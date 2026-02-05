@@ -46,30 +46,6 @@ vim.keymap.set("t", "<Esc>", [[<C-\><C-n>]], { desc = "Exit terminal mode" })
 local term_buf = nil
 local term_win = nil
 
-local function term_cd_to_current_file_dir()
-  local dir
-
-  -- 终端 buffer 不要用 buf name（会是 term://...）
-  if vim.bo.buftype == "terminal" then
-    dir = vim.fn.getcwd()
-  else
-    local file = vim.api.nvim_buf_get_name(0)
-    if file ~= nil and file ~= "" then
-      dir = vim.fs.dirname(file)
-    else
-      dir = vim.fn.getcwd()
-    end
-  end
-
-  if not dir or not vim.b.terminal_job_id then
-    return
-  end
-
-  -- 你用的是 pwsh：不要 cd /d（那是 cmd.exe 的语法）
-  local cmd = 'cd "' .. dir .. '"\r'
-  vim.fn.chansend(vim.b.terminal_job_id, cmd)
-end
-
 vim.keymap.set("n", "<leader>tt", function()
   -- 1) 如果终端窗口存在：隐藏（关闭窗口即可，保留 buffer）
   if term_win and vim.api.nvim_win_is_valid(term_win) then
@@ -92,8 +68,7 @@ vim.keymap.set("n", "<leader>tt", function()
   -- 3) 每次显示出来都进入输入模式（满足你“再次打开直接可输命令”）
   vim.cmd("startinsert")
 
-  -- 4) 可选：每次打开时 cd 到当前文件目录
-  term_cd_to_current_file_dir()
+  -- 4) no implicit cd here (pure toggle)
 end, { desc = "Terminal: Toggle (pwsh, reuse buffer)" })
 
 -- Back-compat (no cheatsheet entry)
@@ -120,6 +95,74 @@ local function ensure_terminal_visible()
   vim.cmd("startinsert")
   return term_buf, term_win
 end
+
+
+
+-- Terminal: explicit cd helpers (no :cd / :lcd)
+local function term_send_line(line)
+  -- ensure terminal exists and get into its buffer
+  local buf, win = ensure_terminal_visible()
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    vim.notify("Terminal not available", vim.log.levels.WARN)
+    return
+  end
+  -- terminal_job_id is buffer-local; make sure we're in that buffer
+  vim.api.nvim_set_current_win(win)
+  if not vim.b.terminal_job_id then
+    vim.notify("Terminal job not ready", vim.log.levels.WARN)
+    return
+  end
+  vim.fn.chansend(vim.b.terminal_job_id, line .. "\r\n")
+end
+
+local function term_cd(dir)
+  if not dir or dir == "" then return end
+  term_send_line('cd "' .. dir .. '"')
+end
+
+vim.keymap.set("n", "<leader>tc", function()
+  -- cd terminal to current file dir (explicit, not automatic)
+  local dir = vim.fn.expand("%:p:h")
+  if not dir or dir == "" then
+    vim.notify("No current file directory", vim.log.levels.WARN)
+    return
+  end
+  term_cd(dir)
+end, { desc = "Terminal: cd to current file dir" })
+
+local find_nearest_uproject
+local ue_roots
+
+vim.keymap.set("n", "<leader>tp", function()
+  -- cd terminal to UE project root (STRICT: cwd must contain .uproject)
+  local cwd = vim.loop.cwd()
+  local up = nil
+  if type(find_nearest_uproject) == "function" then
+    up = find_nearest_uproject(cwd)
+  else
+    local matches = vim.fn.globpath(cwd, "*.uproject", false, true)
+    if type(matches) == "table" and #matches > 0 then up = matches[1] end
+  end
+  if not up then
+    vim.notify("No .uproject in cwd (your rule: no upward search). :cd to the .uproject dir first.", vim.log.levels.WARN)
+    return
+  end
+  term_cd(cwd)
+end, { desc = "Terminal: cd to UE project root (cwd)" })
+
+vim.keymap.set("n", "<leader>te", function()
+  -- cd terminal to UE engine root (requires ue_roots() to succeed)
+  if type(ue_roots) ~= "function" then
+    vim.notify("ue_roots() not available", vim.log.levels.WARN)
+    return
+  end
+  local project_root, engine_root, err = ue_roots()
+  if err or not engine_root or engine_root == "" then
+    vim.notify("UE engine root not detected. Ensure cwd is .uproject dir.", vim.log.levels.WARN)
+    return
+  end
+  term_cd(engine_root)
+end, { desc = "Terminal: cd to UE engine root" })
 
 
 -- ========== Bootstrap lazy.nvim ==========
@@ -301,12 +344,15 @@ require("lazy").setup({
 
 
 -- ===== UE roots from .uproject EngineAssociation (Windows HKCU Builds) =====
-local function find_nearest_uproject(start_dir)
-  start_dir = start_dir or vim.loop.cwd()
-  local matches = vim.fs.find(function(name)
-    return name:sub(-9) == ".uproject"
-  end, { path = start_dir, upward = true, type = "file" })
-  return matches[1]
+find_nearest_uproject = function(start_dir)
+  -- User requirement: only accept .uproject in the *current directory* (no upward search).
+  local dir = start_dir or vim.loop.cwd()
+  -- globpath(..., true) returns a list; robust on Windows paths.
+  local matches = vim.fn.globpath(dir, "*.uproject", false, true)
+  if type(matches) == "table" and #matches > 0 then
+    return matches[1]
+  end
+  return nil
 end
 
 local function read_all(path)
@@ -341,10 +387,10 @@ local function trim(s)
 end
 
 
-local function ue_roots()
+ue_roots = function()
   local uproject = find_nearest_uproject()
   if not uproject then
-    return nil, nil, "No .uproject found upward from cwd"
+    return nil, nil, "No .uproject found in cwd (run :cd into the .uproject folder or open from there)"
   end
   local project_root = vim.fs.dirname(uproject)
 
@@ -910,7 +956,86 @@ local map = vim.keymap.set
 -- ========== Git keymaps ==========
 -- Status / UI
 map("n", "<leader>gg", "<cmd>Git<cr>", { desc = "Git: status (fugitive)" })
-map("n", "<leader>gl", "<cmd>LazyGit<cr>", { desc = "Git: LazyGit" })
+map("n", "<leader>gl", function()
+  -- Open LazyGit in a large floating terminal.
+  -- If this is a UE project (ue_roots() works), prefer engine_root as the starting directory.
+  -- Then resolve the actual git toplevel from that directory; if not a git repo, fallback to nvim cwd git root.
+  local function git_root(dir)
+    if not dir or dir == "" then return nil end
+    local out = vim.fn.systemlist({ "git", "-C", dir, "rev-parse", "--show-toplevel" })
+    if vim.v.shell_error ~= 0 or not out or not out[1] or out[1] == "" then
+      return nil
+    end
+    return out[1]
+  end
+
+  local start_dir = vim.loop.cwd()
+  if type(ue_roots) == "function" then
+    local pr, er, err = ue_roots()
+    if not err and er and er ~= "" then
+      start_dir = er
+    elseif not err and pr and pr ~= "" then
+      start_dir = pr
+    end
+  end
+
+  local repo = git_root(start_dir) or git_root(vim.loop.cwd())
+  if not repo then
+    vim.notify("LazyGit: 当前目录与引擎目录都不是 git repo（找不到 .git）。", vim.log.levels.WARN)
+    return
+  end
+
+  -- Create floating window
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].filetype = "lazygit"
+
+  local ui = vim.api.nvim_list_uis()[1]
+  local width = math.floor(ui.width * 0.90)
+  local height = math.floor(ui.height * 0.90)
+  local row = math.floor((ui.height - height) / 2)
+  local col = math.floor((ui.width - width) / 2)
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    row = row,
+    col = col,
+    width = width,
+    height = height,
+    style = "minimal",
+    border = "rounded",
+  })
+
+  -- Close helpers
+  local function close()
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+  end
+
+  vim.keymap.set("n", "q", close, { buffer = buf, nowait = true, silent = true })
+  vim.keymap.set("n", "<Esc>", close, { buffer = buf, nowait = true, silent = true })
+
+  -- Start lazygit with explicit cwd=repo
+  local job = vim.fn.termopen({ "lazygit" }, {
+    cwd = repo,
+    on_exit = function()
+      vim.schedule(close)
+    end,
+  })
+
+  if job <= 0 then
+    vim.notify("LazyGit: termopen failed (is lazygit in PATH?)", vim.log.levels.ERROR)
+    close()
+    return
+  end
+
+  -- terminal mode mappings
+  vim.cmd("startinsert")
+  vim.keymap.set("t", "<Esc>", [[<C-\><C-n>]], { buffer = buf, silent = true })
+end, { desc = "Git: LazyGit (float, UE->engine root, resolve git root)" })
 map("n", "<leader>gD", "<cmd>DiffviewOpen<cr>", { desc = "Git: Diffview open" })
 map("n", "<leader>gq", "<cmd>DiffviewClose<cr>", { desc = "Git: Diffview close" })
 map("n", "<leader>gF", "<cmd>DiffviewFileHistory %<cr>", { desc = "Git: File history (current)" })
@@ -1115,8 +1240,8 @@ local builtin = require("telescope.builtin")
 local function ue_telescope_roots()
   local project_root, engine_root, err = ue_roots()
   if err then
-    vim.notify(err, vim.log.levels.WARN)
-    return nil
+    -- Fallback requirement: if no .uproject in cwd, still allow normal search within current cwd.
+    return { vim.loop.cwd() }
   end
   return { project_root, engine_root }
 end
@@ -1611,33 +1736,30 @@ end
 
 vim.keymap.set("n", "<leader>?", open_cheatsheet, { desc = "General: Cheatsheet" })
 
+-- Hard guarantee: sessions never capture/restore cwd
+vim.opt.sessionoptions = {
+  "blank", "buffers", "folds", "help", "tabpages", "winsize", "winpos", "terminal",
+}
+vim.opt.sessionoptions:remove("curdir") -- double-safe
+
 require("auto-session").setup({
-  -- 自动恢复：进入某个 cwd 时，如果有 session 就恢复
+  -- 重要：不自动 restore（避免 session 把 cwd 恢复到某个 Engine/Source/... 造成“自动 cd”错觉）
   auto_restore_enabled = true,
 
+  -- 仍然自动保存/创建 session（需要时你可以手动 :SessionRestore）
   auto_save_enabled = true,
-
   auto_create_enabled = true,
+  cwd_change_handling = false,
 
-  -- 会话文件放哪里（建议固定到标准目录，避免污染项目）
   session_dir = vim.fn.stdpath("data") .. "/sessions/",
-
-  -- session 的命名策略（按 cwd 生成唯一名）
-  -- 旧版本是 auto_session_use_git_branch / auto_session_root_dir 等字段，
-  -- 新版本的字段可能略有变化；这个插件整体很稳定，但你装的版本不同字段会差一点。
-  -- 如果你发现某字段无效，直接 :h auto-session 或 :checkhealth 看提示即可。
-
-  -- 避免某些目录自动 restore（比如 home / Downloads / temp）
   auto_restore_last_session = false,
   suppressed_dirs = { "~", "~/Downloads", "/tmp" },
 
-  -- 保存前清理：把不该进 session 的东西从 buffer list 里移掉
   pre_save_cmds = {
     "tabdo windo if &buftype == 'help' | q | endif",
     "tabdo windo if &buftype == 'quickfix' | cclose | endif",
   },
 
-  -- sessionoptions 很关键：决定 session 里保存什么
-  sessionoptions = "blank,buffers,curdir,folds,help,tabpages,winsize,winpos,terminal",
+  -- 关键：不记录/恢复 curdir（避免 cwd 被 session 改写）
+  sessionoptions = "blank,buffers,folds,help,tabpages,winsize,winpos,terminal",
 })
-

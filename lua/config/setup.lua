@@ -110,7 +110,7 @@ vim.lsp.config("clangd", {
     "--log=error",
     "--limit-results=200",
     "--limit-references=200",
-    '--query-driver=**/clang++.exe,**/clang-cl.exe,**/aarch64-linux-android-clang++.exe,**/armv7a-linux-androideabi-clang++.exe',
+    "--query-driver=**/clang*.exe",
   },
 
   capabilities = capabilities,
@@ -683,7 +683,7 @@ vim.keymap.set("n", "<leader>?", open_cheatsheet, { desc = "General: Cheatsheet"
 
 require("auto-session").setup({
   -- 重要：不自动 restore（避免 session 把 cwd 恢复到某个 Engine/Source/... 造成“自动 cd”错觉）
-  auto_restore_enabled = false,
+  auto_restore_enabled = true,
 
   -- 仍然自动保存/创建 session（需要时你可以手动 :SessionRestore）
   auto_save_enabled = true,

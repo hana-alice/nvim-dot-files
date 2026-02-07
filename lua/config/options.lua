@@ -118,3 +118,47 @@ end
 -- Statusline: show UEIndex/GTAGS progress in the status bar
 vim.g.ueindex_status = vim.g.ueindex_status or ""
 vim.o.statusline = "%f %m%r %= %{get(g:,'ueindex_status','')} %l:%c"
+
+-- Show UEIndex/GTAGS progress in statusline (works with lualine too)
+vim.g.ueindex_status = vim.g.ueindex_status or ""
+
+local function ue_status()
+  local s = vim.g.ueindex_status
+  if not s or s == "" then return "" end
+  return s
+end
+
+-- If lualine is present, inject a component (no window changes)
+do
+  local ok, lualine = pcall(require, "lualine")
+  if ok and not vim.g._ue_lualine_injected then
+    vim.g._ue_lualine_injected = true
+
+    local cfg = {}
+    pcall(function()
+      cfg = lualine.get_config() or {}
+    end)
+
+    cfg.sections = cfg.sections or {}
+    -- pick a section that typically exists
+    cfg.sections.lualine_x = cfg.sections.lualine_x or {}
+
+    -- avoid duplicate injection
+    local already = false
+    for _, c in ipairs(cfg.sections.lualine_x) do
+      if type(c) == "function" and c == ue_status then
+        already = true
+        break
+      end
+    end
+    if not already then
+      table.insert(cfg.sections.lualine_x, 1, ue_status)
+    end
+
+    -- re-setup once to apply
+    pcall(lualine.setup, cfg)
+  elseif not ok then
+    -- Fallback to builtin statusline (no lualine)
+    vim.o.statusline = "%f %m%r %= %{get(g:,'ueindex_status','')} %l:%c"
+  end
+end

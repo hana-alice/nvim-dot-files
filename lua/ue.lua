@@ -223,6 +223,7 @@ local function _run_lines(cmd, opts)
   return vim.v.shell_error or 0, lines
 end
 
+-- === status helper (fast-event safe) ===
 local function _set_status(msg)
   vim.g.ueindex_status = msg or ""
   vim.schedule(function()
@@ -541,6 +542,235 @@ local function ue_files_from_index()
     },
   })
 end
+
+
+local function _fs_stat(path)
+  return vim.loop.fs_stat(path)
+end
+
+local function _count_lines_stream(path)
+  local n = 0
+  local f = io.open(path, "rb")
+  if not f then return 0 end
+  for _ in f:lines() do
+    n = n + 1
+  end
+  f:close()
+  return n
+end
+
+local function _needs_rebuild(root, filelist)
+  root = _norm(root)
+  filelist = _norm(filelist)
+
+  local st_list = _fs_stat(filelist)
+  if not st_list then return true end
+
+  local st_gtags = _fs_stat(root .. "/GTAGS")
+  local st_grtags = _fs_stat(root .. "/GRTAGS")
+  local st_gpath = _fs_stat(root .. "/GPATH")
+
+  if not (st_gtags and st_grtags and st_gpath) then
+    return true
+  end
+
+  -- GTAGS 比 filelist 新：认为 up-to-date（smart skip）
+  -- 只要任一库文件旧于 filelist，就重建
+  local list_mtime = st_list.mtime.sec
+  if st_gtags.mtime.sec < list_mtime then return true end
+  if st_grtags.mtime.sec < list_mtime then return true end
+  if st_gpath.mtime.sec < list_mtime then return true end
+  return false
+end
+
+-- gtags rebuild with true progress (no UI disruption)
+local function _spawn_gtags_progress(root, filelist, label, on_exit)
+  if vim.fn.executable("gtags") == 0 then
+    vim.notify("gtags not found in PATH", vim.log.levels.ERROR)
+    if on_exit then on_exit(127) end
+    return
+  end
+
+  root = _norm(root)
+  filelist = _norm(filelist)
+
+  local total = _count_lines_stream(filelist)
+  local processed = 0
+  local start_ms = vim.loop.hrtime()
+  local last_draw_ms = 0
+
+  local function now_ms()
+    return math.floor((vim.loop.hrtime() - start_ms) / 1e6)
+  end
+
+  local function fmt_status(state)
+    local ms = now_ms()
+    local sec = math.max(ms / 1000.0, 0.001)
+    local rate = processed / sec
+    local pct = (total > 0) and math.floor((processed * 100.0) / total) or 0
+    return ("GTAGS(%s): %s %d/%d %d%%  %.1f/s  %ds"):format(
+      label, state, processed, total, pct, rate, math.floor(sec)
+    )
+  end
+
+  _set_status(fmt_status("starting"))
+
+  local stdout = vim.loop.new_pipe(false)
+  local stderr = vim.loop.new_pipe(false)
+
+  local buf = ""
+  local function consume(chunk)
+    if not chunk or chunk == "" then return end
+    buf = buf .. chunk
+    while true do
+      local s, e = buf:find("\n", 1, true)
+      if not s then break end
+      local line = buf:sub(1, s - 1)
+      buf = buf:sub(e + 1)
+
+      -- 典型行： [123] extracting tags of xxx
+      if line:find("extracting tags of ", 1, true) then
+        processed = processed + 1
+      end
+
+      -- 限频刷新（避免 redraw 太频繁）
+      local ms = now_ms()
+      if (ms - last_draw_ms) >= 500 then
+        last_draw_ms = ms
+        _set_status(fmt_status("running"))
+      end
+    end
+  end
+
+  local handle
+  handle = vim.loop.spawn("gtags", {
+    cwd = root,
+    args = {
+      "-v",
+      "-f", filelist,
+      "--skip-unreadable",
+      "--skip-symlink",
+    },
+    stdio = { nil, stdout, stderr },
+  }, function(code, _signal)
+    if stdout and not stdout:is_closing() then stdout:read_stop(); stdout:close() end
+    if stderr and not stderr:is_closing() then stderr:read_stop(); stderr:close() end
+    if handle and not handle:is_closing() then handle:close() end
+
+    vim.schedule(function()
+      if code == 0 then
+        _set_status(fmt_status("done"))
+      else
+        _set_status(("GTAGS(%s): failed(%d)"):format(label, code))
+      end
+      if on_exit then pcall(on_exit, code) end
+      vim.defer_fn(function() _set_status("") end, 2500)
+    end)
+  end)
+
+  if not handle then
+    _set_status(("GTAGS(%s): spawn failed"):format(label))
+    if on_exit then on_exit(1) end
+    return
+  end
+
+  stdout:read_start(function(err, data)
+    if err then return end
+    consume(data)
+  end)
+
+  stderr:read_start(function(_err, _data)
+    -- 不把 stderr 打到 UI，避免影响工作界面
+  end)
+end
+
+local function build_gtags_from_filelist_smart(root, filelist, label, on_exit)
+  root = _norm(root)
+  filelist = _norm(filelist)
+
+  if not _needs_rebuild(root, filelist) then
+    _set_status(("GTAGS(%s): up-to-date (skip)"):format(label))
+    vim.defer_fn(function() _set_status("") end, 1200)
+    if on_exit then on_exit(0) end
+    return true
+  end
+
+  -- rebuild
+  -- 注意：gtags 会在 root 下写 GTAGS/GRTAGS/GPATH，所以先删掉旧库（避免混）
+  pcall(vim.fn.delete, root .. "/GTAGS")
+  pcall(vim.fn.delete, root .. "/GRTAGS")
+  pcall(vim.fn.delete, root .. "/GPATH")
+
+  _spawn_gtags_progress(root, filelist, label, on_exit)
+  return true
+end
+
+-- =========================
+-- UEIndex command (smart)
+-- =========================
+-- 你原来的 build_ue_index_split() 保持不变（生成：
+--   .cache/gtags_project.files  (相对路径列表)
+--   .cache/gtags_engine.files   (相对路径列表)
+-- 并返回 project_root/engine_root/paths）
+-- 这里假设它还存在并返回 r.project_root, r.engine_root, r.paths
+
+vim.api.nvim_create_user_command("UEIndex", function()
+  local r = build_ue_index_split()
+  if not r then return end
+
+  -- smart build: project then engine
+  build_gtags_from_filelist_smart(r.project_root, r.paths.gtags_project, "project", function(code)
+    if code ~= 0 then
+      vim.notify("GTAGS(project) failed", vim.log.levels.WARN)
+      return
+    end
+    build_gtags_from_filelist_smart(r.engine_root, r.paths.gtags_engine, "engine", function(_)
+      -- done
+    end)
+  end)
+end, {})
+
+-- =========================
+-- Manual clear cache command
+-- =========================
+vim.api.nvim_create_user_command("UEClearCache", function()
+  local project_root, engine_root, err = ue_roots()
+  if err then
+    vim.notify("UEClearCache failed: " .. err, vim.log.levels.WARN)
+    return
+  end
+
+  project_root = _norm(project_root)
+  engine_root  = _norm(engine_root)
+
+  local function rm(path)
+    pcall(vim.fn.delete, path, "rf")
+  end
+
+  _set_status("UEClearCache: cleaning...")
+
+  -- ===== Project root =====
+  rm(project_root .. "/.cache")   -- UEIndex / gtags filelists
+  rm(project_root .. "/GTAGS")
+  rm(project_root .. "/GRTAGS")
+  rm(project_root .. "/GPATH")
+  rm(project_root .. "/.ignore")  -- 按你的要求：一起清
+
+  -- ===== Engine root =====
+  rm(engine_root .. "/GTAGS")
+  rm(engine_root .. "/GRTAGS")
+  rm(engine_root .. "/GPATH")
+  rm(engine_root .. "/.ignore")   -- 同上
+
+  _set_status("UEClearCache: done")
+  vim.defer_fn(function()
+    _set_status("")
+  end, 1200)
+
+  vim.notify("UE caches cleared (project + engine only).")
+end, {})
+
+
 
 vim.keymap.set("n", "<leader>su", ue_files_from_index, { desc = "Search: UE files (index)" })
 vim.keymap.set("n", "<leader>fF", "<leader>su", { remap = true, silent = true })

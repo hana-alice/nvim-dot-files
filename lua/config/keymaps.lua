@@ -2,14 +2,26 @@
 vim.keymap.set("t", "<Esc>", [[<C-\><C-n>]], { desc = "Exit terminal mode" })
 
 -- Toggle terminal (single instance), hide by closing window, reuse buffer
-local term_buf = nil
-local term_win = nil
+-- Share state globally so other modules (e.g. UE build hotkeys) can reuse the same terminal.
+_G.ue_term_buf = _G.ue_term_buf or nil
+_G.ue_term_win = _G.ue_term_win or nil
+
+local function get_term_state()
+  return _G.ue_term_buf, _G.ue_term_win
+end
+
+local function set_term_state(buf, win)
+  _G.ue_term_buf = buf
+  _G.ue_term_win = win
+end
 
 vim.keymap.set("n", "<leader>tt", function()
+  local term_buf, term_win = get_term_state()
   -- 1) 如果终端窗口存在：隐藏（关闭窗口即可，保留 buffer）
   if term_win and vim.api.nvim_win_is_valid(term_win) then
     vim.api.nvim_win_close(term_win, true)
     term_win = nil
+    set_term_state(term_buf, term_win)
     return
   end
 
@@ -24,6 +36,8 @@ vim.keymap.set("n", "<leader>tt", function()
     vim.api.nvim_win_set_buf(term_win, term_buf)
   end
 
+  set_term_state(term_buf, term_win)
+
   -- 3) 每次显示出来都进入输入模式（满足你“再次打开直接可输命令”）
   vim.cmd("startinsert")
 
@@ -37,6 +51,7 @@ vim.keymap.set("n", "<leader>t", "<leader>tt", { remap = true, silent = true })
 -- Ensure terminal window is visible (reuse the same terminal buffer).
 -- Unlike <leader>t toggle, this will OPEN if hidden but will NOT close it.
 local function ensure_terminal_visible()
+  local term_buf, term_win = get_term_state()
   if term_win and vim.api.nvim_win_is_valid(term_win) then
     return term_buf, term_win
   end
@@ -50,6 +65,8 @@ local function ensure_terminal_visible()
     term_win = vim.api.nvim_get_current_win()
     vim.api.nvim_win_set_buf(term_win, term_buf)
   end
+
+  set_term_state(term_buf, term_win)
 
   vim.cmd("startinsert")
   return term_buf, term_win
@@ -274,7 +291,12 @@ end, { desc = "Git: diff this (against ~)" })
 local cmp = require("cmp")
 
 -- Session helpers
-vim.keymap.set("n", "<leader>ss", "<cmd>SessionSave<cr>", { desc = "Session: Save" })
-vim.keymap.set("n", "<leader>sr", "<cmd>SessionRestore<cr>", { desc = "Session: Restore (cwd)" })
-vim.keymap.set("n", "<leader>sd", "<cmd>SessionDelete<cr>", { desc = "Session: Delete (cwd)" })
-vim.keymap.set("n", "<leader>sf", "<cmd>SessionSearch<cr>", { desc = "Session: Search" })
+-- Sessions: keep under <leader>S* to avoid colliding with Search (<leader>f*/<leader>s*)
+vim.keymap.set("n", "<leader>Ss", "<cmd>SessionSave<cr>", { desc = "Session: Save" })
+vim.keymap.set("n", "<leader>Sr", "<cmd>SessionRestore<cr>", { desc = "Session: Restore (cwd)" })
+vim.keymap.set("n", "<leader>Sd", "<cmd>SessionDelete<cr>", { desc = "Session: Delete (cwd)" })
+vim.keymap.set("n", "<leader>Sf", "<cmd>SessionSearch<cr>", { desc = "Session: Search" })
+
+-- Back-compat for old session keymaps that don't collide
+vim.keymap.set("n", "<leader>ss", "<leader>Ss", { remap = true, silent = true })
+vim.keymap.set("n", "<leader>sd", "<leader>Sd", { remap = true, silent = true })

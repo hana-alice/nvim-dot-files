@@ -155,13 +155,6 @@ vim.filetype.add({
 
 local builtin = require("telescope.builtin")
 
--- 文件 / grep
--- vim.keymap.set("n", "<leader>ff", builtin.find_files, { desc = "Find Files" })
--- vim.keymap.set("n", "<leader>fg", builtin.live_grep,  { desc = "Live Grep (ripgrep)" })
-
-
-local builtin = require("telescope.builtin")
-
 local function ue_telescope_roots()
   local project_root, engine_root, err = require("ue").ue_roots()
   if err then
@@ -171,8 +164,8 @@ local function ue_telescope_roots()
   return { project_root, engine_root }
 end
 
--- Space f f：从 Project + Engine 找文件
-vim.keymap.set("n", "<leader>sf", function()
+-- <leader>ff: Project + Engine find files
+vim.keymap.set("n", "<leader>ff", function()
   local project_root, engine_root, err = require("ue").ue_roots()
   if err then
     vim.notify(err, vim.log.levels.WARN)
@@ -195,11 +188,11 @@ vim.keymap.set("n", "<leader>sf", function()
     find_command = find_command,
   })
 end, { desc = "Search: Telescope: Find files (Project + Engine)" })
--- Back-compat (no cheatsheet entry)
-vim.keymap.set("n", "<leader>ff", "<leader>sf", { remap = true, silent = true })
+-- Optional aliases
+vim.keymap.set("n", "<leader>sf", "<leader>ff", { remap = true, silent = true })
 
--- Space f g：从 Project + Engine grep
-vim.keymap.set("n", "<leader>sg", function()
+-- <leader>fg: Project + Engine live grep
+vim.keymap.set("n", "<leader>fg", function()
   local project_root, engine_root, err = require("ue").ue_roots()
   if err then
     vim.notify(err, vim.log.levels.WARN)
@@ -230,25 +223,16 @@ vim.keymap.set("n", "<leader>sg", function()
     end,
   })
 end, { desc = "Search: Telescope: Live grep (Project + Engine)" })
--- Back-compat (no cheatsheet entry)
-vim.keymap.set("n", "<leader>fg", "<leader>sg", { remap = true, silent = true })
+-- Optional aliases
+vim.keymap.set("n", "<leader>sg", "<leader>fg", { remap = true, silent = true })
 
 
--- 最近文件 / buffer
-vim.keymap.set("n", "<leader>sr", builtin.oldfiles,  { desc = "Search: Recent files" })
--- Back-compat (no cheatsheet entry)
-vim.keymap.set("n", "<leader>fr", "<leader>sr", { remap = true, silent = true })
-vim.keymap.set("n", "<leader>sb", builtin.buffers,   { desc = "Search: Buffers" })
-vim.keymap.set("n", "<leader>sh", builtin.help_tags, { desc = "Search: Help tags" })
--- Back-compat (no cheatsheet entry)
-vim.keymap.set("n", "<leader>fh", "<leader>sh", { remap = true, silent = true })
--- Back-compat (no cheatsheet entry)
-vim.keymap.set("n", "<leader>fb", "<leader>sb", { remap = true, silent = true })
+-- Recent files / buffers / help
+vim.keymap.set("n", "<leader>fr", builtin.oldfiles,  { desc = "Search: Recent files" })
+vim.keymap.set("n", "<leader>fb", builtin.buffers,  { desc = "Search: Buffers" })
+vim.keymap.set("n", "<leader>fh", builtin.help_tags,{ desc = "Search: Help tags" })
 
--- LSP（以后你上 clangd 会非常爽）
-vim.keymap.set("n", "gr", builtin.lsp_references,    { desc = "LSP References" })
-vim.keymap.set("n", "gd", builtin.lsp_definitions,  { desc = "LSP Definitions" })
-vim.keymap.set("n", "gi", builtin.lsp_implementations, { desc = "LSP Implementations" })
+-- NOTE: do NOT override gd/gr/gi here; keep them LSP-owned via on_attach (with fallback logic).
 
 
 -- =========YAZI
@@ -468,59 +452,16 @@ require("telescope").setup({
 })
 
 
--- ===== Telescope UE compatibility (UE uses Project+Engine, else fallback to cwd) =====
-local builtin = require("telescope.builtin")
-
-local function smart_roots()
-  local project_root, engine_root, err = require("ue").ue_roots()
-  if err then
-    return nil, false
-  end
-  return {
-	  project_root .. "/Source",
-	  project_root .. "/Plugins",
-	  engine_root,
-	}, true
-	
-end
-
-vim.keymap.set("n", "<leader>sf", function()
-  local dirs = ue_telescope_roots()
-  if not dirs then return end
-  builtin.find_files({
-    search_dirs = dirs,
-    hidden = true,
-  })
-end, { desc = "Search: Telescope: Find files (Project + Engine)" })
--- Back-compat (no cheatsheet entry)
-vim.keymap.set("n", "<leader>ff", "<leader>sf", { remap = true, silent = true })
-
-vim.keymap.set("n", "<leader>sg", function()
-  local dirs = ue_telescope_roots()
-  if not dirs then return end
-  builtin.live_grep({
-    search_dirs = dirs,
-    additional_args = function()
-      return {
-        "--hidden",
-        "--follow",
-        "--glob=!.git/*",
-        "--glob=!**/Binaries/**",
-        "--glob=!**/Intermediate/**",
-        "--glob=!**/Saved/**",
-        "--glob=!**/DerivedDataCache/**",
-        "--glob=!**/Content/**",
-      }
-    end,
-  })
-end, { desc = "Search: Telescope: Live grep (Project + Engine)" })
--- Back-compat (no cheatsheet entry)
-vim.keymap.set("n", "<leader>fg", "<leader>sg", { remap = true, silent = true })
+-- (Removed) duplicated Telescope UE keymaps block.
+-- The canonical mappings are defined earlier:
+--   <leader>ff / <leader>fg (plus optional aliases <leader>sf / <leader>sg)
 
 
 -- ===== UE build hotkey (reuse ue_roots + reuse single terminal) =====
 
 local function ensure_term_visible()
+  local term_win = _G.ue_term_win
+  local term_buf = _G.ue_term_buf
   -- 如果终端窗口存在，直接复用
   if term_win and vim.api.nvim_win_is_valid(term_win) then
     vim.api.nvim_set_current_win(term_win)
@@ -537,6 +478,9 @@ local function ensure_term_visible()
     term_win = vim.api.nvim_get_current_win()
     vim.api.nvim_win_set_buf(term_win, term_buf)
   end
+
+  _G.ue_term_win = term_win
+  _G.ue_term_buf = term_buf
 
   vim.cmd("startinsert")
   return term_buf

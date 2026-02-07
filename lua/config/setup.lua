@@ -89,7 +89,10 @@ local function on_attach(_, bufnr)
   end
 
   bufmap("n", "gd", vim.lsp.buf.definition, "LSP: Go to definition")
-  bufmap("n", "gr", vim.lsp.buf.references, "LSP: References")
+  bufmap("n", "gr", function()
+    require("utils.lsp_fallback").references()
+  end, "References (LSP -> GTAGS)")
+
   bufmap("n", "K", vim.lsp.buf.hover, "LSP: Hover")
   bufmap("n", "<leader>rn", vim.lsp.buf.rename, "LSP: Rename")
   bufmap("n", "<leader>ca", vim.lsp.buf.code_action, "LSP: Code action")

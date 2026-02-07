@@ -115,3 +115,6 @@ local function term_send_line(line)
   vim.fn.chansend(vim.b.terminal_job_id, line .. "\r\n")
 end
 
+-- Statusline: show UEIndex/GTAGS progress in the status bar
+vim.g.ueindex_status = vim.g.ueindex_status or ""
+vim.o.statusline = "%f %m%r %= %{get(g:,'ueindex_status','')} %l:%c"

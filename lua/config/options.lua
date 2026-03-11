@@ -1,3 +1,11 @@
--- Options are automatically loaded before lazy.nvim startup
--- Default options that are always set: https://github.com/LazyVim/LazyVim/blob/main/lua/lazyvim/config/options.lua
--- Add any additional options here
+vim.g.root_spec = { "cwd" }
+
+-- Keep sessions from silently restoring a different cwd.
+vim.opt.sessionoptions = { "buffers", "tabpages", "winsize", "help", "globals", "skiprtp", "folds" }
+
+vim.filetype.add({
+  extension = {
+    usf = "hlsl",
+    ush = "hlsl",
+  },
+})

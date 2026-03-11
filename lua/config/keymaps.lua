@@ -1,3 +1,13 @@
--- Keymaps are automatically loaded on the VeryLazy event
--- Default keymaps that are always set: https://github.com/LazyVim/LazyVim/blob/main/lua/lazyvim/config/keymaps.lua
--- Add any additional keymaps here
+local map = vim.keymap.set
+
+map("n", "gd", function()
+  require("utils.lsp_fallback").definition()
+end, { desc = "Definition (LSP -> GTAGS)" })
+map("n", "gr", function()
+  require("utils.lsp_fallback").references()
+end, { desc = "References (LSP -> GTAGS)" })
+map("n", "<leader>ub", "<cmd>UEBuildAndroid<cr>", { desc = "UE: Build Android Development" })
+map("n", "<leader>uB", "<cmd>UEPrepare<cr>", { desc = "UE: Prepare symbols + compile_commands" })
+map("n", "<leader>uc", "<cmd>UEExportCompileCommands<cr>", { desc = "UE: Export compile_commands" })
+map("n", "<leader>up", "<cmd>UEPaths<cr>", { desc = "UE: Show paths" })
+map("n", "<leader>uP", "<cmd>UESetProject<cr>", { desc = "UE: Set project" })

@@ -35,6 +35,7 @@
 ## Symbols / LSP / Code Nav
 - `gd` Definition
 - `gr` References
+- `<leader>ch` Switch header / source (`clangd`)
 - `gI` Implementations
 - `gy` Type definition
 - `gai` Incoming calls
@@ -57,6 +58,10 @@
 - `<leader>sG` Grep (cwd)
 - `<leader>sw` Search current word or visual selection (root)
 - `<leader>sW` Search current word or visual selection (cwd)
+- `<leader>sx` Grep whole word (root)
+- `<leader>sX` Grep case-sensitive (root)
+- `<leader>sy` Live grep current word or visual selection (root)
+- `<leader>sY` Live grep current word or visual selection (cwd)
 - `<leader>sd` Diagnostics
 - `<leader>sD` Buffer diagnostics
 - `<leader>sq` Quickfix list
@@ -69,6 +74,15 @@
 - `<leader>sr` Search and replace (`grug-far`)
 - `<leader>st` Todo comments
 - `<leader>sT` Todo/Fix/Fixme comments
+
+## Live Grep Tips
+- 默认是 `smart-case`: 搜 `foo` 忽略大小写，搜 `Foo` 自动区分大小写
+- `<leader>sw` / `<leader>sW` 是直接搜当前词或选区，不是 live 模式
+- `<leader>sy` / `<leader>sY` 会把当前词或选区预填进 livegrep，可继续改关键字
+- 在 livegrep 输入里可追加 ripgrep 参数: `foo -- --word-regexp`
+- 强制全字匹配: `foo -- --word-regexp`
+- 强制区分大小写: `foo -- --case-sensitive`
+- 两个一起用: `Foo -- --word-regexp --case-sensitive`
 
 ## Editing
 - `<C-s>` Save file

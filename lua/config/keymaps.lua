@@ -1,11 +1,43 @@
 local map = vim.keymap.set
 
+local function live_grep_with(opts)
+  return function()
+    LazyVim.pick.open("live_grep", vim.deepcopy(opts or {}))
+  end
+end
+
+local function live_grep_word_with(opts)
+  return function()
+    local config = {
+      regex = false,
+      search = function(picker)
+        return picker:word()
+      end,
+    }
+    if opts then
+      config = vim.tbl_deep_extend("force", config, vim.deepcopy(opts))
+    end
+    LazyVim.pick.open("live_grep", config)
+  end
+end
+
 map("n", "gd", function()
   require("utils.lsp_fallback").definition()
 end, { desc = "Definition (LSP -> GTAGS)" })
 map("n", "gr", function()
   require("utils.lsp_fallback").references()
 end, { desc = "References (LSP -> GTAGS)" })
+map("n", "<leader>sx", live_grep_with({
+  regex = false,
+  args = { "--word-regexp" },
+}), { desc = "Search: Grep whole word (root)" })
+map("n", "<leader>sX", live_grep_with({
+  args = { "--case-sensitive" },
+}), { desc = "Search: Grep case-sensitive (root)" })
+map({ "n", "x" }, "<leader>sy", live_grep_word_with(), { desc = "Search: Live grep word/selection (root)" })
+map({ "n", "x" }, "<leader>sY", live_grep_word_with({
+  root = false,
+}), { desc = "Search: Live grep word/selection (cwd)" })
 map("n", "<leader>ub", "<cmd>UEBuildAndroid<cr>", { desc = "UE: Build Android Development" })
 map("n", "<leader>uB", "<cmd>UEPrepare<cr>", { desc = "UE: Prepare symbols + compile_commands" })
 map("n", "<leader>uc", "<cmd>UEExportCompileCommands<cr>", { desc = "UE: Export compile_commands" })

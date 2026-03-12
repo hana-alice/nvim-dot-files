@@ -6,6 +6,8 @@ local cheatsheet_win = nil
 local build_term_buf = nil
 local build_term_win = nil
 local build_term_jobid = nil
+local status_cache = {}
+local dirty_index_roots = {}
 
 local function trim(value)
   return vim.trim(tostring(value or ""))
@@ -76,6 +78,23 @@ local function ensure_dir(path)
   end
 end
 
+local function file_stat(path)
+  path = norm(path)
+  if path == "" or not vim.uv or not vim.uv.fs_stat then
+    return nil
+  end
+  return vim.uv.fs_stat(path)
+end
+
+local function file_mtime(path)
+  local stat = file_stat(path)
+  local mtime = stat and stat.mtime or nil
+  if type(mtime) == "table" then
+    return tonumber(mtime.sec) or 0
+  end
+  return tonumber(mtime) or 0
+end
+
 local function path_has_prefix(path, prefix)
   path = norm(path)
   prefix = norm(prefix)
@@ -86,6 +105,11 @@ local function path_has_prefix(path, prefix)
     return path:sub(1, 1) == "/"
   end
   return path == prefix or path:sub(1, #prefix + 1) == prefix .. "/"
+end
+
+local function is_absolute_path(path)
+  path = norm(path)
+  return path ~= "" and (path:sub(1, 1) == "/" or path:match("^[A-Za-z]:/") or path:match("^//"))
 end
 
 local function split_path(path)
@@ -202,7 +226,7 @@ local function parse_global_entries(root, lines)
     local file, lnum, text = line:match("^(.-):(%d+):(.*)$")
     if file and lnum then
       file = norm(file)
-      if file:sub(1, 1) ~= "/" and not file:match("^[A-Za-z]:/") and not file:match("^//") then
+      if not is_absolute_path(file) then
         file = join(root, file)
       end
       table.insert(entries, {
@@ -216,6 +240,175 @@ local function parse_global_entries(root, lines)
   return entries
 end
 
+local function strip_ansi(line)
+  line = tostring(line or "")
+  line = line:gsub("\27%[[0-9;?]*[%a]", "")
+  return line:gsub("\r", "")
+end
+
+local function normalize_output_lines(output)
+  if type(output) == "table" then
+    local lines = {}
+    for _, line in ipairs(output) do
+      line = trim(strip_ansi(line))
+      if line ~= "" then
+        table.insert(lines, line)
+      end
+    end
+    return lines
+  end
+
+  local lines = {}
+  for line in tostring(output or ""):gmatch("[^\r\n]+") do
+    line = trim(strip_ansi(line))
+    if line ~= "" then
+      table.insert(lines, line)
+    end
+  end
+  return lines
+end
+
+local function resolve_output_path(root, path)
+  path = norm(path)
+  if path == "" then
+    return ""
+  end
+  if not is_absolute_path(path) and root and root ~= "" then
+    path = join(root, path)
+  end
+  return path
+end
+
+local function looks_like_diagnostic_text(text)
+  local lower = trim(text):lower()
+  return lower:find("error", 1, true) ~= nil
+    or lower:find("warning", 1, true) ~= nil
+    or lower:find("note:", 1, true) ~= nil
+    or lower:find("fatal", 1, true) ~= nil
+    or lower:find("failed", 1, true) ~= nil
+    or lower:find("exception", 1, true) ~= nil
+    or lower:find("undefined reference", 1, true) ~= nil
+end
+
+local function is_summary_diagnostic_line(line)
+  return line:match("^FAILURE:")
+    or line:match("^BUILD FAILED")
+    or line:match("^%* What went wrong:")
+    or line:match("^%* Try:")
+    or line:match("^Execution failed for task")
+    or line:match("^A failure occurred while executing")
+    or line:match("^UnrealBuildTool:%s*ERROR:")
+    or line:match("^ERROR:")
+    or line:match("^error:")
+    or line:match("^> ")
+    or line:match("EXIT CODE")
+end
+
+local function extract_quoted_path(line)
+  for _, pattern in ipairs({
+    [["([A-Za-z]:[^"]+)"]],
+    [['([A-Za-z]:[^']+)']],
+    [["(/[^"]+)"]],
+    [['(/[^']+)']],
+  }) do
+    local candidate = line:match(pattern)
+    if candidate and is_absolute_path(candidate) then
+      return norm(candidate)
+    end
+  end
+end
+
+local function add_quickfix_entry(entries, seen, entry)
+  local key = table.concat({
+    norm(entry.filename or ""),
+    tostring(entry.lnum or 0),
+    tostring(entry.col or 0),
+    trim(entry.text or ""),
+  }, "\31")
+  if seen[key] then
+    return
+  end
+  seen[key] = true
+  table.insert(entries, entry)
+end
+
+local function parse_output_entry(line, opts)
+  opts = opts or {}
+
+  for _, parser in ipairs({
+    function(text)
+      local file, lnum, col, message = text:match("^(.-):(%d+):(%d+):%s*(.*)$")
+      return file, lnum, col, message
+    end,
+    function(text)
+      local file, lnum, message = text:match("^(.-):(%d+):%s*(.*)$")
+      return file, lnum, nil, message
+    end,
+    function(text)
+      local file, lnum, col, message = text:match("^(.-)%((%d+),(%d+)%)%s*:%s*(.*)$")
+      return file, lnum, col, message
+    end,
+    function(text)
+      local file, lnum, message = text:match("^(.-)%((%d+)%)%s*:%s*(.*)$")
+      return file, lnum, nil, message
+    end,
+    function(text)
+      local file, lnum, col, message = text:match("^(.-)%((%d+),(%d+)%)%s+(.*)$")
+      return file, lnum, col, message
+    end,
+    function(text)
+      local file, lnum, message = text:match("^(.-)%((%d+)%)%s+(.*)$")
+      return file, lnum, nil, message
+    end,
+  }) do
+    local file, lnum, col, message = parser(line)
+    file = resolve_output_path(opts.root, file)
+    if file ~= "" and looks_like_diagnostic_text(message or line) then
+      return {
+        filename = file,
+        lnum = tonumber(lnum) or 1,
+        col = tonumber(col) or 1,
+        text = trim(message ~= "" and message or line),
+      }
+    end
+  end
+
+  local quoted = extract_quoted_path(line)
+  if quoted and (looks_like_diagnostic_text(line) or is_summary_diagnostic_line(line)) then
+    return {
+      filename = quoted,
+      lnum = 1,
+      col = 1,
+      text = trim(line),
+    }
+  end
+end
+
+local function diagnostic_entries_from_output(output, opts)
+  opts = opts or {}
+  local lines = normalize_output_lines(output)
+  local entries = {}
+  local seen = {}
+
+  for _, line in ipairs(lines) do
+    local entry = parse_output_entry(line, opts)
+    if entry then
+      add_quickfix_entry(entries, seen, entry)
+    elseif is_summary_diagnostic_line(line) then
+      add_quickfix_entry(entries, seen, { text = trim(line) })
+    end
+  end
+
+  if #entries == 0 then
+    local start = math.max(#lines - (opts.tail_limit or 12) + 1, 1)
+    for index = start, #lines do
+      add_quickfix_entry(entries, seen, { text = lines[index] })
+    end
+  end
+
+  return entries
+end
+
 local function populate_quickfix_from_entries(title, entries)
   if not entries or #entries == 0 then
     return false
@@ -224,6 +417,10 @@ local function populate_quickfix_from_entries(title, entries)
   vim.fn.setqflist({}, " ", { title = title, items = entries })
   vim.cmd("copen")
   return true
+end
+
+local function populate_quickfix_from_output(title, output, opts)
+  return populate_quickfix_from_entries(title, diagnostic_entries_from_output(output, opts))
 end
 
 local function jump_to_entry(entry)
@@ -607,6 +804,217 @@ local function picker_search_dirs(ctx)
   end
 
   return dirs
+end
+
+local function plugin_scope_from_root(root, path)
+  root = norm(root)
+  path = norm(path)
+  if root == "" then
+    return nil
+  end
+
+  local plugins_root = join(root, "Plugins")
+  if not path_has_prefix(path, plugins_root) then
+    return nil
+  end
+
+  local parts = split_path(relative_to(plugins_root, path))
+  if #parts == 0 then
+    return nil
+  end
+
+  local plugin_root = join(plugins_root, parts[1])
+  if not is_dir(plugin_root) then
+    return nil
+  end
+
+  return {
+    kind = "plugin",
+    name = parts[1],
+    root = plugin_root,
+    label = "Plugin " .. parts[1],
+  }
+end
+
+local function project_module_scope(project_root, path)
+  project_root = norm(project_root)
+  path = norm(path)
+  if project_root == "" then
+    return nil
+  end
+
+  local source_root = join(project_root, "Source")
+  if not path_has_prefix(path, source_root) then
+    return nil
+  end
+
+  local parts = split_path(relative_to(source_root, path))
+  if #parts == 0 then
+    return nil
+  end
+
+  local module_root = join(source_root, parts[1])
+  if not is_dir(module_root) then
+    return nil
+  end
+
+  return {
+    kind = "module",
+    name = parts[1],
+    root = module_root,
+    label = "Module " .. parts[1],
+  }
+end
+
+local function engine_module_scope(engine_root, path)
+  engine_root = norm(engine_root)
+  path = norm(path)
+  if engine_root == "" then
+    return nil
+  end
+
+  local source_root = join(engine_root, "Engine", "Source")
+  if not path_has_prefix(path, source_root) then
+    return nil
+  end
+
+  local parts = split_path(relative_to(source_root, path))
+  if #parts < 2 then
+    return nil
+  end
+
+  local module_root = join(source_root, parts[1], parts[2])
+  if not is_dir(module_root) then
+    return nil
+  end
+
+  return {
+    kind = "module",
+    name = parts[2],
+    root = module_root,
+    label = "Module " .. parts[2],
+  }
+end
+
+local function current_scope_info_from_context(ctx)
+  if not ctx then
+    return nil, "No UE context available"
+  end
+
+  local path = norm(vim.api.nvim_buf_get_name(0))
+  if path == "" then
+    path = cwd()
+  end
+
+  local scope = plugin_scope_from_root(ctx.project_root, path)
+    or project_module_scope(ctx.project_root, path)
+    or plugin_scope_from_root(join(ctx.engine_root, "Engine"), path)
+    or engine_module_scope(ctx.engine_root, path)
+
+  if scope then
+    return scope
+  end
+
+  return nil, "Current file is not inside a UE module or plugin"
+end
+
+local function current_scope_info(opts)
+  local ctx, err = resolve_context(opts)
+  if not ctx then
+    return nil, err
+  end
+
+  return current_scope_info_from_context(ctx)
+end
+
+local function index_output_paths(ctx)
+  local outputs = {}
+  local compile_commands = join(ctx.engine_root, "compile_commands.json")
+  if compile_commands ~= "" then
+    table.insert(outputs, compile_commands)
+  end
+  for _, name in ipairs({ "GTAGS", "GRTAGS", "GPATH" }) do
+    table.insert(outputs, join(ctx.paths.workspace_db, name))
+  end
+  return outputs
+end
+
+local function status_root_key(ctx)
+  if not ctx then
+    return ""
+  end
+  return table.concat({
+    norm(ctx.engine_root),
+    norm(ctx.project_root),
+  }, "\31")
+end
+
+local function clear_index_dirty(ctx)
+  local key = status_root_key(ctx)
+  if key ~= "" then
+    dirty_index_roots[key] = nil
+  end
+end
+
+local function mark_index_dirty(ctx)
+  local key = status_root_key(ctx)
+  if key ~= "" then
+    dirty_index_roots[key] = true
+  end
+end
+
+local function index_status_token(ctx)
+  if not ctx or not ctx.project_root then
+    return "UE?"
+  end
+
+  local outputs = index_output_paths(ctx)
+
+  for _, path in ipairs(outputs) do
+    if file_mtime(path) <= 0 then
+      return "IDX?"
+    end
+  end
+  if not db_ready(ctx.paths.workspace_db) then
+    return "IDX?"
+  end
+  if dirty_index_roots[status_root_key(ctx)] then
+    return "IDX!"
+  end
+  return "IDX"
+end
+
+local function short_scope_token(scope)
+  if not scope or not scope.name then
+    return "UE"
+  end
+  return (scope.kind == "plugin" and "P:" or "M:") .. scope.name
+end
+
+local function invalidate_status_cache()
+  status_cache = {}
+end
+
+local function refresh_statusline()
+  local ok, ue = pcall(require, "ue")
+  local status = ""
+  if ok and type(ue.statusline_status) == "function" then
+    local ok_status, value = pcall(ue.statusline_status)
+    if ok_status and type(value) == "string" then
+      status = value
+    end
+  end
+  if vim.g.ueindex_status == status then
+    return
+  end
+  vim.g.ueindex_status = status
+  pcall(vim.cmd, "redrawstatus")
+end
+
+local function set_build_status(value)
+  vim.g.ue_build_status = trim(value)
+  invalidate_status_cache()
+  refresh_statusline()
 end
 
 local function scan_relative_files(root, search_paths)
@@ -1155,8 +1563,40 @@ local function android_build_command(ctx)
   return direct_ubt_command(ctx.engine_root, build_args)
 end
 
+local function append_job_output(lines, pending, chunks)
+  pending = pending or ""
+  for _, chunk in ipairs(chunks or {}) do
+    if chunk and chunk ~= "" then
+      pending = pending .. chunk
+      while true do
+        local newline = pending:find("\n", 1, true)
+        if not newline then
+          break
+        end
+        local line = trim(strip_ansi(pending:sub(1, newline - 1)))
+        if line ~= "" then
+          table.insert(lines, line)
+        end
+        pending = pending:sub(newline + 1)
+      end
+    end
+  end
+  return pending
+end
+
+local function flush_job_output(lines, pending)
+  pending = trim(strip_ansi(pending))
+  if pending ~= "" then
+    table.insert(lines, pending)
+  end
+  return ""
+end
+
 local function open_terminal_command(cmd, opts)
   opts = opts or {}
+  local output_lines = {}
+  local stdout_pending = ""
+  local stderr_pending = ""
 
   local function prune_state()
     if build_term_win and not vim.api.nvim_win_is_valid(build_term_win) then
@@ -1235,13 +1675,34 @@ local function open_terminal_command(cmd, opts)
     pcall(vim.api.nvim_buf_delete, previous_buf, { force = true })
   end
 
+  if opts.quickfix_title then
+    set_build_status("B...")
+  end
+
   local active_jobid
   active_jobid = vim.fn.termopen(cmd, {
     cwd = opts.cwd,
+    on_stdout = function(_, data)
+      stdout_pending = append_job_output(output_lines, stdout_pending, data)
+    end,
+    on_stderr = function(_, data)
+      stderr_pending = append_job_output(output_lines, stderr_pending, data)
+    end,
     on_exit = function(_, code)
       vim.schedule(function()
+        stdout_pending = flush_job_output(output_lines, stdout_pending)
+        stderr_pending = flush_job_output(output_lines, stderr_pending)
         if build_term_jobid == active_jobid then
           build_term_jobid = nil
+        end
+        if code ~= 0 and opts.quickfix_title then
+          populate_quickfix_from_output(opts.quickfix_title, output_lines, {
+            root = opts.quickfix_root,
+            tail_limit = opts.tail_limit,
+          })
+        end
+        if opts.quickfix_title then
+          set_build_status(code == 0 and "BOK" or ("B" .. tostring(code)))
         end
         local level = code == 0 and vim.log.levels.INFO or vim.log.levels.ERROR
         vim.notify(("UE build finished with exit code %d"):format(code), level)
@@ -1250,6 +1711,9 @@ local function open_terminal_command(cmd, opts)
   })
   if active_jobid <= 0 then
     build_term_jobid = nil
+    if opts.quickfix_title then
+      set_build_status("BERR")
+    end
     vim.notify("Failed to start UE build terminal", vim.log.levels.ERROR)
     return
   end
@@ -1285,6 +1749,43 @@ function M.picker_options(opts)
     exclude = vim.deepcopy(PICKER_EXCLUDES),
     follow = true,
   }, nil
+end
+
+function M.current_scope_picker_options(opts)
+  local scope, err = current_scope_info(opts)
+  if not scope then
+    return nil, nil, err
+  end
+
+  return {
+    dirs = { scope.root },
+    exclude = vim.deepcopy(PICKER_EXCLUDES),
+    follow = true,
+  }, scope, nil
+end
+
+function M.statusline_status(opts)
+  local ctx = resolve_context(opts)
+  if not ctx then
+    return trim(vim.g.ue_build_status or "")
+  end
+
+  local parts = {}
+  local scope = current_scope_info_from_context(ctx)
+  parts[#parts + 1] = short_scope_token(scope)
+
+  if ctx.project_root then
+    parts[#parts + 1] = index_status_token(ctx)
+  else
+    parts[#parts + 1] = "UE?"
+  end
+
+  local build = trim(vim.g.ue_build_status or "")
+  if build ~= "" then
+    parts[#parts + 1] = build
+  end
+
+  return table.concat(parts, " ")
 end
 
 function M.ue_roots(opts)
@@ -1545,6 +2046,8 @@ local function set_project(input)
   end
 
   persist_project(engine_root, project_root, uproject)
+  invalidate_status_cache()
+  refresh_statusline()
   vim.notify("UE project set:\nEngine: " .. engine_root .. "\nProject: " .. project_root)
 end
 
@@ -1557,10 +2060,16 @@ local function export_compile_commands()
 
   local ok_compile, compile_result = generate_compile_commands(ctx)
   if not ok_compile then
+    invalidate_status_cache()
+    refresh_statusline()
+    populate_quickfix_from_output("UEExportCompileCommands", compile_result, { root = workspace_root(ctx) })
     vim.notify("UEExportCompileCommands failed: " .. compile_result, vim.log.levels.ERROR)
     return
   end
 
+  clear_index_dirty(ctx)
+  invalidate_status_cache()
+  refresh_statusline()
   vim.notify("compile_commands exported:\n" .. compile_result)
 end
 
@@ -1577,12 +2086,18 @@ local function build_android()
 
   local cmd, build_err = android_build_command(ctx)
   if not cmd then
+    set_build_status("BERR")
     vim.notify("UEBuildAndroid failed: " .. build_err, vim.log.levels.ERROR)
     return
   end
 
   cleanup_gradle_debug_artifacts(ctx)
-  open_terminal_command(cmd, { cwd = windows_host_cwd() })
+  open_terminal_command(cmd, {
+    cwd = windows_host_cwd(),
+    quickfix_title = "UEBuildAndroid",
+    quickfix_root = workspace_root(ctx),
+    tail_limit = 16,
+  })
 end
 
 local function prepare()
@@ -1604,12 +2119,18 @@ local function prepare()
 
   local project_rel, project_err = scan_relative_files(ctx.project_root, existing_relative_dirs(ctx.project_root, PROJECT_INDEX_DIRS))
   if not project_rel then
+    invalidate_status_cache()
+    refresh_statusline()
+    populate_quickfix_from_output("UEPrepare project scan", project_err, { root = ctx.project_root })
     vim.notify("UEPrepare project scan failed: " .. project_err, vim.log.levels.ERROR)
     return
   end
 
   local engine_rel, engine_err = scan_relative_files(ctx.engine_root, { "Engine/Source", "Engine/Plugins" })
   if not engine_rel then
+    invalidate_status_cache()
+    refresh_statusline()
+    populate_quickfix_from_output("UEPrepare engine scan", engine_err, { root = ctx.engine_root })
     vim.notify("UEPrepare engine scan failed: " .. engine_err, vim.log.levels.ERROR)
     return
   end
@@ -1646,16 +2167,25 @@ local function prepare()
 
   local ok_workspace, workspace_err = build_gtags_db(root, ctx.paths.workspace_list, ctx.paths.workspace_db, "workspace")
   if not ok_workspace then
+    invalidate_status_cache()
+    refresh_statusline()
+    populate_quickfix_from_output("UEPrepare GTAGS", workspace_err, { root = root })
     vim.notify("UEPrepare GTAGS failed: " .. workspace_err, vim.log.levels.ERROR)
     return
   end
 
   local ok_compile, compile_path = generate_compile_commands(ctx)
   if not ok_compile then
+    invalidate_status_cache()
+    refresh_statusline()
+    populate_quickfix_from_output("UEPrepare compile_commands", compile_path, { root = root })
     vim.notify("UEPrepare compile_commands failed: " .. compile_path, vim.log.levels.WARN)
     return
   end
 
+  clear_index_dirty(ctx)
+  invalidate_status_cache()
+  refresh_statusline()
   vim.notify(
     ("UEPrepare done:\nProject files: %d\nEngine files: %d\nGTAGS files: %d\ncompile_commands: %s\nCache: %s"):format(
       #project_cpp,
@@ -1679,6 +2209,8 @@ local function clear_cache()
   pcall(vim.fn.delete, ctx.paths.workspace_list)
   pcall(vim.fn.delete, join(ctx.paths.cache, "gtags"), "rf")
 
+  invalidate_status_cache()
+  refresh_statusline()
   vim.notify("UE cache cleared under: " .. ctx.paths.cache)
 end
 
@@ -1687,6 +2219,9 @@ function M.setup()
     return
   end
   setup_done = true
+
+  vim.g.ueindex_status = vim.g.ueindex_status or ""
+  vim.g.ue_build_status = vim.g.ue_build_status or ""
 
   vim.api.nvim_create_user_command("UEPaths", show_paths, {})
   vim.api.nvim_create_user_command("UESetProject", function(opts)
@@ -1698,6 +2233,35 @@ function M.setup()
   vim.api.nvim_create_user_command("UECheatsheet", show_cheatsheet, {})
   vim.api.nvim_create_user_command("UECheatsheetEdit", edit_cheatsheet, {})
   vim.api.nvim_create_user_command("UEClearCache", clear_cache, {})
+
+  local group = vim.api.nvim_create_augroup("ue_statusline", { clear = true })
+  vim.api.nvim_create_autocmd("BufEnter", {
+    group = group,
+    callback = function()
+      refresh_statusline()
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufWritePost", {
+    group = group,
+    pattern = { "*.Build.cs", "*.Target.cs", "*.uproject", "*.uplugin" },
+    callback = function()
+      local ctx = resolve_context()
+      if ctx and ctx.project_root then
+        mark_index_dirty(ctx)
+      end
+      invalidate_status_cache()
+      refresh_statusline()
+    end,
+  })
+  vim.api.nvim_create_autocmd("DirChanged", {
+    group = group,
+    callback = function()
+      invalidate_status_cache()
+      refresh_statusline()
+    end,
+  })
+
+  vim.schedule(refresh_statusline)
 end
 
 return M

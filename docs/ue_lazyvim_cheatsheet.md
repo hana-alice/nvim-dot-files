@@ -22,15 +22,17 @@
 - `<leader>,` Buffers
 - `<leader>/` Grep (root)
 - `<leader>:` Command history
-- `<leader>ff` Find Files (root)
-- `<leader>fF` Find Files (cwd)
-- `<leader>fg` Git files
+- `<leader>ff` Find Files in current UE project (fast path)
+- `<leader>fF` Find Files in UE workspace (engine + project)
+- `<leader>fg` Git files in current UE project
 - `<leader>fr` Recent files
 - `<leader>fR` Recent files (cwd)
 - `<leader>fp` Projects
 - `<leader>fb` Buffers
 - `<leader>fB` All buffers
 - `<leader>fc` Find config files
+- `<leader>uo` Find files in current UE module/plugin
+- `<leader>uO` Grep in current UE module/plugin
 
 ## Symbols / LSP / Code Nav
 - `gd` Definition
@@ -179,9 +181,13 @@
 - `<leader>uB` Run `UEPrepare`
 - `<leader>uc` Export `compile_commands.json`
 - `<leader>ub` Build Android Development with Windows `Build.bat`
+- `<leader>uo` Find files in current module/plugin
+- `<leader>uO` Grep in current module/plugin
 - `<leader>up` Show current UE paths
 - `:UECheatsheet` Open this cheatsheet
 - `:UECheatsheetEdit` Edit this markdown file
+- `UEBuildAndroid` / `UEPrepare` / `UEExportCompileCommands` 失败时会自动把错误塞进 quickfix
+- lualine 里的 UE 状态会显示类似 `M:Foo IDX BOK` / `P:Bar IDX! B6`
 
 ## Explorer / Discovery
 - `<leader>e` Explorer (root)

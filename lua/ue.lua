@@ -197,11 +197,12 @@ end
 
 local function parse_global_entries(root, lines)
   local entries = {}
+  root = norm(root)
   for _, line in ipairs(lines or {}) do
     local file, lnum, text = line:match("^(.-):(%d+):(.*)$")
     if file and lnum then
       file = norm(file)
-      if file:sub(1, 1) ~= "/" then
+      if file:sub(1, 1) ~= "/" and not file:match("^[A-Za-z]:/") and not file:match("^//") then
         file = join(root, file)
       end
       table.insert(entries, {
@@ -270,7 +271,12 @@ end
 local function run_lines(cmd, opts)
   opts = opts or {}
   if vim.system then
-    local result = vim.system(cmd, { text = true, cwd = opts.cwd }):wait()
+    local system_opts = { text = true }
+    local cwd_path = norm(trim(opts.cwd))
+    if cwd_path ~= "" and is_dir(cwd_path) then
+      system_opts.cwd = cwd_path
+    end
+    local result = vim.system(cmd, system_opts):wait()
     local output = (result.stdout or "") .. (result.stderr or "")
     local lines = {}
     for line in output:gmatch("[^\r\n]+") do
@@ -634,6 +640,47 @@ end
 local function clean_db_dir(dir)
   pcall(vim.fn.delete, dir, "rf")
   ensure_dir(dir)
+end
+
+local function glob_paths(pattern)
+  local matches = vim.fn.glob(pattern, false, true)
+  if type(matches) ~= "table" then
+    return {}
+  end
+  local paths = {}
+  local seen = {}
+  for _, match in ipairs(matches) do
+    local path = norm(match)
+    if path ~= "" and not seen[path] then
+      seen[path] = true
+      table.insert(paths, path)
+    end
+  end
+  return paths
+end
+
+local function cleanup_gradle_debug_artifacts(ctx)
+  if not ctx or not ctx.project_root or ctx.project_root == "" then
+    return
+  end
+
+  local patterns = {
+    join(ctx.project_root, "Intermediate", "Android", "*", "gradle", "app", "build", "outputs", "apk", "app-debug.apk"),
+    join(ctx.project_root, "Intermediate", "Android", "*", "gradle", "app", "build", "outputs", "apk", "debug", "app-debug.apk"),
+    join(ctx.project_root, "Intermediate", "Android", "*", "gradle", "app", "build", "intermediates", "apk", "app-debug.apk"),
+    join(ctx.project_root, "Intermediate", "Android", "*", "gradle", "app", "build", "intermediates", "apk", "debug", "app-debug.apk"),
+    join(ctx.project_root, "Intermediate", "Android", "*", "gradle", "app", "build", "intermediates", "incremental", "packageDebug"),
+    join(ctx.project_root, "Intermediate", "Android", "*", "gradle", "app", "build", "intermediates", "incremental", "debug", "packageDebug"),
+  }
+
+  for _, pattern in ipairs(patterns) do
+    for _, path in ipairs(glob_paths(pattern)) do
+      local ok = pcall(vim.fn.delete, path, "rf")
+      if not ok then
+        vim.notify("Failed to clean stale Gradle artifact: " .. path, vim.log.levels.WARN)
+      end
+    end
+  end
 end
 
 local function db_ready(db_dir)
@@ -1213,7 +1260,11 @@ end
 
 local function workspace_root(ctx)
   if ctx.project_root and ctx.project_root ~= "" then
-    return common_ancestor({ ctx.engine_root, ctx.project_root })
+    local root = common_ancestor({ ctx.engine_root, ctx.project_root })
+    if root ~= "" then
+      return root
+    end
+    return ctx.project_root
   end
   return ctx.engine_root
 end
@@ -1530,6 +1581,7 @@ local function build_android()
     return
   end
 
+  cleanup_gradle_debug_artifacts(ctx)
   open_terminal_command(cmd, { cwd = windows_host_cwd() })
 end
 

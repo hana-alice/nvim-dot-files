@@ -11,3 +11,5 @@ map("n", "<leader>uB", "<cmd>UEPrepare<cr>", { desc = "UE: Prepare symbols + com
 map("n", "<leader>uc", "<cmd>UEExportCompileCommands<cr>", { desc = "UE: Export compile_commands" })
 map("n", "<leader>up", "<cmd>UEPaths<cr>", { desc = "UE: Show paths" })
 map("n", "<leader>uP", "<cmd>UESetProject<cr>", { desc = "UE: Set project" })
+map("n", "<leader>ut", "<cmd>ThemePicker<cr>", { desc = "UI: Theme picker" })
+map("n", "<leader>?", "<cmd>UECheatsheet<cr>", { desc = "UE: Cheatsheet" })

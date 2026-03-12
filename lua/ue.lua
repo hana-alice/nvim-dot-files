@@ -1,6 +1,11 @@
 local M = {}
 
 local setup_done = false
+local cheatsheet_buf = nil
+local cheatsheet_win = nil
+local build_term_buf = nil
+local build_term_win = nil
+local build_term_jobid = nil
 
 local function trim(value)
   return vim.trim(tostring(value or ""))
@@ -24,6 +29,29 @@ local function cwd()
     return norm(uv_cwd)
   end
   return norm(vim.fn.getcwd())
+end
+
+local function is_native_windows()
+  return vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1
+end
+
+local function focus_window(win)
+  if not win or not vim.api.nvim_win_is_valid(win) then
+    return false
+  end
+  return pcall(vim.api.nvim_set_current_win, win)
+end
+
+local function startinsert_in_window(win)
+  vim.schedule(function()
+    if not win or not vim.api.nvim_win_is_valid(win) then
+      return
+    end
+    if vim.api.nvim_get_current_win() ~= win then
+      return
+    end
+    pcall(vim.cmd, "startinsert")
+  end)
 end
 
 local function join(...)
@@ -121,7 +149,7 @@ local function relative_to(root, path)
     return path
   end
   if root == "/" then
-    return path:gsub("^/+", "")
+    return path
   end
   if path == root then
     return "."
@@ -493,6 +521,88 @@ local function filter_cpp(paths)
   return filtered
 end
 
+local PROJECT_INDEX_DIRS = {
+  "Source",
+  "Config",
+  "Plugins",
+  "CSharpScript",
+  "Script",
+  "TypeScript",
+  "typescript",
+}
+
+local GTAGS_EXCLUDE_SUBSTRINGS = {
+  "Engine/Source/ThirdParty/MCPP/mcpp-2.7.2/",
+}
+
+local ENGINE_PICKER_DIRS = {
+  "Engine/Source",
+  "Engine/Plugins",
+  "Engine/Shaders",
+  "Engine/Config",
+}
+
+local PICKER_EXCLUDES = {
+  "**/.git/**",
+  "**/.vs/**",
+  "**/Binaries/**",
+  "**/Content/**",
+  "**/DerivedDataCache/**",
+  "**/Intermediate/**",
+  "**/Saved/**",
+}
+
+local function existing_relative_dirs(root, search_paths)
+  local dirs = {}
+  for _, search_path in ipairs(search_paths or {}) do
+    if is_dir(join(root, search_path)) then
+      table.insert(dirs, search_path)
+    end
+  end
+  return dirs
+end
+
+local function filter_gtags_paths(paths)
+  local filtered = {}
+  for _, path in ipairs(paths or {}) do
+    local normalized = norm(path)
+    local excluded = false
+    for _, pattern in ipairs(GTAGS_EXCLUDE_SUBSTRINGS) do
+      if normalized:find(pattern, 1, true) then
+        excluded = true
+        break
+      end
+    end
+    if not excluded then
+      table.insert(filtered, normalized)
+    end
+  end
+  return filtered
+end
+
+local function picker_search_dirs(ctx)
+  local dirs = {}
+  local seen = {}
+
+  local function add(path)
+    path = norm(path)
+    if path ~= "" and is_dir(path) and not seen[path] then
+      seen[path] = true
+      table.insert(dirs, path)
+    end
+  end
+
+  for _, relative in ipairs(existing_relative_dirs(ctx.engine_root, ENGINE_PICKER_DIRS)) do
+    add(join(ctx.engine_root, relative))
+  end
+
+  if ctx.project_root and ctx.project_root ~= "" then
+    add(ctx.project_root)
+  end
+
+  return dirs
+end
+
 local function scan_relative_files(root, search_paths)
   local fd = first_executable({ "fd", "fdfind" })
   if not fd then
@@ -527,7 +637,13 @@ local function clean_db_dir(dir)
 end
 
 local function db_ready(db_dir)
-  return is_file(join(db_dir, "GTAGS")) and is_file(join(db_dir, "GRTAGS")) and is_file(join(db_dir, "GPATH"))
+  for _, name in ipairs({ "GTAGS", "GRTAGS", "GPATH" }) do
+    local path = join(db_dir, name)
+    if not is_file(path) or vim.fn.getfsize(path) <= 0 then
+      return false
+    end
+  end
+  return true
 end
 
 local function build_gtags_db(root, filelist, db_dir, label)
@@ -550,6 +666,10 @@ local function build_gtags_db(root, filelist, db_dir, label)
   end
 
   if not db_ready(db_dir) then
+    local output = table.concat(lines or {}, "\n")
+    if output ~= "" then
+      return false, output
+    end
     return false, "GTAGS database not generated: " .. db_dir
   end
 
@@ -673,6 +793,43 @@ local function build_bat_path(engine_root)
   return join(engine_root, "Engine", "Build", "BatchFiles", "Build.bat")
 end
 
+local function ubt_exe_path(engine_root)
+  if is_windows_path(engine_root) then
+    return engine_root:gsub("/", "\\") .. "\\Engine\\Binaries\\DotNET\\UnrealBuildTool.exe"
+  end
+  return join(engine_root, "Engine", "Binaries", "DotNET", "UnrealBuildTool.exe")
+end
+
+local function ensure_executable(path)
+  if is_windows_path(path) then
+    return true
+  end
+  if vim.fn.executable(path) == 1 then
+    return true
+  end
+  local code = select(1, run_lines({ "chmod", "+x", path }))
+  if code == 0 and vim.fn.executable(path) == 1 then
+    return true
+  end
+  return false, "Failed to mark executable: " .. path
+end
+
+local function direct_ubt_command(engine_root, args)
+  local exe = ubt_exe_path(engine_root)
+  if not is_file(exe) then
+    return nil, "UnrealBuildTool.exe not found under engine root: " .. exe
+  end
+
+  local ok_exec, exec_err = ensure_executable(exe)
+  if not ok_exec then
+    return nil, exec_err
+  end
+
+  local cmd = { exe }
+  vim.list_extend(cmd, args or {})
+  return cmd
+end
+
 local function build_bat_windows_command(engine_root, args)
   local engine_root_win = to_windows_path(engine_root)
   if not engine_root_win then
@@ -684,7 +841,15 @@ local function build_bat_windows_command(engine_root, args)
     return nil, "Failed to convert Build.bat path to Windows path: " .. build_bat_path(engine_root)
   end
 
-  local function cmd_token(value)
+  local function direct_cmd_token(value)
+    value = tostring(value or "")
+    if value:find("%s") then
+      return cmd_quote(value)
+    end
+    return value
+  end
+
+  local function shell_cmd_token(value)
     value = tostring(value or "")
     if value:find("%s") then
       return '\\"' .. value:gsub('"', '\\"') .. '\\"'
@@ -692,17 +857,30 @@ local function build_bat_windows_command(engine_root, args)
     return value
   end
 
-  local parts = {
-    "pushd " .. cmd_token(engine_root_win),
-    "&&",
-    "call " .. cmd_token(build_bat_win),
+  local direct_parts = {
+    "call " .. direct_cmd_token(build_bat_win),
   }
 
   for _, arg in ipairs(args or {}) do
-    table.insert(parts, cmd_token(arg))
+    table.insert(direct_parts, direct_cmd_token(arg))
   end
 
-  local shell = first_executable({ "zsh", "bash", "sh" }) or "sh"
+  if is_native_windows() then
+    return { "cmd.exe", "/d", "/c", table.concat(direct_parts, " ") }
+  end
+
+  local parts = {
+    "call " .. shell_cmd_token(build_bat_win),
+  }
+
+  for _, arg in ipairs(args or {}) do
+    table.insert(parts, shell_cmd_token(arg))
+  end
+
+  local shell = first_executable({ "zsh", "bash", "sh" })
+  if not shell then
+    return { "cmd.exe", "/d", "/c", table.concat(direct_parts, " ") }
+  end
   local shell_name = vim.fs.basename(shell)
   local shell_flag = shell_name == "sh" and "-c" or "-lc"
   local shell_cmd = ('cd %s && cmd.exe /d /c "%s"'):format(
@@ -741,46 +919,10 @@ local function compile_commands_targets(ctx)
   }
 end
 
-local function infer_windows_engine_root_from_compile_commands(path)
-  local content = read_all(path)
-  if not content or content == "" then
-    return nil
-  end
-
-  local directory = content:match('"directory"%s*:%s*"([A-Za-z]:[^"]+)"')
-  if directory then
-    directory = directory:gsub("/", "\\")
-    local lower = directory:lower()
-    local index = lower:find("\\engine\\source", 1, true)
-    if index then
-      return directory:sub(1, index - 1)
-    end
-  end
-
-  local file = content:match('"file"%s*:%s*"([A-Za-z]:[^"]+)"')
-  if file then
-    file = file:gsub("/", "\\")
-    local lower = file:lower()
-    local index = lower:find("\\engine\\", 1, true)
-    if index then
-      return file:sub(1, index - 1)
-    end
-  end
-
-  return nil
-end
-
 local function windows_engine_root(ctx)
   local override = trim(vim.env.UE_WINDOWS_ENGINE_ROOT)
   if override ~= "" then
     return to_windows_path(override)
-  end
-
-  if ctx.project_root and ctx.project_root ~= "" then
-    local inferred = infer_windows_engine_root_from_compile_commands(join(ctx.project_root, "compile_commands.json"))
-    if inferred then
-      return inferred
-    end
   end
 
   return to_windows_path(ctx.engine_root)
@@ -871,16 +1013,6 @@ local function generate_compile_commands(ctx)
     return false, "No project configured for engine root. Run :UESetProject [path]"
   end
 
-  local engine_root_win = windows_engine_root(ctx)
-  if not engine_root_win or engine_root_win == "" then
-    return false, "Failed to resolve Windows engine root for compile_commands export"
-  end
-
-  local build_bat_file = build_bat_path(engine_root_win)
-  if not is_windows_path(build_bat_file) and not is_file(build_bat_file) then
-    return false, "Build.bat not found under engine root: " .. build_bat_file
-  end
-
   local uproject = ctx.uproject or find_uproject_in_dir(ctx.project_root)
   if not uproject then
     return false, "No .uproject found in project root: " .. ctx.project_root
@@ -891,15 +1023,38 @@ local function generate_compile_commands(ctx)
     return false, "Failed to convert .uproject path to Windows path for Build.bat"
   end
 
-  local cmd, cmd_err = build_bat_windows_command(engine_root_win, {
-    "-Mode=GenerateClangDatabase",
-    detect_target_name(ctx.project_root, uproject),
-    target_platform(ctx.engine_root, { "Build.bat" }),
-    target_configuration(),
-    "-Project=" .. project_arg,
-    "-Game",
-    "-Engine",
-  })
+  local cmd, cmd_err
+  if is_windows_path(ctx.engine_root) then
+    local engine_root_win = windows_engine_root(ctx)
+    if not engine_root_win or engine_root_win == "" then
+      return false, "Failed to resolve Windows engine root for compile_commands export"
+    end
+
+    local build_bat_file = build_bat_path(engine_root_win)
+    if not is_windows_path(build_bat_file) and not is_file(build_bat_file) then
+      return false, "Build.bat not found under engine root: " .. build_bat_file
+    end
+
+    cmd, cmd_err = build_bat_windows_command(engine_root_win, {
+      "-Mode=GenerateClangDatabase",
+      detect_target_name(ctx.project_root, uproject),
+      target_platform(ctx.engine_root, { "Build.bat" }),
+      target_configuration(),
+      "-Project=" .. project_arg,
+      "-Game",
+      "-Engine",
+    })
+  else
+    cmd, cmd_err = direct_ubt_command(ctx.engine_root, {
+      "-Mode=GenerateClangDatabase",
+      detect_target_name(ctx.project_root, uproject),
+      target_platform(ctx.engine_root, { ubt_exe_path(ctx.engine_root) }),
+      target_configuration(),
+      "-Project=" .. project_arg,
+      "-Game",
+      "-Engine",
+    })
+  end
   if not cmd then
     return false, cmd_err
   end
@@ -922,49 +1077,138 @@ local function android_build_command(ctx)
     return nil, "No .uproject found in project root: " .. ctx.project_root
   end
 
-  local engine_root_win = windows_engine_root(ctx)
-  if not engine_root_win or engine_root_win == "" then
-    return nil, "Failed to resolve Windows engine root for build command"
-  end
-
-  local build_bat_file = build_bat_path(engine_root_win)
-  if not is_windows_path(build_bat_file) and not is_file(build_bat_file) then
-    return nil, "Build.bat not found under engine root: " .. build_bat_file
-  end
-
   local uproject_win = to_windows_path(uproject)
   if not uproject_win then
     return nil, "Failed to convert UE build paths to Windows paths"
   end
 
-  return build_bat_windows_command(engine_root_win, {
+  local build_args = {
     build_target_name(ctx.project_root, uproject),
     "Android",
     "Development",
     "-Project=" .. uproject_win,
     "-WaitMutex",
     "-FromMsBuild",
-  })
+  }
+
+  if is_windows_path(ctx.engine_root) then
+    local engine_root_win = windows_engine_root(ctx)
+    if not engine_root_win or engine_root_win == "" then
+      return nil, "Failed to resolve Windows engine root for build command"
+    end
+
+    local build_bat_file = build_bat_path(engine_root_win)
+    if not is_windows_path(build_bat_file) and not is_file(build_bat_file) then
+      return nil, "Build.bat not found under engine root: " .. build_bat_file
+    end
+
+    return build_bat_windows_command(engine_root_win, build_args)
+  end
+
+  return direct_ubt_command(ctx.engine_root, build_args)
 end
 
 local function open_terminal_command(cmd, opts)
   opts = opts or {}
-  vim.cmd(("botright %dnew"):format(opts.height or 14))
-  local buf = vim.api.nvim_get_current_buf()
+
+  local function prune_state()
+    if build_term_win and not vim.api.nvim_win_is_valid(build_term_win) then
+      build_term_win = nil
+    end
+    if build_term_buf and not vim.api.nvim_buf_is_valid(build_term_buf) then
+      build_term_buf = nil
+    end
+  end
+
+  local function track_state(buf, win)
+    build_term_buf = buf
+    build_term_win = win
+
+    vim.api.nvim_create_autocmd("BufWipeout", {
+      buffer = buf,
+      once = true,
+      callback = function(args)
+        if build_term_buf == args.buf then
+          build_term_buf = nil
+        end
+      end,
+    })
+
+    vim.api.nvim_create_autocmd("WinClosed", {
+      once = true,
+      pattern = tostring(win),
+      callback = function()
+        if build_term_win == win then
+          build_term_win = nil
+        end
+      end,
+    })
+  end
+
+  local function job_running()
+    if not build_term_jobid then
+      return false
+    end
+    local ok, result = pcall(vim.fn.jobwait, { build_term_jobid }, 0)
+    return ok and result and result[1] == -1
+  end
+
+  local function ensure_window()
+    prune_state()
+
+    if build_term_win and focus_window(build_term_win) then
+      return build_term_win
+    end
+
+    vim.cmd(("botright %dnew"):format(opts.height or 14))
+    build_term_win = vim.api.nvim_get_current_win()
+    return build_term_win
+  end
+
+  if job_running() then
+    local running_win = ensure_window()
+    if build_term_buf and vim.api.nvim_buf_is_valid(build_term_buf) then
+      vim.api.nvim_win_set_buf(running_win, build_term_buf)
+    end
+    startinsert_in_window(running_win)
+    vim.notify("UE build is already running", vim.log.levels.WARN)
+    return
+  end
+
+  local win = ensure_window()
+  local previous_buf = build_term_buf
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_win_set_buf(win, buf)
+  track_state(buf, win)
   vim.bo[buf].bufhidden = "wipe"
   vim.bo[buf].buflisted = false
   vim.bo[buf].swapfile = false
 
-  vim.fn.termopen(cmd, {
+  if previous_buf and previous_buf ~= buf and vim.api.nvim_buf_is_valid(previous_buf) then
+    pcall(vim.api.nvim_buf_delete, previous_buf, { force = true })
+  end
+
+  local active_jobid
+  active_jobid = vim.fn.termopen(cmd, {
     cwd = opts.cwd,
     on_exit = function(_, code)
       vim.schedule(function()
+        if build_term_jobid == active_jobid then
+          build_term_jobid = nil
+        end
         local level = code == 0 and vim.log.levels.INFO or vim.log.levels.ERROR
         vim.notify(("UE build finished with exit code %d"):format(code), level)
       end)
     end,
   })
-  vim.cmd("startinsert")
+  if active_jobid <= 0 then
+    build_term_jobid = nil
+    vim.notify("Failed to start UE build terminal", vim.log.levels.ERROR)
+    return
+  end
+
+  build_term_jobid = active_jobid
+  startinsert_in_window(win)
 end
 
 local function workspace_root(ctx)
@@ -972,6 +1216,24 @@ local function workspace_root(ctx)
     return common_ancestor({ ctx.engine_root, ctx.project_root })
   end
   return ctx.engine_root
+end
+
+function M.picker_options(opts)
+  local ctx, err = resolve_context(opts)
+  if not ctx then
+    return nil, err
+  end
+
+  local dirs = picker_search_dirs(ctx)
+  if #dirs == 0 then
+    return nil, "No UE search directories found"
+  end
+
+  return {
+    dirs = dirs,
+    exclude = vim.deepcopy(PICKER_EXCLUDES),
+    follow = true,
+  }, nil
 end
 
 function M.ue_roots(opts)
@@ -1081,6 +1343,136 @@ local function show_paths()
   vim.notify(table.concat(lines, "\n"))
 end
 
+local function close_cheatsheet()
+  if cheatsheet_win and vim.api.nvim_win_is_valid(cheatsheet_win) then
+    vim.api.nvim_win_close(cheatsheet_win, true)
+  end
+  cheatsheet_win = nil
+  cheatsheet_buf = nil
+end
+
+local function cheatsheet_path()
+  return join(vim.fn.stdpath("config"), "docs", "ue_lazyvim_cheatsheet.md")
+end
+
+local function read_cheatsheet_lines()
+  local path = cheatsheet_path()
+  if is_file(path) then
+    local lines = vim.fn.readfile(path)
+    if type(lines) == "table" and #lines > 0 then
+      return lines
+    end
+  end
+
+  return {
+    "# UE + LazyVim Cheatsheet",
+    "",
+    "Cheatsheet file missing.",
+    "",
+    "- Expected path: `" .. path .. "`",
+    "- Run `:UECheatsheetEdit` to create or edit it",
+  }
+end
+
+local function max_line_width(lines)
+  local width = 0
+  for _, line in ipairs(lines or {}) do
+    width = math.max(width, vim.fn.strdisplaywidth(line))
+  end
+  return width
+end
+
+local function open_markdown_float(lines, title)
+  if cheatsheet_win and vim.api.nvim_win_is_valid(cheatsheet_win) and cheatsheet_buf and vim.api.nvim_buf_is_valid(cheatsheet_buf) then
+    vim.bo[cheatsheet_buf].modifiable = true
+    vim.api.nvim_buf_set_lines(cheatsheet_buf, 0, -1, false, lines)
+    vim.bo[cheatsheet_buf].modifiable = false
+    vim.bo[cheatsheet_buf].readonly = true
+    vim.api.nvim_set_current_win(cheatsheet_win)
+    return
+  end
+
+  local width = math.min(
+    math.max(80, math.min(120, max_line_width(lines) + 4)),
+    math.max(vim.o.columns - 6, 60)
+  )
+  local height = math.min(math.max(#lines + 2, 18), math.max(vim.o.lines - 6, 10))
+  local row = math.floor((vim.o.lines - height) / 2) - 1
+  local col = math.floor((vim.o.columns - width) / 2)
+
+  cheatsheet_buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[cheatsheet_buf].buftype = "nofile"
+  vim.bo[cheatsheet_buf].bufhidden = "wipe"
+  vim.bo[cheatsheet_buf].swapfile = false
+  vim.bo[cheatsheet_buf].modifiable = true
+  vim.bo[cheatsheet_buf].filetype = "markdown"
+
+  vim.api.nvim_buf_set_lines(cheatsheet_buf, 0, -1, false, lines)
+  vim.bo[cheatsheet_buf].modifiable = false
+  vim.bo[cheatsheet_buf].readonly = true
+
+  cheatsheet_win = vim.api.nvim_open_win(cheatsheet_buf, true, {
+    relative = "editor",
+    row = math.max(row, 1),
+    col = math.max(col, 1),
+    width = width,
+    height = height,
+    border = "rounded",
+    title = title,
+    title_pos = "center",
+    style = "minimal",
+  })
+
+  vim.wo[cheatsheet_win].wrap = true
+  vim.wo[cheatsheet_win].linebreak = true
+  vim.wo[cheatsheet_win].cursorline = true
+  vim.wo[cheatsheet_win].number = false
+  vim.wo[cheatsheet_win].relativenumber = false
+  vim.wo[cheatsheet_win].signcolumn = "no"
+  vim.wo[cheatsheet_win].foldenable = false
+  vim.wo[cheatsheet_win].conceallevel = 0
+
+  local close_keys = { "q", "<Esc>" }
+  for _, lhs in ipairs(close_keys) do
+    vim.keymap.set("n", lhs, close_cheatsheet, { buffer = cheatsheet_buf, silent = true, nowait = true })
+  end
+
+  vim.api.nvim_create_autocmd("WinClosed", {
+    once = true,
+    callback = function(args)
+      if tonumber(args.match) == cheatsheet_win then
+        cheatsheet_win = nil
+        cheatsheet_buf = nil
+      end
+    end,
+  })
+end
+
+local function edit_cheatsheet()
+  local path = cheatsheet_path()
+  ensure_dir(dirname(path))
+  vim.cmd("edit " .. vim.fn.fnameescape(path))
+end
+
+local function show_cheatsheet()
+  local ctx = resolve_context()
+  local lines = vim.deepcopy(read_cheatsheet_lines())
+
+  if ctx then
+    table.insert(lines, "")
+    table.insert(lines, "## Current Context")
+    table.insert(lines, "- Engine: `" .. ctx.engine_root .. "`")
+    table.insert(lines, "- Project: `" .. (ctx.project_root or "<unset>") .. "`")
+  end
+
+  table.insert(lines, "")
+  table.insert(lines, "- Cheatsheet file: `" .. cheatsheet_path() .. "`")
+  table.insert(lines, "- `:UECheatsheetEdit` opens the markdown file")
+  table.insert(lines, "`q` / `<Esc>` close, `j/k` `Ctrl-f/b` `gg/G` scroll")
+
+  open_markdown_float(lines, " UE + LazyVim Cheatsheet ")
+end
+
 local function set_project(input)
   local engine_root = current_engine_root()
   if not engine_root then
@@ -1158,7 +1550,7 @@ local function prepare()
 
   ensure_dir(ctx.paths.cache)
 
-  local project_rel, project_err = scan_relative_files(ctx.project_root, { "Source", "Plugins" })
+  local project_rel, project_err = scan_relative_files(ctx.project_root, existing_relative_dirs(ctx.project_root, PROJECT_INDEX_DIRS))
   if not project_rel then
     vim.notify("UEPrepare project scan failed: " .. project_err, vim.log.levels.ERROR)
     return
@@ -1170,8 +1562,8 @@ local function prepare()
     return
   end
 
-  local project_cpp = filter_cpp(project_rel)
-  local engine_cpp = filter_cpp(engine_rel)
+  local project_cpp = filter_gtags_paths(filter_cpp(project_rel))
+  local engine_cpp = filter_gtags_paths(filter_cpp(engine_rel))
   local workspace_cpp = {}
   local workspace_seen = {}
   local root = workspace_root(ctx)
@@ -1251,6 +1643,8 @@ function M.setup()
   vim.api.nvim_create_user_command("UEExportCompileCommands", export_compile_commands, {})
   vim.api.nvim_create_user_command("UEBuildAndroid", build_android, {})
   vim.api.nvim_create_user_command("UEPrepare", prepare, {})
+  vim.api.nvim_create_user_command("UECheatsheet", show_cheatsheet, {})
+  vim.api.nvim_create_user_command("UECheatsheetEdit", edit_cheatsheet, {})
   vim.api.nvim_create_user_command("UEClearCache", clear_cache, {})
 end
 

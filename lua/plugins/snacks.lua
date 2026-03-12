@@ -1,6 +1,50 @@
+local function ue_picker_opts()
+  local ok, ue = pcall(require, "ue")
+  if not ok then
+    return nil
+  end
+  local opts = ue.picker_options()
+  if type(opts) ~= "table" or #opts.dirs == 0 then
+    return nil
+  end
+  return opts
+end
+
+local function ue_files()
+  local snacks = require("snacks")
+  local opts = ue_picker_opts()
+  if opts then
+    return snacks.picker.files(opts)
+  end
+  return snacks.picker.files()
+end
+
+local function ue_git_files()
+  local snacks = require("snacks")
+  local opts = ue_picker_opts()
+  if opts then
+    return snacks.picker.files(opts)
+  end
+  return snacks.picker.git_files()
+end
+
+local function ue_grep()
+  local snacks = require("snacks")
+  local opts = ue_picker_opts()
+  if opts then
+    return snacks.picker.grep(opts)
+  end
+  return snacks.picker.grep()
+end
+
 return {
   {
     "folke/snacks.nvim",
+    keys = {
+      { "<leader>ff", ue_files, desc = "Find Files" },
+      { "<leader>fg", ue_git_files, desc = "Find Git Files" },
+      { "<leader>sg", ue_grep, desc = "Grep" },
+    },
     opts = function(_, opts)
       opts = opts or {}
       opts.picker = opts.picker or {}

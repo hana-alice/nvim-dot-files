@@ -100,6 +100,7 @@
 ## Buffers / Windows / Tabs
 - `<S-h>` / `<S-l>` Prev / next buffer
 - `<leader>bb` Switch to other buffer
+- `<leader>bn` New empty buffer
 - `<leader>bd` Delete buffer
 - `<leader>bo` Delete other buffers
 - `<leader>bD` Delete buffer and window

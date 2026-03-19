@@ -184,6 +184,7 @@
 - `<leader>uB` Run `UEPrepare`
 - `<leader>uc` Export `compile_commands.json`
 - `<leader>ub` Build Android Development with Windows `Build.bat`
+- `<leader>ui` Install built APK to connected Android device
 - `<leader>uo` Find files in current module/plugin
 - `<leader>uO` Grep in current module/plugin
 - `<leader>up` Show current UE paths
@@ -194,8 +195,9 @@
 
 ## Android DAP (Debug)
 - `<leader>da` Attach to Android process (auto ASLR fix + resume)
+- `<leader>dL` Launch app in debug mode (force-stop + start -D + auto-attach)
 - `:UESetAndroidPackage <pkg>` Set the Android package used by `UEAndroidDAPAttach`
-- `F9` Toggle hardware breakpoint on current line (via LLDB evaluate)
+- `F9` Toggle hardware breakpoint (works with or without DAP session; pending BPs apply on attach)
 - `F5` Continue
 - `F6` Pause
 - `F10` Step Over
@@ -206,6 +208,7 @@
 - `<leader>dR` Reset layout (re-open DAP UI if debugging, otherwise `:only`)
 - `:qa` auto-cleanup: disconnect DAP, kill CodeLLDB, kill remote lldb-server
 - Only hardware breakpoints (`-H`) work; software BPs cannot write to remote Android memory
+- F9 can be used **before** attaching — breakpoints are saved as pending and auto-applied after ASLR fix on attach/launch
 - Globals/Static scopes are filtered out to prevent LLDB from enumerating millions of symbols
 
 ## Explorer / Discovery

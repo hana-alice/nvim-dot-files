@@ -58,3 +58,5 @@ map("n", "<leader>do", "<cmd>UEAndroidDAPStepOut<cr>", { desc = "DAP: Step Out" 
 map("n", "<leader>du", "<cmd>UEAndroidDAPToggleUI<cr>", { desc = "DAP: Toggle UI" })
 map("n", "<leader>dr", "<cmd>UEAndroidDAPREPL<cr>", { desc = "DAP: Toggle REPL" })
 map("n", "<leader>dR", "<cmd>UEResetLayout<cr>", { desc = "Reset Layout (DAP or default)" })
+map("n", "<leader>dL", "<cmd>UEAndroidDAPLaunch<cr>", { desc = "DAP: Android Launch Debug" })
+map("n", "<leader>ui", "<cmd>UEInstallAndroid<cr>", { desc = "UE: Install APK to device" })

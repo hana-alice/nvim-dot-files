@@ -2207,6 +2207,92 @@ local function build_android()
   })
 end
 
+-- Find the newest APK in project build outputs
+local function find_apk(ctx)
+  if not ctx or not ctx.project_root or ctx.project_root == "" then
+    return nil
+  end
+  local pr = ctx.project_root
+  local patterns = {
+    -- UE5 Gradle output (most common)
+    join(pr, "Binaries", "Android", "*.apk"),
+    join(pr, "Intermediate", "Android", "*", "gradle", "app", "build", "outputs", "apk", "*.apk"),
+    join(pr, "Intermediate", "Android", "*", "gradle", "app", "build", "outputs", "apk", "debug", "*.apk"),
+    join(pr, "Intermediate", "Android", "*", "gradle", "app", "build", "outputs", "apk", "release", "*.apk"),
+  }
+  local best = nil
+  local best_mtime = 0
+  for _, pattern in ipairs(patterns) do
+    for _, path in ipairs(glob_paths(pattern)) do
+      local mtime = vim.fn.getftime(path)
+      if mtime > best_mtime then
+        best = path
+        best_mtime = mtime
+      end
+    end
+  end
+  return best
+end
+
+local function install_android()
+  local ctx, err = resolve_context()
+  if not ctx then
+    vim.notify(err, vim.log.levels.WARN)
+    return
+  end
+  if not ctx.project_root then
+    vim.notify("No project configured. Run :UESetProject [path]", vim.log.levels.WARN)
+    return
+  end
+
+  local apk = find_apk(ctx)
+  if not apk then
+    vim.notify("No APK found in project build outputs", vim.log.levels.ERROR)
+    return
+  end
+
+  local apk_win = to_windows_path(apk) or apk
+  local mtime = vim.fn.getftime(apk)
+  local age = os.time() - mtime
+  local age_str
+  if age < 60 then
+    age_str = age .. "s ago"
+  elseif age < 3600 then
+    age_str = math.floor(age / 60) .. "m ago"
+  else
+    age_str = math.floor(age / 3600) .. "h ago"
+  end
+
+  vim.notify(("Installing APK (built %s):\n%s"):format(age_str, apk_win))
+  vim.fn.jobstart({ "adb", "install", "-r", apk_win }, {
+    stdout_buffered = true,
+    stderr_buffered = true,
+    on_stdout = function(_, data)
+      for _, line in ipairs(data) do
+        if line ~= "" then
+          vim.schedule(function() vim.notify("[install] " .. line) end)
+        end
+      end
+    end,
+    on_stderr = function(_, data)
+      for _, line in ipairs(data) do
+        if line ~= "" then
+          vim.schedule(function() vim.notify("[install err] " .. line, vim.log.levels.WARN) end)
+        end
+      end
+    end,
+    on_exit = function(_, code)
+      vim.schedule(function()
+        if code == 0 then
+          vim.notify("APK installed successfully")
+        else
+          vim.notify("APK install failed (exit " .. code .. ")", vim.log.levels.ERROR)
+        end
+      end)
+    end,
+  })
+end
+
 local function prepare()
   local ctx, err = resolve_context()
   if not ctx then
@@ -2595,56 +2681,267 @@ function M.android_dap_attach()
     attach_state.source_map[pr] = pr
   end
 
-  vim.notify("Starting Android DAP preflight...")
+  local progress = { "DAP Attach" }
+  local notify_id = "ue_dap_attach"
+  local function progress_update(msg, level)
+    table.insert(progress, msg)
+    vim.notify(table.concat(progress, "\n"), level or vim.log.levels.INFO, { id = notify_id, title = "DAP Attach" })
+  end
+
+  progress_update("starting preflight...")
   local ps1 = M._android_preflight_ps1(attach_state)
   vim.fn.jobstart({ "powershell", "-NoProfile", "-Command", ps1 }, {
-    stdout_buffered = true,
-    stderr_buffered = true,
     on_stdout = function(_, data)
       for _, line in ipairs(data) do
-        if line ~= "" then vim.schedule(function() vim.notify("[preflight] " .. line) end) end
+        if line ~= "" then vim.schedule(function() progress_update(line) end) end
       end
     end,
     on_stderr = function(_, data)
       for _, line in ipairs(data) do
-        if line ~= "" then vim.schedule(function() vim.notify("[preflight err] " .. line, vim.log.levels.WARN) end) end
+        if line ~= "" then vim.schedule(function() progress_update("ERR: " .. line, vim.log.levels.WARN) end) end
       end
     end,
     on_exit = function(_, code)
       vim.schedule(function()
         if code ~= 0 then
-          vim.notify("Android DAP preflight failed (exit " .. code .. ")", vim.log.levels.ERROR)
+          progress_update("FAILED (exit " .. code .. ")", vim.log.levels.ERROR)
           return
         end
         local pid = trim((vim.fn.readfile(attach_state.pid_file) or {})[1] or "")
         local connect_uri = trim((vim.fn.readfile(attach_state.uri_file) or {})[1] or "")
         if pid == "" or connect_uri == "" then
-          vim.notify("Preflight didn't produce PID or connect URI", vim.log.levels.ERROR)
+          progress_update("no PID or connect URI produced", vim.log.levels.ERROR)
           return
         end
         attach_state.pid = pid
         attach_state.connect_uri = connect_uri
         M._dap_session_state = attach_state
-        vim.notify(("Android DAP: pid=%s, connecting..."):format(pid))
-        -- CodeLLDB's initialized event can fire before process attach finishes.
-        -- Wait for the first real stop from the attached process before fixing ASLR.
+        progress_update(("pid=%s, connecting DAP..."):format(pid))
         dap.listeners.after.event_initialized["ue_aslr_fix"] = nil
         dap.listeners.after.event_stopped["ue_aslr_fix"] = function(dap_session)
           dap.listeners.after.event_stopped["ue_aslr_fix"] = nil
           if dap.session() ~= dap_session then
             return
           end
-          vim.notify("Applying ASLR fix...")
+          progress_update("applying ASLR fix...")
           M._apply_aslr_fix(attach_state, function(ok)
             if ok then
-              vim.notify("ASLR fix applied.")
-              -- Re-apply saved breakpoints before continuing
+              progress_update("ASLR fix applied")
               M._reapply_breakpoints(function()
-                vim.notify("Breakpoint sync finished. Continuing process...")
-                M._dap_eval_lldb("process continue", function() end)
+                progress_update("breakpoints synced, continuing...")
+                M._dap_eval_lldb("process continue", function()
+                  vim.schedule(function() progress_update("READY") end)
+                end)
               end)
             else
-              vim.notify("ASLR fix failed. Process remains stopped.", vim.log.levels.WARN)
+              progress_update("ASLR fix FAILED — process remains stopped", vim.log.levels.WARN)
+            end
+          end)
+        end
+        dap.run(M._android_dap_config(attach_state))
+      end)
+    end,
+  })
+end
+
+function M._android_launch_preflight_ps1(session)
+  local pkg = session.package_name
+  -- Native debugging: start app normally (not -D which waits for JDWP/Java debugger).
+  -- Auto-detect main launcher activity from package manager.
+  return ([[
+$ErrorActionPreference = "Stop"
+$adb = "]] .. (session.adb or "adb") .. [["
+$serial = (& $adb devices | Select-String "^\S+\s+device$" | Select-Object -First 1).Line.Split()[0]
+if (-not $serial) { throw "No Android device found" }
+Write-Host "device=$serial"
+# Detect main activity
+$dumpLines = (& $adb -s $serial shell "dumpsys package ]] .. pkg .. [[" 2>$null) -split "`n"
+$activity = ""
+$inMain = $false
+foreach ($l in $dumpLines) {
+    if ($l -match 'android\.intent\.action\.MAIN') { $inMain = $true; continue }
+    if ($inMain -and $l -match ']] .. pkg:gsub("%.", "\\.") .. [[/([^\s]+)') {
+        $activity = $Matches[1]
+        break
+    }
+    if ($inMain -and $l.Trim() -eq "") { $inMain = $false }
+}
+if (-not $activity) { $activity = "com.epicgames.unreal.GameActivity" }
+Write-Host "activity=$activity"
+# Force-stop
+Write-Host "force-stop..."
+& $adb -s $serial shell "am force-stop ]] .. pkg .. [["
+Start-Sleep -Milliseconds 500
+# Launch
+Write-Host "launching ]] .. pkg .. [[/$activity ..."
+& $adb -s $serial shell "am start -n ]] .. pkg .. [[/$activity"
+Write-Host "waiting for process..."
+$retries = 0
+$targetPid = ""
+while ($retries -lt 15) {
+    Start-Sleep -Milliseconds 500
+    $raw = (& $adb -s $serial shell pidof -s "]] .. pkg .. [[" 2>$null)
+    $targetPid = (($raw | Out-String) -replace '\D','').Trim()
+    if ($targetPid) { break }
+    $retries++
+}
+if (-not $targetPid) { throw "Process ]] .. pkg .. [[ did not start within 8s" }
+Write-Host "pid=$targetPid"
+Write-Host "setting up lldb-server..."
+& $adb -s $serial shell "run-as ]] .. pkg .. [[ sh -c 'pkill -9 lldb-server 2>/dev/null; rm -rf /data/data/]] .. pkg .. [[/lldb 2>/dev/null'" 2>$null
+& $adb -s $serial shell "run-as ]] .. pkg .. [[ mkdir -p /data/data/]] .. pkg .. [[/lldb/bin"
+& $adb -s $serial push "]] .. session.lldb_server_path .. [[" "/data/local/tmp/lldb-server"
+& $adb -s $serial shell "cat /data/local/tmp/lldb-server | run-as ]] .. pkg .. [[ sh -c 'cat > /data/data/]] .. pkg .. [[/lldb/bin/lldb-server && chmod 700 /data/data/]] .. pkg .. [[/lldb/bin/lldb-server'"
+$sockPath = "/data/data/]] .. pkg .. [[/lldb/]] .. session.socket_name .. [["
+& $adb -s $serial shell "run-as ]] .. pkg .. [[ sh -c '/data/data/]] .. pkg .. [[/lldb/bin/lldb-server platform --server --listen unix-abstract://$sockPath </dev/null >/dev/null 2>&1 & echo started'"
+Start-Sleep -Seconds 2
+$lldbPid = ((& $adb -s $serial shell "run-as ]] .. pkg .. [[ pidof lldb-server" 2>$null) | Out-String).Trim()
+if (-not $lldbPid) { throw "lldb-server failed to start" }
+Write-Host "lldb-server pid=$lldbPid"
+$connectUri = "unix-abstract-connect://[$serial]$sockPath"
+Write-Host "connect_uri=$connectUri"
+$targetPid | Out-File -Encoding ascii "]] .. session.pid_file .. [["
+$serial | Out-File -Encoding ascii "]] .. session.serial_file .. [["
+$connectUri | Out-File -Encoding ascii "]] .. session.uri_file .. [["
+Write-Host "PREFLIGHT_OK"
+]])
+end
+
+function M.android_dap_launch()
+  local dap_ok, dap = pcall(require, "dap")
+  if not dap_ok then
+    vim.notify("nvim-dap not installed", vim.log.levels.ERROR)
+    return
+  end
+  local ctx = resolve_context() or {}
+  local project_root = ctx.project_root or ""
+  local engine_root = ctx.engine_root or ""
+  local state = ctx.state or {}
+
+  -- Auto-detect symbol .so
+  local symbol_lib = ""
+  if project_root ~= "" then
+    local so_dir = project_root .. "/Intermediate/Android/arm64/jni/arm64-v8a/"
+    for _, name in ipairs({ "libUE4.so", "libUnreal.so" }) do
+      local candidate = vim.fn.glob(so_dir .. name)
+      if candidate ~= "" then
+        symbol_lib = candidate
+        break
+      end
+    end
+  end
+  if symbol_lib == "" then
+    local default = project_root ~= "" and (project_root .. "/") or ""
+    symbol_lib = vim.fn.input("Path to symbol .so (with debug symbols): ", default)
+  end
+  if symbol_lib == "" then return end
+
+  -- Package name
+  local saved_pkg = state.android_package or ""
+  local package_name = saved_pkg
+  if package_name == "" then
+    package_name = vim.fn.input("Android package name: ", "")
+  end
+  if package_name == "" then return end
+  if engine_root ~= "" and package_name ~= saved_pkg then
+    update_state_field(engine_root, "android_package", package_name)
+    invalidate_status_cache()
+  end
+
+  -- lldb-server
+  local as_lldb = ""
+  local localappdata = vim.fn.expand("$LOCALAPPDATA")
+  local search_patterns = {
+    localappdata .. "/Programs/Android Studio*/plugins/android-ndk/resources/lldb/android/arm64-v8a/lldb-server",
+    localappdata .. "/Android/Sdk/ndk/*/toolchains/llvm/prebuilt/*/lib64/clang/*/lib/linux/aarch64/lldb-server",
+  }
+  for _, pattern in ipairs(search_patterns) do
+    as_lldb = vim.fn.glob(pattern)
+    if as_lldb ~= "" then break end
+  end
+  if as_lldb == "" then
+    as_lldb = vim.fn.input("Path to arm64 lldb-server: ")
+  end
+  if as_lldb == "" then return end
+
+  local tmpdir = vim.fn.tempname():gsub("[/\\][^/\\]*$", "")
+  local attach_state = {
+    package_name = package_name,
+    symbol_lib = to_windows_path(symbol_lib) or symbol_lib,
+    lldb_server_path = to_windows_path(as_lldb) or as_lldb,
+    project_root = to_windows_path(project_root) or project_root,
+    engine_root = to_windows_path(engine_root) or engine_root,
+    adb = to_windows_path(vim.fn.exepath("adb")) or "adb",
+    socket_name = "lldb-platform-" .. os.time(),
+    pid_file = to_windows_path(tmpdir .. "/ue_dap_pid.txt"),
+    serial_file = to_windows_path(tmpdir .. "/ue_dap_serial.txt"),
+    uri_file = to_windows_path(tmpdir .. "/ue_dap_uri.txt"),
+    exec_search_paths = { to_windows_path(vim.fn.fnamemodify(symbol_lib, ":h")) },
+    source_map = {},
+  }
+  if engine_root ~= "" then
+    local er = engine_root:gsub("\\", "/")
+    attach_state.source_map[er] = er
+  end
+  if project_root ~= "" then
+    local pr = project_root:gsub("\\", "/")
+    attach_state.source_map[pr] = pr
+  end
+
+  local progress = { "DAP Launch" }
+  local notify_id = "ue_dap_launch"
+  local function progress_update(msg, level)
+    table.insert(progress, msg)
+    vim.notify(table.concat(progress, "\n"), level or vim.log.levels.INFO, { id = notify_id, title = "DAP Launch" })
+  end
+
+  progress_update("starting...")
+  local ps1 = M._android_launch_preflight_ps1(attach_state)
+  vim.fn.jobstart({ "powershell", "-NoProfile", "-Command", ps1 }, {
+    on_stdout = function(_, data)
+      for _, line in ipairs(data) do
+        if line ~= "" then vim.schedule(function() progress_update(line) end) end
+      end
+    end,
+    on_stderr = function(_, data)
+      for _, line in ipairs(data) do
+        if line ~= "" then vim.schedule(function() progress_update("ERR: " .. line, vim.log.levels.WARN) end) end
+      end
+    end,
+    on_exit = function(_, code)
+      vim.schedule(function()
+        if code ~= 0 then
+          progress_update("FAILED (exit " .. code .. ")", vim.log.levels.ERROR)
+          return
+        end
+        local pid = trim((vim.fn.readfile(attach_state.pid_file) or {})[1] or "")
+        local connect_uri = trim((vim.fn.readfile(attach_state.uri_file) or {})[1] or "")
+        if pid == "" or connect_uri == "" then
+          progress_update("no PID or connect URI produced", vim.log.levels.ERROR)
+          return
+        end
+        attach_state.pid = pid
+        attach_state.connect_uri = connect_uri
+        M._dap_session_state = attach_state
+        progress_update(("pid=%s, connecting DAP..."):format(pid))
+        dap.listeners.after.event_initialized["ue_aslr_fix"] = nil
+        dap.listeners.after.event_stopped["ue_aslr_fix"] = function(dap_session)
+          dap.listeners.after.event_stopped["ue_aslr_fix"] = nil
+          if dap.session() ~= dap_session then
+            return
+          end
+          progress_update("applying ASLR fix...")
+          M._apply_aslr_fix(attach_state, function(ok)
+            if ok then
+              progress_update("ASLR fix applied")
+              M._reapply_breakpoints(function()
+                progress_update("breakpoints synced, continuing...")
+                M._dap_eval_lldb("process continue", function()
+                  vim.schedule(function() progress_update("READY") end)
+                end)
+              end)
+            else
+              progress_update("ASLR fix FAILED — process remains stopped", vim.log.levels.WARN)
             end
           end)
         end
@@ -2673,11 +2970,9 @@ function M._dap_eval_lldb(command, cb)
 end
 
 function M.dap_toggle_breakpoint()
-  local ok, dap = pcall(require, "dap")
-  if not ok or not dap.session() then
-    vim.notify("No DAP session active", vim.log.levels.WARN)
-    return
-  end
+  local dap_ok, dap = pcall(require, "dap")
+  local has_session = dap_ok and dap.session() ~= nil
+
   local bufnr = vim.api.nvim_get_current_buf()
   local line = vim.api.nvim_win_get_cursor(0)[1]
   local path = norm(vim.api.nvim_buf_get_name(bufnr))
@@ -2687,32 +2982,42 @@ function M.dap_toggle_breakpoint()
   local is_set = M._breakpoint_specs[key] ~= nil
 
   if is_set then
+    -- Remove breakpoint
     local spec = M._breakpoint_specs[key]
     M._breakpoint_specs[key] = nil
     vim.fn.sign_unplace("ue_dap_bp", { buffer = bufnr, id = line })
-    M._dap_eval_lldb(spec.clear_command, function(ok2, result)
-      vim.schedule(function()
-        vim.notify(ok2 and ("BP cleared: %s:%d"):format(file, line)
-          or ("BP clear failed: %s"):format(result), ok2 and vim.log.levels.INFO or vim.log.levels.ERROR)
+    if has_session then
+      M._dap_eval_lldb(spec.clear_command, function(ok2, result)
+        vim.schedule(function()
+          vim.notify(ok2 and ("BP cleared: %s:%d"):format(file, line)
+            or ("BP clear failed: %s"):format(result), ok2 and vim.log.levels.INFO or vim.log.levels.ERROR)
+        end)
       end)
-    end)
+    else
+      vim.notify(("BP removed (pending): %s:%d"):format(file, line))
+    end
   else
+    -- Add breakpoint
     local set_cmd = ('breakpoint set -H --file "%s" --line %d'):format(file, line)
     local clear_cmd = ('breakpoint clear --file "%s" --line %d'):format(file, line)
     M._breakpoint_specs[key] = { set_command = set_cmd, clear_command = clear_cmd, file = file, line = line }
     vim.fn.sign_define("UEDapBreakpoint", { text = "●", texthl = "DiagnosticError" })
     vim.fn.sign_place(line, "ue_dap_bp", "UEDapBreakpoint", bufnr, { lnum = line })
-    M._dap_eval_lldb(set_cmd, function(ok2, result)
-      vim.schedule(function()
-        if ok2 then
-          vim.notify(("HW BP set: %s:%d"):format(file, line))
-        else
-          M._breakpoint_specs[key] = nil
-          vim.fn.sign_unplace("ue_dap_bp", { buffer = bufnr, id = line })
-          vim.notify(("BP set failed: %s"):format(result), vim.log.levels.ERROR)
-        end
+    if has_session then
+      M._dap_eval_lldb(set_cmd, function(ok2, result)
+        vim.schedule(function()
+          if ok2 then
+            vim.notify(("HW BP set: %s:%d"):format(file, line))
+          else
+            M._breakpoint_specs[key] = nil
+            vim.fn.sign_unplace("ue_dap_bp", { buffer = bufnr, id = line })
+            vim.notify(("BP set failed: %s"):format(result), vim.log.levels.ERROR)
+          end
+        end)
       end)
-    end)
+    else
+      vim.notify(("BP pending: %s:%d (will apply on attach)"):format(file, line))
+    end
   end
 end
 
@@ -2956,6 +3261,7 @@ function M.setup()
   end, { nargs = "?" })
   vim.api.nvim_create_user_command("UEExportCompileCommands", export_compile_commands, {})
   vim.api.nvim_create_user_command("UEBuildAndroid", build_android, {})
+  vim.api.nvim_create_user_command("UEInstallAndroid", install_android, {})
   vim.api.nvim_create_user_command("UEPrepare", prepare, {})
   vim.api.nvim_create_user_command("UECheatsheet", show_cheatsheet, {})
   vim.api.nvim_create_user_command("UECheatsheetEdit", edit_cheatsheet, {})
@@ -2964,6 +3270,9 @@ function M.setup()
   -- Android DAP commands
   vim.api.nvim_create_user_command("UEAndroidDAPAttach", function()
     M.android_dap_attach()
+  end, {})
+  vim.api.nvim_create_user_command("UEAndroidDAPLaunch", function()
+    M.android_dap_launch()
   end, {})
   vim.api.nvim_create_user_command("UEAndroidDAPContinue", function()
     M.dap_continue()

@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git checkout:*)",
+      "Bash(nvim:*)",
+      "Bash(adb shell:*)",
+      "Bash(git stash:*)",
+      "Bash(adb devices:*)",
+      "Bash(adb push:*)",
+      "Bash(powershell -NoProfile -Command '\n$adb = \"adb\"\n$serial = \"DEVICESERIAL\"\n$pkg = \"com.example.mygame\"\n& $adb -s $serial shell \"run-as $pkg sh -c ''pkill -9 lldb-server 2>/dev/null''\" 2>$null\n$sockName = \"lldb-platform-test123\"\n$sockPrefix = \"/data/data/$pkg/lldb\"\n$lldbCmd = \"/data/data/$pkg/lldb/bin/lldb-server platform --server --listen unix-abstract://$sockPrefix/$sockName\"\n& $adb -s $serial shell \"run-as $pkg sh -c ''nohup $lldbCmd </dev/null >/dev/null 2>&1 &''\"\nStart-Sleep -Seconds 2\n$lldbPid = \\(& $adb -s $serial shell \"run-as $pkg pidof lldb-server\" 2>$null\\).Trim\\(\\)\nWrite-Host \"lldb-server pid=$lldbPid\"\nif \\(-not $lldbPid\\) { throw \"lldb-server failed\" }\n$connectUri = \"unix-abstract-connect://[$serial]$sockPrefix/$sockName\"\nWrite-Host \"connect_uri=$connectUri\"\nWrite-Host \"DONE\"\n' 2>&1)",
+      "Bash(taskkill /F /IM nvim.exe)",
+      "Bash(test -f $LOCALAPPDATA/nvim-main/nvim-data/lazy/lazyvim.json)",
+      "Read(//c/Users/hana-alice/AppData/Local/nvim/$LOCALAPPDATA/nvim-main/nvim-data/lazy/**)",
+      "Read(//c/Users/hana-alice/AppData/Local/nvim/$LOCALAPPDATA/**)",
+      "Bash(sort -t: -k2 -n /tmp/nvim_startup.log)",
+      "Bash(lua lua/ue.lua)",
+      "Bash(luacheck lua/ue.lua)"
+    ]
+  }
+}

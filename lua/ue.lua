@@ -6,8 +6,11 @@ local cheatsheet_win = nil
 local build_term_buf = nil
 local build_term_win = nil
 local build_term_jobid = nil
-local status_cache = {}
+local status_cache = {} -- { key = string, value = string, tick = number }
 local dirty_index_roots = {}
+local _engine_root_cache = {} -- dir -> engine_root (or false)
+local _context_cache = {} -- key -> { ctx, ts }
+local _CONTEXT_TTL = 5 -- seconds
 
 local function trim(value)
   return vim.trim(tostring(value or ""))
@@ -596,9 +599,28 @@ local function find_engine_root(path)
     return nil
   end
 
-  local dir = is_file(path) and dirname(path) or path
+  local start_dir = is_file(path) and dirname(path) or path
+  if _engine_root_cache[start_dir] ~= nil then
+    local cached = _engine_root_cache[start_dir]
+    return cached ~= false and cached or nil
+  end
+
+  local dir = start_dir
+  local visited = {}
   while dir ~= "" do
+    if _engine_root_cache[dir] ~= nil then
+      local cached = _engine_root_cache[dir]
+      local result = cached ~= false and cached or nil
+      for _, v in ipairs(visited) do
+        _engine_root_cache[v] = cached
+      end
+      return result
+    end
+    table.insert(visited, dir)
     if is_engine_root(dir) then
+      for _, v in ipairs(visited) do
+        _engine_root_cache[v] = dir
+      end
       return dir
     end
     local parent = dirname(dir)
@@ -608,6 +630,9 @@ local function find_engine_root(path)
     dir = parent
   end
 
+  for _, v in ipairs(visited) do
+    _engine_root_cache[v] = false
+  end
   return nil
 end
 
@@ -661,22 +686,43 @@ local function persist_project(engine_root, project_root, uproject)
   local paths = cache_paths(engine_root)
   ensure_dir(paths.cache)
 
-  local payload = {
-    project_root = norm(project_root),
-    uproject = uproject and norm(uproject) or nil,
-    updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-  }
+  -- Merge into existing state to preserve extra fields (android_package, etc.)
+  local existing = read_state(engine_root)
+  existing.project_root = norm(project_root)
+  existing.uproject = uproject and norm(uproject) or nil
+  existing.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
 
-  write_all(paths.state, vim.json.encode(payload))
-  return payload
+  write_all(paths.state, vim.json.encode(existing))
+  return existing
+end
+
+local function update_state_field(engine_root, key, value)
+  local paths = cache_paths(engine_root)
+  ensure_dir(paths.cache)
+  local existing = read_state(engine_root)
+  existing[key] = value
+  existing.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
+  write_all(paths.state, vim.json.encode(existing))
 end
 
 local function resolve_context(opts)
   opts = opts or {}
 
+  -- Cache key: cwd + bufname (covers the two inputs that vary)
+  local cur_cwd = cwd()
+  local cur_buf = norm(vim.api.nvim_buf_get_name(0))
+  local cache_key = cur_cwd .. "\0" .. cur_buf
+  local now = vim.uv.hrtime() / 1e9
+  local cached = _context_cache[cache_key]
+  if cached and (now - cached.ts) < _CONTEXT_TTL then
+    return cached.ctx, cached.err
+  end
+
   local engine_root = current_engine_root()
   if not engine_root then
-    return nil, "No Unreal Engine root found from current buffer or cwd"
+    local err = "No Unreal Engine root found from current buffer or cwd"
+    _context_cache[cache_key] = { ctx = nil, err = err, ts = now }
+    return nil, err
   end
 
   local state = read_state(engine_root)
@@ -687,10 +733,9 @@ local function resolve_context(opts)
   end
 
   if not project_root and opts.detect_project ~= false then
-    local candidates = { cwd() }
-    local bufname = norm(vim.api.nvim_buf_get_name(0))
-    if bufname ~= "" and bufname ~= candidates[1] then
-      table.insert(candidates, bufname)
+    local candidates = { cur_cwd }
+    if cur_buf ~= "" and cur_buf ~= candidates[1] then
+      table.insert(candidates, cur_buf)
     end
     for _, candidate in ipairs(candidates) do
       project_root, uproject = detect_project_root_from_path(candidate)
@@ -700,13 +745,15 @@ local function resolve_context(opts)
     end
   end
 
-  return {
+  local ctx = {
     engine_root = engine_root,
     project_root = project_root,
     uproject = uproject,
     state = state,
     paths = cache_paths(engine_root),
   }
+  _context_cache[cache_key] = { ctx = ctx, err = nil, ts = now }
+  return ctx
 end
 
 local function filter_cpp(paths)
@@ -753,7 +800,28 @@ local PICKER_EXCLUDES = {
   "**/DerivedDataCache/**",
   "**/Intermediate/**",
   "**/Saved/**",
+  "**/ThirdParty/**",
 }
+
+-- Extensions (for fd -e / files picker ft)
+M.FT_CPP = {
+  "c", "cc", "cpp", "cxx",
+  "h", "hh", "hpp", "hxx",
+  "inl", "ipp", "inc",
+  "m", "mm",
+}
+
+M.FT_SHADER = {
+  "usf", "ush",
+  "hlsl", "hlsli",
+  "glsl", "comp", "vert", "frag", "geom", "tesc", "tese",
+  "metal",
+}
+
+M.FT_CODE = vim.list_extend(vim.list_extend({}, M.FT_CPP), M.FT_SHADER)
+
+-- Globs (for rg -g / grep picker)
+M.GLOBS_CODE = vim.tbl_map(function(ext) return "*." .. ext end, M.FT_CODE)
 
 local function existing_relative_dirs(root, search_paths)
   local dirs = {}
@@ -993,6 +1061,7 @@ end
 
 local function invalidate_status_cache()
   status_cache = {}
+  _context_cache = {}
 end
 
 local function refresh_statusline()
@@ -1751,6 +1820,22 @@ function M.picker_options(opts)
   }, nil
 end
 
+function M.picker_project_options(opts)
+  local ctx, err = resolve_context(opts)
+  if not ctx then
+    return nil, err
+  end
+  if not ctx.project_root then
+    return nil, "No UE project configured"
+  end
+
+  return {
+    dirs = { ctx.project_root },
+    exclude = vim.deepcopy(PICKER_EXCLUDES),
+    follow = false,
+  }, nil
+end
+
 function M.current_scope_picker_options(opts)
   local scope, err = current_scope_info(opts)
   if not scope then
@@ -2051,6 +2136,28 @@ local function set_project(input)
   vim.notify("UE project set:\nEngine: " .. engine_root .. "\nProject: " .. project_root)
 end
 
+local function set_android_package(input)
+  local engine_root = current_engine_root()
+  if not engine_root then
+    vim.notify("No Unreal Engine root found from current buffer or cwd", vim.log.levels.WARN)
+    return
+  end
+
+  input = trim(input)
+  if input == "" then
+    local state = read_state(engine_root)
+    input = vim.fn.input("Android package name: ", state.android_package or "")
+  end
+  if input == "" then
+    return
+  end
+
+  update_state_field(engine_root, "android_package", input)
+  invalidate_status_cache()
+  refresh_statusline()
+  vim.notify("UE Android package set:\nEngine: " .. engine_root .. "\nPackage: " .. input)
+end
+
 local function export_compile_commands()
   local ctx, err = resolve_context()
   if not ctx then
@@ -2214,6 +2321,620 @@ local function clear_cache()
   vim.notify("UE cache cleared under: " .. ctx.paths.cache)
 end
 
+-- ---------------------------------------------------------------------------
+-- Android DAP debugging via CodeLLDB
+-- ---------------------------------------------------------------------------
+
+M._dap_session_state = M._dap_session_state or {}
+M._breakpoint_specs = M._breakpoint_specs or {}
+
+local function clear_android_breakpoint_state()
+  M._breakpoint_specs = {}
+  pcall(vim.fn.sign_unplace, "ue_dap_bp")
+end
+
+local function basename(path)
+  return path:match("([^/\\]+)$") or path
+end
+
+local function to_windows_path(p)
+  if not p or p == "" then return nil end
+  return tostring(p):gsub("/", "\\")
+end
+
+function M.codelldb_paths()
+  local candidates = {
+    vim.fn.stdpath("data") .. "/codelldb/extension/extension",
+    vim.fn.stdpath("config") .. "/data/codelldb/extension/extension",
+  }
+  for _, root in ipairs(candidates) do
+    local adapter = root .. "/adapter/codelldb"
+    local liblldb = root .. "/lldb/bin/liblldb"
+    if vim.fn.has("win32") == 1 then
+      adapter = adapter .. ".exe"
+      liblldb = liblldb .. ".dll"
+    elseif vim.fn.has("mac") == 1 then
+      liblldb = liblldb .. ".dylib"
+    else
+      liblldb = liblldb .. ".so"
+    end
+    if vim.fn.filereadable(adapter) == 1 then
+      return adapter, liblldb, root
+    end
+  end
+  return nil, nil, nil
+end
+
+function M._reapply_breakpoints(cb)
+  local specs = M._breakpoint_specs or {}
+  local keys = vim.tbl_keys(specs)
+  if #keys == 0 then
+    if cb then cb() end
+    return
+  end
+  local pending = #keys
+  local function done()
+    pending = pending - 1
+    if pending <= 0 and cb then cb() end
+  end
+  for _, key in ipairs(keys) do
+    local spec = specs[key]
+    M._dap_eval_lldb(spec.set_command, function(ok, result)
+      vim.schedule(function()
+        if ok then
+          vim.notify(("BP restored: %s:%d"):format(spec.file, spec.line))
+        else
+          vim.notify(("BP restore failed: %s:%d: %s"):format(spec.file, spec.line, tostring(result)), vim.log.levels.WARN)
+        end
+      end)
+      done()
+    end)
+  end
+end
+
+function M._apply_aslr_fix(session_state, cb)
+  -- Apply ASLR fix AFTER DAP session is established
+  -- Reads /proc/maps from device via adb, parses base, sends LLDB command
+  local pid = session_state.pid
+  -- Derive .so name from symbol_lib path (supports libUE4.so, libUnreal.so, etc.)
+  local so_name = session_state.symbol_lib and vim.fn.fnamemodify(session_state.symbol_lib, ":t") or "libUE4.so"
+  local adb = session_state.adb or "adb"
+
+  -- Read /proc/maps directly via adb (more reliable than platform shell)
+  vim.fn.jobstart({ adb, "shell", "cat /proc/" .. pid .. "/maps" }, {
+    stdout_buffered = true,
+    on_stdout = function(_, data)
+      local base_addr = nil
+      for _, line in ipairs(data or {}) do
+        if line:find(so_name, 1, true) then
+          base_addr = line:match("^(%x+)%-")
+          break
+        end
+      end
+      if not base_addr then
+        vim.schedule(function()
+          vim.notify("ASLR fix: " .. so_name .. " not found in /proc/maps", vim.log.levels.ERROR)
+          if cb then cb(false) end
+        end)
+        return
+      end
+      local base_hex = "0x" .. base_addr
+      vim.schedule(function()
+        vim.notify("ASLR fix: " .. so_name .. " base=" .. base_hex)
+        M._dap_eval_lldb(
+          ("target modules load --file %s --slide %s"):format(so_name, base_hex),
+          function(ok, result)
+            vim.schedule(function()
+              vim.notify("ASLR fix: " .. (ok and "applied" or "FAILED: " .. tostring(result)))
+              if cb then cb(ok) end
+            end)
+          end
+        )
+      end)
+    end,
+    on_exit = function(_, code)
+      if code ~= 0 then
+        vim.schedule(function()
+          vim.notify("ASLR fix: adb shell failed (exit " .. code .. ")", vim.log.levels.ERROR)
+          if cb then cb(false) end
+        end)
+      end
+    end,
+  })
+end
+
+function M._android_dap_config(session)
+  local target_create = {}
+  if session.symbol_lib then
+    table.insert(target_create, ('target create "%s"'):format(session.symbol_lib))
+  end
+  for _, sp in ipairs(session.exec_search_paths or {}) do
+    table.insert(target_create, ('settings append target.exec-search-paths "%s"'):format(sp))
+  end
+  return {
+    name = "UE Android Attach",
+    type = "codelldb",
+    request = "attach",
+    breakpointMode = "file",
+    stopOnEntry = false,
+    program = session.symbol_lib,
+    cwd = session.project_root or vim.fn.getcwd(),
+    sourceLanguages = { "cpp" },
+    sourceMap = (session.source_map and next(session.source_map)) and session.source_map or vim.empty_dict(),
+    initCommands = {
+      "settings set stop-disassembly-display never",
+      "settings set target.inline-breakpoint-strategy always",
+      "settings set target.move-to-nearest-code true",
+      "settings set target.process.stop-on-sharedlibrary-events false",
+      "platform select remote-android",
+    },
+    targetCreateCommands = target_create,
+    processCreateCommands = {
+      ('platform connect "%s"'):format(session.connect_uri),
+      ("process attach -p %s"):format(session.pid),
+      "settings set target.process.thread.step-avoid-regexp ''",
+      "process handle SIGSTOP -p true -s false -n false",
+      "process handle SIGSEGV -p true -s false -n false",
+      "process handle SIGBUS -p true -s false -n false",
+      "process handle SIGPIPE -p true -s false -n false",
+    },
+    preTerminateCommands = { "process detach" },
+  }
+end
+
+function M._android_preflight_ps1(session)
+  local pkg = session.package_name
+  return ([[
+$ErrorActionPreference = "Stop"
+$adb = "]] .. (session.adb or "adb") .. [["
+$serial = (& $adb devices | Select-String "^\S+\s+device$" | Select-Object -First 1).Line.Split()[0]
+if (-not $serial) { throw "No Android device found" }
+Write-Host "serial=$serial"
+$raw = (& $adb -s $serial shell pidof -s "]] .. pkg .. [[" 2>$null)
+$targetPid = (($raw | Out-String) -replace '\D','').Trim()
+if (-not $targetPid) { throw "Process ]] .. pkg .. [[ not running" }
+Write-Host "pid=$targetPid"
+& $adb -s $serial shell "run-as ]] .. pkg .. [[ sh -c 'pkill -9 lldb-server 2>/dev/null; rm -rf /data/data/]] .. pkg .. [[/lldb 2>/dev/null'" 2>$null
+& $adb -s $serial shell "run-as ]] .. pkg .. [[ mkdir -p /data/data/]] .. pkg .. [[/lldb/bin"
+& $adb -s $serial push "]] .. session.lldb_server_path .. [[" "/data/local/tmp/lldb-server"
+& $adb -s $serial shell "cat /data/local/tmp/lldb-server | run-as ]] .. pkg .. [[ sh -c 'cat > /data/data/]] .. pkg .. [[/lldb/bin/lldb-server && chmod 700 /data/data/]] .. pkg .. [[/lldb/bin/lldb-server'"
+$sockPath = "/data/data/]] .. pkg .. [[/lldb/]] .. session.socket_name .. [["
+& $adb -s $serial shell "run-as ]] .. pkg .. [[ sh -c '/data/data/]] .. pkg .. [[/lldb/bin/lldb-server platform --server --listen unix-abstract://$sockPath </dev/null >/dev/null 2>&1 & echo started'"
+Start-Sleep -Seconds 2
+$lldbPid = ((& $adb -s $serial shell "run-as ]] .. pkg .. [[ pidof lldb-server" 2>$null) | Out-String).Trim()
+if (-not $lldbPid) { throw "lldb-server failed to start" }
+Write-Host "lldb-server pid=$lldbPid"
+$connectUri = "unix-abstract-connect://[$serial]$sockPath"
+Write-Host "connect_uri=$connectUri"
+$targetPid | Out-File -Encoding ascii "]] .. session.pid_file .. [["
+$serial | Out-File -Encoding ascii "]] .. session.serial_file .. [["
+$connectUri | Out-File -Encoding ascii "]] .. session.uri_file .. [["
+Write-Host "PREFLIGHT_OK"
+]])
+end
+
+function M.android_dap_attach()
+  local dap_ok, dap = pcall(require, "dap")
+  if not dap_ok then
+    vim.notify("nvim-dap not installed", vim.log.levels.ERROR)
+    return
+  end
+  local ctx = resolve_context() or {}
+  local project_root = ctx.project_root or ""
+  local engine_root = ctx.engine_root or ""
+  local state = ctx.state or {}
+
+  -- Auto-detect symbol .so: try libUE4.so (UE4) then libUnreal.so (UE5)
+  local symbol_lib = ""
+  if project_root ~= "" then
+    local so_dir = project_root .. "/Intermediate/Android/arm64/jni/arm64-v8a/"
+    for _, name in ipairs({ "libUE4.so", "libUnreal.so" }) do
+      local candidate = vim.fn.glob(so_dir .. name)
+      if candidate ~= "" then
+        symbol_lib = candidate
+        break
+      end
+    end
+  end
+  if symbol_lib == "" then
+    local default = project_root ~= "" and (project_root .. "/") or ""
+    symbol_lib = vim.fn.input("Path to symbol .so (with debug symbols): ", default)
+  end
+  if symbol_lib == "" then return end
+
+  -- Package name: read from persisted state, fallback to prompt
+  local saved_pkg = state.android_package or ""
+  local package_name = vim.fn.input("Android package name: ", saved_pkg)
+  if package_name == "" then return end
+  -- Persist for next attach
+  if engine_root ~= "" and package_name ~= saved_pkg then
+    update_state_field(engine_root, "android_package", package_name)
+    invalidate_status_cache()
+  end
+
+  -- lldb-server: search Android Studio, NDK side-by-side, then prompt
+  local as_lldb = ""
+  local localappdata = vim.fn.expand("$LOCALAPPDATA")
+  local search_patterns = {
+    localappdata .. "/Programs/Android Studio*/plugins/android-ndk/resources/lldb/android/arm64-v8a/lldb-server",
+    localappdata .. "/Android/Sdk/ndk/*/toolchains/llvm/prebuilt/*/lib64/clang/*/lib/linux/aarch64/lldb-server",
+  }
+  for _, pattern in ipairs(search_patterns) do
+    as_lldb = vim.fn.glob(pattern)
+    if as_lldb ~= "" then break end
+  end
+  if as_lldb == "" then
+    as_lldb = vim.fn.input("Path to arm64 lldb-server: ")
+  end
+  if as_lldb == "" then return end
+
+  local tmpdir = vim.fn.tempname():gsub("[/\\][^/\\]*$", "")
+  local attach_state = {
+    package_name = package_name,
+    symbol_lib = to_windows_path(symbol_lib) or symbol_lib,
+    lldb_server_path = to_windows_path(as_lldb) or as_lldb,
+    project_root = to_windows_path(project_root) or project_root,
+    engine_root = to_windows_path(engine_root) or engine_root,
+    adb = to_windows_path(vim.fn.exepath("adb")) or "adb",
+    socket_name = "lldb-platform-" .. os.time(),
+    pid_file = to_windows_path(tmpdir .. "/ue_dap_pid.txt"),
+    serial_file = to_windows_path(tmpdir .. "/ue_dap_serial.txt"),
+    uri_file = to_windows_path(tmpdir .. "/ue_dap_uri.txt"),
+    exec_search_paths = { to_windows_path(vim.fn.fnamemodify(symbol_lib, ":h")) },
+    source_map = {},
+  }
+  if engine_root ~= "" then
+    local er = engine_root:gsub("\\", "/")
+    attach_state.source_map[er] = er
+  end
+  if project_root ~= "" then
+    local pr = project_root:gsub("\\", "/")
+    attach_state.source_map[pr] = pr
+  end
+
+  vim.notify("Starting Android DAP preflight...")
+  local ps1 = M._android_preflight_ps1(attach_state)
+  vim.fn.jobstart({ "powershell", "-NoProfile", "-Command", ps1 }, {
+    stdout_buffered = true,
+    stderr_buffered = true,
+    on_stdout = function(_, data)
+      for _, line in ipairs(data) do
+        if line ~= "" then vim.schedule(function() vim.notify("[preflight] " .. line) end) end
+      end
+    end,
+    on_stderr = function(_, data)
+      for _, line in ipairs(data) do
+        if line ~= "" then vim.schedule(function() vim.notify("[preflight err] " .. line, vim.log.levels.WARN) end) end
+      end
+    end,
+    on_exit = function(_, code)
+      vim.schedule(function()
+        if code ~= 0 then
+          vim.notify("Android DAP preflight failed (exit " .. code .. ")", vim.log.levels.ERROR)
+          return
+        end
+        local pid = trim((vim.fn.readfile(attach_state.pid_file) or {})[1] or "")
+        local connect_uri = trim((vim.fn.readfile(attach_state.uri_file) or {})[1] or "")
+        if pid == "" or connect_uri == "" then
+          vim.notify("Preflight didn't produce PID or connect URI", vim.log.levels.ERROR)
+          return
+        end
+        attach_state.pid = pid
+        attach_state.connect_uri = connect_uri
+        M._dap_session_state = attach_state
+        vim.notify(("Android DAP: pid=%s, connecting..."):format(pid))
+        -- CodeLLDB's initialized event can fire before process attach finishes.
+        -- Wait for the first real stop from the attached process before fixing ASLR.
+        dap.listeners.after.event_initialized["ue_aslr_fix"] = nil
+        dap.listeners.after.event_stopped["ue_aslr_fix"] = function(dap_session)
+          dap.listeners.after.event_stopped["ue_aslr_fix"] = nil
+          if dap.session() ~= dap_session then
+            return
+          end
+          vim.notify("Applying ASLR fix...")
+          M._apply_aslr_fix(attach_state, function(ok)
+            if ok then
+              vim.notify("ASLR fix applied.")
+              -- Re-apply saved breakpoints before continuing
+              M._reapply_breakpoints(function()
+                vim.notify("Breakpoint sync finished. Continuing process...")
+                M._dap_eval_lldb("process continue", function() end)
+              end)
+            else
+              vim.notify("ASLR fix failed. Process remains stopped.", vim.log.levels.WARN)
+            end
+          end)
+        end
+        dap.run(M._android_dap_config(attach_state))
+      end)
+    end,
+  })
+end
+
+function M._dap_eval_lldb(command, cb)
+  local dap = require("dap")
+  local session = dap.session()
+  if not session then
+    if cb then cb(false, "No DAP session") end
+    return
+  end
+  -- CodeLLDB repl evaluate works without frameId even when the process is running
+  session:evaluate(command, function(err, resp)
+    local result = resp and resp.result or ""
+    if err then
+      if cb then cb(false, tostring(err)) end
+    else
+      if cb then cb(true, result) end
+    end
+  end, { context = "repl" })
+end
+
+function M.dap_toggle_breakpoint()
+  local ok, dap = pcall(require, "dap")
+  if not ok or not dap.session() then
+    vim.notify("No DAP session active", vim.log.levels.WARN)
+    return
+  end
+  local bufnr = vim.api.nvim_get_current_buf()
+  local line = vim.api.nvim_win_get_cursor(0)[1]
+  local path = norm(vim.api.nvim_buf_get_name(bufnr))
+  if path == "" then return end
+  local file = basename(path)
+  local key = path .. ":" .. line
+  local is_set = M._breakpoint_specs[key] ~= nil
+
+  if is_set then
+    local spec = M._breakpoint_specs[key]
+    M._breakpoint_specs[key] = nil
+    vim.fn.sign_unplace("ue_dap_bp", { buffer = bufnr, id = line })
+    M._dap_eval_lldb(spec.clear_command, function(ok2, result)
+      vim.schedule(function()
+        vim.notify(ok2 and ("BP cleared: %s:%d"):format(file, line)
+          or ("BP clear failed: %s"):format(result), ok2 and vim.log.levels.INFO or vim.log.levels.ERROR)
+      end)
+    end)
+  else
+    local set_cmd = ('breakpoint set -H --file "%s" --line %d'):format(file, line)
+    local clear_cmd = ('breakpoint clear --file "%s" --line %d'):format(file, line)
+    M._breakpoint_specs[key] = { set_command = set_cmd, clear_command = clear_cmd, file = file, line = line }
+    vim.fn.sign_define("UEDapBreakpoint", { text = "●", texthl = "DiagnosticError" })
+    vim.fn.sign_place(line, "ue_dap_bp", "UEDapBreakpoint", bufnr, { lnum = line })
+    M._dap_eval_lldb(set_cmd, function(ok2, result)
+      vim.schedule(function()
+        if ok2 then
+          vim.notify(("HW BP set: %s:%d"):format(file, line))
+        else
+          M._breakpoint_specs[key] = nil
+          vim.fn.sign_unplace("ue_dap_bp", { buffer = bufnr, id = line })
+          vim.notify(("BP set failed: %s"):format(result), vim.log.levels.ERROR)
+        end
+      end)
+    end)
+  end
+end
+
+function M.dap_continue()
+  local ok, dap = pcall(require, "dap")
+  if not ok or not dap.session() then return end
+  local session = dap.session()
+  local tid = session.stopped_thread_id
+  if tid then
+    dap.continue()
+  else
+    -- Process might already be running; use LLDB command
+    M._dap_eval_lldb("process continue", function(ok2, result)
+      if not ok2 then
+        vim.schedule(function()
+          vim.notify("Continue failed: " .. tostring(result), vim.log.levels.WARN)
+        end)
+      end
+    end)
+  end
+end
+
+function M.dap_pause()
+  local ok, dap = pcall(require, "dap")
+  if not ok or not dap.session() then return end
+  -- dap.pause() requires a thread ID; use raw request to pause all threads
+  local session = dap.session()
+  session:request("pause", { threadId = 0 }, function(err)
+    if err then
+      -- Fallback: try getting threads first
+      session:request("threads", {}, function(terr, tresp)
+        if not terr and tresp and tresp.threads and tresp.threads[1] then
+          session:request("pause", { threadId = tresp.threads[1].id })
+        else
+          vim.schedule(function()
+            vim.notify("Pause failed: " .. tostring(err), vim.log.levels.ERROR)
+          end)
+        end
+      end)
+    end
+  end)
+end
+
+function M.dap_step_over()
+  local ok, dap = pcall(require, "dap")
+  if ok and dap.session() then dap.step_over() end
+end
+
+function M.dap_step_into()
+  local ok, dap = pcall(require, "dap")
+  if ok and dap.session() then dap.step_into() end
+end
+
+function M.dap_step_out()
+  local ok, dap = pcall(require, "dap")
+  if ok and dap.session() then dap.step_out() end
+end
+
+function M.dap_toggle_ui()
+  local ok, dapui = pcall(require, "dapui")
+  if not ok then return end
+  dapui.toggle()
+end
+
+function M.dap_reset_layout()
+  local dap_ok, dap = pcall(require, "dap")
+  local dapui_ok, dapui = pcall(require, "dapui")
+  if dap_ok and dap.session() and dapui_ok then
+    -- DAP active: close and re-open DAP UI to reset split sizes
+    dapui.close()
+    -- Close all non-normal windows (leftover floats, etc.)
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_is_valid(win) then
+        local buf = vim.api.nvim_win_get_buf(win)
+        local bt = vim.bo[buf].buftype
+        if bt == "nofile" or bt == "prompt" then
+          local ft = vim.bo[buf].filetype
+          if ft:find("^dap") then
+            pcall(vim.api.nvim_win_close, win, true)
+          end
+        end
+      end
+    end
+    vim.cmd("wincmd =")
+    dapui.open({ reset = true })
+  else
+    -- No DAP: close everything except current window
+    vim.cmd("only")
+    vim.cmd("wincmd =")
+  end
+end
+
+function M.dap_toggle_repl()
+  local ok, dap = pcall(require, "dap")
+  if ok then dap.repl.toggle() end
+end
+
+function M.setup_dap(dap, dapui)
+  local adapter, liblldb = M.codelldb_paths()
+  if not adapter then
+    vim.notify("CodeLLDB not found. Install it to enable Android debugging.", vim.log.levels.WARN)
+    return
+  end
+  dap.adapters.codelldb = {
+    type = "server",
+    port = "${port}",
+    executable = { command = adapter, args = { "--port", "${port}", "--liblldb", liblldb } },
+  }
+  -- Remember which window/buffer was active before DAP UI opened
+  local saved_win = nil
+  local saved_buf = nil
+  local function save_layout()
+    if not saved_win then
+      saved_win = vim.api.nvim_get_current_win()
+      saved_buf = vim.api.nvim_get_current_buf()
+    end
+  end
+  local function restore_layout()
+    dapui.close()
+    -- Close any leftover DAP/special windows, keep only normal file windows
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_is_valid(win) then
+        local buf = vim.api.nvim_win_get_buf(win)
+        local bt = vim.bo[buf].buftype
+        local ft = vim.bo[buf].filetype
+        if bt == "nofile" or ft:find("^dap") then
+          pcall(vim.api.nvim_win_close, win, true)
+        end
+      end
+    end
+    -- Focus the original window or the first remaining window
+    if saved_win and vim.api.nvim_win_is_valid(saved_win) then
+      pcall(vim.api.nvim_set_current_win, saved_win)
+    elseif saved_buf and vim.api.nvim_buf_is_valid(saved_buf) then
+      -- Original window gone but buffer alive — switch to it
+      pcall(vim.cmd, "buffer " .. saved_buf)
+    end
+    saved_win = nil
+    saved_buf = nil
+    -- Equalize whatever windows remain
+    vim.cmd("wincmd =")
+  end
+
+  local function close_explorer()
+    local ok_snacks, snacks = pcall(require, "snacks")
+    if ok_snacks and snacks.picker and snacks.picker.get then
+      for _, picker in ipairs(snacks.picker.get({ source = "explorer" }) or {}) do
+        pcall(function() picker:close() end)
+      end
+    end
+  end
+
+  local function on_session_end()
+    restore_layout()
+    -- Keep _breakpoint_specs and signs so they persist across re-attach.
+    -- They will be re-applied to the new LLDB session after ASLR fix.
+    -- Kill remote lldb-server so re-attach can start a new one
+    local state = M._dap_session_state or {}
+    if state.package_name then
+      vim.fn.jobstart({ state.adb or "adb", "shell",
+        "run-as " .. state.package_name .. " sh -c 'pkill -9 lldb-server 2>/dev/null'" }, { detach = true })
+    end
+    M._dap_session_state = {}
+  end
+
+  dap.listeners.after.event_initialized["dapui_config"] = function()
+    close_explorer()
+    save_layout()
+    dapui.open()
+  end
+  dap.listeners.before.event_terminated["dapui_config"] = function() on_session_end() end
+  dap.listeners.before.event_exited["dapui_config"] = function() on_session_end() end
+  dap.listeners.after.disconnect["dapui_config"] = function() on_session_end() end
+
+  -- Track global scope variablesReferences to block them (crashes LLDB on huge binaries)
+  local blocked_refs = {}
+  dap.listeners.before.event_stopped["ue_clear_blocked"] = function()
+    blocked_refs = {}
+  end
+  dap.listeners.after.scopes["ue_block_globals"] = function(_, body)
+    if body and body.scopes then
+      for i = #body.scopes, 1, -1 do
+        local s = body.scopes[i]
+        if s.name == "Globals" or s.name == "Static" then
+          blocked_refs[s.variablesReference] = true
+          table.remove(body.scopes, i)
+        end
+      end
+    end
+  end
+  vim.fn.sign_define("DapBreakpoint", { text = "●", texthl = "DiagnosticError" })
+  vim.fn.sign_define("DapStopped", { text = "▶", texthl = "DiagnosticInfo", linehl = "CursorLine" })
+
+  -- Full cleanup on quit: disconnect DAP, kill CodeLLDB adapter, kill remote lldb-server
+  vim.api.nvim_create_autocmd("VimLeavePre", {
+    group = vim.api.nvim_create_augroup("ue_dap_cleanup", { clear = true }),
+    callback = function()
+      local session = dap.session()
+      if not session then return end
+      -- Detach cleanly so the game keeps running
+      pcall(function()
+        session:request("disconnect", { terminateDebuggee = false })
+      end)
+      -- Kill CodeLLDB adapter process
+      local adapter_pid = session.adapter and session.adapter.pid
+      if adapter_pid then
+        if vim.fn.has("win32") == 1 then
+          vim.fn.system({ "taskkill", "/F", "/T", "/PID", tostring(adapter_pid) })
+        else
+          vim.fn.system({ "kill", "-9", tostring(adapter_pid) })
+        end
+      end
+      -- Kill remote lldb-server
+      local state = M._dap_session_state or {}
+      if state.package_name then
+        vim.fn.system({ "adb", "shell",
+          "run-as " .. state.package_name .. " sh -c 'pkill -9 lldb-server 2>/dev/null'" })
+      end
+      -- Clear state
+      M._dap_session_state = {}
+      clear_android_breakpoint_state()
+    end,
+  })
+end
+
 function M.setup()
   if setup_done then
     return
@@ -2227,6 +2948,9 @@ function M.setup()
   vim.api.nvim_create_user_command("UESetProject", function(opts)
     set_project(opts.args)
   end, { nargs = "?" })
+  vim.api.nvim_create_user_command("UESetAndroidPackage", function(opts)
+    set_android_package(opts.args)
+  end, { nargs = "?" })
   vim.api.nvim_create_user_command("UEExportCompileCommands", export_compile_commands, {})
   vim.api.nvim_create_user_command("UEBuildAndroid", build_android, {})
   vim.api.nvim_create_user_command("UEPrepare", prepare, {})
@@ -2234,11 +2958,51 @@ function M.setup()
   vim.api.nvim_create_user_command("UECheatsheetEdit", edit_cheatsheet, {})
   vim.api.nvim_create_user_command("UEClearCache", clear_cache, {})
 
+  -- Android DAP commands
+  vim.api.nvim_create_user_command("UEAndroidDAPAttach", function()
+    M.android_dap_attach()
+  end, {})
+  vim.api.nvim_create_user_command("UEAndroidDAPContinue", function()
+    M.dap_continue()
+  end, {})
+  vim.api.nvim_create_user_command("UEAndroidDAPPause", function()
+    M.dap_pause()
+  end, {})
+  vim.api.nvim_create_user_command("UEAndroidDAPToggleBreakpoint", function()
+    M.dap_toggle_breakpoint()
+  end, {})
+  vim.api.nvim_create_user_command("UEAndroidDAPStepOver", function()
+    M.dap_step_over()
+  end, {})
+  vim.api.nvim_create_user_command("UEAndroidDAPStepIn", function()
+    M.dap_step_into()
+  end, {})
+  vim.api.nvim_create_user_command("UEAndroidDAPStepOut", function()
+    M.dap_step_out()
+  end, {})
+  vim.api.nvim_create_user_command("UEAndroidDAPToggleUI", function()
+    M.dap_toggle_ui()
+  end, {})
+  vim.api.nvim_create_user_command("UEAndroidDAPREPL", function()
+    M.dap_toggle_repl()
+  end, {})
+  vim.api.nvim_create_user_command("UEResetLayout", function()
+    M.dap_reset_layout()
+  end, {})
+
   local group = vim.api.nvim_create_augroup("ue_statusline", { clear = true })
+  local statusline_timer = vim.uv.new_timer()
   vim.api.nvim_create_autocmd("BufEnter", {
     group = group,
     callback = function()
-      refresh_statusline()
+      local bt = vim.bo.buftype
+      if bt ~= "" and bt ~= "help" then
+        return -- skip special buffers (terminal, nofile, prompt, dap-*)
+      end
+      -- Debounce: defer statusline refresh so rapid buffer switches
+      -- (picker confirm, DAP UI open) don't block the event loop
+      statusline_timer:stop()
+      statusline_timer:start(50, 0, vim.schedule_wrap(refresh_statusline))
     end,
   })
   vim.api.nvim_create_autocmd("BufWritePost", {

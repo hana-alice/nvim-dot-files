@@ -1,57 +1,68 @@
-local function ue_workspace_picker_opts()
+local function get_ue()
   local ok, ue = pcall(require, "ue")
-  if not ok then
-    return nil
-  end
+  return ok and ue or nil
+end
+
+local function workspace_opts()
+  local ue = get_ue()
+  if not ue then return nil end
   local opts = ue.picker_options()
-  if type(opts) ~= "table" or #opts.dirs == 0 then
-    return nil
-  end
+  if type(opts) ~= "table" or #opts.dirs == 0 then return nil end
   return opts
 end
 
-local function ue_project_root()
-  local ok, ue = pcall(require, "ue")
-  if not ok or type(ue.ue_roots) ~= "function" then
-    return nil
-  end
-  local project_root = ue.ue_roots()
-  if type(project_root) ~= "string" or project_root == "" then
-    return nil
-  end
-  return project_root
-end
-
-local function ue_project_picker_opts()
-  local opts = ue_workspace_picker_opts()
-  local project_root = ue_project_root()
-  if not opts or not project_root then
-    return nil
-  end
-
-  opts = vim.deepcopy(opts)
-  opts.dirs = { project_root }
-  opts.follow = false
+local function project_opts()
+  local ue = get_ue()
+  if not ue then return nil end
+  local opts = ue.picker_project_options()
+  if type(opts) ~= "table" then return nil end
   return opts
 end
 
-local function ue_scope_picker_opts()
-  local ok, ue = pcall(require, "ue")
-  if not ok then
-    return nil, nil, nil
-  end
+local function project_root()
+  local ue = get_ue()
+  if not ue or type(ue.ue_roots) ~= "function" then return nil end
+  local root = ue.ue_roots()
+  if type(root) ~= "string" or root == "" then return nil end
+  return root
+end
+
+local function scope_opts()
+  local ue = get_ue()
+  if not ue then return nil, nil end
   local opts, scope, err = ue.current_scope_picker_options()
-  if type(opts) ~= "table" then
-    return nil, nil, err
-  end
-  return opts, scope, nil
+  if type(opts) ~= "table" then return nil, err end
+  return opts, nil
 end
+
+local function code_ft()
+  local ue = get_ue()
+  return ue and ue.FT_CODE or nil
+end
+
+local function code_globs()
+  local ue = get_ue()
+  return ue and ue.GLOBS_CODE or nil
+end
+
+-- Apply file type filter: ft for files picker, glob for grep picker
+local function with_ft(opts, ft)
+  if opts and ft then opts.ft = ft end
+  return opts
+end
+
+local function with_glob(opts, globs)
+  if opts and globs then opts.glob = globs end
+  return opts
+end
+
+---------- Find files ----------
 
 local function ue_files()
   local snacks = require("snacks")
-  local opts = ue_project_picker_opts()
+  local opts = with_ft(project_opts(), code_ft())
   if opts then
-    opts.title = "UE Project Files"
+    opts.title = "UE Project Code"
     return snacks.picker.files(opts)
   end
   return snacks.picker.files()
@@ -59,9 +70,19 @@ end
 
 local function ue_workspace_files()
   local snacks = require("snacks")
-  local opts = ue_workspace_picker_opts()
+  local opts = with_ft(workspace_opts(), code_ft())
   if opts then
-    opts.title = "UE Workspace Files"
+    opts.title = "UE Workspace Code"
+    return snacks.picker.files(opts)
+  end
+  return snacks.picker.files()
+end
+
+local function ue_workspace_all_files()
+  local snacks = require("snacks")
+  local opts = workspace_opts()
+  if opts then
+    opts.title = "UE Workspace All Files"
     return snacks.picker.files(opts)
   end
   return snacks.picker.files()
@@ -69,61 +90,85 @@ end
 
 local function ue_git_files()
   local snacks = require("snacks")
-  local project_root = ue_project_root()
-  if project_root then
-    return snacks.picker.git_files({
-      cwd = project_root,
-      title = "UE Project Git Files",
-    })
+  local root = project_root()
+  if root then
+    return snacks.picker.git_files({ cwd = root, title = "UE Project Git Files" })
   end
   return snacks.picker.git_files()
 end
 
-local function ue_grep()
+---------- Grep ----------
+
+local function ue_project_grep()
   local snacks = require("snacks")
-  local opts = ue_workspace_picker_opts()
+  local opts = with_glob(project_opts(), code_globs())
   if opts then
+    opts.title = "Grep Project Code"
     return snacks.picker.grep(opts)
   end
   return snacks.picker.grep()
 end
 
+local function ue_grep()
+  local snacks = require("snacks")
+  local opts = with_glob(workspace_opts(), code_globs())
+  if opts then
+    opts.title = "Grep Workspace Code"
+    return snacks.picker.grep(opts)
+  end
+  return snacks.picker.grep()
+end
+
+local function ue_grep_all()
+  local snacks = require("snacks")
+  local opts = workspace_opts()
+  if opts then
+    opts.title = "Grep Workspace All"
+    return snacks.picker.grep(opts)
+  end
+  return snacks.picker.grep()
+end
+
+---------- Scope (current module/plugin) ----------
+
 local function ue_scope_files()
   local snacks = require("snacks")
-  local opts, _, err = ue_scope_picker_opts()
+  local opts, err = scope_opts()
   if opts then
     opts.title = "UE Scope Files"
+    with_ft(opts, code_ft())
     return snacks.picker.files(opts)
   end
-  if err then
-    vim.notify(err, vim.log.levels.WARN)
-    return
-  end
-  vim.notify("No UE module or plugin scope found", vim.log.levels.WARN)
+  vim.notify(err or "No UE module or plugin scope found", vim.log.levels.WARN)
 end
 
 local function ue_scope_grep()
   local snacks = require("snacks")
-  local opts, _, err = ue_scope_picker_opts()
+  local opts, err = scope_opts()
   if opts then
     opts.title = "UE Scope Grep"
+    with_glob(opts, code_globs())
     return snacks.picker.grep(opts)
   end
-  if err then
-    vim.notify(err, vim.log.levels.WARN)
-    return
-  end
-  vim.notify("No UE module or plugin scope found", vim.log.levels.WARN)
+  vim.notify(err or "No UE module or plugin scope found", vim.log.levels.WARN)
 end
+
+---------- Plugin spec ----------
 
 return {
   {
     "folke/snacks.nvim",
     keys = {
-      { "<leader>ff", ue_files, desc = "Find Project Files" },
-      { "<leader>fF", ue_workspace_files, desc = "Find UE Workspace Files" },
+      -- Grep
+      { "<leader>/", ue_project_grep, desc = "Grep Project Code (C++/Shader)" },
+      { "<leader>sg", ue_grep, desc = "Grep Workspace Code (C++/Shader)" },
+      { "<leader>sG", ue_grep_all, desc = "Grep Workspace All Files" },
+      -- Find files
+      { "<leader>ff", ue_files, desc = "Find Project Code (C++/Shader)" },
+      { "<leader>fF", ue_workspace_files, desc = "Find Workspace Code (C++/Shader)" },
+      { "<leader>fa", ue_workspace_all_files, desc = "Find Workspace All Files" },
       { "<leader>fg", ue_git_files, desc = "Find Project Git Files" },
-      { "<leader>sg", ue_grep, desc = "Grep" },
+      -- Scope (current module/plugin)
       { "<leader>uo", ue_scope_files, desc = "UE: Files in current module/plugin" },
       { "<leader>uO", ue_scope_grep, desc = "UE: Grep current module/plugin" },
     },

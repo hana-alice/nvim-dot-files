@@ -20,10 +20,11 @@
 ## Search / Picker
 - `<leader><space>` Find Files (root)
 - `<leader>,` Buffers
-- `<leader>/` Grep (root)
+- `<leader>/` Grep project code (C++/Shader only, excludes intermediates)
 - `<leader>:` Command history
-- `<leader>ff` Find Files in current UE project (fast path)
-- `<leader>fF` Find Files in UE workspace (engine + project)
+- `<leader>ff` Find project code files (C++/Shader only)
+- `<leader>fF` Find workspace code files (engine + project, C++/Shader)
+- `<leader>fa` Find workspace all files (no type filter)
 - `<leader>fg` Git files in current UE project
 - `<leader>fr` Recent files
 - `<leader>fR` Recent files (cwd)
@@ -31,8 +32,8 @@
 - `<leader>fb` Buffers
 - `<leader>fB` All buffers
 - `<leader>fc` Find config files
-- `<leader>uo` Find files in current UE module/plugin
-- `<leader>uO` Grep in current UE module/plugin
+- `<leader>uo` Find code files in current UE module/plugin
+- `<leader>uO` Grep code in current UE module/plugin
 
 ## Symbols / LSP / Code Nav
 - `gd` Definition
@@ -56,8 +57,8 @@
 ## Search Inside Code
 - `<leader>sb` Current buffer lines
 - `<leader>sB` Grep open buffers
-- `<leader>sg` Grep (root)
-- `<leader>sG` Grep (cwd)
+- `<leader>sg` Grep workspace code (C++/Shader, engine + project)
+- `<leader>sG` Grep workspace all files (no type filter)
 - `<leader>sw` Search current word or visual selection (root)
 - `<leader>sW` Search current word or visual selection (cwd)
 - `<leader>sx` Grep whole word (root)
@@ -179,6 +180,7 @@
 
 ## UE Custom
 - `<leader>uP` Set project root or `.uproject`
+- `:UESetAndroidPackage <pkg>` Persist Android package name for DAP attach
 - `<leader>uB` Run `UEPrepare`
 - `<leader>uc` Export `compile_commands.json`
 - `<leader>ub` Build Android Development with Windows `Build.bat`
@@ -189,6 +191,22 @@
 - `:UECheatsheetEdit` Edit this markdown file
 - `UEBuildAndroid` / `UEPrepare` / `UEExportCompileCommands` 失败时会自动把错误塞进 quickfix
 - lualine 里的 UE 状态会显示类似 `M:Foo IDX BOK` / `P:Bar IDX! B6`
+
+## Android DAP (Debug)
+- `<leader>da` Attach to Android process (auto ASLR fix + resume)
+- `:UESetAndroidPackage <pkg>` Set the Android package used by `UEAndroidDAPAttach`
+- `F9` Toggle hardware breakpoint on current line (via LLDB evaluate)
+- `F5` Continue
+- `F6` Pause
+- `F10` Step Over
+- `<leader>di` Step In
+- `<leader>do` Step Out
+- `<leader>du` Toggle DAP UI (auto save/restore window layout)
+- `<leader>dr` Toggle REPL
+- `<leader>dR` Reset layout (re-open DAP UI if debugging, otherwise `:only`)
+- `:qa` auto-cleanup: disconnect DAP, kill CodeLLDB, kill remote lldb-server
+- Only hardware breakpoints (`-H`) work; software BPs cannot write to remote Android memory
+- Globals/Static scopes are filtered out to prevent LLDB from enumerating millions of symbols
 
 ## Explorer / Discovery
 - `<leader>e` Explorer (root)

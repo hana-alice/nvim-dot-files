@@ -2544,7 +2544,10 @@ function M.android_dap_attach()
 
   -- Package name: read from persisted state, fallback to prompt
   local saved_pkg = state.android_package or ""
-  local package_name = vim.fn.input("Android package name: ", saved_pkg)
+  local package_name = saved_pkg
+  if package_name == "" then
+    package_name = vim.fn.input("Android package name: ", "")
+  end
   if package_name == "" then return end
   -- Persist for next attach
   if engine_root ~= "" and package_name ~= saved_pkg then

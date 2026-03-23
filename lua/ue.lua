@@ -492,9 +492,14 @@ end
 
 local function write_all(path, content)
   ensure_dir(dirname(path))
-  local file = assert(io.open(path, "wb"))
+  local file, err = io.open(path, "wb")
+  if not file then
+    vim.notify("write_all failed: " .. (err or path), vim.log.levels.ERROR)
+    return false
+  end
   file:write(content)
   file:close()
+  return true
 end
 
 local function read_all(path)
@@ -1227,20 +1232,36 @@ local function target_platform(engine_root, cmd)
   if override ~= "" then
     return override
   end
+  -- Check persisted state
+  if engine_root and engine_root ~= "" then
+    local state = read_state(engine_root)
+    local persisted = trim(state.target_platform or "")
+    if persisted ~= "" then
+      return persisted
+    end
+  end
   local exe = trim((cmd or {})[1])
   if exe ~= "" and (exe:lower():match("%.exe$") or exe:lower():match("%.bat$")) then
     return "Win64"
   end
-  if engine_root:match("^/mnt/[a-z]/") then
+  if engine_root and engine_root:match("^/mnt/[a-z]/") then
     return "Win64"
   end
   return "Linux"
 end
 
-local function target_configuration()
+local function target_configuration(engine_root)
   local override = trim(vim.env.UE_TARGET_CONFIGURATION)
   if override ~= "" then
     return override
+  end
+  -- Check persisted state
+  if engine_root and engine_root ~= "" then
+    local state = read_state(engine_root)
+    local persisted = trim(state.target_configuration or "")
+    if persisted ~= "" then
+      return persisted
+    end
   end
   return "Development"
 end
@@ -1563,7 +1584,7 @@ local function generate_compile_commands(ctx)
       "-Mode=GenerateClangDatabase",
       detect_target_name(ctx.project_root, uproject),
       target_platform(ctx.engine_root, { "Build.bat" }),
-      target_configuration(),
+      target_configuration(ctx.engine_root),
       "-Project=" .. project_arg,
       "-Game",
       "-Engine",
@@ -1573,7 +1594,7 @@ local function generate_compile_commands(ctx)
       "-Mode=GenerateClangDatabase",
       detect_target_name(ctx.project_root, uproject),
       target_platform(ctx.engine_root, { ubt_exe_path(ctx.engine_root) }),
-      target_configuration(),
+      target_configuration(ctx.engine_root),
       "-Project=" .. project_arg,
       "-Game",
       "-Engine",
@@ -1606,10 +1627,13 @@ local function android_build_command(ctx)
     return nil, "Failed to convert UE build paths to Windows paths"
   end
 
+  local plat = target_platform(ctx.engine_root, nil)
+  local conf = target_configuration(ctx.engine_root)
+
   local build_args = {
     build_target_name(ctx.project_root, uproject),
-    "Android",
-    "Development",
+    plat,
+    conf,
     "-Project=" .. uproject_win,
     "-WaitMutex",
     "-FromMsBuild",
@@ -1716,7 +1740,8 @@ local function open_terminal_command(cmd, opts)
       return build_term_win
     end
 
-    vim.cmd(("botright %dnew"):format(opts.height or 14))
+    local height = opts.height or math.max(8, math.floor(vim.o.lines * 0.25))
+    vim.cmd(("botright %dnew"):format(height))
     build_term_win = vim.api.nvim_get_current_win()
     return build_term_win
   end
@@ -1965,9 +1990,16 @@ local function show_paths()
     return
   end
 
+  local plat = target_platform(ctx.engine_root, nil)
+  local conf = target_configuration(ctx.engine_root)
+  local plat_source = trim(ctx.state.target_platform or "") ~= "" and "set" or (trim(vim.env.UE_TARGET_PLATFORM or "") ~= "" and "env" or "auto")
+  local conf_source = trim(ctx.state.target_configuration or "") ~= "" and "set" or (trim(vim.env.UE_TARGET_CONFIGURATION or "") ~= "" and "env" or "auto")
+
   local lines = {
     "Engine: " .. ctx.engine_root,
     "Project: " .. (ctx.project_root or "<unset>"),
+    "Platform: " .. plat .. " (" .. plat_source .. ")",
+    "Configuration: " .. conf .. " (" .. conf_source .. ")",
     "GTAGS Root: " .. workspace_root(ctx),
     "Compile Commands: " .. compile_commands_targets(ctx)[1],
     "Compile Commands (Engine): " .. compile_commands_targets(ctx)[2],
@@ -2158,6 +2190,65 @@ local function set_android_package(input)
   vim.notify("UE Android package set:\nEngine: " .. engine_root .. "\nPackage: " .. input)
 end
 
+local PLATFORM_CHOICES = { "Win64", "Android", "Linux", "Mac", "IOS" }
+local CONFIGURATION_CHOICES = { "Development", "DebugGame", "Debug", "Shipping", "Test" }
+
+local function set_platform(input)
+  local engine_root = current_engine_root()
+  if not engine_root then
+    vim.notify("No Unreal Engine root found from current buffer or cwd", vim.log.levels.WARN)
+    return
+  end
+
+  local state = read_state(engine_root)
+  local current_plat = trim(state.target_platform or "")
+  local current_conf = trim(state.target_configuration or "")
+
+  -- Direct input: "Win64 Development" or "Win64" or "Android DebugGame"
+  input = trim(input or "")
+  if input ~= "" then
+    local parts = vim.split(input, "%s+")
+    local plat = parts[1]
+    local conf = parts[2]
+    if plat and plat ~= "" then
+      update_state_field(engine_root, "target_platform", plat)
+    end
+    if conf and conf ~= "" then
+      update_state_field(engine_root, "target_configuration", conf)
+    end
+    invalidate_status_cache()
+    refresh_statusline()
+    _context_cache = {}
+    vim.notify(("UE platform: %s %s"):format(
+      plat or current_plat or "(auto)",
+      conf or current_conf or "Development"
+    ))
+    return
+  end
+
+  -- Interactive: select platform then configuration
+  vim.ui.select(PLATFORM_CHOICES, {
+    prompt = "Target Platform (current: " .. (current_plat ~= "" and current_plat or "auto") .. "):",
+  }, function(plat)
+    if not plat then
+      return
+    end
+    vim.ui.select(CONFIGURATION_CHOICES, {
+      prompt = "Target Configuration (current: " .. (current_conf ~= "" and current_conf or "Development") .. "):",
+    }, function(conf)
+      if not conf then
+        return
+      end
+      update_state_field(engine_root, "target_platform", plat)
+      update_state_field(engine_root, "target_configuration", conf)
+      invalidate_status_cache()
+      refresh_statusline()
+      _context_cache = {}
+      vim.notify(("UE platform set: %s %s\nRun :UEExportCompileCommands to regenerate for this platform"):format(plat, conf))
+    end)
+  end)
+end
+
 local function export_compile_commands()
   local ctx, err = resolve_context()
   if not ctx then
@@ -2191,17 +2282,23 @@ local function build_android()
     return
   end
 
+  local plat = target_platform(ctx.engine_root, nil)
+  local conf = target_configuration(ctx.engine_root)
+  local title = ("UEBuild %s %s"):format(plat, conf)
+
   local cmd, build_err = android_build_command(ctx)
   if not cmd then
     set_build_status("BERR")
-    vim.notify("UEBuildAndroid failed: " .. build_err, vim.log.levels.ERROR)
+    vim.notify(title .. " failed: " .. build_err, vim.log.levels.ERROR)
     return
   end
 
-  cleanup_gradle_debug_artifacts(ctx)
+  if plat == "Android" then
+    cleanup_gradle_debug_artifacts(ctx)
+  end
   open_terminal_command(cmd, {
     cwd = windows_host_cwd(),
-    quickfix_title = "UEBuildAndroid",
+    quickfix_title = title,
     quickfix_root = workspace_root(ctx),
     tail_limit = 16,
   })
@@ -2413,6 +2510,7 @@ end
 
 M._dap_session_state = M._dap_session_state or {}
 M._breakpoint_specs = M._breakpoint_specs or {}
+M._dap_attach_in_progress = false
 
 local function clear_android_breakpoint_state()
   M._breakpoint_specs = {}
@@ -2485,9 +2583,10 @@ function M._apply_aslr_fix(session_state, cb)
   -- Derive .so name from symbol_lib path (supports libUE4.so, libUnreal.so, etc.)
   local so_name = session_state.symbol_lib and vim.fn.fnamemodify(session_state.symbol_lib, ":t") or "libUE4.so"
   local adb = session_state.adb or "adb"
+  local cb_fired = false
 
   -- Read /proc/maps directly via adb (more reliable than platform shell)
-  vim.fn.jobstart({ adb, "shell", "cat /proc/" .. pid .. "/maps" }, {
+  local job_id = vim.fn.jobstart({ adb, "shell", "cat /proc/" .. pid .. "/maps" }, {
     stdout_buffered = true,
     on_stdout = function(_, data)
       local base_addr = nil
@@ -2499,6 +2598,8 @@ function M._apply_aslr_fix(session_state, cb)
       end
       if not base_addr then
         vim.schedule(function()
+          if cb_fired then return end
+          cb_fired = true
           vim.notify("ASLR fix: " .. so_name .. " not found in /proc/maps", vim.log.levels.ERROR)
           if cb then cb(false) end
         end)
@@ -2506,11 +2607,14 @@ function M._apply_aslr_fix(session_state, cb)
       end
       local base_hex = "0x" .. base_addr
       vim.schedule(function()
+        if cb_fired then return end
         vim.notify("ASLR fix: " .. so_name .. " base=" .. base_hex)
         M._dap_eval_lldb(
           ("target modules load --file %s --slide %s"):format(so_name, base_hex),
           function(ok, result)
             vim.schedule(function()
+              if cb_fired then return end
+              cb_fired = true
               vim.notify("ASLR fix: " .. (ok and "applied" or "FAILED: " .. tostring(result)))
               if cb then cb(ok) end
             end)
@@ -2521,12 +2625,24 @@ function M._apply_aslr_fix(session_state, cb)
     on_exit = function(_, code)
       if code ~= 0 then
         vim.schedule(function()
+          if cb_fired then return end
+          cb_fired = true
           vim.notify("ASLR fix: adb shell failed (exit " .. code .. ")", vim.log.levels.ERROR)
           if cb then cb(false) end
         end)
       end
     end,
   })
+  -- Timeout: kill adb job if it hangs (device disconnected, etc.)
+  if job_id and job_id > 0 then
+    vim.defer_fn(function()
+      if cb_fired then return end
+      pcall(vim.fn.jobstop, job_id)
+      cb_fired = true
+      vim.notify("ASLR fix: timed out (10s)", vim.log.levels.ERROR)
+      if cb then cb(false) end
+    end, 10000)
+  end
 end
 
 function M._android_dap_config(session)
@@ -2605,6 +2721,14 @@ function M.android_dap_attach()
     vim.notify("nvim-dap not installed", vim.log.levels.ERROR)
     return
   end
+  if M._dap_attach_in_progress then
+    vim.notify("DAP attach/launch already in progress", vim.log.levels.WARN)
+    return
+  end
+  if vim.fn.exepath("adb") == "" then
+    vim.notify("adb not found in PATH", vim.log.levels.ERROR)
+    return
+  end
   local ctx = resolve_context() or {}
   local project_root = ctx.project_root or ""
   local engine_root = ctx.engine_root or ""
@@ -2665,7 +2789,7 @@ function M.android_dap_attach()
     project_root = to_windows_path(project_root) or project_root,
     engine_root = to_windows_path(engine_root) or engine_root,
     adb = to_windows_path(vim.fn.exepath("adb")) or "adb",
-    socket_name = "lldb-platform-" .. os.time(),
+    socket_name = "lldb-platform-" .. vim.uv.hrtime(),
     pid_file = to_windows_path(tmpdir .. "/ue_dap_pid.txt"),
     serial_file = to_windows_path(tmpdir .. "/ue_dap_serial.txt"),
     uri_file = to_windows_path(tmpdir .. "/ue_dap_uri.txt"),
@@ -2681,6 +2805,7 @@ function M.android_dap_attach()
     attach_state.source_map[pr] = pr
   end
 
+  M._dap_attach_in_progress = true
   local progress = { "DAP Attach" }
   local notify_id = "ue_dap_attach"
   local function progress_update(msg, level)
@@ -2690,7 +2815,8 @@ function M.android_dap_attach()
 
   progress_update("starting preflight...")
   local ps1 = M._android_preflight_ps1(attach_state)
-  vim.fn.jobstart({ "powershell", "-NoProfile", "-Command", ps1 }, {
+  local preflight_done = false
+  local preflight_job = vim.fn.jobstart({ "powershell", "-NoProfile", "-Command", ps1 }, {
     on_stdout = function(_, data)
       for _, line in ipairs(data) do
         if line ~= "" then vim.schedule(function() progress_update(line) end) end
@@ -2702,14 +2828,17 @@ function M.android_dap_attach()
       end
     end,
     on_exit = function(_, code)
+      preflight_done = true
       vim.schedule(function()
         if code ~= 0 then
+          M._dap_attach_in_progress = false
           progress_update("FAILED (exit " .. code .. ")", vim.log.levels.ERROR)
           return
         end
         local pid = trim((vim.fn.readfile(attach_state.pid_file) or {})[1] or "")
         local connect_uri = trim((vim.fn.readfile(attach_state.uri_file) or {})[1] or "")
         if pid == "" or connect_uri == "" then
+          M._dap_attach_in_progress = false
           progress_update("no PID or connect URI produced", vim.log.levels.ERROR)
           return
         end
@@ -2720,6 +2849,7 @@ function M.android_dap_attach()
         dap.listeners.after.event_initialized["ue_aslr_fix"] = nil
         dap.listeners.after.event_stopped["ue_aslr_fix"] = function(dap_session)
           dap.listeners.after.event_stopped["ue_aslr_fix"] = nil
+          M._dap_attach_in_progress = false
           if dap.session() ~= dap_session then
             return
           end
@@ -2742,6 +2872,15 @@ function M.android_dap_attach()
       end)
     end,
   })
+  -- Timeout: kill preflight if it hangs (device disconnected, adb stuck)
+  if preflight_job and preflight_job > 0 then
+    vim.defer_fn(function()
+      if preflight_done then return end
+      pcall(vim.fn.jobstop, preflight_job)
+      M._dap_attach_in_progress = false
+      progress_update("TIMED OUT (30s) — device may be disconnected", vim.log.levels.ERROR)
+    end, 30000)
+  end
 end
 
 function M._android_launch_preflight_ps1(session)
@@ -2813,6 +2952,14 @@ function M.android_dap_launch()
     vim.notify("nvim-dap not installed", vim.log.levels.ERROR)
     return
   end
+  if M._dap_attach_in_progress then
+    vim.notify("DAP attach/launch already in progress", vim.log.levels.WARN)
+    return
+  end
+  if vim.fn.exepath("adb") == "" then
+    vim.notify("adb not found in PATH", vim.log.levels.ERROR)
+    return
+  end
   local ctx = resolve_context() or {}
   local project_root = ctx.project_root or ""
   local engine_root = ctx.engine_root or ""
@@ -2872,7 +3019,7 @@ function M.android_dap_launch()
     project_root = to_windows_path(project_root) or project_root,
     engine_root = to_windows_path(engine_root) or engine_root,
     adb = to_windows_path(vim.fn.exepath("adb")) or "adb",
-    socket_name = "lldb-platform-" .. os.time(),
+    socket_name = "lldb-platform-" .. vim.uv.hrtime(),
     pid_file = to_windows_path(tmpdir .. "/ue_dap_pid.txt"),
     serial_file = to_windows_path(tmpdir .. "/ue_dap_serial.txt"),
     uri_file = to_windows_path(tmpdir .. "/ue_dap_uri.txt"),
@@ -2888,6 +3035,7 @@ function M.android_dap_launch()
     attach_state.source_map[pr] = pr
   end
 
+  M._dap_attach_in_progress = true
   local progress = { "DAP Launch" }
   local notify_id = "ue_dap_launch"
   local function progress_update(msg, level)
@@ -2897,7 +3045,8 @@ function M.android_dap_launch()
 
   progress_update("starting...")
   local ps1 = M._android_launch_preflight_ps1(attach_state)
-  vim.fn.jobstart({ "powershell", "-NoProfile", "-Command", ps1 }, {
+  local preflight_done = false
+  local preflight_job = vim.fn.jobstart({ "powershell", "-NoProfile", "-Command", ps1 }, {
     on_stdout = function(_, data)
       for _, line in ipairs(data) do
         if line ~= "" then vim.schedule(function() progress_update(line) end) end
@@ -2909,14 +3058,17 @@ function M.android_dap_launch()
       end
     end,
     on_exit = function(_, code)
+      preflight_done = true
       vim.schedule(function()
         if code ~= 0 then
+          M._dap_attach_in_progress = false
           progress_update("FAILED (exit " .. code .. ")", vim.log.levels.ERROR)
           return
         end
         local pid = trim((vim.fn.readfile(attach_state.pid_file) or {})[1] or "")
         local connect_uri = trim((vim.fn.readfile(attach_state.uri_file) or {})[1] or "")
         if pid == "" or connect_uri == "" then
+          M._dap_attach_in_progress = false
           progress_update("no PID or connect URI produced", vim.log.levels.ERROR)
           return
         end
@@ -2927,6 +3079,7 @@ function M.android_dap_launch()
         dap.listeners.after.event_initialized["ue_aslr_fix"] = nil
         dap.listeners.after.event_stopped["ue_aslr_fix"] = function(dap_session)
           dap.listeners.after.event_stopped["ue_aslr_fix"] = nil
+          M._dap_attach_in_progress = false
           if dap.session() ~= dap_session then
             return
           end
@@ -2949,6 +3102,15 @@ function M.android_dap_launch()
       end)
     end,
   })
+  -- Timeout: kill preflight if it hangs (device disconnected, adb stuck)
+  if preflight_job and preflight_job > 0 then
+    vim.defer_fn(function()
+      if preflight_done then return end
+      pcall(vim.fn.jobstop, preflight_job)
+      M._dap_attach_in_progress = false
+      progress_update("TIMED OUT (30s) — device may be disconnected", vim.log.levels.ERROR)
+    end, 30000)
+  end
 end
 
 function M._dap_eval_lldb(command, cb)
@@ -3172,6 +3334,9 @@ function M.setup_dap(dap, dapui)
 
   local function on_session_end()
     restore_layout()
+    M._dap_attach_in_progress = false
+    -- Clean up any pending ASLR listener (session died before event_stopped)
+    dap.listeners.after.event_stopped["ue_aslr_fix"] = nil
     -- Keep _breakpoint_specs and signs so they persist across re-attach.
     -- They will be re-applied to the new LLDB session after ASLR fix.
     -- Kill remote lldb-server so re-attach can start a new one
@@ -3259,7 +3424,32 @@ function M.setup()
   vim.api.nvim_create_user_command("UESetAndroidPackage", function(opts)
     set_android_package(opts.args)
   end, { nargs = "?" })
+  vim.api.nvim_create_user_command("UESetPlatform", function(opts)
+    set_platform(opts.args)
+  end, {
+    nargs = "?",
+    complete = function(arg_lead)
+      local all = {}
+      for _, p in ipairs(PLATFORM_CHOICES) do
+        for _, c in ipairs(CONFIGURATION_CHOICES) do
+          table.insert(all, p .. " " .. c)
+        end
+        table.insert(all, p)
+      end
+      if arg_lead == "" then
+        return all
+      end
+      local matches = {}
+      for _, item in ipairs(all) do
+        if item:lower():find(arg_lead:lower(), 1, true) == 1 then
+          table.insert(matches, item)
+        end
+      end
+      return matches
+    end,
+  })
   vim.api.nvim_create_user_command("UEExportCompileCommands", export_compile_commands, {})
+  vim.api.nvim_create_user_command("UEBuild", build_android, {})
   vim.api.nvim_create_user_command("UEBuildAndroid", build_android, {})
   vim.api.nvim_create_user_command("UEInstallAndroid", install_android, {})
   vim.api.nvim_create_user_command("UEPrepare", prepare, {})
@@ -3303,7 +3493,10 @@ function M.setup()
   end, {})
 
   local group = vim.api.nvim_create_augroup("ue_statusline", { clear = true })
-  local statusline_timer = vim.uv.new_timer()
+  -- Stop old timer on reload to prevent leaks
+  if M._statusline_timer then pcall(function() M._statusline_timer:stop() end) end
+  M._statusline_timer = vim.uv.new_timer()
+  local statusline_timer = M._statusline_timer
   vim.api.nvim_create_autocmd("BufEnter", {
     group = group,
     callback = function()

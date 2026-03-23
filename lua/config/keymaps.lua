@@ -39,7 +39,7 @@ map({ "n", "x" }, "<leader>sY", live_grep_word_with({
   root = false,
 }), { desc = "Search: Live grep word/selection (cwd)" })
 map("n", "<leader>bn", "<cmd>confirm enew<cr>", { desc = "Buffer: New empty buffer" })
-map("n", "<leader>ub", "<cmd>UEBuildAndroid<cr>", { desc = "UE: Build Android Development" })
+map("n", "<leader>ub", "<cmd>UEBuild<cr>", { desc = "UE: Build (platform from UESetPlatform)" })
 map("n", "<leader>uB", "<cmd>UEPrepare<cr>", { desc = "UE: Prepare symbols + compile_commands" })
 map("n", "<leader>uc", "<cmd>UEExportCompileCommands<cr>", { desc = "UE: Export compile_commands" })
 map("n", "<leader>up", "<cmd>UEPaths<cr>", { desc = "UE: Show paths" })

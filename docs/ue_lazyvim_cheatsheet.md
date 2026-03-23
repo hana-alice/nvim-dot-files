@@ -18,7 +18,7 @@
 - `<leader>cs` 用 Trouble 打开 symbols outline
 
 ## Search / Picker
-- `<leader><space>` Find Files (root)
+- `<leader><space>` Find Project Files (excludes intermediates)
 - `<leader>,` Buffers
 - `<leader>/` Grep project code (C++/Shader only, excludes intermediates)
 - `<leader>:` Command history
@@ -180,6 +180,8 @@
 
 ## UE Custom
 - `<leader>uP` Set project root or `.uproject`
+- `:UESetPlatform` Interactive select platform + configuration (Win64/Android/Linux × Development/DebugGame/…)
+- `:UESetPlatform Win64 Development` Direct set (also accepts single arg like `Win64`)
 - `:UESetAndroidPackage <pkg>` Persist Android package name for DAP attach
 - `<leader>uB` Run `UEPrepare`
 - `<leader>uc` Export `compile_commands.json`
@@ -191,6 +193,8 @@
 - `:UECheatsheet` Open this cheatsheet
 - `:UECheatsheetEdit` Edit this markdown file
 - `UEBuildAndroid` / `UEPrepare` / `UEExportCompileCommands` 失败时会自动把错误塞进 quickfix
+- 切换平台流程: `:UESetPlatform Win64 Development` → `:UEExportCompileCommands` → clangd 自动重载
+- `:UEPaths` 会显示当前 Platform / Configuration 及来源 (set/env/auto)
 - lualine 里的 UE 状态会显示类似 `M:Foo IDX BOK` / `P:Bar IDX! B6`
 
 ## Android DAP (Debug)

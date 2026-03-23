@@ -58,6 +58,17 @@ end
 
 ---------- Find files ----------
 
+-- <leader><space> — project files (all types, fast)
+local function ue_project_files()
+  local snacks = require("snacks")
+  local opts = project_opts()
+  if opts then
+    opts.title = "UE Project Files"
+    return snacks.picker.files(opts)
+  end
+  return snacks.picker.files()
+end
+
 local function ue_files()
   local snacks = require("snacks")
   local opts = with_ft(project_opts(), code_ft())
@@ -164,9 +175,10 @@ return {
       { "<leader>sg", ue_grep, desc = "Grep Workspace Code (C++/Shader)" },
       { "<leader>sG", ue_grep_all, desc = "Grep Workspace All Files" },
       -- Find files
-      { "<leader>ff", ue_files, desc = "Find Project Code (C++/Shader)" },
+      { "<leader><space>", ue_workspace_all_files, desc = "Find Engine Files" },
+      { "<leader>ff", ue_project_files, desc = "Find Project Files" },
       { "<leader>fF", ue_workspace_files, desc = "Find Workspace Code (C++/Shader)" },
-      { "<leader>fa", ue_workspace_all_files, desc = "Find Workspace All Files" },
+      { "<leader>fa", ue_files, desc = "Find Project Code (C++/Shader)" },
       { "<leader>fg", ue_git_files, desc = "Find Project Git Files" },
       -- Scope (current module/plugin)
       { "<leader>uo", ue_scope_files, desc = "UE: Files in current module/plugin" },

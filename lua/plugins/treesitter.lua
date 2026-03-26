@@ -9,6 +9,7 @@ return {
         "bash",
         "c",
         "cpp",
+        "hlsl",
         "json",
         "lua",
         "markdown",

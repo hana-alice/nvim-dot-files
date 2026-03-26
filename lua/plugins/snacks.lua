@@ -45,6 +45,11 @@ local function code_globs()
   return ue and ue.GLOBS_CODE or nil
 end
 
+local function all_globs()
+  local ue = get_ue()
+  return ue and ue.GLOBS_ALL or nil
+end
+
 -- Apply file type filter: ft for files picker, glob for grep picker
 local function with_ft(opts, ft)
   if opts and ft then opts.ft = ft end
@@ -56,9 +61,29 @@ local function with_glob(opts, globs)
   return opts
 end
 
+-- Track last search queries so the picker reopens with previous input
+local last_query = {}
+
+local function with_last_query(key, opts)
+  opts = opts or {}
+  if last_query[key] and last_query[key] ~= "" then
+    opts.search = last_query[key]
+  end
+  local orig_on_close = opts.on_close
+  opts.on_close = function(picker)
+    -- Try common locations for the search text
+    local q = (picker.filter and picker.filter.search)
+      or (picker.input and picker.input.filter and picker.input.filter.search)
+      or ""
+    last_query[key] = q
+    if orig_on_close then orig_on_close(picker) end
+  end
+  return opts
+end
+
 ---------- Find files ----------
 
--- <leader><space> — project files (all types, fast)
+-- <leader>ff — project files (all types, fast)
 local function ue_project_files()
   local snacks = require("snacks")
   local opts = project_opts()
@@ -91,12 +116,9 @@ end
 
 local function ue_workspace_all_files()
   local snacks = require("snacks")
-  local opts = workspace_opts()
-  if opts then
-    opts.title = "UE Workspace All Files"
-    return snacks.picker.files(opts)
-  end
-  return snacks.picker.files()
+  local opts = with_last_query("files", workspace_opts() or {})
+  opts.title = "UE Workspace All Files"
+  return snacks.picker.files(opts)
 end
 
 local function ue_git_files()
@@ -112,12 +134,9 @@ end
 
 local function ue_project_grep()
   local snacks = require("snacks")
-  local opts = with_glob(project_opts(), code_globs())
-  if opts then
-    opts.title = "Grep Project Code"
-    return snacks.picker.grep(opts)
-  end
-  return snacks.picker.grep()
+  local opts = with_last_query("grep", with_glob(workspace_opts(), all_globs()) or {})
+  opts.title = "Grep All Code (Engine+Project)"
+  return snacks.picker.grep(opts)
 end
 
 local function ue_grep()
@@ -171,7 +190,7 @@ return {
     "folke/snacks.nvim",
     keys = {
       -- Grep
-      { "<leader>/", ue_project_grep, desc = "Grep Project Code (C++/Shader)" },
+      { "<leader>/", ue_project_grep, desc = "Grep All Code (Engine+Project)" },
       { "<leader>sg", ue_grep, desc = "Grep Workspace Code (C++/Shader)" },
       { "<leader>sG", ue_grep_all, desc = "Grep Workspace All Files" },
       -- Find files

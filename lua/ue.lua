@@ -825,8 +825,24 @@ M.FT_SHADER = {
 
 M.FT_CODE = vim.list_extend(vim.list_extend({}, M.FT_CPP), M.FT_SHADER)
 
+M.FT_CONFIG = {
+  "ini", "cfg", "conf",
+  "cs",
+  "ts", "js",
+  "json",
+  "xml",
+  "yaml", "yml",
+  "py",
+  "lua",
+  "uproject", "uplugin",
+  "build.cs", "target.cs",
+}
+
+M.FT_ALL = vim.list_extend(vim.list_extend({}, M.FT_CODE), M.FT_CONFIG)
+
 -- Globs (for rg -g / grep picker)
 M.GLOBS_CODE = vim.tbl_map(function(ext) return "*." .. ext end, M.FT_CODE)
+M.GLOBS_ALL = vim.tbl_map(function(ext) return "*." .. ext end, M.FT_ALL)
 
 local function existing_relative_dirs(root, search_paths)
   local dirs = {}
@@ -2517,6 +2533,68 @@ local function clear_android_breakpoint_state()
   pcall(vim.fn.sign_unplace, "ue_dap_bp")
 end
 
+local function save_breakpoints()
+  local ctx = resolve_context()
+  if not ctx then return end
+  local specs = M._breakpoint_specs or {}
+  -- Convert to a serialisable list
+  local list = {}
+  for key, spec in pairs(specs) do
+    list[#list + 1] = {
+      key = key,
+      set_command = spec.set_command,
+      clear_command = spec.clear_command,
+      file = spec.file,
+      line = spec.line,
+    }
+  end
+  update_state_field(ctx.engine_root, "breakpoints", list)
+end
+
+local function load_breakpoints()
+  local ctx = resolve_context()
+  if not ctx then return end
+  local state = read_state(ctx.engine_root)
+  local list = state and state.breakpoints or {}
+  if type(list) ~= "table" or #list == 0 then return end
+
+  vim.fn.sign_define("UEDapBreakpoint", { text = "●", texthl = "DiagnosticError" })
+
+  for _, entry in ipairs(list) do
+    if entry.key and entry.set_command then
+      M._breakpoint_specs[entry.key] = {
+        set_command = entry.set_command,
+        clear_command = entry.clear_command,
+        file = entry.file,
+        line = entry.line,
+      }
+      -- Restore sign if the buffer is loaded
+      local path = entry.key:match("^(.+):%d+$")
+      if path then
+        local bufnr = vim.fn.bufnr(path)
+        if bufnr ~= -1 then
+          vim.fn.sign_place(entry.line, "ue_dap_bp", "UEDapBreakpoint", bufnr, { lnum = entry.line })
+        end
+      end
+    end
+  end
+  -- For files not yet loaded, place signs when they open
+  vim.api.nvim_create_autocmd("BufReadPost", {
+    group = vim.api.nvim_create_augroup("ue_dap_bp_restore", { clear = true }),
+    callback = function(ev)
+      local buf_path = norm(vim.api.nvim_buf_get_name(ev.buf))
+      if buf_path == "" then return end
+      for key, spec in pairs(M._breakpoint_specs) do
+        local kpath = key:match("^(.+):%d+$")
+        if kpath and norm(kpath) == buf_path then
+          vim.fn.sign_define("UEDapBreakpoint", { text = "●", texthl = "DiagnosticError" })
+          vim.fn.sign_place(spec.line, "ue_dap_bp", "UEDapBreakpoint", ev.buf, { lnum = spec.line })
+        end
+      end
+    end,
+  })
+end
+
 local function basename(path)
   return path:match("([^/\\]+)$") or path
 end
@@ -3181,6 +3259,7 @@ function M.dap_toggle_breakpoint()
       vim.notify(("BP pending: %s:%d (will apply on attach)"):format(file, line))
     end
   end
+  save_breakpoints()
 end
 
 function M.dap_continue()
@@ -3401,11 +3480,14 @@ function M.setup_dap(dap, dapui)
         vim.fn.system({ "adb", "shell",
           "run-as " .. state.package_name .. " sh -c 'pkill -9 lldb-server 2>/dev/null'" })
       end
-      -- Clear state
+      -- Clear session state but persist breakpoints to disk
       M._dap_session_state = {}
-      clear_android_breakpoint_state()
+      save_breakpoints()
     end,
   })
+
+  -- Restore breakpoints from last session
+  load_breakpoints()
 end
 
 function M.setup()

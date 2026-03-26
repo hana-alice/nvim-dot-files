@@ -71,10 +71,8 @@ local function with_last_query(key, opts)
   end
   local orig_on_close = opts.on_close
   opts.on_close = function(picker)
-    -- Try common locations for the search text
-    local q = (picker.filter and picker.filter.search)
-      or (picker.input and picker.input.filter and picker.input.filter.search)
-      or ""
+    local f = type(picker.filter) == "function" and picker:filter() or picker.filter
+    local q = (f and f.search) or ""
     last_query[key] = q
     if orig_on_close then orig_on_close(picker) end
   end

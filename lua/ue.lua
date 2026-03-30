@@ -2553,6 +2553,15 @@ M._dap_session_state = M._dap_session_state or {}
 M._breakpoint_specs = M._breakpoint_specs or {}
 M._dap_attach_in_progress = false
 M._dap_run_state = M._dap_run_state or "idle"
+M._continue_debounce_until_ms = M._continue_debounce_until_ms or 0
+
+local function mono_ms()
+  local uv = vim.uv or vim.loop
+  if uv and uv.hrtime then
+    return math.floor(uv.hrtime() / 1e6)
+  end
+  return math.floor(vim.fn.reltimefloat(vim.fn.reltime()) * 1000)
+end
 
 local function clear_android_breakpoint_state()
   M._breakpoint_specs = {}
@@ -2740,12 +2749,14 @@ local function request_dap_continue(dap)
   end
   M._continue_pending = true
   M._dap_run_state = "resuming"
+  M._continue_debounce_until_ms = mono_ms() + 750
   local ok, err = pcall(dap.continue)
   if ok then
     return true
   end
   M._continue_pending = false
   M._dap_run_state = session.stopped_thread_id and "stopped" or "idle"
+  M._continue_debounce_until_ms = 0
   vim.notify("Continue failed: " .. tostring(err), vim.log.levels.WARN)
   return false
 end
@@ -3506,11 +3517,18 @@ function M.dap_continue()
     vim.notify("Attach bootstrap still running; wait for READY", vim.log.levels.DEBUG)
     return
   end
+  local now = mono_ms()
+  if M._dap_run_state ~= "stopped" and now < (M._continue_debounce_until_ms or 0) then
+    return
+  end
   if M._continue_pending or M._dap_run_state == "resuming" then return end
   local session = dap.session()
-  if session.stopped_thread_id or session.current_frame or M._dap_run_state == "stopped" then
+  local is_stopped = M._dap_run_state == "stopped"
+    or (session.stopped_thread_id and M._dap_run_state ~= "running" and M._dap_run_state ~= "attaching")
+  if is_stopped then
     request_dap_continue(dap)
   else
+    M._continue_debounce_until_ms = now + 250
     vim.notify("Process already running", vim.log.levels.DEBUG)
   end
 end
@@ -3692,6 +3710,7 @@ function M.setup_dap(dap, dapui)
     M._dap_attach_in_progress = false
     M._dap_run_state = "idle"
     M._continue_pending = false
+    M._continue_debounce_until_ms = 0
     M._pause_pending = false
     -- Clean up any pending ASLR listeners (session died before event_stopped)
     dap.listeners.after.event_stopped["ue_aslr_fix"] = nil
@@ -3724,16 +3743,20 @@ function M.setup_dap(dap, dapui)
     if dap.session() ~= session then return end
     M._dap_run_state = "stopped"
     M._continue_pending = false
+    M._continue_debounce_until_ms = 0
     M._pause_pending = false
   end
   dap.listeners.after.event_continued["ue-android-dap-run-state"] = function(session)
     if dap.session() ~= session then return end
     M._dap_run_state = "running"
     M._continue_pending = false
+    session.current_frame = nil
+    session.stopped_thread_id = nil
   end
   dap.listeners.after["continue"]["ue-android-dap-run-state"] = function(session, err)
     if dap.session() ~= session or not err then return end
     M._continue_pending = false
+    M._continue_debounce_until_ms = 0
     M._dap_run_state = session.stopped_thread_id and "stopped" or "idle"
   end
   dap.listeners.after.event_stopped["ue-android-dap-source-nav"] = function(session, body)

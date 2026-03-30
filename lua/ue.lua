@@ -2554,6 +2554,7 @@ M._breakpoint_specs = M._breakpoint_specs or {}
 M._dap_attach_in_progress = false
 M._dap_run_state = M._dap_run_state or "idle"
 M._continue_debounce_until_ms = M._continue_debounce_until_ms or 0
+M._dap_source_file_cache = M._dap_source_file_cache or {}
 
 local function mono_ms()
   local uv = vim.uv or vim.loop
@@ -2660,7 +2661,14 @@ local function frame_has_local_source(frame)
   if path == "" or path:match("^[a-z]+://") then
     return false
   end
-  return is_file(path)
+  local cache = M._dap_source_file_cache or {}
+  local cached = cache[path]
+  if cached == nil then
+    cached = is_file(path)
+    cache[path] = cached
+    M._dap_source_file_cache = cache
+  end
+  return cached
 end
 
 local function pick_local_source_frame(frames)
@@ -2797,21 +2805,35 @@ function M._reapply_breakpoints(cb)
     return
   end
   local pending = #keys
+  local restored = 0
+  local failed = {}
   local function done()
     pending = pending - 1
     if pending <= 0 then
       -- After all BPs set, check resolved status
       M._dap_eval_lldb("breakpoint list", function(_, bp_list)
         vim.schedule(function()
+          local total, resolved = 0, 0
           if bp_list then
-            local total, resolved = 0, 0
             for n in bp_list:gmatch("resolved = (%d+)") do
               total = total + 1
               resolved = resolved + tonumber(n)
             end
-            vim.notify(("BPs: %d set, %d resolved"):format(total, resolved),
-              resolved > 0 and vim.log.levels.INFO or vim.log.levels.WARN)
           end
+          local parts = { ("BPs restored: %d/%d"):format(restored, #keys) }
+          if total > 0 then
+            parts[#parts + 1] = ("resolved: %d/%d"):format(resolved, total)
+          end
+          if #failed > 0 then
+            local sample = {}
+            for i = 1, math.min(#failed, 3) do
+              sample[#sample + 1] = failed[i]
+            end
+            parts[#parts + 1] = ("failed: %d"):format(#failed)
+            parts[#parts + 1] = table.concat(sample, "\n")
+          end
+          local level = (#failed == 0 and resolved > 0) and vim.log.levels.INFO or vim.log.levels.WARN
+          vim.notify(table.concat(parts, "\n"), level)
         end)
         if cb then cb() end
       end)
@@ -2820,13 +2842,11 @@ function M._reapply_breakpoints(cb)
   for _, key in ipairs(keys) do
     local spec = specs[key]
     M._dap_eval_lldb(spec.set_command, function(ok, result)
-      vim.schedule(function()
-        if ok then
-          vim.notify(("BP restored: %s:%d"):format(spec.file, spec.line))
-        else
-          vim.notify(("BP restore failed: %s:%d: %s"):format(spec.file, spec.line, tostring(result)), vim.log.levels.WARN)
-        end
-      end)
+      if ok then
+        restored = restored + 1
+      else
+        failed[#failed + 1] = ("%s:%d: %s"):format(spec.file, spec.line, tostring(result))
+      end
       done()
     end)
   end
@@ -3135,6 +3155,7 @@ function M.android_dap_attach()
 
   M._dap_attach_in_progress = true
   M._dap_run_state = "attaching"
+  M._dap_source_file_cache = {}
   local progress = { "DAP Attach" }
   local notify_id = "ue_dap_attach"
   local function progress_update(msg, level)
@@ -3348,6 +3369,7 @@ function M.android_dap_launch()
 
   M._dap_attach_in_progress = true
   M._dap_run_state = "attaching"
+  M._dap_source_file_cache = {}
   local progress = { "DAP Launch" }
   local notify_id = "ue_dap_launch"
   local function progress_update(msg, level)
@@ -3711,6 +3733,7 @@ function M.setup_dap(dap, dapui)
     M._dap_run_state = "idle"
     M._continue_pending = false
     M._continue_debounce_until_ms = 0
+    M._dap_source_file_cache = {}
     M._pause_pending = false
     -- Clean up any pending ASLR listeners (session died before event_stopped)
     dap.listeners.after.event_stopped["ue_aslr_fix"] = nil

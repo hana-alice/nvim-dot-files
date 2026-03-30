@@ -130,6 +130,10 @@ local function setup_options()
   vim.g.ueindex_status = vim.g.ueindex_status or ""
 
   vim.opt.clipboard = "unnamedplus"
+  -- Keep Neovim mouse support enabled, but don't show the old popup menu on right click.
+  vim.opt.mouse = "a"
+  vim.opt.mousemodel = "extend"
+  vim.cmd("silent! aunmenu PopUp")
   vim.opt.undofile = true
   vim.opt.undodir = vim.fn.stdpath("state") .. "/undo"
   vim.opt.backup = false

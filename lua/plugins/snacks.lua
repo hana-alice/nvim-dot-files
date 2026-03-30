@@ -187,6 +187,10 @@ return {
   {
     "folke/snacks.nvim",
     keys = {
+      { "<leader>fe", false },
+      { "<leader>fE", false },
+      { "<leader>e", function() require("utils.yazi").open_current() end, desc = "Yazi (current file)" },
+      { "<leader>E", false },
       -- Grep
       { "<leader>/", ue_project_grep, desc = "Grep All Code (Engine+Project)" },
       { "<leader>sg", ue_grep, desc = "Grep Workspace Code (C++/Shader)" },
@@ -203,6 +207,10 @@ return {
     },
     opts = function(_, opts)
       opts = opts or {}
+      opts.explorer = vim.tbl_deep_extend("force", opts.explorer or {}, {
+        enabled = false,
+        replace_netrw = false,
+      })
       opts.picker = opts.picker or {}
       opts.picker.win = opts.picker.win or {}
       opts.picker.win.input = opts.picker.win.input or {}

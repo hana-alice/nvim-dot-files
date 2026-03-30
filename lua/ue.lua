@@ -2552,6 +2552,7 @@ end
 M._dap_session_state = M._dap_session_state or {}
 M._breakpoint_specs = M._breakpoint_specs or {}
 M._dap_attach_in_progress = false
+M._dap_run_state = M._dap_run_state or "idle"
 
 local function clear_android_breakpoint_state()
   M._breakpoint_specs = {}
@@ -2626,6 +2627,129 @@ local function basename(path)
   return path:match("([^/\\]+)$") or path
 end
 
+local function is_sigstop_stop(body)
+  if type(body) ~= "table" then
+    return false
+  end
+  local text = table.concat({
+    tostring(body.reason or ""),
+    tostring(body.description or ""),
+    tostring(body.text or ""),
+  }, " "):lower()
+  return text:find("sigstop", 1, true) ~= nil
+end
+
+local function frame_has_local_source(frame)
+  local source = frame and frame.source or nil
+  if not source then
+    return false
+  end
+  if tonumber(source.sourceReference or 0) ~= 0 then
+    return false
+  end
+  local path = norm(source.path or "")
+  if path == "" or path:match("^[a-z]+://") then
+    return false
+  end
+  return is_file(path)
+end
+
+local function pick_local_source_frame(frames)
+  for _, frame in ipairs(frames or {}) do
+    if frame_has_local_source(frame) then
+      return frame
+    end
+  end
+  return nil
+end
+
+local function request_stack_frames(session, thread_id, cb)
+  if not session or not thread_id then
+    if cb then cb(nil) end
+    return
+  end
+  session:request("stackTrace", {
+    threadId = thread_id,
+    startFrame = 0,
+    levels = 20,
+  }, function(err, response)
+    if err then
+      if cb then cb(nil, err) end
+      return
+    end
+    local frames = response and response.stackFrames or nil
+    local thread = session.threads and session.threads[thread_id] or nil
+    if thread and frames then
+      thread.frames = frames
+    end
+    if cb then cb(frames) end
+  end)
+end
+
+local function maybe_jump_to_local_source_frame(session, body)
+  if not session or M._dap_attach_in_progress or is_sigstop_stop(body) then
+    return
+  end
+  if frame_has_local_source(session.current_frame) then
+    return
+  end
+
+  local thread_id = (body and body.threadId) or session.stopped_thread_id
+  if not thread_id then
+    return
+  end
+
+  local function jump_from_frames(frames)
+    if frame_has_local_source(session.current_frame) then
+      return
+    end
+    local frame = pick_local_source_frame(frames)
+    if not frame then
+      return
+    end
+    if type(session._frame_set) == "function" then
+      session:_frame_set(frame)
+      return
+    end
+    local source = frame.source or {}
+    local path = norm(source.path or "")
+    if path == "" then
+      return
+    end
+    vim.cmd("edit " .. vim.fn.fnameescape(path))
+    vim.api.nvim_win_set_cursor(0, { frame.line or 1, math.max((frame.column or 1) - 1, 0) })
+  end
+
+  local thread = session.threads and session.threads[thread_id] or nil
+  if thread and thread.frames and #thread.frames > 0 then
+    jump_from_frames(thread.frames)
+    return
+  end
+
+  request_stack_frames(session, thread_id, function(frames)
+    vim.schedule(function()
+      jump_from_frames(frames)
+    end)
+  end)
+end
+
+local function request_dap_continue(dap)
+  local session = dap and dap.session and dap.session() or nil
+  if not session then
+    return false
+  end
+  M._continue_pending = true
+  M._dap_run_state = "resuming"
+  local ok, err = pcall(dap.continue)
+  if ok then
+    return true
+  end
+  M._continue_pending = false
+  M._dap_run_state = session.stopped_thread_id and "stopped" or "idle"
+  vim.notify("Continue failed: " .. tostring(err), vim.log.levels.WARN)
+  return false
+end
+
 local function to_windows_path(p)
   if not p or p == "" then return nil end
   return tostring(p):gsub("/", "\\")
@@ -2698,28 +2822,40 @@ function M._reapply_breakpoints(cb)
 end
 
 function M._setup_aslr_listeners(dap, attach_state, progress_update)
-  -- ASLR fix now runs inline in processCreateCommands (Python script).
-  -- This listener handles: reapply pending BPs, then continue the process.
   local handled = false
-  local function on_post_attach()
+  local function do_aslr_and_continue()
     if handled then return end
     handled = true
     dap.listeners.after.event_stopped["ue_aslr_fix"] = nil
     dap.listeners.after.event_initialized["ue_aslr_fix"] = nil
-    M._dap_attach_in_progress = false
-    progress_update("ASLR fix applied in processCreateCommands, syncing breakpoints...")
-    M._reapply_breakpoints(function()
-      progress_update("breakpoints synced, continuing...")
-      M._dap_eval_lldb("process continue", function()
-        vim.schedule(function() progress_update("READY") end)
-      end)
+    progress_update("applying ASLR fix...")
+    M._apply_aslr_fix(attach_state, function(ok)
+      local function do_continue()
+        -- MUST use dap.continue() to keep nvim-dap state in sync.
+        -- Using _dap_eval_lldb("process continue") bypasses the DAP protocol
+        -- and leaves nvim-dap unaware the process is running, which causes:
+        -- 1) no auto-jump to source on breakpoint hit
+        -- 2) F5 sends duplicate continue → CodeLLDB disconnects
+        vim.schedule(function()
+          progress_update("READY")
+          request_dap_continue(dap)
+          M._dap_attach_in_progress = false
+        end)
+      end
+      if ok then
+        progress_update("ASLR fix applied, syncing breakpoints...")
+        M._reapply_breakpoints(function() do_continue() end)
+      else
+        progress_update("ASLR fix FAILED — continuing without fix", vim.log.levels.WARN)
+        do_continue()
+      end
     end)
   end
   -- Primary: on first stopped event (SIGSTOP from attach)
   dap.listeners.after.event_stopped["ue_aslr_fix"] = function(dap_session)
     if dap.session() ~= dap_session then return end
     progress_update("stopped event received")
-    on_post_attach()
+    do_aslr_and_continue()
   end
   -- Fallback: if event_stopped doesn't fire within 5s
   dap.listeners.after.event_initialized["ue_aslr_fix"] = function()
@@ -2727,47 +2863,106 @@ function M._setup_aslr_listeners(dap, attach_state, progress_update)
     progress_update("DAP initialized, waiting for stopped event...")
     vim.defer_fn(function()
       if not handled then
-        progress_update("stopped event timeout, continuing anyway...")
-        on_post_attach()
+        progress_update("stopped event timeout, applying ASLR fix anyway...")
+        do_aslr_and_continue()
       end
     end, 5000)
   end
 end
 
+function M._apply_aslr_fix(session_state, cb)
+  local pid = session_state.pid
+  local so_name = session_state.symbol_lib and vim.fn.fnamemodify(session_state.symbol_lib, ":t") or "libUE4.so"
+  local pkg = session_state.package_name or ""
+  local adb = session_state.adb or "adb"
+  local cb_fired = false
 
-function M._aslr_fix_lldb_script(pid, so_name)
-  -- Generate a Python one-liner for LLDB that reads /proc/maps and applies the correct slide.
-  -- Runs inline in processCreateCommands BEFORE configurationDone, BEFORE breakpoints are set.
-  local py_lines = {
-    "import lldb",
-    "rc = lldb.SBCommandReturnObject()",
-    "interp = lldb.debugger.GetCommandInterpreter()",
-    ("interp.HandleCommand('platform shell cat /proc/%s/maps', rc)"):format(pid),
-    "output = rc.GetOutput() or ''",
-    "base = None",
-    "for line in output.split(chr(10)):",
-    ("    if '%s' in line:"):format(so_name),
-    "        parts = line.split('-')",
-    "        if parts:",
-    "            base = '0x' + parts[0].strip()",
-    "            break",
-    "if base:",
-    ("    interp.HandleCommand('target modules load --file %s --slide ' + base, rc)"):format(so_name),
-    "    print('ASLR fix: ' + rc.GetOutput().strip())",
-    "    print('ASLR fix applied: slide=' + base)",
-    "else:",
-    ("    print('ASLR fix FAILED: %s not found in /proc/%s/maps')"):format(so_name, pid),
-    "    print('platform shell output length: ' + str(len(output)))",
-    "    print('first 500 chars: ' + output[:500])",
-  }
-  -- Join with literal \n for Python exec(), escape backslashes and double quotes
-  local code = table.concat(py_lines, "\\n")
-  code = code:gsub('"', '\\"')
-  return 'script exec("' .. code .. '")'
+  local function fire_cb(ok, msg)
+    if cb_fired then return end
+    cb_fired = true
+    if msg then vim.notify("ASLR fix: " .. msg, ok and vim.log.levels.INFO or vim.log.levels.ERROR) end
+    if cb then cb(ok) end
+  end
+
+  local function parse_base(text)
+    for line in text:gmatch("[^\r\n]+") do
+      if line:find(so_name, 1, true) then
+        return line:match("(%x+)%-")
+      end
+    end
+    return nil
+  end
+
+  local function apply_slide(base_addr)
+    local base_hex = "0x" .. base_addr
+    vim.notify("ASLR fix: " .. so_name .. " base=" .. base_hex)
+    M._dap_eval_lldb(
+      ("target modules load --file %s --slide %s"):format(so_name, base_hex),
+      function(ok2, result2)
+        vim.schedule(function()
+          if ok2 then
+            -- Verify module state after slide
+            M._dap_eval_lldb("image list " .. so_name, function(_, img)
+              vim.schedule(function()
+                vim.notify("ASLR fix applied (slide=" .. base_hex .. ")\n" .. (img or ""))
+                fire_cb(true, nil)
+              end)
+            end)
+          else
+            fire_cb(false, "target modules load FAILED: " .. tostring(result2))
+          end
+        end)
+      end
+    )
+  end
+
+  local function fallback_adb()
+    if pkg == "" then
+      fire_cb(false, "no package_name for adb fallback")
+      return
+    end
+    vim.notify("ASLR fix: trying adb run-as fallback...")
+    vim.fn.jobstart({ adb, "shell", "run-as", pkg, "cat", "/proc/" .. pid .. "/maps" }, {
+      stdout_buffered = true,
+      on_stdout = function(_, data)
+        local text = table.concat(data or {}, "\n")
+        local base = parse_base(text)
+        if base then
+          vim.schedule(function() apply_slide(base) end)
+        else
+          vim.schedule(function() fire_cb(false, so_name .. " not found (adb run-as)") end)
+        end
+      end,
+      on_exit = function(_, code)
+        if code ~= 0 then
+          vim.schedule(function() fire_cb(false, "adb run-as exit " .. code) end)
+        end
+      end,
+    })
+  end
+
+  -- Primary: LLDB platform shell (lldb-server runs as the app)
+  vim.notify("ASLR fix: reading /proc/" .. pid .. "/maps via platform shell...")
+  M._dap_eval_lldb(
+    ('platform shell grep %s /proc/%s/maps'):format(so_name, pid),
+    function(ok, result)
+      vim.schedule(function()
+        if ok and result and result ~= "" then
+          local base = parse_base(result)
+          if base then
+            apply_slide(base)
+            return
+          end
+        end
+        fallback_adb()
+      end)
+    end
+  )
+
+  vim.defer_fn(function() fire_cb(false, "timed out (15s)") end, 15000)
 end
 
 function M._android_dap_config(session)
-  local so_name = session.symbol_lib and vim.fn.fnamemodify(session.symbol_lib, ":t") or "libUE4.so"
   local target_create = {}
   if session.symbol_lib then
     table.insert(target_create, ('target create "%s"'):format(session.symbol_lib))
@@ -2796,8 +2991,6 @@ function M._android_dap_config(session)
     processCreateCommands = {
       ('platform connect "%s"'):format(session.connect_uri),
       ("process attach -p %s"):format(session.pid),
-      -- ASLR fix: inline Python reads /proc/maps via platform shell, applies correct slide
-      M._aslr_fix_lldb_script(session.pid, so_name),
       "settings set target.process.thread.step-avoid-regexp ''",
       "process handle SIGSTOP -p true -s false -n false",
       "process handle SIGSEGV -p true -s false -n false",
@@ -2930,6 +3123,7 @@ function M.android_dap_attach()
   end
 
   M._dap_attach_in_progress = true
+  M._dap_run_state = "attaching"
   local progress = { "DAP Attach" }
   local notify_id = "ue_dap_attach"
   local function progress_update(msg, level)
@@ -2956,6 +3150,7 @@ function M.android_dap_attach()
       vim.schedule(function()
         if code ~= 0 then
           M._dap_attach_in_progress = false
+          M._dap_run_state = "idle"
           progress_update("FAILED (exit " .. code .. ")", vim.log.levels.ERROR)
           return
         end
@@ -2963,6 +3158,7 @@ function M.android_dap_attach()
         local connect_uri = trim((vim.fn.readfile(attach_state.uri_file) or {})[1] or "")
         if pid == "" or connect_uri == "" then
           M._dap_attach_in_progress = false
+          M._dap_run_state = "idle"
           progress_update("no PID or connect URI produced", vim.log.levels.ERROR)
           return
         end
@@ -2981,6 +3177,7 @@ function M.android_dap_attach()
       if preflight_done then return end
       pcall(vim.fn.jobstop, preflight_job)
       M._dap_attach_in_progress = false
+      M._dap_run_state = "idle"
       progress_update("TIMED OUT (30s) — device may be disconnected", vim.log.levels.ERROR)
     end, 30000)
   end
@@ -3139,6 +3336,7 @@ function M.android_dap_launch()
   end
 
   M._dap_attach_in_progress = true
+  M._dap_run_state = "attaching"
   local progress = { "DAP Launch" }
   local notify_id = "ue_dap_launch"
   local function progress_update(msg, level)
@@ -3165,6 +3363,7 @@ function M.android_dap_launch()
       vim.schedule(function()
         if code ~= 0 then
           M._dap_attach_in_progress = false
+          M._dap_run_state = "idle"
           progress_update("FAILED (exit " .. code .. ")", vim.log.levels.ERROR)
           return
         end
@@ -3172,6 +3371,7 @@ function M.android_dap_launch()
         local connect_uri = trim((vim.fn.readfile(attach_state.uri_file) or {})[1] or "")
         if pid == "" or connect_uri == "" then
           M._dap_attach_in_progress = false
+          M._dap_run_state = "idle"
           progress_update("no PID or connect URI produced", vim.log.levels.ERROR)
           return
         end
@@ -3190,6 +3390,7 @@ function M.android_dap_launch()
       if preflight_done then return end
       pcall(vim.fn.jobstop, preflight_job)
       M._dap_attach_in_progress = false
+      M._dap_run_state = "idle"
       progress_update("TIMED OUT (30s) — device may be disconnected", vim.log.levels.ERROR)
     end, 30000)
   end
@@ -3301,30 +3502,28 @@ end
 function M.dap_continue()
   local ok, dap = pcall(require, "dap")
   if not ok or not dap.session() then return end
+  if M._dap_attach_in_progress then
+    vim.notify("Attach bootstrap still running; wait for READY", vim.log.levels.DEBUG)
+    return
+  end
+  if M._continue_pending or M._dap_run_state == "resuming" then return end
   local session = dap.session()
-  local tid = session.stopped_thread_id
-  if tid then
-    dap.continue()
+  if session.stopped_thread_id or session.current_frame or M._dap_run_state == "stopped" then
+    request_dap_continue(dap)
   else
-    -- Process might already be running; use LLDB command
-    M._dap_eval_lldb("process continue", function(ok2, result)
-      if not ok2 then
-        vim.schedule(function()
-          vim.notify("Continue failed: " .. tostring(result), vim.log.levels.WARN)
-        end)
-      end
-    end)
+    vim.notify("Process already running", vim.log.levels.DEBUG)
   end
 end
 
 function M.dap_pause()
   local ok, dap = pcall(require, "dap")
   if not ok or not dap.session() then return end
-  -- dap.pause() requires a thread ID; use raw request to pause all threads
+  if M._pause_pending then return end
+  M._pause_pending = true
+  vim.defer_fn(function() M._pause_pending = false end, 500)
   local session = dap.session()
   session:request("pause", { threadId = 0 }, function(err)
     if err then
-      -- Fallback: try getting threads first
       session:request("threads", {}, function(terr, tresp)
         if not terr and tresp and tresp.threads and tresp.threads[1] then
           session:request("pause", { threadId = tresp.threads[1].id })
@@ -3491,6 +3690,9 @@ function M.setup_dap(dap, dapui)
   local function on_session_end()
     restore_layout()
     M._dap_attach_in_progress = false
+    M._dap_run_state = "idle"
+    M._continue_pending = false
+    M._pause_pending = false
     -- Clean up any pending ASLR listeners (session died before event_stopped)
     dap.listeners.after.event_stopped["ue_aslr_fix"] = nil
     dap.listeners.after.event_initialized["ue_aslr_fix"] = nil
@@ -3513,6 +3715,31 @@ function M.setup_dap(dap, dapui)
   dap.listeners.before.event_terminated["dapui_config"] = function() on_session_end() end
   dap.listeners.before.event_exited["dapui_config"] = function() on_session_end() end
   dap.listeners.after.disconnect["dapui_config"] = function() on_session_end() end
+
+  dap.listeners.after.event_initialized["ue-android-dap-run-state"] = function(session)
+    if dap.session() ~= session then return end
+    M._dap_run_state = M._dap_attach_in_progress and "attaching" or "stopped"
+  end
+  dap.listeners.after.event_stopped["ue-android-dap-run-state"] = function(session)
+    if dap.session() ~= session then return end
+    M._dap_run_state = "stopped"
+    M._continue_pending = false
+    M._pause_pending = false
+  end
+  dap.listeners.after.event_continued["ue-android-dap-run-state"] = function(session)
+    if dap.session() ~= session then return end
+    M._dap_run_state = "running"
+    M._continue_pending = false
+  end
+  dap.listeners.after["continue"]["ue-android-dap-run-state"] = function(session, err)
+    if dap.session() ~= session or not err then return end
+    M._continue_pending = false
+    M._dap_run_state = session.stopped_thread_id and "stopped" or "idle"
+  end
+  dap.listeners.after.event_stopped["ue-android-dap-source-nav"] = function(session, body)
+    if dap.session() ~= session then return end
+    maybe_jump_to_local_source_frame(session, body)
+  end
 
   -- Track global scope variablesReferences to block them (crashes LLDB on huge binaries)
   local blocked_refs = {}

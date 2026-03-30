@@ -13,8 +13,17 @@ return {
       require("bamboo").setup(opts)
     end,
   },
+  {
+    "olimorris/onedarkpro.nvim",
+    lazy = false,
+    priority = 1000,
+  },
   { "savq/melange-nvim", name = "melange", lazy = false, priority = 1000 },
   { "everviolet/nvim", name = "Evergarden", lazy = false, priority = 1000 },
+  { "projekt0n/github-nvim-theme", lazy = false, priority = 1000 },
+  { "rose-pine/neovim", name = "rose-pine", lazy = false, priority = 1000 },
+  { "EdenEast/nightfox.nvim", lazy = false, priority = 1000 },
+  { "Mofiqul/vscode.nvim", lazy = false, priority = 1000 },
   {
     "LazyVim/LazyVim",
     init = function()

@@ -2376,30 +2376,55 @@ local function install_android()
     age_str = math.floor(age / 3600) .. "h ago"
   end
 
-  vim.notify(("Installing APK (built %s):\n%s"):format(age_str, apk_win))
+  local progress = require("fidget.progress")
+  local handle = progress.handle.create({
+    title = "Installing APK",
+    message = ("built %s — %s"):format(age_str, vim.fn.fnamemodify(apk_win, ":t")),
+    lsp_client = { name = "adb" },
+    percentage = 0,
+  })
+
+  local dots = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+  local tick = 0
+  local timer = vim.uv.new_timer()
+  timer:start(0, 120, vim.schedule_wrap(function()
+    if handle then
+      tick = tick + 1
+      handle.message = dots[tick % #dots + 1] .. " installing..."
+    end
+  end))
+
   vim.fn.jobstart({ "adb", "install", "-r", apk_win }, {
     stdout_buffered = true,
     stderr_buffered = true,
     on_stdout = function(_, data)
       for _, line in ipairs(data) do
         if line ~= "" then
-          vim.schedule(function() vim.notify("[install] " .. line) end)
+          vim.schedule(function()
+            if handle then handle.message = line end
+          end)
         end
       end
     end,
     on_stderr = function(_, data)
       for _, line in ipairs(data) do
         if line ~= "" then
-          vim.schedule(function() vim.notify("[install err] " .. line, vim.log.levels.WARN) end)
+          vim.schedule(function()
+            if handle then handle.message = line end
+          end)
         end
       end
     end,
     on_exit = function(_, code)
       vim.schedule(function()
+        timer:stop()
+        timer:close()
         if code == 0 then
-          vim.notify("APK installed successfully")
+          handle.message = "Installed successfully"
+          handle:finish()
         else
-          vim.notify("APK install failed (exit " .. code .. ")", vim.log.levels.ERROR)
+          handle.message = "Failed (exit " .. code .. ")"
+          handle:finish()
         end
       end)
     end,
@@ -2562,8 +2587,10 @@ local function load_breakpoints()
 
   for _, entry in ipairs(list) do
     if entry.key and entry.set_command then
+      -- Migrate old -H (hardware BP) commands to software BP
+      local set_cmd = entry.set_command:gsub("breakpoint set %-H ", "breakpoint set ")
       M._breakpoint_specs[entry.key] = {
-        set_command = entry.set_command,
+        set_command = set_cmd,
         clear_command = entry.clear_command,
         file = entry.file,
         line = entry.line,
@@ -2637,7 +2664,23 @@ function M._reapply_breakpoints(cb)
   local pending = #keys
   local function done()
     pending = pending - 1
-    if pending <= 0 and cb then cb() end
+    if pending <= 0 then
+      -- After all BPs set, check resolved status
+      M._dap_eval_lldb("breakpoint list", function(_, bp_list)
+        vim.schedule(function()
+          if bp_list then
+            local total, resolved = 0, 0
+            for n in bp_list:gmatch("resolved = (%d+)") do
+              total = total + 1
+              resolved = resolved + tonumber(n)
+            end
+            vim.notify(("BPs: %d set, %d resolved"):format(total, resolved),
+              resolved > 0 and vim.log.levels.INFO or vim.log.levels.WARN)
+          end
+        end)
+        if cb then cb() end
+      end)
+    end
   end
   for _, key in ipairs(keys) do
     local spec = specs[key]
@@ -2654,76 +2697,77 @@ function M._reapply_breakpoints(cb)
   end
 end
 
-function M._apply_aslr_fix(session_state, cb)
-  -- Apply ASLR fix AFTER DAP session is established
-  -- Reads /proc/maps from device via adb, parses base, sends LLDB command
-  local pid = session_state.pid
-  -- Derive .so name from symbol_lib path (supports libUE4.so, libUnreal.so, etc.)
-  local so_name = session_state.symbol_lib and vim.fn.fnamemodify(session_state.symbol_lib, ":t") or "libUE4.so"
-  local adb = session_state.adb or "adb"
-  local cb_fired = false
-
-  -- Read /proc/maps directly via adb (more reliable than platform shell)
-  local job_id = vim.fn.jobstart({ adb, "shell", "cat /proc/" .. pid .. "/maps" }, {
-    stdout_buffered = true,
-    on_stdout = function(_, data)
-      local base_addr = nil
-      for _, line in ipairs(data or {}) do
-        if line:find(so_name, 1, true) then
-          base_addr = line:match("^(%x+)%-")
-          break
-        end
-      end
-      if not base_addr then
-        vim.schedule(function()
-          if cb_fired then return end
-          cb_fired = true
-          vim.notify("ASLR fix: " .. so_name .. " not found in /proc/maps", vim.log.levels.ERROR)
-          if cb then cb(false) end
-        end)
-        return
-      end
-      local base_hex = "0x" .. base_addr
-      vim.schedule(function()
-        if cb_fired then return end
-        vim.notify("ASLR fix: " .. so_name .. " base=" .. base_hex)
-        M._dap_eval_lldb(
-          ("target modules load --file %s --slide %s"):format(so_name, base_hex),
-          function(ok, result)
-            vim.schedule(function()
-              if cb_fired then return end
-              cb_fired = true
-              vim.notify("ASLR fix: " .. (ok and "applied" or "FAILED: " .. tostring(result)))
-              if cb then cb(ok) end
-            end)
-          end
-        )
+function M._setup_aslr_listeners(dap, attach_state, progress_update)
+  -- ASLR fix now runs inline in processCreateCommands (Python script).
+  -- This listener handles: reapply pending BPs, then continue the process.
+  local handled = false
+  local function on_post_attach()
+    if handled then return end
+    handled = true
+    dap.listeners.after.event_stopped["ue_aslr_fix"] = nil
+    dap.listeners.after.event_initialized["ue_aslr_fix"] = nil
+    M._dap_attach_in_progress = false
+    progress_update("ASLR fix applied in processCreateCommands, syncing breakpoints...")
+    M._reapply_breakpoints(function()
+      progress_update("breakpoints synced, continuing...")
+      M._dap_eval_lldb("process continue", function()
+        vim.schedule(function() progress_update("READY") end)
       end)
-    end,
-    on_exit = function(_, code)
-      if code ~= 0 then
-        vim.schedule(function()
-          if cb_fired then return end
-          cb_fired = true
-          vim.notify("ASLR fix: adb shell failed (exit " .. code .. ")", vim.log.levels.ERROR)
-          if cb then cb(false) end
-        end)
-      end
-    end,
-  })
-  -- Timeout: kill adb job if it hangs (device disconnected, etc.)
-  if job_id and job_id > 0 then
+    end)
+  end
+  -- Primary: on first stopped event (SIGSTOP from attach)
+  dap.listeners.after.event_stopped["ue_aslr_fix"] = function(dap_session)
+    if dap.session() ~= dap_session then return end
+    progress_update("stopped event received")
+    on_post_attach()
+  end
+  -- Fallback: if event_stopped doesn't fire within 5s
+  dap.listeners.after.event_initialized["ue_aslr_fix"] = function()
+    dap.listeners.after.event_initialized["ue_aslr_fix"] = nil
+    progress_update("DAP initialized, waiting for stopped event...")
     vim.defer_fn(function()
-      if cb_fired then return end
-      pcall(vim.fn.jobstop, job_id)
-      cb_fired = true
-      vim.notify("ASLR fix: timed out (10s)", vim.log.levels.ERROR)
-      if cb then cb(false) end
-    end, 10000)
+      if not handled then
+        progress_update("stopped event timeout, continuing anyway...")
+        on_post_attach()
+      end
+    end, 5000)
   end
 end
 
+
+function M._aslr_fix_lldb_script(pid, so_name)
+  -- Generate a Python one-liner for LLDB that reads /proc/maps and applies the correct slide.
+  -- Runs inline in processCreateCommands BEFORE configurationDone, BEFORE breakpoints are set.
+  local py_lines = {
+    "import lldb",
+    "rc = lldb.SBCommandReturnObject()",
+    "interp = lldb.debugger.GetCommandInterpreter()",
+    ("interp.HandleCommand('platform shell cat /proc/%s/maps', rc)"):format(pid),
+    "output = rc.GetOutput() or ''",
+    "base = None",
+    "for line in output.split(chr(10)):",
+    ("    if '%s' in line:"):format(so_name),
+    "        parts = line.split('-')",
+    "        if parts:",
+    "            base = '0x' + parts[0].strip()",
+    "            break",
+    "if base:",
+    ("    interp.HandleCommand('target modules load --file %s --slide ' + base, rc)"):format(so_name),
+    "    print('ASLR fix: ' + rc.GetOutput().strip())",
+    "    print('ASLR fix applied: slide=' + base)",
+    "else:",
+    ("    print('ASLR fix FAILED: %s not found in /proc/%s/maps')"):format(so_name, pid),
+    "    print('platform shell output length: ' + str(len(output)))",
+    "    print('first 500 chars: ' + output[:500])",
+  }
+  -- Join with literal \n for Python exec(), escape backslashes and double quotes
+  local code = table.concat(py_lines, "\\n")
+  code = code:gsub('"', '\\"')
+  return 'script exec("' .. code .. '")'
+end
+
 function M._android_dap_config(session)
+  local so_name = session.symbol_lib and vim.fn.fnamemodify(session.symbol_lib, ":t") or "libUE4.so"
   local target_create = {}
   if session.symbol_lib then
     table.insert(target_create, ('target create "%s"'):format(session.symbol_lib))
@@ -2752,6 +2796,8 @@ function M._android_dap_config(session)
     processCreateCommands = {
       ('platform connect "%s"'):format(session.connect_uri),
       ("process attach -p %s"):format(session.pid),
+      -- ASLR fix: inline Python reads /proc/maps via platform shell, applies correct slide
+      M._aslr_fix_lldb_script(session.pid, so_name),
       "settings set target.process.thread.step-avoid-regexp ''",
       "process handle SIGSTOP -p true -s false -n false",
       "process handle SIGSEGV -p true -s false -n false",
@@ -2924,28 +2970,7 @@ function M.android_dap_attach()
         attach_state.connect_uri = connect_uri
         M._dap_session_state = attach_state
         progress_update(("pid=%s, connecting DAP..."):format(pid))
-        dap.listeners.after.event_initialized["ue_aslr_fix"] = nil
-        dap.listeners.after.event_stopped["ue_aslr_fix"] = function(dap_session)
-          dap.listeners.after.event_stopped["ue_aslr_fix"] = nil
-          M._dap_attach_in_progress = false
-          if dap.session() ~= dap_session then
-            return
-          end
-          progress_update("applying ASLR fix...")
-          M._apply_aslr_fix(attach_state, function(ok)
-            if ok then
-              progress_update("ASLR fix applied")
-              M._reapply_breakpoints(function()
-                progress_update("breakpoints synced, continuing...")
-                M._dap_eval_lldb("process continue", function()
-                  vim.schedule(function() progress_update("READY") end)
-                end)
-              end)
-            else
-              progress_update("ASLR fix FAILED — process remains stopped", vim.log.levels.WARN)
-            end
-          end)
-        end
+        M._setup_aslr_listeners(dap, attach_state, progress_update)
         dap.run(M._android_dap_config(attach_state))
       end)
     end,
@@ -3154,28 +3179,7 @@ function M.android_dap_launch()
         attach_state.connect_uri = connect_uri
         M._dap_session_state = attach_state
         progress_update(("pid=%s, connecting DAP..."):format(pid))
-        dap.listeners.after.event_initialized["ue_aslr_fix"] = nil
-        dap.listeners.after.event_stopped["ue_aslr_fix"] = function(dap_session)
-          dap.listeners.after.event_stopped["ue_aslr_fix"] = nil
-          M._dap_attach_in_progress = false
-          if dap.session() ~= dap_session then
-            return
-          end
-          progress_update("applying ASLR fix...")
-          M._apply_aslr_fix(attach_state, function(ok)
-            if ok then
-              progress_update("ASLR fix applied")
-              M._reapply_breakpoints(function()
-                progress_update("breakpoints synced, continuing...")
-                M._dap_eval_lldb("process continue", function()
-                  vim.schedule(function() progress_update("READY") end)
-                end)
-              end)
-            else
-              progress_update("ASLR fix FAILED — process remains stopped", vim.log.levels.WARN)
-            end
-          end)
-        end
+        M._setup_aslr_listeners(dap, attach_state, progress_update)
         dap.run(M._android_dap_config(attach_state))
       end)
     end,
@@ -3237,8 +3241,8 @@ function M.dap_toggle_breakpoint()
       vim.notify(("BP removed (pending): %s:%d"):format(file, line))
     end
   else
-    -- Add breakpoint
-    local set_cmd = ('breakpoint set -H --file "%s" --line %d'):format(file, line)
+    -- Add breakpoint (software BP — requires correct ASLR slide)
+    local set_cmd = ('breakpoint set --file "%s" --line %d'):format(file, line)
     local clear_cmd = ('breakpoint clear --file "%s" --line %d'):format(file, line)
     M._breakpoint_specs[key] = { set_command = set_cmd, clear_command = clear_cmd, file = file, line = line }
     vim.fn.sign_define("UEDapBreakpoint", { text = "●", texthl = "DiagnosticError" })
@@ -3247,7 +3251,39 @@ function M.dap_toggle_breakpoint()
       M._dap_eval_lldb(set_cmd, function(ok2, result)
         vim.schedule(function()
           if ok2 then
-            vim.notify(("HW BP set: %s:%d"):format(file, line))
+            -- Verify resolved status
+            M._dap_eval_lldb("breakpoint list", function(_, bp_list)
+              vim.schedule(function()
+                local resolved = 0
+                if bp_list then
+                  for n in bp_list:gmatch("resolved = (%d+)") do
+                    resolved = resolved + tonumber(n)
+                  end
+                end
+                if resolved > 0 then
+                  vim.notify(("BP set: %s:%d (resolved)"):format(file, line))
+                else
+                  -- Diagnose: check what LLDB knows about this file
+                  M._dap_eval_lldb(('image lookup --file "%s"'):format(file), function(_, lookup)
+                    vim.schedule(function()
+                      local diag = ("BP UNRESOLVED: %s:%d\n"):format(file, line)
+                      if lookup and lookup ~= "" then
+                        -- Show first few matches to reveal DWARF paths
+                        local lines = {}
+                        for l in lookup:gmatch("[^\n]+") do
+                          lines[#lines + 1] = l
+                          if #lines >= 8 then break end
+                        end
+                        diag = diag .. "image lookup found:\n" .. table.concat(lines, "\n")
+                      else
+                        diag = diag .. "image lookup: file NOT found in any module"
+                      end
+                      vim.notify(diag, vim.log.levels.WARN)
+                    end)
+                  end)
+                end
+              end)
+            end)
           else
             M._breakpoint_specs[key] = nil
             vim.fn.sign_unplace("ue_dap_bp", { buffer = bufnr, id = line })
@@ -3356,6 +3392,47 @@ function M.dap_toggle_repl()
   if ok then dap.repl.toggle() end
 end
 
+function M.dap_diagnose()
+  local dap_ok, dap = pcall(require, "dap")
+  if not dap_ok or not dap.session() then
+    vim.notify("No DAP session", vim.log.levels.WARN)
+    return
+  end
+
+  local results = {}
+  local pending = 3
+  local function collect(label, ok, data)
+    if ok and data and data ~= "" then
+      results[#results + 1] = ("=== %s ===\n%s"):format(label, data)
+    else
+      results[#results + 1] = ("=== %s ===\n(empty)"):format(label)
+    end
+    pending = pending - 1
+    if pending <= 0 then
+      vim.schedule(function()
+        local buf = vim.api.nvim_create_buf(false, true)
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(table.concat(results, "\n\n"), "\n"))
+        vim.bo[buf].buftype = "nofile"
+        vim.bo[buf].filetype = "log"
+        vim.cmd("botright split")
+        vim.api.nvim_win_set_buf(0, buf)
+      end)
+    end
+  end
+
+  -- 1) What modules does LLDB have loaded?
+  M._dap_eval_lldb("image list", function(ok, r) collect("image list", ok, r) end)
+  -- 2) Check symbol file status for the main .so
+  local state = M._dap_session_state or {}
+  local so_name = state.symbol_lib and vim.fn.fnamemodify(state.symbol_lib, ":t") or "libUE4.so"
+  M._dap_eval_lldb(
+    ('image dump symfile "%s"'):format(so_name),
+    function(ok, r) collect("symfile " .. so_name, ok, r) end
+  )
+  -- 3) Check source map and settings
+  M._dap_eval_lldb("settings show target.source-map", function(ok, r) collect("source-map", ok, r) end)
+end
+
 function M.setup_dap(dap, dapui)
   local adapter, liblldb = M.codelldb_paths()
   if not adapter then
@@ -3414,8 +3491,9 @@ function M.setup_dap(dap, dapui)
   local function on_session_end()
     restore_layout()
     M._dap_attach_in_progress = false
-    -- Clean up any pending ASLR listener (session died before event_stopped)
+    -- Clean up any pending ASLR listeners (session died before event_stopped)
     dap.listeners.after.event_stopped["ue_aslr_fix"] = nil
+    dap.listeners.after.event_initialized["ue_aslr_fix"] = nil
     -- Keep _breakpoint_specs and signs so they persist across re-attach.
     -- They will be re-applied to the new LLDB session after ASLR fix.
     -- Kill remote lldb-server so re-attach can start a new one
@@ -3569,6 +3647,9 @@ function M.setup()
   end, {})
   vim.api.nvim_create_user_command("UEAndroidDAPREPL", function()
     M.dap_toggle_repl()
+  end, {})
+  vim.api.nvim_create_user_command("UEDAPDiag", function()
+    M.dap_diagnose()
   end, {})
   vim.api.nvim_create_user_command("UEResetLayout", function()
     M.dap_reset_layout()

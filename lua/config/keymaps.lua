@@ -21,12 +21,95 @@ local function live_grep_word_with(opts)
   end
 end
 
+local function termcodes(keys)
+  return vim.api.nvim_replace_termcodes(keys, true, false, true)
+end
+
+local function escape_substitute_pattern(text)
+  return vim.fn.escape(text or "", [[/\]]):gsub("\n", [[\n]])
+end
+
+local function open_substitute(range, pattern)
+  local command = string.format(":%ss/\\V%s//gc", range, pattern)
+  vim.fn.feedkeys(termcodes(command .. "<Left><Left><Left><Left>"), "n")
+end
+
+local function open_word_substitute()
+  local word = vim.fn.expand("<cword>")
+  if word == nil or word == "" then
+    vim.notify("No word under cursor", vim.log.levels.WARN)
+    return
+  end
+
+  open_substitute("%", [[\<]] .. escape_substitute_pattern(word) .. [[\>]])
+end
+
+local function visual_selection_text()
+  local lines = vim.fn.getregion(vim.fn.getpos("'<"), vim.fn.getpos("'>"), { type = vim.fn.mode() })
+  if type(lines) ~= "table" or vim.tbl_isempty(lines) then
+    return ""
+  end
+  return table.concat(lines, "\n")
+end
+
+local function open_visual_substitute()
+  local selection = visual_selection_text()
+  if selection == "" then
+    vim.notify("No selection to replace", vim.log.levels.WARN)
+    return
+  end
+
+  vim.schedule(function()
+    open_substitute("'<,'>", escape_substitute_pattern(selection))
+  end)
+end
+
+local function close_current_target()
+  local win = vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_get_current_buf()
+  local config = vim.api.nvim_win_get_config(win)
+  local is_float = config.relative ~= nil and config.relative ~= ""
+  local buftype = vim.bo[buf].buftype
+  local buflisted = vim.bo[buf].buflisted
+  local win_type = vim.fn.win_gettype(win)
+  local is_normal_buffer = buftype == "" and buflisted and win_type == "" and not is_float
+
+  if is_normal_buffer then
+    Snacks.bufdelete({ buf = buf })
+    return
+  end
+
+  local ok = pcall(vim.api.nvim_win_close, win, false)
+  if ok then
+    return
+  end
+
+  Snacks.bufdelete({ buf = buf })
+end
+
+local function comment_operator()
+  return require("vim._comment").operator()
+end
+
+local function comment_line()
+  return require("vim._comment").operator() .. "_"
+end
+
+local function comment_textobject()
+  require("vim._comment").textobject()
+end
+
 map("n", "gd", function()
   require("utils.lsp_fallback").definition()
 end, { desc = "Definition (LSP -> GTAGS)" })
 map("n", "gr", function()
   require("utils.lsp_fallback").references()
 end, { desc = "References (LSP -> GTAGS)" })
+map({ "n", "x" }, "gc", comment_operator, { expr = true, desc = "Toggle comment" })
+map("n", "gcc", comment_line, { expr = true, desc = "Toggle comment line" })
+map("o", "gc", comment_textobject, { desc = "Comment textobject" })
+map("n", "gco", "o<esc>Vcx<esc><cmd>normal gcc<cr>fxa<bs>", { desc = "Add Comment Below" })
+map("n", "gcO", "O<esc>Vcx<esc><cmd>normal gcc<cr>fxa<bs>", { desc = "Add Comment Above" })
 map("n", "<leader>sx", live_grep_with({
   regex = false,
   args = { "--word-regexp" },
@@ -38,6 +121,9 @@ map({ "n", "x" }, "<leader>sy", live_grep_word_with(), { desc = "Search: Live gr
 map({ "n", "x" }, "<leader>sY", live_grep_word_with({
   root = false,
 }), { desc = "Search: Live grep word/selection (cwd)" })
+map("n", "<leader>sr", open_word_substitute, { desc = "Search: Replace current word in buffer" })
+map("x", "<leader>sr", open_visual_substitute, { desc = "Search: Replace selection in range" })
+map("n", "<leader>bc", close_current_target, { desc = "Buffer/Window: Smart close current target" })
 map("n", "<leader>bn", "<cmd>confirm enew<cr>", { desc = "Buffer: New empty buffer" })
 map("n", "<leader>ub", "<cmd>UEBuild<cr>", { desc = "UE: Build (platform from UESetPlatform)" })
 map("n", "<leader>uB", "<cmd>UEPrepare<cr>", { desc = "UE: Prepare symbols + compile_commands" })

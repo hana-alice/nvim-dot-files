@@ -39,6 +39,41 @@ local LABELS = {
   habamax = "Habamax",
 }
 
+local PLUGIN_BY_THEME = {
+  tokyonight = "tokyonight.nvim",
+  catppuccin = "catppuccin",
+  catppuccin_frappe = "catppuccin",
+  catppuccin_latte = "catppuccin",
+  catppuccin_macchiato = "catppuccin",
+  catppuccin_mocha = "catppuccin",
+  bamboo = "bamboo",
+  ["bamboo-vulgaris"] = "bamboo",
+  ["bamboo-multiplex"] = "bamboo",
+  ["bamboo-light"] = "bamboo",
+  gruvbox = "gruvbox",
+  kanagawa = "kanagawa",
+  onedark = "onedarkpro.nvim",
+  onelight = "onedarkpro.nvim",
+  onedark_vivid = "onedarkpro.nvim",
+  onedark_dark = "onedarkpro.nvim",
+  Evergarden = "Evergarden",
+  github_light = "github-nvim-theme",
+  github_light_default = "github-nvim-theme",
+  github_light_high_contrast = "github-nvim-theme",
+  github_light_colorblind = "github-nvim-theme",
+  github_light_tritanopia = "github-nvim-theme",
+  github_dark = "github-nvim-theme",
+  github_dark_default = "github-nvim-theme",
+  ["rose-pine"] = "rose-pine",
+  ["rose-pine-moon"] = "rose-pine",
+  ["rose-pine-dawn"] = "rose-pine",
+  dayfox = "nightfox.nvim",
+  dawnfox = "nightfox.nvim",
+  nightfox = "nightfox.nvim",
+  nordfox = "nightfox.nvim",
+  vscode = "vscode.nvim",
+}
+
 local function state_path()
   return vim.fn.stdpath("state") .. "/theme.txt"
 end
@@ -67,13 +102,46 @@ local function runtime_colors()
   return names
 end
 
+local function known_colors()
+  local names = {}
+  for name in pairs(LABELS) do
+    table.insert(names, name)
+  end
+  return names
+end
+
+local function ensure_theme_loaded(name)
+  local plugin = PLUGIN_BY_THEME[name]
+  if not plugin then
+    return
+  end
+
+  local ok, lazy = pcall(require, "lazy")
+  if ok and lazy and type(lazy.load) == "function" then
+    lazy.load({ plugins = { plugin } })
+  end
+end
+
 local function theme_names()
-  local ordered = runtime_colors()
+  local ordered = {}
+  local seen = {}
+  local function add(name)
+    name = normalize_name(name)
+    if name ~= "" and not seen[name] then
+      seen[name] = true
+      table.insert(ordered, name)
+    end
+  end
+
+  for _, name in ipairs(known_colors()) do
+    add(name)
+  end
+  for _, name in ipairs(runtime_colors()) do
+    add(name)
+  end
   local saved = normalize_name(vim.fn.filereadable(state_path()) == 1 and (vim.fn.readfile(state_path())[1] or "") or "")
 
-  if saved ~= "" and not vim.list_contains(ordered, saved) then
-    table.insert(ordered, saved)
-  end
+  add(saved)
 
   if vim.tbl_isempty(ordered) then
     ordered = { DEFAULT }
@@ -156,12 +224,14 @@ function M.load_startup()
     name = DEFAULT
   end
 
+  ensure_theme_loaded(name)
   local ok, err = pcall(vim.cmd.colorscheme, name)
   if ok then
     return
   end
 
   write_state(DEFAULT)
+  ensure_theme_loaded(DEFAULT)
   vim.schedule(function()
     vim.notify(
       "Failed to load theme " .. name .. "; fell back to " .. DEFAULT .. "\n" .. tostring(err),
@@ -191,6 +261,7 @@ function M.apply(name, opts)
     return false
   end
 
+  ensure_theme_loaded(name)
   local ok, err = pcall(vim.cmd.colorscheme, name)
   if not ok then
     vim.notify("Failed to load theme " .. name .. ": " .. tostring(err), vim.log.levels.ERROR)

@@ -9,6 +9,11 @@ local function current_symbol()
 end
 
 local function sync_locations(method, timeout_ms)
+  local clients = vim.lsp.get_clients({ bufnr = 0, method = method })
+  if not clients or vim.tbl_isempty(clients) then
+    return nil
+  end
+
   local params = vim.lsp.util.make_position_params(0, "utf-8")
   if method == "textDocument/references" then
     params.context = { includeDeclaration = true }

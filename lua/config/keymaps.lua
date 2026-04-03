@@ -99,12 +99,51 @@ local function comment_textobject()
   require("vim._comment").textobject()
 end
 
+local function move_cursor_to_mouse()
+  local mouse = vim.fn.getmousepos()
+  local win = tonumber(mouse.winid) or 0
+  if win == 0 or not vim.api.nvim_win_is_valid(win) then
+    return false
+  end
+
+  local buf = vim.api.nvim_win_get_buf(win)
+  local line_count = math.max(vim.api.nvim_buf_line_count(buf), 1)
+  local line = math.min(math.max(tonumber(mouse.line) or 1, 1), line_count)
+  local text = vim.api.nvim_buf_get_lines(buf, line - 1, line, false)[1] or ""
+  local col = math.min(math.max(tonumber(mouse.column) or 1, 1), #text + 1)
+
+  vim.api.nvim_set_current_win(win)
+  vim.api.nvim_win_set_cursor(win, { line, col - 1 })
+  return true
+end
+
+local function open_file_reference_under_cursor()
+  local cfile = vim.fn.expand("<cfile>")
+  if cfile == nil or cfile == "" then
+    return false
+  end
+  if not (cfile:find("[/\\]") or cfile:find("%.[%w_%-]+$")) then
+    return false
+  end
+
+  return pcall(vim.cmd.normal, { args = { "gf" }, bang = true })
+end
+
+local function ctrl_leftmouse_jump()
+  move_cursor_to_mouse()
+  if open_file_reference_under_cursor() then
+    return
+  end
+  require("utils.lsp_fallback").definition()
+end
+
 map("n", "gd", function()
   require("utils.lsp_fallback").definition()
 end, { desc = "Definition (LSP -> GTAGS)" })
 map("n", "gr", function()
   require("utils.lsp_fallback").references()
 end, { desc = "References (LSP -> GTAGS)" })
+map("n", "<C-LeftMouse>", ctrl_leftmouse_jump, { desc = "Mouse: Jump to definition or file" })
 map({ "n", "x" }, "gc", comment_operator, { expr = true, desc = "Toggle comment" })
 map("n", "gcc", comment_line, { expr = true, desc = "Toggle comment line" })
 map("o", "gc", comment_textobject, { desc = "Comment textobject" })
@@ -128,6 +167,7 @@ map("n", "<leader>bn", "<cmd>confirm enew<cr>", { desc = "Buffer: New empty buff
 map("n", "<leader>ub", "<cmd>UEBuild<cr>", { desc = "UE: Build (platform from UESetPlatform)" })
 map("n", "<leader>uB", "<cmd>UEPrepare<cr>", { desc = "UE: Prepare symbols + compile_commands" })
 map("n", "<leader>uc", "<cmd>UEExportCompileCommands<cr>", { desc = "UE: Export compile_commands" })
+map("n", "<leader>ul", "<cmd>UELaunch<cr>", { desc = "UE: Launch app (no debugger)" })
 map("n", "<leader>up", "<cmd>UEPaths<cr>", { desc = "UE: Show paths" })
 map("n", "<leader>uP", "<cmd>UESetProject<cr>", { desc = "UE: Set project" })
 map("n", "<leader>ut", "<cmd>ThemePicker<cr>", { desc = "UI: Theme picker" })

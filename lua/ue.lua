@@ -6,6 +6,7 @@ local cheatsheet_win = nil
 local build_term_buf = nil
 local build_term_win = nil
 local build_term_jobid = nil
+local prepare_jobid = nil
 local status_cache = {} -- { key = string, value = string, tick = number }
 local dirty_index_roots = {}
 local _engine_root_cache = {} -- dir -> engine_root (or false)
@@ -431,8 +432,12 @@ local function jump_to_entry(entry)
     return false
   end
 
+  local target = norm(entry.filename)
+  local current = norm(vim.api.nvim_buf_get_name(0))
   vim.cmd("normal! m'")
-  vim.cmd("edit " .. vim.fn.fnameescape(entry.filename))
+  if target ~= "" and target ~= current then
+    vim.cmd("edit " .. vim.fn.fnameescape(target))
+  end
   vim.api.nvim_win_set_cursor(0, { entry.lnum, math.max((entry.col or 1) - 1, 0) })
   return true
 end
@@ -475,6 +480,9 @@ local function run_lines(cmd, opts)
     local cwd_path = norm(trim(opts.cwd))
     if cwd_path ~= "" and is_dir(cwd_path) then
       system_opts.cwd = cwd_path
+    end
+    if type(opts.env) == "table" and next(opts.env) ~= nil then
+      system_opts.env = vim.tbl_extend("force", vim.fn.environ(), opts.env)
     end
     local result = vim.system(cmd, system_opts):wait()
     local output = (result.stdout or "") .. (result.stderr or "")
@@ -524,6 +532,170 @@ local function find_uproject_in_dir(dir)
     return norm(matches[1])
   end
   return nil
+end
+
+local DEFAULT_PLATFORM_CHOICES = { "Win64", "Android", "Linux", "Mac", "IOS" }
+local DEFAULT_CONFIGURATION_CHOICES = { "Development", "DebugGame", "Debug", "Shipping", "Test" }
+local TARGET_KIND_SUFFIXES = { "Editor", "Client", "Server" }
+
+local function copy_list(items)
+  local copy = {}
+  vim.list_extend(copy, items or {})
+  return copy
+end
+
+local function push_unique(list, seen, value)
+  value = trim(value)
+  if value == "" or seen[value] then
+    return
+  end
+  seen[value] = true
+  table.insert(list, value)
+end
+
+local function find_solution_in_dir(dir, uproject)
+  local matches = vim.fn.globpath(dir, "*.sln", false, true)
+  if type(matches) ~= "table" or #matches == 0 then
+    return nil
+  end
+
+  table.sort(matches)
+  if uproject and uproject ~= "" then
+    local preferred = join(dir, vim.fs.basename(uproject):gsub("%.uproject$", "") .. ".sln")
+    for _, match in ipairs(matches) do
+      match = norm(match)
+      if match == preferred then
+        return match
+      end
+    end
+  end
+
+  return norm(matches[1])
+end
+
+local function parse_solution_configurations(solution_path)
+  local content = read_all(solution_path)
+  if not content or content == "" then
+    return nil
+  end
+
+  local platforms = {}
+  local platform_seen = {}
+  local configs_by_platform = {}
+  local in_section = false
+
+  for line in content:gmatch("[^\r\n]+") do
+    local text = trim(line)
+    if text:match("^GlobalSection%(SolutionConfigurationPlatforms%)%s*=%s*preSolution$") then
+      in_section = true
+    elseif in_section and text == "EndGlobalSection" then
+      break
+    elseif in_section then
+      local left = trim(text:match("^([^=]+)=") or "")
+      local configuration, platform = left:match("^(.-)|(.+)$")
+      configuration = trim(configuration)
+      platform = trim(platform)
+      if configuration ~= "" and platform ~= "" then
+        push_unique(platforms, platform_seen, platform)
+        local bucket = configs_by_platform[platform]
+        if not bucket then
+          bucket = { order = {}, seen = {} }
+          configs_by_platform[platform] = bucket
+        end
+        push_unique(bucket.order, bucket.seen, configuration)
+      end
+    end
+  end
+
+  if #platforms == 0 then
+    return nil
+  end
+
+  local configurations = {}
+  for platform, bucket in pairs(configs_by_platform) do
+    configurations[platform] = bucket.order
+  end
+
+  return {
+    path = norm(solution_path),
+    platforms = platforms,
+    configurations = configurations,
+  }
+end
+
+local function solution_configuration_data(project_root, uproject)
+  project_root = norm(project_root)
+  if project_root == "" or not is_dir(project_root) then
+    return nil
+  end
+
+  local solution = find_solution_in_dir(project_root, uproject)
+  if not solution then
+    return nil
+  end
+
+  return parse_solution_configurations(solution)
+end
+
+local function available_platform_choices(project_root, uproject)
+  local solution = solution_configuration_data(project_root, uproject)
+  if solution and #solution.platforms > 0 then
+    return copy_list(solution.platforms)
+  end
+  return copy_list(DEFAULT_PLATFORM_CHOICES)
+end
+
+local function available_configuration_choices(project_root, uproject, platform)
+  local solution = solution_configuration_data(project_root, uproject)
+  if solution then
+    local platform_configs = solution.configurations[trim(platform or "")]
+    if platform_configs and #platform_configs > 0 then
+      return copy_list(platform_configs)
+    end
+
+    local merged = {}
+    local seen = {}
+    for _, candidate_platform in ipairs(solution.platforms or {}) do
+      for _, configuration in ipairs(solution.configurations[candidate_platform] or {}) do
+        push_unique(merged, seen, configuration)
+      end
+    end
+    if #merged > 0 then
+      return merged
+    end
+  end
+
+  return copy_list(DEFAULT_CONFIGURATION_CHOICES)
+end
+
+local function split_target_configuration_name(configuration)
+  configuration = trim(configuration)
+  for _, suffix in ipairs(TARGET_KIND_SUFFIXES) do
+    local base = trim(configuration:match("^(.-)%s+" .. suffix .. "$") or "")
+    if base ~= "" then
+      return base, suffix
+    end
+  end
+  return configuration ~= "" and configuration or "Development", "Game"
+end
+
+local function default_target_configuration(project_root, uproject, platform)
+  local choices = available_configuration_choices(project_root, uproject, platform)
+  local preferred = { "Development Editor", "DebugGame Editor", "Development" }
+
+  for _, want in ipairs(preferred) do
+    for _, choice in ipairs(choices) do
+      if choice == want then
+        return choice
+      end
+    end
+  end
+
+  if #choices > 0 then
+    return choices[1]
+  end
+
+  return "Development"
 end
 
 local function resolve_project_input(path)
@@ -761,14 +933,22 @@ local function resolve_context(opts)
   return ctx
 end
 
-local function filter_cpp(paths)
+local function path_has_extension(path, extensions)
+  local normalized = norm(path):lower()
+  for _, extension in ipairs(extensions or {}) do
+    local ext = trim(extension):lower()
+    if ext ~= "" and normalized:match("%." .. vim.pesc(ext) .. "$") then
+      return true
+    end
+  end
+  return false
+end
+
+local function filter_extensions(paths, extensions)
   local filtered = {}
   for _, path in ipairs(paths or {}) do
     local normalized = norm(path)
-    if normalized:match("%.c$") or normalized:match("%.cc$") or normalized:match("%.cpp$") or normalized:match("%.cxx$")
-      or normalized:match("%.h$") or normalized:match("%.hh$") or normalized:match("%.hpp$") or normalized:match("%.hxx$")
-      or normalized:match("%.inl$") or normalized:match("%.ipp$") or normalized:match("%.inc$")
-      or normalized:match("%.m$") or normalized:match("%.mm$") then
+    if path_has_extension(normalized, extensions) then
       table.insert(filtered, normalized)
     end
   end
@@ -776,14 +956,43 @@ local function filter_cpp(paths)
   return filtered
 end
 
+local function filter_cpp(paths)
+  return filter_extensions(paths, M.FT_CPP)
+end
+
+local function filter_shader(paths)
+  return filter_extensions(paths, M.FT_SHADER)
+end
+
+local function filter_code(paths)
+  return filter_extensions(paths, M.FT_CODE)
+end
+
 local PROJECT_INDEX_DIRS = {
   "Source",
+  "Shaders",
   "Config",
   "Plugins",
   "CSharpScript",
   "Script",
   "TypeScript",
   "typescript",
+}
+
+local ENGINE_INDEX_DIRS = {
+  "Engine/Source",
+  "Engine/Plugins",
+  "Engine/Shaders",
+}
+
+local PROJECT_SHADER_DIRS = {
+  "Shaders",
+  "Plugins",
+}
+
+local ENGINE_SHADER_DIRS = {
+  "Engine/Shaders",
+  "Engine/Plugins",
 }
 
 local GTAGS_EXCLUDE_SUBSTRINGS = {
@@ -1107,6 +1316,16 @@ local function set_build_status(value)
   refresh_statusline()
 end
 
+local function set_prepare_running(value)
+  value = not not value
+  if M._prepare_running == value then
+    return
+  end
+  M._prepare_running = value
+  invalidate_status_cache()
+  refresh_statusline()
+end
+
 local function scan_relative_files(root, search_paths)
   local fd = first_executable({ "fd", "fdfind" })
   if not fd then
@@ -1222,25 +1441,80 @@ local function build_gtags_db(root, filelist, db_dir, label)
 end
 
 local function global_lines(root, db_dir, args)
-  local cmd = { "env", "GTAGSROOT=" .. root, "GTAGSDBPATH=" .. db_dir, "global" }
+  local cmd = { "global" }
   vim.list_extend(cmd, args)
-  return run_lines(cmd, { cwd = root })
+
+  if vim.system then
+    return run_lines(cmd, {
+      cwd = root,
+      env = {
+        GTAGSROOT = root,
+        GTAGSDBPATH = db_dir,
+      },
+    })
+  end
+
+  local prev_root = vim.env.GTAGSROOT
+  local prev_db = vim.env.GTAGSDBPATH
+  vim.env.GTAGSROOT = root
+  vim.env.GTAGSDBPATH = db_dir
+  local ok, code, lines = pcall(run_lines, cmd, { cwd = root })
+  vim.env.GTAGSROOT = prev_root
+  vim.env.GTAGSDBPATH = prev_db
+  if not ok then
+    error(code)
+  end
+  return code, lines
 end
 
-local function detect_target_name(project_root, uproject)
+local function detect_target_names(project_root, uproject)
   local targets = vim.fn.globpath(join(project_root, "Source"), "*.Target.cs", false, true)
-  local editor_target, game_target
+  local detected = {
+    Editor = nil,
+    Client = nil,
+    Server = nil,
+    Game = nil,
+  }
 
   for _, target in ipairs(targets or {}) do
     local name = vim.fs.basename(target):gsub("%.Target%.cs$", "")
-    if name:match("Editor$") then
-      editor_target = editor_target or name
-    else
-      game_target = game_target or name
+    local matched = false
+    for _, kind in ipairs(TARGET_KIND_SUFFIXES) do
+      if name:match(kind .. "$") then
+        detected[kind] = detected[kind] or name
+        matched = true
+        break
+      end
+    end
+    if not matched then
+      detected.Game = detected.Game or name
     end
   end
 
-  return editor_target or game_target or vim.fs.basename(uproject):gsub("%.uproject$", "")
+  local fallback = vim.fs.basename(uproject):gsub("%.uproject$", "")
+  detected.Game = detected.Game or fallback
+  return detected
+end
+
+local function detect_target_name(project_root, uproject, kind)
+  local detected = detect_target_names(project_root, uproject)
+  local fallback = vim.fs.basename(uproject):gsub("%.uproject$", "")
+  kind = trim(kind or "")
+
+  if kind == "Editor" then
+    return detected.Editor or detected.Game or detected.Client or detected.Server or fallback
+  end
+  if kind == "Client" then
+    return detected.Client or detected.Game or detected.Editor or detected.Server or fallback
+  end
+  if kind == "Server" then
+    return detected.Server or detected.Game or detected.Editor or detected.Client or fallback
+  end
+  if kind == "Game" then
+    return detected.Game or detected.Editor or detected.Client or detected.Server or fallback
+  end
+
+  return detected.Editor or detected.Game or detected.Client or detected.Server or fallback
 end
 
 local function target_platform(engine_root, cmd)
@@ -1266,7 +1540,7 @@ local function target_platform(engine_root, cmd)
   return "Linux"
 end
 
-local function target_configuration(engine_root)
+local function selected_target_configuration(engine_root, project_root, uproject, platform)
   local override = trim(vim.env.UE_TARGET_CONFIGURATION)
   if override ~= "" then
     return override
@@ -1279,15 +1553,27 @@ local function target_configuration(engine_root)
       return persisted
     end
   end
-  return "Development"
+  return default_target_configuration(project_root, uproject, platform)
 end
 
-local function build_target_name(project_root, uproject)
+local function target_configuration(engine_root, project_root, uproject, platform)
+  local configuration = selected_target_configuration(engine_root, project_root, uproject, platform)
+  local normalized = split_target_configuration_name(configuration)
+  return normalized
+end
+
+local function target_kind(engine_root, project_root, uproject, platform)
+  local configuration = selected_target_configuration(engine_root, project_root, uproject, platform)
+  local _, kind = split_target_configuration_name(configuration)
+  return kind
+end
+
+local function build_target_name(project_root, uproject, kind)
   local override = trim(vim.env.UE_BUILD_TARGET)
   if override ~= "" then
     return override
   end
-  return "Client"
+  return detect_target_name(project_root, uproject, kind)
 end
 
 local function command_is_windows(cmd)
@@ -1539,11 +1825,313 @@ local function compile_commands_candidates(ctx)
   return candidates
 end
 
+local function scan_shader_files(root, search_paths)
+  root = norm(root)
+  if root == "" then
+    return {}
+  end
+
+  local files = {}
+  local seen = {}
+  for _, search_path in ipairs(existing_relative_dirs(root, search_paths)) do
+    for _, extension in ipairs(M.FT_SHADER) do
+      for _, pattern in ipairs({
+        join(root, search_path, "*." .. extension),
+        join(root, search_path, "**", "*." .. extension),
+      }) do
+        for _, absolute in ipairs(glob_paths(pattern)) do
+          local normalized = norm(absolute)
+          local key = normalized:lower()
+          if is_file(normalized) and not seen[key] then
+            seen[key] = true
+            table.insert(files, normalized)
+          end
+        end
+      end
+    end
+  end
+  table.sort(files)
+  return files
+end
+
+local function shader_search_dirs(ctx)
+  local dirs = {}
+  local seen = {}
+
+  local function add(path)
+    path = norm(path)
+    local key = path:lower()
+    if path ~= "" and is_dir(path) and not seen[key] then
+      seen[key] = true
+      table.insert(dirs, path)
+    end
+  end
+
+  if ctx.project_root and ctx.project_root ~= "" then
+    for _, relative in ipairs(PROJECT_SHADER_DIRS) do
+      add(join(ctx.project_root, relative))
+    end
+  end
+  for _, relative in ipairs(ENGINE_SHADER_DIRS) do
+    add(join(ctx.engine_root, relative))
+  end
+
+  return dirs
+end
+
+local function shader_definition_entry(file, lnum, line, symbol)
+  line = tostring(line or "")
+  local trimmed = trim(line)
+  if trimmed == "" or trimmed:match("^//") or trimmed:match("^#") then
+    return nil
+  end
+
+  local start_col, end_col = trimmed:find(symbol, 1, true)
+  if not start_col or not trimmed:sub(end_col + 1):match("^%s*%(") then
+    return nil
+  end
+
+  local before = trimmed:sub(1, start_col - 1)
+  if before:match("^%s*$") then
+    return nil
+  end
+  if before:find("=", 1, true) or before:find(",", 1, true) or before:find("%(") then
+    return nil
+  end
+  if before:match("%f[%a]return%f[%A]")
+    or before:match("%f[%a]if%f[%A]")
+    or before:match("%f[%a]for%f[%A]")
+    or before:match("%f[%a]while%f[%A]")
+    or before:match("%f[%a]switch%f[%A]") then
+    return nil
+  end
+
+  before = trim(before)
+  if before == "" then
+    return nil
+  end
+  for token in before:gmatch("%S+") do
+    if not token:match("^[%a_][%w_<>%[%],:%*&]*$") then
+      return nil
+    end
+  end
+
+  return {
+    filename = file,
+    lnum = lnum,
+    col = math.max((line:find(symbol, 1, true) or 1), 1),
+    text = trimmed,
+  }
+end
+
+local function collect_shader_definition_entries(entries, seen, file, lines, symbol)
+  for lnum, line in ipairs(lines or {}) do
+    local entry = shader_definition_entry(file, lnum, line, symbol)
+    if entry then
+      add_quickfix_entry(entries, seen, entry)
+    end
+  end
+end
+
+local function rg_shader_definition_entries(dirs, symbol, seen_files)
+  local rg = first_executable({ "rg" })
+  if not rg or #dirs == 0 then
+    return nil
+  end
+
+  local cmd = {
+    rg,
+    "--line-number",
+    "--with-filename",
+    "--no-heading",
+    "--color",
+    "never",
+    "--no-ignore",
+    "--max-count",
+    "200",
+  }
+
+  for _, extension in ipairs(M.FT_SHADER) do
+    table.insert(cmd, "-g")
+    table.insert(cmd, "*." .. extension)
+  end
+
+  table.insert(cmd, [[\b]] .. symbol .. [[\s*\(]])
+  vim.list_extend(cmd, dirs)
+
+  local code, lines = run_lines(cmd)
+  if code ~= 0 and code ~= 1 then
+    return nil
+  end
+
+  local entries = {}
+  local seen_entries = {}
+  for _, line in ipairs(lines or {}) do
+    local file, lnum, text = tostring(line):match("^(.-):(%d+):(.*)$")
+    if file and lnum then
+      file = norm(file)
+      if not is_absolute_path(file) then
+        file = norm(file)
+      end
+      local key = file:lower()
+      if not (seen_files and seen_files[key]) then
+        local entry = shader_definition_entry(file, tonumber(lnum), text, symbol)
+        if entry then
+          add_quickfix_entry(entries, seen_entries, entry)
+        end
+      end
+    end
+  end
+
+  return entries
+end
+
+local function shader_definition_search(ctx, symbol)
+  local current = norm(vim.api.nvim_buf_get_name(0))
+  if current == "" or not path_has_extension(current, M.FT_SHADER) then
+    return false
+  end
+
+  local function finalize(entries)
+    if #entries == 0 then
+      return false
+    end
+    if #entries == 1 then
+      return jump_to_entry(entries[1])
+    end
+    return populate_quickfix_from_entries("Shader definitions: " .. symbol, entries)
+  end
+
+  local entries = {}
+  local seen_entries = {}
+  collect_shader_definition_entries(entries, seen_entries, current, vim.api.nvim_buf_get_lines(0, 0, -1, false), symbol)
+  if #entries > 0 then
+    return finalize(entries)
+  end
+
+  local current_dir = dirname(current)
+  local seen_files = { [current:lower()] = true }
+  local same_dir_entries = rg_shader_definition_entries({ current_dir }, symbol, seen_files) or {}
+  if #same_dir_entries > 0 then
+    return finalize(same_dir_entries)
+  end
+
+  local rest_entries = rg_shader_definition_entries(shader_search_dirs(ctx), symbol, seen_files) or {}
+  return finalize(rest_entries)
+end
+
+local function shader_include_roots(shader_files)
+  local roots = {}
+  local seen = {}
+  for _, path in ipairs(shader_files or {}) do
+    local root = norm(path):match("^(.-/Shaders)/")
+    if root and not seen[root] then
+      seen[root] = true
+      table.insert(roots, root)
+    end
+  end
+  table.sort(roots)
+  return roots
+end
+
+local function compile_commands_program(entry)
+  if type(entry) == "table" and type(entry.arguments) == "table" and entry.arguments[1] then
+    return trim(entry.arguments[1])
+  end
+
+  local command = type(entry) == "table" and trim(entry.command) or ""
+  if command ~= "" then
+    if command:sub(1, 1) == '"' then
+      return command:match('^"([^"]+)"') or command:match("^(%S+)")
+    end
+    return command:match("^(%S+)")
+  end
+
+  return first_executable({ "clang++", "clang", "clang++.exe", "clang.exe", "cl.exe", "cl" }) or "clang++"
+end
+
+local function compile_commands_template_entry(entries)
+  for _, entry in ipairs(entries or {}) do
+    if type(entry) == "table" and type(entry.arguments) == "table" and entry.arguments[1] and entry.file then
+      return entry
+    end
+  end
+  for _, entry in ipairs(entries or {}) do
+    if type(entry) == "table" and entry.file then
+      return entry
+    end
+  end
+  return {}
+end
+
+local function make_shader_compile_command_entry(shader_file, template, include_roots)
+  local arguments = {
+    compile_commands_program(template),
+    "-x",
+    "c++-header",
+    "-fsyntax-only",
+    "-Wno-pragma-once-outside-header",
+  }
+  for _, root in ipairs(include_roots or {}) do
+    table.insert(arguments, "-I")
+    table.insert(arguments, root)
+  end
+  table.insert(arguments, shader_file)
+
+  return {
+    directory = trim(template.directory or dirname(shader_file)),
+    file = shader_file,
+    arguments = arguments,
+  }
+end
+
+local function augment_compile_commands_with_shaders(ctx, content)
+  local ok, decoded = pcall(vim.json.decode, content)
+  if not ok or type(decoded) ~= "table" then
+    return content
+  end
+
+  local shader_files = {}
+  if ctx.project_root and ctx.project_root ~= "" then
+    vim.list_extend(shader_files, scan_shader_files(ctx.project_root, PROJECT_INDEX_DIRS))
+  end
+  vim.list_extend(shader_files, scan_shader_files(ctx.engine_root, ENGINE_INDEX_DIRS))
+  if #shader_files == 0 then
+    return content
+  end
+
+  local include_roots = shader_include_roots(shader_files)
+  local template = compile_commands_template_entry(decoded)
+  local existing = {}
+  for _, entry in ipairs(decoded) do
+    if type(entry) == "table" and entry.file then
+      existing[norm(entry.file):lower()] = true
+    end
+  end
+
+  local added = false
+  for _, shader_file in ipairs(shader_files) do
+    local key = shader_file:lower()
+    if not existing[key] then
+      table.insert(decoded, make_shader_compile_command_entry(shader_file, template, include_roots))
+      existing[key] = true
+      added = true
+    end
+  end
+
+  if not added then
+    return content
+  end
+
+  return vim.json.encode(decoded)
+end
+
 local function write_compile_commands_targets(ctx, content)
   if not content or content == "" then
     return false, "compile_commands.json was empty"
   end
 
+  content = augment_compile_commands_with_shaders(ctx, content)
   local preferred = compile_commands_targets(ctx)[1]
   for _, target in ipairs(compile_commands_targets(ctx)) do
     write_all(target, content)
@@ -1585,6 +2173,9 @@ local function generate_compile_commands(ctx)
   end
 
   local cmd, cmd_err
+  local plat
+  local conf
+  local kind
   if is_windows_path(ctx.engine_root) then
     local engine_root_win = windows_engine_root(ctx)
     if not engine_root_win or engine_root_win == "" then
@@ -1596,21 +2187,27 @@ local function generate_compile_commands(ctx)
       return false, "Build.bat not found under engine root: " .. build_bat_file
     end
 
+    plat = target_platform(ctx.engine_root, { "Build.bat" })
+    conf = target_configuration(ctx.engine_root, ctx.project_root, uproject, plat)
+    kind = target_kind(ctx.engine_root, ctx.project_root, uproject, plat)
     cmd, cmd_err = build_bat_windows_command(engine_root_win, {
       "-Mode=GenerateClangDatabase",
-      detect_target_name(ctx.project_root, uproject),
-      target_platform(ctx.engine_root, { "Build.bat" }),
-      target_configuration(ctx.engine_root),
+      detect_target_name(ctx.project_root, uproject, kind),
+      plat,
+      conf,
       "-Project=" .. project_arg,
       "-Game",
       "-Engine",
     })
   else
+    plat = target_platform(ctx.engine_root, { ubt_exe_path(ctx.engine_root) })
+    conf = target_configuration(ctx.engine_root, ctx.project_root, uproject, plat)
+    kind = target_kind(ctx.engine_root, ctx.project_root, uproject, plat)
     cmd, cmd_err = direct_ubt_command(ctx.engine_root, {
       "-Mode=GenerateClangDatabase",
-      detect_target_name(ctx.project_root, uproject),
-      target_platform(ctx.engine_root, { ubt_exe_path(ctx.engine_root) }),
-      target_configuration(ctx.engine_root),
+      detect_target_name(ctx.project_root, uproject, kind),
+      plat,
+      conf,
       "-Project=" .. project_arg,
       "-Game",
       "-Engine",
@@ -1644,10 +2241,11 @@ local function android_build_command(ctx)
   end
 
   local plat = target_platform(ctx.engine_root, nil)
-  local conf = target_configuration(ctx.engine_root)
+  local conf = target_configuration(ctx.engine_root, ctx.project_root, uproject, plat)
+  local kind = target_kind(ctx.engine_root, ctx.project_root, uproject, plat)
 
   local build_args = {
-    build_target_name(ctx.project_root, uproject),
+    build_target_name(ctx.project_root, uproject, kind),
     plat,
     conf,
     "-Project=" .. uproject_win,
@@ -1906,6 +2504,10 @@ function M.statusline_status(opts)
     parts[#parts + 1] = "UE?"
   end
 
+  if M._prepare_running then
+    parts[#parts + 1] = "PREP*"
+  end
+
   local build = trim(vim.g.ue_build_status or "")
   if build ~= "" then
     parts[#parts + 1] = build
@@ -1971,21 +2573,20 @@ function M.gtags_definition(symbol)
     vim.notify(err, vim.log.levels.WARN)
     return false
   end
-  if not ctx.project_root then
-    return false
+
+  if shader_definition_search(ctx, symbol) then
+    return true
   end
 
   local root = workspace_root(ctx)
-  if not db_ready(ctx.paths.workspace_db) then
-    return false
+  if db_ready(ctx.paths.workspace_db) then
+    local code, lines = global_lines(root, ctx.paths.workspace_db, { "-d", "--result=grep", symbol })
+    if (code == 0 or code == 1) and lines and #lines > 0 then
+      return jump_to_global_result(root, lines)
+    end
   end
 
-  local code, lines = global_lines(root, ctx.paths.workspace_db, { "-d", "--result=grep", symbol })
-  if (code ~= 0 and code ~= 1) or not lines or #lines == 0 then
-    return false
-  end
-
-  return jump_to_global_result(root, lines)
+  return false
 end
 
 function M.android_build_command(opts)
@@ -2003,11 +2604,15 @@ local function show_paths()
   local ctx, err = resolve_context()
   if not ctx then
     vim.notify(err, vim.log.levels.WARN)
+    if vim.g.ue_prepare_headless == 1 then
+      error(err)
+    end
     return
   end
 
   local plat = target_platform(ctx.engine_root, nil)
-  local conf = target_configuration(ctx.engine_root)
+  local selected_conf = selected_target_configuration(ctx.engine_root, ctx.project_root, ctx.uproject, plat)
+  local conf = target_configuration(ctx.engine_root, ctx.project_root, ctx.uproject, plat)
   local plat_source = trim(ctx.state.target_platform or "") ~= "" and "set" or (trim(vim.env.UE_TARGET_PLATFORM or "") ~= "" and "env" or "auto")
   local conf_source = trim(ctx.state.target_configuration or "") ~= "" and "set" or (trim(vim.env.UE_TARGET_CONFIGURATION or "") ~= "" and "env" or "auto")
 
@@ -2015,7 +2620,7 @@ local function show_paths()
     "Engine: " .. ctx.engine_root,
     "Project: " .. (ctx.project_root or "<unset>"),
     "Platform: " .. plat .. " (" .. plat_source .. ")",
-    "Configuration: " .. conf .. " (" .. conf_source .. ")",
+    "Configuration: " .. selected_conf .. " (" .. conf_source .. ")",
     "GTAGS Root: " .. workspace_root(ctx),
     "Compile Commands: " .. compile_commands_targets(ctx)[1],
     "Compile Commands (Engine): " .. compile_commands_targets(ctx)[2],
@@ -2025,6 +2630,9 @@ local function show_paths()
     "Workspace List: " .. ctx.paths.workspace_list,
     "Workspace DB: " .. ctx.paths.workspace_db,
   }
+  if selected_conf ~= conf then
+    table.insert(lines, 5, "UBT Configuration: " .. conf)
+  end
   vim.notify(table.concat(lines, "\n"))
 end
 
@@ -2206,26 +2814,83 @@ local function set_android_package(input)
   vim.notify("UE Android package set:\nEngine: " .. engine_root .. "\nPackage: " .. input)
 end
 
-local PLATFORM_CHOICES = { "Win64", "Android", "Linux", "Mac", "IOS" }
-local CONFIGURATION_CHOICES = { "Development", "DebugGame", "Debug", "Shipping", "Test" }
+local function platform_selection_context()
+  local ctx = resolve_context({ detect_project = true })
+  if ctx then
+    return ctx.engine_root, ctx.project_root, ctx.uproject, ctx.state
+  end
+
+  local engine_root = current_engine_root()
+  if not engine_root then
+    return nil, nil, nil, {}
+  end
+
+  local state = read_state(engine_root)
+  local project_root = norm(state.project_root or "")
+  local uproject = norm(state.uproject or "")
+  if uproject == "" and project_root ~= "" then
+    uproject = find_uproject_in_dir(project_root) or ""
+  end
+
+  return engine_root, project_root, uproject, state
+end
+
+local function split_platform_input(input)
+  input = trim(input or "")
+  if input == "" then
+    return nil, nil
+  end
+
+  local platform, configuration = input:match("^(%S+)%s+(.+)$")
+  if platform then
+    return trim(platform), trim(configuration)
+  end
+
+  return input, nil
+end
+
+local function set_platform_completions(arg_lead)
+  local _, project_root, uproject = platform_selection_context()
+  local all = {}
+  local seen = {}
+
+  for _, platform in ipairs(available_platform_choices(project_root, uproject)) do
+    push_unique(all, seen, platform)
+    for _, configuration in ipairs(available_configuration_choices(project_root, uproject, platform)) do
+      push_unique(all, seen, platform .. " " .. configuration)
+    end
+  end
+
+  if arg_lead == "" then
+    return all
+  end
+
+  local matches = {}
+  for _, item in ipairs(all) do
+    if item:lower():find(arg_lead:lower(), 1, true) == 1 then
+      table.insert(matches, item)
+    end
+  end
+  return matches
+end
 
 local function set_platform(input)
-  local engine_root = current_engine_root()
+  local engine_root, project_root, uproject, state = platform_selection_context()
   if not engine_root then
     vim.notify("No Unreal Engine root found from current buffer or cwd", vim.log.levels.WARN)
     return
   end
 
-  local state = read_state(engine_root)
   local current_plat = trim(state.target_platform or "")
   local current_conf = trim(state.target_configuration or "")
+  local default_plat = current_plat ~= "" and current_plat or target_platform(engine_root, nil)
+  local default_conf = current_conf ~= "" and current_conf
+    or selected_target_configuration(engine_root, project_root, uproject, default_plat)
 
-  -- Direct input: "Win64 Development" or "Win64" or "Android DebugGame"
+  -- Direct input: "Win64 Development Editor" or "Win64" or "Android DebugGame"
   input = trim(input or "")
   if input ~= "" then
-    local parts = vim.split(input, "%s+")
-    local plat = parts[1]
-    local conf = parts[2]
+    local plat, conf = split_platform_input(input)
     if plat and plat ~= "" then
       update_state_field(engine_root, "target_platform", plat)
     end
@@ -2236,21 +2901,24 @@ local function set_platform(input)
     refresh_statusline()
     _context_cache = {}
     vim.notify(("UE platform: %s %s"):format(
-      plat or current_plat or "(auto)",
-      conf or current_conf or "Development"
+      plat or default_plat or "(auto)",
+      conf or default_conf
     ))
     return
   end
 
   -- Interactive: select platform then configuration
-  vim.ui.select(PLATFORM_CHOICES, {
+  vim.ui.select(available_platform_choices(project_root, uproject), {
     prompt = "Target Platform (current: " .. (current_plat ~= "" and current_plat or "auto") .. "):",
   }, function(plat)
     if not plat then
       return
     end
-    vim.ui.select(CONFIGURATION_CHOICES, {
-      prompt = "Target Configuration (current: " .. (current_conf ~= "" and current_conf or "Development") .. "):",
+
+    local current_for_platform = current_conf ~= "" and current_conf
+      or selected_target_configuration(engine_root, project_root, uproject, plat)
+    vim.ui.select(available_configuration_choices(project_root, uproject, plat), {
+      prompt = "Target Configuration (current: " .. current_for_platform .. "):",
     }, function(conf)
       if not conf then
         return
@@ -2287,6 +2955,8 @@ local function export_compile_commands()
   vim.notify("compile_commands exported:\n" .. compile_result)
 end
 
+local stop_android_debugger
+
 local function build_android()
   local ctx, err = resolve_context()
   if not ctx then
@@ -2295,11 +2965,14 @@ local function build_android()
   end
   if not ctx.project_root then
     vim.notify("No project configured for engine root. Run :UESetProject [path]", vim.log.levels.WARN)
+    if vim.g.ue_prepare_headless == 1 then
+      error("No project configured for engine root. Run :UESetProject [path]")
+    end
     return
   end
 
   local plat = target_platform(ctx.engine_root, nil)
-  local conf = target_configuration(ctx.engine_root)
+  local conf = selected_target_configuration(ctx.engine_root, ctx.project_root, ctx.uproject, plat)
   local title = ("UEBuild %s %s"):format(plat, conf)
 
   local cmd, build_err = android_build_command(ctx)
@@ -2310,7 +2983,24 @@ local function build_android()
   end
 
   if plat == "Android" then
+    local cleanup = stop_android_debugger({ kill_orphans = true })
     cleanup_gradle_debug_artifacts(ctx)
+    if cleanup.disconnected or cleanup.adapter_killed or cleanup.orphan_killed > 0 then
+      local parts = {}
+      if cleanup.disconnected then
+        table.insert(parts, "detached active DAP")
+      end
+      if cleanup.adapter_killed then
+        table.insert(parts, "stopped CodeLLDB adapter")
+      end
+      if cleanup.orphan_killed > 0 then
+        table.insert(parts, ("killed %d stale CodeLLDB process%s"):format(
+          cleanup.orphan_killed,
+          cleanup.orphan_killed == 1 and "" or "es"
+        ))
+      end
+      vim.notify("Android build preflight: " .. table.concat(parts, ", "), vim.log.levels.INFO)
+    end
   end
   open_terminal_command(cmd, {
     cwd = windows_host_cwd(),
@@ -2345,6 +3035,30 @@ local function find_apk(ctx)
     end
   end
   return best
+end
+
+function M.launch_app()
+  return require("utils.ue_launch").launch({
+    build_target_name = build_target_name,
+    dirname = dirname,
+    file_mtime = file_mtime,
+    find_uproject_in_dir = find_uproject_in_dir,
+    glob_paths = glob_paths,
+    is_file = is_file,
+    is_windows_path = is_windows_path,
+    join = join,
+    norm = norm,
+    powershell_quote = powershell_quote,
+    resolve_context = resolve_context,
+    run_lines = run_lines,
+    selected_target_configuration = selected_target_configuration,
+    strip_ansi = strip_ansi,
+    target_configuration = target_configuration,
+    target_kind = target_kind,
+    target_platform = target_platform,
+    trim = trim,
+    update_state_field = update_state_field,
+  })
 end
 
 local function install_android()
@@ -2454,47 +3168,53 @@ local function prepare()
     refresh_statusline()
     populate_quickfix_from_output("UEPrepare project scan", project_err, { root = ctx.project_root })
     vim.notify("UEPrepare project scan failed: " .. project_err, vim.log.levels.ERROR)
+    if vim.g.ue_prepare_headless == 1 then
+      error("UEPrepare project scan failed: " .. project_err)
+    end
     return
   end
 
-  local engine_rel, engine_err = scan_relative_files(ctx.engine_root, { "Engine/Source", "Engine/Plugins" })
+  local engine_rel, engine_err = scan_relative_files(ctx.engine_root, ENGINE_INDEX_DIRS)
   if not engine_rel then
     invalidate_status_cache()
     refresh_statusline()
     populate_quickfix_from_output("UEPrepare engine scan", engine_err, { root = ctx.engine_root })
     vim.notify("UEPrepare engine scan failed: " .. engine_err, vim.log.levels.ERROR)
+    if vim.g.ue_prepare_headless == 1 then
+      error("UEPrepare engine scan failed: " .. engine_err)
+    end
     return
   end
 
-  local project_cpp = filter_gtags_paths(filter_cpp(project_rel))
-  local engine_cpp = filter_gtags_paths(filter_cpp(engine_rel))
-  local workspace_cpp = {}
+  local project_code = filter_gtags_paths(filter_code(project_rel))
+  local engine_code = filter_gtags_paths(filter_code(engine_rel))
+  local workspace_code = {}
   local workspace_seen = {}
   local root = workspace_root(ctx)
 
-  for _, path in ipairs(project_cpp) do
+  for _, path in ipairs(project_code) do
     local absolute = join(ctx.project_root, path)
     local relative = relative_to(root, absolute)
     if not workspace_seen[relative] then
       workspace_seen[relative] = true
-      table.insert(workspace_cpp, relative)
+      table.insert(workspace_code, relative)
     end
   end
 
-  for _, path in ipairs(engine_cpp) do
+  for _, path in ipairs(engine_code) do
     local absolute = join(ctx.engine_root, path)
     local relative = relative_to(root, absolute)
     if not workspace_seen[relative] then
       workspace_seen[relative] = true
-      table.insert(workspace_cpp, relative)
+      table.insert(workspace_code, relative)
     end
   end
 
-  table.sort(workspace_cpp)
+  table.sort(workspace_code)
 
-  write_lines(ctx.paths.project_list, project_cpp)
-  write_lines(ctx.paths.engine_list, engine_cpp)
-  write_lines(ctx.paths.workspace_list, workspace_cpp)
+  write_lines(ctx.paths.project_list, project_code)
+  write_lines(ctx.paths.engine_list, engine_code)
+  write_lines(ctx.paths.workspace_list, workspace_code)
 
   local ok_workspace, workspace_err = build_gtags_db(root, ctx.paths.workspace_list, ctx.paths.workspace_db, "workspace")
   if not ok_workspace then
@@ -2502,6 +3222,9 @@ local function prepare()
     refresh_statusline()
     populate_quickfix_from_output("UEPrepare GTAGS", workspace_err, { root = root })
     vim.notify("UEPrepare GTAGS failed: " .. workspace_err, vim.log.levels.ERROR)
+    if vim.g.ue_prepare_headless == 1 then
+      error("UEPrepare GTAGS failed: " .. workspace_err)
+    end
     return
   end
 
@@ -2511,21 +3234,131 @@ local function prepare()
     refresh_statusline()
     populate_quickfix_from_output("UEPrepare compile_commands", compile_path, { root = root })
     vim.notify("UEPrepare compile_commands failed: " .. compile_path, vim.log.levels.WARN)
+    if vim.g.ue_prepare_headless == 1 then
+      error("UEPrepare compile_commands failed: " .. compile_path)
+    end
     return
   end
 
   clear_index_dirty(ctx)
   invalidate_status_cache()
   refresh_statusline()
-  vim.notify(
-    ("UEPrepare done:\nProject files: %d\nEngine files: %d\nGTAGS files: %d\ncompile_commands: %s\nCache: %s"):format(
-      #project_cpp,
-      #engine_cpp,
-      #workspace_cpp,
-      compile_path,
-      ctx.paths.cache
-    )
+  local summary = ("UEPrepare done:\nProject files: %d\nEngine files: %d\nGTAGS files: %d\ncompile_commands: %s\nCache: %s"):format(
+    #project_code,
+    #engine_code,
+    #workspace_code,
+    compile_path,
+    ctx.paths.cache
   )
+  if vim.g.ue_prepare_headless == 1 then
+    print(summary)
+    return
+  end
+  vim.notify(summary)
+end
+
+
+local function append_job_output(lines, data)
+  for _, line in ipairs(data or {}) do
+    line = trim(line)
+    if line ~= "" then
+      table.insert(lines, line)
+    end
+  end
+end
+
+local function prepare_async()
+  local ctx, err = resolve_context()
+  if not ctx then
+    vim.notify(err, vim.log.levels.WARN)
+    return
+  end
+  if not ctx.project_root then
+    vim.notify("No project configured for engine root. Run :UESetProject [path]", vim.log.levels.WARN)
+    return
+  end
+
+  if prepare_jobid then
+    local ok_wait, result = pcall(vim.fn.jobwait, { prepare_jobid }, 0)
+    if ok_wait and result and result[1] == -1 then
+      vim.notify("UEPrepare is already running", vim.log.levels.INFO)
+      return
+    end
+    prepare_jobid = nil
+  end
+
+  if ctx.state.project_root ~= ctx.project_root then
+    persist_project(ctx.engine_root, ctx.project_root, ctx.uproject)
+  end
+
+  ensure_dir(ctx.paths.cache)
+  local log_path = join(ctx.paths.cache, "ue_prepare_headless.log")
+  local output = {}
+  local cmd = {
+    vim.v.progpath,
+    "--headless",
+    "--cmd",
+    "lua vim.g.ue_prepare_headless = 1",
+    "-c",
+    "lua require('ue').prepare_headless()",
+  }
+
+  set_prepare_running(true)
+  vim.notify("UEPrepare started in background", vim.log.levels.INFO)
+
+  prepare_jobid = vim.fn.jobstart(cmd, {
+    cwd = ctx.project_root,
+    stdout_buffered = true,
+    stderr_buffered = true,
+    on_stdout = function(_, data)
+      append_job_output(output, data)
+    end,
+    on_stderr = function(_, data)
+      append_job_output(output, data)
+    end,
+    on_exit = function(_, code)
+      vim.schedule(function()
+        prepare_jobid = nil
+        set_prepare_running(false)
+
+        local text = table.concat(output, "\n")
+        if text ~= "" then
+          write_all(log_path, text .. "\n")
+        end
+
+        if code == 0 then
+          clear_index_dirty(ctx)
+          invalidate_status_cache()
+          refresh_statusline()
+          vim.notify("UEPrepare finished", vim.log.levels.INFO)
+          return
+        end
+
+        invalidate_status_cache()
+        refresh_statusline()
+        if text ~= "" then
+          populate_quickfix_from_output("UEPrepare background run", text, { root = ctx.project_root })
+        end
+        vim.notify("UEPrepare failed, see quickfix/log: " .. log_path, vim.log.levels.ERROR)
+      end)
+    end,
+  })
+
+  if prepare_jobid <= 0 then
+    prepare_jobid = nil
+    set_prepare_running(false)
+    vim.notify("Failed to start background UEPrepare", vim.log.levels.ERROR)
+  end
+end
+
+function M.prepare_headless()
+  local ok, err = xpcall(prepare, debug.traceback)
+  if not ok then
+    vim.api.nvim_err_writeln(err)
+    vim.cmd("cquit 1")
+    return
+  end
+  vim.cmd("qall!")
 end
 
 local function clear_cache()
@@ -2562,6 +3395,103 @@ local function mono_ms()
     return math.floor(uv.hrtime() / 1e6)
   end
   return math.floor(vim.fn.reltimefloat(vim.fn.reltime()) * 1000)
+end
+
+local function reset_android_dap_state()
+  M._dap_attach_in_progress = false
+  M._dap_run_state = "idle"
+  M._continue_pending = false
+  M._continue_debounce_until_ms = 0
+  M._pause_pending = false
+  M._dap_source_file_cache = {}
+  M._dap_session_state = {}
+end
+
+local function stop_process_tree(pid)
+  pid = tonumber(pid)
+  if not pid or pid <= 0 then
+    return false
+  end
+  if is_native_windows() then
+    vim.fn.system({ "taskkill", "/F", "/T", "/PID", tostring(pid) })
+  else
+    vim.fn.system({ "kill", "-9", tostring(pid) })
+  end
+  return vim.v.shell_error == 0
+end
+
+local function cleanup_remote_android_lldb(state)
+  state = state or {}
+  if not state.package_name then
+    return
+  end
+  local adb = state.adb or "adb"
+  local serial = trim(state.serial or "")
+  local cmd = { adb }
+  if serial ~= "" then
+    table.insert(cmd, "-s")
+    table.insert(cmd, serial)
+  end
+  table.insert(cmd, "shell")
+  table.insert(cmd, "run-as " .. state.package_name .. " sh -c 'pkill -9 lldb-server 2>/dev/null'")
+  vim.fn.jobstart(cmd, { detach = true })
+end
+
+local function kill_managed_codelldb_processes()
+  if not is_native_windows() then
+    return 0
+  end
+  local adapter, _, _ = M.codelldb_paths()
+  if not adapter then
+    return 0
+  end
+  local shell = first_executable({ "pwsh", "powershell", "powershell.exe" })
+  if not shell then
+    return 0
+  end
+  local escaped = norm(adapter):gsub("/", "\\"):gsub("'", "''")
+  local cmd = ([[Get-Process codelldb -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq '%s' } | ForEach-Object { $id = $_.Id; Stop-Process -Id $id -Force -ErrorAction SilentlyContinue; $id }]]):format(escaped)
+  local code, lines = run_lines({ shell, "-NoProfile", "-NonInteractive", "-Command", cmd })
+  if code ~= 0 then
+    return 0
+  end
+  local killed = 0
+  for _, line in ipairs(lines or {}) do
+    if trim(line):match("^%d+$") then
+      killed = killed + 1
+    end
+  end
+  return killed
+end
+
+stop_android_debugger = function(opts)
+  opts = opts or {}
+  local dap_ok, dap = pcall(require, "dap")
+  local session = dap_ok and dap.session and dap.session() or nil
+  local state = M._dap_session_state or {}
+  local adapter_pid = session and session.adapter and session.adapter.pid or nil
+
+  if session then
+    pcall(function()
+      session:request("disconnect", { terminateDebuggee = false })
+    end)
+  end
+  if adapter_pid then
+    stop_process_tree(adapter_pid)
+  end
+
+  cleanup_remote_android_lldb(state)
+  reset_android_dap_state()
+
+  local killed = 0
+  if opts.kill_orphans then
+    killed = kill_managed_codelldb_processes()
+  end
+  return {
+    disconnected = session ~= nil,
+    adapter_killed = adapter_pid ~= nil,
+    orphan_killed = killed,
+  }
 end
 
 local function clear_android_breakpoint_state()
@@ -2852,6 +3782,108 @@ function M._reapply_breakpoints(cb)
   end
 end
 
+local function android_symbol_copy_root(ctx)
+  local project_root = ctx and ctx.project_root or ""
+  local project_name = trim(vim.fs.basename(project_root))
+  if project_name == "" then
+    project_name = "default"
+  end
+  return join(vim.fn.stdpath("cache"), "ue", "android-symbols", project_name)
+end
+
+local function copy_file_if_needed(source, dest)
+  source = norm(source)
+  dest = norm(dest)
+  if source == "" or dest == "" or not is_file(source) then
+    return nil, "source file not found"
+  end
+
+  local src_stat = file_stat(source)
+  local dest_stat = file_stat(dest)
+  local needs_copy = not dest_stat
+    or (src_stat and dest_stat and src_stat.size ~= dest_stat.size)
+    or file_mtime(source) > file_mtime(dest)
+
+  if not needs_copy then
+    return dest
+  end
+
+  ensure_dir(dirname(dest))
+  if vim.uv and vim.uv.fs_copyfile then
+    local ok, err = vim.uv.fs_copyfile(source, dest)
+    if ok then
+      return dest
+    end
+    return nil, err or "fs_copyfile failed"
+  end
+
+  local ok, err = pcall(vim.fn.writefile, vim.fn.readblob(source), dest, "b")
+  if ok then
+    return dest
+  end
+  return nil, err or "writefile failed"
+end
+
+local function android_symbol_candidates(project_root)
+  if project_root == "" then
+    return {}
+  end
+
+  local patterns = {
+    join(project_root, "Binaries", "Android", "*.so"),
+    join(project_root, "Source", "*", "Binaries", "Android", "*.so"),
+    join(project_root, "Intermediate", "Android", "arm64", "jni", "arm64-v8a", "libUE4.so"),
+    join(project_root, "Intermediate", "Android", "arm64", "jni", "arm64-v8a", "libUnreal.so"),
+  }
+  local candidates = {}
+  local seen = {}
+  for _, pattern in ipairs(patterns) do
+    for _, path in ipairs(glob_paths(pattern)) do
+      if is_file(path) and not seen[path] then
+        seen[path] = true
+        table.insert(candidates, path)
+      end
+    end
+  end
+  table.sort(candidates, function(a, b)
+    local a_intermediate = path_has_prefix(a, join(project_root, "Intermediate"))
+    local b_intermediate = path_has_prefix(b, join(project_root, "Intermediate"))
+    if a_intermediate ~= b_intermediate then
+      return not a_intermediate
+    end
+    return file_mtime(a) > file_mtime(b)
+  end)
+  return candidates
+end
+
+local function resolve_android_symbol_lib(ctx)
+  local project_root = ctx and ctx.project_root or ""
+  for _, path in ipairs(android_symbol_candidates(project_root)) do
+    return path
+  end
+  return ""
+end
+
+local function snapshot_android_symbol_lib(ctx, symbol_lib)
+  symbol_lib = norm(symbol_lib)
+  if symbol_lib == "" or not is_file(symbol_lib) then
+    return symbol_lib, nil
+  end
+
+  local basename = trim(vim.fs.basename(symbol_lib))
+  if basename == "" then
+    return symbol_lib, nil
+  end
+
+  local snapshot_dir = android_symbol_copy_root(ctx)
+  local snapshot = join(snapshot_dir, basename)
+  local copied, err = copy_file_if_needed(symbol_lib, snapshot)
+  if copied then
+    return copied, nil
+  end
+  return symbol_lib, err
+end
+
 function M._setup_aslr_listeners(dap, attach_state, progress_update)
   local handled = false
   local function do_aslr_and_continue()
@@ -3082,23 +4114,19 @@ function M.android_dap_attach()
   local engine_root = ctx.engine_root or ""
   local state = ctx.state or {}
 
-  -- Auto-detect symbol .so: try libUE4.so (UE4) then libUnreal.so (UE5)
-  local symbol_lib = ""
-  if project_root ~= "" then
-    local so_dir = project_root .. "/Intermediate/Android/arm64/jni/arm64-v8a/"
-    for _, name in ipairs({ "libUE4.so", "libUnreal.so" }) do
-      local candidate = vim.fn.glob(so_dir .. name)
-      if candidate ~= "" then
-        symbol_lib = candidate
-        break
-      end
-    end
-  end
+  -- Prefer non-Intermediate .so and debug against a snapshot copy so builds can replace the original.
+  local symbol_lib = resolve_android_symbol_lib(ctx)
   if symbol_lib == "" then
     local default = project_root ~= "" and (project_root .. "/") or ""
     symbol_lib = vim.fn.input("Path to symbol .so (with debug symbols): ", default)
   end
   if symbol_lib == "" then return end
+  local original_symbol_lib = symbol_lib
+  local snapshot_err
+  symbol_lib, snapshot_err = snapshot_android_symbol_lib(ctx, symbol_lib)
+  if snapshot_err then
+    vim.notify("Android symbols snapshot failed, using original .so: " .. snapshot_err, vim.log.levels.WARN)
+  end
 
   -- Package name: read from persisted state, fallback to prompt
   local saved_pkg = state.android_package or ""
@@ -3133,6 +4161,7 @@ function M.android_dap_attach()
   local attach_state = {
     package_name = package_name,
     symbol_lib = to_windows_path(symbol_lib) or symbol_lib,
+    original_symbol_lib = to_windows_path(original_symbol_lib) or original_symbol_lib,
     lldb_server_path = to_windows_path(as_lldb) or as_lldb,
     project_root = to_windows_path(project_root) or project_root,
     engine_root = to_windows_path(engine_root) or engine_root,
@@ -3187,6 +4216,7 @@ function M.android_dap_attach()
           return
         end
         local pid = trim((vim.fn.readfile(attach_state.pid_file) or {})[1] or "")
+        local serial = trim((vim.fn.readfile(attach_state.serial_file) or {})[1] or "")
         local connect_uri = trim((vim.fn.readfile(attach_state.uri_file) or {})[1] or "")
         if pid == "" or connect_uri == "" then
           M._dap_attach_in_progress = false
@@ -3195,6 +4225,7 @@ function M.android_dap_attach()
           return
         end
         attach_state.pid = pid
+        attach_state.serial = serial
         attach_state.connect_uri = connect_uri
         M._dap_session_state = attach_state
         progress_update(("pid=%s, connecting DAP..."):format(pid))
@@ -3297,23 +4328,19 @@ function M.android_dap_launch()
   local engine_root = ctx.engine_root or ""
   local state = ctx.state or {}
 
-  -- Auto-detect symbol .so
-  local symbol_lib = ""
-  if project_root ~= "" then
-    local so_dir = project_root .. "/Intermediate/Android/arm64/jni/arm64-v8a/"
-    for _, name in ipairs({ "libUE4.so", "libUnreal.so" }) do
-      local candidate = vim.fn.glob(so_dir .. name)
-      if candidate ~= "" then
-        symbol_lib = candidate
-        break
-      end
-    end
-  end
+  -- Prefer non-Intermediate .so and debug against a snapshot copy so builds can replace the original.
+  local symbol_lib = resolve_android_symbol_lib(ctx)
   if symbol_lib == "" then
     local default = project_root ~= "" and (project_root .. "/") or ""
     symbol_lib = vim.fn.input("Path to symbol .so (with debug symbols): ", default)
   end
   if symbol_lib == "" then return end
+  local original_symbol_lib = symbol_lib
+  local snapshot_err
+  symbol_lib, snapshot_err = snapshot_android_symbol_lib(ctx, symbol_lib)
+  if snapshot_err then
+    vim.notify("Android symbols snapshot failed, using original .so: " .. snapshot_err, vim.log.levels.WARN)
+  end
 
   -- Package name
   local saved_pkg = state.android_package or ""
@@ -3347,6 +4374,7 @@ function M.android_dap_launch()
   local attach_state = {
     package_name = package_name,
     symbol_lib = to_windows_path(symbol_lib) or symbol_lib,
+    original_symbol_lib = to_windows_path(original_symbol_lib) or original_symbol_lib,
     lldb_server_path = to_windows_path(as_lldb) or as_lldb,
     project_root = to_windows_path(project_root) or project_root,
     engine_root = to_windows_path(engine_root) or engine_root,
@@ -3401,6 +4429,7 @@ function M.android_dap_launch()
           return
         end
         local pid = trim((vim.fn.readfile(attach_state.pid_file) or {})[1] or "")
+        local serial = trim((vim.fn.readfile(attach_state.serial_file) or {})[1] or "")
         local connect_uri = trim((vim.fn.readfile(attach_state.uri_file) or {})[1] or "")
         if pid == "" or connect_uri == "" then
           M._dap_attach_in_progress = false
@@ -3409,6 +4438,7 @@ function M.android_dap_launch()
           return
         end
         attach_state.pid = pid
+        attach_state.serial = serial
         attach_state.connect_uri = connect_uri
         M._dap_session_state = attach_state
         progress_update(("pid=%s, connecting DAP..."):format(pid))
@@ -3430,7 +4460,11 @@ function M.android_dap_launch()
 end
 
 function M._dap_eval_lldb(command, cb)
-  local dap = require("dap")
+  local dap_ok, dap = pcall(require, "dap")
+  if not dap_ok then
+    if cb then cb(false, "DAP not available") end
+    return
+  end
   local session = dap.session()
   if not session then
     if cb then cb(false, "No DAP session") end
@@ -3445,6 +4479,44 @@ function M._dap_eval_lldb(command, cb)
       if cb then cb(true, result) end
     end
   end, { context = "repl" })
+end
+
+function M.ensure_dap_loaded()
+  local dap_ok, dap = pcall(require, "dap")
+  if dap_ok then
+    return true, dap
+  end
+
+  local lazy_ok, lazy = pcall(require, "lazy")
+  if lazy_ok and lazy and type(lazy.load) == "function" then
+    lazy.load({ plugins = { "nvim-dap", "nvim-dap-ui", "nvim-nio" } })
+  end
+
+  dap_ok, dap = pcall(require, "dap")
+  if not dap_ok then
+    vim.notify("nvim-dap not available", vim.log.levels.ERROR)
+    return false, nil
+  end
+  return true, dap
+end
+
+function M.ensure_dapui_loaded()
+  local dapui_ok, dapui = pcall(require, "dapui")
+  if dapui_ok then
+    return true, dapui
+  end
+
+  local dap_ok = M.ensure_dap_loaded()
+  if not dap_ok then
+    return false, nil
+  end
+
+  dapui_ok, dapui = pcall(require, "dapui")
+  if not dapui_ok then
+    vim.notify("nvim-dap-ui not available", vim.log.levels.ERROR)
+    return false, nil
+  end
+  return true, dapui
 end
 
 function M.dap_toggle_breakpoint()
@@ -3533,7 +4605,7 @@ function M.dap_toggle_breakpoint()
 end
 
 function M.dap_continue()
-  local ok, dap = pcall(require, "dap")
+  local ok, dap = M.ensure_dap_loaded()
   if not ok or not dap.session() then return end
   if M._dap_attach_in_progress then
     vim.notify("Attach bootstrap still running; wait for READY", vim.log.levels.DEBUG)
@@ -3556,7 +4628,7 @@ function M.dap_continue()
 end
 
 function M.dap_pause()
-  local ok, dap = pcall(require, "dap")
+  local ok, dap = M.ensure_dap_loaded()
   if not ok or not dap.session() then return end
   if M._pause_pending then return end
   M._pause_pending = true
@@ -3578,29 +4650,29 @@ function M.dap_pause()
 end
 
 function M.dap_step_over()
-  local ok, dap = pcall(require, "dap")
+  local ok, dap = M.ensure_dap_loaded()
   if ok and dap.session() then dap.step_over() end
 end
 
 function M.dap_step_into()
-  local ok, dap = pcall(require, "dap")
+  local ok, dap = M.ensure_dap_loaded()
   if ok and dap.session() then dap.step_into() end
 end
 
 function M.dap_step_out()
-  local ok, dap = pcall(require, "dap")
+  local ok, dap = M.ensure_dap_loaded()
   if ok and dap.session() then dap.step_out() end
 end
 
 function M.dap_toggle_ui()
-  local ok, dapui = pcall(require, "dapui")
+  local ok, dapui = M.ensure_dapui_loaded()
   if not ok then return end
   dapui.toggle()
 end
 
 function M.dap_reset_layout()
-  local dap_ok, dap = pcall(require, "dap")
-  local dapui_ok, dapui = pcall(require, "dapui")
+  local dap_ok, dap = M.ensure_dap_loaded()
+  local dapui_ok, dapui = M.ensure_dapui_loaded()
   if dap_ok and dap.session() and dapui_ok then
     -- DAP active: close and re-open DAP UI to reset split sizes
     dapui.close()
@@ -3627,12 +4699,12 @@ function M.dap_reset_layout()
 end
 
 function M.dap_toggle_repl()
-  local ok, dap = pcall(require, "dap")
+  local ok, dap = M.ensure_dap_loaded()
   if ok then dap.repl.toggle() end
 end
 
 function M.dap_diagnose()
-  local dap_ok, dap = pcall(require, "dap")
+  local dap_ok, dap = M.ensure_dap_loaded()
   if not dap_ok or not dap.session() then
     vim.notify("No DAP session", vim.log.levels.WARN)
     return
@@ -3729,24 +4801,14 @@ function M.setup_dap(dap, dapui)
 
   local function on_session_end()
     restore_layout()
-    M._dap_attach_in_progress = false
-    M._dap_run_state = "idle"
-    M._continue_pending = false
-    M._continue_debounce_until_ms = 0
-    M._dap_source_file_cache = {}
-    M._pause_pending = false
     -- Clean up any pending ASLR listeners (session died before event_stopped)
     dap.listeners.after.event_stopped["ue_aslr_fix"] = nil
     dap.listeners.after.event_initialized["ue_aslr_fix"] = nil
     -- Keep _breakpoint_specs and signs so they persist across re-attach.
     -- They will be re-applied to the new LLDB session after ASLR fix.
     -- Kill remote lldb-server so re-attach can start a new one
-    local state = M._dap_session_state or {}
-    if state.package_name then
-      vim.fn.jobstart({ state.adb or "adb", "shell",
-        "run-as " .. state.package_name .. " sh -c 'pkill -9 lldb-server 2>/dev/null'" }, { detach = true })
-    end
-    M._dap_session_state = {}
+    cleanup_remote_android_lldb(M._dap_session_state)
+    reset_android_dap_state()
   end
 
   dap.listeners.after.event_initialized["dapui_config"] = function()
@@ -3826,13 +4888,9 @@ function M.setup_dap(dap, dapui)
         end
       end
       -- Kill remote lldb-server
-      local state = M._dap_session_state or {}
-      if state.package_name then
-        vim.fn.system({ "adb", "shell",
-          "run-as " .. state.package_name .. " sh -c 'pkill -9 lldb-server 2>/dev/null'" })
-      end
+      cleanup_remote_android_lldb(M._dap_session_state)
       -- Clear session state but persist breakpoints to disk
-      M._dap_session_state = {}
+      reset_android_dap_state()
       save_breakpoints()
     end,
   })
@@ -3861,31 +4919,17 @@ function M.setup()
     set_platform(opts.args)
   end, {
     nargs = "?",
-    complete = function(arg_lead)
-      local all = {}
-      for _, p in ipairs(PLATFORM_CHOICES) do
-        for _, c in ipairs(CONFIGURATION_CHOICES) do
-          table.insert(all, p .. " " .. c)
-        end
-        table.insert(all, p)
-      end
-      if arg_lead == "" then
-        return all
-      end
-      local matches = {}
-      for _, item in ipairs(all) do
-        if item:lower():find(arg_lead:lower(), 1, true) == 1 then
-          table.insert(matches, item)
-        end
-      end
-      return matches
-    end,
+    complete = set_platform_completions,
   })
   vim.api.nvim_create_user_command("UEExportCompileCommands", export_compile_commands, {})
   vim.api.nvim_create_user_command("UEBuild", build_android, {})
   vim.api.nvim_create_user_command("UEBuildAndroid", build_android, {})
+  vim.api.nvim_create_user_command("UELaunch", function()
+    M.launch_app()
+  end, {})
   vim.api.nvim_create_user_command("UEInstallAndroid", install_android, {})
-  vim.api.nvim_create_user_command("UEPrepare", prepare, {})
+  vim.api.nvim_create_user_command("UEPrepare", prepare_async, {})
+  vim.api.nvim_create_user_command("UEPrepareSync", prepare, {})
   vim.api.nvim_create_user_command("UECheatsheet", show_cheatsheet, {})
   vim.api.nvim_create_user_command("UECheatsheetEdit", edit_cheatsheet, {})
   vim.api.nvim_create_user_command("UEClearCache", clear_cache, {})

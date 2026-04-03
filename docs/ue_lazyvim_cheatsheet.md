@@ -28,6 +28,7 @@
 - `<leader>fg` Git files in current UE project
 - `<leader>fr` Recent files
 - `<leader>fR` Recent files (cwd)
+- `<leader>fC` Clear file/grep picker history
 - `<leader>fp` Projects
 - `<leader>fb` Buffers
 - `<leader>fB` All buffers
@@ -37,6 +38,7 @@
 
 ## Symbols / LSP / Code Nav
 - `gd` Definition
+- `Ctrl + LeftMouse` Smart jump: file ref uses `gf`, symbol uses `gd`
 - `gr` References
 - `<leader>ch` Switch header / source (`clangd`)
 - `gI` Implementations
@@ -53,6 +55,7 @@
 - `[w` / `]w` Prev / next warning
 - `<leader>cl` LSP info
 - `<leader>K` Keyword help
+- completion menu: `Tab` / `Shift-Tab` switch items, `Enter` confirm
 
 ## Search Inside Code
 - `<leader>sb` Current buffer lines
@@ -72,6 +75,8 @@
 - `<leader>sj` Jumps
 - `<leader>sm` Marks
 - `<leader>su` Undo history
+- `<leader>sH` Grep history
+- `<leader>sC` Clear file/grep picker history
 - `<leader>sR` Resume last picker
 - `<leader>sp` Search plugin specs
 - `<leader>sr` Search and replace (`grug-far`)
@@ -82,6 +87,12 @@
 - 默认是 `smart-case`: 搜 `foo` 忽略大小写，搜 `Foo` 自动区分大小写
 - `<leader>sw` / `<leader>sW` 是直接搜当前词或选区，不是 live 模式
 - `<leader>sy` / `<leader>sY` 会把当前词或选区预填进 livegrep，可继续改关键字
+- `<leader>/` 默认空白打开，不会自动带回最近一次 grep 查询
+- `<leader><space>` 默认空白打开，不会自动带回最近一次文件过滤词
+- grep / files 查询仍会写入 picker history，只是不再默认预填到输入框
+- 在 grep picker 里可用 `<C-Up>` / `<C-Down>` 前后切换查询历史
+- `<leader>sH` 可直接打开 grep 历史列表再重搜
+- `<leader>sC` / `<leader>fC` 可同时清空持久化的 grep / files picker 历史
 - 在 livegrep 输入里可追加 ripgrep 参数: `foo -- --word-regexp`
 - 强制全字匹配: `foo -- --word-regexp`
 - 强制区分大小写: `foo -- --case-sensitive`
@@ -180,11 +191,11 @@
 
 ## UE Custom
 - `<leader>uP` Set project root or `.uproject`
-- `:UESetPlatform` Interactive select platform + configuration (Win64/Android/Linux × Development/DebugGame/…)
-- `:UESetPlatform Win64 Development` Direct set (also accepts single arg like `Win64`)
+- `:UESetPlatform` Interactive select platform + configuration, 优先对齐当前项目 `.sln` 里的 VS 配置
+- `:UESetPlatform Win64 Development Editor` Direct set (also accepts single arg like `Win64`)
 - `:UESetAndroidPackage <pkg>` Persist Android package name for DAP attach
-- `<leader>uB` Run `UEPrepare`
-- `<leader>uc` Export `compile_commands.json`
+- `<leader>uB` Run `UEPrepare` (rebuild workspace GTAGS for C++ + Shader)
+- `<leader>uc` Export `compile_commands.json` (adds synthetic `.usf/.ush` entries)
 - `<leader>ub` Build Android Development with Windows `Build.bat`
 - `<leader>ui` Install built APK to connected Android device
 - `<leader>uo` Find files in current module/plugin
@@ -193,8 +204,8 @@
 - `:UECheatsheet` Open this cheatsheet
 - `:UECheatsheetEdit` Edit this markdown file
 - `UEBuildAndroid` / `UEPrepare` / `UEExportCompileCommands` 失败时会自动把错误塞进 quickfix
-- 切换平台流程: `:UESetPlatform Win64 Development` → `:UEExportCompileCommands` → clangd 自动重载
-- `:UEPaths` 会显示当前 Platform / Configuration 及来源 (set/env/auto)
+- 切换 Win64 Editor 流程: `:UESetPlatform Win64 Development Editor` → `:UEExportCompileCommands` → clangd 自动重载
+- `:UEPaths` 会显示当前 Platform / Configuration 及来源；若是 VS 配置名会额外显示传给 UBT 的基础配置
 - lualine 里的 UE 状态会显示类似 `M:Foo IDX BOK` / `P:Bar IDX! B6`
 
 ## Android DAP (Debug)

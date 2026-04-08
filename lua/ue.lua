@@ -455,6 +455,127 @@ local function jump_to_global_result(root, lines)
   return populate_quickfix_from_entries("GTAGS definitions", entries)
 end
 
+local function is_header_like_path(path)
+  local lower = norm(path):lower()
+  return lower:match("%.h$") ~= nil
+    or lower:match("%.hh$") ~= nil
+    or lower:match("%.hpp$") ~= nil
+    or lower:match("%.hxx$") ~= nil
+    or lower:match("%.inl$") ~= nil
+    or lower:match("%.inc$") ~= nil
+    or lower:match("%.ipp$") ~= nil
+end
+
+local function grep_definition_score(symbol, entry, current_file, current_line)
+  local text = trim(entry.text or "")
+  if text == "" then
+    return -1
+  end
+
+  local escaped = vim.pesc(symbol)
+  local token_pattern = "%f[%w_]" .. escaped .. "%f[^%w_]"
+  if not text:find(token_pattern) then
+    return -1
+  end
+
+  local score = 0
+  if norm(entry.filename) == current_file and tonumber(entry.lnum) == tonumber(current_line) then
+    score = score - 120
+  end
+  if is_header_like_path(entry.filename) then
+    score = score + 15
+  end
+
+  if text:match("^%s*#%s*define%s+" .. escaped .. "%f[^%w_]") then
+    score = score + 140
+  end
+  if text:match("^%s*" .. escaped .. "%s*=") or text:match("^%s*" .. escaped .. "%s*,") then
+    score = score + 120
+  end
+  if text:match("^%s*enum%s+.-" .. escaped .. "%f[^%w_]") then
+    score = score + 110
+  end
+  if text:match("^%s*class%s+" .. escaped .. "%f[^%w_]") then
+    score = score + 110
+  end
+  if text:match("^%s*struct%s+" .. escaped .. "%f[^%w_]") then
+    score = score + 110
+  end
+  if text:match("^%s*typedef%s+.-" .. escaped .. "%f[^%w_]") then
+    score = score + 100
+  end
+  if text:match("^%s*using%s+" .. escaped .. "%f[^%w_]") then
+    score = score + 100
+  end
+  if text:match("%f[%w_]" .. escaped .. "%f[^%w_]%s*%(") and not text:match("^%s*return%s+") then
+    score = score + 80
+  end
+
+  return score
+end
+
+local function copy_qf_entry(entry)
+  return {
+    filename = entry.filename,
+    lnum = entry.lnum,
+    col = entry.col,
+    text = entry.text,
+  }
+end
+
+local function jump_to_global_grep_candidate(root, symbol, lines)
+  local entries = parse_global_entries(root, lines)
+  if #entries == 0 then
+    return false
+  end
+
+  local current_file = norm(vim.api.nvim_buf_get_name(0))
+  local current_line = vim.api.nvim_win_get_cursor(0)[1]
+  for _, entry in ipairs(entries) do
+    entry._score = grep_definition_score(symbol, entry, current_file, current_line)
+  end
+
+  table.sort(entries, function(a, b)
+    if a._score ~= b._score then
+      return a._score > b._score
+    end
+    local a_file = norm(a.filename):lower()
+    local b_file = norm(b.filename):lower()
+    if a_file ~= b_file then
+      return a_file < b_file
+    end
+    return (a.lnum or 0) < (b.lnum or 0)
+  end)
+
+  local best = entries[1]
+  local second = entries[2]
+  if best and best._score >= 100 and (not second or best._score > second._score) then
+    return jump_to_entry(best)
+  end
+
+  local candidates = {}
+  if best and best._score > 0 then
+    for _, entry in ipairs(entries) do
+      if entry._score == best._score then
+        candidates[#candidates + 1] = copy_qf_entry(entry)
+      end
+    end
+    if #candidates == 1 then
+      return jump_to_entry(candidates[1])
+    end
+    return populate_quickfix_from_entries("GTAGS symbol candidates: " .. symbol, candidates)
+  end
+
+  if #entries == 1 then
+    return jump_to_entry(entries[1])
+  end
+
+  for index, entry in ipairs(entries) do
+    entries[index] = copy_qf_entry(entry)
+  end
+  return populate_quickfix_from_entries("GTAGS grep: " .. symbol, entries)
+end
+
 function M.clangd_cmd(root_dir)
   local clangd = first_executable(clangd_candidates(root_dir or cwd())) or "clangd"
   return {
@@ -2134,6 +2255,231 @@ local function augment_compile_commands_with_shaders(ctx, content)
   return vim.json.encode(decoded)
 end
 
+-- ---------------------------------------------------------------------------
+-- RSP-based compile_commands.json generation
+-- ---------------------------------------------------------------------------
+
+local generate_compile_commands_from_rsp
+do
+
+local function tokenize_rsp_line(line)
+  local tokens = {}
+  local i = 1
+  local len = #line
+  while i <= len do
+    local ch = line:sub(i, i)
+    if ch == " " or ch == "\t" then
+      i = i + 1
+    else
+      local buf = {}
+      while i <= len do
+        ch = line:sub(i, i)
+        if ch == " " or ch == "\t" then
+          break
+        elseif ch == '"' then
+          local j = line:find('"', i + 1, true)
+          if j then
+            buf[#buf + 1] = line:sub(i + 1, j - 1)
+            i = j + 1
+          else
+            buf[#buf + 1] = line:sub(i + 1)
+            i = len + 1
+          end
+        else
+          local j = line:find('[" \t]', i)
+          if j then
+            buf[#buf + 1] = line:sub(i, j - 1)
+            i = j
+          else
+            buf[#buf + 1] = line:sub(i)
+            i = len + 1
+          end
+        end
+      end
+      if #buf > 0 then
+        tokens[#tokens + 1] = table.concat(buf)
+      end
+    end
+  end
+  return tokens
+end
+
+local function parse_rsp_tokens(tokens)
+  local args = {}
+  local i = 1
+  while i <= #tokens do
+    local tok = tokens[i]
+    if tok == "-o" then
+      i = i + 2
+    elseif tok == "-MD" then
+      i = i + 1
+    elseif tok:match("^%-MF") then
+      i = i + 1
+    elseif tok == "-include-pch" then
+      i = i + 2
+    else
+      args[#args + 1] = tok
+      i = i + 1
+    end
+  end
+
+  local input_file = nil
+  for j = #args, 1, -1 do
+    local a = args[j]
+    if not a:match("^%-") then
+      input_file = a
+      table.remove(args, j)
+      break
+    end
+  end
+
+  return args, input_file
+end
+
+local function extract_unity_includes(unity_file, engine_source_dir)
+  local content = read_all(unity_file)
+  if not content then
+    return nil
+  end
+  local includes = {}
+  for inc_path in content:gmatch('#include%s+"([^"]+%.cpp)"') do
+    local abs
+    if inc_path:match("^[A-Za-z]:") or inc_path:match("^/") then
+      abs = norm(inc_path)
+    else
+      abs = norm(join(engine_source_dir, inc_path))
+      if not is_file(abs) then
+        abs = norm(join(dirname(unity_file), inc_path))
+      end
+    end
+    if is_file(abs) then
+      includes[#includes + 1] = abs
+    end
+  end
+  if #includes > 0 then
+    return includes
+  end
+  return nil
+end
+
+local function collect_rsp_files(ctx)
+  local fd = first_executable({ "fd", "fdfind" })
+  if not fd then
+    return nil, "fd/fdfind not found in PATH"
+  end
+
+  local search_roots = {}
+  local engine_build = join(ctx.engine_root, "Engine", "Intermediate", "Build")
+  if is_dir(engine_build) then
+    search_roots[#search_roots + 1] = engine_build
+  end
+  if ctx.project_root and ctx.project_root ~= "" then
+    local project_build = join(ctx.project_root, "Intermediate", "Build")
+    if is_dir(project_build) then
+      search_roots[#search_roots + 1] = project_build
+    end
+  end
+
+  if #search_roots == 0 then
+    return nil, "No Intermediate/Build directories found"
+  end
+
+  local cmd = { fd, "--no-ignore", "--type", "f", "--extension", "rsp" }
+  for _, root in ipairs(search_roots) do
+    cmd[#cmd + 1] = "--search-path"
+    cmd[#cmd + 1] = root
+  end
+
+  local code, lines = run_lines(cmd, { cwd = ctx.engine_root })
+  if code ~= 0 or not lines or #lines == 0 then
+    return nil, "No .rsp files found"
+  end
+
+  local rsp_files = {}
+  for _, line in ipairs(lines) do
+    local p = norm(trim(line))
+    if p ~= "" then
+      rsp_files[#rsp_files + 1] = p
+    end
+  end
+  return rsp_files, nil
+end
+
+generate_compile_commands_from_rsp = function(ctx)
+  local rsp_files, err = collect_rsp_files(ctx)
+  if not rsp_files then
+    return nil, err
+  end
+
+  local engine_source_dir = join(ctx.engine_root, "Engine", "Source")
+  local entries = {}
+  local seen_files = {}
+
+  for _, rsp_path in ipairs(rsp_files) do
+    local content = read_all(rsp_path)
+    if content then
+      content = trim(content)
+      if content ~= "" then
+        local tokens = tokenize_rsp_line(content)
+        local args, input_file = parse_rsp_tokens(tokens)
+
+        if input_file and input_file ~= "" then
+          input_file = norm(input_file)
+
+          table.insert(args, 1, "clang++")
+          table.insert(args, "-D__INTELLISENSE__")
+
+          local unity_includes = extract_unity_includes(input_file, engine_source_dir)
+          if unity_includes then
+            for _, real_file in ipairs(unity_includes) do
+              local key = real_file:lower()
+              if not seen_files[key] then
+                seen_files[key] = true
+                local entry_args = vim.list_extend({}, args)
+                entry_args[#entry_args + 1] = real_file
+                entries[#entries + 1] = {
+                  directory = ctx.engine_root,
+                  file = real_file,
+                  arguments = entry_args,
+                }
+              end
+            end
+          else
+            local key = input_file:lower()
+            if not seen_files[key] then
+              seen_files[key] = true
+              local entry_args = vim.list_extend({}, args)
+              entry_args[#entry_args + 1] = input_file
+              entries[#entries + 1] = {
+                directory = ctx.engine_root,
+                file = input_file,
+                arguments = entry_args,
+              }
+            end
+          end
+        end
+      end
+    end
+  end
+
+  if #entries == 0 then
+    return nil, "No compile entries generated from .rsp files"
+  end
+
+  local json_content = vim.json.encode(entries)
+  json_content = augment_compile_commands_with_shaders(ctx, json_content)
+
+  local targets = compile_commands_targets(ctx)
+  local preferred = targets[1]
+  for _, target in ipairs(targets) do
+    write_all(target, json_content)
+  end
+
+  return #entries, preferred
+end
+
+end -- do block
+
 local function write_compile_commands_targets(ctx, content)
   if not content or content == "" then
     return false, "compile_commands.json was empty"
@@ -2161,6 +2507,11 @@ local function export_compile_commands_to_engine_root(ctx)
 end
 
 local function generate_compile_commands(ctx)
+  local rsp_count, rsp_path = generate_compile_commands_from_rsp(ctx)
+  if rsp_count then
+    return true, rsp_path .. " (" .. rsp_count .. " entries from .rsp files)"
+  end
+
   local ok_existing, existing_path = export_compile_commands_to_engine_root(ctx)
   if ok_existing then
     return true, existing_path
@@ -2566,7 +2917,7 @@ function M.gtags_references(symbol)
 
   local root = workspace_root(ctx)
   if db_ready(ctx.paths.workspace_db) then
-    local code, lines = global_lines(root, ctx.paths.workspace_db, { "-r", "--result=grep", symbol })
+    local code, lines = global_lines(root, ctx.paths.workspace_db, { "-r", "--literal", "--result=grep", symbol })
     if (code == 0 or code == 1) and lines and #lines > 0 then
       return populate_quickfix_from_global("GTAGS references: " .. symbol, root, lines)
     end
@@ -2588,9 +2939,14 @@ function M.gtags_definition(symbol)
 
   local root = workspace_root(ctx)
   if db_ready(ctx.paths.workspace_db) then
-    local code, lines = global_lines(root, ctx.paths.workspace_db, { "-d", "--result=grep", symbol })
+    local code, lines = global_lines(root, ctx.paths.workspace_db, { "-d", "--literal", "--result=grep", symbol })
     if (code == 0 or code == 1) and lines and #lines > 0 then
       return jump_to_global_result(root, lines)
+    end
+
+    code, lines = global_lines(root, ctx.paths.workspace_db, { "-g", "--literal", "--result=grep", symbol })
+    if (code == 0 or code == 1) and lines and #lines > 0 then
+      return jump_to_global_grep_candidate(root, symbol, lines)
     end
   end
 
@@ -4855,6 +5211,22 @@ function M.setup()
     complete = set_platform_completions,
   })
   vim.api.nvim_create_user_command("UEExportCompileCommands", export_compile_commands, {})
+  vim.api.nvim_create_user_command("UEGenerateFromRSP", function()
+    local ctx, err = resolve_context()
+    if not ctx then
+      vim.notify(err, vim.log.levels.WARN)
+      return
+    end
+    local count, result = generate_compile_commands_from_rsp(ctx)
+    if not count then
+      vim.notify("UEGenerateFromRSP failed: " .. (result or "unknown error"), vim.log.levels.ERROR)
+      return
+    end
+    clear_index_dirty(ctx)
+    invalidate_status_cache()
+    refresh_statusline()
+    vim.notify(("compile_commands generated from .rsp: %d C++ entries\n%s"):format(count, result))
+  end, {})
   vim.api.nvim_create_user_command("UEBuild", build_android, {})
   vim.api.nvim_create_user_command("UEBuildAndroid", build_android, {})
   vim.api.nvim_create_user_command("UELaunch", function()

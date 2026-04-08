@@ -57,13 +57,25 @@ local function jump_to_location(location)
   return true
 end
 
+local function jump_with_lsp(method, title, timeout_ms)
+  local locations = sync_locations(method, timeout_ms)
+  if not locations or #locations == 0 then
+    return false
+  end
+
+  if #locations == 1 and jump_to_location(locations[1]) then
+    return true
+  end
+
+  return populate_quickfix(title, locations)
+end
+
 function M.definition()
-  local locations = sync_locations("textDocument/definition", 800)
-  if locations and #locations > 0 then
-    if #locations == 1 and jump_to_location(locations[1]) then
-      return
-    end
-    if populate_quickfix("LSP definitions", locations) then
+  for _, request in ipairs({
+    { method = "textDocument/definition", title = "LSP definitions" },
+    { method = "textDocument/declaration", title = "LSP declarations" },
+  }) do
+    if jump_with_lsp(request.method, request.title, 800) then
       return
     end
   end

@@ -1,8 +1,6 @@
 local M = {}
 
 local setup_done = false
-local cheatsheet_buf = nil
-local cheatsheet_win = nil
 local build_term_buf = nil
 local build_term_win = nil
 local build_term_jobid = nil
@@ -2646,134 +2644,46 @@ local function show_paths()
   vim.notify(table.concat(lines, "\n"))
 end
 
-local function close_cheatsheet()
-  if cheatsheet_win and vim.api.nvim_win_is_valid(cheatsheet_win) then
-    vim.api.nvim_win_close(cheatsheet_win, true)
-  end
-  cheatsheet_win = nil
-  cheatsheet_buf = nil
-end
-
 local function cheatsheet_path()
   return join(vim.fn.stdpath("config"), "docs", "ue_lazyvim_cheatsheet.md")
 end
 
-local function read_cheatsheet_lines()
+local function open_cheatsheet(opts)
+  opts = opts or {}
   local path = cheatsheet_path()
-  if is_file(path) then
-    local lines = vim.fn.readfile(path)
-    if type(lines) == "table" and #lines > 0 then
-      return lines
-    end
+  ensure_dir(dirname(path))
+
+  if not is_file(path) then
+    vim.notify("Cheatsheet file missing: " .. path, vim.log.levels.WARN)
   end
 
-  return {
-    "# UE + LazyVim Cheatsheet",
-    "",
-    "Cheatsheet file missing.",
-    "",
-    "- Expected path: `" .. path .. "`",
-    "- Run `:UECheatsheetEdit` to create or edit it",
-  }
-end
+  vim.cmd("tab drop " .. vim.fn.fnameescape(path))
 
-local function max_line_width(lines)
-  local width = 0
-  for _, line in ipairs(lines or {}) do
-    width = math.max(width, vim.fn.strdisplaywidth(line))
+  vim.bo.buftype = ""
+  vim.bo.bufhidden = ""
+  vim.bo.swapfile = false
+  vim.bo.filetype = "markdown"
+  vim.bo.readonly = not opts.editable
+  vim.bo.modifiable = opts.editable == true
+
+  vim.wo.wrap = true
+  vim.wo.linebreak = true
+  vim.wo.number = false
+  vim.wo.relativenumber = false
+  vim.wo.signcolumn = "no"
+  vim.wo.conceallevel = 0
+
+  if opts.editable then
+    vim.notify("Editing cheatsheet: " .. path)
   end
-  return width
-end
-
-local function open_markdown_float(lines, title)
-  if cheatsheet_win and vim.api.nvim_win_is_valid(cheatsheet_win) and cheatsheet_buf and vim.api.nvim_buf_is_valid(cheatsheet_buf) then
-    vim.bo[cheatsheet_buf].modifiable = true
-    vim.api.nvim_buf_set_lines(cheatsheet_buf, 0, -1, false, lines)
-    vim.bo[cheatsheet_buf].modifiable = false
-    vim.bo[cheatsheet_buf].readonly = true
-    vim.api.nvim_set_current_win(cheatsheet_win)
-    return
-  end
-
-  local width = math.min(
-    math.max(80, math.min(120, max_line_width(lines) + 4)),
-    math.max(vim.o.columns - 6, 60)
-  )
-  local height = math.min(math.max(#lines + 2, 18), math.max(vim.o.lines - 6, 10))
-  local row = math.floor((vim.o.lines - height) / 2) - 1
-  local col = math.floor((vim.o.columns - width) / 2)
-
-  cheatsheet_buf = vim.api.nvim_create_buf(false, true)
-  vim.bo[cheatsheet_buf].buftype = "nofile"
-  vim.bo[cheatsheet_buf].bufhidden = "wipe"
-  vim.bo[cheatsheet_buf].swapfile = false
-  vim.bo[cheatsheet_buf].modifiable = true
-  vim.bo[cheatsheet_buf].filetype = "markdown"
-
-  vim.api.nvim_buf_set_lines(cheatsheet_buf, 0, -1, false, lines)
-  vim.bo[cheatsheet_buf].modifiable = false
-  vim.bo[cheatsheet_buf].readonly = true
-
-  cheatsheet_win = vim.api.nvim_open_win(cheatsheet_buf, true, {
-    relative = "editor",
-    row = math.max(row, 1),
-    col = math.max(col, 1),
-    width = width,
-    height = height,
-    border = "rounded",
-    title = title,
-    title_pos = "center",
-    style = "minimal",
-  })
-
-  vim.wo[cheatsheet_win].wrap = true
-  vim.wo[cheatsheet_win].linebreak = true
-  vim.wo[cheatsheet_win].cursorline = true
-  vim.wo[cheatsheet_win].number = false
-  vim.wo[cheatsheet_win].relativenumber = false
-  vim.wo[cheatsheet_win].signcolumn = "no"
-  vim.wo[cheatsheet_win].foldenable = false
-  vim.wo[cheatsheet_win].conceallevel = 0
-
-  local close_keys = { "q", "<Esc>" }
-  for _, lhs in ipairs(close_keys) do
-    vim.keymap.set("n", lhs, close_cheatsheet, { buffer = cheatsheet_buf, silent = true, nowait = true })
-  end
-
-  vim.api.nvim_create_autocmd("WinClosed", {
-    once = true,
-    callback = function(args)
-      if tonumber(args.match) == cheatsheet_win then
-        cheatsheet_win = nil
-        cheatsheet_buf = nil
-      end
-    end,
-  })
 end
 
 local function edit_cheatsheet()
-  local path = cheatsheet_path()
-  ensure_dir(dirname(path))
-  vim.cmd("edit " .. vim.fn.fnameescape(path))
+  open_cheatsheet({ editable = true })
 end
 
 local function show_cheatsheet()
-  local ctx = resolve_context()
-  local lines = vim.deepcopy(read_cheatsheet_lines())
-
-  if ctx then
-    table.insert(lines, "")
-    table.insert(lines, "## Current Context")
-    table.insert(lines, "- Engine: `" .. ctx.engine_root .. "`")
-    table.insert(lines, "- Project: `" .. (ctx.project_root or "<unset>") .. "`")
-  end
-
-  table.insert(lines, "")
-  table.insert(lines, "- Cheatsheet file: `" .. cheatsheet_path() .. "`")
-  table.insert(lines, "- `:UECheatsheetEdit` opens the markdown file")
-  table.insert(lines, "`q` / `<Esc>` close, `j/k` `Ctrl-f/b` `gg/G` scroll")
-
-  open_markdown_float(lines, " UE + LazyVim Cheatsheet ")
+  open_cheatsheet({ editable = false })
 end
 
 local function set_project(input)

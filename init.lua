@@ -41,5 +41,8 @@ cleanup_stale_shada_tmp()
 
 require("config.snacks_global").setup()
 require("config.lazy")
+require("config.options")
+require("config.autocmds")
+require("config.keymaps")
 require("config.windows").setup()
 require("ue").setup()

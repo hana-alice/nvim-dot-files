@@ -137,6 +137,16 @@ local function ctrl_leftmouse_jump()
   require("utils.lsp_fallback").definition()
 end
 
+local function sidebar_toggle(kind)
+  return function()
+    require("utils.sidebar").toggle(kind)
+  end
+end
+
+local function sidebar_pick()
+  require("utils.sidebar").pick()
+end
+
 map("n", "gd", function()
   require("utils.lsp_fallback").definition()
 end, { desc = "Definition (LSP -> GTAGS)" })
@@ -173,6 +183,15 @@ map("n", "<leader>uD", "<cmd>UEDebugLogToggle<cr>", { desc = "UE: Toggle Windows
 map("n", "<leader>up", "<cmd>UEPaths<cr>", { desc = "UE: Show paths" })
 map("n", "<leader>uP", "<cmd>UESetProject<cr>", { desc = "UE: Set project" })
 map("n", "<leader>ut", "<cmd>ThemePicker<cr>", { desc = "UI: Theme picker" })
+map("n", "<leader>va", sidebar_pick, { desc = "Sidebar: Choose view" })
+map("n", "<leader>vv", sidebar_toggle(), { desc = "Sidebar: Toggle last view" })
+map("n", "<leader>vb", sidebar_toggle("buffers"), { desc = "Sidebar: Buffers" })
+map("n", "<leader>vg", sidebar_toggle("git_status"), { desc = "Sidebar: Git modified files" })
+map("n", "<leader>vs", sidebar_toggle("symbols"), { desc = "Sidebar: File symbols" })
+map("n", "<leader>vd", sidebar_toggle("diagnostics"), { desc = "Sidebar: Diagnostics" })
+map("n", "<leader>vq", sidebar_toggle("qflist"), { desc = "Sidebar: Pinned results" })
+map("n", "<leader>vl", sidebar_toggle("loclist"), { desc = "Sidebar: Location list" })
+map("n", "<leader>vt", sidebar_toggle("todo"), { desc = "Sidebar: TODO / FIXME" })
 map("n", "<leader>?", "<cmd>UECheatsheet<cr>", { desc = "UE: Cheatsheet" })
 
 -- Android DAP keymaps

@@ -155,6 +155,19 @@ local function paste_picker_clipboard(picker)
   picker:find({ refresh = false })
 end
 
+local function pin_sidebar_qflist(picker)
+  local ok, actions = pcall(require, "snacks.picker.actions")
+  if not ok then
+    vim.notify("Snacks picker actions unavailable", vim.log.levels.ERROR)
+    return
+  end
+
+  actions.qflist(picker)
+  vim.schedule(function()
+    require("utils.sidebar").open("qflist")
+  end)
+end
+
 local function grep_history_items()
   local items = {}
   local seen = {}
@@ -354,17 +367,20 @@ return {
       opts.picker = opts.picker or {}
       opts.picker.actions = vim.tbl_deep_extend("force", opts.picker.actions or {}, {
         paste_clipboard = paste_picker_clipboard,
+        pin_sidebar_qflist = pin_sidebar_qflist,
       })
       opts.picker.win = opts.picker.win or {}
       opts.picker.win.input = opts.picker.win.input or {}
       opts.picker.win.list = opts.picker.win.list or {}
       opts.picker.win.input.keys = vim.tbl_deep_extend("force", opts.picker.win.input.keys or {}, {
+        ["<C-q>"] = { "pin_sidebar_qflist", mode = { "i", "n" } },
         ["<C-v>"] = { "paste_clipboard", mode = { "i", "n" } },
         ["<Tab>"] = { "list_down", mode = { "i", "n" } },
         ["<S-Tab>"] = { "list_up", mode = { "i", "n" } },
         ["<C-Space>"] = { "select_and_next", mode = { "i", "n" } },
       })
       opts.picker.win.list.keys = vim.tbl_deep_extend("force", opts.picker.win.list.keys or {}, {
+        ["<C-q>"] = { "pin_sidebar_qflist", mode = { "n", "x" } },
         ["<C-v>"] = { "paste_clipboard", mode = { "n", "x" } },
         ["<Tab>"] = { "list_down", mode = { "n", "x" } },
         ["<S-Tab>"] = { "list_up", mode = { "n", "x" } },

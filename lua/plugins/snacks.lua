@@ -211,7 +211,8 @@ end
 
 local function ue_workspace_all_files()
   local snacks = require("snacks")
-  local opts = workspace_opts() or {}
+  local ue = get_ue()
+  local opts = ue and ue.picker_options({ include_third_party = true }) or workspace_opts() or {}
   opts.title = "UE Workspace All Files"
   return snacks.picker.files(opts)
 end
@@ -334,7 +335,7 @@ return {
       { "<leader>sH", ue_grep_history, desc = "Search: Grep History" },
       { "<leader>sC", ue_clear_picker_history, desc = "Search: Clear Picker History" },
       -- Find files
-      { "<leader><space>", ue_workspace_all_files, desc = "Find Engine Files" },
+      { "<leader><space>", ue_workspace_all_files, desc = "Find Workspace All Files" },
       { "<leader>fC", ue_clear_picker_history, desc = "Find: Clear Search History" },
       { "<leader>ff", ue_project_files, desc = "Find Project Files" },
       { "<leader>fF", ue_workspace_files, desc = "Find Workspace Code (C++/Shader)" },

@@ -1017,6 +1017,16 @@ local PICKER_EXCLUDES = {
   "**/ThirdParty/**",
 }
 
+local function picker_excludes(opts)
+  local excludes = vim.deepcopy(PICKER_EXCLUDES)
+  if type(opts) == "table" and opts.include_third_party then
+    excludes = vim.tbl_filter(function(pattern)
+      return pattern ~= "**/ThirdParty/**"
+    end, excludes)
+  end
+  return excludes
+end
+
 -- Extensions (for fd -e / files picker ft)
 M.FT_CPP = {
   "c", "cc", "cpp", "cxx",
@@ -2454,7 +2464,7 @@ function M.picker_options(opts)
 
   return {
     dirs = dirs,
-    exclude = vim.deepcopy(PICKER_EXCLUDES),
+    exclude = picker_excludes(opts),
     follow = true,
   }, nil
 end
@@ -2470,7 +2480,7 @@ function M.picker_project_options(opts)
 
   return {
     dirs = { ctx.project_root },
-    exclude = vim.deepcopy(PICKER_EXCLUDES),
+    exclude = picker_excludes(opts),
     follow = false,
   }, nil
 end
@@ -2483,7 +2493,7 @@ function M.current_scope_picker_options(opts)
 
   return {
     dirs = { scope.root },
-    exclude = vim.deepcopy(PICKER_EXCLUDES),
+    exclude = picker_excludes(opts),
     follow = true,
   }, scope, nil
 end
@@ -3037,8 +3047,8 @@ local function find_apk(ctx)
   return best
 end
 
-function M.launch_app()
-  return require("utils.ue_launch").launch({
+local function ue_runtime_env()
+  return {
     build_target_name = build_target_name,
     dirname = dirname,
     file_mtime = file_mtime,
@@ -3058,7 +3068,20 @@ function M.launch_app()
     target_platform = target_platform,
     trim = trim,
     update_state_field = update_state_field,
-  })
+  }
+end
+
+function M.launch_app()
+  package.loaded["utils.ue_launch"] = nil
+  return require("utils.ue_launch").launch(ue_runtime_env())
+end
+
+function M.toggle_log()
+  return require("utils.ue_logs").toggle_main_log(ue_runtime_env())
+end
+
+function M.toggle_debug_log()
+  return require("utils.ue_logs").toggle_debug_log(ue_runtime_env())
 end
 
 local function install_android()
@@ -4926,6 +4949,12 @@ function M.setup()
   vim.api.nvim_create_user_command("UEBuildAndroid", build_android, {})
   vim.api.nvim_create_user_command("UELaunch", function()
     M.launch_app()
+  end, {})
+  vim.api.nvim_create_user_command("UELogToggle", function()
+    M.toggle_log()
+  end, {})
+  vim.api.nvim_create_user_command("UEDebugLogToggle", function()
+    M.toggle_debug_log()
   end, {})
   vim.api.nvim_create_user_command("UEInstallAndroid", install_android, {})
   vim.api.nvim_create_user_command("UEPrepare", prepare_async, {})

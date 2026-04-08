@@ -18,13 +18,13 @@
 - `<leader>cs` 用 Trouble 打开 symbols outline
 
 ## Search / Picker
-- `<leader><space>` Find Project Files (excludes intermediates)
+- `<leader><space>` Find workspace all files (includes `ThirdParty`, excludes intermediates)
 - `<leader>,` Buffers
 - `<leader>/` Grep project code (C++/Shader only, excludes intermediates)
 - `<leader>:` Command history
-- `<leader>ff` Find project code files (C++/Shader only)
+- `<leader>ff` Find project files (all types, excludes intermediates)
 - `<leader>fF` Find workspace code files (engine + project, C++/Shader)
-- `<leader>fa` Find workspace all files (no type filter)
+- `<leader>fa` Find project code files (C++/Shader only)
 - `<leader>fg` Git files in current UE project
 - `<leader>fr` Recent files
 - `<leader>fR` Recent files (cwd)

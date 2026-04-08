@@ -239,30 +239,44 @@ local function android_launch_command(env, ctx)
 end
 
 local function powershell_start_process_command(powershell_quote, exe, args, working_dir)
-  local ps = {
-    "Start-Process",
-    "-FilePath",
-    powershell_quote(exe),
-  }
-  if working_dir and working_dir ~= "" then
-    ps[#ps + 1] = "-WorkingDirectory"
-    ps[#ps + 1] = powershell_quote(working_dir)
-  end
-  if args and #args > 0 then
-    local quoted_args = {}
-    for _, arg in ipairs(args) do
-      quoted_args[#quoted_args + 1] = powershell_quote(arg)
+  local function windows_native_path(value)
+    value = tostring(value or "")
+    if value:match("^[A-Za-z]:/") or value:match("^//") then
+      return value:gsub("/", "\\")
     end
-    ps[#ps + 1] = "-ArgumentList"
-    ps[#ps + 1] = table.concat(quoted_args, ", ")
+    return value
   end
+
+  exe = windows_native_path(exe)
+  working_dir = windows_native_path(working_dir)
+  local quoted_args = {}
+  for _, arg in ipairs(args or {}) do
+    quoted_args[#quoted_args + 1] = powershell_quote(windows_native_path(arg))
+  end
+
+  local start_process = "Start-Process -FilePath " .. powershell_quote(exe)
+  if working_dir and working_dir ~= "" then
+    start_process = start_process .. " -WorkingDirectory " .. powershell_quote(working_dir)
+  end
+  start_process = start_process .. " -ArgumentList $argsList -PassThru"
+
+  local ps = {
+    "$ErrorActionPreference = 'Stop'",
+    "$argsList = @(" .. table.concat(quoted_args, ", ") .. ")",
+    "$proc = " .. start_process,
+    "if (-not $proc -or -not $proc.Id) { throw 'Start-Process did not return a process id' }",
+    "Start-Sleep -Milliseconds 200",
+    "if (-not (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) { throw ('Process exited immediately: ' + $proc.Id) }",
+    "Write-Output ('pid=' + $proc.Id)",
+  }
+
   return {
     "powershell.exe",
     "-NoProfile",
     "-ExecutionPolicy",
     "Bypass",
     "-Command",
-    table.concat(ps, " "),
+    table.concat(ps, "; "),
   }
 end
 
@@ -278,11 +292,21 @@ local function launch_desktop_process(env, spec)
   local cmd
   if env.is_windows_path(exe) then
     cmd = powershell_start_process_command(env.powershell_quote, exe, spec.args or {}, spec.cwd or env.dirname(exe))
-  else
-    cmd = { exe }
-    vim.list_extend(cmd, spec.args or {})
+    local result = vim.system(cmd, { text = true }):wait()
+    local output = ((result.stdout or "") .. "\n" .. (result.stderr or "")):gsub("^%s+", ""):gsub("%s+$", "")
+    if (result.code or 0) ~= 0 then
+      return false, output ~= "" and output or ("Launch failed with exit code " .. tostring(result.code))
+    end
+
+    local pid = output:match("pid=(%d+)")
+    if not pid then
+      return false, output ~= "" and output or "Launch did not report a process id"
+    end
+    return true, pid
   end
 
+  cmd = { exe }
+  vim.list_extend(cmd, spec.args or {})
   local ok, jobid = pcall(vim.fn.jobstart, cmd, {
     cwd = spec.cwd,
     detach = true,
@@ -290,7 +314,7 @@ local function launch_desktop_process(env, spec)
   if not ok or not jobid or jobid <= 0 then
     return false, "Failed to launch process"
   end
-  return true
+  return true, tostring(jobid)
 end
 
 local function launch_android_process(env, spec)
@@ -332,6 +356,30 @@ local function launch_android_process(env, spec)
   return true
 end
 
+function M.resolve_spec(env)
+  local ctx, err = env.resolve_context()
+  if not ctx then
+    return nil, err
+  end
+
+  local platform = env.target_platform(ctx.engine_root, nil)
+  if platform == "Android" then
+    local spec, launch_err = android_launch_command(env, ctx)
+    if not spec then
+      return nil, launch_err
+    end
+    spec.platform = platform
+    spec.kind = "Android"
+    return spec, ctx
+  end
+
+  local spec, launch_err = desktop_launch_spec(env, ctx)
+  if not spec then
+    return nil, launch_err
+  end
+  return spec, ctx
+end
+
 function M.launch(env)
   local ctx, err = env.resolve_context()
   if not ctx then
@@ -359,15 +407,15 @@ function M.launch(env)
     return
   end
 
-  local ok, err_msg = launch_desktop_process(env, spec)
+  local ok, detail = launch_desktop_process(env, spec)
   if not ok then
-    vim.notify(err_msg, vim.log.levels.ERROR)
+    vim.notify(detail, vim.log.levels.ERROR)
     return
   end
 
   local target = vim.fn.fnamemodify(spec.exe, ":t")
   local args = #spec.args > 0 and (" " .. table.concat(spec.args, " ")) or ""
-  vim.notify(("Launched %s: %s%s"):format(spec.platform, target, args), vim.log.levels.INFO)
+  vim.notify(("Launched %s: %s%s (pid %s)"):format(spec.platform, target, args, detail), vim.log.levels.INFO)
 end
 
 return M

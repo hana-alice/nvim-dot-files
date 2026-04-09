@@ -1738,7 +1738,7 @@ local function to_windows_path(path)
     return nil
   end
   if is_windows_path(path) then
-    return path:gsub("/", "\\")
+    return (path:gsub("/", "\\"))
   end
 
   local code, lines = run_lines({ "wslpath", "-w", path })
@@ -3723,6 +3723,9 @@ local function reset_android_dap_state()
   M._pause_pending = false
   M._dap_source_file_cache = {}
   M._dap_session_state = {}
+  for _, spec in pairs(M._breakpoint_specs or {}) do
+    spec.runtime_breakpoint_id = nil
+  end
 end
 
 local function stop_process_tree(pid)
@@ -3745,14 +3748,21 @@ local function cleanup_remote_android_lldb(state)
   end
   local adb = state.adb or "adb"
   local serial = trim(state.serial or "")
-  local cmd = { adb }
+  local serial_args = {}
   if serial ~= "" then
-    table.insert(cmd, "-s")
-    table.insert(cmd, serial)
+    serial_args = { "-s", serial }
   end
-  table.insert(cmd, "shell")
-  table.insert(cmd, "run-as " .. state.package_name .. " sh -c 'pkill -9 lldb-server 2>/dev/null'")
-  vim.fn.jobstart(cmd, { detach = true })
+  -- Kill lldb-server on device
+  local kill_cmd = { adb }
+  vim.list_extend(kill_cmd, serial_args)
+  vim.list_extend(kill_cmd, { "shell", "run-as " .. state.package_name .. " sh -c 'pkill -9 lldb-server 2>/dev/null'" })
+  vim.fn.jobstart(kill_cmd, { detach = true })
+  -- Remove adb port forward
+  local port = state.port or 5039
+  local fwd_cmd = { adb }
+  vim.list_extend(fwd_cmd, serial_args)
+  vim.list_extend(fwd_cmd, { "forward", "--remove", "tcp:" .. port })
+  vim.fn.jobstart(fwd_cmd, { detach = true })
 end
 
 local function kill_managed_codelldb_processes()
@@ -3828,6 +3838,8 @@ local function save_breakpoints()
       key = key,
       set_command = spec.set_command,
       clear_command = spec.clear_command,
+      set_commands = spec.set_commands,
+      clear_commands = spec.clear_commands,
       file = spec.file,
       line = spec.line,
     }
@@ -3845,22 +3857,15 @@ local function load_breakpoints()
   vim.fn.sign_define("UEDapBreakpoint", { text = "●", texthl = "DiagnosticError" })
 
   for _, entry in ipairs(list) do
-    if entry.key and entry.set_command then
-      -- Migrate old -H (hardware BP) commands to software BP
-      local set_cmd = entry.set_command:gsub("breakpoint set %-H ", "breakpoint set ")
-      M._breakpoint_specs[entry.key] = {
-        set_command = set_cmd,
-        clear_command = entry.clear_command,
-        file = entry.file,
-        line = entry.line,
-      }
+    local key = trim(entry.key)
+    local line = tonumber(entry.line)
+    local path = key:match("^(.+):%d+$")
+    if key ~= "" and line and line > 0 and path and path ~= "" then
+      M._breakpoint_specs[key] = M._dap_make_breakpoint_spec(path, line)
       -- Restore sign if the buffer is loaded
-      local path = entry.key:match("^(.+):%d+$")
-      if path then
-        local bufnr = vim.fn.bufnr(path)
-        if bufnr ~= -1 then
-          vim.fn.sign_place(entry.line, "ue_dap_bp", "UEDapBreakpoint", bufnr, { lnum = entry.line })
-        end
+      local bufnr = vim.fn.bufnr(path)
+      if bufnr ~= -1 then
+        vim.fn.sign_place(line, "ue_dap_bp", "UEDapBreakpoint", bufnr, { lnum = line })
       end
     end
   end
@@ -4019,7 +4024,7 @@ end
 
 local function to_windows_path(p)
   if not p or p == "" then return nil end
-  return tostring(p):gsub("/", "\\")
+  return (tostring(p):gsub("/", "\\"))
 end
 
 function M.codelldb_paths()
@@ -4089,14 +4094,29 @@ function M._reapply_breakpoints(cb)
   end
   for _, key in ipairs(keys) do
     local spec = specs[key]
-    M._dap_eval_lldb(spec.set_command, function(ok, result)
-      if ok then
-        restored = restored + 1
-      else
-        failed[#failed + 1] = ("%s:%d: %s"):format(spec.file, spec.line, tostring(result))
-      end
+    -- After ASLR fix, use the canonical set_command directly.
+    -- Do NOT use _dap_try_set_breakpoint here: CodeLLDB REPL evaluate returns ""
+    -- for breakpoint commands, so the multi-variant fallback creates 9 duplicate
+    -- breakpoints per spec (none get deleted because resolution is never detected).
+    local cmd = spec.set_command
+    if not cmd or cmd == "" then
+      failed[#failed + 1] = ("%s:%d: no set_command"):format(spec.file or "?", spec.line or 0)
       done()
-    end)
+    else
+      M._dap_eval_lldb(cmd, function(ok, result)
+        if ok then
+          restored = restored + 1
+          -- Try to extract breakpoint id from console output (may be empty for CodeLLDB)
+          local bp_id = tostring(result or ""):match("Breakpoint%s+(%d+):")
+          if bp_id then
+            spec.runtime_breakpoint_id = bp_id
+          end
+        else
+          failed[#failed + 1] = ("%s:%d: %s"):format(spec.file or "?", spec.line or 0, tostring(result))
+        end
+        done()
+      end)
+    end
   end
 end
 
@@ -4253,7 +4273,11 @@ end
 
 function M._apply_aslr_fix(session_state, cb)
   local pid = session_state.pid
-  local so_name = session_state.symbol_lib and vim.fn.fnamemodify(session_state.symbol_lib, ":t") or "libUE4.so"
+  -- The symbol file on disk (e.g. Client-arm64.so) differs from the on-device
+  -- lib name (e.g. libUE4.so).  We search /proc/maps for the UE main lib name
+  -- and tell LLDB to slide the module it loaded via target create.
+  local lldb_module = session_state.symbol_lib and vim.fn.fnamemodify(session_state.symbol_lib, ":t") or "libUE4.so"
+  local device_so_candidates = { "libUE4.so", "libUnreal.so", lldb_module }
   local pkg = session_state.package_name or ""
   local adb = session_state.adb or "adb"
   local cb_fired = false
@@ -4265,10 +4289,12 @@ function M._apply_aslr_fix(session_state, cb)
     if cb then cb(ok) end
   end
 
-  local function parse_base(text)
+  local function parse_base(text, candidates)
     for line in text:gmatch("[^\r\n]+") do
-      if line:find(so_name, 1, true) then
-        return line:match("(%x+)%-")
+      for _, name in ipairs(candidates) do
+        if line:find(name, 1, true) then
+          return line:match("(%x+)%-")
+        end
       end
     end
     return nil
@@ -4276,14 +4302,13 @@ function M._apply_aslr_fix(session_state, cb)
 
   local function apply_slide(base_addr)
     local base_hex = "0x" .. base_addr
-    vim.notify("ASLR fix: " .. so_name .. " base=" .. base_hex)
+    vim.notify("ASLR fix: " .. lldb_module .. " base=" .. base_hex)
     M._dap_eval_lldb(
-      ("target modules load --file %s --slide %s"):format(so_name, base_hex),
+      ("target modules load --file %s --slide %s"):format(lldb_module, base_hex),
       function(ok2, result2)
         vim.schedule(function()
           if ok2 then
-            -- Verify module state after slide
-            M._dap_eval_lldb("image list " .. so_name, function(_, img)
+            M._dap_eval_lldb("image list " .. lldb_module, function(_, img)
               vim.schedule(function()
                 vim.notify("ASLR fix applied (slide=" .. base_hex .. ")\n" .. (img or ""))
                 fire_cb(true, nil)
@@ -4307,11 +4332,13 @@ function M._apply_aslr_fix(session_state, cb)
       stdout_buffered = true,
       on_stdout = function(_, data)
         local text = table.concat(data or {}, "\n")
-        local base = parse_base(text)
+        local base = parse_base(text, device_so_candidates)
         if base then
           vim.schedule(function() apply_slide(base) end)
         else
-          vim.schedule(function() fire_cb(false, so_name .. " not found (adb run-as)") end)
+          vim.schedule(function()
+            fire_cb(false, table.concat(device_so_candidates, "/") .. " not found (adb run-as)")
+          end)
         end
       end,
       on_exit = function(_, code)
@@ -4322,14 +4349,15 @@ function M._apply_aslr_fix(session_state, cb)
     })
   end
 
-  -- Primary: LLDB platform shell (lldb-server runs as the app)
+  -- Primary: LLDB platform shell — grep for each candidate name
+  local grep_pattern = table.concat(device_so_candidates, "|")
   vim.notify("ASLR fix: reading /proc/" .. pid .. "/maps via platform shell...")
   M._dap_eval_lldb(
-    ('platform shell grep %s /proc/%s/maps'):format(so_name, pid),
+    ('platform shell grep -E "%s" /proc/%s/maps'):format(grep_pattern, pid),
     function(ok, result)
       vim.schedule(function()
         if ok and result and result ~= "" then
-          local base = parse_base(result)
+          local base = parse_base(result, device_so_candidates)
           if base then
             apply_slide(base)
             return
@@ -4384,9 +4412,12 @@ end
 
 function M._android_preflight_ps1(session)
   local pkg = session.package_name
+  local port = session.port or 5039
   return ([[
 $ErrorActionPreference = "Stop"
 $adb = "]] .. (session.adb or "adb") .. [["
+$port = ]] .. port .. [[
+
 $serial = (& $adb devices | Select-String "^\S+\s+device$" | Select-Object -First 1).Line.Split()[0]
 if (-not $serial) { throw "No Android device found" }
 Write-Host "serial=$serial"
@@ -4398,17 +4429,22 @@ Write-Host "pid=$targetPid"
 & $adb -s $serial shell "run-as ]] .. pkg .. [[ mkdir -p /data/data/]] .. pkg .. [[/lldb/bin"
 & $adb -s $serial push "]] .. session.lldb_server_path .. [[" "/data/local/tmp/lldb-server"
 & $adb -s $serial shell "cat /data/local/tmp/lldb-server | run-as ]] .. pkg .. [[ sh -c 'cat > /data/data/]] .. pkg .. [[/lldb/bin/lldb-server && chmod 700 /data/data/]] .. pkg .. [[/lldb/bin/lldb-server'"
-$sockPath = "/data/data/]] .. pkg .. [[/lldb/]] .. session.socket_name .. [["
-& $adb -s $serial shell "run-as ]] .. pkg .. [[ sh -c '/data/data/]] .. pkg .. [[/lldb/bin/lldb-server platform --server --listen unix-abstract://$sockPath </dev/null >/dev/null 2>&1 & echo started'"
-Start-Sleep -Seconds 2
-$lldbPid = ((& $adb -s $serial shell "run-as ]] .. pkg .. [[ pidof lldb-server" 2>$null) | Out-String).Trim()
+& $adb -s $serial shell "run-as ]] .. pkg .. [[ sh -c '/data/data/]] .. pkg .. [[/lldb/bin/lldb-server platform --server --listen tcp://0.0.0.0:$port </dev/null >/dev/null 2>&1 & echo started'"
+$retries = 0
+$lldbPid = ""
+while ($retries -lt 5) {
+    Start-Sleep -Milliseconds 500
+    $lldbPid = ((& $adb -s $serial shell "run-as ]] .. pkg .. [[ pidof lldb-server" 2>$null) | Out-String).Trim()
+    if ($lldbPid) { break }
+    $retries++
+}
 if (-not $lldbPid) { throw "lldb-server failed to start" }
 Write-Host "lldb-server pid=$lldbPid"
-$connectUri = "unix-abstract-connect://[$serial]$sockPath"
-Write-Host "connect_uri=$connectUri"
+try { & $adb -s $serial forward --remove tcp:$port 2>$null } catch {}
+& $adb -s $serial forward tcp:$port tcp:$port
+Write-Host "connect_uri=connect://localhost:$port"
 $targetPid | Out-File -Encoding ascii "]] .. session.pid_file .. [["
 $serial | Out-File -Encoding ascii "]] .. session.serial_file .. [["
-$connectUri | Out-File -Encoding ascii "]] .. session.uri_file .. [["
 Write-Host "PREFLIGHT_OK"
 ]])
 end
@@ -4476,6 +4512,7 @@ function M.android_dap_attach()
   if as_lldb == "" then return end
 
   local tmpdir = vim.fn.tempname():gsub("[/\\][^/\\]*$", "")
+  local dap_port = 5039
   local attach_state = {
     package_name = package_name,
     symbol_lib = to_windows_path(symbol_lib) or symbol_lib,
@@ -4484,10 +4521,9 @@ function M.android_dap_attach()
     project_root = to_windows_path(project_root) or project_root,
     engine_root = to_windows_path(engine_root) or engine_root,
     adb = to_windows_path(vim.fn.exepath("adb")) or "adb",
-    socket_name = "lldb-platform-" .. vim.uv.hrtime(),
+    port = dap_port,
     pid_file = to_windows_path(tmpdir .. "/ue_dap_pid.txt"),
     serial_file = to_windows_path(tmpdir .. "/ue_dap_serial.txt"),
-    uri_file = to_windows_path(tmpdir .. "/ue_dap_uri.txt"),
     exec_search_paths = { to_windows_path(vim.fn.fnamemodify(symbol_lib, ":h")) },
     source_map = {},
   }
@@ -4535,11 +4571,11 @@ function M.android_dap_attach()
         end
         local pid = trim((vim.fn.readfile(attach_state.pid_file) or {})[1] or "")
         local serial = trim((vim.fn.readfile(attach_state.serial_file) or {})[1] or "")
-        local connect_uri = trim((vim.fn.readfile(attach_state.uri_file) or {})[1] or "")
-        if pid == "" or connect_uri == "" then
+        local connect_uri = ("connect://localhost:%d"):format(attach_state.port or 5039)
+        if pid == "" then
           M._dap_attach_in_progress = false
           M._dap_run_state = "idle"
-          progress_update("no PID or connect URI produced", vim.log.levels.ERROR)
+          progress_update("no PID produced", vim.log.levels.ERROR)
           return
         end
         attach_state.pid = pid
@@ -4566,11 +4602,14 @@ end
 
 function M._android_launch_preflight_ps1(session)
   local pkg = session.package_name
+  local port = session.port or 5039
   -- Native debugging: start app normally (not -D which waits for JDWP/Java debugger).
   -- Auto-detect main launcher activity from package manager.
   return ([[
 $ErrorActionPreference = "Stop"
 $adb = "]] .. (session.adb or "adb") .. [["
+$port = ]] .. port .. [[
+
 $serial = (& $adb devices | Select-String "^\S+\s+device$" | Select-Object -First 1).Line.Split()[0]
 if (-not $serial) { throw "No Android device found" }
 Write-Host "device=$serial"
@@ -4612,17 +4651,22 @@ Write-Host "setting up lldb-server..."
 & $adb -s $serial shell "run-as ]] .. pkg .. [[ mkdir -p /data/data/]] .. pkg .. [[/lldb/bin"
 & $adb -s $serial push "]] .. session.lldb_server_path .. [[" "/data/local/tmp/lldb-server"
 & $adb -s $serial shell "cat /data/local/tmp/lldb-server | run-as ]] .. pkg .. [[ sh -c 'cat > /data/data/]] .. pkg .. [[/lldb/bin/lldb-server && chmod 700 /data/data/]] .. pkg .. [[/lldb/bin/lldb-server'"
-$sockPath = "/data/data/]] .. pkg .. [[/lldb/]] .. session.socket_name .. [["
-& $adb -s $serial shell "run-as ]] .. pkg .. [[ sh -c '/data/data/]] .. pkg .. [[/lldb/bin/lldb-server platform --server --listen unix-abstract://$sockPath </dev/null >/dev/null 2>&1 & echo started'"
-Start-Sleep -Seconds 2
-$lldbPid = ((& $adb -s $serial shell "run-as ]] .. pkg .. [[ pidof lldb-server" 2>$null) | Out-String).Trim()
+& $adb -s $serial shell "run-as ]] .. pkg .. [[ sh -c '/data/data/]] .. pkg .. [[/lldb/bin/lldb-server platform --server --listen tcp://0.0.0.0:$port </dev/null >/dev/null 2>&1 & echo started'"
+$retries = 0
+$lldbPid = ""
+while ($retries -lt 5) {
+    Start-Sleep -Milliseconds 500
+    $lldbPid = ((& $adb -s $serial shell "run-as ]] .. pkg .. [[ pidof lldb-server" 2>$null) | Out-String).Trim()
+    if ($lldbPid) { break }
+    $retries++
+}
 if (-not $lldbPid) { throw "lldb-server failed to start" }
 Write-Host "lldb-server pid=$lldbPid"
-$connectUri = "unix-abstract-connect://[$serial]$sockPath"
-Write-Host "connect_uri=$connectUri"
+try { & $adb -s $serial forward --remove tcp:$port 2>$null } catch {}
+& $adb -s $serial forward tcp:$port tcp:$port
+Write-Host "connect_uri=connect://localhost:$port"
 $targetPid | Out-File -Encoding ascii "]] .. session.pid_file .. [["
 $serial | Out-File -Encoding ascii "]] .. session.serial_file .. [["
-$connectUri | Out-File -Encoding ascii "]] .. session.uri_file .. [["
 Write-Host "PREFLIGHT_OK"
 ]])
 end
@@ -4689,6 +4733,7 @@ function M.android_dap_launch()
   if as_lldb == "" then return end
 
   local tmpdir = vim.fn.tempname():gsub("[/\\][^/\\]*$", "")
+  local dap_port = 5039
   local attach_state = {
     package_name = package_name,
     symbol_lib = to_windows_path(symbol_lib) or symbol_lib,
@@ -4697,10 +4742,9 @@ function M.android_dap_launch()
     project_root = to_windows_path(project_root) or project_root,
     engine_root = to_windows_path(engine_root) or engine_root,
     adb = to_windows_path(vim.fn.exepath("adb")) or "adb",
-    socket_name = "lldb-platform-" .. vim.uv.hrtime(),
+    port = dap_port,
     pid_file = to_windows_path(tmpdir .. "/ue_dap_pid.txt"),
     serial_file = to_windows_path(tmpdir .. "/ue_dap_serial.txt"),
-    uri_file = to_windows_path(tmpdir .. "/ue_dap_uri.txt"),
     exec_search_paths = { to_windows_path(vim.fn.fnamemodify(symbol_lib, ":h")) },
     source_map = {},
   }
@@ -4748,11 +4792,11 @@ function M.android_dap_launch()
         end
         local pid = trim((vim.fn.readfile(attach_state.pid_file) or {})[1] or "")
         local serial = trim((vim.fn.readfile(attach_state.serial_file) or {})[1] or "")
-        local connect_uri = trim((vim.fn.readfile(attach_state.uri_file) or {})[1] or "")
-        if pid == "" or connect_uri == "" then
+        local connect_uri = ("connect://localhost:%d"):format(attach_state.port or 5039)
+        if pid == "" then
           M._dap_attach_in_progress = false
           M._dap_run_state = "idle"
-          progress_update("no PID or connect URI produced", vim.log.levels.ERROR)
+          progress_update("no PID produced", vim.log.levels.ERROR)
           return
         end
         attach_state.pid = pid
@@ -4797,6 +4841,234 @@ function M._dap_eval_lldb(command, cb)
       if cb then cb(true, result) end
     end
   end, { context = "repl" })
+end
+
+function M._dap_make_breakpoint_spec(path, line)
+  path = norm(path)
+  line = tonumber(line)
+  if path == "" or not line or line <= 0 then
+    return nil
+  end
+
+  local files = {}
+  local seen = {}
+  local function add(candidate)
+    candidate = trim(candidate)
+    if candidate == "" or seen[candidate] then
+      return
+    end
+    seen[candidate] = true
+    files[#files + 1] = candidate
+  end
+
+  add(path)
+  if is_native_windows() then
+    add(path:gsub("/", "\\"))
+  end
+
+  local ctx = resolve_context() or {}
+  local roots = {}
+  local function add_root(root)
+    root = norm(root)
+    if root ~= "" then
+      roots[#roots + 1] = root
+    end
+  end
+
+  add_root(ctx.project_root or "")
+  if trim(ctx.project_root or "") ~= "" then
+    add_root(join(ctx.project_root, "Source"))
+  end
+  add_root(ctx.engine_root or "")
+  if trim(ctx.engine_root or "") ~= "" then
+    add_root(join(ctx.engine_root, "Engine"))
+    add_root(join(ctx.engine_root, "Engine", "Source"))
+  end
+
+  for _, root in ipairs(roots) do
+    if path_has_prefix(path, root) then
+      local relative = relative_to(root, path)
+      add(relative)
+      if is_native_windows() then
+        add(relative:gsub("/", "\\"))
+      end
+    end
+  end
+
+  add(basename(path))
+
+  local set_commands = {}
+  local clear_commands = {}
+  for _, file in ipairs(files) do
+    local escaped = file:gsub('"', '\\"')
+    set_commands[#set_commands + 1] = ('breakpoint set --file "%s" --line %d'):format(escaped, line)
+    clear_commands[#clear_commands + 1] = ('breakpoint clear --file "%s" --line %d'):format(escaped, line)
+  end
+
+  return {
+    set_command = set_commands[1],
+    clear_command = clear_commands[1],
+    set_commands = set_commands,
+    clear_commands = clear_commands,
+    file = path,
+    line = line,
+    runtime_breakpoint_id = nil,
+  }
+end
+
+function M._dap_try_set_breakpoint(spec, cb)
+  spec = spec or {}
+  local set_commands = spec.set_commands or {}
+  if #set_commands == 0 and spec.set_command then
+    set_commands = { spec.set_command }
+  end
+  local clear_commands = spec.clear_commands or {}
+  if #clear_commands == 0 and spec.clear_command then
+    clear_commands = { spec.clear_command }
+  end
+
+  if #set_commands == 0 then
+    if cb then
+      cb(false, "No breakpoint commands", false)
+    end
+    return
+  end
+
+  local index = 1
+  local last_result = ""
+
+  local function finish(ok, result, resolved)
+    if cb then
+      cb(ok, result, resolved)
+    end
+  end
+
+  local function try_next()
+    local set_command = set_commands[index]
+    if not set_command then
+      finish(false, last_result ~= "" and last_result or "No breakpoint command resolved", false)
+      return
+    end
+
+    -- CodeLLDB REPL evaluate returns "" for breakpoint commands.
+    -- Capture the actual output from event_output console events.
+    local dap = require("dap")
+    local console_lines = {}
+    local listener_key = "bp-try-" .. tostring(vim.uv.hrtime())
+    dap.listeners.after.event_output[listener_key] = function(_, body)
+      if body and body.category == "console" and body.output then
+        console_lines[#console_lines + 1] = body.output
+      end
+    end
+
+    M._dap_eval_lldb(set_command, function(ok, repl_result)
+      -- Remove listener after a short delay to catch trailing output
+      vim.defer_fn(function()
+        dap.listeners.after.event_output[listener_key] = nil
+
+        if not ok then
+          finish(false, repl_result, false)
+          return
+        end
+
+        -- Merge REPL result with captured console output
+        local result = tostring(repl_result or "")
+        if result == "" and #console_lines > 0 then
+          result = table.concat(console_lines, "")
+        end
+        last_result = result
+
+        local breakpoint_id = result:match("Breakpoint%s+(%d+)")
+        local locations = tonumber(result:match("locations%s*=%s*(%d+)"))
+        local lower = result:lower()
+        local resolved = (locations or 0) > 0
+          or lower:find("resolved", 1, true) ~= nil
+          or lower:find("where =", 1, true) ~= nil
+        local is_last = index >= #set_commands
+
+        spec.set_command = set_command
+        spec.clear_command = clear_commands[index] or spec.clear_command
+        spec.runtime_breakpoint_id = breakpoint_id
+
+        if resolved or is_last then
+          finish(true, result, resolved)
+          return
+        end
+
+        if breakpoint_id then
+          M._dap_eval_lldb("breakpoint delete " .. breakpoint_id, function()
+            spec.runtime_breakpoint_id = nil
+            index = index + 1
+            try_next()
+          end)
+        else
+          index = index + 1
+          try_next()
+        end
+      end, 100)
+    end)
+  end
+
+  try_next()
+end
+
+function M._dap_clear_breakpoint(spec, cb)
+  spec = spec or {}
+  local commands = {}
+  if spec.runtime_breakpoint_id then
+    commands[#commands + 1] = "breakpoint delete " .. spec.runtime_breakpoint_id
+  end
+  if spec.clear_command then
+    commands[#commands + 1] = spec.clear_command
+  end
+  if #commands == 0 then
+    if cb then
+      cb(false, "No breakpoint clear command")
+    end
+    return
+  end
+
+  local index = 1
+  local function try_next(last_result)
+    local command = commands[index]
+    if not command then
+      if cb then
+        cb(false, last_result or "No breakpoint clear command")
+      end
+      return
+    end
+
+    M._dap_eval_lldb(command, function(ok, result)
+      if ok then
+        spec.runtime_breakpoint_id = nil
+        if cb then
+          cb(true, result)
+        end
+        return
+      end
+
+      index = index + 1
+      try_next(result)
+    end)
+  end
+
+  try_next()
+end
+
+function M._dap_filter_scopes(scope_resp)
+  if type(scope_resp) ~= "table" or type(scope_resp.scopes) ~= "table" then
+    return scope_resp
+  end
+
+  for i = #scope_resp.scopes, 1, -1 do
+    local scope = scope_resp.scopes[i]
+    local name = trim(scope and scope.name or "")
+    if name == "Globals" or name == "Static" then
+      table.remove(scope_resp.scopes, i)
+    end
+  end
+
+  return scope_resp
 end
 
 function M.ensure_dap_loaded()
@@ -4855,7 +5127,7 @@ function M.dap_toggle_breakpoint()
     M._breakpoint_specs[key] = nil
     vim.fn.sign_unplace("ue_dap_bp", { buffer = bufnr, id = line })
     if has_session then
-      M._dap_eval_lldb(spec.clear_command, function(ok2, result)
+      M._dap_clear_breakpoint(spec, function(ok2, result)
         vim.schedule(function()
           vim.notify(ok2 and ("BP cleared: %s:%d"):format(file, line)
             or ("BP clear failed: %s"):format(result), ok2 and vim.log.levels.INFO or vim.log.levels.ERROR)
@@ -4865,49 +5137,41 @@ function M.dap_toggle_breakpoint()
       vim.notify(("BP removed (pending): %s:%d"):format(file, line))
     end
   else
-    -- Add breakpoint (software BP — requires correct ASLR slide)
-    local set_cmd = ('breakpoint set --file "%s" --line %d'):format(file, line)
-    local clear_cmd = ('breakpoint clear --file "%s" --line %d'):format(file, line)
-    M._breakpoint_specs[key] = { set_command = set_cmd, clear_command = clear_cmd, file = file, line = line }
+    -- Add breakpoint (prefer exact source path, fallback to shorter LLDB matches)
+    local spec = M._dap_make_breakpoint_spec(path, line)
+    if not spec then
+      vim.notify("BP set failed: invalid path or line", vim.log.levels.ERROR)
+      return
+    end
+    M._breakpoint_specs[key] = spec
     vim.fn.sign_define("UEDapBreakpoint", { text = "●", texthl = "DiagnosticError" })
     vim.fn.sign_place(line, "ue_dap_bp", "UEDapBreakpoint", bufnr, { lnum = line })
     if has_session then
-      M._dap_eval_lldb(set_cmd, function(ok2, result)
+      M._dap_try_set_breakpoint(spec, function(ok2, result, resolved)
         vim.schedule(function()
           if ok2 then
-            -- Verify resolved status
-            M._dap_eval_lldb("breakpoint list", function(_, bp_list)
-              vim.schedule(function()
-                local resolved = 0
-                if bp_list then
-                  for n in bp_list:gmatch("resolved = (%d+)") do
-                    resolved = resolved + tonumber(n)
+            if resolved then
+              vim.notify(("BP set: %s:%d (resolved)"):format(file, line))
+            else
+              -- Diagnose exact-path miss without being confused by other breakpoints.
+              M._dap_eval_lldb(('image lookup --file "%s"'):format(spec.file:gsub('"', '\\"')), function(_, lookup)
+                vim.schedule(function()
+                  local diag = ("BP unresolved: %s:%d\n"):format(file, line)
+                  diag = diag .. "LLDB tried: " .. tostring(spec.set_command)
+                  if lookup and lookup ~= "" then
+                    local lines = {}
+                    for l in lookup:gmatch("[^\n]+") do
+                      lines[#lines + 1] = l
+                      if #lines >= 8 then break end
+                    end
+                    diag = diag .. "\nimage lookup found:\n" .. table.concat(lines, "\n")
+                  else
+                    diag = diag .. "\nimage lookup: file NOT found in module debug info"
                   end
-                end
-                if resolved > 0 then
-                  vim.notify(("BP set: %s:%d (resolved)"):format(file, line))
-                else
-                  -- Diagnose: check what LLDB knows about this file
-                  M._dap_eval_lldb(('image lookup --file "%s"'):format(file), function(_, lookup)
-                    vim.schedule(function()
-                      local diag = ("BP UNRESOLVED: %s:%d\n"):format(file, line)
-                      if lookup and lookup ~= "" then
-                        -- Show first few matches to reveal DWARF paths
-                        local lines = {}
-                        for l in lookup:gmatch("[^\n]+") do
-                          lines[#lines + 1] = l
-                          if #lines >= 8 then break end
-                        end
-                        diag = diag .. "image lookup found:\n" .. table.concat(lines, "\n")
-                      else
-                        diag = diag .. "image lookup: file NOT found in any module"
-                      end
-                      vim.notify(diag, vim.log.levels.WARN)
-                    end)
-                  end)
-                end
+                  vim.notify(diag, vim.log.levels.WARN)
+                end)
               end)
-            end)
+            end
           else
             M._breakpoint_specs[key] = nil
             vim.fn.sign_unplace("ue_dap_bp", { buffer = bufnr, id = line })
@@ -5142,12 +5406,30 @@ function M.setup_dap(dap, dapui)
     if dap.session() ~= session then return end
     M._dap_run_state = M._dap_attach_in_progress and "attaching" or "stopped"
   end
-  dap.listeners.after.event_stopped["ue-android-dap-run-state"] = function(session)
+  dap.listeners.after.event_stopped["ue-android-dap-run-state"] = function(session, body)
     if dap.session() ~= session then return end
     M._dap_run_state = "stopped"
     M._continue_pending = false
     M._continue_debounce_until_ms = 0
     M._pause_pending = false
+    -- Auto-continue on signal stops (exception) that are not breakpoints and
+    -- not during attach bootstrap.  Android processes receive stray SIGSTOP /
+    -- SIGSEGV / etc. on unrelated threads (Chrome_IOThread, Signal Catcher,
+    -- …).  Stopping on them freezes the app and confuses the user.
+    if not M._dap_attach_in_progress then
+      body = body or {}
+      local reason = tostring(body.reason or ""):lower()
+      local has_bp = body.hitBreakpointIds and #body.hitBreakpointIds > 0
+      if reason == "exception" and not has_bp then
+        vim.defer_fn(function()
+          if dap.session() == session and M._dap_run_state == "stopped" then
+            vim.notify("Auto-continuing past signal on thread "
+              .. tostring(body.threadId or "?"), vim.log.levels.DEBUG)
+            request_dap_continue(dap)
+          end
+        end, 50)
+      end
+    end
   end
   dap.listeners.after.event_continued["ue-android-dap-run-state"] = function(session)
     if dap.session() ~= session then return end
@@ -5167,21 +5449,9 @@ function M.setup_dap(dap, dapui)
     maybe_jump_to_local_source_frame(session, body)
   end
 
-  -- Track global scope variablesReferences to block them (crashes LLDB on huge binaries)
-  local blocked_refs = {}
-  dap.listeners.before.event_stopped["ue_clear_blocked"] = function()
-    blocked_refs = {}
-  end
-  dap.listeners.after.scopes["ue_block_globals"] = function(_, body)
-    if body and body.scopes then
-      for i = #body.scopes, 1, -1 do
-        local s = body.scopes[i]
-        if s.name == "Globals" or s.name == "Static" then
-          blocked_refs[s.variablesReference] = true
-          table.remove(body.scopes, i)
-        end
-      end
-    end
+  -- Strip huge Global/Static scopes before nvim-dap's callback requests variables for them.
+  dap.listeners.before.scopes["ue_block_globals"] = function(_, _, body)
+    M._dap_filter_scopes(body)
   end
   vim.fn.sign_define("DapBreakpoint", { text = "●", texthl = "DiagnosticError" })
   vim.fn.sign_define("DapStopped", { text = "▶", texthl = "DiagnosticInfo", linehl = "CursorLine" })

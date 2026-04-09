@@ -337,6 +337,7 @@ return {
     "folke/snacks.nvim",
     lazy = true,
     keys = {
+      { "<leader>;", function() Snacks.picker.commands() end, desc = "Commands" },
       { "<leader>fe", false },
       { "<leader>fE", false },
       { "<leader>e", function() require("utils.yazi").open_current() end, desc = "Yazi (current file)" },

@@ -36,6 +36,7 @@ local LABELS = {
   nightfox = "Nightfox",
   nordfox = "Nordfox",
   vscode = "VSCode",
+  ["ubuntu-terminal"] = "Ubuntu Terminal",
   habamax = "Habamax",
 }
 

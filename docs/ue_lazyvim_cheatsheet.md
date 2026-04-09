@@ -145,6 +145,7 @@
 - `<leader>fa` 找项目 code 文件
 - `<leader>fg` 找当前 UE 项目的 git files
 - `<leader>,` buffers
+- `<leader>;` 搜索所有可用 command，选中后回车直接执行
 - `<leader>:` 命令历史
 - `<leader>fr` / `<leader>fR` recent files
 - `<leader>fC` 清理 file/grep picker history
@@ -243,6 +244,7 @@
 - `<leader>ut` 主题选择器
 - `:Theme` 打开主题选择器
 - `:Theme <name>` 设置并持久化主题
+- `:Theme ubuntu-terminal` 切到 Ubuntu Terminal 风格主题
 - `<leader>uf` format on save
 - `<leader>uF` force format mode
 - `<leader>ud` diagnostics 开关

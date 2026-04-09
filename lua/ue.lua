@@ -3019,27 +3019,56 @@ local function open_cheatsheet(opts)
   vim.bo.bufhidden = ""
   vim.bo.swapfile = false
   vim.bo.filetype = "markdown"
-  vim.bo.readonly = not opts.editable
-  vim.bo.modifiable = opts.editable == true
+  vim.bo.readonly = false
+  vim.bo.modifiable = true
 
   vim.wo.wrap = true
   vim.wo.linebreak = true
   vim.wo.number = false
   vim.wo.relativenumber = false
   vim.wo.signcolumn = "no"
-  vim.wo.conceallevel = 0
 
-  if opts.editable then
-    vim.notify("Editing cheatsheet: " .. path)
+  local preview = opts.preview ~= false
+  if not preview then
+    vim.wo.conceallevel = 0
+  end
+
+  local bufnr = vim.api.nvim_get_current_buf()
+  vim.schedule(function()
+    if not vim.api.nvim_buf_is_valid(bufnr) then
+      return
+    end
+
+    pcall(vim.api.nvim_buf_call, bufnr, function()
+      if preview then
+        vim.cmd("silent! MarkdownPreview")
+      else
+        vim.cmd("silent! MarkdownEdit")
+      end
+    end)
+
+    if not preview then
+      for _, win in ipairs(vim.fn.win_findbuf(bufnr)) do
+        if vim.api.nvim_win_is_valid(win) then
+          vim.wo[win].conceallevel = 0
+        end
+      end
+    end
+  end)
+
+  if preview then
+    vim.notify("Cheatsheet preview: normal mode renders, insert mode edits\n" .. path)
+  else
+    vim.notify("Editing cheatsheet (raw markdown): " .. path)
   end
 end
 
 local function edit_cheatsheet()
-  open_cheatsheet({ editable = true })
+  open_cheatsheet({ preview = false })
 end
 
 local function show_cheatsheet()
-  open_cheatsheet({ editable = false })
+  open_cheatsheet({ preview = true })
 end
 
 local function set_project(input)

@@ -9,8 +9,12 @@
 - UE / Android DAP 工作流
 
 ## 文档入口
-- `:UECheatsheet` 以普通 markdown 文档打开这份手册
-- `:UECheatsheetEdit` 直接编辑这份手册
+- `:UECheatsheet` 默认以预览模式打开这份手册
+- 在 markdown 里，Normal 模式看渲染后的预览，按 `i` 进入 Insert 后会回到原始 markdown 方便编辑
+- `:UECheatsheetEdit` 强制原文编辑这份手册，不走渲染预览
+- `:MarkdownPreview` 当前 markdown buffer 开启渲染预览
+- `:MarkdownEdit` 当前 markdown buffer 关闭预览，回到原始 markdown
+- `:MarkdownPreviewToggle` 当前 markdown buffer 切换预览 / 原文
 - 文档路径：`docs/ue_lazyvim_cheatsheet.md`
 - 维护约定：以后所有快捷键新增、删除、改动，都要同步更新这份手册
 
@@ -244,14 +248,13 @@
 - `<leader>ud` diagnostics 开关
 - `<leader>us` 拼写检查
 - `<leader>uw` 自动换行
-- `<leader>ul` 行号
-- `<leader>uL` 相对行号
 - `<leader>uh` inlay hints
 - `<leader>uG` git signs
 - `<leader>uT` treesitter
 - `<leader>uz` zen mode
 - `<leader>uZ` zen zoom alias
 - `<leader>ur` redraw 并清掉搜索高亮
+- 注意：这套配置里 `u` 前缀有一部分默认 LazyVim toggle 被 UE / Android 工作流刻意接管了，比如 `ub` / `ui` / `ul` / `uL` / `uD` / `up`
 
 ## Windows 自定义
 - `<leader>E` 在 Explorer 中定位当前文件
@@ -259,13 +262,20 @@
 - `:RevealInExplorer` 直接调用定位
 
 ## UE 工作流
-- `<leader>uP` 设置项目根目录或 `.uproject`
+- `<leader>uj` 设置项目根目录或 `.uproject`
+- `<leader>uP` 同上，旧的大写兼容键
 - `:UESetPlatform` 交互选择 platform + configuration
 - `:UESetPlatform Win64 Development Editor` 直接设置
-- `<leader>uB` 执行 `UEPrepare`
-- `<leader>uc` 导出 `compile_commands.json`
 - `<leader>ub` Android Development 构建
+- `<leader>ue` 执行 `UEPrepare`
+- `<leader>uB` 同上，旧的大写兼容键
+- `<leader>uc` 导出 `compile_commands.json`
+- `<leader>ul` 启动 app，但不 attach debugger
 - `<leader>ui` 安装 APK 到连接设备
+- `<leader>ug` 切换 app log
+- `<leader>uL` 同上，旧的大写兼容键
+- `<leader>uv` 切换 Windows debug log
+- `<leader>uD` 同上，旧的大写兼容键
 - `<leader>uo` / `<leader>uO` 在当前 module/plugin 范围查文件 / grep
 - `<leader>up` 查看当前 UE 路径
 - `UEBuildAndroid` / `UEPrepare` / `UEExportCompileCommands` 失败时会写入 quickfix
@@ -277,18 +287,39 @@
 
 ## Android DAP
 - `<leader>da` attach 到 Android 进程
-- `<leader>dL` debug 模式启动并自动 attach
+- `<leader>db` 切换硬件断点
+- `<leader>dc` continue
+- `<leader>dp` pause
+- `<leader>dn` step over
+- `<leader>di` step in
+- `<leader>do` step out
+- `<leader>dl` debug 模式启动并自动 attach
+- `<leader>dL` 同上，旧的大写兼容键
+- `<leader>du` 切换 DAP UI
+- `<leader>dr` 切换 REPL
+- `<leader>dx` 重置布局
+- `<leader>dR` 同上，旧的大写兼容键
 - `:UESetAndroidPackage <pkg>` 设置 attach 用的包名
 - `F9` 切换硬件断点
 - `F5` continue
 - `F6` pause
 - `F10` step over
-- `<leader>di` step in
-- `<leader>do` step out
-- `<leader>du` 切换 DAP UI
-- `<leader>dr` 切换 REPL
-- `<leader>dR` 重置布局
 - `:qa` 会自动做 DAP 清理
+
+推荐优先记住这一组全小写：
+- `Space ub` build
+- `Space ui` install apk
+- `Space da` attach
+- `Space dl` launch debug
+- `Space dc` continue
+- `Space dp` pause
+- `Space dn` step over
+- `Space di` step in
+- `Space do` step out
+- `Space db` breakpoint
+- `Space du` dap ui
+- `Space dr` repl
+- `Space dx` reset layout
 
 ## 提升开发效率的习惯
 - 改代码前先 `*` 搜当前词，再 `gr` 看引用

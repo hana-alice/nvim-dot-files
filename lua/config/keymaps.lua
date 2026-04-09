@@ -147,6 +147,18 @@ local function sidebar_pick()
   require("utils.sidebar").pick()
 end
 
+local function apply_ue_runtime_overrides()
+  local opts = { nowait = true }
+
+  map("n", "<leader>ub", "<cmd>UEBuild<cr>", vim.tbl_extend("force", opts, { desc = "UE: Build (platform from UESetPlatform)" }))
+  map("n", "<leader>ug", "<cmd>UELogToggle<cr>", vim.tbl_extend("force", opts, { desc = "UE: Toggle app log" }))
+  map("n", "<leader>ui", "<cmd>UEInstallAndroid<cr>", vim.tbl_extend("force", opts, { desc = "UE: Install APK to device" }))
+  map("n", "<leader>ul", "<cmd>UELaunch<cr>", vim.tbl_extend("force", opts, { desc = "UE: Launch app (no debugger)" }))
+  map("n", "<leader>uL", "<cmd>UELogToggle<cr>", vim.tbl_extend("force", opts, { desc = "UE: Toggle app log" }))
+  map("n", "<leader>uD", "<cmd>UEDebugLogToggle<cr>", vim.tbl_extend("force", opts, { desc = "UE: Toggle Windows debug log" }))
+  map("n", "<leader>up", "<cmd>UEPaths<cr>", vim.tbl_extend("force", opts, { desc = "UE: Show paths" }))
+end
+
 map("n", "gd", function()
   require("utils.lsp_fallback").definition()
 end, { desc = "Definition (LSP -> GTAGS)" })
@@ -176,12 +188,16 @@ map("n", "<leader>bc", close_current_target, { desc = "Buffer/Window: Smart clos
 map("n", "<leader>bn", "<cmd>confirm enew<cr>", { desc = "Buffer: New empty buffer" })
 map("n", "<leader>ub", "<cmd>UEBuild<cr>", { desc = "UE: Build (platform from UESetPlatform)" })
 map("n", "<leader>uB", "<cmd>UEPrepare<cr>", { desc = "UE: Prepare symbols + compile_commands" })
+map("n", "<leader>ue", "<cmd>UEPrepare<cr>", { desc = "UE: Prepare symbols + compile_commands" })
 map("n", "<leader>uc", "<cmd>UEExportCompileCommands<cr>", { desc = "UE: Export compile_commands" })
 map("n", "<leader>ul", "<cmd>UELaunch<cr>", { desc = "UE: Launch app (no debugger)" })
 map("n", "<leader>uL", "<cmd>UELogToggle<cr>", { desc = "UE: Toggle app log" })
+map("n", "<leader>ug", "<cmd>UELogToggle<cr>", { desc = "UE: Toggle app log" })
 map("n", "<leader>uD", "<cmd>UEDebugLogToggle<cr>", { desc = "UE: Toggle Windows debug log" })
+map("n", "<leader>uv", "<cmd>UEDebugLogToggle<cr>", { desc = "UE: Toggle Windows debug log" })
 map("n", "<leader>up", "<cmd>UEPaths<cr>", { desc = "UE: Show paths" })
 map("n", "<leader>uP", "<cmd>UESetProject<cr>", { desc = "UE: Set project" })
+map("n", "<leader>uj", "<cmd>UESetProject<cr>", { desc = "UE: Set project" })
 map("n", "<leader>ut", "<cmd>ThemePicker<cr>", { desc = "UI: Theme picker" })
 map("n", "<leader>va", sidebar_pick, { desc = "Sidebar: Choose view" })
 map("n", "<leader>vv", sidebar_toggle(), { desc = "Sidebar: Toggle last view" })
@@ -196,6 +212,12 @@ map("n", "<leader>?", "<cmd>UECheatsheet<cr>", { desc = "UE: Cheatsheet" })
 
 -- Android DAP keymaps
 map("n", "<leader>da", "<cmd>UEAndroidDAPAttach<cr>", { desc = "DAP: Android Attach" })
+map("n", "<leader>db", "<cmd>UEAndroidDAPToggleBreakpoint<cr>", { desc = "DAP: Toggle Breakpoint" })
+map("n", "<leader>dc", "<cmd>UEAndroidDAPContinue<cr>", { desc = "DAP: Continue" })
+map("n", "<leader>dl", "<cmd>UEAndroidDAPLaunch<cr>", { desc = "DAP: Android Launch Debug" })
+map("n", "<leader>dn", "<cmd>UEAndroidDAPStepOver<cr>", { desc = "DAP: Step Over" })
+map("n", "<leader>dp", "<cmd>UEAndroidDAPPause<cr>", { desc = "DAP: Pause" })
+map("n", "<leader>dx", "<cmd>UEResetLayout<cr>", { desc = "Reset Layout (DAP or default)" })
 map("n", "<F5>", "<cmd>UEAndroidDAPContinue<cr>", { desc = "DAP: Continue" })
 map("n", "<F6>", "<cmd>UEAndroidDAPPause<cr>", { desc = "DAP: Pause" })
 map("n", "<F9>", "<cmd>UEAndroidDAPToggleBreakpoint<cr>", { desc = "DAP: Toggle Breakpoint" })
@@ -207,3 +229,10 @@ map("n", "<leader>dr", "<cmd>UEAndroidDAPREPL<cr>", { desc = "DAP: Toggle REPL" 
 map("n", "<leader>dR", "<cmd>UEResetLayout<cr>", { desc = "Reset Layout (DAP or default)" })
 map("n", "<leader>dL", "<cmd>UEAndroidDAPLaunch<cr>", { desc = "DAP: Android Launch Debug" })
 map("n", "<leader>ui", "<cmd>UEInstallAndroid<cr>", { desc = "UE: Install APK to device" })
+
+apply_ue_runtime_overrides()
+
+vim.api.nvim_create_autocmd("User", {
+  pattern = "VeryLazy",
+  callback = apply_ue_runtime_overrides,
+})

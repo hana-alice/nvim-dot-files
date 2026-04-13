@@ -10,6 +10,14 @@ return {
       local dap = require("dap")
       local dapui = require("dapui")
       dapui.setup({
+        -- In stacks panel, <CR> / double-click should jump to frame (open),
+        -- not try to expand (which frames don't support).
+        element_mappings = {
+          stacks = {
+            open = { "<CR>", "<2-LeftMouse>", "o" },
+            expand = "e",
+          },
+        },
         layouts = {
           {
             -- Right panel: variables & watches (widest, most-used)

@@ -7,6 +7,44 @@
 -- Or remove existing autocmds by their group name (which is prefixed with `lazyvim_` for the defaults)
 -- e.g. vim.api.nvim_del_augroup_by_name("lazyvim_wrap_spell")
 
+-- ── Preserve viewport when switching buffers ─────────────────────────
+-- Without this, switching buffers resets the scroll position so the
+-- cursor lands in the middle of the screen instead of where you left it.
+local buf_views = {}
+local view_group = vim.api.nvim_create_augroup("PreserveBufferView", { clear = true })
+
+vim.api.nvim_create_autocmd("BufLeave", {
+  group = view_group,
+  callback = function()
+    local buf = vim.api.nvim_get_current_buf()
+    if vim.bo[buf].buftype == "" then
+      buf_views[buf] = vim.fn.winsaveview()
+    end
+  end,
+})
+
+vim.api.nvim_create_autocmd("BufEnter", {
+  group = view_group,
+  callback = function()
+    local buf = vim.api.nvim_get_current_buf()
+    local view = buf_views[buf]
+    if view and vim.bo[buf].buftype == "" then
+      vim.schedule(function()
+        if vim.api.nvim_get_current_buf() == buf then
+          pcall(vim.fn.winrestview, view)
+        end
+      end)
+    end
+  end,
+})
+
+vim.api.nvim_create_autocmd("BufDelete", {
+  group = view_group,
+  callback = function(args)
+    buf_views[args.buf] = nil
+  end,
+})
+
 local is_windows = vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1
 
 if is_windows then

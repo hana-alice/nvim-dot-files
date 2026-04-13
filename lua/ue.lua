@@ -444,6 +444,44 @@ local function populate_quickfix_from_global(title, root, lines)
   return populate_quickfix_from_entries(title, parse_global_entries(root, lines))
 end
 
+local function path_proximity_score(entry_path, current_file)
+  local entry_norm = norm(entry_path):lower()
+
+  -- Vendored/duplicate header directories that should be deprioritized
+  -- when a canonical copy lives elsewhere.
+  local vendored_pats = {
+    "thirdparty/sdl2/.-/vulkan/",
+    "thirdparty/sdl2/.-/khronos/",
+    "thirdparty/sdl/.-/vulkan/",
+    "thirdparty/sdl/.-/khronos/",
+  }
+
+  -- Penalise vendored duplicates
+  for _, pat in ipairs(vendored_pats) do
+    if entry_norm:find(pat) then
+      return -30
+    end
+  end
+
+  -- Reward sharing a common ThirdParty/<Lib> prefix with the current file.
+  -- e.g. current = .../ThirdParty/Vulkan/... and entry = .../ThirdParty/Vulkan/...
+  local cur_norm = current_file:lower()
+  local cur_tp = cur_norm:match("thirdparty/([^/]+)/")
+  local ent_tp = entry_norm:match("thirdparty/([^/]+)/")
+  if cur_tp and ent_tp and cur_tp == ent_tp then
+    return 10
+  end
+
+  -- Reward being under the same module directory (e.g. both in VulkanRHI)
+  local cur_mod = cur_norm:match("/([^/]+)/private/") or cur_norm:match("/([^/]+)/public/")
+  local ent_mod = entry_norm:match("/([^/]+)/private/") or entry_norm:match("/([^/]+)/public/")
+  if cur_mod and ent_mod and cur_mod == ent_mod then
+    return 10
+  end
+
+  return 0
+end
+
 local function jump_to_global_result(root, lines)
   local entries = parse_global_entries(root, lines)
   if #entries == 0 then
@@ -452,6 +490,23 @@ local function jump_to_global_result(root, lines)
   if #entries == 1 then
     return jump_to_entry(entries[1])
   end
+
+  -- When GTAGS -d returns multiple identical definitions (e.g. vendored
+  -- copies of the same header), pick the best one by path proximity
+  -- instead of dumping them all into quickfix.
+  local current_file = norm(vim.api.nvim_buf_get_name(0))
+  for _, entry in ipairs(entries) do
+    entry._prox = path_proximity_score(entry.filename, current_file)
+  end
+  table.sort(entries, function(a, b)
+    return a._prox > b._prox
+  end)
+  local best = entries[1]
+  local second = entries[2]
+  if best._prox > (second and second._prox or -999) then
+    return jump_to_entry(best)
+  end
+
   return populate_quickfix_from_entries("GTAGS definitions", entries)
 end
 
@@ -485,6 +540,9 @@ local function grep_definition_score(symbol, entry, current_file, current_line)
   if is_header_like_path(entry.filename) then
     score = score + 15
   end
+
+  -- Path proximity: penalise vendored duplicates, reward same-module headers
+  score = score + path_proximity_score(entry.filename, current_file)
 
   if text:match("^%s*#%s*define%s+" .. escaped .. "%f[^%w_]") then
     score = score + 140
@@ -653,9 +711,11 @@ local function find_uproject_in_dir(dir)
   return nil
 end
 
-local DEFAULT_PLATFORM_CHOICES = { "Win64", "Android", "Linux", "Mac", "IOS" }
-local DEFAULT_CONFIGURATION_CHOICES = { "Development", "DebugGame", "Debug", "Shipping", "Test" }
-local TARGET_KIND_SUFFIXES = { "Editor", "Client", "Server" }
+local UE_CONST = {
+  DEFAULT_PLATFORM_CHOICES = { "Win64", "Android", "Linux", "Mac", "IOS" },
+  DEFAULT_CONFIGURATION_CHOICES = { "Development", "DebugGame", "Debug", "Shipping", "Test" },
+  TARGET_KIND_SUFFIXES = { "Editor", "Client", "Server" },
+}
 
 local function copy_list(items)
   local copy = {}
@@ -761,7 +821,7 @@ local function available_platform_choices(project_root, uproject)
   if solution and #solution.platforms > 0 then
     return copy_list(solution.platforms)
   end
-  return copy_list(DEFAULT_PLATFORM_CHOICES)
+  return copy_list(UE_CONST.DEFAULT_PLATFORM_CHOICES)
 end
 
 local function available_configuration_choices(project_root, uproject, platform)
@@ -784,12 +844,12 @@ local function available_configuration_choices(project_root, uproject, platform)
     end
   end
 
-  return copy_list(DEFAULT_CONFIGURATION_CHOICES)
+  return copy_list(UE_CONST.DEFAULT_CONFIGURATION_CHOICES)
 end
 
 local function split_target_configuration_name(configuration)
   configuration = trim(configuration)
-  for _, suffix in ipairs(TARGET_KIND_SUFFIXES) do
+  for _, suffix in ipairs(UE_CONST.TARGET_KIND_SUFFIXES) do
     local base = trim(configuration:match("^(.-)%s+" .. suffix .. "$") or "")
     if base ~= "" then
       return base, suffix
@@ -1087,7 +1147,7 @@ local function filter_code(paths)
   return filter_extensions(paths, M.FT_CODE)
 end
 
-local PROJECT_INDEX_DIRS = {
+UE_CONST.PROJECT_INDEX_DIRS = {
   "Source",
   "Shaders",
   "Config",
@@ -1098,34 +1158,34 @@ local PROJECT_INDEX_DIRS = {
   "typescript",
 }
 
-local ENGINE_INDEX_DIRS = {
+UE_CONST.ENGINE_INDEX_DIRS = {
   "Engine/Source",
   "Engine/Plugins",
   "Engine/Shaders",
 }
 
-local PROJECT_SHADER_DIRS = {
+UE_CONST.PROJECT_SHADER_DIRS = {
   "Shaders",
   "Plugins",
 }
 
-local ENGINE_SHADER_DIRS = {
+UE_CONST.ENGINE_SHADER_DIRS = {
   "Engine/Shaders",
   "Engine/Plugins",
 }
 
-local GTAGS_EXCLUDE_SUBSTRINGS = {
+UE_CONST.GTAGS_EXCLUDE_SUBSTRINGS = {
   "Engine/Source/ThirdParty/MCPP/mcpp-2.7.2/",
 }
 
-local ENGINE_PICKER_DIRS = {
+UE_CONST.ENGINE_PICKER_DIRS = {
   "Engine/Source",
   "Engine/Plugins",
   "Engine/Shaders",
   "Engine/Config",
 }
 
-local PICKER_EXCLUDES = {
+UE_CONST.PICKER_EXCLUDES = {
   "**/.git/**",
   "**/.vs/**",
   "**/Binaries/**",
@@ -1137,7 +1197,7 @@ local PICKER_EXCLUDES = {
 }
 
 local function picker_excludes(opts)
-  local excludes = vim.deepcopy(PICKER_EXCLUDES)
+  local excludes = vim.deepcopy(UE_CONST.PICKER_EXCLUDES)
   if type(opts) == "table" and opts.include_third_party then
     excludes = vim.tbl_filter(function(pattern)
       return pattern ~= "**/ThirdParty/**"
@@ -1197,7 +1257,7 @@ local function filter_gtags_paths(paths)
   for _, path in ipairs(paths or {}) do
     local normalized = norm(path)
     local excluded = false
-    for _, pattern in ipairs(GTAGS_EXCLUDE_SUBSTRINGS) do
+    for _, pattern in ipairs(UE_CONST.GTAGS_EXCLUDE_SUBSTRINGS) do
       if normalized:find(pattern, 1, true) then
         excluded = true
         break
@@ -1222,7 +1282,7 @@ local function picker_search_dirs(ctx)
     end
   end
 
-  for _, relative in ipairs(existing_relative_dirs(ctx.engine_root, ENGINE_PICKER_DIRS)) do
+  for _, relative in ipairs(existing_relative_dirs(ctx.engine_root, UE_CONST.ENGINE_PICKER_DIRS)) do
     add(join(ctx.engine_root, relative))
   end
 
@@ -1608,7 +1668,7 @@ local function detect_target_names(project_root, uproject)
   for _, target in ipairs(targets or {}) do
     local name = vim.fs.basename(target):gsub("%.Target%.cs$", "")
     local matched = false
-    for _, kind in ipairs(TARGET_KIND_SUFFIXES) do
+    for _, kind in ipairs(UE_CONST.TARGET_KIND_SUFFIXES) do
       if name:match(kind .. "$") then
         detected[kind] = detected[kind] or name
         matched = true
@@ -1997,11 +2057,11 @@ local function shader_search_dirs(ctx)
   end
 
   if ctx.project_root and ctx.project_root ~= "" then
-    for _, relative in ipairs(PROJECT_SHADER_DIRS) do
+    for _, relative in ipairs(UE_CONST.PROJECT_SHADER_DIRS) do
       add(join(ctx.project_root, relative))
     end
   end
-  for _, relative in ipairs(ENGINE_SHADER_DIRS) do
+  for _, relative in ipairs(UE_CONST.ENGINE_SHADER_DIRS) do
     add(join(ctx.engine_root, relative))
   end
 
@@ -2222,9 +2282,9 @@ local function augment_compile_commands_with_shaders(ctx, content)
 
   local shader_files = {}
   if ctx.project_root and ctx.project_root ~= "" then
-    vim.list_extend(shader_files, scan_shader_files(ctx.project_root, PROJECT_INDEX_DIRS))
+    vim.list_extend(shader_files, scan_shader_files(ctx.project_root, UE_CONST.PROJECT_INDEX_DIRS))
   end
-  vim.list_extend(shader_files, scan_shader_files(ctx.engine_root, ENGINE_INDEX_DIRS))
+  vim.list_extend(shader_files, scan_shader_files(ctx.engine_root, UE_CONST.ENGINE_INDEX_DIRS))
   if #shader_files == 0 then
     return content
   end
@@ -3480,7 +3540,7 @@ local function prepare()
 
   ensure_dir(ctx.paths.cache)
 
-  local project_rel, project_err = scan_relative_files(ctx.project_root, existing_relative_dirs(ctx.project_root, PROJECT_INDEX_DIRS))
+  local project_rel, project_err = scan_relative_files(ctx.project_root, existing_relative_dirs(ctx.project_root, UE_CONST.PROJECT_INDEX_DIRS))
   if not project_rel then
     invalidate_status_cache()
     refresh_statusline()
@@ -3492,7 +3552,7 @@ local function prepare()
     return
   end
 
-  local engine_rel, engine_err = scan_relative_files(ctx.engine_root, ENGINE_INDEX_DIRS)
+  local engine_rel, engine_err = scan_relative_files(ctx.engine_root, UE_CONST.ENGINE_INDEX_DIRS)
   if not engine_rel then
     invalidate_status_cache()
     refresh_statusline()
@@ -3610,62 +3670,172 @@ local function prepare_async()
   end
 
   ensure_dir(ctx.paths.cache)
-  local log_path = join(ctx.paths.cache, "ue_prepare_headless.log")
-  local output = {}
-  local cmd = {
-    vim.v.progpath,
-    "--headless",
-    "--cmd",
-    "lua vim.g.ue_prepare_headless = 1",
-    "-c",
-    "lua require('ue').prepare_headless()",
-  }
+
+  -- fidget progress
+  local ok_fidget, progress = pcall(require, "fidget.progress")
+  local handle
+  if ok_fidget then
+    handle = progress.handle.create({
+      title = "UEPrepare",
+      message = "scanning project files...",
+      lsp_client = { name = "ue" },
+      percentage = 0,
+    })
+  end
+
+  local function update(msg, pct)
+    if handle then
+      handle.message = msg
+      if pct then handle.percentage = pct end
+    end
+  end
+
+  local function fail(msg)
+    invalidate_status_cache()
+    refresh_statusline()
+    set_prepare_running(false)
+    if handle then
+      handle.message = "FAILED: " .. msg
+      handle:finish()
+    end
+    vim.notify("UEPrepare failed: " .. msg, vim.log.levels.ERROR)
+  end
 
   set_prepare_running(true)
-  vim.notify("UEPrepare started in background", vim.log.levels.INFO)
 
-  prepare_jobid = vim.fn.jobstart(cmd, {
-    cwd = ctx.project_root,
-    stdout_buffered = true,
-    stderr_buffered = true,
+  -- ── Step 1: scan files (synchronous, fast) ──────────────────────────
+  update("scanning project files...", 5)
+  local project_rel, project_err = scan_relative_files(ctx.project_root, existing_relative_dirs(ctx.project_root, UE_CONST.PROJECT_INDEX_DIRS))
+  if not project_rel then
+    fail(project_err)
+    return
+  end
+
+  update("scanning engine files...", 15)
+  local engine_rel, engine_err = scan_relative_files(ctx.engine_root, UE_CONST.ENGINE_INDEX_DIRS)
+  if not engine_rel then
+    fail(engine_err)
+    return
+  end
+
+  -- ── Step 2: build file lists (synchronous, fast) ────────────────────
+  update("building file lists...", 25)
+  local project_code = filter_gtags_paths(filter_code(project_rel))
+  local engine_code = filter_gtags_paths(filter_code(engine_rel))
+  local workspace_code = {}
+  local workspace_seen = {}
+  local root = workspace_root(ctx)
+
+  for _, path in ipairs(project_code) do
+    local absolute = join(ctx.project_root, path)
+    local relative = relative_to(root, absolute)
+    if not workspace_seen[relative] then
+      workspace_seen[relative] = true
+      table.insert(workspace_code, relative)
+    end
+  end
+
+  for _, path in ipairs(engine_code) do
+    local absolute = join(ctx.engine_root, path)
+    local relative = relative_to(root, absolute)
+    if not workspace_seen[relative] then
+      workspace_seen[relative] = true
+      table.insert(workspace_code, relative)
+    end
+  end
+
+  table.sort(workspace_code)
+
+  write_lines(ctx.paths.project_list, project_code)
+  write_lines(ctx.paths.engine_list, engine_code)
+  write_lines(ctx.paths.workspace_list, workspace_code)
+
+  -- ── Step 3: build GTAGS (async, slow) ───────────────────────────────
+  update(("indexing %d files with gtags..."):format(#workspace_code), 30)
+
+  local gtags = first_executable({ "gtags" })
+  if not gtags then
+    fail("gtags not found in PATH")
+    return
+  end
+
+  local db_dir = ctx.paths.workspace_db
+  local filelist = ctx.paths.workspace_list
+  clean_db_dir(db_dir)
+
+  local gtags_cmd = { gtags, "-f", filelist, "--skip-unreadable", "--skip-symlink", db_dir }
+  local gtags_output = {}
+  local indexed_count = 0
+
+  -- Use engine_root as cwd so that relative paths in the file list resolve correctly.
+  -- When the file list contains absolute paths (cross-drive), gtags handles them too.
+  local gtags_cwd = ctx.engine_root
+
+  prepare_jobid = vim.fn.jobstart(gtags_cmd, {
+    cwd = gtags_cwd,
     on_stdout = function(_, data)
-      append_job_output(output, data)
+      append_job_output(gtags_output, data)
     end,
     on_stderr = function(_, data)
-      append_job_output(output, data)
+      for _, line in ipairs(data or {}) do
+        line = trim(line)
+        if line ~= "" then
+          table.insert(gtags_output, line)
+          -- gtags prints "Warning: ..." for unreadable files; count non-warning lines
+          if not line:match("^Warning:") then
+            indexed_count = indexed_count + 1
+          end
+          vim.schedule(function()
+            local pct = math.min(30 + math.floor(indexed_count / math.max(#workspace_code, 1) * 50), 80)
+            update(("gtags: %d/%d files"):format(indexed_count, #workspace_code), pct)
+          end)
+        end
+      end
     end,
     on_exit = function(_, code)
       vim.schedule(function()
         prepare_jobid = nil
-        set_prepare_running(false)
 
-        local text = table.concat(output, "\n")
-        if text ~= "" then
-          write_all(log_path, text .. "\n")
-        end
-
-        if code == 0 then
-          clear_index_dirty(ctx)
-          invalidate_status_cache()
-          refresh_statusline()
-          vim.notify("UEPrepare finished", vim.log.levels.INFO)
+        if code ~= 0 or not db_ready(db_dir) then
+          fail("gtags exited with code " .. code .. "\n" .. table.concat(gtags_output, "\n"))
           return
         end
 
+        -- ── Step 4: generate compile_commands (may be fast or slow) ─────
+        update("generating compile_commands...", 85)
+
+        local ok_compile, compile_path = generate_compile_commands(ctx)
+        if not ok_compile then
+          -- compile_commands failure is non-fatal — GTAGS is the important part
+          update("compile_commands skipped: " .. (compile_path or "unknown"), 90)
+          vim.notify("UEPrepare: compile_commands failed (non-fatal): " .. (compile_path or "unknown"), vim.log.levels.WARN)
+        end
+
+        clear_index_dirty(ctx)
         invalidate_status_cache()
         refresh_statusline()
-        if text ~= "" then
-          populate_quickfix_from_output("UEPrepare background run", text, { root = ctx.project_root })
+        set_prepare_running(false)
+
+        local summary = ("UEPrepare done: %d project, %d engine, %d GTAGS files"):format(
+          #project_code, #engine_code, #workspace_code
+        )
+        if ok_compile then
+          summary = summary .. "\ncompile_commands: " .. compile_path
         end
-        vim.notify("UEPrepare failed, see quickfix/log: " .. log_path, vim.log.levels.ERROR)
+
+        update("done", 100)
+        if handle then
+          handle.message = summary
+          handle:finish()
+        end
+        vim.notify(summary)
       end)
     end,
   })
 
   if prepare_jobid <= 0 then
     prepare_jobid = nil
-    set_prepare_running(false)
-    vim.notify("Failed to start background UEPrepare", vim.log.levels.ERROR)
+    fail("failed to start gtags process")
   end
 end
 
@@ -4379,6 +4549,17 @@ function M._android_dap_config(session)
   for _, sp in ipairs(session.exec_search_paths or {}) do
     table.insert(target_create, ('settings append target.exec-search-paths "%s"'):format(sp))
   end
+  local formatter = vim.fn.stdpath("config") .. "/data/UE4DataFormatters_2ByteChars.py"
+  local init_commands = {
+    "settings set stop-disassembly-display never",
+    "settings set target.inline-breakpoint-strategy always",
+    "settings set target.move-to-nearest-code true",
+    "settings set target.process.stop-on-sharedlibrary-events false",
+    "platform select remote-android",
+  }
+  if vim.uv.fs_stat(formatter) then
+    table.insert(init_commands, ('command script import "%s"'):format(formatter:gsub("\\", "/")))
+  end
   return {
     name = "UE Android Attach",
     type = "codelldb",
@@ -4389,13 +4570,7 @@ function M._android_dap_config(session)
     cwd = session.project_root or vim.fn.getcwd(),
     sourceLanguages = { "cpp" },
     sourceMap = (session.source_map and next(session.source_map)) and session.source_map or vim.empty_dict(),
-    initCommands = {
-      "settings set stop-disassembly-display never",
-      "settings set target.inline-breakpoint-strategy always",
-      "settings set target.move-to-nearest-code true",
-      "settings set target.process.stop-on-sharedlibrary-events false",
-      "platform select remote-android",
-    },
+    initCommands = init_commands,
     targetCreateCommands = target_create,
     processCreateCommands = {
       ('platform connect "%s"'):format(session.connect_uri),
@@ -5381,8 +5556,102 @@ function M.setup_dap(dap, dapui)
     end
   end
 
+  local logcat_buf = nil
+  local logcat_job = nil
+
+  local function stop_logcat()
+    if logcat_job then
+      pcall(vim.fn.jobstop, logcat_job)
+      logcat_job = nil
+    end
+    if logcat_buf and vim.api.nvim_buf_is_valid(logcat_buf) then
+      -- Close any window showing the logcat buffer
+      for _, win in ipairs(vim.api.nvim_list_wins()) do
+        if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == logcat_buf then
+          pcall(vim.api.nvim_win_close, win, true)
+        end
+      end
+      pcall(vim.api.nvim_buf_delete, logcat_buf, { force = true })
+      logcat_buf = nil
+    end
+  end
+
+  local function start_logcat()
+    stop_logcat()
+    local state = M._dap_session_state or {}
+    local pid = state.pid
+    local adb = state.adb or "adb"
+    local serial = state.serial or ""
+    if not pid or pid == "" then return end
+
+    logcat_buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[logcat_buf].buftype = "nofile"
+    vim.bo[logcat_buf].bufhidden = "wipe"
+    vim.bo[logcat_buf].filetype = "log"
+    vim.api.nvim_buf_set_name(logcat_buf, "logcat:" .. pid)
+
+    local cmd = { adb }
+    if serial ~= "" then
+      vim.list_extend(cmd, { "-s", serial })
+    end
+    vim.list_extend(cmd, { "logcat", "--pid=" .. pid })
+
+    local buf = logcat_buf
+    logcat_job = vim.fn.jobstart(cmd, {
+      on_stdout = function(_, data)
+        if not vim.api.nvim_buf_is_valid(buf) then return end
+        local lines = {}
+        for _, line in ipairs(data) do
+          if line ~= "" then lines[#lines + 1] = line end
+        end
+        if #lines > 0 then
+          vim.schedule(function()
+            if not vim.api.nvim_buf_is_valid(buf) then return end
+            vim.api.nvim_buf_set_lines(buf, -1, -1, false, lines)
+            -- Auto-scroll windows showing this buffer
+            for _, win in ipairs(vim.api.nvim_list_wins()) do
+              if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
+                local lc = vim.api.nvim_buf_line_count(buf)
+                pcall(vim.api.nvim_win_set_cursor, win, { lc, 0 })
+              end
+            end
+          end)
+        end
+      end,
+      on_stderr = function() end,
+      on_exit = function() logcat_job = nil end,
+    })
+  end
+
+  local function open_logcat_window()
+    if not logcat_buf or not vim.api.nvim_buf_is_valid(logcat_buf) then return end
+    -- Find the bottom DAP panel (repl/console) to place logcat next to it
+    local target_win = nil
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_is_valid(win) then
+        local buf = vim.api.nvim_win_get_buf(win)
+        local ft = vim.bo[buf].filetype
+        if ft == "dap-repl" or ft == "dapui_console" then
+          target_win = win
+          break
+        end
+      end
+    end
+    if target_win then
+      vim.api.nvim_set_current_win(target_win)
+      vim.cmd("vertical rightbelow split")
+      vim.api.nvim_win_set_buf(0, logcat_buf)
+      vim.wo.number = false
+      vim.wo.relativenumber = false
+      vim.wo.signcolumn = "no"
+      vim.wo.wrap = false
+    end
+  end
+
   local function on_session_end()
+    stop_logcat()
     restore_layout()
+    source_path_cache = {}
     -- Clean up any pending ASLR listeners (session died before event_stopped)
     dap.listeners.after.event_stopped["ue_aslr_fix"] = nil
     dap.listeners.after.event_initialized["ue_aslr_fix"] = nil
@@ -5397,6 +5666,8 @@ function M.setup_dap(dap, dapui)
     close_explorer()
     save_layout()
     dapui.open()
+    start_logcat()
+    vim.defer_fn(open_logcat_window, 200)
   end
   dap.listeners.before.event_terminated["dapui_config"] = function() on_session_end() end
   dap.listeners.before.event_exited["dapui_config"] = function() on_session_end() end
@@ -5452,6 +5723,68 @@ function M.setup_dap(dap, dapui)
   -- Strip huge Global/Static scopes before nvim-dap's callback requests variables for them.
   dap.listeners.before.scopes["ue_block_globals"] = function(_, _, body)
     M._dap_filter_scopes(body)
+  end
+
+  -- Rewrite relative source paths in stack frames so dap-ui can open local files.
+  -- LLDB returns paths relative to DWARF comp_dir (e.g. "Runtime/VulkanRHI/Private/VulkanShaders.cpp").
+  -- We join with known prefixes — NO glob (glob freezes Neovim on large UE trees).
+  local source_path_cache = {}
+  local function resolve_source_path(rel_path)
+    if not rel_path or rel_path == "" then return nil end
+    local cached = source_path_cache[rel_path]
+    if cached ~= nil then return cached or nil end
+
+    -- Already absolute and exists?
+    if rel_path:match("^[A-Za-z]:") or rel_path:match("^/") then
+      local p = norm(rel_path)
+      if is_file(p) then
+        source_path_cache[rel_path] = p
+        return p
+      end
+      source_path_cache[rel_path] = false
+      return nil
+    end
+
+    -- Build candidate prefixes: DWARF comp_dir is typically engine_root/Engine/Source,
+    -- so relative paths like "Runtime/VulkanRHI/Private/X.cpp" resolve from there.
+    local state = M._dap_session_state or {}
+    local prefixes = {}
+    local er = state.engine_root or ""
+    if er ~= "" then
+      prefixes[#prefixes + 1] = er .. "/Engine/Source"
+      prefixes[#prefixes + 1] = er .. "/Engine"
+      prefixes[#prefixes + 1] = er
+    end
+    local pr = state.project_root or ""
+    if pr ~= "" then
+      prefixes[#prefixes + 1] = pr .. "/Source"
+      prefixes[#prefixes + 1] = pr
+    end
+    prefixes[#prefixes + 1] = vim.fn.getcwd()
+
+    for _, prefix in ipairs(prefixes) do
+      local candidate = norm(prefix .. "/" .. rel_path)
+      if is_file(candidate) then
+        source_path_cache[rel_path] = candidate
+        return candidate
+      end
+    end
+
+    source_path_cache[rel_path] = false
+    return nil
+  end
+
+  dap.listeners.before.stackTrace["ue_source_path_rewrite"] = function(_, err, response)
+    if err or not response or not response.stackFrames then return end
+    for _, frame in ipairs(response.stackFrames) do
+      local source = frame.source
+      if source and source.path then
+        local resolved = resolve_source_path(source.path)
+        if resolved then
+          source.path = resolved
+        end
+      end
+    end
   end
   vim.fn.sign_define("DapBreakpoint", { text = "●", texthl = "DiagnosticError" })
   vim.fn.sign_define("DapStopped", { text = "▶", texthl = "DiagnosticInfo", linehl = "CursorLine" })

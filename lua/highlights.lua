@@ -26,6 +26,12 @@ local function set_from(targets, source, extra)
 end
 
 function M.apply()
+  -- ubuntu-terminal defines its own treesitter/LSP semantic groups inline;
+  -- skip the generic overrides so they don't flatten the per-role colours.
+  if vim.g.colors_name == "ubuntu-terminal" then
+    return
+  end
+
   set_from({
     "@keyword",
     "@keyword.function",

@@ -1,78 +1,34 @@
 local M = {}
 
 local DEFAULT = "tokyonight"
+local ALIASES = {
+  ubokai = "unokai",
+  ubuntu = "ubuntu-terminal",
+  catppuccin_frappe = "catppuccin-frappe",
+  catppuccin_latte = "catppuccin-latte",
+  catppuccin_macchiato = "catppuccin-macchiato",
+  catppuccin_mocha = "catppuccin-mocha",
+}
 local picker = nil
 
 local LABELS = {
   tokyonight = "Tokyo Night",
   catppuccin = "Catppuccin",
-  catppuccin_frappe = "Catppuccin Frappe",
-  catppuccin_latte = "Catppuccin Latte",
-  catppuccin_macchiato = "Catppuccin Macchiato",
-  catppuccin_mocha = "Catppuccin Mocha",
-  bamboo = "Bamboo",
-  ["bamboo-vulgaris"] = "Bamboo Vulgaris",
-  ["bamboo-multiplex"] = "Bamboo Multiplex",
-  ["bamboo-light"] = "Bamboo Light",
-  gruvbox = "Gruvbox",
-  kanagawa = "Kanagawa",
-  onedark = "One Dark",
-  onelight = "One Light",
-  onedark_vivid = "One Dark Vivid",
-  onedark_dark = "One Dark Dark",
-  Evergarden = "Evergarden",
-  ["github_light"] = "GitHub Light",
-  ["github_light_default"] = "GitHub Light Default",
-  ["github_light_high_contrast"] = "GitHub Light High Contrast",
-  ["github_light_colorblind"] = "GitHub Light Colorblind",
-  ["github_light_tritanopia"] = "GitHub Light Tritanopia",
-  ["github_dark"] = "GitHub Dark",
-  ["github_dark_default"] = "GitHub Dark Default",
-  ["rose-pine"] = "Rosé Pine",
-  ["rose-pine-moon"] = "Rosé Pine Moon",
-  ["rose-pine-dawn"] = "Rosé Pine Dawn",
-  dayfox = "Dayfox",
-  dawnfox = "Dawnfox",
-  nightfox = "Nightfox",
-  nordfox = "Nordfox",
-  vscode = "VSCode",
+  ["catppuccin-frappe"] = "Catppuccin Frappe",
+  ["catppuccin-latte"] = "Catppuccin Latte",
+  ["catppuccin-macchiato"] = "Catppuccin Macchiato",
+  ["catppuccin-mocha"] = "Catppuccin Mocha",
+  unokai = "Unokai",
   ["ubuntu-terminal"] = "Ubuntu Terminal",
-  habamax = "Habamax",
 }
 
 local PLUGIN_BY_THEME = {
   tokyonight = "tokyonight.nvim",
   catppuccin = "catppuccin",
-  catppuccin_frappe = "catppuccin",
-  catppuccin_latte = "catppuccin",
-  catppuccin_macchiato = "catppuccin",
-  catppuccin_mocha = "catppuccin",
-  bamboo = "bamboo",
-  ["bamboo-vulgaris"] = "bamboo",
-  ["bamboo-multiplex"] = "bamboo",
-  ["bamboo-light"] = "bamboo",
-  gruvbox = "gruvbox",
-  kanagawa = "kanagawa",
-  onedark = "onedarkpro.nvim",
-  onelight = "onedarkpro.nvim",
-  onedark_vivid = "onedarkpro.nvim",
-  onedark_dark = "onedarkpro.nvim",
-  Evergarden = "Evergarden",
-  github_light = "github-nvim-theme",
-  github_light_default = "github-nvim-theme",
-  github_light_high_contrast = "github-nvim-theme",
-  github_light_colorblind = "github-nvim-theme",
-  github_light_tritanopia = "github-nvim-theme",
-  github_dark = "github-nvim-theme",
-  github_dark_default = "github-nvim-theme",
-  ["rose-pine"] = "rose-pine",
-  ["rose-pine-moon"] = "rose-pine",
-  ["rose-pine-dawn"] = "rose-pine",
-  dayfox = "nightfox.nvim",
-  dawnfox = "nightfox.nvim",
-  nightfox = "nightfox.nvim",
-  nordfox = "nightfox.nvim",
-  vscode = "vscode.nvim",
+  ["catppuccin-frappe"] = "catppuccin",
+  ["catppuccin-latte"] = "catppuccin",
+  ["catppuccin-macchiato"] = "catppuccin",
+  ["catppuccin-mocha"] = "catppuccin",
 }
 
 local function state_path()
@@ -80,27 +36,8 @@ local function state_path()
 end
 
 local function normalize_name(name)
-  return vim.trim(tostring(name or ""))
-end
-
-local function runtime_colors()
-  local files = vim.api.nvim_get_runtime_file("colors/*.*", true)
-  local names = {}
-  local seen = {}
-  local vimruntime = normalize_name(vim.env.VIMRUNTIME)
-
-  for _, file in ipairs(files) do
-    file = normalize_name(file)
-    if vimruntime == "" or file:sub(1, #vimruntime) ~= vimruntime then
-      local name = vim.fn.fnamemodify(file, ":t:r")
-      if name ~= "" and not seen[name] then
-        seen[name] = true
-        table.insert(names, name)
-      end
-    end
-  end
-
-  return names
+  name = vim.trim(tostring(name or ""))
+  return ALIASES[name] or name
 end
 
 local function known_colors()
@@ -123,6 +60,20 @@ local function ensure_theme_loaded(name)
   end
 end
 
+local function read_state()
+  local path = state_path()
+  if vim.fn.filereadable(path) ~= 1 then
+    return ""
+  end
+  local lines = vim.fn.readfile(path)
+  return vim.trim(lines[1] or "")
+end
+
+local function write_state(name)
+  vim.fn.mkdir(vim.fn.fnamemodify(state_path(), ":h"), "p")
+  vim.fn.writefile({ name }, state_path())
+end
+
 local function theme_names()
   local ordered = {}
   local seen = {}
@@ -137,12 +88,7 @@ local function theme_names()
   for _, name in ipairs(known_colors()) do
     add(name)
   end
-  for _, name in ipairs(runtime_colors()) do
-    add(name)
-  end
-  local saved = normalize_name(vim.fn.filereadable(state_path()) == 1 and (vim.fn.readfile(state_path())[1] or "") or "")
-
-  add(saved)
+  add(read_state())
 
   if vim.tbl_isempty(ordered) then
     ordered = { DEFAULT }
@@ -182,20 +128,6 @@ local function theme_label(name)
   return label
 end
 
-local function read_state()
-  local path = state_path()
-  if vim.fn.filereadable(path) ~= 1 then
-    return ""
-  end
-  local lines = vim.fn.readfile(path)
-  return vim.trim(lines[1] or "")
-end
-
-local function write_state(name)
-  vim.fn.mkdir(vim.fn.fnamemodify(state_path(), ":h"), "p")
-  vim.fn.writefile({ name }, state_path())
-end
-
 function M.available()
   local items = {}
   for _, name in ipairs(theme_names()) do
@@ -212,7 +144,7 @@ function M.complete()
 end
 
 function M.startup()
-  local saved = read_state()
+  local saved = normalize_name(read_state())
   if saved ~= "" then
     return saved
   end
@@ -248,12 +180,12 @@ function M.current()
   if has_theme(current) then
     return current
   end
-  return M.startup()
+  return normalize_name(M.startup())
 end
 
 function M.apply(name, opts)
   opts = opts or {}
-  name = vim.trim(tostring(name or ""))
+  name = normalize_name(name)
   if name == "" then
     name = DEFAULT
   end

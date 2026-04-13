@@ -8,6 +8,10 @@ local function current_symbol()
   return word
 end
 
+-- ---------------------------------------------------------------------------
+-- Sync helpers (used by the async fallback chain and by references)
+-- ---------------------------------------------------------------------------
+
 local function sync_locations(method, timeout_ms)
   local clients = vim.lsp.get_clients({ bufnr = 0, method = method })
   if not clients or vim.tbl_isempty(clients) then
@@ -19,7 +23,7 @@ local function sync_locations(method, timeout_ms)
     params.context = { includeDeclaration = true }
   end
 
-  local responses = vim.lsp.buf_request_sync(0, method, params, timeout_ms or 800)
+  local responses = vim.lsp.buf_request_sync(0, method, params, timeout_ms or 5000)
   if not responses then
     return nil
   end
@@ -57,42 +61,108 @@ local function jump_to_location(location)
   return true
 end
 
-local function jump_with_lsp(method, title, timeout_ms)
-  local locations = sync_locations(method, timeout_ms)
+-- ---------------------------------------------------------------------------
+-- Async definition: non-blocking LSP request with GTAGS fallback
+-- ---------------------------------------------------------------------------
+
+--- Fire an async LSP request. Calls `on_result(locations)` on the main thread.
+--- `locations` is nil when no client supports the method or the request fails.
+local function async_lsp_request(bufnr, method, on_result)
+  local clients = vim.lsp.get_clients({ bufnr = bufnr, method = method })
+  if not clients or vim.tbl_isempty(clients) then
+    on_result(nil)
+    return
+  end
+
+  local params = vim.lsp.util.make_position_params(0, "utf-8")
+  local pending = #clients
+  local all_items = {}
+
+  for _, client in ipairs(clients) do
+    client:request(method, params, function(err, result)
+      if not err and result and type(result) == "table" then
+        vim.list_extend(all_items, result)
+      end
+      pending = pending - 1
+      if pending == 0 then
+        vim.schedule(function()
+          on_result(#all_items > 0 and all_items or nil)
+        end)
+      end
+    end, bufnr)
+  end
+end
+
+--- Try to jump from a list of locations. Returns true on success.
+local function try_jump(locations, title)
   if not locations or #locations == 0 then
     return false
   end
-
-  if #locations == 1 and jump_to_location(locations[1]) then
-    return true
+  if #locations == 1 then
+    return jump_to_location(locations[1])
   end
-
   return populate_quickfix(title, locations)
 end
 
+--- GTAGS fallback (synchronous, fast enough for local DB).
+local function gtags_fallback(symbol)
+  if not symbol then
+    return false
+  end
+  local ok, ue = pcall(require, "ue")
+  if ok and ue.gtags_definition then
+    return ue.gtags_definition(symbol)
+  end
+  return false
+end
+
+--- Async definition: definition -> declaration -> GTAGS, all non-blocking for
+--- the LSP parts.
 function M.definition()
-  for _, request in ipairs({
-    { method = "textDocument/definition", title = "LSP definitions" },
-    { method = "textDocument/declaration", title = "LSP declarations" },
-  }) do
-    if jump_with_lsp(request.method, request.title, 800) then
+  local symbol = current_symbol()
+  local bufnr = vim.api.nvim_get_current_buf()
+
+  -- Check if any LSP client supports definition at all.
+  local has_def_client = #vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/definition" }) > 0
+
+  if not has_def_client then
+    -- No LSP — skip straight to GTAGS (sync, but very fast).
+    if not gtags_fallback(symbol) then
+      vim.notify("No definition (LSP/GTAGS)", vim.log.levels.INFO)
+    end
+    return
+  end
+
+  -- Async: textDocument/definition
+  async_lsp_request(bufnr, "textDocument/definition", function(locations)
+    if try_jump(locations, "LSP definitions") then
       return
     end
-  end
 
-  local symbol = current_symbol()
-  if not symbol then
-    vim.notify("No definition (LSP/GTAGS)", vim.log.levels.INFO)
-    return
-  end
+    -- Async fallback: textDocument/declaration
+    local has_decl_client = #vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/declaration" }) > 0
+    if has_decl_client then
+      async_lsp_request(bufnr, "textDocument/declaration", function(decl_locations)
+        if try_jump(decl_locations, "LSP declarations") then
+          return
+        end
+        if not gtags_fallback(symbol) then
+          vim.notify("No definition (LSP/GTAGS)", vim.log.levels.INFO)
+        end
+      end)
+      return
+    end
 
-  local ok, ue = pcall(require, "ue")
-  if ok and ue.gtags_definition and ue.gtags_definition(symbol) then
-    return
-  end
-
-  vim.notify("No definition (LSP/GTAGS)", vim.log.levels.INFO)
+    -- No declaration client — GTAGS fallback
+    if not gtags_fallback(symbol) then
+      vim.notify("No definition (LSP/GTAGS)", vim.log.levels.INFO)
+    end
+  end)
 end
+
+-- ---------------------------------------------------------------------------
+-- References (kept synchronous — usually fast enough, and results go to qf)
+-- ---------------------------------------------------------------------------
 
 function M.references()
   local symbol = current_symbol()
@@ -101,7 +171,7 @@ function M.references()
     return
   end
 
-  local locations = sync_locations("textDocument/references", 800)
+  local locations = sync_locations("textDocument/references", 5000)
   if locations and #locations > 0 and populate_quickfix("LSP references: " .. symbol, locations) then
     return
   end

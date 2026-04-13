@@ -243,6 +243,20 @@ end
 
 local function ue_project_grep(query)
   local snacks = require("snacks")
+  local ue = get_ue()
+
+  -- Try cached grep first (avoids NTFS directory traversal)
+  if ue then
+    local grep_opts = { title = "Grep All Code (Engine+Project)" }
+    if type(query) == "string" and query ~= "" then
+      grep_opts.search = query
+    end
+    if ue.cached_grep(grep_opts) then
+      return
+    end
+  end
+
+  -- Fallback: standard directory-based grep
   local opts = with_glob(workspace_opts(), all_globs()) or {}
   if type(query) == "string" and query ~= "" then
     opts.search = query

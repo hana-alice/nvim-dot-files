@@ -436,7 +436,11 @@ local function jump_to_entry(entry)
   if target ~= "" and target ~= current then
     vim.cmd("edit " .. vim.fn.fnameescape(target))
   end
-  vim.api.nvim_win_set_cursor(0, { entry.lnum, math.max((entry.col or 1) - 1, 0) })
+  local max_line = vim.api.nvim_buf_line_count(0)
+  local lnum = math.min(entry.lnum, max_line)
+  local line_text = vim.api.nvim_buf_get_lines(0, lnum - 1, lnum, false)[1] or ""
+  local col = math.min(math.max((entry.col or 1) - 1, 0), #line_text)
+  vim.api.nvim_win_set_cursor(0, { lnum, col })
   return true
 end
 
@@ -1544,6 +1548,47 @@ local function scan_relative_files(root, search_paths)
   end
 
   return lines, nil
+end
+
+-- Async version: calls cb(lines, err) on vim.schedule when done.
+local function scan_relative_files_async(root, search_paths, cb)
+  local fd = first_executable({ "fd", "fdfind" })
+  if not fd then
+    vim.schedule(function() cb(nil, "fd/fdfind not found in PATH") end)
+    return
+  end
+
+  local cmd = { fd, "--type", "f", "--hidden", "--follow" }
+  local found = false
+  for _, search_path in ipairs(search_paths) do
+    if is_dir(join(root, search_path)) then
+      found = true
+      table.insert(cmd, "--search-path")
+      table.insert(cmd, search_path)
+    end
+  end
+
+  if not found then
+    vim.schedule(function() cb({}, nil) end)
+    return
+  end
+
+  local system_opts = { text = true, cwd = root }
+  vim.system(cmd, system_opts, function(result)
+    vim.schedule(function()
+      if result.code ~= 0 then
+        local output = (result.stdout or "") .. (result.stderr or "")
+        cb(nil, output)
+        return
+      end
+      local output = result.stdout or ""
+      local lines = {}
+      for line in output:gmatch("[^\r\n]+") do
+        lines[#lines + 1] = line
+      end
+      cb(lines, nil)
+    end)
+  end)
 end
 
 local function clean_db_dir(dir)
@@ -3854,82 +3899,84 @@ local function prepare_async()
 
   set_prepare_running(true)
 
-  -- ── Step 1: scan files (synchronous, fast) ──────────────────────────
+  -- ── Step 1: scan files (async, avoids freezing UI on NTFS) ──────────
   update("scanning project files...", 5)
-  local project_rel, project_err = scan_relative_files(ctx.project_root, existing_relative_dirs(ctx.project_root, UE_CONST.PROJECT_INDEX_DIRS))
-  if not project_rel then
-    fail(project_err)
-    return
-  end
 
-  update("scanning engine files...", 15)
-  local engine_rel, engine_err = scan_relative_files(ctx.engine_root, UE_CONST.ENGINE_INDEX_DIRS)
-  if not engine_rel then
-    fail(engine_err)
-    return
-  end
-
-  -- ── Step 2: build file lists (synchronous, fast) ────────────────────
-  update("building file lists...", 25)
-  local project_code = filter_gtags_paths(filter_code(project_rel))
-  local engine_code = filter_gtags_paths(filter_code(engine_rel))
-  local workspace_code = {}
-  local workspace_seen = {}
-  local root = workspace_root(ctx)
-
-  for _, path in ipairs(project_code) do
-    local absolute = join(ctx.project_root, path)
-    local relative = relative_to(root, absolute)
-    if not workspace_seen[relative] then
-      workspace_seen[relative] = true
-      table.insert(workspace_code, relative)
+  local project_dirs = existing_relative_dirs(ctx.project_root, UE_CONST.PROJECT_INDEX_DIRS)
+  scan_relative_files_async(ctx.project_root, project_dirs, function(project_rel, project_err)
+    if not project_rel then
+      fail(project_err)
+      return
     end
-  end
 
-  for _, path in ipairs(engine_code) do
-    local absolute = join(ctx.engine_root, path)
-    local relative = relative_to(root, absolute)
-    if not workspace_seen[relative] then
-      workspace_seen[relative] = true
-      table.insert(workspace_code, relative)
-    end
-  end
+    update("scanning engine files...", 15)
+    scan_relative_files_async(ctx.engine_root, UE_CONST.ENGINE_INDEX_DIRS, function(engine_rel, engine_err)
+      if not engine_rel then
+        fail(engine_err)
+        return
+      end
 
-  table.sort(workspace_code)
+      -- ── Step 2: build file lists ──────────────────────────────────────
+      update("building file lists...", 25)
+      local project_code = filter_gtags_paths(filter_code(project_rel))
+      local engine_code = filter_gtags_paths(filter_code(engine_rel))
+      local workspace_code = {}
+      local workspace_seen = {}
+      local root = workspace_root(ctx)
 
-  write_lines(ctx.paths.project_list, project_code)
-  write_lines(ctx.paths.engine_list, engine_code)
-  write_lines(ctx.paths.workspace_list, workspace_code)
+      for _, path in ipairs(project_code) do
+        local absolute = join(ctx.project_root, path)
+        local relative = relative_to(root, absolute)
+        if not workspace_seen[relative] then
+          workspace_seen[relative] = true
+          table.insert(workspace_code, relative)
+        end
+      end
 
-  -- All-types file list (code + config) for cached grep
-  local project_all = filter_gtags_paths(filter_extensions(project_rel, M.FT_ALL))
-  local engine_all = filter_gtags_paths(filter_extensions(engine_rel, M.FT_ALL))
-  local workspace_all = {}
-  local workspace_all_seen = {}
+      for _, path in ipairs(engine_code) do
+        local absolute = join(ctx.engine_root, path)
+        local relative = relative_to(root, absolute)
+        if not workspace_seen[relative] then
+          workspace_seen[relative] = true
+          table.insert(workspace_code, relative)
+        end
+      end
 
-  for _, path in ipairs(project_all) do
-    local absolute = join(ctx.project_root, path)
-    local relative = relative_to(root, absolute)
-    if not workspace_all_seen[relative] then
-      workspace_all_seen[relative] = true
-      table.insert(workspace_all, relative)
-    end
-  end
+      table.sort(workspace_code)
 
-  for _, path in ipairs(engine_all) do
-    local absolute = join(ctx.engine_root, path)
-    local relative = relative_to(root, absolute)
-    if not workspace_all_seen[relative] then
-      workspace_all_seen[relative] = true
-      table.insert(workspace_all, relative)
-    end
-  end
+      write_lines(ctx.paths.project_list, project_code)
+      write_lines(ctx.paths.engine_list, engine_code)
+      write_lines(ctx.paths.workspace_list, workspace_code)
 
-  table.sort(workspace_all)
-  write_lines(ctx.paths.workspace_all_list, workspace_all)
+      -- All-types file list (code + config) for cached grep
+      local project_all = filter_gtags_paths(filter_extensions(project_rel, M.FT_ALL))
+      local engine_all = filter_gtags_paths(filter_extensions(engine_rel, M.FT_ALL))
+      local workspace_all = {}
+      local workspace_all_seen = {}
 
-  -- ── Step 3: build GTAGS (async, slow) ───────────────────────────────
-  update(("indexing %d files with gtags..."):format(#workspace_code), 30)
+      for _, path in ipairs(project_all) do
+        local absolute = join(ctx.project_root, path)
+        local relative = relative_to(root, absolute)
+        if not workspace_all_seen[relative] then
+          workspace_all_seen[relative] = true
+          table.insert(workspace_all, relative)
+        end
+      end
+
+      for _, path in ipairs(engine_all) do
+        local absolute = join(ctx.engine_root, path)
+        local relative = relative_to(root, absolute)
+        if not workspace_all_seen[relative] then
+          workspace_all_seen[relative] = true
+          table.insert(workspace_all, relative)
+        end
+      end
+
+      table.sort(workspace_all)
+      write_lines(ctx.paths.workspace_all_list, workspace_all)
+
+      -- ── Step 3: build GTAGS (async, slow) ─────────────────────────────
+      update(("indexing %d files with gtags..."):format(#workspace_code), 30)
 
   local gtags = first_executable({ "gtags" })
   if not gtags then
@@ -3994,8 +4041,8 @@ local function prepare_async()
         refresh_statusline()
         set_prepare_running(false)
 
-        local summary = ("UEPrepare done: %d project, %d engine, %d GTAGS files"):format(
-          #project_code, #engine_code, #workspace_code
+        local summary = ("UEPrepare done: %d project, %d engine, %d GTAGS, %d grep files"):format(
+          #project_code, #engine_code, #workspace_code, #workspace_all
         )
         if ok_compile then
           summary = summary .. "\ncompile_commands: " .. compile_path
@@ -4015,6 +4062,8 @@ local function prepare_async()
     prepare_jobid = nil
     fail("failed to start gtags process")
   end
+    end) -- end engine scan callback
+  end) -- end project scan callback
 end
 
 function M.prepare_headless()

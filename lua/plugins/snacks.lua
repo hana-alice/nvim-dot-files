@@ -214,6 +214,13 @@ end
 
 local function ue_workspace_files()
   local snacks = require("snacks")
+  local ue = get_ue()
+
+  -- Try cached file list first (avoids NTFS directory traversal)
+  if ue and ue.cached_files({ title = "UE Workspace Code", list_type = "code" }) then
+    return
+  end
+
   local opts = with_ft(workspace_opts(), code_ft())
   if opts then
     opts.title = "UE Workspace Code"
@@ -225,6 +232,12 @@ end
 local function ue_workspace_all_files()
   local snacks = require("snacks")
   local ue = get_ue()
+
+  -- Try cached file list first (avoids NTFS directory traversal)
+  if ue and ue.cached_files({ title = "UE Workspace All Files", list_type = "all" }) then
+    return
+  end
+
   local opts = ue and ue.picker_options({ include_third_party = true }) or workspace_opts() or {}
   opts.title = "UE Workspace All Files"
   return snacks.picker.files(opts)

@@ -9,7 +9,7 @@ local status_cache = {} -- { key = string, value = string, tick = number }
 local dirty_index_roots = {}
 local _engine_root_cache = {} -- dir -> engine_root (or false)
 local _context_cache = {} -- key -> { ctx, ts }
-local _CONTEXT_TTL = 5 -- seconds
+local _CONTEXT_TTL = 30 -- seconds (filesystem walks are expensive on NTFS)
 
 local function trim(value)
   return vim.trim(tostring(value or ""))
@@ -1457,24 +1457,42 @@ local function mark_index_dirty(ctx)
   end
 end
 
+local _index_status_cache = {} -- key -> { token, ts }
+local _INDEX_STATUS_TTL = 30 -- seconds; only changes after UEPrepare or file save
+
 local function index_status_token(ctx)
   if not ctx or not ctx.project_root then
     return "UE?"
+  end
+
+  local key = status_root_key(ctx)
+  local now = vim.uv.hrtime() / 1e9
+  local cached = _index_status_cache[key]
+  if cached and (now - cached.ts) < _INDEX_STATUS_TTL then
+    -- dirty flag can change without filesystem change
+    if dirty_index_roots[key] then
+      return "IDX!"
+    end
+    return cached.token
   end
 
   local outputs = index_output_paths(ctx)
 
   for _, path in ipairs(outputs) do
     if file_mtime(path) <= 0 then
+      _index_status_cache[key] = { token = "IDX?", ts = now }
       return "IDX?"
     end
   end
   if not db_ready(ctx.paths.workspace_db) then
+    _index_status_cache[key] = { token = "IDX?", ts = now }
     return "IDX?"
   end
-  if dirty_index_roots[status_root_key(ctx)] then
+  if dirty_index_roots[key] then
+    _index_status_cache[key] = { token = "IDX!", ts = now }
     return "IDX!"
   end
+  _index_status_cache[key] = { token = "IDX", ts = now }
   return "IDX"
 end
 
@@ -1488,6 +1506,7 @@ end
 local function invalidate_status_cache()
   status_cache = {}
   _context_cache = {}
+  _index_status_cache = {}
 end
 
 local function refresh_statusline()
@@ -2903,7 +2922,10 @@ local function workspace_root(ctx)
     if root ~= "" then
       return root
     end
-    return ctx.project_root
+    -- No common ancestor (e.g. different drives on Windows).
+    -- Fall back to engine_root because the GTAGS DB and most source
+    -- files live under the engine tree.
+    return ctx.engine_root
   end
   return ctx.engine_root
 end
@@ -2988,6 +3010,70 @@ function M.cached_grep_file_list(opts)
   end
 
   return { files = files, root = root }
+end
+
+-- Read cached code-only file list for files picker.
+-- Returns { files = {abs_path, ...}, root = workspace_root } or nil.
+function M.cached_code_file_list(opts)
+  local ctx, err = resolve_context(opts)
+  if not ctx then
+    return nil, err
+  end
+
+  local list_path = ctx.paths.workspace_list
+  if not is_file(list_path) then
+    return nil, "No cached file list (run :UEPrepare first)"
+  end
+
+  local lines = vim.fn.readfile(list_path)
+  if #lines == 0 then
+    return nil, "Cached file list is empty"
+  end
+
+  local root = workspace_root(ctx)
+  local files = {}
+  for _, line in ipairs(lines) do
+    line = trim(line)
+    if line ~= "" then
+      if line:match("^[A-Za-z]:") or line:match("^/") then
+        files[#files + 1] = line
+      else
+        files[#files + 1] = join(root, line)
+      end
+    end
+  end
+
+  return { files = files, root = root }
+end
+
+-- Files picker using cached file list (avoids fd directory traversal on NTFS).
+-- list_type: "all" (default) or "code"
+function M.cached_files(opts)
+  opts = opts or {}
+  local list_type = opts.list_type or "all"
+  local cache = list_type == "code" and M.cached_code_file_list() or M.cached_grep_file_list()
+  if not cache then
+    return nil
+  end
+
+  local snacks = require("snacks")
+  local items = {}
+  for _, file in ipairs(cache.files) do
+    items[#items + 1] = {
+      file = file,
+      text = file,
+    }
+  end
+
+  snacks.picker.pick({
+    title = opts.title or "Find Files (cached)",
+    source = "files",
+    items = items,
+    format = "file",
+    layout = opts.layout,
+  })
+
+  return true
 end
 
 -- Batched grep using cached file list.
@@ -6158,7 +6244,7 @@ function M.setup()
       -- Debounce: defer statusline refresh so rapid buffer switches
       -- (picker confirm, DAP UI open) don't block the event loop
       statusline_timer:stop()
-      statusline_timer:start(50, 0, vim.schedule_wrap(refresh_statusline))
+      statusline_timer:start(500, 0, vim.schedule_wrap(refresh_statusline))
     end,
   })
   vim.api.nvim_create_autocmd("BufWritePost", {

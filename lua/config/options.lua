@@ -3,8 +3,8 @@ vim.g.autoformat = false
 
 local opt = vim.opt
 
--- Keep sessions from silently restoring a different cwd.
-vim.opt.sessionoptions = { "buffers", "tabpages", "winsize", "help", "globals", "skiprtp", "folds" }
+-- Keep sessions from silently restoring a different cwd without replaying fold state.
+vim.opt.sessionoptions = { "buffers", "tabpages", "winsize", "help", "globals", "skiprtp" }
 vim.opt.list = false
 opt.expandtab = true
 opt.shiftwidth = 4

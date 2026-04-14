@@ -1,7 +1,7 @@
 local M = {}
 
 local state = {
-  last = "git_status",
+  last = "buffers",
   transition_id = 0,
   menu = {
     buf = nil,

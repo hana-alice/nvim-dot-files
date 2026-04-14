@@ -393,6 +393,7 @@ return {
         replace_netrw = false,
       })
       opts.picker = opts.picker or {}
+      opts.picker.layout = vim.tbl_deep_extend("force", { preset = "vscode" }, opts.picker.layout or {})
       opts.picker.actions = vim.tbl_deep_extend("force", opts.picker.actions or {}, {
         paste_clipboard = paste_picker_clipboard,
         pin_sidebar_qflist = pin_sidebar_qflist,

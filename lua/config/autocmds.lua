@@ -70,6 +70,7 @@ if is_windows then
   -- in the buffer on Windows and makes gitsigns think many clean lines changed.
   vim.api.nvim_create_autocmd("BufReadPost", {
     group = mixed_eol_group,
+    nested = true,
     callback = function(args)
       local bufnr = args.buf
       if vim.b[bufnr].ue_mixed_eol_checked then
@@ -87,7 +88,9 @@ if is_windows then
       end
 
       local view = vim.fn.winsaveview()
-      vim.cmd("silent keepalt keepjumps noautocmd edit ++ff=dos")
+      -- Re-read with the correct fileformat and let the normal BufRead/FileType
+      -- pipeline run again. The buffer-local guard above prevents a reload loop.
+      vim.cmd("silent keepalt keepjumps edit ++ff=dos")
       pcall(vim.fn.winrestview, view)
     end,
   })

@@ -39,6 +39,7 @@ end
 
 cleanup_stale_shada_tmp()
 
+require("config.neovide").setup()
 require("config.snacks_global").setup()
 require("config.lazy")
 require("config.options")

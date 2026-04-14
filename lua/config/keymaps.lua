@@ -64,6 +64,50 @@ local function open_visual_substitute()
   end)
 end
 
+local function lsp_supports(buf, method)
+  local get_clients = vim.lsp.get_clients or vim.lsp.get_active_clients
+  for _, client in ipairs(get_clients({ bufnr = buf })) do
+    if type(client.supports_method) == "function" then
+      local ok, supported = pcall(client.supports_method, client, method, buf)
+      if not ok then
+        ok, supported = pcall(client.supports_method, client, method)
+      end
+      if ok and supported then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+local function open_symbol_picker(opts)
+  opts = opts or {}
+  return function()
+    local snacks = require("snacks")
+    local buf = vim.api.nvim_get_current_buf()
+    local has_name = vim.api.nvim_buf_get_name(buf) ~= ""
+
+    if opts.workspace then
+      if lsp_supports(buf, "workspace/symbol") then
+        return snacks.picker.lsp_workspace_symbols({ filter = LazyVim.config.kind_filter })
+      end
+      vim.notify("No workspace symbols provider", vim.log.levels.WARN)
+      return
+    end
+
+    if lsp_supports(buf, "textDocument/documentSymbol") then
+      return snacks.picker.lsp_symbols({ filter = LazyVim.config.kind_filter })
+    end
+    if has_name then
+      local ok = pcall(snacks.picker.treesitter, { filter = LazyVim.config.kind_filter })
+      if ok then
+        return
+      end
+    end
+    vim.notify("No document symbols available", vim.log.levels.WARN)
+  end
+end
+
 local function close_current_target()
   local win = vim.api.nvim_get_current_win()
   local buf = vim.api.nvim_get_current_buf()
@@ -184,6 +228,8 @@ map({ "n", "x" }, "<leader>sY", live_grep_word_with({
 }), { desc = "Search: Live grep word/selection (cwd)" })
 map("n", "<leader>sr", open_word_substitute, { desc = "Search: Replace current word in buffer" })
 map("x", "<leader>sr", open_visual_substitute, { desc = "Search: Replace selection in range" })
+map("n", "<leader>ss", open_symbol_picker(), { desc = "Search: Symbols" })
+map("n", "<leader>sS", open_symbol_picker({ workspace = true }), { desc = "Search: Workspace Symbols" })
 map("n", "<leader>bc", close_current_target, { desc = "Buffer/Window: Smart close current target" })
 map("n", "<leader>bn", "<cmd>confirm enew<cr>", { desc = "Buffer: New empty buffer" })
 map("n", "<leader>ub", "<cmd>UEBuild<cr>", { desc = "UE: Build (platform from UESetPlatform)" })
@@ -235,4 +281,11 @@ apply_ue_runtime_overrides()
 vim.api.nvim_create_autocmd("User", {
   pattern = "VeryLazy",
   callback = apply_ue_runtime_overrides,
+})
+
+vim.api.nvim_create_autocmd("LspAttach", {
+  callback = function(args)
+    map("n", "<leader>ss", open_symbol_picker(), { buffer = args.buf, desc = "Search: Symbols" })
+    map("n", "<leader>sS", open_symbol_picker({ workspace = true }), { buffer = args.buf, desc = "Search: Workspace Symbols" })
+  end,
 })

@@ -131,7 +131,7 @@ local function start_git_refresh(root, force)
   cache.error = nil
   cache.force_refresh = false
 
-  local cmd = { "git", "-C", root, "status", "--porcelain=v1", "--untracked-files=normal" }
+  local cmd = { "git", "-C", root, "status", "--porcelain=v1", "--untracked-files=no" }
   if vim.system then
     vim.system(cmd, { text = true }, function(result)
       vim.schedule(function()

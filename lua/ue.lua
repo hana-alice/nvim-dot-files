@@ -2930,6 +2930,53 @@ local function workspace_root(ctx)
   return ctx.engine_root
 end
 
+local function cached_file_list_info(opts, list_type)
+  local ctx, err = resolve_context(opts)
+  if not ctx then
+    return nil, err
+  end
+
+  local list_path = list_type == "code" and ctx.paths.workspace_list or ctx.paths.workspace_all_list
+  if list_type == "all" and not is_file(list_path) and is_file(ctx.paths.workspace_list) then
+    -- Older caches may not have workspace_all.files yet. Fall back to the
+    -- code-only list so picker startup stays fast until :UEPrepare refreshes.
+    list_path = ctx.paths.workspace_list
+  end
+  if not is_file(list_path) then
+    return nil, "No cached file list (run :UEPrepare first)"
+  end
+
+  return {
+    list_path = list_path,
+    root = workspace_root(ctx),
+  }
+end
+
+local function read_cached_paths(list_path, root)
+  local lines = vim.fn.readfile(list_path)
+  if #lines == 0 then
+    return nil, "Cached file list is empty"
+  end
+
+  local files = {}
+  for _, line in ipairs(lines) do
+    line = trim(line)
+    if line ~= "" then
+      if is_absolute_path(line) then
+        files[#files + 1] = line
+      else
+        files[#files + 1] = join(root, line)
+      end
+    end
+  end
+
+  if #files == 0 then
+    return nil, "Cached file list is empty"
+  end
+
+  return files
+end
+
 function M.picker_options(opts)
   local ctx, err = resolve_context(opts)
   if not ctx then
@@ -2980,97 +3027,85 @@ end
 -- Read cached file list for fast grep (avoids NTFS directory traversal).
 -- Returns { files = {abs_path, ...}, root = workspace_root } or nil.
 function M.cached_grep_file_list(opts)
-  local ctx, err = resolve_context(opts)
-  if not ctx then
+  local info, err = cached_file_list_info(opts, "all")
+  if not info then
     return nil, err
   end
 
-  local list_path = ctx.paths.workspace_all_list
-  if not is_file(list_path) then
-    return nil, "No cached file list (run :UEPrepare first)"
+  local files, read_err = read_cached_paths(info.list_path, info.root)
+  if not files then
+    return nil, read_err
   end
 
-  local lines = vim.fn.readfile(list_path)
-  if #lines == 0 then
-    return nil, "Cached file list is empty"
-  end
-
-  local root = workspace_root(ctx)
-  local files = {}
-  for _, line in ipairs(lines) do
-    line = trim(line)
-    if line ~= "" then
-      -- Lines may be absolute (cross-drive) or relative to workspace root
-      if line:match("^[A-Za-z]:") or line:match("^/") then
-        files[#files + 1] = line
-      else
-        files[#files + 1] = join(root, line)
-      end
-    end
-  end
-
-  return { files = files, root = root }
+  return { files = files, root = info.root, list_path = info.list_path }
 end
 
 -- Read cached code-only file list for files picker.
 -- Returns { files = {abs_path, ...}, root = workspace_root } or nil.
 function M.cached_code_file_list(opts)
-  local ctx, err = resolve_context(opts)
-  if not ctx then
+  local info, err = cached_file_list_info(opts, "code")
+  if not info then
     return nil, err
   end
 
-  local list_path = ctx.paths.workspace_list
-  if not is_file(list_path) then
-    return nil, "No cached file list (run :UEPrepare first)"
+  local files, read_err = read_cached_paths(info.list_path, info.root)
+  if not files then
+    return nil, read_err
   end
 
-  local lines = vim.fn.readfile(list_path)
-  if #lines == 0 then
-    return nil, "Cached file list is empty"
-  end
-
-  local root = workspace_root(ctx)
-  local files = {}
-  for _, line in ipairs(lines) do
-    line = trim(line)
-    if line ~= "" then
-      if line:match("^[A-Za-z]:") or line:match("^/") then
-        files[#files + 1] = line
-      else
-        files[#files + 1] = join(root, line)
-      end
-    end
-  end
-
-  return { files = files, root = root }
+  return { files = files, root = info.root, list_path = info.list_path }
 end
 
--- Files picker using cached file list (avoids fd directory traversal on NTFS).
+-- Files picker using cached file list (avoids fd traversal and streams results into Snacks).
 -- list_type: "all" (default) or "code"
 function M.cached_files(opts)
   opts = opts or {}
   local list_type = opts.list_type or "all"
-  local cache = list_type == "code" and M.cached_code_file_list() or M.cached_grep_file_list()
-  if not cache then
+  local info = cached_file_list_info(opts, list_type == "code" and "code" or "all")
+  if not info then
+    return nil
+  end
+
+  local rg = first_executable({ "rg" })
+  if not rg then
     return nil
   end
 
   local snacks = require("snacks")
-  local items = {}
-  for _, file in ipairs(cache.files) do
-    items[#items + 1] = {
-      file = file,
-      text = file,
-    }
+  local ok, proc = pcall(require, "snacks.picker.source.proc")
+  if not ok then
+    return nil
   end
 
   snacks.picker.pick({
     title = opts.title or "Find Files (cached)",
     source = "files",
-    items = items,
     format = "file",
     layout = opts.layout,
+    finder = function(_, ctx)
+      return proc.proc(
+        ctx:opts({
+          notify = false,
+          cmd = rg,
+          args = { "--no-messages", "--color", "never", "--line-buffered", "--no-filename", "^", info.list_path },
+          transform = function(item)
+            local text = trim(item.text)
+            if text == "" then
+              return false
+            end
+            item.text = text
+            item.file = text
+            if is_absolute_path(text) then
+              item.cwd = nil
+            else
+              item.cwd = info.root
+            end
+            return item
+          end,
+        }),
+        ctx
+      )
+    end,
   })
 
   return true
@@ -3081,15 +3116,40 @@ end
 -- avoiding NTFS directory traversal (~20x faster on Windows).
 function M.cached_grep(opts)
   opts = opts or {}
-  local cache = M.cached_grep_file_list()
-  if not cache then
+  local info = cached_file_list_info(opts, "all")
+  if not info then
     -- Fallback: standard directory-based grep
     return nil
   end
 
   local snacks = require("snacks")
-  local files = cache.files
+  local rg = first_executable({ "rg" })
+  if not rg then
+    return nil
+  end
+
+  local ok, proc = pcall(require, "snacks.picker.source.proc")
+  if not ok then
+    return nil
+  end
+
+  local files
+  local files_ready = false
+  local function ensure_files()
+    if not files_ready then
+      files = read_cached_paths(info.list_path, info.root) or false
+      files_ready = true
+    end
+    return files ~= false and files or nil
+  end
+
   local batch_size = 200
+  local uv = vim.uv or vim.loop
+  local spawn_arg_limit = uv and uv.os_uname().sysname == "Windows_NT" and 28000 or nil
+
+  local function estimate_arg_cost(arg)
+    return #tostring(arg) + 3
+  end
 
   snacks.picker.pick({
     title = opts.title or "Grep All Code (cached)",
@@ -3102,37 +3162,46 @@ function M.cached_grep(opts)
         return function() end
       end
 
+      local loaded_files = ensure_files()
+      if not loaded_files then
+        return function() end
+      end
+
       return function(cb)
-        for batch_start = 1, #files, batch_size do
-          local batch_end = math.min(batch_start + batch_size - 1, #files)
+        local base_args = {
+          "--color=never",
+          "--no-heading",
+          "--with-filename",
+          "--line-number",
+          "--column",
+          "--smart-case",
+          "--max-columns=500",
+          "--max-columns-preview",
+          "-0",
+          "--",
+          pattern,
+        }
 
-          local args = {
-            "--color=never",
-            "--no-heading",
-            "--with-filename",
-            "--line-number",
-            "--column",
-            "--smart-case",
-            "--max-columns=500",
-            "--max-columns-preview",
-            "-0",
-            "--",
-            pattern,
-          }
-          for i = batch_start, batch_end do
-            args[#args + 1] = files[i]
-          end
+        -- Windows CreateProcess hits a ~32k command-line ceiling, so split
+        -- batches by both file count and estimated argument length.
+        local args = vim.deepcopy(base_args)
+        local current_arg_cost = 0
+        for _, arg in ipairs(base_args) do
+          current_arg_cost = current_arg_cost + estimate_arg_cost(arg)
+        end
+        local current_batch_size = 0
 
-          local ok, proc = pcall(require, "snacks.picker.source.proc")
-          if not ok then
+        local function flush_batch()
+          if current_batch_size == 0 then
             return
           end
 
+          local batch_args = args
           proc.proc(
-            ctx:opts({
+            {
               notify = false,
-              cmd = "rg",
-              args = args,
+              cmd = rg,
+              args = batch_args,
               transform = function(item)
                 local file_sep = item.text:find("\0")
                 if not file_sep then
@@ -3149,10 +3218,31 @@ function M.cached_grep(opts)
                 item.file = file
                 return item
               end,
-            }),
+            },
             ctx
           )(cb)
+
+          args = vim.deepcopy(base_args)
+          current_arg_cost = 0
+          for _, arg in ipairs(base_args) do
+            current_arg_cost = current_arg_cost + estimate_arg_cost(arg)
+          end
+          current_batch_size = 0
         end
+
+        for _, file in ipairs(loaded_files) do
+          local file_cost = estimate_arg_cost(file)
+          local exceeds_batch_size = current_batch_size >= batch_size
+          local exceeds_arg_limit = spawn_arg_limit and (current_arg_cost + file_cost) > spawn_arg_limit
+          if current_batch_size > 0 and (exceeds_batch_size or exceeds_arg_limit) then
+            flush_batch()
+          end
+          args[#args + 1] = file
+          current_arg_cost = current_arg_cost + file_cost
+          current_batch_size = current_batch_size + 1
+        end
+
+        flush_batch()
       end
     end,
   })

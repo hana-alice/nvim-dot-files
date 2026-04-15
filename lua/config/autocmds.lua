@@ -17,6 +17,7 @@
 -- before doing so. The BufEnter handler honours this flag and skips the
 -- scheduled winrestview so the jump target is not overwritten.
 local buf_views = {}
+local last_left_buf = nil -- track the buffer we left
 local view_group = vim.api.nvim_create_augroup("PreserveBufferView", { clear = true })
 
 vim.api.nvim_create_autocmd("BufLeave", {
@@ -25,6 +26,12 @@ vim.api.nvim_create_autocmd("BufLeave", {
     local buf = vim.api.nvim_get_current_buf()
     if vim.bo[buf].buftype == "" then
       buf_views[buf] = vim.fn.winsaveview()
+      last_left_buf = buf
+    else
+      -- Leaving a special buffer (picker, sidebar, terminal, etc.)
+      -- → the next BufEnter should NOT restore, because the user is
+      --   returning from a jump action, not manually switching buffers.
+      last_left_buf = nil
     end
   end,
 })
@@ -32,8 +39,7 @@ vim.api.nvim_create_autocmd("BufLeave", {
 vim.api.nvim_create_autocmd("BufEnter", {
   group = view_group,
   callback = function()
-    -- Check skip flag synchronously (before vim.schedule) so there is no
-    -- race with other scheduled callbacks like snacks picker jump.
+    -- Skip flag (set by picker jump wrapper, goto-definition, etc.)
     if vim.g._restore_view_skip then
       vim.g._restore_view_skip = nil
       return
@@ -41,20 +47,31 @@ vim.api.nvim_create_autocmd("BufEnter", {
 
     local buf = vim.api.nvim_get_current_buf()
     local view = buf_views[buf]
-    if view and vim.bo[buf].buftype == "" then
-      vim.schedule(function()
-        -- Re-check: another skip may have been set between the autocmd
-        -- firing and this scheduled callback running.
-        if vim.g._restore_view_skip then
-          vim.g._restore_view_skip = nil
-          return
-        end
-        if vim.api.nvim_get_current_buf() ~= buf then
-          return
-        end
-        pcall(vim.fn.winrestview, view)
-      end)
+
+    -- Only restore if we came from another normal buffer (buftype="").
+    -- If last_left_buf is nil, we came from a special buffer (sidebar,
+    -- picker float, terminal) → skip restore so jump targets stick.
+    -- Also skip if we're "returning" to the same buffer we left (e.g.
+    -- picker opened and closed on the same file → symbol jump).
+    local should_restore = view
+      and vim.bo[buf].buftype == ""
+      and last_left_buf ~= nil
+      and last_left_buf ~= buf
+
+    if not should_restore then
+      return
     end
+
+    vim.schedule(function()
+      if vim.g._restore_view_skip then
+        vim.g._restore_view_skip = nil
+        return
+      end
+      if vim.api.nvim_get_current_buf() ~= buf then
+        return
+      end
+      pcall(vim.fn.winrestview, view)
+    end)
   end,
 })
 

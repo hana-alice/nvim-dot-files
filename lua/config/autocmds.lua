@@ -82,7 +82,7 @@ vim.api.nvim_create_autocmd("BufDelete", {
   end,
 })
 
-local is_windows = vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1
+local is_windows = require("utils.platform").is_windows
 
 if is_windows then
   local mixed_eol_group = vim.api.nvim_create_augroup("UEMixedEOLReload", { clear = true })

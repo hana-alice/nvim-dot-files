@@ -131,12 +131,9 @@ function M.setup()
     group = group,
     callback = M.apply,
   })
-  vim.api.nvim_create_autocmd("User", {
-    group = group,
-    pattern = "VeryLazy",
-    callback = M.apply,
-  })
 
+  -- One deferred initial call to apply highlights after the startup colorscheme
+  -- has loaded. The ColorScheme autocmd handles all subsequent theme changes.
   vim.schedule(M.apply)
 end
 

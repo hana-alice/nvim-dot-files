@@ -151,6 +151,11 @@ local function close_current_target()
   Snacks.bufdelete({ buf = buf })
 end
 
+-- Comment operator using Neovim's built-in vim._comment module.
+-- NOTE: vim._comment is an internal API (underscore-prefixed). We use it here
+-- to get operatorfunc-based gc/gcc without depending on a third-party comment
+-- plugin. If Neovim ever removes/renames it, replace with gc/gcc from
+-- mini.comment or Comment.nvim.  Requires Neovim >= 0.10.
 local function comment_operator()
   return require("vim._comment").operator()
 end
@@ -252,18 +257,11 @@ map("n", "<leader>ss", open_symbol_picker(), { desc = "Search: Symbols" })
 map("n", "<leader>sS", open_symbol_picker({ workspace = true }), { desc = "Search: Workspace Symbols" })
 map("n", "<leader>bc", close_current_target, { desc = "Buffer/Window: Smart close current target" })
 map("n", "<leader>bn", "<cmd>confirm enew<cr>", { desc = "Buffer: New empty buffer" })
-map("n", "<leader>ub", "<cmd>UEBuild<cr>", { desc = "UE: Build (platform from UESetPlatform)" })
+-- Static UE keymaps. Keys that need {nowait=true} are set by
+-- apply_ue_runtime_overrides() on VeryLazy (see below).
 map("n", "<leader>uB", "<cmd>UEPrepare<cr>", { desc = "UE: Prepare symbols + compile_commands" })
-map("n", "<leader>ue", "<cmd>UEPrepare<cr>", { desc = "UE: Prepare symbols + compile_commands" })
 map("n", "<leader>uc", "<cmd>UEExportCompileCommands<cr>", { desc = "UE: Export compile_commands" })
-map("n", "<leader>ul", "<cmd>UELaunch<cr>", { desc = "UE: Launch app (no debugger)" })
-map("n", "<leader>uL", "<cmd>UELogToggle<cr>", { desc = "UE: Toggle app log" })
-map("n", "<leader>ug", "<cmd>UELogToggle<cr>", { desc = "UE: Toggle app log" })
-map("n", "<leader>uD", "<cmd>UEDebugLogToggle<cr>", { desc = "UE: Toggle Windows debug log" })
-map("n", "<leader>uv", "<cmd>UEDebugLogToggle<cr>", { desc = "UE: Toggle Windows debug log" })
-map("n", "<leader>up", "<cmd>UEPaths<cr>", { desc = "UE: Show paths" })
 map("n", "<leader>uP", "<cmd>UESetProject<cr>", { desc = "UE: Set project" })
-map("n", "<leader>uj", "<cmd>UESetProject<cr>", { desc = "UE: Set project" })
 map("n", "<leader>ut", "<cmd>ThemePicker<cr>", { desc = "UI: Theme picker" })
 map("n", "<leader>va", sidebar_pick, { desc = "Sidebar: Choose view" })
 map("n", "<leader>vv", sidebar_toggle(), { desc = "Sidebar: Toggle last view" })
@@ -292,14 +290,13 @@ map("n", "<leader>di", "<cmd>UEAndroidDAPStepIn<cr>", { desc = "DAP: Step In" })
 map("n", "<leader>do", "<cmd>UEAndroidDAPStepOut<cr>", { desc = "DAP: Step Out" })
 map("n", "<leader>du", "<cmd>UEAndroidDAPToggleUI<cr>", { desc = "DAP: Toggle UI" })
 map("n", "<leader>dr", "<cmd>UEAndroidDAPREPL<cr>", { desc = "DAP: Toggle REPL" })
-map("n", "<leader>dR", "<cmd>UEResetLayout<cr>", { desc = "Reset Layout (DAP or default)" })
-map("n", "<leader>dL", "<cmd>UEAndroidDAPLaunch<cr>", { desc = "DAP: Android Launch Debug" })
 map("n", "<leader>ui", "<cmd>UEInstallAndroid<cr>", { desc = "UE: Install APK to device" })
 
-apply_ue_runtime_overrides()
-
+-- Deferred: apply {nowait=true} overrides once LazyVim has finished loading
+-- its own <leader>u* mappings, so ours take priority without delay.
 vim.api.nvim_create_autocmd("User", {
   pattern = "VeryLazy",
+  once = true,
   callback = apply_ue_runtime_overrides,
 })
 

@@ -23,8 +23,9 @@ return {
       opts.highlight = opts.highlight or {}
       opts.highlight.enable = true
       opts.indent = opts.indent or {}
-      opts.indent.enable = true
-      opts.auto_install = true
-    end,
+     opts.indent.enable = true
+     opts.auto_install = true
+     return opts
+   end,
   },
 }

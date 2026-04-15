@@ -2,7 +2,7 @@
 vim.g.mapleader = " "
 vim.g.maplocalleader = " "
 
-if vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1 then
+if require("utils.platform").is_windows then
   local localappdata = vim.env.LOCALAPPDATA
   if localappdata and localappdata ~= "" then
     local base = localappdata:gsub("\\", "/") .. "/nvim-main"
@@ -40,10 +40,9 @@ end
 cleanup_stale_shada_tmp()
 
 require("config.neovide").setup()
-require("config.snacks_global").setup()
 require("config.lazy")
-require("config.options")
-require("config.autocmds")
-require("config.keymaps")
+-- NOTE: config.options / config.autocmds / config.keymaps are auto-loaded by
+-- LazyVim (options before lazy.setup, autocmds+keymaps on VeryLazy). Do NOT
+-- require them here to avoid double execution.
 require("config.windows").setup()
 require("ue").setup()

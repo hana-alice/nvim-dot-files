@@ -35,7 +35,10 @@ local function sync_locations(method, timeout_ms)
     return nil
   end
 
-  local params = vim.lsp.util.make_position_params(0, "utf-8")
+  -- Use the first client's offset_encoding so position params match what the
+  -- server expects (e.g. clangd uses utf-16, not utf-8).
+  local encoding = clients[1].offset_encoding or "utf-16"
+  local params = vim.lsp.util.make_position_params(0, encoding)
   if method == "textDocument/references" then
     params.context = { includeDeclaration = true }
   end
@@ -93,7 +96,9 @@ local function async_lsp_request(bufnr, method, on_result)
     return
   end
 
-  local params = vim.lsp.util.make_position_params(0, "utf-8")
+  -- Use the first client's offset_encoding for position params.
+  local encoding = clients[1].offset_encoding or "utf-16"
+  local params = vim.lsp.util.make_position_params(0, encoding)
   local pending = #clients
   local all_items = {}
 

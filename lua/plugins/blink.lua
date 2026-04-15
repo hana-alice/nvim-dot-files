@@ -11,11 +11,12 @@ return {
         LazyVim.cmp.map({ "snippet_forward", "ai_nes", "ai_accept" }),
         "fallback",
       }
-      opts.keymap["<S-Tab>"] = {
-        "select_prev",
-        "snippet_backward",
-        "fallback",
-      }
-    end,
+     opts.keymap["<S-Tab>"] = {
+       "select_prev",
+       "snippet_backward",
+       "fallback",
+     }
+     return opts
+   end,
   },
 }

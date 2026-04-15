@@ -1,6 +1,6 @@
 local M = {}
 
-local is_windows = vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1
+local is_windows = require("utils.platform").is_windows
 
 local function current_cwd()
   if vim.uv and vim.uv.cwd then
@@ -210,9 +210,6 @@ function M.setup()
   if not is_windows then
     return
   end
-
-  _G.ue_term_buf = _G.ue_term_buf or nil
-  _G.ue_term_win = _G.ue_term_win or nil
 
   setup_options()
   setup_keymaps()

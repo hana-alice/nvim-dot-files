@@ -24,9 +24,10 @@ return {
       })
     end,
     opts = function(_, opts)
-      opts.colorscheme = function()
-        require("theme").load_startup()
-      end
-    end,
+     opts.colorscheme = function()
+       require("theme").load_startup()
+     end
+     return opts
+   end,
   },
 }

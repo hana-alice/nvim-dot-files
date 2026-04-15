@@ -14,7 +14,7 @@ local function path_sep()
 end
 
 local function path_join(...)
-  return table.concat(vim.tbl_flatten({ ... }), path_sep())
+  return table.concat(vim.iter({ ... }):flatten():totable(), path_sep())
 end
 
 local function normalize_log_dir(path)

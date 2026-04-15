@@ -59,7 +59,7 @@ local function startinsert_in_window(win)
 end
 
 local function join(...)
-  return norm(table.concat(vim.tbl_flatten({ ... }), "/"))
+  return norm(table.concat(vim.iter({ ... }):flatten():totable(), "/"))
 end
 
 local function dirname(path)
@@ -4032,7 +4032,7 @@ local function prepare()
 end
 
 
-local function append_job_output(lines, data)
+local function collect_trimmed_lines(lines, data)
   for _, line in ipairs(data or {}) do
     line = trim(line)
     if line ~= "" then
@@ -4199,7 +4199,7 @@ local function prepare_async()
   prepare_jobid = vim.fn.jobstart(gtags_cmd, {
     cwd = gtags_cwd,
     on_stdout = function(_, data)
-      append_job_output(gtags_output, data)
+      collect_trimmed_lines(gtags_output, data)
     end,
     on_stderr = function(_, data)
       for _, line in ipairs(data or {}) do
@@ -4620,7 +4620,9 @@ local function request_dap_continue(dap)
   return false
 end
 
-local function to_windows_path(p)
+-- Simple slash-to-backslash for paths that are already Windows-native (no WSL
+-- conversion needed).  Used by DAP config builders below.
+local function slash_to_backslash(p)
   if not p or p == "" then return nil end
   return (tostring(p):gsub("/", "\\"))
 end
@@ -5118,16 +5120,16 @@ function M.android_dap_attach()
   local dap_port = 5039
   local attach_state = {
     package_name = package_name,
-    symbol_lib = to_windows_path(symbol_lib) or symbol_lib,
-    original_symbol_lib = to_windows_path(original_symbol_lib) or original_symbol_lib,
-    lldb_server_path = to_windows_path(as_lldb) or as_lldb,
-    project_root = to_windows_path(project_root) or project_root,
-    engine_root = to_windows_path(engine_root) or engine_root,
-    adb = to_windows_path(vim.fn.exepath("adb")) or "adb",
+    symbol_lib = slash_to_backslash(symbol_lib) or symbol_lib,
+    original_symbol_lib = slash_to_backslash(original_symbol_lib) or original_symbol_lib,
+    lldb_server_path = slash_to_backslash(as_lldb) or as_lldb,
+    project_root = slash_to_backslash(project_root) or project_root,
+    engine_root = slash_to_backslash(engine_root) or engine_root,
+    adb = slash_to_backslash(vim.fn.exepath("adb")) or "adb",
     port = dap_port,
-    pid_file = to_windows_path(tmpdir .. "/ue_dap_pid.txt"),
-    serial_file = to_windows_path(tmpdir .. "/ue_dap_serial.txt"),
-    exec_search_paths = { to_windows_path(vim.fn.fnamemodify(symbol_lib, ":h")) },
+    pid_file = slash_to_backslash(tmpdir .. "/ue_dap_pid.txt"),
+    serial_file = slash_to_backslash(tmpdir .. "/ue_dap_serial.txt"),
+    exec_search_paths = { slash_to_backslash(vim.fn.fnamemodify(symbol_lib, ":h")) },
     source_map = {},
   }
   if engine_root ~= "" then
@@ -5339,16 +5341,16 @@ function M.android_dap_launch()
   local dap_port = 5039
   local attach_state = {
     package_name = package_name,
-    symbol_lib = to_windows_path(symbol_lib) or symbol_lib,
-    original_symbol_lib = to_windows_path(original_symbol_lib) or original_symbol_lib,
-    lldb_server_path = to_windows_path(as_lldb) or as_lldb,
-    project_root = to_windows_path(project_root) or project_root,
-    engine_root = to_windows_path(engine_root) or engine_root,
-    adb = to_windows_path(vim.fn.exepath("adb")) or "adb",
+    symbol_lib = slash_to_backslash(symbol_lib) or symbol_lib,
+    original_symbol_lib = slash_to_backslash(original_symbol_lib) or original_symbol_lib,
+    lldb_server_path = slash_to_backslash(as_lldb) or as_lldb,
+    project_root = slash_to_backslash(project_root) or project_root,
+    engine_root = slash_to_backslash(engine_root) or engine_root,
+    adb = slash_to_backslash(vim.fn.exepath("adb")) or "adb",
     port = dap_port,
-    pid_file = to_windows_path(tmpdir .. "/ue_dap_pid.txt"),
-    serial_file = to_windows_path(tmpdir .. "/ue_dap_serial.txt"),
-    exec_search_paths = { to_windows_path(vim.fn.fnamemodify(symbol_lib, ":h")) },
+    pid_file = slash_to_backslash(tmpdir .. "/ue_dap_pid.txt"),
+    serial_file = slash_to_backslash(tmpdir .. "/ue_dap_serial.txt"),
+    exec_search_paths = { slash_to_backslash(vim.fn.fnamemodify(symbol_lib, ":h")) },
     source_map = {},
   }
   if engine_root ~= "" then

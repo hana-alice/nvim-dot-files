@@ -1,4 +1,4 @@
-if vim.fn.has("win32") == 0 and vim.fn.has("win64") == 0 then
+if not require("utils.platform").is_windows then
   return {}
 end
 

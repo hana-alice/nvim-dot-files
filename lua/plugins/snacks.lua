@@ -400,65 +400,58 @@ return {
         -- Wrap the default jump action to work around two issues:
         -- 1. PreserveBufferView autocmd (config/autocmds.lua) restoring the
         --    old viewport via winrestview, overwriting the jump target.
-        -- 2. Neovide sending an implicit mouse-position event when the picker
+        --    → Fixed by synchronous skip flag check in autocmds.lua BufEnter.
+        -- 2. Neovide sending an implicit mouse-release event when the picker
         --    float closes and focus returns to the main window, which moves
         --    the cursor to wherever the mouse pointer is on screen.
-        --
-        -- Fix: set the skip flag for (1), disable mouse during jump for (2),
-        -- and install a one-shot CursorMoved guard that snaps the cursor back
-        -- if Neovide repositions it after the jump completes.
+        --    → Fixed by cursor guard using vim.defer_fn(0) that runs AFTER
+        --      all pending vim.schedule callbacks (including snacks' own
+        --      insert-mode reschedule of M.jump).
         jump = function(picker, item, action)
+          -- (1) Tell PreserveBufferView to skip the next BufEnter restore.
           vim.g._restore_view_skip = true
 
-          -- In Neovide: temporarily disable mouse so Neovide cannot reposition
-          -- the cursor when focus returns from the picker float to the main window.
-          local saved_mouse
-          if vim.g.neovide then
-            saved_mouse = vim.o.mouse
-            vim.o.mouse = ""
-          end
-
+          -- Call the real jump. NOTE: in insert mode (picker input), this
+          -- does stopinsert() + vim.schedule(M.jump) internally, so the
+          -- actual jump happens in a later event loop tick.
           require("snacks.picker.actions").jump(picker, item, action)
 
-          -- After jump, record where the cursor landed and guard it.
-          -- Use vim.schedule to run after all pending schedules (the jump
-          -- itself may be wrapped in vim.schedule when coming from insert mode).
+          -- (2) Guard against Neovide mouse-release cursor repositioning.
+          -- We use a two-layer defer: first vim.schedule to get past the
+          -- insert-mode reschedule, then vim.defer_fn(0) to run after
+          -- the actual jump's vim.schedule has completed.
           if vim.g.neovide then
             vim.schedule(function()
-              local ok, pos = pcall(vim.api.nvim_win_get_cursor, 0)
-              if not ok then
-                vim.o.mouse = saved_mouse
-                return
-              end
-              local target_pos = { pos[1], pos[2] }
-              local guard_win = vim.api.nvim_get_current_win()
-              local guard_buf = vim.api.nvim_get_current_buf()
-
-              -- One-shot CursorMoved guard: if Neovide's mouse event moves the
-              -- cursor away from the jump target, snap it back.
-              local guard_id
-              guard_id = vim.api.nvim_create_autocmd("CursorMoved", {
-                once = true,
-                callback = function()
-                  -- Only correct if we're still in the same window/buffer
-                  if vim.api.nvim_get_current_win() == guard_win
-                    and vim.api.nvim_get_current_buf() == guard_buf then
-                    local cur = vim.api.nvim_win_get_cursor(guard_win)
-                    if cur[1] ~= target_pos[1] or cur[2] ~= target_pos[2] then
-                      pcall(vim.api.nvim_win_set_cursor, guard_win, target_pos)
-                      vim.cmd("silent! normal! zz")
-                    end
-                  end
-                end,
-              })
-
-              -- Restore mouse and clean up guard after 300ms
               vim.defer_fn(function()
-                vim.o.mouse = saved_mouse
-                -- If the guard hasn't fired yet, remove it (normal case: user
-                -- didn't move the cursor, no CursorMoved was triggered)
-                pcall(vim.api.nvim_del_autocmd, guard_id)
-              end, 300)
+                -- By now the real jump has landed. Record the position.
+                local win = vim.api.nvim_get_current_win()
+                local buf = vim.api.nvim_get_current_buf()
+                local ok, pos = pcall(vim.api.nvim_win_get_cursor, win)
+                if not ok then return end
+                local target = { pos[1], pos[2] }
+
+                -- One-shot CursorMoved guard: if Neovide's mouse event
+                -- moves the cursor away, snap it back.
+                local guard_id
+                guard_id = vim.api.nvim_create_autocmd("CursorMoved", {
+                  once = true,
+                  callback = function()
+                    if vim.api.nvim_get_current_win() == win
+                      and vim.api.nvim_get_current_buf() == buf then
+                      local cur = vim.api.nvim_win_get_cursor(win)
+                      if cur[1] ~= target[1] or cur[2] ~= target[2] then
+                        pcall(vim.api.nvim_win_set_cursor, win, target)
+                        vim.cmd("silent! normal! zz")
+                      end
+                    end
+                  end,
+                })
+
+                -- Clean up guard after 500ms if it never fired
+                vim.defer_fn(function()
+                  pcall(vim.api.nvim_del_autocmd, guard_id)
+                end, 500)
+              end, 0)
             end)
           end
         end,

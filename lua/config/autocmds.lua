@@ -32,12 +32,19 @@ vim.api.nvim_create_autocmd("BufLeave", {
 vim.api.nvim_create_autocmd("BufEnter", {
   group = view_group,
   callback = function()
+    -- Check skip flag synchronously (before vim.schedule) so there is no
+    -- race with other scheduled callbacks like snacks picker jump.
+    if vim.g._restore_view_skip then
+      vim.g._restore_view_skip = nil
+      return
+    end
+
     local buf = vim.api.nvim_get_current_buf()
     local view = buf_views[buf]
     if view and vim.bo[buf].buftype == "" then
       vim.schedule(function()
-        -- If something requested to skip view restoration (e.g. picker jump),
-        -- clear the flag and bail out.
+        -- Re-check: another skip may have been set between the autocmd
+        -- firing and this scheduled callback running.
         if vim.g._restore_view_skip then
           vim.g._restore_view_skip = nil
           return

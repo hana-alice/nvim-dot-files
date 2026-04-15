@@ -2,7 +2,9 @@
 vim.g.mapleader = " "
 vim.g.maplocalleader = " "
 
-if require("utils.platform").is_windows then
+-- This check runs before runtimepath/XDG is configured, so we cannot
+-- require("utils.platform") here — use inline vim.fn.has() instead.
+if vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1 then
   local localappdata = vim.env.LOCALAPPDATA
   if localappdata and localappdata ~= "" then
     local base = localappdata:gsub("\\", "/") .. "/nvim-main"

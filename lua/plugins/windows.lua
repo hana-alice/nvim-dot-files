@@ -17,14 +17,13 @@ return {
     opts = function(_, opts)
       opts.sections = opts.sections or {}
       opts.sections.lualine_x = opts.sections.lualine_x or {}
-
       for _, component in ipairs(opts.sections.lualine_x) do
         if component == ue_status then
-          return
+          return opts
         end
       end
-
       table.insert(opts.sections.lualine_x, 1, ue_status)
+      return opts
     end,
   },
 }

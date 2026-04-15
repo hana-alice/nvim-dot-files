@@ -476,8 +476,9 @@ return {
         ["<C-v>"] = { "paste_clipboard", mode = { "n", "x" } },
         ["<Tab>"] = { "list_down", mode = { "n", "x" } },
         ["<S-Tab>"] = { "list_up", mode = { "n", "x" } },
-        ["<C-Space>"] = { "select_and_next", mode = { "n", "x" } },
-      })
-    end,
+       ["<C-Space>"] = { "select_and_next", mode = { "n", "x" } },
+     })
+     return opts
+   end,
   },
 }

@@ -56,7 +56,8 @@ return {
         },
       })
 
-      opts.servers.clangd = clangd
-    end,
+     opts.servers.clangd = clangd
+     return opts
+   end,
   },
 }

@@ -44,17 +44,19 @@ return {
           sort = { "filename", "pos" },
           format = "{text}",
         }),
-      })
-    end,
-  },
-  {
-    "folke/which-key.nvim",
-    opts = function(_, opts)
-      opts = opts or {}
-      opts.spec = opts.spec or {}
-      vim.list_extend(opts.spec, {
-        { "<leader>v", group = "sidebar" },
-      })
-    end,
+     })
+     return opts
+   end,
+ },
+ {
+   "folke/which-key.nvim",
+   opts = function(_, opts)
+     opts = opts or {}
+     opts.spec = opts.spec or {}
+     vim.list_extend(opts.spec, {
+       { "<leader>v", group = "sidebar" },
+     })
+     return opts
+   end,
   },
 }

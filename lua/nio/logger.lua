@@ -1,3 +1,10 @@
+-- OVERRIDE: This file shadows the real nvim-nio logger (lua/nio/logger.lua)
+-- by sitting earlier on package.path. Purpose:
+--   1. Default log level = WARN (nio's default is TRACE, generating huge logs)
+--   2. Log-size warning threshold raised to 1 GB
+-- If nvim-nio updates its logger API and this breaks, either update this file
+-- or remove it and configure nio's log level through its public API if one
+-- exists by then.  Last synced with nvim-nio v1.x logger interface.
 local loggers = {}
 
 local log_date_format = "%FT%H:%M:%SZ%z"

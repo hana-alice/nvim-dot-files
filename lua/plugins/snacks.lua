@@ -417,6 +417,11 @@ return {
           require("snacks.picker.actions").jump(picker, item, action)
 
           -- (2) Guard against Neovide mouse-release cursor repositioning.
+          -- Neovide issue: when a floating window closes while the mouse button
+          -- is released, Neovide sends an implicit <LeftRelease> that moves the
+          -- cursor to wherever the mouse pointer sits on screen.
+          -- TODO: Remove this workaround once Neovide fixes this behavior.
+          -- https://github.com/neovide/neovide/issues — search "cursor jump after float close"
           -- We use a two-layer defer: first vim.schedule to get past the
           -- insert-mode reschedule, then vim.defer_fn(0) to run after
           -- the actual jump's vim.schedule has completed.

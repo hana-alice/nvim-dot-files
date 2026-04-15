@@ -10,6 +10,12 @@
 -- ── Preserve viewport when switching buffers ─────────────────────────
 -- Without this, switching buffers resets the scroll position so the
 -- cursor lands in the middle of the screen instead of where you left it.
+--
+-- Guard: any code that positions the cursor after switching buffers
+-- (picker jump, goto-definition, etc.) should set
+--   vim.g._restore_view_skip = true
+-- before doing so. The BufEnter handler honours this flag and skips the
+-- scheduled winrestview so the jump target is not overwritten.
 local buf_views = {}
 local view_group = vim.api.nvim_create_augroup("PreserveBufferView", { clear = true })
 
@@ -30,9 +36,16 @@ vim.api.nvim_create_autocmd("BufEnter", {
     local view = buf_views[buf]
     if view and vim.bo[buf].buftype == "" then
       vim.schedule(function()
-        if vim.api.nvim_get_current_buf() == buf then
-          pcall(vim.fn.winrestview, view)
+        -- If something requested to skip view restoration (e.g. picker jump),
+        -- clear the flag and bail out.
+        if vim.g._restore_view_skip then
+          vim.g._restore_view_skip = nil
+          return
         end
+        if vim.api.nvim_get_current_buf() ~= buf then
+          return
+        end
+        pcall(vim.fn.winrestview, view)
       end)
     end
   end,

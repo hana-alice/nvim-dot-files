@@ -86,20 +86,40 @@ local function open_symbol_picker(opts)
     local snacks = require("snacks")
     local buf = vim.api.nvim_get_current_buf()
     local has_name = vim.api.nvim_buf_get_name(buf) ~= ""
+    local picker_opts = {
+      filter = LazyVim.config.kind_filter,
+      tree = false,
+      auto_confirm = true,
+      jump = { tagstack = true, reuse_win = true },
+    }
+    if vim.g.neovide then
+      picker_opts.win = {
+        list = {
+          keys = {
+            ["<LeftMouse>"] = { "confirm", mode = { "n", "x" } },
+          },
+        },
+      }
+      -- NOTE: Neovide mouse-reposition fix is handled globally in the custom
+      -- jump action wrapper (plugins/snacks.lua), not here.
+    end
 
     if opts.workspace then
       if lsp_supports(buf, "workspace/symbol") then
-        return snacks.picker.lsp_workspace_symbols({ filter = LazyVim.config.kind_filter })
+        return snacks.picker.lsp_workspace_symbols(vim.tbl_deep_extend("force", picker_opts, {
+          supports_live = true,
+          live = true,
+        }))
       end
       vim.notify("No workspace symbols provider", vim.log.levels.WARN)
       return
     end
 
     if lsp_supports(buf, "textDocument/documentSymbol") then
-      return snacks.picker.lsp_symbols({ filter = LazyVim.config.kind_filter })
+      return snacks.picker.lsp_symbols(picker_opts)
     end
     if has_name then
-      local ok = pcall(snacks.picker.treesitter, { filter = LazyVim.config.kind_filter })
+      local ok = pcall(snacks.picker.treesitter, picker_opts)
       if ok then
         return
       end

@@ -156,26 +156,19 @@ function M.open_current()
 
   local cmd = { "yazi", "--chooser-file", chooser_file, "--cwd-file", cwd_file, entry }
 
-  -- Build environment: inherit current env, override TERM so yazi enables
-  -- text preview (Neovim's built-in terminal reports TERM=dumb).
-  local term_env = vim.fn.environ()
-  term_env.TERM = "xterm-256color"
-  term_env.COLORTERM = "truecolor"
-
-  -- Ensure Git-for-Windows utilities (file, less, etc.) are available.
-  -- yazi needs `file` for MIME type detection to enable preview.
+  -- yazi needs `file` for MIME detection. On Windows it ships with Git.
   local git_usr_bin = "C:\\Program Files\\Git\\usr\\bin"
+  local path_patched = false
   if vim.fn.isdirectory(git_usr_bin) == 1 then
-    local sep = term_env.Path and ";" or ":"
-    local path_key = term_env.Path and "Path" or "PATH"
-    if not (term_env[path_key] or ""):find(git_usr_bin, 1, true) then
-      term_env[path_key] = git_usr_bin .. sep .. (term_env[path_key] or "")
+    local cur = vim.env.PATH or ""
+    if not cur:find(git_usr_bin, 1, true) then
+      vim.env.PATH = git_usr_bin .. ";" .. cur
+      path_patched = true
     end
   end
 
   local jobid = vim.fn.termopen(cmd, {
     cwd = cwd,
-    env = term_env,
     on_exit = function(_, code)
       vim.schedule(function()
         finish(code)

@@ -155,8 +155,16 @@ function M.open_current()
   }
 
   local cmd = { "yazi", "--chooser-file", chooser_file, "--cwd-file", cwd_file, entry }
+
+  -- Build environment: inherit current env, override TERM so yazi enables
+  -- text preview (Neovim's built-in terminal reports TERM=dumb).
+  local term_env = vim.fn.environ()
+  term_env.TERM = "xterm-256color"
+  term_env.COLORTERM = "truecolor"
+
   local jobid = vim.fn.termopen(cmd, {
     cwd = cwd,
+    env = term_env,
     on_exit = function(_, code)
       vim.schedule(function()
         finish(code)

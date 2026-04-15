@@ -1,5 +1,9 @@
 local M = {}
 
+-- ==========================================================================
+-- MODULE STATE
+-- ==========================================================================
+
 local setup_done = false
 local build_term_buf = nil
 local build_term_win = nil
@@ -10,6 +14,10 @@ local dirty_index_roots = {}
 local _engine_root_cache = {} -- dir -> engine_root (or false)
 local _context_cache = {} -- key -> { ctx, ts }
 local _CONTEXT_TTL = 30 -- seconds (filesystem walks are expensive on NTFS)
+
+-- ==========================================================================
+-- CORE UTILITIES — paths, files, process, ANSI
+-- ==========================================================================
 
 local function trim(value)
   return vim.trim(tostring(value or ""))
@@ -200,6 +208,10 @@ local function first_executable(candidates)
   return nil
 end
 
+-- ==========================================================================
+-- CLANGD / LSP
+-- ==========================================================================
+
 local function clangd_candidates(root_dir)
   local candidates = {}
   local override = trim(vim.env.UE_CLANGD)
@@ -220,6 +232,10 @@ local function clangd_candidates(root_dir)
 
   return candidates
 end
+
+-- ==========================================================================
+-- OUTPUT PARSING — diagnostics, quickfix, GTAGS results
+-- ==========================================================================
 
 local function parse_global_entries(root, lines)
   local entries = {}
@@ -662,6 +678,10 @@ local function jump_to_global_grep_candidate(root, symbol, lines)
   return populate_quickfix_from_entries("GTAGS grep: " .. symbol, entries)
 end
 
+-- ==========================================================================
+-- PUBLIC: CLANGD
+-- ==========================================================================
+
 function M.clangd_cmd(root_dir)
   local clangd = first_executable(clangd_candidates(root_dir or cwd())) or "clangd"
   return {
@@ -677,6 +697,10 @@ function M.clangd_cmd(root_dir)
     "--query-driver=**/clang*.exe,**/clang*,**/gcc,**/g++,**/cc,**/c++,**/cl.exe",
   }
 end
+
+-- ==========================================================================
+-- FILE I/O + PROCESS
+-- ==========================================================================
 
 local function run_lines(cmd, opts)
   opts = opts or {}
@@ -729,6 +753,10 @@ local function write_lines(path, lines)
   ensure_dir(dirname(path))
   vim.fn.writefile(lines, path)
 end
+
+-- ==========================================================================
+-- PROJECT DETECTION — uproject, solutions, configurations, engine root
+-- ==========================================================================
 
 local function find_uproject_in_dir(dir)
   local matches = vim.fn.globpath(dir, "*.uproject", false, true)
@@ -1090,6 +1118,10 @@ local function update_state_field(engine_root, key, value)
   write_all(paths.state, vim.json.encode(existing))
 end
 
+-- ==========================================================================
+-- CONTEXT RESOLUTION
+-- ==========================================================================
+
 local function resolve_context(opts)
   opts = opts or {}
 
@@ -1140,6 +1172,10 @@ local function resolve_context(opts)
   _context_cache[cache_key] = { ctx = ctx, err = nil, ts = now }
   return ctx
 end
+
+-- ==========================================================================
+-- FILE FILTERING + EXTENSION TABLES
+-- ==========================================================================
 
 local function path_has_extension(path, extensions)
   local normalized = norm(path):lower()
@@ -1272,6 +1308,10 @@ M.FT_ALL = vim.list_extend(vim.list_extend({}, M.FT_CODE), M.FT_CONFIG)
 -- Globs (for rg -g / grep picker)
 M.GLOBS_CODE = vim.tbl_map(function(ext) return "*." .. ext end, M.FT_CODE)
 M.GLOBS_ALL = vim.tbl_map(function(ext) return "*." .. ext end, M.FT_ALL)
+
+-- ==========================================================================
+-- FILE SCANNING + GTAGS DATABASE
+-- ==========================================================================
 
 local function existing_relative_dirs(root, search_paths)
   local dirs = {}
@@ -1747,6 +1787,10 @@ local function global_lines(root, db_dir, args)
   return code, lines
 end
 
+-- ==========================================================================
+-- BUILD TARGETS + PLATFORM DETECTION
+-- ==========================================================================
+
 local function detect_target_names(project_root, uproject)
   local targets = vim.fn.globpath(join(project_root, "Source"), "*.Target.cs", false, true)
   local detected = {
@@ -1855,6 +1899,10 @@ local function build_target_name(project_root, uproject, kind)
   end
   return detect_target_name(project_root, uproject, kind)
 end
+
+-- ==========================================================================
+-- BUILD COMMANDS — Windows wrappers, UBT, Build.bat
+-- ==========================================================================
 
 local function command_is_windows(cmd)
   local exe = trim((cmd or {})[1])
@@ -2039,6 +2087,10 @@ local function wrap_windows_command(cmd)
   }
 end
 
+-- ==========================================================================
+-- COMPILE_COMMANDS.JSON GENERATION
+-- ==========================================================================
+
 local function compile_commands_targets(ctx)
   return {
     join(ctx.engine_root, "compile_commands.json"),
@@ -2104,6 +2156,10 @@ local function compile_commands_candidates(ctx)
 
   return candidates
 end
+
+-- ==========================================================================
+-- SHADER DEFINITION SEARCH + COMPILE COMMANDS AUGMENTATION
+-- ==========================================================================
 
 local function scan_shader_files(root, search_paths)
   root = norm(root)
@@ -2739,6 +2795,10 @@ local function generate_compile_commands(ctx)
   return export_compile_commands_to_engine_root(ctx)
 end
 
+-- ==========================================================================
+-- ANDROID BUILD
+-- ==========================================================================
+
 local function android_build_command(ctx)
   local uproject = ctx.uproject or find_uproject_in_dir(ctx.project_root)
   if not uproject then
@@ -2779,6 +2839,10 @@ local function android_build_command(ctx)
 
   return direct_ubt_command(ctx.engine_root, build_args)
 end
+
+-- ==========================================================================
+-- TERMINAL COMMAND RUNNER
+-- ==========================================================================
 
 local function append_job_output(lines, pending, chunks)
   pending = pending or ""
@@ -2939,6 +3003,10 @@ local function open_terminal_command(cmd, opts)
   build_term_jobid = active_jobid
   startinsert_in_window(win)
 end
+
+-- ==========================================================================
+-- PICKER INTEGRATION — workspace, cached files/grep
+-- ==========================================================================
 
 local function workspace_root(ctx)
   if ctx.project_root and ctx.project_root ~= "" then
@@ -3274,6 +3342,10 @@ function M.cached_grep(opts)
   return true
 end
 
+-- ==========================================================================
+-- PUBLIC: STATUSLINE + ROOTS + GTAGS QUERIES
+-- ==========================================================================
+
 function M.statusline_status(opts)
   local ctx = resolve_context(opts)
   if not ctx then
@@ -3390,6 +3462,10 @@ function M.android_build_command(opts)
   end
   return android_build_command(ctx)
 end
+
+-- ==========================================================================
+-- USER COMMANDS — paths, cheatsheet, project, platform, build, prepare
+-- ==========================================================================
 
 local function show_paths()
   local ctx, err = resolve_context()
@@ -4358,6 +4434,10 @@ M.dap_reset_layout = dap_mod.dap_reset_layout
 M.dap_toggle_repl = dap_mod.dap_toggle_repl
 M.dap_diagnose = dap_mod.dap_diagnose
 M.setup_dap = dap_mod.setup_dap
+
+-- ==========================================================================
+-- SETUP — user commands, autocmds, statusline timer
+-- ==========================================================================
 
 function M.setup()
   if setup_done then

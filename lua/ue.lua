@@ -769,7 +769,10 @@ end
 
 local UE_CONST = {
   DEFAULT_PLATFORM_CHOICES = { "Win64", "Android", "Linux", "Mac", "IOS" },
-  DEFAULT_CONFIGURATION_CHOICES = { "Development", "DebugGame", "Debug", "Shipping", "Test" },
+  DEFAULT_CONFIGURATION_CHOICES = {
+    "Development Editor", "Development", "DebugGame Editor", "DebugGame",
+    "Debug", "Shipping", "Test",
+  },
   TARGET_KIND_SUFFIXES = { "Editor", "Client", "Server" },
 }
 

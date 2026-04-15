@@ -42,6 +42,7 @@ end
 cleanup_stale_shada_tmp()
 
 require("config.neovide").setup()
+require("config.snacks_global").setup()
 require("config.lazy")
 -- NOTE: config.options / config.autocmds / config.keymaps are auto-loaded by
 -- LazyVim (options before lazy.setup, autocmds+keymaps on VeryLazy). Do NOT

@@ -91,7 +91,21 @@ local function open_symbol_picker(opts)
       }))
     end
 
-    return snacks.picker.lsp_symbols(picker_opts)
+    -- Prefer LSP symbols when a capable client is attached and has finished
+    -- indexing (responds within a short timeout). Otherwise, fall back to
+    -- treesitter for instant results while clangd is still loading.
+    local buf = vim.api.nvim_get_current_buf()
+    local has_lsp = #vim.lsp.get_clients({ bufnr = buf, method = "textDocument/documentSymbol" }) > 0
+    if has_lsp then
+      return snacks.picker.lsp_symbols(picker_opts)
+    end
+
+    -- No LSP client supports documentSymbol yet — use treesitter
+    if vim.api.nvim_buf_get_name(buf) ~= "" then
+      local ok = pcall(snacks.picker.treesitter, picker_opts)
+      if ok then return end
+    end
+    vim.notify("No symbols available (LSP loading…)", vim.log.levels.INFO)
   end
 end
 

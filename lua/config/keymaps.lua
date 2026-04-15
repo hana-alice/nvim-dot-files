@@ -64,28 +64,10 @@ local function open_visual_substitute()
   end)
 end
 
-local function lsp_supports(buf, method)
-  local get_clients = vim.lsp.get_clients or vim.lsp.get_active_clients
-  for _, client in ipairs(get_clients({ bufnr = buf })) do
-    if type(client.supports_method) == "function" then
-      local ok, supported = pcall(client.supports_method, client, method, buf)
-      if not ok then
-        ok, supported = pcall(client.supports_method, client, method)
-      end
-      if ok and supported then
-        return true
-      end
-    end
-  end
-  return false
-end
-
 local function open_symbol_picker(opts)
   opts = opts or {}
   return function()
     local snacks = require("snacks")
-    local buf = vim.api.nvim_get_current_buf()
-    local has_name = vim.api.nvim_buf_get_name(buf) ~= ""
     local picker_opts = {
       filter = LazyVim.config.kind_filter,
       tree = false,
@@ -100,31 +82,16 @@ local function open_symbol_picker(opts)
           },
         },
       }
-      -- NOTE: Neovide mouse-reposition fix is handled globally in the custom
-      -- jump action wrapper (plugins/snacks.lua), not here.
     end
 
     if opts.workspace then
-      if lsp_supports(buf, "workspace/symbol") then
-        return snacks.picker.lsp_workspace_symbols(vim.tbl_deep_extend("force", picker_opts, {
-          supports_live = true,
-          live = true,
-        }))
-      end
-      vim.notify("No workspace symbols provider", vim.log.levels.WARN)
-      return
+      return snacks.picker.lsp_workspace_symbols(vim.tbl_deep_extend("force", picker_opts, {
+        supports_live = true,
+        live = true,
+      }))
     end
 
-    if lsp_supports(buf, "textDocument/documentSymbol") then
-      return snacks.picker.lsp_symbols(picker_opts)
-    end
-    if has_name then
-      local ok = pcall(snacks.picker.treesitter, picker_opts)
-      if ok then
-        return
-      end
-    end
-    vim.notify("No document symbols available", vim.log.levels.WARN)
+    return snacks.picker.lsp_symbols(picker_opts)
   end
 end
 
@@ -298,11 +265,4 @@ vim.api.nvim_create_autocmd("User", {
   pattern = "VeryLazy",
   once = true,
   callback = apply_ue_runtime_overrides,
-})
-
-vim.api.nvim_create_autocmd("LspAttach", {
-  callback = function(args)
-    map("n", "<leader>ss", open_symbol_picker(), { buffer = args.buf, desc = "Search: Symbols" })
-    map("n", "<leader>sS", open_symbol_picker({ workspace = true }), { buffer = args.buf, desc = "Search: Workspace Symbols" })
-  end,
 })

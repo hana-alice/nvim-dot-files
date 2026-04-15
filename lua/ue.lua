@@ -439,7 +439,15 @@ local function jump_to_entry(entry)
   local max_line = vim.api.nvim_buf_line_count(0)
   local lnum = math.min(entry.lnum, max_line)
   local line_text = vim.api.nvim_buf_get_lines(0, lnum - 1, lnum, false)[1] or ""
-  local col = math.min(math.max((entry.col or 1) - 1, 0), #line_text)
+  local col = math.max((entry.col or 1) - 1, 0)
+  local symbol = trim(entry._symbol or "")
+  if symbol ~= "" then
+    local from = line_text:find("%f[%w_]" .. vim.pesc(symbol) .. "%f[^%w_]")
+    if from then
+      col = from - 1
+    end
+  end
+  col = math.min(col, #line_text)
   vim.api.nvim_win_set_cursor(0, { lnum, col })
   return true
 end
@@ -486,10 +494,13 @@ local function path_proximity_score(entry_path, current_file)
   return 0
 end
 
-local function jump_to_global_result(root, lines)
+local function jump_to_global_result(root, lines, symbol)
   local entries = parse_global_entries(root, lines)
   if #entries == 0 then
     return false
+  end
+  for _, entry in ipairs(entries) do
+    entry._symbol = symbol
   end
   if #entries == 1 then
     return jump_to_entry(entries[1])
@@ -551,8 +562,19 @@ local function grep_definition_score(symbol, entry, current_file, current_line)
   if text:match("^%s*#%s*define%s+" .. escaped .. "%f[^%w_]") then
     score = score + 140
   end
-  if text:match("^%s*" .. escaped .. "%s*=") or text:match("^%s*" .. escaped .. "%s*,") then
+  if is_header_like_path(entry.filename)
+    and text:match("%f[%w_]" .. escaped .. "%f[^%w_]")
+    and text:match(";%s*$")
+    and not text:match("=")
+    and not text:match("%(")
+  then
+    score = score + 150
+  end
+  if text:match("^%s*" .. escaped .. "%s*,") then
     score = score + 120
+  end
+  if text:match("^%s*" .. escaped .. "%s*=") then
+    score = score - 20
   end
   if text:match("^%s*enum%s+.-" .. escaped .. "%f[^%w_]") then
     score = score + 110
@@ -582,6 +604,7 @@ local function copy_qf_entry(entry)
     lnum = entry.lnum,
     col = entry.col,
     text = entry.text,
+    _symbol = entry._symbol,
   }
 end
 
@@ -594,6 +617,7 @@ local function jump_to_global_grep_candidate(root, symbol, lines)
   local current_file = norm(vim.api.nvim_buf_get_name(0))
   local current_line = vim.api.nvim_win_get_cursor(0)[1]
   for _, entry in ipairs(entries) do
+    entry._symbol = symbol
     entry._score = grep_definition_score(symbol, entry, current_file, current_line)
   end
 
@@ -3344,7 +3368,7 @@ function M.gtags_definition(symbol)
   if db_ready(ctx.paths.workspace_db) then
     local code, lines = global_lines(root, ctx.paths.workspace_db, { "-d", "--literal", "--result=grep", symbol })
     if (code == 0 or code == 1) and lines and #lines > 0 then
-      return jump_to_global_result(root, lines)
+      return jump_to_global_result(root, lines, symbol)
     end
 
     code, lines = global_lines(root, ctx.paths.workspace_db, { "-g", "--literal", "--result=grep", symbol })

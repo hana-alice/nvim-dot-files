@@ -1,15 +1,10 @@
-# Keep the actively edited Neovim config files on LF so git CLI and gitsigns
+# Normalize all text files to LF so git CLI and gitsigns
 # diff against the same content on Windows.
-.gitattributes text eol=lf
-/docs/ue_lazyvim_cheatsheet.md text eol=lf
-/init.lua text eol=lf
-/lua/config/autocmds.lua text eol=lf
-/lua/config/keymaps.lua text eol=lf
-/lua/config/lazy.lua text eol=lf
-/lua/plugins/dap.lua text eol=lf
-/lua/plugins/gitsigns.lua text eol=lf
-/lua/plugins/sidebar.lua text eol=lf
-/lua/plugins/snacks.lua text eol=lf
-/lua/ue.lua text eol=lf
-/lua/utils/lsp_fallback.lua text eol=lf
-/lua/utils/sidebar.lua text eol=lf
+* text=auto eol=lf
+*.py text eol=lf
+*.lua text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+
+# Binary files
+*.pyc binary

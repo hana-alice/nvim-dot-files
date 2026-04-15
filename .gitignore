@@ -6,3 +6,7 @@ debug
 foo.*
 *.log
 data
+.omx/
+.tmp/
+__pycache__/
+*.pyc

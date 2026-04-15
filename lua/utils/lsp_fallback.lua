@@ -8,6 +8,23 @@ local function current_symbol()
   return word
 end
 
+local function normalize_locations(result, position_encoding)
+  if type(result) ~= "table" then
+    return {}
+  end
+
+  local locations = {}
+  local items = vim.islist(result) and result or { result }
+  for _, location in ipairs(items) do
+    if type(location) == "table" and (location.uri or location.targetUri) then
+      local copy = vim.deepcopy(location)
+      copy._position_encoding = position_encoding
+      locations[#locations + 1] = copy
+    end
+  end
+  return locations
+end
+
 -- ---------------------------------------------------------------------------
 -- Sync helpers (used by the async fallback chain and by references)
 -- ---------------------------------------------------------------------------
@@ -29,16 +46,23 @@ local function sync_locations(method, timeout_ms)
   end
 
   local items = {}
-  for _, response in pairs(responses) do
+  for client_id, response in pairs(responses) do
     if response.result and type(response.result) == "table" then
-      vim.list_extend(items, response.result)
+      local client = vim.lsp.get_client_by_id(client_id)
+      vim.list_extend(items, normalize_locations(response.result, client and client.offset_encoding or "utf-16"))
     end
   end
   return items
 end
 
 local function populate_quickfix(title, locations)
-  local items = vim.lsp.util.locations_to_items(locations, "utf-8")
+  local items = {}
+  for _, location in ipairs(locations or {}) do
+    local converted = vim.lsp.util.locations_to_items({ location }, location._position_encoding or "utf-16")
+    if converted and #converted > 0 then
+      vim.list_extend(items, converted)
+    end
+  end
   if not items or vim.tbl_isempty(items) then
     return false
   end
@@ -49,16 +73,11 @@ local function populate_quickfix(title, locations)
 end
 
 local function jump_to_location(location)
-  local items = vim.lsp.util.locations_to_items({ location }, "utf-8")
-  local item = items and items[1] or nil
-  if not item then
-    return false
-  end
-
   vim.cmd("normal! m'")
-  vim.cmd("edit " .. vim.fn.fnameescape(item.filename))
-  vim.api.nvim_win_set_cursor(0, { item.lnum, math.max((item.col or 1) - 1, 0) })
-  return true
+  return vim.lsp.util.show_document(location, location._position_encoding or "utf-16", {
+    reuse_win = true,
+    focus = true,
+  })
 end
 
 -- ---------------------------------------------------------------------------
@@ -81,7 +100,7 @@ local function async_lsp_request(bufnr, method, on_result)
   for _, client in ipairs(clients) do
     client:request(method, params, function(err, result)
       if not err and result and type(result) == "table" then
-        vim.list_extend(all_items, result)
+        vim.list_extend(all_items, normalize_locations(result, client.offset_encoding or "utf-16"))
       end
       pending = pending - 1
       if pending == 0 then

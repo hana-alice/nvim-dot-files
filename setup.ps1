@@ -88,7 +88,7 @@ $configDir = "$env:LOCALAPPDATA\nvim"
 if (-not (Test-Path "$configDir\init.lua")) {
     Write-Err "未找到 nvim 配置目录: $configDir\init.lua"
     Write-Host "  请先 clone 配置仓库:" -ForegroundColor Yellow
-    Write-Host "  git clone https://github.com/hana-alice/nvim-dot-files.git `"$configDir`"" -ForegroundColor White
+    Write-Host "  git clone <YOUR_NVIM_CONFIG_REPO> `"$configDir`"" -ForegroundColor White
     exit 1
 }
 
@@ -116,7 +116,8 @@ if ($SkipFonts) {
 } else {
     $fontDir = "$env:LOCALAPPDATA\Microsoft\Windows\Fonts"
     $jbInstalled = Get-ChildItem -Path $fontDir -Filter "JetBrainsMono*Nerd*" -ErrorAction SilentlyContinue
-    $sysJbInstalled = Get-ChildItem -Path "C:\Windows\Fonts" -Filter "JetBrainsMono*Nerd*" -ErrorAction SilentlyContinue
+    $sysFontDir = Join-Path $env:SystemRoot "Fonts"
+    $sysJbInstalled = Get-ChildItem -Path $sysFontDir -Filter "JetBrainsMono*Nerd*" -ErrorAction SilentlyContinue
 
     if (($jbInstalled -or $sysJbInstalled) -and (-not $Force)) {
         Write-Skip "JetBrainsMono Nerd Font 已安装"
@@ -146,7 +147,7 @@ if ($SkipFonts) {
     }
 
     # Cascadia Mono 通常随 Windows Terminal 预装
-    $cascadiaInstalled = Get-ChildItem -Path "C:\Windows\Fonts" -Filter "CascadiaMono*" -ErrorAction SilentlyContinue
+    $cascadiaInstalled = Get-ChildItem -Path (Join-Path $env:SystemRoot "Fonts") -Filter "CascadiaMono*" -ErrorAction SilentlyContinue
     if ($cascadiaInstalled) {
         Write-Skip "Cascadia Mono 已安装 (随 Windows Terminal 预装)"
     } else {
@@ -192,9 +193,9 @@ Refresh-Path
 
 Write-Step "4. 安装 LLVM (clangd + clang-format)"
 
-$llvmDir = "C:\Program Files\LLVM\bin"
-if ((Test-Path "$llvmDir\clangd.exe") -and (-not $Force)) {
-    Write-Skip "LLVM/clangd 已安装 ($llvmDir\clangd.exe)"
+$llvmDir = Join-Path $env:ProgramFiles "LLVM\bin"
+if ((Test-Path (Join-Path $llvmDir "clangd.exe")) -and (-not $Force)) {
+    Write-Skip "LLVM/clangd 已安装 ($(Join-Path $llvmDir 'clangd.exe'))"
 } else {
     Install-WinGetPackage -Id "LLVM.LLVM" -Name "LLVM (clangd, clang-format)"
     Refresh-Path
@@ -412,7 +413,7 @@ if (Test-Path $codelldbCheck) {
 }
 
 # 检查字体
-$jbCheck = Get-ChildItem -Path "$env:LOCALAPPDATA\Microsoft\Windows\Fonts","C:\Windows\Fonts" -Filter "JetBrainsMono*Nerd*" -ErrorAction SilentlyContinue
+$jbCheck = Get-ChildItem -Path "$env:LOCALAPPDATA\Microsoft\Windows\Fonts",(Join-Path $env:SystemRoot "Fonts") -Filter "JetBrainsMono*Nerd*" -ErrorAction SilentlyContinue
 if ($jbCheck) {
     Write-Ok "JetBrainsMono Nerd Font: 已安装"
 } else {
@@ -437,7 +438,7 @@ if ($allGood) {
 Write-Host ""
 Write-Host "启动方式:" -ForegroundColor White
 Write-Host "  neovide                      # 打开 Neovide" -ForegroundColor Gray
-Write-Host "  neovide -- --cmd 'cd <PROJ_DRIVE>\UEProj'  # 打开指定项目" -ForegroundColor Gray
+Write-Host "  neovide -- --cmd 'cd <YOUR_PROJECT>'    # 打开指定项目" -ForegroundColor Gray
 Write-Host ""
 Write-Host "首次启动说明:" -ForegroundColor White
 Write-Host "  1. Lazy.nvim 会自动下载所有插件 (如未运行 restore)" -ForegroundColor Gray

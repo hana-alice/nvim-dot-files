@@ -162,6 +162,17 @@ function M.open_current()
   term_env.TERM = "xterm-256color"
   term_env.COLORTERM = "truecolor"
 
+  -- Ensure Git-for-Windows utilities (file, less, etc.) are available.
+  -- yazi needs `file` for MIME type detection to enable preview.
+  local git_usr_bin = "C:\\Program Files\\Git\\usr\\bin"
+  if vim.fn.isdirectory(git_usr_bin) == 1 then
+    local sep = term_env.Path and ";" or ":"
+    local path_key = term_env.Path and "Path" or "PATH"
+    if not (term_env[path_key] or ""):find(git_usr_bin, 1, true) then
+      term_env[path_key] = git_usr_bin .. sep .. (term_env[path_key] or "")
+    end
+  end
+
   local jobid = vim.fn.termopen(cmd, {
     cwd = cwd,
     env = term_env,

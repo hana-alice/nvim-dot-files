@@ -3117,15 +3117,17 @@ end
 local function run_compile_commands_pipeline(path, targets)
   local python = (vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1) and "python" or "python3"
   local pch_script = vim.fn.stdpath("config") .. "/tools/prebuild_pch_v2.py"
+  local resolve_script = vim.fn.stdpath("config") .. "/tools/resolve_cdb_paths.py"
   local unify_script = vim.fn.stdpath("config") .. "/tools/unify_include_dirs.py"
   local prune_script = vim.fn.stdpath("config") .. "/tools/prune_include_dirs.py"
   local has_pch = is_file(pch_script)
+  local has_resolve = is_file(resolve_script)
   local has_unify = is_file(unify_script)
   local has_prune = is_file(prune_script)
 
   if not has_pch and not has_unify and not has_prune then return end
 
-  vim.notify("compile_commands pipeline: pch+unify+prune in background...", vim.log.levels.INFO)
+  vim.notify("compile_commands pipeline: pch+resolve+unify+prune in background...", vim.log.levels.INFO)
 
   -- Record mtime before pipeline to detect actual changes
   local stat_before = vim.uv.fs_stat(path)
@@ -3138,6 +3140,11 @@ local function run_compile_commands_pipeline(path, targets)
   local cmds = {}
   if has_pch then
     table.insert(cmds, python .. ' "' .. pch_script .. '" "' .. path .. '"')
+  end
+  if has_resolve then
+    -- Resolve relative -I paths to absolute AFTER PCH (PCH RSP uses absolute paths;
+    -- CDB must match or clang cannot reuse PCH cache, causing 5-400x slower preamble)
+    table.insert(cmds, python .. ' "' .. resolve_script .. '" "' .. path .. '"')
   end
   if has_unify then
     local extra = is_engine_only and " --include-engine" or ""

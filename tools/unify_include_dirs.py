@@ -159,12 +159,87 @@ def greedy_cluster_overhead(variants, max_overhead):
     return clusters
 
 
+def collapse_intermediate_inc(data, dry_run=False):
+    """把 -I.../Intermediate/.../Inc/ModuleA, -I.../Inc/ModuleB, ...
+    折叠为 -I.../Intermediate/.../Inc (一级父目录)。
+
+    UBT 为每个模块生成 .generated.h 放在 Inc/ModuleName/ 下,
+    但文件名全局唯一(只有 Timestamp 冲突, 无所谓),
+    所以可以安全地用父目录替代 N 个子目录, 减少 N-1 个 -I。
+
+    实测: UEProj 81 个 Intermediate Inc 子目录 → 1 个, 节省 ~336ms。
+    """
+    INC_RE = re.compile(
+        r'^(.*[/\\]Intermediate[/\\].*[/\\]Inc)[/\\].+$',
+        re.IGNORECASE
+    )
+    total_collapsed = 0
+    total_dirs_removed = 0
+
+    for entry in data:
+        args = entry.get("arguments", [])
+        # Collect -I dirs and detect collapsible Intermediate/Inc subdirs
+        new_args = []
+        seen_parents = {}  # parent_path -> True (already inserted)
+        i = 0
+        dirs_before = 0
+        dirs_after = 0
+
+        while i < len(args):
+            a = args[i]
+            d = None
+            skip_count = 1
+
+            if a == '-I' and i + 1 < len(args):
+                d = args[i + 1]
+                skip_count = 2
+            elif a.startswith('-I') and len(a) > 2:
+                d = a[2:]
+                skip_count = 1
+
+            if d is not None:
+                dirs_before += 1
+                m = INC_RE.match(d.replace('\\', '/'))
+                if m:
+                    parent = m.group(1)
+                    # Normalize for dedup
+                    parent_key = parent.lower().replace('\\', '/')
+                    if parent_key not in seen_parents:
+                        seen_parents[parent_key] = True
+                        new_args.append(f"-I{parent}")
+                        dirs_after += 1
+                    # else: skip this -I entirely (parent already covers it)
+                    i += skip_count
+                    continue
+                else:
+                    dirs_after += 1
+
+            # Copy non-collapsed args
+            for j in range(skip_count):
+                if i + j < len(args):
+                    new_args.append(args[i + j])
+            i += skip_count
+
+        removed = dirs_before - dirs_after
+        if removed > 0:
+            total_collapsed += 1
+            total_dirs_removed += removed
+            if not dry_run:
+                entry["arguments"] = new_args
+
+    return total_collapsed, total_dirs_removed
+
+
 def main():
     parser = argparse.ArgumentParser(description="聚类统一项目文件的 -I 目录")
     parser.add_argument("path", help="compile_commands.json 路径")
     parser.add_argument("--dry-run", action="store_true", help="只打印统计")
     parser.add_argument("--max-overhead", type=int, default=50,
                         help="每个文件最多增加的 -I 目录数 (默认 50, ~0.2s preamble)")
+    parser.add_argument("--include-engine", action="store_true",
+                        help="也处理 Engine 文件 (用于纯引擎项目)")
+    parser.add_argument("--no-collapse", action="store_true",
+                        help="跳过 Intermediate/Inc 子目录折叠")
     args = parser.parse_args()
 
     path = os.path.abspath(args.path)
@@ -177,25 +252,39 @@ def main():
 
     original_size = os.path.getsize(path)
 
-    # Group PROJECT entries by PCH
+    # Pass 0: Collapse Intermediate/Inc subdirs
+    if not args.no_collapse:
+        n_collapsed, n_removed = collapse_intermediate_inc(data, args.dry_run)
+        if n_collapsed > 0:
+            print(f"[折叠] {n_collapsed} 条目的 Intermediate/Inc 子目录折叠, "
+                  f"减少 {n_removed} 个 -I dirs (~{n_removed * 4.2 / 1000:.2f}s preamble)")
+            print()
+
+    # Group entries by PCH
     pch_groups = defaultdict(list)  # pch_name -> [(idx, dirs_tuple)]
     project_count = 0
     engine_count = 0
 
     for idx, entry in enumerate(data):
         filepath = entry.get("file", "")
-        if not is_project_file(filepath):
+        is_proj = is_project_file(filepath)
+        if not is_proj and not args.include_engine:
             engine_count += 1
             continue
-        project_count += 1
+        if is_proj:
+            project_count += 1
+        else:
+            engine_count += 1
         entry_args = entry.get("arguments", [])
         pch = get_pch_name(entry_args)
         if pch:
             dirs = extract_i_dirs(entry_args)
             pch_groups[pch].append((idx, tuple(sorted(dirs))))
 
-    print(f"总条目: {len(data)} (项目: {project_count}, 其他: {engine_count})")
-    print(f"项目 PCH 组: {len(pch_groups)}")
+    processed = project_count + (engine_count if args.include_engine else 0)
+    skipped = engine_count if not args.include_engine else 0
+    print(f"总条目: {len(data)} (处理: {processed}, 跳过: {skipped})")
+    print(f"PCH 组: {len(pch_groups)}")
     print(f"max-overhead: {args.max_overhead} dirs (~{args.max_overhead * 4.2 / 1000:.1f}s preamble)")
     print()
 

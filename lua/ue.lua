@@ -707,8 +707,8 @@ function M.clangd_cmd(root_dir)
   local cmd = {
     clangd,
     "--background-index",
-    "--background-index-priority=low",
-    "-j=8",
+    "--background-index-priority=normal",
+    "-j=16",
     "--completion-style=detailed",
     "--header-insertion=never",
     "--pch-storage=memory",
@@ -3095,12 +3095,83 @@ local function slim_compile_commands_file(path)
     local removed = result:match("剔除: (%d+)")
     if removed and tonumber(removed) > 0 then
       vim.notify(result, vim.log.levels.INFO)
-      return true
     end
   else
     vim.notify("slim_compile_commands failed: " .. (result or ""), vim.log.levels.WARN)
+    return false
   end
-  return false
+  return true
+end
+
+--- Run PCH prebuild + include-dir unification in background after slim.
+--- @param path string the compile_commands.json file to process
+--- @param targets string[]|nil list of compile_commands targets; after pipeline
+---        finishes the first target is copied to the others and clangd restarts.
+local function run_compile_commands_pipeline(path, targets)
+  local python = (vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1) and "python" or "python3"
+  local pch_script = vim.fn.stdpath("config") .. "/tools/prebuild_pch_v2.py"
+  local unify_script = vim.fn.stdpath("config") .. "/tools/unify_include_dirs.py"
+  local has_pch = is_file(pch_script)
+  local has_unify = is_file(unify_script)
+
+  if not has_pch and not has_unify then return end
+
+  vim.notify("compile_commands pipeline: pch+unify in background...", vim.log.levels.INFO)
+
+  -- Detect engine-only project for unify
+  local path_lower = path:gsub("\\", "/"):lower()
+  local is_engine_only = path_lower:find("/engine/") and true or false
+
+  local cmds = {}
+  if has_pch then
+    table.insert(cmds, python .. ' "' .. pch_script .. '" "' .. path .. '"')
+  end
+  if has_unify then
+    local extra = is_engine_only and " --include-engine" or ""
+    table.insert(cmds, python .. ' "' .. unify_script .. '" "' .. path .. '" --max-overhead=200' .. extra)
+  end
+
+  local shell_cmd = table.concat(cmds, " && ")
+  vim.fn.jobstart(shell_cmd, {
+    on_exit = function(_, code)
+      vim.schedule(function()
+        if code ~= 0 then
+          vim.notify("compile_commands pipeline failed (exit " .. code .. ")", vim.log.levels.WARN)
+          return
+        end
+        -- Sync primary target to secondary targets
+        if targets and #targets > 1 then
+          for i = 2, #targets do
+            local dst = targets[i]
+            local cp_cmd
+            if vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1 then
+              cp_cmd = { "cmd", "/c", "copy", "/y", path:gsub("/", "\\"), dst:gsub("/", "\\") }
+            else
+              cp_cmd = { "cp", path, dst }
+            end
+            vim.fn.system(cp_cmd)
+          end
+        end
+        vim.notify("compile_commands pipeline: done. Restarting clangd...", vim.log.levels.INFO)
+        -- Auto-restart clangd to pick up the changes
+        local clients = vim.lsp.get_clients({ name = "clangd" })
+        for _, client in ipairs(clients) do
+          local bufs = vim.lsp.get_buffers_by_client_id(client.id)
+          client:stop()
+          vim.defer_fn(function()
+            for _, buf in ipairs(bufs) do
+              if vim.api.nvim_buf_is_valid(buf) then
+                vim.api.nvim_buf_call(buf, function()
+                  vim.cmd("LspStart clangd")
+                end)
+                break
+              end
+            end
+          end, 500)
+        end
+      end)
+    end,
+  })
 end
 
 local function write_compile_commands_targets(ctx, content)
@@ -3159,6 +3230,7 @@ local function generate_compile_commands(ctx)
   for _, target in ipairs(targets) do
     if is_file(target) and vim.fn.getfsize(target) > 1024 then
       slim_compile_commands_file(target)
+      run_compile_commands_pipeline(target, targets)
       return true, target .. " (UBT, existing)"
     end
   end
@@ -3166,12 +3238,14 @@ local function generate_compile_commands(ctx)
   -- Try other candidate locations (Engine/Intermediate/Build/, project root, fd search)
   local ok_existing, existing_path = export_compile_commands_to_engine_root(ctx)
   if ok_existing then
+    run_compile_commands_pipeline(targets[1], targets)
     return true, existing_path .. " (UBT)"
   end
 
   -- Fallback: generate from .rsp files (works without running GenerateClangDatabase)
   local rsp_count, rsp_path = generate_compile_commands_from_rsp(ctx)
   if rsp_count then
+    run_compile_commands_pipeline(targets[1], targets)
     return true, rsp_path .. " (" .. rsp_count .. " entries from .rsp files)"
   end
 
@@ -3244,7 +3318,11 @@ local function generate_compile_commands(ctx)
     return false, table.concat(lines or {}, "\n")
   end
 
-  return export_compile_commands_to_engine_root(ctx)
+  local ok_gen, gen_path = export_compile_commands_to_engine_root(ctx)
+  if ok_gen then
+    run_compile_commands_pipeline(targets[1], targets)
+  end
+  return ok_gen, gen_path
 end
 
 -- ==========================================================================

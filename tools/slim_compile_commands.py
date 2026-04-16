@@ -187,6 +187,104 @@ def prune_nonexistent_includes(entries: list, check_fs: bool = False) -> list:
     return entries
 
 
+def strip_unnecessary_flags(entries: list) -> list:
+    """剥离 clangd indexing 不需要的编译参数，缩短命令行。
+
+    保留: -I, -D, -include, -include-pch, -std=, -x, -target, --target,
+          -f 语义相关 (rtti, exceptions, modules, char8_t 等), 源文件路径
+    移除: -W* (诊断由 .clangd 控制), -O* (优化), -g* (调试信息),
+          -c (隐含), -o <file> (输出), -fcolor-diagnostics, -ffunction-sections,
+          -fdata-sections, -fvisibility*, -fmessage-length, -fmacro-backtrace-limit,
+          -fdiagnostics-*, -MF/-MD/-MT (依赖跟踪)
+    """
+    # -f flags that affect code semantics (MUST keep)
+    KEEP_F_PREFIXES = (
+        '-frtti', '-fno-rtti',
+        '-fexceptions', '-fno-exceptions',
+        '-fmodules', '-fcxx-modules', '-fno-modules',
+        '-fchar8_t', '-fno-char8_t',
+        '-fshort-wchar', '-fno-short-wchar',
+        '-fshort-enums', '-fno-short-enums',
+        '-fms-extensions', '-fno-ms-extensions',
+        '-fms-compatibility', '-fno-ms-compatibility',
+        '-fdelayed-template-parsing', '-fno-delayed-template-parsing',
+        '-fsized-deallocation', '-fno-sized-deallocation',
+        '-faligned-allocation', '-fno-aligned-allocation',
+        '-fpic', '-fPIC', '-fpie', '-fPIE',
+    )
+    # Flags to strip entirely
+    STRIP_PREFIXES = ('-W', '-O')
+    STRIP_EXACT = {'-c', '-g', '-g0', '-g1', '-g2', '-g3', '-ggdb',
+                   '-gdwarf', '-gdwarf-2', '-gdwarf-3', '-gdwarf-4', '-gdwarf-5'}
+    # Flags that consume the next argument
+    STRIP_WITH_NEXT = {'-o', '-MF', '-MT', '-MQ'}
+    # -f flags to strip (non-semantic)
+    STRIP_F_PREFIXES = (
+        '-fcolor-', '-fdiagnostics-', '-ffunction-section', '-fdata-section',
+        '-fvisibility', '-fmessage-length', '-fmacro-backtrace-limit',
+        '-fno-profile', '-fprofile', '-fstack-protector', '-fno-stack-protector',
+        '-faddrsig', '-fno-addrsig', '-fuse-ld', '-flto', '-fno-lto',
+        '-fsave-optimization', '-fno-save-optimization', '-fcoverage',
+        '-ftime-trace', '-fcrash-diagnostics',
+    )
+
+    total_removed = 0
+    for e in entries:
+        args = e.get("arguments", [])
+        new_args = []
+        i = 0
+        removed = 0
+        while i < len(args):
+            a = args[i]
+
+            # Strip -o <file>, -MF <file>, etc.
+            if a in STRIP_WITH_NEXT:
+                removed += 2
+                i += 2
+                continue
+
+            # Strip -MD, -MMD (standalone, no arg)
+            if a in ('-MD', '-MMD', '-MP'):
+                removed += 1
+                i += 1
+                continue
+
+            # Strip -W*, -O*
+            if any(a.startswith(p) for p in STRIP_PREFIXES):
+                removed += 1
+                i += 1
+                continue
+
+            # Strip exact matches
+            if a in STRIP_EXACT:
+                removed += 1
+                i += 1
+                continue
+
+            # Strip non-semantic -f flags (but keep semantic ones)
+            if a.startswith('-f') or a.startswith('-fno-'):
+                if any(a.startswith(p) for p in KEEP_F_PREFIXES):
+                    new_args.append(a)
+                elif any(a.startswith(p) for p in STRIP_F_PREFIXES):
+                    removed += 1
+                    i += 1
+                    continue
+                else:
+                    new_args.append(a)  # unknown -f flag: keep it safe
+            else:
+                new_args.append(a)
+            i += 1
+
+        if removed > 0:
+            e["arguments"] = new_args
+            total_removed += removed
+
+    if total_removed:
+        avg = total_removed / len(entries) if entries else 0
+        print(f"  剥离无用编译参数: {total_removed} 个 (avg {avg:.0f}/entry)")
+    return entries
+
+
 def main():
     parser = argparse.ArgumentParser(description="精简 compile_commands.json")
     parser.add_argument("path", help="compile_commands.json 路径")
@@ -236,6 +334,9 @@ def main():
     # 统一 Definitions
     kept = unify_definitions(kept)
 
+    # 剥离 clangd 不需要的编译参数
+    kept = strip_unnecessary_flags(kept)
+
     # 精简 include 路径
     if args.prune_includes:
         print("\n检查 -I 目录存在性...")
@@ -247,9 +348,9 @@ def main():
         print("(dry-run 模式，未修改文件)")
         return
 
-    if removed == 0:
-        print("无需修改")
-        return
+    if removed == 0 and not args.prune_includes:
+        # Even with no entries removed, flags were stripped — always write
+        pass
 
     # 备份 (使用不同后缀，不覆盖 PCH 脚本的备份)
     bak = path + ".slim-bak"

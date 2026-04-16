@@ -178,11 +178,23 @@ local function gtags_fallback(symbol)
   return false
 end
 
+--- Shader file extensions — clangd can't handle these, go straight to GTAGS.
+local SHADER_EXTS = { usf = true, ush = true, hlsl = true, hlsli = true, glsl = true, frag = true, vert = true, metal = true, comp = true }
+
 --- Async definition: definition -> declaration -> GTAGS, all non-blocking for
 --- the LSP parts.
 function M.definition()
   local symbol = current_symbol()
   local bufnr = vim.api.nvim_get_current_buf()
+
+  -- Shader files: skip LSP entirely, clangd can't parse HLSL/USF properly.
+  local ext = vim.fn.expand("%:e"):lower()
+  if SHADER_EXTS[ext] then
+    if not gtags_fallback(symbol) then
+      vim.notify("No definition (GTAGS)", vim.log.levels.INFO)
+    end
+    return
+  end
 
   -- Check if any LSP client supports definition at all.
   local has_def_client = #vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/definition" }) > 0

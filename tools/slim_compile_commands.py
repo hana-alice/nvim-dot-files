@@ -4,13 +4,18 @@ slim_compile_commands.py — 精简 UE 项目 compile_commands.json
 
 优化:
   1. 剔除 .generated.h / .init.gen.c / gen.cpp 等自动生成条目
-  2. 统一 Definitions.*.h 为公共版本，让 clangd preamble 缓存可复用
-     (133 种 preamble -> ~6 种，缓存命中率从 3% -> 接近 100%)
+  2. 剔除 shader 文件 (usf/ush/hlsl/glsl 等) — clangd 不支持
+  3. 剔除 Engine 目录的 C++ 文件 — 跳转靠 index 缓存，不需要反复 parse
+  4. 剔除 Intermediate 目录的条目 — PCH 头文件定义条目
+  5. 剔除 uetemp/ndk 等无关条目
+  6. 统一 Definitions.*.h 为公共版本，让 clangd preamble 缓存可复用
+  7. (可选) 精简 -I/-D 参数，移除不存在的目录
 
 用法:
-  python slim_compile_commands.py <path_to_compile_commands.json> [--dry-run]
+  python slim_compile_commands.py <path_to_compile_commands.json> [--dry-run] [--keep-engine]
 
-备份：自动在同目录生成 compile_commands.json.bak
+备份：自动在同目录生成 compile_commands.json.slim-bak
+       （与 prebuild_pch_v2.py 的 .pre-pch.bak 互不干扰）
 """
 
 import argparse
@@ -21,65 +26,78 @@ import shutil
 import sys
 from pathlib import Path
 
-# --- 阶段 1: 剔除生成文件 ---
+# --- 剔除规则 ---
 
-SKIP_PATTERNS = [
-    r"\.generated\.h$",
-    r"\.generated\.cpp$",
+SKIP_FILE_PATTERNS = [
+    r"\.generated\.(h|cpp)$",
     r"\.init\.gen\.c(pp)?$",
     r"\.gen\.cpp$",
     r"gen\.cpp$",
     r"PerModuleInline\.gen$",
 ]
+SKIP_FILE_RE = re.compile("|".join(SKIP_FILE_PATTERNS), re.IGNORECASE)
 
-SKIP_RE = re.compile("|".join(SKIP_PATTERNS), re.IGNORECASE)
+# Shader 后缀 — clangd 完全不支持
+SHADER_EXTS = frozenset({
+    "usf", "ush", "hlsl", "glsl", "frag", "vert", "metal", "hlsli", "comp",
+    "sf", "cg",  # 罕见但可能出现
+})
+
+# Engine 路径识别 (大小写不敏感)
+ENGINE_PATH_RE = re.compile(
+    r"[/\\]Engine[/\\](?:Source|Plugins|Shaders|Content|Intermediate|Binaries)[/\\]",
+    re.IGNORECASE,
+)
+
+# Intermediate 目录
+INTERMEDIATE_RE = re.compile(r"[/\\]Intermediate[/\\]", re.IGNORECASE)
+
+# uetemp 目录
+UETEMP_RE = re.compile(r"[/\\]uetemp[/\\]", re.IGNORECASE)
+
+# NDK / SDK 系统路径
+SDK_RE = re.compile(
+    r"[/\\](?:Android[/\\]Sdk|ndk)[/\\]",
+    re.IGNORECASE,
+)
 
 
-def should_keep(entry: dict) -> bool:
+def categorize_entry(entry: dict) -> str:
+    """返回条目类别: keep / skip_generated / skip_shader / skip_engine / skip_intermediate / skip_other"""
     f = entry.get("file", "").replace("\\", "/")
-    return not SKIP_RE.search(f)
+
+    # 1. 自动生成文件
+    if SKIP_FILE_RE.search(f):
+        return "skip_generated"
+
+    # 2. Shader
+    ext = f.rsplit(".", 1)[-1].lower() if "." in f else ""
+    if ext in SHADER_EXTS:
+        return "skip_shader"
+
+    # 3. Intermediate 目录 (PCH 定义头等)
+    if INTERMEDIATE_RE.search(f):
+        return "skip_intermediate"
+
+    # 4. uetemp
+    if UETEMP_RE.search(f):
+        return "skip_uetemp"
+
+    # 5. NDK/SDK
+    if SDK_RE.search(f):
+        return "skip_sdk"
+
+    # 6. Engine 目录
+    if ENGINE_PATH_RE.search(f):
+        return "skip_engine"
+
+    return "keep"
 
 
-# --- 阶段 2: 统一 Definitions.*.h ---
+# --- Definitions.*.h 统一 ---
 
-def unify_definitions(entries: list, dry_run: bool = False) -> list:
-    """将每个条目的 -include Definitions.*.h 替换为统一的公共定义头。
-    
-    Definitions.*.h 的区别只是各模块的 _API 宏和少量平台宏。
-    对 clangd 来说这些宏基本为空(Android monolithic build)，
-    统一后所有 TU 共享同一个 preamble，索引速度提升数倍。
-    """
-    # 先收集所有不同的 Definitions 头路径，找到 Intermediate 目录
-    definitions_dir = None
-    definitions_set = set()
-    for e in entries:
-        args = e.get("arguments", [])
-        for i, a in enumerate(args):
-            if a == "-include" and i + 1 < len(args):
-                nxt = args[i + 1].replace("\\", "/")
-                if "/Definitions." in nxt:
-                    definitions_set.add(nxt)
-                    # 提取 Intermediate 根目录
-                    m = re.search(r"(.+/Intermediate/Build/[^/]+/[^/]+/Development)/", nxt)
-                    if m and definitions_dir is None:
-                        definitions_dir = m.group(1)
-
-    if not definitions_set:
-        return entries  # 没有 Definitions 头，跳过
-
-    print(f"  Definitions.*.h 变体数: {len(definitions_set)}")
-
-    if definitions_dir is None:
-        print("  无法定位 Intermediate/Build 目录，跳过统一")
-        return entries
-
-    # 生成统一的 Definitions 头
-    # 读取所有 Definitions 头，提取所有 _API 宏
-    # 但实际上我们不需要真的合并——只要去掉 -include Definitions.*.h 即可
-    # 因为 SharedPCH 已经包含了所有必要的 #define
-    # Definitions.*.h 的内容和 SharedPCH 高度重复，只多了 MODULE_API 宏
-    # 去掉它后，_API 宏未定义 -> clang 会当空宏处理，不影响代码理解
-
+def unify_definitions(entries: list) -> list:
+    """去掉 -include Definitions.*.h，让 preamble 缓存可复用。"""
     modified = 0
     for e in entries:
         args = e.get("arguments", [])
@@ -93,7 +111,6 @@ def unify_definitions(entries: list, dry_run: bool = False) -> list:
             if a == "-include" and i + 1 < len(args):
                 nxt = args[i + 1].replace("\\", "/")
                 if "/Definitions." in nxt:
-                    # 去掉这个 -include Definitions.*.h
                     skip_next = True
                     changed = True
                     continue
@@ -102,7 +119,71 @@ def unify_definitions(entries: list, dry_run: bool = False) -> list:
             e["arguments"] = new_args
             modified += 1
 
-    print(f"  去掉 Definitions.*.h 的条目数: {modified}")
+    if modified:
+        print(f"  去掉 Definitions.*.h 的条目数: {modified}")
+    return entries
+
+
+# --- 精简 include 路径 (可选) ---
+
+def prune_nonexistent_includes(entries: list, check_fs: bool = False) -> list:
+    """移除指向不存在目录的 -I 参数。仅在 --prune-includes 时启用。"""
+    if not check_fs:
+        return entries
+
+    # 缓存目录存在性检查
+    dir_exists_cache = {}
+    removed_total = 0
+
+    for e in entries:
+        args = e.get("arguments", [])
+        new_args = []
+        removed = 0
+        i = 0
+        while i < len(args):
+            a = args[i]
+            # -I/path 或 -I /path
+            if a.startswith("-I"):
+                if a == "-I" and i + 1 < len(args):
+                    # -I <dir>
+                    d = args[i + 1].replace("\\", "/")
+                    if d not in dir_exists_cache:
+                        # 转换为可检查的路径
+                        check = d
+                        if check[1:3] == ":/":
+                            check = "/mnt/" + check[0].lower() + check[2:]
+                        dir_exists_cache[d] = os.path.isdir(check)
+                    if dir_exists_cache[d]:
+                        new_args.append(a)
+                        new_args.append(args[i + 1])
+                    else:
+                        removed += 1
+                    i += 2
+                    continue
+                else:
+                    # -I/path
+                    d = a[2:].replace("\\", "/")
+                    if d not in dir_exists_cache:
+                        check = d
+                        if len(check) > 2 and check[1:3] == ":/":
+                            check = "/mnt/" + check[0].lower() + check[2:]
+                        dir_exists_cache[d] = os.path.isdir(check)
+                    if dir_exists_cache[d]:
+                        new_args.append(a)
+                    else:
+                        removed += 1
+                    i += 1
+                    continue
+            new_args.append(a)
+            i += 1
+
+        if removed > 0:
+            e["arguments"] = new_args
+            removed_total += removed
+
+    if removed_total:
+        print(f"  移除不存在的 -I 目录: {removed_total} (总计)")
+        print(f"  目录检查缓存大小: {len(dir_exists_cache)}")
     return entries
 
 
@@ -110,6 +191,10 @@ def main():
     parser = argparse.ArgumentParser(description="精简 compile_commands.json")
     parser.add_argument("path", help="compile_commands.json 路径")
     parser.add_argument("--dry-run", action="store_true", help="只打印统计，不修改文件")
+    parser.add_argument("--keep-engine", action="store_true",
+                        help="保留 Engine 目录的 C++ 文件 (默认剔除)")
+    parser.add_argument("--prune-includes", action="store_true",
+                        help="移除指向不存在目录的 -I 参数 (较慢，需要文件系统检查)")
     args = parser.parse_args()
 
     path = os.path.abspath(args.path)
@@ -121,46 +206,72 @@ def main():
         data = json.load(f)
 
     original_count = len(data)
+    original_size = os.path.getsize(path)
 
-    # 阶段 1: 剔除生成文件
-    filtered = [e for e in data if should_keep(e)]
-    removed_count = original_count - len(filtered)
+    # 分类统计
+    stats = {}
+    kept = []
+    for e in data:
+        cat = categorize_entry(e)
+        if args.keep_engine and cat == "skip_engine":
+            cat = "keep"
+        stats[cat] = stats.get(cat, 0) + 1
+        if cat == "keep":
+            kept.append(e)
 
     print(f"原始条目: {original_count}")
-    print(f"剔除条目: {removed_count} ({removed_count*100/original_count:.1f}%)" if original_count > 0 else "")
-    print(f"保留条目: {len(filtered)}")
+    print(f"原始大小: {original_size / 1048576:.1f} MB")
+    print()
+    for cat in ["keep", "skip_generated", "skip_shader", "skip_engine",
+                 "skip_intermediate", "skip_uetemp", "skip_sdk"]:
+        count = stats.get(cat, 0)
+        if count > 0:
+            pct = count * 100 / original_count
+            marker = " ✓" if cat == "keep" else " ✗"
+            print(f"  {cat:20s}: {count:6d} ({pct:5.1f}%){marker}")
 
-    # 阶段 2: 统一 Definitions
-    filtered = unify_definitions(filtered, dry_run=args.dry_run)
+    removed = original_count - len(kept)
+    print(f"\n保留: {len(kept)} | 剔除: {removed} ({removed*100/original_count:.1f}%)")
 
-    print(f"原始大小: {os.path.getsize(path)/1048576:.1f} MB")
+    # 统一 Definitions
+    kept = unify_definitions(kept)
+
+    # 精简 include 路径
+    if args.prune_includes:
+        print("\n检查 -I 目录存在性...")
+        kept = prune_nonexistent_includes(kept, check_fs=True)
 
     if args.dry_run:
+        est_size = original_size * len(kept) / original_count
+        print(f"\n预估新大小: {est_size / 1048576:.1f} MB")
         print("(dry-run 模式，未修改文件)")
         return
 
-    if removed_count == 0:
-        # 阶段 1 没有剔除，检查阶段 2 是否做了修改
-        has_definitions = any(
-            "/Definitions." in str(e.get("arguments", []))
-            for e in filtered[:100]
-        )
-        if not has_definitions:
-            print("无需修改")
-            return
+    if removed == 0:
+        print("无需修改")
+        return
 
-    # 备份
-    bak = path + ".bak"
+    # 备份 (使用不同后缀，不覆盖 PCH 脚本的备份)
+    bak = path + ".slim-bak"
     if not os.path.exists(bak):
         shutil.copy2(path, bak)
-        print(f"备份: {bak}")
+        print(f"\n备份: {bak}")
+    else:
+        print(f"\n备份已存在: {bak}")
 
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(filtered, f, ensure_ascii=False)
+        json.dump(kept, f, ensure_ascii=False)
 
     new_size = os.path.getsize(path)
-    print(f"新大小:   {new_size/1048576:.1f} MB")
+    print(f"新大小: {new_size / 1048576:.1f} MB (减少 {(1 - new_size/original_size)*100:.0f}%)")
     print("完成。重启 clangd 使生效。")
+
+    # 同步到 Engine 目录 (如果存在)
+    parent = os.path.dirname(path)
+    engine_cc = os.path.join(parent, "Engine", "compile_commands.json")
+    if os.path.isfile(engine_cc):
+        shutil.copy2(path, engine_cc)
+        print(f"已同步到: {engine_cc}")
 
 
 if __name__ == "__main__":

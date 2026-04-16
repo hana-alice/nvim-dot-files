@@ -707,8 +707,8 @@ function M.clangd_cmd(root_dir)
   local cmd = {
     clangd,
     "--background-index",
-    "--background-index-priority=normal",
-    "-j=" .. tostring(math.max(4, vim.uv.available_parallelism and vim.uv.available_parallelism() or 8)),
+    "--background-index-priority=low",
+    "-j=8",
     "--completion-style=detailed",
     "--header-insertion=never",
     "--pch-storage=memory",
@@ -3086,15 +3086,16 @@ local function slim_compile_commands_file(path)
     return false
   end
   local python = (vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1) and "python" or "python3"
-  local cmd = { python, script, path }
+  -- --keep-engine: preserve Engine C++ entries for goto-definition
+  -- strips shaders, Intermediate, uetemp, NDK only
+  local cmd = { python, script, path, "--keep-engine" }
   local result = vim.fn.system(cmd)
   if vim.v.shell_error == 0 then
-    if result:match("剔除条目: (%d+)") then
-      local removed = result:match("剔除条目: (%d+)")
-      if tonumber(removed) > 0 then
-        vim.notify(result, vim.log.levels.INFO)
-        return true
-      end
+    -- New script outputs "保留: N | 剔除: M (...%)"
+    local removed = result:match("剔除: (%d+)")
+    if removed and tonumber(removed) > 0 then
+      vim.notify(result, vim.log.levels.INFO)
+      return true
     end
   else
     vim.notify("slim_compile_commands failed: " .. (result or ""), vim.log.levels.WARN)

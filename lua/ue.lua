@@ -710,6 +710,7 @@ function M.clangd_cmd(root_dir)
     "--background-index-priority=normal",
     "-j=16",
     "--completion-style=detailed",
+    "--completion-parse=auto",          -- text-based completion while preamble builds
     "--header-insertion=never",
     "--pch-storage=memory",
     "--function-arg-placeholders",
@@ -727,6 +728,12 @@ function M.clangd_cmd(root_dir)
       local cc_path = join(engine_root, "compile_commands.json")
       if is_file(cc_path) then
         table.insert(cmd, "--compile-commands-dir=" .. engine_root)
+      end
+      -- Use offline pre-built index if available (.clangd-index/<project>.idx)
+      local project_name = vim.fn.fnamemodify(engine_root, ":t")
+      local idx_path = join(engine_root, ".clangd-index", project_name .. ".idx")
+      if is_file(idx_path) then
+        table.insert(cmd, "--index-file=" .. idx_path)
       end
     end
   end

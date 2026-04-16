@@ -83,6 +83,44 @@ local function jump_to_location(location)
   })
 end
 
+local function normalize_path(path)
+  path = tostring(path or ""):gsub("\\", "/")
+  path = path:gsub("/+$", "")
+  return path
+end
+
+local function location_path(location)
+  local uri = location and (location.uri or location.targetUri)
+  if not uri or uri == "" then
+    return ""
+  end
+  return normalize_path(vim.uri_to_fname(uri))
+end
+
+local function location_line(location)
+  local range = location and (location.targetSelectionRange or location.targetRange or location.range)
+  local start = range and range.start or nil
+  return start and (tonumber(start.line) or 0) + 1 or 0
+end
+
+local function filter_self_locations(locations)
+  if not locations or #locations == 0 then
+    return locations
+  end
+
+  local current_file = normalize_path(vim.api.nvim_buf_get_name(0))
+  local current_line = vim.api.nvim_win_get_cursor(0)[1]
+  local filtered = {}
+
+  for _, location in ipairs(locations) do
+    if location_path(location) ~= current_file or location_line(location) ~= current_line then
+      filtered[#filtered + 1] = location
+    end
+  end
+
+  return #filtered > 0 and filtered or locations
+end
+
 -- ---------------------------------------------------------------------------
 -- Async definition: non-blocking LSP request with GTAGS fallback
 -- ---------------------------------------------------------------------------
@@ -159,6 +197,7 @@ function M.definition()
 
   -- Async: textDocument/definition
   async_lsp_request(bufnr, "textDocument/definition", function(locations)
+    locations = filter_self_locations(locations)
     if try_jump(locations, "LSP definitions") then
       return
     end
@@ -167,6 +206,7 @@ function M.definition()
     local has_decl_client = #vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/declaration" }) > 0
     if has_decl_client then
       async_lsp_request(bufnr, "textDocument/declaration", function(decl_locations)
+        decl_locations = filter_self_locations(decl_locations)
         if try_jump(decl_locations, "LSP declarations") then
           return
         end

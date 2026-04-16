@@ -258,6 +258,22 @@ local function parse_global_entries(root, lines)
   return entries
 end
 
+local function parse_rg_entries(lines)
+  local entries = {}
+  for _, line in ipairs(lines or {}) do
+    local file, lnum, col, text = tostring(line or ""):match("^(.-):(%d+):(%d+):(.*)$")
+    if file and lnum and col then
+      entries[#entries + 1] = {
+        filename = norm(file),
+        lnum = tonumber(lnum),
+        col = tonumber(col),
+        text = text or "",
+      }
+    end
+  end
+  return entries
+end
+
 local function strip_ansi(line)
   line = tostring(line or "")
   line = line:gsub("\27%[[0-9;?]*[%a]", "")
@@ -624,8 +640,7 @@ local function copy_qf_entry(entry)
   }
 end
 
-local function jump_to_global_grep_candidate(root, symbol, lines)
-  local entries = parse_global_entries(root, lines)
+local function jump_to_grep_candidate_entries(symbol, entries)
   if #entries == 0 then
     return false
   end
@@ -676,6 +691,11 @@ local function jump_to_global_grep_candidate(root, symbol, lines)
     entries[index] = copy_qf_entry(entry)
   end
   return populate_quickfix_from_entries("GTAGS grep: " .. symbol, entries)
+end
+
+local function jump_to_global_grep_candidate(root, symbol, lines)
+  local entries = parse_global_entries(root, lines)
+  return jump_to_grep_candidate_entries(symbol, entries)
 end
 
 -- ==========================================================================
@@ -1147,19 +1167,31 @@ local function resolve_context(opts)
 
   local state = read_state(engine_root)
   local project_root, uproject
+  local state_project_root, state_uproject
+  local candidates = { cur_cwd }
 
-  if state.project_root then
-    project_root, uproject = resolve_project_input(state.project_root)
+  if cur_buf ~= "" and cur_buf ~= candidates[1] then
+    table.insert(candidates, cur_buf)
   end
 
-  if not project_root and opts.detect_project ~= false then
-    local candidates = { cur_cwd }
-    if cur_buf ~= "" and cur_buf ~= candidates[1] then
-      table.insert(candidates, cur_buf)
-    end
+  if state.project_root then
+    state_project_root, state_uproject = resolve_project_input(state.project_root)
+  end
+
+  if opts.detect_project ~= false then
     for _, candidate in ipairs(candidates) do
       project_root, uproject = detect_project_root_from_path(candidate)
       if project_root then
+        break
+      end
+    end
+  end
+
+  if not project_root and state_project_root then
+    for _, candidate in ipairs(candidates) do
+      if candidate ~= "" and path_has_prefix(candidate, state_project_root) then
+        project_root = state_project_root
+        uproject = state_uproject
         break
       end
     end
@@ -1209,6 +1241,10 @@ end
 
 local function filter_shader(paths)
   return filter_extensions(paths, M.FT_SHADER)
+end
+
+local function filter_gtags_code(paths)
+  return filter_cpp(paths)
 end
 
 local function filter_code(paths)
@@ -1524,11 +1560,70 @@ local function mark_index_dirty(ctx)
   end
 end
 
+local function mode_token(ctx)
+  if ctx and ctx.project_root and ctx.project_root ~= "" then
+    return "PROJECT"
+  end
+  return "ENGINE"
+end
+
+local function count_cached_entries(path)
+  if not is_file(path) then
+    return 0
+  end
+  local ok, lines = pcall(vim.fn.readfile, path)
+  if not ok or type(lines) ~= "table" then
+    return 0
+  end
+  return #lines
+end
+
+local function prepare_cache_ready(ctx)
+  if not ctx then
+    return false
+  end
+  for _, path in ipairs({
+    ctx.paths.project_list,
+    ctx.paths.engine_list,
+    ctx.paths.workspace_list,
+    ctx.paths.workspace_all_list,
+  }) do
+    if not is_file(path) then
+      return false
+    end
+  end
+  if not db_ready(ctx.paths.workspace_db) then
+    return false
+  end
+  local key = status_root_key(ctx)
+  return key ~= "" and not dirty_index_roots[key]
+end
+
+local function prepare_summary(ctx, compile_path, opts)
+  opts = opts or {}
+  local project_count = opts.project_count or count_cached_entries(ctx.paths.project_list)
+  local engine_count = opts.engine_count or count_cached_entries(ctx.paths.engine_list)
+  local workspace_count = opts.workspace_count or count_cached_entries(ctx.paths.workspace_list)
+  local workspace_all_count = opts.workspace_all_count or count_cached_entries(ctx.paths.workspace_all_list)
+
+  local summary = ("UEPrepare done:\nProject files: %d\nEngine files: %d\nGTAGS files: %d\nGrep files: %d")
+    :format(project_count, engine_count, workspace_count, workspace_all_count)
+  summary = summary .. "\nMode: " .. (mode_token(ctx) == "PROJECT" and "project" or "engine-only")
+  if opts.reused_cache then
+    summary = summary .. "\nIndex cache: reused"
+  end
+  if compile_path and compile_path ~= "" then
+    summary = summary .. "\ncompile_commands: " .. compile_path
+  end
+  summary = summary .. "\nCache: " .. ctx.paths.cache
+  return summary
+end
+
 local _index_status_cache = {} -- key -> { token, ts }
 local _INDEX_STATUS_TTL = 30 -- seconds; only changes after UEPrepare or file save
 
 local function index_status_token(ctx)
-  if not ctx or not ctx.project_root then
+  if not ctx then
     return "UE?"
   end
 
@@ -1788,6 +1883,65 @@ local function global_lines(root, db_dir, args)
     error(code)
   end
   return code, lines
+end
+
+local function rg_code_definition_search(ctx, symbol)
+  symbol = trim(symbol)
+  if not ctx or symbol == "" then
+    return false
+  end
+
+  local rg = first_executable({ "rg" })
+  if not rg then
+    return false
+  end
+
+  local dirs = {}
+  local seen = {}
+  local function add_dir(dir)
+    dir = norm(dir)
+    if dir ~= "" and is_dir(dir) and not seen[dir] then
+      seen[dir] = true
+      dirs[#dirs + 1] = dir
+    end
+  end
+
+  if ctx.project_root and ctx.project_root ~= "" then
+    for _, relative in ipairs(existing_relative_dirs(ctx.project_root, UE_CONST.PROJECT_INDEX_DIRS)) do
+      add_dir(join(ctx.project_root, relative))
+    end
+  end
+  for _, relative in ipairs(existing_relative_dirs(ctx.engine_root, UE_CONST.ENGINE_INDEX_DIRS)) do
+    add_dir(join(ctx.engine_root, relative))
+  end
+
+  if #dirs == 0 then
+    return false
+  end
+
+  local cmd = {
+    rg,
+    "--color", "never",
+    "--no-heading",
+    "--line-number",
+    "--column",
+    "--fixed-strings",
+    "--with-filename",
+  }
+  for _, ext in ipairs(M.FT_CPP) do
+    cmd[#cmd + 1] = "-g"
+    cmd[#cmd + 1] = "*." .. ext
+  end
+  cmd[#cmd + 1] = "--"
+  cmd[#cmd + 1] = symbol
+  vim.list_extend(cmd, dirs)
+
+  local code, lines = run_lines(cmd, { cwd = workspace_root(ctx) })
+  if code ~= 0 and code ~= 1 then
+    return false
+  end
+
+  return jump_to_grep_candidate_entries(symbol, parse_rg_entries(lines))
 end
 
 -- ==========================================================================
@@ -2472,7 +2626,8 @@ end
 local generate_compile_commands_from_rsp
 do
 
-local function tokenize_rsp_line(line)
+--- Tokenize a single line: split on unquoted whitespace, strip quotes.
+local function tokenize_rsp_single_line(line)
   local tokens = {}
   local i = 1
   local len = #line
@@ -2514,29 +2669,197 @@ local function tokenize_rsp_line(line)
   return tokens
 end
 
+--- Tokenize an entire rsp file content (multi-line, handles \r\n).
+--- Also expands @"file" nested rsp references recursively.
+--- base_dir is the directory for resolving relative @ references
+--- (typically Engine/Source, since UBT runs from there).
+local function tokenize_rsp_content(content, base_dir, depth)
+  depth = depth or 0
+  if depth > 5 then return {} end -- prevent infinite recursion
+  local tokens = {}
+  -- Split on \r\n or \n
+  for line in content:gmatch("[^\r\n]+") do
+    line = trim(line)
+    if line ~= "" then
+      local line_tokens = tokenize_rsp_single_line(line)
+      for _, tok in ipairs(line_tokens) do
+        -- Expand @"path" or @path nested rsp references
+        local ref = tok:match("^@\"(.+)\"$") or tok:match("^@(.+)$")
+        if ref then
+          local ref_path
+          if ref:match("^[A-Za-z]:") or ref:match("^/") then
+            ref_path = ref
+          else
+            ref_path = join(base_dir, ref)
+          end
+          ref_path = norm(ref_path)
+          local nested = read_all(ref_path)
+          if nested then
+            -- Keep the same base_dir for nested refs (all relative to UBT CWD)
+            local nested_tokens = tokenize_rsp_content(nested, base_dir, depth + 1)
+            for _, nt in ipairs(nested_tokens) do
+              tokens[#tokens + 1] = nt
+            end
+          end
+        else
+          tokens[#tokens + 1] = tok
+        end
+      end
+    end
+  end
+  return tokens
+end
+
+--- MSVC-style flag skip/conversion table.
+--- Returns: "skip" (drop this token), "skip2" (drop this + next),
+---          converted string, or nil (keep as-is).
+local function convert_msvc_flag(tok, next_tok)
+  -- Output file flags: skip
+  if tok:match("^/Fo") or tok:match("^/Fp") or tok:match("^/Fd")
+      or tok:match("^/Fe") then
+    return "skip"
+  end
+  -- PCH usage: skip (/Yu, /Yc)
+  if tok:match("^/Yu") or tok:match("^/Yc") then
+    return "skip"
+  end
+  -- Linker-only flags: skip
+  if tok:match("^/MANIFEST") or tok:match("^/NOLOGO") or tok:match("^/DEBUG")
+      or tok:match("^/MACHINE") or tok:match("^/SUBSYSTEM") or tok:match("^/OUT:")
+      or tok:match("^/PDB:") or tok:match("^/IGNORE:") or tok:match("^/NODEFAULTLIB")
+      or tok:match("^/DEF") or tok:match("^/NAME:") or tok:match("^/errorReport")
+      or tok:match("^/INCREMENTAL") or tok:match("^/OPT:") or tok:match("^/ENTRY:")
+      or tok:match("^/IMPLIB:") or tok:match("^/MAP:") then
+    return "skip"
+  end
+  -- Experimental log / source dependencies: skip
+  if tok == "/experimental:log" then
+    return "skip2"
+  end
+  if tok:match("^/sourceDependencies") then
+    return "skip2"
+  end
+  -- /c (compile only) — clang++ uses -c but compile_commands entries don't need it
+  if tok == "/c" or tok == "/nologo" then
+    return "skip"
+  end
+  -- /I "path" → -I "path" (may be /I"path" or /I path)
+  local ipath = tok:match("^/I\"(.+)\"$") or tok:match("^/I(.+)$")
+  if ipath and ipath ~= "" then
+    return "-I" .. ipath
+  end
+  if tok == "/I" then
+    return "-I"
+  end
+  -- /external:I "path" → -isystem path
+  local extpath = tok:match("^/external:I\"(.+)\"$") or tok:match("^/external:I(.+)$")
+  if extpath and extpath ~= "" then
+    return "-isystem" .. extpath
+  end
+  if tok == "/external:I" then
+    return "-isystem"
+  end
+  -- /external:W0 — suppress external warnings — map to nothing meaningful for clang
+  if tok:match("^/external:W") then
+    return "skip"
+  end
+  -- /D → -D
+  local dval = tok:match("^/D(.+)$")
+  if dval then
+    return "-D" .. dval
+  end
+  -- /FI"path" → -include path  (forced include)
+  local fipath = tok:match("^/FI\"(.+)\"$") or tok:match("^/FI(.+)$")
+  if fipath and fipath ~= "" then
+    return "-include", fipath
+  end
+  -- /std:c++XX → -std=c++XX
+  local std = tok:match("^/std:(.+)$")
+  if std then
+    return "-std=" .. std
+  end
+  -- /TP → -x c++, /TC → -x c
+  if tok == "/TP" then
+    return "-xc++"
+  end
+  if tok == "/TC" then
+    return "-xc"
+  end
+  -- MSVC-only flags that clang should ignore: skip
+  if tok:match("^/GR") or tok:match("^/Gw") or tok:match("^/Gy") or tok:match("^/Gs")
+      or tok:match("^/guard:") or tok:match("^/Zp") or tok:match("^/Zo")
+      or tok:match("^/Z7") or tok:match("^/Zi") or tok:match("^/ZI")
+      or tok:match("^/FC$") or tok:match("^/bigobj$") or tok:match("^/fp:")
+      or tok:match("^/Ob") or tok:match("^/O1") or tok:match("^/O2") or tok:match("^/Ox")
+      or tok:match("^/Oi") or tok:match("^/MD") or tok:match("^/MT")
+      or tok:match("^/diagnostics:") or tok:match("^/utf%-8$")
+      or tok:match("^/we%d") or tok:match("^/wd%d") or tok:match("^/W%d")
+      or tok:match("^/EH") or tok:match("^/RTC")
+      or tok:match("^/Zc:")
+      or tok:match("^/d2") or tok == "/Ot" or tok == "/GF" then
+    return "skip"
+  end
+  -- /permissive- → -fpermissive (approximate)
+  if tok == "/permissive-" then
+    return "skip"
+  end
+  -- Pass-through clang-style flags unchanged
+  return nil
+end
+
+--- Parse rsp tokens into clang-compatible args + source file.
+--- Handles both MSVC (/I /D /FI /Fo) and clang (-o -I -D) styles.
 local function parse_rsp_tokens(tokens)
   local args = {}
+  local input_file = nil
   local i = 1
   while i <= #tokens do
     local tok = tokens[i]
+    local next_tok = tokens[i + 1]
+
+    -- Clang-style skips
     if tok == "-o" then
       i = i + 2
+      goto continue
     elseif tok == "-MD" then
       i = i + 1
+      goto continue
     elseif tok:match("^%-MF") then
-      i = i + 1
+      if tok == "-MF" then i = i + 2 else i = i + 1 end
+      goto continue
     elseif tok == "-include-pch" then
       i = i + 2
-    else
-      args[#args + 1] = tok
-      i = i + 1
+      goto continue
     end
+
+    -- MSVC conversion
+    if tok:match("^/") then
+      local result, extra = convert_msvc_flag(tok, next_tok)
+      if result == "skip" then
+        i = i + 1
+        goto continue
+      elseif result == "skip2" then
+        i = i + 2
+        goto continue
+      elseif result then
+        args[#args + 1] = result
+        if extra then
+          args[#args + 1] = extra
+        end
+        i = i + 1
+        goto continue
+      end
+    end
+
+    args[#args + 1] = tok
+    i = i + 1
+    ::continue::
   end
 
-  local input_file = nil
+  -- Find input file: last non-flag token
   for j = #args, 1, -1 do
     local a = args[j]
-    if not a:match("^%-") then
+    if not a:match("^%-") and (a:match("%.cpp$") or a:match("%.c$") or a:match("%.cc$") or a:match("%.cxx$")) then
       input_file = a
       table.remove(args, j)
       break
@@ -2594,7 +2917,8 @@ local function collect_rsp_files(ctx)
     return nil, "No Intermediate/Build directories found"
   end
 
-  local cmd = { fd, "--no-ignore", "--type", "f", "--extension", "rsp" }
+  -- Only collect compile rsp files (Module.*.cpp.obj.rsp), skip link/lib/def rsp
+  local cmd = { fd, "--no-ignore", "--type", "f", "-e", "rsp", "--glob", "*.cpp.obj.rsp" }
   for _, root in ipairs(search_roots) do
     cmd[#cmd + 1] = "--search-path"
     cmd[#cmd + 1] = root
@@ -2605,13 +2929,53 @@ local function collect_rsp_files(ctx)
     return nil, "No .rsp files found"
   end
 
+  -- Determine target filter from configuration.
+  -- "Development Editor" → target=UnrealEditor, config=Development
+  -- "Development" → target=UnrealGame, config=Development
+  local target_filter = nil
+  local config_filter = nil
+  local config = ctx.state and trim(ctx.state.target_configuration or "") or ""
+  if config ~= "" then
+    if config:match(" Editor$") then
+      target_filter = "UnrealEditor"
+      config_filter = config:gsub(" Editor$", "")
+    else
+      target_filter = "UnrealGame"
+      config_filter = config
+    end
+  end
+
   local rsp_files = {}
   for _, line in ipairs(lines) do
     local p = norm(trim(line))
     if p ~= "" then
-      rsp_files[#rsp_files + 1] = p
+      -- If target/config filter is set, only include matching paths.
+      -- Path pattern: .../Build/Win64/x64/{TargetName}/{Configuration}/{Module}/...
+      local dominated = true
+      if target_filter then
+        -- Check if path contains /{target_filter}/{config_filter}/
+        local has_target = p:find("/" .. target_filter .. "/", 1, true)
+        local has_config = config_filter and p:find("/" .. config_filter .. "/", 1, true)
+        if not has_target or (config_filter and not has_config) then
+          dominated = false
+        end
+      end
+      if dominated then
+        rsp_files[#rsp_files + 1] = p
+      end
     end
   end
+
+  if #rsp_files == 0 then
+    -- Fallback: if filter was too strict, return all compile rsp files
+    for _, line in ipairs(lines) do
+      local p = norm(trim(line))
+      if p ~= "" then
+        rsp_files[#rsp_files + 1] = p
+      end
+    end
+  end
+
   return rsp_files, nil
 end
 
@@ -2622,6 +2986,9 @@ generate_compile_commands_from_rsp = function(ctx)
   end
 
   local engine_source_dir = join(ctx.engine_root, "Engine", "Source")
+  -- UBT runs with Engine/Source as CWD, so all relative paths in rsp files
+  -- (../Intermediate/Build/..., Runtime/Core/Public, etc.) are relative to it.
+  local compile_dir = engine_source_dir
   local entries = {}
   local seen_files = {}
 
@@ -2630,11 +2997,16 @@ generate_compile_commands_from_rsp = function(ctx)
     if content then
       content = trim(content)
       if content ~= "" then
-        local tokens = tokenize_rsp_line(content)
+        local tokens = tokenize_rsp_content(content, engine_source_dir)
         local args, input_file = parse_rsp_tokens(tokens)
 
         if input_file and input_file ~= "" then
-          input_file = norm(input_file)
+          -- Resolve relative paths against Engine/Source (UBT's working dir)
+          if not input_file:match("^[A-Za-z]:") and not input_file:match("^/") then
+            input_file = norm(join(engine_source_dir, input_file))
+          else
+            input_file = norm(input_file)
+          end
 
           table.insert(args, 1, "clang++")
           table.insert(args, "-D__INTELLISENSE__")
@@ -2648,7 +3020,7 @@ generate_compile_commands_from_rsp = function(ctx)
                 local entry_args = vim.list_extend({}, args)
                 entry_args[#entry_args + 1] = real_file
                 entries[#entries + 1] = {
-                  directory = ctx.engine_root,
+                  directory = compile_dir,
                   file = real_file,
                   arguments = entry_args,
                 }
@@ -2661,7 +3033,7 @@ generate_compile_commands_from_rsp = function(ctx)
               local entry_args = vim.list_extend({}, args)
               entry_args[#entry_args + 1] = input_file
               entries[#entries + 1] = {
-                directory = ctx.engine_root,
+                directory = compile_dir,
                 file = input_file,
                 arguments = entry_args,
               }
@@ -2728,7 +3100,8 @@ local function generate_compile_commands(ctx)
   end
 
   if not ctx.project_root or ctx.project_root == "" then
-    return false, "No project configured for engine root. Run :UESetProject [path]"
+    return false,
+      "No engine compile_commands source found. Need existing compile_commands.json, engine .rsp files, or a project via :UESetProject [path]"
   end
 
   local uproject = ctx.uproject or find_uproject_in_dir(ctx.project_root)
@@ -3352,18 +3725,15 @@ end
 function M.statusline_status(opts)
   local ctx = resolve_context(opts)
   if not ctx then
-    return trim(vim.g.ue_build_status or "")
+    local build = trim(vim.g.ue_build_status or "")
+    return build ~= "" and ("UE " .. build) or ""
   end
 
-  local parts = {}
+  local parts = { "UE" }
   local scope = current_scope_info_from_context(ctx)
   parts[#parts + 1] = short_scope_token(scope)
-
-  if ctx.project_root then
-    parts[#parts + 1] = index_status_token(ctx)
-  else
-    parts[#parts + 1] = "UE?"
-  end
+  parts[#parts + 1] = mode_token(ctx)
+  parts[#parts + 1] = index_status_token(ctx)
 
   if M._prepare_running then
     parts[#parts + 1] = "PREP*"
@@ -3452,7 +3822,7 @@ function M.gtags_definition(symbol)
     end
   end
 
-  return false
+  return rg_code_definition_search(ctx, symbol)
 end
 
 function M.android_build_command(opts)
@@ -3976,10 +4346,6 @@ local function prepare()
     vim.notify(err, vim.log.levels.WARN)
     return
   end
-  if not ctx.project_root then
-    vim.notify("No project configured for engine root. Run :UESetProject [path]", vim.log.levels.WARN)
-    return
-  end
 
   if ctx.state.project_root ~= ctx.project_root then
     persist_project(ctx.engine_root, ctx.project_root, ctx.uproject)
@@ -3987,16 +4353,46 @@ local function prepare()
 
   ensure_dir(ctx.paths.cache)
 
-  local project_rel, project_err = scan_relative_files(ctx.project_root, existing_relative_dirs(ctx.project_root, UE_CONST.PROJECT_INDEX_DIRS))
-  if not project_rel then
+  local root = workspace_root(ctx)
+  if prepare_cache_ready(ctx) then
+    local ok_compile, compile_path = generate_compile_commands(ctx)
+    if not ok_compile then
+      invalidate_status_cache()
+      refresh_statusline()
+      populate_quickfix_from_output("UEPrepare compile_commands", compile_path, { root = root })
+      vim.notify("UEPrepare compile_commands failed: " .. compile_path, vim.log.levels.WARN)
+      if vim.g.ue_prepare_headless == 1 then
+        error("UEPrepare compile_commands failed: " .. compile_path)
+      end
+      return
+    end
+    clear_index_dirty(ctx)
     invalidate_status_cache()
     refresh_statusline()
-    populate_quickfix_from_output("UEPrepare project scan", project_err, { root = ctx.project_root })
-    vim.notify("UEPrepare project scan failed: " .. project_err, vim.log.levels.ERROR)
+    local summary = prepare_summary(ctx, compile_path, { reused_cache = true })
     if vim.g.ue_prepare_headless == 1 then
-      error("UEPrepare project scan failed: " .. project_err)
+      print(summary)
+      return
     end
+    vim.notify(summary)
     return
+  end
+
+  local project_rel = {}
+  if ctx.project_root and ctx.project_root ~= "" then
+    local project_dirs = existing_relative_dirs(ctx.project_root, UE_CONST.PROJECT_INDEX_DIRS)
+    local project_err
+    project_rel, project_err = scan_relative_files(ctx.project_root, project_dirs)
+    if not project_rel then
+      invalidate_status_cache()
+      refresh_statusline()
+      populate_quickfix_from_output("UEPrepare project scan", project_err, { root = ctx.project_root })
+      vim.notify("UEPrepare project scan failed: " .. project_err, vim.log.levels.ERROR)
+      if vim.g.ue_prepare_headless == 1 then
+        error("UEPrepare project scan failed: " .. project_err)
+      end
+      return
+    end
   end
 
   local engine_rel, engine_err = scan_relative_files(ctx.engine_root, UE_CONST.ENGINE_INDEX_DIRS)
@@ -4011,11 +4407,10 @@ local function prepare()
     return
   end
 
-  local project_code = filter_gtags_paths(filter_code(project_rel))
-  local engine_code = filter_gtags_paths(filter_code(engine_rel))
+  local project_code = filter_gtags_paths(filter_gtags_code(project_rel))
+  local engine_code = filter_gtags_paths(filter_gtags_code(engine_rel))
   local workspace_code = {}
   local workspace_seen = {}
-  local root = workspace_root(ctx)
 
   for _, path in ipairs(project_code) do
     local absolute = join(ctx.project_root, path)
@@ -4095,14 +4490,12 @@ local function prepare()
   clear_index_dirty(ctx)
   invalidate_status_cache()
   refresh_statusline()
-  local summary = ("UEPrepare done:\nProject files: %d\nEngine files: %d\nGTAGS files: %d\nGrep files: %d\ncompile_commands: %s\nCache: %s"):format(
-    #project_code,
-    #engine_code,
-    #workspace_code,
-    #workspace_all,
-    compile_path,
-    ctx.paths.cache
-  )
+  local summary = prepare_summary(ctx, compile_path, {
+    project_count = #project_code,
+    engine_count = #engine_code,
+    workspace_count = #workspace_code,
+    workspace_all_count = #workspace_all,
+  })
   if vim.g.ue_prepare_headless == 1 then
     print(summary)
     return
@@ -4126,10 +4519,6 @@ local function prepare_async()
     vim.notify(err, vim.log.levels.WARN)
     return
   end
-  if not ctx.project_root then
-    vim.notify("No project configured for engine root. Run :UESetProject [path]", vim.log.levels.WARN)
-    return
-  end
 
   if prepare_jobid then
     local ok_wait, result = pcall(vim.fn.jobwait, { prepare_jobid }, 0)
@@ -4145,6 +4534,23 @@ local function prepare_async()
   end
 
   ensure_dir(ctx.paths.cache)
+
+  if prepare_cache_ready(ctx) then
+    local root = workspace_root(ctx)
+    local ok_compile, compile_path = generate_compile_commands(ctx)
+    if not ok_compile then
+      invalidate_status_cache()
+      refresh_statusline()
+      populate_quickfix_from_output("UEPrepare compile_commands", compile_path, { root = root })
+      vim.notify("UEPrepare compile_commands failed: " .. compile_path, vim.log.levels.WARN)
+      return
+    end
+    clear_index_dirty(ctx)
+    invalidate_status_cache()
+    refresh_statusline()
+    vim.notify(prepare_summary(ctx, compile_path, { reused_cache = true }))
+    return
+  end
 
   -- fidget progress
   local ok_fidget, progress = pcall(require, "fidget.progress")
@@ -4178,16 +4584,7 @@ local function prepare_async()
 
   set_prepare_running(true)
 
-  -- ── Step 1: scan files (async, avoids freezing UI on NTFS) ──────────
-  update("scanning project files...", 5)
-
-  local project_dirs = existing_relative_dirs(ctx.project_root, UE_CONST.PROJECT_INDEX_DIRS)
-  scan_relative_files_async(ctx.project_root, project_dirs, function(project_rel, project_err)
-    if not project_rel then
-      fail(project_err)
-      return
-    end
-
+  local function continue_with_project_scan(project_rel)
     update("scanning engine files...", 15)
     scan_relative_files_async(ctx.engine_root, UE_CONST.ENGINE_INDEX_DIRS, function(engine_rel, engine_err)
       if not engine_rel then
@@ -4197,8 +4594,8 @@ local function prepare_async()
 
       -- ── Step 2: build file lists ──────────────────────────────────────
       update("building file lists...", 25)
-      local project_code = filter_gtags_paths(filter_code(project_rel))
-      local engine_code = filter_gtags_paths(filter_code(engine_rel))
+      local project_code = filter_gtags_paths(filter_gtags_code(project_rel))
+      local engine_code = filter_gtags_paths(filter_gtags_code(engine_rel))
       local workspace_code = {}
       local workspace_seen = {}
       local root = workspace_root(ctx)
@@ -4257,92 +4654,129 @@ local function prepare_async()
       -- ── Step 3: build GTAGS (async, slow) ─────────────────────────────
       update(("indexing %d files with gtags..."):format(#workspace_code), 30)
 
-  local gtags = first_executable({ "gtags" })
-  if not gtags then
-    fail("gtags not found in PATH")
-    return
-  end
-
-  local db_dir = ctx.paths.workspace_db
-  local filelist = ctx.paths.workspace_list
-  clean_db_dir(db_dir)
-
-  local gtags_cmd = { gtags, "-f", filelist, "--skip-unreadable", "--skip-symlink", db_dir }
-  local gtags_output = {}
-  local indexed_count = 0
-
-  -- Use engine_root as cwd so that relative paths in the file list resolve correctly.
-  -- When the file list contains absolute paths (cross-drive), gtags handles them too.
-  local gtags_cwd = ctx.engine_root
-
-  prepare_jobid = vim.fn.jobstart(gtags_cmd, {
-    cwd = gtags_cwd,
-    on_stdout = function(_, data)
-      collect_trimmed_lines(gtags_output, data)
-    end,
-    on_stderr = function(_, data)
-      for _, line in ipairs(data or {}) do
-        line = trim(line)
-        if line ~= "" then
-          table.insert(gtags_output, line)
-          -- gtags prints "Warning: ..." for unreadable files; count non-warning lines
-          if not line:match("^Warning:") then
-            indexed_count = indexed_count + 1
-          end
-          vim.schedule(function()
-            local pct = math.min(30 + math.floor(indexed_count / math.max(#workspace_code, 1) * 50), 80)
-            update(("gtags: %d/%d files"):format(indexed_count, #workspace_code), pct)
-          end)
-        end
+      local gtags = first_executable({ "gtags" })
+      if not gtags then
+        fail("gtags not found in PATH")
+        return
       end
-    end,
-    on_exit = function(_, code)
-      vim.schedule(function()
+
+      local db_dir = ctx.paths.workspace_db
+      local filelist = ctx.paths.workspace_list
+      clean_db_dir(db_dir)
+
+      local gtags_cmd = { gtags, "-f", filelist, "--skip-unreadable", "--skip-symlink", db_dir }
+      local gtags_output = {}
+      local indexed_count = 0
+      local gtags_started_at = vim.uv.hrtime()
+      local gtags_timer = vim.uv.new_timer()
+
+      -- Use engine_root as cwd so that relative paths in the file list resolve correctly.
+      -- When the file list contains absolute paths (cross-drive), gtags handles them too.
+      local gtags_cwd = ctx.engine_root
+
+      gtags_timer:start(2000, 2000, vim.schedule_wrap(function()
+        if prepare_jobid and prepare_jobid > 0 then
+          local elapsed = math.max(1, math.floor((vim.uv.hrtime() - gtags_started_at) / 1e9))
+          local pct = indexed_count > 0
+              and math.min(30 + math.floor(indexed_count / math.max(#workspace_code, 1) * 50), 80)
+            or 35
+          update(("gtags running: %d/%d files, %ds elapsed"):format(indexed_count, #workspace_code, elapsed), pct)
+        end
+      end))
+
+      prepare_jobid = vim.fn.jobstart(gtags_cmd, {
+        cwd = gtags_cwd,
+        on_stdout = function(_, data)
+          collect_trimmed_lines(gtags_output, data)
+        end,
+        on_stderr = function(_, data)
+          for _, line in ipairs(data or {}) do
+            line = trim(line)
+            if line ~= "" then
+              table.insert(gtags_output, line)
+              -- gtags prints "Warning: ..." for unreadable files; count non-warning lines
+              if not line:match("^Warning:") then
+                indexed_count = indexed_count + 1
+              end
+              vim.schedule(function()
+                local pct = math.min(30 + math.floor(indexed_count / math.max(#workspace_code, 1) * 50), 80)
+                update(("gtags: %d/%d files"):format(indexed_count, #workspace_code), pct)
+              end)
+            end
+          end
+        end,
+        on_exit = function(_, code)
+          vim.schedule(function()
+            prepare_jobid = nil
+            if gtags_timer then
+              gtags_timer:stop()
+              gtags_timer:close()
+              gtags_timer = nil
+            end
+
+            if code ~= 0 or not db_ready(db_dir) then
+              fail("gtags exited with code " .. code .. "\n" .. table.concat(gtags_output, "\n"))
+              return
+            end
+
+            -- ── Step 4: generate compile_commands (may be fast or slow) ─────
+            update("generating compile_commands...", 85)
+
+            local ok_compile, compile_path = generate_compile_commands(ctx)
+            if not ok_compile then
+              -- compile_commands failure is non-fatal — GTAGS is the important part
+              update("compile_commands skipped: " .. (compile_path or "unknown"), 90)
+              vim.notify("UEPrepare: compile_commands failed (non-fatal): " .. (compile_path or "unknown"), vim.log.levels.WARN)
+            end
+
+            clear_index_dirty(ctx)
+            invalidate_status_cache()
+            refresh_statusline()
+            set_prepare_running(false)
+
+            local summary = prepare_summary(ctx, ok_compile and compile_path or nil, {
+              project_count = #project_code,
+              engine_count = #engine_code,
+              workspace_count = #workspace_code,
+              workspace_all_count = #workspace_all,
+            })
+
+            update("done", 100)
+            if handle then
+              handle.message = summary
+              handle:finish()
+            end
+            vim.notify(summary)
+          end)
+        end,
+      })
+
+      if prepare_jobid <= 0 then
         prepare_jobid = nil
-
-        if code ~= 0 or not db_ready(db_dir) then
-          fail("gtags exited with code " .. code .. "\n" .. table.concat(gtags_output, "\n"))
-          return
+        if gtags_timer then
+          gtags_timer:stop()
+          gtags_timer:close()
+          gtags_timer = nil
         end
-
-        -- ── Step 4: generate compile_commands (may be fast or slow) ─────
-        update("generating compile_commands...", 85)
-
-        local ok_compile, compile_path = generate_compile_commands(ctx)
-        if not ok_compile then
-          -- compile_commands failure is non-fatal — GTAGS is the important part
-          update("compile_commands skipped: " .. (compile_path or "unknown"), 90)
-          vim.notify("UEPrepare: compile_commands failed (non-fatal): " .. (compile_path or "unknown"), vim.log.levels.WARN)
-        end
-
-        clear_index_dirty(ctx)
-        invalidate_status_cache()
-        refresh_statusline()
-        set_prepare_running(false)
-
-        local summary = ("UEPrepare done: %d project, %d engine, %d GTAGS, %d grep files"):format(
-          #project_code, #engine_code, #workspace_code, #workspace_all
-        )
-        if ok_compile then
-          summary = summary .. "\ncompile_commands: " .. compile_path
-        end
-
-        update("done", 100)
-        if handle then
-          handle.message = summary
-          handle:finish()
-        end
-        vim.notify(summary)
-      end)
-    end,
-  })
-
-  if prepare_jobid <= 0 then
-    prepare_jobid = nil
-    fail("failed to start gtags process")
+        fail("failed to start gtags process")
+      end
+    end)
   end
-    end) -- end engine scan callback
-  end) -- end project scan callback
+  -- ── Step 1: scan files (async, avoids freezing UI on NTFS) ──────────
+  if ctx.project_root and ctx.project_root ~= "" then
+    update("scanning project files...", 5)
+    local project_dirs = existing_relative_dirs(ctx.project_root, UE_CONST.PROJECT_INDEX_DIRS)
+    scan_relative_files_async(ctx.project_root, project_dirs, function(project_rel, project_err)
+      if not project_rel then
+        fail(project_err)
+        return
+      end
+      continue_with_project_scan(project_rel)
+    end)
+  else
+    update("engine-only mode: skipping project scan...", 5)
+    continue_with_project_scan({})
+  end
 end
 
 function M.prepare_headless()
@@ -4560,7 +4994,7 @@ function M.setup()
     pattern = { "*.Build.cs", "*.Target.cs", "*.uproject", "*.uplugin" },
     callback = function()
       local ctx = resolve_context()
-      if ctx and ctx.project_root then
+      if ctx then
         mark_index_dirty(ctx)
       end
       invalidate_status_cache()

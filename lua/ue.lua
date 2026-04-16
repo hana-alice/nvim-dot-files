@@ -708,7 +708,7 @@ function M.clangd_cmd(root_dir)
     clangd,
     "--background-index",
     "--background-index-priority=normal",
-    "-j=16",
+    "-j=24",
     "--completion-style=detailed",
     "--completion-parse=auto",          -- text-based completion while preamble builds
     "--header-insertion=never",
@@ -3127,6 +3127,10 @@ local function run_compile_commands_pipeline(path, targets)
 
   vim.notify("compile_commands pipeline: pch+unify+prune in background...", vim.log.levels.INFO)
 
+  -- Record mtime before pipeline to detect actual changes
+  local stat_before = vim.uv.fs_stat(path)
+  local mtime_before = stat_before and stat_before.mtime.sec or 0
+
   -- Detect engine-only project for unify
   local path_lower = path:gsub("\\", "/"):lower()
   local is_engine_only = path_lower:find("/engine/") and true or false
@@ -3150,6 +3154,13 @@ local function run_compile_commands_pipeline(path, targets)
       vim.schedule(function()
         if code ~= 0 then
           vim.notify("compile_commands pipeline failed (exit " .. code .. ")", vim.log.levels.WARN)
+          return
+        end
+        -- Check if CDB was actually modified
+        local stat_after = vim.uv.fs_stat(path)
+        local mtime_after = stat_after and stat_after.mtime.sec or 0
+        if mtime_after == mtime_before then
+          vim.notify("compile_commands pipeline: no changes, skipping clangd restart", vim.log.levels.INFO)
           return
         end
         -- Sync primary target to secondary targets

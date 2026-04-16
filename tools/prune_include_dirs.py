@@ -235,9 +235,12 @@ def main():
     print(f"Dir cache: {len(_dir_cache)} directories cached")
 
     if not dry_run:
-        with open(cdb_path, 'w') as f:
-            json.dump(cdb, f, indent=2)
-        print(f"Written to {cdb_path}")
+        if total_removed == 0:
+            print("No changes needed — CDB already pruned")
+        else:
+            with open(cdb_path, 'w') as f:
+                json.dump(cdb, f, indent=2)
+            print(f"Written to {cdb_path}")
     else:
         print("[DRY RUN] No changes made")
 

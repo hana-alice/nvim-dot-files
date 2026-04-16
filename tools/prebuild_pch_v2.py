@@ -250,19 +250,22 @@ def main():
                 new_args.append(a)
             data[idx]["arguments"] = new_args
 
-    # 备份
-    bak = cc_path + ".pre-pch.bak"
-    if not os.path.exists(bak):
-        shutil.copy2(cc_path, bak)
+    if modified == 0:
+        print("\nNo changes needed — PCH already applied")
+    else:
+        # 备份
+        bak = cc_path + ".pre-pch.bak"
+        if not os.path.exists(bak):
+            shutil.copy2(cc_path, bak)
 
-    with open(cc_path, "w") as f:
-        json.dump(data, f, ensure_ascii=False)
+        with open(cc_path, "w") as f:
+            json.dump(data, f, ensure_ascii=False)
 
-    # 同步到 Engine 子目录
-    engine_cc = os.path.join(cc_dir, "Engine", "compile_commands.json")
-    if os.path.isdir(os.path.dirname(engine_cc)):
-        shutil.copy2(cc_path, engine_cc)
-        print(f"同步: {engine_cc}")
+        # 同步到 Engine 子目录
+        engine_cc = os.path.join(cc_dir, "Engine", "compile_commands.json")
+        if os.path.isdir(os.path.dirname(engine_cc)):
+            shutil.copy2(cc_path, engine_cc)
+            print(f"同步: {engine_cc}")
 
     print(f"\n替换了 {modified} 个条目 (-include -> -include-pch)")
     print(f"\n下一步:")

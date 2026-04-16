@@ -704,18 +704,34 @@ end
 
 function M.clangd_cmd(root_dir)
   local clangd = first_executable(clangd_candidates(root_dir or cwd())) or "clangd"
-  return {
+  local cmd = {
     clangd,
     "--background-index",
+    "--background-index-priority=normal",
+    "-j=" .. tostring(math.max(4, vim.uv.available_parallelism and vim.uv.available_parallelism() or 8)),
     "--completion-style=detailed",
     "--header-insertion=never",
     "--pch-storage=memory",
-    "--clang-tidy",
     "--function-arg-placeholders",
     "--limit-results=200",
     "--limit-references=200",
     "--query-driver=**/clang*.exe,**/clang*,**/gcc,**/g++,**/cc,**/c++,**/cl.exe",
   }
+
+  -- Point clangd to the engine root's compile_commands.json explicitly.
+  -- Without this, clangd searches from the file's directory upward and may
+  -- find a stale copy or miss the one we maintain at the engine root.
+  if root_dir and root_dir ~= "" then
+    local engine_root = find_engine_root(root_dir)
+    if engine_root then
+      local cc_path = join(engine_root, "compile_commands.json")
+      if is_file(cc_path) then
+        table.insert(cmd, "--compile-commands-dir=" .. engine_root)
+      end
+    end
+  end
+
+  return cmd
 end
 
 -- ==========================================================================
@@ -1578,6 +1594,16 @@ local function count_cached_entries(path)
   return #lines
 end
 
+local function db_ready(db_dir)
+  for _, name in ipairs({ "GTAGS", "GRTAGS", "GPATH" }) do
+    local path = join(db_dir, name)
+    if not is_file(path) or vim.fn.getfsize(path) <= 0 then
+      return false
+    end
+  end
+  return true
+end
+
 local function prepare_cache_ready(ctx)
   if not ctx then
     return false
@@ -1816,16 +1842,6 @@ local function cleanup_gradle_debug_artifacts(ctx)
       end
     end
   end
-end
-
-local function db_ready(db_dir)
-  for _, name in ipairs({ "GTAGS", "GRTAGS", "GPATH" }) do
-    local path = join(db_dir, name)
-    if not is_file(path) or vim.fn.getfsize(path) <= 0 then
-      return false
-    end
-  end
-  return true
 end
 
 local function build_gtags_db(root, filelist, db_dir, label)
@@ -3062,15 +3078,61 @@ end
 
 end -- do block
 
+local function slim_compile_commands_file(path)
+  -- Use external Python script to avoid 200MB JSON decode inside Neovim
+  local script = vim.fn.stdpath("config") .. "/tools/slim_compile_commands.py"
+  if not is_file(script) then
+    vim.notify("slim_compile_commands.py not found: " .. script, vim.log.levels.WARN)
+    return false
+  end
+  local python = (vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1) and "python" or "python3"
+  local cmd = { python, script, path }
+  local result = vim.fn.system(cmd)
+  if vim.v.shell_error == 0 then
+    if result:match("剔除条目: (%d+)") then
+      local removed = result:match("剔除条目: (%d+)")
+      if tonumber(removed) > 0 then
+        vim.notify(result, vim.log.levels.INFO)
+        return true
+      end
+    end
+  else
+    vim.notify("slim_compile_commands failed: " .. (result or ""), vim.log.levels.WARN)
+  end
+  return false
+end
+
 local function write_compile_commands_targets(ctx, content)
   if not content or content == "" then
     return false, "compile_commands.json was empty"
   end
 
   content = augment_compile_commands_with_shaders(ctx, content)
+
+  -- Slim: strip .generated.h / .init.gen.c / gen.cpp entries to speed up clangd indexing
+  local ok_decode, decoded = pcall(vim.json.decode, content)
+  if ok_decode and type(decoded) == "table" then
+    local original_count = #decoded
+    local kept = {}
+    for _, entry in ipairs(decoded) do
+      local f = (entry.file or ""):gsub("\\", "/")
+      if not f:match("%.generated%.") and not f:match("%.init%.gen%.") and not f:match("gen%.cpp$") then
+        kept[#kept + 1] = entry
+      end
+    end
+    if #kept < original_count then
+      vim.notify(
+        ("compile_commands: %d → %d entries (-%d generated)"):format(original_count, #kept, original_count - #kept),
+        vim.log.levels.INFO
+      )
+      content = vim.json.encode(kept)
+    end
+  end
+
   local preferred = compile_commands_targets(ctx)[1]
   for _, target in ipairs(compile_commands_targets(ctx)) do
     write_all(target, content)
+    slim_compile_commands_file(target)
   end
 
   return true, preferred
@@ -3089,14 +3151,27 @@ local function export_compile_commands_to_engine_root(ctx)
 end
 
 local function generate_compile_commands(ctx)
+  -- Prefer UBT-generated compile_commands.json if it already exists at a target path.
+  -- The UBT file is more complete (15k+ entries with full module resolution)
+  -- vs RSP-based generation which may miss entries or have subtly wrong paths.
+  local targets = compile_commands_targets(ctx)
+  for _, target in ipairs(targets) do
+    if is_file(target) and vim.fn.getfsize(target) > 1024 then
+      slim_compile_commands_file(target)
+      return true, target .. " (UBT, existing)"
+    end
+  end
+
+  -- Try other candidate locations (Engine/Intermediate/Build/, project root, fd search)
+  local ok_existing, existing_path = export_compile_commands_to_engine_root(ctx)
+  if ok_existing then
+    return true, existing_path .. " (UBT)"
+  end
+
+  -- Fallback: generate from .rsp files (works without running GenerateClangDatabase)
   local rsp_count, rsp_path = generate_compile_commands_from_rsp(ctx)
   if rsp_count then
     return true, rsp_path .. " (" .. rsp_count .. " entries from .rsp files)"
-  end
-
-  local ok_existing, existing_path = export_compile_commands_to_engine_root(ctx)
-  if ok_existing then
-    return true, existing_path
   end
 
   if not ctx.project_root or ctx.project_root == "" then
@@ -3945,7 +4020,7 @@ local function edit_cheatsheet()
 end
 
 local function show_cheatsheet()
-  open_cheatsheet({ preview = true })
+  require("utils.cheatsheet").open()
 end
 
 local function set_project(input)
@@ -4110,32 +4185,13 @@ local function set_platform(input)
       invalidate_status_cache()
       refresh_statusline()
       _context_cache = {}
-      vim.notify(("UE platform set: %s %s\nRun :UEExportCompileCommands to regenerate for this platform"):format(plat, conf))
+      vim.notify(("UE platform set: %s %s\nRun :UEPrepare to regenerate for this platform"):format(plat, conf))
     end)
   end)
 end
 
-local function export_compile_commands()
-  local ctx, err = resolve_context()
-  if not ctx then
-    vim.notify(err, vim.log.levels.WARN)
-    return
-  end
-
-  local ok_compile, compile_result = generate_compile_commands(ctx)
-  if not ok_compile then
-    invalidate_status_cache()
-    refresh_statusline()
-    populate_quickfix_from_output("UEExportCompileCommands", compile_result, { root = workspace_root(ctx) })
-    vim.notify("UEExportCompileCommands failed: " .. compile_result, vim.log.levels.ERROR)
-    return
-  end
-
-  clear_index_dirty(ctx)
-  invalidate_status_cache()
-  refresh_statusline()
-  vim.notify("compile_commands exported:\n" .. compile_result)
-end
+-- export_compile_commands is now an alias for prepare_async (unified flow)
+local export_compile_commands
 
 local stop_android_debugger
 
@@ -4535,6 +4591,48 @@ local function prepare_async()
 
   ensure_dir(ctx.paths.cache)
 
+  -- ── Timing & ETA ─────────────────────────────────────────────────────
+  -- Load previous run timings for ETA estimation
+  local prev_timings = ctx.state.prepare_timings or {}
+  local phase_start = vim.uv.hrtime()
+  local total_start = phase_start
+  local timings = {} -- { phase_name = seconds }
+
+  local function elapsed_s()
+    return math.max(1, math.floor((vim.uv.hrtime() - total_start) / 1e9))
+  end
+
+  local function phase_elapsed_s()
+    return (vim.uv.hrtime() - phase_start) / 1e9
+  end
+
+  local function start_phase()
+    phase_start = vim.uv.hrtime()
+  end
+
+  local function end_phase(name)
+    timings[name] = phase_elapsed_s()
+    phase_start = vim.uv.hrtime()
+  end
+
+  local function eta_str(phase_name, pct_done)
+    -- Try to estimate from previous run timings
+    local prev_total = 0
+    for _, v in pairs(prev_timings) do prev_total = prev_total + (tonumber(v) or 0) end
+    if prev_total > 0 then
+      local el = elapsed_s()
+      local progress = math.max(pct_done / 100, 0.01)
+      local est_total = el / progress
+      local remaining = math.max(0, math.floor(est_total - el))
+      if remaining > 0 then
+        return (" ~%ds left"):format(remaining)
+      end
+      return " finishing..."
+    end
+    return ""
+  end
+
+  -- ── Cache fast-path ──────────────────────────────────────────────────
   if prepare_cache_ready(ctx) then
     local root = workspace_root(ctx)
     local ok_compile, compile_path = generate_compile_commands(ctx)
@@ -4552,21 +4650,23 @@ local function prepare_async()
     return
   end
 
-  -- fidget progress
+  -- ── fidget progress ──────────────────────────────────────────────────
   local ok_fidget, progress = pcall(require, "fidget.progress")
   local handle
   if ok_fidget then
     handle = progress.handle.create({
       title = "UEPrepare",
-      message = "scanning project files...",
+      message = "starting...",
       lsp_client = { name = "ue" },
       percentage = 0,
     })
   end
 
   local function update(msg, pct)
+    local eta = eta_str(nil, pct or 0)
+    local full_msg = msg .. eta .. ("  [%ds]"):format(elapsed_s())
     if handle then
-      handle.message = msg
+      handle.message = full_msg
       if pct then handle.percentage = pct end
     end
   end
@@ -4583,201 +4683,244 @@ local function prepare_async()
   end
 
   set_prepare_running(true)
+  start_phase()
 
-  local function continue_with_project_scan(project_rel)
-    update("scanning engine files...", 15)
-    scan_relative_files_async(ctx.engine_root, UE_CONST.ENGINE_INDEX_DIRS, function(engine_rel, engine_err)
-      if not engine_rel then
-        fail(engine_err)
-        return
+  local function continue_after_scan(project_rel, engine_rel)
+    end_phase("scan")
+
+    -- ── Phase 2: build file lists ────────────────────────────────────
+    update("building file lists...", 25)
+    start_phase()
+
+    local project_code = filter_gtags_paths(filter_gtags_code(project_rel))
+    local engine_code = filter_gtags_paths(filter_gtags_code(engine_rel))
+    local workspace_code = {}
+    local workspace_seen = {}
+    local root = workspace_root(ctx)
+
+    for _, path in ipairs(project_code) do
+      local absolute = join(ctx.project_root, path)
+      local relative = relative_to(root, absolute)
+      if not workspace_seen[relative] then
+        workspace_seen[relative] = true
+        table.insert(workspace_code, relative)
       end
+    end
 
-      -- ── Step 2: build file lists ──────────────────────────────────────
-      update("building file lists...", 25)
-      local project_code = filter_gtags_paths(filter_gtags_code(project_rel))
-      local engine_code = filter_gtags_paths(filter_gtags_code(engine_rel))
-      local workspace_code = {}
-      local workspace_seen = {}
-      local root = workspace_root(ctx)
+    for _, path in ipairs(engine_code) do
+      local absolute = join(ctx.engine_root, path)
+      local relative = relative_to(root, absolute)
+      if not workspace_seen[relative] then
+        workspace_seen[relative] = true
+        table.insert(workspace_code, relative)
+      end
+    end
 
-      for _, path in ipairs(project_code) do
-        local absolute = join(ctx.project_root, path)
-        local relative = relative_to(root, absolute)
-        if not workspace_seen[relative] then
-          workspace_seen[relative] = true
-          table.insert(workspace_code, relative)
+    table.sort(workspace_code)
+
+    write_lines(ctx.paths.project_list, project_code)
+    write_lines(ctx.paths.engine_list, engine_code)
+    write_lines(ctx.paths.workspace_list, workspace_code)
+
+    -- All-types file list (code + config) for cached grep
+    local project_all = filter_gtags_paths(filter_extensions(project_rel, M.FT_ALL))
+    local engine_all = filter_gtags_paths(filter_extensions(engine_rel, M.FT_ALL))
+    local workspace_all = {}
+    local workspace_all_seen = {}
+
+    for _, path in ipairs(project_all) do
+      local absolute = join(ctx.project_root, path)
+      local relative = relative_to(root, absolute)
+      if not workspace_all_seen[relative] then
+        workspace_all_seen[relative] = true
+        table.insert(workspace_all, relative)
+      end
+    end
+
+    for _, path in ipairs(engine_all) do
+      local absolute = join(ctx.engine_root, path)
+      local relative = relative_to(root, absolute)
+      if not workspace_all_seen[relative] then
+        workspace_all_seen[relative] = true
+        table.insert(workspace_all, relative)
+      end
+    end
+
+    table.sort(workspace_all)
+    write_lines(ctx.paths.workspace_all_list, workspace_all)
+
+    end_phase("lists")
+
+    -- ── Phase 3: build GTAGS (async, slow) ───────────────────────────
+    update(("indexing %d files with gtags..."):format(#workspace_code), 30)
+    start_phase()
+
+    local gtags = first_executable({ "gtags" })
+    if not gtags then
+      fail("gtags not found in PATH")
+      return
+    end
+
+    local db_dir = ctx.paths.workspace_db
+    local filelist = ctx.paths.workspace_list
+    clean_db_dir(db_dir)
+
+    local gtags_cmd = { gtags, "-f", filelist, "--skip-unreadable", "--skip-symlink", db_dir }
+    local gtags_output = {}
+    local indexed_count = 0
+    local gtags_started_at = vim.uv.hrtime()
+    local gtags_timer = vim.uv.new_timer()
+    local gtags_cwd = ctx.engine_root
+
+    gtags_timer:start(2000, 2000, vim.schedule_wrap(function()
+      if prepare_jobid and prepare_jobid > 0 then
+        local gtags_elapsed = math.max(1, math.floor((vim.uv.hrtime() - gtags_started_at) / 1e9))
+        local pct = indexed_count > 0
+            and math.min(30 + math.floor(indexed_count / math.max(#workspace_code, 1) * 50), 80)
+          or 35
+        -- ETA based on gtags progress
+        local gtags_eta = ""
+        if indexed_count > 100 then
+          local rate = indexed_count / gtags_elapsed
+          local remaining_files = #workspace_code - indexed_count
+          local remaining_s = math.max(0, math.floor(remaining_files / rate))
+          -- Add estimate for compile_commands phase
+          local cc_est = tonumber(prev_timings.compile_commands) or 10
+          gtags_eta = (" ~%ds left"):format(remaining_s + math.floor(cc_est))
+        end
+        local msg = ("gtags: %d/%d files, %ds elapsed%s"):format(
+          indexed_count, #workspace_code, gtags_elapsed, gtags_eta)
+        if handle then
+          handle.message = msg
+          handle.percentage = pct
         end
       end
+    end))
 
-      for _, path in ipairs(engine_code) do
-        local absolute = join(ctx.engine_root, path)
-        local relative = relative_to(root, absolute)
-        if not workspace_seen[relative] then
-          workspace_seen[relative] = true
-          table.insert(workspace_code, relative)
-        end
-      end
-
-      table.sort(workspace_code)
-
-      write_lines(ctx.paths.project_list, project_code)
-      write_lines(ctx.paths.engine_list, engine_code)
-      write_lines(ctx.paths.workspace_list, workspace_code)
-
-      -- All-types file list (code + config) for cached grep
-      local project_all = filter_gtags_paths(filter_extensions(project_rel, M.FT_ALL))
-      local engine_all = filter_gtags_paths(filter_extensions(engine_rel, M.FT_ALL))
-      local workspace_all = {}
-      local workspace_all_seen = {}
-
-      for _, path in ipairs(project_all) do
-        local absolute = join(ctx.project_root, path)
-        local relative = relative_to(root, absolute)
-        if not workspace_all_seen[relative] then
-          workspace_all_seen[relative] = true
-          table.insert(workspace_all, relative)
-        end
-      end
-
-      for _, path in ipairs(engine_all) do
-        local absolute = join(ctx.engine_root, path)
-        local relative = relative_to(root, absolute)
-        if not workspace_all_seen[relative] then
-          workspace_all_seen[relative] = true
-          table.insert(workspace_all, relative)
-        end
-      end
-
-      table.sort(workspace_all)
-      write_lines(ctx.paths.workspace_all_list, workspace_all)
-
-      -- ── Step 3: build GTAGS (async, slow) ─────────────────────────────
-      update(("indexing %d files with gtags..."):format(#workspace_code), 30)
-
-      local gtags = first_executable({ "gtags" })
-      if not gtags then
-        fail("gtags not found in PATH")
-        return
-      end
-
-      local db_dir = ctx.paths.workspace_db
-      local filelist = ctx.paths.workspace_list
-      clean_db_dir(db_dir)
-
-      local gtags_cmd = { gtags, "-f", filelist, "--skip-unreadable", "--skip-symlink", db_dir }
-      local gtags_output = {}
-      local indexed_count = 0
-      local gtags_started_at = vim.uv.hrtime()
-      local gtags_timer = vim.uv.new_timer()
-
-      -- Use engine_root as cwd so that relative paths in the file list resolve correctly.
-      -- When the file list contains absolute paths (cross-drive), gtags handles them too.
-      local gtags_cwd = ctx.engine_root
-
-      gtags_timer:start(2000, 2000, vim.schedule_wrap(function()
-        if prepare_jobid and prepare_jobid > 0 then
-          local elapsed = math.max(1, math.floor((vim.uv.hrtime() - gtags_started_at) / 1e9))
-          local pct = indexed_count > 0
-              and math.min(30 + math.floor(indexed_count / math.max(#workspace_code, 1) * 50), 80)
-            or 35
-          update(("gtags running: %d/%d files, %ds elapsed"):format(indexed_count, #workspace_code, elapsed), pct)
-        end
-      end))
-
-      prepare_jobid = vim.fn.jobstart(gtags_cmd, {
-        cwd = gtags_cwd,
-        on_stdout = function(_, data)
-          collect_trimmed_lines(gtags_output, data)
-        end,
-        on_stderr = function(_, data)
-          for _, line in ipairs(data or {}) do
-            line = trim(line)
-            if line ~= "" then
-              table.insert(gtags_output, line)
-              -- gtags prints "Warning: ..." for unreadable files; count non-warning lines
-              if not line:match("^Warning:") then
-                indexed_count = indexed_count + 1
-              end
-              vim.schedule(function()
-                local pct = math.min(30 + math.floor(indexed_count / math.max(#workspace_code, 1) * 50), 80)
-                update(("gtags: %d/%d files"):format(indexed_count, #workspace_code), pct)
-              end)
+    prepare_jobid = vim.fn.jobstart(gtags_cmd, {
+      cwd = gtags_cwd,
+      on_stdout = function(_, data)
+        collect_trimmed_lines(gtags_output, data)
+      end,
+      on_stderr = function(_, data)
+        for _, line in ipairs(data or {}) do
+          line = trim(line)
+          if line ~= "" then
+            table.insert(gtags_output, line)
+            if not line:match("^Warning:") then
+              indexed_count = indexed_count + 1
             end
           end
-        end,
-        on_exit = function(_, code)
-          vim.schedule(function()
-            prepare_jobid = nil
-            if gtags_timer then
-              gtags_timer:stop()
-              gtags_timer:close()
-              gtags_timer = nil
-            end
-
-            if code ~= 0 or not db_ready(db_dir) then
-              fail("gtags exited with code " .. code .. "\n" .. table.concat(gtags_output, "\n"))
-              return
-            end
-
-            -- ── Step 4: generate compile_commands (may be fast or slow) ─────
-            update("generating compile_commands...", 85)
-
-            local ok_compile, compile_path = generate_compile_commands(ctx)
-            if not ok_compile then
-              -- compile_commands failure is non-fatal — GTAGS is the important part
-              update("compile_commands skipped: " .. (compile_path or "unknown"), 90)
-              vim.notify("UEPrepare: compile_commands failed (non-fatal): " .. (compile_path or "unknown"), vim.log.levels.WARN)
-            end
-
-            clear_index_dirty(ctx)
-            invalidate_status_cache()
-            refresh_statusline()
-            set_prepare_running(false)
-
-            local summary = prepare_summary(ctx, ok_compile and compile_path or nil, {
-              project_count = #project_code,
-              engine_count = #engine_code,
-              workspace_count = #workspace_code,
-              workspace_all_count = #workspace_all,
-            })
-
-            update("done", 100)
-            if handle then
-              handle.message = summary
-              handle:finish()
-            end
-            vim.notify(summary)
-          end)
-        end,
-      })
-
-      if prepare_jobid <= 0 then
-        prepare_jobid = nil
-        if gtags_timer then
-          gtags_timer:stop()
-          gtags_timer:close()
-          gtags_timer = nil
         end
-        fail("failed to start gtags process")
+      end,
+      on_exit = function(_, code)
+        vim.schedule(function()
+          prepare_jobid = nil
+          if gtags_timer then
+            gtags_timer:stop()
+            gtags_timer:close()
+            gtags_timer = nil
+          end
+
+          if code ~= 0 or not db_ready(db_dir) then
+            fail("gtags exited with code " .. code .. "\n" .. table.concat(gtags_output, "\n"))
+            return
+          end
+
+          end_phase("gtags")
+
+          -- ── Phase 4: generate compile_commands ─────────────────────
+          update("generating compile_commands from .rsp...", 85)
+          start_phase()
+
+          local ok_compile, compile_path = generate_compile_commands(ctx)
+          if not ok_compile then
+            update("compile_commands skipped: " .. (compile_path or "unknown"), 90)
+            vim.notify("UEPrepare: compile_commands failed (non-fatal): " .. (compile_path or "unknown"), vim.log.levels.WARN)
+          end
+
+          end_phase("compile_commands")
+
+          -- ── Phase 5: finalize ──────────────────────────────────────
+          clear_index_dirty(ctx)
+          invalidate_status_cache()
+          refresh_statusline()
+          set_prepare_running(false)
+
+          -- Persist timings for future ETA estimation
+          timings.total = elapsed_s()
+          update_state_field(ctx.engine_root, "prepare_timings", timings)
+
+          local summary = prepare_summary(ctx, ok_compile and compile_path or nil, {
+            project_count = #project_code,
+            engine_count = #engine_code,
+            workspace_count = #workspace_code,
+            workspace_all_count = #workspace_all,
+          })
+          summary = summary .. ("\nElapsed: %ds (scan:%ds lists:%ds gtags:%ds cc:%ds)"):format(
+            timings.total,
+            math.floor(timings.scan or 0),
+            math.floor(timings.lists or 0),
+            math.floor(timings.gtags or 0),
+            math.floor(timings.compile_commands or 0))
+
+          update("done", 100)
+          if handle then
+            handle.message = ("done in %ds"):format(timings.total)
+            handle:finish()
+          end
+          vim.notify(summary)
+        end)
+      end,
+    })
+
+    if prepare_jobid <= 0 then
+      prepare_jobid = nil
+      if gtags_timer then
+        gtags_timer:stop()
+        gtags_timer:close()
+        gtags_timer = nil
       end
-    end)
+      fail("failed to start gtags process")
+    end
   end
-  -- ── Step 1: scan files (async, avoids freezing UI on NTFS) ──────────
-  if ctx.project_root and ctx.project_root ~= "" then
-    update("scanning project files...", 5)
-    local project_dirs = existing_relative_dirs(ctx.project_root, UE_CONST.PROJECT_INDEX_DIRS)
-    scan_relative_files_async(ctx.project_root, project_dirs, function(project_rel, project_err)
-      if not project_rel then
-        fail(project_err)
-        return
-      end
-      continue_with_project_scan(project_rel)
-    end)
-  else
-    update("engine-only mode: skipping project scan...", 5)
-    continue_with_project_scan({})
+
+  -- ── Phase 1: scan files (async) ──────────────────────────────────────
+  local function start_scan()
+    if ctx.project_root and ctx.project_root ~= "" then
+      update("scanning project files...", 5)
+      local project_dirs = existing_relative_dirs(ctx.project_root, UE_CONST.PROJECT_INDEX_DIRS)
+      scan_relative_files_async(ctx.project_root, project_dirs, function(project_rel, project_err)
+        if not project_rel then
+          fail(project_err)
+          return
+        end
+        update("scanning engine files...", 15)
+        scan_relative_files_async(ctx.engine_root, UE_CONST.ENGINE_INDEX_DIRS, function(engine_rel, engine_err)
+          if not engine_rel then
+            fail(engine_err)
+            return
+          end
+          continue_after_scan(project_rel, engine_rel)
+        end)
+      end)
+    else
+      update("engine-only: scanning engine files...", 10)
+      scan_relative_files_async(ctx.engine_root, UE_CONST.ENGINE_INDEX_DIRS, function(engine_rel, engine_err)
+        if not engine_rel then
+          fail(engine_err)
+          return
+        end
+        continue_after_scan({}, engine_rel)
+      end)
+    end
   end
+
+  start_scan()
 end
+
+-- export_compile_commands is now an alias for the unified prepare flow
+export_compile_commands = prepare_async
 
 function M.prepare_headless()
   local ok, err = xpcall(prepare, debug.traceback)
@@ -4789,22 +4932,79 @@ function M.prepare_headless()
   vim.cmd("qall!")
 end
 
-local function clear_cache()
+local function clear_cache(opts)
+  opts = opts or {}
+  local bang = opts.bang or false -- :UEClearCache! = full clean including clangd + LSP restart
+
   local ctx, err = resolve_context({ detect_project = false })
   if not ctx then
     vim.notify(err, vim.log.levels.WARN)
     return
   end
 
-  pcall(vim.fn.delete, ctx.paths.project_list)
-  pcall(vim.fn.delete, ctx.paths.engine_list)
-  pcall(vim.fn.delete, ctx.paths.workspace_list)
-  pcall(vim.fn.delete, ctx.paths.workspace_all_list)
-  pcall(vim.fn.delete, join(ctx.paths.cache, "gtags"), "rf")
+  local removed = {}
+
+  -- 1. nvim-ue own caches (gtags file lists, state, db)
+  for _, f in ipairs({ ctx.paths.project_list, ctx.paths.engine_list, ctx.paths.workspace_list, ctx.paths.workspace_all_list, ctx.paths.state }) do
+    if vim.fn.filereadable(f) == 1 then
+      pcall(vim.fn.delete, f)
+      table.insert(removed, "  " .. f)
+    end
+  end
+  local gtags_dir = join(ctx.paths.cache, "gtags")
+  if is_dir(gtags_dir) then
+    pcall(vim.fn.delete, gtags_dir, "rf")
+    table.insert(removed, "  " .. gtags_dir .. "/ (gtags)")
+  end
+
+  -- 2. clangd index cache (.cache/clangd/ under engine and project roots)
+  local clangd_roots = { ctx.engine_root }
+  if ctx.project_root then
+    table.insert(clangd_roots, ctx.project_root)
+  end
+  for _, root in ipairs(clangd_roots) do
+    local clangd_cache = join(root, ".cache", "clangd")
+    if is_dir(clangd_cache) then
+      pcall(vim.fn.delete, clangd_cache, "rf")
+      table.insert(removed, "  " .. clangd_cache .. "/ (clangd index)")
+    end
+  end
+
+  -- 3. compile_commands.json (only with bang)
+  if bang then
+    for _, root in ipairs(clangd_roots) do
+      local cc = join(root, "compile_commands.json")
+      if vim.fn.filereadable(cc) == 1 then
+        pcall(vim.fn.delete, cc)
+        table.insert(removed, "  " .. cc .. " (compile_commands)")
+      end
+    end
+  end
+
+  -- summary
+  if #removed == 0 then
+    vim.notify("UE: no caches found to clean", vim.log.levels.INFO)
+  else
+    vim.notify("UE cache cleared:\n" .. table.concat(removed, "\n"), vim.log.levels.INFO)
+  end
 
   invalidate_status_cache()
   refresh_statusline()
-  vim.notify("UE cache cleared under: " .. ctx.paths.cache)
+
+  -- 4. restart clangd LSP so it re-indexes cleanly
+  if bang then
+    local clients = vim.lsp.get_clients({ name = "clangd" })
+    if #clients > 0 then
+      -- Stop all clangd instances first, then restart after they exit
+      for _, client in ipairs(clients) do
+        client:stop()
+      end
+      vim.defer_fn(function()
+        vim.cmd("edit")  -- re-trigger lspconfig attach on current buffer
+        vim.notify("UE: clangd restarted", vim.log.levels.INFO)
+      end, 500)
+    end
+  end
 end
 
 -- ---------------------------------------------------------------------------
@@ -4898,23 +5098,9 @@ function M.setup()
     nargs = "?",
     complete = set_platform_completions,
   })
-  vim.api.nvim_create_user_command("UEExportCompileCommands", export_compile_commands, {})
-  vim.api.nvim_create_user_command("UEGenerateFromRSP", function()
-    local ctx, err = resolve_context()
-    if not ctx then
-      vim.notify(err, vim.log.levels.WARN)
-      return
-    end
-    local count, result = generate_compile_commands_from_rsp(ctx)
-    if not count then
-      vim.notify("UEGenerateFromRSP failed: " .. (result or "unknown error"), vim.log.levels.ERROR)
-      return
-    end
-    clear_index_dirty(ctx)
-    invalidate_status_cache()
-    refresh_statusline()
-    vim.notify(("compile_commands generated from .rsp: %d C++ entries\n%s"):format(count, result))
-  end, {})
+  -- Legacy aliases (thin wrappers → UEPrepare)
+  vim.api.nvim_create_user_command("UEExportCompileCommands", prepare_async, {})
+  vim.api.nvim_create_user_command("UEGenerateFromRSP", prepare_async, {})
   vim.api.nvim_create_user_command("UEBuild", build_android, {})
   vim.api.nvim_create_user_command("UEBuildAndroid", build_android, {})
   vim.api.nvim_create_user_command("UELaunch", function()
@@ -4931,7 +5117,9 @@ function M.setup()
   vim.api.nvim_create_user_command("UEPrepareSync", prepare, {})
   vim.api.nvim_create_user_command("UECheatsheet", show_cheatsheet, {})
   vim.api.nvim_create_user_command("UECheatsheetEdit", edit_cheatsheet, {})
-  vim.api.nvim_create_user_command("UEClearCache", clear_cache, {})
+  vim.api.nvim_create_user_command("UEClearCache", function(cmd_opts)
+    clear_cache({ bang = cmd_opts.bang })
+  end, { bang = true, desc = "Clear UE caches (! = also clangd index, compile_commands, restart LSP)" })
 
   -- Android DAP commands
   vim.api.nvim_create_user_command("UEAndroidDAPAttach", function()

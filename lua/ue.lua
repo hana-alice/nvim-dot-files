@@ -4830,8 +4830,21 @@ local function prepare_async()
 
     end_phase("lists")
 
-    -- ── Phase 3: build GTAGS (async, slow) ───────────────────────────
-    update(("indexing %d files with gtags..."):format(#workspace_code), 30)
+    -- ── Phase 3a: generate compile_commands (parallel with gtags) ────
+    -- compile_commands doesn't depend on gtags, so start it immediately.
+    -- The pipeline (slim → pch → unify) runs in background via jobstart.
+    update("generating compile_commands...", 30)
+    start_phase()
+
+    local ok_compile, compile_path = generate_compile_commands(ctx)
+    if not ok_compile then
+      vim.notify("UEPrepare: compile_commands failed (non-fatal): " .. (compile_path or "unknown"), vim.log.levels.WARN)
+    end
+
+    end_phase("compile_commands")
+
+    -- ── Phase 3b: build GTAGS (async, slow) ───────────────────────────
+    update(("indexing %d files with gtags..."):format(#workspace_code), 35)
     start_phase()
 
     local gtags = first_executable({ "gtags" })
@@ -4908,19 +4921,7 @@ local function prepare_async()
 
           end_phase("gtags")
 
-          -- ── Phase 4: generate compile_commands ─────────────────────
-          update("generating compile_commands from .rsp...", 85)
-          start_phase()
-
-          local ok_compile, compile_path = generate_compile_commands(ctx)
-          if not ok_compile then
-            update("compile_commands skipped: " .. (compile_path or "unknown"), 90)
-            vim.notify("UEPrepare: compile_commands failed (non-fatal): " .. (compile_path or "unknown"), vim.log.levels.WARN)
-          end
-
-          end_phase("compile_commands")
-
-          -- ── Phase 5: finalize ──────────────────────────────────────
+          -- ── Finalize ─────────────────────────────────────────────
           clear_index_dirty(ctx)
           invalidate_status_cache()
           refresh_statusline()

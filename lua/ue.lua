@@ -3118,12 +3118,14 @@ local function run_compile_commands_pipeline(path, targets)
   local python = (vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1) and "python" or "python3"
   local pch_script = vim.fn.stdpath("config") .. "/tools/prebuild_pch_v2.py"
   local unify_script = vim.fn.stdpath("config") .. "/tools/unify_include_dirs.py"
+  local prune_script = vim.fn.stdpath("config") .. "/tools/prune_include_dirs.py"
   local has_pch = is_file(pch_script)
   local has_unify = is_file(unify_script)
+  local has_prune = is_file(prune_script)
 
-  if not has_pch and not has_unify then return end
+  if not has_pch and not has_unify and not has_prune then return end
 
-  vim.notify("compile_commands pipeline: pch+unify in background...", vim.log.levels.INFO)
+  vim.notify("compile_commands pipeline: pch+unify+prune in background...", vim.log.levels.INFO)
 
   -- Detect engine-only project for unify
   local path_lower = path:gsub("\\", "/"):lower()
@@ -3136,6 +3138,10 @@ local function run_compile_commands_pipeline(path, targets)
   if has_unify then
     local extra = is_engine_only and " --include-engine" or ""
     table.insert(cmds, python .. ' "' .. unify_script .. '" "' .. path .. '" --max-overhead=200' .. extra)
+  end
+  if has_prune then
+    -- Use python -I to isolate from PYTHONPATH pollution; sample 20 files per PCH group
+    table.insert(cmds, python .. ' -I "' .. prune_script .. '" "' .. path .. '" --sample 20')
   end
 
   local shell_cmd = table.concat(cmds, " && ")

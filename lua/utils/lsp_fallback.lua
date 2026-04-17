@@ -348,6 +348,94 @@ local function clear_winner(scored_locations, platform_hints, current_buf_path)
   return nil
 end
 
+-- ---------------------------------------------------------------------------
+-- workspace/symbol path: AST-free, fast, fuzzy. We filter to exact name
+-- match because gd semantics require it.
+-- ---------------------------------------------------------------------------
+
+-- SymbolInformation.kind values we want for goto-definition.
+-- Filter out things like Module/File/Namespace which can't be a "definition".
+local DEFINITION_KINDS = {
+  [5] = true,   -- Class
+  [6] = true,   -- Method
+  [7] = true,   -- Property
+  [8] = true,   -- Field
+  [9] = true,   -- Constructor
+  [10] = true,  -- Enum
+  [11] = true,  -- Interface
+  [12] = true,  -- Function
+  [13] = true,  -- Variable
+  [14] = true,  -- Constant
+  [22] = true,  -- Struct
+  [23] = true,  -- Event
+  [24] = true,  -- Operator
+  [25] = true,  -- TypeParameter
+}
+
+-- async_lsp_workspace_symbol(bufnr, query, exact, on_result):
+--   Sends workspace/symbol to all clients on bufnr.
+--   Calls on_result(locations|nil) once when all clients have replied
+--   (or after 5s, whichever first).
+--   When `exact` is true, filters results whose .name ~= query.
+local function async_lsp_workspace_symbol(bufnr, query, exact, on_result)
+  local clients = vim.lsp.get_clients({ bufnr = bufnr, method = "workspace/symbol" })
+  if #clients == 0 then
+    vim.schedule(function() on_result(nil) end)
+    return
+  end
+
+  local pending = #clients
+  local merged = {}
+  local fired = false
+  local timer = nil
+
+  local function fire(arg)
+    if fired then return end
+    fired = true
+    if timer and not timer:is_closing() then
+      timer:stop()
+      timer:close()
+    end
+    on_result(arg)
+  end
+
+  local function dec_pending()
+    pending = pending - 1
+    if pending == 0 then fire(#merged > 0 and merged or nil) end
+  end
+
+  -- Hard 5s ceiling — workspace/symbol should be < 200ms; if it's slower
+  -- something is wrong (e.g. clangd is rebuilding its symbol DB) and we'd
+  -- rather let the precise path / GTAGS take over.
+  timer = vim.defer_fn(function() fire(#merged > 0 and merged or nil) end, 5000)
+
+  for _, client in ipairs(clients) do
+    local ok_req = pcall(function()
+      client:request("workspace/symbol", { query = query }, function(err, result)
+        if not err and type(result) == "table" then
+          for _, sym in ipairs(result) do
+            local keep = true
+            if exact and sym.name ~= query then keep = false end
+            if keep and sym.kind and not DEFINITION_KINDS[sym.kind] then keep = false end
+            if keep and sym.location and sym.location.uri and sym.location.range then
+              -- normalize SymbolInformation -> Location
+              table.insert(merged, {
+                uri = sym.location.uri,
+                range = sym.location.range,
+                -- carry kind for later ranking
+                _ws_kind = sym.kind,
+                _ws_container = sym.containerName,
+              })
+            end
+          end
+        end
+        dec_pending()
+      end, bufnr)
+    end)
+    if not ok_req then dec_pending() end
+  end
+end
+
 -- Async LSP definition with built-in retry for empty results (clangd preamble
 -- still building) AND smart implementation merging when definition only
 -- returns headers (which usually means the user is on a virtual interface

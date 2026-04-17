@@ -394,6 +394,18 @@ return {
       })
       opts.picker = opts.picker or {}
       opts.picker.layout = vim.tbl_deep_extend("force", { preset = "vscode" }, opts.picker.layout or {})
+      -- Override projects source. Default (recent=true) walks vim.v.oldfiles
+      -- synchronously and calls Snacks.git.get_root() for each, which on UE
+      -- workspaces (hundreds of oldfiles, deep paths) blocks the main loop
+      -- for tens of seconds inside Neovide → looks like a freeze.
+      -- Use a fixed dev root with shallow depth instead.
+      opts.picker.sources = opts.picker.sources or {}
+      opts.picker.sources.projects = vim.tbl_deep_extend("force", opts.picker.sources.projects or {}, {
+        recent = false,
+        dev = { "<PROJ_DRIVE>" },
+        max_depth = 1,
+        patterns = { ".git", ".uproject", "package.json" },
+      })
       opts.picker.actions = vim.tbl_deep_extend("force", opts.picker.actions or {}, {
         paste_clipboard = paste_picker_clipboard,
         pin_sidebar_qflist = pin_sidebar_qflist,

@@ -149,6 +149,23 @@ local function populate_quickfix(title, locations)
 end
 
 local function jump_to_location(location)
+  local uri = location.uri or location.targetUri
+  if uri then
+    -- Pre-load the target buffer so vim.lsp.util.show_document doesn't end
+    -- up calling nvim_win_set_cursor on a still-empty (lazy bufadd'd)
+    -- buffer, which would raise "Cursor position outside buffer" and
+    -- strand the caller. We must use :edit (not just bufload) because
+    -- bufload alone doesn't always trigger BufReadCmd autocommands that
+    -- some configs rely on (treesitter, lsp attach, filetype, etc.).
+    -- However, for files already loaded, :edit is a no-op-ish.
+    local target_path = vim.uri_to_fname(uri)
+    local bufnr = vim.fn.bufnr(target_path)
+    if bufnr == -1 or not vim.api.nvim_buf_is_loaded(bufnr) then
+      -- Use silent :edit so it doesn't print "X lines" message during
+      -- the async callback. Wrap in pcall in case the path is unreadable.
+      pcall(vim.cmd, "silent! edit " .. vim.fn.fnameescape(target_path))
+    end
+  end
   vim.cmd("normal! m'")
   return vim.lsp.util.show_document(location, location._position_encoding or "utf-16", {
     reuse_win = true,
@@ -811,8 +828,8 @@ function M.definition()
 
       -- Jump now if we haven't already.
       if not jumped then
-        local pok, ok = pcall(jump_to_location, winner)
-        ok = pok and ok
+        local pok, ok_or_err = pcall(jump_to_location, winner)
+        local ok = pok and ok_or_err == true
         if ok then
           jumped = true
           instant_winner = winner
@@ -822,6 +839,22 @@ function M.definition()
           -- still runs and can post a "precise differs" hint.
           -- INSTANT_PRECISE_RECONCILE controls whether reconcile is shown
           -- (handled in precise track), not whether precise keeps running.
+        else
+          -- Instant jump failed — most likely show_document raised
+          -- "Cursor position outside buffer" because the target file
+          -- couldn't be loaded synchronously. Do NOT mark resolved here:
+          -- let the precise track / GTAGS still try to deliver a real
+          -- jump. Log at DEBUG so it's available via :messages but not
+          -- noisy. The OVERALL_TIMEOUT_MS hard-stop guarantees we won't
+          -- hang forever even in pathological cases.
+          if not pok then
+            vim.schedule(function()
+              vim.notify(string.format(
+                "⚠ instant jump errored, falling back: %s",
+                tostring(ok_or_err):sub(1, 200)
+              ), vim.log.levels.DEBUG)
+            end)
+          end
         end
       end
     end)

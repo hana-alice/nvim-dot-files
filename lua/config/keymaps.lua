@@ -275,8 +275,16 @@ map("n", "<leader>ui", "<cmd>UEInstallAndroid<cr>", { desc = "UE: Install APK to
 
 -- Deferred: apply {nowait=true} overrides once LazyVim has finished loading
 -- its own <leader>u* mappings, so ours take priority without delay.
-vim.api.nvim_create_autocmd("User", {
-  pattern = "VeryLazy",
-  once = true,
-  callback = apply_ue_runtime_overrides,
-})
+-- CRITICAL: if VeryLazy already fired by the time this file loads (which
+-- can happen because LazyVim auto-loads config/keymaps.lua ON the
+-- VeryLazy event itself), the once-handler would never run. Apply
+-- immediately in that case.
+if vim.v.vim_did_enter == 1 then
+  apply_ue_runtime_overrides()
+else
+  vim.api.nvim_create_autocmd("User", {
+    pattern = "VeryLazy",
+    once = true,
+    callback = apply_ue_runtime_overrides,
+  })
+end

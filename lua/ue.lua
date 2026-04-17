@@ -60,8 +60,9 @@ local function cwd()
   return norm(vim.fn.getcwd())
 end
 
+local _platform = require("utils.platform")
 local function is_native_windows()
-  return vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1
+  return _platform.is_windows
 end
 
 local function focus_window(win)
@@ -721,11 +722,38 @@ end
 
 function M.clangd_cmd(root_dir)
   local clangd = first_executable(clangd_candidates(root_dir or cwd())) or "clangd"
+
+  -- Adaptive -j: clangd preambles for UE TUs cost 1.5–3 GB each. With
+  -- --pch-storage=memory + N parallel workers, peak memory ~= N * 2 GB.
+  -- Default budget: 1 worker per 4 GB RAM, clamped to [8, 24]. Override
+  -- via UE_CLANGD_JOBS=N.
+  local jobs
+  local env_jobs = tonumber(vim.env.UE_CLANGD_JOBS or "")
+  if env_jobs and env_jobs > 0 then
+    jobs = math.floor(env_jobs)
+  else
+    local total_mb = 0
+    local ok, mem = pcall(function()
+      return vim.uv.get_total_memory and vim.uv.get_total_memory() or 0
+    end)
+    if ok and type(mem) == "number" and mem > 0 then
+      total_mb = math.floor(mem / (1024 * 1024))
+    end
+    if total_mb >= 1024 then
+      local total_gb = math.floor(total_mb / 1024)
+      jobs = math.floor(total_gb / 4)
+    else
+      jobs = 8
+    end
+    if jobs < 8 then jobs = 8 end
+    if jobs > 24 then jobs = 24 end
+  end
+
   local cmd = {
     clangd,
     "--background-index",
     "--background-index-priority=normal",
-    "-j=24",
+    "-j=" .. tostring(jobs),
     "--completion-style=detailed",
     "--completion-parse=auto",          -- text-based completion while preamble builds
     "--header-insertion=never",
@@ -743,10 +771,17 @@ function M.clangd_cmd(root_dir)
     local engine_root = find_engine_root(root_dir)
     if engine_root then
       local cc_path = join(engine_root, "compile_commands.json")
+      local cc_mtime = 0
       if is_file(cc_path) then
         table.insert(cmd, "--compile-commands-dir=" .. engine_root)
+        local st = vim.uv.fs_stat(cc_path)
+        cc_mtime = st and st.mtime and st.mtime.sec or 0
       end
       -- Use staged offline indexes if available; active index wins.
+      -- CRITICAL: only attach indexes that are AT LEAST as fresh as the
+      -- compile_commands.json. A stale index references TUs that no
+      -- longer exist after CDB regeneration; clangd will not clean it
+      -- and gd can jump to phantom locations in deleted files.
       local idx_candidates = {
         cache_paths(engine_root).active_index,
         cache_paths(engine_root).hot_index,
@@ -755,8 +790,12 @@ function M.clangd_cmd(root_dir)
       }
       for _, idx_path in ipairs(idx_candidates) do
         if is_file(idx_path) then
-          table.insert(cmd, "--index-file=" .. idx_path)
-          break
+          local st = vim.uv.fs_stat(idx_path)
+          local idx_mtime = st and st.mtime and st.mtime.sec or 0
+          if cc_mtime == 0 or idx_mtime >= cc_mtime then
+            table.insert(cmd, "--index-file=" .. idx_path)
+            break
+          end
         end
       end
     end
@@ -1118,7 +1157,17 @@ local function find_engine_root(path)
   return nil
 end
 
-local function current_engine_root()
+local function current_engine_root(preferred_bufname)
+  -- Prefer the buffer's own engine when explicitly provided. This is critical
+  -- for multi-engine workflows: when cwd is in Engine A but we're resolving a
+  -- buffer in Engine B, we MUST return B's engine, not A's.
+  if preferred_bufname and preferred_bufname ~= "" then
+    local engine_root = find_engine_root(preferred_bufname)
+    if engine_root then
+      return engine_root
+    end
+  end
+
   local current_cwd = cwd()
   if current_cwd ~= "" then
     local engine_root = find_engine_root(current_cwd)
@@ -1128,7 +1177,7 @@ local function current_engine_root()
   end
 
   local bufname = norm(vim.api.nvim_buf_get_name(0))
-  if bufname ~= "" then
+  if bufname ~= "" and bufname ~= preferred_bufname then
     return find_engine_root(bufname)
   end
 
@@ -1211,17 +1260,33 @@ end
 local function resolve_context(opts)
   opts = opts or {}
 
-  -- Cache key: cwd + bufname (covers the two inputs that vary)
+  -- Cache key: cwd + bufname (covers the two inputs that vary).
+  -- When an explicit bufname is passed (e.g. clangd_root(bufnr=42) for a
+  -- non-current buffer), use it for both detection AND cache key so two
+  -- different buffers can't share a stale entry.
   local cur_cwd = cwd()
-  local cur_buf = norm(vim.api.nvim_buf_get_name(0))
+  local explicit_buf = opts.bufname and norm(opts.bufname) or nil
+  local cur_buf = explicit_buf or norm(vim.api.nvim_buf_get_name(0))
   local cache_key = cur_cwd .. "\0" .. cur_buf
   local now = vim.uv.hrtime() / 1e9
   local cached = CORE_RT.context_cache[cache_key]
   if cached and (now - cached.ts) < _CONTEXT_TTL then
-    return cached.ctx, cached.err
+    -- Stale-state guard: if state.json on disk is newer than when this
+    -- ctx was built, drop the cache entry. Without this guard external
+    -- writers (other nvim processes, build scripts) would be invisible
+    -- for up to _CONTEXT_TTL seconds.
+    if cached.ctx and cached.state_path then
+      local mtime = vim.uv.fs_stat(cached.state_path)
+      mtime = mtime and mtime.mtime and mtime.mtime.sec or 0
+      if mtime <= (cached.state_mtime or 0) then
+        return cached.ctx, cached.err
+      end
+    else
+      return cached.ctx, cached.err
+    end
   end
 
-  local engine_root = current_engine_root()
+  local engine_root = current_engine_root(explicit_buf)
   if not engine_root then
     local err = "No Unreal Engine root found from current buffer or cwd"
     CORE_RT.context_cache[cache_key] = { ctx = nil, err = err, ts = now }
@@ -1260,14 +1325,24 @@ local function resolve_context(opts)
     end
   end
 
+  local paths = cache_paths(engine_root)
+  local state_stat = vim.uv.fs_stat(paths.state)
+  local state_mtime = state_stat and state_stat.mtime and state_stat.mtime.sec or 0
+
   local ctx = {
     engine_root = engine_root,
     project_root = project_root,
     uproject = uproject,
     state = state,
-    paths = cache_paths(engine_root),
+    paths = paths,
   }
-  CORE_RT.context_cache[cache_key] = { ctx = ctx, err = nil, ts = now }
+  CORE_RT.context_cache[cache_key] = {
+    ctx = ctx,
+    err = nil,
+    ts = now,
+    state_path = paths.state,
+    state_mtime = state_mtime,
+  }
   return ctx
 end
 
@@ -2505,6 +2580,7 @@ end
 invalidate_status_cache = function()
   CORE_RT.status_cache = {}
   CORE_RT.context_cache = {}
+  CORE_RT.engine_root_cache = {}
   INDEX_RT.status_cache = {}
 end
 
@@ -4845,12 +4921,16 @@ end
 function M.clangd_root(bufnr)
   bufnr = bufnr or 0
   local bufname = norm(vim.api.nvim_buf_get_name(bufnr))
-  local engine_root = find_engine_root(bufname) or current_engine_root()
+  local engine_root = find_engine_root(bufname) or current_engine_root(bufname)
   if engine_root then
     if bufname == "" or path_has_prefix(bufname, engine_root) then
       return engine_root
     end
-    local ctx = resolve_context()
+    -- Pass the bufname through so resolve_context picks up the buffer's
+    -- own engine, not the cwd's engine. Critical for multi-engine setups
+    -- and for background buffers (lsp may invoke clangd_root for a buf
+    -- other than the current one).
+    local ctx = resolve_context({ bufname = bufname })
     if ctx and ctx.project_root and path_has_prefix(bufname, ctx.project_root) then
       return ctx.engine_root
     end

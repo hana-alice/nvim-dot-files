@@ -4,15 +4,32 @@ local M = {}
 -- MODULE STATE
 -- ==========================================================================
 
-local setup_done = false
-local build_term_buf = nil
-local build_term_win = nil
-local build_term_jobid = nil
-local prepare_jobid = nil
-local status_cache = {} -- { key = string, value = string, tick = number }
-local dirty_index_roots = {}
-local _engine_root_cache = {} -- dir -> engine_root (or false)
-local _context_cache = {} -- key -> { ctx, ts }
+local CORE_RT = {
+  setup_done = false,
+  build_term_buf = nil,
+  build_term_win = nil,
+  build_term_jobid = nil,
+  prepare_jobid = nil,
+  status_cache = {}, -- { key = string, value = string, tick = number }
+  dirty_index_roots = {},
+  engine_root_cache = {}, -- dir -> engine_root (or false)
+  context_cache = {}, -- key -> { ctx, ts }
+}
+local INDEX_FN = {}
+local INDEX_RT = {
+  job = nil,
+  module_state = {},
+  contexts = {},
+  timers = {},
+  idle_cold_ms = 120000,
+  debounce_current_ms = 1200,
+  debounce_hot_ms = 8000,
+  restart_debounce_s = 45,
+  last_restart_at = 0,
+  status_cache = {},
+  status_ttl = 30,
+}
+local cache_paths
 local _CONTEXT_TTL = 30 -- seconds (filesystem walks are expensive on NTFS)
 
 -- ==========================================================================
@@ -729,11 +746,18 @@ function M.clangd_cmd(root_dir)
       if is_file(cc_path) then
         table.insert(cmd, "--compile-commands-dir=" .. engine_root)
       end
-      -- Use offline pre-built index if available (.clangd-index/<project>.idx)
-      local project_name = vim.fn.fnamemodify(engine_root, ":t")
-      local idx_path = join(engine_root, ".clangd-index", project_name .. ".idx")
-      if is_file(idx_path) then
-        table.insert(cmd, "--index-file=" .. idx_path)
+      -- Use staged offline indexes if available; active index wins.
+      local idx_candidates = {
+        cache_paths(engine_root).active_index,
+        cache_paths(engine_root).hot_index,
+        cache_paths(engine_root).current_index,
+        cache_paths(engine_root).full_index,
+      }
+      for _, idx_path in ipairs(idx_candidates) do
+        if is_file(idx_path) then
+          table.insert(cmd, "--index-file=" .. idx_path)
+          break
+        end
       end
     end
   end
@@ -1058,26 +1082,26 @@ local function find_engine_root(path)
   end
 
   local start_dir = is_file(path) and dirname(path) or path
-  if _engine_root_cache[start_dir] ~= nil then
-    local cached = _engine_root_cache[start_dir]
+  if CORE_RT.engine_root_cache[start_dir] ~= nil then
+    local cached = CORE_RT.engine_root_cache[start_dir]
     return cached ~= false and cached or nil
   end
 
   local dir = start_dir
   local visited = {}
   while dir ~= "" do
-    if _engine_root_cache[dir] ~= nil then
-      local cached = _engine_root_cache[dir]
+    if CORE_RT.engine_root_cache[dir] ~= nil then
+      local cached = CORE_RT.engine_root_cache[dir]
       local result = cached ~= false and cached or nil
       for _, v in ipairs(visited) do
-        _engine_root_cache[v] = cached
+        CORE_RT.engine_root_cache[v] = cached
       end
       return result
     end
     table.insert(visited, dir)
     if is_engine_root(dir) then
       for _, v in ipairs(visited) do
-        _engine_root_cache[v] = dir
+        CORE_RT.engine_root_cache[v] = dir
       end
       return dir
     end
@@ -1089,7 +1113,7 @@ local function find_engine_root(path)
   end
 
   for _, v in ipairs(visited) do
-    _engine_root_cache[v] = false
+    CORE_RT.engine_root_cache[v] = false
   end
   return nil
 end
@@ -1111,8 +1135,12 @@ local function current_engine_root()
   return nil
 end
 
-local function cache_paths(engine_root)
+cache_paths = function(engine_root)
   local cache = join(engine_root, ".cache", "nvim-ue")
+  local index_dir = join(cache, "index")
+  local index_cdb_dir = join(index_dir, "compile_commands")
+  local active_index_dir = join(engine_root, ".clangd-index")
+  local project_name = vim.fn.fnamemodify(engine_root, ":t")
   return {
     cache = cache,
     state = join(cache, "state.json"),
@@ -1121,6 +1149,18 @@ local function cache_paths(engine_root)
     workspace_list = join(cache, "workspace_gtags.files"),
     workspace_all_list = join(cache, "workspace_all.files"),
     workspace_db = join(cache, "gtags", "workspace"),
+    index_dir = index_dir,
+    index_state = join(index_dir, "modules.json"),
+    index_queue = join(index_dir, "queue.json"),
+    index_cdb_dir = index_cdb_dir,
+    index_current_cdb = join(index_cdb_dir, "current.json"),
+    index_hot_cdb = join(index_cdb_dir, "hot.json"),
+    index_full_cdb = join(index_cdb_dir, "full.json"),
+    active_index_dir = active_index_dir,
+    active_index = join(active_index_dir, project_name .. ".idx"),
+    current_index = join(active_index_dir, project_name .. ".current.idx"),
+    hot_index = join(active_index_dir, project_name .. ".hot.idx"),
+    full_index = join(active_index_dir, project_name .. ".full.idx"),
   }
 end
 
@@ -1176,7 +1216,7 @@ local function resolve_context(opts)
   local cur_buf = norm(vim.api.nvim_buf_get_name(0))
   local cache_key = cur_cwd .. "\0" .. cur_buf
   local now = vim.uv.hrtime() / 1e9
-  local cached = _context_cache[cache_key]
+  local cached = CORE_RT.context_cache[cache_key]
   if cached and (now - cached.ts) < _CONTEXT_TTL then
     return cached.ctx, cached.err
   end
@@ -1184,7 +1224,7 @@ local function resolve_context(opts)
   local engine_root = current_engine_root()
   if not engine_root then
     local err = "No Unreal Engine root found from current buffer or cwd"
-    _context_cache[cache_key] = { ctx = nil, err = err, ts = now }
+    CORE_RT.context_cache[cache_key] = { ctx = nil, err = err, ts = now }
     return nil, err
   end
 
@@ -1227,7 +1267,7 @@ local function resolve_context(opts)
     state = state,
     paths = cache_paths(engine_root),
   }
-  _context_cache[cache_key] = { ctx = ctx, err = nil, ts = now }
+  CORE_RT.context_cache[cache_key] = { ctx = ctx, err = nil, ts = now }
   return ctx
 end
 
@@ -1547,11 +1587,706 @@ local function current_scope_info(opts)
   return current_scope_info_from_context(ctx)
 end
 
+local status_root_key, clear_index_dirty, mark_index_dirty, invalidate_status_cache, refresh_statusline
+
+local INDEX_CORE_MODULES = {
+  Core = true,
+  CoreUObject = true,
+  Engine = true,
+  InputCore = true,
+  Slate = true,
+  SlateCore = true,
+  RenderCore = true,
+  RHI = true,
+  Renderer = true,
+  Projects = true,
+  ApplicationCore = true,
+  UnrealEd = true,
+}
+
+local INDEX_ALWAYS_COLD_MODULES = {
+  VulkanRHI = true,
+  OpenGLDrv = true,
+  NullDrv = true,
+}
+
+local function unix_now()
+  return os.time()
+end
+
+local function read_json_file(path, default)
+  default = default or {}
+  if not is_file(path) then
+    return vim.deepcopy(default)
+  end
+  local content = read_all(path)
+  if not content or content == "" then
+    return vim.deepcopy(default)
+  end
+  local ok, decoded = pcall(vim.json.decode, content)
+  if not ok or type(decoded) ~= "table" then
+    return vim.deepcopy(default)
+  end
+  return decoded
+end
+
+local function write_json_file(path, value)
+  return write_all(path, vim.json.encode(value or {}))
+end
+
+local function module_scope_for_path(ctx, path)
+  if not ctx then
+    return nil
+  end
+  path = norm(path)
+  if path == "" then
+    return nil
+  end
+  return plugin_scope_from_root(ctx.project_root, path)
+    or project_module_scope(ctx.project_root, path)
+    or plugin_scope_from_root(join(ctx.engine_root, "Engine"), path)
+    or engine_module_scope(ctx.engine_root, path)
+end
+
+local function module_key(scope)
+  if not scope or not scope.root then
+    return ""
+  end
+  return (scope.kind or "module") .. ":" .. norm(scope.root)
+end
+
+local function module_tier(scope)
+  if not scope then
+    return "warm"
+  end
+  local root = norm(scope.root)
+  if INDEX_CORE_MODULES[scope.name or ""] then
+    return "core"
+  end
+  if INDEX_ALWAYS_COLD_MODULES[scope.name or ""] then
+    return "cold"
+  end
+  if root:find("/Developer/") or root:find("/Experimental/") then
+    return "cold"
+  end
+  return "warm"
+end
+
+local function locate_engine_module_root(engine_root, name)
+  if trim(name) == "" then
+    return nil
+  end
+  local matches = vim.fn.globpath(join(engine_root, "Engine", "Source"), "*/" .. name, false, true)
+  if type(matches) == "table" then
+    for _, match in ipairs(matches) do
+      local candidate = norm(match)
+      if is_dir(candidate) then
+        return candidate
+      end
+    end
+  end
+  return nil
+end
+
+local function index_state_default()
+  return {
+    version = 1,
+    active_module = nil,
+    root_dirty = false,
+    modules = {},
+    queue = {},
+    build = {
+      phase = "idle",
+      status = "idle",
+      started_at = 0,
+      finished_at = 0,
+      message = "",
+      active_index = "",
+    },
+    stats = {
+      current_runs = 0,
+      hot_runs = 0,
+      full_runs = 0,
+    },
+    updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+  }
+end
+
+local function save_index_state(ctx, state)
+  if not ctx or not state then
+    return
+  end
+  state.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
+  local key = status_root_key(ctx)
+  INDEX_RT.module_state[key] = state
+  INDEX_RT.contexts[key] = ctx
+  ensure_dir(ctx.paths.index_dir)
+  write_json_file(ctx.paths.index_state, state)
+  write_json_file(ctx.paths.index_queue, state.queue or {})
+end
+
+local function ensure_index_state(ctx)
+  local key = status_root_key(ctx)
+  if key == "" then
+    return index_state_default()
+  end
+  if INDEX_RT.module_state[key] then
+    return INDEX_RT.module_state[key]
+  end
+  local state = read_json_file(ctx.paths.index_state, index_state_default())
+  if type(state.modules) ~= "table" then
+    state.modules = {}
+  end
+  if type(state.queue) ~= "table" then
+    state.queue = {}
+  end
+  if state.root_dirty == nil then
+    state.root_dirty = false
+  end
+  if type(state.build) ~= "table" then
+    state.build = index_state_default().build
+  end
+  if type(state.stats) ~= "table" then
+    state.stats = index_state_default().stats
+  end
+  INDEX_RT.module_state[key] = state
+  return state
+end
+
+local function ensure_module_record(state, scope)
+  if not state or not scope then
+    return nil
+  end
+  local key = module_key(scope)
+  if key == "" then
+    return nil
+  end
+  local rec = state.modules[key] or {
+    key = key,
+    kind = scope.kind or "module",
+    name = scope.name or vim.fs.basename(scope.root),
+    root = norm(scope.root),
+    label = scope.label or ((scope.kind == "plugin" and "Plugin " or "Module ") .. (scope.name or vim.fs.basename(scope.root))),
+    tier = module_tier(scope),
+    last_opened = 0,
+    last_changed = 0,
+    last_indexed = 0,
+    dirty = false,
+    dirty_reason = "",
+    hot_score = 0,
+  }
+  rec.kind = rec.kind or scope.kind or "module"
+  rec.name = rec.name or scope.name or vim.fs.basename(scope.root)
+  rec.root = norm(rec.root or scope.root)
+  rec.label = rec.label or scope.label or rec.name
+  rec.tier = module_tier({ name = rec.name, root = rec.root, kind = rec.kind })
+  state.modules[key] = rec
+  return rec
+end
+
+local function seed_core_modules(ctx, state)
+  for name, enabled in pairs(INDEX_CORE_MODULES) do
+    if enabled then
+      local root = locate_engine_module_root(ctx.engine_root, name)
+      if root then
+        ensure_module_record(state, {
+          kind = "module",
+          name = name,
+          root = root,
+          label = "Module " .. name,
+        })
+      end
+    end
+  end
+end
+
+local function module_record_from_path(ctx, path)
+  local scope = module_scope_for_path(ctx, path)
+  if not scope then
+    return nil, nil
+  end
+  local state = ensure_index_state(ctx)
+  seed_core_modules(ctx, state)
+  local rec = ensure_module_record(state, scope)
+  save_index_state(ctx, state)
+  return rec, state
+end
+
+local function module_key_from_path(ctx, path)
+  local scope = module_scope_for_path(ctx, path)
+  return module_key(scope), scope
+end
+
+local function module_score(rec, state)
+  if not rec then
+    return -100000
+  end
+  local score = 0
+  if rec.tier == "core" then
+    score = score + 500
+  elseif rec.tier == "cold" then
+    score = score - 400
+  end
+  if state and state.active_module == rec.key then
+    score = score + 1000
+  end
+  if rec.dirty then
+    score = score + 300
+  end
+  local now = unix_now()
+  if (tonumber(rec.last_opened) or 0) > 0 then
+    local age = now - (tonumber(rec.last_opened) or 0)
+    if age < 600 then
+      score = score + 200
+    elseif age < 3600 then
+      score = score + 80
+    end
+  end
+  if (tonumber(rec.last_changed) or 0) > 0 then
+    local age = now - (tonumber(rec.last_changed) or 0)
+    if age < 600 then
+      score = score + 300
+    elseif age < 3600 then
+      score = score + 120
+    end
+  end
+  score = score + (tonumber(rec.hot_score) or 0)
+  return score
+end
+
+local function sorted_module_records(state)
+  local items = {}
+  for _, rec in pairs(state.modules or {}) do
+    rec._score = module_score(rec, state)
+    items[#items + 1] = rec
+  end
+  table.sort(items, function(a, b)
+    if a._score == b._score then
+      return (a.name or "") < (b.name or "")
+    end
+    return a._score > b._score
+  end)
+  return items
+end
+
+INDEX_FN.set_active_module = function(ctx, path)
+  local rec, state = module_record_from_path(ctx, path)
+  if not rec or not state then
+    return nil
+  end
+  rec.last_opened = unix_now()
+  rec.hot_score = math.min((tonumber(rec.hot_score) or 0) + 25, 1000)
+  state.active_module = rec.key
+  save_index_state(ctx, state)
+  return rec
+end
+
+INDEX_FN.mark_module_dirty = function(ctx, path, reason)
+  local rec, state = module_record_from_path(ctx, path)
+  if not rec or not state then
+    mark_index_dirty(ctx)
+    return nil
+  end
+  rec.dirty = true
+  rec.dirty_reason = trim(reason) ~= "" and trim(reason) or "buffer-write"
+  rec.last_changed = unix_now()
+  rec.hot_score = math.min((tonumber(rec.hot_score) or 0) + 50, 1000)
+  mark_index_dirty(ctx)
+  save_index_state(ctx, state)
+  return rec
+end
+
+INDEX_FN.clear_module_dirty_flags = function(ctx, keys)
+  local state = ensure_index_state(ctx)
+  local changed = false
+  for _, key in ipairs(keys or {}) do
+    local rec = state.modules[key]
+    if rec and rec.dirty then
+      rec.dirty = false
+      rec.dirty_reason = ""
+      rec.last_indexed = unix_now()
+      changed = true
+    end
+  end
+  local has_dirty = false
+  for _, rec in pairs(state.modules or {}) do
+    if rec.dirty then
+      has_dirty = true
+      break
+    end
+  end
+  if not has_dirty then
+    clear_index_dirty(ctx)
+  end
+  if changed then
+    save_index_state(ctx, state)
+  end
+end
+
+INDEX_FN.index_phase_paths = function(ctx, phase)
+  if phase == "current" then
+    return ctx.paths.index_current_cdb, ctx.paths.current_index
+  end
+  if phase == "hot" then
+    return ctx.paths.index_hot_cdb, ctx.paths.hot_index
+  end
+  return ctx.paths.index_full_cdb, ctx.paths.full_index
+end
+
+INDEX_FN.base_compile_commands_path = function(ctx)
+  local path = join(ctx.engine_root, "compile_commands.json")
+  if is_file(path) then
+    return path
+  end
+  path = join(ctx.engine_root, "Engine", "compile_commands.json")
+  if is_file(path) then
+    return path
+  end
+  return nil
+end
+
+INDEX_FN.normalize_cdb_file = function(entry)
+  if type(entry) ~= "table" then
+    return ""
+  end
+  local file = norm(entry.file or "")
+  local dir = norm(entry.directory or "")
+  if file ~= "" and not is_absolute_path(file) and dir ~= "" then
+    file = join(dir, file)
+  end
+  return norm(file)
+end
+
+INDEX_FN.select_phase_module_keys = function(ctx, state, phase)
+  seed_core_modules(ctx, state)
+  local selected = {}
+  local seen = {}
+  local ordered = sorted_module_records(state)
+  local function add(key)
+    if key and key ~= "" and not seen[key] and state.modules[key] then
+      seen[key] = true
+      selected[#selected + 1] = key
+    end
+  end
+
+  for _, rec in ipairs(ordered) do
+    if rec.tier == "core" then
+      add(rec.key)
+    end
+  end
+
+  if state.active_module then
+    add(state.active_module)
+  end
+
+  if phase == "current" then
+    for _, rec in ipairs(ordered) do
+      if rec.dirty then
+        add(rec.key)
+      end
+      if #selected >= 6 then
+        break
+      end
+    end
+  elseif phase == "hot" then
+    for _, rec in ipairs(ordered) do
+      if rec.tier ~= "cold" or rec.dirty or rec.key == state.active_module then
+        add(rec.key)
+      end
+      if #selected >= 18 then
+        break
+      end
+    end
+  else
+    for _, rec in ipairs(ordered) do
+      add(rec.key)
+    end
+  end
+
+  return selected
+end
+
+INDEX_FN.write_subset_compile_commands = function(ctx, phase)
+  local state = ensure_index_state(ctx)
+  local cdb_path = INDEX_FN.base_compile_commands_path(ctx)
+  if not cdb_path then
+    return nil, nil, "compile_commands.json not found"
+  end
+  local content = read_all(cdb_path)
+  if not content or content == "" then
+    return nil, nil, "compile_commands.json is empty"
+  end
+  local ok, decoded = pcall(vim.json.decode, content)
+  if not ok or type(decoded) ~= "table" then
+    return nil, nil, "Failed to parse compile_commands.json"
+  end
+
+  local selected_keys = INDEX_FN.select_phase_module_keys(ctx, state, phase)
+  local selected_set = {}
+  for _, key in ipairs(selected_keys) do
+    selected_set[key] = true
+  end
+
+  local subset = {}
+  for _, entry in ipairs(decoded) do
+    local file = INDEX_FN.normalize_cdb_file(entry)
+    local key = module_key_from_path(ctx, file)
+    if phase == "full" then
+      subset[#subset + 1] = entry
+    elseif key ~= "" and selected_set[key] then
+      subset[#subset + 1] = entry
+    end
+  end
+
+  if #subset == 0 then
+    return nil, nil, "No compile_commands entries matched selected modules"
+  end
+
+  local out_cdb = INDEX_FN.index_phase_paths(ctx, phase)
+  ensure_dir(ctx.paths.index_cdb_dir)
+  write_json_file(out_cdb, subset)
+  return out_cdb, selected_keys, nil
+end
+
+INDEX_FN.maybe_restart_clangd_for_index = function()
+  local now = unix_now()
+  if (now - INDEX_RT.last_restart_at) < INDEX_RT.restart_debounce_s then
+    return
+  end
+  INDEX_RT.last_restart_at = now
+  local clients = vim.lsp.get_clients({ name = "clangd" })
+  if #clients == 0 then
+    return
+  end
+  for _, client in ipairs(clients) do
+    client:stop()
+  end
+  vim.defer_fn(function()
+    pcall(vim.cmd, "edit")
+  end, 500)
+end
+
+INDEX_FN.promote_active_index = function(ctx, src_path)
+  src_path = norm(src_path)
+  if src_path == "" or not is_file(src_path) then
+    return false
+  end
+  ensure_dir(ctx.paths.active_index_dir)
+  local content = read_all(src_path)
+  if not content or content == "" then
+    return false
+  end
+  return write_all(ctx.paths.active_index, content)
+end
+
+INDEX_FN.build_phase_async = function(ctx, phase)
+  local state = ensure_index_state(ctx)
+  local root_key = status_root_key(ctx)
+  if INDEX_RT.job then
+    state.queue[phase] = unix_now()
+    save_index_state(ctx, state)
+    return false, "busy"
+  end
+
+  local subset_cdb, selected_keys, err = INDEX_FN.write_subset_compile_commands(ctx, phase)
+  if not subset_cdb then
+    state.build = {
+      phase = phase,
+      status = "error",
+      started_at = unix_now(),
+      finished_at = unix_now(),
+      message = err,
+      active_index = state.build and state.build.active_index or "",
+    }
+    save_index_state(ctx, state)
+    invalidate_status_cache()
+    refresh_statusline()
+    return false, err
+  end
+
+  local python = is_native_windows() and "python" or "python3"
+  local build_script = vim.fn.stdpath("config") .. "/tools/build_clangd_index.py"
+  if not is_file(build_script) then
+    return false, "build_clangd_index.py not found"
+  end
+
+  local _, out_idx = INDEX_FN.index_phase_paths(ctx, phase)
+  if is_file(out_idx) then
+    pcall(vim.fn.delete, out_idx)
+  end
+  local indexer = first_executable({
+    "/mnt/c/Program Files/LLVM/bin/clangd-indexer.exe",
+    "clangd-indexer",
+    "clangd-indexer.exe",
+    "C:/Program Files/LLVM/bin/clangd-indexer.exe",
+  })
+  local cmd = { python, build_script, subset_cdb, "--output", out_idx }
+  if indexer then
+    cmd[#cmd + 1] = "--indexer"
+    cmd[#cmd + 1] = indexer
+  end
+
+  state.queue[phase] = nil
+  state.build = {
+    phase = phase,
+    status = "running",
+    started_at = unix_now(),
+    finished_at = 0,
+    message = string.format("%s modules=%d", phase, #selected_keys),
+    active_index = state.build and state.build.active_index or "",
+  }
+  save_index_state(ctx, state)
+  invalidate_status_cache()
+  refresh_statusline()
+
+  INDEX_RT.job = { root_key = root_key, phase = phase }
+  vim.system(cmd, { text = true, cwd = ctx.engine_root }, function(result)
+    vim.schedule(function()
+      local live_state = ensure_index_state(ctx)
+      INDEX_RT.job = nil
+      local stderr = trim((result.stderr or "") .. "\n" .. (result.stdout or ""))
+      local ok_result = (result.code == 0) and is_file(out_idx)
+      if ok_result and INDEX_FN.promote_active_index(ctx, out_idx) then
+        INDEX_FN.clear_module_dirty_flags(ctx, selected_keys)
+        live_state.stats[phase .. "_runs"] = (tonumber(live_state.stats[phase .. "_runs"]) or 0) + 1
+        live_state.build = {
+          phase = phase,
+          status = "ready",
+          started_at = live_state.build.started_at or unix_now(),
+          finished_at = unix_now(),
+          message = string.format("%s ready (%d modules)", phase, #selected_keys),
+          active_index = ctx.paths.active_index,
+        }
+        save_index_state(ctx, live_state)
+        INDEX_FN.maybe_restart_clangd_for_index()
+      else
+        live_state.build = {
+          phase = phase,
+          status = "error",
+          started_at = live_state.build.started_at or unix_now(),
+          finished_at = unix_now(),
+          message = stderr ~= "" and stderr or (phase .. " index build failed"),
+          active_index = live_state.build.active_index or "",
+        }
+        save_index_state(ctx, live_state)
+      end
+      invalidate_status_cache()
+      refresh_statusline()
+      INDEX_FN.try_start_queued_build()
+    end)
+  end)
+
+  return true
+end
+
+INDEX_FN.try_start_queued_build = function()
+  if INDEX_RT.job then
+    return false
+  end
+  local started = false
+  while not INDEX_RT.job do
+    local picked_phase, picked_ctx, picked_state, picked_ts = nil, nil, nil, nil
+    for _, phase_name in ipairs({ "current", "hot", "full" }) do
+      for key, state in pairs(INDEX_RT.module_state or {}) do
+        local queued_at = state and state.queue and state.queue[phase_name]
+        local ctx = INDEX_RT.contexts[key]
+        if queued_at and ctx and (picked_ts == nil or queued_at < picked_ts) then
+          picked_phase = phase_name
+          picked_ctx = ctx
+          picked_state = state
+          picked_ts = queued_at
+        end
+      end
+      if picked_phase then
+        break
+      end
+    end
+    if not picked_phase or not picked_ctx or not picked_state then
+      break
+    end
+    local ok_started = INDEX_FN.build_phase_async(picked_ctx, picked_phase)
+    if ok_started then
+      started = true
+      break
+    end
+    picked_state.queue[picked_phase] = nil
+    save_index_state(picked_ctx, picked_state)
+  end
+  return started
+end
+
+INDEX_FN.schedule_index_phase = function(ctx, phase, delay_ms)
+  if not ctx then
+    return
+  end
+  local state = ensure_index_state(ctx)
+  state.queue[phase] = unix_now()
+  save_index_state(ctx, state)
+  local timer_key = status_root_key(ctx) .. "::" .. phase
+  if INDEX_RT.timers[timer_key] then
+    INDEX_RT.timers[timer_key]:stop()
+    INDEX_RT.timers[timer_key]:close()
+    INDEX_RT.timers[timer_key] = nil
+  end
+  local timer = vim.uv.new_timer()
+  INDEX_RT.timers[timer_key] = timer
+  timer:start(delay_ms, 0, vim.schedule_wrap(function()
+    if INDEX_RT.timers[timer_key] then
+      INDEX_RT.timers[timer_key]:stop()
+      INDEX_RT.timers[timer_key]:close()
+      INDEX_RT.timers[timer_key] = nil
+    end
+    INDEX_FN.build_phase_async(ctx, phase)
+  end))
+end
+
+INDEX_FN.schedule_index_refresh = function(ctx, opts)
+  opts = opts or {}
+  if not ctx or not INDEX_FN.base_compile_commands_path(ctx) then
+    return
+  end
+  if opts.current ~= false then
+    INDEX_FN.schedule_index_phase(ctx, "current", opts.current_delay_ms or INDEX_RT.debounce_current_ms)
+  end
+  if opts.hot then
+    INDEX_FN.schedule_index_phase(ctx, "hot", opts.hot_delay_ms or INDEX_RT.debounce_hot_ms)
+  end
+  if opts.full then
+    INDEX_FN.schedule_index_phase(ctx, "full", opts.full_delay_ms or INDEX_RT.idle_cold_ms)
+  end
+end
+
+INDEX_FN.index_status_summary = function(ctx)
+  local state = ensure_index_state(ctx)
+  local dirty = 0
+  for _, rec in pairs(state.modules or {}) do
+    if rec.dirty then
+      dirty = dirty + 1
+    end
+  end
+  local active_name = "-"
+  if state.active_module and state.modules[state.active_module] then
+    active_name = state.modules[state.active_module].name or active_name
+  end
+  return {
+    active = active_name,
+    dirty = dirty,
+    root_dirty = (state.root_dirty or false) or (CORE_RT.dirty_index_roots[status_root_key(ctx)] and true or false),
+    phase = state.build and state.build.phase or "idle",
+    status = state.build and state.build.status or "idle",
+    message = state.build and state.build.message or "",
+    active_index = state.build and state.build.active_index or "",
+  }
+end
+
 local function index_output_paths(ctx)
   local outputs = {}
   local compile_commands = join(ctx.engine_root, "compile_commands.json")
   if compile_commands ~= "" then
     table.insert(outputs, compile_commands)
+  end
+  if ctx.paths and ctx.paths.active_index then
+    table.insert(outputs, ctx.paths.active_index)
   end
   for _, name in ipairs({ "GTAGS", "GRTAGS", "GPATH" }) do
     table.insert(outputs, join(ctx.paths.workspace_db, name))
@@ -1559,7 +2294,7 @@ local function index_output_paths(ctx)
   return outputs
 end
 
-local function status_root_key(ctx)
+status_root_key = function(ctx)
   if not ctx then
     return ""
   end
@@ -1569,17 +2304,23 @@ local function status_root_key(ctx)
   }, "\31")
 end
 
-local function clear_index_dirty(ctx)
+clear_index_dirty = function(ctx)
   local key = status_root_key(ctx)
   if key ~= "" then
-    dirty_index_roots[key] = nil
+    CORE_RT.dirty_index_roots[key] = nil
+    local state = ensure_index_state(ctx)
+    state.root_dirty = false
+    save_index_state(ctx, state)
   end
 end
 
-local function mark_index_dirty(ctx)
+mark_index_dirty = function(ctx)
   local key = status_root_key(ctx)
   if key ~= "" then
-    dirty_index_roots[key] = true
+    CORE_RT.dirty_index_roots[key] = true
+    local state = ensure_index_state(ctx)
+    state.root_dirty = true
+    save_index_state(ctx, state)
   end
 end
 
@@ -1629,7 +2370,7 @@ local function prepare_cache_ready(ctx)
     return false
   end
   local key = status_root_key(ctx)
-  return key ~= "" and not dirty_index_roots[key]
+  return key ~= "" and not CORE_RT.dirty_index_roots[key]
 end
 
 local function prepare_summary(ctx, compile_path, opts)
@@ -1652,9 +2393,6 @@ local function prepare_summary(ctx, compile_path, opts)
   return summary
 end
 
-local _index_status_cache = {} -- key -> { token, ts }
-local _INDEX_STATUS_TTL = 30 -- seconds; only changes after UEPrepare or file save
-
 local function index_status_token(ctx)
   if not ctx then
     return "UE?"
@@ -1662,33 +2400,40 @@ local function index_status_token(ctx)
 
   local key = status_root_key(ctx)
   local now = vim.uv.hrtime() / 1e9
-  local cached = _index_status_cache[key]
-  if cached and (now - cached.ts) < _INDEX_STATUS_TTL then
-    -- dirty flag can change without filesystem change
-    if dirty_index_roots[key] then
-      return "IDX!"
+  local summary = INDEX_FN.index_status_summary(ctx)
+  local cached = INDEX_RT.status_cache[key]
+  if cached and (now - cached.ts) < INDEX_RT.status_ttl then
+    if summary.status == "running" then
+      return cached.token
+    end
+    if summary.root_dirty then
+      return summary.dirty > 0 and string.format("IDX!%d", summary.dirty) or "IDX!R"
     end
     return cached.token
   end
 
-  local outputs = index_output_paths(ctx)
-
-  for _, path in ipairs(outputs) do
-    if file_mtime(path) <= 0 then
-      _index_status_cache[key] = { token = "IDX?", ts = now }
-      return "IDX?"
+  local token
+  if summary.status == "running" then
+    token = "IDX:" .. summary.phase:sub(1, 1):upper() .. "*"
+  elseif summary.root_dirty then
+    token = summary.dirty > 0 and string.format("IDX!%d", summary.dirty) or "IDX!R"
+  else
+    local outputs = index_output_paths(ctx)
+    for _, path in ipairs(outputs) do
+      if file_mtime(path) <= 0 then
+        token = "IDX?"
+        break
+      end
+    end
+    if not token and not db_ready(ctx.paths.workspace_db) then
+      token = "IDX?"
+    end
+    if not token then
+      token = summary.active ~= "-" and ("IDX:" .. summary.active) or "IDX"
     end
   end
-  if not db_ready(ctx.paths.workspace_db) then
-    _index_status_cache[key] = { token = "IDX?", ts = now }
-    return "IDX?"
-  end
-  if dirty_index_roots[key] then
-    _index_status_cache[key] = { token = "IDX!", ts = now }
-    return "IDX!"
-  end
-  _index_status_cache[key] = { token = "IDX", ts = now }
-  return "IDX"
+  INDEX_RT.status_cache[key] = { token = token, ts = now }
+  return token
 end
 
 local function short_scope_token(scope)
@@ -1698,13 +2443,13 @@ local function short_scope_token(scope)
   return (scope.kind == "plugin" and "P:" or "M:") .. scope.name
 end
 
-local function invalidate_status_cache()
-  status_cache = {}
-  _context_cache = {}
-  _index_status_cache = {}
+invalidate_status_cache = function()
+  CORE_RT.status_cache = {}
+  CORE_RT.context_cache = {}
+  INDEX_RT.status_cache = {}
 end
 
-local function refresh_statusline()
+refresh_statusline = function()
   local ok, ue = pcall(require, "ue")
   local status = ""
   if ok and type(ue.statusline_status) == "function" then
@@ -3441,24 +4186,24 @@ local function open_terminal_command(cmd, opts)
   local stderr_pending = ""
 
   local function prune_state()
-    if build_term_win and not vim.api.nvim_win_is_valid(build_term_win) then
-      build_term_win = nil
+    if CORE_RT.build_term_win and not vim.api.nvim_win_is_valid(CORE_RT.build_term_win) then
+      CORE_RT.build_term_win = nil
     end
-    if build_term_buf and not vim.api.nvim_buf_is_valid(build_term_buf) then
-      build_term_buf = nil
+    if CORE_RT.build_term_buf and not vim.api.nvim_buf_is_valid(CORE_RT.build_term_buf) then
+      CORE_RT.build_term_buf = nil
     end
   end
 
   local function track_state(buf, win)
-    build_term_buf = buf
-    build_term_win = win
+    CORE_RT.build_term_buf = buf
+    CORE_RT.build_term_win = win
 
     vim.api.nvim_create_autocmd("BufWipeout", {
       buffer = buf,
       once = true,
       callback = function(args)
-        if build_term_buf == args.buf then
-          build_term_buf = nil
+        if CORE_RT.build_term_buf == args.buf then
+          CORE_RT.build_term_buf = nil
         end
       end,
     })
@@ -3467,38 +4212,38 @@ local function open_terminal_command(cmd, opts)
       once = true,
       pattern = tostring(win),
       callback = function()
-        if build_term_win == win then
-          build_term_win = nil
+        if CORE_RT.build_term_win == win then
+          CORE_RT.build_term_win = nil
         end
       end,
     })
   end
 
   local function job_running()
-    if not build_term_jobid then
+    if not CORE_RT.build_term_jobid then
       return false
     end
-    local ok, result = pcall(vim.fn.jobwait, { build_term_jobid }, 0)
+    local ok, result = pcall(vim.fn.jobwait, { CORE_RT.build_term_jobid }, 0)
     return ok and result and result[1] == -1
   end
 
   local function ensure_window()
     prune_state()
 
-    if build_term_win and focus_window(build_term_win) then
-      return build_term_win
+    if CORE_RT.build_term_win and focus_window(CORE_RT.build_term_win) then
+      return CORE_RT.build_term_win
     end
 
     local height = opts.height or math.max(8, math.floor(vim.o.lines * 0.25))
     vim.cmd(("botright %dnew"):format(height))
-    build_term_win = vim.api.nvim_get_current_win()
-    return build_term_win
+    CORE_RT.build_term_win = vim.api.nvim_get_current_win()
+    return CORE_RT.build_term_win
   end
 
   if job_running() then
     local running_win = ensure_window()
-    if build_term_buf and vim.api.nvim_buf_is_valid(build_term_buf) then
-      vim.api.nvim_win_set_buf(running_win, build_term_buf)
+    if CORE_RT.build_term_buf and vim.api.nvim_buf_is_valid(CORE_RT.build_term_buf) then
+      vim.api.nvim_win_set_buf(running_win, CORE_RT.build_term_buf)
     end
     startinsert_in_window(running_win)
     vim.notify("UE build is already running", vim.log.levels.WARN)
@@ -3506,7 +4251,7 @@ local function open_terminal_command(cmd, opts)
   end
 
   local win = ensure_window()
-  local previous_buf = build_term_buf
+  local previous_buf = CORE_RT.build_term_buf
   local buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_win_set_buf(win, buf)
   track_state(buf, win)
@@ -3535,8 +4280,8 @@ local function open_terminal_command(cmd, opts)
       vim.schedule(function()
         stdout_pending = flush_job_output(output_lines, stdout_pending)
         stderr_pending = flush_job_output(output_lines, stderr_pending)
-        if build_term_jobid == active_jobid then
-          build_term_jobid = nil
+        if CORE_RT.build_term_jobid == active_jobid then
+          CORE_RT.build_term_jobid = nil
         end
         if code ~= 0 and opts.quickfix_title then
           populate_quickfix_from_output(opts.quickfix_title, output_lines, {
@@ -3553,7 +4298,7 @@ local function open_terminal_command(cmd, opts)
     end,
   })
   if active_jobid <= 0 then
-    build_term_jobid = nil
+    CORE_RT.build_term_jobid = nil
     if opts.quickfix_title then
       set_build_status("BERR")
     end
@@ -3561,7 +4306,7 @@ local function open_terminal_command(cmd, opts)
     return
   end
 
-  build_term_jobid = active_jobid
+  CORE_RT.build_term_jobid = active_jobid
   startinsert_in_window(win)
 end
 
@@ -3932,6 +4677,76 @@ function M.statusline_status(opts)
   return table.concat(parts, " ")
 end
 
+function M.index_status(opts)
+  local ctx, err = resolve_context(opts)
+  if not ctx then
+    vim.notify(err, vim.log.levels.WARN)
+    return nil
+  end
+  local summary = INDEX_FN.index_status_summary(ctx)
+  local lines = {
+    "UE index status:",
+    "  active module: " .. summary.active,
+    "  build phase: " .. summary.phase,
+    "  build status: " .. summary.status,
+    "  dirty modules: " .. tostring(summary.dirty),
+    "  message: " .. trim(summary.message),
+    "  active index: " .. trim(summary.active_index),
+  }
+  local state = ensure_index_state(ctx)
+  local ordered = sorted_module_records(state)
+  if #ordered > 0 then
+    lines[#lines + 1] = "  top modules:"
+    for i = 1, math.min(8, #ordered) do
+      local rec = ordered[i]
+      lines[#lines + 1] = string.format("    %d. %s [%s] score=%d dirty=%s", i, rec.name or rec.key, rec.tier or "warm", tonumber(rec._score) or 0, rec.dirty and "yes" or "no")
+    end
+  end
+  local msg = table.concat(lines, "\n")
+  vim.notify(msg, vim.log.levels.INFO)
+  return msg
+end
+
+function M.index_now(opts)
+  local ctx, err = resolve_context(opts)
+  if not ctx then
+    vim.notify(err, vim.log.levels.WARN)
+    return false
+  end
+  local path = norm(vim.api.nvim_buf_get_name(0))
+  if path ~= "" then
+    INDEX_FN.set_active_module(ctx, path)
+  end
+  INDEX_FN.schedule_index_refresh(ctx, { current = true, hot = true, full = true, current_delay_ms = 50, hot_delay_ms = 2500 })
+  invalidate_status_cache()
+  refresh_statusline()
+  return true
+end
+
+function M.index_hot(opts)
+  local ctx, err = resolve_context(opts)
+  if not ctx then
+    vim.notify(err, vim.log.levels.WARN)
+    return false
+  end
+  INDEX_FN.schedule_index_refresh(ctx, { current = false, hot = true, hot_delay_ms = 50, full = true })
+  invalidate_status_cache()
+  refresh_statusline()
+  return true
+end
+
+function M.index_full(opts)
+  local ctx, err = resolve_context(opts)
+  if not ctx then
+    vim.notify(err, vim.log.levels.WARN)
+    return false
+  end
+  INDEX_FN.schedule_index_refresh(ctx, { current = false, hot = false, full = true, full_delay_ms = 50 })
+  invalidate_status_cache()
+  refresh_statusline()
+  return true
+end
+
 function M.ue_roots(opts)
   local ctx, err = resolve_context(opts)
   if not ctx then
@@ -4266,7 +5081,7 @@ local function set_platform(input)
     end
     invalidate_status_cache()
     refresh_statusline()
-    _context_cache = {}
+    CORE_RT.context_cache = {}
     vim.notify(("UE platform: %s %s"):format(
       plat or default_plat or "(auto)",
       conf or default_conf
@@ -4294,7 +5109,7 @@ local function set_platform(input)
       update_state_field(engine_root, "target_configuration", conf)
       invalidate_status_cache()
       refresh_statusline()
-      _context_cache = {}
+      CORE_RT.context_cache = {}
       vim.notify(("UE platform set: %s %s\nRun :UEPrepare to regenerate for this platform"):format(plat, conf))
     end)
   end)
@@ -4533,6 +5348,7 @@ local function prepare()
       return
     end
     clear_index_dirty(ctx)
+    INDEX_FN.schedule_index_refresh(ctx, { current = true, hot = true, full = true, current_delay_ms = 50 })
     invalidate_status_cache()
     refresh_statusline()
     local summary = prepare_summary(ctx, compile_path, { reused_cache = true })
@@ -4654,6 +5470,7 @@ local function prepare()
   end
 
   clear_index_dirty(ctx)
+  INDEX_FN.schedule_index_refresh(ctx, { current = true, hot = true, full = true, current_delay_ms = 50 })
   invalidate_status_cache()
   refresh_statusline()
   local summary = prepare_summary(ctx, compile_path, {
@@ -4686,13 +5503,13 @@ local function prepare_async()
     return
   end
 
-  if prepare_jobid then
-    local ok_wait, result = pcall(vim.fn.jobwait, { prepare_jobid }, 0)
+  if CORE_RT.prepare_jobid then
+    local ok_wait, result = pcall(vim.fn.jobwait, { CORE_RT.prepare_jobid }, 0)
     if ok_wait and result and result[1] == -1 then
       vim.notify("UEPrepare is already running", vim.log.levels.INFO)
       return
     end
-    prepare_jobid = nil
+    CORE_RT.prepare_jobid = nil
   end
 
   if ctx.state.project_root ~= ctx.project_root then
@@ -4754,6 +5571,7 @@ local function prepare_async()
       return
     end
     clear_index_dirty(ctx)
+    INDEX_FN.schedule_index_refresh(ctx, { current = true, hot = true, full = true, current_delay_ms = 50, hot_delay_ms = 2500 })
     invalidate_status_cache()
     refresh_statusline()
     vim.notify(prepare_summary(ctx, compile_path, { reused_cache = true }))
@@ -4896,7 +5714,7 @@ local function prepare_async()
     local gtags_cwd = ctx.engine_root
 
     gtags_timer:start(2000, 2000, vim.schedule_wrap(function()
-      if prepare_jobid and prepare_jobid > 0 then
+      if CORE_RT.prepare_jobid and CORE_RT.prepare_jobid > 0 then
         local gtags_elapsed = math.max(1, math.floor((vim.uv.hrtime() - gtags_started_at) / 1e9))
         local pct = indexed_count > 0
             and math.min(30 + math.floor(indexed_count / math.max(#workspace_code, 1) * 50), 80)
@@ -4920,7 +5738,7 @@ local function prepare_async()
       end
     end))
 
-    prepare_jobid = vim.fn.jobstart(gtags_cmd, {
+    CORE_RT.prepare_jobid = vim.fn.jobstart(gtags_cmd, {
       cwd = gtags_cwd,
       on_stdout = function(_, data)
         collect_trimmed_lines(gtags_output, data)
@@ -4938,7 +5756,7 @@ local function prepare_async()
       end,
       on_exit = function(_, code)
         vim.schedule(function()
-          prepare_jobid = nil
+          CORE_RT.prepare_jobid = nil
           if gtags_timer then
             gtags_timer:stop()
             gtags_timer:close()
@@ -4985,8 +5803,8 @@ local function prepare_async()
       end,
     })
 
-    if prepare_jobid <= 0 then
-      prepare_jobid = nil
+    if CORE_RT.prepare_jobid <= 0 then
+      CORE_RT.prepare_jobid = nil
       if gtags_timer then
         gtags_timer:stop()
         gtags_timer:close()
@@ -5056,7 +5874,18 @@ local function clear_cache(opts)
   local removed = {}
 
   -- 1. nvim-ue own caches (gtags file lists, state, db)
-  for _, f in ipairs({ ctx.paths.project_list, ctx.paths.engine_list, ctx.paths.workspace_list, ctx.paths.workspace_all_list, ctx.paths.state }) do
+  for _, f in ipairs({
+    ctx.paths.project_list,
+    ctx.paths.engine_list,
+    ctx.paths.workspace_list,
+    ctx.paths.workspace_all_list,
+    ctx.paths.state,
+    ctx.paths.index_state,
+    ctx.paths.index_queue,
+    ctx.paths.index_current_cdb,
+    ctx.paths.index_hot_cdb,
+    ctx.paths.index_full_cdb,
+  }) do
     if vim.fn.filereadable(f) == 1 then
       pcall(vim.fn.delete, f)
       table.insert(removed, "  " .. f)
@@ -5081,6 +5910,15 @@ local function clear_cache(opts)
     end
   end
 
+  if bang then
+    for _, idx in ipairs({ ctx.paths.active_index, ctx.paths.current_index, ctx.paths.hot_index, ctx.paths.full_index }) do
+      if is_file(idx) then
+        pcall(vim.fn.delete, idx)
+        table.insert(removed, "  " .. idx .. " (offline index)")
+      end
+    end
+  end
+
   -- 3. compile_commands.json (only with bang)
   if bang then
     for _, root in ipairs(clangd_roots) do
@@ -5100,6 +5938,17 @@ local function clear_cache(opts)
   end
 
   invalidate_status_cache()
+  local root_key = status_root_key(ctx)
+  for timer_key, timer in pairs(INDEX_RT.timers or {}) do
+    if vim.startswith(timer_key, root_key .. "::") then
+      timer:stop()
+      timer:close()
+      INDEX_RT.timers[timer_key] = nil
+    end
+  end
+  CORE_RT.dirty_index_roots[root_key] = nil
+  INDEX_RT.module_state[root_key] = nil
+  INDEX_RT.contexts[root_key] = nil
   refresh_statusline()
 
   -- 4. restart clangd LSP so it re-indexes cleanly
@@ -5188,10 +6037,10 @@ M.setup_dap = dap_mod.setup_dap
 -- ==========================================================================
 
 function M.setup()
-  if setup_done then
+  if CORE_RT.setup_done then
     return
   end
-  setup_done = true
+  CORE_RT.setup_done = true
 
   vim.g.ueindex_status = vim.g.ueindex_status or ""
   vim.g.ue_build_status = vim.g.ue_build_status or ""
@@ -5226,6 +6075,18 @@ function M.setup()
   vim.api.nvim_create_user_command("UEInstallAndroid", install_android, {})
   vim.api.nvim_create_user_command("UEPrepare", prepare_async, {})
   vim.api.nvim_create_user_command("UEPrepareSync", prepare, {})
+  vim.api.nvim_create_user_command("UEIndexStatus", function()
+    M.index_status()
+  end, {})
+  vim.api.nvim_create_user_command("UEIndexNow", function()
+    M.index_now()
+  end, {})
+  vim.api.nvim_create_user_command("UEIndexHot", function()
+    M.index_hot()
+  end, {})
+  vim.api.nvim_create_user_command("UEIndexFull", function()
+    M.index_full()
+  end, {})
   vim.api.nvim_create_user_command("UECheatsheet", show_cheatsheet, {})
   vim.api.nvim_create_user_command("UECheatsheetEdit", edit_cheatsheet, {})
   vim.api.nvim_create_user_command("UEClearCache", function(cmd_opts)
@@ -5286,6 +6147,43 @@ function M.setup()
       -- (picker confirm, DAP UI open) don't block the event loop
       statusline_timer:stop()
       statusline_timer:start(500, 0, vim.schedule_wrap(refresh_statusline))
+
+      local path = norm(vim.api.nvim_buf_get_name(0))
+      if path == "" then
+        return
+      end
+      local lower = path:lower()
+      if not (lower:match("%.c$") or lower:match("%.cc$") or lower:match("%.cpp$") or lower:match("%.cxx$") or lower:match("%.h$") or lower:match("%.hh$") or lower:match("%.hpp$") or lower:match("%.hxx$") or lower:match("%.inl$") or lower:match("%.inc$") or lower:match("%.ipp$")) then
+        return
+      end
+      local ctx = resolve_context()
+      if not ctx then
+        return
+      end
+      if INDEX_FN.set_active_module(ctx, path) then
+        invalidate_status_cache()
+        refresh_statusline()
+      end
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufWritePost", {
+    group = group,
+    pattern = { "*.c", "*.cc", "*.cpp", "*.cxx", "*.h", "*.hh", "*.hpp", "*.hxx", "*.inl", "*.inc", "*.ipp" },
+    callback = function()
+      local path = norm(vim.api.nvim_buf_get_name(0))
+      if path == "" then
+        return
+      end
+      local ctx = resolve_context()
+      if not ctx then
+        return
+      end
+      INDEX_FN.set_active_module(ctx, path)
+      if INDEX_FN.mark_module_dirty(ctx, path, "buffer-write") then
+        INDEX_FN.schedule_index_refresh(ctx, { current = true, hot = true, current_delay_ms = 150, hot_delay_ms = 2500 })
+      end
+      invalidate_status_cache()
+      refresh_statusline()
     end,
   })
   vim.api.nvim_create_autocmd("BufWritePost", {

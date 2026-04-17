@@ -206,29 +206,220 @@ local function populate_quickfix(title, locations)
   return true
 end
 
-local function jump_to_location(location)
-  local uri = location.uri or location.targetUri
-  if uri then
-    -- Pre-load the target buffer so vim.lsp.util.show_document doesn't end
-    -- up calling nvim_win_set_cursor on a still-empty (lazy bufadd'd)
-    -- buffer, which would raise "Cursor position outside buffer" and
-    -- strand the caller. We must use :edit (not just bufload) because
-    -- bufload alone doesn't always trigger BufReadCmd autocommands that
-    -- some configs rely on (treesitter, lsp attach, filetype, etc.).
-    -- However, for files already loaded, :edit is a no-op-ish.
-    local target_path = vim.uri_to_fname(uri)
-    local bufnr = vim.fn.bufnr(target_path)
-    if bufnr == -1 or not vim.api.nvim_buf_is_loaded(bufnr) then
-      -- Use silent :edit so it doesn't print "X lines" message during
-      -- the async callback. Wrap in pcall in case the path is unreadable.
-      pcall(vim.cmd, "silent! edit " .. vim.fn.fnameescape(target_path))
+local function reconcile_landing_to_definition(sym, landed_line_1b)
+  -- Verify cursor's landing line actually mentions the symbol. If not, the
+  -- background-index gave us a stale line number — search the buffer for a
+  -- real definition pattern near the landing point and silently reposition.
+  if not sym or sym == "" then return end
+
+  local bufnr = vim.api.nvim_get_current_buf()
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+  if line_count == 0 then return end
+
+  local cur_line_text = vim.api.nvim_buf_get_lines(
+    bufnr, landed_line_1b - 1, landed_line_1b, false)[1] or ""
+
+  -- Lua patterns can't do \b — fake word-boundary by checking neighbors.
+  local function has_token(s, tok)
+    if not s or s == "" then return false end
+    local idx = 1
+    while true do
+      local a, b = s:find(tok, idx, true)
+      if not a then return false end
+      local before = (a > 1) and s:sub(a - 1, a - 1) or ""
+      local after = s:sub(b + 1, b + 1)
+      local function is_id_ch(c)
+        return c ~= "" and c:match("[%w_]") ~= nil
+      end
+      if not is_id_ch(before) and not is_id_ch(after) then
+        return true
+      end
+      idx = b + 1
     end
   end
+
+  -- If the landing line literally contains the symbol token, trust it.
+  if has_token(cur_line_text, sym) then return end
+
+  -- Stale: search a window around the landing line for a definition site.
+  -- Window grows in stages so we prefer near hits over far ones.
+  local function escape_for_pattern(s)
+    return (s:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1"))
+  end
+  local sym_pat = escape_for_pattern(sym)
+
+  -- Definition-shaped patterns (ordered by specificity / likelihood).
+  local def_patterns = {
+    "class%s+" .. sym_pat .. "[%s:{<]",   -- class Foo : / { / <
+    "class%s+" .. sym_pat .. "$",          -- class Foo (eol)
+    "struct%s+" .. sym_pat .. "[%s:{<]",
+    "struct%s+" .. sym_pat .. "$",
+    "using%s+" .. sym_pat .. "%s*=",       -- using Foo =
+    "typedef%s+.*%s" .. sym_pat .. "%s*;", -- typedef X Foo;
+    "enum%s+class%s+" .. sym_pat,
+    "enum%s+" .. sym_pat,
+    "namespace%s+" .. sym_pat,
+    "%f[%w_]" .. sym_pat .. "%s*::%s*" .. sym_pat .. "%s*%(", -- Foo::Foo(
+  }
+
+  -- Stage 1: ±200 line window. Stage 2: whole file fallback.
+  local windows = {
+    { math.max(1, landed_line_1b - 200), math.min(line_count, landed_line_1b + 200) },
+    { 1, line_count },
+  }
+
+  local best_line = nil
+  local best_dist = math.huge
+  for _, win in ipairs(windows) do
+    local lo, hi = win[1], win[2]
+    local lines = vim.api.nvim_buf_get_lines(bufnr, lo - 1, hi, false)
+    for i, text in ipairs(lines) do
+      for _, pat in ipairs(def_patterns) do
+        if text:find(pat) then
+          local lineno = lo + i - 1
+          local dist = math.abs(lineno - landed_line_1b)
+          if dist < best_dist then
+            best_dist = dist
+            best_line = lineno
+          end
+          break
+        end
+      end
+    end
+    if best_line then break end -- found in narrow window, don't widen
+  end
+
+  if not best_line or best_line == landed_line_1b then
+    if M._dtrace then pcall(M._dtrace, "reconcile: no def-pattern found for %q near line %d", sym, landed_line_1b) end
+    return
+  end
+
+  -- Find column of symbol on the chosen line for a precise cursor.
+  local target_text = vim.api.nvim_buf_get_lines(
+    bufnr, best_line - 1, best_line, false)[1] or ""
+  local col = 0
+  local s = target_text:find(sym, 1, true)
+  if s then col = s - 1 end
+
+  pcall(vim.api.nvim_win_set_cursor, 0, { best_line, col })
+  if M._dtrace then pcall(M._dtrace, "reconcile: %q drift %d -> %d (Δ=%d)", sym, landed_line_1b, best_line, best_line - landed_line_1b) end
+end
+
+local function jump_to_location(location)
+  local uri = location.uri or location.targetUri
+  local range = location.range or location.targetSelectionRange or location.targetRange
+  if not uri or not range or not range.start then
+    return false
+  end
+
+  local target_path = vim.uri_to_fname(uri)
+  local bufnr = vim.fn.bufnr(target_path)
+  if bufnr == -1 or not vim.api.nvim_buf_is_loaded(bufnr) then
+    -- silent so it doesn't print "X lines" mid-callback
+    local ok = pcall(vim.cmd, "silent! edit " .. vim.fn.fnameescape(target_path))
+    if not ok then return false end
+    bufnr = vim.fn.bufnr(target_path)
+  end
+
+  -- Push current cursor onto jumplist BEFORE switching buffer
   vim.cmd("normal! m'")
-  return vim.lsp.util.show_document(location, location._position_encoding or "utf-16", {
-    reuse_win = true,
-    focus = true,
-  })
+
+  -- We DO NOT use vim.lsp.util.show_document here. It has two failure modes
+  -- on Windows + ws/symbol-synthesized locations:
+  --   1. _position_encoding is unset on synthetic ws/symbol locations (we
+  --      build them by hand from SymbolInformation). show_document falls
+  --      back to utf-16 even when clangd is utf-8 → off-by-N column or
+  --      a refusal to set cursor on what it thinks is an out-of-range pos.
+  --   2. With reuse_win=true and BufReadCmd autocommands, the cursor set
+  --      can race the BufRead and end up at line 1 col 0 (the user reports
+  --      "jumped to top of file" on FDataDrivenShaderPlatformInfo).
+  --
+  -- Instead: switch to target buffer in the current window directly, then
+  -- nvim_win_set_cursor with a clamped position. clangd's columns are 0-
+  -- indexed UTF-16 codepoint offsets, but for the all-ASCII identifiers
+  -- that gd lands on, that's identical to byte columns — and we clamp to
+  -- line length so we never set an out-of-range cursor.
+  if bufnr ~= -1 and vim.api.nvim_get_current_buf() ~= bufnr then
+    vim.api.nvim_set_current_buf(bufnr)
+  end
+
+  local line_1b = (range.start.line or 0) + 1
+  local line_count = vim.api.nvim_buf_line_count(0)
+  if line_1b > line_count then line_1b = line_count end
+  if line_1b < 1 then line_1b = 1 end
+
+  local line_text = vim.api.nvim_buf_get_lines(0, line_1b - 1, line_1b, false)[1] or ""
+  local col = range.start.character or 0
+  if col > #line_text then col = #line_text end
+  if col < 0 then col = 0 end
+
+  -- Two-phase cursor set: synchronous now (so synchronous code observes the
+  -- target line) AND deferred via vim.defer_fn (so any BufRead / FileType /
+  -- LspAttach / treesitter-on-load autocmds — many of which reset cursor to
+  -- line 1 by calling things like `keepjumps normal! 1G` or restoring '"'
+  -- mark to (1,0) when the buffer was never visited — can't strand us at
+  -- top-of-file). The deferred re-set only fires if cursor was reset; we
+  -- never override a user-moved cursor.
+  local function apply_cursor_if_stranded(target_buf)
+    -- Only fix if we're still in the target buffer and cursor was reset.
+    if vim.api.nvim_get_current_buf() ~= target_buf then return end
+    local cur = vim.api.nvim_win_get_cursor(0)
+    -- "Stranded" means cursor sits at (1, 0..1) — classic BufRead reset.
+    -- If user moved deliberately we leave them alone.
+    if cur[1] ~= 1 or cur[2] > 1 then return end
+    -- Re-clamp in case the buffer mutated.
+    local lc = vim.api.nvim_buf_line_count(0)
+    local ln = math.min(math.max(line_1b, 1), lc)
+    local lt = vim.api.nvim_buf_get_lines(0, ln - 1, ln, false)[1] or ""
+    local cc = math.min(math.max(col, 0), #lt)
+    pcall(vim.api.nvim_win_set_cursor, 0, { ln, cc })
+    pcall(vim.cmd, "normal! zz")
+    if M._dtrace then pcall(M._dtrace, "jump: deferred un-strand to %d:%d", ln, cc) end
+  end
+
+  local ok_cur = pcall(vim.api.nvim_win_set_cursor, 0, { line_1b, col })
+  if not ok_cur then
+    -- final safety net: try the original show_document path (best effort)
+    pcall(vim.lsp.util.show_document, location,
+      location._position_encoding or "utf-16",
+      { reuse_win = true, focus = true })
+  end
+
+  -- Defer second cursor set (only if cursor was stranded). 30ms catches
+  -- BufRead/FileType chains; 150ms catches slower late autocmds (treesitter
+  -- region attach, LspAttach handlers, etc.). Both bail if user moved.
+  local target_buf = vim.api.nvim_get_current_buf()
+  vim.defer_fn(function() apply_cursor_if_stranded(target_buf) end, 30)
+  vim.defer_fn(function()
+    apply_cursor_if_stranded(target_buf)
+    -- reconcile only if we're still in the target buf and at our line
+    if vim.api.nvim_get_current_buf() ~= target_buf then return end
+    local cur = vim.api.nvim_win_get_cursor(0)
+    -- Run reconcile only if we ARE at the intended line (not user-moved).
+    if cur[1] == line_1b then
+      local sym = location._sym_name or location._origin_cword
+      if sym and #sym > 0 then
+        pcall(reconcile_landing_to_definition, sym, line_1b)
+      end
+    end
+  end, 150)
+
+  -- Reconcile against stale background-index line numbers. clangd's
+  -- workspace/symbol returns positions from its persistent index, which lags
+  -- behind file edits — symbols can drift dozens of lines. Verify that the
+  -- landing line actually contains the symbol token; if not, search nearby
+  -- for a definition pattern and silently reposition.
+  -- Symbol comes from the location (ws/symbol path) or, for precise/definition
+  -- locations that don't carry it, we fall back to the original cword captured
+  -- before the jump (set on the location by the caller as _origin_cword).
+  local sym = location._sym_name or location._origin_cword
+  if sym and #sym > 0 then
+    pcall(reconcile_landing_to_definition, sym, line_1b)
+  end
+
+  -- Center the new position so the user sees context
+  pcall(vim.cmd, "normal! zz")
+  return true
 end
 
 local function filter_self_locations(locations, ref_file, ref_line)
@@ -551,6 +742,9 @@ local function async_lsp_workspace_symbol(bufnr, query, exact, on_result)
                 -- carry kind for later ranking
                 _ws_kind = sym.kind,
                 _ws_container = sym.containerName,
+                -- carry symbol name so post-jump reconcile can verify
+                -- the landing line and silently fix stale-index drift
+                _sym_name = sym.name,
               })
             end
           end
@@ -828,7 +1022,7 @@ end
 -- ---------------------------------------------------------------------------
 -- MODULE_REVISION bumps every time this file is meaningfully edited so we
 -- can tell from a trace whether the user is running stale bytecode.
-local MODULE_REVISION = "selftest+disklog+exportrev+canddump+receiver+singleton"
+local MODULE_REVISION = "selftest+disklog+exportrev+canddump+receiver+singleton+jumpfix+reconcile+cwordcarry+unstrand"
 local TRACE_MAX = 200
 local trace_ring = {}
 local trace_idx = 0
@@ -849,6 +1043,10 @@ local function dtrace(fmt, ...)
     if f then f:write(line .. "\n"); f:close() end
   end)
 end
+-- Expose to early-defined functions like reconcile_landing_to_definition
+M._dtrace = dtrace
+-- Expose for headless e2e testing of stale-index recovery
+M._test_reconcile = reconcile_landing_to_definition
 function M.dump_trace()
   local lines = { string.format("=== UEDefTrace  module_rev=%s  trace_idx=%d ===",
     MODULE_REVISION, trace_idx) }
@@ -1052,6 +1250,9 @@ function M.definition()
 
       -- Jump now if we haven't already.
       if not jumped then
+        -- Carry origin cword so reconcile can verify the landing line and
+        -- fix stale-index drift even on this synthetic ws/symbol location.
+        winner._origin_cword = symbol
         local pok, ok_or_err = pcall(jump_to_location, winner)
         local ok = pok and ok_or_err == true
         dtrace("instant: jump pok=%s ok=%s err=%s",
@@ -1102,6 +1303,8 @@ function M.definition()
         if not jumped then
           -- precise won the race
           if winner then
+            -- Carry origin cword so reconcile can fix stale-index drift.
+            winner._origin_cword = symbol
             local pok, ok = pcall(jump_to_location, winner)
             ok = pok and ok
             dtrace("precise: jump pok=%s ok=%s", tostring(pok), tostring(ok))

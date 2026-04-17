@@ -731,14 +731,26 @@ end
 -- ---------------------------------------------------------------------------
 -- MODULE_REVISION bumps every time this file is meaningfully edited so we
 -- can tell from a trace whether the user is running stale bytecode.
-local MODULE_REVISION = "f75fa9b+headeronly+precisetrace"
+local MODULE_REVISION = "selftest+disklog"
 local TRACE_MAX = 200
 local trace_ring = {}
 local trace_idx = 0
+-- Disk-backed log (so trace survives even if :UEDefTrace itself errors).
+local DISK_LOG = vim.fn.stdpath("cache") .. "/ue_def_trace.log"
+-- Truncate on module load so each session starts clean.
+pcall(function()
+  local f = io.open(DISK_LOG, "w")
+  if f then f:write(string.format("=== module loaded rev=%s at %s ===\n",
+    MODULE_REVISION, os.date("%Y-%m-%d %H:%M:%S"))); f:close() end
+end)
 local function dtrace(fmt, ...)
   trace_idx = trace_idx + 1
-  trace_ring[((trace_idx - 1) % TRACE_MAX) + 1] = string.format(
-    "[%s #%d] " .. fmt, os.date("%H:%M:%S"), trace_idx, ...)
+  local line = string.format("[%s #%d] " .. fmt, os.date("%H:%M:%S"), trace_idx, ...)
+  trace_ring[((trace_idx - 1) % TRACE_MAX) + 1] = line
+  pcall(function()
+    local f = io.open(DISK_LOG, "a")
+    if f then f:write(line .. "\n"); f:close() end
+  end)
 end
 function M.dump_trace()
   local lines = { string.format("=== UEDefTrace  module_rev=%s  trace_idx=%d ===",
@@ -762,6 +774,42 @@ function M.dump_trace()
   vim.api.nvim_buf_set_name(0, "UEDefTrace")
 end
 vim.api.nvim_create_user_command("UEDefTrace", function() M.dump_trace() end, {})
+
+-- :UEDefSelfTest — exercises pick_winner_with_label on synthetic GetBinCount-
+-- like data (2 header hits in same module). PASS proves the header-only
+-- relaxation in clear_winner is loaded; FAIL means stale module.
+function M.self_test()
+  -- Synthetic ws/symbol response: 2 .h declarations, same module.
+  local ref_file = vim.fn.expand("~/dummy_module/foo.cpp"):gsub("\\", "/")
+  -- Force ref_file to look like UE for same-module match.
+  ref_file = "<PROJ_DRIVE>/UEProj/Engine/Source/Runtime/Renderer/Private/Nanite/foo.cpp"
+  local hits = {
+    {
+      uri = "file:///<PROJ_DRIVE>/UEProj/Engine/Source/Runtime/Renderer/Private/Nanite/NaniteShared.h",
+      range = { start = { line = 735, character = 12 }, ["end"] = { line = 735, character = 23 } },
+      _ws_kind = 6,
+    },
+    {
+      uri = "file:///<PROJ_DRIVE>/UEProj/Engine/Source/Runtime/Renderer/Private/Nanite/NaniteShared.h",
+      range = { start = { line = 897, character = 12 }, ["end"] = { line = 897, character = 23 } },
+      _ws_kind = 6,
+    },
+  }
+  local winner, label, ranked = pick_winner_with_label(hits, {}, ref_file)
+  local lines = {
+    "=== UEDefSelfTest  module_rev=" .. MODULE_REVISION,
+    "input: 2 header hits, same module (simulated GetBinCount)",
+    "winner: " .. (winner and ("PICKED " .. (winner.uri or "?") ..
+      ":" .. tostring(winner.range and winner.range.start and winner.range.start.line + 1 or "?"))
+      or "NIL (ambiguous — header-only relaxation NOT loaded; module is stale)"),
+    "label: " .. tostring(label),
+    "ranked count: " .. tostring(#(ranked or {})),
+    "result: " .. (winner and "PASS ✓" or "FAIL ✗ — restart nvim or :Lazy reload utils.lsp_fallback"),
+  }
+  for _, l in ipairs(lines) do print(l) end
+  return winner ~= nil
+end
+vim.api.nvim_create_user_command("UEDefSelfTest", function() M.self_test() end, {})
 
 -- ---------------------------------------------------------------------------
 -- M.definition: LSP first (with empty-result retries), GTAGS only after LSP

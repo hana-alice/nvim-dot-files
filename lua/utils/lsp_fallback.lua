@@ -28,7 +28,7 @@ local LSP_PROGRESS_NOTICE_MS = 600
 -- Hard cap: if LSP+GTAGS still nothing after this, declare failure.
 -- Big TUs (e.g. NaniteCullRaster.cpp) can take 30-60s to build a fresh
 -- preamble + AST after first edit; we'd rather wait than wrong-jump.
-local OVERALL_TIMEOUT_MS = 90000
+local OVERALL_TIMEOUT_MS = 30000
 -- Empty-result retries (clangd preamble building).
 local LSP_RETRY_COUNT = 20
 local LSP_RETRY_INTERVAL_MS = 2000
@@ -705,6 +705,40 @@ local function progress_notice(initial_msg)
 end
 
 -- ---------------------------------------------------------------------------
+-- Persistent debug ring-buffer for goto-definition tracing.
+-- Always-on, low-overhead (max 200 entries). View with :UEDefTrace.
+-- ---------------------------------------------------------------------------
+local TRACE_MAX = 200
+local trace_ring = {}
+local trace_idx = 0
+local function dtrace(fmt, ...)
+  trace_idx = trace_idx + 1
+  trace_ring[((trace_idx - 1) % TRACE_MAX) + 1] = string.format(
+    "[%s #%d] " .. fmt, os.date("%H:%M:%S"), trace_idx, ...)
+end
+function M.dump_trace()
+  local lines = {}
+  -- Walk from oldest to newest
+  local start = trace_idx > TRACE_MAX and trace_idx - TRACE_MAX + 1 or 1
+  for i = start, trace_idx do
+    local entry = trace_ring[((i - 1) % TRACE_MAX) + 1]
+    if entry then table.insert(lines, entry) end
+  end
+  if #lines == 0 then
+    print("(no def trace entries yet)")
+    return
+  end
+  -- Open a scratch buffer
+  vim.cmd("vnew")
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
+  vim.bo.buftype = "nofile"
+  vim.bo.bufhidden = "wipe"
+  vim.bo.swapfile = false
+  vim.api.nvim_buf_set_name(0, "UEDefTrace")
+end
+vim.api.nvim_create_user_command("UEDefTrace", function() M.dump_trace() end, {})
+
+-- ---------------------------------------------------------------------------
 -- M.definition: LSP first (with empty-result retries), GTAGS only after LSP
 -- has definitively given up. Never blocks the main loop.
 -- ---------------------------------------------------------------------------
@@ -724,6 +758,7 @@ function M.definition()
   local bufnr = vim.api.nvim_get_current_buf()
   local ref_file = normalize_path(vim.api.nvim_buf_get_name(bufnr))
   local ref_line = vim.api.nvim_win_get_cursor(0)[1]
+  dtrace("M.definition() called sym=%q file=%s:%d", symbol or "", vim.fn.fnamemodify(ref_file, ":t"), ref_line)
 
   -- Clear any stale precise-winner from a previous gd; it's no longer
   -- relevant once the user invokes gd on something else.
@@ -814,22 +849,31 @@ function M.definition()
   -- ---- Track 1: instant via workspace/symbol -----------------------------
   local instant_winner = nil
   if has_ws_client and symbol and symbol ~= "" then
+    dtrace("instant: dispatching ws/symbol q=%q", symbol)
     async_lsp_workspace_symbol(bufnr, symbol, true, function(ws_locs)
+      local n = ws_locs and #ws_locs or 0
+      dtrace("instant: ws/symbol back n=%d still=%s resolved=%s",
+        n, tostring(still_current()), tostring(resolved))
       if not still_current() or resolved then return end
       if not ws_locs or #ws_locs == 0 then return end
-      -- > INSTANT_MAX_CANDIDATES means symbol is too generic (e.g. "i" or
-      -- "Init"); skip instant entirely and let precise/quickfix handle it.
-      if #ws_locs > INSTANT_MAX_CANDIDATES then return end
+      if #ws_locs > INSTANT_MAX_CANDIDATES then
+        dtrace("instant: SKIP n>%d", INSTANT_MAX_CANDIDATES); return
+      end
       ws_locs = filter_self_locations(ws_locs, ref_file, ref_line)
+      dtrace("instant: after filter_self n=%d", ws_locs and #ws_locs or 0)
       if not ws_locs or #ws_locs == 0 then return end
 
       local winner, label = pick_winner_with_label(ws_locs, platform_hints, ref_file)
+      dtrace("instant: pick_winner winner=%s label=%s",
+        tostring(winner ~= nil), tostring(label))
       if not winner then return end -- ambiguous, let precise path handle
 
       -- Jump now if we haven't already.
       if not jumped then
         local pok, ok_or_err = pcall(jump_to_location, winner)
         local ok = pok and ok_or_err == true
+        dtrace("instant: jump pok=%s ok=%s err=%s",
+          tostring(pok), tostring(ok), pok and "" or tostring(ok_or_err):sub(1,80))
         if ok then
           jumped = true
           instant_winner = winner
@@ -862,7 +906,10 @@ function M.definition()
 
   -- ---- Track 2: precise via textDocument/definition (+impl/+decl) --------
   if has_def_client then
+    dtrace("precise: dispatching textDocument/definition")
     async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_current, function(locs)
+      dtrace("precise: back n=%d still=%s jumped=%s",
+        locs and #locs or 0, tostring(still_current()), tostring(jumped))
       if not still_current() then return end
 
       if locs and #locs > 0 then

@@ -547,6 +547,29 @@ end
 -- Jump dispatch
 -- ---------------------------------------------------------------------------
 
+-- pick_winner_with_label(locs, platform_hints, ref_file):
+--   Reranks, picks a clear winner, returns winner_loc + short label string
+--   suitable for the success notice ("FooFile.h:42") + the ranked list.
+--   Returns (nil, nil, ranked) if no clear winner — caller can populate
+--   quickfix from `ranked`. Returns (nil, nil, nil) if locs is empty.
+local function pick_winner_with_label(locs, platform_hints, ref_file)
+  if not locs or #locs == 0 then return nil, nil, nil end
+  local ranked = rerank_locations(locs, platform_hints, ref_file)
+  local winner = clear_winner(ranked, platform_hints, ref_file)
+  if not winner then return nil, nil, ranked end
+
+  local p = location_path(winner)
+  local short = (p ~= "" and (p:match("([^/\\]+)$") or p)) or "?"
+  local lnum
+  if winner.range and winner.range.start then
+    lnum = winner.range.start.line + 1
+  elseif winner.targetSelectionRange and winner.targetSelectionRange.start then
+    lnum = winner.targetSelectionRange.start.line + 1
+  end
+  local label = lnum and string.format("%s:%d", short, lnum) or short
+  return winner, label, ranked
+end
+
 local function try_jump(locations, title)
   if not locations or #locations == 0 then
     return false

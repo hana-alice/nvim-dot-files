@@ -246,6 +246,108 @@ local function async_lsp_request(bufnr, method, on_result)
   end
 end
 
+-- ---------------------------------------------------------------------------
+-- Location ranking helpers (used by async_lsp_definition_with_retry below
+-- and by M.definition's rerank). Defined here so they're visible to the
+-- async retry logic which decides whether to also query implementation.
+-- ---------------------------------------------------------------------------
+
+-- Path-based ranking for "go to implementation" candidates. We trust LSP for
+-- semantic correctness (it gave us the right symbol's overrides), but among
+-- multiple overrides we want the one matching the current target platform —
+-- e.g. RHICreateShaderBundle on Win64 should land in D3D12RHI, not the base
+-- virtual declaration in DynamicRHI.h.
+local function score_location_for_platform(loc, platform_hints, current_buf_path)
+  local path = location_path(loc):lower()
+  if path == "" then
+    return -math.huge
+  end
+
+  local score = 0
+
+  -- Strong preference: source files over headers (real implementation).
+  if path:match("%.cpp$") or path:match("%.mm$") or path:match("%.cc$") then
+    score = score + 500
+  elseif path:match("%.inl$") or path:match("%.ipp$") then
+    score = score + 200
+  elseif path:match("%.h$") or path:match("%.hpp$") or path:match("%.hxx$") then
+    score = score + 0
+  end
+
+  -- Penalize known wrappers / validation layers — they forward, they're not
+  -- the actual implementation the user wants to read.
+  if path:match("rhivalidation") then score = score - 800 end
+  if path:match("rhi/public/dynamicrhi") then score = score - 400 end
+  if path:match("/null") or path:match("nullrhi") then score = score - 600 end
+  if path:match("/mock") or path:match("/stub") then score = score - 600 end
+
+  -- Platform hint matching: earlier in the priority list = bigger boost.
+  if platform_hints then
+    for i, kw in ipairs(platform_hints) do
+      if kw and kw ~= "" and path:find(kw:lower(), 1, true) then
+        score = score + math.max(100, 1000 - (i - 1) * 100)
+        break
+      end
+    end
+  end
+
+  -- Same-module preference: if the candidate lives in the same UE module
+  -- directory as the current buffer (e.g. .../Renderer/...), nudge it.
+  if current_buf_path and current_buf_path ~= "" then
+    local cur_module = current_buf_path:lower():match("/source/[^/]+/([^/]+)/")
+    local cand_module = path:match("/source/[^/]+/([^/]+)/")
+    if cur_module and cand_module and cur_module == cand_module then
+      score = score + 50
+    end
+  end
+
+  return score
+end
+
+local function rerank_locations(locations, platform_hints, current_buf_path)
+  if not locations or #locations <= 1 then
+    return locations
+  end
+  local scored = {}
+  for _, loc in ipairs(locations) do
+    table.insert(scored, {
+      loc = loc,
+      score = score_location_for_platform(loc, platform_hints, current_buf_path),
+    })
+  end
+  table.sort(scored, function(a, b) return a.score > b.score end)
+  local out = {}
+  for _, e in ipairs(scored) do
+    out[#out + 1] = e.loc
+  end
+  return out
+end
+
+-- A definition result is "thin" if every candidate is a .h file — likely a
+-- forward/declaration/inline-trampoline, which means the user probably wants
+-- the implementation (.cpp) instead. We use this to decide whether to also
+-- query textDocument/implementation and merge.
+local function is_thin_header_only(locations)
+  if not locations or #locations == 0 then return false end
+  for _, loc in ipairs(locations) do
+    local p = location_path(loc):lower()
+    if p:match("%.cpp$") or p:match("%.mm$") or p:match("%.cc$") then
+      return false
+    end
+  end
+  return true
+end
+
+-- Decide whether a top-1 candidate clearly wins. If yes, jump directly even
+-- when there are multiple results. Margin >= 200 = a confident pick.
+local function clear_winner(scored_locations, platform_hints, current_buf_path)
+  if #scored_locations < 2 then return scored_locations[1] end
+  local s1 = score_location_for_platform(scored_locations[1], platform_hints, current_buf_path)
+  local s2 = score_location_for_platform(scored_locations[2], platform_hints, current_buf_path)
+  if s1 - s2 >= 200 then return scored_locations[1] end
+  return nil
+end
+
 -- Async LSP definition with built-in retry for empty results (clangd preamble
 -- still building) AND smart implementation merging when definition only
 -- returns headers (which usually means the user is on a virtual interface
@@ -343,105 +445,6 @@ end
 -- ---------------------------------------------------------------------------
 -- Jump dispatch
 -- ---------------------------------------------------------------------------
-
--- Path-based ranking for "go to implementation" candidates. We trust LSP for
--- semantic correctness (it gave us the right symbol's overrides), but among
--- multiple overrides we want the one matching the current target platform —
--- e.g. RHICreateShaderBundle on Win64 should land in D3D12RHI, not the base
--- virtual declaration in DynamicRHI.h.
-local function score_location_for_platform(loc, platform_hints, current_buf_path)
-  local path = location_path(loc):lower()
-  if path == "" then
-    return -math.huge
-  end
-
-  local score = 0
-
-  -- Strong preference: source files over headers (real implementation).
-  if path:match("%.cpp$") or path:match("%.mm$") or path:match("%.cc$") then
-    score = score + 500
-  elseif path:match("%.inl$") or path:match("%.ipp$") then
-    score = score + 200
-  elseif path:match("%.h$") or path:match("%.hpp$") or path:match("%.hxx$") then
-    score = score + 0
-  end
-
-  -- Penalize known wrappers / validation layers — they forward, they're not
-  -- the actual implementation the user wants to read.
-  if path:match("rhivalidation") then score = score - 800 end
-  if path:match("rhi/public/dynamicrhi") then score = score - 400 end
-  if path:match("/null") or path:match("nullrhi") then score = score - 600 end
-  if path:match("/mock") or path:match("/stub") then score = score - 600 end
-
-  -- Platform hint matching: earlier in the priority list = bigger boost.
-  if platform_hints then
-    for i, kw in ipairs(platform_hints) do
-      if kw and kw ~= "" and path:find(kw:lower(), 1, true) then
-        -- First hint = +1000, second = +900, etc.
-        score = score + math.max(100, 1000 - (i - 1) * 100)
-        break -- first match dominates
-      end
-    end
-  end
-
-  -- Same-module preference: if the candidate lives in the same UE module
-  -- directory as the current buffer (e.g. .../Renderer/...), nudge it.
-  if current_buf_path and current_buf_path ~= "" then
-    local cur_module = current_buf_path:lower():match("/source/[^/]+/([^/]+)/")
-    local cand_module = path:match("/source/[^/]+/([^/]+)/")
-    if cur_module and cand_module and cur_module == cand_module then
-      score = score + 50
-    end
-  end
-
-  return score
-end
-
-local function rerank_locations(locations, platform_hints, current_buf_path)
-  if not locations or #locations <= 1 then
-    return locations
-  end
-  local scored = {}
-  for _, loc in ipairs(locations) do
-    table.insert(scored, {
-      loc = loc,
-      score = score_location_for_platform(loc, platform_hints, current_buf_path),
-    })
-  end
-  table.sort(scored, function(a, b) return a.score > b.score end)
-  local out = {}
-  for _, e in ipairs(scored) do
-    out[#out + 1] = e.loc
-  end
-  return out
-end
-
--- A definition result is "thin" if every candidate is a .h file — likely a
--- forward/declaration/inline-trampoline, which means the user probably wants
--- the implementation (.cpp) instead. We use this to decide whether to also
--- query textDocument/implementation and merge.
-local function is_thin_header_only(locations)
-  if not locations or #locations == 0 then return false end
-  for _, loc in ipairs(locations) do
-    local p = location_path(loc):lower()
-    if p:match("%.cpp$") or p:match("%.mm$") or p:match("%.cc$") then
-      return false
-    end
-  end
-  return true
-end
-
--- Decide whether a top-1 candidate clearly wins. If yes, jump directly even
--- when there are multiple results. Margin = (top - second). Empirically, a
--- platform_hint match gives at least +100 over a non-match, so a 200+ margin
--- means we have a confident pick.
-local function clear_winner(scored_locations, platform_hints, current_buf_path)
-  if #scored_locations < 2 then return scored_locations[1] end
-  local s1 = score_location_for_platform(scored_locations[1], platform_hints, current_buf_path)
-  local s2 = score_location_for_platform(scored_locations[2], platform_hints, current_buf_path)
-  if s1 - s2 >= 200 then return scored_locations[1] end
-  return nil
-end
 
 local function try_jump(locations, title)
   if not locations or #locations == 0 then

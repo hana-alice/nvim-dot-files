@@ -213,6 +213,10 @@ map("n", "gd", function()
   require("utils.lsp_fallback").definition()
 end, { desc = "Definition (LSP -> GTAGS)" })
 
+vim.keymap.set("n", "<leader>gP", function()
+  require("utils.lsp_fallback").jump_to_precise()
+end, { desc = "Jump to precise definition (after instant jump)" })
+
 vim.api.nvim_create_user_command("UEDefStatus", function()
   require("utils.lsp_fallback").status()
 end, { desc = "Show LSP definition fallback status (debug)" })

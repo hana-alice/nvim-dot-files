@@ -708,32 +708,45 @@ function M.definition()
   local ref_file = normalize_path(vim.api.nvim_buf_get_name(bufnr))
   local ref_line = vim.api.nvim_win_get_cursor(0)[1]
 
+  -- Clear any stale precise-winner from a previous gd; it's no longer
+  -- relevant once the user invokes gd on something else.
+  M._last_precise_winner = nil
   request_token = request_token + 1
   local my_token = request_token
   local function still_current() return my_token == request_token end
 
-  local resolved = false
+  -- Three independent tracks; whichever produces a usable jump first wins.
+  local jumped = false   -- some track has navigated the cursor
+  local resolved = false -- terminal state, no more notices, no more work
   local notice = nil
+
   local function clear_notice()
-    if notice then
-      pcall(notice.clear)
-      notice = nil
-    end
+    if notice then pcall(notice.clear); notice = nil end
   end
-  -- done(success_msg): if a message is provided AND a notice exists, replace
-  -- the spinner with that message and let it auto-dismiss after a few seconds
-  -- (so the user can see what resolved). If no message, clear immediately.
   local function done(success_msg, lifetime_ms)
     resolved = true
     if success_msg and notice then
-      pcall(notice.finish, success_msg, lifetime_ms or 3000)
-      notice = nil
+      pcall(notice.finish, success_msg, lifetime_ms or 3000); notice = nil
+    elseif success_msg then
+      -- Resolved before the spinner appeared (fast path). Still show the
+      -- result so the user can see whether instant or precise won.
+      pcall(vim.notify, success_msg, vim.log.levels.INFO,
+        { title = "LSP definition", timeout = lifetime_ms or 3000 })
     else
       clear_notice()
     end
   end
 
-  -- Shader files: LSP can't help, go straight to async GTAGS.
+  -- Resolve platform hints once (cheap, cached state.json).
+  local platform_hints = nil
+  do
+    local ok, ue = pcall(require, "ue")
+    if ok and ue.platform_path_priorities then
+      platform_hints = ue.platform_path_priorities()
+    end
+  end
+
+  -- Shader files: still GTAGS-only, same as before.
   local ext = buf_extension(bufnr)
   if SHADER_EXTS[ext] then
     gtags_fallback_async(symbol, function(ok)
@@ -747,7 +760,9 @@ function M.definition()
   end
 
   local has_def_client = #vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/definition" }) > 0
-  if not has_def_client then
+  local has_ws_client  = #vim.lsp.get_clients({ bufnr = bufnr, method = "workspace/symbol" }) > 0
+
+  if not has_def_client and not has_ws_client then
     gtags_fallback_async(symbol, function(ok)
       if not still_current() then return end
       done()
@@ -758,107 +773,154 @@ function M.definition()
     return
   end
 
-  -- Schedule progress notice if LSP is slow to answer.
-  -- IMPORTANT: do NOT spam updates. Even with replace=id, noice/snacks log
-  -- every vim.notify call to message history, so a 2s ticker produces
-  -- "2s elapsed / 4s elapsed / 6s elapsed ..." in :messages even though
-  -- only one bubble is visible. We emit at most TWO notices total:
-  --   1. ~600ms in: "still resolving, LSP is busy"
-  --   2. shortly before fallback: "still no LSP result, will fall back to
-  --      GTAGS in Ns" (only if the first notice is still active)
-  local started_at = vim.loop.hrtime()
-  local function elapsed_s()
-    return math.floor((vim.loop.hrtime() - started_at) / 1e9)
-  end
-
+  -- Progress notice (only after 600ms, so fast jumps don't flash a spinner).
   vim.defer_fn(function()
     if not still_current() or resolved then return end
     notice = progress_notice(string.format(
-      "⏳ resolving %s ... LSP busy (preamble/indexing), up to %ds before GTAGS fallback",
-      symbol or "?", math.floor(LSP_RETRY_COUNT * LSP_RETRY_INTERVAL_MS / 1000)
+      "⏳ resolving %s ... (instant index path racing precise AST path)",
+      symbol or "?"
     ))
   end, LSP_PROGRESS_NOTICE_MS)
 
-  -- Single mid-wait reassurance update, only if we're still pending past
-  -- the halfway mark. One in-place update, no spam.
-  local lsp_budget_ms = LSP_RETRY_COUNT * LSP_RETRY_INTERVAL_MS
-  vim.defer_fn(function()
-    if not still_current() or resolved or not notice then return end
-    notice.update(string.format(
-      "⏳ %s ... %ds elapsed, LSP still indexing (fallback at %ds)",
-      symbol or "?", elapsed_s(), math.floor(lsp_budget_ms / 1000)
-    ))
-  end, math.floor(lsp_budget_ms / 2))
-
-  -- Hard timeout: bail out.
+  -- Hard timeout: bail out. Only WARN if nothing has jumped — otherwise
+  -- the instant track already navigated and the precise reconcile just
+  -- couldn't finish in time, which is normal for very large UE TUs.
   vim.defer_fn(function()
     if not still_current() or resolved then return end
     done()
-    vim.notify(string.format("Definition lookup timed out after %ds (%s)",
-      math.floor(OVERALL_TIMEOUT_MS / 1000), symbol or "?"),
-      vim.log.levels.WARN)
+    if not jumped then
+      vim.notify(string.format("Definition lookup timed out after %ds (%s)",
+        math.floor(OVERALL_TIMEOUT_MS / 1000), symbol or "?"), vim.log.levels.WARN)
+    end
   end, OVERALL_TIMEOUT_MS)
 
-  -- Resolve current platform once for ranking. Cheap (cached state.json).
-  local platform_hints = nil
-  do
-    local ok, ue = pcall(require, "ue")
-    if ok and ue.platform_path_priorities then
-      platform_hints = ue.platform_path_priorities()
-    end
-  end
-
-  -- LSP first, with retries for empty result while preamble builds.
-  async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_current, function(locs)
-    if not still_current() or resolved then return end
-
-    -- Format a short "where we landed" suffix for the success notice.
-    local function loc_label(loc)
-      local p = location_path(loc)
-      if p == "" then return "?" end
-      local short = p:match("([^/\\]+)$") or p
-      local lnum
-      if loc.range and loc.range.start then lnum = loc.range.start.line + 1
-      elseif loc.targetSelectionRange and loc.targetSelectionRange.start then lnum = loc.targetSelectionRange.start.line + 1 end
-      if lnum then return string.format("%s:%d", short, lnum) end
-      return short
-    end
-
-    if locs and #locs > 0 then
-      -- Rerank by platform & implementation preference, then jump.
-      local ranked = rerank_locations(locs, platform_hints, ref_file)
-      local winner = clear_winner(ranked, platform_hints, ref_file)
-      if winner then
-        local ok = jump_to_location(winner)
-        if ok then
-          done(string.format("✓ %s → %s", symbol or "?", loc_label(winner)), 3000)
-          return
-        end
-        -- jump failed; fall through to try_jump (which will quickfix the rest)
-      end
-      local outcome = try_jump(ranked, "LSP definitions")
-      if outcome == true or outcome == "open_failed" then
-        local first = ranked and ranked[1] or nil
-        local msg = first
-            and string.format("✓ %s → %s (%d candidates)", symbol or "?", loc_label(first), #ranked)
-            or string.format("✓ %s (LSP)", symbol or "?")
-        done(msg, 3000)
-        return
-      end
-      -- try_jump returned false (empty after dedup): treat as no LSP result.
-    end
-
-    -- LSP gave up. Try GTAGS async.
-    gtags_fallback_async(symbol, function(jumped)
+  -- ---- Track 1: instant via workspace/symbol -----------------------------
+  local instant_winner = nil
+  if has_ws_client and symbol and symbol ~= "" then
+    async_lsp_workspace_symbol(bufnr, symbol, true, function(ws_locs)
       if not still_current() or resolved then return end
-      if jumped then
-        done(string.format("✓ %s (GTAGS fallback)", symbol or "?"), 3000)
-      else
-        done()
-        vim.notify("No definition (LSP and GTAGS both empty): " .. (symbol or "?"), vim.log.levels.INFO)
+      if not ws_locs or #ws_locs == 0 then return end
+      -- > INSTANT_MAX_CANDIDATES means symbol is too generic (e.g. "i" or
+      -- "Init"); skip instant entirely and let precise/quickfix handle it.
+      if #ws_locs > INSTANT_MAX_CANDIDATES then return end
+      ws_locs = filter_self_locations(ws_locs, ref_file, ref_line)
+      if not ws_locs or #ws_locs == 0 then return end
+
+      local winner, label = pick_winner_with_label(ws_locs, platform_hints, ref_file)
+      if not winner then return end -- ambiguous, let precise path handle
+
+      -- Jump now if we haven't already.
+      if not jumped then
+        local pok, ok = pcall(jump_to_location, winner)
+        ok = pok and ok
+        if ok then
+          jumped = true
+          instant_winner = winner
+          done(string.format("⚡ %s → %s (instant)", symbol or "?", label or "?"), 3000)
+          -- Note: done() sets resolved=true, but the precise track callback
+          -- only gates on still_current() (not resolved) — so reconcile
+          -- still runs and can post a "precise differs" hint.
+          -- INSTANT_PRECISE_RECONCILE controls whether reconcile is shown
+          -- (handled in precise track), not whether precise keeps running.
+        end
       end
     end)
-  end)
+  end
+
+  -- ---- Track 2: precise via textDocument/definition (+impl/+decl) --------
+  if has_def_client then
+    async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_current, function(locs)
+      if not still_current() then return end
+
+      if locs and #locs > 0 then
+        local winner, label, ranked = pick_winner_with_label(locs, platform_hints, ref_file)
+
+        if not jumped then
+          -- precise won the race
+          if winner then
+            local pok, ok = pcall(jump_to_location, winner)
+            ok = pok and ok
+            if ok then
+              jumped = true
+              done(string.format("✓ %s → %s (precise)", symbol or "?", label or "?"), 3000)
+              return
+            end
+          end
+          -- multi-candidate / no clear winner → quickfix
+          local outcome = try_jump(ranked or locs, "LSP definitions")
+          if outcome == true or outcome == "open_failed" then
+            local first = (ranked or locs)[1]
+            local _, lab2 = pick_winner_with_label({ first }, platform_hints, ref_file)
+            jumped = true
+            done(string.format("✓ %s → %s (%d candidates)", symbol or "?",
+              lab2 or "?", #(ranked or locs)), 3000)
+            return
+          end
+        else
+          -- instant already jumped. Reconcile if precise disagrees.
+          if INSTANT_PRECISE_RECONCILE and winner and instant_winner then
+            local same = location_key(winner) == location_key(instant_winner)
+            if not same then
+              vim.notify(string.format(
+                "ℹ precise definition differs: %s (press <leader>gP to switch)",
+                label or "?"
+              ), vim.log.levels.INFO)
+              M._last_precise_winner = winner
+            end
+          end
+          -- TODO(instant-goto): when winner is nil but ranked has multiple
+          -- candidates AND instant_winner is set, surface a "precise found N
+          -- candidates" hint and let <leader>gP open a quickfix. For v1 we
+          -- silently keep the instant jump.
+          done() -- clear spinner; instant message already shown
+          return
+        end
+      end
+
+      -- LSP precise gave nothing. If instant already jumped, we're done.
+      if jumped then done(); return end
+
+      -- Otherwise fall through to GTAGS.
+      gtags_fallback_async(symbol, function(jumped_g)
+        if not still_current() or resolved then return end
+        if jumped_g then
+          jumped = true
+          done(string.format("✓ %s (GTAGS fallback)", symbol or "?"), 3000)
+        else
+          done()
+          vim.notify("No definition (LSP and GTAGS both empty): " .. (symbol or "?"),
+            vim.log.levels.INFO)
+        end
+      end)
+    end)
+  else
+    -- ws_client only, no def_client. Wait briefly for instant track,
+    -- then fall back to GTAGS if it didn't pan out.
+    vim.defer_fn(function()
+      if not still_current() or resolved or jumped then return end
+      gtags_fallback_async(symbol, function(jumped_g)
+        if not still_current() or resolved then return end
+        if jumped_g then
+          jumped = true
+          done(string.format("✓ %s (GTAGS fallback)", symbol or "?"), 3000)
+        else
+          done()
+          vim.notify("No definition: " .. (symbol or "?"), vim.log.levels.INFO)
+        end
+      end)
+    end, INSTANT_DEADLINE_MS + 100)
+  end
+end
+
+-- Jump to the precise definition stored by the last reconcile, if any.
+function M.jump_to_precise()
+  local w = M._last_precise_winner
+  if not w then
+    vim.notify("No precise winner recorded yet", vim.log.levels.WARN)
+    return
+  end
+  pcall(jump_to_location, w)
+  M._last_precise_winner = nil
 end
 
 -- ---------------------------------------------------------------------------

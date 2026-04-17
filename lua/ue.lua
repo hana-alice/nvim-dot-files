@@ -1614,6 +1614,32 @@ local function unix_now()
   return os.time()
 end
 
+local function index_phase_label(phase)
+  phase = trim(phase):lower()
+  if phase == "current" then
+    return "T0"
+  elseif phase == "hot" then
+    return "HOT"
+  elseif phase == "full" then
+    return "FULL"
+  elseif phase == "idle" or phase == "" then
+    return "IDLE"
+  end
+  return phase:upper()
+end
+
+local function module_tier_label(tier)
+  tier = trim(tier):lower()
+  if tier == "core" then
+    return "CORE"
+  elseif tier == "cold" then
+    return "COLD"
+  elseif tier == "warm" then
+    return "WARM"
+  end
+  return tier ~= "" and tier:upper() or "-"
+end
+
 local function read_json_file(path, default)
   default = default or {}
   if not is_file(path) then
@@ -2259,23 +2285,52 @@ end
 INDEX_FN.index_status_summary = function(ctx)
   local state = ensure_index_state(ctx)
   local dirty = 0
+  local total = 0
+  local tier_counts = { core = 0, warm = 0, cold = 0 }
   for _, rec in pairs(state.modules or {}) do
+    total = total + 1
+    local tier = rec.tier or "warm"
+    if tier_counts[tier] ~= nil then
+      tier_counts[tier] = tier_counts[tier] + 1
+    end
     if rec.dirty then
       dirty = dirty + 1
     end
   end
   local active_name = "-"
+  local active_tier = "-"
+  local active_kind = "-"
   if state.active_module and state.modules[state.active_module] then
-    active_name = state.modules[state.active_module].name or active_name
+    local active = state.modules[state.active_module]
+    active_name = active.name or active_name
+    active_tier = module_tier_label(active.tier)
+    active_kind = active.kind or active_kind
   end
+  local queued = {}
+  for _, phase_name in ipairs({ "current", "hot", "full" }) do
+    if state.queue and state.queue[phase_name] then
+      queued[#queued + 1] = index_phase_label(phase_name)
+    end
+  end
+  local phase = state.build and state.build.phase or "idle"
   return {
     active = active_name,
+    active_tier = active_tier,
+    active_kind = active_kind,
     dirty = dirty,
+    total = total,
+    core = tier_counts.core,
+    warm = tier_counts.warm,
+    cold = tier_counts.cold,
+    queued = queued,
+    queue_count = #queued,
     root_dirty = (state.root_dirty or false) or (CORE_RT.dirty_index_roots[status_root_key(ctx)] and true or false),
-    phase = state.build and state.build.phase or "idle",
+    phase = phase,
+    phase_label = index_phase_label(phase),
     status = state.build and state.build.status or "idle",
     message = state.build and state.build.message or "",
     active_index = state.build and state.build.active_index or "",
+    active_index_name = trim(vim.fs.basename(state.build and state.build.active_index or "")),
   }
 end
 
@@ -2414,7 +2469,7 @@ local function index_status_token(ctx)
 
   local token
   if summary.status == "running" then
-    token = "IDX:" .. summary.phase:sub(1, 1):upper() .. "*"
+    token = "IDX:" .. summary.phase_label .. "*"
   elseif summary.root_dirty then
     token = summary.dirty > 0 and string.format("IDX!%d", summary.dirty) or "IDX!R"
   else
@@ -2429,7 +2484,11 @@ local function index_status_token(ctx)
       token = "IDX?"
     end
     if not token then
-      token = summary.active ~= "-" and ("IDX:" .. summary.active) or "IDX"
+      if summary.active ~= "-" then
+        token = "IDX:" .. summary.phase_label .. "/" .. summary.active
+      else
+        token = "IDX:" .. summary.phase_label
+      end
     end
   end
   INDEX_RT.status_cache[key] = { token = token, ts = now }
@@ -4661,9 +4720,14 @@ function M.statusline_status(opts)
 
   local parts = { "UE" }
   local scope = current_scope_info_from_context(ctx)
+  local summary = INDEX_FN.index_status_summary(ctx)
   parts[#parts + 1] = short_scope_token(scope)
   parts[#parts + 1] = mode_token(ctx)
   parts[#parts + 1] = index_status_token(ctx)
+
+  if summary.queue_count > 0 then
+    parts[#parts + 1] = "Q:" .. table.concat(summary.queued, "/")
+  end
 
   if M._prepare_running then
     parts[#parts + 1] = "PREP*"
@@ -4684,22 +4748,35 @@ function M.index_status(opts)
     return nil
   end
   local summary = INDEX_FN.index_status_summary(ctx)
+  local queue_text = (#summary.queued > 0) and table.concat(summary.queued, ", ") or "-"
   local lines = {
     "UE index status:",
-    "  active module: " .. summary.active,
-    "  build phase: " .. summary.phase,
-    "  build status: " .. summary.status,
-    "  dirty modules: " .. tostring(summary.dirty),
-    "  message: " .. trim(summary.message),
-    "  active index: " .. trim(summary.active_index),
+    "  mode: " .. mode_token(ctx),
+    "  phase: " .. summary.phase_label .. " (" .. summary.phase .. ")",
+    "  build: " .. summary.status,
+    "  active: " .. summary.active .. " [" .. summary.active_tier .. "/" .. summary.active_kind .. "]",
+    "  dirty: root=" .. (summary.root_dirty and "yes" or "no") .. ", modules=" .. tostring(summary.dirty),
+    "  queue: " .. queue_text,
+    "  modules: total=" .. tostring(summary.total) .. ", core=" .. tostring(summary.core) .. ", warm=" .. tostring(summary.warm) .. ", cold=" .. tostring(summary.cold),
+    "  index file: " .. (trim(summary.active_index_name) ~= "" and summary.active_index_name or "-"),
+    "  message: " .. (trim(summary.message) ~= "" and trim(summary.message) or "-"),
   }
   local state = ensure_index_state(ctx)
   local ordered = sorted_module_records(state)
   if #ordered > 0 then
-    lines[#lines + 1] = "  top modules:"
+    lines[#lines + 1] = "  hot modules:"
     for i = 1, math.min(8, #ordered) do
       local rec = ordered[i]
-      lines[#lines + 1] = string.format("    %d. %s [%s] score=%d dirty=%s", i, rec.name or rec.key, rec.tier or "warm", tonumber(rec._score) or 0, rec.dirty and "yes" or "no")
+      lines[#lines + 1] = string.format(
+        "    %d. %s [%s] score=%d dirty=%s opened=%d changed=%d",
+        i,
+        rec.name or rec.key,
+        module_tier_label(rec.tier),
+        tonumber(rec._score) or 0,
+        rec.dirty and "yes" or "no",
+        tonumber(rec.last_opened) or 0,
+        tonumber(rec.last_changed) or 0
+      )
     end
   end
   local msg = table.concat(lines, "\n")

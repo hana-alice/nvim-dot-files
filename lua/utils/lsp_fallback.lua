@@ -741,24 +741,42 @@ end
 -- Returns {update = fn(msg), clear = fn(), finish = fn(msg, lifetime_ms)}.
 -- snacks/noice/nvim-notify all support replacing a notification by passing
 -- the previous id back via opts.replace; we use that when available.
+-- Module-level singleton: only ONE LSP-definition notice may be visible at
+-- a time. A second gd while a first one is still resolving will reuse the
+-- same notification slot (snacks: same id; nvim-notify: same handle), so the
+-- top-right corner never accumulates a stack of spinners.
+local _shared_notice_id = nil
+
 local function progress_notice(initial_msg)
-  local current_id = nil
   local function emit(msg, opts_override)
-    local opts = { title = "LSP definition", timeout = false }
-    if current_id ~= nil then
-      opts.replace = current_id
-      opts.id = current_id            -- snacks
-      opts.hide_from_history = true
+    -- hide_from_history is set from the FIRST emit — without this, snacks
+    -- writes every spinner update into :messages history even when we
+    -- pass `replace=id`. This is what makes the top-right corner appear to
+    -- accumulate "resolving..." entries across multiple gd invocations.
+    local opts = {
+      title = "LSP definition",
+      timeout = false,
+      hide_from_history = true,
+    }
+    if _shared_notice_id ~= nil then
+      opts.replace = _shared_notice_id
+      opts.id = _shared_notice_id            -- snacks key
+    else
+      opts.id = "ue_lsp_definition_progress"  -- stable snacks slot key
     end
     if opts_override then
       for k, v in pairs(opts_override) do opts[k] = v end
     end
-    local ok, new_id = pcall(vim.notify, msg, opts_override and opts_override.level or vim.log.levels.INFO, opts)
+    local ok, new_id = pcall(vim.notify,
+      msg,
+      opts_override and opts_override.level or vim.log.levels.INFO,
+      opts)
     if ok then
-      current_id = new_id or current_id
+      _shared_notice_id = new_id or _shared_notice_id
     end
   end
   emit(initial_msg)
+  local current_id = _shared_notice_id
   return {
     update = function(msg) emit(msg) end,
     clear = function()
@@ -767,25 +785,28 @@ local function progress_notice(initial_msg)
           if type(current_id) == "table" and current_id.hide then
             current_id:hide()
           elseif vim.notify and package.loaded["notify"] then
-            -- nvim-notify: re-emit with very short timeout to dismiss
             pcall(vim.notify, "", vim.log.levels.INFO, { replace = current_id, timeout = 1 })
           end
         end
       end)
+      -- Only clear the shared slot if we're still the active notice.
+      if _shared_notice_id == current_id then _shared_notice_id = nil end
       current_id = nil
     end,
     -- Update the notice to a "done" message that auto-dismisses after
-    -- lifetime_ms. This gives the user a moment to see *what* resolved
-    -- (especially after a long preamble wait) instead of the spinner just
-    -- vanishing. After lifetime_ms we explicitly clear in case the notify
-    -- backend ignored our timeout.
+    -- lifetime_ms. Critically: the "done" message is allowed into history
+    -- (hide_from_history=false) so the user can see the latest resolution
+    -- in :messages — but spinner ticks remain history-suppressed.
     finish = function(msg, lifetime_ms, level)
       lifetime_ms = lifetime_ms or 3000
-      emit(msg, { timeout = lifetime_ms, level = level or vim.log.levels.INFO })
+      emit(msg, {
+        timeout = lifetime_ms,
+        level = level or vim.log.levels.INFO,
+        hide_from_history = false,
+      })
       local id_at_finish = current_id
       vim.defer_fn(function()
-        -- Only clear if the notice is still ours (no newer request took over).
-        if current_id == id_at_finish then
+        if _shared_notice_id == id_at_finish then
           pcall(function()
             if type(current_id) == "table" and current_id.hide then
               current_id:hide()
@@ -793,6 +814,7 @@ local function progress_notice(initial_msg)
               pcall(vim.notify, "", vim.log.levels.INFO, { replace = current_id, timeout = 1 })
             end
           end)
+          _shared_notice_id = nil
           current_id = nil
         end
       end, lifetime_ms + 200)
@@ -806,7 +828,7 @@ end
 -- ---------------------------------------------------------------------------
 -- MODULE_REVISION bumps every time this file is meaningfully edited so we
 -- can tell from a trace whether the user is running stale bytecode.
-local MODULE_REVISION = "selftest+disklog+exportrev+canddump+receiver"
+local MODULE_REVISION = "selftest+disklog+exportrev+canddump+receiver+singleton"
 local TRACE_MAX = 200
 local trace_ring = {}
 local trace_idx = 0

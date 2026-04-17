@@ -35,6 +35,19 @@ local LSP_RETRY_INTERVAL_MS = 2000
 -- Update the progress notice on every retry so the user sees forward motion.
 local PROGRESS_TICK_INTERVAL_MS = LSP_RETRY_INTERVAL_MS
 
+-- Instant path config ---------------------------------------------------
+-- The instant path uses workspace/symbol (no AST required). If it returns
+-- a single high-confidence match within INSTANT_DEADLINE_MS, we jump
+-- immediately and skip the AST-bound path.
+local INSTANT_DEADLINE_MS = 400      -- give ws/symbol up to 400ms before
+                                     -- letting precise path take over UI
+local INSTANT_MAX_CANDIDATES = 50    -- if more than this match by name,
+                                     -- bail (almost certainly the wrong
+                                     -- query, e.g. cursor on `int`)
+-- When set, after instant jump we still run the precise path; if it
+-- returns a different location we surface a small notice.
+local INSTANT_PRECISE_RECONCILE = true
+
 -- ---------------------------------------------------------------------------
 -- Symbol / position helpers
 -- ---------------------------------------------------------------------------

@@ -213,6 +213,11 @@ local function reconcile_landing_to_definition(sym, landed_line_1b)
   if not sym or sym == "" then return end
 
   local bufnr = vim.api.nvim_get_current_buf()
+  local actual = vim.api.nvim_win_get_cursor(0)
+  if M._dtrace then
+    pcall(M._dtrace, "reconcile: ENTER sym=%q landed=%d actual_cursor=%d:%d",
+      sym, landed_line_1b, actual[1], actual[2])
+  end
   local line_count = vim.api.nvim_buf_line_count(bufnr)
   if line_count == 0 then return end
 
@@ -356,17 +361,16 @@ local function jump_to_location(location)
   -- Two-phase cursor set: synchronous now (so synchronous code observes the
   -- target line) AND deferred via vim.defer_fn (so any BufRead / FileType /
   -- LspAttach / treesitter-on-load autocmds — many of which reset cursor to
-  -- line 1 by calling things like `keepjumps normal! 1G` or restoring '"'
-  -- mark to (1,0) when the buffer was never visited — can't strand us at
-  -- top-of-file). The deferred re-set only fires if cursor was reset; we
-  -- never override a user-moved cursor.
-  local function apply_cursor_if_stranded(target_buf)
-    -- Only fix if we're still in the target buffer and cursor was reset.
-    if vim.api.nvim_get_current_buf() ~= target_buf then return end
+  -- line 1 (BufRead reset) OR to the shada '"' mark (BufReadPost restore-
+  -- cursor autocmds, which can land on ANY line/col from a previous session)
+  -- — can't strand us at the wrong location. The deferred re-set checks
+  -- whether cursor is at our target; if not, force it back. The 30/150ms
+  -- timing is too short for a human keystroke, so we don't need to worry
+  -- about overriding intentional user movement.
+  local function apply_cursor_if_drifted(target_buf)
+    if vim.api.nvim_get_current_buf() ~= target_buf then return false end
     local cur = vim.api.nvim_win_get_cursor(0)
-    -- "Stranded" means cursor sits at (1, 0..1) — classic BufRead reset.
-    -- If user moved deliberately we leave them alone.
-    if cur[1] ~= 1 or cur[2] > 1 then return end
+    if cur[1] == line_1b then return false end -- already where we want
     -- Re-clamp in case the buffer mutated.
     local lc = vim.api.nvim_buf_line_count(0)
     local ln = math.min(math.max(line_1b, 1), lc)
@@ -374,7 +378,8 @@ local function jump_to_location(location)
     local cc = math.min(math.max(col, 0), #lt)
     pcall(vim.api.nvim_win_set_cursor, 0, { ln, cc })
     pcall(vim.cmd, "normal! zz")
-    if M._dtrace then pcall(M._dtrace, "jump: deferred un-strand to %d:%d", ln, cc) end
+    if M._dtrace then pcall(M._dtrace, "jump: drift-fix %d:%d -> %d:%d", cur[1], cur[2], ln, cc) end
+    return true
   end
 
   local ok_cur = pcall(vim.api.nvim_win_set_cursor, 0, { line_1b, col })
@@ -389,9 +394,19 @@ local function jump_to_location(location)
   -- BufRead/FileType chains; 150ms catches slower late autocmds (treesitter
   -- region attach, LspAttach handlers, etc.). Both bail if user moved.
   local target_buf = vim.api.nvim_get_current_buf()
-  vim.defer_fn(function() apply_cursor_if_stranded(target_buf) end, 30)
   vim.defer_fn(function()
-    apply_cursor_if_stranded(target_buf)
+    if M._dtrace then
+      local c = vim.api.nvim_win_get_cursor(0)
+      pcall(M._dtrace, "jump: 30ms tick cursor=%d:%d target=%d", c[1], c[2], line_1b)
+    end
+    apply_cursor_if_drifted(target_buf)
+  end, 30)
+  vim.defer_fn(function()
+    if M._dtrace then
+      local c = vim.api.nvim_win_get_cursor(0)
+      pcall(M._dtrace, "jump: 150ms tick cursor=%d:%d target=%d", c[1], c[2], line_1b)
+    end
+    apply_cursor_if_drifted(target_buf)
     -- reconcile only if we're still in the target buf and at our line
     if vim.api.nvim_get_current_buf() ~= target_buf then return end
     local cur = vim.api.nvim_win_get_cursor(0)
@@ -401,6 +416,8 @@ local function jump_to_location(location)
       if sym and #sym > 0 then
         pcall(reconcile_landing_to_definition, sym, line_1b)
       end
+    elseif M._dtrace then
+      pcall(M._dtrace, "jump: 150ms reconcile skipped, cursor=%d not target=%d", cur[1], line_1b)
     end
   end, 150)
 
@@ -413,6 +430,12 @@ local function jump_to_location(location)
   -- locations that don't carry it, we fall back to the original cword captured
   -- before the jump (set on the location by the caller as _origin_cword).
   local sym = location._sym_name or location._origin_cword
+  -- INSTRUMENT: log actual cursor immediately after our set, vs target.
+  if M._dtrace then
+    local actual = vim.api.nvim_win_get_cursor(0)
+    pcall(M._dtrace, "jump: post-set cursor actual=%d:%d target=%d:%d sym=%s",
+      actual[1], actual[2], line_1b, col, tostring(sym))
+  end
   if sym and #sym > 0 then
     pcall(reconcile_landing_to_definition, sym, line_1b)
   end
@@ -1022,7 +1045,7 @@ end
 -- ---------------------------------------------------------------------------
 -- MODULE_REVISION bumps every time this file is meaningfully edited so we
 -- can tell from a trace whether the user is running stale bytecode.
-local MODULE_REVISION = "selftest+disklog+exportrev+canddump+receiver+singleton+jumpfix+reconcile+cwordcarry+unstrand+noticeflush"
+local MODULE_REVISION = "selftest+disklog+exportrev+canddump+receiver+singleton+jumpfix+reconcile+cwordcarry+unstrand+noticeflush+driftfix"
 local TRACE_MAX = 200
 local trace_ring = {}
 local trace_idx = 0

@@ -729,6 +729,9 @@ end
 -- Persistent debug ring-buffer for goto-definition tracing.
 -- Always-on, low-overhead (max 200 entries). View with :UEDefTrace.
 -- ---------------------------------------------------------------------------
+-- MODULE_REVISION bumps every time this file is meaningfully edited so we
+-- can tell from a trace whether the user is running stale bytecode.
+local MODULE_REVISION = "f75fa9b+headeronly+precisetrace"
 local TRACE_MAX = 200
 local trace_ring = {}
 local trace_idx = 0
@@ -738,15 +741,16 @@ local function dtrace(fmt, ...)
     "[%s #%d] " .. fmt, os.date("%H:%M:%S"), trace_idx, ...)
 end
 function M.dump_trace()
-  local lines = {}
+  local lines = { string.format("=== UEDefTrace  module_rev=%s  trace_idx=%d ===",
+    MODULE_REVISION, trace_idx) }
   -- Walk from oldest to newest
   local start = trace_idx > TRACE_MAX and trace_idx - TRACE_MAX + 1 or 1
   for i = start, trace_idx do
     local entry = trace_ring[((i - 1) % TRACE_MAX) + 1]
     if entry then table.insert(lines, entry) end
   end
-  if #lines == 0 then
-    print("(no def trace entries yet)")
+  if #lines == 1 then
+    print("(no def trace entries yet, module_rev=" .. MODULE_REVISION .. ")")
     return
   end
   -- Open a scratch buffer

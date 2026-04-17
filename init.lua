@@ -2,15 +2,28 @@
 vim.g.mapleader = " "
 vim.g.maplocalleader = " "
 
+-- Windows: redirect data/state/cache into %LOCALAPPDATA%\nvim-main so we have
+-- a single, clean nvim runtime directory next to the config dir.
+--
+-- IMPORTANT: the AUTHORITATIVE setup is a Windows USER environment variable
+-- (XDG_DATA_HOME / XDG_STATE_HOME / XDG_CACHE_HOME / NVIM_LOG_FILE), set via
+-- scripts/set_xdg_env.ps1. Doing it there guarantees nvim picks the right
+-- paths BEFORE init.lua runs (otherwise the early-init log file leaks into
+-- %LOCALAPPDATA%\nvim-data\log).
+--
+-- The block below stays as a fallback for fresh machines where the env vars
+-- have not been installed yet — it still keeps stdpath('data'/'state'/'cache')
+-- pointing at nvim-main, just not the pre-init log.
+--
 -- This check runs before runtimepath/XDG is configured, so we cannot
 -- require("utils.platform") here — use inline vim.fn.has() instead.
 if vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1 then
   local localappdata = vim.env.LOCALAPPDATA
   if localappdata and localappdata ~= "" then
     local base = localappdata:gsub("\\", "/") .. "/nvim-main"
-    vim.env.XDG_DATA_HOME = base
-    vim.env.XDG_STATE_HOME = base
-    vim.env.XDG_CACHE_HOME = base
+    vim.env.XDG_DATA_HOME = vim.env.XDG_DATA_HOME or base
+    vim.env.XDG_STATE_HOME = vim.env.XDG_STATE_HOME or base
+    vim.env.XDG_CACHE_HOME = vim.env.XDG_CACHE_HOME or base
   end
 end
 

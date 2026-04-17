@@ -1,0 +1,6 @@
+print("data=" .. vim.fn.stdpath("data"))
+print("state=" .. vim.fn.stdpath("state"))
+print("cache=" .. vim.fn.stdpath("cache"))
+print("log=" .. vim.fn.stdpath("log"))
+print("NVIM_LOG_FILE=" .. (vim.env.NVIM_LOG_FILE or "<unset>"))
+print("XDG_DATA_HOME=" .. (vim.env.XDG_DATA_HOME or "<unset>"))

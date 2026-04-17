@@ -2763,7 +2763,14 @@ local function rg_code_definition_search(ctx, symbol)
   cmd[#cmd + 1] = symbol
   vim.list_extend(cmd, dirs)
 
-  local code, lines = run_lines(cmd, { cwd = workspace_root(ctx) })
+  local cwd = ctx.engine_root
+  if ctx.project_root and ctx.project_root ~= "" then
+    local root = common_ancestor({ ctx.engine_root, ctx.project_root })
+    if root ~= "" then
+      cwd = root
+    end
+  end
+  local code, lines = run_lines(cmd, { cwd = cwd })
   if code ~= 0 and code ~= 1 then
     return false
   end

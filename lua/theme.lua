@@ -18,6 +18,11 @@ local LABELS = {
   ["catppuccin-latte"] = "Catppuccin Latte",
   ["catppuccin-macchiato"] = "Catppuccin Macchiato",
   ["catppuccin-mocha"] = "Catppuccin Mocha",
+  kanagawa = "Kanagawa",
+  monokai = "Monokai",
+  monokai_pro = "Monokai Pro",
+  monokai_soda = "Monokai Soda",
+  monokai_ristretto = "Monokai Ristretto",
   unokai = "Unokai",
   ["ubuntu-terminal"] = "Ubuntu Terminal",
 }
@@ -29,6 +34,11 @@ local PLUGIN_BY_THEME = {
   ["catppuccin-latte"] = "catppuccin",
   ["catppuccin-macchiato"] = "catppuccin",
   ["catppuccin-mocha"] = "catppuccin",
+  kanagawa = "kanagawa.nvim",
+  monokai = "monokai.nvim",
+  monokai_pro = "monokai.nvim",
+  monokai_soda = "monokai.nvim",
+  monokai_ristretto = "monokai.nvim",
 }
 
 local function state_path()
@@ -151,6 +161,13 @@ function M.startup()
   return DEFAULT
 end
 
+local function colorscheme_for(name)
+  if name == "kanagawa" then
+    return "kanagawa-dragon"
+  end
+  return name
+end
+
 function M.load_startup()
   local name = normalize_name(M.startup())
   if name == "" then
@@ -158,7 +175,7 @@ function M.load_startup()
   end
 
   ensure_theme_loaded(name)
-  local ok, err = pcall(vim.cmd.colorscheme, name)
+  local ok, err = pcall(vim.cmd.colorscheme, colorscheme_for(name))
   if ok then
     return
   end
@@ -195,7 +212,7 @@ function M.apply(name, opts)
   end
 
   ensure_theme_loaded(name)
-  local ok, err = pcall(vim.cmd.colorscheme, name)
+  local ok, err = pcall(vim.cmd.colorscheme, colorscheme_for(name))
   if not ok then
     vim.notify("Failed to load theme " .. name .. ": " .. tostring(err), vim.log.levels.ERROR)
     return false

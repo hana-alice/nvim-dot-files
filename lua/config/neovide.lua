@@ -19,7 +19,11 @@ function M.setup()
     return
   end
 
-  vim.o.guifont = "JetBrainsMono Nerd Font Mono,Cascadia Mono:h12"
+  -- JetBrainsMonoNL = official "No Ligatures" variant (ligatures physically
+  -- removed from the font). NFM = Nerd Font Mono (single-width icons).
+  -- Note: Neovide's guifont syntax does NOT support disabling OpenType
+  -- features — relying on the NL variant is the correct approach.
+  vim.o.guifont = "JetBrainsMonoNL NFM:h12"
   vim.opt.linespace = 0
 
   vim.g.neovide_scale_factor = 1.0

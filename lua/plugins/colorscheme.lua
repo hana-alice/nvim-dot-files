@@ -1,6 +1,24 @@
 return {
   { "folke/tokyonight.nvim", lazy = true, priority = 1000 },
   {
+    "rebelot/kanagawa.nvim",
+    lazy = true,
+    priority = 1000,
+    opts = function(_, opts)
+      opts = opts or {}
+      opts.theme = "dragon"
+      opts.background = vim.tbl_extend("force", opts.background or {}, {
+        dark = "dragon",
+      })
+      return opts
+    end,
+  },
+  {
+    "tanvirtin/monokai.nvim",
+    lazy = true,
+    priority = 1000,
+  },
+  {
     "LazyVim/LazyVim",
     init = function()
       require("highlights").setup()

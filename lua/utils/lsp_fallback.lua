@@ -1022,7 +1022,7 @@ end
 -- ---------------------------------------------------------------------------
 -- MODULE_REVISION bumps every time this file is meaningfully edited so we
 -- can tell from a trace whether the user is running stale bytecode.
-local MODULE_REVISION = "selftest+disklog+exportrev+canddump+receiver+singleton+jumpfix+reconcile+cwordcarry+unstrand"
+local MODULE_REVISION = "selftest+disklog+exportrev+canddump+receiver+singleton+jumpfix+reconcile+cwordcarry+unstrand+noticeflush"
 local TRACE_MAX = 200
 local trace_ring = {}
 local trace_idx = 0
@@ -1134,6 +1134,16 @@ function M.definition()
   -- Clear any stale precise-winner from a previous gd; it's no longer
   -- relevant once the user invokes gd on something else.
   M._last_precise_winner = nil
+
+  -- Aggressively dismiss any prior gd's lingering notice. The previous
+  -- invocation's done()/clear path won't fire (its still_current() returns
+  -- false now) so the spinner notice would visually persist on screen until
+  -- snacks GC. Force-clear the shared slot here.
+  if M._active_notice then
+    pcall(M._active_notice.clear)
+    M._active_notice = nil
+  end
+
   request_token = request_token + 1
   local my_token = request_token
   local function still_current() return my_token == request_token end
@@ -1145,11 +1155,13 @@ function M.definition()
 
   local function clear_notice()
     if notice then pcall(notice.clear); notice = nil end
+    if M._active_notice then M._active_notice = nil end
   end
   local function done(success_msg, lifetime_ms)
     resolved = true
     if success_msg and notice then
       pcall(notice.finish, success_msg, lifetime_ms or 3000); notice = nil
+      M._active_notice = nil
     elseif success_msg then
       -- Resolved before the spinner appeared (fast path). Still show the
       -- result so the user can see whether instant or precise won.
@@ -1203,6 +1215,7 @@ function M.definition()
       "⏳ resolving %s ... (instant index path racing precise AST path)",
       symbol or "?"
     ))
+    M._active_notice = notice
   end, LSP_PROGRESS_NOTICE_MS)
 
   -- Hard timeout: bail out. Only WARN if nothing has jumped — otherwise

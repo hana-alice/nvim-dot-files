@@ -319,15 +319,29 @@ local function jump_to_location(location)
 
   local target_path = vim.uri_to_fname(uri)
   local bufnr = vim.fn.bufnr(target_path)
+
+  -- Push the SOURCE cursor onto jumplist FIRST, before any buffer switch.
+  --
+  -- BUG fixed here (2026-04-17): previously `m'` ran AFTER `:silent! edit
+  -- <target>`. That command synchronously switches the current window's
+  -- buffer to the target with cursor at (1, 0) — so `m'` recorded the wrong
+  -- position. Result: jumplist ended up with [..., (target_buf, 1, 0),
+  -- (target_buf, target_line, target_col)] and Ctrl-O first jumped to
+  -- (target_buf, 1, 0) — "stranded at top of file" — and only the SECOND
+  -- Ctrl-O reached the real source position. Live jumplist probe of the
+  -- user's session showed every cold-buffer gd produced this dup pattern.
+  --
+  -- Additionally use `keepjumps` on the `:edit` so the buffer switch itself
+  -- doesn't append its own (1, 0) entry; we already control the jumplist
+  -- via the explicit `m'` above.
+  vim.cmd("normal! m'")
+
   if bufnr == -1 or not vim.api.nvim_buf_is_loaded(bufnr) then
     -- silent so it doesn't print "X lines" mid-callback
-    local ok = pcall(vim.cmd, "silent! edit " .. vim.fn.fnameescape(target_path))
+    local ok = pcall(vim.cmd, "keepjumps silent! edit " .. vim.fn.fnameescape(target_path))
     if not ok then return false end
     bufnr = vim.fn.bufnr(target_path)
   end
-
-  -- Push current cursor onto jumplist BEFORE switching buffer
-  vim.cmd("normal! m'")
 
   -- We DO NOT use vim.lsp.util.show_document here. It has two failure modes
   -- on Windows + ws/symbol-synthesized locations:
@@ -1045,7 +1059,7 @@ end
 -- ---------------------------------------------------------------------------
 -- MODULE_REVISION bumps every time this file is meaningfully edited so we
 -- can tell from a trace whether the user is running stale bytecode.
-local MODULE_REVISION = "selftest+disklog+exportrev+canddump+receiver+singleton+jumpfix+reconcile+cwordcarry+unstrand+noticeflush+driftfix"
+local MODULE_REVISION = "selftest+disklog+exportrev+canddump+receiver+singleton+jumpfix+reconcile+cwordcarry+unstrand+noticeflush+driftfix+jumplistsourcefix"
 local TRACE_MAX = 200
 local trace_ring = {}
 local trace_idx = 0
@@ -1070,6 +1084,8 @@ end
 M._dtrace = dtrace
 -- Expose for headless e2e testing of stale-index recovery
 M._test_reconcile = reconcile_landing_to_definition
+-- Expose jump_to_location for jumplist regression tests
+M._test_jump_to_location = jump_to_location
 function M.dump_trace()
   local lines = { string.format("=== UEDefTrace  module_rev=%s  trace_idx=%d ===",
     MODULE_REVISION, trace_idx) }

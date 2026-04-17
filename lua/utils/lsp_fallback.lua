@@ -60,6 +60,64 @@ local function current_symbol()
   return word
 end
 
+-- current_receiver():
+--   For an expression like `RasterPipelines.GetBinCount(...)` or
+--   `Ctx->GetBinCount(...)` with cursor on `GetBinCount`, return the
+--   receiver identifier ("RasterPipelines" / "Ctx").
+--
+--   Used to disambiguate ws/symbol candidates that share the same method
+--   name but live on different classes — we score candidates whose
+--   container name overlaps the receiver name.
+--
+--   Returns "" if no clear receiver could be identified (free function,
+--   start-of-line, after `::`, etc.).
+local function current_receiver()
+  local ok, line = pcall(vim.api.nvim_get_current_line)
+  if not ok or not line or line == "" then return "" end
+  local _, col = unpack(vim.api.nvim_win_get_cursor(0))
+  -- walk left from the byte BEFORE the current word to find `.` / `->` / `::`
+  -- skip over the cword first
+  local i = col
+  -- go past identifier chars under and after cursor (cword may be multi-byte
+  -- but UE is ASCII identifiers in practice)
+  while i > 0 and line:sub(i, i):match("[%w_]") do i = i - 1 end
+  -- now line:sub(i,i) is the byte immediately before the identifier
+  local prev = line:sub(i, i)
+  if prev == "." then
+    -- "<receiver>.cword"
+    local j = i - 1
+    while j > 0 and line:sub(j, j):match("[%w_]") do j = j - 1 end
+    return line:sub(j + 1, i - 1)
+  elseif prev == ">" and line:sub(i - 1, i - 1) == "-" then
+    -- "<receiver>->cword"
+    local j = i - 2
+    while j > 0 and line:sub(j, j):match("[%w_]") do j = j - 1 end
+    return line:sub(j + 1, i - 2)
+  elseif prev == ":" and line:sub(i - 1, i - 1) == ":" then
+    -- "<Class>::cword" — receiver is the class itself
+    local j = i - 2
+    while j > 0 and line:sub(j, j):match("[%w_]") do j = j - 1 end
+    return line:sub(j + 1, i - 2)
+  end
+  return ""
+end
+
+-- normalize_class_name(name):
+--   Strip UE/Hungarian-style class prefix so that "FNaniteRasterPipelines"
+--   matches receiver "RasterPipelines" via simple substring containment.
+--   Strips: F (struct), U (UObject), A (AActor), T (template), I (interface),
+--   E (enum), S (Slate), G (global). Never strips if the result would be
+--   empty or start with a lowercase letter (i.e. "Foo" → "oo" is wrong).
+local function normalize_class_name(name)
+  if not name or name == "" then return "" end
+  local first = name:sub(1, 1)
+  local rest = name:sub(2)
+  if first:match("[FUATIESG]") and rest:sub(1, 1):match("[A-Z]") then
+    return rest
+  end
+  return name
+end
+
 local function normalize_locations(result, position_encoding)
   if type(result) ~= "table" then
     return {}
@@ -287,13 +345,30 @@ end
 -- multiple overrides we want the one matching the current target platform —
 -- e.g. RHICreateShaderBundle on Win64 should land in D3D12RHI, not the base
 -- virtual declaration in DynamicRHI.h.
-local function score_location_for_platform(loc, platform_hints, current_buf_path)
+local function score_location_for_platform(loc, platform_hints, current_buf_path, receiver)
   local path = location_path(loc):lower()
   if path == "" then
     return -math.huge
   end
 
   local score = 0
+
+  -- Receiver-aware container scoring (huge multiplier for the right one).
+  -- ws/symbol attaches the symbol's container name as `_ws_container`. If the
+  -- candidate's container shares meaningful substring with the call's
+  -- receiver name, that's almost always the right method.
+  if receiver and receiver ~= "" and loc._ws_container and loc._ws_container ~= "" then
+    local recv_norm = normalize_class_name(receiver):lower()
+    local cont_norm = normalize_class_name(loc._ws_container):lower()
+    if recv_norm ~= "" and cont_norm ~= "" then
+      -- Substring either way: container "naniterasterpipelines" contains
+      -- receiver "rasterpipelines" (variable named after type) OR receiver
+      -- "ctx" might be a typedef whose underlying type contains "ctx".
+      if cont_norm:find(recv_norm, 1, true) or recv_norm:find(cont_norm, 1, true) then
+        score = score + 1000
+      end
+    end
+  end
 
   -- Strong preference: source files over headers (real implementation).
   if path:match("%.cpp$") or path:match("%.mm$") or path:match("%.cc$") then
@@ -334,7 +409,7 @@ local function score_location_for_platform(loc, platform_hints, current_buf_path
   return score
 end
 
-local function rerank_locations(locations, platform_hints, current_buf_path)
+local function rerank_locations(locations, platform_hints, current_buf_path, receiver)
   if not locations or #locations <= 1 then
     return locations
   end
@@ -342,7 +417,7 @@ local function rerank_locations(locations, platform_hints, current_buf_path)
   for _, loc in ipairs(locations) do
     table.insert(scored, {
       loc = loc,
-      score = score_location_for_platform(loc, platform_hints, current_buf_path),
+      score = score_location_for_platform(loc, platform_hints, current_buf_path, receiver),
     })
   end
   table.sort(scored, function(a, b) return a.score > b.score end)
@@ -384,10 +459,10 @@ end
 --      a small margin, as long as the top-1 has a score > 0 (i.e. matched
 --      *something* — same module, platform hint, etc.) OR there are only
 --      2 candidates (decl+sibling-decl, common for overloaded methods).
-local function clear_winner(scored_locations, platform_hints, current_buf_path)
+local function clear_winner(scored_locations, platform_hints, current_buf_path, receiver)
   if #scored_locations < 2 then return scored_locations[1] end
-  local s1 = score_location_for_platform(scored_locations[1], platform_hints, current_buf_path)
-  local s2 = score_location_for_platform(scored_locations[2], platform_hints, current_buf_path)
+  local s1 = score_location_for_platform(scored_locations[1], platform_hints, current_buf_path, receiver)
+  local s2 = score_location_for_platform(scored_locations[2], platform_hints, current_buf_path, receiver)
   if s1 - s2 >= 200 then return scored_locations[1] end
   -- Header-only relaxation: if no .cpp/.cc/.mm in the result set, the top-1
   -- header is already as good as the instant path can do; jumping there is
@@ -590,10 +665,10 @@ end
 --   suitable for the success notice ("FooFile.h:42") + the ranked list.
 --   Returns (nil, nil, ranked) if no clear winner — caller can populate
 --   quickfix from `ranked`. Returns (nil, nil, nil) if locs is empty.
-local function pick_winner_with_label(locs, platform_hints, ref_file)
+local function pick_winner_with_label(locs, platform_hints, ref_file, receiver)
   if not locs or #locs == 0 then return nil, nil, nil end
-  local ranked = rerank_locations(locs, platform_hints, ref_file)
-  local winner = clear_winner(ranked, platform_hints, ref_file)
+  local ranked = rerank_locations(locs, platform_hints, ref_file, receiver)
+  local winner = clear_winner(ranked, platform_hints, ref_file, receiver)
   if not winner then return nil, nil, ranked end
 
   local p = location_path(winner)
@@ -731,7 +806,7 @@ end
 -- ---------------------------------------------------------------------------
 -- MODULE_REVISION bumps every time this file is meaningfully edited so we
 -- can tell from a trace whether the user is running stale bytecode.
-local MODULE_REVISION = "selftest+disklog"
+local MODULE_REVISION = "selftest+disklog+exportrev+canddump+receiver"
 local TRACE_MAX = 200
 local trace_ring = {}
 local trace_idx = 0
@@ -828,10 +903,13 @@ vim.api.nvim_create_user_command("UEDefSelfTest", function() M.self_test() end, 
 
 function M.definition()
   local symbol = current_symbol()
+  local receiver = current_receiver()
   local bufnr = vim.api.nvim_get_current_buf()
   local ref_file = normalize_path(vim.api.nvim_buf_get_name(bufnr))
   local ref_line = vim.api.nvim_win_get_cursor(0)[1]
-  dtrace("M.definition() called sym=%q file=%s:%d", symbol or "", vim.fn.fnamemodify(ref_file, ":t"), ref_line)
+  dtrace("M.definition() called sym=%q recv=%q file=%s:%d",
+    symbol or "", receiver or "",
+    vim.fn.fnamemodify(ref_file, ":t"), ref_line)
 
   -- Clear any stale precise-winner from a previous gd; it's no longer
   -- relevant once the user invokes gd on something else.
@@ -936,7 +1014,16 @@ function M.definition()
       dtrace("instant: after filter_self n=%d", ws_locs and #ws_locs or 0)
       if not ws_locs or #ws_locs == 0 then return end
 
-      local winner, label = pick_winner_with_label(ws_locs, platform_hints, ref_file)
+      -- Dump candidate set for diagnosis
+      for i, loc in ipairs(ws_locs) do
+        local uri = loc.uri or (loc.targetUri or "?")
+        local rng = loc.range or loc.targetSelectionRange or {}
+        local ln = rng.start and rng.start.line or -1
+        dtrace("instant: cand[%d] uri=%s line=%d kind=%s", i,
+          tostring(uri):gsub("file:///", ""):sub(-80), ln, tostring(loc._ws_kind))
+      end
+
+      local winner, label = pick_winner_with_label(ws_locs, platform_hints, ref_file, receiver)
       dtrace("instant: pick_winner winner=%s label=%s",
         tostring(winner ~= nil), tostring(label))
       if not winner then return end -- ambiguous, let precise path handle
@@ -986,7 +1073,7 @@ function M.definition()
       if not still_current() then return end
 
       if locs and #locs > 0 then
-        local winner, label, ranked = pick_winner_with_label(locs, platform_hints, ref_file)
+        local winner, label, ranked = pick_winner_with_label(locs, platform_hints, ref_file, receiver)
         dtrace("precise: pick winner=%s label=%s n_ranked=%d",
           tostring(winner ~= nil), tostring(label), #(ranked or locs))
 
@@ -1006,7 +1093,7 @@ function M.definition()
           local outcome = try_jump(ranked or locs, "LSP definitions")
           if outcome == true or outcome == "open_failed" then
             local first = (ranked or locs)[1]
-            local _, lab2 = pick_winner_with_label({ first }, platform_hints, ref_file)
+            local _, lab2 = pick_winner_with_label({ first }, platform_hints, ref_file, receiver)
             jumped = true
             done(string.format("✓ %s → %s (%d candidates)", symbol or "?",
               lab2 or "?", #(ranked or locs)), 3000)
@@ -1143,5 +1230,9 @@ function M.references()
 
   vim.notify("No references (LSP/GTAGS)", vim.log.levels.INFO)
 end
+
+-- Export module revision so external probes can verify which build is
+-- actually loaded (e.g. via `lua print(require('utils.lsp_fallback').MODULE_REVISION)`).
+M.MODULE_REVISION = MODULE_REVISION
 
 return M

@@ -36,4 +36,5 @@ require("config.lazy")
 -- LazyVim (options before lazy.setup, autocmds+keymaps on VeryLazy). Do NOT
 -- require them here to avoid double execution.
 require("config.windows").setup()
+require("utils.recent_projects").setup()
 require("ue").setup()

@@ -369,12 +369,33 @@ local function is_thin_header_only(locations)
 end
 
 -- Decide whether a top-1 candidate clearly wins. If yes, jump directly even
--- when there are multiple results. Margin >= 200 = a confident pick.
+-- when there are multiple results.
+--
+-- Strategy (conservative → aggressive):
+--   1. Single candidate: trivially the winner.
+--   2. Margin >= 200: confident pick (e.g. .cpp def vs .h decl).
+--   3. Header-only result set: clangd workspace/symbol commonly only
+--      returns headers (kind=Method on the declaration), not the .cpp
+--      out-of-class definition. In that case ranks by same-module / platform
+--      collapse to <200 margin and we'd ambiguous-bail. But the user is
+--      almost always served better by jumping to top-1 and letting precise
+--      reconcile if needed — much better than waiting 30s for AST.
+--      So when ALL candidates are headers, we accept the top-1 even with
+--      a small margin, as long as the top-1 has a score > 0 (i.e. matched
+--      *something* — same module, platform hint, etc.) OR there are only
+--      2 candidates (decl+sibling-decl, common for overloaded methods).
 local function clear_winner(scored_locations, platform_hints, current_buf_path)
   if #scored_locations < 2 then return scored_locations[1] end
   local s1 = score_location_for_platform(scored_locations[1], platform_hints, current_buf_path)
   local s2 = score_location_for_platform(scored_locations[2], platform_hints, current_buf_path)
   if s1 - s2 >= 200 then return scored_locations[1] end
+  -- Header-only relaxation: if no .cpp/.cc/.mm in the result set, the top-1
+  -- header is already as good as the instant path can do; jumping there is
+  -- strictly better than the 30s precise-track wait. Precise reconcile will
+  -- fix it later if it disagrees.
+  if is_thin_header_only(scored_locations) and #scored_locations <= 4 then
+    return scored_locations[1]
+  end
   return nil
 end
 
@@ -914,12 +935,15 @@ function M.definition()
 
       if locs and #locs > 0 then
         local winner, label, ranked = pick_winner_with_label(locs, platform_hints, ref_file)
+        dtrace("precise: pick winner=%s label=%s n_ranked=%d",
+          tostring(winner ~= nil), tostring(label), #(ranked or locs))
 
         if not jumped then
           -- precise won the race
           if winner then
             local pok, ok = pcall(jump_to_location, winner)
             ok = pok and ok
+            dtrace("precise: jump pok=%s ok=%s", tostring(pok), tostring(ok))
             if ok then
               jumped = true
               done(string.format("✓ %s → %s (precise)", symbol or "?", label or "?"), 3000)

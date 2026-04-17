@@ -720,6 +720,17 @@ end
 -- PUBLIC: CLANGD
 -- ==========================================================================
 
+-- Forward declaration for find_engine_root, which is defined further below
+-- (line ~1152). Without this forward decl, the call inside clangd_cmd
+-- (around line 771) resolves to global _G.find_engine_root (nil) and
+-- raises "attempt to call global 'find_engine_root' (a nil value)" the
+-- first time clangd_cmd is called with a non-nil root_dir (e.g. via
+-- on_new_config). The historical reason this didn't fire in practice is
+-- that LazyVim's ue.lua plugin wrapper invokes clangd_cmd() with no
+-- args, which skips the offending branch. Forward-declaring keeps it
+-- correct for all entry points.
+local find_engine_root
+
 function M.clangd_cmd(root_dir)
   local clangd = first_executable(clangd_candidates(root_dir or cwd())) or "clangd"
 
@@ -1149,7 +1160,7 @@ local function is_engine_root(dir)
   return true
 end
 
-local function find_engine_root(path)
+function find_engine_root(path)
   path = norm(path)
   if path == "" then
     return nil

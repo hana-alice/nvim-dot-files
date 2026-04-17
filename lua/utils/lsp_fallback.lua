@@ -310,152 +310,47 @@ local function reconcile_landing_to_definition(sym, landed_line_1b)
   if M._dtrace then pcall(M._dtrace, "reconcile: %q drift %d -> %d (Δ=%d)", sym, landed_line_1b, best_line, best_line - landed_line_1b) end
 end
 
+-- Tier 1 refactor (2026-04-17): the buffer-switch + jumplist + cursor logic
+-- has moved to lua/utils/ue_goto/jumper.lua with a strict contract.
+-- This wrapper performs the jump, then runs the legacy reconcile pass for
+-- ws/symbol-staleness drift. Tier 2 will lift the reconcile into the
+-- provider so jumper sees only already-precise locations.
+local jumper = require("utils.ue_goto.jumper")
+
 local function jump_to_location(location)
-  local uri = location.uri or location.targetUri
-  local range = location.range or location.targetSelectionRange or location.targetRange
-  if not uri or not range or not range.start then
-    return false
-  end
+  if not location then return false end
 
-  local target_path = vim.uri_to_fname(uri)
-  local bufnr = vim.fn.bufnr(target_path)
-
-  -- Push the SOURCE cursor onto jumplist FIRST, before any buffer switch.
-  --
-  -- BUG fixed here (2026-04-17): previously `m'` ran AFTER `:silent! edit
-  -- <target>`. That command synchronously switches the current window's
-  -- buffer to the target with cursor at (1, 0) — so `m'` recorded the wrong
-  -- position. Result: jumplist ended up with [..., (target_buf, 1, 0),
-  -- (target_buf, target_line, target_col)] and Ctrl-O first jumped to
-  -- (target_buf, 1, 0) — "stranded at top of file" — and only the SECOND
-  -- Ctrl-O reached the real source position. Live jumplist probe of the
-  -- user's session showed every cold-buffer gd produced this dup pattern.
-  --
-  -- Additionally use `keepjumps` on the `:edit` so the buffer switch itself
-  -- doesn't append its own (1, 0) entry; we already control the jumplist
-  -- via the explicit `m'` above.
-  vim.cmd("normal! m'")
-
-  if bufnr == -1 or not vim.api.nvim_buf_is_loaded(bufnr) then
-    -- silent so it doesn't print "X lines" mid-callback
-    local ok = pcall(vim.cmd, "keepjumps silent! edit " .. vim.fn.fnameescape(target_path))
-    if not ok then return false end
-    bufnr = vim.fn.bufnr(target_path)
-  end
-
-  -- We DO NOT use vim.lsp.util.show_document here. It has two failure modes
-  -- on Windows + ws/symbol-synthesized locations:
-  --   1. _position_encoding is unset on synthetic ws/symbol locations (we
-  --      build them by hand from SymbolInformation). show_document falls
-  --      back to utf-16 even when clangd is utf-8 → off-by-N column or
-  --      a refusal to set cursor on what it thinks is an out-of-range pos.
-  --   2. With reuse_win=true and BufReadCmd autocommands, the cursor set
-  --      can race the BufRead and end up at line 1 col 0 (the user reports
-  --      "jumped to top of file" on FDataDrivenShaderPlatformInfo).
-  --
-  -- Instead: switch to target buffer in the current window directly, then
-  -- nvim_win_set_cursor with a clamped position. clangd's columns are 0-
-  -- indexed UTF-16 codepoint offsets, but for the all-ASCII identifiers
-  -- that gd lands on, that's identical to byte columns — and we clamp to
-  -- line length so we never set an out-of-range cursor.
-  if bufnr ~= -1 and vim.api.nvim_get_current_buf() ~= bufnr then
-    vim.api.nvim_set_current_buf(bufnr)
-  end
-
-  local line_1b = (range.start.line or 0) + 1
-  local line_count = vim.api.nvim_buf_line_count(0)
-  if line_1b > line_count then line_1b = line_count end
-  if line_1b < 1 then line_1b = 1 end
-
-  local line_text = vim.api.nvim_buf_get_lines(0, line_1b - 1, line_1b, false)[1] or ""
-  local col = range.start.character or 0
-  if col > #line_text then col = #line_text end
-  if col < 0 then col = 0 end
-
-  -- Two-phase cursor set: synchronous now (so synchronous code observes the
-  -- target line) AND deferred via vim.defer_fn (so any BufRead / FileType /
-  -- LspAttach / treesitter-on-load autocmds — many of which reset cursor to
-  -- line 1 (BufRead reset) OR to the shada '"' mark (BufReadPost restore-
-  -- cursor autocmds, which can land on ANY line/col from a previous session)
-  -- — can't strand us at the wrong location. The deferred re-set checks
-  -- whether cursor is at our target; if not, force it back. The 30/150ms
-  -- timing is too short for a human keystroke, so we don't need to worry
-  -- about overriding intentional user movement.
-  local function apply_cursor_if_drifted(target_buf)
-    if vim.api.nvim_get_current_buf() ~= target_buf then return false end
-    local cur = vim.api.nvim_win_get_cursor(0)
-    if cur[1] == line_1b then return false end -- already where we want
-    -- Re-clamp in case the buffer mutated.
-    local lc = vim.api.nvim_buf_line_count(0)
-    local ln = math.min(math.max(line_1b, 1), lc)
-    local lt = vim.api.nvim_buf_get_lines(0, ln - 1, ln, false)[1] or ""
-    local cc = math.min(math.max(col, 0), #lt)
-    pcall(vim.api.nvim_win_set_cursor, 0, { ln, cc })
-    pcall(vim.cmd, "normal! zz")
-    if M._dtrace then pcall(M._dtrace, "jump: drift-fix %d:%d -> %d:%d", cur[1], cur[2], ln, cc) end
-    return true
-  end
-
-  local ok_cur = pcall(vim.api.nvim_win_set_cursor, 0, { line_1b, col })
-  if not ok_cur then
-    -- final safety net: try the original show_document path (best effort)
-    pcall(vim.lsp.util.show_document, location,
-      location._position_encoding or "utf-16",
-      { reuse_win = true, focus = true })
-  end
-
-  -- Defer second cursor set (only if cursor was stranded). 30ms catches
-  -- BufRead/FileType chains; 150ms catches slower late autocmds (treesitter
-  -- region attach, LspAttach handlers, etc.). Both bail if user moved.
-  local target_buf = vim.api.nvim_get_current_buf()
-  vim.defer_fn(function()
-    if M._dtrace then
-      local c = vim.api.nvim_win_get_cursor(0)
-      pcall(M._dtrace, "jump: 30ms tick cursor=%d:%d target=%d", c[1], c[2], line_1b)
+  -- Surface jumper's shada-race re-asserts in the dtrace ring buffer so
+  -- regressions are debuggable. The hook is module-global; rewriting it on
+  -- each call is fine.
+  jumper._on_reassert = function(reason, prev_cur, ln, cc)
+    if M and M._dtrace then
+      pcall(M._dtrace, "jump: shada-race reassert (%s) %d:%d -> %d:%d",
+        tostring(reason), prev_cur[1], prev_cur[2], ln, cc)
     end
-    apply_cursor_if_drifted(target_buf)
-  end, 30)
-  vim.defer_fn(function()
-    if M._dtrace then
-      local c = vim.api.nvim_win_get_cursor(0)
-      pcall(M._dtrace, "jump: 150ms tick cursor=%d:%d target=%d", c[1], c[2], line_1b)
-    end
-    apply_cursor_if_drifted(target_buf)
-    -- reconcile only if we're still in the target buf and at our line
-    if vim.api.nvim_get_current_buf() ~= target_buf then return end
-    local cur = vim.api.nvim_win_get_cursor(0)
-    -- Run reconcile only if we ARE at the intended line (not user-moved).
-    if cur[1] == line_1b then
-      local sym = location._sym_name or location._origin_cword
-      if sym and #sym > 0 then
-        pcall(reconcile_landing_to_definition, sym, line_1b)
-      end
-    elseif M._dtrace then
-      pcall(M._dtrace, "jump: 150ms reconcile skipped, cursor=%d not target=%d", cur[1], line_1b)
-    end
-  end, 150)
+  end
 
-  -- Reconcile against stale background-index line numbers. clangd's
-  -- workspace/symbol returns positions from its persistent index, which lags
-  -- behind file edits — symbols can drift dozens of lines. Verify that the
-  -- landing line actually contains the symbol token; if not, search nearby
-  -- for a definition pattern and silently reposition.
-  -- Symbol comes from the location (ws/symbol path) or, for precise/definition
-  -- locations that don't carry it, we fall back to the original cword captured
-  -- before the jump (set on the location by the caller as _origin_cword).
+  local ok = jumper.jump(location)
+  if not ok then return false end
+
+  -- Drift reconcile: clangd's workspace/symbol returns positions from its
+  -- persistent index, which lags real file edits. If the landed line doesn't
+  -- contain the expected symbol token, reconcile_landing_to_definition will
+  -- search nearby and silently reposition.
+  --
+  -- TODO Tier 2: lift this into provider.lua so jumper only ever receives
+  -- already-reconciled locations and this wrapper disappears entirely.
   local sym = location._sym_name or location._origin_cword
-  -- INSTRUMENT: log actual cursor immediately after our set, vs target.
-  if M._dtrace then
-    local actual = vim.api.nvim_win_get_cursor(0)
-    pcall(M._dtrace, "jump: post-set cursor actual=%d:%d target=%d:%d sym=%s",
-      actual[1], actual[2], line_1b, col, tostring(sym))
-  end
   if sym and #sym > 0 then
+    local range = location.range or location.targetSelectionRange or location.targetRange
+    local line_1b = ((range and range.start and range.start.line) or 0) + 1
     pcall(reconcile_landing_to_definition, sym, line_1b)
   end
 
-  -- Center the new position so the user sees context
-  pcall(vim.cmd, "normal! zz")
+  if M and M._dtrace then
+    local cur = vim.api.nvim_win_get_cursor(0)
+    pcall(M._dtrace, "jump: done cursor=%d:%d sym=%s", cur[1], cur[2], tostring(sym))
+  end
   return true
 end
 
@@ -1059,7 +954,7 @@ end
 -- ---------------------------------------------------------------------------
 -- MODULE_REVISION bumps every time this file is meaningfully edited so we
 -- can tell from a trace whether the user is running stale bytecode.
-local MODULE_REVISION = "selftest+disklog+exportrev+canddump+receiver+singleton+jumpfix+reconcile+cwordcarry+unstrand+noticeflush+driftfix+jumplistsourcefix"
+local MODULE_REVISION = "selftest+disklog+exportrev+canddump+receiver+singleton+jumpfix+reconcile+cwordcarry+unstrand+noticeflush+driftfix+jumplistsourcefix+tier1jumper"
 local TRACE_MAX = 200
 local trace_ring = {}
 local trace_idx = 0

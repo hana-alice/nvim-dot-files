@@ -833,6 +833,41 @@ local function run_lines(cmd, opts)
   return vim.v.shell_error or 0, lines
 end
 
+-- run_lines_async: forward-declared inside an immediately-executed do-block to
+-- avoid consuming a slot in the main-chunk's 200-local budget. The actual
+-- function is assigned to a module-level upvalue table M._async so callers
+-- (also inside a do-block) can reach it without polluting main-chunk locals.
+M._async = M._async or {}
+do
+  function M._async.run_lines(cmd, opts, on_done)
+    opts = opts or {}
+    if not vim.system then
+      local code, lines = run_lines(cmd, opts)
+      vim.schedule(function() on_done(code, lines) end)
+      return nil
+    end
+
+    local system_opts = { text = true }
+    local cwd_path = norm(trim(opts.cwd))
+    if cwd_path ~= "" and is_dir(cwd_path) then
+      system_opts.cwd = cwd_path
+    end
+    if type(opts.env) == "table" and next(opts.env) ~= nil then
+      system_opts.env = vim.tbl_extend("force", vim.fn.environ(), opts.env)
+    end
+
+    local handle = vim.system(cmd, system_opts, function(result)
+      local output = (result.stdout or "") .. (result.stderr or "")
+      local lines = {}
+      for line in output:gmatch("[^\r\n]+") do
+        table.insert(lines, line)
+      end
+      vim.schedule(function() on_done(result.code or 0, lines) end)
+    end)
+    return handle
+  end
+end
+
 local function write_all(path, content)
   ensure_dir(dirname(path))
   local file, err = io.open(path, "wb")
@@ -4987,6 +5022,174 @@ function M.gtags_definition(symbol)
   end
 
   return rg_code_definition_search(ctx, symbol)
+end
+
+-- ---------------------------------------------------------------------------
+-- Async GTAGS definition (does NOT block the main loop).
+-- Calls on_done(true) if it jumped/populated qf, on_done(false) otherwise.
+-- Wrapped in do-end to keep the helper locals out of the file's main-chunk
+-- locals budget (Lua's 200-local limit per function).
+-- ---------------------------------------------------------------------------
+
+do
+  local function global_lines_async(root, db_dir, args, on_done)
+    local cmd = { "global" }
+    vim.list_extend(cmd, args)
+    return M._async.run_lines(cmd, {
+      cwd = root,
+      env = {
+        GTAGSROOT = root,
+        GTAGSDBPATH = db_dir,
+      },
+    }, on_done)
+  end
+
+  local function rg_code_definition_search_async(ctx, symbol, on_done)
+    symbol = trim(symbol)
+    if not ctx or symbol == "" then
+      on_done(false)
+      return
+    end
+
+    local rg = first_executable({ "rg" })
+    if not rg then
+      on_done(false)
+      return
+    end
+
+    local dirs = {}
+    local seen = {}
+    local function add_dir(dir)
+      dir = norm(dir)
+      if dir ~= "" and is_dir(dir) and not seen[dir] then
+        seen[dir] = true
+        dirs[#dirs + 1] = dir
+      end
+    end
+
+    if ctx.project_root and ctx.project_root ~= "" then
+      for _, relative in ipairs(existing_relative_dirs(ctx.project_root, UE_CONST.PROJECT_INDEX_DIRS)) do
+        add_dir(join(ctx.project_root, relative))
+      end
+    end
+    for _, relative in ipairs(existing_relative_dirs(ctx.engine_root, UE_CONST.ENGINE_INDEX_DIRS)) do
+      add_dir(join(ctx.engine_root, relative))
+    end
+
+    if #dirs == 0 then
+      on_done(false)
+      return
+    end
+
+    local cmd = {
+      rg, "--color", "never", "--no-heading",
+      "--line-number", "--column", "--fixed-strings", "--with-filename",
+    }
+    for _, ext in ipairs(M.FT_CPP) do
+      cmd[#cmd + 1] = "-g"
+      cmd[#cmd + 1] = "*." .. ext
+    end
+    cmd[#cmd + 1] = "--"
+    cmd[#cmd + 1] = symbol
+    vim.list_extend(cmd, dirs)
+
+    local cwd = ctx.engine_root
+    if ctx.project_root and ctx.project_root ~= "" then
+      local root = common_ancestor({ ctx.engine_root, ctx.project_root })
+      if root ~= "" then
+        cwd = root
+      end
+    end
+
+    M._async.run_lines(cmd, { cwd = cwd }, function(code, lines)
+      if code ~= 0 and code ~= 1 then
+        on_done(false)
+        return
+      end
+      local jumped = jump_to_grep_candidate_entries(symbol, parse_rg_entries(lines))
+      on_done(jumped and true or false)
+    end)
+  end
+
+  -- Public async API. Called by lsp_fallback.
+  -- on_done(true) -> jumped or qf populated; on_done(false) -> nothing found.
+  function M.gtags_definition_async(symbol, on_done)
+    on_done = on_done or function() end
+    local ctx, err = resolve_context()
+    if not ctx then
+      vim.notify(err, vim.log.levels.WARN)
+      on_done(false)
+      return
+    end
+
+    if shader_definition_search(ctx, symbol) then
+      on_done(true)
+      return
+    end
+
+    local root = workspace_root(ctx)
+    local function rg_step()
+      rg_code_definition_search_async(ctx, symbol, on_done)
+    end
+
+    if not db_ready(ctx.paths.workspace_db) then
+      rg_step()
+      return
+    end
+
+    global_lines_async(root, ctx.paths.workspace_db,
+      { "-d", "--literal", "--result=grep", symbol },
+      function(code, lines)
+        if (code == 0 or code == 1) and lines and #lines > 0 then
+          if jump_to_global_result(root, lines, symbol) then
+            on_done(true)
+            return
+          end
+        end
+        global_lines_async(root, ctx.paths.workspace_db,
+          { "-g", "--literal", "--result=grep", symbol },
+          function(code2, lines2)
+            if (code2 == 0 or code2 == 1) and lines2 and #lines2 > 0 then
+              if jump_to_global_grep_candidate(root, symbol, lines2) then
+                on_done(true)
+                return
+              end
+            end
+            rg_step()
+          end)
+      end)
+  end
+end
+
+-- ---------------------------------------------------------------------------
+-- Public platform query API (consumed by lsp_fallback for smart gd ranking).
+-- Wrapped in do-end to avoid main-chunk local budget pressure.
+-- ---------------------------------------------------------------------------
+
+do
+  -- Path keyword priority list for ranking implementation candidates.
+  -- Earlier entries = higher preference. lsp_fallback scores hits by index.
+  local PLATFORM_PATH_HINTS = {
+    Win64    = { "D3D12RHI", "D3D11RHI", "VulkanRHI", "WindowsRHI", "WindowsPlatform", "Windows/" },
+    Win32    = { "D3D11RHI", "D3D12RHI", "VulkanRHI", "WindowsRHI", "WindowsPlatform", "Windows/" },
+    Android  = { "VulkanRHI", "OpenGLDrv", "AndroidRHI", "AndroidOpenGL", "AndroidVulkan", "Android/" },
+    Mac      = { "MetalRHI", "MacRHI", "MacPlatform", "Mac/", "Apple/" },
+    IOS      = { "MetalRHI", "IOSRHI", "IOSPlatform", "IOS/", "Apple/" },
+    TVOS     = { "MetalRHI", "TVOSPlatform", "TVOS/", "Apple/" },
+    Linux    = { "VulkanRHI", "LinuxRHI", "LinuxPlatform", "Linux/" },
+    LinuxArm64 = { "VulkanRHI", "LinuxRHI", "LinuxPlatform", "Linux/" },
+  }
+
+  function M.current_platform()
+    local ok, ctx = pcall(resolve_context)
+    local engine = (ok and type(ctx) == "table") and ctx.engine_root or nil
+    return target_platform(engine, nil)
+  end
+
+  function M.platform_path_priorities(platform)
+    platform = platform or M.current_platform() or ""
+    return PLATFORM_PATH_HINTS[platform] or {}
+  end
 end
 
 function M.android_build_command(opts)

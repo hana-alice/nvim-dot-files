@@ -11,8 +11,33 @@
 --   * try_jump treats a successful LSP result as terminal even if the
 --     URI cannot be opened — we notify rather than fall through to
 --     GTAGS which would jump to an unrelated symbol.
+--   * gd is fully non-blocking. The main loop never waits on rg/global.
+--     LSP and GTAGS race in parallel; LSP wins if it answers within
+--     LSP_PRIMARY_WINDOW_MS, otherwise GTAGS jumps when ready.
+--   * When LSP returns empty (preamble still building), we retry
+--     LSP_RETRY_COUNT times with LSP_RETRY_INTERVAL_MS spacing before
+--     accepting "no LSP result". Critical for cold clangd on UE.
 
 local M = {}
+
+-- ---------------------------------------------------------------------------
+-- Tunables
+-- ---------------------------------------------------------------------------
+-- After this many ms with no LSP answer, surface a "still working" notice.
+local LSP_PROGRESS_NOTICE_MS = 600
+-- Hard cap: if LSP+GTAGS still nothing after this, declare failure.
+-- Big TUs (e.g. NaniteCullRaster.cpp) can take 30-60s to build a fresh
+-- preamble + AST after first edit; we'd rather wait than wrong-jump.
+local OVERALL_TIMEOUT_MS = 90000
+-- Empty-result retries (clangd preamble building).
+local LSP_RETRY_COUNT = 20
+local LSP_RETRY_INTERVAL_MS = 2000
+-- Update the progress notice on every retry so the user sees forward motion.
+local PROGRESS_TICK_INTERVAL_MS = LSP_RETRY_INTERVAL_MS
+
+-- ---------------------------------------------------------------------------
+-- Symbol / position helpers
+-- ---------------------------------------------------------------------------
 
 local function current_symbol()
   local word = vim.fn.expand("<cword>")
@@ -83,9 +108,6 @@ local function dedup_locations(locations)
   return out
 end
 
--- Group locations by their captured offset_encoding and call
--- vim.lsp.util.locations_to_items once per group (it groups by file
--- internally and avoids N readfile() round-trips).
 local function locations_to_items_grouped(locations)
   local by_enc = {}
   for _, loc in ipairs(locations or {}) do
@@ -134,12 +156,6 @@ local function filter_self_locations(locations, ref_file, ref_line)
       filtered[#filtered + 1] = location
     end
   end
-
-  -- CRITICAL: when LSP returns ONLY the self-location (e.g. gd on a
-  -- header decl whose definition is in a .cpp clangd hasn't indexed),
-  -- return {} so the caller can fall through to declaration/GTAGS.
-  -- Returning the original list would jump to the same line and bypass
-  -- all fallback steps.
   return filtered
 end
 
@@ -147,8 +163,6 @@ end
 -- Sync helpers (used by references)
 -- ---------------------------------------------------------------------------
 
--- Per-client sync request: each client gets its own params built from its own
--- offset_encoding. Returns {locations, partial_error_count}.
 local function sync_locations(method, timeout_ms)
   local clients = vim.lsp.get_clients({ bufnr = 0, method = method })
   if not clients or vim.tbl_isempty(clients) then
@@ -179,22 +193,18 @@ local function sync_locations(method, timeout_ms)
 end
 
 -- ---------------------------------------------------------------------------
--- Async definition: non-blocking LSP request with GTAGS fallback
+-- Async LSP request
 -- ---------------------------------------------------------------------------
 
--- Module-level token: increments on every M.definition() call so stale
--- callbacks from older gd presses cannot override a fresher one.
 local request_token = 0
 
---- Fire an async LSP request. Calls `on_result(locations)` on the main thread.
---- `locations` is nil when no client supports the method or the request fails.
---- Each client receives params built from its OWN offset_encoding.
+-- Fire one LSP request round across all clients. Calls on_result(locations)
+-- exactly once on the main thread. locations is nil iff every client failed
+-- or returned no result.
 local function async_lsp_request(bufnr, method, on_result)
   local clients = vim.lsp.get_clients({ bufnr = bufnr, method = method })
   if not clients or vim.tbl_isempty(clients) then
-    vim.schedule(function()
-      on_result(nil)
-    end)
+    vim.schedule(function() on_result(nil) end)
     return
   end
 
@@ -203,9 +213,7 @@ local function async_lsp_request(bufnr, method, on_result)
   local done = false
 
   local function finish()
-    if done then
-      return
-    end
+    if done then return end
     done = true
     vim.schedule(function()
       on_result(#all_items > 0 and all_items or nil)
@@ -214,9 +222,7 @@ local function async_lsp_request(bufnr, method, on_result)
 
   local function dec_pending()
     pending = pending - 1
-    if pending <= 0 then
-      finish()
-    end
+    if pending <= 0 then finish() end
   end
 
   for _, client in ipairs(clients) do
@@ -240,136 +246,532 @@ local function async_lsp_request(bufnr, method, on_result)
   end
 end
 
---- Try to jump from a list of locations.
---- Returns:
----   true  on a successful jump or quickfix populate
----   "open_failed" when LSP returned a result we could NOT open (caller
----                 should NOT fall through to a different fallback)
----   false when there are no usable locations
+-- Async LSP definition with built-in retry for empty results (clangd preamble
+-- still building) AND smart implementation merging when definition only
+-- returns headers (which usually means the user is on a virtual interface
+-- declaration and wants the platform-specific override).
+--
+-- Calls on_result(locations|nil) exactly once.
+local function async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_current, on_result)
+  local attempts = 0
+
+  -- Run definition + (conditionally) implementation, merge & dedup. Calls
+  -- inner(merged|nil) once.
+  local function def_plus_impl(inner)
+    async_lsp_request(bufnr, "textDocument/definition", function(def_locs)
+      if not still_current() then return end
+      def_locs = filter_self_locations(def_locs, ref_file, ref_line)
+
+      -- If definition gave us a real source file (not header-only), use it.
+      if def_locs and #def_locs > 0 and not is_thin_header_only(def_locs) then
+        inner(def_locs)
+        return
+      end
+
+      -- Definition was empty OR header-only. Try implementation in parallel
+      -- with declaration as a backup.
+      local has_impl = #vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/implementation" }) > 0
+      if not has_impl then
+        -- No implementation method; fall back to declaration as before.
+        local has_decl = #vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/declaration" }) > 0
+        if has_decl then
+          async_lsp_request(bufnr, "textDocument/declaration", function(decl_locs)
+            if not still_current() then return end
+            decl_locs = filter_self_locations(decl_locs, ref_file, ref_line)
+            local merged = {}
+            if def_locs then vim.list_extend(merged, def_locs) end
+            if decl_locs then vim.list_extend(merged, decl_locs) end
+            inner(#merged > 0 and merged or nil)
+          end)
+        else
+          inner(def_locs and #def_locs > 0 and def_locs or nil)
+        end
+        return
+      end
+
+      async_lsp_request(bufnr, "textDocument/implementation", function(impl_locs)
+        if not still_current() then return end
+        impl_locs = filter_self_locations(impl_locs, ref_file, ref_line)
+
+        -- Merge def + impl, dedup.
+        local merged = {}
+        if def_locs then vim.list_extend(merged, def_locs) end
+        if impl_locs then vim.list_extend(merged, impl_locs) end
+        merged = dedup_locations(merged)
+
+        if #merged > 0 then
+          inner(merged)
+          return
+        end
+
+        -- Nothing useful from def or impl; try declaration as a last resort.
+        local has_decl = #vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/declaration" }) > 0
+        if has_decl then
+          async_lsp_request(bufnr, "textDocument/declaration", function(decl_locs)
+            if not still_current() then return end
+            decl_locs = filter_self_locations(decl_locs, ref_file, ref_line)
+            inner(decl_locs and #decl_locs > 0 and decl_locs or nil)
+          end)
+        else
+          inner(nil)
+        end
+      end)
+    end)
+  end
+
+  local function try_once()
+    attempts = attempts + 1
+    def_plus_impl(function(locs)
+      if not still_current() then return end
+      if locs and #locs > 0 then
+        on_result(locs)
+        return
+      end
+      if attempts < LSP_RETRY_COUNT + 1 then
+        vim.defer_fn(function()
+          if still_current() then try_once() end
+        end, LSP_RETRY_INTERVAL_MS)
+      else
+        on_result(nil)
+      end
+    end)
+  end
+
+  try_once()
+end
+
+-- ---------------------------------------------------------------------------
+-- Jump dispatch
+-- ---------------------------------------------------------------------------
+
+-- Path-based ranking for "go to implementation" candidates. We trust LSP for
+-- semantic correctness (it gave us the right symbol's overrides), but among
+-- multiple overrides we want the one matching the current target platform —
+-- e.g. RHICreateShaderBundle on Win64 should land in D3D12RHI, not the base
+-- virtual declaration in DynamicRHI.h.
+local function score_location_for_platform(loc, platform_hints, current_buf_path)
+  local path = location_path(loc):lower()
+  if path == "" then
+    return -math.huge
+  end
+
+  local score = 0
+
+  -- Strong preference: source files over headers (real implementation).
+  if path:match("%.cpp$") or path:match("%.mm$") or path:match("%.cc$") then
+    score = score + 500
+  elseif path:match("%.inl$") or path:match("%.ipp$") then
+    score = score + 200
+  elseif path:match("%.h$") or path:match("%.hpp$") or path:match("%.hxx$") then
+    score = score + 0
+  end
+
+  -- Penalize known wrappers / validation layers — they forward, they're not
+  -- the actual implementation the user wants to read.
+  if path:match("rhivalidation") then score = score - 800 end
+  if path:match("rhi/public/dynamicrhi") then score = score - 400 end
+  if path:match("/null") or path:match("nullrhi") then score = score - 600 end
+  if path:match("/mock") or path:match("/stub") then score = score - 600 end
+
+  -- Platform hint matching: earlier in the priority list = bigger boost.
+  if platform_hints then
+    for i, kw in ipairs(platform_hints) do
+      if kw and kw ~= "" and path:find(kw:lower(), 1, true) then
+        -- First hint = +1000, second = +900, etc.
+        score = score + math.max(100, 1000 - (i - 1) * 100)
+        break -- first match dominates
+      end
+    end
+  end
+
+  -- Same-module preference: if the candidate lives in the same UE module
+  -- directory as the current buffer (e.g. .../Renderer/...), nudge it.
+  if current_buf_path and current_buf_path ~= "" then
+    local cur_module = current_buf_path:lower():match("/source/[^/]+/([^/]+)/")
+    local cand_module = path:match("/source/[^/]+/([^/]+)/")
+    if cur_module and cand_module and cur_module == cand_module then
+      score = score + 50
+    end
+  end
+
+  return score
+end
+
+local function rerank_locations(locations, platform_hints, current_buf_path)
+  if not locations or #locations <= 1 then
+    return locations
+  end
+  local scored = {}
+  for _, loc in ipairs(locations) do
+    table.insert(scored, {
+      loc = loc,
+      score = score_location_for_platform(loc, platform_hints, current_buf_path),
+    })
+  end
+  table.sort(scored, function(a, b) return a.score > b.score end)
+  local out = {}
+  for _, e in ipairs(scored) do
+    out[#out + 1] = e.loc
+  end
+  return out
+end
+
+-- A definition result is "thin" if every candidate is a .h file — likely a
+-- forward/declaration/inline-trampoline, which means the user probably wants
+-- the implementation (.cpp) instead. We use this to decide whether to also
+-- query textDocument/implementation and merge.
+local function is_thin_header_only(locations)
+  if not locations or #locations == 0 then return false end
+  for _, loc in ipairs(locations) do
+    local p = location_path(loc):lower()
+    if p:match("%.cpp$") or p:match("%.mm$") or p:match("%.cc$") then
+      return false
+    end
+  end
+  return true
+end
+
+-- Decide whether a top-1 candidate clearly wins. If yes, jump directly even
+-- when there are multiple results. Margin = (top - second). Empirically, a
+-- platform_hint match gives at least +100 over a non-match, so a 200+ margin
+-- means we have a confident pick.
+local function clear_winner(scored_locations, platform_hints, current_buf_path)
+  if #scored_locations < 2 then return scored_locations[1] end
+  local s1 = score_location_for_platform(scored_locations[1], platform_hints, current_buf_path)
+  local s2 = score_location_for_platform(scored_locations[2], platform_hints, current_buf_path)
+  if s1 - s2 >= 200 then return scored_locations[1] end
+  return nil
+end
+
 local function try_jump(locations, title)
   if not locations or #locations == 0 then
     return false
   end
-  -- Prefer clangd-style: dedup before counting.
   locations = dedup_locations(locations)
   if #locations == 1 then
     local ok = jump_to_location(locations[1])
-    if ok then
-      return true
-    end
+    if ok then return true end
     vim.notify("LSP location could not be opened: " .. tostring(locations[1].uri or locations[1].targetUri), vim.log.levels.WARN)
     return "open_failed"
   end
   return populate_quickfix(title, locations) and true or false
 end
 
---- GTAGS fallback (synchronous, fast enough for local DB).
-local function gtags_fallback(symbol)
+-- ---------------------------------------------------------------------------
+-- GTAGS fallback (now async)
+-- ---------------------------------------------------------------------------
+
+local function gtags_fallback_async(symbol, on_done)
   if not symbol then
-    return false
+    on_done(false)
+    return
   end
   local ok, ue = pcall(require, "ue")
-  if ok and ue.gtags_definition then
-    return ue.gtags_definition(symbol)
+  if not ok then
+    on_done(false)
+    return
   end
-  return false
+  if ue.gtags_definition_async then
+    ue.gtags_definition_async(symbol, on_done)
+    return
+  end
+  -- Backward-compat: schedule sync version off the immediate keystroke so
+  -- the press itself still feels responsive.
+  vim.schedule(function()
+    local r = ue.gtags_definition and ue.gtags_definition(symbol) or false
+    on_done(r and true or false)
+  end)
 end
 
---- Shader file extensions — clangd can't handle these, go straight to GTAGS.
+-- ---------------------------------------------------------------------------
+-- Shader-only fast path
+-- ---------------------------------------------------------------------------
+
 local SHADER_EXTS = { usf = true, ush = true, hlsl = true, hlsli = true, glsl = true, frag = true, vert = true, metal = true, comp = true }
 
 local function buf_extension(bufnr)
   local name = vim.api.nvim_buf_get_name(bufnr)
-  if name == "" then
-    return ""
-  end
+  if name == "" then return "" end
   return (name:match("%.([^./\\]+)$") or ""):lower()
 end
 
---- Async definition: definition -> declaration -> GTAGS, all non-blocking for
---- the LSP parts.
+-- ---------------------------------------------------------------------------
+-- Progress notification helper
+-- ---------------------------------------------------------------------------
+-- Returns {update = fn(msg), clear = fn(), finish = fn(msg, lifetime_ms)}.
+-- snacks/noice/nvim-notify all support replacing a notification by passing
+-- the previous id back via opts.replace; we use that when available.
+local function progress_notice(initial_msg)
+  local current_id = nil
+  local function emit(msg, opts_override)
+    local opts = { title = "LSP definition", timeout = false }
+    if current_id ~= nil then
+      opts.replace = current_id
+      opts.id = current_id            -- snacks
+      opts.hide_from_history = true
+    end
+    if opts_override then
+      for k, v in pairs(opts_override) do opts[k] = v end
+    end
+    local ok, new_id = pcall(vim.notify, msg, opts_override and opts_override.level or vim.log.levels.INFO, opts)
+    if ok then
+      current_id = new_id or current_id
+    end
+  end
+  emit(initial_msg)
+  return {
+    update = function(msg) emit(msg) end,
+    clear = function()
+      pcall(function()
+        if current_id ~= nil then
+          if type(current_id) == "table" and current_id.hide then
+            current_id:hide()
+          elseif vim.notify and package.loaded["notify"] then
+            -- nvim-notify: re-emit with very short timeout to dismiss
+            pcall(vim.notify, "", vim.log.levels.INFO, { replace = current_id, timeout = 1 })
+          end
+        end
+      end)
+      current_id = nil
+    end,
+    -- Update the notice to a "done" message that auto-dismisses after
+    -- lifetime_ms. This gives the user a moment to see *what* resolved
+    -- (especially after a long preamble wait) instead of the spinner just
+    -- vanishing. After lifetime_ms we explicitly clear in case the notify
+    -- backend ignored our timeout.
+    finish = function(msg, lifetime_ms, level)
+      lifetime_ms = lifetime_ms or 3000
+      emit(msg, { timeout = lifetime_ms, level = level or vim.log.levels.INFO })
+      local id_at_finish = current_id
+      vim.defer_fn(function()
+        -- Only clear if the notice is still ours (no newer request took over).
+        if current_id == id_at_finish then
+          pcall(function()
+            if type(current_id) == "table" and current_id.hide then
+              current_id:hide()
+            elseif vim.notify and package.loaded["notify"] then
+              pcall(vim.notify, "", vim.log.levels.INFO, { replace = current_id, timeout = 1 })
+            end
+          end)
+          current_id = nil
+        end
+      end, lifetime_ms + 200)
+    end,
+  }
+end
+
+-- ---------------------------------------------------------------------------
+-- M.definition: LSP first (with empty-result retries), GTAGS only after LSP
+-- has definitively given up. Never blocks the main loop.
+-- ---------------------------------------------------------------------------
+--
+-- Design rationale:
+--   * Correctness > speed. We never "jump now, correct later" — that creates
+--     a confusing two-jump UX. We pick the best source we have, then jump.
+--   * LSP semantic results beat GTAGS textual results, always. So we wait
+--     for LSP to finish (including preamble-building retries) before
+--     considering GTAGS.
+--   * The user opted into "accept latency, async". Worst case is a multi-
+--     second wait while preamble builds, with a progress notice. The buffer
+--     is fully usable during that wait — no main-loop blocking.
+
 function M.definition()
   local symbol = current_symbol()
   local bufnr = vim.api.nvim_get_current_buf()
   local ref_file = normalize_path(vim.api.nvim_buf_get_name(bufnr))
   local ref_line = vim.api.nvim_win_get_cursor(0)[1]
 
-  -- Bump token; capture our own.
   request_token = request_token + 1
   local my_token = request_token
+  local function still_current() return my_token == request_token end
 
-  local function still_current()
-    return my_token == request_token
+  local resolved = false
+  local notice = nil
+  local function clear_notice()
+    if notice then
+      pcall(notice.clear)
+      notice = nil
+    end
+  end
+  -- done(success_msg): if a message is provided AND a notice exists, replace
+  -- the spinner with that message and let it auto-dismiss after a few seconds
+  -- (so the user can see what resolved). If no message, clear immediately.
+  local function done(success_msg, lifetime_ms)
+    resolved = true
+    if success_msg and notice then
+      pcall(notice.finish, success_msg, lifetime_ms or 3000)
+      notice = nil
+    else
+      clear_notice()
+    end
   end
 
-  -- Shader files: skip LSP entirely, clangd can't parse HLSL/USF properly.
+  -- Shader files: LSP can't help, go straight to async GTAGS.
   local ext = buf_extension(bufnr)
   if SHADER_EXTS[ext] then
-    if not gtags_fallback(symbol) then
-      vim.notify("No definition (LSP/GTAGS)", vim.log.levels.INFO)
-    end
+    gtags_fallback_async(symbol, function(ok)
+      if not still_current() then return end
+      done()
+      if not ok then
+        vim.notify("No definition (GTAGS empty): " .. (symbol or "?"), vim.log.levels.INFO)
+      end
+    end)
     return
   end
 
-  -- Check if any LSP client supports definition at all.
   local has_def_client = #vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/definition" }) > 0
-
   if not has_def_client then
-    -- No LSP — skip straight to GTAGS (sync, but very fast).
-    if not gtags_fallback(symbol) then
-      vim.notify("No definition (LSP/GTAGS)", vim.log.levels.INFO)
-    end
+    gtags_fallback_async(symbol, function(ok)
+      if not still_current() then return end
+      done()
+      if not ok then
+        vim.notify("No definition (no LSP, GTAGS empty): " .. (symbol or "?"), vim.log.levels.INFO)
+      end
+    end)
     return
   end
 
-  -- Async: textDocument/definition
-  async_lsp_request(bufnr, "textDocument/definition", function(locations)
-    if not still_current() then
-      return
+  -- Schedule progress notice if LSP is slow to answer.
+  -- IMPORTANT: do NOT spam updates. Even with replace=id, noice/snacks log
+  -- every vim.notify call to message history, so a 2s ticker produces
+  -- "2s elapsed / 4s elapsed / 6s elapsed ..." in :messages even though
+  -- only one bubble is visible. We emit at most TWO notices total:
+  --   1. ~600ms in: "still resolving, LSP is busy"
+  --   2. shortly before fallback: "still no LSP result, will fall back to
+  --      GTAGS in Ns" (only if the first notice is still active)
+  local started_at = vim.loop.hrtime()
+  local function elapsed_s()
+    return math.floor((vim.loop.hrtime() - started_at) / 1e9)
+  end
+
+  vim.defer_fn(function()
+    if not still_current() or resolved then return end
+    notice = progress_notice(string.format(
+      "⏳ resolving %s ... LSP busy (preamble/indexing), up to %ds before GTAGS fallback",
+      symbol or "?", math.floor(LSP_RETRY_COUNT * LSP_RETRY_INTERVAL_MS / 1000)
+    ))
+  end, LSP_PROGRESS_NOTICE_MS)
+
+  -- Single mid-wait reassurance update, only if we're still pending past
+  -- the halfway mark. One in-place update, no spam.
+  local lsp_budget_ms = LSP_RETRY_COUNT * LSP_RETRY_INTERVAL_MS
+  vim.defer_fn(function()
+    if not still_current() or resolved or not notice then return end
+    notice.update(string.format(
+      "⏳ %s ... %ds elapsed, LSP still indexing (fallback at %ds)",
+      symbol or "?", elapsed_s(), math.floor(lsp_budget_ms / 1000)
+    ))
+  end, math.floor(lsp_budget_ms / 2))
+
+  -- Hard timeout: bail out.
+  vim.defer_fn(function()
+    if not still_current() or resolved then return end
+    done()
+    vim.notify(string.format("Definition lookup timed out after %ds (%s)",
+      math.floor(OVERALL_TIMEOUT_MS / 1000), symbol or "?"),
+      vim.log.levels.WARN)
+  end, OVERALL_TIMEOUT_MS)
+
+  -- Resolve current platform once for ranking. Cheap (cached state.json).
+  local platform_hints = nil
+  do
+    local ok, ue = pcall(require, "ue")
+    if ok and ue.platform_path_priorities then
+      platform_hints = ue.platform_path_priorities()
     end
-    locations = filter_self_locations(locations, ref_file, ref_line)
-    local jumped = try_jump(locations, "LSP definitions")
-    if jumped == true then
-      return
-    end
-    if jumped == "open_failed" then
-      -- LSP gave us a real location; opening failed. Do NOT fall back —
-      -- GTAGS would jump to an unrelated symbol.
-      return
+  end
+
+  -- LSP first, with retries for empty result while preamble builds.
+  async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_current, function(locs)
+    if not still_current() or resolved then return end
+
+    -- Format a short "where we landed" suffix for the success notice.
+    local function loc_label(loc)
+      local p = location_path(loc)
+      if p == "" then return "?" end
+      local short = p:match("([^/\\]+)$") or p
+      local lnum
+      if loc.range and loc.range.start then lnum = loc.range.start.line + 1
+      elseif loc.targetSelectionRange and loc.targetSelectionRange.start then lnum = loc.targetSelectionRange.start.line + 1 end
+      if lnum then return string.format("%s:%d", short, lnum) end
+      return short
     end
 
-    -- Async fallback: textDocument/declaration
-    local has_decl_client = #vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/declaration" }) > 0
-    if has_decl_client then
-      async_lsp_request(bufnr, "textDocument/declaration", function(decl_locations)
-        if not still_current() then
+    if locs and #locs > 0 then
+      -- Rerank by platform & implementation preference, then jump.
+      local ranked = rerank_locations(locs, platform_hints, ref_file)
+      local winner = clear_winner(ranked, platform_hints, ref_file)
+      if winner then
+        local ok = jump_to_location(winner)
+        if ok then
+          done(string.format("✓ %s → %s", symbol or "?", loc_label(winner)), 3000)
           return
         end
-        decl_locations = filter_self_locations(decl_locations, ref_file, ref_line)
-        local decl_jumped = try_jump(decl_locations, "LSP declarations")
-        if decl_jumped == true then
-          return
-        end
-        if decl_jumped == "open_failed" then
-          return
-        end
-        if not gtags_fallback(symbol) then
-          vim.notify("No definition (LSP/GTAGS)", vim.log.levels.INFO)
-        end
-      end)
-      return
+        -- jump failed; fall through to try_jump (which will quickfix the rest)
+      end
+      local outcome = try_jump(ranked, "LSP definitions")
+      if outcome == true or outcome == "open_failed" then
+        local first = ranked and ranked[1] or nil
+        local msg = first
+            and string.format("✓ %s → %s (%d candidates)", symbol or "?", loc_label(first), #ranked)
+            or string.format("✓ %s (LSP)", symbol or "?")
+        done(msg, 3000)
+        return
+      end
+      -- try_jump returned false (empty after dedup): treat as no LSP result.
     end
 
-    -- No declaration client — GTAGS fallback
-    if not gtags_fallback(symbol) then
-      vim.notify("No definition (LSP/GTAGS)", vim.log.levels.INFO)
-    end
+    -- LSP gave up. Try GTAGS async.
+    gtags_fallback_async(symbol, function(jumped)
+      if not still_current() or resolved then return end
+      if jumped then
+        done(string.format("✓ %s (GTAGS fallback)", symbol or "?"), 3000)
+      else
+        done()
+        vim.notify("No definition (LSP and GTAGS both empty): " .. (symbol or "?"), vim.log.levels.INFO)
+      end
+    end)
   end)
 end
 
 -- ---------------------------------------------------------------------------
 -- References (sync — usually fast enough, results go to qf)
 -- ---------------------------------------------------------------------------
+
+-- ---------------------------------------------------------------------------
+-- Diagnostics
+-- ---------------------------------------------------------------------------
+
+-- Show current LSP client status for the current buffer plus our last token.
+-- Useful when gd seems hung: tells you if clangd is even attached and what
+-- its progress messages look like.
+function M.status()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local lines = {
+    string.format("buffer: %d  name: %s", bufnr, vim.api.nvim_buf_get_name(bufnr)),
+    string.format("request_token: %d", request_token),
+    "",
+    "LSP clients (definition method):",
+  }
+  local def_clients = vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/definition" })
+  if vim.tbl_isempty(def_clients) then
+    table.insert(lines, "  (none)")
+  else
+    for _, c in ipairs(def_clients) do
+      table.insert(lines, string.format("  - %s (id=%d, encoding=%s)",
+        c.name, c.id, c.offset_encoding or "?"))
+      -- progress messages
+      local progress = c.progress
+      if progress and progress.pending then
+        for token, msg in pairs(progress.pending) do
+          table.insert(lines, string.format("    progress[%s]: %s",
+            tostring(token), vim.inspect(msg)))
+        end
+      end
+    end
+  end
+  vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO, { title = "LSP fallback status" })
+end
 
 function M.references()
   local symbol = current_symbol()

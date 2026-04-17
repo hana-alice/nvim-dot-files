@@ -212,6 +212,10 @@ end
 map("n", "gd", function()
   require("utils.lsp_fallback").definition()
 end, { desc = "Definition (LSP -> GTAGS)" })
+
+vim.api.nvim_create_user_command("UEDefStatus", function()
+  require("utils.lsp_fallback").status()
+end, { desc = "Show LSP definition fallback status (debug)" })
 map("n", "gr", function()
   require("utils.lsp_fallback").references()
 end, { desc = "References (LSP -> GTAGS)" })

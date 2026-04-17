@@ -248,6 +248,15 @@ local function clangd_candidates(root_dir)
     table.insert(candidates, "/mnt/c/Program Files/LLVM/bin/clangd.exe")
   end
 
+  -- Windows native paths: when running nvim on Windows directly (not under
+  -- WSL), `clangd` may not be on PATH (the user installs LLVM into Program
+  -- Files but doesn't always add bin/ to PATH). Try the canonical install
+  -- location explicitly.
+  if vim.fn.has("win32") == 1 then
+    table.insert(candidates, "C:/Program Files/LLVM/bin/clangd.exe")
+    table.insert(candidates, "C:/Program Files (x86)/LLVM/bin/clangd.exe")
+  end
+
   return candidates
 end
 

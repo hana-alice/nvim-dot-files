@@ -181,6 +181,21 @@ function M.definition()
     sym or "", receiver or "",
     vim.fn.fnamemodify(ref_file, ":t"), ref_line)
 
+  -- Early bail: if the cursor sits inside a qualified-name chain rooted at
+  -- a template parameter (dependent name like `TShaderClass::FParameters::
+  -- FTypeInfo::GetStructMetadata`), clangd cannot resolve any segment of
+  -- that chain without instantiation context. Don't waste 30s on retries —
+  -- detect it from the AST and stop immediately.
+  local dep, dep_root, dep_chain = symbol_mod.is_dependent_at_cursor()
+  if dep then
+    vim.notify(string.format(
+      "⊘ %s — dependent name (rooted at template parameter `%s`); not resolvable without instantiation. Try grepping for the concrete type or jump to %s instead.",
+      dep_chain or (sym or "?"), dep_root or "?", dep_root or "?"),
+      vim.log.levels.INFO,
+      { title = "LSP definition", timeout = 4000 })
+    return
+  end
+
   -- Clear any stale precise-winner from a previous gd; it's no longer
   -- relevant once the user invokes gd on something else.
   M._last_precise_winner = nil

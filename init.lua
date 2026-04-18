@@ -37,4 +37,5 @@ require("config.lazy")
 -- require them here to avoid double execution.
 require("config.windows").setup()
 require("utils.recent_projects").setup()
+require("workarounds").setup({ auto_apply = false })
 require("ue").setup()

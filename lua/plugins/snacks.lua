@@ -394,37 +394,12 @@ return {
       })
       opts.picker = opts.picker or {}
       opts.picker.layout = vim.tbl_deep_extend("force", { preset = "vscode" }, opts.picker.layout or {})
-      -- Override projects source. Default (recent=true) walks vim.v.oldfiles
-      -- synchronously and calls Snacks.git.get_root() for each, which on UE
-      -- workspaces (hundreds of oldfiles, deep paths) blocks the main loop
-      -- for tens of seconds inside Neovide → looks like a freeze.
-      -- Replace finder with our own static-list reader: utils.recent_projects
-      -- maintains an MRU file (BufReadPost/DirChanged → walk parents to
-      -- find .git/.uproject root). Picker reads it instantly — no scan,
-      -- no git spawn.
-      opts.picker.sources = opts.picker.sources or {}
-      opts.picker.sources.projects = vim.tbl_deep_extend("force", opts.picker.sources.projects or {}, {
-        finder = function(_, _)
-          local ok, rp = pcall(require, "utils.recent_projects")
-          local list = {}
-          if ok then
-            list = rp.list()
-            if #list < 5 then
-              -- Lazy bootstrap on first picker open: synchronously walk
-              -- top-30 oldfiles to seed the project list.
-              pcall(rp.bootstrap_from_oldfiles, 30)
-              list = rp.list()
-            end
-          end
-          ---@async
-          return function(cb)
-            for _, dir in ipairs(list) do
-              cb({ file = dir, text = dir, dir = true })
-            end
-          end
-        end,
-        patterns = { ".git", ".uproject", ".uplugin", "package.json" },
-      })
+
+      -- Workaround: snacks projects picker freezes for ~30s on UE workspaces
+      -- (oldfiles walk + per-entry git spawn on main loop). See
+      -- lua/workarounds/snacks/projects_picker_freeze.lua for full context.
+      require("workarounds.snacks.projects_picker_freeze").apply(opts)
+
       opts.picker.actions = vim.tbl_deep_extend("force", opts.picker.actions or {}, {
         paste_clipboard = paste_picker_clipboard,
         pin_sidebar_qflist = pin_sidebar_qflist,

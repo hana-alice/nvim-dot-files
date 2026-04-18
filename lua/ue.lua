@@ -6315,6 +6315,17 @@ local function clear_cache(opts)
         table.insert(removed, "  " .. cc .. " (compile_commands)")
       end
     end
+    -- PCH cache: invalidates after LLVM/clangd version bump where the
+    -- old PCH format is rejected ("uses an older format that is no
+    -- longer supported"). The error is silently dropped by clangd, so
+    -- the only symptom is "all UE types unknown" — see :UEBuildPCH.
+    for _, root in ipairs(clangd_roots) do
+      local pch_dir = join(root, ".clangd-pch")
+      if is_dir(pch_dir) then
+        pcall(vim.fn.delete, pch_dir, "rf")
+        table.insert(removed, "  " .. pch_dir .. "/ (PCH cache)")
+      end
+    end
   end
 
   -- summary
@@ -6476,6 +6487,53 @@ function M.setup()
   end, {})
   vim.api.nvim_create_user_command("UECheatsheet", show_cheatsheet, {})
   vim.api.nvim_create_user_command("UECheatsheetEdit", edit_cheatsheet, {})
+  vim.api.nvim_create_user_command("UEBuildPCH", function()
+    local ctx, err = resolve_context({ detect_project = false })
+    if not ctx then
+      vim.notify(err, vim.log.levels.WARN)
+      return
+    end
+    local roots = { ctx.engine_root }
+    if ctx.project_root then table.insert(roots, ctx.project_root) end
+    local bat = nil
+    for _, root in ipairs(roots) do
+      local candidate = join(root, ".clangd-pch", "build_pch.bat")
+      if is_file(candidate) then bat = candidate; break end
+    end
+    if not bat then
+      vim.notify(
+        "No build_pch.bat found. Run :UEPrepare first to generate the PCH pipeline.",
+        vim.log.levels.WARN
+      )
+      return
+    end
+    -- Convert forward → backslash for cmd.exe
+    local bat_win = bat:gsub("/", "\\")
+    vim.notify("UE: rebuilding PCH (background) — " .. bat_win, vim.log.levels.INFO)
+    vim.fn.jobstart({ "cmd.exe", "/c", bat_win }, {
+      cwd = vim.fs.dirname(bat),
+      detach = false,
+      on_stdout = function(_, data)
+        for _, line in ipairs(data or {}) do
+          if line ~= "" then vim.schedule(function() vim.notify("[UEBuildPCH] " .. line, vim.log.levels.INFO) end) end
+        end
+      end,
+      on_stderr = function(_, data)
+        for _, line in ipairs(data or {}) do
+          if line ~= "" then vim.schedule(function() vim.notify("[UEBuildPCH stderr] " .. line, vim.log.levels.WARN) end) end
+        end
+      end,
+      on_exit = function(_, code)
+        vim.schedule(function()
+          if code == 0 then
+            vim.notify("UE: PCH rebuild OK — restart clangd with :LspRestart", vim.log.levels.INFO)
+          else
+            vim.notify("UE: PCH rebuild FAILED (exit " .. code .. ")", vim.log.levels.ERROR)
+          end
+        end)
+      end,
+    })
+  end, { desc = "Rebuild clangd PCH cache (after LLVM/clangd version bump)" })
   vim.api.nvim_create_user_command("UEClearCache", function(cmd_opts)
     clear_cache({ bang = cmd_opts.bang })
   end, { bang = true, desc = "Clear UE caches (! = also clangd index, compile_commands, restart LSP)" })

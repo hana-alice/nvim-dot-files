@@ -331,8 +331,12 @@ def main():
     removed = original_count - len(kept)
     print(f"\n保留: {len(kept)} | 剔除: {removed} ({removed*100/original_count:.1f}%)")
 
-    # 统一 Definitions
-    kept = unify_definitions(kept)
+    # 统一 Definitions —— 已禁用：删除 -include Definitions.<Module>.h 会导致
+    # PCH 缺失 UE_BUILD_DEVELOPMENT / WITH_EDITOR 等关键 build configuration
+    # 宏，clangd 加载 PCH 后宏环境不匹配 → AST 失效 → 所有 UE 类型显示
+    # "unknown type name 'int32'/'TCHAR'" 等，整片代码飘红。
+    # preamble 缓存复用的小优化不值得 correctness 损失。
+    # kept = unify_definitions(kept)
 
     # 剥离 clangd 不需要的编译参数
     kept = strip_unnecessary_flags(kept)

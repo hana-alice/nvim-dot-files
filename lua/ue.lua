@@ -4751,6 +4751,10 @@ function M.cached_grep(opts)
     search = opts.search or "",
     live = true,
     need_search = true,
+    -- Telescope-style layout (list + side preview) so users can read match
+    -- context inline. Matches the `sources.grep` override in plugins/snacks.lua;
+    -- pick() doesn't auto-apply source defaults, so we set it explicitly.
+    layout = { preset = "telescope" },
     finder = function(picker_opts, ctx)
       local pattern = ctx.filter.search
       if not pattern or pattern == "" then

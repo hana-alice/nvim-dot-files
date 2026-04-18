@@ -162,9 +162,25 @@ local function pin_sidebar_qflist(picker)
     return
   end
 
+  -- (1) Convert picker selection to vim quickfix list. This also closes
+  --     the picker float.
   actions.qflist(picker)
+
+  -- (2) Open the bottom tree-grouped quickfix view. We deliberately do NOT
+  --     call utils.sidebar.open("qflist") here — that opens the left
+  --     sidebar mode. The pin action should produce ONLY the bottom panel.
+  --     Also tear down any currently-open left sidebar so the user gets a
+  --     single, focused view of the pinned results.
   vim.schedule(function()
-    require("utils.sidebar").open("qflist")
+    pcall(function() require("utils.sidebar").close() end)
+    local ok_t, trouble = pcall(require, "trouble")
+    if not ok_t then
+      vim.notify("Trouble unavailable; pinned results stayed in :copen",
+        vim.log.levels.WARN)
+      vim.cmd("botright copen 12")
+      return
+    end
+    trouble.open("ue_qflist_bottom")
   end)
 end
 
@@ -394,6 +410,16 @@ return {
       })
       opts.picker = opts.picker or {}
       opts.picker.layout = vim.tbl_deep_extend("force", { preset = "vscode" }, opts.picker.layout or {})
+
+      -- Per-source layout overrides:
+      -- grep wants telescope layout (list + side preview) so users can read
+      -- match context without jumping. The global vscode preset has no
+      -- preview which makes "<leader>/" feel like a blind drop.
+      opts.picker.sources = opts.picker.sources or {}
+      opts.picker.sources.grep = vim.tbl_deep_extend(
+        "force", opts.picker.sources.grep or {}, {
+          layout = { preset = "telescope" },
+        })
 
       -- Workaround: snacks projects picker freezes for ~30s on UE workspaces
       -- (oldfiles walk + per-entry git spawn on main loop). See

@@ -44,6 +44,22 @@ return {
           sort = { "filename", "pos" },
           format = "{text}",
         }),
+        -- Bottom-pinned tree-grouped quickfix view, used by the picker
+        -- "<C-q> pin" action. NOT routed through sidebar_mode() because
+        -- it must NOT open in the left sidebar — it lives at the bottom
+        -- as a horizontal split, grouped-by-file (trouble's default
+        -- qflist mode is already tree-shaped).
+        ue_qflist_bottom = {
+          desc = "Bottom quickfix tree (pinned picker results)",
+          mode = "qflist",
+          focus = true,
+          warn_no_results = false,
+          open_no_results = true,
+          win = {
+            position = "bottom",
+            size = { height = 12 },
+          },
+        },
      })
      return opts
    end,

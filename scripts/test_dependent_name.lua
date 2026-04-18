@@ -51,6 +51,24 @@ local cases = {
   --    Document expected behavior: this case may NOT be detected (false neg).
   {"<PROJ_DRIVE>/UEProj/Engine/Source/Runtime/Core/Public/Templates/Decay.h",
     45, "Type",               nil,   "EDGE: TRemoveReference<T>::Type — template_type LHS"},
+
+  -- 7. The new report from user: PolymorphicNetSerializerImpl.h
+  --    line 110: `UScriptStruct* ScriptStruct = Object->GetScriptStruct();`
+  --    line 112: `ScriptStruct->DestroyStruct(Object);`
+  --    line 106: `void operator()(SourceItemType* Object) const`
+  --    line 102: `typedef ExternalSourceItemType SourceItemType;`
+  --    line 64:  `template <typename ExternalSourceType, typename ExternalSourceItemType, ...>`
+  --    Object's type SourceItemType* resolves through 1 typedef hop to
+  --    template parameter ExternalSourceItemType.
+  {"<PROJ_DRIVE>/UEProj/Engine/Source/Runtime/Net/Iris/Public/Iris/Serialization/PolymorphicNetSerializerImpl.h",
+    110, "GetScriptStruct",   true,  "obj->method via typedef-to-template-param (Shape C, the user's case)"},
+  {"<PROJ_DRIVE>/UEProj/Engine/Source/Runtime/Net/Iris/Public/Iris/Serialization/PolymorphicNetSerializerImpl.h",
+    110, "Object",            true,  "obj on LHS of ->member, but cursor only inside field_expression argument — also reports dependent (correct: any member access we'd attempt would be dependent)"},
+  -- ScriptStruct is UScriptStruct* (concrete) — NOT dependent.
+  {"<PROJ_DRIVE>/UEProj/Engine/Source/Runtime/Net/Iris/Public/Iris/Serialization/PolymorphicNetSerializerImpl.h",
+    112, "DestroyStruct",     false, "negative: ScriptStruct is concrete UScriptStruct*"},
+  {"<PROJ_DRIVE>/UEProj/Engine/Source/Runtime/Net/Iris/Public/Iris/Serialization/PolymorphicNetSerializerImpl.h",
+    110, "ScriptStruct",      false, "negative: cursor on local var name being declared, not a member access"},
 }
 
 local function run(file, line, target_token, expect_dep, label)

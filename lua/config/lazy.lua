@@ -32,9 +32,14 @@ require("lazy").setup({
   },
   install = { colorscheme = { "tokyonight", "habamax" } },
   checker = {
-    enabled = true, -- check for plugin updates periodically
-    notify = false, -- notify on update
-  }, -- automatically check for plugin updates
+    enabled = true, -- check for plugin updates
+    notify = false,
+    frequency = 86400, -- check at most once a day (was: every hour)
+  },
+  change_detection = {
+    enabled = true,
+    notify = false, -- silence "config reloaded" toasts
+  },
   performance = {
     rtp = {
       -- disable some rtp plugins
@@ -49,6 +54,12 @@ require("lazy").setup({
         "tohtml",
         "tutor",
         "zipPlugin",
+        -- additional unused on UE/Win workflow:
+        "rplugin",     -- python/ruby remote plugins (not used)
+        "spellfile",   -- spell file downloader (we use offline dict if any)
+        "man",         -- :Man pager (not used on Windows)
+        -- NOTE: do NOT disable "shada" — it's needed for ' marks, / history,
+        -- : history, and last-cursor-position (g`")
       },
     },
   },

@@ -111,6 +111,35 @@ headlessly. Re-runnable.
 468-line keymap + workflow handbook covering vanilla Vim, LazyVim, and
 the UE/DAP additions. Open in-editor with `:UECheatsheet`.
 
+### 8. Sub-second grep on 100k-file UE workspaces (`tools/cindex-uefilter` + `lua/utils/code_search`)
+
+`<leader>/` (the project grep picker) used to walk the directory tree
+on every keystroke — ~14-32s per query on UEProj because NTFS
+recursion is the physical bottleneck and `rg --files-from` doesn't
+exist.
+
+`:UEPrepare` now also builds a trigram index using a small Go fork of
+[google/codesearch](https://github.com/google/codesearch). The fork
+adds one flag, `-files-from FILE`, which lets us index exactly the
+clean file list `:UEPrepare` already produces (skipping
+`graphify-out/`, `Intermediate/`, `DerivedDataCache/`, etc. that the
+upstream walker would otherwise vacuum up).
+
+Numbers measured on UEProj (~43k files):
+
+| Pattern                     | Hits | csearch     | rg (walk) |
+| --------------------------- | ---- | ----------- | --------- |
+| `DeviceEvaluation`          | 10   | **85 ms**   | ~30 s     |
+| `FRDGBuilder`               | 2491 | **365 ms**  | ~14 s     |
+| `FRHICommandList`           | 6593 | **693 ms**  | ~18 s     |
+| `NaniteRasterPipelines`     | 57   | **73 ms**   | ~12 s     |
+
+Build the binary once: `cd tools/cindex-uefilter && go install ./...`
+(Go ≥ 1.22 + a working `$GOBIN` on `$PATH`). The next `:UEPrepare`
+will detect it and produce a `.cache/nvim-ue/csearch.idx` (~70 MB on
+UEProj). When the index is missing, the picker silently falls back to
+the rg-batched path.
+
 ---
 
 ## Layout
@@ -125,15 +154,19 @@ the UE/DAP additions. Open in-editor with `:UECheatsheet`.
 │   ├── ue/                     UE submodules (DAP)
 │   ├── utils/
 │   │   ├── ue_goto/            instant goto-def architecture
+│   │   ├── code_search/        sub-second grep via csearch + cindex-uefilter
 │   │   ├── lsp_fallback.lua    fall-through gd resolver
 │   │   ├── recent_projects.lua MRU without re-statting NTFS
-│   │   ├── platform.lua        is_windows flag
+│   │   ├── platform.lua        is_windows / is_mac / is_linux flags
 │   │   └── ...
 │   ├── workarounds/            isolated quirk patches + registry
 │   ├── nio/                    async logger
 │   ├── trouble/sources/        custom trouble sources
 │   └── theme.lua, highlights.lua
-├── tools/                      Python utilities (PCH, CDB, index, DAP probes)
+├── tools/
+│   ├── cindex-uefilter/        Go fork of google/codesearch's cindex
+│   │                           (adds -files-from FILE for clean indexing)
+│   └── (Python utilities...)   PCH, CDB, index, DAP probes
 ├── scripts/                    Windows installer + cleanup + profiling
 ├── docs/
 │   ├── ue_lazyvim_cheatsheet.md

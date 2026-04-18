@@ -69,6 +69,19 @@ end
 -- Fire one LSP request round across all clients. Calls on_result(locations)
 -- exactly once on the main thread. locations is nil iff every client failed
 -- or returned no result.
+--
+-- HARD CONTRACT (Tier-2 hardening, 2026-04-18):
+--   on_result is invoked EXACTLY ONCE within REQUEST_HARD_CEILING_MS, no
+--   matter what:
+--     * no clients         → on_result(nil) on next tick
+--     * make_params fails  → counts as one pending slot
+--     * client:request raises → counts as one pending slot
+--     * client never replies (clangd hung mid-preamble, network LSP
+--       died, etc.) → ceiling timer fires on_result(nil)
+--   This makes the function safe to chain into spinner cleanup paths
+--   without leaking notices when the LSP server misbehaves.
+local REQUEST_HARD_CEILING_MS = 30000
+
 function M.async_lsp_request(bufnr, method, on_result)
   local clients = vim.lsp.get_clients({ bufnr = bufnr, method = method })
   if not clients or vim.tbl_isempty(clients) then
@@ -79,10 +92,15 @@ function M.async_lsp_request(bufnr, method, on_result)
   local pending = #clients
   local all_items = {}
   local done = false
+  local ceiling_timer = nil
 
   local function finish()
     if done then return end
     done = true
+    if ceiling_timer and not ceiling_timer:is_closing() then
+      ceiling_timer:stop()
+      ceiling_timer:close()
+    end
     vim.schedule(function()
       on_result(#all_items > 0 and all_items or nil)
     end)
@@ -93,6 +111,12 @@ function M.async_lsp_request(bufnr, method, on_result)
     if pending <= 0 then finish() end
   end
 
+  -- Hard ceiling: if any client never replies (clangd preamble crash,
+  -- network LSP died, etc.) finish anyway with whatever we collected.
+  ceiling_timer = vim.defer_fn(function()
+    if not done then finish() end
+  end, REQUEST_HARD_CEILING_MS)
+
   for _, client in ipairs(clients) do
     local enc = client.offset_encoding or "utf-16"
     local ok_make, params = pcall(vim.lsp.util.make_position_params, 0, enc)
@@ -101,6 +125,7 @@ function M.async_lsp_request(bufnr, method, on_result)
     else
       local ok_req = pcall(function()
         client:request(method, params, function(err, result)
+          if done then return end -- ceiling already fired
           if not err and result and type(result) == "table" then
             vim.list_extend(all_items, location.normalize_locations(result, enc))
           end
@@ -213,13 +238,33 @@ local ranking = require("utils.ue_goto.ranking")
 --     3. As a last resort, query declaration.
 --     4. If everything is empty and we still have retries left, wait
 --        LSP_RETRY_INTERVAL_MS and try again (clangd preamble building).
---   Calls on_result(locations|nil) exactly once.
+--
+--   HARD CONTRACT (Tier-2 hardening, 2026-04-18):
+--     on_result(locations|nil) is invoked EXACTLY ONCE, full stop. This
+--     holds even when:
+--       * still_current() returns false at any point during the chain
+--         (we still finish the chain, just stop retrying)
+--       * any underlying LSP request hangs / never responds
+--         (async_lsp_request enforces its own hard ceiling)
+--     Caller should still test still_current() before acting on the
+--     result (the request may be stale), but is GUARANTEED that any
+--     spinner / progress notice it owns will get a definitive
+--     terminating callback. No leaked spinners. Ever.
 function M.async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_current, on_result)
   local attempts = 0
+  local on_result_fired = false
+  local function fire(locs)
+    if on_result_fired then return end
+    on_result_fired = true
+    on_result(locs)
+  end
 
   local function def_plus_impl(inner)
+    -- inner(locs|nil) is contractually called exactly once. We do NOT
+    -- short-circuit on still_current() inside this chain — that's what
+    -- caused spinner leaks: inner stayed unfired and the outer caller's
+    -- done() path never ran.
     M.async_lsp_request(bufnr, "textDocument/definition", function(def_locs)
-      if not still_current() then return end
       def_locs = location.filter_self_locations(def_locs, ref_file, ref_line)
 
       if def_locs and #def_locs > 0 and not ranking.is_thin_header_only(def_locs) then
@@ -232,7 +277,6 @@ function M.async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_curr
         local has_decl = #vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/declaration" }) > 0
         if has_decl then
           M.async_lsp_request(bufnr, "textDocument/declaration", function(decl_locs)
-            if not still_current() then return end
             decl_locs = location.filter_self_locations(decl_locs, ref_file, ref_line)
             local merged = {}
             if def_locs then vim.list_extend(merged, def_locs) end
@@ -246,7 +290,6 @@ function M.async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_curr
       end
 
       M.async_lsp_request(bufnr, "textDocument/implementation", function(impl_locs)
-        if not still_current() then return end
         impl_locs = location.filter_self_locations(impl_locs, ref_file, ref_line)
 
         local merged = {}
@@ -262,7 +305,6 @@ function M.async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_curr
         local has_decl = #vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/declaration" }) > 0
         if has_decl then
           M.async_lsp_request(bufnr, "textDocument/declaration", function(decl_locs)
-            if not still_current() then return end
             decl_locs = location.filter_self_locations(decl_locs, ref_file, ref_line)
             inner(decl_locs and #decl_locs > 0 and decl_locs or nil)
           end)
@@ -276,17 +318,24 @@ function M.async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_curr
   local function try_once()
     attempts = attempts + 1
     def_plus_impl(function(locs)
-      if not still_current() then return end
       if locs and #locs > 0 then
-        on_result(locs)
+        fire(locs)
         return
       end
-      if attempts < M.config.LSP_RETRY_COUNT + 1 then
+      -- Empty result. Decide whether to retry, but ALWAYS fire eventually.
+      -- still_current() controls "should we keep retrying" but does NOT
+      -- silence the final on_result — callers depend on it for cleanup.
+      if attempts < M.config.LSP_RETRY_COUNT + 1 and still_current() then
         vim.defer_fn(function()
-          if still_current() then try_once() end
+          if still_current() then
+            try_once()
+          else
+            -- Stopped while waiting on retry — fire now so caller cleans up.
+            fire(nil)
+          end
         end, M.config.LSP_RETRY_INTERVAL_MS)
       else
-        on_result(nil)
+        fire(nil)
       end
     end)
   end

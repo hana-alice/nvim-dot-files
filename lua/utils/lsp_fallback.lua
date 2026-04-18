@@ -353,7 +353,16 @@ function M.definition()
     provider.async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_current, function(locs)
       dtrace("precise: back n=%d still=%s jumped=%s",
         locs and #locs or 0, tostring(still_current()), tostring(jumped))
-      if not still_current() then return end
+      -- HARD INVARIANT: precise track owns the spinner. Once we receive
+      -- the on_result callback, the spinner MUST end on every exit path,
+      -- stale or not. Otherwise the "⏳ resolving ..." notice is leaked
+      -- forever (until the 30s overall timeout fires).
+      if not still_current() then
+        -- Stale: do nothing observable, but clear our spinner so nothing
+        -- lingers on screen. The fresher invocation has its own spinner.
+        clear_notice()
+        return
+      end
 
       if locs and #locs > 0 then
         local winner, label, ranked = ranking.pick_winner_with_label(locs, platform_hints, ref_file, receiver)
@@ -402,7 +411,12 @@ function M.definition()
 
       -- LSP precise gave nothing, fall through to GTAGS.
       provider.gtags_fallback_async(sym, function(jumped_g)
-        if not still_current() or resolved then return end
+        -- Same invariant: spinner ownership transfers to us here. Always
+        -- terminate it before returning.
+        if not still_current() or resolved then
+          clear_notice()
+          return
+        end
         if jumped_g then
           jumped = true
           done(string.format("✓ %s (GTAGS fallback)", sym or "?"), 3000)
@@ -417,9 +431,19 @@ function M.definition()
     -- ws_client only, no def_client. Wait briefly for instant track,
     -- then fall back to GTAGS if it didn't pan out.
     vim.defer_fn(function()
-      if not still_current() or resolved or jumped then return end
+      -- HARD INVARIANT: this branch owns the spinner cleanup.
+      -- jumped=true means instant track resolved cleanly and already
+      -- called done(); nothing left to do.
+      if jumped then return end
+      if not still_current() or resolved then
+        clear_notice()
+        return
+      end
       provider.gtags_fallback_async(sym, function(jumped_g)
-        if not still_current() or resolved then return end
+        if not still_current() or resolved then
+          clear_notice()
+          return
+        end
         if jumped_g then
           jumped = true
           done(string.format("✓ %s (GTAGS fallback)", sym or "?"), 3000)

@@ -32,10 +32,31 @@ end
 -- a time. A second gd while the first is still resolving reuses the same
 -- notification slot (snacks: same id; nvim-notify: same handle), so the
 -- top-right corner never accumulates a stack of spinners.
+--
+-- SELF-DESTRUCT (Tier-1 hardening, 2026-04-18):
+--   Even if the upstream business logic forgets to call clear()/finish(),
+--   every progress_notice() automatically self-destructs after
+--   SELF_DESTRUCT_MS. This is a defense-in-depth safety net — the real
+--   fix lives in the provider/orchestrator's hard contract — but ensures
+--   a runaway spinner can never linger longer than this regardless of
+--   what bug crept in upstream.
+--
+--   Each update()/finish() resets the self-destruct timer. clear() cancels
+--   it explicitly.
 
 local _shared_notice_id = nil
+local SELF_DESTRUCT_MS = 8000
 
 function M.progress_notice(initial_msg)
+  local self_destruct_timer = nil
+
+  local function cancel_self_destruct()
+    if self_destruct_timer and not self_destruct_timer:is_closing() then
+      pcall(function() self_destruct_timer:stop(); self_destruct_timer:close() end)
+      self_destruct_timer = nil
+    end
+  end
+
   local function emit(msg, opts_override)
     -- hide_from_history is set from the FIRST emit — without this, snacks
     -- writes every spinner update into :messages history even when we
@@ -63,50 +84,82 @@ function M.progress_notice(initial_msg)
       _shared_notice_id = new_id or _shared_notice_id
     end
   end
+
   emit(initial_msg)
   local current_id = _shared_notice_id
-  return {
-    update = function(msg) emit(msg) end,
-    clear = function()
-      pcall(function()
-        if current_id ~= nil then
+
+  -- Forward declarations so the self-destruct callback can reach hide().
+  local handle = {}
+
+  local function hide_now()
+    cancel_self_destruct()
+    pcall(function()
+      if current_id ~= nil then
+        if type(current_id) == "table" and current_id.hide then
+          current_id:hide()
+        elseif vim.notify and package.loaded["notify"] then
+          pcall(vim.notify, "", vim.log.levels.INFO, { replace = current_id, timeout = 1 })
+        end
+      end
+    end)
+    if _shared_notice_id == current_id then _shared_notice_id = nil end
+    current_id = nil
+  end
+
+  -- Arm self-destruct: if no one calls clear()/finish() within SELF_DESTRUCT_MS
+  -- the spinner force-hides itself. Each update() rearms it.
+  local function arm_self_destruct()
+    cancel_self_destruct()
+    self_destruct_timer = vim.defer_fn(function()
+      -- Force a "timed out" finish with a short lifetime so the user
+      -- gets a visible cue rather than the spinner just vanishing.
+      emit("⌛ progress notice self-timed-out (no terminating callback)", {
+        timeout = 2000,
+        hide_from_history = false,
+        level = vim.log.levels.WARN,
+      })
+      vim.defer_fn(hide_now, 2200)
+    end, SELF_DESTRUCT_MS)
+  end
+
+  arm_self_destruct()
+
+  handle.update = function(msg)
+    emit(msg)
+    arm_self_destruct() -- re-arm on each progress update
+  end
+
+  handle.clear = hide_now
+
+  -- Update the notice to a "done" message that auto-dismisses after
+  -- lifetime_ms. The "done" message is allowed into history so the user
+  -- can see the latest resolution in :messages — only spinner ticks are
+  -- history-suppressed.
+  handle.finish = function(msg, lifetime_ms, level)
+    cancel_self_destruct()
+    lifetime_ms = lifetime_ms or 3000
+    emit(msg, {
+      timeout = lifetime_ms,
+      level = level or vim.log.levels.INFO,
+      hide_from_history = false,
+    })
+    local id_at_finish = current_id
+    vim.defer_fn(function()
+      if _shared_notice_id == id_at_finish then
+        pcall(function()
           if type(current_id) == "table" and current_id.hide then
             current_id:hide()
           elseif vim.notify and package.loaded["notify"] then
             pcall(vim.notify, "", vim.log.levels.INFO, { replace = current_id, timeout = 1 })
           end
-        end
-      end)
-      if _shared_notice_id == current_id then _shared_notice_id = nil end
-      current_id = nil
-    end,
-    -- Update the notice to a "done" message that auto-dismisses after
-    -- lifetime_ms. The "done" message is allowed into history so the user
-    -- can see the latest resolution in :messages — only spinner ticks are
-    -- history-suppressed.
-    finish = function(msg, lifetime_ms, level)
-      lifetime_ms = lifetime_ms or 3000
-      emit(msg, {
-        timeout = lifetime_ms,
-        level = level or vim.log.levels.INFO,
-        hide_from_history = false,
-      })
-      local id_at_finish = current_id
-      vim.defer_fn(function()
-        if _shared_notice_id == id_at_finish then
-          pcall(function()
-            if type(current_id) == "table" and current_id.hide then
-              current_id:hide()
-            elseif vim.notify and package.loaded["notify"] then
-              pcall(vim.notify, "", vim.log.levels.INFO, { replace = current_id, timeout = 1 })
-            end
-          end)
-          _shared_notice_id = nil
-          current_id = nil
-        end
-      end, lifetime_ms + 200)
-    end,
-  }
+        end)
+        _shared_notice_id = nil
+        current_id = nil
+      end
+    end, lifetime_ms + 200)
+  end
+
+  return handle
 end
 
 -- try_jump(locations, title): single-location jump or quickfix.

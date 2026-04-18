@@ -4709,15 +4709,77 @@ end
 -- Batched grep using cached file list.
 -- Spawns rg with file paths as positional args instead of searching directories,
 -- avoiding NTFS directory traversal (~20x faster on Windows).
+--
+-- WHEN A CSEARCH INDEX EXISTS (built by :UEPrepare via cindex-uefilter),
+-- the picker uses a sub-second trigram-indexed grep instead. On a 100k-file
+-- UE workspace, csearch returns FRDGBuilder (5k hits) in ~700ms vs ~14s
+-- for the rg-batched path. See lua/utils/code_search/ for backend details.
 function M.cached_grep(opts)
   opts = opts or {}
-  local info = cached_file_list_info(opts, "all")
-  if not info then
-    -- Fallback: standard directory-based grep
+  local ctx = resolve_context(opts)
+  if not ctx then
     return nil
   end
 
   local snacks = require("snacks")
+  local code_search = require("utils.code_search")
+  local cs_ctx = { workspace_root = workspace_root(ctx) }
+  local has_index = code_search.is_indexed(cs_ctx)
+  local backend_label = has_index and "csearch" or "rg"
+
+  local title_default = ("Grep All Code [%s]"):format(backend_label)
+
+  -- ── csearch fast path ────────────────────────────────────────────────
+  if has_index then
+    snacks.picker.pick({
+      title = opts.title or title_default,
+      search = opts.search or "",
+      live = true,
+      need_search = true,
+      layout = { preset = "telescope" },
+      finder = function(_picker_opts, finder_ctx)
+        local pattern = finder_ctx.filter.search
+        if not pattern or pattern == "" then
+          return function() end
+        end
+        return function(cb)
+          local stop = code_search.stream(cs_ctx, pattern, {
+            code_only   = opts.code_only,
+            smart_case  = true,
+            max_count   = opts.max_count or 5000,
+          }, {
+            on_line = function(file, lnum, col, text)
+              cb({
+                text = file .. "\0" .. lnum .. ":" .. col .. ":" .. text,
+                pos = { lnum, math.max(0, col - 1) },
+                file = file,
+              })
+            end,
+            on_done = function(code, err)
+              if err and code ~= 0 then
+                vim.notify("UE grep [csearch]: " .. err, vim.log.levels.WARN, { title = "UE" })
+              end
+            end,
+          })
+          return stop
+        end
+      end,
+    })
+    return true
+  end
+
+  -- ── rg-batched fallback (v2): cached file list + per-batch rg ────────
+  -- Used when no csearch index exists yet (UEPrepare hasn't been run, or
+  -- cindex-uefilter isn't installed). This path is the legacy ~14-30s
+  -- behavior on UE workspaces. To get sub-second grep, run :UEPrepare.
+
+  local info = cached_file_list_info(opts, "all")
+  if not info then
+    -- No cached file list and no csearch index; let snacks fall back to
+    -- its default grep over the directory tree (slowest path).
+    return nil
+  end
+
   local rg = first_executable({ "rg" })
   if not rg then
     return nil
@@ -4746,17 +4808,24 @@ function M.cached_grep(opts)
     return #tostring(arg) + 3
   end
 
+  -- Hint the user that csearch would make this fast.
+  if not vim.b._ue_grep_csearch_hint_shown then
+    vim.b._ue_grep_csearch_hint_shown = true
+    vim.notify(
+      "UE grep: no csearch index. Run :UEPrepare for sub-second search.",
+      vim.log.levels.INFO,
+      { title = "UE" }
+    )
+  end
+
   snacks.picker.pick({
-    title = opts.title or "Grep All Code (cached)",
+    title = opts.title or title_default,
     search = opts.search or "",
     live = true,
     need_search = true,
-    -- Telescope-style layout (list + side preview) so users can read match
-    -- context inline. Matches the `sources.grep` override in plugins/snacks.lua;
-    -- pick() doesn't auto-apply source defaults, so we set it explicitly.
     layout = { preset = "telescope" },
-    finder = function(picker_opts, ctx)
-      local pattern = ctx.filter.search
+    finder = function(picker_opts, finder_ctx)
+      local pattern = finder_ctx.filter.search
       if not pattern or pattern == "" then
         return function() end
       end
@@ -4818,7 +4887,7 @@ function M.cached_grep(opts)
                 return item
               end,
             },
-            ctx
+            finder_ctx
           )(cb)
 
           args = vim.deepcopy(base_args)
@@ -5864,6 +5933,42 @@ local function prepare()
   INDEX_FN.schedule_index_refresh(ctx, { current = true, hot = true, full = true, current_delay_ms = 50 })
   invalidate_status_cache()
   refresh_statusline()
+
+  -- ── csearch index (sync path) ───────────────────────────────────────
+  -- Build the trigram index for sub-second grep. Same logic as the async
+  -- path; we just block on the libuv callback here.
+  do
+    local cs_root = root
+    local cs_ctx_p = { workspace_root = cs_root }
+    local code_search_p = require("utils.code_search")
+    if code_search_p.cindex_uefilter_exe() then
+      local abs_list = ctx.paths.cache .. "/csearch_filelist.txt"
+      local fout = io.open(abs_list, "w")
+      if fout then
+        for _, rel in ipairs(workspace_all) do
+          fout:write(cs_root, "/", rel, "\n")
+        end
+        fout:close()
+        local cs_done, cs_ok, cs_err = false, false, nil
+        code_search_p.build_index(cs_ctx_p, abs_list, function(ok_cs, err_cs, _st)
+          cs_ok, cs_err = ok_cs, err_cs
+          cs_done = true
+        end)
+        vim.wait(180000, function() return cs_done end, 100)
+        pcall(os.remove, abs_list)
+        if not cs_ok then
+          vim.notify("UEPrepare: csearch index failed: " .. (cs_err or "timeout"),
+            vim.log.levels.WARN, { title = "UE" })
+        end
+      end
+    else
+      vim.notify(
+        "UEPrepare: cindex-uefilter not found — grep will use slow rg fallback.\n" ..
+        "  Build it via: cd " .. vim.fn.stdpath("config") .. "/tools/cindex-uefilter && go install ./...",
+        vim.log.levels.WARN, { title = "UE" })
+    end
+  end
+
   local summary = prepare_summary(ctx, compile_path, {
     project_count = #project_code,
     engine_count = #engine_code,
@@ -5965,6 +6070,51 @@ local function prepare_async()
     INDEX_FN.schedule_index_refresh(ctx, { current = true, hot = true, full = true, current_delay_ms = 50, hot_delay_ms = 2500 })
     invalidate_status_cache()
     refresh_statusline()
+
+    -- Build csearch index if missing or stale (older than workspace_all).
+    -- Async; doesn't block the fast-path return.
+    local code_search_fp = require("utils.code_search")
+    local cs_ctx_fp = { workspace_root = root }
+    local need_index = true
+    do
+      local idx_path = code_search_fp.index_path(cs_ctx_fp)
+      local list_path = ctx.paths.workspace_all_list
+      local idx_stat = idx_path and vim.loop.fs_stat(idx_path) or nil
+      local list_stat = list_path and vim.loop.fs_stat(list_path) or nil
+      if idx_stat and idx_stat.size > 1024 and list_stat then
+        local idx_mt  = idx_stat.mtime  and idx_stat.mtime.sec  or 0
+        local list_mt = list_stat.mtime and list_stat.mtime.sec or 0
+        if idx_mt >= list_mt then need_index = false end
+      end
+    end
+    if need_index and code_search_fp.cindex_uefilter_exe() then
+      local abs_list = ctx.paths.cache .. "/csearch_filelist.txt"
+      local fout = io.open(abs_list, "w")
+      if fout then
+        for line in io.lines(ctx.paths.workspace_all_list) do
+          local trimmed = line:gsub("\r$", "")
+          if trimmed ~= "" then
+            fout:write(root, "/", trimmed, "\n")
+          end
+        end
+        fout:close()
+        vim.notify("UEPrepare: rebuilding csearch index in background...",
+          vim.log.levels.INFO, { title = "UE", timeout = 3000, replace = "ue.csearch.build" })
+        code_search_fp.build_index(cs_ctx_fp, abs_list, function(ok_cs, err_cs, stats)
+          pcall(os.remove, abs_list)
+          if ok_cs then
+            local mb = math.floor((stats.index_size or 0) / 1024 / 1024)
+            vim.notify(("✓ csearch index rebuilt: %d MB in %.1fs"):format(
+              mb, (stats.ms or 0) / 1000),
+              vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
+          else
+            vim.notify("UEPrepare: csearch rebuild failed: " .. (err_cs or "unknown"),
+              vim.log.levels.WARN, { title = "UE", replace = "ue.csearch.build" })
+          end
+        end)
+      end
+    end
+
     vim.notify(prepare_summary(ctx, compile_path, { reused_cache = true }))
     return
   end
@@ -6161,35 +6311,94 @@ local function prepare_async()
 
           end_phase("gtags")
 
-          -- ── Finalize ─────────────────────────────────────────────
-          clear_index_dirty(ctx)
-          invalidate_status_cache()
-          refresh_statusline()
-          set_prepare_running(false)
+          -- ── Phase 4: csearch index (sub-second grep) ─────────────
+          -- We feed cindex-uefilter the same workspace_all list GTAGS used
+          -- (with absolute paths). cindex-uefilter is a small fork of
+          -- google/codesearch's cindex that adds a -files-from flag,
+          -- letting us index exactly our pre-filtered file set instead
+          -- of walking the dir tree (which would suck in graphify-out
+          -- caches, Intermediate, etc.). See tools/cindex-uefilter/.
+          start_phase()
+          update("building csearch index...", 85)
 
-          -- Persist timings for future ETA estimation
-          timings.total = elapsed_s()
-          update_state_field(ctx.engine_root, "prepare_timings", timings)
+          local code_search = require("utils.code_search")
+          local function finalize_after_csearch()
+            end_phase("csearch")
 
-          local summary = prepare_summary(ctx, ok_compile and compile_path or nil, {
-            project_count = #project_code,
-            engine_count = #engine_code,
-            workspace_count = #workspace_code,
-            workspace_all_count = #workspace_all,
-          })
-          summary = summary .. ("\nElapsed: %ds (scan:%ds lists:%ds gtags:%ds cc:%ds)"):format(
-            timings.total,
-            math.floor(timings.scan or 0),
-            math.floor(timings.lists or 0),
-            math.floor(timings.gtags or 0),
-            math.floor(timings.compile_commands or 0))
+            -- ── Finalize ───────────────────────────────────────────
+            clear_index_dirty(ctx)
+            invalidate_status_cache()
+            refresh_statusline()
+            set_prepare_running(false)
 
-          update("done", 100)
-          if handle then
-            handle.message = ("done in %ds"):format(timings.total)
-            handle:finish()
+            -- Persist timings for future ETA estimation
+            timings.total = elapsed_s()
+            update_state_field(ctx.engine_root, "prepare_timings", timings)
+
+            local summary = prepare_summary(ctx, ok_compile and compile_path or nil, {
+              project_count = #project_code,
+              engine_count = #engine_code,
+              workspace_count = #workspace_code,
+              workspace_all_count = #workspace_all,
+            })
+            summary = summary .. ("\nElapsed: %ds (scan:%ds lists:%ds gtags:%ds cc:%ds csearch:%ds)"):format(
+              timings.total,
+              math.floor(timings.scan or 0),
+              math.floor(timings.lists or 0),
+              math.floor(timings.gtags or 0),
+              math.floor(timings.compile_commands or 0),
+              math.floor(timings.csearch or 0))
+
+            update("done", 100)
+            if handle then
+              handle.message = ("done in %ds"):format(timings.total)
+              handle:finish()
+            end
+            vim.notify(summary)
           end
-          vim.notify(summary)
+
+          -- If cindex-uefilter is missing, skip silently (with a one-time
+          -- hint). The grep picker will fall back to rg-batched mode.
+          if not code_search.cindex_uefilter_exe() then
+            vim.notify(
+              "UEPrepare: cindex-uefilter not found — grep will use slow rg fallback.\n" ..
+              "  Build it via: cd " .. vim.fn.stdpath("config") .. "/tools/cindex-uefilter && go install ./...",
+              vim.log.levels.WARN, { title = "UE" })
+            finalize_after_csearch()
+            return
+          end
+
+          -- Materialize an absolute-path tmpfile from workspace_all (which
+          -- holds workspace-root-relative paths).
+          local cs_root = workspace_root(ctx)
+          local cs_ctx = { workspace_root = cs_root }
+          local abs_list = ctx.paths.cache .. "/csearch_filelist.txt"
+          local fout = io.open(abs_list, "w")
+          if not fout then
+            vim.notify("UEPrepare: failed to write " .. abs_list, vim.log.levels.WARN, { title = "UE" })
+            finalize_after_csearch()
+            return
+          end
+          for _, rel in ipairs(workspace_all) do
+            fout:write(cs_root, "/", rel, "\n")
+          end
+          fout:close()
+
+          code_search.build_index(cs_ctx, abs_list, function(ok_cs, err_cs, stats)
+            -- Tidy up the temp filelist regardless of outcome.
+            pcall(os.remove, abs_list)
+
+            if ok_cs then
+              local mb = math.floor((stats.index_size or 0) / 1024 / 1024)
+              vim.notify(("✓ csearch index: %d MB in %.1fs"):format(
+                mb, (stats.ms or 0) / 1000),
+                vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
+            else
+              vim.notify("UEPrepare: csearch index failed: " .. (err_cs or "unknown"),
+                vim.log.levels.WARN, { title = "UE" })
+            end
+            finalize_after_csearch()
+          end)
         end)
       end,
     })

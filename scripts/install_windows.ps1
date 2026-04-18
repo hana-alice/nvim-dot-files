@@ -143,6 +143,7 @@ $ScoopPackages = [ordered]@{
   'less'      = 'less'
   '7zip'      = '7zip'
   'gtags'     = 'global'      # GNU GLOBAL — provides gtags
+  'go'        = 'go'          # for building cindex-uefilter (csearch fork)
 }
 
 if (-not $SkipScoop) {
@@ -258,6 +259,40 @@ try {
   Write-OK "treesitter parsers installed"
 } catch {
   Write-Warn2 "treesitter install had issues: $_"
+}
+
+# ---------------------------------------------------------------------------
+# Step 7: Build cindex-uefilter (csearch fork — sub-second :UEPrepare grep)
+# ---------------------------------------------------------------------------
+
+Write-Step "Step 7: cindex-uefilter (csearch fork for sub-second grep)"
+$cindexUe = "$env:USERPROFILE\go\bin\cindex-uefilter.exe"
+if (Test-Path $cindexUe) {
+  Write-Skip "cindex-uefilter already built at $cindexUe"
+} elseif (Test-CommandExists 'go') {
+  $toolDir = Join-Path $NvimConfigRoot 'tools\cindex-uefilter'
+  if (-not (Test-Path $toolDir)) {
+    Write-Warn2 "tools/cindex-uefilter not found at $toolDir — skipping"
+  } else {
+    Write-Information "  building from $toolDir"
+    Push-Location $toolDir
+    try {
+      $env:GOPROXY = 'https://goproxy.cn,direct'
+      $env:GOSUMDB = 'off'
+      Invoke-Native go @('install','./...')
+      # Also ensure plain csearch is on PATH (used at query time).
+      if (-not (Test-Path "$env:USERPROFILE\go\bin\csearch.exe")) {
+        Invoke-Native go @('install','github.com/google/codesearch/cmd/csearch@latest')
+      }
+      Write-OK "cindex-uefilter built; csearch installed"
+    } catch {
+      Write-Warn2 "cindex-uefilter build failed: $_"
+    } finally {
+      Pop-Location
+    }
+  }
+} else {
+  Write-Warn2 "go not on PATH — skipping cindex-uefilter build (sub-second grep will be unavailable)"
 }
 
 # ---------------------------------------------------------------------------

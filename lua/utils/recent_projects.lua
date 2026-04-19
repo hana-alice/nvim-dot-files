@@ -140,8 +140,15 @@ function M.setup()
       vim.schedule(function()
         record_current()
         -- One-shot bootstrap on first launch when our state is empty.
+        -- DEFERRED off the startup critical path: the original 30-oldfile
+        -- walk does ~1800 sync stat calls on cold NTFS (Defender-scanned),
+        -- which freezes the dashboard for several seconds if it runs
+        -- during VimEnter. defer_fn(500) runs after the dashboard is
+        -- painted and the user can already see the UI.
         if #M.list() < 5 then
-          M.bootstrap_from_oldfiles(30)
+          vim.defer_fn(function()
+            M.bootstrap_from_oldfiles(30)
+          end, 500)
         end
       end)
     end,

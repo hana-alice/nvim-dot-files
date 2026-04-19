@@ -132,3 +132,19 @@ if is_windows then
     end,
   })
 end
+
+-- ── Recent projects MRU tracker ──────────────────────────────────────
+-- Maintains lua/utils/recent_projects.lua state file via DirChanged /
+-- VimEnter / BufReadPost autocmds. Without this, the snacks projects
+-- picker workaround sees <5 entries and synchronously walks oldfiles
+-- (60+ stat calls per file × 30 files) on the main loop → ~5s freeze
+-- when pressing `p` in the dashboard on cold Neovide.
+require("utils.recent_projects").setup()
+
+-- ── Snacks picker subsystem warmup ───────────────────────────────────
+-- Pre-load the heavy picker modules during the window where the user
+-- is reading the dashboard. Without this, the FIRST press of any
+-- picker key (dashboard p/f/g/r, <leader>;, <leader>ff) blocks for
+-- ~2-4s on cold Neovide while snacks lazy-loads its picker subsystem
+-- + creates 3 floating windows on the main loop.
+require("workarounds.snacks.picker_first_open_freeze").apply()

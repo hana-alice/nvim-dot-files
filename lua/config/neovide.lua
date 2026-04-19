@@ -30,7 +30,7 @@ function M.setup()
   vim.g.neovide_theme = "dark"
   vim.g.neovide_remember_window_size = true
   vim.g.neovide_confirm_quit = true
-  vim.g.neovide_refresh_rate_idle = 5
+  vim.g.neovide_refresh_rate_idle = 30
 
   vim.g.neovide_position_animation_length = 0.08
   vim.g.neovide_scroll_animation_length = 0.12

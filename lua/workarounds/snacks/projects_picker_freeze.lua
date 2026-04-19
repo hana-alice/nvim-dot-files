@@ -33,13 +33,13 @@ function M.apply(opts)
         local list = {}
         if ok then
           list = rp.list()
-          if #list < 5 then
-            -- Lazy bootstrap on first picker open: synchronously walk
-            -- top-30 oldfiles to seed the project list.
-            pcall(rp.bootstrap_from_oldfiles, 30)
-            list = rp.list()
-          end
         end
+        -- DO NOT bootstrap synchronously here. Bootstrap is a 30-oldfile
+        -- × 60-stat NTFS walk that freezes the picker for ~5s on cold
+        -- Neovide. utils.recent_projects.setup() (called from
+        -- config/autocmds.lua) handles bootstrap async via defer_fn(500)
+        -- on VimEnter. If the list is short on first ever launch, the
+        -- picker will just show fewer entries — next open will be full.
         ---@async
         return function(cb)
           for _, dir in ipairs(list) do

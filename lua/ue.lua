@@ -4729,6 +4729,63 @@ function M.cached_grep(opts)
 
   local title_default = ("Grep All Code [%s]"):format(backend_label)
 
+  -- ─ Helpers shared by both csearch and rg paths ──────────────────────
+  -- Wrap a `cb(item)` so that whenever a new file appears in the stream
+  -- (compared to the previous item), we first emit a header item for that
+  -- file. csearch outputs in file-grouped order; rg --with-filename does
+  -- too — so this gives a cheap "tree-like" grouping without buffering.
+  -- The header item carries _is_grep_header=true so the format function
+  -- and confirm hook can treat it specially.
+  --
+  -- DESIGN NOTE
+  -- This is intentionally NOT a real recursive directory tree. Doing that
+  -- would require buffering all matches, sorting by path, and emitting
+  -- intermediate dir nodes — losing the live-streaming UX. The two-level
+  -- grouping (file header + indented hit lines) covers ~90% of the value
+  -- ("which files contain this") at a fraction of the complexity.
+  local function make_grouping_cb(cb)
+    local last_file = nil
+    return function(item)
+      if item and item.file and item.file ~= last_file then
+        last_file = item.file
+        cb({
+          text = item.file,
+          file = item.file,
+          pos  = { 1, 0 },
+          _is_grep_header = true,
+        })
+      end
+      cb(item)
+    end
+  end
+
+  -- Format: file headers get a bold prefix + path; hit lines get a thin
+  -- left margin so they visually nest under the preceding header.
+  local function format_grouped(item, picker)
+    if item._is_grep_header then
+      return {
+        { "▼ ", "SnacksPickerDir" },
+        { tostring(item.file or item.text or "?"), "SnacksPickerFile" },
+      }
+    end
+    -- Default grep format, but indented two spaces.
+    local default = require("snacks.picker.format").file(item, picker)
+    table.insert(default, 1, { "  ", "SnacksPickerDir" })
+    return default
+  end
+
+  -- Confirm: header → jump to file line 1; hit → default.
+  local function confirm_grouped(picker, item)
+    if item and item._is_grep_header then
+      picker:close()
+      vim.schedule(function()
+        vim.cmd("edit " .. vim.fn.fnameescape(item.file))
+      end)
+      return
+    end
+    return require("snacks.picker.actions").jump(picker, item)
+  end
+
   -- ── csearch fast path ────────────────────────────────────────────────
   if has_index then
     snacks.picker.pick({
@@ -4738,12 +4795,17 @@ function M.cached_grep(opts)
       live = true,
       need_search = true,
       layout = { preset = "telescope" },
+      format = format_grouped,
+      confirm = confirm_grouped,
       finder = function(_picker_opts, finder_ctx)
         local pattern = finder_ctx.filter.search
         if not pattern or pattern == "" then
           return function() end
         end
         return function(cb)
+          -- Wrap cb to inject file-header items between file groups.
+          cb = make_grouping_cb(cb)
+
           -- snacks finder protocol: this function MUST block until ALL
           -- callbacks have been emitted, otherwise snacks marks the finder
           -- "done" and any later cb call trips its "yielded after done"
@@ -4874,6 +4936,8 @@ function M.cached_grep(opts)
     live = true,
     need_search = true,
     layout = { preset = "telescope" },
+    format = format_grouped,
+    confirm = confirm_grouped,
     finder = function(picker_opts, finder_ctx)
       local pattern = finder_ctx.filter.search
       if not pattern or pattern == "" then
@@ -4886,6 +4950,9 @@ function M.cached_grep(opts)
       end
 
       return function(cb)
+        -- Wrap cb to inject file-header items between file groups.
+        cb = make_grouping_cb(cb)
+
         local base_args = {
           "--color=never",
           "--no-heading",

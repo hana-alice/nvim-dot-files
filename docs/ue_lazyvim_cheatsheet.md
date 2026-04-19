@@ -243,7 +243,8 @@ Reading large files:
 | `<leader>sX`     | Grep case-sensitive                     |
 | `<leader>sH`     | Grep history                            |
 | `<leader>sC`     | Clear grep/files history                |
-| `<leader>sR`     | Resume last picker                      |
+| `<leader>sR`     | Resume last picker (any kind)           |
+| `<leader>s/`     | Resume last grep (works after `<C-q>` pin) |
 | `<leader>sk`     | Keymaps                                 |
 | `<leader>sh`     | Help tags                               |
 | `<leader>sm`     | Marks                                   |

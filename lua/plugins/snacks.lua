@@ -412,6 +412,15 @@ return {
       { "<leader>sg", ue_grep, desc = "Grep Workspace Code (C++/Shader)" },
       { "<leader>sG", ue_grep_all, desc = "Grep Workspace All Files" },
       { "<leader>sH", ue_grep_history, desc = "Search: Grep History" },
+      -- Resume the last grep picker, even if it was closed via <C-q> pin.
+      -- snacks.picker.resume keys state by source name. Our pickers use
+      -- "ue_grep_csearch" / "ue_grep_rg" sources; we try csearch first
+      -- then fall back to rg, mirroring the live decision in cached_grep.
+      { "<leader>s/", function()
+        local picker = require("snacks").picker
+        local ok = pcall(picker.resume, "ue_grep_csearch")
+        if not ok then pcall(picker.resume, "ue_grep_rg") end
+      end, desc = "Resume Last Grep (incl. after <C-q> pin)" },
       { "<leader>sC", ue_clear_picker_history, desc = "Search: Clear Picker History" },
       -- Find files
       { "<leader><space>", ue_workspace_all_files, desc = "Find Workspace All Files" },

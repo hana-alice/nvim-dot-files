@@ -4732,6 +4732,7 @@ function M.cached_grep(opts)
   -- ── csearch fast path ────────────────────────────────────────────────
   if has_index then
     snacks.picker.pick({
+      source = "ue_grep_csearch",
       title = opts.title or title_default,
       search = opts.search or "",
       live = true,
@@ -4867,6 +4868,7 @@ function M.cached_grep(opts)
   end
 
   snacks.picker.pick({
+    source = "ue_grep_rg",
     title = opts.title or title_default,
     search = opts.search or "",
     live = true,

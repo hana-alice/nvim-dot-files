@@ -4854,6 +4854,34 @@ function M.cached_grep(opts)
     return require("snacks.picker.actions").jump(picker, item, action or { cmd = "edit" })
   end
 
+  -- ─ Diagnostic trace (opt-in via vim.g.ue_grep_trace) ────────────────
+  -- When enabled, write per-event lines to a stable log path so we can
+  -- post-mortem WHY the picker felt laggy on a real human typing session.
+  -- Zero overhead when disabled (single boolean check per event).
+  --
+  -- Toggle: :UEGrepTraceToggle  (or set vim.g.ue_grep_trace = true)
+  -- Log:    vim.fn.stdpath("state") .. "/ue_grep_trace.log"
+  local trace_enabled = vim.g.ue_grep_trace == true
+  local trace_log_path = vim.fn.stdpath("state") .. "/ue_grep_trace.log"
+  local trace_t0 = vim.loop.hrtime()
+  local function trace(fmt, ...)
+    if not trace_enabled then return end
+    local ms = (vim.loop.hrtime() - trace_t0) / 1e6
+    local line = string.format("[+%8.1fms] " .. fmt, ms, ...)
+    local f = io.open(trace_log_path, "a")
+    if f then f:write(line .. "\n"); f:close() end
+  end
+  if trace_enabled then
+    -- Truncate at session start (first cached_grep call after toggle on).
+    local f = io.open(trace_log_path, "w")
+    if f then
+      f:write(string.format("=== UE grep trace  %s  backend=%s  grouping=%s ===\n",
+        os.date("%Y-%m-%d %H:%M:%S"), backend_label,
+        tostring(grouping_enabled)))
+      f:close()
+    end
+  end
+
   -- ── csearch fast path ────────────────────────────────────────────────
   if has_index then
     snacks.picker.pick({
@@ -4873,6 +4901,7 @@ function M.cached_grep(opts)
         if not pattern or pattern == "" then
           return function() end
         end
+        trace("finder START pattern=%q", pattern)
         return function(cb)
           -- Wrap cb to inject file-header items between file groups.
           if grouping_enabled then
@@ -4888,6 +4917,8 @@ function M.cached_grep(opts)
           -- aborts us (sleep returns early on abort).
           local done = false
           local pending = {}  -- items waiting to be drained on the main loop
+          local items_received = 0
+          local items_emitted = 0
           local stop = code_search.stream(cs_ctx, pattern, {
             code_only   = opts.code_only,
             smart_case  = true,
@@ -4901,9 +4932,12 @@ function M.cached_grep(opts)
                 pos  = { lnum, math.max(0, col - 1) },
                 file = file,
               }
+              items_received = items_received + 1
             end,
             on_done = function(code, err)
               done = true
+              trace("csearch DONE pat=%q recv=%d code=%s err=%s",
+                pattern, items_received, tostring(code), tostring(err and err:sub(1,80)))
               if err and code ~= 0 then
                 vim.schedule(function()
                   vim.notify("UE grep [csearch]: " .. err, vim.log.levels.WARN, { title = "UE" })
@@ -4911,6 +4945,68 @@ function M.cached_grep(opts)
               end
             end,
           })
+
+          -- Watchdog timer: snacks aborts our async task by killing the
+          -- coroutine — when that happens our drain loop never executes
+          -- another iteration so its abort-detection branch never fires
+          -- and stop() never runs. Result: csearch processes accumulate.
+          --
+          -- Fix: an independent vim.loop timer outside the coroutine.
+          -- It checks the picker's filter every 30ms and kills csearch
+          -- the moment we detect the user moved on. This survives
+          -- coroutine death.
+          local watchdog_killed = false
+          local watchdog
+          local ok_timer, timer = pcall(vim.loop.new_timer)
+          if ok_timer and timer then
+            watchdog = timer
+            trace("WATCHDOG start pat=%q", pattern)
+            local ok_start = pcall(function()
+              watchdog:start(30, 30, vim.schedule_wrap(function()
+                -- Snapshot reference; timer callback may fire after
+                -- watchdog has been nilled by the outer cleanup path.
+                local t = watchdog
+                if watchdog_killed or done then
+                  if t and not t:is_closing() then
+                    pcall(function() t:stop() end)
+                    pcall(function() t:close() end)
+                  end
+                  return
+                end
+                -- IMPORTANT: do NOT compare against finder_ctx.filter —
+                -- snacks captures the filter REFERENCE at finder start
+                -- and never updates it for this finder. Compare against
+                -- the LIVE picker input value instead.
+                local cur = nil
+                local p = finder_ctx and finder_ctx.picker
+                if p and p.input and p.input.filter then
+                  cur = p.input.filter.search
+                end
+                if cur ~= nil and cur ~= pattern then
+                  watchdog_killed = true
+                  trace("WATCHDOG kill pat=%q new=%q recv=%d",
+                    pattern, tostring(cur), items_received)
+                  pcall(stop)
+                  if t and not t:is_closing() then
+                    pcall(function() t:stop() end)
+                    pcall(function() t:close() end)
+                  end
+                end
+              end))
+            end)
+            if not ok_start then
+              trace("WATCHDOG start FAILED pat=%q", pattern)
+            end
+          else
+            trace("WATCHDOG new_timer FAILED pat=%q", pattern)
+          end
+          local function kill_watchdog()
+            watchdog_killed = true
+            if watchdog and not watchdog:is_closing() then
+              pcall(function() watchdog:stop() end)
+              pcall(function() watchdog:close() end)
+            end
+          end
 
           -- Drain loop: sleep in short slices so we can flush pending
           -- items frequently AND react to picker aborts (filter.search
@@ -4932,15 +5028,25 @@ function M.cached_grep(opts)
           local max_total_ms = 30000  -- absolute upper bound, ~30s
           local elapsed = 0
           local read_idx = 1
+          local tick_count = 0
+          local longest_drain_ms = 0
           while not done and elapsed < max_total_ms do
-            -- Abort detection: if the picker filter changed, snacks will
-            -- abort our async task; ctx.async:sleep returns early. We
-            -- check the running flag via filter identity. Kill the
-            -- subprocess IMMEDIATELY (before break) so it stops producing
-            -- items in the brief window before our outer cleanup runs —
-            -- otherwise on slow grep workloads the dead csearch keeps
-            -- writing stdout for tens of ms while we're already gone.
-            if finder_ctx.filter.search ~= pattern then
+            tick_count = tick_count + 1
+            -- Abort detection: compare against LIVE picker input, not the
+            -- finder_ctx.filter snapshot (snacks captures the filter at
+            -- finder start and never updates it for this finder, so
+            -- finder_ctx.filter.search would always equal `pattern`).
+            local cur_search = nil
+            do
+              local p = finder_ctx and finder_ctx.picker
+              if p and p.input and p.input.filter then
+                cur_search = p.input.filter.search
+              end
+            end
+            if cur_search ~= nil and cur_search ~= pattern then
+              trace("ABORT pat=%q new=%q tick=%d elapsed=%dms recv=%d emit=%d pending=%d",
+                pattern, tostring(cur_search), tick_count, elapsed,
+                items_received, items_emitted, #pending - read_idx + 1)
               pcall(stop)
               break
             end
@@ -4950,9 +5056,17 @@ function M.cached_grep(opts)
             local n = #pending
             if read_idx <= n then
               local stop_at = math.min(n, read_idx + CB_BUDGET - 1)
+              local drain_t0 = vim.loop.hrtime()
               for i = read_idx, stop_at do
                 cb(pending[i])
                 pending[i] = nil
+                items_emitted = items_emitted + 1
+              end
+              local drain_ms = (vim.loop.hrtime() - drain_t0) / 1e6
+              if drain_ms > longest_drain_ms then longest_drain_ms = drain_ms end
+              if drain_ms > 20 then
+                trace("SLOW DRAIN tick=%d elapsed=%dms emitted=%d in %.1fms (budget=%d, queue_len=%d)",
+                  tick_count, elapsed, stop_at - read_idx + 1, drain_ms, CB_BUDGET, n - stop_at)
               end
               read_idx = stop_at + 1
             end
@@ -4965,20 +5079,44 @@ function M.cached_grep(opts)
           -- marked our finder done and any further cb trips the
           -- "yielded after done" bug-trap. Just kill the subprocess and
           -- discard any pending items.
-          local aborted = (finder_ctx.filter.search ~= pattern)
+          -- Detect WHY we exited the loop. Use LIVE picker input (not
+          -- finder_ctx.filter snapshot — same reason as drain abort).
+          local final_cur = nil
+          do
+            local p = finder_ctx and finder_ctx.picker
+            if p and p.input and p.input.filter then
+              final_cur = p.input.filter.search
+            end
+          end
+          local aborted = (final_cur ~= nil and final_cur ~= pattern)
 
           if not aborted then
             -- Final drain after done (still safe — we haven't returned).
             -- Resume from read_idx so we don't double-cb earlier items.
+            local final_drain_t0 = vim.loop.hrtime()
+            local final_count = 0
             for i = read_idx, #pending do
               cb(pending[i])
+              final_count = final_count + 1
             end
+            local final_drain_ms = (vim.loop.hrtime() - final_drain_t0) / 1e6
+            trace("FINAL DRAIN pat=%q count=%d in %.1fms", pattern, final_count, final_drain_ms)
           end
 
           -- Stop the subprocess if it's still alive (timeout / abort path).
           if not done then
-            stop()
+            pcall(stop)
           end
+
+          -- Watchdog cleanup: normal completion path. Abort path also
+          -- kills it from inside the timer callback once it detects the
+          -- abort; this is the catch-all for the "loop exited because
+          -- done=true" path.
+          kill_watchdog()
+
+          trace("finder END pat=%q aborted=%s ticks=%d elapsed=%dms recv=%d emit=%d longest_drain=%.1fms",
+            pattern, tostring(aborted), tick_count, elapsed,
+            items_received, items_emitted, longest_drain_ms)
         end
       end,
     })
@@ -6910,6 +7048,110 @@ function M.setup()
       vim.log.levels.INFO,
       { title = "UE", timeout = 4000 })
   end, { desc = "Toggle UE grep file-grouping + preview throttle + Tab=list_down" })
+
+  vim.api.nvim_create_user_command("UEGrepTraceToggle", function()
+    vim.g.ue_grep_trace = not (vim.g.ue_grep_trace == true)
+    local on = vim.g.ue_grep_trace
+    local path = vim.fn.stdpath("state") .. "/ue_grep_trace.log"
+
+    -- Also install a global error sink so any vim.notify(level=ERROR) or
+    -- bare lua error that triggers Windows beep gets captured. We DO NOT
+    -- override vim.notify (noice would warn about that and ding loudly);
+    -- instead we just poll :messages periodically and tee Error/E5/attempt
+    -- patterns to disk.
+    if on and not vim.g._ue_err_sink_installed then
+      vim.g._ue_err_sink_installed = true
+      local err_log = vim.fn.stdpath("state") .. "/ue_errors.log"
+      local f = io.open(err_log, "w")
+      if f then f:write("=== installed " .. os.date() .. " ===\n"); f:close() end
+      local timer = vim.loop.new_timer()
+      timer:start(500, 500, vim.schedule_wrap(function()
+        local m = vim.api.nvim_exec2("messages", { output = true }).output or ""
+        if m:find("Error") or m:find("E5") or m:find("attempt")
+           or m:find("aborted") then
+          local fp = io.open(err_log, "a")
+          if fp then
+            fp:write("[poll @" .. os.date() .. "]\n" .. m:sub(-2000) .. "\n---\n")
+            fp:close()
+          end
+          pcall(vim.cmd, "messages clear")
+        end
+      end))
+    end
+
+    vim.notify(string.format("UE grep trace: %s\nlog: %s",
+      on and "ON" or "OFF", path),
+      vim.log.levels.INFO, { title = "UE", timeout = 6000 })
+  end, { desc = "Toggle UE grep finder trace logging + error sink" })
+
+  vim.api.nvim_create_user_command("UEGrepTraceShow", function()
+    local path = vim.fn.stdpath("state") .. "/ue_grep_trace.log"
+    if vim.fn.filereadable(path) == 0 then
+      vim.notify("no trace log at " .. path, vim.log.levels.WARN, { title = "UE" })
+      return
+    end
+    -- Open trace log in a new tab so it doesn't blow away current layout.
+    vim.cmd("tabnew " .. vim.fn.fnameescape(path))
+    vim.bo.buftype = ""
+    vim.bo.buflisted = false
+    vim.cmd("normal! G")  -- jump to end (newest events)
+  end, { desc = "Open the UE grep trace log in a new tab" })
+
+  vim.api.nvim_create_user_command("UEGrepDiagDump", function()
+    -- One-shot bundle: trace + errors + tail of :messages + Snacks notifier
+    -- history into a single file the user can paste back in one go.
+    local out_path = vim.fn.stdpath("state") .. "/ue_grep_diag.txt"
+    local trace_path = vim.fn.stdpath("state") .. "/ue_grep_trace.log"
+    local err_path = vim.fn.stdpath("state") .. "/ue_errors.log"
+
+    local function read_file(p, max_bytes)
+      max_bytes = max_bytes or 50000
+      if vim.fn.filereadable(p) == 0 then return "(missing: " .. p .. ")" end
+      local fp = io.open(p, "r"); if not fp then return "(open failed)" end
+      local content = fp:read("*a") or ""; fp:close()
+      if #content > max_bytes then
+        content = "...[truncated, showing last " .. max_bytes .. " bytes]...\n"
+                  .. content:sub(-max_bytes)
+      end
+      return content
+    end
+
+    local parts = {}
+    table.insert(parts, "=== UEGrepDiagDump  " .. os.date("%Y-%m-%d %H:%M:%S") .. " ===")
+    table.insert(parts, "trace_enabled=" .. tostring(vim.g.ue_grep_trace == true))
+    table.insert(parts, "grouping_enabled=" .. tostring(vim.g.ue_grep_grouping_enabled ~= false))
+    table.insert(parts, "err_sink_installed=" .. tostring(vim.g._ue_err_sink_installed == true))
+
+    table.insert(parts, "\n========== TRACE  (" .. trace_path .. ") ==========")
+    table.insert(parts, read_file(trace_path))
+
+    table.insert(parts, "\n========== ERRORS  (" .. err_path .. ") ==========")
+    table.insert(parts, read_file(err_path))
+
+    table.insert(parts, "\n========== :messages tail ==========")
+    local m = vim.api.nvim_exec2("messages", { output = true }).output or ""
+    table.insert(parts, m:sub(-3000))
+
+    if Snacks and Snacks.notifier and Snacks.notifier.get_history then
+      table.insert(parts, "\n========== Snacks notifier (errors+warns last 30) ==========")
+      local hist = Snacks.notifier.get_history() or {}
+      local kept = {}
+      for _, n in ipairs(hist) do
+        if n.level == "error" or n.level == "warn" then table.insert(kept, n) end
+      end
+      for i = math.max(1, #kept - 29), #kept do
+        local n = kept[i]
+        table.insert(parts, string.format("[%s] %s",
+          n.level, tostring(n.msg):sub(1, 400)))
+      end
+    end
+
+    local body = table.concat(parts, "\n")
+    local fp = io.open(out_path, "w")
+    if fp then fp:write(body); fp:close() end
+    vim.notify("UE grep diag → " .. out_path,
+      vim.log.levels.INFO, { title = "UE", timeout = 5000 })
+  end, { desc = "Bundle UE grep trace + errors + messages into one diag file" })
   vim.api.nvim_create_user_command("UEGenerateFromRSP", prepare_async, {})
   vim.api.nvim_create_user_command("UEBuild", build_android, {})
   vim.api.nvim_create_user_command("UEBuildAndroid", build_android, {})

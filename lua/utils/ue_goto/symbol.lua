@@ -442,6 +442,153 @@ local function shape_field_expression(node, template_params, bufnr)
 end
 
 -- ---------------------------------------------------------------------------
+-- is_at_definition_at_cursor() — public entry point
+-- ---------------------------------------------------------------------------
+--
+-- True when the cursor IS the definition site of the symbol it sits on.
+-- Goto-definition from this position is a no-op — the LSP would either jump
+-- to the same line (best case) or to ANOTHER definition with the same name
+-- (overload, friend decl, forward decl in header). Either way we don't want
+-- to spin clangd up for 30s and risk landing on a sibling.
+--
+-- Detection rule (pure syntax via TS, no regex):
+--   cursor's leaf identifier is the `name`/`declarator` field of one of
+--   these C++ definition nodes:
+--     class_specifier       struct_specifier       union_specifier
+--     enum_specifier        enumerator             namespace_definition
+--     function_definition   field_declaration (function decl WITH body)
+--     type_definition (typedef)                    alias_declaration
+--     template_type_parameter / parameter_declaration → too noisy, skip
+--
+-- Returns: bail (bool), kind (string for the toast), name (string)
+local DEFINITION_KIND_BY_NODE = {
+  class_specifier      = "class",
+  struct_specifier     = "struct",
+  union_specifier      = "union",
+  enum_specifier       = "enum",
+  enumerator           = "enumerator",
+  namespace_definition = "namespace",
+  function_definition  = "function",
+  type_definition      = "typedef",
+  alias_declaration    = "type alias",
+}
+
+-- Return true if `id_node` is the "name" of `def_node`. We resolve "name"
+-- via the grammar's named fields for each definition kind, with a fallback
+-- of structural identity (id_node IS the field's first-result node).
+local function id_is_name_of_definition(id_node, def_node)
+  local def_type = def_node:type()
+  -- Field accessors per node type:
+  --   class/struct/union/enum/namespace_definition/alias_declaration → "name"
+  --   function_definition/type_definition → "declarator"  (which itself
+  --     contains the actual identifier, possibly wrapped in qualified_id)
+  --   enumerator → "name"
+  local field_name
+  if def_type == "function_definition" or def_type == "type_definition" then
+    field_name = "declarator"
+  else
+    field_name = "name"
+  end
+
+  local fld = def_node:field(field_name)
+  if not fld or not fld[1] then return false end
+  local target = fld[1]
+
+  -- For function_definition/type_definition we may need to dig into the
+  -- declarator to reach the bare identifier. Walk down through
+  -- function_declarator / pointer_declarator / reference_declarator etc.
+  local function find_id_in_declarator(d)
+    if not d then return nil end
+    local t = d:type()
+    if t == "identifier" or t == "field_identifier" or t == "type_identifier" then
+      return d
+    end
+    -- qualified_identifier: take its rightmost name field
+    if t == "qualified_identifier" then
+      local nm = d:field("name")
+      if nm and nm[1] then return find_id_in_declarator(nm[1]) end
+    end
+    -- function_declarator / pointer_declarator / reference_declarator /
+    -- parenthesized_declarator / array_declarator / init_declarator
+    --   all expose the inner declarator via "declarator" field.
+    local inner = d:field("declarator")
+    if inner and inner[1] then
+      return find_id_in_declarator(inner[1])
+    end
+    -- destructor_name / operator_name / template_function — treat as name
+    if t == "destructor_name" or t == "operator_name" or t == "template_function" then
+      return d
+    end
+    return nil
+  end
+
+  if def_type == "function_definition" or def_type == "type_definition" then
+    target = find_id_in_declarator(target) or target
+  elseif def_type == "alias_declaration" then
+    -- alias_declaration "name" field IS already a type_identifier; nothing
+    -- to dig.
+  end
+
+  if not target then return false end
+
+  -- Compare by range — same start/end means same node.
+  local a1, a2, a3, a4 = target:range()
+  local b1, b2, b3, b4 = id_node:range()
+  return a1 == b1 and a2 == b2 and a3 == b3 and a4 == b4
+end
+
+function M.is_at_definition_at_cursor()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local ok_parser, parser = pcall(vim.treesitter.get_parser, bufnr, "cpp")
+  if not ok_parser or not parser then return false end
+  local trees = parser:parse()
+  if not trees or not trees[1] then return false end
+
+  local row, col = unpack(vim.api.nvim_win_get_cursor(0))
+  row = row - 1
+  local node = trees[1]:root():descendant_for_range(row, col, row, col)
+  if not node then return false end
+
+  -- Only consider leaf identifier-ish nodes — bail-out logic is tied to
+  -- "cursor sits on the symbol itself".
+  local nt = node:type()
+  if nt ~= "identifier"
+     and nt ~= "field_identifier"
+     and nt ~= "type_identifier"
+     and nt ~= "namespace_identifier" then
+    return false
+  end
+
+  -- Walk up at most a few levels looking for an enclosing definition node.
+  -- We don't walk arbitrarily deep — definitions wrap their name within
+  -- 1-4 ancestor steps in practice (class/struct/enum: 1; function via
+  -- declarators: 2-4).
+  local p = node:parent()
+  local hops = 0
+  while p and hops < 6 do
+    local pt = p:type()
+    local kind = DEFINITION_KIND_BY_NODE[pt]
+    if kind then
+      if id_is_name_of_definition(node, p) then
+        local name = vim.treesitter.get_node_text(node, bufnr)
+        return true, kind, name
+      end
+      -- Found a definition node but cursor isn't its name field
+      -- (e.g. cursor on base class identifier in class_specifier's
+      -- base_class_clause). Don't bail — this is a use site.
+      return false
+    end
+    -- Stop walking once we leave the local declarator chain.
+    if pt == "translation_unit" or pt == "compound_statement" then
+      return false
+    end
+    p = p:parent()
+    hops = hops + 1
+  end
+  return false
+end
+
+-- ---------------------------------------------------------------------------
 -- is_dependent_at_cursor() — public entry point
 -- ---------------------------------------------------------------------------
 

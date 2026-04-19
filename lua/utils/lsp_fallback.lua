@@ -181,7 +181,22 @@ function M.definition()
     sym or "", receiver or "",
     vim.fn.fnamemodify(ref_file, ":t"), ref_line)
 
-  -- Early bail: if the cursor sits inside a qualified-name chain rooted at
+  -- Early bail #1: cursor IS the definition site of the symbol it sits on
+  -- (e.g. cursor on `FAutoConsoleVariableRef` in `class FAutoConsoleVariableRef
+  -- : private FAutoConsoleObject`). gd here is meaningless and risks landing
+  -- on a sibling overload (forward decl, friend decl, another overload of the
+  -- same name). Don't enter the race.
+  local at_def, def_kind, def_name = symbol_mod.is_at_definition_at_cursor()
+  if at_def then
+    vim.notify(string.format(
+      "● already at %s definition of `%s`",
+      def_kind or "?", def_name or sym or "?"),
+      vim.log.levels.INFO,
+      { title = "LSP definition", timeout = 3000 })
+    return
+  end
+
+  -- Early bail #2: if the cursor sits inside a qualified-name chain rooted at
   -- a template parameter (dependent name like `TShaderClass::FParameters::
   -- FTypeInfo::GetStructMetadata`), clangd cannot resolve any segment of
   -- that chain without instantiation context. Don't waste 30s on retries —

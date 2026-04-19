@@ -149,11 +149,25 @@ local function stream_csearch(ctx, pattern, opts, callbacks)
   end
   table.insert(env, "CSEARCHINDEX=" .. M.index_path(ctx))
 
+  -- Stopped is set the moment the picker tells us to stop. From this
+  -- point on we MUST NOT call any callback — the picker has marked its
+  -- finder done and any further yield trips snacks' "yielded after done"
+  -- bug-trap (which spams the user with red Snacks Picker Finder errors).
+  local stopped = false
+
   local function safe_close()
     if closed then return end
     closed = true
+    if stdout then pcall(stdout.read_stop, stdout) end
+    if stderr then pcall(stderr.read_stop, stderr) end
     if stdout then pcall(stdout.close, stdout) end
     if stderr then pcall(stderr.close, stderr) end
+  end
+
+  local function safe_kill()
+    if handle and not closed then
+      pcall(handle.kill, handle, "sigterm")
+    end
   end
 
   -- Pre-compile a Lua plain-find pattern for column estimation.
@@ -170,18 +184,24 @@ local function stream_csearch(ctx, pattern, opts, callbacks)
   }, function(code)
     safe_close()
     if handle then handle:close() end
+    if stopped then return end
     vim.schedule(function()
+      if stopped then return end
       callbacks.on_done(code, code ~= 0 and table.concat(stderr_buf, "") or nil)
     end)
   end)
 
   if not handle then
     safe_close()
-    vim.schedule(function() callbacks.on_done(1, "failed to spawn csearch") end)
-    return function() end
+    vim.schedule(function()
+      if stopped then return end
+      callbacks.on_done(1, "failed to spawn csearch")
+    end)
+    return function() stopped = true end
   end
 
   stdout:read_start(function(_, data)
+    if stopped then return end
     if not data then return end
     leftover = leftover .. data
     while true do
@@ -189,7 +209,7 @@ local function stream_csearch(ctx, pattern, opts, callbacks)
       if not nl then break end
       local line = leftover:sub(1, nl - 1):gsub("\r$", "")
       leftover = leftover:sub(nl + 1)
-      if line ~= "" and emitted < max_count then
+      if line ~= "" and emitted < max_count and not stopped then
         -- Format: <file>:<lnum>:<text>
         -- Files on Windows can start with C:\ — find the FIRST `:` AFTER
         -- the drive letter pair.
@@ -205,6 +225,10 @@ local function stream_csearch(ctx, pattern, opts, callbacks)
             local col = (text:lower():find(needle, 1, true) or 1)
             emitted = emitted + 1
             vim.schedule(function()
+              -- Re-check inside the scheduled tick: by the time this
+              -- runs the picker may have moved on (new keystroke ⇒ new
+              -- finder ⇒ stop() called on us).
+              if stopped then return end
               callbacks.on_line(file, lnum, col, text)
             end)
           end
@@ -213,13 +237,18 @@ local function stream_csearch(ctx, pattern, opts, callbacks)
     end
   end)
   stderr:read_start(function(_, data)
+    if stopped then return end
     if data then table.insert(stderr_buf, data) end
   end)
 
   return function()
-    if handle and not closed then
-      pcall(handle.kill, handle, "sigterm")
-    end
+    -- Picker is done with us. Mark stopped FIRST so any in-flight
+    -- vim.schedule callback short-circuits before touching the picker,
+    -- THEN kill+close. Order matters: scheduled callbacks already on the
+    -- main-loop queue would otherwise still call on_line.
+    stopped = true
+    safe_kill()
+    safe_close()
   end
 end
 

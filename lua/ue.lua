@@ -4743,25 +4743,73 @@ function M.cached_grep(opts)
           return function() end
         end
         return function(cb)
+          -- snacks finder protocol: this function MUST block until ALL
+          -- callbacks have been emitted, otherwise snacks marks the finder
+          -- "done" and any later cb call trips its "yielded after done"
+          -- bug-trap. We start csearch in the background, queue items
+          -- through a buffer, and use ctx.async:sleep() to yield to the
+          -- picker until the csearch process reports done OR the picker
+          -- aborts us (sleep returns early on abort).
+          local done = false
+          local pending = {}  -- items waiting to be drained on the main loop
           local stop = code_search.stream(cs_ctx, pattern, {
             code_only   = opts.code_only,
             smart_case  = true,
             max_count   = opts.max_count or 5000,
           }, {
             on_line = function(file, lnum, col, text)
-              cb({
-                text = file .. "\0" .. lnum .. ":" .. col .. ":" .. text,
-                pos = { lnum, math.max(0, col - 1) },
+              -- Buffer the item; we drain inside the sleep loop below
+              -- where it's safe to call cb (we're guaranteed not yet done).
+              pending[#pending + 1] = {
+                text = file .. ":" .. lnum .. ":" .. col .. ":" .. text,
+                pos  = { lnum, math.max(0, col - 1) },
                 file = file,
-              })
+              }
             end,
             on_done = function(code, err)
+              done = true
               if err and code ~= 0 then
-                vim.notify("UE grep [csearch]: " .. err, vim.log.levels.WARN, { title = "UE" })
+                vim.schedule(function()
+                  vim.notify("UE grep [csearch]: " .. err, vim.log.levels.WARN, { title = "UE" })
+                end)
               end
             end,
           })
-          return stop
+
+          -- Drain loop: sleep in short slices so we can flush pending
+          -- items frequently AND react to picker aborts (filter.search
+          -- changing under us).
+          local drain_slice_ms = 30
+          local max_total_ms = 30000  -- absolute upper bound, ~30s
+          local elapsed = 0
+          while not done and elapsed < max_total_ms do
+            -- Abort detection: if the picker filter changed, snacks will
+            -- abort our async task; ctx.async:sleep returns early. We
+            -- check the running flag via filter identity.
+            if finder_ctx.filter.search ~= pattern then
+              break  -- new keystroke → abandon, snacks will start a fresh finder
+            end
+            -- Drain any items accumulated since last slice.
+            local n = #pending
+            if n > 0 then
+              for i = 1, n do
+                cb(pending[i])
+                pending[i] = nil
+              end
+            end
+            finder_ctx.async:sleep(drain_slice_ms)
+            elapsed = elapsed + drain_slice_ms
+          end
+
+          -- Final drain after done (still safe — we haven't returned).
+          for i = 1, #pending do
+            cb(pending[i])
+          end
+
+          -- Stop the subprocess if it's still alive (timeout / abort path).
+          if not done then
+            stop()
+          end
         end
       end,
     })

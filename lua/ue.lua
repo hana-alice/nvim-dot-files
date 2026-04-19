@@ -4730,6 +4730,13 @@ function M.cached_grep(opts)
   local title_default = ("Grep All Code [%s]"):format(backend_label)
 
   -- ─ Helpers shared by both csearch and rg paths ──────────────────────
+  -- Dev toggle: lets us A/B compare against vanilla snacks behavior to
+  -- isolate whether grouping/format/preview/throttle changes are the cause
+  -- of perceived lag. When false, finder cb is unwrapped, format/preview/
+  -- throttle are not installed, and Tab keeps snacks default behavior.
+  -- Toggle at runtime with :UEGrepGroupingToggle.
+  local grouping_enabled = (vim.g.ue_grep_grouping_enabled ~= false)
+
   -- Wrap a `cb(item)` so that whenever a new file appears in the stream
   -- (compared to the previous item), we first emit a header item for that
   -- file. csearch outputs in file-grouped order; rg --with-filename does
@@ -4746,7 +4753,11 @@ function M.cached_grep(opts)
   local function make_grouping_cb(cb)
     local last_file = nil
     return function(item)
-      if item and item.file and item.file ~= last_file then
+      -- Drop nil items defensively — snacks finder.add() does
+      -- `item.idx, item.score = ...` and crashes on nil. We've seen this
+      -- crop up rarely from upstream proc.proc transforms returning nil.
+      if item == nil then return end
+      if item.file and item.file ~= last_file then
         last_file = item.file
         cb({
           text = item.file,
@@ -4759,6 +4770,10 @@ function M.cached_grep(opts)
     end
   end
 
+  -- Hoist snacks default formatter once (require cache is fast but per-item
+  -- lookup adds up across thousands of redraws on every Tab press).
+  local snacks_format_file = require("snacks.picker.format").file
+
   -- Format: file headers get a bold prefix + path; hit lines get a thin
   -- left margin so they visually nest under the preceding header.
   local function format_grouped(item, picker)
@@ -4769,13 +4784,66 @@ function M.cached_grep(opts)
       }
     end
     -- Default grep format, but indented two spaces.
-    local default = require("snacks.picker.format").file(item, picker)
+    local default = snacks_format_file(item, picker)
     table.insert(default, 1, { "  ", "SnacksPickerDir" })
     return default
   end
 
-  -- Confirm: header → jump to file line 1; hit → default.
-  local function confirm_grouped(picker, item)
+  -- Preview: header items have no useful preview (file line 1 is rarely
+  -- where you want to start). Show a placeholder instead — this avoids the
+  -- per-Tab cost of opening a fresh buffer + treesitter highlighting just
+  -- to flash a line-1 view that the user is going to scroll past.
+  local function preview_grouped(ctx)
+    local item = ctx.item
+    if item and item._is_grep_header then
+      ctx.preview:reset()
+      ctx.preview:set_lines({
+        "── " .. (item.file or "?") .. " ──",
+        "",
+        "  (file header — press <CR> to open at line 1)",
+      })
+      ctx.preview:set_title(vim.fn.fnamemodify(item.file or "", ":t"))
+      return
+    end
+    -- Default file preview for hit items.
+    return require("snacks.picker.preview").file(ctx)
+  end
+
+  -- Per-picker keymap override:
+  -- snacks default <Tab> = select_and_next (multi-select), which on huge
+  -- grep result lists costs a full list redraw + selected-set highlight
+  -- recompute on EVERY press — feels laggy when the user is just scanning
+  -- with key-repeat. Override <Tab> to plain list_down here. Multi-select
+  -- still available via <S-Tab> / <C-Space> (which we leave alone).
+  local fast_tab_keys = {
+    win = {
+      input = { keys = { ["<Tab>"] = { "list_down", mode = { "i", "n" } } } },
+      list  = { keys = { ["<Tab>"] = "list_down" } },
+    },
+  }
+
+  -- Preview throttle: snacks default is 60ms which is faster than typical
+  -- Tab key-repeat (30-50ms), so each Tab still fires a fresh preview build.
+  -- For UE-scale files (.cpp 500KB+, 50-200ms TS highlight), this stacks up
+  -- and feels laggy. Bump to 200ms — preview renders only after the user
+  -- pauses scrolling.
+  local function on_show_picker(picker)
+    pcall(function()
+      local snacks_util = require("snacks.util")
+      local ref = picker:ref()
+      picker._throttled_preview = snacks_util.throttle(function()
+        local this = ref()
+        if this then this:_show_preview() end
+      end, { ms = 200, name = "preview" })
+    end)
+  end
+
+  -- Confirm: header → jump to file line 1; hit → snacks default jump.
+  -- snacks `confirm` callback signature is (picker, item, action) where
+  -- action is the keymap entry (e.g. { cmd = "edit" }). When forwarding
+  -- to snacks's own jump action we MUST pass it (or a sane default) —
+  -- jump() does `action.cmd` at line 89 and crashes on nil.
+  local function confirm_grouped(picker, item, action)
     if item and item._is_grep_header then
       picker:close()
       vim.schedule(function()
@@ -4783,7 +4851,7 @@ function M.cached_grep(opts)
       end)
       return
     end
-    return require("snacks.picker.actions").jump(picker, item)
+    return require("snacks.picker.actions").jump(picker, item, action or { cmd = "edit" })
   end
 
   -- ── csearch fast path ────────────────────────────────────────────────
@@ -4795,8 +4863,11 @@ function M.cached_grep(opts)
       live = true,
       need_search = true,
       layout = { preset = "telescope" },
-      format = format_grouped,
-      confirm = confirm_grouped,
+      format = grouping_enabled and format_grouped or nil,
+      preview = grouping_enabled and preview_grouped or nil,
+      on_show = grouping_enabled and on_show_picker or nil,
+      win = grouping_enabled and fast_tab_keys.win or nil,
+      confirm = grouping_enabled and confirm_grouped or nil,
       finder = function(_picker_opts, finder_ctx)
         local pattern = finder_ctx.filter.search
         if not pattern or pattern == "" then
@@ -4804,7 +4875,9 @@ function M.cached_grep(opts)
         end
         return function(cb)
           -- Wrap cb to inject file-header items between file groups.
-          cb = make_grouping_cb(cb)
+          if grouping_enabled then
+            cb = make_grouping_cb(cb)
+          end
 
           -- snacks finder protocol: this function MUST block until ALL
           -- callbacks have been emitted, otherwise snacks marks the finder
@@ -4841,10 +4914,24 @@ function M.cached_grep(opts)
 
           -- Drain loop: sleep in short slices so we can flush pending
           -- items frequently AND react to picker aborts (filter.search
-          -- changing under us).
-          local drain_slice_ms = 30
+          -- changing under us). Small slice (5ms) lets us notice aborts
+          -- fast — when the user is typing, each keystroke aborts the
+          -- prior finder, and a 30ms slice meant 30ms of dead csearch
+          -- output kept landing in the picker. Per-tick cb count is also
+          -- capped so we never hand snacks more than CB_BUDGET items in
+          -- one frame (large bursts → snacks rebuilds list+highlight per
+          -- batch and can stall the main loop for tens of ms).
+          -- Tunables: smaller slice = faster abort response; smaller
+          -- budget = lower per-tick stall on snacks redraw. Sweet spot
+          -- found empirically at 2ms / 80 — abort after typing a key is
+          -- ~imperceptible, and large result bursts (Render*, FName etc.)
+          -- spread across ~10 frames at 16ms each instead of stalling
+          -- one frame for 100ms+.
+          local drain_slice_ms = 2
+          local CB_BUDGET = 80  -- items per drain tick
           local max_total_ms = 30000  -- absolute upper bound, ~30s
           local elapsed = 0
+          local read_idx = 1
           while not done and elapsed < max_total_ms do
             -- Abort detection: if the picker filter changed, snacks will
             -- abort our async task; ctx.async:sleep returns early. We
@@ -4852,21 +4939,35 @@ function M.cached_grep(opts)
             if finder_ctx.filter.search ~= pattern then
               break  -- new keystroke → abandon, snacks will start a fresh finder
             end
-            -- Drain any items accumulated since last slice.
+            -- Drain up to CB_BUDGET items accumulated since last slice.
+            -- Use read_idx (not #pending) so we don't churn the array on
+            -- every tick — set entries to nil so GC can reclaim text.
             local n = #pending
-            if n > 0 then
-              for i = 1, n do
+            if read_idx <= n then
+              local stop_at = math.min(n, read_idx + CB_BUDGET - 1)
+              for i = read_idx, stop_at do
                 cb(pending[i])
                 pending[i] = nil
               end
+              read_idx = stop_at + 1
             end
             finder_ctx.async:sleep(drain_slice_ms)
             elapsed = elapsed + drain_slice_ms
           end
 
-          -- Final drain after done (still safe — we haven't returned).
-          for i = 1, #pending do
-            cb(pending[i])
+          -- Detect WHY we exited the loop. If the user aborted us
+          -- (filter changed), we MUST NOT call cb anymore — snacks has
+          -- marked our finder done and any further cb trips the
+          -- "yielded after done" bug-trap. Just kill the subprocess and
+          -- discard any pending items.
+          local aborted = (finder_ctx.filter.search ~= pattern)
+
+          if not aborted then
+            -- Final drain after done (still safe — we haven't returned).
+            -- Resume from read_idx so we don't double-cb earlier items.
+            for i = read_idx, #pending do
+              cb(pending[i])
+            end
           end
 
           -- Stop the subprocess if it's still alive (timeout / abort path).
@@ -4936,8 +5037,11 @@ function M.cached_grep(opts)
     live = true,
     need_search = true,
     layout = { preset = "telescope" },
-    format = format_grouped,
-    confirm = confirm_grouped,
+    format = grouping_enabled and format_grouped or nil,
+    preview = grouping_enabled and preview_grouped or nil,
+    on_show = grouping_enabled and on_show_picker or nil,
+    win = grouping_enabled and fast_tab_keys.win or nil,
+    confirm = grouping_enabled and confirm_grouped or nil,
     finder = function(picker_opts, finder_ctx)
       local pattern = finder_ctx.filter.search
       if not pattern or pattern == "" then
@@ -4951,7 +5055,9 @@ function M.cached_grep(opts)
 
       return function(cb)
         -- Wrap cb to inject file-header items between file groups.
-        cb = make_grouping_cb(cb)
+        if grouping_enabled then
+          cb = make_grouping_cb(cb)
+        end
 
         local base_args = {
           "--color=never",
@@ -6788,6 +6894,17 @@ function M.setup()
   })
   -- Legacy aliases (thin wrappers → UEPrepare)
   vim.api.nvim_create_user_command("UEExportCompileCommands", prepare_async, {})
+  vim.api.nvim_create_user_command("UEGrepGroupingToggle", function()
+    -- Default is true; flip the global. Affects subsequent grep picker
+    -- invocations (already-open pickers stay as they were).
+    vim.g.ue_grep_grouping_enabled = not (vim.g.ue_grep_grouping_enabled ~= false)
+    local now = vim.g.ue_grep_grouping_enabled
+    vim.notify(
+      string.format("UE grep grouping/preview/Tab tweaks: %s",
+        now and "ON (default)" or "OFF (vanilla snacks)"),
+      vim.log.levels.INFO,
+      { title = "UE", timeout = 4000 })
+  end, { desc = "Toggle UE grep file-grouping + preview throttle + Tab=list_down" })
   vim.api.nvim_create_user_command("UEGenerateFromRSP", prepare_async, {})
   vim.api.nvim_create_user_command("UEBuild", build_android, {})
   vim.api.nvim_create_user_command("UEBuildAndroid", build_android, {})

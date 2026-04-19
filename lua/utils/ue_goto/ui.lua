@@ -93,14 +93,33 @@ function M.progress_notice(initial_msg)
 
   local function hide_now()
     cancel_self_destruct()
+    -- Hide the notification, regardless of which notify backend is in use
+    -- (snacks.notifier, nvim-notify, noice — all of them honor `replace=id`
+    -- with a near-zero timeout to dismiss the original bubble).
+    --
+    -- HISTORY: previous version only handled the nvim-notify path
+    -- (`package.loaded["notify"]`) and a `current_id.hide()` call. With
+    -- snacks.notifier (LazyVim default) the id is a string/number — neither
+    -- branch fired, so the spinner was never actually dismissed. Symptom:
+    -- "✓ jumped" success toast appears AND the "⏳ resolving …" spinner
+    -- stays on screen until the 8s self-destruct (or forever if that path
+    -- also no-ops). Fix is one universal call.
     pcall(function()
-      if current_id ~= nil then
-        if type(current_id) == "table" and current_id.hide then
-          current_id:hide()
-        elseif vim.notify and package.loaded["notify"] then
-          pcall(vim.notify, "", vim.log.levels.INFO, { replace = current_id, timeout = 1 })
-        end
+      if current_id == nil then return end
+      -- nvim-notify exposes a record with :hide() — use it if present.
+      if type(current_id) == "table" and type(current_id.hide) == "function" then
+        current_id:hide()
+        return
       end
+      -- Universal path: emit an empty replacement with a tiny timeout. snacks
+      -- and noice both treat this as "remove the bubble". hide_from_history
+      -- prevents the empty replacement from polluting :messages.
+      pcall(vim.notify, "", vim.log.levels.INFO, {
+        replace = current_id,
+        id = current_id,
+        timeout = 1,
+        hide_from_history = true,
+      })
     end)
     if _shared_notice_id == current_id then _shared_notice_id = nil end
     current_id = nil
@@ -145,16 +164,9 @@ function M.progress_notice(initial_msg)
     })
     local id_at_finish = current_id
     vim.defer_fn(function()
+      -- Only hide if we still own the slot (no newer notice has taken it).
       if _shared_notice_id == id_at_finish then
-        pcall(function()
-          if type(current_id) == "table" and current_id.hide then
-            current_id:hide()
-          elseif vim.notify and package.loaded["notify"] then
-            pcall(vim.notify, "", vim.log.levels.INFO, { replace = current_id, timeout = 1 })
-          end
-        end)
-        _shared_notice_id = nil
-        current_id = nil
+        hide_now()
       end
     end, lifetime_ms + 200)
   end

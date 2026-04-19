@@ -4935,9 +4935,14 @@ function M.cached_grep(opts)
           while not done and elapsed < max_total_ms do
             -- Abort detection: if the picker filter changed, snacks will
             -- abort our async task; ctx.async:sleep returns early. We
-            -- check the running flag via filter identity.
+            -- check the running flag via filter identity. Kill the
+            -- subprocess IMMEDIATELY (before break) so it stops producing
+            -- items in the brief window before our outer cleanup runs —
+            -- otherwise on slow grep workloads the dead csearch keeps
+            -- writing stdout for tens of ms while we're already gone.
             if finder_ctx.filter.search ~= pattern then
-              break  -- new keystroke → abandon, snacks will start a fresh finder
+              pcall(stop)
+              break
             end
             -- Drain up to CB_BUDGET items accumulated since last slice.
             -- Use read_idx (not #pending) so we don't churn the array on

@@ -153,18 +153,11 @@ end
 local function setup_keymaps()
   vim.keymap.set("t", "<Esc>", [[<C-\><C-n>]], { desc = "Exit terminal mode" })
 
-  vim.keymap.set("n", "<leader>tt", function()
-    local term_buf, term_win = get_term_state()
-    if term_win and vim.api.nvim_win_is_valid(term_win) then
-      vim.api.nvim_win_close(term_win, true)
-      set_term_state(term_buf, nil)
-      return
-    end
-
-    ensure_terminal_visible()
-  end, { desc = "Terminal: Toggle (" .. terminal_shell() .. ", reuse buffer)" })
-
-  vim.keymap.set("n", "<leader>t", "<leader>tt", { remap = true, silent = true })
+  -- NOTE: <leader>tt / <leader>t intentionally NOT bound here.
+  -- Use the LazyVim built-in <C-/> (or <C-_>) for the root terminal toggle —
+  -- single source of truth. The bottom "reuse buffer" terminal still exists,
+  -- but it's now opened on demand by <leader>tc / <leader>te / <leader>tp,
+  -- which need a controllable buffer to inject `cd` commands into.
   pcall(vim.keymap.del, "n", "<leader>fE")
   pcall(vim.keymap.del, "n", "<leader>E")
   vim.keymap.set("n", "<leader>E", reveal_current_file, { desc = "Open: Reveal current file in Explorer" })

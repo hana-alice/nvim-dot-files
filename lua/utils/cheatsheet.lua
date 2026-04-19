@@ -52,6 +52,17 @@ local tabs = {
     name = "Basics",
     sections = {
       {
+        title = "Conventions",
+        mappings = {
+          { "Built-in wins",   "Dup w/ LazyVim → drop ours" },
+          { "No mixed case",   "Avoid <ldr>X+ 2-letter combos" },
+          { "u prefix shared", "UI toggles + UE runtime" },
+          { "<C-/>",           "THE terminal toggle" },
+          { "<leader>?",       "This cheatsheet" },
+          { "<leader>sk",      "Discover any keymap" },
+        },
+      },
+      {
         title = "Start Here",
         mappings = {
           { "<leader>",         "Open which-key" },
@@ -84,6 +95,7 @@ local tabs = {
           { "<C-f>/<C-b>", "Full page down / up" },
           { "H / M / L",   "Screen top / mid / bottom" },
           { "<C-o>/<C-i>", "Jump back / forward" },
+          { "[c",          "Jump to TS context" },
         },
       },
       {
@@ -210,6 +222,20 @@ local tabs = {
           { "<leader>sr",       "Cross-file search/replace" },
           { "<C-q>",            "Picker → quickfix" },
           { "<C-Space>",        "Multi-select in picker" },
+          { "<leader>s/",       "Resume grep after <C-q> pin" },
+        },
+      },
+      {
+        title = "Inside a Picker",
+        mappings = {
+          { "<C-q>",            "Send results to quickfix" },
+          { "<C-Space>",        "Multi-select toggle" },
+          { "<C-j> / <C-k>",    "Down / up" },
+          { "<C-d> / <C-u>",    "Half page down / up" },
+          { "<C-p> / <C-n>",    "Prev / next history" },
+          { "<C-/>",            "Toggle picker help" },
+          { "<Tab>",            "Focus list ↔ input" },
+          { "<CR> / q / <Esc>", "Confirm / close" },
         },
       },
     },
@@ -251,10 +277,11 @@ local tabs = {
       {
         title = "Terminal",
         mappings = {
+          { "<C-/>",            "Toggle root term (LazyVim)" },
           { "<leader>ft / fT",  "Float terminal root / cwd" },
-          { "<C-/>",            "Toggle root terminal" },
-          { "<leader>tt",       "Bottom terminal (reuse)" },
-          { "<leader>tc/tp/te", "cd to file / project / UE" },
+          { "<leader>tc",       "Bottom term + cd to file dir" },
+          { "<leader>tp",       "Bottom term + cd to project" },
+          { "<leader>te",       "Bottom term + cd to UE engine" },
           { "<Esc>",            "Exit terminal mode" },
         },
       },
@@ -402,6 +429,7 @@ local tabs = {
           { ":UEClearCache", "Clear UE + clangd caches" },
           { ":UEClearCache!","+ rm cc + restart clangd" },
           { ":UEHelp",       "UE command help" },
+          { "<leader>?",     "Open this cheatsheet" },
         },
       },
       {

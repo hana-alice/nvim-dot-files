@@ -197,6 +197,7 @@ local tabs = {
         title = "Picker / Grep",
         mappings = {
           { "<leader><space>",  "Find workspace files" },
+          { "<leader>fe",       "File tree (project)" },
           { "<leader>ff / fF",  "Project / workspace files" },
           { "<leader>fg",       "Git files (UE-aware)" },
           { "<leader>,",        "Buffers" },

@@ -403,7 +403,21 @@ return {
     lazy = true,
     keys = {
       { "<leader>;", function() Snacks.picker.commands() end, desc = "Commands" },
-      { "<leader>fe", false },
+      -- <leader>fe — file tree browser (snacks.picker.explorer style).
+      -- Tree of the project root with directory expand/collapse — for the
+      -- "I want to see the structure" workflow. Fuzzy file finder stays on
+      -- <leader>ff / <leader><space> (no UX change there).
+      { "<leader>fe", function()
+        local snacks = require("snacks")
+        local cwd = project_root() or vim.uv.cwd()
+        snacks.picker.explorer({
+          cwd = cwd,
+          title = "UE Tree (" .. vim.fn.fnamemodify(cwd, ":t") .. ")",
+          auto_close = true,
+          jump = { close = true },
+          layout = { preset = "telescope" },
+        })
+      end, desc = "File tree browser (current project)" },
       { "<leader>fE", false },
       { "<leader>e", function() require("utils.yazi").open_current() end, desc = "Yazi (current file)" },
       { "<leader>E", false },

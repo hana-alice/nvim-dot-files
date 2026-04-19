@@ -262,6 +262,7 @@ is still loading.
 | Key              | Action                                  |
 |------------------|-----------------------------------------|
 | `<leader><space>`| Find workspace files                    |
+| `<leader>fe`     | File tree browser (project, snacks explorer) |
 | `<leader>ff`     | Find project files                      |
 | `<leader>fF`     | Find workspace code files               |
 | `<leader>fa`     | Find project code files                 |

@@ -156,28 +156,50 @@ local function paste_picker_clipboard(picker)
 end
 
 local function pin_sidebar_qflist(picker)
-  local ok, actions = pcall(require, "snacks.picker.actions")
-  if not ok then
-    vim.notify("Snacks picker actions unavailable", vim.log.levels.ERROR)
-    return
+  -- We do NOT call snacks.picker.actions.qflist(): that helper does
+  -- `vim.cmd("botright copen")` itself, which left us with TWO panels
+  -- visible (the native quickfix split AND the trouble float). We want
+  -- only the trouble tree, so we replicate the qflist-population logic
+  -- inline and skip the copen.
+
+  local sel = picker:selected()
+  local items = (sel and #sel > 0) and sel or picker:items()
+
+  local qf = {}
+  for _, item in ipairs(items) do
+    local file = (item.file ~= nil and item.file ~= "")
+        and item.file
+        or (Snacks and Snacks.picker and Snacks.picker.util and Snacks.picker.util.path
+            and Snacks.picker.util.path(item) or nil)
+    qf[#qf + 1] = {
+      filename = file,
+      bufnr    = item.buf,
+      lnum     = (item.pos and item.pos[1]) or 1,
+      col      = ((item.pos and item.pos[2]) or 0) + 1,
+      end_lnum = item.end_pos and item.end_pos[1] or nil,
+      end_col  = item.end_pos and (item.end_pos[2] + 1) or nil,
+      text     = item.line or item.comment or item.label or item.name or item.detail or item.text or "",
+      pattern  = item.search,
+      valid    = true,
+    }
   end
 
-  -- (1) Convert picker selection to vim quickfix list. This also closes
-  --     the picker float.
-  actions.qflist(picker)
+  -- Set the list BEFORE closing the picker — closing changes focus and
+  -- some snacks bookkeeping; populating first keeps things tidy.
+  vim.fn.setqflist({}, " ", {
+    title = "Pinned: " .. (picker.opts and picker.opts.title or "picker"),
+    items = qf,
+  })
+  picker:close()
 
-  -- (2) Open the bottom tree-grouped quickfix view. We deliberately do NOT
-  --     call utils.sidebar.open("qflist") here — that opens the left
-  --     sidebar mode. The pin action should produce ONLY the bottom panel.
-  --     Also tear down any currently-open left sidebar so the user gets a
-  --     single, focused view of the pinned results.
+  -- Close any left sidebar so the bottom trouble panel is the only
+  -- secondary view, then pop trouble.
   vim.schedule(function()
     pcall(function() require("utils.sidebar").close() end)
     local ok_t, trouble = pcall(require, "trouble")
     if not ok_t then
-      vim.notify("Trouble unavailable; pinned results stayed in :copen",
-        vim.log.levels.WARN)
-      vim.cmd("botright copen 12")
+      vim.notify("Trouble unavailable; falling back to :copen", vim.log.levels.WARN)
+      vim.cmd("botright copen 14")
       return
     end
     trouble.open("ue_qflist_bottom")

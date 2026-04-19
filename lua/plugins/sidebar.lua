@@ -47,17 +47,27 @@ return {
         -- Bottom-pinned tree-grouped quickfix view, used by the picker
         -- "<C-q> pin" action. NOT routed through sidebar_mode() because
         -- it must NOT open in the left sidebar — it lives at the bottom
-        -- as a horizontal split, grouped-by-file (trouble's default
-        -- qflist mode is already tree-shaped).
+        -- as a horizontal split.
+        --
+        -- Tree shape: directory > filename > entries.  trouble ships a
+        -- `directory` group that splits item.dirname by "/" into nested
+        -- nodes (see lua/trouble/tree.lua), giving a real folder tree
+        -- instead of trouble's default flat-by-filename list.
         ue_qflist_bottom = {
           desc = "Bottom quickfix tree (pinned picker results)",
           mode = "qflist",
           focus = true,
           warn_no_results = false,
           open_no_results = true,
+          groups = {
+            { "directory" },
+            { "filename", format = "{file_icon} {filename} {count}" },
+          },
+          sort = { "filename", "pos" },
+          format = "{text:ts} {pos}",
           win = {
             position = "bottom",
-            size = { height = 12 },
+            size = { height = 14 },
           },
         },
      })

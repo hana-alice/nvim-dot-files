@@ -223,15 +223,27 @@ function M.definition()
   end
   local function done(success_msg, lifetime_ms)
     resolved = true
-    if success_msg and notice then
-      pcall(notice.finish, success_msg, lifetime_ms or 3000); notice = nil
-      M._active_notice = nil
-    elseif success_msg then
-      -- Resolved before the spinner appeared (fast path).
+    -- DESIGN NOTE
+    -- We deliberately DON'T forward success_msg into the spinner notice
+    -- via notice.finish() any more.
+    --
+    -- Why: snacks.notify with `replace=id` has been observed to keep
+    -- displaying the old (spinner) text on screen even after a finish()
+    -- emit() with the new text — race between snacks' internal queue
+    -- update and the next paint, plus the spinner's hide_from_history
+    -- flag interacting with replace semantics. Net effect: the user
+    -- sees "⏳ resolving X ... (instant index path racing precise AST
+    -- path)" lingering on screen *after* the cursor has already jumped
+    -- to the target. That's the visible bug we're fixing here.
+    --
+    -- Treatment: hard-clear any existing spinner FIRST, then emit the
+    -- success text as a brand-new notification with a fresh id. This
+    -- guarantees the user only ever sees the success line — never the
+    -- stale "resolving" text — once a jump has actually happened.
+    clear_notice()
+    if success_msg then
       pcall(vim.notify, success_msg, vim.log.levels.INFO,
         { title = "LSP definition", timeout = lifetime_ms or 3000 })
-    else
-      clear_notice()
     end
   end
 
@@ -272,8 +284,13 @@ function M.definition()
   end
 
   -- Progress notice (only after 600ms, so fast jumps don't flash a spinner).
+  -- We check BOTH `resolved` and `jumped`: by the time this defer fires the
+  -- instant track may have already navigated the cursor but not yet returned
+  -- through done() (microsecond window). Showing a "resolving" spinner AFTER
+  -- the user has already landed at the target is the precise visual bug we
+  -- want to suppress.
   vim.defer_fn(function()
-    if not still_current() or resolved then return end
+    if not still_current() or resolved or jumped then return end
     notice = ui.progress_notice(string.format(
       "⏳ resolving %s ... (instant index path racing precise AST path)",
       sym or "?"

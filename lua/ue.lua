@@ -4083,6 +4083,84 @@ local function slim_compile_commands_file(path)
   return true
 end
 
+--- Spawn a long-running shell job, capture stdout+stderr to a timestamped log
+--- file under stdpath('log')/<tag>/, and notify on failure with the log path.
+---
+--- This is the standard pattern for any background job in ue.lua. When it fails,
+--- the user can quote the log file path back to the agent for instant debugging
+--- — no need to re-run to capture the failure.
+---
+--- @param cmd string|string[] command (string for shell, list for argv)
+--- @param tag string subdirectory name under stdpath('log') (e.g. "ue-pipeline")
+--- @param opts table {
+---   cdb     = string?      -- optional context to record in log header
+---   on_exit = fun(code:integer, log_lines:string[], log_path:string)
+---                          -- called on success (code==0). On failure, helper
+---                          -- handles notify + log flush; on_exit is NOT called.
+---   on_fail = fun(code:integer, log_lines:string[], log_path:string)?
+---                          -- optional override for failure handling
+---   cwd     = string?
+---   env     = table?
+--- }
+--- @return integer jobid
+function M._logged_jobstart(cmd, tag, opts)
+  opts = opts or {}
+  local log_dir = vim.fn.stdpath("log") .. "/" .. tag
+  vim.fn.mkdir(log_dir, "p")
+  local log_path = log_dir .. "/" .. os.date("%Y%m%d-%H%M%S") .. ".log"
+  local log_lines = {}
+
+  local function on_data(_, data)
+    if not data then return end
+    for _, line in ipairs(data) do
+      if line and line ~= "" then table.insert(log_lines, line) end
+    end
+  end
+
+  local function flush_log(code)
+    local f = io.open(log_path, "w")
+    if not f then return end
+    f:write("# ue.lua " .. tag .. "\n")
+    f:write("# cmd: " .. (type(cmd) == "table" and table.concat(cmd, " ") or tostring(cmd)) .. "\n")
+    f:write("# exit: " .. tostring(code) .. "\n")
+    if opts.cdb then f:write("# cdb: " .. tostring(opts.cdb) .. "\n") end
+    f:write(("# time: %s\n\n"):format(os.date("%Y-%m-%d %H:%M:%S")))
+    for _, line in ipairs(log_lines) do f:write(line, "\n") end
+    f:close()
+  end
+
+  local job_opts = {
+    stdout_buffered = false,
+    stderr_buffered = false,
+    on_stdout = on_data,
+    on_stderr = on_data,
+    on_exit = function(_, code)
+      vim.schedule(function()
+        flush_log(code)
+        if code ~= 0 then
+          if opts.on_fail then
+            opts.on_fail(code, log_lines, log_path)
+          else
+            local tail = {}
+            for i = math.max(1, #log_lines - 4), #log_lines do
+              table.insert(tail, log_lines[i])
+            end
+            local msg = ("%s failed (exit %d)\nlog: %s\n--- last lines ---\n%s")
+              :format(tag, code, log_path, table.concat(tail, "\n"))
+            vim.notify(msg, vim.log.levels.ERROR, { timeout = 15000 })
+          end
+          return
+        end
+        if opts.on_exit then opts.on_exit(code, log_lines, log_path) end
+      end)
+    end,
+  }
+  if opts.cwd then job_opts.cwd = opts.cwd end
+  if opts.env then job_opts.env = opts.env end
+
+  return vim.fn.jobstart(cmd, job_opts)
+end
+
 --- Run PCH prebuild + include-dir unification in background after slim.
 --- @param path string the compile_commands.json file to process
 --- @param targets string[]|nil list of compile_commands targets; after pipeline
@@ -4129,13 +4207,13 @@ local function run_compile_commands_pipeline(path, targets)
   end
 
   local shell_cmd = table.concat(cmds, " && ")
-  vim.fn.jobstart(shell_cmd, {
-    on_exit = function(_, code)
-      vim.schedule(function()
-        if code ~= 0 then
-          vim.notify("compile_commands pipeline failed (exit " .. code .. ")", vim.log.levels.WARN)
-          return
-        end
+
+  -- Capture stdout+stderr into a timestamped log file so failures are debuggable
+  -- without re-running. Uses M._logged_jobstart so other long-running jobs
+  -- (PCH rebuild, gtags, etc.) can adopt the same pattern.
+  M._logged_jobstart(shell_cmd, "ue-pipeline", {
+    cdb = path,
+    on_exit = function(code, log_lines, log_path)
         -- Check if CDB was actually modified
         local stat_after = vim.uv.fs_stat(path)
         local mtime_after = stat_after and stat_after.mtime.sec or 0
@@ -4173,7 +4251,6 @@ local function run_compile_commands_pipeline(path, targets)
             end
           end, 500)
         end
-      end)
     end,
   })
 end

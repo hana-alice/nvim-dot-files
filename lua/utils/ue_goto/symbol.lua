@@ -627,4 +627,96 @@ function M.is_dependent_name(_receiver)
   return ok and true or false
 end
 
+-- ---------------------------------------------------------------------------
+-- Call-site arity (treesitter, cpp grammar)
+--
+-- Goal: tell syntax_filter.lua how many arguments the cursor's call
+-- expression takes, so candidate function definitions with mismatched
+-- parameter count can be eliminated.
+--
+-- Returns (arity:int, callee_name:string) when cursor sits inside an
+-- enclosing call_expression (or template_function whose parent is a
+-- call_expression). Returns nil when cursor is not in a call (e.g. on a
+-- declaration name, in a type expression).
+-- ---------------------------------------------------------------------------
+function M.call_arity_at_cursor()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local ok_parser, parser = pcall(vim.treesitter.get_parser, bufnr, "cpp")
+  if not ok_parser or not parser then return nil end
+  local trees = parser:parse()
+  if not trees or not trees[1] then return nil end
+
+  local row, col = unpack(vim.api.nvim_win_get_cursor(0))
+  row = row - 1  -- TS is 0-indexed
+  local node = trees[1]:root():descendant_for_range(row, col, row, col)
+  if not node then return nil end
+
+  -- Walk up to the nearest call_expression. Stop at function_definition
+  -- (we do NOT want to accept a nested call from a sibling, only the one
+  -- that lexically encloses cursor).
+  local call = nil
+  local n = node
+  while n do
+    local t = n:type()
+    if t == "call_expression" then call = n; break end
+    -- function_declarator catches prototypes (no body); function_definition
+    -- catches definitions with body. Both indicate cursor is on a declaration
+    -- site rather than at a call site.
+    if t == "function_definition" or t == "function_declarator" then
+      return nil  -- cursor is on a declaration site, not a call
+    end
+    n = n:parent()
+  end
+  if not call then return nil end
+
+  -- Extract argument_list and count direct children that are not punctuation.
+  local args_field = call:field("arguments")
+  local arglist = args_field and args_field[1]
+  if not arglist then
+    -- Some grammars expose arguments as second child without the field.
+    for c in call:iter_children() do
+      if c:type() == "argument_list" then arglist = c; break end
+    end
+  end
+  if not arglist then return nil end
+
+  local arity = 0
+  for c in arglist:iter_children() do
+    local ct = c:type()
+    -- Skip punctuation: `(`, `)`, `,`. Count everything else as one arg.
+    if ct ~= "(" and ct ~= ")" and ct ~= "," and ct ~= "comment" and ct ~= "ERROR" then
+      arity = arity + 1
+    end
+  end
+
+  -- Extract callee name (best-effort: identifier, qualified_identifier,
+  -- field_expression, template_function).
+  local function leaf_name(callee_node)
+    if not callee_node then return nil end
+    local t = callee_node:type()
+    if t == "identifier" or t == "field_identifier" or t == "type_identifier" then
+      return vim.treesitter.get_node_text(callee_node, bufnr)
+    elseif t == "qualified_identifier" then
+      -- rightmost identifier
+      local nf = callee_node:field("name")
+      if nf and nf[1] then return leaf_name(nf[1]) end
+    elseif t == "field_expression" then
+      local fld = callee_node:field("field")
+      if fld and fld[1] then return leaf_name(fld[1]) end
+    elseif t == "template_function" then
+      local nm = callee_node:field("name")
+      if nm and nm[1] then return leaf_name(nm[1]) end
+    end
+    -- Fallback: text
+    local txt = vim.treesitter.get_node_text(callee_node, bufnr) or ""
+    return txt:match("([%w_]+)%s*$")
+  end
+
+  local fn_field = call:field("function")
+  local fn_node = fn_field and fn_field[1]
+  local name = leaf_name(fn_node)
+
+  return arity, name
+end
+
 return M

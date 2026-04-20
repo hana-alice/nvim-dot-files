@@ -38,6 +38,7 @@ local ranking      = require("utils.ue_goto.ranking")
 local provider     = require("utils.ue_goto.provider")
 local ui           = require("utils.ue_goto.ui")
 local jumper       = require("utils.ue_goto.jumper")
+local syntax_filter = require("utils.ue_goto.syntax_filter")
 
 -- ---------------------------------------------------------------------------
 -- Tunables
@@ -51,7 +52,7 @@ local INSTANT_PRECISE_RECONCILE = true
 -- ---------------------------------------------------------------------------
 -- Persistent debug ring-buffer (Tier 3: lift to ue_goto_dev/trace.lua).
 -- ---------------------------------------------------------------------------
-local MODULE_REVISION = "tier2split"
+local MODULE_REVISION = "syntax-filter-v1"
 local TRACE_MAX = 200
 local trace_ring = {}
 local trace_idx = 0
@@ -97,35 +98,23 @@ function M.dump_trace()
 end
 vim.api.nvim_create_user_command("UEDefTrace", function() M.dump_trace() end, {})
 
--- :UEDefSelfTest — exercises ranking on synthetic GetBinCount-like data
--- to prove the header-only relaxation is loaded (vs. stale module).
+-- :UEDefSelfTest — smoke test that syntax_filter loads and ranking.clear_winner
+-- has been removed (proves the new bytecode is live, not the stale tier2split one).
 function M.self_test()
-  local ref_file = "<PROJ_DRIVE>/UEProj/Engine/Source/Runtime/Renderer/Private/Nanite/foo.cpp"
-  local hits = {
-    {
-      uri = "file:///<PROJ_DRIVE>/UEProj/Engine/Source/Runtime/Renderer/Private/Nanite/NaniteShared.h",
-      range = { start = { line = 735, character = 12 }, ["end"] = { line = 735, character = 23 } },
-      _ws_kind = 6,
-    },
-    {
-      uri = "file:///<PROJ_DRIVE>/UEProj/Engine/Source/Runtime/Renderer/Private/Nanite/NaniteShared.h",
-      range = { start = { line = 897, character = 12 }, ["end"] = { line = 897, character = 23 } },
-      _ws_kind = 6,
-    },
-  }
-  local winner, label, ranked = ranking.pick_winner_with_label(hits, {}, ref_file, "")
+  local ok, sf = pcall(require, "utils.ue_goto.syntax_filter")
   local lines = {
     "=== UEDefSelfTest  module_rev=" .. MODULE_REVISION,
-    "input: 2 header hits, same module (simulated GetBinCount)",
-    "winner: " .. (winner and ("PICKED " .. (winner.uri or "?") ..
-      ":" .. tostring(winner.range and winner.range.start and winner.range.start.line + 1 or "?"))
-      or "NIL (ambiguous — header-only relaxation NOT loaded; module is stale)"),
-    "label: " .. tostring(label),
-    "ranked count: " .. tostring(#(ranked or {})),
-    "result: " .. (winner and "PASS ✓" or "FAIL ✗ — restart nvim or :Lazy reload utils.lsp_fallback"),
   }
+  if not ok then
+    table.insert(lines, "FAIL ✗ — syntax_filter module not loadable: " .. tostring(sf))
+  else
+    table.insert(lines, "syntax_filter module: LOADED ✓")
+    table.insert(lines, "ranking.clear_winner removed: " ..
+      tostring(require("utils.ue_goto.ranking").clear_winner == nil))
+    table.insert(lines, "result: PASS ✓")
+  end
   for _, l in ipairs(lines) do print(l) end
-  return winner ~= nil
+  return ok
 end
 vim.api.nvim_create_user_command("UEDefSelfTest", function() M.self_test() end, {})
 
@@ -146,14 +135,28 @@ local function jump_to_location(location)
       tostring(reason), prev_cur[1], prev_cur[2], ln, cc)
   end
 
+  local pre_buf = vim.api.nvim_get_current_buf()
+  local pre_cur = vim.api.nvim_win_get_cursor(0)
+
   local ok = jumper.jump(location)
   if not ok then return false end
 
   local sym = location._sym_name or location._origin_cword
+  local reconcile_ok = true
   if sym and #sym > 0 then
     local range = location.range or location.targetSelectionRange or location.targetRange
     local line_1b = ((range and range.start and range.start.line) or 0) + 1
-    pcall(provider.reconcile_landing_to_definition, sym, line_1b, dtrace)
+    local rok, rresult = pcall(provider.reconcile_landing_to_definition, sym, line_1b, dtrace)
+    if rok and rresult == false then
+      reconcile_ok = false
+    end
+  end
+
+  if not reconcile_ok then
+    pcall(dtrace, "jump: REJECTED bogus location, restoring cursor to %d:%d", pre_cur[1], pre_cur[2])
+    pcall(vim.api.nvim_set_current_buf, pre_buf)
+    pcall(vim.api.nvim_win_set_cursor, 0, pre_cur)
+    return false
   end
 
   local cur = vim.api.nvim_win_get_cursor(0)
@@ -350,32 +353,50 @@ function M.definition()
           tostring(uri):gsub("file:///", ""):sub(-80), ln, tostring(loc._ws_kind))
       end
 
-      local winner, label = ranking.pick_winner_with_label(ws_locs, platform_hints, ref_file, receiver)
-      dtrace("instant: pick_winner winner=%s label=%s",
-        tostring(winner ~= nil), tostring(label))
-      if not winner then return end
+      -- SYNTAX FILTER (deterministic overload disambiguation).
+      local filtered, fi = syntax_filter.filter_by_call_signature(ws_locs, bufnr, dtrace)
+      dtrace("instant: syntax_filter applied=%s K=%s before=%d after=%d skipped=%d",
+        tostring(fi.applied), tostring(fi.call_arity), fi.before, fi.after, fi.skipped)
 
-      if not jumped then
-        winner._origin_cword = sym
-        local pok, ok_or_err = pcall(jump_to_location, winner)
-        local ok = pok and ok_or_err == true
-        dtrace("instant: jump pok=%s ok=%s err=%s",
-          tostring(pok), tostring(ok), pok and "" or tostring(ok_or_err):sub(1,80))
-        if ok then
-          jumped = true
-          instant_winner = winner
-          done(string.format("⚡ %s → %s (instant)", sym or "?", label or "?"), 3000)
-        else
-          if not pok then
-            vim.schedule(function()
-              vim.notify(string.format(
-                "⚠ instant jump errored, falling back: %s",
-                tostring(ok_or_err):sub(1, 200)
-              ), vim.log.levels.DEBUG)
-            end)
+      if #filtered == 1 then
+        local winner = filtered[1]
+        if not jumped then
+          winner._origin_cword = sym
+          winner._sym_name = sym
+          local pok, ok_or_err = pcall(jump_to_location, winner)
+          local ok = pok and ok_or_err == true
+          local p = location_mod.location_path(winner)
+          local short = p:match("([^/\\]+)$") or "?"
+          local label = string.format("%s:%d", short, location_mod.location_line(winner))
+          dtrace("instant: jump pok=%s ok=%s label=%s err=%s",
+            tostring(pok), tostring(ok), label,
+            pok and "" or tostring(ok_or_err):sub(1, 80))
+          if ok then
+            jumped = true
+            instant_winner = winner
+            local tag = fi.applied and "instant·syntax" or "instant"
+            done(string.format("⚡ %s → %s (%s)", sym or "?", label, tag), 3000)
+          end
+        end
+      elseif #filtered > 1 then
+        -- Multiple candidates pass the syntax filter — show quickfix
+        -- sorted by ranking heuristics. Do NOT auto-pick.
+        local sorted = ranking.rerank_locations(filtered, platform_hints, ref_file, receiver)
+        if not jumped then
+          local outcome = ui.try_jump(sorted, "LSP definitions (instant)")
+          if outcome == true or outcome == "open_failed" then
+            jumped = true
+            local first = sorted[1]
+            local p = location_mod.location_path(first)
+            local short = p:match("([^/\\]+)$") or "?"
+            local label = string.format("%s:%d", short, location_mod.location_line(first))
+            local tag = fi.applied and "instant·syntax" or "instant"
+            done(string.format("⚡ %s → %s (%d candidates, %s)", sym or "?", label, #sorted, tag), 3000)
           end
         end
       end
+      -- #filtered == 0 case is impossible — syntax_filter has its own
+      -- "all eliminated → fallback" safety net.
     end)
   end
 
@@ -397,41 +418,54 @@ function M.definition()
       end
 
       if locs and #locs > 0 then
-        local winner, label, ranked = ranking.pick_winner_with_label(locs, platform_hints, ref_file, receiver)
-        dtrace("precise: pick winner=%s label=%s n_ranked=%d",
-          tostring(winner ~= nil), tostring(label), #(ranked or locs))
+        local filtered, fi = syntax_filter.filter_by_call_signature(locs, bufnr, dtrace)
+        dtrace("precise: syntax_filter applied=%s K=%s before=%d after=%d skipped=%s",
+          tostring(fi.applied), tostring(fi.call_arity), fi.before, fi.after, tostring(fi.skipped))
 
         if not jumped then
-          if winner then
+          if #filtered == 1 then
+            local winner = filtered[1]
             winner._origin_cword = sym
+            winner._sym_name = sym
             local pok, ok = pcall(jump_to_location, winner)
             ok = pok and ok
             dtrace("precise: jump pok=%s ok=%s", tostring(pok), tostring(ok))
             if ok then
               jumped = true
-              done(string.format("✓ %s → %s (precise)", sym or "?", label or "?"), 3000)
+              local p = location_mod.location_path(winner)
+              local short = p:match("([^/\\]+)$") or "?"
+              local label = string.format("%s:%d", short, location_mod.location_line(winner))
+              local tag = fi.applied and "precise·syntax" or "precise"
+              done(string.format("✓ %s → %s (%s)", sym or "?", label, tag), 3000)
               return
             end
           end
-          local outcome = ui.try_jump(ranked or locs, "LSP definitions")
+          local sorted = ranking.rerank_locations(filtered, platform_hints, ref_file, receiver)
+          local outcome = ui.try_jump(sorted, "LSP definitions")
           if outcome == true or outcome == "open_failed" then
-            local first = (ranked or locs)[1]
-            local _, lab2 = ranking.pick_winner_with_label({ first }, platform_hints, ref_file, receiver)
             jumped = true
-            done(string.format("✓ %s → %s (%d candidates)", sym or "?",
-              lab2 or "?", #(ranked or locs)), 3000)
+            local first = sorted[1]
+            local p = location_mod.location_path(first)
+            local short = p:match("([^/\\]+)$") or "?"
+            local label = string.format("%s:%d", short, location_mod.location_line(first))
+            local tag = fi.applied and "precise·syntax" or "precise"
+            done(string.format("✓ %s → %s (%d candidates, %s)", sym or "?", label, #sorted, tag), 3000)
             return
           end
         else
-          -- instant already jumped. Reconcile if precise disagrees.
-          if INSTANT_PRECISE_RECONCILE and winner and instant_winner then
-            local same = location_mod.location_key(winner) == location_mod.location_key(instant_winner)
+          -- instant already jumped. Reconcile if precise (post-filter) disagrees.
+          if INSTANT_PRECISE_RECONCILE and instant_winner and #filtered >= 1 then
+            local precise_pick = filtered[1]
+            local same = location_mod.location_key(precise_pick) == location_mod.location_key(instant_winner)
             if not same then
+              local p = location_mod.location_path(precise_pick)
+              local short = p:match("([^/\\]+)$") or "?"
+              local label = string.format("%s:%d", short, location_mod.location_line(precise_pick))
               vim.notify(string.format(
                 "ℹ precise definition differs: %s (press <leader>gP to switch)",
-                label or "?"
+                label
               ), vim.log.levels.INFO)
-              M._last_precise_winner = winner
+              M._last_precise_winner = precise_pick
             end
           end
           done()

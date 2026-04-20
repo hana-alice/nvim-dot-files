@@ -57,17 +57,20 @@ for _, k in ipairs(public) do
 end
 
 P("\n--- pure-logic invariants ---")
--- 1. ranking picks .cpp over .h (header-only relax must NOT trigger when
---    a .cpp is present)
+-- 1. ranking sorts .cpp before .h (winner-pick was removed in 2026-04
+--    syntax-filter-v1; ranking is now sort-only, used as quickfix order
+--    after syntax_filter narrows candidates).
 do
   local cpp = { uri = "file:///c:/x/y.cpp", range = { start = { line = 0 } } }
   local h   = { uri = "file:///c:/x/y.h",   range = { start = { line = 0 } } }
-  local w, lbl = ranking.pick_winner_with_label({ h, cpp }, {}, "/c/x/z.cpp", "")
-  if w == cpp and lbl:match("y%.cpp:1") then
-    P("OK   .cpp beats .h:", lbl)
+  local sorted = ranking.rerank_locations({ h, cpp }, {}, "/c/x/z.cpp", "")
+  if sorted[1] == cpp and sorted[2] == h then
+    P("OK   .cpp sorts before .h (rerank_locations)")
   else
-    P("FAIL .cpp beats .h: got", tostring(w), tostring(lbl))
-    missing[#missing + 1] = "rank_cpp"
+    P("FAIL .cpp sort: got",
+      tostring(sorted[1] and sorted[1].uri),
+      tostring(sorted[2] and sorted[2].uri))
+    missing[#missing + 1] = "rank_cpp_sort"
   end
 end
 -- 2. self_test (synthetic GetBinCount header-only relax) returns true

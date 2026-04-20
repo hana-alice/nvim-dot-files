@@ -231,7 +231,7 @@ Reading large files:
 
 | Key              | Action                                  |
 |------------------|-----------------------------------------|
-| `gd`             | Go to definition (LSP → GTAGS → rg)     |
+| `gd`             | Go to definition (TS overload filter → LSP → GTAGS → rg) |
 | `gr`             | References (LSP → GTAGS fallback)       |
 | `gD`             | Go to declaration                       |
 | `gI`             | Go to implementation                    |
@@ -256,6 +256,18 @@ Reading large files:
 LSP fallback chain (gd / gr): LSP → GTAGS index → ripgrep word search.
 Status: `:UEDefStatus`. Used heavily for huge UE codebases where clangd
 is still loading.
+
+`gd` overload disambiguation (since 2026-04 syntax-filter-v1):
+treesitter parses cursor's call_expression for argument count K, then
+for each candidate parses its function_declarator for params P/D/V.
+Drops mismatched candidates pre-jump. Spinner tag indicates path:
+  ⚡ ... (instant·syntax)  — ws/symbol + filter, single match → jumped
+  ⚡ ... (instant)         — ws/symbol, filter inactive (cursor not in call)
+  ✓ ... (precise·syntax)   — textDocument/definition + filter
+  ✓ ... (N candidates, ...) — filter left N>1 → quickfix sorted by ranking
+  ⊘ ... — dependent-name early-bail (template parameter)
+  ● already at ... — cursor IS the definition site
+Trace: `:UEDefTrace`. Self-test: `:UEDefSelfTest`.
 
 ## Picker / Search (Snacks)
 

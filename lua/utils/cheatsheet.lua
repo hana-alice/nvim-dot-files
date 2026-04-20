@@ -183,7 +183,7 @@ local tabs = {
           { "n / N",           "Next / prev match" },
           { "* / #",           "Search word fwd / back" },
           { ":noh",            "Clear search highlight" },
-          { "gd",              "Definition (LSP→GTAGS→rg)" },
+          { "gd",              "Definition (TS arity filter → LSP → GTAGS → rg)" },
           { "gr",              "References (LSP→GTAGS)" },
           { "gD",              "Declaration" },
           { "gI",              "Implementation" },

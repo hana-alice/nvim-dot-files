@@ -1380,6 +1380,22 @@ local function resolve_context(opts)
     end
   end
 
+  -- Fallback: when no buffer is open (dashboard / fresh nvim) and cwd is
+  -- the engine root itself, the prefix check above can't possibly match
+  -- (engine_root path will never be inside project_root, and the empty
+  -- buffer name fails the `candidate ~= ""` guard). In this case the
+  -- user has already explicitly run :UESetProject earlier — trust it.
+  -- Without this, :UEBuild / :UEStatus etc all error with "No project
+  -- configured" right after `z unrealen` until the user opens a project
+  -- source file, which is surprising UX.
+  if not project_root and state_project_root then
+    local has_real_buffer = cur_buf ~= "" and cur_buf ~= cur_cwd
+    if not has_real_buffer then
+      project_root = state_project_root
+      uproject = state_uproject
+    end
+  end
+
   local paths = cache_paths(engine_root)
   local state_stat = vim.uv.fs_stat(paths.state)
   local state_mtime = state_stat and state_stat.mtime and state_stat.mtime.sec or 0

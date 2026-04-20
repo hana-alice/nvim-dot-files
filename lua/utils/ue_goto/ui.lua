@@ -49,6 +49,16 @@ local SELF_DESTRUCT_MS = 8000
 
 function M.progress_notice(initial_msg)
   local self_destruct_timer = nil
+  -- Fallback id used when no notice has ever been emitted yet (or the
+  -- notify backend doesn't return an id from vim.notify). This MUST match
+  -- L74's opts.id so that replace=fallback_id targets the bubble we just
+  -- emitted. Without this, snacks.notifier (which often returns nil from
+  -- vim.notify) leaves _shared_notice_id == nil → hide_now() bails on
+  -- `current_id == nil` and the spinner sticks until self-destruct (8s)
+  -- — or, if the success vim.notify happens to land in a different slot,
+  -- forever. THIS is the long-standing "spinner never disappears even
+  -- after gd jumped" bug we've been chasing.
+  local FALLBACK_ID = "ue_lsp_definition_progress"
 
   local function cancel_self_destruct()
     if self_destruct_timer and not self_destruct_timer:is_closing() then
@@ -71,7 +81,7 @@ function M.progress_notice(initial_msg)
       opts.replace = _shared_notice_id
       opts.id = _shared_notice_id
     else
-      opts.id = "ue_lsp_definition_progress"
+      opts.id = FALLBACK_ID
     end
     if opts_override then
       for k, v in pairs(opts_override) do opts[k] = v end
@@ -81,7 +91,7 @@ function M.progress_notice(initial_msg)
       opts_override and opts_override.level or vim.log.levels.INFO,
       opts)
     if ok then
-      _shared_notice_id = new_id or _shared_notice_id
+      _shared_notice_id = new_id or _shared_notice_id or FALLBACK_ID
     end
   end
 

@@ -53,7 +53,7 @@ local INSTANT_PRECISE_RECONCILE = true
 -- ---------------------------------------------------------------------------
 -- Persistent debug ring-buffer (Tier 3: lift to ue_goto_dev/trace.lua).
 -- ---------------------------------------------------------------------------
-local MODULE_REVISION = "syntax-filter-v2-pairpicker"
+local MODULE_REVISION = "syntax-filter-v2-pairpicker-spinnerfix"
 local TRACE_MAX = 200
 local trace_ring = {}
 local trace_idx = 0

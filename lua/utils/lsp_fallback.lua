@@ -39,6 +39,7 @@ local provider     = require("utils.ue_goto.provider")
 local ui           = require("utils.ue_goto.ui")
 local jumper       = require("utils.ue_goto.jumper")
 local syntax_filter = require("utils.ue_goto.syntax_filter")
+local pair_picker = require("utils.ue_goto.pair_picker")
 
 -- ---------------------------------------------------------------------------
 -- Tunables
@@ -52,7 +53,7 @@ local INSTANT_PRECISE_RECONCILE = true
 -- ---------------------------------------------------------------------------
 -- Persistent debug ring-buffer (Tier 3: lift to ue_goto_dev/trace.lua).
 -- ---------------------------------------------------------------------------
-local MODULE_REVISION = "syntax-filter-v1"
+local MODULE_REVISION = "syntax-filter-v2-pairpicker"
 local TRACE_MAX = 200
 local trace_ring = {}
 local trace_idx = 0
@@ -379,10 +380,32 @@ function M.definition()
           end
         end
       elseif #filtered > 1 then
-        -- Multiple candidates pass the syntax filter — show quickfix
-        -- sorted by ranking heuristics. Do NOT auto-pick.
-        local sorted = ranking.rerank_locations(filtered, platform_hints, ref_file, receiver)
+        -- Multiple candidates pass syntax_filter. Try pair_picker for the
+        -- two structurally-safe auto-jump patterns (header+cpp pair, sole
+        -- cpp among headers). On miss, fall back to quickfix sorted by
+        -- ranking heuristics.
+        local pp_winner, pp_rule = pair_picker.pick_safe_winner(filtered)
+        if pp_winner and not jumped then
+          pp_winner._origin_cword = sym
+          pp_winner._sym_name = sym
+          local pok, ok_or_err = pcall(jump_to_location, pp_winner)
+          local ok = pok and ok_or_err == true
+          local p = location_mod.location_path(pp_winner)
+          local short = p:match("([^/\\]+)$") or "?"
+          local label = string.format("%s:%d", short, location_mod.location_line(pp_winner))
+          dtrace("instant: pair_picker rule=%s pok=%s ok=%s label=%s",
+            tostring(pp_rule), tostring(pok), tostring(ok), label)
+          if ok then
+            jumped = true
+            instant_winner = pp_winner
+            local tag = fi.applied
+              and string.format("instant·syntax·%s", pp_rule)
+              or  string.format("instant·%s", pp_rule)
+            done(string.format("⚡ %s → %s (%s, %d→1)", sym or "?", label, tag, #filtered), 3000)
+          end
+        end
         if not jumped then
+          local sorted = ranking.rerank_locations(filtered, platform_hints, ref_file, receiver)
           local outcome = ui.try_jump(sorted, "LSP definitions (instant)")
           if outcome == true or outcome == "open_failed" then
             jumped = true
@@ -438,6 +461,28 @@ function M.definition()
               local tag = fi.applied and "precise·syntax" or "precise"
               done(string.format("✓ %s → %s (%s)", sym or "?", label, tag), 3000)
               return
+            end
+          elseif #filtered > 1 then
+            -- Try pair_picker before falling to quickfix.
+            local pp_winner, pp_rule = pair_picker.pick_safe_winner(filtered)
+            if pp_winner then
+              pp_winner._origin_cword = sym
+              pp_winner._sym_name = sym
+              local pok, ok = pcall(jump_to_location, pp_winner)
+              ok = pok and ok
+              dtrace("precise: pair_picker rule=%s pok=%s ok=%s",
+                tostring(pp_rule), tostring(pok), tostring(ok))
+              if ok then
+                jumped = true
+                local p = location_mod.location_path(pp_winner)
+                local short = p:match("([^/\\]+)$") or "?"
+                local label = string.format("%s:%d", short, location_mod.location_line(pp_winner))
+                local tag = fi.applied
+                  and string.format("precise·syntax·%s", pp_rule)
+                  or  string.format("precise·%s", pp_rule)
+                done(string.format("✓ %s → %s (%s, %d→1)", sym or "?", label, tag, #filtered), 3000)
+                return
+              end
             end
           end
           local sorted = ranking.rerank_locations(filtered, platform_hints, ref_file, receiver)

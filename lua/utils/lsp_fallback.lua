@@ -38,6 +38,7 @@ local ranking      = require("utils.ue_goto.ranking")
 local provider     = require("utils.ue_goto.provider")
 local ui           = require("utils.ue_goto.ui")
 local jumper       = require("utils.ue_goto.jumper")
+local syntax_filter = require("utils.ue_goto.syntax_filter")
 
 -- ---------------------------------------------------------------------------
 -- Tunables
@@ -350,32 +351,50 @@ function M.definition()
           tostring(uri):gsub("file:///", ""):sub(-80), ln, tostring(loc._ws_kind))
       end
 
-      local winner, label = ranking.pick_winner_with_label(ws_locs, platform_hints, ref_file, receiver)
-      dtrace("instant: pick_winner winner=%s label=%s",
-        tostring(winner ~= nil), tostring(label))
-      if not winner then return end
+      -- SYNTAX FILTER (deterministic overload disambiguation).
+      local filtered, fi = syntax_filter.filter_by_call_signature(ws_locs, bufnr, dtrace)
+      dtrace("instant: syntax_filter applied=%s K=%s before=%d after=%d skipped=%d",
+        tostring(fi.applied), tostring(fi.call_arity), fi.before, fi.after, fi.skipped)
 
-      if not jumped then
-        winner._origin_cword = sym
-        local pok, ok_or_err = pcall(jump_to_location, winner)
-        local ok = pok and ok_or_err == true
-        dtrace("instant: jump pok=%s ok=%s err=%s",
-          tostring(pok), tostring(ok), pok and "" or tostring(ok_or_err):sub(1,80))
-        if ok then
-          jumped = true
-          instant_winner = winner
-          done(string.format("⚡ %s → %s (instant)", sym or "?", label or "?"), 3000)
-        else
-          if not pok then
-            vim.schedule(function()
-              vim.notify(string.format(
-                "⚠ instant jump errored, falling back: %s",
-                tostring(ok_or_err):sub(1, 200)
-              ), vim.log.levels.DEBUG)
-            end)
+      if #filtered == 1 then
+        local winner = filtered[1]
+        if not jumped then
+          winner._origin_cword = sym
+          winner._sym_name = sym
+          local pok, ok_or_err = pcall(jump_to_location, winner)
+          local ok = pok and ok_or_err == true
+          local p = location_mod.location_path(winner)
+          local short = p:match("([^/\\]+)$") or "?"
+          local label = string.format("%s:%d", short, location_mod.location_line(winner))
+          dtrace("instant: jump pok=%s ok=%s label=%s err=%s",
+            tostring(pok), tostring(ok), label,
+            pok and "" or tostring(ok_or_err):sub(1, 80))
+          if ok then
+            jumped = true
+            instant_winner = winner
+            local tag = fi.applied and "instant·syntax" or "instant"
+            done(string.format("⚡ %s → %s (%s)", sym or "?", label, tag), 3000)
+          end
+        end
+      elseif #filtered > 1 then
+        -- Multiple candidates pass the syntax filter — show quickfix
+        -- sorted by ranking heuristics. Do NOT auto-pick.
+        local sorted = ranking.rerank_locations(filtered, platform_hints, ref_file, receiver)
+        if not jumped then
+          local outcome = ui.try_jump(sorted, "LSP definitions (instant)")
+          if outcome == true or outcome == "open_failed" then
+            jumped = true
+            local first = sorted[1]
+            local p = location_mod.location_path(first)
+            local short = p:match("([^/\\]+)$") or "?"
+            local label = string.format("%s:%d", short, location_mod.location_line(first))
+            local tag = fi.applied and "instant·syntax" or "instant"
+            done(string.format("⚡ %s → %s (%d candidates, %s)", sym or "?", label, #sorted, tag), 3000)
           end
         end
       end
+      -- #filtered == 0 case is impossible — syntax_filter has its own
+      -- "all eliminated → fallback" safety net.
     end)
   end
 

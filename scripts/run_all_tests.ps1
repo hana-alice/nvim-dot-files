@@ -18,6 +18,7 @@ $tests = @(
   "test_call_arity.lua",
   "test_declarator_arity.lua",
   "test_syntax_filter.lua",
+  "test_pair_picker.lua",
   "test_ranking_sort.lua",
   "test_dependent_name.lua",
   "test_tier2_wireup.lua",

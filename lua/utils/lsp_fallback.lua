@@ -151,6 +151,43 @@ vim.api.nvim_create_user_command("UEDefReload", reload_ue_def, {
   desc = "Hot-reload ue_goto/lsp_fallback modules + run self-test",
 })
 
+-- :UEDefDiag — diagnose stuck/slow gd. Prints the last ~40 trace lines
+-- + cursor context (symbol, receiver, dependent, call_arity) so the user
+-- can grab one block of text when reporting "gd is hanging on FOO".
+vim.api.nvim_create_user_command("UEDefDiag", function()
+  local symbol_mod = require("utils.ue_goto.symbol")
+  local sym  = symbol_mod.current_symbol()
+  local recv = symbol_mod.current_receiver()
+  local at_def, dk, dn = symbol_mod.is_at_definition_at_cursor()
+  local dep, droot, dchain = symbol_mod.is_dependent_at_cursor()
+  local arity, callee
+  if symbol_mod.call_arity_at_cursor then
+    arity, callee = symbol_mod.call_arity_at_cursor()
+  end
+  local cur = vim.api.nvim_win_get_cursor(0)
+  local bufname = vim.api.nvim_buf_get_name(0)
+  print("=== UEDefDiag  rev=" .. MODULE_REVISION .. " ===")
+  print(string.format("buf:    %s:%d", bufname, cur[1]))
+  print(string.format("line:   %s", vim.api.nvim_get_current_line():sub(1, 100)))
+  print(string.format("symbol: %q  receiver: %q", tostring(sym), tostring(recv)))
+  print(string.format("at_def: %s (kind=%s name=%s)",
+    tostring(at_def), tostring(dk), tostring(dn)))
+  print(string.format("dependent: %s (root=%s chain=%s)",
+    tostring(dep), tostring(droot), tostring(dchain)))
+  print(string.format("call_arity K=%s callee=%s",
+    tostring(arity), tostring(callee)))
+  print("--- last 40 trace entries ---")
+  -- Reach into the local ring buffer.
+  local lines = {}
+  for i = 1, TRACE_MAX do
+    local idx = ((trace_idx - i) % TRACE_MAX) + 1
+    local entry = trace_ring[idx]
+    if entry then table.insert(lines, 1, entry) end
+    if #lines >= 40 then break end
+  end
+  for _, l in ipairs(lines) do print(l) end
+end, { desc = "Diagnose stuck gd: cursor context + last 40 trace lines" })
+
 -- ---------------------------------------------------------------------------
 -- Jump wrapper — jumper.jump + post-jump reconcile.
 -- ---------------------------------------------------------------------------

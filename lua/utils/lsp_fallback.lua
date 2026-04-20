@@ -119,6 +119,38 @@ function M.self_test()
 end
 vim.api.nvim_create_user_command("UEDefSelfTest", function() M.self_test() end, {})
 
+-- :UEDefReload — drop ue_goto/lsp_fallback bytecode from package.loaded and
+-- re-require, then print the new MODULE_REVISION. Use after editing any
+-- module under lua/utils/ue_goto/ or lua/utils/lsp_fallback.lua to pick up
+-- changes WITHOUT restarting nvim/Neovide. Also runs self_test for sanity.
+local function reload_ue_def()
+  local dropped = {}
+  for k in pairs(package.loaded) do
+    if k:match("^utils%.ue_goto") or k == "utils.lsp_fallback" then
+      package.loaded[k] = nil
+      dropped[#dropped + 1] = k
+    end
+  end
+  table.sort(dropped)
+  local ok, fresh = pcall(require, "utils.lsp_fallback")
+  local lines = { "=== UEDefReload ===" }
+  table.insert(lines, "dropped: " .. tostring(#dropped) .. " modules")
+  for _, k in ipairs(dropped) do table.insert(lines, "  - " .. k) end
+  if ok then
+    table.insert(lines, "reloaded: utils.lsp_fallback ✓")
+    table.insert(lines, "MODULE_REVISION = " .. tostring(fresh.MODULE_REVISION))
+    -- Also re-bind gd via the user's existing lspconfig glue if present.
+    local ok2, lf = pcall(require, "utils.lsp_fallback")
+    if ok2 and lf.self_test then lf.self_test() end
+  else
+    table.insert(lines, "FAIL re-require: " .. tostring(fresh))
+  end
+  for _, l in ipairs(lines) do print(l) end
+end
+vim.api.nvim_create_user_command("UEDefReload", reload_ue_def, {
+  desc = "Hot-reload ue_goto/lsp_fallback modules + run self-test",
+})
+
 -- ---------------------------------------------------------------------------
 -- Jump wrapper — jumper.jump + post-jump reconcile.
 -- ---------------------------------------------------------------------------

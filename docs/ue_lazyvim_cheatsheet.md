@@ -261,10 +261,12 @@ is still loading.
 treesitter parses cursor's call_expression for argument count K, then
 for each candidate parses its function_declarator for params P/D/V.
 Drops mismatched candidates pre-jump. Spinner tag indicates path:
+  ⚡ ... (instant·syntax·pair_h_cpp, N→1) — pair_picker 自动选 .cpp
+  ⚡ ... (instant·syntax·sole_cpp, N→1)  — N hdr + 1 cpp, 跳 cpp
   ⚡ ... (instant·syntax)  — ws/symbol + filter, single match → jumped
   ⚡ ... (instant)         — ws/symbol, filter inactive (cursor not in call)
   ✓ ... (precise·syntax)   — textDocument/definition + filter
-  ✓ ... (N candidates, ...) — filter left N>1 → quickfix sorted by ranking
+  ✓ ... (N candidates, ...) — filter + pair_picker 都没敲定 → quickfix
   ⊘ ... — dependent-name early-bail (template parameter)
   ● already at ... — cursor IS the definition site
 Trace: `:UEDefTrace`. Self-test: `:UEDefSelfTest`.

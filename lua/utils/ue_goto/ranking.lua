@@ -1,8 +1,10 @@
--- ue_goto.ranking — pure scoring + winner-pick on Location candidates.
+-- ue_goto.ranking — pure scoring + sort utilities for quickfix display.
 --
--- Stateless. No vim.api except via location.lua. Used by provider.lua
--- to pick the instant-track winner from workspace/symbol results, and
--- by the precise track to rank textDocument/definition responses.
+-- Stateless. NOTE (2026-04): the winner-pick functions (clear_winner /
+-- pick_winner_with_label) have been REMOVED. Overload disambiguation now
+-- lives in syntax_filter.lua (treesitter-driven). Ranking survives only
+-- as a tiebreaker that orders the quickfix list when multiple candidates
+-- pass the syntax filter.
 
 local location = require("utils.ue_goto.location")
 local symbol = require("utils.ue_goto.symbol")
@@ -119,47 +121,7 @@ function M.is_thin_header_only(locations)
   return true
 end
 
--- clear_winner(scored_locations, platform_hints, current_buf_path, receiver):
---   Decide whether a top-1 candidate clearly wins. Strategy:
---     1. Single candidate: trivially the winner.
---     2. Margin >= 200: confident pick (e.g. .cpp def vs .h decl).
---     3. Header-only result set with <=4 candidates: accept top-1 anyway.
---        clangd workspace/symbol commonly returns only header decls (the
---        out-of-class .cpp def isn't indexed as a top-level symbol). Without
---        this relaxation we'd ambiguous-bail on `RasterPipelines.GetBinCount`
---        and force the user to wait 30s for the precise track.
-function M.clear_winner(scored_locations, platform_hints, current_buf_path, receiver)
-  if #scored_locations < 2 then return scored_locations[1] end
-  local s1 = M.score_location_for_platform(scored_locations[1], platform_hints, current_buf_path, receiver)
-  local s2 = M.score_location_for_platform(scored_locations[2], platform_hints, current_buf_path, receiver)
-  if s1 - s2 >= 200 then return scored_locations[1] end
-  if M.is_thin_header_only(scored_locations) and #scored_locations <= 4 then
-    return scored_locations[1]
-  end
-  return nil
-end
-
--- pick_winner_with_label(locs, platform_hints, ref_file, receiver):
---   Reranks, picks a clear winner, returns (winner_loc, label, ranked).
---   Returns (nil, nil, ranked) when no clear winner — caller populates
---   quickfix from ranked.
---   Returns (nil, nil, nil) when locs is empty.
-function M.pick_winner_with_label(locs, platform_hints, ref_file, receiver)
-  if not locs or #locs == 0 then return nil, nil, nil end
-  local ranked = M.rerank_locations(locs, platform_hints, ref_file, receiver)
-  local winner = M.clear_winner(ranked, platform_hints, ref_file, receiver)
-  if not winner then return nil, nil, ranked end
-
-  local p = location.location_path(winner)
-  local short = (p ~= "" and (p:match("([^/\\]+)$") or p)) or "?"
-  local lnum
-  if winner.range and winner.range.start then
-    lnum = winner.range.start.line + 1
-  elseif winner.targetSelectionRange and winner.targetSelectionRange.start then
-    lnum = winner.targetSelectionRange.start.line + 1
-  end
-  local label = lnum and string.format("%s:%d", short, lnum) or short
-  return winner, label, ranked
-end
-
 return M
+
+
+

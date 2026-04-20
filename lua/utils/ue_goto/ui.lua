@@ -25,164 +25,113 @@ function M.buf_extension(bufnr)
 end
 
 -- ---------------------------------------------------------------------------
--- Progress notification
+-- Progress notification (FIRE-AND-FORGET model, rewritten 2026-04-20)
 -- ---------------------------------------------------------------------------
--- Returns {update = fn(msg), clear = fn(), finish = fn(msg, lifetime_ms)}.
--- Module-level singleton: only ONE LSP-definition notice may be visible at
--- a time. A second gd while the first is still resolving reuses the same
--- notification slot (snacks: same id; nvim-notify: same handle), so the
--- top-right corner never accumulates a stack of spinners.
+-- Returns {update = fn(msg) [no-op], clear = fn(), finish = fn(msg, lifetime_ms)}.
 --
--- SELF-DESTRUCT (Tier-1 hardening, 2026-04-18):
---   Even if the upstream business logic forgets to call clear()/finish(),
---   every progress_notice() automatically self-destructs after
---   SELF_DESTRUCT_MS. This is a defense-in-depth safety net — the real
---   fix lives in the provider/orchestrator's hard contract — but ensures
---   a runaway spinner can never linger longer than this regardless of
---   what bug crept in upstream.
+-- Why this exists in this shape:
+--   The previous implementation tried to maintain a single live spinner
+--   bubble via snacks.notifier `replace=id` semantics. In practice this
+--   was unreliable on Windows + snacks: identical id strings sometimes
+--   produced a NEW bubble instead of replacing the existing one (snacks
+--   GC'd the original entry but its floating window still lingered in
+--   nvim_list_wins). Symptom the user actually hit: two identical
+--   "⏳ resolving X ..." bubbles stuck on screen forever after a gd
+--   that hit the clangd indexing wall.
 --
---   Each update()/finish() resets the self-destruct timer. clear() cancels
---   it explicitly.
+--   We now model the spinner as a SHORT-LIVED disposable notification
+--   with a hard timeout (DEFAULT_LIFETIME_MS). It will self-dismiss
+--   regardless of any replace-semantic glitch, so a runaway spinner is
+--   impossible by construction. clear() is a BELT-AND-SUSPENDERS sweep
+--   that walks every floating window and force-closes anything titled
+--   "LSP definition" — this is the ground-truth dismiss path; we no
+--   longer trust id-based replace at all.
+--
+--   `update()` is a no-op shim (kept only to keep the handle shape
+--   stable; no live caller used it as of this rewrite).
+--
+-- Trade-off:
+--   - Pro: spinner CANNOT linger past DEFAULT_LIFETIME_MS, ever.
+--   - Pro: simpler — no replace, no id juggling, no self-destruct timer.
+--   - Con: very long resolves (>DEFAULT_LIFETIME_MS) lose the visible
+--     spinner before the result lands. For LSP gd this is fine because
+--     OVERALL_TIMEOUT_MS in lsp_fallback is already capped near this.
 
-local _shared_notice_id = nil
-local SELF_DESTRUCT_MS = 8000
+local DEFAULT_LIFETIME_MS = 8000
+
+-- Force-close any lingering floating notification bubbles for our title.
+-- This is the ground truth: it doesn't matter what snacks/noice/native
+-- thinks about replace=id — if a window is on screen with our title, we
+-- close it.
+local function close_all_definition_bubbles()
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    local ok_cfg, cfg = pcall(vim.api.nvim_win_get_config, win)
+    if ok_cfg and cfg.relative and cfg.relative ~= "" then
+      -- Title can be string or array-of-{text,hl}. Inspect safely.
+      local title_str = ""
+      if type(cfg.title) == "string" then
+        title_str = cfg.title
+      elseif type(cfg.title) == "table" then
+        for _, chunk in ipairs(cfg.title) do
+          if type(chunk) == "table" and chunk[1] then
+            title_str = title_str .. tostring(chunk[1])
+          end
+        end
+      end
+      -- Also peek the buffer text — some backends don't set title.
+      local buf_text = ""
+      local ok_b, lines = pcall(vim.api.nvim_buf_get_lines,
+        vim.api.nvim_win_get_buf(win), 0, 3, false)
+      if ok_b and lines then buf_text = table.concat(lines, "\n") end
+
+      if title_str:find("LSP definition", 1, true)
+        or buf_text:find("resolving", 1, true)
+        or buf_text:find("instant index path racing", 1, true)
+      then
+        pcall(vim.api.nvim_win_close, win, true)
+      end
+    end
+  end
+end
 
 function M.progress_notice(initial_msg)
-  local self_destruct_timer = nil
-  -- Fallback id used when no notice has ever been emitted yet (or the
-  -- notify backend doesn't return an id from vim.notify). This MUST match
-  -- L74's opts.id so that replace=fallback_id targets the bubble we just
-  -- emitted. Without this, snacks.notifier (which often returns nil from
-  -- vim.notify) leaves _shared_notice_id == nil → hide_now() bails on
-  -- `current_id == nil` and the spinner sticks until self-destruct (8s)
-  -- — or, if the success vim.notify happens to land in a different slot,
-  -- forever. THIS is the long-standing "spinner never disappears even
-  -- after gd jumped" bug we've been chasing.
-  local FALLBACK_ID = "ue_lsp_definition_progress"
+  -- Fire the notification. We deliberately do NOT pass replace= or id=
+  -- — every progress_notice is a fresh disposable bubble. snacks/noice
+  -- will lay them out vertically; clear()/finish() sweeps them all.
+  pcall(vim.notify, initial_msg, vim.log.levels.INFO, {
+    title = "LSP definition",
+    timeout = DEFAULT_LIFETIME_MS,
+    hide_from_history = true,
+  })
 
-  local function cancel_self_destruct()
-    if self_destruct_timer and not self_destruct_timer:is_closing() then
-      pcall(function() self_destruct_timer:stop(); self_destruct_timer:close() end)
-      self_destruct_timer = nil
-    end
-  end
-
-  local function emit(msg, opts_override)
-    -- hide_from_history is set from the FIRST emit — without this, snacks
-    -- writes every spinner update into :messages history even when we
-    -- pass `replace=id`. This is what makes the top-right corner appear to
-    -- accumulate "resolving..." entries across multiple gd invocations.
-    local opts = {
-      title = "LSP definition",
-      timeout = false,
-      hide_from_history = true,
-    }
-    if _shared_notice_id ~= nil then
-      opts.replace = _shared_notice_id
-      opts.id = _shared_notice_id
-    else
-      opts.id = FALLBACK_ID
-    end
-    if opts_override then
-      for k, v in pairs(opts_override) do opts[k] = v end
-    end
-    local ok, new_id = pcall(vim.notify,
-      msg,
-      opts_override and opts_override.level or vim.log.levels.INFO,
-      opts)
-    if ok then
-      _shared_notice_id = new_id or _shared_notice_id or FALLBACK_ID
-    end
-  end
-
-  emit(initial_msg)
-  local current_id = _shared_notice_id
-
-  -- Forward declarations so the self-destruct callback can reach hide().
   local handle = {}
 
-  local function hide_now()
-    cancel_self_destruct()
-    -- Hide the notification, regardless of which notify backend is in use
-    -- (snacks.notifier, nvim-notify, noice — all of them honor `replace=id`
-    -- with a near-zero timeout to dismiss the original bubble).
-    --
-    -- HISTORY: previous version only handled the nvim-notify path
-    -- (`package.loaded["notify"]`) and a `current_id.hide()` call. With
-    -- snacks.notifier (LazyVim default) the id is a string/number — neither
-    -- branch fired, so the spinner was never actually dismissed. Symptom:
-    -- "✓ jumped" success toast appears AND the "⏳ resolving …" spinner
-    -- stays on screen until the 8s self-destruct (or forever if that path
-    -- also no-ops). Fix is one universal call.
-    pcall(function()
-      if current_id == nil then return end
-      -- nvim-notify exposes a record with :hide() — use it if present.
-      if type(current_id) == "table" and type(current_id.hide) == "function" then
-        current_id:hide()
-        return
-      end
-      -- Universal path: emit an empty replacement with a tiny timeout. snacks
-      -- and noice both treat this as "remove the bubble". hide_from_history
-      -- prevents the empty replacement from polluting :messages.
-      pcall(vim.notify, "", vim.log.levels.INFO, {
-        replace = current_id,
-        id = current_id,
-        timeout = 1,
-        hide_from_history = true,
-      })
-    end)
-    if _shared_notice_id == current_id then _shared_notice_id = nil end
-    current_id = nil
+  -- update() kept as no-op shim for handle-shape stability. If you ever
+  -- want live progress text again, do it by emitting a brand-new notice
+  -- AFTER calling close_all_definition_bubbles() — never rely on replace.
+  handle.update = function(_msg) end
+
+  handle.clear = function()
+    close_all_definition_bubbles()
   end
 
-  -- Arm self-destruct: if no one calls clear()/finish() within SELF_DESTRUCT_MS
-  -- the spinner force-hides itself. Each update() rearms it.
-  local function arm_self_destruct()
-    cancel_self_destruct()
-    self_destruct_timer = vim.defer_fn(function()
-      -- Force a "timed out" finish with a short lifetime so the user
-      -- gets a visible cue rather than the spinner just vanishing.
-      emit("⌛ progress notice self-timed-out (no terminating callback)", {
-        timeout = 2000,
-        hide_from_history = false,
-        level = vim.log.levels.WARN,
-      })
-      vim.defer_fn(hide_now, 2200)
-    end, SELF_DESTRUCT_MS)
-  end
-
-  arm_self_destruct()
-
-  handle.update = function(msg)
-    emit(msg)
-    arm_self_destruct() -- re-arm on each progress update
-  end
-
-  handle.clear = hide_now
-
-  -- Update the notice to a "done" message that auto-dismisses after
-  -- lifetime_ms. The "done" message is allowed into history so the user
-  -- can see the latest resolution in :messages — only spinner ticks are
-  -- history-suppressed.
   handle.finish = function(msg, lifetime_ms, level)
-    cancel_self_destruct()
-    lifetime_ms = lifetime_ms or 3000
-    emit(msg, {
-      timeout = lifetime_ms,
-      level = level or vim.log.levels.INFO,
-      hide_from_history = false,
-    })
-    local id_at_finish = current_id
-    vim.defer_fn(function()
-      -- Only hide if we still own the slot (no newer notice has taken it).
-      if _shared_notice_id == id_at_finish then
-        hide_now()
-      end
-    end, lifetime_ms + 200)
+    close_all_definition_bubbles()
+    if msg and msg ~= "" then
+      pcall(vim.notify, msg, level or vim.log.levels.INFO, {
+        title = "LSP definition",
+        timeout = lifetime_ms or 3000,
+        hide_from_history = false,
+      })
+    end
   end
 
   return handle
 end
+
+-- Public hook so other modules (or :GdReset commands) can sweep stuck
+-- bubbles without going through a handle.
+M.close_all_definition_bubbles = close_all_definition_bubbles
 
 -- try_jump(locations, title): single-location jump or quickfix.
 -- Returns:

@@ -1388,11 +1388,25 @@ local function resolve_context(opts)
   -- Without this, :UEBuild / :UEStatus etc all error with "No project
   -- configured" right after `z unrealen` until the user opens a project
   -- source file, which is surprising UX.
+  --
+  -- Extended fallback: when the user is browsing engine source (cwd or
+  -- buffer is inside engine_root) and didn't auto-detect a project from
+  -- the buffer path either, also trust state.project_root. Typical case:
+  -- `z unrealen` (UnrealEngine bare engine repo, no .uproject anywhere
+  -- nearby) + browsing Renderer/Engine sources to build a game project
+  -- pinned earlier via :UESetProject pointing to a different drive.
   if not project_root and state_project_root then
     local has_real_buffer = cur_buf ~= "" and cur_buf ~= cur_cwd
     if not has_real_buffer then
       project_root = state_project_root
       uproject = state_uproject
+    else
+      local cwd_in_engine = cur_cwd ~= "" and path_has_prefix(cur_cwd, engine_root)
+      local buf_in_engine = cur_buf ~= "" and path_has_prefix(cur_buf, engine_root)
+      if cwd_in_engine or buf_in_engine then
+        project_root = state_project_root
+        uproject = state_uproject
+      end
     end
   end
 
@@ -4315,9 +4329,16 @@ local function generate_compile_commands(ctx)
 end
 
 -- ==========================================================================
--- ANDROID BUILD
+-- BUILD COMMAND (UBT/Build.bat — platform from state.target_platform)
 -- ==========================================================================
 
+-- Build a UBT/Build.bat command for the platform+configuration persisted in
+-- state.json (set via :UESetPlatform). Despite the legacy name, this is
+-- platform-agnostic — Win64/Android/IOS/Linux all flow through the same
+-- "Build.bat <Target> <Platform> <Configuration> -Project=..." invocation.
+-- Kept as `android_build_command` for now to avoid breaking the public
+-- M.android_build_command API surface; rename together when there are
+-- no external callers left.
 local function android_build_command(ctx)
   local uproject = ctx.uproject or find_uproject_in_dir(ctx.project_root)
   if not uproject then

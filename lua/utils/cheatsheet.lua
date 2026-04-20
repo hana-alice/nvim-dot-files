@@ -434,9 +434,9 @@ local tabs = {
         },
       },
       {
-        title = "Android",
+        title = "Build / Run",
         mappings = {
-          { "<leader>ub",   "Android build" },
+          { "<leader>ub",   "Build (platform from :UESetPlatform)" },
           { "<leader>ui",   "Install APK" },
           { "<leader>ul",   "Launch app (no debug)" },
           { "<leader>ug",   "Toggle app log" },

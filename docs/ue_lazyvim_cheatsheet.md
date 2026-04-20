@@ -457,7 +457,7 @@ Note: some `u` prefix keys are overridden by UE/Android workflow
 | `<leader>uP`              | Same (legacy key)                   |
 | `:UESetPlatform`           | Interactive platform+config select |
 | `:UESetPlatform Win64 Development Editor` | Direct set          |
-| `<leader>ub`              | Android Development build           |
+| `<leader>ub`              | Build (platform from :UESetPlatform) |
 | `<leader>ue`              | Run UEPrepare (index + cc)          |
 | `<leader>uB`              | Same (legacy key)                   |
 | `<leader>uc`              | Export compile_commands.json        |

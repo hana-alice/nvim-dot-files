@@ -719,4 +719,87 @@ function M.call_arity_at_cursor()
   return arity, name
 end
 
+-- ---------------------------------------------------------------------------
+-- Off-buffer function-declarator arity probe.
+--
+-- Reads file from disk, parses with vim.treesitter.get_string_parser (no
+-- buffer side effect), locates the nearest function_declarator at or
+-- straddling line_1b, and returns (formal_count, default_count, is_variadic).
+--
+-- Returns nil on parse failure / file missing — caller should treat nil as
+-- "unknown, do not filter this candidate out".
+--
+-- Tolerance: clangd's index line numbers can be off by ±1 vs source (newline
+-- normalization, multi-line declarators). We search a ±3 line window for
+-- the nearest function_declarator node.
+-- ---------------------------------------------------------------------------
+function M.declarator_arity_at(path, line_1b)
+  if not path or path == "" then return nil end
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local content = f:read("*a"); f:close()
+  if not content or content == "" then return nil end
+
+  local ok_p, parser = pcall(vim.treesitter.get_string_parser, content, "cpp")
+  if not ok_p or not parser then return nil end
+  local ok_parse, trees = pcall(function() return parser:parse() end)
+  if not ok_parse or not trees or not trees[1] then return nil end
+  local root = trees[1]:root()
+
+  local target_row = (line_1b or 1) - 1
+  local LO = math.max(0, target_row - 3)
+  local HI = target_row + 3
+
+  -- Find the function_declarator whose start_row falls within [LO, HI],
+  -- preferring the one closest to target_row.
+  local best_decl = nil
+  local best_dist = math.huge
+
+  local function walk(node)
+    local sr = node:start()
+    local er = node:end_()
+    if er < LO or sr > HI then
+      -- entirely outside window — recurse only if node spans across (could contain a hit)
+      if sr <= HI and er >= LO then
+        for c in node:iter_children() do walk(c) end
+      end
+      return
+    end
+    local t = node:type()
+    if t == "function_declarator" then
+      local d = math.abs(sr - target_row)
+      if d < best_dist then best_dist = d; best_decl = node end
+    end
+    for c in node:iter_children() do walk(c) end
+  end
+  walk(root)
+  if not best_decl then return nil end
+
+  -- parameters field
+  local pf = best_decl:field("parameters")
+  local plist = pf and pf[1]
+  if not plist then
+    for c in best_decl:iter_children() do
+      if c:type() == "parameter_list" then plist = c; break end
+    end
+  end
+  if not plist then return 0, 0, false end
+
+  local count = 0
+  local defaults = 0
+  local variadic = false
+
+  for c in plist:iter_children() do
+    local t = c:type()
+    if t == "parameter_declaration" or t == "optional_parameter_declaration" then
+      count = count + 1
+      if t == "optional_parameter_declaration" then defaults = defaults + 1 end
+    elseif t == "variadic_parameter_declaration" or t == "..." then
+      variadic = true
+    end
+  end
+
+  return count, defaults, variadic
+end
+
 return M

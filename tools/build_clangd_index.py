@@ -112,11 +112,30 @@ def main():
     print(f"Output: {idx_path}")
     print(f"Indexer: {indexer}")
 
+    # CRITICAL: Inject Definitions.<Module>.h #defines as explicit -D into CDB.
+    # clangd-indexer's disableUnsupportedOptions() strips -include-pch, which
+    # makes the Build.h:47 #error UE_BUILD_DEBUG fire on ~97% of UE TUs and
+    # produces a useless index. We expand the .h file's #defines into -D args
+    # so the indexer sees the macros without needing PCH support.
+    inject_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inject_definitions_to_cdb.py")
+    if os.path.isfile(inject_script):
+        print("\n[1/2] Injecting Definitions.h #defines into CDB...")
+        rc = subprocess.call([sys.executable, "-I", inject_script, cdb_path])
+        if rc != 0:
+            print(f"  WARN: inject_definitions_to_cdb returned {rc}")
+        # Re-read CDB after injection (size may have grown)
+        with open(cdb_path, "r", encoding="utf-8") as f:
+            cdb = json.load(f)
+        print(f"  CDB size after inject: {len(cdb)} entries, {os.path.getsize(cdb_path)/1024/1024:.1f} MB")
+    else:
+        print(f"  WARN: {inject_script} not found, skipping injection")
+        print(f"  (Indexer will likely fail on ~97% of UE TUs without it.)")
+
     # Build index
-    cmd = [indexer, "--executor=all-TUs", cdb_path]
+    cmd = [indexer, "--executor=all-TUs"]
     if args.jobs > 0:
-        # clangd-indexer doesn't have -j flag, it uses all CPUs by default
-        pass
+        cmd.append(f"--execute-concurrency={args.jobs}")
+    cmd.append(cdb_path)
 
     print(f"\nBuilding index... (this may take a while)")
     t0 = time.time()

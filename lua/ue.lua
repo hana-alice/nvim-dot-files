@@ -772,12 +772,13 @@ function M.clangd_cmd(root_dir)
   local cmd = {
     clangd,
     "--background-index",
-    "--background-index-priority=normal",
+    "--background-index-priority=background",  -- nice 到最低，editing 不抢 UI 调度
     "-j=" .. tostring(jobs),
     "--completion-style=detailed",
     "--completion-parse=auto",          -- text-based completion while preamble builds
     "--header-insertion=never",
     "--pch-storage=memory",
+    "--clang-tidy=false",               -- 显式关 tidy（.clangd 已 Remove '*'，cmdline 兜底防回归）
     "--function-arg-placeholders",
     "--limit-results=200",
     "--limit-references=200",

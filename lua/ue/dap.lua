@@ -100,7 +100,7 @@ local function kill_managed_codelldb_processes()
   return killed
 end
 
-stop_android_debugger = function(opts)
+function D.stop_android_debugger(opts)
   opts = opts or {}
   local dap_ok, dap = pcall(require, "dap")
   local session = dap_ok and dap.session and dap.session() or nil

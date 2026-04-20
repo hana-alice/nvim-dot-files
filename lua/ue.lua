@@ -5981,7 +5981,11 @@ end
 -- export_compile_commands is now an alias for prepare_async (unified flow)
 local export_compile_commands
 
-local stop_android_debugger
+-- stop_android_debugger lives in ue/dap.lua and is now accessed via
+-- `require("ue.dap").stop_android_debugger(...)` directly. The previous
+-- forward-declaration pattern relied on dap.lua doing a bare global write
+-- to fill this local, which silently broke after the tiered split (different
+-- main chunks don't share locals). See build_android() below.
 
 local function build_android()
   local ctx, err = resolve_context()
@@ -6009,7 +6013,7 @@ local function build_android()
   end
 
   if plat == "Android" then
-    local cleanup = stop_android_debugger({ kill_orphans = true })
+    local cleanup = require("ue.dap").stop_android_debugger({ kill_orphans = true })
     cleanup_gradle_debug_artifacts(ctx)
     if cleanup.disconnected or cleanup.adapter_killed or cleanup.orphan_killed > 0 then
       local parts = {}

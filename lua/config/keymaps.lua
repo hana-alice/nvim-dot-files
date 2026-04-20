@@ -213,6 +213,11 @@ map("n", "gd", function()
   require("utils.lsp_fallback").definition()
 end, { desc = "Definition (LSP -> GTAGS)" })
 
+-- Eagerly load utils.lsp_fallback so its :UEDef* user_commands
+-- (UEDefTrace / UEDefSelfTest / UEDefReload) are registered at startup
+-- — otherwise they only appear after the first gd. ~5ms cost.
+pcall(require, "utils.lsp_fallback")
+
 vim.keymap.set("n", "<leader>gP", function()
   require("utils.lsp_fallback").jump_to_precise()
 end, { desc = "Jump to precise definition (after instant jump)" })

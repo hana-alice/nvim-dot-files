@@ -385,7 +385,7 @@ end
 --   Tier 3: lift the search into the response path (so jumper sees only
 --   already-corrected locations) and delete this function.
 function M.reconcile_landing_to_definition(sym, landed_line_1b, dtrace)
-  if not sym or sym == "" then return end
+  if not sym or sym == "" then return true end
 
   local bufnr = vim.api.nvim_get_current_buf()
   local actual = vim.api.nvim_win_get_cursor(0)
@@ -394,7 +394,7 @@ function M.reconcile_landing_to_definition(sym, landed_line_1b, dtrace)
       sym, landed_line_1b, actual[1], actual[2])
   end
   local line_count = vim.api.nvim_buf_line_count(bufnr)
-  if line_count == 0 then return end
+  if line_count == 0 then return true end
 
   local cur_line_text = vim.api.nvim_buf_get_lines(
     bufnr, landed_line_1b - 1, landed_line_1b, false)[1] or ""
@@ -418,7 +418,7 @@ function M.reconcile_landing_to_definition(sym, landed_line_1b, dtrace)
     end
   end
 
-  if has_token(cur_line_text, sym) then return end
+  if has_token(cur_line_text, sym) then return true end
 
   local function escape_for_pattern(s)
     return (s:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1"))
@@ -465,8 +465,8 @@ function M.reconcile_landing_to_definition(sym, landed_line_1b, dtrace)
   end
 
   if not best_line or best_line == landed_line_1b then
-    if dtrace then pcall(dtrace, "reconcile: no def-pattern found for %q near line %d", sym, landed_line_1b) end
-    return
+    if dtrace then pcall(dtrace, "reconcile: HARD-MISS no def-pattern found for %q near line %d", sym, landed_line_1b) end
+    return false
   end
 
   local target_text = vim.api.nvim_buf_get_lines(
@@ -477,6 +477,7 @@ function M.reconcile_landing_to_definition(sym, landed_line_1b, dtrace)
 
   pcall(vim.api.nvim_win_set_cursor, 0, { best_line, col })
   if dtrace then pcall(dtrace, "reconcile: %q drift %d -> %d (Δ=%d)", sym, landed_line_1b, best_line, best_line - landed_line_1b) end
+  return true
 end
 
 return M

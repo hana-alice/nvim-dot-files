@@ -135,14 +135,28 @@ local function jump_to_location(location)
       tostring(reason), prev_cur[1], prev_cur[2], ln, cc)
   end
 
+  local pre_buf = vim.api.nvim_get_current_buf()
+  local pre_cur = vim.api.nvim_win_get_cursor(0)
+
   local ok = jumper.jump(location)
   if not ok then return false end
 
   local sym = location._sym_name or location._origin_cword
+  local reconcile_ok = true
   if sym and #sym > 0 then
     local range = location.range or location.targetSelectionRange or location.targetRange
     local line_1b = ((range and range.start and range.start.line) or 0) + 1
-    pcall(provider.reconcile_landing_to_definition, sym, line_1b, dtrace)
+    local rok, rresult = pcall(provider.reconcile_landing_to_definition, sym, line_1b, dtrace)
+    if rok and rresult == false then
+      reconcile_ok = false
+    end
+  end
+
+  if not reconcile_ok then
+    pcall(dtrace, "jump: REJECTED bogus location, restoring cursor to %d:%d", pre_cur[1], pre_cur[2])
+    pcall(vim.api.nvim_set_current_buf, pre_buf)
+    pcall(vim.api.nvim_win_set_cursor, 0, pre_cur)
+    return false
   end
 
   local cur = vim.api.nvim_win_get_cursor(0)

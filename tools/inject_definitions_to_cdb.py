@@ -30,7 +30,9 @@ RE_UNDEF = re.compile(r'^\s*#\s*undef\s+(\w+)\s*$')
 
 
 def winpath_to_local(p):
-    if len(p) >= 2 and p[1] == ':':
+    # Only translate D:\ -> /mnt/d/ when running under WSL (where /mnt/c exists).
+    # Under native Windows Python, paths stay as-is.
+    if len(p) >= 2 and p[1] == ':' and os.path.isdir('/mnt/c'):
         return f'/mnt/{p[0].lower()}/{p[2:].replace(chr(92), "/").lstrip("/")}'
     return p
 

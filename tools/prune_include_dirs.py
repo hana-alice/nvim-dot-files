@@ -176,9 +176,30 @@ class IncludeResolver:
 
 ALWAYS_KEEP_PATTERNS = ['intermediate', 'generated', '/gen/']
 
+# UE module subdir suffixes that count as "module-local" header roots.
+# When we know the module name for a group, we keep any -I dir whose
+# tail matches `<Module>/<Suffix>` so that other TUs of the same module
+# (or its subdir layouts: Module/Public/X.h, Module/Classes/Y.h) keep
+# resolving even if our sampled TUs didn't transitively include them.
+_MODULE_LOCAL_SUFFIXES = ('public', 'private', 'classes', 'internal')
+
+
 def should_always_keep(d):
     d_low = d.replace('\\', '/').lower()
     return any(p in d_low for p in ALWAYS_KEEP_PATTERNS)
+
+
+def is_module_local_dir(dir_path, module_name):
+    """True if dir_path is one of <...>/<module_name>/<Public|Private|Classes|Internal>.
+    Case-insensitive (NTFS). Tolerates Source/<Module>/<Sub> or just <Module>/<Sub>."""
+    if not module_name:
+        return False
+    parts = [p for p in dir_path.replace('\\', '/').lower().split('/') if p]
+    if len(parts) < 2:
+        return False
+    if parts[-1] not in _MODULE_LOCAL_SUFFIXES:
+        return False
+    return parts[-2] == module_name.lower()
 
 
 def extract_i_dirs(args):
@@ -299,6 +320,32 @@ def main():
 
     print(f"Loaded {len(cdb)} entries | sample={sample_n} | workers={workers} | {'DRY RUN' if dry_run else 'LIVE'}")
 
+    # Pre-scan: derive the set of all module-local source roots from the cdb.
+    # For each entry's source file, walk up to find the nearest
+    # <...>/<Module>/<Public|Private|Classes|Internal>/... ancestor and
+    # treat that ancestor (PLUS its sibling sub-roots) as header roots that
+    # must never be stripped.
+    # Rationale: if a cpp lives at .../Module/Private/x.cpp, we know the
+    # module's physical layout, so .../Module/{Public,Classes,Internal} are
+    # legitimate header roots even if no cpp in our cdb sits in them.
+    module_local_roots = set()
+    _SUBS = ('public', 'private', 'classes', 'internal')
+    for e in cdb:
+        f = (e.get('file') or '').replace('\\', '/')
+        if not f:
+            continue
+        parts = f.split('/')
+        # Look for the FIRST ancestor matching <Module>/<Sub> (closest to source)
+        for i in range(len(parts) - 2, 0, -1):
+            sub = parts[i].lower()
+            if sub in _SUBS:
+                # The cpp's own sub root, plus all sibling subs.
+                module_prefix = '/'.join(parts[:i]).lower()  # excludes the sub
+                for s in _SUBS:
+                    module_local_roots.add(f'{module_prefix}/{s}')
+                break
+    print(f"Module-local source roots discovered: {len(module_local_roots)}")
+
     # 按 module 分组（同 module 共享 used dirs 集合，比 PCH 分组细得多）
     pch_groups = defaultdict(list)
     for idx, e in enumerate(cdb):
@@ -339,7 +386,19 @@ def main():
         if pch not in group_results:
             continue
         group_used, all_dirs = group_results[pch]
+        # Extract module name from group key (mod:<Name> or pch:<X>) so we
+        # can keep the module's own Public/Private/Classes/Internal dirs.
+        mod_name = pch[4:] if pch.startswith('mod:') else None
         keep = group_used | {d for d in all_dirs if should_always_keep(d)}
+        if mod_name:
+            keep |= {d for d in all_dirs if is_module_local_dir(d, mod_name)}
+        # Global module-local roots: any -I that resolves to (or is a parent
+        # of) a real <Module>/<Public|Private|Classes|Internal> source root
+        # in this CDB must be kept.
+        for d in all_dirs:
+            d_low = d.replace('\\', '/').lower().rstrip('/')
+            if d_low in module_local_roots:
+                keep.add(d)
         for idx in indices:
             args = cdb[idx].get('arguments') or []
             if not args:

@@ -27,6 +27,7 @@ MARKER = '-DUE_DEFS_INJECTED=1'
 
 RE_DEF = re.compile(r'^\s*#\s*define\s+(\w+)(?:\s+(.+?))?\s*$')
 RE_UNDEF = re.compile(r'^\s*#\s*undef\s+(\w+)\s*$')
+RE_INCLUDE = re.compile(r'^\s*#\s*include\s+"([^"]+)"\s*$')
 
 
 def winpath_to_local(p):
@@ -37,10 +38,24 @@ def winpath_to_local(p):
     return p
 
 
-def parse_definitions_h(path):
+def parse_definitions_h(path, _seen=None):
+    """Parse a Definitions.h-style header and return -D/-U flags.
+
+    Recursively follows #include "SharedDefinitions.*.h" / "Definitions.*.h"
+    so SharedPCH macros (PLATFORM_WINDOWS, UBT_COMPILED_PLATFORM, WITH_EDITOR,
+    UE_EDITOR, etc.) propagate to TUs whose own Definitions.<Mod>.h only does
+    `#include "SharedDefinitions.X.Cpp20.h"` plus a few #defines.
+    """
     args = []
     if not os.path.isfile(path):
         return args
+    if _seen is None:
+        _seen = set()
+    real = os.path.realpath(path)
+    if real in _seen:
+        return args
+    _seen.add(real)
+    base_dir = os.path.dirname(path)
     try:
         with open(path, encoding='utf-8', errors='replace') as f:
             for line in f:
@@ -57,6 +72,17 @@ def parse_definitions_h(path):
                 m = RE_UNDEF.match(line)
                 if m:
                     args.append(f'-U{m.group(1)}')
+                    continue
+                m = RE_INCLUDE.match(line)
+                if m:
+                    inc = m.group(1)
+                    # Only follow Definitions/SharedDefinitions siblings —
+                    # ignore real engine headers like "CoreMinimal.h".
+                    if not (inc.startswith('Definitions.') or inc.startswith('SharedDefinitions.')):
+                        continue
+                    cand = os.path.join(base_dir, inc)
+                    if os.path.isfile(cand):
+                        args.extend(parse_definitions_h(cand, _seen))
     except (OSError, UnicodeDecodeError):
         pass
     return args
@@ -219,6 +245,7 @@ def get_module_from_filepath(file_path):
 
 # Cache the project's Intermediate/Build/.../Development root once
 _dev_root_cache = [None]
+_shared_pch_cache = {}  # mod -> [SharedPCH paths]
 def find_dev_root(any_cpp_path):
     """Locate <Intermediate>/Build/<Plat>/<Target>/Development by scanning sibling dirs."""
     if _dev_root_cache[0] is not None:
@@ -251,20 +278,101 @@ def find_dev_root(any_cpp_path):
     return ''
 
 
+def find_shared_pch_for_module(dev_root, mod):
+    """Read <dev_root>/<mod>/Module.<mod>*.obj.rsp and extract /FI SharedPCH.X.h.
+    Returns absolute paths to all SharedPCH headers force-included for this module
+    (usually 0 or 1)."""
+    if not dev_root or not mod:
+        return []
+    cache_key = (dev_root, mod)
+    if cache_key in _shared_pch_cache:
+        return _shared_pch_cache[cache_key]
+    mod_dir = f'{dev_root}/{mod}'
+    mod_dir_local = winpath_to_local(mod_dir)
+    if not os.path.isdir(mod_dir_local):
+        _shared_pch_cache[cache_key] = []
+        return []
+    rsps = []
+    try:
+        for fn in os.listdir(mod_dir_local):
+            if fn.startswith(f'Module.{mod}') and fn.endswith('.obj.rsp'):
+                rsps.append(f'{mod_dir_local}/{fn}')
+    except OSError:
+        return []
+    if not rsps:
+        return []
+    found = []
+    seen = set()
+    # /FI"path"   or   /FI path   or   -include path / -include="path"
+    re_fi_q = re.compile(r'/FI"([^"]+)"')
+    re_fi_b = re.compile(r'/FI\s+(\S+)')
+    re_inc = re.compile(r'(?:^|\s)-include[= ]"?([^\s"]+)"?')
+    # only one rsp per module is needed — they share preprocessor flags
+    rsp = rsps[0]
+    try:
+        with open(rsp, encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except OSError:
+        return []
+    for m in list(re_fi_q.finditer(content)) + list(re_fi_b.finditer(content)) + list(re_inc.finditer(content)):
+        p = m.group(1).strip().strip('"')
+        if 'SharedPCH' not in p:
+            continue
+        # rsp paths are relative to Engine/Source (UBT cwd), not module dir.
+        # Try a few base dirs, accept the first that exists.
+        candidates = []
+        if os.path.isabs(p) or (len(p) >= 2 and p[1] == ':'):
+            candidates.append(p)
+        else:
+            # Engine/Source is two levels above dev_root (.../Engine/Intermediate/Build/Win64/.../Development -> ../../../../Source)
+            # Easier: dev_root contains 'Intermediate', strip it back to Engine/.
+            mod_local = mod_dir_local.replace('\\', '/')
+            engine_dir = mod_local
+            while engine_dir and not engine_dir.endswith('/Engine') and '/' in engine_dir:
+                engine_dir = engine_dir.rsplit('/', 1)[0]
+            if engine_dir:
+                candidates.append(os.path.normpath(f'{engine_dir}/Source/{p}'))
+                candidates.append(os.path.normpath(f'{engine_dir}/{p.lstrip("./")}'))
+            candidates.append(os.path.normpath(os.path.join(mod_dir_local, p)))
+        resolved = None
+        for c in candidates:
+            cn = c.replace('\\', '/')
+            if os.path.isfile(winpath_to_local(cn)):
+                resolved = cn
+                break
+        if not resolved:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        found.append(resolved)
+    _shared_pch_cache[cache_key] = found
+    return found
+
+
 def infer_definitions_paths_from_module(file_path, dev_root):
     """When CDB lacks -include Definitions.X.h, try to locate the Definitions.h
-    files based on file path -> module name -> Intermediate layout."""
+    files based on file path -> module name -> Intermediate layout.
+
+    Order matters: SharedPCH (broad, generic) goes FIRST, so per-module
+    Definitions.<Mod>.h (which has the correct DLLEXPORT for *this* module)
+    gets injected LATER and overrides.  The 'last wins' loop in main() will
+    then correctly let module-local wins."""
     if not dev_root:
         return []
     mod = get_module_from_filepath(file_path)
     if not mod:
         return []
     paths = []
-    # Subset Definitions.<Module>.h (per-module slim defines)
+    # 1. SharedPCH.<X>.<Y>.h FIRST (broad set, may have <MOD>_API=DLLIMPORT)
+    for sp in find_shared_pch_for_module(dev_root, mod):
+        if sp not in paths:
+            paths.append(sp)
+    # 2. Definitions.<Module>.h (per-module slim defines, has correct DLLEXPORT for this mod)
     subset = f'{dev_root}/{mod}/Definitions.{mod}.h'
     if os.path.isfile(winpath_to_local(subset)):
         paths.append(subset)
-    # Plain Definitions.h (full set, for PCH-source modules)
+    # 3. Plain Definitions.h (full set, for PCH-source modules)
     full = f'{dev_root}/{mod}/Definitions.h'
     if os.path.isfile(winpath_to_local(full)):
         paths.append(full)

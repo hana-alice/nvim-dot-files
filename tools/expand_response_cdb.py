@@ -50,16 +50,40 @@ CL_FLAGS_GLUED_OR_SPACE = {'/I', '/FI', '/Yu', '/Yc', '/Fp', '/Fo', '/Fd', '/sou
 CL_FLAGS_DROP_WITH_ARG = {'/Fo', '/Fp', '/Fd', '/Fa', '/sourceDependencies'}
 
 
-# Fast tokenizer: regex-based. UE .response uses simple format —
-# whitespace-separated tokens with optional "..." quoting (no escapes,
-# no nested quotes). 50-100x faster than shlex on 14k entries.
-_TOK_RE = re.compile(r'"([^"]*)"|(\S+)')
-
+# Fast tokenizer for cl-style command lines:
+#   * Whitespace separates tokens, EXCEPT inside double quotes.
+#   * Double quotes are part of the token grammar (cl semantics):
+#     they delimit a literal substring; the quotes themselves are
+#     stripped from the final token. So `/FI"a b\c.h"` is ONE token
+#     whose value is `/FIa b\c.h` (no surrounding quotes).
+#   * Backslashes are kept literal (Windows paths). `\"` is NOT
+#     supported (UE's UBT never emits it).
+#
+# Wrong approach #1 (regex `"([^"]*)"|(\S+)`): splits `/FI"a b\c.h"`
+# into `/FI"a` `b\c.h"`. Catastrophic for clang-cl which then sees a
+# bare `b\c.h"` token and a `/FI"a` flag with mismatched quotes.
 def tokenize_response(text):
-    """Tokenize a response file. Handles "quoted strings" and bare tokens.
-    Backslashes preserved as-is (Windows paths)."""
-    return [m.group(1) if m.group(1) is not None else m.group(2)
-            for m in _TOK_RE.finditer(text)]
+    """Tokenize cl/clang-cl response text. Returns list of strings with
+    quotes stripped but ALL inter-character content preserved (so a
+    flag glued to a quoted value emerges as one token, e.g.
+    `/FI"foo.h"` -> `/FIfoo.h`)."""
+    tokens = []
+    buf = []
+    in_quote = False
+    for ch in text:
+        if ch == '"':
+            in_quote = not in_quote
+            # quote itself is dropped
+            continue
+        if not in_quote and ch.isspace():
+            if buf:
+                tokens.append(''.join(buf))
+                buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        tokens.append(''.join(buf))
+    return tokens
 
 
 def expand_response_file(path, base_dir, seen):
@@ -177,8 +201,7 @@ def needs_expand(entry):
 def parse_command_for_driver_and_rsp(cmd):
     """Split `command` string into (driver_path, [rsp_paths], extra_tokens).
     Returns None if no @response found."""
-    toks = [m.group(1) if m.group(1) is not None else m.group(2)
-            for m in _TOK_RE.finditer(cmd)]
+    toks = tokenize_response(cmd)
     if not toks:
         return None
     driver = toks[0]

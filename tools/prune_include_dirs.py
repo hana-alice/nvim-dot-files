@@ -321,13 +321,15 @@ def main():
     print(f"Loaded {len(cdb)} entries | sample={sample_n} | workers={workers} | {'DRY RUN' if dry_run else 'LIVE'}")
 
     # Pre-scan: derive the set of all module-local source roots from the cdb.
-    # For each entry's source file, walk up to find the nearest
-    # <...>/<Module>/<Public|Private|Classes|Internal>/... ancestor and
-    # treat that ancestor (PLUS its sibling sub-roots) as header roots that
-    # must never be stripped.
-    # Rationale: if a cpp lives at .../Module/Private/x.cpp, we know the
-    # module's physical layout, so .../Module/{Public,Classes,Internal} are
-    # legitimate header roots even if no cpp in our cdb sits in them.
+    # For each entry's source file, locate the module physical root and
+    # treat its <Public|Private|Classes|Internal> subdirs as header roots
+    # that must never be stripped.
+    # Two layouts in UE:
+    #   A) .../Source/<Module>/<Sub>/x.cpp    -> module root = parent of <Sub>
+    #   B) .../Source/<Module>/x.cpp          -> module root = parent of x.cpp
+    # For both, we register all four sibling sub-roots (<Module>/{Public,
+    # Private,Classes,Internal}) so a cpp in Private also keeps the module's
+    # Public/Classes/Internal dirs alive.
     module_local_roots = set()
     _SUBS = ('public', 'private', 'classes', 'internal')
     for e in cdb:
@@ -335,15 +337,25 @@ def main():
         if not f:
             continue
         parts = f.split('/')
-        # Look for the FIRST ancestor matching <Module>/<Sub> (closest to source)
+        module_dir = None  # absolute path of <Module> dir (lowercase)
+        # Layout A: walk up looking for a sub-root
         for i in range(len(parts) - 2, 0, -1):
             sub = parts[i].lower()
             if sub in _SUBS:
-                # The cpp's own sub root, plus all sibling subs.
-                module_prefix = '/'.join(parts[:i]).lower()  # excludes the sub
-                for s in _SUBS:
-                    module_local_roots.add(f'{module_prefix}/{s}')
+                module_dir = '/'.join(parts[:i]).lower()
                 break
+        # Layout B: cpp directly under <Module>; the directory holding the
+        # cpp IS the module dir (only if it sits under .../Source/).
+        if module_dir is None and len(parts) >= 3:
+            # parts[-1] = file, parts[-2] = module dir name
+            for i in range(len(parts) - 2, 0, -1):
+                if parts[i].lower() == 'source' and i + 1 < len(parts) - 1:
+                    module_dir = '/'.join(parts[:i + 2]).lower()
+                    break
+        if module_dir is None:
+            continue
+        for s in _SUBS:
+            module_local_roots.add(f'{module_dir}/{s}')
     print(f"Module-local source roots discovered: {len(module_local_roots)}")
 
     # 按 module 分组（同 module 共享 used dirs 集合，比 PCH 分组细得多）

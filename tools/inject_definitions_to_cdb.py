@@ -152,12 +152,104 @@ def find_uht_include_dirs(any_def_path):
     return candidates
 
 
+def find_module_publics(any_cpp_path):
+    """Walk Source/{Runtime,Editor,Developer}/<Module>/{Public,Internal,Classes}
+    and return [-Idir,...] for every such module dir found.
+
+    UE compiles using PCH which inlines these paths; clangd-indexer has no PCH
+    so it needs them as explicit -I. Without these, transitive #include chains
+    like `UnrealClient.h -> Elements/Framework/TypedElementListFwd.h` fail."""
+    parts = any_cpp_path.replace('\\', '/').split('/')
+    try:
+        idx = parts.index('Source')
+    except ValueError:
+        return []
+    src_root = '/'.join(parts[:idx + 1])
+    src_local = winpath_to_local(src_root)
+    if not os.path.isdir(src_local):
+        return []
+    dirs = []
+    for sub in ('Runtime', 'Editor', 'Developer'):
+        sub_dir = f'{src_local}/{sub}'
+        if not os.path.isdir(sub_dir):
+            continue
+        try:
+            for mod in os.listdir(sub_dir):
+                mod_dir = f'{sub_dir}/{mod}'
+                if not os.path.isdir(mod_dir):
+                    continue
+                for kind in ('Public', 'Internal', 'Classes'):
+                    kdir = f'{mod_dir}/{kind}'
+                    if os.path.isdir(kdir):
+                        # Emit Windows-style path matching CDB convention
+                        win_path = f'{src_root}/{sub}/{mod}/{kind}'
+                        dirs.append(f'-I{win_path}')
+        except (OSError, PermissionError):
+            continue
+    return dirs
+
+
 
 def quote_for_command(token):
     """Return token quoted for inclusion in a 'command' string. Preserves =val."""
     if any(c in token for c in (' ', '\t', '"')):
         return '"' + token.replace('"', '\\"') + '"'
     return token
+
+
+def get_module_from_filepath(file_path):
+    """Extract UE module name from a cpp file path.
+    .../Source/.../<Module>/Public|Private|Classes|Internal/...cpp"""
+    parts = file_path.replace('\\', '/').split('/')
+    for i, p in enumerate(parts):
+        if p in ('Private', 'Public', 'Classes', 'Internal') and i > 0:
+            return parts[i - 1]
+    return None
+
+
+# Cache the project's Intermediate/Build/.../Development root once
+_dev_root_cache = [None]
+def find_dev_root(any_cpp_path):
+    """Locate <Intermediate>/Build/<Plat>/<Target>/Development by scanning sibling dirs."""
+    if _dev_root_cache[0] is not None:
+        return _dev_root_cache[0]
+    parts = any_cpp_path.replace('\\', '/').split('/')
+    # Find 'Engine' or any 'Source' parent
+    for i, p in enumerate(parts):
+        if p == 'Source':
+            engine_root = '/'.join(parts[:i])  # .../Engine
+            # Try common layouts
+            candidates = [
+                f'{engine_root}/Intermediate/Build/Win64/x64/UnrealEditor/Development',
+                f'{engine_root}/Intermediate/Build/Win64/UnrealEditor/Development',
+            ]
+            for c in candidates:
+                if os.path.isdir(winpath_to_local(c)):
+                    _dev_root_cache[0] = c
+                    return c
+            break
+    _dev_root_cache[0] = ''
+    return ''
+
+
+def infer_definitions_paths_from_module(file_path, dev_root):
+    """When CDB lacks -include Definitions.X.h, try to locate the Definitions.h
+    files based on file path -> module name -> Intermediate layout."""
+    if not dev_root:
+        return []
+    mod = get_module_from_filepath(file_path)
+    if not mod:
+        return []
+    paths = []
+    # Subset Definitions.<Module>.h (per-module slim defines)
+    subset = f'{dev_root}/{mod}/Definitions.{mod}.h'
+    if os.path.isfile(winpath_to_local(subset)):
+        paths.append(subset)
+    # Plain Definitions.h (full set, for PCH-source modules)
+    full = f'{dev_root}/{mod}/Definitions.h'
+    if os.path.isfile(winpath_to_local(full)):
+        paths.append(full)
+    return paths
 
 
 def main():
@@ -189,7 +281,9 @@ def main():
             defs_cache[p] = parse_definitions_h(winpath_to_local(p))
         return defs_cache[p]
 
-    # Compute UHT -I dirs ONCE per CDB (not per entry; they're project-wide)
+    # Compute UHT -I dirs ONCE per CDB (not per entry; they're project-wide).
+    # Try first from CDB's -include Definitions; fall back to inferring dev_root
+    # from any cpp file path (CDBs from new UBT may not embed -include).
     uht_dirs = []
     for e in cdb:
         tokens = list(e['arguments']) if 'arguments' in e else shlex.split(e.get('command', ''), posix=False)
@@ -197,14 +291,37 @@ def main():
         if defs:
             uht_dirs = find_uht_include_dirs(defs[0])
             break
+    if not uht_dirs and cdb:
+        # Fallback: derive from any cpp's path -> Engine root -> Intermediate
+        any_cpp = cdb[0].get('file', '')
+        dev_root = find_dev_root(any_cpp)
+        if dev_root:
+            # find_uht_include_dirs expects a Definitions.h path inside Intermediate;
+            # fake one by appending /<anything>/Definitions.h to dev_root
+            fake_def = f'{dev_root}/Core/Definitions.h'
+            uht_dirs = find_uht_include_dirs(fake_def)
     print(f'UHT include dirs to inject: {len(uht_dirs)}', file=sys.stderr)
     if uht_dirs:
         print(f'  sample: {uht_dirs[0]}', file=sys.stderr)
+
+    # Module Public/Internal/Classes -I (safety net for transitive #include chains
+    # that UE compiles via PCH; clangd-indexer has no PCH).
+    module_dirs = []
+    if cdb:
+        module_dirs = find_module_publics(cdb[0].get('file', ''))
+    print(f'Module Public/Internal/Classes -I: {len(module_dirs)}', file=sys.stderr)
+    if module_dirs:
+        print(f'  sample: {module_dirs[0]}', file=sys.stderr)
 
     n_entries = len(cdb)
     n_modified = 0
     n_no_def = 0
     n_def_total = 0
+
+    # Cache the dev_root for module-based Definitions.h fallback
+    dev_root_for_fallback = ''
+    if cdb:
+        dev_root_for_fallback = find_dev_root(cdb[0].get('file', ''))
 
     for e in cdb:
         # Get tokens
@@ -220,6 +337,10 @@ def main():
             mode = 'command'
 
         def_paths = find_force_include_definitions(tokens)
+        # FALLBACK: if CDB doesn't carry -include Definitions (newer UBT
+        # GenerateClangDatabase omits these), infer them from the cpp file path.
+        if not def_paths and dev_root_for_fallback:
+            def_paths = infer_definitions_paths_from_module(e.get('file', ''), dev_root_for_fallback)
         # Also locate the PCH-module's full Definitions.h (contains UE_BUILD_*,
         # WITH_EDITOR, UBT_COMPILED_PLATFORM, etc that the subset .h omits).
         pch_module = find_pch_module_name(tokens)
@@ -301,6 +422,12 @@ def main():
         for d in uht_dirs:
             if d not in existing_dirs:
                 new_tokens.append(d)
+                existing_dirs.add(d)
+        # Inject module Public/Internal/Classes -I as safety net
+        for d in module_dirs:
+            if d not in existing_dirs:
+                new_tokens.append(d)
+                existing_dirs.add(d)
         new_tokens.extend(ordered)
 
         # Write back

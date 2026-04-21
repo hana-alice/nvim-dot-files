@@ -13,7 +13,7 @@ $sw.Stop()
 Write-Host ("  Build CDB took {0:N1}s" -f $sw.Elapsed.TotalSeconds)
 
 Write-Host ""
-Write-Host "=== Step 2: Run clangd-indexer (8 cores - super-unity is heavy per TU) ===" -ForegroundColor Cyan
+Write-Host "=== Step 2: Run clangd-indexer (8 cores - super-unity sweet spot, 23 TUs) ===" -ForegroundColor Cyan
 $sw = [Diagnostics.Stopwatch]::StartNew()
 & 'C:\Program Files\LLVM\bin\clangd-indexer.exe' --executor=all-TUs --execute-concurrency=8 "-p=$workDir" $workDir 2>$logF 1>$idx
 $sw.Stop()

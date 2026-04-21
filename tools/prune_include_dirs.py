@@ -138,6 +138,24 @@ def get_pch(args):
     return ''
 
 
+def get_module(file_path):
+    """Extract UE module name from cpp path.
+    .../Source/.../<Module>/Public|Private|Classes|Internal/...cpp"""
+    parts = file_path.replace('\\', '/').split('/')
+    for i, p in enumerate(parts):
+        if p in ('Private', 'Public', 'Classes', 'Internal') and i > 0:
+            return parts[i - 1]
+    return None
+
+
+def get_group_key(file_path, args):
+    """Group key for prune: module first, fall back to PCH for non-module files."""
+    mod = get_module(file_path)
+    if mod:
+        return f'mod:{mod}'
+    return f'pch:{get_pch(args)}'
+
+
 def prune_args(args, keep_dirs):
     new_args = []
     i = 0
@@ -171,7 +189,7 @@ def main():
 
     cdb_path = sys.argv[1]
     dry_run = '--dry-run' in sys.argv
-    sample_n = 30
+    sample_n = 2  # per-module groups have 1-3 distinct -I sets; 2 is enough
     for i, a in enumerate(sys.argv):
         if a == '--sample' and i + 1 < len(sys.argv):
             sample_n = int(sys.argv[i + 1])
@@ -181,13 +199,13 @@ def main():
 
     print(f"Loaded {len(cdb)} entries | sample={sample_n} | {'DRY RUN' if dry_run else 'LIVE'}")
 
-    # 按 PCH 分组
+    # 按 module 分组（同 module 共享 used dirs 集合，比 PCH 分组细得多）
     pch_groups = defaultdict(list)
     for idx, e in enumerate(cdb):
-        pch = get_pch(e.get('arguments', []))
-        pch_groups[pch].append(idx)
+        key = get_group_key(e.get('file', ''), e.get('arguments', []))
+        pch_groups[key].append(idx)
 
-    print(f"PCH groups: {len(pch_groups)}")
+    print(f"Module/PCH groups: {len(pch_groups)}")
 
     total_removed = 0
     t_start = time.time()

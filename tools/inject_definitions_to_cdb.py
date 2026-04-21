@@ -199,8 +199,18 @@ def quote_for_command(token):
 
 def get_module_from_filepath(file_path):
     """Extract UE module name from a cpp file path.
-    .../Source/.../<Module>/Public|Private|Classes|Internal/...cpp"""
+    Two layouts:
+    1. .../Source/.../<Module>/Public|Private|Classes|Internal/...cpp
+    2. .../Intermediate/Build/.../Development/<Module>/Module.<Module>[.N].cpp (UBT unity)"""
     parts = file_path.replace('\\', '/').split('/')
+    # Layout 2: UBT unity in Intermediate/.../Development/<Module>/Module.<Module>.cpp
+    base = parts[-1] if parts else ''
+    if base.startswith('Module.') and base.endswith('.cpp'):
+        # Module.<Mod>.cpp or Module.<Mod>.<N>.cpp
+        # Parent dir name is the module
+        if len(parts) >= 2:
+            return parts[-2]
+    # Layout 1: Source-tree
     for i, p in enumerate(parts):
         if p in ('Private', 'Public', 'Classes', 'Internal') and i > 0:
             return parts[i - 1]
@@ -214,11 +224,20 @@ def find_dev_root(any_cpp_path):
     if _dev_root_cache[0] is not None:
         return _dev_root_cache[0]
     parts = any_cpp_path.replace('\\', '/').split('/')
-    # Find 'Engine' or any 'Source' parent
+    # Layout 2: file IS already in Development/<Mod>/Module.X.cpp
+    if 'Development' in parts:
+        try:
+            idx = parts.index('Development')
+            dev_root = '/'.join(parts[:idx + 1])
+            if os.path.isdir(winpath_to_local(dev_root)):
+                _dev_root_cache[0] = dev_root
+                return dev_root
+        except ValueError:
+            pass
+    # Layout 1: derive from Source-tree path
     for i, p in enumerate(parts):
         if p == 'Source':
             engine_root = '/'.join(parts[:i])  # .../Engine
-            # Try common layouts
             candidates = [
                 f'{engine_root}/Intermediate/Build/Win64/x64/UnrealEditor/Development',
                 f'{engine_root}/Intermediate/Build/Win64/UnrealEditor/Development',

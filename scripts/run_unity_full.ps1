@@ -16,9 +16,9 @@ $sw.Stop()
 Write-Host ("  Build CDB took {0:N1}s, CDB {1:N1} MB" -f $sw.Elapsed.TotalSeconds, ((Get-Item $cdb).Length / 1MB))
 
 Write-Host ""
-Write-Host "=== Step 2: Run clangd-indexer (8 cores) ===" -ForegroundColor Cyan
+Write-Host "=== Step 2: Run clangd-indexer (12 cores) ===" -ForegroundColor Cyan
 $sw = [Diagnostics.Stopwatch]::StartNew()
-& 'C:\Program Files\LLVM\bin\clangd-indexer.exe' --executor=all-TUs --execute-concurrency=8 "-p=$workDir" $workDir 2>$logF 1>$idx
+& 'C:\Program Files\LLVM\bin\clangd-indexer.exe' --executor=all-TUs --execute-concurrency=12 "-p=$workDir" $workDir 2>$logF 1>$idx
 $sw.Stop()
 
 $idxSz = (Get-Item $idx).Length / 1MB

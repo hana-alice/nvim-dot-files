@@ -4167,10 +4167,12 @@ end
 ---        finishes the first target is copied to the others and clangd restarts.
 local function run_compile_commands_pipeline(path, targets)
   local python = (vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1) and "python" or "python3"
+  local expand_script = vim.fn.stdpath("config") .. "/tools/expand_response_cdb.py"
   local pch_script = vim.fn.stdpath("config") .. "/tools/prebuild_pch_v2.py"
   local resolve_script = vim.fn.stdpath("config") .. "/tools/resolve_cdb_paths.py"
   local unify_script = vim.fn.stdpath("config") .. "/tools/unify_include_dirs.py"
   local prune_script = vim.fn.stdpath("config") .. "/tools/prune_include_dirs.py"
+  local has_expand = is_file(expand_script)
   local has_pch = is_file(pch_script)
   local has_resolve = is_file(resolve_script)
   local has_unify = is_file(unify_script)
@@ -4178,7 +4180,7 @@ local function run_compile_commands_pipeline(path, targets)
 
   if not has_pch and not has_unify and not has_prune then return end
 
-  vim.notify("compile_commands pipeline: pch+resolve+unify+prune in background...", vim.log.levels.INFO)
+  vim.notify("compile_commands pipeline: expand+pch+resolve+unify+prune in background...", vim.log.levels.INFO)
 
   -- Record mtime before pipeline to detect actual changes
   local stat_before = vim.uv.fs_stat(path)
@@ -4189,6 +4191,13 @@ local function run_compile_commands_pipeline(path, targets)
   local is_engine_only = path_lower:find("/engine/") and true or false
 
   local cmds = {}
+  if has_expand then
+    -- Expand UE response-file form (command "@xxx.response") into flat
+    -- arguments[]. UnrealBuildTool produces this format for engine
+    -- builds; without expansion all downstream scripts (pch/resolve/
+    -- unify/prune) silently no-op because they read e['arguments'].
+    table.insert(cmds, python .. ' "' .. expand_script .. '" "' .. path .. '"')
+  end
   if has_pch then
     table.insert(cmds, python .. ' "' .. pch_script .. '" "' .. path .. '"')
   end

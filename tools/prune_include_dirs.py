@@ -220,7 +220,9 @@ def main():
         group_used = set()
         for s_idx in sample:
             e = cdb[s_idx]
-            args = e['arguments']
+            args = e.get('arguments') or []
+            if not args:
+                continue  # entry was not expanded (e.g. missing .response) — skip
             base = e.get('directory', '').replace('\\', '/')
             fpath = e.get('file', '').replace('\\', '/')
             resolver = IncludeResolver(extract_i_dirs(args), base)
@@ -230,19 +232,23 @@ def main():
         # 所有 always-keep dirs
         all_dirs = set()
         for idx in indices:
-            all_dirs.update(extract_i_dirs(cdb[idx]['arguments']))
+            all_dirs.update(extract_i_dirs(cdb[idx].get('arguments') or []))
         keep = group_used | {d for d in all_dirs if should_always_keep(d)}
 
         # 裁剪
         grp_removed = 0
         for idx in indices:
-            new_args, removed = prune_args(cdb[idx]['arguments'], keep)
+            args = cdb[idx].get('arguments') or []
+            if not args:
+                continue
+            new_args, removed = prune_args(args, keep)
             if not dry_run:
                 cdb[idx]['arguments'] = new_args
             grp_removed += removed
 
         t1 = time.time()
-        orig_count = len(extract_i_dirs(cdb[indices[0]]['arguments'])) if dry_run else len(all_dirs)
+        first_args = cdb[indices[0]].get('arguments') or []
+        orig_count = len(extract_i_dirs(first_args)) if dry_run else len(all_dirs)
         print(f"  {pch or '(none)':40s}: {len(indices):5d} entries, "
               f"sampled {len(sample):2d}, used {len(group_used):3d}/{len(all_dirs):3d} dirs, "
               f"removed {grp_removed:6d} args ({t1-t0:.1f}s)")

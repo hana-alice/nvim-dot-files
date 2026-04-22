@@ -93,16 +93,34 @@ def find_force_include_definitions(tokens):
     i, n = 0, len(tokens)
     while i < n:
         t = tokens[i]
+        # GCC/clang style: -include <path>
         if t == '-include' and i + 1 < n:
             nxt = tokens[i + 1].strip('"')
             if 'Definitions' in nxt and nxt.endswith('.h'):
                 paths.append(nxt)
             i += 2
             continue
+        # GCC/clang inline: -include=<path>
         if t.startswith('-include='):
             v = t[len('-include='):].strip('"')
             if 'Definitions' in v and v.endswith('.h'):
                 paths.append(v)
+            i += 1
+            continue
+        # MSVC / clang-cl: /FI<path> or /FI <path> (and -FI variants)
+        # UE generates these for cl-mode CDB entries (the common case on Win).
+        if (t.startswith('/FI') or t.startswith('-FI')) and len(t) > 3:
+            v = t[3:].strip('"')
+            if 'Definitions' in v and v.endswith('.h'):
+                paths.append(v)
+            i += 1
+            continue
+        if (t == '/FI' or t == '-FI') and i + 1 < n:
+            nxt = tokens[i + 1].strip('"')
+            if 'Definitions' in nxt and nxt.endswith('.h'):
+                paths.append(nxt)
+            i += 2
+            continue
         i += 1
     return paths
 

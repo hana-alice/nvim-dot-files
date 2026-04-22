@@ -2308,6 +2308,13 @@ INDEX_FN.build_phase_async = function(ctx, phase)
     "C:/Program Files/LLVM/bin/clangd-indexer.exe",
   })
   local cmd = { python, build_script, subset_cdb, "--output", out_idx }
+  -- Default to unity builds: 1 unity TU subsumes 30-50 individual cpps,
+  -- giving roughly 3-5x faster wall-clock for the same symbol coverage.
+  -- Override via UE_INDEX_NO_UNITY=1 env var (e.g. when UE hasn't been
+  -- built yet so Module.<X>.cpp aggregates don't exist).
+  if vim.env.UE_INDEX_NO_UNITY ~= "1" then
+    cmd[#cmd + 1] = "--use-unity"
+  end
   if indexer then
     cmd[#cmd + 1] = "--indexer"
     cmd[#cmd + 1] = indexer

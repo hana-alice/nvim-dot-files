@@ -25,6 +25,7 @@ build_clangd_index.py - 为 clangd 离线预建索引
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -139,10 +140,24 @@ def main():
         print(f"  (Indexer will likely fail on ~97% of UE TUs without it.)")
 
     # Build index
+    # CRITICAL: clangd-indexer's positional arg is a SOURCE file used as a
+    # filter, NOT the CDB itself. The CDB is found by searching for
+    # `compile_commands.json` in cwd-or-parent (ClangTool default). If we
+    # pass `hot.json` as positional, indexer ignores it as filter and falls
+    # back to <cwd-or-ancestor>/compile_commands.json — i.e. the FULL base
+    # CDB — silently indexing all 14334 TUs instead of our 2979-entry hot
+    # subset. Workaround: stage the subset as `compile_commands.json` in a
+    # private dir and `cd` there.
+    stage_dir = os.path.join(os.path.dirname(idx_path), f"_stage_{os.path.basename(idx_path)}")
+    os.makedirs(stage_dir, exist_ok=True)
+    staged_cdb = os.path.join(stage_dir, "compile_commands.json")
+    shutil.copyfile(cdb_path, staged_cdb)
+    print(f"  Staged subset CDB at: {staged_cdb}")
+
     cmd = [indexer, "--executor=all-TUs"]
     if args.jobs > 0:
         cmd.append(f"--execute-concurrency={args.jobs}")
-    cmd.append(cdb_path)
+    cmd.append(staged_cdb)
 
     print(f"\nBuilding index... (this may take a while)")
     t0 = time.time()
@@ -152,7 +167,7 @@ def main():
             cmd,
             stdout=out_f,
             stderr=subprocess.PIPE,
-            cwd=project_root,
+            cwd=stage_dir,
         )
         # Stream stderr for progress
         processed = 0

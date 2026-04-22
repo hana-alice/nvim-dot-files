@@ -2327,7 +2327,13 @@ INDEX_FN.build_phase_async = function(ctx, phase)
   refresh_statusline()
 
   INDEX_RT.job = { root_key = root_key, phase = phase }
-  vim.system(cmd, { text = true, cwd = ctx.engine_root }, function(result)
+  -- Defensive env scrub: if our parent (hermes/wt/IDE) injected PYTHONHOME
+  -- pointing at a different python minor than `python` on PATH, the child
+  -- explodes with `_sre.MAGIC mismatch` from the stdlib loader. Strip it.
+  local child_env = vim.fn.environ()
+  child_env.PYTHONHOME = nil
+  child_env.PYTHONPATH = nil
+  vim.system(cmd, { text = true, cwd = ctx.engine_root, env = child_env }, function(result)
     vim.schedule(function()
       local live_state = ensure_index_state(ctx)
       INDEX_RT.job = nil

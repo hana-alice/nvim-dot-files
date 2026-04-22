@@ -103,6 +103,13 @@ def main():
     os.makedirs(idx_dir, exist_ok=True)
     project_name = os.path.basename(project_root)
     idx_path = args.output or os.path.join(idx_dir, f"{project_name}.idx")
+    # When --output points outside the auto-detected idx_dir, ensure that
+    # parent dir exists too. Otherwise the open() at line 143 raises
+    # FileNotFoundError after the inject step has already mutated the CDB
+    # — leaving a broken pipeline state with no .idx file written.
+    out_parent = os.path.dirname(idx_path)
+    if out_parent:
+        os.makedirs(out_parent, exist_ok=True)
 
     # Count entries
     with open(cdb_path, "r", encoding="utf-8") as f:

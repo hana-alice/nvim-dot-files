@@ -75,6 +75,8 @@ def main():
     parser.add_argument("compile_commands", help="Path to compile_commands.json")
     parser.add_argument("--jobs", "-j", type=int, default=0,
                         help="Number of parallel workers (default: CPU count, max 24)")
+    parser.add_argument("--use-unity", action="store_true",
+                        help="Convert input CDB to unity-build CDB (Module.<X>.cpp aggregates) before indexing. Requires UE to have been built so that Intermediate/Build/.../Module.<X>.cpp files exist.")
     parser.add_argument("--server", action="store_true",
                         help="Start clangd-index-server after building")
     parser.add_argument("--port", type=int, default=50051,
@@ -119,6 +121,34 @@ def main():
     print(f"Project root: {project_root}")
     print(f"Output: {idx_path}")
     print(f"Indexer: {indexer}")
+
+    # OPTIONAL: Convert input CDB to unity-build CDB. UE generates
+    # Module.<Mod>.<N>.cpp aggregate files at build-time that #include 50-100
+    # individual cpps. Indexing the unity files instead trades many small TUs
+    # for fewer large TUs, eliminating per-TU preamble repetition (the main
+    # cost on UE — preamble is ~170 MB and takes ~5s to build per TU).
+    # Empirical estimate: full base CDB 14334 entries × 8 worker @ 1.46
+    # files/sec = 164 min; unity ≈ 287 unity TUs × ~25s / 8 worker ≈ 15 min.
+    if args.use_unity:
+        unity_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build_unity_cdb.py")
+        if not os.path.isfile(unity_script):
+            print(f"\nERROR: --use-unity requested but {unity_script} not found", file=sys.stderr)
+            return 1
+        unity_cdb_path = os.path.join(os.path.dirname(cdb_path),
+                                      os.path.basename(cdb_path).replace(".json", ".unity.json"))
+        if os.path.basename(unity_cdb_path) == os.path.basename(cdb_path):
+            unity_cdb_path = cdb_path + ".unity.json"
+        print(f"\n[unity] Converting {os.path.basename(cdb_path)} → {os.path.basename(unity_cdb_path)}...")
+        t_unity = time.time()
+        rc = subprocess.call([sys.executable, "-I", unity_script, cdb_path, unity_cdb_path])
+        if rc != 0:
+            print(f"\nERROR: build_unity_cdb returned {rc}", file=sys.stderr)
+            return 1
+        # Use the unity CDB for the rest of the pipeline
+        cdb_path = unity_cdb_path
+        with open(cdb_path, "r", encoding="utf-8") as f:
+            cdb = json.load(f)
+        print(f"[unity] {len(cdb)} unity TUs in {time.time()-t_unity:.1f}s")
 
     # CRITICAL: Inject Definitions.<Module>.h #defines as explicit -D into CDB.
     # clangd-indexer's disableUnsupportedOptions() strips -include-pch, which

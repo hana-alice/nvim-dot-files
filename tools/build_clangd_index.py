@@ -74,7 +74,7 @@ def main():
     parser = argparse.ArgumentParser(description="Build clangd offline index")
     parser.add_argument("compile_commands", help="Path to compile_commands.json")
     parser.add_argument("--jobs", "-j", type=int, default=0,
-                        help="Number of parallel workers (default: CPU count)")
+                        help="Number of parallel workers (default: CPU count, max 24)")
     parser.add_argument("--server", action="store_true",
                         help="Start clangd-index-server after building")
     parser.add_argument("--port", type=int, default=50051,
@@ -155,8 +155,18 @@ def main():
     print(f"  Staged subset CDB at: {staged_cdb}")
 
     cmd = [indexer, "--executor=all-TUs"]
-    if args.jobs > 0:
-        cmd.append(f"--execute-concurrency={args.jobs}")
+    # If user didn't specify --jobs, default to CPU count clamped to [8, 24].
+    # Empirically clangd-indexer's own default greatly under-uses the box on
+    # multi-core Windows machines (we observed ~2.4 files/sec on a 24-core
+    # machine — implies ~6-8 workers actually busy). Forcing the flag fixes it.
+    effective_jobs = args.jobs
+    if effective_jobs <= 0:
+        try:
+            effective_jobs = max(8, min(24, os.cpu_count() or 8))
+        except Exception:
+            effective_jobs = 8
+    cmd.append(f"--execute-concurrency={effective_jobs}")
+    print(f"  indexer concurrency: {effective_jobs}")
     cmd.append(staged_cdb)
 
     print(f"\nBuilding index... (this may take a while)")

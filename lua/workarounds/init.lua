@@ -145,33 +145,30 @@ local function find_entry(name)
 end
 
 function M.apply(name)
+  local log = require("utils.log")
   local e = find_entry(name)
   if not e then
-    vim.notify("workarounds: unknown " .. tostring(name), vim.log.levels.ERROR)
+    log.notify_error("workarounds", "unknown " .. tostring(name))
     return false
   end
   if e.error then
-    vim.notify(string.format("workarounds[%s]: cannot apply (%s)", name, e.error),
-               vim.log.levels.ERROR)
+    log.notify_error("workarounds", string.format("[%s]: cannot apply (%s)", name, e.error))
     return false
   end
   local ok, mod_or_err = pcall(require, e.module_name)
   if not ok then
-    vim.notify(string.format("workarounds[%s]: require failed: %s",
-                             name, tostring(mod_or_err)),
-               vim.log.levels.ERROR)
+    log.notify_error("workarounds", string.format("[%s]: require failed: %s",
+                             name, tostring(mod_or_err)))
     return false
   end
   if type(mod_or_err.apply) ~= "function" then
-    vim.notify(string.format("workarounds[%s]: missing apply()", name),
-               vim.log.levels.ERROR)
+    log.notify_error("workarounds", string.format("[%s]: missing apply()", name))
     return false
   end
   local ok2, err = pcall(mod_or_err.apply)
   if not ok2 then
-    vim.notify(string.format("workarounds[%s]: apply() error: %s",
-                             name, tostring(err)),
-               vim.log.levels.ERROR)
+    log.notify_error("workarounds", string.format("[%s]: apply() error: %s",
+                             name, tostring(err)))
     return false
   end
   e.applied = true

@@ -103,7 +103,7 @@ local function open_in_explorer(path, select_file)
 
   local job = vim.fn.jobstart({ "cmd.exe", "/c", command }, { detach = true })
   if job <= 0 then
-    vim.notify("Failed to launch Explorer for: " .. path, vim.log.levels.ERROR)
+    require("utils.log").notify_error("windows", "Failed to launch Explorer for: " .. path)
   end
 end
 

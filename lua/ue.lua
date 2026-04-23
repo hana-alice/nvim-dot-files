@@ -893,7 +893,7 @@ local function write_all(path, content)
   ensure_dir(dirname(path))
   local file, err = io.open(path, "wb")
   if not file then
-    vim.notify("write_all failed: " .. (err or path), vim.log.levels.ERROR)
+    require("utils.log").notify_error("ue.io", "write_all failed: " .. (err or path))
     return false
   end
   file:write(content)
@@ -4161,6 +4161,7 @@ function M._logged_jobstart(cmd, tag, opts)
             local msg = ("%s failed (exit %d)\nlog: %s\n--- last lines ---\n%s")
               :format(tag, code, log_path, table.concat(tail, "\n"))
             vim.notify(msg, vim.log.levels.ERROR, { timeout = 15000 })
+            require("utils.log").error("ue.runner", msg)
           end
           return
         end
@@ -4627,7 +4628,9 @@ local function open_terminal_command(cmd, opts)
           set_build_status(code == 0 and "BOK" or ("B" .. tostring(code)))
         end
         local level = code == 0 and vim.log.levels.INFO or vim.log.levels.ERROR
-        vim.notify(("UE build finished with exit code %d"):format(code), level)
+        local msg = ("UE build finished with exit code %d"):format(code)
+        vim.notify(msg, level)
+        if code ~= 0 then require("utils.log").error("ue.build", msg) end
       end)
     end,
   })
@@ -4636,7 +4639,7 @@ local function open_terminal_command(cmd, opts)
     if opts.quickfix_title then
       set_build_status("BERR")
     end
-    vim.notify("Failed to start UE build terminal", vim.log.levels.ERROR)
+    require("utils.log").notify_error("ue.build", "Failed to start UE build terminal")
     return
   end
 
@@ -6108,7 +6111,7 @@ local function build_android()
   local cmd, build_err = android_build_command(ctx)
   if not cmd then
     set_build_status("BERR")
-    vim.notify(title .. " failed: " .. build_err, vim.log.levels.ERROR)
+    require("utils.log").notify_error("ue.build", title .. " failed: " .. build_err)
     return
   end
 
@@ -6217,7 +6220,7 @@ local function install_android()
 
   local apk = find_apk(ctx)
   if not apk then
-    vim.notify("No APK found in project build outputs", vim.log.levels.ERROR)
+    require("utils.log").notify_error("ue.android", "No APK found in project build outputs")
     return
   end
 
@@ -6336,7 +6339,7 @@ local function prepare()
       invalidate_status_cache()
       refresh_statusline()
       populate_quickfix_from_output("UEPrepare project scan", project_err, { root = ctx.project_root })
-      vim.notify("UEPrepare project scan failed: " .. project_err, vim.log.levels.ERROR)
+      require("utils.log").notify_error("ue.prepare", "UEPrepare project scan failed: " .. project_err)
       if vim.g.ue_prepare_headless == 1 then
         error("UEPrepare project scan failed: " .. project_err)
       end
@@ -6349,7 +6352,7 @@ local function prepare()
     invalidate_status_cache()
     refresh_statusline()
     populate_quickfix_from_output("UEPrepare engine scan", engine_err, { root = ctx.engine_root })
-    vim.notify("UEPrepare engine scan failed: " .. engine_err, vim.log.levels.ERROR)
+    require("utils.log").notify_error("ue.prepare", "UEPrepare engine scan failed: " .. engine_err)
     if vim.g.ue_prepare_headless == 1 then
       error("UEPrepare engine scan failed: " .. engine_err)
     end
@@ -6417,7 +6420,7 @@ local function prepare()
     invalidate_status_cache()
     refresh_statusline()
     populate_quickfix_from_output("UEPrepare GTAGS", workspace_err, { root = root })
-    vim.notify("UEPrepare GTAGS failed: " .. workspace_err, vim.log.levels.ERROR)
+    require("utils.log").notify_error("ue.prepare", "UEPrepare GTAGS failed: " .. workspace_err)
     if vim.g.ue_prepare_headless == 1 then
       error("UEPrepare GTAGS failed: " .. workspace_err)
     end
@@ -6655,7 +6658,7 @@ local function prepare_async()
       handle.message = "FAILED: " .. msg
       handle:finish()
     end
-    vim.notify("UEPrepare failed: " .. msg, vim.log.levels.ERROR)
+    require("utils.log").notify_error("ue.prepare", "UEPrepare failed: " .. msg)
   end
 
   set_prepare_running(true)
@@ -7363,7 +7366,7 @@ function M.setup()
           if code == 0 then
             vim.notify("UE: PCH rebuild OK — restart clangd with :LspRestart", vim.log.levels.INFO)
           else
-            vim.notify("UE: PCH rebuild FAILED (exit " .. code .. ")", vim.log.levels.ERROR)
+            require("utils.log").notify_error("ue.pch", "UE: PCH rebuild FAILED (exit " .. code .. ")")
           end
         end)
       end,

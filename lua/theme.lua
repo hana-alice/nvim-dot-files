@@ -211,14 +211,14 @@ function M.apply(name, opts)
     name = DEFAULT
   end
   if not has_theme(name) then
-    vim.notify("Unknown theme: " .. name, vim.log.levels.ERROR)
+    require("utils.log").notify_error("theme", "Unknown theme: " .. name)
     return false
   end
 
   ensure_theme_loaded(name)
   local ok, err = pcall(vim.cmd.colorscheme, colorscheme_for(name))
   if not ok then
-    vim.notify("Failed to load theme " .. name .. ": " .. tostring(err), vim.log.levels.ERROR)
+    require("utils.log").notify_error("theme", "Failed to load theme " .. name .. ": " .. tostring(err))
     return false
   end
 

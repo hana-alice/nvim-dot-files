@@ -29,6 +29,15 @@ end
 
 cleanup_stale_shada_tmp()
 
+-- Initialise the rotating debug logger early so it is available to every
+-- subsequent setup call. Eager require also installs :NvimLog* commands.
+do
+  local ok_log, log = pcall(require, "utils.log")
+  if ok_log then
+    log.install_commands()
+  end
+end
+
 require("config.neovide").setup()
 require("config.snacks_global").setup()
 require("config.lazy")

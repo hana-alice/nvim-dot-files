@@ -97,7 +97,7 @@ end
 local function open_trouble(kind)
   local trouble = trouble_instance()
   if not trouble then
-    vim.notify("Trouble is unavailable", vim.log.levels.ERROR)
+    require("utils.log").notify_error("sidebar", "Trouble is unavailable")
     return
   end
 
@@ -277,7 +277,7 @@ end
 function M.open(kind)
   kind = normalize_mode(kind or state.last)
   if not kind or not mode_labels[kind] then
-    vim.notify("Unknown sidebar mode: " .. tostring(kind), vim.log.levels.ERROR)
+    require("utils.log").notify_error("sidebar", "Unknown sidebar mode: " .. tostring(kind))
     return
   end
 

@@ -389,7 +389,7 @@ local function ue_clear_picker_history()
   local ok_files, err_files = clear_picker_history("files")
   local ok_grep, err_grep = clear_picker_history("grep")
   if not ok_files or not ok_grep then
-    vim.notify(err_files or err_grep or "Failed to clear picker history", vim.log.levels.ERROR)
+    require("utils.log").notify_error("snacks", err_files or err_grep or "Failed to clear picker history")
     return
   end
   vim.notify("Cleared file and grep history")

@@ -8,6 +8,9 @@ local ALIASES = {
   catppuccin_latte = "catppuccin-latte",
   catppuccin_macchiato = "catppuccin-macchiato",
   catppuccin_mocha = "catppuccin-mocha",
+  rider = "rider-light",
+  rider_light = "rider-light",
+  ["rider light"] = "rider-light",
 }
 local picker = nil
 
@@ -25,6 +28,7 @@ local LABELS = {
   monokai_ristretto = "Monokai Ristretto",
   unokai = "Unokai",
   ["ubuntu-terminal"] = "Ubuntu Terminal",
+  ["rider-light"] = "Rider Light",
 }
 
 local PLUGIN_BY_THEME = {

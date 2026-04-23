@@ -28,7 +28,7 @@ end
 function M.apply()
   -- ubuntu-terminal defines its own treesitter/LSP semantic groups inline;
   -- skip the generic overrides so they don't flatten the per-role colours.
-  if vim.g.colors_name == "ubuntu-terminal" then
+  if vim.g.colors_name == "ubuntu-terminal" or vim.g.colors_name == "rider-light" then
     return
   end
 

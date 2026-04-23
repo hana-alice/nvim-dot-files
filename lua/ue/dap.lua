@@ -595,7 +595,10 @@ function D._apply_aslr_fix(session_state, cb)
   local function fire_cb(ok, msg)
     if cb_fired then return end
     cb_fired = true
-    if msg then vim.notify("ASLR fix: " .. msg, ok and vim.log.levels.INFO or vim.log.levels.ERROR) end
+    if msg then
+      vim.notify("ASLR fix: " .. msg, ok and vim.log.levels.INFO or vim.log.levels.ERROR)
+      if not ok then require("utils.log").error("dap.aslr", msg) end
+    end
     if cb then cb(ok) end
   end
 
@@ -767,7 +770,7 @@ end
 function D.android_dap_attach()
   local dap_ok, dap = pcall(require, "dap")
   if not dap_ok then
-    vim.notify("nvim-dap not installed", vim.log.levels.ERROR)
+    require("utils.log").notify_error("dap", "nvim-dap not installed")
     return
   end
   if D._dap_attach_in_progress then
@@ -775,7 +778,7 @@ function D.android_dap_attach()
     return
   end
   if vim.fn.exepath("adb") == "" then
-    vim.notify("adb not found in PATH", vim.log.levels.ERROR)
+    require("utils.log").notify_error("dap", "adb not found in PATH")
     return
   end
   local ctx = core.resolve_context() or {}
@@ -795,6 +798,7 @@ function D.android_dap_attach()
   symbol_lib, snapshot_err = snapshot_android_symbol_lib(ctx, symbol_lib)
   if snapshot_err then
     vim.notify("Android symbols snapshot failed, using original .so: " .. snapshot_err, vim.log.levels.WARN)
+    require("utils.log").warn("dap.attach", "snapshot failed: %s", snapshot_err)
   end
 
   -- Package name: read from persisted state, fallback to prompt
@@ -859,6 +863,11 @@ function D.android_dap_attach()
   local function progress_update(msg, level)
     table.insert(progress, msg)
     vim.notify(table.concat(progress, "\n"), level or vim.log.levels.INFO, { id = notify_id, title = "DAP Attach" })
+    if level == vim.log.levels.ERROR then
+      require("utils.log").error("dap.attach", msg)
+    elseif level == vim.log.levels.WARN then
+      require("utils.log").warn("dap.attach", msg)
+    end
   end
 
   progress_update("starting preflight...")
@@ -989,7 +998,7 @@ end
 function D.android_dap_launch()
   local dap_ok, dap = pcall(require, "dap")
   if not dap_ok then
-    vim.notify("nvim-dap not installed", vim.log.levels.ERROR)
+    require("utils.log").notify_error("dap", "nvim-dap not installed")
     return
   end
   if D._dap_attach_in_progress then
@@ -997,7 +1006,7 @@ function D.android_dap_launch()
     return
   end
   if vim.fn.exepath("adb") == "" then
-    vim.notify("adb not found in PATH", vim.log.levels.ERROR)
+    require("utils.log").notify_error("dap", "adb not found in PATH")
     return
   end
   local ctx = core.resolve_context() or {}
@@ -1017,6 +1026,7 @@ function D.android_dap_launch()
   symbol_lib, snapshot_err = snapshot_android_symbol_lib(ctx, symbol_lib)
   if snapshot_err then
     vim.notify("Android symbols snapshot failed, using original .so: " .. snapshot_err, vim.log.levels.WARN)
+    require("utils.log").warn("dap.attach", "snapshot failed: %s", snapshot_err)
   end
 
   -- Package name
@@ -1080,6 +1090,11 @@ function D.android_dap_launch()
   local function progress_update(msg, level)
     table.insert(progress, msg)
     vim.notify(table.concat(progress, "\n"), level or vim.log.levels.INFO, { id = notify_id, title = "DAP Launch" })
+    if level == vim.log.levels.ERROR then
+      require("utils.log").error("dap.launch", msg)
+    elseif level == vim.log.levels.WARN then
+      require("utils.log").warn("dap.launch", msg)
+    end
   end
 
   progress_update("starting...")
@@ -1399,7 +1414,7 @@ function D.ensure_dap_loaded()
 
   dap_ok, dap = pcall(require, "dap")
   if not dap_ok then
-    vim.notify("nvim-dap not available", vim.log.levels.ERROR)
+    require("utils.log").notify_error("dap", "nvim-dap not available")
     return false, nil
   end
   return true, dap
@@ -1418,7 +1433,7 @@ function D.ensure_dapui_loaded()
 
   dapui_ok, dapui = pcall(require, "dapui")
   if not dapui_ok then
-    vim.notify("nvim-dap-ui not available", vim.log.levels.ERROR)
+    require("utils.log").notify_error("dap", "nvim-dap-ui not available")
     return false, nil
   end
   return true, dapui
@@ -1444,8 +1459,9 @@ function D.dap_toggle_breakpoint()
     if has_session then
       D._dap_clear_breakpoint(spec, function(ok2, result)
         vim.schedule(function()
-          vim.notify(ok2 and ("BP cleared: %s:%d"):format(file, line)
-            or ("BP clear failed: %s"):format(result), ok2 and vim.log.levels.INFO or vim.log.levels.ERROR)
+          local msg = ok2 and ("BP cleared: %s:%d"):format(file, line) or ("BP clear failed: %s"):format(result)
+          vim.notify(msg, ok2 and vim.log.levels.INFO or vim.log.levels.ERROR)
+          if not ok2 then require("utils.log").error("dap.bp", msg) end
         end)
       end)
     else
@@ -1455,7 +1471,7 @@ function D.dap_toggle_breakpoint()
     -- Add breakpoint (prefer exact source path, fallback to shorter LLDB matches)
     local spec = D._dap_make_breakpoint_spec(path, line)
     if not spec then
-      vim.notify("BP set failed: invalid path or line", vim.log.levels.ERROR)
+      require("utils.log").notify_error("dap.bp", "BP set failed: invalid path or line")
       return
     end
     D._breakpoint_specs[key] = spec
@@ -1490,7 +1506,7 @@ function D.dap_toggle_breakpoint()
           else
             D._breakpoint_specs[key] = nil
             vim.fn.sign_unplace("ue_dap_bp", { buffer = bufnr, id = line })
-            vim.notify(("BP set failed: %s"):format(result), vim.log.levels.ERROR)
+            require("utils.log").notify_error("dap.bp", ("BP set failed: %s"):format(result))
           end
         end)
       end)
@@ -1538,7 +1554,7 @@ function D.dap_pause()
           session:request("pause", { threadId = tresp.threads[1].id })
         else
           vim.schedule(function()
-            vim.notify("Pause failed: " .. tostring(err), vim.log.levels.ERROR)
+            require("utils.log").notify_error("dap.pause", "Pause failed: " .. tostring(err))
           end)
         end
       end)

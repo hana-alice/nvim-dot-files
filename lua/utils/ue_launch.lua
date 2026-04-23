@@ -346,7 +346,7 @@ local function launch_android_process(env, spec)
           return
         end
         local detail = #output > 0 and ("\n" .. table.concat(output, "\n")) or ""
-        vim.notify(("Android launch failed (exit %d)%s"):format(code, detail), vim.log.levels.ERROR)
+        require("utils.log").notify_error("ue_launch", ("Android launch failed (exit %d)%s"):format(code, detail))
       end)
     end,
   })
@@ -391,25 +391,25 @@ function M.launch(env)
   if platform == "Android" then
     local spec, launch_err = android_launch_command(env, ctx)
     if not spec then
-      vim.notify(launch_err, vim.log.levels.ERROR)
+      require("utils.log").notify_error("ue_launch", launch_err)
       return
     end
     local ok, err_msg = launch_android_process(env, spec)
     if not ok then
-      vim.notify(err_msg, vim.log.levels.ERROR)
+      require("utils.log").notify_error("ue_launch", err_msg)
     end
     return
   end
 
   local spec, launch_err = desktop_launch_spec(env, ctx)
   if not spec then
-    vim.notify(launch_err, vim.log.levels.ERROR)
+    require("utils.log").notify_error("ue_launch", launch_err)
     return
   end
 
   local ok, detail = launch_desktop_process(env, spec)
   if not ok then
-    vim.notify(detail, vim.log.levels.ERROR)
+    require("utils.log").notify_error("ue_launch", detail)
     return
   end
 

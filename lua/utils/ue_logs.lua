@@ -644,7 +644,7 @@ local function start_stream(env, spec)
 
   if active_jobid <= 0 then
     reset_state()
-    vim.notify(("Failed to start %s"):format(spec.title), vim.log.levels.ERROR)
+    require("utils.log").notify_error("ue_logs", ("Failed to start %s (jobstart returned %s)"):format(spec.title, tostring(active_jobid)))
     return
   end
 

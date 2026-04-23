@@ -114,12 +114,13 @@ local function finish(code)
     vim.cmd.edit(vim.fn.fnameescape(chosen))
   elseif code ~= 0 then
     vim.notify("Yazi exited with code " .. code, vim.log.levels.WARN)
+    require("utils.log").warn("yazi", "exited with code %d", code)
   end
 end
 
 function M.open_current()
   if vim.fn.executable("yazi") ~= 1 then
-    vim.notify("`yazi` is not available in PATH", vim.log.levels.ERROR)
+    require("utils.log").notify_error("yazi", "`yazi` is not available in PATH")
     return
   end
 
@@ -182,7 +183,7 @@ function M.open_current()
     clear_state()
     close_window(win)
     delete_buffer(buf)
-    vim.notify("Failed to start yazi", vim.log.levels.ERROR)
+    require("utils.log").notify_error("yazi", "Failed to start yazi (termopen returned " .. tostring(jobid) .. ")")
     return
   end
 

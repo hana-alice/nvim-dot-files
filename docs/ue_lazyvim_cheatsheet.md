@@ -532,6 +532,29 @@ Quick reference (all lowercase, in order):
 - `zM` / `zR` — fold all / open all
 - `<C-o>` / `<C-i>` — jump back / forward
 
+## Debug Log (persistent error trail)
+
+All ERROR-level `vim.notify` calls and key job/process callback failures are also written to a rotating log file on disk, so problems that flash by once can still be inspected later (great for AI/manual debugging).
+
+| Command                        | Action                                                                 |
+|--------------------------------|------------------------------------------------------------------------|
+| `:NvimLog`                     | Open the current log file in a split (read-only-ish, just inspect)     |
+| `:NvimLogPath`                 | Echo the absolute path of the active log file                          |
+| `:NvimLogClear`                | Truncate + rotate (keeps `.1`–`.5` backups)                            |
+| `:NvimLogLevel <lvl>`          | Set min level: `trace` / `debug` / `info` / `warn` / `error` (default `info`) |
+
+- File: `stdpath('log')/nvim/nvim-debug.log` → on this box `<LOCAL_APPDATA>\nvim-data\nvim\nvim-debug.log`
+- Rotation: per-file cap **2 MB**, keeps **5** rolling backups (`.1` … `.5`); old ones drop off the tail
+- Format: `ISO-time LEVEL [scope] message | short_src:line`
+- Scopes you'll see: `ue` / `ue.build` / `ue.prepare` / `ue.android` / `ue.pch` / `ue.io` / `dap` / `dap.bp` / `dap.pause` / `dap.aslr` / `yazi` / `theme` / `workarounds` / `sidebar` / `snacks` / `windows` / `ue_logs` / `ue_launch` / `smoke`
+- A red `vim.notify(..., ERROR)` you missed? Tail the file:
+
+  ```bash
+  tail -f "$LOCALAPPDATA/nvim-data/nvim/nvim-debug.log"
+  ```
+
+- Want more detail temporarily? `:NvimLogLevel debug` then reproduce. Reset with `:NvimLogLevel info`.
+
 ## When Stuck
 - `<leader>sk` — search keymaps for the action you want
 - `<leader>sh` — search help

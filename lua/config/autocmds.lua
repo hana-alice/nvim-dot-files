@@ -148,3 +148,11 @@ require("utils.recent_projects").setup()
 -- ~2-4s on cold Neovide while snacks lazy-loads its picker subsystem
 -- + creates 3 floating windows on the main loop.
 require("workarounds.snacks.picker_first_open_freeze").apply()
+
+-- ── Snacks picker: tolerate OOB LSP positions in str_byteindex ───────
+-- Wrap snacks.picker.util.str_byteindex so that LSP-provided Position
+-- characters past the end of the line clamp instead of throwing
+-- E5108 "index out of range" (snacks defaults strict_indexing=true).
+-- See lua/workarounds/snacks/picker_str_byteindex_oob.lua for full
+-- context. Triggered by <leader>ss (Search: Symbols) on clangd in UE.
+require("workarounds.snacks.picker_str_byteindex_oob").apply()

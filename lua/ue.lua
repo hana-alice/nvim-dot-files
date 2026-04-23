@@ -2241,15 +2241,48 @@ INDEX_FN.maybe_restart_clangd_for_index = function()
     return
   end
   INDEX_RT.last_restart_at = now
+
+  -- Snapshot which buffers had clangd attached BEFORE we stop, so we can
+  -- explicitly re-attach to each of them. The previous version only ran
+  -- `:edit` on the *current* buffer, which silently no-op'd whenever the
+  -- user was sitting in a picker / log / non-cpp buffer when the index
+  -- finished. clangd then stayed dead until the user noticed `gd` was slow,
+  -- by which time goto-def was falling back to treesitter or nothing.
   local clients = vim.lsp.get_clients({ name = "clangd" })
   if #clients == 0 then
     return
   end
+
+  local cpp_bufs = {}
   for _, client in ipairs(clients) do
+    for buf, _ in pairs(client.attached_buffers or {}) do
+      if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_is_loaded(buf) then
+        cpp_bufs[buf] = true
+      end
+    end
     client:stop()
   end
+
+  -- Also include any cpp/c/h buffers that exist but weren't attached (e.g.
+  -- a fresh open during the restart window) — better to over-restart than
+  -- miss them.
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(b) then
+      local ft = vim.bo[b].filetype
+      if ft == "cpp" or ft == "c" or ft == "h" or ft == "objcpp" or ft == "objc" then
+        cpp_bufs[b] = true
+      end
+    end
+  end
+
   vim.defer_fn(function()
-    pcall(vim.cmd, "edit")
+    for buf, _ in pairs(cpp_bufs) do
+      if vim.api.nvim_buf_is_valid(buf) then
+        pcall(vim.api.nvim_buf_call, buf, function()
+          vim.cmd("LspStart clangd")
+        end)
+      end
+    end
   end, 500)
 end
 

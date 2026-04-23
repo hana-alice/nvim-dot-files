@@ -538,22 +538,25 @@ All ERROR-level `vim.notify` calls and key job/process callback failures are als
 
 | Command                        | Action                                                                 |
 |--------------------------------|------------------------------------------------------------------------|
-| `:NvimLog`                     | Open the current log file in a split (read-only-ish, just inspect)     |
-| `:NvimLogPath`                 | Echo the absolute path of the active log file                          |
+| `:NvimLog`                     | Open the current log file in a new tab                                 |
+| `:NvimLogPath`                 | Echo + yank the absolute path of the active log file                   |
 | `:NvimLogClear`                | Truncate + rotate (keeps `.1`–`.5` backups)                            |
-| `:NvimLogLevel <lvl>`          | Set min level: `trace` / `debug` / `info` / `warn` / `error` (default `info`) |
+| `:NvimLogLevel <lvl>`          | Set global threshold: `trace`/`debug`/`info`/`warn`/`error` (default `warn`) |
+| `:NvimLogScope <scope> <lvl>`  | Per-scope override (use `clear` to remove); no args = list overrides   |
 
 - File: `stdpath('log')/nvim/nvim-debug.log` → on this box `<LOCAL_APPDATA>\nvim-data\nvim\nvim-debug.log`
 - Rotation: per-file cap **2 MB**, keeps **5** rolling backups (`.1` … `.5`); old ones drop off the tail
-- Format: `ISO-time LEVEL [scope] message | short_src:line`
+- Default level is **WARN**: only `warn`/`error` land on disk. Raise to `info`/`debug`/`trace` via `:NvimLogLevel` for noisier sessions; reset back when done.
+- Format: `ISO-time LEVEL [scope] message [k=v ...] | short_src:line`
 - Scopes you'll see: `ue` / `ue.build` / `ue.prepare` / `ue.android` / `ue.pch` / `ue.io` / `dap` / `dap.bp` / `dap.pause` / `dap.aslr` / `yazi` / `theme` / `workarounds` / `sidebar` / `snacks` / `windows` / `ue_logs` / `ue_launch` / `smoke`
+- Want only `ue.dap` chatter? `:NvimLogScope ue.dap debug` then reproduce. `:NvimLogScope ue.dap clear` to remove.
 - A red `vim.notify(..., ERROR)` you missed? Tail the file:
 
   ```bash
   tail -f "$LOCALAPPDATA/nvim-data/nvim/nvim-debug.log"
   ```
 
-- Want more detail temporarily? `:NvimLogLevel debug` then reproduce. Reset with `:NvimLogLevel info`.
+- Lua module authors: prefer `local L = require("utils.log").scoped("my.scope")` then `L.error(...)` / `L.error_ctx("msg", {k=v})` / `L.notify_error("...")` / `L.wrap_job{cmd=...}`. Fast-event safe (libuv timer/job callbacks ok).
 
 ## When Stuck
 - `<leader>sk` — search keymaps for the action you want

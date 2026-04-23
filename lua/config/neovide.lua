@@ -46,7 +46,7 @@ function M.setup()
   vim.g.neovide_light_radius = 5
   vim.g.neovide_floating_corner_radius = 0.2
   vim.g.neovide_padding_top = 4
-  vim.g.neovide_padding_bottom = 4
+  vim.g.neovide_padding_bottom = 0 -- 0 to flush statusline against window edge (cmdheight=0 + noice)
   vim.g.neovide_padding_left = 6
   vim.g.neovide_padding_right = 6
   vim.g.neovide_hide_mouse_when_typing = true

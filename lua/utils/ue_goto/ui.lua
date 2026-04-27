@@ -18,6 +18,22 @@ M.SHADER_EXTS = {
   metal = true, comp = true,
 }
 
+-- Filetypes where clangd cannot help and gtags is the primary jumper.
+-- Superset of SHADER_EXTS plus filetypes outside clangd's domain that
+-- still benefit from gtags (Build.cs / Target.cs scripts, Python tools,
+-- Lua plugin code, USS/UMG-adjacent C# in editor extensions).
+M.NON_CLANGD_EXTS = {
+  -- Shaders (shared with SHADER_EXTS)
+  usf = true, ush = true,
+  hlsl = true, hlsli = true,
+  glsl = true,
+  frag = true, vert = true,
+  metal = true, comp = true,
+  -- Build / tooling languages clangd does not own
+  cs = true,
+  py = true,
+}
+
 function M.buf_extension(bufnr)
   local name = vim.api.nvim_buf_get_name(bufnr)
   if name == "" then return "" end

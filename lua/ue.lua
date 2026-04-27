@@ -1509,12 +1509,10 @@ UE_CONST.GTAGS_EXCLUDE_SUBSTRINGS = {
 
 -- GTAGS-only exclusions: applied AFTER GTAGS_EXCLUDE_SUBSTRINGS, only to
 -- the gtags input list. csearch / file picker / workspace_all are NOT
--- affected — those still see ThirdParty so the user can grep into them.
---
--- Rationale: ThirdParty Python ships full stdlib + site-packages
--- (~11.6k of 11.8k total .py for a stock UE checkout). Indexing those
--- buries real engine Python and blows wall-clock for zero day-to-day
--- value. Same logic for ThirdParty C# (UBT mirror dependencies).
+-- affected — those still see ThirdParty so the user can still grep into
+-- them. Currently empty because FT_GTAGS is shader-only and shaders
+-- under ThirdParty are negligible (see ue.lua FT_GTAGS comment).
+-- Pre-populated patterns kept for the day we re-add cs/py to FT_GTAGS.
 UE_CONST.GTAGS_ONLY_EXCLUDE_SUBSTRINGS = {
   "/ThirdParty/Python",
   "/site-packages/",
@@ -1595,9 +1593,18 @@ M.FT_ALL = vim.list_extend(vim.list_extend({}, M.FT_CODE), M.FT_CONFIG)
 -- often during UE feature porting and clangd has no parser for either.
 -- Why .lua + .uproject/.uplugin omitted: low symbol density, ad-hoc grep
 -- via :UEGrep is faster than maintaining tags.
-M.FT_GTAGS = vim.list_extend(vim.list_extend({}, M.FT_SHADER), {
-  "cs", "py",
-})
+-- Files where gtags is the primary indexer (because clangd can't help).
+-- Strictly limited to shaders: GNU Global on Windows ships without a
+-- self-contained language parser — its plug-in stub spawns an external
+-- `ctags` for languages the bundled DLL doesn't natively handle. We
+-- can route .usf/.ush/.hlsl/.hlsli through the C++ langmap (validated:
+-- 100% definition-jump hit rate, zero deps), but .cs/.py would force
+-- a hard dependency on a separately-installed ctags.exe.
+--
+-- For .cs (Build.cs/Target.cs) and .py the user falls back to csearch
+-- grep — adequate during day-to-day porting. If we ever add the
+-- universal-ctags binary to dev machines, extend this list.
+M.FT_GTAGS = vim.list_extend({}, M.FT_SHADER)
 
 -- Globs (for rg -g / grep picker)
 M.GLOBS_CODE = vim.tbl_map(function(ext) return "*." .. ext end, M.FT_CODE)

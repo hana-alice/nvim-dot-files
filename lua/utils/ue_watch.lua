@@ -74,32 +74,16 @@ M.WATCHED_EXTS = {
   hlsl = "shader", hlsli = "shader",
 }
 
--- Path substrings that disqualify a file from triggering reindex even if its
--- extension matches WATCHED_EXTS. UE builds churn through Intermediate/Build/
--- *.generated.h and Saved/ — without this gate a single Hot Reload would
--- spam thousands of csearch appends and run the timer hot indefinitely.
-M.PATH_BLOCKLIST = {
-  "/intermediate/",
-  "/binaries/",
-  "/build/",
-  "/saved/",
-  "/derivedatacache/",
-  "/.git/",
-  "/.vs/",
-  "/.idea/",
-  "/.vscode/",
-  "/.cache/",
-}
+-- Path classification is delegated to utils.ue_paths so the watcher and
+-- the rg-on-dirty grep overlay agree on what counts as noise.
+local ue_paths = require("utils.ue_paths")
+
+-- Back-compat alias: callers (and tests) that read M.PATH_BLOCKLIST still
+-- get the same logical list.
+M.PATH_BLOCKLIST = ue_paths.BLOCKLIST_FRAGMENTS
 
 local function path_blocked(abs_lower)
-  for _, frag in ipairs(M.PATH_BLOCKLIST) do
-    if abs_lower:find(frag, 1, true) then return true end
-  end
-  -- UE-generated header convention: foo.generated.h emitted by UHT into
-  -- Intermediate/, but some module layouts mirror them. Reject by suffix too.
-  if abs_lower:find("%.generated%.h$") then return true end
-  if abs_lower:find("%.gen%.cpp$") then return true end
-  return false
+  return ue_paths.is_blocked(abs_lower)
 end
 
 -- ---------------------------------------------------------------------------
@@ -398,6 +382,24 @@ function M.flush_now()
   -- Test/debug helper: bypass the debounce timer.
   if state.timer then state.timer:stop() end
   vim.schedule(flush)
+end
+
+-- Snapshot the pending add/del sets as plain arrays of absolute paths.
+-- Used by the rg-on-dirty grep overlay so it can treat "files the watcher
+-- saw but haven't been re-indexed yet" as part of the dirty set.
+--
+-- Returns { adds = { path1, path2, ... }, dels = { ... } }. Empty arrays
+-- when watcher isn't running / no pending events. NEVER touches the
+-- internal sets so calling this is safe from any thread / scheduler ctx.
+function M.snapshot_pending()
+  local adds, dels = {}, {}
+  if state.pending_add then
+    for p in pairs(state.pending_add) do adds[#adds + 1] = p end
+  end
+  if state.pending_del then
+    for p in pairs(state.pending_del) do dels[#dels + 1] = p end
+  end
+  return { adds = adds, dels = dels }
 end
 
 return M

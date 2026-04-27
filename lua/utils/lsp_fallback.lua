@@ -344,9 +344,9 @@ function M.definition()
     end
   end
 
-  -- Shader files: GTAGS-only.
+  -- Files clangd cannot answer (shaders, Build.cs, Python): GTAGS-only.
   local ext = ui.buf_extension(bufnr)
-  if ui.SHADER_EXTS[ext] then
+  if ui.NON_CLANGD_EXTS[ext] then
     provider.gtags_fallback_async(sym, function(ok)
       if not still_current() then return end
       done()

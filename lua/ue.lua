@@ -1468,7 +1468,8 @@ local function filter_shader(paths)
 end
 
 local function filter_gtags_code(paths)
-  return filter_cpp(paths)
+  -- GTAGS owns clangd's complement — see M.FT_GTAGS comment for rationale.
+  return filter_extensions(paths, M.FT_GTAGS)
 end
 
 local function filter_code(paths)
@@ -1504,6 +1505,23 @@ UE_CONST.ENGINE_SHADER_DIRS = {
 
 UE_CONST.GTAGS_EXCLUDE_SUBSTRINGS = {
   "Engine/Source/ThirdParty/MCPP/mcpp-2.7.2/",
+}
+
+-- GTAGS-only exclusions: applied AFTER GTAGS_EXCLUDE_SUBSTRINGS, only to
+-- the gtags input list. csearch / file picker / workspace_all are NOT
+-- affected — those still see ThirdParty so the user can grep into them.
+--
+-- Rationale: ThirdParty Python ships full stdlib + site-packages
+-- (~11.6k of 11.8k total .py for a stock UE checkout). Indexing those
+-- buries real engine Python and blows wall-clock for zero day-to-day
+-- value. Same logic for ThirdParty C# (UBT mirror dependencies).
+UE_CONST.GTAGS_ONLY_EXCLUDE_SUBSTRINGS = {
+  "/ThirdParty/Python",
+  "/site-packages/",
+  "/Win64/Lib/",
+  "/Linux/Lib/",
+  "/Mac/Lib/",
+  "/ThirdParty/",
 }
 
 UE_CONST.ENGINE_PICKER_DIRS = {
@@ -1568,6 +1586,19 @@ M.FT_CONFIG = {
 
 M.FT_ALL = vim.list_extend(vim.list_extend({}, M.FT_CODE), M.FT_CONFIG)
 
+-- Extensions GTAGS owns: clangd's complement.
+-- C/C++ (.h/.cpp/...) is intentionally excluded — clangd already provides
+-- richer goto/refs for those files. GTAGS only needs to cover what clangd
+-- does NOT handle: shaders + glue/build languages.
+--
+-- Why .cs/.py: Build.cs / Target.cs / engine Python tooling are jumped to
+-- often during UE feature porting and clangd has no parser for either.
+-- Why .lua + .uproject/.uplugin omitted: low symbol density, ad-hoc grep
+-- via :UEGrep is faster than maintaining tags.
+M.FT_GTAGS = vim.list_extend(vim.list_extend({}, M.FT_SHADER), {
+  "cs", "py",
+})
+
 -- Globs (for rg -g / grep picker)
 M.GLOBS_CODE = vim.tbl_map(function(ext) return "*." .. ext end, M.FT_CODE)
 M.GLOBS_ALL = vim.tbl_map(function(ext) return "*." .. ext end, M.FT_ALL)
@@ -1592,6 +1623,27 @@ local function filter_gtags_paths(paths)
     local normalized = norm(path)
     local excluded = false
     for _, pattern in ipairs(UE_CONST.GTAGS_EXCLUDE_SUBSTRINGS) do
+      if normalized:find(pattern, 1, true) then
+        excluded = true
+        break
+      end
+    end
+    if not excluded then
+      table.insert(filtered, normalized)
+    end
+  end
+  return filtered
+end
+
+-- GTAGS-only filter: chained AFTER filter_gtags_paths, ONLY for the
+-- gtags input list. Keeps ThirdParty visible to csearch / file picker
+-- while preventing wall-clock blowup when indexing the workspace tree.
+local function filter_gtags_only_paths(paths)
+  local filtered = {}
+  for _, path in ipairs(paths or {}) do
+    local normalized = norm(path)
+    local excluded = false
+    for _, pattern in ipairs(UE_CONST.GTAGS_ONLY_EXCLUDE_SUBSTRINGS) do
       if normalized:find(pattern, 1, true) then
         excluded = true
         break
@@ -2876,8 +2928,27 @@ local function build_gtags_db(root, filelist, db_dir, label)
 
   clean_db_dir(db_dir)
 
+  -- Use repo-bundled gtags.conf with the `hlsl-cpp` label so that
+  -- .usf/.ush/.hlsl/.hlsli get parsed by the exuberant-ctags backend
+  -- as C++. Without this, gtags only sees C/C++/C# and silently skips
+  -- shaders (workspace_gtags.files contained 0 .usf entries before the
+  -- FT_GTAGS expansion). Falls back to system defaults if the bundled
+  -- file is missing — never hard-fails the indexer over config plumbing.
+  local env = nil
+  -- Resolve repo root from this very file's path (lua/ue.lua → ../..).
+  local source = debug.getinfo(1, "S").source or ""
+  if source:sub(1, 1) == "@" then source = source:sub(2) end
+  local plugin_root = norm(vim.fn.fnamemodify(source, ":h:h"))
+  local conf_path = plugin_root ~= "" and (plugin_root .. "/tools/gtags/gtags.conf") or ""
+  if conf_path ~= "" and is_file(conf_path) then
+    env = {
+      GTAGSCONF = conf_path,
+      GTAGSLABEL = "hlsl-cpp",
+    }
+  end
+
   local cmd = { gtags, "-f", filelist, "--skip-unreadable", "--skip-symlink", db_dir }
-  local code, lines = run_lines(cmd, { cwd = root })
+  local code, lines = run_lines(cmd, { cwd = root, env = env })
   if code ~= 0 then
     return false, table.concat(lines or {}, "\n")
   end
@@ -6392,8 +6463,8 @@ local function prepare()
     return
   end
 
-  local project_code = filter_gtags_paths(filter_gtags_code(project_rel))
-  local engine_code = filter_gtags_paths(filter_gtags_code(engine_rel))
+  local project_code = filter_gtags_only_paths(filter_gtags_paths(filter_gtags_code(project_rel)))
+  local engine_code = filter_gtags_only_paths(filter_gtags_paths(filter_gtags_code(engine_rel)))
   local workspace_code = {}
   local workspace_seen = {}
 
@@ -6769,8 +6840,8 @@ local function prepare_async(opts)
     update("building file lists...", 25)
     start_phase()
 
-    local project_code = filter_gtags_paths(filter_gtags_code(project_rel))
-    local engine_code = filter_gtags_paths(filter_gtags_code(engine_rel))
+    local project_code = filter_gtags_only_paths(filter_gtags_paths(filter_gtags_code(project_rel)))
+    local engine_code = filter_gtags_only_paths(filter_gtags_paths(filter_gtags_code(engine_rel)))
     local workspace_code = {}
     local workspace_seen = {}
     local root = workspace_root(ctx)

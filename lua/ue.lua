@@ -5686,6 +5686,20 @@ function M.clangd_root(bufnr)
   return vim.fs.root(bufname ~= "" and bufname or cwd(), { "compile_commands.json", ".clangd", ".git" }) or cwd()
 end
 
+-- Public hook called by lua/utils/ue_watch.lua when a shader file is added
+-- or deleted between :UEPrepare runs. Idempotent — safe to call repeatedly.
+-- Returns (ok, message). On a project with ~1500 shaders this is ~1.1s wall.
+function M.gtags_rebuild_shaders()
+  local ctx, err = resolve_context()
+  if not ctx then return false, err or "no UE context" end
+  if not ctx.paths or not ctx.paths.workspace_list or not ctx.paths.workspace_db then
+    return false, "ctx.paths missing workspace_list/workspace_db"
+  end
+  local root = workspace_root(ctx)
+  local ok, msg = build_gtags_db(root, ctx.paths.workspace_list, ctx.paths.workspace_db, "workspace")
+  return ok, msg
+end
+
 function M.gtags_references(symbol)
   local ctx, err = resolve_context()
   if not ctx then
@@ -7041,6 +7055,22 @@ local function prepare_async(opts)
               handle:finish()
             end
             vim.notify(summary)
+
+            -- Start the incremental watcher so adds/deletes between runs of
+            -- :UEPrepare don't force a full rebuild. Soft require so that
+            -- a syntax error in ue_watch.lua never breaks :UEPrepare.
+            local watch_ok, watch = pcall(require, "utils.ue_watch")
+            if watch_ok then
+              local cs_ok, cs = pcall(require, "utils.code_search")
+              local cs_index = cs_ok and cs.index_path and cs.index_path(ctx) or nil
+              watch.start({
+                root = workspace_root(ctx),
+                csearch_index = cs_index,
+                shader_filelist = ctx.paths and ctx.paths.workspace_list or nil,
+                gtags_db = ctx.paths and ctx.paths.workspace_db or nil,
+                debounce_ms = 1500,
+              })
+            end
           end
 
           -- If cindex-uefilter is missing, skip silently (with a one-time
@@ -7495,6 +7525,23 @@ function M.setup()
     prepare_async({ force_csearch = true })
   end, { desc = "UEPrepare + force csearch index rebuild (ghost cleanup)" })
   vim.api.nvim_create_user_command("UEPrepareSync", prepare, {})
+  vim.api.nvim_create_user_command("UEWatchStatus", function()
+    local ok, watch = pcall(require, "utils.ue_watch")
+    if not ok then vim.notify("ue_watch module missing", vim.log.levels.WARN); return end
+    local s = watch.status()
+    vim.notify(("UEWatch: running=%s root=%s pending(+%d/-%d) last=%s"):format(
+      tostring(s.running), s.watch_root or "?",
+      s.pending_adds, s.pending_dels,
+      s.last_event_at == 0 and "never" or tostring(s.last_event_at)))
+  end, { desc = "Show ue_watch incremental indexer status" })
+  vim.api.nvim_create_user_command("UEWatchStop", function()
+    local ok, watch = pcall(require, "utils.ue_watch")
+    if ok then watch.stop(); vim.notify("UEWatch stopped") end
+  end, {})
+  vim.api.nvim_create_user_command("UEWatchFlush", function()
+    local ok, watch = pcall(require, "utils.ue_watch")
+    if ok and watch.flush_now then watch.flush_now(); vim.notify("UEWatch flush triggered") end
+  end, { desc = "Bypass debounce; immediately apply pending watcher events" })
   vim.api.nvim_create_user_command("UEIndexStatus", function()
     M.index_status()
   end, {})

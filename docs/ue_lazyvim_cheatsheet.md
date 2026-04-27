@@ -411,6 +411,11 @@ it. `<C-/>` is for a fast scratch shell.
 | `<leader>gS`     | Git stash                               |
 | `<leader>gd`     | Diff hunks                              |
 | `<leader>gD`     | Diff against origin                     |
+| `<leader>gv/gV`  | Diffview open / close                   |
+| `<leader>gvf`    | Diffview: this file history             |
+| `<leader>gvb`    | Diffview: branch history                |
+| `<leader>gvc`    | Diffview: last commit (HEAD~1)          |
+| `<leader>gvm`    | Diffview: vs origin/HEAD                |
 | `<leader>gB`     | Open file in browser                    |
 | `<leader>gY`     | Copy repo URL                           |
 

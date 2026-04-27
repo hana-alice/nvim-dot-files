@@ -49,15 +49,46 @@ return {
             { "n", "q", "<cmd>DiffviewClose<cr>", { desc = "Close diffview" } },
             { "n", "<tab>", actions.select_next_entry, { desc = "Next file" } },
             { "n", "<s-tab>", actions.select_prev_entry, { desc = "Prev file" } },
+            -- ] c / [ c stay vim-native (next/prev hunk WITHIN the current file).
+            -- ] h / [ h cross file boundary: when at the last hunk of a file,
+            -- jump to the first hunk of the next file automatically.
+            { "n", "]h", function()
+                local prev_line = vim.fn.line(".")
+                vim.cmd("normal! ]c")
+                if vim.fn.line(".") == prev_line then
+                  -- already at last hunk → advance to next file
+                  actions.select_next_entry()
+                  vim.schedule(function()
+                    vim.cmd("normal! gg")
+                    pcall(vim.cmd, "normal! ]c")
+                  end)
+                end
+              end, { desc = "Next change (cross file)" } },
+            { "n", "[h", function()
+                local prev_line = vim.fn.line(".")
+                vim.cmd("normal! [c")
+                if vim.fn.line(".") == prev_line then
+                  actions.select_prev_entry()
+                  vim.schedule(function()
+                    vim.cmd("normal! G")
+                    pcall(vim.cmd, "normal! [c")
+                  end)
+                end
+              end, { desc = "Prev change (cross file)" } },
+            -- ] x / [ x conflicts (merge-tool only — no-op outside merge view)
+            { "n", "]x", actions.next_conflict, { desc = "Next conflict" } },
+            { "n", "[x", actions.prev_conflict, { desc = "Prev conflict" } },
           },
           file_panel = {
             { "n", "q", "<cmd>DiffviewClose<cr>", { desc = "Close diffview" } },
             { "n", "<tab>", actions.select_next_entry, { desc = "Next file" } },
             { "n", "<s-tab>", actions.select_prev_entry, { desc = "Prev file" } },
             { "n", "<cr>", actions.select_entry, { desc = "Open file" } },
+            -- j/k → next_entry/prev_entry already defaults from diffview/config.lua
           },
           file_history_panel = {
             { "n", "q", "<cmd>DiffviewClose<cr>", { desc = "Close diffview" } },
+            { "n", "<cr>", actions.select_entry, { desc = "Open commit" } },
           },
         },
       }

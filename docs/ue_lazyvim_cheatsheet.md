@@ -416,6 +416,10 @@ it. `<C-/>` is for a fast scratch shell.
 | `<leader>gvb`    | Diffview: branch history                |
 | `<leader>gvc`    | Diffview: last commit (HEAD~1)          |
 | `<leader>gvm`    | Diffview: vs origin/HEAD                |
+| `]c` / `[c`      | (in diff) Next/prev hunk in current file|
+| `]h` / `[h`      | (in diff) Next/prev hunk, cross file    |
+| `]x` / `[x`      | (in diff) Next/prev merge conflict      |
+| `<tab>` / `<s-tab>` | (in diff) Next/prev file             |
 | `<leader>gB`     | Open file in browser                    |
 | `<leader>gY`     | Copy repo URL                           |
 

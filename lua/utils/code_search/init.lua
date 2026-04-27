@@ -77,17 +77,26 @@ end
 -- Per-workspace index path. Lives next to UEPrepare's other caches.
 -- ctx must expose workspace_root either as a field OR via a wrapper —
 -- callers typically pass { workspace_root = "...", ... }.
+--
+-- Layout v2: prefer ctx.csearch_idx if caller passed it (avoids duplicating
+-- the layout knowledge here). Fall back to legacy in-cache location for
+-- back-compat with non-ue.lua callers.
 function M.index_path(ctx)
+  -- v2: caller supplied an explicit path (single source of truth in ue.lua)
+  if ctx.csearch_idx and ctx.csearch_idx ~= "" then
+    local dir = vim.fn.fnamemodify(ctx.csearch_idx, ":h")
+    if vim.fn.isdirectory(dir) == 0 then vim.fn.mkdir(dir, "p") end
+    return ctx.csearch_idx
+  end
   local root = ctx.workspace_root or ctx.root
   if not root or root == "" then
     return nil
   end
-  local nvim_ue_cache = root .. "/.cache/nvim-ue"
-  if vim.fn.isdirectory(nvim_ue_cache) == 0 then
-    vim.fn.mkdir(nvim_ue_cache, "p")
+  local csearch_dir = root .. "/.cache/nvim-ue/csearch"
+  if vim.fn.isdirectory(csearch_dir) == 0 then
+    vim.fn.mkdir(csearch_dir, "p")
   end
-  -- Don't use a hash — keep it discoverable + greppable.
-  return nvim_ue_cache .. "/csearch.idx"
+  return csearch_dir .. "/csearch.idx"
 end
 
 -- Check that a usable csearch index file exists for this workspace.

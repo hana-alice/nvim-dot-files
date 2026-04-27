@@ -1240,27 +1240,60 @@ local function current_engine_root(preferred_bufname)
   return nil
 end
 
+-- Cache layout v2 (2026-04-27):
+--   .cache/nvim-ue/
+--     state.json                              -- top-level (scanner-friendly)
+--     csearch/csearch.idx                     -- trigram index
+--     gtags/                                  -- gtags input lists + DB
+--       workspace/         (GTAGS DB)
+--       workspace.files
+--       workspace_all.files
+--       engine.files
+--       project.files
+--     cdb/                                    -- clangd compile-db assets
+--       modules.json, queue.json
+--       compile_commands/{current,hot,full}.json
+--     logs/                                   -- ue.lua _logged_jobstart sink
+--     runtime/dirty.json                      -- watcher persistence
+--     legacy/                                 -- pre-v2 holdouts (manual prune)
 cache_paths = function(engine_root)
   local cache = join(engine_root, ".cache", "nvim-ue")
-  local index_dir = join(cache, "index")
-  local index_cdb_dir = join(index_dir, "compile_commands")
+  local csearch_dir = join(cache, "csearch")
+  local gtags_root = join(cache, "gtags")
+  local cdb_dir = join(cache, "cdb")
+  local cdb_files_dir = join(cdb_dir, "compile_commands")
+  local logs_dir = join(cache, "logs")
+  local runtime_dir = join(cache, "runtime")
+  local legacy_dir = join(cache, "legacy")
   local active_index_dir = join(engine_root, ".clangd-index")
   local project_name = vim.fn.fnamemodify(engine_root, ":t")
   return {
     cache = cache,
     state = join(cache, "state.json"),
-    project_list = join(cache, "project_gtags.files"),
-    engine_list = join(cache, "engine_gtags.files"),
-    workspace_list = join(cache, "workspace_gtags.files"),
-    workspace_all_list = join(cache, "workspace_all.files"),
-    workspace_db = join(cache, "gtags", "workspace"),
-    index_dir = index_dir,
-    index_state = join(index_dir, "modules.json"),
-    index_queue = join(index_dir, "queue.json"),
-    index_cdb_dir = index_cdb_dir,
-    index_current_cdb = join(index_cdb_dir, "current.json"),
-    index_hot_cdb = join(index_cdb_dir, "hot.json"),
-    index_full_cdb = join(index_cdb_dir, "full.json"),
+    -- gtags
+    gtags_root = gtags_root,
+    project_list = join(gtags_root, "project.files"),
+    engine_list = join(gtags_root, "engine.files"),
+    workspace_list = join(gtags_root, "workspace.files"),
+    workspace_all_list = join(gtags_root, "workspace_all.files"),
+    workspace_db = join(gtags_root, "workspace"),
+    -- csearch
+    csearch_dir = csearch_dir,
+    csearch_idx = join(csearch_dir, "csearch.idx"),
+    -- cdb (was: index/)
+    index_dir = cdb_dir,                   -- back-compat alias
+    index_state = join(cdb_dir, "modules.json"),
+    index_queue = join(cdb_dir, "queue.json"),
+    index_cdb_dir = cdb_files_dir,
+    index_current_cdb = join(cdb_files_dir, "current.json"),
+    index_hot_cdb = join(cdb_files_dir, "hot.json"),
+    index_full_cdb = join(cdb_files_dir, "full.json"),
+    -- logs / runtime / legacy
+    logs_dir = logs_dir,
+    runtime_dir = runtime_dir,
+    dirty_json = join(runtime_dir, "dirty.json"),
+    legacy_dir = legacy_dir,
+    -- clangd active overlay (lives under engine_root, not under cache)
     active_index_dir = active_index_dir,
     active_index = join(active_index_dir, project_name .. ".idx"),
     current_index = join(active_index_dir, project_name .. ".current.idx"),
@@ -4974,7 +5007,7 @@ function M.cached_grep(opts)
 
   local snacks = require("snacks")
   local code_search = require("utils.code_search")
-  local cs_ctx = { workspace_root = workspace_root(ctx) }
+  local cs_ctx = { workspace_root = workspace_root(ctx), csearch_idx = ctx.paths and ctx.paths.csearch_idx or nil }
   local has_index = code_search.is_indexed(cs_ctx)
   local backend_label = has_index and "csearch" or "rg"
 
@@ -6812,7 +6845,7 @@ local function prepare_async(opts)
     -- comments in tools/cindex-uefilter/ and the in-progress PoC).
     -- Async; doesn't block the fast-path return.
     local code_search_fp = require("utils.code_search")
-    local cs_ctx_fp = { workspace_root = root }
+    local cs_ctx_fp = { workspace_root = root, csearch_idx = ctx.paths and ctx.paths.csearch_idx or nil }
     local need_index = true
     local stale_reason = "missing"
     do
@@ -7141,14 +7174,24 @@ local function prepare_async(opts)
             local watch_ok, watch = pcall(require, "utils.ue_watch")
             if watch_ok then
               local cs_ok, cs = pcall(require, "utils.code_search")
-              local cs_index = cs_ok and cs.index_path and cs.index_path(ctx) or nil
+              local cs_index = cs_ok and cs.index_path
+                and cs.index_path({ workspace_root = workspace_root(ctx), csearch_idx = ctx.paths and ctx.paths.csearch_idx or nil })
+                or nil
               watch.start({
                 root = workspace_root(ctx),
                 csearch_index = cs_index,
                 shader_filelist = ctx.paths and ctx.paths.workspace_list or nil,
                 gtags_db = ctx.paths and ctx.paths.workspace_db or nil,
+                dirty_json_path = ctx.paths and ctx.paths.dirty_json or nil,
                 debounce_ms = 1500,
               })
+              -- :UEPrepare just rebuilt the indices; the cumulative dirty set
+              -- is now logically empty (csearch was reset, gtags rebuilt).
+              -- Clear it so the rg-on-dirty overlay doesn't keep re-greping
+              -- thousands of stale entries forever.
+              if type(watch.clear_persistent_dirty) == "function" then
+                watch.clear_persistent_dirty("prepare")
+              end
             end
           end
 
@@ -7166,7 +7209,7 @@ local function prepare_async(opts)
           -- Materialize an absolute-path tmpfile from workspace_all (which
           -- holds workspace-root-relative paths).
           local cs_root = workspace_root(ctx)
-          local cs_ctx = { workspace_root = cs_root }
+          local cs_ctx = { workspace_root = cs_root, csearch_idx = ctx.paths and ctx.paths.csearch_idx or nil }
           local abs_list = ctx.paths.cache .. "/csearch_filelist.txt"
           local fout = io.open(abs_list, "w")
           if not fout then
@@ -7621,6 +7664,65 @@ function M.setup()
     local ok, watch = pcall(require, "utils.ue_watch")
     if ok and watch.flush_now then watch.flush_now(); vim.notify("UEWatch flush triggered") end
   end, { desc = "Bypass debounce; immediately apply pending watcher events" })
+  vim.api.nvim_create_user_command("UEDirtyStatus", function()
+    -- Show the cumulative-since-last-:UEPrepare dirty set (rg-on-dirty
+    -- overlay's source of truth for the cindex modify-no-op workaround).
+    local ok, watch = pcall(require, "utils.ue_watch")
+    if not ok then vim.notify("ue_watch module missing", vim.log.levels.WARN); return end
+    local st = (watch.persistent_dirty_status and watch.persistent_dirty_status()) or { count = 0 }
+    local lines = {
+      ("UEDirty: %d files in cumulative dirty set"):format(st.count or 0),
+      ("  cap=%d  warn_at=%d"):format(st.cap or 0, st.warn_at or 0),
+      ("  path=%s"):format(st.path or "(unconfigured)"),
+    }
+    -- Also show the dirty_files.collect breakdown so the user can see what
+    -- the rg-on-dirty overlay would actually use right now.
+    local df_ok, df = pcall(require, "utils.dirty_files")
+    if df_ok then
+      local r = df.collect({})
+      table.insert(lines, ("  collect: buffer=%d watcher=%d persistent=%d -> dedup=%d filter=%d -> %d files%s"):format(
+        r.stats.buffer or 0, r.stats.watcher or 0, r.stats.persistent or 0,
+        r.stats.dedup_in or 0, r.stats.filter_in or 0,
+        #r.files, r.truncated and " (TRUNCATED)" or ""))
+    end
+    vim.notify(table.concat(lines, "\n"))
+  end, { desc = "Show cumulative dirty set + dirty_files.collect breakdown" })
+  vim.api.nvim_create_user_command("UEDirtyClear", function()
+    local ok, watch = pcall(require, "utils.ue_watch")
+    if not ok then vim.notify("ue_watch module missing", vim.log.levels.WARN); return end
+    if type(watch.clear_persistent_dirty) ~= "function" then
+      vim.notify("clear_persistent_dirty unavailable (old ue_watch?)", vim.log.levels.WARN); return
+    end
+    watch.clear_persistent_dirty("manual")
+    vim.notify("UEDirty cleared")
+  end, { desc = "Manually clear the cumulative dirty set (use after manual reindex)" })
+  vim.api.nvim_create_user_command("UECachePaths", function()
+    -- Dump the v2 cache layout that ue.lua's cache_paths() resolved for
+    -- the current ctx. Useful to verify migration / debug missing-path
+    -- bugs without `:lua print(vim.inspect(...))` gymnastics.
+    local ctx, err = resolve_context()
+    if not ctx then
+      vim.notify("UECachePaths: " .. (err or "no ctx"), vim.log.levels.WARN)
+      return
+    end
+    if not ctx.paths then
+      vim.notify("UECachePaths: ctx.paths missing", vim.log.levels.WARN)
+      return
+    end
+    local lines = { "UECachePaths (layout v2):" }
+    -- Sort for deterministic display.
+    local keys = {}
+    for k in pairs(ctx.paths) do keys[#keys + 1] = k end
+    table.sort(keys)
+    for _, k in ipairs(keys) do
+      local v = ctx.paths[k]
+      if type(v) == "string" then
+        local exists = (vim.uv or vim.loop).fs_stat(v) ~= nil
+        table.insert(lines, ("  %-22s %s  %s"):format(k, exists and "[ok]" or "[--]", v))
+      end
+    end
+    vim.notify(table.concat(lines, "\n"))
+  end, { desc = "Dump cache_paths() result + existence check" })
   vim.api.nvim_create_user_command("UEIndexStatus", function()
     M.index_status()
   end, {})

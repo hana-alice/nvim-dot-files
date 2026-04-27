@@ -5166,10 +5166,77 @@ function M.cached_grep(opts)
           -- through a buffer, and use ctx.async:sleep() to yield to the
           -- picker until the csearch process reports done OR the picker
           -- aborts us (sleep returns early on abort).
-          local done = false
+          local done = false              -- csearch done flag (kept name for diff continuity)
+          local done_rg_dirty = true      -- start as true; flipped to false only if we actually spawn rg
+          local rg_dirty_handle = nil
           local pending = {}  -- items waiting to be drained on the main loop
           local items_received = 0
           local items_emitted = 0
+
+          -- ── rg-on-dirty overlay ───────────────────────────────────
+          -- csearch's path-key dedup means cindex SKIPS already-indexed
+          -- files even when their content changed (POC verified). So
+          -- "I just added MyNewClass and grep <leader>/MyNewClass"
+          -- returns 0 from csearch alone. Mitigation: in parallel,
+          -- run rg over the dirty file set (git status + modified
+          -- buffers + watcher pending_add). Items get text prefix
+          -- "[LIVE] " so the user knows which results are the bypass.
+          --
+          -- DESIGN GUARDS (per user constraints):
+          --   * empty dirty set → don't spawn rg at all (zero overhead)
+          --   * dirty set already filtered via utils.ue_paths blocklist
+          --     so Intermediate/Build/.generated.h won't pollute results
+          do
+            local ok_df, dirty_files_mod = pcall(require, "utils.dirty_files")
+            local ok_lg, live_grep_mod = pcall(require, "utils.live_grep_overlay")
+            if ok_df and ok_lg then
+              local files, info = dirty_files_mod.collect_or_nil({
+                root = cs_ctx and cs_ctx.root or nil,
+                git_timeout_ms = 800,
+              })
+              if files then
+                trace("rg-on-dirty START pat=%q dirty=%d (git=%d buf=%d watcher=%d, dropped=%d) truncated=%s",
+                  pattern, #files,
+                  info.stats.git, info.stats.buffer, info.stats.watcher,
+                  info.stats.dedup_in - info.stats.filter_in,
+                  tostring(info.truncated))
+                done_rg_dirty = false
+                rg_dirty_handle = live_grep_mod.start(pattern, files, {
+                  smart_case = true,
+                  on_line = function(rec)
+                    -- Same item shape as csearch on_line so the picker
+                    -- format function doesn't need to differentiate.
+                    -- Prefix text with [LIVE] so the user spots them.
+                    pending[#pending + 1] = {
+                      text = rec.file .. ":" .. rec.lnum .. ":" .. rec.col .. ":[LIVE] " .. rec.text,
+                      pos  = { rec.lnum, math.max(0, rec.col - 1) },
+                      file = rec.file,
+                    }
+                    items_received = items_received + 1
+                  end,
+                  on_done = function(code, err)
+                    done_rg_dirty = true
+                    trace("rg-on-dirty DONE pat=%q code=%s err=%s",
+                      pattern, tostring(code), tostring(err and err:sub(1,80)))
+                    -- exit code 1 = no matches (normal); only warn on real errors
+                    if err and code and code > 1 then
+                      vim.schedule(function()
+                        vim.notify("UE grep [LIVE rg]: " .. err, vim.log.levels.WARN, { title = "UE" })
+                      end)
+                    end
+                  end,
+                })
+                if not rg_dirty_handle then
+                  -- spawn failed (argv too big, exec missing, etc.) —
+                  -- leave done_rg_dirty=true so main loop doesn't block.
+                  done_rg_dirty = true
+                end
+              else
+                trace("rg-on-dirty SKIP pat=%q (no dirty files)", pattern)
+              end
+            end
+          end
+
           local stop = code_search.stream(cs_ctx, pattern, {
             code_only   = opts.code_only,
             smart_case  = true,
@@ -5238,6 +5305,10 @@ function M.cached_grep(opts)
                   trace("WATCHDOG kill pat=%q new=%q recv=%d",
                     pattern, tostring(cur), items_received)
                   pcall(stop)
+                  -- Also kill rg-on-dirty if it's still streaming.
+                  if rg_dirty_handle and rg_dirty_handle.stop then
+                    pcall(rg_dirty_handle.stop)
+                  end
                   if t and not t:is_closing() then
                     pcall(function() t:stop() end)
                     pcall(function() t:close() end)
@@ -5281,7 +5352,10 @@ function M.cached_grep(opts)
           local read_idx = 1
           local tick_count = 0
           local longest_drain_ms = 0
-          while not done and elapsed < max_total_ms do
+          -- Loop until BOTH csearch AND rg-on-dirty have reported done.
+          -- done_rg_dirty starts as true if we never spawned rg, so this
+          -- collapses to the original "while not done" in that case.
+          while not (done and done_rg_dirty) and elapsed < max_total_ms do
             tick_count = tick_count + 1
             -- Abort detection: compare against LIVE picker input, not the
             -- finder_ctx.filter snapshot (snacks captures the filter at
@@ -5299,6 +5373,7 @@ function M.cached_grep(opts)
                 pattern, tostring(cur_search), tick_count, elapsed,
                 items_received, items_emitted, #pending - read_idx + 1)
               pcall(stop)
+              if rg_dirty_handle and rg_dirty_handle.stop then pcall(rg_dirty_handle.stop) end
               break
             end
             -- Drain up to CB_BUDGET items accumulated since last slice.
@@ -5357,6 +5432,10 @@ function M.cached_grep(opts)
           -- Stop the subprocess if it's still alive (timeout / abort path).
           if not done then
             pcall(stop)
+          end
+          -- Same for rg-on-dirty.
+          if rg_dirty_handle and rg_dirty_handle.stop and not done_rg_dirty then
+            pcall(rg_dirty_handle.stop)
           end
 
           -- Watchdog cleanup: normal completion path. Abort path also

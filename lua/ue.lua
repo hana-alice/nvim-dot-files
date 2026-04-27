@@ -6535,7 +6535,8 @@ local function collect_trimmed_lines(lines, data)
   end
 end
 
-local function prepare_async()
+local function prepare_async(opts)
+  opts = opts or {}
   local ctx, err = resolve_context()
   if not ctx then
     vim.notify(err, vim.log.levels.WARN)
@@ -6550,6 +6551,11 @@ local function prepare_async()
     end
     CORE_RT.prepare_jobid = nil
   end
+
+  -- Stash force flags so the cache fast-path csearch staleness check
+  -- can honor :UEPrepareReindex (force a csearch rebuild even when the
+  -- regular UEPrepare cache is fresh).
+  ctx._force_csearch = opts.force_csearch and true or false
 
   if ctx.state.project_root ~= ctx.project_root then
     persist_project(ctx.engine_root, ctx.project_root, ctx.uproject)
@@ -6614,20 +6620,79 @@ local function prepare_async()
     invalidate_status_cache()
     refresh_statusline()
 
-    -- Build csearch index if missing or stale (older than workspace_all).
+    -- Build csearch index if missing or stale.
+    --
+    -- Staleness is judged from sources that actually reflect worktree
+    -- changes (more reliable than workspace_all_list, which is rewritten
+    -- on every UEPrepare and whose mtime always tracks idx mtime):
+    --
+    --   1. Force flag (:UEPrepareReindex)         → rebuild
+    --   2. idx missing / too small                → rebuild
+    --   3. idx older than .git/index of engine OR project   → rebuild
+    --      (git tracks every file add/remove/edit; HEAD-only would miss
+    --       working-tree edits that haven't been committed yet)
+    --   4. idx older than 30 days                 → rebuild
+    --      (safety net: ghost entries accumulate from upstream renames
+    --       even when our incremental detection misses them)
+    --   5. Otherwise                              → reuse existing idx
+    --
+    -- This is still a *full cold rebuild* on each trigger — true
+    -- incremental indexing requires cindex-uefilter changes (see
+    -- comments in tools/cindex-uefilter/ and the in-progress PoC).
     -- Async; doesn't block the fast-path return.
     local code_search_fp = require("utils.code_search")
     local cs_ctx_fp = { workspace_root = root }
     local need_index = true
+    local stale_reason = "missing"
     do
       local idx_path = code_search_fp.index_path(cs_ctx_fp)
-      local list_path = ctx.paths.workspace_all_list
       local idx_stat = idx_path and vim.loop.fs_stat(idx_path) or nil
-      local list_stat = list_path and vim.loop.fs_stat(list_path) or nil
-      if idx_stat and idx_stat.size > 1024 and list_stat then
-        local idx_mt  = idx_stat.mtime  and idx_stat.mtime.sec  or 0
-        local list_mt = list_stat.mtime and list_stat.mtime.sec or 0
-        if idx_mt >= list_mt then need_index = false end
+
+      if ctx._force_csearch then
+        stale_reason = "forced"
+      elseif not idx_stat or (idx_stat.size or 0) <= 1024 then
+        stale_reason = "missing"
+      else
+        local idx_mt = idx_stat.mtime and idx_stat.mtime.sec or 0
+        local now = os.time()
+
+        -- Age cap: rebuild monthly to clear accumulated ghost entries.
+        if (now - idx_mt) > (30 * 24 * 3600) then
+          stale_reason = ("age %.1fd"):format((now - idx_mt) / 86400)
+        else
+          -- Newest .git/index across engine + project.
+          local function git_index_mtime(repo_root)
+            if not repo_root or repo_root == "" then return 0 end
+            local s = vim.loop.fs_stat(repo_root .. "/.git/index")
+            return (s and s.mtime and s.mtime.sec) or 0
+          end
+          local git_mt = math.max(
+            git_index_mtime(ctx.engine_root),
+            git_index_mtime(ctx.project_root))
+
+          if git_mt > 0 and idx_mt >= git_mt then
+            need_index = false
+          elseif git_mt == 0 then
+            -- No .git/index found anywhere → fall back to old heuristic
+            -- (workspace_all_list mtime). Better than nothing.
+            local list_path = ctx.paths.workspace_all_list
+            local list_stat = list_path and vim.loop.fs_stat(list_path) or nil
+            if list_stat then
+              local list_mt = list_stat.mtime and list_stat.mtime.sec or 0
+              if idx_mt >= list_mt then
+                need_index = false
+              else
+                stale_reason = "list newer (no .git fallback)"
+              end
+            else
+              -- No baseline at all; trust existing idx to avoid pointless
+              -- rebuilds. UEPrepareReindex is the escape hatch.
+              need_index = false
+            end
+          else
+            stale_reason = ("git/index newer by %ds"):format(git_mt - idx_mt)
+          end
+        end
       end
     end
     if need_index and code_search_fp.cindex_uefilter_exe() then
@@ -6641,7 +6706,7 @@ local function prepare_async()
           end
         end
         fout:close()
-        vim.notify("UEPrepare: rebuilding csearch index in background...",
+        vim.notify(("UEPrepare: rebuilding csearch index in background (reason: %s)..."):format(stale_reason),
           vim.log.levels.INFO, { title = "UE", timeout = 3000, replace = "ue.csearch.build" })
         code_search_fp.build_index(cs_ctx_fp, abs_list, function(ok_cs, err_cs, stats)
           pcall(os.remove, abs_list)
@@ -7342,7 +7407,15 @@ function M.setup()
     M.toggle_debug_log()
   end, {})
   vim.api.nvim_create_user_command("UEInstallAndroid", install_android, {})
-  vim.api.nvim_create_user_command("UEPrepare", prepare_async, {})
+  vim.api.nvim_create_user_command("UEPrepare", function()
+    prepare_async()
+  end, {})
+  vim.api.nvim_create_user_command("UEPrepareReindex", function()
+    -- Force csearch rebuild even when the cache fast-path would skip it.
+    -- Useful after large branch switches / engine syncs that leave
+    -- ghost entries in the existing index.
+    prepare_async({ force_csearch = true })
+  end, { desc = "UEPrepare + force csearch index rebuild (ghost cleanup)" })
   vim.api.nvim_create_user_command("UEPrepareSync", prepare, {})
   vim.api.nvim_create_user_command("UEIndexStatus", function()
     M.index_status()

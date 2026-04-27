@@ -60,6 +60,14 @@ local state = {
   timer = nil,
   last_event_at = 0,
   flush_running = false,
+  -- Persistent dirty set (in-memory mirror of dirty.json on disk).
+  -- Holds every add we've seen since the last :UEPrepare, even AFTER flush.
+  -- WHY: cindex's modify-is-no-op bug means a flushed-into-csearch path may
+  -- still have stale trigrams. The rg-on-dirty overlay needs the full
+  -- post-prepare cumulative set, not just the in-flight pre-flush queue.
+  -- Keys: lowercased forward-slash abs path. Values: true.
+  persistent_dirty = {},
+  persistent_dirty_loaded = false,
 }
 
 -- Files we care about. Anything else is dropped at the watcher boundary so
@@ -269,6 +277,13 @@ local function flush()
   step("gtags_shader", provider_gtags_shader_rebuild,
     vim.list_extend(vim.list_extend({}, adds), dels))
 
+  -- Track adds in the cumulative dirty set so the rg-on-dirty overlay can
+  -- compensate for cindex's modify-no-op bug (see persistent_dirty docs).
+  -- Even successful flushes get tracked: csearch *will* skip any path that
+  -- was already in the index regardless of mtime, so we stay paranoid until
+  -- the next :UEPrepare clears the set.
+  add_to_persistent_dirty(adds)
+
   state.flush_running = false
 end
 
@@ -382,6 +397,146 @@ function M.flush_now()
   -- Test/debug helper: bypass the debounce timer.
   if state.timer then state.timer:stop() end
   vim.schedule(flush)
+end
+
+-- ---------------------------------------------------------------------------
+-- Persistent dirty.json — cumulative add-set since last :UEPrepare.
+-- ---------------------------------------------------------------------------
+
+local PERSISTENT_DIRTY_CAP = 1000  -- LRU-ish hard cap; see save_persistent_dirty
+local PERSISTENT_DIRTY_WARN = 500  -- nag threshold
+
+local function persistent_dirty_path()
+  return state.opts and state.opts.dirty_json_path or nil
+end
+
+local function load_persistent_dirty()
+  if state.persistent_dirty_loaded then return end
+  state.persistent_dirty_loaded = true
+  local p = persistent_dirty_path()
+  if not p then return end
+  local fd, _ = io.open(p, "r")
+  if not fd then return end
+  local content = fd:read("*a")
+  fd:close()
+  if not content or content == "" then return end
+  -- Two formats accepted:
+  --   1) JSON array of paths (preferred for atomic write/read)
+  --   2) Newline-separated paths (back-compat / hand-edit friendly)
+  local ok, decoded = pcall(vim.json.decode, content)
+  if ok and type(decoded) == "table" then
+    for _, abs in ipairs(decoded) do
+      if type(abs) == "string" and abs ~= "" then
+        state.persistent_dirty[abs:lower()] = abs
+      end
+    end
+  else
+    for line in content:gmatch("[^\r\n]+") do
+      state.persistent_dirty[line:lower()] = line
+    end
+  end
+end
+
+local function save_persistent_dirty()
+  local p = persistent_dirty_path()
+  if not p then return end
+  -- Build sorted array (deterministic ordering -> no spurious git diffs if
+  -- somebody ever puts this file under VCS for debugging).
+  local arr = {}
+  for _, abs in pairs(state.persistent_dirty) do arr[#arr + 1] = abs end
+  table.sort(arr)
+  -- Cap: drop oldest entries (= lex-smallest after sort, which is *not* truly
+  -- LRU but close enough — UE paths share long prefixes so lex-sort is
+  -- file-locality-friendly). Re-prepare resets this anyway.
+  if #arr > PERSISTENT_DIRTY_CAP then
+    local trimmed = {}
+    local start = #arr - PERSISTENT_DIRTY_CAP + 1
+    for i = start, #arr do trimmed[#trimmed + 1] = arr[i] end
+    arr = trimmed
+    -- Rebuild in-memory set from the cap to keep the two views in sync.
+    state.persistent_dirty = {}
+    for _, abs in ipairs(arr) do state.persistent_dirty[abs:lower()] = abs end
+  end
+  -- Atomic write: tmp + rename.
+  local dir = vim.fn.fnamemodify(p, ":h")
+  if vim.fn.isdirectory(dir) == 0 then vim.fn.mkdir(dir, "p") end
+  local tmp = p .. ".tmp"
+  local fd, err = io.open(tmp, "w")
+  if not fd then
+    log_debug("save dirty.json open failed: " .. tostring(err))
+    return
+  end
+  fd:write(vim.json.encode(arr))
+  fd:close()
+  local ok, rename_err = vim.uv.fs_rename(tmp, p)
+  if not ok then log_debug("save dirty.json rename failed: " .. tostring(rename_err)) end
+  -- Nag once per crossing — caller can debounce externally if needed.
+  if #arr >= PERSISTENT_DIRTY_WARN and not state._warned_dirty_high then
+    state._warned_dirty_high = true
+    vim.schedule(function()
+      vim.notify(("[ue.watch] %d files dirty since last :UEPrepare. Consider :UEPrepareReindex."):format(#arr),
+        vim.log.levels.INFO)
+    end)
+  end
+end
+
+local function add_to_persistent_dirty(paths)
+  if #paths == 0 then return end
+  load_persistent_dirty()
+  local changed = false
+  for _, abs in ipairs(paths) do
+    local k = abs:lower()
+    if not state.persistent_dirty[k] then
+      state.persistent_dirty[k] = abs
+      changed = true
+    end
+  end
+  if changed then save_persistent_dirty() end
+end
+
+-- Public API: snapshot the cumulative dirty set.
+-- Returns array of abs paths (forward-slash). Empty when no path configured /
+-- file missing / cleared.
+function M.snapshot_persistent_dirty()
+  load_persistent_dirty()
+  local arr = {}
+  for _, abs in pairs(state.persistent_dirty) do arr[#arr + 1] = abs end
+  return arr
+end
+
+-- Public API: clear the dirty set. Called from :UEPrepare on success.
+-- 'reason' is logged for debugging — pass "prepare" / "reindex" / "manual".
+function M.clear_persistent_dirty(reason)
+  state.persistent_dirty = {}
+  state.persistent_dirty_loaded = true
+  state._warned_dirty_high = false
+  local p = persistent_dirty_path()
+  if p then
+    -- Empty array, atomic write.
+    local dir = vim.fn.fnamemodify(p, ":h")
+    if vim.fn.isdirectory(dir) == 0 then vim.fn.mkdir(dir, "p") end
+    local tmp = p .. ".tmp"
+    local fd = io.open(tmp, "w")
+    if fd then
+      fd:write("[]")
+      fd:close()
+      vim.uv.fs_rename(tmp, p)
+    end
+  end
+  log_info(("persistent_dirty cleared (reason=%s)"):format(reason or "?"))
+end
+
+-- Public API: stats for :UEDirtyStatus.
+function M.persistent_dirty_status()
+  load_persistent_dirty()
+  local n = 0
+  for _ in pairs(state.persistent_dirty) do n = n + 1 end
+  return {
+    count = n,
+    path = persistent_dirty_path(),
+    cap = PERSISTENT_DIRTY_CAP,
+    warn_at = PERSISTENT_DIRTY_WARN,
+  }
 end
 
 -- Snapshot the pending add/del sets as plain arrays of absolute paths.

@@ -14,21 +14,32 @@
 --   rg pass over JUST the dirty files. This module is the "JUST the dirty
 --   files" half — three sources merged, deduped, filtered.
 --
--- THREE SOURCES:
---   1. git status --porcelain  — committed-but-modified, plus untracked
---   2. nvim modified buffers   — typed-but-unsaved (catches "in-flight"
---                                 edits before :w even fires fs_event)
---   3. ue_watch pending_add    — fs_event saw it, debounce timer hasn't
---                                 flushed yet, csearch hasn't ingested it
+-- THREE SOURCES (v2, post 2026-04-27 — git source removed):
+--   1. nvim modified buffers      — typed-but-unsaved (catches "in-flight"
+--                                    edits before :w even fires fs_event)
+--   2. ue_watch pending_add       — fs_event saw it, debounce timer hasn't
+--                                    flushed yet, csearch hasn't ingested it
+--   3. ue_watch persistent_dirty  — cumulative add-set since last :UEPrepare,
+--                                    persisted to .cache/.../runtime/dirty.json
+--                                    so it survives nvim restarts. THIS IS
+--                                    THE ONE THAT MATTERS for the cindex
+--                                    modify-no-op bug.
+--
+-- WHY git was removed:
+--   `git status --porcelain` on the UE tree is 195-200ms (warm fs cache).
+--   `<leader>/` runs the finder with live=true, so EVERY keystroke would
+--   pay that cost. Worse, git status doesn't actually answer the right
+--   question — it tells you "things uncommitted right now", but the cindex
+--   modify-no-op affects "things modified since the last cindex -reset",
+--   which is anchored on :UEPrepare, NOT on commits. The new dirty.json
+--   tracks the right anchor.
 --
 -- DEDUPE KEY: forward-slash + lowercase absolute path. Windows is case-
 -- insensitive on disk so "Foo.h" and "foo.h" must collapse to one entry,
 -- otherwise rg gets duplicate file args and emits duplicate matches.
 --
 -- FILTERING: utils.ue_paths.is_searchable — same blocklist the watcher
--- uses (Intermediate/Build/Saved/.generated.h/.gen.cpp/...). Keeps the
--- rg subprocess fast and prevents UE Hot Reload churn from polluting
--- the [LIVE] overlay column with thousands of generated headers.
+-- uses (Intermediate/Build/Saved/.generated.h/.gen.cpp/...).
 --
 -- LIMITS:
 --   * Windows command line cap is ~32K — we truncate to opts.max_files
@@ -46,8 +57,6 @@ local function norm_abs(path)
   local abs = vim.fn.fnamemodify(path, ":p")
   if not abs or abs == "" then return nil end
   abs = abs:gsub("\\", "/")
-  -- Strip trailing slash from dir-y paths (shouldn't happen for files but
-  -- defensive — git can emit dir entries for submodules).
   abs = abs:gsub("/$", "")
   return abs
 end
@@ -57,46 +66,7 @@ local function key_of(abs_path)
   return abs_path:lower()
 end
 
--- ── Source 1: git status --porcelain ────────────────────────────────────
--- Returns absolute paths. Includes untracked (??) and modified (M /AM/MM)
--- entries; excludes deleted (D ) — rg can't grep what's gone.
---
--- Synchronous: ~50ms on UE tree per memory note. If you want non-blocking,
--- call this from a coroutine yourself or use _git_dirty_async below.
-local function git_dirty_sync(root, timeout_ms)
-  if not root or root == "" then return {} end
-  timeout_ms = timeout_ms or 1500
-  local ok, res = pcall(vim.system, {
-    "git", "-C", root, "status", "--porcelain", "--no-renames",
-    "--untracked-files=normal",
-  }, { text = true, timeout = timeout_ms })
-  if not ok then return {} end
-  local out = res:wait()
-  if not out or out.code ~= 0 or not out.stdout then return {} end
-
-  local files = {}
-  for line in out.stdout:gmatch("[^\r\n]+") do
-    -- Format: "XY path" where XY is 2-char status. Path starts at col 4.
-    -- Quoted paths (spaces/unicode) start with " — strip outer quotes.
-    if #line >= 4 then
-      local status = line:sub(1, 2)
-      local path = line:sub(4)
-      -- Skip pure deletes: " D ..." or "D  ..." with no add half.
-      local is_delete = (status:sub(1,1) == "D" and status:sub(2,2) ~= "M")
-                     or (status:sub(2,2) == "D" and status:sub(1,1) == " ")
-      if not is_delete then
-        if path:sub(1,1) == '"' and path:sub(-1) == '"' then
-          path = path:sub(2, -2):gsub('\\\\', '\\'):gsub('\\"', '"')
-        end
-        local abs = norm_abs(root .. "/" .. path)
-        if abs then files[#files + 1] = abs end
-      end
-    end
-  end
-  return files
-end
-
--- ── Source 2: nvim modified buffers ─────────────────────────────────────
+-- ── Source 1: nvim modified buffers ─────────────────────────────────────
 local function buffer_dirty()
   local files = {}
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
@@ -111,7 +81,8 @@ local function buffer_dirty()
   return files
 end
 
--- ── Source 3: watcher pending_add ───────────────────────────────────────
+-- ── Source 2: watcher pending_add ───────────────────────────────────────
+-- In-flight: fs_event saw it, debounce hasn't fired yet.
 local function watcher_pending()
   local ok, watch = pcall(require, "utils.ue_watch")
   if not ok then return {} end
@@ -125,31 +96,47 @@ local function watcher_pending()
   return files
 end
 
+-- ── Source 3: persistent dirty.json ─────────────────────────────────────
+-- Cumulative since last :UEPrepare. Anchored correctly to the cindex -reset
+-- moment. This is the source that actually fixes the modify-no-op bug.
+local function persistent_dirty()
+  local ok, watch = pcall(require, "utils.ue_watch")
+  if not ok then return {} end
+  if type(watch.snapshot_persistent_dirty) ~= "function" then return {} end
+  local arr = watch.snapshot_persistent_dirty()
+  local files = {}
+  for _, p in ipairs(arr or {}) do
+    local abs = norm_abs(p)
+    if abs then files[#files + 1] = abs end
+  end
+  return files
+end
+
 -- ── Merge / filter / dedupe ─────────────────────────────────────────────
 --
 -- opts:
---   root            (string, optional) — repo root for git status. Falls
---                   back to cwd. Pass nil/empty to skip git source.
 --   max_files       (int, default 500) — hard cap, see Windows cmdline note.
 --   require_code_ext (bool, default true) — apply ue_paths.CODE_EXTS gate.
---   include         (table, optional) — { git=bool, buffer=bool, watcher=bool }
+--   include         (table, optional) — { buffer=bool, watcher=bool, persistent=bool }
 --                   defaults all true. Useful for tests.
+--   root            (string, optional) — kept for back-compat / API stability;
+--                   no longer used (git source removed).
 --
 -- Returns:
 --   {
 --     files = { abs_path, ... },     -- deduped, filtered, capped
 --     truncated = bool,              -- true if max_files hit
---     stats = { git=N, buffer=N, watcher=N, dedup_in=N, filter_in=N },
+--     stats = { buffer=N, watcher=N, persistent=N, dedup_in=N, filter_in=N },
 --   }
 function M.collect(opts)
   opts = opts or {}
   local include = opts.include or {}
-  local want_git     = include.git ~= false
-  local want_buffer  = include.buffer ~= false
-  local want_watcher = include.watcher ~= false
+  local want_buffer     = include.buffer ~= false
+  local want_watcher    = include.watcher ~= false
+  local want_persistent = include.persistent ~= false
   local max_files = opts.max_files or M.DEFAULT_MAX_FILES
 
-  local stats = { git = 0, buffer = 0, watcher = 0, dedup_in = 0, filter_in = 0 }
+  local stats = { buffer = 0, watcher = 0, persistent = 0, dedup_in = 0, filter_in = 0 }
 
   local seen = {}
   local merged = {}
@@ -165,24 +152,20 @@ function M.collect(opts)
     end
   end
 
-  if want_git     then add_source(git_dirty_sync(opts.root or vim.fn.getcwd(), opts.git_timeout_ms), "git") end
-  if want_buffer  then add_source(buffer_dirty(), "buffer") end
-  if want_watcher then add_source(watcher_pending(), "watcher") end
+  -- Order matters for cap-truncation priority: buffer first (active edit
+  -- right now), then in-flight watcher, then cumulative persistent.
+  if want_buffer     then add_source(buffer_dirty(), "buffer") end
+  if want_watcher    then add_source(watcher_pending(), "watcher") end
+  if want_persistent then add_source(persistent_dirty(), "persistent") end
 
   stats.dedup_in = #merged
 
-  -- Filter against blocklist. Done AFTER dedup because most dupes come
-  -- from git+buffer pointing at the same file — saves blocklist lookups.
   local filtered = ue_paths.filter(merged, { require_code_ext = opts.require_code_ext })
   stats.filter_in = #filtered
 
   local truncated = false
   if #filtered > max_files then
     truncated = true
-    -- Keep the FIRST max_files. Since git list comes first, then buffer,
-    -- then watcher, this prioritises committed-but-modified over
-    -- newly-discovered fs_event adds — usually what the user wants
-    -- (git changes are "things I'm actively working on").
     local capped = {}
     for i = 1, max_files do capped[i] = filtered[i] end
     filtered = capped
@@ -200,9 +183,9 @@ function M.collect_or_nil(opts)
 end
 
 -- Test hooks (exposed for headless smoke).
-M._git_dirty_sync = git_dirty_sync
 M._buffer_dirty = buffer_dirty
 M._watcher_pending = watcher_pending
+M._persistent_dirty = persistent_dirty
 M._norm_abs = norm_abs
 M._key_of = key_of
 

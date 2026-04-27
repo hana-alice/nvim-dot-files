@@ -422,6 +422,14 @@ it. `<C-/>` is for a fast scratch shell.
 | `<tab>` / `<s-tab>` | (in diff) Next/prev file             |
 | `<leader>gB`     | Open file in browser                    |
 | `<leader>gY`     | Copy repo URL                           |
+| `<leader>gn`     | Neogit status (current split)           |
+| `<leader>gN`     | Neogit status (full tab)                |
+| `<leader>gnc`    | Neogit commit popup                     |
+| `<leader>gnp`    | Neogit pull popup                       |
+| `<leader>gnP`    | Neogit push popup                       |
+| `<leader>gnl`    | Neogit log                              |
+| `<leader>gnb`    | Neogit branch popup                     |
+| `<leader>gns`    | Neogit stash popup                      |
 
 This config uses `[h` / `]h` for hunk nav, **not** `[c` / `]c` — `[c` is
 treesitter context jump.

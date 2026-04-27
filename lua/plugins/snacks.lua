@@ -471,6 +471,12 @@ return {
       -- lua/workarounds/snacks/projects_picker_freeze.lua for full context.
       require("workarounds.snacks.projects_picker_freeze").apply(opts)
 
+      -- Workaround: smart picker (<leader><leader>) lists buffers whose
+      -- file was deleted on disk after a branch switch — selecting one
+      -- opens an empty buffer at the stale path.
+      -- See lua/workarounds/snacks/smart_picker_dead_buffer.lua.
+      require("workarounds.snacks.smart_picker_dead_buffer").apply(opts)
+
       opts.picker.actions = vim.tbl_deep_extend("force", opts.picker.actions or {}, {
         paste_clipboard = paste_picker_clipboard,
         pin_sidebar_qflist = pin_sidebar_qflist,

@@ -52,13 +52,19 @@ local M = {}
 
 M.DEFAULT_MAX_FILES = 500
 
+-- Fast-event-safe path normalization. Original used vim.fn.fnamemodify(":p")
+-- which is forbidden in fast event ctx (snacks picker finder runs there).
+-- All three sources (buffer/watcher/persistent) already give abs paths in
+-- practice, so a pure-Lua slash-normalize is enough.
 local function norm_abs(path)
   if not path or path == "" then return nil end
-  local abs = vim.fn.fnamemodify(path, ":p")
-  if not abs or abs == "" then return nil end
-  abs = abs:gsub("\\", "/")
-  abs = abs:gsub("/$", "")
-  return abs
+  -- Already abs? Windows: "X:..." or "X:/..." or "//...". Unix: "/...".
+  -- If relative, do NOT call vim.fn.fnamemodify in fast ctx — return as-is
+  -- and let the caller filter; the dirty-set sources never produce relative
+  -- paths so this branch is defensive only.
+  local p = path:gsub("\\", "/")
+  p = p:gsub("/$", "")
+  return p
 end
 
 local function key_of(abs_path)
@@ -67,19 +73,76 @@ local function key_of(abs_path)
 end
 
 -- ── Source 1: nvim modified buffers ─────────────────────────────────────
-local function buffer_dirty()
+-- Fast-event-safe via a main-loop-maintained cache. The actual buffer scan
+-- runs in BufModifiedSet/BufWritePost/BufEnter autocmds (always main loop)
+-- and is just a table read here.
+--
+-- Module-level cache: array of abs paths, refreshed on the autocmds above.
+-- Stale-tolerant: missing a just-modified buffer for one tick doesn't break
+-- anything (watcher/persistent take over after :w).
+local _buffer_cache = {}
+local _buffer_cache_dirty = true  -- forces a rebuild on first non-fast call
+
+local function rebuild_buffer_cache()
+  -- MUST be called from main loop. Asserts to catch any accidental
+  -- regression — better a loud crash here than a silent stale cache.
+  assert(not vim.in_fast_event(), "rebuild_buffer_cache called in fast event")
   local files = {}
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_loaded(buf)
         and vim.bo[buf].modified
         and vim.bo[buf].buftype == "" then
       local name = vim.api.nvim_buf_get_name(buf)
-      local abs = norm_abs(name)
-      if abs then files[#files + 1] = abs end
+      if name and name ~= "" then
+        -- vim.fn.fnamemodify IS allowed here (main loop). Result is abs.
+        local abs = vim.fn.fnamemodify(name, ":p"):gsub("\\", "/"):gsub("/$", "")
+        files[#files + 1] = abs
+      end
     end
   end
-  return files
+  _buffer_cache = files
+  _buffer_cache_dirty = false
 end
+
+-- Public: lazy refresh from main loop. fast ctx readers get whatever's
+-- cached (possibly stale by one autocmd tick).
+local function buffer_dirty()
+  if vim.in_fast_event() then
+    -- Cannot rebuild here — return the last cached snapshot. If autocmds
+    -- have been firing this is up-to-date; if the cache was never primed
+    -- the result is empty (acceptable: in-flight typed-but-unsaved is the
+    -- only thing this source uniquely covers, and that gap closes on :w).
+    return _buffer_cache
+  end
+  if _buffer_cache_dirty then rebuild_buffer_cache() end
+  return _buffer_cache
+end
+
+-- Wire autocmds to invalidate + rebuild on the events that change the
+-- "is any buffer modified?" answer. Idempotent (group= clears prior).
+local _autocmds_installed = false
+local function ensure_autocmds()
+  if _autocmds_installed then return end
+  _autocmds_installed = true
+  local grp = vim.api.nvim_create_augroup("UEDirtyFilesBufferCache", { clear = true })
+  vim.api.nvim_create_autocmd(
+    { "BufModifiedSet", "BufWritePost", "BufEnter", "BufDelete", "BufWipeout" },
+    {
+      group = grp,
+      callback = function()
+        -- Mark dirty; rebuild lazily on next non-fast call OR eagerly here
+        -- if we're already on the main loop (autocmds are).
+        _buffer_cache_dirty = true
+        if not vim.in_fast_event() then rebuild_buffer_cache() end
+      end,
+    }
+  )
+end
+
+-- Schedule the autocmd registration for the next main-loop tick — `require`
+-- itself can be reached from a fast ctx (e.g. snacks finder), and
+-- nvim_create_augroup is forbidden there.
+vim.schedule(ensure_autocmds)
 
 -- ── Source 2: watcher pending_add ───────────────────────────────────────
 -- In-flight: fs_event saw it, debounce hasn't fired yet.

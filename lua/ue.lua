@@ -5228,9 +5228,9 @@ function M.cached_grep(opts)
                 git_timeout_ms = 800,
               })
               if files then
-                trace("rg-on-dirty START pat=%q dirty=%d (git=%d buf=%d watcher=%d, dropped=%d) truncated=%s",
+                trace("rg-on-dirty START pat=%q dirty=%d (buf=%d watcher=%d persistent=%d, dropped=%d) truncated=%s",
                   pattern, #files,
-                  info.stats.git, info.stats.buffer, info.stats.watcher,
+                  info.stats.buffer, info.stats.watcher, info.stats.persistent or 0,
                   info.stats.dedup_in - info.stats.filter_in,
                   tostring(info.truncated))
                 done_rg_dirty = false

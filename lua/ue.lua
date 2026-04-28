@@ -5089,40 +5089,8 @@ function M.cached_grep(opts)
       ctx.preview:set_title(vim.fn.fnamemodify(item.file or "", ":t"))
       return
     end
-    -- Lightweight plain-text preview: read ~11 lines around the hit via
-    -- vim.fn.readfile (no buffer attach, no syntax, no LSP). On UE-scale
-    -- workspaces snacks's default `picker.preview.file` runs ~150ms per
-    -- selection (buffer load + treesitter highlight + jump), which makes
-    -- arrow-key candidate-switching feel laggy (verified by ue_grep_trace.log
-    -- showing prev avg 36-160ms vs <2ms for this implementation). The cost
-    -- of snacks's preview is *intrinsic* to attach+TS+LSP on big cpp files —
-    -- not a regression we can fix upstream — so we trade syntax color for
-    -- 75x lower preview latency. <CR> still opens the real file in the
-    -- editor with full highlighting via confirm_grouped → snacks jump.
-    local file = item.file or item.path
-    local lnum = tonumber(item.line or item.lnum or item.row) or 1
-    if not file or file == "" then
-      ctx.preview:reset()
-      ctx.preview:set_lines({ "(no file)" })
-      return
-    end
-    local ok_read, lines = pcall(vim.fn.readfile, file)
-    ctx.preview:reset()
-    if not ok_read or type(lines) ~= "table" then
-      ctx.preview:set_lines({ "(read failed: " .. file .. ")" })
-      ctx.preview:set_title(vim.fn.fnamemodify(file, ":t"))
-      return
-    end
-    local total = #lines
-    local from = math.max(1, lnum - 5)
-    local to = math.min(total, lnum + 5)
-    local out = {}
-    for i = from, to do
-      local marker = (i == lnum) and ">> " or "   "
-      table.insert(out, string.format("%s%5d  %s", marker, i, lines[i] or ""))
-    end
-    ctx.preview:set_lines(out)
-    ctx.preview:set_title(vim.fn.fnamemodify(file, ":t") .. ":" .. lnum)
+    -- Default file preview for hit items.
+    return require("snacks.picker.preview").file(ctx)
   end
 
   -- Per-picker keymap override:

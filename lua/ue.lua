@@ -5089,8 +5089,40 @@ function M.cached_grep(opts)
       ctx.preview:set_title(vim.fn.fnamemodify(item.file or "", ":t"))
       return
     end
-    -- Default file preview for hit items.
-    return require("snacks.picker.preview").file(ctx)
+    -- Lightweight plain-text preview: read ~11 lines around the hit via
+    -- vim.fn.readfile (no buffer attach, no syntax, no LSP). On UE-scale
+    -- workspaces snacks's default `picker.preview.file` runs ~150ms per
+    -- selection (buffer load + treesitter highlight + jump), which makes
+    -- arrow-key candidate-switching feel laggy (verified by ue_grep_trace.log
+    -- showing prev avg 36-160ms vs <2ms for this implementation). The cost
+    -- of snacks's preview is *intrinsic* to attach+TS+LSP on big cpp files —
+    -- not a regression we can fix upstream — so we trade syntax color for
+    -- 75x lower preview latency. <CR> still opens the real file in the
+    -- editor with full highlighting via confirm_grouped → snacks jump.
+    local file = item.file or item.path
+    local lnum = tonumber(item.line or item.lnum or item.row) or 1
+    if not file or file == "" then
+      ctx.preview:reset()
+      ctx.preview:set_lines({ "(no file)" })
+      return
+    end
+    local ok_read, lines = pcall(vim.fn.readfile, file)
+    ctx.preview:reset()
+    if not ok_read or type(lines) ~= "table" then
+      ctx.preview:set_lines({ "(read failed: " .. file .. ")" })
+      ctx.preview:set_title(vim.fn.fnamemodify(file, ":t"))
+      return
+    end
+    local total = #lines
+    local from = math.max(1, lnum - 5)
+    local to = math.min(total, lnum + 5)
+    local out = {}
+    for i = from, to do
+      local marker = (i == lnum) and ">> " or "   "
+      table.insert(out, string.format("%s%5d  %s", marker, i, lines[i] or ""))
+    end
+    ctx.preview:set_lines(out)
+    ctx.preview:set_title(vim.fn.fnamemodify(file, ":t") .. ":" .. lnum)
   end
 
   -- Per-picker keymap override:
@@ -5156,12 +5188,12 @@ function M.cached_grep(opts)
     if f then f:write(line .. "\n"); f:close() end
   end
   if trace_enabled then
-    -- Truncate at session start (first cached_grep call after toggle on).
+    -- Truncate at session start so each <leader>/ produces a clean timeline.
     local f = io.open(trace_log_path, "w")
     if f then
-      f:write(string.format("=== UE grep trace  %s  backend=%s  grouping=%s ===\n",
+      f:write(string.format("=== UE grep trace  %s  backend=%s  grouping=%s  has_index=%s ===\n",
         os.date("%Y-%m-%d %H:%M:%S"), backend_label,
-        tostring(grouping_enabled)))
+        tostring(grouping_enabled), tostring(has_index)))
       f:close()
     end
   end
@@ -5199,83 +5231,24 @@ function M.cached_grep(opts)
           -- through a buffer, and use ctx.async:sleep() to yield to the
           -- picker until the csearch process reports done OR the picker
           -- aborts us (sleep returns early on abort).
-          local done = false              -- csearch done flag (kept name for diff continuity)
-          local done_rg_dirty = true      -- start as true; flipped to false only if we actually spawn rg
-          local rg_dirty_handle = nil
+          local done = false
           local pending = {}  -- items waiting to be drained on the main loop
           local items_received = 0
           local items_emitted = 0
 
-          -- ── rg-on-dirty overlay ───────────────────────────────────
-          -- csearch's path-key dedup means cindex SKIPS already-indexed
-          -- files even when their content changed (POC verified). So
-          -- "I just added MyNewClass and grep <leader>/MyNewClass"
-          -- returns 0 from csearch alone. Mitigation: in parallel,
-          -- run rg over the dirty file set (git status + modified
-          -- buffers + watcher pending_add). Items get text prefix
-          -- "[LIVE] " so the user knows which results are the bypass.
-          --
-          -- DESIGN GUARDS (per user constraints):
-          --   * empty dirty set → don't spawn rg at all (zero overhead)
-          --   * dirty set already filtered via utils.ue_paths blocklist
-          --     so Intermediate/Build/.generated.h won't pollute results
-          do
-            local ok_df, dirty_files_mod = pcall(require, "utils.dirty_files")
-            local ok_lg, live_grep_mod = pcall(require, "utils.live_grep_overlay")
-            if ok_df and ok_lg then
-              local files, info = dirty_files_mod.collect_or_nil({
-                root = cs_ctx and cs_ctx.root or nil,
-                git_timeout_ms = 800,
-              })
-              if files then
-                trace("rg-on-dirty START pat=%q dirty=%d (buf=%d watcher=%d persistent=%d, dropped=%d) truncated=%s",
-                  pattern, #files,
-                  info.stats.buffer, info.stats.watcher, info.stats.persistent or 0,
-                  info.stats.dedup_in - info.stats.filter_in,
-                  tostring(info.truncated))
-                done_rg_dirty = false
-                rg_dirty_handle = live_grep_mod.start(pattern, files, {
-                  smart_case = true,
-                  on_line = function(rec)
-                    -- Same item shape as csearch on_line so the picker
-                    -- format function doesn't need to differentiate.
-                    -- Prefix text with [LIVE] so the user spots them.
-                    pending[#pending + 1] = {
-                      text = rec.file .. ":" .. rec.lnum .. ":" .. rec.col .. ":[LIVE] " .. rec.text,
-                      pos  = { rec.lnum, math.max(0, rec.col - 1) },
-                      file = rec.file,
-                    }
-                    items_received = items_received + 1
-                  end,
-                  on_done = function(code, err)
-                    done_rg_dirty = true
-                    trace("rg-on-dirty DONE pat=%q code=%s err=%s",
-                      pattern, tostring(code), tostring(err and err:sub(1,80)))
-                    -- exit code 1 = no matches (normal); only warn on real errors
-                    if err and code and code > 1 then
-                      vim.schedule(function()
-                        vim.notify("UE grep [LIVE rg]: " .. err, vim.log.levels.WARN, { title = "UE" })
-                      end)
-                    end
-                  end,
-                })
-                if not rg_dirty_handle then
-                  -- spawn failed (argv too big, exec missing, etc.) —
-                  -- leave done_rg_dirty=true so main loop doesn't block.
-                  done_rg_dirty = true
-                end
-              else
-                trace("rg-on-dirty SKIP pat=%q (no dirty files)", pattern)
-              end
-            end
-          end
-
+          local t_cs_spawn_0 = vim.loop.hrtime()
+          local cs_first_line_logged = false
           local stop = code_search.stream(cs_ctx, pattern, {
             code_only   = opts.code_only,
             smart_case  = true,
             max_count   = opts.max_count or 5000,
           }, {
             on_line = function(file, lnum, col, text)
+              if not cs_first_line_logged then
+                cs_first_line_logged = true
+                trace("PHASE csearch_first_line=%.2fms after_spawn",
+                  (vim.loop.hrtime() - t_cs_spawn_0) / 1e6)
+              end
               -- Buffer the item; we drain inside the sleep loop below
               -- where it's safe to call cb (we're guaranteed not yet done).
               pending[#pending + 1] = {
@@ -5287,8 +5260,10 @@ function M.cached_grep(opts)
             end,
             on_done = function(code, err)
               done = true
-              trace("csearch DONE pat=%q recv=%d code=%s err=%s",
-                pattern, items_received, tostring(code), tostring(err and err:sub(1,80)))
+              trace("csearch DONE pat=%q recv=%d code=%s err=%s elapsed=%.1fms",
+                pattern, items_received, tostring(code),
+                tostring(err and err:sub(1,80)),
+                (vim.loop.hrtime() - t_cs_spawn_0) / 1e6)
               if err and code ~= 0 then
                 vim.schedule(function()
                   vim.notify("UE grep [csearch]: " .. err, vim.log.levels.WARN, { title = "UE" })
@@ -5296,6 +5271,8 @@ function M.cached_grep(opts)
               end
             end,
           })
+          trace("PHASE cs_stream_call_returned=%.2fms",
+            (vim.loop.hrtime() - t_cs_spawn_0) / 1e6)
 
           -- Watchdog timer: snacks aborts our async task by killing the
           -- coroutine — when that happens our drain loop never executes
@@ -5338,10 +5315,6 @@ function M.cached_grep(opts)
                   trace("WATCHDOG kill pat=%q new=%q recv=%d",
                     pattern, tostring(cur), items_received)
                   pcall(stop)
-                  -- Also kill rg-on-dirty if it's still streaming.
-                  if rg_dirty_handle and rg_dirty_handle.stop then
-                    pcall(rg_dirty_handle.stop)
-                  end
                   if t and not t:is_closing() then
                     pcall(function() t:stop() end)
                     pcall(function() t:close() end)
@@ -5385,10 +5358,7 @@ function M.cached_grep(opts)
           local read_idx = 1
           local tick_count = 0
           local longest_drain_ms = 0
-          -- Loop until BOTH csearch AND rg-on-dirty have reported done.
-          -- done_rg_dirty starts as true if we never spawned rg, so this
-          -- collapses to the original "while not done" in that case.
-          while not (done and done_rg_dirty) and elapsed < max_total_ms do
+          while not done and elapsed < max_total_ms do
             tick_count = tick_count + 1
             -- Abort detection: compare against LIVE picker input, not the
             -- finder_ctx.filter snapshot (snacks captures the filter at
@@ -5406,7 +5376,6 @@ function M.cached_grep(opts)
                 pattern, tostring(cur_search), tick_count, elapsed,
                 items_received, items_emitted, #pending - read_idx + 1)
               pcall(stop)
-              if rg_dirty_handle and rg_dirty_handle.stop then pcall(rg_dirty_handle.stop) end
               break
             end
             -- Drain up to CB_BUDGET items accumulated since last slice.
@@ -5465,10 +5434,6 @@ function M.cached_grep(opts)
           -- Stop the subprocess if it's still alive (timeout / abort path).
           if not done then
             pcall(stop)
-          end
-          -- Same for rg-on-dirty.
-          if rg_dirty_handle and rg_dirty_handle.stop and not done_rg_dirty then
-            pcall(rg_dirty_handle.stop)
           end
 
           -- Watchdog cleanup: normal completion path. Abort path also

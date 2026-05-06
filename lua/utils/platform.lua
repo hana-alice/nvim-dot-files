@@ -1,9 +1,8 @@
--- Shared platform detection flags. Require once, use everywhere.
--- Avoids scattering `vim.fn.has("win32")` checks across dozens of files.
-local M = {}
+-- Compatibility shim for `require("utils.platform")`.
+--
+-- The real implementation moved to `lua/utils/platform/init.lua` so we can
+-- ship a per-platform driver registry under the same namespace.
+-- This file is kept so existing call sites (which directly read
+-- `M.is_windows`, etc.) remain valid byte-for-byte.
 
-M.is_windows = vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1
-M.is_mac     = vim.fn.has("mac") == 1 or vim.fn.has("macunix") == 1
-M.is_linux   = (not M.is_windows) and (not M.is_mac) and (vim.fn.has("unix") == 1)
-
-return M
+return require("utils.platform.init")

@@ -411,25 +411,23 @@ it. `<C-/>` is for a fast scratch shell.
 | `<leader>gS`     | Git stash                               |
 | `<leader>gd`     | Diff hunks                              |
 | `<leader>gD`     | Diff against origin                     |
-| `<leader>gv/gV`  | Diffview open / close                   |
-| `<leader>gvf`    | Diffview: this file history             |
-| `<leader>gvb`    | Diffview: branch history                |
-| `<leader>gvc`    | Diffview: last commit (HEAD~1)          |
-| `<leader>gvm`    | Diffview: vs origin/HEAD                |
+| `<leader>gv`     | Diffview: working tree (visual: line history) |
+| `<leader>gV`     | Diffview: close                         |
+| `<leader>gm`     | Diffview: this file history             |
+| `<leader>gM`     | Diffview: branch history                |
+| `<leader>gn`     | Neogit status panel (one-stop)          |
 | `]c` / `[c`      | (in diff) Next/prev hunk in current file|
 | `]h` / `[h`      | (in diff) Next/prev hunk, cross file    |
 | `]x` / `[x`      | (in diff) Next/prev merge conflict      |
 | `<tab>` / `<s-tab>` | (in diff) Next/prev file             |
 | `<leader>gB`     | Open file in browser                    |
 | `<leader>gY`     | Copy repo URL                           |
-| `<leader>gn`     | Neogit status (current split)           |
-| `<leader>gN`     | Neogit status (full tab)                |
-| `<leader>gnc`    | Neogit commit popup                     |
-| `<leader>gnp`    | Neogit pull popup                       |
-| `<leader>gnP`    | Neogit push popup                       |
-| `<leader>gnl`    | Neogit log                              |
-| `<leader>gnb`    | Neogit branch popup                     |
-| `<leader>gns`    | Neogit stash popup                      |
+
+Inside Neogit status (`<leader>gn`) every action is one keystroke:
+`s`/`u`/`x` stage/unstage/discard, `c` commit, `P` push, `p` pull,
+`b` branch, `Z` stash, `l` log, `<tab>` fold section, `?` help, `q` close.
+
+Branch diff or any ad-hoc ref pair: `:DiffviewOpen main..feature`.
 
 This config uses `[h` / `]h` for hunk nav, **not** `[c` / `]c` — `[c` is
 treesitter context jump.

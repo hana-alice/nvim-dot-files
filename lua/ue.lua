@@ -2416,7 +2416,30 @@ INDEX_FN.build_phase_async = function(ctx, phase)
     return false, err
   end
 
-  local python = is_native_windows() and "python" or "python3"
+  -- Pin to Python 3.12 absolute path on Windows: relying on PATH `python`
+  -- bites us when an outer shell (hermes-aux, uv, conda) injects PYTHONHOME
+  -- pointing at a different minor (3.11/3.14) — child explodes with
+  -- `_sre.MAGIC mismatch` from the stdlib loader. Absolute path + scrubbed
+  -- env is the only reliable combo.
+  local python
+  if is_native_windows() then
+    -- Probe well-known per-user / system Python 3.12 install locations.
+    -- Falls back to PATH `python` if nothing matches (caller can override
+    -- via UE_PYTHON env var for non-standard installs).
+    local candidates = {
+      vim.env.UE_PYTHON,
+      vim.fn.expand("~/AppData/Local/Programs/Python/Python312/python.exe"),
+      vim.fn.expand("~/AppData/Local/Programs/Python/Python313/python.exe"),
+      "C:/Python312/python.exe",
+      "C:/Python313/python.exe",
+    }
+    for _, p in ipairs(candidates) do
+      if p and p ~= "" and is_file(p) then python = p; break end
+    end
+    python = python or "python"
+  else
+    python = "python3"
+  end
   local build_script = vim.fn.stdpath("config") .. "/tools/build_clangd_index.py"
   if not is_file(build_script) then
     return false, "build_clangd_index.py not found"
@@ -2462,15 +2485,34 @@ INDEX_FN.build_phase_async = function(ctx, phase)
   -- Defensive env scrub: if our parent (hermes/wt/IDE) injected PYTHONHOME
   -- pointing at a different python minor than `python` on PATH, the child
   -- explodes with `_sre.MAGIC mismatch` from the stdlib loader. Strip it.
+  -- IMPORTANT: setting key=nil in vim.fn.environ() is NOT enough — vim.system
+  -- on Windows has been observed inheriting the parent env even when the key
+  -- is removed from the table. Force-overwrite to the empty string so the
+  -- child sees an explicit blank, which Python's site.py treats as unset.
   local child_env = vim.fn.environ()
-  child_env.PYTHONHOME = nil
-  child_env.PYTHONPATH = nil
+  child_env.PYTHONHOME = ""
+  child_env.PYTHONPATH = ""
+  child_env.PYTHONSTARTUP = ""
+  local t_build_0 = vim.uv.hrtime()
+  local use_unity = (vim.env.UE_INDEX_NO_UNITY ~= "1")
   vim.system(cmd, { text = true, cwd = ctx.engine_root, env = child_env }, function(result)
+    local elapsed_s = (vim.uv.hrtime() - t_build_0) / 1e9
     vim.schedule(function()
       local live_state = ensure_index_state(ctx)
       INDEX_RT.job = nil
       local stderr = trim((result.stderr or "") .. "\n" .. (result.stdout or ""))
       local ok_result = (result.code == 0) and is_file(out_idx)
+      -- Persist per-phase timing so :UEIndexTimings (and post-mortem
+      -- inspection of state.json) can answer "how long did the last
+      -- :UEIndexFull take" without relying on console output.
+      live_state.index_timings = live_state.index_timings or {}
+      live_state.index_timings[phase] = {
+        elapsed_s = math.floor(elapsed_s * 100 + 0.5) / 100,
+        modules = #selected_keys,
+        status = ok_result and "ready" or "error",
+        unity = use_unity,
+        finished_at = unix_now(),
+      }
       if ok_result and INDEX_FN.promote_active_index(ctx, out_idx) then
         INDEX_FN.clear_module_dirty_flags(ctx, selected_keys)
         live_state.stats[phase .. "_runs"] = (tonumber(live_state.stats[phase .. "_runs"]) or 0) + 1
@@ -2479,7 +2521,7 @@ INDEX_FN.build_phase_async = function(ctx, phase)
           status = "ready",
           started_at = live_state.build.started_at or unix_now(),
           finished_at = unix_now(),
-          message = string.format("%s ready (%d modules)", phase, #selected_keys),
+          message = string.format("%s ready (%d modules) in %.1fs", phase, #selected_keys, elapsed_s),
           active_index = ctx.paths.active_index,
         }
         save_index_state(ctx, live_state)
@@ -7731,6 +7773,34 @@ function M.setup()
   vim.api.nvim_create_user_command("UEIndexFull", function()
     M.index_full()
   end, {})
+  vim.api.nvim_create_user_command("UEIndexTimings", function()
+    local ctx, err = resolve_context()
+    if not ctx then vim.notify("UEIndexTimings: " .. (err or "no ctx"), vim.log.levels.WARN); return end
+    local state = ensure_index_state(ctx)
+    local timings = state.index_timings or {}
+    local lines = { "UEIndexTimings (last run per phase):" }
+    local phases = { "current", "hot", "full" }
+    local any = false
+    for _, p in ipairs(phases) do
+      local t = timings[p]
+      if t then
+        any = true
+        local age = "?"
+        if t.finished_at and t.finished_at > 0 then
+          local secs = os.time() - t.finished_at
+          if secs < 60 then age = secs .. "s ago"
+          elseif secs < 3600 then age = math.floor(secs / 60) .. "m ago"
+          else age = math.floor(secs / 3600) .. "h ago" end
+        end
+        table.insert(lines, ("  %-7s %7.2fs  modules=%d  unity=%s  %s  (%s)"):format(
+          p, t.elapsed_s or 0, t.modules or 0, tostring(t.unity), t.status or "?", age))
+      else
+        table.insert(lines, ("  %-7s (never run)"):format(p))
+      end
+    end
+    if not any then table.insert(lines, "  (no phase has completed yet)") end
+    vim.notify(table.concat(lines, "\n"))
+  end, { desc = "Show last per-phase clangd-indexer wall-clock time" })
   vim.api.nvim_create_user_command("UECheatsheet", show_cheatsheet, {})
   vim.api.nvim_create_user_command("UECheatsheetEdit", edit_cheatsheet, {})
   vim.api.nvim_create_user_command("UEBuildPCH", function()

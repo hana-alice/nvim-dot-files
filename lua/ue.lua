@@ -35,34 +35,86 @@ local _CONTEXT_TTL = 30 -- seconds (filesystem walks are expensive on NTFS)
 -- ==========================================================================
 -- CORE UTILITIES — paths, files, process, ANSI
 -- ==========================================================================
+--
+-- The path/file/process helpers below were extracted to `lua/ue/core/{fs,proc}`
+-- in Phase B of the multi-platform migration. Each helper is rebound here as
+-- a `local function` whose body forwards to the extracted module — keeping
+-- every existing call site (`norm(...)`, `join(...)`, `is_file(...)`, etc.)
+-- byte-for-byte equivalent.
+--
+-- Constraint: a single Lua chunk is capped at 200 locals, and the original
+-- file already uses 202 locals (our wrappers re-occupy the same slots the
+-- original `local function trim` etc. did, so the count is unchanged). To
+-- stay under the cap we DO NOT introduce a top-level `_platform` or `_core`
+-- local — module table lookups happen inside each wrapper body where they
+-- do not occupy chunk-level slots.
 
 local function trim(value)
-  return vim.trim(tostring(value or ""))
+  return require("ue.core.fs").trim(value)
 end
 
 local function norm(path)
-  if not path or path == "" then
-    return ""
-  end
-  path = tostring(path):gsub("\\", "/")
-  path = path:gsub("/+", "/")
-  if #path > 1 and path:sub(-1) == "/" then
-    path = path:sub(1, -2)
-  end
-  return path
+  return require("ue.core.fs").norm(path)
 end
 
 local function cwd()
-  local uv_cwd = vim.uv and vim.uv.cwd and vim.uv.cwd() or nil
-  if uv_cwd and uv_cwd ~= "" then
-    return norm(uv_cwd)
-  end
-  return norm(vim.fn.getcwd())
+  return require("ue.core.fs").cwd()
 end
 
-local _platform = require("utils.platform")
+local function join(...)
+  return require("ue.core.fs").join(...)
+end
+
+local function dirname(path)
+  return require("ue.core.fs").dirname(path)
+end
+
+local function is_dir(path)
+  return require("ue.core.fs").is_dir(path)
+end
+
+local function is_file(path)
+  return require("ue.core.fs").is_file(path)
+end
+
+local function ensure_dir(path)
+  return require("ue.core.fs").ensure_dir(path)
+end
+
+local function file_stat(path)
+  return require("ue.core.fs").file_stat(path)
+end
+
+local function file_mtime(path)
+  return require("ue.core.fs").file_mtime(path)
+end
+
+local function path_has_prefix(path, prefix)
+  return require("ue.core.fs").path_has_prefix(path, prefix)
+end
+
+local function is_absolute_path(path)
+  return require("ue.core.fs").is_absolute_path(path)
+end
+
+local function split_path(path)
+  return require("ue.core.fs").split_path(path)
+end
+
+local function common_ancestor(paths)
+  return require("ue.core.fs").common_ancestor(paths)
+end
+
+local function relative_to(root, path)
+  return require("ue.core.fs").relative_to(root, path)
+end
+
+local function first_executable(candidates)
+  return require("ue.core.proc").first_executable(candidates)
+end
+
 local function is_native_windows()
-  return _platform.is_windows
+  return require("utils.platform").is_windows
 end
 
 local function focus_window(win)
@@ -82,148 +134,6 @@ local function startinsert_in_window(win)
     end
     pcall(vim.cmd, "startinsert")
   end)
-end
-
-local function join(...)
-  return norm(table.concat(vim.iter({ ... }):flatten():totable(), "/"))
-end
-
-local function dirname(path)
-  return norm(vim.fs.dirname(path))
-end
-
-local function is_dir(path)
-  return vim.fn.isdirectory(path) == 1
-end
-
-local function is_file(path)
-  return vim.fn.filereadable(path) == 1
-end
-
-local function ensure_dir(path)
-  if path ~= "" and not is_dir(path) then
-    vim.fn.mkdir(path, "p")
-  end
-end
-
-local function file_stat(path)
-  path = norm(path)
-  if path == "" or not vim.uv or not vim.uv.fs_stat then
-    return nil
-  end
-  return vim.uv.fs_stat(path)
-end
-
-local function file_mtime(path)
-  local stat = file_stat(path)
-  local mtime = stat and stat.mtime or nil
-  if type(mtime) == "table" then
-    return tonumber(mtime.sec) or 0
-  end
-  return tonumber(mtime) or 0
-end
-
-local function path_has_prefix(path, prefix)
-  path = norm(path)
-  prefix = norm(prefix)
-  if prefix == "" then
-    return false
-  end
-  if prefix == "/" then
-    return path:sub(1, 1) == "/"
-  end
-  return path == prefix or path:sub(1, #prefix + 1) == prefix .. "/"
-end
-
-local function is_absolute_path(path)
-  path = norm(path)
-  return path ~= "" and (path:sub(1, 1) == "/" or path:match("^[A-Za-z]:/") or path:match("^//"))
-end
-
-local function split_path(path)
-  local parts = {}
-  for part in norm(path):gmatch("[^/]+") do
-    table.insert(parts, part)
-  end
-  return parts
-end
-
-local function common_ancestor(paths)
-  local normalized = {}
-  local absolute = true
-
-  for _, path in ipairs(paths or {}) do
-    path = norm(path)
-    if path ~= "" then
-      table.insert(normalized, path)
-      absolute = absolute and path:sub(1, 1) == "/"
-    end
-  end
-
-  if #normalized == 0 then
-    return ""
-  end
-
-  local shared = split_path(normalized[1])
-  for index = 2, #normalized do
-    local parts = split_path(normalized[index])
-    local keep = 0
-    for part_index = 1, math.min(#shared, #parts) do
-      if shared[part_index] ~= parts[part_index] then
-        break
-      end
-      keep = part_index
-    end
-    while #shared > keep do
-      table.remove(shared)
-    end
-    if #shared == 0 then
-      break
-    end
-  end
-
-  if #shared == 0 then
-    return absolute and "/" or ""
-  end
-
-  local prefix = table.concat(shared, "/")
-  if absolute then
-    return "/" .. prefix
-  end
-  return prefix
-end
-
-local function relative_to(root, path)
-  root = norm(root)
-  path = norm(path)
-
-  if root == "" then
-    return path
-  end
-  if root == "/" then
-    return path
-  end
-  if path == root then
-    return "."
-  end
-  if not path_has_prefix(path, root) then
-    return path
-  end
-  return path:sub(#root + 2)
-end
-
-local function first_executable(candidates)
-  for _, candidate in ipairs(candidates or {}) do
-    if candidate and candidate ~= "" then
-      if candidate:find("/", 1, true) and is_file(candidate) then
-        return candidate
-      end
-      if vim.fn.executable(candidate) == 1 then
-        return candidate
-      end
-    end
-  end
-  return nil
 end
 
 -- ==========================================================================

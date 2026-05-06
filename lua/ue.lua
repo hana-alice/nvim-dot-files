@@ -16,21 +16,26 @@ local CORE_RT = {
   context_cache = {}, -- key -> { ctx, ts }
 }
 local INDEX_FN = {}
+-- Phase C: tunables sourced from `ue.config`. Literal fallbacks (`or 120000`
+-- etc.) match the previous hard-coded values exactly so behaviour is
+-- unchanged when no user override is provided. The fallbacks also keep this
+-- chunk loadable if `ue.config` ever fails to require.
+local _ue_cfg = require("ue.config")
 local INDEX_RT = {
   job = nil,
   module_state = {},
   contexts = {},
   timers = {},
-  idle_cold_ms = 120000,
-  debounce_current_ms = 1200,
-  debounce_hot_ms = 8000,
-  restart_debounce_s = 45,
+  idle_cold_ms        = _ue_cfg.get("index.idle_cold_ms")        or 120000,
+  debounce_current_ms = _ue_cfg.get("index.debounce_current_ms") or 1200,
+  debounce_hot_ms     = _ue_cfg.get("index.debounce_hot_ms")     or 8000,
+  restart_debounce_s  = _ue_cfg.get("index.restart_debounce_s")  or 45,
   last_restart_at = 0,
   status_cache = {},
-  status_ttl = 30,
+  status_ttl          = _ue_cfg.get("index.status_ttl_s")        or 30,
 }
 local cache_paths
-local _CONTEXT_TTL = 30 -- seconds (filesystem walks are expensive on NTFS)
+local _CONTEXT_TTL = _ue_cfg.get("context.ttl_s") or 30 -- seconds (filesystem walks are expensive on NTFS)
 
 -- ==========================================================================
 -- CORE UTILITIES — paths, files, process, ANSI

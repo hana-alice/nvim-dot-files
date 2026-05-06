@@ -6424,12 +6424,18 @@ local function install_android()
     end
   end))
 
+  -- Accumulate full stdout / stderr so we can surface the REAL adb error on
+  -- failure (the per-line message overwrite would otherwise leave you with
+  -- just "Failed (exit 1)" and lose the actual "Failure [INSTALL_FAILED_*]"
+  -- line that adb prints).
+  local stdout_lines, stderr_lines = {}, {}
   vim.fn.jobstart({ "adb", "install", "-r", apk_win }, {
     stdout_buffered = true,
     stderr_buffered = true,
     on_stdout = function(_, data)
       for _, line in ipairs(data) do
         if line ~= "" then
+          table.insert(stdout_lines, line)
           vim.schedule(function()
             if handle then handle.message = line end
           end)
@@ -6439,6 +6445,7 @@ local function install_android()
     on_stderr = function(_, data)
       for _, line in ipairs(data) do
         if line ~= "" then
+          table.insert(stderr_lines, line)
           vim.schedule(function()
             if handle then handle.message = line end
           end)
@@ -6452,10 +6459,66 @@ local function install_android()
         if code == 0 then
           handle.message = "Installed successfully"
           handle:finish()
-        else
-          handle.message = "Failed (exit " .. code .. ")"
-          handle:finish()
+          return
         end
+
+        -- Failure path: keep the fidget handle alive long enough for the user
+        -- to actually READ the adb error, then finish it. Show stderr first
+        -- (where adb writes "Failure [INSTALL_FAILED_*]"), fall back to
+        -- stdout, fall back to a placeholder. Full blob goes to utils.log
+        -- so `:NvimLog` always has the post-mortem.
+        local stderr_blob = table.concat(stderr_lines, "\n")
+        local stdout_blob = table.concat(stdout_lines, "\n")
+
+        -- Pick the most useful single line for the inline progress display:
+        -- prefer a line containing "Failure [", then any stderr line, then
+        -- the last stdout line. fidget collapses newlines so we keep it short.
+        local function pick_summary()
+          for _, line in ipairs(stderr_lines) do
+            if line:find("Failure %[") or line:find("^adb: ") then
+              return line
+            end
+          end
+          if #stderr_lines > 0 then return stderr_lines[#stderr_lines] end
+          if #stdout_lines > 0 then return stdout_lines[#stdout_lines] end
+          return "(no output captured)"
+        end
+
+        local summary = pick_summary()
+
+        -- Append a short hint for well-known failure codes so the user gets
+        -- an actionable next step inline, without having to grep docs.
+        local hint
+        if summary:find("INSTALL_FAILED_UPDATE_INCOMPATIBLE") then
+          hint = "→ run: adb uninstall <your.package.id>  (signature mismatch from leftover PMS record)"
+        elseif summary:find("INSTALL_FAILED_INSUFFICIENT_STORAGE") then
+          hint = "→ free space on /data or use adb install -r -d"
+        elseif summary:find("INSTALL_FAILED_VERSION_DOWNGRADE") then
+          hint = "→ downgrade blocked; use adb install -r -d (allow downgrade) or uninstall first"
+        elseif summary:find("INSTALL_FAILED_NO_MATCHING_ABIS") then
+          hint = "→ ABI mismatch (e.g. arm64 APK on x86 device); check device ABI with: adb shell getprop ro.product.cpu.abi"
+        elseif summary:find("INSTALL_PARSE_FAILED") then
+          hint = "→ APK corrupt or unsigned; rebuild + re-sign"
+        elseif summary:find("device offline") or summary:find("no devices/emulators") then
+          hint = "→ adb device gone; check: adb devices"
+        end
+
+        handle.message = ("✗ exit %d — %s%s"):format(code, summary, hint and ("  " .. hint) or "")
+
+        -- Persist the full output to the rotating debug log BEFORE finishing
+        -- the handle, so even if fidget vanishes the user can `:NvimLog`.
+        local ok_log, log = pcall(require, "utils.log")
+        if ok_log and log.error then
+          log.error("ue.install", ("adb install failed (exit %d): %s\n--- stderr ---\n%s\n--- stdout ---\n%s\nLog: see :NvimLog"):format(
+            code, vim.fn.fnamemodify(apk_win, ":t"), stderr_blob, stdout_blob
+          ))
+        end
+
+        -- Delay finish() so the failure message stays on screen ~8s instead
+        -- of fidget's default ~3s. handle:finish() is what triggers fade-out.
+        vim.defer_fn(function()
+          if handle then handle:finish() end
+        end, 8000)
       end)
     end,
   })

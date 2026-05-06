@@ -1,20 +1,11 @@
 -- Neogit: Magit-style git operation panel for Neovim.
 --
--- Why both neogit + diffview + lazygit?
---   * lazygit  : terminal-based, fastest for staged-by-staged commit & rebase.
---   * neogit   : in-Neovim status panel, stage hunks WITH lsp/treesitter context,
---                jump straight into a buffer, drives diffview for diffs.
---   * diffview : pure diff/PR review surface. neogit hands diff rendering to it.
+-- Single entry point only — user rule: no nested gn{c,p,P,l,b,s} subkeys.
+-- Inside the Neogit status buffer everything is one keystroke already
+-- (s stage, u unstage, x discard, c commit, P push, p pull, b branch,
+--  Z stash, l log, $ command output, ? help).
 --
--- Keymap layout (avoids existing <leader>g{d,h,v,...}):
---   <leader>gn   -> open Neogit status (toggle)
---   <leader>gN   -> Neogit in a new tab (full-screen)
---   <leader>gnc  -> commit
---   <leader>gnp  -> pull
---   <leader>gnP  -> push
---   <leader>gnl  -> log
---   <leader>gnb  -> branch popup
---   <leader>gns  -> stash popup
+-- Keymap: <leader>gn → Neogit status (the only entry point).
 return {
   {
     "NeogitOrg/neogit",
@@ -26,13 +17,6 @@ return {
     },
     keys = {
       { "<leader>gn", function() require("neogit").open() end, desc = "Neogit (status)" },
-      { "<leader>gN", function() require("neogit").open({ kind = "tab" }) end, desc = "Neogit (tab)" },
-      { "<leader>gnc", function() require("neogit").open({ "commit" }) end, desc = "Neogit commit" },
-      { "<leader>gnp", function() require("neogit").open({ "pull" }) end, desc = "Neogit pull" },
-      { "<leader>gnP", function() require("neogit").open({ "push" }) end, desc = "Neogit push" },
-      { "<leader>gnl", function() require("neogit").open({ "log" }) end, desc = "Neogit log" },
-      { "<leader>gnb", function() require("neogit").open({ "branch" }) end, desc = "Neogit branches" },
-      { "<leader>gns", function() require("neogit").open({ "stash" }) end, desc = "Neogit stash" },
     },
     opts = {
       -- Use diffview for the diff surface (1 hunk -> opens diffview tab).
@@ -40,20 +24,13 @@ return {
         diffview = true,
         telescope = true,
       },
-      -- Disable signs in the status buffer; gitsigns already paints buffers.
       disable_signs = false,
       disable_hint = false,
       disable_context_highlighting = false,
       disable_commit_confirmation = false,
-      -- Auto-refresh status buffer on focus.
       auto_refresh = true,
-      -- Where the status window opens; "tab" = full screen, "split" = horizontal,
-      -- "vsplit", "floating" also work. Default split keeps current layout intact.
       kind = "tab",
-      -- Commit editor uses a floating window so it doesn't disturb your layout.
-      commit_editor = {
-        kind = "tab",
-      },
+      commit_editor = { kind = "tab" },
       commit_select_view = { kind = "tab" },
       commit_view = {
         kind = "vsplit",
@@ -66,20 +43,18 @@ return {
       tag_editor = { kind = "auto" },
       preview_buffer = { kind = "floating" },
       popup = { kind = "split" },
-      -- Sign column markers in the status buffer.
       signs = {
         hunk = { "", "" },
         item = { "", "" },
         section = { "", "" },
       },
-      -- Override the status buffer mappings only where needed; keep defaults.
       mappings = {
         status = {
           ["q"] = "Close",
           ["<esc>"] = "Close",
-          -- "<tab>" already toggles section folding by default
-          -- "s" stage, "u" unstage, "x" discard, "c" commit popup, "P" push popup, "p" pull popup
-          -- ":" command, "?" help
+          -- Defaults already cover: s/u/x stage/unstage/discard, c commit popup,
+          -- P push popup, p pull popup, b branch popup, Z stash popup,
+          -- l log popup, <tab> toggle section, ? help.
         },
       },
     },

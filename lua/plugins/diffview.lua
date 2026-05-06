@@ -4,9 +4,10 @@
 -- diff / 3-way merge is painful inline. Diffview opens a dedicated tab with
 -- a file panel + side-by-side editors, like the GitHub PR view.
 --
--- Keymap prefix: <leader>gv  (g = git, v = view/diffview)
---   Avoids existing <leader>gd (gitsigns hunk diff) and <leader>gh (LazyVim
---   git submenu). All <leader>gv* are free as of nvim/docs/ue_lazyvim_cheatsheet.md.
+-- Keymap policy (user rule): all git keys live under <leader>g, single-level only.
+-- LazyVim already occupies: gb gB gc gd gD ge gf gg gG gh* gi gI gl gL go gp gP
+--                           gr gs gS gY
+-- Free letters used here:   gv gV gm gM gn
 return {
   {
     "sindrets/diffview.nvim",
@@ -21,10 +22,10 @@ return {
     keys = {
       { "<leader>gv", "<cmd>DiffviewOpen<cr>", desc = "Diffview: working tree" },
       { "<leader>gV", "<cmd>DiffviewClose<cr>", desc = "Diffview: close" },
-      { "<leader>gvf", "<cmd>DiffviewFileHistory %<cr>", desc = "Diffview: this file history" },
-      { "<leader>gvb", "<cmd>DiffviewFileHistory<cr>", desc = "Diffview: branch history" },
-      { "<leader>gvc", "<cmd>DiffviewOpen HEAD~1<cr>", desc = "Diffview: last commit" },
-      { "<leader>gvm", "<cmd>DiffviewOpen origin/HEAD...HEAD<cr>", desc = "Diffview: vs origin/HEAD" },
+      { "<leader>gm", "<cmd>DiffviewFileHistory %<cr>", desc = "Diffview: this file history" },
+      { "<leader>gM", "<cmd>DiffviewFileHistory<cr>", desc = "Diffview: branch history" },
+      -- visual mode: line history of the selection (re-uses gv letter, mode-disambiguated)
+      { "<leader>gv", ":DiffviewFileHistory<cr>", mode = "v", desc = "Diffview: selection history" },
     },
     opts = function()
       local actions = require("diffview.actions")
@@ -84,7 +85,6 @@ return {
             { "n", "<tab>", actions.select_next_entry, { desc = "Next file" } },
             { "n", "<s-tab>", actions.select_prev_entry, { desc = "Prev file" } },
             { "n", "<cr>", actions.select_entry, { desc = "Open file" } },
-            -- j/k → next_entry/prev_entry already defaults from diffview/config.lua
           },
           file_history_panel = {
             { "n", "q", "<cmd>DiffviewClose<cr>", { desc = "Close diffview" } },

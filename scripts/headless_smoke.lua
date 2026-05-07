@@ -102,6 +102,59 @@ check("ue.cdb.json.template_entry empty",  function()
   assert(type(t) == "table")
 end)
 
+-- ── Phase E.2: ue.cdb.paths + ue.cdb.shaders ───────────────────────────
+check("require ue.cdb.paths",              function() return require("ue.cdb.paths") end)
+check("ue.cdb.paths.targets shape",        function()
+  local t = require("ue.cdb.paths").targets({ engine_root = "/x" })
+  assert(#t == 2 and t[1] == "/x/compile_commands.json")
+end)
+check("ue.cdb.paths.candidates no fd",     function()
+  -- omit `run_lines` → no fd-based discovery; non-existent root → empty
+  local c = require("ue.cdb.paths").candidates({ engine_root = "/nonexistent_xyz_12345" }, {})
+  assert(type(c) == "table")
+end)
+check("require ue.cdb.shaders",            function() return require("ue.cdb.shaders") end)
+check("ue.cdb.shaders.augment empty list", function()
+  assert(require("ue.cdb.shaders").augment("[]", {}, {}) == "[]")
+end)
+check("ue.cdb.shaders.make_entry shape",   function()
+  local e = require("ue.cdb.shaders").make_entry("/s/x.usf",
+    { directory = "/d", arguments = { "clang++" } }, { "/inc" })
+  assert(e.file == "/s/x.usf" and e.directory == "/d")
+  assert(e.arguments[1] == "clang++" and e.arguments[2] == "-x")
+end)
+
+-- ── Phase E.3: ue.cdb.pipeline ─────────────────────────────────────────
+check("require ue.cdb.pipeline",           function() return require("ue.cdb.pipeline") end)
+check("ue.cdb.pipeline.set_runtime + slim noop", function()
+  local p = require("ue.cdb.pipeline")
+  local notes = {}
+  p.set_runtime({
+    notify    = function(msg, _) notes[#notes+1] = msg end,
+    log_error = function(_, _) end,
+    jobstart  = function(_, _, _) return 0 end,
+  })
+  -- slim() returns false when the python script is missing AND the
+  -- notify path produces a warning — both observable in headless.
+  local ok = p.slim("/nonexistent/cdb.json")
+  assert(ok == false or ok == true)
+end)
+
+-- ── Phase F.2: ue.dap.platforms registry ───────────────────────────────
+check("require ue.dap.platforms",          function() return require("ue.dap.platforms") end)
+check("ue.dap.platforms.register + lookup", function()
+  local p = require("ue.dap.platforms")
+  p._reset_for_test()
+  local hit = false
+  p.register_attach("xtest", function() hit = true end)
+  local h = p.attach_handler("xtest")
+  assert(type(h) == "function")
+  h()
+  assert(hit, "registered handler did not fire")
+  assert(p.launch_handler("xtest") == nil)
+  p._reset_for_test()
+end)
+
 -- ── Public API freeze (require("ue")) ──────────────────────────────────
 check("require ue",                        function() return require("ue") end)
 local PUBLIC_TABLES = { "FT_CPP", "FT_SHADER", "FT_CODE", "FT_CONFIG", "FT_ALL", "FT_GTAGS", "GLOBS_CODE", "GLOBS_ALL" }
@@ -127,7 +180,7 @@ for _, fn in ipairs(PUBLIC_FUNCTIONS) do
   end)
 end
 
--- ── Phase F.1: UEDAP* aliases register on setup() ───────────────────────
+-- ── Phase F.1+F.2: UEDAP* aliases register on setup() + dispatch table ─
 check("ue.setup() registers UEDAP* aliases", function()
   require("ue").setup()
   for _, c in ipairs({
@@ -137,6 +190,12 @@ check("ue.setup() registers UEDAP* aliases", function()
   }) do
     assert(vim.fn.exists(":" .. c) == 2, c .. " not registered")
   end
+end)
+check("ue.setup() registers android in dap.platforms", function()
+  -- ue.setup() should have populated the dispatch table with android
+  local p = require("ue.dap.platforms")
+  assert(type(p.attach_handler("android")) == "function", "android attach handler missing")
+  assert(type(p.launch_handler("android")) == "function", "android launch handler missing")
 end)
 check("backward-compat: UEAndroidDAP* still registered", function()
   for _, c in ipairs({

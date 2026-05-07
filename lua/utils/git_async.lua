@@ -1,0 +1,12 @@
+-- DEPRECATED. Use `utils.async_launcher` instead.
+--
+-- This module was the original git-only launcher. It has been
+-- generalized into `utils.async_launcher` so UE prepare / GTAGS
+-- index / build commands can share the same placeholder + fidget
+-- progress contract.
+--
+-- This file remains as a thin forwarder to keep older callsites
+-- (lua/plugins/diffview.lua, fugitive.lua, neogit.lua) working
+-- without immediate edits. Newly-written callsites should import
+-- async_launcher directly.
+return require("utils.async_launcher")

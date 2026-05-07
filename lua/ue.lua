@@ -3359,10 +3359,7 @@ end
 -- ==========================================================================
 
 local function compile_commands_targets(ctx)
-  return {
-    join(ctx.engine_root, "compile_commands.json"),
-    join(ctx.engine_root, "Engine", "compile_commands.json"),
-  }
+  return require("ue.cdb.paths").targets(ctx)
 end
 
 local function windows_engine_root(ctx)
@@ -3375,53 +3372,10 @@ local function windows_engine_root(ctx)
 end
 
 local function compile_commands_candidates(ctx)
-  local seen = {}
-  local candidates = {}
-
-  local function add(path)
-    path = norm(path)
-    if path ~= "" and not seen[path] and is_file(path) then
-      seen[path] = true
-      table.insert(candidates, path)
-    end
-  end
-
-  for _, target in ipairs(compile_commands_targets(ctx)) do
-    add(target)
-  end
-  if ctx.project_root and ctx.project_root ~= "" then
-    add(join(ctx.project_root, "compile_commands.json"))
-  end
-  add(join(ctx.engine_root, "Engine", "Intermediate", "Build", "compile_commands.json"))
-
-  local fd = first_executable({ "fd", "fdfind" })
-  if fd then
-    local cmd = {
-      fd,
-      "--absolute-path",
-      "--type",
-      "f",
-      "--hidden",
-      "--follow",
-      "--glob",
-      "compile_commands.json",
-      "--search-path",
-      ctx.engine_root,
-    }
-    if ctx.project_root and ctx.project_root ~= "" and ctx.project_root ~= ctx.engine_root then
-      table.insert(cmd, "--search-path")
-      table.insert(cmd, ctx.project_root)
-    end
-
-    local code, lines = run_lines(cmd, { cwd = "/" })
-    if code == 0 then
-      for _, line in ipairs(lines or {}) do
-        add(line)
-      end
-    end
-  end
-
-  return candidates
+  return require("ue.cdb.paths").candidates(ctx, {
+    first_executable = first_executable,
+    run_lines        = run_lines,
+  })
 end
 
 -- ==========================================================================
@@ -3646,32 +3600,12 @@ local function compile_commands_template_entry(entries)
 end
 
 local function make_shader_compile_command_entry(shader_file, template, include_roots)
-  local arguments = {
-    compile_commands_program(template),
-    "-x",
-    "c++-header",
-    "-fsyntax-only",
-    "-Wno-pragma-once-outside-header",
-  }
-  for _, root in ipairs(include_roots or {}) do
-    table.insert(arguments, "-I")
-    table.insert(arguments, root)
-  end
-  table.insert(arguments, shader_file)
-
-  return {
-    directory = trim(template.directory or dirname(shader_file)),
-    file = shader_file,
-    arguments = arguments,
-  }
+  return require("ue.cdb.shaders").make_entry(shader_file, template, include_roots)
 end
 
 local function augment_compile_commands_with_shaders(ctx, content)
-  local ok, decoded = pcall(vim.json.decode, content)
-  if not ok or type(decoded) ~= "table" then
-    return content
-  end
-
+  -- Discovery stays here (captures UE_CONST + scan_shader_files); the
+  -- augmentation primitive itself moved to lua/ue/cdb/shaders.lua.
   local shader_files = {}
   if ctx.project_root and ctx.project_root ~= "" then
     vim.list_extend(shader_files, scan_shader_files(ctx.project_root, UE_CONST.PROJECT_INDEX_DIRS))
@@ -3680,31 +3614,8 @@ local function augment_compile_commands_with_shaders(ctx, content)
   if #shader_files == 0 then
     return content
   end
-
   local include_roots = shader_include_roots(shader_files)
-  local template = compile_commands_template_entry(decoded)
-  local existing = {}
-  for _, entry in ipairs(decoded) do
-    if type(entry) == "table" and entry.file then
-      existing[norm(entry.file):lower()] = true
-    end
-  end
-
-  local added = false
-  for _, shader_file in ipairs(shader_files) do
-    local key = shader_file:lower()
-    if not existing[key] then
-      table.insert(decoded, make_shader_compile_command_entry(shader_file, template, include_roots))
-      existing[key] = true
-      added = true
-    end
-  end
-
-  if not added then
-    return content
-  end
-
-  return vim.json.encode(decoded)
+  return require("ue.cdb.shaders").augment(content, shader_files, include_roots)
 end
 
 -- ---------------------------------------------------------------------------

@@ -3638,33 +3638,11 @@ local function shader_include_roots(shader_files)
 end
 
 local function compile_commands_program(entry)
-  if type(entry) == "table" and type(entry.arguments) == "table" and entry.arguments[1] then
-    return trim(entry.arguments[1])
-  end
-
-  local command = type(entry) == "table" and trim(entry.command) or ""
-  if command ~= "" then
-    if command:sub(1, 1) == '"' then
-      return command:match('^"([^"]+)"') or command:match("^(%S+)")
-    end
-    return command:match("^(%S+)")
-  end
-
-  return first_executable({ "clang++", "clang", "clang++.exe", "clang.exe", "cl.exe", "cl" }) or "clang++"
+  return require("ue.cdb.json").program(entry)
 end
 
 local function compile_commands_template_entry(entries)
-  for _, entry in ipairs(entries or {}) do
-    if type(entry) == "table" and type(entry.arguments) == "table" and entry.arguments[1] and entry.file then
-      return entry
-    end
-  end
-  for _, entry in ipairs(entries or {}) do
-    if type(entry) == "table" and entry.file then
-      return entry
-    end
-  end
-  return {}
+  return require("ue.cdb.json").template_entry(entries)
 end
 
 local function make_shader_compile_command_entry(shader_file, template, include_roots)

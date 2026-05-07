@@ -7589,40 +7589,38 @@ function M.setup()
     M.dap_reset_layout()
   end, {})
 
-  -- ─ Phase F.1: platform-neutral UEDAP* aliases ─────────────────────────
-  -- Same handlers, friendlier names. UEDAPAttach / UEDAPLaunch accept an
-  -- optional platform argument; missing/empty falls back to the current
-  -- target platform. Non-android platforms surface a NotImplemented hint
-  -- pending Phase F.2 dispatch wiring.
-  local function dap_dispatch_attach(platform)
-    platform = (platform ~= "" and platform) or (M.current_platform() or "")
-    if platform == "Android" or platform:lower() == "android" then
-      M.android_dap_attach()
-      return
-    end
-    vim.notify(
-      ("UEDAPAttach: platform %q not yet implemented (Phase F.2). Pass `android` for now."):format(platform),
-      vim.log.levels.WARN
-    )
-  end
+  -- ─ Phase F.1+F.2: platform-neutral UEDAP* aliases via dispatch table ──
+  -- F.1 introduced the UEDAP* command names with hard-coded android branch.
+  -- F.2 moves the per-platform handler decision into ue.dap.platforms so
+  -- new platforms register via M.register_attach / register_launch instead
+  -- of growing an if/else chain inside ue.lua. android is registered here
+  -- to preserve current behaviour byte-for-byte.
+  local dap_platforms = require("ue.dap.platforms")
+  dap_platforms.register_attach("android", function() M.android_dap_attach() end)
+  dap_platforms.register_launch("android", function() M.android_dap_launch() end)
 
-  local function dap_dispatch_launch(platform)
+  local function dap_dispatch(kind, platform)
     platform = (platform ~= "" and platform) or (M.current_platform() or "")
-    if platform == "Android" or platform:lower() == "android" then
-      M.android_dap_launch()
+    local handler = (kind == "attach")
+      and dap_platforms.attach_handler(platform)
+      or  dap_platforms.launch_handler(platform)
+    if handler then
+      handler()
       return
     end
+    local known = dap_platforms.known_platforms()
     vim.notify(
-      ("UEDAPLaunch: platform %q not yet implemented (Phase F.2). Pass `android` for now."):format(platform),
+      ("UEDAP%s: platform %q has no handler (registered: %s). Pass one of these as the argument."):format(
+        kind == "attach" and "Attach" or "Launch", platform, table.concat(known, ", ")),
       vim.log.levels.WARN
     )
   end
 
   vim.api.nvim_create_user_command("UEDAPAttach", function(opts)
-    dap_dispatch_attach(opts.args or "")
+    dap_dispatch("attach", opts.args or "")
   end, { nargs = "?", desc = "DAP: Attach (optional: platform)" })
   vim.api.nvim_create_user_command("UEDAPLaunch", function(opts)
-    dap_dispatch_launch(opts.args or "")
+    dap_dispatch("launch", opts.args or "")
   end, { nargs = "?", desc = "DAP: Launch (optional: platform)" })
   vim.api.nvim_create_user_command("UEDAPContinue",        function() M.dap_continue()         end, { desc = "DAP: Continue" })
   vim.api.nvim_create_user_command("UEDAPPause",           function() M.dap_pause()            end, { desc = "DAP: Pause" })

@@ -47,6 +47,16 @@ local function python_exe()
 end
 
 local function tool_path(name)
+  -- Phase I: read from ue.config first (lets the user point cdb.tools_dir
+  -- at a custom location), fall back to stdpath("config")/tools for the
+  -- existing install layout.
+  local ok, cfg = pcall(require, "ue.config")
+  if ok and cfg and cfg.get then
+    local dir = cfg.get("cdb.tools_dir")
+    if type(dir) == "string" and dir ~= "" then
+      return dir .. "/" .. name
+    end
+  end
   return vim.fn.stdpath("config") .. "/tools/" .. name
 end
 
@@ -101,42 +111,67 @@ end
 --- is skipped if its python script is absent. After success, syncs `path`
 --- to every other entry in `targets` and restarts clangd. Returns the
 --- jobid from `_rt.jobstart` (nil if no scripts existed).
+---
+--- Phase I: the script list and per-step args are sourced from
+--- ue.config.cdb.steps (default = the original 5-step recipe). To skip a
+--- step the user simply removes its entry from the list.
 ---@param path string CDB file to mutate in-place
 ---@param targets string[]? sibling CDB targets to copy `path` into on success
 ---@param on_done fun()? optional completion callback (after clangd restart)
 function M.run(path, targets, on_done)
   local python = python_exe()
 
-  local steps = {
-    { script = "expand_response_cdb.py",  args = '"' .. path .. '"' },
-    { script = "prebuild_pch_v2.py",      args = '"' .. path .. '"' },
-    { script = "resolve_cdb_paths.py",    args = '"' .. path .. '"' },
-    { script = "unify_include_dirs.py",   args = '"' .. path .. '" --max-overhead=200' },
-    { script = "prune_include_dirs.py",   args = '"' .. path .. '" --sample 20', isolate = true },
+  local CANONICAL_ARGS = {
+    ["expand_response_cdb.py"] = function(p) return '"' .. p .. '"' end,
+    ["prebuild_pch_v2.py"]     = function(p) return '"' .. p .. '"' end,
+    ["resolve_cdb_paths.py"]   = function(p) return '"' .. p .. '"' end,
+    ["unify_include_dirs.py"]  = function(p) return '"' .. p .. '" --max-overhead=200' end,
+    ["prune_include_dirs.py"]  = function(p, isolate)
+      isolate.value = true
+      return '"' .. p .. '" --sample 20'
+    end,
   }
+
+  -- Read the configured pipeline; fall back to canonical recipe if config
+  -- is unavailable for any reason.
+  local script_names
+  do
+    local ok, cfg = pcall(require, "ue.config")
+    script_names = (ok and cfg and cfg.get and cfg.get("cdb.steps")) or {
+      "expand_response_cdb.py",
+      "prebuild_pch_v2.py",
+      "resolve_cdb_paths.py",
+      "unify_include_dirs.py",
+      "prune_include_dirs.py",
+    }
+  end
 
   -- Engine-only CDB → unify needs --include-engine
   local path_lower = path:gsub("\\", "/"):lower()
-  if path_lower:find("/engine/") then
-    for _, s in ipairs(steps) do
-      if s.script == "unify_include_dirs.py" then
-        s.args = s.args .. " --include-engine"
-      end
-    end
-  end
+  local engine_only = path_lower:find("/engine/") ~= nil
 
   local cmds = {}
-  local any = false
-  for _, s in ipairs(steps) do
-    local script_path = tool_path(s.script)
+  for _, name in ipairs(script_names) do
+    local script_path = tool_path(name)
     if fs.is_file(script_path) then
-      any = true
-      local prefix = s.isolate and (python .. ' -I "') or (python .. ' "')
-      table.insert(cmds, prefix .. script_path .. '" ' .. s.args)
+      local arg_builder = CANONICAL_ARGS[name]
+      local isolate_flag = { value = false }
+      local args
+      if arg_builder then
+        args = arg_builder(path, isolate_flag)
+        if name == "unify_include_dirs.py" and engine_only then
+          args = args .. " --include-engine"
+        end
+      else
+        -- Unknown script: pass the cdb path as a single quoted arg.
+        args = '"' .. path .. '"'
+      end
+      local prefix = isolate_flag.value and (python .. ' -I "') or (python .. ' "')
+      table.insert(cmds, prefix .. script_path .. '" ' .. args)
     end
   end
 
-  if not any then return nil end
+  if #cmds == 0 then return nil end
 
   _rt.notify("compile_commands pipeline: expand+pch+resolve+unify+prune in background...", vim.log.levels.INFO)
 

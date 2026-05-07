@@ -7589,15 +7589,22 @@ function M.setup()
     M.dap_reset_layout()
   end, {})
 
-  -- ─ Phase F.1+F.2: platform-neutral UEDAP* aliases via dispatch table ──
+  -- ─ Phase F.1+F.2+H: platform-neutral UEDAP* aliases via dispatch table ─
   -- F.1 introduced the UEDAP* command names with hard-coded android branch.
-  -- F.2 moves the per-platform handler decision into ue.dap.platforms so
-  -- new platforms register via M.register_attach / register_launch instead
-  -- of growing an if/else chain inside ue.lua. android is registered here
-  -- to preserve current behaviour byte-for-byte.
+  -- F.2 moved the per-platform handler decision into ue.dap.platforms.
+  -- H registers concrete handlers for win64 / mac / linux / ios alongside
+  -- the existing android implementation. New platforms still register here
+  -- — this is the single seam the dispatch flows through.
   local dap_platforms = require("ue.dap.platforms")
   dap_platforms.register_attach("android", function() M.android_dap_attach() end)
   dap_platforms.register_launch("android", function() M.android_dap_launch() end)
+  for _, id in ipairs({ "win64", "mac", "linux", "ios" }) do
+    local ok, plat_mod = pcall(require, "ue.dap." .. id)
+    if ok and type(plat_mod) == "table" then
+      if type(plat_mod.attach) == "function" then dap_platforms.register_attach(id, plat_mod.attach) end
+      if type(plat_mod.launch) == "function" then dap_platforms.register_launch(id, plat_mod.launch) end
+    end
+  end
 
   local function dap_dispatch(kind, platform)
     platform = (platform ~= "" and platform) or (M.current_platform() or "")

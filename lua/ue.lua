@@ -7785,6 +7785,50 @@ function M.setup()
     M.dap_reset_layout()
   end, {})
 
+  -- ─ Phase F.1: platform-neutral UEDAP* aliases ─────────────────────────
+  -- Same handlers, friendlier names. UEDAPAttach / UEDAPLaunch accept an
+  -- optional platform argument; missing/empty falls back to the current
+  -- target platform. Non-android platforms surface a NotImplemented hint
+  -- pending Phase F.2 dispatch wiring.
+  local function dap_dispatch_attach(platform)
+    platform = (platform ~= "" and platform) or (M.current_platform() or "")
+    if platform == "Android" or platform:lower() == "android" then
+      M.android_dap_attach()
+      return
+    end
+    vim.notify(
+      ("UEDAPAttach: platform %q not yet implemented (Phase F.2). Pass `android` for now."):format(platform),
+      vim.log.levels.WARN
+    )
+  end
+
+  local function dap_dispatch_launch(platform)
+    platform = (platform ~= "" and platform) or (M.current_platform() or "")
+    if platform == "Android" or platform:lower() == "android" then
+      M.android_dap_launch()
+      return
+    end
+    vim.notify(
+      ("UEDAPLaunch: platform %q not yet implemented (Phase F.2). Pass `android` for now."):format(platform),
+      vim.log.levels.WARN
+    )
+  end
+
+  vim.api.nvim_create_user_command("UEDAPAttach", function(opts)
+    dap_dispatch_attach(opts.args or "")
+  end, { nargs = "?", desc = "DAP: Attach (optional: platform)" })
+  vim.api.nvim_create_user_command("UEDAPLaunch", function(opts)
+    dap_dispatch_launch(opts.args or "")
+  end, { nargs = "?", desc = "DAP: Launch (optional: platform)" })
+  vim.api.nvim_create_user_command("UEDAPContinue",        function() M.dap_continue()         end, { desc = "DAP: Continue" })
+  vim.api.nvim_create_user_command("UEDAPPause",           function() M.dap_pause()            end, { desc = "DAP: Pause" })
+  vim.api.nvim_create_user_command("UEDAPToggleBreakpoint",function() M.dap_toggle_breakpoint()end, { desc = "DAP: Toggle breakpoint" })
+  vim.api.nvim_create_user_command("UEDAPStepOver",        function() M.dap_step_over()        end, { desc = "DAP: Step over" })
+  vim.api.nvim_create_user_command("UEDAPStepIn",          function() M.dap_step_into()        end, { desc = "DAP: Step in" })
+  vim.api.nvim_create_user_command("UEDAPStepOut",         function() M.dap_step_out()         end, { desc = "DAP: Step out" })
+  vim.api.nvim_create_user_command("UEDAPToggleUI",        function() M.dap_toggle_ui()        end, { desc = "DAP: Toggle UI" })
+  vim.api.nvim_create_user_command("UEDAPREPL",            function() M.dap_toggle_repl()      end, { desc = "DAP: Toggle REPL" })
+
   local group = vim.api.nvim_create_augroup("ue_statusline", { clear = true })
   -- Stop old timer on reload to prevent leaks
   if M._statusline_timer then pcall(function() M._statusline_timer:stop() end) end

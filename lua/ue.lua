@@ -147,9 +147,26 @@ end
 
 local function clangd_candidates(root_dir)
   local candidates = {}
+
+  -- Phase I priority order:
+  --   1. UE_CLANGD env var (legacy, highest)
+  --   2. ue.config.clangd.candidates_extra (user setup() override)
+  --   3. PATH default + canonical /usr/{local/}bin
+  --   4. WSL bridge path when running under /mnt/<drive>/
+  --   5. Windows native LLVM install (Program Files)
   local override = trim(vim.env.UE_CLANGD)
   if override ~= "" then
     table.insert(candidates, override)
+  end
+
+  do
+    local ok, cfg = pcall(require, "ue.config")
+    if ok and cfg and cfg.get then
+      local extra = cfg.get("clangd.candidates_extra")
+      if type(extra) == "table" then
+        vim.list_extend(candidates, extra)
+      end
+    end
   end
 
   vim.list_extend(candidates, {
@@ -731,6 +748,22 @@ function M.clangd_cmd(root_dir)
           if cc_mtime == 0 or idx_mtime >= cc_mtime then
             table.insert(cmd, "--index-file=" .. idx_path)
             break
+          end
+        end
+      end
+    end
+  end
+
+  -- Phase I: append user-configured extra clangd args, last so they can
+  -- override anything ue.lua chose. Empty default = behaviour unchanged.
+  do
+    local ok, cfg = pcall(require, "ue.config")
+    if ok and cfg and cfg.get then
+      local extra = cfg.get("clangd.extra_args")
+      if type(extra) == "table" then
+        for _, a in ipairs(extra) do
+          if type(a) == "string" and a ~= "" then
+            table.insert(cmd, a)
           end
         end
       end

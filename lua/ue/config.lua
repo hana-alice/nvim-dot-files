@@ -44,6 +44,41 @@ local function defaults()
       enabled = { "Win64", "Android", "Mac", "IOS", "Linux" },
       default = nil,  -- nil = auto-detect from current_platform()
     },
+    -- Phase I additions ────────────────────────────────────────────────
+    clangd = {
+      -- Extra candidate paths tried BEFORE the platform driver defaults
+      -- and before the env-var override. Highest priority. Empty means
+      -- ue.lua's existing clangd_candidates() runs unchanged.
+      candidates_extra = {},
+      -- Extra args appended to the clangd command line. Empty means
+      -- behaviour unchanged.
+      extra_args = {},
+    },
+    dap = {
+      -- Concrete codelldb adapter. nil => probe via driver +
+      -- vendored install. ue.dap._common.find_codelldb consumes this.
+      codelldb_path = nil,
+      -- lldb-server binary for remote debugging. nil => probe via driver.
+      lldb_server_path = nil,
+      -- Default Android package name. nil => prompt on first use, then
+      -- persist via update_state_field("android_package", ...).
+      android_package = nil,
+    },
+    cdb = {
+      -- Directory holding the python pipeline scripts. Lazy so the user
+      -- can override stdpath via XDG_CONFIG_HOME and still get the right
+      -- path on the first read.
+      tools_dir = function() return vim.fn.stdpath("config") .. "/tools" end,
+      -- Ordered pipeline. Removing or renaming a step lets the user skip
+      -- slow ones (e.g. drop `prune_include_dirs.py` on a small project).
+      steps = {
+        "expand_response_cdb.py",
+        "prebuild_pch_v2.py",
+        "resolve_cdb_paths.py",
+        "unify_include_dirs.py",
+        "prune_include_dirs.py",
+      },
+    },
   }
 end
 

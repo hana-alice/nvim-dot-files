@@ -180,7 +180,7 @@ for _, fn in ipairs(PUBLIC_FUNCTIONS) do
   end)
 end
 
--- ── Phase F.1+F.2: UEDAP* aliases register on setup() + dispatch table ─
+-- ── Phase F.1+F.2+H: UEDAP* aliases + dispatch table + per-platform ────
 check("ue.setup() registers UEDAP* aliases", function()
   require("ue").setup()
   for _, c in ipairs({
@@ -192,10 +192,68 @@ check("ue.setup() registers UEDAP* aliases", function()
   end
 end)
 check("ue.setup() registers android in dap.platforms", function()
-  -- ue.setup() should have populated the dispatch table with android
   local p = require("ue.dap.platforms")
   assert(type(p.attach_handler("android")) == "function", "android attach handler missing")
   assert(type(p.launch_handler("android")) == "function", "android launch handler missing")
+end)
+check("Phase H: every platform module exports attach + launch", function()
+  for _, id in ipairs({ "win64", "mac", "linux", "ios" }) do
+    local m = require("ue.dap." .. id)
+    assert(type(m.attach) == "function", id .. ".attach missing")
+    assert(type(m.launch) == "function", id .. ".launch missing")
+  end
+end)
+check("Phase H: ue.setup() registers win64/mac/linux/ios", function()
+  local p = require("ue.dap.platforms")
+  for _, id in ipairs({ "win64", "mac", "linux", "ios" }) do
+    assert(type(p.attach_handler(id)) == "function", id .. " attach not registered")
+    assert(type(p.launch_handler(id)) == "function", id .. " launch not registered")
+  end
+end)
+check("Phase H: ue.dap._common.find_codelldb returns string-or-nil", function()
+  local r = require("ue.dap._common").find_codelldb()
+  assert(r == nil or type(r) == "string", "find_codelldb returned " .. type(r))
+end)
+
+-- ── Phase I: ue.config schema expansion ────────────────────────────────
+check("Phase I: ue.config defaults include clangd/dap/cdb tables", function()
+  local opts = require("ue.config").options()
+  assert(type(opts.clangd) == "table", "clangd table missing")
+  assert(type(opts.dap)    == "table", "dap table missing")
+  assert(type(opts.cdb)    == "table", "cdb table missing")
+end)
+check("Phase I: ue.config.cdb.steps default has 5 entries", function()
+  assert(#require("ue.config").get("cdb.steps") == 5)
+end)
+check("Phase I: ue.config.cdb.tools_dir is a string", function()
+  assert(type(require("ue.config").get("cdb.tools_dir")) == "string")
+end)
+check("Phase I: ue.config.dap.codelldb_path defaults nil", function()
+  assert(require("ue.config").get("dap.codelldb_path") == nil)
+end)
+check("Phase I: ue.config.dap.codelldb_path user override", function()
+  local cfg = require("ue.config")
+  cfg.setup({ dap = { codelldb_path = "/x/codelldb" }})
+  assert(cfg.get("dap.codelldb_path") == "/x/codelldb")
+  cfg.reset_for_test()
+  assert(cfg.get("dap.codelldb_path") == nil)
+end)
+check("Phase I: clangd.extra_args appended to clangd_cmd tail", function()
+  local cfg = require("ue.config")
+  local base = require("ue").clangd_cmd()
+  cfg.setup({ clangd = { extra_args = { "--log=verbose", "-j=2" } } })
+  local with_extra = require("ue").clangd_cmd()
+  assert(#with_extra == #base + 2, "expected +2 args, got " .. (#with_extra - #base))
+  assert(with_extra[#with_extra]     == "-j=2")
+  assert(with_extra[#with_extra - 1] == "--log=verbose")
+  cfg.reset_for_test()
+end)
+check("Phase I: cdb.tools_dir override changes pipeline lookups", function()
+  local cfg = require("ue.config")
+  -- Reset just to be sure, then verify the override path comes back
+  cfg.setup({ cdb = { tools_dir = "/some/custom/dir" }})
+  assert(cfg.get("cdb.tools_dir") == "/some/custom/dir")
+  cfg.reset_for_test()
 end)
 check("backward-compat: UEAndroidDAP* still registered", function()
   for _, c in ipairs({

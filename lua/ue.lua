@@ -7584,37 +7584,56 @@ function M.setup()
     clear_cache({ bang = cmd_opts.bang })
   end, { bang = true, desc = "Clear UE caches (! = also clangd index, compile_commands, restart LSP)" })
 
-  -- Android DAP commands
-  vim.api.nvim_create_user_command("UEAndroidDAPAttach", function()
-    M.android_dap_attach()
-  end, {})
-  vim.api.nvim_create_user_command("UEAndroidDAPLaunch", function()
-    M.android_dap_launch()
-  end, {})
-  vim.api.nvim_create_user_command("UEAndroidDAPContinue", function()
-    M.dap_continue()
-  end, {})
-  vim.api.nvim_create_user_command("UEAndroidDAPPause", function()
-    M.dap_pause()
-  end, {})
-  vim.api.nvim_create_user_command("UEAndroidDAPToggleBreakpoint", function()
-    M.dap_toggle_breakpoint()
-  end, {})
-  vim.api.nvim_create_user_command("UEAndroidDAPStepOver", function()
-    M.dap_step_over()
-  end, {})
-  vim.api.nvim_create_user_command("UEAndroidDAPStepIn", function()
-    M.dap_step_into()
-  end, {})
-  vim.api.nvim_create_user_command("UEAndroidDAPStepOut", function()
-    M.dap_step_out()
-  end, {})
-  vim.api.nvim_create_user_command("UEAndroidDAPToggleUI", function()
-    M.dap_toggle_ui()
-  end, {})
-  vim.api.nvim_create_user_command("UEAndroidDAPREPL", function()
-    M.dap_toggle_repl()
-  end, {})
+  -- ─ Phase F.3: UEAndroidDAP* deprecation notice ─────────────────────
+  -- The platform-neutral UEDAP* aliases (Phase F.1+F.2+H) are the
+  -- preferred surface. The old UEAndroidDAP* names are kept so user
+  -- keymaps don't break, but each one now warns ONCE per session, the
+  -- first time it's invoked, with a pointer at the new alias.
+  M._dap_deprecation_seen = M._dap_deprecation_seen or {}
+  local function dap_deprecated(old_name, new_name, fn)
+    return function()
+      if not M._dap_deprecation_seen[old_name] then
+        M._dap_deprecation_seen[old_name] = true
+        vim.notify(
+          (":%s is deprecated; use :%s instead. (warning shown once per session.)"):format(old_name, new_name),
+          vim.log.levels.WARN
+        )
+      end
+      fn()
+    end
+  end
+
+  -- Android DAP commands (Phase F.3: each warns once, then forwards).
+  vim.api.nvim_create_user_command("UEAndroidDAPAttach",
+    dap_deprecated("UEAndroidDAPAttach", "UEDAPAttach android",
+      function() M.android_dap_attach() end), {})
+  vim.api.nvim_create_user_command("UEAndroidDAPLaunch",
+    dap_deprecated("UEAndroidDAPLaunch", "UEDAPLaunch android",
+      function() M.android_dap_launch() end), {})
+  vim.api.nvim_create_user_command("UEAndroidDAPContinue",
+    dap_deprecated("UEAndroidDAPContinue", "UEDAPContinue",
+      function() M.dap_continue() end), {})
+  vim.api.nvim_create_user_command("UEAndroidDAPPause",
+    dap_deprecated("UEAndroidDAPPause", "UEDAPPause",
+      function() M.dap_pause() end), {})
+  vim.api.nvim_create_user_command("UEAndroidDAPToggleBreakpoint",
+    dap_deprecated("UEAndroidDAPToggleBreakpoint", "UEDAPToggleBreakpoint",
+      function() M.dap_toggle_breakpoint() end), {})
+  vim.api.nvim_create_user_command("UEAndroidDAPStepOver",
+    dap_deprecated("UEAndroidDAPStepOver", "UEDAPStepOver",
+      function() M.dap_step_over() end), {})
+  vim.api.nvim_create_user_command("UEAndroidDAPStepIn",
+    dap_deprecated("UEAndroidDAPStepIn", "UEDAPStepIn",
+      function() M.dap_step_into() end), {})
+  vim.api.nvim_create_user_command("UEAndroidDAPStepOut",
+    dap_deprecated("UEAndroidDAPStepOut", "UEDAPStepOut",
+      function() M.dap_step_out() end), {})
+  vim.api.nvim_create_user_command("UEAndroidDAPToggleUI",
+    dap_deprecated("UEAndroidDAPToggleUI", "UEDAPToggleUI",
+      function() M.dap_toggle_ui() end), {})
+  vim.api.nvim_create_user_command("UEAndroidDAPREPL",
+    dap_deprecated("UEAndroidDAPREPL", "UEDAPREPL",
+      function() M.dap_toggle_repl() end), {})
   vim.api.nvim_create_user_command("UEDAPDiag", function()
     M.dap_diagnose()
   end, {})

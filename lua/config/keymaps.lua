@@ -296,6 +296,22 @@ end, { desc = "Print restart plan without acting (debug)" })
 
 map("n", "<leader>qr", "<cmd>Restart<cr>", { desc = "Quit: Restart Neovim in cwd" })
 
+-- Windows-style paste in cmdline (`:` / `/` / `?`) and insert mode.
+-- Default Ctrl+V in cmdline is "literal-insert next key" (rarely useful);
+-- in insert mode it's blockwise paste. On Windows users with muscle
+-- memory from every other app, Ctrl+V should paste from the system
+-- clipboard. Map it to <C-r>+ (insert from + register = system clip).
+--
+-- Notes:
+-- * `c` mode covers `:` Ex-command, `/` and `?` search.
+-- * `i` mode covers normal insert; we use <C-r><C-o>+ to insert
+--   literally without auto-indent re-flow on multi-line pastes.
+-- * Visual-block `<C-v>` is preserved (we don't remap it in normal/x).
+-- * We deliberately do NOT remap normal-mode <C-v>; that would break
+--   visual-block selection which is a core nvim feature.
+map("c", "<C-v>", "<C-r>+", { desc = "Cmdline: paste from system clipboard" })
+map("i", "<C-v>", "<C-r><C-o>+", { desc = "Insert: paste from system clipboard (literal)" })
+
 -- Android DAP keymaps
 map("n", "<leader>da", "<cmd>UEAndroidDAPAttach<cr>", { desc = "DAP: Android Attach" })
 map("n", "<leader>db", "<cmd>UEAndroidDAPToggleBreakpoint<cr>", { desc = "DAP: Toggle Breakpoint" })

@@ -23,6 +23,7 @@ know "how this specific subsystem is shaped."
 | `2026-05-07-dap-real-platforms.md` | H | Real attach/launch handlers for Win64 / macOS / Linux / iOS via `ue/dap/<platform>.lua` |
 | `2026-05-07-config-schema-expansion.md` | I | Add `clangd.*`, `dap.*`, `cdb.*` keys to `ue.config` schema |
 | `2026-05-07-android-config-wire.md` | J | Wire `ue/dap.lua` Android prompts (`lldb_server_path`, `android_package`) through `ue.config` |
+| `2026-05-07-ueprepare-csearch-pipeline.md` | (draft) | One-command incremental `:UEPrepare` — drives existing `ueprepare` + UBT `-SkipBuild` (no compile) + `cindex` + ccjson + clangd reload, async with progress UI |
 
 ### Earlier ADRs (2026-04)
 

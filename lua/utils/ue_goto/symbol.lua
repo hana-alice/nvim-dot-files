@@ -559,6 +559,109 @@ function M.is_at_definition_at_cursor()
     return false
   end
 
+  -- ── UE-macro definition site detection ───────────────────────────────
+  -- Many UE definitions hide inside macros that TS sees as call_expression,
+  -- so the structural class_specifier/struct_specifier walk below misses
+  -- them entirely. We hard-list the macros whose FIRST argument names a
+  -- newly-defined type/shader/log-category. Cursor on that first arg ==
+  -- cursor on the definition site.
+  --
+  -- Examples (cursor on `XXX` is a definition):
+  --   BEGIN_SHADER_PARAMETER_STRUCT(XXX, )
+  --   BEGIN_UNIFORM_BUFFER_STRUCT(XXX, )
+  --   DECLARE_GLOBAL_SHADER(XXX)
+  --   IMPLEMENT_GLOBAL_SHADER(XXX, ...)
+  --   IMPLEMENT_SHADER_TYPE(, XXX, ...)            -- 2nd arg, special-cased
+  --   DECLARE_LOG_CATEGORY_EXTERN(XXX, ...)
+  --   DEFINE_LOG_CATEGORY(XXX, ...)
+  --   DECLARE_DELEGATE(XXX) / DECLARE_MULTICAST_DELEGATE(XXX)
+  --   DECLARE_DYNAMIC_DELEGATE(XXX) / *_OneParam / *_TwoParams ...
+  --   DECLARE_CYCLE_STAT(_, XXX, _) etc — these define a stat ID; skip,
+  --     too noisy and rarely a gd target.
+  --
+  -- Map: macro_name → 1-based index of the argument that names the
+  -- newly-defined symbol.
+  local UE_DEF_MACRO_ARG_IDX = {
+    BEGIN_SHADER_PARAMETER_STRUCT                   = 1,
+    BEGIN_SHADER_PARAMETER_STRUCT_EX                = 1,
+    BEGIN_UNIFORM_BUFFER_STRUCT                     = 1,
+    BEGIN_UNIFORM_BUFFER_STRUCT_WITH_CONSTRUCTOR    = 1,
+    BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT            = 1,
+    DECLARE_GLOBAL_SHADER                           = 1,
+    IMPLEMENT_GLOBAL_SHADER                         = 1,
+    IMPLEMENT_SHADER_TYPE                           = 2,
+    IMPLEMENT_MATERIAL_SHADER_TYPE                  = 2,
+    DECLARE_LOG_CATEGORY_EXTERN                     = 1,
+    DEFINE_LOG_CATEGORY                             = 1,
+    DEFINE_LOG_CATEGORY_STATIC                      = 1,
+    DECLARE_DELEGATE                                = 1,
+    DECLARE_MULTICAST_DELEGATE                      = 1,
+    DECLARE_DYNAMIC_DELEGATE                        = 1,
+    DECLARE_DYNAMIC_MULTICAST_DELEGATE              = 1,
+    DECLARE_DELEGATE_OneParam                       = 1,
+    DECLARE_DELEGATE_TwoParams                      = 1,
+    DECLARE_DELEGATE_ThreeParams                    = 1,
+    DECLARE_DELEGATE_FourParams                     = 1,
+    DECLARE_MULTICAST_DELEGATE_OneParam             = 1,
+    DECLARE_MULTICAST_DELEGATE_TwoParams            = 1,
+    DECLARE_MULTICAST_DELEGATE_ThreeParams          = 1,
+  }
+
+  -- Walk up to find an enclosing call_expression where the cursor's
+  -- identifier is the i-th argument (per the macro's contract).
+  local function ue_macro_def_kind(id_node)
+    -- argument_list is the immediate parent of the identifier-as-arg
+    -- (possibly via type_descriptor / parenthesized_expression for some
+    -- shapes; macro args are simple identifiers here, so direct parent
+    -- is enough for the listed macros).
+    local arg = id_node
+    -- Allow one level of wrapper (e.g. type_identifier inside type_descriptor).
+    local p = arg:parent()
+    if not p then return nil end
+    local pt = p:type()
+    if pt == "type_descriptor" then
+      arg = p
+      p = p:parent()
+      if not p then return nil end
+      pt = p:type()
+    end
+    if pt ~= "argument_list" then return nil end
+    -- p is argument_list. Its parent is call_expression.
+    local call = p:parent()
+    if not call or call:type() ~= "call_expression" then return nil end
+
+    local fn_field = call:field("function")
+    local fn = fn_field and fn_field[1]
+    if not fn or fn:type() ~= "identifier" then return nil end
+    local macro = vim.treesitter.get_node_text(fn, bufnr)
+    local want_idx = UE_DEF_MACRO_ARG_IDX[macro]
+    if not want_idx then return nil end
+
+    -- Find the index (1-based, ignoring punctuation) of `arg` inside p.
+    local idx = 0
+    for child in p:iter_children() do
+      local ct = child:type()
+      if ct ~= "(" and ct ~= ")" and ct ~= "," and ct ~= "comment" then
+        idx = idx + 1
+        if child == arg then
+          if idx == want_idx then
+            return macro
+          else
+            return nil
+          end
+        end
+      end
+    end
+    return nil
+  end
+
+  local ue_macro = ue_macro_def_kind(node)
+  if ue_macro then
+    local name = vim.treesitter.get_node_text(node, bufnr)
+    return true, "UE macro " .. ue_macro, name
+  end
+  -- ── end UE-macro detection ───────────────────────────────────────────
+
   -- Walk up at most a few levels looking for an enclosing definition node.
   -- We don't walk arbitrarily deep — definitions wrap their name within
   -- 1-4 ancestor steps in practice (class/struct/enum: 1; function via

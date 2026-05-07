@@ -16,7 +16,16 @@ return {
       "nvim-telescope/telescope.nvim", -- optional; falls back to vim.ui.select if absent
     },
     keys = {
-      { "<leader>gn", function() require("neogit").open() end, desc = "Neogit (status)" },
+      {
+        "<leader>gn",
+        function()
+          require("utils.git_async").launch({
+            name = "Neogit (status)",
+            run  = function() require("neogit").open() end,
+          })
+        end,
+        desc = "Neogit (status)",
+      },
     },
     opts = {
       -- Use diffview for the diff surface (1 hunk -> opens diffview tab).

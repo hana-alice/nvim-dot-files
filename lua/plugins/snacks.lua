@@ -477,6 +477,48 @@ return {
       -- See lua/workarounds/snacks/smart_picker_dead_buffer.lua.
       require("workarounds.snacks.smart_picker_dead_buffer").apply(opts)
 
+      -- <leader><leader> matcher tuning: smart-case + fzf-style fuzzy +
+      -- filename-priority scoring. Snacks defaults already enable
+      -- smartcase/ignorecase/fuzzy at the matcher level (see
+      -- snacks/picker/core/matcher.lua), but `filename_bonus` is opt-in
+      -- and lives on the score config — without it, `MyUI.cpp` and
+      -- `src/ui-helpers/foo.cpp` tie when typing "ui". Setting it here
+      -- as a global matcher option means the smart picker (and every
+      -- other source that doesn't override matcher) gets filename-first
+      -- ranking with path matches as a fallback.
+      -- Scratch buffer persistence:
+      -- Default snacks.scratch already writes to stdpath("data").."/scratch"
+      -- and autowrites on hide. The annoyance is `filekey.ft = true`: opening
+      -- <leader>. with a different filetype context creates a NEW scratch
+      -- file, so the same project ends up with cpp/dosini/markdown/... islands
+      -- and `<leader>.` rarely re-opens the one you were just typing in.
+      --
+      -- We pin scratch to a fixed root under the data dir (explicit, not
+      -- magic), drop ft from the file key (one scratch per cwd+branch+count),
+      -- and force the buffer's filetype to markdown so headers/lists render.
+      -- For a second/third independent scratch in the same project, prefix a
+      -- count: `2<leader>.`, `3<leader>.` open distinct (count=2/3) buffers.
+      -- `<leader>S` still lists every scratch ever created (full history).
+      opts.scratch = vim.tbl_deep_extend("force", opts.scratch or {}, {
+        root = vim.fn.stdpath("data") .. "/scratch",
+        ft = "markdown",
+        autowrite = true,
+        filekey = {
+          cwd    = true,
+          branch = true,
+          count  = true,
+          ft     = false, -- one persistent scratch per (cwd, branch, count)
+        },
+      })
+
+      opts.picker.matcher = vim.tbl_deep_extend("force", opts.picker.matcher or {}, {
+        fuzzy          = true,   -- fzf-style subsequence matching
+        smartcase      = true,   -- lower → case-insensitive; mixed → case-sensitive
+        ignorecase     = true,   -- baseline for smartcase to flip off
+        filename_bonus = true,   -- score filename matches above path matches
+        sort_empty     = false,  -- keep frecency/source order when query is empty
+      })
+
       opts.picker.actions = vim.tbl_deep_extend("force", opts.picker.actions or {}, {
         paste_clipboard = paste_picker_clipboard,
         pin_sidebar_qflist = pin_sidebar_qflist,

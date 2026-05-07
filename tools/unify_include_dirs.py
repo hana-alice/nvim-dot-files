@@ -159,75 +159,23 @@ def greedy_cluster_overhead(variants, max_overhead):
     return clusters
 
 
-def collapse_intermediate_inc(data, dry_run=False):
-    """把 -I.../Intermediate/.../Inc/ModuleA, -I.../Inc/ModuleB, ...
-    折叠为 -I.../Intermediate/.../Inc (一级父目录)。
-
-    UBT 为每个模块生成 .generated.h 放在 Inc/ModuleName/ 下,
-    但文件名全局唯一(只有 Timestamp 冲突, 无所谓),
-    所以可以安全地用父目录替代 N 个子目录, 减少 N-1 个 -I。
-
-    实测: UEProj 81 个 Intermediate Inc 子目录 → 1 个, 节省 ~336ms。
-    """
-    INC_RE = re.compile(
-        r'^(.*[/\\]Intermediate[/\\].*[/\\]Inc)[/\\].+$',
-        re.IGNORECASE
-    )
-    total_collapsed = 0
-    total_dirs_removed = 0
-
-    for entry in data:
-        args = entry.get("arguments", [])
-        # Collect -I dirs and detect collapsible Intermediate/Inc subdirs
-        new_args = []
-        seen_parents = {}  # parent_path -> True (already inserted)
-        i = 0
-        dirs_before = 0
-        dirs_after = 0
-
-        while i < len(args):
-            a = args[i]
-            d = None
-            skip_count = 1
-
-            if a == '-I' and i + 1 < len(args):
-                d = args[i + 1]
-                skip_count = 2
-            elif a.startswith('-I') and len(a) > 2:
-                d = a[2:]
-                skip_count = 1
-
-            if d is not None:
-                dirs_before += 1
-                m = INC_RE.match(d.replace('\\', '/'))
-                if m:
-                    parent = m.group(1)
-                    # Normalize for dedup
-                    parent_key = parent.lower().replace('\\', '/')
-                    if parent_key not in seen_parents:
-                        seen_parents[parent_key] = True
-                        new_args.append(f"-I{parent}")
-                        dirs_after += 1
-                    # else: skip this -I entirely (parent already covers it)
-                    i += skip_count
-                    continue
-                else:
-                    dirs_after += 1
-
-            # Copy non-collapsed args
-            for j in range(skip_count):
-                if i + j < len(args):
-                    new_args.append(args[i + j])
-            i += skip_count
-
-        removed = dirs_before - dirs_after
-        if removed > 0:
-            total_collapsed += 1
-            total_dirs_removed += removed
-            if not dry_run:
-                entry["arguments"] = new_args
-
-    return total_collapsed, total_dirs_removed
+# NOTE: 历史上这里曾有一个 `collapse_intermediate_inc()`,
+# 把每个 entry 里 N 个 `-I.../Intermediate/.../Inc/<Module>` 折叠成单个
+# `-I.../Intermediate/.../Inc` 父目录, 试图节省 preamble 时间。
+#
+# 这是一个 BUG, 已于 [本次提交] 移除。原因:
+#   1) `-I` 不递归: 给 `-I.../Inc/` 看不到 `Inc/Engine/X.generated.h`,
+#      clangd 在 UObject-heavy TU (如 StaticMeshRender.cpp) 上会冒出
+#      "X.generated.h not found" + 大批继承断裂的假 diagnostics。
+#   2) "*.generated.h 文件名全局唯一" 的假设在 UE 大型项目里不成立,
+#      跨模块同名是常见现象, 折叠会真的丢路径。
+#
+# 它当时之所以没立刻爆: PCH 共享 + 同 commit 的聚类让大部分 TU 走 PCH
+# 预热的 include path, generated.h 走 PCH 缓存命中而非直接 #include 解析,
+# 把问题潜伏掉了 — 直到 PCH miss 的 TU 暴露。
+#
+# 如果未来真要再做"压 -I"的优化, 必须在 module 这一层 (`Inc/<Module>`)
+# 之上再判断, 不能折到 `Inc/`。最简单的选择: 不要做这件事。
 
 
 def main():
@@ -239,7 +187,7 @@ def main():
     parser.add_argument("--include-engine", action="store_true",
                         help="也处理 Engine 文件 (用于纯引擎项目)")
     parser.add_argument("--no-collapse", action="store_true",
-                        help="跳过 Intermediate/Inc 子目录折叠")
+                        help=argparse.SUPPRESS)  # deprecated noop, kept for backwards compat
     args = parser.parse_args()
 
     path = os.path.abspath(args.path)
@@ -252,13 +200,11 @@ def main():
 
     original_size = os.path.getsize(path)
 
-    # Pass 0: Collapse Intermediate/Inc subdirs
-    if not args.no_collapse:
-        n_collapsed, n_removed = collapse_intermediate_inc(data, args.dry_run)
-        if n_collapsed > 0:
-            print(f"[折叠] {n_collapsed} 条目的 Intermediate/Inc 子目录折叠, "
-                  f"减少 {n_removed} 个 -I dirs (~{n_removed * 4.2 / 1000:.2f}s preamble)")
-            print()
+    # Pass 0 (Intermediate/Inc 折叠) 已被永久移除 — 那个折叠会让 clangd
+    # 在 UObject-heavy TU 上找不到 *.generated.h。详见本文件顶部的 NOTE。
+    if args.no_collapse:
+        # 历史 flag, pipeline.lua 里以前会传 — 留个空壳避免老调用炸。
+        pass
 
     # Group entries by PCH
     pch_groups = defaultdict(list)  # pch_name -> [(idx, dirs_tuple)]

@@ -7,6 +7,46 @@ local D = {}
 -- Upstream utilities â set by D.setup()
 local core = {}
 
+-- Phase J: shared probes for android_package + lldb-server. Both honour
+-- ue.config first, then fall back to the existing prompts. Keeping them
+-- as D._<name>_for_test makes them reachable from headless smoke without
+-- spinning up a real adb session.
+
+local function ue_cfg_get(key)
+  local ok, cfg = pcall(require, "ue.config")
+  if ok and cfg and cfg.get then return cfg.get(key) end
+  return nil
+end
+
+local function fs_is_file(path)
+  if not path or path == "" then return false end
+  return vim.fn.filereadable(path) == 1
+end
+
+--- Resolve an android package name without prompting unless necessary.
+--- Order: persisted state → ue.config.dap.android_package → prompt.
+function D._pick_android_package_for_test(state_value)
+  local saved = state_value or ""
+  if saved ~= "" then return saved end
+  local cfg_pkg = ue_cfg_get("dap.android_package")
+  if type(cfg_pkg) == "string" and cfg_pkg ~= "" then return cfg_pkg end
+  return vim.fn.input("Android package name: ", "")
+end
+
+--- Resolve the path to an arm64 lldb-server.
+--- Order: ue.config.dap.lldb_server_path → glob list → prompt.
+function D._pick_lldb_server_for_test(globs)
+  local cfg_path = ue_cfg_get("dap.lldb_server_path")
+  if type(cfg_path) == "string" and cfg_path ~= "" and fs_is_file(cfg_path) then
+    return cfg_path
+  end
+  for _, pattern in ipairs(globs or {}) do
+    local hit = vim.fn.glob(pattern)
+    if hit and hit ~= "" then return hit end
+  end
+  return vim.fn.input("Path to arm64 lldb-server: ")
+end
+
 -- Module state (was M._xxx in ue.lua)
 D._dap_session_state = {}
 D._breakpoint_specs = {}
@@ -814,20 +854,13 @@ function D.android_dap_attach()
     core.invalidate_status_cache()
   end
 
-  -- lldb-server: search Android Studio, NDK side-by-side, then prompt
-  local as_lldb = ""
+  -- lldb-server: ue.config first, then Android Studio + NDK globs, then prompt
   local localappdata = vim.fn.expand("$LOCALAPPDATA")
   local search_patterns = {
     localappdata .. "/Programs/Android Studio*/plugins/android-ndk/resources/lldb/android/arm64-v8a/lldb-server",
     localappdata .. "/Android/Sdk/ndk/*/toolchains/llvm/prebuilt/*/lib64/clang/*/lib/linux/aarch64/lldb-server",
   }
-  for _, pattern in ipairs(search_patterns) do
-    as_lldb = vim.fn.glob(pattern)
-    if as_lldb ~= "" then break end
-  end
-  if as_lldb == "" then
-    as_lldb = vim.fn.input("Path to arm64 lldb-server: ")
-  end
+  local as_lldb = D._pick_lldb_server_for_test(search_patterns)
   if as_lldb == "" then return end
 
   local tmpdir = vim.fn.tempname():gsub("[/\\][^/\\]*$", "")
@@ -1041,20 +1074,13 @@ function D.android_dap_launch()
     core.invalidate_status_cache()
   end
 
-  -- lldb-server
-  local as_lldb = ""
+  -- lldb-server: ue.config first, then Android Studio + NDK globs, then prompt
   local localappdata = vim.fn.expand("$LOCALAPPDATA")
   local search_patterns = {
     localappdata .. "/Programs/Android Studio*/plugins/android-ndk/resources/lldb/android/arm64-v8a/lldb-server",
     localappdata .. "/Android/Sdk/ndk/*/toolchains/llvm/prebuilt/*/lib64/clang/*/lib/linux/aarch64/lldb-server",
   }
-  for _, pattern in ipairs(search_patterns) do
-    as_lldb = vim.fn.glob(pattern)
-    if as_lldb ~= "" then break end
-  end
-  if as_lldb == "" then
-    as_lldb = vim.fn.input("Path to arm64 lldb-server: ")
-  end
+  local as_lldb = D._pick_lldb_server_for_test(search_patterns)
   if as_lldb == "" then return end
 
   local tmpdir = vim.fn.tempname():gsub("[/\\][^/\\]*$", "")

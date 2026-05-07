@@ -7548,15 +7548,41 @@ function M.setup()
   end, {})
   vim.api.nvim_create_user_command("UEInstallAndroid", install_android, {})
   vim.api.nvim_create_user_command("UEPrepare", function()
-    prepare_async()
+    require("utils.async_launcher").launch({
+      name  = "UE: Prepare (rsp + ccjson + index)",
+      group = "ue",
+      run   = function(report)
+        -- prepare_async already returns immediately and runs UBT/cindex
+        -- in libuv jobs. The launcher placeholder + fidget handle here
+        -- exist to give a unified visible-progress surface during the
+        -- 100–500ms window where ueprepare itself spins up + first job
+        -- spawn happens on the main thread.
+        if report then report("dispatching prepare_async ...") end
+        prepare_async()
+      end,
+    })
   end, {})
   vim.api.nvim_create_user_command("UEPrepareReindex", function()
     -- Force csearch rebuild even when the cache fast-path would skip it.
     -- Useful after large branch switches / engine syncs that leave
     -- ghost entries in the existing index.
-    prepare_async({ force_csearch = true })
+    require("utils.async_launcher").launch({
+      name  = "UE: Prepare + force csearch rebuild",
+      group = "ue",
+      run   = function(report)
+        if report then report("force_csearch=true → rebuilding index ...") end
+        prepare_async({ force_csearch = true })
+      end,
+    })
   end, { desc = "UEPrepare + force csearch index rebuild (ghost cleanup)" })
-  vim.api.nvim_create_user_command("UEPrepareSync", prepare, {})
+  vim.api.nvim_create_user_command("UEPrepareSync", function()
+    -- Synchronous escape hatch — debug only. Will block the UI for the
+    -- full duration of prepare. Use :UEPrepare for the async path.
+    vim.notify(
+      "UEPrepareSync will block the UI; use :UEPrepare for async",
+      vim.log.levels.WARN, { title = "ue" })
+    prepare()
+  end, { desc = "UEPrepare synchronous (blocks UI; debug only)" })
   vim.api.nvim_create_user_command("UEWatchStatus", function()
     local ok, watch = pcall(require, "utils.ue_watch")
     if not ok then vim.notify("ue_watch module missing", vim.log.levels.WARN); return end
@@ -7637,13 +7663,28 @@ function M.setup()
     M.index_status()
   end, {})
   vim.api.nvim_create_user_command("UEIndexNow", function()
+    -- Single-buffer reindex; usually <100ms, no placeholder needed.
     M.index_now()
   end, {})
   vim.api.nvim_create_user_command("UEIndexHot", function()
-    M.index_hot()
+    require("utils.async_launcher").launch({
+      name  = "UE: GTAGS hot reindex",
+      group = "ue",
+      run   = function(report)
+        if report then report("scheduling hot + full passes ...") end
+        M.index_hot()
+      end,
+    })
   end, {})
   vim.api.nvim_create_user_command("UEIndexFull", function()
-    M.index_full()
+    require("utils.async_launcher").launch({
+      name  = "UE: GTAGS full reindex",
+      group = "ue",
+      run   = function(report)
+        if report then report("scheduling full pass ...") end
+        M.index_full()
+      end,
+    })
   end, {})
   vim.api.nvim_create_user_command("UEIndexTimings", function()
     local ctx, err = resolve_context()

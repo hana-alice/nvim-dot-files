@@ -268,6 +268,34 @@ map("n", "<leader>vl", sidebar_toggle("loclist"), { desc = "Sidebar: Location li
 map("n", "<leader>vt", sidebar_toggle("todo"), { desc = "Sidebar: TODO / FIXME" })
 map("n", "<leader>?", "<cmd>UECheatsheet<cr>", { desc = "UE: Cheatsheet" })
 
+-- Restart Neovim in the current cwd. Detects Neovide / WezTerm / native
+-- terminal and spawns a fresh nvim there before tearing down this one.
+-- See lua/utils/restart.lua for the detection contract.
+vim.api.nvim_create_user_command("Restart", function(opts)
+  local restart = require("utils.restart")
+  if opts.bang then
+    restart.restart({ force = true })
+  else
+    -- Wrap with async_launcher so the spawn + qa transition has a
+    -- visible placeholder + right-bottom progress entry.
+    require("utils.async_launcher").launch({
+      name  = "Restart in cwd " .. vim.fn.getcwd(),
+      group = "nvim",
+      run   = function(report)
+        if report then report("detecting client + spawning ...") end
+        restart.restart()
+      end,
+      hold_ms = 50,  -- spawn returns fast; don't block the qa
+    })
+  end
+end, { bang = true, desc = "Restart Neovim in current cwd (! = qa! no prompt)" })
+
+vim.api.nvim_create_user_command("RestartDetect", function()
+  require("utils.restart").restart({ dry_run = true })
+end, { desc = "Print restart plan without acting (debug)" })
+
+map("n", "<leader>qr", "<cmd>Restart<cr>", { desc = "Quit: Restart Neovim in cwd" })
+
 -- Android DAP keymaps
 map("n", "<leader>da", "<cmd>UEAndroidDAPAttach<cr>", { desc = "DAP: Android Attach" })
 map("n", "<leader>db", "<cmd>UEAndroidDAPToggleBreakpoint<cr>", { desc = "DAP: Toggle Breakpoint" })

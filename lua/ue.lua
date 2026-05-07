@@ -1861,6 +1861,139 @@ local function write_json_file(path, value)
   return write_all(path, vim.json.encode(value or {}))
 end
 
+-- Reverse-map a unity TU path back to the originating module name.
+-- UBT emits unity .cpp files at:
+--   <root>/Intermediate/Build/<Plat>/<Target>/<Conf>/[<PlatGroup>/]<Module>/Module.<Module>[.gen][.N_of_M].cpp
+-- where <root> is Engine/, the project root, or a plugin/platform plugin root.
+-- Returns the bare module name (e.g. "AIGraph", "AIModule") or nil.
+local function unity_tu_module_name(path)
+  if not path or path == "" then
+    return nil
+  end
+  if not path:find("/Intermediate/Build/", 1, true) then
+    return nil
+  end
+  local raw = path:match("/Module%.([^/]+)%.cpp$")
+  if not raw then
+    return nil
+  end
+  -- Strip "N_of_M" slice suffix (any trailing ".<digits>_of_<digits>")
+  raw = raw:gsub("%.%d+_of_%d+$", "")
+  -- Strip ".gen" UHT suffix
+  raw = raw:gsub("%.gen$", "")
+  if raw == "" then
+    return nil
+  end
+  return raw
+end
+
+-- name -> resolved root cache, populated on demand. Keyed by
+-- "engine_root|project_root|name" so multiple workspaces don't collide.
+local UNITY_MODULE_ROOT_CACHE = {}
+
+local function unity_locate_module_root(engine_root, project_root, name)
+  if not name or name == "" then
+    return nil
+  end
+  local key = (engine_root or "") .. "|" .. (project_root or "") .. "|" .. name
+  local cached = UNITY_MODULE_ROOT_CACHE[key]
+  if cached ~= nil then
+    if cached == false then
+      return nil
+    end
+    return cached
+  end
+
+  local function check(candidate)
+    candidate = norm(candidate)
+    if candidate ~= "" and is_dir(candidate) then
+      return candidate
+    end
+    return nil
+  end
+
+  -- 1) Engine/Source/<Tier>/<Module>
+  local hit = locate_engine_module_root(engine_root, name)
+
+  -- 2) Engine plugin: Engine/Plugins/**/<Module>/Source/<Module>
+  if not hit and engine_root and engine_root ~= "" then
+    local matches = vim.fn.globpath(
+      join(engine_root, "Engine", "Plugins"),
+      "**/" .. name .. "/Source/" .. name,
+      false,
+      true
+    )
+    if type(matches) == "table" then
+      for _, m in ipairs(matches) do
+        hit = check(m)
+        if hit then break end
+      end
+    end
+  end
+
+  -- 3) Engine platforms plugin: Engine/Platforms/*/Plugins/**/<Module>/Source/<Module>
+  if not hit and engine_root and engine_root ~= "" then
+    local matches = vim.fn.globpath(
+      join(engine_root, "Engine", "Platforms"),
+      "*/Plugins/**/" .. name .. "/Source/" .. name,
+      false,
+      true
+    )
+    if type(matches) == "table" then
+      for _, m in ipairs(matches) do
+        hit = check(m)
+        if hit then break end
+      end
+    end
+  end
+
+  -- 4) Project module: <project>/Source/<Module>
+  if not hit and project_root and project_root ~= "" then
+    hit = check(join(project_root, "Source", name))
+  end
+
+  -- 5) Project plugin: <project>/Plugins/**/<Module>/Source/<Module>
+  if not hit and project_root and project_root ~= "" then
+    local matches = vim.fn.globpath(
+      join(project_root, "Plugins"),
+      "**/" .. name .. "/Source/" .. name,
+      false,
+      true
+    )
+    if type(matches) == "table" then
+      for _, m in ipairs(matches) do
+        hit = check(m)
+        if hit then break end
+      end
+    end
+  end
+
+  UNITY_MODULE_ROOT_CACHE[key] = hit or false
+  return hit
+end
+
+local function unity_scope_for_path(ctx, path)
+  local name = unity_tu_module_name(path)
+  if not name then
+    return nil
+  end
+  local root = unity_locate_module_root(ctx.engine_root, ctx.project_root, name)
+  if not root then
+    return nil
+  end
+  -- Detect plugin vs module by whether root sits under any /Plugins/ chain
+  local kind = "module"
+  if norm(root):find("/Plugins/", 1, true) then
+    kind = "plugin"
+  end
+  return {
+    kind = kind,
+    name = name,
+    root = root,
+    label = (kind == "plugin" and "Plugin " or "Module ") .. name,
+  }
+end
+
 local function module_scope_for_path(ctx, path)
   if not ctx then
     return nil
@@ -1873,6 +2006,7 @@ local function module_scope_for_path(ctx, path)
     or project_module_scope(ctx.project_root, path)
     or plugin_scope_from_root(join(ctx.engine_root, "Engine"), path)
     or engine_module_scope(ctx.engine_root, path)
+    or unity_scope_for_path(ctx, path)
 end
 
 local function module_key(scope)
@@ -4310,6 +4444,12 @@ local function generate_compile_commands(ctx)
       "-Project=" .. project_arg,
       "-Game",
       "-Engine",
+      -- Force unity build mode in the generated CDB.
+      -- this UE fork's GenerateClangDatabase Mode hard-appends "-DisableUnity" per-target,
+      -- which only sets bUseUnityBuild=false. "-ForceUnity" sets bForceUnityBuild=true,
+      -- and UEBuildModuleCPP.cs:402 OR's the two -> module goes through unity aggregation.
+      -- Result: CDB contains ~847 Module.<X>.cpp unity TUs instead of 14k per-file entries.
+      "-ForceUnity",
     })
   else
     plat = target_platform(ctx.engine_root, { ubt_exe_path(ctx.engine_root) })
@@ -4323,6 +4463,8 @@ local function generate_compile_commands(ctx)
       "-Project=" .. project_arg,
       "-Game",
       "-Engine",
+      -- Force unity build mode (see Windows branch above for rationale).
+      "-ForceUnity",
     })
   end
   if not cmd then

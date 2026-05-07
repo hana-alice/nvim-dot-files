@@ -255,6 +255,31 @@ check("Phase I: cdb.tools_dir override changes pipeline lookups", function()
   assert(cfg.get("cdb.tools_dir") == "/some/custom/dir")
   cfg.reset_for_test()
 end)
+
+-- ── Phase J: ue/dap.lua reads ue.config for android prompts ────────────
+check("Phase J: dap._pick_android_package_for_test (state wins)", function()
+  assert(require("ue.dap")._pick_android_package_for_test("com.from.state") == "com.from.state")
+end)
+check("Phase J: dap._pick_android_package_for_test (cfg fills empty state)", function()
+  local cfg = require("ue.config")
+  cfg.setup({ dap = { android_package = "com.from.cfg" }})
+  assert(require("ue.dap")._pick_android_package_for_test("") == "com.from.cfg")
+  cfg.reset_for_test()
+end)
+check("Phase J: dap._pick_lldb_server_for_test (cfg path wins)", function()
+  local cfg = require("ue.config")
+  -- Pick a path we know exists on this host (the lint script always does).
+  local existing = vim.fn.stdpath("config") .. "/scripts/lint_no_bare_globals.lua"
+  cfg.setup({ dap = { lldb_server_path = existing }})
+  assert(require("ue.dap")._pick_lldb_server_for_test({}) == existing)
+  cfg.reset_for_test()
+end)
+
+-- ── Phase F.3: UEAndroidDAP* wraps with one-shot deprecation tracker ───
+check("Phase F.3: M._dap_deprecation_seen exists after setup()", function()
+  require("ue").setup()
+  assert(type(require("ue")._dap_deprecation_seen) == "table")
+end)
 check("backward-compat: UEAndroidDAP* still registered", function()
   for _, c in ipairs({
     "UEAndroidDAPAttach", "UEAndroidDAPLaunch", "UEAndroidDAPContinue",

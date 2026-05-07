@@ -16,53 +16,110 @@ local CORE_RT = {
   context_cache = {}, -- key -> { ctx, ts }
 }
 local INDEX_FN = {}
+-- Phase C: tunables sourced from `ue.config`. Literal fallbacks (`or 120000`
+-- etc.) match the previous hard-coded values exactly so behaviour is
+-- unchanged when no user override is provided. The fallbacks also keep this
+-- chunk loadable if `ue.config` ever fails to require.
+local _ue_cfg = require("ue.config")
 local INDEX_RT = {
   job = nil,
   module_state = {},
   contexts = {},
   timers = {},
-  idle_cold_ms = 120000,
-  debounce_current_ms = 1200,
-  debounce_hot_ms = 8000,
-  restart_debounce_s = 45,
+  idle_cold_ms        = _ue_cfg.get("index.idle_cold_ms")        or 120000,
+  debounce_current_ms = _ue_cfg.get("index.debounce_current_ms") or 1200,
+  debounce_hot_ms     = _ue_cfg.get("index.debounce_hot_ms")     or 8000,
+  restart_debounce_s  = _ue_cfg.get("index.restart_debounce_s")  or 45,
   last_restart_at = 0,
   status_cache = {},
-  status_ttl = 30,
+  status_ttl          = _ue_cfg.get("index.status_ttl_s")        or 30,
 }
 local cache_paths
-local _CONTEXT_TTL = 30 -- seconds (filesystem walks are expensive on NTFS)
+local _CONTEXT_TTL = _ue_cfg.get("context.ttl_s") or 30 -- seconds (filesystem walks are expensive on NTFS)
 
 -- ==========================================================================
 -- CORE UTILITIES — paths, files, process, ANSI
 -- ==========================================================================
+--
+-- The path/file/process helpers below were extracted to `lua/ue/core/{fs,proc}`
+-- in Phase B of the multi-platform migration. Each helper is rebound here as
+-- a `local function` whose body forwards to the extracted module — keeping
+-- every existing call site (`norm(...)`, `join(...)`, `is_file(...)`, etc.)
+-- byte-for-byte equivalent.
+--
+-- Constraint: a single Lua chunk is capped at 200 locals, and the original
+-- file already uses 202 locals (our wrappers re-occupy the same slots the
+-- original `local function trim` etc. did, so the count is unchanged). To
+-- stay under the cap we DO NOT introduce a top-level `_platform` or `_core`
+-- local — module table lookups happen inside each wrapper body where they
+-- do not occupy chunk-level slots.
 
 local function trim(value)
-  return vim.trim(tostring(value or ""))
+  return require("ue.core.fs").trim(value)
 end
 
 local function norm(path)
-  if not path or path == "" then
-    return ""
-  end
-  path = tostring(path):gsub("\\", "/")
-  path = path:gsub("/+", "/")
-  if #path > 1 and path:sub(-1) == "/" then
-    path = path:sub(1, -2)
-  end
-  return path
+  return require("ue.core.fs").norm(path)
 end
 
 local function cwd()
-  local uv_cwd = vim.uv and vim.uv.cwd and vim.uv.cwd() or nil
-  if uv_cwd and uv_cwd ~= "" then
-    return norm(uv_cwd)
-  end
-  return norm(vim.fn.getcwd())
+  return require("ue.core.fs").cwd()
 end
 
-local _platform = require("utils.platform")
+local function join(...)
+  return require("ue.core.fs").join(...)
+end
+
+local function dirname(path)
+  return require("ue.core.fs").dirname(path)
+end
+
+local function is_dir(path)
+  return require("ue.core.fs").is_dir(path)
+end
+
+local function is_file(path)
+  return require("ue.core.fs").is_file(path)
+end
+
+local function ensure_dir(path)
+  return require("ue.core.fs").ensure_dir(path)
+end
+
+local function file_stat(path)
+  return require("ue.core.fs").file_stat(path)
+end
+
+local function file_mtime(path)
+  return require("ue.core.fs").file_mtime(path)
+end
+
+local function path_has_prefix(path, prefix)
+  return require("ue.core.fs").path_has_prefix(path, prefix)
+end
+
+local function is_absolute_path(path)
+  return require("ue.core.fs").is_absolute_path(path)
+end
+
+local function split_path(path)
+  return require("ue.core.fs").split_path(path)
+end
+
+local function common_ancestor(paths)
+  return require("ue.core.fs").common_ancestor(paths)
+end
+
+local function relative_to(root, path)
+  return require("ue.core.fs").relative_to(root, path)
+end
+
+local function first_executable(candidates)
+  return require("ue.core.proc").first_executable(candidates)
+end
+
 local function is_native_windows()
-  return _platform.is_windows
+  return require("utils.platform").is_windows
 end
 
 local function focus_window(win)
@@ -84,157 +141,32 @@ local function startinsert_in_window(win)
   end)
 end
 
-local function join(...)
-  return norm(table.concat(vim.iter({ ... }):flatten():totable(), "/"))
-end
-
-local function dirname(path)
-  return norm(vim.fs.dirname(path))
-end
-
-local function is_dir(path)
-  return vim.fn.isdirectory(path) == 1
-end
-
-local function is_file(path)
-  return vim.fn.filereadable(path) == 1
-end
-
-local function ensure_dir(path)
-  if path ~= "" and not is_dir(path) then
-    vim.fn.mkdir(path, "p")
-  end
-end
-
-local function file_stat(path)
-  path = norm(path)
-  if path == "" or not vim.uv or not vim.uv.fs_stat then
-    return nil
-  end
-  return vim.uv.fs_stat(path)
-end
-
-local function file_mtime(path)
-  local stat = file_stat(path)
-  local mtime = stat and stat.mtime or nil
-  if type(mtime) == "table" then
-    return tonumber(mtime.sec) or 0
-  end
-  return tonumber(mtime) or 0
-end
-
-local function path_has_prefix(path, prefix)
-  path = norm(path)
-  prefix = norm(prefix)
-  if prefix == "" then
-    return false
-  end
-  if prefix == "/" then
-    return path:sub(1, 1) == "/"
-  end
-  return path == prefix or path:sub(1, #prefix + 1) == prefix .. "/"
-end
-
-local function is_absolute_path(path)
-  path = norm(path)
-  return path ~= "" and (path:sub(1, 1) == "/" or path:match("^[A-Za-z]:/") or path:match("^//"))
-end
-
-local function split_path(path)
-  local parts = {}
-  for part in norm(path):gmatch("[^/]+") do
-    table.insert(parts, part)
-  end
-  return parts
-end
-
-local function common_ancestor(paths)
-  local normalized = {}
-  local absolute = true
-
-  for _, path in ipairs(paths or {}) do
-    path = norm(path)
-    if path ~= "" then
-      table.insert(normalized, path)
-      absolute = absolute and path:sub(1, 1) == "/"
-    end
-  end
-
-  if #normalized == 0 then
-    return ""
-  end
-
-  local shared = split_path(normalized[1])
-  for index = 2, #normalized do
-    local parts = split_path(normalized[index])
-    local keep = 0
-    for part_index = 1, math.min(#shared, #parts) do
-      if shared[part_index] ~= parts[part_index] then
-        break
-      end
-      keep = part_index
-    end
-    while #shared > keep do
-      table.remove(shared)
-    end
-    if #shared == 0 then
-      break
-    end
-  end
-
-  if #shared == 0 then
-    return absolute and "/" or ""
-  end
-
-  local prefix = table.concat(shared, "/")
-  if absolute then
-    return "/" .. prefix
-  end
-  return prefix
-end
-
-local function relative_to(root, path)
-  root = norm(root)
-  path = norm(path)
-
-  if root == "" then
-    return path
-  end
-  if root == "/" then
-    return path
-  end
-  if path == root then
-    return "."
-  end
-  if not path_has_prefix(path, root) then
-    return path
-  end
-  return path:sub(#root + 2)
-end
-
-local function first_executable(candidates)
-  for _, candidate in ipairs(candidates or {}) do
-    if candidate and candidate ~= "" then
-      if candidate:find("/", 1, true) and is_file(candidate) then
-        return candidate
-      end
-      if vim.fn.executable(candidate) == 1 then
-        return candidate
-      end
-    end
-  end
-  return nil
-end
-
 -- ==========================================================================
 -- CLANGD / LSP
 -- ==========================================================================
 
 local function clangd_candidates(root_dir)
   local candidates = {}
+
+  -- Phase I priority order:
+  --   1. UE_CLANGD env var (legacy, highest)
+  --   2. ue.config.clangd.candidates_extra (user setup() override)
+  --   3. PATH default + canonical /usr/{local/}bin
+  --   4. WSL bridge path when running under /mnt/<drive>/
+  --   5. Windows native LLVM install (Program Files)
   local override = trim(vim.env.UE_CLANGD)
   if override ~= "" then
     table.insert(candidates, override)
+  end
+
+  do
+    local ok, cfg = pcall(require, "ue.config")
+    if ok and cfg and cfg.get then
+      local extra = cfg.get("clangd.candidates_extra")
+      if type(extra) == "table" then
+        vim.list_extend(candidates, extra)
+      end
+    end
   end
 
   vim.list_extend(candidates, {
@@ -816,6 +748,22 @@ function M.clangd_cmd(root_dir)
           if cc_mtime == 0 or idx_mtime >= cc_mtime then
             table.insert(cmd, "--index-file=" .. idx_path)
             break
+          end
+        end
+      end
+    end
+  end
+
+  -- Phase I: append user-configured extra clangd args, last so they can
+  -- override anything ue.lua chose. Empty default = behaviour unchanged.
+  do
+    local ok, cfg = pcall(require, "ue.config")
+    if ok and cfg and cfg.get then
+      local extra = cfg.get("clangd.extra_args")
+      if type(extra) == "table" then
+        for _, a in ipairs(extra) do
+          if type(a) == "string" and a ~= "" then
+            table.insert(cmd, a)
           end
         end
       end
@@ -3444,10 +3392,7 @@ end
 -- ==========================================================================
 
 local function compile_commands_targets(ctx)
-  return {
-    join(ctx.engine_root, "compile_commands.json"),
-    join(ctx.engine_root, "Engine", "compile_commands.json"),
-  }
+  return require("ue.cdb.paths").targets(ctx)
 end
 
 local function windows_engine_root(ctx)
@@ -3460,53 +3405,10 @@ local function windows_engine_root(ctx)
 end
 
 local function compile_commands_candidates(ctx)
-  local seen = {}
-  local candidates = {}
-
-  local function add(path)
-    path = norm(path)
-    if path ~= "" and not seen[path] and is_file(path) then
-      seen[path] = true
-      table.insert(candidates, path)
-    end
-  end
-
-  for _, target in ipairs(compile_commands_targets(ctx)) do
-    add(target)
-  end
-  if ctx.project_root and ctx.project_root ~= "" then
-    add(join(ctx.project_root, "compile_commands.json"))
-  end
-  add(join(ctx.engine_root, "Engine", "Intermediate", "Build", "compile_commands.json"))
-
-  local fd = first_executable({ "fd", "fdfind" })
-  if fd then
-    local cmd = {
-      fd,
-      "--absolute-path",
-      "--type",
-      "f",
-      "--hidden",
-      "--follow",
-      "--glob",
-      "compile_commands.json",
-      "--search-path",
-      ctx.engine_root,
-    }
-    if ctx.project_root and ctx.project_root ~= "" and ctx.project_root ~= ctx.engine_root then
-      table.insert(cmd, "--search-path")
-      table.insert(cmd, ctx.project_root)
-    end
-
-    local code, lines = run_lines(cmd, { cwd = "/" })
-    if code == 0 then
-      for _, line in ipairs(lines or {}) do
-        add(line)
-      end
-    end
-  end
-
-  return candidates
+  return require("ue.cdb.paths").candidates(ctx, {
+    first_executable = first_executable,
+    run_lines        = run_lines,
+  })
 end
 
 -- ==========================================================================
@@ -3723,62 +3625,20 @@ local function shader_include_roots(shader_files)
 end
 
 local function compile_commands_program(entry)
-  if type(entry) == "table" and type(entry.arguments) == "table" and entry.arguments[1] then
-    return trim(entry.arguments[1])
-  end
-
-  local command = type(entry) == "table" and trim(entry.command) or ""
-  if command ~= "" then
-    if command:sub(1, 1) == '"' then
-      return command:match('^"([^"]+)"') or command:match("^(%S+)")
-    end
-    return command:match("^(%S+)")
-  end
-
-  return first_executable({ "clang++", "clang", "clang++.exe", "clang.exe", "cl.exe", "cl" }) or "clang++"
+  return require("ue.cdb.json").program(entry)
 end
 
 local function compile_commands_template_entry(entries)
-  for _, entry in ipairs(entries or {}) do
-    if type(entry) == "table" and type(entry.arguments) == "table" and entry.arguments[1] and entry.file then
-      return entry
-    end
-  end
-  for _, entry in ipairs(entries or {}) do
-    if type(entry) == "table" and entry.file then
-      return entry
-    end
-  end
-  return {}
+  return require("ue.cdb.json").template_entry(entries)
 end
 
 local function make_shader_compile_command_entry(shader_file, template, include_roots)
-  local arguments = {
-    compile_commands_program(template),
-    "-x",
-    "c++-header",
-    "-fsyntax-only",
-    "-Wno-pragma-once-outside-header",
-  }
-  for _, root in ipairs(include_roots or {}) do
-    table.insert(arguments, "-I")
-    table.insert(arguments, root)
-  end
-  table.insert(arguments, shader_file)
-
-  return {
-    directory = trim(template.directory or dirname(shader_file)),
-    file = shader_file,
-    arguments = arguments,
-  }
+  return require("ue.cdb.shaders").make_entry(shader_file, template, include_roots)
 end
 
 local function augment_compile_commands_with_shaders(ctx, content)
-  local ok, decoded = pcall(vim.json.decode, content)
-  if not ok or type(decoded) ~= "table" then
-    return content
-  end
-
+  -- Discovery stays here (captures UE_CONST + scan_shader_files); the
+  -- augmentation primitive itself moved to lua/ue/cdb/shaders.lua.
   local shader_files = {}
   if ctx.project_root and ctx.project_root ~= "" then
     vim.list_extend(shader_files, scan_shader_files(ctx.project_root, UE_CONST.PROJECT_INDEX_DIRS))
@@ -3787,31 +3647,8 @@ local function augment_compile_commands_with_shaders(ctx, content)
   if #shader_files == 0 then
     return content
   end
-
   local include_roots = shader_include_roots(shader_files)
-  local template = compile_commands_template_entry(decoded)
-  local existing = {}
-  for _, entry in ipairs(decoded) do
-    if type(entry) == "table" and entry.file then
-      existing[norm(entry.file):lower()] = true
-    end
-  end
-
-  local added = false
-  for _, shader_file in ipairs(shader_files) do
-    local key = shader_file:lower()
-    if not existing[key] then
-      table.insert(decoded, make_shader_compile_command_entry(shader_file, template, include_roots))
-      existing[key] = true
-      added = true
-    end
-  end
-
-  if not added then
-    return content
-  end
-
-  return vim.json.encode(decoded)
+  return require("ue.cdb.shaders").augment(content, shader_files, include_roots)
 end
 
 -- ---------------------------------------------------------------------------
@@ -4258,28 +4095,7 @@ end
 end -- do block
 
 local function slim_compile_commands_file(path)
-  -- Use external Python script to avoid 200MB JSON decode inside Neovim
-  local script = vim.fn.stdpath("config") .. "/tools/slim_compile_commands.py"
-  if not is_file(script) then
-    vim.notify("slim_compile_commands.py not found: " .. script, vim.log.levels.WARN)
-    return false
-  end
-  local python = (vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1) and "python" or "python3"
-  -- --keep-engine: preserve Engine C++ entries for goto-definition
-  -- strips shaders, Intermediate, uetemp, NDK only
-  local cmd = { python, script, path, "--keep-engine" }
-  local result = vim.fn.system(cmd)
-  if vim.v.shell_error == 0 then
-    -- New script outputs "保留: N | 剔除: M (...%)"
-    local removed = result:match("剔除: (%d+)")
-    if removed and tonumber(removed) > 0 then
-      vim.notify(result, vim.log.levels.INFO)
-    end
-  else
-    vim.notify("slim_compile_commands failed: " .. (result or ""), vim.log.levels.WARN)
-    return false
-  end
-  return true
+  return require("ue.cdb.pipeline").slim(path)
 end
 
 --- Spawn a long-running shell job, capture stdout+stderr to a timestamped log
@@ -4366,102 +4182,16 @@ end
 --- @param targets string[]|nil list of compile_commands targets; after pipeline
 ---        finishes the first target is copied to the others and clangd restarts.
 local function run_compile_commands_pipeline(path, targets)
-  local python = (vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1) and "python" or "python3"
-  local expand_script = vim.fn.stdpath("config") .. "/tools/expand_response_cdb.py"
-  local pch_script = vim.fn.stdpath("config") .. "/tools/prebuild_pch_v2.py"
-  local resolve_script = vim.fn.stdpath("config") .. "/tools/resolve_cdb_paths.py"
-  local unify_script = vim.fn.stdpath("config") .. "/tools/unify_include_dirs.py"
-  local prune_script = vim.fn.stdpath("config") .. "/tools/prune_include_dirs.py"
-  local has_expand = is_file(expand_script)
-  local has_pch = is_file(pch_script)
-  local has_resolve = is_file(resolve_script)
-  local has_unify = is_file(unify_script)
-  local has_prune = is_file(prune_script)
-
-  if not has_pch and not has_unify and not has_prune then return end
-
-  vim.notify("compile_commands pipeline: expand+pch+resolve+unify+prune in background...", vim.log.levels.INFO)
-
-  -- Record mtime before pipeline to detect actual changes
-  local stat_before = vim.uv.fs_stat(path)
-  local mtime_before = stat_before and stat_before.mtime.sec or 0
-
-  -- Detect engine-only project for unify
-  local path_lower = path:gsub("\\", "/"):lower()
-  local is_engine_only = path_lower:find("/engine/") and true or false
-
-  local cmds = {}
-  if has_expand then
-    -- Expand UE response-file form (command "@xxx.response") into flat
-    -- arguments[]. UnrealBuildTool produces this format for engine
-    -- builds; without expansion all downstream scripts (pch/resolve/
-    -- unify/prune) silently no-op because they read e['arguments'].
-    table.insert(cmds, python .. ' "' .. expand_script .. '" "' .. path .. '"')
-  end
-  if has_pch then
-    table.insert(cmds, python .. ' "' .. pch_script .. '" "' .. path .. '"')
-  end
-  if has_resolve then
-    -- Resolve relative -I paths to absolute AFTER PCH (PCH RSP uses absolute paths;
-    -- CDB must match or clang cannot reuse PCH cache, causing 5-400x slower preamble)
-    table.insert(cmds, python .. ' "' .. resolve_script .. '" "' .. path .. '"')
-  end
-  if has_unify then
-    local extra = is_engine_only and " --include-engine" or ""
-    table.insert(cmds, python .. ' "' .. unify_script .. '" "' .. path .. '" --max-overhead=200' .. extra)
-  end
-  if has_prune then
-    -- Use python -I to isolate from PYTHONPATH pollution; sample 20 files per PCH group
-    table.insert(cmds, python .. ' -I "' .. prune_script .. '" "' .. path .. '" --sample 20')
-  end
-
-  local shell_cmd = table.concat(cmds, " && ")
-
-  -- Capture stdout+stderr into a timestamped log file so failures are debuggable
-  -- without re-running. Uses M._logged_jobstart so other long-running jobs
-  -- (PCH rebuild, gtags, etc.) can adopt the same pattern.
-  M._logged_jobstart(shell_cmd, "ue-pipeline", {
-    cdb = path,
-    on_exit = function(code, log_lines, log_path)
-        -- Check if CDB was actually modified
-        local stat_after = vim.uv.fs_stat(path)
-        local mtime_after = stat_after and stat_after.mtime.sec or 0
-        if mtime_after == mtime_before then
-          vim.notify("compile_commands pipeline: no changes, skipping clangd restart", vim.log.levels.INFO)
-          return
-        end
-        -- Sync primary target to secondary targets
-        if targets and #targets > 1 then
-          for i = 2, #targets do
-            local dst = targets[i]
-            local cp_cmd
-            if vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1 then
-              cp_cmd = { "cmd", "/c", "copy", "/y", path:gsub("/", "\\"), dst:gsub("/", "\\") }
-            else
-              cp_cmd = { "cp", path, dst }
-            end
-            vim.fn.system(cp_cmd)
-          end
-        end
-        vim.notify("compile_commands pipeline: done. Restarting clangd...", vim.log.levels.INFO)
-        -- Auto-restart clangd to pick up the changes
-        local clients = vim.lsp.get_clients({ name = "clangd" })
-        for _, client in ipairs(clients) do
-          local bufs = vim.lsp.get_buffers_by_client_id(client.id)
-          client:stop()
-          vim.defer_fn(function()
-            for _, buf in ipairs(bufs) do
-              if vim.api.nvim_buf_is_valid(buf) then
-                vim.api.nvim_buf_call(buf, function()
-                  vim.cmd("LspStart clangd")
-                end)
-                break
-              end
-            end
-          end, 500)
-        end
-    end,
+  -- ue.cdb.pipeline drives the expand → pch → resolve → unify → prune
+  -- chain. We inject `_logged_jobstart` here so the pipeline module stays
+  -- import-safe (no circular require to ue.lua) and headlessly testable.
+  local pipeline = require("ue.cdb.pipeline")
+  pipeline.set_runtime({
+    jobstart  = M._logged_jobstart,
+    notify    = function(msg, level) vim.notify(msg, level) end,
+    log_error = function(scope, msg) require("utils.log").notify_error(scope, msg) end,
   })
+  pipeline.run(path, targets)
 end
 
 local function write_compile_commands_targets(ctx, content)
@@ -7854,43 +7584,111 @@ function M.setup()
     clear_cache({ bang = cmd_opts.bang })
   end, { bang = true, desc = "Clear UE caches (! = also clangd index, compile_commands, restart LSP)" })
 
-  -- Android DAP commands
-  vim.api.nvim_create_user_command("UEAndroidDAPAttach", function()
-    M.android_dap_attach()
-  end, {})
-  vim.api.nvim_create_user_command("UEAndroidDAPLaunch", function()
-    M.android_dap_launch()
-  end, {})
-  vim.api.nvim_create_user_command("UEAndroidDAPContinue", function()
-    M.dap_continue()
-  end, {})
-  vim.api.nvim_create_user_command("UEAndroidDAPPause", function()
-    M.dap_pause()
-  end, {})
-  vim.api.nvim_create_user_command("UEAndroidDAPToggleBreakpoint", function()
-    M.dap_toggle_breakpoint()
-  end, {})
-  vim.api.nvim_create_user_command("UEAndroidDAPStepOver", function()
-    M.dap_step_over()
-  end, {})
-  vim.api.nvim_create_user_command("UEAndroidDAPStepIn", function()
-    M.dap_step_into()
-  end, {})
-  vim.api.nvim_create_user_command("UEAndroidDAPStepOut", function()
-    M.dap_step_out()
-  end, {})
-  vim.api.nvim_create_user_command("UEAndroidDAPToggleUI", function()
-    M.dap_toggle_ui()
-  end, {})
-  vim.api.nvim_create_user_command("UEAndroidDAPREPL", function()
-    M.dap_toggle_repl()
-  end, {})
+  -- ─ Phase F.3: UEAndroidDAP* deprecation notice ─────────────────────
+  -- The platform-neutral UEDAP* aliases (Phase F.1+F.2+H) are the
+  -- preferred surface. The old UEAndroidDAP* names are kept so user
+  -- keymaps don't break, but each one now warns ONCE per session, the
+  -- first time it's invoked, with a pointer at the new alias.
+  M._dap_deprecation_seen = M._dap_deprecation_seen or {}
+  local function dap_deprecated(old_name, new_name, fn)
+    return function()
+      if not M._dap_deprecation_seen[old_name] then
+        M._dap_deprecation_seen[old_name] = true
+        vim.notify(
+          (":%s is deprecated; use :%s instead. (warning shown once per session.)"):format(old_name, new_name),
+          vim.log.levels.WARN
+        )
+      end
+      fn()
+    end
+  end
+
+  -- Android DAP commands (Phase F.3: each warns once, then forwards).
+  vim.api.nvim_create_user_command("UEAndroidDAPAttach",
+    dap_deprecated("UEAndroidDAPAttach", "UEDAPAttach android",
+      function() M.android_dap_attach() end), {})
+  vim.api.nvim_create_user_command("UEAndroidDAPLaunch",
+    dap_deprecated("UEAndroidDAPLaunch", "UEDAPLaunch android",
+      function() M.android_dap_launch() end), {})
+  vim.api.nvim_create_user_command("UEAndroidDAPContinue",
+    dap_deprecated("UEAndroidDAPContinue", "UEDAPContinue",
+      function() M.dap_continue() end), {})
+  vim.api.nvim_create_user_command("UEAndroidDAPPause",
+    dap_deprecated("UEAndroidDAPPause", "UEDAPPause",
+      function() M.dap_pause() end), {})
+  vim.api.nvim_create_user_command("UEAndroidDAPToggleBreakpoint",
+    dap_deprecated("UEAndroidDAPToggleBreakpoint", "UEDAPToggleBreakpoint",
+      function() M.dap_toggle_breakpoint() end), {})
+  vim.api.nvim_create_user_command("UEAndroidDAPStepOver",
+    dap_deprecated("UEAndroidDAPStepOver", "UEDAPStepOver",
+      function() M.dap_step_over() end), {})
+  vim.api.nvim_create_user_command("UEAndroidDAPStepIn",
+    dap_deprecated("UEAndroidDAPStepIn", "UEDAPStepIn",
+      function() M.dap_step_into() end), {})
+  vim.api.nvim_create_user_command("UEAndroidDAPStepOut",
+    dap_deprecated("UEAndroidDAPStepOut", "UEDAPStepOut",
+      function() M.dap_step_out() end), {})
+  vim.api.nvim_create_user_command("UEAndroidDAPToggleUI",
+    dap_deprecated("UEAndroidDAPToggleUI", "UEDAPToggleUI",
+      function() M.dap_toggle_ui() end), {})
+  vim.api.nvim_create_user_command("UEAndroidDAPREPL",
+    dap_deprecated("UEAndroidDAPREPL", "UEDAPREPL",
+      function() M.dap_toggle_repl() end), {})
   vim.api.nvim_create_user_command("UEDAPDiag", function()
     M.dap_diagnose()
   end, {})
   vim.api.nvim_create_user_command("UEResetLayout", function()
     M.dap_reset_layout()
   end, {})
+
+  -- ─ Phase F.1+F.2+H: platform-neutral UEDAP* aliases via dispatch table ─
+  -- F.1 introduced the UEDAP* command names with hard-coded android branch.
+  -- F.2 moved the per-platform handler decision into ue.dap.platforms.
+  -- H registers concrete handlers for win64 / mac / linux / ios alongside
+  -- the existing android implementation. New platforms still register here
+  -- — this is the single seam the dispatch flows through.
+  local dap_platforms = require("ue.dap.platforms")
+  dap_platforms.register_attach("android", function() M.android_dap_attach() end)
+  dap_platforms.register_launch("android", function() M.android_dap_launch() end)
+  for _, id in ipairs({ "win64", "mac", "linux", "ios" }) do
+    local ok, plat_mod = pcall(require, "ue.dap." .. id)
+    if ok and type(plat_mod) == "table" then
+      if type(plat_mod.attach) == "function" then dap_platforms.register_attach(id, plat_mod.attach) end
+      if type(plat_mod.launch) == "function" then dap_platforms.register_launch(id, plat_mod.launch) end
+    end
+  end
+
+  local function dap_dispatch(kind, platform)
+    platform = (platform ~= "" and platform) or (M.current_platform() or "")
+    local handler = (kind == "attach")
+      and dap_platforms.attach_handler(platform)
+      or  dap_platforms.launch_handler(platform)
+    if handler then
+      handler()
+      return
+    end
+    local known = dap_platforms.known_platforms()
+    vim.notify(
+      ("UEDAP%s: platform %q has no handler (registered: %s). Pass one of these as the argument."):format(
+        kind == "attach" and "Attach" or "Launch", platform, table.concat(known, ", ")),
+      vim.log.levels.WARN
+    )
+  end
+
+  vim.api.nvim_create_user_command("UEDAPAttach", function(opts)
+    dap_dispatch("attach", opts.args or "")
+  end, { nargs = "?", desc = "DAP: Attach (optional: platform)" })
+  vim.api.nvim_create_user_command("UEDAPLaunch", function(opts)
+    dap_dispatch("launch", opts.args or "")
+  end, { nargs = "?", desc = "DAP: Launch (optional: platform)" })
+  vim.api.nvim_create_user_command("UEDAPContinue",        function() M.dap_continue()         end, { desc = "DAP: Continue" })
+  vim.api.nvim_create_user_command("UEDAPPause",           function() M.dap_pause()            end, { desc = "DAP: Pause" })
+  vim.api.nvim_create_user_command("UEDAPToggleBreakpoint",function() M.dap_toggle_breakpoint()end, { desc = "DAP: Toggle breakpoint" })
+  vim.api.nvim_create_user_command("UEDAPStepOver",        function() M.dap_step_over()        end, { desc = "DAP: Step over" })
+  vim.api.nvim_create_user_command("UEDAPStepIn",          function() M.dap_step_into()        end, { desc = "DAP: Step in" })
+  vim.api.nvim_create_user_command("UEDAPStepOut",         function() M.dap_step_out()         end, { desc = "DAP: Step out" })
+  vim.api.nvim_create_user_command("UEDAPToggleUI",        function() M.dap_toggle_ui()        end, { desc = "DAP: Toggle UI" })
+  vim.api.nvim_create_user_command("UEDAPREPL",            function() M.dap_toggle_repl()      end, { desc = "DAP: Toggle REPL" })
 
   local group = vim.api.nvim_create_augroup("ue_statusline", { clear = true })
   -- Stop old timer on reload to prevent leaks

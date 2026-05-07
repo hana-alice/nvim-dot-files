@@ -4062,28 +4062,7 @@ end
 end -- do block
 
 local function slim_compile_commands_file(path)
-  -- Use external Python script to avoid 200MB JSON decode inside Neovim
-  local script = vim.fn.stdpath("config") .. "/tools/slim_compile_commands.py"
-  if not is_file(script) then
-    vim.notify("slim_compile_commands.py not found: " .. script, vim.log.levels.WARN)
-    return false
-  end
-  local python = (vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1) and "python" or "python3"
-  -- --keep-engine: preserve Engine C++ entries for goto-definition
-  -- strips shaders, Intermediate, uetemp, NDK only
-  local cmd = { python, script, path, "--keep-engine" }
-  local result = vim.fn.system(cmd)
-  if vim.v.shell_error == 0 then
-    -- New script outputs "保留: N | 剔除: M (...%)"
-    local removed = result:match("剔除: (%d+)")
-    if removed and tonumber(removed) > 0 then
-      vim.notify(result, vim.log.levels.INFO)
-    end
-  else
-    vim.notify("slim_compile_commands failed: " .. (result or ""), vim.log.levels.WARN)
-    return false
-  end
-  return true
+  return require("ue.cdb.pipeline").slim(path)
 end
 
 --- Spawn a long-running shell job, capture stdout+stderr to a timestamped log
@@ -4170,102 +4149,16 @@ end
 --- @param targets string[]|nil list of compile_commands targets; after pipeline
 ---        finishes the first target is copied to the others and clangd restarts.
 local function run_compile_commands_pipeline(path, targets)
-  local python = (vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1) and "python" or "python3"
-  local expand_script = vim.fn.stdpath("config") .. "/tools/expand_response_cdb.py"
-  local pch_script = vim.fn.stdpath("config") .. "/tools/prebuild_pch_v2.py"
-  local resolve_script = vim.fn.stdpath("config") .. "/tools/resolve_cdb_paths.py"
-  local unify_script = vim.fn.stdpath("config") .. "/tools/unify_include_dirs.py"
-  local prune_script = vim.fn.stdpath("config") .. "/tools/prune_include_dirs.py"
-  local has_expand = is_file(expand_script)
-  local has_pch = is_file(pch_script)
-  local has_resolve = is_file(resolve_script)
-  local has_unify = is_file(unify_script)
-  local has_prune = is_file(prune_script)
-
-  if not has_pch and not has_unify and not has_prune then return end
-
-  vim.notify("compile_commands pipeline: expand+pch+resolve+unify+prune in background...", vim.log.levels.INFO)
-
-  -- Record mtime before pipeline to detect actual changes
-  local stat_before = vim.uv.fs_stat(path)
-  local mtime_before = stat_before and stat_before.mtime.sec or 0
-
-  -- Detect engine-only project for unify
-  local path_lower = path:gsub("\\", "/"):lower()
-  local is_engine_only = path_lower:find("/engine/") and true or false
-
-  local cmds = {}
-  if has_expand then
-    -- Expand UE response-file form (command "@xxx.response") into flat
-    -- arguments[]. UnrealBuildTool produces this format for engine
-    -- builds; without expansion all downstream scripts (pch/resolve/
-    -- unify/prune) silently no-op because they read e['arguments'].
-    table.insert(cmds, python .. ' "' .. expand_script .. '" "' .. path .. '"')
-  end
-  if has_pch then
-    table.insert(cmds, python .. ' "' .. pch_script .. '" "' .. path .. '"')
-  end
-  if has_resolve then
-    -- Resolve relative -I paths to absolute AFTER PCH (PCH RSP uses absolute paths;
-    -- CDB must match or clang cannot reuse PCH cache, causing 5-400x slower preamble)
-    table.insert(cmds, python .. ' "' .. resolve_script .. '" "' .. path .. '"')
-  end
-  if has_unify then
-    local extra = is_engine_only and " --include-engine" or ""
-    table.insert(cmds, python .. ' "' .. unify_script .. '" "' .. path .. '" --max-overhead=200' .. extra)
-  end
-  if has_prune then
-    -- Use python -I to isolate from PYTHONPATH pollution; sample 20 files per PCH group
-    table.insert(cmds, python .. ' -I "' .. prune_script .. '" "' .. path .. '" --sample 20')
-  end
-
-  local shell_cmd = table.concat(cmds, " && ")
-
-  -- Capture stdout+stderr into a timestamped log file so failures are debuggable
-  -- without re-running. Uses M._logged_jobstart so other long-running jobs
-  -- (PCH rebuild, gtags, etc.) can adopt the same pattern.
-  M._logged_jobstart(shell_cmd, "ue-pipeline", {
-    cdb = path,
-    on_exit = function(code, log_lines, log_path)
-        -- Check if CDB was actually modified
-        local stat_after = vim.uv.fs_stat(path)
-        local mtime_after = stat_after and stat_after.mtime.sec or 0
-        if mtime_after == mtime_before then
-          vim.notify("compile_commands pipeline: no changes, skipping clangd restart", vim.log.levels.INFO)
-          return
-        end
-        -- Sync primary target to secondary targets
-        if targets and #targets > 1 then
-          for i = 2, #targets do
-            local dst = targets[i]
-            local cp_cmd
-            if vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1 then
-              cp_cmd = { "cmd", "/c", "copy", "/y", path:gsub("/", "\\"), dst:gsub("/", "\\") }
-            else
-              cp_cmd = { "cp", path, dst }
-            end
-            vim.fn.system(cp_cmd)
-          end
-        end
-        vim.notify("compile_commands pipeline: done. Restarting clangd...", vim.log.levels.INFO)
-        -- Auto-restart clangd to pick up the changes
-        local clients = vim.lsp.get_clients({ name = "clangd" })
-        for _, client in ipairs(clients) do
-          local bufs = vim.lsp.get_buffers_by_client_id(client.id)
-          client:stop()
-          vim.defer_fn(function()
-            for _, buf in ipairs(bufs) do
-              if vim.api.nvim_buf_is_valid(buf) then
-                vim.api.nvim_buf_call(buf, function()
-                  vim.cmd("LspStart clangd")
-                end)
-                break
-              end
-            end
-          end, 500)
-        end
-    end,
+  -- ue.cdb.pipeline drives the expand → pch → resolve → unify → prune
+  -- chain. We inject `_logged_jobstart` here so the pipeline module stays
+  -- import-safe (no circular require to ue.lua) and headlessly testable.
+  local pipeline = require("ue.cdb.pipeline")
+  pipeline.set_runtime({
+    jobstart  = M._logged_jobstart,
+    notify    = function(msg, level) vim.notify(msg, level) end,
+    log_error = function(scope, msg) require("utils.log").notify_error(scope, msg) end,
   })
+  pipeline.run(path, targets)
 end
 
 local function write_compile_commands_targets(ctx, content)

@@ -65,14 +65,14 @@ def get_module_api_defines(dev_root_local, mod):
 def find_shared_pch_for_module(dev_root_local, mod):
     mod_dir = f'{dev_root_local}/{mod}'
     if not os.path.isdir(mod_dir):
-        return ()
+        return ('NONE',)
     rsps = [f for f in os.listdir(mod_dir) if f.startswith(f'Module.{mod}') and f.endswith('.obj.rsp')]
     if not rsps:
-        return ()
+        return ('NONE',)
     try:
         content = open(f'{mod_dir}/{rsps[0]}', encoding='utf-8', errors='replace').read()
     except OSError:
-        return ()
+        return ('NONE',)
     pchs = sorted(set(os.path.basename(m.group(1)) for m in RE_FI_PCH.finditer(content)))
     return tuple(pchs) if pchs else ('NONE',)
 
@@ -159,24 +159,67 @@ def main():
                         f.write(f'#undef {name}\n#define {name} {val}\n')
                     f.write(f'#include "{member_path}"\n')
 
-            # Build args: union of -I from ALL chunk members (so each module's
-            # Public/Private/Classes/UHT headers resolve), -D from chunk[0]
-            # (note: per-module <MOD>_API=DLLEXPORT will be wrong for non-chunk[0],
-            # but indexer mostly tolerates this — symbols get recorded either way).
+            # Build args: union of -I, -D, -U from ALL chunk members so each
+            # module's Public/Private/Classes/UHT headers + per-module
+            # DLLEXPORT macros (from Definitions.X.h, injected upstream) survive.
+            # Without this, only chunk[0]'s -D set wins → other modules' API
+            # macros undefined → indexer hits Build.h:47 #error UE_BUILD_DEBUG.
+            #
+            # CRITICAL: must handle BOTH glued (`-IPATH`, `-DNAME=val`) AND
+            # split (`-I PATH`, `-D NAME=val`, `-include PATH`) forms. UBT
+            # emits split form for absolute -I paths in modern CDBs. Treating
+            # them as separate `-I` and `PATH` tokens during merge corrupts
+            # the union (lone `-I` preserved, path string sorted into wrong
+            # bucket → indexer sees `-I -ID:/...` which is a parse bomb).
+            def _walk_member_args(args):
+                """Yield ('inc'|'def'|'other', token_or_pair) preserving split forms."""
+                n = len(args)
+                i = 0
+                while i < n:
+                    a = args[i]
+                    # split-form -I / -D / -U / -include / -isystem
+                    if a in ('-I', '-D', '-U', '-include', '-isystem', '-imacros') and i + 1 < n:
+                        kind = 'inc' if a in ('-I', '-include', '-isystem', '-imacros') else 'def'
+                        yield kind, (a, args[i + 1])
+                        i += 2
+                        continue
+                    # glued -IPATH / -DNAME[=VAL] / -UNAME
+                    if (a.startswith('-I') and len(a) > 2) or a.startswith('-isystem='):
+                        yield 'inc', (a,)
+                        i += 1
+                        continue
+                    if (a.startswith('-D') and len(a) > 2) or (a.startswith('-U') and len(a) > 2):
+                        yield 'def', (a,)
+                        i += 1
+                        continue
+                    yield 'other', (a,)
+                    i += 1
+
             base_args = list(template_entry.get('arguments', []))
-            # Collect all unique -I from all members
-            all_includes = []
+            all_includes = []  # list of tuples
             seen_inc = set()
+            all_defines = []
+            seen_def = set()
             for _, mem_e in chunk:
-                for a in mem_e.get('arguments', []):
-                    if a.startswith('-I'):
-                        if a not in seen_inc:
-                            seen_inc.add(a)
-                            all_includes.append(a)
-            # Replace template's -I block with the union
-            new_args = [a for a in base_args if not a.startswith('-I')]
-            # Insert union -I right after clang++
-            new_args = new_args[:1] + all_includes + new_args[1:]
+                for kind, payload in _walk_member_args(mem_e.get('arguments', [])):
+                    key = '\x00'.join(payload)
+                    if kind == 'inc' and key not in seen_inc:
+                        seen_inc.add(key)
+                        all_includes.append(payload)
+                    elif kind == 'def' and key not in seen_def:
+                        seen_def.add(key)
+                        all_defines.append(payload)
+            # Strip template's -I/-D/-U/-include (any form); we re-insert union.
+            new_args = []
+            for kind, payload in _walk_member_args(base_args):
+                if kind == 'other':
+                    new_args.extend(payload)
+            # Flatten union back into args
+            flat_inc = [tok for tup in all_includes for tok in tup]
+            flat_def = [tok for tup in all_defines for tok in tup]
+            # Insert union right after clang++ executable (preserves arg ordering
+            # for clang's remaining flags that follow).
+            new_args = new_args[:1] + flat_inc + flat_def + new_args[1:]
             # Swap file path
             old_cpp = template_entry['file']
             for i, a in enumerate(new_args):

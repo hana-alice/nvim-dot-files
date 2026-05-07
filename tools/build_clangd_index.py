@@ -77,6 +77,10 @@ def main():
                         help="Number of parallel workers (default: CPU count, max 24)")
     parser.add_argument("--use-unity", action="store_true",
                         help="Convert input CDB to unity-build CDB (Module.<X>.cpp aggregates) before indexing. Requires UE to have been built so that Intermediate/Build/.../Module.<X>.cpp files exist.")
+    parser.add_argument("--use-super-unity", action="store_true",
+                        help="After --use-unity, further group Module.<X>.cpp by SharedPCH into ~25 super-unity TUs (vs ~800 plain unity TUs). Eliminates per-TU SharedPCH re-parse cost, ~5-10x faster wall clock. Implies --use-unity. Requires UE to have been built.")
+    parser.add_argument("--super-unity-max-mods", type=int, default=50,
+                        help="Max Module.<X>.cpp members per super-unity TU (default 50). Lower = more TUs but less RAM per TU.")
     parser.add_argument("--server", action="store_true",
                         help="Start clangd-index-server after building")
     parser.add_argument("--port", type=int, default=50051,
@@ -129,6 +133,9 @@ def main():
     # cost on UE — preamble is ~170 MB and takes ~5s to build per TU).
     # Empirical estimate: full base CDB 14334 entries × 8 worker @ 1.46
     # files/sec = 164 min; unity ≈ 287 unity TUs × ~25s / 8 worker ≈ 15 min.
+    if args.use_super_unity:
+        # super-unity implies plain unity as the first hop
+        args.use_unity = True
     if args.use_unity:
         unity_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build_unity_cdb.py")
         if not os.path.isfile(unity_script):
@@ -155,9 +162,17 @@ def main():
     # makes the Build.h:47 #error UE_BUILD_DEBUG fire on ~97% of UE TUs and
     # produces a useless index. We expand the .h file's #defines into -D args
     # so the indexer sees the macros without needing PCH support.
+    #
+    # ORDER MATTERS: inject MUST run BEFORE super-unity. Inject's
+    # get_module_from_filepath only understands `Module.<X>.cpp` paths; the
+    # synthetic `SuperUnity.<PCH>.<N>.cpp` files super-unity emits would all
+    # return None → 0 -D injected → indexer hits #error on every TU. By
+    # injecting first, super-unity's per-chunk -I/-D/-U union (see
+    # build_super_unity_cdb.py) then carries the per-module DLLEXPORT macros
+    # into each super-TU.
     inject_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inject_definitions_to_cdb.py")
     if os.path.isfile(inject_script):
-        print("\n[1/2] Injecting Definitions.h #defines into CDB...")
+        print("\n[inject] Injecting Definitions.h #defines into CDB...")
         rc = subprocess.call([sys.executable, "-I", inject_script, cdb_path])
         if rc != 0:
             print(f"  WARN: inject_definitions_to_cdb returned {rc}")
@@ -168,6 +183,33 @@ def main():
     else:
         print(f"  WARN: {inject_script} not found, skipping injection")
         print(f"  (Indexer will likely fail on ~97% of UE TUs without it.)")
+
+    if args.use_super_unity:
+        # Group plain-unity TUs by their SharedPCH set into ~25 super-unity TUs.
+        # This eliminates the "every TU re-parses 170MB SharedPCH" cost that
+        # dominates clangd-indexer wall clock on UE.
+        # Runs AFTER inject so super-unity's per-chunk arg union picks up the
+        # injected -D flags from each member Module.<X>.cpp's CDB entry.
+        super_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build_super_unity_cdb.py")
+        if not os.path.isfile(super_script):
+            print(f"\nERROR: --use-super-unity requested but {super_script} not found", file=sys.stderr)
+            return 1
+        super_cdb_path = cdb_path.replace(".unity.json", ".super-unity.json")
+        if super_cdb_path == cdb_path:
+            super_cdb_path = cdb_path + ".super-unity.json"
+        print(f"\n[super-unity] Grouping by SharedPCH (max {args.super_unity_max_mods} mods/TU)...")
+        t_super = time.time()
+        rc = subprocess.call([
+            sys.executable, "-I", super_script,
+            cdb_path, super_cdb_path, str(args.super_unity_max_mods),
+        ])
+        if rc != 0:
+            print(f"\nERROR: build_super_unity_cdb returned {rc}", file=sys.stderr)
+            return 1
+        cdb_path = super_cdb_path
+        with open(cdb_path, "r", encoding="utf-8") as f:
+            cdb = json.load(f)
+        print(f"[super-unity] {len(cdb)} super-unity TUs in {time.time()-t_super:.1f}s")
 
     # Build index
     # CRITICAL: clangd-indexer's positional arg is a SOURCE file used as a

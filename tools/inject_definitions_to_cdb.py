@@ -482,6 +482,19 @@ def main():
             mode = 'command'
 
         def_paths = find_force_include_definitions(tokens)
+        # CRITICAL: paths in /FI / -include are usually RELATIVE to the
+        # entry's `directory` (UBT cwd = Engine/Source). Resolve to absolute
+        # here, otherwise parse_definitions_h's `os.path.isfile()` silently
+        # fails and returns [] -> 0 -D injected.
+        entry_cwd = e.get('directory', '') or ''
+        if def_paths and entry_cwd:
+            resolved = []
+            for p in def_paths:
+                pn = p.replace('\\', '/')
+                if not os.path.isabs(pn) and not (len(pn) >= 2 and pn[1] == ':'):
+                    pn = os.path.normpath(os.path.join(entry_cwd, pn)).replace('\\', '/')
+                resolved.append(pn)
+            def_paths = resolved
         # FALLBACK: if CDB doesn't carry -include Definitions (newer UBT
         # GenerateClangDatabase omits these), infer them from the cpp file path.
         if not def_paths and dev_root_for_fallback:

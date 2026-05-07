@@ -44,7 +44,7 @@ local _CONTEXT_TTL = _ue_cfg.get("context.ttl_s") or 30 -- seconds (filesystem w
 -- The path/file/process helpers below were extracted to `lua/ue/core/{fs,proc}`
 -- in Phase B of the multi-platform migration. Each helper is rebound here as
 -- a `local function` whose body forwards to the extracted module — keeping
--- every existing call site (`norm(...)`, `join(...)`, `is_file(...)`, etc.)
+-- every existing call site (`norm(...)`, `join(...)`, `_ufs.is_file(...)`, etc.)
 -- byte-for-byte equivalent.
 --
 -- Constraint: a single Lua chunk is capped at 200 locals, and the original
@@ -54,73 +54,17 @@ local _CONTEXT_TTL = _ue_cfg.get("context.ttl_s") or 30 -- seconds (filesystem w
 -- local — module table lookups happen inside each wrapper body where they
 -- do not occupy chunk-level slots.
 
-local function trim(value)
-  return require("ue.core.fs").trim(value)
-end
+-- Cached module tables (was 17 single-line wrappers; compacted to save LuaJIT local slots).
+local _ufs = require("ue.core.fs")
+local _uproc = require("ue.core.proc")
+local _uplat = require("utils.platform")
 
-local function norm(path)
-  return require("ue.core.fs").norm(path)
-end
+-- High-frequency aliases (kept short for readability).
+local trim = _ufs.trim
+local norm = _ufs.norm
+local cwd = _ufs.cwd
+local join = _ufs.join
 
-local function cwd()
-  return require("ue.core.fs").cwd()
-end
-
-local function join(...)
-  return require("ue.core.fs").join(...)
-end
-
-local function dirname(path)
-  return require("ue.core.fs").dirname(path)
-end
-
-local function is_dir(path)
-  return require("ue.core.fs").is_dir(path)
-end
-
-local function is_file(path)
-  return require("ue.core.fs").is_file(path)
-end
-
-local function ensure_dir(path)
-  return require("ue.core.fs").ensure_dir(path)
-end
-
-local function file_stat(path)
-  return require("ue.core.fs").file_stat(path)
-end
-
-local function file_mtime(path)
-  return require("ue.core.fs").file_mtime(path)
-end
-
-local function path_has_prefix(path, prefix)
-  return require("ue.core.fs").path_has_prefix(path, prefix)
-end
-
-local function is_absolute_path(path)
-  return require("ue.core.fs").is_absolute_path(path)
-end
-
-local function split_path(path)
-  return require("ue.core.fs").split_path(path)
-end
-
-local function common_ancestor(paths)
-  return require("ue.core.fs").common_ancestor(paths)
-end
-
-local function relative_to(root, path)
-  return require("ue.core.fs").relative_to(root, path)
-end
-
-local function first_executable(candidates)
-  return require("ue.core.proc").first_executable(candidates)
-end
-
-local function is_native_windows()
-  return require("utils.platform").is_windows
-end
 
 local function focus_window(win)
   if not win or not vim.api.nvim_win_is_valid(win) then
@@ -203,7 +147,7 @@ local function parse_global_entries(root, lines)
     local file, lnum, text = line:match("^(.-):(%d+):(.*)$")
     if file and lnum then
       file = norm(file)
-      if not is_absolute_path(file) then
+      if not _ufs.is_absolute_path(file) then
         file = join(root, file)
       end
       table.insert(entries, {
@@ -266,7 +210,7 @@ local function resolve_output_path(root, path)
   if path == "" then
     return ""
   end
-  if not is_absolute_path(path) and root and root ~= "" then
+  if not _ufs.is_absolute_path(path) and root and root ~= "" then
     path = join(root, path)
   end
   return path
@@ -305,7 +249,7 @@ local function extract_quoted_path(line)
     [['(/[^']+)']],
   }) do
     local candidate = line:match(pattern)
-    if candidate and is_absolute_path(candidate) then
+    if candidate and _ufs.is_absolute_path(candidate) then
       return norm(candidate)
     end
   end
@@ -673,7 +617,7 @@ end
 local find_engine_root
 
 function M.clangd_cmd(root_dir)
-  local clangd = first_executable(clangd_candidates(root_dir or cwd())) or "clangd"
+  local clangd = _uproc.first_executable(clangd_candidates(root_dir or cwd())) or "clangd"
 
   -- Adaptive -j: clangd preambles for UE TUs cost 1.5–3 GB each. With
   -- --pch-storage=memory + N parallel workers, peak memory ~= N * 2 GB.
@@ -725,7 +669,7 @@ function M.clangd_cmd(root_dir)
     if engine_root then
       local cc_path = join(engine_root, "compile_commands.json")
       local cc_mtime = 0
-      if is_file(cc_path) then
+      if _ufs.is_file(cc_path) then
         table.insert(cmd, "--compile-commands-dir=" .. engine_root)
         local st = vim.uv.fs_stat(cc_path)
         cc_mtime = st and st.mtime and st.mtime.sec or 0
@@ -742,7 +686,7 @@ function M.clangd_cmd(root_dir)
         cache_paths(engine_root).full_index,
       }
       for _, idx_path in ipairs(idx_candidates) do
-        if is_file(idx_path) then
+        if _ufs.is_file(idx_path) then
           local st = vim.uv.fs_stat(idx_path)
           local idx_mtime = st and st.mtime and st.mtime.sec or 0
           if cc_mtime == 0 or idx_mtime >= cc_mtime then
@@ -782,7 +726,7 @@ local function run_lines(cmd, opts)
   if vim.system then
     local system_opts = { text = true }
     local cwd_path = norm(trim(opts.cwd))
-    if cwd_path ~= "" and is_dir(cwd_path) then
+    if cwd_path ~= "" and _ufs.is_dir(cwd_path) then
       system_opts.cwd = cwd_path
     end
     if type(opts.env) == "table" and next(opts.env) ~= nil then
@@ -818,7 +762,7 @@ do
 
     local system_opts = { text = true }
     local cwd_path = norm(trim(opts.cwd))
-    if cwd_path ~= "" and is_dir(cwd_path) then
+    if cwd_path ~= "" and _ufs.is_dir(cwd_path) then
       system_opts.cwd = cwd_path
     end
     if type(opts.env) == "table" and next(opts.env) ~= nil then
@@ -838,7 +782,7 @@ do
 end
 
 local function write_all(path, content)
-  ensure_dir(dirname(path))
+  _ufs.ensure_dir(_ufs.dirname(path))
   local file, err = io.open(path, "wb")
   if not file then
     require("utils.log").notify_error("ue.io", "write_all failed: " .. (err or path))
@@ -860,7 +804,7 @@ local function read_all(path)
 end
 
 local function write_lines(path, lines)
-  ensure_dir(dirname(path))
+  _ufs.ensure_dir(_ufs.dirname(path))
   vim.fn.writefile(lines, path)
 end
 
@@ -973,7 +917,7 @@ end
 
 local function solution_configuration_data(project_root, uproject)
   project_root = norm(project_root)
-  if project_root == "" or not is_dir(project_root) then
+  if project_root == "" or not _ufs.is_dir(project_root) then
     return nil
   end
 
@@ -1053,13 +997,13 @@ local function resolve_project_input(path)
   end
 
   if path:match("%.uproject$") then
-    if not is_file(path) then
+    if not _ufs.is_file(path) then
       return nil, nil, "Project file not found: " .. path
     end
-    return dirname(path), path, nil
+    return _ufs.dirname(path), path, nil
   end
 
-  if not is_dir(path) then
+  if not _ufs.is_dir(path) then
     return nil, nil, "Project directory not found: " .. path
   end
 
@@ -1077,13 +1021,13 @@ local function detect_project_root_from_path(path)
     return nil, nil
   end
 
-  local dir = is_file(path) and dirname(path) or path
+  local dir = _ufs.is_file(path) and _ufs.dirname(path) or path
   while dir ~= "" do
     local uproject = find_uproject_in_dir(dir)
     if uproject then
       return dir, uproject
     end
-    local parent = dirname(dir)
+    local parent = _ufs.dirname(dir)
     if parent == dir then
       break
     end
@@ -1110,7 +1054,7 @@ local function is_engine_root(dir)
   }
 
   for _, path in ipairs(required) do
-    if not is_dir(path) then
+    if not _ufs.is_dir(path) then
       return false
     end
   end
@@ -1124,7 +1068,7 @@ function find_engine_root(path)
     return nil
   end
 
-  local start_dir = is_file(path) and dirname(path) or path
+  local start_dir = _ufs.is_file(path) and _ufs.dirname(path) or path
   if CORE_RT.engine_root_cache[start_dir] ~= nil then
     local cached = CORE_RT.engine_root_cache[start_dir]
     return cached ~= false and cached or nil
@@ -1148,7 +1092,7 @@ function find_engine_root(path)
       end
       return dir
     end
-    local parent = dirname(dir)
+    local parent = _ufs.dirname(dir)
     if parent == dir then
       break
     end
@@ -1252,7 +1196,7 @@ end
 
 local function read_state(engine_root)
   local paths = cache_paths(engine_root)
-  if not is_file(paths.state) then
+  if not _ufs.is_file(paths.state) then
     return {}
   end
 
@@ -1269,7 +1213,7 @@ end
 
 local function persist_project(engine_root, project_root, uproject)
   local paths = cache_paths(engine_root)
-  ensure_dir(paths.cache)
+  _ufs.ensure_dir(paths.cache)
 
   -- Merge into existing state to preserve extra fields (android_package, etc.)
   local existing = read_state(engine_root)
@@ -1283,7 +1227,7 @@ end
 
 local function update_state_field(engine_root, key, value)
   local paths = cache_paths(engine_root)
-  ensure_dir(paths.cache)
+  _ufs.ensure_dir(paths.cache)
   local existing = read_state(engine_root)
   existing[key] = value
   existing.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
@@ -1354,7 +1298,7 @@ local function resolve_context(opts)
 
   if not project_root and state_project_root then
     for _, candidate in ipairs(candidates) do
-      if candidate ~= "" and path_has_prefix(candidate, state_project_root) then
+      if candidate ~= "" and _ufs.path_has_prefix(candidate, state_project_root) then
         project_root = state_project_root
         uproject = state_uproject
         break
@@ -1383,8 +1327,8 @@ local function resolve_context(opts)
       project_root = state_project_root
       uproject = state_uproject
     else
-      local cwd_in_engine = cur_cwd ~= "" and path_has_prefix(cur_cwd, engine_root)
-      local buf_in_engine = cur_buf ~= "" and path_has_prefix(cur_buf, engine_root)
+      local cwd_in_engine = cur_cwd ~= "" and _ufs.path_has_prefix(cur_cwd, engine_root)
+      local buf_in_engine = cur_buf ~= "" and _ufs.path_has_prefix(cur_buf, engine_root)
       if cwd_in_engine or buf_in_engine then
         project_root = state_project_root
         uproject = state_uproject
@@ -1598,7 +1542,7 @@ M.GLOBS_ALL = vim.tbl_map(function(ext) return "*." .. ext end, M.FT_ALL)
 local function existing_relative_dirs(root, search_paths)
   local dirs = {}
   for _, search_path in ipairs(search_paths or {}) do
-    if is_dir(join(root, search_path)) then
+    if _ufs.is_dir(join(root, search_path)) then
       table.insert(dirs, search_path)
     end
   end
@@ -1650,7 +1594,7 @@ local function picker_search_dirs(ctx)
 
   local function add(path)
     path = norm(path)
-    if path ~= "" and is_dir(path) and not seen[path] then
+    if path ~= "" and _ufs.is_dir(path) and not seen[path] then
       seen[path] = true
       table.insert(dirs, path)
     end
@@ -1675,17 +1619,17 @@ local function plugin_scope_from_root(root, path)
   end
 
   local plugins_root = join(root, "Plugins")
-  if not path_has_prefix(path, plugins_root) then
+  if not _ufs.path_has_prefix(path, plugins_root) then
     return nil
   end
 
-  local parts = split_path(relative_to(plugins_root, path))
+  local parts = _ufs.split_path(_ufs.relative_to(plugins_root, path))
   if #parts == 0 then
     return nil
   end
 
   local plugin_root = join(plugins_root, parts[1])
-  if not is_dir(plugin_root) then
+  if not _ufs.is_dir(plugin_root) then
     return nil
   end
 
@@ -1705,17 +1649,17 @@ local function project_module_scope(project_root, path)
   end
 
   local source_root = join(project_root, "Source")
-  if not path_has_prefix(path, source_root) then
+  if not _ufs.path_has_prefix(path, source_root) then
     return nil
   end
 
-  local parts = split_path(relative_to(source_root, path))
+  local parts = _ufs.split_path(_ufs.relative_to(source_root, path))
   if #parts == 0 then
     return nil
   end
 
   local module_root = join(source_root, parts[1])
-  if not is_dir(module_root) then
+  if not _ufs.is_dir(module_root) then
     return nil
   end
 
@@ -1735,17 +1679,17 @@ local function engine_module_scope(engine_root, path)
   end
 
   local source_root = join(engine_root, "Engine", "Source")
-  if not path_has_prefix(path, source_root) then
+  if not _ufs.path_has_prefix(path, source_root) then
     return nil
   end
 
-  local parts = split_path(relative_to(source_root, path))
+  local parts = _ufs.split_path(_ufs.relative_to(source_root, path))
   if #parts < 2 then
     return nil
   end
 
   local module_root = join(source_root, parts[1], parts[2])
-  if not is_dir(module_root) then
+  if not _ufs.is_dir(module_root) then
     return nil
   end
 
@@ -1843,7 +1787,7 @@ end
 
 local function read_json_file(path, default)
   default = default or {}
-  if not is_file(path) then
+  if not _ufs.is_file(path) then
     return vim.deepcopy(default)
   end
   local content = read_all(path)
@@ -1906,7 +1850,7 @@ local function unity_locate_module_root(engine_root, project_root, name)
 
   local function check(candidate)
     candidate = norm(candidate)
-    if candidate ~= "" and is_dir(candidate) then
+    if candidate ~= "" and _ufs.is_dir(candidate) then
       return candidate
     end
     return nil
@@ -2041,7 +1985,7 @@ local function locate_engine_module_root(engine_root, name)
   if type(matches) == "table" then
     for _, match in ipairs(matches) do
       local candidate = norm(match)
-      if is_dir(candidate) then
+      if _ufs.is_dir(candidate) then
         return candidate
       end
     end
@@ -2081,7 +2025,7 @@ local function save_index_state(ctx, state)
   local key = status_root_key(ctx)
   INDEX_RT.module_state[key] = state
   INDEX_RT.contexts[key] = ctx
-  ensure_dir(ctx.paths.index_dir)
+  _ufs.ensure_dir(ctx.paths.index_dir)
   write_json_file(ctx.paths.index_state, state)
   write_json_file(ctx.paths.index_queue, state.queue or {})
 end
@@ -2296,11 +2240,11 @@ end
 
 INDEX_FN.base_compile_commands_path = function(ctx)
   local path = join(ctx.engine_root, "compile_commands.json")
-  if is_file(path) then
+  if _ufs.is_file(path) then
     return path
   end
   path = join(ctx.engine_root, "Engine", "compile_commands.json")
-  if is_file(path) then
+  if _ufs.is_file(path) then
     return path
   end
   return nil
@@ -2312,7 +2256,7 @@ INDEX_FN.normalize_cdb_file = function(entry)
   end
   local file = norm(entry.file or "")
   local dir = norm(entry.directory or "")
-  if file ~= "" and not is_absolute_path(file) and dir ~= "" then
+  if file ~= "" and not _ufs.is_absolute_path(file) and dir ~= "" then
     file = join(dir, file)
   end
   return norm(file)
@@ -2404,7 +2348,7 @@ INDEX_FN.write_subset_compile_commands = function(ctx, phase)
   end
 
   local out_cdb = INDEX_FN.index_phase_paths(ctx, phase)
-  ensure_dir(ctx.paths.index_cdb_dir)
+  _ufs.ensure_dir(ctx.paths.index_cdb_dir)
   write_json_file(out_cdb, subset)
   return out_cdb, selected_keys, nil
 end
@@ -2462,10 +2406,10 @@ end
 
 INDEX_FN.promote_active_index = function(ctx, src_path)
   src_path = norm(src_path)
-  if src_path == "" or not is_file(src_path) then
+  if src_path == "" or not _ufs.is_file(src_path) then
     return false
   end
-  ensure_dir(ctx.paths.active_index_dir)
+  _ufs.ensure_dir(ctx.paths.active_index_dir)
   local content = read_all(src_path)
   if not content or content == "" then
     return false
@@ -2504,7 +2448,7 @@ INDEX_FN.build_phase_async = function(ctx, phase)
   -- `_sre.MAGIC mismatch` from the stdlib loader. Absolute path + scrubbed
   -- env is the only reliable combo.
   local python
-  if is_native_windows() then
+  if _uplat.is_windows then
     -- Probe well-known per-user / system Python 3.12 install locations.
     -- Falls back to PATH `python` if nothing matches (caller can override
     -- via UE_PYTHON env var for non-standard installs).
@@ -2516,22 +2460,22 @@ INDEX_FN.build_phase_async = function(ctx, phase)
       "C:/Python313/python.exe",
     }
     for _, p in ipairs(candidates) do
-      if p and p ~= "" and is_file(p) then python = p; break end
+      if p and p ~= "" and _ufs.is_file(p) then python = p; break end
     end
     python = python or "python"
   else
     python = "python3"
   end
   local build_script = vim.fn.stdpath("config") .. "/tools/build_clangd_index.py"
-  if not is_file(build_script) then
+  if not _ufs.is_file(build_script) then
     return false, "build_clangd_index.py not found"
   end
 
   local _, out_idx = INDEX_FN.index_phase_paths(ctx, phase)
-  if is_file(out_idx) then
+  if _ufs.is_file(out_idx) then
     pcall(vim.fn.delete, out_idx)
   end
-  local indexer = first_executable({
+  local indexer = _uproc.first_executable({
     "/mnt/c/Program Files/LLVM/bin/clangd-indexer.exe",
     "clangd-indexer",
     "clangd-indexer.exe",
@@ -2597,7 +2541,7 @@ INDEX_FN.build_phase_async = function(ctx, phase)
       local live_state = ensure_index_state(ctx)
       INDEX_RT.job = nil
       local stderr = trim((result.stderr or "") .. "\n" .. (result.stdout or ""))
-      local ok_result = (result.code == 0) and is_file(out_idx)
+      local ok_result = (result.code == 0) and _ufs.is_file(out_idx)
       -- Persist per-phase timing so :UEIndexTimings (and post-mortem
       -- inspection of state.json) can answer "how long did the last
       -- :UEIndexFull take" without relying on console output.
@@ -2824,7 +2768,7 @@ local function mode_token(ctx)
 end
 
 local function count_cached_entries(path)
-  if not is_file(path) then
+  if not _ufs.is_file(path) then
     return 0
   end
   local ok, lines = pcall(vim.fn.readfile, path)
@@ -2837,7 +2781,7 @@ end
 local function db_ready(db_dir)
   for _, name in ipairs({ "GTAGS", "GRTAGS", "GPATH" }) do
     local path = join(db_dir, name)
-    if not is_file(path) or vim.fn.getfsize(path) <= 0 then
+    if not _ufs.is_file(path) or vim.fn.getfsize(path) <= 0 then
       return false
     end
   end
@@ -2854,7 +2798,7 @@ local function prepare_cache_ready(ctx)
     ctx.paths.workspace_list,
     ctx.paths.workspace_all_list,
   }) do
-    if not is_file(path) then
+    if not _ufs.is_file(path) then
       return false
     end
   end
@@ -2912,7 +2856,7 @@ local function index_status_token(ctx)
   else
     local outputs = index_output_paths(ctx)
     for _, path in ipairs(outputs) do
-      if file_mtime(path) <= 0 then
+      if _ufs.file_mtime(path) <= 0 then
         token = "IDX?"
         break
       end
@@ -2979,7 +2923,7 @@ local function set_prepare_running(value)
 end
 
 local function scan_relative_files(root, search_paths)
-  local fd = first_executable({ "fd", "fdfind" })
+  local fd = _uproc.first_executable({ "fd", "fdfind" })
   if not fd then
     return nil, "fd/fdfind not found in PATH"
   end
@@ -2987,7 +2931,7 @@ local function scan_relative_files(root, search_paths)
   local cmd = { fd, "--type", "f", "--hidden", "--follow" }
   local found = false
   for _, search_path in ipairs(search_paths) do
-    if is_dir(join(root, search_path)) then
+    if _ufs.is_dir(join(root, search_path)) then
       found = true
       table.insert(cmd, "--search-path")
       table.insert(cmd, search_path)
@@ -3008,7 +2952,7 @@ end
 
 -- Async version: calls cb(lines, err) on vim.schedule when done.
 local function scan_relative_files_async(root, search_paths, cb)
-  local fd = first_executable({ "fd", "fdfind" })
+  local fd = _uproc.first_executable({ "fd", "fdfind" })
   if not fd then
     vim.schedule(function() cb(nil, "fd/fdfind not found in PATH") end)
     return
@@ -3017,7 +2961,7 @@ local function scan_relative_files_async(root, search_paths, cb)
   local cmd = { fd, "--type", "f", "--hidden", "--follow" }
   local found = false
   for _, search_path in ipairs(search_paths) do
-    if is_dir(join(root, search_path)) then
+    if _ufs.is_dir(join(root, search_path)) then
       found = true
       table.insert(cmd, "--search-path")
       table.insert(cmd, search_path)
@@ -3049,7 +2993,7 @@ end
 
 local function clean_db_dir(dir)
   pcall(vim.fn.delete, dir, "rf")
-  ensure_dir(dir)
+  _ufs.ensure_dir(dir)
 end
 
 local function glob_paths(pattern)
@@ -3094,12 +3038,12 @@ local function cleanup_gradle_debug_artifacts(ctx)
 end
 
 local function build_gtags_db(root, filelist, db_dir, label)
-  local gtags = first_executable({ "gtags" })
+  local gtags = _uproc.first_executable({ "gtags" })
   if not gtags then
     return false, "gtags not found in PATH"
   end
 
-  if not is_file(filelist) or vim.fn.getfsize(filelist) <= 0 then
+  if not _ufs.is_file(filelist) or vim.fn.getfsize(filelist) <= 0 then
     clean_db_dir(db_dir)
     return true, label .. ": no files to index"
   end
@@ -3118,7 +3062,7 @@ local function build_gtags_db(root, filelist, db_dir, label)
   if source:sub(1, 1) == "@" then source = source:sub(2) end
   local plugin_root = norm(vim.fn.fnamemodify(source, ":h:h"))
   local conf_path = plugin_root ~= "" and (plugin_root .. "/tools/gtags/gtags.conf") or ""
-  if conf_path ~= "" and is_file(conf_path) then
+  if conf_path ~= "" and _ufs.is_file(conf_path) then
     env = {
       GTAGSCONF = conf_path,
       GTAGSLABEL = "hlsl-cpp",
@@ -3175,7 +3119,7 @@ local function rg_code_definition_search(ctx, symbol)
     return false
   end
 
-  local rg = first_executable({ "rg" })
+  local rg = _uproc.first_executable({ "rg" })
   if not rg then
     return false
   end
@@ -3184,7 +3128,7 @@ local function rg_code_definition_search(ctx, symbol)
   local seen = {}
   local function add_dir(dir)
     dir = norm(dir)
-    if dir ~= "" and is_dir(dir) and not seen[dir] then
+    if dir ~= "" and _ufs.is_dir(dir) and not seen[dir] then
       seen[dir] = true
       dirs[#dirs + 1] = dir
     end
@@ -3222,7 +3166,7 @@ local function rg_code_definition_search(ctx, symbol)
 
   local cwd = ctx.engine_root
   if ctx.project_root and ctx.project_root ~= "" then
-    local root = common_ancestor({ ctx.engine_root, ctx.project_root })
+    local root = _ufs.common_ancestor({ ctx.engine_root, ctx.project_root })
     if root ~= "" then
       cwd = root
     end
@@ -3402,7 +3346,7 @@ end
 
 local function windows_host_cwd()
   for _, candidate in ipairs({ "/mnt/c/Windows", "/mnt/c" }) do
-    if is_dir(candidate) then
+    if _ufs.is_dir(candidate) then
       return candidate
     end
   end
@@ -3439,7 +3383,7 @@ end
 
 local function direct_ubt_command(engine_root, args)
   local exe = ubt_exe_path(engine_root)
-  if not is_file(exe) then
+  if not _ufs.is_file(exe) then
     return nil, "UnrealBuildTool.exe not found under engine root: " .. exe
   end
 
@@ -3488,7 +3432,7 @@ local function build_bat_windows_command(engine_root, args)
     table.insert(direct_parts, direct_cmd_token(arg))
   end
 
-  if is_native_windows() then
+  if _uplat.is_windows then
     return { "cmd.exe", "/d", "/c", table.concat(direct_parts, " ") }
   end
 
@@ -3500,7 +3444,7 @@ local function build_bat_windows_command(engine_root, args)
     table.insert(parts, shell_cmd_token(arg))
   end
 
-  local shell = first_executable({ "zsh", "bash", "sh" })
+  local shell = _uproc.first_executable({ "zsh", "bash", "sh" })
   if not shell then
     return { "cmd.exe", "/d", "/c", table.concat(direct_parts, " ") }
   end
@@ -3580,7 +3524,7 @@ local function scan_shader_files(root, search_paths)
         for _, absolute in ipairs(glob_paths(pattern)) do
           local normalized = norm(absolute)
           local key = normalized:lower()
-          if is_file(normalized) and not seen[key] then
+          if _ufs.is_file(normalized) and not seen[key] then
             seen[key] = true
             table.insert(files, normalized)
           end
@@ -3599,7 +3543,7 @@ local function shader_search_dirs(ctx)
   local function add(path)
     path = norm(path)
     local key = path:lower()
-    if path ~= "" and is_dir(path) and not seen[key] then
+    if path ~= "" and _ufs.is_dir(path) and not seen[key] then
       seen[key] = true
       table.insert(dirs, path)
     end
@@ -3672,7 +3616,7 @@ local function collect_shader_definition_entries(entries, seen, file, lines, sym
 end
 
 local function rg_shader_definition_entries(dirs, symbol, seen_files)
-  local rg = first_executable({ "rg" })
+  local rg = _uproc.first_executable({ "rg" })
   if not rg or #dirs == 0 then
     return nil
   end
@@ -3708,7 +3652,7 @@ local function rg_shader_definition_entries(dirs, symbol, seen_files)
     local file, lnum, text = tostring(line):match("^(.-):(%d+):(.*)$")
     if file and lnum then
       file = norm(file)
-      if not is_absolute_path(file) then
+      if not _ufs.is_absolute_path(file) then
         file = norm(file)
       end
       local key = file:lower()
@@ -3747,7 +3691,7 @@ local function shader_definition_search(ctx, symbol)
     return finalize(entries)
   end
 
-  local current_dir = dirname(current)
+  local current_dir = _ufs.dirname(current)
   local seen_files = { [current:lower()] = true }
   local same_dir_entries = rg_shader_definition_entries({ current_dir }, symbol, seen_files) or {}
   if #same_dir_entries > 0 then
@@ -4061,11 +4005,11 @@ local function extract_unity_includes(unity_file, engine_source_dir)
       abs = norm(inc_path)
     else
       abs = norm(join(engine_source_dir, inc_path))
-      if not is_file(abs) then
-        abs = norm(join(dirname(unity_file), inc_path))
+      if not _ufs.is_file(abs) then
+        abs = norm(join(_ufs.dirname(unity_file), inc_path))
       end
     end
-    if is_file(abs) then
+    if _ufs.is_file(abs) then
       includes[#includes + 1] = abs
     end
   end
@@ -4076,19 +4020,19 @@ local function extract_unity_includes(unity_file, engine_source_dir)
 end
 
 local function collect_rsp_files(ctx)
-  local fd = first_executable({ "fd", "fdfind" })
+  local fd = _uproc.first_executable({ "fd", "fdfind" })
   if not fd then
     return nil, "fd/fdfind not found in PATH"
   end
 
   local search_roots = {}
   local engine_build = join(ctx.engine_root, "Engine", "Intermediate", "Build")
-  if is_dir(engine_build) then
+  if _ufs.is_dir(engine_build) then
     search_roots[#search_roots + 1] = engine_build
   end
   if ctx.project_root and ctx.project_root ~= "" then
     local project_build = join(ctx.project_root, "Intermediate", "Build")
-    if is_dir(project_build) then
+    if _ufs.is_dir(project_build) then
       search_roots[#search_roots + 1] = project_build
     end
   end
@@ -4396,7 +4340,7 @@ local function generate_compile_commands(ctx)
   -- vs RSP-based generation which may miss entries or have subtly wrong paths.
   local targets = compile_commands_targets(ctx)
   for _, target in ipairs(targets) do
-    if is_file(target) and vim.fn.getfsize(target) > 1024 then
+    if _ufs.is_file(target) and vim.fn.getfsize(target) > 1024 then
       slim_compile_commands_file(target)
       run_compile_commands_pipeline(target, targets)
       return true, target .. " (UBT, existing)"
@@ -4443,7 +4387,7 @@ local function generate_compile_commands(ctx)
     end
 
     local build_bat_file = build_bat_path(engine_root_win)
-    if not is_windows_path(build_bat_file) and not is_file(build_bat_file) then
+    if not is_windows_path(build_bat_file) and not _ufs.is_file(build_bat_file) then
       return false, "Build.bat not found under engine root: " .. build_bat_file
     end
 
@@ -4543,7 +4487,7 @@ local function android_build_command(ctx)
     end
 
     local build_bat_file = build_bat_path(engine_root_win)
-    if not is_windows_path(build_bat_file) and not is_file(build_bat_file) then
+    if not is_windows_path(build_bat_file) and not _ufs.is_file(build_bat_file) then
       return nil, "Build.bat not found under engine root: " .. build_bat_file
     end
 
@@ -4725,7 +4669,7 @@ end
 
 local function workspace_root(ctx)
   if ctx.project_root and ctx.project_root ~= "" then
-    local root = common_ancestor({ ctx.engine_root, ctx.project_root })
+    local root = _ufs.common_ancestor({ ctx.engine_root, ctx.project_root })
     if root ~= "" then
       return root
     end
@@ -4744,12 +4688,12 @@ local function cached_file_list_info(opts, list_type)
   end
 
   local list_path = list_type == "code" and ctx.paths.workspace_list or ctx.paths.workspace_all_list
-  if list_type == "all" and not is_file(list_path) and is_file(ctx.paths.workspace_list) then
+  if list_type == "all" and not _ufs.is_file(list_path) and _ufs.is_file(ctx.paths.workspace_list) then
     -- Older caches may not have workspace_all.files yet. Fall back to the
     -- code-only list so picker startup stays fast until :UEPrepare refreshes.
     list_path = ctx.paths.workspace_list
   end
-  if not is_file(list_path) then
+  if not _ufs.is_file(list_path) then
     return nil, "No cached file list (run :UEPrepare first)"
   end
 
@@ -4769,7 +4713,7 @@ local function read_cached_paths(list_path, root)
   for _, line in ipairs(lines) do
     line = trim(line)
     if line ~= "" then
-      if is_absolute_path(line) then
+      if _ufs.is_absolute_path(line) then
         files[#files + 1] = line
       else
         files[#files + 1] = join(root, line)
@@ -4873,7 +4817,7 @@ function M.cached_files(opts)
     return nil
   end
 
-  local rg = first_executable({ "rg" })
+  local rg = _uproc.first_executable({ "rg" })
   if not rg then
     return nil
   end
@@ -4902,7 +4846,7 @@ function M.cached_files(opts)
             end
             item.text = text
             item.file = text
-            if is_absolute_path(text) then
+            if _ufs.is_absolute_path(text) then
               item.cwd = nil
             else
               item.cwd = info.root
@@ -5359,7 +5303,7 @@ function M.cached_grep(opts)
     return nil
   end
 
-  local rg = first_executable({ "rg" })
+  local rg = _uproc.first_executable({ "rg" })
   if not rg then
     return nil
   end
@@ -5641,7 +5585,7 @@ function M.clangd_root(bufnr)
   local bufname = norm(vim.api.nvim_buf_get_name(bufnr))
   local engine_root = find_engine_root(bufname) or current_engine_root(bufname)
   if engine_root then
-    if bufname == "" or path_has_prefix(bufname, engine_root) then
+    if bufname == "" or _ufs.path_has_prefix(bufname, engine_root) then
       return engine_root
     end
     -- Pass the bufname through so resolve_context picks up the buffer's
@@ -5649,10 +5593,10 @@ function M.clangd_root(bufnr)
     -- and for background buffers (lsp may invoke clangd_root for a buf
     -- other than the current one).
     local ctx = resolve_context({ bufname = bufname })
-    if ctx and ctx.project_root and path_has_prefix(bufname, ctx.project_root) then
+    if ctx and ctx.project_root and _ufs.path_has_prefix(bufname, ctx.project_root) then
       return ctx.engine_root
     end
-    if path_has_prefix(cwd(), engine_root) then
+    if _ufs.path_has_prefix(cwd(), engine_root) then
       return engine_root
     end
   end
@@ -5748,7 +5692,7 @@ do
       return
     end
 
-    local rg = first_executable({ "rg" })
+    local rg = _uproc.first_executable({ "rg" })
     if not rg then
       on_done(false)
       return
@@ -5758,7 +5702,7 @@ do
     local seen = {}
     local function add_dir(dir)
       dir = norm(dir)
-      if dir ~= "" and is_dir(dir) and not seen[dir] then
+      if dir ~= "" and _ufs.is_dir(dir) and not seen[dir] then
         seen[dir] = true
         dirs[#dirs + 1] = dir
       end
@@ -5792,7 +5736,7 @@ do
 
     local cwd = ctx.engine_root
     if ctx.project_root and ctx.project_root ~= "" then
-      local root = common_ancestor({ ctx.engine_root, ctx.project_root })
+      local root = _ufs.common_ancestor({ ctx.engine_root, ctx.project_root })
       if root ~= "" then
         cwd = root
       end
@@ -5948,9 +5892,9 @@ end
 local function open_cheatsheet(opts)
   opts = opts or {}
   local path = cheatsheet_path()
-  ensure_dir(dirname(path))
+  _ufs.ensure_dir(_ufs.dirname(path))
 
-  if not is_file(path) then
+  if not _ufs.is_file(path) then
     vim.notify("Cheatsheet file missing: " .. path, vim.log.levels.WARN)
   end
 
@@ -6463,7 +6407,7 @@ local function prepare()
     persist_project(ctx.engine_root, ctx.project_root, ctx.uproject)
   end
 
-  ensure_dir(ctx.paths.cache)
+  _ufs.ensure_dir(ctx.paths.cache)
 
   local root = workspace_root(ctx)
   if prepare_cache_ready(ctx) then
@@ -6527,7 +6471,7 @@ local function prepare()
 
   for _, path in ipairs(project_code) do
     local absolute = join(ctx.project_root, path)
-    local relative = relative_to(root, absolute)
+    local relative = _ufs.relative_to(root, absolute)
     if not workspace_seen[relative] then
       workspace_seen[relative] = true
       table.insert(workspace_code, relative)
@@ -6536,7 +6480,7 @@ local function prepare()
 
   for _, path in ipairs(engine_code) do
     local absolute = join(ctx.engine_root, path)
-    local relative = relative_to(root, absolute)
+    local relative = _ufs.relative_to(root, absolute)
     if not workspace_seen[relative] then
       workspace_seen[relative] = true
       table.insert(workspace_code, relative)
@@ -6557,7 +6501,7 @@ local function prepare()
 
   for _, path in ipairs(project_all) do
     local absolute = join(ctx.project_root, path)
-    local relative = relative_to(root, absolute)
+    local relative = _ufs.relative_to(root, absolute)
     if not workspace_all_seen[relative] then
       workspace_all_seen[relative] = true
       table.insert(workspace_all, relative)
@@ -6566,7 +6510,7 @@ local function prepare()
 
   for _, path in ipairs(engine_all) do
     local absolute = join(ctx.engine_root, path)
-    local relative = relative_to(root, absolute)
+    local relative = _ufs.relative_to(root, absolute)
     if not workspace_all_seen[relative] then
       workspace_all_seen[relative] = true
       table.insert(workspace_all, relative)
@@ -6689,7 +6633,7 @@ local function prepare_async(opts)
     persist_project(ctx.engine_root, ctx.project_root, ctx.uproject)
   end
 
-  ensure_dir(ctx.paths.cache)
+  _ufs.ensure_dir(ctx.paths.cache)
 
   -- ── Timing & ETA ─────────────────────────────────────────────────────
   -- Load previous run timings for ETA estimation
@@ -6905,7 +6849,7 @@ local function prepare_async(opts)
 
     for _, path in ipairs(project_code) do
       local absolute = join(ctx.project_root, path)
-      local relative = relative_to(root, absolute)
+      local relative = _ufs.relative_to(root, absolute)
       if not workspace_seen[relative] then
         workspace_seen[relative] = true
         table.insert(workspace_code, relative)
@@ -6914,7 +6858,7 @@ local function prepare_async(opts)
 
     for _, path in ipairs(engine_code) do
       local absolute = join(ctx.engine_root, path)
-      local relative = relative_to(root, absolute)
+      local relative = _ufs.relative_to(root, absolute)
       if not workspace_seen[relative] then
         workspace_seen[relative] = true
         table.insert(workspace_code, relative)
@@ -6935,7 +6879,7 @@ local function prepare_async(opts)
 
     for _, path in ipairs(project_all) do
       local absolute = join(ctx.project_root, path)
-      local relative = relative_to(root, absolute)
+      local relative = _ufs.relative_to(root, absolute)
       if not workspace_all_seen[relative] then
         workspace_all_seen[relative] = true
         table.insert(workspace_all, relative)
@@ -6944,7 +6888,7 @@ local function prepare_async(opts)
 
     for _, path in ipairs(engine_all) do
       local absolute = join(ctx.engine_root, path)
-      local relative = relative_to(root, absolute)
+      local relative = _ufs.relative_to(root, absolute)
       if not workspace_all_seen[relative] then
         workspace_all_seen[relative] = true
         table.insert(workspace_all, relative)
@@ -6973,7 +6917,7 @@ local function prepare_async(opts)
     update(("indexing %d files with gtags..."):format(#workspace_code), 35)
     start_phase()
 
-    local gtags = first_executable({ "gtags" })
+    local gtags = _uproc.first_executable({ "gtags" })
     if not gtags then
       fail("gtags not found in PATH")
       return
@@ -7254,7 +7198,7 @@ local function clear_cache(opts)
     end
   end
   local gtags_dir = join(ctx.paths.cache, "gtags")
-  if is_dir(gtags_dir) then
+  if _ufs.is_dir(gtags_dir) then
     pcall(vim.fn.delete, gtags_dir, "rf")
     table.insert(removed, "  " .. gtags_dir .. "/ (gtags)")
   end
@@ -7266,7 +7210,7 @@ local function clear_cache(opts)
   end
   for _, root in ipairs(clangd_roots) do
     local clangd_cache = join(root, ".cache", "clangd")
-    if is_dir(clangd_cache) then
+    if _ufs.is_dir(clangd_cache) then
       pcall(vim.fn.delete, clangd_cache, "rf")
       table.insert(removed, "  " .. clangd_cache .. "/ (clangd index)")
     end
@@ -7274,7 +7218,7 @@ local function clear_cache(opts)
 
   if bang then
     for _, idx in ipairs({ ctx.paths.active_index, ctx.paths.current_index, ctx.paths.hot_index, ctx.paths.full_index }) do
-      if is_file(idx) then
+      if _ufs.is_file(idx) then
         pcall(vim.fn.delete, idx)
         table.insert(removed, "  " .. idx .. " (offline index)")
       end
@@ -7296,7 +7240,7 @@ local function clear_cache(opts)
     -- the only symptom is "all UE types unknown" — see :UEBuildPCH.
     for _, root in ipairs(clangd_roots) do
       local pch_dir = join(root, ".clangd-pch")
-      if is_dir(pch_dir) then
+      if _ufs.is_dir(pch_dir) then
         pcall(vim.fn.delete, pch_dir, "rf")
         table.insert(removed, "  " .. pch_dir .. "/ (PCH cache)")
       end
@@ -7741,7 +7685,7 @@ function M.setup()
     local bat = nil
     for _, root in ipairs(roots) do
       local candidate = join(root, ".clangd-pch", "build_pch.bat")
-      if is_file(candidate) then bat = candidate; break end
+      if _ufs.is_file(candidate) then bat = candidate; break end
     end
     if not bat then
       vim.notify(

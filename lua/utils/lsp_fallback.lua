@@ -226,7 +226,12 @@ local function jump_to_location(location)
     pcall(dtrace, "jump: REJECTED bogus location, restoring cursor to %d:%d", pre_cur[1], pre_cur[2])
     pcall(vim.api.nvim_set_current_buf, pre_buf)
     pcall(vim.api.nvim_win_set_cursor, 0, pre_cur)
-    return false
+    -- Sentinel string so callers can distinguish "reconcile rejected as
+    -- hallucination" from "open failed / generic false". Quickfix
+    -- fallback should NOT be offered for rejected_bogus — the candidate
+    -- list IS the bogus answer; presenting it as a menu is worse than
+    -- telling the user "no reliable definition".
+    return "rejected_bogus"
   end
 
   local cur = vim.api.nvim_win_get_cursor(0)
@@ -514,14 +519,23 @@ function M.definition()
         dtrace("precise: syntax_filter applied=%s K=%s before=%d after=%d skipped=%s",
           tostring(fi.applied), tostring(fi.call_arity), fi.before, fi.after, tostring(fi.skipped))
 
+        -- Track whether precise's single attempt was rejected as bogus
+        -- (reconcile HARD-MISS). When true AND no other candidates exist,
+        -- we must NOT fall through to the quickfix list — the candidate
+        -- list IS the bogus answer. Showing it as a menu confuses users
+        -- ("clangd told me it can't find this, why am I picking from a
+        -- list of fake answers?"). Better UX: report ⊘ no reliable
+        -- definition and let the user fall back to <leader>fG (grep).
+        local precise_rejected = false
+
         if not jumped then
           if #filtered == 1 then
             local winner = filtered[1]
             winner._origin_cword = sym
             winner._sym_name = sym
-            local pok, ok = pcall(jump_to_location, winner)
-            ok = pok and ok
-            dtrace("precise: jump pok=%s ok=%s", tostring(pok), tostring(ok))
+            local pok, ok_or_err = pcall(jump_to_location, winner)
+            local ok = pok and ok_or_err == true
+            dtrace("precise: jump pok=%s ok=%s", tostring(pok), tostring(ok_or_err))
             if ok then
               jumped = true
               local p = location_mod.location_path(winner)
@@ -531,16 +545,19 @@ function M.definition()
               done(string.format("✓ %s → %s (%s)", sym or "?", label, tag), 3000)
               return
             end
+            if pok and ok_or_err == "rejected_bogus" then
+              precise_rejected = true
+            end
           elseif #filtered > 1 then
             -- Try pair_picker before falling to quickfix.
             local pp_winner, pp_rule = pair_picker.pick_safe_winner(filtered)
             if pp_winner then
               pp_winner._origin_cword = sym
               pp_winner._sym_name = sym
-              local pok, ok = pcall(jump_to_location, pp_winner)
-              ok = pok and ok
+              local pok, ok_or_err = pcall(jump_to_location, pp_winner)
+              local ok = pok and ok_or_err == true
               dtrace("precise: pair_picker rule=%s pok=%s ok=%s",
-                tostring(pp_rule), tostring(pok), tostring(ok))
+                tostring(pp_rule), tostring(pok), tostring(ok_or_err))
               if ok then
                 jumped = true
                 local p = location_mod.location_path(pp_winner)
@@ -552,7 +569,23 @@ function M.definition()
                 done(string.format("✓ %s → %s (%s, %d→1)", sym or "?", label, tag, #filtered), 3000)
                 return
               end
+              -- pair_picker chose ONE winner, but jump_to_location
+              -- rejected it as bogus. The remaining filtered[] members
+              -- are no more trustworthy than the rejected one. Treat as
+              -- whole-set rejection.
+              if pok and ok_or_err == "rejected_bogus" then
+                precise_rejected = true
+              end
             end
+          end
+          -- Whole-set rejection short-circuit: don't insult the user
+          -- with a "pick from these wrong answers" menu.
+          if precise_rejected then
+            local tag = fi.applied and "precise·syntax" or "precise"
+            done(string.format(
+              "⊘ %s — clangd's only candidate was rejected as bogus (%s); try <leader>fG to grep",
+              sym or "?", tag), 4000)
+            return
           end
           local sorted = ranking.rerank_locations(filtered, platform_hints, ref_file, receiver)
           local outcome = ui.try_jump(sorted, "LSP definitions")

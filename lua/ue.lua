@@ -2426,7 +2426,25 @@ INDEX_FN.build_phase_async = function(ctx, phase)
     return false, "busy"
   end
 
-  local subset_cdb, selected_keys, err = INDEX_FN.write_subset_compile_commands(ctx, phase)
+  -- Phase split:
+  --   full       → build_full_cdb.py (single entry: rsp + inject + super-unity
+  --                 sidecar + clangd-indexer). Operates on the engine-root
+  --                 base CDB directly; no per-module subset because full == all.
+  --   hot/current → build_clangd_index.py with a per-module subset CDB
+  --                 (per-file entries only — small N, super-unity overhead
+  --                 not worth it).
+  local subset_cdb, selected_keys, err
+  if phase == "full" then
+    selected_keys = {}  -- full has no per-module selection; #selected_keys == 0 is fine
+    local base = INDEX_FN.base_compile_commands_path(ctx)
+    if not base then
+      err = "base compile_commands.json not found at engine root"
+    else
+      subset_cdb = base  -- build_full_cdb.py reads/writes this in place
+    end
+  else
+    subset_cdb, selected_keys, err = INDEX_FN.write_subset_compile_commands(ctx, phase)
+  end
   if not subset_cdb then
     state.build = {
       phase = phase,
@@ -2466,9 +2484,16 @@ INDEX_FN.build_phase_async = function(ctx, phase)
   else
     python = "python3"
   end
-  local build_script = vim.fn.stdpath("config") .. "/tools/build_clangd_index.py"
+
+  local tools_dir = vim.fn.stdpath("config") .. "/tools"
+  local build_script
+  if phase == "full" then
+    build_script = tools_dir .. "/build_full_cdb.py"
+  else
+    build_script = tools_dir .. "/build_clangd_index.py"
+  end
   if not _ufs.is_file(build_script) then
-    return false, "build_clangd_index.py not found"
+    return false, build_script .. " not found"
   end
 
   local _, out_idx = INDEX_FN.index_phase_paths(ctx, phase)
@@ -2481,31 +2506,26 @@ INDEX_FN.build_phase_async = function(ctx, phase)
     "clangd-indexer.exe",
     "C:/Program Files/LLVM/bin/clangd-indexer.exe",
   })
-  local cmd = { python, build_script, subset_cdb, "--output", out_idx }
-  -- Default to unity builds: 1 unity TU subsumes 30-50 individual cpps,
-  -- giving roughly 3-5x faster wall-clock for the same symbol coverage.
-  -- Override via UE_INDEX_NO_UNITY=1 env var (e.g. when UE hasn't been
-  -- built yet so Module.<X>.cpp aggregates don't exist).
-  --
-  -- For :UEIndexFull also enable super-unity by default: groups the ~600-1200
-  -- plain unity TUs into ~13-25 super-TUs by SharedPCH, eliminating per-TU
-  -- ~170 MB SharedPCH re-parse cost. ~50x faster than plain unity for full
-  -- (verified on UnrealEngine: 165min -> 50s end-to-end).
-  -- Skipped automatically for hot/current (which only target a handful of
-  -- modules — super-unity grouping has no meaningful win there and the .cpp
-  -- generation overhead is not amortized).
-  -- Escape hatches:
-  --   UE_INDEX_NO_UNITY=1        -> disable both unity and super-unity
-  --   UE_INDEX_NO_SUPER_UNITY=1  -> keep plain unity, skip super-unity
-  if vim.env.UE_INDEX_NO_UNITY ~= "1" then
-    cmd[#cmd + 1] = "--use-unity"
-    if phase == "full" and vim.env.UE_INDEX_NO_SUPER_UNITY ~= "1" then
-      cmd[#cmd + 1] = "--use-super-unity"
+
+  local cmd
+  if phase == "full" then
+    -- build_full_cdb.py <src> <dst_active> --idx-output <idx>
+    -- Single entry that produces:
+    --   * dst_active           (per-file CDB for LSP, == src in our wiring)
+    --   * dst_active.indexer   (super-unity sidecar for indexer)
+    --   * idx                  (clangd-indexer output, written from sidecar)
+    cmd = { python, build_script, subset_cdb, subset_cdb, "--idx-output", out_idx }
+    if indexer then
+      cmd[#cmd + 1] = "--indexer"
+      cmd[#cmd + 1] = indexer
     end
-  end
-  if indexer then
-    cmd[#cmd + 1] = "--indexer"
-    cmd[#cmd + 1] = indexer
+  else
+    -- hot/current: per-file subset → indexer, no unity/super-unity.
+    cmd = { python, build_script, subset_cdb, "--output", out_idx }
+    if indexer then
+      cmd[#cmd + 1] = "--indexer"
+      cmd[#cmd + 1] = indexer
+    end
   end
 
   state.queue[phase] = nil
@@ -2534,7 +2554,6 @@ INDEX_FN.build_phase_async = function(ctx, phase)
   child_env.PYTHONPATH = ""
   child_env.PYTHONSTARTUP = ""
   local t_build_0 = vim.uv.hrtime()
-  local use_unity = (vim.env.UE_INDEX_NO_UNITY ~= "1")
   vim.system(cmd, { text = true, cwd = ctx.engine_root, env = child_env }, function(result)
     local elapsed_s = (vim.uv.hrtime() - t_build_0) / 1e9
     vim.schedule(function()
@@ -2550,7 +2569,7 @@ INDEX_FN.build_phase_async = function(ctx, phase)
         elapsed_s = math.floor(elapsed_s * 100 + 0.5) / 100,
         modules = #selected_keys,
         status = ok_result and "ready" or "error",
-        unity = use_unity,
+        super_unity = (phase == "full"),
         finished_at = unix_now(),
       }
       if ok_result and INDEX_FN.promote_active_index(ctx, out_idx) then

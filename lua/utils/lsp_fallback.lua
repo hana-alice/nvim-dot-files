@@ -53,7 +53,7 @@ local INSTANT_PRECISE_RECONCILE = true
 -- ---------------------------------------------------------------------------
 -- Persistent debug ring-buffer (Tier 3: lift to ue_goto_dev/trace.lua).
 -- ---------------------------------------------------------------------------
-local MODULE_REVISION = "syntax-filter-v2-pairpicker-spinnerfix"
+local MODULE_REVISION = "precise-first-v1"
 local TRACE_MAX = 200
 local trace_ring = {}
 local trace_idx = 0
@@ -244,7 +244,24 @@ M._test_jump_to_location = jump_to_location
 M._test_reconcile = function(sym, landed) provider.reconcile_landing_to_definition(sym, landed, dtrace) end
 
 -- ---------------------------------------------------------------------------
--- M.definition: 3-track race (instant ws/symbol, precise td/definition, GTAGS)
+-- M.definition: precise-first
+--   1. textDocument/definition (+impl/+decl + retry)  ← always primary
+--   2. workspace/symbol fallback                       ← only when (1) is empty
+--   3. GTAGS                                            ← only when (2) is also empty
+--
+-- Rationale (vs the previous 3-track race):
+--   * The race was: instant ws/symbol vs precise td/definition vs GTAGS;
+--     whichever returned first won. ws/symbol uses fuzzy NAME matching with
+--     no scope/AST context, so for fields/variables/enums it returns ALL
+--     same-named symbols across the workspace and the user gets a candidate
+--     picker even when precise (textDocument/definition) would have a single
+--     unambiguous answer (verified on `bBindlessPrimitive`: precise returns
+--     ONE Location, ws/symbol returns N).
+--   * User decision: precise must ALWAYS win when it has a usable answer.
+--     ws/symbol is for the rare case where the AST cannot resolve the symbol
+--     at all (typos, macro tokens, broken TUs). GTAGS is for after that.
+--   * No reconcile / `<leader>gP` "switch to precise" indirection — there
+--     is no second candidate to switch to, precise IS the answer.
 -- ---------------------------------------------------------------------------
 
 local request_token = 0
@@ -255,15 +272,11 @@ function M.definition()
   local bufnr = vim.api.nvim_get_current_buf()
   local ref_file = location_mod.normalize_path(vim.api.nvim_buf_get_name(bufnr))
   local ref_line = vim.api.nvim_win_get_cursor(0)[1]
-  dtrace("M.definition() called sym=%q recv=%q file=%s:%d",
+  dtrace("M.definition() called sym=%q recv=%q file=%s:%d (precise-first)",
     sym or "", receiver or "",
     vim.fn.fnamemodify(ref_file, ":t"), ref_line)
 
-  -- Early bail #1: cursor IS the definition site of the symbol it sits on
-  -- (e.g. cursor on `FAutoConsoleVariableRef` in `class FAutoConsoleVariableRef
-  -- : private FAutoConsoleObject`). gd here is meaningless and risks landing
-  -- on a sibling overload (forward decl, friend decl, another overload of the
-  -- same name). Don't enter the race.
+  -- Early bail #1: cursor IS the definition site of the symbol it sits on.
   local at_def, def_kind, def_name = symbol_mod.is_at_definition_at_cursor()
   if at_def then
     vim.notify(string.format(
@@ -274,11 +287,7 @@ function M.definition()
     return
   end
 
-  -- Early bail #2: if the cursor sits inside a qualified-name chain rooted at
-  -- a template parameter (dependent name like `TShaderClass::FParameters::
-  -- FTypeInfo::GetStructMetadata`), clangd cannot resolve any segment of
-  -- that chain without instantiation context. Don't waste 30s on retries —
-  -- detect it from the AST and stop immediately.
+  -- Early bail #2: dependent name rooted at template parameter.
   local dep, dep_root, dep_chain = symbol_mod.is_dependent_at_cursor()
   if dep then
     vim.notify(string.format(
@@ -289,14 +298,11 @@ function M.definition()
     return
   end
 
-  -- Clear any stale precise-winner from a previous gd; it's no longer
-  -- relevant once the user invokes gd on something else.
+  -- Stale state from prior gd: clear (kept for backward compat with any
+  -- callers that still poke M._last_precise_winner; precise-first never
+  -- writes to it so it's effectively dead).
   M._last_precise_winner = nil
 
-  -- Aggressively dismiss any prior gd's lingering notice. The previous
-  -- invocation's done()/clear path won't fire (its still_current() returns
-  -- false now) so the spinner notice would visually persist on screen
-  -- until snacks GC. Force-clear the shared slot here.
   if M._active_notice then
     pcall(M._active_notice.clear)
     M._active_notice = nil
@@ -316,23 +322,6 @@ function M.definition()
   end
   local function done(success_msg, lifetime_ms)
     resolved = true
-    -- DESIGN NOTE
-    -- We deliberately DON'T forward success_msg into the spinner notice
-    -- via notice.finish() any more.
-    --
-    -- Why: snacks.notify with `replace=id` has been observed to keep
-    -- displaying the old (spinner) text on screen even after a finish()
-    -- emit() with the new text — race between snacks' internal queue
-    -- update and the next paint, plus the spinner's hide_from_history
-    -- flag interacting with replace semantics. Net effect: the user
-    -- sees "⏳ resolving X ... (instant index path racing precise AST
-    -- path)" lingering on screen *after* the cursor has already jumped
-    -- to the target. That's the visible bug we're fixing here.
-    --
-    -- Treatment: hard-clear any existing spinner FIRST, then emit the
-    -- success text as a brand-new notification with a fresh id. This
-    -- guarantees the user only ever sees the success line — never the
-    -- stale "resolving" text — once a jump has actually happened.
     clear_notice()
     if success_msg then
       pcall(vim.notify, success_msg, vim.log.levels.INFO,
@@ -340,7 +329,7 @@ function M.definition()
     end
   end
 
-  -- Resolve platform hints once.
+  -- Resolve platform hints once (used by ranking when precise returns N).
   local platform_hints = nil
   do
     local ok, ue = pcall(require, "ue")
@@ -352,6 +341,7 @@ function M.definition()
   -- Files clangd cannot answer (shaders, Build.cs, Python): GTAGS-only.
   local ext = ui.buf_extension(bufnr)
   if ui.NON_CLANGD_EXTS[ext] then
+    dtrace("non-clangd ext=%s -> GTAGS direct", tostring(ext))
     provider.gtags_fallback_async(sym, function(ok)
       if not still_current() then return end
       done()
@@ -366,6 +356,7 @@ function M.definition()
   local has_ws_client  = #vim.lsp.get_clients({ bufnr = bufnr, method = "workspace/symbol" }) > 0
 
   if not has_def_client and not has_ws_client then
+    dtrace("no LSP clients -> GTAGS direct")
     provider.gtags_fallback_async(sym, function(ok)
       if not still_current() then return end
       done()
@@ -376,24 +367,15 @@ function M.definition()
     return
   end
 
-  -- Progress notice (only after 600ms, so fast jumps don't flash a spinner).
-  -- We check BOTH `resolved` and `jumped`: by the time this defer fires the
-  -- instant track may have already navigated the cursor but not yet returned
-  -- through done() (microsecond window). Showing a "resolving" spinner AFTER
-  -- the user has already landed at the target is the precise visual bug we
-  -- want to suppress.
+  -- Spinner: only after 600ms so fast precise hits don't flash.
   vim.defer_fn(function()
     if not still_current() or resolved or jumped then return end
-    notice = ui.progress_notice(string.format(
-      "⏳ resolving %s ... (instant index path racing precise AST path)",
-      sym or "?"
-    ))
+    notice = ui.progress_notice(string.format("⏳ resolving %s ...", sym or "?"))
     M._active_notice = notice
   end, LSP_PROGRESS_NOTICE_MS)
 
-  -- Hard timeout: bail. WARN only if nothing has jumped — instant track may
-  -- have already navigated and precise reconcile just timed out, which is
-  -- normal on huge UE TUs.
+  -- Hard timeout: 30s ceiling. async_lsp_definition_with_retry has its own
+  -- per-request ceiling; this is the orchestrator-level safety net.
   vim.defer_fn(function()
     if not still_current() or resolved then return end
     done()
@@ -403,233 +385,118 @@ function M.definition()
     end
   end, OVERALL_TIMEOUT_MS)
 
-  -- ---- Track 1: instant via workspace/symbol -----------------------------
-  local instant_winner = nil
-  if has_ws_client and sym and sym ~= "" then
-    dtrace("instant: dispatching ws/symbol q=%q", sym)
-    provider.async_lsp_workspace_symbol(bufnr, sym, true, function(ws_locs)
-      local n = ws_locs and #ws_locs or 0
-      dtrace("instant: ws/symbol back n=%d still=%s resolved=%s",
-        n, tostring(still_current()), tostring(resolved))
-      if not still_current() or resolved then return end
-      if not ws_locs or #ws_locs == 0 then return end
-      if #ws_locs > INSTANT_MAX_CANDIDATES then
-        dtrace("instant: SKIP n>%d", INSTANT_MAX_CANDIDATES); return
-      end
-      ws_locs = location_mod.filter_self_locations(ws_locs, ref_file, ref_line)
-      dtrace("instant: after filter_self n=%d", ws_locs and #ws_locs or 0)
-      if not ws_locs or #ws_locs == 0 then return end
+  -- ---------------------------------------------------------------
+  -- Forward declaration so handle_precise / fallback can call each other.
+  -- ---------------------------------------------------------------
+  local fallback_ws_then_gtags
 
-      for i, loc in ipairs(ws_locs) do
-        local uri = loc.uri or (loc.targetUri or "?")
-        local rng = loc.range or loc.targetSelectionRange or {}
-        local ln = rng.start and rng.start.line or -1
-        dtrace("instant: cand[%d] uri=%s line=%d kind=%s", i,
-          tostring(uri):gsub("file:///", ""):sub(-80), ln, tostring(loc._ws_kind))
-      end
+  -- handle_precise: process the on_result of async_lsp_definition_with_retry.
+  -- locs may be nil (LSP returned empty) or a non-empty list (def+impl+decl
+  -- already merged & deduped by provider).
+  local function handle_precise(locs)
+    dtrace("precise: back n=%d still=%s jumped=%s",
+      locs and #locs or 0, tostring(still_current()), tostring(jumped))
+    if not still_current() then
+      clear_notice()
+      return
+    end
 
-      -- SYNTAX FILTER (deterministic overload disambiguation).
-      local filtered, fi = syntax_filter.filter_by_call_signature(ws_locs, bufnr, dtrace)
-      dtrace("instant: syntax_filter applied=%s K=%s before=%d after=%d skipped=%d",
-        tostring(fi.applied), tostring(fi.call_arity), fi.before, fi.after, fi.skipped)
+    if locs and #locs > 0 then
+      local filtered, fi = syntax_filter.filter_by_call_signature(locs, bufnr, dtrace)
+      dtrace("precise: syntax_filter applied=%s K=%s before=%d after=%d skipped=%s",
+        tostring(fi.applied), tostring(fi.call_arity), fi.before, fi.after, tostring(fi.skipped))
+
+      local precise_rejected = false
 
       if #filtered == 1 then
         local winner = filtered[1]
-        if not jumped then
-          winner._origin_cword = sym
-          winner._sym_name = sym
-          local pok, ok_or_err = pcall(jump_to_location, winner)
-          local ok = pok and ok_or_err == true
+        winner._origin_cword = sym
+        winner._sym_name = sym
+        local pok, ok_or_err = pcall(jump_to_location, winner)
+        local ok = pok and ok_or_err == true
+        dtrace("precise: jump pok=%s ok=%s", tostring(pok), tostring(ok_or_err))
+        if ok then
+          jumped = true
           local p = location_mod.location_path(winner)
           local short = p:match("([^/\\]+)$") or "?"
           local label = string.format("%s:%d", short, location_mod.location_line(winner))
-          dtrace("instant: jump pok=%s ok=%s label=%s err=%s",
-            tostring(pok), tostring(ok), label,
-            pok and "" or tostring(ok_or_err):sub(1, 80))
-          if ok then
-            jumped = true
-            instant_winner = winner
-            local tag = fi.applied and "instant·syntax" or "instant"
-            done(string.format("⚡ %s → %s (%s)", sym or "?", label, tag), 3000)
-          end
+          local tag = fi.applied and "precise·syntax" or "precise"
+          done(string.format("✓ %s → %s (%s)", sym or "?", label, tag), 3000)
+          return
+        end
+        if pok and ok_or_err == "rejected_bogus" then
+          precise_rejected = true
         end
       elseif #filtered > 1 then
-        -- Multiple candidates pass syntax_filter. Try pair_picker for the
-        -- two structurally-safe auto-jump patterns (header+cpp pair, sole
-        -- cpp among headers). On miss, fall back to quickfix sorted by
-        -- ranking heuristics.
+        -- pair_picker first (header+cpp / sole-cpp-among-headers heuristics).
         local pp_winner, pp_rule = pair_picker.pick_safe_winner(filtered)
-        if pp_winner and not jumped then
+        if pp_winner then
           pp_winner._origin_cword = sym
           pp_winner._sym_name = sym
           local pok, ok_or_err = pcall(jump_to_location, pp_winner)
           local ok = pok and ok_or_err == true
-          local p = location_mod.location_path(pp_winner)
-          local short = p:match("([^/\\]+)$") or "?"
-          local label = string.format("%s:%d", short, location_mod.location_line(pp_winner))
-          dtrace("instant: pair_picker rule=%s pok=%s ok=%s label=%s",
-            tostring(pp_rule), tostring(pok), tostring(ok), label)
+          dtrace("precise: pair_picker rule=%s pok=%s ok=%s",
+            tostring(pp_rule), tostring(pok), tostring(ok_or_err))
           if ok then
             jumped = true
-            instant_winner = pp_winner
-            local tag = fi.applied
-              and string.format("instant·syntax·%s", pp_rule)
-              or  string.format("instant·%s", pp_rule)
-            done(string.format("⚡ %s → %s (%s, %d→1)", sym or "?", label, tag, #filtered), 3000)
-          end
-        end
-        if not jumped then
-          local sorted = ranking.rerank_locations(filtered, platform_hints, ref_file, receiver)
-          local outcome = ui.try_jump(sorted, "LSP definitions (instant)")
-          if outcome == true or outcome == "open_failed" then
-            jumped = true
-            local first = sorted[1]
-            local p = location_mod.location_path(first)
+            local p = location_mod.location_path(pp_winner)
             local short = p:match("([^/\\]+)$") or "?"
-            local label = string.format("%s:%d", short, location_mod.location_line(first))
-            local tag = fi.applied and "instant·syntax" or "instant"
-            done(string.format("⚡ %s → %s (%d candidates, %s)", sym or "?", label, #sorted, tag), 3000)
+            local label = string.format("%s:%d", short, location_mod.location_line(pp_winner))
+            local tag = fi.applied
+              and string.format("precise·syntax·%s", pp_rule)
+              or  string.format("precise·%s", pp_rule)
+            done(string.format("✓ %s → %s (%s, %d→1)", sym or "?", label, tag, #filtered), 3000)
+            return
+          end
+          if pok and ok_or_err == "rejected_bogus" then
+            precise_rejected = true
           end
         end
       end
-      -- #filtered == 0 case is impossible — syntax_filter has its own
-      -- "all eliminated → fallback" safety net.
-    end)
-  end
 
-  -- ---- Track 2: precise via textDocument/definition (+impl/+decl) --------
-  if has_def_client then
-    dtrace("precise: dispatching textDocument/definition")
-    provider.async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_current, function(locs)
-      dtrace("precise: back n=%d still=%s jumped=%s",
-        locs and #locs or 0, tostring(still_current()), tostring(jumped))
-      -- HARD INVARIANT: precise track owns the spinner. Once we receive
-      -- the on_result callback, the spinner MUST end on every exit path,
-      -- stale or not. Otherwise the "⏳ resolving ..." notice is leaked
-      -- forever (until the 30s overall timeout fires).
-      if not still_current() then
-        -- Stale: do nothing observable, but clear our spinner so nothing
-        -- lingers on screen. The fresher invocation has its own spinner.
-        clear_notice()
+      -- Reject-bogus short circuit: precise's only / pair_picker pick was
+      -- a hallucination. Don't pretend the rest of filtered is trustworthy.
+      if precise_rejected then
+        local tag = fi.applied and "precise·syntax" or "precise"
+        done(string.format(
+          "⊘ %s — clangd's only candidate was rejected as bogus (%s); try <leader>fG to grep",
+          sym or "?", tag), 4000)
         return
       end
 
-      if locs and #locs > 0 then
-        local filtered, fi = syntax_filter.filter_by_call_signature(locs, bufnr, dtrace)
-        dtrace("precise: syntax_filter applied=%s K=%s before=%d after=%d skipped=%s",
-          tostring(fi.applied), tostring(fi.call_arity), fi.before, fi.after, tostring(fi.skipped))
-
-        -- Track whether precise's single attempt was rejected as bogus
-        -- (reconcile HARD-MISS). When true AND no other candidates exist,
-        -- we must NOT fall through to the quickfix list — the candidate
-        -- list IS the bogus answer. Showing it as a menu confuses users
-        -- ("clangd told me it can't find this, why am I picking from a
-        -- list of fake answers?"). Better UX: report ⊘ no reliable
-        -- definition and let the user fall back to <leader>fG (grep).
-        local precise_rejected = false
-
-        if not jumped then
-          if #filtered == 1 then
-            local winner = filtered[1]
-            winner._origin_cword = sym
-            winner._sym_name = sym
-            local pok, ok_or_err = pcall(jump_to_location, winner)
-            local ok = pok and ok_or_err == true
-            dtrace("precise: jump pok=%s ok=%s", tostring(pok), tostring(ok_or_err))
-            if ok then
-              jumped = true
-              local p = location_mod.location_path(winner)
-              local short = p:match("([^/\\]+)$") or "?"
-              local label = string.format("%s:%d", short, location_mod.location_line(winner))
-              local tag = fi.applied and "precise·syntax" or "precise"
-              done(string.format("✓ %s → %s (%s)", sym or "?", label, tag), 3000)
-              return
-            end
-            if pok and ok_or_err == "rejected_bogus" then
-              precise_rejected = true
-            end
-          elseif #filtered > 1 then
-            -- Try pair_picker before falling to quickfix.
-            local pp_winner, pp_rule = pair_picker.pick_safe_winner(filtered)
-            if pp_winner then
-              pp_winner._origin_cword = sym
-              pp_winner._sym_name = sym
-              local pok, ok_or_err = pcall(jump_to_location, pp_winner)
-              local ok = pok and ok_or_err == true
-              dtrace("precise: pair_picker rule=%s pok=%s ok=%s",
-                tostring(pp_rule), tostring(pok), tostring(ok_or_err))
-              if ok then
-                jumped = true
-                local p = location_mod.location_path(pp_winner)
-                local short = p:match("([^/\\]+)$") or "?"
-                local label = string.format("%s:%d", short, location_mod.location_line(pp_winner))
-                local tag = fi.applied
-                  and string.format("precise·syntax·%s", pp_rule)
-                  or  string.format("precise·%s", pp_rule)
-                done(string.format("✓ %s → %s (%s, %d→1)", sym or "?", label, tag, #filtered), 3000)
-                return
-              end
-              -- pair_picker chose ONE winner, but jump_to_location
-              -- rejected it as bogus. The remaining filtered[] members
-              -- are no more trustworthy than the rejected one. Treat as
-              -- whole-set rejection.
-              if pok and ok_or_err == "rejected_bogus" then
-                precise_rejected = true
-              end
-            end
-          end
-          -- Whole-set rejection short-circuit: don't insult the user
-          -- with a "pick from these wrong answers" menu.
-          if precise_rejected then
-            local tag = fi.applied and "precise·syntax" or "precise"
-            done(string.format(
-              "⊘ %s — clangd's only candidate was rejected as bogus (%s); try <leader>fG to grep",
-              sym or "?", tag), 4000)
-            return
-          end
-          local sorted = ranking.rerank_locations(filtered, platform_hints, ref_file, receiver)
-          local outcome = ui.try_jump(sorted, "LSP definitions")
-          if outcome == true or outcome == "open_failed" then
-            jumped = true
-            local first = sorted[1]
-            local p = location_mod.location_path(first)
-            local short = p:match("([^/\\]+)$") or "?"
-            local label = string.format("%s:%d", short, location_mod.location_line(first))
-            local tag = fi.applied and "precise·syntax" or "precise"
-            done(string.format("✓ %s → %s (%d candidates, %s)", sym or "?", label, #sorted, tag), 3000)
-            return
-          end
-        else
-          -- instant already jumped. Reconcile if precise (post-filter) disagrees.
-          if INSTANT_PRECISE_RECONCILE and instant_winner and #filtered >= 1 then
-            local precise_pick = filtered[1]
-            local same = location_mod.location_key(precise_pick) == location_mod.location_key(instant_winner)
-            if not same then
-              local p = location_mod.location_path(precise_pick)
-              local short = p:match("([^/\\]+)$") or "?"
-              local label = string.format("%s:%d", short, location_mod.location_line(precise_pick))
-              vim.notify(string.format(
-                "ℹ precise definition differs: %s (press <leader>gP to switch)",
-                label
-              ), vim.log.levels.INFO)
-              M._last_precise_winner = precise_pick
-            end
-          end
-          done()
+      -- N>1 candidates and pair_picker didn't pick: rerank + picker UI.
+      -- This is the legitimate "real overloads" case (e.g. virtual function
+      -- with N implementations). User gets to choose.
+      if not jumped and #filtered >= 1 then
+        local sorted = ranking.rerank_locations(filtered, platform_hints, ref_file, receiver)
+        local outcome = ui.try_jump(sorted, "LSP definitions")
+        if outcome == true or outcome == "open_failed" then
+          jumped = true
+          local first = sorted[1]
+          local p = location_mod.location_path(first)
+          local short = p:match("([^/\\]+)$") or "?"
+          local label = string.format("%s:%d", short, location_mod.location_line(first))
+          local tag = fi.applied and "precise·syntax" or "precise"
+          done(string.format("✓ %s → %s (%d candidates, %s)", sym or "?", label, #sorted, tag), 3000)
           return
         end
       end
+    end
 
-      if jumped then done(); return end
+    -- Precise gave nothing usable: fall to ws/symbol then GTAGS.
+    if jumped then done(); return end
+    fallback_ws_then_gtags()
+  end
 
-      -- LSP precise gave nothing, fall through to GTAGS.
+  -- ws/symbol fallback: clangd couldn't resolve the symbol via AST (typo,
+  -- macro token, broken TU, etc.). Last-ditch fuzzy name lookup. May return
+  -- many same-named symbols — present as picker, never auto-jump (user
+  -- already established that auto-jumping ws/symbol candidates is wrong).
+  fallback_ws_then_gtags = function()
+    if not has_ws_client or not sym or sym == "" then
+      dtrace("fallback: skipping ws/symbol (no client or no sym), going GTAGS")
       provider.gtags_fallback_async(sym, function(jumped_g)
-        -- Same invariant: spinner ownership transfers to us here. Always
-        -- terminate it before returning.
-        if not still_current() or resolved then
-          clear_notice()
-          return
-        end
+        if not still_current() or resolved then clear_notice(); return end
         if jumped_g then
           jumped = true
           done(string.format("✓ %s (GTAGS fallback)", sym or "?"), 3000)
@@ -639,33 +506,87 @@ function M.definition()
             vim.log.levels.INFO)
         end
       end)
-    end)
-  else
-    -- ws_client only, no def_client. Wait briefly for instant track,
-    -- then fall back to GTAGS if it didn't pan out.
-    vim.defer_fn(function()
-      -- HARD INVARIANT: this branch owns the spinner cleanup.
-      -- jumped=true means instant track resolved cleanly and already
-      -- called done(); nothing left to do.
-      if jumped then return end
-      if not still_current() or resolved then
-        clear_notice()
+      return
+    end
+
+    dtrace("fallback: dispatching ws/symbol q=%q (precise was empty)", sym)
+    provider.async_lsp_workspace_symbol(bufnr, sym, true, function(ws_locs)
+      local n = ws_locs and #ws_locs or 0
+      dtrace("fallback ws/symbol: n=%d still=%s resolved=%s",
+        n, tostring(still_current()), tostring(resolved))
+      if not still_current() or resolved then return end
+
+      if ws_locs then
+        ws_locs = location_mod.filter_self_locations(ws_locs, ref_file, ref_line)
+      end
+
+      if not ws_locs or #ws_locs == 0 then
+        -- ws/symbol also empty: GTAGS.
+        provider.gtags_fallback_async(sym, function(jumped_g)
+          if not still_current() or resolved then clear_notice(); return end
+          if jumped_g then
+            jumped = true
+            done(string.format("✓ %s (GTAGS fallback)", sym or "?"), 3000)
+          else
+            done()
+            vim.notify("No definition (LSP and GTAGS both empty): " .. (sym or "?"),
+              vim.log.levels.INFO)
+          end
+        end)
         return
       end
-      provider.gtags_fallback_async(sym, function(jumped_g)
-        if not still_current() or resolved then
-          clear_notice()
-          return
-        end
-        if jumped_g then
-          jumped = true
-          done(string.format("✓ %s (GTAGS fallback)", sym or "?"), 3000)
-        else
-          done()
-          vim.notify("No definition: " .. (sym or "?"), vim.log.levels.INFO)
-        end
-      end)
-    end, INSTANT_DEADLINE_MS + 100)
+
+      if #ws_locs > INSTANT_MAX_CANDIDATES then
+        dtrace("fallback ws/symbol: too many candidates (%d > %d), going GTAGS",
+          #ws_locs, INSTANT_MAX_CANDIDATES)
+        provider.gtags_fallback_async(sym, function(jumped_g)
+          if not still_current() or resolved then clear_notice(); return end
+          if jumped_g then
+            jumped = true
+            done(string.format("✓ %s (GTAGS fallback)", sym or "?"), 3000)
+          else
+            done()
+            vim.notify(string.format(
+              "Too many ws/symbol candidates (%d), GTAGS empty: %s",
+              #ws_locs, sym or "?"), vim.log.levels.INFO)
+          end
+        end)
+        return
+      end
+
+      -- ws/symbol returned a manageable set: try syntax_filter to narrow,
+      -- then ALWAYS show as picker (no auto-jump on ws/symbol fallback —
+      -- this is the precise-first contract).
+      local filtered, fi = syntax_filter.filter_by_call_signature(ws_locs, bufnr, dtrace)
+      dtrace("fallback ws/symbol: syntax_filter applied=%s before=%d after=%d",
+        tostring(fi.applied), fi.before, fi.after)
+
+      local sorted = ranking.rerank_locations(filtered, platform_hints, ref_file, receiver)
+      local outcome = ui.try_jump(sorted, "LSP ws/symbol fallback (precise was empty)")
+      if outcome == true or outcome == "open_failed" then
+        jumped = true
+        local first = sorted[1]
+        local p = location_mod.location_path(first)
+        local short = p:match("([^/\\]+)$") or "?"
+        local label = string.format("%s:%d", short, location_mod.location_line(first))
+        done(string.format("⚠ %s → %s (ws/symbol fallback, %d cand)",
+          sym or "?", label, #sorted), 3000)
+      else
+        -- picker dismissed without selection
+        done()
+      end
+    end)
+  end
+
+  -- ---------------------------------------------------------------
+  -- Dispatch.
+  -- ---------------------------------------------------------------
+  if has_def_client then
+    dtrace("precise: dispatching textDocument/definition (precise-first)")
+    provider.async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_current, handle_precise)
+  else
+    -- No def_client; only ws/symbol + GTAGS available.
+    fallback_ws_then_gtags()
   end
 end
 

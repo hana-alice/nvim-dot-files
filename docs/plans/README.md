@@ -24,6 +24,7 @@ know "how this specific subsystem is shaped."
 | `2026-05-07-config-schema-expansion.md` | I | Add `clangd.*`, `dap.*`, `cdb.*` keys to `ue.config` schema |
 | `2026-05-07-android-config-wire.md` | J | Wire `ue/dap.lua` Android prompts (`lldb_server_path`, `android_package`) through `ue.config` |
 | `2026-05-07-ueprepare-csearch-pipeline.md` | (draft) | One-command incremental `:UEPrepare` — drives existing `ueprepare` + UBT `-SkipBuild` (no compile) + `cindex` + ccjson + clangd reload, async with progress UI |
+| `2026-05-08-h-inject-cdb.md` | (post-iteration) | `.h` CDB inject for clangd LSP — `.cpp.json` reverse-lookup + dual donor paths (cdb-donor + wrapper-donor), 34/34 .h 0 ERROR validated, 8 pitfalls catalogued. Consumed by `docs/skills/ue-ide-bootstrap.md` step 4 |
 
 ### Earlier ADRs (2026-04)
 

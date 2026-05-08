@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-build_clangd_index.py - 为 clangd 离线预建索引
+build_clangd_index.py - 为 clangd 离线预建索引（hot/current 子集专用）
+
+NOTE: 这个脚本现在**只服务 :UEIndexHot / :UEIndexCurrent**，输入是
+per-file 的小子集 CDB（几百到几千 TU）。:UEIndexFull 走 build_full_cdb.py
+（rsp + inject + super-unity sidecar + clangd-indexer 一条龙）。
 
 使用 clangd-indexer 预先索引所有 TU，生成 .idx 文件。
 配合 .clangd 的 Index.External.File 或 clangd-index-server 使用，
 可跳过后台索引，大幅加速 clangd 启动体验。
 
 流程:
-  1. 读取 compile_commands.json
+  1. 读取 compile_commands.json（已 inject 过 -D 的 per-file 子集）
   2. 调用 clangd-indexer --executor=all-TUs 生成 .idx
   3. 输出到 .clangd-index/<project>.idx
 
@@ -75,12 +79,6 @@ def main():
     parser.add_argument("compile_commands", help="Path to compile_commands.json")
     parser.add_argument("--jobs", "-j", type=int, default=0,
                         help="Number of parallel workers (default: CPU count, max 24)")
-    parser.add_argument("--use-unity", action="store_true",
-                        help="Convert input CDB to unity-build CDB (Module.<X>.cpp aggregates) before indexing. Requires UE to have been built so that Intermediate/Build/.../Module.<X>.cpp files exist.")
-    parser.add_argument("--use-super-unity", action="store_true",
-                        help="After --use-unity, further group Module.<X>.cpp by SharedPCH into ~25 super-unity TUs (vs ~800 plain unity TUs). Eliminates per-TU SharedPCH re-parse cost, ~5-10x faster wall clock. Implies --use-unity. Requires UE to have been built.")
-    parser.add_argument("--super-unity-max-mods", type=int, default=50,
-                        help="Max Module.<X>.cpp members per super-unity TU (default 50). Lower = more TUs but less RAM per TU.")
     parser.add_argument("--server", action="store_true",
                         help="Start clangd-index-server after building")
     parser.add_argument("--port", type=int, default=50051,
@@ -126,36 +124,12 @@ def main():
     print(f"Output: {idx_path}")
     print(f"Indexer: {indexer}")
 
-    # OPTIONAL: Convert input CDB to unity-build CDB. UE generates
-    # Module.<Mod>.<N>.cpp aggregate files at build-time that #include 50-100
-    # individual cpps. Indexing the unity files instead trades many small TUs
-    # for fewer large TUs, eliminating per-TU preamble repetition (the main
-    # cost on UE — preamble is ~170 MB and takes ~5s to build per TU).
-    # Empirical estimate: full base CDB 14334 entries × 8 worker @ 1.46
-    # files/sec = 164 min; unity ≈ 287 unity TUs × ~25s / 8 worker ≈ 15 min.
-    if args.use_super_unity:
-        # super-unity implies plain unity as the first hop
-        args.use_unity = True
-    if args.use_unity:
-        unity_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build_unity_cdb.py")
-        if not os.path.isfile(unity_script):
-            print(f"\nERROR: --use-unity requested but {unity_script} not found", file=sys.stderr)
-            return 1
-        unity_cdb_path = os.path.join(os.path.dirname(cdb_path),
-                                      os.path.basename(cdb_path).replace(".json", ".unity.json"))
-        if os.path.basename(unity_cdb_path) == os.path.basename(cdb_path):
-            unity_cdb_path = cdb_path + ".unity.json"
-        print(f"\n[unity] Converting {os.path.basename(cdb_path)} → {os.path.basename(unity_cdb_path)}...")
-        t_unity = time.time()
-        rc = subprocess.call([sys.executable, "-I", unity_script, cdb_path, unity_cdb_path])
-        if rc != 0:
-            print(f"\nERROR: build_unity_cdb returned {rc}", file=sys.stderr)
-            return 1
-        # Use the unity CDB for the rest of the pipeline
-        cdb_path = unity_cdb_path
-        with open(cdb_path, "r", encoding="utf-8") as f:
-            cdb = json.load(f)
-        print(f"[unity] {len(cdb)} unity TUs in {time.time()-t_unity:.1f}s")
+    # NOTE: previously this script supported --use-unity / --use-super-unity
+    # to convert the per-file CDB into Module.<X>.cpp / SuperUnity.<PCH>.<N>.cpp
+    # super-TUs in-process. Those code paths now live in build_full_cdb.py
+    # (which is the single entry for :UEIndexFull). This script is now reserved
+    # for hot/current phases — small per-module subsets that don't benefit from
+    # super-unity grouping.
 
     # CRITICAL: Inject Definitions.<Module>.h #defines as explicit -D into CDB.
     # clangd-indexer's disableUnsupportedOptions() strips -include-pch, which
@@ -183,33 +157,6 @@ def main():
     else:
         print(f"  WARN: {inject_script} not found, skipping injection")
         print(f"  (Indexer will likely fail on ~97% of UE TUs without it.)")
-
-    if args.use_super_unity:
-        # Group plain-unity TUs by their SharedPCH set into ~25 super-unity TUs.
-        # This eliminates the "every TU re-parses 170MB SharedPCH" cost that
-        # dominates clangd-indexer wall clock on UE.
-        # Runs AFTER inject so super-unity's per-chunk arg union picks up the
-        # injected -D flags from each member Module.<X>.cpp's CDB entry.
-        super_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build_super_unity_cdb.py")
-        if not os.path.isfile(super_script):
-            print(f"\nERROR: --use-super-unity requested but {super_script} not found", file=sys.stderr)
-            return 1
-        super_cdb_path = cdb_path.replace(".unity.json", ".super-unity.json")
-        if super_cdb_path == cdb_path:
-            super_cdb_path = cdb_path + ".super-unity.json"
-        print(f"\n[super-unity] Grouping by SharedPCH (max {args.super_unity_max_mods} mods/TU)...")
-        t_super = time.time()
-        rc = subprocess.call([
-            sys.executable, "-I", super_script,
-            cdb_path, super_cdb_path, str(args.super_unity_max_mods),
-        ])
-        if rc != 0:
-            print(f"\nERROR: build_super_unity_cdb returned {rc}", file=sys.stderr)
-            return 1
-        cdb_path = super_cdb_path
-        with open(cdb_path, "r", encoding="utf-8") as f:
-            cdb = json.load(f)
-        print(f"[super-unity] {len(cdb)} super-unity TUs in {time.time()-t_super:.1f}s")
 
     # Build index
     # CRITICAL: clangd-indexer's positional arg is a SOURCE file used as a

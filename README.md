@@ -129,7 +129,6 @@ Numbers measured on UEProj (~43k files):
 
 | Pattern                     | Hits | csearch     | rg (walk) |
 | --------------------------- | ---- | ----------- | --------- |
-| `DeviceEvaluation`          | 10   | **85 ms**   | ~30 s     |
 | `FRDGBuilder`               | 2491 | **365 ms**  | ~14 s     |
 | `FRHICommandList`           | 6593 | **693 ms**  | ~18 s     |
 | `NaniteRasterPipelines`     | 57   | **73 ms**   | ~12 s     |

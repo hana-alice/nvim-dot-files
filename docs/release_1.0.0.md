@@ -128,7 +128,7 @@ nvim/
 
 - **DAP 调试器** 不直接暴露给 ue.lua —— 走 `require('ue.dap').<api>` 的 M 表，
   这样 progress_update 这类 cross-cutting concerns 改一处覆盖 12+ 个 attach/launch 错误点
-  (commit 96636ff 利用了这个设计，加了一行就把日志覆盖到全部 DAP 错误路径)。
+  (commit fea71ba 利用了这个设计，加了一行就把日志覆盖到全部 DAP 错误路径)。
 
 - **monolithic ue.lua** 的内部分区靠注释带和 INDEX_FN 等命名前缀做软边界。
 
@@ -259,7 +259,7 @@ UE5 Android 调试在传统 IDE 里 (Android Studio / VS Android workload) 痛�
 `progress_update(msg, level)` 是这一层的核心 cross-cutting 函数 —— 同时
 把消息推到 fidget 进度条 + 落盘 nvim-debug.log + ERROR 时 vim.notify。
 v2 logger 改了这一个函数就把全部 12 个 attach/launch 错误点都接入了日志系统
-(commit 96636ff)。
+(commit fea71ba)。
 
 ### 4.3 诊断命令
 
@@ -282,7 +282,7 @@ v2 logger 改了这一个函数就把全部 12 个 attach/launch 错误点都接
 
 ### 5.1 设计
 
-`lua/utils/log.lua` (v2, 583 行, commit 2d9150e) — 旋转文件日志:
+`lua/utils/log.lua` (v2, 583 行, commit ddd9193) — 旋转文件日志:
 - 路径: `%LOCALAPPDATA%\nvim-data\nvim\nvim-debug.log` + `.1`–`.5` (2MB / 5 backups)
 - 默认 level: WARN (ERROR/WARN 必落盘)
 - 5 个命令: `:NvimLog` `:NvimLogPath` `:NvimLogClear` `:NvimLogLevel` `:NvimLogScope`
@@ -308,7 +308,7 @@ windows config, snacks, ue, ue.dap)。
 ## 6. snacks.nvim picker 的 6 个 workarounds
 
 `lua/workarounds/snacks/`:
-1. `picker_str_byteindex_oob.lua` — LSP 给的 position 越界时不要 crash (commit 154e83a)
+1. `picker_str_byteindex_oob.lua` — LSP 给的 position 越界时不要 crash (commit 7ee9769)
 2. `picker_first_open_freeze.lua` — 第一次开 picker 卡 N 秒
 3. `projects_picker_freeze.lua` — projects picker 在 Neovide 上冻死
 4. snacks-picker-source-override 系列 (源码改不了的 source 默认值)
@@ -325,8 +325,8 @@ windows config, snacks, ue, ue.dap)。
   做了 module 级 cache, 省 90%+ I/O
 - **csearch** 集成: utils/code_search/, ripgrep 在 11593 cpp 上不够快时的备份
 - **recent_projects.lua** + sessions 自动恢复
-- **rider-light colorscheme** (commit 904ede3) — 给做 UE 工具同事用 Rider 主题的人无缝过渡
-- **cindent for C/C++/HLSL/C#/Java/GLSL** (commit 108050c)
+- **rider-light colorscheme** (commit 11cdfba) — 给做 UE 工具同事用 Rider 主题的人无缝过渡
+- **cindent for C/C++/HLSL/C#/Java/GLSL** (commit c35c86a)
 - **52 个 lua 文件** 全部通过 `lint_no_bare_globals` (skill lua-bare-global-detection)
 
 ---

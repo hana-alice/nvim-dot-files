@@ -47,20 +47,20 @@ not carry.
 
 | Phase | Commit | Title | Module(s) added | ADR |
 |---|---|---|---|---|
-| **A** | `bdecf3c` | platform driver + per-OS modules | `lua/utils/platform/{init,windows,macos,linux,stub}.lua` | `2026-05-06-multi-platform-foundation.md` |
-| **B** | `20d344f` | extract fs/proc utilities from ue.lua | `lua/ue/core/{fs,proc}.lua` | `2026-05-06-multi-platform-foundation.md` |
-| **C** | `40f6a57` | introduce schema for tunables | `lua/ue/config.lua` | `2026-05-06-multi-platform-foundation.md` |
-| **E.1** | `8911a5f` | extract pure JSON helpers | `lua/ue/cdb/json.lua` | `2026-05-07-cdb-pipeline-split.md` |
-| **E.2** | `b855e8d` | extract paths + shaders helpers | `lua/ue/cdb/{paths,shaders}.lua` | `2026-05-07-cdb-pipeline-split.md` |
-| **E.3** | `7b7d941` | extract pipeline driver with DI | `lua/ue/cdb/pipeline.lua` | `2026-05-07-cdb-pipeline-split.md` |
-| **F.1** | `c9b4a99` | platform-neutral UEDAP* aliases | (registers 11 commands) | `2026-05-07-dap-multiplatform.md` |
-| **F.2** | `3292371` | per-platform dispatch table | `lua/ue/dap/platforms.lua` | `2026-05-07-dap-multiplatform.md` |
-| **H** | `cc1565d` | real per-platform DAP handlers | `lua/ue/dap/{_common,win64,mac,linux,ios}.lua` | `2026-05-07-dap-real-platforms.md` |
-| **I** | `d2ee7aa` | expand schema for clangd/dap/cdb | (extends `ue/config.lua`) | `2026-05-07-config-schema-expansion.md` |
-| **J** | `bb1b7c3` | wire android prompts to ue.config | (extends `ue/dap.lua`) | `2026-05-07-android-config-wire.md` |
-| **F.3** | `197dd96` | one-shot deprecation on UEAndroidDAP* | (10 commands wrapped) | `2026-05-07-dap-multiplatform.md` (followup) |
-| **G** | `018d508`,`8f14e70`,`e81faba` | `headless_smoke.lua` runner + extensions | `scripts/headless_smoke.lua` | inline in foundation ADR |
-| **G CI** | `6be40a9` | 3-OS GitHub Actions matrix | `.github/workflows/headless.yml` | inline |
+| **A** | `a8ece2f` | platform driver + per-OS modules | `lua/utils/platform/{init,windows,macos,linux,stub}.lua` | `2026-05-06-multi-platform-foundation.md` |
+| **B** | `0720ff0` | extract fs/proc utilities from ue.lua | `lua/ue/core/{fs,proc}.lua` | `2026-05-06-multi-platform-foundation.md` |
+| **C** | `8d64ef1` | introduce schema for tunables | `lua/ue/config.lua` | `2026-05-06-multi-platform-foundation.md` |
+| **E.1** | `3077c68` | extract pure JSON helpers | `lua/ue/cdb/json.lua` | `2026-05-07-cdb-pipeline-split.md` |
+| **E.2** | `9aa5a84` | extract paths + shaders helpers | `lua/ue/cdb/{paths,shaders}.lua` | `2026-05-07-cdb-pipeline-split.md` |
+| **E.3** | `4526e51` | extract pipeline driver with DI | `lua/ue/cdb/pipeline.lua` | `2026-05-07-cdb-pipeline-split.md` |
+| **F.1** | `4ae2699` | platform-neutral UEDAP* aliases | (registers 11 commands) | `2026-05-07-dap-multiplatform.md` |
+| **F.2** | `129311f` | per-platform dispatch table | `lua/ue/dap/platforms.lua` | `2026-05-07-dap-multiplatform.md` |
+| **H** | `4781091` | real per-platform DAP handlers | `lua/ue/dap/{_common,win64,mac,linux,ios}.lua` | `2026-05-07-dap-real-platforms.md` |
+| **I** | `f5ee7e9` | expand schema for clangd/dap/cdb | (extends `ue/config.lua`) | `2026-05-07-config-schema-expansion.md` |
+| **J** | `4d6871a` | wire android prompts to ue.config | (extends `ue/dap.lua`) | `2026-05-07-android-config-wire.md` |
+| **F.3** | `bb67c9e` | one-shot deprecation on UEAndroidDAP* | (10 commands wrapped) | `2026-05-07-dap-multiplatform.md` (followup) |
+| **G** | `c602c23`,`4f6ebdf`,`129f88c` | `headless_smoke.lua` runner + extensions | `scripts/headless_smoke.lua` | inline in foundation ADR |
+| **G CI** | `582b221` | 3-OS GitHub Actions matrix | `.github/workflows/headless.yml` | inline |
 | D | (covered by smoke commits) | headless gate (test contract) | — | inline |
 
 Phase D never got its own commit — it became the running headless

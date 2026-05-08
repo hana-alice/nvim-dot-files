@@ -46,9 +46,10 @@ before/after diffs. Do not edit by hand.
   to and reset per branch
 - Iteration logs are added **once a branch is ready to merge**, not
   during work. They reference the commit hashes on the branch
-- Sanitization rules: paths in new ADRs use `vim.fn.stdpath` or
-  `<USER>`/`<LOCAL_APPDATA>` placeholders; existing PII in 2026-04
-  ADRs is intentionally left untouched (see iteration log §7)
+- Sanitization rules: ALL files (new and legacy ADRs, scripts, baseline
+  logs, READMEs) use `<USER>` / `<LOCAL_APPDATA>` / `<PROJ_DRIVE>` /
+  `UEProj` placeholders. The full-repo sanitization pass on 2026-05-08
+  retired the previous "legacy ADRs left untouched" carve-out
 
 ## How to add a new ADR
 

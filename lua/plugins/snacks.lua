@@ -530,8 +530,8 @@ return {
 
       opts.picker.matcher = vim.tbl_deep_extend("force", opts.picker.matcher or {}, {
         fuzzy          = true,   -- fzf-style subsequence matching
-        smartcase      = true,   -- lower → case-insensitive; mixed → case-sensitive
-        ignorecase     = true,   -- baseline for smartcase to flip off
+        smartcase      = false,  -- DISABLED: we want truly case-insensitive always
+        ignorecase     = true,   -- always lowercase both sides before comparing
         filename_bonus = true,   -- score filename matches above path matches
         sort_empty     = false,  -- keep frecency/source order when query is empty
       })

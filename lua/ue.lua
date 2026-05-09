@@ -5622,6 +5622,20 @@ function M.clangd_root(bufnr)
   return vim.fs.root(bufname ~= "" and bufname or cwd(), { "compile_commands.json", ".clangd", ".git" }) or cwd()
 end
 
+-- Build the minimum-viable ctx that utils.code_search.stream / .is_indexed
+-- need: { workspace_root, csearch_idx }. Returns nil when bufnr is not in a
+-- recognized UE project (so callers can short-circuit gracefully).
+function M.csearch_ctx(bufnr)
+  bufnr = bufnr or 0
+  local bufname = norm(vim.api.nvim_buf_get_name(bufnr))
+  local ctx = resolve_context({ bufname = bufname ~= "" and bufname or nil })
+  if not ctx or not ctx.engine_root then return nil end
+  return {
+    workspace_root = workspace_root(ctx),
+    csearch_idx = ctx.paths and ctx.paths.csearch_idx or nil,
+  }
+end
+
 -- Public hook called by lua/utils/ue_watch.lua when a shader file is added
 -- or deleted between :UEPrepare runs. Idempotent — safe to call repeatedly.
 -- Returns (ok, message). On a project with ~1500 shaders this is ~1.1s wall.

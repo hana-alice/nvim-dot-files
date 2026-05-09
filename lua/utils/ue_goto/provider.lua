@@ -225,10 +225,10 @@ function M.async_lsp_workspace_symbol(bufnr, query, exact, on_result)
 end
 
 -- ---------------------------------------------------------------------------
--- Precise track: textDocument/definition (+impl/+decl) with retry
+-- Precise track: textDocument/definition with retry (single request — impl
+-- and decl merging removed; cache + csearch_fallback in lsp_fallback handle
+-- the "definition empty" case instead of inflating the response).
 -- ---------------------------------------------------------------------------
-
-local ranking = require("utils.ue_goto.ranking")
 
 -- async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_current, on_result):
 --   Builds a definition response that's actually useful for navigation:
@@ -259,65 +259,23 @@ function M.async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_curr
     on_result(locs)
   end
 
-  local function def_plus_impl(inner)
-    -- inner(locs|nil) is contractually called exactly once. We do NOT
-    -- short-circuit on still_current() inside this chain — that's what
-    -- caused spinner leaks: inner stayed unfired and the outer caller's
-    -- done() path never ran.
+  -- Single textDocument/definition request, self-filtered. The previous
+  -- implementation merged def + impl + decl across three round-trips; that
+  -- pulled in N implementations of virtual functions and turned single-
+  -- answer cases (e.g. FGlobalShader -> FGlobalShader's class decl) into
+  -- multi-candidate picker UIs because impl returned every override. The
+  -- cache + csearch fallback chain in lsp_fallback now handles "def empty"
+  -- without needing to inflate def with siblings.
+  local function def_only(inner)
     M.async_lsp_request(bufnr, "textDocument/definition", function(def_locs)
       def_locs = location.filter_self_locations(def_locs, ref_file, ref_line)
-
-      if def_locs and #def_locs > 0 and not ranking.is_thin_header_only(def_locs) then
-        inner(def_locs)
-        return
-      end
-
-      local has_impl = #vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/implementation" }) > 0
-      if not has_impl then
-        local has_decl = #vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/declaration" }) > 0
-        if has_decl then
-          M.async_lsp_request(bufnr, "textDocument/declaration", function(decl_locs)
-            decl_locs = location.filter_self_locations(decl_locs, ref_file, ref_line)
-            local merged = {}
-            if def_locs then vim.list_extend(merged, def_locs) end
-            if decl_locs then vim.list_extend(merged, decl_locs) end
-            inner(#merged > 0 and merged or nil)
-          end)
-        else
-          inner(def_locs and #def_locs > 0 and def_locs or nil)
-        end
-        return
-      end
-
-      M.async_lsp_request(bufnr, "textDocument/implementation", function(impl_locs)
-        impl_locs = location.filter_self_locations(impl_locs, ref_file, ref_line)
-
-        local merged = {}
-        if def_locs then vim.list_extend(merged, def_locs) end
-        if impl_locs then vim.list_extend(merged, impl_locs) end
-        merged = location.dedup_locations(merged)
-
-        if #merged > 0 then
-          inner(merged)
-          return
-        end
-
-        local has_decl = #vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/declaration" }) > 0
-        if has_decl then
-          M.async_lsp_request(bufnr, "textDocument/declaration", function(decl_locs)
-            decl_locs = location.filter_self_locations(decl_locs, ref_file, ref_line)
-            inner(decl_locs and #decl_locs > 0 and decl_locs or nil)
-          end)
-        else
-          inner(nil)
-        end
-      end)
+      inner(def_locs and #def_locs > 0 and def_locs or nil)
     end)
   end
 
   local function try_once()
     attempts = attempts + 1
-    def_plus_impl(function(locs)
+    def_only(function(locs)
       if locs and #locs > 0 then
         fire(locs)
         return

@@ -1,59 +1,73 @@
--- LSP definition/references with GTAGS fallback — orchestrator.
+-- utils/lsp_fallback.lua
+-- ============================================================================
+-- gd orchestrator (rewrite, phase-2 of the cache pivot).
 --
--- This module USED to be a 1410-line god module. It now delegates to:
---   utils.ue_goto.symbol    — cursor-context extraction (cword, receiver)
---   utils.ue_goto.location  — Location utility (path, line, dedup, qf)
---   utils.ue_goto.ranking   — score / pick_winner
---   utils.ue_goto.provider  — async LSP requests (ws/symbol, def, impl,
---                             decl, references), GTAGS, post-jump reconcile
---   utils.ue_goto.ui        — progress notice, try_jump, shader-ext detect
---   utils.ue_goto.jumper    — buffer switch + jumplist + cursor + zz with
---                             a strict contract (jumplist tail = source pos)
+-- Path-A (clangd LSP):
+--   textDocument/definition (single, no impl/decl merge).
 --
--- Public surface (UNCHANGED — call sites must not break):
---   M.definition(), M.references(), M.jump_to_precise(), M.status(),
---   M.dump_trace(), M.self_test()
+-- Path-B (cache + csearch fallback chain):
+--   1. utils.ue_goto.cache.get   — per-project memoized successful jumps,
+--                                  keyed by (receiver::sym + sym), validated
+--                                  against the live filesystem before reuse.
+--   2. utils.ue_goto.csearch_fallback — RE2 def-shaped pattern over the
+--                                  csearch trigram index.
+--   3. provider.gtags_fallback_async — last-resort, identifier-only.
 --
--- Design rationale (why orchestrate at all instead of inlining):
---   * Correctness > speed. We never "jump now, correct later" — that
---     creates a confusing two-jump UX. We pick the best location we have,
---     then jump.
---   * LSP semantic results beat GTAGS textual results, always. So we wait
---     for LSP to finish (including preamble-building retries) before
---     considering GTAGS.
---   * The user opted into "accept latency, async". Worst case is a multi-
---     second wait while preamble builds, with a progress notice. The
---     buffer is fully usable during that wait — no main-loop blocking.
---   * Position params are computed PER CLIENT using that client's
---     offset_encoding (mixing encodings silently produces wrong positions
---     on multibyte lines).
---   * Async definition uses a request token so a stale callback from a
---     previous gd can never override a fresher one.
+-- Order semantics:
+--   * Path-A always runs concurrently first (Path-B chain only fires if
+--     Path-A returns empty within the LSP retry budget). This keeps
+--     correctness > speed: clangd's AST answer always beats any
+--     identifier-text answer when clangd has one.
+--   * EXCEPTION: cache.get is consulted BEFORE Path-A and acts as a fast
+--     short-circuit when a previously-validated answer exists under EITHER
+--     primary (receiver::sym) or secondary (sym) key. Validation
+--     (file exists + symbol-substring within ±2 lines of cached site) is
+--     run on every get, so a cache hit is approximately as trustworthy as
+--     a fresh path-A answer. Stale entries are evicted permanently on
+--     validation failure.
+--   * Successful path-A and path-B (csearch) results are written back to
+--     cache. GTAGS results are NOT cached — they are textual identifier
+--     hits with no scope/AST disambiguation, and we don't want them
+--     leaking into future cache.get short-circuits.
+--
+-- What this rewrite intentionally drops vs the prior 669-line orchestrator:
+--   * pair_picker: header+cpp / sole-cpp heuristic (kept on disk, not wired)
+--   * syntax_filter: TS-driven overload disambiguation (ditto)
+--   * post-jump reconcile: bogus-location rejection via M.reconcile_landing_*
+--     (ditto)
+--   * workspace/symbol fallback: pure name-matching with no scope, mostly
+--     produced wrong picker UIs (per precise-first contract)
+--   * M.jump_to_precise / M._last_precise_winner: dead path
+--
+-- Public surface (CALL-SITE COMPATIBLE):
+--   M.definition()   gd entry
+--   M.references()   <leader>gr / kept verbatim
+--   M.status()       :UEDefStatus diagnostic
+--   M.dump_trace()   :UEDefTrace dump ring buffer
+--   M.self_test()    :UEDefSelfTest
+-- ============================================================================
 
 local M = {}
 
 local symbol_mod   = require("utils.ue_goto.symbol")
 local location_mod = require("utils.ue_goto.location")
-local ranking      = require("utils.ue_goto.ranking")
 local provider     = require("utils.ue_goto.provider")
 local ui           = require("utils.ue_goto.ui")
 local jumper       = require("utils.ue_goto.jumper")
-local syntax_filter = require("utils.ue_goto.syntax_filter")
-local pair_picker = require("utils.ue_goto.pair_picker")
+local cache        = require("utils.ue_goto.cache")
+local csearch_fb   = require("utils.ue_goto.csearch_fallback")
 
 -- ---------------------------------------------------------------------------
 -- Tunables
 -- ---------------------------------------------------------------------------
 local LSP_PROGRESS_NOTICE_MS = 600
 local OVERALL_TIMEOUT_MS     = 30000
-local INSTANT_DEADLINE_MS    = 400
-local INSTANT_MAX_CANDIDATES = 50
-local INSTANT_PRECISE_RECONCILE = true
+local CSEARCH_TIMEOUT_MS     = 4000
 
 -- ---------------------------------------------------------------------------
--- Persistent debug ring-buffer (Tier 3: lift to ue_goto_dev/trace.lua).
+-- Persistent debug ring-buffer.
 -- ---------------------------------------------------------------------------
-local MODULE_REVISION = "precise-first-v1"
+local MODULE_REVISION = "cache-csearch-v1"
 local TRACE_MAX = 200
 local trace_ring = {}
 local trace_idx = 0
@@ -99,30 +113,30 @@ function M.dump_trace()
 end
 vim.api.nvim_create_user_command("UEDefTrace", function() M.dump_trace() end, {})
 
--- :UEDefSelfTest — smoke test that syntax_filter loads and ranking.clear_winner
--- has been removed (proves the new bytecode is live, not the stale tier2split one).
 function M.self_test()
-  local ok, sf = pcall(require, "utils.ue_goto.syntax_filter")
-  local lines = {
-    "=== UEDefSelfTest  module_rev=" .. MODULE_REVISION,
+  local checks = {
+    { "cache",         pcall(require, "utils.ue_goto.cache") },
+    { "csearch_fb",    pcall(require, "utils.ue_goto.csearch_fallback") },
+    { "jumper",        pcall(require, "utils.ue_goto.jumper") },
+    { "provider",      pcall(require, "utils.ue_goto.provider") },
+    { "symbol",        pcall(require, "utils.ue_goto.symbol") },
+    { "location",      pcall(require, "utils.ue_goto.location") },
+    { "ui",            pcall(require, "utils.ue_goto.ui") },
   }
-  if not ok then
-    table.insert(lines, "FAIL ✗ — syntax_filter module not loadable: " .. tostring(sf))
-  else
-    table.insert(lines, "syntax_filter module: LOADED ✓")
-    table.insert(lines, "ranking.clear_winner removed: " ..
-      tostring(require("utils.ue_goto.ranking").clear_winner == nil))
-    table.insert(lines, "result: PASS ✓")
+  local lines = { "=== UEDefSelfTest  module_rev=" .. MODULE_REVISION }
+  local all_ok = true
+  for _, c in ipairs(checks) do
+    local mark = c[2] and "✓" or "✗"
+    table.insert(lines, string.format("  %s  %s", mark, c[1]))
+    all_ok = all_ok and c[2]
   end
+  table.insert(lines, all_ok and "result: PASS ✓" or "result: FAIL ✗")
   for _, l in ipairs(lines) do print(l) end
-  return ok
+  return all_ok
 end
 vim.api.nvim_create_user_command("UEDefSelfTest", function() M.self_test() end, {})
 
--- :UEDefReload — drop ue_goto/lsp_fallback bytecode from package.loaded and
--- re-require, then print the new MODULE_REVISION. Use after editing any
--- module under lua/utils/ue_goto/ or lua/utils/lsp_fallback.lua to pick up
--- changes WITHOUT restarting nvim/Neovide. Also runs self_test for sanity.
+-- :UEDefReload — drop ue_goto bytecode + utils.lsp_fallback, re-require.
 local function reload_ue_def()
   local dropped = {}
   for k in pairs(package.loaded) do
@@ -133,37 +147,26 @@ local function reload_ue_def()
   end
   table.sort(dropped)
   local ok, fresh = pcall(require, "utils.lsp_fallback")
-  local lines = { "=== UEDefReload ===" }
-  table.insert(lines, "dropped: " .. tostring(#dropped) .. " modules")
-  for _, k in ipairs(dropped) do table.insert(lines, "  - " .. k) end
+  print("=== UEDefReload ===")
+  print("dropped: " .. tostring(#dropped) .. " modules")
+  for _, k in ipairs(dropped) do print("  - " .. k) end
   if ok then
-    table.insert(lines, "reloaded: utils.lsp_fallback ✓")
-    table.insert(lines, "MODULE_REVISION = " .. tostring(fresh.MODULE_REVISION))
-    -- Also re-bind gd via the user's existing lspconfig glue if present.
-    local ok2, lf = pcall(require, "utils.lsp_fallback")
-    if ok2 and lf.self_test then lf.self_test() end
+    print("reloaded: utils.lsp_fallback ✓  rev=" .. tostring(fresh.MODULE_REVISION))
+    if fresh.self_test then fresh.self_test() end
   else
-    table.insert(lines, "FAIL re-require: " .. tostring(fresh))
+    print("FAIL re-require: " .. tostring(fresh))
   end
-  for _, l in ipairs(lines) do print(l) end
 end
 vim.api.nvim_create_user_command("UEDefReload", reload_ue_def, {
   desc = "Hot-reload ue_goto/lsp_fallback modules + run self-test",
 })
 
--- :UEDefDiag — diagnose stuck/slow gd. Prints the last ~40 trace lines
--- + cursor context (symbol, receiver, dependent, call_arity) so the user
--- can grab one block of text when reporting "gd is hanging on FOO".
+-- :UEDefDiag — cursor context + last 40 trace entries.
 vim.api.nvim_create_user_command("UEDefDiag", function()
-  local symbol_mod = require("utils.ue_goto.symbol")
   local sym  = symbol_mod.current_symbol()
   local recv = symbol_mod.current_receiver()
   local at_def, dk, dn = symbol_mod.is_at_definition_at_cursor()
   local dep, droot, dchain = symbol_mod.is_dependent_at_cursor()
-  local arity, callee
-  if symbol_mod.call_arity_at_cursor then
-    arity, callee = symbol_mod.call_arity_at_cursor()
-  end
   local cur = vim.api.nvim_win_get_cursor(0)
   local bufname = vim.api.nvim_buf_get_name(0)
   print("=== UEDefDiag  rev=" .. MODULE_REVISION .. " ===")
@@ -174,10 +177,13 @@ vim.api.nvim_create_user_command("UEDefDiag", function()
     tostring(at_def), tostring(dk), tostring(dn)))
   print(string.format("dependent: %s (root=%s chain=%s)",
     tostring(dep), tostring(droot), tostring(dchain)))
-  print(string.format("call_arity K=%s callee=%s",
-    tostring(arity), tostring(callee)))
+  -- cache stats
+  local ok, st = pcall(cache.stats, 0)
+  if ok and st then
+    print(string.format("cache:  entries=%d project=%s",
+      st.entries or 0, tostring(st.project)))
+  end
   print("--- last 40 trace entries ---")
-  -- Reach into the local ring buffer.
   local lines = {}
   for i = 1, TRACE_MAX do
     local idx = ((trace_idx - i) % TRACE_MAX) + 1
@@ -188,102 +194,72 @@ vim.api.nvim_create_user_command("UEDefDiag", function()
   for _, l in ipairs(lines) do print(l) end
 end, { desc = "Diagnose stuck gd: cursor context + last 40 trace lines" })
 
+-- :UEDefCacheClear — drop the entire on-disk + memory cache for current project.
+vim.api.nvim_create_user_command("UEDefCacheClear", function()
+  if cache.clear then
+    local ok, msg = pcall(cache.clear, 0)
+    if ok then
+      vim.notify("ue_goto cache cleared: " .. tostring(msg or "ok"),
+        vim.log.levels.INFO, { title = "UEDefCacheClear" })
+    else
+      vim.notify("clear failed: " .. tostring(msg), vim.log.levels.ERROR)
+    end
+  end
+end, {})
+
 -- ---------------------------------------------------------------------------
--- Jump wrapper — jumper.jump + post-jump reconcile.
+-- Internal helpers
 -- ---------------------------------------------------------------------------
--- Tier 3 will lift reconcile into the provider's response path so jumper
--- only ever sees already-reconciled locations. For now this thin wrapper
--- performs the jump, then runs the reconcile pass for ws/symbol-staleness
--- drift correction.
+
+-- Wrap jumper.jump with the dtrace-friendly reassert hook.
 local function jump_to_location(location)
   if not location then return false end
-
-  -- Surface jumper's shada-race re-asserts in the dtrace ring buffer so
-  -- regressions are debuggable.
   jumper._on_reassert = function(reason, prev_cur, ln, cc)
     pcall(dtrace, "jump: shada-race reassert (%s) %d:%d -> %d:%d",
       tostring(reason), prev_cur[1], prev_cur[2], ln, cc)
   end
-
-  local pre_buf = vim.api.nvim_get_current_buf()
-  local pre_cur = vim.api.nvim_win_get_cursor(0)
-
   local ok = jumper.jump(location)
-  if not ok then return false end
-
-  local sym = location._sym_name or location._origin_cword
-  local reconcile_ok = true
-  if sym and #sym > 0 then
-    local range = location.range or location.targetSelectionRange or location.targetRange
-    local line_1b = ((range and range.start and range.start.line) or 0) + 1
-    local rok, rresult = pcall(provider.reconcile_landing_to_definition, sym, line_1b, dtrace)
-    if rok and rresult == false then
-      reconcile_ok = false
-    end
+  if ok then
+    local cur = vim.api.nvim_win_get_cursor(0)
+    pcall(dtrace, "jump: done cursor=%d:%d", cur[1], cur[2])
   end
-
-  if not reconcile_ok then
-    pcall(dtrace, "jump: REJECTED bogus location, restoring cursor to %d:%d", pre_cur[1], pre_cur[2])
-    pcall(vim.api.nvim_set_current_buf, pre_buf)
-    pcall(vim.api.nvim_win_set_cursor, 0, pre_cur)
-    -- Sentinel string so callers can distinguish "reconcile rejected as
-    -- hallucination" from "open failed / generic false". Quickfix
-    -- fallback should NOT be offered for rejected_bogus — the candidate
-    -- list IS the bogus answer; presenting it as a menu is worse than
-    -- telling the user "no reliable definition".
-    return "rejected_bogus"
-  end
-
-  local cur = vim.api.nvim_win_get_cursor(0)
-  pcall(dtrace, "jump: done cursor=%d:%d sym=%s", cur[1], cur[2], tostring(sym))
-  return true
+  return ok
 end
--- Expose for jumplist regression tests (scripts/test_jumper_real.lua,
--- scripts/test_jumplist_fix.lua).
-M._test_jump_to_location = jump_to_location
-M._test_reconcile = function(sym, landed) provider.reconcile_landing_to_definition(sym, landed, dtrace) end
+M._test_jump_to_location = jump_to_location  -- regression tests
+
+-- Format a one-line "✓ sym → file:line (tag)" status string.
+local function format_jump_msg(sym, loc, tag, n_more)
+  local p = location_mod.location_path(loc)
+  local short = p:match("([^/\\]+)$") or "?"
+  local label = string.format("%s:%d", short, location_mod.location_line(loc))
+  if n_more and n_more > 1 then
+    return string.format("✓ %s → %s (%s, %d candidates)", sym or "?", label, tag, n_more)
+  end
+  return string.format("✓ %s → %s (%s)", sym or "?", label, tag)
+end
 
 -- ---------------------------------------------------------------------------
--- M.definition: precise-first
---   1. textDocument/definition (+impl/+decl + retry)  ← always primary
---   2. workspace/symbol fallback                       ← only when (1) is empty
---   3. GTAGS                                            ← only when (2) is also empty
---
--- Rationale (vs the previous 3-track race):
---   * The race was: instant ws/symbol vs precise td/definition vs GTAGS;
---     whichever returned first won. ws/symbol uses fuzzy NAME matching with
---     no scope/AST context, so for fields/variables/enums it returns ALL
---     same-named symbols across the workspace and the user gets a candidate
---     picker even when precise (textDocument/definition) would have a single
---     unambiguous answer (verified on `bBindlessPrimitive`: precise returns
---     ONE Location, ws/symbol returns N).
---   * User decision: precise must ALWAYS win when it has a usable answer.
---     ws/symbol is for the rare case where the AST cannot resolve the symbol
---     at all (typos, macro tokens, broken TUs). GTAGS is for after that.
---   * No reconcile / `<leader>gP` "switch to precise" indirection — there
---     is no second candidate to switch to, precise IS the answer.
+-- M.definition — gd entry.
 -- ---------------------------------------------------------------------------
 
 local request_token = 0
 
 function M.definition()
-  local sym = symbol_mod.current_symbol()
+  local sym      = symbol_mod.current_symbol()
   local receiver = symbol_mod.current_receiver()
-  local bufnr = vim.api.nvim_get_current_buf()
+  local bufnr    = vim.api.nvim_get_current_buf()
   local ref_file = location_mod.normalize_path(vim.api.nvim_buf_get_name(bufnr))
   local ref_line = vim.api.nvim_win_get_cursor(0)[1]
-  dtrace("M.definition() called sym=%q recv=%q file=%s:%d (precise-first)",
+  dtrace("M.definition() sym=%q recv=%q file=%s:%d",
     sym or "", receiver or "",
     vim.fn.fnamemodify(ref_file, ":t"), ref_line)
 
-  -- Early bail #1: cursor IS the definition site of the symbol it sits on.
+  -- Early bail #1: cursor sits ON the definition site itself.
   local at_def, def_kind, def_name = symbol_mod.is_at_definition_at_cursor()
   if at_def then
-    vim.notify(string.format(
-      "● already at %s definition of `%s`",
+    vim.notify(string.format("● already at %s definition of `%s`",
       def_kind or "?", def_name or sym or "?"),
-      vim.log.levels.INFO,
-      { title = "LSP definition", timeout = 3000 })
+      vim.log.levels.INFO, { title = "LSP definition", timeout = 3000 })
     return
   end
 
@@ -291,22 +267,18 @@ function M.definition()
   local dep, dep_root, dep_chain = symbol_mod.is_dependent_at_cursor()
   if dep then
     vim.notify(string.format(
-      "⊘ %s — dependent name (rooted at template parameter `%s`); not resolvable without instantiation. Try grepping for the concrete type or jump to %s instead.",
-      dep_chain or (sym or "?"), dep_root or "?", dep_root or "?"),
-      vim.log.levels.INFO,
-      { title = "LSP definition", timeout = 4000 })
+      "⊘ %s — dependent name (rooted at template param `%s`); not resolvable without instantiation.",
+      dep_chain or sym or "?", dep_root or "?"),
+      vim.log.levels.INFO, { title = "LSP definition", timeout = 4000 })
     return
   end
 
-  -- Stale state from prior gd: clear (kept for backward compat with any
-  -- callers that still poke M._last_precise_winner; precise-first never
-  -- writes to it so it's effectively dead).
-  M._last_precise_winner = nil
-
-  if M._active_notice then
-    pcall(M._active_notice.clear)
-    M._active_notice = nil
+  if not sym or sym == "" then
+    vim.notify("No symbol under cursor", vim.log.levels.WARN)
+    return
   end
+
+  if M._active_notice then pcall(M._active_notice.clear); M._active_notice = nil end
 
   request_token = request_token + 1
   local my_token = request_token
@@ -329,16 +301,24 @@ function M.definition()
     end
   end
 
-  -- Resolve platform hints once (used by ranking when precise returns N).
-  local platform_hints = nil
-  do
-    local ok, ue = pcall(require, "ue")
-    if ok and ue.platform_path_priorities then
-      platform_hints = ue.platform_path_priorities()
+  -- ----- cache short-circuit -------------------------------------------------
+  local ch_locs, ch_key, ch_source = cache.get(sym, receiver, bufnr)
+  if ch_locs and #ch_locs > 0 then
+    dtrace("cache HIT key=%q source=%s n=%d",
+      tostring(ch_key), tostring(ch_source), #ch_locs)
+    -- Stamp transient fields so downstream debug shows the right name.
+    ch_locs[1]._origin_cword = sym
+    ch_locs[1]._sym_name     = sym
+    if jump_to_location(ch_locs[1]) then
+      jumped = true
+      done(format_jump_msg(sym, ch_locs[1],
+        string.format("cache·%s", ch_source or "?"), #ch_locs), 2000)
+      return
     end
+    dtrace("cache: jump failed; proceeding to live resolve")
   end
 
-  -- Files clangd cannot answer (shaders, Build.cs, Python): GTAGS-only.
+  -- ----- non-clangd ext (shaders, Build.cs, Python) -> GTAGS direct ----------
   local ext = ui.buf_extension(bufnr)
   if ui.NON_CLANGD_EXTS[ext] then
     dtrace("non-clangd ext=%s -> GTAGS direct", tostring(ext))
@@ -353,29 +333,15 @@ function M.definition()
   end
 
   local has_def_client = #vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/definition" }) > 0
-  local has_ws_client  = #vim.lsp.get_clients({ bufnr = bufnr, method = "workspace/symbol" }) > 0
 
-  if not has_def_client and not has_ws_client then
-    dtrace("no LSP clients -> GTAGS direct")
-    provider.gtags_fallback_async(sym, function(ok)
-      if not still_current() then return end
-      done()
-      if not ok then
-        vim.notify("No definition (no LSP, GTAGS empty): " .. (sym or "?"), vim.log.levels.INFO)
-      end
-    end)
-    return
-  end
-
-  -- Spinner: only after 600ms so fast precise hits don't flash.
+  -- Spinner: only show after 600ms so fast precise / cache hits don't flash.
   vim.defer_fn(function()
     if not still_current() or resolved or jumped then return end
     notice = ui.progress_notice(string.format("⏳ resolving %s ...", sym or "?"))
     M._active_notice = notice
   end, LSP_PROGRESS_NOTICE_MS)
 
-  -- Hard timeout: 30s ceiling. async_lsp_definition_with_retry has its own
-  -- per-request ceiling; this is the orchestrator-level safety net.
+  -- Hard timeout: 30s ceiling.
   vim.defer_fn(function()
     if not still_current() or resolved then return end
     done()
@@ -385,224 +351,107 @@ function M.definition()
     end
   end, OVERALL_TIMEOUT_MS)
 
-  -- ---------------------------------------------------------------
-  -- Forward declaration so handle_precise / fallback can call each other.
-  -- ---------------------------------------------------------------
-  local fallback_ws_then_gtags
+  -- ----- the cache+csearch fallback chain ------------------------------------
+  -- Tried in order when path-A returns empty:
+  --   (1) csearch_fb.find  (RE2 def-shaped pattern, scored)
+  --   (2) provider.gtags_fallback_async  (jumps internally)
+  local function csearch_then_gtags()
+    if jumped or resolved then return end
+    dtrace("path-B: csearch dispatch sym=%q recv=%q", sym, tostring(receiver))
+    csearch_fb.find(sym, {
+      bufnr = bufnr,
+      receiver = receiver,
+      timeout_ms = CSEARCH_TIMEOUT_MS,
+    }, function(locs, info)
+      if not still_current() or resolved then clear_notice(); return end
+      dtrace("path-B: csearch back n=%d took=%dms reason=%s indexed=%s",
+        info.count or 0, info.took_ms or -1,
+        tostring(info.reason), tostring(info.indexed))
 
-  -- handle_precise: process the on_result of async_lsp_definition_with_retry.
-  -- locs may be nil (LSP returned empty) or a non-empty list (def+impl+decl
-  -- already merged & deduped by provider).
-  local function handle_precise(locs)
-    dtrace("precise: back n=%d still=%s jumped=%s",
-      locs and #locs or 0, tostring(still_current()), tostring(jumped))
-    if not still_current() then
-      clear_notice()
-      return
-    end
-
-    if locs and #locs > 0 then
-      local filtered, fi = syntax_filter.filter_by_call_signature(locs, bufnr, dtrace)
-      dtrace("precise: syntax_filter applied=%s K=%s before=%d after=%d skipped=%s",
-        tostring(fi.applied), tostring(fi.call_arity), fi.before, fi.after, tostring(fi.skipped))
-
-      local precise_rejected = false
-
-      if #filtered == 1 then
-        local winner = filtered[1]
-        winner._origin_cword = sym
-        winner._sym_name = sym
-        local pok, ok_or_err = pcall(jump_to_location, winner)
-        local ok = pok and ok_or_err == true
-        dtrace("precise: jump pok=%s ok=%s", tostring(pok), tostring(ok_or_err))
-        if ok then
+      if locs and #locs > 0 then
+        locs[1]._origin_cword = sym
+        locs[1]._sym_name     = sym
+        if jump_to_location(locs[1]) then
           jumped = true
-          local p = location_mod.location_path(winner)
-          local short = p:match("([^/\\]+)$") or "?"
-          local label = string.format("%s:%d", short, location_mod.location_line(winner))
-          local tag = fi.applied and "precise·syntax" or "precise"
-          done(string.format("✓ %s → %s (%s)", sym or "?", label, tag), 3000)
+          cache.put(sym, receiver, locs, "csearch", bufnr)
+          done(format_jump_msg(sym, locs[1], "csearch", #locs), 3000)
           return
         end
-        if pok and ok_or_err == "rejected_bogus" then
-          precise_rejected = true
-        end
-      elseif #filtered > 1 then
-        -- pair_picker first (header+cpp / sole-cpp-among-headers heuristics).
-        local pp_winner, pp_rule = pair_picker.pick_safe_winner(filtered)
-        if pp_winner then
-          pp_winner._origin_cword = sym
-          pp_winner._sym_name = sym
-          local pok, ok_or_err = pcall(jump_to_location, pp_winner)
-          local ok = pok and ok_or_err == true
-          dtrace("precise: pair_picker rule=%s pok=%s ok=%s",
-            tostring(pp_rule), tostring(pok), tostring(ok_or_err))
-          if ok then
-            jumped = true
-            local p = location_mod.location_path(pp_winner)
-            local short = p:match("([^/\\]+)$") or "?"
-            local label = string.format("%s:%d", short, location_mod.location_line(pp_winner))
-            local tag = fi.applied
-              and string.format("precise·syntax·%s", pp_rule)
-              or  string.format("precise·%s", pp_rule)
-            done(string.format("✓ %s → %s (%s, %d→1)", sym or "?", label, tag, #filtered), 3000)
-            return
-          end
-          if pok and ok_or_err == "rejected_bogus" then
-            precise_rejected = true
-          end
-        end
+        dtrace("path-B: csearch jump failed; falling through to GTAGS")
       end
 
-      -- Reject-bogus short circuit: precise's only / pair_picker pick was
-      -- a hallucination. Don't pretend the rest of filtered is trustworthy.
-      if precise_rejected then
-        local tag = fi.applied and "precise·syntax" or "precise"
-        done(string.format(
-          "⊘ %s — clangd's only candidate was rejected as bogus (%s); try <leader>fG to grep",
-          sym or "?", tag), 4000)
-        return
-      end
-
-      -- N>1 candidates and pair_picker didn't pick: rerank + picker UI.
-      -- This is the legitimate "real overloads" case (e.g. virtual function
-      -- with N implementations). User gets to choose.
-      if not jumped and #filtered >= 1 then
-        local sorted = ranking.rerank_locations(filtered, platform_hints, ref_file, receiver)
-        local outcome = ui.try_jump(sorted, "LSP definitions")
-        if outcome == true or outcome == "open_failed" then
-          jumped = true
-          local first = sorted[1]
-          local p = location_mod.location_path(first)
-          local short = p:match("([^/\\]+)$") or "?"
-          local label = string.format("%s:%d", short, location_mod.location_line(first))
-          local tag = fi.applied and "precise·syntax" or "precise"
-          done(string.format("✓ %s → %s (%d candidates, %s)", sym or "?", label, #sorted, tag), 3000)
-          return
-        end
-      end
-    end
-
-    -- Precise gave nothing usable: fall to ws/symbol then GTAGS.
-    if jumped then done(); return end
-    fallback_ws_then_gtags()
-  end
-
-  -- ws/symbol fallback: clangd couldn't resolve the symbol via AST (typo,
-  -- macro token, broken TU, etc.). Last-ditch fuzzy name lookup. May return
-  -- many same-named symbols — present as picker, never auto-jump (user
-  -- already established that auto-jumping ws/symbol candidates is wrong).
-  fallback_ws_then_gtags = function()
-    if not has_ws_client or not sym or sym == "" then
-      dtrace("fallback: skipping ws/symbol (no client or no sym), going GTAGS")
-      provider.gtags_fallback_async(sym, function(jumped_g)
+      -- csearch empty or jump failed -> GTAGS (last resort).
+      provider.gtags_fallback_async(sym, function(g_jumped)
         if not still_current() or resolved then clear_notice(); return end
-        if jumped_g then
+        if g_jumped then
           jumped = true
           done(string.format("✓ %s (GTAGS fallback)", sym or "?"), 3000)
         else
           done()
-          vim.notify("No definition (LSP and GTAGS both empty): " .. (sym or "?"),
+          vim.notify(string.format(
+            "No definition (clangd/csearch/GTAGS all empty): %s", sym or "?"),
             vim.log.levels.INFO)
         end
       end)
-      return
-    end
-
-    dtrace("fallback: dispatching ws/symbol q=%q (precise was empty)", sym)
-    provider.async_lsp_workspace_symbol(bufnr, sym, true, function(ws_locs)
-      local n = ws_locs and #ws_locs or 0
-      dtrace("fallback ws/symbol: n=%d still=%s resolved=%s",
-        n, tostring(still_current()), tostring(resolved))
-      if not still_current() or resolved then return end
-
-      if ws_locs then
-        ws_locs = location_mod.filter_self_locations(ws_locs, ref_file, ref_line)
-      end
-
-      if not ws_locs or #ws_locs == 0 then
-        -- ws/symbol also empty: GTAGS.
-        provider.gtags_fallback_async(sym, function(jumped_g)
-          if not still_current() or resolved then clear_notice(); return end
-          if jumped_g then
-            jumped = true
-            done(string.format("✓ %s (GTAGS fallback)", sym or "?"), 3000)
-          else
-            done()
-            vim.notify("No definition (LSP and GTAGS both empty): " .. (sym or "?"),
-              vim.log.levels.INFO)
-          end
-        end)
-        return
-      end
-
-      if #ws_locs > INSTANT_MAX_CANDIDATES then
-        dtrace("fallback ws/symbol: too many candidates (%d > %d), going GTAGS",
-          #ws_locs, INSTANT_MAX_CANDIDATES)
-        provider.gtags_fallback_async(sym, function(jumped_g)
-          if not still_current() or resolved then clear_notice(); return end
-          if jumped_g then
-            jumped = true
-            done(string.format("✓ %s (GTAGS fallback)", sym or "?"), 3000)
-          else
-            done()
-            vim.notify(string.format(
-              "Too many ws/symbol candidates (%d), GTAGS empty: %s",
-              #ws_locs, sym or "?"), vim.log.levels.INFO)
-          end
-        end)
-        return
-      end
-
-      -- ws/symbol returned a manageable set: try syntax_filter to narrow,
-      -- then ALWAYS show as picker (no auto-jump on ws/symbol fallback —
-      -- this is the precise-first contract).
-      local filtered, fi = syntax_filter.filter_by_call_signature(ws_locs, bufnr, dtrace)
-      dtrace("fallback ws/symbol: syntax_filter applied=%s before=%d after=%d",
-        tostring(fi.applied), fi.before, fi.after)
-
-      local sorted = ranking.rerank_locations(filtered, platform_hints, ref_file, receiver)
-      local outcome = ui.try_jump(sorted, "LSP ws/symbol fallback (precise was empty)")
-      if outcome == true or outcome == "open_failed" then
-        jumped = true
-        local first = sorted[1]
-        local p = location_mod.location_path(first)
-        local short = p:match("([^/\\]+)$") or "?"
-        local label = string.format("%s:%d", short, location_mod.location_line(first))
-        done(string.format("⚠ %s → %s (ws/symbol fallback, %d cand)",
-          sym or "?", label, #sorted), 3000)
-      else
-        -- picker dismissed without selection
-        done()
-      end
     end)
   end
 
-  -- ---------------------------------------------------------------
-  -- Dispatch.
-  -- ---------------------------------------------------------------
-  if has_def_client then
-    dtrace("precise: dispatching textDocument/definition (precise-first)")
-    provider.async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_current, handle_precise)
-  else
-    -- No def_client; only ws/symbol + GTAGS available.
-    fallback_ws_then_gtags()
-  end
-end
-
--- Jump to the precise definition stored by the last reconcile, if any.
-function M.jump_to_precise()
-  local w = M._last_precise_winner
-  if not w then
-    vim.notify("No precise winner recorded yet", vim.log.levels.WARN)
+  if not has_def_client then
+    dtrace("no LSP def-client -> path-B directly")
+    csearch_then_gtags()
     return
   end
-  pcall(jump_to_location, w)
-  M._last_precise_winner = nil
+
+  -- ----- path-A: textDocument/definition -------------------------------------
+  dtrace("path-A: dispatching textDocument/definition")
+  provider.async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_current,
+    function(locs)
+      if not still_current() then clear_notice(); return end
+      dtrace("path-A: back n=%d", locs and #locs or 0)
+
+      if not locs or #locs == 0 then
+        csearch_then_gtags()
+        return
+      end
+
+      -- N>=1 — pick first (locations from clangd are ordered: definition
+      -- before declaration). On N>1 (overloads / virtuals), present a picker.
+      if #locs == 1 then
+        locs[1]._origin_cword = sym
+        locs[1]._sym_name     = sym
+        if jump_to_location(locs[1]) then
+          jumped = true
+          cache.put(sym, receiver, locs, "lsp", bufnr)
+          done(format_jump_msg(sym, locs[1], "precise"), 3000)
+          return
+        end
+        -- jump failed -> path-B
+        csearch_then_gtags()
+        return
+      end
+
+      -- N>1 candidates -> picker UI. User selects → ui.try_jump executes
+      -- the jump itself; if successful, write the *picked* location back
+      -- to cache (we don't know which one until the picker finishes, so
+      -- ui.try_jump's outcome is "true"/"open_failed" but doesn't return
+      -- the chosen location). We fallback to caching the entire candidate
+      -- set under the same keys; cache.get's first-element semantics will
+      -- replay locs[1] which may not be what the user picked. To avoid
+      -- that footgun, we DON'T cache when N>1 — wait for an unambiguous
+      -- next gd to record the right answer.
+      local outcome = ui.try_jump(locs, "LSP definitions")
+      if outcome == true or outcome == "open_failed" then
+        jumped = true
+        done(format_jump_msg(sym, locs[1], "precise·picker", #locs), 3000)
+      else
+        -- picker dismissed without a selection
+        done()
+      end
+    end)
 end
 
 -- ---------------------------------------------------------------------------
--- Diagnostics
+-- M.status
 -- ---------------------------------------------------------------------------
 
 function M.status()
@@ -621,20 +470,20 @@ function M.status()
     for _, c in ipairs(def_clients) do
       table.insert(lines, string.format("  - %s (id=%d, encoding=%s)",
         c.name, c.id, c.offset_encoding or "?"))
-      local progress = c.progress
-      if progress and progress.pending then
-        for token, msg in pairs(progress.pending) do
-          table.insert(lines, string.format("    progress[%s]: %s",
-            tostring(token), vim.inspect(msg)))
-        end
-      end
     end
+  end
+  local ok, st = pcall(cache.stats, bufnr)
+  if ok and st then
+    table.insert(lines, "")
+    table.insert(lines, string.format(
+      "cache: entries=%d  lru_max=%d  project=%s",
+      st.entries or 0, st.lru_max or 0, tostring(st.project)))
   end
   vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO, { title = "LSP fallback status" })
 end
 
 -- ---------------------------------------------------------------------------
--- M.references — sync, qf-only.
+-- M.references — sync, qf-only. Unchanged from prior implementation.
 -- ---------------------------------------------------------------------------
 
 function M.references()
@@ -643,26 +492,19 @@ function M.references()
     vim.notify("No symbol under cursor", vim.log.levels.WARN)
     return
   end
-
   local locations, errors, timed_out = provider.sync_locations("textDocument/references", 5000)
   if timed_out then
-    vim.notify("LSP references timed out — falling back to GTAGS (results may be lower quality)",
-      vim.log.levels.WARN)
+    vim.notify("LSP references timed out — falling back to GTAGS", vim.log.levels.WARN)
   elseif errors and errors > 0 then
-    vim.notify(string.format("LSP references: %d client(s) returned errors", errors),
+    vim.notify(string.format("LSP references: %d client(s) errored", errors),
       vim.log.levels.WARN)
   end
-
   if locations and #locations > 0
     and location_mod.populate_quickfix("LSP references: " .. sym, locations) then
     return
   end
-
   local ok, ue = pcall(require, "ue")
-  if ok and ue.gtags_references and ue.gtags_references(sym) then
-    return
-  end
-
+  if ok and ue.gtags_references and ue.gtags_references(sym) then return end
   vim.notify("No references (LSP/GTAGS)", vim.log.levels.INFO)
 end
 

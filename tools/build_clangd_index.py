@@ -13,7 +13,7 @@ per-file 的小子集 CDB（几百到几千 TU）。:UEIndexFull 走 build_full_
 流程:
   1. 读取 compile_commands.json（已 inject 过 -D 的 per-file 子集）
   2. 调用 clangd-indexer --executor=all-TUs 生成 .idx
-  3. 输出到 .clangd-index/<project>.idx
+  3. 输出到 .cache/nvim-ue/clangd/index/<project>.idx
 
 用法:
   python build_clangd_index.py <PROJ_DRIVE>/UEProj/compile_commands.json
@@ -104,7 +104,9 @@ def main():
     project_root = detect_project_root(cdb_path)
 
     # Output path
-    idx_dir = os.path.join(project_root, ".clangd-index")
+    # Cache layout v3: idx lives under <project>/.cache/nvim-ue/clangd/index
+    # (was: <project>/.clangd-index). Single-root cache.
+    idx_dir = os.path.join(project_root, ".cache", "nvim-ue", "clangd", "index")
     os.makedirs(idx_dir, exist_ok=True)
     project_name = os.path.basename(project_root)
     idx_path = args.output or os.path.join(idx_dir, f"{project_name}.idx")

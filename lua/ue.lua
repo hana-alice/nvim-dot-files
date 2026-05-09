@@ -1132,20 +1132,20 @@ local function current_engine_root(preferred_bufname)
   return nil
 end
 
--- Cache layout v2 (2026-04-27):
---   .cache/nvim-ue/
+-- Cache layout v3 (2026-05-09):
+--   .cache/nvim-ue/                           -- single root, all cache lives here
 --     state.json                              -- top-level (scanner-friendly)
 --     csearch/csearch.idx                     -- trigram index
 --     gtags/                                  -- gtags input lists + DB
 --       workspace/         (GTAGS DB)
---       workspace.files
---       workspace_all.files
---       engine.files
---       project.files
+--       workspace.files / workspace_all.files / engine.files / project.files
 --     cdb/                                    -- clangd compile-db assets
 --       modules.json, queue.json
---       compile_commands/{current,hot,full}.json
---     logs/                                   -- ue.lua _logged_jobstart sink
+--       compile_commands/{current,hot,full,inject_full}.json
+--     clangd/                                 -- clangd-consumed artifacts (was: $root/.clangd-{index,pch})
+--       index/<project>.{idx,current.idx,hot.idx,full.idx}
+--       pch/<*.pch + build_pch.bat>
+--     logs/                                   -- ue.lua _logged_jobstart sink + indexer logs
 --     runtime/dirty.json                      -- watcher persistence
 --     legacy/                                 -- pre-v2 holdouts (manual prune)
 cache_paths = function(engine_root)
@@ -1157,7 +1157,9 @@ cache_paths = function(engine_root)
   local logs_dir = join(cache, "logs")
   local runtime_dir = join(cache, "runtime")
   local legacy_dir = join(cache, "legacy")
-  local active_index_dir = join(engine_root, ".clangd-index")
+  local clangd_dir = join(cache, "clangd")
+  local active_index_dir = join(clangd_dir, "index")
+  local pch_dir = join(clangd_dir, "pch")
   local project_name = vim.fn.fnamemodify(engine_root, ":t")
   return {
     cache = cache,
@@ -1180,17 +1182,22 @@ cache_paths = function(engine_root)
     index_current_cdb = join(cdb_files_dir, "current.json"),
     index_hot_cdb = join(cdb_files_dir, "hot.json"),
     index_full_cdb = join(cdb_files_dir, "full.json"),
+    index_inject_full_cdb = join(cdb_files_dir, "inject_full.json"),
     -- logs / runtime / legacy
     logs_dir = logs_dir,
     runtime_dir = runtime_dir,
     dirty_json = join(runtime_dir, "dirty.json"),
     legacy_dir = legacy_dir,
-    -- clangd active overlay (lives under engine_root, not under cache)
+    -- clangd-consumed artifacts (.idx + .pch). v3 collapses these under
+    -- .cache/nvim-ue/clangd/ instead of two separate top-level dirs.
+    clangd_dir = clangd_dir,
     active_index_dir = active_index_dir,
     active_index = join(active_index_dir, project_name .. ".idx"),
     current_index = join(active_index_dir, project_name .. ".current.idx"),
     hot_index = join(active_index_dir, project_name .. ".hot.idx"),
     full_index = join(active_index_dir, project_name .. ".full.idx"),
+    pch_dir = pch_dir,
+    pch_build_bat = join(pch_dir, "build_pch.bat"),
   }
 end
 
@@ -7272,7 +7279,7 @@ local function clear_cache(opts)
     -- longer supported"). The error is silently dropped by clangd, so
     -- the only symptom is "all UE types unknown" — see :UEBuildPCH.
     for _, root in ipairs(clangd_roots) do
-      local pch_dir = join(root, ".clangd-pch")
+      local pch_dir = cache_paths(root).pch_dir
       if _ufs.is_dir(pch_dir) then
         pcall(vim.fn.delete, pch_dir, "rf")
         table.insert(removed, "  " .. pch_dir .. "/ (PCH cache)")
@@ -7717,7 +7724,7 @@ function M.setup()
     if ctx.project_root then table.insert(roots, ctx.project_root) end
     local bat = nil
     for _, root in ipairs(roots) do
-      local candidate = join(root, ".clangd-pch", "build_pch.bat")
+      local candidate = cache_paths(root).pch_build_bat
       if _ufs.is_file(candidate) then bat = candidate; break end
     end
     if not bat then

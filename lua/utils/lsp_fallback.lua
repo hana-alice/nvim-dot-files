@@ -287,6 +287,18 @@ function M.definition()
     return
   end
 
+  -- Early bail #3: cursor inside a syntactic dead-zone (comment / string /
+  -- number / char literal). LSP cannot resolve these and would otherwise
+  -- spend a 30s timeout returning empty. Toast + bail.
+  local in_dead, dead_kind = symbol_mod.is_in_unresolvable_context_at_cursor()
+  if in_dead then
+    dtrace("dead-zone bail: kind=%s", tostring(dead_kind))
+    vim.notify(string.format("⊘ cursor is inside %s — no definition lookup",
+      dead_kind or "literal"),
+      vim.log.levels.INFO, { title = "LSP definition", timeout = 2000 })
+    return
+  end
+
   if not sym or sym == "" then
     vim.notify("No symbol under cursor", vim.log.levels.WARN)
     return

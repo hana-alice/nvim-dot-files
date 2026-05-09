@@ -214,14 +214,28 @@ end, {})
 -- Wrap jumper.jump with the dtrace-friendly reassert hook.
 local function jump_to_location(location)
   if not location then return false end
+  -- Pre-jump trace: where we are + where we're aiming. Knowing the source
+  -- file/line in the trace makes "wrong-place" reports trivial to triage.
+  local pre_name = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(0), ":t")
+  local pre_pos = vim.api.nvim_win_get_cursor(0)
+  local cw = vim.fn.expand("<cword>")
+  local dst_uri = location.uri or location.targetUri or ""
+  local dst_rng = location.range or location.targetSelectionRange or location.targetRange or {}
+  local dst_line = (((dst_rng or {}).start) or {}).line or -1
+  pcall(dtrace, "jump: pre  cur=%s:%d:%d cword=%q -> dst=%s:%d",
+    pre_name, pre_pos[1], pre_pos[2], tostring(cw),
+    vim.fn.fnamemodify(vim.uri_to_fname(dst_uri ~= "" and dst_uri or "file:///?"), ":t"),
+    dst_line + 1)
+
   jumper._on_reassert = function(reason, prev_cur, ln, cc)
     pcall(dtrace, "jump: shada-race reassert (%s) %d:%d -> %d:%d",
       tostring(reason), prev_cur[1], prev_cur[2], ln, cc)
   end
   local ok = jumper.jump(location)
   if ok then
+    local cur_name = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(0), ":t")
     local cur = vim.api.nvim_win_get_cursor(0)
-    pcall(dtrace, "jump: done cursor=%d:%d", cur[1], cur[2])
+    pcall(dtrace, "jump: done cur=%s:%d:%d", cur_name, cur[1], cur[2])
   end
   return ok
 end

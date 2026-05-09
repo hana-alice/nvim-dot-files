@@ -7,80 +7,21 @@
 -- Or remove existing autocmds by their group name (which is prefixed with `lazyvim_` for the defaults)
 -- e.g. vim.api.nvim_del_augroup_by_name("lazyvim_wrap_spell")
 
--- ── Preserve viewport when switching buffers ─────────────────────────
--- Without this, switching buffers resets the scroll position so the
--- cursor lands in the middle of the screen instead of where you left it.
---
--- Guard: any code that positions the cursor after switching buffers
--- (picker jump, goto-definition, etc.) should set
---   vim.g._restore_view_skip = true
--- before doing so. The BufEnter handler honours this flag and skips the
--- scheduled winrestview so the jump target is not overwritten.
-local buf_views = {}
-local last_left_buf = nil -- track the buffer we left
-local view_group = vim.api.nvim_create_augroup("PreserveBufferView", { clear = true })
-
-vim.api.nvim_create_autocmd("BufLeave", {
-  group = view_group,
-  callback = function()
-    local buf = vim.api.nvim_get_current_buf()
-    if vim.bo[buf].buftype == "" then
-      buf_views[buf] = vim.fn.winsaveview()
-      last_left_buf = buf
-    else
-      -- Leaving a special buffer (picker, sidebar, terminal, etc.)
-      -- → the next BufEnter should NOT restore, because the user is
-      --   returning from a jump action, not manually switching buffers.
-      last_left_buf = nil
-    end
-  end,
-})
-
-vim.api.nvim_create_autocmd("BufEnter", {
-  group = view_group,
-  callback = function()
-    -- Skip flag (set by picker jump wrapper, goto-definition, etc.)
-    if vim.g._restore_view_skip then
-      vim.g._restore_view_skip = nil
-      return
-    end
-
-    local buf = vim.api.nvim_get_current_buf()
-    local view = buf_views[buf]
-
-    -- Only restore if we came from another normal buffer (buftype="").
-    -- If last_left_buf is nil, we came from a special buffer (sidebar,
-    -- picker float, terminal) → skip restore so jump targets stick.
-    -- Also skip if we're "returning" to the same buffer we left (e.g.
-    -- picker opened and closed on the same file → symbol jump).
-    local should_restore = view
-      and vim.bo[buf].buftype == ""
-      and last_left_buf ~= nil
-      and last_left_buf ~= buf
-
-    if not should_restore then
-      return
-    end
-
-    vim.schedule(function()
-      if vim.g._restore_view_skip then
-        vim.g._restore_view_skip = nil
-        return
-      end
-      if vim.api.nvim_get_current_buf() ~= buf then
-        return
-      end
-      pcall(vim.fn.winrestview, view)
-    end)
-  end,
-})
-
-vim.api.nvim_create_autocmd("BufDelete", {
-  group = view_group,
-  callback = function(args)
-    buf_views[args.buf] = nil
-  end,
-})
+-- Note: PreserveBufferView (BufLeave winsaveview / BufEnter winrestview) was
+-- removed on 2026-05-09. It was a workaround for the perceived "buffer
+-- viewport gets lost on switch" symptom, but it stomped on legitimate cursor
+-- positioning by any code that crossed buffers (LSP gd, ue_goto/jumper, the
+-- snacks picker jump action, etc.). Each such code path had to set
+-- vim.g._restore_view_skip = true to opt out — easy to forget and silently
+-- caused cursor drift after goto-definition (verified via
+-- selftest_gd11 trace 2026-05-09: jumper landed at GlobalShader.h:388:8,
+-- then PreserveBufferView's scheduled winrestview snapped back to the
+-- buffer's last-left view {lnum=368, col=0, topline=364}, dragging the
+-- cursor with it). Vim/Neovim's native behavior already restores the
+-- per-buffer cursor on re-enter; the residual "viewport feels reset"
+-- symptom is handled by lazyvim_last_loc on first read and by the user's
+-- own zz/zt habits afterwards. Removing this autocmd also lets us drop
+-- the _restore_view_skip dance from snacks.lua picker jump wrapper.
 
 local is_windows = require("utils.platform").is_windows
 

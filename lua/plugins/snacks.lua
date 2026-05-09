@@ -453,6 +453,23 @@ return {
         enabled = false,
         replace_netrw = false,
       })
+      -- Disable snacks.scroll smooth-scroll animation.
+      -- Reason: when ue_goto/jumper.lua does a cross-buffer jump and lands at
+      -- a target line far from the buffer's last cursor position (e.g. gd from
+      -- a .cpp at line 58 -> a .h at line 388, where the .h was last
+      -- visited at line 80), snacks.scroll launches a winrestview animation
+      -- from the OLD position towards the NEW one. Each animation frame calls
+      -- nvim_win_set_cursor, so the cursor visibly drifts away from the jump
+      -- target and lands somewhere mid-animation (line 240 in screenshots,
+      -- 63/76/80/81 in autopsy traces) instead of staying at line 388.
+      -- Trace evidence (selftest_gd10): SETCUR stack -> snacks/scroll.lua:373
+      -- -> snacks/animate/init.lua:163 step(), winrestview at scroll.lua:340.
+      -- Fix path A: kill the animation globally. Trade-off: no smooth scroll
+      -- on <C-d>/<C-u>/zz/zb/zt; cursor jumps are instant. Acceptable for a
+      -- code-heavy workflow where correctness > eye-candy.
+      opts.scroll = vim.tbl_deep_extend("force", opts.scroll or {}, {
+        enabled = false,
+      })
       opts.picker = opts.picker or {}
       opts.picker.layout = vim.tbl_deep_extend("force", { preset = "vscode" }, opts.picker.layout or {})
 
@@ -522,31 +539,29 @@ return {
       opts.picker.actions = vim.tbl_deep_extend("force", opts.picker.actions or {}, {
         paste_clipboard = paste_picker_clipboard,
         pin_sidebar_qflist = pin_sidebar_qflist,
-        -- Wrap the default jump action to work around two issues:
-        -- 1. PreserveBufferView autocmd (config/autocmds.lua) restoring the
-        --    old viewport via winrestview, overwriting the jump target.
-        --    → Fixed by synchronous skip flag check in autocmds.lua BufEnter.
-        -- 2. Neovide sending an implicit mouse-release event when the picker
-        --    float closes and focus returns to the main window, which moves
-        --    the cursor to wherever the mouse pointer is on screen.
-        --    → Fixed by cursor guard using vim.defer_fn(0) that runs AFTER
-        --      all pending vim.schedule callbacks (including snacks' own
-        --      insert-mode reschedule of M.jump).
+        -- Wrap the default jump action to work around a Neovide-specific
+        -- issue: when the picker float closes, Neovide sends an implicit
+        -- mouse-release event that moves the cursor to wherever the mouse
+        -- pointer sits on screen. We install a one-shot CursorMoved guard
+        -- to snap the cursor back to the actual jump target.
+        --
+        -- Note: a previous variant of this wrapper also set
+        -- vim.g._restore_view_skip = true to coordinate with the
+        -- PreserveBufferView autocmd in config/autocmds.lua. That autocmd
+        -- has been removed (it was a leaky workaround that hijacked every
+        -- cross-buffer cursor positioning, including LSP gd / ue_goto/jumper)
+        -- — so the skip-flag dance is gone. This wrapper now ONLY handles
+        -- the Neovide mouse-release guard.
+        --
+        -- TODO: Remove this wrapper entirely once Neovide fixes the implicit
+        -- mouse-release. https://github.com/neovide/neovide/issues
         jump = function(picker, item, action)
-          -- (1) Tell PreserveBufferView to skip the next BufEnter restore.
-          vim.g._restore_view_skip = true
-
           -- Call the real jump. NOTE: in insert mode (picker input), this
           -- does stopinsert() + vim.schedule(M.jump) internally, so the
           -- actual jump happens in a later event loop tick.
           require("snacks.picker.actions").jump(picker, item, action)
 
-          -- (2) Guard against Neovide mouse-release cursor repositioning.
-          -- Neovide issue: when a floating window closes while the mouse button
-          -- is released, Neovide sends an implicit <LeftRelease> that moves the
-          -- cursor to wherever the mouse pointer sits on screen.
-          -- TODO: Remove this workaround once Neovide fixes this behavior.
-          -- https://github.com/neovide/neovide/issues — search "cursor jump after float close"
+          -- Neovide-only: guard against the mouse-release cursor reposition.
           -- We use a two-layer defer: first vim.schedule to get past the
           -- insert-mode reschedule, then vim.defer_fn(0) to run after
           -- the actual jump's vim.schedule has completed.

@@ -990,7 +990,30 @@ local function default_target_configuration(project_root, uproject, platform)
   return "Development"
 end
 
-local function resolve_project_input(path)
+-- Build/persist the workspace -> .uproject relative-path hint. This lets the
+-- user type just the workspace root with `:UESetProject` (e.g. an arbitrary
+-- p4 workspace mount point) and have the .uproject located by joining a
+-- previously-recorded relative subpath.
+--
+-- Stored per engine_root in state.json under `uproject_relative_path` (e.g.
+-- "Source/Foo/Foo.uproject" -- never hard-coded here, the value comes from
+-- whatever the user passes to `:UESetUprojectRelativePath`).
+local function set_uproject_relative_path(engine_root, rel)
+  rel = norm(trim(rel or ""))
+  if rel == "" then
+    update_state_field(engine_root, "uproject_relative_path", nil)
+    return
+  end
+  -- Strip leading slashes/backslashes so join() works regardless of input form
+  rel = rel:gsub("^[/\\]+", "")
+  if not rel:match("%.uproject$") then
+    return nil, "uproject_relative_path must end with .uproject"
+  end
+  update_state_field(engine_root, "uproject_relative_path", rel)
+  return rel
+end
+
+local function resolve_project_input(path, engine_root)
   path = norm(trim(path))
   if path == "" then
     return nil, nil, "Project path not provided"
@@ -1007,12 +1030,32 @@ local function resolve_project_input(path)
     return nil, nil, "Project directory not found: " .. path
   end
 
+  -- Fast path: .uproject directly inside the dir.
   local uproject = find_uproject_in_dir(path)
-  if not uproject then
-    return nil, nil, "Selected directory has no .uproject: " .. path
+  if uproject then
+    return path, uproject, nil
   end
 
-  return path, uproject, nil
+  -- Workspace shortcut: <workspace>/<rel> where <rel> was previously taught
+  -- via :UESetUprojectRelativePath. Lets the user just type the workspace
+  -- mount point. Per-engine_root, so different engines can have different
+  -- conventions.
+  if engine_root then
+    local state = read_state(engine_root)
+    local rel = state and state.uproject_relative_path
+    if rel and rel ~= "" then
+      local candidate = norm(join(path, rel))
+      if _ufs.is_file(candidate) then
+        return _ufs.dirname(candidate), candidate, nil
+      end
+      return nil, nil, "Workspace shortcut miss: expected " .. candidate ..
+        " (set hint: :UESetUprojectRelativePath, or pass full .uproject)"
+    end
+  end
+
+  return nil, nil, "Selected directory has no .uproject: " .. path ..
+    "\nEither pass the full .uproject path, or run :UESetUprojectRelativePath" ..
+    " <relative/path/to.uproject> once so the workspace root works in future."
 end
 
 local function detect_project_root_from_path(path)
@@ -1291,7 +1334,7 @@ local function resolve_context(opts)
   end
 
   if state.project_root then
-    state_project_root, state_uproject = resolve_project_input(state.project_root)
+    state_project_root, state_uproject = resolve_project_input(state.project_root, engine_root)
   end
 
   if opts.detect_project ~= false then
@@ -6010,7 +6053,7 @@ local function set_project(input)
     input = vim.fn.input("UE project dir or .uproject: ", default_path, "file")
   end
 
-  local project_root, uproject, err = resolve_project_input(input)
+  local project_root, uproject, err = resolve_project_input(input, engine_root)
   if not project_root then
     vim.notify(err, vim.log.levels.WARN)
     return
@@ -6042,6 +6085,41 @@ local function set_android_package(input)
   invalidate_status_cache()
   refresh_statusline()
   vim.notify("UE Android package set:\nEngine: " .. engine_root .. "\nPackage: " .. input)
+end
+
+-- Tell ue.lua how to find the .uproject when only a workspace root is given
+-- to :UESetProject. Stored per engine_root in state.json so different engines
+-- can have different conventions and the value never appears in source code.
+local function set_uproject_relative_path_command(input)
+  local engine_root = current_engine_root()
+  if not engine_root then
+    vim.notify("No Unreal Engine root found from current buffer or cwd", vim.log.levels.WARN)
+    return
+  end
+
+  input = trim(input)
+  if input == "" then
+    local state = read_state(engine_root)
+    input = vim.fn.input(
+      "uproject path relative to workspace root (e.g. Sub/Dir/Foo.uproject), empty to clear: ",
+      state.uproject_relative_path or ""
+    )
+  end
+
+  if input == "" then
+    update_state_field(engine_root, "uproject_relative_path", nil)
+    invalidate_status_cache()
+    vim.notify("UE uproject_relative_path cleared (engine: " .. engine_root .. ")")
+    return
+  end
+
+  local rel, err = set_uproject_relative_path(engine_root, input)
+  if err then
+    vim.notify(err, vim.log.levels.WARN)
+    return
+  end
+  invalidate_status_cache()
+  vim.notify("UE uproject_relative_path set:\nEngine: " .. engine_root .. "\nRelative: " .. (rel or input))
 end
 
 local function platform_selection_context()
@@ -7409,6 +7487,12 @@ function M.setup()
   vim.api.nvim_create_user_command("UESetAndroidPackage", function(opts)
     set_android_package(opts.args)
   end, { nargs = "?" })
+  vim.api.nvim_create_user_command("UESetUprojectRelativePath", function(opts)
+    set_uproject_relative_path_command(opts.args)
+  end, {
+    nargs = "?",
+    desc = "Set workspace -> .uproject relative path (used by :UESetProject when given only a workspace root)",
+  })
   vim.api.nvim_create_user_command("UESetPlatform", function(opts)
     set_platform(opts.args)
   end, {

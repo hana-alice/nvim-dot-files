@@ -28,8 +28,10 @@ M.BLOCKLIST_FRAGMENTS = {
   "/.idea/",
   "/.vscode/",
   "/.cache/",
-  "/.clangd-index/",
-  "/.clangd-pch/",
+  -- Note: .clangd-index/ and .clangd-pch/ used to be top-level dirs that
+  -- needed explicit ignore entries. Cache layout v3 (2026-05) collapses
+  -- both under .cache/nvim-ue/clangd/, so the .cache/ entry above
+  -- already covers them. Do NOT re-add them.
   "/.claude/",
 }
 

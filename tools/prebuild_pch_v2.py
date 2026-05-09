@@ -277,7 +277,9 @@ def main():
     default_directory = to_forward_slash(data[first_idx].get("directory", ""))
 
     cc_dir = os.path.dirname(cc_path)
-    pch_dir = os.path.join(cc_dir, ".clangd-pch")
+    # Cache layout v3: PCH lives under <project>/.cache/nvim-ue/clangd/pch
+    # (was: <project>/.clangd-pch). Single-root cache.
+    pch_dir = os.path.join(cc_dir, ".cache", "nvim-ue", "clangd", "pch")
     os.makedirs(pch_dir, exist_ok=True)
 
     # Windows 路径 (正斜杠)

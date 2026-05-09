@@ -87,15 +87,16 @@ def main():
         return
 
     cc_dir = os.path.dirname(cc_path)
-    # PCH 输出目录用 Windows 路径
-    pch_dir_wsl = os.path.join(cc_dir, ".clangd-pch")
+    # Cache layout v3: PCH lives under <project>/.cache/nvim-ue/clangd/pch
+    # (was: <project>/.clangd-pch). Single-root cache.
+    pch_rel = os.path.join(".cache", "nvim-ue", "clangd", "pch")
+    pch_dir_wsl = os.path.join(cc_dir, pch_rel)
     os.makedirs(pch_dir_wsl, exist_ok=True)
 
     # 推断 Windows 路径
-    # <PROJ_DRIVE>/UEProj -> <PROJ_DRIVE>/UEProj
     if cc_dir.startswith("/mnt/"):
         drive = cc_dir[5].upper()
-        pch_dir_win = f"{drive}:{cc_dir[6:]}/.clangd-pch".replace("/", "\\")
+        pch_dir_win = f"{drive}:{cc_dir[6:]}/{pch_rel}".replace("/", "\\")
     else:
         pch_dir_win = pch_dir_wsl.replace("/", "\\")
 

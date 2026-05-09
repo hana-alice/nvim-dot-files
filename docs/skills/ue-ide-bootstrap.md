@@ -193,7 +193,7 @@ python <path>/inject_h_entries.py
 |---|---|
 | 耗时 | **~50 s**（baseline 165 min，~200x 提升） |
 | 内存 | 峰值 ~16 GB（13 个 super-TU 并行，每个 ~1.2 GB） |
-| 磁盘新增 | **+~244 MB**（`.clangd-index/<repo-name>.idx`） |
+| 磁盘新增 | **+~244 MB**（`.cache/nvim-ue/clangd/index/<repo-name>.idx`） |
 | 产出 | 全局 symbol index（gd / xref 跨 TU 用） |
 
 ⚠️ clangd-indexer 必须用打过 `-include-pch` 补丁的版本，否则 `disableUnsupportedOptions` 把 PCH 剥了，UE 的 `-D` 宏全丢，`.generated.h` 解析失败，97% TU 静默 crash。

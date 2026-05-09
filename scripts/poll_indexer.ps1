@@ -6,8 +6,8 @@ foreach ($x in $p) {
     $effPct = $cpu / ($up * 60) * 100
     Write-Host ("PID {0,5}  Uptime {1,5:N1}m  CPU {2,8:N0}s  Eff {3,5:N0}%  Threads {4,3}  WS {5,5:N0} MB" -f $x.Id, $up, $cpu, $effPct, $x.Threads.Count, ($x.WorkingSet64/1MB))
 }
-$log = '<PROJ_DRIVE>\UEProj\Engine\.clangd-index\full.log'
-$out = '<PROJ_DRIVE>\UEProj\Engine\.clangd-index\full.idx'
+$log = '<PROJ_DRIVE>\UEProj\Engine\.cache\nvim-ue\logs\full.log'
+$out = '<PROJ_DRIVE>\UEProj\Engine\.cache\nvim-ue\clangd\index\full.idx'
 if (Test-Path $log) {
     $sz = (Get-Item $log).Length / 1MB
     Write-Host ("Log: {0:N1} MB" -f $sz)

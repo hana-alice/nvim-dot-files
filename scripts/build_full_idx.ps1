@@ -2,12 +2,17 @@
 # Steps: backup CDB -> inject -> indexer -> stats
 $ErrorActionPreference = 'Continue'
 $cdbReal = '<PROJ_DRIVE>\UEProj\Engine\compile_commands.json'
-$cdbWork = '<PROJ_DRIVE>\UEProj\Engine\.clangd-index\cdb_inject_full.json'
+$cdbWork = '<PROJ_DRIVE>\UEProj\Engine\.cache\nvim-ue\cdb\compile_commands\inject_full.json'
 # Match ue.lua naming convention: <project_name>.full.idx where project_name = leaf dir of engine_root
-$out = '<PROJ_DRIVE>\UEProj\Engine\.clangd-index\Engine.full.idx'
+$out = '<PROJ_DRIVE>\UEProj\Engine\.cache\nvim-ue\clangd\index\Engine.full.idx'
 $indexer = 'C:\Program Files\LLVM\bin\clangd-indexer.exe'
 $inject  = '<LOCAL_APPDATA>\nvim\tools\inject_definitions_to_cdb.py'
-$logFile = '<PROJ_DRIVE>\UEProj\Engine\.clangd-index\full.log'
+$logFile = '<PROJ_DRIVE>\UEProj\Engine\.cache\nvim-ue\logs\full.log'
+
+# Ensure cache subdirs exist (they normally do, but this script may run before :UEPrepare)
+New-Item -ItemType Directory -Force -Path (Split-Path $cdbWork) | Out-Null
+New-Item -ItemType Directory -Force -Path (Split-Path $out) | Out-Null
+New-Item -ItemType Directory -Force -Path (Split-Path $logFile) | Out-Null
 
 # Use a side copy of CDB so we don't disturb the live one
 Write-Host "=== Step 1: Copy CDB to side location ===" -ForegroundColor Cyan

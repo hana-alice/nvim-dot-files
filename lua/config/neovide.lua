@@ -34,7 +34,21 @@ function M.setup()
 
   vim.g.neovide_position_animation_length = 0.08
   vim.g.neovide_scroll_animation_length = 0.12
-  vim.g.neovide_scroll_animation_far_lines = 1
+  -- ROOT-CAUSE FIX for "<C-o>/gd flash" perceived after cross-buffer jumps.
+  --
+  -- Wire trace (pynvim UI sniff, see C:/tmp/ui_wire_baseline.log) proves:
+  -- when nvim does <C-o> across buffers, Neovide receives a SINGLE
+  -- win_viewport with scroll_delta=2818 (raw line count between source and
+  -- target). With far_lines=1, Neovide treats this as "far scroll" and plays
+  -- a 120ms scroll animation that visually rasters the entire buffer past
+  -- the screen -- that's the "flash". There is no (1,0) intermediate cursor
+  -- frame on the wire; the flash is 100% client-side scroll animation.
+  --
+  -- Setting far_lines well above one page height (~52) but well below typical
+  -- cross-buffer jump distances (hundreds-thousands) lets <C-f>/<C-b>/zz and
+  -- in-screen scrolls animate, while jumplist navigation, gd-to-far-file,
+  -- picker confirms, gg, G, etc. teleport instantly.
+  vim.g.neovide_scroll_animation_far_lines = 200
   vim.g.neovide_cursor_animation_length = 0.08
   vim.g.neovide_cursor_trail_size = 0.6
   vim.g.neovide_cursor_animate_in_insert_mode = false

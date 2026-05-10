@@ -146,6 +146,18 @@ function M.jump(location)
 
   -- ---- step 6: center view ------------------------------------------------
   pcall(vim.cmd, "normal! zz")
+
+  -- ---- step 7: force-flush cursor to UI in the SAME wire frame as viewport
+  -- Without this, wire trace shows win_viewport(top=2002, scroll_delta=-2818)
+  -- arriving 65ms BEFORE the corresponding grid_cursor_goto. During that gap
+  -- Neovide keeps drawing the cursor at the previous buffer's old screen cell,
+  -- then animates it 80ms over to the real position -- visually a "flash".
+  --
+  -- nvim__redraw is the Nvim 0.10+ experimental API that exists exactly for
+  -- "I just mutated state, push cursor to the UI NOW, don't wait for the
+  -- redraw scheduler." Cheap, idempotent, no-op on UIs that don't care.
+  pcall(vim.api.nvim__redraw, { cursor = true, flush = true })
+
   return true
 end
 

@@ -623,13 +623,19 @@ end
 
 function D._apply_aslr_fix(session_state, cb)
   local pid = session_state.pid
-  -- The symbol file on disk (e.g. Client-arm64.so) differs from the on-device
-  -- lib name (e.g. libUE4.so).  We search /proc/maps for the UE main lib name
-  -- and tell LLDB to slide the module it loaded via target create.
-  local lldb_module = session_state.symbol_lib and vim.fn.fnamemodify(session_state.symbol_lib, ":t") or "libUE4.so"
-  local device_so_candidates = { "libUE4.so", "libUnreal.so", lldb_module }
+  -- The symbol file on disk (e.g. Client-arm64.so) is the LOCAL path passed
+  -- to LLDB `target create`.  The on-device .so loaded into the running
+  -- process has a different name (UE main module is usually libUE4.so or
+  -- libUnreal.so).  We search /proc/<pid>/maps for the device-side name and
+  -- tell LLDB to slide the locally-loaded module by that base address.
+  local device_so_candidates = { "libUE4.so", "libUnreal.so" }
   local pkg = session_state.package_name or ""
   local adb = session_state.adb or "adb"
+  -- The LOCAL symbol .so passed to `target create` becomes an LLDB module
+  -- whose name is its basename (e.g. Client-arm64.so). `target modules load
+  -- --file` must reference that LLDB module name, NOT the device-side .so.
+  local lldb_module = vim.fn.fnamemodify(session_state.symbol_lib or "", ":t")
+  if lldb_module == "" then lldb_module = "libUE4.so" end
   local cb_fired = false
 
   local function fire_cb(ok, msg)
@@ -689,8 +695,20 @@ function D._apply_aslr_fix(session_state, cb)
         if base then
           vim.schedule(function() apply_slide(base) end)
         else
+          -- Diagnostic: dump every .so seen in maps so the user can pick the
+          -- real device-side UE module name and add it to device_so_candidates.
+          local seen = {}
+          for so in text:gmatch("/[^%s]+%.so") do
+            seen[vim.fn.fnamemodify(so, ":t")] = true
+          end
+          local names = {}
+          for n, _ in pairs(seen) do table.insert(names, n) end
+          table.sort(names)
+          local hint = #names > 0
+              and ("\nLibs seen on device: " .. table.concat(names, ", "))
+              or "\n(maps was empty — adb run-as likely denied; try: adb shell run-as " .. pkg .. " cat /proc/" .. pid .. "/maps)"
           vim.schedule(function()
-            fire_cb(false, table.concat(device_so_candidates, "/") .. " not found (adb run-as)")
+            fire_cb(false, "no candidate of {" .. table.concat(device_so_candidates, ", ") .. "} found in /proc/" .. pid .. "/maps" .. hint)
           end)
         end
       end,
@@ -702,24 +720,13 @@ function D._apply_aslr_fix(session_state, cb)
     })
   end
 
-  -- Primary: LLDB platform shell — grep for each candidate name
-  local grep_pattern = table.concat(device_so_candidates, "|")
-  vim.notify("ASLR fix: reading /proc/" .. pid .. "/maps via platform shell...")
-  D._dap_eval_lldb(
-    ('platform shell grep -E "%s" /proc/%s/maps'):format(grep_pattern, pid),
-    function(ok, result)
-      vim.schedule(function()
-        if ok and result and result ~= "" then
-          local base = parse_base(result, device_so_candidates)
-          if base then
-            apply_slide(base)
-            return
-          end
-        end
-        fallback_adb()
-      end)
-    end
-  )
+  -- Read /proc/<pid>/maps directly via adb. The previously-tried "primary"
+  -- path (LLDB `platform shell grep ...` against remote-android platform)
+  -- does NOT work: lldb-server's android platform sandbox replies
+  -- "error: unable to run remote process" for arbitrary shell commands,
+  -- which codelldb forwards as a console message and never resolves the
+  -- evaluate request — causing a 15-second hang for nothing.
+  fallback_adb()
 
   vim.defer_fn(function() fire_cb(false, "timed out (15s)") end, 15000)
 end
@@ -800,7 +807,7 @@ if (-not $lldbPid) { throw "lldb-server failed to start" }
 Write-Host "lldb-server pid=$lldbPid"
 try { & $adb -s $serial forward --remove tcp:$port 2>$null } catch {}
 & $adb -s $serial forward tcp:$port tcp:$port
-Write-Host "connect_uri=connect://localhost:$port"
+Write-Host "connect_uri=connect://[$serial]:$port"
 $targetPid | Out-File -Encoding ascii "]] .. session.pid_file .. [["
 $serial | Out-File -Encoding ascii "]] .. session.serial_file .. [["
 Write-Host "PREFLIGHT_OK"
@@ -856,7 +863,12 @@ function D.android_dap_attach()
 
   -- lldb-server: ue.config first, then Android Studio + NDK globs, then prompt
   local localappdata = vim.fn.expand("$LOCALAPPDATA")
+  -- IMPORTANT: lldb-server must come from the SAME NDK version that built the UE
+  -- game .so. Mismatched versions (e.g. NDK r25 client vs NDK r21 game) handshake
+  -- OK then drop the connection during register/auxv exchange. UE 4.x/5.x ships
+  -- with NDK 21.4.7075529 by default — prefer that, then fall back to others.
   local search_patterns = {
+    localappdata .. "/Android/Sdk/ndk/21.*/toolchains/llvm/prebuilt/*/lib64/clang/*/lib/linux/aarch64/lldb-server",
     localappdata .. "/Programs/Android Studio*/plugins/android-ndk/resources/lldb/android/arm64-v8a/lldb-server",
     localappdata .. "/Android/Sdk/ndk/*/toolchains/llvm/prebuilt/*/lib64/clang/*/lib/linux/aarch64/lldb-server",
   }
@@ -928,7 +940,11 @@ function D.android_dap_attach()
         end
         local pid = core.trim((vim.fn.readfile(attach_state.pid_file) or {})[1] or "")
         local serial = core.trim((vim.fn.readfile(attach_state.serial_file) or {})[1] or "")
-        local connect_uri = ("connect://localhost:%d"):format(attach_state.port or 5039)
+        -- LLDB platform=remote-android requires connect://[<serial>]:<port>.
+        -- "connect://localhost:<port>" is rejected by remote-android with
+        -- "Invalid URL:" even though tcp forwarding is set up correctly.
+        local connect_uri = (serial ~= "" and ("connect://[%s]:%d"):format(serial, attach_state.port or 5039))
+          or ("connect://localhost:%d"):format(attach_state.port or 5039)
         if pid == "" then
           D._dap_attach_in_progress = false
           D._dap_run_state = "idle"
@@ -1021,7 +1037,7 @@ if (-not $lldbPid) { throw "lldb-server failed to start" }
 Write-Host "lldb-server pid=$lldbPid"
 try { & $adb -s $serial forward --remove tcp:$port 2>$null } catch {}
 & $adb -s $serial forward tcp:$port tcp:$port
-Write-Host "connect_uri=connect://localhost:$port"
+Write-Host "connect_uri=connect://[$serial]:$port"
 $targetPid | Out-File -Encoding ascii "]] .. session.pid_file .. [["
 $serial | Out-File -Encoding ascii "]] .. session.serial_file .. [["
 Write-Host "PREFLIGHT_OK"
@@ -1076,7 +1092,12 @@ function D.android_dap_launch()
 
   -- lldb-server: ue.config first, then Android Studio + NDK globs, then prompt
   local localappdata = vim.fn.expand("$LOCALAPPDATA")
+  -- IMPORTANT: lldb-server must come from the SAME NDK version that built the UE
+  -- game .so. Mismatched versions (e.g. NDK r25 client vs NDK r21 game) handshake
+  -- OK then drop the connection during register/auxv exchange. UE 4.x/5.x ships
+  -- with NDK 21.4.7075529 by default — prefer that, then fall back to others.
   local search_patterns = {
+    localappdata .. "/Android/Sdk/ndk/21.*/toolchains/llvm/prebuilt/*/lib64/clang/*/lib/linux/aarch64/lldb-server",
     localappdata .. "/Programs/Android Studio*/plugins/android-ndk/resources/lldb/android/arm64-v8a/lldb-server",
     localappdata .. "/Android/Sdk/ndk/*/toolchains/llvm/prebuilt/*/lib64/clang/*/lib/linux/aarch64/lldb-server",
   }
@@ -1148,7 +1169,11 @@ function D.android_dap_launch()
         end
         local pid = core.trim((vim.fn.readfile(attach_state.pid_file) or {})[1] or "")
         local serial = core.trim((vim.fn.readfile(attach_state.serial_file) or {})[1] or "")
-        local connect_uri = ("connect://localhost:%d"):format(attach_state.port or 5039)
+        -- LLDB platform=remote-android requires connect://[<serial>]:<port>.
+        -- "connect://localhost:<port>" is rejected by remote-android with
+        -- "Invalid URL:" even though tcp forwarding is set up correctly.
+        local connect_uri = (serial ~= "" and ("connect://[%s]:%d"):format(serial, attach_state.port or 5039))
+          or ("connect://localhost:%d"):format(attach_state.port or 5039)
         if pid == "" then
           D._dap_attach_in_progress = false
           D._dap_run_state = "idle"

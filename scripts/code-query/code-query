@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-# Bash/MSYS shim — invoke code_query.py with a clean Python environment.
-# Strip PYTHONHOME/PYTHONPATH (uv leaks them on Windows -> SRE mismatch).
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY="/c/Users/lizeqiang/AppData/Local/Programs/Python/Python312/python.exe"
-if [ ! -x "$PY" ]; then
-  PY="$(command -v python || command -v python3)"
-fi
-PYTHONPATH= PYTHONHOME= exec "$PY" "$HERE/code_query.py" "$@"

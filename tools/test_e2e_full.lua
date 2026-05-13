@@ -143,4 +143,4 @@ vim.defer_fn(function()
 end, 90000)
 
 p("Triggering attach...")
-vim.cmd("UEAndroidDAPAttach")
+vim.cmd("UEDAPAttach android")

@@ -55,11 +55,21 @@ local function defaults()
       extra_args = {},
     },
     dap = {
-      -- Concrete codelldb adapter. nil => probe via driver +
-      -- vendored install. ue.dap._common.find_codelldb consumes this.
-      codelldb_path = nil,
-      -- lldb-server binary for remote debugging. nil => probe via driver.
+      -- Concrete lldb-dap adapter. nil => probe via driver + PATH.
+      -- Consumed by ue.dap._common.find_lldb_dap.
+      lldb_dap_path = nil,
+      -- Optional PYTHONHOME/PYTHONPATH overrides for lldb-dap's embedded
+      -- Python. Usually leave nil; set only if lldb-dap cannot import its
+      -- bundled `lldb` Python module.
+      lldb_dap_python_dir = nil,
+      lldb_dap_pythonpath = nil,
+      -- Backward-compatible alias accepted by older local configs. New
+      -- Android code should use android_lldb_server.
       lldb_server_path = nil,
+
+      -- Path to an arm64 lldb-server binary used for Android remote-debugging.
+      -- Pushed to /data/local/tmp on the device by the preflight script.
+      android_lldb_server = nil,
       -- Default Android package name. nil => prompt on first use, then
       -- persist via update_state_field("android_package", ...).
       android_package = nil,

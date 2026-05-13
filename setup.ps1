@@ -7,7 +7,7 @@
       2. Neovide (GPU-accelerated frontend)
       3. JetBrainsMono Nerd Font + Cascadia Mono (guifont)
       4. 外部工具: ripgrep, fd, fzf, yazi, stylua, git, python3, LLVM/clangd
-      5. codelldb DAP 调试适配器 (v1.12.1)
+      5. lldb-dap DAP 调试适配器 (随 LLVM 安装, 无需单独下载)
       6. Lazy.nvim 插件同步
       7. CapsLock→Esc 映射注册 (可选)
     运行: 以管理员权限打开 PowerShell, 执行:
@@ -20,7 +20,6 @@
 param(
     [switch]$SkipFonts,
     [switch]$SkipCapslock,
-    [switch]$SkipCodelldb,
     [switch]$SkipPlugins,
     [switch]$Force
 )
@@ -214,67 +213,30 @@ if ((Test-Path (Join-Path $llvmDir "clangd.exe")) -and (-not $Force)) {
 }
 
 # ────────────────────────────────────────────────
-# 5. codelldb DAP 调试适配器
+# 5. lldb-dap DAP 调试适配器 (随 LLVM 安装, 无需单独下载)
 # ────────────────────────────────────────────────
 
-Write-Step "5. 安装 codelldb DAP 适配器"
+Write-Step "5. 校验 lldb-dap (DAP 调试适配器)"
 
-if ($SkipCodelldb) {
-    Write-Skip "codelldb 安装已跳过 (-SkipCodelldb)"
+$lldbDapCandidates = @(
+    (Join-Path $llvmDir "lldb-dap.exe"),
+    (Join-Path $llvmDir "lldb-dap-18.exe"),
+    (Join-Path $llvmDir "lldb-dap-19.exe"),
+    (Join-Path $llvmDir "lldb-dap-20.exe"),
+    (Join-Path $llvmDir "lldb-dap-21.exe"),
+    (Join-Path $llvmDir "lldb-dap-22.exe")
+)
+$lldbDap = $lldbDapCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if ($lldbDap) {
+    Write-Ok "lldb-dap: $lldbDap"
 } else {
-    $codelldbVersion = "1.12.1"
-    $codelldbDir = "$configDir\data\codelldb"
-    $codelldbExtDir = "$codelldbDir\extension\extension"
-    $codelldbAdapter = "$codelldbExtDir\adapter\codelldb.exe"
-
-    if ((Test-Path $codelldbAdapter) -and (-not $Force)) {
-        Write-Skip "codelldb v$codelldbVersion 已安装"
-    } else {
-        Write-Host "  下载 codelldb v$codelldbVersion ..."
-        $codelldbUrl = "https://github.com/vadimcn/codelldb/releases/download/v$codelldbVersion/codelldb-win32-x64.vsix"
-        $vsixFile = "$env:TEMP\codelldb-win32-x64.vsix"
-
-        try {
-            Invoke-WebRequest -Uri $codelldbUrl -OutFile $vsixFile -UseBasicParsing
-
-            # VSIX 就是一个 zip
-            if (Test-Path "$codelldbDir\extension") {
-                Remove-Item -Path "$codelldbDir\extension" -Recurse -Force
-            }
-            New-Item -ItemType Directory -Path $codelldbDir -Force | Out-Null
-            Expand-Archive -Path $vsixFile -DestinationPath "$codelldbDir\extension" -Force
-
-            # 保留原始 vsix 备份
-            Copy-Item -Path $vsixFile -Destination "$codelldbDir\codelldb-win32-x64.vsix" -Force
-
-            if (Test-Path $codelldbAdapter) {
-                Write-Ok "codelldb v$codelldbVersion 安装完成"
-            } else {
-                Write-Err "codelldb 安装异常: adapter 可执行文件未找到"
-            }
-        } catch {
-            Write-Err "codelldb 下载失败: $($_.Exception.Message)"
-            Write-Host "  请手动下载: $codelldbUrl" -ForegroundColor Yellow
-        } finally {
-            Remove-Item -Path $vsixFile -Force -ErrorAction SilentlyContinue
-        }
-    }
-
-    # 同时确保 nvim-main data 目录也有 codelldb (stdpath("data") on Windows)
-    $nvimDataDir = "$env:LOCALAPPDATA\nvim-main\lazy"
-    # 注: codelldb 查找路径优先 stdpath("data")/codelldb, 再 stdpath("config")/data/codelldb
-    # config/data/codelldb 已通过上面安装, stdpath("data") 由 init.lua 设为 nvim-main
-    $altCodelldb = "$env:LOCALAPPDATA\nvim-main\codelldb"
-    if (-not (Test-Path $altCodelldb) -and (Test-Path "$codelldbDir\extension")) {
-        Write-Host "  创建 symlink: nvim-main\codelldb -> config\data\codelldb ..."
-        try {
-            New-Item -ItemType Junction -Path $altCodelldb -Target "$codelldbDir" -Force | Out-Null
-            Write-Ok "stdpath('data') codelldb symlink 已创建"
-        } catch {
-            Write-Host "  [WARN] Junction 创建失败 (可能需管理员权限), 跳过" -ForegroundColor Yellow
-        }
-    }
+    Write-Err "lldb-dap 未在 $llvmDir 找到 (LLVM 18+ 才自带; 当前安装可能过旧)"
+    Write-Host "  检查 LLVM 版本: & '$llvmDir\clang.exe' --version" -ForegroundColor Yellow
+    Write-Host "  如需升级: winget upgrade --id LLVM.LLVM" -ForegroundColor Yellow
 }
+
+# Python (用于 lldb-dap 的 Python script bridge & UE4 data formatter)
+# Python 3.12 已在 step 3 安装。lldb-dap 会自己 discover。
 
 # ────────────────────────────────────────────────
 # 6. Lazy.nvim 插件同步
@@ -403,12 +365,16 @@ foreach ($c in $checks) {
     }
 }
 
-# 检查 codelldb
-$codelldbCheck = "$configDir\data\codelldb\extension\extension\adapter\codelldb.exe"
-if (Test-Path $codelldbCheck) {
-    Write-Ok "codelldb: $codelldbCheck"
+# 检查 lldb-dap (随 LLVM 自带)
+$lldbDapCheck = $null
+foreach ($cand in @("lldb-dap.exe","lldb-dap-18.exe","lldb-dap-19.exe","lldb-dap-20.exe","lldb-dap-21.exe","lldb-dap-22.exe")) {
+    $p = Join-Path $llvmDir $cand
+    if (Test-Path $p) { $lldbDapCheck = $p; break }
+}
+if ($lldbDapCheck) {
+    Write-Ok "lldb-dap: $lldbDapCheck"
 } else {
-    Write-Err "codelldb: 未找到"
+    Write-Err "lldb-dap: 未在 LLVM\bin 找到 (需要 LLVM 18+)"
     $allGood = $false
 }
 
@@ -444,5 +410,6 @@ Write-Host "首次启动说明:" -ForegroundColor White
 Write-Host "  1. Lazy.nvim 会自动下载所有插件 (如未运行 restore)" -ForegroundColor Gray
 Write-Host "  2. Mason 会自动安装 LSP 服务器 (lua_ls 等)" -ForegroundColor Gray
 Write-Host "  3. clangd 使用 LLVM 全局安装版 (UE 项目推荐)" -ForegroundColor Gray
-Write-Host "  4. 如需 Android DAP, 需额外安装 Android NDK lldb-server" -ForegroundColor Gray
+Write-Host "  4. 如需 Android DAP, 需额外安装 Android NDK lldb-server (arm64)" -ForegroundColor Gray
+Write-Host "     路径配置: ~/.config/nvim 中 ue.config dap.android_lldb_server" -ForegroundColor Gray
 Write-Host ""

@@ -53,7 +53,7 @@ for _, id in ipairs({ "windows", "macos", "linux", "stub" }) do
     assert(m.id == id, "id mismatch")
     for _, k in ipairs({
       "shell", "open_path", "reveal_file", "cmd_quote",
-      "default_clangd_candidates", "default_codelldb_paths",
+      "default_clangd_candidates", "default_lldb_dap_paths",
       "default_lldb_server_paths",
     }) do
       assert(type(m[k]) == "function", k .. " missing")
@@ -210,9 +210,9 @@ check("Phase H: ue.setup() registers win64/mac/linux/ios", function()
     assert(type(p.launch_handler(id)) == "function", id .. " launch not registered")
   end
 end)
-check("Phase H: ue.dap._common.find_codelldb returns string-or-nil", function()
-  local r = require("ue.dap._common").find_codelldb()
-  assert(r == nil or type(r) == "string", "find_codelldb returned " .. type(r))
+check("Phase H: ue.dap._common.find_lldb_dap returns string-or-nil", function()
+  local r = require("ue.dap._common").find_lldb_dap()
+  assert(r == nil or type(r) == "string", "find_lldb_dap returned " .. type(r))
 end)
 
 -- ── Phase I: ue.config schema expansion ────────────────────────────────
@@ -228,15 +228,28 @@ end)
 check("Phase I: ue.config.cdb.tools_dir is a string", function()
   assert(type(require("ue.config").get("cdb.tools_dir")) == "string")
 end)
-check("Phase I: ue.config.dap.codelldb_path defaults nil", function()
-  assert(require("ue.config").get("dap.codelldb_path") == nil)
+check("Phase I: ue.config.dap.lldb_dap_path defaults nil", function()
+  assert(require("ue.config").get("dap.lldb_dap_path") == nil)
 end)
-check("Phase I: ue.config.dap.codelldb_path user override", function()
+check("Phase I: ue.config.dap.lldb_dap_path user override", function()
   local cfg = require("ue.config")
-  cfg.setup({ dap = { codelldb_path = "/x/codelldb" }})
-  assert(cfg.get("dap.codelldb_path") == "/x/codelldb")
+  cfg.setup({ dap = { lldb_dap_path = "/x/lldb-dap" }})
+  assert(cfg.get("dap.lldb_dap_path") == "/x/lldb-dap")
   cfg.reset_for_test()
-  assert(cfg.get("dap.codelldb_path") == nil)
+  assert(cfg.get("dap.lldb_dap_path") == nil)
+end)
+check("Phase I: ue.config.dap lldb-dap env defaults are sanitized", function()
+  local env = require("ue.dap._common")._lldb_dap_env()
+  assert(env.PYTHONHOME == "")
+  assert(env.PYTHONPATH == "")
+end)
+check("Phase I: ue.config.dap lldb-dap env override", function()
+  local cfg = require("ue.config")
+  cfg.setup({ dap = { lldb_dap_python_dir = "/pyhome", lldb_dap_pythonpath = "/pypath" }})
+  local env = require("ue.dap._common")._lldb_dap_env()
+  assert(env.PYTHONHOME == "/pyhome")
+  assert(env.PYTHONPATH == "/pypath")
+  cfg.reset_for_test()
 end)
 check("Phase I: clangd.extra_args appended to clangd_cmd tail", function()
   local cfg = require("ue.config")
@@ -270,25 +283,23 @@ check("Phase J: dap._pick_lldb_server_for_test (cfg path wins)", function()
   local cfg = require("ue.config")
   -- Pick a path we know exists on this host (the lint script always does).
   local existing = vim.fn.stdpath("config") .. "/scripts/lint_no_bare_globals.lua"
-  cfg.setup({ dap = { lldb_server_path = existing }})
+  cfg.setup({ dap = { android_lldb_server = existing }})
   assert(require("ue.dap")._pick_lldb_server_for_test({}) == existing)
   cfg.reset_for_test()
 end)
-
--- ── Phase F.3: UEAndroidDAP* wraps with one-shot deprecation tracker ───
-check("Phase F.3: M._dap_deprecation_seen exists after setup()", function()
-  require("ue").setup()
-  assert(type(require("ue")._dap_deprecation_seen) == "table")
+check("Phase J: dap android_lldb_server config is used by android module", function()
+  local cfg = require("ue.config")
+  local existing = vim.fn.stdpath("config") .. "/scripts/lint_no_bare_globals.lua"
+  cfg.setup({ dap = { android_lldb_server = existing }})
+  assert(require("ue.dap.android")._pick_lldb_server_for_test({}) == existing)
+  cfg.reset_for_test()
 end)
-check("backward-compat: UEAndroidDAP* still registered", function()
-  for _, c in ipairs({
-    "UEAndroidDAPAttach", "UEAndroidDAPLaunch", "UEAndroidDAPContinue",
-    "UEAndroidDAPPause", "UEAndroidDAPToggleBreakpoint", "UEAndroidDAPStepOver",
-    "UEAndroidDAPStepIn", "UEAndroidDAPStepOut", "UEAndroidDAPToggleUI",
-    "UEAndroidDAPREPL",
-  }) do
-    assert(vim.fn.exists(":" .. c) == 2, c .. " was removed")
-  end
+check("Phase J: dap lldb_server_path legacy alias still works", function()
+  local cfg = require("ue.config")
+  local existing = vim.fn.stdpath("config") .. "/scripts/lint_no_bare_globals.lua"
+  cfg.setup({ dap = { lldb_server_path = existing }})
+  assert(require("ue.dap.android")._pick_lldb_server_for_test({}) == existing)
+  cfg.reset_for_test()
 end)
 
 -- ── Report ──────────────────────────────────────────────────────────────

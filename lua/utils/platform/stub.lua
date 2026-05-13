@@ -16,7 +16,7 @@ end
 function M.open_path(_) end
 function M.reveal_file(_) end
 function M.default_clangd_candidates() return {} end
-function M.default_codelldb_paths() return {} end
+function M.default_lldb_dap_paths() return {} end
 function M.default_lldb_server_paths() return {} end
 function M.cmd_quote(value) return tostring(value or "") end
 

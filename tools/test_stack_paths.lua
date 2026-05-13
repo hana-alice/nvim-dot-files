@@ -82,4 +82,4 @@ vim.notify = function(msg, level, opts)
 end
 
 vim.defer_fn(function() p("TIMEOUT"); vim.cmd("qall!") end, 90000)
-vim.cmd("UEAndroidDAPAttach")
+vim.cmd("UEDAPAttach android")

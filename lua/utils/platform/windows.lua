@@ -55,26 +55,50 @@ function M.default_clangd_candidates()
   }
 end
 
-function M.default_codelldb_paths()
-  -- Search: Mason install dir, scoop shim, then PATH.
-  local data = vim.fn.stdpath("data")
+function M.default_lldb_dap_paths()
+  -- Standard LLVM Windows install (winget LLVM.LLVM / installer .exe).
+  -- PATH lookup is the final fallback inside ue.dap._common.find_lldb_dap.
+  --
+  -- C:/tools/lldb-21/bin/lldb-dap.exe is given top priority as a workaround
+  -- for llvm/llvm-project#178155: LLVM 22.x lldb-dap.exe on Windows crashes
+  -- with STATUS_STACK_BUFFER_OVERRUN (0xC0000409) at startup because
+  -- NativeFile's ctor calls _get_osfhandle(fd) on a pipe fd whose CRT
+  -- table lives in lldb-dap.exe's CRT, not liblldb.dll's CRT. The fix
+  -- (PR #195855) is merged in main but NOT backported to release/22.x —
+  -- 22.1.5 still crashes. 21.1.8's File.cpp predates the offending change
+  -- and works fine. We side-load 21.1.8's lldb-dap.exe + liblldb.dll +
+  -- python310.dll into a private directory; clang/clangd stay on 22.1.5.
+  local pf = (vim.uv or vim.loop).os_getenv("ProgramFiles") or "C:/Program Files"
   return {
-    data .. "/mason/packages/codelldb/extension/adapter/codelldb.exe",
-    "codelldb.exe",
-    "codelldb",
+    "C:/tools/lldb-21/bin/lldb-dap.exe",
+    pf .. "/LLVM/bin/lldb-dap.exe",
+    "C:/Program Files/LLVM/bin/lldb-dap.exe",
+    "C:/Program Files (x86)/LLVM/bin/lldb-dap.exe",
   }
 end
 
 function M.default_lldb_server_paths()
   -- Android NDK / Android Studio side-by-side. Globs are resolved by
   -- callers because `vim.fs.find` semantics differ from shell globs.
+  --
+  -- CRITICAL ORDERING (see commit 144c28d): the lldb-server pushed to the
+  -- device MUST match the NDK that built libUE4.so / libUnreal.so. UE 4.x/5.x
+  -- ships with NDK 21.4.7075529 (clang 9.0.9). When a newer NDK is installed
+  -- side-by-side and picked instead, the LLDB wire protocol (qLaunchGDBServer
+  -- handshake) deadlocks against an LLVM 21+ lldb-dap client. Pin r21 first,
+  -- then Android Studio's bundled lldb, then anything else as a fallback.
   local localappdata = (vim.uv or vim.loop).os_getenv("LOCALAPPDATA") or ""
   local out = {}
   if localappdata ~= "" then
     out[#out + 1] = localappdata
+      .. "/Android/Sdk/ndk/21.*/toolchains/llvm/prebuilt/*/lib64/clang/*/lib/linux/aarch64/lldb-server"
+    out[#out + 1] = localappdata
       .. "/Programs/Android Studio*/plugins/android-ndk/resources/lldb/android/arm64-v8a/lldb-server"
     out[#out + 1] = localappdata
       .. "/Android/Sdk/ndk/*/toolchains/llvm/prebuilt/*/lib64/clang/*/lib/linux/aarch64/lldb-server"
+    -- NDK 26+ dropped the lib64 suffix.
+    out[#out + 1] = localappdata
+      .. "/Android/Sdk/ndk/*/toolchains/llvm/prebuilt/*/lib/clang/*/lib/linux/aarch64/lldb-server"
   end
   return out
 end

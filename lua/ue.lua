@@ -89,6 +89,10 @@ end
 -- CLANGD / LSP
 -- ==========================================================================
 
+local function is_native_windows()
+  return vim.fn.has("win32") == 1
+end
+
 local function clangd_candidates(root_dir)
   local candidates = {}
 
@@ -813,11 +817,23 @@ end
 -- ==========================================================================
 
 local function find_uproject_in_dir(dir)
+  -- Top-level
   local matches = vim.fn.globpath(dir, "*.uproject", false, true)
   if type(matches) == "table" and #matches > 0 then
     table.sort(matches)
     return norm(matches[1])
   end
+
+  -- P4 workspace fixed layout: <workspace>/Source/Client/*.uproject
+  local client_dir = join(dir, "Source", "Client")
+  if _ufs.is_dir(client_dir) then
+    local m2 = vim.fn.globpath(client_dir, "*.uproject", false, true)
+    if type(m2) == "table" and #m2 > 0 then
+      table.sort(m2)
+      return norm(m2[1])
+    end
+  end
+
   return nil
 end
 
@@ -1012,6 +1028,13 @@ local function set_uproject_relative_path(engine_root, rel)
   update_state_field(engine_root, "uproject_relative_path", rel)
   return rel
 end
+
+-- Forward declarations: read_state / update_state_field are defined later
+-- (~line 1247/1278) but referenced by resolve_project_input and the
+-- set_uproject_relative_path block above. Without these, calls hit the global
+-- nil and blow up E5108 ("attempt to call global 'read_state' (a nil value)").
+local read_state
+local update_state_field
 
 local function resolve_project_input(path, engine_root)
   path = norm(trim(path))
@@ -1244,7 +1267,7 @@ cache_paths = function(engine_root)
   }
 end
 
-local function read_state(engine_root)
+read_state = function(engine_root)
   local paths = cache_paths(engine_root)
   if not _ufs.is_file(paths.state) then
     return {}
@@ -1275,7 +1298,7 @@ local function persist_project(engine_root, project_root, uproject)
   return existing
 end
 
-local function update_state_field(engine_root, key, value)
+update_state_field = function(engine_root, key, value)
   local paths = cache_paths(engine_root)
   _ufs.ensure_dir(paths.cache)
   local existing = read_state(engine_root)
@@ -2857,6 +2880,59 @@ local function db_ready(db_dir)
   return true
 end
 
+local prepare_freshness  -- forward-decl alias kept for in-module callers
+do
+  -- mtime of <repo>/.git/index in epoch seconds; 0 when missing/unreadable.
+  -- Tracks every file add/remove/edit (including uncommitted working-tree
+  -- changes) — more reliable than HEAD ref for "is the worktree newer than
+  -- our cached file list?" decisions. Reused by both prepare_async's csearch
+  -- staleness check (via copy below) and prepare_freshness().
+  local function git_index_mtime(repo_root)
+    if not repo_root or repo_root == "" then return 0 end
+    local s = vim.loop.fs_stat(repo_root .. "/.git/index")
+    return (s and s.mtime and s.mtime.sec) or 0
+  end
+
+  -- Classify how trustworthy ctx.paths.workspace_all_list is right now.
+  -- Returns one of:
+  --   "fresh"        — list newer than .git/index of engine + project
+  --   "stale"        — list older than .git/index (worktree drifted since
+  --                    last :UEPrepare; e.g. git pull added new files)
+  --   "in_progress"  — :UEPrepare is currently rebuilding (CORE_RT.prepare_jobid live)
+  --   "never"        — no list file exists at all
+  --   "unknown"      — list exists but no .git/index found anywhere; can't judge
+  --
+  -- This is the single source of truth that user-facing surfaces (picker,
+  -- csearch grep, BufReadPost on file outside list) consult before warning
+  -- the user that results may miss recent worktree additions.
+  function CORE_RT.prepare_freshness(ctx)
+    if not ctx or not ctx.paths then return "unknown" end
+    if CORE_RT.prepare_jobid then
+      local ok_wait, result = pcall(vim.fn.jobwait, { CORE_RT.prepare_jobid }, 0)
+      if ok_wait and result and result[1] == -1 then
+        return "in_progress"
+      end
+    end
+    local list_path = ctx.paths.workspace_all_list
+    local list_stat = list_path and vim.loop.fs_stat(list_path) or nil
+    if not list_stat then
+      return "never"
+    end
+    local list_mt = list_stat.mtime and list_stat.mtime.sec or 0
+    local git_mt = math.max(
+      git_index_mtime(ctx.engine_root),
+      git_index_mtime(ctx.project_root))
+    if git_mt == 0 then
+      return "unknown"
+    end
+    if list_mt >= git_mt then
+      return "fresh"
+    end
+    return "stale"
+  end
+  prepare_freshness = CORE_RT.prepare_freshness
+end
+
 local function prepare_cache_ready(ctx)
   if not ctx then
     return false
@@ -2872,6 +2948,14 @@ local function prepare_cache_ready(ctx)
     end
   end
   if not db_ready(ctx.paths.workspace_db) then
+    return false
+  end
+  -- Worktree-drift check: if .git/index of either repo is newer than our
+  -- cached list, the cache is structurally complete but logically stale
+  -- (e.g. `git pull` brought in new files that don't show in <space><space>).
+  -- Falling through to the slow path forces the lists to be regenerated.
+  -- Mirrors the staleness logic the csearch fast-path already uses below.
+  if prepare_freshness(ctx) == "stale" then
     return false
   end
   local key = status_root_key(ctx)
@@ -3082,18 +3166,54 @@ local function glob_paths(pattern)
   return paths
 end
 
+-- Resolve the directory that actually contains Binaries/ and Intermediate/.
+-- In some workspaces (P4 layouts especially), `ctx.project_root` is the repo
+-- root (e.g. `<repo-root>`) while the `.uproject` and ALL of its
+-- build outputs live a few dirs down (`Source/Client/`). Using project_root
+-- directly makes Binaries/Intermediate globs miss everything. Prefer the
+-- directory containing the uproject; fall back to project_root for legacy
+-- flat layouts where they coincide.
+local function uproject_dir(ctx)
+  if ctx and ctx.uproject and ctx.uproject ~= "" then
+    local d = _ufs.dirname(ctx.uproject)
+    if d and d ~= "" then return d end
+  end
+  return ctx and ctx.project_root or nil
+end
+
 local function cleanup_gradle_debug_artifacts(ctx)
-  if not ctx or not ctx.project_root or ctx.project_root == "" then
+  local pr = uproject_dir(ctx)
+  if not pr or pr == "" then
     return
   end
 
+  -- Wipe Gradle packaging-stage artifacts that AGP's incremental task tracker
+  -- can desync against (last-build interrupted / shared cache stale). Symptoms:
+  --   "Zip file 'app-*.apk' already contains entry 'META-INF/.../app-metadata.properties'"
+  -- Root cause: the per-task incremental state thinks an entry is missing but
+  -- the final APK on disk still has it, so PackageAndroidArtifact tries to
+  -- re-add it and fails. Cleaning the output APKs PLUS the intermediates that
+  -- feed into packaging (app_metadata, merged_manifest, packaged_manifests,
+  -- incremental/packageDebug) forces AGP back to a clean packaging step.
+  local debug_dir = join(pr, "Intermediate", "Android", "*", "gradle", "app", "build")
   local patterns = {
-    join(ctx.project_root, "Intermediate", "Android", "*", "gradle", "app", "build", "outputs", "apk", "app-debug.apk"),
-    join(ctx.project_root, "Intermediate", "Android", "*", "gradle", "app", "build", "outputs", "apk", "debug", "app-debug.apk"),
-    join(ctx.project_root, "Intermediate", "Android", "*", "gradle", "app", "build", "intermediates", "apk", "app-debug.apk"),
-    join(ctx.project_root, "Intermediate", "Android", "*", "gradle", "app", "build", "intermediates", "apk", "debug", "app-debug.apk"),
-    join(ctx.project_root, "Intermediate", "Android", "*", "gradle", "app", "build", "intermediates", "incremental", "packageDebug"),
-    join(ctx.project_root, "Intermediate", "Android", "*", "gradle", "app", "build", "intermediates", "incremental", "debug", "packageDebug"),
+    -- output APKs (debug + release variants, with and without variant subdir)
+    join(debug_dir, "outputs", "apk", "app-debug.apk"),
+    join(debug_dir, "outputs", "apk", "debug", "app-debug.apk"),
+    join(debug_dir, "outputs", "apk", "app-release.apk"),
+    join(debug_dir, "outputs", "apk", "release", "app-release.apk"),
+    join(debug_dir, "intermediates", "apk", "app-debug.apk"),
+    join(debug_dir, "intermediates", "apk", "debug", "app-debug.apk"),
+    -- packaging incremental state
+    join(debug_dir, "intermediates", "incremental", "packageDebug"),
+    join(debug_dir, "intermediates", "incremental", "debug", "packageDebug"),
+    join(debug_dir, "intermediates", "incremental", "packageRelease"),
+    join(debug_dir, "intermediates", "incremental", "release", "packageRelease"),
+    -- packaging input intermediates that frequently drift and produce
+    -- duplicate META-INF/com/android/build/gradle/app-metadata.properties
+    join(debug_dir, "intermediates", "app_metadata"),
+    join(debug_dir, "intermediates", "merged_manifest"),
+    join(debug_dir, "intermediates", "packaged_manifests"),
   }
 
   for _, pattern in ipairs(patterns) do
@@ -4769,7 +4889,52 @@ local function cached_file_list_info(opts, list_type)
   return {
     list_path = list_path,
     root = workspace_root(ctx),
+    ctx = ctx,
   }
+end
+
+-- ── Freshness notification: per-root, per-(state) deduped ────────────────
+-- Picker / grep entrypoints call notify_prepare_freshness(ctx, surface_label)
+-- to surface a one-shot warning when the cached lists are stale relative to
+-- the worktree. Stays out of the way once acknowledged for that root+state.
+-- Reset on :UEPrepare completion (handled in prepare_async's finalization).
+-- State table lives on CORE_RT to avoid burning module-level local slots
+-- (LuaJIT main function has a hard 200-local cap).
+CORE_RT.freshness_notified = CORE_RT.freshness_notified or {}
+
+do
+  function CORE_RT.notify_freshness(ctx, surface)
+    if not ctx then return end
+    local state = prepare_freshness(ctx)
+    if state == "fresh" or state == "unknown" then
+      return  -- silence: trustworthy enough OR unable to judge (no .git/index)
+    end
+    local key = status_root_key(ctx)
+    if not key or key == "" then return end
+    local last = CORE_RT.freshness_notified[key]
+    if last == state then return end  -- already warned for this state on this root
+    CORE_RT.freshness_notified[key] = state
+
+    local msg
+    if state == "in_progress" then
+      msg = ("[%s] :UEPrepare is still running — results may be incomplete"):format(surface or "ue")
+    elseif state == "never" then
+      msg = ("[%s] No cached file list yet — run :UEPrepare for accurate results"):format(surface or "ue")
+    else  -- stale
+      msg = ("[%s] :UEPrepare is stale (worktree changed since last run) — results may miss new files. Run :UEPrepare to refresh."):format(surface or "ue")
+    end
+    vim.schedule(function()
+      vim.notify(msg, vim.log.levels.WARN, { title = "UE" })
+    end)
+  end
+
+  function CORE_RT.clear_freshness(ctx)
+    if not ctx then return end
+    local key = status_root_key(ctx)
+    if key and key ~= "" then
+      CORE_RT.freshness_notified[key] = nil
+    end
+  end
 end
 
 local function read_cached_paths(list_path, root)
@@ -4885,6 +5050,7 @@ function M.cached_files(opts)
   if not info then
     return nil
   end
+  CORE_RT.notify_freshness(info.ctx, "find files")
 
   local rg = _uproc.first_executable({ "rg" })
   if not rg then
@@ -4945,6 +5111,7 @@ function M.cached_grep(opts)
   if not ctx then
     return nil
   end
+  CORE_RT.notify_freshness(ctx, "grep")
 
   local snacks = require("snacks")
   local code_search = require("utils.code_search")
@@ -6284,10 +6451,10 @@ local function build_android()
         table.insert(parts, "detached active DAP")
       end
       if cleanup.adapter_killed then
-        table.insert(parts, "stopped CodeLLDB adapter")
+        table.insert(parts, "stopped lldb-dap adapter")
       end
       if cleanup.orphan_killed > 0 then
-        table.insert(parts, ("killed %d stale CodeLLDB process%s"):format(
+        table.insert(parts, ("killed %d stale lldb-dap process%s"):format(
           cleanup.orphan_killed,
           cleanup.orphan_killed == 1 and "" or "es"
         ))
@@ -6303,12 +6470,14 @@ local function build_android()
   })
 end
 
--- Find the newest APK in project build outputs
+-- Find the newest APK in project build outputs.
+-- Searches under uproject's directory (NOT ctx.project_root — see uproject_dir
+-- comment for why these can differ in P4 / Source/Client layouts).
 local function find_apk(ctx)
-  if not ctx or not ctx.project_root or ctx.project_root == "" then
+  local pr = uproject_dir(ctx)
+  if not pr or pr == "" then
     return nil
   end
-  local pr = ctx.project_root
   local patterns = {
     -- UE5 Gradle output (most common)
     join(pr, "Binaries", "Android", "*.apk"),
@@ -7096,6 +7265,7 @@ local function prepare_async(opts)
       on_exit = function(_, code)
         vim.schedule(function()
           CORE_RT.prepare_jobid = nil
+          CORE_RT.clear_freshness(ctx)
           if gtags_timer then
             gtags_timer:stop()
             gtags_timer:close()
@@ -7412,46 +7582,45 @@ dap_mod.setup_core({
   trim = trim,
   norm = norm,
   join = join,
-  dirname = dirname,
-  is_file = is_file,
-  ensure_dir = ensure_dir,
+  dirname = _ufs.dirname,
+  is_file = _ufs.is_file,
+  ensure_dir = _ufs.ensure_dir,
   run_lines = run_lines,
-  file_stat = file_stat,
-  file_mtime = file_mtime,
+  file_stat = _ufs.file_stat,
+  file_mtime = _ufs.file_mtime,
   glob_paths = glob_paths,
   is_native_windows = is_native_windows,
   resolve_context = resolve_context,
   invalidate_status_cache = invalidate_status_cache,
   refresh_statusline = refresh_statusline,
-  first_executable = first_executable,
-  path_has_prefix = path_has_prefix,
-  relative_to = relative_to,
+  first_executable = _uproc.first_executable,
+  path_has_prefix = _ufs.path_has_prefix,
+  relative_to = _ufs.relative_to,
   update_state_field = update_state_field,
   read_state = read_state,
 })
 
 -- Re-export DAP state for backward compat (plugins/dap.lua calls M.setup_dap)
 M._dap_session_state = dap_mod._dap_session_state
-M._breakpoint_specs = dap_mod._breakpoint_specs
 M._dap_attach_in_progress = dap_mod._dap_attach_in_progress
 M._dap_run_state = dap_mod._dap_run_state
 M._continue_debounce_until_ms = dap_mod._continue_debounce_until_ms
 M._dap_source_file_cache = dap_mod._dap_source_file_cache
 
--- Delegate DAP public API
-M.codelldb_paths = dap_mod.codelldb_paths
-M._reapply_breakpoints = dap_mod._reapply_breakpoints
-M._setup_aslr_listeners = dap_mod._setup_aslr_listeners
-M._apply_aslr_fix = dap_mod._apply_aslr_fix
-M._android_dap_config = dap_mod._android_dap_config
-M._android_preflight_ps1 = dap_mod._android_preflight_ps1
+-- Delegate DAP public API. Migrated from codelldb → lldb-dap; the old
+-- M.codelldb_paths / ASLR listeners / hand-written breakpoint helpers
+-- are gone (lldb-dap handles all of that natively).
+M.lldb_dap_path = dap_mod.lldb_dap_path
 M.android_dap_attach = dap_mod.android_dap_attach
-M._android_launch_preflight_ps1 = dap_mod._android_launch_preflight_ps1
+
+-- Expose state helpers so peripheral modules (ue/dap/android.lua's pick_package,
+-- external probes, future plugins) can read/write the persisted .cache/nvim-ue/
+-- state.json without re-implementing the path resolution. These are forward-
+-- declared locals upthread; they exist by the time setup_dap / require returns.
+M.read_state = read_state
+M.update_state_field = update_state_field
+M.resolve_context = resolve_context
 M.android_dap_launch = dap_mod.android_dap_launch
-M._dap_eval_lldb = dap_mod._dap_eval_lldb
-M._dap_make_breakpoint_spec = dap_mod._dap_make_breakpoint_spec
-M._dap_try_set_breakpoint = dap_mod._dap_try_set_breakpoint
-M._dap_clear_breakpoint = dap_mod._dap_clear_breakpoint
 M._dap_filter_scopes = dap_mod._dap_filter_scopes
 M.ensure_dap_loaded = dap_mod.ensure_dap_loaded
 M.ensure_dapui_loaded = dap_mod.ensure_dapui_loaded
@@ -7465,6 +7634,7 @@ M.dap_toggle_ui = dap_mod.dap_toggle_ui
 M.dap_reset_layout = dap_mod.dap_reset_layout
 M.dap_toggle_repl = dap_mod.dap_toggle_repl
 M.dap_diagnose = dap_mod.dap_diagnose
+M.stop_android_debugger = dap_mod.stop_android_debugger
 M.setup_dap = dap_mod.setup_dap
 
 -- ==========================================================================
@@ -7849,56 +8019,6 @@ function M.setup()
     clear_cache({ bang = cmd_opts.bang })
   end, { bang = true, desc = "Clear UE caches (! = also clangd index, compile_commands, restart LSP)" })
 
-  -- ─ Phase F.3: UEAndroidDAP* deprecation notice ─────────────────────
-  -- The platform-neutral UEDAP* aliases (Phase F.1+F.2+H) are the
-  -- preferred surface. The old UEAndroidDAP* names are kept so user
-  -- keymaps don't break, but each one now warns ONCE per session, the
-  -- first time it's invoked, with a pointer at the new alias.
-  M._dap_deprecation_seen = M._dap_deprecation_seen or {}
-  local function dap_deprecated(old_name, new_name, fn)
-    return function()
-      if not M._dap_deprecation_seen[old_name] then
-        M._dap_deprecation_seen[old_name] = true
-        vim.notify(
-          (":%s is deprecated; use :%s instead. (warning shown once per session.)"):format(old_name, new_name),
-          vim.log.levels.WARN
-        )
-      end
-      fn()
-    end
-  end
-
-  -- Android DAP commands (Phase F.3: each warns once, then forwards).
-  vim.api.nvim_create_user_command("UEAndroidDAPAttach",
-    dap_deprecated("UEAndroidDAPAttach", "UEDAPAttach android",
-      function() M.android_dap_attach() end), {})
-  vim.api.nvim_create_user_command("UEAndroidDAPLaunch",
-    dap_deprecated("UEAndroidDAPLaunch", "UEDAPLaunch android",
-      function() M.android_dap_launch() end), {})
-  vim.api.nvim_create_user_command("UEAndroidDAPContinue",
-    dap_deprecated("UEAndroidDAPContinue", "UEDAPContinue",
-      function() M.dap_continue() end), {})
-  vim.api.nvim_create_user_command("UEAndroidDAPPause",
-    dap_deprecated("UEAndroidDAPPause", "UEDAPPause",
-      function() M.dap_pause() end), {})
-  vim.api.nvim_create_user_command("UEAndroidDAPToggleBreakpoint",
-    dap_deprecated("UEAndroidDAPToggleBreakpoint", "UEDAPToggleBreakpoint",
-      function() M.dap_toggle_breakpoint() end), {})
-  vim.api.nvim_create_user_command("UEAndroidDAPStepOver",
-    dap_deprecated("UEAndroidDAPStepOver", "UEDAPStepOver",
-      function() M.dap_step_over() end), {})
-  vim.api.nvim_create_user_command("UEAndroidDAPStepIn",
-    dap_deprecated("UEAndroidDAPStepIn", "UEDAPStepIn",
-      function() M.dap_step_into() end), {})
-  vim.api.nvim_create_user_command("UEAndroidDAPStepOut",
-    dap_deprecated("UEAndroidDAPStepOut", "UEDAPStepOut",
-      function() M.dap_step_out() end), {})
-  vim.api.nvim_create_user_command("UEAndroidDAPToggleUI",
-    dap_deprecated("UEAndroidDAPToggleUI", "UEDAPToggleUI",
-      function() M.dap_toggle_ui() end), {})
-  vim.api.nvim_create_user_command("UEAndroidDAPREPL",
-    dap_deprecated("UEAndroidDAPREPL", "UEDAPREPL",
-      function() M.dap_toggle_repl() end), {})
   vim.api.nvim_create_user_command("UEDAPDiag", function()
     M.dap_diagnose()
   end, {})

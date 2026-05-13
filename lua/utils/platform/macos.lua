@@ -44,22 +44,28 @@ function M.default_clangd_candidates()
   }
 end
 
-function M.default_codelldb_paths()
-  local data = vim.fn.stdpath("data")
+function M.default_lldb_dap_paths()
+  -- Homebrew LLVM (Apple Silicon then Intel), then Xcode CLT lldb-dap
+  -- (Xcode 15+ ships it). PATH fallback caught upstream.
   return {
-    data .. "/mason/packages/codelldb/extension/adapter/codelldb",
-    "codelldb",
+    "/opt/homebrew/opt/llvm/bin/lldb-dap",
+    "/usr/local/opt/llvm/bin/lldb-dap",
+    "/Library/Developer/CommandLineTools/usr/bin/lldb-dap",
+    "/Applications/Xcode.app/Contents/Developer/usr/bin/lldb-dap",
   }
 end
 
 function M.default_lldb_server_paths()
-  -- macOS native debugging uses `lldb` directly via codelldb; for
+  -- macOS native debugging uses `lldb-dap` directly. For
   -- Android targets users typically install NDK side-by-side under
   -- ~/Library/Android/sdk/ndk/*. Globs resolved by callers.
+  -- See utils/platform/windows.lua for the NDK r21 ordering rationale.
   local home = (vim.uv or vim.loop).os_homedir() or ""
   if home == "" then return {} end
   return {
+    home .. "/Library/Android/sdk/ndk/21.*/toolchains/llvm/prebuilt/*/lib64/clang/*/lib/linux/aarch64/lldb-server",
     home .. "/Library/Android/sdk/ndk/*/toolchains/llvm/prebuilt/*/lib64/clang/*/lib/linux/aarch64/lldb-server",
+    home .. "/Library/Android/sdk/ndk/*/toolchains/llvm/prebuilt/*/lib/clang/*/lib/linux/aarch64/lldb-server",
   }
 end
 

@@ -41,7 +41,7 @@ M.is_linux   = M.id == "linux"
 ---@field open_path fun(path: string)
 ---@field reveal_file fun(path: string)
 ---@field default_clangd_candidates fun(): string[]
----@field default_codelldb_paths    fun(): string[]
+---@field default_lldb_dap_paths    fun(): string[]
 ---@field default_lldb_server_paths fun(): string[]
 ---@field cmd_quote fun(value: string): string
 

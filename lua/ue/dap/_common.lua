@@ -176,4 +176,84 @@ function M.run(config, fallback_msg)
   return true
 end
 
+-- ── codelldb (Android route) ──────────────────────────────────────────────
+-- lldb-dap is the win64/linux/mac/ios route. Android specifically uses
+-- vadimcn/codelldb because:
+--   * Windows host + Android lldb-server `gdbserver --attach` + lldb-dap
+--     21.x crashes on first setBreakpoints (LLVM #102254 / #138096).
+--   * Pure gdb-remote-port mode in lldb-dap doesn't enumerate modules over
+--     Android (LLVM #126935), leaving every breakpoint unverified.
+--   * codelldb's `request:"custom"` exposes ordered targetCreateCommands /
+--     processCreateCommands that map 1:1 to a known-good bare-lldb sequence.
+-- See docs/plans/2026-05-13_123500-android-aslike-nvim-ide-route.md for
+-- the full empirical write-up.
+
+--- Resolve a codelldb adapter executable.
+--- Returns the first readable file path, or nil.
+function M.find_codelldb()
+  local ok_cfg, cfg = pcall(require, "ue.config")
+  if ok_cfg and cfg and cfg.get then
+    local override = cfg.get("dap.codelldb_path")
+    if type(override) == "string" and override ~= "" and fs.is_file(override) then
+      return override
+    end
+  end
+  local ok_plat, plat = pcall(require, "utils.platform")
+  if ok_plat and plat and plat.driver then
+    local driver = plat.driver()
+    if driver and driver.default_codelldb_paths then
+      for _, p in ipairs(driver.default_codelldb_paths() or {}) do
+        if fs.is_file(p) then return p end
+      end
+    end
+  end
+  return executable_on_path("codelldb") or executable_on_path("codelldb.exe")
+end
+
+--- Wire `dap.adapters.codelldb` to the resolved codelldb executable.
+--- codelldb is a TCP-based adapter: it forks itself, the child binds a
+--- random port, prints "Listening on port N", then nvim-dap connects.
+--- nvim-dap's `type="server"` with `executable.command` handles this if
+--- we set `port="${port}"`.
+function M.ensure_codelldb_adapter(dap, adapter)
+  if not dap or not dap.adapters then return end
+  local cur = dap.adapters.codelldb
+  if type(cur) == "table"
+    and cur.type == "server"
+    and cur.executable
+    and cur.executable.command == adapter then
+    return
+  end
+  dap.adapters.codelldb = {
+    type = "server",
+    port = "${port}",
+    executable = {
+      command = adapter,
+      args    = { "--port", "${port}" },
+    },
+  }
+end
+
+--- Run a codelldb config via nvim-dap.
+function M.run_codelldb(config, fallback_msg)
+  local dap, err = M.require_dap()
+  if not dap then
+    vim.notify((fallback_msg or "DAP unavailable") .. ": " .. err, vim.log.levels.WARN)
+    return false
+  end
+  local adapter = M.find_codelldb()
+  if not adapter then
+    vim.notify(
+      "codelldb adapter not found.\n" ..
+      "Download from https://github.com/vadimcn/codelldb/releases and either\n" ..
+      "set ue.config.dap.codelldb_path or extract to C:\\tools\\codelldb\\.",
+      vim.log.levels.ERROR
+    )
+    return false
+  end
+  M.ensure_codelldb_adapter(dap, adapter)
+  dap.run(config)
+  return true
+end
+
 return M

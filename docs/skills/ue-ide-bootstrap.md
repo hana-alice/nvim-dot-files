@@ -124,26 +124,38 @@ nvim:    LazyVim + 本仓 ue.lua 已就绪
 
 ---
 
-### 第 3 步 — UBT GenerateClangDatabase（生 raw CDB）
+### 第 3 步 — `:UEPrepare` 解析 `.rsp` 生 CDB
 
-```bash
-./Engine/Build/BatchFiles/Build.bat \
-    -Mode=GenerateClangDatabase \
-    UE4Editor Win64 Development \
-    -OutputDir="<repo-root>"
+```vim
+:UEPrepare           " ue.lua 封装；headless 也行：vim.g.ue_prepare_headless=1 + ue.prepare_headless()
 ```
 
-或在 nvim 里：`:UEPrepare`（ue.lua 已封装）
+UBT 在第 2 步 build 时已为每个 unity TU 写了一份 `Module.<Mod>.{cpp.obj,cppa8.o}.rsp`
+（含 sysroot/-I/-D/PCH/-c <unity.cpp> 的完整 clang/MSVC 命令行）。
+`:UEPrepare` 直接扫这些 `.rsp`，生成 `compile_commands.json`，
+然后跑 slim → PCH-rewrite → unify-includes → prune-unused-dirs 流水线。
 
 | 项 | 数值 |
 |---|---|
-| 耗时 | **60-220 s** |
-| 内存 | <4 GB |
-| 磁盘新增 | **+~323 MB**（`compile_commands.json` raw, 约 14k entries） |
-| 产出 | raw CDB（per-file, 纯 .cpp） |
+| 耗时 | **<5 s**（rsp 扫描）+ ~30-60 s（pipeline） |
+| 内存 | <2 GB |
+| 磁盘新增 | **~300-500 MB**（`compile_commands.json`, 17k+ entries：engine + game 模块齐全） |
+| 产出 | per-TU CDB（unity .cpp，覆盖 Win64/Android/iOS/Linux 同口径） |
 
-⚠️ GenerateProjectFiles 的 configuration 必须和这一步对上，否则 UBT 直接 crash。
+**为什么 rsp-first 而不是 `Build.bat -Mode=GenerateClangDatabase`**：
+- GenerateClangDatabase 只导出当前 *target* 链入的模块；runtime 用的 Engine 模块经常缺
+- rsp 路径对所有平台同口径（Android NDK 用 `.cppa8.o.rsp`，Win64 用 `.cpp.obj.rsp`，Linux/Mac 用 `.cpp.o.rsp`），不依赖 Build.bat
+- 没有任何 rebuild 成本——读硬盘上已存在的 rsp 文件而已
+
+⚠️ 仅扫 compile rsp（后缀 `.obj.rsp` / `.o.rsp`），跳过 link / lib / def rsp。
+⚠️ P4 workspace 布局：`.uproject` 在 `<workspace>/Source/<Game>/` 下而非 workspace 根，
+   `collect_rsp_files` 已自动把 `dirname(uproject)/Intermediate/Build` 加进搜索路径。
 ⚠️ 不能让 LSP clangd 吃 unity CDB——gd 跳到 forward decl + 满屏红线。
+   slim_compile_commands.py 已识别并保留 `Module.<Mod>.cpp` 这类合法 unity TU。
+
+**fallback**：若 `.rsp` 一个都收不到（fresh clone / 还没 build），才回退到查找已存在的
+`compile_commands.json`（UBT 旧产物 / 手放）。`Build.bat -Mode=GenerateClangDatabase`
+路径已从 ue.lua 删除——它的覆盖率劣于 rsp 路径。
 
 ---
 
@@ -182,9 +194,10 @@ python <path>/inject_h_entries.py
 ### 第 5 步 — super-unity .idx（offline 全局索引）
 
 ```vim
-:UEIndexFull   " ue.lua 封装
-" 内部:
-"   1. UBT GenerateClangDatabase + -ForceUnity 生 unity CDB
+" :UEPrepare 已自动调度（full phase）。手动重跑 GTAGS：
+:UEIndexFull   " ue.lua 封装 — GTAGS 全量重扫
+" 内部（super-unity 部分由 prepare 自动管理）：
+"   1. 上一步 .rsp 已生成 unity CDB（无需再跑 -ForceUnity）
 "   2. 按 SharedPCH 分组成 ~13 个 super-TU
 "   3. 打过 -include-pch 补丁的 clangd-indexer 跑
 ```
@@ -261,7 +274,7 @@ blocklist：`Intermediate / Build / Saved / .generated.h`（避免 Hot-Reload �
 ├──────────────────────────────────────┼──────────┼──────────┼───────────┤
 │ 1. Setup + GenerateProjectFiles      │  10 min  │  <2 GB   │  +5-10 GB │
 │ 2. Build 一次 Editor (cold)          │  90 min  │  ~40 GB  │  +60 GB   │
-│ 3. GenerateClangDatabase             │   2 min  │  <4 GB   │  +0.3 GB  │
+│ 3. :UEPrepare (rsp → CDB + pipeline) │  ~1 min  │  <2 GB   │  +0.4 GB  │
 │ 4. .h inject (inject_h_entries.py)   │   7 s    │  0.5 GB  │  +0.2 GB  │
 │ 5. super-unity .idx                  │  50 s    │  ~16 GB  │  +0.24 GB │
 │ 6. csearch index                     │   2 min  │  ~3 GB   │  +0.4 GB  │
@@ -337,9 +350,8 @@ echo "[1/8] Setup + GenerateProjectFiles..."
 echo "[2/8] Build UE4Editor (this takes ~90 min)..."
 ./Engine/Build/BatchFiles/Build.bat UE4Editor Win64 Development
 
-echo "[3/8] Generate raw CDB..."
-./Engine/Build/BatchFiles/Build.bat -Mode=GenerateClangDatabase \
-    UE4Editor Win64 Development -OutputDir="$REPO"
+echo "[3/8] Generate CDB from .rsp..."
+nvim --headless +':UEPrepare' +qa
 cp compile_commands.json compile_commands.json.before_h_poc
 
 echo "[4/8] Inject .h entries..."

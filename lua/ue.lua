@@ -7607,9 +7607,11 @@ M._dap_run_state = dap_mod._dap_run_state
 M._continue_debounce_until_ms = dap_mod._continue_debounce_until_ms
 M._dap_source_file_cache = dap_mod._dap_source_file_cache
 
--- Delegate DAP public API. Migrated from codelldb → lldb-dap; the old
--- M.codelldb_paths / ASLR listeners / hand-written breakpoint helpers
--- are gone (lldb-dap handles all of that natively).
+-- Delegate DAP public API.  We're back on codelldb (1.12.2) for the
+-- Android route as of 2026-05; the lldb-dap experiment is retired.
+-- The historical M.codelldb_paths / ASLR listeners / hand-written
+-- breakpoint helpers stay deleted — codelldb handles all of that
+-- natively, and persistence is owned by ue.dap._persist_bp instead.
 M.lldb_dap_path = dap_mod.lldb_dap_path
 M.android_dap_attach = dap_mod.android_dap_attach
 
@@ -7649,6 +7651,14 @@ function M.setup()
 
   vim.g.ueindex_status = vim.g.ueindex_status or ""
   vim.g.ue_build_status = vim.g.ue_build_status or ""
+
+  -- Wire persistent breakpoints eagerly (before nvim-dap is loaded).  This
+  -- module only depends on dap.breakpoints lazily inside its callbacks, so
+  -- the autocmds it installs (BufReadPost restore + VimLeavePre flush) can
+  -- safely fire even if the user never triggers DAP this session.
+  pcall(function()
+    require("ue.dap._persist_bp").setup()
+  end)
 
   vim.api.nvim_create_user_command("UEPaths", show_paths, {})
   vim.api.nvim_create_user_command("UESetProject", function(opts)

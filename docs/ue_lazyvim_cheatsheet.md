@@ -699,38 +699,68 @@ Typical Win64 workflow:
 2. `<leader>uc` (`:UEExportCompileCommands`)
 3. Open code, use `gd` / `gr` / `<leader>ss` / `<leader>/`
 
-## DAP — Android (legacy keymap, still primary today)
+## DAP — Android (current keymap, codelldb 1.12.2 route)
 
-Source: `lua/config/keymaps.lua` `<leader>d*` block + `<F5/F6/F9/F10>`.
-All bound to `:UEAndroidDAP*` commands.
+Source: `lua/config/keymaps.lua` `<leader>d*` block + `dap_fkeys` table.
+All bound to `:UEAndroidDAP*` commands today; the `:UEDAP*` neutral
+commands below are the migration target.
 
-| Key              | Action                                  |
-|------------------|-----------------------------------------|
-| `<leader>da`     | Attach to Android process               |
-| `<leader>dl`     | Launch debug (auto-attach)              |
-| `<leader>db`     | Toggle hardware breakpoint              |
-| `<leader>dc`     | Continue                                |
-| `<leader>dp`     | Pause                                   |
-| `<leader>dn`     | Step over                               |
-| `<leader>di`     | Step in                                 |
-| `<leader>do`     | Step out                                |
-| `<leader>du`     | Toggle DAP UI                           |
-| `<leader>dr`     | Toggle REPL                             |
-| `<leader>dx`     | Reset DAP layout                        |
-| `<F5>`           | Continue                                |
-| `<F6>`           | Pause                                   |
-| `<F9>`           | Toggle hardware breakpoint              |
-| `<F10>`          | Step over                               |
+The `<F5/F6/F9/F10/F11/S-F11>` set is bound in **n / i / t / v** modes
+(important: `dap-repl` is a prompt buffer, normal-only bindings produce
+literal `<F5>` characters in insert mode).
+
+| Key              | Action                                          |
+|------------------|-------------------------------------------------|
+| `<leader>da`     | Attach to Android process                       |
+| `<leader>dl`     | Launch debug (auto-attach)                      |
+| `<leader>db`     | Toggle breakpoint (persisted, see below)        |
+| `<leader>dc`     | Continue                                        |
+| `<leader>dp`     | Pause                                           |
+| `<leader>dn`     | Step over                                       |
+| `<leader>di`     | Step in                                         |
+| `<leader>do`     | Step out                                        |
+| `<leader>du`     | Toggle DAP UI                                   |
+| `<leader>dr`     | Toggle REPL                                     |
+| `<leader>dx`     | Reset DAP layout                                |
+| `<F5>`           | Continue                                        |
+| `<F6>`           | Pause                                           |
+| `<F9>`           | Toggle breakpoint (persisted, per UE project)   |
+| `<F10>`          | Step over                                       |
+| `<F11>`          | Step in (Neovide may steal — see Note below)    |
+| `<S-F11>`        | Step out                                        |
+
+**Persistent breakpoints** (added 2026-05-13): `<F9>` /
+`<leader>db` write to
+`<engine_root>/.cache/nvim-ue/breakpoints/<project>.json`. They survive
+nvim restarts and are lazy-restored when each file is opened
+(`BufReadPost`). Save is debounced (250 ms) so spamming F9 won't
+thrash disk. Conditional / hit-count / log-message variants are
+preserved. Module: `lua/ue/dap/_persist_bp.lua`.
+
+Helper functions exposed but not yet bound to keys:
+
+| Function (call via `:lua`)                            | Action                                |
+|-------------------------------------------------------|---------------------------------------|
+| `require('ue.dap').dap_set_conditional_breakpoint()`  | Prompt for `condition` and persist    |
+| `require('ue.dap').dap_set_logpoint()`                | Prompt for `log message` and persist  |
+| `require('ue.dap').dap_clear_breakpoints()`           | Clear all (in-memory + persisted)     |
+| `require('ue.dap').dap_list_breakpoints()`            | Print persisted list to `:messages`   |
+
+**Note (Neovide 0.16+)**: F11 is bound to fullscreen by default. If
+`<F11>` toggles fullscreen instead of stepping in, set
+`vim.g.neovide_fullscreen = false` in your config or rebind StepIn
+elsewhere.
 
 Quick reference (all lowercase, in order):
 - `Space ub` build → `Space ui` install → `Space da` attach
 - `Space dl` launch debug
 - `Space dc` continue, `Space dp` pause
 - `Space dn` step over, `Space di` step in, `Space do` step out
-- `Space db` breakpoint, `Space du` DAP UI, `Space dr` REPL,
-  `Space dx` reset
+- `Space db` breakpoint (persisted), `Space du` DAP UI,
+  `Space dr` REPL, `Space dx` reset
 
-`:qa` auto-cleans DAP session.
+`:qa` triggers `VimLeavePre`, which flushes any pending bp save and
+then auto-cleans the DAP session.
 
 ## DAP — Platform-neutral (newer commands, no key by default)
 

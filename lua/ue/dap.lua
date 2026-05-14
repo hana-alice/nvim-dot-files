@@ -227,12 +227,38 @@ end
 -- Breakpoint / step / continue / pause user commands.
 -- ─────────────────────────────────────────────────────────────────────
 
---- Toggle a breakpoint at the cursor. Forwards to nvim-dap's native toggle —
---- lldb-dap handles `setBreakpoints` natively, so this Just Works™.
+--- Toggle a breakpoint at the cursor.  Wraps nvim-dap's native toggle and
+--- persists the bp set to disk so it survives nvim restarts.  Storage is
+--- per UE project (see ue.dap._persist_bp).
 function D.dap_toggle_breakpoint()
-  local ok, dap = D.ensure_dap_loaded()
+  local ok = D.ensure_dap_loaded()
   if not ok then return end
-  dap.toggle_breakpoint()
+  local pbp = require("ue.dap._persist_bp")
+  pbp.toggle()
+end
+
+--- Set a conditional breakpoint and persist it.
+function D.dap_set_conditional_breakpoint()
+  if not D.ensure_dap_loaded() then return end
+  require("ue.dap._persist_bp").toggle_conditional()
+end
+
+--- Set a logpoint and persist it.
+function D.dap_set_logpoint()
+  if not D.ensure_dap_loaded() then return end
+  require("ue.dap._persist_bp").toggle_logpoint()
+end
+
+--- Clear all breakpoints (current bufs + persisted store).
+function D.dap_clear_breakpoints()
+  if not D.ensure_dap_loaded() then return end
+  require("ue.dap._persist_bp").clear_all()
+end
+
+--- Print persisted bp list (debug aid).
+function D.dap_list_breakpoints()
+  if not D.ensure_dap_loaded() then return end
+  require("ue.dap._persist_bp").list()
 end
 
 function D.dap_continue()
@@ -315,23 +341,69 @@ end
 function D.dap_reset_layout()
   local dap_ok, dap = D.ensure_dap_loaded()
   local dapui_ok, dapui = D.ensure_dapui_loaded()
-  if dap_ok and dap.session() and dapui_ok then
-    dapui.close()
-    for _, win in ipairs(vim.api.nvim_list_wins()) do
-      if vim.api.nvim_win_is_valid(win) then
-        local buf = vim.api.nvim_win_get_buf(win)
-        local bt = vim.bo[buf].buftype
-        if bt == "nofile" or bt == "prompt" then
-          local ft = vim.bo[buf].filetype
-          if ft:find("^dap") then pcall(vim.api.nvim_win_close, win, true) end
+  if not dap_ok or not dapui_ok then
+    vim.cmd("only")
+    vim.cmd("wincmd =")
+    return
+  end
+
+  -- Step 1: close any leftover dap-* panels and dap-src:// virtual buffers.
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_is_valid(win) then
+      local buf = vim.api.nvim_win_get_buf(win)
+      local bt = vim.bo[buf].buftype
+      local ft = vim.bo[buf].filetype
+      local name = vim.api.nvim_buf_get_name(buf)
+      if (bt == "nofile" or bt == "prompt") and ft:find("^dap") then
+        pcall(vim.api.nvim_win_close, win, true)
+      elseif name:match("^dap%-src://") then
+        -- close (and wipe) the 1-line memory-reference stub buffer so
+        -- it never re-anchors as the editor area on next attach
+        pcall(vim.api.nvim_win_close, win, true)
+        pcall(vim.api.nvim_buf_delete, buf, { force = true })
+      end
+    end
+  end
+  pcall(function() dapui.close() end)
+
+  -- Step 2: re-anchor a real file buffer in the current window if it
+  -- ended up empty / on a stub.
+  local cur = vim.api.nvim_get_current_win()
+  if vim.api.nvim_win_is_valid(cur) then
+    local b = vim.api.nvim_win_get_buf(cur)
+    local bt = vim.bo[b].buftype
+    local name = vim.api.nvim_buf_get_name(b)
+    if bt ~= "" or name:match("^dap%-src://") then
+      -- find any normal file buffer to pin
+      for _, bf in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_loaded(bf) and vim.bo[bf].buftype == ""
+           and vim.api.nvim_buf_get_name(bf) ~= "" then
+          local n = vim.api.nvim_buf_get_name(bf)
+          if not n:match("^dap%-src://") then
+            pcall(vim.api.nvim_set_current_buf, bf)
+            break
+          end
         end
       end
     end
-    vim.cmd("wincmd =")
+  end
+
+  vim.cmd("wincmd =")
+
+  -- Step 3: if a session is active, re-open dapui (and re-pin saved_buf
+  -- handling via the listener — we can just call dapui.open here).
+  if dap.session() then
     dapui.open({ reset = true })
-  else
-    vim.cmd("only")
-    vim.cmd("wincmd =")
+    -- restart logcat panel if Android session
+    local android_ok, _ = pcall(require, "ue.dap.android")
+    if android_ok and D._dap_session_state and D._dap_session_state.pid then
+      -- defer slightly so dapui finishes its splits first
+      vim.defer_fn(function()
+        -- start_logcat / open_logcat_window are local closures inside
+        -- setup_dap; we just notify and rely on the user re-attaching
+        -- if logcat is needed. (logcat survives reset_layout typically.)
+      end, 100)
+    end
   end
 end
 
@@ -453,13 +525,112 @@ function D.setup_dap(dap, dapui)
   require("ue.dap._common").ensure_adapter(dap, adapter)
 
   -- ─── window / layout save & restore ───────────────────────────────
+  -- "main_win" is the one normal-file window the user works in during a
+  -- DAP session. dapui's three side panels surround it. We pin it on
+  -- session start so the layout is deterministic — no leftover build
+  -- output / floats / extra splits — and we keep it alive even if the
+  -- user accidentally <C-w>q's it (we re-create it from saved_buf).
   local saved_win, saved_buf
+
+  --- Pick the "best" window to keep as the main code window:
+  -- prefer the current window if it holds a real file; otherwise scan
+  -- for any normal-file window; otherwise fall back to current.
+  local function pick_main_window()
+    local cur = vim.api.nvim_get_current_win()
+    local function is_code_win(w)
+      if not vim.api.nvim_win_is_valid(w) then return false end
+      if vim.api.nvim_win_get_config(w).relative ~= "" then return false end
+      local b = vim.api.nvim_win_get_buf(w)
+      local bt = vim.bo[b].buftype
+      local ft = vim.bo[b].filetype
+      if bt ~= "" then return false end
+      if ft:find("^dap") or ft == "snacks_picker_list" or ft == "snacks_picker_input"
+         or ft == "snacks_dashboard" or ft == "snacks_explorer" then return false end
+      -- Reject dap-src:// virtual source stubs (memory-reference views
+      -- left over from a prior session). They have buftype="" but are
+      -- 1-line placeholders that collapse the editor area.
+      local name = vim.api.nvim_buf_get_name(b)
+      if name:match("^dap%-src://") then return false end
+      return true
+    end
+    if is_code_win(cur) then return cur end
+    for _, w in ipairs(vim.api.nvim_list_wins()) do
+      if is_code_win(w) then return w end
+    end
+    return cur
+  end
+
   local function save_layout()
-    if not saved_win then
+    if saved_win then return end
+    -- 1) pick the main code window before we touch anything
+    local main = pick_main_window()
+    local main_buf
+    if vim.api.nvim_win_is_valid(main) then
+      main_buf = vim.api.nvim_win_get_buf(main)
+    end
+    -- if pick_main_window fell through (only dap-src:// or dapui buffers
+    -- left from a prior session) main_buf is bogus — make a fresh empty
+    -- buffer so the editor area has a proper anchor.
+    local main_name = main_buf and vim.api.nvim_buf_get_name(main_buf) or ""
+    local main_bt = main_buf and vim.bo[main_buf].buftype or "?"
+    local main_ft = main_buf and vim.bo[main_buf].filetype or "?"
+    if main_bt ~= "" or main_ft:find("^dap") or main_name:match("^dap%-src://") then
+      vim.cmd("enew")
       saved_win = vim.api.nvim_get_current_win()
       saved_buf = vim.api.nvim_get_current_buf()
+    else
+      pcall(vim.api.nvim_set_current_win, main)
+      saved_win = main
+      saved_buf = main_buf
     end
+    -- 2) close everything else (build output, floats, extra splits) so
+    --    dapui.open() lands into a deterministic single-window layout.
+    pcall(vim.cmd, "only")
   end
+
+  --- Public helper: ensure the user's current window is a real code
+  --- window (used by pickers / file commands so they don't crash on
+  --- nofile/prompt buftypes left by dapui panels).
+  function D.dap_focus_main_window()
+    local cur = vim.api.nvim_get_current_win()
+    if vim.api.nvim_win_is_valid(cur) then
+      local b = vim.api.nvim_win_get_buf(cur)
+      if vim.bo[b].buftype == "" and not vim.bo[b].filetype:find("^dap") then
+        return cur
+      end
+    end
+    -- current window is dapui / nofile / prompt — try saved main
+    if saved_win and vim.api.nvim_win_is_valid(saved_win) then
+      pcall(vim.api.nvim_set_current_win, saved_win)
+      return saved_win
+    end
+    -- saved main was closed — re-create it from saved_buf
+    if saved_buf and vim.api.nvim_buf_is_valid(saved_buf) then
+      vim.cmd("topleft vsplit")
+      vim.cmd("wincmd l")
+      pcall(vim.api.nvim_set_current_buf, saved_buf)
+      saved_win = vim.api.nvim_get_current_win()
+      return saved_win
+    end
+    -- last resort: any normal-file window in the tab
+    for _, w in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_is_valid(w)
+         and vim.api.nvim_win_get_config(w).relative == "" then
+        local b = vim.api.nvim_win_get_buf(w)
+        if vim.bo[b].buftype == "" then
+          pcall(vim.api.nvim_set_current_win, w)
+          saved_win = w; saved_buf = b
+          return w
+        end
+      end
+    end
+    -- no normal-file window left at all — make one
+    vim.cmd("enew")
+    saved_win = vim.api.nvim_get_current_win()
+    saved_buf = vim.api.nvim_get_current_buf()
+    return saved_win
+  end
+
   local function restore_layout()
     dapui.close()
     for _, win in ipairs(vim.api.nvim_list_wins()) do
@@ -617,13 +788,56 @@ function D.setup_dap(dap, dapui)
   dap.listeners.after.event_initialized["dapui_config"] = function()
     close_explorer()
     save_layout()
+    -- Guarantee the editor area holds a real file buffer (NOT a leftover
+    -- dap-src:// stub from a previous session). dapui.open() docks its
+    -- panels around whatever the current window holds; if that window
+    -- has a 1-line nofile buffer the code area collapses to 1 row.
+    if saved_buf and vim.api.nvim_buf_is_valid(saved_buf)
+       and vim.bo[saved_buf].buftype == "" then
+      pcall(vim.api.nvim_set_current_buf, saved_buf)
+    end
     dapui.open()
     start_logcat()
     vim.defer_fn(open_logcat_window, 200)
+    -- Mark progress popup as done.
+    pcall(function() require("ue.dap._progress").done("debugger attached") end)
   end
   dap.listeners.before.event_terminated["dapui_config"] = function() on_session_end() end
   dap.listeners.before.event_exited["dapui_config"]     = function() on_session_end() end
   dap.listeners.after.disconnect["dapui_config"]        = function() on_session_end() end
+
+  -- ─── Rewire `dap.terminate` for UE Android Attach sessions ────────
+  -- The dapui controls bar's ■ button (and any plain `:lua require("dap")
+  -- .terminate()` invocation) issues a DAP `terminate` request.  codelldb
+  -- maps `terminate` to SIGKILL the inferior — fine for `launch` but
+  -- catastrophic for `attach` (it kills the game we just attached to).
+  --
+  -- For our "UE Android Attach" sessions (cfg.request == "launch" but
+  -- semantically attach via gdb-remote) we transparently redirect
+  -- terminate -> disconnect{terminateDebuggee=false}, i.e. a clean
+  -- detach that leaves the device-side process running.  Other sessions
+  -- (Win64 Launch / Linux Launch) keep the original terminate semantics.
+  if not D._dap_terminate_rewired then
+    local orig_terminate = dap.terminate
+    dap.terminate = function(opts, terminate_opts, cb)
+      local sess = dap.session()
+      local cfg = sess and sess.config or nil
+      local is_ue_attach =
+        cfg and tostring(cfg.name or ""):match("UE Android Attach") ~= nil
+      if is_ue_attach then
+        return dap.disconnect({ terminateDebuggee = false }, cb)
+      end
+      return orig_terminate(opts, terminate_opts, cb)
+    end
+    D._dap_terminate_rewired = true
+  end
+
+  -- Wire persistent breakpoints (per-project json under
+  -- <engine_root>/.cache/nvim-ue/breakpoints/<project>.json).  setup()
+  -- installs autocmds for BufReadPost restore + VimLeavePre flush.
+  pcall(function()
+    require("ue.dap._persist_bp").setup()
+  end)
 
   dap.listeners.after.event_initialized["ue-dap-run-state"] = function(session)
     if dap.session() ~= session then return end
@@ -683,6 +897,35 @@ function D.setup_dap(dap, dapui)
       end
     end
   end
+
+  -- ─── auto re-spawn main code window if user accidentally closes it ─
+  -- During a DAP session, dapui panels are buftype=nofile/prompt. If
+  -- the user does <C-w>q on the only normal-file window, the next
+  -- picker (<space><space>, <space>e, …) lands in a nofile window and
+  -- crashes. We watch WinClosed; if after the close there's no
+  -- normal-file window left in the tab, we re-spawn one from saved_buf
+  -- so the layout stays usable.
+  vim.api.nvim_create_autocmd("WinClosed", {
+    group = vim.api.nvim_create_augroup("ue_dap_main_window_guard", { clear = true }),
+    callback = function()
+      if not dap.session() then return end
+      vim.schedule(function()
+        if not dap.session() then return end
+        for _, w in ipairs(vim.api.nvim_list_wins()) do
+          if vim.api.nvim_win_is_valid(w)
+             and vim.api.nvim_win_get_config(w).relative == "" then
+            local b = vim.api.nvim_win_get_buf(w)
+            local ft = vim.bo[b].filetype
+            if vim.bo[b].buftype == "" and not ft:find("^dap") then
+              return  -- still have a code window, nothing to do
+            end
+          end
+        end
+        -- no normal-file window left — re-spawn from saved_buf
+        D.dap_focus_main_window()
+      end)
+    end,
+  })
 
   -- ─── signs ────────────────────────────────────────────────────────
   vim.fn.sign_define("DapBreakpoint", { text = "●", texthl = "DiagnosticError" })

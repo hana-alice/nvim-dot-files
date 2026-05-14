@@ -48,6 +48,11 @@ return {
           },
         },
         controls = {
+          -- Buttons are re-enabled. The ■ (terminate) button is rewired
+          -- by ue.setup_dap() to call `dap.disconnect{terminateDebuggee=
+          -- false}` for our attach sessions (UE Android Attach), so it
+          -- behaves as a safe "detach" — the target game keeps running.
+          -- ⏏ explicitly maps to detach as well.
           enabled = true,
           element = "repl",
           icons = {

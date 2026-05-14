@@ -320,10 +320,23 @@ map("n", "<leader>dl", "<cmd>UEDAPLaunch android<cr>", { desc = "DAP: Android La
 map("n", "<leader>dn", "<cmd>UEDAPStepOver<cr>", { desc = "DAP: Step Over" })
 map("n", "<leader>dp", "<cmd>UEDAPPause<cr>", { desc = "DAP: Pause" })
 map("n", "<leader>dx", "<cmd>UEResetLayout<cr>", { desc = "Reset Layout (DAP or default)" })
-map("n", "<F5>", "<cmd>UEDAPContinue<cr>", { desc = "DAP: Continue" })
-map("n", "<F6>", "<cmd>UEDAPPause<cr>", { desc = "DAP: Pause" })
-map("n", "<F9>", "<cmd>UEDAPToggleBreakpoint<cr>", { desc = "DAP: Toggle Breakpoint" })
-map("n", "<F10>", "<cmd>UEDAPStepOver<cr>", { desc = "DAP: Step Over" })
+-- DAP function-row keys: bind in normal+insert+terminal so they fire from
+-- dap-repl (insert/prompt), dapui_watches (insert), terminal logcat windows,
+-- and regular code buffers alike. Without this, pressing F5 inside the REPL
+-- inserts a literal "<F5>" instead of stepping.
+local dap_fkeys = {
+  ["<F5>"]   = { cmd = "UEDAPContinue",        desc = "DAP: Continue" },
+  ["<F6>"]   = { cmd = "UEDAPPause",           desc = "DAP: Pause" },
+  ["<F9>"]   = { cmd = "UEDAPToggleBreakpoint",desc = "DAP: Toggle Breakpoint" },
+  ["<F10>"]  = { cmd = "UEDAPStepOver",        desc = "DAP: Step Over" },
+  ["<F11>"]  = { cmd = "UEDAPStepIn",          desc = "DAP: Step In (VS/CLion)" },
+  ["<S-F11>"]= { cmd = "UEDAPStepOut",         desc = "DAP: Step Out (VS/CLion)" },
+}
+for lhs, spec in pairs(dap_fkeys) do
+  for _, mode in ipairs({ "n", "i", "t", "v" }) do
+    vim.keymap.set(mode, lhs, "<Cmd>" .. spec.cmd .. "<CR>", { desc = spec.desc, silent = true })
+  end
+end
 map("n", "<leader>di", "<cmd>UEDAPStepIn<cr>", { desc = "DAP: Step In" })
 map("n", "<leader>do", "<cmd>UEDAPStepOut<cr>", { desc = "DAP: Step Out" })
 map("n", "<leader>du", "<cmd>UEDAPToggleUI<cr>", { desc = "DAP: Toggle UI" })

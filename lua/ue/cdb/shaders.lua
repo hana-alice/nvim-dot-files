@@ -40,6 +40,32 @@ function M.make_entry(shader_file, template, include_roots)
   }
 end
 
+--- In-place augment over a CDB entries TABLE (no JSON round-trip).
+--- Use this when the caller already has the entries in memory — saves
+--- a decode + encode of the full CDB (can be hundreds of MB).
+--- Returns the same table (mutated). Always safe to call.
+function M.augment_table(entries, shader_files, include_roots)
+  if not shader_files or #shader_files == 0 then return entries end
+  if type(entries) ~= "table" then return entries end
+
+  local template = json.template_entry(entries)
+  local existing = {}
+  for _, entry in ipairs(entries) do
+    if type(entry) == "table" and entry.file then
+      existing[fs.norm(entry.file):lower()] = true
+    end
+  end
+
+  for _, shader_file in ipairs(shader_files) do
+    local key = shader_file:lower()
+    if not existing[key] then
+      table.insert(entries, M.make_entry(shader_file, template, include_roots or {}))
+      existing[key] = true
+    end
+  end
+  return entries
+end
+
 --- Take a JSON `content` blob (string), append synthetic entries for any
 --- `shader_files` not already present, and return the (possibly updated)
 --- JSON. Identical surface to the original `augment_compile_commands_with_shaders`

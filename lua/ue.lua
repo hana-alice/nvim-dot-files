@@ -1042,6 +1042,17 @@ local function resolve_project_input(path, engine_root)
     return nil, nil, "Project path not provided"
   end
 
+  -- Reject Windows drive-relative paths like "E:sample/..." (missing slash
+  -- after the drive letter). vim.fn.isdirectory() may still resolve them
+  -- via the per-drive cwd quirk, but they break downstream UBT/clangd
+  -- invocations and confuse is_windows_path(). Force the caller to supply
+  -- an absolute path.
+  if path:match("^[A-Za-z]:[^\\/]") then
+    return nil, nil,
+      "Drive-relative path not allowed: " .. path ..
+      " (missing slash after drive letter, e.g. use 'E:/sample/...' not 'E:sample/...')"
+  end
+
   if path:match("%.uproject$") then
     if not _ufs.is_file(path) then
       return nil, nil, "Project file not found: " .. path
@@ -1540,6 +1551,27 @@ UE_CONST.PICKER_EXCLUDES = {
   "ThirdParty",
 }
 
+-- Excludes for :UEPrepare's full-tree scan (gtags / clangd / csearch feed).
+-- Diverges from PICKER_EXCLUDES in two ways:
+--   1. ThirdParty is KEPT (we want to grep into vendored ThirdParty sources).
+--   2. node_modules / obj / bin are added (these are pure cache trees that
+--      regularly hit hundreds of thousands of files in shipped UE projects
+--      that ship JS/TS tooling + .NET helpers alongside Source/).
+-- Content is excluded mandatorily — it holds .uasset/.umap/.wem/.bnk binary
+-- assets only, never anything clangd/gtags/csearch needs.
+UE_CONST.SCAN_EXCLUDES = {
+  ".git",
+  ".vs",
+  "Binaries",
+  "Content",
+  "DerivedDataCache",
+  "Intermediate",
+  "Saved",
+  "node_modules",
+  "obj",
+  "bin",
+}
+
 local function picker_excludes(opts)
   local excludes = vim.deepcopy(UE_CONST.PICKER_EXCLUDES)
   if type(opts) == "table" and opts.include_third_party then
@@ -1714,6 +1746,91 @@ local function plugin_scope_from_root(root, path)
   }
 end
 
+-- Resolve where project modules / plugins actually live, given only the
+-- workspace root the user supplied via :UESetProject.
+--
+-- Two layouts are supported:
+--   1. Standard:    <project_root>/<Project>.uproject
+--                   modules in <project_root>/Source/<Module>/
+--                   plugins in <project_root>/Plugins/
+--   2. P4 nested:   <project_root>/Source/<Project>/<Project>.uproject
+--                   modules in <project_root>/Source/<Project>/Source/<Module>/
+--                   plugins in <project_root>/Source/<Project>/Plugins/
+--
+-- Detection rule: if exactly one .uproject exists at <project_root>/Source/*/
+-- we adopt nested layout, anchored at that .uproject's directory. Otherwise
+-- we fall back to project_root (standard layout). Result is cached per
+-- project_root so we glob disk at most once per workspace per session.
+--
+-- Parked on CORE_RT (not as top-level locals) because ue.lua is at the
+-- LuaJIT 200-local cap. See skill luajit-200-local-cap-with-loader-cache-mask.
+CORE_RT.project_module_anchor_cache = CORE_RT.project_module_anchor_cache or {}
+
+function CORE_RT.project_module_anchor(project_root)
+  project_root = norm(project_root or "")
+  if project_root == "" then
+    return ""
+  end
+  local cached = CORE_RT.project_module_anchor_cache[project_root]
+  if cached ~= nil then
+    return cached
+  end
+
+  local anchor = project_root
+  local nested = vim.fn.globpath(join(project_root, "Source"), "*/*.uproject", false, true)
+  if type(nested) == "table" and #nested == 1 then
+    anchor = norm(_ufs.dirname(nested[1]))
+  end
+
+  CORE_RT.project_module_anchor_cache[project_root] = anchor
+  return anchor
+end
+
+-- Project-specific scan whitelist. Path = `<project_root>/.ueprepare-scan-paths`,
+-- one entry per line, # for comments. Each entry is a root-relative directory
+-- (e.g. `Source/Client/Source`, `Source/Protocol`). When the file exists, it
+-- REPLACES UE_CONST.PROJECT_INDEX_DIRS for this project. When absent, the
+-- default PROJECT_INDEX_DIRS is used (legacy behavior).
+--
+-- Why whitelist > blacklist (.ueprepare-scan-ignore was deleted): some
+-- projects bury non-source data (config tables, SDK toolchains, art assets)
+-- under `Source/`. Blacklist plays whack-a-mole; whitelist is declarative
+-- and cuts scan input dramatically (verified 877k -> 116k on sample_dev).
+--
+-- Cached per-project on CORE_RT to avoid repeated disk reads. Use
+-- :UEReloadScanPaths to invalidate (see command below).
+CORE_RT.project_index_dirs_cache = CORE_RT.project_index_dirs_cache or {}
+
+function CORE_RT.project_index_dirs(ctx)
+  local project_root = ctx and ctx.project_root or nil
+  if not project_root or project_root == "" then
+    return UE_CONST.PROJECT_INDEX_DIRS
+  end
+  local cached = CORE_RT.project_index_dirs_cache[project_root]
+  if cached ~= nil then
+    return cached
+  end
+
+  local dirs = nil
+  local f = io.open(project_root .. "/.ueprepare-scan-paths", "r")
+  if f then
+    dirs = {}
+    for line in f:lines() do
+      local s = line:gsub("\r$", ""):gsub("^%s+", ""):gsub("%s+$", "")
+      s = s:gsub("%s+#.*$", "")
+      if s ~= "" and not s:match("^#") then
+        table.insert(dirs, s)
+      end
+    end
+    f:close()
+    if #dirs == 0 then dirs = nil end -- empty file -> fall back to default
+  end
+
+  local result = dirs or UE_CONST.PROJECT_INDEX_DIRS
+  CORE_RT.project_index_dirs_cache[project_root] = result
+  return result
+end
+
 local function project_module_scope(project_root, path)
   project_root = norm(project_root)
   path = norm(path)
@@ -1721,7 +1838,7 @@ local function project_module_scope(project_root, path)
     return nil
   end
 
-  local source_root = join(project_root, "Source")
+  local source_root = join(CORE_RT.project_module_anchor(project_root), "Source")
   if not _ufs.path_has_prefix(path, source_root) then
     return nil
   end
@@ -1964,15 +2081,19 @@ local function unity_locate_module_root(engine_root, project_root, name)
     end
   end
 
-  -- 4) Project module: <project>/Source/<Module>
-  if not hit and project_root and project_root ~= "" then
-    hit = check(join(project_root, "Source", name))
+  -- 4) Project module: <anchor>/Source/<Module>
+  --    Anchor = CORE_RT.project_module_anchor(project_root). Equals project_root
+  --    for standard layouts; equals <project_root>/Source/<ProjectName> for the
+  --    P4 nested layout where the .uproject lives one level deeper.
+  local project_anchor = project_root and project_root ~= "" and CORE_RT.project_module_anchor(project_root) or nil
+  if not hit and project_anchor then
+    hit = check(join(project_anchor, "Source", name))
   end
 
-  -- 5) Project plugin: <project>/Plugins/**/<Module>/Source/<Module>
-  if not hit and project_root and project_root ~= "" then
+  -- 5) Project plugin: <anchor>/Plugins/**/<Module>/Source/<Module>
+  if not hit and project_anchor then
     local matches = vim.fn.globpath(
-      join(project_root, "Plugins"),
+      join(project_anchor, "Plugins"),
       "**/" .. name .. "/Source/" .. name,
       false,
       true
@@ -3112,6 +3233,18 @@ local function scan_relative_files_async(root, search_paths, cb)
   end
 
   local cmd = { fd, "--type", "f", "--hidden", "--follow" }
+  -- Prune cache/asset/intermediate trees at fd level so we never even traverse
+  -- them. Without this, shipped UE projects with Content/ + node_modules/ +
+  -- Saved/ blow up to 5M+ files in Source/ subtree, and the downstream lists
+  -- pass spent ~55s on the main thread doing dedup+sort+write of ~700k paths.
+  -- See UE_CONST.SCAN_EXCLUDES for rationale (Content mandatory, ThirdParty
+  -- intentionally KEPT for grep into vendored sources).
+  for _, ex in ipairs(UE_CONST.SCAN_EXCLUDES) do
+    table.insert(cmd, "--exclude")
+    table.insert(cmd, ex)
+  end
+  -- (Removed: .ueprepare-scan-ignore blacklist. Replaced by per-project
+  -- .ueprepare-scan-paths whitelist in CORE_RT.project_index_dirs.)
   local found = false
   for _, search_path in ipairs(search_paths) do
     if _ufs.is_dir(join(root, search_path)) then
@@ -3324,7 +3457,7 @@ local function rg_code_definition_search(ctx, symbol)
   end
 
   if ctx.project_root and ctx.project_root ~= "" then
-    for _, relative in ipairs(existing_relative_dirs(ctx.project_root, UE_CONST.PROJECT_INDEX_DIRS)) do
+    for _, relative in ipairs(existing_relative_dirs(ctx.project_root, CORE_RT.project_index_dirs(ctx))) do
       add_dir(join(ctx.project_root, relative))
     end
   end
@@ -3373,7 +3506,30 @@ end
 -- ==========================================================================
 
 local function detect_target_names(project_root, uproject)
-  local targets = vim.fn.globpath(join(project_root, "Source"), "*.Target.cs", false, true)
+  -- Two layouts to support:
+  --   1. Standard:  <project_root>/<Project>.uproject + <project_root>/Source/*.Target.cs
+  --   2. P4 nested: <project_root>/Source/Client/Client.uproject
+  --                 + <project_root>/Source/Client/Source/*.Target.cs
+  --
+  -- Prefer the directory next to the .uproject (matches what UBT itself
+  -- does), fall back to <project_root>/Source for the standard layout.
+  local search_dirs = {}
+  if uproject and uproject ~= "" then
+    table.insert(search_dirs, join(_ufs.dirname(uproject), "Source"))
+  end
+  table.insert(search_dirs, join(project_root, "Source"))
+
+  local seen, targets = {}, {}
+  for _, dir in ipairs(search_dirs) do
+    if seen[dir] == nil then
+      seen[dir] = true
+      local found = vim.fn.globpath(dir, "*.Target.cs", false, true)
+      if type(found) == "table" then
+        for _, t in ipairs(found) do table.insert(targets, t) end
+      end
+    end
+  end
+
   local detected = {
     Editor = nil,
     Client = nil,
@@ -3381,7 +3537,7 @@ local function detect_target_names(project_root, uproject)
     Game = nil,
   }
 
-  for _, target in ipairs(targets or {}) do
+  for _, target in ipairs(targets) do
     local name = vim.fs.basename(target):gsub("%.Target%.cs$", "")
     local matched = false
     for _, kind in ipairs(UE_CONST.TARGET_KIND_SUFFIXES) do
@@ -3521,16 +3677,13 @@ local function to_windows_path(path)
     return (path:gsub("/", "\\"))
   end
 
-  local code, lines = run_lines({ "wslpath", "-w", path })
-  if code ~= 0 or not lines or not lines[1] then
-    return nil
-  end
-
-  local converted = trim(lines[1])
-  if converted == "" then
-    return nil
-  end
-  return converted
+  -- Historical: this used to spawn `wslpath -w` to convert /mnt/d/... into
+  -- D:\... when ue.lua ran inside WSL. WSL is no longer a supported host
+  -- (Windows-native + Mac-native only), so a non-Windows path here means
+  -- the caller passed a malformed path (e.g. drive-relative like "E:sample/"
+  -- or a posix absolute that doesn't make sense on this host). Fail
+  -- loudly instead of silently spawning a missing helper.
+  return nil
 end
 
 local function windows_host_cwd()
@@ -3702,9 +3855,45 @@ local function scan_shader_files(root, search_paths)
     return {}
   end
 
+  -- Prefer `fd` (single multi-extension multi-search-path walk, ~100x faster
+  -- than nested vim.fn.glob loops on Windows for large UE trees).
+  -- vim.fn.glob path retained as a fallback when fd is unavailable.
+  local existing = existing_relative_dirs(root, search_paths)
+  if #existing == 0 then return {} end
+
   local files = {}
   local seen = {}
-  for _, search_path in ipairs(existing_relative_dirs(root, search_paths)) do
+
+  if vim.fn.executable("fd") == 1 and vim.system then
+    local cmd = { "fd", "--type", "f", "--hidden", "--no-ignore", "--absolute-path" }
+    for _, ex in ipairs(UE_CONST.SCAN_EXCLUDES) do
+      table.insert(cmd, "--exclude"); table.insert(cmd, ex)
+    end
+    for _, ext in ipairs(M.FT_SHADER) do
+      table.insert(cmd, "-e"); table.insert(cmd, ext)
+    end
+    for _, sp in ipairs(existing) do
+      table.insert(cmd, "--search-path"); table.insert(cmd, sp)
+    end
+    local ok, result = pcall(function()
+      return vim.system(cmd, { text = true, cwd = root }):wait()
+    end)
+    if ok and result and result.code == 0 and result.stdout then
+      for line in (result.stdout):gmatch("[^\r\n]+") do
+        local normalized = norm(line)
+        local key = normalized:lower()
+        if not seen[key] then
+          seen[key] = true
+          table.insert(files, normalized)
+        end
+      end
+      table.sort(files)
+      return files
+    end
+    -- fall through to glob fallback on failure
+  end
+
+  for _, search_path in ipairs(existing) do
     for _, extension in ipairs(M.FT_SHADER) do
       for _, pattern in ipairs({
         join(root, search_path, "*." .. extension),
@@ -3921,15 +4110,50 @@ local function augment_compile_commands_with_shaders(ctx, content)
   -- Discovery stays here (captures UE_CONST + scan_shader_files); the
   -- augmentation primitive itself moved to lua/ue/cdb/shaders.lua.
   local shader_files = {}
-  if ctx.project_root and ctx.project_root ~= "" then
-    vim.list_extend(shader_files, scan_shader_files(ctx.project_root, UE_CONST.PROJECT_INDEX_DIRS))
-  end
-  vim.list_extend(shader_files, scan_shader_files(ctx.engine_root, UE_CONST.ENGINE_INDEX_DIRS))
+  CORE_RT.trace_seg("shader.scan", function()
+    if ctx.project_root and ctx.project_root ~= "" then
+      vim.list_extend(shader_files, scan_shader_files(ctx.project_root, CORE_RT.project_index_dirs(ctx)))
+    end
+    vim.list_extend(shader_files, scan_shader_files(ctx.engine_root, UE_CONST.ENGINE_INDEX_DIRS))
+  end)
+  CORE_RT.trace_mark(string.format("shader.count=%d", #shader_files))
   if #shader_files == 0 then
     return content
   end
-  local include_roots = shader_include_roots(shader_files)
-  return require("ue.cdb.shaders").augment(content, shader_files, include_roots)
+  local include_roots = CORE_RT.trace_seg("shader.include_roots", function()
+    return shader_include_roots(shader_files)
+  end)
+  CORE_RT.trace_mark(string.format("shader.include_roots_count=%d", #include_roots))
+  return CORE_RT.trace_seg("shader.augment", function()
+    return require("ue.cdb.shaders").augment(content, shader_files, include_roots)
+  end)
+end
+
+-- Table variant: augments an in-memory entries table directly (no JSON round-trip).
+-- Use when caller already has the parsed CDB in memory — saves a decode+encode
+-- of the full CDB (~224 MB on UE5 projects, ~200s round-trip on the main thread).
+local function augment_compile_commands_table_with_shaders(ctx, entries, progress)
+  progress = progress or function() end
+  progress("shader_scan", 70, "scanning shaders...")
+  local shader_files = {}
+  CORE_RT.trace_seg("shader.scan", function()
+    if ctx.project_root and ctx.project_root ~= "" then
+      vim.list_extend(shader_files, scan_shader_files(ctx.project_root, CORE_RT.project_index_dirs(ctx)))
+    end
+    vim.list_extend(shader_files, scan_shader_files(ctx.engine_root, UE_CONST.ENGINE_INDEX_DIRS))
+  end)
+  CORE_RT.trace_mark(string.format("shader.count=%d", #shader_files))
+  if #shader_files == 0 then
+    return entries
+  end
+  progress("shader_augment", 80, string.format("augmenting cdb with %d shaders...", #shader_files))
+  local include_roots = CORE_RT.trace_seg("shader.include_roots", function()
+    return shader_include_roots(shader_files)
+  end)
+  CORE_RT.trace_mark(string.format("shader.include_roots_count=%d", #include_roots))
+  return CORE_RT.trace_seg("shader.augment_table", function()
+    return require("ue.cdb.shaders").augment_table(entries, shader_files, include_roots)
+  end)
 end
 
 -- ---------------------------------------------------------------------------
@@ -4325,11 +4549,17 @@ local function collect_rsp_files(ctx)
   return rsp_files, nil
 end
 
-generate_compile_commands_from_rsp = function(ctx)
-  local rsp_files, err = collect_rsp_files(ctx)
+generate_compile_commands_from_rsp = function(ctx, progress)
+  progress = progress or function() end
+  progress("collect_rsp", 30, "collecting .rsp files...")
+  local rsp_files, err = CORE_RT.trace_seg("ccjson.collect_rsp", function()
+    return collect_rsp_files(ctx)
+  end)
   if not rsp_files then
     return nil, err
   end
+  CORE_RT.trace_mark(string.format("ccjson.rsp_count=%d", #rsp_files))
+  progress("parse_loop", 40, string.format("parsing %d rsp files...", #rsp_files))
 
   local engine_source_dir = join(ctx.engine_root, "Engine", "Source")
   -- UBT runs with Engine/Source as CWD, so all relative paths in rsp files
@@ -4337,9 +4567,15 @@ generate_compile_commands_from_rsp = function(ctx)
   local compile_dir = engine_source_dir
   local entries = {}
   local seen_files = {}
+  local _ccjson_read_ms = 0
+  local _ccjson_unity_ms = 0
+  local _ccjson_unity_calls = 0
 
+  CORE_RT.trace_seg("ccjson.parse_loop", function()
   for _, rsp_path in ipairs(rsp_files) do
+    local _t0 = vim.loop.hrtime()
     local content = read_all(rsp_path)
+    _ccjson_read_ms = _ccjson_read_ms + (vim.loop.hrtime() - _t0) / 1e6
     if content then
       content = trim(content)
       if content ~= "" then
@@ -4357,7 +4593,10 @@ generate_compile_commands_from_rsp = function(ctx)
           table.insert(args, 1, "clang++")
           table.insert(args, "-D__INTELLISENSE__")
 
+          local _u0 = vim.loop.hrtime()
           local unity_includes = extract_unity_includes(input_file, engine_source_dir)
+          _ccjson_unity_ms = _ccjson_unity_ms + (vim.loop.hrtime() - _u0) / 1e6
+          _ccjson_unity_calls = _ccjson_unity_calls + 1
           if unity_includes then
             for _, real_file in ipairs(unity_includes) do
               local key = real_file:lower()
@@ -4389,19 +4628,31 @@ generate_compile_commands_from_rsp = function(ctx)
       end
     end
   end
+  end)
+  CORE_RT.trace_mark(string.format(
+    "ccjson.read_total=%.0fms unity_total=%.0fms unity_calls=%d entries=%d",
+    _ccjson_read_ms, _ccjson_unity_ms, _ccjson_unity_calls, #entries))
 
   if #entries == 0 then
     return nil, "No compile entries generated from .rsp files"
   end
 
-  local json_content = vim.json.encode(entries)
-  json_content = augment_compile_commands_with_shaders(ctx, json_content)
+  entries = augment_compile_commands_table_with_shaders(ctx, entries, progress)
+
+  progress("encode", 85, string.format("encoding cdb (%d entries)...", #entries))
+  local json_content = CORE_RT.trace_seg("ccjson.encode", function()
+    return vim.json.encode(entries)
+  end)
 
   local targets = compile_commands_targets(ctx)
   local preferred = targets[1]
-  for _, target in ipairs(targets) do
-    write_all(target, json_content)
-  end
+  progress("write", 90, string.format("writing cdb (%.1f MB x %d)...", #json_content / 1048576, #targets))
+  CORE_RT.trace_seg("ccjson.write", function()
+    for _, target in ipairs(targets) do
+      write_all(target, json_content)
+    end
+  end)
+  progress("done", 95, string.format("cdb written: %d entries", #entries))
 
   return #entries, preferred
 end
@@ -4556,7 +4807,7 @@ local function export_compile_commands_to_engine_root(ctx)
   return false, "compile_commands.json not found at any candidate path"
 end
 
-local function generate_compile_commands(ctx)
+local function generate_compile_commands(ctx, progress)
   local targets = compile_commands_targets(ctx)
 
   -- PRIMARY: generate from .rsp files. UBT writes one Module.<Mod>.{cpp.obj,cppa8.o}.rsp
@@ -4571,7 +4822,7 @@ local function generate_compile_commands(ctx)
   --   2. Re-running Build.bat costs 30-60s; reading rsp files costs <2s.
   --   3. The unity-rsp pipeline produces identical args to what the build
   --      actually used, so PCH/macro mismatches are eliminated by construction.
-  local rsp_count, rsp_path = generate_compile_commands_from_rsp(ctx)
+  local rsp_count, rsp_path = generate_compile_commands_from_rsp(ctx, progress)
   if rsp_count and rsp_count > 0 then
     run_compile_commands_pipeline(targets[1], targets)
     return true, rsp_path .. " (" .. rsp_count .. " entries from .rsp files)"
@@ -5923,7 +6174,7 @@ do
     end
 
     if ctx.project_root and ctx.project_root ~= "" then
-      for _, relative in ipairs(existing_relative_dirs(ctx.project_root, UE_CONST.PROJECT_INDEX_DIRS)) do
+      for _, relative in ipairs(existing_relative_dirs(ctx.project_root, CORE_RT.project_index_dirs(ctx))) do
         add_dir(join(ctx.project_root, relative))
       end
     end
@@ -6466,11 +6717,11 @@ end
 local function ue_runtime_env()
   return {
     build_target_name = build_target_name,
-    dirname = dirname,
-    file_mtime = file_mtime,
+    dirname = _ufs.dirname,
+    file_mtime = _ufs.file_mtime,
     find_uproject_in_dir = find_uproject_in_dir,
     glob_paths = glob_paths,
-    is_file = is_file,
+    is_file = _ufs.is_file,
     is_windows_path = is_windows_path,
     join = join,
     norm = norm,
@@ -6688,7 +6939,7 @@ local function prepare()
 
   local project_rel = {}
   if ctx.project_root and ctx.project_root ~= "" then
-    local project_dirs = existing_relative_dirs(ctx.project_root, UE_CONST.PROJECT_INDEX_DIRS)
+    local project_dirs = existing_relative_dirs(ctx.project_root, CORE_RT.project_index_dirs(ctx))
     local project_err
     project_rel, project_err = scan_relative_files(ctx.project_root, project_dirs)
     if not project_rel then
@@ -6886,6 +7137,46 @@ local function prepare_async(opts)
 
   _ufs.ensure_dir(ctx.paths.cache)
 
+  -- ── DEBUG TRACE (remove after diagnosis) ─────────────────────────────
+  -- Measures main-thread blocking segments inside :UEPrepare. Writes to
+  -- <cache>/logs/ue-prepare-trace.log. Mounted on CORE_RT to keep top-level
+  -- local count under LuaJIT's 200-cap.
+  if not CORE_RT.trace_open then
+    function CORE_RT.trace_open(label, log_dir)
+      _ufs.ensure_dir(log_dir)
+      local p = log_dir .. "/ue-prepare-trace.log"
+      local f = io.open(p, "a")
+      if f then
+        f:write(("\n=== %s @ %s ===\n"):format(label, os.date("%Y-%m-%d %H:%M:%S")))
+        f:close()
+      end
+      CORE_RT.trace_path = p
+      CORE_RT.trace_t0 = vim.uv.hrtime()
+    end
+    function CORE_RT.trace_seg(name, fn)
+      local t = vim.uv.hrtime()
+      local ok, r1, r2, r3 = pcall(fn)
+      local ms = (vim.uv.hrtime() - t) / 1e6
+      local rel = (vim.uv.hrtime() - (CORE_RT.trace_t0 or t)) / 1e6
+      local f = CORE_RT.trace_path and io.open(CORE_RT.trace_path, "a") or nil
+      if f then
+        f:write(("[+%8.1fms] %-28s %8.1f ms %s\n"):format(rel, name, ms, ok and "" or ("ERR: " .. tostring(r1))))
+        f:close()
+      end
+      if not ok then error(r1) end
+      return r1, r2, r3
+    end
+    function CORE_RT.trace_mark(name)
+      local rel = (vim.uv.hrtime() - (CORE_RT.trace_t0 or vim.uv.hrtime())) / 1e6
+      local f = CORE_RT.trace_path and io.open(CORE_RT.trace_path, "a") or nil
+      if f then
+        f:write(("[+%8.1fms] %-28s   (mark)\n"):format(rel, name))
+        f:close()
+      end
+    end
+  end
+  CORE_RT.trace_open(opts.force_csearch and "UEPrepareReindex" or "UEPrepare", ctx.paths.logs_dir)
+
   -- ── Timing & ETA ─────────────────────────────────────────────────────
   -- Load previous run timings for ETA estimation
   local prev_timings = ctx.state.prepare_timings or {}
@@ -6927,130 +7218,10 @@ local function prepare_async(opts)
     return ""
   end
 
-  -- ── Cache fast-path ──────────────────────────────────────────────────
-  if prepare_cache_ready(ctx) then
-    local root = workspace_root(ctx)
-    local ok_compile, compile_path = generate_compile_commands(ctx)
-    if not ok_compile then
-      invalidate_status_cache()
-      refresh_statusline()
-      populate_quickfix_from_output("UEPrepare compile_commands", compile_path, { root = root })
-      vim.notify("UEPrepare compile_commands failed: " .. compile_path, vim.log.levels.WARN)
-      return
-    end
-    clear_index_dirty(ctx)
-    INDEX_FN.schedule_index_refresh(ctx, { current = true, hot = true, full = true, current_delay_ms = 50, hot_delay_ms = 2500 })
-    invalidate_status_cache()
-    refresh_statusline()
-
-    -- Build csearch index if missing or stale.
-    --
-    -- Staleness is judged from sources that actually reflect worktree
-    -- changes (more reliable than workspace_all_list, which is rewritten
-    -- on every UEPrepare and whose mtime always tracks idx mtime):
-    --
-    --   1. Force flag (:UEPrepareReindex)         → rebuild
-    --   2. idx missing / too small                → rebuild
-    --   3. idx older than .git/index of engine OR project   → rebuild
-    --      (git tracks every file add/remove/edit; HEAD-only would miss
-    --       working-tree edits that haven't been committed yet)
-    --   4. idx older than 30 days                 → rebuild
-    --      (safety net: ghost entries accumulate from upstream renames
-    --       even when our incremental detection misses them)
-    --   5. Otherwise                              → reuse existing idx
-    --
-    -- This is still a *full cold rebuild* on each trigger — true
-    -- incremental indexing requires cindex-uefilter changes (see
-    -- comments in tools/cindex-uefilter/ and the in-progress PoC).
-    -- Async; doesn't block the fast-path return.
-    local code_search_fp = require("utils.code_search")
-    local cs_ctx_fp = { workspace_root = root, csearch_idx = ctx.paths and ctx.paths.csearch_idx or nil }
-    local need_index = true
-    local stale_reason = "missing"
-    do
-      local idx_path = code_search_fp.index_path(cs_ctx_fp)
-      local idx_stat = idx_path and vim.loop.fs_stat(idx_path) or nil
-
-      if ctx._force_csearch then
-        stale_reason = "forced"
-      elseif not idx_stat or (idx_stat.size or 0) <= 1024 then
-        stale_reason = "missing"
-      else
-        local idx_mt = idx_stat.mtime and idx_stat.mtime.sec or 0
-        local now = os.time()
-
-        -- Age cap: rebuild monthly to clear accumulated ghost entries.
-        if (now - idx_mt) > (30 * 24 * 3600) then
-          stale_reason = ("age %.1fd"):format((now - idx_mt) / 86400)
-        else
-          -- Newest .git/index across engine + project.
-          local function git_index_mtime(repo_root)
-            if not repo_root or repo_root == "" then return 0 end
-            local s = vim.loop.fs_stat(repo_root .. "/.git/index")
-            return (s and s.mtime and s.mtime.sec) or 0
-          end
-          local git_mt = math.max(
-            git_index_mtime(ctx.engine_root),
-            git_index_mtime(ctx.project_root))
-
-          if git_mt > 0 and idx_mt >= git_mt then
-            need_index = false
-          elseif git_mt == 0 then
-            -- No .git/index found anywhere → fall back to old heuristic
-            -- (workspace_all_list mtime). Better than nothing.
-            local list_path = ctx.paths.workspace_all_list
-            local list_stat = list_path and vim.loop.fs_stat(list_path) or nil
-            if list_stat then
-              local list_mt = list_stat.mtime and list_stat.mtime.sec or 0
-              if idx_mt >= list_mt then
-                need_index = false
-              else
-                stale_reason = "list newer (no .git fallback)"
-              end
-            else
-              -- No baseline at all; trust existing idx to avoid pointless
-              -- rebuilds. UEPrepareReindex is the escape hatch.
-              need_index = false
-            end
-          else
-            stale_reason = ("git/index newer by %ds"):format(git_mt - idx_mt)
-          end
-        end
-      end
-    end
-    if need_index and code_search_fp.cindex_uefilter_exe() then
-      local abs_list = ctx.paths.cache .. "/csearch_filelist.txt"
-      local fout = io.open(abs_list, "w")
-      if fout then
-        for line in io.lines(ctx.paths.workspace_all_list) do
-          local trimmed = line:gsub("\r$", "")
-          if trimmed ~= "" then
-            fout:write(root, "/", trimmed, "\n")
-          end
-        end
-        fout:close()
-        vim.notify(("UEPrepare: rebuilding csearch index in background (reason: %s)..."):format(stale_reason),
-          vim.log.levels.INFO, { title = "UE", timeout = 3000, replace = "ue.csearch.build" })
-        code_search_fp.build_index(cs_ctx_fp, abs_list, function(ok_cs, err_cs, stats)
-          pcall(os.remove, abs_list)
-          if ok_cs then
-            local mb = math.floor((stats.index_size or 0) / 1024 / 1024)
-            vim.notify(("✓ csearch index rebuilt: %d MB in %.1fs"):format(
-              mb, (stats.ms or 0) / 1000),
-              vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
-          else
-            vim.notify("UEPrepare: csearch rebuild failed: " .. (err_cs or "unknown"),
-              vim.log.levels.WARN, { title = "UE", replace = "ue.csearch.build" })
-          end
-        end)
-      end
-    end
-
-    vim.notify(prepare_summary(ctx, compile_path, { reused_cache = true }))
-    return
-  end
-
-  -- ── fidget progress ──────────────────────────────────────────────────
+  -- ── fidget progress (created BEFORE fast-path so async ccjson can stream
+  --     progress events into it; previously this was only set up on the cold
+  --     path after fast-path returned, so fast-path's 17s ccjson run looked
+  --     like a silent freeze) ─────────────────────────────────────────────
   local ok_fidget, progress = pcall(require, "fidget.progress")
   local handle
   if ok_fidget then
@@ -7071,6 +7242,124 @@ local function prepare_async(opts)
     end
   end
 
+  -- ── Cache fast-path ──────────────────────────────────────────────────
+  if prepare_cache_ready(ctx) then
+    CORE_RT.trace_mark("FAST_PATH_TAKEN")
+    local root = workspace_root(ctx)
+    update("generating compile_commands (async)...", 25)
+
+    -- Async ccjson — runs in headless nvim subprocess, streams progress
+    -- here, and continues with the rest of fast-path in on_done.
+    M.async_generate_compile_commands(ctx,
+      function(stage, pct, detail)
+        update(detail, pct)
+      end,
+      function(ok_compile, compile_path)
+        if not ok_compile then
+          invalidate_status_cache()
+          refresh_statusline()
+          populate_quickfix_from_output("UEPrepare compile_commands", compile_path, { root = root })
+          vim.notify("UEPrepare compile_commands failed: " .. compile_path, vim.log.levels.WARN)
+          if handle then handle.message = "FAILED"; handle:finish() end
+          return
+        end
+        update("indexing...", 95)
+        -- Subprocess wrote compile_commands.json but did NOT run the
+        -- expand+pch+resolve+unify+prune pipeline (those rely on jobstart
+        -- whose lifetime is tied to the main nvim, not the subprocess).
+        -- Start it here in the main nvim.
+        local targets_main = compile_commands_targets(ctx)
+        run_compile_commands_pipeline(targets_main[1], targets_main)
+        clear_index_dirty(ctx)
+        INDEX_FN.schedule_index_refresh(ctx, { current = true, hot = true, full = true, current_delay_ms = 50, hot_delay_ms = 2500 })
+        invalidate_status_cache()
+        refresh_statusline()
+
+        -- csearch index rebuild (same logic as before, just moved here).
+        local code_search_fp = require("utils.code_search")
+        local cs_ctx_fp = { workspace_root = root, csearch_idx = ctx.paths and ctx.paths.csearch_idx or nil }
+        local need_index = true
+        local stale_reason = "missing"
+        do
+          local idx_path = code_search_fp.index_path(cs_ctx_fp)
+          local idx_stat = idx_path and vim.loop.fs_stat(idx_path) or nil
+          if ctx._force_csearch then
+            stale_reason = "forced"
+          elseif not idx_stat or (idx_stat.size or 0) <= 1024 then
+            stale_reason = "missing"
+          else
+            local idx_mt = idx_stat.mtime and idx_stat.mtime.sec or 0
+            local now = os.time()
+            if (now - idx_mt) > (30 * 24 * 3600) then
+              stale_reason = ("age %.1fd"):format((now - idx_mt) / 86400)
+            else
+              local function git_index_mtime(repo_root)
+                if not repo_root or repo_root == "" then return 0 end
+                local s = vim.loop.fs_stat(repo_root .. "/.git/index")
+                return (s and s.mtime and s.mtime.sec) or 0
+              end
+              local git_mt = math.max(
+                git_index_mtime(ctx.engine_root),
+                git_index_mtime(ctx.project_root))
+              if git_mt > 0 and idx_mt >= git_mt then
+                need_index = false
+              elseif git_mt == 0 then
+                local list_path = ctx.paths.workspace_all_list
+                local list_stat = list_path and vim.loop.fs_stat(list_path) or nil
+                if list_stat then
+                  local list_mt = list_stat.mtime and list_stat.mtime.sec or 0
+                  if idx_mt >= list_mt then
+                    need_index = false
+                  else
+                    stale_reason = "list newer (no .git fallback)"
+                  end
+                else
+                  need_index = false
+                end
+              else
+                stale_reason = ("git/index newer by %ds"):format(git_mt - idx_mt)
+              end
+            end
+          end
+        end
+        if need_index and code_search_fp.cindex_uefilter_exe() then
+          local abs_list = ctx.paths.cache .. "/csearch_filelist.txt"
+          local fout = io.open(abs_list, "w")
+          if fout then
+            local n_lines = 0
+            for line in io.lines(ctx.paths.workspace_all_list) do
+              local trimmed = line:gsub("\r$", "")
+              if trimmed ~= "" then
+                fout:write(root, "/", trimmed, "\n")
+                n_lines = n_lines + 1
+              end
+            end
+            fout:close()
+            local f = io.open(CORE_RT.trace_path, "a")
+            if f then f:write(("    (csearch_dump wrote %d lines)\n"):format(n_lines)); f:close() end
+            vim.notify(("UEPrepare: rebuilding csearch index in background (reason: %s)..."):format(stale_reason),
+              vim.log.levels.INFO, { title = "UE", timeout = 3000, replace = "ue.csearch.build" })
+            code_search_fp.build_index(cs_ctx_fp, abs_list, function(ok_cs, err_cs, stats)
+              pcall(os.remove, abs_list)
+              if ok_cs then
+                local mb = math.floor((stats.index_size or 0) / 1024 / 1024)
+                vim.notify(("✓ csearch index rebuilt: %d MB in %.1fs"):format(
+                  mb, (stats.ms or 0) / 1000),
+                  vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
+              else
+                vim.notify("UEPrepare: csearch rebuild failed: " .. (err_cs or "unknown"),
+                  vim.log.levels.WARN, { title = "UE", replace = "ue.csearch.build" })
+              end
+            end)
+          end
+        end
+
+        if handle then handle.message = "done"; handle.percentage = 100; handle:finish() end
+        vim.notify(prepare_summary(ctx, compile_path, { reused_cache = true }))
+      end)
+    return
+  end
+
   local function fail(msg)
     invalidate_status_cache()
     refresh_statusline()
@@ -7087,67 +7376,75 @@ local function prepare_async(opts)
 
   local function continue_after_scan(project_rel, engine_rel)
     end_phase("scan")
+    CORE_RT.trace_mark("scan_done -> continue_after_scan")
+    local f0 = io.open(CORE_RT.trace_path, "a")
+    if f0 then f0:write(("    (scan: project_rel=%d engine_rel=%d)\n"):format(#project_rel, #engine_rel)); f0:close() end
 
     -- ── Phase 2: build file lists ────────────────────────────────────
     update("building file lists...", 25)
     start_phase()
 
-    local project_code = filter_gtags_only_paths(filter_gtags_paths(filter_gtags_code(project_rel)))
-    local engine_code = filter_gtags_only_paths(filter_gtags_paths(filter_gtags_code(engine_rel)))
-    local workspace_code = {}
-    local workspace_seen = {}
-    local root = workspace_root(ctx)
+    local workspace_code, workspace_all, project_code, engine_code
+    CORE_RT.trace_seg("cold.lists_total", function()
+      project_code = filter_gtags_only_paths(filter_gtags_paths(filter_gtags_code(project_rel)))
+      engine_code = filter_gtags_only_paths(filter_gtags_paths(filter_gtags_code(engine_rel)))
+      workspace_code = {}
+      local workspace_seen = {}
+      local root_local = workspace_root(ctx)
 
-    for _, path in ipairs(project_code) do
-      local absolute = join(ctx.project_root, path)
-      local relative = _ufs.relative_to(root, absolute)
-      if not workspace_seen[relative] then
-        workspace_seen[relative] = true
-        table.insert(workspace_code, relative)
+      for _, path in ipairs(project_code) do
+        local absolute = join(ctx.project_root, path)
+        local relative = _ufs.relative_to(root_local, absolute)
+        if not workspace_seen[relative] then
+          workspace_seen[relative] = true
+          table.insert(workspace_code, relative)
+        end
       end
-    end
 
-    for _, path in ipairs(engine_code) do
-      local absolute = join(ctx.engine_root, path)
-      local relative = _ufs.relative_to(root, absolute)
-      if not workspace_seen[relative] then
-        workspace_seen[relative] = true
-        table.insert(workspace_code, relative)
+      for _, path in ipairs(engine_code) do
+        local absolute = join(ctx.engine_root, path)
+        local relative = _ufs.relative_to(root_local, absolute)
+        if not workspace_seen[relative] then
+          workspace_seen[relative] = true
+          table.insert(workspace_code, relative)
+        end
       end
-    end
 
-    table.sort(workspace_code)
+      table.sort(workspace_code)
 
-    write_lines(ctx.paths.project_list, project_code)
-    write_lines(ctx.paths.engine_list, engine_code)
-    write_lines(ctx.paths.workspace_list, workspace_code)
+      write_lines(ctx.paths.project_list, project_code)
+      write_lines(ctx.paths.engine_list, engine_code)
+      write_lines(ctx.paths.workspace_list, workspace_code)
 
-    -- All-types file list (code + config) for cached grep
-    local project_all = filter_gtags_paths(filter_extensions(project_rel, M.FT_ALL))
-    local engine_all = filter_gtags_paths(filter_extensions(engine_rel, M.FT_ALL))
-    local workspace_all = {}
-    local workspace_all_seen = {}
+      -- All-types file list (code + config) for cached grep
+      local project_all = filter_gtags_paths(filter_extensions(project_rel, M.FT_ALL))
+      local engine_all = filter_gtags_paths(filter_extensions(engine_rel, M.FT_ALL))
+      workspace_all = {}
+      local workspace_all_seen = {}
 
-    for _, path in ipairs(project_all) do
-      local absolute = join(ctx.project_root, path)
-      local relative = _ufs.relative_to(root, absolute)
-      if not workspace_all_seen[relative] then
-        workspace_all_seen[relative] = true
-        table.insert(workspace_all, relative)
+      for _, path in ipairs(project_all) do
+        local absolute = join(ctx.project_root, path)
+        local relative = _ufs.relative_to(root_local, absolute)
+        if not workspace_all_seen[relative] then
+          workspace_all_seen[relative] = true
+          table.insert(workspace_all, relative)
+        end
       end
-    end
 
-    for _, path in ipairs(engine_all) do
-      local absolute = join(ctx.engine_root, path)
-      local relative = _ufs.relative_to(root, absolute)
-      if not workspace_all_seen[relative] then
-        workspace_all_seen[relative] = true
-        table.insert(workspace_all, relative)
+      for _, path in ipairs(engine_all) do
+        local absolute = join(ctx.engine_root, path)
+        local relative = _ufs.relative_to(root_local, absolute)
+        if not workspace_all_seen[relative] then
+          workspace_all_seen[relative] = true
+          table.insert(workspace_all, relative)
+        end
       end
-    end
 
-    table.sort(workspace_all)
-    write_lines(ctx.paths.workspace_all_list, workspace_all)
+      table.sort(workspace_all)
+      write_lines(ctx.paths.workspace_all_list, workspace_all)
+    end)
+    local f1 = io.open(CORE_RT.trace_path, "a")
+    if f1 then f1:write(("    (lists: workspace_code=%d workspace_all=%d)\n"):format(#workspace_code, #workspace_all)); f1:close() end
 
     end_phase("lists")
 
@@ -7157,7 +7454,9 @@ local function prepare_async(opts)
     update("generating compile_commands...", 30)
     start_phase()
 
-    local ok_compile, compile_path = generate_compile_commands(ctx)
+    local ok_compile, compile_path = CORE_RT.trace_seg("cold.ccjson", function()
+      return generate_compile_commands(ctx)
+    end)
     if not ok_compile then
       vim.notify("UEPrepare: compile_commands failed (non-fatal): " .. (compile_path or "unknown"), vim.log.levels.WARN)
     end
@@ -7337,10 +7636,12 @@ local function prepare_async(opts)
             finalize_after_csearch()
             return
           end
-          for _, rel in ipairs(workspace_all) do
-            fout:write(cs_root, "/", rel, "\n")
-          end
-          fout:close()
+          CORE_RT.trace_seg("cold.csearch_dump", function()
+            for _, rel in ipairs(workspace_all) do
+              fout:write(cs_root, "/", rel, "\n")
+            end
+            fout:close()
+          end)
 
           code_search.build_index(cs_ctx, abs_list, function(ok_cs, err_cs, stats)
             -- Tidy up the temp filelist regardless of outcome.
@@ -7376,7 +7677,7 @@ local function prepare_async(opts)
   local function start_scan()
     if ctx.project_root and ctx.project_root ~= "" then
       update("scanning project files...", 5)
-      local project_dirs = existing_relative_dirs(ctx.project_root, UE_CONST.PROJECT_INDEX_DIRS)
+      local project_dirs = existing_relative_dirs(ctx.project_root, CORE_RT.project_index_dirs(ctx))
       scan_relative_files_async(ctx.project_root, project_dirs, function(project_rel, project_err)
         if not project_rel then
           fail(project_err)
@@ -8125,6 +8426,142 @@ function M.setup()
   })
 
   vim.schedule(refresh_statusline)
+end
+
+-- ==========================================================================
+-- ASYNC COMPILE_COMMANDS SUBPROCESS
+-- ==========================================================================
+-- Generating compile_commands.json on the main thread freezes nvim for 17s+
+-- on UE5 projects (parse 11k .rsp files, scan 2k shaders, encode/write 224MB
+-- JSON x2). To eliminate that freeze we re-run the entire pipeline in a
+-- headless nvim subprocess and stream progress events back via stderr.
+
+-- Subprocess entry: called by lua/ue/ccjson_subprocess.lua after it loaded
+-- ctx from a JSON file passed on argv. Re-runs the same generate_compile_commands
+-- the in-process path would, but with the progress callback wired to stderr.
+function M._ccjson_subprocess_run(ctx, progress)
+  -- CORE_RT.trace_seg is lazy-installed inside prepare_async() in the main
+  -- nvim. The subprocess never enters prepare_async, so we install minimal
+  -- no-op shims here.
+  if not CORE_RT.trace_seg then
+    function CORE_RT.trace_seg(_name, fn)
+      return fn()
+    end
+    function CORE_RT.trace_mark(_label) end
+    CORE_RT.trace_path = nil
+  end
+
+  -- We only run generate_compile_commands_from_rsp here, NOT the full
+  -- generate_compile_commands. The latter also kicks off run_compile_commands_pipeline
+  -- which uses vim.fn.jobstart — those jobs would be killed when this short-lived
+  -- headless nvim exits. The main nvim must start the pipeline itself after
+  -- it receives DONE.
+  local rsp_count, rsp_path = generate_compile_commands_from_rsp(ctx, progress)
+  if rsp_count and rsp_count > 0 then
+    return true, rsp_path
+  end
+  return false, rsp_path or "no rsp entries"
+end
+
+-- Spawn a headless nvim subprocess that runs the ccjson pipeline.
+--   ctx          — same ctx table the in-process path would pass
+--   on_progress  — function(stage, pct, detail) called per PROGRESS line
+--   on_done      — function(ok, msg) called once when the subprocess exits
+-- Returns the vim.system handle so caller can keep a reference if needed.
+function M.async_generate_compile_commands(ctx, on_progress, on_done)
+  on_progress = on_progress or function() end
+  on_done = on_done or function() end
+
+  -- 1. Dump ctx to a temp JSON file (argv has size limits on Windows).
+  local tmp = vim.fn.tempname() .. ".ccjson-ctx.json"
+  local ok_enc, ctx_json = pcall(vim.json.encode, ctx)
+  if not ok_enc then
+    on_done(false, "ctx encode failed: " .. tostring(ctx_json))
+    return nil
+  end
+  local fh, ferr = io.open(tmp, "wb")
+  if not fh then
+    on_done(false, "tmp ctx write failed: " .. tostring(ferr))
+    return nil
+  end
+  fh:write(ctx_json)
+  fh:close()
+
+  -- 2. Build the headless nvim command.
+  --    -u NONE skips init.lua so LazyVim/plugins don't load (saves ~3s startup).
+  --    --cmd 'set rtp+=... | lua package.path=...' wires our config's lua/ dir
+  --    so `require("ue")` finds this file and its submodules.
+  local nvim_exe = vim.v.progpath
+  local config_lua = vim.fn.stdpath("config") .. "/lua"
+  local sub_entry = config_lua .. "/ue/ccjson_subprocess.lua"
+  local rtp_cmd = string.format(
+    "lua package.path=%q..';'..%q..';'..package.path",
+    config_lua .. "/?.lua",
+    config_lua .. "/?/init.lua"
+  )
+
+  local cmd = {
+    nvim_exe,
+    "--headless",
+    "-u", "NONE",
+    "--cmd", rtp_cmd,
+    "-l", sub_entry,
+    tmp,
+  }
+
+  -- 3. Stream stderr — one progress event per line.
+  local stderr_buf = ""
+  local last_stage, last_pct, last_detail = "starting", 25, "spawning subprocess..."
+  local function consume_stderr(chunk)
+    if not chunk or chunk == "" then return end
+    stderr_buf = stderr_buf .. chunk
+    while true do
+      local nl = stderr_buf:find("\n", 1, true)
+      if not nl then break end
+      local line = stderr_buf:sub(1, nl - 1):gsub("\r$", "")
+      stderr_buf = stderr_buf:sub(nl + 1)
+      if line ~= "" then
+        local stage, pct, detail = line:match("^PROGRESS|([^|]+)|(%-?%d+)|(.*)$")
+        if stage then
+          last_stage, last_pct, last_detail = stage, tonumber(pct) or 0, detail
+          vim.schedule(function()
+            on_progress(stage, tonumber(pct) or 0, detail)
+          end)
+        else
+          local preferred = line:match("^DONE|([^|]*)|")
+          if preferred then
+            last_stage = "done"
+          else
+            -- Anything else (ERROR|..., or stray output) — keep for failure msg.
+            last_detail = line
+          end
+        end
+      end
+    end
+  end
+
+  -- 4. Spawn.
+  local handle = vim.system(cmd, {
+    text = true,
+    stderr = function(_, data) consume_stderr(data) end,
+    stdout = function(_, _) end, -- subprocess only writes progress to stderr
+  }, function(obj)
+    -- Final flush in case stderr didn't end with \n.
+    if stderr_buf ~= "" then
+      consume_stderr("\n")
+    end
+    pcall(os.remove, tmp)
+    vim.schedule(function()
+      if obj.code == 0 then
+        on_done(true, "compile_commands.json (async subprocess)")
+      else
+        local msg = string.format("ccjson subprocess exit=%d: %s", obj.code or -1, last_detail)
+        on_done(false, msg)
+      end
+    end)
+  end)
+
+  return handle
 end
 
 return M

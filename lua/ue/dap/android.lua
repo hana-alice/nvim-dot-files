@@ -53,6 +53,7 @@ M._session = {
   lldb_server_local = nil,  -- host path to NDK lldb-server
   symbol_lib        = nil,  -- host path to libUE4.so (with DWARF)
   source_map        = nil,  -- list of { from, to } pairs
+  engine_root       = nil,  -- host engine root, used to wire LLDB UE data formatters
 }
 
 local function reset_session()
@@ -373,12 +374,56 @@ local function pick_libue4_base(adb, serial, pkg, pid)
   return nil
 end
 
-local function init_commands(_session)
-  return {
+local function find_engine_root_from_cwd()
+  local d = vim.fn.getcwd()
+  for _ = 1, 12 do
+    if vim.uv.fs_stat(d .. "/Engine/Build/BatchFiles") then return d end
+    local parent = vim.fs.dirname(d)
+    if not parent or parent == d then break end
+    d = parent
+  end
+  return nil
+end
+
+local function init_commands(session)
+  local cmds = {
     "settings set plugin.process.gdb-remote.packet-timeout 60",
     "settings set target.inline-breakpoint-strategy always",
     "settings set target.move-to-nearest-code true",
   }
+  -- UE LLDB pretty-printers for FString / FName / TArray / TMap / FVector …
+  -- Shipped by Epic at  <engine>/Engine/Extras/LLDBDataFormatters/.
+  -- _2ByteChars variant matches UE's default 2-byte TCHAR build (Android,
+  -- Win64, Linux). If user is on a 4-byte TCHAR build they can swap the
+  -- filename via ue.config.dap.lldb_formatter_path.
+  local er = session and session.engine_root
+  if not er or er == "" then er = find_engine_root_from_cwd() end
+  local cfg_path
+  local ok_cfg, ue_cfg = pcall(require, "ue.config")
+  if ok_cfg and ue_cfg and ue_cfg.get then
+    cfg_path = ue_cfg.get("dap.lldb_formatter_path")
+  end
+  local formatter = cfg_path
+  if (not formatter or formatter == "") and er and er ~= "" then
+    formatter = er .. "/Engine/Extras/LLDBDataFormatters/UE4DataFormatters_2ByteChars.py"
+  end
+  if formatter and formatter ~= "" then
+    local f = io.open(formatter, "r")
+    if f then
+      f:close()
+      table.insert(cmds, string.format('command script import "%s"', formatter))
+    else
+      -- Silent skip: missing formatter is annoying but not fatal.
+      -- Surface it once via :messages so users notice if they expect it.
+      vim.schedule(function()
+        vim.notify(
+          "[ue.dap] LLDB formatter not found: " .. formatter ..
+          "\n(set ue.config.dap.lldb_formatter_path to override)",
+          vim.log.levels.WARN)
+      end)
+    end
+  end
+  return cmds
 end
 
 -- Commands that run AFTER process is created/attached. Here we:
@@ -440,10 +485,34 @@ function M.stop_android_debugger(opts)
     pcall(function()
       dap.session():request("disconnect", { terminateDebuggee = false })
     end)
-    pcall(function() dap.terminate() end)
+    -- NOTE: do NOT call dap.terminate() here. For an attach session,
+    -- nvim-dap maps terminate() to a DAP `terminate` request which
+    -- codelldb interprets as "kill the debuggee process". We only want
+    -- to detach (disconnect terminateDebuggee=false above). The
+    -- on_session_end listener will handle UI/logcat/state cleanup
+    -- once the disconnect response comes back.
     result.disconnected = true
   end
 
+  -- Tear down device-side resources (lldb-server / port forward / SIGCONT).
+  M._cleanup_device_side()
+  result.adapter_killed = true
+
+  reset_session()
+  return result
+end
+
+--- Internal: tear down device-side resources only. Does NOT touch the
+--- DAP session — caller is responsible for that.
+---
+--- This must NEVER send a `disconnect` request: when invoked from the
+--- on_session_end listener, codelldb has already begun shutting the
+--- adapter down. Sending a second disconnect there causes nvim-dap's
+--- callback table to receive a duplicate response with no matching
+--- entry, logged as `"No callback found. Did the debug adapter send
+--- duplicate responses?"` — and codelldb exits, which makes dapui
+--- panels disappear ("the debug UI just closed by itself").
+function M._cleanup_device_side()
   local sess = M._session
   if sess.serial and sess.adb then
     if sess.package_name then
@@ -458,16 +527,16 @@ function M.stop_android_debugger(opts)
       pcall(adb_run, sess.adb, { "-s", sess.serial, "shell",
         "kill", "-CONT", tostring(sess.pid) })
     end
-    result.adapter_killed = true
   end
-
-  reset_session()
-  return result
 end
 
--- Backward-compat shim for the old codelldb-era ue.dap dispatch path.
+-- Cleanup hook called by ue.dap on session end events (terminated/exited/
+-- disconnect). MUST NOT issue another `disconnect` — see _cleanup_device_side
+-- comment. Only releases device-side resources and clears local state.
 function M.cleanup(_session_state)
-  return M.stop_android_debugger()
+  M._cleanup_device_side()
+  reset_session()
+  return { device_cleaned = true }
 end
 
 -- ── public: attach / launch ───────────────────────────────────────────────
@@ -475,34 +544,42 @@ end
 local function bootstrap_session(opts)
   opts = opts or {}
   local ctx = opts.context
+  local P = require("ue.dap._progress")
 
   local sess = M._session
   sess.adb  = "adb"
   sess.port = pick_port()
+  sess.engine_root = ctx and ctx.engine_root or nil
 
+  P.step("1/6  picking package …")
   local pkg = pick_package(ctx)
-  if not pkg then return nil end
+  if not pkg then P.hide(); return nil end
   sess.package_name = pkg
 
+  P.step("2/6  picking device …")
   local serial = (ctx and ctx.android_serial) or pick_serial(sess.adb)
   if not serial then
-    vim.notify("UEDAP android: no device in `adb devices`", vim.log.levels.ERROR)
+    P.error("no device in `adb devices`")
     return nil
   end
   sess.serial = serial
 
+  P.step("3/6  locating lldb-server …")
   local server_src = pick_lldb_server()
-  if not server_src then return nil end
+  if not server_src then P.hide(); return nil end
   sess.lldb_server_local = server_src
 
+  P.step("4/6  picking symbol lib …")
   local sym = pick_symbol_lib(ctx)
-  if not sym then return nil end
+  if not sym then P.hide(); return nil end
   sess.symbol_lib = sym
 
   sess.source_map = pick_source_map(ctx)
 
+  P.step("5/6  pushing lldb-server to device …")
   local ok_push, push_msg = ensure_lldb_server_in_app(sess.adb, serial, pkg, server_src)
   if not ok_push then
+    P.error("lldb-server bootstrap failed: " .. tostring(push_msg))
     log.notify_error("dap.android", "lldb-server bootstrap failed: " .. push_msg)
     return nil
   end
@@ -513,53 +590,54 @@ end
 function M.attach(opts)
   if not bootstrap_session(opts) then return end
   local sess = M._session
+  local P = require("ue.dap._progress")
 
+  P.step("6/6  finding pid for " .. (sess.package_name or "?") .. " …")
   local pid = pidof(sess.adb, sess.serial, sess.package_name)
   if not pid then
-    vim.notify(
-      ("UEDAP android: process %s not running on device %s"):format(
-        sess.package_name, sess.serial),
-      vim.log.levels.ERROR
-    )
+    P.error(("process %s not running on %s"):format(sess.package_name, sess.serial))
     M.stop_android_debugger()
     return
   end
   sess.pid = pid
 
+  P.step(("starting lldb-server (pid=%s port=%d) …"):format(pid, sess.port))
   local ok_srv, srv_err = start_lldb_server_gdbserver(
     sess.adb, sess.serial, sess.package_name, pid, sess.port)
   if not ok_srv then
+    P.error("lldb-server gdbserver failed: " .. tostring(srv_err))
     log.notify_error("dap.android", "lldb-server gdbserver failed: " .. srv_err)
     M.stop_android_debugger()
     return
   end
 
   -- Snapshot device-side libUE4.so load base for module rebasing.
+  P.step("reading /proc/" .. pid .. "/maps for libUE4.so base …")
   sess.libue4_base = pick_libue4_base(sess.adb, sess.serial, sess.package_name, pid)
   if sess.libue4_base then
-    vim.notify("[dap.android] libUE4.so device base = 0x" .. sess.libue4_base,
-      vim.log.levels.INFO)
+    P.step("libUE4.so base = 0x" .. sess.libue4_base .. "  — attaching …")
   else
-    vim.notify(
-      "[dap.android] libUE4.so base not found in /proc/maps; frames will show raw addresses",
-      vim.log.levels.WARN)
+    P.step("libUE4.so base not found; frames will show raw addresses — attaching …")
   end
 
   local cfg = codelldb_attach_config(sess, sess.source_map)
   C.run_codelldb(cfg, "UEDAP android attach")
+  -- progress popup is finalized by ue.dap.lua's event_initialized listener
+  -- (P.done) or by stop_android_debugger / on_session_end (P.hide).
 end
 
 function M.launch(opts)
   if not bootstrap_session(opts) then return end
   local sess = M._session
+  local P = require("ue.dap._progress")
 
-  -- Best-effort start the activity; ignore failure (user may have started it).
+  P.step("6/6  starting activity " .. (sess.package_name or "?") .. " …")
   pcall(adb_run, sess.adb, {
     "-s", sess.serial, "shell", "monkey", "-p", sess.package_name,
     "-c", "android.intent.category.LAUNCHER", "1",
   })
 
-  -- Poll for pid up to 5s.
+  P.step("waiting for process to appear …")
   local pid
   for _ = 1, 25 do
     pid = pidof(sess.adb, sess.serial, sess.package_name)
@@ -567,23 +645,24 @@ function M.launch(opts)
     vim.wait(200)
   end
   if not pid then
-    vim.notify(
-      ("UEDAP android launch: %s did not start within 5s"):format(sess.package_name),
-      vim.log.levels.ERROR
-    )
+    P.error(("%s did not start within 5s"):format(sess.package_name))
     M.stop_android_debugger()
     return
   end
   sess.pid = pid
 
+  P.step(("starting lldb-server (pid=%s port=%d) …"):format(pid, sess.port))
   local ok_srv, srv_err = start_lldb_server_gdbserver(
     sess.adb, sess.serial, sess.package_name, pid, sess.port)
   if not ok_srv then
+    P.error("lldb-server gdbserver failed: " .. tostring(srv_err))
     log.notify_error("dap.android", "lldb-server gdbserver failed: " .. srv_err)
     M.stop_android_debugger()
     return
   end
 
+  sess.libue4_base = pick_libue4_base(sess.adb, sess.serial, sess.package_name, pid)
+  P.step("attaching debugger …")
   local cfg = codelldb_attach_config(sess, sess.source_map)
   cfg.name = "UE Android Launch (codelldb)"
   C.run_codelldb(cfg, "UEDAP android launch")

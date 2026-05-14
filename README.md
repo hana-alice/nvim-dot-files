@@ -93,7 +93,6 @@ Standalone Python utilities that don't need Neovim to run:
 | `slim_compile_commands.py`    | Strip noise, keep `-include` directives         |
 | `build_clangd_index.py`       | Offline `clangd-indexer` for instant cold-start |
 | `restore_force_includes.py`   | Re-inject `-include X.h` after slim             |
-| `android_*_probe.py`          | Hardware-breakpoint research scripts (codelldb) |
 
 Each is idempotent and skip-writes when the output is unchanged, so you
 can re-run them in a watcher loop without invalidating PCHs or restarting

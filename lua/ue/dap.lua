@@ -514,15 +514,57 @@ end
 -- ─────────────────────────────────────────────────────────────────────
 
 function D.setup_dap(dap, dapui)
-  -- Wire the lldb-dap adapter (may be re-wired later when find_lldb_dap
-  -- result changes due to PATH updates).
-  local adapter = D.lldb_dap_path()
-  if not adapter then
-    vim.notify("lldb-dap not found. Install LLVM 18+ to enable DAP debugging.",
-               vim.log.levels.WARN)
-    return
+  -- Best-effort wire of the historical lldb-dap adapter (some workflows
+  -- still attach to a host-side binary by hand). The codelldb adapter is
+  -- wired further down — that's the active Android route, and it must
+  -- not gate listener installation on lldb-dap presence.
+  local lldb_dap = D.lldb_dap_path()
+  if lldb_dap then
+    require("ue.dap._common").ensure_adapter(dap, lldb_dap)
   end
-  require("ue.dap._common").ensure_adapter(dap, adapter)
+
+  -- Wire the codelldb adapter eagerly + register a generic cpp
+  -- configuration so a plain `:DapContinue` / `<F5>` from any C/C++
+  -- buffer drops the user into the UE Android attach picker. The
+  -- attach driver mutates the live config later (M.attach builds the
+  -- real codelldb_attach_config); this entry is just the launcher.
+  do
+    local C = require("ue.dap._common")
+    local codelldb = C.find_codelldb()
+    if codelldb then
+      C.ensure_codelldb_adapter(dap, codelldb)
+    end
+    -- Idempotent registration: only inject our entry if not already
+    -- present. Users can append their own configurations.cpp items;
+    -- we never overwrite the table.
+    dap.configurations = dap.configurations or {}
+    local cpp = dap.configurations.cpp or {}
+    local have_ue_attach = false
+    for _, c in ipairs(cpp) do
+      if c and c.name == "UE Android Attach (codelldb)" then
+        have_ue_attach = true
+        break
+      end
+    end
+    if not have_ue_attach then
+      table.insert(cpp, 1, {
+        name    = "UE Android Attach (codelldb)",
+        type    = "codelldb",
+        request = "launch",
+        program = function()
+          -- Hand off to the real attach pipeline; nvim-dap will see
+          -- this returns nil/false and abort its own session start.
+          vim.schedule(function()
+            require("ue.dap.android").attach({})
+          end)
+          return nil
+        end,
+      })
+    end
+    dap.configurations.cpp  = cpp
+    dap.configurations.c    = dap.configurations.c   or cpp
+    dap.configurations.rust = dap.configurations.rust or cpp
+  end
 
   -- ─── window / layout save & restore ───────────────────────────────
   -- "main_win" is the one normal-file window the user works in during a

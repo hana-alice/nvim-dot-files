@@ -177,6 +177,22 @@ end
 local function pick_port()
   local cfg_port = ue_cfg_get("dap.android_port")
   if type(cfg_port) == "number" and cfg_port > 0 then return cfg_port end
+  -- Allocate a free TCP port on the host. We can't reserve it (lldb-server
+  -- on the device binds the same number after `adb forward`), but the
+  -- host-side `adb forward tcp:N tcp:N` will still claim it cleanly so
+  -- two concurrent sessions never collide on the historical default 5045.
+  local ok, server = pcall(vim.uv.new_tcp)
+  if ok and server then
+    local bind_ok = pcall(server.bind, server, "127.0.0.1", 0)
+    if bind_ok then
+      local sn = server:getsockname()
+      local port = sn and sn.port
+      pcall(server.close, server)
+      if type(port) == "number" and port > 0 then return port end
+    else
+      pcall(server.close, server)
+    end
+  end
   return 5045
 end
 
@@ -587,18 +603,10 @@ local function bootstrap_session(opts)
   return true
 end
 
-function M.attach(opts)
-  if not bootstrap_session(opts) then return end
-  local sess = M._session
+-- Common tail of attach/launch: spin up lldb-server gdbserver, snapshot
+-- libUE4.so base, hand off to codelldb. Mutates sess.
+local function _finalize_session(sess, pid, cfg_name, run_label)
   local P = require("ue.dap._progress")
-
-  P.step("6/6  finding pid for " .. (sess.package_name or "?") .. " …")
-  local pid = pidof(sess.adb, sess.serial, sess.package_name)
-  if not pid then
-    P.error(("process %s not running on %s"):format(sess.package_name, sess.serial))
-    M.stop_android_debugger()
-    return
-  end
   sess.pid = pid
 
   P.step(("starting lldb-server (pid=%s port=%d) …"):format(pid, sess.port))
@@ -621,9 +629,25 @@ function M.attach(opts)
   end
 
   local cfg = codelldb_attach_config(sess, sess.source_map)
-  C.run_codelldb(cfg, "UEDAP android attach")
-  -- progress popup is finalized by ue.dap.lua's event_initialized listener
+  cfg.name = cfg_name
+  C.run_codelldb(cfg, run_label)
+  -- Progress popup finalized by ue.dap.lua's event_initialized listener
   -- (P.done) or by stop_android_debugger / on_session_end (P.hide).
+end
+
+function M.attach(opts)
+  if not bootstrap_session(opts) then return end
+  local sess = M._session
+  local P = require("ue.dap._progress")
+
+  P.step("6/6  finding pid for " .. (sess.package_name or "?") .. " …")
+  local pid = pidof(sess.adb, sess.serial, sess.package_name)
+  if not pid then
+    P.error(("process %s not running on %s"):format(sess.package_name, sess.serial))
+    M.stop_android_debugger()
+    return
+  end
+  _finalize_session(sess, pid, "UE Android Attach (codelldb)", "UEDAP android attach")
 end
 
 function M.launch(opts)
@@ -649,23 +673,7 @@ function M.launch(opts)
     M.stop_android_debugger()
     return
   end
-  sess.pid = pid
-
-  P.step(("starting lldb-server (pid=%s port=%d) …"):format(pid, sess.port))
-  local ok_srv, srv_err = start_lldb_server_gdbserver(
-    sess.adb, sess.serial, sess.package_name, pid, sess.port)
-  if not ok_srv then
-    P.error("lldb-server gdbserver failed: " .. tostring(srv_err))
-    log.notify_error("dap.android", "lldb-server gdbserver failed: " .. srv_err)
-    M.stop_android_debugger()
-    return
-  end
-
-  sess.libue4_base = pick_libue4_base(sess.adb, sess.serial, sess.package_name, pid)
-  P.step("attaching debugger …")
-  local cfg = codelldb_attach_config(sess, sess.source_map)
-  cfg.name = "UE Android Launch (codelldb)"
-  C.run_codelldb(cfg, "UEDAP android launch")
+  _finalize_session(sess, pid, "UE Android Launch (codelldb)", "UEDAP android launch")
 end
 
 -- ── test hooks ────────────────────────────────────────────────────────────

@@ -15,6 +15,22 @@ local CORE_RT = {
   engine_root_cache = {}, -- dir -> engine_root (or false)
   context_cache = {}, -- key -> { ctx, ts }
 }
+-- ── Trace API (permanently no-op) ────────────────────────────────────────
+-- These were used during :UEPrepare main-thread blocking diagnosis. The
+-- ccjson stage is now async (see M.async_generate_compile_commands), so the
+-- writers are stubbed out. Call sites (~40, mostly in ccjson + shader
+-- pipelines) remain as semantic segment markers — readable and zero-cost.
+-- To re-enable file logging for a future regression hunt, restore the
+-- original lazy-installed implementations from git history at this anchor:
+--   git log -p -- lua/ue.lua | grep -n "function CORE_RT.trace_open"
+function CORE_RT.trace_open(_label, _log_dir) end
+function CORE_RT.trace_seg(_name, fn)
+  return fn()
+end
+function CORE_RT.trace_mark(_name) end
+CORE_RT.trace_path = nil
+CORE_RT.trace_t0 = nil
+
 local INDEX_FN = {}
 -- Phase C: tunables sourced from `ue.config`. Literal fallbacks (`or 120000`
 -- etc.) match the previous hard-coded values exactly so behaviour is
@@ -7137,46 +7153,6 @@ local function prepare_async(opts)
 
   _ufs.ensure_dir(ctx.paths.cache)
 
-  -- ── DEBUG TRACE (remove after diagnosis) ─────────────────────────────
-  -- Measures main-thread blocking segments inside :UEPrepare. Writes to
-  -- <cache>/logs/ue-prepare-trace.log. Mounted on CORE_RT to keep top-level
-  -- local count under LuaJIT's 200-cap.
-  if not CORE_RT.trace_open then
-    function CORE_RT.trace_open(label, log_dir)
-      _ufs.ensure_dir(log_dir)
-      local p = log_dir .. "/ue-prepare-trace.log"
-      local f = io.open(p, "a")
-      if f then
-        f:write(("\n=== %s @ %s ===\n"):format(label, os.date("%Y-%m-%d %H:%M:%S")))
-        f:close()
-      end
-      CORE_RT.trace_path = p
-      CORE_RT.trace_t0 = vim.uv.hrtime()
-    end
-    function CORE_RT.trace_seg(name, fn)
-      local t = vim.uv.hrtime()
-      local ok, r1, r2, r3 = pcall(fn)
-      local ms = (vim.uv.hrtime() - t) / 1e6
-      local rel = (vim.uv.hrtime() - (CORE_RT.trace_t0 or t)) / 1e6
-      local f = CORE_RT.trace_path and io.open(CORE_RT.trace_path, "a") or nil
-      if f then
-        f:write(("[+%8.1fms] %-28s %8.1f ms %s\n"):format(rel, name, ms, ok and "" or ("ERR: " .. tostring(r1))))
-        f:close()
-      end
-      if not ok then error(r1) end
-      return r1, r2, r3
-    end
-    function CORE_RT.trace_mark(name)
-      local rel = (vim.uv.hrtime() - (CORE_RT.trace_t0 or vim.uv.hrtime())) / 1e6
-      local f = CORE_RT.trace_path and io.open(CORE_RT.trace_path, "a") or nil
-      if f then
-        f:write(("[+%8.1fms] %-28s   (mark)\n"):format(rel, name))
-        f:close()
-      end
-    end
-  end
-  CORE_RT.trace_open(opts.force_csearch and "UEPrepareReindex" or "UEPrepare", ctx.paths.logs_dir)
-
   -- ── Timing & ETA ─────────────────────────────────────────────────────
   -- Load previous run timings for ETA estimation
   local prev_timings = ctx.state.prepare_timings or {}
@@ -7335,8 +7311,6 @@ local function prepare_async(opts)
               end
             end
             fout:close()
-            local f = io.open(CORE_RT.trace_path, "a")
-            if f then f:write(("    (csearch_dump wrote %d lines)\n"):format(n_lines)); f:close() end
             vim.notify(("UEPrepare: rebuilding csearch index in background (reason: %s)..."):format(stale_reason),
               vim.log.levels.INFO, { title = "UE", timeout = 3000, replace = "ue.csearch.build" })
             code_search_fp.build_index(cs_ctx_fp, abs_list, function(ok_cs, err_cs, stats)
@@ -7376,9 +7350,6 @@ local function prepare_async(opts)
 
   local function continue_after_scan(project_rel, engine_rel)
     end_phase("scan")
-    CORE_RT.trace_mark("scan_done -> continue_after_scan")
-    local f0 = io.open(CORE_RT.trace_path, "a")
-    if f0 then f0:write(("    (scan: project_rel=%d engine_rel=%d)\n"):format(#project_rel, #engine_rel)); f0:close() end
 
     -- ── Phase 2: build file lists ────────────────────────────────────
     update("building file lists...", 25)
@@ -7443,8 +7414,6 @@ local function prepare_async(opts)
       table.sort(workspace_all)
       write_lines(ctx.paths.workspace_all_list, workspace_all)
     end)
-    local f1 = io.open(CORE_RT.trace_path, "a")
-    if f1 then f1:write(("    (lists: workspace_code=%d workspace_all=%d)\n"):format(#workspace_code, #workspace_all)); f1:close() end
 
     end_phase("lists")
 
@@ -8440,17 +8409,6 @@ end
 -- ctx from a JSON file passed on argv. Re-runs the same generate_compile_commands
 -- the in-process path would, but with the progress callback wired to stderr.
 function M._ccjson_subprocess_run(ctx, progress)
-  -- CORE_RT.trace_seg is lazy-installed inside prepare_async() in the main
-  -- nvim. The subprocess never enters prepare_async, so we install minimal
-  -- no-op shims here.
-  if not CORE_RT.trace_seg then
-    function CORE_RT.trace_seg(_name, fn)
-      return fn()
-    end
-    function CORE_RT.trace_mark(_label) end
-    CORE_RT.trace_path = nil
-  end
-
   -- We only run generate_compile_commands_from_rsp here, NOT the full
   -- generate_compile_commands. The latter also kicks off run_compile_commands_pipeline
   -- which uses vim.fn.jobstart — those jobs would be killed when this short-lived

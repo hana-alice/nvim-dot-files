@@ -4215,23 +4215,45 @@ local function collect_rsp_files(ctx)
   end
 
   local search_roots = {}
-  local engine_build = join(ctx.engine_root, "Engine", "Intermediate", "Build")
-  if _ufs.is_dir(engine_build) then
-    search_roots[#search_roots + 1] = engine_build
-  end
-  if ctx.project_root and ctx.project_root ~= "" then
-    local project_build = join(ctx.project_root, "Intermediate", "Build")
-    if _ufs.is_dir(project_build) then
-      search_roots[#search_roots + 1] = project_build
+  local seen_roots = {}
+  local function add_root(p)
+    if not p or p == "" then return end
+    p = norm(p)
+    if seen_roots[p] then return end
+    if _ufs.is_dir(p) then
+      seen_roots[p] = true
+      search_roots[#search_roots + 1] = p
     end
+  end
+
+  add_root(join(ctx.engine_root, "Engine", "Intermediate", "Build"))
+  if ctx.project_root and ctx.project_root ~= "" then
+    add_root(join(ctx.project_root, "Intermediate", "Build"))
+  end
+  -- P4 workspace layout: project_root is the workspace mount, but the uproject
+  -- (and therefore Intermediate/Build) lives under <workspace>/Source/Client/.
+  -- Always include the .uproject parent dir so game-side rsp gets collected.
+  if ctx.uproject and ctx.uproject ~= "" then
+    add_root(join(_ufs.dirname(ctx.uproject), "Intermediate", "Build"))
   end
 
   if #search_roots == 0 then
     return nil, "No Intermediate/Build directories found"
   end
 
-  -- Only collect compile rsp files (Module.*.cpp.obj.rsp), skip link/lib/def rsp
-  local cmd = { fd, "--no-ignore", "--type", "f", "-e", "rsp", "--glob", "*.cpp.obj.rsp" }
+  -- Collect compile-rsp files for both MSVC and clang/NDK naming:
+  --   MSVC:    Module.<Mod>.cpp.obj.rsp,  <Mod>.cpp.obj.rsp (single-TU modules)
+  --   NDK arm64: Module.<Mod>.cppa8.o.rsp, <Mod>.cppa8.o.rsp, .ca8.o.rsp (.c), .mma8.o.rsp (.mm)
+  --   NDK arm32: Module.<Mod>.cppa7.o.rsp, .cppa7.o.rsp variants
+  --   Linux/Mac: Module.<Mod>.cpp.o.rsp,   <Mod>.cpp.o.rsp
+  -- We DO NOT pre-filter by "Module.*.rsp" glob — UBT only emits the Module.
+  -- prefix when a module is unity-split into N_of_M chunks; small/single-TU
+  -- modules (game-side: <Game>.cppa8.o.rsp, third-party SDKs like *.SDK.rsp,
+  -- third-party C SDKs: android_native_app_glue.ca8.o.rsp; .mm bridges)
+  -- have no Module. prefix and would be silently dropped, killing every
+  -- game-only entry in the resulting CDB. The .obj.rsp / .o.rsp suffix
+  -- filter below is the real compile-vs-link discriminator.
+  local cmd = { fd, "--no-ignore", "--type", "f", "-e", "rsp" }
   for _, root in ipairs(search_roots) do
     cmd[#cmd + 1] = "--search-path"
     cmd[#cmd + 1] = root
@@ -4262,19 +4284,26 @@ local function collect_rsp_files(ctx)
   for _, line in ipairs(lines) do
     local p = norm(trim(line))
     if p ~= "" then
-      -- If target/config filter is set, only include matching paths.
-      -- Path pattern: .../Build/Win64/x64/{TargetName}/{Configuration}/{Module}/...
-      local dominated = true
-      if target_filter then
-        -- Check if path contains /{target_filter}/{config_filter}/
-        local has_target = p:find("/" .. target_filter .. "/", 1, true)
-        local has_config = config_filter and p:find("/" .. config_filter .. "/", 1, true)
-        if not has_target or (config_filter and not has_config) then
-          dominated = false
+      -- Reject non-compile rsp (link / lib / def). Compile rsp end with
+      -- .obj.rsp or .o.rsp (Windows MSVC: .cpp.obj.rsp; NDK: .cppa8.o.rsp,
+      -- .cppa7.o.rsp; Linux/Mac: .cpp.o.rsp).
+      local lp = p:lower()
+      local is_compile = lp:match("%.obj%.rsp$") or lp:match("%.o%.rsp$")
+      if is_compile and not (lp:match("%.link%.rsp$") or lp:match("%.lib%.rsp$") or lp:match("%.def%.rsp$")) then
+        -- If target/config filter is set, only include matching paths.
+        -- Path pattern: .../Build/Win64/x64/{TargetName}/{Configuration}/{Module}/...
+        local dominated = true
+        if target_filter then
+          -- Check if path contains /{target_filter}/{config_filter}/
+          local has_target = p:find("/" .. target_filter .. "/", 1, true)
+          local has_config = config_filter and p:find("/" .. config_filter .. "/", 1, true)
+          if not has_target or (config_filter and not has_config) then
+            dominated = false
+          end
         end
-      end
-      if dominated then
-        rsp_files[#rsp_files + 1] = p
+        if dominated then
+          rsp_files[#rsp_files + 1] = p
+        end
       end
     end
   end
@@ -4284,7 +4313,11 @@ local function collect_rsp_files(ctx)
     for _, line in ipairs(lines) do
       local p = norm(trim(line))
       if p ~= "" then
-        rsp_files[#rsp_files + 1] = p
+        local lp = p:lower()
+        local is_compile = lp:match("%.obj%.rsp$") or lp:match("%.o%.rsp$")
+        if is_compile and not (lp:match("%.link%.rsp$") or lp:match("%.lib%.rsp$") or lp:match("%.def%.rsp$")) then
+          rsp_files[#rsp_files + 1] = p
+        end
       end
     end
   end
@@ -4520,14 +4553,32 @@ local function export_compile_commands_to_engine_root(ctx)
     end
   end
 
-  return false, "compile_commands.json not found after GenerateClangDatabase"
+  return false, "compile_commands.json not found at any candidate path"
 end
 
 local function generate_compile_commands(ctx)
-  -- Prefer UBT-generated compile_commands.json if it already exists at a target path.
-  -- The UBT file is more complete (15k+ entries with full module resolution)
-  -- vs RSP-based generation which may miss entries or have subtly wrong paths.
   local targets = compile_commands_targets(ctx)
+
+  -- PRIMARY: generate from .rsp files. UBT writes one Module.<Mod>.{cpp.obj,cppa8.o}.rsp
+  -- per unity TU at compile time, containing the exact clang/MSVC command line
+  -- (sysroot, -I, -D, PCH, -c <unity.cpp>). This is the most complete and
+  -- accurate source of truth — covers Engine + game modules uniformly across
+  -- Win64 / Android / IOS / Linux.
+  --
+  -- Why rsp instead of `Build.bat -Mode=GenerateClangDatabase`:
+  --   1. GenerateClangDatabase only emits modules the active *target* links;
+  --      Engine modules used by the runtime are often missing.
+  --   2. Re-running Build.bat costs 30-60s; reading rsp files costs <2s.
+  --   3. The unity-rsp pipeline produces identical args to what the build
+  --      actually used, so PCH/macro mismatches are eliminated by construction.
+  local rsp_count, rsp_path = generate_compile_commands_from_rsp(ctx)
+  if rsp_count and rsp_count > 0 then
+    run_compile_commands_pipeline(targets[1], targets)
+    return true, rsp_path .. " (" .. rsp_count .. " entries from .rsp files)"
+  end
+
+  -- FALLBACK: an existing UBT-generated compile_commands.json at a target path.
+  -- Only used if no rsp files are present (fresh clone / pre-build).
   for _, target in ipairs(targets) do
     if _ufs.is_file(target) and vim.fn.getfsize(target) > 1024 then
       slim_compile_commands_file(target)
@@ -4536,102 +4587,15 @@ local function generate_compile_commands(ctx)
     end
   end
 
-  -- Try other candidate locations (Engine/Intermediate/Build/, project root, fd search)
+  -- FALLBACK 2: search candidate locations (Engine/Intermediate/Build/, project root, fd search)
   local ok_existing, existing_path = export_compile_commands_to_engine_root(ctx)
   if ok_existing then
     run_compile_commands_pipeline(targets[1], targets)
     return true, existing_path .. " (UBT)"
   end
 
-  -- Fallback: generate from .rsp files (works without running GenerateClangDatabase)
-  local rsp_count, rsp_path = generate_compile_commands_from_rsp(ctx)
-  if rsp_count then
-    run_compile_commands_pipeline(targets[1], targets)
-    return true, rsp_path .. " (" .. rsp_count .. " entries from .rsp files)"
-  end
-
-  if not ctx.project_root or ctx.project_root == "" then
-    return false,
-      "No engine compile_commands source found. Need existing compile_commands.json, engine .rsp files, or a project via :UESetProject [path]"
-  end
-
-  local uproject = ctx.uproject or find_uproject_in_dir(ctx.project_root)
-  if not uproject then
-    return false, "No .uproject found in project root: " .. ctx.project_root
-  end
-
-  local project_arg = to_windows_path(uproject)
-  if not project_arg then
-    return false, "Failed to convert .uproject path to Windows path for Build.bat"
-  end
-
-  local cmd, cmd_err
-  local plat
-  local conf
-  local kind
-  if is_windows_path(ctx.engine_root) then
-    local engine_root_win = windows_engine_root(ctx)
-    if not engine_root_win or engine_root_win == "" then
-      return false, "Failed to resolve Windows engine root for compile_commands export"
-    end
-
-    local build_bat_file = build_bat_path(engine_root_win)
-    if not is_windows_path(build_bat_file) and not _ufs.is_file(build_bat_file) then
-      return false, "Build.bat not found under engine root: " .. build_bat_file
-    end
-
-    plat = target_platform(ctx.engine_root, { "Build.bat" })
-    conf = target_configuration(ctx.engine_root, ctx.project_root, uproject, plat)
-    kind = target_kind(ctx.engine_root, ctx.project_root, uproject, plat)
-    cmd, cmd_err = build_bat_windows_command(engine_root_win, {
-      "-Mode=GenerateClangDatabase",
-      detect_target_name(ctx.project_root, uproject, kind),
-      plat,
-      conf,
-      "-Project=" .. project_arg,
-      "-Game",
-      "-Engine",
-      -- Force unity build mode in the generated CDB.
-      -- this UE fork's GenerateClangDatabase Mode hard-appends "-DisableUnity" per-target,
-      -- which only sets bUseUnityBuild=false. "-ForceUnity" sets bForceUnityBuild=true,
-      -- and UEBuildModuleCPP.cs:402 OR's the two -> module goes through unity aggregation.
-      -- Result: CDB contains ~847 Module.<X>.cpp unity TUs instead of 14k per-file entries.
-      "-ForceUnity",
-    })
-  else
-    plat = target_platform(ctx.engine_root, { ubt_exe_path(ctx.engine_root) })
-    conf = target_configuration(ctx.engine_root, ctx.project_root, uproject, plat)
-    kind = target_kind(ctx.engine_root, ctx.project_root, uproject, plat)
-    cmd, cmd_err = direct_ubt_command(ctx.engine_root, {
-      "-Mode=GenerateClangDatabase",
-      detect_target_name(ctx.project_root, uproject, kind),
-      plat,
-      conf,
-      "-Project=" .. project_arg,
-      "-Game",
-      "-Engine",
-      -- Force unity build mode (see Windows branch above for rationale).
-      "-ForceUnity",
-    })
-  end
-  if not cmd then
-    return false, cmd_err
-  end
-
-  for _, target in ipairs(compile_commands_targets(ctx)) do
-    pcall(vim.fn.delete, target)
-  end
-
-  local code, lines = run_lines(cmd, { cwd = windows_host_cwd() })
-  if code ~= 0 then
-    return false, table.concat(lines or {}, "\n")
-  end
-
-  local ok_gen, gen_path = export_compile_commands_to_engine_root(ctx)
-  if ok_gen then
-    run_compile_commands_pipeline(targets[1], targets)
-  end
-  return ok_gen, gen_path
+  return false,
+    "No engine compile_commands source found. Build the project once (UBT writes Module.*.rsp under Intermediate/Build) or place a compile_commands.json at the engine root."
 end
 
 -- ==========================================================================

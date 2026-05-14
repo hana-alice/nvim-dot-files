@@ -53,7 +53,10 @@ ENGINE_PATH_RE = re.compile(
 INTERMEDIATE_RE = re.compile(r"[/\\]Intermediate[/\\]", re.IGNORECASE)
 
 # uetemp 目录
-UETEMP_RE = re.compile(r"[/\\]uetemp[/\\]", re.IGNORECASE)
+# UETEMP_RE removed — see categorize_entry() comment. Engine roots are
+# sometimes literally named "uetemp" (D:/project/uetemp), so blanket-skipping
+# any path containing /uetemp/ was a false positive.
+
 
 # NDK / SDK 系统路径
 SDK_RE = re.compile(
@@ -65,6 +68,7 @@ SDK_RE = re.compile(
 def categorize_entry(entry: dict) -> str:
     """返回条目类别: keep / skip_generated / skip_shader / skip_engine / skip_intermediate / skip_other"""
     f = entry.get("file", "").replace("\\", "/")
+    basename = f.rsplit("/", 1)[-1]
 
     # 1. 自动生成文件
     if SKIP_FILE_RE.search(f):
@@ -75,13 +79,19 @@ def categorize_entry(entry: dict) -> str:
     if ext in SHADER_EXTS:
         return "skip_shader"
 
-    # 3. Intermediate 目录 (PCH 定义头等)
+    # 3. Intermediate 目录 — 跳过 generated 头/源，但保留 UE 的 unity TU
+    #    Module.<Mod>.cpp / Module.<Mod>.N_of_M.cpp / Module.<Mod>.gen.N_of_M.cpp
+    #    都在 Intermediate/Build/.../<Mod>/ 下，是合法的 clangd cdb entry。
     if INTERMEDIATE_RE.search(f):
-        return "skip_intermediate"
+        if basename.startswith("Module.") and basename.endswith(".cpp"):
+            pass  # fall through to keep
+        else:
+            return "skip_intermediate"
 
-    # 4. uetemp
-    if UETEMP_RE.search(f):
-        return "skip_uetemp"
+    # 4. (removed) UETEMP_RE — historically skipped /uetemp/ as a temp build
+    #    cache; but engine roots are now sometimes literally named "uetemp"
+    #    (D:/project/uetemp). The rule was a false positive; rely on
+    #    INTERMEDIATE_RE and explicit Engine root scoping instead.
 
     # 5. NDK/SDK
     if SDK_RE.search(f):
@@ -321,7 +331,7 @@ def main():
     print(f"原始大小: {original_size / 1048576:.1f} MB")
     print()
     for cat in ["keep", "skip_generated", "skip_shader", "skip_engine",
-                 "skip_intermediate", "skip_uetemp", "skip_sdk"]:
+                 "skip_intermediate", "skip_sdk"]:
         count = stats.get(cat, 0)
         if count > 0:
             pct = count * 100 / original_count

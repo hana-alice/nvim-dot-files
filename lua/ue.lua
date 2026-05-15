@@ -6785,6 +6785,93 @@ local function set_platform_completions(arg_lead)
   return matches
 end
 
+-- Fast platform swap: when shards already exist for the requested (platform,
+-- configuration), flip manifest.active + re-merge into the top-level cdb
+-- WITHOUT re-running :UEPrepare. Returns ok, new_active_key, stats|err.
+--
+-- Preconditions:
+--   * state.target_platform / state.target_configuration ALREADY persisted
+--     (set_platform calls update_state_field before invoking this).
+--   * <cache>/cdb/compile_commands/shards/<plat>-<target>-<config>.json exists.
+--
+-- Side effects on success:
+--   * manifest.active set to the best matching shard key + written to disk.
+--   * Top-level engine_root/compile_commands.json (and Engine/compile_commands.json)
+--     rewritten to be the merged result from all shards, with the new
+--     active key winning conflicts.
+--   * run_compile_commands_pipeline executes the standard slim/pch/resolve/
+--     unify/prune chain so clangd sees the same shape it would after a full
+--     :UEPrepare.
+--   * vim.cmd("LspRestart clangd") so clangd reloads the swapped cdb.
+--
+-- Parked on CORE_RT (not declared as a top-level `local function`) to avoid
+-- pushing this monolith past LuaJIT's 200-local cap. See skill
+-- `luajit-200-local-cap-with-loader-cache-mask` Fix D.
+function CORE_RT.fast_swap_active_platform(engine_root)
+  -- Prefer resolve_context (gives full ctx with paths cached); fall back to
+  -- a synthetic ctx built from state.json when called without a buffer in
+  -- the project (rare, but happens for headless tests / engine-root cwd).
+  local ctx = resolve_context({ detect_project = true })
+  if not ctx or norm(ctx.engine_root or "") ~= norm(engine_root) then
+    local state = read_state(engine_root)
+    if not state.project_root or state.project_root == "" then
+      return false, nil, "no project_root in state.json — open a file in the project first or run :UEPrepare"
+    end
+    ctx = {
+      engine_root = engine_root,
+      project_root = state.project_root,
+      uproject = state.uproject or find_uproject_in_dir(state.project_root) or "",
+      state = state,
+      paths = cache_paths(engine_root),
+    }
+  end
+  -- ctx.state was loaded BEFORE set_platform's update_state_field calls
+  -- (because resolve_context caches). Re-read so target_platform / config
+  -- reflect what the user just selected — otherwise active_key() picks the
+  -- stale platform's shard.
+  ctx.state = read_state(engine_root)
+
+  local shards = require("ue.cdb.shards")
+  local manifest = shards.read_manifest(ctx)
+  if not manifest or not manifest.shards or not next(manifest.shards) then
+    return false, nil, "no shards on disk yet — run :UEPrepare once to seed the per-platform cache"
+  end
+
+  local new_key = shards.active_key(ctx, manifest)
+  if new_key == "" or not manifest.shards[new_key] then
+    local have = {}
+    for k, _ in pairs(manifest.shards) do have[#have + 1] = k end
+    table.sort(have)
+    return false, nil, string.format(
+      "no shard for platform=%s config=%s (have: %s) — run :UEPrepare to build it",
+      ctx.state.target_platform or "?",
+      ctx.state.target_configuration or "?",
+      table.concat(have, ", "))
+  end
+
+  -- Flip + persist BEFORE merge so merge_shards' active-bonus picks the new winner.
+  manifest.active = new_key
+  shards.write_manifest(ctx, manifest)
+
+  local merged, stats = shards.merge_shards(ctx, manifest)
+  local json = vim.json.encode(merged)
+
+  local targets = compile_commands_targets(ctx)
+  for _, target in ipairs(targets) do
+    write_all(target, json)
+  end
+
+  -- Run the standard post-process chain (slim + PCH FI inject + resolve +
+  -- unify + prune) so clangd sees the same cdb shape as after :UEPrepare.
+  run_compile_commands_pipeline(targets[1], targets)
+
+  -- Tell clangd to reload. LspRestart is async — clangd reads the new cdb on
+  -- attach, so any open buffer will pick up the swap within ~1s.
+  pcall(vim.cmd, "LspRestart clangd")
+
+  return true, new_key, stats
+end
+
 local function set_platform(input)
   local engine_root, project_root, uproject, state = platform_selection_context()
   if not engine_root then
@@ -6811,10 +6898,25 @@ local function set_platform(input)
     invalidate_status_cache()
     refresh_statusline()
     CORE_RT.context_cache = {}
-    vim.notify(("UE platform: %s %s"):format(
-      plat or default_plat or "(auto)",
-      conf or default_conf
-    ))
+
+    -- Try the cheap path first: if a shard already exists for the new
+    -- (platform,config), flip manifest.active + re-merge in-place (~1s)
+    -- instead of forcing a full :UEPrepare (~30-60s).
+    local ok, key, info = CORE_RT.fast_swap_active_platform(engine_root)
+    if ok then
+      vim.notify(("UE platform: %s %s\nFast-swapped to shard %s (%d entries, %d shards merged)"):format(
+        plat or default_plat or "(auto)",
+        conf or default_conf,
+        key,
+        info.total_out,
+        info.shard_count), vim.log.levels.INFO, { title = "UE", timeout = 4000 })
+    else
+      vim.notify(("UE platform: %s %s\n%s"):format(
+        plat or default_plat or "(auto)",
+        conf or default_conf,
+        info or "fast-swap failed — run :UEPrepare to generate this platform's shard"),
+        vim.log.levels.WARN, { title = "UE", timeout = 6000 })
+    end
     return
   end
 
@@ -6839,7 +6941,17 @@ local function set_platform(input)
       invalidate_status_cache()
       refresh_statusline()
       CORE_RT.context_cache = {}
-      vim.notify(("UE platform set: %s %s\nRun :UEPrepare to regenerate for this platform"):format(plat, conf))
+
+      local ok, key, info = CORE_RT.fast_swap_active_platform(engine_root)
+      if ok then
+        vim.notify(("UE platform set: %s %s\nFast-swapped to shard %s (%d entries)"):format(
+          plat, conf, key, info.total_out),
+          vim.log.levels.INFO, { title = "UE", timeout = 4000 })
+      else
+        vim.notify(("UE platform set: %s %s\n%s"):format(
+          plat, conf, info or "Run :UEPrepare to regenerate for this platform"),
+          vim.log.levels.WARN, { title = "UE", timeout = 6000 })
+      end
     end)
   end)
 end

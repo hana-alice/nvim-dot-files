@@ -48,6 +48,14 @@
 local uv = vim.uv or vim.loop
 local M = {}
 
+-- Forward declarations for helpers defined later in the file but referenced
+-- earlier (Lua silently treats undeclared names as globals → nil at call time).
+-- See skill `ue-lua-engine-only-maintenance` Pitfalls section: must be plain
+-- assignment (`name = function(...)`) at the definition site, NOT
+-- `local function name(...)` which creates a SECOND local that shadows this
+-- forward-decl and leaves the upper closure bound to nil forever.
+local add_to_persistent_dirty
+
 -- ---------------------------------------------------------------------------
 -- State
 -- ---------------------------------------------------------------------------
@@ -480,7 +488,7 @@ local function save_persistent_dirty()
   end
 end
 
-local function add_to_persistent_dirty(paths)
+add_to_persistent_dirty = function(paths)
   if #paths == 0 then return end
   load_persistent_dirty()
   local changed = false

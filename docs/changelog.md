@@ -44,6 +44,42 @@ keep this file rolling forward as the unreleased section.
 
 ---
 
+### 2026-05-15 — 治本修 clangd LSP 对 UE .h / PCH-cpp 的结构性盲点
+
+**任务**
+UE 编 cl.exe 走得通，但 clangd LSP 给 .h 一片红 (`'MGShading.h' file not found` cascade)，
+PCH-dependent .cpp 也红 (`unknown class FGlobalShader` fatal cascade)。根因是
+UBT 出 cdb 时 (a) 只写 .cpp 不写 .h，clangd header inference 选不到正确 -I，
+(b) 把 .cpp 的 /FI=SharedPCH 剥掉，cl 靠 /Yu /Fp 读 .pch 二进制能跑，但 clangd
+不读 PCH binary，缺一片符号。
+
+**完成**
+- 新模块 `lua/ue/cdb/header_inject.lua` — 扫 `Engine/Intermediate/Build/<Plat>/<Target>/<Config>/*/<TU>.cpp.json`
+  建 reverse-include 图，给每个 .h 选 donor (path A clone CDB entry + 补 /FI=PCH；
+  path B 用 wrapper response 解析)。
+- 新模块 `lua/ue/cdb/pch_fi_inject.lua` — 对 PCH-dependent .cpp 补回 /FI=SharedPCH。
+- hook 进 ue.lua prepare pipeline ~L4834，按 bucket fan-out，shard 落盘前完成。
+  shards 已含修复 → fast-swap 自动跟上。
+
+**坑**
+- LuaJIT 200-local cap: 不能在 ue.lua 顶层新增 local，inline require 进 trace_seg 闭包
+- path A 不补 /FI=PCH 会回归 22 ERROR (skill PoC v6 数据)
+- 路径必须 lowercase + slash 归一 (NTFS case-insensitive 但 map key 会撞)
+- bucket roots 父 dir 即 config-level intermediate dir，不用从 rsp 反推
+- pch_fi_inject 必须区分 SharedPCH/PCH.<X> vs 普通 /FI (Definitions.Renderer.h 不能加)
+
+**验证 (subagent 阶段 — 用户实测待回填)**
+- Subagent A smoke: scanned=1169 cpp.json, h_added=15341 (a=2059 b=13282), MG 三头 ✓
+- Subagent B smoke: fi_added=130, MGRasterizer.cpp 拿到 SharedPCH.Engine.ShadowErrors.h
+- 幂等验证: re-run fi_added=0 already_had=130
+- 用户实测: TODO (重启 Neovide / 重跑 UEPrepare 后开 MGPipeline.h 看 diag)
+
+**Follow-up**
+- PCH per-platform 隔离 plan 仍待 (`.hermes/plans/2026-05-15_111637-pch-per-platform-isolation.md`)
+  ── 本改用 text /FI 不读 PCH binary，对 LSP 无影响；那个 plan 后跟。
+
+---
+
 ### 2026-05-15 — `:UESetPlatform` fast-swap (no re-prepare)
 
 **Task** Win64 ↔ Android 切换时 `:UEPrepare` 会覆盖对方平台的产物，cdb

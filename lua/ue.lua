@@ -4832,6 +4832,42 @@ generate_compile_commands_from_rsp = function(ctx, progress)
   active_bucket.entries = augment_compile_commands_table_with_shaders(
     ctx, active_bucket.entries, progress)
 
+  -- Per-bucket structural fixups for clangd LSP:
+  --   (a) synthesize .h CDB entries (UBT writes only .cpp; clangd header
+  --       inference picks wrong donor for sibling-include headers).
+  --   (b) re-inject /FI=SharedPCH.<X>.h on PCH-dependent .cpp (UBT strips
+  --       it because cl.exe reads /Yu /Fp binary PCH; clangd needs text /FI).
+  -- Must run BEFORE shard write so each on-disk shard is clangd-complete
+  -- and fast-swap (:UESetPlatform) inherits the fix for free.
+  -- NOTE: inline require inside trace_seg closure — ue.lua is at the
+  --       LuaJIT 200 main-chunk local cap; do not add top-level locals.
+  progress("inject", 82, "injecting .h entries + PCH /FI per bucket...")
+  CORE_RT.trace_seg("ccjson.inject", function()
+    local header_inject = require("ue.cdb.header_inject")
+    local pch_fi_inject = require("ue.cdb.pch_fi_inject")
+    for _, b in pairs(buckets) do
+      local ok_h, h_stats = pcall(header_inject.run, b)
+      if not ok_h then
+        CORE_RT.trace_mark(string.format(
+          "inject %s/%s/%s: header_inject ERROR: %s",
+          b.platform, b.target, b.config, tostring(h_stats)))
+        h_stats = { h_added = 0, donor_a = 0, donor_b = 0 }
+      end
+      local ok_f, fi_stats = pcall(pch_fi_inject.run, b)
+      if not ok_f then
+        CORE_RT.trace_mark(string.format(
+          "inject %s/%s/%s: pch_fi_inject ERROR: %s",
+          b.platform, b.target, b.config, tostring(fi_stats)))
+        fi_stats = { fi_added = 0, response_missing = 0 }
+      end
+      CORE_RT.trace_mark(string.format(
+        "inject %s/%s/%s: h_added=%d h_a=%d h_b=%d fi_added=%d fi_missing=%d",
+        b.platform, b.target, b.config,
+        h_stats.h_added or 0, h_stats.donor_a or 0, h_stats.donor_b or 0,
+        fi_stats.fi_added or 0, fi_stats.response_missing or 0))
+    end
+  end)
+
   -- Write every bucket to its shard file + update manifest.
   progress("shards", 85, "writing per-config shards...")
   local active_key = nil

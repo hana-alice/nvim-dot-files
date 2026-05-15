@@ -4481,19 +4481,35 @@ local function collect_rsp_files(ctx)
     return nil, "No Intermediate/Build directories found"
   end
 
-  -- Collect compile-rsp files for both MSVC and clang/NDK naming:
-  --   MSVC:    Module.<Mod>.cpp.obj.rsp,  <Mod>.cpp.obj.rsp (single-TU modules)
-  --   NDK arm64: Module.<Mod>.cppa8.o.rsp, <Mod>.cppa8.o.rsp, .ca8.o.rsp (.c), .mma8.o.rsp (.mm)
-  --   NDK arm32: Module.<Mod>.cppa7.o.rsp, .cppa7.o.rsp variants
-  --   Linux/Mac: Module.<Mod>.cpp.o.rsp,   <Mod>.cpp.o.rsp
-  -- We DO NOT pre-filter by "Module.*.rsp" glob — UBT only emits the Module.
+  -- Collect compile response-files. UBT emits one of two suffix families
+  -- depending on the engine/toolchain combo:
+  --
+  --   UE5 (any toolchain) and UE4 NDK/Linux: `.rsp` extension
+  --     MSVC:    Module.<Mod>.cpp.obj.rsp,  <Mod>.cpp.obj.rsp (single-TU modules)
+  --     NDK arm64: Module.<Mod>.cppa8.o.rsp, <Mod>.cppa8.o.rsp, .ca8.o.rsp, .mma8.o.rsp
+  --     NDK arm32: Module.<Mod>.cppa7.o.rsp variants
+  --     Linux/Mac: Module.<Mod>.cpp.o.rsp,  <Mod>.cpp.o.rsp
+  --
+  --   UE4 Windows (MSVC): `.response` extension
+  --     <Source>.cpp.obj.response,  Module.<Mod>.cpp.obj.response
+  --     UBT keeps a `.response.old` backup alongside — must reject those.
+  --
+  -- We do NOT pre-filter by "Module.*" glob — UBT only emits the Module.
   -- prefix when a module is unity-split into N_of_M chunks; small/single-TU
-  -- modules (game-side: <Game>.cppa8.o.rsp, third-party SDKs like *.SDK.rsp,
-  -- third-party C SDKs: android_native_app_glue.ca8.o.rsp; .mm bridges)
-  -- have no Module. prefix and would be silently dropped, killing every
-  -- game-only entry in the resulting CDB. The .obj.rsp / .o.rsp suffix
-  -- filter below is the real compile-vs-link discriminator.
-  local cmd = { fd, "--no-ignore", "--type", "f", "-e", "rsp" }
+  -- modules and third-party SDKs have no Module. prefix and would be
+  -- silently dropped, killing every game-only entry in the resulting CDB.
+  -- The .obj.{rsp,response} / .o.rsp suffix filter below is the real
+  -- compile-vs-link discriminator.
+  local cmd = {
+    fd,
+    "--no-ignore",
+    "--type",
+    "f",
+    "-e",
+    "rsp",
+    "-e",
+    "response",
+  }
   for _, root in ipairs(search_roots) do
     cmd[#cmd + 1] = "--search-path"
     cmd[#cmd + 1] = root
@@ -4501,67 +4517,154 @@ local function collect_rsp_files(ctx)
 
   local code, lines = run_lines(cmd, { cwd = ctx.engine_root })
   if code ~= 0 or not lines or #lines == 0 then
-    return nil, "No .rsp files found"
+    return nil, "No .rsp/.response files found"
   end
 
-  -- Determine target filter from configuration.
-  -- "Development Editor" → target=UnrealEditor, config=Development
-  -- "Development" → target=UnrealGame, config=Development
-  local target_filter = nil
-  local config_filter = nil
+  -- Determine target/platform filters from persisted state.
+  --
+  -- Target name resolution must NOT assume UE5 default names (UnrealEditor /
+  -- UnrealGame). UE4 ships `UE4Editor.Target.cs` and most game projects use
+  -- a custom name from `<Project>.Target.cs` (e.g. `Client`, `ClientEditor`).
+  -- We build the filter set from (a) detect_target_names against the
+  -- project's Source/ tree, plus (b) the engine's own *.Target.cs files
+  -- found by globbing `<engine>/Engine/Source/*.Target.cs` and stripping
+  -- the `.Target.cs` suffix. Any rsp path containing `/<Name>/` for a
+  -- detected target name passes.
+  --
+  -- Platform filter additionally constrains by `/<Platform>/` segment so a
+  -- stray Android-target rsp can't slip in when the user is on Win64.
   local config = ctx.state and trim(ctx.state.target_configuration or "") or ""
+  local platform = ctx.state and trim(ctx.state.target_platform or "") or ""
+  local config_filter = nil
+  local kind_suffix = nil  -- "Editor"|"Client"|"Server"|"Game"|nil
   if config ~= "" then
     if config:match(" Editor$") then
-      target_filter = "UnrealEditor"
+      kind_suffix = "Editor"
       config_filter = config:gsub(" Editor$", "")
+    elseif config:match(" Client$") then
+      kind_suffix = "Client"
+      config_filter = config:gsub(" Client$", "")
+    elseif config:match(" Server$") then
+      kind_suffix = "Server"
+      config_filter = config:gsub(" Server$", "")
     else
-      target_filter = "UnrealGame"
+      kind_suffix = "Game"
       config_filter = config
     end
   end
 
+  -- Collect candidate target names from project + engine Source dirs.
+  local target_names = {}
+  local seen_target = {}
+  local function add_target(name)
+    name = trim(name or "")
+    if name == "" or seen_target[name] then return end
+    seen_target[name] = true
+    target_names[#target_names + 1] = name
+  end
+  if ctx.project_root and ctx.uproject and ctx.uproject ~= "" then
+    local detected = detect_target_names(ctx.project_root, ctx.uproject)
+    -- Prefer the kind matching the configuration first, but include the
+    -- others as best-effort (UBT may have built more than one variant).
+    if kind_suffix and detected[kind_suffix] then
+      add_target(detected[kind_suffix])
+    end
+    for _, k in ipairs({ "Editor", "Client", "Server", "Game" }) do
+      add_target(detected[k])
+    end
+  end
+  -- Engine-side targets (UE4Editor.Target.cs / UnrealEditor.Target.cs / ...).
+  do
+    local engine_source = join(ctx.engine_root, "Engine", "Source")
+    local engine_targets = vim.fn.globpath(engine_source, "*.Target.cs", false, true)
+    if type(engine_targets) == "table" then
+      for _, t in ipairs(engine_targets) do
+        add_target((vim.fs.basename(t):gsub("%.Target%.cs$", "")))
+      end
+    end
+  end
+
   local rsp_files = {}
+  local kept_by_target = false
   for _, line in ipairs(lines) do
     local p = norm(trim(line))
     if p ~= "" then
-      -- Reject non-compile rsp (link / lib / def). Compile rsp end with
-      -- .obj.rsp or .o.rsp (Windows MSVC: .cpp.obj.rsp; NDK: .cppa8.o.rsp,
-      -- .cppa7.o.rsp; Linux/Mac: .cpp.o.rsp).
+      -- Reject non-compile rsp (link / lib / def) and UBT `.response.old`
+      -- backups. Compile artifacts end in .obj.rsp, .o.rsp, or .obj.response.
       local lp = p:lower()
-      local is_compile = lp:match("%.obj%.rsp$") or lp:match("%.o%.rsp$")
-      if is_compile and not (lp:match("%.link%.rsp$") or lp:match("%.lib%.rsp$") or lp:match("%.def%.rsp$")) then
-        -- If target/config filter is set, only include matching paths.
-        -- Path pattern: .../Build/Win64/x64/{TargetName}/{Configuration}/{Module}/...
+      local is_compile = lp:match("%.obj%.rsp$")
+        or lp:match("%.o%.rsp$")
+        or lp:match("%.obj%.response$")
+      local is_backup = lp:match("%.response%.old$") or lp:match("%.rsp%.old$")
+      local is_linker = lp:match("%.link%.rsp$")
+        or lp:match("%.lib%.rsp$")
+        or lp:match("%.def%.rsp$")
+        or lp:match("%.link%.response$")
+        or lp:match("%.lib%.response$")
+        or lp:match("%.def%.response$")
+      if is_compile and not is_backup and not is_linker then
         local dominated = true
-        if target_filter then
-          -- Check if path contains /{target_filter}/{config_filter}/
-          local has_target = p:find("/" .. target_filter .. "/", 1, true)
-          local has_config = config_filter and p:find("/" .. config_filter .. "/", 1, true)
-          if not has_target or (config_filter and not has_config) then
+
+        -- Platform filter: `/<Platform>/` must appear in the path.
+        if platform ~= "" then
+          if not p:find("/" .. platform .. "/", 1, true) then
             dominated = false
           end
         end
+
+        -- Target-name filter: at least one detected target name must
+        -- appear as a path segment. Skipped silently if we somehow have
+        -- no detected targets (rare; treated as "match anything" so we
+        -- never lose entries on misconfigured trees).
+        if dominated and #target_names > 0 then
+          local target_hit = false
+          for _, tn in ipairs(target_names) do
+            if p:find("/" .. tn .. "/", 1, true) then
+              target_hit = true
+              break
+            end
+          end
+          if not target_hit then
+            dominated = false
+          end
+        end
+
+        -- Configuration filter (Development / DebugGame / Shipping / Test).
+        if dominated and config_filter and config_filter ~= "" then
+          if not p:find("/" .. config_filter .. "/", 1, true) then
+            dominated = false
+          end
+        end
+
         if dominated then
           rsp_files[#rsp_files + 1] = p
+          kept_by_target = true
         end
       end
     end
   end
 
   if #rsp_files == 0 then
-    -- Fallback: if filter was too strict, return all compile rsp files
-    for _, line in ipairs(lines) do
-      local p = norm(trim(line))
-      if p ~= "" then
-        local lp = p:lower()
-        local is_compile = lp:match("%.obj%.rsp$") or lp:match("%.o%.rsp$")
-        if is_compile and not (lp:match("%.link%.rsp$") or lp:match("%.lib%.rsp$") or lp:match("%.def%.rsp$")) then
-          rsp_files[#rsp_files + 1] = p
-        end
-      end
-    end
+    -- No silent fallback: an empty filter result almost always means the
+    -- user's selected platform/configuration has never been built, OR a
+    -- detection bug. Returning "all rsp files" hides both and lets foreign
+    -- target entries (e.g. Android .cppa8.o.rsp) win the dedup race in the
+    -- caller, producing a CDB with the wrong toolchain for every cpp.
+    local detail = string.format(
+      "rsp filter matched 0 files (platform=%s config=%s kind=%s targets=[%s] roots=%d scanned=%d). "
+        .. "Build the selected target at least once, or re-check :UESetPlatform / :UESetConfiguration.",
+      platform == "" and "<unset>" or platform,
+      config_filter or "<unset>",
+      kind_suffix or "<unset>",
+      table.concat(target_names, ","),
+      #search_roots,
+      #lines
+    )
+    return nil, detail
   end
 
+  -- Suppress unused-var warning for the diagnostic-only flag.
+  local _ = kept_by_target
   return rsp_files, nil
 end
 
@@ -4581,11 +4684,42 @@ generate_compile_commands_from_rsp = function(ctx, progress)
   -- UBT runs with Engine/Source as CWD, so all relative paths in rsp files
   -- (../Intermediate/Build/..., Runtime/Core/Public, etc.) are relative to it.
   local compile_dir = engine_source_dir
-  local entries = {}
-  local seen_files = {}
+
+  -- Per-shard bucketing: classify every rsp by (platform, target, config)
+  -- and stuff its entries into a per-bucket array. This replaces the old
+  -- single global `entries` table. See ue.cdb.shards.
+  local shards_mod = require("ue.cdb.shards")
+  local buckets = {}             -- buckets[key] = { plat, target, config, entries[], seen_files{}, roots{} }
+  local UNKNOWN_KEY = "Unknown-Unknown-Unknown"
+  local function get_bucket(rsp_path)
+    local plat, target, config = shards_mod.classify_rsp_path(rsp_path)
+    local key
+    if plat then
+      key = shards_mod.shard_key(plat, target, config)
+    else
+      key = UNKNOWN_KEY
+      plat, target, config = "Unknown", "Unknown", "Unknown"
+    end
+    local b = buckets[key]
+    if not b then
+      b = {
+        key = key,
+        platform = plat,
+        target = target,
+        config = config,
+        entries = {},
+        seen_files = {},
+        roots = {},
+      }
+      buckets[key] = b
+    end
+    return b
+  end
+
   local _ccjson_read_ms = 0
   local _ccjson_unity_ms = 0
   local _ccjson_unity_calls = 0
+  local total_entries = 0
 
   CORE_RT.trace_seg("ccjson.parse_loop", function()
   for _, rsp_path in ipairs(rsp_files) do
@@ -4609,6 +4743,9 @@ generate_compile_commands_from_rsp = function(ctx, progress)
           table.insert(args, 1, "clang++")
           table.insert(args, "-D__INTELLISENSE__")
 
+          local bucket = get_bucket(rsp_path)
+          bucket.roots[_ufs.dirname(rsp_path)] = true
+
           local _u0 = vim.loop.hrtime()
           local unity_includes = extract_unity_includes(input_file, engine_source_dir)
           _ccjson_unity_ms = _ccjson_unity_ms + (vim.loop.hrtime() - _u0) / 1e6
@@ -4616,28 +4753,30 @@ generate_compile_commands_from_rsp = function(ctx, progress)
           if unity_includes then
             for _, real_file in ipairs(unity_includes) do
               local key = real_file:lower()
-              if not seen_files[key] then
-                seen_files[key] = true
+              if not bucket.seen_files[key] then
+                bucket.seen_files[key] = true
                 local entry_args = vim.list_extend({}, args)
                 entry_args[#entry_args + 1] = real_file
-                entries[#entries + 1] = {
+                bucket.entries[#bucket.entries + 1] = {
                   directory = compile_dir,
                   file = real_file,
                   arguments = entry_args,
                 }
+                total_entries = total_entries + 1
               end
             end
           else
             local key = input_file:lower()
-            if not seen_files[key] then
-              seen_files[key] = true
+            if not bucket.seen_files[key] then
+              bucket.seen_files[key] = true
               local entry_args = vim.list_extend({}, args)
               entry_args[#entry_args + 1] = input_file
-              entries[#entries + 1] = {
+              bucket.entries[#bucket.entries + 1] = {
                 directory = compile_dir,
                 file = input_file,
                 arguments = entry_args,
               }
+              total_entries = total_entries + 1
             end
           end
         end
@@ -4645,32 +4784,98 @@ generate_compile_commands_from_rsp = function(ctx, progress)
     end
   end
   end)
-  CORE_RT.trace_mark(string.format(
-    "ccjson.read_total=%.0fms unity_total=%.0fms unity_calls=%d entries=%d",
-    _ccjson_read_ms, _ccjson_unity_ms, _ccjson_unity_calls, #entries))
 
-  if #entries == 0 then
+  -- Bucket summary for tracing.
+  do
+    local pieces = {}
+    for k, b in pairs(buckets) do
+      pieces[#pieces + 1] = string.format("%s=%d", k, #b.entries)
+    end
+    table.sort(pieces)
+    CORE_RT.trace_mark(string.format(
+      "ccjson.read_total=%.0fms unity_total=%.0fms unity_calls=%d entries=%d shards=%d [%s]",
+      _ccjson_read_ms, _ccjson_unity_ms, _ccjson_unity_calls, total_entries,
+      vim.tbl_count(buckets), table.concat(pieces, ", ")))
+  end
+
+  if total_entries == 0 then
     return nil, "No compile entries generated from .rsp files"
   end
 
-  entries = augment_compile_commands_table_with_shaders(ctx, entries, progress)
+  -- Pick the *active* bucket: the one matching state.target_platform +
+  -- state.target_configuration. Shader CDB augmentation is only attached
+  -- to the active bucket (shader entries are platform-agnostic; merging
+  -- them onto every shard would just duplicate work).
+  local state = ctx.state or {}
+  local want_plat = trim(state.target_platform or "")
+  local want_conf = trim(state.target_configuration or "")
+  local want_conf_stripped = want_conf:gsub(" Editor$", "")
+  local active_bucket = nil
+  for _, b in pairs(buckets) do
+    if (want_plat == "" or b.platform == want_plat) and
+       (want_conf == "" or b.config == want_conf_stripped) then
+      active_bucket = b
+      break
+    end
+  end
+  if not active_bucket then
+    -- Fall back to whichever bucket has the most entries.
+    local best_count = -1
+    for _, b in pairs(buckets) do
+      if #b.entries > best_count then
+        active_bucket, best_count = b, #b.entries
+      end
+    end
+  end
 
-  progress("encode", 85, string.format("encoding cdb (%d entries)...", #entries))
+  progress("shaders", 80, "augmenting active shard with shader entries...")
+  active_bucket.entries = augment_compile_commands_table_with_shaders(
+    ctx, active_bucket.entries, progress)
+
+  -- Write every bucket to its shard file + update manifest.
+  progress("shards", 85, "writing per-config shards...")
+  local active_key = nil
+  CORE_RT.trace_seg("ccjson.write_shards", function()
+    for _, b in pairs(buckets) do
+      local roots = {}
+      for r, _ in pairs(b.roots) do roots[#roots + 1] = r end
+      local k = shards_mod.write_shard(ctx, b.platform, b.target, b.config, b.entries, roots)
+      if b == active_bucket then active_key = k end
+    end
+  end)
+
+  -- Ensure manifest.active reflects the bucket clangd should consume.
+  if active_key then
+    local manifest = shards_mod.read_manifest(ctx)
+    manifest.active = active_key
+    shards_mod.write_manifest(ctx, manifest)
+  end
+
+  -- Merge all shards (priority dedup) → final top-level CDB.
+  progress("merge", 90, "merging shards into top-level CDB...")
+  local merged, stats = CORE_RT.trace_seg("ccjson.merge", function()
+    return shards_mod.merge_shards(ctx)
+  end)
+  CORE_RT.trace_mark(string.format(
+    "ccjson.merge in=%d out=%d dropped=%d shards=%d active=%s",
+    stats.total_in, stats.total_out, stats.dropped, stats.shard_count,
+    stats.active or "(none)"))
+
   local json_content = CORE_RT.trace_seg("ccjson.encode", function()
-    return vim.json.encode(entries)
+    return vim.json.encode(merged)
   end)
 
   local targets = compile_commands_targets(ctx)
   local preferred = targets[1]
-  progress("write", 90, string.format("writing cdb (%.1f MB x %d)...", #json_content / 1048576, #targets))
+  progress("write", 92, string.format("writing cdb (%.1f MB x %d)...", #json_content / 1048576, #targets))
   CORE_RT.trace_seg("ccjson.write", function()
     for _, target in ipairs(targets) do
       write_all(target, json_content)
     end
   end)
-  progress("done", 95, string.format("cdb written: %d entries", #entries))
+  progress("done", 95, string.format("cdb written: %d entries (active=%s)", #merged, active_key or "?"))
 
-  return #entries, preferred
+  return #merged, preferred
 end
 
 end -- do block

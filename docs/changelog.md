@@ -44,6 +44,130 @@ keep this file rolling forward as the unreleased section.
 
 ---
 
+### 2026-05-18 — 把 build_pch.bat 合进 UEPrepare（⛔ 已回滚 — 方向错）
+
+**Task** 用户在 UEProj engine 打开 MGRasterizer.cpp，第 1 行
+`unknown class name 'FGlobalShader'` fatal + 7 个 cascade diag。当时
+误诊为"`.pch` 二进制不存在 → clangd 没 PCH 上下文 → 报错"，按这个错误
+诊断写了把 `build_pch.bat` 合进 `:UEPrepare` pipeline 的方案。
+
+**Implemented**（已**全部回滚**，不在生效代码中；下方仅记录被回滚的 5 处）
+- `lua/ue/cdb/pipeline.lua` `M.run` 加 `opts.skip_restart` → 已回滚
+- `lua/ue.lua` `CORE_RT.build_pch_async` + `_pch_cache_fresh` → 已删
+- `lua/ue.lua` `run_compile_commands_pipeline` 加 `ctx` 参数 → 已回滚
+- `lua/ue.lua` 6 个调用点传 `ctx` → 已全部恢复
+- `lua/ue.lua` `:UEBuildPCH` 改 thin wrapper → 已恢复原 body
+
+**Pitfalls / Gotchas**（教训本身）
+- **用户试用反馈**：电脑卡死。build_pch.bat 默认串行编 24 个 PCH，
+  SharedPCH.Engine 一个就 8633 文件 + clang++ 满载几十分钟。jobstart
+  没带 `START /LOW` 优先级，桌面交互全干掉。
+- **用户提的关键质疑（一击致命）**：rsp 里已经能精确提取每个 TU 的所有
+  header（通过 `-include SharedPCH.h` 文本路径），clangd 拿到这个 token
+  就能 parse 整条 PCH 头链（验证：`SharedPCH.Engine.ShadowErrors.h` →
+  `EngineSharedPCH.h` L580 `#include "GlobalShader.h"` ✓）。`.pch` 二进制
+  **仅是性能优化**，不是正确性必备。我把 .pch 当成"必备依赖"是误判了
+  `prebuild_pch_v2.py` 的语义。
+- **真根因下面单独写一条**。回滚后跑 `nvim --headless +'lua
+  pcall(require,"ue")' +q` → `LOADED_OK`；`require("ue.cdb.pipeline")` →
+  `PIPELINE_OK`；grep 0 残留 `build_pch_async / _pch_cache_fresh /
+  skip_restart`；0 CR。
+
+**Validation**
+- 回滚后所有文件 headless require OK，无残留符号。
+
+**Follow-ups**
+- 真根因 + 修复见同日下一条 changelog 条目。
+- 失败方案归档 plan：`.hermes/plans/2026-05-18_120000-wire-build-pch-into-ueprepare.md`
+  顶部已标 ABANDONED + superseded by 下面那份新 plan。
+- 后续如果还想做 PCH 优化（手动可选），方案必须用 `START /LOW /WAIT`
+  限优先级 + 限并发 + 让用户主动触发，**绝不**进 `:UEPrepare` 默认链路。
+
+---
+
+### 2026-05-18 — 真根因：prebuild_pch_v2 删了 -include 文本头（✅ 已落地 + 验证）
+
+**Task** 回滚错方向后，正面查 `FGlobalShader unknown class` 的真根因。
+
+**Diagnosis**
+对比 cdb 四个阶段产物里 MGRasterizer.cpp 的 entry：
+
+| 阶段 | -include | -include-pch |
+|---|---|---|
+| pre-pch.bak（prebuild_pch_v2 之前） | `..\Intermediate\..\SharedPCH.Engine.ShadowErrors.h` + `..\Intermediate\..\Definitions.Renderer.h` | (空) |
+| pre-unify.bak（prebuild_pch_v2 之后） | `..\Intermediate\..\Definitions.Renderer.h`（**SharedPCH 没了**） | `D:/.../.cache/.../SharedPCH...pch` |
+| current | `E:\proj\other_project_dev\..\Definitions.Renderer.h`（**错指别项目**） | （同上，但 .pch 文件不存在）|
+
+**两个独立 bug**:
+
+1. **本条主线**：`tools/prebuild_pch_v2.py` L383-415，三种 PCH 引用形式
+   （`-include X.h` / `/Yu<X.h>` / `/Yu X.h`）都是 **replace 不是 append** —
+   注入 `-include-pch X.pch` 时**删了**原 `-include X.h`。设计假设
+   "用户会跑 :UEBuildPCH 把 .pch 编出来"。一旦 .pch 不存在（绝大多数
+   情况），clangd 静默跳过 `-include-pch`，又没有原 `-include` 文本头
+   做 fallback → SharedPCH 的 600+ header（包括 GlobalShader.h）一个都
+   没拉进来 → FGlobalShader 找不到。
+2. **顺带发现**：`tools/resolve_cdb_paths.py` 把 `..\Intermediate\..`
+   相对路径 resolve 到了 `E:\proj\other_project_dev`（完全不同的盘符 +
+   项目）。cdb directory 是 `D:/project/UnrealEngine/Engine/Source`，按
+   定义该 resolve 到 `D:/project/UnrealEngine/...`。说明 resolve 有
+   跨项目搜索 fallback 漏。**这是另一个独立 bug**，本条不修，单独跟。
+
+**Fix plan**（✅ 已落地）
+- `prebuild_pch_v2.py` 改 replace → append：保留原 `-include SharedPCH.h`，
+  追加 `-include-pch SharedPCH.pch`。两者共存，幂等。
+  - .pch 存在 → clangd 用 mmap preamble（性能 OK）
+  - .pch 不存在 → clangd fallback 到文本 -include（正确性 OK，性能差）
+  - `.pch` 退化为纯优化，不再是正确性依赖。
+- `:UEBuildPCH` 保留为**纯手动可选**入口，从不进 `:UEPrepare`。
+- plan: `.hermes/plans/2026-05-18_160000-fix-prebuild-pch-preserve-include.md`
+
+**Pitfalls / Gotchas**
+- 修 prebuild_pch_v2 必须**幂等**：重复跑不能重复 append。识别条件
+  "args 里同时有 `-include X.h` 和 `-include-pch X.pch`，且 X 对得上"
+  → skip。已实现：扫 `-include-pch <pch_path>` 时 ±2 邻域查 `-include
+  <original_header>` 命中即跳过 entry。
+- /Yu form 没有原生 `-include`，要从 original_header 反构一个 `-include
+  <header>` 注入，注入位置需与 -include-pch 紧邻便于幂等检测。
+- pipeline 顺序：`expand_response_cdb → prebuild_pch_v2 → resolve_cdb_paths
+  → unify_include_dirs → prune_include_dirs`。光跑 prebuild_pch_v2 不够，
+  clangd 见不到 absolute path 会静默 0 diag（误读为"修好了"）。验证时
+  必须跑完整条 pipeline。
+
+**Validation**（✅ 已做）
+- direct clangd probe（自研一次性脚本 `clangd_probe.py`，不依赖 nvim
+  实例，spawn clangd 直接发 LSP）：
+  - **Baseline**（pre-pch.bak 原始 cdb 走完旧 pipeline）：8 diag / 8 errs
+    含 `L1 unknown class FGlobalShader` fatal + `Too many errors` + 5
+    cascade (`L174/L251/L399/L497/L565`)
+  - **A-fix**（fixed prebuild_pch_v2 走完完整 pipeline）：2 diag / 2 errs
+    - `L1 FGlobalShader` ✓ 消失
+    - `Too many errors` ✓ 消失
+    - `L174 Create does not match` ✓ 消失
+    - `L251 No matching AddPass` ✓ 消失
+    - `L399 GetRHI no member` ✓ 消失
+    - `L565 member_call_without_object` ✓ 消失
+    - 仅剩 `L497 RenderMetaGeometry does not match` (真业务 error，
+      与 SharedPCH 无关，源码声明/定义不一致)
+    - 新增 `L3 Eigen/Dense not found`（prune_include_dirs 过度修剪，
+      另起 plan 调查）
+- **幂等性测试** ✅：在已 fixed 的 cdb 上重跑 prebuild_pch_v2 → 输出
+  "No changes needed — PCH already applied / 替换了 0 个条目"，
+  args 计数 / -include / -include-pch 完全不变。
+- **共存兼容性测试** ✅：同 entry 同时含 `-include SharedPCH.h` +
+  `-include-pch <不存在的 .pch>` → clangd 不报错，静默走文本 fallback。
+  证伪了"两者共存会冲突"的担心。
+
+**Follow-ups**
+- 另起 plan 调查 `resolve_cdb_paths.py` 跨项目漏出去的根因
+  （cdb directory 明确是 D:/，怎么 resolve 出 E:/ 的）。
+- 另起 plan 调查 `prune_include_dirs.py` 把 Eigen/Dense 的 -I 剪掉。
+- 旧 plan `2026-05-15_111637-pch-per-platform-isolation.md`（PCH 按
+  platform 隔离）部分相关：那份假设的也是 ".pch 需要存在"，重新评估时
+  也要考虑 ".pch 是纯优化"这个事实。
+
+---
+
 ### 2026-05-15 — 治本修 clangd LSP 对 UE .h / PCH-cpp 的结构性盲点
 
 **任务**

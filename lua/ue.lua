@@ -2627,6 +2627,134 @@ INDEX_FN.promote_active_index = function(ctx, src_path)
   return write_all(ctx.paths.active_index, content)
 end
 
+-- Keep `<engine_root>/.clangd`'s `Index.External.File` /
+-- `Index.External.MountPoint` lines in sync with the authoritative
+-- `cache_paths(engine_root).active_index` path. Called from the success
+-- branch of build_phase_async right after promote_active_index, before
+-- the LspRestart, so the restarted clangd reads the corrected file.
+--
+-- Surgical: only the `Index.External.{File,MountPoint}` keys are touched
+-- (or an `Index:` block is appended if absent). All other content
+-- (CompileFlags `/vctoolsdir` MSVC pin, Diagnostics, comments, etc.)
+-- is preserved byte-for-byte. Idempotent: re-running with the same
+-- paths is a no-op (no write, no clangd restart amplification).
+--
+-- Why this lives here: the v3 cache migration moved idx from
+-- `<root>/.clangd-index/` to `<root>/.cache/nvim-ue/clangd/index/`, but
+-- nobody rewrote existing `.clangd` files. Result: clangd silently fell
+-- back to `--background-index`, burning 17 GB RAM / 32 min CPU per cold
+-- open. The hot/full/current pipeline is now responsible for keeping
+-- `.clangd` honest.
+INDEX_FN.sync_dot_clangd = function(ctx)
+  if not ctx or not ctx.engine_root or ctx.engine_root == "" then
+    return false, "no engine_root"
+  end
+  local idx_path = ctx.paths and ctx.paths.active_index
+  if not idx_path or idx_path == "" then
+    return false, "no active_index path"
+  end
+  local clangd_path = ctx.engine_root .. "/.clangd"
+
+  -- Native-slashes on Windows for consistency with how UBT writes paths
+  -- elsewhere in the cdb. clangd accepts both, but pinning one form lets
+  -- a textual diff stay clean across runs.
+  local function native(p)
+    if _uplat.is_windows then
+      return (p:gsub("/", "\\"))
+    end
+    return p
+  end
+  local want_file = native(idx_path)
+  local want_mount = native(ctx.engine_root)
+
+  local existing = ""
+  if _ufs.is_file(clangd_path) then
+    existing = read_all(clangd_path) or ""
+  end
+
+  local new_content
+  if existing == "" then
+    -- No .clangd at all → write a minimal one. Background: Skip is
+    -- required since we have an external idx and don't want clangd
+    -- redoing the work.
+    new_content = table.concat({
+      "Index:",
+      "  External:",
+      "    File: " .. want_file,
+      "    MountPoint: " .. want_mount,
+      "  Background: Skip",
+      "",
+    }, "\n")
+  else
+    -- Find Index: block. If present, edit its External sub-block in place.
+    -- If absent, append a fresh Index: block.
+    local has_index = existing:match("\n?Index:%s*\n") or existing:match("^Index:%s*\n")
+    if has_index then
+      -- Replace `    File: ...` / `    MountPoint: ...` lines under
+      -- `  External:` if present; inject an External: sub-block if not.
+      local has_external = existing:match("\n%s*External:%s*\n") or existing:match("^%s*External:%s*\n")
+      if has_external then
+        -- gsub a single line at a time: tolerate any leading-whitespace
+        -- indent, replace the trailing value.
+        local edited = existing
+        -- File: ...
+        local file_replaced
+        edited, file_replaced = edited:gsub("(\n%s*External:[^\n]*\n[^\n]-\n?)(%s*)File:%s*[^\n]*", function(prefix, indent)
+          return prefix .. indent .. "File: " .. want_file
+        end, 1)
+        if file_replaced == 0 then
+          -- External: existed but had no File: line; inject after External:
+          edited = edited:gsub("(\n)(%s*)External:%s*\n", function(nl, indent)
+            return nl .. indent .. "External:\n" .. indent .. "  File: " .. want_file .. "\n" .. indent .. "  MountPoint: " .. want_mount .. "\n"
+          end, 1)
+        else
+          -- MountPoint: ...
+          local mp_replaced
+          edited, mp_replaced = edited:gsub("(\n%s*External:[^\n]*\n[^\n]-\n?)(%s*)MountPoint:%s*[^\n]*", function(prefix, indent)
+            return prefix .. indent .. "MountPoint: " .. want_mount
+          end, 1)
+          if mp_replaced == 0 then
+            -- File: was replaced but no MountPoint: line; inject right after File:
+            edited = edited:gsub("(%s*)File:%s*" .. want_file:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1"), function(indent)
+              return indent .. "File: " .. want_file .. "\n" .. indent .. "MountPoint: " .. want_mount
+            end, 1)
+          end
+        end
+        new_content = edited
+      else
+        -- Index: exists but no External: sub-block. Inject one right
+        -- after the Index: header line.
+        new_content = existing:gsub("(\n?)(Index:%s*\n)", function(nl, hdr)
+          return nl .. hdr .. "  External:\n    File: " .. want_file .. "\n    MountPoint: " .. want_mount .. "\n  Background: Skip\n"
+        end, 1)
+      end
+    else
+      -- No Index: block at all. Append one at EOF, separated by a blank line.
+      local sep = (existing:sub(-1) == "\n") and "" or "\n"
+      new_content = existing .. sep .. "\nIndex:\n  External:\n    File: " .. want_file .. "\n    MountPoint: " .. want_mount .. "\n  Background: Skip\n"
+    end
+  end
+
+  if new_content == existing then
+    return true, "unchanged"
+  end
+
+  -- Atomic write: tmp + rename. NTFS rename is atomic; clangd never sees
+  -- a half-written file mid-read.
+  local tmp_path = clangd_path .. ".tmp." .. tostring(vim.uv.hrtime())
+  local ok = write_all(tmp_path, new_content)
+  if not ok then
+    pcall(vim.fn.delete, tmp_path)
+    return false, "tmp write failed"
+  end
+  local rn_ok, rn_err = (vim.uv or vim.loop).fs_rename(tmp_path, clangd_path)
+  if not rn_ok then
+    pcall(vim.fn.delete, tmp_path)
+    return false, "rename failed: " .. tostring(rn_err)
+  end
+  return true, "updated"
+end
+
 INDEX_FN.build_phase_async = function(ctx, phase)
   local state = ensure_index_state(ctx)
   local root_key = status_root_key(ctx)
@@ -2783,6 +2911,11 @@ INDEX_FN.build_phase_async = function(ctx, phase)
         finished_at = unix_now(),
       }
       if ok_result and INDEX_FN.promote_active_index(ctx, out_idx) then
+        -- Keep .clangd's External.File in lockstep with the freshly
+        -- promoted active_index. Without this, clangd reads a stale
+        -- pre-v3-cache-migration path and silently falls back to
+        -- --background-index (17 GB RAM / 32 min CPU symptom).
+        pcall(INDEX_FN.sync_dot_clangd, ctx)
         INDEX_FN.clear_module_dirty_flags(ctx, selected_keys)
         live_state.stats[phase .. "_runs"] = (tonumber(live_state.stats[phase .. "_runs"]) or 0) + 1
         live_state.build = {

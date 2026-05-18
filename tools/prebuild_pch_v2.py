@@ -373,6 +373,33 @@ def main():
         form = info.get("form", "clang")
         for idx in info["indices"]:
             args = data[idx]["arguments"]
+
+            # ── Idempotency check ────────────────────────────────────────
+            # After A-fix (2026-05-18), each PCH-bearing entry should carry
+            # BOTH:
+            #   -include <SharedPCH.X.ShadowErrors.h>   ← text fallback (always
+            #                                              works, drives clangd
+            #                                              correctness)
+            #   -include-pch <SharedPCH.X.ShadowErrors.pch>  ← perf optimization
+            #                                              (silently no-ops if
+            #                                              .pch missing)
+            # If we already see -include-pch pointing at our pch_path AND a
+            # neighbouring -include pointing at our original_header, this entry
+            # was already processed: skip it (re-running this script on a
+            # already-fixed cdb must be a no-op).
+            already_done = False
+            for j, a in enumerate(args):
+                if a == "-include-pch" and j + 1 < len(args) and args[j + 1] == pch_path:
+                    # look ±2 for -include <original_header>
+                    for k in range(max(0, j - 2), min(len(args), j + 3)):
+                        if args[k] == "-include" and k + 1 < len(args) and args[k + 1] == original_header:
+                            already_done = True
+                            break
+                if already_done:
+                    break
+            if already_done:
+                continue
+
             new_args = []
             skip_next = False
             replaced_this_entry = False
@@ -380,33 +407,46 @@ def main():
                 if skip_next:
                     skip_next = False
                     continue
-                # clang form: -include X.h  ->  -include-pch X.pch
+                # clang form: -include X.h  →  -include X.h  +  -include-pch X.pch
+                # (KEEP the original -include as text-include fallback; only
+                # APPEND -include-pch for perf. clangd: when .pch exists +
+                # preamble hash matches, it mmap-loads the binary and the
+                # text -include is a no-op. When .pch missing, clangd falls
+                # back to the text -include — full correctness preserved.)
                 if (form == 'clang' and a == "-include" and i + 1 < len(args)
                         and args[i + 1] == original_header
                         and not replaced_this_entry):
+                    new_args.append("-include")
+                    new_args.append(args[i + 1])  # keep original text header
                     new_args.append("-include-pch")
                     new_args.append(pch_path)
                     skip_next = True
                     modified += 1
                     replaced_this_entry = True
                     continue
-                # cl-yu joined: /Yu<path>  ->  -include-pch X.pch
-                # NB: clang-cl driver also accepts -include-pch transparently;
-                # we drop /Yu entirely since the cdb is for clangd indexing,
-                # not for clang-cl actual compilation.
+                # cl-yu joined: /Yu<path>  →  -include <X.h>  +  -include-pch X.pch
+                # NB: /Yu form has no native -include. Synthesize one from
+                # original_header so the text-fallback path also works here.
+                # (clang-cl accepts both -include and /Yu; we drop /Yu since
+                # clangd never reads a real .pch via /Yu without a matching
+                # /Fp binary anyway.)
                 if (form == 'cl-yu' and a.startswith('/Yu') and a != '/Yu'
                         and not replaced_this_entry):
                     raw = a[3:].strip().strip('"')
                     if raw == original_header:
+                        new_args.append("-include")
+                        new_args.append(original_header)
                         new_args.append("-include-pch")
                         new_args.append(pch_path)
                         modified += 1
                         replaced_this_entry = True
                         continue
-                # cl-yu split: /Yu <path>  ->  -include-pch X.pch
+                # cl-yu split: /Yu <path>  →  -include <X.h>  +  -include-pch X.pch
                 if (form == 'cl-yu-split' and a == '/Yu' and i + 1 < len(args)
                         and args[i + 1] == original_header
                         and not replaced_this_entry):
+                    new_args.append("-include")
+                    new_args.append(original_header)
                     new_args.append("-include-pch")
                     new_args.append(pch_path)
                     skip_next = True

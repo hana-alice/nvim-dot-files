@@ -54,9 +54,17 @@ keep this file rolling forward as the unreleased section.
 2. 删掉 #7 的 image-list-only inline 过滤代码（复杂、覆盖不全），统一走 `eval()` + `clamp()` 路径。三条命令（`image list -b` / `image dump symfile <lib>` / `settings show target.source-map`）行为对称。
 3. 注释明确：diag 是 one-screen 摘要不是 full dump；想看完整输出走 `:UEDAPRepl <cmd>`（将来加这命令）。
 
-**验证（pending: 用户重启 Neovide 后跑）**
+**验证（D4 实测 commit `88fad8c` 通过 ✅）**
 
-D3 attempt (PID 42176) 跑到一半 nvim 卡死 pipe 不响应，**进程没 OOM (110 MB)** 但 Windows named pipe server 失活——这是另一个独立的 nvim Win32 bug（client timeout 时 pipe server 不清理）。本 fix 防止 evaluate response 之大触发 buffer 爆涨，应该同时也能间接缓解 pipe 卡死（少量数据 buffer set lines 不会触发 vim 主 loop 长阻塞）。
+PID 44636 重启后 attach 干净，跑完整 Phase D4：
+
+- ✅ `image list -b` 真实输出 = **18,933 bytes / 584 行**（lldb-dap 22.1.6 确实接受 `-b` flag，是 brief 模式 —— #7 误判已平反）
+- ✅ `image dump symfile "libUE4.so"` 真实输出 = **252,217,134 bytes (252 MB) / 1,124,793 行** —— **就是它撑爆 #2 和 #3 的 buffer**
+- ✅ Diag buffer 总行数：**451 行**（之前 1,124,845 → 451，降 99.96%）
+- ✅ clamp 截断提示按设计出现：image list 部分 `... (truncated; 385 more lines elided)`，symfile 部分 `... (truncated; 64 more lines elided)`
+- ✅ session torn down 干净
+
+**额外发现 (单独 follow-up)**：source-map 段显示同一条映射 (`<build-host-path>` → `<local-source>`) 被注册了**两次**。lldb 解析 source 时会两次走同一映射，可能是某些情况下 source 跳错的根因之一。下一轮单独 patch（只保留一条，或在 attach_commands 里加 `settings clear target.source-map` 后再 set）。
 
 **坑**
 

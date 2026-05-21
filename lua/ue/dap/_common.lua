@@ -177,16 +177,24 @@ function M.run(config, fallback_msg)
 end
 
 -- ── codelldb (Android route) ──────────────────────────────────────────────
--- lldb-dap is the win64/linux/mac/ios route. Android specifically uses
--- vadimcn/codelldb because:
---   * Windows host + Android lldb-server `gdbserver --attach` + lldb-dap
---     21.x crashes on first setBreakpoints (LLVM #102254 / #138096).
---   * Pure gdb-remote-port mode in lldb-dap doesn't enumerate modules over
---     Android (LLVM #126935), leaving every breakpoint unverified.
---   * codelldb's `request:"custom"` exposes ordered targetCreateCommands /
---     processCreateCommands that map 1:1 to a known-good bare-lldb sequence.
--- See docs/plans/2026-05-13_123500-android-aslike-nvim-ide-route.md for
--- the full empirical write-up.
+-- lldb-dap is the win64/linux/mac/ios route. Android currently uses
+-- vadimcn/codelldb. As of 2026-05-21, lldb-dap 22.1.6 was thought to be
+-- unworkable for UE Android because BP plant 100% hung. THAT WAS WRONG.
+-- The hang was a self-inflicted symptom of `process handle SIGSEGV
+-- --notify true` (see android.lua:545-547): on a UE process with hundreds
+-- of threads + ART's implicit-null-check SIGSEGVs, lldb-dap emits one
+-- DAP "stopped" event per signal per thread, flooding the stdout pipe
+-- and killing the adapter (Errno 22 on Windows). codelldb does not crash
+-- because it throttles/coalesces these events internally.
+--
+-- Confirmed fix: set `--notify false` on SIGSEGV/SIGBUS. lldb-dap 22.1.6
+-- then attaches AND plants setFunctionBreakpoints AND verifies them
+-- (probe_bp_v12.py in /c/tools/lldb-22/, stable across runs).
+--
+-- Migration to lldb-dap is therefore unblocked but not yet wired in:
+-- want a single Android adapter, and the user prefers minimal risk
+-- while codelldb works. See sessions/ue-dap-lldb-dap-migration.md and
+-- skill lldb-dap-22-platform-mode-breakpoint-crash for the full story.
 
 --- Resolve a codelldb adapter executable.
 --- Returns the first readable file path, or nil.

@@ -360,6 +360,31 @@ map("n", "<leader>dh", "<cmd>UEDAPHover<cr>",            { desc = "DAP: Hover (e
 map("v", "<leader>dh", ":UEDAPHover<cr>",                { desc = "DAP: Hover (eval selection)" })
 map("n", "<leader>dw", "<cmd>UEDAPWatchAdd<cr>",         { desc = "DAP: Add cword to Watches" })
 map("v", "<leader>dw", ":UEDAPWatchAdd<cr>",             { desc = "DAP: Add selection to Watches" })
+-- UE-aware watch templates: prompt for template type via vim.ui.select,
+-- then use cword as the expression (or the visual selection in visual mode).
+-- Press <leader>dW on an identifier → pick fname/uobject/actor/tarray/raw.
+local function _ue_dap_watch_picker()
+  local templates = { "fname", "uobject", "actor", "tarray", "raw" }
+  local mode = vim.api.nvim_get_mode().mode
+  local expr
+  if mode == "v" or mode == "V" or mode == "\22" then
+    vim.cmd('noautocmd silent normal! "zy')
+    expr = vim.fn.getreg("z"):gsub("[\r\n]+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+  else
+    expr = vim.fn.expand("<cword>")
+  end
+  if not expr or expr == "" then
+    vim.notify("[ue.dap] no expression under cursor", vim.log.levels.WARN)
+    return
+  end
+  vim.ui.select(templates, {
+    prompt = "UE Watch template for `" .. expr .. "`:",
+  }, function(choice)
+    if choice then vim.cmd(("UEDAPWatchUE %s %s"):format(choice, expr)) end
+  end)
+end
+map("n", "<leader>dW", _ue_dap_watch_picker, { desc = "DAP: UE-aware watch (picker)" })
+map("v", "<leader>dW", _ue_dap_watch_picker, { desc = "DAP: UE-aware watch (picker, selection)" })
 map("n", "<leader>dt", "<cmd>UEDAPRunToCursor<cr>",      { desc = "DAP: Run to cursor" })
 map("n", "<leader>dk", "<cmd>UEDAPFrameUp<cr>",          { desc = "DAP: Stack frame up" })
 map("n", "<leader>dj", "<cmd>UEDAPFrameDown<cr>",        { desc = "DAP: Stack frame down" })

@@ -529,6 +529,8 @@ local tabs = {
           { "<leader>dh",   "Hover eval (cword / selection)" },
           { "<leader>de",   "Evaluate expression (prompt)" },
           { "<leader>dw",   "Add cword / selection to Watches" },
+          { "<leader>dW",   "UE-aware watch picker (fname/uobject/actor/tarray)" },
+          { ":UEDAPWatchUE", "fname|uobject|actor|tarray|raw <expr>" },
           { "<leader>dt",   "Run to cursor" },
           { "<leader>dk",   "Stack frame up" },
           { "<leader>dj",   "Stack frame down" },

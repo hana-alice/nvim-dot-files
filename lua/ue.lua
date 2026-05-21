@@ -8475,6 +8475,11 @@ M.dap_list_breakpoints = dap_mod.dap_list_breakpoints
 M.dap_hover = dap_mod.dap_hover
 M.dap_eval_prompt = dap_mod.dap_eval_prompt
 M.dap_add_watch_cword = dap_mod.dap_add_watch_cword
+M.dap_watch_template = dap_mod.dap_watch_template
+M.dap_watch_fname = dap_mod.dap_watch_fname
+M.dap_watch_uobject = dap_mod.dap_watch_uobject
+M.dap_watch_actor = dap_mod.dap_watch_actor
+M.dap_watch_tarray = dap_mod.dap_watch_tarray
 M.dap_run_to_cursor = dap_mod.dap_run_to_cursor
 M.dap_frame_up = dap_mod.dap_frame_up
 M.dap_frame_down = dap_mod.dap_frame_down
@@ -8942,6 +8947,21 @@ function M.setup()
   vim.api.nvim_create_user_command("UEDAPEval",            function() M.dap_eval_prompt() end, { desc = "DAP: Evaluate expression (prompt)" })
   vim.api.nvim_create_user_command("UEDAPWatchAdd",        function() M.dap_add_watch_cword() end,
     { desc = "DAP: Add cword/selection to Watches", range = true })
+  vim.api.nvim_create_user_command("UEDAPWatchUE", function(opts)
+    -- Args: <type> [expression]. If expression omitted, use cword/visual.
+    -- type one of: fname uobject actor tarray raw
+    local args = opts.fargs or {}
+    local template = args[1] or ""
+    local expr = #args >= 2 and table.concat(args, " ", 2) or ""
+    M.dap_watch_template(template, expr)
+  end, {
+    nargs = "+",
+    range = true,
+    complete = function(_arg_lead, _cmd_line, _cursor_pos)
+      return { "fname", "uobject", "actor", "tarray", "raw" }
+    end,
+    desc = "DAP: Add UE-aware watch (fname/uobject/actor/tarray/raw)",
+  })
   vim.api.nvim_create_user_command("UEDAPRunToCursor",     function() M.dap_run_to_cursor() end, { desc = "DAP: Run to cursor" })
   vim.api.nvim_create_user_command("UEDAPFrameUp",         function() M.dap_frame_up() end, { desc = "DAP: Stack frame up" })
   vim.api.nvim_create_user_command("UEDAPFrameDown",       function() M.dap_frame_down() end, { desc = "DAP: Stack frame down" })

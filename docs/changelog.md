@@ -44,6 +44,39 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-05-21 (later #6) — feat(dap): UE-aware watch templates + 扩展 native type summary
+
+**Task** 接着 #3 的 FString native fallback，把无 Python 时能用纯字符串模板表达的 UE 类型全部加上 (`FVector`/`FVector2D`/`FVector4`/`FIntVector`/`FRotator`/`FQuat`/`FColor`/`FLinearColor`/`FBox`/`TArray<*>`/`TWeakObjectPtr<*>`/`TSharedPtr<*>`/`TSharedRef<*>`)，并为需要调函数的 `FName`/`UObject*`/`AActor*` 提供 **预制 watch expression 包装**（通过 `:UEDAPWatchUE` + `<leader>dW` 选 picker）。
+
+**改动**
+
+1. `lua/ue/dap/android.lua` `init_commands` 的 `not has_python` 分支：从只有 FString 一条扩到 14 条 native summary（`type summary add -w UEFallback ...`），覆盖 UE 最常见的数学/容器类型；`-x "^TArray<.+>$"` 走 regex 一次性覆盖所有 `TArray<T>` 实例化。
+2. `lua/ue/dap.lua` 新增：
+   - `_dap_watch_push(expr)` 内部 helper：去掉换行/前后空白、走 `dapui.elements.watches.add()`，dapui 不可用时 notify 退出。
+   - `dap_watch_fname(expr)` / `dap_watch_uobject(expr)` / `dap_watch_actor(expr)` / `dap_watch_tarray(expr)` 四个 UE 专属 watch helper，把 "我每次都要看 X 的 Y" 模式预制好（FName→`ToString()`；UObject→`GetClass()->GetName()`+`GetName()`；AActor 再加 `GetActorLocation()`；TArray→raw + 前 4 个元素）。每个 helper 都 `_require_session()` 守门。
+   - `dap_watch_template(template, expr)` 统一 dispatcher：未知模板名打 warn 但 fallback 成 raw watch（不静默吞）。
+3. `lua/ue.lua` re-export 5 个新函数 + 注册 `:UEDAPWatchUE <type> [expr]` user command (nargs=+, complete 列出 `fname|uobject|actor|tarray|raw`)。
+4. `lua/config/keymaps.lua` 加 `<leader>dW` (normal + visual)：local helper `_ue_dap_watch_picker` 用 `vim.ui.select` 弹模板选项 + 把 cword/visual selection 作为 expr 拼成 `:UEDAPWatchUE ...`。
+5. `lua/utils/cheatsheet.lua` DAP Inspect/Navigate 段补 `<leader>dW` + `:UEDAPWatchUE`。
+
+**验证**
+
+- Headless：`require('ue.dap')` 加载，`dap_watch_template/fname/uobject/actor/tarray/_dap_watch_push` 全部 `function`。
+- 真 nvim (PID 12312) hot-reload：`:UEDAPWatchUE` 注册 ✓；`<leader>dW` normal + visual 都拿到 callback；`dap_watch_template('raw','MyVar')` → push `MyVar`；`dap_watch_template('UNKNOWN_TYPE','OtherVar')` → push `OtherVar` + warning notify（fallback 设计正确，不静默吞）。
+- `_lldb_dap_attach_config_for_test` 抓出来 `initCommands` 含 14 条 `type summary add -w UEFallback` 全部出现。
+
+**坑**
+
+- `vim.fn.maparg(lhs, mode, false, true)` 在 keymap 有 callback function 时返回的 dict 含 function reference → pynvim msgpack `Cannot convert given Lua type`。换 `vim.api.nvim_get_keymap('n')` 过滤 lhs（API 返回 `has_callback` 标志 + 字符串 desc，全部可序列化）。
+- `<leader>dW` 加进 keymaps.lua 后单纯 `require('ue').setup()` reload 不触发新 mapping，因为 keymaps.lua 不属于 `ue.*` 模块树。修复 = `dofile(stdpath('config') .. '/lua/config/keymaps.lua')` 重新执行（生产环境用户重启 nvim 即可）。
+- `FName::ToString()` / `UObject->GetName()` 这些 watch 模板要求 inferior 有这些符号且未被 inline 优化掉 — Development build OK，Shipping 失败时 watch 显示 `error: ...` 而不是崩；可接受降级。
+- TArray `(expr).GetData()[i]` 写 watches 而不是 `(expr)[i]` 的原因：UE 的 `TArray::operator[]` 在某些版本会调 `RangeCheck()`，watches 评估 abort；`GetData()` 拿裸指针下标更安全。
+
+**Follow-up**
+
+- attach 状态下实测 FVector/TArray 这些 native summary 是不是真展开（无 session 只能验证字符串被发出，没法验 lldb-dap 真接受 `-x` regex 模式 + 复合 `${var.Min.X}` 嵌套引用）。
+- `FName::ToString()` 在 Shipping 下到底是怎么炸的 — 看 watch 报错信息，必要时加注释告知用户。
+
 ### 2026-05-21 (later #5) — feat(dap): UEDAPDiag 充实成五段式诊断面板
 
 **Task** 上一版 `:UEDAPDiag` 只跑 3 条 lldb 命令 (`image list` / `image dump symfile` / `source-map`)，且 **要求有 active session**，没 session 直接 `notify("No DAP session")` 退出。但绝大多数"为什么 attach 不上"的诊断需求恰恰发生在 **没有 session** 的时候。重写成五段式：无 session 也能跑，有 session 则附加 lldb 内省段。

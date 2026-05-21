@@ -508,6 +508,38 @@ function D.android_dap_launch(_opts)
   android.launch({ context = ctx })
 end
 
+--- Reattach to the last-known Android session (same pkg/serial/symbol_lib,
+--- fresh pid). Used after the app crashes / is killed / hot-reloads and
+--- the liveness poller has auto-detached. No prompts on success path.
+function D.android_dap_reattach()
+  local ok, android = pcall(require, "ue.dap.android")
+  if not ok then
+    require("utils.log").notify_error("dap", "ue.dap.android not loadable")
+    return
+  end
+  if type(android.reattach) ~= "function" then
+    vim.notify("[dap] reattach not available in this build", vim.log.levels.WARN)
+    return
+  end
+  android.reattach()
+end
+
+--- Print a one-line summary of the current Android DAP session: package,
+--- serial, pid, port, libUE4 base, liveness poller state. Cheap probe so
+--- the user can sanity-check the wire without diving into :messages.
+function D.android_dap_status()
+  local ok, android = pcall(require, "ue.dap.android")
+  if not ok then
+    require("utils.log").notify_error("dap", "ue.dap.android not loadable")
+    return
+  end
+  if type(android.status) == "function" then
+    android.status()
+  else
+    vim.notify("[dap] status not available in this build", vim.log.levels.WARN)
+  end
+end
+
 -- ─────────────────────────────────────────────────────────────────────
 -- setup_dap — wire dap-ui listeners, logcat, source-path rewrite,
 -- scope filter, VimLeavePre cleanup. Called by lua/plugins/dap.lua.

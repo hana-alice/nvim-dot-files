@@ -62,6 +62,25 @@ local function reset_session()
   M._session.port = 5045
 end
 
+-- ── reattach memory ───────────────────────────────────────────────────────
+-- Snapshot of the last successful session, kept across stop() so that
+-- :UEDAPReattach can replay pkg/serial/symbol_lib without re-prompting.
+M._last_session = nil
+
+local function snapshot_last_session()
+  local s = M._session
+  if not (s.package_name and s.serial and s.symbol_lib) then return end
+  M._last_session = {
+    package_name      = s.package_name,
+    serial            = s.serial,
+    symbol_lib        = s.symbol_lib,
+    lldb_server_local = s.lldb_server_local,
+    source_map        = s.source_map,
+    engine_root       = s.engine_root,
+    adb               = s.adb,
+  }
+end
+
 -- ── config helpers ────────────────────────────────────────────────────────
 
 local function ue_cfg_get(key)
@@ -232,15 +251,88 @@ local function adb_run(adb, args)
   return (out or ""):gsub("[\r\n]+$", "")
 end
 
-local function pick_serial(adb)
-  local out = adb_run(adb, { "devices" })
+-- Parse `adb devices` into { {serial, status, model?}, ... }.
+-- status ∈ { "device", "unauthorized", "offline", "no permissions", ... }
+local function list_devices(adb)
+  local out = adb_run(adb, { "devices", "-l" })
+  local rows = {}
   for line in out:gmatch("[^\n]+") do
-    local serial, status = line:match("^(%S+)%s+(%S+)$")
-    if serial and status == "device" and serial ~= "List" then
-      return serial
+    if not line:match("^List of devices") and line ~= "" then
+      local serial, status, rest = line:match("^(%S+)%s+(%S+)%s*(.*)$")
+      if serial and status and serial ~= "List" then
+        local model = rest and rest:match("model:(%S+)") or nil
+        rows[#rows + 1] = { serial = serial, status = status, model = model }
+      end
     end
   end
+  return rows
+end
+
+-- Resolve the adb serial to use for this session.
+-- Behavior (per user policy "多设备你给我选,不要自己决定"):
+--   * 0 ready devices  → notify + nil (with hints for unauthorized/offline)
+--   * 1 ready device   → return it silently
+--   * >1 ready devices → vim.ui.select, ALWAYS prompt, never cache a default
+-- `done(serial|nil)` is called with the picked serial or nil on cancel/empty.
+-- Returns the serial synchronously when possible (0 or 1 device); for the
+-- multi-device case it returns nil and dispatches `done` asynchronously.
+local function pick_serial_async(adb, done)
+  local rows = list_devices(adb)
+  local ready, not_ready = {}, {}
+  for _, r in ipairs(rows) do
+    if r.status == "device" then ready[#ready + 1] = r
+    else not_ready[#not_ready + 1] = r end
+  end
+
+  if #ready == 0 then
+    if #not_ready > 0 then
+      local parts = {}
+      for _, r in ipairs(not_ready) do
+        local hint = r.status
+        if r.status == "unauthorized" then
+          hint = "unauthorized (tap 'Allow USB debugging' on device)"
+        elseif r.status == "offline" then
+          hint = "offline (try `adb kill-server && adb devices`)"
+        end
+        parts[#parts + 1] = string.format("  %s  %s", r.serial, hint)
+      end
+      vim.notify("No ready Android device. Detected:\n" .. table.concat(parts, "\n"),
+        vim.log.levels.WARN)
+    else
+      vim.notify("No Android device found in `adb devices`.\n" ..
+        "Connect a device with USB debugging enabled.", vim.log.levels.WARN)
+    end
+    done(nil)
+    return nil
+  end
+
+  if #ready == 1 then
+    done(ready[1].serial)
+    return ready[1].serial
+  end
+
+  -- Multi-device: ALWAYS prompt. No silent default.
+  local items = {}
+  for _, r in ipairs(ready) do items[#items + 1] = r end
+  vim.ui.select(items, {
+    prompt = "Select Android device for DAP attach:",
+    format_item = function(r)
+      if r.model then return ("%s  [%s]"):format(r.serial, r.model) end
+      return r.serial
+    end,
+  }, function(choice)
+    done(choice and choice.serial or nil)
+  end)
   return nil
+end
+
+-- Sync wrapper retained for tests/legacy callers that don't expect async.
+-- For the multi-device case this returns nil; production code MUST use
+-- pick_serial_async via bootstrap_session (which is already async-friendly).
+local function pick_serial(adb)
+  local picked
+  pick_serial_async(adb, function(s) picked = s end)
+  return picked
 end
 
 local function pidof(adb, serial, pkg)
@@ -496,6 +588,11 @@ function M.stop_android_debugger(opts)
   opts = opts or {}
   local result = { disconnected = false, adapter_killed = false, orphan_killed = 0 }
 
+  -- Stop the liveness poller FIRST so it can't race with reset_session.
+  if M._stop_liveness_poller then pcall(M._stop_liveness_poller) end
+  -- Remember session for :UEDAPReattach BEFORE reset_session wipes it.
+  snapshot_last_session()
+
   local ok_dap, dap = pcall(require, "dap")
   if ok_dap and dap and dap.session and dap.session() then
     pcall(function()
@@ -550,6 +647,8 @@ end
 -- disconnect). MUST NOT issue another `disconnect` — see _cleanup_device_side
 -- comment. Only releases device-side resources and clears local state.
 function M.cleanup(_session_state)
+  if M._stop_liveness_poller then pcall(M._stop_liveness_poller) end
+  snapshot_last_session()
   M._cleanup_device_side()
   reset_session()
   return { device_cleaned = true }
@@ -557,7 +656,7 @@ end
 
 -- ── public: attach / launch ───────────────────────────────────────────────
 
-local function bootstrap_session(opts)
+local function bootstrap_session(opts, on_ready)
   opts = opts or {}
   local ctx = opts.context
   local P = require("ue.dap._progress")
@@ -569,38 +668,49 @@ local function bootstrap_session(opts)
 
   P.step("1/6  picking package …")
   local pkg = pick_package(ctx)
-  if not pkg then P.hide(); return nil end
+  if not pkg then P.hide(); on_ready(false); return end
   sess.package_name = pkg
 
   P.step("2/6  picking device …")
-  local serial = (ctx and ctx.android_serial) or pick_serial(sess.adb)
-  if not serial then
-    P.error("no device in `adb devices`")
-    return nil
-  end
-  sess.serial = serial
-
-  P.step("3/6  locating lldb-server …")
-  local server_src = pick_lldb_server()
-  if not server_src then P.hide(); return nil end
-  sess.lldb_server_local = server_src
-
-  P.step("4/6  picking symbol lib …")
-  local sym = pick_symbol_lib(ctx)
-  if not sym then P.hide(); return nil end
-  sess.symbol_lib = sym
-
-  sess.source_map = pick_source_map(ctx)
-
-  P.step("5/6  pushing lldb-server to device …")
-  local ok_push, push_msg = ensure_lldb_server_in_app(sess.adb, serial, pkg, server_src)
-  if not ok_push then
-    P.error("lldb-server bootstrap failed: " .. tostring(push_msg))
-    log.notify_error("dap.android", "lldb-server bootstrap failed: " .. push_msg)
-    return nil
+  if ctx and ctx.android_serial then
+    sess.serial = ctx.android_serial
   end
 
-  return true
+  local function after_serial(serial)
+    if not serial then
+      P.error("no device selected")
+      on_ready(false); return
+    end
+    sess.serial = serial
+
+    P.step("3/6  locating lldb-server …")
+    local server_src = pick_lldb_server()
+    if not server_src then P.hide(); on_ready(false); return end
+    sess.lldb_server_local = server_src
+
+    P.step("4/6  picking symbol lib …")
+    local sym = pick_symbol_lib(ctx)
+    if not sym then P.hide(); on_ready(false); return end
+    sess.symbol_lib = sym
+
+    sess.source_map = pick_source_map(ctx)
+
+    P.step("5/6  pushing lldb-server to device …")
+    local ok_push, push_msg = ensure_lldb_server_in_app(sess.adb, serial, pkg, server_src)
+    if not ok_push then
+      P.error("lldb-server bootstrap failed: " .. tostring(push_msg))
+      log.notify_error("dap.android", "lldb-server bootstrap failed: " .. push_msg)
+      on_ready(false); return
+    end
+
+    on_ready(true)
+  end
+
+  if sess.serial then
+    after_serial(sess.serial)
+  else
+    pick_serial_async(sess.adb, after_serial)
+  end
 end
 
 -- Common tail of attach/launch: spin up lldb-server gdbserver, snapshot
@@ -636,44 +746,226 @@ local function _finalize_session(sess, pid, cfg_name, run_label)
 end
 
 function M.attach(opts)
-  if not bootstrap_session(opts) then return end
-  local sess = M._session
-  local P = require("ue.dap._progress")
-
-  P.step("6/6  finding pid for " .. (sess.package_name or "?") .. " …")
-  local pid = pidof(sess.adb, sess.serial, sess.package_name)
-  if not pid then
-    P.error(("process %s not running on %s"):format(sess.package_name, sess.serial))
-    M.stop_android_debugger()
+  if M._attach_in_progress then
+    vim.notify("[ue.dap.android] attach already in progress — wait for it to finish or :UEDAPStop",
+      vim.log.levels.WARN)
     return
   end
-  _finalize_session(sess, pid, "UE Android Attach (codelldb)", "UEDAP android attach")
+  local ok_dap, dap = pcall(require, "dap")
+  if ok_dap and dap and dap.session and dap.session() then
+    vim.notify("[ue.dap.android] DAP session already active — :UEDAPStop first, or :UEDAPReattach",
+      vim.log.levels.WARN)
+    return
+  end
+  M._attach_in_progress = true
+  bootstrap_session(opts, function(ok)
+    if not ok then M._attach_in_progress = false; return end
+    local sess = M._session
+    local P = require("ue.dap._progress")
+    P.step("6/6  finding pid for " .. (sess.package_name or "?") .. " …")
+    local pid = pidof(sess.adb, sess.serial, sess.package_name)
+    if not pid then
+      P.error(("process %s not running on %s"):format(sess.package_name, sess.serial))
+      M._attach_in_progress = false
+      M.stop_android_debugger()
+      return
+    end
+    _finalize_session(sess, pid, "UE Android Attach (codelldb)", "UEDAP android attach")
+    M._attach_in_progress = false
+    M._start_liveness_poller()
+  end)
 end
 
 function M.launch(opts)
-  if not bootstrap_session(opts) then return end
+  if M._attach_in_progress then
+    vim.notify("[ue.dap.android] attach already in progress", vim.log.levels.WARN)
+    return
+  end
+  local ok_dap, dap = pcall(require, "dap")
+  if ok_dap and dap and dap.session and dap.session() then
+    vim.notify("[ue.dap.android] DAP session already active — :UEDAPStop first",
+      vim.log.levels.WARN)
+    return
+  end
+  M._attach_in_progress = true
+  bootstrap_session(opts, function(ok)
+    if not ok then M._attach_in_progress = false; return end
+    local sess = M._session
+    local P = require("ue.dap._progress")
+    P.step("6/6  starting activity " .. (sess.package_name or "?") .. " …")
+    pcall(adb_run, sess.adb, {
+      "-s", sess.serial, "shell", "monkey", "-p", sess.package_name,
+      "-c", "android.intent.category.LAUNCHER", "1",
+    })
+
+    P.step("waiting for process to appear …")
+    local pid
+    for _ = 1, 25 do
+      pid = pidof(sess.adb, sess.serial, sess.package_name)
+      if pid then break end
+      vim.wait(200)
+    end
+    if not pid then
+      P.error(("%s did not start within 5s"):format(sess.package_name))
+      M._attach_in_progress = false
+      M.stop_android_debugger()
+      return
+    end
+    _finalize_session(sess, pid, "UE Android Launch (codelldb)", "UEDAP android launch")
+    M._attach_in_progress = false
+    M._start_liveness_poller()
+  end)
+end
+
+-- ── public: reattach (same pkg/serial/symbol_lib, fresh pid) ──────────────
+-- Keeps the last successful session's pkg/serial/symbol_lib/lldb_server_local
+-- in M._last_session and lets the user re-attach in one command after the app
+-- restarts (Live++/hot-reload/manual relaunch). No re-pick of paths/devices.
+-- (snapshot_last_session / M._last_session are defined near the top so
+-- stop_android_debugger / cleanup can reference them.)
+
+function M.reattach()
+  if M._attach_in_progress then
+    vim.notify("[ue.dap.android] attach in progress", vim.log.levels.WARN)
+    return
+  end
+  local ok_dap, dap = pcall(require, "dap")
+  if ok_dap and dap and dap.session and dap.session() then
+    vim.notify("[ue.dap.android] active session — :UEDAPStop first", vim.log.levels.WARN)
+    return
+  end
+  local last = M._last_session
+  if not last then
+    vim.notify("[ue.dap.android] no previous session to reattach to — use :UEDAPAttach",
+      vim.log.levels.WARN)
+    return
+  end
+
+  M._attach_in_progress = true
+  -- Replay state into the live session table.
   local sess = M._session
+  sess.adb               = last.adb or "adb"
+  sess.serial            = last.serial
+  sess.package_name      = last.package_name
+  sess.symbol_lib        = last.symbol_lib
+  sess.lldb_server_local = last.lldb_server_local
+  sess.source_map        = last.source_map
+  sess.engine_root       = last.engine_root
+  sess.port              = pick_port()
+
   local P = require("ue.dap._progress")
+  P.step(("reattach: waiting for %s on %s …"):format(last.package_name, last.serial))
 
-  P.step("6/6  starting activity " .. (sess.package_name or "?") .. " …")
-  pcall(adb_run, sess.adb, {
-    "-s", sess.serial, "shell", "monkey", "-p", sess.package_name,
-    "-c", "android.intent.category.LAUNCHER", "1",
-  })
-
-  P.step("waiting for process to appear …")
+  -- Poll up to 10s for the app to be running.
   local pid
-  for _ = 1, 25 do
+  for _ = 1, 50 do
     pid = pidof(sess.adb, sess.serial, sess.package_name)
     if pid then break end
     vim.wait(200)
   end
   if not pid then
-    P.error(("%s did not start within 5s"):format(sess.package_name))
-    M.stop_android_debugger()
+    P.error(("%s not running on %s after 10s"):format(last.package_name, last.serial))
+    M._attach_in_progress = false
     return
   end
-  _finalize_session(sess, pid, "UE Android Launch (codelldb)", "UEDAP android launch")
+
+  -- Ensure lldb-server is still in the sandbox (Android may have cleared
+  -- /data/data/<pkg> on user-data wipe / reinstall).
+  local ok_push, push_msg = ensure_lldb_server_in_app(
+    sess.adb, sess.serial, sess.package_name, sess.lldb_server_local)
+  if not ok_push then
+    P.error("lldb-server re-stage failed: " .. tostring(push_msg))
+    M._attach_in_progress = false
+    return
+  end
+
+  _finalize_session(sess, pid,
+    "UE Android Attach (codelldb)", "UEDAP android reattach")
+  M._attach_in_progress = false
+  M._start_liveness_poller()
+end
+
+-- ── public: liveness poller ───────────────────────────────────────────────
+-- IDE-style auto-detach: poll the app pid every 1.5s; after 2 consecutive
+-- misses, assume the app exited (user-killed, crash, Low-Memory-Killer) and
+-- auto stop the DAP session + notify. User policy: direct stop+notify, NO
+-- reattach prompt (dapui floats would steal focus). User can :UEDAPReattach
+-- manually when they restart the app.
+M._liveness_timer  = nil
+M._liveness_misses = 0
+
+function M._stop_liveness_poller()
+  if M._liveness_timer then
+    pcall(function() M._liveness_timer:stop() end)
+    pcall(function() M._liveness_timer:close() end)
+    M._liveness_timer = nil
+  end
+  M._liveness_misses = 0
+end
+
+function M._start_liveness_poller()
+  M._stop_liveness_poller()
+  snapshot_last_session()  -- remember for :UEDAPReattach
+  local sess = M._session
+  if not (sess.adb and sess.serial and sess.package_name and sess.pid) then return end
+  local adb, serial, pkg, pid = sess.adb, sess.serial, sess.package_name, sess.pid
+  local timer = vim.uv.new_timer()
+  if not timer then return end
+  M._liveness_timer = timer
+  timer:start(2000, 1500, vim.schedule_wrap(function()
+    -- Bail if session is gone (user already stopped, or a different attach).
+    local ok_dap, dap = pcall(require, "dap")
+    local has_sess = ok_dap and dap and dap.session and dap.session() or nil
+    if not has_sess or M._session.pid ~= pid then
+      M._stop_liveness_poller()
+      return
+    end
+    local live = pidof(adb, serial, pkg)
+    if live and live == pid then
+      M._liveness_misses = 0
+      return
+    end
+    -- Tolerate a single transient miss (adb hiccup, brief unauthorized).
+    M._liveness_misses = M._liveness_misses + 1
+    if M._liveness_misses < 2 then return end
+
+    -- App is gone. Stop everything, notify, snapshot for reattach.
+    M._stop_liveness_poller()
+    local why
+    if live and live ~= pid then
+      why = ("App %s restarted (new pid=%d). Detaching."):format(pkg, live)
+    else
+      why = ("App %s exited on %s. Detaching."):format(pkg, serial)
+    end
+    vim.notify("[ue.dap.android] " .. why .. "\nUse :UEDAPReattach to reconnect.",
+      vim.log.levels.WARN)
+    pcall(M.stop_android_debugger)
+  end))
+end
+
+-- ── public: status (one-line probe for the user) ──────────────────────────
+function M.status()
+  local ok_dap, dap = pcall(require, "dap")
+  local has_sess = ok_dap and dap and dap.session and dap.session() or nil
+  local s = M._session
+  local lines = {
+    "── UE Android DAP status ──",
+    ("  session     : %s"):format(has_sess and "ACTIVE" or "idle"),
+    ("  attaching   : %s"):format(M._attach_in_progress and "yes" or "no"),
+    ("  package     : %s"):format(s.package_name or "-"),
+    ("  serial      : %s"):format(s.serial or "-"),
+    ("  pid         : %s"):format(s.pid or "-"),
+    ("  port        : %s"):format(s.port or "-"),
+    ("  libUE4 base : %s"):format(s.libue4_base and ("0x" .. s.libue4_base) or "-"),
+    ("  symbol_lib  : %s"):format(s.symbol_lib or "-"),
+    ("  liveness    : %s (misses=%d)"):format(
+      M._liveness_timer and "polling" or "off", M._liveness_misses or 0),
+  }
+  if M._last_session then
+    lines[#lines + 1] = ("  last (reattach target): %s @ %s"):format(
+      M._last_session.package_name, M._last_session.serial)
+  end
+  vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO)
 end
 
 -- ── test hooks ────────────────────────────────────────────────────────────

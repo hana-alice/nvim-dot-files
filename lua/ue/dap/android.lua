@@ -494,6 +494,19 @@ local function init_commands(session)
   -- _2ByteChars variant matches UE's default 2-byte TCHAR build (Android,
   -- Win64, Linux). If user is on a 4-byte TCHAR build they can swap the
   -- filename via ue.config.dap.lldb_formatter_path.
+  --
+  -- IMPORTANT: Epic's formatter is pure-Python (uses lldb.SBValue API).
+  -- LLVM 22.1.6 Windows minimal builds (the one we ship lldb-dap from)
+  -- DO NOT include the `lldb` Python module — only liblldb.dll + the
+  -- DAP front-end. `command script import` against that build emits
+  --   ModuleNotFoundError: No module named 'lldb'
+  -- to the console (non-fatal, attach continues). To still get *some*
+  -- pretty-printing for the single most common type (FString), we fall
+  -- back to a native `type summary --summary-string` rule which lldb's
+  -- C++ summary engine handles without any Python interpreter.
+  -- FName / TArray / TMap / FVector lose their summaries on that build —
+  -- those types require SBValue.ReadMemory / decode logic that can't be
+  -- expressed in the summary-string mini-language.
   local er = session and session.engine_root
   if not er or er == "" then er = find_engine_root_from_cwd() end
   local cfg_path
@@ -505,7 +518,31 @@ local function init_commands(session)
   if (not formatter or formatter == "") and er and er ~= "" then
     formatter = er .. "/Engine/Extras/LLDBDataFormatters/UE4DataFormatters_2ByteChars.py"
   end
-  if formatter and formatter ~= "" then
+
+  -- Detect whether the configured lldb-dap.exe ships the `lldb` Python
+  -- module. Standard LLVM Windows installer layout puts it at
+  --   <install_root>/lib/site-packages/lldb/__init__.py
+  -- (or Lib/site-packages/lldb on python.org-style trees). The minimal
+  -- 22.1.6 build we use has none of those — so we treat missing dir as
+  -- "no Python". This file probe is fast and cached per attach.
+  local dap_exe = (C.find_lldb_dap and C.find_lldb_dap()) or nil
+  local has_python = false
+  if dap_exe and dap_exe ~= "" then
+    local install_root = vim.fs.dirname(vim.fs.dirname(dap_exe))  -- strip /bin/lldb-dap.exe
+    if install_root and install_root ~= "" then
+      for _, sub in ipairs({ "lib/site-packages/lldb", "Lib/site-packages/lldb",
+                              "lib/python3/dist-packages/lldb" }) do
+        local probe = install_root .. "/" .. sub
+        local st = vim.uv and vim.uv.fs_stat(probe) or vim.loop.fs_stat(probe)
+        if st and st.type == "directory" then
+          has_python = true
+          break
+        end
+      end
+    end
+  end
+
+  if formatter and formatter ~= "" and has_python then
     local f = io.open(formatter, "r")
     if f then
       f:close()
@@ -518,6 +555,20 @@ local function init_commands(session)
           vim.log.levels.WARN)
       end)
     end
+  elseif formatter and formatter ~= "" and not has_python then
+    -- No Python in lldb-dap → native FString summary only.
+    -- FString layout (UE5):  TArray<TCHAR> Data { AllocatorInstance.Data : TCHAR*, ArrayNum : int32, ArrayMax : int32 }
+    -- Summary-string `%s` on a TCHAR* (char16_t*) prints as UTF-16 cstring.
+    table.insert(cmds,
+      'type summary add -w UEFallback --summary-string "${var.Data.AllocatorInstance.Data%s}" FString')
+    table.insert(cmds, 'type category enable UEFallback')
+    vim.schedule(function()
+      vim.notify(
+        "[ue.dap] lldb-dap has no Python module — using native FString fallback only.\n" ..
+        "FName / TArray / TMap / FVector summaries unavailable on this build.\n" ..
+        "(Use a full LLVM install with Python bindings to restore them.)",
+        vim.log.levels.INFO)
+    end)
   end
   return cmds
 end
@@ -601,24 +652,59 @@ function M.stop_android_debugger(opts)
   snapshot_last_session()
 
   local ok_dap, dap = pcall(require, "dap")
-  if ok_dap and dap and dap.session and dap.session() then
-    pcall(function()
-      dap.session():request("disconnect", { terminateDebuggee = false })
-    end)
-    -- NOTE: do NOT call dap.terminate() here. For an attach session,
-    -- nvim-dap maps terminate() to a DAP `terminate` request which
-    -- lldb-dap interprets as "kill the debuggee process". We only want
-    -- to detach (disconnect terminateDebuggee=false above). The
-    -- on_session_end listener will handle UI/logcat/state cleanup
-    -- once the disconnect response comes back.
-    result.disconnected = true
+  local sess_active = ok_dap and dap and dap.session and dap.session() or nil
+
+  -- Two-phase teardown to avoid leaking a ptrace lock on the inferior:
+  --   1. Send DAP `disconnect terminateDebuggee=false` and WAIT for the
+  --      response. lldb-dap forwards this to the on-device gdbserver
+  --      child which calls `PT_DETACH` (kernel-side ptrace release)
+  --      before its own socket close. If we kill lldb-server here
+  --      before the response round-trips, the gdbserver child dies
+  --      with the ptrace lock still held → inferior left in state `T`
+  --      (orphan SIGSTOP, TracerPid=0) and unrecoverable except by
+  --      `kill -9` on the game.
+  --   2. Only AFTER the disconnect ACK (or a short timeout) tear down
+  --      the device-side processes + adb forward.
+  --
+  -- The callback approach: dap.session():request(cmd, args, cb) invokes
+  -- cb(err, body) when the response arrives. We schedule the device
+  -- cleanup from the callback. Belt-and-braces: a 1.5s safety timer
+  -- runs cleanup even if the response never comes (dead adapter, etc.)
+  -- to guarantee idempotent behavior of repeated :UEDAPStop calls.
+  local cleanup_done = false
+  local function finalize()
+    if cleanup_done then return end
+    cleanup_done = true
+    M._cleanup_device_side()
+    result.adapter_killed = true
+    reset_session()
   end
 
-  -- Tear down device-side resources (lldb-server / port forward / SIGCONT).
-  M._cleanup_device_side()
-  result.adapter_killed = true
+  if sess_active then
+    local ok_req = pcall(function()
+      sess_active:request("disconnect", { terminateDebuggee = false }, function(_err, _body)
+        -- lldb-dap may close stdio before the callback fires (it
+        -- does the response then exits in the same tick); pcall the
+        -- finalize to swallow any nvim-dap internal error.
+        vim.schedule(function() pcall(finalize) end)
+      end)
+    end)
+    if ok_req then
+      result.disconnected = true
+    else
+      -- request() itself blew up (very rare — adapter already gone).
+      -- Just clean up synchronously.
+      finalize()
+      return result
+    end
+    -- Safety timer: if lldb-dap never replies (it's already dead),
+    -- finalize anyway so the user can retry attach immediately.
+    vim.defer_fn(function() pcall(finalize) end, 1500)
+  else
+    -- No active session — just cleanup device side and exit.
+    finalize()
+  end
 
-  reset_session()
   return result
 end
 

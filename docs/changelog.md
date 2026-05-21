@@ -44,6 +44,64 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-05-21 (later #3) — fix: 两阶段 stop + FString 无-Python fallback
+
+**Task** Follow-up #2 + #3 from the lldb-dap live-attach session:
+- #3: `:UEDAPStop` 现在等 `disconnect` 响应再 killall lldb-server（避免 ptrace lock leak）
+- #2: 自动探测 lldb-dap 是否带 Python，无 Python 时退到 native `type summary` FString fallback
+
+**改动**
+1. `lua/ue/dap/android.lua` `stop_android_debugger()` 重写：
+   - 改成两阶段 teardown：先 `sess:request("disconnect", ..., callback)` 异步发，
+     callback 里 `vim.schedule(finalize)` 再做 `_cleanup_device_side` + `reset_session`
+   - 加 `cleanup_done` 闭包 guard + `vim.defer_fn(finalize, 1500)` 安全兜底，
+     如果 lldb-dap 已死/响应永不来，1.5s 后也强清，保证 `:UEDAPStop` 幂等
+   - 根因：原版同步并发跑 disconnect (异步) 和 killall (同步)，killall 比
+     disconnect ACK 快，gdbserver 子进程死时 `PT_DETACH` 还没下发到 kernel，
+     inferior 留在 state=T（TracerPid=0 但 SIGSTOP 仍在），只能 `kill -9`。
+     现在让 killall 等到 DAP 协议层确认 detach 完成再发。
+2. `lua/ue/dap/android.lua` `attach_commands()` 加 Python detection + fallback：
+   - 探针：`<lldb-dap install_root>/(lib|Lib)/site-packages/lldb/` 目录是否存在
+   - 22.1.6 Windows 最小化 build 无 Python module → 走 native 分支：
+     - `type summary add -w UEFallback --summary-string "${var.Data.AllocatorInstance.Data%s}" FString`
+     - `type category enable UEFallback`
+     - 一次性 INFO notify 告知 FName/TArray/TMap/FVector 无 summary
+   - Python build → 原 `command script import` 路径不变（向后兼容）
+   - 根因：Epic 的 `UE4DataFormatters_2ByteChars.py` 第一行 `import lldb`，
+     22.1.6 Windows minimal build 只装了 liblldb.dll + lldb-dap.exe，没有
+     `lldb` Python 模块 → `ModuleNotFoundError: No module named 'lldb'` 灌到
+     console（不致命但难看）。Native summary-string 只能写最简单的指针-到-cstring
+     映射，所以只救 FString（最常用），其余类型放弃 summary。
+
+**测试**
+- `nvim --headless -c "lua require('ue.dap.android')"` → 加载 OK
+- `nvim --headless luafile lua/ue/dap/android.lua` → exit 0
+- 实测验证（需要 fresh Neovide 重启）：
+  - `:UEDAPStop` 后跑 `adb shell ps -A | grep <pkg>` 应该看到 inferior 干净退出
+    或 state=R/S，不再 stuck on state=T
+  - FString 变量 hover 显示 `string=...` 而不是裸 char16_t 指针
+  - notify 弹出 "FString fallback only" 字样
+
+**坑**
+- `dap.session():request(cmd, args, cb)` 真签名（nvim-dap 上游 session.lua:1883）：
+  `function Session:request(command, arguments, on_result)` —— 没 callback 时
+  会用当前协程 resume，跑同步流不要漏 callback，否则收不到响应也不会出错
+  (`on_result = function(_, _) end` swallow)
+- `vim.uv.fs_stat` (Neovim 0.10+) vs `vim.loop.fs_stat`（旧）兼容：写成
+  `vim.uv and vim.uv.fs_stat(...) or vim.loop.fs_stat(...)`
+- `type summary` 的 `--summary-string` 对 char16_t* 的 `%s` 格式说明符理论上
+  打 UTF-16 cstring。如果实测乱码可能要换成 `${var.Data.AllocatorInstance.Data}: char16_t*`
+  让 lldb 自己选 summary，待 fresh nvim 实测确认。
+
+**follow-up（剩余）**
+- #1 PID 跳变修复实测：需 fresh Neovide 跑 `:UEDAPAttach android`，对比 attach 前后
+  `pidof com.example.mygame` 应该不变（hot-reload session 因 0xC0000409 阻塞实测）
+- #4: nvim-dap hot-reload 后 lldb-dap 0xC0000409 STATUS_STACK_BUFFER_OVERRUN。
+  fresh nvim 不复现，仅 `package.loaded[...]=nil; require('ue').setup()` 后 attach
+  触发。怀疑 ensure_adapter 重新喂 stdio pipe 时 `_get_osfhandle(3)` 失效（skill
+  ue-android-codelldb-attach-traps Bug 5）。短期 workaround：改 ue.lua 配置后重启
+  Neovide，不要 hot-reload。后续要修可以加 ensure_adapter 内的 stdio fd 验证。
+
 ### 2026-05-21 (later #2) — fix: auto-continue `entry` stops on Android attach (PID jump fix)
 
 **Task** Follow-up #1 from the lldb-dap live-attach session: stop the Android

@@ -5888,10 +5888,65 @@ function M.cached_grep(opts)
       live = true,
       need_search = true,
       layout = { preset = "telescope" },
+      -- Search mode toggles. snacks auto-merges these with built-in toggles
+      -- (regex, follow, hidden, ignored, modified — see snacks/picker/config/
+      -- defaults.lua). For each entry it auto-generates a toggle_<name>
+      -- action that flips picker.opts[name] then calls picker:find().
+      --
+      -- Title icon semantics: snacks renders icon when picker.opts[name] ==
+      -- toggle.value. We want "icon visible = mode ENABLED" so:
+      --   regex: value=true   → R shows when regex mode is ON (literal off)
+      --   word:  value=true   → W shows when whole-word ON
+      --   case:  value=true   → C shows when case-sensitive ON
+      -- Without overriding regex here, snacks' default value=false would
+      -- show R when LITERAL mode is on, which is reverse intuition.
+      regex = false,
+      word = false,
+      case = false,
+      toggles = {
+        regex = { icon = "R", value = true },
+        word  = { icon = "W", value = true },
+        case  = { icon = "C", value = true },
+      },
+      -- Keymaps: Alt-g/x/w/c = mode toggles. NB: Alt+R is GLOBALLY hooked
+      -- by NVIDIA App / GeForce Experience for Performance Overlay (system-
+      -- level hotkey, nvim never sees the keypress). Don't waste time on
+      -- <a-r> on this machine. <a-g> = "grep regex" mnemonic, no conflict
+      -- (snacks default <C-g> = toggle_live, distinct key).
+      -- <a-w> covers user intuition "w = word" (snacks default cycle_win
+      -- overridden); <a-x> alternate for word (consistency with
+      -- <leader>sx cheatsheet entry). <a-c> = case.
+      win = vim.tbl_deep_extend("force", grouping_enabled and fast_tab_keys.win or {}, {
+        input = { keys = {
+          ["<a-g>"] = { "ue_grep_toggle_regex", mode = { "i", "n" } },
+          ["<a-x>"] = { "ue_grep_toggle_word",  mode = { "i", "n" } },
+          ["<a-w>"] = { "ue_grep_toggle_word",  mode = { "i", "n" } },
+          ["<a-c>"] = { "ue_grep_toggle_case",  mode = { "i", "n" } },
+        } },
+      }),
+      actions = {
+        ue_grep_toggle_regex = function(picker)
+          picker.opts.regex = not picker.opts.regex
+          require("snacks").notify((picker.opts.regex and "✓ regex ON " or "✗ regex OFF (literal)"),
+            { title = "UE grep", level = "info" })
+          picker.list:set_target(); picker:find()
+        end,
+        ue_grep_toggle_word = function(picker)
+          picker.opts.word = not picker.opts.word
+          require("snacks").notify((picker.opts.word and "✓ whole-word ON " or "✗ whole-word OFF"),
+            { title = "UE grep", level = "info" })
+          picker.list:set_target(); picker:find()
+        end,
+        ue_grep_toggle_case = function(picker)
+          picker.opts.case = not picker.opts.case
+          require("snacks").notify((picker.opts.case and "✓ case-sensitive ON " or "✗ smart-case"),
+            { title = "UE grep", level = "info" })
+          picker.list:set_target(); picker:find()
+        end,
+      },
       format = grouping_enabled and format_grouped or nil,
       preview = grouping_enabled and preview_grouped or nil,
       on_show = grouping_enabled and on_show_picker or nil,
-      win = grouping_enabled and fast_tab_keys.win or nil,
       confirm = grouping_enabled and confirm_grouped or nil,
       finder = function(_picker_opts, finder_ctx)
         local pattern = finder_ctx.filter.search
@@ -5919,10 +5974,18 @@ function M.cached_grep(opts)
 
           local t_cs_spawn_0 = vim.loop.hrtime()
           local cs_first_line_logged = false
+          -- Read mode toggles from picker.opts (Alt-r/Alt-x/Alt-c flip
+          -- these in place via snacks auto-generated toggle_<name> actions,
+          -- then picker:find() restarts this finder so we see the new values).
+          local _picker = finder_ctx and finder_ctx.picker
+          local _po = _picker and _picker.opts or {}
           local stop = code_search.stream(cs_ctx, pattern, {
             code_only   = opts.code_only,
             smart_case  = true,
             max_count   = opts.max_count or 5000,
+            regex       = _po.regex == true,   -- snacks default false = literal
+            word        = _po.word == true,
+            case        = _po.case == true,
           }, {
             on_line = function(file, lnum, col, text)
               if not cs_first_line_logged then
@@ -6189,10 +6252,46 @@ function M.cached_grep(opts)
     live = true,
     need_search = true,
     layout = { preset = "telescope" },
+    -- Same toggle wiring as csearch path (see comment there).
+    regex = false,
+    word = false,
+    case = false,
+    toggles = {
+      regex = { icon = "R", value = true },
+      word  = { icon = "W", value = true },
+      case  = { icon = "C", value = true },
+    },
+    win = vim.tbl_deep_extend("force", grouping_enabled and fast_tab_keys.win or {}, {
+      input = { keys = {
+        ["<a-g>"] = { "ue_grep_toggle_regex", mode = { "i", "n" } },
+        ["<a-x>"] = { "ue_grep_toggle_word",  mode = { "i", "n" } },
+        ["<a-w>"] = { "ue_grep_toggle_word",  mode = { "i", "n" } },
+        ["<a-c>"] = { "ue_grep_toggle_case",  mode = { "i", "n" } },
+      } },
+    }),
+    actions = {
+      ue_grep_toggle_regex = function(picker)
+        picker.opts.regex = not picker.opts.regex
+        require("snacks").notify((picker.opts.regex and "✓ regex ON " or "✗ regex OFF (literal)"),
+          { title = "UE grep", level = "info" })
+        picker.list:set_target(); picker:find()
+      end,
+      ue_grep_toggle_word = function(picker)
+        picker.opts.word = not picker.opts.word
+        require("snacks").notify((picker.opts.word and "✓ whole-word ON " or "✗ whole-word OFF"),
+          { title = "UE grep", level = "info" })
+        picker.list:set_target(); picker:find()
+      end,
+      ue_grep_toggle_case = function(picker)
+        picker.opts.case = not picker.opts.case
+        require("snacks").notify((picker.opts.case and "✓ case-sensitive ON " or "✗ smart-case"),
+          { title = "UE grep", level = "info" })
+        picker.list:set_target(); picker:find()
+      end,
+    },
     format = grouping_enabled and format_grouped or nil,
     preview = grouping_enabled and preview_grouped or nil,
     on_show = grouping_enabled and on_show_picker or nil,
-    win = grouping_enabled and fast_tab_keys.win or nil,
     confirm = grouping_enabled and confirm_grouped or nil,
     finder = function(picker_opts, finder_ctx)
       local pattern = finder_ctx.filter.search
@@ -6204,6 +6303,13 @@ function M.cached_grep(opts)
       if not loaded_files then
         return function() end
       end
+
+      -- Read mode toggles from picker.opts (same wiring as csearch path).
+      local _picker = finder_ctx and finder_ctx.picker
+      local _po = _picker and _picker.opts or {}
+      local mode_regex = _po.regex == true
+      local mode_word  = _po.word == true
+      local mode_case  = _po.case == true
 
       return function(cb)
         -- Wrap cb to inject file-header items between file groups.
@@ -6217,13 +6323,28 @@ function M.cached_grep(opts)
           "--with-filename",
           "--line-number",
           "--column",
-          "--smart-case",
           "--max-columns=500",
           "--max-columns-preview",
           "-0",
-          "--",
-          pattern,
         }
+        -- Case mode: explicit case-sensitive ⇒ -s, else smart-case (default
+        -- rg behavior we previously hard-coded).
+        if mode_case then
+          table.insert(base_args, "--case-sensitive")
+        else
+          table.insert(base_args, "--smart-case")
+        end
+        -- Regex mode: when off, take input literally. -F is rg's
+        -- fixed-strings flag; combined with -w it still matches whole
+        -- words (rg treats -F as the engine, -w as a wrapper).
+        if not mode_regex then
+          table.insert(base_args, "--fixed-strings")
+        end
+        if mode_word then
+          table.insert(base_args, "--word-regexp")
+        end
+        table.insert(base_args, "--")
+        table.insert(base_args, pattern)
 
         -- Windows CreateProcess hits a ~32k command-line ceiling, so split
         -- batches by both file count and estimated argument length.
@@ -8357,6 +8478,8 @@ M.dap_reset_layout = dap_mod.dap_reset_layout
 M.dap_toggle_repl = dap_mod.dap_toggle_repl
 M.dap_diagnose = dap_mod.dap_diagnose
 M.stop_android_debugger = dap_mod.stop_android_debugger
+M.android_dap_reattach  = dap_mod.android_dap_reattach
+M.android_dap_status    = dap_mod.android_dap_status
 M.setup_dap = dap_mod.setup_dap
 
 -- ==========================================================================
@@ -8804,6 +8927,24 @@ function M.setup()
   vim.api.nvim_create_user_command("UEDAPStepOut",         function() M.dap_step_out()         end, { desc = "DAP: Step out" })
   vim.api.nvim_create_user_command("UEDAPToggleUI",        function() M.dap_toggle_ui()        end, { desc = "DAP: Toggle UI" })
   vim.api.nvim_create_user_command("UEDAPREPL",            function() M.dap_toggle_repl()      end, { desc = "DAP: Toggle REPL" })
+  vim.api.nvim_create_user_command("UEDAPStop", function()
+    M.stop_android_debugger({ kill_orphans = true })
+    vim.notify("[ue.dap] session stopped", vim.log.levels.INFO)
+  end, { desc = "DAP: Stop / detach (Android: keeps app running)" })
+  vim.api.nvim_create_user_command("UEDAPReattach", function()
+    if type(M.android_dap_reattach) == "function" then
+      M.android_dap_reattach()
+    else
+      vim.notify("UEDAPReattach unavailable", vim.log.levels.WARN)
+    end
+  end, { desc = "DAP: Reattach Android using last pkg/serial/symbol_lib" })
+  vim.api.nvim_create_user_command("UEDAPStatus", function()
+    if type(M.android_dap_status) == "function" then
+      M.android_dap_status()
+    else
+      vim.notify("UEDAPStatus unavailable", vim.log.levels.WARN)
+    end
+  end, { desc = "DAP: One-line status of the current Android session" })
 
   local group = vim.api.nvim_create_augroup("ue_statusline", { clear = true })
   -- Stop old timer on reload to prevent leaks

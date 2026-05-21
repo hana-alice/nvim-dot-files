@@ -21,7 +21,10 @@
 --       on_done(exit_code, err_msg | nil)
 --       Returns a stop() function the caller can invoke to kill the proc.
 --
--- opts: { code_only = bool, max_count = int, smart_case = bool }
+-- opts: { code_only = bool, max_count = int, smart_case = bool,
+--         regex = bool (default true; false = literal/fixed-string),
+--         word  = bool (whole-word match, wraps pattern in \b...\b),
+--         case  = bool (case-sensitive; nil/false = smart-case behavior) }
 
 local M = {}
 
@@ -125,6 +128,12 @@ local function stream_csearch(ctx, pattern, opts, callbacks)
     return function() end
   end
 
+  -- Keep the user's ORIGINAL untransformed text for column estimation
+  -- below. Pattern rewrites (literal escape, \b wrap, (?i) prefix) only
+  -- affect what we hand to csearch; column-finding still uses the raw
+  -- needle, which is what actually appears in matched text.
+  local raw_needle = pattern
+
   local args = { "-n" }
   if opts.code_only then
     -- csearch -f filters by FILE PATH regex (not glob). Build a regex
@@ -133,9 +142,39 @@ local function stream_csearch(ctx, pattern, opts, callbacks)
     table.insert(args,
       "\\.(cpp|c|cc|cxx|h|hpp|hh|hxx|inl|cs|usf|ush|hlsl|hlsli|ini|cfg|json|xml|uproject|uplugin|target\\.cs|build\\.cs)$")
   end
-  if opts.smart_case ~= false then
-    -- csearch uses RE2; default is case-sensitive. Apply a lowercase
-    -- pattern + (?i) prefix when no uppercase chars present (smart-case).
+
+  -- Pattern rewrite pipeline. ORDER MATTERS: literal-escape first (so
+  -- subsequent \b additions are not themselves escaped), then word-wrap,
+  -- then case-flag injection.
+  --
+  -- regex defaults to TRUE (caller treats pattern as RE2). When false,
+  -- the input is taken literally — every RE2 metachar is escaped. This
+  -- is the fix for "\Pr" / "[1-9]" / "(foo|bar)" etc. silently exploding
+  -- csearch's RE2 parser ("error parsing regexp: invalid character class
+  -- range: `\Pr`"). Anything the user types is matched verbatim.
+  local is_regex = opts.regex ~= false
+  if not is_regex then
+    -- RE2 has the same metaset as PCRE for escaping purposes. \Q...\E is
+    -- the cleanest escape — RE2 supports it and it survives word-wrapping
+    -- as long as the wrapping happens at boundary points.
+    -- BUT \b...\Q...\E\b doesn't work universally in RE2 (some engines
+    -- treat \Q inside \b oddly), so do byte-level escape instead.
+    pattern = pattern:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?%{%}%|%\\])", "\\%1")
+  end
+
+  if opts.word then
+    pattern = "\\b" .. pattern .. "\\b"
+  end
+
+  -- Case sensitivity. opts.case=true → strict case-sensitive (no (?i)).
+  -- opts.case=nil/false → smart-case (lowercase pattern ⇒ (?i)) IF the
+  -- legacy smart_case opt is on. Keeping the old smart_case path for
+  -- back-compat with callers that haven't migrated to opts.case yet.
+  local case_sensitive = opts.case == true
+  if not case_sensitive and opts.smart_case ~= false then
+    -- Only inject (?i) when there's no uppercase in the ORIGINAL search
+    -- text. After literal-escape "Foo.Bar" becomes "Foo\.Bar" which
+    -- still has uppercase, so this still works correctly.
     if not pattern:match("%u") then
       pattern = "(?i)" .. pattern
     end
@@ -180,8 +219,9 @@ local function stream_csearch(ctx, pattern, opts, callbacks)
   end
 
   -- Pre-compile a Lua plain-find pattern for column estimation.
-  -- For RE2 prefixed patterns we strip the (?i) flag before matching.
-  local needle = pattern:gsub("^%(%?i%)", ""):lower()
+  -- Uses raw_needle (untransformed user text), not the post-rewrite
+  -- pattern which may be \b-wrapped or backslash-escaped.
+  local needle = raw_needle:lower()
 
   local emitted = 0
   local max_count = opts.max_count or 5000

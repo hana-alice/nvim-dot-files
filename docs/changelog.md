@@ -44,6 +44,158 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-05-21 — lldb-dap 22.1.6 platform-mode 迁移评估（**翻案**：可迁，根因不在 LLVM）
+
+**Task** 续前一条 "驳回" 评估，用户要求 "继续追踪"。结果**翻案**：lldb-dap
+22.1.6 + platform remote-android 是**可用的**，之前 100% hang 是我们 probe
+脚本自己写错了 `process handle --notify true`，导致 lldb-dap 给每个 SIGSEGV
++ 每个 thread 发一个 DAP `stopped` event，1820+ event 在几百毫秒内淹没
+Win32 stdio pipe → write 返回 EINVAL → adapter 死。
+
+**Diagnosis 关键转折**
+- 一直追源码、追上游 issue 都查不到对症 bug。
+- **真正破案**靠在 probe 里加 `log enable gdb-remote packets`（路线 1 的
+  packet log），看 hang 期间 wire 上发生啥。结果：
+  - 442× `$xADDR,800` memory read
+  - 458× `$qXXX` query
+  - 507× `$pXX` register read
+  - 只 **3× `$Z` breakpoint insert**，**全部 `$OK`！**
+- 也就是说 BP 已经成功 plant 了，hang 在后续 memory/register read 风暴里。
+- 交叉 LLDBDAP_LOG (internal): 临死前 250ms 内连发 1820+ `stopped` event。
+- 顺藤摸瓜：我们刚 `process handle SIGSEGV --notify true` —— notify 风暴。
+
+**验证修复**
+- `probe_bp_v12.py` 改为 `--notify false`：连续两次 run
+  - `setFunctionBreakpoints {"name":"FEngineLoop::Tick"}` → `success=True`
+    `id=2, instructionReference=0x75AC7003D4, line=1`
+  - `alive=True`，final `stopped_count=85`（vs 1820+ 风暴的死亡情形）
+
+**bug 现场指向 `lua/ue/dap/android.lua:545-547`**
+```lua
+"process handle SIGSEGV --notify true --pass true --stop false",  -- 给 codelldb 还能凑合
+"process handle SIGBUS  --notify true --pass true --stop false",
+"process handle SIGPIPE --notify false --pass true --stop false",
+```
+codelldb 不死是因为它内部对 stopped 事件做了节流/合并；lldb-dap 1:1 转发，被这玩意儿淹。
+
+**Implemented**
+- `lua/ue/dap/_common.lua:179-198` 整段 "codelldb (Android route)" 注释重写：
+  删掉错的 LLVM #102254/#138096/#126935 引用（那三个 issue 实际是
+  NSan/clangd-hover/FD-inheritance，跟我们一点关系没有），改为引到新 skill。
+- skill `software-development/lldb-dap-22-platform-mode-breakpoint-crash` **完全重写**：
+  改为 "appears to crash, but root cause is --notify true; fix is --notify false"，
+  含三个排除性假设的表格、packet-log 诊断方法、`probe_bp_v12.py` 作为 contract test。
+
+**没动的**
+- `lua/ue/dap/android.lua` 的 `post_run_commands` **保留 `--notify true`** —
+  codelldb 路径还在用，没必要改。等真要迁 lldb-dap 时一并改。
+- 不加 `use_lldb_dap` flag —— 用户红线 "两个并存入口"。
+
+**Pitfalls / Gotchas**
+- `log enable -f <file> lldb gdb-remote packets process`：channel name list 加了
+  `process` 之后整个 log 被 Process layer state-machine 噪音淹没，packet line
+  一个都不出。要拿 wire packet 用 `log enable -f <file> gdb-remote packets`
+  单独一个 channel。
+- termux LLDB 21.1.8 deb 是 GNU SONAME (`libz.so.1`)，扔 Android `/data/local/tmp`
+  跑直接 `CANNOT LINK libz.so.1 not found`。dead end，记入 skill。
+- `curl -C -` 续传跨 mirror 时**可能拼出比权威 Content-Length 还大的脏文件**，
+  导致 lzma decompress 报 corrupt。永远先 `curl -sI` 比对 Content-Length，
+  不一致就 `rm` 全新下，不要 trust resume。
+- 不到非要 cross-compile LLVM 22.1.6 lldb-server for Android（"host==device
+  完全同 commit"）的地步 —— 三档 device server (LLDB 9/18/21) 在错配置下
+  全 hang，对配置下全通，device 版本根本不是变量。skill 记 dead end #2。
+
+**Validation**
+- `/c/tools/lldb-22/probe_bp_v12.py` 两次连续跑全过 ✅ (probe-level: attach + setBP only)
+- 输出格式: `[main] func setBreakpoints: alive=True success=True`
+  `final stop_count=85`
+- **端到端真机命中 (probe_bp_v13)** ✅ 2026-05-21 补测：
+  - 流程 DAP-spec 正确：initialize → initialized event → setFunctionBreakpoints
+    → configurationDone → continue → 等 stopped(reason=breakpoint)
+  - 60s 内拿到 `*** BP HIT *** reason=breakpoint tid=6273 desc="breakpoint 1.1"`
+  - stack frame #0 = `FEngineLoop::Tick()` @ libUE4.so，完整调用栈到 `__pthread_start`
+  - scopes (Locals/Globals/Registers) + variables 链路全通
+  - stop_count=21 (远小于 hang 时 1820+ 风暴), alive=True 全程
+  - stderr 0 字节，disconnect terminateDebuggee=false 干净退
+  - 注意：`continue` response success 字段 = False 是 lldb-dap 已知行为，
+    但 stopped event 正确到达，证明 continue 实际生效
+
+**Follow-ups**
+- 端到端已 PASS，**可以**正式 migrate android.lua → lldb-dap：
+  1. `dap.adapters.lldb-dap` 替 `dap.adapters.codelldb`
+  2. attach config 用 `attachCommands` 一次性塞：process attach + 3× process handle
+     `--notify false`（参考 probe_bp_v13.py main() 段）
+  3. 跑 `probe_bp_v13.py` 作 regression
+  4. 验 libUE4 rebase 是否还需要（lldb-dap platform mode 自动 sync module
+     slides，不像 codelldb 的 gdb-remote port 模式）
+- 当前分支：`feat/lldb-dap-migration` (本条记录的所有改动落在这里)
+- 用户红线："两个并存入口" = 红线，迁移=一次性砍 codelldb，不留 fallback
+
+### 2026-05-21 — lldb-dap 22.1.6 platform-mode 迁移评估（验证后驳回，已被上一条翻案）
+
+**Task** 试 LLVM 22.1.6 lldb-dap + NDK 21 lldb-server + platform remote-android，
+看能否把 `lua/ue/dap/android.lua` 从 codelldb 迁到 lldb-dap stdio
+（上一次 5/13 session 假设 22.1.6 修了 #102254 / #138096，让 lldb-dap 在 Android
+platform mode 下可用）。**结论：迁移驳回。lldb-dap 22.1.6 + platform mode 在
+首个 breakpoint plant 仍然 100% hard-crash。**
+
+**验证产物（不改 nvim 仓库内文件）**
+- `C:\tools\lldb-22\install\bin\lldb-dap.exe` (LLVM 22.1.6 私有安装, 7z 抽 NSIS)
+- 设备 `/data/local/tmp/lldb-server` 替为 NDK 21.4.7075529 LLDB 9.0.9
+- probe 脚本三件套：
+  - `probe_attach.py` v2 — attach happy path（170 threads, Client-arm64.so 3GB
+    DWARF, configurationDone + deferred attach response, threads enumerated）✅
+  - `probe_bp.py` v3 — DAP `setFunctionBreakpoints` → lldb-dap 进程 hard crash ❌
+  - `probe_bp_v4.py` v4 — `evaluate "breakpoint set --name X"`（绕开 DAP）→
+    同样 hard crash ❌
+  - v5 加 `--shlib Client-arm64.so` 范围限定 → 仍 hard crash ❌
+- 复现率 100%（连续 3 次，不同 BP 名 / 不同 scope）
+
+**Findings 固化**
+- 新 skill: `software-development/lldb-dap-22-platform-mode-breakpoint-crash`
+  含完整 probe 流程 + 再次评估新 LLVM release 时的验证脚本路径。
+
+**Decision**
+- `lua/ue/dap/android.lua` codelldb 路径**保持不动**（它工作）。
+- 不加 `use_lldb_dap` flag（违反"两个并存入口"红线，且只会把用户暴露给已知 crash）。
+- 下次有 22.1.7+ 出来，跑 `probe_bp_v4.py` 验证一遍再考虑——不许凭"应该修了"提迁移。
+
+**深挖根因（同日，clone 源码后）**
+clone `llvm-project @ llvmorg-22.1.6` (commit fc4aad7b) sparse-checkout 到
+`/c/src/llvm-project`。三个对照实验排除掉了 DWARF / device server 版本 / SIGSEGV
+三个早先假设：
+- probe v8 (host-only 3.92GB Client-arm64.so, 无 device, 无 platform mode):
+  `breakpoint set` <1 秒返回带 inlined frame + 源码行 + address ✅ → **DWARF parser 没问题**
+- probe v9 (NDK 27 LLDB 18 替换 NDK 21 LLDB 9 在 device 上): 完全一样的 hang →
+  **device-side server 版本不是变量**
+- probe v7 (`process handle SIGSEGV --pass true --stop false` 在 BP 前): 一样 hang →
+  **不是 ART signal handler 干扰**
+
+定位到代码路径: `lldb/tools/lldb-dap/FunctionBreakpoint.cpp` 的
+`SBTarget::BreakpointCreateByName` 在 `platform remote-android` 模式下进入
+liblldb 的 platform driver，**hang 在 liblldb 自身**，不在 lldb-dap 翻译层。
+证据: LLDBDAP_LOG 最后一行 `queued (command=evaluate seq=N)` 之后 120 秒零输出；
+stderr 0 字节（既不是 LLVM PrettyStackTrace 也不是 LLVM assert）；
+`BaseRequestHandler::Run` 没 try/catch（任何 C++ exception/AV 直接 std::terminate）。
+
+**为什么 codelldb 不死**: codelldb 用 `gdb-remote 127.0.0.1:<port>` 模式，
+不是 `platform remote-android`。同一个 `BreakpointCreateByName` 走另一条 platform
+driver 路径不死锁。bug 在 `lldb/source/Plugins/Platform/Android/`，
+跟 host DWARF parser、DAP 消息循环、device server 版本都无关。
+
+对应上游 issue 也吻合: #126935（platform-android 模式不枚举 modules）、
+#102254 / #138096（setBreakpoints crash in remote-platform 上下文）—— 全都是
+`platform remote-android` 特有问题。
+
+skill `lldb-dap-22-platform-mode-breakpoint-crash` 同步更新 "Root cause analysis"
+小节，含 4 个排除性实验完整记录。
+
+**Follow-ups**
+- 如 `lua/ue/dap/_common.lua:183` 注释提到 LLVM #102254 / #138096，今天可以
+  补一条："re-verified 2026-05-21 with LLVM 22.1.6, still crashes" — 可选。
+- LLVM 上游 issue tracker 可贴一次 platform-mode + Android UE 的复现 trace
+  （probe_bp_v4.log + probe_bp.log）作为额外数据点，帮助上游修。可选 follow-up。
+
 ### 2026-05-21 — Snacks dashboard 加彩色像素头像
 
 **Task** 用户想把 dashboard 默认 golden ASCII art 换成自己的彩色像素头像

@@ -565,42 +565,218 @@ end
 --- Uses nvim-dap's native eval — no custom REPL plumbing needed.
 function D.dap_diagnose()
   local dap_ok, dap = D.ensure_dap_loaded()
-  if not dap_ok or not dap.session() then
-    vim.notify("No DAP session", vim.log.levels.WARN)
-    return
+  local session = (dap_ok and dap.session) and dap.session() or nil
+  local sections = {}
+
+  local function push(title, body)
+    table.insert(sections, ("=== %s ===\n%s"):format(title, body or "(empty)"))
   end
-  local session = dap.session()
-  local results = {}
-  local pending = 3
-  local function collect(label, ok, data)
-    results[#results + 1] = ok and (("=== %s ===\n%s"):format(label, data or ""))
-                              or  (("=== %s ===\n(failed)"):format(label))
-    pending = pending - 1
-    if pending <= 0 then
-      vim.schedule(function()
-        local buf = vim.api.nvim_create_buf(false, true)
-        vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(table.concat(results, "\n\n"), "\n"))
-        vim.bo[buf].buftype = "nofile"
-        vim.bo[buf].filetype = "log"
-        vim.cmd("botright split")
-        vim.api.nvim_win_set_buf(0, buf)
-      end)
+
+  -- ── A. nvim-dap session metadata ─────────────────────────────────────
+  do
+    local lines = {}
+    if not session then
+      lines[#lines + 1] = "(no active session)"
+    else
+      local thread_count = vim.tbl_count(session.threads or {})
+      local cur_frame = session.current_frame
+      lines[#lines + 1] = ("initialized       : %s"):format(tostring(session.initialized))
+      lines[#lines + 1] = ("stopped_thread_id : %s"):format(tostring(session.stopped_thread_id))
+      lines[#lines + 1] = ("thread count      : %d"):format(thread_count)
+      lines[#lines + 1] = ("run_state         : %s"):format(tostring(D._dap_run_state or "?"))
+      lines[#lines + 1] = ("current frame     : %s"):format(
+        cur_frame and (("#%s %s (%s:%s)"):format(
+          cur_frame.id or "?", cur_frame.name or "?",
+          (cur_frame.source and cur_frame.source.path) or "?",
+          cur_frame.line or "?")) or "-")
+      if session.config then
+        lines[#lines + 1] = ("config.name       : %s"):format(session.config.name or "-")
+        lines[#lines + 1] = ("config.request    : %s"):format(session.config.request or "-")
+        lines[#lines + 1] = ("config.type       : %s"):format(session.config.type or "-")
+      end
     end
+    push("DAP session", table.concat(lines, "\n"))
   end
-  -- lldb-dap responds to DAP `evaluate` with context="repl" and runs the
-  -- string as an lldb command.
-  local function eval(cmd, label)
-    session:request("evaluate", { expression = "`" .. cmd, context = "repl" },
-      function(err, resp)
-        collect(label, not err and resp and resp.result ~= nil,
-                resp and resp.result or tostring(err))
-      end)
+
+  -- ── B. ue.dap.android session state + adapter resolution ─────────────
+  do
+    local lines = {}
+    local s = D._dap_session_state or {}
+    lines[#lines + 1] = ("package    : %s"):format(s.package_name or "-")
+    lines[#lines + 1] = ("serial     : %s"):format(s.serial or "-")
+    lines[#lines + 1] = ("pid        : %s"):format(s.pid or "-")
+    lines[#lines + 1] = ("port       : %s"):format(s.port or "-")
+    lines[#lines + 1] = ("symbol_lib : %s"):format(s.symbol_lib or "-")
+    -- adapter path + version probe
+    local ok_common, common = pcall(require, "ue.dap._common")
+    if ok_common and common.find_lldb_dap then
+      local dap_exe = common.find_lldb_dap()
+      lines[#lines + 1] = ("lldb-dap   : %s"):format(dap_exe or "(not resolved)")
+      if dap_exe and vim.fn.executable(dap_exe) == 1 then
+        local ver = vim.fn.system({ dap_exe, "--version" })
+        -- lldb-dap --version prints multiple lines; the actual version is in
+        -- "  LLVM version X.Y.Z" or "lldb version X.Y.Z". Grep the first
+        -- line that has a "version" token with digits after it.
+        local pretty
+        for _, line in ipairs(vim.split(ver or "", "[\r\n]+", { plain = false })) do
+          local v = line:match("version%s+([%d%.]+)")
+          if v then pretty = line:gsub("^%s+", ""); break end
+        end
+        lines[#lines + 1] = ("  version  : %s"):format(pretty or "(no parsable version)")
+        -- python availability (same probe as attach_commands)
+        local root = vim.fs.dirname(vim.fs.dirname(dap_exe))
+        local has_py = false
+        if root then
+          for _, sub in ipairs({ "lib/site-packages/lldb", "Lib/site-packages/lldb",
+                                  "lib/python3/dist-packages/lldb" }) do
+            local st = (vim.uv or vim.loop).fs_stat(root .. "/" .. sub)
+            if st and st.type == "directory" then has_py = true; break end
+          end
+        end
+        lines[#lines + 1] = ("  python   : %s"):format(has_py and "yes" or "NO (FString native fallback only)")
+      end
+    end
+    -- liveness state
+    local ok_and, android = pcall(require, "ue.dap.android")
+    if ok_and then
+      lines[#lines + 1] = ("liveness   : %s (misses=%s)"):format(
+        android._liveness_timer and "polling" or "off",
+        tostring(android._liveness_misses or 0))
+      if android._last_session then
+        lines[#lines + 1] = ("reattach target: %s @ %s"):format(
+          android._last_session.package_name or "-",
+          android._last_session.serial or "-")
+      end
+    end
+    push("ue.dap.android state", table.concat(lines, "\n"))
   end
-  eval("image list",                           "image list")
-  local state = D._dap_session_state or {}
-  local so_name = state.symbol_lib and vim.fn.fnamemodify(state.symbol_lib, ":t") or "libUE4.so"
-  eval(('image dump symfile "%s"'):format(so_name), "symfile " .. so_name)
-  eval("settings show target.source-map",      "source-map")
+
+  -- ── C. device-side: lldb-server processes + adb forward list ─────────
+  do
+    local lines = {}
+    local s = D._dap_session_state or {}
+    local serial = s.serial
+    if not serial or serial == "" then
+      lines[#lines + 1] = "(no serial — device probes skipped)"
+    else
+      local function adb(args)
+        local cmd = { "adb", "-s", serial }
+        for _, a in ipairs(args) do cmd[#cmd + 1] = a end
+        local out = vim.fn.systemlist(cmd)
+        return out, vim.v.shell_error
+      end
+      local ps_out, _ = adb({ "shell", "ps -A | grep lldb-server" })
+      lines[#lines + 1] = "lldb-server processes:"
+      if #ps_out == 0 then
+        lines[#lines + 1] = "  (none)"
+      else
+        for _, l in ipairs(ps_out) do lines[#lines + 1] = "  " .. l end
+      end
+      local fwd_out, _ = adb({ "forward", "--list" })
+      lines[#lines + 1] = ""
+      lines[#lines + 1] = "adb forward --list:"
+      if #fwd_out == 0 then
+        lines[#lines + 1] = "  (none)"
+      else
+        for _, l in ipairs(fwd_out) do lines[#lines + 1] = "  " .. l end
+      end
+      if s.package_name then
+        local pid_out, _ = adb({ "shell", "pidof " .. s.package_name })
+        local pid = (pid_out[1] or ""):gsub("%s+$", "")
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = ("inferior pid (pidof): %s"):format(pid ~= "" and pid or "(dead)")
+        if pid ~= "" then
+          local status_out, _ = adb({ "shell",
+            ("cat /proc/%s/status 2>/dev/null | grep -E '^State|^TracerPid'"):format(pid) })
+          for _, l in ipairs(status_out) do lines[#lines + 1] = "  " .. l end
+        end
+      end
+    end
+    push("device-side (adb)", table.concat(lines, "\n"))
+  end
+
+  -- ── D. log files: paths + last 20 lines of each ──────────────────────
+  do
+    local lines = {}
+    local logs = {
+      { name = "dap.log (nvim-dap)",
+        path = vim.fn.stdpath("cache") .. "/dap.log" },
+      { name = "ue_dap_e2e.log (lldb-dap trace)",
+        path = (vim.uv or vim.loop).os_tmpdir() .. "/ue_dap_e2e.log" },
+    }
+    for _, l in ipairs(logs) do
+      lines[#lines + 1] = ("── %s ──"):format(l.name)
+      lines[#lines + 1] = ("path: %s"):format(l.path)
+      local fst = (vim.uv or vim.loop).fs_stat(l.path)
+      if not fst then
+        lines[#lines + 1] = "  (file does not exist)"
+      elseif fst.size == 0 then
+        lines[#lines + 1] = "  (empty)"
+      else
+        lines[#lines + 1] = ("  size: %d bytes, mtime: %s"):format(
+          fst.size, os.date("%H:%M:%S", fst.mtime.sec))
+        -- last 20 lines
+        local ok_read, all = pcall(vim.fn.readfile, l.path)
+        if ok_read and #all > 0 then
+          local start = math.max(1, #all - 20)
+          lines[#lines + 1] = ("  ── tail (last %d lines) ──"):format(#all - start + 1)
+          for i = start, #all do lines[#lines + 1] = "    " .. all[i] end
+        end
+      end
+      lines[#lines + 1] = ""
+    end
+    push("log files", table.concat(lines, "\n"))
+  end
+
+  -- ── E. (if session active) lldb introspection commands ────────────────
+  -- These need an active stopped session; if not we just skip the section.
+  if session then
+    local pending = 3
+    local lldb_results = {}
+    local function collect(label, ok, data)
+      lldb_results[#lldb_results + 1] = ("── %s ──\n%s"):format(label,
+        ok and (data or "") or "(failed: " .. tostring(data) .. ")")
+      pending = pending - 1
+      if pending <= 0 then
+        push("lldb introspection (via DAP evaluate)", table.concat(lldb_results, "\n\n"))
+        D._render_diag_buffer(sections)
+      end
+    end
+    local function eval(cmd, label)
+      session:request("evaluate", { expression = "`" .. cmd, context = "repl" },
+        function(err, resp)
+          collect(label, not err and resp and resp.result ~= nil,
+                  resp and resp.result or tostring(err))
+        end)
+    end
+    eval("image list",                           "image list")
+    local state = D._dap_session_state or {}
+    local so_name = state.symbol_lib and vim.fn.fnamemodify(state.symbol_lib, ":t") or "libUE4.so"
+    eval(('image dump symfile "%s"'):format(so_name), "symfile " .. so_name)
+    eval("settings show target.source-map",      "source-map")
+  else
+    D._render_diag_buffer(sections)
+  end
+end
+
+--- Render the assembled diagnostic sections into a scratch buffer in a
+--- bottom split. Factored out so dap_diagnose can call it both synchronously
+--- (no session) and from the lldb evaluate completion callback.
+function D._render_diag_buffer(sections)
+  vim.schedule(function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    local body = table.concat(sections, "\n\n")
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(body, "\n", { plain = true }))
+    vim.bo[buf].buftype = "nofile"
+    vim.bo[buf].bufhidden = "wipe"
+    vim.bo[buf].filetype = "log"
+    vim.api.nvim_buf_set_name(buf, "UEDAPDiag@" .. os.date("%H%M%S"))
+    vim.cmd("botright split")
+    vim.api.nvim_win_set_buf(0, buf)
+    vim.api.nvim_win_set_height(0, math.min(30, math.max(15, vim.api.nvim_buf_line_count(buf))))
+    -- press q to wipe
+    vim.keymap.set("n", "q", "<cmd>bwipeout<cr>", { buffer = buf, silent = true, desc = "Close diag" })
+  end)
 end
 
 -- ─────────────────────────────────────────────────────────────────────

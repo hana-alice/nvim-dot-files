@@ -44,6 +44,38 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-05-21 (later #5) — feat(dap): UEDAPDiag 充实成五段式诊断面板
+
+**Task** 上一版 `:UEDAPDiag` 只跑 3 条 lldb 命令 (`image list` / `image dump symfile` / `source-map`)，且 **要求有 active session**，没 session 直接 `notify("No DAP session")` 退出。但绝大多数"为什么 attach 不上"的诊断需求恰恰发生在 **没有 session** 的时候。重写成五段式：无 session 也能跑，有 session 则附加 lldb 内省段。
+
+**改动**
+
+1. `lua/ue/dap.lua` `dap_diagnose` 重写为五段：
+   - **A. DAP session** — `initialized` / `stopped_thread_id` / thread count / `D._dap_run_state` / current frame / config.name|request|type
+   - **B. ue.dap.android state** — package/serial/pid/port/symbol_lib + adapter 路径 + `lldb-dap --version` 解析 + python module 探针（同 `attach_commands` 探 `lib/site-packages/lldb` 那条）+ liveness poller 状态 + last reattach target
+   - **C. device-side (adb)** — `adb shell ps -A | grep lldb-server` + `adb forward --list` + `pidof <pkg>` + `/proc/<pid>/status` 的 `State`/`TracerPid` (检测 `do_freezer_trap`/`tracing stop` 烂尾态)
+   - **D. log files** — `stdpath('cache')/dap.log` + `os_tmpdir()/ue_dap_e2e.log` 路径 + size + mtime + tail 20 行
+   - **E. lldb introspection (DAP evaluate)** — 仅 active session 时跑，保留原 image/symfile/source-map 三命令
+2. 新增 `D._render_diag_buffer(sections)` —— 把上面拼好的段落 dump 到新 nofile/bufhidden=wipe buffer，botright split，按 `q` 关闭，buffer name 带秒级时间戳（`UEDAPDiag@HHMMSS`）避免覆盖前次诊断
+3. lldb-dap version 解析：`vim.fn.system { dap_exe, '--version' }` 多行输出，老逻辑 `gsub('[\r\n].*$', '')` 只抓第一行 `lldb-dap: LLVM (http://llvm.org/):` 没意义。改成逐行匹配 `version%s+([%d%.]+)`，第二行 `  LLVM version 22.1.6` 命中 ✓
+
+**测试**
+- `nvim --headless -c "lua require('ue.dap')"` → 加载 OK
+- pynvim hot-reload + `:UEDAPDiag` (无 session) → 输出 5 段，含
+  - lldb-dap path = `C:/tools/lldb-22/install/bin/lldb-dap.exe`
+  - version = `LLVM version 22.1.6`
+  - python = `NO (FString native fallback only)`
+  - dap.log tail 把过往 exit code `1` / `3221226505` (0xC0000409) 全暴露出来 ✓
+
+**坑**
+- buffer 命名带时间戳必须**秒级**而不是分钟级：之前测试两次连续敲 `:UEDAPDiag`，秒数一致 buffer 名重复，`nvim_buf_set_name` 撞名 silently fail，看到的还是上次的旧内容。换 `@HHMMSS` + `bufhidden=wipe`，确保 `q` 一关就被清掉，下次新建一定是干净 buffer。
+- `lldb-dap --version` Windows minimal build 第一行**没有版本号**，是 "lldb-dap: LLVM (http://llvm.org/):"。要解析必须逐行扫，匹配 `version%s+([%d%.]+)`。不要假设第一行就是版本信息。
+- `vim.fn.systemlist` 拿 adb shell 输出在 Windows 下行尾自动 strip CR，不用额外处理；但 `vim.fn.system` (无 list 版) 保留 CR。
+- `vim.fn.stdpath('cache')` 在 Windows 上 = `C:\Users\...\AppData\Local\Temp\nvim`（短文件名 `LIZEQI~1`）— 看起来怪但路径有效。
+
+**follow-up（剩余）**
+- C (UE 专属 watch templates: UObject/FName/UEnum 一键 watch) 未做
+
 ### 2026-05-21 (later #4) — feat(dap): 补齐 IDE 调试交互能力（hover / eval / watch / run-to-cursor / frame nav）
 
 **Task** 当前 UEDAP 命令集只覆盖 attach/stop/continue/pause/step/toggle-bp/UI 这些"启动+步进"基础项；条件断点和 logpoint 函数早就实现在 `_persist_bp.lua` 但**没接成 user command 或 keymap**，hover/eval/watch/run-to-cursor/frame-up-down/restart-frame 完全缺失。这轮把缺口补齐到 VSCode/CLion 同等水平。

@@ -44,6 +44,83 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-05-21 — lldb-dap 22.1.6 迁移落地（删 codelldb，砍 136 行）
+
+**Task** 端到端验证通过 (probe_bp_v13 confirmed real BP hit on FEngineLoop::Tick
+on 2026-05-21) 后正式迁移：android.lua 从 codelldb + gdbserver --attach 切到
+lldb-dap + platform remote-android。一次性删除全部 codelldb 路径，遵循用户
+红线"不留两个并存入口"。
+
+**Implemented**
+- `lua/ue/dap/android.lua`：
+  - 文件头 doctring 全段重写（codelldb→lldb-dap, gdbserver→platform mode）
+  - `ensure_lldb_server_in_app` (run-as sandbox copy + ndk27 后缀) →
+    `ensure_lldb_server_pushed` (PUBLIC /data/local/tmp/lldb-server)
+  - `start_lldb_server_gdbserver` (sh-in-sh hack 脚本 + tracerpid 轮询) →
+    `start_lldb_server_platform` (`./lldb-server platform --server --listen *:N`)
+  - `pick_libue4_base` 整段删除（platform mode 自动 sync module slides）
+  - `init_commands`：保留 packet-timeout / inline-breakpoint / formatter
+    导入；新增 `target.exec-search-paths` 指向 host-side libUE4.so 目录，
+    避免拉 device 上 stripped 副本
+  - `attach_commands` 新增（codelldb 没有等价物）：4 行 platform select +
+    connect + process attach --pid + 3× `process handle ... --notify FALSE`
+    （CRITICAL：去 false 直接复现 1820+ stopped event 风暴 = adapter 死）
+  - `lldb_dap_attach_config` 替换 `codelldb_attach_config`：type="lldb",
+    request="attach", attachCommands+initCommands 取代 targetCreateCommands
+    +processCreateCommands+postRunCommands
+  - `_cleanup_device_side`：run-as pkill → 直接 killall（PUBLIC location 不
+    需要 run-as），fallback 端口 5045→5039
+  - `M.attach/launch/reattach` config name "(codelldb)" → "(lldb-dap)"
+  - `M.status` 删 libUE4 base 行
+  - `M._codelldb_attach_config_for_test` → `M._lldb_dap_attach_config_for_test`
+- `lua/ue/dap/_common.lua` 整段删除：
+  - `M.find_codelldb` / `M.ensure_codelldb_adapter` / `M.run_codelldb`
+  - 该文件历史最末段 88 行 codelldb (Android route) 整体清掉
+- `lua/ue/dap.lua` setup_dap：
+  - 删 `C.find_codelldb()` + `C.ensure_codelldb_adapter()` 段
+  - dap.configurations.cpp 默认条目 type "codelldb"→"lldb",
+    request "launch"→"attach", name "(codelldb)"→"(lldb-dap)"，并兼容旧
+    name 防止用户已有 launch.json 重复注入
+- `lua/utils/platform/windows.lua`：删 `default_codelldb_paths()` 17 行
+- `tools/test_e2e_android_codelldb.lua` → `tools/test_e2e_android_lldb_dap.lua`
+  （文件 git mv + 内容 codelldb→lldb-dap 文案修整 + default port 5045→5039）
+
+**Pitfalls / Gotchas**
+- platform mode wildcard listen：`--listen *:port` 必须在 git-bash 命令行
+  转义成 `\\*:port` (这里有反斜杠转义层 + sh 层 + adb shell 层)，否则
+  shell glob 把 `*` 展开成当前目录里第一个文件名 → lldb-server 启动失败。
+  android.lua 里我们用 `\\*:%d` 拼 string.format 后整串走 `vim.fn.system
+  { adb, ..., "shell", cmd_string }`，由 adb shell 直接交给 device sh，
+  避开 host-side 展开。
+- `target.exec-search-paths` 是 lldb 设置项不是 dap setting，必须放在
+  `initCommands` 里以 `settings set` 形式发，不能塞 dap config 顶层。
+- 兼容已存在 launch.json：原来 nvim-dap configurations.cpp 里若有用户手动
+  添加的 "UE Android Attach (codelldb)" 条目，现在 setup_dap 不会重复
+  注入新条目（match 旧名也算 have_ue_attach）。但旧条目 type="codelldb"
+  会失败 — 用户重启 nvim 即可清除。
+- 不再需要 host-side libUE4.so 也能跑：lldb-dap platform mode 会从 device
+  pull stripped libUE4.so 进 ~/.lldb/module_cache（一次性 3.85GB）。
+  symbol_lib 现在是"强烈建议"而非"必需"，缺它仍能 attach + setBP，只是
+  source 视图为空。
+
+**Validation**
+- `nvim -l scripts/headless_smoke.lua` → 97/97 passed, 0 failed
+- `nvim -l scripts/lint_no_bare_globals.lua` → 95 files scanned, OK
+- `lua/ ` 下死 codelldb 引用 = 0（grep
+  `find_codelldb|run_codelldb|ensure_codelldb_adapter|adapters.codelldb|
+   type="codelldb"` 全空）
+- 4 个核心模块（ue.dap / ue.dap.android / ue.dap._common /
+  utils.platform.windows）headless require 全部 OK
+
+**净删 136 行**（5 files: 211 + / 347 -）
+
+**Follow-ups**
+- 真机端到端：装好的 nvim 跑 `:UEDAPAttach`，验完整 attach + 命中 +
+  variables panel 链路。Probe 已在 lldb-dap 协议层证明可行
+  (probe_bp_v13.py)，nvim/dapui 集成仍需触发一次。
+- 长期：LLVM 22.2 / 23 release 出来重跑 probe_bp_v12 / v13 作 regression。
+- docs/TOOLING.md 还有 codelldb 段（150-159 行），下次顺手清。
+
 ### 2026-05-21 — lldb-dap 22.1.6 platform-mode 迁移评估（**翻案**：可迁，根因不在 LLVM）
 
 **Task** 续前一条 "驳回" 评估，用户要求 "继续追踪"。结果**翻案**：lldb-dap

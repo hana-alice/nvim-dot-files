@@ -44,6 +44,55 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-05-21 (later #2) — fix: auto-continue `entry` stops on Android attach (PID jump fix)
+
+**Task** Follow-up #1 from the lldb-dap live-attach session: stop the Android
+inferior from getting relaunched by Android's watchdog mid-attach. Root cause
+was the 174 `event_stopped` events (one per thread, `reason = "entry"`) that
+lldb-dap emits after `process attach --pid` returns under platform mode with
+stopOnEntry=true — the inferior sat frozen, system_server flagged it as ANR
+within seconds, the launcher relaunched the app, and the user saw PID jump.
+
+**Implemented**
+- `lua/ue/dap.lua` `dap.listeners.after.event_stopped["ue-dap-run-state"]`:
+  add `entry` to the auto-continue benign-reason whitelist alongside
+  `exception`. Remove the now-redundant `_dap_attach_in_progress` guard —
+  the inner `has_bp` / `reason` filters already exclude real breakpoints
+  and user `pause` requests.
+
+**Root-cause trace evidence** (Temp/ue_dap_e2e.log, 17:55 attach)
+- `EVT event_stopped body={ allThreadsStopped=true, description="signal SIGSTOP", reason="entry", threadId=8238 }`
+- Repeated 174× (one per thread) with `reason="entry"` — the listener's
+  old `reason=="exception"` filter dropped every single one, so no
+  auto-continue ever fired, inferior stayed in SIGSTOP indefinitely.
+
+**Pitfalls / Gotchas**
+- The OLD listener comment specifically called out "Android sends stray
+  SIGSTOP/SIGSEGV on unrelated threads". The author was thinking about
+  *post-attach* signals (`reason="exception"`), not realizing the
+  *attach-time* SIGSTOP wave comes in as `reason="entry"`. Two different
+  DAP reasons for what looks like the same signal class.
+- stopOnEntry=true is non-negotiable on platform-mode Android (see the
+  comment in `android.lua` lldb_dap_attach_config) — we can't fix this by
+  flipping stopOnEntry to false. The fix has to be on the consumption side.
+
+**Validation**
+- Headless luafile syntax check OK.
+- Live e2e verification deferred: during attempted in-place validation the
+  running Neovide nvim's lldb-dap spawn hit a 0xC0000409
+  (STATUS_STACK_BUFFER_OVERRUN) startup crash on the SECOND attach,
+  blocking re-test in the same nvim instance. Standalone `lldb-dap.exe
+  --help` and a fresh probe_attach.py both pass against 22.1.6, so the
+  binary itself is healthy — the stdio fd-3 invalidation seems to be a
+  nvim-dap-side condition triggered by hot-reloading the adapter wiring
+  in a long-running Neovide session. Captured as new follow-up.
+
+**Follow-ups**
+- Stdio fd-3 invalidation after `ensure_adapter` re-wires in a hot-reloaded
+  ue.setup() — surfaces as 0xC0000409 on the next lldb-dap spawn. Needs
+  reproducer outside Neovide to isolate.
+- Followups 2 (FString formatter) and 3 (UEDAPStop ordering) still open.
+
 ### 2026-05-21 (later) — lldb-dap 22.1.6 nvim live attach 端到端验证
 
 **Task** 接续上午"lldb-dap 22.1.6 迁移落地"。Phase 1 用 `probe_attach.py` 验过裸

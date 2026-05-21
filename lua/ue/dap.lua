@@ -921,20 +921,27 @@ function D.setup_dap(dap, dapui)
     D._continue_pending = false
     D._continue_debounce_until_ms = 0
     D._pause_pending = false
-    -- Auto-continue on signal stops that aren't breakpoints (Android sends
-    -- stray SIGSTOP/SIGSEGV on unrelated threads — Chrome_IOThread, Signal
-    -- Catcher, …). Stopping on them freezes the app and confuses the user.
-    if not D._dap_attach_in_progress then
-      body = body or {}
-      local reason = tostring(body.reason or ""):lower()
-      local has_bp = body.hitBreakpointIds and #body.hitBreakpointIds > 0
-      if reason == "exception" and not has_bp then
-        vim.defer_fn(function()
-          if dap.session() == session and D._dap_run_state == "stopped" then
-            request_dap_continue(dap)
-          end
-        end, 50)
-      end
+    -- Auto-continue on benign stops that the user did not request:
+    --   * `entry` — stopOnEntry=true on Android attach lands us in 174
+    --     SIGSTOP events (one per thread) the instant `process attach`
+    --     returns. Without auto-continue, the inferior sits frozen, the
+    --     watchdog (Android system_server) eventually flags it as ANR
+    --     and may relaunch the app — observed as "PID jumps after attach".
+    --   * `exception` — Android delivers stray SIGSEGV/SIGSTOP/SIGBUS on
+    --     unrelated threads (Chrome_IOThread, Signal Catcher, …). Stopping
+    --     on them freezes the app and confuses the user.
+    -- A real breakpoint hit reports `hitBreakpointIds`; a user-requested
+    -- pause reports `reason = "pause"`. Both bypass auto-continue.
+    body = body or {}
+    local reason = tostring(body.reason or ""):lower()
+    local has_bp = body.hitBreakpointIds and #body.hitBreakpointIds > 0
+    local is_benign = (reason == "entry" or reason == "exception") and not has_bp
+    if is_benign then
+      vim.defer_fn(function()
+        if dap.session() == session and D._dap_run_state == "stopped" then
+          request_dap_continue(dap)
+        end
+      end, 50)
     end
   end
   dap.listeners.after.event_continued["ue-dap-run-state"] = function(session)

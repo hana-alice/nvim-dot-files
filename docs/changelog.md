@@ -44,6 +44,32 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-05-21 (later #8) — fix(dap): UEDAPDiag clamp evaluate responses universally
+
+**Task** Fix #7 (`image list -b` filter) 实测无效——D2 实测 buffer 仍 1124845 行。深入分析后发现：**罪魁不是 `image list` 而是 `image dump symfile "libUE4.so"`**。UE4 主 so 含数百万符号，symfile dump 每个符号一段、含 DIE/CU/sections，单次响应几十 MB / 百万行级别。`-b` flag 改 image list 行为但 symfile 不受影响，所以前一版 fix 只 patch 了一半路径，buffer 继续被 symfile 撑爆。
+
+**改动**
+
+1. `lua/ue/dap.lua` section E 引入 **统一 clamp** — `MAX_BYTES_PER_RESPONSE = 32KB` + `MAX_LINES_PER_RESPONSE = 200`，每条 evaluate response 在装进 buffer 前 (a) 按字节截断 + 写明 "truncated; raw was N bytes" 提示，(b) 再按行数截断防短行洪水。
+2. 删掉 #7 的 image-list-only inline 过滤代码（复杂、覆盖不全），统一走 `eval()` + `clamp()` 路径。三条命令（`image list -b` / `image dump symfile <lib>` / `settings show target.source-map`）行为对称。
+3. 注释明确：diag 是 one-screen 摘要不是 full dump；想看完整输出走 `:UEDAPRepl <cmd>`（将来加这命令）。
+
+**验证（pending: 用户重启 Neovide 后跑）**
+
+D3 attempt (PID 42176) 跑到一半 nvim 卡死 pipe 不响应，**进程没 OOM (110 MB)** 但 Windows named pipe server 失活——这是另一个独立的 nvim Win32 bug（client timeout 时 pipe server 不清理）。本 fix 防止 evaluate response 之大触发 buffer 爆涨，应该同时也能间接缓解 pipe 卡死（少量数据 buffer set lines 不会触发 vim 主 loop 长阻塞）。
+
+**坑**
+
+- **症状归因偏差**：#7 把锅扣在 `image list` 上做了 inline filter，但 D2 实测 fix 之后仍 1.1M 行——**因为 fix 只改了 image list 不改 symfile**。debugging 时不能只看症状关键词（"image list 1.1M 行"）就锁定它，要看 collect() 实际收到 3 段响应里**哪段贡献了**那 1.1M。今后用 `lldb_results[i]` 各段长度日志辅助定位。
+- **lldb-dap 22.1.6 的 `image list -b` 行为未确认** — D2 跑出 1.1M 行说明 `-b` flag 没生效（被忽略 / 当 module name filter），但 D3 想直接 evaluate 验证时 nvim pipe 死掉。当下 fix 不依赖 `-b` 行为正确——universal clamp 兜底无论 lldb 怎么响应都安全。
+- **Windows nvim named pipe failure 模式**：进程仍活，CPU normal，但 `\\.\pipe\nvim.PID.0` 直接 `FileNotFoundError`。无法救活，只能重启。本轮已 2 次复现，下次起在脚本内部捕 socket exception 立即 graceful，不一直 retry。
+
+**Follow-up**
+
+- 用户重启后跑 D4：实测 clamp 后 buffer 总行数 ≤ ~600 行 (3 段 × 200 + 头部)，不会 OOM。
+- 加 `:UEDAPRepl <cmd>` user command 给用户跑任意 lldb 命令的逃生口（结果走单独 buffer 同样 clamp）。
+- 单独 skill 记录 lldb-dap evaluate response 大小陷阱 + Windows nvim pipe 失活模式。
+
 ### 2026-05-21 (later #7) — fix(dap): UEDAPDiag `image list` 限流，避免 OOM
 
 **Task** Phase D 实测时 `:UEDAPDiag` 在 attach 状态下跑出 **1125437 行**输出，吃掉 nvim 1.5 GB working set 后 pipe server 卡死。根因：UE Android attach 后 LLDB 加载 ~700 个共享库，`image list` 每个库一段、含 sections，单次命令出百万行。LLDB CLI 又不支持 shell pipe（`image list | head -5` → `error: unknown or ambiguous option`），不能在 LLDB 侧分页。

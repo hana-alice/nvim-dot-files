@@ -76,11 +76,23 @@ keep this file rolling forward as the unreleased section.
 **测试**
 - `nvim --headless -c "lua require('ue.dap.android')"` → 加载 OK
 - `nvim --headless luafile lua/ue/dap/android.lua` → exit 0
-- 实测验证（需要 fresh Neovide 重启）：
-  - `:UEDAPStop` 后跑 `adb shell ps -A | grep <pkg>` 应该看到 inferior 干净退出
-    或 state=R/S，不再 stuck on state=T
-  - FString 变量 hover 显示 `string=...` 而不是裸 char16_t 指针
-  - notify 弹出 "FString fallback only" 字样
+- ✅ **fresh Neovide 实测通过 (2026-05-21 18:49)**：
+  - `:UEDAPAttach android` → 171 threads, PID 11788 → 11788 (#1 修复确认)
+  - `type summary list UEFallback` 返回 `FString: ${var.Data.AllocatorInstance.Data%s}`，
+    summary rule 注册成功 (#2 修复确认)
+  - `:UEDAPStop` → dap.session() 清空 +1.17s, lldb-server gone +1.83s
+    （killall 后于 disconnect ACK，符合两阶段设计）；
+    post-stop 游戏 state=S TracerPid=0，**不再 stuck 在 T (tracing stop)** (#3 修复确认)
+
+**坑（实测发现）**
+- Android `do_freezer_trap` 状态：app 在后台被 cgroup freezer 冻住（不是 SIGSTOP），
+  ptrace attach 会卡住但不报错。要 attach 必须先 `monkey -p PKG -c LAUNCHER 1` 或
+  `am start -W` 拉到前台直到 GameActivity resumed。判据：`ps` state 从 `do_freezer_trap`
+  变成 `do_epoll_wait`/`do_select`。
+- 旧 stuck ptracer 清理：如果上次 stop 失败留下 `State: t TracerPid: <pid>`，
+  `killall -9 lldb-server` 把 tracer 干掉后 state 变 `T (signal stop) TracerPid: 0`
+  ——这时仍卡住，需要 `kill -CONT <inferior_pid>` 或 ANR watchdog 触发 launcher 重启。
+  **这就是 follow-up #3 修复要根除的烂尾态**。
 
 **坑**
 - `dap.session():request(cmd, args, cb)` 真签名（nvim-dap 上游 session.lua:1883）：
@@ -94,8 +106,7 @@ keep this file rolling forward as the unreleased section.
   让 lldb 自己选 summary，待 fresh nvim 实测确认。
 
 **follow-up（剩余）**
-- #1 PID 跳变修复实测：需 fresh Neovide 跑 `:UEDAPAttach android`，对比 attach 前后
-  `pidof com.example.mygame` 应该不变（hot-reload session 因 0xC0000409 阻塞实测）
+- ✅ #1 PID 跳变修复：fresh 实测确认（见上方测试段）
 - #4: nvim-dap hot-reload 后 lldb-dap 0xC0000409 STATUS_STACK_BUFFER_OVERRUN。
   fresh nvim 不复现，仅 `package.loaded[...]=nil; require('ue').setup()` 后 attach
   触发。怀疑 ensure_adapter 重新喂 stdio pipe 时 `_get_osfhandle(3)` 失效（skill

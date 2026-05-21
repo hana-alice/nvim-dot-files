@@ -44,6 +44,56 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-05-21 (later) — lldb-dap 22.1.6 nvim live attach 端到端验证
+
+**Task** 接续上午"lldb-dap 22.1.6 迁移落地"。Phase 1 用 `probe_attach.py` 验过裸
+DAP 协议；本次在 user 实际 Neovide nvim (PID 45484, --embed) 里跑
+`:UEDAPAttach android` 完整端到端。
+
+**Validation**
+- `pynvim` 走 `\\.\pipe\nvim.45484.0` (Win 路径必须 forward-slash 形式) 探查
+- 旧 nvim 缓存了过期 adapter (`C:/tools/lldb-21/...`)；强制清
+  `package.loaded[ue.dap*|utils.platform*|ue.config|ue]` 后 `require('ue').setup()`
+  → adapter 切到 `C:/tools/lldb-22/install/bin/lldb-dap.exe` (22.1.6)，
+  `:UEDAPStop`/`:UEDAPStatus`/`:UEDAPReattach` 命令重新注册
+- 装 DAP listener trace 写 `Temp/ue_dap_e2e.log`
+- 多设备弹 snacks.picker（emulator + 工作机两台），
+  `nvim_input('<CR>')` 确认 emulator
+- 完整 attach 拿到：`has_session=true initialized=true thread_count=174`
+  (qm-thread, CrashSightThread, V8 worker, hwuiTask, OkHttp 等都在)
+- `_last_session` 全字段填齐 (serial=<emulator>, package=com.example.mygame,
+  symbol_lib=<project>/Source/Client/Binaries/Android/<sym-dir>/Client-arm64/libUE4.so,
+  source-map <build-host-path> ↔ <local-project-path>)
+- `$__lldb_version: 22.1.6 fc4aad7b` 在 trace 里确认
+- `:UEDAPStop` → disconnect 异步 ~3s 后 `dap.session()=nil` 干净
+
+**Pitfalls / Gotchas**
+- **Neovide --embed 不能 jobstart 重启自己**：必须用 RPC 强制清
+  `package.loaded` + 手 `require('ue').setup()` 才能让正在运行的 nvim 拾起
+  改过的 windows.lua / android.lua。否则跑的还是缓存。
+- **`vim.fn.input` ≠ snacks.picker**：`pick_serial_async` 多设备走
+  `vim.ui.select` 被 LazyVim 桥到 snacks。`nvim_feedkeys` 不进 picker
+  input 的 keymap，要用 `nvim_input`（走真键盘输入循环）。
+- **端到端时游戏 PID 跳了**：attach 前 PID=8238 → stop 后 `pidof` 空 → 几秒
+  后看 `ps -A | grep <pkg>` 是 PID=9346 (state=S, do_freezer_trap)。
+  Android 应用在 attach 期间 SIGSEGV 触发了 launcher 自动重启。
+  init/preRun 里有 `process handle SIGSEGV --notify false --pass false
+  --stop false` 但 trace 显示 174 个 thread 各发了一次 SIGSTOP
+  event_stopped——这是 attach 时 lldb-server 自己发的 SIGSTOP，不被
+  `process handle` 管。看是否需要在 platform connect 后立即 `continue`
+  (open follow-up)。
+- **LLDB Python 模块缺失**：`UE4DataFormatters_2ByteChars.py` 加载报
+  `No module named 'lldb'`——LLVM 22.1.6 Windows 自建版本没打包 lldb python
+  module。FString/TArray pretty-print 失效。可接受 caveat，记 follow-up。
+
+**Follow-ups**
+- Attach 后立刻 `continue` 让游戏不要在 SIGSTOP 状态裸奔（可能是 PID 跳的根源）
+- LLDB python 模块：要么改用带 python 的 LLVM build，要么干脆改用纯 LLDB
+  format string formatter (lldb-dap 支持 `command alias` 而非
+  `command script import`)
+- `:UEDAPStop` 杀 lldb-server 顺序：先发完 detach 再 killall，避免 ptrace
+  泄漏给游戏
+
 ### 2026-05-21 — lldb-dap 22.1.6 迁移落地（删 codelldb，砍 136 行）
 
 **Task** 端到端验证通过 (probe_bp_v13 confirmed real BP hit on FEngineLoop::Tick

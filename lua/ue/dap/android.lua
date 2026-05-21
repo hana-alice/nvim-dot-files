@@ -407,21 +407,45 @@ local function start_lldb_server_platform(adb, serial, port)
     "killall lldb-server 2>/dev/null; true" })
   vim.wait(150)
 
-  -- Launch in detached background. Pattern proven by probe_bp_v13.py:
-  --   adb shell "cd /data/local/tmp && ./lldb-server platform --server --listen *:5039"
-  -- We background-spawn via the adb shell, not via vim.fn.jobstart, so the
-  -- device-side process survives even when the host-side adb client exits.
-  -- Use nohup + </dev/null + redirect + & so the shell can exit cleanly.
+  -- Spawn `lldb-server platform --server --listen *:N` as a never-exiting
+  -- foreground process on the device, and treat the host-side `adb shell`
+  -- as a long-lived background job that mirrors that lifetime.
+  --
+  -- DO NOT use nohup + `&` + `vim.fn.system(...)`. On Android 14+ adbd's
+  -- shell does NOT consider its stdout closed even when the child is
+  -- `nohup`-ed and redirected — the adb shell client therefore blocks
+  -- forever, and so does vim.fn.system (proven on an arm64 emulator
+  -- 2026-05-21: device-side server reaches LISTEN state, host-side
+  -- vim.fn.system never returns). probe_bp_v13.py escaped this by using
+  -- subprocess.Popen with stdout=DEVNULL and NOT calling .wait() — same
+  -- shape we replicate here via vim.fn.jobstart (detached + no callbacks).
   --
   -- IMPORTANT: `--listen *:port` works for `lldb-server platform`. The
   -- positional `[host]:port` form that NDK 27 lldb-server's gdbserver mode
   -- required does NOT apply here — platform mode accepts the wildcard.
   local cmd = string.format(
-    "cd /data/local/tmp && nohup ./lldb-server platform --server --listen \\*:%d </dev/null >./lldb-server-platform.log 2>&1 &",
+    "cd /data/local/tmp && ./lldb-server platform --server --listen \\*:%d",
     port
   )
-  vim.fn.system({ adb, "-s", serial, "shell", cmd })
-  vim.wait(400)
+  -- jobstart returns immediately; we don't care about output, but we DO
+  -- want the job tracked so a later VimLeavePre can kill the adb client
+  -- (which kills the device-side ssh-tunnel-equivalent and thus the
+  -- platform server too).
+  local jobid = vim.fn.jobstart({ adb, "-s", serial, "shell", cmd }, {
+    detach = false,
+    -- Discard output: lldb-server platform doesn't print anything
+    -- meaningful and keeping the pipe open silently is fine since
+    -- jobstart doesn't block on a full buffer.
+  })
+  if not jobid or jobid <= 0 then
+    return false, "failed to spawn adb shell lldb-server (jobstart=" .. tostring(jobid) .. ")"
+  end
+  -- Snapshot the job id on the module so cleanup can kill it on detach.
+  M._lldb_server_jobid = jobid
+
+  -- Give the device-side lldb-server time to bind the socket BEFORE we
+  -- try `adb forward`. 400ms is conservative; probe_bp_v13.py uses 1.5s.
+  vim.wait(800)
 
   -- adb forward host:port → device:port. Idempotent.
   adb_run(adb, { "-s", serial, "forward", "--remove", "tcp:" .. port })
@@ -429,16 +453,7 @@ local function start_lldb_server_platform(adb, serial, port)
     if vim.v.shell_error ~= 0 then return false, "adb forward failed" end
   end
 
-  -- Probe that the platform server is actually listening. `lsof` is not
-  -- universally present on Android, but a `pgrep -f lldb-server` will
-  -- confirm the process is alive.
-  for _ = 1, 15 do
-    local out = adb_run(adb, { "-s", serial, "shell",
-      "pgrep -f 'lldb-server platform' || true" })
-    if out and out:match("%d+") then return true, nil end
-    vim.wait(120)
-  end
-  return false, "lldb-server platform did not start within ~2s"
+  return true, nil
 end
 
 -- ── lldb-dap config builder ───────────────────────────────────────────────
@@ -539,7 +554,25 @@ local function lldb_dap_attach_config(session, source_map)
     name           = "UE Android Attach (lldb-dap)",
     type           = "lldb",  -- matches dap.adapters.lldb wired by _common.ensure_adapter
     request        = "attach",
-    stopOnEntry    = false,
+    -- stopOnEntry MUST be true even though we don't want to "stop on
+    -- entry" semantically. Background: lldb-dap's platform-mode attach
+    -- sequence executes attachCommands (platform select / connect / process
+    -- attach), at which point the target is paused. lldb-dap then reports
+    -- this paused state via a `stopped` event. If stopOnEntry=false,
+    -- nvim-dap auto-issues `continue` before our user-level continue gets
+    -- a chance, and any subsequent `configurationDone` request fails with
+    -- "Expected process to be stopped". With stopOnEntry=true nvim-dap
+    -- waits for an explicit continue. We never expose the "entry stop"
+    -- to the user — the post-attach continue in finalize hands the
+    -- process right back to running before any UI panel paints.
+    stopOnEntry    = true,
+    -- lldb-dap timeout in seconds for the full attach sequence (platform
+    -- connect + process attach + module enumeration). Default is 30s
+    -- which is too short for a 3.85 GB libUE4.so over USB. probe_bp_v13
+    -- uses 180s and verified it's enough margin. Note this is a
+    -- lldb-dap-specific config key under the `attach` request body, not
+    -- a DAP-spec field.
+    timeout        = 180,
     cwd            = vim.fn.getcwd(),
     initCommands   = init_commands(session),
     attachCommands = attach_commands(session),
@@ -601,6 +634,13 @@ end
 --- panels disappear ("the debug UI just closed by itself").
 function M._cleanup_device_side()
   local sess = M._session
+  -- Stop the host-side `adb shell lldb-server platform` job we spawned via
+  -- jobstart in start_lldb_server_platform. Killing the adb client closes
+  -- the shell, which the device propagates to the platform server.
+  if M._lldb_server_jobid and M._lldb_server_jobid > 0 then
+    pcall(vim.fn.jobstop, M._lldb_server_jobid)
+    M._lldb_server_jobid = nil
+  end
   if sess.serial and sess.adb then
     -- PUBLIC platform-mode lldb-server: no need for run-as. A plain
     -- killall on the binary covers both the live platform server and any

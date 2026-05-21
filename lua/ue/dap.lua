@@ -261,6 +261,151 @@ function D.dap_list_breakpoints()
   require("ue.dap._persist_bp").list()
 end
 
+-- ── Inspect / evaluate / navigate ──────────────────────────────────────────
+--
+-- These wrap `dap.ui.widgets` and `dap.session():request` to give us the
+-- VSCode/CLion-equivalent debug interactions: hover-eval, expression prompt,
+-- add-watch from cword, run-to-cursor, frame up/down, restart frame.
+--
+-- All of them no-op (with a notify) when there's no active session — this
+-- keeps F-key bindings safe to press before attach has happened.
+
+local function _require_session()
+  local ok, dap = D.ensure_dap_loaded()
+  if not ok then return nil, nil end
+  local s = dap.session()
+  if not s then
+    vim.notify("[ue.dap] no active session", vim.log.levels.WARN)
+    return nil, dap
+  end
+  return s, dap
+end
+
+--- Show a floating hover popup with the variable / expression under cursor.
+--- In visual mode evaluates the selection. K-style.
+function D.dap_hover()
+  local _, dap = D.ensure_dap_loaded()
+  if not dap then return end
+  if not dap.session() then
+    vim.notify("[ue.dap] no active session — start attach first", vim.log.levels.WARN)
+    return
+  end
+  local ok, widgets = pcall(require, "dap.ui.widgets")
+  if not ok then
+    vim.notify("[ue.dap] dap.ui.widgets not available", vim.log.levels.WARN)
+    return
+  end
+  -- Visual selection? Pull the selected text as the expression.
+  local mode = vim.api.nvim_get_mode().mode
+  if mode == "v" or mode == "V" or mode == "\22" then
+    -- yank to register z without clobbering "
+    vim.cmd('noautocmd silent normal! "zy')
+    local expr = vim.fn.getreg("z")
+    if expr and expr ~= "" then
+      widgets.hover(function() return expr end)
+      return
+    end
+  end
+  widgets.hover()
+end
+
+--- Prompt for an arbitrary expression and print the result to :messages.
+--- Useful when you want the answer to stick around instead of disappearing
+--- with a hover popup.
+function D.dap_eval_prompt()
+  local sess = _require_session()
+  if not sess then return end
+  vim.ui.input({ prompt = "DAP eval: " }, function(expr)
+    if not expr or expr == "" then return end
+    local frame_id
+    if sess.current_frame then frame_id = sess.current_frame.id end
+    sess:request("evaluate", {
+      expression = expr,
+      context = "repl",
+      frameId = frame_id,
+    }, function(err, body)
+      if err then
+        vim.notify("[ue.dap eval] " .. (err.message or vim.inspect(err)),
+          vim.log.levels.ERROR)
+        return
+      end
+      local out = body and body.result or "<no result>"
+      vim.notify("[ue.dap eval] " .. expr .. "  =>  " .. tostring(out),
+        vim.log.levels.INFO)
+    end)
+  end)
+end
+
+--- Add the word under cursor (or visual selection) to dapui's Watches panel.
+--- Falls back to `dap.repl` `-exec` if dapui isn't loaded.
+function D.dap_add_watch_cword()
+  local sess = _require_session()
+  if not sess then return end
+  local expr
+  local mode = vim.api.nvim_get_mode().mode
+  if mode == "v" or mode == "V" or mode == "\22" then
+    vim.cmd('noautocmd silent normal! "zy')
+    expr = vim.fn.getreg("z")
+  else
+    expr = vim.fn.expand("<cword>")
+  end
+  if not expr or expr == "" then
+    vim.notify("[ue.dap] nothing under cursor to watch", vim.log.levels.WARN)
+    return
+  end
+  -- Strip whitespace + newlines so multi-line visual selections become one expr.
+  expr = expr:gsub("[\r\n]+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+  local dapui_ok, dapui = D.ensure_dapui_loaded()
+  if dapui_ok and dapui.elements and dapui.elements.watches
+                and dapui.elements.watches.add then
+    dapui.elements.watches.add(expr)
+    vim.notify("[ue.dap] watch added: " .. expr, vim.log.levels.INFO)
+  else
+    vim.notify("[ue.dap] dapui watches unavailable — use REPL", vim.log.levels.WARN)
+  end
+end
+
+--- Run-to-cursor: ephemeral breakpoint at current line + continue, removed
+--- when the session next stops. Implemented via dap.run_to_cursor() (nvim-dap
+--- built-in).
+function D.dap_run_to_cursor()
+  local _, dap = D.ensure_dap_loaded()
+  if not dap then return end
+  if not dap.session() then
+    vim.notify("[ue.dap] no active session — start attach first", vim.log.levels.WARN)
+    return
+  end
+  dap.run_to_cursor()
+end
+
+--- Move up one stack frame (callee -> caller direction).
+function D.dap_frame_up()
+  local _, dap = D.ensure_dap_loaded()
+  if not dap or not dap.session() then
+    vim.notify("[ue.dap] no active session", vim.log.levels.WARN); return
+  end
+  dap.up()
+end
+
+--- Move down one stack frame (caller -> callee direction).
+function D.dap_frame_down()
+  local _, dap = D.ensure_dap_loaded()
+  if not dap or not dap.session() then
+    vim.notify("[ue.dap] no active session", vim.log.levels.WARN); return
+  end
+  dap.down()
+end
+
+--- Restart the current stack frame (rewinds to function entry, re-executes).
+--- Requires adapter support; lldb-dap supports it on attach sessions.
+function D.dap_restart_frame()
+  local _, dap = D.ensure_dap_loaded()
+  if not dap or not dap.session() then
+    vim.notify("[ue.dap] no active session", vim.log.levels.WARN); return
+  end
+  dap.restart_frame()
+end
+
 function D.dap_continue()
   local ok, dap = D.ensure_dap_loaded()
   if not ok then return end

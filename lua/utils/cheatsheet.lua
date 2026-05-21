@@ -512,12 +512,27 @@ local tabs = {
         mappings = {
           { "<leader>da",   "Attach to Android" },
           { "<leader>dl",   "Launch + auto attach" },
-          { "<leader>db",   "Toggle HW breakpoint" },
+          { "<leader>db",   "Toggle breakpoint" },
+          { "<leader>dB",   "Conditional breakpoint" },
+          { "<leader>dL",   "Logpoint" },
+          { "<leader>dC",   "Clear all breakpoints" },
           { "<leader>dc",   "Continue" },
           { "<leader>dp",   "Pause" },
           { "<leader>dn",   "Step over" },
           { "<leader>di",   "Step in" },
           { "<leader>do",   "Step out" },
+        },
+      },
+      {
+        title = "DAP Inspect / Navigate",
+        mappings = {
+          { "<leader>dh",   "Hover eval (cword / selection)" },
+          { "<leader>de",   "Evaluate expression (prompt)" },
+          { "<leader>dw",   "Add cword / selection to Watches" },
+          { "<leader>dt",   "Run to cursor" },
+          { "<leader>dk",   "Stack frame up" },
+          { "<leader>dj",   "Stack frame down" },
+          { "<leader>dR",   "Restart current frame" },
         },
       },
       {

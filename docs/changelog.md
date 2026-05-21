@@ -44,6 +44,53 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-05-21 (later #4) — feat(dap): 补齐 IDE 调试交互能力（hover / eval / watch / run-to-cursor / frame nav）
+
+**Task** 当前 UEDAP 命令集只覆盖 attach/stop/continue/pause/step/toggle-bp/UI 这些"启动+步进"基础项；条件断点和 logpoint 函数早就实现在 `_persist_bp.lua` 但**没接成 user command 或 keymap**，hover/eval/watch/run-to-cursor/frame-up-down/restart-frame 完全缺失。这轮把缺口补齐到 VSCode/CLion 同等水平。
+
+**改动**
+
+1. `lua/ue/dap.lua` 加 7 个新函数 (插在 `dap_list_breakpoints` 之后)：
+   - `D.dap_hover()` — 调用 `dap.ui.widgets.hover()`；visual 模式 yank 到 reg z 当 expression
+   - `D.dap_eval_prompt()` — `vim.ui.input` + `sess:request("evaluate", { context = "repl", frameId = current_frame.id })`，结果 notify 出来（不像 hover 一闪而过）
+   - `D.dap_add_watch_cword()` — `dapui.elements.watches.add(expr)`；visual yank 优先于 cword
+   - `D.dap_run_to_cursor()` — `dap.run_to_cursor()` (nvim-dap 内置)
+   - `D.dap_frame_up()` / `D.dap_frame_down()` — 包 `dap.up()` / `dap.down()`
+   - `D.dap_restart_frame()` — 包 `dap.restart_frame()` (内部 `session:restart_frame()` 走 DAP 协议 restartFrame request)
+   - 共用 helper `_require_session()` 在没有 active session 时 notify warn 早退，保证 F-keys 在 attach 前按了也不报错
+2. `lua/ue/dap.lua` 早就有但**之前没 export**的 3 个：
+   - `D.dap_set_conditional_breakpoint()` (wrap `_persist_bp.toggle_conditional()`)
+   - `D.dap_set_logpoint()` (wrap `_persist_bp.toggle_logpoint()`)
+   - `D.dap_clear_breakpoints()` (wrap `_persist_bp.clear_all()`)
+   - `D.dap_list_breakpoints()` (wrap `_persist_bp.list()`)
+3. `lua/ue.lua` 加 11 个 `M.dap_*` re-export
+4. `lua/ue.lua` 加 11 个 `UEDAP*` user command:
+   - `:UEDAPCondBreakpoint` / `:UEDAPLogpoint` / `:UEDAPClearBreakpoints` / `:UEDAPListBreakpoints`
+   - `:UEDAPHover` (range=true) / `:UEDAPEval` / `:UEDAPWatchAdd` (range=true)
+   - `:UEDAPRunToCursor` / `:UEDAPFrameUp` / `:UEDAPFrameDown` / `:UEDAPRestartFrame`
+5. `lua/config/keymaps.lua` 加 10 个 normal-mode keymap + 2 个 visual 变体:
+   - `<leader>dB` Conditional / `<leader>dL` Logpoint / `<leader>dC` Clear all (大写避撞 `<leader>db/dc`)
+   - `<leader>de` Eval prompt / `<leader>dh` Hover / `<leader>dw` Watch add (visual 变体走 `:cmd<cr>` 不是 `<cmd>` 因为 `<cmd>` bypass visual mode)
+   - `<leader>dt` Run to cursor
+   - `<leader>dk` / `<leader>dj` 帧上下 (vim 风)
+   - `<leader>dR` Restart frame
+6. `lua/utils/cheatsheet.lua` Android DAP 一节加 dB/dL/dC，新增 "DAP Inspect / Navigate" 一节
+
+**测试**
+- `nvim --headless -c "lua require('ue.dap')"` → 加载 OK，7 个新函数 type=function
+- Pynvim hot-reload + 验证 10 个 user command + 10 个 normal-mode keymap 全部注册 ✅
+- live e2e attach 流程不变（已 commit ee5d491/c941ef6/93585a7 验证过，本轮纯加交互层）
+
+**坑**
+- visual 模式的 keymap：用 `:UEDAPHover<cr>` 而不是 `<cmd>UEDAPHover<cr>`。`<cmd>` 进入命令行不走 visual 模式状态机，`nvim_get_mode()` 在命令回调里返回 `n` 而不是 `v` → 视觉选择拿不到。`:` 走 ex 命令保留 mode，回调里 yank 到 reg z 才能拿到选择。
+- visual yank 必须 `noautocmd silent normal! "zy`：`noautocmd` 避免触发 `TextYankPost` 等扰乱 dap-repl 输入，`silent` 抑制 "1 line yanked"，`"z` 用 z 寄存器不污染 `"`
+- `dap.restart_frame()` 比手搓 `sess:request("restartFrame", {frameId=...})` 好：nvim-dap 内部 `session:restart_frame()` 会处理 step granularity / scope refresh，手搓的话变量面板不刷新
+- 没把 `K` 重新绑：LSP hover 不能让位。改用 `<leader>dh`
+- `dap.ui.widgets.hover` 接受 `function(): string` 当 expression provider；visual 模式我们手工 yank 然后 `widgets.hover(function() return expr end)`，normal 模式让 widgets 自己抓 `<cword>`
+
+**follow-up（剩余）**
+- B (UEDAPDiag/Status 充实) / C (UE 专属 watch 模板) 还没动，等下次决定优先级
+
 ### 2026-05-21 (later #3) — fix: 两阶段 stop + FString 无-Python fallback
 
 **Task** Follow-up #2 + #3 from the lldb-dap live-attach session:

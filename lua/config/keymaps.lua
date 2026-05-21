@@ -341,6 +341,29 @@ map("n", "<leader>di", "<cmd>UEDAPStepIn<cr>", { desc = "DAP: Step In" })
 map("n", "<leader>do", "<cmd>UEDAPStepOut<cr>", { desc = "DAP: Step Out" })
 map("n", "<leader>du", "<cmd>UEDAPToggleUI<cr>", { desc = "DAP: Toggle UI" })
 map("n", "<leader>dr", "<cmd>UEDAPREPL<cr>", { desc = "DAP: Toggle REPL" })
+
+-- DAP inspect / evaluate / navigate (added 2026-05-21)
+--   <leader>dB / dL / dC : conditional bp / logpoint / clear all (capitals
+--                          to avoid colliding with the lowercase counterparts
+--                          for plain toggle / continue).
+--   <leader>de / dw / dh : eval-prompt / watch-add / hover. Visual variants
+--                          of dh and dw evaluate the selection instead of
+--                          <cword>.
+--   <leader>dt           : run-to-cursor (ephemeral bp + continue).
+--   <leader>dk / dj      : stack frame up / down (vim-flavored arrow keys).
+--   <leader>dR           : restart current frame.
+map("n", "<leader>dB", "<cmd>UEDAPCondBreakpoint<cr>",   { desc = "DAP: Conditional Breakpoint" })
+map("n", "<leader>dL", "<cmd>UEDAPLogpoint<cr>",         { desc = "DAP: Logpoint" })
+map("n", "<leader>dC", "<cmd>UEDAPClearBreakpoints<cr>", { desc = "DAP: Clear all breakpoints" })
+map("n", "<leader>de", "<cmd>UEDAPEval<cr>",             { desc = "DAP: Evaluate expression" })
+map("n", "<leader>dh", "<cmd>UEDAPHover<cr>",            { desc = "DAP: Hover (eval cword)" })
+map("v", "<leader>dh", ":UEDAPHover<cr>",                { desc = "DAP: Hover (eval selection)" })
+map("n", "<leader>dw", "<cmd>UEDAPWatchAdd<cr>",         { desc = "DAP: Add cword to Watches" })
+map("v", "<leader>dw", ":UEDAPWatchAdd<cr>",             { desc = "DAP: Add selection to Watches" })
+map("n", "<leader>dt", "<cmd>UEDAPRunToCursor<cr>",      { desc = "DAP: Run to cursor" })
+map("n", "<leader>dk", "<cmd>UEDAPFrameUp<cr>",          { desc = "DAP: Stack frame up" })
+map("n", "<leader>dj", "<cmd>UEDAPFrameDown<cr>",        { desc = "DAP: Stack frame down" })
+map("n", "<leader>dR", "<cmd>UEDAPRestartFrame<cr>",     { desc = "DAP: Restart frame" })
 map("n", "<leader>ui", "<cmd>UEInstallAndroid<cr>", { desc = "UE: Install APK to device" })
 
 -- Deferred: apply {nowait=true} overrides once LazyVim has finished loading

@@ -77,23 +77,6 @@ function M.default_lldb_dap_paths()
   }
 end
 
-function M.default_codelldb_paths()
-  -- vadimcn/codelldb VSIX, unpacked. Used only by the Android route — see
-  -- ue.dap.android and ue.dap._common.find_codelldb. The VSIX layout is:
-  --   <root>/extension/adapter/codelldb.exe
-  --   <root>/extension/lldb/bin/liblldb.dll  (loaded by codelldb.exe)
-  -- We try a few common unpack locations. PATH lookup is the last fallback
-  -- inside ue.dap._common.find_codelldb.
-  local home = (vim.uv or vim.loop).os_getenv("USERPROFILE") or ""
-  local lp   = (vim.uv or vim.loop).os_getenv("LOCALAPPDATA") or ""
-  return {
-    "C:/tools/codelldb/extension/adapter/codelldb.exe",
-    home .. "/.local/share/codelldb/extension/adapter/codelldb.exe",
-    lp   .. "/codelldb/extension/adapter/codelldb.exe",
-    home .. "/.vscode/extensions/vadimcn.vscode-lldb-1.12.2/adapter/codelldb.exe",
-  }
-end
-
 function M.default_lldb_server_paths()
   -- Android NDK / Android Studio side-by-side. Globs are resolved by
   -- callers because `vim.fs.find` semantics differ from shell globs.

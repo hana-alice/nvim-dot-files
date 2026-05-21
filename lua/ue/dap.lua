@@ -546,26 +546,23 @@ end
 -- ─────────────────────────────────────────────────────────────────────
 
 function D.setup_dap(dap, dapui)
-  -- Best-effort wire of the historical lldb-dap adapter (some workflows
-  -- still attach to a host-side binary by hand). The codelldb adapter is
-  -- wired further down — that's the active Android route, and it must
-  -- not gate listener installation on lldb-dap presence.
+  -- Wire the lldb-dap adapter for ALL routes (host-side win64/linux/mac/ios
+  -- AND Android). dap.adapters.lldb is the single adapter used everywhere
+  -- after the 2026-05-21 codelldb→lldb-dap migration. Listener installation
+  -- below must not gate on adapter presence — even on hosts without lldb-dap
+  -- the user can still install dapui panels and breakpoint UI; missing
+  -- adapter is reported when they try to start a session.
   local lldb_dap = D.lldb_dap_path()
   if lldb_dap then
     require("ue.dap._common").ensure_adapter(dap, lldb_dap)
   end
 
-  -- Wire the codelldb adapter eagerly + register a generic cpp
-  -- configuration so a plain `:DapContinue` / `<F5>` from any C/C++
-  -- buffer drops the user into the UE Android attach picker. The
-  -- attach driver mutates the live config later (M.attach builds the
-  -- real codelldb_attach_config); this entry is just the launcher.
+  -- Register a generic cpp configuration so a plain `:DapContinue` / `<F5>`
+  -- from any C/C++ buffer drops the user into the UE Android attach picker.
+  -- The attach driver builds the real lldb-dap config inside
+  -- ue.dap.android.attach (which mutates dap.adapters.lldb if needed); this
+  -- entry is just the launcher.
   do
-    local C = require("ue.dap._common")
-    local codelldb = C.find_codelldb()
-    if codelldb then
-      C.ensure_codelldb_adapter(dap, codelldb)
-    end
     -- Idempotent registration: only inject our entry if not already
     -- present. Users can append their own configurations.cpp items;
     -- we never overwrite the table.
@@ -573,16 +570,17 @@ function D.setup_dap(dap, dapui)
     local cpp = dap.configurations.cpp or {}
     local have_ue_attach = false
     for _, c in ipairs(cpp) do
-      if c and c.name == "UE Android Attach (codelldb)" then
+      if c and (c.name == "UE Android Attach (lldb-dap)"
+                or c.name == "UE Android Attach (codelldb)") then
         have_ue_attach = true
         break
       end
     end
     if not have_ue_attach then
       table.insert(cpp, 1, {
-        name    = "UE Android Attach (codelldb)",
-        type    = "codelldb",
-        request = "launch",
+        name    = "UE Android Attach (lldb-dap)",
+        type    = "lldb",
+        request = "attach",
         program = function()
           -- Hand off to the real attach pipeline; nvim-dap will see
           -- this returns nil/false and abort its own session start.

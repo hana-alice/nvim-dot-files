@@ -839,9 +839,35 @@ function D.dap_diagnose()
   if session then
     local pending = 3
     local lldb_results = {}
+    -- Universal cap: any single lldb response that comes back bigger than
+    -- this is truncated before we touch it. We've seen `image list` and
+    -- especially `image dump symfile libUE4.so` produce >1M lines on UE
+    -- Android (~700 modules / millions of symbols), which OOMs nvim with
+    -- a wedged buffer. The cap is intentionally tiny — diag is supposed
+    -- to be a one-screen summary, not a full dump. Use :UEDAPRepl <cmd>
+    -- if you need the raw output.
+    local MAX_BYTES_PER_RESPONSE = 32 * 1024  -- 32 KB
+    local MAX_LINES_PER_RESPONSE = 200
+    local function clamp(s)
+      s = s or ""
+      if #s > MAX_BYTES_PER_RESPONSE then
+        s = s:sub(1, MAX_BYTES_PER_RESPONSE)
+          .. ("\n... (truncated; raw response was %d bytes, cap is %d. Run :UEDAPRepl <cmd> for full output)")
+            :format(#s, MAX_BYTES_PER_RESPONSE)
+      end
+      -- Also clamp line count in case it's lots of short lines.
+      local lines = vim.split(s, "\n", { plain = true })
+      if #lines > MAX_LINES_PER_RESPONSE then
+        local kept = {}
+        for i = 1, MAX_LINES_PER_RESPONSE do kept[i] = lines[i] end
+        kept[#kept + 1] = ("... (truncated; %d more lines elided)"):format(#lines - MAX_LINES_PER_RESPONSE)
+        s = table.concat(kept, "\n")
+      end
+      return s
+    end
     local function collect(label, ok, data)
       lldb_results[#lldb_results + 1] = ("── %s ──\n%s"):format(label,
-        ok and (data or "") or "(failed: " .. tostring(data) .. ")")
+        ok and clamp(data or "") or "(failed: " .. tostring(data) .. ")")
       pending = pending - 1
       if pending <= 0 then
         push("lldb introspection (via DAP evaluate)", table.concat(lldb_results, "\n\n"))
@@ -855,41 +881,15 @@ function D.dap_diagnose()
                   resp and resp.result or tostring(err))
         end)
     end
-    -- `image list` on a fully-attached UE Android process loads ~700 shared
-    -- libraries → 1M+ lines easily OOMs nvim. LLDB CLI doesn't support
-    -- shell pipes (`image list | head -5` → "unknown or ambiguous option"),
-    -- so we (a) ask for `-b` (basename-only, one line per module),
-    -- (b) parse + filter in Lua, (c) print count + UE-related lines.
-    -- The raw dump is one `:UEDAPRepl image list` away if needed.
-    local state2 = D._dap_session_state or {}
-    local so_basename2 = state2.symbol_lib and vim.fn.fnamemodify(state2.symbol_lib, ":t") or "libUE4.so"
-    -- Special label-eval that post-processes the output in Lua before push.
-    session:request("evaluate", { expression = "`image list -b", context = "repl" },
-      function(err, resp)
-        local raw = (not err) and resp and resp.result or ""
-        if err or raw == "" then
-          collect("image list (filtered)", false, tostring(err))
-          return
-        end
-        local lines = vim.split(raw, "\n", { plain = true, trimempty = true })
-        local ue_keywords = { so_basename2, "libUnreal", "libUE", "libGame" }
-        local filtered = {}
-        for _, l in ipairs(lines) do
-          for _, kw in ipairs(ue_keywords) do
-            if l:find(kw, 1, true) then
-              table.insert(filtered, l)
-              break
-            end
-          end
-        end
-        local summary = ("modules loaded: %d\nUE-related (filtered):\n  %s")
-          :format(#lines, table.concat(filtered, "\n  "))
-        collect("image list (filtered, UE-related)", true, summary)
-      end)
+    -- All three of these can produce huge output on UE Android (image list
+    -- itself is fine but image dump symfile on libUE4.so is multi-MB).
+    -- We rely on clamp() above as the universal safety net rather than
+    -- per-command argument tricks.
+    eval("image list -b",                          "image list -b (basename)")
     local state = D._dap_session_state or {}
     local so_name = state.symbol_lib and vim.fn.fnamemodify(state.symbol_lib, ":t") or "libUE4.so"
     eval(('image dump symfile "%s"'):format(so_name), "symfile " .. so_name)
-    eval("settings show target.source-map",      "source-map")
+    eval("settings show target.source-map",        "source-map")
   else
     D._render_diag_buffer(sections)
   end

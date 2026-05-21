@@ -44,6 +44,33 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-05-21 (later #7) — fix(dap): UEDAPDiag `image list` 限流，避免 OOM
+
+**Task** Phase D 实测时 `:UEDAPDiag` 在 attach 状态下跑出 **1125437 行**输出，吃掉 nvim 1.5 GB working set 后 pipe server 卡死。根因：UE Android attach 后 LLDB 加载 ~700 个共享库，`image list` 每个库一段、含 sections，单次命令出百万行。LLDB CLI 又不支持 shell pipe（`image list | head -5` → `error: unknown or ambiguous option`），不能在 LLDB 侧分页。
+
+**改动**
+
+1. `lua/ue/dap.lua` section E 的 `image list` 调用改成 **`image list -b`**（basename-only，每模块一行 ~50 字符），在 Lua 侧 `vim.split` 后 (a) 输出模块总数 (b) 过滤含关键字 `libUE/libUnreal/libGame/<symbol_lib basename>` 的行（用户真正想看的就 1-3 个）。
+2. 注释明确说明：LLDB 不支持 pipe，所以分页/过滤必须在 Lua 侧做；想看原始 `image list` 走 `:UEDAPRepl image list`（如果将来加这个命令）。
+3. 三段 pending 计数不变（`image list`/`image dump symfile`/`settings show target.source-map`），只是 image list 改成 inline `session:request` + 自带 collect 回调。
+
+**验证（pending: 用户重启 Neovide 后跑 Phase D 续集）**
+
+上一轮 #6 的 Phase D（active attach 实测）发现：
+- ✅ `type summary list -w UEFallback` 列出全部 **14 条** native summary，**lldb-dap 22.1.6 完全接受** `-x "^TArray<.+>$"` regex + 嵌套 `${var.Min.X}` 复合引用。`type category list` 显示 `UEFallback (enabled)` 第二条。
+- ✅ Attach 9.2s 完成、165 threads stopped at entry、auto-continue 起效。
+- ❌ `image list` 直接打爆 buffer → nvim 1.5GB / pipe 不响应（本 commit 修）。
+
+**坑**
+
+- **LLDB 命令行不支持 shell pipe** — `image list | head -5` 不是 LLDB 不会而是 LLDB 把 `|` 当 `head` 的参数。`grep`/`wc` 在 LLDB 内同样不可用。要分页/过滤只能 (a) 用 LLDB 自带 flag 例如 `-b` 缩量 + Lua 侧二次处理，或 (b) 写 Python 命令插件（无 Python 排除）。
+- **`image list -b` 输出格式** — 每行 `[索引] basename`，不含完整路径/UUID。用户想看完整列表得自己跑 `image list`，但实测一定 OOM nvim，所以**这不是 diag 该做的事**，是单独 `:UEDAPRepl` 该做的事。
+- **Active session 状态下跑 1M+ 行写入 Lua buffer 时 nvim 完全无响应** — pipe server 不接新连接（FileNotFoundError）但进程 Responding=True、CPU=0（卡在 vim API call，不在 lua loop）。强杀 nvim 是唯一恢复路径；本 commit 防止这种情况复现。
+
+**Follow-up**
+
+- 用户重启 Neovide 后续跑 Phase D：实测过滤后的 image list 应该只有 5-10 行；FString/FVector 等 summary 真展开（需要找一个 UE 全局变量做 eval target）。
+
 ### 2026-05-21 (later #6) — feat(dap): UE-aware watch templates + 扩展 native type summary
 
 **Task** 接着 #3 的 FString native fallback，把无 Python 时能用纯字符串模板表达的 UE 类型全部加上 (`FVector`/`FVector2D`/`FVector4`/`FIntVector`/`FRotator`/`FQuat`/`FColor`/`FLinearColor`/`FBox`/`TArray<*>`/`TWeakObjectPtr<*>`/`TSharedPtr<*>`/`TSharedRef<*>`)，并为需要调函数的 `FName`/`UObject*`/`AActor*` 提供 **预制 watch expression 包装**（通过 `:UEDAPWatchUE` + `<leader>dW` 选 picker）。

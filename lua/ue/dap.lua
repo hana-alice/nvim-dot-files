@@ -855,7 +855,37 @@ function D.dap_diagnose()
                   resp and resp.result or tostring(err))
         end)
     end
-    eval("image list",                           "image list")
+    -- `image list` on a fully-attached UE Android process loads ~700 shared
+    -- libraries → 1M+ lines easily OOMs nvim. LLDB CLI doesn't support
+    -- shell pipes (`image list | head -5` → "unknown or ambiguous option"),
+    -- so we (a) ask for `-b` (basename-only, one line per module),
+    -- (b) parse + filter in Lua, (c) print count + UE-related lines.
+    -- The raw dump is one `:UEDAPRepl image list` away if needed.
+    local state2 = D._dap_session_state or {}
+    local so_basename2 = state2.symbol_lib and vim.fn.fnamemodify(state2.symbol_lib, ":t") or "libUE4.so"
+    -- Special label-eval that post-processes the output in Lua before push.
+    session:request("evaluate", { expression = "`image list -b", context = "repl" },
+      function(err, resp)
+        local raw = (not err) and resp and resp.result or ""
+        if err or raw == "" then
+          collect("image list (filtered)", false, tostring(err))
+          return
+        end
+        local lines = vim.split(raw, "\n", { plain = true, trimempty = true })
+        local ue_keywords = { so_basename2, "libUnreal", "libUE", "libGame" }
+        local filtered = {}
+        for _, l in ipairs(lines) do
+          for _, kw in ipairs(ue_keywords) do
+            if l:find(kw, 1, true) then
+              table.insert(filtered, l)
+              break
+            end
+          end
+        end
+        local summary = ("modules loaded: %d\nUE-related (filtered):\n  %s")
+          :format(#lines, table.concat(filtered, "\n  "))
+        collect("image list (filtered, UE-related)", true, summary)
+      end)
     local state = D._dap_session_state or {}
     local so_name = state.symbol_lib and vim.fn.fnamemodify(state.symbol_lib, ":t") or "libUE4.so"
     eval(('image dump symfile "%s"'):format(so_name), "symfile " .. so_name)

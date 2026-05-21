@@ -556,17 +556,68 @@ local function init_commands(session)
       end)
     end
   elseif formatter and formatter ~= "" and not has_python then
-    -- No Python in lldb-dap → native FString summary only.
-    -- FString layout (UE5):  TArray<TCHAR> Data { AllocatorInstance.Data : TCHAR*, ArrayNum : int32, ArrayMax : int32 }
-    -- Summary-string `%s` on a TCHAR* (char16_t*) prints as UTF-16 cstring.
+    -- No Python in lldb-dap → fall back to native `type summary` rules.
+    -- These can express anything that's a simple `${var.field}` template;
+    -- they CAN'T express the FName index→string lookup or TArray element
+    -- iteration that Epic's Python formatter does, so we cover only the
+    -- types that have purely-data layouts.
+    --
+    -- Layout references (UE5 stock, 2-byte TCHAR builds):
+    --   FString { TArray<TCHAR> Data }                    where TArray = { AllocatorInstance.Data : TCHAR*, ArrayNum, ArrayMax }
+    --   FVector       { float X, Y, Z }                   (float = double in 5.0+, layout still has X/Y/Z)
+    --   FVector2D     { float X, Y }
+    --   FVector4      { float X, Y, Z, W }
+    --   FIntVector    { int32 X, Y, Z }
+    --   FRotator      { float Pitch, Yaw, Roll }
+    --   FQuat         { float X, Y, Z, W }
+    --   FColor        { uint8 B, G, R, A } (BGRA on disk)
+    --   FLinearColor  { float R, G, B, A }
+    --   FBox          { FVector Min, Max; uint8 IsValid }
+    --   TArray<T>     { Data, ArrayNum, ArrayMax }        — we show count only
     table.insert(cmds,
       'type summary add -w UEFallback --summary-string "${var.Data.AllocatorInstance.Data%s}" FString')
+    table.insert(cmds,
+      'type summary add -w UEFallback --summary-string "(X=${var.X} Y=${var.Y} Z=${var.Z})" FVector')
+    table.insert(cmds,
+      'type summary add -w UEFallback --summary-string "(X=${var.X} Y=${var.Y})" FVector2D')
+    table.insert(cmds,
+      'type summary add -w UEFallback --summary-string "(X=${var.X} Y=${var.Y} Z=${var.Z} W=${var.W})" FVector4')
+    table.insert(cmds,
+      'type summary add -w UEFallback --summary-string "(X=${var.X} Y=${var.Y} Z=${var.Z})" FIntVector')
+    table.insert(cmds,
+      'type summary add -w UEFallback --summary-string "(Pitch=${var.Pitch} Yaw=${var.Yaw} Roll=${var.Roll})" FRotator')
+    table.insert(cmds,
+      'type summary add -w UEFallback --summary-string "(X=${var.X} Y=${var.Y} Z=${var.Z} W=${var.W})" FQuat')
+    table.insert(cmds,
+      'type summary add -w UEFallback --summary-string "(R=${var.R} G=${var.G} B=${var.B} A=${var.A})" FColor')
+    table.insert(cmds,
+      'type summary add -w UEFallback --summary-string "(R=${var.R} G=${var.G} B=${var.B} A=${var.A})" FLinearColor')
+    table.insert(cmds,
+      'type summary add -w UEFallback --summary-string "Min=(${var.Min.X},${var.Min.Y},${var.Min.Z}) Max=(${var.Max.X},${var.Max.Y},${var.Max.Z}) Valid=${var.IsValid}" FBox')
+    -- TArray<T>: regex match, show element count + capacity. For element
+    -- VALUES the user can expand the Variables panel — lldb already does
+    -- per-element child rendering, so we only need to add a useful summary
+    -- on the parent. -x is regex match, ^TArray<.+>$ catches all instantiations.
+    table.insert(cmds,
+      'type summary add -w UEFallback -x "^TArray<.+>$" --summary-string "size=${var.ArrayNum} cap=${var.ArrayMax}"')
+    -- TWeakObjectPtr<T>: show whether it's pointing at anything (ObjectIndex==-1
+    -- means null). Layout: { ObjectIndex, ObjectSerialNumber }.
+    table.insert(cmds,
+      'type summary add -w UEFallback -x "^TWeakObjectPtr<.+>$" --summary-string "idx=${var.ObjectIndex} serial=${var.ObjectSerialNumber}"')
+    -- TSharedPtr / TSharedRef: show ref count. Layout: { Object, SharedReferenceCount }
+    -- where SharedReferenceCount is { ReferenceController* } pointing at a
+    -- struct with SharedReferenceCount/WeakReferenceCount. We can only
+    -- safely show the inner pointer.
+    table.insert(cmds,
+      'type summary add -w UEFallback -x "^TSharedPtr<.+>$" --summary-string "obj=${var.Object}"')
+    table.insert(cmds,
+      'type summary add -w UEFallback -x "^TSharedRef<.+>$" --summary-string "obj=${var.Object}"')
     table.insert(cmds, 'type category enable UEFallback')
     vim.schedule(function()
       vim.notify(
-        "[ue.dap] lldb-dap has no Python module — using native FString fallback only.\n" ..
-        "FName / TArray / TMap / FVector summaries unavailable on this build.\n" ..
-        "(Use a full LLVM install with Python bindings to restore them.)",
+        "[ue.dap] lldb-dap has no Python module — using native UE summary fallback.\n" ..
+        "Covered: FString, FVector*, FRotator, FQuat, FColor*, FBox, TArray, TWeakObjectPtr, TSharedPtr/Ref.\n" ..
+        "FName / UObject->GetName() still require Python bindings or :UEDAPWatchFName command.",
         vim.log.levels.INFO)
     end)
   end

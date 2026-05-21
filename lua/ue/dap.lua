@@ -338,6 +338,25 @@ end
 
 --- Add the word under cursor (or visual selection) to dapui's Watches panel.
 --- Falls back to `dap.repl` `-exec` if dapui isn't loaded.
+--- Internal: push a raw expression string into the dapui Watches panel.
+--- Returns true on success. Notifies on failure so callers can fail-fast.
+function D._dap_watch_push(expr)
+  if not expr or expr == "" then
+    vim.notify("[ue.dap] watch: empty expression", vim.log.levels.WARN)
+    return false
+  end
+  expr = expr:gsub("[\r\n]+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+  local dapui_ok, dapui = D.ensure_dapui_loaded()
+  if not (dapui_ok and dapui.elements and dapui.elements.watches
+                   and dapui.elements.watches.add) then
+    vim.notify("[ue.dap] dapui watches unavailable — use REPL", vim.log.levels.WARN)
+    return false
+  end
+  dapui.elements.watches.add(expr)
+  vim.notify("[ue.dap] watch added: " .. expr, vim.log.levels.INFO)
+  return true
+end
+
 function D.dap_add_watch_cword()
   local sess = _require_session()
   if not sess then return end
@@ -353,15 +372,102 @@ function D.dap_add_watch_cword()
     vim.notify("[ue.dap] nothing under cursor to watch", vim.log.levels.WARN)
     return
   end
-  -- Strip whitespace + newlines so multi-line visual selections become one expr.
-  expr = expr:gsub("[\r\n]+", " "):gsub("^%s+", ""):gsub("%s+$", "")
-  local dapui_ok, dapui = D.ensure_dapui_loaded()
-  if dapui_ok and dapui.elements and dapui.elements.watches
-                and dapui.elements.watches.add then
-    dapui.elements.watches.add(expr)
-    vim.notify("[ue.dap] watch added: " .. expr, vim.log.levels.INFO)
+  D._dap_watch_push(expr)
+end
+
+-- ── UE-aware watch templates ───────────────────────────────────────────────
+--
+-- These commands cover the "I always want to see THIS for THAT type" patterns
+-- so the user doesn't have to type out the full lldb expression every time.
+-- All of them are just convenience wrappers around _dap_watch_push — the
+-- inferior decides whether the expression actually evaluates. If symbols are
+-- missing or the function got inlined out, the watch will show
+-- "error: <expression failure>" and that's fine — at least the user knows
+-- it tried.
+--
+-- The receiving form (`expr`) is either an argument string or, if omitted,
+-- the cword/visual selection — same UX as :UEDAPWatchAdd.
+local function _resolve_watch_target(opts_args)
+  if opts_args and opts_args ~= "" then return opts_args end
+  local mode = vim.api.nvim_get_mode().mode
+  if mode == "v" or mode == "V" or mode == "\22" then
+    vim.cmd('noautocmd silent normal! "zy')
+    local s = vim.fn.getreg("z")
+    if s and s ~= "" then return s end
+  end
+  return vim.fn.expand("<cword>")
+end
+
+--- Watch an FName as its resolved string. Goes through FName::ToString()
+--- which needs FName symbols — works in Development+, may fail in Shipping.
+--- @param expr string  C++ expression that resolves to an FName
+function D.dap_watch_fname(expr)
+  if not _require_session() then return end
+  if not expr or expr == "" then return end
+  -- Two siblings: the raw struct (Index visible) + the resolved string.
+  D._dap_watch_push(expr)                                 -- raw view: shows {Index=N}
+  D._dap_watch_push(("(%s).ToString()"):format(expr))     -- resolved: needs symbols
+end
+
+--- Watch a UObject* pointer: show class name + object name.
+--- Calls GetClass()->GetName() and GetName() — requires UObject symbols
+--- (almost always present in Development).
+--- @param expr string  C++ expression that resolves to a UObject*
+function D.dap_watch_uobject(expr)
+  if not _require_session() then return end
+  if not expr or expr == "" then return end
+  D._dap_watch_push(expr)                                            -- raw ptr
+  D._dap_watch_push(("(%s) ? (%s)->GetName() : FString()"):format(expr, expr))
+  D._dap_watch_push(("(%s) ? (%s)->GetClass()->GetName() : FString()"):format(expr, expr))
+end
+
+--- Watch an AActor*: class + name + world location (X/Y/Z).
+--- @param expr string  C++ expression resolving to AActor*
+function D.dap_watch_actor(expr)
+  if not _require_session() then return end
+  if not expr or expr == "" then return end
+  D._dap_watch_push(expr)
+  D._dap_watch_push(("(%s) ? (%s)->GetClass()->GetName() : FString()"):format(expr, expr))
+  D._dap_watch_push(("(%s) ? (%s)->GetName() : FString()"):format(expr, expr))
+  D._dap_watch_push(("(%s) ? (%s)->GetActorLocation() : FVector::ZeroVector"):format(expr, expr))
+end
+
+--- Watch a TArray<T>: show the raw struct (size+cap come from the native
+--- type summary) plus the first 4 elements via Data[i] indexing. Useful
+--- when the dapui Variables panel's lazy-expansion is annoying.
+--- @param expr string  C++ expression resolving to a TArray<T>&
+function D.dap_watch_tarray(expr)
+  if not _require_session() then return end
+  if not expr or expr == "" then return end
+  D._dap_watch_push(expr)                                  -- {size cap}
+  for i = 0, 3 do
+    D._dap_watch_push(("(%s).GetData()[%d]"):format(expr, i))
+  end
+end
+
+--- Generic dispatcher for `:UEDAPWatch <type> [expr]` so we don't have to
+--- register one user command per template. Falls back to a plain watch
+--- (same as :UEDAPWatchAdd) if `type` is unknown — that way typos don't
+--- silently swallow the expression.
+function D.dap_watch_template(template, expr)
+  expr = _resolve_watch_target(expr)
+  if not expr or expr == "" then
+    vim.notify("[ue.dap] watch template: missing expression", vim.log.levels.WARN)
+    return
+  end
+  local t = (template or ""):lower()
+  if t == "fname" then     D.dap_watch_fname(expr)
+  elseif t == "uobject" then D.dap_watch_uobject(expr)
+  elseif t == "actor" then   D.dap_watch_actor(expr)
+  elseif t == "tarray" then  D.dap_watch_tarray(expr)
+  elseif t == "" or t == "raw" then
+    D._dap_watch_push(expr)
   else
-    vim.notify("[ue.dap] dapui watches unavailable — use REPL", vim.log.levels.WARN)
+    vim.notify(
+      ("[ue.dap] unknown template '%s' (known: fname uobject actor tarray raw) — adding as raw watch")
+        :format(template),
+      vim.log.levels.WARN)
+    D._dap_watch_push(expr)
   end
 end
 

@@ -235,23 +235,27 @@ local function pick_source_map(ctx)
   local cfg_sm = ue_cfg_get("dap.android_source_map")
   if type(cfg_sm) == "table" and #cfg_sm > 0 then return cfg_sm end
   -- DWARF on UE Android builds bakes the build-machine root into
-  -- DW_AT_comp_dir (observed: "D:\project\uetemp\Engine\Source"). Map both
-  -- backslash and forward-slash variants of the build root onto the local
-  -- project root so lldb-dap can resolve at least Game-side sources.
-  -- Engine sources are only resolvable if the user has a local Engine tree
-  -- under project_root/Engine. When absent, the Engine map still points
-  -- somewhere existing so lldb-dap won't bail with "Cursor position outside
-  -- buffer" — frames just won't show source for Engine code (expected).
+  -- DW_AT_comp_dir (observed: "D:\project\uetemp\Engine\Source").
+  --
+  -- We only register the BACKSLASH form of the build root, not both
+  -- backslash and forward-slash variants. lldb-dap on Windows normalizes
+  -- `from` keys to backslashes internally, so sending both variants
+  -- results in two identical entries in `target.source-map` and lldb
+  -- traverses the same mapping twice on every source resolve (visible
+  -- via UEDAPDiag section E, follow-up #9 root cause). One canonical
+  -- backslash entry matches DWARF emitted with either separator.
+  --
+  -- Engine sources are only resolvable if the user has a local Engine
+  -- tree under project_root/Engine. When absent, the Engine map is
+  -- omitted — frames just won't show source for Engine code (expected).
   local proot = ctx and (ctx.project_root or ctx.engine_root)
   if not proot then return nil end
   local sm = {
     { from = "D:\\project\\uetemp", to = proot },
-    { from = "D:/project/uetemp",   to = proot },
   }
   if fs.is_dir(proot .. "/Engine") then
     -- Prefer explicit Engine→Engine mapping if the user has source locally.
     table.insert(sm, 1, { from = "D:\\project\\uetemp\\Engine", to = proot .. "/Engine" })
-    table.insert(sm, 1, { from = "D:/project/uetemp/Engine",   to = proot .. "/Engine" })
   end
   return sm
 end

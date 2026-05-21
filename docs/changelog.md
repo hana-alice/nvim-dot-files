@@ -44,6 +44,44 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-05-21 (later #9) — fix(dap/android): de-duplicate source-map entries
+
+**Task** D4 实测发现 `target.source-map` 显示同一条映射被注册两次。根因：`pick_source_map()` 故意 emit 反斜杠 + 正斜杠两个 `from` 变体（以为 DWARF `DW_AT_comp_dir` 路径分隔符不确定），但 **lldb-dap 在 Windows 上把所有 `from` key 都规范化成反斜杠**——dict 转 list 后两条 entry 完全相同。LLDB 每次解析 source 走同一映射两次，无害但浪费 + 让 diag 输出误导。
+
+**根因实证**
+
+probe `_lldb_dap_attach_config_for_test` 抓出 cfg.sourceMap：
+
+    {
+      "<build-host-path>": "<local-source>",   ← 反斜杠 key
+      "<build-host-path>": "<local-source>",   ← 正斜杠 key
+    }
+
+发出去 2 个不同 key（Lua dict 视角），但 LLDB 接收后 `target.source-map` 显示成两条相同 `<build-host-path> -> <local-source>`。证实 LLDB 内部 normalize。
+
+**改动**
+
+`lua/ue/dap/android.lua` `pick_source_map()` 只发反斜杠形式（Game + Engine 各 1 条最多 2 条），删去正斜杠重复。注释明确解释为什么。
+
+**验证（D5 实测 ✅）**
+
+PID 44636 fresh attach (164 threads, 9s) → `:UEDAPDiag` section "source-map"：
+
+    target.source-map (path-map) =
+    [0] "<build-host-path>" -> "<local-source>"
+
+只 1 条。diag buffer 453 行（与 D4 持平）。Session torn down 干净。
+
+**坑**
+
+- 写 source-map 时不要为了"covering 路径分隔符不确定" emit 两条 — LLDB 自己 normalize，多发等于自坑。如果未来发现 DWARF 用正斜杠且匹配失败，应在 attach_commands 里手动 `image lookup --regex` 找一个真实 frame 的 source file 看 LLDB 报的是哪种分隔符，**有数据再决定**，不要预防性多发。
+- `_lldb_dap_attach_config_for_test` 接受外部传入的 source_map 参数 → 它**绕过** `pick_source_map`。Probe `pick_source_map` 本身要单独走 `dofile` + `load(string)` 技巧把 local function 抠出来（因为它是 module-local）。
+
+**Follow-up (可选)**
+
+- 加 `:UEDAPRepl <cmd>` 让用户直接发任意 lldb 命令（diag clamp 是 32KB cap，原始输出需逃生口）。
+- 把这次踩过的所有 attach 阶段坑沉淀成 skill `lldb-dap-large-eval-response-clamp`（universal clamp pattern）+ `lldb-source-map-windows-backslash-normalize`（本条）。
+
 ### 2026-05-21 (later #8) — fix(dap): UEDAPDiag clamp evaluate responses universally
 
 **Task** Fix #7 (`image list -b` filter) 实测无效——D2 实测 buffer 仍 1124845 行。深入分析后发现：**罪魁不是 `image list` 而是 `image dump symfile "libUE4.so"`**。UE4 主 so 含数百万符号，symfile dump 每个符号一段、含 DIE/CU/sections，单次响应几十 MB / 百万行级别。`-b` flag 改 image list 行为但 symfile 不受影响，所以前一版 fix 只 patch 了一半路径，buffer 继续被 symfile 撑爆。

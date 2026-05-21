@@ -8468,6 +8468,17 @@ M._dap_filter_scopes = dap_mod._dap_filter_scopes
 M.ensure_dap_loaded = dap_mod.ensure_dap_loaded
 M.ensure_dapui_loaded = dap_mod.ensure_dapui_loaded
 M.dap_toggle_breakpoint = dap_mod.dap_toggle_breakpoint
+M.dap_set_conditional_breakpoint = dap_mod.dap_set_conditional_breakpoint
+M.dap_set_logpoint = dap_mod.dap_set_logpoint
+M.dap_clear_breakpoints = dap_mod.dap_clear_breakpoints
+M.dap_list_breakpoints = dap_mod.dap_list_breakpoints
+M.dap_hover = dap_mod.dap_hover
+M.dap_eval_prompt = dap_mod.dap_eval_prompt
+M.dap_add_watch_cword = dap_mod.dap_add_watch_cword
+M.dap_run_to_cursor = dap_mod.dap_run_to_cursor
+M.dap_frame_up = dap_mod.dap_frame_up
+M.dap_frame_down = dap_mod.dap_frame_down
+M.dap_restart_frame = dap_mod.dap_restart_frame
 M.dap_continue = dap_mod.dap_continue
 M.dap_pause = dap_mod.dap_pause
 M.dap_step_over = dap_mod.dap_step_over
@@ -8922,6 +8933,19 @@ function M.setup()
   vim.api.nvim_create_user_command("UEDAPContinue",        function() M.dap_continue()         end, { desc = "DAP: Continue" })
   vim.api.nvim_create_user_command("UEDAPPause",           function() M.dap_pause()            end, { desc = "DAP: Pause" })
   vim.api.nvim_create_user_command("UEDAPToggleBreakpoint",function() M.dap_toggle_breakpoint()end, { desc = "DAP: Toggle breakpoint" })
+  vim.api.nvim_create_user_command("UEDAPCondBreakpoint",  function() M.dap_set_conditional_breakpoint() end, { desc = "DAP: Conditional breakpoint (prompt)" })
+  vim.api.nvim_create_user_command("UEDAPLogpoint",        function() M.dap_set_logpoint() end, { desc = "DAP: Logpoint (prompt)" })
+  vim.api.nvim_create_user_command("UEDAPClearBreakpoints",function() M.dap_clear_breakpoints() end, { desc = "DAP: Clear all breakpoints" })
+  vim.api.nvim_create_user_command("UEDAPListBreakpoints", function() M.dap_list_breakpoints() end, { desc = "DAP: List persisted breakpoints" })
+  vim.api.nvim_create_user_command("UEDAPHover",           function() M.dap_hover() end,
+    { desc = "DAP: Hover (eval cword or selection)", range = true })
+  vim.api.nvim_create_user_command("UEDAPEval",            function() M.dap_eval_prompt() end, { desc = "DAP: Evaluate expression (prompt)" })
+  vim.api.nvim_create_user_command("UEDAPWatchAdd",        function() M.dap_add_watch_cword() end,
+    { desc = "DAP: Add cword/selection to Watches", range = true })
+  vim.api.nvim_create_user_command("UEDAPRunToCursor",     function() M.dap_run_to_cursor() end, { desc = "DAP: Run to cursor" })
+  vim.api.nvim_create_user_command("UEDAPFrameUp",         function() M.dap_frame_up() end, { desc = "DAP: Stack frame up" })
+  vim.api.nvim_create_user_command("UEDAPFrameDown",       function() M.dap_frame_down() end, { desc = "DAP: Stack frame down" })
+  vim.api.nvim_create_user_command("UEDAPRestartFrame",    function() M.dap_restart_frame() end, { desc = "DAP: Restart current frame" })
   vim.api.nvim_create_user_command("UEDAPStepOver",        function() M.dap_step_over()        end, { desc = "DAP: Step over" })
   vim.api.nvim_create_user_command("UEDAPStepIn",          function() M.dap_step_into()        end, { desc = "DAP: Step in" })
   vim.api.nvim_create_user_command("UEDAPStepOut",         function() M.dap_step_out()         end, { desc = "DAP: Step out" })

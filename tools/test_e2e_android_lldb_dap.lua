@@ -1,8 +1,8 @@
--- E2E test for ue.dap.android codelldb route.
+-- E2E test for ue.dap.android lldb-dap route.
 -- Runs from headless nvim (with full plugin tree). Performs:
---   1. bootstrap (push lldb-server to app sandbox)
---   2. start lldb-server gdbserver --attach
---   3. wire codelldb adapter
+--   1. bootstrap (push lldb-server to /data/local/tmp PUBLIC)
+--   2. start lldb-server platform --server
+--   3. wire lldb-dap adapter (dap.adapters.lldb)
 --   4. open a dap session, drive it via dap.session():on_event /:request
 --   5. setFunctionBreakpoints on FEngineLoop::Tick
 --   6. wait for stopped/initialized events
@@ -15,7 +15,7 @@
 --   UE_DAP_E2E_SERIAL=ABCDEF123456 \
 --   UE_DAP_E2E_SYM=/abs/path/to/libUE4.so \
 --   UE_DAP_E2E_PROOT=/abs/path/to/project \
---   nvim --headless -l tools/test_e2e_android_codelldb.lua
+--   nvim --headless -l tools/test_e2e_android_lldb_dap.lua
 -- (Run with full init so nvim-dap is on rtp.)
 
 local function getenv(name, default)
@@ -28,7 +28,7 @@ local PKG    = getenv("UE_DAP_E2E_PKG")
 local SERIAL = getenv("UE_DAP_E2E_SERIAL")
 local SYM    = getenv("UE_DAP_E2E_SYM")
 local PROOT  = getenv("UE_DAP_E2E_PROOT")
-local PORT   = tonumber(getenv("UE_DAP_E2E_PORT", "5045"))
+local PORT   = tonumber(getenv("UE_DAP_E2E_PORT", "5039"))
 
 if not (PKG and SERIAL and SYM and PROOT) then
   io.stderr:write([[
@@ -37,7 +37,7 @@ if not (PKG and SERIAL and SYM and PROOT) then
   UE_DAP_E2E_SERIAL  adb serial of the test device
   UE_DAP_E2E_SYM     absolute path to host-side libUE4.so with DWARF
   UE_DAP_E2E_PROOT   absolute path to project root
-  UE_DAP_E2E_PORT    (optional, default 5045) gdbserver TCP port
+  UE_DAP_E2E_PORT    (optional, default 5039) lldb-server platform TCP port
 ]])
   os.exit(2)
 end
@@ -58,7 +58,7 @@ package.path = package.path
   .. ";" .. dap_root .. "/lua/?.lua"
   .. ";" .. dap_root .. "/lua/?/init.lua"
 
-p("== ue.dap.android codelldb e2e ==")
+p("== ue.dap.android lldb-dap e2e ==")
 
 -- Force test config into ue.config so we don't get prompted.
 local cfg = require("ue.config")
@@ -140,8 +140,10 @@ if not wait_for(function() sess = dap.session(); return sess ~= nil end, 15000) 
 end
 p("session: %s", tostring(sess))
 
--- Wait for stopOnEntry stop. codelldb attach via gdb-remote can take 30s+
--- because target create on a 3.85GB libUE4.so reads/parses DWARF first.
+-- Wait for stopOnEntry stop. lldb-dap attach via platform mode is much
+-- faster than codelldb's gdb-remote target-create — module enumeration
+-- is incremental and host-side DWARF parse only runs on first source-line
+-- query, not on attach. 60s ceiling kept as a safety margin.
 p("waiting for stopped event (stopOnEntry, up to 60s)...")
 if not wait_for(function() return got_stopped end, 60000) then
   p("FAIL no stopped event after 60s (initialized=%s)", tostring(got_initialized))
@@ -210,7 +212,7 @@ if got_stopped then
 
   -- Enumerate all threads to find the UE GameThread (this is where Tick lives;
   -- the Android main thread just runs ALooper in bionic libc syscalls).
-  -- codelldb formats thread.name as: `<lldb_idx>: tid=<linux_tid> "<comm>"`.
+  -- lldb-dap formats thread.name as: `<lldb_idx>: tid=<linux_tid> "<comm>"`.
   local game_thread_id = nil
   local render_thread_id = nil
   local rhi_thread_id = nil
@@ -222,7 +224,7 @@ if got_stopped then
       for _, t in ipairs(body.threads) do
         thread_names[t.id] = t.name
         local nm = tostring(t.name or "")
-        -- comm sits inside escaped quotes in the codelldb-formatted name.
+        -- comm sits inside escaped quotes in the lldb-dap-formatted name.
         local comm = nm:match('"([^"]+)"') or nm
         if comm:match("GameThread") and not game_thread_id then
           game_thread_id = t.id
@@ -236,7 +238,7 @@ if got_stopped then
         end
       end
       if not game_thread_id then
-        -- Dump first 30 thread names to see what codelldb actually returns.
+        -- Dump first 30 thread names to see what lldb-dap actually returns.
         p("  (no GameThread found; first 30 thread names:)")
         local n = 0
         for _, t in ipairs(body.threads) do

@@ -8489,6 +8489,8 @@ M.dap_pause = dap_mod.dap_pause
 M.dap_step_over = dap_mod.dap_step_over
 M.dap_step_into = dap_mod.dap_step_into
 M.dap_step_out = dap_mod.dap_step_out
+M.dap_bottom_tab = dap_mod.dap_bottom_tab
+M.dap_next_bottom_tab = dap_mod.dap_next_bottom_tab
 M.dap_toggle_ui = dap_mod.dap_toggle_ui
 M.dap_reset_layout = dap_mod.dap_reset_layout
 M.dap_toggle_repl = dap_mod.dap_toggle_repl
@@ -8969,6 +8971,19 @@ function M.setup()
   vim.api.nvim_create_user_command("UEDAPStepOver",        function() M.dap_step_over()        end, { desc = "DAP: Step over" })
   vim.api.nvim_create_user_command("UEDAPStepIn",          function() M.dap_step_into()        end, { desc = "DAP: Step in" })
   vim.api.nvim_create_user_command("UEDAPStepOut",         function() M.dap_step_out()         end, { desc = "DAP: Step out" })
+  vim.api.nvim_create_user_command("UEDAPTab", function(opts)
+    M.dap_bottom_tab(opts.args)
+  end, {
+    nargs = 1,
+    complete = function()
+      return { "repl", "console", "breakpoints", "logcat" }
+    end,
+    desc = "DAP: switch right-bottom tab",
+  })
+  vim.api.nvim_create_user_command("UEDAPNextTab", function() M.dap_next_bottom_tab(1) end,
+    { desc = "DAP: next right-bottom tab" })
+  vim.api.nvim_create_user_command("UEDAPPrevTab", function() M.dap_next_bottom_tab(-1) end,
+    { desc = "DAP: previous right-bottom tab" })
   vim.api.nvim_create_user_command("UEDAPToggleUI",        function() M.dap_toggle_ui()        end, { desc = "DAP: Toggle UI" })
   vim.api.nvim_create_user_command("UEDAPREPL",            function() M.dap_toggle_repl()      end, { desc = "DAP: Toggle REPL" })
   vim.api.nvim_create_user_command("UEDAPStop", function()

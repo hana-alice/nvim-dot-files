@@ -10,6 +10,7 @@ return {
       local dap = require("dap")
       local dapui = require("dapui")
       dapui.setup({
+        force_buffers = false,
         -- In stacks panel, <CR> / double-click should jump to frame (open),
         -- not try to expand (which frames don't support).
         element_mappings = {
@@ -20,41 +21,21 @@ return {
         },
         layouts = {
           {
-            -- Right panel: variables & watches (widest, most-used)
+            -- Left debug rail: locals, call stack, watches.
             elements = {
-              { id = "scopes", size = 0.7 },
-              { id = "watches", size = 0.3 },
-            },
-            position = "right",
-            size = 60,
-          },
-          {
-            -- Left panel: call stack & breakpoints (navigation context)
-            elements = {
-              { id = "stacks", size = 0.6 },
-              { id = "breakpoints", size = 0.4 },
+              { id = "scopes", size = 0.45 },
+              { id = "stacks", size = 0.25 },
+              { id = "watches", size = 0.30 },
             },
             position = "left",
-            size = 40,
-          },
-          {
-            -- Bottom: REPL + console
-            elements = {
-              { id = "repl", size = 0.65 },
-              { id = "console", size = 0.35 },
-            },
-            position = "bottom",
-            size = 12,
+            size = 54,
           },
         },
         controls = {
-          -- Buttons are re-enabled. The ■ (terminate) button is rewired
-          -- by ue.setup_dap() to call `dap.disconnect{terminateDebuggee=
-          -- false}` for our attach sessions (UE Android Attach), so it
-          -- behaves as a safe "detach" — the target game keeps running.
-          -- ⏏ explicitly maps to detach as well.
+          -- Keep the clickable debug controls visible, but attach them to the
+          -- left rail so they do not overwrite the right-bottom tab bar.
           enabled = true,
-          element = "repl",
+          element = "scopes",
           icons = {
             pause = "⏸ ",
             play = "▶ ",

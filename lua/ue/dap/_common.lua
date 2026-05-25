@@ -55,21 +55,41 @@ end
 --- Windows; lldb-dap itself does not need the user's shell Python. Advanced
 --- users can still opt in to explicit paths through ue.config.
 function M._lldb_dap_env()
-  local env = vim.fn.environ()
-  env.PYTHONHOME = ""
-  env.PYTHONPATH = ""
+  local env_hash = vim.fn.environ()
+  env_hash.PYTHONHOME = ""
+  env_hash.PYTHONPATH = ""
+  -- Enable lldb-dap own protocol trace log. Source: lldb-dap
+  -- tool/lldb-dap.cpp L644 (getenv "LLDBDAP_LOG"). Captures full DAP
+  -- request/response/event stream including state transitions that
+  -- nvim-dap log can't see.
+  local log_file = vim.fn.stdpath("cache") .. "/lldb-dap-protocol.log"
+  -- Truncate previous run's log so each attach session is fresh
+  local f = io.open(log_file, "w")
+  if f then f:close() end
+  env_hash.LLDBDAP_LOG = log_file
   local ok_cfg, cfg = pcall(require, "ue.config")
   if ok_cfg and cfg and cfg.get then
     local pyhome = cfg.get("dap.lldb_dap_python_dir")
     if type(pyhome) == "string" and pyhome ~= "" then
-      env.PYTHONHOME = pyhome
+      env_hash.PYTHONHOME = pyhome
     end
     local pypath = cfg.get("dap.lldb_dap_pythonpath")
     if type(pypath) == "string" and pypath ~= "" then
-      env.PYTHONPATH = pypath
+      env_hash.PYTHONPATH = pypath
     end
   end
-  return env
+  -- libuv `uv.spawn` env field requires an ARRAY of "K=V" strings, NOT a
+  -- hash map. nvim-dap session.lua L1601 passes our env directly to
+  -- uv.spawn without normalization (the normalize path at L137-143 is
+  -- only used by the terminal-spawn / runInTerminal route). So we must
+  -- produce the array form ourselves here.
+  local arr = {}
+  for k, v in pairs(env_hash) do
+    if k:find("^[^=]*$") then
+      arr[#arr + 1] = k .. "=" .. tostring(v)
+    end
+  end
+  return arr
 end
 
 --- Lazy-load nvim-dap. Returns the module or nil + reason.
@@ -97,8 +117,24 @@ end
 ---@param adapter string absolute path to lldb-dap
 function M.ensure_adapter(dap, adapter)
   if not dap or not dap.adapters then return end
+  -- Disable nvim-dap's "auto-continue any thread that stops after another is
+  -- already stopped" behaviour for the `lldb` config type. lldb-dap 22.1.6
+  -- on platform-mode Android attach reports stopOnEntry as ONE `stopped`
+  -- event per thread (all with allThreadsStopped=true). nvim-dap interprets
+  -- every event after the first as "a NEW thread stopped while another is
+  -- already stopped" and fires a per-thread `continue` request — for a UE4
+  -- app that floods lldb-dap with ~165 continues, one of which lands on the
+  -- entry stop (OK) and the rest return `notStopped`, wedging the session.
+  -- Keep every stopped event visible to nvim-dap, but prevent that automatic
+  -- fan-out; the user resumes explicitly with F5 after the entry stop.
+  -- (Set unconditionally, BEFORE the adapter-already-wired early return.)
+  dap.defaults = dap.defaults or {}
+  dap.defaults.lldb = dap.defaults.lldb or {}
+  dap.defaults.lldb.auto_continue_if_many_stopped = false
+
   local cur = dap.adapters.lldb
-  if type(cur) == "table"
+  -- Force re-wire to refresh env (LLDBDAP_LOG path may change across sessions)
+  if false and type(cur) == "table"
     and cur.type == "executable"
     and cur.command == adapter
     and cur.options ~= nil then

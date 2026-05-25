@@ -36,9 +36,13 @@ D._dap_session_state         = {}
 D._dap_attach_in_progress    = false
 D._dap_run_state             = "idle"   -- idle | attaching | stopped | running | resuming
 D._continue_pending          = false
+D._step_pending              = false  -- true while a step request awaits adapter `stopped` event
+D._step_debounce_until_ms    = 0      -- monotonic-ms watchdog; lets the keymap recover if the adapter never replies
+D._step_feedback_until_ms    = 0      -- throttle for visible step-rejection notifications (one per 2 s)
 D._continue_debounce_until_ms = 0
 D._pause_pending             = false
 D._dap_source_file_cache     = {}
+D._dap_expected_focus_thread_id = nil
 
 -- ─────────────────────────────────────────────────────────────────────
 -- Helpers.
@@ -87,6 +91,7 @@ end
 
 local function maybe_jump_to_local_source_frame(session, body)
   if not session or D._dap_attach_in_progress or is_sigstop_stop(body) then return end
+  if body and body.preserveFocusHint and not body.threadCausedFocus then return end
   if frame_has_local_source(session.current_frame) then return end
   local thread_id = (body and body.threadId) or session.stopped_thread_id
   if not thread_id then return end
@@ -118,10 +123,19 @@ end
 local function request_dap_continue(dap)
   local session = dap and dap.session and dap.session() or nil
   if not session then return false end
+  session._ue_expected_focus_thread_id = nil
+  D._dap_expected_focus_thread_id = nil
   D._continue_pending = true
   D._dap_run_state = "resuming"
   D._continue_debounce_until_ms = mono_ms() + 750
-  local ok, err = pcall(dap.continue)
+  local ok, err
+  if type(session._step) == "function" then
+    ok, err = pcall(function()
+      session:_step("continue", { singleThread = false })
+    end)
+  else
+    ok, err = pcall(dap.continue)
+  end
   if ok then return true end
   D._continue_pending = false
   D._dap_run_state = session.stopped_thread_id and "stopped" or "idle"
@@ -130,14 +144,114 @@ local function request_dap_continue(dap)
   return false
 end
 
+local function remember_focus_thread(session, thread_id)
+  if not session or not thread_id then return end
+  session._ue_expected_focus_thread_id = thread_id
+  D._dap_expected_focus_thread_id = thread_id
+end
+
+local function current_stopped_thread(session)
+  if not session then return nil end
+  if session.stopped_thread_id then return session.stopped_thread_id end
+  local only
+  for id, thread in pairs(session.threads or {}) do
+    if thread and thread.stopped then
+      if only then return nil end
+      only = thread.id or id
+    end
+  end
+  return only
+end
+
+-- Throttled feedback for step-request rejections. High-frequency drops
+-- (held F10) stay silent so the user is not spammed; low-frequency cases
+-- (session running, state machine confused) surface a one-shot hint per
+-- 2 s window so the user knows why their keypress did nothing.
+local function step_feedback(msg, level)
+  local now = mono_ms()
+  if now < (D._step_feedback_until_ms or 0) then return end
+  D._step_feedback_until_ms = now + 2000
+  vim.notify(msg, level or vim.log.levels.INFO)
+end
+
+local function request_step(dap, command)
+  local session = dap and dap.session and dap.session() or nil
+  if not session then return end
+
+  -- Re-entrancy guard. Holding F10 / pressing F10 faster than the adapter
+  -- can answer with a stopped event produces back-to-back step requests.
+  -- lldb-dap 22.1.6 in platform-android mode crashes the inferior when it
+  -- receives a second `next` / `stepIn` before the previous one resolved
+  -- (see MEMORY: lldb-dap-22-platform-mode-breakpoint-crash). Drop
+  -- duplicate step requests until the adapter sends back `stopped` or the
+  -- short debounce window expires.
+  --
+  -- Silent drops (high-frequency, expected): held F10, _continue_pending,
+  -- resuming. Spamming notify here would punish the exact case the guard
+  -- exists to absorb.
+  local now = mono_ms()
+  if D._step_pending then
+    if now < (D._step_debounce_until_ms or 0) then return end
+    -- Debounce window lapsed without a stopped event — assume the previous
+    -- step is genuinely lost so we don't deadlock the keymap forever.
+    D._step_pending = false
+  end
+  if D._continue_pending or D._dap_run_state == "resuming" then return end
+
+  -- Visible feedback (low-frequency, surprising): session is actively
+  -- running, or the state machine is in a state from which we cannot
+  -- step. These mean the user pressed F10 expecting motion and got
+  -- nothing — they deserve to know why.
+  if D._dap_run_state == "running" then
+    step_feedback("[ue.dap] session is running — press F6 (UEDAPPause) before stepping",
+      vim.log.levels.WARN)
+    return
+  end
+  -- Only step when the adapter is parked. Allow the case where our tracker
+  -- thinks we are idle but the session reports a stopped thread.
+  if D._dap_run_state ~= "stopped" and not session.stopped_thread_id then
+    step_feedback(("[ue.dap] cannot step in state '%s' (no stopped thread); use :UEDAPDiag")
+      :format(tostring(D._dap_run_state or "?")), vim.log.levels.WARN)
+    return
+  end
+
+  local thread_id = current_stopped_thread(session)
+  if thread_id then remember_focus_thread(session, thread_id) end
+  local opts = { singleThread = true }
+  if type(session._step) ~= "function" then
+    vim.notify("[ue.dap] active session does not support stepping", vim.log.levels.WARN)
+    return
+  end
+
+  D._step_pending = true
+  D._step_debounce_until_ms = now + 750
+  D._dap_run_state = "resuming"
+  local ok, err = pcall(function()
+    session:_step(command, opts)
+  end)
+  if not ok then
+    D._step_pending = false
+    D._step_debounce_until_ms = 0
+    D._dap_run_state = session.stopped_thread_id and "stopped" or "idle"
+    vim.notify("[ue.dap] step (" .. tostring(command) .. ") failed: " .. tostring(err),
+      vim.log.levels.WARN)
+  end
+end
+
 local function reset_session_state()
   D._dap_attach_in_progress    = false
   D._dap_run_state             = "idle"
   D._continue_pending          = false
   D._continue_debounce_until_ms = 0
   D._pause_pending             = false
+  D._step_pending              = false
+  D._step_debounce_until_ms    = 0
+  D._step_feedback_until_ms    = 0
   D._dap_source_file_cache     = {}
-  D._dap_session_state         = {}
+  for k in pairs(D._dap_session_state or {}) do
+    D._dap_session_state[k] = nil
+  end
+  D._dap_expected_focus_thread_id = nil
 end
 
 -- ─────────────────────────────────────────────────────────────────────
@@ -566,17 +680,31 @@ end
 
 function D.dap_step_over()
   local ok, dap = D.ensure_dap_loaded()
-  if ok and dap.session() then dap.step_over() end
+  if ok and dap.session() then request_step(dap, "next") end
 end
 
 function D.dap_step_into()
   local ok, dap = D.ensure_dap_loaded()
-  if ok and dap.session() then dap.step_into() end
+  if ok and dap.session() then request_step(dap, "stepIn") end
 end
 
 function D.dap_step_out()
   local ok, dap = D.ensure_dap_loaded()
-  if ok and dap.session() then dap.step_out() end
+  if ok and dap.session() then request_step(dap, "stepOut") end
+end
+
+function D.dap_bottom_tab(name, opts)
+  if type(D._dap_bottom_tab_impl) == "function" then
+    return D._dap_bottom_tab_impl(name, opts)
+  end
+  vim.notify("[ue.dap] DAP UI tabs are not initialized yet", vim.log.levels.WARN)
+end
+
+function D.dap_next_bottom_tab(delta)
+  if type(D._dap_next_bottom_tab_impl) == "function" then
+    return D._dap_next_bottom_tab_impl(delta)
+  end
+  vim.notify("[ue.dap] DAP UI tabs are not initialized yet", vim.log.levels.WARN)
 end
 
 -- ─────────────────────────────────────────────────────────────────────
@@ -586,6 +714,10 @@ end
 function D.dap_toggle_ui()
   local ok, dapui = D.ensure_dapui_loaded()
   if not ok then return end
+  if type(D._dap_toggle_debug_layout) == "function" then
+    D._dap_toggle_debug_layout()
+    return
+  end
   dapui.toggle()
 end
 
@@ -644,7 +776,11 @@ function D.dap_reset_layout()
   -- Step 3: if a session is active, re-open dapui (and re-pin saved_buf
   -- handling via the listener — we can just call dapui.open here).
   if dap.session() then
-    dapui.open({ reset = true })
+    if type(D._dap_open_debug_layout) == "function" then
+      D._dap_open_debug_layout({ reset = true })
+    else
+      dapui.open({ reset = true })
+    end
     -- restart logcat panel if Android session
     local android_ok, _ = pcall(require, "ue.dap.android")
     if android_ok and D._dap_session_state and D._dap_session_state.pid then
@@ -660,7 +796,12 @@ end
 
 function D.dap_toggle_repl()
   local ok, dap = D.ensure_dap_loaded()
-  if ok then dap.repl.toggle() end
+  if not ok then return end
+  if dap.session() and type(D._dap_bottom_tab_impl) == "function" then
+    D.dap_bottom_tab("repl")
+    return
+  end
+  dap.repl.toggle()
 end
 
 -- ─────────────────────────────────────────────────────────────────────
@@ -1192,6 +1333,208 @@ function D.setup_dap(dap, dapui)
 
   -- ─── logcat side-panel (Android sessions only) ────────────────────
   local logcat_buf, logcat_job
+  local start_logcat
+  local bottom_tabs = { "repl", "console", "breakpoints", "logcat" }
+  local bottom_tab_labels = {
+    repl = "REPL",
+    console = "Console",
+    breakpoints = "Breakpoints",
+    logcat = "Logcat",
+  }
+  local active_bottom_tab = "repl"
+
+  local function current_android_state()
+    local state = D._dap_session_state or {}
+    local ok_android, android = pcall(require, "ue.dap.android")
+    local sess = ok_android and android and android._session or nil
+    if type(sess) == "table" then
+      for k, v in pairs(sess) do
+        if state[k] == nil and v ~= nil then
+          state[k] = v
+        end
+      end
+    end
+    return state
+  end
+
+  local function bottom_tab_statusline(active)
+    local parts = {}
+    for i, name in ipairs(bottom_tabs) do
+      local label = bottom_tab_labels[name] or name
+      if name == active then
+        parts[#parts + 1] = "%#TabLineSel#%" .. i
+          .. "@v:lua.UEDapBottomTabClick@ " .. label .. " %T"
+      else
+        parts[#parts + 1] = "%#TabLine#%" .. i
+          .. "@v:lua.UEDapBottomTabClick@ " .. label .. " %T"
+      end
+    end
+    parts[#parts + 1] = "%#TabLineFill#"
+    return table.concat(parts, "")
+  end
+
+  local function is_bottom_tab_win(win)
+    if not vim.api.nvim_win_is_valid(win) then return false end
+    local buf = vim.api.nvim_win_get_buf(win)
+    local ft = vim.bo[buf].filetype
+    local name = vim.api.nvim_buf_get_name(buf)
+    return ft == "dap-repl"
+      or ft == "dapui_console"
+      or ft == "dapui_breakpoints"
+      or name:match("logcat:%d+$") ~= nil
+  end
+
+  local function find_bottom_tab_window()
+    if D._dap_bottom_tab_win and vim.api.nvim_win_is_valid(D._dap_bottom_tab_win) then
+      return D._dap_bottom_tab_win
+    end
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      if is_bottom_tab_win(win) then
+        D._dap_bottom_tab_win = win
+        return win
+      end
+    end
+    return nil
+  end
+
+  local function render_dapui_element(name)
+    if not (dapui and dapui.elements and dapui.elements[name]) then return nil end
+    local elem = dapui.elements[name]
+    pcall(function()
+      if elem.render then elem.render() end
+    end)
+    if elem.buffer then
+      local ok_buf, buf = pcall(elem.buffer)
+      if ok_buf and buf and vim.api.nvim_buf_is_valid(buf) then return buf end
+    end
+    return nil
+  end
+
+  local function bottom_tab_buffer(name)
+    if name == "logcat" then
+      if (not logcat_buf or not vim.api.nvim_buf_is_valid(logcat_buf))
+         and type(start_logcat) == "function" then
+        local state = current_android_state()
+        if state.pid and state.pid ~= "" then
+          start_logcat()
+        end
+      end
+      if logcat_buf and vim.api.nvim_buf_is_valid(logcat_buf) then return logcat_buf end
+      return nil
+    end
+    return render_dapui_element(name)
+  end
+
+  local function apply_bottom_tab_window(win, active)
+    if not win or not vim.api.nvim_win_is_valid(win) then return end
+    pcall(vim.api.nvim_win_set_option, win, "winbar", "")
+    pcall(vim.api.nvim_win_set_option, win, "statusline", bottom_tab_statusline(active))
+    pcall(vim.api.nvim_win_set_option, win, "number", false)
+    pcall(vim.api.nvim_win_set_option, win, "relativenumber", false)
+    pcall(vim.api.nvim_win_set_option, win, "signcolumn", "no")
+    pcall(vim.api.nvim_win_set_option, win, "wrap", false)
+  end
+
+  _G.UEDapBottomTabClick = function(minwid)
+    local name = bottom_tabs[tonumber(minwid) or 1] or "repl"
+    vim.schedule(function()
+      if type(D.dap_bottom_tab) == "function" then
+        D.dap_bottom_tab(name)
+      end
+    end)
+  end
+
+  local function open_bottom_tab_window()
+    local existing = find_bottom_tab_window()
+    if existing then
+      return existing
+    end
+
+    local code_win = saved_win
+    if not (code_win and vim.api.nvim_win_is_valid(code_win)) then
+      code_win = D.dap_focus_main_window()
+    end
+    if not (code_win and vim.api.nvim_win_is_valid(code_win)) then return nil end
+
+    local cur = vim.api.nvim_get_current_win()
+    pcall(vim.api.nvim_set_current_win, code_win)
+    vim.cmd("belowright split")
+    local win = vim.api.nvim_get_current_win()
+    D._dap_bottom_tab_win = win
+    pcall(vim.api.nvim_win_set_height, win, 12)
+    apply_bottom_tab_window(win, active_bottom_tab)
+    pcall(vim.api.nvim_set_current_win, code_win)
+    if cur ~= code_win and vim.api.nvim_win_is_valid(cur) then
+      pcall(vim.api.nvim_set_current_win, cur)
+    end
+    return win
+  end
+
+  local function open_debug_layout(opts)
+    opts = opts or {}
+    -- dap-ui owns only the left debug rail. The bottom tab host is our own
+    -- split under the saved code window, so it aligns with code instead of
+    -- spanning under the left rail.
+    dapui.open({ layout = 1, reset = opts.reset })
+    D._dap_bottom_tab_win = open_bottom_tab_window()
+    D.dap_bottom_tab(active_bottom_tab or "repl", { quiet = true })
+  end
+
+  local function close_debug_layout()
+    if D._dap_bottom_tab_win and vim.api.nvim_win_is_valid(D._dap_bottom_tab_win) then
+      pcall(vim.api.nvim_win_close, D._dap_bottom_tab_win, true)
+    end
+    dapui.close({ layout = 1 })
+    D._dap_bottom_tab_win = nil
+  end
+
+  function D._dap_open_debug_layout(opts)
+    open_debug_layout(opts)
+  end
+
+  function D._dap_toggle_debug_layout()
+    if find_bottom_tab_window() then
+      close_debug_layout()
+    else
+      open_debug_layout({ reset = false })
+    end
+  end
+
+  D._dap_bottom_tab_impl = function(name, opts)
+    opts = opts or {}
+    name = tostring(name or active_bottom_tab or "repl"):lower()
+    if not vim.tbl_contains(bottom_tabs, name) then
+      vim.notify("[ue.dap] unknown tab: " .. name, vim.log.levels.WARN)
+      return
+    end
+    active_bottom_tab = name
+    local buf = bottom_tab_buffer(name)
+    if not buf then
+      if not opts.quiet then
+        vim.notify("[ue.dap] tab unavailable: " .. name, vim.log.levels.WARN)
+      end
+      return
+    end
+    local win = find_bottom_tab_window()
+    if not win then
+      win = open_bottom_tab_window()
+    end
+    if not win then return end
+    vim.api.nvim_win_set_buf(win, buf)
+    D._dap_bottom_tab_win = win
+    apply_bottom_tab_window(win, name)
+  end
+
+  D._dap_next_bottom_tab_impl = function(delta)
+    delta = delta or 1
+    local cur = active_bottom_tab or "repl"
+    local idx = 1
+    for i, name in ipairs(bottom_tabs) do
+      if name == cur then idx = i; break end
+    end
+    idx = ((idx - 1 + delta) % #bottom_tabs) + 1
+    D.dap_bottom_tab(bottom_tabs[idx])
+  end
 
   local function stop_logcat()
     if logcat_job then pcall(vim.fn.jobstop, logcat_job); logcat_job = nil end
@@ -1206,9 +1549,9 @@ function D.setup_dap(dap, dapui)
     end
   end
 
-  local function start_logcat()
+  start_logcat = function()
     stop_logcat()
-    local state = D._dap_session_state or {}
+    local state = current_android_state()
     local pid, adb, serial = state.pid, state.adb or "adb", state.serial or ""
     if not pid or pid == "" then return end
     logcat_buf = vim.api.nvim_create_buf(false, true)
@@ -1243,35 +1586,28 @@ function D.setup_dap(dap, dapui)
       on_stderr = function() end,
       on_exit = function() logcat_job = nil end,
     })
+    if logcat_job <= 0 then
+      vim.notify("[ue.dap] logcat failed to start: " .. table.concat(cmd, " "),
+        vim.log.levels.WARN)
+    end
   end
 
   local function open_logcat_window()
     if not logcat_buf or not vim.api.nvim_buf_is_valid(logcat_buf) then return end
-    local target_win
-    for _, win in ipairs(vim.api.nvim_list_wins()) do
-      if vim.api.nvim_win_is_valid(win) then
-        local ft = vim.bo[vim.api.nvim_win_get_buf(win)].filetype
-        if ft == "dap-repl" or ft == "dapui_console" then
-          target_win = win
-          break
-        end
-      end
-    end
-    if target_win then
-      vim.api.nvim_set_current_win(target_win)
-      vim.cmd("vertical rightbelow split")
-      vim.api.nvim_win_set_buf(0, logcat_buf)
-      vim.wo.number = false
-      vim.wo.relativenumber = false
-      vim.wo.signcolumn = "no"
-      vim.wo.wrap = false
-    end
+    D.dap_bottom_tab("logcat", { quiet = true })
   end
 
   -- ─── source-path rewrite (relative LLDB paths → absolute) ─────────
   local source_path_cache = {}
   local function resolve_source_path(rel_path)
     if not rel_path or rel_path == "" then return nil end
+    -- lldb-dap 22 occasionally emits source.path frames as msgpack bin →
+    -- Vim Blob in lua. Trap: type(blob) reports "string" so a naive type
+    -- guard doesn't filter it. Force-coerce via tostring so downstream
+    -- pattern matches / vim.fn.filereadable / cache keys all see a real
+    -- Lua string.
+    rel_path = tostring(rel_path)
+    if rel_path == "" then return nil end
     local cached = source_path_cache[rel_path]
     if cached ~= nil then return cached or nil end
     if rel_path:match("^[A-Za-z]:") or rel_path:match("^/") then
@@ -1325,9 +1661,8 @@ function D.setup_dap(dap, dapui)
        and vim.bo[saved_buf].buftype == "" then
       pcall(vim.api.nvim_set_current_buf, saved_buf)
     end
-    dapui.open()
+    open_debug_layout({ reset = true })
     start_logcat()
-    vim.defer_fn(open_logcat_window, 200)
     -- Mark progress popup as done.
     pcall(function() require("ue.dap._progress").done("debugger attached") end)
   end
@@ -1371,35 +1706,74 @@ function D.setup_dap(dap, dapui)
   dap.listeners.after.event_initialized["ue-dap-run-state"] = function(session)
     if dap.session() ~= session then return end
     D._dap_run_state = D._dap_attach_in_progress and "attaching" or "stopped"
+    -- Tell the user the entry stop is expected. On Android attach with
+    -- lldb-dap 22 + stopOnEntry=true the inferior stops with ~174 SIGSTOP
+    -- threads; nvim-dap consumes them all (auto_continue_if_many_stopped=
+    -- false in _common.lua) and waits. The user must press F5 (or
+    -- :DapContinue / :UEDAPContinue) to resume.
+    vim.notify(
+      "[ue.dap] Attached. Stopped at entry — press F5 (or :DapContinue) to run.",
+      vim.log.levels.INFO)
   end
-  dap.listeners.after.event_stopped["ue-dap-run-state"] = function(session, body)
+
+  -- ─── lldb-dap 22 platform-mode attach: per-thread stopped events ─────
+  -- Per llvmorg-22.1.6 lldb/tools/lldb-dap/EventHelper.cpp L177-249
+  -- (SendThreadStoppedEvent): on stopOnEntry attach, lldb-dap emits one
+  -- DAP `stopped` event PER THREAD that has a stop reason. For a UE4 app
+  -- that is ~174 events in a burst. This is upstream-blessed behavior
+  -- (LLVM commit 7a417614) and nvim-dap already accommodates it via
+  -- `dap.defaults.lldb.auto_continue_if_many_stopped = false` (set in
+  -- `lua/ue/dap/_common.lua`). With that flag false, nvim-dap's
+  -- session.lua L733-748 sees N>1 stopped events, sets should_jump=false
+  -- for later non-focused stops, does NOT send a continue, and lets the
+  -- inferior stay frozen at entry until the user resumes manually.
+  --
+  -- A previous version of this file monkey-patched Session.event_stopped
+  -- to drop "entry burst" tail events, AND scheduled a 50ms client-side
+  -- auto-continue. Both were unnecessary workarounds we wrote ourselves:
+  -- the monkey-patch broke nvim-dap's thread-state bookkeeping, and the
+  -- 50ms auto-continue raced the burst (resuming the inferior before
+  -- nvim-dap finished consuming the 173 tail events), producing ~322
+  -- `invalid thread` error popups. Both have been removed; the protocol
+  -- now flows naturally per the DAP spec.
+
+  dap.listeners.before.event_stopped["ue-dap-preserve-lldb-focus"] = function(session, body)
+    if dap.session() ~= session or not body or not body.threadId then return end
+    local cfg = session.config or {}
+    if cfg.type ~= "lldb" then return end
+
+    if body.threadCausedFocus then
+      session._ue_last_focus_thread_id = body.threadId
+      session._ue_expected_focus_thread_id = nil
+      D._dap_expected_focus_thread_id = nil
+      return
+    end
+
+    -- lldb-dap 22 can report a stop as multiple per-thread `stopped`
+    -- events. The event for the thread that should own editor focus is
+    -- marked `threadCausedFocus`; other events carry `preserveFocusHint`.
+    -- nvim-dap currently ignores both fields. If a non-focus event arrives
+    -- first after F10/F11, it would become `stopped_thread_id`, so the next
+    -- step would run the wrong thread. Seed the expected focus thread before
+    -- nvim-dap's handler sees non-focus events.
+    if body.preserveFocusHint then
+      local focus = session._ue_expected_focus_thread_id
+        or D._dap_expected_focus_thread_id
+        or session.stopped_thread_id
+      if focus and focus ~= body.threadId then
+        session.stopped_thread_id = focus
+      end
+    end
+  end
+
+  dap.listeners.after.event_stopped["ue-dap-run-state"] = function(session, _body)
     if dap.session() ~= session then return end
     D._dap_run_state = "stopped"
     D._continue_pending = false
     D._continue_debounce_until_ms = 0
     D._pause_pending = false
-    -- Auto-continue on benign stops that the user did not request:
-    --   * `entry` — stopOnEntry=true on Android attach lands us in 174
-    --     SIGSTOP events (one per thread) the instant `process attach`
-    --     returns. Without auto-continue, the inferior sits frozen, the
-    --     watchdog (Android system_server) eventually flags it as ANR
-    --     and may relaunch the app — observed as "PID jumps after attach".
-    --   * `exception` — Android delivers stray SIGSEGV/SIGSTOP/SIGBUS on
-    --     unrelated threads (Chrome_IOThread, Signal Catcher, …). Stopping
-    --     on them freezes the app and confuses the user.
-    -- A real breakpoint hit reports `hitBreakpointIds`; a user-requested
-    -- pause reports `reason = "pause"`. Both bypass auto-continue.
-    body = body or {}
-    local reason = tostring(body.reason or ""):lower()
-    local has_bp = body.hitBreakpointIds and #body.hitBreakpointIds > 0
-    local is_benign = (reason == "entry" or reason == "exception") and not has_bp
-    if is_benign then
-      vim.defer_fn(function()
-        if dap.session() == session and D._dap_run_state == "stopped" then
-          request_dap_continue(dap)
-        end
-      end, 50)
-    end
+    D._step_pending = false
+    D._step_debounce_until_ms = 0
   end
   dap.listeners.after.event_continued["ue-dap-run-state"] = function(session)
     if dap.session() ~= session then return end

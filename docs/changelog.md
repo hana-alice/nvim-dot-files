@@ -44,6 +44,175 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-05-22 (night #2) — ui(dap): VS-style left rail plus right-bottom tabs
+
+**Task** — 调试 UI 改成参考图形态：左侧是 Locals / Stack / Watches，
+代码窗口保持在右上，我们额外的面板放到代码窗口下方并做成 tab。
+
+**Implemented**
+- `lua/plugins/dap.lua`:
+  - dap-ui layout 只保留左侧 debug rail；底部不再使用 dap-ui 的 `bottom`
+    layout，避免 `botright split` 横跨整屏。
+  - 左侧常驻 `scopes` / `stacks` / `watches`，不再把 variables 放右边挤代码。
+  - 关闭 `force_buffers`，允许自定义右下 tab host 在同一个窗口里切换 buffer。
+- `lua/ue/dap.lua`:
+  - 新增右下 tab 切换：`repl` / `console` / `breakpoints` / `logcat`。
+  - DAP attach 打开左侧 rail 后，在保存的代码窗口内部 `belowright split`
+    出右下 tab，因此底部只在代码窗口下方，不会横跨左侧 rail。
+  - Tab winbar 使用 `%@v:lua.UEDapBottomTabClick@...%T` 点击区，鼠标可切换。
+  - Logcat 不再额外 `vertical split`，而是进入右下 `logcat` tab。
+  - `UEDAPREPL` 在调试会话中切到 `repl` tab，而不是再开独立 REPL 窗。
+- `lua/ue.lua` / `lua/config/keymaps.lua`:
+  - 新增 `:UEDAPTab repl|console|breakpoints|logcat`、
+    `:UEDAPNextTab`、`:UEDAPPrevTab`。
+  - 新增 `<leader>d1`..`<leader>d4` 和 `<leader>d]` / `<leader>d[`。
+
+**Validation**
+- Headless load for `lua/plugins/dap.lua`, `lua/ue/dap.lua`, `lua/ue.lua`,
+  and `lua/config/keymaps.lua`.
+- Headless tab probe: fake dap-ui REPL/Console/Breakpoints buffers, attach-time
+  open left rail + right-column bottom split, switch tabs, verify the same
+  bottom window buffer changes and the winbar has clickable tab regions.
+- `git diff --check`.
+
+**Remaining risk**
+- Visual verification still needs a live Neovide attach because dap-ui split
+  geometry depends on the real current window and Neovide dimensions.
+
+---
+
+### 2026-05-22 (night) — fix(dap): keep lldb-dap step focus on the requested thread
+
+**Task** — UE Android attach can stop and break, but F10/F11 may jump to another
+thread after lldb-dap 22 emits a multi-thread stopped burst.
+
+**Implemented**
+- `lua/ue/dap.lua`:
+  - `D.dap_step_over` / `D.dap_step_into` / `D.dap_step_out` now call the
+    active session's `_step("next"|"stepIn"|"stepOut", { singleThread = true })`
+    directly, so F11 cannot fall back to nvim-dap's parameter-less `stepIn`.
+  - Step requests remember the current stopped thread before resuming.
+  - Added `ue-dap-preserve-lldb-focus` before-stopped listener. It respects
+    lldb-dap's `threadCausedFocus` / `preserveFocusHint` fields so non-focus
+    stopped events cannot steal `session.stopped_thread_id`.
+  - Source auto-navigation now ignores non-focus `preserveFocusHint` events,
+    so the editor cursor follows the same focused thread as stepping.
+- `lua/ue/dap/_common.lua` comment corrected: no coalesced client continue;
+  nvim-dap consumes all stopped events with `auto_continue_if_many_stopped=false`.
+- `lua/ue/dap/android.lua` comments corrected: `postRunCommands` stays empty,
+  and the user resumes with F5 after configuration is armed.
+
+**Pitfalls / Gotchas**
+- `auto_continue_if_many_stopped=false` stops nvim-dap from fan-out continuing,
+  but nvim-dap still ignores DAP focus hints. lldb-dap can send a non-focused
+  thread's stopped event before the actual focus thread, which is enough to
+  poison the next step request unless we seed the expected focus thread first.
+- Fixing `session.stopped_thread_id` alone is insufficient because our own
+  source-nav listener also fetched stack traces from every stopped event.
+
+**Validation**
+- Headless module load: `lua/ue/dap.lua`, `_common.lua`, and `android.lua`.
+- Headless focus probe: step-over/step-in/step-out dispatch `next`/`stepIn`/
+  `stepOut` with `singleThread=true`, record thread 101, preserve that focus
+  when a thread 202 `preserveFocusHint` event arrives, and clear the expectation
+  when thread 101 reports `threadCausedFocus=true`.
+- `git diff --check` on touched DAP files.
+
+**Remaining risk**
+- Live Neovide/device verification is still required for `/proc/PID/status`,
+  game ticking after F5, and actual F10 behavior against the UE process.
+
+---
+
+### 2026-05-22 (later) — fix(dap/android): auto-discover package + symbol_lib from packageInfo.txt
+
+**Task** — `:UEDAPAttach android` 每次启动都弹两个 `vim.fn.input` 让用户手输 Android
+package name 和 host libUE4.so 路径，违反"减心智负担"。
+
+**Root cause (3 层叠加)**
+1. `ue.dap.android.pick_package` 仅在 `ctx.engine_root` 存在时查 state.json；当
+   buffer 没在 UE 项目里（cwd=~，bufname=""）时 `resolve_context()` 返回 nil →
+   ctx 为 nil → 跳过 state 分支。
+2. `:UEPrepare` 从未把 `android_package` 字段写进 state.json（这字段从来没人写过），
+   即便 ctx 有 engine_root，state 里也读不到。
+3. `pick_symbol_lib` glob 命中多个版本时按字典序取第一个 = **最旧** symbols，
+   跟当前 APK 版本不对应；且同样依赖 `ctx.project_root`，ctx nil 时整段 skip。
+
+**Implemented**
+- `lua/ue/dap/android.lua`:
+  - 新增 `read_package_info(proot)` 读 `Source/Client/Binaries/Android/packageInfo.txt`
+    （UE 在每次 Android cook 时写：line1=package, line2=versionCode, line3=versionName）。
+  - 新增 `discover_project_root(start)` 沿目录树向上找 `Source/Client/Binaries/Android`
+    标记。
+  - 新增 `effective_project_root(ctx)` 优先级链：ctx → ue.config.project_root →
+    bufname 探测 → cwd 探测。
+  - `pick_package` 优先级: state → cfg → **packageInfo.txt → input**。命中
+    packageInfo 后用 `ue.update_state_field` 持久化，下次直接复用 state 分支。
+  - `pick_symbol_lib` 优先级: cfg → **packageInfo.versionCode 精确匹配
+    `Client_Symbols_v<code>/Client-arm64/libUE4.so`** → glob 按 mtime 取最新
+    （从前的字典序首选 → mtime 修正）→ input。
+  - 新增 test hooks `M._pick_package_for_test` / `M._pick_symbol_lib_for_test` /
+    `M._effective_project_root_for_test`。
+
+**Pitfalls / Gotchas**
+- `ue.read_state` / `ue.resolve_context` 在 ue.lua 是 local forward-declared，
+  靠 L8463/8465 `M.x = x` 暴露；初判以为没暴露，搜 `M.read_state` 才看清。
+- `dap.lua` 里 `local core = {}` 看起来空，但 `D.setup_core` (L1540) 在 ue.lua
+  L8422 注入了 `resolve_context`。问题不在 wiring，在 buffer 不在项目里时
+  resolve_context 返回 nil。
+- `packageInfo.txt` 用 `\r\n` 行尾（Windows cook 产出），`vim.fn.readfile` 已自动
+  剥 `\n` 但 `\r` 残留——`read_package_info` 里加了 trim。
+
+**Validation**
+- Headless RPC probe (`/c/Users/lizeqiang/AppData/Local/Temp/probe_picker2_run.lua`)
+  把 picker 经 `_for_test` 直接调三种 ctx 形态：
+  - Case A: ctx=nil, cwd=E:/aki/zeqiang_aki_3.4 →
+    package=`com.example.mygame`, sym=`Client_Symbols_v<code>/.../libUE4.so`, 0 prompts
+  - Case B: ctx={project_root="E:/aki/zeqiang_aki_3.4"} → 同上, 0 prompts
+  - Case C: ctx={engine_root="E:/aki/zeqiang_aki_3.3"} 但 cwd=3.4 → fallback 到
+    cwd 探测命中 3.4, 0 prompts
+- Hot-reloaded 到 PID 56396 nvim，下次 `<space>da` 不再弹两个 input。
+
+**Follow-ups**
+- `:UEPrepare` Android 阶段可顺便把 `android_package` 写进 state.json (持久化
+  到 .cache/nvim-ue/state.json)，使首次 attach 都不依赖 packageInfo.txt fallback。
+- 沉淀 skill `ue-android-attach-auto-discover-from-packageinfo`：单源真理位置
+  + versionCode 精确匹配模式。
+
+---
+
+
+
+**Task** 接 ue-android-dap-ide-polish 续集。用户报告 `:UEDAPAttach android` 完成后 UI 卡 `||`、PC 停在 `svc #0` (syscall 29)、F5 → "process already running"；三层状态机互相矛盾（adb 内核 `t (tracing stop)`、lldb-dap 看是 running、nvim-dap UI 显示 paused）。即 attach race condition，每次 attach 必复现。
+
+**Implemented**
+- `lua/ue/dap/_common.lua` `M.ensure_adapter()` — 在 adapter-already-wired 早返回之前把 `dap.defaults.lldb.auto_continue_if_many_stopped = false`。原因见下方根因。
+- `lua/ue/dap.lua` event_stopped listener — 新加 `D._auto_continue_armed` 守卫：一个 benign stop burst 内只有第一个 stop 触发 deferred continue，其余 skip（之前 165 个 entry events 各自 schedule 一个 50ms-deferred continue，全部冲向 lldb-dap）。
+- `lua/ue/dap.lua` event_stopped listener — 区分 user pause vs spurious exception：lldb-dap 22 把用户 pause 报为 `reason="exception"`（不是协议规定的 `"pause"`），增加 `D._pause_pending` 判断把它从 benign 集合里排除，否则用户按 F6 也会被 auto-continue。
+- `lua/ue/dap.lua` event_initialized listener — 新 session 起来时清 `D._auto_continue_armed`，避免上次残留。
+
+**Root cause** (probe 数据驱动，不是猜)
+- lldb-dap 22.1.6 在 platform-mode attach 时，对**每个线程**都发一个 `stopped` event (`reason=entry`, `allThreadsStopped=true`)。UE4 app 约 165 线程，attach 后 67ms 内 lldb-dap 涌出 165 个 stopped event。
+- nvim-dap 的默认 `auto_continue_if_many_stopped=true` 把"已经有线程 stopped 时另一个线程也 stopped"判定为"独立 stop"，对**后续每个**线程自动发 `continue(threadId=N)` request。
+- 结果：lldb-dap 1 秒内收到 165 个 continue request，**1 个成功** + 164 个返回 `notStopped`。nvim-dap UI/state 机被淹没，session 雪崩。
+
+**Pitfalls / Gotchas**
+- 第一版 fix 把 default 设置放在 `ensure_adapter` 末尾 → adapter 已 wire 时早返回路径根本跑不到 → setting 没生效。**必须放在 early-return 前**。
+- `_auto_continue_armed` 守卫在数据上 took_branch=1, skipped_armed=82 完美生效，但 lldb-dap 端依然 1 OK + 81 notStopped — 这才暴露真凶不在我们 listener，而在 nvim-dap 内部 `session.lua:741` 的自动 `continue` 发射。教训：fix 加上后必须看**完整的事件计数**，单看自家 listener 状态不够。
+- lldb-dap 22 把用户 pause 报成 `exception` 而非协议规定的 `"pause"` — 现有 `is_benign = (entry|exception) and not has_bp` 把它误判为 benign 后 auto-continue 回去，导致 pause "看起来失败"。区分依赖 `D._pause_pending` 500ms 窗口（D.dap_pause 设，500ms 后清）。
+- nvim-dap 的 `dap.continue()` (`session:_step('continue')`) 只发 1 个 continue request，不会自己 fanout。fanout 来自 `session.lua:741` 的 `auto_continue_if_many_stopped` 路径，跟我们的 deferred continue 是两件事——必须**同时**修两边。
+- hot-reload 测试 artifact：reload ue 模块后，user command 注册时拷贝的旧 M.dap_pause 引用旧 D，但 listener 重新注册引用新 D — 两个 D 表隔离，`D._pause_pending` 在 listener 处永远 false。生产无影响（用户一次 startup 一份 D），但测试时必须 fresh nvim 重启。
+
+**Validation**
+- 实写 probe `dap_wedge_trace.py`：fresh attach 抓到 165 stopped events 67ms 内涌出 + 1 OK continue + 164 notStopped — 数据锁定根因。
+- 实写 probe `dap_fix_trace2.py`：fix #1 (`auto_continue_armed` guard) **单独** verify — took_branch=1 / skipped_armed=82 / continue_invocations=1，但 lldb-dap 端仍 1 OK + 81 notStopped — 证明守卫工作但不够 → 转向 fix #2。
+- 实写 probe `dap_fix_verify.py`：fix #1 + #2 (`auto_continue_if_many_stopped=false`) 一起 verify — 83 stopped events / 1 OK / **0 notStopped** / inferior 跑起来 / 1 continued event。**PASS**。
+- adb 验证：fix 后 game state=`S` (sleeping/running)、TracerPid=lldb-server PID、lldb-server 在 `do_select` 等命令 — 标准健康 attached state。
+
+**Follow-ups**
+- pause 修复（`is_user_pause`）在 fresh nvim 没能完整 e2e 验证：fresh nvim 第一次 attach 慢 / 因 30s timeout 失败 / game 被 ANR 重启，验证脚本中断。**生产环境需要用户重启 nvim 后手动确认 F6/`:UEDAPPause` + F5/`:UEDAPContinue` 正常**。
+- 等用户验证 OK 后，沉淀 skill `nvim-dap-lldb-platform-attach-allthreads-stop-coalesce`（lldb-dap 22 platform-mode attach 全线程 stop 雪崩的通用配方）。
+
 ### 2026-05-21 (later #9) — fix(dap/android): de-duplicate source-map entries
 
 **Task** D4 实测发现 `target.source-map` 显示同一条映射被注册两次。根因：`pick_source_map()` 故意 emit 反斜杠 + 正斜杠两个 `from` 变体（以为 DWARF `DW_AT_comp_dir` 路径分隔符不确定），但 **lldb-dap 在 Windows 上把所有 `from` key 都规范化成反斜杠**——dict 转 list 后两条 entry 完全相同。LLDB 每次解析 source 走同一映射两次，无害但浪费 + 让 diag 输出误导。
@@ -945,3 +1114,42 @@ class range: \Pr` 的 csearch warn — 因为输入直传 RE2，`\P{...}` 当 Un
   前 D:/project/UnrealEngine 场景无害但要 follow-up 修 (resolve_context
   没 invalidate)。
 
+## 2026-05-25 — F10 hold/spam crashes Android DAP inferior
+
+- **Task**: 用户在 nvim DAP 调试 Android 时按快 F10 → app 闪退 + debugger 断连，要求修复。
+- **Done**: `lua/ue/dap.lua::request_step` 加再入 guard。
+  - 顶层加 `D._step_pending` / `D._step_debounce_until_ms` 状态。
+  - 进入时检查 `_step_pending` / `_continue_pending` / `run_state` (running/resuming)，背靠背 F10 直接 drop。
+  - 发出 step 时乐观切 `run_state="resuming"`，pcall 失败回滚。
+  - 750ms watchdog：debounce 内 drop，超时自愈避免锁死键。
+  - `event_stopped` listener 清 `_step_pending`；`reset_session_state` 清 step 字段（session 退出/崩了路径自动覆盖）。
+- **坑**:
+  - `request_dap_continue` 已经有完整节流（pending+debounce+resuming），但 `request_step` 是裸的——一直没人注意，直到 lldb-dap 22.1.6 platform-android 模式遇到 back-to-back next 直接崩 inferior（MEMORY lldb-dap-22-platform-mode-breakpoint-crash 同类）。
+  - listener 在 `D.setup_dap` 闭包里注册，光 `package.loaded[...]=nil; require()` 旧 listener 还闭包旧 `D` 表 → 必须再调一次 setup_dap，靠 dap.listeners key 覆盖。
+  - hermes 的 terminal 工具在这台机子上 shell session 卡死了（永远 cd 一条 Windows 风格路径并报 No such file or directory），所有 terminal 调用 RC=126；改用 execute_code 走 subprocess 绕过；read_file / patch 工具读 `lua/ue/dap.lua` 也报 File not found，最后全用 Python open() 改 + nvim -l 做 syntax check。
+- **验证**:
+  - `nvim -l` loadfile `lua/ue/dap.lua` → RC=0, LOAD OK。
+  - pynvim 连两个 live nvim (PID 63080 / 13504) reload + 重跑 setup_dap → 都返回 OK，`_step_pending=false`。
+  - 端到端 live 验证（实际 attach → 按快 F10）由用户在 Neovide 里走一遍确认。
+- **Follow-up**:
+  - 用户场景验证：连 Android → `<F5>` → 断点停下 → 短时间内连按 F10 5~10 次 → 期望 app 不闪退、debugger 不断连。
+  - 若仍出问题，看 `:UEDAPDiag` 的 run_state 段，或临时把 debounce 从 750ms 调大到 1500ms。
+
+## 2026-05-25 — F10 throttle: visible feedback for low-frequency rejects + skill honesty pass
+
+- **Task**: 用户问"是不是 workaround"。我自审承认归因未经证实 + 上一轮没给 running 态 F10 反馈。本轮：补 feedback，skill 库做诚实化。
+- **Done (code)**: `lua/ue/dap.lua::request_step` 加 `step_feedback` 函数（mono_ms 节流 2000ms），把 4 个 silent return 拆成 2 silent (held F10 / continue_pending) + 2 visible (running → "press F6 first" / unknown state → ":UEDAPDiag" hint)。新增 `D._step_feedback_until_ms` 字段，初始化 + reset_session_state 一起清。
+- **Done (skill)**: `nvim-dap-stopped-burst-noise-suppression` 三处 patch:
+  - Trap 3 root cause 拆成两层：layer 1 = 状态机不对称（确证）；layer 2 = lldb-dap 22 platform-android back-to-back step crash（未经上游证实，GitHub Issues 搜了 6 个 query 全 0 命中）。
+  - 750ms 标明是经验数字（人键间 50-200ms × ~10 倍头空间），不是 DAP 协议推荐。
+  - 加 silent vs visible feedback 分流表 + step_feedback 节流模式。
+- **Done (template)**: `references/request_step_template.lua` 同步加 step_feedback + 4-case 分流。代号扫描干净（无内部代号字面量）。
+- **坑**:
+  - 上轮我把"按快 F10 → app 闪退"直接归因为"lldb-dap 22 platform-android back-to-back step crashes inferior"。本轮搜 LLVM Issues 没找到佐证。诚实做法：节流是真 fix（状态机一致性 bug），崩溃归因待验证。skill 必须区分这两层，否则后续别人看到会把"客户端节流 fix lldb-dap 22 bug"当结论。
+  - silent vs notify 不能一刀切。held F10 silent 是必须的（这就是 guard 要吸收的高频路径，notify 反而扰民）。running/unknown 必须 visible，否则用户按了不动以为 nvim 卡了。但 visible 也必须节流（2s 一条），否则 running 状态 5 次 F10 = 5 个 popup，自己又造 notify flood。
+- **验证**:
+  - `nvim -l loadfile` → RC=0 LOAD OK。
+  - 等用户在 live Neovide 重测一次：连 Android → 断点 → 按快 F10 多次（期望不闪退）+ continue 让它跑 → running 状态按 F10（期望弹一条 "press F6 first"，第 2~5 次同状态 silent）。
+- **Follow-up**:
+  - LLVM Issues 还可以再去 lldb-dev 邮件列表 / Discord 问 platform-android attach + step burst 有没有人遇到过。优先级低，仅为升级归因从"推测"到"确证"。
+  - 如果 750ms 在用户实际使用中误吞合法第二步（debounce 内 F10 没反应），调到 500ms 试，再不行考虑改成"等 stopped event 来才放行，不设硬超时" + 一个软超时通过 `:UEDAPDiag` 暴露给用户。

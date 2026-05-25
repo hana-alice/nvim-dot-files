@@ -46,7 +46,18 @@ function M.is_dir(path)
 end
 
 function M.is_file(path)
-  return vim.fn.filereadable(path) == 1
+  -- Defensive: vim.fn.filereadable raises E976 "Using a Blob as a String"
+  -- when called with a Vim Blob value. Trap: Lua's `type()` reports Blob
+  -- as "string" (it goes through the same metatable path as Vim strings),
+  -- so a `type(path) ~= "string"` guard does NOT filter Blobs. We have to
+  -- (a) pcall filereadable as a hard backstop, and (b) coerce via tostring
+  -- so the rare Blob source.path frame from lldb-dap doesn't blow up the
+  -- whole stackTrace listener.
+  if path == nil or path == "" then return false end
+  local s = tostring(path)
+  if s == "" then return false end
+  local ok, ret = pcall(vim.fn.filereadable, s)
+  return ok and ret == 1
 end
 
 function M.ensure_dir(path)

@@ -59,38 +59,31 @@ function M.default_lldb_dap_paths()
   -- Standard LLVM Windows install (winget LLVM.LLVM / installer .exe).
   -- PATH lookup is the final fallback inside ue.dap._common.find_lldb_dap.
   --
-  -- C:/tools/lldb-21/bin/lldb-dap.exe is given top priority as a workaround
-  -- for llvm/llvm-project#178155: LLVM 22.x lldb-dap.exe on Windows crashes
-  -- with STATUS_STACK_BUFFER_OVERRUN (0xC0000409) at startup because
-  -- NativeFile's ctor calls _get_osfhandle(fd) on a pipe fd whose CRT
-  -- table lives in lldb-dap.exe's CRT, not liblldb.dll's CRT. The fix
-  -- (PR #195855) is merged in main but NOT backported to release/22.x —
-  -- 22.1.5 still crashes. 21.1.8's File.cpp predates the offending change
-  -- and works fine. We side-load 21.1.8's lldb-dap.exe + liblldb.dll +
-  -- python310.dll into a private directory; clang/clangd stay on 22.1.5.
+  -- Ordering priorities (highest first):
+  -- 1. C:/tools/lldb-22/install/bin/lldb-dap.exe — our locally-built
+  --    LLVM 22.1.6 (commit fc4aad7b). Verified end-to-end against UE
+  --    Android via platform mode (probe_bp_v13.py, 2026-05-21). The
+  --    STATUS_STACK_BUFFER_OVERRUN (0xC0000409) startup crash described
+  --    in llvm/llvm-project#178155 is NOT reproducible against this
+  --    build — that issue was for the 22.1.4/5 distribution shipped on
+  --    GitHub Releases; our self-built 22.1.6 is fine.
+  -- 2. Program Files/LLVM/bin/lldb-dap.exe — whatever the user installed
+  --    system-wide. May be 22.x or 21.x; LLVM Installer usually ships
+  --    the latest stable.
+  -- 3. C:/tools/lldb-21/bin/lldb-dap.exe — historic 21.1.8 fallback for
+  --    hosts that DO hit the 22.x startup crash. Kept last so it doesn't
+  --    accidentally win on an Android-platform-mode workflow (21.1.8's
+  --    platform protocol handshake is incompatible with NDK 27 server,
+  --    confirmed by reproducing "Connection shut down by remote side
+  --    while waiting for reply to initial handshake packet" in headless
+  --    e2e on 2026-05-21).
   local pf = (vim.uv or vim.loop).os_getenv("ProgramFiles") or "C:/Program Files"
   return {
-    "C:/tools/lldb-21/bin/lldb-dap.exe",
+    "C:/tools/lldb-22/install/bin/lldb-dap.exe",
     pf .. "/LLVM/bin/lldb-dap.exe",
+    "C:/tools/lldb-21/bin/lldb-dap.exe",
     "C:/Program Files/LLVM/bin/lldb-dap.exe",
     "C:/Program Files (x86)/LLVM/bin/lldb-dap.exe",
-  }
-end
-
-function M.default_codelldb_paths()
-  -- vadimcn/codelldb VSIX, unpacked. Used only by the Android route — see
-  -- ue.dap.android and ue.dap._common.find_codelldb. The VSIX layout is:
-  --   <root>/extension/adapter/codelldb.exe
-  --   <root>/extension/lldb/bin/liblldb.dll  (loaded by codelldb.exe)
-  -- We try a few common unpack locations. PATH lookup is the last fallback
-  -- inside ue.dap._common.find_codelldb.
-  local home = (vim.uv or vim.loop).os_getenv("USERPROFILE") or ""
-  local lp   = (vim.uv or vim.loop).os_getenv("LOCALAPPDATA") or ""
-  return {
-    "C:/tools/codelldb/extension/adapter/codelldb.exe",
-    home .. "/.local/share/codelldb/extension/adapter/codelldb.exe",
-    lp   .. "/codelldb/extension/adapter/codelldb.exe",
-    home .. "/.vscode/extensions/vadimcn.vscode-lldb-1.12.2/adapter/codelldb.exe",
   }
 end
 

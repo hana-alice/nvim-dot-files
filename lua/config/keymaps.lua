@@ -341,6 +341,60 @@ map("n", "<leader>di", "<cmd>UEDAPStepIn<cr>", { desc = "DAP: Step In" })
 map("n", "<leader>do", "<cmd>UEDAPStepOut<cr>", { desc = "DAP: Step Out" })
 map("n", "<leader>du", "<cmd>UEDAPToggleUI<cr>", { desc = "DAP: Toggle UI" })
 map("n", "<leader>dr", "<cmd>UEDAPREPL<cr>", { desc = "DAP: Toggle REPL" })
+map("n", "<leader>d1", "<cmd>UEDAPTab repl<cr>", { desc = "DAP Tab: REPL" })
+map("n", "<leader>d2", "<cmd>UEDAPTab console<cr>", { desc = "DAP Tab: Console" })
+map("n", "<leader>d3", "<cmd>UEDAPTab breakpoints<cr>", { desc = "DAP Tab: Breakpoints" })
+map("n", "<leader>d4", "<cmd>UEDAPTab logcat<cr>", { desc = "DAP Tab: Logcat" })
+map("n", "<leader>d]", "<cmd>UEDAPNextTab<cr>", { desc = "DAP Tab: Next" })
+map("n", "<leader>d[", "<cmd>UEDAPPrevTab<cr>", { desc = "DAP Tab: Previous" })
+
+-- DAP inspect / evaluate / navigate (added 2026-05-21)
+--   <leader>dB / dL / dC : conditional bp / logpoint / clear all (capitals
+--                          to avoid colliding with the lowercase counterparts
+--                          for plain toggle / continue).
+--   <leader>de / dw / dh : eval-prompt / watch-add / hover. Visual variants
+--                          of dh and dw evaluate the selection instead of
+--                          <cword>.
+--   <leader>dt           : run-to-cursor (ephemeral bp + continue).
+--   <leader>dk / dj      : stack frame up / down (vim-flavored arrow keys).
+--   <leader>dR           : restart current frame.
+map("n", "<leader>dB", "<cmd>UEDAPCondBreakpoint<cr>",   { desc = "DAP: Conditional Breakpoint" })
+map("n", "<leader>dL", "<cmd>UEDAPLogpoint<cr>",         { desc = "DAP: Logpoint" })
+map("n", "<leader>dC", "<cmd>UEDAPClearBreakpoints<cr>", { desc = "DAP: Clear all breakpoints" })
+map("n", "<leader>de", "<cmd>UEDAPEval<cr>",             { desc = "DAP: Evaluate expression" })
+map("n", "<leader>dh", "<cmd>UEDAPHover<cr>",            { desc = "DAP: Hover (eval cword)" })
+map("v", "<leader>dh", ":UEDAPHover<cr>",                { desc = "DAP: Hover (eval selection)" })
+map("n", "<leader>dw", "<cmd>UEDAPWatchAdd<cr>",         { desc = "DAP: Add cword to Watches" })
+map("v", "<leader>dw", ":UEDAPWatchAdd<cr>",             { desc = "DAP: Add selection to Watches" })
+-- UE-aware watch templates: prompt for template type via vim.ui.select,
+-- then use cword as the expression (or the visual selection in visual mode).
+-- Press <leader>dW on an identifier → pick fname/uobject/actor/tarray/raw.
+local function _ue_dap_watch_picker()
+  local templates = { "fname", "uobject", "actor", "tarray", "raw" }
+  local mode = vim.api.nvim_get_mode().mode
+  local expr
+  if mode == "v" or mode == "V" or mode == "\22" then
+    vim.cmd('noautocmd silent normal! "zy')
+    expr = vim.fn.getreg("z"):gsub("[\r\n]+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+  else
+    expr = vim.fn.expand("<cword>")
+  end
+  if not expr or expr == "" then
+    vim.notify("[ue.dap] no expression under cursor", vim.log.levels.WARN)
+    return
+  end
+  vim.ui.select(templates, {
+    prompt = "UE Watch template for `" .. expr .. "`:",
+  }, function(choice)
+    if choice then vim.cmd(("UEDAPWatchUE %s %s"):format(choice, expr)) end
+  end)
+end
+map("n", "<leader>dW", _ue_dap_watch_picker, { desc = "DAP: UE-aware watch (picker)" })
+map("v", "<leader>dW", _ue_dap_watch_picker, { desc = "DAP: UE-aware watch (picker, selection)" })
+map("n", "<leader>dt", "<cmd>UEDAPRunToCursor<cr>",      { desc = "DAP: Run to cursor" })
+map("n", "<leader>dk", "<cmd>UEDAPFrameUp<cr>",          { desc = "DAP: Stack frame up" })
+map("n", "<leader>dj", "<cmd>UEDAPFrameDown<cr>",        { desc = "DAP: Stack frame down" })
+map("n", "<leader>dR", "<cmd>UEDAPRestartFrame<cr>",     { desc = "DAP: Restart frame" })
 map("n", "<leader>ui", "<cmd>UEInstallAndroid<cr>", { desc = "UE: Install APK to device" })
 
 -- Deferred: apply {nowait=true} overrides once LazyVim has finished loading

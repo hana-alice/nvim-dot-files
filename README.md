@@ -12,6 +12,10 @@ It's also a general-purpose editor that happens to know about UE.
   1 workaround registry 1 Windows installer   0 tolerance for UI stalls
 ```
 
+> **New here?** The full module-by-module audit of what we add on top of
+> upstream LazyVim — defaults, overrides, why, where — lives in
+> [`docs/architecture-vs-lazyvim.md`](docs/architecture-vs-lazyvim.md).
+
 ---
 
 ## What's actually in here

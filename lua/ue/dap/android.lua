@@ -3,8 +3,8 @@
 -- Adapter: LLVM lldb-dap (resolved by ue.dap._common.find_lldb_dap).
 -- Wire:    nvim-dap → lldb-dap (host, LLVM 22.1.6) → platform connect
 --          → adb forward → lldb-server platform on /data/local/tmp/ (PUBLIC)
---          → process attach --pid → ART implicit-null SIGSEGV suppressed
---          via `process handle SIGSEGV/SIGBUS/SIGPIPE --notify false`.
+--          → process attach --pid → ART SIGSEGV/SIGBUS traps passed back to
+--          the inferior while DAP signal notifications stay suppressed.
 --
 -- Why lldb-dap (migrated from codelldb 2026-05-21):
 --   * codelldb is a VS Code extension carrying a vendored liblldb. It works
@@ -157,7 +157,70 @@ local function pick_lldb_server()
   return typed
 end
 
+-- ── project root + packageInfo.txt auto-discovery ────────────────────────
+--
+-- UE's Android packaging writes Source/Client/Binaries/Android/packageInfo.txt
+-- on every cook. Layout:
+--   line 1: package name      (e.g. com.example.mygame)
+--   line 2: versionCode       (e.g. 169723198) — matches Client_Symbols_v<code>/
+--   line 3: versionName
+--
+-- This is the single source of truth for both pick_package and pick_symbol_lib,
+-- so we never have to prompt the user when a cooked APK exists on disk. Falls
+-- through to ctx/cfg/input only when there is no cooked output.
+
+local function read_package_info(proot)
+  if not proot then return nil end
+  local path = proot .. "/Source/Client/Binaries/Android/packageInfo.txt"
+  if not fs.is_file(path) then return nil end
+  local ok, lines = pcall(vim.fn.readfile, path)
+  if not ok or type(lines) ~= "table" or #lines < 1 then return nil end
+  local trim = function(s) return (tostring(s or ""):gsub("[\r\n%s]+$", ""):gsub("^%s+", "")) end
+  return {
+    package      = trim(lines[1]),
+    version_code = trim(lines[2] or ""),
+    path         = path,
+  }
+end
+
+-- Walk up from `start` looking for a directory that contains
+-- Source/Client/Binaries/Android (canonical UE project root marker).
+local function discover_project_root(start)
+  if not start or start == "" then return nil end
+  local cur = start
+  -- If start is a file, drop to its dir.
+  local stat = vim.uv and vim.uv.fs_stat(cur)
+  if stat and stat.type == "file" then cur = vim.fn.fnamemodify(cur, ":h") end
+  for _ = 1, 16 do
+    if cur == "" or cur == "/" then break end
+    if fs.is_file(cur .. "/Source/Client/Binaries/Android/packageInfo.txt")
+      or vim.fn.isdirectory(cur .. "/Source/Client/Binaries/Android") == 1 then
+      return cur
+    end
+    local parent = vim.fn.fnamemodify(cur, ":h")
+    if parent == cur then break end
+    cur = parent
+  end
+  return nil
+end
+
+local function effective_project_root(ctx)
+  if ctx and (ctx.project_root or ctx.engine_root) then
+    return ctx.project_root or ctx.engine_root
+  end
+  local cfg_proot = ue_cfg_get("project_root") or ue_cfg_get("dap.project_root")
+  if type(cfg_proot) == "string" and cfg_proot ~= "" then return cfg_proot end
+  local bufname = vim.api.nvim_buf_get_name(0)
+  if bufname and bufname ~= "" then
+    local r = discover_project_root(bufname)
+    if r then return r end
+  end
+  local cwd = vim.fn.getcwd()
+  return discover_project_root(cwd)
+end
+
 local function pick_package(ctx)
+  -- 1. Persisted per-engine_root state (set on previous attach).
   local engine_root = ctx and ctx.engine_root
   if engine_root then
     local ok_ue, ue = pcall(require, "ue")
@@ -169,36 +232,76 @@ local function pick_package(ctx)
       end
     end
   end
+  -- 2. Config override.
   local cfg_pkg = ue_cfg_get("dap.android_package")
   if type(cfg_pkg) == "string" and cfg_pkg ~= "" then return cfg_pkg end
+  -- 3. packageInfo.txt under the discovered project root — written by
+  --    UE on every Android cook, single source of truth.
+  local proot = effective_project_root(ctx)
+  local info = read_package_info(proot)
+  if info and info.package ~= "" then
+    -- Persist for next time so we never re-discover. Best-effort, ignore
+    -- failures (no engine_root, immutable FS, etc).
+    if engine_root then
+      local ok_ue, ue = pcall(require, "ue")
+      if ok_ue and ue and ue.update_state_field then
+        pcall(ue.update_state_field, engine_root, "android_package", info.package)
+      end
+    end
+    return info.package
+  end
+  -- 4. Last resort: prompt.
   local typed = vim.fn.input("Android package name: ", "")
   if typed == "" then return nil end
   return typed
 end
 
 local function pick_symbol_lib(ctx)
+  -- 1. Config override.
   local cfg_sym = ue_cfg_get("dap.android_symbol_lib")
   if type(cfg_sym) == "string" and cfg_sym ~= "" and fs.is_file(cfg_sym) then
     return cfg_sym
   end
-  -- Auto-search common UE Android symbol locations under project_root.
-  local proot = ctx and (ctx.project_root or ctx.engine_root)
+  local proot = effective_project_root(ctx)
   if proot then
-    local candidates = {
+    -- 2. Exact match against packageInfo.txt versionCode — guarantees the
+    --    symbols correspond to the installed APK.
+    local info = read_package_info(proot)
+    if info and info.version_code ~= "" then
+      local exact = {
+        proot .. "/Source/Client/Binaries/Android/Client_Symbols_v" .. info.version_code .. "/Client-arm64/libUE4.so",
+        proot .. "/Source/Client/Binaries/Android/Client_Symbols_v" .. info.version_code .. "/Client-arm64/libUnreal.so",
+      }
+      for _, p in ipairs(exact) do
+        if fs.is_file(p) then return p end
+      end
+    end
+    -- 3. Glob over all symbol packages, pick the newest by mtime (best
+    --    guess when no packageInfo or no exact match).
+    local glob_patterns = {
       proot .. "/Source/Client/Binaries/Android/*Symbols*/Client-arm64/libUE4.so",
       proot .. "/Source/Client/Binaries/Android/*Symbols*/Client-arm64/libUnreal.so",
       proot .. "/Source/Client/Intermediate/Android/arm64/jni/arm64-v8a/libUE4.so",
       proot .. "/Source/Client/Intermediate/Android/arm64/jni/arm64-v8a/libUnreal.so",
     }
-    for _, pat in ipairs(candidates) do
+    local best_path, best_mtime = nil, -1
+    for _, pat in ipairs(glob_patterns) do
       local hit = vim.fn.glob(pat)
       if hit and hit ~= "" then
         for line in (hit .. "\n"):gmatch("([^\n]+)\n") do
-          if fs.is_file(line) then return line end
+          if fs.is_file(line) then
+            local st = vim.uv and vim.uv.fs_stat(line)
+            local mt = (st and st.mtime and st.mtime.sec) or 0
+            if mt > best_mtime then
+              best_path, best_mtime = line, mt
+            end
+          end
         end
       end
     end
+    if best_path then return best_path end
   end
+  -- 4. Last resort: prompt.
   local typed = vim.fn.input("Path to host libUE4.so (with DWARF): ", "", "file")
   if typed == "" then return nil end
   if not fs.is_file(typed) then
@@ -632,21 +735,118 @@ end
 --   1. platform select remote-android       → switches lldb to talk Android
 --   2. platform connect connect://[serial]:port  → opens the wire
 --   3. process attach --pid N                → ptraces the target
---   4. process handle SIG*  --notify FALSE   → CRITICAL: without this,
---      lldb-dap broadcasts a DAP `stopped` event per signal per thread,
---      flooding stdout pipe → Win32 EINVAL → adapter dies. See
---      skill lldb-dap-22-platform-mode-breakpoint-crash for the full
---      forensics. probe_bp_v13.py is the contract test.
+--   4. process handle SIG*  --notify FALSE   → suppress per-signal DAP
+--      stopped events on stdout. The pass/stop disposition still matters
+--      for inferior correctness — see the SIGSEGV/SIGBUS note below.
+--
+-- Signal disposition for Android ART/JIT:
+--   SIGSEGV / SIGBUS — `--pass TRUE` is mandatory. Android ART uses
+--   userspace SIGSEGV (and SIGBUS) handlers as part of its normal
+--   operation:
+--     * Read barriers in JIT-compiled code (MessageQueue.nextLegacy
+--       and friends): a load on a page mprotect'd to PROT_NONE
+--       triggers SIGSEGV, ART's handler rewrites the reference, retry.
+--     * Concurrent compacting GC uses the same mechanism to redirect
+--       loads to moved objects.
+--     * GC card table / heap poisoning uses SIGBUS the same way.
+--   If lldb intercepts these and DROPS them (`--pass false`), ART's
+--   handler never runs → the faulting thread spins on the same
+--   instruction forever and the whole process appears hung. We verified
+--   this by attaching bare `lldb` to the running game: with `--pass
+--   false` many Java handler threads stop at JIT(MessageQueue.nextLegacy
+--   + 760), and `process continue` cannot make progress.
+--   With `--pass true`, lldb forwards the signal to inferior, ART's
+--   sigsegv handler runs, the page is unprotected, and the thread
+--   continues. We still keep `--stop false` so lldb does not surface
+--   these as user-visible stops (they happen continuously during normal
+--   execution and would flood the UI).
+--
+--   SIGPIPE — `--pass false` is fine; ART does not rely on it and the
+--   game has its own SIGPIPE policy (typically ignored).
+--
+-- See skill lldb-dap-22-platform-mode-breakpoint-crash for the
+-- per-signal stdout flooding story (`--notify false`) and
+-- probe_bp_v13.py for the original contract test.
 local function attach_commands(session)
-  return {
+  local cmds = {
     "platform select remote-android",
     string.format("platform connect connect://[%s]:%d",
       session.serial, session.port),
     string.format("process attach --pid %d", session.pid),
-    "process handle SIGSEGV --notify false --pass false --stop false",
-    "process handle SIGBUS  --notify false --pass false --stop false",
+    -- Signal disposition for Android inferior.
+    -- ART uses SIGSEGV/SIGBUS as intentional userspace traps (JIT read
+    -- barriers, concurrent compacting GC card-table protect/unprotect,
+    -- heap poisoning). When lldb traps these signals with --pass=false,
+    -- PTRACE_CONT immediately re-fires the queued signal — the kernel
+    -- restops the thread, lldb silently re-eats it (--stop=false hides
+    -- the event from DAP), and the inferior never makes forward progress.
+    -- Symptom: DAP sees a `continued` event and run_state→running, but
+    -- /proc/PID/status stays in `t (ptrace_stop)` and the game UI freezes.
+    --
+    -- The correct disposition is --pass=true so the kernel actually
+    -- delivers the signal to the inferior, ART's handler runs, the page
+    -- gets fixed up, and the thread continues. --stop=false keeps these
+    -- benign internal traps invisible to the DAP client (no thousands of
+    -- stop events). --notify=false suppresses console spam.
+    --
+    -- Red line #4 (real C++ SIGSEGV must stop): when --stop=false, lldb
+    -- does NOT stop on the signal — but a real crash at an unmapped
+    -- address still propagates through ART's chain handler to libc's
+    -- default disposition → SIGABRT/tombstone → DAP `exited` event. The
+    -- crash is not silently swallowed; it's surfaced via process death.
+    -- (If we ever need an in-process stop on real crashes, we can add a
+    -- breakpoint on `__art_sigsegv_fault_handler`'s no-recover branch.)
+    --
+    -- Note: an earlier bare-lldb test with `lldb --batch` appeared to
+    -- hang after `process continue` under --pass=true. That was an
+    -- artifact of --batch synchronous stdout flushing, not a real hang.
+    -- lldb-dap drives the same SBProcess API asynchronously over DAP and
+    -- does not exhibit the apparent hang.
+    "process handle SIGSEGV --notify false --pass true  --stop false",
+    "process handle SIGBUS  --notify false --pass true  --stop false",
     "process handle SIGPIPE --notify false --pass false --stop false",
   }
+  -- ── attach host symbol file to the device-pulled stripped libUE4.so ────
+  -- After `process attach`, lldb-dap has pulled the stripped libUE4.so
+  -- from the device into ~/.lldb/module_cache/remote-android/.cache/<UUID>/.
+  -- That copy has no DWARF, so any breakpoint set by file:line stays
+  -- pending and source view is blank.
+  --
+  -- Our host-side symbol_lib (Client_Symbols_v<ver>/Client-arm64/libUE4.so)
+  -- carries the full DWARF and shares the same GNU build-id with the
+  -- stripped device copy (UE bundles them at cook time from the same link
+  -- step). `target symbols add` registers the host file with lldb and
+  -- lldb matches it back to the loaded module by UUID — no manual
+  -- coordinate juggling.
+  --
+  -- target.exec-search-paths in initCommands only helps lldb FIND a host
+  -- copy at module-load time, but here lldb has already loaded the cached
+  -- stripped version before initCommands run (cache hit), so search-paths
+  -- alone is not enough — we must explicitly attach the DWARF.
+  if session and session.symbol_lib and session.symbol_lib ~= "" then
+    table.insert(cmds,
+      string.format('target symbols add "%s"', session.symbol_lib))
+  end
+  return cmds
+end
+
+-- postRunCommands run between attach completion and `configurationDone`.
+-- Per lldb-dap 22 source (AttachRequestHandler.cpp L138-145):
+--   1. WaitForProcessToStop (process must end up stopped)
+--   2. RunPostRunCommands  ← us
+--   3. (later) ConfigurationDoneRequestHandler L36-37 verifies process
+--      is STILL in a stopped state, else throws:
+--      "Expected process to be stopped. Process is in an unexpected
+--       state and may have missed an initial configuration."
+--
+-- Therefore postRunCommands MUST NOT resume the inferior. `process
+-- continue` here triggers the exact error above. Keep this empty (or
+-- limited to read-only / settings-tweaking commands). The actual resume
+-- happens client-side from nvim-dap via dap.continue() after nvim-dap has
+-- consumed the lldb-dap 22 per-thread entry-stop burst naturally (see
+-- lua/ue/dap.lua and lua/ue/dap/_common.lua).
+local function post_run_commands(_session)
+  return {}
 end
 
 -- Build the lldb-dap DAP config for the current session.
@@ -660,17 +860,16 @@ local function lldb_dap_attach_config(session, source_map)
     name           = "UE Android Attach (lldb-dap)",
     type           = "lldb",  -- matches dap.adapters.lldb wired by _common.ensure_adapter
     request        = "attach",
-    -- stopOnEntry MUST be true even though we don't want to "stop on
-    -- entry" semantically. Background: lldb-dap's platform-mode attach
-    -- sequence executes attachCommands (platform select / connect / process
-    -- attach), at which point the target is paused. lldb-dap then reports
-    -- this paused state via a `stopped` event. If stopOnEntry=false,
-    -- nvim-dap auto-issues `continue` before our user-level continue gets
-    -- a chance, and any subsequent `configurationDone` request fails with
-    -- "Expected process to be stopped". With stopOnEntry=true nvim-dap
-    -- waits for an explicit continue. We never expose the "entry stop"
-    -- to the user — the post-attach continue in finalize hands the
-    -- process right back to running before any UI panel paints.
+    -- stopOnEntry=true required by lldb-dap 22 attach protocol: lldb-dap
+    -- needs the inferior PAUSED while it processes `configurationDone`
+    -- (breakpoints, exception filters, etc.). With stopOnEntry=false,
+    -- lldb-dap auto-resumes the process before configurationDone arrives
+    -- and errors out: "Expected process to be stopped. Process is in an
+    -- unexpected state and may have missed an initial configuration."
+    --
+    -- nvim-dap consumes the lldb-dap 22 per-thread entry-stop burst with
+    -- auto_continue_if_many_stopped=false and waits. The user resumes with
+    -- F5 / :DapContinue after breakpoints and exception filters are armed.
     stopOnEntry    = true,
     -- lldb-dap timeout in seconds for the full attach sequence (platform
     -- connect + process attach + module enumeration). Default is 30s
@@ -682,6 +881,7 @@ local function lldb_dap_attach_config(session, source_map)
     cwd            = vim.fn.getcwd(),
     initCommands   = init_commands(session),
     attachCommands = attach_commands(session),
+    postRunCommands = post_run_commands(session),
   }
   if type(source_map) == "table" and #source_map > 0 then
     -- lldb-dap accepts sourceMap as a dict { from = to } (same shape as
@@ -908,6 +1108,21 @@ function M.attach(opts)
       vim.log.levels.WARN)
     return
   end
+  -- Clear stale notifier popups from a previous session so this attach's
+  -- diagnostics aren't drowned in old warnings that have already been
+  -- fixed. snacks.notifier accumulates active toasts forever by default
+  -- (history is the dict behind get_history); without this the user sees
+  -- the same popup wall on every attach and can't tell whether errors are
+  -- current or historical. We hide each toast by id (the only public API)
+  -- rather than mutating the internal history dict.
+  pcall(function()
+    local snacks = require("snacks")
+    if not (snacks and snacks.notifier and snacks.notifier.get_history) then return end
+    local hist = snacks.notifier.get_history()
+    for _, item in ipairs(hist) do
+      if item.id then pcall(snacks.notifier.hide, item.id) end
+    end
+  end)
   M._attach_in_progress = true
   bootstrap_session(opts, function(ok)
     if not ok then M._attach_in_progress = false; return end
@@ -1126,6 +1341,18 @@ end
 
 function M._lldb_dap_attach_config_for_test(session, source_map)
   return lldb_dap_attach_config(session, source_map)
+end
+
+function M._pick_package_for_test(ctx)
+  return pick_package(ctx)
+end
+
+function M._pick_symbol_lib_for_test(ctx)
+  return pick_symbol_lib(ctx)
+end
+
+function M._effective_project_root_for_test(ctx)
+  return effective_project_root(ctx)
 end
 
 return M

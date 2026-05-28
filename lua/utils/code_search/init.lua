@@ -423,7 +423,15 @@ end
 --
 --   abs_list_path : a temp file containing absolute paths (one per line)
 --   cb(ok, err, { count, ms, index_size })
-function M.build_index(ctx, abs_list_path, cb)
+--   opts.mode     : "reset" (default — wipe and rebuild) or "add" (incremental
+--                   append to existing index; csearch's cindex semantics:
+--                   "add the file or directory tree to the index").
+--                   Use "add" for watcher-driven dirty file flushes so the
+--                   trigram index stays current without re-walking the whole
+--                   workspace.
+function M.build_index(ctx, abs_list_path, cb, opts)
+  opts = opts or {}
+  local mode = opts.mode or "reset"
   local cindex = M.cindex_uefilter_exe()
   if not cindex then
     vim.schedule(function()
@@ -449,8 +457,15 @@ function M.build_index(ctx, abs_list_path, cb)
   local handle
   local started = vim.loop.hrtime()
 
+  local args = {}
+  if mode == "reset" then
+    table.insert(args, "-reset")
+  end
+  table.insert(args, "-files-from")
+  table.insert(args, abs_list_path)
+
   handle = vim.loop.spawn(cindex, {
-    args = { "-reset", "-files-from", abs_list_path },
+    args = args,
     env = env,
     stdio = { nil, nil, stderr },
   }, function(code)

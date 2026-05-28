@@ -1516,6 +1516,7 @@ UE_CONST.ENGINE_INDEX_DIRS = {
   "Engine/Source",
   "Engine/Plugins",
   "Engine/Shaders",
+  "Engine/Config",
 }
 
 UE_CONST.PROJECT_SHADER_DIRS = {
@@ -3152,31 +3153,84 @@ end
 
 local prepare_freshness  -- forward-decl alias kept for in-module callers
 do
-  -- mtime of <repo>/.git/index in epoch seconds; 0 when missing/unreadable.
-  -- Tracks every file add/remove/edit (including uncommitted working-tree
-  -- changes) — more reliable than HEAD ref for "is the worktree newer than
-  -- our cached file list?" decisions. Reused by both prepare_async's csearch
-  -- staleness check (via copy below) and prepare_freshness().
+  -- Resolve <repo>/.git into the actual gitdir, then return mtime of its index.
+  -- Handles four shapes:
+  --   1. .git is a directory (regular repo) → <repo>/.git/index
+  --   2. .git is a file "gitdir: <path>" (worktree / submodule)
+  --      → resolve <path>/index. If <path> ends with worktrees/<name>, the
+  --        worktree's per-worktree index sits there; that's what we want
+  --        (it changes on any file add/remove in that worktree).
+  --   3. .git is missing entirely → return 0 (caller falls back to other anchors).
+  --   4. .git file points to a non-existent path → 0.
+  -- Returns mtime in epoch seconds, or 0 on any failure.
   local function git_index_mtime(repo_root)
     if not repo_root or repo_root == "" then return 0 end
-    local s = vim.loop.fs_stat(repo_root .. "/.git/index")
+    local dot_git = repo_root .. "/.git"
+    local st = vim.loop.fs_stat(dot_git)
+    if not st then return 0 end
+    if st.type == "directory" then
+      local s = vim.loop.fs_stat(dot_git .. "/index")
+      return (s and s.mtime and s.mtime.sec) or 0
+    end
+    -- file: parse "gitdir: <path>" (worktree pointer)
+    local f = io.open(dot_git, "r")
+    if not f then return 0 end
+    local line = f:read("*l")
+    f:close()
+    if not line then return 0 end
+    local gitdir = line:match("^gitdir:%s*(.+)%s*$")
+    if not gitdir or gitdir == "" then return 0 end
+    -- Resolve relative gitdir against repo_root
+    if not gitdir:match("^[A-Za-z]:") and not gitdir:match("^/") then
+      gitdir = repo_root .. "/" .. gitdir
+    end
+    local idx = gitdir:gsub("\\", "/") .. "/index"
+    local si = vim.loop.fs_stat(idx)
+    return (si and si.mtime and si.mtime.sec) or 0
+  end
+
+  -- mtime of a directory tree's TOP-LEVEL marker (cheap stat on the dir itself,
+  -- NOT recursive walk). Used as an external anchor of last resort when neither
+  -- engine nor project has a usable .git. Captures "did the project_root dir
+  -- entry itself change since list was built". Not perfect (subdir adds may not
+  -- bump parent mtime on all filesystems) but a real external signal — beats
+  -- comparing the list to itself.
+  local function dir_mtime(p)
+    if not p or p == "" then return 0 end
+    local s = vim.loop.fs_stat(p)
     return (s and s.mtime and s.mtime.sec) or 0
   end
 
   -- Classify how trustworthy ctx.paths.workspace_all_list is right now.
   -- Returns one of:
-  --   "fresh"        — list newer than .git/index of engine + project
-  --   "stale"        — list older than .git/index (worktree drifted since
-  --                    last :UEPrepare; e.g. git pull added new files)
-  --   "in_progress"  — :UEPrepare is currently rebuilding (CORE_RT.prepare_jobid live)
+  --   "fresh"        — list newer than every external anchor we could find
+  --   "stale"        — list older than at least one external anchor, OR
+  --                    ue_watch has accumulated unflushed dirty files since the
+  --                    last :UEPrepare clear (watcher-observed drift)
+  --   "in_progress"  — :UEPrepare is currently rebuilding
   --   "never"        — no list file exists at all
-  --   "unknown"      — list exists but no .git/index found anywhere; can't judge
   --
-  -- This is the single source of truth that user-facing surfaces (picker,
-  -- csearch grep, BufReadPost on file outside list) consult before warning
-  -- the user that results may miss recent worktree additions.
+  -- Anchors (we take max across all available, then compare to list mtime):
+  --   1. <engine_root>/.git/index (worktree-aware)
+  --   2. <project_root>/.git/index (worktree-aware)
+  --   3. <engine_root> dir mtime  (filesystem fallback)
+  --   4. <project_root> dir mtime (filesystem fallback)
+  --   5. state.updated_at         (catches :UESetProject reconfigurations)
+  --
+  -- We deliberately do NOT compare list mtime against itself or against
+  -- workspace_all_list's siblings — that's the self-validating loop the old
+  -- code hit, where fast-path's "is index stale?" check compared csearch.idx
+  -- against the very list cindex consumed, so a stale build forever validated
+  -- its own staleness. The anchor set above is all EXTERNAL to our cache dir.
+  --
+  -- Watcher overlay: ue_watch persists an LRU dirty set across sessions. Any
+  -- non-empty dirty set means we have observed file changes that haven't been
+  -- folded into the list yet, regardless of mtime arithmetic. This catches the
+  -- common case where the user edits/adds files INSIDE an open nvim session
+  -- (no .git/index bump on uncommitted creates if file is gitignored or
+  -- pre-stage) but ue_watch saw the fs_event.
   function CORE_RT.prepare_freshness(ctx)
-    if not ctx or not ctx.paths then return "unknown" end
+    if not ctx or not ctx.paths then return "never" end
     if CORE_RT.prepare_jobid then
       local ok_wait, result = pcall(vim.fn.jobwait, { CORE_RT.prepare_jobid }, 0)
       if ok_wait and result and result[1] == -1 then
@@ -3189,13 +3243,40 @@ do
       return "never"
     end
     local list_mt = list_stat.mtime and list_stat.mtime.sec or 0
-    local git_mt = math.max(
-      git_index_mtime(ctx.engine_root),
-      git_index_mtime(ctx.project_root))
-    if git_mt == 0 then
-      return "unknown"
+
+    -- Watcher overlay: dirty files observed since last :UEPrepare clear
+    local ok_watch, watch = pcall(require, "utils.ue_watch")
+    if ok_watch and type(watch.persistent_dirty_status) == "function" then
+      local st = watch.persistent_dirty_status() or {}
+      if (st.count or 0) > 0 then
+        return "stale"
+      end
     end
-    if list_mt >= git_mt then
+
+    -- Anchor max. state.updated_at is ISO8601 — convert.
+    local function iso_to_epoch(s)
+      if type(s) ~= "string" then return 0 end
+      local y, mo, d, h, mi, se = s:match("^(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
+      if not y then return 0 end
+      return os.time({ year = tonumber(y), month = tonumber(mo), day = tonumber(d),
+                       hour = tonumber(h), min = tonumber(mi), sec = tonumber(se) })
+    end
+    local anchors = {
+      git_index_mtime(ctx.engine_root),
+      git_index_mtime(ctx.project_root),
+      dir_mtime(ctx.engine_root),
+      dir_mtime(ctx.project_root),
+      iso_to_epoch(ctx.state and ctx.state.updated_at),
+    }
+    local anchor_max = 0
+    for _, a in ipairs(anchors) do
+      if a and a > anchor_max then anchor_max = a end
+    end
+    if anchor_max == 0 then
+      -- No external signal at all is itself suspicious; lean conservative.
+      return "stale"
+    end
+    if list_mt >= anchor_max then
       return "fresh"
     end
     return "stale"
@@ -5655,6 +5736,30 @@ function M.cached_files(opts)
   if not info then
     return nil
   end
+
+  -- Lazy-start ue_watch so subsequent edits/adds get tracked into the
+  -- persistent dirty set even if the user never runs :UEPrepare this session.
+  -- Without this, freshness banners on <space><space> would only become
+  -- truthful AFTER the first explicit :UEPrepare of the session (which is
+  -- exactly the failure mode that landed us here). Idempotent — M.start
+  -- early-returns when a handle is already live.
+  do
+    local ok_watch, watch = pcall(require, "utils.ue_watch")
+    if ok_watch and type(watch.start) == "function" then
+      local already = (type(watch.status) == "function") and (watch.status() or {}).running
+      if not already and info.ctx and info.ctx.paths then
+        pcall(watch.start, {
+          root = info.root,
+          csearch_index = info.ctx.paths.csearch_idx,
+          shader_filelist = info.ctx.paths.workspace_list,
+          gtags_db = info.ctx.paths.workspace_db,
+          dirty_json_path = info.ctx.paths.dirty_json,
+          debounce_ms = 1500,
+        })
+      end
+    end
+  end
+
   CORE_RT.notify_freshness(info.ctx, "find files")
 
   local rg = _uproc.first_executable({ "rg" })
@@ -6932,6 +7037,84 @@ local function show_cheatsheet()
   require("utils.cheatsheet").open()
 end
 
+-- Wipe all project-scoped cache artifacts when the active project changes.
+-- (Wrapped in do/end so neither this helper NOR set_project occupies a
+-- LuaJIT main-chunk local slot — see skill luajit-200-local-cap-with-loader-cache-mask.
+-- We expose set_project through CORE_RT instead.)
+do
+-- Wipe all project-scoped cache artifacts when the active project changes.
+-- Engine-only artifacts (engine.files, engine .git mtime probe) survive — the
+-- engine tree itself hasn't moved. List files, csearch index, gtags DB, and
+-- per-platform cdb shards all reflect the OLD project's content and would
+-- silently feed `<space><space>` / grep stale results until the next full
+-- :UEPrepare. We delete them eagerly so callers see "never" (not "fresh") and
+-- get a loud `notify_freshness` banner until they rerun :UEPrepare manually.
+--
+-- NOTE: by design this does NOT auto-trigger UEPrepare. Per-user rule:
+-- :UEPrepare runs only on explicit user request. Our job is to invalidate so
+-- the staleness signal becomes truthful — not to second-guess timing.
+local function invalidate_project_scoped_cache(engine_root, reason)
+  local paths = cache_paths(engine_root)
+  local victims = {
+    -- file lists (workspace_all_list drives <space><space> AND csearch input)
+    paths.project_list,
+    paths.workspace_list,
+    paths.workspace_all_list,
+    -- csearch trigram index + cindex tmp staging
+    paths.csearch_idx,
+    paths.csearch_idx .. "~",
+    paths.csearch_idx .. "~~",
+    -- gtags DB (project-scoped; tags from old project tree are wrong)
+    join(paths.gtags_root, "GTAGS"),
+    join(paths.gtags_root, "GPATH"),
+    join(paths.gtags_root, "GRTAGS"),
+    join(paths.workspace_db, "GTAGS"),
+    join(paths.workspace_db, "GPATH"),
+    join(paths.workspace_db, "GRTAGS"),
+    -- cdb shards (per-platform compile_commands referencing old project paths)
+    paths.index_current_cdb,
+    paths.index_hot_cdb,
+    paths.index_full_cdb,
+    paths.index_inject_full_cdb,
+    paths.index_state,
+    paths.index_queue,
+    -- runtime dirty set tied to old project
+    paths.dirty_json,
+  }
+  local removed = 0
+  for _, p in ipairs(victims) do
+    if p and _ufs.is_file(p) then
+      if pcall(os.remove, p) then removed = removed + 1 end
+    end
+  end
+
+  -- Also nuke clangd index .idx files keyed by old project_name. Engine_root
+  -- → project_name derivation is in cache_paths; the .idx filename embeds
+  -- it. We list and rm by glob since multiple suffix variants exist.
+  if _ufs.is_dir(paths.active_index_dir) then
+    local glob = vim.fn.globpath(paths.active_index_dir, "*.idx", false, true)
+    for _, f in ipairs(glob) do
+      if pcall(os.remove, f) then removed = removed + 1 end
+    end
+  end
+
+  -- Force prepare_freshness to re-read from disk on next call.
+  CORE_RT.freshness_notified = {}
+  CORE_RT.context_cache = {}
+
+  -- Tell ue_watch (if running) to flush its dirty set — it referred to old
+  -- project's files. Best-effort; module may not be loaded yet.
+  local ok_watch, watch = pcall(require, "utils.ue_watch")
+  if ok_watch and type(watch.clear_persistent_dirty) == "function" then
+    watch.clear_persistent_dirty("set_project:" .. (reason or "switch"))
+  end
+  if ok_watch and type(watch.stop) == "function" then
+    pcall(watch.stop)  -- old watch handle was rooted at previous project_root
+  end
+
+  return removed
+end
+
 local function set_project(input)
   local engine_root = current_engine_root()
   if not engine_root then
@@ -6952,11 +7135,31 @@ local function set_project(input)
     return
   end
 
+  -- Detect actual project switch BEFORE persisting (persist overwrites state).
+  local prev = read_state(engine_root)
+  local prev_project = prev and prev.project_root or nil
+  local switched = prev_project and norm(prev_project) ~= norm(project_root) or false
+
   persist_project(engine_root, project_root, uproject)
+
+  local removed = 0
+  if switched then
+    removed = invalidate_project_scoped_cache(engine_root, "switch")
+  end
+
   invalidate_status_cache()
   refresh_statusline()
-  vim.notify("UE project set:\nEngine: " .. engine_root .. "\nProject: " .. project_root)
+
+  local msg = "UE project set:\nEngine: " .. engine_root .. "\nProject: " .. project_root
+  if switched then
+    msg = msg .. ("\n\nProject CHANGED (was: %s)\n  → invalidated %d cache files (lists / csearch / gtags / cdb shards)\n  → run :UEPrepare to rebuild (or :UEPrepare! to force a clean full pass)"):format(prev_project or "?", removed)
+    vim.notify(msg, vim.log.levels.WARN, { title = "UE" })
+  else
+    vim.notify(msg, vim.log.levels.INFO, { title = "UE" })
+  end
 end
+CORE_RT.set_project = set_project
+end -- close do-block opened above invalidate_project_scoped_cache
 
 local function set_android_package(input)
   local engine_root = current_engine_root()
@@ -7871,37 +8074,16 @@ local function prepare_async(opts)
           elseif not idx_stat or (idx_stat.size or 0) <= 1024 then
             stale_reason = "missing"
           else
-            local idx_mt = idx_stat.mtime and idx_stat.mtime.sec or 0
-            local now = os.time()
-            if (now - idx_mt) > (30 * 24 * 3600) then
-              stale_reason = ("age %.1fd"):format((now - idx_mt) / 86400)
+            -- Reuse the canonical freshness oracle. It already considers
+            -- worktree-aware git index mtime, dir mtimes, state.updated_at,
+            -- and the watcher's persistent dirty set — all the things this
+            -- fast-path used to half-implement and get wrong for git
+            -- worktrees / projects without their own .git.
+            local fr = prepare_freshness(ctx)
+            if fr == "fresh" then
+              need_index = false
             else
-              local function git_index_mtime(repo_root)
-                if not repo_root or repo_root == "" then return 0 end
-                local s = vim.loop.fs_stat(repo_root .. "/.git/index")
-                return (s and s.mtime and s.mtime.sec) or 0
-              end
-              local git_mt = math.max(
-                git_index_mtime(ctx.engine_root),
-                git_index_mtime(ctx.project_root))
-              if git_mt > 0 and idx_mt >= git_mt then
-                need_index = false
-              elseif git_mt == 0 then
-                local list_path = ctx.paths.workspace_all_list
-                local list_stat = list_path and vim.loop.fs_stat(list_path) or nil
-                if list_stat then
-                  local list_mt = list_stat.mtime and list_stat.mtime.sec or 0
-                  if idx_mt >= list_mt then
-                    need_index = false
-                  else
-                    stale_reason = "list newer (no .git fallback)"
-                  end
-                else
-                  need_index = false
-                end
-              else
-                stale_reason = ("git/index newer by %ds"):format(git_mt - idx_mt)
-              end
+              stale_reason = "freshness=" .. fr
             end
           end
         end
@@ -8523,7 +8705,7 @@ function M.setup()
 
   vim.api.nvim_create_user_command("UEPaths", show_paths, {})
   vim.api.nvim_create_user_command("UESetProject", function(opts)
-    set_project(opts.args)
+    CORE_RT.set_project(opts.args)
   end, { nargs = "?" })
   vim.api.nvim_create_user_command("UESetAndroidPackage", function(opts)
     set_android_package(opts.args)
@@ -8670,9 +8852,10 @@ function M.setup()
     M.toggle_debug_log()
   end, {})
   vim.api.nvim_create_user_command("UEInstallAndroid", install_android, {})
-  vim.api.nvim_create_user_command("UEPrepare", function()
+  vim.api.nvim_create_user_command("UEPrepare", function(cmd)
+    local bang = cmd.bang and true or false
     require("utils.async_launcher").launch({
-      name  = "UE: Prepare (rsp + ccjson + index)",
+      name  = bang and "UE: Prepare (FORCE full rebuild)" or "UE: Prepare (rsp + ccjson + index)",
       group = "ue",
       run   = function(report)
         -- prepare_async already returns immediately and runs UBT/cindex
@@ -8680,11 +8863,91 @@ function M.setup()
         -- exist to give a unified visible-progress surface during the
         -- 100–500ms window where ueprepare itself spins up + first job
         -- spawn happens on the main thread.
-        if report then report("dispatching prepare_async ...") end
-        prepare_async()
+        --
+        -- :UEPrepare!  → force_csearch=true AND wipe the cache fast-path
+        --                gates so EVERY phase rebuilds from scratch.
+        --                Use after a confused state (project switch with
+        --                stale lists, corrupted .idx, post-:UESetProject
+        --                if the invalidation missed something). Always
+        --                correct, just slow.
+        -- :UEPrepare   → normal flow. Fast-path skips phases whose inputs
+        --                still look fresh against external anchors.
+        if bang then
+          if report then report("BANG → forcing full clean rebuild ...") end
+          -- Mark the engine_root as dirty so prepare_cache_ready returns
+          -- false and we take the cold path (which rebuilds every phase).
+          local ctx_b = resolve_context()
+          if ctx_b then
+            local key = status_root_key(ctx_b)
+            if key and key ~= "" then
+              CORE_RT.dirty_index_roots[key] = true
+            end
+            -- Also clear watcher dirty set; cold rebuild covers everything.
+            local ok_watch, watch = pcall(require, "utils.ue_watch")
+            if ok_watch and type(watch.clear_persistent_dirty) == "function" then
+              watch.clear_persistent_dirty("UEPrepare!")
+            end
+          end
+          prepare_async({ force_csearch = true })
+        else
+          if report then report("dispatching prepare_async ...") end
+          prepare_async()
+        end
       end,
     })
-  end, {})
+  end, { bang = true, desc = "UE prepare (bang = force full clean rebuild)" })
+  vim.api.nvim_create_user_command("UEPrepareIncremental", function()
+    -- Apply the watcher's accumulated dirty file set as a cindex INCREMENTAL
+    -- add (no -reset). Fast (proportional to dirty count, not workspace size)
+    -- and safe — cindex add is the documented way to incrementally extend
+    -- the trigram index. After success we clear the dirty set so the
+    -- "freshness" oracle stops warning.
+    --
+    -- Use this when freshness banner says stale but you don't want to pay
+    -- for a full :UEPrepare. Doesn't refresh gtags or cdb — only csearch.
+    -- For gtags/cdb drift, use :UEPrepare (normal) or :UEPrepare! (full).
+    local ctx, err = resolve_context()
+    if not ctx then vim.notify(err or "no ctx", vim.log.levels.WARN); return end
+    local ok_watch, watch = pcall(require, "utils.ue_watch")
+    if not ok_watch then vim.notify("ue_watch module missing", vim.log.levels.WARN); return end
+    local dirty = (type(watch.snapshot_persistent_dirty) == "function")
+      and watch.snapshot_persistent_dirty() or {}
+    if #dirty == 0 then
+      vim.notify("No dirty files since last :UEPrepare — nothing to add", vim.log.levels.INFO, { title = "UE" })
+      return
+    end
+    local code_search = require("utils.code_search")
+    if not code_search.cindex_uefilter_exe() then
+      vim.notify("cindex-uefilter not found — build it first", vim.log.levels.WARN, { title = "UE" })
+      return
+    end
+    local abs_list = ctx.paths.cache .. "/csearch_incremental.txt"
+    local fout = io.open(abs_list, "w")
+    if not fout then
+      vim.notify("UEPrepareIncremental: cannot write " .. abs_list, vim.log.levels.WARN)
+      return
+    end
+    for _, p in ipairs(dirty) do fout:write(p, "\n") end
+    fout:close()
+    vim.notify(("UEPrepareIncremental: adding %d dirty files to csearch index ..."):format(#dirty),
+      vim.log.levels.INFO, { title = "UE", timeout = 3000, replace = "ue.csearch.build" })
+    local cs_ctx = { workspace_root = workspace_root(ctx), csearch_idx = ctx.paths.csearch_idx }
+    code_search.build_index(cs_ctx, abs_list, function(ok_cs, err_cs, stats)
+      pcall(os.remove, abs_list)
+      if ok_cs then
+        if type(watch.clear_persistent_dirty) == "function" then
+          watch.clear_persistent_dirty("UEPrepareIncremental")
+        end
+        local mb = math.floor((stats.index_size or 0) / 1024 / 1024)
+        vim.notify(("✓ csearch +%d files (%.1fs, idx now %d MB)"):format(
+          #dirty, (stats.ms or 0) / 1000, mb),
+          vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
+      else
+        vim.notify("UEPrepareIncremental failed: " .. (err_cs or "?"),
+          vim.log.levels.WARN, { title = "UE" })
+      end
+    end, { mode = "add" })
+  end, { desc = "Append watcher's dirty files to csearch index (no full rebuild)" })
   vim.api.nvim_create_user_command("UEPrepareReindex", function()
     -- Force csearch rebuild even when the cache fast-path would skip it.
     -- Useful after large branch switches / engine syncs that leave

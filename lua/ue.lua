@@ -8093,7 +8093,7 @@ local function prepare_async(opts)
             stale_reason = "missing"
           else
             -- Reuse the canonical freshness oracle. It already considers
-            -- worktree-aware git index mtime, dir mtimes, state.updated_at,
+            -- worktree-aware git index mtime + dir mtimes
             -- and the watcher's persistent dirty set — all the things this
             -- fast-path used to half-implement and get wrong for git
             -- worktrees / projects without their own .git.

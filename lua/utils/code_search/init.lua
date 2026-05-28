@@ -137,10 +137,13 @@ local function stream_csearch(ctx, pattern, opts, callbacks)
   local args = { "-n" }
   if opts.code_only then
     -- csearch -f filters by FILE PATH regex (not glob). Build a regex
-    -- that matches the source extensions.
+    -- that matches the source extensions. Kept in sync with ue.lua's
+    -- FT_CODE + FT_CONFIG so opts.code_only never accidentally drops
+    -- TypeScript / C# / Python / YAML files the user can see in the
+    -- file picker.
     table.insert(args, "-f")
     table.insert(args,
-      "\\.(cpp|c|cc|cxx|h|hpp|hh|hxx|inl|cs|usf|ush|hlsl|hlsli|ini|cfg|json|xml|uproject|uplugin|target\\.cs|build\\.cs)$")
+      "\\.(cpp|c|cc|cxx|h|hpp|hh|hxx|inl|ipp|inc|m|mm|cs|usf|ush|hlsl|hlsli|glsl|comp|vert|frag|geom|tesc|tese|metal|ini|cfg|conf|ts|tsx|js|json|xml|yaml|yml|py|lua|uproject|uplugin|target\\.cs|build\\.cs)$")
   end
 
   -- Pattern rewrite pipeline. ORDER MATTERS: literal-escape first (so

@@ -3215,7 +3215,8 @@ do
   --   2. <project_root>/.git/index (worktree-aware)
   --   3. <engine_root> dir mtime  (filesystem fallback)
   --   4. <project_root> dir mtime (filesystem fallback)
-  --   5. state.updated_at         (catches :UESetProject reconfigurations)
+  -- (state.updated_at was tried as anchor #5 but had to be removed — see
+  --  the long comment next to the `anchors` table below.)
   --
   -- We deliberately do NOT compare list mtime against itself or against
   -- workspace_all_list's siblings — that's the self-validating loop the old
@@ -3253,20 +3254,25 @@ do
       end
     end
 
-    -- Anchor max. state.updated_at is ISO8601 — convert.
-    local function iso_to_epoch(s)
-      if type(s) ~= "string" then return 0 end
-      local y, mo, d, h, mi, se = s:match("^(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
-      if not y then return 0 end
-      return os.time({ year = tonumber(y), month = tonumber(mo), day = tonumber(d),
-                       hour = tonumber(h), min = tonumber(mi), sec = tonumber(se) })
-    end
+    -- Anchor max. We deliberately do NOT include state.updated_at here.
+    -- Although it looks like a useful "when did we last prepare" signal,
+    -- it's written by :UEPrepare's finalize step AFTER list_dump completes
+    -- (list_dump → cindex csearch ~120s → finalize writes state.json).
+    -- So state.updated_at is ALWAYS list_mt + minutes, which means any
+    -- comparison `list_mt < anchor_max(state.updated_at)` reports stale
+    -- the instant :UEPrepare finishes — every subsequent grep / picker
+    -- entry triggers a phantom "[grep] :UEPrepare is stale" WARN even
+    -- though nothing actually changed. The scenario state.updated_at was
+    -- originally added to catch (project reconfiguration via :UESetProject)
+    -- is now covered by invalidate_project_scoped_cache deleting the list
+    -- file outright → list_stat == nil → "never" branch above. The other
+    -- real-change scenarios (git ops, fs changes, watcher dirty) are still
+    -- caught by the four remaining anchors.
     local anchors = {
       git_index_mtime(ctx.engine_root),
       git_index_mtime(ctx.project_root),
       dir_mtime(ctx.engine_root),
       dir_mtime(ctx.project_root),
-      iso_to_epoch(ctx.state and ctx.state.updated_at),
     }
     local anchor_max = 0
     for _, a in ipairs(anchors) do
@@ -7889,7 +7895,19 @@ local function prepare()
       local fout = io.open(abs_list, "w")
       if fout then
         for _, rel in ipairs(workspace_all) do
-          fout:write(cs_root, "/", rel, "\n")
+          -- workspace_all may contain absolute paths when relative_to() cannot
+          -- compute a relative path (e.g. cross-drive on Windows: project on E:,
+          -- engine on D:). Cross-drive entries fall through unchanged from
+          -- _ufs.relative_to(). Naive cs_root.."/"..rel for those would produce
+          -- garbage like "D:/project/uetemp/E:/aki/...", which os.Stat rejects
+          -- and cindex silently skips, leaving the project-side tree entirely
+          -- absent from the csearch index. Guard with is_absolute_path so we
+          -- only prefix when rel is actually relative.
+          if _ufs.is_absolute_path(rel) then
+            fout:write(rel, "\n")
+          else
+            fout:write(cs_root, "/", rel, "\n")
+          end
         end
         fout:close()
         local cs_done, cs_ok, cs_err = false, false, nil
@@ -8095,7 +8113,13 @@ local function prepare_async(opts)
             for line in io.lines(ctx.paths.workspace_all_list) do
               local trimmed = line:gsub("\r$", "")
               if trimmed ~= "" then
-                fout:write(root, "/", trimmed, "\n")
+                -- Guard against cross-drive absolute paths in workspace_all_list
+                -- (see lengthy comment near the sync path for the full story).
+                if _ufs.is_absolute_path(trimmed) then
+                  fout:write(trimmed, "\n")
+                else
+                  fout:write(root, "/", trimmed, "\n")
+                end
                 n_lines = n_lines + 1
               end
             end
@@ -8396,7 +8420,12 @@ local function prepare_async(opts)
           end
           CORE_RT.trace_seg("cold.csearch_dump", function()
             for _, rel in ipairs(workspace_all) do
-              fout:write(cs_root, "/", rel, "\n")
+              -- Same cross-drive absolute-path guard as the sync path.
+              if _ufs.is_absolute_path(rel) then
+                fout:write(rel, "\n")
+              else
+                fout:write(cs_root, "/", rel, "\n")
+              end
             end
             fout:close()
           end)

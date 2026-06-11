@@ -171,10 +171,26 @@ the rg-batched path.
 │   └── (Python utilities...)   PCH, CDB, index, DAP probes
 ├── scripts/                    Windows installer + cleanup + profiling
 ├── docs/
+│   ├── architecture/           architecture overview (subsystems / data flow)
 │   ├── ue_lazyvim_cheatsheet.md
+│   ├── CONSTRAINTS.md          forbidden / pitfalls / load-bearing constraints
+│   ├── testing-regression.md   regression policy + change→filter map
 │   └── plans/                  architecture decision records
-└── CLAUDE.md                   instructions for AI agents working here
+├── memory/                     stable project knowledge for AI agents (start here)
+├── decisions/                  ADR navigation (authoritative ADRs live in docs/plans/)
+├── lessons/                    platform quirks / hard-won debugging knowledge
+├── tests/                      headless regression suite
+├── <every major dir>/CLAUDE.md recursive local subsystem rules (child = delta only)
+└── CLAUDE.md                   ROOT: SESSION START protocol + Definition of Done
 ```
+
+**AI persistence layer**: a new context starts at root `CLAUDE.md`
+(auto-injected) → SESSION START reads `docs/CONSTRAINTS.md` →
+`memory/project_overview.md` → the current dir's `CLAUDE.md` (falls back to
+the nearest ancestor). Every major directory carries its own `CLAUDE.md`
+(children write only deltas over the parent). "Done" is gated by the root
+Definition of Done: run scoped regression, append to `docs/changelog.md`,
+and follow the milestone policy on version wrap.
 
 ---
 
@@ -217,7 +233,24 @@ These are the rules this config follows. They are not optional:
 - **Skip-write when unchanged** — every generator (CDB, PCH, .clangd)
   must compare before writing so downstream caches don't invalidate
 
+For the full checklist of what's **forbidden**, what **pitfalls** have already
+cost time, and which **constraints** are load-bearing, see
+[`docs/CONSTRAINTS.md`](docs/CONSTRAINTS.md).
+
 See `CLAUDE.md` for the full agent contract.
+
+## Regression tests
+
+Run the full headless regression suite after any change:
+
+```
+nvim --headless -l tests/run.lua          # cross-platform, authoritative
+pwsh -File scripts/run_regression.ps1     # Windows convenience wrapper
+```
+
+Exit code `0` = all pass, `1` = any failure. New cases go in
+`tests/cases/<area>_spec.lua` (auto-discovered). Full guide:
+[`docs/testing-regression.md`](docs/testing-regression.md).
 
 ---
 

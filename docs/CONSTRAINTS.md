@@ -238,6 +238,37 @@
   `_on_reassert` 钩子在跳完 ~10ms 后 verify 并必要时 reassert。
   → `docs/architecture-symbol-resolution.md` §2.7; commit `252e9e0`
 
+### grep 缓存 / csearch 失效
+
+- **K26 — csearch 负探测被永久缓存 → `<leader>/` 静默搜不全**
+  症状: `<leader>/`（cached_grep）只返回残缺结果，picker 标题 `Grep All Code (Engine+Project)`
+  **无 `[csearch]`/`[rg]` 后缀**（=回落到最底层 snacks 目录遍历，排除 ThirdParty、与索引无关）。
+  根因: `utils/code_search` 的 `csearch_exe`/`cindex_uefilter_exe` 一旦探测失败就把
+  `_probed=true`+`nil` 钉死整会话（冷启动 PATH 未就绪 / 索引重建期失败），此后
+  `is_indexed()` 恒 false → grep 永走回落。
+  解决: 负探测不缓存（仅成功时缓存路径）；UEPrepare 完成 / 切项目 / 切平台后
+  `_reset_probe_cache()` 重探；UEPrepare finalize 清 `context_cache`。回落必须**可见**
+  （一次性 WARN + 标题标 slow fallback），不给残缺静默结果。
+  → `docs/architecture/grep-cache-invalidation.md`; `lua/utils/code_search/init.lua`;
+    `lua/ue.lua` cached_grep / finalize_after_csearch; `lua/plugins/snacks.lua` ue_project_grep
+
+- **K27 — 切平台/换引擎后 grep 缓存不失效**
+  症状: `UESetPlatform` 走 fast-swap 只 flip cdb shard，csearch/workspace_all 原封不动；
+  `UESetProject` 换引擎（engine_root 未持久化）时 engine 维度判不出"变了"。
+  解决: csearch/workspace_all **按平台+配置分路径**（`cache_paths(root, platform_key)`，
+  key 同源 `shards` 平台维度），切平台落不同目录、旧平台保留、不删重来；旧单一路径
+  首次按当前平台 **自动 move 迁移**（`migrate_legacy_csearch_if_needed`）。
+  `engine_root` 持久化进 state.json，`set_project` 比对 project+engine 任一变即失效全平台。
+  → `docs/architecture/grep-cache-invalidation.md`; `lua/ue.lua` cache_paths /
+    platform_key_from_state / invalidate_project_scoped_cache / set_platform
+
+- **K28 — csearch/rg stream `on_done` 先于尾部 `on_line` → `<leader>/` 丢最后几条命中**
+  症状: 命令行 csearch/rg 输出完整，但 snacks picker 末尾少 2–4 条结果；旧实现逐行
+  `vim.schedule(on_line)`，exit callback 另行 `vim.schedule(on_done)`，调度顺序不可证明。
+  解决: stdout read callback 同步解析进 backend 队列，由单一 scheduled flusher 先 drain
+  全部 parsed hits，再在进程退出且 backlog 为空时调用 `on_done`；stop 后所有 flusher 都短路。
+  → `docs/architecture/grep-cache-invalidation.md` D6; `lua/utils/code_search/init.lua`
+
 ---
 
 ## 三、约束（Constraints）
@@ -295,6 +326,19 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 - clangd 永远是权威源但永不前台阻塞: spinner 600ms 后才显示，30s 硬超时。
 - jumper 后置条件: 一个 `<Ctrl-O>` 回到源、恰好一条 jumplist 条目、无 `(target_buf,1,0)` 幽灵。
 → `docs/architecture-symbol-resolution.md` §1、§5、§2.7
+
+### C5b — grep 缓存按平台分路径 + 失效契约
+
+- csearch 索引 + grep 文件清单（workspace_all/workspace/project/engine + GTAGS DB）
+  按 `<Platform>-<Config>` 分目录（`cache_paths(root, platform_key)`）；platform_key 空时
+  回落旧单一路径（兼容 + 迁移源）。**只有 grep-facing 工件分平台**，state/cdb shards/
+  clangd index/pch 不分。
+- `platform_key` 由 `platform_key_from_state` 生成，与 `ue.cdb.shards` 平台维度同源。
+- 失效矩阵：project 或 engine 任一变 → 删全平台 grep+cdb 缓存（`set_project` 比对
+  state.project_root **与** state.engine_root，故 engine_root MUST 持久化）；platform 变 →
+  **不删**，切到新平台目录，旧平台保留；旧单一路径首次 **move 迁移**。
+- 负探测不缓存 + UEPrepare/切换后重探 + 回落可见（见坑 K26/K27）。
+→ `docs/architecture/grep-cache-invalidation.md`; `lua/ue.lua`; `lua/utils/code_search/`
 
 ### C6 — 改动后回归政策（分范围）
 

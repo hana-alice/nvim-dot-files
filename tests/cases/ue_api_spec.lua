@@ -39,3 +39,24 @@ t.describe("ue: 公共函数冻结", function()
     end)
   end
 end)
+
+t.describe("ue.clangd_cmd", function()
+  local ue = require("ue")
+
+  t.it("function-arg-placeholders 对 clangd 22 使用显式布尔值", function()
+    local cmd = ue.clangd_cmd()
+    local has_explicit = false
+    local has_bare = false
+
+    for _, arg in ipairs(cmd) do
+      if arg == "--function-arg-placeholders=true" then
+        has_explicit = true
+      elseif arg == "--function-arg-placeholders" then
+        has_bare = true
+      end
+    end
+
+    t.assert_true(has_explicit, "clangd 22 需要 --function-arg-placeholders=true")
+    t.assert_false(has_bare, "clangd 22 不接受裸 --function-arg-placeholders")
+  end)
+end)

@@ -13,6 +13,13 @@ trigram 索引（google/codesearch 的 csearch）驱动的亚秒级 live grep，
 - **不用 zoekt 替代**：Windows 不可用，已论证死胡同。→ P13
 - 后端优先级：`csearch（有索引）` → `rg`；`current_backend(ctx)` 决策，调用方不假设。
 - 流式 API（`stream` + `on_line/on_done`）async，不阻塞主线程；stop() 后不得再回调（snacks「yielded after done」陷阱）。
+- **负探测不缓存**：`csearch_exe`/`cindex_uefilter_exe` 只在探测成功时缓存路径；
+  失败返回 nil 但不钉死——冷启动 PATH 未就绪/索引重建期的一次失败不得让整会话
+  `is_indexed()=false`（曾导致 `<leader>/` 静默走最慢目录遍历、搜不全）。
+  UEPrepare 完成 / 切项目 / 切平台后调 `_reset_probe_cache()` 强制重探。→ 见
+  `../../../docs/architecture/grep-cache-invalidation.md`
+- **索引按平台+配置分路径**：`ctx.paths.csearch_idx` = `csearch/<Platform>-<Config>/csearch.idx`
+  （由 `ue.cache_paths(root, platform_key)` 推导）。切平台不删旧平台索引。
 
 ## 改动 → 必跑回归
 

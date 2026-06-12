@@ -44,6 +44,11 @@ Neovide 残留进程、blink.cmp 换行破坏 undo。
 跨 buffer 跳转 cursor 漂移；解法砍 snacks.scroll + PreserveBufferView，jumper `_on_reassert` 校正。
 → `../docs/architecture-symbol-resolution.md §2.7`
 
+### grep 缓存 / csearch 失效（K26–K27）
+负探测被永久缓存 → `<leader>/` 静默走最慢目录遍历搜不全（修：负探测不缓存 + 重探 + 回落可见）；
+切平台/换引擎 grep 缓存不失效（修：csearch 按平台+配置分路径、切平台不删重来、engine_root 持久化）。
+→ `../docs/CONSTRAINTS.md §二 grep 缓存/csearch 失效`；`../docs/architecture/grep-cache-invalidation.md`
+
 ## 新增一条教训
 
 1. 优先在权威出处记录（workaround frontmatter / `docs/CONSTRAINTS.md §二` / `docs/TOOLING.md`）。

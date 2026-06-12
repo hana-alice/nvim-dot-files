@@ -24,7 +24,8 @@
 -- opts: { code_only = bool, max_count = int, smart_case = bool,
 --         regex = bool (default true; false = literal/fixed-string),
 --         word  = bool (whole-word match, wraps pattern in \b...\b),
---         case  = bool (case-sensitive; nil/false = smart-case behavior) }
+--         case  = bool (case-sensitive; nil/false = smart-case behavior),
+--         ignore_case = bool (force case-insensitive unless case=true) }
 
 local M = {}
 
@@ -32,13 +33,30 @@ local platform = require("utils.platform")
 
 -- ── csearch backend ──────────────────────────────────────────────────────
 
--- Resolve csearch executable path. Cached per-session.
+-- Resolve executable paths. We cache ONLY successful probes.
+--
+-- WHY no negative caching: a probe can fail transiently during a cold GUI
+-- start (PATH / vim.env not yet fully populated) or while UEPrepare is
+-- mid-rebuild. If we cached that nil for the whole session, is_indexed()
+-- would return false forever, cached_grep() would silently fall through to
+-- the slowest snacks directory-walk path, and the user would get incomplete
+-- grep results with no signal. So: success → remember the path; failure →
+-- return nil WITHOUT poisoning the next call. The lookup is cheap (a handful
+-- of executable() checks), so re-probing on miss is acceptable.
+--
+-- _reset_probe_cache() lets UEPrepare's finalize step (and tests) force a
+-- re-probe after the toolchain may have become available.
 local _csearch_path = nil
-local _csearch_probed = false
+local _cindex_path = nil
+local MIN_INDEX_SIZE = 1024
+
+function M._reset_probe_cache()
+  _csearch_path = nil
+  _cindex_path = nil
+end
 
 local function csearch_exe()
-  if _csearch_probed then return _csearch_path end
-  _csearch_probed = true
+  if _csearch_path then return _csearch_path end
   local candidates = {
     vim.fn.exepath("csearch"),
     vim.fn.exepath("csearch.exe"),
@@ -48,19 +66,15 @@ local function csearch_exe()
   }
   for _, c in ipairs(candidates) do
     if c and c ~= "" and vim.fn.executable(c) == 1 then
-      _csearch_path = c
+      _csearch_path = c  -- cache success only
       return c
     end
   end
-  return nil
+  return nil  -- do NOT cache the miss
 end
 
-local _cindex_path = nil
-local _cindex_probed = false
-
 function M.cindex_uefilter_exe()
-  if _cindex_probed then return _cindex_path end
-  _cindex_probed = true
+  if _cindex_path then return _cindex_path end
   local candidates = {
     vim.fn.exepath("cindex-uefilter"),
     vim.fn.exepath("cindex-uefilter.exe"),
@@ -70,11 +84,11 @@ function M.cindex_uefilter_exe()
   }
   for _, c in ipairs(candidates) do
     if c and c ~= "" and vim.fn.executable(c) == 1 then
-      _cindex_path = c
+      _cindex_path = c  -- cache success only
       return c
     end
   end
-  return nil
+  return nil  -- do NOT cache the miss
 end
 
 -- Per-workspace index path. Lives next to UEPrepare's other caches.
@@ -102,14 +116,41 @@ function M.index_path(ctx)
   return csearch_dir .. "/csearch.idx"
 end
 
+local function usable_index_stat(path)
+  local stat = path and vim.loop.fs_stat(path) or nil
+  return stat and stat.size and stat.size > MIN_INDEX_SIZE and stat or nil
+end
+
+local function recover_staged_index(idx)
+  if usable_index_stat(idx) then
+    return true
+  end
+
+  for _, staged in ipairs({ idx .. "~~", idx .. "~" }) do
+    if usable_index_stat(staged) then
+      local cur = vim.loop.fs_stat(idx)
+      if cur then
+        pcall(vim.loop.fs_unlink, idx)
+      end
+      local ok = pcall(vim.loop.fs_rename, staged, idx)
+      if ok and usable_index_stat(idx) then
+        return true
+      end
+    end
+  end
+
+  return false
+end
+
 -- Check that a usable csearch index file exists for this workspace.
 function M.is_indexed(ctx)
   if not csearch_exe() then return false end
   local idx = M.index_path(ctx)
   if not idx then return false end
-  local stat = vim.loop.fs_stat(idx)
-  return stat ~= nil and stat.size > 1024  -- empty index is ~73 bytes
+  return recover_staged_index(idx)
 end
+
+M._recover_staged_index_for_test = recover_staged_index
 
 function M.current_backend(ctx)
   if M.is_indexed(ctx) then return "csearch" end
@@ -170,11 +211,14 @@ local function stream_csearch(ctx, pattern, opts, callbacks)
   end
 
   -- Case sensitivity. opts.case=true → strict case-sensitive (no (?i)).
-  -- opts.case=nil/false → smart-case (lowercase pattern ⇒ (?i)) IF the
-  -- legacy smart_case opt is on. Keeping the old smart_case path for
-  -- back-compat with callers that haven't migrated to opts.case yet.
+  -- opts.ignore_case=true → unconditional (?i), used by UE grep so
+  -- camelCase queries like r.useLandscape still match r.UseLandscape...
+  -- opts.case=nil/false without ignore_case keeps the legacy smart-case
+  -- behavior (lowercase pattern ⇒ (?i)) for non-UE callers.
   local case_sensitive = opts.case == true
-  if not case_sensitive and opts.smart_case ~= false then
+  if not case_sensitive and opts.ignore_case == true then
+    pattern = "(?i)" .. pattern
+  elseif not case_sensitive and opts.smart_case ~= false then
     -- Only inject (?i) when there's no uppercase in the ORIGINAL search
     -- text. After literal-escape "Foo.Bar" becomes "Foo\.Bar" which
     -- still has uppercase, so this still works correctly.
@@ -229,6 +273,56 @@ local function stream_csearch(ctx, pattern, opts, callbacks)
   local emitted = 0
   local max_count = opts.max_count or 5000
 
+  -- DELIVERY ORDERING (fix 2026-06-12 — "<leader>/ drops trailing hits"):
+  -- We must guarantee on_done() fires STRICTLY AFTER every on_line() for this
+  -- search. The old code did `vim.schedule(on_line)` per line AND
+  -- `vim.schedule(on_done)` from the exit callback. libuv does not order the
+  -- exit event after the final stdout-data event, and even when it does, the
+  -- per-line schedules and the on_done schedule are independent queue entries
+  -- whose relative order is not guaranteed — so on_done could run while the
+  -- last few on_line callbacks were still queued. The ue.lua drain loop keys
+  -- off on_done (done=true) to stop draining, so those late lines were never
+  -- delivered → 2–4 trailing hits silently dropped.
+  --
+  -- Fix: parse lines SYNCHRONOUSLY in the read callback into `parsed` (no
+  -- per-line schedule), and run a SINGLE scheduled flusher that (a) delivers
+  -- all parsed-but-undelivered lines, then (b) calls on_done — but only once
+  -- the process has exited. A flush is requested on every data chunk (to keep
+  -- the picker streaming) and on exit; the flusher always drains the full
+  -- backlog before signalling done, so no line can be stranded behind on_done.
+  local parsed = {}        -- { {file,lnum,col,text}, ... } parsed, not yet delivered
+  local delivered_idx = 0  -- high-water mark of parsed[] handed to on_line
+  local proc_exited = false
+  local exit_code = 0
+  local exit_err = nil
+  local flush_scheduled = false
+  local done_called = false
+
+  local function flush()
+    flush_scheduled = false
+    if stopped then return end
+    -- Deliver every parsed line we haven't delivered yet.
+    while delivered_idx < #parsed do
+      delivered_idx = delivered_idx + 1
+      local it = parsed[delivered_idx]
+      if stopped then return end
+      callbacks.on_line(it.file, it.lnum, it.col, it.text)
+    end
+    -- Only signal done after the process exited AND the full backlog is
+    -- delivered. If more data is still arriving, proc_exited is false and we
+    -- bail; the next flush (or the exit flush) will finish the job.
+    if proc_exited and not done_called then
+      done_called = true
+      callbacks.on_done(exit_code, exit_err)
+    end
+  end
+
+  local function request_flush()
+    if flush_scheduled or stopped then return end
+    flush_scheduled = true
+    vim.schedule(flush)
+  end
+
   handle = vim.loop.spawn(cs, {
     args = args,
     env = env,
@@ -237,10 +331,13 @@ local function stream_csearch(ctx, pattern, opts, callbacks)
     safe_close()
     if handle then handle:close() end
     if stopped then return end
-    vim.schedule(function()
-      if stopped then return end
-      callbacks.on_done(code, code ~= 0 and table.concat(stderr_buf, "") or nil)
-    end)
+    exit_code = code
+    exit_err = code ~= 0 and table.concat(stderr_buf, "") or nil
+    proc_exited = true
+    -- Force a final flush even if one is already scheduled — the scheduled one
+    -- may have run before proc_exited flipped, leaving done uncalled.
+    flush_scheduled = true
+    vim.schedule(flush)
   end)
 
   if not handle then
@@ -276,17 +373,14 @@ local function stream_csearch(ctx, pattern, opts, callbacks)
             local lnum = tonumber(lnum_str) or 1
             local col = (text:lower():find(needle, 1, true) or 1)
             emitted = emitted + 1
-            vim.schedule(function()
-              -- Re-check inside the scheduled tick: by the time this
-              -- runs the picker may have moved on (new keystroke ⇒ new
-              -- finder ⇒ stop() called on us).
-              if stopped then return end
-              callbacks.on_line(file, lnum, col, text)
-            end)
+            -- Parse synchronously; deliver via the single flusher. This keeps
+            -- on_line strictly before on_done (see ordering note above).
+            parsed[#parsed + 1] = { file = file, lnum = lnum, col = col, text = text }
           end
         end
       end
     end
+    request_flush()
   end)
   stderr:read_start(function(_, data)
     if stopped then return end
@@ -316,9 +410,16 @@ local function stream_rg(ctx, pattern, opts, callbacks)
   local args = {
     "--color=never", "--no-heading", "--with-filename",
     "--line-number", "--column",
-    "--smart-case", "--max-columns=500", "-0",
+    "--max-columns=500", "-0",
     "-j", "32", "--mmap",
   }
+  if opts.case == true then
+    table.insert(args, "--case-sensitive")
+  elseif opts.ignore_case == true then
+    table.insert(args, "--ignore-case")
+  else
+    table.insert(args, "--smart-case")
+  end
   for _, ex in ipairs(opts.exclude_dirs or {}) do
     table.insert(args, "-g"); table.insert(args, "!**/" .. ex .. "/**")
   end
@@ -339,12 +440,57 @@ local function stream_rg(ctx, pattern, opts, callbacks)
   local handle
   local closed = false
   local leftover = ""
+  local stopped = false
 
   local function safe_close()
     if closed then return end
     closed = true
+    if stdout then pcall(stdout.read_stop, stdout) end
+    if stderr then pcall(stderr.read_stop, stderr) end
     if stdout then pcall(stdout.close, stdout) end
     if stderr then pcall(stderr.close, stderr) end
+  end
+
+  local function safe_kill()
+    if handle and not closed then
+      pcall(handle.kill, handle, "sigterm")
+    end
+  end
+
+  local emitted = 0
+  local max_count = opts.max_count or 5000
+
+  -- Same delivery-ordering fix as the csearch path: parse synchronously into
+  -- `parsed`, deliver + signal on_done via a single flusher so on_done always
+  -- runs after every on_line (no dropped trailing hits). All state declared
+  -- BEFORE spawn so the exit callback can close over it.
+  local parsed = {}
+  local delivered_idx = 0
+  local proc_exited = false
+  local exit_code = 0
+  local exit_err = nil
+  local flush_scheduled = false
+  local done_called = false
+
+  local function flush()
+    flush_scheduled = false
+    if stopped then return end
+    while delivered_idx < #parsed do
+      delivered_idx = delivered_idx + 1
+      local it = parsed[delivered_idx]
+      if stopped then return end
+      callbacks.on_line(it.file, it.lnum, it.col, it.text)
+    end
+    if proc_exited and not done_called then
+      done_called = true
+      callbacks.on_done(exit_code, exit_err)
+    end
+  end
+
+  local function request_flush()
+    if flush_scheduled or stopped then return end
+    flush_scheduled = true
+    vim.schedule(flush)
   end
 
   handle = vim.loop.spawn(rg, {
@@ -354,21 +500,25 @@ local function stream_rg(ctx, pattern, opts, callbacks)
   }, function(code)
     safe_close()
     if handle then handle:close() end
-    vim.schedule(function()
-      callbacks.on_done(code, code ~= 0 and table.concat(stderr_buf, "") or nil)
-    end)
+    if stopped then return end
+    exit_code = code
+    exit_err = code ~= 0 and table.concat(stderr_buf, "") or nil
+    proc_exited = true
+    flush_scheduled = true
+    vim.schedule(flush)
   end)
 
   if not handle then
     safe_close()
-    vim.schedule(function() callbacks.on_done(1, "failed to spawn rg") end)
-    return function() end
+    vim.schedule(function()
+      if stopped then return end
+      callbacks.on_done(1, "failed to spawn rg")
+    end)
+    return function() stopped = true end
   end
 
-  local emitted = 0
-  local max_count = opts.max_count or 5000
-
   stdout:read_start(function(_, data)
+    if stopped then return end
     if not data then return end
     leftover = leftover .. data
     while true do
@@ -388,20 +538,20 @@ local function stream_rg(ctx, pattern, opts, callbacks)
       local lnum_s, col_s, text = rest:match("^(%d+):(%d+):(.*)$")
       if lnum_s and col_s and text and emitted < max_count then
         emitted = emitted + 1
-        vim.schedule(function()
-          callbacks.on_line(rec, tonumber(lnum_s), tonumber(col_s), text)
-        end)
+        parsed[#parsed + 1] = { file = rec, lnum = tonumber(lnum_s), col = tonumber(col_s), text = text }
       end
     end
+    request_flush()
   end)
   stderr:read_start(function(_, data)
+    if stopped then return end
     if data then table.insert(stderr_buf, data) end
   end)
 
   return function()
-    if handle and not closed then
-      pcall(handle.kill, handle, "sigterm")
-    end
+    stopped = true
+    safe_kill()
+    safe_close()
   end
 end
 
@@ -480,10 +630,15 @@ function M.build_index(ctx, abs_list_path, cb, opts)
         cb(false, "cindex-uefilter exit=" .. code .. ": " .. table.concat(stderr_buf, ""), { ms = ms })
         return
       end
-      local stat = vim.loop.fs_stat(idx)
+      recover_staged_index(idx)
+      local stat = usable_index_stat(idx)
+      if not stat then
+        cb(false, "cindex-uefilter completed but produced no usable csearch index at " .. idx, { ms = ms, index_size = 0 })
+        return
+      end
       cb(true, nil, {
         ms = ms,
-        index_size = stat and stat.size or 0,
+        index_size = stat.size,
       })
     end)
   end)

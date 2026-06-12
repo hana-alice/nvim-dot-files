@@ -45,6 +45,88 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-06-12 — fix(ue): make UE grep ignore CVar camelCase by default
+
+**Task** — Continue the `<leader>/` result-completeness fix for the actual query `r.useLandscape`; the picker was still missing expected mixed-case CVar hits.
+
+**Implemented**
+- `lua/utils/code_search/init.lua` `stream_csearch`/`stream_rg`: added `ignore_case=true` as an explicit mode, separate from legacy smart-case, so callers can force case-insensitive literal searches unless `case=true`.
+- `lua/ue.lua` `cached_grep`: made both csearch and rg-backed UE grep default to ignore-case; Alt-C still switches to strict case-sensitive mode.
+- `lua/ue.lua` `cached_grep`: added temporary always-on backend debug logging to `stdpath("state") .. "/ue_grep_backend_debug.log"` while this issue is being verified live.
+- `lua/ue.lua` `cached_grep`: fixed the csearch picker drain queue to track `pending_len` explicitly instead of using `#pending` after drained entries are set to nil.
+- `tests/cases/utils_spec.lua`: added an rg streaming regression where `r.useLandscape` matches `r.UseLandscapeSrvBuffer`.
+- `tests/cases/grep_cache_spec.lua`: added static coverage that UE grep wires ignore-case by default and that the csearch drain loop does not use `#pending` for a holey queue.
+
+**Pitfalls / Gotchas**
+- `r.useLandscape` contains an uppercase `L`, so smart-case treats it as case-sensitive and misses source/config spellings like `r.UseLandscapeSrvBuffer`.
+- The live debug log showed the real remaining loss: csearch returned `recv=15` for `r.usela`, but the picker emitted only 12. The drain loop nilled old queue entries for GC and then used `#pending`; Lua length on a table with holes is undefined, so final tail hits could be skipped.
+- Direct `rg -i -F "r.useLandscape"` over the active engine+project returned 14 hits; csearch with the new ignore-case stream returned the same 14, so the indexed result set now matches the direct scan for this exact query.
+
+**Validation**
+- `nvim --headless -l tests/run.lua utils` → 30/30 passed.
+- `nvim --headless -l tests/run.lua grep_cache` → 21/21 passed.
+- Real csearch stream probe from `D:/project/uetemp` for `r.useLandscape` with `ignore_case=true` → 14 hits, `code=0`.
+- Direct `rg -n -i -F "r.useLandscape"` over `D:/project/uetemp/Engine` + `E:/aki/zeqiang_aki_3.5/Source/Client` → 14 hits.
+- Full regression: `nvim --headless -l tests/run.lua` → 360/360 passed.
+
+**Follow-ups**
+- Remove the temporary `ue_grep_backend_debug.log` writer after the user confirms the live picker is fixed.
+
+### 2026-06-12 — fix(ue): stop UEPrepare clangd error and guard live grep typing
+
+**Task** — Fix two fresh regressions reported after the grep work: `:UEPrepare` surfaces an err from clangd startup, and `<leader>/` can freeze/crash while typing a search.
+
+**Implemented**
+- `lua/ue.lua` `clangd_cmd`: changed `--function-arg-placeholders` to `--function-arg-placeholders=true`, matching clangd 22's boolean flag parser.
+- `lua/ue.lua` `cached_grep`: added a two-character live-search gate and a short-input result cap for csearch, while preserving the existing 5000-result cap for longer queries.
+- `lua/ue.lua` `cached_grep`: forced the picker title to append the actual backend (`[csearch]` or `[rg]`) even when the caller passes a custom title.
+- `lua/utils/code_search/init.lua`: recover from `cindex-uefilter` leaving a valid staged `csearch.idx~~`/`csearch.idx~` next to an empty final `csearch.idx`, and stop reporting cindex success when no usable final index exists.
+- `tests/cases/ue_api_spec.lua`: added regression coverage for the clangd flag format.
+- `tests/cases/grep_cache_spec.lua`: added regression coverage for the live grep input gate and backend title marker.
+- `tests/cases/utils_spec.lua`: added regression coverage for staged csearch index recovery.
+
+**Pitfalls / Gotchas**
+- clangd 22 rejects the historical bare boolean flag and logs `Value specified by --function-arg-placeholders is invalid`; this shows up after `:UEPrepare` because the command refresh path restarts LSP.
+- snacks live pickers refresh on typed input, so a one-character UE-wide grep can flood thousands of items before the user finishes the query.
+- A successful `cindex-uefilter` process can still leave the large index in `csearch.idx~~` while `csearch.idx` is empty; the picker must treat that as recoverable, not as “no csearch”.
+
+**Validation**
+- `nvim --headless -l tests/run.lua ue_api` → 34/34 passed.
+- `nvim --headless -l tests/run.lua grep_cache` → 19/19 passed.
+- `nvim --headless -l tests/run.lua utils` → 29/29 passed.
+- Real cache repair: restored `D:/project/uetemp/.cache/nvim-ue/csearch/Android-Development/csearch.idx` from the valid staged index; final index is >300 MB.
+- Real backend probe from `D:/project/uetemp`: `current_backend(...)` → `csearch`, title seam → `Grep All Code (Engine+Project) [csearch]`.
+- Real csearch stream probe for `VulkanRHI` with `max_count=1` → 1 hit, `on_done=true`.
+- Full regression: `nvim --headless -l tests/run.lua` → 357/357 passed.
+
+**Follow-ups**
+- 无。
+
+### 2026-06-12 — fix(grep): finish `<leader>/` result completeness and remove temporary diagnostics
+
+**Task** — Continue the unfinished `<leader>/` search fix: results were still incomplete in some sessions, and the live code still contained temporary fingerprint logs from diagnosis.
+
+**Implemented**
+- `lua/utils/code_search/init.lua`: completed the single-flusher contract for the rg backend, matching csearch, including stop guards so killed searches do not emit late `on_line`/`on_done` callbacks.
+- `lua/ue.lua` and `lua/plugins/snacks.lua`: removed temporary `DIAG v2` fingerprint file logging while keeping the opt-in `UEGrepTrace*`/`UEGrepDiagDump` diagnostics.
+- `tests/cases/utils_spec.lua`: added rg stream ordering and stop-after-cancel regression coverage.
+- `tests/cases/grep_cache_spec.lua`: added fallback visibility checks for the slow fallback title and WARN wording.
+- `docs/architecture/grep-cache-invalidation.md` and `docs/CONSTRAINTS.md`: documented the stream callback-ordering pitfall and updated test coverage notes.
+
+**Pitfalls / Gotchas**
+- csearch and rg must both enforce `on_line` before `on_done`; fixing only csearch leaves the no-index rg path able to trip the same tail-loss class.
+- The permanent diagnostics are the opt-in trace/dump commands, not unconditional writes to `stdpath("state")`.
+
+**Validation**
+- `nvim --headless -l tests/run.lua grep_cache` → 16/16 passed.
+- `nvim --headless -l tests/run.lua utils` → 28/28 passed.
+- `nvim --headless -l tests/run.lua structure` → 36/36 passed.
+- Real backend diagnostic with temporary files: csearch selected with a generated index and returned 40/40 hits; rg selected without an index and returned 40/40 hits.
+- Full regression: `nvim --headless -l tests/run.lua` → 352/352 passed.
+
+**Follow-ups**
+- 无。
+
 ### 2026-06-12 — docs(rules): add GPT/Codex AGENTS entrypoint
 
 **Task** — 参考现有 Claude Code 工程方法论，为 GPT/Codex 增加可自动发现的本地执行入口。

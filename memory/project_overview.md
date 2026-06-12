@@ -17,10 +17,13 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 
 新 context 进来、动代码前**按序读**：
 
-1. **根 `CLAUDE.md`** — SESSION START 协议 + Definition of Done（完成的硬标准）。
+1. **根 `CLAUDE.md` / `AGENTS.md`** — Claude 与 GPT/Codex 的 SESSION START 协议 +
+   Definition of Done（完成的硬标准）。
 2. **`docs/CONSTRAINTS.md`** — 禁止 / 踩过的坑 / 约束（权威索引）。
 3. **本文件** — 项目总览 + 子系统速查。
-4. **当前改动目录的 `CLAUDE.md`** — 子系统本地规则（无则回落最近祖先目录）。
+4. **当前改动目录的本地规则** — GPT/Codex 先以根 `AGENTS.md` 进入；若目标子树有更近的
+   嵌套 `AGENTS.md` 则读它，否则读最近祖先 `CLAUDE.md`。Claude 读当前目录 `CLAUDE.md`
+   （无则回落最近祖先目录）。
 
 ## 子系统速查
 
@@ -55,4 +58,3 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 1. **改完跑回归**：按改动范围跑对应 filter（映射见 `tests/CLAUDE.md`），提交前全量。
 2. **改完记 changelog**：`docs/changelog.md` 追加一条，Validation 写所跑回归范围。
 3. **收尾走 milestone**：semver 触发 + 四件套（见 `docs/CONSTRAINTS.md` §三 C8）。
-

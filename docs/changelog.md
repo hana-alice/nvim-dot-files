@@ -45,7 +45,27 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
-_No entries yet — append `### YYYY-MM-DD — Title` blocks here as work lands._
+### 2026-06-12 — docs(rules): add GPT/Codex AGENTS entrypoint
+
+**Task** — 参考现有 Claude Code 工程方法论，为 GPT/Codex 增加可自动发现的本地执行入口。
+
+**Implemented**
+- 新增根 `AGENTS.md`：保留自主执行、SESSION START、命令风格、git/adb 策略、DoD，
+  并要求 GPT/Codex 在局部改动前读取最近的 `CLAUDE.md` 规则。
+- 更新 `docs/CONSTRAINTS.md` 与 `memory/project_overview.md`：把根 `AGENTS.md`
+  登记为 GPT/Codex 入口，避免只提 Claude。
+- 更新 `tests/cases/structure_spec.lua`：结构回归现在守护根 `AGENTS.md` 存在、链接可解析、
+  且包含 GPT/Codex 入口与 Definition of Done。
+
+**Pitfalls / Gotchas**
+- 没有复制所有子目录 `CLAUDE.md` 为 `AGENTS.md`，避免两套局部规则并行维护导致漂移；
+  GPT/Codex 从根入口按最近祖先 `CLAUDE.md` 读取局部增量。
+
+**Validation**
+- `nvim --headless -l tests/run.lua structure` → 36/36 passed, exit 0。
+
+**Follow-ups**
+- 无。
 
 
 ### 2026-05-28 — UE cache invalidation: setproject auto-invalidates, freshness uses external anchors, picker lazy-starts watcher

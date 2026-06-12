@@ -1,6 +1,6 @@
 -- tests/cases/structure_spec.lua
 -- AI 持久化结构可发现性回归：
---   ① 主要目录都有 CLAUDE.md
+--   ① 根 AGENTS.md + 主要目录 CLAUDE.md 可发现
 --   ② 知识库四根文件存在
 --   ③ 关键文档内链不悬空
 --   ④ 强制入口（SESSION START + DoD）与三条政策可发现
@@ -31,6 +31,10 @@ local MAJOR_DIRS = {
 }
 
 t.describe("structure: 主要目录本地规则存在", function()
+  t.it("根 AGENTS.md 存在", function()
+    t.assert_true(exists("AGENTS.md"), "缺少 GPT/Codex 本地规则入口: AGENTS.md")
+  end)
+
   for _, d in ipairs(MAJOR_DIRS) do
     t.it(d .. "/CLAUDE.md 存在", function()
       -- 目录本身存在才要求规则（防止清单与实际目录漂移误报）
@@ -91,6 +95,7 @@ local function resolve(base_dir, target)
 end
 
 local KEY_DOCS = {
+  "AGENTS.md",
   "CLAUDE.md",
   "docs/CONSTRAINTS.md",
   "memory/project_overview.md",
@@ -129,6 +134,12 @@ t.describe("structure: 强制入口与政策可发现", function()
   end)
   t.it("根 CLAUDE.md 含 Definition of Done", function()
     t.assert_contains(root, "Definition of Done")
+  end)
+  t.it("根 AGENTS.md 含 GPT/Codex 入口与完成标准", function()
+    local agents = read("AGENTS.md") or ""
+    t.assert_contains(agents, "GPT/Codex")
+    t.assert_contains(agents, "Session Start")
+    t.assert_contains(agents, "Definition of Done")
   end)
   t.it("tests/CLAUDE.md 含 change→filter 映射表", function()
     t.assert_contains(tests_rules, "CHANGE-TO-FILTER MAP")

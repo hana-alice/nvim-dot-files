@@ -328,9 +328,11 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 
 为让持续介入的 AI agent **从文件而非 chat 历史**发现规则，本仓提供：
 
-- **强制执行入口**：根 `CLAUDE.md` 的 SESSION START 协议（动代码前先读
-  `docs/CONSTRAINTS.md` → `memory/project_overview.md` → 当前目录 `CLAUDE.md`）+ Definition of Done。
+- **强制执行入口**：根 `CLAUDE.md`（Claude Code）与根 `AGENTS.md`（GPT/Codex）的
+  SESSION START 协议（动代码前先读 `docs/CONSTRAINTS.md` → `memory/project_overview.md` →
+  当前目录本地规则）+ Definition of Done。
 - **递归本地规则**：每个主要目录一份 `CLAUDE.md`，子级只写相对父级的增量；
+  GPT/Codex 从根 `AGENTS.md` 进入后按最近祖先 `CLAUDE.md` 读取这些局部规则。
   **目录无 `CLAUDE.md` 时回落最近祖先目录的规则**。
 - **持久化知识库四区**：
   - `memory/project_overview.md` — 项目总览 + 子系统速查 + 先读顺序。

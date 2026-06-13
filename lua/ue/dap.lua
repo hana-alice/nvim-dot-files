@@ -1974,14 +1974,32 @@ function D.setup_dap(dap, dapui)
     D._ue_android_reattach_timer:start(3000, 0, function()
       D._ue_android_reattach_timer:stop()
       D._ue_android_reattach_scheduled = false
-      pcall(function()
-        local ok, android = pcall(require, "ue.dap.android")
-        if ok and android.reattach then
-          vim.schedule(function()
-            vim.notify("[ue.dap] Re-attaching with updated breakpoints …", vim.log.levels.INFO)
-          end)
-          android.reattach()
-        end
+      -- UV timer callback runs off-thread; all nvim API calls MUST be
+      -- on the main loop via vim.schedule.
+      vim.schedule(function()
+        pcall(function()
+          local ok_android, android = pcall(require, "ue.dap.android")
+          if not (ok_android and android.reattach) then return end
+          local ok_dap, dap = pcall(require, "dap")
+          if not (ok_dap and dap) then return end
+          -- Step 1: cleanly detach from the current session.
+          vim.notify("[ue.dap] Detaching to re-preseed breakpoints …", vim.log.levels.INFO)
+          if dap.session() then
+            dap.disconnect({ terminateDebuggee = false }, function()
+              -- disconnect callback is already on the main thread
+              -- (handle_body → vim.schedule → callback).  self:close()
+              -- has already run, so dap.session() is nil by now.
+              if dap.session() then
+                vim.notify("[ue.dap] re-attach skipped: session still active", vim.log.levels.WARN)
+                return
+              end
+              android.reattach()
+            end)
+          else
+            -- No active session — just re-attach directly.
+            android.reattach()
+          end
+        end)
       end)
     end)
   end

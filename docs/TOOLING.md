@@ -2,6 +2,10 @@
 
 External binaries and version constraints for this Neovim configuration.
 
+> **Regression tests:** run `nvim --headless -l tests/run.lua` (or
+> `pwsh -File scripts/run_regression.ps1` on Windows) after any change.
+> Full guide: [`testing-regression.md`](testing-regression.md).
+
 This file is **English-only** (this repo is mirrored to a public GitHub
 remote). Keep notes here factual and reproducible.
 
@@ -180,27 +184,50 @@ nvim-dap
 
 ## Android lldb-server (current)
 
-- **Required**: NDK **27** `lldb-server` for `aarch64-android` (LLDB 18)
-- **Install path glob**: `%LOCALAPPDATA%\Android\Sdk\ndk\27.*\toolchains\llvm\prebuilt\windows-x86_64\lib\clang\18\lib\linux\aarch64\lldb-server`
+> **Status (2026-06-02): device server reverted to NDK 21 LLDB 9.0.9.**
+> The NDK 27 LLDB 18 note below is superseded — on `a3ad86f3` (Android 16,
+> arm64) NDK 27 LLDB 18 **and** Android Studio bundled LLDB 19 both *Segfault*
+> on `gdbserver --attach` against this UE `libUE4.so`. NDK 21.4.7075529
+> LLDB 9.0.9 (the NDK that built `libUE4.so`) keeps a stable tracer and
+> attaches. This is the version `default_lldb_server_paths()` now pins first.
+
+- **Required**: NDK **21.4.7075529** `lldb-server` for `aarch64-android` (LLDB 9.0.9)
+- **Install path glob**: `%LOCALAPPDATA%\Android\Sdk\ndk\21.*\toolchains\llvm\prebuilt\windows-x86_64\lib64\clang\*\lib\linux\aarch64\lldb-server`
+- Resolution: `lua/utils/platform/windows.lua` `default_lldb_server_paths()`
+  lists NDK 21 **first**, Android Studio bundled lldb second (fallback only),
+  other NDKs last.
 - Pushed to device by `lua/ue/dap/android.lua`:
-  - host:                                  `<NDK>/.../lldb-server`
-  - device staging:                        `/data/local/tmp/lldb-server-ndk27`
-  - app sandbox (via `run-as`):            `/data/data/<pkg>/lldb-server-ndk27`
-- Command on device: `lldb-server-ndk27 gdbserver --attach <pid> 127.0.0.1:<port>`
+  - host:                                  `<NDK21>/.../aarch64/lldb-server`
+  - public staging:                        `/data/local/tmp/lldb-server`
+  - app sandbox (via `run-as`):            `files/lldb-server` (relative to
+    `/data/user/0/<pkg>`)
+- Command on device: `files/lldb-server gdbserver --attach <pid> *:<port>`
+  - **MUST NOT** use `cd files && ./lldb-server` — under the `runas_app`
+    SELinux domain (Android 12+) `cd` silently fails, cwd stays `/`, and
+    `./lldb-server` reports `inaccessible or not found`. Use the path relative
+    to the run-as cwd (`files/lldb-server`). Verified on `a3ad86f3`.
 
-Why **NDK 27**, not NDK 21 (the version that built libUE4.so):
+Why **NDK 21** (not NDK 27 / Android Studio bundled):
 
-- `gdbserver --attach` does NOT use the `qLaunchGDBServer` handshake;
-  the LLDB-version-mismatch deadlock that motivated NDK-21-pinning in
-  the old lldb-dap+platform-mode route does not apply here.
-- NDK 21's lldb-server is too old to attach reliably under Android 12+.
-- Cross-major gdb-remote (host LLDB 22 ↔ device LLDB 18) is empirically
-  stable; verified against UE 5.x `libUnreal.so`.
+- The device `lldb-server` must match the NDK that built `libUE4.so`
+  (UE 4.x/5.x ship NDK 21.4.7075529 / clang 9.0.9).
+- On `a3ad86f3` (2026-06-02) `gdbserver --attach` *Segfaults* with NDK 27
+  LLDB 18 and Android Studio LLDB 19, but stays alive with NDK 21 LLDB 9.0.9.
+- After a successful attach, `lua/ue/dap/android.lua` emits
+  `target modules load --file libUE4.so --slide 0x<base>` (base from
+  `run-as <pkg> cat /proc/<pid>/maps`) so file:line breakpoints resolve — the
+  gdb-remote path does not auto-rebase modules (see Pitfalls #2).
 
-The platform driver's `default_lldb_server_paths()` glob list still
-contains NDK 21 entries — those are for the *retired* lldb-dap route
-and are kept for backwards compatibility. `ue.dap.android` resolves
-**all** matches and picks the highest NDK version.
+### Environment requirements (Android DAP, verified on a3ad86f3)
+
+| Component        | Required                                                        |
+| ---------------- | --------------------------------------------------------------- |
+| Host adapter     | LLVM 22.1.6 `lldb-dap.exe` (forward-only — see top of file)     |
+| Device server    | **NDK 21.4.7075529 LLDB 9.0.9** `lldb-server` (arm64)           |
+| Device           | arm64-v8a, app **DEBUGGABLE**, `run-as <pkg>` usable            |
+| Host symbol .so  | symbol-rich `libUE4.so` (e.g. `.../Client_Symbols_v*/Client-arm64/libUE4.so`) |
+| Validation scope | adb serial `a3ad86f3` only (other devices need their own proof) |
+
 
 ## Pitfalls (codelldb route, hard-won)
 

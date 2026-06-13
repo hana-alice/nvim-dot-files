@@ -1189,7 +1189,11 @@ local function bootstrap_session(opts, on_ready)
   -- for values that are stable for this workspace and already known.
   -- Priority: explicit context/opts -> last successful session -> workspace default.
   ctx.android_package = ctx.android_package or opts.package_name or opts.package
-    or (M._last_session and M._last_session.package_name) or "<android-package>"
+    or (M._last_session and M._last_session.package_name)
+  -- When none of the above sources provides a package name, leave it nil
+  -- so pick_package() falls through to persisted state → project discovery
+  -- → config → user prompt, instead of treating a placeholder as a real
+  -- Android package name.
   ctx.android_serial = ctx.android_serial or opts.serial or opts.android_serial
     or (M._last_session and M._last_session.serial)
   ctx.android_symbol_lib = ctx.android_symbol_lib or ctx.symbol_lib or opts.symbol_lib

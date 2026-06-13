@@ -1844,6 +1844,7 @@ function D.setup_dap(dap, dapui)
     stop_logcat()
     restore_layout()
     source_path_cache = {}
+    D._ue_android_pending_bps = {}  -- clear pending breakpoints on session end
     -- Hand cleanup of remote lldb-server / adb forward to ue.dap.android.
     local ok, android = pcall(require, "ue.dap.android")
     if ok and android.cleanup then
@@ -1956,25 +1957,46 @@ function D.setup_dap(dap, dapui)
       return orig_frame_set(session, frame)
     end
 
-    -- Breakpoints: let nvim-dap's setBreakpoints reach lldb-dap unchanged.
+    -- Android post-attach breakpoints: DAP setBreakpoints and evaluate-based
+    -- REPLANT both resolve symbols correctly (verified=true, resolved=1) but
+    -- breakpoints planted after the initial attach do NOT fire on-device.
+    -- Only the attachCommands preseed (which runs during configurationDone,
+    -- before the process is resumed) produces breakpoints that actually stop
+    -- the inferior.  Root cause is believed to be a lldb-server / SELinux /
+    -- ptrace interaction on Android 16+ where post-attach memory writes to
+    -- running (or even paused-but-not-freshly-attached) code pages are
+    -- silently dropped.
     --
-    -- HISTORY: an earlier gdb-remote-route version intercepted Android
-    -- setBreakpoints and returned a SYNTHETIC verified=true response — never
-    -- sending the request to lldb. That made post-attach F9 a no-op: the sign
-    -- stayed ● (faked), but lldb never planted the breakpoint, so the app ran
-    -- straight through it. Under the K30 platform route lldb-dap handles
-    -- file:line setBreakpoints itself (with the host symbol-rich libUE4.so as
-    -- the exec-search-path + ASLR rebase done in attachCommands), so the real
-    -- request must flow through. The interception is REMOVED.
+    -- Fix: after any setBreakpoints changes the breakpoint set, debounce-
+    -- schedule a clean disconnect + re-attach.  M.reattach() re-runs the
+    -- full preseed path (attachCommands with current breakpoints) which is
+    -- the ONLY mechanism proven to produce working breakpoints on a3ad86f3.
     --
-    -- The only adjustment we keep is path canonicalization for verified=false
-    -- rendering (see remap_breakpoint_response_to_local_paths listener below),
-    -- which rewrites response source paths back to local buffer paths without
-    -- blocking the request.
-    if session_mod and session_mod._ue_android_orig_request then
-      -- Restore any previously-installed interception (hot-reload safety).
-      session_mod.request = session_mod._ue_android_orig_request
-      session_mod._ue_android_orig_request = nil
+    -- The debounce window (3s) merges multiple rapid F9 presses into a
+    -- single re-attach, and the guard (D._reattach_scheduled) prevents
+    -- stacking schedulers.  The flow: F9 → instant verified=true UI → 3s
+    -- → detach → re-attach (preseed) → F5 to continue.
+    D._ue_android_reattach_timer = D._ue_android_reattach_timer
+      or (vim.uv and vim.uv.new_timer())
+    D._ue_android_reattach_scheduled = false
+
+    local function schedule_reattach()
+      if D._ue_android_reattach_scheduled then return end
+      D._ue_android_reattach_scheduled = true
+      if not D._ue_android_reattach_timer then return end
+      D._ue_android_reattach_timer:start(3000, 0, function()
+        D._ue_android_reattach_timer:stop()
+        D._ue_android_reattach_scheduled = false
+        pcall(function()
+          local ok, android = pcall(require, "ue.dap.android")
+          if ok and android.reattach then
+            vim.schedule(function()
+              vim.notify("[ue.dap] Re-attaching with updated breakpoints …", vim.log.levels.INFO)
+            end)
+            android.reattach()
+          end
+        end)
+      end)
     end
   end
 
@@ -2075,23 +2097,28 @@ function D.setup_dap(dap, dapui)
     maybe_jump_to_local_source_frame(session, body)
   end
 
+  -- Before setBreakpoints: rewrite UE Android source paths from Windows
+  -- absolute paths to basename-only so lldb-dap can match them against
+  -- DWARF (which records file names / relative paths, not host paths).
+  dap.listeners.before.setBreakpoints["ue_android_bp_source_rewrite"] = function(session, args)
+    if not is_ue_android_lldb_session(session) then return end
+    if not args or not args.source then return end
+    local rewritten = ue_android_breakpoint_source(args.source)
+    if rewritten ~= args.source then
+      args.source = rewritten
+    end
+  end
+
   dap.listeners.after.setBreakpoints["ue_android_bp_local_response"] = function(session, _err, response)
     if not is_ue_android_lldb_session(session) then return end
     remap_breakpoint_response_to_local_paths(response)
-    -- K33 diagnosis: log every setBreakpoints response so we can see verified
-    -- state + message (e.g. "pending"/"no locations") without a live REPL.
-    pcall(function()
-      local path = vim.fn.stdpath("cache") .. "/ue-dap-bp-diag.log"
-      local fh = io.open(path, "a")
-      if not fh then return end
-      fh:write(("[%s] setBreakpoints response:\n"):format(os.date("%H:%M:%S")))
-      for _, bp in ipairs((response and response.breakpoints) or {}) do
-        fh:write(("  verified=%s line=%s id=%s msg=%s src=%s\n"):format(
-          tostring(bp.verified), tostring(bp.line), tostring(bp.id),
-          tostring(bp.message), tostring(bp.source and (bp.source.path or bp.source.name))))
-      end
-      fh:close()
-    end)
+    -- Schedule a debounced detach+reattach.  The only proven way to plant
+    -- working Android breakpoints is the preseed inside attachCommands
+    -- (which runs during configurationDone, before the process is resumed).
+    -- DAP setBreakpoints and evaluate-based replant both resolve symbols but
+    -- the breakpoint instructions are not reliably written into the remote
+    -- process memory on this device/Android-version combination.
+    schedule_reattach()
   end
 
   -- K33 diagnosis: capture lldb-dap console/output events to a host log file so

@@ -1957,50 +1957,36 @@ function D.setup_dap(dap, dapui)
       return orig_frame_set(session, frame)
     end
 
-    -- Android post-attach breakpoints: DAP setBreakpoints and evaluate-based
-    -- REPLANT both resolve symbols correctly (verified=true, resolved=1) but
-    -- breakpoints planted after the initial attach do NOT fire on-device.
-    -- Only the attachCommands preseed (which runs during configurationDone,
-    -- before the process is resumed) produces breakpoints that actually stop
-    -- the inferior.  Root cause is believed to be a lldb-server / SELinux /
-    -- ptrace interaction on Android 16+ where post-attach memory writes to
-    -- running (or even paused-but-not-freshly-attached) code pages are
-    -- silently dropped.
-    --
-    -- Fix: after any setBreakpoints changes the breakpoint set, debounce-
-    -- schedule a clean disconnect + re-attach.  M.reattach() re-runs the
-    -- full preseed path (attachCommands with current breakpoints) which is
-    -- the ONLY mechanism proven to produce working breakpoints on a3ad86f3.
-    --
-    -- The debounce window (3s) merges multiple rapid F9 presses into a
-    -- single re-attach, and the guard (D._reattach_scheduled) prevents
-    -- stacking schedulers.  The flow: F9 → instant verified=true UI → 3s
-    -- → detach → re-attach (preseed) → F5 to continue.
-    D._ue_android_reattach_timer = D._ue_android_reattach_timer
-      or (vim.uv and vim.uv.new_timer())
-    D._ue_android_reattach_scheduled = false
-
-    local function schedule_reattach()
-      if D._ue_android_reattach_scheduled then return end
-      D._ue_android_reattach_scheduled = true
-      if not D._ue_android_reattach_timer then return end
-      D._ue_android_reattach_timer:start(3000, 0, function()
-        D._ue_android_reattach_timer:stop()
-        D._ue_android_reattach_scheduled = false
-        pcall(function()
-          local ok, android = pcall(require, "ue.dap.android")
-          if ok and android.reattach then
-            vim.schedule(function()
-              vim.notify("[ue.dap] Re-attaching with updated breakpoints …", vim.log.levels.INFO)
-            end)
-            android.reattach()
-          end
-        end)
-      end)
-    end
+    -- Android post-attach breakpoints: see schedule_reattach() defined
+    -- above (outside this session_mod block).  The listener in
+    -- after.setBreakpoints calls it.
   end
 
-  -- Wire persistent breakpoints (per-project json under
+  -- ─── Re-attach scheduler (used by after.setBreakpoints below) ────────────
+  D._ue_android_reattach_timer = D._ue_android_reattach_timer
+    or (vim.uv and vim.uv.new_timer())
+  D._ue_android_reattach_scheduled = false
+
+  local function schedule_reattach()
+    if D._ue_android_reattach_scheduled then return end
+    D._ue_android_reattach_scheduled = true
+    if not D._ue_android_reattach_timer then return end
+    D._ue_android_reattach_timer:start(3000, 0, function()
+      D._ue_android_reattach_timer:stop()
+      D._ue_android_reattach_scheduled = false
+      pcall(function()
+        local ok, android = pcall(require, "ue.dap.android")
+        if ok and android.reattach then
+          vim.schedule(function()
+            vim.notify("[ue.dap] Re-attaching with updated breakpoints …", vim.log.levels.INFO)
+          end)
+          android.reattach()
+        end
+      end)
+    end)
+  end
+
+  -- ─── nvim-dap-ui threads-list crash guard ─────────────────────────────
   -- <engine_root>/.cache/nvim-ue/breakpoints/<project>.json).  setup()
   -- installs autocmds for BufReadPost restore + VimLeavePre flush.
   pcall(function()

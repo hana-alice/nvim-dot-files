@@ -479,9 +479,10 @@ A few common "improvements" we declined:
 
 1. `README.md` — the elevator pitch.
 2. This file — the architecture.
-3. `docs/TOOLING.md` — version constraints (LLVM, lldb-dap, etc.).
-4. `docs/architecture-symbol-resolution.md` — deep-dive on goto-def.
-5. `docs/ue_lazyvim_cheatsheet.md` — every keymap.
-6. `lua/workarounds/README.md` — the workaround contract.
-7. `lua/ue.lua` head + `function M.setup()` — engine entrypoint.
-8. `docs/release_1.0.*.md` — what each version changed.
+3. `docs/CONSTRAINTS.md` — the consolidated 禁止 / 坑 / 约束 checklist.
+4. `docs/TOOLING.md` — version constraints (LLVM, lldb-dap, etc.).
+5. `docs/architecture-symbol-resolution.md` — deep-dive on goto-def.
+6. `docs/ue_lazyvim_cheatsheet.md` — every keymap.
+7. `lua/workarounds/README.md` — the workaround contract.
+8. `lua/ue.lua` head + `function M.setup()` — engine entrypoint.
+9. `docs/release_1.0.*.md` — what each version changed.

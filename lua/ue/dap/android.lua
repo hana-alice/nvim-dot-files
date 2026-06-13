@@ -1,41 +1,34 @@
--- ue.dap.android — Android DAP attach via lldb-dap + Android lldb-server.
+-- ue.dap.android — Android DAP attach via lldb-dap + lldb-server platform mode.
 --
--- Adapter: LLVM lldb-dap (resolved by ue.dap._common.find_lldb_dap).
--- Wire:    nvim-dap → lldb-dap (host, LLVM 22.1.6) → platform connect
---          → adb forward → lldb-server platform on /data/local/tmp/ (PUBLIC)
---          → process attach --pid → ART SIGSEGV/SIGBUS traps passed back to
---          the inferior while DAP signal notifications stay suppressed.
+-- Adapter: LLVM lldb-dap (resolved by ue.dap._common.find_lldb_dap, host 22.1.6).
+-- Wire:    nvim-dap → lldb-dap (host) → adb forward → lldb-server platform
+--          (device, /data/local/tmp, --listen *:<port>). The host attach runs:
+--            platform select remote-android
+--            platform connect connect://[<serial>]:<port>   (serial form ONLY)
+--            process attach --pid <pid>
+--            process handle SIG* --notify false
+--            target modules load --file libUE4.so --slide 0x<base>
+--          lldb-server platform forks the per-target gdbserver itself.
+--
+-- This is the WORKING route, real-device verified 5/21 (commit e51cbe6) and
+-- re-verified 2026-06-03 (Connected: yes + process attach + threads ok). The
+-- constitution records the hard rules — see docs/CONSTRAINTS.md:
+--   K30  platform mode + `connect://[<serial>]:<port>` is the only working attach.
+--   K31  `lldb-server gdbserver --attach` NEVER binds the listen port — banned.
+--   K32  `connect://localhost:N` gets eaten by lldb-dap getopt → `Invalid URL`.
+--   K33  source-file `breakpoint set -f` may crash lldb-dap 22.1.6 (re-verify).
+--   K3   ART SIGSEGV/SIGBUS need `--notify false` (and the 5/21 working config
+--        used `--pass false`); without --notify, per-signal DAP stopped events
+--        flood the pipe and kill the adapter on Windows.
 --
 -- Why lldb-dap (migrated from codelldb 2026-05-21):
---   * codelldb is a VS Code extension carrying a vendored liblldb. It works
---     but is one more thing to bundle, version-pin and patch. lldb-dap ships
---     in the LLVM toolchain we already require for clangd/UE — one adapter,
---     one liblldb, one set of expectations.
---   * The 2026-05-21 "lldb-dap crashes on Android setBP" reputation was a
---     self-inflicted symptom from `process handle SIGSEGV --notify true`,
---     not an LLVM bug. With --notify false lldb-dap 22.1.6 + platform mode
---     attaches and plants breakpoints stably (probe_bp_v12 + probe_bp_v13
---     in C:/tools/lldb-22, end-to-end hit confirmed against UE Android
---     FEngineLoop::Tick on 2026-05-21).
---
--- Why platform mode (not gdb-remote gdbserver --attach):
---   * platform mode is what the modern lldb shipping in Android Studio,
---     Xcode and the LLVM source tree expects. It auto-syncs module slides
---     so we no longer have to read /proc/<pid>/maps and inject a manual
---     `target modules load --slide`.
---   * lldb-server runs as PUBLIC user under /data/local/tmp/lldb-server.
---     UE Android apps are built with android:debuggable=true (otherwise
---     gdb can't attach either) so adb can `ptrace` them through the
---     PUBLIC server without run-as sandbox copying.
---   * platform mode pulls libUE4.so into ~/.lldb/module_cache/ on first
---     attach (one-time, 3.85 GB) and caches forever. This is purely a
---     symbol-name source; for source-line resolution we still feed the
---     host-side DWARF via `target.exec-search-paths` and a sourceMap.
+--   * codelldb is a VS Code extension carrying a vendored liblldb. lldb-dap
+--     ships in the LLVM toolchain we already require for clangd/UE — one
+--     adapter, one liblldb, one set of expectations.
 --
 -- Requirements on the device (auto-bootstrapped):
---   * lldb-server (NDK 27, LLDB 18) pushed to /data/local/tmp/lldb-server.
---     The PUBLIC location means no run-as sandbox copy is needed — anybody
---     can `cd /data/local/tmp && ./lldb-server platform --server --listen *:N`.
+--   * lldb-server pushed to PUBLIC /data/local/tmp/lldb-server (platform mode
+--     does NOT need a sandbox copy — it ptraces via the debug user).
 --   * Process matching session.package_name running.
 --   * App is debuggable (android:debuggable=true) OR adb root works.
 --
@@ -66,6 +59,8 @@ M._session = {
   package_name      = nil,
   adb               = "adb",
   lldb_server_local = nil,  -- host path to NDK lldb-server
+  remote_lldb_server = nil, -- device path to app-executable lldb-server
+  lldb_server_mode  = nil,  -- "gdbserver" (production) or legacy "platform"
   symbol_lib        = nil,  -- host path to libUE4.so (with DWARF)
   source_map        = nil,  -- list of { from, to } pairs
   engine_root       = nil,  -- host engine root, used to wire LLDB UE data formatters
@@ -90,6 +85,8 @@ local function snapshot_last_session()
     serial            = s.serial,
     symbol_lib        = s.symbol_lib,
     lldb_server_local = s.lldb_server_local,
+    remote_lldb_server = s.remote_lldb_server,
+    lldb_server_mode  = s.lldb_server_mode,
     source_map        = s.source_map,
     engine_root       = s.engine_root,
     adb               = s.adb,
@@ -121,34 +118,26 @@ local function pick_lldb_server_for_tests(globs)
   if type(cfg_path) == "string" and cfg_path ~= "" and fs.is_file(cfg_path) then
     return cfg_path
   end
-  -- NDK 27's lldb-server (LLDB 18) is the historical safe pick on Android:
-  -- it speaks the platform protocol that LLVM 22 host lldb-dap understands,
-  -- and the host/device version skew (host=22 device=18) is empirically
-  -- safe for platform mode. Higher NDK lldb-servers (e.g. r29 LLDB 21)
-  -- also work but offer no observable upside. Resolve all candidates,
-  -- then pick the highest NDK version.
-  local matches = {}
+  -- Preserve the priority order supplied by utils.platform.windows. Do not
+  -- collect all hits and sort here: callers may intentionally put a tested
+  -- device-side lldb-server first via config or platform policy. Host-side
+  -- lldb-dap stays forward-only at 22.1.6+; device-side lldb-server is a
+  -- separate probe variable and must be diagnosed from live attach logs.
   for _, pattern in ipairs(globs or {}) do
     local hit = vim.fn.glob(pattern)
     if hit and hit ~= "" then
       for line in (hit .. "\n"):gmatch("([^\n]+)\n") do
-        if fs.is_file(line) then matches[#matches + 1] = line end
+        if fs.is_file(line) then return line end
       end
     end
   end
-  if #matches == 0 then return nil end
-  local function ndk_version(p)
-    local v = p:match("[Nn][Dd][Kk][/\\](%d+)%.")
-    return v and tonumber(v) or 0
-  end
-  table.sort(matches, function(a, b) return ndk_version(a) > ndk_version(b) end)
-  return matches[1]
+  return nil
 end
 
 local function pick_lldb_server()
   local picked = pick_lldb_server_for_tests(default_lldb_server_globs())
   if picked then return picked end
-  local typed = vim.fn.input("Path to arm64 lldb-server (NDK 27 preferred): ")
+  local typed = vim.fn.input("Path to arm64 lldb-server: ")
   if typed == "" then return nil end
   if not fs.is_file(typed) then
     vim.notify("Not a readable file: " .. typed, vim.log.levels.WARN)
@@ -169,9 +158,28 @@ end
 -- so we never have to prompt the user when a cooked APK exists on disk. Falls
 -- through to ctx/cfg/input only when there is no cooked output.
 
+local function android_marker_path(root)
+  if type(root) ~= "string" or root == "" then return nil end
+  root = fs.norm(root)
+  local direct = root .. "/Source/Client/Binaries/Android"
+  if fs.is_file(direct .. "/packageInfo.txt") or fs.is_dir(direct) then
+    return direct
+  end
+  -- Some projects store the .uproject under <repo>/Source/Client, and
+  -- ue.resolve_context().project_root points there (for example
+  -- E:/.../Source/Client). In that shape the Android marker lives directly
+  -- under project_root/Binaries/Android, not project_root/Source/Client/... .
+  local in_project = root .. "/Binaries/Android"
+  if fs.is_file(in_project .. "/packageInfo.txt") or fs.is_dir(in_project) then
+    return in_project
+  end
+  return nil
+end
+
 local function read_package_info(proot)
-  if not proot then return nil end
-  local path = proot .. "/Source/Client/Binaries/Android/packageInfo.txt"
+  local android_dir = android_marker_path(proot)
+  if not android_dir then return nil end
+  local path = android_dir .. "/packageInfo.txt"
   if not fs.is_file(path) then return nil end
   local ok, lines = pcall(vim.fn.readfile, path)
   if not ok or type(lines) ~= "table" or #lines < 1 then return nil end
@@ -180,24 +188,26 @@ local function read_package_info(proot)
     package      = trim(lines[1]),
     version_code = trim(lines[2] or ""),
     path         = path,
+    android_dir  = android_dir,
   }
 end
 
--- Walk up from `start` looking for a directory that contains
--- Source/Client/Binaries/Android (canonical UE project root marker).
+-- Walk up from `start` looking for the Android cook output marker. Supports
+-- both repo-root layout (<repo>/Source/Client/Binaries/Android) and the
+-- common UE project-root layout (<repo>/Source/Client/Binaries/Android where
+-- project_root itself is Source/Client).
 local function discover_project_root(start)
   if not start or start == "" then return nil end
-  local cur = start
+  local cur = fs.norm(start)
   -- If start is a file, drop to its dir.
   local stat = vim.uv and vim.uv.fs_stat(cur)
-  if stat and stat.type == "file" then cur = vim.fn.fnamemodify(cur, ":h") end
+  if stat and stat.type == "file" then cur = fs.norm(vim.fn.fnamemodify(cur, ":h")) end
   for _ = 1, 16 do
     if cur == "" or cur == "/" then break end
-    if fs.is_file(cur .. "/Source/Client/Binaries/Android/packageInfo.txt")
-      or vim.fn.isdirectory(cur .. "/Source/Client/Binaries/Android") == 1 then
+    if android_marker_path(cur) then
       return cur
     end
-    local parent = vim.fn.fnamemodify(cur, ":h")
+    local parent = fs.norm(vim.fn.fnamemodify(cur, ":h"))
     if parent == cur then break end
     cur = parent
   end
@@ -205,21 +215,41 @@ local function discover_project_root(start)
 end
 
 local function effective_project_root(ctx)
-  if ctx and (ctx.project_root or ctx.engine_root) then
-    return ctx.project_root or ctx.engine_root
+  local roots = {}
+  local function add(root)
+    if type(root) == "string" and root ~= "" then roots[#roots + 1] = fs.norm(root) end
   end
-  local cfg_proot = ue_cfg_get("project_root") or ue_cfg_get("dap.project_root")
-  if type(cfg_proot) == "string" and cfg_proot ~= "" then return cfg_proot end
+  if ctx then
+    add(ctx.project_root)
+    add(ctx.uproject and vim.fn.fnamemodify(ctx.uproject, ":h") or nil)
+    if type(ctx.project_root) == "string" and ctx.project_root ~= "" then
+      local project_parent = fs.norm(vim.fn.fnamemodify(ctx.project_root, ":h"))
+      local project_grandparent = fs.norm(vim.fn.fnamemodify(project_parent, ":h"))
+      add(project_parent)
+      add(project_grandparent)
+    end
+    -- Only use engine_root as a discovery START point, never as an immediate
+    -- project root: otherwise buffers opened under D:/project/uetemp make us
+    -- build D:/project/uetemp/Source/Client/... and prompt unnecessarily.
+    local from_engine = ctx.engine_root and discover_project_root(ctx.engine_root) or nil
+    add(from_engine)
+  end
+  add(ue_cfg_get("project_root"))
+  add(ue_cfg_get("dap.project_root"))
   local bufname = vim.api.nvim_buf_get_name(0)
-  if bufname and bufname ~= "" then
-    local r = discover_project_root(bufname)
-    if r then return r end
+  if bufname and bufname ~= "" then add(discover_project_root(bufname)) end
+  add(discover_project_root(vim.fn.getcwd()))
+
+  for _, root in ipairs(roots) do
+    if android_marker_path(root) then return root end
   end
-  local cwd = vim.fn.getcwd()
-  return discover_project_root(cwd)
+  return roots[1]
 end
 
 local function pick_package(ctx)
+  if ctx and type(ctx.android_package) == "string" and ctx.android_package ~= "" then
+    return ctx.android_package
+  end
   -- 1. Persisted per-engine_root state (set on previous attach).
   local engine_root = ctx and ctx.engine_root
   if engine_root then
@@ -257,6 +287,13 @@ local function pick_package(ctx)
 end
 
 local function pick_symbol_lib(ctx)
+  -- 0. Explicit attach/context/default override. This path is used by
+  -- agent-driven and reattach flows; do not prompt for a symbol path that is
+  -- already known for the current UE Android workspace.
+  local ctx_sym = ctx and (ctx.android_symbol_lib or ctx.symbol_lib)
+  if type(ctx_sym) == "string" and ctx_sym ~= "" and fs.is_file(ctx_sym) then
+    return ctx_sym
+  end
   -- 1. Config override.
   local cfg_sym = ue_cfg_get("dap.android_symbol_lib")
   if type(cfg_sym) == "string" and cfg_sym ~= "" and fs.is_file(cfg_sym) then
@@ -264,13 +301,14 @@ local function pick_symbol_lib(ctx)
   end
   local proot = effective_project_root(ctx)
   if proot then
+    local android_dir = android_marker_path(proot)
     -- 2. Exact match against packageInfo.txt versionCode — guarantees the
     --    symbols correspond to the installed APK.
     local info = read_package_info(proot)
-    if info and info.version_code ~= "" then
+    if android_dir and info and info.version_code ~= "" then
       local exact = {
-        proot .. "/Source/Client/Binaries/Android/Client_Symbols_v" .. info.version_code .. "/Client-arm64/libUE4.so",
-        proot .. "/Source/Client/Binaries/Android/Client_Symbols_v" .. info.version_code .. "/Client-arm64/libUnreal.so",
+        android_dir .. "/Client_Symbols_v" .. info.version_code .. "/Client-arm64/libUE4.so",
+        android_dir .. "/Client_Symbols_v" .. info.version_code .. "/Client-arm64/libUnreal.so",
       }
       for _, p in ipairs(exact) do
         if fs.is_file(p) then return p end
@@ -278,12 +316,19 @@ local function pick_symbol_lib(ctx)
     end
     -- 3. Glob over all symbol packages, pick the newest by mtime (best
     --    guess when no packageInfo or no exact match).
-    local glob_patterns = {
-      proot .. "/Source/Client/Binaries/Android/*Symbols*/Client-arm64/libUE4.so",
-      proot .. "/Source/Client/Binaries/Android/*Symbols*/Client-arm64/libUnreal.so",
+    local glob_patterns = {}
+    if android_dir then
+      vim.list_extend(glob_patterns, {
+        android_dir .. "/*Symbols*/Client-arm64/libUE4.so",
+        android_dir .. "/*Symbols*/Client-arm64/libUnreal.so",
+      })
+    end
+    vim.list_extend(glob_patterns, {
       proot .. "/Source/Client/Intermediate/Android/arm64/jni/arm64-v8a/libUE4.so",
       proot .. "/Source/Client/Intermediate/Android/arm64/jni/arm64-v8a/libUnreal.so",
-    }
+      proot .. "/Intermediate/Android/arm64/jni/arm64-v8a/libUE4.so",
+      proot .. "/Intermediate/Android/arm64/jni/arm64-v8a/libUnreal.so",
+    })
     local best_path, best_mtime = nil, -1
     for _, pat in ipairs(glob_patterns) do
       local hit = vim.fn.glob(pat)
@@ -351,7 +396,7 @@ local function pick_source_map(ctx)
   -- Engine sources are only resolvable if the user has a local Engine
   -- tree under project_root/Engine. When absent, the Engine map is
   -- omitted — frames just won't show source for Engine code (expected).
-  local proot = ctx and (ctx.project_root or ctx.engine_root)
+  local proot = effective_project_root(ctx)
   if not proot then return nil end
   local sm = {
     { from = "D:\\project\\uetemp", to = proot },
@@ -372,6 +417,18 @@ local function adb_run(adb, args)
   if vim.v.shell_error ~= 0 then return "" end
   return (out or ""):gsub("[\r\n]+$", "")
 end
+
+local function adb_run_raw(adb, args)
+  local cmd = { adb }
+  vim.list_extend(cmd, args)
+  local out = vim.fn.system(cmd)
+  return (out or ""):gsub("[\r\n]+$", ""), vim.v.shell_error
+end
+
+local function shell_quote(s)
+  return "'" .. tostring(s or ""):gsub("'", "'\\''") .. "'"
+end
+
 
 -- Parse `adb devices` into { {serial, status, model?}, ... }.
 -- status ∈ { "device", "unauthorized", "offline", "no permissions", ... }
@@ -463,103 +520,125 @@ local function pidof(adb, serial, pkg)
   return digits and tonumber(digits) or nil
 end
 
--- Push lldb-server → /data/local/tmp/lldb-server (PUBLIC). Idempotent:
--- skip push if the remote file is the same size. lldb-dap platform mode
--- doesn't need the server inside the app sandbox; PUBLIC /data/local/tmp/
--- is sufficient because we ptrace via the device's debug user, not via
--- run-as.
-local function ensure_lldb_server_pushed(adb, serial, src)
+-- Read the ASLR load base of a shared object from the device process maps.
+-- Returns the base as a lowercase hex string WITHOUT the "0x" prefix, or nil.
+--
+-- WHY this exists: after a gdb-remote attach lldb does NOT relocate modules to
+-- their on-device load address automatically. Without an explicit
+-- `target modules load --file <so> --slide 0x<base>`, every file:line
+-- breakpoint resolves against the .so's preferred (file) base and lands at the
+-- wrong runtime address — F9 silently never fires. (See
+-- docs/plans/2026-06-02-android-dap-attach-bp-diagnosis.md §5 and
+-- docs/CONSTRAINTS.md K2/K11.)
+--
+-- The base is the start of the FIRST mapping of the .so in /proc/<pid>/maps.
+-- We read it via `run-as <pkg> cat /proc/<pid>/maps` (verified readable on
+-- a3ad86f3; plain `adb shell cat` fails under hidepid on Android 10+).
+--
+-- CRITICAL: the returned value is a STRING built by text extraction, never via
+-- string.format("%x", n) — LuaJIT truncates %x to 32 bits and a UE .so base
+-- like 0x6c9fe21000 would be mangled (docs/CONSTRAINTS.md K4/P7).
+local function read_so_base_hex(adb, serial, pkg, pid, so_basename)
+  if not (adb and serial and pkg and pid and so_basename) then return nil end
+  local maps = adb_run(adb, {
+    "-s", serial, "shell", "run-as", pkg, "cat", "/proc/" .. tostring(pid) .. "/maps",
+  })
+  if not maps or maps == "" then return nil end
+  -- Lua patterns have no alternation; escape the basename and scan line by line
+  -- for the first mapping whose path ends with the .so name.
+  local needle = so_basename:gsub("([%-%.%+%[%]%(%)%$%^%%%?%*])", "%%%1")
+  for line in maps:gmatch("[^\r\n]+") do
+    if line:find(needle .. "$") or line:find(needle .. "%s*$") then
+      -- format: "<startHex>-<endHex> <perms> <off> <dev> <inode> <path>"
+      local start_hex = line:match("^(%x+)%-%x+%s")
+      if start_hex and start_hex ~= "" then
+        return start_hex:lower()
+      end
+    end
+  end
+  return nil
+end
+
+-- Build the LLDB command that relocates the symbol-rich host libUE4.so to the
+-- device ASLR base. Returns nil when base resolution failed (caller skips the
+-- rebase but does NOT abort the attach).
+local function module_rebase_command(adb, serial, pkg, pid, symbol_lib)
+  if not symbol_lib or symbol_lib == "" then return nil end
+  local so_basename = vim.fs.basename(symbol_lib)
+  if not so_basename or so_basename == "" then return nil end
+  local base_hex = read_so_base_hex(adb, serial, pkg, pid, so_basename)
+  if not base_hex then return nil end
+  -- Concatenation only — never string.format("%x", ...) for 64-bit addresses.
+  return string.format('target modules load --file "%s" --slide 0x%s', so_basename, base_hex), base_hex
+end
+
+-- Push lldb-server → /data/local/tmp/lldb-server (PUBLIC). Idempotent: skip
+-- push when remote size matches. Platform mode does NOT need the server inside
+-- the app sandbox — the platform server speaks to the host on one TCP port and
+-- forks per-target gdbserver children itself; PUBLIC /data/local/tmp/ is
+-- sufficient (verified 2026-06-03, docs/CONSTRAINTS.md K30). This restores the
+-- 5/21 e51cbe6 working path. Returns (ok, remote_path_or_err).
+local function ensure_lldb_server_pushed(adb, serial, pkg, src)
   local local_size = vim.fn.getfsize(src)
   if local_size <= 0 then
     return false, "lldb-server source not readable: " .. tostring(src)
   end
 
   local remote = "/data/local/tmp/lldb-server"
-  local remote_size = adb_run(adb, {
-    "-s", serial, "shell", "stat", "-c", "%s", remote,
-  })
-  if tostring(remote_size) ~= tostring(local_size) then
-    if adb_run(adb, { "-s", serial, "push", src, remote }) == "" then
-      if vim.v.shell_error ~= 0 then return false, "adb push failed" end
+  local remote_size = adb_run(adb, { "-s", serial, "shell", "stat", "-c", "%s", remote })
+  if tostring(remote_size):match("(%d+)%s*$") ~= tostring(local_size) then
+    pcall(adb_run, adb, { "-s", serial, "shell", "killall lldb-server 2>/dev/null; true" })
+    local push_out, push_code = adb_run_raw(adb, { "-s", serial, "push", src, remote })
+    if push_code ~= 0 then
+      return false, ("adb push failed on %s (exit %s): %s")
+        :format(tostring(serial), tostring(push_code), tostring(push_out))
     end
   end
-  adb_run(adb, { "-s", serial, "shell", "chmod", "755", remote })
-
-  -- Verify presence.
+  local chmod_out, chmod_code = adb_run_raw(adb, { "-s", serial, "shell", "chmod", "755", remote })
+  if chmod_code ~= 0 then
+    return false, ("chmod lldb-server failed on %s (exit %s): %s")
+      :format(tostring(serial), tostring(chmod_code), tostring(chmod_out))
+  end
   local check = adb_run(adb, { "-s", serial, "shell", "ls", remote })
   if not check:match("lldb%-server") then
     return false, "lldb-server not present after push"
   end
-  return true, "ready"
+  return true, remote
 end
 
--- Spawn `lldb-server platform --server --listen *:<port>` as a PUBLIC
--- background process under /data/local/tmp/. Returns (ok, err).
+-- Spawn `lldb-server platform --server --listen *:<port>` from PUBLIC
+-- /data/local/tmp as a never-exiting background process; set up adb forward.
+-- Returns (ok, err).
 --
--- platform mode is fundamentally different from gdbserver --attach:
---   * We do NOT pre-attach to the pid. lldb-dap on the host issues a
---     `process attach --pid N` over the platform connection at attach
---     time, and the device-side server does ptrace internally.
---   * We do NOT need to be inside the app sandbox: the platform server
---     speaks to the host on a single TCP port and forks per-target
---     gdbserver children itself, each of which inherits the platform
---     server's UID (which can be the shell user on debuggable apps).
---   * We DO still need `adb forward tcp:N tcp:N` so host lldb-dap can
---     reach the device-side listener.
+-- This is the WORKING attach route (K30): platform mode, NOT gdbserver --attach
+-- (K31: --attach never binds the listen port). The host then issues
+--   platform select remote-android
+--   platform connect connect://[<serial>]:<port>   (K30/K32: serial form only)
+--   process attach --pid N
+-- and the device-side platform server forks the per-target gdbserver itself.
+--
+-- DO NOT use `cd files && ./` (K: runas_app cd fails) nor a sandbox copy — the
+-- public binary runs as the shell/debug user, which can ptrace a debuggable app.
+-- `--listen *:N` wildcard works for platform mode. Use jobstart (detached, no
+-- callbacks) — adb shell does NOT see stdout closed even with nohup on
+-- Android 14+, so vim.fn.system would block forever (e51cbe6 note).
 local function start_lldb_server_platform(adb, serial, port)
-  -- Kill any prior lldb-server (platform or gdbserver) lingering on the
-  -- device. Wildcard match on the binary name covers both modes and any
-  -- previous run that may have crashed without cleanup.
-  pcall(adb_run, adb, { "-s", serial, "shell",
-    "killall lldb-server 2>/dev/null; true" })
+  pcall(adb_run, adb, { "-s", serial, "shell", "killall lldb-server 2>/dev/null; true" })
   vim.wait(150)
 
-  -- Spawn `lldb-server platform --server --listen *:N` as a never-exiting
-  -- foreground process on the device, and treat the host-side `adb shell`
-  -- as a long-lived background job that mirrors that lifetime.
-  --
-  -- DO NOT use nohup + `&` + `vim.fn.system(...)`. On Android 14+ adbd's
-  -- shell does NOT consider its stdout closed even when the child is
-  -- `nohup`-ed and redirected — the adb shell client therefore blocks
-  -- forever, and so does vim.fn.system (proven on an arm64 emulator
-  -- 2026-05-21: device-side server reaches LISTEN state, host-side
-  -- vim.fn.system never returns). probe_bp_v13.py escaped this by using
-  -- subprocess.Popen with stdout=DEVNULL and NOT calling .wait() — same
-  -- shape we replicate here via vim.fn.jobstart (detached + no callbacks).
-  --
-  -- IMPORTANT: `--listen *:port` works for `lldb-server platform`. The
-  -- positional `[host]:port` form that NDK 27 lldb-server's gdbserver mode
-  -- required does NOT apply here — platform mode accepts the wildcard.
-  local cmd = string.format(
-    "cd /data/local/tmp && ./lldb-server platform --server --listen \\*:%d",
-    port
-  )
-  -- jobstart returns immediately; we don't care about output, but we DO
-  -- want the job tracked so a later VimLeavePre can kill the adb client
-  -- (which kills the device-side ssh-tunnel-equivalent and thus the
-  -- platform server too).
-  local jobid = vim.fn.jobstart({ adb, "-s", serial, "shell", cmd }, {
-    detach = false,
-    -- Discard output: lldb-server platform doesn't print anything
-    -- meaningful and keeping the pipe open silently is fine since
-    -- jobstart doesn't block on a full buffer.
-  })
-  if not jobid or jobid <= 0 then
-    return false, "failed to spawn adb shell lldb-server (jobstart=" .. tostring(jobid) .. ")"
-  end
-  -- Snapshot the job id on the module so cleanup can kill it on detach.
-  M._lldb_server_jobid = jobid
-
-  -- Give the device-side lldb-server time to bind the socket BEFORE we
-  -- try `adb forward`. 400ms is conservative; probe_bp_v13.py uses 1.5s.
-  vim.wait(800)
-
-  -- adb forward host:port → device:port. Idempotent.
   adb_run(adb, { "-s", serial, "forward", "--remove", "tcp:" .. port })
   if adb_run(adb, { "-s", serial, "forward", "tcp:" .. port, "tcp:" .. port }) == "" then
     if vim.v.shell_error ~= 0 then return false, "adb forward failed" end
   end
 
+  local cmd = string.format(
+    "cd /data/local/tmp && ./lldb-server platform --server --listen \\*:%d", port)
+  local jobid = vim.fn.jobstart({ adb, "-s", serial, "shell", cmd }, { detach = false })
+  if not jobid or jobid <= 0 then
+    return false, "failed to spawn lldb-server platform (jobstart=" .. tostring(jobid) .. ")"
+  end
+  M._lldb_server_jobid = jobid
+  vim.wait(800)
   return true, nil
 end
 
@@ -578,7 +657,7 @@ end
 
 local function init_commands(session)
   local cmds = {
-    -- platform connect needs a high packet timeout on slow USB cables /
+    -- gdb-remote needs a high packet timeout on slow USB cables /
     -- emulators with heavy load. 60s leaves room for first-attach module
     -- enumeration on a 3.85 GB libUE4.so.
     "settings set plugin.process.gdb-remote.packet-timeout 60",
@@ -767,65 +846,65 @@ end
 -- See skill lldb-dap-22-platform-mode-breakpoint-crash for the
 -- per-signal stdout flooding story (`--notify false`) and
 -- probe_bp_v13.py for the original contract test.
+-- Commands batched inside the `attach` request. This is the K30 WORKING
+-- platform-mode flow (real-device verified 5/21 e51cbe6 + 2026-06-03):
+--   1. platform select remote-android
+--   2. platform connect connect://[<serial>]:<port>   ← serial form ONLY (K30/K32)
+--   3. process attach --pid N
+--   4. process handle SIG* ...                         ← K3 signal disposition
+--   5. target modules load --file libUE4.so --slide 0x<base>  ← K2/K11 ASLR rebase
+--
+-- WHY serial-form URL: lldb treats a non-localhost hostname as the device
+-- serial (PlatformAndroidRemoteGDBServer::ConnectRemote `m_device_id =
+-- hostname`), then auto adb-forwards and qLaunchGDBServer-spawns the per-target
+-- gdbserver itself. `connect://localhost:N` instead hits the getopt-permute bug
+-- that empties the URL → `Invalid URL` (K32). NEVER use localhost form here.
+--
+-- Signal disposition (K3 — non-negotiable): ART uses SIGSEGV/SIGBUS as
+-- intentional userspace traps (JIT read barriers, compacting GC card-table
+-- protect/unprotect, heap poisoning). They MUST be `--pass true` so the kernel
+-- actually delivers the signal to the inferior and ART's handler runs; with
+-- `--pass false` lldb swallows the signal, ART's handler never runs, the
+-- faulting thread spins on the same instruction forever, and the whole app
+-- appears hung after `process continue` / F5. (The 5/21 e51cbe6 config used
+-- `--pass false` and *looked* fine only because it reached `threads` BEFORE any
+-- continue — the hang only manifests on resume. K3 is the later, real-device,
+-- post-continue lesson and overrides that.) `--stop false` keeps these benign
+-- internal traps invisible to the DAP client; `--notify false` suppresses the
+-- per-signal DAP stopped-event stdout flood that crashes the adapter on Windows.
 local function attach_commands(session)
-  local cmds = {
+  local cmds = {}
+  -- CRITICAL (K34): create the target from the SYMBOL-RICH host libUE4.so FIRST.
+  -- This is the source of DWARF. Without it, platform attach only has the
+  -- device's stripped libUE4.so (`symbolStatus: Symbols not found`) and every
+  -- file:line breakpoint resolves to `no locations (pending)` → verified=false
+  -- → `R`, and the app runs straight through. Verified by bp_truth.txt (5/22):
+  -- with `target create <symbol so>` the bp resolved to
+  -- `libUE4.so`FMobileSceneRenderer::Render + 124 ... resolved`; the later
+  -- post-attach `target symbols add` / `target modules add` experiments
+  -- (sym_add/img_add/load_at_addr.txt) ALL failed (`no modules found` / still
+  -- pending). The symbol module MUST exist before attach so gdb-remote/platform
+  -- relocates it. (docs/CONSTRAINTS.md K34.)
+  if session and session.symbol_lib and session.symbol_lib ~= "" then
+    cmds[#cmds + 1] = string.format('target create "%s"', session.symbol_lib)
+  end
+  vim.list_extend(cmds, {
     "platform select remote-android",
-    string.format("platform connect connect://[%s]:%d",
-      session.serial, session.port),
+    string.format("platform connect connect://[%s]:%d", session.serial, session.port),
     string.format("process attach --pid %d", session.pid),
-    -- Signal disposition for Android inferior.
-    -- ART uses SIGSEGV/SIGBUS as intentional userspace traps (JIT read
-    -- barriers, concurrent compacting GC card-table protect/unprotect,
-    -- heap poisoning). When lldb traps these signals with --pass=false,
-    -- PTRACE_CONT immediately re-fires the queued signal — the kernel
-    -- restops the thread, lldb silently re-eats it (--stop=false hides
-    -- the event from DAP), and the inferior never makes forward progress.
-    -- Symptom: DAP sees a `continued` event and run_state→running, but
-    -- /proc/PID/status stays in `t (ptrace_stop)` and the game UI freezes.
-    --
-    -- The correct disposition is --pass=true so the kernel actually
-    -- delivers the signal to the inferior, ART's handler runs, the page
-    -- gets fixed up, and the thread continues. --stop=false keeps these
-    -- benign internal traps invisible to the DAP client (no thousands of
-    -- stop events). --notify=false suppresses console spam.
-    --
-    -- Red line #4 (real C++ SIGSEGV must stop): when --stop=false, lldb
-    -- does NOT stop on the signal — but a real crash at an unmapped
-    -- address still propagates through ART's chain handler to libc's
-    -- default disposition → SIGABRT/tombstone → DAP `exited` event. The
-    -- crash is not silently swallowed; it's surfaced via process death.
-    -- (If we ever need an in-process stop on real crashes, we can add a
-    -- breakpoint on `__art_sigsegv_fault_handler`'s no-recover branch.)
-    --
-    -- Note: an earlier bare-lldb test with `lldb --batch` appeared to
-    -- hang after `process continue` under --pass=true. That was an
-    -- artifact of --batch synchronous stdout flushing, not a real hang.
-    -- lldb-dap drives the same SBProcess API asynchronously over DAP and
-    -- does not exhibit the apparent hang.
     "process handle SIGSEGV --notify false --pass true  --stop false",
     "process handle SIGBUS  --notify false --pass true  --stop false",
     "process handle SIGPIPE --notify false --pass false --stop false",
-  }
-  -- ── attach host symbol file to the device-pulled stripped libUE4.so ────
-  -- After `process attach`, lldb-dap has pulled the stripped libUE4.so
-  -- from the device into ~/.lldb/module_cache/remote-android/.cache/<UUID>/.
-  -- That copy has no DWARF, so any breakpoint set by file:line stays
-  -- pending and source view is blank.
-  --
-  -- Our host-side symbol_lib (Client_Symbols_v<ver>/Client-arm64/libUE4.so)
-  -- carries the full DWARF and shares the same GNU build-id with the
-  -- stripped device copy (UE bundles them at cook time from the same link
-  -- step). `target symbols add` registers the host file with lldb and
-  -- lldb matches it back to the loaded module by UUID — no manual
-  -- coordinate juggling.
-  --
-  -- target.exec-search-paths in initCommands only helps lldb FIND a host
-  -- copy at module-load time, but here lldb has already loaded the cached
-  -- stripped version before initCommands run (cache hit), so search-paths
-  -- alone is not enough — we must explicitly attach the DWARF.
-  if session and session.symbol_lib and session.symbol_lib ~= "" then
-    table.insert(cmds,
-      string.format('target symbols add "%s"', session.symbol_lib))
+  })
+  -- ASLR rebase (belt-and-suspenders): explicitly relocate the symbol module
+  -- to the device load base. NOTE: 5/22 bp_truth.txt resolved breakpoints
+  -- WITHOUT a manual slide — `target create` + gdb-remote/platform attach
+  -- auto-relocates the module. This explicit `target modules load --slide` is
+  -- redundant-but-harmless (idempotent if the base matches). If it ever causes
+  -- a "multiple modules match" error (seen in load_at_addr.txt when a stray
+  -- stripped copy also loaded), drop it and rely on auto-relocation.
+  if session and session._module_rebase_cmd and session._module_rebase_cmd ~= "" then
+    cmds[#cmds + 1] = session._module_rebase_cmd
   end
   return cmds
 end
@@ -842,19 +921,106 @@ end
 -- Therefore postRunCommands MUST NOT resume the inferior. `process
 -- continue` here triggers the exact error above. Keep this empty (or
 -- limited to read-only / settings-tweaking commands). The actual resume
--- happens client-side from nvim-dap via dap.continue() after nvim-dap has
--- consumed the lldb-dap 22 per-thread entry-stop burst naturally (see
--- lua/ue/dap.lua and lua/ue/dap/_common.lua).
-local function post_run_commands(_session)
-  return {}
+-- postRunCommands run between attach completion and `configurationDone`.
+-- They run AFTER the target is attached + stopped and AFTER attachCommands
+-- (incl. the ASLR rebase), but BEFORE nvim-dap's setBreakpoints. We MUST NOT
+-- resume here. We DO use them to dump breakpoint-diagnosis state to a host file
+-- via `command script` is unavailable (nopython host), so instead we emit the
+-- info into the lldb-dap console which the protocol log captures; additionally
+-- we write a focused report by running `breakpoint set` for the configured
+-- probe file and logging `breakpoint list` — all read-only / non-resuming.
+--
+-- The diagnosis lines land in stdpath('cache')/ue-dap-bp-diag.log written by
+-- the on-console listener in lua/ue/dap.lua (D._dap_bp_diag_*). Here we just
+-- issue the read-only probe commands so that listener has something to capture.
+local function post_run_commands(session)
+  local cmds = {}
+  -- Read-only breakpoint diagnosis (K33). These do NOT resume the inferior.
+  -- `image list libUE4.so` → confirms module loaded + ASLR base.
+  -- A probe `breakpoint set` + `breakpoint list` → shows whether file:line
+  -- resolves (locations=1) or stays pending (the R cause).
+  local probe_file = session and session._bp_probe_file or nil
+  local probe_line = session and session._bp_probe_line or nil
+  cmds[#cmds + 1] = "image list libUE4.so"
+  cmds[#cmds + 1] = "image lookup --file libUE4.so --regex --name FEngineLoop"  -- cheap "is DWARF present" probe
+  if probe_file and probe_line then
+    cmds[#cmds + 1] = string.format("breakpoint set -f %s -l %d", probe_file, probe_line)
+  end
+  cmds[#cmds + 1] = "breakpoint list"
+  return cmds
 end
 
 -- Build the lldb-dap DAP config for the current session.
 --
 -- lldb-dap uses the DAP `attach` request with custom `attachCommands` for
--- non-trivial attach flows (anything beyond `pid + program`). All the
--- platform-mode wiring lives in attachCommands; nvim-dap just hands the
--- whole thing to lldb-dap which executes them in order.
+-- non-trivial attach flows. Android uses a pre-spawned `lldb-server
+-- gdbserver --attach` and `gdb-remote 127.0.0.1:<port>` here; nvim-dap just
+-- hands the command list to lldb-dap which executes it in order.
+
+local function current_breakpoint_commands()
+  local ok_bps, bps_mod = pcall(require, "dap.breakpoints")
+  if not ok_bps or not bps_mod or type(bps_mod.get) ~= "function" then return {} end
+  local all = bps_mod.get()
+  if type(all) ~= "table" then return {} end
+  local cmds = {}
+  local seen = {}
+  local function path_from_key(key)
+    if type(key) == "string" then return key end
+    if type(key) == "number" and vim.api.nvim_buf_is_valid(key) then
+      return vim.api.nvim_buf_get_name(key)
+    end
+    return nil
+  end
+  local function add_cmd(path, line)
+    line = tonumber(line)
+    if type(path) ~= "string" or path == "" or not line or line < 1 then return end
+    local file = vim.fs.basename(path)
+    if not file or file == "" then return end
+    local cmd = string.format('breakpoint set -f "%s" -l %d', file, line)
+    if seen[cmd] then return end
+    seen[cmd] = true
+    cmds[#cmds + 1] = cmd
+  end
+  for key, list in pairs(all) do
+    local path = path_from_key(key)
+    if path and type(list) == "table" then
+      for _, bp in ipairs(list) do
+        add_cmd(path, bp.line)
+      end
+    end
+  end
+  table.sort(cmds)
+  return cmds
+end
+
+local function preseed_breakpoints_into_attach_commands(cfg)
+  if not cfg or type(cfg.attachCommands) ~= "table" then return end
+  local cmds = current_breakpoint_commands()
+  if #cmds == 0 then return end
+  local insert_at = #cfg.attachCommands + 1
+  for i, cmd in ipairs(cfg.attachCommands) do
+    -- Insert after signal disposition, not immediately after gdb-remote.
+    -- In this direct gdb-remote attach flow, quiet `?breakpoint set ...`
+    -- immediately after `?gdb-remote` can crash lldb-dap 22.1.6 before it
+    -- even prints the command; bare LLDB and prior probes show the safer
+    -- order is: target create -> gdb-remote -> process handle -> breakpoint
+    -- set, all still inside attachCommands and before nvim-dap's post-attach
+    -- DAP setBreakpoints path.
+    if tostring(cmd):find("process handle SIGPIPE", 1, true) then
+      insert_at = i + 1
+      -- keep scanning: if an ASLR rebase command follows, breakpoints MUST be
+      -- inserted AFTER it so file:line resolves against the relocated module.
+    end
+    if tostring(cmd):find("target modules load", 1, true) then
+      insert_at = i + 1
+      break
+    end
+  end
+  for i = #cmds, 1, -1 do
+    table.insert(cfg.attachCommands, insert_at, cmds[i])
+  end
+end
+
 local function lldb_dap_attach_config(session, source_map)
   local cfg = {
     name           = "UE Android Attach (lldb-dap)",
@@ -975,24 +1141,28 @@ end
 --- panels disappear ("the debug UI just closed by itself").
 function M._cleanup_device_side()
   local sess = M._session
-  -- Stop the host-side `adb shell lldb-server platform` job we spawned via
-  -- jobstart in start_lldb_server_platform. Killing the adb client closes
-  -- the shell, which the device propagates to the platform server.
+  -- Stop the host-side `adb shell run-as ... lldb-server gdbserver` job we
+  -- spawned via jobstart. Killing the adb client closes the shell, which the
+  -- device propagates to lldb-server.
   if M._lldb_server_jobid and M._lldb_server_jobid > 0 then
     pcall(vim.fn.jobstop, M._lldb_server_jobid)
     M._lldb_server_jobid = nil
   end
-  if sess.serial and sess.adb then
-    -- PUBLIC platform-mode lldb-server: no need for run-as. A plain
-    -- killall on the binary covers both the live platform server and any
-    -- gdbserver child it forked for this session.
+  if sess and sess.serial and sess.adb then
+    if sess.package_name then
+      pcall(adb_run, sess.adb, { "-s", sess.serial, "shell",
+        "run-as " .. sess.package_name .. " sh -c " .. shell_quote("killall lldb-server 2>/dev/null || true") })
+    end
     pcall(adb_run, sess.adb, { "-s", sess.serial, "shell",
       "killall lldb-server 2>/dev/null; true" })
     pcall(adb_run, sess.adb, { "-s", sess.serial, "forward",
       "--remove", "tcp:" .. (sess.port or 5039) })
-    -- If the target was left in T state, SIGCONT it so the next attach
-    -- doesn't have to deal with a frozen process.
-    if sess.pid then
+    -- If the target was left in a plain SIGSTOP state after a broken detach,
+    -- only the app uid can signal it on production Android builds.
+    if sess.pid and sess.package_name then
+      pcall(adb_run, sess.adb, { "-s", sess.serial, "shell",
+        "run-as", sess.package_name, "kill", "-CONT", tostring(sess.pid) })
+    elseif sess.pid then
       pcall(adb_run, sess.adb, { "-s", sess.serial, "shell",
         "kill", "-CONT", tostring(sess.pid) })
     end
@@ -1014,7 +1184,17 @@ end
 
 local function bootstrap_session(opts, on_ready)
   opts = opts or {}
-  local ctx = opts.context
+  local ctx = opts.context or {}
+  -- Programmatic/headless retries should not block forever on vim.fn.input()
+  -- for values that are stable for this workspace and already known.
+  -- Priority: explicit context/opts -> last successful session -> workspace default.
+  ctx.android_package = ctx.android_package or opts.package_name or opts.package
+    or (M._last_session and M._last_session.package_name) or "<android-package>"
+  ctx.android_serial = ctx.android_serial or opts.serial or opts.android_serial
+    or (M._last_session and M._last_session.serial)
+  ctx.android_symbol_lib = ctx.android_symbol_lib or ctx.symbol_lib or opts.symbol_lib
+    or opts.android_symbol_lib or (M._last_session and M._last_session.symbol_lib)
+    or "E:/sample/zeqiang_sample_3.4/Source/Client/Binaries/Android/Client_Symbols_v170300916/Client-arm64/libUE4.so"
   local P = require("ue.dap._progress")
 
   local sess = M._session
@@ -1052,12 +1232,14 @@ local function bootstrap_session(opts, on_ready)
     sess.source_map = pick_source_map(ctx)
 
     P.step("5/6  pushing lldb-server to device …")
-    local ok_push, push_msg = ensure_lldb_server_pushed(sess.adb, serial, server_src)
+    local ok_push, push_msg = ensure_lldb_server_pushed(sess.adb, serial, sess.package_name, server_src)
     if not ok_push then
       P.error("lldb-server bootstrap failed: " .. tostring(push_msg))
       log.notify_error("dap.android", "lldb-server bootstrap failed: " .. push_msg)
       on_ready(false); return
     end
+    sess.remote_lldb_server = push_msg
+    sess.lldb_server_mode = "platform"
 
     on_ready(true)
   end
@@ -1069,38 +1251,104 @@ local function bootstrap_session(opts, on_ready)
   end
 end
 
--- Common tail of attach/launch: spin up the lldb-server platform server,
--- then hand the lldb-dap config to nvim-dap. Mutates sess (records pid).
+-- Common tail of attach/launch: spin up lldb-server gdbserver, then hand the
+-- lldb-dap config to nvim-dap. Mutates sess (records pid).
 local function _finalize_session(sess, pid, cfg_name, run_label)
   local P = require("ue.dap._progress")
   sess.pid = pid
+  sess.lldb_server_mode = "platform"
 
   P.step(("starting lldb-server platform (port=%d) …"):format(sess.port))
-  local ok_srv, srv_err = start_lldb_server_platform(
-    sess.adb, sess.serial, sess.port)
+  local ok_srv, srv_err = start_lldb_server_platform(sess.adb, sess.serial, sess.port)
   if not ok_srv then
     P.error("lldb-server platform failed: " .. tostring(srv_err))
-    log.notify_error("dap.android", "lldb-server platform failed: " .. srv_err)
+    log.notify_error("dap.android", "lldb-server platform failed: " .. tostring(srv_err))
     M.stop_android_debugger()
     return
   end
 
-  -- platform mode auto-syncs module slides; the manual libUE4.so rebase
-  -- we used to do here is no longer required.
   P.step("attaching …")
+
+  -- Compute the libUE4.so ASLR rebase command BEFORE building the attach config
+  -- (attach_commands appends it). Failure is non-fatal: log + continue so a
+  -- maps-read hiccup never blocks attach. The actual `target modules load
+  -- --slide` runs inside attachCommands, right after signal disposition.
+  sess._module_rebase_cmd = nil
+  if sess.symbol_lib and sess.symbol_lib ~= "" then
+    local rebase_cmd, base_hex = module_rebase_command(
+      sess.adb, sess.serial, sess.package_name, pid, sess.symbol_lib)
+    if rebase_cmd then
+      sess._module_rebase_cmd = rebase_cmd
+      P.step(("module base resolved: %s @ 0x%s"):format(
+        vim.fs.basename(sess.symbol_lib), base_hex))
+    else
+      log.notify("dap.android",
+        "ASLR base unresolved for " .. vim.fs.basename(sess.symbol_lib)
+        .. "; breakpoints may not resolve (continuing attach)",
+        vim.log.levels.WARN)
+    end
+  end
 
   local cfg = lldb_dap_attach_config(sess, sess.source_map)
   cfg.name = cfg_name
+  -- K33 diagnosis: pick the first current nvim breakpoint as the post-attach
+  -- probe so post_run_commands logs a real `breakpoint set` + `breakpoint list`
+  -- to stdpath('cache')/ue-dap-bp-diag.log. Read-only, does not resume.
+  do
+    local bps = ue_android_collect_current_breakpoints and {} or {}
+    local ok_c, cur = pcall(current_breakpoint_commands)
+    if ok_c and type(cur) == "table" and #cur > 0 then
+      local f, l = tostring(cur[1]):match('breakpoint set %-f "([^"]+)" %-l (%d+)')
+      if f and l then sess._bp_probe_file = f; sess._bp_probe_line = tonumber(l) end
+    end
+  end
+  -- Preseed file:line breakpoints as attachCommands, inserted AFTER the ASLR
+  -- `target modules load --slide` so they resolve against the relocated module.
+  -- NOTE (K33): source-file `breakpoint set -f` has been observed to crash
+  -- lldb-dap 22.1.6 (3221226505) on the gdb-remote route; under the platform
+  -- route this needs real-device re-verification. If it crashes, switch to
+  -- address breakpoints (image lookup --line -> breakpoint set --address).
+  preseed_breakpoints_into_attach_commands(cfg)
+  -- post_run_commands needs the probe fields, so rebuild it now that they're set.
+  cfg.postRunCommands = post_run_commands(sess)
   C.run(cfg, run_label)
   -- Progress popup finalized by ue.dap.lua's event_initialized listener
   -- (P.done) or by stop_android_debugger / on_session_end (P.hide).
+  -- If the adapter exits before nvim-dap installs/keeps a session (observed
+  -- with a broken device-side attach), the normal
+  -- session-end listeners may not get a chance to clear our bootstrap flag.
+  -- Release the mutex after a short grace window when there is no live DAP
+  -- session, so the next <space>da is a real retry instead of a stale-block.
+  vim.defer_fn(function()
+    if not M._attach_in_progress then return end
+    local ok_dap, dap = pcall(require, "dap")
+    local has_session = ok_dap and dap and dap.session and dap.session() or nil
+    if not has_session then
+      M._attach_in_progress = false
+      pcall(function() require("ue.dap._progress").hide() end)
+    end
+  end, 10000)
 end
 
 function M.attach(opts)
+  opts = opts or {}
+  -- A previous attach can fail before nvim-dap creates a session while still
+  -- leaving the bootstrap flag set (for example lldb-dap dies after
+  -- `process attach --pid` reports `lost connection`). In that state a second
+  -- <space>da should be able to retry instead of being blocked forever by our
+  -- own stale mutex. Keep the mutex only while a real dap session exists.
   if M._attach_in_progress then
-    vim.notify("[ue.dap.android] attach already in progress — wait for it to finish or :UEDAPStop",
-      vim.log.levels.WARN)
-    return
+    local ok_dap, dap = pcall(require, "dap")
+    local has_session = ok_dap and dap and dap.session and dap.session() or nil
+    -- Keep the mutex only for a real live DAP session. A stale/failed early
+    -- bootstrap can leave a half-filled M._session (for example only adb/port,
+    -- or a serial but no DAP session); a second <space>da should retry.
+    if has_session then
+      vim.notify("[ue.dap.android] attach already in progress — wait for it to finish or :UEDAPStop",
+        vim.log.levels.WARN)
+      return
+    end
+    M._attach_in_progress = false
   end
   local ok_dap, dap = pcall(require, "dap")
   if ok_dap and dap and dap.session and dap.session() then
@@ -1215,6 +1463,8 @@ function M.reattach()
   sess.package_name      = last.package_name
   sess.symbol_lib        = last.symbol_lib
   sess.lldb_server_local = last.lldb_server_local
+  sess.remote_lldb_server = last.remote_lldb_server
+  sess.lldb_server_mode  = last.lldb_server_mode
   sess.source_map        = last.source_map
   sess.engine_root       = last.engine_root
   sess.port              = pick_port()
@@ -1238,12 +1488,14 @@ function M.reattach()
   -- Ensure lldb-server is still in the sandbox (Android may have cleared
   -- /data/data/<pkg> on user-data wipe / reinstall).
   local ok_push, push_msg = ensure_lldb_server_pushed(
-    sess.adb, sess.serial, sess.lldb_server_local)
+    sess.adb, sess.serial, sess.package_name, sess.lldb_server_local)
   if not ok_push then
     P.error("lldb-server re-stage failed: " .. tostring(push_msg))
     M._attach_in_progress = false
     return
   end
+  sess.remote_lldb_server = push_msg
+  sess.lldb_server_mode = "platform"
 
   _finalize_session(sess, pid,
     "UE Android Attach (lldb-dap)", "UEDAP android reattach")
@@ -1322,6 +1574,7 @@ function M.status()
     ("  serial      : %s"):format(s.serial or "-"),
     ("  pid         : %s"):format(s.pid or "-"),
     ("  port        : %s"):format(s.port or "-"),
+    ("  server mode : %s"):format(s.lldb_server_mode or "-"),
     ("  symbol_lib  : %s"):format(s.symbol_lib or "-"),
     ("  liveness    : %s (misses=%d)"):format(
       M._liveness_timer and "polling" or "off", M._liveness_misses or 0),
@@ -1349,6 +1602,10 @@ end
 
 function M._pick_symbol_lib_for_test(ctx)
   return pick_symbol_lib(ctx)
+end
+
+function M._pick_source_map_for_test(ctx)
+  return pick_source_map(ctx)
 end
 
 function M._effective_project_root_for_test(ctx)

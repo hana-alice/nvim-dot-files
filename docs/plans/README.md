@@ -33,6 +33,13 @@ know "how this specific subsystem is shaped."
 | `2026-04-17-instant-goto-architecture.md` | tier-2 split of the goto-definition engine into `lua/utils/ue_goto/` |
 | `2026-04-20-syntax-overload-disambiguation.md` | C++ overload disambiguation strategy for instant goto-def |
 
+### Android DAP series (2026-06)
+
+| File | Subject |
+|---|---|
+| `2026-06-02-android-dap-attach-bp-diagnosis.md` | Diagnostic report: attach failure + F9 breakpoint short-circuit root causes (device `a3ad86f3`) |
+| `2026-06-15-android-dap-live-breakpoints.md` | ADR: session-time live breakpoints via lldb-dap evaluate channel (K36); slide load-bearing (K37); D1 gate → 2A branch; synthetic-frame chokepoint convergence. On-device proof `2e2df4cb` |
+
 ### Baselines
 
 `baselines/` holds frozen output snapshots that ADRs reference for

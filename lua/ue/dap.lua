@@ -95,6 +95,33 @@ local function is_ue_android_lldb_session(session)
 end
 
 
+-- ─── UPSTREAM ROOT CAUSE: nvim-dap synthetic-frame handling ──────────────
+-- ANCHOR(ue-synthetic-frame-guard). Three sites in this file defend against the
+-- SAME upstream nvim-dap defect; this predicate is their shared classifier.
+--
+-- Defect: lldb-dap (Android platform-mode attach) reports attach/exception
+-- stops as PC-only "synthetic" frames — `line = 0` and/or a `sourceReference`
+-- with no real on-disk path. nvim-dap's `Session:jump_to_frame()`
+-- (lua/dap/session.lua) does NOT honour `preserveFocusHint`/`threadCausedFocus`
+-- for these, and feeds `line = 0` to `nvim_win_set_cursor` (1-based), which
+-- raises `E474: Invalid argument`, opens junk `dap-src://` buffers, and emits
+-- "Debug adapter stopped at unavailable location" per stopped thread.
+--
+-- THE CHOKEPOINT is the `before.stackTrace` listener "ue_source_path_rewrite"
+-- (search ANCHOR-USE:stackTrace). It runs before nvim-dap's built-in
+-- `event_stopped` consumes the stackTrace response, so neutering synthetic
+-- frames there (line=-1 placeholder) stops the bad UI hop at the source for
+-- every downstream consumer. The two other sites are thin defence-in-depth:
+--   • `_frame_set` monkey-patch (ANCHOR-USE:_frame_set) — guards the rare path
+--     where a synthetic frame reaches frame-set directly (manual frame nav)
+--     without having gone through our stackTrace rewrite.
+--   • basename→local-path remap (ANCHOR-USE:bp-response) — orthogonal: it
+--     rewrites setBreakpoints RESPONSE source paths (not stop frames) so the
+--     breakpoint markers land on the user's local buffer rather than the
+--     DWARF basename; it shares no frame logic but is listed here because it
+--     is the third place we translate between DWARF/synthetic and local paths.
+-- Removing any of these requires the upstream fix to jump_to_frame; until then
+-- the chokepoint carries the load and the other two stay as cheap guards.
 local function frame_is_synthetic_or_invalid(frame)
   if type(frame) ~= "table" then return true end
   local line = tonumber(frame.line) or 0
@@ -148,58 +175,11 @@ local function local_path_for_breakpoint_source(source)
   return nil
 end
 
-local function ue_android_collect_current_breakpoints()
-  local ok, bps_mod = pcall(require, "dap.breakpoints")
-  if not ok or not bps_mod or type(bps_mod.get) ~= "function" then return {} end
-  local all = bps_mod.get()
-  local out = {}
-  local seen = {}
-  if type(all) ~= "table" then return out end
-  local function path_from_key(key)
-    if type(key) == "string" then return key end
-    if type(key) == "number" and vim.api.nvim_buf_is_valid(key) then
-      return vim.api.nvim_buf_get_name(key)
-    end
-    return nil
-  end
-  for key, list in pairs(all) do
-    local path = path_from_key(key)
-    if path and is_ue_android_source_path(path) and type(list) == "table" then
-      local source = ue_android_breakpoint_source({ path = path, name = vim.fs.basename(path) })
-      local file = source and (source.path or source.name) or vim.fs.basename(path)
-      for _, bp in ipairs(list) do
-        local line = tonumber(bp.line)
-        if file and file ~= "" and line and line > 0 then
-          local dedupe = file .. ":" .. tostring(line)
-          if not seen[dedupe] then
-            seen[dedupe] = true
-            out[#out + 1] = { file = file, line = line }
-          end
-        end
-      end
-    end
-  end
-  return out
-end
-
-local function ue_android_preseed_breakpoints(session)
-  local cfg = session and session.config or nil
-  if not cfg or not is_ue_android_lldb_session(session) then return end
-  local bps = ue_android_collect_current_breakpoints()
-  if #bps == 0 then return end
-  cfg.attachCommands = cfg.attachCommands or {}
-  local insert_at = #cfg.attachCommands + 1
-  for i, cmd in ipairs(cfg.attachCommands) do
-    if tostring(cmd):find("process handle SIGPIPE", 1, true) then insert_at = i + 1; break end
-  end
-  for i = #bps, 1, -1 do
-    local bp = bps[i]
-    table.insert(cfg.attachCommands, insert_at,
-      string.format('?breakpoint set -f "%s" -l %d', bp.file, bp.line))
-  end
-end
-
 local function remap_breakpoint_response_to_local_paths(response)
+  -- ANCHOR-USE:bp-response — see ANCHOR(ue-synthetic-frame-guard) above.
+  -- Thin/orthogonal site: rewrites setBreakpoints RESPONSE source paths
+  -- (DWARF basename → user's local buffer path) so breakpoint markers render
+  -- on the local file, not a synthetic basename source.
   if not response or not response.breakpoints then return end
   for _, bp in ipairs(response.breakpoints) do
     if bp.source then
@@ -212,38 +192,112 @@ local function remap_breakpoint_response_to_local_paths(response)
   end
 end
 
+local function append_android_bp_diag(lines)
+  if type(lines) == "string" then lines = { lines } end
+  if type(lines) ~= "table" then return end
+  pcall(function()
+    local path = vim.fn.stdpath("cache") .. "/ue-dap-bp-diag.log"
+    local fh = io.open(path, "a")
+    if not fh then return end
+    for _, line in ipairs(lines) do
+      fh:write(tostring(line), "\n")    end
+    fh:close()
+  end)
+end
 
-local function ue_android_synthetic_breakpoint_response(args)
-  args = args or {}
-  local source = args.source or {}
-  local local_path = local_path_for_breakpoint_source(source) or norm_path(source.path or "")
-  local response = { breakpoints = {} }
-  for _, bp in ipairs(args.breakpoints or args.lines or {}) do
-    local line = tonumber(type(bp) == "table" and bp.line or bp)
-    if line and line > 0 then
-      -- Android file:line breakpoints are now genuinely planted as
-      -- attachCommands (`?breakpoint set -f <file> -l <N>`) AFTER the libUE4.so
-      -- ASLR rebase, so they resolve against the relocated module (see
-      -- lua/ue/dap/android.lua preseed_breakpoints_into_attach_commands +
-      -- module_rebase_command). We still synthesize the DAP setBreakpoints
-      -- response locally — sending a live setBreakpoints over this direct
-      -- gdb-remote attach can crash lldb-dap 22.1.6 with
-      -- STATUS_STACK_BUFFER_OVERRUN (docs/CONSTRAINTS.md K14) — but report
-      -- verified=true to reflect that the breakpoint WAS preseeded, instead of
-      -- the old always-false lie. Breakpoints toggled AFTER attach are not
-      -- preseeded; those still need a re-attach to take effect.
-      response.breakpoints[#response.breakpoints + 1] = {
-        id = line,
-        line = line,
-        verified = true,
-        source = {
-          name = source.name or (local_path ~= "" and vim.fs.basename(local_path) or nil),
-          path = local_path ~= "" and local_path or nil,
-        },
-      }
+-- ─── Live (session-time) breakpoint planting ─────────────────────────────
+-- PROVEN PATH, not a workaround (design android-dap-live-breakpoints D2;
+-- 2026-06-15 gate evidence tools/evidence/android-f9/livebp-gate.*.json).
+-- After configurationDone, nvim-dap's native setBreakpoints for an Android
+-- attach session resolves AND hits on this device/route (K30 platform mode +
+-- 3.5 matching symbols). The earlier "you must :UEDAPReattach" warning was for
+-- a route where the memory write was silently dropped (361b9e7); that does not
+-- reproduce here, so session-time F9 is handled live.
+--
+
+-- Pure helper (unit-tested via D._live_plant_command_for_test): build the
+-- lldb-dap evaluate backtick command for one file:line breakpoint. The basename
+-- form MUST match what attach-time preseed uses (ue_android_breakpoint_source),
+-- because that is the shape proven to resolve against the device DWARF.
+-- Returns nil when source/line cannot produce a valid command.
+local function ue_android_live_plant_command(source, line)
+  line = tonumber(line)
+  if not line or line <= 0 then return nil end
+  local rewritten = ue_android_breakpoint_source(source or {})
+  local file = rewritten and (rewritten.name or rewritten.path) or nil
+  if type(file) ~= "string" or file == "" then
+    file = source and source.name or nil
+  end
+  if type(file) ~= "string" or file == "" then return nil end
+  return string.format('`breakpoint set -f "%s" -l %d', file, line), file
+end
+
+-- Pure helper (unit-tested via D._scan_breakpoint_resolved_for_test): parse the
+-- `resolved = N` count from an `lldb breakpoint list` dump. Returns the LAST
+-- resolved value seen (the dump lists one breakpoint per block), or nil if no
+-- resolved line is present. This is the honest-verified signal: resolved>0 means
+-- LLDB actually planted the breakpoint; resolved=0 / nil means it did not.
+local function scan_breakpoint_resolved(text)
+  local resolved = nil
+  for l in (tostring(text or "") .. "\n"):gmatch("([^\n]*)\n") do
+    local n = l:match("locations = %d+, resolved = (%d+)")
+    if n then resolved = tonumber(n) end
+  end
+  return resolved
+end
+-- Channel priority (D2): B = evaluate backtick `breakpoint set -f/-l` (reuses
+-- the attach-time preseed file:line form that is proven to resolve, and the
+-- evaluate result text carries `resolved=N` for honest verified state) → A =
+-- DAP setBreakpoints native (already in flight; used as the fallback path).
+-- C = address is NOT needed (gate showed B/A both hit).
+--
+-- This helper sends the file:line command over evaluate and reads back
+-- `breakpoint list` to confirm resolved>0. It NEVER detach+reattach and NEVER
+-- fakes success: a failure to resolve is surfaced via vim.notify + diag log.
+local function ue_android_live_plant_via_evaluate(session, source, lines)
+  if type(lines) ~= "table" or #lines == 0 then return end
+
+  for _, bp in ipairs(lines) do
+    local cmd, file = ue_android_live_plant_command(source, type(bp) == "table" and bp.line or bp)
+    if cmd then
+      local line = tonumber(type(bp) == "table" and bp.line or bp)
+      append_android_bp_diag({
+        "== live breakpoint plant (evaluate) ==",
+        "cmd=" .. cmd,
+      })
+      pcall(function()
+        session:request("evaluate", { expression = cmd, context = "repl" },
+          function(set_err, set_res)
+            append_android_bp_diag({
+              "live plant evaluate response:",
+              "error=" .. tostring(set_err and (set_err.message or set_err) or "nil"),
+              "result=" .. tostring(set_res and set_res.result or ""),
+            })
+            -- Read back resolved state and surface honest feedback.
+            session:request("evaluate", { expression = "`breakpoint list", context = "repl" },
+              function(list_err, list_res)
+                local text = list_res and list_res.result or ""
+                append_android_bp_diag({ "live plant breakpoint list:", text })
+                local resolved = scan_breakpoint_resolved(text)
+                if set_err or (resolved ~= nil and resolved == 0) then
+                  -- MUST NOT fake success; tell the user exactly what failed.
+                  local now = mono_ms()
+                  if now >= (D._ue_android_bp_notice_until_ms or 0) then
+                    D._ue_android_bp_notice_until_ms = now + 5000
+                    vim.notify(
+                      string.format(
+                        "[ue.dap] live breakpoint %s:%d did not resolve (%s). "
+                        .. "See :UEDAPDiag / ue-dap-bp-diag.log.",
+                        file, line,
+                        set_err and "command error" or "resolved=0"),
+                      vim.log.levels.WARN)
+                  end
+                end
+              end)
+          end)
+      end)
     end
   end
-  return response
 end
 
 local function frame_has_local_source(frame)
@@ -490,6 +544,25 @@ end
 --- Resolve an lldb-dap adapter path. Returns absolute path or nil.
 function D.lldb_dap_path()
   return require("ue.dap._common").find_lldb_dap()
+end
+
+-- ─── Live-breakpoint pure-logic test seams ───────────────────────────────
+-- These expose the two pure helpers that carry the load-bearing invariants of
+-- the session-time live breakpoint path (change android-dap-live-breakpoints).
+-- Tested in tests/cases/dap_spec.lua so the behavior — not just the source
+-- text — is locked against regression.
+
+--- Build the live-plant evaluate command for one file:line. Returns (cmd, file)
+--- or nil. MUST use the same basename form as attach-time preseed.
+function D._live_plant_command_for_test(source, line)
+  return ue_android_live_plant_command(source, line)
+end
+
+--- Parse `resolved = N` from an lldb `breakpoint list` dump. Returns the last
+--- resolved count or nil. This is the honest-verified signal (resolved>0 = real
+--- plant; 0/nil = failure → warn, never fake success).
+function D._scan_breakpoint_resolved_for_test(text)
+  return scan_breakpoint_resolved(text)
 end
 
 --- Strip Globals / Static scopes (massive variable trees that hang dap-ui).
@@ -1889,10 +1962,6 @@ function D.setup_dap(dap, dapui)
     end
   end
 
-  dap.listeners.on_session["ue_android_preseed_breakpoints"] = function(session)
-    ue_android_preseed_breakpoints(session)
-  end
-
   dap.listeners.after.event_initialized["dapui_config"] = function()
     close_explorer()
     save_layout()
@@ -1915,15 +1984,17 @@ function D.setup_dap(dap, dapui)
 
   -- ─── Rewire `dap.terminate` for UE Android Attach sessions ────────
   -- The dapui controls bar's ■ button (and any plain `:lua require("dap")
-  -- .terminate()` invocation) issues a DAP `terminate` request.  codelldb
+  -- .terminate()` invocation) issues a DAP `terminate` request.  lldb-dap
   -- maps `terminate` to SIGKILL the inferior — fine for `launch` but
   -- catastrophic for `attach` (it kills the game we just attached to).
   --
-  -- For our "UE Android Attach" sessions (cfg.request == "launch" but
-  -- semantically attach via gdb-remote) we transparently redirect
-  -- terminate -> disconnect{terminateDebuggee=false}, i.e. a clean
-  -- detach that leaves the device-side process running.  Other sessions
-  -- (Win64 Launch / Linux Launch) keep the original terminate semantics.
+  -- Our "UE Android Attach" sessions use `request = "attach"` with custom
+  -- attachCommands (see lua/ue/dap/android.lua lldb_dap_attach_config). We
+  -- transparently redirect terminate -> disconnect{terminateDebuggee=false},
+  -- i.e. a clean detach that leaves the device-side process running.  Other
+  -- sessions (Win64 Launch / Linux Launch) keep the original terminate
+  -- semantics. Selection is by cfg.name ("UE Android Attach"), not request
+  -- type, so it stays correct regardless of the request field.
   if not D._dap_terminate_rewired then
     local orig_terminate = dap.terminate
     dap.terminate = function(opts, terminate_opts, cb)
@@ -1939,11 +2010,13 @@ function D.setup_dap(dap, dapui)
     D._dap_terminate_rewired = true
   end
 
-  -- Android/lldb-dap often reports attach/exception stops with PC-only
-  -- synthetic sourceReference frames and line=0.  nvim-dap upstream pcall()s
-  -- the cursor move but still raises a visible DAP error notification and
-  -- opens dap-src:// buffers.  Filter those frames at the source for the UE
-  -- Android session; keep normal local-file frames untouched.
+  -- ANCHOR-USE:_frame_set — see ANCHOR(ue-synthetic-frame-guard) at the top of
+  -- this file. Defence-in-depth (thin): the stackTrace chokepoint already
+  -- neuters synthetic frames before nvim-dap consumes them, but a synthetic
+  -- frame can still reach `_frame_set` directly via manual frame navigation
+  -- that bypasses our rewrite. Drop it here too so the cursor never hops to a
+  -- line=0 / dap-src:// frame. Removing this depends on the upstream
+  -- jump_to_frame fix; until then it stays as a cheap guard.
   if session_mod then
     if not session_mod._ue_android_orig_frame_set then
       session_mod._ue_android_orig_frame_set = session_mod._frame_set
@@ -1957,51 +2030,8 @@ function D.setup_dap(dap, dapui)
       return orig_frame_set(session, frame)
     end
 
-    -- Android post-attach breakpoints: see schedule_reattach() defined
-    -- above (outside this session_mod block).  The listener in
-    -- after.setBreakpoints calls it.
-  end
-
-  -- ─── Re-attach scheduler (used by after.setBreakpoints below) ────────────
-  D._ue_android_reattach_timer = D._ue_android_reattach_timer
-    or (vim.uv and vim.uv.new_timer())
-  D._ue_android_reattach_scheduled = false
-
-  local function schedule_reattach()
-    if D._ue_android_reattach_scheduled then return end
-    D._ue_android_reattach_scheduled = true
-    if not D._ue_android_reattach_timer then return end
-    D._ue_android_reattach_timer:start(3000, 0, function()
-      D._ue_android_reattach_timer:stop()
-      D._ue_android_reattach_scheduled = false
-      -- UV timer callback runs off-thread; all nvim API calls MUST be
-      -- on the main loop via vim.schedule.
-      vim.schedule(function()
-        pcall(function()
-          local ok_android, android = pcall(require, "ue.dap.android")
-          if not (ok_android and android.reattach) then return end
-          local ok_dap, dap = pcall(require, "dap")
-          if not (ok_dap and dap) then return end
-          -- Step 1: cleanly detach from the current session.
-          vim.notify("[ue.dap] Detaching to re-preseed breakpoints …", vim.log.levels.INFO)
-          if dap.session() then
-            dap.disconnect({ terminateDebuggee = false }, function()
-              -- disconnect callback is already on the main thread
-              -- (handle_body → vim.schedule → callback).  self:close()
-              -- has already run, so dap.session() is nil by now.
-              if dap.session() then
-                vim.notify("[ue.dap] re-attach skipped: session still active", vim.log.levels.WARN)
-                return
-              end
-              android.reattach()
-            end)
-          else
-            -- No active session — just re-attach directly.
-            android.reattach()
-          end
-        end)
-      end)
-    end)
+    -- Android attachCommands are owned by ue.dap.android. This module only
+    -- rewrites DAP source paths and reports adapter responses.
   end
 
   -- ─── nvim-dap-ui threads-list crash guard ─────────────────────────────
@@ -2096,49 +2126,103 @@ function D.setup_dap(dap, dapui)
     D._continue_debounce_until_ms = 0
     D._dap_run_state = session.stopped_thread_id and "stopped" or "idle"
   end
+  dap.listeners.after.configurationDone["ue_android_bp_config_done"] = function(session)
+    if not is_ue_android_lldb_session(session) then return end
+    session._ue_android_configuration_done = true
+    append_android_bp_diag("== DAP configurationDone ==")
+  end
   dap.listeners.after.event_stopped["ue-dap-source-nav"] = function(session, body)
     if dap.session() ~= session then return end
+    if is_ue_android_lldb_session(session) then
+      local frame = session.current_frame
+      append_android_bp_diag({
+        "== DAP stopped event ==",
+        "reason=" .. tostring(body and body.reason or ""),
+        "threadId=" .. tostring(body and body.threadId or ""),
+        "hitBreakpointIds=" .. vim.inspect(body and body.hitBreakpointIds or {}),
+        "currentFrame=" .. vim.inspect(frame),
+      })
+      local is_entry_stop = body and (body.reason == "entry"
+        or tostring(body.description or ""):find("SIGSTOP", 1, true) ~= nil)
+      if is_entry_stop then
+        return
+      end
+    end
     maybe_jump_to_local_source_frame(session, body)
   end
 
-  -- Before setBreakpoints: rewrite UE Android source paths from Windows
-  -- absolute paths to basename-only so lldb-dap can match them against
-  -- DWARF (which records file names / relative paths, not host paths).
-  dap.listeners.before.setBreakpoints["ue_android_bp_source_rewrite"] = function(session, args)
+  -- NOTE: nvim-dap's `listeners.before.setBreakpoints` does NOT run before the
+  -- request is sent — it runs in the RESPONSE pipeline with the signature
+  -- (session, err, response, request, request_seq), same as the after-listener
+  -- (see dap/session.lua handle_body L1104-1109; changelog 2026-06-02 pitfall).
+  -- So we cannot mutate outgoing `args.source` here. Source-path basename
+  -- rewriting for the wire is owned by ue.dap.android (attachCommands + DWARF
+  -- match); this listener records the OUTGOING request shape (the original
+  -- setBreakpoints arguments live in `request`, which session.lua stores from
+  -- `message_requests[seq]`) so the live-plant path below can replay the real
+  -- file:line set. `request` here is the request payload table; its breakpoint
+  -- lines are under `request.breakpoints` / `request.lines` (NOT nested under
+  -- `.arguments` — nvim-dap stashes the arguments table directly).
+  dap.listeners.before.setBreakpoints["ue_android_bp_record_request"] = function(session, _err, _response, request)
     if not is_ue_android_lldb_session(session) then return end
-    if not args or not args.source then return end
-    local rewritten = ue_android_breakpoint_source(args.source)
-    if rewritten ~= args.source then
-      args.source = rewritten
+    -- `request` may be the raw arguments table or wrap it under `.arguments`
+    -- depending on nvim-dap version; handle both.
+    local args = request and (request.arguments or request) or nil
+    if type(args) ~= "table" then return end
+    local lines = args.breakpoints or args.lines or {}
+    session._ue_android_last_setbp = {
+      source = vim.deepcopy(args.source),
+      lines = vim.deepcopy(lines),
+    }
+  end
+
+  dap.listeners.after.setBreakpoints["ue_android_bp_local_response"] = function(session, _err, response, request)
+    if not is_ue_android_lldb_session(session) then return end
+    remap_breakpoint_response_to_local_paths(response)
+    append_android_bp_diag({
+      "== DAP setBreakpoints response ==",
+      "configurationDone=" .. tostring(session._ue_android_configuration_done == true),
+      vim.inspect(response),
+    })
+    -- configurationDone gate distinguishes initial sync vs live change:
+    --   • before gate  → initial breakpoints already preseeded into
+    --     attachCommands by ue.dap.android; nothing more to do here.
+    --   • after gate   → a session-time F9 change. The 2026-06-15 gate proved
+    --     live planting resolves AND hits on this route, so we plant it live
+    --     via the evaluate channel (design D2-B) instead of warning the user
+    --     to :UEDAPReattach. The native setBreakpoints response above is kept
+    --     in the diag log; the live evaluate path is the one that arms LLDB.
+    if session._ue_android_configuration_done ~= true then
+      append_android_bp_diag("initial setBreakpoints sync; preseed owns initial breakpoints")
+      return
+    end
+    -- Recover the requested file:line set. Prefer the `request` payload handed
+    -- to this same after-listener (authoritative for THIS response); fall back
+    -- to the snapshot recorded by the before-listener.
+    local snap = session._ue_android_last_setbp
+    local req_args = request and (request.arguments or request) or nil
+    local source = (req_args and req_args.source) or (snap and snap.source) or nil
+    local lines = (req_args and (req_args.breakpoints or req_args.lines))
+      or (snap and snap.lines) or {}
+    append_android_bp_diag({
+      "active-session setBreakpoints: line_count=" .. tostring(type(lines) == "table" and #lines or -1),
+    })
+    if type(lines) == "table" and #lines > 0 then
+      append_android_bp_diag("active-session setBreakpoints → live evaluate plant")
+      ue_android_live_plant_via_evaluate(session, source, lines)
+    else
+      append_android_bp_diag("active-session setBreakpoints with no lines (clear); native response stands")
     end
   end
 
-  dap.listeners.after.setBreakpoints["ue_android_bp_local_response"] = function(session, _err, response)
-    if not is_ue_android_lldb_session(session) then return end
-    remap_breakpoint_response_to_local_paths(response)
-    -- Schedule a debounced detach+reattach.  The only proven way to plant
-    -- working Android breakpoints is the preseed inside attachCommands
-    -- (which runs during configurationDone, before the process is resumed).
-    -- DAP setBreakpoints and evaluate-based replant both resolve symbols but
-    -- the breakpoint instructions are not reliably written into the remote
-    -- process memory on this device/Android-version combination.
-    schedule_reattach()
-  end
-
   -- K33 diagnosis: capture lldb-dap console/output events to a host log file so
-  -- the postRunCommands probe (image list / breakpoint set / breakpoint list)
+  -- the postRunCommands probe (image list / image lookup / breakpoint list)
   -- output is inspectable without a live REPL.
   dap.listeners.after.event_output["ue_android_bp_diag"] = function(session, body)
     if not is_ue_android_lldb_session(session) then return end
     local out = body and body.output
     if type(out) ~= "string" or out == "" then return end
-    pcall(function()
-      local path = vim.fn.stdpath("cache") .. "/ue-dap-bp-diag.log"
-      local fh = io.open(path, "a")
-      if not fh then return end
-      fh:write(out)
-      fh:close()
-    end)
+    append_android_bp_diag(out)
   end
 
   dap.listeners.before.scopes["ue_block_globals"] = function(_, _, body)
@@ -2146,6 +2230,12 @@ function D.setup_dap(dap, dapui)
   end
 
   dap.listeners.before.stackTrace["ue_source_path_rewrite"] = function(session, err, response)
+    -- ANCHOR-USE:stackTrace — THE CHOKEPOINT for the synthetic-frame defect.
+    -- See ANCHOR(ue-synthetic-frame-guard) at the top of this file. This runs
+    -- before nvim-dap's built-in event_stopped consumes the stackTrace
+    -- response, so neutering synthetic frames here (line=-1 placeholder) is the
+    -- single load-bearing fix; the _frame_set patch and bp-response remap are
+    -- only thin defence-in-depth around it.
     if err or not response or not response.stackFrames then return end
     local is_android = is_ue_android_lldb_session(session)
     local filtered = nil
@@ -2165,15 +2255,19 @@ function D.setup_dap(dap, dapui)
       --
       -- Do NOT replace an all-synthetic stack with an empty list: upstream
       -- nvim-dap reports "Debug adapter stopped at unavailable location" for
-      -- every stopped thread. Instead, strip `source` from synthetic frames.
-      -- get_top_frame() can still keep a current frame/scopes by frameId, but
-      -- jump_to_frame() exits early with "source missing" and never touches an
-      -- invalid buffer/line. Real local-file frames and breakpoint hits are
-      -- kept untouched.
+      -- every stopped thread. Keep a non-jumpable placeholder source instead:
+      -- jump_to_frame() returns before source_to_bufnr() when line < 0, so it
+      -- preserves frameId/scopes without opening dap-src:// or notifying
+      -- "Source missing". Real local-file frames and breakpoint hits are kept
+      -- untouched.
       if is_android then
         if frame_is_synthetic_or_invalid(frame) then
           local copy = vim.deepcopy(frame)
-          copy.source = nil
+          copy.line = -1
+          copy.column = 1
+          copy.source = {
+            name = source and source.name or frame.name or "<synthetic>",
+          }
           sanitized = sanitized or {}
           sanitized[#sanitized + 1] = copy
         else

@@ -132,14 +132,11 @@ function M.ensure_adapter(dap, adapter)
   dap.defaults.lldb = dap.defaults.lldb or {}
   dap.defaults.lldb.auto_continue_if_many_stopped = false
 
-  local cur = dap.adapters.lldb
-  -- Force re-wire to refresh env (LLDBDAP_LOG path may change across sessions)
-  if false and type(cur) == "table"
-    and cur.type == "executable"
-    and cur.command == adapter
-    and cur.options ~= nil then
-    return
-  end
+  -- Always re-wire the adapter table. We intentionally do NOT short-circuit
+  -- when the path is unchanged: env (notably LLDBDAP_LOG) is recomputed per
+  -- call via M._lldb_dap_env() and may differ across sessions, so a stale
+  -- adapters.lldb.options.env would point the log at a previous run. Re-wiring
+  -- is cheap (a table assignment) and keeps env fresh.
   dap.adapters.lldb = {
     type    = "executable",
     command = adapter,

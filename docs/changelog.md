@@ -53,6 +53,132 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-06-15 — docs/test: harden + preserve the live-breakpoint experience (ADR, behavioral tests, knowledge base)
+
+**Task** — The session-time live-breakpoint work (previous entry) is load-bearing and hard-won; preserve it against regression and knowledge loss via behavioral tests, an ADR, and knowledge-base updates (user request: "保留这次的经验不被破坏").
+
+**Implemented**
+- **Refactored for testability** (`lua/ue/dap.lua`): extracted two pure helpers from `ue_android_live_plant_via_evaluate` — `ue_android_live_plant_command(source, line)` (builds the backtick `breakpoint set -f <basename> -l <N>` command, reusing the proven preseed basename form) and `scan_breakpoint_resolved(text)` (parses `resolved = N` from a `breakpoint list` dump — the honest-verified signal). Exposed as `D._live_plant_command_for_test` / `D._scan_breakpoint_resolved_for_test`. Behavior unchanged; the inline parser in the listener now calls the shared helper.
+- **Behavioral tests** (`tests/cases/dap_spec.lua`): added 3 behavioral cases (live-plant command basename form; rejects invalid line/empty source; resolved-parser resolved>0 vs 0/nil vs multi-block) that lock the *behavior* not just source text, plus 3 INVARIANT guards: nvim-dap `before.setBreakpoints` runs in the response pipeline (no before-request hook — also asserts the misleading `*_source_rewrite` name stays gone), live plant never fakes success / never detach+reattach, and the ASLR slide stays load-bearing with the `UE_DAP_NO_SLIDE` reverify switch.
+- **ADR** (`docs/plans/2026-06-15-android-dap-live-breakpoints.md`): full decision record — D1 gate methodology, D2 channel priority, D3 preseed downgrade, D4 honest verified, D5 (rejected slide removal), D-OQ5 synthetic-frame chokepoint, the invariants table mapping each to its test guard, the 4 hard-won pitfalls, rejected approaches, rollback point. Registered in `decisions/README.md` and `docs/plans/README.md` (new "Android DAP series (2026-06)" section).
+- **Knowledge base**: `lessons/README.md` K30–K33 section expanded to K30–K37 (K34 not-reproducing, K36 live evaluate channel, K37 slide load-bearing); `K1–K33` → `K1–K37`; adapter arc updated to LLVM 22.1.6+ forward-only. `lua/ue/dap/CLAUDE.md` gained local rules for K36/K37, the no-before-request-hook gotcha, and the synthetic-frame chokepoint, plus ADR/evidence pointers in 先读.
+
+**Pitfalls / Gotchas**
+- The previous entry's tests were pure source-text greps — brittle and they don't prove the logic. Extracting pure helpers behind `_for_test` seams (mirroring `android.lua`'s existing `_*_for_test` pattern) lets the harness assert real behavior without a live adapter or device.
+- `structure_spec` guards internal-link integrity across the knowledge base, so every new doc pointer (ADR path, evidence dir) must resolve — verified via full regression below.
+
+**Validation**
+- `nvim --headless -l tests/run.lua dap` → 23/23 passed (was 17; +6 behavioral/invariant cases).
+- `nvim --headless -l tests/run.lua` → full regression (run below).
+
+**Follow-ups**
+- If nvim-dap ever adds a true before-request hook, the INVARIANT test for the response-pipeline assumption will flag it — revisit the setBreakpoints recovery then.
+
+### 2026-06-15 — feat(dap/android): session-time live breakpoints + synthetic-frame convergence + cleanup
+
+**Task** — Eliminate the "must `:UEDAPReattach`" work-around for session-time F9 breakpoints on UE Android attach (change `android-dap-live-breakpoints`). Prove on-device whether live planting is feasible, wire the proven channel, and do the unconditional cleanup (dead code, no-op push, stale comments, synthetic-frame guard convergence).
+
+**Implemented**
+- **Live breakpoint path (the proven fix, not a work-around):**
+  - `lua/ue/dap.lua` `ue_android_live_plant_via_evaluate()`: new helper that plants session-time breakpoints via the lldb-dap evaluate backtick `breakpoint set -f "<basename>" -l <N>` channel (design D2-B), reusing the proven `ue_android_breakpoint_source` basename form. Reads back `breakpoint list resolved=N`; on `resolved=0` or command error it surfaces an honest `vim.notify` (throttled via `D._ue_android_bp_notice_until_ms`) — MUST NOT fake success, MUST NOT detach+reattach.
+  - `dap.listeners.after.setBreakpoints["ue_android_bp_local_response"]`: after `configurationDone`, routes session-time changes through the live plant instead of the old reattach warning. Recovers the requested file:line from the `request` payload (with a `before.setBreakpoints` snapshot fallback). Initial (pre-gate) setBreakpoints stays owned by attachCommands preseed.
+  - Renamed `before.setBreakpoints["ue_android_bp_source_rewrite"]` → `["ue_android_bp_record_request"]`; documented that nvim-dap's `before.setBreakpoints` fires in the RESPONSE pipeline (signature `session, err, response, request, seq`), so it records the outgoing shape rather than mutating it.
+  - Removed the active-session "are not silently reattached / use :UEDAPReattach" warning block.
+- **Synthetic-frame guard convergence:** added `ANCHOR(ue-synthetic-frame-guard)` doc-block on `frame_is_synthetic_or_invalid` naming the upstream nvim-dap `jump_to_frame` root cause; cross-referenced the three sites — `ANCHOR-USE:stackTrace` (the chokepoint), `ANCHOR-USE:_frame_set` (thin guard), `ANCHOR-USE:bp-response` (orthogonal path remap). No external behavior change. Recorded the D-OQ5 decision (stackTrace layer) in design.md.
+- **Unconditional cleanup:** `_common.lua` removed the dead `if false and …` adapter short-circuit (now always re-wires, comment explains env refresh); `_persist_bp.lua` fixed the no-op `set_breakpoints({ [bufnr] = nil })` to push the real restored list; `dap.lua` corrected the stale `dap.terminate` comment (`request="launch"` → `request="attach"`).
+- **ASLR slide D5 verification:** added `UE_DAP_NO_SLIDE` env switch in `lua/ue/dap/android.lua` to skip the explicit `target modules load --slide`. On-device verification showed the slide is **load-bearing** on this device (no-slide → attach timeout / `3221226505`), so the slide + plumbing were **kept**, not removed.
+- **Tooling/evidence:** new `tools/nvim_android_dap_livebp_gate.lua` (D1 feasibility gate, `NVIM_DAP_LIVEBP_CHANNEL=evaluate|setbreakpoints`) and `tools/nvim_android_dap_livebp_e2e.lua` (production-path E2E). Evidence under `tools/evidence/android-f9/` with README index.
+- **Tests:** `tests/cases/dap_spec.lua` — replaced the warning-gate assertion with "session-time setBreakpoints is gated and planted live (not warned)" (asserts the reattach warning is gone + live plant present); added "synthetic-frame guards converge on a single annotated chokepoint" (ANCHOR markers).
+- **Docs/spec:** `docs/CONSTRAINTS.md` K34 marked not-reproducing on current route; added K36 (live evaluate channel is the proven fix) and K37 (slide load-bearing). `docs/TOOLING.md` session-time F9 section rewritten for the live channel. `openspec/specs/android-dap-attach/spec.md` gained the "会话中 F9 变更经 live 通道即时下发" requirement + scenarios.
+
+**Pitfalls / Gotchas**
+- nvim-dap has **no before-request hook**: `listeners.before.setBreakpoints` runs in `handle_body`'s response pipeline (session.lua L1104-1109), same args as the after-listener. You cannot mutate the outgoing `args.source` there. The original `ue_android_bp_source_rewrite` name was misleading; the real wire-side basename match is owned by attachCommands + DWARF. Recovering the requested lines must read the stored `request` payload (`message_requests[seq]`), which is handed to both before- and after-listeners.
+- The D1 gate plants with its OWN channel code, so a passing gate does not prove the *wired* production listener works. The separate `livebp-e2e.lua` harness drives the real F9 flow (`dap.breakpoints.set` + `session:set_breakpoints`) and asserts `production_live_plant_diag=true` + `saw_reattach_warning=false`. First E2E run showed the production listener saw `line_count=0` (recovered from the wrong payload field) until the `request`-payload recovery was added.
+- The `3221226505` adapter exit on session teardown is expected (lldb-dap exits when we disconnect); it is NOT the K34 crash — `adapter_alive=true` is captured *before* teardown and the breakpoint hit precedes it.
+- Device residue (stray `lldb-server`, accumulated `adb forward`) caused false no-slide timeouts; `pkill -f lldb-server` + `adb forward --remove-all` between runs is required for clean D5 measurement.
+
+**Validation**
+- D1 gate (device `2e2df4cb`, target `MobileShadingRenderer.cpp:1367`, 3.5 matching symbols): channel B (evaluate) `resolved_after_plant=1`, `saw_breakpoint`, `stop.reason="breakpoint"`, `adapter_alive` → `livebp-gate.evaluate.result.json`; channel A (setBreakpoints) same hit → `livebp-gate.setbreakpoints.result.json`. **Conclusion: live feasible → 2A branch.**
+- Production E2E (`livebp-e2e.result.json`): `production_live_plant_diag=true`, `saw_reattach_warning=false`, `breakpoint list resolved=1`, `stop.reason="breakpoint"` hits.
+- D5 slide check: `UE_DAP_NO_SLIDE=1` → attach timeout / `3221226505` (`noslide-preseed.result.json`); slide-present baseline immediately hits (`slide-recheck.result.json`) → slide kept.
+- `nvim --headless -l tests/run.lua dap` → 17/17 passed.
+- `nvim --headless -l tests/run.lua` → 369/369 passed (full regression).
+- `openspec validate android-dap-live-breakpoints` → (run below).
+
+**Follow-ups**
+- 2B branch (live-infeasible) is N/A — gate proved feasibility. Slide removal (5.2) deferred: re-verify `UE_DAP_NO_SLIDE` on other devices/Android versions before removing the plumbing.
+
+### 2026-06-15 — fix(dap/android): drop hardcoded 3.4 symbol_lib fallback + archive smoke evidence
+
+**Task** — Remove the hardcoded banned 3.4 symbol library fallback that could silently short-circuit symbol auto-discovery, and tidy the F9 smoke evidence trail.
+
+**Implemented**
+- `lua/ue/dap/android.lua` `bootstrap_session`: removed the literal `E:/sample/zeqiang_sample_3.4/.../Client_Symbols_v170300916/Client-arm64/libUE4.so` fallback from the `ctx.android_symbol_lib` assignment. A literal path makes `pick_symbol_lib()` step 0 return it verbatim and skip the `packageInfo.txt` versionCode exact-match, so a stale build-id (`ad3d4e7c…`, 3.4) would attach and resolve breakpoints against the wrong source revision. Now falls through to config → packageInfo versionCode → newest-by-mtime glob → prompt (mirrors the `pick_package` nil fallthrough from `361b9e7`).
+- `tests/cases/dap_spec.lua`: added "bootstrap does not hardcode a symbol_lib fallback path" guarding against any `or "...libUE4.so"` fallback or string-literal `android_symbol_lib` assignment in `android.lua`.
+- `tools/evidence/android-f9/`: moved the five `nvim_android_dap_smoketest.*.result.json` smoke captures out of `tools/` into a dedicated evidence dir with a `README.md` index; updated the reference in `openspec/changes/fix-android-f9-breakpoint-hit/code-behavior-audit.md`.
+
+**Pitfalls / Gotchas**
+- The dangerous shape is specifically `... or "<path>.so"`: it forces a concrete library regardless of the installed APK build-id. The fix relies on `pick_symbol_lib`'s existing discovery chain, which already cross-matches the device versionCode — the hardcoded default was actively defeating it.
+- HEAD before this work still carried the `schedule_reattach` auto detach+reattach commits (`361b9e7`/`33fb69b`/`32c156f`); the working tree had already reverted them to the honest-warning design. This entry's edits sit on top of that honest-warning working tree, which `dap_spec` ("setBreakpoints must not silently detach and reattach") locks in.
+
+**Validation**
+- `nvim --headless -l tests/run.lua dap` → 16/16 passed (added the hardcode guard).
+- `nvim --headless -l tests/run.lua structure` → 36/36 passed (evidence move did not break dir/structure guards).
+- `nvim --headless -l tests/run.lua` → 368/368 passed (full regression).
+- `openspec validate fix-android-f9-breakpoint-hit` → passed.
+- Source grep confirms no remaining `zeqiang_sample_3.4` / `Client_Symbols_v170300916` literal outside an explanatory comment.
+
+**Follow-ups**
+- Optional: cross-check the picked symbol lib build-id against the device `libUE4.so` build-id at attach time and WARN on mismatch (honest-first), rather than trusting mtime alone.
+
+### 2026-06-15 — fix(dap/android): make F9 breakpoint handling evidence-driven
+
+**Task** — Rework the Android F9 breakpoint fix around the actual code path, removing false-success behavior and stale attach-route assumptions.
+
+**Implemented**
+- `lua/ue/dap/android.lua`: made Android attach-time breakpoint preseed the single owner, handling bufnr-keyed and path-keyed nvim-dap breakpoints, inserting quiet `breakpoint set` commands after signal disposition/ASLR rebase, and logging the final attach/post-run command set plus `breakpoint list` to `ue-dap-bp-diag.log`.
+- `lua/ue/dap.lua`: removed the duplicate Android attachCommands injector, dead synthetic breakpoint response, and silent auto reattach; active-session F9 changes now log real `setBreakpoints` responses and warn that explicit `:UEDAPReattach` is required unless a safe live command path is proven.
+- `tests/cases/dap_spec.lua`: added regressions for bufnr/path breakpoint collection, preseed insertion after ASLR rebase, immediate `breakpoint list`, and absence of the old duplicate preseed / auto-reattach paths.
+- `tools/nvim_android_dap_smoketest.lua`: updated the smoke harness to load `nvim-dap` under `nvim --headless -l`, use the current `ue.dap.android.attach()` path, honor explicit project/device/symbol env vars, write result files relative to the startup cwd, and continue through attach `SIGSTOP` without invoking the interactive `dap.continue()` prompt.
+- `tools/nvim_android_dap_smoketest.lua`: debounced the lldb-dap per-thread entry-stop burst before auto-continue, so the harness no longer races hundreds of `SIGSTOP` events and creates false `invalid thread` noise while proving breakpoint behavior.
+- `tools/nvim_android_dap_smoketest.lua`: installs `ue.setup_dap()` in headless mode before attach, captures LLDB console output into the result JSON, and parses `breakpoint list`, target `image lookup`, and DAP `setBreakpoints` responses into machine-readable fields.
+- `lua/ue/dap.lua`: skips custom source navigation for Android attach entry/SIGSTOP events while preserving breakpoint-stop navigation, keeping attach noise out of the F9 success path.
+- `lua/ue/dap.lua`: rewrites Android synthetic stackTrace frames to non-jumpable `line=-1` placeholder sources, avoiding both cursor `E474` and `Source missing` notifications while preserving frame IDs for scopes.
+- `lua/ue/dap.lua`: gates the Android active-session F9 warning behind `configurationDone`, so the initial DAP `setBreakpoints` sync for attach-before breakpoints is logged but no longer misreported as a user session-time change.
+- `docs/CONSTRAINTS.md`, `docs/TOOLING.md`, and `openspec/specs/android-dap-attach/spec.md`: aligned the documented Android route with K30 serial-form platform mode and made F9 success require LLDB `resolved>0`, adapter liveness, breakpoint stop event, and source-frame mapping.
+- `openspec/changes/fix-android-f9-breakpoint-hit/code-behavior-audit.md`: recorded the current F9 keymap, persistence, attach preseed, active-session `setBreakpoints`, and source-navigation design before applying runtime edits.
+
+**Pitfalls / Gotchas**
+- F9 only mutates nvim-dap's local breakpoint store; LLDB sees it only through attach-time preseed or the active-session DAP `setBreakpoints` path.
+- Session-time F9 is not safely equivalent to an immediate Android LLDB breakpoint today. The old silent detach/reattach made that look instant while changing the user's session under the hood.
+- Address breakpoint fallback and immediate LLDB command updates are intentionally not enabled without live proof that they map to the same source line and keep `lldb-dap` alive.
+- Early attach-before smoke proved a narrower failure layer than the original symptom: with the old 3.4 symbol lib, LLDB resolved file:line breakpoints but to code that did not match the user's local source revision.
+- The smoke harness must install the same `ue.setup_dap()` listeners used by real Neovim before attach; otherwise stackTrace/source guards are absent and line-0 attach frames create harness-only noise.
+- nvim-dap's initial `setBreakpoints` sync happens during session configuration even for attach-before breakpoints that were already preseeded into LLDB. Treating every Android `setBreakpoints` response as a session-time F9 change creates a false warning on the successful path.
+- Stripping `source` from all-synthetic Android frames avoids dap-src cursor errors but makes upstream nvim-dap emit `Source missing`; `line=-1` placeholder sources are the quieter non-jumpable shape.
+- The current `MobileShadingRenderer.cpp` on disk does not match the line table embedded in `Client_Symbols_v170300916/Client-arm64/libUE4.so`: local line 1367 is `Scene->UpdateMobileShadowSpotlight(nullptr);`, but LLDB resolves both source lines 1367 and 1369 to the compiled block at `FMobileSceneRenderer::Render + 672`, whose surrounding disassembly is the sky-atmosphere path. This is a source/symbol revision mismatch, not app-output evidence.
+- The matching symbol lib is the 3.5 `Client_Symbols_v171457238/Client-arm64/libUE4.so` build-id `648da3d17f2ac45ad0a6c5c1166cb248ae0baa1c`; with that symbol source, `MobileShadingRenderer.cpp:1367` resolves to the user's target line and hits.
+
+**Validation**
+- `nvim --headless -l tests/run.lua dap` -> 14/14 passed after the smoke parser and synthetic-frame guard updates.
+- Live Android smoke on `2e2df4cb`, `<android-package>`, fresh pid `25401`: `LaunchEngineLoop.cpp:4803` preseeded after ASLR rebase, `breakpoint list` resolved to `FEngineLoop::Tick() + 88`, DAP `setBreakpoints` returned `verified=true`, continue succeeded, and no `3221226505`; no breakpoint stop within 180s.
+- Live Android smoke on `2e2df4cb`, fresh pid `27308`: `MobileShadingRenderer.cpp:1361` preseeded after ASLR rebase, `breakpoint list` resolved to `FMobileSceneRenderer::Render(...) + 588`, DAP `setBreakpoints` returned `verified=true`, continue succeeded, and no `3221226505`; no breakpoint stop within 180s.
+- Live Android smoke on `2e2df4cb`, fresh pid `27308`: after entry-stop debounce, `LaunchEngineLoop.cpp:4803` preseeded after ASLR rebase, `breakpoint list` resolved to `FEngineLoop::Tick() + 88`, continue succeeded after 174 entry stops, adapter stayed alive, and no `invalid thread` storm; no breakpoint stop within 120s while the device remained on the GM/login screen.
+- Live Android smoke on `2e2df4cb`, active pid `27308`, target `MobileShadingRenderer.cpp:1369`: result JSON captured `breakpoint list` with `locations=1`, `resolved=1`, `hit count=0`, location `FMobileSceneRenderer::Render(...) + 672 at MobileShadingRenderer.cpp:1369:8`, address `0x0000007838794c4c`; target `image lookup` returned four line matches; DAP `setBreakpoints` returned adapter-native `verified=true` and local source mapping; no `reason="breakpoint"` stop within 120s.
+- The same `1369` smoke emitted the active-session reattach warning, did not emit `Vim:E474` or `Source missing`, left `<android-package>` alive with `TracerPid=0`, and left no `lldb-server` process.
+- Local LLDB symbol audit with `C:/tools/llvm-22.1.6/bin/lldb.exe`: `image lookup --file MobileShadingRenderer.cpp --line 1367` and `--line 1369` both resolve to `FMobileSceneRenderer::Render(...) + 672/+676/+712/+720 at MobileShadingRenderer.cpp:1369:8`; disassembly around `libUE4.so[0xef74c4c]` shows the resolved block is gated by `ShouldRenderSkyAtmosphere`, while the currently checked-out local source has `Scene->UpdateMobileShadowSpotlight(nullptr);` at line 1367.
+- Build-id audit: device `libUE4.so` is `648da3d17f2ac45ad0a6c5c1166cb248ae0baa1c`; old 3.4 symbol lib is `ad3d4e7c5f83823edbea33d7a9d5b13cb9153afc`; 3.5 `Client_Symbols_v171457238/Client-arm64/libUE4.so` matches the device build-id.
+- Local LLDB symbol audit with the matching 3.5 lib: `image lookup --file MobileShadingRenderer.cpp --line 1367` returns one match, `FMobileSceneRenderer::Render(...) + 616 at MobileShadingRenderer.cpp:1367:2`, address offset `libUE4.so[0x00000000166e9a80]`.
+- Live Android smoke on `2e2df4cb`, active pid `27308`, target `D:/project/uetemp/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp:1367`, matching 3.5 symbols: preseeded breakpoint resolved to `address=0x000000783ff09a80`, continue ran after 179 attach SIGSTOP entry stops, then DAP emitted `reason="breakpoint"` / `description="breakpoint 1.1 2.1"` with `hitBreakpointIds=[1,2]`.
+- The same matching-symbol smoke captured stackTrace frame 0 as `FMobileSceneRenderer::Render(FRHICommandListImmediate&, bool)` at local source `D:/project/uetemp/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp:1367`, proving the stop-frame local source mapping.
+- Post-smoke system cleanup: `<android-package>` remained alive at pid `27308`, `/proc/27308/status` reported `State: S (sleeping)` and `TracerPid: 0`, `pidof lldb-server` returned none, and host `Get-Process lldb/lldb-dap` returned none.
+- Local LLDB symbol audit with `C:/tools/llvm-22.1.6/bin/lldb.exe`: `image lookup --name FEngineLoop::Tick` resolved to `D:\project\uetemp\Engine\Source\Runtime\Launch\Private\LaunchEngineLoop.cpp:4802`; source-file `breakpoint set -f LaunchEngineLoop.cpp -l 4802/4803` resolved under K30 without adapter crash, so address fallback remains intentionally unimplemented.
+- Full regression `nvim --headless -l tests/run.lua` -> 366/366 passed.
+- `openspec validate fix-android-f9-breakpoint-hit` -> passed.
+
+**Follow-ups**
+- Only implement address fallback or active-session immediate breakpoint commands after live evidence proves source-file breakpoints are pending/crashing or the command path is stable.
+
 ### 2026-06-12 — fix(ue): make UE grep ignore CVar camelCase by default
 
 **Task** — Continue the `<leader>/` result-completeness fix for the actual query `r.useLandscape`; the picker was still missing expected mixed-case CVar hits.

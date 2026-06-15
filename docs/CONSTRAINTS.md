@@ -164,29 +164,78 @@
   解决: **永远用 K30 的 `connect://[<serial>]:<port>` serial 形式**，不用 localhost 形式。
   → 归档 change `2026-06-03-android-dap-platform-mode` design §E4
 
-- **K33 — source-file `breakpoint set -f <f> -l <N>` 崩溃 lldb-dap 22.1.6（待 platform 路径复验）**
+- **K33 — F9 成功判据必须包含 LLDB resolved + stop event**
+  症状: UI 里出现断点标记、甚至某些路径返回 `verified=true`，但目标进程运行到对应源码行
+  不停，或者 LLDB `breakpoint list` 仍是 pending / no locations。
+  解决: Android F9 断点成功必须同时满足：DAP 响应与真实状态一致、LLDB `breakpoint list`
+  对应断点 `resolved>0`、adapter 存活（无 `3221226505`）、目标触发 breakpoint stop、
+  stop frame 映射到正确本地源码行。UI 标记不算成功，合成 `verified=true` 禁止作为证明。
+  → `openspec/specs/android-dap-attach/spec.md`; change `fix-android-f9-breakpoint-hit`
+
+- **K34 — source-file `breakpoint set -f <f> -l <N>` 可能崩溃 lldb-dap 22.1.6（需按路线复验）**
   症状: 在直连 gdb-remote attach 路径下，attachCommands/post-attach 的 source-file
   `breakpoint set` 让 lldb-dap 在 DWARF 索引后退出 `3221226505`
   （STATUS_STACK_BUFFER_OVERRUN）。
-  解决: 接通断点需在 attach 稳定后选 preseed 或 address 断点（`image lookup --line` →
-  `breakpoint set --address`）；判据见归档 change 的 handshake-diagnostics "正解 vs
-  workaround"。注: 该崩溃在 gdb-remote 路径观察到，platform 路径下是否仍崩需复验。
-  → 归档 change `2026-06-03-android-dap-attach-bp-fix` / `-handshake-rootcause`
+  解决: 接通断点需在 attach 稳定后先证明 source-file 路径在当前 K30 platform route 下
+  不崩且 resolved；若不稳定，只能在 `image lookup --line` → `breakpoint set --address`
+  与 stop frame 语义等价被证明后采用 address 断点。不能把“碰巧不崩”或“UI 变绿”作为正解。
+  **现状（2026-06-15 真机 `2e2df4cb` 复验）: 在 K30 platform route + 3.5 匹配符号下
+  source-file `breakpoint set -f/-l` 不复现该崩溃**——闸门 evaluate 通道
+  `adapter_alive=true`、`resolved=1`、命中，端到端 live F9 亦命中。该崩溃为旧
+  gdb-remote 直连路线产物。session-time live 断点经 lldb-dap evaluate backtick 通道
+  下发是当前正解（非 work around）。证据 `tools/evidence/android-f9/livebp-*.result.json`。
+  → 归档 change `2026-06-03-android-dap-attach-bp-fix` / `-handshake-rootcause`;
+    change `android-dap-live-breakpoints`
+
+- **K35 — Android file:line 断点需要先 `target create` symbol-rich host libUE4.so**
+  症状: platform attach 只看到设备 stripped `libUE4.so` 时，file:line 断点长期 pending /
+  no locations，F9 不会命中。
+  解决: attachCommands 第一阶段先 `target create "<symbol-rich libUE4.so>"`，再走
+  `platform select` / serial-form `platform connect` / `process attach --pid`。后置
+  `target symbols add` / `target modules add` 不能替代这个顺序。
+  → `lua/ue/dap/android.lua`; `docs/changelog.md` 2026-05-21/2026-06-03 断点记录
+
+- **K36 — session-time live 断点经 lldb-dap evaluate 通道可行（本设备实证，非 work around）**
+  症状/背景: 历史 `361b9e7` 记录"attach 后写断点指令被内核静默丢弃，session-time live
+  断点物理不可行"，但那是旧 gdb-remote 直连路线/旧符号的观测。
+  解决/现状: 2026-06-15 真机 `2e2df4cb` D1 闸门 + 端到端复验——在 K30 platform route +
+  3.5 匹配符号下，attach 后 continue、再经 **lldb-dap evaluate backtick
+  `breakpoint set -f/-l`**（或 DAP setBreakpoints）下发断点 **resolved=1 且命中**，
+  adapter 存活（无 `3221226505`）。故会话中 F9 变更走 live evaluate 通道即时下发为正解，
+  **不再要求 `:UEDAPReattach`**，attach-time preseed 降级为初始快照。`361b9e7` 结论不适用
+  当前路线。证据 `tools/evidence/android-f9/livebp-gate.*.json` / `livebp-e2e.result.json`。
+  → change `android-dap-live-breakpoints`; `lua/ue/dap.lua`
+    `ue_android_live_plant_via_evaluate`
+
+- **K37 — 本设备 attach 不下发 `target modules load --slide` 则 attach 失败（slide 为 load-bearing）**
+  症状: 设 `UE_DAP_NO_SLIDE=1` 跳过显式 ASLR slide 时，attach 在 `android_attach_start`
+  后即超时、adapter 早退 `3221226505`，从不到 `initialized` / 命中。
+  解决: **保留** attachCommands 里的 `target modules load --file libUE4.so --slide 0x<base>`
+  及其 plumbing（`module_rebase_command` / `read_so_base_hex` / `_module_rebase_cmd`）。
+  旧注释"5/22 无 slide 也 resolved"在当前设备/版本不复现；删除前置条件（不下发 slide 仍
+  resolved+命中）未满足。`UE_DAP_NO_SLIDE` 环境开关保留供后续在其他设备/版本复验。
+  证据 `tools/evidence/android-f9/noslide-preseed.result.json`(timeout) vs
+  `slide-recheck.result.json`(ok)。
+  → change `android-dap-live-breakpoints` design D5/OQ#3; `lua/ue/dap/android.lua`
 
 ### 工具链 / LLVM
 
 - **K14 — LLVM 22.0–22.1.5 的 `lldb-dap.exe` 在 Windows 启动崩溃**
   症状: DAP client 一发 `initialize` 就 `STATUS_STACK_BUFFER_OVERRUN`(`0xC0000409`)。
   根因: `liblldb.dll` 的 `NativeFile` ctor 在 pipe FD 上调 `_get_osfhandle`，跨 CRT。
-  解决/现状: 当前用 **codelldb 1.12.2**（自带 patched liblldb，不受影响）。
-  → `docs/TOOLING.md` §"lldb-dap" + §"Active adapter (codelldb 1.12.2)"
+  解决/现状: Android DAP 当前使用 **LLVM 22.1.6+ `lldb-dap.exe`** forward-only 路线；
+  22.0–22.1.5 仍禁止，历史 codelldb 记录只保留作 crash 分析参考。
+  → `docs/TOOLING.md` §"Current Android DAP status"; `lua/utils/platform/windows.lua`
+  `default_lldb_dap_paths()`
   （LLVM #178155 / fix #195855 未 backport 到 release/22.x）
 
 - **K15 — 适配器迁移弧线（别照退役钉死项行事）**
-  历史: lldb-dap 21.1.8 side-load → **codelldb 1.12.2（当前）** → （git 上另有 lldb-dap
-  22.x platform-mode 探索分支）。`docs/TOOLING.md` 顶部 21.1.8 段落是**历史参考**，
-  其 `STATUS_STACK_BUFFER_OVERRUN` 分析仍有价值，但**当前生效的适配器是 codelldb 1.12.2**。
-  → `docs/TOOLING.md` 状态横幅; git log（`b9cce1d` merge `feat/lldb-dap-migration`、
+  历史: lldb-dap 21.1.8 side-load → codelldb 1.12.2 → **LLVM 22.1.6+ lldb-dap
+  forward-only（当前 Android DAP）**。`docs/TOOLING.md` 里的 21.1.8/codelldb 段落是
+  **历史参考**，其 crash 分析仍有价值，但当前 Android 行为以顶部
+  `Current Android DAP status` 和代码为准。
+  → `docs/TOOLING.md` 状态横幅; `lua/utils/platform/windows.lua` `default_lldb_dap_paths()`;
+  git log（`b9cce1d` merge `feat/lldb-dap-migration`、
   `7c70462`、release_1.0.3）
 
 ### snacks / clangd / lazy（活跃 workaround，共 9 个文件）
@@ -280,8 +329,8 @@
 | 组件 | 版本 | 备注 | 出处 |
 |------|------|------|------|
 | clangd / clang | **LLVM 22.1.x**（22.1.5 verified） | **不要降级到 21.x** —— super-unity CDB pipeline 与 `.idx` 格式依赖 22.x 行为 | `docs/TOOLING.md` §clangd |
-| DAP 适配器 | **codelldb 1.12.2**（当前） | 自带 patched liblldb；不需要 PATH 上的 `python310.dll`。路径解析见 `lua/utils/platform/windows.lua` `default_codelldb_paths()`，可经 `ue.config` `dap.codelldb_path` 覆盖 | `docs/TOOLING.md` §"Active adapter" |
-| lldb-server（Android） | **NDK 21.4.7075529**（LLDB 9.0.9, aarch64-android） | 必须匹配 libUE4.so 构建 NDK；NDK27/AS-bundled 在该 UE 目标 `gdbserver --attach` 会 Segfault（a3ad86f3 实测）。`default_lldb_server_paths()` 已钉 NDK21 首选 | `docs/TOOLING.md` §"Android lldb-server (current)" |
+| DAP 适配器（Android） | **LLVM 22.1.6+ `lldb-dap.exe`**（forward-only，当前） | Android platform-mode attach 以 `lua/utils/platform/windows.lua` `default_lldb_dap_paths()` 为准；首选 `C:/tools/lldb-22/install/bin/lldb-dap.exe`。不得静默降级到 LLVM 21 或历史 codelldb 路线。 | `docs/TOOLING.md` §"Current Android DAP status" |
+| lldb-server（Android） | **NDK 27 LLDB 18.x**（aarch64-android，platform server） | 当前 K30 路线使用 `/data/local/tmp/lldb-server platform --server --listen`，由 host serial-form `platform connect` 拉起目标 gdbserver；`gdbserver --attach` 路线已证伪。`default_lldb_server_paths()` 以 NDK27 platform server 为首选。 | `docs/TOOLING.md` §"Current Android DAP status" |
 | adb | Platform-Tools 35.x+ | | `docs/TOOLING.md` §adb |
 | Neovim | **0.10+** | 用到 `vim.uv` / `vim.system` / `vim.api.nvim__redraw` | `docs/TOOLING.md` §Neovim |
 | Go（构建 cindex-uefilter） | ≥ 1.22 | 仅构建 csearch 索引工具时需要 | `README.md` §8 |

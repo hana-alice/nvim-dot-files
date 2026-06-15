@@ -45,6 +45,7 @@
 |---|---|
 | Android DAP attach platform 模式（宪法级 K30） | `openspec/changes/archive/2026-06-03-android-dap-platform-mode/` |
 | Android DAP attach handshake 根因 | `openspec/changes/archive/2026-06-03-android-dap-attach-handshake-rootcause/` |
+| Android DAP session-time live 断点（K36/K37，evaluate 通道正解） | ADR `docs/plans/2026-06-15-android-dap-live-breakpoints.md`；归档 `openspec/changes/archive/2026-06-15-android-dap-live-breakpoints/` |
 
 ## 新增一条决策
 

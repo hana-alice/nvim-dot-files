@@ -393,18 +393,28 @@ local function pick_source_map(ctx)
   -- via UEDAPDiag section E, follow-up #9 root cause). One canonical
   -- backslash entry matches DWARF emitted with either separator.
   --
-  -- Engine sources are only resolvable if the user has a local Engine
-  -- tree under project_root/Engine. When absent, the Engine map is
-  -- omitted — frames just won't show source for Engine code (expected).
+  -- Engine sources are resolvable when either project_root/Engine exists
+  -- or the original build-machine Engine root exists locally. The broad
+  -- build-root -> project-root mapping is still useful for project source,
+  -- but without the more specific Engine entry it can rewrite valid Engine
+  -- DWARF paths into nonexistent project_root/Engine paths.
   local proot = effective_project_root(ctx)
   if not proot then return nil end
-  local sm = {
-    { from = "D:\\project\\uetemp", to = proot },
-  }
-  if fs.is_dir(proot .. "/Engine") then
+  local build_root = fs.norm((ctx and ctx.android_build_root)
+    or ue_cfg_get("dap.android_build_root")
+    or "D:/project/uetemp")
+  local sm = {}
+  local build_engine = build_root .. "/Engine"
+  local project_engine = proot .. "/Engine"
+  if fs.is_dir(project_engine) then
     -- Prefer explicit Engine→Engine mapping if the user has source locally.
-    table.insert(sm, 1, { from = "D:\\project\\uetemp\\Engine", to = proot .. "/Engine" })
+    table.insert(sm, { from = build_engine, to = project_engine })
+  elseif fs.is_dir(build_engine) then
+    -- Keep local Engine DWARF paths local instead of letting the broader
+    -- build-root mapping rewrite them to a nonexistent project Engine path.
+    table.insert(sm, { from = build_engine, to = build_engine })
   end
+  table.insert(sm, { from = build_root, to = proot })
   return sm
 end
 
@@ -427,6 +437,20 @@ end
 
 local function shell_quote(s)
   return "'" .. tostring(s or ""):gsub("'", "'\\''") .. "'"
+end
+
+local function append_bp_diag(lines)
+  if type(lines) == "string" then lines = { lines } end
+  if type(lines) ~= "table" then return end
+  pcall(function()
+    local path = vim.fn.stdpath("cache") .. "/ue-dap-bp-diag.log"
+    local fh = io.open(path, "a")
+    if not fh then return end
+    for _, line in ipairs(lines) do
+      fh:write(tostring(line), "\n")
+    end
+    fh:close()
+  end)
 end
 
 
@@ -523,8 +547,8 @@ end
 -- Read the ASLR load base of a shared object from the device process maps.
 -- Returns the base as a lowercase hex string WITHOUT the "0x" prefix, or nil.
 --
--- WHY this exists: after a gdb-remote attach lldb does NOT relocate modules to
--- their on-device load address automatically. Without an explicit
+-- WHY this exists: Android remote attach can leave the symbol-rich host module
+-- without the device ASLR load address. Without an explicit
 -- `target modules load --file <so> --slide 0x<base>`, every file:line
 -- breakpoint resolves against the .so's preferred (file) base and lands at the
 -- wrong runtime address — F9 silently never fires. (See
@@ -903,7 +927,12 @@ local function attach_commands(session)
   -- redundant-but-harmless (idempotent if the base matches). If it ever causes
   -- a "multiple modules match" error (seen in load_at_addr.txt when a stray
   -- stripped copy also loaded), drop it and rely on auto-relocation.
-  if session and session._module_rebase_cmd and session._module_rebase_cmd ~= "" then
+  --
+  -- D5 verification hook: set UE_DAP_NO_SLIDE=1 to skip the explicit slide so a
+  -- real-device run can confirm `breakpoint list resolved=1` + hit WITHOUT it
+  -- (the precondition for permanently removing this plumbing).
+  if session and session._module_rebase_cmd and session._module_rebase_cmd ~= ""
+    and (vim.env.UE_DAP_NO_SLIDE or "") == "" then
     cmds[#cmds + 1] = session._module_rebase_cmd
   end
   return cmds
@@ -927,24 +956,24 @@ end
 -- resume here. We DO use them to dump breakpoint-diagnosis state to a host file
 -- via `command script` is unavailable (nopython host), so instead we emit the
 -- info into the lldb-dap console which the protocol log captures; additionally
--- we write a focused report by running `breakpoint set` for the configured
--- probe file and logging `breakpoint list` — all read-only / non-resuming.
+-- we write a focused report by running `image lookup` for the configured
+-- probe file and logging `breakpoint list` — all non-mutating / non-resuming.
 --
 -- The diagnosis lines land in stdpath('cache')/ue-dap-bp-diag.log written by
 -- the on-console listener in lua/ue/dap.lua (D._dap_bp_diag_*). Here we just
 -- issue the read-only probe commands so that listener has something to capture.
 local function post_run_commands(session)
   local cmds = {}
-  -- Read-only breakpoint diagnosis (K33). These do NOT resume the inferior.
+  -- Breakpoint diagnosis (K33). These do NOT resume the inferior.
   -- `image list libUE4.so` → confirms module loaded + ASLR base.
-  -- A probe `breakpoint set` + `breakpoint list` → shows whether file:line
-  -- resolves (locations=1) or stays pending (the R cause).
+  -- `image lookup` + `breakpoint list` shows whether symbols and preseeded
+  -- breakpoints resolve without planting an extra diagnostic breakpoint.
   local probe_file = session and session._bp_probe_file or nil
   local probe_line = session and session._bp_probe_line or nil
   cmds[#cmds + 1] = "image list libUE4.so"
-  cmds[#cmds + 1] = "image lookup --file libUE4.so --regex --name FEngineLoop"  -- cheap "is DWARF present" probe
+  cmds[#cmds + 1] = "image lookup --name FEngineLoop::Tick"  -- cheap symbol/DWARF presence probe
   if probe_file and probe_line then
-    cmds[#cmds + 1] = string.format("breakpoint set -f %s -l %d", probe_file, probe_line)
+    cmds[#cmds + 1] = string.format('image lookup --file "%s" --line %d', probe_file, probe_line)
   end
   cmds[#cmds + 1] = "breakpoint list"
   return cmds
@@ -953,9 +982,10 @@ end
 -- Build the lldb-dap DAP config for the current session.
 --
 -- lldb-dap uses the DAP `attach` request with custom `attachCommands` for
--- non-trivial attach flows. Android uses a pre-spawned `lldb-server
--- gdbserver --attach` and `gdb-remote 127.0.0.1:<port>` here; nvim-dap just
--- hands the command list to lldb-dap which executes it in order.
+-- non-trivial attach flows. Android uses the K30 platform route here:
+-- platform select remote-android -> platform connect connect://[serial]:port
+-- -> process attach --pid. nvim-dap just hands the command list to lldb-dap
+-- which executes it in order.
 
 local function current_breakpoint_commands()
   local ok_bps, bps_mod = pcall(require, "dap.breakpoints")
@@ -976,7 +1006,7 @@ local function current_breakpoint_commands()
     if type(path) ~= "string" or path == "" or not line or line < 1 then return end
     local file = vim.fs.basename(path)
     if not file or file == "" then return end
-    local cmd = string.format('breakpoint set -f "%s" -l %d', file, line)
+    local cmd = string.format('?breakpoint set -f "%s" -l %d', file, line)
     if seen[cmd] then return end
     seen[cmd] = true
     cmds[#cmds + 1] = cmd
@@ -999,13 +1029,9 @@ local function preseed_breakpoints_into_attach_commands(cfg)
   if #cmds == 0 then return end
   local insert_at = #cfg.attachCommands + 1
   for i, cmd in ipairs(cfg.attachCommands) do
-    -- Insert after signal disposition, not immediately after gdb-remote.
-    -- In this direct gdb-remote attach flow, quiet `?breakpoint set ...`
-    -- immediately after `?gdb-remote` can crash lldb-dap 22.1.6 before it
-    -- even prints the command; bare LLDB and prior probes show the safer
-    -- order is: target create -> gdb-remote -> process handle -> breakpoint
-    -- set, all still inside attachCommands and before nvim-dap's post-attach
-    -- DAP setBreakpoints path.
+    -- Breakpoints must be inserted after the target is attached and after
+    -- signal disposition. If an ASLR rebase command is present, continue
+    -- scanning so file:line breakpoints are inserted after the rebase.
     if tostring(cmd):find("process handle SIGPIPE", 1, true) then
       insert_at = i + 1
       -- keep scanning: if an ASLR rebase command follows, breakpoints MUST be
@@ -1019,6 +1045,7 @@ local function preseed_breakpoints_into_attach_commands(cfg)
   for i = #cmds, 1, -1 do
     table.insert(cfg.attachCommands, insert_at, cmds[i])
   end
+  table.insert(cfg.attachCommands, insert_at + #cmds, "breakpoint list")
 end
 
 local function lldb_dap_attach_config(session, source_map)
@@ -1196,9 +1223,17 @@ local function bootstrap_session(opts, on_ready)
   -- Android package name.
   ctx.android_serial = ctx.android_serial or opts.serial or opts.android_serial
     or (M._last_session and M._last_session.serial)
+  -- NOTE: do NOT hardcode a symbol_lib fallback here. A literal path short-
+  -- circuits pick_symbol_lib() (its step 0 returns any existing ctx path
+  -- verbatim, skipping the packageInfo.txt versionCode exact-match step), so a
+  -- stale build-id lib would attach and resolve breakpoints to the WRONG source
+  -- revision (the 3.4 `ad3d4e7c…` false-lead in docs/CONSTRAINTS.md / handoff).
+  -- Leave it nil when no explicit/last-session source is known so pick_symbol_lib
+  -- falls through to: ue.config.dap.android_symbol_lib → packageInfo versionCode
+  -- exact match → newest-by-mtime glob → prompt. Mirrors the pick_package nil
+  -- fallthrough (commit 361b9e7).
   ctx.android_symbol_lib = ctx.android_symbol_lib or ctx.symbol_lib or opts.symbol_lib
     or opts.android_symbol_lib or (M._last_session and M._last_session.symbol_lib)
-    or "E:/aki/zeqiang_aki_3.4/Source/Client/Binaries/Android/Client_Symbols_v170300916/Client-arm64/libUE4.so"
   local P = require("ue.dap._progress")
 
   local sess = M._session
@@ -1296,25 +1331,44 @@ local function _finalize_session(sess, pid, cfg_name, run_label)
   local cfg = lldb_dap_attach_config(sess, sess.source_map)
   cfg.name = cfg_name
   -- K33 diagnosis: pick the first current nvim breakpoint as the post-attach
-  -- probe so post_run_commands logs a real `breakpoint set` + `breakpoint list`
-  -- to stdpath('cache')/ue-dap-bp-diag.log. Read-only, does not resume.
+  -- probe so post_run_commands logs `image lookup` + `breakpoint list` to
+  -- stdpath('cache')/ue-dap-bp-diag.log. Non-mutating, does not resume.
   do
-    local bps = ue_android_collect_current_breakpoints and {} or {}
     local ok_c, cur = pcall(current_breakpoint_commands)
     if ok_c and type(cur) == "table" and #cur > 0 then
-      local f, l = tostring(cur[1]):match('breakpoint set %-f "([^"]+)" %-l (%d+)')
+      local first = tostring(cur[1]):gsub("^%?", "")
+      local f, l = first:match('breakpoint set %-f "([^"]+)" %-l (%d+)')
       if f and l then sess._bp_probe_file = f; sess._bp_probe_line = tonumber(l) end
     end
   end
   -- Preseed file:line breakpoints as attachCommands, inserted AFTER the ASLR
   -- `target modules load --slide` so they resolve against the relocated module.
   -- NOTE (K33): source-file `breakpoint set -f` has been observed to crash
-  -- lldb-dap 22.1.6 (3221226505) on the gdb-remote route; under the platform
-  -- route this needs real-device re-verification. If it crashes, switch to
-  -- address breakpoints (image lookup --line -> breakpoint set --address).
+  -- lldb-dap 22.1.6 (3221226505) on prior Android routes; under the current
+  -- K30 platform route this needs real-device re-verification. If it crashes,
+  -- switch to address breakpoints (image lookup --line -> breakpoint set
+  -- --address) only with semantic-equivalence proof.
   preseed_breakpoints_into_attach_commands(cfg)
   -- post_run_commands needs the probe fields, so rebuild it now that they're set.
   cfg.postRunCommands = post_run_commands(sess)
+  do
+    local lines = {
+      "== UE Android DAP attach breakpoint audit ==",
+      ("serial=%s pid=%s port=%s package=%s"):format(
+        tostring(sess.serial), tostring(sess.pid), tostring(sess.port), tostring(sess.package_name)),
+      "symbol_lib=" .. tostring(sess.symbol_lib),
+      "module_rebase_cmd=" .. tostring(sess._module_rebase_cmd),
+      "-- attachCommands --",
+    }
+    for i, cmd in ipairs(cfg.attachCommands or {}) do
+      lines[#lines + 1] = ("%02d %s"):format(i, tostring(cmd))
+    end
+    lines[#lines + 1] = "-- postRunCommands --"
+    for i, cmd in ipairs(cfg.postRunCommands or {}) do
+      lines[#lines + 1] = ("%02d %s"):format(i, tostring(cmd))
+    end
+    append_bp_diag(lines)
+  end
   C.run(cfg, run_label)
   -- Progress popup finalized by ue.dap.lua's event_initialized listener
   -- (P.done) or by stop_android_debugger / on_session_end (P.hide).
@@ -1598,6 +1652,14 @@ end
 
 function M._lldb_dap_attach_config_for_test(session, source_map)
   return lldb_dap_attach_config(session, source_map)
+end
+
+function M._current_breakpoint_commands_for_test()
+  return current_breakpoint_commands()
+end
+
+function M._preseed_breakpoints_into_attach_commands_for_test(cfg)
+  return preseed_breakpoints_into_attach_commands(cfg)
 end
 
 function M._pick_package_for_test(ctx)

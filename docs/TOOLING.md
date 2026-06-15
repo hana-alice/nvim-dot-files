@@ -2,16 +2,60 @@
 
 External binaries and version constraints for this Neovim configuration.
 
+> **Regression tests:** run `nvim --headless -l tests/run.lua` (or
+> `pwsh -File scripts/run_regression.ps1` on Windows) after any change.
+> Full guide: [`testing-regression.md`](testing-regression.md).
+
 This file is **English-only** (this repo is mirrored to a public GitHub
 remote). Keep notes here factual and reproducible.
 
-> **Status (2026-05-13): the `lldb-dap 21.1.8 side-load` route below is
-> superseded.** The active Android / Win64 DAP adapter is **codelldb
-> 1.12.2** (see *Active adapter (codelldb 1.12.2)* at the bottom of this
-> file). The 21.1.8 section is retained verbatim because the
-> `STATUS_STACK_BUFFER_OVERRUN` analysis is still useful reference for
-> anyone who later tries to revisit a stock LLVM-shipped `lldb-dap.exe`
-> on Windows.
+## Current Android DAP status
+
+As of 2026-06-15, the active Android route in `lua/ue/dap/android.lua` is:
+
+```text
+nvim-dap
+  -> LLVM 22.1.6+ lldb-dap.exe
+    -> lldb-server platform --server --listen *:<port>
+      -> platform connect connect://[<adb-serial>]:<port>
+      -> process attach --pid <pid>
+```
+
+Hard constraints:
+
+- Use serial-form `platform connect connect://[<serial>]:<port>`.
+- Do not use `platform connect connect://localhost:<port>` or
+  `connect://127.0.0.1:<port>` for Android.
+- Do not use `lldb-server gdbserver --attach <pid>` as the production route.
+- Stage `lldb-server` under `/data/local/tmp/lldb-server`; platform mode does
+  not require the binary inside the app sandbox.
+- Prefer the NDK 27 LLDB 18.x `lldb-server` for the platform server path, as
+  ordered by `lua/utils/platform/windows.lua`.
+
+Android F9 breakpoint success requires evidence from the debugger, not just UI:
+
+- DAP `setBreakpoints` response must reflect the real state.
+- `breakpoint list` must show the target location as `resolved>0`.
+- The adapter must stay alive, with no `3221226505`.
+- The inferior must emit a breakpoint stop event.
+- The selected frame must map back to the expected local source line.
+
+Attach-time breakpoint preseed is owned by `lua/ue/dap/android.lua`. Generic
+host-side DAP glue in `lua/ue/dap.lua` must not inject Android attachCommands.
+Session-time F9 changes (after `configurationDone`) are planted **live** through
+the lldb-dap evaluate backtick `breakpoint set -f/-l` channel
+(`ue_android_live_plant_via_evaluate` in `lua/ue/dap.lua`); they resolve and hit
+without a reattach (verified on device `2e2df4cb`, 2026-06-15 — see
+`docs/CONSTRAINTS.md` K36 and `tools/evidence/android-f9/livebp-*.json`). The
+live plant reads back `breakpoint list resolved=N` and surfaces an honest
+warning on `resolved=0`; it MUST NOT fake success and MUST NOT silent
+detach+reattach. The explicit `target modules load --slide` ASLR rebase remains
+load-bearing on this device (K37); `UE_DAP_NO_SLIDE=1` skips it for re-verification.
+
+> **Historical sections below:** the older lldb-dap 21.1.8 side-load and
+> codelldb 1.12.2 notes are retained because their crash analyses remain useful
+> reference. For current Android behavior, follow **Current Android DAP status**
+> above and the source in `lua/ue/dap/android.lua`.
 
 ## clangd / clang (C++ LSP + indexer)
 
@@ -23,7 +67,7 @@ remote). Keep notes here factual and reproducible.
 Do **not** downgrade clang/clangd to 21.x — the super-unity CDB pipeline
 and `.idx` format depend on 22.x behavior.
 
-## lldb-dap (DAP debugger adapter, Windows)
+## Historical lldb-dap 21 side-load (DAP debugger adapter, Windows)
 
 - **Required**: LLVM **21.1.8** — **NOT 22.x**
 - **Install path**: `C:\tools\lldb-21\bin\` (private side-load, not on PATH)
@@ -114,10 +158,10 @@ backward-compatible; verified working for `platform select remote-android`
 
 ---
 
-## Active adapter (codelldb 1.12.2)
+## Historical adapter route (codelldb 1.12.2)
 
-> Added 2026-05-13. This is the route the editor actually uses today —
-> the 21.1.8 section above is kept as historical reference.
+> Added 2026-05-13. Retained as historical reference; current Android DAP
+> behavior is documented in **Current Android DAP status**.
 
 ### Why codelldb (and not stock lldb-dap)
 
@@ -178,29 +222,33 @@ nvim-dap
   rewrites terminate→`disconnect{terminateDebuggee=false}` for UE
   Android sessions (= ■ button detaches instead of killing the game).
 
-## Android lldb-server (current)
+## Android lldb-server (platform route)
 
-- **Required**: NDK **27** `lldb-server` for `aarch64-android` (LLDB 18)
-- **Install path glob**: `%LOCALAPPDATA%\Android\Sdk\ndk\27.*\toolchains\llvm\prebuilt\windows-x86_64\lib\clang\18\lib\linux\aarch64\lldb-server`
-- Pushed to device by `lua/ue/dap/android.lua`:
-  - host:                                  `<NDK>/.../lldb-server`
-  - device staging:                        `/data/local/tmp/lldb-server-ndk27`
-  - app sandbox (via `run-as`):            `/data/data/<pkg>/lldb-server-ndk27`
-- Command on device: `lldb-server-ndk27 gdbserver --attach <pid> 127.0.0.1:<port>`
+- **Required**: NDK 27 LLDB 18.x `lldb-server` for `aarch64-android` for the
+  platform server route.
+- **Install path glob**:
+  `%LOCALAPPDATA%\Android\Sdk\ndk\27.*\toolchains\llvm\prebuilt\*\lib\clang\*\lib\linux\aarch64\lldb-server`
+- Resolution: `lua/utils/platform/windows.lua` `default_lldb_server_paths()`
+  lists NDK 27 first for platform mode, then other NDK / Android Studio
+  fallbacks.
+- Pushed to device by `lua/ue/dap/android.lua` as `/data/local/tmp/lldb-server`.
+- Command on device:
+  `cd /data/local/tmp && ./lldb-server platform --server --listen *:<port>`.
 
-Why **NDK 27**, not NDK 21 (the version that built libUE4.so):
+Do not use `lldb-server gdbserver --attach <pid>` as the production path. That
+route has separate historical notes in `docs/CONSTRAINTS.md` K31/K34 and is
+retained only as diagnostic background.
 
-- `gdbserver --attach` does NOT use the `qLaunchGDBServer` handshake;
-  the LLDB-version-mismatch deadlock that motivated NDK-21-pinning in
-  the old lldb-dap+platform-mode route does not apply here.
-- NDK 21's lldb-server is too old to attach reliably under Android 12+.
-- Cross-major gdb-remote (host LLDB 22 ↔ device LLDB 18) is empirically
-  stable; verified against UE 5.x `libUnreal.so`.
+### Environment requirements (Android DAP, verified on a3ad86f3)
 
-The platform driver's `default_lldb_server_paths()` glob list still
-contains NDK 21 entries — those are for the *retired* lldb-dap route
-and are kept for backwards compatibility. `ue.dap.android` resolves
-**all** matches and picks the highest NDK version.
+| Component        | Required                                                        |
+| ---------------- | --------------------------------------------------------------- |
+| Host adapter     | LLVM 22.1.6+ `lldb-dap.exe` (forward-only)                      |
+| Device server    | **NDK 27 LLDB 18.x** `lldb-server` platform server (arm64)      |
+| Device           | arm64-v8a, app **DEBUGGABLE**, `run-as <pkg>` usable            |
+| Host symbol .so  | symbol-rich `libUE4.so` (e.g. `.../Client_Symbols_v*/Client-arm64/libUE4.so`) |
+| Validation scope | adb serial `a3ad86f3` only (other devices need their own proof) |
+
 
 ## Pitfalls (codelldb route, hard-won)
 

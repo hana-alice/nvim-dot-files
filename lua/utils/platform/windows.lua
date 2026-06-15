@@ -67,21 +67,18 @@ function M.default_lldb_dap_paths()
   --    in llvm/llvm-project#178155 is NOT reproducible against this
   --    build — that issue was for the 22.1.4/5 distribution shipped on
   --    GitHub Releases; our self-built 22.1.6 is fine.
-  -- 2. Program Files/LLVM/bin/lldb-dap.exe — whatever the user installed
-  --    system-wide. May be 22.x or 21.x; LLVM Installer usually ships
-  --    the latest stable.
-  -- 3. C:/tools/lldb-21/bin/lldb-dap.exe — historic 21.1.8 fallback for
-  --    hosts that DO hit the 22.x startup crash. Kept last so it doesn't
-  --    accidentally win on an Android-platform-mode workflow (21.1.8's
-  --    platform protocol handshake is incompatible with NDK 27 server,
-  --    confirmed by reproducing "Connection shut down by remote side
-  --    while waiting for reply to initial handshake packet" in headless
-  --    e2e on 2026-05-21).
+  -- 2. Program Files/LLVM/bin/lldb-dap.exe — system-wide LLVM, but it
+  --    MUST be 22.1.6 or newer before use. Do not fall back to LLVM 21:
+  --    Android platform-mode was debugged and fixed on 22.1.6, and future
+  --    changes are allowed to move forward only after a fresh probe pass.
+  --
+  -- Version policy: host-side lldb-dap is forward-only. If 22.1.6 is
+  -- unavailable or broken, fail loudly and install/fix a 22.1.6+ build;
+  -- never silently downgrade to C:/tools/lldb-21 or another older adapter.
   local pf = (vim.uv or vim.loop).os_getenv("ProgramFiles") or "C:/Program Files"
   return {
     "C:/tools/lldb-22/install/bin/lldb-dap.exe",
     pf .. "/LLVM/bin/lldb-dap.exe",
-    "C:/tools/lldb-21/bin/lldb-dap.exe",
     "C:/Program Files/LLVM/bin/lldb-dap.exe",
     "C:/Program Files (x86)/LLVM/bin/lldb-dap.exe",
   }
@@ -91,24 +88,30 @@ function M.default_lldb_server_paths()
   -- Android NDK / Android Studio side-by-side. Globs are resolved by
   -- callers because `vim.fs.find` semantics differ from shell globs.
   --
-  -- CRITICAL ORDERING (see commit 144c28d): the lldb-server pushed to the
-  -- device MUST match the NDK that built libUE4.so / libUnreal.so. UE 4.x/5.x
-  -- ships with NDK 21.4.7075529 (clang 9.0.9). When a newer NDK is installed
-  -- side-by-side and picked instead, the LLDB wire protocol (qLaunchGDBServer
-  -- handshake) deadlocks against an LLVM 21+ lldb-dap client. Pin r21 first,
-  -- then Android Studio's bundled lldb, then anything else as a fallback.
+  -- ORDERING for PLATFORM MODE (docs/CONSTRAINTS.md K30, real-device verified
+  -- 5/21 e51cbe6 + 2026-06-03): the device server runs `lldb-server platform
+  -- --server --listen` and the host connects via
+  -- `platform connect connect://[<serial>]:<port>`; lldb-server platform forks
+  -- the per-target gdbserver itself. NDK 27 LLDB 18 is the verified-working
+  -- platform server for this UE target on Android 16. (The earlier NDK-21-first
+  -- ordering was for the abandoned `gdbserver --attach` route — K31, which never
+  -- bound its listen port at all; version-matching mattered there but the route
+  -- is dead.) Prefer NDK 27, then any NDK, then Android Studio bundled.
   local localappdata = (vim.uv or vim.loop).os_getenv("LOCALAPPDATA") or ""
   local out = {}
   if localappdata ~= "" then
+    -- NDK 27 LLDB 18 — verified working platform server (2026-06-03).
     out[#out + 1] = localappdata
-      .. "/Android/Sdk/ndk/21.*/toolchains/llvm/prebuilt/*/lib64/clang/*/lib/linux/aarch64/lldb-server"
-    out[#out + 1] = localappdata
-      .. "/Programs/Android Studio*/plugins/android-ndk/resources/lldb/android/arm64-v8a/lldb-server"
-    out[#out + 1] = localappdata
-      .. "/Android/Sdk/ndk/*/toolchains/llvm/prebuilt/*/lib64/clang/*/lib/linux/aarch64/lldb-server"
-    -- NDK 26+ dropped the lib64 suffix.
+      .. "/Android/Sdk/ndk/27.*/toolchains/llvm/prebuilt/*/lib/clang/*/lib/linux/aarch64/lldb-server"
+    -- Any NDK with the newer (no-lib64) layout.
     out[#out + 1] = localappdata
       .. "/Android/Sdk/ndk/*/toolchains/llvm/prebuilt/*/lib/clang/*/lib/linux/aarch64/lldb-server"
+    -- Older NDKs (lib64 suffix, e.g. r21/r22).
+    out[#out + 1] = localappdata
+      .. "/Android/Sdk/ndk/*/toolchains/llvm/prebuilt/*/lib64/clang/*/lib/linux/aarch64/lldb-server"
+    -- Android Studio bundled lldb — last-resort fallback.
+    out[#out + 1] = localappdata
+      .. "/Programs/Android Studio*/plugins/android-ndk/resources/lldb/android/arm64-v8a/lldb-server"
   end
   return out
 end

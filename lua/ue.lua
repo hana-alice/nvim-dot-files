@@ -675,7 +675,7 @@ function M.clangd_cmd(root_dir)
     "--header-insertion=never",
     "--pch-storage=memory",
     "--clang-tidy=false",               -- 显式关 tidy（.clangd 已 Remove '*'，cmdline 兜底防回归）
-    "--function-arg-placeholders",
+    "--function-arg-placeholders=true",
     "--limit-results=200",
     "--limit-references=200",
     "--query-driver=**/clang*.exe,**/clang*,**/gcc,**/g++,**/cc,**/c++,**/cl.exe",
@@ -1225,13 +1225,35 @@ local function current_engine_root(preferred_bufname)
   return nil
 end
 
+-- Derive the per-platform cache subdir key from a state table.
+-- Same shape as ue.cdb.shards.shard_key ("<Platform>-<Target>-<Config>") but
+-- we only have platform + configuration in state (no target), so the key is
+-- "<Platform>-<Config>" (config with " Editor" suffix stripped, matching the
+-- shard config segment). Returns "" when no platform is set yet → callers
+-- fall back to the legacy single-path cache layout.
+--
+-- Parked on CORE_RT (not a top-level local) to stay under the LuaJIT 200-local
+-- cap. Pure function — safe to call from resolve_context / set_platform.
+function CORE_RT.platform_key_from_state(state)
+  state = state or {}
+  local plat = (state.target_platform or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if plat == "" then return "" end
+  local conf = (state.target_configuration or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  conf = conf:gsub(" Editor$", "")
+  if conf == "" then return plat end
+  return plat .. "-" .. conf
+end
+
 -- Cache layout v3 (2026-05-09):
 --   .cache/nvim-ue/                           -- single root, all cache lives here
 --     state.json                              -- top-level (scanner-friendly)
---     csearch/csearch.idx                     -- trigram index
---     gtags/                                  -- gtags input lists + DB
+--     csearch/<platform_key>/csearch.idx      -- trigram index (per-platform, v3.1)
+--     gtags/<platform_key>/                   -- gtags input lists + DB (per-platform, v3.1)
 --       workspace/         (GTAGS DB)
 --       workspace.files / workspace_all.files / engine.files / project.files
+--     (legacy single-path csearch/csearch.idx + gtags/*.files auto-migrated
+--      into the active platform_key dir on first resolve — see
+--      migrate_legacy_csearch_if_needed)
 --     cdb/                                    -- clangd compile-db assets
 --       modules.json, queue.json
 --       compile_commands/{current,hot,full,inject_full}.json
@@ -1241,10 +1263,28 @@ end
 --     logs/                                   -- ue.lua _logged_jobstart sink + indexer logs
 --     runtime/dirty.json                      -- watcher persistence
 --     legacy/                                 -- pre-v2 holdouts (manual prune)
-cache_paths = function(engine_root)
+-- cache_paths(engine_root, platform_key)
+--
+-- platform_key (optional): a "<Platform>-<Target>-<Config>" string (same shape
+-- as ue.cdb.shards.shard_key) used to give csearch + the grep file lists their
+-- OWN per-platform subdirectory. Rationale: a user who builds Android then
+-- switches to Win64 should keep BOTH csearch indices on disk — switching
+-- platform must not wipe the other platform's grep index (matches the cdb
+-- shard model). When platform_key is nil/"" we fall back to the legacy
+-- single-path layout (csearch/csearch.idx, gtags/workspace_all.files); this
+-- preserves backward compat AND is the migration source (see
+-- migrate_legacy_csearch_if_needed).
+--
+-- Only the grep-facing artifacts (csearch index + workspace/project/engine
+-- file lists + gtags DB) are sharded by platform. state.json, cdb shards
+-- (already platform-keyed internally), clangd index, pch, logs, runtime stay
+-- at the single top-level location.
+cache_paths = function(engine_root, platform_key)
   local cache = join(engine_root, ".cache", "nvim-ue")
-  local csearch_dir = join(cache, "csearch")
-  local gtags_root = join(cache, "gtags")
+  platform_key = (type(platform_key) == "string" and platform_key ~= "") and platform_key or nil
+  -- Per-platform subdir for grep artifacts; legacy single path when no key.
+  local csearch_dir = platform_key and join(cache, "csearch", platform_key) or join(cache, "csearch")
+  local gtags_root = platform_key and join(cache, "gtags", platform_key) or join(cache, "gtags")
   local cdb_dir = join(cache, "cdb")
   local cdb_files_dir = join(cdb_dir, "compile_commands")
   local logs_dir = join(cache, "logs")
@@ -1257,14 +1297,15 @@ cache_paths = function(engine_root)
   return {
     cache = cache,
     state = join(cache, "state.json"),
-    -- gtags
+    platform_key = platform_key,
+    -- gtags (per-platform when platform_key set)
     gtags_root = gtags_root,
     project_list = join(gtags_root, "project.files"),
     engine_list = join(gtags_root, "engine.files"),
     workspace_list = join(gtags_root, "workspace.files"),
     workspace_all_list = join(gtags_root, "workspace_all.files"),
     workspace_db = join(gtags_root, "workspace"),
-    -- csearch
+    -- csearch (per-platform when platform_key set)
     csearch_dir = csearch_dir,
     csearch_idx = join(csearch_dir, "csearch.idx"),
     -- cdb (was: index/)
@@ -1294,6 +1335,62 @@ cache_paths = function(engine_root)
   }
 end
 
+-- Migrate the legacy single-path csearch + gtags caches into the active
+-- per-platform subdir (v3.1). Parallels ue.cdb.shards.migrate_legacy_if_needed.
+--
+-- Before v3.1 grep caches lived at csearch/csearch.idx and gtags/*.files.
+-- v3.1 shards them by platform_key (csearch/<key>/, gtags/<key>/). On first
+-- resolve with a known platform_key, if the new subdir is empty but the old
+-- flat files exist, MOVE them in (so the existing index isn't thrown away and
+-- the user doesn't have to rerun :UEPrepare just because we changed layout).
+--
+-- Idempotent: once moved, the legacy files are gone so subsequent calls no-op.
+-- A no-platform session (platform_key == "") uses the legacy path directly and
+-- never migrates. Parked on CORE_RT to stay under the LuaJIT local cap.
+function CORE_RT.migrate_legacy_csearch_if_needed(engine_root, platform_key)
+  if not platform_key or platform_key == "" then return false end
+  local legacy = cache_paths(engine_root)            -- platform_key=nil → flat layout
+  local active = cache_paths(engine_root, platform_key)
+  local moved = false
+
+  local function move_if(src, dst)
+    if not src or not dst or src == dst then return end
+    if _ufs.is_file(src) and not _ufs.is_file(dst) then
+      _ufs.ensure_dir(_ufs.dirname(dst))
+      -- os.rename works within the same volume (cache always lives under one
+      -- engine_root, so src/dst share a drive). Fall back to copy+remove only
+      -- if rename fails (defensive; shouldn't happen on same volume).
+      local ok = pcall(os.rename, src, dst)
+      if not ok then
+        local data = nil
+        local f = io.open(src, "rb")
+        if f then data = f:read("*a"); f:close() end
+        if data then
+          local o = io.open(dst, "wb")
+          if o then o:write(data); o:close(); pcall(os.remove, src); ok = true end
+        end
+      end
+      if ok then moved = true end
+    end
+  end
+
+  -- csearch index (+ cindex tmp staging siblings)
+  move_if(legacy.csearch_idx, active.csearch_idx)
+  move_if(legacy.csearch_idx .. "~", active.csearch_idx .. "~")
+  move_if(legacy.csearch_idx .. "~~", active.csearch_idx .. "~~")
+  -- grep file lists
+  move_if(legacy.project_list, active.project_list)
+  move_if(legacy.engine_list, active.engine_list)
+  move_if(legacy.workspace_list, active.workspace_list)
+  move_if(legacy.workspace_all_list, active.workspace_all_list)
+  -- gtags DB files
+  for _, name in ipairs({ "GTAGS", "GPATH", "GRTAGS" }) do
+    move_if(join(legacy.workspace_db, name), join(active.workspace_db, name))
+  end
+
+  return moved
+end
+
 read_state = function(engine_root)
   local paths = cache_paths(engine_root)
   if not _ufs.is_file(paths.state) then
@@ -1308,6 +1405,9 @@ read_state = function(engine_root)
   if decoded.project_root then
     decoded.project_root = norm(decoded.project_root)
   end
+  if decoded.engine_root then
+    decoded.engine_root = norm(decoded.engine_root)
+  end
   return decoded
 end
 
@@ -1318,6 +1418,12 @@ local function persist_project(engine_root, project_root, uproject)
   -- Merge into existing state to preserve extra fields (android_package, etc.)
   local existing = read_state(engine_root)
   existing.project_root = norm(project_root)
+  -- Persist engine_root too. Without it the "did the engine change?"
+  -- invalidation dimension has no on-disk anchor (engine_root used to be
+  -- re-derived from the buffer every session, so a project pinned against a
+  -- DIFFERENT engine could silently reuse stale caches). cache_paths is keyed
+  -- by engine_root, so the engine that owns this state.json IS engine_root.
+  existing.engine_root = norm(engine_root)
   existing.uproject = uproject and norm(uproject) or nil
   existing.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
 
@@ -1436,7 +1542,13 @@ local function resolve_context(opts)
     end
   end
 
-  local paths = cache_paths(engine_root)
+  local platform_key = CORE_RT.platform_key_from_state(state)
+  -- v3.1: migrate legacy single-path grep caches into the active platform
+  -- subdir once, so an existing index survives the layout change.
+  if platform_key ~= "" then
+    pcall(CORE_RT.migrate_legacy_csearch_if_needed, engine_root, platform_key)
+  end
+  local paths = cache_paths(engine_root, platform_key)
   local state_stat = vim.uv.fs_stat(paths.state)
   local state_mtime = state_stat and state_stat.mtime and state_stat.mtime.sec or 0
 
@@ -2459,6 +2571,107 @@ INDEX_FN.base_compile_commands_path = function(ctx)
     return path
   end
   return nil
+end
+
+-- CDB partition by (platform, config) -- see docs/changelog.md 2026-05-28 (#5)
+-- UBT's compile_commands.json accumulates entries from every config + platform
+-- that has ever been built in this checkout. clangd then walks all those
+-- per-config -include Definitions.<Module>.h headers when servicing `gd` on
+-- macros like UE_BUILD_DEVELOPMENT, jumping to whichever config's generated
+-- header happens to be in the CDB (often a stale Dev one from days ago, even
+-- though the current build is Test).
+--
+-- Fix: after every :UEPrepare we shell out to tools/cdb_partition.py, which
+-- splits the base CDB into per-(plat, cfg) files under
+-- <repo>/.cache/nvim-ue/cdb/active/compile_commands.<plat>-<cfg>.json and
+-- rewrites the base to contain ONLY the active group + shaders. Active group
+-- is auto-picked (largest cmd count) unless the caller passes an explicit
+-- "Platform/Config" pair, e.g. :UECDBSwitch Win64 Development.
+--
+-- Pipeline placement: invoked right after run_compile_commands_pipeline (which
+-- expands rsps / injects defs / unifies includes) and BEFORE
+-- INDEX_FN.schedule_index_refresh -- so the per-phase subset CDBs and the
+-- clangd-indexer feed all see the already-partitioned base. Failure here is
+-- non-fatal: we surface a WARN and leave the base CDB untouched (clangd
+-- continues to work, just with the old multi-group mix).
+INDEX_FN.partition_base_cdb = function(ctx, opts)
+  opts = opts or {}
+  local base = INDEX_FN.base_compile_commands_path(ctx)
+  if not base then
+    return false, "no base compile_commands.json"
+  end
+
+  local nvim_root = vim.fn.fnamemodify(vim.fn.stdpath("config"), ":p")
+  local script = join(nvim_root, "tools", "cdb_partition.py")
+  if not _ufs.is_file(script) then
+    return false, "cdb_partition.py missing at " .. script
+  end
+
+  -- Reuse the same Python probe sequence used elsewhere in this file for the
+  -- ccjson / pch subprocesses (Python 3.12 absolute path on Windows to dodge
+  -- PYTHONHOME contamination from outer shells).
+  local python
+  if _uplat.is_windows then
+    local cands = {
+      vim.env.UE_PYTHON,
+      vim.fn.expand("~/AppData/Local/Programs/Python/Python312/python.exe"),
+      vim.fn.expand("~/AppData/Local/Programs/Python/Python313/python.exe"),
+      "C:/Python312/python.exe",
+      "C:/Python313/python.exe",
+    }
+    for _, c in ipairs(cands) do
+      if c and c ~= "" and _ufs.is_file(c) then python = c; break end
+    end
+    python = python or "python"
+  else
+    python = "python3"
+  end
+
+  local cmd = { python, script, base }
+  if opts.active then
+    table.insert(cmd, "--active")
+    table.insert(cmd, opts.active)
+  end
+  if opts.out_dir then
+    table.insert(cmd, "--out-dir")
+    table.insert(cmd, opts.out_dir)
+  end
+
+  -- Scrub PYTHONPATH/PYTHONHOME (same reason as the ccjson subprocess).
+  local env = vim.fn.environ()
+  env.PYTHONPATH = nil
+  env.PYTHONHOME = nil
+  local env_list = {}
+  for k, v in pairs(env) do
+    table.insert(env_list, k .. "=" .. v)
+  end
+
+  local result = vim.system(cmd, { env = env_list, text = true, timeout = 120000 }):wait()
+  if result.code == 0 then
+    return true, (result.stdout or ""):gsub("%s+$", "")
+  end
+  if result.code == 3 then
+    -- "no classifiable groups" -- single-config CDB, nothing to do.
+    return true, "single-group CDB, no partition needed"
+  end
+  local msg = ("cdb_partition exit=%d stderr=%s"):format(
+    result.code or -1,
+    (result.stderr or ""):gsub("%s+$", ""))
+  return false, msg
+end
+
+-- Read the partition manifest to know what groups exist + which is active.
+-- Returns nil if no manifest (CDB never partitioned yet).
+INDEX_FN.read_partition_manifest = function(ctx)
+  local base = INDEX_FN.base_compile_commands_path(ctx)
+  if not base then return nil end
+  local mf_path = vim.fn.fnamemodify(base, ":h") .. "/compile_commands.partition.json"
+  if not _ufs.is_file(mf_path) then return nil end
+  local content = read_all(mf_path)
+  if not content or content == "" then return nil end
+  local ok, mf = pcall(vim.json.decode, content)
+  if not ok or type(mf) ~= "table" then return nil end
+  return mf, mf_path
 end
 
 INDEX_FN.normalize_cdb_file = function(entry)
@@ -5629,6 +5842,26 @@ do
   end
 end
 
+function CORE_RT.grep_live_search_ready(pattern, min_chars)
+  min_chars = tonumber(min_chars) or 2
+  return #trim(tostring(pattern or "")) >= min_chars
+end
+
+function CORE_RT.grep_backend_title(base, backend_label)
+  backend_label = trim(tostring(backend_label or ""))
+  base = trim(tostring(base or ""))
+  if base == "" then
+    base = "Grep All Code"
+  end
+  if backend_label == "" then
+    return base
+  end
+  if base:find("%[" .. vim.pesc(backend_label) .. "%]") then
+    return base
+  end
+  return base .. " [" .. backend_label .. "]"
+end
+
 local function read_cached_paths(list_path, root)
   local lines = vim.fn.readfile(list_path)
   if #lines == 0 then
@@ -5823,6 +6056,7 @@ end
 -- for the rg-batched path. See lua/utils/code_search/ for backend details.
 function M.cached_grep(opts)
   opts = opts or {}
+
   local ctx = resolve_context(opts)
   if not ctx then
     return nil
@@ -5835,7 +6069,10 @@ function M.cached_grep(opts)
   local has_index = code_search.is_indexed(cs_ctx)
   local backend_label = has_index and "csearch" or "rg"
 
-  local title_default = ("Grep All Code [%s]"):format(backend_label)
+  local title_default = CORE_RT.grep_backend_title("Grep All Code", backend_label)
+  local live_min_chars = opts.live_min_chars or 2
+  local live_max_count = opts.max_count or 5000
+  local short_live_max_count = opts.short_live_max_count or 1200
 
   -- ─ Helpers shared by both csearch and rg paths ──────────────────────
   -- Dev toggle: lets us A/B compare against vanilla snacks behavior to
@@ -5990,14 +6227,43 @@ function M.cached_grep(opts)
     end
   end
 
+  -- Temporary always-on diagnostic for the current "<leader>/ missing
+  -- results" investigation. The user explicitly allowed logs; remove after
+  -- they confirm the fix. This captures backend + mode + result counts
+  -- without requiring the heavier trace toggle above.
+  local debug_log_path = vim.fn.stdpath("state") .. "/ue_grep_backend_debug.log"
+  local function grep_debug(fmt, ...)
+    local ok, line = pcall(string.format, fmt, ...)
+    if not ok then
+      line = tostring(fmt)
+    end
+    local f = io.open(debug_log_path, "a")
+    if f then
+      f:write(os.date("%Y-%m-%d %H:%M:%S") .. " " .. line .. "\n")
+      f:close()
+    end
+  end
+  do
+    local idx_size = nil
+    if cs_ctx.csearch_idx then
+      local st = vim.loop.fs_stat(cs_ctx.csearch_idx)
+      idx_size = st and st.size or nil
+    end
+    grep_debug("OPEN backend=%s has_index=%s idx=%s idx_size=%s title=%s",
+      tostring(backend_label), tostring(has_index), tostring(cs_ctx.csearch_idx),
+      tostring(idx_size), tostring(CORE_RT.grep_backend_title(opts.title or title_default, backend_label)))
+  end
+
   -- ── csearch fast path ────────────────────────────────────────────────
   if has_index then
     snacks.picker.pick({
       source = "ue_grep_csearch",
-      title = opts.title or title_default,
+      title = CORE_RT.grep_backend_title(opts.title or title_default, backend_label),
       search = opts.search or "",
       live = true,
       need_search = true,
+      limit = live_max_count,
+      limit_live = live_max_count,
       layout = { preset = "telescope" },
       -- Search mode toggles. snacks auto-merges these with built-in toggles
       -- (regex, follow, hidden, ignored, modified — see snacks/picker/config/
@@ -6050,8 +6316,9 @@ function M.cached_grep(opts)
         end,
         ue_grep_toggle_case = function(picker)
           picker.opts.case = not picker.opts.case
-          require("snacks").notify((picker.opts.case and "✓ case-sensitive ON " or "✗ smart-case"),
+          require("snacks").notify((picker.opts.case and "✓ case-sensitive ON " or "✗ ignore-case"),
             { title = "UE grep", level = "info" })
+          grep_debug("TOGGLE backend=csearch case=%s", tostring(picker.opts.case == true))
           picker.list:set_target(); picker:find()
         end,
       },
@@ -6061,7 +6328,7 @@ function M.cached_grep(opts)
       confirm = grouping_enabled and confirm_grouped or nil,
       finder = function(_picker_opts, finder_ctx)
         local pattern = finder_ctx.filter.search
-        if not pattern or pattern == "" then
+        if not CORE_RT.grep_live_search_ready(pattern, live_min_chars) then
           return function() end
         end
         trace("finder START pattern=%q", pattern)
@@ -6080,6 +6347,7 @@ function M.cached_grep(opts)
           -- aborts us (sleep returns early on abort).
           local done = false
           local pending = {}  -- items waiting to be drained on the main loop
+          local pending_len = 0
           local items_received = 0
           local items_emitted = 0
 
@@ -6090,13 +6358,21 @@ function M.cached_grep(opts)
           -- then picker:find() restarts this finder so we see the new values).
           local _picker = finder_ctx and finder_ctx.picker
           local _po = _picker and _picker.opts or {}
+          local pattern_len = #trim(tostring(pattern or ""))
+          local mode_case = _po.case == true
+          local mode_ignore_case = not mode_case
+          grep_debug("FINDER backend=csearch pattern=%q regex=%s word=%s case=%s ignore_case=%s max=%d",
+            tostring(pattern), tostring(_po.regex == true), tostring(_po.word == true),
+            tostring(mode_case), tostring(mode_ignore_case),
+            pattern_len <= live_min_chars and short_live_max_count or live_max_count)
           local stop = code_search.stream(cs_ctx, pattern, {
             code_only   = opts.code_only,
             smart_case  = true,
-            max_count   = opts.max_count or 5000,
+            max_count   = pattern_len <= live_min_chars and short_live_max_count or live_max_count,
             regex       = _po.regex == true,   -- snacks default false = literal
             word        = _po.word == true,
-            case        = _po.case == true,
+            case        = mode_case,
+            ignore_case = mode_ignore_case,
           }, {
             on_line = function(file, lnum, col, text)
               if not cs_first_line_logged then
@@ -6106,7 +6382,8 @@ function M.cached_grep(opts)
               end
               -- Buffer the item; we drain inside the sleep loop below
               -- where it's safe to call cb (we're guaranteed not yet done).
-              pending[#pending + 1] = {
+              pending_len = pending_len + 1
+              pending[pending_len] = {
                 text = file .. ":" .. lnum .. ":" .. col .. ":" .. text,
                 pos  = { lnum, math.max(0, col - 1) },
                 file = file,
@@ -6118,6 +6395,10 @@ function M.cached_grep(opts)
               trace("csearch DONE pat=%q recv=%d code=%s err=%s elapsed=%.1fms",
                 pattern, items_received, tostring(code),
                 tostring(err and err:sub(1,80)),
+                (vim.loop.hrtime() - t_cs_spawn_0) / 1e6)
+              grep_debug("DONE backend=csearch pattern=%q recv=%d code=%s err=%s elapsed=%.1fms",
+                tostring(pattern), items_received, tostring(code),
+                tostring(err and err:sub(1, 120)),
                 (vim.loop.hrtime() - t_cs_spawn_0) / 1e6)
               if err and code ~= 0 then
                 vim.schedule(function()
@@ -6229,21 +6510,26 @@ function M.cached_grep(opts)
             if cur_search ~= nil and cur_search ~= pattern then
               trace("ABORT pat=%q new=%q tick=%d elapsed=%dms recv=%d emit=%d pending=%d",
                 pattern, tostring(cur_search), tick_count, elapsed,
-                items_received, items_emitted, #pending - read_idx + 1)
+                items_received, items_emitted, pending_len - read_idx + 1)
               pcall(stop)
               break
             end
             -- Drain up to CB_BUDGET items accumulated since last slice.
-            -- Use read_idx (not #pending) so we don't churn the array on
-            -- every tick — set entries to nil so GC can reclaim text.
-            local n = #pending
+            -- Use read_idx + pending_len rather than #pending: drained
+            -- entries are set to nil below, and Lua's length operator is
+            -- undefined on tables with holes. Using #pending here used to
+            -- drop tail hits (e.g. backend recv=15 but picker emitted=12).
+            local n = pending_len
             if read_idx <= n then
               local stop_at = math.min(n, read_idx + CB_BUDGET - 1)
               local drain_t0 = vim.loop.hrtime()
               for i = read_idx, stop_at do
-                cb(pending[i])
+                local item = pending[i]
+                if item then
+                  cb(item)
+                  items_emitted = items_emitted + 1
+                end
                 pending[i] = nil
-                items_emitted = items_emitted + 1
               end
               local drain_ms = (vim.loop.hrtime() - drain_t0) / 1e6
               if drain_ms > longest_drain_ms then longest_drain_ms = drain_ms end
@@ -6278,12 +6564,19 @@ function M.cached_grep(opts)
             -- Resume from read_idx so we don't double-cb earlier items.
             local final_drain_t0 = vim.loop.hrtime()
             local final_count = 0
-            for i = read_idx, #pending do
-              cb(pending[i])
-              final_count = final_count + 1
+            for i = read_idx, pending_len do
+              local item = pending[i]
+              if item then
+                cb(item)
+                final_count = final_count + 1
+                items_emitted = items_emitted + 1
+              end
+              pending[i] = nil
             end
             local final_drain_ms = (vim.loop.hrtime() - final_drain_t0) / 1e6
             trace("FINAL DRAIN pat=%q count=%d in %.1fms", pattern, final_count, final_drain_ms)
+            grep_debug("FINAL backend=csearch pattern=%q final_count=%d total_recv=%d emitted_before_final=%d",
+              tostring(pattern), final_count, items_received, items_emitted)
           end
 
           -- Stop the subprocess if it's still alive (timeout / abort path).
@@ -6300,6 +6593,8 @@ function M.cached_grep(opts)
           trace("finder END pat=%q aborted=%s ticks=%d elapsed=%dms recv=%d emit=%d longest_drain=%.1fms",
             pattern, tostring(aborted), tick_count, elapsed,
             items_received, items_emitted, longest_drain_ms)
+          grep_debug("END backend=csearch pattern=%q aborted=%s recv=%d emitted=%d longest_drain=%.1fms",
+            tostring(pattern), tostring(aborted), items_received, items_emitted, longest_drain_ms)
         end
       end,
     })
@@ -6315,6 +6610,20 @@ function M.cached_grep(opts)
   if not info then
     -- No cached file list and no csearch index; let snacks fall back to
     -- its default grep over the directory tree (slowest path).
+    -- Make the fall-through VISIBLE: a silent nil here means ue_project_grep
+    -- runs a plain dir-walk that excludes ThirdParty and is NOT index-backed,
+    -- so the user gets incomplete results with no signal (the bug this whole
+    -- change fixes). One-shot WARN per buffer (no ticker — see P5).
+    if not vim.b._ue_grep_fallback_warned then
+      vim.b._ue_grep_fallback_warned = true
+      vim.schedule(function()
+        vim.notify(
+          "UE grep: no csearch index and no cached file list — falling back to a " ..
+          "slow directory walk that may MISS files. Run :UEPrepare for complete, " ..
+          "sub-second grep.",
+          vim.log.levels.WARN, { title = "UE" })
+      end)
+    end
     return nil
   end
 
@@ -6358,10 +6667,12 @@ function M.cached_grep(opts)
 
   snacks.picker.pick({
     source = "ue_grep_rg",
-    title = opts.title or title_default,
+    title = CORE_RT.grep_backend_title(opts.title or title_default, backend_label),
     search = opts.search or "",
     live = true,
     need_search = true,
+    limit = live_max_count,
+    limit_live = live_max_count,
     layout = { preset = "telescope" },
     -- Same toggle wiring as csearch path (see comment there).
     regex = false,
@@ -6395,8 +6706,9 @@ function M.cached_grep(opts)
       end,
       ue_grep_toggle_case = function(picker)
         picker.opts.case = not picker.opts.case
-        require("snacks").notify((picker.opts.case and "✓ case-sensitive ON " or "✗ smart-case"),
+        require("snacks").notify((picker.opts.case and "✓ case-sensitive ON " or "✗ ignore-case"),
           { title = "UE grep", level = "info" })
+        grep_debug("TOGGLE backend=rg case=%s", tostring(picker.opts.case == true))
         picker.list:set_target(); picker:find()
       end,
     },
@@ -6406,7 +6718,7 @@ function M.cached_grep(opts)
     confirm = grouping_enabled and confirm_grouped or nil,
     finder = function(picker_opts, finder_ctx)
       local pattern = finder_ctx.filter.search
-      if not pattern or pattern == "" then
+      if not CORE_RT.grep_live_search_ready(pattern, live_min_chars) then
         return function() end
       end
 
@@ -6421,6 +6733,10 @@ function M.cached_grep(opts)
       local mode_regex = _po.regex == true
       local mode_word  = _po.word == true
       local mode_case  = _po.case == true
+      local mode_ignore_case = not mode_case
+      grep_debug("FINDER backend=rg pattern=%q regex=%s word=%s case=%s ignore_case=%s files_ready=%s",
+        tostring(pattern), tostring(mode_regex), tostring(mode_word), tostring(mode_case),
+        tostring(mode_ignore_case), tostring(loaded_files ~= nil))
 
       return function(cb)
         -- Wrap cb to inject file-header items between file groups.
@@ -6438,12 +6754,14 @@ function M.cached_grep(opts)
           "--max-columns-preview",
           "-0",
         }
-        -- Case mode: explicit case-sensitive ⇒ -s, else smart-case (default
-        -- rg behavior we previously hard-coded).
+        -- Case mode: explicit case-sensitive ⇒ -s, else ignore-case. UE CVar
+        -- searches are frequently typed as camelCase fragments (e.g.
+        -- r.useLandscape) while source/config uses r.UseLandscape..., so the
+        -- default must not be rg smart-case.
         if mode_case then
           table.insert(base_args, "--case-sensitive")
         else
-          table.insert(base_args, "--smart-case")
+          table.insert(base_args, "--ignore-case")
         end
         -- Regex mode: when off, take input literally. -F is rg's
         -- fixed-strings flag; combined with -w it still matches whole
@@ -7062,11 +7380,10 @@ do
 local function invalidate_project_scoped_cache(engine_root, reason)
   local paths = cache_paths(engine_root)
   local victims = {
-    -- file lists (workspace_all_list drives <space><space> AND csearch input)
+    -- legacy single-path file lists + csearch (pre-v3.1 layout)
     paths.project_list,
     paths.workspace_list,
     paths.workspace_all_list,
-    -- csearch trigram index + cindex tmp staging
     paths.csearch_idx,
     paths.csearch_idx .. "~",
     paths.csearch_idx .. "~~",
@@ -7094,6 +7411,24 @@ local function invalidate_project_scoped_cache(engine_root, reason)
     end
   end
 
+  -- v3.1: csearch + gtags lists now live in per-platform subdirs
+  -- (csearch/<key>/, gtags/<key>/). A PROJECT switch invalidates EVERY
+  -- platform's grep cache (they all index the old project's files), so wipe
+  -- the whole per-platform tree, not just the active one.
+  for _, sub in ipairs({ "csearch", "gtags" }) do
+    local dir = join(paths.cache, sub)
+    if _ufs.is_dir(dir) then
+      if pcall(vim.fn.delete, dir, "rf") then removed = removed + 1 end
+    end
+  end
+
+  -- Also wipe per-shard cdb files (per-platform CDB shards reference old
+  -- project source paths). The shards live under cdb/compile_commands/shards/.
+  local shards_dir = join(paths.index_cdb_dir, "shards")
+  if _ufs.is_dir(shards_dir) then
+    if pcall(vim.fn.delete, shards_dir, "rf") then removed = removed + 1 end
+  end
+
   -- Also nuke clangd index .idx files keyed by old project_name. Engine_root
   -- → project_name derivation is in cache_paths; the .idx filename embeds
   -- it. We list and rm by glob since multiple suffix variants exist.
@@ -7107,6 +7442,10 @@ local function invalidate_project_scoped_cache(engine_root, reason)
   -- Force prepare_freshness to re-read from disk on next call.
   CORE_RT.freshness_notified = {}
   CORE_RT.context_cache = {}
+
+  -- Re-probe the csearch toolchain next time (a stale negative probe from a
+  -- cold start would otherwise keep is_indexed() false for the session).
+  pcall(function() require("utils.code_search")._reset_probe_cache() end)
 
   -- Tell ue_watch (if running) to flush its dirty set — it referred to old
   -- project's files. Best-effort; module may not be loaded yet.
@@ -7144,13 +7483,21 @@ local function set_project(input)
   -- Detect actual project switch BEFORE persisting (persist overwrites state).
   local prev = read_state(engine_root)
   local prev_project = prev and prev.project_root or nil
-  local switched = prev_project and norm(prev_project) ~= norm(project_root) or false
+  local prev_engine = prev and prev.engine_root or nil
+  -- Switch = project_root changed OR the engine_root recorded in this
+  -- state.json no longer matches the live engine_root. The engine dimension
+  -- matters because caches (csearch/gtags/cdb) index BOTH the project and the
+  -- engine tree; pointing the same state.json at a different engine makes them
+  -- stale even if the project path is unchanged.
+  local project_switched = prev_project and norm(prev_project) ~= norm(project_root) or false
+  local engine_switched = prev_engine and prev_engine ~= "" and norm(prev_engine) ~= norm(engine_root) or false
+  local switched = project_switched or engine_switched
 
   persist_project(engine_root, project_root, uproject)
 
   local removed = 0
   if switched then
-    removed = invalidate_project_scoped_cache(engine_root, "switch")
+    removed = invalidate_project_scoped_cache(engine_root, project_switched and "project-switch" or "engine-switch")
   end
 
   invalidate_status_cache()
@@ -7158,7 +7505,9 @@ local function set_project(input)
 
   local msg = "UE project set:\nEngine: " .. engine_root .. "\nProject: " .. project_root
   if switched then
-    msg = msg .. ("\n\nProject CHANGED (was: %s)\n  → invalidated %d cache files (lists / csearch / gtags / cdb shards)\n  → run :UEPrepare to rebuild (or :UEPrepare! to force a clean full pass)"):format(prev_project or "?", removed)
+    local what = project_switched and ("Project CHANGED (was: %s)"):format(prev_project or "?")
+      or ("Engine CHANGED (was: %s)"):format(prev_engine or "?")
+    msg = msg .. ("\n\n%s\n  → invalidated %d cache entries (lists / csearch / gtags / cdb shards, all platforms)\n  → run :UEPrepare to rebuild (or :UEPrepare! to force a clean full pass)"):format(what, removed)
     vim.notify(msg, vim.log.levels.WARN, { title = "UE" })
   else
     vim.notify(msg, vim.log.levels.INFO, { title = "UE" })
@@ -7397,6 +7746,20 @@ local function set_platform(input)
     invalidate_status_cache()
     refresh_statusline()
     CORE_RT.context_cache = {}
+    CORE_RT.freshness_notified = {}
+    -- Per-platform grep cache: switching platform points csearch/workspace_all
+    -- at csearch/<new-key>/ etc. We do NOT delete the previous platform's
+    -- index (cross-platform users keep both). If the new platform has no
+    -- csearch index yet, the next <leader>/ will surface the visible
+    -- "run :UEPrepare" fallback (no silent stale results).
+    pcall(function() require("utils.code_search")._reset_probe_cache() end)
+    do
+      local new_state = read_state(engine_root)
+      local new_key = CORE_RT.platform_key_from_state(new_state)
+      if new_key ~= "" then
+        pcall(CORE_RT.migrate_legacy_csearch_if_needed, engine_root, new_key)
+      end
+    end
 
     -- Try the cheap path first: if a shard already exists for the new
     -- (platform,config), flip manifest.active + re-merge in-place (~1s)
@@ -7440,6 +7803,15 @@ local function set_platform(input)
       invalidate_status_cache()
       refresh_statusline()
       CORE_RT.context_cache = {}
+      CORE_RT.freshness_notified = {}
+      pcall(function() require("utils.code_search")._reset_probe_cache() end)
+      do
+        local new_state = read_state(engine_root)
+        local new_key = CORE_RT.platform_key_from_state(new_state)
+        if new_key ~= "" then
+          pcall(CORE_RT.migrate_legacy_csearch_if_needed, engine_root, new_key)
+        end
+      end
 
       local ok, key, info = CORE_RT.fast_swap_active_platform(engine_root)
       if ok then
@@ -7888,7 +8260,7 @@ local function prepare()
   -- path; we just block on the libuv callback here.
   do
     local cs_root = root
-    local cs_ctx_p = { workspace_root = cs_root }
+    local cs_ctx_p = { workspace_root = cs_root, csearch_idx = ctx.paths and ctx.paths.csearch_idx or nil }
     local code_search_p = require("utils.code_search")
     if code_search_p.cindex_uefilter_exe() then
       local abs_list = ctx.paths.cache .. "/csearch_filelist.txt"
@@ -7928,6 +8300,11 @@ local function prepare()
         "  Build it via: cd " .. vim.fn.stdpath("config") .. "/tools/cindex-uefilter && go install ./...",
         vim.log.levels.WARN, { title = "UE" })
     end
+    -- Index rebuilt (sync path): drop ctx cache + re-probe toolchain so the
+    -- next grep sees is_indexed() fresh.
+    CORE_RT.context_cache = {}
+    CORE_RT.freshness_notified = {}
+    pcall(function() require("utils.code_search")._reset_probe_cache() end)
   end
 
   local summary = prepare_summary(ctx, compile_path, {
@@ -8074,6 +8451,16 @@ local function prepare_async(opts)
         -- Start it here in the main nvim.
         local targets_main = compile_commands_targets(ctx)
         run_compile_commands_pipeline(targets_main[1], targets_main)
+        -- Partition base CDB by (plat, cfg) so clangd's gd on macros like
+        -- UE_BUILD_DEVELOPMENT does not jump into stale Dev generated headers
+        -- when the current build is Test. See INDEX_FN.partition_base_cdb.
+        do
+          local ok_p, msg_p = INDEX_FN.partition_base_cdb(ctx)
+          if not ok_p then
+            vim.notify("UEPrepare: cdb_partition failed -- " .. tostring(msg_p),
+              vim.log.levels.WARN, { title = "ue.cdb" })
+          end
+        end
         clear_index_dirty(ctx)
         INDEX_FN.schedule_index_refresh(ctx, { current = true, hot = true, full = true, current_delay_ms = 50, hot_delay_ms = 2500 })
         invalidate_status_cache()
@@ -8343,6 +8730,13 @@ local function prepare_async(opts)
             invalidate_status_cache()
             refresh_statusline()
             set_prepare_running(false)
+
+            -- Index just rebuilt: drop the resolve_context cache so the next
+            -- grep re-reads is_indexed() fresh, and re-probe the csearch
+            -- toolchain in case a cold-start negative probe is cached.
+            CORE_RT.context_cache = {}
+            CORE_RT.freshness_notified = {}
+            pcall(function() require("utils.code_search")._reset_probe_cache() end)
 
             -- Persist timings for future ETA estimation
             timings.total = elapsed_s()
@@ -8674,6 +9068,13 @@ M.android_dap_attach = dap_mod.android_dap_attach
 M.read_state = read_state
 M.update_state_field = update_state_field
 M.resolve_context = resolve_context
+-- Test seams for grep-cache invalidation (grep_cache_spec.lua). cache_paths
+-- is a forward-declared local; CORE_RT helpers are parked off the local cap.
+M.cache_paths = cache_paths
+M.platform_key_from_state = CORE_RT.platform_key_from_state
+M.migrate_legacy_csearch_if_needed = CORE_RT.migrate_legacy_csearch_if_needed
+M._grep_live_search_ready_for_test = CORE_RT.grep_live_search_ready
+M._grep_backend_title_for_test = CORE_RT.grep_backend_title
 M.android_dap_launch = dap_mod.android_dap_launch
 M._dap_filter_scopes = dap_mod._dap_filter_scopes
 M.ensure_dap_loaded = dap_mod.ensure_dap_loaded
@@ -8998,6 +9399,72 @@ function M.setup()
       vim.log.levels.WARN, { title = "ue" })
     prepare()
   end, { desc = "UEPrepare synchronous (blocks UI; debug only)" })
+  vim.api.nvim_create_user_command("UECDBPartition", function(cmd)
+    -- Manually re-run partition. Optional arg: "Android/Test" to also set active.
+    local ctx = require_ctx_or_nil()
+    if not ctx then
+      vim.notify("UECDBPartition: no UE context (run :UESetProject first)",
+        vim.log.levels.WARN, { title = "ue.cdb" }); return
+    end
+    local opts = {}
+    local arg = (cmd.args or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if arg ~= "" then opts.active = arg end
+    local ok, msg = INDEX_FN.partition_base_cdb(ctx, opts)
+    local lvl = ok and vim.log.levels.INFO or vim.log.levels.WARN
+    vim.notify("UECDBPartition: " .. (msg or (ok and "ok" or "failed")),
+      lvl, { title = "ue.cdb" })
+  end, { nargs = "?", desc = "Partition base CDB by (plat,cfg); optional Platform/Config arg" })
+  vim.api.nvim_create_user_command("UECDBSwitch", function(cmd)
+    -- Switch active (plat, cfg) group. Usage:
+    --   :UECDBSwitch Android Test
+    --   :UECDBSwitch Win64 Development
+    local ctx = require_ctx_or_nil()
+    if not ctx then
+      vim.notify("UECDBSwitch: no UE context", vim.log.levels.WARN, { title = "ue.cdb" }); return
+    end
+    local args = cmd.fargs or {}
+    if #args ~= 2 then
+      vim.notify("Usage: :UECDBSwitch <Platform> <Config>  e.g. :UECDBSwitch Android Test",
+        vim.log.levels.WARN, { title = "ue.cdb" }); return
+    end
+    local spec = args[1] .. "/" .. args[2]
+    local ok, msg = INDEX_FN.partition_base_cdb(ctx, { active = spec })
+    if not ok then
+      vim.notify("UECDBSwitch failed: " .. tostring(msg), vim.log.levels.WARN, { title = "ue.cdb" }); return
+    end
+    -- After switching active, the base CDB content changed -- re-kick clangd
+    -- so it re-reads. We piggy-back on the index refresh's existing restart.
+    INDEX_FN.maybe_restart_clangd_for_index()
+    vim.notify("UECDBSwitch: active=" .. spec, vim.log.levels.INFO, { title = "ue.cdb" })
+  end, { nargs = "*", desc = "Switch CDB active (plat, cfg) group" })
+  vim.api.nvim_create_user_command("UECDBStatus", function()
+    local ctx = require_ctx_or_nil()
+    if not ctx then
+      vim.notify("UECDBStatus: no UE context", vim.log.levels.WARN, { title = "ue.cdb" }); return
+    end
+    local mf, mf_path = INDEX_FN.read_partition_manifest(ctx)
+    if not mf then
+      vim.notify("UECDBStatus: no partition manifest yet (run :UEPrepare or :UECDBPartition)",
+        vim.log.levels.INFO, { title = "ue.cdb" }); return
+    end
+    local lines = { "Manifest: " .. mf_path }
+    if mf.active then
+      table.insert(lines, ("Active: %s/%s/%s (%d cmds)"):format(
+        mf.active.platform or "?", mf.active.project or "?", mf.active.config or "?",
+        mf.active.cmd_count or 0))
+    end
+    if mf.unclassified_in_base then
+      table.insert(lines, ("Shaders kept in base: %d"):format(mf.unclassified_in_base))
+    end
+    table.insert(lines, "Groups:")
+    for _, g in ipairs(mf.groups or {}) do
+      table.insert(lines, ("  %s  %s/%s/%s  %d cmds"):format(
+        g.active and "*" or " ",
+        g.platform or "?", g.project or "?", g.config or "?",
+        g.cmd_count or 0))
+    end
+    vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO, { title = "ue.cdb" })
+  end, { desc = "Show CDB partition status" })
   vim.api.nvim_create_user_command("UEWatchStatus", function()
     local ok, watch = pcall(require, "utils.ue_watch")
     if not ok then vim.notify("ue_watch module missing", vim.log.levels.WARN); return end

@@ -307,12 +307,16 @@ local function ue_project_grep(query)
     end
   end
 
-  -- Fallback: standard directory-based grep
+  -- Fallback: standard directory-based grep. This path is NOT index-backed
+  -- and excludes ThirdParty etc., so it can miss files the csearch/rg paths
+  -- find. Title says "slow fallback" so the missing [csearch]/[rg] suffix is
+  -- not mistaken for a complete result. cached_grep() already emitted a
+  -- one-shot WARN explaining why (no index / no cached list).
   local opts = with_glob(workspace_opts(), all_globs()) or {}
   if type(query) == "string" and query ~= "" then
     opts.search = query
   end
-  opts.title = "Grep All Code (Engine+Project)"
+  opts.title = "Grep All Code (slow fallback — run :UEPrepare)"
   return snacks.picker.grep(opts)
 end
 

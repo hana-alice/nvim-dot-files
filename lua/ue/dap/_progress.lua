@@ -62,7 +62,11 @@ local function ensure_win()
   vim.bo[state.buf].buftype = "nofile"
   vim.bo[state.buf].bufhidden = "wipe"
   vim.bo[state.buf].swapfile = false
-  vim.api.nvim_buf_set_name(state.buf, "[ue-dap progress]")
+  -- Reloads can leave an old hidden [ue-dap progress] buffer around. Buffer
+  -- names are globally unique, so use a unique suffix instead of throwing E95
+  -- and aborting the attach bootstrap.
+  pcall(vim.api.nvim_buf_set_name, state.buf,
+    ("[ue-dap progress %d]"):format(vim.api.nvim_buf_get_number(state.buf)))
 
   local width = state.width
   local row = vim.o.lines - 4   -- above status/cmdline

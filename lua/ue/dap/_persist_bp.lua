@@ -147,11 +147,17 @@ function M.restore_for_buf(bufnr)
   end
   -- Once restored, drop from pending so we don't double-set on reload.
   state.pending_paths[key] = nil
-  -- If a session is already running, push the new bps to the adapter.
+  -- If a session is already running, push the freshly-restored breakpoints to
+  -- the adapter so they arm live (no reattach needed). nvim-dap's
+  -- session:set_breakpoints reads the current dap.breakpoints store for the
+  -- given bufnr, so we pass the bufnr keyed to its real breakpoint list rather
+  -- than an empty table (the previous `{ [bufnr] = nil }` was a silent no-op).
   local ok_dap, dap = pcall(require, "dap")
   if ok_dap and dap.session() then
     pcall(function()
-      dap.session():set_breakpoints({ [bufnr] = nil })
+      local cur = dapbp.get(bufnr)
+      local list = cur and cur[bufnr] or {}
+      dap.session():set_breakpoints({ [bufnr] = list })
     end)
   end
 end

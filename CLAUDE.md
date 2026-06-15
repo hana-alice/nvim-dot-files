@@ -1,5 +1,9 @@
 # Local workflow
 
+> **Before writing code here**, read [`docs/CONSTRAINTS.md`](docs/CONSTRAINTS.md)
+> — the consolidated list of what is forbidden (禁止), what pitfalls have already
+> cost time (踩过的坑), and which constraints are load-bearing (约束).
+
 You are working in Claude Code CLI inside a trusted local development workflow on Windows Terminal.
 
 Default to doing the work yourself with minimal interruption.
@@ -98,6 +102,41 @@ Prefer direct single adb commands such as:
 - `adb shell am start ...`
 
 Do not combine adb with unrelated commands in one compound shell command unless absolutely necessary.
+
+<!-- SESSION START PROTOCOL -->
+## SESSION START（强制前置·每个新 context 必做）
+
+进入本仓、**动任何代码之前**，按序读完以下文件——这是强制前置步骤，不是建议：
+
+1. [`docs/CONSTRAINTS.md`](docs/CONSTRAINTS.md) — 禁止 / 踩过的坑 / 约束（权威索引）。
+2. [`memory/project_overview.md`](memory/project_overview.md) — 项目总览 + 子系统速查 + 知识库导航。
+3. **当前改动目录的 `CLAUDE.md`** — 子系统本地规则。该目录**无** `CLAUDE.md` 时，
+   适用**最近祖先目录**的 `CLAUDE.md`（回落语义）。子级规则只写相对父级的增量。
+
+知识库四区：[`memory/`](memory/project_overview.md) · [`decisions/`](decisions/README.md) ·
+[`lessons/`](lessons/README.md) · [`docs/architecture/overview.md`](docs/architecture/overview.md)。
+<!-- END SESSION START PROTOCOL -->
+
+<!-- DEFINITION OF DONE -->
+## Definition of Done（完成的硬标准·缺一不算完成）
+
+一次改动只有同时满足下列条件才算「完成」。这是本仓所有开发政策的**强制执行入口**；
+其余文档（CONSTRAINTS / `tests/CLAUDE.md` / `docs/testing-regression.md` / `docs/changelog.md`）是出处与细节。
+
+1. **跑回归并全绿** — 按改动范围跑对应 filter（映射见 [`tests/CLAUDE.md`](tests/CLAUDE.md)
+   的 CHANGE-TO-FILTER MAP）；**提交/合并前必跑全量** `nvim --headless -l tests/run.lua`；
+   **影响面不确定就升级到全量，不猜窄 filter**。权威：[`docs/testing-regression.md`](docs/testing-regression.md)。
+2. **记 changelog** — 在 [`docs/changelog.md`](docs/changelog.md) Unreleased 追加一条（用既有模板），
+   其 **Validation 字段写明所跑回归范围与结果**。
+3. **收尾版本走 milestone** — 满足 semver 触发时执行 milestone 政策（release 文档 + changelog 归档 +
+   全量回归门禁 + git tag〔须用户确认〕 + 架构变更同步知识库）。权威：`docs/CONSTRAINTS.md §三 C8`。
+<!-- END DEFINITION OF DONE -->
+
+You are working in Claude Code CLI inside a trusted local development workflow on Windows Terminal.
+
+Default to doing the work yourself with minimal interruption.
+Do not offload routine execution back to the user.
+Do not stop after editing code if the next natural step is to run, verify, or inspect the result.
 
 ## Build and verification policy
 

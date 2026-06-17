@@ -152,6 +152,12 @@ end
 
 M._recover_staged_index_for_test = recover_staged_index
 
+-- Test seam: "is this index path usable?" (exists + above min size). Backs the
+-- D9 resilience guard that refuses incremental builds onto a corrupt/0-byte idx.
+function M._usable_index_for_test(path)
+  return usable_index_stat(path) ~= nil
+end
+
 function M.current_backend(ctx)
   if M.is_indexed(ctx) then return "csearch" end
   if vim.fn.executable("rg") == 1 then return "rg" end
@@ -597,6 +603,22 @@ function M.build_index(ctx, abs_list_path, cb, opts)
   end
 
   local idx = M.index_path(ctx)
+
+  -- Resilience (D9): an incremental "add" against an unusable target index
+  -- (missing / 0-byte / corrupt) makes cindex `merge` read a broken header →
+  -- `corrupt index: remove` → the idx is deleted → the next add hits a 0-byte
+  -- idx again → death loop (2026-06-17). Refuse the add and point the user at a
+  -- full rebuild. mode="reset" is always safe (it ignores the prior idx), so it
+  -- is exempt from this guard.
+  if mode == "add" and not usable_index_stat(idx) then
+    vim.schedule(function()
+      cb(false,
+         "csearch index unusable (missing/0-byte/corrupt) — run :UEPrepare for a full rebuild",
+         { index_size = 0 })
+    end)
+    return
+  end
+
   local env = {}
   for k, v in pairs(vim.fn.environ()) do
     if k ~= "CSEARCHINDEX" then

@@ -326,16 +326,16 @@
   全部 parsed hits，再在进程退出且 backlog 为空时调用 `on_done`；stop 后所有 flusher 都短路。
   → `docs/architecture/grep-cache-invalidation.md` D6; `lua/utils/code_search/init.lua`
 
-- **K29 — watcher 批量 add 把每路径拼进 argv → `ENAMETOOLONG`**
+- **K29 — watcher 批量 add 把每路径拼进 argv → `ENAMETOOLONG`**（后续被 K31g 取代写者本身）
   症状: `git checkout` / 构建批量产生几百个长 UE 路径后，`ue_watch` flush 抛
   `vim/_system.lua:256: ENAMETOOLONG: name too long`（`provider_csearch_add` 把每个
   dirty 路径作为一个 argv 元素拼进裸 `cindex` 命令，超 Windows ~32 KiB argv 上限）。
-  解决: provider 改委托 `code_search.build_index(.., { mode = "add" })`——dirty 路径写进
-  临时文件经 `cindex-uefilter -files-from` 入索引（与 `:UEPrepareIncremental` 同源），
-  任意数量都是单文件参数；且 async 不 `:wait()`。**这是用对既有正解 + 平台契约（argv
-  上限非上游 bug），非 workaround**，落主逻辑。
-  → `docs/architecture/grep-cache-invalidation.md` D7; `lua/utils/ue_watch.lua`
-    `provider_csearch_add`; `tests/cases/ue_watch_csearch_spec.lua`
+  解决（历史，2026-06-16）: provider 改委托 `build_index(.., {mode="add"})` 经
+  `cindex-uefilter -files-from` 入索引。**注意：该修复把 watcher 变成 csearch.idx 的第二个
+  写者，随即引出 K31g 的并发写损坏 → 2026-06-17 整体退役该写者。** argv 上限是 OS 契约、
+  `-files-from` 是任意长度列表喂子进程的正解，这条结论仍成立，但现在只有 prepare 家族走该
+  路径，watcher 不再写索引。
+  → `docs/architecture/grep-cache-invalidation.md` D7（存档）/ D9（现状）; K31g
 
 - **K30g — freshness 用 `.git/index` 当 anchor → fsmonitor/TortoiseGit 后台 touch 触发假 stale**
   症状: `:UEPrepare` 完成后 `<space><space>` / `<leader>/` 仍弹
@@ -349,6 +349,27 @@
   dirty overlay + `dir_mtime` 兜底，弃 index 零覆盖损失。
   → `docs/architecture/grep-cache-invalidation.md` D8; `lua/ue.lua`
     `git_commit_state_mtime` / `prepare_freshness`
+
+- **K31g — csearch.idx 并发写损坏（cindex `<idx>~` 路径硬编码）→ `corrupt index` + 0 字节死循环**
+  症状: `:UEPrepare` 卡在 ~85%，同时刷屏
+  `[ue.watch] csearch_add: cindex-uefilter exit=1 ... merge ... corrupt index: remove <csearch.idx>`；
+  目录里 `csearch.idx` 0 字节、`csearch.idx~` 半截、`csearch.idx~~` 是上次好索引。
+  根因: cindex 原子写协议把 staged 文件**硬编码**为 `<idx>~`（非每进程独立临时文件）。
+  watcher 增量（K29 引入的 `mode="add"` 写者）与用户 `:UEPrepare` 全量并发跑同一个 `idx`，
+  抢同一个 `idx~`，在 merge/rename 窗口互毁；0 字节 idx 再被下一次 `add` 撞上 → 死循环。
+  解决（三层，2026-06-17）: ① **β 单写者**——`ue_watch` provider 退回 record-only（不写
+  csearch.idx），写者收敛为 prepare 家族；新文件靠 persistent_dirty + rg-on-dirty overlay
+  到下次手动 prepare。② **Policy A 串行**——`CORE_RT.csearch_build_running` 单标志，构建入口
+  `csearch_build_begin` 拒绝并发（不排队），完成回调无条件 `csearch_build_done`。③ **韧性**——
+  `build_index` 在 `mode="add"` spawn 前校验 idx 可用，不可用则拒绝并引导全量；`mode="reset"`
+  永远安全。④ **清理（D-3b）**——β 把「构建成功⇒dirty 归零」责任转移给 prepare，**每条全量
+  成功路径**（fast-path/cold/sync）都须 `clear_persistent_dirty_safe`；漏清会让
+  `prepare_freshness` 第一道闸恒判 stale（刚 prepare 完仍弹 stale）且 overlay 背巨大脏集合
+  → `<space><space>` 变卡。失败不清。
+  → `docs/architecture/grep-cache-invalidation.md` D9; change `fix-csearch-index-single-writer`;
+    `lua/utils/ue_watch.lua` `provider_csearch_add`（record-only）; `lua/ue.lua`
+    `csearch_build_begin/done` + `clear_persistent_dirty_safe`; `lua/utils/code_search/init.lua`
+    `build_index` add-guard; `tests/cases/ue_watch_csearch_spec.lua` / `csearch_build_guard_spec.lua`
 
 ---
 

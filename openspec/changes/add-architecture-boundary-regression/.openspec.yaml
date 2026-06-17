@@ -1,0 +1,9 @@
+schema: spec-driven
+created: 2026-06-17
+status: draft
+note: >
+  Exploration archive only (captured via /opsx:explore). NOT approved for
+  implementation. Blocked on three decisions recorded in design.md (甲/乙/丙).
+  Source thinking: comparison of repo against the "AI 长期软件工程手册"
+  (feishu docx OiE4dVswhoUMOtxC43AcFUQin9f, 2026-06-15) gap #1
+  「架构边界写了但没有自动执行」.

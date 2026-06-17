@@ -53,6 +53,55 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-06-16 — ue_watch: incremental csearch via -files-from, not argv fan-out (fix ENAMETOOLONG)
+
+**Task** — `ue_watch`'s debounce flush threw `vim/_system.lua:256: ENAMETOOLONG: name too long` after a `git checkout` / build. User required this be a permanent correct fix, not a workaround.
+
+**Root cause** — `provider_csearch_add` built the indexer invocation as `cmd = {"cindex"}; for p in paths do table.insert(cmd, p) end` — one dirty path per argv element. A checkout/build batches hundreds of long UE paths (~80–120 chars each) into one flush; the assembled command line blows Windows' ~32 KiB argv limit. Two further defects rode along: it called bare `cindex` (not the repo-canonical `cindex-uefilter`, which alone supports `-files-from` and UE-path filtering) and `:wait()`-blocked the UI thread (violates P6 / C4 conv #2).
+
+**Why this is the correct fix, not a workaround** — argv length is an OS contract, not an upstream bug that could be "fixed away"; feeding an arbitrary-length path list to a child process via a `-files-from` file is the permanently right design (the very reason `cindex-uefilter` exists). The change converges the watcher onto the already-vetted incremental path `:UEPrepareIncremental` uses. Nothing here is "patch around someone else's bug" → lives in main logic with plain comments, NOT `lua/workarounds/` (per C2: a fix that IS the right answer is not a workaround).
+
+**Implemented**
+- `lua/utils/ue_watch.lua` — rewrote `provider_csearch_add`: writes dirty paths to `<csearch_index>.incremental.txt`, calls `require("utils.code_search").build_index({ csearch_idx = <index> }, list, cb, { mode = "add" })`, removes the temp file in the callback. Probes `cindex_uefilter_exe()` and the `build_index` API up front, returning explicit failure (not silent) when unavailable. Async — no `:wait()`.
+- `lua/utils/ue_watch.lua` — added the `-files-from`/argv-limit rule to the module's "Design constraints" header and a full provider-doc comment explaining the OS-contract rationale.
+- `lua/utils/ue_watch.lua` — added test seams `M._provider_csearch_add_for_test` + `M._set_opts_for_test` (non-runtime API).
+- `tests/cases/ue_watch_csearch_spec.lua` (new, 7 cases) — static guards that argv fan-out / bare `cindex` cannot return; behavioral test with a stubbed `code_search` backend asserting the provider routes through `build_index{mode="add"}` with the dirty paths written to the `-files-from` list and the temp file cleaned up; no-op on empty, explicit failure on missing index config / missing `cindex-uefilter`.
+
+**Pitfalls / Gotchas**
+- `cindex-uefilter` (not bare `cindex`) is the repo-wide canonical indexer; bare `cindex` lacks `-files-from` and UE-path filtering (code_search/CLAUDE.md). The old provider was a pre-2026-05-28 leftover that never adopted the `build_index{mode="add"}` path the rest of the system standardized on.
+- Provider failures are logged, not propagated: the flush is fire-and-forget on the scheduler, and the cumulative `persistent_dirty` set + rg-on-dirty overlay already cover any path that misses a given flush.
+
+**Validation**
+- `nvim --headless -l tests/run.lua ue_watch_csearch` → 7/7 passed.
+- `nvim --headless -l tests/run.lua utils` → 30/30 passed.
+- Full suite `nvim --headless -l tests/run.lua` → 382/382 passed (covers both 2026-06-16 entries: ue_watch + freshness anchor).
+
+**Follow-ups**
+- None. Module design captured in `docs/architecture/grep-cache-invalidation.md` D7; pitfall in `docs/CONSTRAINTS.md` K29.
+
+### 2026-06-16 — grep freshness: anchor on git commit-state, not .git/index (kill phantom "stale" after UEPrepare)
+
+**Task** — On a UE git worktree, `<space><space>` / `<leader>/` kept warning `:UEPrepare is stale (worktree changed since last run)` immediately after a successful `:UEPrepare`, even though no source file had changed. User report: "我已经 UEPrepare! 了为什么 space space 找文件还会提示 stale".
+
+**Root cause** — `prepare_freshness` anchored list freshness on `.git/index` mtime. On UE worktrees the engine `.git` is a `gitdir:` pointer into the main repo's `worktrees/<name>/` (here `D:/project/uetemp/.git` → `D:/project/UnrealEngine/.git/worktrees/uetemp`), and that per-worktree `index` is re-touched minutes after UEPrepare by git's always-on `fsmonitor--daemon` and TortoiseGit background refresh — without the working-tree file SET changing. So `index_mtime > list_mtime` → false "stale". (Observed: list 18:35:44, index re-touched 18:46:40 → 18:57:20 by background tooling.)
+
+**Implemented**
+- `lua/ue.lua`: replaced `git_index_mtime(repo_root)` with `git_commit_state_mtime(repo_root)` — same worktree-aware `.git` / `gitdir:` resolution, but anchors on the newest mtime of `HEAD` + `logs/HEAD` (commit-state) instead of `index` (staging area). `logs/HEAD` appends on every ref movement (commit / pull / merge / rebase / reset / checkout), so it captures fast-forwards that leave `HEAD`'s symref text unchanged.
+- Updated the two anchor call sites in `CORE_RT.prepare_freshness` and the anchor-list doc comments (anchors #1/#2 now "git commit-state (HEAD + logs/HEAD)").
+- Uncommitted/unstaged new-file detection is unchanged — still covered by the `ue_watch` dirty overlay and the `dir_mtime` anchors, which is why dropping `index` loses no real-change coverage.
+
+**Pitfalls / Gotchas**
+- `index` is NOT a proxy for "file population changed": fsmonitor / TortoiseGit / background `git add` / build artifact staging all bump it. It was redundant with the watcher+dir anchors for the add/remove case and actively harmful for the refresh case.
+- A linked worktree has per-worktree `HEAD`/`logs/HEAD` under `worktrees/<name>/`, so a branch switch in THIS worktree still shows and sibling worktrees of the same main repo don't bleed in.
+
+**Validation**
+- `nvim --headless -l tests/run.lua grep_cache` → 21/21 passed.
+- Full suite `nvim --headless -l tests/run.lua` → 375/375 passed.
+- Live anchor recompute against the user's real cache: new anchors max = `dir_mtime` 18:02:50 < list 18:35:44 → `fresh` (was `stale` under the old `index` 18:57:20 anchor).
+
+**Follow-ups**
+- None. `index`-based detection intentionally retired; `UE_DAP_*`-style escape hatch not added (watcher overlay already covers the uncommitted-add edge).
+
 ### 2026-06-15 — docs/test: harden + preserve the live-breakpoint experience (ADR, behavioral tests, knowledge base)
 
 **Task** — The session-time live-breakpoint work (previous entry) is load-bearing and hard-won; preserve it against regression and knowledge loss via behavioral tests, an ADR, and knowledge-base updates (user request: "保留这次的经验不被破坏").

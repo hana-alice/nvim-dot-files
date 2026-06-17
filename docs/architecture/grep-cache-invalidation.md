@@ -1,10 +1,13 @@
 # Grep 缓存失效与平台分路径 · 模块设计
 
 > 子系统：`lua/utils/code_search/` + `lua/ue.lua`（cache_paths / resolve_context /
-> set_project / set_platform / prepare）+ `lua/plugins/snacks.lua`（grep keymaps）。
+> set_project / set_platform / prepare / **prepare_freshness**）+ `lua/utils/ue_watch.lua`
+> （**增量 csearch provider**）+ `lua/plugins/snacks.lua`（grep keymaps）。
 > 关联：`docs/architecture/overview.md` §2 数据流；`lua/utils/code_search/CLAUDE.md`；
 > `docs/CONSTRAINTS.md §二/§三`。
 > 引入：2026-06-11，修复 `<leader>/` 静默搜不全。
+> 扩充：2026-06-16，D7（watcher 增量入索引经 `-files-from`，修 ENAMETOOLONG）+
+> D8（freshness anchor 改 commit-state，修 fsmonitor 假 stale）。
 
 ## 1. 问题背景
 
@@ -96,6 +99,46 @@ picker 前都检查 `stopped`。
 理由：snacks finder 的 drain loop 以 `on_done` 设置的 done 状态决定何时停止等待；如果
 `on_done` 先于尾部 `on_line` 被处理，那些尾部命中即使已经由子进程输出，也不会进入 picker。
 
+### D7 — watcher 增量 csearch 入索引：经 `build_index{mode="add"}` + `-files-from`，禁 argv fan-out
+
+`ue_watch` 的 `provider_csearch_add`（debounce flush 时为 dirty adds 更新 trigram 索引）
+**委托给 `code_search.build_index(cs_ctx, list_path, cb, { mode = "add" })`**——与
+`:UEPrepareIncremental` 同一条已验证路径（2026-05-28 引入）。该 helper：
+
+- 跑 `cindex-uefilter -files-from <临时文件>`（**不是**裸 `cindex`）。`cindex-uefilter`
+  是全仓唯一规范 indexer（UE 路径过滤 + `-files-from` 能力，fork 存在的全部理由）。
+- `mode="add"` 去掉 `-reset`，对既有 `csearch.idx` **append**（csearch 增量语义），
+  不全量重建。
+- **async**（无 `:wait()` 阻塞 UI 线程，遵守 P6 / C4 约定2）。
+
+**为什么必须 `-files-from` 文件而非 argv**：旧实现把每个 dirty 路径作为一个 argv 元素拼进
+`cindex` 命令（`cmd={cindex}; for p in paths insert(cmd,p)`）。一次 `git checkout` /
+构建批量产生几百个长 UE 路径（单条 80–120 字符）进 `pending_add`，flush 时拼成的命令行
+超过 **Windows ~32 KiB argv 上限** → `ENAMETOOLONG`（`vim/_system.lua:256` spawn 抛错）。
+argv 长度是 **OS 契约**，不是可被上游修复的 bug；把任意长度文件列表喂给子进程，**文件列表
+入口（`-files-from`）本就是唯一正确做法**——这是修正我们自己的设计缺陷，非 workaround，
+故落主逻辑配普通注释，不进 `lua/workarounds/`。
+
+失败仅 log 不阻断：provider 在 scheduler 上 fire-and-forget，未入索引的路径仍由累积
+`persistent_dirty` 集合 + rg-on-dirty overlay 兜底（见 §2 persistent_dirty）。
+
+### D8 — freshness anchor：git commit-state（`HEAD`+`logs/HEAD`），非 `.git/index`
+
+`prepare_freshness` 判定缓存 list 是否过期时，git 维度 anchor 取
+`git_commit_state_mtime(repo)` = `<gitdir>/HEAD` 与 `<gitdir>/logs/HEAD` 的较新 mtime，
+**不取 `.git/index`**。`.git`/`gitdir:` 解析与 worktree 处理不变（UE 引擎是
+UnrealEngine 主仓的 linked worktree，`.git` 是 `gitdir:` 指针，元数据在
+`<main>/.git/worktrees/<name>/`）。
+
+理由：`index`（暂存区）会被 **git fsmonitor 守护进程 / TortoiseGit 后台 refresh /
+构建产物 staging** 频繁 touch，而**工作树文件集合并未变**——在 UE worktree（巨树 +
+常驻 fsmonitor + TortoiseGit）上，UEPrepare 完成几分钟后 index 就被重新 touch，导致
+`index_mt > list_mt` → 假"stale" → 每次 `<space><space>` 误弹 stale 警告。
+`HEAD`+`logs/HEAD` 只在**真正改变文件集合**的操作（checkout / pull / merge / rebase /
+reset / commit）上移动（`logs/HEAD` 每次 ref 变更追加，捕获 HEAD symref 文本不变的
+fast-forward）。未提交的新增文件仍由 `ue_watch` dirty overlay + `dir_mtime` anchor 兜底，
+故弃用 `index` 零覆盖损失。
+
 ## 3. 失效正确性论证
 
 - **engine 变**：旧 `set_project` 只比 project_root；engine 换了（同 project 指向新引擎）
@@ -105,6 +148,10 @@ picker 前都检查 `stopped`。
 - **重建期负探测**：D1（不缓存负探测）+ UEPrepare finalize 重探，双保险。
 - **stream 尾部命中**：D6 让 backend 只从一个 flusher 交付命中和 done，消除 callback
   调度顺序竞争。
+- **watcher 增量入索引不溢出 argv**：D7 让 dirty adds 经 `-files-from` 文件喂给
+  `cindex-uefilter`，任意数量都是单文件参数，消除 ENAMETOOLONG；且 async 不阻塞 UI。
+- **freshness 不误报**：D8 让 git anchor 取 commit-state 而非 index，fsmonitor /
+  TortoiseGit 后台 touch index 不再触发假 stale。
 
 ## 4. 风险与缓解
 
@@ -113,6 +160,8 @@ picker 前都检查 `stopped`。
 | `cache_paths` 布局变更影响面大 | platform_key="" 完全回落旧路径，老缓存零破坏；D4 move-once 幂等；spec 守护布局 |
 | 跨盘绝对路径（E 工程/D 引擎） | 迁移/分路径仅改缓存落点，不碰路径内容生成；既有 cross-drive guard 不受影响 |
 | watch 模块索引路径 | `ue_watch.start` 的 `csearch_index` 入参随 ctx.paths 自动指向平台目录，无需额外改 |
+| watcher 大批量 add 溢出命令行 | D7：dirty adds 经 `-files-from` 临时文件（非 argv）喂 `cindex-uefilter`，任意数量单参数，杜绝 ENAMETOOLONG；spec 静态守护「不复活 argv 拼接」 |
+| fsmonitor/TortoiseGit 后台改 index 触发假 stale | D8：freshness git anchor 取 `HEAD`+`logs/HEAD`（commit-state）而非 index；新增文件仍由 dirty overlay + dir_mtime 兜底 |
 
 ## 5. 测试
 
@@ -120,10 +169,14 @@ picker 前都检查 `stopped`。
   platform_key 生成、迁移 move+幂等+不覆盖+空 key、engine_root 往返。
 - `tests/cases/utils_spec.lua`（扩充）：`_reset_probe_cache` 存在/幂等、`is_indexed` 无索引安静返回 false、
   rg stream 的 `on_done` 排序与 stop 后不回调。
-- 回归范围：跨子系统（ue.lua + code_search + snacks）→ 提交前全量
+- `tests/cases/ue_watch_csearch_spec.lua`（7 例，D7）：provider 经 `build_index{mode="add"}` +
+  `-files-from` 临时文件路由；静态守护「不复活 `local cindex="cindex"` / per-path argv 拼接」；
+  空 paths no-op、缺索引配置 / 缺 `cindex-uefilter` 时显式失败不静默吞。
+- 回归范围：跨子系统（ue.lua + code_search + ue_watch + snacks）→ 提交前全量
   `nvim --headless -l tests/run.lua`。
 
 ## 6. 公共 API 增量（M.*）
 
 - `M._reset_probe_cache`（code_search）
 - `M.cache_paths` / `M.platform_key_from_state` / `M.migrate_legacy_csearch_if_needed`（ue，测试 seam）
+- `M._provider_csearch_add_for_test` / `M._set_opts_for_test`（ue_watch，测试 seam — 非运行时 API）

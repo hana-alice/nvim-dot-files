@@ -3366,40 +3366,74 @@ end
 
 local prepare_freshness  -- forward-decl alias kept for in-module callers
 do
-  -- Resolve <repo>/.git into the actual gitdir, then return mtime of its index.
-  -- Handles four shapes:
-  --   1. .git is a directory (regular repo) → <repo>/.git/index
-  --   2. .git is a file "gitdir: <path>" (worktree / submodule)
-  --      → resolve <path>/index. If <path> ends with worktrees/<name>, the
-  --        worktree's per-worktree index sits there; that's what we want
-  --        (it changes on any file add/remove in that worktree).
-  --   3. .git is missing entirely → return 0 (caller falls back to other anchors).
-  --   4. .git file points to a non-existent path → 0.
+  -- Resolve <repo>/.git into the actual gitdir, then return the newest mtime
+  -- among that gitdir's COMMIT-STATE files (HEAD + logs/HEAD), NOT its index.
+  --
+  -- Why not index? `index` (the staging area) is touched by operations that do
+  -- NOT change the working-tree file SET our cached list enumerates:
+  --   * git's fsmonitor--daemon periodically re-stats the worktree and rewrites
+  --     index to refresh its cache-stat fields;
+  --   * TortoiseGit / IDE git integrations call `git add`/refresh in the
+  --     background;
+  --   * a build that stages generated artifacts bumps index.
+  -- On a UE worktree (huge tree + always-on fsmonitor + TortoiseGit) index gets
+  -- re-touched minutes after :UEPrepare even though no file was added/removed,
+  -- so the list looks "stale" and every <space><space> warns falsely.
+  --
+  -- HEAD + logs/HEAD instead move precisely on the operations that DO change the
+  -- working-tree file set: checkout, pull/merge/rebase, commit, reset. (Branch
+  -- switches rewrite HEAD; every ref movement appends to logs/HEAD.) That is the
+  -- real "did the on-disk file population change?" signal we want to anchor on.
+  -- Uncommitted/unstaged new files are still caught by ue_watch's dirty overlay
+  -- and the directory-mtime anchors in prepare_freshness — index was redundant
+  -- with those for the add/remove case and harmful for the refresh case.
+  --
+  -- Handles four shapes of <repo>/.git:
+  --   1. directory (regular repo) → <repo>/.git/{HEAD,logs/HEAD}
+  --   2. file "gitdir: <path>" (worktree / submodule) → resolve <path>/{...}.
+  --      For a linked worktree <path> is .../worktrees/<name>, whose HEAD and
+  --      logs/HEAD are per-worktree (so a branch switch in THIS worktree shows,
+  --      and unrelated worktrees of the same repo don't bleed in).
+  --   3. .git missing entirely → 0 (caller falls back to other anchors).
+  --   4. .git points to a non-existent path → 0.
   -- Returns mtime in epoch seconds, or 0 on any failure.
-  local function git_index_mtime(repo_root)
+  local function git_commit_state_mtime(repo_root)
     if not repo_root or repo_root == "" then return 0 end
     local dot_git = repo_root .. "/.git"
     local st = vim.loop.fs_stat(dot_git)
     if not st then return 0 end
+
+    local gitdir
     if st.type == "directory" then
-      local s = vim.loop.fs_stat(dot_git .. "/index")
-      return (s and s.mtime and s.mtime.sec) or 0
+      gitdir = dot_git
+    else
+      -- file: parse "gitdir: <path>" (worktree pointer)
+      local f = io.open(dot_git, "r")
+      if not f then return 0 end
+      local line = f:read("*l")
+      f:close()
+      if not line then return 0 end
+      local g = line:match("^gitdir:%s*(.-)%s*$")
+      if not g or g == "" then return 0 end
+      -- Resolve relative gitdir against repo_root
+      if not g:match("^[A-Za-z]:") and not g:match("^/") then
+        g = repo_root .. "/" .. g
+      end
+      gitdir = g
     end
-    -- file: parse "gitdir: <path>" (worktree pointer)
-    local f = io.open(dot_git, "r")
-    if not f then return 0 end
-    local line = f:read("*l")
-    f:close()
-    if not line then return 0 end
-    local gitdir = line:match("^gitdir:%s*(.+)%s*$")
-    if not gitdir or gitdir == "" then return 0 end
-    -- Resolve relative gitdir against repo_root
-    if not gitdir:match("^[A-Za-z]:") and not gitdir:match("^/") then
-      gitdir = repo_root .. "/" .. gitdir
+    gitdir = gitdir:gsub("\\", "/")
+
+    -- Newest mtime across the commit-state anchors. We deliberately do NOT read
+    -- index here (see header). HEAD moves on branch switch; logs/HEAD appends on
+    -- every ref update (commit / pull / reset / checkout), so it captures merges
+    -- and fast-forwards that leave HEAD's symref text unchanged.
+    local newest = 0
+    for _, rel in ipairs({ "/HEAD", "/logs/HEAD" }) do
+      local s = vim.loop.fs_stat(gitdir .. rel)
+      local mt = s and s.mtime and s.mtime.sec or 0
+      if mt > newest then newest = mt end
     end
-    local idx = gitdir:gsub("\\", "/") .. "/index"
-    local si = vim.loop.fs_stat(idx)
-    return (si and si.mtime and si.mtime.sec) or 0
+    return newest
   end
 
   -- mtime of a directory tree's TOP-LEVEL marker (cheap stat on the dir itself,
@@ -3424,12 +3458,16 @@ do
   --   "never"        — no list file exists at all
   --
   -- Anchors (we take max across all available, then compare to list mtime):
-  --   1. <engine_root>/.git/index (worktree-aware)
-  --   2. <project_root>/.git/index (worktree-aware)
+  --   1. <engine_root> git commit-state (HEAD + logs/HEAD, worktree-aware)
+  --   2. <project_root> git commit-state (HEAD + logs/HEAD, worktree-aware)
   --   3. <engine_root> dir mtime  (filesystem fallback)
   --   4. <project_root> dir mtime (filesystem fallback)
-  -- (state.updated_at was tried as anchor #5 but had to be removed — see
-  --  the long comment next to the `anchors` table below.)
+  -- (We deliberately anchor on commit-state, NOT .git/index — index is touched
+  --  by fsmonitor / TortoiseGit / background `git add` without the working-tree
+  --  file SET changing, which produced phantom "stale" warnings after every
+  --  build on UE worktrees. See git_commit_state_mtime's header. state.updated_at
+  --  was tried as anchor #5 but had to be removed — see the long comment next to
+  --  the `anchors` table below.)
   --
   -- We deliberately do NOT compare list mtime against itself or against
   -- workspace_all_list's siblings — that's the self-validating loop the old
@@ -3482,8 +3520,8 @@ do
     -- real-change scenarios (git ops, fs changes, watcher dirty) are still
     -- caught by the four remaining anchors.
     local anchors = {
-      git_index_mtime(ctx.engine_root),
-      git_index_mtime(ctx.project_root),
+      git_commit_state_mtime(ctx.engine_root),
+      git_commit_state_mtime(ctx.project_root),
       dir_mtime(ctx.engine_root),
       dir_mtime(ctx.project_root),
     }

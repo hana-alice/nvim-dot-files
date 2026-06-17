@@ -1678,4 +1678,13 @@ function M._effective_project_root_for_test(ctx)
   return effective_project_root(ctx)
 end
 
+-- Build attachCommands from a synthetic session table (no device / adb). Guards
+-- the load-bearing attach ordering: K34 symbol-rich `target create` FIRST, K30
+-- serial-form `platform connect connect://[<serial>]:<port>`, K37 explicit ASLR
+-- `target modules load --slide` honoured/skipped per session._module_rebase_cmd
+-- and the UE_DAP_NO_SLIDE switch.
+function M._attach_commands_for_test(session)
+  return attach_commands(session)
+end
+
 return M

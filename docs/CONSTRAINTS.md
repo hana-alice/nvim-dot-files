@@ -104,7 +104,9 @@
   解决: F9 走 `ue.dap._persist_bp`，存到
   `<engine_root>/.cache/nvim-ue/breakpoints/<project>.json`，250ms 防抖、
   `BufReadPost` 懒恢复；该模块从 `ue.lua` 提前 `setup()`，保证 nvim-dap 懒加载前也生效。
-  → `docs/TOOLING.md` §Pitfalls #10; `lua/ue/dap/_persist_bp.lua`
+  → `docs/TOOLING.md` §Pitfalls #10; `lua/ue/dap/_persist_bp.lua`;
+    行为测 `tests/cases/dap_spec.lua`「F9 持久化往返（K10）」（JSON 往返 / 路径归一 /
+    project_name sanitize / save 合并 pending 不擦除未开文件断点）
 
 ### Android ASLR（来自 MEMORY，需对当前代码复核）
 
@@ -146,7 +148,9 @@
     `m_device_id = parsed_url->hostname`）。这是 remote-android 官方 serial-based URL，
     **非 workaround**。
   → `tools/dap_platform_e51cbe6.py`; 归档 change `2026-06-03-android-dap-platform-mode`;
-    `git show e51cbe6:lua/ue/dap/android.lua`
+    `git show e51cbe6:lua/ue/dap/android.lua`;
+    行为测 `tests/cases/dap_spec.lua`「attach_commands（K30/K34/K37 顺序与 slide 开关）」
+    （serial 方括号 URL / target create 先序 / 信号处置后置）
 
 - **K31 — `lldb-server gdbserver --attach <pid>` 在该设备从不绑定监听端口**
   症状: ptrace 附上（`TracerPid` 非 0）但端口永不进 LISTEN（`/proc/net/tcp` 0 条），
@@ -193,7 +197,9 @@
   解决: attachCommands 第一阶段先 `target create "<symbol-rich libUE4.so>"`，再走
   `platform select` / serial-form `platform connect` / `process attach --pid`。后置
   `target symbols add` / `target modules add` 不能替代这个顺序。
-  → `lua/ue/dap/android.lua`; `docs/changelog.md` 2026-05-21/2026-06-03 断点记录
+  → `lua/ue/dap/android.lua`; `docs/changelog.md` 2026-05-21/2026-06-03 断点记录;
+    行为测 `tests/cases/dap_spec.lua`「attach_commands」（target create 第一条 + 早于
+    connect/attach）与「pick_symbol_lib（K35）」（versionCode 精确匹配优先于 mtime）
 
 - **K36 — session-time live 断点经 lldb-dap evaluate 通道可行（本设备实证，非 work around）**
   症状/背景: 历史 `361b9e7` 记录"attach 后写断点指令被内核静默丢弃，session-time live
@@ -216,7 +222,9 @@
   resolved+命中）未满足。`UE_DAP_NO_SLIDE` 环境开关保留供后续在其他设备/版本复验。
   证据 `tools/evidence/android-f9/noslide-preseed.result.json`(timeout) vs
   `slide-recheck.result.json`(ok)。
-  → change `android-dap-live-breakpoints` design D5/OQ#3; `lua/ue/dap/android.lua`
+  → change `android-dap-live-breakpoints` design D5/OQ#3; `lua/ue/dap/android.lua`;
+    行为测 `tests/cases/dap_spec.lua`「attach_commands」（默认含显式 slide；
+    `UE_DAP_NO_SLIDE=1` 时跳过——锁住开关语义与 plumbing 存在）
 
 ### 工具链 / LLVM
 

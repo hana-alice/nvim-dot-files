@@ -24,8 +24,13 @@
 --     csearch only, or both. The watcher decides; the providers are dumb.
 --   * Idempotent providers: re-firing the same path is a no-op so we can be
 --     liberal with retries.
---   * Never block UI: every disk operation goes through vim.system or
---     vim.uv async APIs and posts back via vim.schedule.
+--   * Never block UI: every disk operation goes through vim.system / vim.uv
+--     async APIs (or code_search.build_index, itself async) and posts back via
+--     vim.schedule. No provider may :wait() on the UI thread.
+--   * Arbitrary-length path lists go to child processes via a -files-from temp
+--     file, NEVER as argv elements — Windows' ~32 KiB command-line limit makes
+--     argv fan-out (one path = one arg) overflow on big git-checkout/build
+--     batches (ENAMETOOLONG). See provider_csearch_add.
 --
 -- Hard limits we accept (documented for future maintainers)
 --   * codesearch can't delete a path from an index — see codesearch's Merge
@@ -149,30 +154,61 @@ end
 -- the rest of the pipeline.
 -- ---------------------------------------------------------------------------
 
--- Provider: csearch index append.
--- codesearch's `cindex <path>` appends to $CSEARCHINDEX. Empirical: a single
--- file added to a 192MB UE index merges in ~1.4s (streaming, not full
--- re-hash). Batching multiple paths in one cindex call amortises that.
+-- Provider: csearch index append (incremental).
+--
+-- Delegates to code_search.build_index(..., { mode = "add" }) — the SAME
+-- vetted path :UEPrepareIncremental uses (introduced 2026-05-28). That helper:
+--   * runs `cindex-uefilter -files-from <tempfile>` (NOT bare `cindex`):
+--       - `cindex-uefilter` is the repo-wide canonical indexer (UE-path
+--         filtering + the `-files-from` capability the fork exists for);
+--       - `-files-from <tempfile>` is the ONLY correct way to feed an
+--         arbitrary-length path list to a child process. Passing each path as
+--         an argv element (the old impl did) blows Windows' ~32 KiB command-
+--         line limit the instant a `git checkout` / build batches a few hundred
+--         long UE paths into one flush → ENAMETOOLONG. argv length is an OS
+--         contract, not a fixable upstream bug, so file-list input is the
+--         permanent right answer here, not a workaround.
+--   * is async (no `:wait()` on the UI thread — honours the never-block rule).
+-- mode="add" drops `-reset` so the existing index is appended to, not rebuilt.
+--
+-- Failures are logged (not returned) because the call is fire-and-forget on the
+-- scheduler; the cumulative persistent_dirty set + rg-on-dirty overlay already
+-- cover any path that didn't make it into the trigram index this flush.
 local function provider_csearch_add(paths)
   if #paths == 0 then return true end
   if not state.opts or not state.opts.csearch_index then
     return false, "no csearch_index configured"
   end
-  local cindex = "cindex"  -- assume PATH; fail loud if missing
-  if vim.fn.executable(cindex) == 0 then
-    return false, "cindex executable not found in PATH"
+  local ok_cs, code_search = pcall(require, "utils.code_search")
+  if not ok_cs or type(code_search.build_index) ~= "function" then
+    return false, "utils.code_search.build_index unavailable"
   end
-  local cmd = { cindex }
-  for _, p in ipairs(paths) do table.insert(cmd, p) end
-  local result = vim.system(cmd, {
-    text = true,
-    env = vim.tbl_extend("force", vim.fn.environ(), {
-      CSEARCHINDEX = state.opts.csearch_index,
-    }),
-  }):wait()
-  if result.code ~= 0 then
-    return false, "cindex failed: " .. (result.stderr or "")
+  if not code_search.cindex_uefilter_exe() then
+    return false, "cindex-uefilter not found in PATH"
   end
+
+  -- Write the dirty paths to a temp file fed via -files-from. Keeping it next
+  -- to the index avoids cross-volume temp churn and self-documents intent.
+  local list_path = state.opts.csearch_index .. ".incremental.txt"
+  local fout, ferr = io.open(list_path, "w")
+  if not fout then
+    return false, "open incremental list: " .. (ferr or "?")
+  end
+  for _, p in ipairs(paths) do fout:write(p, "\n") end
+  fout:close()
+
+  -- build_index keys its index off ctx.csearch_idx (single source of truth in
+  -- ue.lua's cache layout); pass the watcher's configured index path verbatim.
+  local cs_ctx = { csearch_idx = state.opts.csearch_index }
+  code_search.build_index(cs_ctx, list_path, function(ok_add, err_add, stats)
+    pcall(os.remove, list_path)
+    if ok_add then
+      log_info(("csearch +%d files in %dms"):format(#paths, (stats and stats.ms) or 0))
+    else
+      log_warn("csearch_add: " .. tostring(err_add or "?"))
+    end
+  end, { mode = "add" })
+
   return true
 end
 
@@ -564,5 +600,13 @@ function M.snapshot_pending()
   end
   return { adds = adds, dels = dels }
 end
+
+-- Test seam: expose the csearch-add provider so the regression can drive it
+-- with a stubbed code_search backend and assert it routes through
+-- build_index{mode="add"} (i.e. -files-from temp file, never argv fan-out).
+-- Not part of the runtime API — providers stay "dumb" and the dispatcher owns
+-- ordering; this is purely for headless verification.
+M._provider_csearch_add_for_test = provider_csearch_add
+M._set_opts_for_test = function(opts) state.opts = opts end
 
 return M

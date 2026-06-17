@@ -318,6 +318,30 @@
   全部 parsed hits，再在进程退出且 backlog 为空时调用 `on_done`；stop 后所有 flusher 都短路。
   → `docs/architecture/grep-cache-invalidation.md` D6; `lua/utils/code_search/init.lua`
 
+- **K29 — watcher 批量 add 把每路径拼进 argv → `ENAMETOOLONG`**
+  症状: `git checkout` / 构建批量产生几百个长 UE 路径后，`ue_watch` flush 抛
+  `vim/_system.lua:256: ENAMETOOLONG: name too long`（`provider_csearch_add` 把每个
+  dirty 路径作为一个 argv 元素拼进裸 `cindex` 命令，超 Windows ~32 KiB argv 上限）。
+  解决: provider 改委托 `code_search.build_index(.., { mode = "add" })`——dirty 路径写进
+  临时文件经 `cindex-uefilter -files-from` 入索引（与 `:UEPrepareIncremental` 同源），
+  任意数量都是单文件参数；且 async 不 `:wait()`。**这是用对既有正解 + 平台契约（argv
+  上限非上游 bug），非 workaround**，落主逻辑。
+  → `docs/architecture/grep-cache-invalidation.md` D7; `lua/utils/ue_watch.lua`
+    `provider_csearch_add`; `tests/cases/ue_watch_csearch_spec.lua`
+
+- **K30g — freshness 用 `.git/index` 当 anchor → fsmonitor/TortoiseGit 后台 touch 触发假 stale**
+  症状: `:UEPrepare` 完成后 `<space><space>` / `<leader>/` 仍弹
+  `:UEPrepare is stale (worktree changed since last run)`，但无源码改动。根因:
+  `prepare_freshness` 拿 `.git/index` mtime 当 anchor，而 git fsmonitor 守护进程 /
+  TortoiseGit 后台 refresh 会在 prepare 后重新 touch index（工作树文件集合未变），
+  `index_mt > list_mt` → 假 stale。UE 引擎是 UnrealEngine 主仓的 linked worktree
+  （`.git` 是 `gitdir:` 指针，index 在 `<main>/.git/worktrees/<name>/`），加剧该现象。
+  解决: git anchor 改 `git_commit_state_mtime` = `HEAD` + `logs/HEAD`（commit-state，
+  只随 checkout/pull/merge/rebase/reset/commit 移动）；未提交新增文件仍由 `ue_watch`
+  dirty overlay + `dir_mtime` 兜底，弃 index 零覆盖损失。
+  → `docs/architecture/grep-cache-invalidation.md` D8; `lua/ue.lua`
+    `git_commit_state_mtime` / `prepare_freshness`
+
 ---
 
 ## 三、约束（Constraints）

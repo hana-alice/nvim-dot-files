@@ -305,4 +305,61 @@ function M.setup()
   M.load()
 end
 
+-- ── test seams ───────────────────────────────────────────────────────────
+-- Pure helpers exposed for headless round-trip tests (K10: F9 breakpoint
+-- persistence). These touch only the JSON file + path normalization, never
+-- a live nvim-dap session, so they run in tests/ without a debugger attached.
+
+-- Normalize a path key the same way every storage/lookup path does.
+function M._norm_for_test(p)
+  return norm(p)
+end
+
+-- Round-trip a table through the on-disk JSON writer/reader. Returns the
+-- decoded value (or nil on any failure), proving encode↔decode parity and
+-- that the directory is created.
+function M._json_round_trip_for_test(path, tbl)
+  local ok = write_json_file(path, tbl)
+  if not ok then return nil end
+  return read_json_file(path)
+end
+
+-- Derive the filename-safe project name from a uproject/project_root pair,
+-- mirroring resolve_cache_path()'s logic WITHOUT requiring a real ue context.
+-- Guards the K10 storage layout (per-project bucketing must not collide / leak
+-- foreign-project paths after a checkout switch).
+function M._project_name_for_test(uproject, project_root)
+  local project_name
+  if uproject and uproject ~= "" then
+    project_name = vim.fs.basename(uproject):gsub("%.uproject$", "")
+  elseif project_root and project_root ~= "" then
+    project_name = vim.fs.basename(project_root)
+  else
+    project_name = "default"
+  end
+  return project_name:gsub("[^%w%._%-]", "_")
+end
+
+-- Drive M.save() against a fixed cache_path + pre-seeded pending_paths, with
+-- dap.breakpoints stubbed by the caller. Returns the persisted data table read
+-- back from disk. Guards the K10 "merge pending on save" invariant: saving
+-- after opening ONE file must NOT erase breakpoints for unopened files.
+function M._save_with_state_for_test(cache_path, pending_paths)
+  state.cache_path = cache_path
+  state.data = { version = 1, project = "test", breakpoints = {} }
+  state.pending_paths = pending_paths or {}
+  M.save()
+  return read_json_file(cache_path)
+end
+
+-- Reset module state between test cases (load() is once-per-session guarded).
+function M._reset_state_for_test()
+  state.loaded = false
+  state.cache_path = nil
+  state.data = nil
+  state.pending_paths = {}
+  if state.save_timer then pcall(function() state.save_timer:stop() end) end
+  state.save_timer = nil
+end
+
 return M

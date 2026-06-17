@@ -53,6 +53,35 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-06-16 — tests: activate dormant DAP seams + F9 persistence round-trip (K-pitfall → behavioral)
+
+**Task** — Deepen debugger test coverage for long-term stability. Strategy (from explore session): migrate hard-won DAP knowledge from source-text grep assertions toward pure-function behavioral tests, prioritizing already-extracted-but-unexercised `_for_test` seams, and annotate each debugger case with the K-pitfall it guards.
+
+**Implemented**
+- `lua/ue/dap/android.lua` — added `M._attach_commands_for_test(session)` seam over the pure `attach_commands(session)` builder (no device/adb needed).
+- `lua/ue/dap/_persist_bp.lua` — added pure test seams `M._norm_for_test`, `M._json_round_trip_for_test`, `M._project_name_for_test`, `M._save_with_state_for_test`, `M._reset_state_for_test` (JSON + path-normalization logic only; never a live nvim-dap session).
+- `tests/cases/dap_spec.lua` — +21 behavioral cases driving the previously-dormant seams:
+  - `pick_symbol_lib` (K35 + 3.4 false-lead): versionCode exact-match beats mtime-newest; ctx > config > auto-discover precedence.
+  - `pick_package`: ctx > config > packageInfo.txt first-line.
+  - `pick_lldb_server` (C1): preserves platform glob priority order (no resort); config override; nil on no hit.
+  - `effective_project_root`: Android-marker'd candidate wins.
+  - `attach_commands` (K30/K34/K37): `target create` symbol-rich FIRST and before connect/attach; serial-bracket `connect://[serial]:port` (never localhost); signal handling after attach; explicit slide present by default and skipped under `UE_DAP_NO_SLIDE=1`.
+  - `_persist_bp` (K10): JSON round-trip shape preservation; backslash/forward-slash key normalization; project_name sanitize; **save merges pending_paths so unopened-file breakpoints are not erased** (the documented disaster scenario).
+- Annotated existing debugger cases with their guarded K-numbers (K10/K33/K34/K36/K37).
+- `docs/CONSTRAINTS.md` — K10/K30/K35/K37 entries now point at their backing behavioral tests.
+
+**Pitfalls / Gotchas**
+- The 8 existing INVARIANT cases that grep `dap.lua`/`android.lua` source text are kept (they guard "the misleading name must not return" structural facts that have no pure-logic form), but new coverage is behavioral wherever a seam exists. Source-grep that targets the third-party `nvim-dap/lua/dap/session.lua` remains the one acceptable exception (it documents an upstream contract we depend on).
+- `cfg.reset_for_test()` is called before AND after each config-touching case so a setup() override can't leak across cases.
+
+**Validation**
+- `nvim --headless -l tests/run.lua dap` → 44/44 passed (was 20).
+- `nvim --headless -l tests/run.lua platform` → 10/10 passed.
+- Full suite below.
+
+**Follow-ups**
+- `module_rebase_command` / `read_so_base_hex` (ASLR base parsing from /proc/maps) still lack seams — they need adb stubbing; candidate for a future round.
+
 ### 2026-06-16 — ue_watch: incremental csearch via -files-from, not argv fan-out (fix ENAMETOOLONG)
 
 **Task** — `ue_watch`'s debounce flush threw `vim/_system.lua:256: ENAMETOOLONG: name too long` after a `git checkout` / build. User required this be a permanent correct fix, not a workaround.

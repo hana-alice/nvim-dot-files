@@ -99,32 +99,65 @@ picker 前都检查 `stopped`。
 理由：snacks finder 的 drain loop 以 `on_done` 设置的 done 状态决定何时停止等待；如果
 `on_done` 先于尾部 `on_line` 被处理，那些尾部命中即使已经由子进程输出，也不会进入 picker。
 
-### D7 — watcher 增量 csearch 入索引：经 `build_index{mode="add"}` + `-files-from`，禁 argv fan-out
+### D7 — watcher 增量 csearch 入索引（已被 D9 取代 / 退役，仅存档）
 
-`ue_watch` 的 `provider_csearch_add`（debounce flush 时为 dirty adds 更新 trigram 索引）
-**委托给 `code_search.build_index(cs_ctx, list_path, cb, { mode = "add" })`**——与
-`:UEPrepareIncremental` 同一条已验证路径（2026-05-28 引入）。该 helper：
+> **状态（2026-06-17）：D7 的「watcher 写 csearch 索引」整体退役，被 D9 取代。**
+> 下面保留原始记述作为决策链存档；当前实现以 **D9** 为准——watcher 不再写 csearch.idx。
 
-- 跑 `cindex-uefilter -files-from <临时文件>`（**不是**裸 `cindex`）。`cindex-uefilter`
-  是全仓唯一规范 indexer（UE 路径过滤 + `-files-from` 能力，fork 存在的全部理由）。
-- `mode="add"` 去掉 `-reset`，对既有 `csearch.idx` **append**（csearch 增量语义），
-  不全量重建。
-- **async**（无 `:wait()` 阻塞 UI 线程，遵守 P6 / C4 约定2）。
+D7（2026-06-16）把 `ue_watch` 的 `provider_csearch_add` 改为委托
+`code_search.build_index(.., {mode="add"})`（`cindex-uefilter -files-from <临时文件>`），
+修掉了老 argv fan-out 的 `ENAMETOOLONG`。**但它引入了一个更深的问题**：watcher 由此成为
+csearch.idx 的**第二个写者**，与用户的 `:UEPrepare` 全量构建并发写同一个索引。cindex 把
+staged 路径硬编码为 `<idx>~`，两个写者抢同一个 `idx~`，在 merge/rename 窗口互毁 →
+`corrupt index: remove` + 0 字节 idx 死循环（2026-06-17 现场）。
 
-**为什么必须 `-files-from` 文件而非 argv**：旧实现把每个 dirty 路径作为一个 argv 元素拼进
-`cindex` 命令（`cmd={cindex}; for p in paths insert(cmd,p)`）。一次 `git checkout` /
-构建批量产生几百个长 UE 路径（单条 80–120 字符）进 `pending_add`，flush 时拼成的命令行
-超过 **Windows ~32 KiB argv 上限** → `ENAMETOOLONG`（`vim/_system.lua:256` spawn 抛错）。
-argv 长度是 **OS 契约**，不是可被上游修复的 bug；把任意长度文件列表喂给子进程，**文件列表
-入口（`-files-from`）本就是唯一正确做法**——这是修正我们自己的设计缺陷，非 workaround，
-故落主逻辑配普通注释，不进 `lua/workarounds/`。
+D7 当时的论证「失败仅 log，未入索引的路径由 persistent_dirty + rg-on-dirty overlay 兜底」
+其实**已经预示了 watcher 自动增量不是 load-bearing**——既然 overlay 已兜底，自动写索引的
+收益极窄（编辑到下次 prepare 之间的窗口），却换来永久并发写危险面。故 D9 直接收回这个写者。
+关于 argv 上限的结论（`-files-from` 是任意长度路径列表喂子进程的唯一正解）仍然成立，只是
+现在只有 `:UEPrepare*`（单写者）走这条路径，watcher 不再走。
 
-失败仅 log 不阻断：provider 在 scheduler 上 fire-and-forget，未入索引的路径仍由累积
-`persistent_dirty` 集合 + rg-on-dirty overlay 兜底（见 §2 persistent_dirty）。
+### D9 — csearch.idx 单写者所有权 + 构建串行 + 增量韧性（取代 D7 的写者）
 
-### D8 — freshness anchor：git commit-state（`HEAD`+`logs/HEAD`），非 `.git/index`
+三层，每层「删/守」而非「加聪明」：
 
-`prepare_freshness` 判定缓存 list 是否过期时，git 维度 anchor 取
+**β（结构层）— watcher 退回记账员**：`ue_watch` 的 `provider_csearch_add` 改为
+**record-only no-op**，不再调用 `build_index` / 不写 csearch.idx。新文件的可见性由 flush()
+里的 `add_to_persistent_dirty` + rg-on-dirty overlay 提供（直到用户下次手动 `:UEPrepare*`）。
+csearch.idx 的写者收敛为**唯一所有者：用户显式触发的 prepare 家族**
+（`:UEPrepare` / `:UEPrepareReindex` / `:UEPrepareIncremental`）。
+用户已确认：新内容到下次手动 prepare 才识别，可接受。
+
+**Policy A（顺序层）— 构建串行，拒绝不排队**：`CORE_RT.csearch_build_running` 单标志，
+每个 csearch 构建入口启动前 `CORE_RT.csearch_build_begin(label)` 检查；占用中**拒绝并可见
+提示**（不排队、不写锁文件）。完成回调**无条件** `CORE_RT.csearch_build_done()`（成功与失败
+两条路径都清）——否则一次失败永久卡死。不排队的依据：全量已索引整份清单（含增量的脏文件），
+并发时排队增量是冗余白做。
+
+**韧性层 — 增量前校验 idx 可用**：`build_index` 在 `mode="add"` 且 spawn 前调
+`usable_index_stat(idx)`；不可用（0 字节 / 损坏 / 缺失）则不 spawn、直接
+`cb(false, "...run :UEPrepare")`。`mode="reset"`（全量）无视旧 idx，永远安全，不受此约束。
+这把「0 字节 idx → add → corrupt → remove」的死循环在源头切断。`recover_staged_index` 仍作
+构建后兜底（从 `idx~~` 提升）。
+
+**清理层 — 全量构建成功后 dirty 集合必归零**：β 把 watcher 降级为记账员后，「构建成功 ⇒
+dirty 归零」的清理责任完全转移到 prepare 家族，且**必须在每条全量成功路径都清**
+（cache fast-path / cold full / sync），统一走 `CORE_RT.clear_persistent_dirty_safe`。
+只有 cold-full 清、其它路径漏清会引出两个直接症状：(1) `prepare_freshness` 的第一道闸
+（`persistent_dirty_status().count > 0 → "stale"`）恒真——刚 prepare 完仍弹「stale」+ ue_watch
+提示；(2) rg-on-dirty overlay 每次 grep 背着巨大脏集合（实测 dirty.json 110 KB）重复扫 → picker
+变卡。失败则**不清**（脏文件仍需 overlay 兜底可见，直到下次成功构建）。
+
+为什么不是加锁 / 双索引 / 排队：见 change `fix-csearch-index-single-writer` 的 design.md
+Rejected Alternatives（α 锁仍需崩溃恢复且任意两写者重叠仍损坏；γ 双索引查询期 merge 成本永久；
+Policy B 排队对全量是冗余）。
+
+cindex `<idx>~` 路径硬编码 = 并发写损坏的根因，记 CONSTRAINTS K31g。防回归护栏：
+`tests/cases/ue_watch_csearch_spec.lua`（watcher 不写索引，静态+行为）、
+`tests/cases/csearch_build_guard_spec.lua`（构建串行拒绝并发 + 增量拒绝损坏 idx + 全量成功清 dirty）。
+
+
+### D8 — freshness anchor：git commit-state（`HEAD`+`logs/HEAD`），非 `.git/index``prepare_freshness` 判定缓存 list 是否过期时，git 维度 anchor 取
 `git_commit_state_mtime(repo)` = `<gitdir>/HEAD` 与 `<gitdir>/logs/HEAD` 的较新 mtime，
 **不取 `.git/index`**。`.git`/`gitdir:` 解析与 worktree 处理不变（UE 引擎是
 UnrealEngine 主仓的 linked worktree，`.git` 是 `gitdir:` 指针，元数据在
@@ -148,8 +181,8 @@ fast-forward）。未提交的新增文件仍由 `ue_watch` dirty overlay + `dir
 - **重建期负探测**：D1（不缓存负探测）+ UEPrepare finalize 重探，双保险。
 - **stream 尾部命中**：D6 让 backend 只从一个 flusher 交付命中和 done，消除 callback
   调度顺序竞争。
-- **watcher 增量入索引不溢出 argv**：D7 让 dirty adds 经 `-files-from` 文件喂给
-  `cindex-uefilter`，任意数量都是单文件参数，消除 ENAMETOOLONG；且 async 不阻塞 UI。
+- **watcher 不再写 csearch 索引（取代 D7）**：D9 让 watcher 退回记账员，csearch.idx 单写者
+  =prepare 家族；消除 watcher×UEPrepare 并发写损坏（`corrupt index` + 0 字节死循环）。
 - **freshness 不误报**：D8 让 git anchor 取 commit-state 而非 index，fsmonitor /
   TortoiseGit 后台 touch index 不再触发假 stale。
 
@@ -160,7 +193,8 @@ fast-forward）。未提交的新增文件仍由 `ue_watch` dirty overlay + `dir
 | `cache_paths` 布局变更影响面大 | platform_key="" 完全回落旧路径，老缓存零破坏；D4 move-once 幂等；spec 守护布局 |
 | 跨盘绝对路径（E 工程/D 引擎） | 迁移/分路径仅改缓存落点，不碰路径内容生成；既有 cross-drive guard 不受影响 |
 | watch 模块索引路径 | `ue_watch.start` 的 `csearch_index` 入参随 ctx.paths 自动指向平台目录，无需额外改 |
-| watcher 大批量 add 溢出命令行 | D7：dirty adds 经 `-files-from` 临时文件（非 argv）喂 `cindex-uefilter`，任意数量单参数，杜绝 ENAMETOOLONG；spec 静态守护「不复活 argv 拼接」 |
+| csearch.idx 并发写损坏（watcher×UEPrepare 抢 `<idx>~`） | D9 β：watcher 退回记账员不写索引；Policy A：构建串行拒绝并发；韧性：增量前校验 idx 可用。spec 静态+行为守护「不复活 csearch 写者」 |
+| 删除自动增量后新文件到下次 prepare 才识别 | 用户已确认可接受；persistent_dirty + rg-on-dirty overlay 使其非静默丢失 |
 | fsmonitor/TortoiseGit 后台改 index 触发假 stale | D8：freshness git anchor 取 `HEAD`+`logs/HEAD`（commit-state）而非 index；新增文件仍由 dirty overlay + dir_mtime 兜底 |
 
 ## 5. 测试
@@ -169,9 +203,11 @@ fast-forward）。未提交的新增文件仍由 `ue_watch` dirty overlay + `dir
   platform_key 生成、迁移 move+幂等+不覆盖+空 key、engine_root 往返。
 - `tests/cases/utils_spec.lua`（扩充）：`_reset_probe_cache` 存在/幂等、`is_indexed` 无索引安静返回 false、
   rg stream 的 `on_done` 排序与 stop 后不回调。
-- `tests/cases/ue_watch_csearch_spec.lua`（7 例，D7）：provider 经 `build_index{mode="add"}` +
-  `-files-from` 临时文件路由；静态守护「不复活 `local cindex="cindex"` / per-path argv 拼接」；
-  空 paths no-op、缺索引配置 / 缺 `cindex-uefilter` 时显式失败不静默吞。
+- `tests/cases/ue_watch_csearch_spec.lua`（D9，5 例）：watcher csearch provider 是
+  record-only no-op——静态守护「不调用 `code_search.build_index()` / 不写 `.incremental.txt` /
+  不裸 cindex」+ 行为守护「有/无 dirty 路径都不触发 build_index」。
+- `tests/cases/csearch_build_guard_spec.lua`（D9，6 例）：构建串行（begin 占用 / 第二次拒绝 /
+  done 后可再 begin / 失败也清标志）+ 增量遇 0 字节·缺失 idx 被拒不 spawn + `_usable_index_for_test`。
 - 回归范围：跨子系统（ue.lua + code_search + ue_watch + snacks）→ 提交前全量
   `nvim --headless -l tests/run.lua`。
 
@@ -180,3 +216,7 @@ fast-forward）。未提交的新增文件仍由 `ue_watch` dirty overlay + `dir
 - `M._reset_probe_cache`（code_search）
 - `M.cache_paths` / `M.platform_key_from_state` / `M.migrate_legacy_csearch_if_needed`（ue，测试 seam）
 - `M._provider_csearch_add_for_test` / `M._set_opts_for_test`（ue_watch，测试 seam — 非运行时 API）
+- `M._usable_index_for_test`（code_search，D9 测试 seam）
+- `M._csearch_build_begin_for_test` / `M._csearch_build_done_for_test` /
+  `M._csearch_build_running_for_test`（ue，D9 Policy A 测试 seam — 非运行时 API）
+- 运行时：`CORE_RT.csearch_build_begin` / `CORE_RT.csearch_build_done`（D9 构建串行守卫）

@@ -10,6 +10,11 @@ local CORE_RT = {
   build_term_win = nil,
   build_term_jobid = nil,
   prepare_jobid = nil,
+  -- csearch build serialization (D9 Policy A): only one csearch build may run
+  -- at a time. Every csearch build entry checks this flag and refuses (does NOT
+  -- queue) if it is set; the build's completion callback clears it
+  -- unconditionally (success AND failure) so a failed build can't wedge it.
+  csearch_build_running = false,
   status_cache = {}, -- { key = string, value = string, tick = number }
   dirty_index_roots = {},
   engine_root_cache = {}, -- dir -> engine_root (or false)
@@ -3681,6 +3686,61 @@ local function set_prepare_running(value)
   M._prepare_running = value
   invalidate_status_cache()
   refresh_statusline()
+end
+
+-- csearch build serialization (D9 Policy A). Returns true when the caller is
+-- cleared to start a csearch build (and marks the slot busy); returns false +
+-- emits a visible notice when a build is already running. The build's
+-- completion callback MUST call CORE_RT.csearch_build_done() unconditionally
+-- (success AND failure) so a failed build can't wedge the slot. Rejection —
+-- never queueing: a concurrent full :UEPrepare already reindexes the whole file
+-- list (including any incremental's dirty files), so queuing would be redundant
+-- work that then races the next build.
+--
+-- Defined on CORE_RT (not a main-chunk local) to stay under LuaJIT's 200-local
+-- cap on the main function (see CONSTRAINTS luajit-200-local-cap).
+function CORE_RT.csearch_build_begin(label)
+  if CORE_RT.csearch_build_running then
+    vim.schedule(function()
+      vim.notify(
+        ("[ue] csearch build already in progress — %s skipped"):format(label or "build"),
+        vim.log.levels.WARN, { title = "UE", replace = "ue.csearch.build" })
+    end)
+    return false
+  end
+  CORE_RT.csearch_build_running = true
+  return true
+end
+
+function CORE_RT.csearch_build_done()
+  CORE_RT.csearch_build_running = false
+end
+
+-- Clear the watcher's persistent dirty set after a SUCCESSFUL full csearch
+-- build (D9 / D-3b). Soft-requires ue_watch so this is safe to call from any
+-- prepare path. Since β made the watcher a bookkeeper (not a writer), clearing
+-- the dirty set on build success is now the prepare family's sole job — and it
+-- MUST happen on EVERY full-build success path (cache fast-path / cold full /
+-- sync), not just one. A residual dirty set otherwise (1) makes
+-- prepare_freshness' dirty gate return "stale" right after a successful prepare,
+-- and (2) makes the rg-on-dirty overlay re-grep a huge stale set on every
+-- <leader>/ / <space><space> (picker lag). Only call on SUCCESS — a failed
+-- build leaves the dirty set so the overlay keeps those files visible.
+function CORE_RT.clear_persistent_dirty_safe(reason)
+  local ok_watch, watch = pcall(require, "utils.ue_watch")
+  if ok_watch and type(watch.clear_persistent_dirty) == "function" then
+    watch.clear_persistent_dirty(reason or "prepare")
+  end
+end
+
+-- Test seams for the serialization guard (D9 Policy A).
+function M._csearch_build_begin_for_test(label) return CORE_RT.csearch_build_begin(label) end
+function M._csearch_build_done_for_test() return CORE_RT.csearch_build_done() end
+function M._csearch_build_running_for_test() return CORE_RT.csearch_build_running end
+
+-- Public alias for the D-3b dirty-clear helper (also used by tests).
+function M.clear_persistent_dirty_safe(reason)
+  return CORE_RT.clear_persistent_dirty_safe(reason)
 end
 
 local function scan_relative_files(root, search_paths)
@@ -8320,16 +8380,24 @@ local function prepare()
           end
         end
         fout:close()
-        local cs_done, cs_ok, cs_err = false, false, nil
-        code_search_p.build_index(cs_ctx_p, abs_list, function(ok_cs, err_cs, _st)
-          cs_ok, cs_err = ok_cs, err_cs
-          cs_done = true
-        end)
-        vim.wait(180000, function() return cs_done end, 100)
-        pcall(os.remove, abs_list)
-        if not cs_ok then
-          vim.notify("UEPrepare: csearch index failed: " .. (cs_err or "timeout"),
-            vim.log.levels.WARN, { title = "UE" })
+        if not CORE_RT.csearch_build_begin("UEPrepare (sync)") then
+          pcall(os.remove, abs_list)
+        else
+          local cs_done, cs_ok, cs_err = false, false, nil
+          code_search_p.build_index(cs_ctx_p, abs_list, function(ok_cs, err_cs, _st)
+            cs_ok, cs_err = ok_cs, err_cs
+            cs_done = true
+          end)
+          vim.wait(180000, function() return cs_done end, 100)
+          CORE_RT.csearch_build_done()
+          pcall(os.remove, abs_list)
+          if not cs_ok then
+            vim.notify("UEPrepare: csearch index failed: " .. (cs_err or "timeout"),
+              vim.log.levels.WARN, { title = "UE" })
+          else
+            -- Full build succeeded (D-3b): dirty set is logically empty.
+            CORE_RT.clear_persistent_dirty_safe("prepare:sync")
+          end
         end
       end
     else
@@ -8549,20 +8617,27 @@ local function prepare_async(opts)
               end
             end
             fout:close()
-            vim.notify(("UEPrepare: rebuilding csearch index in background (reason: %s)..."):format(stale_reason),
-              vim.log.levels.INFO, { title = "UE", timeout = 3000, replace = "ue.csearch.build" })
-            code_search_fp.build_index(cs_ctx_fp, abs_list, function(ok_cs, err_cs, stats)
+            if not CORE_RT.csearch_build_begin("UEPrepare (cache fast-path)") then
               pcall(os.remove, abs_list)
-              if ok_cs then
-                local mb = math.floor((stats.index_size or 0) / 1024 / 1024)
-                vim.notify(("✓ csearch index rebuilt: %d MB in %.1fs"):format(
-                  mb, (stats.ms or 0) / 1000),
-                  vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
-              else
-                vim.notify("UEPrepare: csearch rebuild failed: " .. (err_cs or "unknown"),
-                  vim.log.levels.WARN, { title = "UE", replace = "ue.csearch.build" })
-              end
-            end)
+            else
+              vim.notify(("UEPrepare: rebuilding csearch index in background (reason: %s)..."):format(stale_reason),
+                vim.log.levels.INFO, { title = "UE", timeout = 3000, replace = "ue.csearch.build" })
+              code_search_fp.build_index(cs_ctx_fp, abs_list, function(ok_cs, err_cs, stats)
+                CORE_RT.csearch_build_done()
+                pcall(os.remove, abs_list)
+                if ok_cs then
+                  local mb = math.floor((stats.index_size or 0) / 1024 / 1024)
+                  vim.notify(("✓ csearch index rebuilt: %d MB in %.1fs"):format(
+                    mb, (stats.ms or 0) / 1000),
+                    vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
+                  -- Full build succeeded (D-3b): dirty set is logically empty.
+                  CORE_RT.clear_persistent_dirty_safe("prepare:fast-path")
+                else
+                  vim.notify("UEPrepare: csearch rebuild failed: " .. (err_cs or "unknown"),
+                    vim.log.levels.WARN, { title = "UE", replace = "ue.csearch.build" })
+                end
+              end)
+            end
           end
         end
 
@@ -8818,13 +8893,10 @@ local function prepare_async(opts)
                 dirty_json_path = ctx.paths and ctx.paths.dirty_json or nil,
                 debounce_ms = 1500,
               })
-              -- :UEPrepare just rebuilt the indices; the cumulative dirty set
-              -- is now logically empty (csearch was reset, gtags rebuilt).
-              -- Clear it so the rg-on-dirty overlay doesn't keep re-greping
-              -- thousands of stale entries forever.
-              if type(watch.clear_persistent_dirty) == "function" then
-                watch.clear_persistent_dirty("prepare")
-              end
+              -- NOTE: dirty set is cleared in the csearch build SUCCESS callback
+              -- below (D-3b), NOT here. Clearing here would wipe it before the
+              -- cold full build has actually succeeded — if the build then fails,
+              -- the overlay would have lost the very files it must keep visible.
             end
           end
 
@@ -8862,7 +8934,13 @@ local function prepare_async(opts)
             fout:close()
           end)
 
+          if not CORE_RT.csearch_build_begin("UEPrepare (cold full build)") then
+            pcall(os.remove, abs_list)
+            finalize_after_csearch()
+            return
+          end
           code_search.build_index(cs_ctx, abs_list, function(ok_cs, err_cs, stats)
+            CORE_RT.csearch_build_done()
             -- Tidy up the temp filelist regardless of outcome.
             pcall(os.remove, abs_list)
 
@@ -8871,6 +8949,8 @@ local function prepare_async(opts)
               vim.notify(("✓ csearch index: %d MB in %.1fs"):format(
                 mb, (stats.ms or 0) / 1000),
                 vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
+              -- Full build succeeded (D-3b): dirty set is logically empty.
+              CORE_RT.clear_persistent_dirty_safe("prepare:cold-full")
             else
               vim.notify("UEPrepare: csearch index failed: " .. (err_cs or "unknown"),
                 vim.log.levels.WARN, { title = "UE" })
@@ -9397,10 +9477,15 @@ function M.setup()
     end
     for _, p in ipairs(dirty) do fout:write(p, "\n") end
     fout:close()
+    if not CORE_RT.csearch_build_begin("UEPrepareIncremental") then
+      pcall(os.remove, abs_list)
+      return
+    end
     vim.notify(("UEPrepareIncremental: adding %d dirty files to csearch index ..."):format(#dirty),
       vim.log.levels.INFO, { title = "UE", timeout = 3000, replace = "ue.csearch.build" })
     local cs_ctx = { workspace_root = workspace_root(ctx), csearch_idx = ctx.paths.csearch_idx }
     code_search.build_index(cs_ctx, abs_list, function(ok_cs, err_cs, stats)
+      CORE_RT.csearch_build_done()
       pcall(os.remove, abs_list)
       if ok_cs then
         if type(watch.clear_persistent_dirty) == "function" then

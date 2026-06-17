@@ -53,6 +53,34 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-06-17 — csearch.idx 单写者：消除并发写损坏（corrupt index 死循环）
+
+**Task** — `:UEPrepare` 卡在 ~85% 且刷屏 `cindex-uefilter exit=1 ... corrupt index: remove`。OpenSpec change `fix-csearch-index-single-writer`（proposal+design 已先行 validate）。
+
+**Root cause** — cindex 原子写协议把 staged 文件硬编码为 `<idx>~`（非每进程独立临时文件）。2026-06-16 D7 把 `ue_watch` 改成 csearch.idx 的第二个写者，其 debounce 增量与用户 `:UEPrepare` 全量并发抢同一个 `idx~`，在 merge/rename 窗口互毁 → `corrupt index: remove` → 0 字节 idx 再被下一次 `mode="add"` 撞上 → 死循环。
+
+**Implemented（三层，D9）**
+- `lua/utils/ue_watch.lua`：`provider_csearch_add` 退回 **record-only no-op**——删除 `build_index` 调用 / `-files-from` 临时列表；csearch 写者收敛为 prepare 家族。新文件靠 `persistent_dirty` + rg-on-dirty overlay 到下次手动 prepare（用户已确认可接受）。更新模块 header + provider doc 声明 D9 单写者契约。
+- `lua/ue.lua`：新增 `CORE_RT.csearch_build_running` + `CORE_RT.csearch_build_begin/done`（Policy A 串行守卫，挂 CORE_RT 避开 LuaJIT 200-local 上限）。三处构建入口（sync / cache fast-path / cold full）+ `:UEPrepareIncremental` 全部接入：占用中拒绝并可见提示（不排队），完成回调无条件清标志。
+- `lua/utils/code_search/init.lua`：`build_index` 在 `mode="add"` spawn 前校验 `usable_index_stat(idx)`，不可用则 `cb(false, "...run :UEPrepare")` 不 spawn；`mode="reset"` 不受限。新增 `M._usable_index_for_test`。
+- `tests/cases/ue_watch_csearch_spec.lua`：改写为 D9 契约——静态+行为守护「watcher 不写 csearch 索引」（防回归：重新接回写者即测红）。
+- `tests/cases/csearch_build_guard_spec.lua`（新，8 例）：构建串行（begin/拒绝/done/失败也清）+ 增量遇 0 字节·缺失 idx 被拒不 spawn + `_usable_index_for_test` + 全量成功清 dirty（D-3b）。
+- **D-3b（dirty 清理层，apply 中发现的 D9 缺口）**：`lua/ue.lua` 新增 `CORE_RT.clear_persistent_dirty_safe`（soft-require ue_watch）；三条全量成功路径（sync / cache fast-path / cold full）成功分支统一调用，**失败不清**。修复「UEPrepare 完仍弹 stale + `<space><space>` 变卡」——β 把 watcher 退出写者后，清 dirty 的责任转移给 prepare，但初版只有 cold-full 清，fast-path/sync 漏清 → dirty.json 残留（实测 110 KB）→ `prepare_freshness` 第一道闸恒判 stale + overlay 背巨大脏集合变卡。
+- 文档：`grep-cache-invalidation.md`（D7 退役存档 + D9 含 D-3b 清理层 + §3/§4/§5/§6 同步）、`CONSTRAINTS.md`（K31g 含 D-3b 二次症状、K29 标注被取代）。spec 新增「全量成功后 dirty 归零」Requirement。
+
+**Pitfalls / Gotchas**
+- 把 `csearch_build_begin/done` 作 main-chunk `local function` 会顶破 LuaJIT 200-local 上限（`main function has more than 200 local variables`）→ 改挂 `CORE_RT.*`。
+- `ue_watch_csearch_spec` 的静态护栏须用 `code_search%.build_index%s*%(`（带括号）匹配「调用」，否则 provider doc-comment 里「不得 re-add build_index」的文字会误判为违规。
+
+**Why not workaround** — 这是修我们自己的设计缺陷（D7 把 watcher 变第二写者），按 C2 落主逻辑配普通注释 + spec `SHALL` + 防回归测，不进 `lua/workarounds/`。被否决方案（α 锁 / γ 双索引 / Policy B 排队）见 change design.md。
+
+**Validation**
+- `nvim --headless -l tests/run.lua ue_watch_csearch` → 5/5；`csearch_build_guard` → 6/6。
+- 全量见下（提交前跑）。
+
+**Follow-ups**
+- 无。单写者已写成 `ue-code-search` spec 的 `SHALL` + 行为测护栏。
+
 ### 2026-06-16 — tests: activate dormant DAP seams + F9 persistence round-trip (K-pitfall → behavioral)
 
 **Task** — Deepen debugger test coverage for long-term stability. Strategy (from explore session): migrate hard-won DAP knowledge from source-text grep assertions toward pure-function behavioral tests, prioritizing already-extracted-but-unexercised `_for_test` seams, and annotate each debugger case with the K-pitfall it guards.

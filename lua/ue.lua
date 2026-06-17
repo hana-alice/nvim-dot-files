@@ -3371,121 +3371,33 @@ end
 
 local prepare_freshness  -- forward-decl alias kept for in-module callers
 do
-  -- Resolve <repo>/.git into the actual gitdir, then return the newest mtime
-  -- among that gitdir's COMMIT-STATE files (HEAD + logs/HEAD), NOT its index.
+  -- ── csearch freshness via content fingerprint (D10 / L2) ──────────────────
   --
-  -- Why not index? `index` (the staging area) is touched by operations that do
-  -- NOT change the working-tree file SET our cached list enumerates:
-  --   * git's fsmonitor--daemon periodically re-stats the worktree and rewrites
-  --     index to refresh its cache-stat fields;
-  --   * TortoiseGit / IDE git integrations call `git add`/refresh in the
-  --     background;
-  --   * a build that stages generated artifacts bumps index.
-  -- On a UE worktree (huge tree + always-on fsmonitor + TortoiseGit) index gets
-  -- re-touched minutes after :UEPrepare even though no file was added/removed,
-  -- so the list looks "stale" and every <space><space> warns falsely.
+  -- freshness answers ONE question: "did the indexed file SET change
+  -- (add/remove/rename)?". The indexed set IS workspace_all.files (a sorted,
+  -- deterministic list — table.sort'ed at both write sites). Its content hash is
+  -- a DIRECT measurement of that question.
   --
-  -- HEAD + logs/HEAD instead move precisely on the operations that DO change the
-  -- working-tree file set: checkout, pull/merge/rebase, commit, reset. (Branch
-  -- switches rewrite HEAD; every ref movement appends to logs/HEAD.) That is the
-  -- real "did the on-disk file population change?" signal we want to anchor on.
-  -- Uncommitted/unstaged new files are still caught by ue_watch's dirty overlay
-  -- and the directory-mtime anchors in prepare_freshness — index was redundant
-  -- with those for the add/remove case and harmful for the refresh case.
+  -- We deliberately do NOT use any mtime proxy (git index, git commit-state,
+  -- dir mtime). Every proxy has a noise source that produced phantom "stale":
+  --   * .git/index  → fsmonitor / TortoiseGit background touch   (K30g)
+  --   * dir mtime   → compiler artifacts landing in the engine tree
+  --   * git HEAD    → only reflects committed state; misses uncommitted adds
+  -- Swapping one proxy for a quieter one (D8 did: index→commit-state) is endless
+  -- whack-a-mole. The fix is to stop proxying and measure the object itself.
   --
-  -- Handles four shapes of <repo>/.git:
-  --   1. directory (regular repo) → <repo>/.git/{HEAD,logs/HEAD}
-  --   2. file "gitdir: <path>" (worktree / submodule) → resolve <path>/{...}.
-  --      For a linked worktree <path> is .../worktrees/<name>, whose HEAD and
-  --      logs/HEAD are per-worktree (so a branch switch in THIS worktree shows,
-  --      and unrelated worktrees of the same repo don't bleed in).
-  --   3. .git missing entirely → 0 (caller falls back to other anchors).
-  --   4. .git points to a non-existent path → 0.
-  -- Returns mtime in epoch seconds, or 0 on any failure.
-  local function git_commit_state_mtime(repo_root)
-    if not repo_root or repo_root == "" then return 0 end
-    local dot_git = repo_root .. "/.git"
-    local st = vim.loop.fs_stat(dot_git)
-    if not st then return 0 end
-
-    local gitdir
-    if st.type == "directory" then
-      gitdir = dot_git
-    else
-      -- file: parse "gitdir: <path>" (worktree pointer)
-      local f = io.open(dot_git, "r")
-      if not f then return 0 end
-      local line = f:read("*l")
-      f:close()
-      if not line then return 0 end
-      local g = line:match("^gitdir:%s*(.-)%s*$")
-      if not g or g == "" then return 0 end
-      -- Resolve relative gitdir against repo_root
-      if not g:match("^[A-Za-z]:") and not g:match("^/") then
-        g = repo_root .. "/" .. g
-      end
-      gitdir = g
-    end
-    gitdir = gitdir:gsub("\\", "/")
-
-    -- Newest mtime across the commit-state anchors. We deliberately do NOT read
-    -- index here (see header). HEAD moves on branch switch; logs/HEAD appends on
-    -- every ref update (commit / pull / reset / checkout), so it captures merges
-    -- and fast-forwards that leave HEAD's symref text unchanged.
-    local newest = 0
-    for _, rel in ipairs({ "/HEAD", "/logs/HEAD" }) do
-      local s = vim.loop.fs_stat(gitdir .. rel)
-      local mt = s and s.mtime and s.mtime.sec or 0
-      if mt > newest then newest = mt end
-    end
-    return newest
-  end
-
-  -- mtime of a directory tree's TOP-LEVEL marker (cheap stat on the dir itself,
-  -- NOT recursive walk). Used as an external anchor of last resort when neither
-  -- engine nor project has a usable .git. Captures "did the project_root dir
-  -- entry itself change since list was built". Not perfect (subdir adds may not
-  -- bump parent mtime on all filesystems) but a real external signal — beats
-  -- comparing the list to itself.
-  local function dir_mtime(p)
-    if not p or p == "" then return 0 end
-    local s = vim.loop.fs_stat(p)
-    return (s and s.mtime and s.mtime.sec) or 0
-  end
-
-  -- Classify how trustworthy ctx.paths.workspace_all_list is right now.
-  -- Returns one of:
-  --   "fresh"        — list newer than every external anchor we could find
-  --   "stale"        — list older than at least one external anchor, OR
-  --                    ue_watch has accumulated unflushed dirty files since the
-  --                    last :UEPrepare clear (watcher-observed drift)
-  --   "in_progress"  — :UEPrepare is currently rebuilding
-  --   "never"        — no list file exists at all
+  -- Content-level edits to EXISTING files are out of scope here — clangd handles
+  -- those live (LSP didChange). csearch is a file-level trigram index; a file
+  -- that still exists with changed content keeps working trigrams, so only set
+  -- changes require a rebuild. (User-defined boundary.)
   --
-  -- Anchors (we take max across all available, then compare to list mtime):
-  --   1. <engine_root> git commit-state (HEAD + logs/HEAD, worktree-aware)
-  --   2. <project_root> git commit-state (HEAD + logs/HEAD, worktree-aware)
-  --   3. <engine_root> dir mtime  (filesystem fallback)
-  --   4. <project_root> dir mtime (filesystem fallback)
-  -- (We deliberately anchor on commit-state, NOT .git/index — index is touched
-  --  by fsmonitor / TortoiseGit / background `git add` without the working-tree
-  --  file SET changing, which produced phantom "stale" warnings after every
-  --  build on UE worktrees. See git_commit_state_mtime's header. state.updated_at
-  --  was tried as anchor #5 but had to be removed — see the long comment next to
-  --  the `anchors` table below.)
-  --
-  -- We deliberately do NOT compare list mtime against itself or against
-  -- workspace_all_list's siblings — that's the self-validating loop the old
-  -- code hit, where fast-path's "is index stale?" check compared csearch.idx
-  -- against the very list cindex consumed, so a stale build forever validated
-  -- its own staleness. The anchor set above is all EXTERNAL to our cache dir.
-  --
-  -- Watcher overlay: ue_watch persists an LRU dirty set across sessions. Any
-  -- non-empty dirty set means we have observed file changes that haven't been
-  -- folded into the list yet, regardless of mtime arithmetic. This catches the
-  -- common case where the user edits/adds files INSIDE an open nvim session
-  -- (no .git/index bump on uncommitted creates if file is gitignored or
-  -- pre-stage) but ue_watch saw the fs_event.
+  -- Two non-proxy signals remain alongside the fingerprint:
+  --   * existence (no list → "never")
+  --   * ue_watch persistent_dirty (event-driven, zero-noise; covers in-session
+  --     set changes before the list is re-enumerated).
+  -- Cross-session set changes (e.g. git pull while nvim was closed) are caught
+  -- by the fingerprint: the next UEPrepare re-enumerates the list, its bytes
+  -- differ, hash mismatches.
   function CORE_RT.prepare_freshness(ctx)
     if not ctx or not ctx.paths then return "never" end
     if CORE_RT.prepare_jobid then
@@ -3495,13 +3407,13 @@ do
       end
     end
     local list_path = ctx.paths.workspace_all_list
-    local list_stat = list_path and vim.loop.fs_stat(list_path) or nil
-    if not list_stat then
+    if not list_path or not vim.loop.fs_stat(list_path) then
       return "never"
     end
-    local list_mt = list_stat.mtime and list_stat.mtime.sec or 0
 
     -- Watcher overlay: dirty files observed since last :UEPrepare clear
+    -- (in-session set changes not yet folded into the list). Event-driven,
+    -- not a proxy.
     local ok_watch, watch = pcall(require, "utils.ue_watch")
     if ok_watch and type(watch.persistent_dirty_status) == "function" then
       local st = watch.persistent_dirty_status() or {}
@@ -3510,35 +3422,26 @@ do
       end
     end
 
-    -- Anchor max. We deliberately do NOT include state.updated_at here.
-    -- Although it looks like a useful "when did we last prepare" signal,
-    -- it's written by :UEPrepare's finalize step AFTER list_dump completes
-    -- (list_dump → cindex csearch ~120s → finalize writes state.json).
-    -- So state.updated_at is ALWAYS list_mt + minutes, which means any
-    -- comparison `list_mt < anchor_max(state.updated_at)` reports stale
-    -- the instant :UEPrepare finishes — every subsequent grep / picker
-    -- entry triggers a phantom "[grep] :UEPrepare is stale" WARN even
-    -- though nothing actually changed. The scenario state.updated_at was
-    -- originally added to catch (project reconfiguration via :UESetProject)
-    -- is now covered by invalidate_project_scoped_cache deleting the list
-    -- file outright → list_stat == nil → "never" branch above. The other
-    -- real-change scenarios (git ops, fs changes, watcher dirty) are still
-    -- caught by the four remaining anchors.
-    local anchors = {
-      git_commit_state_mtime(ctx.engine_root),
-      git_commit_state_mtime(ctx.project_root),
-      dir_mtime(ctx.engine_root),
-      dir_mtime(ctx.project_root),
-    }
-    local anchor_max = 0
-    for _, a in ipairs(anchors) do
-      if a and a > anchor_max then anchor_max = a end
+    -- Content fingerprint: the steady-state verdict. Compare the list's content
+    -- hash against the hash recorded when the index was last built. Equal =
+    -- fresh. (NOTE: list_fingerprint caches on the list's own (mtime,size) so
+    -- this is a stat in steady state — the mtime is a cache key, never a
+    -- verdict; the verdict is the content hash.)
+    local recorded
+    local ok_state, state = pcall(read_state, ctx.engine_root)
+    if ok_state and type(state) == "table" then
+      recorded = state.csearch_input_hash
     end
-    if anchor_max == 0 then
-      -- No external signal at all is itself suspicious; lean conservative.
+    if type(recorded) ~= "string" or recorded == "" then
+      -- No fingerprint on record (fresh upgrade / never built): lean stale so
+      -- the user runs :UEPrepare; the first successful full build records it.
       return "stale"
     end
-    if list_mt >= anchor_max then
+    local cur = CORE_RT.list_fingerprint(list_path)
+    if not cur then
+      return "stale"  -- could not hash the list → conservative
+    end
+    if cur == recorded then
       return "fresh"
     end
     return "stale"
@@ -3733,6 +3636,25 @@ function CORE_RT.clear_persistent_dirty_safe(reason)
   end
 end
 
+-- Called once on EVERY full csearch build SUCCESS path (sync / cache fast-path /
+-- cold full). Bundles the two post-success obligations so the three call sites
+-- can't drift:
+--   D-3b: clear the watcher dirty set (it's logically empty — full build indexed
+--         everything).
+--   D10:  record the content fingerprint of the list we just indexed, so
+--         prepare_freshness can compare future list bytes against it.
+-- MUST only be called on SUCCESS. On failure neither obligation applies (dirty
+-- files must stay visible; the fingerprint must not move ahead of a built index).
+function CORE_RT.on_full_csearch_success(ctx, reason)
+  CORE_RT.clear_persistent_dirty_safe(reason)
+  local list_path = ctx and ctx.paths and ctx.paths.workspace_all_list
+  if not list_path or not ctx.engine_root then return end
+  local hash = CORE_RT.list_fingerprint(list_path)
+  if hash then
+    pcall(update_state_field, ctx.engine_root, "csearch_input_hash", hash)
+  end
+end
+
 -- Test seams for the serialization guard (D9 Policy A).
 function M._csearch_build_begin_for_test(label) return CORE_RT.csearch_build_begin(label) end
 function M._csearch_build_done_for_test() return CORE_RT.csearch_build_done() end
@@ -3742,6 +3664,47 @@ function M._csearch_build_running_for_test() return CORE_RT.csearch_build_runnin
 function M.clear_persistent_dirty_safe(reason)
   return CORE_RT.clear_persistent_dirty_safe(reason)
 end
+
+-- ── csearch freshness content fingerprint (D10 / L2) ────────────────────────
+-- Content hash of workspace_all.files = a DIRECT measurement of "did the
+-- indexed file SET change (add/remove/rename)?". This replaces all mtime-proxy
+-- anchors (git index, git commit-state D8, dir_mtime), which were polluted by
+-- fsmonitor / TortoiseGit / compiler artifacts touching unrelated paths and
+-- produced phantom "stale". The list is table.sort'ed at both write sites so its
+-- bytes are deterministic for a given file set.
+--
+-- Cost: sha256 over the (~22 MB) list is ~46ms. We cache the hash keyed on the
+-- list's OWN (mtime,size); steady-state freshness checks only stat (microseconds)
+-- and reuse the cached hash. NOTE: this mtime is a cache-invalidation key for
+-- "should we recompute the hash", NOT a freshness verdict — the verdict is
+-- always the content hash comparison. That distinction is the whole point: a
+-- proxy treats mtime AS truth; here truth is the bytes, mtime only hints when to
+-- re-read them.
+CORE_RT.list_fingerprint_cache = {}  -- path -> { mt, size, hash }
+function CORE_RT.list_fingerprint(path)
+  if not path or path == "" then return nil end
+  local st = vim.loop.fs_stat(path)
+  if not st then return nil end
+  local mt = (st.mtime and st.mtime.sec) or 0
+  local size = st.size or 0
+  local cached = CORE_RT.list_fingerprint_cache[path]
+  if cached and cached.mt == mt and cached.size == size then
+    return cached.hash
+  end
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local data = f:read("*a")
+  f:close()
+  if not data then return nil end
+  local ok_h, hash = pcall(vim.fn.sha256, data)
+  if not ok_h or type(hash) ~= "string" then return nil end
+  CORE_RT.list_fingerprint_cache[path] = { mt = mt, size = size, hash = hash }
+  return hash
+end
+
+-- Test seam for the fingerprint helper (D10).
+function M._list_fingerprint_for_test(path) return CORE_RT.list_fingerprint(path) end
+function M._reset_fingerprint_cache_for_test() CORE_RT.list_fingerprint_cache = {} end
 
 local function scan_relative_files(root, search_paths)
   local fd = _uproc.first_executable({ "fd", "fdfind" })
@@ -8395,8 +8358,8 @@ local function prepare()
             vim.notify("UEPrepare: csearch index failed: " .. (cs_err or "timeout"),
               vim.log.levels.WARN, { title = "UE" })
           else
-            -- Full build succeeded (D-3b): dirty set is logically empty.
-            CORE_RT.clear_persistent_dirty_safe("prepare:sync")
+            -- Full build succeeded (D-3b + D10): clear dirty + record fingerprint.
+            CORE_RT.on_full_csearch_success(ctx, "prepare:sync")
           end
         end
       end
@@ -8630,8 +8593,8 @@ local function prepare_async(opts)
                   vim.notify(("✓ csearch index rebuilt: %d MB in %.1fs"):format(
                     mb, (stats.ms or 0) / 1000),
                     vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
-                  -- Full build succeeded (D-3b): dirty set is logically empty.
-                  CORE_RT.clear_persistent_dirty_safe("prepare:fast-path")
+                  -- Full build succeeded (D-3b + D10): clear dirty + fingerprint.
+                  CORE_RT.on_full_csearch_success(ctx, "prepare:fast-path")
                 else
                   vim.notify("UEPrepare: csearch rebuild failed: " .. (err_cs or "unknown"),
                     vim.log.levels.WARN, { title = "UE", replace = "ue.csearch.build" })
@@ -8949,8 +8912,8 @@ local function prepare_async(opts)
               vim.notify(("✓ csearch index: %d MB in %.1fs"):format(
                 mb, (stats.ms or 0) / 1000),
                 vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
-              -- Full build succeeded (D-3b): dirty set is logically empty.
-              CORE_RT.clear_persistent_dirty_safe("prepare:cold-full")
+              -- Full build succeeded (D-3b + D10): clear dirty + fingerprint.
+              CORE_RT.on_full_csearch_success(ctx, "prepare:cold-full")
             else
               vim.notify("UEPrepare: csearch index failed: " .. (err_cs or "unknown"),
                 vim.log.levels.WARN, { title = "UE" })

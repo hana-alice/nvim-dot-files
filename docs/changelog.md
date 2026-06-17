@@ -53,6 +53,33 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-06-17 — csearch freshness 改用内容指纹，退役所有 mtime 代理 anchor（D10 / L2）
+
+**Task** — `:UEPrepare` 完成后（尤其重新编译后）`<space><space>` 仍反复弹 stale。OpenSpec change `csearch-freshness-content-fingerprint`（proposal+design 先行 validate）。
+
+**Root cause** — `prepare_freshness` 一直用 **mtime 侧信道代理**猜「被索引文件集合是否变」，每个代理有自己的噪声：`.git/index` 被 fsmonitor/TortoiseGit 后台 touch（K30g）；`dir_mtime` 被**编译产物**落进引擎树 touch（重编即假 stale）。D8 把 git anchor 换成 commit-state 只是换噪声更小的代理，随后被 dir_mtime 击穿——换代理是无尽打地鼠。
+
+**Implemented（D10）**
+- `lua/ue.lua`：重写 `CORE_RT.prepare_freshness`——稳态判定改为 `list_fingerprint(workspace_all.files) == state.csearch_input_hash`，相等 fresh 否则 stale；保留 ① in_progress / ② never / ③ watcher dirty>0→stale。**删除整段 mtime anchor 块**及 `git_commit_state_mtime`/`git_index_mtime`/`dir_mtime` 三个辅助函数（167 行）。
+- `lua/ue.lua`：新增 `CORE_RT.list_fingerprint(path)`——`vim.fn.sha256(内容)`，用文件自身 (mtime,size) 作 hash 缓存键（稳态只 stat，实测全量 46ms 仅 miss 付一次）。mtime 仅作缓存失效，判定永远是内容 hash。
+- `lua/ue.lua`：新增 `CORE_RT.on_full_csearch_success(ctx, reason)`，把 D-3b 清 dirty + D10 记 `state.csearch_input_hash` 绑成一个钩子；三条全量成功路径（sync/fast-path/cold-full）统一调用，失败不调（指纹不前移于已建成索引）。
+- 测试 seam：`M._list_fingerprint_for_test` / `M._reset_fingerprint_cache_for_test`。
+- `tests/cases/freshness_fingerprint_spec.lua`（新，7 例）：指纹同/异/缺失/缓存 + 防回归（freshness 源不再引用任何 mtime anchor + 记录钩子存在）。
+- 文档：`grep-cache-invalidation.md`（D8 退役存档 + 新增 D10 + §2/§4/§5/§6 同步）、`CONSTRAINTS.md`（K30g 收敛为「mtime 代理已退役→内容指纹」）。
+
+**Pitfalls / Gotchas**
+- 删 anchor 块时旧 `do...end` 内还残留 167 行孤儿代码（旧 git_commit_state_mtime/dir_mtime 注释体）；`loadfile` 仍 OK 是因为它们在块内但不可达——必须连同辅助函数整段删，否则误导后人。
+- 内容编辑（已有文件改内容）**有意不检测**——clangd 实时感知；csearch 是文件级 trigram，集合不变不重建。这是用户定的边界，写进 spec。
+
+**Why theoretically-perfect not patch** — 不再「换更好的代理」（无尽打地鼠），而是**直接测量被检测对象本身**（清单内容）。所有代理噪声（fsmonitor/编译/git 漏报）一次性消失：它们都不改 list 内容。被否决：换源码子目录 dir_mtime（仍代理）、per-file hash L4（UE 万级不可行）、保留 D8 兜底（冗余噪声源）——见 change design.md。
+
+**Validation**
+- `nvim --headless -l tests/run.lua freshness_fingerprint` → 7/7。
+- 全量见下。
+
+**Follow-ups**
+- 升级首跑（旧 state 无 `csearch_input_hash`）会判一次 stale → 跑一次 `:UEPrepare` 即写入并转稳定。
+
 ### 2026-06-17 — csearch.idx 单写者：消除并发写损坏（corrupt index 死循环）
 
 **Task** — `:UEPrepare` 卡在 ~85% 且刷屏 `cindex-uefilter exit=1 ... corrupt index: remove`。OpenSpec change `fix-csearch-index-single-writer`（proposal+design 已先行 validate）。

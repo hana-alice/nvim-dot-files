@@ -337,18 +337,23 @@
   路径，watcher 不再写索引。
   → `docs/architecture/grep-cache-invalidation.md` D7（存档）/ D9（现状）; K31g
 
-- **K30g — freshness 用 `.git/index` 当 anchor → fsmonitor/TortoiseGit 后台 touch 触发假 stale**
+- **K30g — freshness 用 mtime 代理当 anchor → 后台 touch / 编译产物触发假 stale（已收敛到内容指纹 D10）**
   症状: `:UEPrepare` 完成后 `<space><space>` / `<leader>/` 仍弹
-  `:UEPrepare is stale (worktree changed since last run)`，但无源码改动。根因:
-  `prepare_freshness` 拿 `.git/index` mtime 当 anchor，而 git fsmonitor 守护进程 /
-  TortoiseGit 后台 refresh 会在 prepare 后重新 touch index（工作树文件集合未变），
-  `index_mt > list_mt` → 假 stale。UE 引擎是 UnrealEngine 主仓的 linked worktree
-  （`.git` 是 `gitdir:` 指针，index 在 `<main>/.git/worktrees/<name>/`），加剧该现象。
-  解决: git anchor 改 `git_commit_state_mtime` = `HEAD` + `logs/HEAD`（commit-state，
-  只随 checkout/pull/merge/rebase/reset/commit 移动）；未提交新增文件仍由 `ue_watch`
-  dirty overlay + `dir_mtime` 兜底，弃 index 零覆盖损失。
-  → `docs/architecture/grep-cache-invalidation.md` D8; `lua/ue.lua`
-    `git_commit_state_mtime` / `prepare_freshness`
+  `:UEPrepare is stale (worktree changed since last run)`，但无源码增删。两个噪声源：
+  (1) `.git/index` 被 git fsmonitor / TortoiseGit 后台 refresh touch；
+  (2) `dir_mtime` 被**编译产物**落进引擎树 touch（重编一次即 stale）。根因是结构性的——
+  `prepare_freshness` 用 **mtime 侧信道代理**猜「文件集合是否变」，每个代理都有自己的噪声。
+  中间态: D8（2026-06-16）把 git anchor 从 index 换成 commit-state（`HEAD`+`logs/HEAD`），
+  只是换了个噪声更小的代理，随后被 dir_mtime 噪声再次击穿——换代理是无尽打地鼠。
+  终解 **D10**（2026-06-17）: 停止代理，改对 `workspace_all.files` **内容取 sha256 指纹**
+  （它就是被索引集合的确定性序列化，table.sort 后 bytes 稳定），与全量构建成功时记录的
+  `state.csearch_input_hash` 比对。退役全部 mtime anchor（git index / commit-state / dir_mtime）。
+  会话内集合变化由 watcher dirty 捕获，会话间由指纹捕获；内容编辑归 clangd，不在 csearch
+  freshness 范围。指纹用 list 自身 (mtime,size) 作缓存键，稳态只 stat（mtime 仅作缓存失效，
+  非判定）。
+  → `docs/architecture/grep-cache-invalidation.md` D10（D8 存档）; change
+    `csearch-freshness-content-fingerprint`; `lua/ue.lua` `prepare_freshness` /
+    `list_fingerprint` / `on_full_csearch_success`; `tests/cases/freshness_fingerprint_spec.lua`
 
 - **K31g — csearch.idx 并发写损坏（cindex `<idx>~` 路径硬编码）→ `corrupt index` + 0 字节死循环**
   症状: `:UEPrepare` 卡在 ~85%，同时刷屏

@@ -8,6 +8,8 @@
 > 引入：2026-06-11，修复 `<leader>/` 静默搜不全。
 > 扩充：2026-06-16，D7（watcher 增量入索引经 `-files-from`，修 ENAMETOOLONG）+
 > D8（freshness anchor 改 commit-state，修 fsmonitor 假 stale）。
+> 2026-06-17：D7→D9（csearch 单写者，修 corrupt 死循环）；D8→D10（freshness 改内容指纹，
+> 退役所有 mtime 代理 anchor，修编译产物 touch 假 stale）。
 
 ## 1. 问题背景
 
@@ -157,20 +159,45 @@ cindex `<idx>~` 路径硬编码 = 并发写损坏的根因，记 CONSTRAINTS K31
 `tests/cases/csearch_build_guard_spec.lua`（构建串行拒绝并发 + 增量拒绝损坏 idx + 全量成功清 dirty）。
 
 
-### D8 — freshness anchor：git commit-state（`HEAD`+`logs/HEAD`），非 `.git/index``prepare_freshness` 判定缓存 list 是否过期时，git 维度 anchor 取
-`git_commit_state_mtime(repo)` = `<gitdir>/HEAD` 与 `<gitdir>/logs/HEAD` 的较新 mtime，
-**不取 `.git/index`**。`.git`/`gitdir:` 解析与 worktree 处理不变（UE 引擎是
-UnrealEngine 主仓的 linked worktree，`.git` 是 `gitdir:` 指针，元数据在
-`<main>/.git/worktrees/<name>/`）。
+### D8 — freshness anchor：git commit-state（已被 D10 取代 / 退役，仅存档）
 
-理由：`index`（暂存区）会被 **git fsmonitor 守护进程 / TortoiseGit 后台 refresh /
-构建产物 staging** 频繁 touch，而**工作树文件集合并未变**——在 UE worktree（巨树 +
-常驻 fsmonitor + TortoiseGit）上，UEPrepare 完成几分钟后 index 就被重新 touch，导致
-`index_mt > list_mt` → 假"stale" → 每次 `<space><space>` 误弹 stale 警告。
-`HEAD`+`logs/HEAD` 只在**真正改变文件集合**的操作（checkout / pull / merge / rebase /
-reset / commit）上移动（`logs/HEAD` 每次 ref 变更追加，捕获 HEAD symref 文本不变的
-fast-forward）。未提交的新增文件仍由 `ue_watch` dirty overlay + `dir_mtime` anchor 兜底，
-故弃用 `index` 零覆盖损失。
+> **状态（2026-06-17）：D8 的「mtime 代理 anchor」整体退役，被 D10 内容指纹取代。**
+> 下面保留原始记述作决策链；当前 freshness 以 **D10** 为准——不再用任何 mtime 代理。
+
+D8（2026-06-16）把 git 维度 anchor 从 `.git/index` mtime 换成 `HEAD`+`logs/HEAD`
+（commit-state），缓解了 fsmonitor/TortoiseGit 后台 touch index 引发的假 stale（K30g）。
+**但它只是换了个噪声更小的代理**：随后 `dir_mtime` anchor 又被**编译产物落进引擎树 touch**
+引发假 stale（重编一次即 stale，未增删任何文件）。换代理是无尽的打地鼠——D10 直接停止代理。
+
+### D10 — freshness 用文件清单内容指纹（取代 D8 + 所有 mtime 代理）
+
+freshness 真正要回答的唯一问题：**被索引的文件【集合】变了吗（增/删/改名）**。该集合即
+`workspace_all.files` 的内容（两个写入点都 `table.sort`，bytes 确定性）。其**内容 hash 是对
+该问题的直接测量**，无代理噪声。
+
+```
+prepare_freshness 稳态：
+  ① in_progress / ② list 不存在 = never
+  ③ watcher persistent_dirty>0 → stale   （会话内集合变化，事件驱动，零噪声）
+  ④ hash(workspace_all.files) ≠ state.csearch_input_hash → stale   （确定性）
+  ⑤ 否则 fresh
+  删除：git_index_mtime / git_commit_state_mtime(D8) / dir_mtime —— 全部 mtime 代理
+```
+
+- **记录点**：csearch 全量构建**成功**后，`CORE_RT.on_full_csearch_success(ctx, reason)`
+  在三条全量成功路径（sync / fast-path / cold-full）统一调用，一并做 D-3b 清 dirty + D10 写
+  `state.csearch_input_hash = list_fingerprint(workspace_all.files)`。失败不写（指纹不得前移
+  于已建成的索引）。
+- **成本**：sha256(22 MB) 实测 46ms；`CORE_RT.list_fingerprint` 用 list 自身 `(mtime,size)`
+  作缓存键 → 稳态只 stat（微秒），仅 list 被改写时重算一次。**此 mtime 仅作缓存失效键，
+  判定永远是内容 hash**——与「拿 mtime 当真相」的代理本质不同。
+- **边界**：已有文件内容编辑**不在 csearch freshness 范围**——clangd 实时感知（LSP didChange）。
+  csearch 是文件级 trigram 索引，集合不变不需重建。
+- **噪声消失论证**：fsmonitor/TortoiseGit touch index、编译产物 touch 目录、git 漏报未提交，
+  **都不改 list 内容** → 不再假 stale；会话内集合变化由 watcher dirty 捕获，会话间由指纹捕获。
+
+防回归：`tests/cases/freshness_fingerprint_spec.lua`（指纹同/异 + 缓存 + freshness 源不再引用
+任何 mtime anchor）。详见 change `csearch-freshness-content-fingerprint`。
 
 ## 3. 失效正确性论证
 
@@ -183,8 +210,8 @@ fast-forward）。未提交的新增文件仍由 `ue_watch` dirty overlay + `dir
   调度顺序竞争。
 - **watcher 不再写 csearch 索引（取代 D7）**：D9 让 watcher 退回记账员，csearch.idx 单写者
   =prepare 家族；消除 watcher×UEPrepare 并发写损坏（`corrupt index` + 0 字节死循环）。
-- **freshness 不误报**：D8 让 git anchor 取 commit-state 而非 index，fsmonitor /
-  TortoiseGit 后台 touch index 不再触发假 stale。
+- **freshness 不误报**：D10 让 freshness 取 `workspace_all.files` 内容指纹而非任何 mtime
+  代理；fsmonitor/TortoiseGit touch index、编译产物 touch 目录都不改 list 内容 → 不再假 stale。
 
 ## 4. 风险与缓解
 
@@ -195,7 +222,7 @@ fast-forward）。未提交的新增文件仍由 `ue_watch` dirty overlay + `dir
 | watch 模块索引路径 | `ue_watch.start` 的 `csearch_index` 入参随 ctx.paths 自动指向平台目录，无需额外改 |
 | csearch.idx 并发写损坏（watcher×UEPrepare 抢 `<idx>~`） | D9 β：watcher 退回记账员不写索引；Policy A：构建串行拒绝并发；韧性：增量前校验 idx 可用。spec 静态+行为守护「不复活 csearch 写者」 |
 | 删除自动增量后新文件到下次 prepare 才识别 | 用户已确认可接受；persistent_dirty + rg-on-dirty overlay 使其非静默丢失 |
-| fsmonitor/TortoiseGit 后台改 index 触发假 stale | D8：freshness git anchor 取 `HEAD`+`logs/HEAD`（commit-state）而非 index；新增文件仍由 dirty overlay + dir_mtime 兜底 |
+| fsmonitor/TortoiseGit 后台改 index、编译产物 touch 目录 → 假 stale | D10：freshness 改 `workspace_all.files` 内容指纹（确定性），退役所有 mtime 代理（git index/commit-state/dir_mtime）；会话内集合变化由 watcher dirty 捕获，会话间由指纹捕获 |
 
 ## 5. 测试
 
@@ -206,8 +233,12 @@ fast-forward）。未提交的新增文件仍由 `ue_watch` dirty overlay + `dir
 - `tests/cases/ue_watch_csearch_spec.lua`（D9，5 例）：watcher csearch provider 是
   record-only no-op——静态守护「不调用 `code_search.build_index()` / 不写 `.incremental.txt` /
   不裸 cindex」+ 行为守护「有/无 dirty 路径都不触发 build_index」。
-- `tests/cases/csearch_build_guard_spec.lua`（D9，6 例）：构建串行（begin 占用 / 第二次拒绝 /
-  done 后可再 begin / 失败也清标志）+ 增量遇 0 字节·缺失 idx 被拒不 spawn + `_usable_index_for_test`。
+- `tests/cases/csearch_build_guard_spec.lua`（D9，8 例）：构建串行（begin 占用 / 第二次拒绝 /
+  done 后可再 begin / 失败也清标志）+ 增量遇 0 字节·缺失 idx 被拒不 spawn + `_usable_index_for_test`
+  + 全量成功清 dirty（D-3b）。
+- `tests/cases/freshness_fingerprint_spec.lua`（D10，7 例）：`list_fingerprint` 内容同/异 +
+  缺失→nil + (mtime,size) 缓存命中；防回归——`prepare_freshness` 源不再引用任何 mtime 代理
+  anchor（git index/commit-state/dir_mtime）+ `on_full_csearch_success` 记录指纹。
 - 回归范围：跨子系统（ue.lua + code_search + ue_watch + snacks）→ 提交前全量
   `nvim --headless -l tests/run.lua`。
 
@@ -220,3 +251,6 @@ fast-forward）。未提交的新增文件仍由 `ue_watch` dirty overlay + `dir
 - `M._csearch_build_begin_for_test` / `M._csearch_build_done_for_test` /
   `M._csearch_build_running_for_test`（ue，D9 Policy A 测试 seam — 非运行时 API）
 - 运行时：`CORE_RT.csearch_build_begin` / `CORE_RT.csearch_build_done`（D9 构建串行守卫）
+- 运行时：`CORE_RT.list_fingerprint` / `CORE_RT.on_full_csearch_success`（D10 指纹 + 全量成功钩子）
+- `M._list_fingerprint_for_test` / `M._reset_fingerprint_cache_for_test`（ue，D10 测试 seam）
+- 持久状态：`state.csearch_input_hash`（D10，全量构建成功后记录的 list 内容指纹）

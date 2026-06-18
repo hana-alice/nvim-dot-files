@@ -24,8 +24,18 @@
 --     csearch only, or both. The watcher decides; the providers are dumb.
 --   * Idempotent providers: re-firing the same path is a no-op so we can be
 --     liberal with retries.
---   * Never block UI: every disk operation goes through vim.system or
---     vim.uv async APIs and posts back via vim.schedule.
+--   * Never block UI: every disk operation goes through vim.system / vim.uv
+--     async APIs and posts back via vim.schedule. No provider may :wait() on
+--     the UI thread.
+--   * csearch index is SINGLE-WRITER: this watcher MUST NOT write csearch.idx.
+--     It only records adds into the persistent dirty set (bookkeeper, not
+--     indexer). csearch index writing is owned exclusively by the user-initiated
+--     prepare family. cindex hardcodes its staged path as `<idx>~`, so a second
+--     concurrent writer corrupts the index in the merge/rename window
+--     (`corrupt index: remove` + 0-byte death loop, 2026-06-17). New files stay
+--     visible between prepares via persistent_dirty + the rg-on-dirty overlay.
+--     See grep-cache-invalidation.md D9 + CONSTRAINTS K31g; a behavioral test
+--     guards against re-adding a csearch writer here.
 --
 -- Hard limits we accept (documented for future maintainers)
 --   * codesearch can't delete a path from an index — see codesearch's Merge
@@ -149,30 +159,29 @@ end
 -- the rest of the pipeline.
 -- ---------------------------------------------------------------------------
 
--- Provider: csearch index append.
--- codesearch's `cindex <path>` appends to $CSEARCHINDEX. Empirical: a single
--- file added to a 192MB UE index merges in ~1.4s (streaming, not full
--- re-hash). Batching multiple paths in one cindex call amortises that.
+-- Provider: csearch index — RECORD-ONLY (the watcher is a bookkeeper, not an
+-- indexer). See grep-cache-invalidation.md D9 + CONSTRAINTS K31g.
+--
+-- The watcher MUST NOT write csearch.idx. cindex's atomic-write protocol hard-
+-- codes the staged sibling path as `<idx>~`, so a watcher-driven incremental
+-- build and a user-driven `:UEPrepare` full build race the SAME `idx~` and
+-- corrupt each other in the merge/rename window — the symptom that retired this
+-- writer was `corrupt index: remove` + a 0-byte idx death loop (2026-06-17).
+--
+-- Why record-only is sufficient: csearch index writing has exactly one owner,
+-- the user-initiated prepare family (`:UEPrepare` / `:UEPrepareReindex` /
+-- `:UEPrepareIncremental`). New files stay visible BETWEEN prepares via the
+-- cumulative `persistent_dirty` set + the rg-on-dirty grep overlay — that
+-- bookkeeping (add_to_persistent_dirty, called by flush()) is the watcher's
+-- whole job here. Recognising new content only at the next manual prepare is a
+-- deliberate, accepted tradeoff (the auto-incremental writer was never load-
+-- bearing; it bought a narrow window at the cost of a permanent concurrent-write
+-- hazard). Do NOT re-add a build_index / cindex call here — a behavioral test
+-- guards against it.
 local function provider_csearch_add(paths)
-  if #paths == 0 then return true end
-  if not state.opts or not state.opts.csearch_index then
-    return false, "no csearch_index configured"
-  end
-  local cindex = "cindex"  -- assume PATH; fail loud if missing
-  if vim.fn.executable(cindex) == 0 then
-    return false, "cindex executable not found in PATH"
-  end
-  local cmd = { cindex }
-  for _, p in ipairs(paths) do table.insert(cmd, p) end
-  local result = vim.system(cmd, {
-    text = true,
-    env = vim.tbl_extend("force", vim.fn.environ(), {
-      CSEARCHINDEX = state.opts.csearch_index,
-    }),
-  }):wait()
-  if result.code ~= 0 then
-    return false, "cindex failed: " .. (result.stderr or "")
-  end
+  -- Intentionally a no-op beyond bookkeeping: flush() records `paths` into the
+  -- persistent dirty set separately (add_to_persistent_dirty). This provider
+  -- exists so the dispatcher fan-out shape stays stable, but it writes nothing.
   return true
 end
 
@@ -273,7 +282,8 @@ local function flush()
   log_info(("flush: +%d -%d"):format(#adds, #dels))
 
   -- Fan out. Order: CDB first (so clangd has the file before csearch hits
-  -- might race-trigger a goto), then csearch, then gtags shaders.
+  -- might race-trigger a goto), then csearch (record-only no-op — see D9),
+  -- then gtags shaders.
   local function step(who, fn, args)
     local ok, err = fn(args)
     if not ok then log_warn(who .. ": " .. tostring(err or "?")) end
@@ -285,11 +295,10 @@ local function flush()
   step("gtags_shader", provider_gtags_shader_rebuild,
     vim.list_extend(vim.list_extend({}, adds), dels))
 
-  -- Track adds in the cumulative dirty set so the rg-on-dirty overlay can
-  -- compensate for cindex's modify-no-op bug (see persistent_dirty docs).
-  -- Even successful flushes get tracked: csearch *will* skip any path that
-  -- was already in the index regardless of mtime, so we stay paranoid until
-  -- the next :UEPrepare clears the set.
+  -- Track adds in the cumulative dirty set. This — NOT a csearch write — is how
+  -- new files stay greppable between manual :UEPrepare runs: the rg-on-dirty
+  -- overlay reads this set. The watcher is a bookkeeper here, never an indexer
+  -- (D9). The set is cleared by :UEPrepare* on success.
   add_to_persistent_dirty(adds)
 
   state.flush_running = false
@@ -563,6 +572,21 @@ function M.snapshot_pending()
     for p in pairs(state.pending_del) do dels[#dels + 1] = p end
   end
   return { adds = adds, dels = dels }
+end
+
+-- Test seam: expose the csearch-add provider so the regression can assert it is
+-- RECORD-ONLY — it must never call code_search.build_index / write csearch.idx
+-- (D9 single-writer invariant; guards against re-introducing a second writer).
+M._provider_csearch_add_for_test = provider_csearch_add
+M._set_opts_for_test = function(opts) state.opts = opts end
+
+-- Test seam: seed the in-memory persistent dirty set without a real fs_event,
+-- so D-3b tests can verify clear_persistent_dirty zeroes it. Marks it loaded so
+-- a later count read doesn't lazy-load over the top.
+M._seed_persistent_dirty_for_test = function(paths)
+  state.persistent_dirty_loaded = true
+  state.persistent_dirty = {}
+  for _, p in ipairs(paths or {}) do state.persistent_dirty[tostring(p):lower()] = p end
 end
 
 return M

@@ -29,6 +29,7 @@ local LABELS = {
   unokai = "Unokai",
   ["ubuntu-terminal"] = "Ubuntu Terminal",
   ["rider-light"] = "Rider Light",
+  apprentice = "Apprentice",
 }
 
 local PLUGIN_BY_THEME = {

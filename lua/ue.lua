@@ -10,6 +10,11 @@ local CORE_RT = {
   build_term_win = nil,
   build_term_jobid = nil,
   prepare_jobid = nil,
+  -- csearch build serialization (D9 Policy A): only one csearch build may run
+  -- at a time. Every csearch build entry checks this flag and refuses (does NOT
+  -- queue) if it is set; the build's completion callback clears it
+  -- unconditionally (success AND failure) so a failed build can't wedge it.
+  csearch_build_running = false,
   status_cache = {}, -- { key = string, value = string, tick = number }
   dirty_index_roots = {},
   engine_root_cache = {}, -- dir -> engine_root (or false)
@@ -3366,83 +3371,33 @@ end
 
 local prepare_freshness  -- forward-decl alias kept for in-module callers
 do
-  -- Resolve <repo>/.git into the actual gitdir, then return mtime of its index.
-  -- Handles four shapes:
-  --   1. .git is a directory (regular repo) → <repo>/.git/index
-  --   2. .git is a file "gitdir: <path>" (worktree / submodule)
-  --      → resolve <path>/index. If <path> ends with worktrees/<name>, the
-  --        worktree's per-worktree index sits there; that's what we want
-  --        (it changes on any file add/remove in that worktree).
-  --   3. .git is missing entirely → return 0 (caller falls back to other anchors).
-  --   4. .git file points to a non-existent path → 0.
-  -- Returns mtime in epoch seconds, or 0 on any failure.
-  local function git_index_mtime(repo_root)
-    if not repo_root or repo_root == "" then return 0 end
-    local dot_git = repo_root .. "/.git"
-    local st = vim.loop.fs_stat(dot_git)
-    if not st then return 0 end
-    if st.type == "directory" then
-      local s = vim.loop.fs_stat(dot_git .. "/index")
-      return (s and s.mtime and s.mtime.sec) or 0
-    end
-    -- file: parse "gitdir: <path>" (worktree pointer)
-    local f = io.open(dot_git, "r")
-    if not f then return 0 end
-    local line = f:read("*l")
-    f:close()
-    if not line then return 0 end
-    local gitdir = line:match("^gitdir:%s*(.+)%s*$")
-    if not gitdir or gitdir == "" then return 0 end
-    -- Resolve relative gitdir against repo_root
-    if not gitdir:match("^[A-Za-z]:") and not gitdir:match("^/") then
-      gitdir = repo_root .. "/" .. gitdir
-    end
-    local idx = gitdir:gsub("\\", "/") .. "/index"
-    local si = vim.loop.fs_stat(idx)
-    return (si and si.mtime and si.mtime.sec) or 0
-  end
-
-  -- mtime of a directory tree's TOP-LEVEL marker (cheap stat on the dir itself,
-  -- NOT recursive walk). Used as an external anchor of last resort when neither
-  -- engine nor project has a usable .git. Captures "did the project_root dir
-  -- entry itself change since list was built". Not perfect (subdir adds may not
-  -- bump parent mtime on all filesystems) but a real external signal — beats
-  -- comparing the list to itself.
-  local function dir_mtime(p)
-    if not p or p == "" then return 0 end
-    local s = vim.loop.fs_stat(p)
-    return (s and s.mtime and s.mtime.sec) or 0
-  end
-
-  -- Classify how trustworthy ctx.paths.workspace_all_list is right now.
-  -- Returns one of:
-  --   "fresh"        — list newer than every external anchor we could find
-  --   "stale"        — list older than at least one external anchor, OR
-  --                    ue_watch has accumulated unflushed dirty files since the
-  --                    last :UEPrepare clear (watcher-observed drift)
-  --   "in_progress"  — :UEPrepare is currently rebuilding
-  --   "never"        — no list file exists at all
+  -- ── csearch freshness via content fingerprint (D10 / L2) ──────────────────
   --
-  -- Anchors (we take max across all available, then compare to list mtime):
-  --   1. <engine_root>/.git/index (worktree-aware)
-  --   2. <project_root>/.git/index (worktree-aware)
-  --   3. <engine_root> dir mtime  (filesystem fallback)
-  --   4. <project_root> dir mtime (filesystem fallback)
-  -- (state.updated_at was tried as anchor #5 but had to be removed — see
-  --  the long comment next to the `anchors` table below.)
+  -- freshness answers ONE question: "did the indexed file SET change
+  -- (add/remove/rename)?". The indexed set IS workspace_all.files (a sorted,
+  -- deterministic list — table.sort'ed at both write sites). Its content hash is
+  -- a DIRECT measurement of that question.
   --
-  -- We deliberately do NOT compare list mtime against itself or against
-  -- workspace_all_list's siblings — that's the self-validating loop the old
-  -- code hit, where fast-path's "is index stale?" check compared csearch.idx
-  -- against the very list cindex consumed, so a stale build forever validated
-  -- its own staleness. The anchor set above is all EXTERNAL to our cache dir.
+  -- We deliberately do NOT use any mtime proxy (git index, git commit-state,
+  -- dir mtime). Every proxy has a noise source that produced phantom "stale":
+  --   * .git/index  → fsmonitor / TortoiseGit background touch   (K30g)
+  --   * dir mtime   → compiler artifacts landing in the engine tree
+  --   * git HEAD    → only reflects committed state; misses uncommitted adds
+  -- Swapping one proxy for a quieter one (D8 did: index→commit-state) is endless
+  -- whack-a-mole. The fix is to stop proxying and measure the object itself.
   --
-  -- Watcher overlay: ue_watch persists an LRU dirty set across sessions. Any
-  -- non-empty dirty set means we have observed file changes that haven't been
-  -- folded into the list yet, regardless of mtime arithmetic. This catches the
-  -- common case where the user edits/adds files INSIDE an open nvim session
-  -- (no .git/index bump on uncommitted creates if file is gitignored or
-  -- pre-stage) but ue_watch saw the fs_event.
+  -- Content-level edits to EXISTING files are out of scope here — clangd handles
+  -- those live (LSP didChange). csearch is a file-level trigram index; a file
+  -- that still exists with changed content keeps working trigrams, so only set
+  -- changes require a rebuild. (User-defined boundary.)
+  --
+  -- Two non-proxy signals remain alongside the fingerprint:
+  --   * existence (no list → "never")
+  --   * ue_watch persistent_dirty (event-driven, zero-noise; covers in-session
+  --     set changes before the list is re-enumerated).
+  -- Cross-session set changes (e.g. git pull while nvim was closed) are caught
+  -- by the fingerprint: the next UEPrepare re-enumerates the list, its bytes
+  -- differ, hash mismatches.
   function CORE_RT.prepare_freshness(ctx)
     if not ctx or not ctx.paths then return "never" end
     if CORE_RT.prepare_jobid then
@@ -3452,13 +3407,13 @@ do
       end
     end
     local list_path = ctx.paths.workspace_all_list
-    local list_stat = list_path and vim.loop.fs_stat(list_path) or nil
-    if not list_stat then
+    if not list_path or not vim.loop.fs_stat(list_path) then
       return "never"
     end
-    local list_mt = list_stat.mtime and list_stat.mtime.sec or 0
 
     -- Watcher overlay: dirty files observed since last :UEPrepare clear
+    -- (in-session set changes not yet folded into the list). Event-driven,
+    -- not a proxy.
     local ok_watch, watch = pcall(require, "utils.ue_watch")
     if ok_watch and type(watch.persistent_dirty_status) == "function" then
       local st = watch.persistent_dirty_status() or {}
@@ -3467,35 +3422,26 @@ do
       end
     end
 
-    -- Anchor max. We deliberately do NOT include state.updated_at here.
-    -- Although it looks like a useful "when did we last prepare" signal,
-    -- it's written by :UEPrepare's finalize step AFTER list_dump completes
-    -- (list_dump → cindex csearch ~120s → finalize writes state.json).
-    -- So state.updated_at is ALWAYS list_mt + minutes, which means any
-    -- comparison `list_mt < anchor_max(state.updated_at)` reports stale
-    -- the instant :UEPrepare finishes — every subsequent grep / picker
-    -- entry triggers a phantom "[grep] :UEPrepare is stale" WARN even
-    -- though nothing actually changed. The scenario state.updated_at was
-    -- originally added to catch (project reconfiguration via :UESetProject)
-    -- is now covered by invalidate_project_scoped_cache deleting the list
-    -- file outright → list_stat == nil → "never" branch above. The other
-    -- real-change scenarios (git ops, fs changes, watcher dirty) are still
-    -- caught by the four remaining anchors.
-    local anchors = {
-      git_index_mtime(ctx.engine_root),
-      git_index_mtime(ctx.project_root),
-      dir_mtime(ctx.engine_root),
-      dir_mtime(ctx.project_root),
-    }
-    local anchor_max = 0
-    for _, a in ipairs(anchors) do
-      if a and a > anchor_max then anchor_max = a end
+    -- Content fingerprint: the steady-state verdict. Compare the list's content
+    -- hash against the hash recorded when the index was last built. Equal =
+    -- fresh. (NOTE: list_fingerprint caches on the list's own (mtime,size) so
+    -- this is a stat in steady state — the mtime is a cache key, never a
+    -- verdict; the verdict is the content hash.)
+    local recorded
+    local ok_state, state = pcall(read_state, ctx.engine_root)
+    if ok_state and type(state) == "table" then
+      recorded = state.csearch_input_hash
     end
-    if anchor_max == 0 then
-      -- No external signal at all is itself suspicious; lean conservative.
+    if type(recorded) ~= "string" or recorded == "" then
+      -- No fingerprint on record (fresh upgrade / never built): lean stale so
+      -- the user runs :UEPrepare; the first successful full build records it.
       return "stale"
     end
-    if list_mt >= anchor_max then
+    local cur = CORE_RT.list_fingerprint(list_path)
+    if not cur then
+      return "stale"  -- could not hash the list → conservative
+    end
+    if cur == recorded then
       return "fresh"
     end
     return "stale"
@@ -3644,6 +3590,121 @@ local function set_prepare_running(value)
   invalidate_status_cache()
   refresh_statusline()
 end
+
+-- csearch build serialization (D9 Policy A). Returns true when the caller is
+-- cleared to start a csearch build (and marks the slot busy); returns false +
+-- emits a visible notice when a build is already running. The build's
+-- completion callback MUST call CORE_RT.csearch_build_done() unconditionally
+-- (success AND failure) so a failed build can't wedge the slot. Rejection —
+-- never queueing: a concurrent full :UEPrepare already reindexes the whole file
+-- list (including any incremental's dirty files), so queuing would be redundant
+-- work that then races the next build.
+--
+-- Defined on CORE_RT (not a main-chunk local) to stay under LuaJIT's 200-local
+-- cap on the main function (see CONSTRAINTS luajit-200-local-cap).
+function CORE_RT.csearch_build_begin(label)
+  if CORE_RT.csearch_build_running then
+    vim.schedule(function()
+      vim.notify(
+        ("[ue] csearch build already in progress — %s skipped"):format(label or "build"),
+        vim.log.levels.WARN, { title = "UE", replace = "ue.csearch.build" })
+    end)
+    return false
+  end
+  CORE_RT.csearch_build_running = true
+  return true
+end
+
+function CORE_RT.csearch_build_done()
+  CORE_RT.csearch_build_running = false
+end
+
+-- Clear the watcher's persistent dirty set after a SUCCESSFUL full csearch
+-- build (D9 / D-3b). Soft-requires ue_watch so this is safe to call from any
+-- prepare path. Since β made the watcher a bookkeeper (not a writer), clearing
+-- the dirty set on build success is now the prepare family's sole job — and it
+-- MUST happen on EVERY full-build success path (cache fast-path / cold full /
+-- sync), not just one. A residual dirty set otherwise (1) makes
+-- prepare_freshness' dirty gate return "stale" right after a successful prepare,
+-- and (2) makes the rg-on-dirty overlay re-grep a huge stale set on every
+-- <leader>/ / <space><space> (picker lag). Only call on SUCCESS — a failed
+-- build leaves the dirty set so the overlay keeps those files visible.
+function CORE_RT.clear_persistent_dirty_safe(reason)
+  local ok_watch, watch = pcall(require, "utils.ue_watch")
+  if ok_watch and type(watch.clear_persistent_dirty) == "function" then
+    watch.clear_persistent_dirty(reason or "prepare")
+  end
+end
+
+-- Called once on EVERY full csearch build SUCCESS path (sync / cache fast-path /
+-- cold full). Bundles the two post-success obligations so the three call sites
+-- can't drift:
+--   D-3b: clear the watcher dirty set (it's logically empty — full build indexed
+--         everything).
+--   D10:  record the content fingerprint of the list we just indexed, so
+--         prepare_freshness can compare future list bytes against it.
+-- MUST only be called on SUCCESS. On failure neither obligation applies (dirty
+-- files must stay visible; the fingerprint must not move ahead of a built index).
+function CORE_RT.on_full_csearch_success(ctx, reason)
+  CORE_RT.clear_persistent_dirty_safe(reason)
+  local list_path = ctx and ctx.paths and ctx.paths.workspace_all_list
+  if not list_path or not ctx.engine_root then return end
+  local hash = CORE_RT.list_fingerprint(list_path)
+  if hash then
+    pcall(update_state_field, ctx.engine_root, "csearch_input_hash", hash)
+  end
+end
+
+-- Test seams for the serialization guard (D9 Policy A).
+function M._csearch_build_begin_for_test(label) return CORE_RT.csearch_build_begin(label) end
+function M._csearch_build_done_for_test() return CORE_RT.csearch_build_done() end
+function M._csearch_build_running_for_test() return CORE_RT.csearch_build_running end
+
+-- Public alias for the D-3b dirty-clear helper (also used by tests).
+function M.clear_persistent_dirty_safe(reason)
+  return CORE_RT.clear_persistent_dirty_safe(reason)
+end
+
+-- ── csearch freshness content fingerprint (D10 / L2) ────────────────────────
+-- Content hash of workspace_all.files = a DIRECT measurement of "did the
+-- indexed file SET change (add/remove/rename)?". This replaces all mtime-proxy
+-- anchors (git index, git commit-state D8, dir_mtime), which were polluted by
+-- fsmonitor / TortoiseGit / compiler artifacts touching unrelated paths and
+-- produced phantom "stale". The list is table.sort'ed at both write sites so its
+-- bytes are deterministic for a given file set.
+--
+-- Cost: sha256 over the (~22 MB) list is ~46ms. We cache the hash keyed on the
+-- list's OWN (mtime,size); steady-state freshness checks only stat (microseconds)
+-- and reuse the cached hash. NOTE: this mtime is a cache-invalidation key for
+-- "should we recompute the hash", NOT a freshness verdict — the verdict is
+-- always the content hash comparison. That distinction is the whole point: a
+-- proxy treats mtime AS truth; here truth is the bytes, mtime only hints when to
+-- re-read them.
+CORE_RT.list_fingerprint_cache = {}  -- path -> { mt, size, hash }
+function CORE_RT.list_fingerprint(path)
+  if not path or path == "" then return nil end
+  local st = vim.loop.fs_stat(path)
+  if not st then return nil end
+  local mt = (st.mtime and st.mtime.sec) or 0
+  local size = st.size or 0
+  local cached = CORE_RT.list_fingerprint_cache[path]
+  if cached and cached.mt == mt and cached.size == size then
+    return cached.hash
+  end
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local data = f:read("*a")
+  f:close()
+  if not data then return nil end
+  local ok_h, hash = pcall(vim.fn.sha256, data)
+  if not ok_h or type(hash) ~= "string" then return nil end
+  CORE_RT.list_fingerprint_cache[path] = { mt = mt, size = size, hash = hash }
+  return hash
+end
+
+-- Test seam for the fingerprint helper (D10).
+function M._list_fingerprint_for_test(path) return CORE_RT.list_fingerprint(path) end
+function M._reset_fingerprint_cache_for_test() CORE_RT.list_fingerprint_cache = {} end
 
 local function scan_relative_files(root, search_paths)
   local fd = _uproc.first_executable({ "fd", "fdfind" })
@@ -6285,16 +6346,15 @@ function M.cached_grep(opts)
         word  = { icon = "W", value = true },
         case  = { icon = "C", value = true },
       },
-      -- Keymaps: Alt-g/x/w/c = mode toggles. NB: Alt+R is GLOBALLY hooked
-      -- by NVIDIA App / GeForce Experience for Performance Overlay (system-
-      -- level hotkey, nvim never sees the keypress). Don't waste time on
-      -- <a-r> on this machine. <a-g> = "grep regex" mnemonic, no conflict
-      -- (snacks default <C-g> = toggle_live, distinct key).
-      -- <a-w> covers user intuition "w = word" (snacks default cycle_win
-      -- overridden); <a-x> alternate for word (consistency with
-      -- <leader>sx cheatsheet entry). <a-c> = case.
+      -- Keymaps: Alt-r/g/x/w/c = mode toggles, shown live as R/W/C icons in
+      -- the picker title. <a-r> is the intuitive "regex" toggle (matches
+      -- snacks' own default); <a-g> = "grep regex" mnemonic alias. Both flip
+      -- the same regex flag. <a-w>/<a-x> = whole-word, <a-c> = case-sensitive.
+      -- NOTE: <a-r> previously collided with NVIDIA App's global Performance
+      -- Overlay hotkey; if it ever stops reaching nvim again, use <a-g>.
       win = vim.tbl_deep_extend("force", grouping_enabled and fast_tab_keys.win or {}, {
         input = { keys = {
+          ["<a-r>"] = { "ue_grep_toggle_regex", mode = { "i", "n" } },
           ["<a-g>"] = { "ue_grep_toggle_regex", mode = { "i", "n" } },
           ["<a-x>"] = { "ue_grep_toggle_word",  mode = { "i", "n" } },
           ["<a-w>"] = { "ue_grep_toggle_word",  mode = { "i", "n" } },
@@ -8282,16 +8342,24 @@ local function prepare()
           end
         end
         fout:close()
-        local cs_done, cs_ok, cs_err = false, false, nil
-        code_search_p.build_index(cs_ctx_p, abs_list, function(ok_cs, err_cs, _st)
-          cs_ok, cs_err = ok_cs, err_cs
-          cs_done = true
-        end)
-        vim.wait(180000, function() return cs_done end, 100)
-        pcall(os.remove, abs_list)
-        if not cs_ok then
-          vim.notify("UEPrepare: csearch index failed: " .. (cs_err or "timeout"),
-            vim.log.levels.WARN, { title = "UE" })
+        if not CORE_RT.csearch_build_begin("UEPrepare (sync)") then
+          pcall(os.remove, abs_list)
+        else
+          local cs_done, cs_ok, cs_err = false, false, nil
+          code_search_p.build_index(cs_ctx_p, abs_list, function(ok_cs, err_cs, _st)
+            cs_ok, cs_err = ok_cs, err_cs
+            cs_done = true
+          end)
+          vim.wait(180000, function() return cs_done end, 100)
+          CORE_RT.csearch_build_done()
+          pcall(os.remove, abs_list)
+          if not cs_ok then
+            vim.notify("UEPrepare: csearch index failed: " .. (cs_err or "timeout"),
+              vim.log.levels.WARN, { title = "UE" })
+          else
+            -- Full build succeeded (D-3b + D10): clear dirty + record fingerprint.
+            CORE_RT.on_full_csearch_success(ctx, "prepare:sync")
+          end
         end
       end
     else
@@ -8511,20 +8579,27 @@ local function prepare_async(opts)
               end
             end
             fout:close()
-            vim.notify(("UEPrepare: rebuilding csearch index in background (reason: %s)..."):format(stale_reason),
-              vim.log.levels.INFO, { title = "UE", timeout = 3000, replace = "ue.csearch.build" })
-            code_search_fp.build_index(cs_ctx_fp, abs_list, function(ok_cs, err_cs, stats)
+            if not CORE_RT.csearch_build_begin("UEPrepare (cache fast-path)") then
               pcall(os.remove, abs_list)
-              if ok_cs then
-                local mb = math.floor((stats.index_size or 0) / 1024 / 1024)
-                vim.notify(("✓ csearch index rebuilt: %d MB in %.1fs"):format(
-                  mb, (stats.ms or 0) / 1000),
-                  vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
-              else
-                vim.notify("UEPrepare: csearch rebuild failed: " .. (err_cs or "unknown"),
-                  vim.log.levels.WARN, { title = "UE", replace = "ue.csearch.build" })
-              end
-            end)
+            else
+              vim.notify(("UEPrepare: rebuilding csearch index in background (reason: %s)..."):format(stale_reason),
+                vim.log.levels.INFO, { title = "UE", timeout = 3000, replace = "ue.csearch.build" })
+              code_search_fp.build_index(cs_ctx_fp, abs_list, function(ok_cs, err_cs, stats)
+                CORE_RT.csearch_build_done()
+                pcall(os.remove, abs_list)
+                if ok_cs then
+                  local mb = math.floor((stats.index_size or 0) / 1024 / 1024)
+                  vim.notify(("✓ csearch index rebuilt: %d MB in %.1fs"):format(
+                    mb, (stats.ms or 0) / 1000),
+                    vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
+                  -- Full build succeeded (D-3b + D10): clear dirty + fingerprint.
+                  CORE_RT.on_full_csearch_success(ctx, "prepare:fast-path")
+                else
+                  vim.notify("UEPrepare: csearch rebuild failed: " .. (err_cs or "unknown"),
+                    vim.log.levels.WARN, { title = "UE", replace = "ue.csearch.build" })
+                end
+              end)
+            end
           end
         end
 
@@ -8780,13 +8855,10 @@ local function prepare_async(opts)
                 dirty_json_path = ctx.paths and ctx.paths.dirty_json or nil,
                 debounce_ms = 1500,
               })
-              -- :UEPrepare just rebuilt the indices; the cumulative dirty set
-              -- is now logically empty (csearch was reset, gtags rebuilt).
-              -- Clear it so the rg-on-dirty overlay doesn't keep re-greping
-              -- thousands of stale entries forever.
-              if type(watch.clear_persistent_dirty) == "function" then
-                watch.clear_persistent_dirty("prepare")
-              end
+              -- NOTE: dirty set is cleared in the csearch build SUCCESS callback
+              -- below (D-3b), NOT here. Clearing here would wipe it before the
+              -- cold full build has actually succeeded — if the build then fails,
+              -- the overlay would have lost the very files it must keep visible.
             end
           end
 
@@ -8824,7 +8896,13 @@ local function prepare_async(opts)
             fout:close()
           end)
 
+          if not CORE_RT.csearch_build_begin("UEPrepare (cold full build)") then
+            pcall(os.remove, abs_list)
+            finalize_after_csearch()
+            return
+          end
           code_search.build_index(cs_ctx, abs_list, function(ok_cs, err_cs, stats)
+            CORE_RT.csearch_build_done()
             -- Tidy up the temp filelist regardless of outcome.
             pcall(os.remove, abs_list)
 
@@ -8833,6 +8911,8 @@ local function prepare_async(opts)
               vim.notify(("✓ csearch index: %d MB in %.1fs"):format(
                 mb, (stats.ms or 0) / 1000),
                 vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
+              -- Full build succeeded (D-3b + D10): clear dirty + fingerprint.
+              CORE_RT.on_full_csearch_success(ctx, "prepare:cold-full")
             else
               vim.notify("UEPrepare: csearch index failed: " .. (err_cs or "unknown"),
                 vim.log.levels.WARN, { title = "UE" })
@@ -9359,10 +9439,15 @@ function M.setup()
     end
     for _, p in ipairs(dirty) do fout:write(p, "\n") end
     fout:close()
+    if not CORE_RT.csearch_build_begin("UEPrepareIncremental") then
+      pcall(os.remove, abs_list)
+      return
+    end
     vim.notify(("UEPrepareIncremental: adding %d dirty files to csearch index ..."):format(#dirty),
       vim.log.levels.INFO, { title = "UE", timeout = 3000, replace = "ue.csearch.build" })
     local cs_ctx = { workspace_root = workspace_root(ctx), csearch_idx = ctx.paths.csearch_idx }
     code_search.build_index(cs_ctx, abs_list, function(ok_cs, err_cs, stats)
+      CORE_RT.csearch_build_done()
       pcall(os.remove, abs_list)
       if ok_cs then
         if type(watch.clear_persistent_dirty) == "function" then

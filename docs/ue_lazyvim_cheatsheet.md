@@ -1,56 +1,73 @@
 # Neovim + LazyVim Development Handbook
 
-Covers Vim fundamentals → LazyVim workflows → UE/Android DAP, with the
-keymap conventions used in **this** config.
+> Vim fundamentals → LazyVim workflows → UE / Android DAP, with the keymap
+> conventions used in **this** config.
 
-> 浮窗版：`:UECheatsheet` （`<leader>?`） — 卡片式、可分类切换。
-> 文档完整版（你现在看的）：`:UECheatsheetEdit` 或 `<leader>?` 后切到 Markdown。
+**Two surfaces, one source of truth:**
+
+- 🪟 **Floating cheatsheet** — `<leader>?` / `:UECheatsheet` (tabbed cards).
+- 📄 **This document** — `:UECheatsheetEdit`, the full reference.
+
+Both are tested: `tests/cases/cheatsheet_spec.lua` fails if a command listed
+here or in `lua/utils/cheatsheet.lua` no longer exists in `lua/`, or if the two
+surfaces drift apart.
 
 ---
 
-## How to Re-Generate This Document
+## Contents
 
-This file is **derived from code**, not the other way around. If you
-edit any keymap, regenerate by:
+- [🚦 Start here](#-start-here-the-8-keys-you-must-know)
+- [📐 Keymap conventions](#-keymap-conventions-this-config)
+- [⌨️ Vim fundamentals](#️-vim-fundamentals--modes)
+- [🧭 LSP navigation](#-lsp-navigation)
+- [🔍 Picker / search](#-picker--search-snacks)
+- [🩺 Trouble / diagnostics](#-trouble--quickfix--diagnostics)
+- [🗂️ Sidebar / buffers / windows](#️-left-sidebar--workbench)
+- [💻 Terminal](#-terminal--shell)
+- [🌳 Git](#-git)
+- [🎨 UI / toggles](#-ui--toggles)
+- [🪟 Windows-only](#-windows-only)
+- [🎮 UE workflow](#-ue-workflow)
+- [🐞 DAP debugging](#-dap--unified-uedap-commands)
+- [📝 Logs / workarounds / markdown](#-logs--workarounds)
 
-1. Re-scan keymap-bearing files:
-   - `lua/config/keymaps.lua` — the bulk of `<leader>` bindings
+---
+
+## 🔄 How this document is maintained
+
+This file is **derived from code**. After editing any keymap or command:
+
+1. Re-scan the keymap-bearing files:
+   - `lua/config/keymaps.lua` — the bulk of `<leader>` and DAP bindings
    - `lua/config/windows.lua` — `<leader>E / oe / tc / tp / te`
    - `lua/plugins/*.lua` — every `keys = { ... }` block
-   - `lua/ue.lua` — every `vim.api.nvim_create_user_command("UE…")`
-2. Cross-check **command** existence: a key that calls `<cmd>UEFoo<cr>`
-   is dead if `UEFoo` isn't created anywhere. Use:
+   - `lua/ue.lua` — every `nvim_create_user_command("UE…")`
+2. Verify command existence (a key calling `<cmd>UEFoo<cr>` is dead if `UEFoo`
+   is never created):
 
    ```bash
-   grep -rE 'create_user_command\("(\w+)"' lua | \
-     sed -E 's/.*"(\w+)".*/\1/' | sort -u
+   grep -rE 'create_user_command\("(\w+)"' lua | sed -E 's/.*"(\w+)".*/\1/' | sort -u
    ```
-3. Update **both** this file AND `lua/utils/cheatsheet.lua` (the
-   floating window). They are two surfaces over the same data.
-4. The Git section lists **only** what really exists — there is
-   **no lazygit** in this config; `<leader>gn` (Neogit) is the only
-   git UI entry point.
+3. Update **both** this file **and** `lua/utils/cheatsheet.lua` — they are two
+   surfaces over the same data.
+4. Run the guard: `nvim --headless -l tests/run.lua cheatsheet`.
 
-## How to Use This Document
+---
 
-- `<leader>?` / `:UECheatsheet`         — open the floating cheatsheet
-- `:UECheatsheetEdit`                   — edit this markdown file
-- `:MarkdownPreview` / `:MarkdownPreviewToggle` — pretty render
-- File: `docs/ue_lazyvim_cheatsheet.md`
+## 🚦 Start Here (the 8 keys you must know)
 
-## Start Here (the 8 keys you must know)
-- `Space`                 → `<leader>` (hold to open which-key)
+- `Space`                 → `<leader>`
 - `<leader>sk`            → search keymaps (best discovery)
 - `<leader>sh`            → search help
 - `<leader><space>`       → find files (workspace-aware)
-- `<leader>/`             → grep project
+- `<leader>/`             → grep project (Engine + Project)
 - `gd` / `gr`             → goto definition / references
 - `u` / `<C-r>`           → undo / redo
 - `.`                     → repeat last change
 
 ---
 
-## Keymap Conventions (this config)
+## 📐 Keymap Conventions (this config)
 
 The keymap surface follows a few rules so muscle memory stays cheap:
 
@@ -72,7 +89,7 @@ and update **both** this doc and `lua/utils/cheatsheet.lua`.
 
 ---
 
-## Vim Fundamentals — Modes
+## ⌨️ Vim Fundamentals — Modes
 
 | Mode     | Enter              | Purpose                       |
 |----------|--------------------|-------------------------------|
@@ -241,7 +258,7 @@ functions, `zo` to open the section you want, `zR` to reset.
 
 ---
 
-## LSP Navigation
+## 🧭 LSP Navigation
 
 Source: `lua/plugins/ue.lua` (`gd`, `<leader>ch`),
 `lua/config/keymaps.lua` (`gr`, `<leader>gP`, `<C-LeftMouse>`).
@@ -288,7 +305,7 @@ Drops mismatched candidates pre-jump. Spinner tag indicates path:
   ⊘ ... — dependent-name early-bail (template parameter)
   ● already at ... — cursor IS the definition site
 
-## Picker / Search (Snacks)
+## 🔍 Picker / Search (Snacks)
 
 Source: `lua/plugins/snacks.lua` (`<leader>;` / `fe` / `e` / `/` /
 `s*` / `<space>` / `f*` / `uo` / `uO`), `lua/config/keymaps.lua`
@@ -331,11 +348,52 @@ Source: `lua/plugins/snacks.lua` (`<leader>;` / `fe` / `e` / `/` /
 | `<C-Space>`      | Multi-select toggle                     |
 | `<C-j>` / `<C-k>`| Down / up                               |
 | `<C-d>` / `<C-u>`| Half page down / up                     |
+| `<C-f>` / `<C-b>`| Preview scroll down / up                |
 | `<C-p>` / `<C-n>`| Prev / next history                     |
 | `<C-/>`          | Toggle help inside picker               |
-| `<Tab>`          | Toggle focus list ↔ input               |
+| `<Tab>` / `<S-Tab>` | Toggle focus list ↔ input            |
+| `<C-s>`          | Open in split / send selection          |
+| `<C-v>`          | Open in vertical split                  |
+| `<C-t>`          | Open in new tab                         |
 | `<CR>`           | Confirm                                 |
 | `<Esc>` / `q`    | Close picker                            |
+
+### Refining a live grep — whole-word, case, regex (read this)
+
+`<leader>/` (and `<leader>sg/sG`) open a **live grep** that pipes your input to
+ripgrep. There is no separate keystroke "after typing" to turn on whole-word or
+case — you control ripgrep two ways:
+
+1. **Inline rg flags** — type your pattern, then ` -- ` (space-dash-dash-space),
+   then any ripgrep flags. The text before `--` is the pattern, the rest are
+   flags:
+
+   | You type in the grep box | Effect |
+   |---|---|
+   | `FRDGBuilder` | smart-case substring (default) |
+   | `FRDGBuilder -- --word-regexp` | whole-word match (capital `W` boundary) |
+   | `FRDGBuilder -- -w` | whole-word (short flag) |
+   | `FRDGBuilder -- --case-sensitive` | force case-sensitive |
+   | `FRDGBuilder -- -s` | case-sensitive (short flag) |
+   | `FRDGBuilder -- -w -s` | whole-word **and** case-sensitive |
+   | `F.*Builder -- ` | pattern is already regex (rg is regex by default) |
+   | `Foo\(` / `a\|b` | escape regex metachars, or use them — rg regex syntax |
+   | `foo -- -g '*.cpp'` | restrict to a glob |
+   | `foo -- -F` | fixed-string (treat pattern literally, no regex) |
+
+2. **Dedicated launch keys** — start the grep already in that mode:
+
+   | Key | Mode it launches in |
+   |---|---|
+   | `<leader>sx` | whole-word (`--word-regexp`) grep |
+   | `<leader>sX` | case-sensitive grep |
+   | `<leader>sw` / `<leader>sW` | grep current word / WORD immediately |
+   | `<leader>sy` / `<leader>sY` | live grep with current word **prefilled** (then edit + add `-- flags`) |
+   | `<leader>sg` / `<leader>sG` | grep workspace code / all files |
+
+So the answer to "Space `/` then whole-word capital": either launch with
+`<leader>sx`, or in the `<leader>/` box type `pattern -- -w` (add `-s` for
+capital/case-sensitive).
 
 ### Picker matcher (this config)
 
@@ -350,16 +408,16 @@ Source: `lua/plugins/snacks.lua` (`<leader>;` / `fe` / `e` / `/` /
 
 ### Grep Tips
 
-- Default is smart-case
+- Default is smart-case; type a capital to force case on that token
 - `<leader>sw` searches current word/selection directly
 - `<leader>sy` prefills current word into live grep for further editing
 - `<leader>sx` for whole-word, `<leader>sX` for case-sensitive
+- Inline flags after ` -- `: `Foo -- --word-regexp --case-sensitive`
 - In any Snacks picker: `<C-q>` sends results to quickfix (auto-opens sidebar)
 - `<C-Space>` to multi-select, then `<C-q>` to pin filtered subset
-- Append ripgrep args in live grep: `Foo -- --word-regexp --case-sensitive`
 - After `<C-q>` pin, recover the picker with `<leader>s/`
 
-## Trouble / Quickfix / Diagnostics
+## 🩺 Trouble / Quickfix / Diagnostics
 
 | Key              | Action                                  |
 |------------------|-----------------------------------------|
@@ -375,7 +433,7 @@ Source: `lua/plugins/snacks.lua` (`<leader>;` / `fe` / `e` / `/` /
 | `:cnext` / `:cprev` | Navigate quickfix                   |
 | `:cdo {cmd}`     | Run cmd on every quickfix entry         |
 
-## Left Sidebar / Workbench
+## 🗂️ Left Sidebar / Workbench
 
 Source: `lua/config/keymaps.lua` (`<leader>v*`).
 
@@ -415,7 +473,7 @@ Views share the same left panel. Switching `v?` replaces content.
 | `<leader><tab>d`      | Close tab (LazyVim)                  |
 | `<leader><tab>o`      | Close other tabs (LazyVim)           |
 
-## Terminal / Shell
+## 💻 Terminal / Shell
 
 Source: `lua/config/windows.lua` (`<leader>tc / tp / te`,
 `<Esc>` in terminal mode).
@@ -434,7 +492,7 @@ Source: `lua/config/windows.lua` (`<leader>tc / tp / te`,
 terminal so the config can inject `cd ...` into it. `<C-/>` is for a
 fast scratch shell.
 
-## Git
+## 🌳 Git
 
 Source: `lua/plugins/diffview.lua`, `lua/plugins/neogit.lua`,
 `lua/plugins/fugitive.lua`, `lua/plugins/gitsigns.lua`,
@@ -565,7 +623,7 @@ If you want to disable the placeholder for a specific key, replace
 the `function() require("utils.async_launcher").launch{...} end`
 wrapper with the plain `<cmd>...<cr>` form.
 
-## UI / Toggles
+## 🎨 UI / Toggles
 
 Source: `lua/plugins/zen-mode.lua` (`<leader>z`),
 `lua/config/keymaps.lua` (`<leader>ut`, `<leader>?`).
@@ -592,7 +650,7 @@ Note: some `<leader>u…` keys are **overridden** by UE/Android workflow
 (`ub` / `ui` / `ul` / `uL` / `uD` / `up` / `ug`) via `nowait=true`
 after VeryLazy.
 
-## Windows-only
+## 🪟 Windows-only
 
 Source: `lua/config/windows.lua`.
 
@@ -631,7 +689,7 @@ saved/aborted before the old session exits.
 
 ---
 
-## UE Workflow
+## 🎮 UE Workflow
 
 Source: `lua/config/keymaps.lua` (static `<leader>uB / uc / uP`,
 runtime `ub / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.lua`
@@ -663,6 +721,7 @@ have no key bound by default:
 | Command                | Action                                  |
 |------------------------|-----------------------------------------|
 | `:UEPrepareReindex`    | Reindex without re-export ccjson        |
+| `:UEPrepareIncremental`| Prepare only dirty files (fast refresh) |
 | `:UEPrepareSync`       | Synchronous prepare (debug)             |
 | `:UEGenerateFromRSP`   | Re-export ccjson from cached `.rsp`     |
 | `:UEBuildAndroid`      | Force Android build target              |
@@ -692,103 +751,94 @@ have no key bound by default:
 | `:UEDefSelfTest`       | Run goto-def self-test                  |
 | `:UEDefDiag`           | Goto-def diagnostics dump               |
 | `:UEDefReload`         | Reload goto-def module                  |
+| `:UEDefCacheClear`     | Clear goto-def cache                     |
 
-Typical Win64 workflow:
+Typical first-run workflow (see the README for the full step list):
 
-1. `:UESetPlatform Win64 Development Editor`
-2. `<leader>uc` (`:UEExportCompileCommands`)
-3. Open code, use `gd` / `gr` / `<leader>ss` / `<leader>/`
+1. `:UESetProject` — bind project + engine root (persisted)
+2. `:UESetPlatform Win64 Development Editor`
+3. Build once for the platform (`<leader>ub` / `:UEBuild`) — `:UEPrepare`
+   derives its compile flags from a real platform build
+4. `:UEPrepare` — CDB pipeline + csearch index + clangd reload
+5. Open code, use `gd` / `gr` / `<leader>ss` / `<leader>/`
 
-## DAP — Android (current keymap, codelldb 1.12.2 route)
+## 🐞 DAP — unified `UEDAP*` commands
 
-Source: `lua/config/keymaps.lua` `<leader>d*` block + `dap_fkeys` table.
-All bound to `:UEAndroidDAP*` commands today; the `:UEDAP*` neutral
-commands below are the migration target.
+Source: `lua/config/keymaps.lua` (`<leader>d*` block + `dap_fkeys` table). All
+keys call the **platform-neutral `:UEDAP*` user commands** defined in
+`lua/ue.lua`. `:UEDAPAttach android` dispatches to the Android handler; on
+Win64 the same commands target the local debugger. (The older
+`UEAndroidDAP*` route is gone — do not look for it.)
 
 The `<F5/F6/F9/F10/F11/S-F11>` set is bound in **n / i / t / v** modes
-(important: `dap-repl` is a prompt buffer, normal-only bindings produce
-literal `<F5>` characters in insert mode).
+(important: `dap-repl` is a prompt buffer; normal-only bindings would type a
+literal `<F5>` in insert mode).
 
-| Key              | Action                                          |
-|------------------|-------------------------------------------------|
-| `<leader>da`     | Attach to Android process                       |
-| `<leader>dl`     | Launch debug (auto-attach)                      |
-| `<leader>db`     | Toggle breakpoint (persisted, see below)        |
-| `<leader>dc`     | Continue                                        |
-| `<leader>dp`     | Pause                                           |
-| `<leader>dn`     | Step over                                       |
-| `<leader>di`     | Step in                                         |
-| `<leader>do`     | Step out                                        |
-| `<leader>du`     | Toggle DAP UI                                   |
-| `<leader>dr`     | Toggle REPL                                     |
-| `<leader>dx`     | Reset DAP layout                                |
-| `<F5>`           | Continue                                        |
-| `<F6>`           | Pause                                           |
-| `<F9>`           | Toggle breakpoint (persisted, per UE project)   |
-| `<F10>`          | Step over                                       |
-| `<F11>`          | Step in (Neovide may steal — see Note below)    |
-| `<S-F11>`        | Step out                                        |
+### Session control
 
-**Persistent breakpoints** (added 2026-05-13): `<F9>` /
-`<leader>db` write to
-`<engine_root>/.cache/nvim-ue/breakpoints/<project>.json`. They survive
-nvim restarts and are lazy-restored when each file is opened
-(`BufReadPost`). Save is debounced (250 ms) so spamming F9 won't
-thrash disk. Conditional / hit-count / log-message variants are
-preserved. Module: `lua/ue/dap/_persist_bp.lua`.
+| Key | Command | Action |
+|---|---|---|
+| `<leader>da` | `:UEDAPAttach android` | Attach to the Android process |
+| `<leader>dl` | `:UEDAPLaunch android` | Launch + auto-attach |
+| `<leader>dc` / `F5` | `:UEDAPContinue` | Continue |
+| `<leader>dp` / `F6` | `:UEDAPPause` | Pause |
+| `<leader>dn` / `F10` | `:UEDAPStepOver` | Step over |
+| `<leader>di` / `F11` | `:UEDAPStepIn` | Step in (Neovide may steal F11 — see note) |
+| `<leader>do` / `S-F11` | `:UEDAPStepOut` | Step out |
 
-Helper functions exposed but not yet bound to keys:
+### Breakpoints
 
-| Function (call via `:lua`)                            | Action                                |
-|-------------------------------------------------------|---------------------------------------|
-| `require('ue.dap').dap_set_conditional_breakpoint()`  | Prompt for `condition` and persist    |
-| `require('ue.dap').dap_set_logpoint()`                | Prompt for `log message` and persist  |
-| `require('ue.dap').dap_clear_breakpoints()`           | Clear all (in-memory + persisted)     |
-| `require('ue.dap').dap_list_breakpoints()`            | Print persisted list to `:messages`   |
+| Key | Command | Action |
+|---|---|---|
+| `<leader>db` / `F9` | `:UEDAPToggleBreakpoint` | Toggle breakpoint (persisted, see below) |
+| `<leader>dB` | `:UEDAPCondBreakpoint` | Conditional breakpoint (prompt) |
+| `<leader>dL` | `:UEDAPLogpoint` | Logpoint (prompt) |
+| `<leader>dC` | `:UEDAPClearBreakpoints` | Clear all breakpoints |
 
-**Note (Neovide 0.16+)**: F11 is bound to fullscreen by default. If
-`<F11>` toggles fullscreen instead of stepping in, set
-`vim.g.neovide_fullscreen = false` in your config or rebind StepIn
-elsewhere.
+**Persistent breakpoints**: `F9` / `<leader>db` write to
+`<engine_root>/.cache/nvim-ue/breakpoints/<project>.json`, survive nvim
+restarts, and lazy-restore on `BufReadPost`. Saves are debounced 250ms.
+Module: `lua/ue/dap/_persist_bp.lua`. In-session, breakpoints are planted live
+via the lldb-dap evaluate channel (no reattach needed).
 
-Quick reference (all lowercase, in order):
-- `Space ub` build → `Space ui` install → `Space da` attach
-- `Space dl` launch debug
-- `Space dc` continue, `Space dp` pause
-- `Space dn` step over, `Space di` step in, `Space do` step out
-- `Space db` breakpoint (persisted), `Space du` DAP UI,
-  `Space dr` REPL, `Space dx` reset
+### Inspect / evaluate / navigate
 
-`:qa` triggers `VimLeavePre`, which flushes any pending bp save and
-then auto-cleans the DAP session.
+| Key | Command | Action |
+|---|---|---|
+| `<leader>de` | `:UEDAPEval` | Evaluate expression (prompt) |
+| `<leader>dh` | `:UEDAPHover` | Hover-eval `<cword>` (visual: selection) |
+| `<leader>dw` | `:UEDAPWatchAdd` | Add `<cword>` / selection to Watches |
+| `<leader>dW` | `:UEDAPWatchUE` | UE-aware watch picker (fname/uobject/actor/tarray/raw) |
+| `<leader>dt` | `:UEDAPRunToCursor` | Run to cursor (ephemeral bp + continue) |
+| `<leader>dk` | `:UEDAPFrameUp` | Stack frame up |
+| `<leader>dj` | `:UEDAPFrameDown` | Stack frame down |
+| `<leader>dR` | `:UEDAPRestartFrame` | Restart current frame |
 
-## DAP — Platform-neutral (newer commands, no key by default)
+### UI / tabs
 
-Source: `lua/ue.lua` `UEDAP*` user commands (since 2026-05 multi-platform
-foundation). Use these in scripts or bind your own keys when working on
-Win64 / macOS / Linux / iOS rather than Android.
+| Key | Command | Action |
+|---|---|---|
+| `<leader>du` | `:UEDAPToggleUI` | Toggle DAP UI |
+| `<leader>dr` | `:UEDAPREPL` | Toggle REPL |
+| `<leader>dx` | `:UEResetLayout` | Reset DAP layout |
+| `<leader>d1` | `:UEDAPTab repl` | Focus REPL tab |
+| `<leader>d2` | `:UEDAPTab console` | Focus Console tab |
+| `<leader>d3` | `:UEDAPTab breakpoints` | Focus Breakpoints tab |
+| `<leader>d4` | `:UEDAPTab logcat` | Focus Logcat tab |
+| `<leader>d]` / `<leader>d[` | `:UEDAPNextTab` / `:UEDAPPrevTab` | Cycle DAP tabs |
 
-| Command                       | Action                          |
-|-------------------------------|---------------------------------|
-| `:UEDAPAttach`                | Attach (platform-aware)         |
-| `:UEDAPLaunch`                | Launch debug (platform-aware)   |
-| `:UEDAPContinue`              | Continue                        |
-| `:UEDAPPause`                 | Pause                           |
-| `:UEDAPToggleBreakpoint`      | Toggle breakpoint               |
-| `:UEDAPStepOver`              | Step over                       |
-| `:UEDAPStepIn`                | Step in                         |
-| `:UEDAPStepOut`               | Step out                        |
-| `:UEDAPToggleUI`              | Toggle DAP UI                   |
-| `:UEDAPREPL`                  | Toggle REPL                     |
-| `:UEDAPDiag`                  | Dump DAP diagnostics            |
+Other commands (no default key): `:UEDAPStatus`, `:UEDAPDiag`,
+`:UEDAPHover`, `:UEDAPListBreakpoints`, `:UEDAPReattach`, `:UEDAPRestartFrame`.
 
-The Android `<leader>d*` keys above will eventually migrate to call
-the platform-neutral `UEDAP*` commands. Until then, they remain
-hardcoded to `UEAndroidDAP*`.
+**Note (Neovide 0.16+)**: F11 defaults to fullscreen. If `F11` toggles
+fullscreen instead of stepping in, set `vim.g.neovide_fullscreen = false`.
+
+`:qa` triggers `VimLeavePre`, which flushes any pending breakpoint save and
+auto-cleans the DAP session.
 
 ---
 
-## Logs & Workarounds
+## 📝 Logs & Workarounds
 
 | Command                        | Action                                                                 |
 |--------------------------------|------------------------------------------------------------------------|

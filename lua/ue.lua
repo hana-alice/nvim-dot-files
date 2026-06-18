@@ -6346,16 +6346,15 @@ function M.cached_grep(opts)
         word  = { icon = "W", value = true },
         case  = { icon = "C", value = true },
       },
-      -- Keymaps: Alt-g/x/w/c = mode toggles. NB: Alt+R is GLOBALLY hooked
-      -- by NVIDIA App / GeForce Experience for Performance Overlay (system-
-      -- level hotkey, nvim never sees the keypress). Don't waste time on
-      -- <a-r> on this machine. <a-g> = "grep regex" mnemonic, no conflict
-      -- (snacks default <C-g> = toggle_live, distinct key).
-      -- <a-w> covers user intuition "w = word" (snacks default cycle_win
-      -- overridden); <a-x> alternate for word (consistency with
-      -- <leader>sx cheatsheet entry). <a-c> = case.
+      -- Keymaps: Alt-r/g/x/w/c = mode toggles, shown live as R/W/C icons in
+      -- the picker title. <a-r> is the intuitive "regex" toggle (matches
+      -- snacks' own default); <a-g> = "grep regex" mnemonic alias. Both flip
+      -- the same regex flag. <a-w>/<a-x> = whole-word, <a-c> = case-sensitive.
+      -- NOTE: <a-r> previously collided with NVIDIA App's global Performance
+      -- Overlay hotkey; if it ever stops reaching nvim again, use <a-g>.
       win = vim.tbl_deep_extend("force", grouping_enabled and fast_tab_keys.win or {}, {
         input = { keys = {
+          ["<a-r>"] = { "ue_grep_toggle_regex", mode = { "i", "n" } },
           ["<a-g>"] = { "ue_grep_toggle_regex", mode = { "i", "n" } },
           ["<a-x>"] = { "ue_grep_toggle_word",  mode = { "i", "n" } },
           ["<a-w>"] = { "ue_grep_toggle_word",  mode = { "i", "n" } },

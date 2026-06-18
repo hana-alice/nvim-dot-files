@@ -53,7 +53,46 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
-### 2026-06-17 — csearch freshness 改用内容指纹，退役所有 mtime 代理 anchor（D10 / L2）
+### 2026-06-18 — Apprentice 主题（同步 Warp）+ grep 切换键 + cheatsheet 配色/扩充
+
+**Task** — 用户要求：cheatsheet 配色难看且快捷键太少（尤其 `<leader>/` 里全字/大小写/正则怎么切）；把当前 Warp 终端主题 Apprentice 同步成 nvim colorscheme。
+
+**Implemented**
+- `colors/apprentice.lua`（新）：把 Warp 的 `apprentice.yaml`（romainl/Apprentice）移植为完整 nvim colorscheme——editor chrome + 语法 + treesitter/LSP 语义 + 诊断 + diff + gitsigns + bufferline + 16 色终端色（终端 16 色逐字照搬 yaml）。**语法组（Constant/String/Identifier/Function/Statement/Type/PreProc/Special 等）逐色对齐上游官方 `colors/apprentice.vim`**，非自创映射。
+- `lua/theme.lua`：LABELS 注册 `apprentice = "Apprentice"`，可 `:Theme apprentice` / ThemePicker 切换并持久化。
+- `lua/ue.lua`：grep picker（cached_grep）加回 `<a-r>` 正则切换（NVIDIA Overlay 关闭后 Alt 可达），与既有 `<a-g>`(regex 别名)/`<a-w>`/`<a-x>`(whole-word)/`<a-c>`(case) 并列；切换实时重跑 rg + 标题 R/W/C 图标 + 提示。
+- `lua/utils/cheatsheet.lua`：配色改为 Apprentice 调色板（cyan 单强调 + 灰阶，去 8 色彩虹）；扩充键位（Code/LSP actions、picker `<C-s>/<C-v>/<C-t>`、live-grep `-- -w/-s` 与 `<a-*>` 切换、UE Index/Diagnostics 等）。
+- `docs/ue_lazyvim_cheatsheet.md`：新增「Refining a live grep」节，讲清 `pattern -- -w -s` inline flag + `<leader>sx/sX` 启动键 + `<a-r/w/c>` 切换三种方式；补 picker 内 split/tab 键。
+- `tests/cases/cheatsheet_spec.lua`：防漂移锚点加入搜索精修键（sx/sX/sw/sy/`-- -w`/`-- -s`）。
+
+**Pitfalls / Gotchas**
+- 主题第一版语法配色是自创角色映射（类型→cyan 等），与作者意图不符，看起来「不像」。改为抓 romainl/Apprentice 官方 `.vim` 的八个核心组原值（Constant #ff8700 / Statement #87afd7 / Type #8787af …）逐色对齐，treesitter/LSP 组对齐到对应 legacy 组。
+- `<a-r>` 历史上被 NVIDIA App 性能 Overlay 全局热键吞掉；用户关闭该 Overlay 后恢复，保留 `<a-g>` 作为兜底别名。
+
+**Validation**
+- `colorscheme apprentice` headless 加载，核心语法组色值与上游一致（Normal/Constant/String/Identifier/Function/Statement/Type/PreProc/Special 全部命中）。
+- 全量 `nvim --headless -l tests/run.lua` → 521/521。
+
+
+
+**Task** — 用户反馈 README 过期、条理混杂、缺 AI 适配说明；cheatsheet 命令过期（codelldb/UEAndroidDAP 旧路线）需更新扩充并纳入回归；样式更新。
+
+**Implemented**
+- `README.md` 重构为主流大项目骨架（features → platform → requirements → install → usage → docs），正式文风、Windows-only 显式声明、把「平台编译一次」列为 `:UEPrepare` 前的必需步骤；benchmark 用表+ASCII 图，头条改为 **super-unity 索引**（11,593 TU 折叠成 ~23，几小时→~3 分钟，NTFS）；新增「Built for long-term AI-assisted development」段（agent 启动流程图 + 硬数据表 19/39/9/21/14/12 + 四知识区 + DoD）。中文版拆到 `docs/README.zh-CN.md`（中英分文件、互相切换）。
+- `docs/ue_lazyvim_cheatsheet.md`：DAP 段整段重写——删 codelldb 1.12.2 / `:UEAndroidDAP*` 旧路线，统一到 `:UEDAP*`；补全 `<leader>d1-d4`（DAP tab）、`d]`/`d[`、`dW`/`de`/`dh`/`dw`/`dt`/`dk`/`dj`/`dR`；补 `:UEPrepareIncremental`、`:UEDefCacheClear`；首跑流程改为 SetProject→SetPlatform→Build→Prepare；去 which-key 措辞；二级标题加 emoji + 顶部目录导航。
+- `lua/utils/cheatsheet.lua`：UE/DAP 两个 float tab 内容与 markdown 对齐（Setup&Prepare / Run·Logs / First-run；Session / Breakpoints / Inspect / UI·Tabs）；**样式更新**——highlight 改为 Catppuccin Mocha 命名调色板、key↔desc 用点线连接、footer 文案更新。
+- `tests/cases/cheatsheet_spec.lua`（新，粒度＝命令真实性 + 双 surface 一致）：扫 float `M.tabs` 与 markdown 的 `:UE*` 命令引用，比对 `commands_spec` 的 UE_COMMANDS 冻结清单（+UEDef* exists 校验）抓死链/过期；校验 float 关键 DAP/UE 键位在 markdown 必含（防漂移）；断言 markdown 不再以命令形式引用 `:UEAndroidDAP`。
+- `tests/CLAUDE.md`：CHANGE-TO-FILTER MAP 新增 `cheatsheet` 行。
+
+**Pitfalls / Gotchas**
+- 命令真实性校验最初用 `vim.fn.exists(":Cmd")` 扫所有前缀（Theme/NvimLog/Markdown），但这些是 lazy-loaded，headless 下未加载 + 前缀歧义（`:UE` 返回 3=ambiguous）→ 大量误报。收敛为只校验 UE*（有 commands_spec 权威冻结清单，确定性强），并对正则加 `*` 边界排除 `:UEDAP*` 通配写法。
+
+**Validation**
+- `nvim --headless -l tests/run.lua cheatsheet` → 91/91。
+- `nvim --headless -l tests/run.lua structure` → 36/36（README 内链）。
+- 全量 `nvim --headless -l tests/run.lua` → 507/507。
+
+
 
 **Task** — `:UEPrepare` 完成后（尤其重新编译后）`<space><space>` 仍反复弹 stale。OpenSpec change `csearch-freshness-content-fingerprint`（proposal+design 先行 validate）。
 

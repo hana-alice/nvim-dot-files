@@ -5,32 +5,38 @@ local api = vim.api
 local fn = vim.fn
 
 -- ══════════════════════════════════════════════════════════════════════
--- HIGHLIGHT GROUPS
+-- HIGHLIGHT GROUPS  (synced from the active Warp terminal theme: Apprentice)
 -- ══════════════════════════════════════════════════════════════════════
-local hl_groups = {
-  CheatTitle     = { fg = "#1e1e2e", bg = "#89b4fa", bold = true },
-  CheatTabActive = { fg = "#1e1e2e", bg = "#a6e3a1", bold = true },
-  CheatTabInact  = { fg = "#bac2de", bg = "#313244" },
-  CheatSection   = { fg = "#1e1e2e", bg = "#45475a" },
-  CheatKey       = { fg = "#f38ba8", bg = "#313244", bold = true },
-  CheatDesc      = { fg = "#cdd6f4", bg = "#313244" },
-  CheatHead1     = { fg = "#1e1e2e", bg = "#f38ba8", bold = true },
-  CheatHead2     = { fg = "#1e1e2e", bg = "#fab387", bold = true },
-  CheatHead3     = { fg = "#1e1e2e", bg = "#a6e3a1", bold = true },
-  CheatHead4     = { fg = "#1e1e2e", bg = "#89b4fa", bold = true },
-  CheatHead5     = { fg = "#1e1e2e", bg = "#cba6f7", bold = true },
-  CheatHead6     = { fg = "#1e1e2e", bg = "#f9e2af", bold = true },
-  CheatHead7     = { fg = "#1e1e2e", bg = "#94e2d5", bold = true },
-  CheatHead8     = { fg = "#1e1e2e", bg = "#74c7ec", bold = true },
-  CheatBg        = { bg = "#1e1e2e" },
-  CheatBorder    = { fg = "#585b70" },
-  CheatAscii     = { fg = "#89b4fa", bold = true },
-  CheatFooter    = { fg = "#6c7086", italic = true },
+-- Palette mirrors ~/AppData/Roaming/warp/Warp/data/themes/apprentice.yaml
+-- (Apprentice — a dark, low-contrast theme by Romain Lafourcade). One accent
+-- (cyan #5fafaf) carries hierarchy; section titles are a left bar + accent
+-- text on the card bg, not a full-width filled colour block.
+local C = {
+  base    = "#1c1c1c",  -- window bg (Apprentice normal black)
+  surface = "#262626",  -- card bg (Apprentice background)
+  overlay = "#444444",  -- separators / dots / inactive (bright black)
+  text    = "#bcbcbc",  -- primary fg (Apprentice foreground)
+  subtext = "#8a8a8a",  -- secondary fg
+  muted   = "#6c6c6c",  -- footer / hints (normal white)
+  accent  = "#5fafaf",  -- the single accent: cyan (Apprentice accent)
+  accent2 = "#87af87",  -- green, for the active tab only
+  key     = "#8fafd7",  -- bright blue — calm, readable on dark
 }
 
-local heading_hls = {
-  "CheatHead1", "CheatHead2", "CheatHead3", "CheatHead4",
-  "CheatHead5", "CheatHead6", "CheatHead7", "CheatHead8",
+local hl_groups = {
+  CheatTitle     = { fg = C.accent, bg = C.base, bold = true },
+  CheatTabActive = { fg = C.base, bg = C.accent2, bold = true },
+  CheatTabInact  = { fg = C.subtext, bg = C.overlay },
+  CheatSection   = { bg = C.surface },              -- card body
+  CheatSecTitle  = { fg = C.accent, bg = C.surface, bold = true },  -- title text
+  CheatSecBar    = { fg = C.accent, bg = C.surface },               -- left │ bar
+  CheatKey       = { fg = C.key, bg = C.surface },  -- bright blue, no bold-red
+  CheatDesc      = { fg = C.text, bg = C.surface },
+  CheatDot       = { fg = C.overlay, bg = C.surface },  -- leader dots
+  CheatBg        = { bg = C.base },
+  CheatBorder    = { fg = C.overlay, bg = C.base },
+  CheatAscii     = { fg = C.accent, bg = C.base, bold = true },
+  CheatFooter    = { fg = C.muted, bg = C.base, italic = true },
 }
 
 local function setup_highlights()
@@ -55,8 +61,9 @@ local tabs = {
         title = "Conventions",
         mappings = {
           { "Built-in wins",   "Dup w/ LazyVim → drop ours" },
-          { "No mixed case",   "Avoid <ldr>X+ 2-letter combos" },
-          { "u prefix shared", "UI toggles + UE runtime" },
+          { "Prefix groups",   "b buf c code d dap f file g git" },
+          { "  …more",         "s search t term u UI/UE v sidebar x trouble w win" },
+          { "u prefix shared", "UI toggles + UE runtime (nowait)" },
           { "<C-/>",           "THE terminal toggle" },
           { "<leader>?",       "This cheatsheet" },
           { "<leader>sk",      "Discover any keymap" },
@@ -65,14 +72,27 @@ local tabs = {
       {
         title = "Start Here",
         mappings = {
-          { "<leader>",         "Open which-key" },
-          { "<leader>sk",       "Search keymaps" },
+          { "<leader>sk",       "Search keymaps (best discovery)" },
           { "<leader>sh",       "Search help" },
           { "<leader><space>",  "Find files" },
-          { "<leader>/",        "Grep project" },
+          { "<leader>/",        "Grep project (Engine+Project)" },
           { "gd / gr",          "Definition / References" },
           { "u / <C-r>",        "Undo / Redo" },
           { ".",                "Repeat last change" },
+          { "<C-o> / <C-i>",    "Jump back / forward" },
+        },
+      },
+      {
+        title = "Code / LSP actions",
+        mappings = {
+          { "K / gK",         "Hover docs / signature help" },
+          { "<leader>ca",     "Code action" },
+          { "<leader>cr",     "Rename symbol" },
+          { "<leader>cf",     "Format buffer / selection" },
+          { "<leader>cd",     "Line diagnostics" },
+          { "<leader>cl",     "LSP info" },
+          { "<leader>ch",     "Switch source / header (clangd)" },
+          { "<leader>gP",     "Switch instant → precise def" },
         },
       },
       {
@@ -197,22 +217,26 @@ local tabs = {
         title = "Picker / Grep",
         mappings = {
           { "<leader><space>",  "Find workspace files" },
-          { "<leader>fe",       "File tree (project)" },
-          { "<leader>ff / fF",  "Project / workspace files" },
+          { "<leader>fe",       "File tree (snacks explorer)" },
+          { "<leader>e",        "Yazi (current file)" },
+          { "<leader>ff / fF",  "Project / workspace code files" },
+          { "<leader>fa",       "Project code files (C++/shader)" },
           { "<leader>fg",       "Git files (UE-aware)" },
+          { "<leader>fC",       "Clear file picker history" },
           { "<leader>,",        "Buffers" },
           { "<leader>;",        "All commands" },
           { "<leader>:",        "Command history" },
           { "<leader>fr / fR",  "Recent files" },
-          { "<leader>/",        "Grep project" },
+          { "<leader>/",        "Grep all code (engine+project)" },
           { "<leader>sg / sG",  "Grep workspace code / all" },
-          { "<leader>sw / sW",  "Search current word" },
-          { "<leader>sy / sY",  "Live grep with prefill" },
+          { "<leader>sw / sW",  "Search current word / WORD" },
+          { "<leader>sy / sY",  "Live grep word prefilled (root/cwd)" },
           { "<leader>sx / sX",  "Whole-word / case-sensitive" },
+          { "<leader>sH / sC",  "Grep history / clear history" },
           { "<leader>sR",       "Resume last picker (any kind)" },
-          { "<leader>s/",       "Resume last grep (after <C-q> pin too)" },
-          { "<leader>sk",       "Keymaps" },
-          { "<leader>sh",       "Help tags" },
+          { "<leader>s/",       "Resume last grep (after <C-q> too)" },
+          { "<leader>sk / sh",  "Keymaps / help tags" },
+          { "<leader>sm",       "Marks" },
         },
       },
       {
@@ -220,10 +244,24 @@ local tabs = {
         mappings = {
           { ":s/old/new/g",     "Replace in line" },
           { ":%s/old/new/gc",   "Replace all + confirm" },
-          { "<leader>sr",       "Cross-file search/replace" },
+          { ":%s/\\<w\\>/x/gc",  "Replace exact word" },
+          { "<leader>sr",       "Replace word in buffer (n) / selection (v)" },
           { "<C-q>",            "Picker → quickfix" },
           { "<C-Space>",        "Multi-select in picker" },
           { "<leader>s/",       "Resume grep after <C-q> pin" },
+        },
+      },
+      {
+        title = "Live grep: whole-word / case / regex",
+        mappings = {
+          { "<leader>sx",       "Launch whole-word grep (--word-regexp)" },
+          { "<leader>sX",       "Launch case-sensitive grep" },
+          { "pat -- -w",        "In grep box: whole-word (after --)" },
+          { "pat -- -s",        "In grep box: case-sensitive" },
+          { "pat -- -w -s",     "Whole-word AND case-sensitive" },
+          { "pat -- -F",        "Fixed-string (literal, no regex)" },
+          { "pat -- -g '*.cpp'","Restrict to a glob" },
+          { "(rg is regex)",    "F.*Bar works; escape \\( \\| as needed" },
         },
       },
       {
@@ -233,9 +271,12 @@ local tabs = {
           { "<C-Space>",        "Multi-select toggle" },
           { "<C-j> / <C-k>",    "Down / up" },
           { "<C-d> / <C-u>",    "Half page down / up" },
+          { "<C-f> / <C-b>",    "Preview scroll down / up" },
           { "<C-p> / <C-n>",    "Prev / next history" },
+          { "<C-s> / <C-v>",    "Open in split / vsplit" },
+          { "<C-t>",            "Open in new tab" },
           { "<C-/>",            "Toggle picker help" },
-          { "<Tab>",            "Focus list ↔ input" },
+          { "<Tab> / <S-Tab>",  "Focus list ↔ input" },
           { "<CR> / q / <Esc>", "Confirm / close" },
         },
       },
@@ -468,37 +509,49 @@ local tabs = {
     name = "UE",
     sections = {
       {
-        title = "UE Workflow",
+        title = "Setup & Prepare",
         mappings = {
-          { "<leader>uB",    "UEPrepare (index + cc)" },
-          { "<leader>uc",    "Export compile_commands" },
-          { "<leader>uP",    "Set project .uproject" },
+          { "<leader>uP",    "UESetProject (project + engine)" },
           { ":UESetPlatform","Select platform + config" },
+          { "<leader>ub",    "UEBuild (build current platform)" },
+          { "<leader>uB",    "UEPrepare (CDB + index + clangd)" },
+          { ":UEPrepareIncremental", "Prepare dirty files only" },
+          { "<leader>uc",    "Export compile_commands" },
           { "<leader>up",    "Show UE paths" },
-          { ":UEClearCache", "Clear UE + clangd caches" },
-          { ":UEClearCache!","+ rm cc + restart clangd" },
-          { ":UECheatsheetEdit", "Edit cheatsheet markdown" },
-          { "<leader>?",     "Open this cheatsheet" },
         },
       },
       {
-        title = "Build / Run",
+        title = "Run / Logs",
         mappings = {
-          { "<leader>ub",   "Build (platform from :UESetPlatform)" },
-          { "<leader>ui",   "Install APK" },
+          { "<leader>ui",   "Install APK to device" },
           { "<leader>ul",   "Launch app (no debug)" },
-          { "<leader>ug",   "Toggle app log" },
-          { "<leader>uL",   "Toggle app log (alias)" },
+          { "<leader>ug/uL","Toggle app log" },
           { "<leader>uD",   "Toggle Win debug log" },
           { "<leader>uo/uO","Module find file / grep" },
+          { ":UEClearCache","Clear UE + clangd caches" },
         },
       },
       {
-        title = "Typical Flow",
+        title = "Index / Diagnostics",
         mappings = {
-          { "1. :UESetPlatform",          "Win64 Dev Editor" },
-          { "2. :UEExportCompileCommands","ccjson + clangd" },
-          { "3. gd / gr",                 "Start working" },
+          { ":UEIndexStatus",   "Index state" },
+          { ":UEIndexTimings",  "Per-stage timings" },
+          { ":UEDirtyStatus",   "Files awaiting reindex" },
+          { ":UEWatchStatus",   "File watcher state" },
+          { ":UEGrepDiagDump",  "Grep diagnostics" },
+          { ":UEDefStatus",     "goto-def fallback state" },
+          { ":UECDBStatus",     "compile_commands status" },
+          { ":UEPaths",         "Show resolved UE paths" },
+        },
+      },
+      {
+        title = "First-run Flow",
+        mappings = {
+          { "1 :UESetProject",  "Bind project + engine" },
+          { "2 :UESetPlatform", "Win64 Dev Editor" },
+          { "3 <leader>ub",     "Build once (required)" },
+          { "4 <leader>uB",     "UEPrepare → index" },
+          { "5 gd / gr",        "Start working" },
         },
       },
     },
@@ -508,59 +561,47 @@ local tabs = {
     name = "DAP",
     sections = {
       {
-        title = "Android DAP",
+        title = "Session",
         mappings = {
-          { "<leader>da",   "Attach to Android" },
+          { "<leader>da",   "Attach (UEDAPAttach android)" },
           { "<leader>dl",   "Launch + auto attach" },
-          { "<leader>db",   "Toggle breakpoint" },
-          { "<leader>dB",   "Conditional breakpoint" },
-          { "<leader>dL",   "Logpoint" },
-          { "<leader>dC",   "Clear all breakpoints" },
-          { "<leader>dc",   "Continue" },
-          { "<leader>dp",   "Pause" },
-          { "<leader>dn",   "Step over" },
-          { "<leader>di",   "Step in" },
-          { "<leader>do",   "Step out" },
+          { "<leader>dc / F5", "Continue" },
+          { "<leader>dp / F6", "Pause" },
+          { "<leader>dn / F10","Step over" },
+          { "<leader>di / F11","Step in" },
+          { "<leader>do / S-F11","Step out" },
         },
       },
       {
-        title = "DAP Inspect / Navigate",
+        title = "Breakpoints",
         mappings = {
-          { "<leader>dh",   "Hover eval (cword / selection)" },
+          { "<leader>db / F9", "Toggle breakpoint (persisted)" },
+          { "<leader>dB",   "Conditional breakpoint" },
+          { "<leader>dL",   "Logpoint" },
+          { "<leader>dC",   "Clear all breakpoints" },
+        },
+      },
+      {
+        title = "Inspect / Navigate",
+        mappings = {
           { "<leader>de",   "Evaluate expression (prompt)" },
+          { "<leader>dh",   "Hover eval (cword / selection)" },
           { "<leader>dw",   "Add cword / selection to Watches" },
-          { "<leader>dW",   "UE-aware watch picker (fname/uobject/actor/tarray)" },
-          { ":UEDAPWatchUE", "fname|uobject|actor|tarray|raw <expr>" },
+          { "<leader>dW",   "UE-aware watch picker" },
           { "<leader>dt",   "Run to cursor" },
-          { "<leader>dk",   "Stack frame up" },
-          { "<leader>dj",   "Stack frame down" },
+          { "<leader>dk/dj","Stack frame up / down" },
           { "<leader>dR",   "Restart current frame" },
         },
       },
       {
-        title = "DAP UI",
+        title = "UI / Tabs",
         mappings = {
           { "<leader>du",   "Toggle DAP UI" },
           { "<leader>dr",   "Toggle REPL" },
           { "<leader>dx",   "Reset layout" },
-          { "F9",           "Toggle breakpoint" },
-          { "F5",           "Continue" },
-          { "F6",           "Pause" },
-          { "F10",          "Step over" },
+          { "<leader>d1-d4","REPL / console / bp / logcat" },
+          { "<leader>d] d[","Next / prev DAP tab" },
           { ":qa",          "Auto DAP cleanup" },
-        },
-      },
-      {
-        title = "Quick Reference",
-        mappings = {
-          { "Space da",  "Attach" },
-          { "Space dl",  "Launch debug" },
-          { "Space db",  "Breakpoint" },
-          { "Space dc",  "Continue" },
-          { "Space dn",  "Step over" },
-          { "Space di",  "Step in" },
-          { "Space do",  "Step out" },
-          { "Space du",  "DAP UI" },
         },
       },
     },
@@ -641,7 +682,7 @@ local function render(tab_idx)
   -- ── Distribute sections into columns ──
   local cards = {}
   for si, sec in ipairs(tab.sections) do
-    local card = { title = sec.title, items = sec.mappings, hl_idx = ((si - 1) % #heading_hls) + 1 }
+    local card = { title = sec.title, items = sec.mappings }
     card.height = 1 + #sec.mappings + 1
     table.insert(cards, card)
   end
@@ -720,19 +761,19 @@ local function render(tab_idx)
     local col_start = pad_left + (ci - 1) * col_w
 
     for _, card in ipairs(columns[ci]) do
-      -- Section heading
-      local title = " " .. card.title .. " "
+      -- Section heading: left accent bar + accent-coloured title on the card
+      -- background (no full-width filled colour block). One accent for all
+      -- sections — hierarchy comes from the bar + weight, not from hue.
+      local title = card.title
       local title_w = fn.strdisplaywidth(title)
-      local title_pad_l = math.floor((col_w - title_w) / 2)
-      local title_pad_r = col_w - title_w - title_pad_l
-      local heading_hl = heading_hls[card.hl_idx]
+      local fill = math.max(0, col_w - 3 - title_w)  -- 3 = "▏ " prefix + trailing space
 
       if r < total_lines then
         api.nvim_buf_set_extmark(buf, ns, r, col_start, {
           virt_text = {
-            { string.rep(" ", title_pad_l), "CheatSection" },
-            { title, heading_hl },
-            { string.rep(" ", title_pad_r), "CheatSection" },
+            { "▏ ", "CheatSecBar" },
+            { title, "CheatSecTitle" },
+            { string.rep(" ", fill), "CheatSection" },
           },
           virt_text_pos = "overlay",
         })
@@ -744,14 +785,14 @@ local function render(tab_idx)
         if r >= total_lines then break end
         local key_str = m[1]
         local desc_str = m[2]
-        local gap = col_w - 4 - fn.strdisplaywidth(key_str) - fn.strdisplaywidth(desc_str)
+        local gap = col_w - 6 - fn.strdisplaywidth(key_str) - fn.strdisplaywidth(desc_str)
         if gap < 1 then gap = 1 end
 
         api.nvim_buf_set_extmark(buf, ns, r, col_start, {
           virt_text = {
             { "  ", "CheatSection" },
             { key_str, "CheatKey" },
-            { string.rep(" ", gap), "CheatSection" },
+            { " " .. string.rep("·", math.max(0, gap - 2)) .. " ", "CheatDot" },
             { desc_str, "CheatDesc" },
             { "  ", "CheatSection" },
           },
@@ -766,7 +807,7 @@ local function render(tab_idx)
   end
 
   -- ── Footer ──
-  local footer = " <Tab>/1-9 切换分类  q/<Esc> 关闭  / 搜索 "
+  local footer = " <Tab>/<S-Tab> 切换分类   1-9 跳转   j/k 滚动   q/<Esc> 关闭 "
   local footer_row = total_lines - 1
   if footer_row > 0 then
     local fpad = math.max(0, math.floor((win_w - fn.strdisplaywidth(footer)) / 2))

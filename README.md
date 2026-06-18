@@ -1,261 +1,263 @@
 # hana-alice's Neovim — Unreal Engine Edition
 
-A LazyVim-based Neovim configuration tuned for a very specific niche:
-**editing huge Unreal Engine C++ projects on Windows**, where stock clangd
-takes minutes to wake up and a careless `:e` can stall the UI for seconds.
+> A LazyVim-based Neovim configuration for editing massive Unreal Engine 5 C++
+> projects on Windows — and engineered for long-term AI-assisted development.
 
-It's also a general-purpose editor that happens to know about UE.
+**English** · [中文 / Chinese](docs/README.zh-CN.md)
 
-```
-  100+ commits          45 lua modules        6.6k-line UE engine
-  1 PCH precompiler     1 CDB pruner          1 jumplist contract
-  1 workaround registry 1 Windows installer   0 tolerance for UI stalls
-```
+## Features
 
-> **New here?** The full module-by-module audit of what we add on top of
-> upstream LazyVim — defaults, overrides, why, where — lives in
-> [`docs/architecture-vs-lazyvim.md`](docs/architecture-vs-lazyvim.md).
+- **Super-unity indexing** — collapses 11,593 translation units into ~23
+  aggregator TUs, cutting a full cold index from **hours to ~3 minutes** on
+  Windows/NTFS while keeping ≥90% of symbols.
+- **Sub-100ms goto-definition** on UE-scale projects, via a 5-tier resolver
+  (treesitter → cache → clangd → csearch → gtags).
+- **Sub-second project grep** using a trigram index over the project file list
+  (`FRDGBuilder`: ~365ms versus ~14s for an NTFS tree walk).
+- **CDB super-pipeline** that expands, PCH-prebuilds and prunes
+  `compile_commands.json` (60–90% of `-I` flags removed) so clangd parses less.
+- **Multi-platform DAP** debugging for Win64 and Android (headless attach), with
+  per-project breakpoint persistence.
+- **File-based knowledge base** for AI agents: per-directory rules, a SESSION
+  START protocol, and a regression-gated Definition of Done.
 
----
+The editor remains general-purpose; UE features no-op when no UE project is present.
 
-## What's actually in here
+## Benchmarks
 
-### 1. UE C++ workflow (`lua/ue.lua`, `lua/ue/`, `lua/plugins/ue.lua`)
+Measured on UEProj: **11,593 `.cpp` files**, 757 `-D` macros per CDB entry,
+on Windows/NTFS — where directory recursion and per-TU indexing are the real
+bottlenecks.
 
-A 6,657-line monolithic engine that owns everything UE-specific:
+### Super-unity indexing — the headline
 
-- clangd discovery and launch, with project-aware flags
-- compile_commands.json lifecycle: slim → PCH-rewrite → unify-includes
-  → prune-unused-dirs (60–90% of `-I` removed, preamble parse 60s → 20s)
-- background indexer with idle/cold/hot debounce so it never thrashes
-  while you're typing
-- DAP setup for Win64 / Android (codelldb), build commands, log tailing,
-  Editor launch helpers, sidebar integration
-
-Public API is exposed on `M.*` so it's testable in headless nvim.
-
-### 2. Instant goto-definition (`lua/utils/ue_goto/`)
-
-A tier-2 split of what used to be one god module. Architecture:
+A naive one-index-per-TU cold build of a UE project runs for **hours**. The
+super-unity pipeline collapses the 11,593 translation units into **~23
+aggregator TUs**, then indexes those — a full cold index in **~3 minutes**,
+keeping ≥90% of symbols.
 
 ```
-ue_goto/
-  jumper.lua     - HARD-contract buffer/cursor switch + jumplist hygiene
-  symbol.lua     - symbol identification at cursor (treesitter-first)
-  location.lua   - precise location resolution + drift correction
-  ranking.lua    - candidate scoring (UE-aware: Engine/Plugins/Project)
-  provider.lua   - LSP / ws-symbol / ctags / fallback fan-out
-  ui.lua         - picker + preview
+Full cold index (11,593 TUs)
+  naive per-TU     ████████████████████████████████████████  hours
+  super-unity      ██▏ ~3 min     (collapses 11,593 TUs → ~23)
 ```
 
-Notable design choices:
-- treesitter pre-LSP early-bail for C++ dependent names — answers in
-  ~5 ms instead of waiting on clangd
-- jumper is a single-responsibility module with a written post-condition
-  contract (one `Ctrl-O` returns to source, exactly one jumplist entry,
-  no spurious `(target_buf, 1, 0)` ghost)
-- no timer-based "drift fixes"; races are synchronized via
-  `BufReadPost` + `BufWinEnter` once-shot autocmds
+### Project-wide grep
 
-### 3. Workaround registry (`lua/workarounds/`)
+A trigram index over the project file list turns NTFS tree-walking into an
+indexed lookup:
 
-Every patch that exists *because of someone else's bug* lives in its own
-file with a frontmatter contract:
+| Pattern | Hits | csearch | ripgrep (NTFS walk) | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| `FRDGBuilder` | 2,491 | **365 ms** | ~14,000 ms | ~38× |
+| `FRHICommandList` | 6,593 | **693 ms** | ~18,000 ms | ~26× |
+| `NaniteRasterPipelines` | 57 | **73 ms** | ~12,000 ms | ~164× |
 
 ```
--- WORKAROUND
--- name: snacks.projects_picker_freeze
--- scope: snacks
--- issue: internal: snacks projects MRU re-stat freezes Neovide
--- introduced: 2026-04-12
--- removal_condition: snacks.nvim ships async MRU
--- enabled: true
--- END WORKAROUND
+FRHICommandList grep (lower is better)
+  csearch  ▏0.7s
+  ripgrep  ████████████████████████████████████████ 18s
 ```
 
-Browse them with `:WorkaroundList`, toggle with `:WorkaroundDisable <name>`.
-When upstream fixes the bug, cleanup is `git rm`, not archaeology.
-See `lua/workarounds/README.md` for the contract.
+## Platform support
 
-### 4. Windows-first ergonomics
+**Windows 10/11 only.** macOS and Linux are not adapted: the configuration loads
+and the base editor works, but the UE subsystems (CDB pipeline, indexing, DAP,
+launchers) are written against the Windows toolchain and are not supported
+elsewhere.
 
-- `lua/utils/platform.lua` — `is_windows` flag threaded through
-  everywhere that touches paths, processes, or file modes
-- `lua/config/neovide.lua` + `lua/config/windows.lua` — Neovide tuning
-  without polluting the main config
-- `:set core.fileMode=false` assumed (this repo lives on NTFS via WSL)
+## Requirements
 
-### 5. Tooling (`tools/`, `scripts/`)
+| Component | Version / Note |
+| --- | --- |
+| OS | Windows 10/11 |
+| Neovim | 0.10+ |
+| Toolchain | clangd/LLVM 22.1.x — pinned; do not use mason auto-install |
+| Android DAP | LLVM 22.1.6+ `lldb-dap` + NDK 27 `lldb-server` |
+| Optional | Go ≥ 1.22, to build the grep index tool |
+| Build prerequisite | A working Unreal Build Tool setup for the target platform |
 
-Standalone Python utilities that don't need Neovim to run:
+Pinned versions are authoritative in
+[`docs/CONSTRAINTS.md` §C1](docs/CONSTRAINTS.md) and
+[`docs/TOOLING.md`](docs/TOOLING.md).
 
-| Tool                          | What it does                                    |
-|-------------------------------|--------------------------------------------------|
-| `prebuild_pch_v2.py`          | Generate `.rsp` + `.bat` to precompile UE PCHs  |
-| `prune_include_dirs.py`       | Drop unused `-I` from CDB (massive preamble win)|
-| `unify_include_dirs.py`       | Deduplicate include dirs across TUs             |
-| `slim_compile_commands.py`    | Strip noise, keep `-include` directives         |
-| `build_clangd_index.py`       | Offline `clangd-indexer` for instant cold-start |
-| `restore_force_includes.py`   | Re-inject `-include X.h` after slim             |
+## Installation
 
-Each is idempotent and skip-writes when the output is unchanged, so you
-can re-run them in a watcher loop without invalidating PCHs or restarting
-clangd.
+```powershell
+git clone https://github.com/hana-alice/nvim-dot-files.git $env:LOCALAPPDATA\nvim
+cd $env:LOCALAPPDATA\nvim
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+.\setup.ps1
+nvim
+```
 
-### 6. One-shot Windows installer (`scripts/install_windows.ps1`)
+`setup.ps1` installs the toolchain, fonts and plugins (run from an Administrator
+PowerShell). Flags: `-SkipFonts`, `-SkipCapslock`, `-SkipPlugins`, `-Force`.
 
-Sets up scoop, installs the entire toolchain (git, neovim, neovide, llvm,
-fd, ripgrep, lazygit, fzf, zoxide, python, nodejs, yazi, gtags, ...),
-points `%LOCALAPPDATA%\nvim` at this repo, and bootstraps lazy.nvim
-headlessly. Re-runnable.
+Optionally build the grep index tool:
 
-### 7. Cheatsheet (`docs/ue_lazyvim_cheatsheet.md`)
+```powershell
+cd tools\cindex-uefilter
+go install ./...   # requires Go >= 1.22 with $GOBIN on PATH
+```
 
-468-line keymap + workflow handbook covering vanilla Vim, LazyVim, and
-the UE/DAP additions. Open in-editor with `:UECheatsheet`.
+Without it, project grep falls back to a slower ripgrep path.
 
-### 8. Sub-second grep on 100k-file UE workspaces (`tools/cindex-uefilter` + `lua/utils/code_search`)
+## Usage
 
-`<leader>/` (the project grep picker) used to walk the directory tree
-on every keystroke — ~14-32s per query on UEProj because NTFS
-recursion is the physical bottleneck and `rg --files-from` doesn't
-exist.
+Open a C++ file inside the UE project, then proceed in order.
 
-`:UEPrepare` now also builds a trigram index using a small Go fork of
-[google/codesearch](https://github.com/google/codesearch). The fork
-adds one flag, `-files-from FILE`, which lets us index exactly the
-clean file list `:UEPrepare` already produces (skipping
-`graphify-out/`, `Intermediate/`, `DerivedDataCache/`, etc. that the
-upstream walker would otherwise vacuum up).
+### 1. Bind the project
 
-Numbers measured on UEProj (~43k files):
+```vim
+:UESetProject
+```
 
-| Pattern                     | Hits | csearch     | rg (walk) |
-| --------------------------- | ---- | ----------- | --------- |
-| `FRDGBuilder`               | 2491 | **365 ms**  | ~14 s     |
-| `FRHICommandList`           | 6593 | **693 ms**  | ~18 s     |
-| `NaniteRasterPipelines`     | 57   | **73 ms**   | ~12 s     |
+Confirms the project root (containing `.uproject`) and the engine root. Both are
+persisted. Use `:UESetUprojectRelativePath` if `.uproject` is not directly under
+the project root.
 
-Build the binary once: `cd tools/cindex-uefilter && go install ./...`
-(Go ≥ 1.22 + a working `$GOBIN` on `$PATH`). The next `:UEPrepare`
-will detect it and produce a `.cache/nvim-ue/csearch.idx` (~70 MB on
-UEProj). When the index is missing, the picker silently falls back to
-the rg-batched path.
+### 2. Select the platform
 
----
+```vim
+:UESetPlatform
+```
+
+Choose `Win64`, `Android`, `Mac`, `IOS` or `Linux`. If unset, the current OS is
+used. Caches are stored per `<Platform>-<Config>`, so switching platforms does
+not invalidate other platforms' caches.
+
+### 3. Build once for the target platform (required)
+
+```
+<leader>ub        " (space u b) → :UEBuild
+```
+
+`:UEPrepare` derives compile flags from a real build of the selected platform.
+**A successful platform build must exist before indexing**; without it there are
+no compile commands to process. Build Android with `:UEBuildAndroid`.
+
+### 4. Build the index
+
+```vim
+:UEPrepare
+```
+
+Runs asynchronously with a progress UI: generates `compile_commands.json`, runs
+the CDB pipeline (expand → PCH → resolve → unify → prune), builds the csearch
+index, and reloads clangd. On completion, goto-definition, project grep and
+clangd are ready.
+
+Variants: `:UEPrepareIncremental` (dirty files only), `:UEPrepareReindex`
+(rebuild the index), `:UEPrepareSync` (blocking).
+
+### Common commands
+
+| Action | Key / Command |
+| --- | --- |
+| Goto definition / references | `gd` / `gr` |
+| Project-wide grep | `<leader>/` |
+| File picker | `<leader><leader>` |
+| Build (current platform) | `<leader>ub` / `:UEBuild` |
+| Launch the Editor | `:UELaunch` |
+| Re-index after adding/removing files | `:UEPrepareIncremental` |
+| Android: install / attach / breakpoint | `:UEInstallAndroid` / `:UEDAPAttach` / `F9` |
+| All commands cheatsheet | `<leader>?` / `:UECheatsheet` |
+
+Full keymap and workflow handbook:
+[`docs/ue_lazyvim_cheatsheet.md`](docs/ue_lazyvim_cheatsheet.md).
+
+## Built for long-term AI-assisted development
+
+This repository is engineered so an AI agent can join, understand the codebase,
+and make safe changes **from files alone** — without relying on chat history.
+The premise: durable AI participation depends on a clear engineering system, not
+on a stronger model.
+
+```
+A new agent context boots like this:
+
+  root CLAUDE.md  (auto-injected)
+        │  SESSION START protocol
+        ▼
+  docs/CONSTRAINTS.md ──► forbidden / pitfalls / load-bearing constraints
+        │
+        ▼
+  memory/project_overview.md ──► subsystems + "read this first" map
+        │
+        ▼
+  <current dir>/CLAUDE.md ──► local subsystem rules (falls back to nearest ancestor)
+```
+
+What makes it AI-durable, by the numbers:
+
+| Mechanism | Count | Purpose |
+| --- | ---: | --- |
+| Per-directory `CLAUDE.md` rules | 19 | Local subsystem rules; children write deltas only |
+| Recorded pitfalls (`K1…`) | 39 | Every debugged trap kept with symptom → fix → source |
+| Isolated workaround files | 9 | Each upstream-bug patch carries a frontmatter contract |
+| Headless regression specs | 21 | Behaviour locked so refactors and migrations stay safe |
+| OpenSpec specs / archived changes | 14 / 12 | Decisions and changes are spec-driven and traceable |
+
+Four knowledge zones, each with a fixed entry point:
+
+| Zone | Entry | Holds |
+| --- | --- | --- |
+| `memory/` | [`project_overview.md`](memory/project_overview.md) | Stable project knowledge, navigation |
+| `decisions/` | [`README.md`](decisions/README.md) | Architecture decision records (ADR) |
+| `lessons/` | [`README.md`](lessons/README.md) | Platform quirks, hard-won debugging knowledge |
+| `docs/architecture/` | [`overview.md`](docs/architecture/overview.md) | Subsystems, data flow, ownership boundaries |
+
+Every change is gated by a **Definition of Done** (run scoped regression, append
+a changelog entry, follow the milestone policy on version wrap). Discoverability
+itself is regression-tested: `structure_spec` fails if a directory rule, a
+knowledge-base file, or an internal link goes missing. The full agent contract
+is in [`CLAUDE.md`](CLAUDE.md).
 
 ## Layout
 
 ```
-.
-├── init.lua                    LazyVim entrypoint
-├── lua/
-│   ├── config/                 keymaps, options, autocmds, lazy bootstrap
-│   ├── plugins/                per-plugin setup (snacks, treesitter, dap, ...)
-│   ├── ue.lua                  UE engine (6.6k lines, single module)
-│   ├── ue/                     UE submodules (DAP)
-│   ├── utils/
-│   │   ├── ue_goto/            instant goto-def architecture
-│   │   ├── code_search/        sub-second grep via csearch + cindex-uefilter
-│   │   ├── lsp_fallback.lua    fall-through gd resolver
-│   │   ├── recent_projects.lua MRU without re-statting NTFS
-│   │   ├── platform.lua        is_windows / is_mac / is_linux flags
-│   │   └── ...
-│   ├── workarounds/            isolated quirk patches + registry
-│   ├── nio/                    async logger
-│   ├── trouble/sources/        custom trouble sources
-│   └── theme.lua, highlights.lua
-├── tools/
-│   ├── cindex-uefilter/        Go fork of google/codesearch's cindex
-│   │                           (adds -files-from FILE for clean indexing)
-│   └── (Python utilities...)   PCH, CDB, index, DAP probes
-├── scripts/                    Windows installer + cleanup + profiling
-├── docs/
-│   ├── architecture/           architecture overview (subsystems / data flow)
-│   ├── ue_lazyvim_cheatsheet.md
-│   ├── CONSTRAINTS.md          forbidden / pitfalls / load-bearing constraints
-│   ├── testing-regression.md   regression policy + change→filter map
-│   └── plans/                  architecture decision records
-├── memory/                     stable project knowledge for AI agents (start here)
-├── decisions/                  ADR navigation (authoritative ADRs live in docs/plans/)
-├── lessons/                    platform quirks / hard-won debugging knowledge
-├── tests/                      headless regression suite
-├── <every major dir>/CLAUDE.md recursive local subsystem rules (child = delta only)
-└── CLAUDE.md                   ROOT: SESSION START protocol + Definition of Done
+init.lua                  LazyVim entrypoint
+setup.ps1                 Windows installer
+lua/
+  config/                 keymaps / options / autocmds / lazy bootstrap
+  plugins/                per-plugin setup (snacks-only)
+  ue.lua                  UE engine hub (~10k lines)
+  ue/{cdb,core,dap}/      CDB pipeline, pure functions, multi-platform DAP
+  utils/ue_goto/          5-tier goto-definition
+  utils/code_search/      csearch sub-second grep
+  utils/platform/         the only place OS branching is allowed
+  workarounds/            isolated upstream-bug patches and registry
+tools/                    cindex-uefilter (Go) and Python CDB/PCH/index utilities
+docs/                     architecture, constraints, tooling, cheatsheet
+tests/                    headless regression suite
 ```
 
-**AI persistence layer**: a new context starts at root `CLAUDE.md`
-(auto-injected) → SESSION START reads `docs/CONSTRAINTS.md` →
-`memory/project_overview.md` → the current dir's `CLAUDE.md` (falls back to
-the nearest ancestor). Every major directory carries its own `CLAUDE.md`
-(children write only deltas over the parent). "Done" is gated by the root
-Definition of Done: run scoped regression, append to `docs/changelog.md`,
-and follow the milestone policy on version wrap.
+## Documentation
 
----
-
-## Install
-
-### Windows (preferred, what this is built for)
-
-```powershell
-# from a PowerShell 7 prompt
-git clone https://github.com/hana-alice/nvim-dot-files.git $env:LOCALAPPDATA\nvim
-cd $env:LOCALAPPDATA\nvim
-.\scripts\install_windows.ps1
-nvim
-```
-
-### Anywhere else
-
-```bash
-git clone https://github.com/hana-alice/nvim-dot-files.git ~/.config/nvim
-nvim
-```
-
-LazyVim will install plugins on first launch. UE-specific features no-op
-gracefully when there's no UE project around.
-
----
-
-## Conventions
-
-These are the rules this config follows. They are not optional:
-
-- **AST/treesitter over regex** for any structural code question
-- **Async over blocking** — multi-second waits OK, blocking the main
-  thread is not
-- **Workaround isolation** — anything that exists only to dodge an
-  upstream bug goes in `lua/workarounds/<scope>/<name>.lua`
-- **Self-verifiable modules** — public API on `M.*`, headless-testable
-- **No periodic ticker notifications** — at most start + middle update,
-  natural fade after success (no `:messages` spam)
-- **Skip-write when unchanged** — every generator (CDB, PCH, .clangd)
-  must compare before writing so downstream caches don't invalidate
-
-For the full checklist of what's **forbidden**, what **pitfalls** have already
-cost time, and which **constraints** are load-bearing, see
-[`docs/CONSTRAINTS.md`](docs/CONSTRAINTS.md).
-
-See `CLAUDE.md` for the full agent contract.
+| Topic | Location |
+| --- | --- |
+| Architecture overview | [`docs/architecture/overview.md`](docs/architecture/overview.md) |
+| Additions over LazyVim | [`docs/architecture-vs-lazyvim.md`](docs/architecture-vs-lazyvim.md) |
+| Symbol resolution internals | [`docs/architecture-symbol-resolution.md`](docs/architecture-symbol-resolution.md) |
+| Forbidden / pitfalls / constraints | [`docs/CONSTRAINTS.md`](docs/CONSTRAINTS.md) |
+| Pinned toolchain | [`docs/TOOLING.md`](docs/TOOLING.md) |
+| Contributing / agent contract | [`CLAUDE.md`](CLAUDE.md) |
 
 ## Regression tests
 
-Run the full headless regression suite after any change:
-
+```powershell
+nvim --headless -l tests/run.lua            # full suite (authoritative)
+nvim --headless -l tests/run.lua <filter>   # scoped
+pwsh -File scripts\run_regression.ps1       # Windows wrapper
 ```
-nvim --headless -l tests/run.lua          # cross-platform, authoritative
-pwsh -File scripts/run_regression.ps1     # Windows convenience wrapper
-```
 
-Exit code `0` = all pass, `1` = any failure. New cases go in
-`tests/cases/<area>_spec.lua` (auto-discovered). Full guide:
-[`docs/testing-regression.md`](docs/testing-regression.md).
-
----
+Exit code `0` indicates success, `1` indicates failure. Policy and the
+change-to-filter map are in [`tests/CLAUDE.md`](tests/CLAUDE.md).
 
 ## Credits
 
-- [LazyVim](https://github.com/LazyVim/LazyVim) — the base distribution
-- [folke/snacks.nvim](https://github.com/folke/snacks.nvim) — picker, statusline, dashboard
-- [clangd](https://clangd.llvm.org/) — the C++ LSP that does all the real work
+[LazyVim](https://github.com/LazyVim/LazyVim),
+[snacks.nvim](https://github.com/folke/snacks.nvim),
+[clangd](https://clangd.llvm.org/),
+[google/codesearch](https://github.com/google/codesearch) (forked to add `-files-from`).

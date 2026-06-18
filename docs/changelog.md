@@ -53,6 +53,178 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-06-18 — Apprentice 主题（同步 Warp）+ grep 切换键 + cheatsheet 配色/扩充
+
+**Task** — 用户要求：cheatsheet 配色难看且快捷键太少（尤其 `<leader>/` 里全字/大小写/正则怎么切）；把当前 Warp 终端主题 Apprentice 同步成 nvim colorscheme。
+
+**Implemented**
+- `colors/apprentice.lua`（新）：把 Warp 的 `apprentice.yaml`（romainl/Apprentice）移植为完整 nvim colorscheme——editor chrome + 语法 + treesitter/LSP 语义 + 诊断 + diff + gitsigns + bufferline + 16 色终端色（终端 16 色逐字照搬 yaml）。**语法组（Constant/String/Identifier/Function/Statement/Type/PreProc/Special 等）逐色对齐上游官方 `colors/apprentice.vim`**，非自创映射。
+- `lua/theme.lua`：LABELS 注册 `apprentice = "Apprentice"`，可 `:Theme apprentice` / ThemePicker 切换并持久化。
+- `lua/ue.lua`：grep picker（cached_grep）加回 `<a-r>` 正则切换（NVIDIA Overlay 关闭后 Alt 可达），与既有 `<a-g>`(regex 别名)/`<a-w>`/`<a-x>`(whole-word)/`<a-c>`(case) 并列；切换实时重跑 rg + 标题 R/W/C 图标 + 提示。
+- `lua/utils/cheatsheet.lua`：配色改为 Apprentice 调色板（cyan 单强调 + 灰阶，去 8 色彩虹）；扩充键位（Code/LSP actions、picker `<C-s>/<C-v>/<C-t>`、live-grep `-- -w/-s` 与 `<a-*>` 切换、UE Index/Diagnostics 等）。
+- `docs/ue_lazyvim_cheatsheet.md`：新增「Refining a live grep」节，讲清 `pattern -- -w -s` inline flag + `<leader>sx/sX` 启动键 + `<a-r/w/c>` 切换三种方式；补 picker 内 split/tab 键。
+- `tests/cases/cheatsheet_spec.lua`：防漂移锚点加入搜索精修键（sx/sX/sw/sy/`-- -w`/`-- -s`）。
+
+**Pitfalls / Gotchas**
+- 主题第一版语法配色是自创角色映射（类型→cyan 等），与作者意图不符，看起来「不像」。改为抓 romainl/Apprentice 官方 `.vim` 的八个核心组原值（Constant #ff8700 / Statement #87afd7 / Type #8787af …）逐色对齐，treesitter/LSP 组对齐到对应 legacy 组。
+- `<a-r>` 历史上被 NVIDIA App 性能 Overlay 全局热键吞掉；用户关闭该 Overlay 后恢复，保留 `<a-g>` 作为兜底别名。
+
+**Validation**
+- `colorscheme apprentice` headless 加载，核心语法组色值与上游一致（Normal/Constant/String/Identifier/Function/Statement/Type/PreProc/Special 全部命中）。
+- 全量 `nvim --headless -l tests/run.lua` → 521/521。
+
+
+
+**Task** — 用户反馈 README 过期、条理混杂、缺 AI 适配说明；cheatsheet 命令过期（codelldb/UEAndroidDAP 旧路线）需更新扩充并纳入回归；样式更新。
+
+**Implemented**
+- `README.md` 重构为主流大项目骨架（features → platform → requirements → install → usage → docs），正式文风、Windows-only 显式声明、把「平台编译一次」列为 `:UEPrepare` 前的必需步骤；benchmark 用表+ASCII 图，头条改为 **super-unity 索引**（11,593 TU 折叠成 ~23，几小时→~3 分钟，NTFS）；新增「Built for long-term AI-assisted development」段（agent 启动流程图 + 硬数据表 19/39/9/21/14/12 + 四知识区 + DoD）。中文版拆到 `docs/README.zh-CN.md`（中英分文件、互相切换）。
+- `docs/ue_lazyvim_cheatsheet.md`：DAP 段整段重写——删 codelldb 1.12.2 / `:UEAndroidDAP*` 旧路线，统一到 `:UEDAP*`；补全 `<leader>d1-d4`（DAP tab）、`d]`/`d[`、`dW`/`de`/`dh`/`dw`/`dt`/`dk`/`dj`/`dR`；补 `:UEPrepareIncremental`、`:UEDefCacheClear`；首跑流程改为 SetProject→SetPlatform→Build→Prepare；去 which-key 措辞；二级标题加 emoji + 顶部目录导航。
+- `lua/utils/cheatsheet.lua`：UE/DAP 两个 float tab 内容与 markdown 对齐（Setup&Prepare / Run·Logs / First-run；Session / Breakpoints / Inspect / UI·Tabs）；**样式更新**——highlight 改为 Catppuccin Mocha 命名调色板、key↔desc 用点线连接、footer 文案更新。
+- `tests/cases/cheatsheet_spec.lua`（新，粒度＝命令真实性 + 双 surface 一致）：扫 float `M.tabs` 与 markdown 的 `:UE*` 命令引用，比对 `commands_spec` 的 UE_COMMANDS 冻结清单（+UEDef* exists 校验）抓死链/过期；校验 float 关键 DAP/UE 键位在 markdown 必含（防漂移）；断言 markdown 不再以命令形式引用 `:UEAndroidDAP`。
+- `tests/CLAUDE.md`：CHANGE-TO-FILTER MAP 新增 `cheatsheet` 行。
+
+**Pitfalls / Gotchas**
+- 命令真实性校验最初用 `vim.fn.exists(":Cmd")` 扫所有前缀（Theme/NvimLog/Markdown），但这些是 lazy-loaded，headless 下未加载 + 前缀歧义（`:UE` 返回 3=ambiguous）→ 大量误报。收敛为只校验 UE*（有 commands_spec 权威冻结清单，确定性强），并对正则加 `*` 边界排除 `:UEDAP*` 通配写法。
+
+**Validation**
+- `nvim --headless -l tests/run.lua cheatsheet` → 91/91。
+- `nvim --headless -l tests/run.lua structure` → 36/36（README 内链）。
+- 全量 `nvim --headless -l tests/run.lua` → 507/507。
+
+
+
+**Task** — `:UEPrepare` 完成后（尤其重新编译后）`<space><space>` 仍反复弹 stale。OpenSpec change `csearch-freshness-content-fingerprint`（proposal+design 先行 validate）。
+
+**Root cause** — `prepare_freshness` 一直用 **mtime 侧信道代理**猜「被索引文件集合是否变」，每个代理有自己的噪声：`.git/index` 被 fsmonitor/TortoiseGit 后台 touch（K30g）；`dir_mtime` 被**编译产物**落进引擎树 touch（重编即假 stale）。D8 把 git anchor 换成 commit-state 只是换噪声更小的代理，随后被 dir_mtime 击穿——换代理是无尽打地鼠。
+
+**Implemented（D10）**
+- `lua/ue.lua`：重写 `CORE_RT.prepare_freshness`——稳态判定改为 `list_fingerprint(workspace_all.files) == state.csearch_input_hash`，相等 fresh 否则 stale；保留 ① in_progress / ② never / ③ watcher dirty>0→stale。**删除整段 mtime anchor 块**及 `git_commit_state_mtime`/`git_index_mtime`/`dir_mtime` 三个辅助函数（167 行）。
+- `lua/ue.lua`：新增 `CORE_RT.list_fingerprint(path)`——`vim.fn.sha256(内容)`，用文件自身 (mtime,size) 作 hash 缓存键（稳态只 stat，实测全量 46ms 仅 miss 付一次）。mtime 仅作缓存失效，判定永远是内容 hash。
+- `lua/ue.lua`：新增 `CORE_RT.on_full_csearch_success(ctx, reason)`，把 D-3b 清 dirty + D10 记 `state.csearch_input_hash` 绑成一个钩子；三条全量成功路径（sync/fast-path/cold-full）统一调用，失败不调（指纹不前移于已建成索引）。
+- 测试 seam：`M._list_fingerprint_for_test` / `M._reset_fingerprint_cache_for_test`。
+- `tests/cases/freshness_fingerprint_spec.lua`（新，7 例）：指纹同/异/缺失/缓存 + 防回归（freshness 源不再引用任何 mtime anchor + 记录钩子存在）。
+- 文档：`grep-cache-invalidation.md`（D8 退役存档 + 新增 D10 + §2/§4/§5/§6 同步）、`CONSTRAINTS.md`（K30g 收敛为「mtime 代理已退役→内容指纹」）。
+
+**Pitfalls / Gotchas**
+- 删 anchor 块时旧 `do...end` 内还残留 167 行孤儿代码（旧 git_commit_state_mtime/dir_mtime 注释体）；`loadfile` 仍 OK 是因为它们在块内但不可达——必须连同辅助函数整段删，否则误导后人。
+- 内容编辑（已有文件改内容）**有意不检测**——clangd 实时感知；csearch 是文件级 trigram，集合不变不重建。这是用户定的边界，写进 spec。
+
+**Why theoretically-perfect not patch** — 不再「换更好的代理」（无尽打地鼠），而是**直接测量被检测对象本身**（清单内容）。所有代理噪声（fsmonitor/编译/git 漏报）一次性消失：它们都不改 list 内容。被否决：换源码子目录 dir_mtime（仍代理）、per-file hash L4（UE 万级不可行）、保留 D8 兜底（冗余噪声源）——见 change design.md。
+
+**Validation**
+- `nvim --headless -l tests/run.lua freshness_fingerprint` → 7/7。
+- 全量见下。
+
+**Follow-ups**
+- 升级首跑（旧 state 无 `csearch_input_hash`）会判一次 stale → 跑一次 `:UEPrepare` 即写入并转稳定。
+
+### 2026-06-17 — csearch.idx 单写者：消除并发写损坏（corrupt index 死循环）
+
+**Task** — `:UEPrepare` 卡在 ~85% 且刷屏 `cindex-uefilter exit=1 ... corrupt index: remove`。OpenSpec change `fix-csearch-index-single-writer`（proposal+design 已先行 validate）。
+
+**Root cause** — cindex 原子写协议把 staged 文件硬编码为 `<idx>~`（非每进程独立临时文件）。2026-06-16 D7 把 `ue_watch` 改成 csearch.idx 的第二个写者，其 debounce 增量与用户 `:UEPrepare` 全量并发抢同一个 `idx~`，在 merge/rename 窗口互毁 → `corrupt index: remove` → 0 字节 idx 再被下一次 `mode="add"` 撞上 → 死循环。
+
+**Implemented（三层，D9）**
+- `lua/utils/ue_watch.lua`：`provider_csearch_add` 退回 **record-only no-op**——删除 `build_index` 调用 / `-files-from` 临时列表；csearch 写者收敛为 prepare 家族。新文件靠 `persistent_dirty` + rg-on-dirty overlay 到下次手动 prepare（用户已确认可接受）。更新模块 header + provider doc 声明 D9 单写者契约。
+- `lua/ue.lua`：新增 `CORE_RT.csearch_build_running` + `CORE_RT.csearch_build_begin/done`（Policy A 串行守卫，挂 CORE_RT 避开 LuaJIT 200-local 上限）。三处构建入口（sync / cache fast-path / cold full）+ `:UEPrepareIncremental` 全部接入：占用中拒绝并可见提示（不排队），完成回调无条件清标志。
+- `lua/utils/code_search/init.lua`：`build_index` 在 `mode="add"` spawn 前校验 `usable_index_stat(idx)`，不可用则 `cb(false, "...run :UEPrepare")` 不 spawn；`mode="reset"` 不受限。新增 `M._usable_index_for_test`。
+- `tests/cases/ue_watch_csearch_spec.lua`：改写为 D9 契约——静态+行为守护「watcher 不写 csearch 索引」（防回归：重新接回写者即测红）。
+- `tests/cases/csearch_build_guard_spec.lua`（新，8 例）：构建串行（begin/拒绝/done/失败也清）+ 增量遇 0 字节·缺失 idx 被拒不 spawn + `_usable_index_for_test` + 全量成功清 dirty（D-3b）。
+- **D-3b（dirty 清理层，apply 中发现的 D9 缺口）**：`lua/ue.lua` 新增 `CORE_RT.clear_persistent_dirty_safe`（soft-require ue_watch）；三条全量成功路径（sync / cache fast-path / cold full）成功分支统一调用，**失败不清**。修复「UEPrepare 完仍弹 stale + `<space><space>` 变卡」——β 把 watcher 退出写者后，清 dirty 的责任转移给 prepare，但初版只有 cold-full 清，fast-path/sync 漏清 → dirty.json 残留（实测 110 KB）→ `prepare_freshness` 第一道闸恒判 stale + overlay 背巨大脏集合变卡。
+- 文档：`grep-cache-invalidation.md`（D7 退役存档 + D9 含 D-3b 清理层 + §3/§4/§5/§6 同步）、`CONSTRAINTS.md`（K31g 含 D-3b 二次症状、K29 标注被取代）。spec 新增「全量成功后 dirty 归零」Requirement。
+
+**Pitfalls / Gotchas**
+- 把 `csearch_build_begin/done` 作 main-chunk `local function` 会顶破 LuaJIT 200-local 上限（`main function has more than 200 local variables`）→ 改挂 `CORE_RT.*`。
+- `ue_watch_csearch_spec` 的静态护栏须用 `code_search%.build_index%s*%(`（带括号）匹配「调用」，否则 provider doc-comment 里「不得 re-add build_index」的文字会误判为违规。
+
+**Why not workaround** — 这是修我们自己的设计缺陷（D7 把 watcher 变第二写者），按 C2 落主逻辑配普通注释 + spec `SHALL` + 防回归测，不进 `lua/workarounds/`。被否决方案（α 锁 / γ 双索引 / Policy B 排队）见 change design.md。
+
+**Validation**
+- `nvim --headless -l tests/run.lua ue_watch_csearch` → 5/5；`csearch_build_guard` → 6/6。
+- 全量见下（提交前跑）。
+
+**Follow-ups**
+- 无。单写者已写成 `ue-code-search` spec 的 `SHALL` + 行为测护栏。
+
+### 2026-06-16 — tests: activate dormant DAP seams + F9 persistence round-trip (K-pitfall → behavioral)
+
+**Task** — Deepen debugger test coverage for long-term stability. Strategy (from explore session): migrate hard-won DAP knowledge from source-text grep assertions toward pure-function behavioral tests, prioritizing already-extracted-but-unexercised `_for_test` seams, and annotate each debugger case with the K-pitfall it guards.
+
+**Implemented**
+- `lua/ue/dap/android.lua` — added `M._attach_commands_for_test(session)` seam over the pure `attach_commands(session)` builder (no device/adb needed).
+- `lua/ue/dap/_persist_bp.lua` — added pure test seams `M._norm_for_test`, `M._json_round_trip_for_test`, `M._project_name_for_test`, `M._save_with_state_for_test`, `M._reset_state_for_test` (JSON + path-normalization logic only; never a live nvim-dap session).
+- `tests/cases/dap_spec.lua` — +21 behavioral cases driving the previously-dormant seams:
+  - `pick_symbol_lib` (K35 + 3.4 false-lead): versionCode exact-match beats mtime-newest; ctx > config > auto-discover precedence.
+  - `pick_package`: ctx > config > packageInfo.txt first-line.
+  - `pick_lldb_server` (C1): preserves platform glob priority order (no resort); config override; nil on no hit.
+  - `effective_project_root`: Android-marker'd candidate wins.
+  - `attach_commands` (K30/K34/K37): `target create` symbol-rich FIRST and before connect/attach; serial-bracket `connect://[serial]:port` (never localhost); signal handling after attach; explicit slide present by default and skipped under `UE_DAP_NO_SLIDE=1`.
+  - `_persist_bp` (K10): JSON round-trip shape preservation; backslash/forward-slash key normalization; project_name sanitize; **save merges pending_paths so unopened-file breakpoints are not erased** (the documented disaster scenario).
+- Annotated existing debugger cases with their guarded K-numbers (K10/K33/K34/K36/K37).
+- `docs/CONSTRAINTS.md` — K10/K30/K35/K37 entries now point at their backing behavioral tests.
+
+**Pitfalls / Gotchas**
+- The 8 existing INVARIANT cases that grep `dap.lua`/`android.lua` source text are kept (they guard "the misleading name must not return" structural facts that have no pure-logic form), but new coverage is behavioral wherever a seam exists. Source-grep that targets the third-party `nvim-dap/lua/dap/session.lua` remains the one acceptable exception (it documents an upstream contract we depend on).
+- `cfg.reset_for_test()` is called before AND after each config-touching case so a setup() override can't leak across cases.
+
+**Validation**
+- `nvim --headless -l tests/run.lua dap` → 44/44 passed (was 20).
+- `nvim --headless -l tests/run.lua platform` → 10/10 passed.
+- Full suite below.
+
+**Follow-ups**
+- `module_rebase_command` / `read_so_base_hex` (ASLR base parsing from /proc/maps) still lack seams — they need adb stubbing; candidate for a future round.
+
+### 2026-06-16 — ue_watch: incremental csearch via -files-from, not argv fan-out (fix ENAMETOOLONG)
+
+**Task** — `ue_watch`'s debounce flush threw `vim/_system.lua:256: ENAMETOOLONG: name too long` after a `git checkout` / build. User required this be a permanent correct fix, not a workaround.
+
+**Root cause** — `provider_csearch_add` built the indexer invocation as `cmd = {"cindex"}; for p in paths do table.insert(cmd, p) end` — one dirty path per argv element. A checkout/build batches hundreds of long UE paths (~80–120 chars each) into one flush; the assembled command line blows Windows' ~32 KiB argv limit. Two further defects rode along: it called bare `cindex` (not the repo-canonical `cindex-uefilter`, which alone supports `-files-from` and UE-path filtering) and `:wait()`-blocked the UI thread (violates P6 / C4 conv #2).
+
+**Why this is the correct fix, not a workaround** — argv length is an OS contract, not an upstream bug that could be "fixed away"; feeding an arbitrary-length path list to a child process via a `-files-from` file is the permanently right design (the very reason `cindex-uefilter` exists). The change converges the watcher onto the already-vetted incremental path `:UEPrepareIncremental` uses. Nothing here is "patch around someone else's bug" → lives in main logic with plain comments, NOT `lua/workarounds/` (per C2: a fix that IS the right answer is not a workaround).
+
+**Implemented**
+- `lua/utils/ue_watch.lua` — rewrote `provider_csearch_add`: writes dirty paths to `<csearch_index>.incremental.txt`, calls `require("utils.code_search").build_index({ csearch_idx = <index> }, list, cb, { mode = "add" })`, removes the temp file in the callback. Probes `cindex_uefilter_exe()` and the `build_index` API up front, returning explicit failure (not silent) when unavailable. Async — no `:wait()`.
+- `lua/utils/ue_watch.lua` — added the `-files-from`/argv-limit rule to the module's "Design constraints" header and a full provider-doc comment explaining the OS-contract rationale.
+- `lua/utils/ue_watch.lua` — added test seams `M._provider_csearch_add_for_test` + `M._set_opts_for_test` (non-runtime API).
+- `tests/cases/ue_watch_csearch_spec.lua` (new, 7 cases) — static guards that argv fan-out / bare `cindex` cannot return; behavioral test with a stubbed `code_search` backend asserting the provider routes through `build_index{mode="add"}` with the dirty paths written to the `-files-from` list and the temp file cleaned up; no-op on empty, explicit failure on missing index config / missing `cindex-uefilter`.
+
+**Pitfalls / Gotchas**
+- `cindex-uefilter` (not bare `cindex`) is the repo-wide canonical indexer; bare `cindex` lacks `-files-from` and UE-path filtering (code_search/CLAUDE.md). The old provider was a pre-2026-05-28 leftover that never adopted the `build_index{mode="add"}` path the rest of the system standardized on.
+- Provider failures are logged, not propagated: the flush is fire-and-forget on the scheduler, and the cumulative `persistent_dirty` set + rg-on-dirty overlay already cover any path that misses a given flush.
+
+**Validation**
+- `nvim --headless -l tests/run.lua ue_watch_csearch` → 7/7 passed.
+- `nvim --headless -l tests/run.lua utils` → 30/30 passed.
+- Full suite `nvim --headless -l tests/run.lua` → 382/382 passed (covers both 2026-06-16 entries: ue_watch + freshness anchor).
+
+**Follow-ups**
+- None. Module design captured in `docs/architecture/grep-cache-invalidation.md` D7; pitfall in `docs/CONSTRAINTS.md` K29.
+
+### 2026-06-16 — grep freshness: anchor on git commit-state, not .git/index (kill phantom "stale" after UEPrepare)
+
+**Task** — On a UE git worktree, `<space><space>` / `<leader>/` kept warning `:UEPrepare is stale (worktree changed since last run)` immediately after a successful `:UEPrepare`, even though no source file had changed. User report: "我已经 UEPrepare! 了为什么 space space 找文件还会提示 stale".
+
+**Root cause** — `prepare_freshness` anchored list freshness on `.git/index` mtime. On UE worktrees the engine `.git` is a `gitdir:` pointer into the main repo's `worktrees/<name>/` (here `D:/project/uetemp/.git` → `D:/project/UnrealEngine/.git/worktrees/uetemp`), and that per-worktree `index` is re-touched minutes after UEPrepare by git's always-on `fsmonitor--daemon` and TortoiseGit background refresh — without the working-tree file SET changing. So `index_mtime > list_mtime` → false "stale". (Observed: list 18:35:44, index re-touched 18:46:40 → 18:57:20 by background tooling.)
+
+**Implemented**
+- `lua/ue.lua`: replaced `git_index_mtime(repo_root)` with `git_commit_state_mtime(repo_root)` — same worktree-aware `.git` / `gitdir:` resolution, but anchors on the newest mtime of `HEAD` + `logs/HEAD` (commit-state) instead of `index` (staging area). `logs/HEAD` appends on every ref movement (commit / pull / merge / rebase / reset / checkout), so it captures fast-forwards that leave `HEAD`'s symref text unchanged.
+- Updated the two anchor call sites in `CORE_RT.prepare_freshness` and the anchor-list doc comments (anchors #1/#2 now "git commit-state (HEAD + logs/HEAD)").
+- Uncommitted/unstaged new-file detection is unchanged — still covered by the `ue_watch` dirty overlay and the `dir_mtime` anchors, which is why dropping `index` loses no real-change coverage.
+
+**Pitfalls / Gotchas**
+- `index` is NOT a proxy for "file population changed": fsmonitor / TortoiseGit / background `git add` / build artifact staging all bump it. It was redundant with the watcher+dir anchors for the add/remove case and actively harmful for the refresh case.
+- A linked worktree has per-worktree `HEAD`/`logs/HEAD` under `worktrees/<name>/`, so a branch switch in THIS worktree still shows and sibling worktrees of the same main repo don't bleed in.
+
+**Validation**
+- `nvim --headless -l tests/run.lua grep_cache` → 21/21 passed.
+- Full suite `nvim --headless -l tests/run.lua` → 375/375 passed.
+- Live anchor recompute against the user's real cache: new anchors max = `dir_mtime` 18:02:50 < list 18:35:44 → `fresh` (was `stale` under the old `index` 18:57:20 anchor).
+
+**Follow-ups**
+- None. `index`-based detection intentionally retired; `UE_DAP_*`-style escape hatch not added (watcher overlay already covers the uncommitted-add edge).
+
 ### 2026-06-15 — docs/test: harden + preserve the live-breakpoint experience (ADR, behavioral tests, knowledge base)
 
 **Task** — The session-time live-breakpoint work (previous entry) is load-bearing and hard-won; preserve it against regression and knowledge loss via behavioral tests, an ADR, and knowledge-base updates (user request: "保留这次的经验不被破坏").

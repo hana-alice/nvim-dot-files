@@ -104,7 +104,9 @@
   解决: F9 走 `ue.dap._persist_bp`，存到
   `<engine_root>/.cache/nvim-ue/breakpoints/<project>.json`，250ms 防抖、
   `BufReadPost` 懒恢复；该模块从 `ue.lua` 提前 `setup()`，保证 nvim-dap 懒加载前也生效。
-  → `docs/TOOLING.md` §Pitfalls #10; `lua/ue/dap/_persist_bp.lua`
+  → `docs/TOOLING.md` §Pitfalls #10; `lua/ue/dap/_persist_bp.lua`;
+    行为测 `tests/cases/dap_spec.lua`「F9 持久化往返（K10）」（JSON 往返 / 路径归一 /
+    project_name sanitize / save 合并 pending 不擦除未开文件断点）
 
 ### Android ASLR（来自 MEMORY，需对当前代码复核）
 
@@ -146,7 +148,9 @@
     `m_device_id = parsed_url->hostname`）。这是 remote-android 官方 serial-based URL，
     **非 workaround**。
   → `tools/dap_platform_e51cbe6.py`; 归档 change `2026-06-03-android-dap-platform-mode`;
-    `git show e51cbe6:lua/ue/dap/android.lua`
+    `git show e51cbe6:lua/ue/dap/android.lua`;
+    行为测 `tests/cases/dap_spec.lua`「attach_commands（K30/K34/K37 顺序与 slide 开关）」
+    （serial 方括号 URL / target create 先序 / 信号处置后置）
 
 - **K31 — `lldb-server gdbserver --attach <pid>` 在该设备从不绑定监听端口**
   症状: ptrace 附上（`TracerPid` 非 0）但端口永不进 LISTEN（`/proc/net/tcp` 0 条），
@@ -193,7 +197,9 @@
   解决: attachCommands 第一阶段先 `target create "<symbol-rich libUE4.so>"`，再走
   `platform select` / serial-form `platform connect` / `process attach --pid`。后置
   `target symbols add` / `target modules add` 不能替代这个顺序。
-  → `lua/ue/dap/android.lua`; `docs/changelog.md` 2026-05-21/2026-06-03 断点记录
+  → `lua/ue/dap/android.lua`; `docs/changelog.md` 2026-05-21/2026-06-03 断点记录;
+    行为测 `tests/cases/dap_spec.lua`「attach_commands」（target create 第一条 + 早于
+    connect/attach）与「pick_symbol_lib（K35）」（versionCode 精确匹配优先于 mtime）
 
 - **K36 — session-time live 断点经 lldb-dap evaluate 通道可行（本设备实证，非 work around）**
   症状/背景: 历史 `361b9e7` 记录"attach 后写断点指令被内核静默丢弃，session-time live
@@ -216,7 +222,9 @@
   resolved+命中）未满足。`UE_DAP_NO_SLIDE` 环境开关保留供后续在其他设备/版本复验。
   证据 `tools/evidence/android-f9/noslide-preseed.result.json`(timeout) vs
   `slide-recheck.result.json`(ok)。
-  → change `android-dap-live-breakpoints` design D5/OQ#3; `lua/ue/dap/android.lua`
+  → change `android-dap-live-breakpoints` design D5/OQ#3; `lua/ue/dap/android.lua`;
+    行为测 `tests/cases/dap_spec.lua`「attach_commands」（默认含显式 slide；
+    `UE_DAP_NO_SLIDE=1` 时跳过——锁住开关语义与 plumbing 存在）
 
 ### 工具链 / LLVM
 
@@ -317,6 +325,56 @@
   解决: stdout read callback 同步解析进 backend 队列，由单一 scheduled flusher 先 drain
   全部 parsed hits，再在进程退出且 backlog 为空时调用 `on_done`；stop 后所有 flusher 都短路。
   → `docs/architecture/grep-cache-invalidation.md` D6; `lua/utils/code_search/init.lua`
+
+- **K29 — watcher 批量 add 把每路径拼进 argv → `ENAMETOOLONG`**（后续被 K31g 取代写者本身）
+  症状: `git checkout` / 构建批量产生几百个长 UE 路径后，`ue_watch` flush 抛
+  `vim/_system.lua:256: ENAMETOOLONG: name too long`（`provider_csearch_add` 把每个
+  dirty 路径作为一个 argv 元素拼进裸 `cindex` 命令，超 Windows ~32 KiB argv 上限）。
+  解决（历史，2026-06-16）: provider 改委托 `build_index(.., {mode="add"})` 经
+  `cindex-uefilter -files-from` 入索引。**注意：该修复把 watcher 变成 csearch.idx 的第二个
+  写者，随即引出 K31g 的并发写损坏 → 2026-06-17 整体退役该写者。** argv 上限是 OS 契约、
+  `-files-from` 是任意长度列表喂子进程的正解，这条结论仍成立，但现在只有 prepare 家族走该
+  路径，watcher 不再写索引。
+  → `docs/architecture/grep-cache-invalidation.md` D7（存档）/ D9（现状）; K31g
+
+- **K30g — freshness 用 mtime 代理当 anchor → 后台 touch / 编译产物触发假 stale（已收敛到内容指纹 D10）**
+  症状: `:UEPrepare` 完成后 `<space><space>` / `<leader>/` 仍弹
+  `:UEPrepare is stale (worktree changed since last run)`，但无源码增删。两个噪声源：
+  (1) `.git/index` 被 git fsmonitor / TortoiseGit 后台 refresh touch；
+  (2) `dir_mtime` 被**编译产物**落进引擎树 touch（重编一次即 stale）。根因是结构性的——
+  `prepare_freshness` 用 **mtime 侧信道代理**猜「文件集合是否变」，每个代理都有自己的噪声。
+  中间态: D8（2026-06-16）把 git anchor 从 index 换成 commit-state（`HEAD`+`logs/HEAD`），
+  只是换了个噪声更小的代理，随后被 dir_mtime 噪声再次击穿——换代理是无尽打地鼠。
+  终解 **D10**（2026-06-17）: 停止代理，改对 `workspace_all.files` **内容取 sha256 指纹**
+  （它就是被索引集合的确定性序列化，table.sort 后 bytes 稳定），与全量构建成功时记录的
+  `state.csearch_input_hash` 比对。退役全部 mtime anchor（git index / commit-state / dir_mtime）。
+  会话内集合变化由 watcher dirty 捕获，会话间由指纹捕获；内容编辑归 clangd，不在 csearch
+  freshness 范围。指纹用 list 自身 (mtime,size) 作缓存键，稳态只 stat（mtime 仅作缓存失效，
+  非判定）。
+  → `docs/architecture/grep-cache-invalidation.md` D10（D8 存档）; change
+    `csearch-freshness-content-fingerprint`; `lua/ue.lua` `prepare_freshness` /
+    `list_fingerprint` / `on_full_csearch_success`; `tests/cases/freshness_fingerprint_spec.lua`
+
+- **K31g — csearch.idx 并发写损坏（cindex `<idx>~` 路径硬编码）→ `corrupt index` + 0 字节死循环**
+  症状: `:UEPrepare` 卡在 ~85%，同时刷屏
+  `[ue.watch] csearch_add: cindex-uefilter exit=1 ... merge ... corrupt index: remove <csearch.idx>`；
+  目录里 `csearch.idx` 0 字节、`csearch.idx~` 半截、`csearch.idx~~` 是上次好索引。
+  根因: cindex 原子写协议把 staged 文件**硬编码**为 `<idx>~`（非每进程独立临时文件）。
+  watcher 增量（K29 引入的 `mode="add"` 写者）与用户 `:UEPrepare` 全量并发跑同一个 `idx`，
+  抢同一个 `idx~`，在 merge/rename 窗口互毁；0 字节 idx 再被下一次 `add` 撞上 → 死循环。
+  解决（三层，2026-06-17）: ① **β 单写者**——`ue_watch` provider 退回 record-only（不写
+  csearch.idx），写者收敛为 prepare 家族；新文件靠 persistent_dirty + rg-on-dirty overlay
+  到下次手动 prepare。② **Policy A 串行**——`CORE_RT.csearch_build_running` 单标志，构建入口
+  `csearch_build_begin` 拒绝并发（不排队），完成回调无条件 `csearch_build_done`。③ **韧性**——
+  `build_index` 在 `mode="add"` spawn 前校验 idx 可用，不可用则拒绝并引导全量；`mode="reset"`
+  永远安全。④ **清理（D-3b）**——β 把「构建成功⇒dirty 归零」责任转移给 prepare，**每条全量
+  成功路径**（fast-path/cold/sync）都须 `clear_persistent_dirty_safe`；漏清会让
+  `prepare_freshness` 第一道闸恒判 stale（刚 prepare 完仍弹 stale）且 overlay 背巨大脏集合
+  → `<space><space>` 变卡。失败不清。
+  → `docs/architecture/grep-cache-invalidation.md` D9; change `fix-csearch-index-single-writer`;
+    `lua/utils/ue_watch.lua` `provider_csearch_add`（record-only）; `lua/ue.lua`
+    `csearch_build_begin/done` + `clear_persistent_dirty_safe`; `lua/utils/code_search/init.lua`
+    `build_index` add-guard; `tests/cases/ue_watch_csearch_spec.lua` / `csearch_build_guard_spec.lua`
 
 ---
 

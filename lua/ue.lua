@@ -5815,6 +5815,18 @@ local function open_terminal_command(cmd, opts)
   end
 
   CORE_RT.build_term_jobid = active_jobid
+  -- Register with the generic task registry (list/cancel via :Tasks). This is
+  -- a pure side-path: only a register call AFTER job creation; on_exit above is
+  -- untouched. Status is derived live from the channel (see task_registry).
+  pcall(function()
+    require("utils.task_registry").register({
+      name = opts.quickfix_title or "build",
+      group = "build",
+      kind = "job",
+      handle = active_jobid,
+      started_at = os.time(),
+    })
+  end)
   startinsert_in_window(win)
 end
 
@@ -6932,6 +6944,17 @@ function M.statusline_status(opts)
   local build = trim(vim.g.ue_build_status or "")
   if build ~= "" then
     parts[#parts + 1] = build
+  end
+
+  -- Generic background-task count segment (⏵N). Shown only when N>0; absent
+  -- (no placeholder) when zero. Count is derived live from the task registry
+  -- at this existing statusline eval — no new timer (config rule P5).
+  local ok_tr, tr = pcall(require, "utils.task_registry")
+  if ok_tr then
+    local n = tr.running_count()
+    if n and n > 0 then
+      parts[#parts + 1] = ("⏵%d"):format(n)
+    end
   end
 
   return table.concat(parts, " ")
@@ -8067,7 +8090,7 @@ local function install_android()
   -- just "Failed (exit 1)" and lose the actual "Failure [INSTALL_FAILED_*]"
   -- line that adb prints).
   local stdout_lines, stderr_lines = {}, {}
-  vim.fn.jobstart({ "adb", "install", "-r", apk_win }, {
+  local install_jobid = vim.fn.jobstart({ "adb", "install", "-r", apk_win }, {
     stdout_buffered = true,
     stderr_buffered = true,
     on_stdout = function(_, data)
@@ -8160,6 +8183,20 @@ local function install_android()
       end)
     end,
   })
+
+  -- Register the adb install job for :Tasks list/cancel. Pure side-path:
+  -- register only, after job creation; on_exit above is untouched.
+  if install_jobid and install_jobid > 0 then
+    pcall(function()
+      require("utils.task_registry").register({
+        name = "UEInstallAndroid",
+        group = "android",
+        kind = "job",
+        handle = install_jobid,
+        started_at = os.time(),
+      })
+    end)
+  end
 end
 
 local function prepare()
@@ -8931,6 +8968,19 @@ local function prepare_async(opts)
         gtags_timer = nil
       end
       fail("failed to start gtags process")
+    else
+      -- Register the gtags phase job for :Tasks list/cancel. Pure side-path:
+      -- register only, after job creation; on_exit above is untouched. Status
+      -- is derived live from the channel.
+      pcall(function()
+        require("utils.task_registry").register({
+          name = "UEPrepare (index)",
+          group = "ue",
+          kind = "job",
+          handle = CORE_RT.prepare_jobid,
+          started_at = os.time(),
+        })
+      end)
     end
   end
 
@@ -9367,6 +9417,17 @@ function M.setup()
     require("utils.async_launcher").launch({
       name  = bang and "UE: Prepare (FORCE full rebuild)" or "UE: Prepare (rsp + ccjson + index)",
       group = "ue",
+      cancel = function()
+        -- <C-c> on the launcher float cancels the prepare jobs registered in
+        -- the task registry (gtags + ccjson). Pure side-path; uses public API.
+        local ok_tr, tr = pcall(require, "utils.task_registry")
+        if not ok_tr then return end
+        for _, row in ipairs(tr.list()) do
+          if row.status == "running" and row.group == "ue" then
+            tr.cancel(row.id)
+          end
+        end
+      end,
       run   = function(report)
         -- prepare_async already returns immediately and runs UBT/cindex
         -- in libuv jobs. The launcher placeholder + fidget handle here
@@ -9849,6 +9910,118 @@ function M.setup()
     end
   end, { desc = "DAP: One-line status of the current Android session" })
 
+  -- ── Generic background-task management (:Tasks / :TaskStop / :TaskStopAll) ─
+  -- Generic, non-UE feature: list and cancel any registered background job
+  -- (build / prepare / launch / install / logcat / log-stream). State is
+  -- derived live from each handle (see lua/utils/task_registry.lua). Registered
+  -- here only to reuse ue.setup()'s idempotent command-registration + the
+  -- commands_spec frozen list; the command NAMES are intentionally prefix-free.
+  do
+    local function task_label(row)
+      local age = row.started_at and (os.time() - row.started_at) or nil
+      local when
+      if row.status == "running" and age then
+        when = ("%dm%02ds"):format(math.floor(age / 60), age % 60)
+      else
+        when = row.status
+      end
+      local icon = ({ running = "●", done = "○", cancelled = "◌" })[row.status] or "?"
+      return ("%s %-22s %-8s %s"):format(icon, row.name, row.group, when)
+    end
+
+    local function pick_and_cancel(rows, prompt)
+      -- rows already filtered to running. vim.ui.select uses snacks backend.
+      vim.ui.select(rows, {
+        prompt = prompt or "Stop task:",
+        format_item = task_label,
+      }, function(choice)
+        if not choice then return end
+        local tr = require("utils.task_registry")
+        if tr.cancel(choice.id) then
+          vim.notify(("已停止 %s"):format(choice.name), vim.log.levels.INFO, { title = "Tasks" })
+        else
+          vim.notify(("%s 已结束"):format(choice.name), vim.log.levels.INFO, { title = "Tasks" })
+        end
+      end)
+    end
+
+    vim.api.nvim_create_user_command("Tasks", function()
+      local tr = require("utils.task_registry")
+      local rows = tr.list()
+      if #rows == 0 then
+        vim.notify("无后台任务", vim.log.levels.INFO, { title = "Tasks" })
+        return
+      end
+      vim.ui.select(rows, {
+        prompt = "Tasks (select to stop):",
+        format_item = task_label,
+      }, function(choice)
+        if not choice then return end
+        if choice.status ~= "running" then
+          vim.notify(("%s 已结束（%s）"):format(choice.name, choice.status), vim.log.levels.INFO, { title = "Tasks" })
+          return
+        end
+        if tr.cancel(choice.id) then
+          vim.notify(("已停止 %s"):format(choice.name), vim.log.levels.INFO, { title = "Tasks" })
+        else
+          vim.notify(("%s 已结束"):format(choice.name), vim.log.levels.INFO, { title = "Tasks" })
+        end
+      end)
+    end, { desc = "List background tasks; select to stop" })
+
+    vim.api.nvim_create_user_command("TaskStop", function(opts)
+      local tr = require("utils.task_registry")
+      local arg = vim.trim(opts.args or "")
+      if arg ~= "" then
+        local id = tonumber(arg)
+        if not id then
+          vim.notify("TaskStop: id must be a number", vim.log.levels.WARN, { title = "Tasks" })
+          return
+        end
+        local st = tr.status(id)
+        if st ~= "running" then
+          vim.notify(("task %s 不在运行（%s）"):format(arg, tostring(st)), vim.log.levels.INFO, { title = "Tasks" })
+          return
+        end
+        if tr.cancel(id) then
+          vim.notify(("已停止 %s"):format((tr.get(id) or {}).name or arg), vim.log.levels.INFO, { title = "Tasks" })
+        end
+        return
+      end
+      -- No id: collect running tasks.
+      local running = {}
+      for _, row in ipairs(tr.list()) do
+        if row.status == "running" then running[#running + 1] = row end
+      end
+      if #running == 0 then
+        vim.notify("无运行中的后台任务", vim.log.levels.INFO, { title = "Tasks" })
+      elseif #running == 1 then
+        local row = running[1]
+        if tr.cancel(row.id) then
+          vim.notify(("已停止 %s"):format(row.name), vim.log.levels.INFO, { title = "Tasks" })
+        end
+      else
+        pick_and_cancel(running, "Stop task:")
+      end
+    end, { nargs = "?", desc = "Stop a background task (by id, or pick if multiple)" })
+
+    vim.api.nvim_create_user_command("TaskStopAll", function()
+      local tr = require("utils.task_registry")
+      local n = 0
+      for _, row in ipairs(tr.list()) do
+        if row.status == "running" then n = n + 1 end
+      end
+      if n == 0 then
+        vim.notify("无运行中的后台任务", vim.log.levels.INFO, { title = "Tasks" })
+        return
+      end
+      local choice = vim.fn.confirm(("停掉 %d 个任务？"):format(n), "&Yes\n&No", 2)
+      if choice ~= 1 then return end
+      local stopped = tr.cancel_all()
+      vim.notify(("已停止 %d 个任务"):format(stopped), vim.log.levels.INFO, { title = "Tasks" })
+    end, { desc = "Stop all running background tasks (confirms first)" })
+  end
+
   local group = vim.api.nvim_create_augroup("ue_statusline", { clear = true })
   -- Stop old timer on reload to prevent leaks
   if M._statusline_timer then pcall(function() M._statusline_timer:stop() end) end
@@ -10047,6 +10220,19 @@ function M.async_generate_compile_commands(ctx, on_progress, on_done)
         on_done(false, msg)
       end
     end)
+  end)
+
+  -- Register the ccjson subprocess for :Tasks list/cancel. Pure side-path:
+  -- register only, after spawn; the completion callback above is untouched.
+  -- Status is derived live from the vim.system handle.
+  pcall(function()
+    require("utils.task_registry").register({
+      name = "UEPrepare (ccjson)",
+      group = "ue",
+      kind = "system",
+      handle = handle,
+      started_at = os.time(),
+    })
   end)
 
   return handle

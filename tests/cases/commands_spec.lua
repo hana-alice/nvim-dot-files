@@ -38,6 +38,24 @@ t.describe("commands: UE* 全量注册", function()
   end
 end)
 
+-- Generic (prefix-free) background-task management commands. Registered by
+-- ue.setup() but intentionally NOT UE-prefixed — they're a general editor
+-- feature backed by lua/utils/task_registry.lua.
+local TASK_COMMANDS = { "Tasks", "TaskStop", "TaskStopAll" }
+
+t.describe("commands: 通用任务管理命令注册", function()
+  require("ue").setup()
+  t.it("冻结清单含 3 个任务命令", function()
+    t.assert_eq(#TASK_COMMANDS, 3)
+  end)
+  for _, c in ipairs(TASK_COMMANDS) do
+    t.it(":" .. c .. " 已注册", function()
+      require("ue").setup()
+      t.assert_eq(vim.fn.exists(":" .. c), 2, c .. " 未注册")
+    end)
+  end
+end)
+
 t.describe("commands: 辅助命令（keymaps.lua 注册）", function()
   vim.g.mapleader = " "
   vim.g.maplocalleader = " "

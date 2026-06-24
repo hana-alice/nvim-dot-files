@@ -162,6 +162,7 @@ Variants: `:UEPrepareIncremental` (dirty files only), `:UEPrepareReindex`
 | Launch the Editor | `:UELaunch` |
 | Re-index after adding/removing files | `:UEPrepareIncremental` |
 | Android: install / attach / breakpoint | `:UEInstallAndroid` / `:UEDAPAttach` / `F9` |
+| Background tasks: list / stop | `<leader>X` / `:Tasks` / `:TaskStopAll` |
 | All commands cheatsheet | `<leader>?` / `:UECheatsheet` |
 
 Full keymap and workflow handbook:

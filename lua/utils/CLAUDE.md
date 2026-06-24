@@ -6,7 +6,8 @@
 
 跨子系统复用的工具：`platform`（OS 分支唯一收口）、`log`（旋转日志）、`lsp_fallback`（gd/gr 兜底）、
 `ue_goto/`（goto 解析栈）、`code_search/`（csearch）、`ue_paths`（路径分类）、`sidebar`/`cheatsheet`/
-`restart`/`recent_projects`/`async_launcher`/`ue_watch`/`ue_launch`/`ue_logs`/`dirty_files` 等。
+`restart`/`recent_projects`/`async_launcher`/`ue_watch`/`ue_launch`/`ue_logs`/`dirty_files`/
+`task_registry`（后台任务列出/停止）等。
 
 ## 专属约定
 
@@ -14,6 +15,11 @@
 - **LSP 行为只走 `lsp_fallback.lua`**，不全局覆盖 `vim.lsp.handlers`。→ P3
 - 纯函数模块（`ue_paths`、`ue_goto/ranking|pair_picker|location`）有行为回归，改契约前看断言。
 - 单一职责、小文件：新功能优先新模块而非堆进现有大文件。
+- **新增后台 job（`jobstart`/`vim.system`/`termopen`）接入 `task_registry`**：唯一允许的接入是在 job
+  创建语句**之后**加一行 `pcall(require("utils.task_registry").register, { name, group, kind="job"|"system", handle })`。
+  **不要**在 `on_exit`/完成回调里回写状态——状态是派生量，由 `task_registry.status()` 实时查句柄得出
+  （派生状态架构从结构上消除竞态，见 change `ue-task-manager` design.md）。短命 `detach=true` 的
+  `xdg-open`/`open`/`cmd start` 类不登记。DAP 会话不登记（K5）。
 
 ## 改动 → 必跑回归
 

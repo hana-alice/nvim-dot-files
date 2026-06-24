@@ -1864,6 +1864,21 @@ function D.setup_dap(dap, dapui)
     if logcat_job <= 0 then
       vim.notify("[ue.dap] logcat failed to start: " .. table.concat(cmd, " "),
         vim.log.levels.WARN)
+    else
+      -- Register the logcat adb job for :Tasks list/cancel. Pure side-path:
+      -- register only, after job creation; on_exit above is untouched. This is
+      -- the adb logcat reader we spawn (NOT the DAP session), so it's safe to
+      -- list/cancel. The DAP adapter + on-device process are never registered
+      -- (K5 boundary).
+      pcall(function()
+        require("utils.task_registry").register({
+          name = "logcat:" .. tostring(pid),
+          group = "dap",
+          kind = "job",
+          handle = logcat_job,
+          started_at = os.time(),
+        })
+      end)
     end
   end
 

@@ -116,7 +116,14 @@ end
 local function open_placeholder(state)
   local group = state.group or "task"
   local title = "  " .. group .. " · " .. state.name .. "  "
-  local hint  = "running in background — press q to dismiss"
+  -- Hint reflects whether a real cancel is wired. When state.cancel exists,
+  -- <C-c> truly cancels the underlying job; q only dismisses the indicator.
+  local hint
+  if state.cancel then
+    hint = "running — q dismiss · <C-c> cancel"
+  else
+    hint = "running in background — press q to dismiss"
+  end
   local width = math.max(#title, #hint, #state.name + 8) + 2
 
   local buf = api.nvim_create_buf(false, true)
@@ -158,9 +165,20 @@ local function open_placeholder(state)
   end
 
   -- q dismisses the placeholder early. The underlying job is NOT
-  -- cancelled — this only hides the indicator.
+  -- cancelled — this only hides the indicator (back-compat: callers that
+  -- pass no `cancel` keep this exact behaviour).
   vim.keymap.set("n", "q", function()
     if active[state.name] then close_window(active[state.name]) end
+  end, { buffer = buf, nowait = true, silent = true })
+
+  -- <C-c> truly cancels the underlying job — but ONLY when the caller wired a
+  -- `cancel` callback. Without it the mapping is a no-op beyond dismissing, so
+  -- existing call sites (no `cancel`) are unaffected.
+  vim.keymap.set("n", "<C-c>", function()
+    local st = active[state.name]
+    if not st then return end
+    if st.cancel then pcall(st.cancel) end
+    close_window(st)
   end, { buffer = buf, nowait = true, silent = true })
 
   return buf, win
@@ -231,7 +249,10 @@ end
 
 ---@param opts table
 ---  { name=string, run=function(report?), hold_ms?=number,
----    on_done?=function, group?=string }
+---    on_done?=function, group?=string, cancel?=function }
+---  cancel: optional. When provided, the placeholder's <C-c> truly cancels
+---          the underlying job. Omitting it preserves the legacy behaviour
+---          (q only hides the indicator; nothing is cancelled).
 function M.launch(opts)
   assert(opts and opts.name and opts.run,
     "async_launcher.launch: name + run required")
@@ -247,6 +268,7 @@ function M.launch(opts)
     group   = opts.group or infer_group(name):gsub(":$", ""),
     started = uv.hrtime(),
     closed  = false,
+    cancel  = opts.cancel,  -- optional: truly cancel underlying job on <C-c>
   }
   active[name] = state
 

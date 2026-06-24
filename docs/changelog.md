@@ -53,7 +53,48 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
-### 2026-06-18 — Apprentice 主题（同步 Warp）+ grep 切换键 + cheatsheet 配色/扩充
+### 2026-06-18 — 通用后台任务管理（:Tasks / 派生状态注册表）
+
+**Task** — 用户：「我 space ub 发起一个任务之后怎么把他停掉」。本仓后台 job（构建/prepare/launch/install/logcat/日志流）句柄散落、部分根本没保存，`async_launcher` 的 `q` 明确「不取消底层 job」，没有统一的「列出+停止」入口。需求是通用编辑器能力，不绑 UE。
+
+**Implemented**
+- `lua/utils/task_registry.lua`（新，零业务依赖）：**派生状态架构**——记录只存 `{id,name,group,kind,handle}`，**无 `state` 字段、无 `mark_done`、无状态机**；`M.status(id)` 每次实时查句柄（`job`→`vim.fn.jobwait({h},0)`、`system`→handle `is_closing`）派生状态。唯一写入入口 `M.register`（纯内存）；`M.cancel` 先复检再动句柄（`jobstop`/`:kill`）、不回写、幂等；`M.list` 查询+GC（终态裁剪到 `KEEP_DONE=16`，无 timer）；`M.running_count`（statusline 用）；探针可注入 `_set_probe_for_test`。架构上消除「副本 vs 真相」「回调写 vs 命令写」两类竞态（见 change `ue-task-manager` design.md）。
+- `lua/utils/async_launcher.lua`：`launch` 加可选 `opts.cancel`；浮窗 `<C-c>` 真正取消（仅当有 `cancel`），`q` 维持「仅隐藏」旧语义（向后兼容，现有调用点零变化）；hint 文案据是否有 cancel 动态显示。
+- `lua/ue.lua`：接入注册表（**只在 job 创建后加一行 `register`，on_exit 零改动**）——`open_terminal_command`（build，terminal/job）、prepare gtags（`CORE_RT.prepare_jobid`）、`async_generate_compile_commands` 的 ccjson `vim.system` handle（此前丢弃，现保存并登记 kind=system）、`install_android`（jobid 此前丢弃）。注册 `:Tasks`/`:TaskStop [id]`/`:TaskStopAll`（无 UE 前缀，通用功能）；`:UEPrepare` 传 `cancel` 给 launcher。`M.statusline_status` 加 `⏵N` 计数段（N>0 显示，N==0 不占位；复用既有 eval，不新增 timer）。
+- `lua/utils/ue_launch.lua`：android launch job 登记（desktop detach job 故意不登记）。`lua/ue/dap.lua`：logcat job 登记（DAP 会话本身不登记，K5）。`lua/utils/ue_logs.lua`：日志流 job 登记。
+- `lua/config/keymaps.lua`：`<leader>X` → `:Tasks`（通用层，不挂 `<leader>u*`）。
+- `lua/utils/cheatsheet.lua`：新增「Tasks (background jobs)」段。`README.md`/`docs/README.zh-CN.md`：键位表补任务管理行。`lua/utils/CLAUDE.md`：新增「后台 job 接入 task_registry」维护契约（只追加 register、不回写 on_exit）。
+
+**Pitfalls / Gotchas**
+- 上一版方案曾用「先抢状态/禁 vim.*/generation 计数」一串规则去*管理* stored 状态机的竞态——本质是 workaround。改为**派生状态**从架构消除竞态：不存状态副本就没有可竞争对象。连带让等价性证明更强（接入点 on_exit 逐字节不变，无需证「末尾追加 mark_done 不改副作用」）。
+- ccjson 的 `vim.system` handle 此前是局部变量用完即弃；登记需在 `M.async_generate_compile_commands` 末尾 `return handle` 前加 register——注意函数末尾的 `return M`（模块导出）一度被新插入块顶掉，导致 `require("ue")` 返回 boolean、`ue.setup()` 全挂（commands_spec 3 连失败）。补回 `return M`。
+
+**Validation**
+- 新增 `tests/cases/task_registry_spec.lua`（15 用例）：register/派生 status/两类 kind cancel/幂等/cancel_all/id 单调/AR-T1 状态即真相/AR-T2-T3 取消语义/AR-T4 源码守护（无 mark_done、register 体纯内存、接入点 on_exit 无 task_registry 写）/AR-T5 list GC 有界幂等/DAP 边界。
+- `commands_spec.lua` 加 `Tasks`/`TaskStop`/`TaskStopAll` 冻结清单（3 命令）。
+- 分范围回归全绿：`task_registry` 15/15、`commands` 81/81、`cheatsheet` 105/105。全量 `nvim --headless -l tests/run.lua` → **540/540**。
+
+**Follow-ups**
+- `:Tasks` 本期用 `vim.ui.select`；design Open Question 记录的「snacks.picker 自定义源双列预览 + `dd`/`<cr>`/`gl` 多动作键」作后续增强。
+- 取消构建未杀 UBT 派生 cl.exe/link.exe 进程树（design Follow-up）。
+
+### 2026-06-18 — 任务管理快捷键扩充 + cheatsheet 双 surface 同步
+
+**Task** — 上一条只给了单键 `<leader>X`，且 cheatsheet 只更新了 float 版、markdown 版漏同步（违反本仓「双 surface 不漂移」回归）。补齐键位粒度与两个 surface。
+
+**Implemented**
+- `lua/config/keymaps.lua`：`<leader>X*` 扩成一组（与 DAP `<leader>d*` 同风格）——`<leader>X`→`:Tasks`（面板）、`<leader>Xs`→`:TaskStop`（停单个，唯一时直接停）、`<leader>XA`→`:TaskStopAll`（停全部，先确认）。
+- `lua/utils/cheatsheet.lua`：float UE tab 的「Tasks」段改用三键 + `:TaskStop [id]` + statusline `⏵N`。
+- `docs/ue_lazyvim_cheatsheet.md`（此前漏同步）：新增「⏵ Background Tasks」节（键表 + 派生状态/不确认/`<C-c>` 取消/DAP K5 边界说明）+ Contents 目录项。
+- `tests/cases/keymaps_spec.lua`：加 `<leader>X`/`Xs`/`XA` → Tasks/TaskStop/TaskStopAll 绑定断言。
+- `tests/cases/cheatsheet_spec.lua`：双 surface 防漂移锚点加入 `<leader>X`/`Xs`/`XA`（强制 markdown 必含）。
+
+**Validation**
+- `keymaps` 46/46、`cheatsheet` 109/109、`commands` 81/81；全量 `nvim --headless -l tests/run.lua` → **547/547**。
+
+
+
+
 
 **Task** — 用户要求：cheatsheet 配色难看且快捷键太少（尤其 `<leader>/` 里全字/大小写/正则怎么切）；把当前 Warp 终端主题 Apprentice 同步成 nvim colorscheme。
 

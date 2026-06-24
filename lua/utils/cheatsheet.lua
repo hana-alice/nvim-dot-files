@@ -532,6 +532,16 @@ local tabs = {
         },
       },
       {
+        title = "Tasks (background jobs)",
+        mappings = {
+          { "<leader>X",     "List tasks; select to stop (:Tasks)" },
+          { "<leader>Xs",    "Stop one (auto if single) (:TaskStop)" },
+          { "<leader>XA",    "Stop all (confirms first) (:TaskStopAll)" },
+          { ":TaskStop [id]","Stop a specific task by id" },
+          { "statusline ⏵N", "N background jobs running" },
+        },
+      },
+      {
         title = "Index / Diagnostics",
         mappings = {
           { ":UEIndexStatus",   "Index state" },

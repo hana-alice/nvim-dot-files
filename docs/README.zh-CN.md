@@ -151,6 +151,7 @@ go install ./...   # 需 Go >= 1.22，且 $GOBIN 在 PATH
 | 启动 Editor | `:UELaunch` |
 | 增删文件后重建索引 | `:UEPrepareIncremental` |
 | Android：安装 / attach / 断点 | `:UEInstallAndroid` / `:UEDAPAttach` / `F9` |
+| 后台任务：列出 / 停止 | `<leader>X` / `:Tasks` / `:TaskStopAll` |
 | 全部命令速查 | `<leader>?` / `:UECheatsheet` |
 
 完整键位与工作流手册见

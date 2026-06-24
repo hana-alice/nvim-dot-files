@@ -213,6 +213,14 @@ map("n", "gd", function()
   require("utils.lsp_fallback").definition()
 end, { desc = "Definition (LSP -> GTAGS)" })
 
+-- Generic background-task manager (list/stop any registered job). Not under
+-- <leader>u* (that namespace is UE-specific); this is a general editor feature.
+-- <leader>X* sub-keys mirror the DAP <leader>d* style: bare = panel, s = stop
+-- one, A = stop all.
+map("n", "<leader>X",  "<cmd>Tasks<cr>",       { desc = "Tasks: list / stop background jobs", nowait = true })
+map("n", "<leader>Xs", "<cmd>TaskStop<cr>",    { desc = "Tasks: stop one (auto if single)", nowait = true })
+map("n", "<leader>XA", "<cmd>TaskStopAll<cr>", { desc = "Tasks: stop all (confirms first)", nowait = true })
+
 -- Eagerly load utils.lsp_fallback so its :UEDef* user_commands
 -- (UEDefTrace / UEDefSelfTest / UEDefReload) are registered at startup
 -- — otherwise they only appear after the first gd. ~5ms cost.

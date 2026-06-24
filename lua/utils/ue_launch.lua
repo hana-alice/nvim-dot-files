@@ -395,6 +395,20 @@ local function launch_android_process(env, spec)
   if not ok or not jobid or jobid <= 0 then
     return false, "Failed to start adb launch job"
   end
+  -- Register the adb-launch job for :Tasks list/cancel. Pure side-path:
+  -- register only, after job creation; on_exit above is untouched. (The
+  -- desktop launch_desktop_process job is intentionally detach=true /
+  -- fire-and-forget and NOT registered — same rationale as the short-lived
+  -- detach jobs excluded by the task-registry design.)
+  pcall(function()
+    require("utils.task_registry").register({
+      name = "UELaunch (" .. (spec.package_name or "android") .. ")",
+      group = "android",
+      kind = "job",
+      handle = jobid,
+      started_at = os.time(),
+    })
+  end)
   return true
 end
 

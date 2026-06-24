@@ -649,6 +649,17 @@ local function start_stream(env, spec)
   end
 
   state.jobid = active_jobid
+  -- Register the log-stream job for :Tasks list/cancel. Pure side-path:
+  -- register only, after job creation; on_exit above is untouched.
+  pcall(function()
+    require("utils.task_registry").register({
+      name = spec.title or "log stream",
+      group = "log",
+      kind = "job",
+      handle = active_jobid,
+      started_at = os.time(),
+    })
+  end)
   vim.cmd("stopinsert")
 end
 

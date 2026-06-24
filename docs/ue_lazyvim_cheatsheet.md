@@ -28,6 +28,7 @@ surfaces drift apart.
 - [🎨 UI / toggles](#-ui--toggles)
 - [🪟 Windows-only](#-windows-only)
 - [🎮 UE workflow](#-ue-workflow)
+- [⏵ Background tasks](#-background-tasks-list--stop-any-job)
 - [🐞 DAP debugging](#-dap--unified-uedap-commands)
 - [📝 Logs / workarounds / markdown](#-logs--workarounds)
 
@@ -761,6 +762,31 @@ Typical first-run workflow (see the README for the full step list):
    derives its compile flags from a real platform build
 4. `:UEPrepare` — CDB pipeline + csearch index + clangd reload
 5. Open code, use `gd` / `gr` / `<leader>ss` / `<leader>/`
+
+## ⏵ Background Tasks (list / stop any job)
+
+Generic, **not UE-specific** — lists and cancels any background job this config
+spawns (build terminal, `:UEPrepare` index/ccjson, `:UELaunch` / `:UEInstallAndroid`,
+logcat, log streams). Backed by `lua/utils/task_registry.lua`, whose task state is
+**derived live** from each job handle (no stored state machine → no cancel/exit
+race). Source: `lua/config/keymaps.lua` (`<leader>X*` block), commands in `lua/ue.lua`.
+
+| Key / Command     | Action                                            |
+|-------------------|---------------------------------------------------|
+| `<leader>X`       | `:Tasks` — list tasks; select one to stop         |
+| `<leader>Xs`      | `:TaskStop` — stop one (auto if single, else pick) |
+| `<leader>XA`      | `:TaskStopAll` — stop all (confirms first)         |
+| `:TaskStop <id>`  | Stop a specific task by id                         |
+| statusline `⏵N`   | Shown when N background jobs are running (hidden at 0) |
+
+Notes:
+
+- **Stopping one task does not confirm** (re-runnable, so confirmation is noise);
+  `:TaskStopAll` confirms once (`停掉 N 个任务？`).
+- On the `:UEPrepare` progress float, `<C-c>` truly cancels the underlying jobs;
+  `q` only hides the indicator (legacy behaviour preserved).
+- Android **DAP debug sessions are never listed/killed here** (that would SIGKILL
+  the on-device game — K5). Stop a debug session with `:UEDAPStop` instead.
 
 ## 🐞 DAP — unified `UEDAP*` commands
 

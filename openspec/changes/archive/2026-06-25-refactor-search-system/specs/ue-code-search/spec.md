@@ -5,7 +5,7 @@
 
 ## MODIFIED Requirements
 
-### Requirement: `<leader>/` SHALL use csearch exclusively (never rg, ever)
+### Requirement: `<leader>/` SHALL prefer complete indexed search
 
 UE 全代码搜索（`<leader>/`）SHALL **只**使用 csearch 索引后端，**任何情况下都不得在此入口使用 rg 或目录遍历**——无论是静默降级、cached-file-list + rg 批量搜索、还是 snacks 默认目录遍历兜底，一律 MUST NOT 出现在 `<leader>/` 路径。当 csearch 索引可用时使用 csearch；当 csearch 索引不可用时，`<leader>/` SHALL 给出可见错误并引导用户运行 `:UEPrepare`，而不是回落到任何 rg / 遍历路径。
 
@@ -32,26 +32,6 @@ UE 全代码搜索（`<leader>/`）SHALL **只**使用 csearch 索引后端，**
 - **THEN** `<leader>sG`（`ue_grep_all`）SHALL 提供专用 rg 入口
 - **AND** 该入口的行为不受本契约约束
 
-### Requirement: csearch index SHALL be platform-independent (single shared index)
-
-csearch trigram 索引 SHALL 全平台共用一份，路径为 `csearch/csearch.idx`（不再按 `platform_key` 分片）。gtags workspace DB 与 cdb compile-db 资产 SHALL 仍按 `platform_key` 分片——它们是平台相关产物（编译参数 / 宏 / include / 条件编译符号按平台不同）。
-
-理由：csearch 索引的输入文件集（`workspace_all.files`）由 `engine_root` + `project_root` + 平台无关常量（`ENGINE_PICKER_DIRS` / `SCAN_EXCLUDES`）+ 平台无关白名单（`.ueprepare-scan-paths`）决定，不含任何平台维度。per-platform 分片是 cache layout v3.1 让 csearch 搭便车的结果，去之使「索引维度」与「`csearch_input_hash` 校验维度（per-engine_root，本就一份）」对齐，并令切平台不再重建 csearch 索引。
-
-#### Scenario: 解析 csearch 索引路径
-- **WHEN** 系统为任一平台 / 配置解析 csearch 索引路径
-- **THEN** 路径 SHALL 为 `csearch/csearch.idx`（与 `platform_key` 无关）
-
-#### Scenario: gtags / cdb 仍分平台
-- **WHEN** state 含 `target_platform = "Android"` 且 `target_configuration = "Development"`
-- **THEN** gtags 文件清单与 DB SHALL 仍位于 `gtags/Android-Development/`
-- **AND** cdb compile-db 资产 SHALL 仍按平台 / 配置分片
-
-#### Scenario: 切换平台
-- **WHEN** 用户在平台 / 配置间切换
-- **THEN** csearch 搜索 SHALL 继续使用同一份 `csearch/csearch.idx`，MUST NOT 因切平台而被判为缺失或需重建
-- **AND** 切平台 SHALL NOT 删除任何既有 csearch 索引
-
 ### Requirement: legacy grep caches SHALL migrate without data loss
 
 当缓存布局变更时，既有 grep 缓存 SHALL 安全迁移，不丢数据、不覆盖更新的文件，且可重复运行。迁移 SHALL 覆盖两个方向：早期「扁平 → 平台子目录」（gtags，历史 v3.1）与本次「csearch 平台子目录 → 扁平共用」。
@@ -72,6 +52,26 @@ csearch trigram 索引 SHALL 全平台共用一份，路径为 `csearch/csearch.
 > （见 change design.md 决策2 对账表）。本 change 将其**固化为 spec 契约以防回归**——尤其是
 > `<leader>/` 去 rg 后，主搜索路径变为纯 csearch，这些行为必须在 csearch 后端下保持成立。
 > 「面板内 scope 过滤」是其中唯一新增的行为。
+
+### Requirement: csearch index SHALL be platform-independent (single shared index)
+
+csearch trigram 索引 SHALL 全平台共用一份，路径为 `csearch/csearch.idx`（不再按 `platform_key` 分片）。gtags workspace DB 与 cdb compile-db 资产 SHALL 仍按 `platform_key` 分片——它们是平台相关产物（编译参数 / 宏 / include / 条件编译符号按平台不同）。
+
+理由：csearch 索引的输入文件集（`workspace_all.files`）由 `engine_root` + `project_root` + 平台无关常量（`ENGINE_PICKER_DIRS` / `SCAN_EXCLUDES`）+ 平台无关白名单（`.ueprepare-scan-paths`）决定，不含任何平台维度。per-platform 分片是 cache layout v3.1 让 csearch 搭便车的结果，去之使「索引维度」与「`csearch_input_hash` 校验维度（per-engine_root，本就一份）」对齐，并令切平台不再重建 csearch 索引。
+
+#### Scenario: 解析 csearch 索引路径
+- **WHEN** 系统为任一平台 / 配置解析 csearch 索引路径
+- **THEN** 路径 SHALL 为 `csearch/csearch.idx`（与 `platform_key` 无关）
+
+#### Scenario: gtags / cdb 仍分平台
+- **WHEN** state 含 `target_platform = "Android"` 且 `target_configuration = "Development"`
+- **THEN** gtags 文件清单与 DB SHALL 仍位于 `gtags/Android-Development/`
+- **AND** cdb compile-db 资产 SHALL 仍按平台 / 配置分片
+
+#### Scenario: 切换平台
+- **WHEN** 用户在平台 / 配置间切换
+- **THEN** csearch 搜索 SHALL 继续使用同一份 `csearch/csearch.idx`，MUST NOT 因切平台而被判为缺失或需重建
+- **AND** 切平台 SHALL NOT 删除任何既有 csearch 索引
 
 ### Requirement: `<leader>/` 结果呈现 SHALL 提供分组、计数与后端状态
 

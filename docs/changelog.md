@@ -53,6 +53,29 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-06-25 — fix(cdb): UEPrepare 的 cdb_partition 与 pipeline 并发撕裂 compile_commands.json（JSONDecodeError 根治）
+
+**Task** — `:UEPrepare` 稳定报错 `ue-pipeline failed (exit 1)` / `json.decoder.JSONDecodeError`（每次偏移不同：char 68551910 / 32430658 / 86744524）。用户只触发一次 UEPrepare，排除手动重入。
+
+**根因（打 log 坐实，非推测）** — fast-path 在 `lua/ue.lua` 起 **async** pipeline（`run_compile_commands_pipeline` → jobstart 立即返回）后，**紧跟同步**跑 `INDEX_FN.partition_base_cdb`，两者并发改写同一个 `<engine_root>/compile_commands.json`（225MB）。带毫秒时间戳的探针实证：`partition START (260175301)` 落在 `pipeline START (260175285)` 与 `pipeline EXIT (260182943)` 之间，partition 全程 ~5.6s 与 pipeline 重叠 → pipeline 的 resolve 阶段读到被 partition 撕裂的中间态 → JSONDecodeError。失败 run 的 partition 备份 `compile_commands.json.bak-20260625-173955`（单行撕裂态）是另一铁证。
+
+**Implemented**
+- `run_compile_commands_pipeline(path, targets, on_done?)` 新增 `on_done` 形参，透传给 `ue.cdb.pipeline.run`（pipeline 本就支持 on_done，wrapper 之前没转发）。
+- fast-path（`lua/ue.lua` ~8402）把 `partition_base_cdb` 从「pipeline 之后立即同步」改为「pipeline 的 `on_done` 回调内」——严格串行在 expand→pch→resolve→unify→prune 完成之后，消除并发写。
+- `on_done` 在 pipeline 的 no-change 与 changed 两条路径都触发（pipeline.lua:189/199），且在 copy_file 到 sibling targets 之后，故 partition 必见最终 base CDB。
+
+**Pitfalls / Gotchas**
+- 误区排查链：先疑「非原子写被中断」→ 再疑「writer/reader 编码不一致（prebuild_pch_v2.py:467 缺 encoding=）」→ 都被证伪（失败时磁盘文件事后是干净 ASCII / 单行）。最终靠时间戳探针锁定是**单次 run 内部自起的两个并发写者**。原子写只是兜底，真因是并发，治本是串行化。
+- 仅 fast-path 同时调 pipeline+partition；cold/full（`generate_compile_commands`）与平台切换（`fast_swap_active_platform`）不调 partition，无此 race；手动 `:UECDBPartition`/`:UECDBSwitch` 无并发 pipeline。
+- 残留隐患（未本次处理）：`prebuild_pch_v2.py:467` / `prune_include_dirs.py:431` 的 CDB 写缺 `encoding='utf-8'`，UE 路径含非 ASCII 时是潜在 bug；各 pipeline 脚本 in-place 写非原子，中断仍可留半成品。可后续单开 cdb 加固 change。
+
+**Validation**
+- 修复后真实 `:UEPrepare`（一个 225MB CDB 的 UE 项目）：pipeline 的 resolve 阶段 **成功通过** `resolve_cdb_paths: resolved 3044 relative paths`（此前每次死在此处），不再有 JSONDecodeError。（测试窗口 2min timeout 截断了后续 unify/prune + clangd 索引，属测试窗口短，非 bug。）
+- 全量回归 `nvim --headless -l tests/run.lua` = **551/551 passed, 0 failed**；分范围 `ue_cdb` 8/8、`smoke` 16/16。
+
+**Follow-ups**
+- cdb 脚本 encoding= + 原子写加固（潜在，未阻塞当前修复）。
+
 ### 2026-06-25 — search 系统小幅度重构：csearch 去平台化 + `<leader>/` 从不加 rg + 面板内 scope
 
 **Task** — `<leader>/` 距 Rider 体验有差距；调研结论：csearch 是 Windows 内容搜索天花板（Everything 1.5 内容索引不适合源码树、zoekt P13 死路），真问题在 ①csearch 索引被无谓地按平台分片、②`<leader>/` 仍会静默降级到 rg、③UI 已实现但可发现性差。本次落实前两项 + 补面板内 scope。OpenSpec change：`refactor-search-system`。

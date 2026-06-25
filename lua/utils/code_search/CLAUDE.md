@@ -18,8 +18,13 @@ trigram 索引（google/codesearch 的 csearch）驱动的亚秒级 live grep，
   `is_indexed()=false`（曾导致 `<leader>/` 静默走最慢目录遍历、搜不全）。
   UEPrepare 完成 / 切项目 / 切平台后调 `_reset_probe_cache()` 强制重探。→ 见
   `../../../docs/architecture/grep-cache-invalidation.md`
-- **索引按平台+配置分路径**：`ctx.paths.csearch_idx` = `csearch/<Platform>-<Config>/csearch.idx`
-  （由 `ue.cache_paths(root, platform_key)` 推导）。切平台不删旧平台索引。
+- **索引平台无关，全平台共用一份**（cache layout v3.2）：`ctx.paths.csearch_idx` =
+  `csearch/csearch.idx`（不再按平台分片）。理由：csearch 文件清单输入平台无关，且
+  `csearch_input_hash`（per-engine_root）与单份索引天然对齐。**gtags/cdb 仍 per-platform**
+  （编译相关）。切平台不重建、不删 csearch；旧 `csearch/<key>/` 残留靠 freshness 判 stale
+  → 下次 `:UEPrepare` 重建。见 change `refactor-search-system`。
+- **`<leader>/` 是 csearch-only 入口，从不加 rg**：无索引时弹可见 ERROR 引导 `:UEPrepare`、
+  不开任何 picker。rg 仅存在于 ① `stream()` 内部供 gd/gr 兜底（P12）、② `<leader>sG` 显式入口。
 
 ## 改动 → 必跑回归
 

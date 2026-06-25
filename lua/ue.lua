@@ -1249,16 +1249,18 @@ function CORE_RT.platform_key_from_state(state)
   return plat .. "-" .. conf
 end
 
--- Cache layout v3 (2026-05-09):
+-- Cache layout v3 (2026-05-09; v3.2 de-platforms csearch):
 --   .cache/nvim-ue/                           -- single root, all cache lives here
 --     state.json                              -- top-level (scanner-friendly)
---     csearch/<platform_key>/csearch.idx      -- trigram index (per-platform, v3.1)
+--     csearch/csearch.idx                     -- trigram index (PLATFORM-INDEPENDENT, v3.2)
 --     gtags/<platform_key>/                   -- gtags input lists + DB (per-platform, v3.1)
 --       workspace/         (GTAGS DB)
 --       workspace.files / workspace_all.files / engine.files / project.files
---     (legacy single-path csearch/csearch.idx + gtags/*.files auto-migrated
---      into the active platform_key dir on first resolve — see
---      migrate_legacy_csearch_if_needed)
+--     (v3.2: csearch index is shared across all platforms — its input file set
+--      has no platform dimension. Users upgrading from the old per-platform
+--      csearch/<key>/csearch.idx are handled by mark-stale → next :UEPrepare
+--      rebuilds the shared index. gtags/*.files still migrate per-platform via
+--      migrate_legacy_csearch_if_needed.)
 --     cdb/                                    -- clangd compile-db assets
 --       modules.json, queue.json
 --       compile_commands/{current,hot,full,inject_full}.json
@@ -1287,8 +1289,15 @@ end
 cache_paths = function(engine_root, platform_key)
   local cache = join(engine_root, ".cache", "nvim-ue")
   platform_key = (type(platform_key) == "string" and platform_key ~= "") and platform_key or nil
-  -- Per-platform subdir for grep artifacts; legacy single path when no key.
-  local csearch_dir = platform_key and join(cache, "csearch", platform_key) or join(cache, "csearch")
+  -- csearch index is PLATFORM-INDEPENDENT (single shared index for all
+  -- platforms/configs). Its input file set (workspace_all.files) is derived
+  -- from engine_root + project_root + platform-agnostic constants/whitelist
+  -- (ENGINE_PICKER_DIRS / SCAN_EXCLUDES / .ueprepare-scan-paths), so the
+  -- trigram index has no platform dimension. The flat `csearch/` path also
+  -- aligns with csearch_input_hash (stored per-engine_root in state.json).
+  -- See change `refactor-search-system` (de-platforming) for the proof.
+  -- gtags/cdb REMAIN per-platform (compile args/macros/includes differ).
+  local csearch_dir = join(cache, "csearch")
   local gtags_root = platform_key and join(cache, "gtags", platform_key) or join(cache, "gtags")
   local cdb_dir = join(cache, "cdb")
   local cdb_files_dir = join(cdb_dir, "compile_commands")
@@ -1379,11 +1388,15 @@ function CORE_RT.migrate_legacy_csearch_if_needed(engine_root, platform_key)
     end
   end
 
-  -- csearch index (+ cindex tmp staging siblings)
-  move_if(legacy.csearch_idx, active.csearch_idx)
-  move_if(legacy.csearch_idx .. "~", active.csearch_idx .. "~")
-  move_if(legacy.csearch_idx .. "~~", active.csearch_idx .. "~~")
-  -- grep file lists
+  -- csearch index is now PLATFORM-INDEPENDENT (flat csearch/csearch.idx for
+  -- all platforms — see cache_paths + change `refactor-search-system`). So
+  -- legacy.csearch_idx == active.csearch_idx and there is nothing to migrate
+  -- here. Users upgrading from the old per-platform csearch layout
+  -- (csearch/<key>/csearch.idx) are handled by mark-stale: the flat index
+  -- won't exist, prepare_freshness returns "stale", and the next :UEPrepare
+  -- rebuilds the shared index. The old csearch/<key>/ dirs are left untouched
+  -- (not deleted solely due to de-platforming).
+  -- grep file lists (gtags — still per-platform)
   move_if(legacy.project_list, active.project_list)
   move_if(legacy.engine_list, active.engine_list)
   move_if(legacy.workspace_list, active.workspace_list)
@@ -6142,6 +6155,22 @@ function M.cached_grep(opts)
   local has_index = code_search.is_indexed(cs_ctx)
   local backend_label = has_index and "csearch" or "rg"
 
+  -- In-panel scope filter (change `refactor-search-system`): capture the
+  -- current buffer's module/plugin scope at open time so <a-s> can restrict
+  -- the search to it without leaving the picker. The scope's root path is
+  -- escaped into an RE2 fragment passed to csearch's -f file-path filter.
+  -- nil when the current file isn't inside any module/plugin (toggle no-ops).
+  local grep_scope = current_scope_info_from_context(ctx)
+  local function scope_path_regex(scope)
+    if not scope or not scope.root then return nil end
+    -- csearch indexes absolute paths with forward slashes (see UEPrepare
+    -- filelist writer). Normalize + escape RE2 metachars in the root so the
+    -- -f regex matches "<root>/..." literally.
+    local root = norm(scope.root)
+    local esc = root:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?%{%}%|%\\/])", "\\%1")
+    return esc
+  end
+
   local title_default = CORE_RT.grep_backend_title("Grep All Code", backend_label)
   local live_min_chars = opts.live_min_chars or 2
   local live_max_count = opts.max_count or 5000
@@ -6300,12 +6329,14 @@ function M.cached_grep(opts)
     end
   end
 
-  -- Temporary always-on diagnostic for the current "<leader>/ missing
-  -- results" investigation. The user explicitly allowed logs; remove after
-  -- they confirm the fix. This captures backend + mode + result counts
-  -- without requiring the heavier trace toggle above.
+  -- Backend diagnostic — now OPT-IN (was always-on during the "<leader>/
+  -- missing results" investigation; that's confirmed fixed). Gated on the same
+  -- vim.g.ue_grep_trace flag so a normal grep writes nothing to disk (P5: no
+  -- silent per-action side-effects). Enable with :UEGrepTraceToggle when
+  -- debugging backend/mode/result-count.
   local debug_log_path = vim.fn.stdpath("state") .. "/ue_grep_backend_debug.log"
   local function grep_debug(fmt, ...)
+    if vim.g.ue_grep_trace ~= true then return end
     local ok, line = pcall(string.format, fmt, ...)
     if not ok then
       line = tostring(fmt)
@@ -6353,15 +6384,19 @@ function M.cached_grep(opts)
       regex = false,
       word = false,
       case = false,
+      scoped = false,
       toggles = {
         regex = { icon = "R", value = true },
         word  = { icon = "W", value = true },
         case  = { icon = "C", value = true },
+        scoped = { icon = "S", value = true },
       },
       -- Keymaps: Alt-r/g/x/w/c = mode toggles, shown live as R/W/C icons in
       -- the picker title. <a-r> is the intuitive "regex" toggle (matches
       -- snacks' own default); <a-g> = "grep regex" mnemonic alias. Both flip
       -- the same regex flag. <a-w>/<a-x> = whole-word, <a-c> = case-sensitive.
+      -- <a-s> = restrict to the current module/plugin scope (in-panel scope
+      -- filter; shows an "S" icon when active).
       -- NOTE: <a-r> previously collided with NVIDIA App's global Performance
       -- Overlay hotkey; if it ever stops reaching nvim again, use <a-g>.
       win = vim.tbl_deep_extend("force", grouping_enabled and fast_tab_keys.win or {}, {
@@ -6371,6 +6406,7 @@ function M.cached_grep(opts)
           ["<a-x>"] = { "ue_grep_toggle_word",  mode = { "i", "n" } },
           ["<a-w>"] = { "ue_grep_toggle_word",  mode = { "i", "n" } },
           ["<a-c>"] = { "ue_grep_toggle_case",  mode = { "i", "n" } },
+          ["<a-s>"] = { "ue_grep_toggle_scope", mode = { "i", "n" } },
         } },
       }),
       actions = {
@@ -6391,6 +6427,21 @@ function M.cached_grep(opts)
           require("snacks").notify((picker.opts.case and "✓ case-sensitive ON " or "✗ ignore-case"),
             { title = "UE grep", level = "info" })
           grep_debug("TOGGLE backend=csearch case=%s", tostring(picker.opts.case == true))
+          picker.list:set_target(); picker:find()
+        end,
+        ue_grep_toggle_scope = function(picker)
+          if not grep_scope then
+            require("snacks").notify(
+              "✗ no module/plugin scope (current file isn't inside one)",
+              { title = "UE grep", level = "warn" })
+            return
+          end
+          picker.opts.scoped = not picker.opts.scoped
+          require("snacks").notify(
+            (picker.opts.scoped
+              and ("✓ scope: " .. (grep_scope.label or grep_scope.name or "current"))
+              or "✗ scope OFF (whole workspace)"),
+            { title = "UE grep", level = "info" })
           picker.list:set_target(); picker:find()
         end,
       },
@@ -6437,6 +6488,7 @@ function M.cached_grep(opts)
             tostring(pattern), tostring(_po.regex == true), tostring(_po.word == true),
             tostring(mode_case), tostring(mode_ignore_case),
             pattern_len <= live_min_chars and short_live_max_count or live_max_count)
+          local scope_re = (_po.scoped and grep_scope) and scope_path_regex(grep_scope) or nil
           local stop = code_search.stream(cs_ctx, pattern, {
             code_only   = opts.code_only,
             smart_case  = true,
@@ -6445,6 +6497,7 @@ function M.cached_grep(opts)
             word        = _po.word == true,
             case        = mode_case,
             ignore_case = mode_ignore_case,
+            path_filter = scope_re,            -- in-panel scope filter (<a-s>)
           }, {
             on_line = function(file, lnum, col, text)
               if not cs_first_line_logged then
@@ -6673,246 +6726,24 @@ function M.cached_grep(opts)
     return true
   end
 
-  -- ── rg-batched fallback (v2): cached file list + per-batch rg ────────
-  -- Used when no csearch index exists yet (UEPrepare hasn't been run, or
-  -- cindex-uefilter isn't installed). This path is the legacy ~14-30s
-  -- behavior on UE workspaces. To get sub-second grep, run :UEPrepare.
-
-  local info = cached_file_list_info(opts, "all")
-  if not info then
-    -- No cached file list and no csearch index; let snacks fall back to
-    -- its default grep over the directory tree (slowest path).
-    -- Make the fall-through VISIBLE: a silent nil here means ue_project_grep
-    -- runs a plain dir-walk that excludes ThirdParty and is NOT index-backed,
-    -- so the user gets incomplete results with no signal (the bug this whole
-    -- change fixes). One-shot WARN per buffer (no ticker — see P5).
-    if not vim.b._ue_grep_fallback_warned then
-      vim.b._ue_grep_fallback_warned = true
-      vim.schedule(function()
-        vim.notify(
-          "UE grep: no csearch index and no cached file list — falling back to a " ..
-          "slow directory walk that may MISS files. Run :UEPrepare for complete, " ..
-          "sub-second grep.",
-          vim.log.levels.WARN, { title = "UE" })
-      end)
-    end
-    return nil
+  -- ── No csearch index: <leader>/ NEVER falls back to rg ─────────────
+  -- Hard contract (change `refactor-search-system`): this entry is csearch-
+  -- ONLY. We removed all three former rg back-doors (rg-batched fallback,
+  -- return-nil -> snacks dir-walk, and the "ue_grep_rg" fast-path). When no
+  -- csearch index is available we surface a visible error and open NO picker.
+  -- rg lives on elsewhere: <leader>sG (ue_grep_all) is the explicit rg entry,
+  -- and code_search.stream() keeps its rg branch for gd/gr fallback (P12).
+  if not vim.b._ue_grep_no_index_warned then
+    vim.b._ue_grep_no_index_warned = true
+    vim.schedule(function()
+      vim.notify(
+        "UE grep: no csearch index — <leader>/ is csearch-only and will not " ..
+        "fall back to rg. Run :UEPrepare to build the index. " ..
+        "(For an explicit rg search use <leader>sG.)",
+        vim.log.levels.ERROR, { title = "UE" })
+    end)
   end
-
-  local rg = _uproc.first_executable({ "rg" })
-  if not rg then
-    return nil
-  end
-
-  local ok, proc = pcall(require, "snacks.picker.source.proc")
-  if not ok then
-    return nil
-  end
-
-  local files
-  local files_ready = false
-  local function ensure_files()
-    if not files_ready then
-      files = read_cached_paths(info.list_path, info.root) or false
-      files_ready = true
-    end
-    return files ~= false and files or nil
-  end
-
-  local batch_size = 200
-  local uv = vim.uv or vim.loop
-  local spawn_arg_limit = uv and uv.os_uname().sysname == "Windows_NT" and 28000 or nil
-
-  local function estimate_arg_cost(arg)
-    return #tostring(arg) + 3
-  end
-
-  -- Hint the user that csearch would make this fast.
-  if not vim.b._ue_grep_csearch_hint_shown then
-    vim.b._ue_grep_csearch_hint_shown = true
-    vim.notify(
-      "UE grep: no csearch index. Run :UEPrepare for sub-second search.",
-      vim.log.levels.INFO,
-      { title = "UE" }
-    )
-  end
-
-  snacks.picker.pick({
-    source = "ue_grep_rg",
-    title = CORE_RT.grep_backend_title(opts.title or title_default, backend_label),
-    search = opts.search or "",
-    live = true,
-    need_search = true,
-    limit = live_max_count,
-    limit_live = live_max_count,
-    layout = { preset = "telescope" },
-    -- Same toggle wiring as csearch path (see comment there).
-    regex = false,
-    word = false,
-    case = false,
-    toggles = {
-      regex = { icon = "R", value = true },
-      word  = { icon = "W", value = true },
-      case  = { icon = "C", value = true },
-    },
-    win = vim.tbl_deep_extend("force", grouping_enabled and fast_tab_keys.win or {}, {
-      input = { keys = {
-        ["<a-g>"] = { "ue_grep_toggle_regex", mode = { "i", "n" } },
-        ["<a-x>"] = { "ue_grep_toggle_word",  mode = { "i", "n" } },
-        ["<a-w>"] = { "ue_grep_toggle_word",  mode = { "i", "n" } },
-        ["<a-c>"] = { "ue_grep_toggle_case",  mode = { "i", "n" } },
-      } },
-    }),
-    actions = {
-      ue_grep_toggle_regex = function(picker)
-        picker.opts.regex = not picker.opts.regex
-        require("snacks").notify((picker.opts.regex and "✓ regex ON " or "✗ regex OFF (literal)"),
-          { title = "UE grep", level = "info" })
-        picker.list:set_target(); picker:find()
-      end,
-      ue_grep_toggle_word = function(picker)
-        picker.opts.word = not picker.opts.word
-        require("snacks").notify((picker.opts.word and "✓ whole-word ON " or "✗ whole-word OFF"),
-          { title = "UE grep", level = "info" })
-        picker.list:set_target(); picker:find()
-      end,
-      ue_grep_toggle_case = function(picker)
-        picker.opts.case = not picker.opts.case
-        require("snacks").notify((picker.opts.case and "✓ case-sensitive ON " or "✗ ignore-case"),
-          { title = "UE grep", level = "info" })
-        grep_debug("TOGGLE backend=rg case=%s", tostring(picker.opts.case == true))
-        picker.list:set_target(); picker:find()
-      end,
-    },
-    format = grouping_enabled and format_grouped or nil,
-    preview = grouping_enabled and preview_grouped or nil,
-    on_show = grouping_enabled and on_show_picker or nil,
-    confirm = grouping_enabled and confirm_grouped or nil,
-    finder = function(picker_opts, finder_ctx)
-      local pattern = finder_ctx.filter.search
-      if not CORE_RT.grep_live_search_ready(pattern, live_min_chars) then
-        return function() end
-      end
-
-      local loaded_files = ensure_files()
-      if not loaded_files then
-        return function() end
-      end
-
-      -- Read mode toggles from picker.opts (same wiring as csearch path).
-      local _picker = finder_ctx and finder_ctx.picker
-      local _po = _picker and _picker.opts or {}
-      local mode_regex = _po.regex == true
-      local mode_word  = _po.word == true
-      local mode_case  = _po.case == true
-      local mode_ignore_case = not mode_case
-      grep_debug("FINDER backend=rg pattern=%q regex=%s word=%s case=%s ignore_case=%s files_ready=%s",
-        tostring(pattern), tostring(mode_regex), tostring(mode_word), tostring(mode_case),
-        tostring(mode_ignore_case), tostring(loaded_files ~= nil))
-
-      return function(cb)
-        -- Wrap cb to inject file-header items between file groups.
-        if grouping_enabled then
-          cb = make_grouping_cb(cb)
-        end
-
-        local base_args = {
-          "--color=never",
-          "--no-heading",
-          "--with-filename",
-          "--line-number",
-          "--column",
-          "--max-columns=500",
-          "--max-columns-preview",
-          "-0",
-        }
-        -- Case mode: explicit case-sensitive ⇒ -s, else ignore-case. UE CVar
-        -- searches are frequently typed as camelCase fragments (e.g.
-        -- r.useLandscape) while source/config uses r.UseLandscape..., so the
-        -- default must not be rg smart-case.
-        if mode_case then
-          table.insert(base_args, "--case-sensitive")
-        else
-          table.insert(base_args, "--ignore-case")
-        end
-        -- Regex mode: when off, take input literally. -F is rg's
-        -- fixed-strings flag; combined with -w it still matches whole
-        -- words (rg treats -F as the engine, -w as a wrapper).
-        if not mode_regex then
-          table.insert(base_args, "--fixed-strings")
-        end
-        if mode_word then
-          table.insert(base_args, "--word-regexp")
-        end
-        table.insert(base_args, "--")
-        table.insert(base_args, pattern)
-
-        -- Windows CreateProcess hits a ~32k command-line ceiling, so split
-        -- batches by both file count and estimated argument length.
-        local args = vim.deepcopy(base_args)
-        local current_arg_cost = 0
-        for _, arg in ipairs(base_args) do
-          current_arg_cost = current_arg_cost + estimate_arg_cost(arg)
-        end
-        local current_batch_size = 0
-
-        local function flush_batch()
-          if current_batch_size == 0 then
-            return
-          end
-
-          local batch_args = args
-          proc.proc(
-            {
-              notify = false,
-              cmd = rg,
-              args = batch_args,
-              transform = function(item)
-                local file_sep = item.text:find("\0")
-                if not file_sep then
-                  return false
-                end
-                local file = item.text:sub(1, file_sep - 1)
-                local rest = item.text:sub(file_sep + 1)
-                local line, col, text = rest:match("^(%d+):(%d+):(.*)$")
-                if not (line and col and text) then
-                  return false
-                end
-                item.text = file .. ":" .. rest
-                item.pos = { tonumber(line), tonumber(col) - 1 }
-                item.file = file
-                return item
-              end,
-            },
-            finder_ctx
-          )(cb)
-
-          args = vim.deepcopy(base_args)
-          current_arg_cost = 0
-          for _, arg in ipairs(base_args) do
-            current_arg_cost = current_arg_cost + estimate_arg_cost(arg)
-          end
-          current_batch_size = 0
-        end
-
-        for _, file in ipairs(loaded_files) do
-          local file_cost = estimate_arg_cost(file)
-          local exceeds_batch_size = current_batch_size >= batch_size
-          local exceeds_arg_limit = spawn_arg_limit and (current_arg_cost + file_cost) > spawn_arg_limit
-          if current_batch_size > 0 and (exceeds_batch_size or exceeds_arg_limit) then
-            flush_batch()
-          end
-          args[#args + 1] = file
-          current_arg_cost = current_arg_cost + file_cost
-          current_batch_size = current_batch_size + 1
-        end
-
-        flush_batch()
-      end
-    end,
-  })
-
-  return true
+  return nil
 end
 
 -- ==========================================================================
@@ -7830,11 +7661,11 @@ local function set_platform(input)
     refresh_statusline()
     CORE_RT.context_cache = {}
     CORE_RT.freshness_notified = {}
-    -- Per-platform grep cache: switching platform points csearch/workspace_all
-    -- at csearch/<new-key>/ etc. We do NOT delete the previous platform's
-    -- index (cross-platform users keep both). If the new platform has no
-    -- csearch index yet, the next <leader>/ will surface the visible
-    -- "run :UEPrepare" fallback (no silent stale results).
+    -- Switching platform repoints gtags/cdb at their <new-key>/ shards, but
+    -- the csearch index is PLATFORM-INDEPENDENT (v3.2) — the same shared
+    -- csearch/csearch.idx serves every platform, so switching platform does
+    -- NOT invalidate or rebuild it. (migrate_legacy_csearch_if_needed still
+    -- migrates gtags lists/DB into the new platform dir.)
     pcall(function() require("utils.code_search")._reset_probe_cache() end)
     do
       local new_state = read_state(engine_root)

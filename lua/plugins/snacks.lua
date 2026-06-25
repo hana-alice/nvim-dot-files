@@ -293,31 +293,21 @@ end
 ---------- Grep ----------
 
 local function ue_project_grep(query)
-  local snacks = require("snacks")
   local ue = get_ue()
 
-  -- Try cached grep first (avoids NTFS directory traversal)
+  -- <leader>/ is csearch-ONLY (change `refactor-search-system`): it NEVER falls
+  -- back to rg or a directory walk. cached_grep() runs the indexed search when a
+  -- csearch index exists; when it doesn't, cached_grep() surfaces a visible
+  -- error (and opens no picker) and returns nil. We do NOT open snacks.picker.grep
+  -- here — that was the last rg back-door. For an explicit rg search use
+  -- <leader>sG (ue_grep_all).
   if ue then
     local grep_opts = { title = "Grep All Code (Engine+Project)" }
     if type(query) == "string" and query ~= "" then
       grep_opts.search = query
     end
-    if ue.cached_grep(grep_opts) then
-      return
-    end
+    ue.cached_grep(grep_opts)
   end
-
-  -- Fallback: standard directory-based grep. This path is NOT index-backed
-  -- and excludes ThirdParty etc., so it can miss files the csearch/rg paths
-  -- find. Title says "slow fallback" so the missing [csearch]/[rg] suffix is
-  -- not mistaken for a complete result. cached_grep() already emitted a
-  -- one-shot WARN explaining why (no index / no cached list).
-  local opts = with_glob(workspace_opts(), all_globs()) or {}
-  if type(query) == "string" and query ~= "" then
-    opts.search = query
-  end
-  opts.title = "Grep All Code (slow fallback — run :UEPrepare)"
-  return snacks.picker.grep(opts)
 end
 
 local function ue_grep()

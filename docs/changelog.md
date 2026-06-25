@@ -53,6 +53,30 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-06-25 — search 系统小幅度重构：csearch 去平台化 + `<leader>/` 从不加 rg + 面板内 scope
+
+**Task** — `<leader>/` 距 Rider 体验有差距；调研结论：csearch 是 Windows 内容搜索天花板（Everything 1.5 内容索引不适合源码树、zoekt P13 死路），真问题在 ①csearch 索引被无谓地按平台分片、②`<leader>/` 仍会静默降级到 rg、③UI 已实现但可发现性差。本次落实前两项 + 补面板内 scope。OpenSpec change：`refactor-search-system`。
+
+**Implemented**
+- **csearch 索引去平台化**（cache layout v3.2）：`ue.lua cache_paths` 的 `csearch_idx` 由 `csearch/<platform_key>/csearch.idx` 改为扁平 `csearch/csearch.idx`，全平台共用一份。依据：csearch 文件清单输入（`engine_root`+`project_root`+平台无关的 `ENGINE_PICKER_DIRS`/`SCAN_EXCLUDES`/`.ueprepare-scan-paths`）无平台维度；且 `csearch_input_hash` 本就 per-engine_root，去平台化使校验维度与索引维度对齐。gtags/cdb 仍 per-platform（编译相关）。
+- **迁移（M2 标记 stale）**：`migrate_legacy_csearch_if_needed` 不再搬运 csearch（扁平后 legacy==active），只迁移 gtags lists/DB；旧 `csearch/<key>/` 不删，靠 `prepare_freshness` 判 stale → 下次 `:UEPrepare` 重建共用索引。更新 `fast_swap_active_platform` 注释（切平台不再动 csearch）。
+- **`<leader>/` 从不加 rg**：移除 4 处 rg 暗门——`cached_grep` 内 ②rg-batched fallback、③`return nil`→snacks 目录遍历、rg fast-path（`source="ue_grep_rg"`，~240 行），以及 `snacks.lua ue_project_grep` 的 `snacks.picker.grep` 兜底（design 原稿漏列的第 4 处）。无索引时弹可见 ERROR 引导 `:UEPrepare`、不开任何 picker。`code_search.stream()` 内 rg 分支保留（gd/gr 兜底 P12）；`<leader>sG` 仍是显式 rg 入口。
+- **面板内 scope 过滤**（`<a-s>`）：新增 `ue_grep_toggle_scope` action + `scoped` toggle（标题 "S" 图标）。复用 csearch 单一 `-f` 文件路径正则；新增纯函数 `code_search._compose_file_regex(opts)` 把 `code_only` 扩展名正则与 scope 路径正则折叠为一条 RE2（`<scope>.*<exts>$`，RE2 无 lookahead）。scope 取自当前 buffer 的 module/plugin（`current_scope_info_from_context`），开面板时捕获。
+
+**Pitfalls / Gotchas**
+- csearch 只接受**单个** `-f`（实测 `csearch --help`），RE2 无 lookahead → scope+code_only 必须折叠成一条线性正则，不能传两个 `-f`。
+- 第 4 处 rg 暗门在 wrapper 层（`ue_project_grep`），不在 `cached_grep` 内——design 原稿只列了 3 处，实施时补正并回写 design.md。
+- 去平台化后 `grep_cache_spec` 多条断言（per-platform 路径、csearch 迁移、rg 路径 case 接线、slow-fallback 标题）全部失效，按新契约重写。
+
+**Validation**
+- 全量回归 `nvim --headless -l tests/run.lua` = **551/551 passed, 0 failed**。
+- 分范围：`grep_cache`（25/25，含新增去平台化路径断言 + scope `-f` 组合 + csearch-only 静态接线）、`csearch`（13/13）、`ue_goto_behavior`（6/6，确认 gd/gr 的 rg 兜底链未被砸穿）、`utils`（30/30）。
+- `ue.lua` / `code_search/init.lua` headless `require` 加载无错。
+
+**Follow-ups**
+- 可发现性（Rider 风常驻 toggle 提示栏 / `footer_keys`）仍是候选子项，未在本次落地。
+- 文档：cheatsheet/README/`code_search/CLAUDE.md` 同步（本条目同批）。
+
 ### 2026-06-18 — 通用后台任务管理（:Tasks / 派生状态注册表）
 
 **Task** — 用户：「我 space ub 发起一个任务之后怎么把他停掉」。本仓后台 job（构建/prepare/launch/install/logcat/日志流）句柄散落、部分根本没保存，`async_launcher` 的 `q` 明确「不取消底层 job」，没有统一的「列出+停止」入口。需求是通用编辑器能力，不绑 UE。

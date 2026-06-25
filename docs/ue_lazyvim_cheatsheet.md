@@ -359,11 +359,24 @@ Source: `lua/plugins/snacks.lua` (`<leader>;` / `fe` / `e` / `/` /
 | `<CR>`           | Confirm                                 |
 | `<Esc>` / `q`    | Close picker                            |
 
-### Refining a live grep — whole-word, case, regex (read this)
+### Refining a grep — whole-word, case, regex, scope (read this)
 
-`<leader>/` (and `<leader>sg/sG`) open a **live grep** that pipes your input to
-ripgrep. There is no separate keystroke "after typing" to turn on whole-word or
-case — you control ripgrep two ways:
+**`<leader>/` is csearch-only** (sub-second trigram index; never falls back to
+rg). It does **not** use ` -- ` rg flags — instead it has **visual toggles** you
+press inside the picker (the active ones show as icons in the title):
+
+| Key | Toggle |
+|---|---|
+| `<a-r>` / `<a-g>` | regex on/off (off = literal) — shows **R** |
+| `<a-w>` / `<a-x>` | whole-word — shows **W** |
+| `<a-c>` | case-sensitive (default ignore-case) — shows **C** |
+| `<a-s>` | restrict to current module/plugin **scope** — shows **S** |
+
+If there's no csearch index, `<leader>/` shows an error telling you to run
+`:UEPrepare` (it will NOT silently fall back to a slow rg search).
+
+**`<leader>sg` / `<leader>sG` are the explicit rg entries** — these open a
+**live grep** that pipes your input to ripgrep, controlled two ways:
 
 1. **Inline rg flags** — type your pattern, then ` -- ` (space-dash-dash-space),
    then any ripgrep flags. The text before `--` is the pattern, the rest are

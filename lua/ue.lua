@@ -5510,7 +5510,13 @@ end
 --- @param path string the compile_commands.json file to process
 --- @param targets string[]|nil list of compile_commands targets; after pipeline
 ---        finishes the first target is copied to the others and clangd restarts.
-local function run_compile_commands_pipeline(path, targets)
+--- @param on_done fun()? optional callback run AFTER the pipeline job completes.
+---        CRITICAL: anything that reads/writes the base compile_commands.json
+---        (e.g. cdb_partition) MUST run here, not concurrently with the async
+---        pipeline — otherwise the two writers tear the file mid-write and the
+---        pipeline's resolve stage hits a JSONDecodeError. See changelog
+---        2026-06-25 "cdb_partition race".
+local function run_compile_commands_pipeline(path, targets, on_done)
   -- ue.cdb.pipeline drives the expand → pch → resolve → unify → prune
   -- chain. We inject `_logged_jobstart` here so the pipeline module stays
   -- import-safe (no circular require to ue.lua) and headlessly testable.
@@ -5520,7 +5526,7 @@ local function run_compile_commands_pipeline(path, targets)
     notify    = function(msg, level) vim.notify(msg, level) end,
     log_error = function(scope, msg) require("utils.log").notify_error(scope, msg) end,
   })
-  pipeline.run(path, targets)
+  pipeline.run(path, targets, on_done)
 end
 
 local function write_compile_commands_targets(ctx, content)
@@ -8386,17 +8392,23 @@ local function prepare_async(opts)
         -- whose lifetime is tied to the main nvim, not the subprocess).
         -- Start it here in the main nvim.
         local targets_main = compile_commands_targets(ctx)
-        run_compile_commands_pipeline(targets_main[1], targets_main)
-        -- Partition base CDB by (plat, cfg) so clangd's gd on macros like
-        -- UE_BUILD_DEVELOPMENT does not jump into stale Dev generated headers
-        -- when the current build is Test. See INDEX_FN.partition_base_cdb.
-        do
+        -- Partition MUST run AFTER the async pipeline completes — both rewrite
+        -- the same base compile_commands.json, and running them concurrently
+        -- tears the file mid-write (pipeline's resolve stage then hits a
+        -- JSONDecodeError). Proven via timestamped race probe 2026-06-25:
+        -- partition START fell inside [pipeline START, pipeline EXIT].
+        -- Fix: hand partition to the pipeline's on_done so it is strictly
+        -- serialized after expand→pch→resolve→unify→prune finishes.
+        run_compile_commands_pipeline(targets_main[1], targets_main, function()
+          -- Partition base CDB by (plat, cfg) so clangd's gd on macros like
+          -- UE_BUILD_DEVELOPMENT does not jump into stale Dev generated headers
+          -- when the current build is Test. See INDEX_FN.partition_base_cdb.
           local ok_p, msg_p = INDEX_FN.partition_base_cdb(ctx)
           if not ok_p then
             vim.notify("UEPrepare: cdb_partition failed -- " .. tostring(msg_p),
               vim.log.levels.WARN, { title = "ue.cdb" })
           end
-        end
+        end)
         clear_index_dirty(ctx)
         INDEX_FN.schedule_index_refresh(ctx, { current = true, hot = true, full = true, current_delay_ms = 50, hot_delay_ms = 2500 })
         invalidate_status_cache()

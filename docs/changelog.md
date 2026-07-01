@@ -53,7 +53,35 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
-### 2026-07-01 — docs(rules): 子系统 AGENTS.md 指针 — Claude/Codex 切换开发信息同步
+### 2026-07-01 — docs(rules): 统一 Claude/Codex 说明为单一内容源（AGENTS.md 权威 + CLAUDE.md=@AGENTS.md stub）
+
+**Task** — 消除「改一次改两份」。上一条（子系统 AGENTS.md 指针）把 CLAUDE.md 当权威、AGENTS.md 当指针，仍是双份。本次反转为**单一内容源**：每个目录规则只维护 `AGENTS.md`（Codex 原生读取），同目录 `CLAUDE.md` 内容退化为 `@AGENTS.md` 导入 stub（Claude 只读 CLAUDE.md，由 import 在启动时展开读同一内容）。改一次两端同步。仅项目级，不动全局 `~/.claude`/`~/.codex`。
+
+**机制依据（实测 + 官方文档）**
+- Claude Code 只读 `CLAUDE.md` 但支持 `@path` import 展开（官方 memory 文档明确推荐此法复用 AGENTS.md）。
+- Codex 只读 `AGENTS.md`（binary strings 实证 59×AGENTS vs 3×CLAUDE 且为帮助文本），不支持 import。
+- 符号链接不可行：本机 `git core.symlinks=false` + Git Bash `ln -s` 实为拷贝 + Windows 需管理员/开发者模式。
+- 故唯一正确单源方向 = AGENTS.md 为内容源、CLAUDE.md=@AGENTS.md。
+
+**Implemented**
+- 根：`AGENTS.md` 合并为完整超集（并入旧根 CLAUDE.md 独有的 Minimize interruptions / Build & verification / User handoff + 详版 SESSION START + Definition of Done，措辞中性化为两 agent 通用）；根 `CLAUDE.md` → `@AGENTS.md` stub（带 human 注释）。
+- 18 子系统：各目录 `AGENTS.md` 由指针改为**实体内容源**（原 CLAUDE.md 正文逐字节搬入，含 dap 宪法级坑 K11/K37 等全部保留；继承说明 `../CLAUDE.md`→`../AGENTS.md`、跨引 `tests/CLAUDE.md`→`tests/AGENTS.md` 等同步）；各目录 `CLAUDE.md` → `@AGENTS.md` stub。
+- `tests/cases/structure_spec.lua`：测①改为断言每目录 `AGENTS.md`（源）存在 + `CLAUDE.md` 为 @AGENTS.md stub；测③ KEY_DOCS 用 `AGENTS.md` 替下 stub 化的 CLAUDE.md 做内链校验；测④内容断言（SESSION START/DoD/changelog/milestone）迁到根 `AGENTS.md`，对 CLAUDE.md 只断言为 stub。新增 `is_agents_stub()` helper。
+- `docs/CONSTRAINTS.md §五/§六` 与 `memory/project_overview.md`：改述为「AGENTS.md 单一内容源 + CLAUDE.md stub」；C6/C7/C8 与 SESSION START/子系统表的权威指针由 `根 CLAUDE.md`/`tests/CLAUDE.md` 改指 `根 AGENTS.md`/`tests/AGENTS.md`。
+
+**Pitfalls / Gotchas**
+- `structure_spec` 测③只校验 `](path)` 形式的相对链接；CONSTRAINTS/overview 里对 `CLAUDE.md` 的提及均为 backtick inline code，非链接，故不触发悬空校验——但仍统一改指内容源以免误导。
+- Claude 首次遇到 `@AGENTS.md` 外部导入会弹一次批准框（同仓相对导入，属正常），批准后不再提示。
+- 反转是「搬家非重写」：18 文件逐字节核对，尤其 dap 段承重坑一字未删。
+
+**Validation**
+- 分范围 `nvim --headless -l tests/run.lua structure` = **37/37 passed**（含内链不悬空 + stub 断言）。
+- 全量 `nvim --headless -l tests/run.lua` = **EXIT 0（全绿）**（23 spec files；harness 契约：exit 0=全绿/1=有失败）。改动跨规则/结构/测试，按政策升级全量。
+
+**Follow-ups**
+- 无。后续新增子系统目录按 CONSTRAINTS §六.4：补 `AGENTS.md`（源）+ `CLAUDE.md`（@AGENTS.md stub）。
+
+### 2026-07-01 — docs(rules): 子系统 AGENTS.md 指针 — Claude/Codex 切换开发信息同步（已被上一条取代）
 
 **Task** — 让 Claude 与 Codex 在本仓来回切换开发时局部规则信息一致：此前 18 个子系统目录只有 `CLAUDE.md`、无 `AGENTS.md`，Codex 若被直接在子目录内启动（未先读根 `AGENTS.md`）就发现不了「回落最近祖先 `CLAUDE.md`」规则，从而漏读局部约束。仅做项目级桥接，不动任何全局配置（`~/.claude`、`~/.codex`）。
 

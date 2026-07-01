@@ -17,28 +17,30 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 
 新 context 进来、动代码前**按序读**：
 
-1. **根 `CLAUDE.md` / `AGENTS.md`** — Claude 与 GPT/Codex 的 SESSION START 协议 +
-   Definition of Done（完成的硬标准）。
+1. **根 `AGENTS.md`（单一内容源）** — Claude 与 GPT/Codex 共用的 SESSION START 协议 +
+   Definition of Done（完成的硬标准）。根 `CLAUDE.md` 内容仅为 `@AGENTS.md` 导入 stub。
 2. **`docs/CONSTRAINTS.md`** — 禁止 / 踩过的坑 / 约束（权威索引）。
 3. **本文件** — 项目总览 + 子系统速查。
-4. **当前改动目录的本地规则** — GPT/Codex 先以根 `AGENTS.md` 进入；若目标子树有更近的
-   嵌套 `AGENTS.md` 则读它，否则读最近祖先 `CLAUDE.md`。Claude 读当前目录 `CLAUDE.md`
-   （无则回落最近祖先目录）。
+4. **当前改动目录的本地规则** — 每个主要目录一份 `AGENTS.md`（内容源）+ 一份 `CLAUDE.md`
+   （`@AGENTS.md` stub）。Codex 读 `AGENTS.md`；Claude 读 `CLAUDE.md` 并由 stub 展开同一内容。
+   目录无本地规则时回落最近祖先目录。
 
 ## 子系统速查
 
-| 子系统 | 位置 | 本地规则 | 一句话 |
+| 子系统 | 位置 | 本地规则（内容源） | 一句话 |
 |---|---|---|---|
-| UE 引擎中枢 | `lua/ue.lua` + `lua/ue/` | `lua/ue/CLAUDE.md` | 索引 / CDB / DAP / 命令注册的中枢 |
-| CDB 流水线 | `lua/ue/cdb/` | `lua/ue/cdb/CLAUDE.md` | compile_commands.json 生成/裁剪/注入 |
-| DAP 调试 | `lua/ue/dap/` | `lua/ue/dap/CLAUDE.md` | codelldb + Android platform 模式 |
-| goto 解析栈 | `lua/utils/ue_goto/` | `lua/utils/ue_goto/CLAUDE.md` | 5 层 fallback：TS→cache→clangd→csearch→gtags |
-| 代码搜索 | `lua/utils/code_search/` | `lua/utils/code_search/CLAUDE.md` | csearch 亚秒级 grep（兜底，非主路） |
-| 平台驱动 | `lua/utils/platform/` | `lua/utils/platform/CLAUDE.md` | 唯一允许做 OS 分支的地方 |
-| workaround 注册表 | `lua/workarounds/` | `lua/workarounds/CLAUDE.md` | 上游 bug 补丁，带 frontmatter |
-| 配置层 | `lua/config/` | `lua/config/CLAUDE.md` | keymaps / options / autocmds / lazy |
-| 插件层 | `lua/plugins/` | `lua/plugins/CLAUDE.md` | per-plugin setup（snacks-only） |
-| 回归测试 | `tests/` | `tests/CLAUDE.md` | headless 套件 + 分范围回归映射 |
+| UE 引擎中枢 | `lua/ue.lua` + `lua/ue/` | `lua/ue/AGENTS.md` | 索引 / CDB / DAP / 命令注册的中枢 |
+| CDB 流水线 | `lua/ue/cdb/` | `lua/ue/cdb/AGENTS.md` | compile_commands.json 生成/裁剪/注入 |
+| DAP 调试 | `lua/ue/dap/` | `lua/ue/dap/AGENTS.md` | codelldb + Android platform 模式 |
+| goto 解析栈 | `lua/utils/ue_goto/` | `lua/utils/ue_goto/AGENTS.md` | 5 层 fallback：TS→cache→clangd→csearch→gtags |
+| 代码搜索 | `lua/utils/code_search/` | `lua/utils/code_search/AGENTS.md` | csearch 亚秒级 grep（兜底，非主路） |
+| 平台驱动 | `lua/utils/platform/` | `lua/utils/platform/AGENTS.md` | 唯一允许做 OS 分支的地方 |
+| workaround 注册表 | `lua/workarounds/` | `lua/workarounds/AGENTS.md` | 上游 bug 补丁，带 frontmatter |
+| 配置层 | `lua/config/` | `lua/config/AGENTS.md` | keymaps / options / autocmds / lazy |
+| 插件层 | `lua/plugins/` | `lua/plugins/AGENTS.md` | per-plugin setup（snacks-only） |
+| 回归测试 | `tests/` | `tests/AGENTS.md` | headless 套件 + 分范围回归映射 |
+
+> 每个主要目录同时有一份 `CLAUDE.md`（内容为 `@AGENTS.md` 导入 stub），供 Claude 读取。
 
 详见 `docs/architecture/overview.md`（数据流 / 平台层 / 构建流水线 / 归属边界）。
 
@@ -53,8 +55,8 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 
 ## 开发纪律（完成的硬标准）
 
-权威在根 `CLAUDE.md` 的 Definition of Done；摘要：
+权威在根 `AGENTS.md` 的 Definition of Done（Claude 侧经 `CLAUDE.md` 的 `@AGENTS.md` 展开）；摘要：
 
-1. **改完跑回归**：按改动范围跑对应 filter（映射见 `tests/CLAUDE.md`），提交前全量。
+1. **改完跑回归**：按改动范围跑对应 filter（映射见 `tests/AGENTS.md`），提交前全量。
 2. **改完记 changelog**：`docs/changelog.md` 追加一条，Validation 写所跑回归范围。
 3. **收尾走 milestone**：semver 触发 + 四件套（见 `docs/CONSTRAINTS.md` §三 C8）。

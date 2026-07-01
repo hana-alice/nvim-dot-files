@@ -147,6 +147,100 @@ t.describe("utils.log", function()
   for _, fn in ipairs({ "info", "warn", "error", "debug", "install_commands" }) do
     t.it(fn .. " 是 function", function() t.assert_type(log[fn], "function") end)
   end
+
+  t.it("notify 记录通知历史", function()
+    local hist = require("utils.notification_history")
+    hist._reset_for_test()
+    local old_notify = vim.notify
+    vim.notify = function() end
+    log.notify("utils_spec", "hello history", vim.log.levels.WARN)
+    local rows = hist.list()
+    vim.wait(20, function() return false end, 10)
+    vim.notify = old_notify
+    t.assert_eq(#rows, 1)
+    t.assert_eq(rows[1].scope, "utils_spec")
+    t.assert_eq(rows[1].level_name, "WARN")
+    t.assert_contains(rows[1].message, "hello history")
+  end)
+
+  t.it("notify_error 记录 ERROR 历史", function()
+    local hist = require("utils.notification_history")
+    hist._reset_for_test()
+    local old_notify = vim.notify
+    vim.notify = function() end
+    log.notify_error("utils_spec", "bad history")
+    local rows = hist.list()
+    vim.wait(20, function() return false end, 10)
+    vim.notify = old_notify
+    t.assert_eq(#rows, 1)
+    t.assert_eq(rows[1].scope, "utils_spec")
+    t.assert_eq(rows[1].level_name, "ERROR")
+    t.assert_contains(rows[1].message, "bad history")
+  end)
+end)
+
+t.describe("utils.notification_history", function()
+  local hist = require("utils.notification_history")
+
+  t.it("返回 table 且核心 API 存在", function()
+    t.assert_type(hist, "table")
+    for _, fn in ipairs({ "record", "list", "clear", "render_lines", "open", "install_commands" }) do
+      t.assert_type(hist[fn], "function", fn .. " 应为 function")
+    end
+  end)
+
+  t.it("按最近优先列出记录", function()
+    hist._reset_for_test()
+    hist.record({ scope = "a", message = "first", level = vim.log.levels.INFO, timestamp = 1 })
+    hist.record({ scope = "b", message = "second", level = vim.log.levels.ERROR, timestamp = 2 })
+    local rows = hist.list()
+    t.assert_eq(#rows, 2)
+    t.assert_eq(rows[1].message, "second")
+    t.assert_eq(rows[2].message, "first")
+  end)
+
+  t.it("容量超过上限时丢弃最旧记录", function()
+    hist._reset_for_test()
+    for i = 1, hist._MAX_RECORDS + 3 do
+      hist.record({ scope = "cap", message = "msg" .. i, level = "info", timestamp = i })
+    end
+    local raw = hist._records_for_test()
+    t.assert_eq(#raw, hist._MAX_RECORDS)
+    t.assert_eq(raw[1].message, "msg4")
+    t.assert_eq(raw[#raw].message, "msg" .. tostring(hist._MAX_RECORDS + 3))
+  end)
+
+  t.it("clear 清空历史", function()
+    hist._reset_for_test()
+    hist.record({ scope = "x", message = "x", level = "warn" })
+    hist.clear()
+    t.assert_eq(#hist.list(), 0)
+  end)
+
+  t.it("render_lines 为空时展示空状态", function()
+    hist._reset_for_test()
+    local lines = table.concat(hist.render_lines(), "\n")
+    t.assert_contains(lines, "Notification History")
+    t.assert_contains(lines, "(empty)")
+  end)
+end)
+
+t.describe("notification history: Android install source contract", function()
+  local cfg = vim.fn.stdpath("config")
+  local text = table.concat(vim.fn.readfile(cfg .. "/lua/ue.lua"), "\n")
+
+  t.it("UEInstallAndroid 记录安装开始、成功、失败历史", function()
+    t.assert_contains(text, "Installing APK:")
+    t.assert_contains(text, "Installed successfully:")
+    t.assert_contains(text, "adb install failed (exit %d)")
+    t.assert_contains(text, "scope = \"ue.install\"")
+  end)
+
+  t.it("UEInstallAndroid 失败详情仍指向 :NvimLog", function()
+    t.assert_contains(text, "--- stderr ---")
+    t.assert_contains(text, "--- stdout ---")
+    t.assert_contains(text, "See :NvimLog")
+  end)
 end)
 
 t.describe("utils.ue_paths", function()

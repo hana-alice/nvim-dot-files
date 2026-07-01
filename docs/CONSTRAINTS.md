@@ -482,9 +482,12 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 - **强制执行入口**：根 `CLAUDE.md`（Claude Code）与根 `AGENTS.md`（GPT/Codex）的
   SESSION START 协议（动代码前先读 `docs/CONSTRAINTS.md` → `memory/project_overview.md` →
   当前目录本地规则）+ Definition of Done。
-- **递归本地规则**：每个主要目录一份 `CLAUDE.md`，子级只写相对父级的增量；
+- **递归本地规则**：每个主要目录一份 `CLAUDE.md`（权威、单一出处），子级只写相对父级的增量；
   GPT/Codex 从根 `AGENTS.md` 进入后按最近祖先 `CLAUDE.md` 读取这些局部规则。
   **目录无 `CLAUDE.md` 时回落最近祖先目录的规则**。
+- **子系统 `AGENTS.md` 指针**：每个带 `CLAUDE.md` 的主要目录再放一个**极简 `AGENTS.md` 指针**，
+  只重定向到同级 `CLAUDE.md` 并声明继承链——**不重复内容**（避免漂移）。作用：当 GPT/Codex
+  被直接在子目录内启动、未先读根 `AGENTS.md` 时，仍能就地发现该目录规则。权威永远是 `CLAUDE.md`。
 - **持久化知识库四区**：
   - `memory/project_overview.md` — 项目总览 + 子系统速查 + 先读顺序。
   - `decisions/README.md` — 架构决策(ADR)导航（权威正文在 `docs/plans/`）。
@@ -505,7 +508,8 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
    并在 `lessons/README.md` 对应领域补一句主题导航。
 3. **改动版本钉死项 / 约定 / 启动顺序** → 同步更新 §三，并保持指向 `docs/TOOLING.md`
    / `README.md` / `init.lua` 的出处链接。
-4. **新增子系统目录 / 迁移知识** → 为新目录补一份本地 `CLAUDE.md`（声明继承父级），
+4. **新增子系统目录 / 迁移知识** → 为新目录补一份本地 `CLAUDE.md`（声明继承父级）**并补一个
+   极简 `AGENTS.md` 指针**（重定向到同级 `CLAUDE.md`、不复制内容），
    在对应知识区 README 登记；`structure_spec` 的目录清单同步。
 5. **新增 spec / 改命令清单** → 同步 `tests/CLAUDE.md` 与 `docs/testing-regression.md` 的 filter 映射，
    及 `commands_spec` 冻结清单。

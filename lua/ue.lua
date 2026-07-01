@@ -7905,6 +7905,14 @@ local function install_android()
   end
 
   local progress = require("fidget.progress")
+  local install_start_msg = ("Installing APK: %s (built %s)"):format(vim.fn.fnamemodify(apk_win, ":t"), age_str)
+  pcall(function()
+    require("utils.notification_history").record({
+      scope = "ue.install",
+      level = vim.log.levels.INFO,
+      message = install_start_msg,
+    })
+  end)
   local handle = progress.handle.create({
     title = "Installing APK",
     message = ("built %s — %s"):format(age_str, vim.fn.fnamemodify(apk_win, ":t")),
@@ -7956,6 +7964,13 @@ local function install_android()
         timer:close()
         if code == 0 then
           handle.message = "Installed successfully"
+          pcall(function()
+            require("utils.notification_history").record({
+              scope = "ue.install",
+              level = vim.log.levels.INFO,
+              message = ("Installed successfully: %s"):format(vim.fn.fnamemodify(apk_win, ":t")),
+            })
+          end)
           handle:finish()
           return
         end
@@ -8002,6 +8017,17 @@ local function install_android()
         end
 
         handle.message = ("✗ exit %d — %s%s"):format(code, summary, hint and ("  " .. hint) or "")
+        pcall(function()
+          require("utils.notification_history").record({
+            scope = "ue.install",
+            level = vim.log.levels.ERROR,
+            message = ("adb install failed (exit %d): %s%s. See :NvimLog"):format(
+              code,
+              summary,
+              hint and ("  " .. hint) or ""
+            ),
+          })
+        end)
 
         -- Persist the full output to the rotating debug log BEFORE finishing
         -- the handle, so even if fidget vanishes the user can `:NvimLog`.

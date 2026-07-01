@@ -53,6 +53,31 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-07-01 — feat(ui): add notification history for user-triggered feedback
+
+**Task** — Make short-lived notifications, errors, and key user-command results reviewable after their toast/progress UI disappears. Android APK install is the motivating path, but the mechanism covers config-controlled notifications generally.
+
+**Implemented**
+- `lua/utils/notification_history.lua`: added a fixed-size in-memory notification history with `record` / `list` / `clear`, read-only scratch-buffer rendering, and `:NotificationHistory` / `:NotificationHistoryClear` command registration.
+- `lua/utils/log.lua`: `notify` and `notify_error` now record history entries before scheduling the existing `vim.notify`; `install_commands()` also installs notification-history commands and is safe to call repeatedly.
+- `lua/ue.lua`: `UEInstallAndroid` records install start, success, and failure summaries while preserving full stdout/stderr in `:NvimLog`.
+- `lua/utils/ue_launch.lua`: launch success and context warnings now go through `utils.log.notify`, so those user-triggered results enter notification history.
+- `lua/config/keymaps.lua`: added `<leader>uN` for `:NotificationHistory`.
+- `tests/cases/utils_spec.lua`, `tests/cases/commands_spec.lua`, `tests/cases/keymaps_spec.lua`: added coverage for history behavior, helper integration, command registration, keymap registration, and Android install source contract.
+
+**Pitfalls / Gotchas**
+- Did not monkey-patch `vim.notify`; history is opt-in through `utils.log.notify*` or explicit `notification_history.record`, avoiding plugin conflicts.
+- `stylua` is not available in the current PATH, so formatting could not be run locally.
+
+**Validation**
+- `nvim --headless -l tests/run.lua utils` = **39/39 passed**.
+- `nvim --headless -l tests/run.lua commands` = **83/83 passed**.
+- `nvim --headless -l tests/run.lua keymaps` = **47/47 passed**.
+- Full `nvim --headless -l tests/run.lua` = **EXIT 0** (23 spec files). Output tail contained known prompt/noise lines from DAP source-path tests but process exit was clean.
+
+**Follow-ups**
+- Gradually migrate other direct `vim.notify` success/error paths to `utils.log.notify` when touching those areas.
+
 ### 2026-07-01 — docs(rules): 统一 Claude/Codex 说明为单一内容源（AGENTS.md 权威 + CLAUDE.md=@AGENTS.md stub）
 
 **Task** — 消除「改一次改两份」。上一条（子系统 AGENTS.md 指针）把 CLAUDE.md 当权威、AGENTS.md 当指针，仍是双份。本次反转为**单一内容源**：每个目录规则只维护 `AGENTS.md`（Codex 原生读取），同目录 `CLAUDE.md` 内容退化为 `@AGENTS.md` 导入 stub（Claude 只读 CLAUDE.md，由 import 在启动时展开读同一内容）。改一次两端同步。仅项目级，不动全局 `~/.claude`/`~/.codex`。

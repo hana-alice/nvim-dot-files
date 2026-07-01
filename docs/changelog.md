@@ -53,6 +53,26 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-07-01 — docs(rules): 子系统 AGENTS.md 指针 — Claude/Codex 切换开发信息同步
+
+**Task** — 让 Claude 与 Codex 在本仓来回切换开发时局部规则信息一致：此前 18 个子系统目录只有 `CLAUDE.md`、无 `AGENTS.md`，Codex 若被直接在子目录内启动（未先读根 `AGENTS.md`）就发现不了「回落最近祖先 `CLAUDE.md`」规则，从而漏读局部约束。仅做项目级桥接，不动任何全局配置（`~/.claude`、`~/.codex`）。
+
+**Implemented**
+- 新增 18 个极简 `AGENTS.md` 指针（每个带 `CLAUDE.md` 的主要目录一份），只重定向到同级 `CLAUDE.md` + 声明继承链 + 正确 `../` 深度的根 `AGENTS.md`/`docs/CONSTRAINTS.md` 链接，**不复制内容**（杜绝漂移）：
+  `docs` `lua` `lua/config` `lua/nio` `lua/plugins` `lua/trouble` `lua/ue` `lua/ue/cdb` `lua/ue/core` `lua/ue/dap` `lua/utils` `lua/utils/code_search` `lua/utils/platform` `lua/utils/ue_goto` `lua/workarounds` `scripts` `tests` `tools`。
+- `docs/CONSTRAINTS.md §五` 增「子系统 `AGENTS.md` 指针」段；§六 第4条维护契约补「新增子系统目录须同时补 `CLAUDE.md` 与指针 `AGENTS.md`」。
+- 权威永远是 `CLAUDE.md`（单一出处）；`AGENTS.md` 仅指针，故子系统 `CLAUDE.md` 措辞不动。
+
+**Pitfalls / Gotchas**
+- `structure_spec.lua` 测③「关键文档内链不悬空」会校验 `AGENTS.md`/`CLAUDE.md`/`CONSTRAINTS.md` 等 KEY_DOCS 的相对链接可解析——故 CONSTRAINTS 编辑未引入悬空链接；指针文件用真实相对 `../` 路径（非仅 IDE 用的 `/C:/` 绝对链接），各深度（1/2/3 级）分别 `../`、`../../`、`../../../`。
+- `structure_spec` MAJOR_DIRS 只断言 `CLAUDE.md` 存在，不禁止额外 `AGENTS.md`，故新增指针不触发冻结清单。
+
+**Validation**
+- 分范围回归 `nvim --headless -l tests/run.lua structure` = **36/36 passed, 0 failed**（含内链不悬空校验）。改动仅文档/规则/知识库结构，按 CHANGE-TO-FILTER MAP 对应 `structure`。
+
+**Follow-ups**
+- 无。提交/合并前若合入其它改动，按 DoD 跑全量 `nvim --headless -l tests/run.lua`。
+
 ### 2026-06-25 — fix(cdb): UEPrepare 的 cdb_partition 与 pipeline 并发撕裂 compile_commands.json（JSONDecodeError 根治）
 
 **Task** — `:UEPrepare` 稳定报错 `ue-pipeline failed (exit 1)` / `json.decoder.JSONDecodeError`（每次偏移不同：char 68551910 / 32430658 / 86744524）。用户只触发一次 UEPrepare，排除手动重入。

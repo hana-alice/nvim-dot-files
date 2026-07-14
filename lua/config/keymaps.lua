@@ -208,6 +208,7 @@ local function apply_ue_runtime_overrides()
   map("n", "<leader>uD", "<cmd>UEDebugLogToggle<cr>", vim.tbl_extend("force", opts, { desc = "UE: Toggle Windows debug log" }))
   map("n", "<leader>uN", "<cmd>NotificationHistory<cr>", vim.tbl_extend("force", opts, { desc = "UI: Notification history" }))
   map("n", "<leader>up", "<cmd>UEPaths<cr>", vim.tbl_extend("force", opts, { desc = "UE: Show paths" }))
+  map("n", "<leader>ut", "<cmd>ThemePicker<cr>", vim.tbl_extend("force", opts, { desc = "UI: Theme picker" }))
 end
 
 map("n", "gd", function()

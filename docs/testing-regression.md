@@ -15,10 +15,13 @@
 |---|---|
 | `lua/config/keymaps.lua` / 命令定义 | `keymaps` `commands` |
 | `lua/ue/config.lua`（schema） | `ue_config` `smoke` |
+| `lua/ue.lua` 项目选择 / context 解析 | `ue_project_context` `ue_api` `smoke` |
 | `lua/ue/cdb/**` | `ue_cdb` |
 | `lua/ue/dap/**` / `lua/utils/platform/**` | `dap` `platform` |
 | `lua/utils/ue_goto/**` / `code_search/**` / `ue_paths.lua` | `ue_goto_behavior` `ue_paths` `utils` |
 | `lua/config/options.lua` / `autocmds.lua` | `options` `autocmds` |
+| `lua/theme.lua` / `lua/highlights.lua` / `colors/**` | `theme` `smoke` |
+| `lua/utils/stall_probe.lua` | `stall_probe` |
 | `lua/workarounds/**` | `workarounds` `smoke` |
 | 文档 / 规则 / 知识库结构 | `structure` |
 | **跨子系统 / 公共 helper / 重构 / 拿不准** | **全量（不带 filter）** |

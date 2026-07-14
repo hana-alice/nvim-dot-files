@@ -1113,28 +1113,6 @@ local function resolve_project_input(path, engine_root)
     " <relative/path/to.uproject> once so the workspace root works in future."
 end
 
-local function detect_project_root_from_path(path)
-  path = norm(path)
-  if path == "" then
-    return nil, nil
-  end
-
-  local dir = _ufs.is_file(path) and _ufs.dirname(path) or path
-  while dir ~= "" do
-    local uproject = find_uproject_in_dir(dir)
-    if uproject then
-      return dir, uproject
-    end
-    local parent = _ufs.dirname(dir)
-    if parent == dir then
-      break
-    end
-    dir = parent
-  end
-
-  return nil, nil
-end
-
 local function is_engine_root(dir)
   dir = norm(dir)
   if dir == "" then
@@ -1249,16 +1227,18 @@ function CORE_RT.platform_key_from_state(state)
   return plat .. "-" .. conf
 end
 
--- Cache layout v3 (2026-05-09):
+-- Cache layout v3 (2026-05-09; v3.2 de-platforms csearch):
 --   .cache/nvim-ue/                           -- single root, all cache lives here
 --     state.json                              -- top-level (scanner-friendly)
---     csearch/<platform_key>/csearch.idx      -- trigram index (per-platform, v3.1)
+--     csearch/csearch.idx                     -- trigram index (PLATFORM-INDEPENDENT, v3.2)
 --     gtags/<platform_key>/                   -- gtags input lists + DB (per-platform, v3.1)
 --       workspace/         (GTAGS DB)
 --       workspace.files / workspace_all.files / engine.files / project.files
---     (legacy single-path csearch/csearch.idx + gtags/*.files auto-migrated
---      into the active platform_key dir on first resolve — see
---      migrate_legacy_csearch_if_needed)
+--     (v3.2: csearch index is shared across all platforms — its input file set
+--      has no platform dimension. Users upgrading from the old per-platform
+--      csearch/<key>/csearch.idx are handled by mark-stale → next :UEPrepare
+--      rebuilds the shared index. gtags/*.files still migrate per-platform via
+--      migrate_legacy_csearch_if_needed.)
 --     cdb/                                    -- clangd compile-db assets
 --       modules.json, queue.json
 --       compile_commands/{current,hot,full,inject_full}.json
@@ -1287,8 +1267,15 @@ end
 cache_paths = function(engine_root, platform_key)
   local cache = join(engine_root, ".cache", "nvim-ue")
   platform_key = (type(platform_key) == "string" and platform_key ~= "") and platform_key or nil
-  -- Per-platform subdir for grep artifacts; legacy single path when no key.
-  local csearch_dir = platform_key and join(cache, "csearch", platform_key) or join(cache, "csearch")
+  -- csearch index is PLATFORM-INDEPENDENT (single shared index for all
+  -- platforms/configs). Its input file set (workspace_all.files) is derived
+  -- from engine_root + project_root + platform-agnostic constants/whitelist
+  -- (ENGINE_PICKER_DIRS / SCAN_EXCLUDES / .ueprepare-scan-paths), so the
+  -- trigram index has no platform dimension. The flat `csearch/` path also
+  -- aligns with csearch_input_hash (stored per-engine_root in state.json).
+  -- See change `refactor-search-system` (de-platforming) for the proof.
+  -- gtags/cdb REMAIN per-platform (compile args/macros/includes differ).
+  local csearch_dir = join(cache, "csearch")
   local gtags_root = platform_key and join(cache, "gtags", platform_key) or join(cache, "gtags")
   local cdb_dir = join(cache, "cdb")
   local cdb_files_dir = join(cdb_dir, "compile_commands")
@@ -1379,11 +1366,15 @@ function CORE_RT.migrate_legacy_csearch_if_needed(engine_root, platform_key)
     end
   end
 
-  -- csearch index (+ cindex tmp staging siblings)
-  move_if(legacy.csearch_idx, active.csearch_idx)
-  move_if(legacy.csearch_idx .. "~", active.csearch_idx .. "~")
-  move_if(legacy.csearch_idx .. "~~", active.csearch_idx .. "~~")
-  -- grep file lists
+  -- csearch index is now PLATFORM-INDEPENDENT (flat csearch/csearch.idx for
+  -- all platforms — see cache_paths + change `refactor-search-system`). So
+  -- legacy.csearch_idx == active.csearch_idx and there is nothing to migrate
+  -- here. Users upgrading from the old per-platform csearch layout
+  -- (csearch/<key>/csearch.idx) are handled by mark-stale: the flat index
+  -- won't exist, prepare_freshness returns "stale", and the next :UEPrepare
+  -- rebuilds the shared index. The old csearch/<key>/ dirs are left untouched
+  -- (not deleted solely due to de-platforming).
+  -- grep file lists (gtags — still per-platform)
   move_if(legacy.project_list, active.project_list)
   move_if(legacy.engine_list, active.engine_list)
   move_if(legacy.workspace_list, active.workspace_list)
@@ -1487,63 +1478,20 @@ local function resolve_context(opts)
 
   local state = read_state(engine_root)
   local project_root, uproject
-  local state_project_root, state_uproject
-  local candidates = { cur_cwd }
 
-  if cur_buf ~= "" and cur_buf ~= candidates[1] then
-    table.insert(candidates, cur_buf)
-  end
-
+  -- Project selection is manual-only. Current cwd/buffers may belong to a
+  -- different checkout and must never override :UESetProject state.
   if state.project_root then
-    state_project_root, state_uproject = resolve_project_input(state.project_root, engine_root)
-  end
-
-  if opts.detect_project ~= false then
-    for _, candidate in ipairs(candidates) do
-      project_root, uproject = detect_project_root_from_path(candidate)
-      if project_root then
-        break
-      end
-    end
-  end
-
-  if not project_root and state_project_root then
-    for _, candidate in ipairs(candidates) do
-      if candidate ~= "" and _ufs.path_has_prefix(candidate, state_project_root) then
-        project_root = state_project_root
-        uproject = state_uproject
-        break
-      end
-    end
-  end
-
-  -- Fallback: when no buffer is open (dashboard / fresh nvim) and cwd is
-  -- the engine root itself, the prefix check above can't possibly match
-  -- (engine_root path will never be inside project_root, and the empty
-  -- buffer name fails the `candidate ~= ""` guard). In this case the
-  -- user has already explicitly run :UESetProject earlier — trust it.
-  -- Without this, :UEBuild / :UEStatus etc all error with "No project
-  -- configured" right after `z unrealen` until the user opens a project
-  -- source file, which is surprising UX.
-  --
-  -- Extended fallback: when the user is browsing engine source (cwd or
-  -- buffer is inside engine_root) and didn't auto-detect a project from
-  -- the buffer path either, also trust state.project_root. Typical case:
-  -- `z unrealen` (UnrealEngine bare engine repo, no .uproject anywhere
-  -- nearby) + browsing Renderer/Engine sources to build a game project
-  -- pinned earlier via :UESetProject pointing to a different drive.
-  if not project_root and state_project_root then
-    local has_real_buffer = cur_buf ~= "" and cur_buf ~= cur_cwd
-    if not has_real_buffer then
-      project_root = state_project_root
-      uproject = state_uproject
+    local persisted_root = norm(state.project_root)
+    local persisted_uproject = norm(state.uproject or "")
+    if _ufs.is_dir(persisted_root)
+      and persisted_uproject ~= ""
+      and _ufs.is_file(persisted_uproject)
+    then
+      project_root = persisted_root
+      uproject = persisted_uproject
     else
-      local cwd_in_engine = cur_cwd ~= "" and _ufs.path_has_prefix(cur_cwd, engine_root)
-      local buf_in_engine = cur_buf ~= "" and _ufs.path_has_prefix(cur_buf, engine_root)
-      if cwd_in_engine or buf_in_engine then
-        project_root = state_project_root
-        uproject = state_uproject
-      end
+      project_root, uproject = resolve_project_input(persisted_root, engine_root)
     end
   end
 
@@ -5497,7 +5445,13 @@ end
 --- @param path string the compile_commands.json file to process
 --- @param targets string[]|nil list of compile_commands targets; after pipeline
 ---        finishes the first target is copied to the others and clangd restarts.
-local function run_compile_commands_pipeline(path, targets)
+--- @param on_done fun()? optional callback run AFTER the pipeline job completes.
+---        CRITICAL: anything that reads/writes the base compile_commands.json
+---        (e.g. cdb_partition) MUST run here, not concurrently with the async
+---        pipeline — otherwise the two writers tear the file mid-write and the
+---        pipeline's resolve stage hits a JSONDecodeError. See changelog
+---        2026-06-25 "cdb_partition race".
+local function run_compile_commands_pipeline(path, targets, on_done)
   -- ue.cdb.pipeline drives the expand → pch → resolve → unify → prune
   -- chain. We inject `_logged_jobstart` here so the pipeline module stays
   -- import-safe (no circular require to ue.lua) and headlessly testable.
@@ -5507,7 +5461,7 @@ local function run_compile_commands_pipeline(path, targets)
     notify    = function(msg, level) vim.notify(msg, level) end,
     log_error = function(scope, msg) require("utils.log").notify_error(scope, msg) end,
   })
-  pipeline.run(path, targets)
+  pipeline.run(path, targets, on_done)
 end
 
 local function write_compile_commands_targets(ctx, content)
@@ -6142,6 +6096,22 @@ function M.cached_grep(opts)
   local has_index = code_search.is_indexed(cs_ctx)
   local backend_label = has_index and "csearch" or "rg"
 
+  -- In-panel scope filter (change `refactor-search-system`): capture the
+  -- current buffer's module/plugin scope at open time so <a-s> can restrict
+  -- the search to it without leaving the picker. The scope's root path is
+  -- escaped into an RE2 fragment passed to csearch's -f file-path filter.
+  -- nil when the current file isn't inside any module/plugin (toggle no-ops).
+  local grep_scope = current_scope_info_from_context(ctx)
+  local function scope_path_regex(scope)
+    if not scope or not scope.root then return nil end
+    -- csearch indexes absolute paths with forward slashes (see UEPrepare
+    -- filelist writer). Normalize + escape RE2 metachars in the root so the
+    -- -f regex matches "<root>/..." literally.
+    local root = norm(scope.root)
+    local esc = root:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?%{%}%|%\\/])", "\\%1")
+    return esc
+  end
+
   local title_default = CORE_RT.grep_backend_title("Grep All Code", backend_label)
   local live_min_chars = opts.live_min_chars or 2
   local live_max_count = opts.max_count or 5000
@@ -6300,12 +6270,14 @@ function M.cached_grep(opts)
     end
   end
 
-  -- Temporary always-on diagnostic for the current "<leader>/ missing
-  -- results" investigation. The user explicitly allowed logs; remove after
-  -- they confirm the fix. This captures backend + mode + result counts
-  -- without requiring the heavier trace toggle above.
+  -- Backend diagnostic — now OPT-IN (was always-on during the "<leader>/
+  -- missing results" investigation; that's confirmed fixed). Gated on the same
+  -- vim.g.ue_grep_trace flag so a normal grep writes nothing to disk (P5: no
+  -- silent per-action side-effects). Enable with :UEGrepTraceToggle when
+  -- debugging backend/mode/result-count.
   local debug_log_path = vim.fn.stdpath("state") .. "/ue_grep_backend_debug.log"
   local function grep_debug(fmt, ...)
+    if vim.g.ue_grep_trace ~= true then return end
     local ok, line = pcall(string.format, fmt, ...)
     if not ok then
       line = tostring(fmt)
@@ -6353,15 +6325,19 @@ function M.cached_grep(opts)
       regex = false,
       word = false,
       case = false,
+      scoped = false,
       toggles = {
         regex = { icon = "R", value = true },
         word  = { icon = "W", value = true },
         case  = { icon = "C", value = true },
+        scoped = { icon = "S", value = true },
       },
       -- Keymaps: Alt-r/g/x/w/c = mode toggles, shown live as R/W/C icons in
       -- the picker title. <a-r> is the intuitive "regex" toggle (matches
       -- snacks' own default); <a-g> = "grep regex" mnemonic alias. Both flip
       -- the same regex flag. <a-w>/<a-x> = whole-word, <a-c> = case-sensitive.
+      -- <a-s> = restrict to the current module/plugin scope (in-panel scope
+      -- filter; shows an "S" icon when active).
       -- NOTE: <a-r> previously collided with NVIDIA App's global Performance
       -- Overlay hotkey; if it ever stops reaching nvim again, use <a-g>.
       win = vim.tbl_deep_extend("force", grouping_enabled and fast_tab_keys.win or {}, {
@@ -6371,6 +6347,7 @@ function M.cached_grep(opts)
           ["<a-x>"] = { "ue_grep_toggle_word",  mode = { "i", "n" } },
           ["<a-w>"] = { "ue_grep_toggle_word",  mode = { "i", "n" } },
           ["<a-c>"] = { "ue_grep_toggle_case",  mode = { "i", "n" } },
+          ["<a-s>"] = { "ue_grep_toggle_scope", mode = { "i", "n" } },
         } },
       }),
       actions = {
@@ -6391,6 +6368,21 @@ function M.cached_grep(opts)
           require("snacks").notify((picker.opts.case and "✓ case-sensitive ON " or "✗ ignore-case"),
             { title = "UE grep", level = "info" })
           grep_debug("TOGGLE backend=csearch case=%s", tostring(picker.opts.case == true))
+          picker.list:set_target(); picker:find()
+        end,
+        ue_grep_toggle_scope = function(picker)
+          if not grep_scope then
+            require("snacks").notify(
+              "✗ no module/plugin scope (current file isn't inside one)",
+              { title = "UE grep", level = "warn" })
+            return
+          end
+          picker.opts.scoped = not picker.opts.scoped
+          require("snacks").notify(
+            (picker.opts.scoped
+              and ("✓ scope: " .. (grep_scope.label or grep_scope.name or "current"))
+              or "✗ scope OFF (whole workspace)"),
+            { title = "UE grep", level = "info" })
           picker.list:set_target(); picker:find()
         end,
       },
@@ -6437,6 +6429,7 @@ function M.cached_grep(opts)
             tostring(pattern), tostring(_po.regex == true), tostring(_po.word == true),
             tostring(mode_case), tostring(mode_ignore_case),
             pattern_len <= live_min_chars and short_live_max_count or live_max_count)
+          local scope_re = (_po.scoped and grep_scope) and scope_path_regex(grep_scope) or nil
           local stop = code_search.stream(cs_ctx, pattern, {
             code_only   = opts.code_only,
             smart_case  = true,
@@ -6445,6 +6438,7 @@ function M.cached_grep(opts)
             word        = _po.word == true,
             case        = mode_case,
             ignore_case = mode_ignore_case,
+            path_filter = scope_re,            -- in-panel scope filter (<a-s>)
           }, {
             on_line = function(file, lnum, col, text)
               if not cs_first_line_logged then
@@ -6673,246 +6667,24 @@ function M.cached_grep(opts)
     return true
   end
 
-  -- ── rg-batched fallback (v2): cached file list + per-batch rg ────────
-  -- Used when no csearch index exists yet (UEPrepare hasn't been run, or
-  -- cindex-uefilter isn't installed). This path is the legacy ~14-30s
-  -- behavior on UE workspaces. To get sub-second grep, run :UEPrepare.
-
-  local info = cached_file_list_info(opts, "all")
-  if not info then
-    -- No cached file list and no csearch index; let snacks fall back to
-    -- its default grep over the directory tree (slowest path).
-    -- Make the fall-through VISIBLE: a silent nil here means ue_project_grep
-    -- runs a plain dir-walk that excludes ThirdParty and is NOT index-backed,
-    -- so the user gets incomplete results with no signal (the bug this whole
-    -- change fixes). One-shot WARN per buffer (no ticker — see P5).
-    if not vim.b._ue_grep_fallback_warned then
-      vim.b._ue_grep_fallback_warned = true
-      vim.schedule(function()
-        vim.notify(
-          "UE grep: no csearch index and no cached file list — falling back to a " ..
-          "slow directory walk that may MISS files. Run :UEPrepare for complete, " ..
-          "sub-second grep.",
-          vim.log.levels.WARN, { title = "UE" })
-      end)
-    end
-    return nil
+  -- ── No csearch index: <leader>/ NEVER falls back to rg ─────────────
+  -- Hard contract (change `refactor-search-system`): this entry is csearch-
+  -- ONLY. We removed all three former rg back-doors (rg-batched fallback,
+  -- return-nil -> snacks dir-walk, and the "ue_grep_rg" fast-path). When no
+  -- csearch index is available we surface a visible error and open NO picker.
+  -- rg lives on elsewhere: <leader>sG (ue_grep_all) is the explicit rg entry,
+  -- and code_search.stream() keeps its rg branch for gd/gr fallback (P12).
+  if not vim.b._ue_grep_no_index_warned then
+    vim.b._ue_grep_no_index_warned = true
+    vim.schedule(function()
+      vim.notify(
+        "UE grep: no csearch index — <leader>/ is csearch-only and will not " ..
+        "fall back to rg. Run :UEPrepare to build the index. " ..
+        "(For an explicit rg search use <leader>sG.)",
+        vim.log.levels.ERROR, { title = "UE" })
+    end)
   end
-
-  local rg = _uproc.first_executable({ "rg" })
-  if not rg then
-    return nil
-  end
-
-  local ok, proc = pcall(require, "snacks.picker.source.proc")
-  if not ok then
-    return nil
-  end
-
-  local files
-  local files_ready = false
-  local function ensure_files()
-    if not files_ready then
-      files = read_cached_paths(info.list_path, info.root) or false
-      files_ready = true
-    end
-    return files ~= false and files or nil
-  end
-
-  local batch_size = 200
-  local uv = vim.uv or vim.loop
-  local spawn_arg_limit = uv and uv.os_uname().sysname == "Windows_NT" and 28000 or nil
-
-  local function estimate_arg_cost(arg)
-    return #tostring(arg) + 3
-  end
-
-  -- Hint the user that csearch would make this fast.
-  if not vim.b._ue_grep_csearch_hint_shown then
-    vim.b._ue_grep_csearch_hint_shown = true
-    vim.notify(
-      "UE grep: no csearch index. Run :UEPrepare for sub-second search.",
-      vim.log.levels.INFO,
-      { title = "UE" }
-    )
-  end
-
-  snacks.picker.pick({
-    source = "ue_grep_rg",
-    title = CORE_RT.grep_backend_title(opts.title or title_default, backend_label),
-    search = opts.search or "",
-    live = true,
-    need_search = true,
-    limit = live_max_count,
-    limit_live = live_max_count,
-    layout = { preset = "telescope" },
-    -- Same toggle wiring as csearch path (see comment there).
-    regex = false,
-    word = false,
-    case = false,
-    toggles = {
-      regex = { icon = "R", value = true },
-      word  = { icon = "W", value = true },
-      case  = { icon = "C", value = true },
-    },
-    win = vim.tbl_deep_extend("force", grouping_enabled and fast_tab_keys.win or {}, {
-      input = { keys = {
-        ["<a-g>"] = { "ue_grep_toggle_regex", mode = { "i", "n" } },
-        ["<a-x>"] = { "ue_grep_toggle_word",  mode = { "i", "n" } },
-        ["<a-w>"] = { "ue_grep_toggle_word",  mode = { "i", "n" } },
-        ["<a-c>"] = { "ue_grep_toggle_case",  mode = { "i", "n" } },
-      } },
-    }),
-    actions = {
-      ue_grep_toggle_regex = function(picker)
-        picker.opts.regex = not picker.opts.regex
-        require("snacks").notify((picker.opts.regex and "✓ regex ON " or "✗ regex OFF (literal)"),
-          { title = "UE grep", level = "info" })
-        picker.list:set_target(); picker:find()
-      end,
-      ue_grep_toggle_word = function(picker)
-        picker.opts.word = not picker.opts.word
-        require("snacks").notify((picker.opts.word and "✓ whole-word ON " or "✗ whole-word OFF"),
-          { title = "UE grep", level = "info" })
-        picker.list:set_target(); picker:find()
-      end,
-      ue_grep_toggle_case = function(picker)
-        picker.opts.case = not picker.opts.case
-        require("snacks").notify((picker.opts.case and "✓ case-sensitive ON " or "✗ ignore-case"),
-          { title = "UE grep", level = "info" })
-        grep_debug("TOGGLE backend=rg case=%s", tostring(picker.opts.case == true))
-        picker.list:set_target(); picker:find()
-      end,
-    },
-    format = grouping_enabled and format_grouped or nil,
-    preview = grouping_enabled and preview_grouped or nil,
-    on_show = grouping_enabled and on_show_picker or nil,
-    confirm = grouping_enabled and confirm_grouped or nil,
-    finder = function(picker_opts, finder_ctx)
-      local pattern = finder_ctx.filter.search
-      if not CORE_RT.grep_live_search_ready(pattern, live_min_chars) then
-        return function() end
-      end
-
-      local loaded_files = ensure_files()
-      if not loaded_files then
-        return function() end
-      end
-
-      -- Read mode toggles from picker.opts (same wiring as csearch path).
-      local _picker = finder_ctx and finder_ctx.picker
-      local _po = _picker and _picker.opts or {}
-      local mode_regex = _po.regex == true
-      local mode_word  = _po.word == true
-      local mode_case  = _po.case == true
-      local mode_ignore_case = not mode_case
-      grep_debug("FINDER backend=rg pattern=%q regex=%s word=%s case=%s ignore_case=%s files_ready=%s",
-        tostring(pattern), tostring(mode_regex), tostring(mode_word), tostring(mode_case),
-        tostring(mode_ignore_case), tostring(loaded_files ~= nil))
-
-      return function(cb)
-        -- Wrap cb to inject file-header items between file groups.
-        if grouping_enabled then
-          cb = make_grouping_cb(cb)
-        end
-
-        local base_args = {
-          "--color=never",
-          "--no-heading",
-          "--with-filename",
-          "--line-number",
-          "--column",
-          "--max-columns=500",
-          "--max-columns-preview",
-          "-0",
-        }
-        -- Case mode: explicit case-sensitive ⇒ -s, else ignore-case. UE CVar
-        -- searches are frequently typed as camelCase fragments (e.g.
-        -- r.useLandscape) while source/config uses r.UseLandscape..., so the
-        -- default must not be rg smart-case.
-        if mode_case then
-          table.insert(base_args, "--case-sensitive")
-        else
-          table.insert(base_args, "--ignore-case")
-        end
-        -- Regex mode: when off, take input literally. -F is rg's
-        -- fixed-strings flag; combined with -w it still matches whole
-        -- words (rg treats -F as the engine, -w as a wrapper).
-        if not mode_regex then
-          table.insert(base_args, "--fixed-strings")
-        end
-        if mode_word then
-          table.insert(base_args, "--word-regexp")
-        end
-        table.insert(base_args, "--")
-        table.insert(base_args, pattern)
-
-        -- Windows CreateProcess hits a ~32k command-line ceiling, so split
-        -- batches by both file count and estimated argument length.
-        local args = vim.deepcopy(base_args)
-        local current_arg_cost = 0
-        for _, arg in ipairs(base_args) do
-          current_arg_cost = current_arg_cost + estimate_arg_cost(arg)
-        end
-        local current_batch_size = 0
-
-        local function flush_batch()
-          if current_batch_size == 0 then
-            return
-          end
-
-          local batch_args = args
-          proc.proc(
-            {
-              notify = false,
-              cmd = rg,
-              args = batch_args,
-              transform = function(item)
-                local file_sep = item.text:find("\0")
-                if not file_sep then
-                  return false
-                end
-                local file = item.text:sub(1, file_sep - 1)
-                local rest = item.text:sub(file_sep + 1)
-                local line, col, text = rest:match("^(%d+):(%d+):(.*)$")
-                if not (line and col and text) then
-                  return false
-                end
-                item.text = file .. ":" .. rest
-                item.pos = { tonumber(line), tonumber(col) - 1 }
-                item.file = file
-                return item
-              end,
-            },
-            finder_ctx
-          )(cb)
-
-          args = vim.deepcopy(base_args)
-          current_arg_cost = 0
-          for _, arg in ipairs(base_args) do
-            current_arg_cost = current_arg_cost + estimate_arg_cost(arg)
-          end
-          current_batch_size = 0
-        end
-
-        for _, file in ipairs(loaded_files) do
-          local file_cost = estimate_arg_cost(file)
-          local exceeds_batch_size = current_batch_size >= batch_size
-          local exceeds_arg_limit = spawn_arg_limit and (current_arg_cost + file_cost) > spawn_arg_limit
-          if current_batch_size > 0 and (exceeds_batch_size or exceeds_arg_limit) then
-            flush_batch()
-          end
-          args[#args + 1] = file
-          current_arg_cost = current_arg_cost + file_cost
-          current_batch_size = current_batch_size + 1
-        end
-
-        flush_batch()
-      end
-    end,
-  })
-
-  return true
+  return nil
 end
 
 -- ==========================================================================
@@ -7830,11 +7602,11 @@ local function set_platform(input)
     refresh_statusline()
     CORE_RT.context_cache = {}
     CORE_RT.freshness_notified = {}
-    -- Per-platform grep cache: switching platform points csearch/workspace_all
-    -- at csearch/<new-key>/ etc. We do NOT delete the previous platform's
-    -- index (cross-platform users keep both). If the new platform has no
-    -- csearch index yet, the next <leader>/ will surface the visible
-    -- "run :UEPrepare" fallback (no silent stale results).
+    -- Switching platform repoints gtags/cdb at their <new-key>/ shards, but
+    -- the csearch index is PLATFORM-INDEPENDENT (v3.2) — the same shared
+    -- csearch/csearch.idx serves every platform, so switching platform does
+    -- NOT invalidate or rebuild it. (migrate_legacy_csearch_if_needed still
+    -- migrates gtags lists/DB into the new platform dir.)
     pcall(function() require("utils.code_search")._reset_probe_cache() end)
     do
       local new_state = read_state(engine_root)
@@ -7992,13 +7764,139 @@ local function find_apk(ctx)
   for _, pattern in ipairs(patterns) do
     for _, path in ipairs(glob_paths(pattern)) do
       local mtime = vim.fn.getftime(path)
-      if mtime > best_mtime then
+      if not best or mtime > best_mtime then
         best = path
         best_mtime = mtime
       end
     end
   end
   return best
+end
+
+function M.ai_context(engine_root)
+  engine_root = norm(trim(engine_root or ""))
+  if engine_root == "" then
+    return nil, "Engine root not provided"
+  end
+  if not is_engine_root(engine_root) then
+    return nil, "Not an Unreal Engine root: " .. engine_root
+  end
+
+  local state = read_state(engine_root)
+  if not state.project_root or state.project_root == "" then
+    return nil, "No project_root in " .. cache_paths(engine_root).state
+  end
+
+  local project_root = norm(state.project_root)
+  local uproject = norm(state.uproject or "")
+  if uproject == "" or not _ufs.is_file(uproject) then
+    local resolved_root, resolved_uproject, project_err = resolve_project_input(project_root, engine_root)
+    if not resolved_root then
+      return nil, project_err
+    end
+    project_root = resolved_root
+    uproject = resolved_uproject
+  end
+
+  local platform_key = CORE_RT.platform_key_from_state(state)
+  local ctx = {
+    engine_root = engine_root,
+    project_root = project_root,
+    uproject = uproject,
+    state = state,
+    paths = cache_paths(engine_root, platform_key),
+  }
+  local platform = target_platform(engine_root, nil)
+  local selected_configuration = selected_target_configuration(engine_root, project_root, uproject, platform)
+  local ubt_configuration = target_configuration(engine_root, project_root, uproject, platform)
+  local kind = target_kind(engine_root, project_root, uproject, platform)
+  local target_name = build_target_name(project_root, uproject, kind)
+  local build_command, build_error = android_build_command(ctx)
+  local apk = find_apk(ctx)
+  local install_command = apk and { "adb", "install", "-r", to_windows_path(apk) or apk } or nil
+  local install_native_action
+  if not apk then
+    install_native_action = "No APK found under the active uproject build outputs."
+  end
+
+  return {
+    schema_version = 1,
+    generated_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    engine_root = engine_root,
+    project_root = project_root,
+    uproject = uproject,
+    state_path = ctx.paths.state,
+    state = {
+      target_platform = state.target_platform,
+      target_configuration = state.target_configuration,
+      android_package = state.android_package,
+      updated_at = state.updated_at,
+    },
+    target = {
+      platform = platform,
+      selected_configuration = selected_configuration,
+      ubt_configuration = ubt_configuration,
+      kind = kind,
+      name = target_name,
+      platform_source = trim(vim.env.UE_TARGET_PLATFORM) ~= "" and "environment" or "state/default",
+      configuration_source = trim(vim.env.UE_TARGET_CONFIGURATION) ~= "" and "environment" or "state/default",
+      target_source = trim(vim.env.UE_BUILD_TARGET) ~= "" and "environment" or "Target.cs/uproject",
+    },
+    artifacts = {
+      build_command = build_command,
+      build_error = build_error,
+      latest_apk = apk,
+      install_command = install_command,
+      compile_commands = join(engine_root, "compile_commands.json"),
+      clangd_index = ctx.paths.active_index,
+    },
+    commands = {
+      {
+        key = "<Space>ub",
+        nvim_command = ":UEBuild",
+        purpose = "Build the active UE target using the persisted platform and configuration.",
+        native_command = build_command,
+        native_action = build_error,
+      },
+      {
+        key = "<Space>ui",
+        nvim_command = ":UEInstallAndroid",
+        purpose = "Install the newest APK from the active project with replacement enabled.",
+        native_command = install_command,
+        native_action = install_native_action,
+      },
+      {
+        key = "<Space>ul",
+        nvim_command = ":UELaunch",
+        purpose = "Launch the active project on the selected platform without attaching a debugger.",
+        native_action = "Platform-specific launch assembled by lua/utils/ue_launch.lua.",
+      },
+      {
+        key = "<Space>ug",
+        nvim_command = ":UELogToggle",
+        purpose = "Toggle the active application's runtime log view.",
+        native_action = "Platform-specific log command assembled by lua/utils/ue_logs.lua.",
+      },
+      {
+        key = "<Space>up",
+        nvim_command = ":UEPaths",
+        purpose = "Show resolved engine, project, platform, configuration, state, CDB, and index paths.",
+        native_action = "Reads the resolved context; no external command.",
+      },
+      {
+        key = "<Space>uB",
+        nvim_command = ":UEPrepare",
+        purpose = "Refresh file lists, compile_commands, GTAGS, csearch, and clangd index inputs.",
+        native_action = "Asynchronous multi-stage pipeline; see lua/ue.lua prepare_async().",
+      },
+      {
+        key = "<Space>uP",
+        nvim_command = ":UESetProject",
+        purpose = "Select and persist the project associated with this engine root.",
+        native_action = "Writes project_root and uproject to the engine state.json.",
+      },
+    },
+  }
 end
 
 local function ue_runtime_env()
@@ -8068,6 +7966,14 @@ local function install_android()
   end
 
   local progress = require("fidget.progress")
+  local install_start_msg = ("Installing APK: %s (built %s)"):format(vim.fn.fnamemodify(apk_win, ":t"), age_str)
+  pcall(function()
+    require("utils.notification_history").record({
+      scope = "ue.install",
+      level = vim.log.levels.INFO,
+      message = install_start_msg,
+    })
+  end)
   local handle = progress.handle.create({
     title = "Installing APK",
     message = ("built %s — %s"):format(age_str, vim.fn.fnamemodify(apk_win, ":t")),
@@ -8119,6 +8025,13 @@ local function install_android()
         timer:close()
         if code == 0 then
           handle.message = "Installed successfully"
+          pcall(function()
+            require("utils.notification_history").record({
+              scope = "ue.install",
+              level = vim.log.levels.INFO,
+              message = ("Installed successfully: %s"):format(vim.fn.fnamemodify(apk_win, ":t")),
+            })
+          end)
           handle:finish()
           return
         end
@@ -8165,6 +8078,17 @@ local function install_android()
         end
 
         handle.message = ("✗ exit %d — %s%s"):format(code, summary, hint and ("  " .. hint) or "")
+        pcall(function()
+          require("utils.notification_history").record({
+            scope = "ue.install",
+            level = vim.log.levels.ERROR,
+            message = ("adb install failed (exit %d): %s%s. See :NvimLog"):format(
+              code,
+              summary,
+              hint and ("  " .. hint) or ""
+            ),
+          })
+        end)
 
         -- Persist the full output to the rotating debug log BEFORE finishing
         -- the handle, so even if fidget vanishes the user can `:NvimLog`.
@@ -8204,10 +8128,6 @@ local function prepare()
   if not ctx then
     vim.notify(err, vim.log.levels.WARN)
     return
-  end
-
-  if ctx.state.project_root ~= ctx.project_root then
-    persist_project(ctx.engine_root, ctx.project_root, ctx.uproject)
   end
 
   _ufs.ensure_dir(ctx.paths.cache)
@@ -8457,10 +8377,6 @@ local function prepare_async(opts)
   -- regular UEPrepare cache is fresh).
   ctx._force_csearch = opts.force_csearch and true or false
 
-  if ctx.state.project_root ~= ctx.project_root then
-    persist_project(ctx.engine_root, ctx.project_root, ctx.uproject)
-  end
-
   _ufs.ensure_dir(ctx.paths.cache)
 
   -- ── Timing & ETA ─────────────────────────────────────────────────────
@@ -8555,17 +8471,23 @@ local function prepare_async(opts)
         -- whose lifetime is tied to the main nvim, not the subprocess).
         -- Start it here in the main nvim.
         local targets_main = compile_commands_targets(ctx)
-        run_compile_commands_pipeline(targets_main[1], targets_main)
-        -- Partition base CDB by (plat, cfg) so clangd's gd on macros like
-        -- UE_BUILD_DEVELOPMENT does not jump into stale Dev generated headers
-        -- when the current build is Test. See INDEX_FN.partition_base_cdb.
-        do
+        -- Partition MUST run AFTER the async pipeline completes — both rewrite
+        -- the same base compile_commands.json, and running them concurrently
+        -- tears the file mid-write (pipeline's resolve stage then hits a
+        -- JSONDecodeError). Proven via timestamped race probe 2026-06-25:
+        -- partition START fell inside [pipeline START, pipeline EXIT].
+        -- Fix: hand partition to the pipeline's on_done so it is strictly
+        -- serialized after expand→pch→resolve→unify→prune finishes.
+        run_compile_commands_pipeline(targets_main[1], targets_main, function()
+          -- Partition base CDB by (plat, cfg) so clangd's gd on macros like
+          -- UE_BUILD_DEVELOPMENT does not jump into stale Dev generated headers
+          -- when the current build is Test. See INDEX_FN.partition_base_cdb.
           local ok_p, msg_p = INDEX_FN.partition_base_cdb(ctx)
           if not ok_p then
             vim.notify("UEPrepare: cdb_partition failed -- " .. tostring(msg_p),
               vim.log.levels.WARN, { title = "ue.cdb" })
           end
-        end
+        end)
         clear_index_dirty(ctx)
         INDEX_FN.schedule_index_refresh(ctx, { current = true, hot = true, full = true, current_delay_ms = 50, hot_delay_ms = 2500 })
         invalidate_status_cache()

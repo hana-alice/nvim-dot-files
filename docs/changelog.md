@@ -53,6 +53,228 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-07-14 — fix(ue): make project selection manual-only
+
+**Task** — `:UESetProject E:/sample/android_3.6_debug` was immediately ignored by `:UEBuild` while cwd/current buffer still belonged to `zeqiang_sample_3.6`, and a later `:UEPrepare` persisted the old project back into state.
+
+**Implemented**
+- `lua/ue.lua`: removed cwd/buffer project auto-discovery from `resolve_context()`; a project now comes only from the per-engine `state.json` written by `:UESetProject`.
+- `lua/ue.lua`: removed synchronous/asynchronous prepare's implicit `persist_project()` writeback, so prepare can no longer change the manually selected project.
+- `lua/ue.lua`: uses the persisted `project_root` + exact `uproject` directly when both still exist, falling back only to validation inside the persisted project root.
+- `tests/cases/ue_project_context_spec.lua`: added regressions proving an old-project buffer cannot override the manual pin and that cwd/buffer alone never select a project.
+- `tests/AGENTS.md`, `docs/testing-regression.md`: added the project/context regression filter mapping.
+
+**Pitfalls / Gotchas**
+- Before this fix, `UEBuild` could use the auto-detected old project without changing state; `UEPrepare` then made the failure persistent by writing that detected project back to `state.json`.
+- Existing Neovim sessions must reload the config before they receive the new manual-only resolver.
+
+**Validation**
+- `nvim --headless -l tests/run.lua ue_project_context` → 2/2 passed.
+- `nvim --headless -l tests/run.lua ue_api` → 35/35 passed.
+- `nvim --headless -l tests/run.lua smoke` → 16/16 passed.
+- Full `nvim --headless -l tests/run.lua` → exit code 0 (27 spec files).
+- Re-ran `:UESetProject E:/sample/android_3.6_debug` under `D:/project/SampleGameDebug`; state now resolves `E:/sample/android_3.6_debug/Source/Client/Client.uproject`.
+
+**Follow-ups**
+- None.
+
+### 2026-07-13 — feat(ue): export resolved Neovim UE context for AI agents
+
+**Task** — Given an engine root, produce an AI-readable context that explains common UE keymaps and resolves the effective project, platform/configuration, target, and native build/install commands.
+
+**Implemented**
+- `lua/ue.lua`: added `ue.ai_context(engine_root)`, reusing persisted state, P4 nested `uproject`, target detection, the live `Build.bat` command builder, and newest-APK selection; fixed zero-mtime APK candidates so generated/test APKs are still selectable.
+- `lua/ue/ai_context.lua`: added JSON/Markdown rendering for active context, resolution precedence, common `<Space>u*` commands, resolved argv, CDB, and clangd-index paths.
+- `scripts/export_ue_context.lua`: added a headless exporter with default output under `<engine>/.omx/context/`.
+- `docs/ue_ai_context.md`: documented invocation, outputs, and resolution contract.
+- `tests/cases/ue_context_spec.lua`, `tests/cases/ue_api_spec.lua`: locked Android Development/P4 project resolution, `Client` target selection, native build/install argv, Markdown content, and the new public API.
+- Generated `.omx/context/ue-nvim-context.{json,md}` under the requested engine checkout.
+
+**Pitfalls / Gotchas**
+- `project_root` is not necessarily the `.uproject` directory. The current P4 layout stores `Client.uproject` under `Source/Client`, so the persisted exact `uproject` path must win over flat-root scanning.
+- Lua's `apk and nil or fallback` expression always selects the fallback when the true branch is `nil`; install fallback text is assigned explicitly instead.
+
+**Validation**
+- `nvim --headless -l tests/run.lua ue_context` → 2/2 passed.
+- `nvim --headless -l tests/run.lua ue_api` → 35/35 passed.
+- `nvim --headless -l tests/run.lua keymaps` → 48/48 passed.
+- `nvim --headless -l tests/run.lua commands` → 83/83 passed.
+- Real export for the requested engine resolved the persisted P4 project, `Client.uproject`, `Android Development`, target `Client`, the engine's `Build.bat` argv, and `Client-arm64.apk`.
+- Full `nvim --headless -l tests/run.lua` → exit code 0 (26 spec files; existing DAP prompt/noise only).
+- `git diff --check` → clean apart from pre-existing CRLF normalization warnings.
+
+**Follow-ups**
+- None.
+
+### 2026-07-06 — feat(theme): add a cool pure-white Porcelain theme
+
+**Task** — 用户要求调研并新增一个有品味的白色主题，明确是白色不是米色。
+
+**Implemented**
+- `colors/porcelain-white.lua`（新）：新增自包含浅色 colorscheme，编辑区 `Normal` 使用纯白 `#FFFFFF`，cursorline / picker / gutter 用冷灰蓝白，不走米色纸张感；覆盖 editor chrome、syntax、Treesitter/LSP semantic tokens、diagnostics、diff、gitsigns、bufferline、picker、completion、terminal 16 色。
+- `lua/theme.lua`：注册 `porcelain-white = "Porcelain White"`，并加入 `white` / `porcelain` / `porcelain_white` / `porcelain white` alias，可通过 `:Theme white` 或 ThemePicker 使用。
+- `lua/highlights.lua`：将 `porcelain-white` 加入自带完整 semantic highlight 的主题跳过清单，避免通用覆盖把精细配色压平。
+- `lua/plugins/colorscheme.lua`：在创建 `:ThemePicker` 同处注册 `<leader>ut`，保证主题入口不依赖 LazyVim 是否加载 `lua/config/keymaps.lua`。
+- `lua/config/keymaps.lua`：把 `<leader>ut` 纳入 VeryLazy 后的 `<leader>u*` nowait 覆盖，避免在 UI/UE 共用前缀下发现不到主题入口。
+- `tests/cases/theme_spec.lua`（新）：锁住主题注册、主题入口 keymap 所在位置、alias 加载、light background、纯白 `Normal` 背景和冷蓝 cursorline。
+- `tests/cases/keymaps_spec.lua`：补 `<leader>ut → ThemePicker` 绑定回归。
+- `tests/AGENTS.md`、`docs/testing-regression.md`：补主题相关改动的回归 filter 映射。
+
+**Pitfalls / Gotchas**
+- 现有 `rider-light` 已是浅色主题，但 cursorline 使用偏黄 `#FCFAED`，不满足“白色不是米色”的要求；本次新增独立主题而不是改 Rider Light，避免破坏 JetBrains 过渡主题语义。
+- `<leader>ut` 原本只在 `lua/config/keymaps.lua` 里声明；用户侧发现不到时，完整 headless 启动也复现 `:ThemePicker` 命令存在但 ThemePicker keymap 不存在。修复为命令和入口 keymap 同源注册在 `lua/plugins/colorscheme.lua`，`keymaps.lua` 里的绑定保留作常规 keymap surface 的回归覆盖。
+
+**Validation**
+- `nvim --headless -l tests/run.lua theme` → 3/3 passed.
+- `nvim --headless -l tests/run.lua keymaps` → 48/48 passed.
+- `nvim --headless -l tests/run.lua smoke` → 16/16 passed.
+- `nvim --headless -l tests/run.lua structure` → 37/37 passed.
+- Full init probe: `nvim --headless -u init.lua ... maparg(' ut')` showed `<Space>ut -> <Cmd>ThemePicker<CR>` with `nowait = 1`.
+- Full `nvim --headless -l tests/run.lua` → exit code 0 (output included existing DAP prompt/noise, no failed exit).
+
+**Follow-ups**
+- 可在真实 Neovide 会话里试用 `:Theme white`，如长时间写 C++ 后觉得某类 token 过重，再针对 semantic token 微调。
+
+### 2026-07-03 — feat(diag): main-loop stall probe for intermittent UI hitches
+
+**Task** — User reports intermittent "卡卡的" hitches, not reliably reproducible. Instead of guessing at suspects, install a permanent low-cost probe that converts each hitch into hard evidence (when / how long / what buffer / which keys preceded it), so the fix targets the real culprit.
+
+**Implemented**
+- `lua/utils/stall_probe.lua` (new): 100ms `uv` timer measures its own scheduling drift; a tick arriving >150ms late means the main loop was blocked that long. Records ring buffer (200 cap) of `{time, over_ms, mode, buf, ft, recent keys+age}`; key trail via `vim.on_key` (MouseMove filtered). Each stall also lands in `utils.log` scope `stall` at WARN. Commands: `:StallProbe [on|off|status|clear]`, `:StallReport` (bottom split, newest first). Timer callback is fast-event-safe (hrtime arithmetic only; context capture via `vim.schedule`). No notifications ever emitted by the probe itself (P5); pure helpers `_over_threshold` / `_ring_push` / `_capture_stall` exposed for headless specs.
+- `init.lua`: start probe on `UIEnter` (once) — headless regression runs never attach a UI, so no hot timer during tests.
+- `tests/cases/stall_probe_spec.lua` (new): threshold decision boundaries, ring-buffer eviction, record capture shape, command registration, stop idempotency, re-setup.
+
+**Pitfalls / Gotchas**
+- Probe measures nvim main-loop blocks only. Client-side (Neovide render) stutter shows NOTHING in `:StallReport` — that absence is itself diagnostic (points at GUI process instead). Noted in the report header.
+- First analysis pass flagged candidate suspects to check against future probe data: `clipboard=unnamedplus` on Windows (every y/d/x syncs system clipboard synchronously), gitsigns `current_line_blame` delay=200ms on UE-sized repos, lazy.nvim `checker.enabled=true` (daily plugin-update git spawns), treesitter-context on `BufReadPost`. Do NOT change these until probe evidence implicates one.
+
+**Validation**
+- `nvim --headless -l tests/run.lua stall_probe` → 9/9 passed.
+- Full `nvim --headless -l tests/run.lua` → exit code 0 (all green), confirming no regression from the init.lua hook.
+
+**Follow-ups**
+- After a few days of normal use: `:StallReport` → correlate stalls with recorded keys; then targeted fix (e.g. swap clipboard to lazy `g:clipboard` osc52/win32yank-async, raise blame delay, disable checker) based on evidence.
+
+### 2026-07-01 — feat(ui): add notification history for user-triggered feedback
+
+**Task** — Make short-lived notifications, errors, and key user-command results reviewable after their toast/progress UI disappears. Android APK install is the motivating path, but the mechanism covers config-controlled notifications generally.
+
+**Implemented**
+- `lua/utils/notification_history.lua`: added a fixed-size in-memory notification history with `record` / `list` / `clear`, read-only scratch-buffer rendering, and `:NotificationHistory` / `:NotificationHistoryClear` command registration.
+- `lua/utils/log.lua`: `notify` and `notify_error` now record history entries before scheduling the existing `vim.notify`; `install_commands()` also installs notification-history commands and is safe to call repeatedly.
+- `lua/ue.lua`: `UEInstallAndroid` records install start, success, and failure summaries while preserving full stdout/stderr in `:NvimLog`.
+- `lua/utils/ue_launch.lua`: launch success and context warnings now go through `utils.log.notify`, so those user-triggered results enter notification history.
+- `lua/config/keymaps.lua`: added `<leader>uN` for `:NotificationHistory`.
+- `tests/cases/utils_spec.lua`, `tests/cases/commands_spec.lua`, `tests/cases/keymaps_spec.lua`: added coverage for history behavior, helper integration, command registration, keymap registration, and Android install source contract.
+
+**Pitfalls / Gotchas**
+- Did not monkey-patch `vim.notify`; history is opt-in through `utils.log.notify*` or explicit `notification_history.record`, avoiding plugin conflicts.
+- `stylua` is not available in the current PATH, so formatting could not be run locally.
+
+**Validation**
+- `nvim --headless -l tests/run.lua utils` = **39/39 passed**.
+- `nvim --headless -l tests/run.lua commands` = **83/83 passed**.
+- `nvim --headless -l tests/run.lua keymaps` = **47/47 passed**.
+- Full `nvim --headless -l tests/run.lua` = **EXIT 0** (23 spec files). Output tail contained known prompt/noise lines from DAP source-path tests but process exit was clean.
+
+**Follow-ups**
+- Gradually migrate other direct `vim.notify` success/error paths to `utils.log.notify` when touching those areas.
+
+### 2026-07-01 — docs(rules): 统一 Claude/Codex 说明为单一内容源（AGENTS.md 权威 + CLAUDE.md=@AGENTS.md stub）
+
+**Task** — 消除「改一次改两份」。上一条（子系统 AGENTS.md 指针）把 CLAUDE.md 当权威、AGENTS.md 当指针，仍是双份。本次反转为**单一内容源**：每个目录规则只维护 `AGENTS.md`（Codex 原生读取），同目录 `CLAUDE.md` 内容退化为 `@AGENTS.md` 导入 stub（Claude 只读 CLAUDE.md，由 import 在启动时展开读同一内容）。改一次两端同步。仅项目级，不动全局 `~/.claude`/`~/.codex`。
+
+**机制依据（实测 + 官方文档）**
+- Claude Code 只读 `CLAUDE.md` 但支持 `@path` import 展开（官方 memory 文档明确推荐此法复用 AGENTS.md）。
+- Codex 只读 `AGENTS.md`（binary strings 实证 59×AGENTS vs 3×CLAUDE 且为帮助文本），不支持 import。
+- 符号链接不可行：本机 `git core.symlinks=false` + Git Bash `ln -s` 实为拷贝 + Windows 需管理员/开发者模式。
+- 故唯一正确单源方向 = AGENTS.md 为内容源、CLAUDE.md=@AGENTS.md。
+
+**Implemented**
+- 根：`AGENTS.md` 合并为完整超集（并入旧根 CLAUDE.md 独有的 Minimize interruptions / Build & verification / User handoff + 详版 SESSION START + Definition of Done，措辞中性化为两 agent 通用）；根 `CLAUDE.md` → `@AGENTS.md` stub（带 human 注释）。
+- 18 子系统：各目录 `AGENTS.md` 由指针改为**实体内容源**（原 CLAUDE.md 正文逐字节搬入，含 dap 宪法级坑 K11/K37 等全部保留；继承说明 `../CLAUDE.md`→`../AGENTS.md`、跨引 `tests/CLAUDE.md`→`tests/AGENTS.md` 等同步）；各目录 `CLAUDE.md` → `@AGENTS.md` stub。
+- `tests/cases/structure_spec.lua`：测①改为断言每目录 `AGENTS.md`（源）存在 + `CLAUDE.md` 为 @AGENTS.md stub；测③ KEY_DOCS 用 `AGENTS.md` 替下 stub 化的 CLAUDE.md 做内链校验；测④内容断言（SESSION START/DoD/changelog/milestone）迁到根 `AGENTS.md`，对 CLAUDE.md 只断言为 stub。新增 `is_agents_stub()` helper。
+- `docs/CONSTRAINTS.md §五/§六` 与 `memory/project_overview.md`：改述为「AGENTS.md 单一内容源 + CLAUDE.md stub」；C6/C7/C8 与 SESSION START/子系统表的权威指针由 `根 CLAUDE.md`/`tests/CLAUDE.md` 改指 `根 AGENTS.md`/`tests/AGENTS.md`。
+
+**Pitfalls / Gotchas**
+- `structure_spec` 测③只校验 `](path)` 形式的相对链接；CONSTRAINTS/overview 里对 `CLAUDE.md` 的提及均为 backtick inline code，非链接，故不触发悬空校验——但仍统一改指内容源以免误导。
+- Claude 首次遇到 `@AGENTS.md` 外部导入会弹一次批准框（同仓相对导入，属正常），批准后不再提示。
+- 反转是「搬家非重写」：18 文件逐字节核对，尤其 dap 段承重坑一字未删。
+
+**Validation**
+- 分范围 `nvim --headless -l tests/run.lua structure` = **37/37 passed**（含内链不悬空 + stub 断言）。
+- 全量 `nvim --headless -l tests/run.lua` = **EXIT 0（全绿）**（23 spec files；harness 契约：exit 0=全绿/1=有失败）。改动跨规则/结构/测试，按政策升级全量。
+
+**Follow-ups**
+- 无。后续新增子系统目录按 CONSTRAINTS §六.4：补 `AGENTS.md`（源）+ `CLAUDE.md`（@AGENTS.md stub）。
+
+### 2026-07-01 — docs(rules): 子系统 AGENTS.md 指针 — Claude/Codex 切换开发信息同步（已被上一条取代）
+
+**Task** — 让 Claude 与 Codex 在本仓来回切换开发时局部规则信息一致：此前 18 个子系统目录只有 `CLAUDE.md`、无 `AGENTS.md`，Codex 若被直接在子目录内启动（未先读根 `AGENTS.md`）就发现不了「回落最近祖先 `CLAUDE.md`」规则，从而漏读局部约束。仅做项目级桥接，不动任何全局配置（`~/.claude`、`~/.codex`）。
+
+**Implemented**
+- 新增 18 个极简 `AGENTS.md` 指针（每个带 `CLAUDE.md` 的主要目录一份），只重定向到同级 `CLAUDE.md` + 声明继承链 + 正确 `../` 深度的根 `AGENTS.md`/`docs/CONSTRAINTS.md` 链接，**不复制内容**（杜绝漂移）：
+  `docs` `lua` `lua/config` `lua/nio` `lua/plugins` `lua/trouble` `lua/ue` `lua/ue/cdb` `lua/ue/core` `lua/ue/dap` `lua/utils` `lua/utils/code_search` `lua/utils/platform` `lua/utils/ue_goto` `lua/workarounds` `scripts` `tests` `tools`。
+- `docs/CONSTRAINTS.md §五` 增「子系统 `AGENTS.md` 指针」段；§六 第4条维护契约补「新增子系统目录须同时补 `CLAUDE.md` 与指针 `AGENTS.md`」。
+- 权威永远是 `CLAUDE.md`（单一出处）；`AGENTS.md` 仅指针，故子系统 `CLAUDE.md` 措辞不动。
+
+**Pitfalls / Gotchas**
+- `structure_spec.lua` 测③「关键文档内链不悬空」会校验 `AGENTS.md`/`CLAUDE.md`/`CONSTRAINTS.md` 等 KEY_DOCS 的相对链接可解析——故 CONSTRAINTS 编辑未引入悬空链接；指针文件用真实相对 `../` 路径（非仅 IDE 用的 `/C:/` 绝对链接），各深度（1/2/3 级）分别 `../`、`../../`、`../../../`。
+- `structure_spec` MAJOR_DIRS 只断言 `CLAUDE.md` 存在，不禁止额外 `AGENTS.md`，故新增指针不触发冻结清单。
+
+**Validation**
+- 分范围回归 `nvim --headless -l tests/run.lua structure` = **36/36 passed, 0 failed**（含内链不悬空校验）。改动仅文档/规则/知识库结构，按 CHANGE-TO-FILTER MAP 对应 `structure`。
+
+**Follow-ups**
+- 无。提交/合并前若合入其它改动，按 DoD 跑全量 `nvim --headless -l tests/run.lua`。
+
+### 2026-06-25 — fix(cdb): UEPrepare 的 cdb_partition 与 pipeline 并发撕裂 compile_commands.json（JSONDecodeError 根治）
+
+**Task** — `:UEPrepare` 稳定报错 `ue-pipeline failed (exit 1)` / `json.decoder.JSONDecodeError`（每次偏移不同：char 68551910 / 32430658 / 86744524）。用户只触发一次 UEPrepare，排除手动重入。
+
+**根因（打 log 坐实，非推测）** — fast-path 在 `lua/ue.lua` 起 **async** pipeline（`run_compile_commands_pipeline` → jobstart 立即返回）后，**紧跟同步**跑 `INDEX_FN.partition_base_cdb`，两者并发改写同一个 `<engine_root>/compile_commands.json`（225MB）。带毫秒时间戳的探针实证：`partition START (260175301)` 落在 `pipeline START (260175285)` 与 `pipeline EXIT (260182943)` 之间，partition 全程 ~5.6s 与 pipeline 重叠 → pipeline 的 resolve 阶段读到被 partition 撕裂的中间态 → JSONDecodeError。失败 run 的 partition 备份 `compile_commands.json.bak-20260625-173955`（单行撕裂态）是另一铁证。
+
+**Implemented**
+- `run_compile_commands_pipeline(path, targets, on_done?)` 新增 `on_done` 形参，透传给 `ue.cdb.pipeline.run`（pipeline 本就支持 on_done，wrapper 之前没转发）。
+- fast-path（`lua/ue.lua` ~8402）把 `partition_base_cdb` 从「pipeline 之后立即同步」改为「pipeline 的 `on_done` 回调内」——严格串行在 expand→pch→resolve→unify→prune 完成之后，消除并发写。
+- `on_done` 在 pipeline 的 no-change 与 changed 两条路径都触发（pipeline.lua:189/199），且在 copy_file 到 sibling targets 之后，故 partition 必见最终 base CDB。
+
+**Pitfalls / Gotchas**
+- 误区排查链：先疑「非原子写被中断」→ 再疑「writer/reader 编码不一致（prebuild_pch_v2.py:467 缺 encoding=）」→ 都被证伪（失败时磁盘文件事后是干净 ASCII / 单行）。最终靠时间戳探针锁定是**单次 run 内部自起的两个并发写者**。原子写只是兜底，真因是并发，治本是串行化。
+- 仅 fast-path 同时调 pipeline+partition；cold/full（`generate_compile_commands`）与平台切换（`fast_swap_active_platform`）不调 partition，无此 race；手动 `:UECDBPartition`/`:UECDBSwitch` 无并发 pipeline。
+- 残留隐患（未本次处理）：`prebuild_pch_v2.py:467` / `prune_include_dirs.py:431` 的 CDB 写缺 `encoding='utf-8'`，UE 路径含非 ASCII 时是潜在 bug；各 pipeline 脚本 in-place 写非原子，中断仍可留半成品。可后续单开 cdb 加固 change。
+
+**Validation**
+- 修复后真实 `:UEPrepare`（一个 225MB CDB 的 UE 项目）：pipeline 的 resolve 阶段 **成功通过** `resolve_cdb_paths: resolved 3044 relative paths`（此前每次死在此处），不再有 JSONDecodeError。（测试窗口 2min timeout 截断了后续 unify/prune + clangd 索引，属测试窗口短，非 bug。）
+- 全量回归 `nvim --headless -l tests/run.lua` = **551/551 passed, 0 failed**；分范围 `ue_cdb` 8/8、`smoke` 16/16。
+
+**Follow-ups**
+- cdb 脚本 encoding= + 原子写加固（潜在，未阻塞当前修复）。
+
+### 2026-06-25 — search 系统小幅度重构：csearch 去平台化 + `<leader>/` 从不加 rg + 面板内 scope
+
+**Task** — `<leader>/` 距 Rider 体验有差距；调研结论：csearch 是 Windows 内容搜索天花板（Everything 1.5 内容索引不适合源码树、zoekt P13 死路），真问题在 ①csearch 索引被无谓地按平台分片、②`<leader>/` 仍会静默降级到 rg、③UI 已实现但可发现性差。本次落实前两项 + 补面板内 scope。OpenSpec change：`refactor-search-system`。
+
+**Implemented**
+- **csearch 索引去平台化**（cache layout v3.2）：`ue.lua cache_paths` 的 `csearch_idx` 由 `csearch/<platform_key>/csearch.idx` 改为扁平 `csearch/csearch.idx`，全平台共用一份。依据：csearch 文件清单输入（`engine_root`+`project_root`+平台无关的 `ENGINE_PICKER_DIRS`/`SCAN_EXCLUDES`/`.ueprepare-scan-paths`）无平台维度；且 `csearch_input_hash` 本就 per-engine_root，去平台化使校验维度与索引维度对齐。gtags/cdb 仍 per-platform（编译相关）。
+- **迁移（M2 标记 stale）**：`migrate_legacy_csearch_if_needed` 不再搬运 csearch（扁平后 legacy==active），只迁移 gtags lists/DB；旧 `csearch/<key>/` 不删，靠 `prepare_freshness` 判 stale → 下次 `:UEPrepare` 重建共用索引。更新 `fast_swap_active_platform` 注释（切平台不再动 csearch）。
+- **`<leader>/` 从不加 rg**：移除 4 处 rg 暗门——`cached_grep` 内 ②rg-batched fallback、③`return nil`→snacks 目录遍历、rg fast-path（`source="ue_grep_rg"`，~240 行），以及 `snacks.lua ue_project_grep` 的 `snacks.picker.grep` 兜底（design 原稿漏列的第 4 处）。无索引时弹可见 ERROR 引导 `:UEPrepare`、不开任何 picker。`code_search.stream()` 内 rg 分支保留（gd/gr 兜底 P12）；`<leader>sG` 仍是显式 rg 入口。
+- **面板内 scope 过滤**（`<a-s>`）：新增 `ue_grep_toggle_scope` action + `scoped` toggle（标题 "S" 图标）。复用 csearch 单一 `-f` 文件路径正则；新增纯函数 `code_search._compose_file_regex(opts)` 把 `code_only` 扩展名正则与 scope 路径正则折叠为一条 RE2（`<scope>.*<exts>$`，RE2 无 lookahead）。scope 取自当前 buffer 的 module/plugin（`current_scope_info_from_context`），开面板时捕获。
+
+**Pitfalls / Gotchas**
+- csearch 只接受**单个** `-f`（实测 `csearch --help`），RE2 无 lookahead → scope+code_only 必须折叠成一条线性正则，不能传两个 `-f`。
+- 第 4 处 rg 暗门在 wrapper 层（`ue_project_grep`），不在 `cached_grep` 内——design 原稿只列了 3 处，实施时补正并回写 design.md。
+- 去平台化后 `grep_cache_spec` 多条断言（per-platform 路径、csearch 迁移、rg 路径 case 接线、slow-fallback 标题）全部失效，按新契约重写。
+
+**Validation**
+- 全量回归 `nvim --headless -l tests/run.lua` = **551/551 passed, 0 failed**。
+- 分范围：`grep_cache`（25/25，含新增去平台化路径断言 + scope `-f` 组合 + csearch-only 静态接线）、`csearch`（13/13）、`ue_goto_behavior`（6/6，确认 gd/gr 的 rg 兜底链未被砸穿）、`utils`（30/30）。
+- `ue.lua` / `code_search/init.lua` headless `require` 加载无错。
+
+**Follow-ups**
+- 可发现性（Rider 风常驻 toggle 提示栏 / `footer_keys`）仍是候选子项，未在本次落地。
+- 文档：cheatsheet/README/`code_search/CLAUDE.md` 同步（本条目同批）。
+
 ### 2026-06-18 — 通用后台任务管理（:Tasks / 派生状态注册表）
 
 **Task** — 用户：「我 space ub 发起一个任务之后怎么把他停掉」。本仓后台 job（构建/prepare/launch/install/logcat/日志流）句柄散落、部分根本没保存，`async_launcher` 的 `q` 明确「不取消底层 job」，没有统一的「列出+停止」入口。需求是通用编辑器能力，不绑 UE。

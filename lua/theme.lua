@@ -11,6 +11,10 @@ local ALIASES = {
   rider = "rider-light",
   rider_light = "rider-light",
   ["rider light"] = "rider-light",
+  white = "porcelain-white",
+  porcelain = "porcelain-white",
+  porcelain_white = "porcelain-white",
+  ["porcelain white"] = "porcelain-white",
 }
 local picker = nil
 
@@ -29,6 +33,7 @@ local LABELS = {
   unokai = "Unokai",
   ["ubuntu-terminal"] = "Ubuntu Terminal",
   ["rider-light"] = "Rider Light",
+  ["porcelain-white"] = "Porcelain White",
   apprentice = "Apprentice",
 }
 

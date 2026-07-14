@@ -53,6 +53,108 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-07-14 — fix(ue): make project selection manual-only
+
+**Task** — `:UESetProject E:/sample/android_3.6_debug` was immediately ignored by `:UEBuild` while cwd/current buffer still belonged to `zeqiang_sample_3.6`, and a later `:UEPrepare` persisted the old project back into state.
+
+**Implemented**
+- `lua/ue.lua`: removed cwd/buffer project auto-discovery from `resolve_context()`; a project now comes only from the per-engine `state.json` written by `:UESetProject`.
+- `lua/ue.lua`: removed synchronous/asynchronous prepare's implicit `persist_project()` writeback, so prepare can no longer change the manually selected project.
+- `lua/ue.lua`: uses the persisted `project_root` + exact `uproject` directly when both still exist, falling back only to validation inside the persisted project root.
+- `tests/cases/ue_project_context_spec.lua`: added regressions proving an old-project buffer cannot override the manual pin and that cwd/buffer alone never select a project.
+- `tests/AGENTS.md`, `docs/testing-regression.md`: added the project/context regression filter mapping.
+
+**Pitfalls / Gotchas**
+- Before this fix, `UEBuild` could use the auto-detected old project without changing state; `UEPrepare` then made the failure persistent by writing that detected project back to `state.json`.
+- Existing Neovim sessions must reload the config before they receive the new manual-only resolver.
+
+**Validation**
+- `nvim --headless -l tests/run.lua ue_project_context` → 2/2 passed.
+- `nvim --headless -l tests/run.lua ue_api` → 35/35 passed.
+- `nvim --headless -l tests/run.lua smoke` → 16/16 passed.
+- Full `nvim --headless -l tests/run.lua` → exit code 0 (27 spec files).
+- Re-ran `:UESetProject E:/sample/android_3.6_debug` under `D:/project/SampleGameDebug`; state now resolves `E:/sample/android_3.6_debug/Source/Client/Client.uproject`.
+
+**Follow-ups**
+- None.
+
+### 2026-07-13 — feat(ue): export resolved Neovim UE context for AI agents
+
+**Task** — Given an engine root, produce an AI-readable context that explains common UE keymaps and resolves the effective project, platform/configuration, target, and native build/install commands.
+
+**Implemented**
+- `lua/ue.lua`: added `ue.ai_context(engine_root)`, reusing persisted state, P4 nested `uproject`, target detection, the live `Build.bat` command builder, and newest-APK selection; fixed zero-mtime APK candidates so generated/test APKs are still selectable.
+- `lua/ue/ai_context.lua`: added JSON/Markdown rendering for active context, resolution precedence, common `<Space>u*` commands, resolved argv, CDB, and clangd-index paths.
+- `scripts/export_ue_context.lua`: added a headless exporter with default output under `<engine>/.omx/context/`.
+- `docs/ue_ai_context.md`: documented invocation, outputs, and resolution contract.
+- `tests/cases/ue_context_spec.lua`, `tests/cases/ue_api_spec.lua`: locked Android Development/P4 project resolution, `Client` target selection, native build/install argv, Markdown content, and the new public API.
+- Generated `.omx/context/ue-nvim-context.{json,md}` under the requested engine checkout.
+
+**Pitfalls / Gotchas**
+- `project_root` is not necessarily the `.uproject` directory. The current P4 layout stores `Client.uproject` under `Source/Client`, so the persisted exact `uproject` path must win over flat-root scanning.
+- Lua's `apk and nil or fallback` expression always selects the fallback when the true branch is `nil`; install fallback text is assigned explicitly instead.
+
+**Validation**
+- `nvim --headless -l tests/run.lua ue_context` → 2/2 passed.
+- `nvim --headless -l tests/run.lua ue_api` → 35/35 passed.
+- `nvim --headless -l tests/run.lua keymaps` → 48/48 passed.
+- `nvim --headless -l tests/run.lua commands` → 83/83 passed.
+- Real export for the requested engine resolved the persisted P4 project, `Client.uproject`, `Android Development`, target `Client`, the engine's `Build.bat` argv, and `Client-arm64.apk`.
+- Full `nvim --headless -l tests/run.lua` → exit code 0 (26 spec files; existing DAP prompt/noise only).
+- `git diff --check` → clean apart from pre-existing CRLF normalization warnings.
+
+**Follow-ups**
+- None.
+
+### 2026-07-06 — feat(theme): add a cool pure-white Porcelain theme
+
+**Task** — 用户要求调研并新增一个有品味的白色主题，明确是白色不是米色。
+
+**Implemented**
+- `colors/porcelain-white.lua`（新）：新增自包含浅色 colorscheme，编辑区 `Normal` 使用纯白 `#FFFFFF`，cursorline / picker / gutter 用冷灰蓝白，不走米色纸张感；覆盖 editor chrome、syntax、Treesitter/LSP semantic tokens、diagnostics、diff、gitsigns、bufferline、picker、completion、terminal 16 色。
+- `lua/theme.lua`：注册 `porcelain-white = "Porcelain White"`，并加入 `white` / `porcelain` / `porcelain_white` / `porcelain white` alias，可通过 `:Theme white` 或 ThemePicker 使用。
+- `lua/highlights.lua`：将 `porcelain-white` 加入自带完整 semantic highlight 的主题跳过清单，避免通用覆盖把精细配色压平。
+- `lua/plugins/colorscheme.lua`：在创建 `:ThemePicker` 同处注册 `<leader>ut`，保证主题入口不依赖 LazyVim 是否加载 `lua/config/keymaps.lua`。
+- `lua/config/keymaps.lua`：把 `<leader>ut` 纳入 VeryLazy 后的 `<leader>u*` nowait 覆盖，避免在 UI/UE 共用前缀下发现不到主题入口。
+- `tests/cases/theme_spec.lua`（新）：锁住主题注册、主题入口 keymap 所在位置、alias 加载、light background、纯白 `Normal` 背景和冷蓝 cursorline。
+- `tests/cases/keymaps_spec.lua`：补 `<leader>ut → ThemePicker` 绑定回归。
+- `tests/AGENTS.md`、`docs/testing-regression.md`：补主题相关改动的回归 filter 映射。
+
+**Pitfalls / Gotchas**
+- 现有 `rider-light` 已是浅色主题，但 cursorline 使用偏黄 `#FCFAED`，不满足“白色不是米色”的要求；本次新增独立主题而不是改 Rider Light，避免破坏 JetBrains 过渡主题语义。
+- `<leader>ut` 原本只在 `lua/config/keymaps.lua` 里声明；用户侧发现不到时，完整 headless 启动也复现 `:ThemePicker` 命令存在但 ThemePicker keymap 不存在。修复为命令和入口 keymap 同源注册在 `lua/plugins/colorscheme.lua`，`keymaps.lua` 里的绑定保留作常规 keymap surface 的回归覆盖。
+
+**Validation**
+- `nvim --headless -l tests/run.lua theme` → 3/3 passed.
+- `nvim --headless -l tests/run.lua keymaps` → 48/48 passed.
+- `nvim --headless -l tests/run.lua smoke` → 16/16 passed.
+- `nvim --headless -l tests/run.lua structure` → 37/37 passed.
+- Full init probe: `nvim --headless -u init.lua ... maparg(' ut')` showed `<Space>ut -> <Cmd>ThemePicker<CR>` with `nowait = 1`.
+- Full `nvim --headless -l tests/run.lua` → exit code 0 (output included existing DAP prompt/noise, no failed exit).
+
+**Follow-ups**
+- 可在真实 Neovide 会话里试用 `:Theme white`，如长时间写 C++ 后觉得某类 token 过重，再针对 semantic token 微调。
+
+### 2026-07-03 — feat(diag): main-loop stall probe for intermittent UI hitches
+
+**Task** — User reports intermittent "卡卡的" hitches, not reliably reproducible. Instead of guessing at suspects, install a permanent low-cost probe that converts each hitch into hard evidence (when / how long / what buffer / which keys preceded it), so the fix targets the real culprit.
+
+**Implemented**
+- `lua/utils/stall_probe.lua` (new): 100ms `uv` timer measures its own scheduling drift; a tick arriving >150ms late means the main loop was blocked that long. Records ring buffer (200 cap) of `{time, over_ms, mode, buf, ft, recent keys+age}`; key trail via `vim.on_key` (MouseMove filtered). Each stall also lands in `utils.log` scope `stall` at WARN. Commands: `:StallProbe [on|off|status|clear]`, `:StallReport` (bottom split, newest first). Timer callback is fast-event-safe (hrtime arithmetic only; context capture via `vim.schedule`). No notifications ever emitted by the probe itself (P5); pure helpers `_over_threshold` / `_ring_push` / `_capture_stall` exposed for headless specs.
+- `init.lua`: start probe on `UIEnter` (once) — headless regression runs never attach a UI, so no hot timer during tests.
+- `tests/cases/stall_probe_spec.lua` (new): threshold decision boundaries, ring-buffer eviction, record capture shape, command registration, stop idempotency, re-setup.
+
+**Pitfalls / Gotchas**
+- Probe measures nvim main-loop blocks only. Client-side (Neovide render) stutter shows NOTHING in `:StallReport` — that absence is itself diagnostic (points at GUI process instead). Noted in the report header.
+- First analysis pass flagged candidate suspects to check against future probe data: `clipboard=unnamedplus` on Windows (every y/d/x syncs system clipboard synchronously), gitsigns `current_line_blame` delay=200ms on UE-sized repos, lazy.nvim `checker.enabled=true` (daily plugin-update git spawns), treesitter-context on `BufReadPost`. Do NOT change these until probe evidence implicates one.
+
+**Validation**
+- `nvim --headless -l tests/run.lua stall_probe` → 9/9 passed.
+- Full `nvim --headless -l tests/run.lua` → exit code 0 (all green), confirming no regression from the init.lua hook.
+
+**Follow-ups**
+- After a few days of normal use: `:StallReport` → correlate stalls with recorded keys; then targeted fix (e.g. swap clipboard to lazy `g:clipboard` osc52/win32yank-async, raise blame delay, disable checker) based on evidence.
+
 ### 2026-07-01 — feat(ui): add notification history for user-triggered feedback
 
 **Task** — Make short-lived notifications, errors, and key user-command results reviewable after their toast/progress UI disappears. Android APK install is the motivating path, but the mechanism covers config-controlled notifications generally.

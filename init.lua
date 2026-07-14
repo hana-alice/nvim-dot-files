@@ -38,6 +38,19 @@ do
   end
 end
 
+-- Diagnostic: main-loop stall probe (100ms tick, records blocks >150ms).
+-- Cheap (hrtime arithmetic per tick); evidence via :StallReport / log scope
+-- "stall". Started on UIEnter so headless regression runs (-l/--headless,
+-- which never attach a UI) don't spin a hot timer.
+vim.api.nvim_create_autocmd("UIEnter", {
+  once = true,
+  callback = function()
+    pcall(function()
+      require("utils.stall_probe").setup()
+    end)
+  end,
+})
+
 require("config.neovide").setup()
 require("config.snacks_global").setup()
 require("config.lazy")

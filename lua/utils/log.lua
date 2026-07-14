@@ -429,11 +429,27 @@ function M.notify(scope, msg, level, opts)
   level = level or vim.log.levels.INFO
   local name = LEVEL_NAME_BY_VALUE[level] or "INFO"
   emit(name, scope, msg)
+  pcall(function()
+    require("utils.notification_history").record({
+      scope = scope,
+      title = opts and opts.title,
+      message = msg,
+      level = level,
+    })
+  end)
   vim.schedule(function() vim.notify(msg, level, opts) end)
 end
 
 function M.notify_error(scope, msg, opts)
   emit("ERROR", scope, msg)
+  pcall(function()
+    require("utils.notification_history").record({
+      scope = scope,
+      title = opts and opts.title,
+      message = msg,
+      level = vim.log.levels.ERROR,
+    })
+  end)
   vim.schedule(function() vim.notify(msg, vim.log.levels.ERROR, opts) end)
 end
 
@@ -629,19 +645,23 @@ end
 -- ---------------------------------------------------------------------------
 
 function M.install_commands()
+  pcall(function()
+    require("utils.notification_history").install_commands()
+  end)
+
   vim.api.nvim_create_user_command("NvimLog", function() M.open() end,
-    { desc = "Open the nvim debug log in a new tab" })
+    { desc = "Open the nvim debug log in a new tab", force = true })
 
   vim.api.nvim_create_user_command("NvimLogPath", function()
     local p = resolve_path_main()
     vim.notify("nvim debug log: " .. (p or "?"), vim.log.levels.INFO, { title = "log" })
     if p then pcall(vim.fn.setreg, "+", p) end
-  end, { desc = "Echo + yank current nvim debug log path" })
+  end, { desc = "Echo + yank current nvim debug log path", force = true })
 
   vim.api.nvim_create_user_command("NvimLogClear", function()
     M.clear()
     vim.notify("nvim debug log rotated/cleared", vim.log.levels.INFO, { title = "log" })
-  end, { desc = "Rotate the active log out of the way and start fresh" })
+  end, { desc = "Rotate the active log out of the way and start fresh", force = true })
 
   vim.api.nvim_create_user_command("NvimLogLevel", function(args)
     local lvl = (args.args or ""):upper()
@@ -658,6 +678,7 @@ function M.install_commands()
   end, {
     nargs = "?",
     complete = function() return { "trace", "debug", "info", "warn", "error" } end,
+    force = true,
     desc = "Show or set the global nvim debug log level",
   })
 
@@ -709,6 +730,7 @@ function M.install_commands()
       end
       return {}
     end,
+    force = true,
     desc = "Show/set per-scope log level overrides",
   })
 end

@@ -27,6 +27,11 @@ return {
         require("theme").select()
       end, { desc = "Select colorscheme" })
 
+      vim.keymap.set("n", "<leader>ut", "<cmd>ThemePicker<cr>", {
+        desc = "UI: Theme picker",
+        nowait = true,
+      })
+
       vim.api.nvim_create_user_command("Theme", function(opts)
         if opts.args == "" then
           require("theme").select()

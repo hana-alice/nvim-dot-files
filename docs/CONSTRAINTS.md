@@ -452,8 +452,8 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 任何 `.lua` 运行时代码或 `tests/` 改动，**完成前 MUST 跑对应范围回归并全绿**。按改动类型跑
 **最小必跑范围**（改动 → spec filter 映射），但 **① 提交/合并前必跑全量；② 影响面不确定升级到全量，不猜窄 filter**。
 新增功能 MUST 补 `*_spec.lua`；冻结清单（`commands_spec` 的 `UE_COMMANDS`、`structure_spec` 目录清单）随相关项变化同步。
-**强制入口在根 `CLAUDE.md` 的 Definition of Done**；映射速查在 `tests/CLAUDE.md`；权威细则在 `docs/testing-regression.md`。
-→ 根 `CLAUDE.md` (Definition of Done); `docs/testing-regression.md`; `tests/CLAUDE.md`
+**强制入口在根 `AGENTS.md` 的 Definition of Done**（Claude 侧经根 `CLAUDE.md` 的 `@AGENTS.md` 展开读同一内容）；映射速查在 `tests/AGENTS.md`；权威细则在 `docs/testing-regression.md`。
+→ 根 `AGENTS.md` (Definition of Done); `docs/testing-regression.md`; `tests/AGENTS.md`
 
 ### C7 — 改动记录政策（changelog）
 
@@ -461,7 +461,7 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 （`### YYYY-MM-DD — 标题` + Task / Implemented / Pitfalls / Validation / Follow-ups）。Implemented 含具体
 文件路径与函数名；**Validation 写明所跑回归范围与结果**（与 C6 联动）。攒够 8–12 条或一项连贯工作收尾
 即切片归档（见 C8）。
-→ 根 `CLAUDE.md` (Definition of Done); `docs/changelog.md` (Entry template / How to use)
+→ 根 `AGENTS.md` (Definition of Done); `docs/changelog.md` (Entry template / How to use)
 
 ### C8 — milestone（版本里程碑）政策
 
@@ -471,7 +471,7 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 ② milestone 前跑**全量回归门禁** `nvim --headless -l tests/run.lua` 全绿；③ 打 git tag `vX.Y.Z`
 （**tag/commit 须用户确认**，遵守本仓 git 政策，不自动执行）；④ 若动了架构/子系统边界，同步
 `memory/` 与 `docs/architecture/overview.md`。
-→ 根 `CLAUDE.md` (Definition of Done); `docs/changelog.md` (Released); `docs/release_1.0.0.md` (格式范例)
+→ 根 `AGENTS.md` (Definition of Done); `docs/changelog.md` (Released); `docs/release_1.0.0.md` (格式范例)
 
 ---
 
@@ -479,19 +479,21 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 
 为让持续介入的 AI agent **从文件而非 chat 历史**发现规则，本仓提供：
 
-- **强制执行入口**：根 `CLAUDE.md`（Claude Code）与根 `AGENTS.md`（GPT/Codex）的
-  SESSION START 协议（动代码前先读 `docs/CONSTRAINTS.md` → `memory/project_overview.md` →
-  当前目录本地规则）+ Definition of Done。
-- **递归本地规则**：每个主要目录一份 `CLAUDE.md`，子级只写相对父级的增量；
-  GPT/Codex 从根 `AGENTS.md` 进入后按最近祖先 `CLAUDE.md` 读取这些局部规则。
-  **目录无 `CLAUDE.md` 时回落最近祖先目录的规则**。
+- **强制执行入口（单一内容源）**：根 `AGENTS.md` 是 Claude 与 GPT/Codex **共用的唯一内容源**
+  （SESSION START 协议：动代码前先读 `docs/CONSTRAINTS.md` → `memory/project_overview.md` →
+  当前目录本地规则；+ Definition of Done）。根 `CLAUDE.md` 内容仅为 `@AGENTS.md` 导入 stub
+  （Claude 只读 `CLAUDE.md`，由该 import 展开读同一内容；Codex 原生读 `AGENTS.md`）。
+- **递归本地规则（单一内容源）**：每个主要目录一份 `AGENTS.md`（权威内容源），同目录一份
+  `CLAUDE.md`（内容为 `@AGENTS.md` stub）。子级只写相对父级的增量；某目录无本地规则时，
+  适用**最近祖先目录**的规则（回落语义）。**只维护 AGENTS.md 一个文件，改一次两端同步**——
+  不再有「改 CLAUDE 又改 AGENTS」的双份维护。
 - **持久化知识库四区**：
   - `memory/project_overview.md` — 项目总览 + 子系统速查 + 先读顺序。
   - `decisions/README.md` — 架构决策(ADR)导航（权威正文在 `docs/plans/`）。
   - `lessons/README.md` — 平台怪癖/调试硬知识导航（权威在本文件 §二）。
   - `docs/architecture/overview.md` — 架构总览（子系统/数据流/平台层/构建流水线/归属边界）。
-- **可发现性回归**：`tests/cases/structure_spec.lua` 守护「目录规则存在 + 知识库结构完整 +
-  内链不悬空 + 政策可发现」，跑 `structure` filter。
+- **可发现性回归**：`tests/cases/structure_spec.lua` 守护「目录规则存在（AGENTS.md 源 +
+  CLAUDE.md stub）+ 知识库结构完整 + 内链不悬空 + 政策可发现」，跑 `structure` filter。
 
 ---
 
@@ -505,9 +507,10 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
    并在 `lessons/README.md` 对应领域补一句主题导航。
 3. **改动版本钉死项 / 约定 / 启动顺序** → 同步更新 §三，并保持指向 `docs/TOOLING.md`
    / `README.md` / `init.lua` 的出处链接。
-4. **新增子系统目录 / 迁移知识** → 为新目录补一份本地 `CLAUDE.md`（声明继承父级），
+4. **新增子系统目录 / 迁移知识** → 为新目录补一份本地 `AGENTS.md`（内容源，声明继承父级）
+   **并补一个 `CLAUDE.md`（内容为 `@AGENTS.md` stub）**，
    在对应知识区 README 登记；`structure_spec` 的目录清单同步。
-5. **新增 spec / 改命令清单** → 同步 `tests/CLAUDE.md` 与 `docs/testing-regression.md` 的 filter 映射，
+5. **新增 spec / 改命令清单** → 同步 `tests/AGENTS.md` 与 `docs/testing-regression.md` 的 filter 映射，
    及 `commands_spec` 冻结清单。
 6. **milestone 收尾** → 须同步 `memory/` 与 `docs/architecture/overview.md`（若动架构），并按 C8 产出四件套。
 7. **出处优先**: 不在此复制原文；摘要与出处冲突时以出处为准。删除某 workaround/坑

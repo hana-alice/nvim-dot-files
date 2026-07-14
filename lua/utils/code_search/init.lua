@@ -168,6 +168,31 @@ end
 --   /path/to/file.cpp:123:matched line text here
 -- We reconstruct column by re-finding pattern (rough; sufficient for
 -- picker preview placement). For exact column, use rg fallback.
+-- Compose csearch's single `-f fileregexp` (RE2) from two independent
+-- constraints. csearch accepts only ONE -f and RE2 has no lookahead, so we
+-- fold both into a single linear regex:
+--   code_only  → path ends in a source extension
+--   path_filter (scope) → path is under a module/plugin/dir root (already an
+--                         RE2-escaped fragment; caller escapes the literal root)
+-- Result:
+--   <scope> .* \.(exts)$   (both)   |   <scope>   (scope only)
+--   \.(exts)$              (code_only only)        |   nil (neither)
+-- Pure + side-effect-free so it can be unit-tested without spawning csearch.
+M._FILE_EXT_RE =
+  "\\.(cpp|c|cc|cxx|h|hpp|hh|hxx|inl|ipp|inc|m|mm|cs|usf|ush|hlsl|hlsli|glsl|comp|vert|frag|geom|tesc|tese|metal|ini|cfg|conf|ts|tsx|js|json|xml|yaml|yml|py|lua|uproject|uplugin|target\\.cs|build\\.cs)$"
+function M._compose_file_regex(opts)
+  opts = opts or {}
+  local scope_re = type(opts.path_filter) == "string" and opts.path_filter ~= "" and opts.path_filter or nil
+  if opts.code_only and scope_re then
+    return scope_re .. ".*" .. M._FILE_EXT_RE
+  elseif opts.code_only then
+    return M._FILE_EXT_RE
+  elseif scope_re then
+    return scope_re
+  end
+  return nil
+end
+
 local function stream_csearch(ctx, pattern, opts, callbacks)
   local cs = csearch_exe()
   if not cs then
@@ -182,15 +207,12 @@ local function stream_csearch(ctx, pattern, opts, callbacks)
   local raw_needle = pattern
 
   local args = { "-n" }
-  if opts.code_only then
-    -- csearch -f filters by FILE PATH regex (not glob). Build a regex
-    -- that matches the source extensions. Kept in sync with ue.lua's
-    -- FT_CODE + FT_CONFIG so opts.code_only never accidentally drops
-    -- TypeScript / C# / Python / YAML files the user can see in the
-    -- file picker.
+  -- csearch supports a SINGLE -f fileregexp; compose code_only + path_filter
+  -- into one RE2 (see M._compose_file_regex). nil → no -f.
+  local file_re = M._compose_file_regex(opts)
+  if file_re then
     table.insert(args, "-f")
-    table.insert(args,
-      "\\.(cpp|c|cc|cxx|h|hpp|hh|hxx|inl|ipp|inc|m|mm|cs|usf|ush|hlsl|hlsli|glsl|comp|vert|frag|geom|tesc|tese|metal|ini|cfg|conf|ts|tsx|js|json|xml|yaml|yml|py|lua|uproject|uplugin|target\\.cs|build\\.cs)$")
+    table.insert(args, file_re)
   end
 
   -- Pattern rewrite pipeline. ORDER MATTERS: literal-escape first (so

@@ -384,7 +384,11 @@ local function launch_android_process(env, spec)
       vim.schedule(function()
         if code == 0 then
           local device = spec.serial and (" on " .. spec.serial) or ""
-          vim.notify(("Android app launched: %s%s"):format(spec.package_name, device), vim.log.levels.INFO)
+          require("utils.log").notify(
+            "ue_launch",
+            ("Android app launched: %s%s"):format(spec.package_name, device),
+            vim.log.levels.INFO
+          )
           return
         end
         local detail = #output > 0 and ("\n" .. table.concat(output, "\n")) or ""
@@ -452,7 +456,7 @@ end
 function M.launch(env)
   local ctx, err = env.resolve_context()
   if not ctx then
-    vim.notify(err, vim.log.levels.WARN)
+    require("utils.log").notify("ue_launch", err, vim.log.levels.WARN)
     return
   end
 
@@ -504,7 +508,11 @@ function M.launch(env)
 
   local target = vim.fn.fnamemodify(spec.exe, ":t")
   local args = #spec.args > 0 and (" " .. table.concat(spec.args, " ")) or ""
-  vim.notify(("Launched %s: %s%s (pid %s)"):format(spec.platform, target, args, detail), vim.log.levels.INFO)
+  require("utils.log").notify(
+    "ue_launch",
+    ("Launched %s: %s%s (pid %s)"):format(spec.platform, target, args, detail),
+    vim.log.levels.INFO
+  )
 end
 
 return M

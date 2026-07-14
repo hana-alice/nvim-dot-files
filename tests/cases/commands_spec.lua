@@ -60,8 +60,9 @@ t.describe("commands: 辅助命令（keymaps.lua 注册）", function()
   vim.g.mapleader = " "
   vim.g.maplocalleader = " "
   require("ue").setup()
+  require("utils.log").install_commands()
   pcall(dofile, cfg .. "/lua/config/keymaps.lua")
-  for _, c in ipairs({ "Restart", "RestartDetect", "UEDefStatus" }) do
+  for _, c in ipairs({ "Restart", "RestartDetect", "UEDefStatus", "NotificationHistory", "NotificationHistoryClear" }) do
     t.it(":" .. c .. " 已注册", function()
       t.assert_eq(vim.fn.exists(":" .. c), 2, c .. " 未注册")
     end)

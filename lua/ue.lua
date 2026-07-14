@@ -1113,28 +1113,6 @@ local function resolve_project_input(path, engine_root)
     " <relative/path/to.uproject> once so the workspace root works in future."
 end
 
-local function detect_project_root_from_path(path)
-  path = norm(path)
-  if path == "" then
-    return nil, nil
-  end
-
-  local dir = _ufs.is_file(path) and _ufs.dirname(path) or path
-  while dir ~= "" do
-    local uproject = find_uproject_in_dir(dir)
-    if uproject then
-      return dir, uproject
-    end
-    local parent = _ufs.dirname(dir)
-    if parent == dir then
-      break
-    end
-    dir = parent
-  end
-
-  return nil, nil
-end
-
 local function is_engine_root(dir)
   dir = norm(dir)
   if dir == "" then
@@ -1500,63 +1478,20 @@ local function resolve_context(opts)
 
   local state = read_state(engine_root)
   local project_root, uproject
-  local state_project_root, state_uproject
-  local candidates = { cur_cwd }
 
-  if cur_buf ~= "" and cur_buf ~= candidates[1] then
-    table.insert(candidates, cur_buf)
-  end
-
+  -- Project selection is manual-only. Current cwd/buffers may belong to a
+  -- different checkout and must never override :UESetProject state.
   if state.project_root then
-    state_project_root, state_uproject = resolve_project_input(state.project_root, engine_root)
-  end
-
-  if opts.detect_project ~= false then
-    for _, candidate in ipairs(candidates) do
-      project_root, uproject = detect_project_root_from_path(candidate)
-      if project_root then
-        break
-      end
-    end
-  end
-
-  if not project_root and state_project_root then
-    for _, candidate in ipairs(candidates) do
-      if candidate ~= "" and _ufs.path_has_prefix(candidate, state_project_root) then
-        project_root = state_project_root
-        uproject = state_uproject
-        break
-      end
-    end
-  end
-
-  -- Fallback: when no buffer is open (dashboard / fresh nvim) and cwd is
-  -- the engine root itself, the prefix check above can't possibly match
-  -- (engine_root path will never be inside project_root, and the empty
-  -- buffer name fails the `candidate ~= ""` guard). In this case the
-  -- user has already explicitly run :UESetProject earlier — trust it.
-  -- Without this, :UEBuild / :UEStatus etc all error with "No project
-  -- configured" right after `z unrealen` until the user opens a project
-  -- source file, which is surprising UX.
-  --
-  -- Extended fallback: when the user is browsing engine source (cwd or
-  -- buffer is inside engine_root) and didn't auto-detect a project from
-  -- the buffer path either, also trust state.project_root. Typical case:
-  -- `z unrealen` (UnrealEngine bare engine repo, no .uproject anywhere
-  -- nearby) + browsing Renderer/Engine sources to build a game project
-  -- pinned earlier via :UESetProject pointing to a different drive.
-  if not project_root and state_project_root then
-    local has_real_buffer = cur_buf ~= "" and cur_buf ~= cur_cwd
-    if not has_real_buffer then
-      project_root = state_project_root
-      uproject = state_uproject
+    local persisted_root = norm(state.project_root)
+    local persisted_uproject = norm(state.uproject or "")
+    if _ufs.is_dir(persisted_root)
+      and persisted_uproject ~= ""
+      and _ufs.is_file(persisted_uproject)
+    then
+      project_root = persisted_root
+      uproject = persisted_uproject
     else
-      local cwd_in_engine = cur_cwd ~= "" and _ufs.path_has_prefix(cur_cwd, engine_root)
-      local buf_in_engine = cur_buf ~= "" and _ufs.path_has_prefix(cur_buf, engine_root)
-      if cwd_in_engine or buf_in_engine then
-        project_root = state_project_root
-        uproject = state_uproject
-      end
+      project_root, uproject = resolve_project_input(persisted_root, engine_root)
     end
   end
 
@@ -7829,13 +7764,139 @@ local function find_apk(ctx)
   for _, pattern in ipairs(patterns) do
     for _, path in ipairs(glob_paths(pattern)) do
       local mtime = vim.fn.getftime(path)
-      if mtime > best_mtime then
+      if not best or mtime > best_mtime then
         best = path
         best_mtime = mtime
       end
     end
   end
   return best
+end
+
+function M.ai_context(engine_root)
+  engine_root = norm(trim(engine_root or ""))
+  if engine_root == "" then
+    return nil, "Engine root not provided"
+  end
+  if not is_engine_root(engine_root) then
+    return nil, "Not an Unreal Engine root: " .. engine_root
+  end
+
+  local state = read_state(engine_root)
+  if not state.project_root or state.project_root == "" then
+    return nil, "No project_root in " .. cache_paths(engine_root).state
+  end
+
+  local project_root = norm(state.project_root)
+  local uproject = norm(state.uproject or "")
+  if uproject == "" or not _ufs.is_file(uproject) then
+    local resolved_root, resolved_uproject, project_err = resolve_project_input(project_root, engine_root)
+    if not resolved_root then
+      return nil, project_err
+    end
+    project_root = resolved_root
+    uproject = resolved_uproject
+  end
+
+  local platform_key = CORE_RT.platform_key_from_state(state)
+  local ctx = {
+    engine_root = engine_root,
+    project_root = project_root,
+    uproject = uproject,
+    state = state,
+    paths = cache_paths(engine_root, platform_key),
+  }
+  local platform = target_platform(engine_root, nil)
+  local selected_configuration = selected_target_configuration(engine_root, project_root, uproject, platform)
+  local ubt_configuration = target_configuration(engine_root, project_root, uproject, platform)
+  local kind = target_kind(engine_root, project_root, uproject, platform)
+  local target_name = build_target_name(project_root, uproject, kind)
+  local build_command, build_error = android_build_command(ctx)
+  local apk = find_apk(ctx)
+  local install_command = apk and { "adb", "install", "-r", to_windows_path(apk) or apk } or nil
+  local install_native_action
+  if not apk then
+    install_native_action = "No APK found under the active uproject build outputs."
+  end
+
+  return {
+    schema_version = 1,
+    generated_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    engine_root = engine_root,
+    project_root = project_root,
+    uproject = uproject,
+    state_path = ctx.paths.state,
+    state = {
+      target_platform = state.target_platform,
+      target_configuration = state.target_configuration,
+      android_package = state.android_package,
+      updated_at = state.updated_at,
+    },
+    target = {
+      platform = platform,
+      selected_configuration = selected_configuration,
+      ubt_configuration = ubt_configuration,
+      kind = kind,
+      name = target_name,
+      platform_source = trim(vim.env.UE_TARGET_PLATFORM) ~= "" and "environment" or "state/default",
+      configuration_source = trim(vim.env.UE_TARGET_CONFIGURATION) ~= "" and "environment" or "state/default",
+      target_source = trim(vim.env.UE_BUILD_TARGET) ~= "" and "environment" or "Target.cs/uproject",
+    },
+    artifacts = {
+      build_command = build_command,
+      build_error = build_error,
+      latest_apk = apk,
+      install_command = install_command,
+      compile_commands = join(engine_root, "compile_commands.json"),
+      clangd_index = ctx.paths.active_index,
+    },
+    commands = {
+      {
+        key = "<Space>ub",
+        nvim_command = ":UEBuild",
+        purpose = "Build the active UE target using the persisted platform and configuration.",
+        native_command = build_command,
+        native_action = build_error,
+      },
+      {
+        key = "<Space>ui",
+        nvim_command = ":UEInstallAndroid",
+        purpose = "Install the newest APK from the active project with replacement enabled.",
+        native_command = install_command,
+        native_action = install_native_action,
+      },
+      {
+        key = "<Space>ul",
+        nvim_command = ":UELaunch",
+        purpose = "Launch the active project on the selected platform without attaching a debugger.",
+        native_action = "Platform-specific launch assembled by lua/utils/ue_launch.lua.",
+      },
+      {
+        key = "<Space>ug",
+        nvim_command = ":UELogToggle",
+        purpose = "Toggle the active application's runtime log view.",
+        native_action = "Platform-specific log command assembled by lua/utils/ue_logs.lua.",
+      },
+      {
+        key = "<Space>up",
+        nvim_command = ":UEPaths",
+        purpose = "Show resolved engine, project, platform, configuration, state, CDB, and index paths.",
+        native_action = "Reads the resolved context; no external command.",
+      },
+      {
+        key = "<Space>uB",
+        nvim_command = ":UEPrepare",
+        purpose = "Refresh file lists, compile_commands, GTAGS, csearch, and clangd index inputs.",
+        native_action = "Asynchronous multi-stage pipeline; see lua/ue.lua prepare_async().",
+      },
+      {
+        key = "<Space>uP",
+        nvim_command = ":UESetProject",
+        purpose = "Select and persist the project associated with this engine root.",
+        native_action = "Writes project_root and uproject to the engine state.json.",
+      },
+    },
+  }
 end
 
 local function ue_runtime_env()
@@ -8067,10 +8128,6 @@ local function prepare()
   if not ctx then
     vim.notify(err, vim.log.levels.WARN)
     return
-  end
-
-  if ctx.state.project_root ~= ctx.project_root then
-    persist_project(ctx.engine_root, ctx.project_root, ctx.uproject)
   end
 
   _ufs.ensure_dir(ctx.paths.cache)
@@ -8319,10 +8376,6 @@ local function prepare_async(opts)
   -- can honor :UEPrepareReindex (force a csearch rebuild even when the
   -- regular UEPrepare cache is fresh).
   ctx._force_csearch = opts.force_csearch and true or false
-
-  if ctx.state.project_root ~= ctx.project_root then
-    persist_project(ctx.engine_root, ctx.project_root, ctx.uproject)
-  end
 
   _ufs.ensure_dir(ctx.paths.cache)
 

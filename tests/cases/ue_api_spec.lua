@@ -17,7 +17,7 @@ local PUBLIC_FUNCTIONS = {
   "cached_files", "cached_grep", "statusline_status", "index_status", "index_now",
   "index_hot", "index_full", "ue_roots", "gtags_rebuild_shaders",
   "gtags_references", "gtags_definition", "launch_app", "toggle_log",
-  "toggle_debug_log", "prepare_headless",
+  "toggle_debug_log", "prepare_headless", "ai_context",
 }
 
 t.describe("ue: 公共表冻结", function()

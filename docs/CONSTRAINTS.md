@@ -222,11 +222,63 @@
   resolved+命中）未满足。`UE_DAP_NO_SLIDE` 环境开关保留供后续在其他设备/版本复验。
   证据 `tools/evidence/android-f9/noslide-preseed.result.json`(timeout) vs
   `slide-recheck.result.json`(ok)。
+  **wait-for-debugger launch 例外语义（2026-07-24）**: wait 模式下 attach 时 libUE4.so 尚未
+  加载，attach-time slide 拿不到属**预期而非失败**；late-rebase poller 在模块出现后经
+  evaluate 通道补发同一条 slide（「晚到」而非「缺席」，K37 仍成立）。
   → change `android-dap-live-breakpoints` design D5/OQ#3; `lua/ue/dap/android.lua`;
     行为测 `tests/cases/dap_spec.lua`「attach_commands」（默认含显式 slide；
     `UE_DAP_NO_SLIDE=1` 时跳过——锁住开关语义与 plumbing 存在）
 
+- **K38 — `/data/local/tmp/lldb-server` root-owned 残留 → shell 用户 chmod EPERM**
+  症状: `lldb-server bootstrap failed: chmod ... to 0755: Operation not permitted`
+  （2026-07-24 真机 a3ad86f3 日志）。旧 `adb root` 会话推的文件 owner 是 root:root，
+  非 root adb 的 shell 用户 chmod 必 EPERM。
+  解决: unlink 看**父目录**权限（/data/local/tmp 为 shell-owned）——尺寸不符先 `rm -f` 再
+  push；同尺寸且 `test -x` 通过直接 reuse（chmod 都不需要）；chmod EPERM 但已可执行 →
+  WARN 继续，不中止 bootstrap。纯决策函数 `lldb_server_stage_plan`（reuse/chmod/repush）。
+  → `lua/ue/dap/android.lua` `ensure_lldb_server_pushed`;
+    行为测 `tests/cases/dap_spec.lua`「lldb_server_stage_plan」
+
+- **K39 — 「启动完再 attach」永远抓不到最早期 crash → wait-for-debugger launch**
+  症状: JNI_OnLoad / 模块静态 init / 引擎 PreInit 阶段的 crash，旧 launch（monkey 启完、
+  pidof 轮询到再 attach）必然错过——attach 前进程已跑过出事点。
+  解决: `:UEDAPLaunch android` 改为 Android Studio debug 按钮语义：`am set-debug-app -w`
+  冻结在 JDWP "Waiting for debugger" 闸门（Application.onCreate 之前、libUE4.so 加载之前）→
+  K30 platform attach → 布断点 → 用户首次 F5 时 jdb（`adb forward tcp:N jdwp:PID` +
+  `SocketAttach`）释放闸门 + late-rebase poller 补发 slide（见 K37 例外语义）。
+  粘性警告: `am set-debug-app -w` 是设备全局标志，**所有退出路径必须 `am clear-debug-app`**，
+  否则后续手动启动该 app 永远冻在等调试器。
+  → `lua/ue/dap/android.lua` `M.launch` / `arm_wait_mode_followup` / `_start_late_rebase_poller`;
+    `docs/changelog.md` 2026-07-24; 行为测 `tests/cases/dap_spec.lua`「wait-for-debugger launch 命令形状」
+
+- **K40 — uv timer 回调里同步 `vim.fn.system(adb …)` → 全天 stall train（违反 P6 的典型形态）**
+  症状: stall_probe 记录 ~50 stalls/min、p50≈410ms/p90≈1s，从 attach 起持续整个调试日
+  （2026-07-24 10:47–16:49 共 1.9 万条），与当前 buffer/按键无关。
+  根因: Android liveness poller 每 1.5s 在 `vim.schedule_wrap` 内同步 `pidof()`
+  （`vim.fn.system` → adb USB 往返 200–1000ms，调试会话期间 adb 被 lldb-dap 占用更慢），
+  每次轮询都阻塞主循环；adapter 异常死亡而 session 未清时 poller 永不停。
+  解决约束: **周期性探测一律 `vim.system`(async callback) / jobstart，禁止在 timer 回调里
+  `vim.fn.system`**；timer fast-event 上下文只 spawn，状态处理 `vim.schedule` 回主循环；
+  加 `in_flight` 防探测堆积；回调先复核 timer/session 仍有效（探测在飞期间可能已 stop）。
+  诊断入口: `:StallReport` / log scope `[stall]`——按分钟聚类 + 看 buffer 无关性即可判定
+  「后台定时器阻塞」而非「按键动作阻塞」。
+  → `lua/ue/dap/android.lua` `_start_liveness_poller`; `lua/utils/stall_probe.lua`;
+    `docs/changelog.md` 2026-07-24（卡顿修复条目）
+
 ### 工具链 / LLVM
+
+- **K41 — 跨盘 project root 缺 `.clangd` → UEPrepare 后 clangd background-index 吃满 CPU/内存**
+  症状: UEPrepare 重生成 CDB 后 clangd `-j=24` 高 CPU/内存常驻（历史同类症状 17GB/32min）；
+  `%LocalAppData%/clangd/index` 万级 shard 持续增长。
+  根因: `.clangd` 按源文件路径**向上查找**。engine root（D:）的 `.clangd` 覆盖不到
+  project（E:）侧 TU（本例 54% 的 CDB）——那半边没有 `Background: Skip`，每次 CDB 变
+  即全量后台索引。诊断要点: shard 回落目录位置——TU 在 compile-commands 目录内 →
+  `<root>/.cache/clangd/index`；外 → `%LocalAppData%/clangd/index`；后者暴涨 = 有一片
+  TU 未被任何 `.clangd` 覆盖。
+  解决: `sync_dot_clangd` 双写——engine root + 引擎树外的 project root 各一份 `.clangd`
+  （同一 active idx、mount 各自根、`Background: Skip`）；树内 project 跳过。
+  → `lua/ue.lua` `sync_one_dot_clangd` / `sync_dot_clangd`; `docs/changelog.md` 2026-07-24;
+    行为测 `tests/cases/ue_api_spec.lua`「sync_dot_clangd（跨盘 project root 双写）」
 
 - **K14 — LLVM 22.0–22.1.5 的 `lldb-dap.exe` 在 Windows 启动崩溃**
   症状: DAP client 一发 `initialize` 就 `STATUS_STACK_BUFFER_OVERRUN`(`0xC0000409`)。

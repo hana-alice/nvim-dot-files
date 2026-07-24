@@ -156,3 +156,189 @@ end)
 -- D-3b 是 helper（CORE_RT.clear_persistent_dirty_safe）经 M.clear_persistent_dirty_safe
 -- 暴露给测试；运行时由三条全量成功回调调用（sync / fast-path / cold-full）。
 
+-- ── D11：智能增量构建决策 + smart_build 端到端（mock build_index）──────────
+t.describe("csearch 智能增量决策（D11 csearch_build_mode）", function()
+  local function mode(stats) return (ue._csearch_build_mode_for_test(stats)) end
+
+  t.it("forced → reset", function()
+    t.assert_eq(mode({ forced = true, has_snapshot = true, added_n = 1, total_n = 100 }), "reset")
+  end)
+
+  t.it("无快照 → reset（没有 diff 基准）", function()
+    t.assert_eq(mode({ has_snapshot = false, added_n = 0, total_n = 100 }), "reset")
+  end)
+
+  t.it("有删除 → reset（cindex 不能删；ghost 命中是正确性问题）", function()
+    t.assert_eq(mode({ has_snapshot = true, added_n = 1, removed_n = 1, total_n = 1000 }),
+      "reset")
+  end)
+
+  t.it("零变化 → skip", function()
+    t.assert_eq(mode({ has_snapshot = true, added_n = 0, removed_n = 0, dirty_n = 0, total_n = 1000 }),
+      "skip")
+  end)
+
+  t.it("小增量 → add", function()
+    t.assert_eq(mode({ has_snapshot = true, added_n = 5, removed_n = 0, dirty_n = 3, total_n = 10000 }),
+      "add")
+  end)
+
+  t.it("超过 30% 阈值 → reset（切分支场景）", function()
+    t.assert_eq(mode({ has_snapshot = true, added_n = 4000, removed_n = 0, dirty_n = 0, total_n = 10000 }),
+      "reset")
+  end)
+end)
+
+t.describe("csearch smart_build 端到端（D11，mock build_index）", function()
+  local function setup_dir()
+    local dir = vim.fn.tempname():gsub("\\", "/")
+    vim.fn.mkdir(dir, "p")
+    return dir
+  end
+  local function write_lines(path, lines)
+    local f = assert(io.open(path, "w"))
+    for _, l in ipairs(lines) do f:write(l, "\n") end
+    f:close()
+  end
+  local function read_lines(path)
+    local out = {}
+    for l in io.lines(path) do out[#out + 1] = l end
+    return out
+  end
+
+  -- mock code_search.build_index：记录调用（mode + 喂入清单），立即成功。
+  local calls
+  local orig_build
+  local function install_mock()
+    calls = {}
+    orig_build = cs.build_index
+    cs.build_index = function(_ctx, list_path, cb, opts)
+      calls[#calls + 1] = {
+        mode = (opts and opts.mode) or "reset",
+        lines = read_lines(list_path),
+      }
+      vim.schedule(function() cb(true, nil, { ms = 1, index_size = 4096 }) end)
+    end
+  end
+  local function restore_mock() cs.build_index = orig_build end
+
+  local function run_smart(ctx, abs_list)
+    local done, res = false, nil
+    ue._csearch_smart_build_for_test(ctx, { csearch_idx = ctx.paths.csearch_idx }, abs_list,
+      function(ok, err, stats) res = { ok = ok, err = err, stats = stats }; done = true end)
+    vim.wait(2000, function() return done end, 20)
+    t.assert_true(done, "smart_build 回调应被调用")
+    return res
+  end
+
+  t.it("首次（无快照）→ reset 全量 + 落快照", function()
+    install_mock()
+    local dir = setup_dir()
+    local ctx = { paths = { csearch_idx = dir .. "/csearch.idx" } }
+    local abs_list = dir .. "/list.txt"
+    write_lines(abs_list, { "D:/w/A.cpp", "D:/w/B.cpp" })
+
+    local res = run_smart(ctx, abs_list)
+    t.assert_true(res.ok)
+    t.assert_eq(res.stats.mode, "reset")
+    t.assert_eq(#calls, 1)
+    t.assert_eq(calls[1].mode, "reset")
+    local snap = ue._csearch_snapshot_path_for_test(ctx)
+    t.assert_true(vim.loop.fs_stat(snap) ~= nil, "成功后应写快照 <idx>.files")
+
+    pcall(vim.fn.delete, dir, "rf")
+    restore_mock()
+  end)
+
+  t.it("集合不变 → skip（不调 build_index）", function()
+    install_mock()
+    local dir = setup_dir()
+    local ctx = { paths = { csearch_idx = dir .. "/csearch.idx" } }
+    local abs_list = dir .. "/list.txt"
+    write_lines(abs_list, { "D:/w/A.cpp", "D:/w/B.cpp" })
+    write_lines(ue._csearch_snapshot_path_for_test(ctx), { "D:/w/A.cpp", "D:/w/B.cpp" })
+
+    local res = run_smart(ctx, abs_list)
+    t.assert_true(res.ok)
+    t.assert_eq(res.stats.mode, "skip")
+    t.assert_eq(#calls, 0, "skip 不应触发任何 cindex 调用")
+
+    pcall(vim.fn.delete, dir, "rf")
+    restore_mock()
+  end)
+
+  t.it("少量新增 → add 且只喂 delta", function()
+    install_mock()
+    local dir = setup_dir()
+    local ctx = { paths = { csearch_idx = dir .. "/csearch.idx" } }
+    local abs_list = dir .. "/list.txt"
+    -- 快照 = 10 个旧文件；新清单 = 旧 10 + 新 2
+    local old = {}
+    for i = 1, 10 do old[i] = ("D:/w/f%02d.cpp"):format(i) end
+    write_lines(ue._csearch_snapshot_path_for_test(ctx), old)
+    local new_list = vim.list_extend(vim.list_extend({}, old), { "D:/w/new1.cpp", "D:/w/new2.cpp" })
+    write_lines(abs_list, new_list)
+
+    local res = run_smart(ctx, abs_list)
+    t.assert_true(res.ok)
+    t.assert_eq(res.stats.mode, "add")
+    t.assert_eq(#calls, 1)
+    t.assert_eq(calls[1].mode, "add")
+    t.assert_eq(#calls[1].lines, 2, "add 只喂 2 个新增文件，不重喂全量")
+    -- 快照应更新为新清单（含新增）
+    local snap_lines = read_lines(ue._csearch_snapshot_path_for_test(ctx))
+    t.assert_eq(#snap_lines, 12, "快照应与新清单同步")
+
+    pcall(vim.fn.delete, dir, "rf")
+    restore_mock()
+  end)
+
+  t.it("有删除 → reset（不留 ghost）", function()
+    install_mock()
+    local dir = setup_dir()
+    local ctx = { paths = { csearch_idx = dir .. "/csearch.idx" } }
+    local abs_list = dir .. "/list.txt"
+    write_lines(ue._csearch_snapshot_path_for_test(ctx), { "D:/w/A.cpp", "D:/w/B.cpp", "D:/w/C.cpp" })
+    write_lines(abs_list, { "D:/w/A.cpp", "D:/w/B.cpp" })  -- C 被删
+
+    local res = run_smart(ctx, abs_list)
+    t.assert_true(res.ok)
+    t.assert_eq(res.stats.mode, "reset", "有删除必须全量（cindex 无删除能力）")
+    t.assert_eq(calls[1].mode, "reset")
+
+    pcall(vim.fn.delete, dir, "rf")
+    restore_mock()
+  end)
+
+  t.it("add 失败 → 自动回退 reset（一次，成功收尾）", function()
+    calls = {}
+    orig_build = cs.build_index
+    cs.build_index = function(_ctx, list_path, cb, opts)
+      local m = (opts and opts.mode) or "reset"
+      calls[#calls + 1] = { mode = m, lines = read_lines(list_path) }
+      vim.schedule(function()
+        if m == "add" then cb(false, "csearch index unusable", {})
+        else cb(true, nil, { ms = 1, index_size = 4096 }) end
+      end)
+    end
+    local dir = setup_dir()
+    local ctx = { paths = { csearch_idx = dir .. "/csearch.idx" } }
+    local abs_list = dir .. "/list.txt"
+    -- 基数要够大：delta 必须 < 30% 阈值才会走 add 路径（1/11 ≈ 9%）。
+    local old = {}
+    for i = 1, 10 do old[i] = ("D:/w/g%02d.cpp"):format(i) end
+    write_lines(ue._csearch_snapshot_path_for_test(ctx), old)
+    write_lines(abs_list, vim.list_extend(vim.list_extend({}, old), { "D:/w/B.cpp" }))
+
+    local res = run_smart(ctx, abs_list)
+    t.assert_true(res.ok, "回退 reset 成功后整体应报成功")
+    t.assert_eq(res.stats.mode, "reset")
+    t.assert_eq(#calls, 2, "应先试 add 再回退 reset")
+    t.assert_eq(calls[1].mode, "add")
+    t.assert_eq(calls[2].mode, "reset")
+
+    pcall(vim.fn.delete, dir, "rf")
+    restore_mock()
+  end)
+end)
+

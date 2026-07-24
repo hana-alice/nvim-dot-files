@@ -580,6 +580,87 @@ t.describe("ue.dap.android: attach_commands（K30/K34/K37 顺序与 slide 开关
 end)
 
 -- ════════════════════════════════════════════════════════════════════════
+-- lldb-server 推送与 chmod EPERM 残留（2026-07-24 真机日志：root-owned
+-- /data/local/tmp/lldb-server 让 shell 用户 chmod EPERM，但文件已 0755 可复用；
+-- 尺寸不匹配时必须先 rm -f 再 push）。纯决策函数，不碰设备。
+-- ════════════════════════════════════════════════════════════════════════
+t.describe("ue.dap.android: lldb_server_stage_plan（chmod EPERM 残留）", function()
+  local android = require("ue.dap.android")
+
+  t.it("同尺寸 + 已可执行 → reuse（root-owned 残留直接复用，不再 chmod）", function()
+    t.assert_eq(android._lldb_server_stage_plan_for_test(true, true), "reuse")
+  end)
+
+  t.it("同尺寸 + 不可执行 → chmod（只补权限，不重推）", function()
+    t.assert_eq(android._lldb_server_stage_plan_for_test(true, false), "chmod")
+  end)
+
+  t.it("尺寸不匹配 → repush（rm -f 残留后 push + chmod）", function()
+    t.assert_eq(android._lldb_server_stage_plan_for_test(false, false), "repush")
+    t.assert_eq(android._lldb_server_stage_plan_for_test(false, true), "repush")
+  end)
+end)
+
+-- ════════════════════════════════════════════════════════════════════════
+-- /proc/<pid>/maps 解析（K2/K11/K4：首个映射段 start 地址，纯字符串抽取，
+-- 严禁 string.format("%x") — LuaJIT 截 32 位）。
+-- ════════════════════════════════════════════════════════════════════════
+t.describe("ue.dap.android: parse_maps_base_hex（K2/K11/K4）", function()
+  local android = require("ue.dap.android")
+  local maps = table.concat({
+    "70b4c2a000-70b4c2b000 r--p 00000000 fe:00 123 /system/lib64/libc.so",
+    "6c9fe21000-6ca1e21000 r--p 00000000 fe:21 456 /data/app/x/lib/arm64/libUE4.so",
+    "6ca1e21000-6ce1e21000 r-xp 02000000 fe:21 456 /data/app/x/lib/arm64/libUE4.so",
+  }, "\n")
+
+  t.it("取第一段映射的 start（64 位 hex 字符串原样保留）", function()
+    t.assert_eq(android._parse_maps_base_hex_for_test(maps, "libUE4.so"), "6c9fe21000")
+  end)
+
+  t.it("找不到目标 so → nil；空输入 → nil", function()
+    t.assert_nil(android._parse_maps_base_hex_for_test(maps, "libFoo.so"))
+    t.assert_nil(android._parse_maps_base_hex_for_test("", "libUE4.so"))
+    t.assert_nil(android._parse_maps_base_hex_for_test(nil, "libUE4.so"))
+  end)
+
+  t.it("basename 里的 '.' 不当作通配符（libUE4Xso 不得匹配）", function()
+    local trap = "6c9fe21000-6ca1e21000 r--p 00000000 fe:21 456 /data/app/x/libUE4Xso"
+    t.assert_nil(android._parse_maps_base_hex_for_test(trap, "libUE4.so"))
+  end)
+end)
+
+-- ════════════════════════════════════════════════════════════════════════
+-- wait-for-debugger launch（Android Studio debug 按钮语义）：
+-- set-debug-app -w → start → clear-debug-app 的命令形状 + jdb 释放 JDWP 闸门。
+-- 纯命令构造，不碰设备。
+-- ════════════════════════════════════════════════════════════════════════
+t.describe("ue.dap.android: wait-for-debugger launch 命令形状", function()
+  local android = require("ue.dap.android")
+
+  t.it("set-debug-app 必须带 -w（不带 -w 不会等待调试器）", function()
+    local steps = android._wait_launch_device_steps_for_test("com.example.game")
+    t.assert_eq(table.concat(steps.set_wait, " "),
+      "shell am set-debug-app -w com.example.game")
+  end)
+
+  t.it("包含 force-stop / start / clear-debug-app 全部步骤", function()
+    local steps = android._wait_launch_device_steps_for_test("com.x")
+    t.assert_eq(table.concat(steps.force_stop, " "), "shell am force-stop com.x")
+    t.assert_true(table.concat(steps.start, " "):find("monkey %-p com%.x") ~= nil,
+      "start 应经 monkey LAUNCHER intent")
+    t.assert_eq(table.concat(steps.clear_wait, " "), "shell am clear-debug-app",
+      "必须有 clear-debug-app，否则 debug-app 闸门粘住后续手动启动")
+  end)
+
+  t.it("jdb 连接串是 SocketAttach localhost:<port>", function()
+    local argv = android._jdb_connect_argv_for_test("C:/jdk/bin/jdb.exe", 8712)
+    t.assert_eq(argv[1], "C:/jdk/bin/jdb.exe")
+    t.assert_eq(argv[2], "-connect")
+    t.assert_eq(argv[3], "com.sun.jdi.SocketAttach:hostname=localhost,port=8712")
+  end)
+end)
+
+-- ════════════════════════════════════════════════════════════════════════
 -- F9 断点持久化往返（K10）。mock dap.breakpoints，纯 JSON + 路径归一化逻辑，
 -- 不需要真实调试会话。
 -- ════════════════════════════════════════════════════════════════════════

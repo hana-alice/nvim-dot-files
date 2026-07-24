@@ -64,6 +64,8 @@ M._session = {
   symbol_lib        = nil,  -- host path to libUE4.so (with DWARF)
   source_map        = nil,  -- list of { from, to } pairs
   engine_root       = nil,  -- host engine root, used to wire LLDB UE data formatters
+  wait_mode         = nil,  -- true when launched via wait-for-debugger (set-debug-app -w)
+  jdwp_port         = nil,  -- host forward port used by the jdb gate-release
 }
 
 local function reset_session()
@@ -356,9 +358,7 @@ local function pick_symbol_lib(ctx)
   return typed
 end
 
-local function pick_port()
-  local cfg_port = ue_cfg_get("dap.android_port")
-  if type(cfg_port) == "number" and cfg_port > 0 then return cfg_port end
+local function alloc_free_port()
   -- Allocate a free TCP port on the host. We can't reserve it (lldb-server
   -- on the device binds the same number after `adb forward`), but the
   -- host-side `adb forward tcp:N tcp:N` will still claim it cleanly so
@@ -375,7 +375,13 @@ local function pick_port()
       pcall(server.close, server)
     end
   end
-  return 5045
+  return nil
+end
+
+local function pick_port()
+  local cfg_port = ue_cfg_get("dap.android_port")
+  if type(cfg_port) == "number" and cfg_port > 0 then return cfg_port end
+  return alloc_free_port() or 5045
 end
 
 local function pick_source_map(ctx)
@@ -562,12 +568,13 @@ end
 -- CRITICAL: the returned value is a STRING built by text extraction, never via
 -- string.format("%x", n) — LuaJIT truncates %x to 32 bits and a UE .so base
 -- like 0x6c9fe21000 would be mangled (docs/CONSTRAINTS.md K4/P7).
-local function read_so_base_hex(adb, serial, pkg, pid, so_basename)
-  if not (adb and serial and pkg and pid and so_basename) then return nil end
-  local maps = adb_run(adb, {
-    "-s", serial, "shell", "run-as", pkg, "cat", "/proc/" .. tostring(pid) .. "/maps",
-  })
-  if not maps or maps == "" then return nil end
+-- Pure parser (unit-tested): find the ASLR load base of `so_basename` in a
+-- /proc/<pid>/maps dump. Returns lowercase hex string WITHOUT "0x", or nil.
+-- CRITICAL: string extraction only — never string.format("%x", n) on 64-bit
+-- values (LuaJIT truncates to 32 bits, docs/CONSTRAINTS.md K4/P7).
+local function parse_maps_base_hex(maps, so_basename)
+  if type(maps) ~= "string" or maps == "" then return nil end
+  if type(so_basename) ~= "string" or so_basename == "" then return nil end
   -- Lua patterns have no alternation; escape the basename and scan line by line
   -- for the first mapping whose path ends with the .so name.
   local needle = so_basename:gsub("([%-%.%+%[%]%(%)%$%^%%%?%*])", "%%%1")
@@ -581,6 +588,14 @@ local function read_so_base_hex(adb, serial, pkg, pid, so_basename)
     end
   end
   return nil
+end
+
+local function read_so_base_hex(adb, serial, pkg, pid, so_basename)
+  if not (adb and serial and pkg and pid and so_basename) then return nil end
+  local maps = adb_run(adb, {
+    "-s", serial, "shell", "run-as", pkg, "cat", "/proc/" .. tostring(pid) .. "/maps",
+  })
+  return parse_maps_base_hex(maps, so_basename)
 end
 
 -- Build the LLDB command that relocates the symbol-rich host libUE4.so to the
@@ -602,6 +617,24 @@ end
 -- forks per-target gdbserver children itself; PUBLIC /data/local/tmp/ is
 -- sufficient (verified 2026-06-03, docs/CONSTRAINTS.md K30). This restores the
 -- 5/21 e51cbe6 working path. Returns (ok, remote_path_or_err).
+-- Pure decision helper (unit-tested): given whether the remote copy matches
+-- the local binary size and whether it is already executable, decide the
+-- staging action.
+--   "reuse"  — same size AND executable: nothing to do. Covers the root-owned
+--              residue case (a file pushed under an old `adb root` session is
+--              root:root; `chmod` from the shell user EPERMs, but the file is
+--              already 0755 so chmod is unnecessary — see nvim-debug.log
+--              `chmod ... Operation not permitted` 2026-07-24).
+--   "chmod"  — same size but not executable: chmod only (no re-push).
+--   "repush" — size differs: rm -f the residue first (the /data/local/tmp
+--              DIRECTORY is shell-owned, so the shell user can unlink even a
+--              root-owned file), then push + chmod.
+local function lldb_server_stage_plan(size_matches, is_executable)
+  if size_matches and is_executable then return "reuse" end
+  if size_matches then return "chmod" end
+  return "repush"
+end
+
 local function ensure_lldb_server_pushed(adb, serial, pkg, src)
   local local_size = vim.fn.getfsize(src)
   if local_size <= 0 then
@@ -610,18 +643,42 @@ local function ensure_lldb_server_pushed(adb, serial, pkg, src)
 
   local remote = "/data/local/tmp/lldb-server"
   local remote_size = adb_run(adb, { "-s", serial, "shell", "stat", "-c", "%s", remote })
-  if tostring(remote_size):match("(%d+)%s*$") ~= tostring(local_size) then
+  local size_matches = tostring(remote_size):match("(%d+)%s*$") == tostring(local_size)
+  local function remote_is_executable()
+    local _, code = adb_run_raw(adb, { "-s", serial, "shell", "test", "-x", remote })
+    return code == 0
+  end
+
+  local plan = lldb_server_stage_plan(size_matches, size_matches and remote_is_executable())
+  if plan == "reuse" then
+    return true, remote
+  end
+
+  if plan == "repush" then
     pcall(adb_run, adb, { "-s", serial, "shell", "killall lldb-server 2>/dev/null; true" })
+    -- Remove any residue first: `adb push` onto an existing root-owned file
+    -- fails with EACCES, but unlinking works because the parent directory is
+    -- shell-owned. Harmless when the file does not exist.
+    pcall(adb_run_raw, adb, { "-s", serial, "shell", "rm", "-f", remote })
     local push_out, push_code = adb_run_raw(adb, { "-s", serial, "push", src, remote })
     if push_code ~= 0 then
       return false, ("adb push failed on %s (exit %s): %s")
         :format(tostring(serial), tostring(push_code), tostring(push_out))
     end
   end
+
   local chmod_out, chmod_code = adb_run_raw(adb, { "-s", serial, "shell", "chmod", "755", remote })
   if chmod_code ~= 0 then
-    return false, ("chmod lldb-server failed on %s (exit %s): %s")
-      :format(tostring(serial), tostring(chmod_code), tostring(chmod_out))
+    -- chmod can EPERM on files we do not own. That is only fatal when the
+    -- binary is genuinely not executable; otherwise log once and proceed.
+    if remote_is_executable() then
+      log.warn("dap.android",
+        "chmod lldb-server EPERM (not owner) but binary already executable — proceeding: "
+        .. tostring(chmod_out))
+    else
+      return false, ("chmod lldb-server failed on %s (exit %s): %s")
+        :format(tostring(serial), tostring(chmod_code), tostring(chmod_out))
+    end
   end
   local check = adb_run(adb, { "-s", serial, "shell", "ls", remote })
   if not check:match("lldb%-server") then
@@ -664,6 +721,235 @@ local function start_lldb_server_platform(adb, serial, port)
   M._lldb_server_jobid = jobid
   vim.wait(800)
   return true, nil
+end
+
+-- ── wait-for-debugger launch (Android Studio debug-button semantics) ──────
+--
+-- Goal: catch crashes in the EARLIEST app init (JNI_OnLoad, module static
+-- init, engine PreInit) that a plain "monkey start → attach when pid shows
+-- up" launch always misses. The Android Studio debug button does:
+--   am set-debug-app -w <pkg>  → next launch of <pkg> blocks in a JDWP
+--                                "Waiting for debugger" gate BEFORE
+--                                Application.onCreate — before libUE4.so
+--                                is even loaded.
+--   start activity             → process spawns, waits at the gate.
+--   attach native debugger     → lldb attaches while nothing of the app has
+--                                run yet; file:line breakpoints are planted
+--                                as pending against the symbol-rich target.
+--   release the JDWP gate      → jdb attach over `adb forward tcp:N jdwp:PID`
+--                                satisfies the gate; app proceeds through
+--                                init and hits the earliest breakpoints.
+--
+-- K37 nuance: at attach time libUE4.so is NOT mapped, so the explicit ASLR
+-- `target modules load --slide` cannot be computed (read_so_base_hex finds
+-- nothing). That is EXPECTED here, not a failure: pending breakpoints
+-- re-resolve when the dynamic linker loads the module, and belt-and-braces
+-- we run a late-rebase poller that watches /proc/<pid>/maps and issues the
+-- explicit slide over the lldb-dap evaluate channel (K36-proven) as soon as
+-- the module appears. Failures are reported ONCE with full context to
+-- ue-dap-bp-diag.log + a single notify — no repeated spam (user policy).
+
+-- Pure command-shape helper (unit-tested): device-side steps of the
+-- wait-for-debugger launch, WITHOUT the adb/-s prefix.
+local function wait_launch_device_steps(pkg)
+  return {
+    force_stop = { "shell", "am", "force-stop", pkg },
+    set_wait   = { "shell", "am", "set-debug-app", "-w", pkg },
+    start      = { "shell", "monkey", "-p", pkg,
+                   "-c", "android.intent.category.LAUNCHER", "1" },
+    clear_wait = { "shell", "am", "clear-debug-app" },
+  }
+end
+
+-- Pure command-shape helper (unit-tested): the jdb invocation that releases
+-- the "Waiting for debugger" JDWP gate once the inferior's threads run.
+local function jdb_connect_argv(jdb, port)
+  return { jdb, "-connect",
+    ("com.sun.jdi.SocketAttach:hostname=localhost,port=%d"):format(port) }
+end
+
+local function find_jdb()
+  local cfg_path = ue_cfg_get("dap.jdb_path")
+  if type(cfg_path) == "string" and cfg_path ~= "" and fs.is_file(cfg_path) then
+    return cfg_path
+  end
+  local exe = vim.fn.exepath("jdb")
+  if exe ~= nil and exe ~= "" then return exe end
+  local jh = vim.env.JAVA_HOME
+  if jh and jh ~= "" then
+    for _, name in ipairs({ "jdb.exe", "jdb" }) do
+      local p = jh .. "/bin/" .. name
+      if fs.is_file(p) then return p end
+    end
+  end
+  return nil
+end
+
+-- One-shot diagnostics for the wait-launch path. Every failure is recorded
+-- exactly once per session (key-deduped) to both the rotating log and
+-- ue-dap-bp-diag.log so it can be reviewed later without popup spam.
+M._wait_notice_seen = {}
+
+local function wait_notice(key, msg, level)
+  if M._wait_notice_seen[key] then return end
+  M._wait_notice_seen[key] = true
+  append_bp_diag({ "== wait-for-debugger notice ==", "key=" .. key, msg })
+  log.notify("dap.android", msg, level or vim.log.levels.WARN)
+end
+
+-- Release the JDWP "Waiting for debugger" gate: forward a host port to the
+-- app's jdwp transport and attach jdb. The jdb handshake only completes once
+-- the inferior's threads are running (i.e. after the user's first F5), which
+-- is exactly when we want the gate to open. jdb stays attached (harmless);
+-- it is killed in _cleanup_device_side.
+local function start_jdwp_release(sess)
+  local jdb = find_jdb()
+  if not jdb then
+    wait_notice("jdb-missing",
+      "jdb not found (PATH / JAVA_HOME / ue.config.dap.jdb_path). "
+      .. "Release the waiting-gate manually:\n"
+      .. ("  adb -s %s forward tcp:8700 jdwp:%d\n"):format(sess.serial, sess.pid)
+      .. "  jdb -connect com.sun.jdi.SocketAttach:hostname=localhost,port=8700")
+    return
+  end
+  local port = alloc_free_port() or 8700
+  local fwd_out, fwd_code = adb_run_raw(sess.adb,
+    { "-s", sess.serial, "forward", "tcp:" .. port, "jdwp:" .. sess.pid })
+  if fwd_code ~= 0 then
+    wait_notice("jdwp-forward",
+      ("jdwp forward failed (exit %s): %s — waiting-gate NOT released; "
+        .. "app will stay in 'Waiting for debugger' until you attach jdb manually.")
+        :format(tostring(fwd_code), tostring(fwd_out)))
+    return
+  end
+  sess.jdwp_port = port
+  local jobid = vim.fn.jobstart(jdb_connect_argv(jdb, port), {
+    on_exit = function(_, code)
+      append_bp_diag({ ("jdb exited (code=%s)"):format(tostring(code)) })
+    end,
+  })
+  if not jobid or jobid <= 0 then
+    wait_notice("jdb-spawn",
+      "failed to spawn jdb (jobstart=" .. tostring(jobid) .. ") — release the waiting-gate manually.")
+    return
+  end
+  M._jdb_jobid = jobid
+  append_bp_diag({
+    "== jdwp release armed ==",
+    ("jdb=%s port=%d pid=%d"):format(jdb, port, sess.pid),
+  })
+end
+
+-- Late ASLR rebase poller (wait-mode only). Watches /proc/<pid>/maps
+-- asynchronously (vim.system — never blocks the UI, P6) until libUE4.so is
+-- mapped, then issues the explicit `target modules load --slide` over the
+-- lldb-dap evaluate channel (K36) and dumps `breakpoint list` to the diag
+-- log. K37 keeps the explicit slide load-bearing on this device; in wait
+-- mode it simply arrives late instead of at attach time.
+M._late_rebase_timer = nil
+
+function M._stop_late_rebase_poller()
+  if M._late_rebase_timer then
+    pcall(function() M._late_rebase_timer:stop() end)
+    pcall(function() M._late_rebase_timer:close() end)
+    M._late_rebase_timer = nil
+  end
+end
+
+function M._start_late_rebase_poller(sess)
+  M._stop_late_rebase_poller()
+  if not (sess and sess.wait_mode and sess.pid and sess.serial and sess.package_name) then return end
+  local so = sess.symbol_lib and vim.fs.basename(sess.symbol_lib) or "libUE4.so"
+  local pid, serial, pkg, adb = sess.pid, sess.serial, sess.package_name, sess.adb
+  local attempts, in_flight = 0, false
+  local max_attempts = 90 -- × 700ms ≈ 63s of app init budget
+  local timer = vim.uv.new_timer()
+  if not timer then return end
+  M._late_rebase_timer = timer
+
+  local function finish_with_base(base_hex)
+    local ok_dap, dap = pcall(require, "dap")
+    local session = ok_dap and dap and dap.session and dap.session() or nil
+    if not session then return end
+    -- Concatenation only — never string.format("%x") on 64-bit values (P7/K4).
+    local cmd = 'target modules load --file "' .. so .. '" --slide 0x' .. base_hex
+    append_bp_diag({ "== late ASLR rebase (wait-mode) ==", cmd })
+    session:request("evaluate", { expression = "`" .. cmd, context = "repl" },
+      function(err, res)
+        append_bp_diag({
+          "late rebase response:",
+          "error=" .. tostring(err and (err.message or err) or "nil"),
+          "result=" .. tostring(res and res.result or ""),
+        })
+        session:request("evaluate", { expression = "`breakpoint list", context = "repl" },
+          function(_lerr, lres)
+            append_bp_diag({ "late rebase breakpoint list:", tostring(lres and lres.result or "") })
+          end)
+        if err then
+          wait_notice("late-rebase-cmd",
+            ("late ASLR rebase command failed (%s) — breakpoints may not resolve; "
+              .. "see ue-dap-bp-diag.log."):format(tostring(err.message or err)))
+        end
+      end)
+  end
+
+  timer:start(1000, 700, vim.schedule_wrap(function()
+    if in_flight then return end
+    attempts = attempts + 1
+    if attempts > max_attempts then
+      M._stop_late_rebase_poller()
+      wait_notice("late-rebase-timeout",
+        (so .. " never appeared in /proc/%d/maps within ~60s of launch — "
+          .. "explicit ASLR slide NOT issued (K37); breakpoints may not resolve. "
+          .. "Context: serial=%s pkg=%s. See ue-dap-bp-diag.log."):format(pid, serial, pkg))
+      return
+    end
+    -- Session gone (user stopped / adapter died) → stop silently.
+    local ok_dap, dap = pcall(require, "dap")
+    if not (ok_dap and dap and dap.session and dap.session()) then
+      M._stop_late_rebase_poller()
+      return
+    end
+    in_flight = true
+    vim.system(
+      { adb, "-s", serial, "shell", "run-as", pkg, "cat", "/proc/" .. pid .. "/maps" },
+      { text = true },
+      function(res)
+        vim.schedule(function()
+          in_flight = false
+          if not M._late_rebase_timer then return end
+          local base = res and res.code == 0
+            and parse_maps_base_hex(res.stdout or "", so) or nil
+          if base then
+            M._stop_late_rebase_poller()
+            finish_with_base(base)
+          end
+        end)
+      end)
+  end))
+end
+
+-- Arm the post-attach follow-up for wait mode: on the FIRST `continued`
+-- event (the user's F5 after the entry stop), release the JDWP gate and
+-- start the late-rebase poller. One-shot; deregistered after firing and in
+-- cleanup paths.
+local WAIT_LISTENER_KEY = "ue_android_wait_followup"
+
+local function disarm_wait_mode_followup()
+  pcall(function()
+    require("dap").listeners.after.event_continued[WAIT_LISTENER_KEY] = nil
+  end)
+end
+
+local function arm_wait_mode_followup(sess)
+  local ok_dap, dap = pcall(require, "dap")
+  if not ok_dap or not dap then return end
+  dap.listeners.after.event_continued[WAIT_LISTENER_KEY] = function(session)
+    if dap.session() ~= session then return end
+    disarm_wait_mode_followup()
+    start_jdwp_release(sess)
+    M._start_late_rebase_poller(sess)
+  end
 end
 
 -- ── lldb-dap config builder ───────────────────────────────────────────────
@@ -1168,6 +1454,13 @@ end
 --- panels disappear ("the debug UI just closed by itself").
 function M._cleanup_device_side()
   local sess = M._session
+  -- Wait-mode follow-ups must die with the session.
+  if M._stop_late_rebase_poller then pcall(M._stop_late_rebase_poller) end
+  disarm_wait_mode_followup()
+  if M._jdb_jobid and M._jdb_jobid > 0 then
+    pcall(vim.fn.jobstop, M._jdb_jobid)
+    M._jdb_jobid = nil
+  end
   -- Stop the host-side `adb shell run-as ... lldb-server gdbserver` job we
   -- spawned via jobstart. Killing the adb client closes the shell, which the
   -- device propagates to lldb-server.
@@ -1176,6 +1469,15 @@ function M._cleanup_device_side()
     M._lldb_server_jobid = nil
   end
   if sess and sess.serial and sess.adb then
+    -- Safety: never leave the device with a sticky debug-app gate (a stale
+    -- `am set-debug-app -w` would freeze every future manual app launch).
+    if sess.wait_mode then
+      pcall(adb_run, sess.adb, { "-s", sess.serial, "shell", "am", "clear-debug-app" })
+    end
+    if sess.jdwp_port then
+      pcall(adb_run, sess.adb, { "-s", sess.serial, "forward",
+        "--remove", "tcp:" .. sess.jdwp_port })
+    end
     if sess.package_name then
       pcall(adb_run, sess.adb, { "-s", sess.serial, "shell",
         "run-as " .. sess.package_name .. " sh -c " .. shell_quote("killall lldb-server 2>/dev/null || true") })
@@ -1320,6 +1622,15 @@ local function _finalize_session(sess, pid, cfg_name, run_label)
       sess._module_rebase_cmd = rebase_cmd
       P.step(("module base resolved: %s @ 0x%s"):format(
         vim.fs.basename(sess.symbol_lib), base_hex))
+    elseif sess.wait_mode then
+      -- EXPECTED in wait-for-debugger launch: the app is frozen at the JDWP
+      -- gate before libUE4.so is loaded, so there is no maps entry yet. The
+      -- late-rebase poller issues the explicit slide once the module appears
+      -- (armed on first continue). Log only — no scary warning.
+      append_bp_diag({
+        "== wait-mode: ASLR base not yet available (module not loaded) ==",
+        "late-rebase poller will issue the slide after first continue.",
+      })
     else
       log.notify("dap.android",
         "ASLR base unresolved for " .. vim.fs.basename(sess.symbol_lib)
@@ -1449,6 +1760,7 @@ function M.attach(opts)
 end
 
 function M.launch(opts)
+  opts = opts or {}
   if M._attach_in_progress then
     vim.notify("[ue.dap.android] attach already in progress", vim.log.levels.WARN)
     return
@@ -1460,32 +1772,72 @@ function M.launch(opts)
     return
   end
   M._attach_in_progress = true
+  -- Fresh session → failures should be reported once again (the dedup is
+  -- per-session, not forever).
+  M._wait_notice_seen = {}
   bootstrap_session(opts, function(ok)
     if not ok then M._attach_in_progress = false; return end
     local sess = M._session
     local P = require("ue.dap._progress")
-    P.step("6/6  starting activity " .. (sess.package_name or "?") .. " …")
-    pcall(adb_run, sess.adb, {
-      "-s", sess.serial, "shell", "monkey", "-p", sess.package_name,
-      "-c", "android.intent.category.LAUNCHER", "1",
-    })
+    local pkg = sess.package_name or "?"
+    local steps = wait_launch_device_steps(sess.package_name)
 
-    P.step("waiting for process to appear …")
-    local pid
-    for _ = 1, 25 do
-      pid = pidof(sess.adb, sess.serial, sess.package_name)
-      if pid then break end
-      vim.wait(200)
-    end
-    if not pid then
-      P.error(("%s did not start within 5s"):format(sess.package_name))
+    -- Android-Studio-debug-button semantics: freeze the app at the JDWP
+    -- "Waiting for debugger" gate from the very first instruction, attach
+    -- lldb while NOTHING of the app has run, then release the gate after
+    -- the user's first continue. Catches earliest-init crashes that the
+    -- old "start, then attach when pid appears" flow always missed.
+    P.step("6/6  set-debug-app -w " .. pkg .. " …")
+    pcall(adb_run, sess.adb, vim.list_extend({ "-s", sess.serial }, steps.force_stop))
+    local sd_out, sd_code = adb_run_raw(sess.adb,
+      vim.list_extend({ "-s", sess.serial }, steps.set_wait))
+    if sd_code ~= 0 then
+      -- User policy: fail with a recorded reason, do NOT silently fall back.
+      P.error("am set-debug-app failed")
+      wait_notice("set-debug-app",
+        ("am set-debug-app -w %s failed (exit %s): %s — wait-for-debugger launch aborted. "
+          .. "Is the app debuggable? Use :UEDAPAttach for a running process instead.")
+          :format(pkg, tostring(sd_code), tostring(sd_out)),
+        vim.log.levels.ERROR)
       M._attach_in_progress = false
       M.stop_android_debugger()
       return
     end
-    _finalize_session(sess, pid, "UE Android Launch (lldb-dap)", "UEDAP android launch")
+
+    P.step("starting activity (waiting at debugger gate) …")
+    pcall(adb_run, sess.adb, vim.list_extend({ "-s", sess.serial }, steps.start))
+
+    local pid
+    for _ = 1, 50 do
+      pid = pidof(sess.adb, sess.serial, sess.package_name)
+      if pid then break end
+      vim.wait(200)
+    end
+    -- One-shot: clear the debug-app flag as soon as the process exists (or
+    -- we give up), so a later manual launch of the app is NOT gated. The
+    -- already-spawned process keeps waiting regardless.
+    pcall(adb_run, sess.adb, vim.list_extend({ "-s", sess.serial }, steps.clear_wait))
+    if not pid then
+      P.error(("%s did not start within 10s"):format(pkg))
+      wait_notice("wait-launch-no-pid",
+        ("%s did not appear within 10s after set-debug-app -w + start "
+          .. "(serial=%s). See ue-dap-bp-diag.log."):format(pkg, sess.serial),
+        vim.log.levels.ERROR)
+      M._attach_in_progress = false
+      M.stop_android_debugger()
+      return
+    end
+
+    sess.wait_mode = true
+    _finalize_session(sess, pid, "UE Android Launch (wait-for-debugger)", "UEDAP android launch")
+    arm_wait_mode_followup(sess)
     M._attach_in_progress = false
     M._start_liveness_poller()
+    vim.notify(
+      "[ue.dap.android] launched " .. pkg .. " frozen at the debugger gate.\n"
+      .. "Set breakpoints, then F5: the JDWP gate is released automatically and\n"
+      .. "the earliest engine init runs under the debugger.",
+      vim.log.levels.INFO)
   end)
 end
 
@@ -1588,15 +1940,24 @@ function M._start_liveness_poller()
   local timer = vim.uv.new_timer()
   if not timer then return end
   M._liveness_timer = timer
-  timer:start(2000, 1500, vim.schedule_wrap(function()
-    -- Bail if session is gone (user already stopped, or a different attach).
+  -- P6: the pid probe MUST NOT run synchronously on the main loop. The old
+  -- implementation called pidof() (vim.fn.system → blocking adb round-trip,
+  -- 300–1000ms over USB) inside vim.schedule_wrap every 1.5s — that showed
+  -- up as a continuous ~p50 400ms main-loop stall train in stall_probe logs
+  -- (2026-07-24, ~50 stalls/min for the whole debug session). Use vim.system
+  -- with a callback instead; `in_flight` prevents overlapping probes when
+  -- adb is slower than the poll interval.
+  local in_flight = false
+  local function on_pid_result(live)
+    -- Runs on the main loop (scheduled). Re-check state: the timer may have
+    -- been stopped, or the session replaced, while the probe was in flight.
+    if M._liveness_timer ~= timer then return end
     local ok_dap, dap = pcall(require, "dap")
     local has_sess = ok_dap and dap and dap.session and dap.session() or nil
     if not has_sess or M._session.pid ~= pid then
       M._stop_liveness_poller()
       return
     end
-    local live = pidof(adb, serial, pkg)
     if live and live == pid then
       M._liveness_misses = 0
       return
@@ -1616,7 +1977,27 @@ function M._start_liveness_poller()
     vim.notify("[ue.dap.android] " .. why .. "\nUse :UEDAPReattach to reconnect.",
       vim.log.levels.WARN)
     pcall(M.stop_android_debugger)
-  end))
+  end
+  timer:start(2000, 1500, function()
+    -- FAST EVENT CONTEXT: spawn only; all state handling is scheduled.
+    if in_flight then return end
+    in_flight = true
+    local ok_spawn = pcall(vim.system,
+      { adb, "-s", serial, "shell", "pidof", "-s", pkg },
+      { text = true },
+      function(res)
+        vim.schedule(function()
+          in_flight = false
+          local live = nil
+          if res and res.code == 0 then
+            local digits = (res.stdout or ""):match("(%d+)")
+            live = digits and tonumber(digits) or nil
+          end
+          on_pid_result(live)
+        end)
+      end)
+    if not ok_spawn then in_flight = false end
+  end)
 end
 
 -- ── public: status (one-line probe for the user) ──────────────────────────
@@ -1685,6 +2066,23 @@ end
 -- and the UE_DAP_NO_SLIDE switch.
 function M._attach_commands_for_test(session)
   return attach_commands(session)
+end
+
+-- Pure helpers exposed for headless specs (no device / adb / dap needed).
+function M._lldb_server_stage_plan_for_test(size_matches, is_executable)
+  return lldb_server_stage_plan(size_matches, is_executable)
+end
+
+function M._parse_maps_base_hex_for_test(maps, so_basename)
+  return parse_maps_base_hex(maps, so_basename)
+end
+
+function M._wait_launch_device_steps_for_test(pkg)
+  return wait_launch_device_steps(pkg)
+end
+
+function M._jdb_connect_argv_for_test(jdb, port)
+  return jdb_connect_argv(jdb, port)
 end
 
 return M

@@ -2794,11 +2794,20 @@ INDEX_FN.promote_active_index = function(ctx, src_path)
   return write_all(ctx.paths.active_index, content)
 end
 
--- Keep `<engine_root>/.clangd`'s `Index.External.File` /
--- `Index.External.MountPoint` lines in sync with the authoritative
--- `cache_paths(engine_root).active_index` path. Called from the success
--- branch of build_phase_async right after promote_active_index, before
--- the LspRestart, so the restarted clangd reads the corrected file.
+-- Keep `.clangd`'s `Index.External.File` / `Index.External.MountPoint` lines
+-- in sync with the authoritative `cache_paths(engine_root).active_index` path
+-- — at the ENGINE root AND, when the project lives outside the engine tree
+-- (typical: engine on D:, project on E:), at the PROJECT root too.
+--
+-- WHY both: clangd discovers `.clangd` by walking UP from each source file.
+-- A project file on E: never reaches the engine-root `.clangd` on D:, so it
+-- gets NO `Background: Skip` → clangd background-indexes every project TU
+-- (~half the CDB) with up to -j=24 workers after every UEPrepare CDB regen.
+-- Observed 2026-07-24: 14.5k shards actively written under
+-- %LocalAppData%/clangd/index (the fallback shard dir for files outside the
+-- compile-commands dir) — the "clangd eats all CPU/RAM after UEPrepare"
+-- symptom. The active idx is built from the FULL cdb (engine + project TUs),
+-- so mounting the same file at the project root is correct.
 --
 -- Surgical: only the `Index.External.{File,MountPoint}` keys are touched
 -- (or an `Index:` block is appended if absent). All other content
@@ -2812,28 +2821,7 @@ end
 -- back to `--background-index`, burning 17 GB RAM / 32 min CPU per cold
 -- open. The hot/full/current pipeline is now responsible for keeping
 -- `.clangd` honest.
-INDEX_FN.sync_dot_clangd = function(ctx)
-  if not ctx or not ctx.engine_root or ctx.engine_root == "" then
-    return false, "no engine_root"
-  end
-  local idx_path = ctx.paths and ctx.paths.active_index
-  if not idx_path or idx_path == "" then
-    return false, "no active_index path"
-  end
-  local clangd_path = ctx.engine_root .. "/.clangd"
-
-  -- Native-slashes on Windows for consistency with how UBT writes paths
-  -- elsewhere in the cdb. clangd accepts both, but pinning one form lets
-  -- a textual diff stay clean across runs.
-  local function native(p)
-    if _uplat.is_windows then
-      return (p:gsub("/", "\\"))
-    end
-    return p
-  end
-  local want_file = native(idx_path)
-  local want_mount = native(ctx.engine_root)
-
+INDEX_FN.sync_one_dot_clangd = function(clangd_path, want_file, want_mount)
   local existing = ""
   if _ufs.is_file(clangd_path) then
     existing = read_all(clangd_path) or ""
@@ -2920,6 +2908,60 @@ INDEX_FN.sync_dot_clangd = function(ctx)
     return false, "rename failed: " .. tostring(rn_err)
   end
   return true, "updated"
+end
+
+INDEX_FN.sync_dot_clangd = function(ctx)
+  if not ctx or not ctx.engine_root or ctx.engine_root == "" then
+    return false, "no engine_root"
+  end
+  local idx_path = ctx.paths and ctx.paths.active_index
+  if not idx_path or idx_path == "" then
+    return false, "no active_index path"
+  end
+
+  -- Native-slashes on Windows for consistency with how UBT writes paths
+  -- elsewhere in the cdb. clangd accepts both, but pinning one form lets
+  -- a textual diff stay clean across runs.
+  local function native(p)
+    if _uplat.is_windows then
+      return (p:gsub("/", "\\"))
+    end
+    return p
+  end
+  local want_file = native(idx_path)
+
+  -- Engine root: mount = engine root (covers all D:-side engine TUs).
+  local ok_e, msg_e = INDEX_FN.sync_one_dot_clangd(
+    ctx.engine_root .. "/.clangd", want_file, native(ctx.engine_root))
+
+  -- Project root OUTSIDE the engine tree: needs its own .clangd or clangd
+  -- background-indexes the whole project half of the CDB (the post-UEPrepare
+  -- CPU/RAM burn). Same idx file; mount = project root. Skip when the
+  -- project lives under the engine root (upward search finds the engine
+  -- .clangd already).
+  local proot = ctx.project_root
+  if proot and proot ~= "" then
+    local proot_n = norm(proot)
+    local eroot_n = norm(ctx.engine_root)
+    local under_engine = proot_n:lower():sub(1, #eroot_n + 1) == (eroot_n:lower() .. "/")
+      or proot_n:lower() == eroot_n:lower()
+    if not under_engine then
+      local ok_p, msg_p = INDEX_FN.sync_one_dot_clangd(
+        proot_n .. "/.clangd", want_file, native(proot_n))
+      if not ok_p then
+        return ok_e, (msg_e or "") .. "; project .clangd: " .. tostring(msg_p)
+      end
+    end
+  end
+  return ok_e, msg_e
+end
+
+-- Test seams: .clangd sync (engine + external project root).
+function M._sync_one_dot_clangd_for_test(path, file, mount)
+  return INDEX_FN.sync_one_dot_clangd(path, file, mount)
+end
+function M._sync_dot_clangd_for_test(ctx)
+  return INDEX_FN.sync_dot_clangd(ctx)
 end
 
 INDEX_FN.build_phase_async = function(ctx, phase)
@@ -3607,6 +3649,202 @@ end
 function M._csearch_build_begin_for_test(label) return CORE_RT.csearch_build_begin(label) end
 function M._csearch_build_done_for_test() return CORE_RT.csearch_build_done() end
 function M._csearch_build_running_for_test() return CORE_RT.csearch_build_running end
+
+-- ── csearch smart incremental build (D11) ───────────────────────────────────
+-- Every stale verdict used to trigger a FULL `-reset` rebuild (minutes on a UE
+-- tree) even when the actual change was "3 files added". cindex natively
+-- supports incremental `add` (re-index given paths, merge into the existing
+-- idx) — what was missing is the DIFF: which files are new since the index was
+-- last built. We record the exact absolute-path list fed to cindex on every
+-- full-build success (snapshot at `<csearch_idx>.files`, per-platform since it
+-- lives next to the idx — C5b) and diff against it on the next build.
+--
+-- Decision rules (pure, unit-tested via _csearch_build_mode_for_test):
+--   * forced / no snapshot        → reset  (no basis for a diff)
+--   * removed > 0                 → reset  (cindex CANNOT delete from an index;
+--                                           ghost entries would serve hits for
+--                                           dead files — correctness over speed)
+--   * added + dirty == 0          → skip   (set unchanged; just refresh
+--                                           bookkeeping)
+--   * added + dirty > 30% of set  → reset  (merge cost approaches full build;
+--                                           usually a branch switch)
+--   * else                        → add    (feed ONLY the delta to cindex)
+--
+-- `dirty` = watcher's persistent set (modified existing files + new files).
+-- Re-adding a modified file refreshes its trigrams, so content edits get folded
+-- in on the cheap path too. An `add` that fails (corrupt/0-byte idx — the
+-- build_index D9 guard refuses it) falls back to one reset automatically.
+CORE_RT.CSEARCH_ADD_RATIO_MAX = 0.30
+
+function CORE_RT.csearch_snapshot_path(ctx)
+  local idx = ctx and ctx.paths and ctx.paths.csearch_idx
+  if not idx or idx == "" then return nil end
+  return idx .. ".files"
+end
+
+-- Pure decision. stats = { forced, has_snapshot, added_n, removed_n, dirty_n,
+-- total_n }. Returns mode ("reset"|"add"|"skip") + human reason.
+function CORE_RT.csearch_build_mode(stats)
+  stats = stats or {}
+  if stats.forced then return "reset", "forced" end
+  if not stats.has_snapshot then return "reset", "no snapshot of last indexed set" end
+  if (stats.removed_n or 0) > 0 then
+    return "reset", ("%d removals (cindex cannot delete)"):format(stats.removed_n)
+  end
+  local work = (stats.added_n or 0) + (stats.dirty_n or 0)
+  if work == 0 then return "skip", "indexed set unchanged" end
+  local total = math.max(tonumber(stats.total_n) or 0, 1)
+  if work > total * CORE_RT.CSEARCH_ADD_RATIO_MAX then
+    return "reset", ("delta %d > %d%% of %d files"):format(
+      work, math.floor(CORE_RT.CSEARCH_ADD_RATIO_MAX * 100), total)
+  end
+  return "add", ("+%d added, %d dirty"):format(stats.added_n or 0, stats.dirty_n or 0)
+end
+
+-- Read a list file into { set = {path=true}, list = {...}, n = count }.
+local function read_list_file(path)
+  local set, list, n = {}, {}, 0
+  local f = path and io.open(path, "r") or nil
+  if not f then return nil end
+  for line in f:lines() do
+    line = line:gsub("\r$", "")
+    if line ~= "" and not set[line] then
+      set[line] = true
+      n = n + 1
+      list[n] = line
+    end
+  end
+  f:close()
+  return { set = set, list = list, n = n }
+end
+
+-- Drop-in replacement for the three prepare-path build_index calls.
+-- cb(ok, err, stats) — stats gains .mode ("reset"|"add"|"skip") and .delta.
+-- Owns: diff, mode decision, add→reset fallback, snapshot refresh on success.
+-- Does NOT own: csearch_build_begin/done (call sites keep that), fingerprint /
+-- dirty-clear (call sites keep on_full_csearch_success — snapshot refresh here
+-- is the only extra obligation, and it is idempotent).
+function CORE_RT.csearch_smart_build(ctx, cs_ctx, abs_list, cb)
+  local code_search = require("utils.code_search")
+  local snap_path = CORE_RT.csearch_snapshot_path(ctx)
+  local new_list = read_list_file(abs_list)
+  if not new_list then
+    vim.schedule(function() cb(false, "cannot read " .. tostring(abs_list), {}) end)
+    return
+  end
+
+  local function snapshot_current()
+    if not snap_path then return end
+    pcall(function()
+      local uvfs = vim.uv or vim.loop
+      uvfs.fs_copyfile(abs_list, snap_path)
+    end)
+  end
+
+  local function run_reset(reason, after_fallback)
+    code_search.build_index(cs_ctx, abs_list, function(ok, err, stats)
+      stats = stats or {}
+      stats.mode = "reset"
+      stats.delta = reason
+      if ok then snapshot_current() end
+      cb(ok, err, stats)
+    end, { mode = "reset" })
+    if after_fallback then
+      vim.schedule(function()
+        vim.notify("[ue] csearch incremental add failed — fell back to full rebuild ("
+          .. tostring(after_fallback) .. ")", vim.log.levels.WARN,
+          { title = "UE", replace = "ue.csearch.build" })
+      end)
+    end
+  end
+
+  -- Gather diff inputs.
+  local old_list = snap_path and read_list_file(snap_path) or nil
+  local added, removed_n = {}, 0
+  if old_list then
+    for _, p in ipairs(new_list.list) do
+      if not old_list.set[p] then added[#added + 1] = p end
+    end
+    for _, p in ipairs(old_list.list) do
+      if not new_list.set[p] then removed_n = removed_n + 1 end
+    end
+  end
+  -- Watcher dirty files still present in the new set (modified existing files;
+  -- drop entries that vanished — they show up as removals instead).
+  local dirty_in_set, dirty_seen = {}, {}
+  do
+    local ok_watch, watch = pcall(require, "utils.ue_watch")
+    if ok_watch and type(watch.snapshot_persistent_dirty) == "function" then
+      for _, p in ipairs(watch.snapshot_persistent_dirty() or {}) do
+        if new_list.set[p] and not dirty_seen[p] then
+          dirty_seen[p] = true
+          dirty_in_set[#dirty_in_set + 1] = p
+        end
+      end
+    end
+  end
+  -- added ∪ dirty without double-counting.
+  local add_input, add_seen = {}, {}
+  for _, p in ipairs(added) do
+    if not add_seen[p] then add_seen[p] = true; add_input[#add_input + 1] = p end
+  end
+  for _, p in ipairs(dirty_in_set) do
+    if not add_seen[p] then add_seen[p] = true; add_input[#add_input + 1] = p end
+  end
+
+  local mode, why = CORE_RT.csearch_build_mode({
+    forced       = ctx and ctx._force_csearch or false,
+    has_snapshot = old_list ~= nil,
+    added_n      = #added,
+    removed_n    = removed_n,
+    dirty_n      = #dirty_in_set,
+    total_n      = new_list.n,
+  })
+
+  if mode == "skip" then
+    snapshot_current()  -- ordering may differ; keep snapshot in lockstep with list
+    vim.schedule(function()
+      cb(true, nil, { mode = "skip", delta = why, ms = 0, index_size = 0, skipped = true })
+    end)
+    return
+  end
+
+  if mode == "reset" then
+    run_reset(why)
+    return
+  end
+
+  -- mode == "add": feed ONLY the delta.
+  local add_list_path = abs_list .. ".add"
+  local fout = io.open(add_list_path, "w")
+  if not fout then
+    run_reset("cannot write add-list")
+    return
+  end
+  for _, p in ipairs(add_input) do fout:write(p, "\n") end
+  fout:close()
+  code_search.build_index(cs_ctx, add_list_path, function(ok, err, stats)
+    pcall(os.remove, add_list_path)
+    if ok then
+      stats = stats or {}
+      stats.mode = "add"
+      stats.delta = why
+      snapshot_current()
+      cb(true, nil, stats)
+      return
+    end
+    -- Incremental refused/failed (typically D9 unusable-idx guard). One
+    -- automatic reset — always safe — instead of surfacing a dead end.
+    run_reset("fallback after add failure", err or "?")
+  end, { mode = "add" })
+end
+
+-- Test seams (D11).
+function M._csearch_build_mode_for_test(stats) return CORE_RT.csearch_build_mode(stats) end
+function M._csearch_snapshot_path_for_test(ctx) return CORE_RT.csearch_snapshot_path(ctx) end
+function M._csearch_smart_build_for_test(ctx, cs_ctx, abs_list, cb)
+  return CORE_RT.csearch_smart_build(ctx, cs_ctx, abs_list, cb)
+end
 
 -- Public alias for the D-3b dirty-clear helper (also used by tests).
 function M.clear_persistent_dirty_safe(reason)
@@ -8303,7 +8541,7 @@ local function prepare()
           pcall(os.remove, abs_list)
         else
           local cs_done, cs_ok, cs_err = false, false, nil
-          code_search_p.build_index(cs_ctx_p, abs_list, function(ok_cs, err_cs, _st)
+          CORE_RT.csearch_smart_build(ctx, cs_ctx_p, abs_list, function(ok_cs, err_cs, _st)
             cs_ok, cs_err = ok_cs, err_cs
             cs_done = true
           end)
@@ -8541,17 +8779,24 @@ local function prepare_async(opts)
             if not CORE_RT.csearch_build_begin("UEPrepare (cache fast-path)") then
               pcall(os.remove, abs_list)
             else
-              vim.notify(("UEPrepare: rebuilding csearch index in background (reason: %s)..."):format(stale_reason),
+              vim.notify(("UEPrepare: refreshing csearch index in background (reason: %s)..."):format(stale_reason),
                 vim.log.levels.INFO, { title = "UE", timeout = 3000, replace = "ue.csearch.build" })
-              code_search_fp.build_index(cs_ctx_fp, abs_list, function(ok_cs, err_cs, stats)
+              CORE_RT.csearch_smart_build(ctx, cs_ctx_fp, abs_list, function(ok_cs, err_cs, stats)
                 CORE_RT.csearch_build_done()
                 pcall(os.remove, abs_list)
                 if ok_cs then
-                  local mb = math.floor((stats.index_size or 0) / 1024 / 1024)
-                  vim.notify(("✓ csearch index rebuilt: %d MB in %.1fs"):format(
-                    mb, (stats.ms or 0) / 1000),
-                    vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
-                  -- Full build succeeded (D-3b + D10): clear dirty + fingerprint.
+                  local mode_str = stats.mode or "reset"
+                  if mode_str == "skip" then
+                    vim.notify("✓ csearch index already current (set unchanged)",
+                      vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
+                  else
+                    local mb = math.floor((stats.index_size or 0) / 1024 / 1024)
+                    vim.notify(("✓ csearch %s: %s — %d MB in %.1fs"):format(
+                      mode_str == "add" and "incremental" or "rebuilt",
+                      stats.delta or "", mb, (stats.ms or 0) / 1000),
+                      vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
+                  end
+                  -- Full/incremental build succeeded (D-3b + D10): clear dirty + fingerprint.
                   CORE_RT.on_full_csearch_success(ctx, "prepare:fast-path")
                 else
                   vim.notify("UEPrepare: csearch rebuild failed: " .. (err_cs or "unknown"),
@@ -8860,17 +9105,24 @@ local function prepare_async(opts)
             finalize_after_csearch()
             return
           end
-          code_search.build_index(cs_ctx, abs_list, function(ok_cs, err_cs, stats)
+          CORE_RT.csearch_smart_build(ctx, cs_ctx, abs_list, function(ok_cs, err_cs, stats)
             CORE_RT.csearch_build_done()
             -- Tidy up the temp filelist regardless of outcome.
             pcall(os.remove, abs_list)
 
             if ok_cs then
-              local mb = math.floor((stats.index_size or 0) / 1024 / 1024)
-              vim.notify(("✓ csearch index: %d MB in %.1fs"):format(
-                mb, (stats.ms or 0) / 1000),
-                vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
-              -- Full build succeeded (D-3b + D10): clear dirty + fingerprint.
+              local mode_str = stats.mode or "reset"
+              if mode_str == "skip" then
+                vim.notify("✓ csearch index already current (set unchanged)",
+                  vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
+              else
+                local mb = math.floor((stats.index_size or 0) / 1024 / 1024)
+                vim.notify(("✓ csearch %s: %s — %d MB in %.1fs"):format(
+                  mode_str == "add" and "incremental" or "index",
+                  stats.delta or "", mb, (stats.ms or 0) / 1000),
+                  vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
+              end
+              -- Full/incremental build succeeded (D-3b + D10): clear dirty + fingerprint.
               CORE_RT.on_full_csearch_success(ctx, "prepare:cold-full")
             else
               vim.notify("UEPrepare: csearch index failed: " .. (err_cs or "unknown"),

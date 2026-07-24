@@ -1,7 +1,7 @@
 # Lessons · 平台怪癖与调试硬知识
 
 > **lessons/** 区：付出过真实调试成本的陷阱与硬知识。
-> 出处优先：权威踩坑清单在 `docs/CONSTRAINTS.md §二（踩过的坑 K1–K37）`，
+> 出处优先：权威踩坑清单在 `docs/CONSTRAINTS.md §二（踩过的坑 K1–K41）`，
 > 本文件是**主题导航**，按领域聚合指回出处，不复制原文。
 
 ## 什么属于这里 / 不属于这里
@@ -23,7 +23,7 @@ disconnect 死循环、Windows pipe 正斜杠、per-project 断点持久化。
 权限模型（用 `platform shell`）；环境残留卡 state T。
 → `../docs/CONSTRAINTS.md §二 Android ASLR`；用户 MEMORY `project_android_dap_aslr_fix.md`
 
-### Android DAP attach platform 模式（K30–K37，宪法级）
+### Android DAP attach platform 模式（K30–K40，宪法级）
 唯一正解 = platform 模式 + serial-based `connect://[<serial>]:<port>`；
 `gdbserver --attach` 在该设备从不 listen；localhost URL 被 getopt 吞空；
 F9 成功判据 = LLDB resolved + stop event（K33）；source-file `breakpoint set -f` 在旧
@@ -32,15 +32,20 @@ file:line 断点需先 `target create` symbol-rich host libUE4.so（K35）。
 **会话中 F9 即时下断点经 lldb-dap evaluate backtick `breakpoint set -f/-l` 通道是正解**
 （K36，真机 `2e2df4cb` 闸门+端到端实证；`361b9e7` 的「内核静默丢弃」不适用当前路线，
 不再需 `:UEDAPReattach`）；**不下发 `target modules load --slide` 则 attach 失败，slide 为
-load-bearing**（K37，`UE_DAP_NO_SLIDE` 开关供其他设备复验）。
+load-bearing**（K37，`UE_DAP_NO_SLIDE` 开关供其他设备复验；wait-launch 例外＝slide「晚到」）。
+`/data/local/tmp/lldb-server` root-owned 残留 chmod EPERM → rm-then-push / reuse（K38）；
+最早期 crash 只有 wait-for-debugger launch（`set-debug-app -w` + JDWP 闸门 + jdb 释放）
+能抓到（K39）；liveness poller 在 timer 回调里同步 `vim.fn.system(adb)` 造成全天
+~50 stalls/min 的主循环卡顿 train → 周期探测必须 async `vim.system` + in_flight（K40）。
 → `../docs/CONSTRAINTS.md §二 Android DAP attach`；归档 change `2026-06-03-android-dap-*` /
   `2026-06-15-android-dap-live-breakpoints`；ADR `../docs/plans/2026-06-15-android-dap-live-breakpoints.md`；
   证据 `../tools/evidence/android-f9/livebp-*.json`
 
-### 工具链 / LLVM（K14–K15）
+### 工具链 / LLVM（K14–K15、K41）
 LLVM 22.0–22.1.5 的 `lldb-dap.exe` Windows 启动崩（`STATUS_STACK_BUFFER_OVERRUN`）；
 适配器迁移弧线（lldb-dap 21.1.8 → codelldb 1.12.2 → **LLVM 22.1.6+ lldb-dap forward-only，
-当前 Android DAP**）。
+当前 Android DAP**）；跨盘 project root 缺 `.clangd` → UEPrepare 后 clangd background-index
+吃满 CPU/内存，`sync_dot_clangd` 须 engine+project 双写（K41）。
 → `../docs/CONSTRAINTS.md §二 工具链/LLVM`；`../docs/TOOLING.md`
 
 ### snacks / clangd / lazy（K16–K24，活跃 workaround）

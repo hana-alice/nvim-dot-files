@@ -199,6 +199,38 @@ prepare_freshness 稳态：
 防回归：`tests/cases/freshness_fingerprint_spec.lua`（指纹同/异 + 缓存 + freshness 源不再引用
 任何 mtime anchor）。详见 change `csearch-freshness-content-fingerprint`。
 
+### D11 — csearch 智能增量构建（stale ≠ 全量重建）
+
+D10 让 freshness **判定**准确了，但每个 stale 判定仍触发全量 `-reset` 重建（UE 树数分钟）——
+即便实际变化只是「加了 3 个文件」。cindex 原生支持增量 `add`（重索引给定路径、merge 进现有
+idx）；缺的是 **diff 基准**：上次索引到底喂了哪些文件。
+
+```
+机制：
+  * 每次构建成功后把喂给 cindex 的绝对路径清单快照到 <csearch_idx>.files
+    （与 idx 同目录 → 天然按平台分路径，C5b 语义免费继承）
+  * 下次构建先 diff（新清单 vs 快照）+ 并入 watcher persistent_dirty（改动的既有文件
+    re-add 刷新 trigram）
+  * 决策（CORE_RT.csearch_build_mode，纯函数）：
+      forced / 无快照            → reset
+      removed > 0               → reset   （cindex 无删除能力；ghost 命中 = 正确性问题）
+      added+dirty == 0          → skip    （集合没变，只刷新记账）
+      added+dirty > 30% 总量     → reset   （merge 成本逼近全量；典型 = 切分支）
+      否则                      → add     （只喂 delta）
+  * add 失败（D9 guard 拒绝 unusable idx 等）→ 自动回退一次 reset（永远安全）
+```
+
+- **单一入口**：`CORE_RT.csearch_smart_build(ctx, cs_ctx, abs_list, cb)` 替换三条 prepare
+  路径（sync / fast-path / cold-full）的裸 `build_index` 调用。begin/done 串行闸与
+  `on_full_csearch_success`（清 dirty + 写指纹）仍归调用点——smart_build 只额外负责快照刷新。
+- **与 D9 的关系**：写者仍只有 prepare 家族（smart_build 是 prepare 的实现细节，不是新写者）；
+  watcher 仍是记账员。`UEPrepareIncremental`（手动挡）保留，语义不变。
+- **正确性边界**：删除必须 reset——cindex merge 只能加不能减，留 ghost 会让 `<leader>/`
+  命中已删除文件（比慢更糟）。30% 阈值 `CORE_RT.CSEARCH_ADD_RATIO_MAX` 可调。
+
+防回归：`tests/cases/csearch_build_guard_spec.lua`（D11 组：mode 决策矩阵 + smart_build
+skip/add/reset 端到端 with mock build_index + 快照往返）。
+
 ## 3. 失效正确性论证
 
 - **engine 变**：旧 `set_project` 只比 project_root；engine 换了（同 project 指向新引擎）

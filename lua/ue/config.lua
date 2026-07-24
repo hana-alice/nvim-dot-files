@@ -70,6 +70,10 @@ local function defaults()
       -- Path to an arm64 lldb-server binary used for Android remote-debugging.
       -- Pushed to /data/local/tmp on the device by the preflight script.
       android_lldb_server = nil,
+      -- Path to a JDK `jdb` executable used by the Android wait-for-debugger
+      -- launch (releases the app's "Waiting for debugger" JDWP gate after the
+      -- native lldb attach). nil => probe PATH, then JAVA_HOME/bin.
+      jdb_path = nil,
       -- Default Android package name. nil => prompt on first use, then
       -- persist via update_state_field("android_package", ...).
       android_package = nil,

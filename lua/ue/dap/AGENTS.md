@@ -22,6 +22,11 @@ UE 专用 DAP：`_common`（adapter 接线 + env 清洗）、`_persist_bp`（断
 - **会话中 F9 即时下断点 = 正解，经 lldb-dap evaluate backtick `breakpoint set -f/-l` 通道**
   （`ue_android_live_plant_via_evaluate` in `../dap.lua`），不再 `:UEDAPReattach`、不 detach+reattach、
   不假 `verified`（回读 `breakpoint list resolved=N`，0/失败则诚实 warn）。preseed 降级为初始快照。→ K36
+- **launch = wait-for-debugger（AS debug 按钮语义）**：`am set-debug-app -w` 冻住 JDWP 闸门 →
+  K30 attach（此时 libUE4.so 未加载，attach-time slide 拿不到属**预期**）→ 首次 continue 时
+  jdb 释放闸门 + late-rebase poller 经 evaluate 通道补发显式 slide（K37 语义「晚到」而非「缺席」）。
+  任何退出路径必须 `am clear-debug-app`（粘性标志会冻住后续手动启动）。失败经 `wait_notice`
+  每会话去重记录（notify + ue-dap-bp-diag.log）。
 - **nvim-dap 没有 before-request hook**：`listeners.before.setBreakpoints` 在响应管线触发
   （签名 `session, err, response, request, seq`），**不能**改 outgoing `args.source`；恢复请求行须读
   `request` payload。别再起 `*_source_rewrite` 这种暗示 wire-mutation 的命名。

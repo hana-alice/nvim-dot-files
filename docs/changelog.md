@@ -54,6 +54,61 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-07-26 — feat(probe): 主动证据探针系统 —— 不等用户反馈，代码自己记录（probe-feedback-loop）
+
+**Task** — 用户拍板新工作流：落地的改动不等「真机浸泡几天回报」——关键路径自己埋
+探针记录证据；**spec 第一条 requirement 就是「读取反馈先修问题」**；探针可迭代
+可休眠；log 必须定期精简、重复项压缩。
+
+**Implemented**
+- `lua/utils/probe.lua`（新，312 行）：
+  - **写时去重**：同 (topic,key) 重复事件压缩为单条 `{count,first,last,data}`
+    ——一万次重复 = 一条记录。
+  - **生命周期**：首次 record 自动 arm（默认 14 天）；TTL 过期或 distinct-key
+    达上限（默认 200）自动休眠，休眠后 record 零成本 no-op（调用点永不需改）；
+    洪水打满留 `_overflow` 聚合记录（F2 哲学：打满必须可见且自停）；
+    `:UEProbeArm <topic> [days]` 重激活迭代 / `:UEProbeSleep` 手动休眠。
+  - **定期精简**：每次 load/save 跑 compaction——30 天 TTL 淘汰、每 topic cap
+    按 last-seen 淘汰最旧、空休眠 topic 整体移除。体积由构造有界。
+  - P6/P5 合规：热路径仅内存 upsert + 2s 防抖一次性 timer 落盘（必 stop+close，
+    F5 教训）；探针自身不 notify；所有调用点 pcall 包裹（探针坏了不伤宿主）。
+  - `:UEProbeReport`（分 topic、armed/dormant 标注、按 last-seen 排序）、
+    `:UEProbeCompact`；`pending_summary()` 供会话启动摘要。
+- **首批探针埋点**（对应本轮落地改动的浸泡观察项，全部 pcall 包裹）：
+  - `android-wait-launch`：wait_notice 失败类 + `gate-release-ok` 成功类
+    （wait-for-debugger 端到端是否真的走通）。
+  - `csearch-smart-build`：每次 prepare 的 mode（skip/add/reset）+
+    `add-fallback-reset`（D11 增量路径日常是否生效）。
+  - `dirty-set-flood`：cap-hit（F2 洪水复发监测）。
+  - `foreign-buffer`：跨 checkout 命中频度（决定告警是否升级快切动作）。
+- `init.lua` UIEnter：probe.setup() + 存在证据时**一次性** INFO 摘要
+  （「读反馈先于新工作」的入口提示，headless 不启动）。
+- `openspec/specs/probe-feedback-loop/spec.md`（新 capability，4 requirements）：
+  **第一条即 report-first**（会话开始先读证据、失败类记录处置先于新工作），
+  另有生命周期 / 精简压缩 / 探针自身不得成为负担。
+- 根 `AGENTS.md` SESSION START 新增第 0 步：读探针反馈先于一切。
+- `tests/cases/probe_spec.lua`（新，9 例）：去重压缩（1000 次→单条 count=1000）、
+  arm/sleep/re-arm、洪水自停 + `_overflow`、TTL 淘汰、空 topic 移除、
+  pending_summary、持久化往返。
+
+**Pitfalls / Gotchas**
+- 探针的调用点合同是「永不需要改」：休眠语义放 record() 内部而非调用点判断，
+  否则每次休眠迭代都要动业务文件。
+- 洪水自停必须留聚合痕迹（`_overflow`）——静默休眠 = 重蹈 F2「打满不可见」。
+- commands_spec 冻结清单只锁 UE_COMMANDS 数组内命令的存在性，UEProbe* 三命令
+  由 probe.setup()（UIEnter）注册、headless 不触发，不入冻结清单（同
+  StallProbe/StallReport 先例）。
+
+**Validation**
+- `probe` filter → exit 0（9 例全绿）；全量 `nvim --headless -l tests/run.lua`
+  → exit 0。
+- 探针实际证据流待日常使用积累（这正是本系统存在的意义——下个会话
+  :UEProbeReport 见）。
+
+**Follow-ups**
+- 下个会话开始时按 spec #1 读报告；若 `csearch-smart-build` 只见 reset 不见
+  add，优先查 D11 快照链路。
+
 ### 2026-07-26 — refactor(ue): F1 phase-1 —— INDEX 子系统切出 lua/ue/index/（ue.lua 10472→9225 行）
 
 **Task** — health-check F1 的第一刀：把 ue.lua 里内聚度最高的 clangd 离线索引块

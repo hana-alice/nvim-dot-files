@@ -485,6 +485,11 @@ local function save_persistent_dirty()
     state._dirty_capped = true
     if not state._warned_dirty_capped then
       state._warned_dirty_capped = true
+      -- Probe: cap-hit is the F2 signal the next session reads first.
+      pcall(function()
+        require("utils.probe").record("dirty-set-flood", "cap-hit",
+          { dropped = dropped, cap = PERSISTENT_DIRTY_CAP })
+      end)
       vim.schedule(function()
         log_warn(("dirty set hit cap=%d — %d oldest entries DROPPED; grep overlay is now lossy. "
           .. "Run :UEPrepare (or :UEPrepareIncremental) to reindex and reset.")

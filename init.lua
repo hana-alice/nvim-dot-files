@@ -48,6 +48,21 @@ vim.api.nvim_create_autocmd("UIEnter", {
     pcall(function()
       require("utils.stall_probe").setup()
     end)
+    -- Proactive evidence probes (:UEProbeReport / spec probe-feedback-loop).
+    -- Session-start summary: surface pending evidence ONCE so the next
+    -- session's first act is READING feedback, not waiting for it.
+    pcall(function()
+      local probe = require("utils.probe").setup()
+      local s = probe.pending_summary()
+      if s.records > 0 then
+        vim.defer_fn(function()
+          vim.notify(
+            ("[probe] %d topic(s) / %d record(s) of evidence pending — :UEProbeReport")
+              :format(s.topics, s.records),
+            vim.log.levels.INFO, { title = "UE", timeout = 6000 })
+        end, 1500)
+      end
+    end)
   end,
 })
 

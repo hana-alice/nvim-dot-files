@@ -2546,6 +2546,13 @@ function CORE_RT.csearch_smart_build(ctx, cs_ctx, abs_list, cb)
     total_n      = new_list.n,
   })
 
+  -- Probe (D11 soak): record which mode each prepare takes, so the next
+  -- session can verify the incremental path actually fires in daily use
+  -- (report-first workflow — probe-feedback-loop spec #1).
+  pcall(function()
+    require("utils.probe").record("csearch-smart-build", mode, why)
+  end)
+
   if mode == "skip" then
     snapshot_current()  -- ordering may differ; keep snapshot in lockstep with list
     vim.schedule(function()
@@ -2580,6 +2587,10 @@ function CORE_RT.csearch_smart_build(ctx, cs_ctx, abs_list, cb)
     end
     -- Incremental refused/failed (typically D9 unusable-idx guard). One
     -- automatic reset — always safe — instead of surfacing a dead end.
+    pcall(function()
+      require("utils.probe").record("csearch-smart-build", "add-fallback-reset",
+        tostring(err or "?"):sub(1, 120))
+    end)
     run_reset("fallback after add failure", err or "?")
   end, { mode = "add" })
 end
@@ -4886,6 +4897,12 @@ function CORE_RT.notify_foreign_buffer(ctx, path)
   if not key then return end
   if CORE_RT.foreign_buffer_notified[key] then return end
   CORE_RT.foreign_buffer_notified[key] = true
+  -- Probe: how often users actually land in foreign checkouts decides
+  -- whether this stays a warning or grows a quick-switch action.
+  pcall(function()
+    require("utils.probe").record("foreign-buffer", key,
+      { pinned = tostring(ctx.project_root or "?") })
+  end)
   vim.schedule(function()
     vim.notify(
       ("[ue] this buffer is OUTSIDE the pinned project:\n  file:    %s\n  project: %s\n" ..

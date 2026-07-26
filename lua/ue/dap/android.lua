@@ -839,6 +839,11 @@ local function wait_notice(key, msg, level)
   if M._wait_notice_seen[key] then return end
   M._wait_notice_seen[key] = true
   append_bp_diag({ "== wait-for-debugger notice ==", "key=" .. key, msg })
+  -- Probe: wait-launch failures are exactly the evidence the next session
+  -- must read before touching this file (probe-feedback-loop spec #1).
+  pcall(function()
+    require("utils.probe").record("android-wait-launch", key, msg:sub(1, 120))
+  end)
   log.notify("dap.android", msg, level or vim.log.levels.WARN)
 end
 
@@ -992,6 +997,13 @@ local function arm_wait_mode_followup(sess)
   dap.listeners.after.event_continued[WAIT_LISTENER_KEY] = function(session)
     if dap.session() ~= session then return end
     disarm_wait_mode_followup()
+    -- Probe: success-path evidence — wait-launch reached the gate-release
+    -- stage (pairs with the failure records from wait_notice; both feed
+    -- the next session's report-first workflow).
+    pcall(function()
+      require("utils.probe").record("android-wait-launch", "gate-release-ok",
+        { pkg = sess.package_name, pid = sess.pid })
+    end)
     start_jdwp_release(sess)
     M._start_late_rebase_poller(sess)
   end

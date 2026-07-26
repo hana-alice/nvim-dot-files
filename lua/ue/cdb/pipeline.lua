@@ -81,11 +81,39 @@ function M.slim(path)
   return false
 end
 
-local function copy_file(src, dst)
-  if vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1 then
-    vim.fn.system({ "cmd", "/c", "copy", "/y", src:gsub("/", "\\"), dst:gsub("/", "\\") })
-  else
-    vim.fn.system({ "cp", src, dst })
+local function copy_file(src, dst, cb)
+  -- Async, non-blocking (F3, health-check 2026-07): the only caller loops
+  -- inside a jobstart on_exit callback copying a multi-MB CDB to N targets;
+  -- the previous `vim.fn.system(copy/cp)` blocked the main loop once per
+  -- target. uv.fs_copyfile does the copy on the libuv threadpool; failure is
+  -- logged (next :UEPrepare rewrites all targets anyway, so a missed mirror
+  -- self-heals). cb() fires on the main loop when this copy settles.
+  local uvfs = vim.uv or vim.loop
+  uvfs.fs_copyfile(src, dst, { excl = false }, function(err)
+    vim.schedule(function()
+      if err then
+        _rt.notify("cdb mirror copy failed (" .. dst .. "): " .. tostring(err),
+          vim.log.levels.WARN)
+      end
+      if cb then cb() end
+    end)
+  end)
+end
+
+-- Copy `src` to targets[2..N] concurrently; call done() once ALL copies have
+-- settled. Sequencing matters: the caller's on_done chain hands the SAME
+-- source file to partition_base_cdb which rewrites it in place — starting
+-- that while a copy is still reading src would mirror a torn file (same
+-- torn-write class as the 2026-06-25 partition×pipeline race).
+local function mirror_targets_then(src, targets, done)
+  local n = targets and #targets or 0
+  if n <= 1 then done(); return end
+  local pending = n - 1
+  for i = 2, n do
+    copy_file(src, targets[i], function()
+      pending = pending - 1
+      if pending == 0 then done() end
+    end)
   end
 end
 
@@ -189,14 +217,15 @@ function M.run(path, targets, on_done)
         if on_done then on_done() end
         return
       end
-      if targets and #targets > 1 then
-        for i = 2, #targets do
-          copy_file(path, targets[i])
-        end
-      end
-      _rt.notify("compile_commands pipeline: done. Restarting clangd...", vim.log.levels.INFO)
-      restart_clangd()
-      if on_done then on_done() end
+      -- Mirror to secondary targets ASYNC, then restart clangd + hand off.
+      -- on_done (→ partition_base_cdb) must not run until mirrors settle —
+      -- partition rewrites `path` in place and a concurrent reader would
+      -- mirror a torn file.
+      mirror_targets_then(path, targets, function()
+        _rt.notify("compile_commands pipeline: done. Restarting clangd...", vim.log.levels.INFO)
+        restart_clangd()
+        if on_done then on_done() end
+      end)
     end,
   })
 end

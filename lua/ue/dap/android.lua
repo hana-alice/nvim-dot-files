@@ -550,6 +550,51 @@ local function pidof(adb, serial, pkg)
   return digits and tonumber(digits) or nil
 end
 
+-- Async pid poll (F4, health-check 2026-07): the old launch/reattach paths
+-- looped `pidof + vim.wait(200)` up to 50 times — a half-blocking wait
+-- (fast events run, but user input freezes for up to 10s while each
+-- synchronous adb round-trip stacks on top). Same fix pattern as K40:
+-- uv timer + vim.system, `in_flight` against overlap, done() on main loop.
+-- done(pid|nil) fires exactly once — pid found, or nil after timeout_ms.
+local function pidof_async(adb, serial, pkg, timeout_ms, done)
+  local timer = vim.uv.new_timer()
+  if not timer then
+    -- Degenerate fallback: single synchronous probe.
+    done(pidof(adb, serial, pkg))
+    return
+  end
+  local deadline = vim.uv.now() + (timeout_ms or 10000)
+  local in_flight, finished = false, false
+  local function finish(pid)
+    if finished then return end
+    finished = true
+    pcall(function() timer:stop() end)
+    pcall(function() timer:close() end)
+    done(pid)
+  end
+  timer:start(0, 200, function()
+    -- FAST EVENT CONTEXT: spawn only; results handled on the main loop.
+    if finished or in_flight then return end
+    if vim.uv.now() >= deadline then
+      vim.schedule(function() finish(nil) end)
+      return
+    end
+    in_flight = true
+    local ok_spawn = pcall(vim.system,
+      { adb, "-s", serial, "shell", "pidof", "-s", pkg },
+      { text = true },
+      function(res)
+        vim.schedule(function()
+          in_flight = false
+          if finished then return end
+          local digits = res and res.code == 0 and (res.stdout or ""):match("(%d+)") or nil
+          if digits then finish(tonumber(digits)) end
+        end)
+      end)
+    if not ok_spawn then in_flight = false end
+  end)
+end
+
 -- Read the ASLR load base of a shared object from the device process maps.
 -- Returns the base as a lowercase hex string WITHOUT the "0x" prefix, or nil.
 --
@@ -1807,37 +1852,34 @@ function M.launch(opts)
     P.step("starting activity (waiting at debugger gate) …")
     pcall(adb_run, sess.adb, vim.list_extend({ "-s", sess.serial }, steps.start))
 
-    local pid
-    for _ = 1, 50 do
-      pid = pidof(sess.adb, sess.serial, sess.package_name)
-      if pid then break end
-      vim.wait(200)
-    end
-    -- One-shot: clear the debug-app flag as soon as the process exists (or
-    -- we give up), so a later manual launch of the app is NOT gated. The
-    -- already-spawned process keeps waiting regardless.
-    pcall(adb_run, sess.adb, vim.list_extend({ "-s", sess.serial }, steps.clear_wait))
-    if not pid then
-      P.error(("%s did not start within 10s"):format(pkg))
-      wait_notice("wait-launch-no-pid",
-        ("%s did not appear within 10s after set-debug-app -w + start "
-          .. "(serial=%s). See ue-dap-bp-diag.log."):format(pkg, sess.serial),
-        vim.log.levels.ERROR)
-      M._attach_in_progress = false
-      M.stop_android_debugger()
-      return
-    end
+    -- Async pid poll (F4): does not freeze user input while the process spawns.
+    pidof_async(sess.adb, sess.serial, sess.package_name, 10000, function(pid)
+      -- One-shot: clear the debug-app flag as soon as the process exists (or
+      -- we give up), so a later manual launch of the app is NOT gated. The
+      -- already-spawned process keeps waiting regardless.
+      pcall(adb_run, sess.adb, vim.list_extend({ "-s", sess.serial }, steps.clear_wait))
+      if not pid then
+        P.error(("%s did not start within 10s"):format(pkg))
+        wait_notice("wait-launch-no-pid",
+          ("%s did not appear within 10s after set-debug-app -w + start "
+            .. "(serial=%s). See ue-dap-bp-diag.log."):format(pkg, sess.serial),
+          vim.log.levels.ERROR)
+        M._attach_in_progress = false
+        M.stop_android_debugger()
+        return
+      end
 
-    sess.wait_mode = true
-    _finalize_session(sess, pid, "UE Android Launch (wait-for-debugger)", "UEDAP android launch")
-    arm_wait_mode_followup(sess)
-    M._attach_in_progress = false
-    M._start_liveness_poller()
-    vim.notify(
-      "[ue.dap.android] launched " .. pkg .. " frozen at the debugger gate.\n"
-      .. "Set breakpoints, then F5: the JDWP gate is released automatically and\n"
-      .. "the earliest engine init runs under the debugger.",
-      vim.log.levels.INFO)
+      sess.wait_mode = true
+      _finalize_session(sess, pid, "UE Android Launch (wait-for-debugger)", "UEDAP android launch")
+      arm_wait_mode_followup(sess)
+      M._attach_in_progress = false
+      M._start_liveness_poller()
+      vim.notify(
+        "[ue.dap.android] launched " .. pkg .. " frozen at the debugger gate.\n"
+        .. "Set breakpoints, then F5: the JDWP gate is released automatically and\n"
+        .. "the earliest engine init runs under the debugger.",
+        vim.log.levels.INFO)
+    end)
   end)
 end
 
@@ -1882,35 +1924,31 @@ function M.reattach()
   local P = require("ue.dap._progress")
   P.step(("reattach: waiting for %s on %s …"):format(last.package_name, last.serial))
 
-  -- Poll up to 10s for the app to be running.
-  local pid
-  for _ = 1, 50 do
-    pid = pidof(sess.adb, sess.serial, sess.package_name)
-    if pid then break end
-    vim.wait(200)
-  end
-  if not pid then
-    P.error(("%s not running on %s after 10s"):format(last.package_name, last.serial))
-    M._attach_in_progress = false
-    return
-  end
+  -- Async pid poll up to 10s (F4 — no half-blocking vim.wait loop).
+  pidof_async(sess.adb, sess.serial, sess.package_name, 10000, function(pid)
+    if not pid then
+      P.error(("%s not running on %s after 10s"):format(last.package_name, last.serial))
+      M._attach_in_progress = false
+      return
+    end
 
-  -- Ensure lldb-server is still in the sandbox (Android may have cleared
-  -- /data/data/<pkg> on user-data wipe / reinstall).
-  local ok_push, push_msg = ensure_lldb_server_pushed(
-    sess.adb, sess.serial, sess.package_name, sess.lldb_server_local)
-  if not ok_push then
-    P.error("lldb-server re-stage failed: " .. tostring(push_msg))
-    M._attach_in_progress = false
-    return
-  end
-  sess.remote_lldb_server = push_msg
-  sess.lldb_server_mode = "platform"
+    -- Ensure lldb-server is still in the sandbox (Android may have cleared
+    -- /data/data/<pkg> on user-data wipe / reinstall).
+    local ok_push, push_msg = ensure_lldb_server_pushed(
+      sess.adb, sess.serial, sess.package_name, sess.lldb_server_local)
+    if not ok_push then
+      P.error("lldb-server re-stage failed: " .. tostring(push_msg))
+      M._attach_in_progress = false
+      return
+    end
+    sess.remote_lldb_server = push_msg
+    sess.lldb_server_mode = "platform"
 
-  _finalize_session(sess, pid,
-    "UE Android Attach (lldb-dap)", "UEDAP android reattach")
-  M._attach_in_progress = false
-  M._start_liveness_poller()
+    _finalize_session(sess, pid,
+      "UE Android Attach (lldb-dap)", "UEDAP android reattach")
+    M._attach_in_progress = false
+    M._start_liveness_poller()
+  end)
 end
 
 -- ── public: liveness poller ───────────────────────────────────────────────

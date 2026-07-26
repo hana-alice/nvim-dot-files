@@ -51,3 +51,80 @@ t.describe("stability: DAP 平台注册可重复清空", function()
     t.assert_nil(p.attach_handler("stab_test"))
   end)
 end)
+
+-- ── K40 模式固化（health-check 2026-07 task 7.2）────────────────────────────
+-- uv timer 回调里禁止同步 spawn：K40（liveness poller 每 1.5s 同步 adb 往返 →
+-- 全天 stall train）的永久防复发。静态扫描 lua/ 全仓：`timer:start(` 后同一
+-- 回调窗口（40 行内、遇 `end)` 边界截断的近似）不得出现
+-- vim.fn.system / vim.fn.systemlist / io.popen。
+-- 近似扫描有误报可能：如出现合法用例，在 ALLOW 表登记 `文件:行号` 并注明理由。
+local t4 = require("tests.harness")
+t4.describe("stability: timer 回调内禁同步 spawn（K40 固化）", function()
+  local cfg_root = vim.fn.stdpath("config")
+  local ALLOW = {
+    -- "lua/xxx.lua:123", -- 理由
+  }
+  local function allowed(rel, lnum)
+    for _, a in ipairs(ALLOW) do
+      if a == (rel .. ":" .. lnum) then return true end
+    end
+    return false
+  end
+
+  t4.it("全仓扫描 0 违例", function()
+    local files = vim.fn.glob(cfg_root .. "/lua/**/*.lua", true, true)
+    local viols = {}
+    for _, path in ipairs(files) do
+      local lines = {}
+      for l in io.lines(path) do lines[#lines + 1] = l end
+      local rel = path:sub(#cfg_root + 2):gsub("\\", "/")
+      for i, l in ipairs(lines) do
+        if l:find("timer:start(", 1, true) and not l:match("^%s*%-%-") then
+          -- 向下最多 40 行找同步 spawn；粗略以缩进回落的 `end)` 截断
+          for j = i + 1, math.min(#lines, i + 40) do
+            local body = lines[j]
+            if body:match("^%s*end%)") and select(2, body:gsub("%s", "")) then
+              break
+            end
+            if not body:match("^%s*%-%-") then
+              if (body:find("vim%.fn%.system") or body:find("io%.popen"))
+                and not allowed(rel, j) then
+                viols[#viols + 1] = ("%s:%d (timer at :%d): %s")
+                  :format(rel, j, i, vim.trim(body):sub(1, 70))
+              end
+            end
+          end
+        end
+      end
+    end
+    t4.assert_eq(#viols, 0,
+      "timer 回调内出现同步 spawn（K40 模式）：\n" .. table.concat(viols, "\n"))
+  end)
+end)
+
+-- 文件行数：不硬卡存量（ue.lua 等 5 个白名单），只锁「不再新增超限文件」。
+t4.describe("stability: 不再新增 >800 行 lua 文件（存量白名单）", function()
+  local cfg_root = vim.fn.stdpath("config")
+  local GRANDFATHERED = {
+    ["lua/ue.lua"] = true,
+    ["lua/ue/dap.lua"] = true,
+    ["lua/ue/dap/android.lua"] = true,
+    ["lua/utils/cheatsheet.lua"] = true,
+    ["lua/utils/ue_goto/symbol.lua"] = true,
+  }
+  t4.it("新文件不超 800 行", function()
+    local files = vim.fn.glob(cfg_root .. "/lua/**/*.lua", true, true)
+    local viols = {}
+    for _, path in ipairs(files) do
+      local rel = path:sub(#cfg_root + 2):gsub("\\", "/")
+      if not GRANDFATHERED[rel] then
+        local n = 0
+        for _ in io.lines(path) do n = n + 1 end
+        if n > 800 then viols[#viols + 1] = rel .. " (" .. n .. " lines)" end
+      end
+    end
+    t4.assert_eq(#viols, 0,
+      "新增超 800 行文件（coding-style 上限；拆分或加入白名单需评审）：\n"
+      .. table.concat(viols, "\n"))
+  end)
+end)

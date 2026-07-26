@@ -36,25 +36,17 @@ function CORE_RT.trace_mark(_name) end
 CORE_RT.trace_path = nil
 CORE_RT.trace_t0 = nil
 
-local INDEX_FN = {}
+-- F1 split phase-1: the clangd index subsystem now lives in lua/ue/index/.
+-- INDEX_FN keeps its historical name so ~60 call sites below are unchanged;
+-- INDEX_RT is the SAME table the module mutates (M._rt), so :UESetProject
+-- cleanup and status-cache code below keep working on live state.
+local INDEX_FN = require("ue.index")
 -- Phase C: tunables sourced from `ue.config`. Literal fallbacks (`or 120000`
 -- etc.) match the previous hard-coded values exactly so behaviour is
 -- unchanged when no user override is provided. The fallbacks also keep this
 -- chunk loadable if `ue.config` ever fails to require.
 local _ue_cfg = require("ue.config")
-local INDEX_RT = {
-  job = nil,
-  module_state = {},
-  contexts = {},
-  timers = {},
-  idle_cold_ms        = _ue_cfg.get("index.idle_cold_ms")        or 120000,
-  debounce_current_ms = _ue_cfg.get("index.debounce_current_ms") or 1200,
-  debounce_hot_ms     = _ue_cfg.get("index.debounce_hot_ms")     or 8000,
-  restart_debounce_s  = _ue_cfg.get("index.restart_debounce_s")  or 45,
-  last_restart_at = 0,
-  status_cache = {},
-  status_ttl          = _ue_cfg.get("index.status_ttl_s")        or 30,
-}
+local INDEX_RT = INDEX_FN._rt
 local cache_paths
 local _CONTEXT_TTL = _ue_cfg.get("context.ttl_s") or 30 -- seconds (filesystem walks are expensive on NTFS)
 
@@ -2006,955 +1998,29 @@ end
 
 local status_root_key, clear_index_dirty, mark_index_dirty, invalidate_status_cache, refresh_statusline
 
-local INDEX_CORE_MODULES = {
-  Core = true,
-  CoreUObject = true,
-  Engine = true,
-  InputCore = true,
-  Slate = true,
-  SlateCore = true,
-  RenderCore = true,
-  RHI = true,
-  Renderer = true,
-  Projects = true,
-  ApplicationCore = true,
-  UnrealEd = true,
-}
-
-local INDEX_ALWAYS_COLD_MODULES = {
-  VulkanRHI = true,
-  OpenGLDrv = true,
-  NullDrv = true,
-}
-
-local function unix_now()
-  return os.time()
-end
-
-local function index_phase_label(phase)
-  phase = trim(phase):lower()
-  if phase == "current" then
-    return "T0"
-  elseif phase == "hot" then
-    return "HOT"
-  elseif phase == "full" then
-    return "FULL"
-  elseif phase == "idle" or phase == "" then
-    return "IDLE"
-  end
-  return phase:upper()
-end
-
-local function module_tier_label(tier)
-  tier = trim(tier):lower()
-  if tier == "core" then
-    return "CORE"
-  elseif tier == "cold" then
-    return "COLD"
-  elseif tier == "warm" then
-    return "WARM"
-  end
-  return tier ~= "" and tier:upper() or "-"
-end
-
-local function read_json_file(path, default)
-  default = default or {}
-  if not _ufs.is_file(path) then
-    return vim.deepcopy(default)
-  end
-  local content = read_all(path)
-  if not content or content == "" then
-    return vim.deepcopy(default)
-  end
-  local ok, decoded = pcall(vim.json.decode, content)
-  if not ok or type(decoded) ~= "table" then
-    return vim.deepcopy(default)
-  end
-  return decoded
-end
-
-local function write_json_file(path, value)
-  return write_all(path, vim.json.encode(value or {}))
-end
-
--- Reverse-map a unity TU path back to the originating module name.
--- UBT emits unity .cpp files at:
---   <root>/Intermediate/Build/<Plat>/<Target>/<Conf>/[<PlatGroup>/]<Module>/Module.<Module>[.gen][.N_of_M].cpp
--- where <root> is Engine/, the project root, or a plugin/platform plugin root.
--- Returns the bare module name (e.g. "AIGraph", "AIModule") or nil.
-local function unity_tu_module_name(path)
-  if not path or path == "" then
-    return nil
-  end
-  if not path:find("/Intermediate/Build/", 1, true) then
-    return nil
-  end
-  local raw = path:match("/Module%.([^/]+)%.cpp$")
-  if not raw then
-    return nil
-  end
-  -- Strip "N_of_M" slice suffix (any trailing ".<digits>_of_<digits>")
-  raw = raw:gsub("%.%d+_of_%d+$", "")
-  -- Strip ".gen" UHT suffix
-  raw = raw:gsub("%.gen$", "")
-  if raw == "" then
-    return nil
-  end
-  return raw
-end
-
--- name -> resolved root cache, populated on demand. Keyed by
--- "engine_root|project_root|name" so multiple workspaces don't collide.
-local UNITY_MODULE_ROOT_CACHE = {}
-
-local function unity_locate_module_root(engine_root, project_root, name)
-  if not name or name == "" then
-    return nil
-  end
-  local key = (engine_root or "") .. "|" .. (project_root or "") .. "|" .. name
-  local cached = UNITY_MODULE_ROOT_CACHE[key]
-  if cached ~= nil then
-    if cached == false then
-      return nil
-    end
-    return cached
-  end
-
-  local function check(candidate)
-    candidate = norm(candidate)
-    if candidate ~= "" and _ufs.is_dir(candidate) then
-      return candidate
-    end
-    return nil
-  end
-
-  -- 1) Engine/Source/<Tier>/<Module>
-  local hit = locate_engine_module_root(engine_root, name)
-
-  -- 2) Engine plugin: Engine/Plugins/**/<Module>/Source/<Module>
-  if not hit and engine_root and engine_root ~= "" then
-    local matches = vim.fn.globpath(
-      join(engine_root, "Engine", "Plugins"),
-      "**/" .. name .. "/Source/" .. name,
-      false,
-      true
-    )
-    if type(matches) == "table" then
-      for _, m in ipairs(matches) do
-        hit = check(m)
-        if hit then break end
-      end
-    end
-  end
-
-  -- 3) Engine platforms plugin: Engine/Platforms/*/Plugins/**/<Module>/Source/<Module>
-  if not hit and engine_root and engine_root ~= "" then
-    local matches = vim.fn.globpath(
-      join(engine_root, "Engine", "Platforms"),
-      "*/Plugins/**/" .. name .. "/Source/" .. name,
-      false,
-      true
-    )
-    if type(matches) == "table" then
-      for _, m in ipairs(matches) do
-        hit = check(m)
-        if hit then break end
-      end
-    end
-  end
-
-  -- 4) Project module: <anchor>/Source/<Module>
-  --    Anchor = CORE_RT.project_module_anchor(project_root). Equals project_root
-  --    for standard layouts; equals <project_root>/Source/<ProjectName> for the
-  --    P4 nested layout where the .uproject lives one level deeper.
-  local project_anchor = project_root and project_root ~= "" and CORE_RT.project_module_anchor(project_root) or nil
-  if not hit and project_anchor then
-    hit = check(join(project_anchor, "Source", name))
-  end
-
-  -- 5) Project plugin: <anchor>/Plugins/**/<Module>/Source/<Module>
-  if not hit and project_anchor then
-    local matches = vim.fn.globpath(
-      join(project_anchor, "Plugins"),
-      "**/" .. name .. "/Source/" .. name,
-      false,
-      true
-    )
-    if type(matches) == "table" then
-      for _, m in ipairs(matches) do
-        hit = check(m)
-        if hit then break end
-      end
-    end
-  end
-
-  UNITY_MODULE_ROOT_CACHE[key] = hit or false
-  return hit
-end
-
-local function unity_scope_for_path(ctx, path)
-  local name = unity_tu_module_name(path)
-  if not name then
-    return nil
-  end
-  local root = unity_locate_module_root(ctx.engine_root, ctx.project_root, name)
-  if not root then
-    return nil
-  end
-  -- Detect plugin vs module by whether root sits under any /Plugins/ chain
-  local kind = "module"
-  if norm(root):find("/Plugins/", 1, true) then
-    kind = "plugin"
-  end
-  return {
-    kind = kind,
-    name = name,
-    root = root,
-    label = (kind == "plugin" and "Plugin " or "Module ") .. name,
-  }
-end
-
-local function module_scope_for_path(ctx, path)
-  if not ctx then
-    return nil
-  end
-  path = norm(path)
-  if path == "" then
-    return nil
-  end
-  return plugin_scope_from_root(ctx.project_root, path)
-    or project_module_scope(ctx.project_root, path)
-    or plugin_scope_from_root(join(ctx.engine_root, "Engine"), path)
-    or engine_module_scope(ctx.engine_root, path)
-    or unity_scope_for_path(ctx, path)
-end
-
-local function module_key(scope)
-  if not scope or not scope.root then
-    return ""
-  end
-  return (scope.kind or "module") .. ":" .. norm(scope.root)
-end
-
-local function module_tier(scope)
-  if not scope then
-    return "warm"
-  end
-  local root = norm(scope.root)
-  if INDEX_CORE_MODULES[scope.name or ""] then
-    return "core"
-  end
-  if INDEX_ALWAYS_COLD_MODULES[scope.name or ""] then
-    return "cold"
-  end
-  if root:find("/Developer/") or root:find("/Experimental/") then
-    return "cold"
-  end
-  return "warm"
-end
-
-local function locate_engine_module_root(engine_root, name)
-  if trim(name) == "" then
-    return nil
-  end
-  local matches = vim.fn.globpath(join(engine_root, "Engine", "Source"), "*/" .. name, false, true)
-  if type(matches) == "table" then
-    for _, match in ipairs(matches) do
-      local candidate = norm(match)
-      if _ufs.is_dir(candidate) then
-        return candidate
-      end
-    end
-  end
-  return nil
-end
-
-local function index_state_default()
-  return {
-    version = 1,
-    active_module = nil,
-    root_dirty = false,
-    modules = {},
-    queue = {},
-    build = {
-      phase = "idle",
-      status = "idle",
-      started_at = 0,
-      finished_at = 0,
-      message = "",
-      active_index = "",
-    },
-    stats = {
-      current_runs = 0,
-      hot_runs = 0,
-      full_runs = 0,
-    },
-    updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-  }
-end
-
-local function save_index_state(ctx, state)
-  if not ctx or not state then
-    return
-  end
-  state.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
-  local key = status_root_key(ctx)
-  INDEX_RT.module_state[key] = state
-  INDEX_RT.contexts[key] = ctx
-  _ufs.ensure_dir(ctx.paths.index_dir)
-  write_json_file(ctx.paths.index_state, state)
-  write_json_file(ctx.paths.index_queue, state.queue or {})
-end
-
-local function ensure_index_state(ctx)
-  local key = status_root_key(ctx)
-  if key == "" then
-    return index_state_default()
-  end
-  if INDEX_RT.module_state[key] then
-    return INDEX_RT.module_state[key]
-  end
-  local state = read_json_file(ctx.paths.index_state, index_state_default())
-  if type(state.modules) ~= "table" then
-    state.modules = {}
-  end
-  if type(state.queue) ~= "table" then
-    state.queue = {}
-  end
-  if state.root_dirty == nil then
-    state.root_dirty = false
-  end
-  if type(state.build) ~= "table" then
-    state.build = index_state_default().build
-  end
-  if type(state.stats) ~= "table" then
-    state.stats = index_state_default().stats
-  end
-  INDEX_RT.module_state[key] = state
-  return state
-end
-
-local function ensure_module_record(state, scope)
-  if not state or not scope then
-    return nil
-  end
-  local key = module_key(scope)
-  if key == "" then
-    return nil
-  end
-  local rec = state.modules[key] or {
-    key = key,
-    kind = scope.kind or "module",
-    name = scope.name or vim.fs.basename(scope.root),
-    root = norm(scope.root),
-    label = scope.label or ((scope.kind == "plugin" and "Plugin " or "Module ") .. (scope.name or vim.fs.basename(scope.root))),
-    tier = module_tier(scope),
-    last_opened = 0,
-    last_changed = 0,
-    last_indexed = 0,
-    dirty = false,
-    dirty_reason = "",
-    hot_score = 0,
-  }
-  rec.kind = rec.kind or scope.kind or "module"
-  rec.name = rec.name or scope.name or vim.fs.basename(scope.root)
-  rec.root = norm(rec.root or scope.root)
-  rec.label = rec.label or scope.label or rec.name
-  rec.tier = module_tier({ name = rec.name, root = rec.root, kind = rec.kind })
-  state.modules[key] = rec
-  return rec
-end
-
-local function seed_core_modules(ctx, state)
-  for name, enabled in pairs(INDEX_CORE_MODULES) do
-    if enabled then
-      local root = locate_engine_module_root(ctx.engine_root, name)
-      if root then
-        ensure_module_record(state, {
-          kind = "module",
-          name = name,
-          root = root,
-          label = "Module " .. name,
-        })
-      end
-    end
-  end
-end
-
-local function module_record_from_path(ctx, path)
-  local scope = module_scope_for_path(ctx, path)
-  if not scope then
-    return nil, nil
-  end
-  local state = ensure_index_state(ctx)
-  seed_core_modules(ctx, state)
-  local rec = ensure_module_record(state, scope)
-  save_index_state(ctx, state)
-  return rec, state
-end
-
-local function module_key_from_path(ctx, path)
-  local scope = module_scope_for_path(ctx, path)
-  return module_key(scope), scope
-end
-
-local function module_score(rec, state)
-  if not rec then
-    return -100000
-  end
-  local score = 0
-  if rec.tier == "core" then
-    score = score + 500
-  elseif rec.tier == "cold" then
-    score = score - 400
-  end
-  if state and state.active_module == rec.key then
-    score = score + 1000
-  end
-  if rec.dirty then
-    score = score + 300
-  end
-  local now = unix_now()
-  if (tonumber(rec.last_opened) or 0) > 0 then
-    local age = now - (tonumber(rec.last_opened) or 0)
-    if age < 600 then
-      score = score + 200
-    elseif age < 3600 then
-      score = score + 80
-    end
-  end
-  if (tonumber(rec.last_changed) or 0) > 0 then
-    local age = now - (tonumber(rec.last_changed) or 0)
-    if age < 600 then
-      score = score + 300
-    elseif age < 3600 then
-      score = score + 120
-    end
-  end
-  score = score + (tonumber(rec.hot_score) or 0)
-  return score
-end
-
-local function sorted_module_records(state)
-  local items = {}
-  for _, rec in pairs(state.modules or {}) do
-    rec._score = module_score(rec, state)
-    items[#items + 1] = rec
-  end
-  table.sort(items, function(a, b)
-    if a._score == b._score then
-      return (a.name or "") < (b.name or "")
-    end
-    return a._score > b._score
-  end)
-  return items
-end
-
-INDEX_FN.set_active_module = function(ctx, path)
-  local rec, state = module_record_from_path(ctx, path)
-  if not rec or not state then
-    return nil
-  end
-  rec.last_opened = unix_now()
-  rec.hot_score = math.min((tonumber(rec.hot_score) or 0) + 25, 1000)
-  state.active_module = rec.key
-  save_index_state(ctx, state)
-  return rec
-end
-
-INDEX_FN.mark_module_dirty = function(ctx, path, reason)
-  local rec, state = module_record_from_path(ctx, path)
-  if not rec or not state then
-    mark_index_dirty(ctx)
-    return nil
-  end
-  rec.dirty = true
-  rec.dirty_reason = trim(reason) ~= "" and trim(reason) or "buffer-write"
-  rec.last_changed = unix_now()
-  rec.hot_score = math.min((tonumber(rec.hot_score) or 0) + 50, 1000)
-  mark_index_dirty(ctx)
-  save_index_state(ctx, state)
-  return rec
-end
-
-INDEX_FN.clear_module_dirty_flags = function(ctx, keys)
-  local state = ensure_index_state(ctx)
-  local changed = false
-  for _, key in ipairs(keys or {}) do
-    local rec = state.modules[key]
-    if rec and rec.dirty then
-      rec.dirty = false
-      rec.dirty_reason = ""
-      rec.last_indexed = unix_now()
-      changed = true
-    end
-  end
-  local has_dirty = false
-  for _, rec in pairs(state.modules or {}) do
-    if rec.dirty then
-      has_dirty = true
-      break
-    end
-  end
-  if not has_dirty then
-    clear_index_dirty(ctx)
-  end
-  if changed then
-    save_index_state(ctx, state)
-  end
-end
-
-INDEX_FN.index_phase_paths = function(ctx, phase)
-  if phase == "current" then
-    return ctx.paths.index_current_cdb, ctx.paths.current_index
-  end
-  if phase == "hot" then
-    return ctx.paths.index_hot_cdb, ctx.paths.hot_index
-  end
-  return ctx.paths.index_full_cdb, ctx.paths.full_index
-end
-
-INDEX_FN.base_compile_commands_path = function(ctx)
-  local path = join(ctx.engine_root, "compile_commands.json")
-  if _ufs.is_file(path) then
-    return path
-  end
-  path = join(ctx.engine_root, "Engine", "compile_commands.json")
-  if _ufs.is_file(path) then
-    return path
-  end
-  return nil
-end
-
--- CDB partition by (platform, config) -- see docs/changelog.md 2026-05-28 (#5)
--- UBT's compile_commands.json accumulates entries from every config + platform
--- that has ever been built in this checkout. clangd then walks all those
--- per-config -include Definitions.<Module>.h headers when servicing `gd` on
--- macros like UE_BUILD_DEVELOPMENT, jumping to whichever config's generated
--- header happens to be in the CDB (often a stale Dev one from days ago, even
--- though the current build is Test).
---
--- Fix: after every :UEPrepare we shell out to tools/cdb_partition.py, which
--- splits the base CDB into per-(plat, cfg) files under
--- <repo>/.cache/nvim-ue/cdb/active/compile_commands.<plat>-<cfg>.json and
--- rewrites the base to contain ONLY the active group + shaders. Active group
--- is auto-picked (largest cmd count) unless the caller passes an explicit
--- "Platform/Config" pair, e.g. :UECDBSwitch Win64 Development.
---
--- Pipeline placement: invoked right after run_compile_commands_pipeline (which
--- expands rsps / injects defs / unifies includes) and BEFORE
--- INDEX_FN.schedule_index_refresh -- so the per-phase subset CDBs and the
--- clangd-indexer feed all see the already-partitioned base. Failure here is
--- non-fatal: we surface a WARN and leave the base CDB untouched (clangd
--- continues to work, just with the old multi-group mix).
-INDEX_FN.partition_base_cdb = function(ctx, opts)
-  opts = opts or {}
-  local base = INDEX_FN.base_compile_commands_path(ctx)
-  if not base then
-    return false, "no base compile_commands.json"
-  end
-
-  local nvim_root = vim.fn.fnamemodify(vim.fn.stdpath("config"), ":p")
-  local script = join(nvim_root, "tools", "cdb_partition.py")
-  if not _ufs.is_file(script) then
-    return false, "cdb_partition.py missing at " .. script
-  end
-
-  -- Reuse the same Python probe sequence used elsewhere in this file for the
-  -- ccjson / pch subprocesses (Python 3.12 absolute path on Windows to dodge
-  -- PYTHONHOME contamination from outer shells).
-  local python
-  if _uplat.is_windows then
-    local cands = {
-      vim.env.UE_PYTHON,
-      vim.fn.expand("~/AppData/Local/Programs/Python/Python312/python.exe"),
-      vim.fn.expand("~/AppData/Local/Programs/Python/Python313/python.exe"),
-      "C:/Python312/python.exe",
-      "C:/Python313/python.exe",
-    }
-    for _, c in ipairs(cands) do
-      if c and c ~= "" and _ufs.is_file(c) then python = c; break end
-    end
-    python = python or "python"
-  else
-    python = "python3"
-  end
-
-  local cmd = { python, script, base }
-  if opts.active then
-    table.insert(cmd, "--active")
-    table.insert(cmd, opts.active)
-  end
-  if opts.out_dir then
-    table.insert(cmd, "--out-dir")
-    table.insert(cmd, opts.out_dir)
-  end
-
-  -- Scrub PYTHONPATH/PYTHONHOME (same reason as the ccjson subprocess).
-  local env = vim.fn.environ()
-  env.PYTHONPATH = nil
-  env.PYTHONHOME = nil
-  local env_list = {}
-  for k, v in pairs(env) do
-    table.insert(env_list, k .. "=" .. v)
-  end
-
-  local result = vim.system(cmd, { env = env_list, text = true, timeout = 120000 }):wait()
-  if result.code == 0 then
-    return true, (result.stdout or ""):gsub("%s+$", "")
-  end
-  if result.code == 3 then
-    -- "no classifiable groups" -- single-config CDB, nothing to do.
-    return true, "single-group CDB, no partition needed"
-  end
-  local msg = ("cdb_partition exit=%d stderr=%s"):format(
-    result.code or -1,
-    (result.stderr or ""):gsub("%s+$", ""))
-  return false, msg
-end
-
--- Read the partition manifest to know what groups exist + which is active.
--- Returns nil if no manifest (CDB never partitioned yet).
-INDEX_FN.read_partition_manifest = function(ctx)
-  local base = INDEX_FN.base_compile_commands_path(ctx)
-  if not base then return nil end
-  local mf_path = vim.fn.fnamemodify(base, ":h") .. "/compile_commands.partition.json"
-  if not _ufs.is_file(mf_path) then return nil end
-  local content = read_all(mf_path)
-  if not content or content == "" then return nil end
-  local ok, mf = pcall(vim.json.decode, content)
-  if not ok or type(mf) ~= "table" then return nil end
-  return mf, mf_path
-end
-
-INDEX_FN.normalize_cdb_file = function(entry)
-  if type(entry) ~= "table" then
-    return ""
-  end
-  local file = norm(entry.file or "")
-  local dir = norm(entry.directory or "")
-  if file ~= "" and not _ufs.is_absolute_path(file) and dir ~= "" then
-    file = join(dir, file)
-  end
-  return norm(file)
-end
-
-INDEX_FN.select_phase_module_keys = function(ctx, state, phase)
-  seed_core_modules(ctx, state)
-  local selected = {}
-  local seen = {}
-  local ordered = sorted_module_records(state)
-  local function add(key)
-    if key and key ~= "" and not seen[key] and state.modules[key] then
-      seen[key] = true
-      selected[#selected + 1] = key
-    end
-  end
-
-  for _, rec in ipairs(ordered) do
-    if rec.tier == "core" then
-      add(rec.key)
-    end
-  end
-
-  if state.active_module then
-    add(state.active_module)
-  end
-
-  if phase == "current" then
-    for _, rec in ipairs(ordered) do
-      if rec.dirty then
-        add(rec.key)
-      end
-      if #selected >= 6 then
-        break
-      end
-    end
-  elseif phase == "hot" then
-    for _, rec in ipairs(ordered) do
-      if rec.tier ~= "cold" or rec.dirty or rec.key == state.active_module then
-        add(rec.key)
-      end
-      if #selected >= 18 then
-        break
-      end
-    end
-  else
-    for _, rec in ipairs(ordered) do
-      add(rec.key)
-    end
-  end
-
-  return selected
-end
-
-INDEX_FN.write_subset_compile_commands = function(ctx, phase)
-  local state = ensure_index_state(ctx)
-  local cdb_path = INDEX_FN.base_compile_commands_path(ctx)
-  if not cdb_path then
-    return nil, nil, "compile_commands.json not found"
-  end
-  local content = read_all(cdb_path)
-  if not content or content == "" then
-    return nil, nil, "compile_commands.json is empty"
-  end
-  local ok, decoded = pcall(vim.json.decode, content)
-  if not ok or type(decoded) ~= "table" then
-    return nil, nil, "Failed to parse compile_commands.json"
-  end
-
-  local selected_keys = INDEX_FN.select_phase_module_keys(ctx, state, phase)
-  local selected_set = {}
-  for _, key in ipairs(selected_keys) do
-    selected_set[key] = true
-  end
-
-  local subset = {}
-  for _, entry in ipairs(decoded) do
-    local file = INDEX_FN.normalize_cdb_file(entry)
-    local key = module_key_from_path(ctx, file)
-    if phase == "full" then
-      subset[#subset + 1] = entry
-    elseif key ~= "" and selected_set[key] then
-      subset[#subset + 1] = entry
-    end
-  end
-
-  if #subset == 0 then
-    return nil, nil, "No compile_commands entries matched selected modules"
-  end
-
-  local out_cdb = INDEX_FN.index_phase_paths(ctx, phase)
-  _ufs.ensure_dir(ctx.paths.index_cdb_dir)
-  write_json_file(out_cdb, subset)
-  return out_cdb, selected_keys, nil
-end
-
-INDEX_FN.maybe_restart_clangd_for_index = function()
-  local now = unix_now()
-  if (now - INDEX_RT.last_restart_at) < INDEX_RT.restart_debounce_s then
-    return
-  end
-  INDEX_RT.last_restart_at = now
-
-  -- Snapshot which buffers had clangd attached BEFORE we stop, so we can
-  -- explicitly re-attach to each of them. The previous version only ran
-  -- `:edit` on the *current* buffer, which silently no-op'd whenever the
-  -- user was sitting in a picker / log / non-cpp buffer when the index
-  -- finished. clangd then stayed dead until the user noticed `gd` was slow,
-  -- by which time goto-def was falling back to treesitter or nothing.
-  local clients = vim.lsp.get_clients({ name = "clangd" })
-  if #clients == 0 then
-    return
-  end
-
-  local cpp_bufs = {}
-  for _, client in ipairs(clients) do
-    for buf, _ in pairs(client.attached_buffers or {}) do
-      if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_is_loaded(buf) then
-        cpp_bufs[buf] = true
-      end
-    end
-    client:stop()
-  end
-
-  -- Also include any cpp/c/h buffers that exist but weren't attached (e.g.
-  -- a fresh open during the restart window) — better to over-restart than
-  -- miss them.
-  for _, b in ipairs(vim.api.nvim_list_bufs()) do
-    if vim.api.nvim_buf_is_loaded(b) then
-      local ft = vim.bo[b].filetype
-      if ft == "cpp" or ft == "c" or ft == "h" or ft == "objcpp" or ft == "objc" then
-        cpp_bufs[b] = true
-      end
-    end
-  end
-
-  vim.defer_fn(function()
-    for buf, _ in pairs(cpp_bufs) do
-      if vim.api.nvim_buf_is_valid(buf) then
-        pcall(vim.api.nvim_buf_call, buf, function()
-          vim.cmd("LspStart clangd")
-        end)
-      end
-    end
-  end, 500)
-end
-
-INDEX_FN.promote_active_index = function(ctx, src_path)
-  src_path = norm(src_path)
-  if src_path == "" or not _ufs.is_file(src_path) then
-    return false
-  end
-  _ufs.ensure_dir(ctx.paths.active_index_dir)
-  local content = read_all(src_path)
-  if not content or content == "" then
-    return false
-  end
-  return write_all(ctx.paths.active_index, content)
-end
-
--- Keep `.clangd`'s `Index.External.File` / `Index.External.MountPoint` lines
--- in sync with the authoritative `cache_paths(engine_root).active_index` path
--- — at the ENGINE root AND, when the project lives outside the engine tree
--- (typical: engine on D:, project on E:), at the PROJECT root too.
---
--- WHY both: clangd discovers `.clangd` by walking UP from each source file.
--- A project file on E: never reaches the engine-root `.clangd` on D:, so it
--- gets NO `Background: Skip` → clangd background-indexes every project TU
--- (~half the CDB) with up to -j=24 workers after every UEPrepare CDB regen.
--- Observed 2026-07-24: 14.5k shards actively written under
--- %LocalAppData%/clangd/index (the fallback shard dir for files outside the
--- compile-commands dir) — the "clangd eats all CPU/RAM after UEPrepare"
--- symptom. The active idx is built from the FULL cdb (engine + project TUs),
--- so mounting the same file at the project root is correct.
---
--- Surgical: only the `Index.External.{File,MountPoint}` keys are touched
--- (or an `Index:` block is appended if absent). All other content
--- (CompileFlags `/vctoolsdir` MSVC pin, Diagnostics, comments, etc.)
--- is preserved byte-for-byte. Idempotent: re-running with the same
--- paths is a no-op (no write, no clangd restart amplification).
---
--- Why this lives here: the v3 cache migration moved idx from
--- `<root>/.clangd-index/` to `<root>/.cache/nvim-ue/clangd/index/`, but
--- nobody rewrote existing `.clangd` files. Result: clangd silently fell
--- back to `--background-index`, burning 17 GB RAM / 32 min CPU per cold
--- open. The hot/full/current pipeline is now responsible for keeping
--- `.clangd` honest.
-INDEX_FN.sync_one_dot_clangd = function(clangd_path, want_file, want_mount)
-  local existing = ""
-  if _ufs.is_file(clangd_path) then
-    existing = read_all(clangd_path) or ""
-  end
-
-  local new_content
-  if existing == "" then
-    -- No .clangd at all → write a minimal one. Background: Skip is
-    -- required since we have an external idx and don't want clangd
-    -- redoing the work.
-    new_content = table.concat({
-      "Index:",
-      "  External:",
-      "    File: " .. want_file,
-      "    MountPoint: " .. want_mount,
-      "  Background: Skip",
-      "",
-    }, "\n")
-  else
-    -- Find Index: block. If present, edit its External sub-block in place.
-    -- If absent, append a fresh Index: block.
-    local has_index = existing:match("\n?Index:%s*\n") or existing:match("^Index:%s*\n")
-    if has_index then
-      -- Replace `    File: ...` / `    MountPoint: ...` lines under
-      -- `  External:` if present; inject an External: sub-block if not.
-      local has_external = existing:match("\n%s*External:%s*\n") or existing:match("^%s*External:%s*\n")
-      if has_external then
-        -- gsub a single line at a time: tolerate any leading-whitespace
-        -- indent, replace the trailing value.
-        local edited = existing
-        -- File: ...
-        local file_replaced
-        edited, file_replaced = edited:gsub("(\n%s*External:[^\n]*\n[^\n]-\n?)(%s*)File:%s*[^\n]*", function(prefix, indent)
-          return prefix .. indent .. "File: " .. want_file
-        end, 1)
-        if file_replaced == 0 then
-          -- External: existed but had no File: line; inject after External:
-          edited = edited:gsub("(\n)(%s*)External:%s*\n", function(nl, indent)
-            return nl .. indent .. "External:\n" .. indent .. "  File: " .. want_file .. "\n" .. indent .. "  MountPoint: " .. want_mount .. "\n"
-          end, 1)
-        else
-          -- MountPoint: ...
-          local mp_replaced
-          edited, mp_replaced = edited:gsub("(\n%s*External:[^\n]*\n[^\n]-\n?)(%s*)MountPoint:%s*[^\n]*", function(prefix, indent)
-            return prefix .. indent .. "MountPoint: " .. want_mount
-          end, 1)
-          if mp_replaced == 0 then
-            -- File: was replaced but no MountPoint: line; inject right after File:
-            edited = edited:gsub("(%s*)File:%s*" .. want_file:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1"), function(indent)
-              return indent .. "File: " .. want_file .. "\n" .. indent .. "MountPoint: " .. want_mount
-            end, 1)
-          end
-        end
-        new_content = edited
-      else
-        -- Index: exists but no External: sub-block. Inject one right
-        -- after the Index: header line.
-        new_content = existing:gsub("(\n?)(Index:%s*\n)", function(nl, hdr)
-          return nl .. hdr .. "  External:\n    File: " .. want_file .. "\n    MountPoint: " .. want_mount .. "\n  Background: Skip\n"
-        end, 1)
-      end
-    else
-      -- No Index: block at all. Append one at EOF, separated by a blank line.
-      local sep = (existing:sub(-1) == "\n") and "" or "\n"
-      new_content = existing .. sep .. "\nIndex:\n  External:\n    File: " .. want_file .. "\n    MountPoint: " .. want_mount .. "\n  Background: Skip\n"
-    end
-  end
-
-  if new_content == existing then
-    return true, "unchanged"
-  end
-
-  -- Atomic write: tmp + rename. NTFS rename is atomic; clangd never sees
-  -- a half-written file mid-read.
-  local tmp_path = clangd_path .. ".tmp." .. tostring(vim.uv.hrtime())
-  local ok = write_all(tmp_path, new_content)
-  if not ok then
-    pcall(vim.fn.delete, tmp_path)
-    return false, "tmp write failed"
-  end
-  local rn_ok, rn_err = (vim.uv or vim.loop).fs_rename(tmp_path, clangd_path)
-  if not rn_ok then
-    pcall(vim.fn.delete, tmp_path)
-    return false, "rename failed: " .. tostring(rn_err)
-  end
-  return true, "updated"
-end
-
-INDEX_FN.sync_dot_clangd = function(ctx)
-  if not ctx or not ctx.engine_root or ctx.engine_root == "" then
-    return false, "no engine_root"
-  end
-  local idx_path = ctx.paths and ctx.paths.active_index
-  if not idx_path or idx_path == "" then
-    return false, "no active_index path"
-  end
-
-  -- Native-slashes on Windows for consistency with how UBT writes paths
-  -- elsewhere in the cdb. clangd accepts both, but pinning one form lets
-  -- a textual diff stay clean across runs.
-  local function native(p)
-    if _uplat.is_windows then
-      return (p:gsub("/", "\\"))
-    end
-    return p
-  end
-  local want_file = native(idx_path)
-
-  -- Engine root: mount = engine root (covers all D:-side engine TUs).
-  local ok_e, msg_e = INDEX_FN.sync_one_dot_clangd(
-    ctx.engine_root .. "/.clangd", want_file, native(ctx.engine_root))
-
-  -- Project root OUTSIDE the engine tree: needs its own .clangd or clangd
-  -- background-indexes the whole project half of the CDB (the post-UEPrepare
-  -- CPU/RAM burn). Same idx file; mount = project root. Skip when the
-  -- project lives under the engine root (upward search finds the engine
-  -- .clangd already).
-  local proot = ctx.project_root
-  if proot and proot ~= "" then
-    local proot_n = norm(proot)
-    local eroot_n = norm(ctx.engine_root)
-    local under_engine = proot_n:lower():sub(1, #eroot_n + 1) == (eroot_n:lower() .. "/")
-      or proot_n:lower() == eroot_n:lower()
-    if not under_engine then
-      local ok_p, msg_p = INDEX_FN.sync_one_dot_clangd(
-        proot_n .. "/.clangd", want_file, native(proot_n))
-      if not ok_p then
-        return ok_e, (msg_e or "") .. "; project .clangd: " .. tostring(msg_p)
-      end
-    end
-  end
-  return ok_e, msg_e
-end
+-- ── clangd index subsystem — extracted to lua/ue/index/ (F1 phase-1) ────────
+-- The 1300-line INDEX block that lived here moved to lua/ue/index/
+-- (_state / _clangd / _build). The subsystem needs late-bound closures over
+-- chunk-locals that intentionally stay in this file (status/statusline
+-- plumbing + raw IO). status_root_key etc. are forward-declared above and
+-- assigned further below — the closures resolve the upvalues at CALL time,
+-- so binding order is safe.
+INDEX_FN.setup({
+  core_rt = CORE_RT,
+  status_root_key = function(ctx) return status_root_key(ctx) end,
+  clear_index_dirty = function(ctx) return clear_index_dirty(ctx) end,
+  mark_index_dirty = function(ctx) return mark_index_dirty(ctx) end,
+  invalidate_status_cache = function() return invalidate_status_cache() end,
+  refresh_statusline = function() return refresh_statusline() end,
+  read_all = function(p) return read_all(p) end,
+  write_all = function(p, c) return write_all(p, c) end,
+})
+-- Former file-locals still referenced below (clear/mark_index_dirty,
+-- UEIndexModules listing, :UESetProject cleanup) — re-bound from the module.
+local ensure_index_state = INDEX_FN.ensure_index_state
+local save_index_state = INDEX_FN.save_index_state
+local sorted_module_records = INDEX_FN.sorted_module_records
+local module_tier_label = INDEX_FN.module_tier_label
 
 -- Test seams: .clangd sync (engine + external project root).
 function M._sync_one_dot_clangd_for_test(path, file, mount)
@@ -2964,327 +2030,6 @@ function M._sync_dot_clangd_for_test(ctx)
   return INDEX_FN.sync_dot_clangd(ctx)
 end
 
-INDEX_FN.build_phase_async = function(ctx, phase)
-  local state = ensure_index_state(ctx)
-  local root_key = status_root_key(ctx)
-  if INDEX_RT.job then
-    state.queue[phase] = unix_now()
-    save_index_state(ctx, state)
-    return false, "busy"
-  end
-
-  -- Phase split:
-  --   full       → build_full_cdb.py (single entry: rsp + inject + super-unity
-  --                 sidecar + clangd-indexer). Operates on the engine-root
-  --                 base CDB directly; no per-module subset because full == all.
-  --   hot/current → build_clangd_index.py with a per-module subset CDB
-  --                 (per-file entries only — small N, super-unity overhead
-  --                 not worth it).
-  local subset_cdb, selected_keys, err
-  if phase == "full" then
-    selected_keys = {}  -- full has no per-module selection; #selected_keys == 0 is fine
-    local base = INDEX_FN.base_compile_commands_path(ctx)
-    if not base then
-      err = "base compile_commands.json not found at engine root"
-    else
-      subset_cdb = base  -- build_full_cdb.py reads/writes this in place
-    end
-  else
-    subset_cdb, selected_keys, err = INDEX_FN.write_subset_compile_commands(ctx, phase)
-  end
-  if not subset_cdb then
-    state.build = {
-      phase = phase,
-      status = "error",
-      started_at = unix_now(),
-      finished_at = unix_now(),
-      message = err,
-      active_index = state.build and state.build.active_index or "",
-    }
-    save_index_state(ctx, state)
-    invalidate_status_cache()
-    refresh_statusline()
-    return false, err
-  end
-
-  -- Pin to Python 3.12 absolute path on Windows: relying on PATH `python`
-  -- bites us when an outer shell (hermes-aux, uv, conda) injects PYTHONHOME
-  -- pointing at a different minor (3.11/3.14) — child explodes with
-  -- `_sre.MAGIC mismatch` from the stdlib loader. Absolute path + scrubbed
-  -- env is the only reliable combo.
-  local python
-  if _uplat.is_windows then
-    -- Probe well-known per-user / system Python 3.12 install locations.
-    -- Falls back to PATH `python` if nothing matches (caller can override
-    -- via UE_PYTHON env var for non-standard installs).
-    local candidates = {
-      vim.env.UE_PYTHON,
-      vim.fn.expand("~/AppData/Local/Programs/Python/Python312/python.exe"),
-      vim.fn.expand("~/AppData/Local/Programs/Python/Python313/python.exe"),
-      "C:/Python312/python.exe",
-      "C:/Python313/python.exe",
-    }
-    for _, p in ipairs(candidates) do
-      if p and p ~= "" and _ufs.is_file(p) then python = p; break end
-    end
-    python = python or "python"
-  else
-    python = "python3"
-  end
-
-  local tools_dir = vim.fn.stdpath("config") .. "/tools"
-  local build_script
-  if phase == "full" then
-    build_script = tools_dir .. "/build_full_cdb.py"
-  else
-    build_script = tools_dir .. "/build_clangd_index.py"
-  end
-  if not _ufs.is_file(build_script) then
-    return false, build_script .. " not found"
-  end
-
-  local _, out_idx = INDEX_FN.index_phase_paths(ctx, phase)
-  if _ufs.is_file(out_idx) then
-    pcall(vim.fn.delete, out_idx)
-  end
-  local indexer = _uproc.first_executable({
-    "/mnt/c/Program Files/LLVM/bin/clangd-indexer.exe",
-    "clangd-indexer",
-    "clangd-indexer.exe",
-    "C:/Program Files/LLVM/bin/clangd-indexer.exe",
-  })
-
-  local cmd
-  if phase == "full" then
-    -- build_full_cdb.py <src> <dst_active> --idx-output <idx>
-    -- Single entry that produces:
-    --   * dst_active           (per-file CDB for LSP, == src in our wiring)
-    --   * dst_active.indexer   (super-unity sidecar for indexer)
-    --   * idx                  (clangd-indexer output, written from sidecar)
-    cmd = { python, build_script, subset_cdb, subset_cdb, "--idx-output", out_idx }
-    if indexer then
-      cmd[#cmd + 1] = "--indexer"
-      cmd[#cmd + 1] = indexer
-    end
-  else
-    -- hot/current: per-file subset → indexer, no unity/super-unity.
-    cmd = { python, build_script, subset_cdb, "--output", out_idx }
-    if indexer then
-      cmd[#cmd + 1] = "--indexer"
-      cmd[#cmd + 1] = indexer
-    end
-  end
-
-  state.queue[phase] = nil
-  state.build = {
-    phase = phase,
-    status = "running",
-    started_at = unix_now(),
-    finished_at = 0,
-    message = string.format("%s modules=%d", phase, #selected_keys),
-    active_index = state.build and state.build.active_index or "",
-  }
-  save_index_state(ctx, state)
-  invalidate_status_cache()
-  refresh_statusline()
-
-  INDEX_RT.job = { root_key = root_key, phase = phase }
-  -- Defensive env scrub: if our parent (hermes/wt/IDE) injected PYTHONHOME
-  -- pointing at a different python minor than `python` on PATH, the child
-  -- explodes with `_sre.MAGIC mismatch` from the stdlib loader. Strip it.
-  -- IMPORTANT: setting key=nil in vim.fn.environ() is NOT enough — vim.system
-  -- on Windows has been observed inheriting the parent env even when the key
-  -- is removed from the table. Force-overwrite to the empty string so the
-  -- child sees an explicit blank, which Python's site.py treats as unset.
-  local child_env = vim.fn.environ()
-  child_env.PYTHONHOME = ""
-  child_env.PYTHONPATH = ""
-  child_env.PYTHONSTARTUP = ""
-  local t_build_0 = vim.uv.hrtime()
-  vim.system(cmd, { text = true, cwd = ctx.engine_root, env = child_env }, function(result)
-    local elapsed_s = (vim.uv.hrtime() - t_build_0) / 1e9
-    vim.schedule(function()
-      local live_state = ensure_index_state(ctx)
-      INDEX_RT.job = nil
-      local stderr = trim((result.stderr or "") .. "\n" .. (result.stdout or ""))
-      local ok_result = (result.code == 0) and _ufs.is_file(out_idx)
-      -- Persist per-phase timing so :UEIndexTimings (and post-mortem
-      -- inspection of state.json) can answer "how long did the last
-      -- :UEIndexFull take" without relying on console output.
-      live_state.index_timings = live_state.index_timings or {}
-      live_state.index_timings[phase] = {
-        elapsed_s = math.floor(elapsed_s * 100 + 0.5) / 100,
-        modules = #selected_keys,
-        status = ok_result and "ready" or "error",
-        super_unity = (phase == "full"),
-        finished_at = unix_now(),
-      }
-      if ok_result and INDEX_FN.promote_active_index(ctx, out_idx) then
-        -- Keep .clangd's External.File in lockstep with the freshly
-        -- promoted active_index. Without this, clangd reads a stale
-        -- pre-v3-cache-migration path and silently falls back to
-        -- --background-index (17 GB RAM / 32 min CPU symptom).
-        pcall(INDEX_FN.sync_dot_clangd, ctx)
-        INDEX_FN.clear_module_dirty_flags(ctx, selected_keys)
-        live_state.stats[phase .. "_runs"] = (tonumber(live_state.stats[phase .. "_runs"]) or 0) + 1
-        live_state.build = {
-          phase = phase,
-          status = "ready",
-          started_at = live_state.build.started_at or unix_now(),
-          finished_at = unix_now(),
-          message = string.format("%s ready (%d modules) in %.1fs", phase, #selected_keys, elapsed_s),
-          active_index = ctx.paths.active_index,
-        }
-        save_index_state(ctx, live_state)
-        INDEX_FN.maybe_restart_clangd_for_index()
-      else
-        live_state.build = {
-          phase = phase,
-          status = "error",
-          started_at = live_state.build.started_at or unix_now(),
-          finished_at = unix_now(),
-          message = stderr ~= "" and stderr or (phase .. " index build failed"),
-          active_index = live_state.build.active_index or "",
-        }
-        save_index_state(ctx, live_state)
-      end
-      invalidate_status_cache()
-      refresh_statusline()
-      INDEX_FN.try_start_queued_build()
-    end)
-  end)
-
-  return true
-end
-
-INDEX_FN.try_start_queued_build = function()
-  if INDEX_RT.job then
-    return false
-  end
-  local started = false
-  while not INDEX_RT.job do
-    local picked_phase, picked_ctx, picked_state, picked_ts = nil, nil, nil, nil
-    for _, phase_name in ipairs({ "current", "hot", "full" }) do
-      for key, state in pairs(INDEX_RT.module_state or {}) do
-        local queued_at = state and state.queue and state.queue[phase_name]
-        local ctx = INDEX_RT.contexts[key]
-        if queued_at and ctx and (picked_ts == nil or queued_at < picked_ts) then
-          picked_phase = phase_name
-          picked_ctx = ctx
-          picked_state = state
-          picked_ts = queued_at
-        end
-      end
-      if picked_phase then
-        break
-      end
-    end
-    if not picked_phase or not picked_ctx or not picked_state then
-      break
-    end
-    local ok_started = INDEX_FN.build_phase_async(picked_ctx, picked_phase)
-    if ok_started then
-      started = true
-      break
-    end
-    picked_state.queue[picked_phase] = nil
-    save_index_state(picked_ctx, picked_state)
-  end
-  return started
-end
-
-INDEX_FN.schedule_index_phase = function(ctx, phase, delay_ms)
-  if not ctx then
-    return
-  end
-  local state = ensure_index_state(ctx)
-  state.queue[phase] = unix_now()
-  save_index_state(ctx, state)
-  local timer_key = status_root_key(ctx) .. "::" .. phase
-  if INDEX_RT.timers[timer_key] then
-    INDEX_RT.timers[timer_key]:stop()
-    INDEX_RT.timers[timer_key]:close()
-    INDEX_RT.timers[timer_key] = nil
-  end
-  local timer = vim.uv.new_timer()
-  INDEX_RT.timers[timer_key] = timer
-  timer:start(delay_ms, 0, vim.schedule_wrap(function()
-    if INDEX_RT.timers[timer_key] then
-      INDEX_RT.timers[timer_key]:stop()
-      INDEX_RT.timers[timer_key]:close()
-      INDEX_RT.timers[timer_key] = nil
-    end
-    INDEX_FN.build_phase_async(ctx, phase)
-  end))
-end
-
-INDEX_FN.schedule_index_refresh = function(ctx, opts)
-  opts = opts or {}
-  if not ctx or not INDEX_FN.base_compile_commands_path(ctx) then
-    return
-  end
-  if opts.current ~= false then
-    INDEX_FN.schedule_index_phase(ctx, "current", opts.current_delay_ms or INDEX_RT.debounce_current_ms)
-  end
-  if opts.hot then
-    INDEX_FN.schedule_index_phase(ctx, "hot", opts.hot_delay_ms or INDEX_RT.debounce_hot_ms)
-  end
-  if opts.full then
-    INDEX_FN.schedule_index_phase(ctx, "full", opts.full_delay_ms or INDEX_RT.idle_cold_ms)
-  end
-end
-
-INDEX_FN.index_status_summary = function(ctx)
-  local state = ensure_index_state(ctx)
-  local dirty = 0
-  local total = 0
-  local tier_counts = { core = 0, warm = 0, cold = 0 }
-  for _, rec in pairs(state.modules or {}) do
-    total = total + 1
-    local tier = rec.tier or "warm"
-    if tier_counts[tier] ~= nil then
-      tier_counts[tier] = tier_counts[tier] + 1
-    end
-    if rec.dirty then
-      dirty = dirty + 1
-    end
-  end
-  local active_name = "-"
-  local active_tier = "-"
-  local active_kind = "-"
-  if state.active_module and state.modules[state.active_module] then
-    local active = state.modules[state.active_module]
-    active_name = active.name or active_name
-    active_tier = module_tier_label(active.tier)
-    active_kind = active.kind or active_kind
-  end
-  local queued = {}
-  for _, phase_name in ipairs({ "current", "hot", "full" }) do
-    if state.queue and state.queue[phase_name] then
-      queued[#queued + 1] = index_phase_label(phase_name)
-    end
-  end
-  local phase = state.build and state.build.phase or "idle"
-  return {
-    active = active_name,
-    active_tier = active_tier,
-    active_kind = active_kind,
-    dirty = dirty,
-    total = total,
-    core = tier_counts.core,
-    warm = tier_counts.warm,
-    cold = tier_counts.cold,
-    queued = queued,
-    queue_count = #queued,
-    root_dirty = (state.root_dirty or false) or (CORE_RT.dirty_index_roots[status_root_key(ctx)] and true or false),
-    phase = phase,
-    phase_label = index_phase_label(phase),
-    status = state.build and state.build.status or "idle",
-    message = state.build and state.build.message or "",
-    active_index = state.build and state.build.active_index or "",
-    active_index_name = trim(vim.fs.basename(state.build and state.build.active_index or "")),
-  }
-end
 
 local function index_output_paths(ctx)
   local outputs = {}
@@ -6105,6 +4850,55 @@ do
       CORE_RT.freshness_notified[key] = nil
     end
   end
+end
+
+-- ── Foreign-checkout buffer warning (one-shot per root) ───────────────────
+-- Project selection is manual-only (:UESetProject, 2026-07-14): opening a
+-- C++ file from a DIFFERENT checkout never switches the context. Correct,
+-- but the symptom users actually see is "tons of diagnostics after
+-- UEPrepare" — clangd finds no CDB entry for the foreign path and parses
+-- with fallback flags (no UE defines/includes). Detect and say so, once
+-- per foreign root per session.
+CORE_RT.foreign_buffer_notified = CORE_RT.foreign_buffer_notified or {}
+
+-- Pure classifier (unit-tested): is `path` outside BOTH the pinned
+-- project_root and engine_root? Returns nil when inside; otherwise a stable
+-- key for dedup (the first path segment two levels up, best effort).
+function CORE_RT.foreign_buffer_key(path, project_root, engine_root)
+  local p = tostring(path or ""):lower():gsub("\\", "/")
+  if p == "" then return nil end
+  local function inside(root)
+    root = tostring(root or ""):lower():gsub("\\", "/"):gsub("/+$", "")
+    if root == "" then return false end
+    return p == root or p:sub(1, #root + 1) == root .. "/"
+  end
+  if inside(project_root) or inside(engine_root) then return nil end
+  -- Dedup key: parent dir 3 levels up caps notification volume without a
+  -- precise checkout-root heuristic.
+  local dir = p
+  for _ = 1, 3 do dir = dir:match("^(.*)/[^/]+$") or dir end
+  return dir
+end
+
+function CORE_RT.notify_foreign_buffer(ctx, path)
+  if not ctx then return end
+  local key = CORE_RT.foreign_buffer_key(path, ctx.project_root, ctx.engine_root)
+  if not key then return end
+  if CORE_RT.foreign_buffer_notified[key] then return end
+  CORE_RT.foreign_buffer_notified[key] = true
+  vim.schedule(function()
+    vim.notify(
+      ("[ue] this buffer is OUTSIDE the pinned project:\n  file:    %s\n  project: %s\n" ..
+       "clangd has no compile command for it (fallback flags → diagnostic noise).\n" ..
+       "Run :UESetProject <its checkout> if you meant to work there.")
+        :format(path, tostring(ctx.project_root or "?")),
+      vim.log.levels.WARN, { title = "UE", timeout = 8000 })
+  end)
+end
+
+-- Test seam.
+function M._foreign_buffer_key_for_test(path, proot, eroot)
+  return CORE_RT.foreign_buffer_key(path, proot, eroot)
 end
 
 function CORE_RT.grep_live_search_ready(pattern, min_chars)
@@ -9475,29 +8269,37 @@ function M.setup()
     local on = vim.g.ue_grep_trace
     local path = vim.fn.stdpath("state") .. "/ue_grep_trace.log"
 
-    -- Also install a global error sink so any vim.notify(level=ERROR) or
-    -- bare lua error that triggers Windows beep gets captured. We DO NOT
-    -- override vim.notify (noice would warn about that and ding loudly);
-    -- instead we just poll :messages periodically and tee Error/E5/attempt
-    -- patterns to disk.
-    if on and not vim.g._ue_err_sink_installed then
-      vim.g._ue_err_sink_installed = true
+    -- Error sink: poll :messages and tee Error/E5/attempt patterns to disk.
+    -- We DO NOT override vim.notify (noice would warn about that and ding
+    -- loudly). Lifecycle (F5, health-check 2026-07): the timer MUST die with
+    -- the toggle — the previous version installed it forever on first ON
+    -- (500ms `nvim_exec2("messages")` + `messages clear` even after OFF),
+    -- a P5-adjacent leak. Handle lives on CORE_RT so repeated toggles reuse
+    -- one slot; OFF stops AND closes it.
+    if on and not CORE_RT.err_sink_timer then
       local err_log = vim.fn.stdpath("state") .. "/ue_errors.log"
       local f = io.open(err_log, "w")
       if f then f:write("=== installed " .. os.date() .. " ===\n"); f:close() end
-      local timer = vim.loop.new_timer()
-      timer:start(500, 500, vim.schedule_wrap(function()
-        local m = vim.api.nvim_exec2("messages", { output = true }).output or ""
-        if m:find("Error") or m:find("E5") or m:find("attempt")
-           or m:find("aborted") then
-          local fp = io.open(err_log, "a")
-          if fp then
-            fp:write("[poll @" .. os.date() .. "]\n" .. m:sub(-2000) .. "\n---\n")
-            fp:close()
+      local timer = vim.uv.new_timer()
+      if timer then
+        CORE_RT.err_sink_timer = timer
+        timer:start(500, 500, vim.schedule_wrap(function()
+          local m = vim.api.nvim_exec2("messages", { output = true }).output or ""
+          if m:find("Error") or m:find("E5") or m:find("attempt")
+             or m:find("aborted") then
+            local fp = io.open(err_log, "a")
+            if fp then
+              fp:write("[poll @" .. os.date() .. "]\n" .. m:sub(-2000) .. "\n---\n")
+              fp:close()
+            end
+            pcall(vim.cmd, "messages clear")
           end
-          pcall(vim.cmd, "messages clear")
-        end
-      end))
+        end))
+      end
+    elseif not on and CORE_RT.err_sink_timer then
+      pcall(function() CORE_RT.err_sink_timer:stop() end)
+      pcall(function() CORE_RT.err_sink_timer:close() end)
+      CORE_RT.err_sink_timer = nil
     end
 
     vim.notify(string.format("UE grep trace: %s\nlog: %s",
@@ -10225,6 +9027,14 @@ function M.setup()
       if not ctx then
         return
       end
+      -- Foreign-checkout guard: project selection is manual-only (2026-07-14),
+      -- so a C++ buffer from ANOTHER checkout (e.g. pinned project is
+      -- E:/sample/A but the file lives in E:/sample/B) is never auto-switched.
+      -- That is by design — but silently leaving it on clangd fallback flags
+      -- reads as "UEPrepare broken, diagnostics everywhere". Warn once per
+      -- foreign root so the user knows to :UESetProject (or that they opened
+      -- the wrong checkout).
+      CORE_RT.notify_foreign_buffer(ctx, path)
       if INDEX_FN.set_active_module(ctx, path) then
         invalidate_status_cache()
         refresh_statusline()

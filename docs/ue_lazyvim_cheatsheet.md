@@ -894,7 +894,6 @@ auto-cleans the DAP session.
 Active workarounds (see `lua/workarounds/`):
 - `lazyvim.close_with_q_invalid_buf` — guards LazyVim's `q` autocmd
 - `neovide.exit_with_gui` — clean Neovide exit on `:qa`
-- `lazy.float_vimresized_invalid_buf` — Lazy.nvim float resize guard
 - **`clangd.non_file_uri_detach`** — clangd attaches to git/diff/oil
   buffers (e.g. `fugitive://...`, `diffview://...`) and floods the
   notification area with `-32602 clangd only supports file:// URIs`

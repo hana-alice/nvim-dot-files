@@ -94,3 +94,58 @@ t.describe("ue_watch csearch provider 行为（record-only no-op）", function()
     restore()
   end)
 end)
+
+-- ── F2（health-check 2026-07）：dirty set cap 打满必须可见 ──────────────────
+-- 现场：批量 git 操作一次性弄脏 1000+ ThirdParty 文件，cap 裁剪静默丢增量，
+-- overlay 变 lossy 无任何提示。约束：打满 → WARN 一次 + status().capped=true；
+-- clear 后复位。
+local t3 = require("tests.harness")
+t3.describe("ue_watch: persistent_dirty cap 打满可见（F2）", function()
+  local watch = require("utils.ue_watch")
+  -- save_persistent_dirty 无落盘路径时 early-return（裁剪也不会跑）——
+  -- 用真实临时 dirty.json 路径驱动完整 save 路径。
+  local function with_tmp_dirty(fn)
+    local dir = vim.fn.tempname():gsub("\\", "/")
+    vim.fn.mkdir(dir, "p")
+    watch._set_opts_for_test({ dirty_json_path = dir .. "/dirty.json" })
+    fn()
+    watch.clear_persistent_dirty("test:f2-cleanup")
+    watch._set_opts_for_test(nil)
+    pcall(vim.fn.delete, dir, "rf")
+  end
+
+  t3.it("超 cap 裁剪后 status().capped=true，count==cap", function()
+    with_tmp_dirty(function()
+      local flood = {}
+      for i = 1, 1100 do flood[i] = ("D:/x/f%04d.cpp"):format(i) end
+      watch._seed_persistent_dirty_for_test(flood)
+      watch._save_persistent_dirty_for_test()
+      local st = watch.persistent_dirty_status() or {}
+      t3.assert_eq(st.count, st.cap, "裁剪后 count 应等于 cap")
+      t3.assert_true(st.capped, "打满后 capped 标志必须为 true（overlay lossy 可见）")
+    end)
+  end)
+
+  t3.it("clear 后 capped 复位为 false", function()
+    with_tmp_dirty(function()
+      local flood = {}
+      for i = 1, 1100 do flood[i] = ("D:/y/g%04d.cpp"):format(i) end
+      watch._seed_persistent_dirty_for_test(flood)
+      watch._save_persistent_dirty_for_test()
+      watch.clear_persistent_dirty("test:f2-reset")
+      local st = watch.persistent_dirty_status() or {}
+      t3.assert_eq(st.count, 0)
+      t3.assert_false(st.capped, "clear 后 capped 必须复位")
+    end)
+  end)
+
+  t3.it("未超 cap 时 capped 保持 false", function()
+    with_tmp_dirty(function()
+      watch._seed_persistent_dirty_for_test({ "D:/z/a.cpp", "D:/z/b.cpp" })
+      watch._save_persistent_dirty_for_test()
+      local st = watch.persistent_dirty_status() or {}
+      t3.assert_eq(st.count, 2)
+      t3.assert_false(st.capped)
+    end)
+  end)
+end)

@@ -62,6 +62,8 @@ require("utils.recent_projects").setup()
 require("workarounds").setup({ auto_apply = false })
 require("workarounds.lazyvim.close_with_q_invalid_buf").apply()
 require("workarounds.neovide.exit_with_gui").apply()
-require("workarounds.lazy.float_vimresized_invalid_buf").apply()
+-- NOTE: workarounds.lazy.float_vimresized_invalid_buf removed 2026-07-26 —
+-- upstream lazy.nvim float.lua VimResized callback now guards win+buf
+-- validity itself (health-check F6; K21 retired).
 require("workarounds.clangd.non_file_uri_detach").apply()
 require("ue").setup()

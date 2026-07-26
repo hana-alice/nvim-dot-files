@@ -124,3 +124,41 @@ t.describe("ue.resolve_context project selection", function()
     end
   end)
 end)
+
+-- ── foreign-checkout buffer 识别（2026-07-24）────────────────────────────
+-- 症状：pin 在 A checkout，打开 B checkout 的同名文件 → clangd fallback flags
+-- → 满屏 diagnostics，被误读为「UEPrepare 坏了」。分类器必须准确区分内/外。
+local t2 = require("tests.harness")
+t2.describe("ue.foreign_buffer_key（跨 checkout buffer 识别）", function()
+  local ue = require("ue")
+
+  t2.it("pinned project 内的文件 → nil（不告警）", function()
+    t2.assert_nil(ue._foreign_buffer_key_for_test(
+      "E:/aki/projA/Source/Client/X.cpp", "E:/aki/projA", "D:/engine"))
+  end)
+
+  t2.it("engine root 内的文件 → nil", function()
+    t2.assert_nil(ue._foreign_buffer_key_for_test(
+      "D:/engine/Engine/Source/Y.cpp", "E:/aki/projA", "D:/engine"))
+  end)
+
+  t2.it("两个根都不含 → 返回稳定 dedup key", function()
+    local k1 = ue._foreign_buffer_key_for_test(
+      "E:/aki/projB/Source/Client/Plugins/K/A.cpp", "E:/aki/projA", "D:/engine")
+    local k2 = ue._foreign_buffer_key_for_test(
+      "E:/aki/projB/Source/Client/Plugins/K/B.cpp", "E:/aki/projA", "D:/engine")
+    t2.assert_true(k1 ~= nil, "外部文件应产生 key")
+    t2.assert_eq(k1, k2, "同一外部目录下的文件应共用 dedup key")
+  end)
+
+  t2.it("前缀相似但非子路径不误判为内部（projA vs projA_debug）", function()
+    t2.assert_true(ue._foreign_buffer_key_for_test(
+      "E:/aki/projA_debug/Source/X.cpp", "E:/aki/projA", "D:/engine") ~= nil,
+      "projA_debug 不是 projA 的子路径，必须判外部")
+  end)
+
+  t2.it("大小写/分隔符归一：反斜杠大写盘符视为内部", function()
+    t2.assert_nil(ue._foreign_buffer_key_for_test(
+      [[E:\AKI\projA\Source\X.cpp]], "e:/aki/proja", "D:/engine"))
+  end)
+end)

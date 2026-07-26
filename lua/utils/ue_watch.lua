@@ -465,14 +465,32 @@ local function save_persistent_dirty()
   -- Cap: drop oldest entries (= lex-smallest after sort, which is *not* truly
   -- LRU but close enough — UE paths share long prefixes so lex-sort is
   -- file-locality-friendly). Re-prepare resets this anyway.
+  --
+  -- F2 (health-check 2026-07): a cap hit means the overlay is now LOSSY —
+  -- freshness may claim files greppable that were silently dropped. This
+  -- MUST be loud (WARN, once per session until cleared), and the status()
+  -- surface exposes `capped` so :UEWatchStatus / pickers can see it.
+  -- Observed real flood: a bulk git operation dirtied 1000+ ThirdParty
+  -- test files (openexr/zlib) in one shot; the set stayed pinned at cap
+  -- with zero indication anywhere.
   if #arr > PERSISTENT_DIRTY_CAP then
+    local dropped = #arr - PERSISTENT_DIRTY_CAP
     local trimmed = {}
-    local start = #arr - PERSISTENT_DIRTY_CAP + 1
+    local start = dropped + 1
     for i = start, #arr do trimmed[#trimmed + 1] = arr[i] end
     arr = trimmed
     -- Rebuild in-memory set from the cap to keep the two views in sync.
     state.persistent_dirty = {}
     for _, abs in ipairs(arr) do state.persistent_dirty[abs:lower()] = abs end
+    state._dirty_capped = true
+    if not state._warned_dirty_capped then
+      state._warned_dirty_capped = true
+      vim.schedule(function()
+        log_warn(("dirty set hit cap=%d — %d oldest entries DROPPED; grep overlay is now lossy. "
+          .. "Run :UEPrepare (or :UEPrepareIncremental) to reindex and reset.")
+          :format(PERSISTENT_DIRTY_CAP, dropped))
+      end)
+    end
   end
   -- Atomic write: tmp + rename.
   local dir = vim.fn.fnamemodify(p, ":h")
@@ -527,6 +545,8 @@ function M.clear_persistent_dirty(reason)
   state.persistent_dirty = {}
   state.persistent_dirty_loaded = true
   state._warned_dirty_high = false
+  state._warned_dirty_capped = false
+  state._dirty_capped = false
   local p = persistent_dirty_path()
   if p then
     -- Empty array, atomic write.
@@ -553,6 +573,9 @@ function M.persistent_dirty_status()
     path = persistent_dirty_path(),
     cap = PERSISTENT_DIRTY_CAP,
     warn_at = PERSISTENT_DIRTY_WARN,
+    -- F2: true once the cap has trimmed entries since the last clear —
+    -- the overlay is LOSSY until the next successful :UEPrepare.
+    capped = state._dirty_capped or false,
   }
 end
 
@@ -587,6 +610,12 @@ M._seed_persistent_dirty_for_test = function(paths)
   state.persistent_dirty_loaded = true
   state.persistent_dirty = {}
   for _, p in ipairs(paths or {}) do state.persistent_dirty[tostring(p):lower()] = p end
+end
+
+-- Test seam (F2): run the save path (cap trim + capped flag) on the current
+-- in-memory set without needing a real dirty_json_path write target.
+M._save_persistent_dirty_for_test = function()
+  save_persistent_dirty()
 end
 
 return M

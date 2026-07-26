@@ -265,6 +265,21 @@
   → `lua/ue/dap/android.lua` `_start_liveness_poller`; `lua/utils/stall_probe.lua`;
     `docs/changelog.md` 2026-07-24（卡顿修复条目）
 
+- **K42 — gitsigns watch_gitdir × git fsmonitor = 自激振荡 spawn 循环 → 全程 UI 卡顿**
+  症状: `<C-f>/<C-b>` 翻页、picker 输入持续卡顿；stall train 在 DAP 会话结束后仍在
+  （排除 K40 后仍 ~40 stalls/min）。jit.profile 8s 采样实锤: gitsigns async spawn +
+  `git/repo/watcher.lua` 占主循环 ~1600/4300 样本。
+  根因: 本机 UE 仓开了 **git fsmonitor**（`core.fsmonitor=true`）。每次 git 子进程运行都
+  会在 `.git/` 里落 fsmonitor cookie 文件 → gitsigns 的 gitdir watcher 观察到变化 →
+  refresh → spawn git → 又落 cookie → watcher 再触发——自激振荡，永不收敛。Windows 上
+  每次 spawn 主循环开销数十 ms，叠加 200ms 的 current_line_blame（每次悬停一个
+  `git blame -L` spawn）雪上加霜。
+  解决约束: 本机 gitsigns **必须 `watch_gitdir.enable=false`**（外部 git 操作靠
+  BufWritePost/FocusGained 刷新，可接受）；`current_line_blame_opts.delay` ≥ 500ms。
+  诊断入口: `jit.profile` 8s 采样（`profe_prof` 模式脚本）看 spawn 栈占比；或
+  `:StallReport` 排除 DAP 后仍有 train 即怀疑 watcher 类自激。
+  → `lua/plugins/gitsigns.lua`; `docs/changelog.md` 2026-07-24（gitsigns 卡顿条目）
+
 ### 工具链 / LLVM
 
 - **K41 — 跨盘 project root 缺 `.clangd` → UEPrepare 后 clangd background-index 吃满 CPU/内存**
@@ -298,7 +313,7 @@
   git log（`b9cce1d` merge `feat/lldb-dap-migration`、
   `7c70462`、release_1.0.3）
 
-### snacks / clangd / lazy（活跃 workaround，共 9 个文件）
+### snacks / clangd / lazy（活跃 workaround，共 8 个文件）
 
 - **K16 — snacks picker 冷启动首开卡死**
   症状: Neovide 冷启后第一次开 picker 卡约 1s。
@@ -321,10 +336,12 @@
   `clangd: -32602: ... clangd only supports file:// URIs`；Neovide 上每次 notify 强制重绘更糟。
   → `lua/workarounds/clangd/non_file_uri_detach.lua`（已在 `init.lua` eager apply）
 
-- **K21 — Lazy float 在 VimResized 时 invalid buffer**
+- **K21 — Lazy float 在 VimResized 时 invalid buffer（已退役 2026-07-26）**
   症状: 刚关掉 Lazy float 后窗口 resize（Neovide 启动 / zen-mode / split），报
   `lazy/view/float.lua:180: Invalid buffer id: N`。
-  → `lua/workarounds/lazy/float_vimresized_invalid_buf.lua`（init.lua eager apply）
+  现状: 上游 lazy.nvim（本机 stable）`float.lua` VimResized 回调已自带 win+buf
+  双重 validity guard（校验失败 return true 自删 autocmd）——workaround 已删除
+  （health-check 2026-07 F6）。若上游回归，按原 frontmatter 重建。
 
 - **K22 — `q` 关闭已失效 buffer**
   症状: 在 snacks/noice picker 候选间导航、或 notify 气泡快速消失时报

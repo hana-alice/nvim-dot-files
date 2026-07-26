@@ -30,6 +30,7 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 | 子系统 | 位置 | 本地规则（内容源） | 一句话 |
 |---|---|---|---|
 | UE 引擎中枢 | `lua/ue.lua` + `lua/ue/` | `lua/ue/AGENTS.md` | 索引 / CDB / DAP / 命令注册的中枢 |
+| clangd 离线索引 | `lua/ue/index/` | `lua/ue/index/AGENTS.md` | current/hot/full 三相索引 + .clangd 同步（F1 切分） |
 | CDB 流水线 | `lua/ue/cdb/` | `lua/ue/cdb/AGENTS.md` | compile_commands.json 生成/裁剪/注入 |
 | DAP 调试 | `lua/ue/dap/` | `lua/ue/dap/AGENTS.md` | codelldb + Android platform 模式 |
 | goto 解析栈 | `lua/utils/ue_goto/` | `lua/utils/ue_goto/AGENTS.md` | 5 层 fallback：TS→cache→clangd→csearch→gtags |

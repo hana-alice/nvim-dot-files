@@ -48,10 +48,10 @@ LLVM 22.0–22.1.5 的 `lldb-dap.exe` Windows 启动崩（`STATUS_STACK_BUFFER_O
 吃满 CPU/内存，`sync_dot_clangd` 须 engine+project 双写（K41）。
 → `../docs/CONSTRAINTS.md §二 工具链/LLVM`；`../docs/TOOLING.md`
 
-### snacks / clangd / lazy（K16–K24，活跃 workaround）
+### snacks / clangd / lazy（K16–K24，活跃 workaround；K21 已退役 2026-07-26）
 picker 冷启卡死、projects picker 卡数十秒、str_byteindex 越界、smart picker 死 buffer、
-clangd 非 `file://` URI 刷屏、Lazy float invalid buffer、`q` 关失效 buffer、
-Neovide 残留进程、blink.cmp 换行破坏 undo。
+clangd 非 `file://` URI 刷屏、~~Lazy float invalid buffer~~（上游已修，workaround 删除）、
+`q` 关失效 buffer、Neovide 残留进程、blink.cmp 换行破坏 undo。
 → 各 `lua/workarounds/<scope>/*.lua` frontmatter（权威）；`../docs/CONSTRAINTS.md §二 snacks/clangd/lazy`
 
 ### goto-def / cursor（K25）

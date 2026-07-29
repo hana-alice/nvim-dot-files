@@ -25,6 +25,7 @@ pwsh -File scripts/run_regression.ps1       # 本机一键（转发 + 退出码�
 | 改动位置 | 最小必跑 filter |
 |---|---|
 | `lua/config/keymaps.lua` / 命令定义 | `keymaps` `commands` |
+| `lua/utils/android_device.lua` / Android ADB device 路由 | `android_device` `dap` `ue_context` |
 | `lua/ue/config.lua`（schema） | `ue_config` `smoke` |
 | `lua/ue.lua` 项目选择 / context 解析 | `ue_project_context` `ue_api` `smoke` |
 | `lua/ue/cdb/**` | `ue_cdb` |

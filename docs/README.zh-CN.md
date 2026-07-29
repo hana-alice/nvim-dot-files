@@ -150,7 +150,8 @@ go install ./...   # 需 Go >= 1.22，且 $GOBIN 在 PATH
 | 编译（当前平台） | `<leader>ub` / `:UEBuild` |
 | 启动 Editor | `:UELaunch` |
 | 增删文件后重建索引 | `:UEPrepareIncremental` |
-| Android：安装 / attach / 断点 | `:UEInstallAndroid` / `:UEDAPAttach` / `F9` |
+| Android：选择设备（名称 + serial，会话全局） | `<leader>uA` / `:UESetAndroidDevice` |
+| Android：在所选设备安装 / attach / 断点 | `<leader>ui` / `:UEDAPAttach` / `F9` |
 | 后台任务：列出 / 停止 | `<leader>X` / `:Tasks` / `:TaskStopAll` |
 | 全部命令速查 | `<leader>?` / `:UECheatsheet` |
 

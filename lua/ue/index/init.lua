@@ -10,8 +10,9 @@
 --   * `M.setup(deps)` MUST be called (ue.lua does, right where the old block
 --     lived) before any index operation runs. deps carries closures over
 --     ue.lua-local functions that intentionally stayed behind:
---     status_root_key / clear_index_dirty / mark_index_dirty /
---     invalidate_status_cache / refresh_statusline / read_all / write_all,
+--     plugin/project/engine scope resolvers / status_root_key /
+--     clear_index_dirty / mark_index_dirty / invalidate_status_cache /
+--     refresh_statusline / read_all / write_all,
 --     plus `core_rt` (the CORE_RT table reference).
 --   * Submodules are loader-style `return function(M, core)` so they share
 --     one internal namespace without globals: core.h = shared helpers

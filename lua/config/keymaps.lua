@@ -200,6 +200,7 @@ end
 local function apply_ue_runtime_overrides()
   local opts = { nowait = true }
 
+  map("n", "<leader>uA", "<cmd>UESetAndroidDevice<cr>", vim.tbl_extend("force", opts, { desc = "UE: Select global Android device" }))
   map("n", "<leader>ub", "<cmd>UEBuild<cr>", vim.tbl_extend("force", opts, { desc = "UE: Build (platform from UESetPlatform)" }))
   map("n", "<leader>ug", "<cmd>UELogToggle<cr>", vim.tbl_extend("force", opts, { desc = "UE: Toggle app log" }))
   map("n", "<leader>ui", "<cmd>UEInstallAndroid<cr>", vim.tbl_extend("force", opts, { desc = "UE: Install APK to device" }))
@@ -263,6 +264,7 @@ map("n", "<leader>bc", close_current_target, { desc = "Buffer/Window: Smart clos
 map("n", "<leader>bn", "<cmd>confirm enew<cr>", { desc = "Buffer: New empty buffer" })
 -- Static UE keymaps. Keys that need {nowait=true} are set by
 -- apply_ue_runtime_overrides() on VeryLazy (see below).
+map("n", "<leader>uA", "<cmd>UESetAndroidDevice<cr>", { desc = "UE: Select global Android device" })
 map("n", "<leader>uB", "<cmd>UEPrepare<cr>", { desc = "UE: Prepare symbols + compile_commands" })
 map("n", "<leader>uc", "<cmd>UEExportCompileCommands<cr>", { desc = "UE: Export compile_commands" })
 map("n", "<leader>uP", "<cmd>UESetProject<cr>", { desc = "UE: Set project" })

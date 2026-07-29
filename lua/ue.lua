@@ -2007,6 +2007,9 @@ local status_root_key, clear_index_dirty, mark_index_dirty, invalidate_status_ca
 -- so binding order is safe.
 INDEX_FN.setup({
   core_rt = CORE_RT,
+  plugin_scope_from_root = plugin_scope_from_root,
+  project_module_scope = project_module_scope,
+  engine_module_scope = engine_module_scope,
   status_root_key = function(ctx) return status_root_key(ctx) end,
   clear_index_dirty = function(ctx) return clear_index_dirty(ctx) end,
   mark_index_dirty = function(ctx) return mark_index_dirty(ctx) end,
@@ -6862,10 +6865,14 @@ function M.ai_context(engine_root)
   local target_name = build_target_name(project_root, uproject, kind)
   local build_command, build_error = android_build_command(ctx)
   local apk = find_apk(ctx)
-  local install_command = apk and { "adb", "install", "-r", to_windows_path(apk) or apk } or nil
+  local selected_android_serial = require("utils.android_device").get()
+  local install_command = apk and selected_android_serial and require("utils.android_device").adb_args(
+    "adb", selected_android_serial, { "install", "-r", to_windows_path(apk) or apk }) or nil
   local install_native_action
   if not apk then
     install_native_action = "No APK found under the active uproject build outputs."
+  elseif not selected_android_serial then
+    install_native_action = "Android device is not selected; run :UESetAndroidDevice."
   end
 
   return {
@@ -6875,6 +6882,7 @@ function M.ai_context(engine_root)
     project_root = project_root,
     uproject = uproject,
     state_path = ctx.paths.state,
+    android_device_serial = selected_android_serial,
     state = {
       target_platform = state.target_platform,
       target_configuration = state.target_configuration,
@@ -6985,6 +6993,10 @@ function M.toggle_debug_log()
   return require("utils.ue_logs").toggle_debug_log(ue_runtime_env())
 end
 
+local function android_install_argv(adb, serial, apk)
+  return require("utils.android_device").adb_args(adb, serial, { "install", "-r", apk })
+end
+
 local function install_android()
   local ctx, err = resolve_context()
   if not ctx then
@@ -7002,7 +7014,21 @@ local function install_android()
     return
   end
 
+  local android_device = require("utils.android_device")
+  local serial = android_device.get()
+  if not serial then
+    android_device.ensure({ prompt = "Select Android device for APK install:" }, function(selected)
+      if selected then install_android() end
+    end)
+    return
+  end
+
   local apk_win = to_windows_path(apk) or apk
+  local install_cmd, install_err = android_install_argv("adb", serial, apk_win)
+  if not install_cmd then
+    require("utils.log").notify_error("ue.android", install_err)
+    return
+  end
   local mtime = vim.fn.getftime(apk)
   local age = os.time() - mtime
   local age_str
@@ -7015,7 +7041,8 @@ local function install_android()
   end
 
   local progress = require("fidget.progress")
-  local install_start_msg = ("Installing APK: %s (built %s)"):format(vim.fn.fnamemodify(apk_win, ":t"), age_str)
+  local install_start_msg = ("Installing APK: %s (built %s) on %s"):format(
+    vim.fn.fnamemodify(apk_win, ":t"), age_str, serial)
   pcall(function()
     require("utils.notification_history").record({
       scope = "ue.install",
@@ -7045,7 +7072,7 @@ local function install_android()
   -- just "Failed (exit 1)" and lose the actual "Failure [INSTALL_FAILED_*]"
   -- line that adb prints).
   local stdout_lines, stderr_lines = {}, {}
-  local install_jobid = vim.fn.jobstart({ "adb", "install", "-r", apk_win }, {
+  local install_jobid = vim.fn.jobstart(install_cmd, {
     stdout_buffered = true,
     stderr_buffered = true,
     on_stdout = function(_, data)
@@ -7113,13 +7140,13 @@ local function install_android()
         -- an actionable next step inline, without having to grep docs.
         local hint
         if summary:find("INSTALL_FAILED_UPDATE_INCOMPATIBLE") then
-          hint = "→ run: adb uninstall <your.package.id>  (signature mismatch from leftover PMS record)"
+          hint = ("→ run: adb -s %s uninstall <your.package.id>  (signature mismatch from leftover PMS record)"):format(serial)
         elseif summary:find("INSTALL_FAILED_INSUFFICIENT_STORAGE") then
-          hint = "→ free space on /data or use adb install -r -d"
+          hint = ("→ free space on /data or use adb -s %s install -r -d"):format(serial)
         elseif summary:find("INSTALL_FAILED_VERSION_DOWNGRADE") then
-          hint = "→ downgrade blocked; use adb install -r -d (allow downgrade) or uninstall first"
+          hint = ("→ downgrade blocked; use adb -s %s install -r -d (allow downgrade) or uninstall first"):format(serial)
         elseif summary:find("INSTALL_FAILED_NO_MATCHING_ABIS") then
-          hint = "→ ABI mismatch (e.g. arm64 APK on x86 device); check device ABI with: adb shell getprop ro.product.cpu.abi"
+          hint = ("→ ABI mismatch; check device ABI with: adb -s %s shell getprop ro.product.cpu.abi"):format(serial)
         elseif summary:find("INSTALL_PARSE_FAILED") then
           hint = "→ APK corrupt or unsigned; rebuild + re-sign"
         elseif summary:find("device offline") or summary:find("no devices/emulators") then
@@ -8231,6 +8258,10 @@ M.setup_dap = dap_mod.setup_dap
 -- SETUP — user commands, autocmds, statusline timer
 -- ==========================================================================
 
+function M._android_install_argv_for_test(adb, serial, apk)
+  return android_install_argv(adb, serial, apk)
+end
+
 function M.setup()
   if CORE_RT.setup_done then
     return
@@ -8255,6 +8286,16 @@ function M.setup()
   vim.api.nvim_create_user_command("UESetAndroidPackage", function(opts)
     set_android_package(opts.args)
   end, { nargs = "?" })
+  vim.api.nvim_create_user_command("UESetAndroidDevice", function()
+    require("utils.android_device").select({
+      prompt = "Select global Android device:",
+    }, function(serial, device)
+      if serial then
+        vim.notify(("Android device selected: %s"):format(
+          require("utils.android_device").format_item(device)), vim.log.levels.INFO)
+      end
+    end)
+  end, { desc = "Select the session-global Android device (name + serial)" })
   vim.api.nvim_create_user_command("UESetUprojectRelativePath", function(opts)
     set_uproject_relative_path_command(opts.args)
   end, {

@@ -33,6 +33,7 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 | clangd 离线索引 | `lua/ue/index/` | `lua/ue/index/AGENTS.md` | current/hot/full 三相索引 + .clangd 同步（F1 切分） |
 | CDB 流水线 | `lua/ue/cdb/` | `lua/ue/cdb/AGENTS.md` | compile_commands.json 生成/裁剪/注入 |
 | DAP 调试 | `lua/ue/dap/` | `lua/ue/dap/AGENTS.md` | codelldb + Android platform 模式 |
+| Android device | `lua/utils/android_device.lua` | `lua/utils/AGENTS.md` | 名称+serial picker；会话全局 serial；统一 `adb -s` |
 | goto 解析栈 | `lua/utils/ue_goto/` | `lua/utils/ue_goto/AGENTS.md` | 5 层 fallback：TS→cache→clangd→csearch→gtags |
 | 代码搜索 | `lua/utils/code_search/` | `lua/utils/code_search/AGENTS.md` | csearch 亚秒级 grep（兜底，非主路） |
 | 平台驱动 | `lua/utils/platform/` | `lua/utils/platform/AGENTS.md` | 唯一允许做 OS 分支的地方 |

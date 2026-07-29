@@ -16,8 +16,8 @@ active index promote / `.clangd` 双写同步（`_clangd`）。
   `return function(M, core)`——共享 `core.h`（helpers）/ `core.RT`（运行时）/
   `core.deps`（ue.lua 注入的闭包），不引全局。
 - **`M.setup(deps)` 必须先于任何索引操作**（ue.lua 在原块位置调用）。deps 是
-  对 ue.lua chunk-local 的 late-bound 闭包（status_root_key / *_index_dirty /
-  statusline 刷新 / read_all / write_all / core_rt）。新增依赖走 deps，
+  对 ue.lua chunk-local 的 late-bound 闭包（scope resolvers / status_root_key /
+  *_index_dirty / statusline 刷新 / read_all / write_all / core_rt）。新增依赖走 deps，
   不得反向 `require("ue")`（会循环）。
 - `M._rt` 与 ue.lua 的 `INDEX_RT` 是**同一张表**（活引用）；:UESetProject
   清理、status cache 直接改它。别做防御性拷贝。

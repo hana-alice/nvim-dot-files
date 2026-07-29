@@ -512,6 +512,7 @@ local tabs = {
         title = "Setup & Prepare",
         mappings = {
           { "<leader>uP",    "UESetProject (project + engine)" },
+          { "<leader>uA",    "Select Android device (name + serial)" },
           { ":UESetPlatform","Select platform + config" },
           { "<leader>ub",    "UEBuild (build current platform)" },
           { "<leader>uB",    "UEPrepare (CDB + index + clangd)" },
@@ -523,7 +524,7 @@ local tabs = {
       {
         title = "Run / Logs",
         mappings = {
-          { "<leader>ui",   "Install APK to device" },
+          { "<leader>ui",   "Install APK to selected device" },
           { "<leader>ul",   "Launch app (no debug)" },
           { "<leader>ug/uL","Toggle app log" },
           { "<leader>uD",   "Toggle Win debug log" },

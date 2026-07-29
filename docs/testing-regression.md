@@ -14,6 +14,7 @@
 | 改动位置 | 最小必跑 filter |
 |---|---|
 | `lua/config/keymaps.lua` / 命令定义 | `keymaps` `commands` |
+| `lua/utils/android_device.lua` / Android ADB device 路由 | `android_device` `dap` `ue_context` |
 | `lua/ue/config.lua`（schema） | `ue_config` `smoke` |
 | `lua/ue.lua` 项目选择 / context 解析 | `ue_project_context` `ue_api` `smoke` |
 | `lua/ue/cdb/**` | `ue_cdb` |
@@ -84,6 +85,7 @@ tests/
 ├── harness/init.lua     # 纯 Lua 框架：断言 + describe/it + 报告 + 自举
 └── cases/
     ├── smoke_spec.lua            # 配置加载冒烟 + ue.setup() 命令注册
+    ├── android_device_spec.lua   # Android device picker + 全局 serial + adb -s 路由
     ├── platform_spec.lua         # utils.platform 四驱动接口契约
     ├── ue_api_spec.lua           # ue 公共表/函数冻结
     ├── ue_config_spec.lua        # ue.config schema 默认值/override/reset
@@ -91,7 +93,7 @@ tests/
     ├── dap_spec.lua              # ue.dap.platforms 注册 + 各平台 attach/launch
     ├── utils_spec.lua            # utils.code_search/log/ue_paths/ue_goto 加载
     ├── keymaps_spec.lua          # 快捷键绑定（DAP 功能键多模式 / leader / gd/gr/gc / Win <C-v>）
-    ├── commands_spec.lua         # 69 个 UE* 命令 + Restart/Workaround* 注册（冻结清单）
+    ├── commands_spec.lua         # 70 个 UE* 命令 + Restart/Workaround* 注册（冻结清单）
     ├── options_spec.lua          # expandtab/shiftwidth/number/sessionoptions
     ├── autocmds_spec.lua         # usf→hlsl、cindent 切换、commentstring 回退
     ├── workarounds_spec.lua      # 注册表发现/无 error/frontmatter/status 形状
@@ -106,6 +108,7 @@ tests/
 | 功能域 | 用例文件 | 覆盖口径 |
 |--------|----------|----------|
 | 配置加载 | smoke_spec | 关键模块 require + setup 不报错 |
+| Android device | android_device_spec | `adb devices -l` 解析、名称+serial picker、全局 serial、install/launch/logcat/DAP `-s` 路由 |
 | 平台驱动 | platform_spec | 四驱动接口形状一致 |
 | ue API | ue_api_spec | 公共表/函数冻结 |
 | ue.config | ue_config_spec | 默认值/override/reset |
@@ -134,7 +137,7 @@ leader 必须先于 `dofile` 设置，否则 `<leader>xx` 会以字面 `<leader>
 
 ### 命令冻结清单维护约定
 
-`commands_spec.lua` 内的 `UE_COMMANDS` 是 69 个 `UE*` 命令的**冻结清单**。新增或重命名 `UE*` 命令时**必须同步**此清单——这是有意的「防误删」契约：清单与实际注册不一致即 FAIL。
+`commands_spec.lua` 内的 `UE_COMMANDS` 是 70 个 `UE*` 命令的**冻结清单**。新增或重命名 `UE*` 命令时**必须同步**此清单——这是有意的「防误删」契约：清单与实际注册不一致即 FAIL。
 
 
 

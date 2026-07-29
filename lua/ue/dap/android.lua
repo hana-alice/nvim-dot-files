@@ -45,11 +45,14 @@
 --   * Optional: source-map entries (DAP "sourceMap") so DWARF build-machine
 --     paths (e.g. D:\project\uetemp\Engine\) resolve to the local checkout.
 
-local C   = require("ue.dap._common")
-local fs  = require("ue.core.fs")
-local log = require("utils.log")
+local C              = require("ue.dap._common")
+local fs             = require("ue.core.fs")
+local log            = require("utils.log")
+local android_device = require("utils.android_device")
 
 local M = {}
+
+local UE_MODULE_BASENAME = "libUE4.so"
 
 -- ── shared session state ──────────────────────────────────────────────────
 M._session = {
@@ -316,22 +319,33 @@ local function pick_symbol_lib(ctx)
         if fs.is_file(p) then return p end
       end
     end
-    -- 3. Glob over all symbol packages, pick the newest by mtime (best
-    --    guess when no packageInfo or no exact match).
-    local glob_patterns = {}
-    if android_dir then
-      vim.list_extend(glob_patterns, {
-        android_dir .. "/*Symbols*/Client-arm64/libUE4.so",
-        android_dir .. "/*Symbols*/Client-arm64/libUnreal.so",
-      })
+    -- 3. Scan all symbol packages, pick the newest by mtime (best guess
+    --    when no packageInfo or no exact match). Use fs.dir for the immediate
+    --    package directories: vim.fn.glob wildcard expansion is unreliable
+    --    for Windows short (8.3) temp paths, including headless tests.
+    local discovered = {}
+    if android_dir and fs.is_dir(android_dir) then
+      for name, kind in vim.fs.dir(android_dir) do
+        if kind == "directory" and name:find("Symbols", 1, true) then
+          discovered[#discovered + 1] = android_dir .. "/" .. name .. "/Client-arm64/libUE4.so"
+          discovered[#discovered + 1] = android_dir .. "/" .. name .. "/Client-arm64/libUnreal.so"
+        end
+      end
     end
-    vim.list_extend(glob_patterns, {
+    local glob_patterns = {
       proot .. "/Source/Client/Intermediate/Android/arm64/jni/arm64-v8a/libUE4.so",
       proot .. "/Source/Client/Intermediate/Android/arm64/jni/arm64-v8a/libUnreal.so",
       proot .. "/Intermediate/Android/arm64/jni/arm64-v8a/libUE4.so",
       proot .. "/Intermediate/Android/arm64/jni/arm64-v8a/libUnreal.so",
-    })
+    }
     local best_path, best_mtime = nil, -1
+    for _, path in ipairs(discovered) do
+      if fs.is_file(path) then
+        local st = vim.uv and vim.uv.fs_stat(path)
+        local mt = (st and st.mtime and st.mtime.sec) or 0
+        if mt > best_mtime then best_path, best_mtime = path, mt end
+      end
+    end
     for _, pat in ipairs(glob_patterns) do
       local hit = vim.fn.glob(pat)
       if hit and hit ~= "" then
@@ -460,88 +474,23 @@ local function append_bp_diag(lines)
 end
 
 
--- Parse `adb devices` into { {serial, status, model?}, ... }.
--- status ∈ { "device", "unauthorized", "offline", "no permissions", ... }
-local function list_devices(adb)
-  local out = adb_run(adb, { "devices", "-l" })
-  local rows = {}
-  for line in out:gmatch("[^\n]+") do
-    if not line:match("^List of devices") and line ~= "" then
-      local serial, status, rest = line:match("^(%S+)%s+(%S+)%s*(.*)$")
-      if serial and status and serial ~= "List" then
-        local model = rest and rest:match("model:(%S+)") or nil
-        rows[#rows + 1] = { serial = serial, status = status, model = model }
-      end
-    end
-  end
-  return rows
-end
-
--- Resolve the adb serial to use for this session.
--- Behavior (per user policy "多设备你给我选,不要自己决定"):
---   * 0 ready devices  → notify + nil (with hints for unauthorized/offline)
---   * 1 ready device   → return it silently
---   * >1 ready devices → vim.ui.select, ALWAYS prompt, never cache a default
--- `done(serial|nil)` is called with the picked serial or nil on cancel/empty.
--- Returns the serial synchronously when possible (0 or 1 device); for the
--- multi-device case it returns nil and dispatches `done` asynchronously.
+-- Device discovery/selection is shared with install, launch, and logcat.
+-- It always presents model/name + serial, even when only one device is ready,
+-- and persists the user's choice in vim.g.ue_android_device_serial.
 local function pick_serial_async(adb, done)
-  local rows = list_devices(adb)
-  local ready, not_ready = {}, {}
-  for _, r in ipairs(rows) do
-    if r.status == "device" then ready[#ready + 1] = r
-    else not_ready[#not_ready + 1] = r end
-  end
-
-  if #ready == 0 then
-    if #not_ready > 0 then
-      local parts = {}
-      for _, r in ipairs(not_ready) do
-        local hint = r.status
-        if r.status == "unauthorized" then
-          hint = "unauthorized (tap 'Allow USB debugging' on device)"
-        elseif r.status == "offline" then
-          hint = "offline (try `adb kill-server && adb devices`)"
-        end
-        parts[#parts + 1] = string.format("  %s  %s", r.serial, hint)
-      end
-      vim.notify("No ready Android device. Detected:\n" .. table.concat(parts, "\n"),
-        vim.log.levels.WARN)
-    else
-      vim.notify("No Android device found in `adb devices`.\n" ..
-        "Connect a device with USB debugging enabled.", vim.log.levels.WARN)
-    end
-    done(nil)
-    return nil
-  end
-
-  if #ready == 1 then
-    done(ready[1].serial)
-    return ready[1].serial
-  end
-
-  -- Multi-device: ALWAYS prompt. No silent default.
-  local items = {}
-  for _, r in ipairs(ready) do items[#items + 1] = r end
-  vim.ui.select(items, {
+  android_device.select({
+    adb = adb,
     prompt = "Select Android device for DAP attach:",
-    format_item = function(r)
-      if r.model then return ("%s  [%s]"):format(r.serial, r.model) end
-      return r.serial
-    end,
-  }, function(choice)
-    done(choice and choice.serial or nil)
+  }, function(serial)
+    done(serial)
   end)
-  return nil
 end
 
--- Sync wrapper retained for tests/legacy callers that don't expect async.
--- For the multi-device case this returns nil; production code MUST use
--- pick_serial_async via bootstrap_session (which is already async-friendly).
-local function pick_serial(adb)
-  local picked
-  pick_serial_async(adb, function(s) picked = s end)
-  return picked
+local function resolve_session_serial(ctx, opts)
+  ctx = ctx or {}
+  opts = opts or {}
+  return ctx.android_serial or opts.serial or opts.android_serial
+    or android_device.get()
 end
 
 local function pidof(adb, serial, pkg)
@@ -909,7 +858,7 @@ end
 function M._start_late_rebase_poller(sess)
   M._stop_late_rebase_poller()
   if not (sess and sess.wait_mode and sess.pid and sess.serial and sess.package_name) then return end
-  local so = sess.symbol_lib and vim.fs.basename(sess.symbol_lib) or "libUE4.so"
+  local so = sess.symbol_lib and vim.fs.basename(sess.symbol_lib) or UE_MODULE_BASENAME
   local pid, serial, pkg, adb = sess.pid, sess.serial, sess.package_name, sess.adb
   local attempts, in_flight = 0, false
   local max_attempts = 90 -- × 700ms ≈ 63s of app init budget
@@ -1570,18 +1519,22 @@ end
 
 local function bootstrap_session(opts, on_ready)
   opts = opts or {}
-  local ctx = opts.context or {}
+  -- Never write session choices back into resolve_context()'s cached table:
+  -- doing so would pin the first serial in ctx.android_serial and make a later
+  -- :UESetAndroidDevice switch lose to that stale "explicit" value.
+  local ctx = vim.tbl_extend("force", {}, opts.context or {})
   -- Programmatic/headless retries should not block forever on vim.fn.input()
   -- for values that are stable for this workspace and already known.
-  -- Priority: explicit context/opts -> last successful session -> workspace default.
+  -- Priority: explicit context/opts -> session-global selected device. A normal
+  -- attach/launch never guesses from last-session history; without either it
+  -- opens the shared device picker below. Reattach has its own explicit replay.
   ctx.android_package = ctx.android_package or opts.package_name or opts.package
     or (M._last_session and M._last_session.package_name)
   -- When none of the above sources provides a package name, leave it nil
   -- so pick_package() falls through to persisted state → project discovery
   -- → config → user prompt, instead of treating a placeholder as a real
   -- Android package name.
-  ctx.android_serial = ctx.android_serial or opts.serial or opts.android_serial
-    or (M._last_session and M._last_session.serial)
+  ctx.android_serial = resolve_session_serial(ctx, opts)
   -- NOTE: do NOT hardcode a symbol_lib fallback here. A literal path short-
   -- circuits pick_symbol_lib() (its step 0 returns any existing ctx path
   -- verbatim, skipping the packageInfo.txt versionCode exact-match step), so a
@@ -1923,7 +1876,7 @@ function M.reattach()
   -- Replay state into the live session table.
   local sess = M._session
   sess.adb               = last.adb or "adb"
-  sess.serial            = last.serial
+  sess.serial            = android_device.get() or last.serial
   sess.package_name      = last.package_name
   sess.symbol_lib        = last.symbol_lib
   sess.lldb_server_local = last.lldb_server_local
@@ -1934,12 +1887,12 @@ function M.reattach()
   sess.port              = pick_port()
 
   local P = require("ue.dap._progress")
-  P.step(("reattach: waiting for %s on %s …"):format(last.package_name, last.serial))
+  P.step(("reattach: waiting for %s on %s …"):format(sess.package_name, sess.serial))
 
   -- Async pid poll up to 10s (F4 — no half-blocking vim.wait loop).
   pidof_async(sess.adb, sess.serial, sess.package_name, 10000, function(pid)
     if not pid then
-      P.error(("%s not running on %s after 10s"):format(last.package_name, last.serial))
+      P.error(("%s not running on %s after 10s"):format(sess.package_name, sess.serial))
       M._attach_in_progress = false
       return
     end
@@ -2129,6 +2082,10 @@ end
 
 function M._wait_launch_device_steps_for_test(pkg)
   return wait_launch_device_steps(pkg)
+end
+
+function M._resolve_session_serial_for_test(ctx, opts)
+  return resolve_session_serial(ctx, opts)
 end
 
 function M._jdb_connect_argv_for_test(jdb, port)

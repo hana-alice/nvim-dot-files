@@ -19,6 +19,7 @@
 | 配置 schema | `lua/ue/config.lua` | `index/context/clangd/dap/cdb` 默认值 + override | `get/setup/options/reset_for_test` |
 | 核心工具 | `lua/ue/core/` | fs / proc 纯函数 | 无副作用，可 headless 断言 |
 | DAP 调试 | `lua/ue/dap/` | codelldb 适配 + 各平台 attach/launch | `platforms` 注册表是唯一 dispatch seam |
+| Android device | `lua/utils/android_device.lua` | `adb devices -l` 枚举、会话级 serial 选择、`adb -s` argv | `vim.g.ue_android_device_serial` 是交互操作真相；活跃任务捕获 serial |
 | 符号解析栈 | `lua/utils/ue_goto/` + `lsp_fallback.lua` | gd/gr 的 5 层 fallback | clangd 权威；TS 只省调用；csearch/gtags 兜底 |
 | 代码搜索 | `lua/utils/code_search/` | csearch 亚秒级 grep | 兜底非主路；clangd MISS 时才用 |
 | 平台驱动 | `lua/utils/platform/` | OS 分支唯一收口 | 四驱动同接口；其余代码不做 OS 分支 |
@@ -33,8 +34,12 @@
 - **goto-definition**：`gd` → `treesitter 早退判定` → `cache(~70% 命中)` → `clangd LSP(权威)`
   → `csearch` → `gtags`，逐层 fall-through，最终兜底 toast「no def」。详见
   `docs/architecture-symbol-resolution.md`。
+- **Android device**：`<Space>uA` / 首次 Android 操作 → `utils.android_device` 异步执行
+  `adb devices -l` → picker 展示名称 + serial → `vim.g.ue_android_device_serial`；install / launch /
+  logcat / 新 DAP session 捕获该值并统一形成 `adb -s <serial> ...`。
 - **DAP**：`UEDAP*` 命令 → `ue.dap.platforms` 按当前平台 dispatch → 具体平台 `attach/launch`
-  → codelldb（Win64/Android）。Android 走 platform 模式 + serial connect URL。
+  → codelldb（Win64/Android）。Android 走 platform 模式 + serial connect URL；K30 URL 与本次
+  session 捕获的 ADB serial 必须一致，切换全局值不改变活跃 session 的 poll/cleanup。
 
 ## 3. 平台分层（platform layers）
 
@@ -54,6 +59,8 @@
 ## 5. 关键归属边界（ownership boundaries）
 
 - **OS 分支**只在 `lua/utils/platform/`。
+- **Android 设备选择**只在 `lua/utils/android_device.lua`；调用点消费 selected serial，
+  活跃长流程只消费启动时捕获的 serial，禁止中途重读 global 后跨设备。
 - **LSP 行为改动**只走 `lua/utils/lsp_fallback.lua` 或 `lua/workarounds/clangd/*`（禁全局 handler 覆盖）。
 - **上游 bug 补丁**只进 `lua/workarounds/<scope>/<name>.lua`（禁 inline monkey-patch）。
 - **goto 精度**只信 clangd（TS 不给答案，csearch/gtags 只兜底）。

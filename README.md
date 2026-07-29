@@ -161,7 +161,8 @@ Variants: `:UEPrepareIncremental` (dirty files only), `:UEPrepareReindex`
 | Build (current platform) | `<leader>ub` / `:UEBuild` |
 | Launch the Editor | `:UELaunch` |
 | Re-index after adding/removing files | `:UEPrepareIncremental` |
-| Android: install / attach / breakpoint | `:UEInstallAndroid` / `:UEDAPAttach` / `F9` |
+| Android: select device (name + serial, session-global) | `<leader>uA` / `:UESetAndroidDevice` |
+| Android: install / attach / breakpoint on selected device | `<leader>ui` / `:UEDAPAttach` / `F9` |
 | Background tasks: list / stop | `<leader>X` / `:Tasks` / `:TaskStopAll` |
 | All commands cheatsheet | `<leader>?` / `:UECheatsheet` |
 

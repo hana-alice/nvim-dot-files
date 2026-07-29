@@ -706,19 +706,20 @@ saved/aborted before the old session exits.
 ## 🎮 UE Workflow
 
 Source: `lua/config/keymaps.lua` (static `<leader>uB / uc / uP`,
-runtime `ub / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.lua`
+runtime `uA / ub / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.lua`
 (`<leader>uo / uO`), all `:UE*` user commands in `lua/ue.lua`.
 
 | Key / Command             | Action                              |
 |---------------------------|-------------------------------------|
 | `<leader>uP`              | `:UESetProject` — set project root  |
+| `<leader>uA`              | `:UESetAndroidDevice` — select Android device (name + serial) for this Neovim session |
 | `:UESetPlatform`          | Interactive platform+config select  |
 | `:UESetPlatform Win64 Development Editor` | Direct set         |
 | `<leader>ub`              | `:UEBuild` (platform from `:UESetPlatform`) |
 | `<leader>uB`              | `:UEPrepare` (symbols + compile_commands) |
 | `<leader>uc`              | `:UEExportCompileCommands`          |
 | `<leader>ul`              | `:UELaunch` (no debugger)           |
-| `<leader>ui`              | `:UEInstallAndroid` (APK to device) |
+| `<leader>ui`              | `:UEInstallAndroid` (APK to selected device via `adb -s`) |
 | `<leader>ug`              | `:UELogToggle` (toggle app log)     |
 | `<leader>uL`              | `:UELogToggle` (alias)              |
 | `<leader>uD`              | `:UEDebugLogToggle` (Windows debug log) |
@@ -726,6 +727,10 @@ runtime `ub / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.lua`
 | `<leader>uO`              | UE: grep in current module / plugin  |
 | `<leader>up`              | `:UEPaths` (show UE paths)          |
 | `<leader>?`               | `:UECheatsheet` (open this cheatsheet) |
+
+Android 选择写入当前 Neovim 会话的全局变量
+`vim.g.ue_android_device_serial`。APK install、launch、logcat 与 DAP 随后都显式使用
+`adb -s <serial>`；切换设备时再次执行 `<leader>uA`。该值不会跨 Neovim 重启持久化。
 
 ### Less-common UE commands
 

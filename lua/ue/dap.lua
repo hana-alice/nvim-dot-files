@@ -1828,15 +1828,15 @@ function D.setup_dap(dap, dapui)
     stop_logcat()
     local state = current_android_state()
     local pid, adb, serial = state.pid, state.adb or "adb", state.serial or ""
-    if not pid or pid == "" then return end
+    if not pid or pid == "" or serial == "" then return end
     logcat_buf = vim.api.nvim_create_buf(false, true)
     vim.bo[logcat_buf].buftype = "nofile"
     vim.bo[logcat_buf].bufhidden = "wipe"
     vim.bo[logcat_buf].filetype = "log"
     vim.api.nvim_buf_set_name(logcat_buf, "logcat:" .. pid)
-    local cmd = { adb }
-    if serial ~= "" then vim.list_extend(cmd, { "-s", serial }) end
-    vim.list_extend(cmd, { "logcat", "--pid=" .. pid })
+    local cmd = require("utils.android_device").adb_args(
+      adb, serial, { "logcat", "--pid=" .. pid })
+    if not cmd then return end
     local buf = logcat_buf
     logcat_job = vim.fn.jobstart(cmd, {
       on_stdout = function(_, data)

@@ -109,6 +109,7 @@ end
 -- name -> resolved root cache, populated on demand. Keyed by
 -- "engine_root|project_root|name" so multiple workspaces don't collide.
 local UNITY_MODULE_ROOT_CACHE = {}
+local locate_engine_module_root
 
 local function unity_locate_module_root(engine_root, project_root, name)
   if not name or name == "" then
@@ -225,10 +226,10 @@ local function module_scope_for_path(ctx, path)
   if path == "" then
     return nil
   end
-  return plugin_scope_from_root(ctx.project_root, path)
-    or project_module_scope(ctx.project_root, path)
-    or plugin_scope_from_root(fs.join(ctx.engine_root, "Engine"), path)
-    or engine_module_scope(ctx.engine_root, path)
+  return core.deps.plugin_scope_from_root(ctx.project_root, path)
+    or core.deps.project_module_scope(ctx.project_root, path)
+    or core.deps.plugin_scope_from_root(fs.join(ctx.engine_root, "Engine"), path)
+    or core.deps.engine_module_scope(ctx.engine_root, path)
     or unity_scope_for_path(ctx, path)
 end
 
@@ -256,7 +257,7 @@ local function module_tier(scope)
   return "warm"
 end
 
-local function locate_engine_module_root(engine_root, name)
+locate_engine_module_root = function(engine_root, name)
   if fs.trim(name) == "" then
     return nil
   end

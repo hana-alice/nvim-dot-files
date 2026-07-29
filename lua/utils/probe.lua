@@ -55,7 +55,9 @@ local function now()
 end
 
 local function probe_path()
-  return state.path_override or (vim.fn.stdpath("state") .. "/ue_probes.json")
+  return state.path_override
+    or vim.env.NVIM_UE_PROBE_PATH
+    or (vim.fn.stdpath("state") .. "/ue_probes.json")
 end
 
 local function empty_store()
@@ -76,7 +78,15 @@ local function compact_store(store)
     local keys = {}
     for k in pairs(recs) do keys[#keys + 1] = k end
     if #keys > cap then
-      table.sort(keys, function(a, b) return (recs[a].last or 0) < (recs[b].last or 0) end)
+      table.sort(keys, function(a, b)
+        -- `_overflow` is the only durable evidence that a topic self-slept;
+        -- never let same-second timestamp ties prune it immediately.
+        if a == "_overflow" then return false end
+        if b == "_overflow" then return true end
+        local a_last, b_last = recs[a].last or 0, recs[b].last or 0
+        if a_last == b_last then return a < b end
+        return a_last < b_last
+      end)
       for i = 1, #keys - cap do recs[keys[i]] = nil end
     end
     -- Auto-sleep expired topics
@@ -121,13 +131,16 @@ local function save_now()
   pcall(vim.uv.fs_rename, tmp, p)
 end
 
+local function cancel_save_timer()
+  if not state.save_timer then return end
+  pcall(function() state.save_timer:stop() end)
+  pcall(function() state.save_timer:close() end)
+  state.save_timer = nil
+end
+
 local function schedule_save()
   -- One-shot debounce; always stop+close the previous timer (F5 lesson).
-  if state.save_timer then
-    pcall(function() state.save_timer:stop() end)
-    pcall(function() state.save_timer:close() end)
-    state.save_timer = nil
-  end
+  cancel_save_timer()
   local timer = vim.uv.new_timer()
   if not timer then save_now(); return end
   state.save_timer = timer
@@ -307,11 +320,20 @@ end
 
 -- ── test seams ─────────────────────────────────────────────────────────────
 function M._set_path_for_test(p)
+  -- Never let a delayed save outlive its test path and spill into the next
+  -- path (especially the real stdpath('state') store).
+  cancel_save_timer()
   state.path_override = p
   state.loaded = false
   state.data = nil
 end
-function M._flush_for_test() save_now() end
+function M._flush_for_test()
+  cancel_save_timer()
+  save_now()
+end
+function M._has_pending_save_for_test()
+  return state.save_timer ~= nil
+end
 function M._now_shift_for_test(topic, key, seconds)
   load()
   local t = state.data.topics[topic]

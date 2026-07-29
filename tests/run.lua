@@ -18,6 +18,13 @@
 -- 抑制 LazyVim 的 stdin 启动路径（与 headless_smoke.lua 一致）。
 vim.g.started_with_stdin = true
 
+-- 回归中的 probe 调用必须写入临时隔离文件，绝不能污染真实的
+-- stdpath('state')/ue_probes.json。probe.lua 也会在测试 seam 切换时取消
+-- 尚未触发的防抖 timer，避免旧测试 payload 延迟写到新路径。
+local probe_test_dir = vim.fn.tempname():gsub("\\", "/")
+vim.fn.mkdir(probe_test_dir, "p")
+vim.env.NVIM_UE_PROBE_PATH = probe_test_dir .. "/ue_probes.json"
+
 -- 自举：require("tests.harness") 之前必须先把配置根目录挂上 rtp/package.path，
 -- 否则 tests.* / ue / utils.* 均无法解析。这里手工做一次最小自举，
 -- 拿到 harness 后由它统一负责后续 require 的解析。
@@ -139,6 +146,13 @@ local function run_legacy()
 end
 
 run_legacy()
+
+vim.api.nvim_create_autocmd("VimLeavePre", {
+  once = true,
+  callback = function()
+    pcall(vim.fn.delete, probe_test_dir, "rf")
+  end,
+})
 
 -- ── 汇总并退出（quit / cquit 1）──────────────────────────────────────────
 harness.run()

@@ -210,6 +210,7 @@ local function apply_ue_runtime_overrides()
   map("n", "<leader>uN", "<cmd>NotificationHistory<cr>", vim.tbl_extend("force", opts, { desc = "UI: Notification history" }))
   map("n", "<leader>up", "<cmd>UEPaths<cr>", vim.tbl_extend("force", opts, { desc = "UE: Show paths" }))
   map("n", "<leader>ut", "<cmd>ThemePicker<cr>", vim.tbl_extend("force", opts, { desc = "UI: Theme picker" }))
+  map("n", "<leader>uC", "<cmd>ThemePicker<cr>", vim.tbl_extend("force", opts, { desc = "UI: Theme picker" }))
 end
 
 map("n", "gd", function()
@@ -269,6 +270,7 @@ map("n", "<leader>uB", "<cmd>UEPrepare<cr>", { desc = "UE: Prepare symbols + com
 map("n", "<leader>uc", "<cmd>UEExportCompileCommands<cr>", { desc = "UE: Export compile_commands" })
 map("n", "<leader>uP", "<cmd>UESetProject<cr>", { desc = "UE: Set project" })
 map("n", "<leader>ut", "<cmd>ThemePicker<cr>", { desc = "UI: Theme picker" })
+map("n", "<leader>uC", "<cmd>ThemePicker<cr>", { desc = "UI: Theme picker" })
 map("n", "<leader>va", sidebar_pick, { desc = "Sidebar: Choose view" })
 map("n", "<leader>vv", sidebar_toggle(), { desc = "Sidebar: Toggle last view" })
 map("n", "<leader>vb", sidebar_toggle("buffers"), { desc = "Sidebar: Buffers" })

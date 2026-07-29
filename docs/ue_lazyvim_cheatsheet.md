@@ -640,13 +640,19 @@ wrapper with the plain `<cmd>...<cr>` form.
 ## 🎨 UI / Toggles
 
 Source: `lua/plugins/zen-mode.lua` (`<leader>z`),
-`lua/config/keymaps.lua` (`<leader>ut`, `<leader>?`).
+`lua/config/keymaps.lua` (`<leader>ut`, `<leader>uC`, `<leader>?`).
+
+Theme picker、命令补全和直接设置统一只暴露以下 6 个 canonical name：
+`monokai_ristretto`、`rider-light`、`ubuntu-terminal`、`unokai`、`catppuccin`、
+`sonokai-espresso`。最后一项固定加载 `sainnhe/sonokai` 的 Espresso variant，
+不会暴露其他 Sonokai variants。
 
 | Key              | Action                                  |
 |------------------|-----------------------------------------|
 | `<leader>ut`     | Theme picker (`:ThemePicker`)           |
+| `<leader>uC`     | 同一个受限 theme picker（覆盖上游入口） |
 | `:Theme`         | Open theme picker                       |
-| `:Theme <name>`  | Set and persist theme                   |
+| `:Theme <name>`  | Set and persist one of the six themes   |
 | `<leader>uf`     | Toggle format on save (LazyVim)         |
 | `<leader>uF`     | Force format mode (LazyVim)             |
 | `<leader>ud`     | Toggle diagnostics (LazyVim)            |

@@ -1,22 +1,21 @@
 return {
-  { "folke/tokyonight.nvim", lazy = true, priority = 1000 },
-  {
-    "rebelot/kanagawa.nvim",
-    lazy = true,
-    priority = 1000,
-    opts = function(_, opts)
-      opts = opts or {}
-      opts.theme = "dragon"
-      opts.background = vim.tbl_extend("force", opts.background or {}, {
-        dark = "dragon",
-      })
-      return opts
-    end,
-  },
+  -- LazyVim declares Tokyo Night upstream; disable it so the local theme
+  -- surface is limited to the entries owned by lua/theme.lua.
+  { "folke/tokyonight.nvim", enabled = false },
   {
     "tanvirtin/monokai.nvim",
     lazy = true,
     priority = 1000,
+  },
+  {
+    "sainnhe/sonokai",
+    name = "sonokai",
+    lazy = true,
+    priority = 1000,
+    init = function()
+      vim.g.sonokai_style = "espresso"
+      vim.g.sonokai_better_performance = 0
+    end,
   },
   {
     "LazyVim/LazyVim",
@@ -27,10 +26,12 @@ return {
         require("theme").select()
       end, { desc = "Select colorscheme" })
 
-      vim.keymap.set("n", "<leader>ut", "<cmd>ThemePicker<cr>", {
-        desc = "UI: Theme picker",
-        nowait = true,
-      })
+      for _, lhs in ipairs({ "<leader>ut", "<leader>uC" }) do
+        vim.keymap.set("n", lhs, "<cmd>ThemePicker<cr>", {
+          desc = "UI: Theme picker",
+          nowait = true,
+        })
+      end
 
       vim.api.nvim_create_user_command("Theme", function(opts)
         if opts.args == "" then
@@ -47,10 +48,10 @@ return {
       })
     end,
     opts = function(_, opts)
-     opts.colorscheme = function()
-       require("theme").load_startup()
-     end
-     return opts
-   end,
+      opts.colorscheme = function()
+        require("theme").load_startup()
+      end
+      return opts
+    end,
   },
 }

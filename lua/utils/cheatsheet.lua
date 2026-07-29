@@ -467,8 +467,8 @@ local tabs = {
       {
         title = "Toggles",
         mappings = {
-          { "<leader>ut",   "Theme picker" },
-          { ":Theme <name>","Set + persist theme" },
+          { "<leader>ut/uC", "Theme picker (six themes only)" },
+          { ":Theme <name>", "Ristretto / Rider / Ubuntu / Unokai / Catppuccin / Sonokai Espresso" },
           { "<leader>uf",   "Format on save" },
           { "<leader>uF",   "Force format mode" },
           { "<leader>ud",   "Diagnostics" },

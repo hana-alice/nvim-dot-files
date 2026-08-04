@@ -712,7 +712,7 @@ saved/aborted before the old session exits.
 ## 🎮 UE Workflow
 
 Source: `lua/config/keymaps.lua` (static `<leader>uB / uc / uP`,
-runtime `uA / ub / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.lua`
+runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.lua`
 (`<leader>uo / uO`), all `:UE*` user commands in `lua/ue.lua`.
 
 | Key / Command             | Action                              |
@@ -722,6 +722,8 @@ runtime `uA / ub / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.lua`
 | `:UESetPlatform`          | Interactive platform+config select  |
 | `:UESetPlatform Win64 Development Editor` | Direct set         |
 | `<leader>ub`              | `:UEBuild` (platform from `:UESetPlatform`) |
+| `<leader>us`              | `:UEBuildAndroidSO` — export + execute UBT compile/link actions (no Deploy/Gradle/APK) |
+| `<leader>uq`              | `:UEDeployAndroidSO` — strip, push, atomically replace and verify `libUE4.so` on the selected root device |
 | `<leader>uB`              | `:UEPrepare` (symbols + compile_commands) |
 | `<leader>uc`              | `:UEExportCompileCommands`          |
 | `<leader>ul`              | `:UELaunch` (no debugger)           |

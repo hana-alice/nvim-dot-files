@@ -117,7 +117,7 @@ t.describe("cheatsheet: 双 surface 不漂移", function()
   local ANCHORS = {
     "<leader>da", "<leader>db", "<leader>dB", "<leader>dL", "<leader>dC",
     "<leader>dW", "<leader>dt", "<leader>dR", "<leader>d1", "<leader>d4",
-    "<leader>uA", "<leader>uB", "<leader>ub", "<leader>uP", "<leader>uC",
+    "<leader>uA", "<leader>uB", "<leader>ub", "<leader>us", "<leader>uq", "<leader>uP", "<leader>uC",
     -- background-task management keys
     "<leader>X", "<leader>Xs", "<leader>XA",
     -- search-refinement keys the user asked to surface

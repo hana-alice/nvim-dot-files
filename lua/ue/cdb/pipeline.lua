@@ -15,11 +15,12 @@
 -- Public surface:
 --   M.set_runtime({ jobstart = ..., notify = ..., log_error = ... })
 --   M.slim(path)                      -> bool          (synchronous)
---   M.run(path, targets, on_done?)    -> jobid|nil     (background)
+--   M.run(path, targets, on_done?)    -> jobid|0|nil, error? (background)
 
 local fs = require("ue.core.fs")
 
 local M = {}
+local running = false
 
 -- Runtime injection table. Defaults assume no fancy logger so that even
 -- pre-`set_runtime` calls degrade gracefully.
@@ -40,6 +41,11 @@ function M.set_runtime(opts)
   if opts.jobstart  then _rt.jobstart  = opts.jobstart  end
   if opts.notify    then _rt.notify    = opts.notify    end
   if opts.log_error then _rt.log_error = opts.log_error end
+end
+
+--- Whether a compile_commands writer pipeline currently owns the mutation slot.
+function M.is_running()
+  return running
 end
 
 local function python_exe()
@@ -138,15 +144,25 @@ end
 --- Background pipeline: expand → pch → resolve → unify → prune. Each step
 --- is skipped if its python script is absent. After success, syncs `path`
 --- to every other entry in `targets` and restarts clangd. Returns the
---- jobid from `_rt.jobstart` (nil if no scripts existed).
+--- jobid from `_rt.jobstart`, 0 when no scripts exist, or nil + error when
+--- the writer slot is occupied or the background job cannot start.
 ---
 --- Phase I: the script list and per-step args are sourced from
 --- ue.config.cdb.steps (default = the original 5-step recipe). To skip a
 --- step the user simply removes its entry from the list.
 ---@param path string CDB file to mutate in-place
 ---@param targets string[]? sibling CDB targets to copy `path` into on success
----@param on_done fun()? optional completion callback (after clangd restart)
+---@param on_done fun(ok:boolean, err:string?)? optional completion callback (after clangd restart)
+---@return integer? jobid
+---@return string? error
 function M.run(path, targets, on_done)
+  if running then
+    local msg = "compile_commands pipeline is already running"
+    _rt.notify(msg, vim.log.levels.WARN)
+    if on_done then on_done(false, msg) end
+    return nil, msg
+  end
+
   local python = python_exe()
 
   local CANONICAL_ARGS = {
@@ -199,7 +215,10 @@ function M.run(path, targets, on_done)
     end
   end
 
-  if #cmds == 0 then return nil end
+  if #cmds == 0 then
+    if on_done then on_done(true) end
+    return 0
+  end
 
   _rt.notify("compile_commands pipeline: expand+pch+resolve+unify+prune in background...", vim.log.levels.INFO)
 
@@ -207,14 +226,27 @@ function M.run(path, targets, on_done)
   local mtime_before = (stat_before and stat_before.mtime and stat_before.mtime.sec) or 0
   local shell_cmd = table.concat(cmds, " && ")
 
-  return _rt.jobstart(shell_cmd, "ue-pipeline", {
+  running = true
+  local finished = false
+  local finish_ok
+  local finish_err
+  local function finish(ok, err)
+    if finished then return end
+    finished = true
+    finish_ok = ok
+    finish_err = err
+    running = false
+    if on_done then on_done(ok, err) end
+  end
+
+  local jobid = _rt.jobstart(shell_cmd, "ue-pipeline", {
     cdb = path,
     on_exit = function(_, _, _)
       local stat_after = vim.uv.fs_stat(path)
       local mtime_after = (stat_after and stat_after.mtime and stat_after.mtime.sec) or 0
       if mtime_after == mtime_before then
         _rt.notify("compile_commands pipeline: no changes, skipping clangd restart", vim.log.levels.INFO)
-        if on_done then on_done() end
+        finish(true)
         return
       end
       -- Mirror to secondary targets ASYNC, then restart clangd + hand off.
@@ -224,10 +256,30 @@ function M.run(path, targets, on_done)
       mirror_targets_then(path, targets, function()
         _rt.notify("compile_commands pipeline: done. Restarting clangd...", vim.log.levels.INFO)
         restart_clangd()
-        if on_done then on_done() end
+        finish(true)
       end)
     end,
+    on_fail = function(code, log_lines, log_path)
+      local tail = {}
+      for i = math.max(1, #log_lines - 4), #log_lines do
+        tail[#tail + 1] = log_lines[i]
+      end
+      local msg = ("ue-pipeline failed (exit %d)\nlog: %s\n--- last lines ---\n%s")
+        :format(code, log_path, table.concat(tail, "\n"))
+      _rt.log_error("ue.runner", msg)
+      finish(false, msg)
+    end,
   })
+  if not jobid or jobid <= 0 then
+    local msg = "compile_commands pipeline failed to start"
+    _rt.log_error("ue.runner", msg)
+    finish(false, msg)
+    return nil, msg
+  end
+  if finished and not finish_ok then
+    return nil, finish_err
+  end
+  return jobid
 end
 
 return M

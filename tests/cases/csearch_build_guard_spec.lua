@@ -250,6 +250,67 @@ t.describe("csearch smart_build 端到端（D11，mock build_index）", function
     restore_mock()
   end)
 
+  t.it("快照旁车丢失但索引+指纹一致 → bootstrap skip，不做 reset", function()
+    install_mock()
+    local dir = setup_dir()
+    local workspace_list = dir .. "/workspace_all.files"
+    local abs_list = dir .. "/list.txt"
+    write_lines(workspace_list, { "Engine/A.cpp", "Engine/B.cpp" })
+    write_lines(abs_list, { "D:/w/Engine/A.cpp", "D:/w/Engine/B.cpp" })
+    ue._reset_fingerprint_cache_for_test()
+    ue.update_state_field(dir, "csearch_input_hash", ue._list_fingerprint_for_test(workspace_list))
+
+    local orig_is_indexed = cs.is_indexed
+    cs.is_indexed = function() return true end
+    local ctx = {
+      engine_root = dir,
+      paths = {
+        csearch_idx = dir .. "/csearch.idx",
+        workspace_all_list = workspace_list,
+      },
+    }
+    local res = run_smart(ctx, abs_list)
+    cs.is_indexed = orig_is_indexed
+
+    t.assert_true(res.ok)
+    t.assert_eq(res.stats.mode, "skip")
+    t.assert_eq(#calls, 0, "已有可用索引且内容指纹一致时不应全量重建")
+    t.assert_true(vim.loop.fs_stat(ue._csearch_snapshot_path_for_test(ctx)) ~= nil,
+      "bootstrap skip 应补回 <idx>.files 快照")
+
+    pcall(vim.fn.delete, dir, "rf")
+    restore_mock()
+  end)
+
+  t.it("快照旁车丢失且主索引不可用 → 即使指纹一致也 reset", function()
+    install_mock()
+    local dir = setup_dir()
+    local workspace_list = dir .. "/workspace_all.files"
+    local abs_list = dir .. "/list.txt"
+    write_lines(workspace_list, { "Engine/A.cpp" })
+    write_lines(abs_list, { "D:/w/Engine/A.cpp" })
+    ue._reset_fingerprint_cache_for_test()
+    ue.update_state_field(dir, "csearch_input_hash", ue._list_fingerprint_for_test(workspace_list))
+
+    local orig_is_indexed = cs.is_indexed
+    cs.is_indexed = function() return false end
+    local res = run_smart({
+      engine_root = dir,
+      paths = {
+        csearch_idx = dir .. "/csearch.idx",
+        workspace_all_list = workspace_list,
+      },
+    }, abs_list)
+    cs.is_indexed = orig_is_indexed
+
+    t.assert_true(res.ok)
+    t.assert_eq(res.stats.mode, "reset")
+    t.assert_eq(#calls, 1, "不能仅凭历史指纹信任缺失/损坏的主索引")
+
+    pcall(vim.fn.delete, dir, "rf")
+    restore_mock()
+  end)
+
   t.it("集合不变 → skip（不调 build_index）", function()
     install_mock()
     local dir = setup_dir()
@@ -341,4 +402,3 @@ t.describe("csearch smart_build 端到端（D11，mock build_index）", function
     restore_mock()
   end)
 end)
-

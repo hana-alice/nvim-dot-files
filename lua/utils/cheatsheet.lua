@@ -515,6 +515,8 @@ local tabs = {
           { "<leader>uA",    "Select Android device (name + serial)" },
           { ":UESetPlatform","Select platform + config" },
           { "<leader>ub",    "UEBuild (build current platform)" },
+          { "<leader>us",    "Build Android SO only (skip APK)" },
+          { "<leader>uq",    "Quick deploy Android SO (root device)" },
           { "<leader>uB",    "UEPrepare (CDB + index + clangd)" },
           { ":UEPrepareIncremental", "Prepare dirty files only" },
           { "<leader>uc",    "Export compile_commands" },

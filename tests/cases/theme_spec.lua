@@ -129,7 +129,7 @@ t.describe("theme: six-entry public surface", function()
     t.assert_true(theme.apply("monokai_ristretto", { persist = false, silent = true }))
   end)
 
-  t.it("all six themes keep C++ semantic roles distinct and aligned across surfaces", function()
+  t.it("all six themes use restrained C++ role families aligned across surfaces", function()
     local role_groups = {
       namespace = {
         "@module.cpp", "@lsp.type.namespace.cpp", "CmpItemKindModule", "BlinkCmpKindModule",
@@ -177,40 +177,54 @@ t.describe("theme: six-entry public surface", function()
         end
       end
 
+      -- Mature IDE themes use coherent families instead of forcing all roles
+      -- into different accents. Only the ambiguity-bearing pairs are required
+      -- to differ; namespace/type, enum/field and parameter/local may share.
       for _, pair in ipairs({
         { "type", "field" },
         { "field", "parameter" },
         { "field", "variable" },
-        { "parameter", "variable" },
-        { "function", "field" },
         { "function", "variable" },
         { "enum_member", "type" },
-        { "enum_member", "variable" },
         { "macro", "namespace" },
-        { "namespace", "variable" },
       }) do
         t.assert_true(colors[pair[1]] ~= colors[pair[2]],
           name .. " must distinguish " .. pair[1] .. " from " .. pair[2])
       end
 
-      local type_hl = vim.api.nvim_get_hl(0, { name = "@lsp.type.struct.cpp", link = false })
-      local parameter_hl = vim.api.nvim_get_hl(0, { name = "@lsp.type.parameter.cpp", link = false })
-      local macro_hl = vim.api.nvim_get_hl(0, { name = "@lsp.type.macro.cpp", link = false })
-      local declaration_hl = vim.api.nvim_get_hl(0, {
-        name = "@lsp.typemod.property.declaration.cpp", link = false,
-      })
-      local readonly_hl = vim.api.nvim_get_hl(0, {
-        name = "@lsp.typemod.method.readonly.cpp", link = false,
-      })
+      t.assert_eq(colors.namespace, colors.type, name .. " namespace should join the type family")
+      if name ~= "catppuccin" then
+        t.assert_eq(colors.enum_member, colors.field, name .. " enum member should join the data family")
+      end
+      if name ~= "ubuntu-terminal" and name ~= "catppuccin" then
+        t.assert_eq(colors.parameter, colors.variable, name .. " parameter should stay in the low-weight local family")
+      end
+
+      for role, groups in pairs(role_groups) do
+        for _, group in ipairs(groups) do
+          local value = vim.api.nvim_get_hl(0, { name = group, link = false })
+          t.assert_nil(value.bold, name .. " " .. role .. " base role must not force bold")
+          t.assert_nil(value.italic, name .. " " .. role .. " base role must not force italic")
+          t.assert_nil(value.strikethrough, name .. " " .. role .. " base role must not strike through")
+        end
+      end
+
+      for _, group in ipairs({
+        "@lsp.mod.declaration.cpp",
+        "@lsp.typemod.property.declaration.cpp",
+        "@lsp.typemod.method.readonly.cpp",
+        "@lsp.typemod.class.abstract.cpp",
+        "@lsp.typemod.method.classScope.cpp",
+        "@lsp.typemod.variable.globalScope.cpp",
+      }) do
+        local value = vim.api.nvim_get_hl(0, { name = group, link = false })
+        t.assert_nil(value.fg, name .. " " .. group .. " must preserve role foreground")
+        t.assert_nil(value.bold, name .. " " .. group .. " must not force bold")
+        t.assert_nil(value.italic, name .. " " .. group .. " must not force italic")
+        t.assert_nil(value.strikethrough, name .. " " .. group .. " must not strike through")
+      end
+
       local deprecated_hl = vim.api.nvim_get_hl(0, { name = "@lsp.mod.deprecated.cpp", link = false })
-      t.assert_true(type_hl.bold == true, name .. " type should use bold as a second channel")
-      t.assert_true(parameter_hl.italic == true, name .. " parameter should use italic as a second channel")
-      t.assert_true(macro_hl.bold == true and macro_hl.italic == true,
-        name .. " macro should combine bold and italic")
-      t.assert_true(declaration_hl.bold == true, name .. " declaration typemod should use bold")
-      t.assert_nil(declaration_hl.fg, name .. " declaration typemod must preserve role foreground")
-      t.assert_true(readonly_hl.italic == true, name .. " readonly typemod should use italic")
-      t.assert_nil(readonly_hl.fg, name .. " readonly typemod must preserve role foreground")
       t.assert_true(deprecated_hl.strikethrough == true, name .. " deprecated modifier should strike through")
       t.assert_nil(deprecated_hl.fg, name .. " modifier must not override semantic role foreground")
     end

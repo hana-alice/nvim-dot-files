@@ -25,80 +25,87 @@ local function set_from(targets, source, extra)
   end
 end
 
--- Each profile reuses the active colorscheme's own palette through existing
--- highlight groups. This keeps theme identity while preventing adjacent C/C++
--- roles from collapsing to the same foreground (notably struct/field/parameter).
+-- Mature IDE themes use a few coherent colour families, not one accent per
+-- semantic token. These profiles follow that restraint while reusing only the
+-- active colorscheme's own palette:
+--   * type family: type/class/struct + namespace
+--   * data family: field/property + (where suitable) enum member
+--   * local family: parameter + ordinary variable
+--   * callable and macro families remain distinct
+-- The deliberate sharing mirrors Rider, VS Code Dark+/Light+, Catppuccin and
+-- the native Monokai/Sonokai role maps. It prevents both same-role ambiguity
+-- and the rainbow effect caused by forcing all eight roles to be different.
 local THEME_PROFILES = {
   monokai_ristretto = {
-    namespace = "Comment",
+    namespace = "Type",
     type = "Type",
     field = "Tag",
-    parameter = "Number",
+    parameter = "Normal",
     variable = "Normal",
     ["function"] = "Function",
-    enum_member = "String",
-    macro = "Macro",
+    enum_member = "Tag",
+    macro = "Number",
   },
   ["rider-light"] = {
-    namespace = "Include",
-    type = "Directory",
+    namespace = "Normal",
+    type = "Normal",
     field = "Constant",
-    parameter = "LspSignatureActiveParameter",
-    variable = "Normal",
-    ["function"] = "Function",
-    enum_member = "String",
-    macro = "Macro",
-  },
-  ["ubuntu-terminal"] = {
-    namespace = "Comment",
-    type = "Type",
-    field = "Constant",
-    parameter = "DiagnosticWarn",
-    variable = "Normal",
-    ["function"] = "Function",
-    enum_member = "String",
-    macro = "Keyword",
-  },
-  unokai = {
-    namespace = "Directory",
-    type = "Type",
-    field = "Identifier",
-    parameter = "Constant",
-    variable = "Normal",
-    ["function"] = "Function",
-    enum_member = "String",
-    macro = "Macro",
-  },
-  catppuccin = {
-    namespace = "Special",
-    type = "Type",
-    field = "Identifier",
-    parameter = "Character",
+    parameter = "Normal",
     variable = "Normal",
     ["function"] = "Function",
     enum_member = "Constant",
     macro = "Macro",
   },
-  ["sonokai-espresso"] = {
-    namespace = "Comment",
+  ["ubuntu-terminal"] = {
+    namespace = "Type",
     type = "Type",
-    field = "Identifier",
-    parameter = "String",
+    field = "Constant",
+    parameter = "DiagnosticWarn",
     variable = "Normal",
     ["function"] = "Function",
-    enum_member = "Number",
+    enum_member = "Constant",
     macro = "Keyword",
+  },
+  unokai = {
+    namespace = "Type",
+    type = "Type",
+    field = "Identifier",
+    parameter = "Normal",
+    variable = "Normal",
+    ["function"] = "Function",
+    enum_member = "Identifier",
+    macro = "Macro",
+  },
+  catppuccin = {
+    namespace = "Type",
+    type = "Type",
+    field = "Tag",
+    parameter = "@variable.parameter",
+    variable = "Normal",
+    ["function"] = "Function",
+    enum_member = "Character",
+    macro = "Macro",
+  },
+  ["sonokai-espresso"] = {
+    namespace = "Type",
+    type = "Type",
+    field = "Identifier",
+    parameter = "Normal",
+    variable = "Normal",
+    ["function"] = "Function",
+    enum_member = "Identifier",
+    macro = "Macro",
   },
 }
 
 local DEFAULT_PROFILE = {
-  namespace = "Include",
+  namespace = "Type",
   type = "Type",
   field = "Identifier",
-  parameter = "Constant",
+  parameter = "Normal",
   variable = "Normal",
   ["function"] = "Function",
-  enum_member = "Special",
+  enum_member = "Identifier",
   macro = "Macro",
 }
 
@@ -153,17 +160,6 @@ local ROLE_KINDS = {
   macro = {}, -- LSP CompletionItemKind has no Macro kind.
 }
 
-local ROLE_STYLES = {
-  namespace = { italic = true },
-  type = { bold = true },
-  field = {},
-  parameter = { italic = true },
-  variable = {},
-  ["function"] = { bold = true },
-  enum_member = { bold = true },
-  macro = { bold = true, italic = true },
-}
-
 local ROLE_ORDER = {
   "variable",
   "namespace",
@@ -201,7 +197,8 @@ end
 
 local function apply_generic_semantic_defaults()
   -- Preserve the pre-existing cross-language defaults. C/C++ exact groups are
-  -- applied afterwards and take precedence over these fallback captures.
+  -- resolved and applied first, so these fallback captures cannot overwrite
+  -- their language-qualified foregrounds.
   set_from({ "@module", "@lsp.type.namespace" }, "Include", { bold = true })
   set_from({
     "@type",
@@ -234,7 +231,10 @@ local function apply_semantic_roles()
   local profile = active_profile()
   for _, role in ipairs(ROLE_ORDER) do
     local source = profile[role] or DEFAULT_PROFILE[role]
-    set_role(ROLE_TARGETS[role], source, ROLE_STYLES[role])
+    -- Base roles carry foreground only. Mature schemes reserve font weight
+    -- for state (declaration/readonly/deprecated), so dense UE code does not
+    -- become a wall of bold and italic identifiers.
+    set_role(ROLE_TARGETS[role], source)
 
     local completion_targets = {}
     for _, kind in ipairs(ROLE_KINDS[role]) do
@@ -282,11 +282,30 @@ local function modifier_targets(modifiers)
 end
 
 local function apply_semantic_modifiers()
-  -- Modifier extmarks have a higher priority than the token-type extmark.
-  -- Keep generic and type-specific variants colourless so they add only a
-  -- second visual channel instead of replacing the role foreground.
-  set_style(modifier_targets({ "declaration", "definition" }), { bold = true })
-  set_style(modifier_targets({ "readonly", "static", "abstract", "virtual" }), { italic = true })
+  -- clangd modifier extmarks sit above token-type extmarks. Mature IDE themes
+  -- do not turn every declaration/static/readonly identifier bold or italic;
+  -- neutralise those modifiers so dense UE code keeps one calm base weight and
+  -- the role foreground remains authoritative. Deprecation is the one state
+  -- that benefits from a universal, conventional glyph channel.
+  set_style(modifier_targets({
+    "declaration",
+    "definition",
+    "deduced",
+    "readonly",
+    "static",
+    "abstract",
+    "virtual",
+    "dependentName",
+    "defaultLibrary",
+    "usedAsMutableReference",
+    "usedAsMutablePointer",
+    "constructorOrDestructor",
+    "userDefined",
+    "functionScope",
+    "classScope",
+    "fileScope",
+    "globalScope",
+  }), {})
   set_style(modifier_targets({ "deprecated" }), { strikethrough = true })
 end
 
@@ -316,13 +335,17 @@ function M.apply()
     "@keyword.directive.define",
   }, "PreProc", { bold = true })
 
-  -- These two local colorschemes already own detailed cross-language role
-  -- maps. Preserve those maps, then apply only the exact C/C++ convergence
-  -- groups below. External themes still receive the existing generic defaults.
+  -- Resolve exact C/C++ roles before generic defaults: some mature themes
+  -- expose their best role source as a Treesitter capture (Catppuccin's maroon
+  -- parameter, for example), and the generic fallback intentionally rewrites
+  -- unqualified captures afterwards. The `.c`/`.cpp` groups stay authoritative.
+  apply_semantic_roles()
+
+  -- These two local colorschemes already own detailed cross-language maps.
+  -- Preserve them; external themes still receive the existing generic defaults.
   if vim.g.colors_name ~= "rider-light" and vim.g.colors_name ~= "ubuntu-terminal" then
     apply_generic_semantic_defaults()
   end
-  apply_semantic_roles()
   apply_semantic_modifiers()
 
   set_from({

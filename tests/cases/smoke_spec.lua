@@ -22,6 +22,17 @@ t.describe("smoke: 核心模块加载", function()
   end)
 end)
 
+t.describe("smoke: clangd capabilities", function()
+  t.it("不再发送 clangd 已弃用的 offsetEncoding 扩展", function()
+    local path = vim.fn.stdpath("config") .. "/lua/plugins/ue.lua"
+    local f = assert(io.open(path, "rb"))
+    local source = f:read("*a")
+    f:close()
+    t.assert_false(source:find("offsetEncoding", 1, true) ~= nil,
+      "Neovim 已通过 LSP 3.17 general.positionEncodings 协商编码")
+  end)
+end)
+
 t.describe("smoke: ue.setup() 注册命令", function()
   t.it("ue.setup() 无异常", function()
     require("ue").setup()

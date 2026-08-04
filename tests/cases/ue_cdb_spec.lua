@@ -52,3 +52,86 @@ t.describe("ue.cdb.shaders", function()
     t.assert_eq(e.arguments[2], "-x")
   end)
 end)
+
+t.describe("ue.cdb.pipeline lifecycle", function()
+  local pipeline = require("ue.cdb.pipeline")
+
+  local function temp_cdb()
+    local path = vim.fn.tempname():gsub("\\", "/") .. ".json"
+    local f = assert(io.open(path, "wb"))
+    f:write("[]")
+    f:close()
+    return path
+  end
+
+  t.it("失败也结束 running 状态并回调 false", function()
+    local path = temp_cdb()
+    local result
+    pipeline.set_runtime({
+      jobstart = function(_, _, opts)
+        opts.on_fail(1, { "boom" }, path .. ".log")
+        return 17
+      end,
+      notify = function() end,
+      log_error = function() end,
+    })
+
+    pipeline.run(path, { path }, function(ok) result = ok end)
+    t.assert_false(result, "pipeline 失败必须显式回调 false")
+    t.assert_false(pipeline.is_running(), "失败后不得永久占用 pipeline 锁")
+    pcall(os.remove, path)
+  end)
+
+  t.it("运行中拒绝第二个 writer，完成后释放", function()
+    local path = temp_cdb()
+    local captured
+    local starts = 0
+    local second_result
+    pipeline.set_runtime({
+      jobstart = function(_, _, opts)
+        starts = starts + 1
+        captured = opts
+        return 23
+      end,
+      notify = function() end,
+      log_error = function() end,
+    })
+
+    pipeline.run(path, { path }, function() end)
+    t.assert_true(pipeline.is_running(), "首个 pipeline 启动后应占用 writer 锁")
+    local second_jobid, second_err = pipeline.run(path, { path }, function(ok) second_result = ok end)
+    t.assert_eq(starts, 1, "运行中第二次调用不得启动新 writer")
+    t.assert_false(second_result, "被拒调用应显式回调 false")
+    t.assert_eq(second_jobid, nil, "被拒调用不得返回伪 jobid")
+    t.assert_contains(tostring(second_err), "already running")
+
+    captured.on_exit(23, 0, "exit")
+    t.assert_false(pipeline.is_running(), "成功完成后应释放 writer 锁")
+    pcall(os.remove, path)
+  end)
+
+  t.it("jobstart 启动失败返回错误且释放 writer", function()
+    local path = temp_cdb()
+    local result
+    pipeline.set_runtime({
+      jobstart = function() return -1 end,
+      notify = function() end,
+      log_error = function() end,
+    })
+
+    local jobid, err = pipeline.run(path, { path }, function(ok) result = ok end)
+    t.assert_eq(jobid, nil)
+    t.assert_contains(tostring(err), "failed to start")
+    t.assert_false(result, "启动失败必须显式回调 false")
+    t.assert_false(pipeline.is_running(), "启动失败后不得永久占用 writer 锁")
+    pcall(os.remove, path)
+  end)
+
+  t.it("同步入口检查 writer slot 并传播 pipeline 启动结果", function()
+    local source = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
+    t.assert_contains(source, 'if pipeline.is_running() then\n    return false, "compile_commands pipeline is already running"')
+    t.assert_contains(source, 'local jobid, pipeline_err = run_compile_commands_pipeline(path, targets)')
+    t.assert_contains(source, 'local pipeline_jobid, pipeline_err = run_compile_commands_pipeline(targets[1], targets)')
+    t.assert_contains(source, 'return false, nil, pipeline_err or "compile_commands pipeline failed to start"')
+  end)
+end)

@@ -159,6 +159,8 @@ Variants: `:UEPrepareIncremental` (dirty files only), `:UEPrepareReindex`
 | Project-wide grep | `<leader>/` |
 | File picker | `<leader><leader>` |
 | Build (current platform) | `<leader>ub` / `:UEBuild` |
+| Android SO only (skip APK) | `<leader>us` / `:UEBuildAndroidSO` |
+| Android quick SO deploy (root device) | `<leader>uq` / `:UEDeployAndroidSO` |
 | Launch the Editor | `:UELaunch` |
 | Re-index after adding/removing files | `:UEPrepareIncremental` |
 | Android: select device (name + serial, session-global) | `<leader>uA` / `:UESetAndroidDevice` |

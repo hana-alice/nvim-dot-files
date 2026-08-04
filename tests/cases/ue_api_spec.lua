@@ -61,6 +61,199 @@ t.describe("ue.clangd_cmd", function()
   end)
 end)
 
+t.describe("ue.android_build_command（SO-only）", function()
+  local ue = require("ue")
+
+  t.it("SO 命令走两阶段 action 脚本，普通 UEBuild 保持原状", function()
+    local old_platform = vim.env.UE_TARGET_PLATFORM
+    local old_configuration = vim.env.UE_TARGET_CONFIGURATION
+    local old_target = vim.env.UE_BUILD_TARGET
+    vim.env.UE_TARGET_PLATFORM = "Android"
+    vim.env.UE_TARGET_CONFIGURATION = "Test"
+    vim.env.UE_BUILD_TARGET = "Client"
+
+    local ctx = {
+      engine_root = "C:/FakeUE",
+      project_root = "C:/FakeProject",
+      uproject = "C:/FakeProject/Client.uproject",
+    }
+    local normal_cmd, normal_err = ue._android_build_command_for_test(ctx)
+    local so_cmd, so_err = ue._android_build_command_for_test(ctx, { skip_deploy = true })
+
+    vim.env.UE_TARGET_PLATFORM = old_platform
+    vim.env.UE_TARGET_CONFIGURATION = old_configuration
+    vim.env.UE_BUILD_TARGET = old_target
+
+    t.assert_true(normal_cmd ~= nil, tostring(normal_err))
+    t.assert_true(so_cmd ~= nil, tostring(so_err))
+    local normal_text = table.concat(normal_cmd, " ")
+    local so_text = table.concat(so_cmd, " ")
+    t.assert_contains(normal_text, "Build.bat Client Android Test")
+    t.assert_false(normal_text:find("ue_android_so_build.ps1", 1, true) ~= nil)
+    t.assert_contains(so_text, "ue_android_so_build.ps1")
+    t.assert_contains(so_text, "-Target Client")
+    t.assert_contains(so_text, "-Platform Android")
+    t.assert_contains(so_text, "-Configuration Test")
+    t.assert_false(so_text:find("-SkipDeploy", 1, true) ~= nil)
+  end)
+
+  t.it("SO 脚本导出并执行 action graph，不使用失效的 -SkipDeploy", function()
+    local script = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/scripts/ue_android_so_build.ps1"), "\n")
+    t.assert_contains(script, "-WriteOutdatedActions=")
+    t.assert_contains(script, '"-Mode=Execute"')
+    t.assert_contains(script, "completed without Android deploy/APK packaging")
+    t.assert_false(script:find('"-SkipDeploy"', 1, true) ~= nil)
+  end)
+
+  t.it("SO deploy 命令锁定 serial/package/当前配置产物", function()
+    local root = vim.fn.tempname()
+    local project_dir = root .. "/Source/Client"
+    local so = project_dir .. "/Binaries/Android/Client-Android-Test-arm64.so"
+    vim.fn.mkdir(vim.fs.dirname(so), "p")
+    vim.fn.writefile({ "so" }, so)
+    vim.fn.writefile({ "{}" }, project_dir .. "/Client.uproject")
+
+    local old_platform = vim.env.UE_TARGET_PLATFORM
+    local old_configuration = vim.env.UE_TARGET_CONFIGURATION
+    local old_target = vim.env.UE_BUILD_TARGET
+    vim.env.UE_TARGET_PLATFORM = "Android"
+    vim.env.UE_TARGET_CONFIGURATION = "Test"
+    vim.env.UE_BUILD_TARGET = "Client"
+    local cmd, err = ue._android_so_deploy_command_for_test({
+      engine_root = "C:/FakeUE",
+      project_root = root,
+      uproject = project_dir .. "/Client.uproject",
+    }, "SERIAL-USB", "com.example.client")
+    vim.env.UE_TARGET_PLATFORM = old_platform
+    vim.env.UE_TARGET_CONFIGURATION = old_configuration
+    vim.env.UE_BUILD_TARGET = old_target
+    vim.fn.delete(root, "rf")
+
+    t.assert_true(cmd ~= nil, tostring(err))
+    local text = table.concat(cmd, " ")
+    t.assert_contains(text, "ue_android_so_deploy.ps1")
+    t.assert_contains(text, "-Serial SERIAL-USB")
+    t.assert_contains(text, "-Package com.example.client")
+    t.assert_contains(text, "Client-Android-Test-arm64.so")
+  end)
+
+  t.it("SO deploy 不降级使用其他配置或通用文件名产物", function()
+    local root = vim.fn.tempname()
+    local project_dir = root .. "/Source/Client"
+    local generic_so = project_dir .. "/Binaries/Android/Client-arm64.so"
+    vim.fn.mkdir(vim.fs.dirname(generic_so), "p")
+    vim.fn.writefile({ "wrong configuration" }, generic_so)
+    vim.fn.writefile({ "{}" }, project_dir .. "/Client.uproject")
+
+    local old_platform = vim.env.UE_TARGET_PLATFORM
+    local old_configuration = vim.env.UE_TARGET_CONFIGURATION
+    local old_target = vim.env.UE_BUILD_TARGET
+    vim.env.UE_TARGET_PLATFORM = "Android"
+    vim.env.UE_TARGET_CONFIGURATION = "Test"
+    vim.env.UE_BUILD_TARGET = "Client"
+    local cmd, err = ue._android_so_deploy_command_for_test({
+      engine_root = "C:/FakeUE",
+      project_root = root,
+      uproject = project_dir .. "/Client.uproject",
+    }, "SERIAL-USB", "com.example.client")
+    vim.env.UE_TARGET_PLATFORM = old_platform
+    vim.env.UE_TARGET_CONFIGURATION = old_configuration
+    vim.env.UE_BUILD_TARGET = old_target
+    vim.fn.delete(root, "rf")
+
+    t.assert_true(cmd == nil, "仅有通用 SO 时必须拒绝部署")
+    t.assert_contains(tostring(err), "Android SO not found")
+  end)
+
+  t.it("SO deploy 捕获并精确恢复已安装文件 metadata", function()
+    local script = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/scripts/ue_android_so_deploy.ps1"), "\n")
+    t.assert_contains(script, '"stat", "-c", "%u"')
+    t.assert_contains(script, '"stat", "-c", "%g"')
+    t.assert_contains(script, '"stat", "-c", "%a"')
+    t.assert_contains(script, '"stat", "-c", "%C"')
+    t.assert_contains(script, '"chcon", $Metadata.Context')
+    t.assert_contains(script, "Assert-RemoteLibraryMetadata")
+    t.assert_false(script:find("system:system", 1, true) ~= nil,
+      "不得假设设备安装目录固定属于 system:system")
+  end)
+end)
+
+t.describe("ue.project_index_dirs（nested project scan scope）", function()
+  local ue = require("ue")
+
+  local function mkdir(path)
+    vim.fn.mkdir(path, "p")
+  end
+
+  local function write_file(path, content)
+    local f = assert(io.open(path, "wb"))
+    f:write(content or "")
+    f:close()
+  end
+
+  local function contains(xs, want)
+    for _, value in ipairs(xs or {}) do
+      if value == want then return true end
+    end
+    return false
+  end
+
+  t.it("nested uproject 默认只扫描项目锚点，不吞掉 project_root/Source 旁支", function()
+    local root = vim.fn.tempname():gsub("\\", "/") .. "_nested_project"
+    mkdir(root .. "/Source/Client/Source")
+    mkdir(root .. "/Source/Client/Plugins")
+    mkdir(root .. "/Source/Client/TypeScript")
+    mkdir(root .. "/Source/Client/typescript")
+    mkdir(root .. "/Source/Config/Raw/Tables")
+    write_file(root .. "/Source/Client/Client.uproject", "{}")
+
+    local dirs = ue._project_index_dirs_for_test({ project_root = root })
+    t.assert_true(contains(dirs, "Source/Client/Source"),
+      "应扫描 nested 项目的 Source，实际=" .. vim.inspect(dirs))
+    t.assert_true(contains(dirs, "Source/Client/Plugins"), "应扫描 nested 项目的 Plugins")
+    t.assert_false(contains(dirs, "Source"),
+      "不得退回扫描整个 project_root/Source（会把 Config/SDK/生成数据吞进 cindex）")
+    t.assert_false(ue._project_scan_roots_match_for_test({ project_root = root }, nil),
+      "旧缓存没有 scan roots 身份时必须失效")
+    t.assert_true(ue._project_scan_roots_match_for_test({ project_root = root }, dirs),
+      "相同 scan roots 才能复用缓存")
+    local case_dirs = ue._existing_relative_dirs_for_test(root, {
+      "Source/Client/TypeScript",
+      "Source/Client/typescript",
+    })
+    t.assert_eq(#case_dirs, vim.fn.has("win32") == 1 and 1 or 2,
+      "Windows 上大小写等价的扫描根不得让 fd 重复遍历同一棵树")
+
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("standard layout 仍保留原有根级默认目录", function()
+    local root = vim.fn.tempname():gsub("\\", "/") .. "_standard_project"
+    mkdir(root .. "/Source")
+    mkdir(root .. "/Plugins")
+    write_file(root .. "/Game.uproject", "{}")
+
+    local dirs = ue._project_index_dirs_for_test({ project_root = root })
+    t.assert_true(contains(dirs, "Source"))
+    t.assert_true(contains(dirs, "Plugins"))
+
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("nested layout 有多个 uproject 时保守回退根级目录", function()
+    local root = vim.fn.tempname():gsub("\\", "/") .. "_ambiguous_nested_project"
+    mkdir(root .. "/Source/Client/Source")
+    write_file(root .. "/Source/Client/A.uproject", "{}")
+    write_file(root .. "/Source/Client/B.uproject", "{}")
+
+    local dirs = ue._project_index_dirs_for_test({ project_root = root })
+    t.assert_true(contains(dirs, "Source"), "多个 .uproject 时不得擅自选择项目锚点")
+    t.assert_false(contains(dirs, "Source/Client/Source"))
+
+    pcall(vim.fn.delete, root, "rf")
+  end)
+end)
+
 -- ── .clangd 同步：engine + 引擎树外 project root 双写（2026-07-24）──────────
 -- 根因回归：project 在 E:、engine 在 D: 时，clangd 从 E: 源文件向上找不到
 -- D: 的 .clangd（无 Background: Skip）→ 对 CDB 里 ~半数的 project TU 全量

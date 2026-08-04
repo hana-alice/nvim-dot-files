@@ -32,6 +32,12 @@ local function fixture()
   return root, engine
 end
 
+local function find_command(context, nvim_command)
+  for _, command in ipairs(context.commands or {}) do
+    if command.nvim_command == nvim_command then return command end
+  end
+end
+
 t.describe("ue.ai_context", function()
   t.it("按引擎 state 解析项目、Android Development 和原生命令", function()
     local root, engine = fixture()
@@ -55,7 +61,7 @@ t.describe("ue.ai_context", function()
     t.assert_eq(context.artifacts.install_command[3], "SERIAL-CONTEXT")
     t.assert_eq(context.artifacts.install_command[4], "install")
     t.assert_eq(context.artifacts.install_command[5], "-r")
-    t.assert_nil(context.commands[2].native_action)
+    t.assert_nil(assert(find_command(context, ":UEInstallAndroid")).native_action)
   end)
 
   t.it("Markdown 同时包含键位、Neovim 命令和解析结果", function()
@@ -81,6 +87,7 @@ t.describe("ue.ai_context", function()
     vim.fn.delete(root, "rf")
 
     t.assert_nil(context.artifacts.install_command)
-    t.assert_contains(context.commands[2].native_action or "", ":UESetAndroidDevice")
+    local install = assert(find_command(context, ":UEInstallAndroid"))
+    t.assert_contains(install.native_action or "", ":UESetAndroidDevice")
   end)
 end)

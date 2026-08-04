@@ -25,6 +25,14 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
    （`@AGENTS.md` stub）。Codex 读 `AGENTS.md`；Claude 读 `CLAUDE.md` 并由 stub 展开同一内容。
    目录无本地规则时回落最近祖先目录。
 
+### 读取范围纪律（避免过度扫描）
+
+- SESSION START 前置在**每个新 context 只执行一次**；同一 context 内已经读过且未变化的规则或文档，不因每个小任务重复读取。
+- 本地规则只读**实际将修改目录**所适用的最近 `AGENTS.md`；不得遍历、批量读取无关子系统的 AGENTS/spec 文档。
+- OpenSpec 只读取并验证当前 change 及其直接影响的主规格；仅在用户要求全局审计或影响面确实无法界定时使用 `openspec validate --all`。
+- 全量回归是提交/合并前的**执行门禁**，不等于需要预先阅读全部测试、spec 或 agent 规则；先按实际影响面读取，再按门禁运行测试。
+- 只有目标文件、约束或依赖关系发生变化，或出现需要消歧的新证据时，才扩大读取范围。
+
 ## 子系统速查
 
 | 子系统 | 位置 | 本地规则（内容源） | 一句话 |
@@ -34,6 +42,7 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 | CDB 流水线 | `lua/ue/cdb/` | `lua/ue/cdb/AGENTS.md` | compile_commands.json 生成/裁剪/注入 |
 | DAP 调试 | `lua/ue/dap/` | `lua/ue/dap/AGENTS.md` | codelldb + Android platform 模式 |
 | Android device | `lua/utils/android_device.lua` | `lua/utils/AGENTS.md` | 名称+serial picker；会话全局 serial；统一 `adb -s` |
+| Android SO 快速迭代 | `lua/ue.lua` + `scripts/ue_android_so_*.ps1` | `scripts/AGENTS.md` | `<leader>us` 只编 SO；`<leader>uq` root 替换、回滚、验证 |
 | goto 解析栈 | `lua/utils/ue_goto/` | `lua/utils/ue_goto/AGENTS.md` | 5 层 fallback：TS→cache→clangd→csearch→gtags |
 | 代码搜索 | `lua/utils/code_search/` | `lua/utils/code_search/AGENTS.md` | csearch 亚秒级 grep（兜底，非主路） |
 | 平台驱动 | `lua/utils/platform/` | `lua/utils/platform/AGENTS.md` | 唯一允许做 OS 分支的地方 |
@@ -44,7 +53,7 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 
 > 每个主要目录同时有一份 `CLAUDE.md`（内容为 `@AGENTS.md` 导入 stub），供 Claude 读取。
 
-详见 `docs/architecture/overview.md`（数据流 / 平台层 / 构建流水线 / 归属边界）。
+详见 `docs/architecture/overview.md`（数据流 / 平台层 / 构建流水线 / 归属边界）。Android SO 快速部署只面向 root 测试设备；正常 APK 安装和未 strip 主机符号文件仍是正式流程与调试真相。
 
 ## 知识库各区
 

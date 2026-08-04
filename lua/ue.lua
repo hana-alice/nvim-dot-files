@@ -1720,12 +1720,20 @@ M.GLOBS_ALL = vim.tbl_map(function(ext) return "*." .. ext end, M.FT_ALL)
 
 local function existing_relative_dirs(root, search_paths)
   local dirs = {}
+  local seen = {}
   for _, search_path in ipairs(search_paths or {}) do
-    if _ufs.is_dir(join(root, search_path)) then
+    local absolute = join(root, search_path)
+    local key = _uplat.is_windows and absolute:lower() or absolute
+    if not seen[key] and _ufs.is_dir(absolute) then
+      seen[key] = true
       table.insert(dirs, search_path)
     end
   end
   return dirs
+end
+
+function M._existing_relative_dirs_for_test(root, search_paths)
+  return existing_relative_dirs(root, search_paths)
 end
 
 local function filter_gtags_paths(paths)
@@ -1851,8 +1859,29 @@ function CORE_RT.project_module_anchor(project_root)
   end
 
   local anchor = project_root
-  local nested = vim.fn.globpath(join(project_root, "Source"), "*/*.uproject", false, true)
-  if type(nested) == "table" and #nested == 1 then
+  -- Inspect exactly Source/*/*.uproject without editor glob options. globpath()
+  -- can omit valid files under the test/runtime option set on Windows, while
+  -- this shallow libuv walk is deterministic and avoids a recursive Source scan.
+  local nested = {}
+  local uvfs = vim.uv or vim.loop
+  local source_scan = uvfs.fs_scandir(join(project_root, "Source"))
+  while source_scan and #nested <= 1 do
+    local dir_name, dir_type = uvfs.fs_scandir_next(source_scan)
+    if not dir_name then break end
+    if dir_type == "directory" then
+      local child_root = join(project_root, "Source", dir_name)
+      local child_scan = uvfs.fs_scandir(child_root)
+      while child_scan do
+        local file_name, file_type = uvfs.fs_scandir_next(child_scan)
+        if not file_name then break end
+        if file_type == "file" and file_name:lower():match("%.uproject$") then
+          nested[#nested + 1] = join(child_root, file_name)
+          if #nested > 1 then break end
+        end
+      end
+    end
+  end
+  if #nested == 1 then
     anchor = norm(_ufs.dirname(nested[1]))
   end
 
@@ -1864,7 +1893,10 @@ end
 -- one entry per line, # for comments. Each entry is a root-relative directory
 -- (e.g. `Source/Client/Source`, `Source/Protocol`). When the file exists, it
 -- REPLACES UE_CONST.PROJECT_INDEX_DIRS for this project. When absent, the
--- default PROJECT_INDEX_DIRS is used (legacy behavior).
+-- default PROJECT_INDEX_DIRS is used. For the supported nested layout
+-- (<project_root>/Source/<Project>/<Project>.uproject), defaults are resolved
+-- relative to the .uproject directory so a broad project_root/Source scan does
+-- not pull sibling config tables, SDKs, and generated data into the index.
 --
 -- Why whitelist > blacklist (.ueprepare-scan-ignore was deleted): some
 -- projects bury non-source data (config tables, SDK toolchains, art assets)
@@ -1876,7 +1908,7 @@ end
 CORE_RT.project_index_dirs_cache = CORE_RT.project_index_dirs_cache or {}
 
 function CORE_RT.project_index_dirs(ctx)
-  local project_root = ctx and ctx.project_root or nil
+  local project_root = norm(ctx and ctx.project_root or "")
   if not project_root or project_root == "" then
     return UE_CONST.PROJECT_INDEX_DIRS
   end
@@ -1900,9 +1932,34 @@ function CORE_RT.project_index_dirs(ctx)
     if #dirs == 0 then dirs = nil end -- empty file -> fall back to default
   end
 
-  local result = dirs or UE_CONST.PROJECT_INDEX_DIRS
+  local result = dirs
+  if not result then
+    local anchor = CORE_RT.project_module_anchor(project_root)
+    if anchor ~= project_root and _ufs.path_has_prefix(anchor, project_root) then
+      local prefix = _ufs.relative_to(project_root, anchor)
+      result = vim.tbl_map(function(relative)
+        return join(prefix, relative)
+      end, UE_CONST.PROJECT_INDEX_DIRS)
+    else
+      result = UE_CONST.PROJECT_INDEX_DIRS
+    end
+  end
   CORE_RT.project_index_dirs_cache[project_root] = result
   return result
+end
+
+-- Test seam: keep scan-root policy observable without exposing CORE_RT.
+function M._project_index_dirs_for_test(ctx)
+  return vim.deepcopy(CORE_RT.project_index_dirs(ctx))
+end
+
+function CORE_RT.project_scan_roots_match(ctx, recorded)
+  return type(recorded) == "table"
+    and vim.deep_equal(recorded, CORE_RT.project_index_dirs(ctx))
+end
+
+function M._project_scan_roots_match_for_test(ctx, recorded)
+  return CORE_RT.project_scan_roots_match(ctx, recorded)
 end
 
 local function project_module_scope(project_root, path)
@@ -2202,6 +2259,13 @@ local function prepare_cache_ready(ctx)
     end
   end
   if not db_ready(ctx.paths.workspace_db) then
+    return false
+  end
+  -- Scan roots are part of the cache identity. This invalidates pre-fix lists
+  -- that scanned project_root/Source broadly, and also makes whitelist/layout
+  -- changes trigger one deliberate rebuild instead of reusing stale file sets.
+  local state = read_state(ctx.engine_root)
+  if not CORE_RT.project_scan_roots_match(ctx, state.project_scan_roots) then
     return false
   end
   -- Worktree-drift check: if .git/index of either repo is newer than our
@@ -2508,6 +2572,22 @@ function CORE_RT.csearch_smart_build(ctx, cs_ctx, abs_list, cb)
 
   -- Gather diff inputs.
   local old_list = snap_path and read_list_file(snap_path) or nil
+  -- The sidecar predates the primary csearch index and can be absent after an
+  -- upgrade or interrupted cleanup. Rebuild it without a full reset only when
+  -- two independent facts agree: the primary index is usable, and the current
+  -- canonical workspace list has the exact fingerprint recorded after the last
+  -- successful build. The absolute temp list cannot be hashed for this check
+  -- because workspace_all.files is workspace-relative on same-drive entries.
+  if not old_list and snap_path and ctx and ctx.paths and ctx.paths.workspace_all_list then
+    local state = read_state(ctx.engine_root)
+    local recorded = state and state.csearch_input_hash or nil
+    local current = CORE_RT.list_fingerprint(ctx.paths.workspace_all_list)
+    local ok_indexed, indexed = pcall(code_search.is_indexed, cs_ctx)
+    if ok_indexed and indexed and type(recorded) == "string" and recorded ~= ""
+        and current == recorded then
+      old_list = new_list
+    end
+  end
   local added, removed_n = {}, 0
   if old_list then
     for _, p in ipairs(new_list.list) do
@@ -4442,7 +4522,7 @@ end
 --- @param path string the compile_commands.json file to process
 --- @param targets string[]|nil list of compile_commands targets; after pipeline
 ---        finishes the first target is copied to the others and clangd restarts.
---- @param on_done fun()? optional callback run AFTER the pipeline job completes.
+--- @param on_done fun(ok:boolean, err:string?)? optional callback run AFTER the pipeline job completes.
 ---        CRITICAL: anything that reads/writes the base compile_commands.json
 ---        (e.g. cdb_partition) MUST run here, not concurrently with the async
 ---        pipeline — otherwise the two writers tear the file mid-write and the
@@ -4458,7 +4538,7 @@ local function run_compile_commands_pipeline(path, targets, on_done)
     notify    = function(msg, level) vim.notify(msg, level) end,
     log_error = function(scope, msg) require("utils.log").notify_error(scope, msg) end,
   })
-  pipeline.run(path, targets, on_done)
+  return pipeline.run(path, targets, on_done)
 end
 
 local function write_compile_commands_targets(ctx, content)
@@ -4510,7 +4590,20 @@ local function export_compile_commands_to_engine_root(ctx)
 end
 
 local function generate_compile_commands(ctx, progress)
+  local pipeline = require("ue.cdb.pipeline")
+  if pipeline.is_running() then
+    return false, "compile_commands pipeline is already running"
+  end
+
   local targets = compile_commands_targets(ctx)
+
+  local function start_pipeline(path)
+    local jobid, pipeline_err = run_compile_commands_pipeline(path, targets)
+    if jobid == nil then
+      return false, pipeline_err or "compile_commands pipeline failed to start"
+    end
+    return true
+  end
 
   -- PRIMARY: generate from .rsp files. UBT writes one Module.<Mod>.{cpp.obj,cppa8.o}.rsp
   -- per unity TU at compile time, containing the exact clang/MSVC command line
@@ -4526,7 +4619,8 @@ local function generate_compile_commands(ctx, progress)
   --      actually used, so PCH/macro mismatches are eliminated by construction.
   local rsp_count, rsp_path = generate_compile_commands_from_rsp(ctx, progress)
   if rsp_count and rsp_count > 0 then
-    run_compile_commands_pipeline(targets[1], targets)
+    local ok_pipeline, pipeline_err = start_pipeline(targets[1])
+    if not ok_pipeline then return false, pipeline_err end
     return true, rsp_path .. " (" .. rsp_count .. " entries from .rsp files)"
   end
 
@@ -4535,7 +4629,8 @@ local function generate_compile_commands(ctx, progress)
   for _, target in ipairs(targets) do
     if _ufs.is_file(target) and vim.fn.getfsize(target) > 1024 then
       slim_compile_commands_file(target)
-      run_compile_commands_pipeline(target, targets)
+      local ok_pipeline, pipeline_err = start_pipeline(target)
+      if not ok_pipeline then return false, pipeline_err end
       return true, target .. " (UBT, existing)"
     end
   end
@@ -4543,7 +4638,8 @@ local function generate_compile_commands(ctx, progress)
   -- FALLBACK 2: search candidate locations (Engine/Intermediate/Build/, project root, fd search)
   local ok_existing, existing_path = export_compile_commands_to_engine_root(ctx)
   if ok_existing then
-    run_compile_commands_pipeline(targets[1], targets)
+    local ok_pipeline, pipeline_err = start_pipeline(targets[1])
+    if not ok_pipeline then return false, pipeline_err end
     return true, existing_path .. " (UBT)"
   end
 
@@ -4562,7 +4658,8 @@ end
 -- Kept as `android_build_command` for now to avoid breaking the public
 -- M.android_build_command API surface; rename together when there are
 -- no external callers left.
-local function android_build_command(ctx)
+local function android_build_command(ctx, opts)
+  opts = opts or {}
   local uproject = ctx.uproject or find_uproject_in_dir(ctx.project_root)
   if not uproject then
     return nil, "No .uproject found in project root: " .. ctx.project_root
@@ -4576,16 +4673,57 @@ local function android_build_command(ctx)
   local plat = target_platform(ctx.engine_root, nil)
   local conf = target_configuration(ctx.engine_root, ctx.project_root, uproject, plat)
   local kind = target_kind(ctx.engine_root, ctx.project_root, uproject, plat)
+  local target_name = build_target_name(ctx.project_root, uproject, kind)
+
+  if opts.skip_deploy == true then
+    if plat ~= "Android" then
+      return nil, "UEBuildAndroidSO requires target platform Android; current platform: " .. plat
+    end
+    if not is_windows_path(ctx.engine_root) then
+      return nil, "UEBuildAndroidSO currently requires a Windows UE host"
+    end
+
+    local engine_root_win = windows_engine_root(ctx)
+    local script = join(vim.fn.stdpath("config"), "scripts", "ue_android_so_build.ps1")
+    local script_win = to_windows_path(script)
+    if not engine_root_win or engine_root_win == "" or not script_win then
+      return nil, "Failed to resolve Windows paths for Android SO build"
+    end
+    if not _ufs.is_file(script) then
+      return nil, "Android SO build script not found: " .. script
+    end
+
+    return {
+      "powershell.exe",
+      "-NoLogo",
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      script_win,
+      "-EngineRoot",
+      engine_root_win,
+      "-Project",
+      uproject_win,
+      "-Target",
+      target_name,
+      "-Platform",
+      plat,
+      "-Configuration",
+      conf,
+      "-WaitMutex",
+      "-FromMsBuild",
+    }
+  end
 
   local build_args = {
-    build_target_name(ctx.project_root, uproject, kind),
+    target_name,
     plat,
     conf,
     "-Project=" .. uproject_win,
     "-WaitMutex",
     "-FromMsBuild",
   }
-
   if is_windows_path(ctx.engine_root) then
     local engine_root_win = windows_engine_root(ctx)
     if not engine_root_win or engine_root_win == "" then
@@ -6153,7 +6291,11 @@ function M.android_build_command(opts)
   if not ctx.project_root then
     return nil, "No project configured for engine root. Run :UESetProject [path]"
   end
-  return android_build_command(ctx)
+  return android_build_command(ctx, opts)
+end
+
+function M._android_build_command_for_test(ctx, opts)
+  return android_build_command(ctx, opts)
 end
 
 -- ==========================================================================
@@ -6586,6 +6728,11 @@ function CORE_RT.fast_swap_active_platform(engine_root)
   -- stale platform's shard.
   ctx.state = read_state(engine_root)
 
+  local pipeline = require("ue.cdb.pipeline")
+  if pipeline.is_running() then
+    return false, nil, "compile_commands pipeline is already running"
+  end
+
   local shards = require("ue.cdb.shards")
   local manifest = shards.read_manifest(ctx)
   if not manifest or not manifest.shards or not next(manifest.shards) then
@@ -6618,7 +6765,10 @@ function CORE_RT.fast_swap_active_platform(engine_root)
 
   -- Run the standard post-process chain (slim + PCH FI inject + resolve +
   -- unify + prune) so clangd sees the same cdb shape as after :UEPrepare.
-  run_compile_commands_pipeline(targets[1], targets)
+  local pipeline_jobid, pipeline_err = run_compile_commands_pipeline(targets[1], targets)
+  if pipeline_jobid == nil then
+    return false, nil, pipeline_err or "compile_commands pipeline failed to start"
+  end
 
   -- Tell clangd to reload. LspRestart is async — clangd reads the new cdb on
   -- attach, so any open buffer will pick up the swap within ~1s.
@@ -6743,7 +6893,8 @@ local export_compile_commands
 -- to fill this local, which silently broke after the tiered split (different
 -- main chunks don't share locals). See build_android() below.
 
-local function build_android()
+local function build_android(opts)
+  opts = opts or {}
   local ctx, err = resolve_context()
   if not ctx then
     vim.notify(err, vim.log.levels.WARN)
@@ -6759,9 +6910,15 @@ local function build_android()
 
   local plat = target_platform(ctx.engine_root, nil)
   local conf = selected_target_configuration(ctx.engine_root, ctx.project_root, ctx.uproject, plat)
-  local title = ("UEBuild %s %s"):format(plat, conf)
+  local so_only = opts.skip_deploy == true
+  if so_only and plat ~= "Android" then
+    vim.notify("UEBuildAndroidSO requires target platform Android; current platform: " .. plat,
+      vim.log.levels.WARN)
+    return
+  end
+  local title = ((so_only and "UEBuildAndroidSO" or "UEBuild") .. " %s %s"):format(plat, conf)
 
-  local cmd, build_err = android_build_command(ctx)
+  local cmd, build_err = android_build_command(ctx, { skip_deploy = so_only })
   if not cmd then
     set_build_status("BERR")
     require("utils.log").notify_error("ue.build", title .. " failed: " .. build_err)
@@ -6770,7 +6927,11 @@ local function build_android()
 
   if plat == "Android" then
     local cleanup = require("ue.dap").stop_android_debugger({ kill_orphans = true })
-    cleanup_gradle_debug_artifacts(ctx)
+    -- SO-only builds never enter UBT's DeployAfterCompile/MakeApk phase, so
+    -- deleting Gradle packaging state here would only slow the next real APK.
+    if not so_only then
+      cleanup_gradle_debug_artifacts(ctx)
+    end
     if cleanup.disconnected or cleanup.adapter_killed or cleanup.orphan_killed > 0 then
       local parts = {}
       if cleanup.disconnected then
@@ -6825,6 +6986,60 @@ local function find_apk(ctx)
   return best
 end
 
+local function find_android_so(ctx)
+  local pr = uproject_dir(ctx)
+  if not pr or pr == "" then return nil end
+
+  local uproject = ctx.uproject or find_uproject_in_dir(ctx.project_root)
+  if not uproject then return nil end
+  local platform = target_platform(ctx.engine_root, nil)
+  local configuration = target_configuration(ctx.engine_root, ctx.project_root, uproject, platform)
+  local kind = target_kind(ctx.engine_root, ctx.project_root, uproject, platform)
+  local target = build_target_name(ctx.project_root, uproject, kind)
+  local exact = join(pr, "Binaries", "Android", ("%s-Android-%s-arm64.so"):format(target, configuration))
+  return _ufs.is_file(exact) and exact or nil
+end
+
+local function android_so_deploy_command(ctx, serial, package_name)
+  serial = trim(serial)
+  package_name = trim(package_name)
+  if serial == "" then return nil, "Android device is not selected; run :UESetAndroidDevice" end
+  if package_name == "" then return nil, "Android package is not configured; run :UESetAndroidPackage" end
+
+  local source_so = find_android_so(ctx)
+  if not source_so then
+    return nil, "Android SO not found; run :UEBuildAndroidSO first"
+  end
+
+  local script = join(vim.fn.stdpath("config"), "scripts", "ue_android_so_deploy.ps1")
+  if not _ufs.is_file(script) then
+    return nil, "Android SO deploy script not found: " .. script
+  end
+  local script_win = to_windows_path(script)
+  local source_so_win = to_windows_path(source_so)
+  if not script_win or not source_so_win then
+    return nil, "Failed to resolve Windows paths for Android SO deploy"
+  end
+
+  return {
+    "powershell.exe",
+    "-NoLogo",
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    script_win,
+    "-Adb",
+    "adb",
+    "-Serial",
+    serial,
+    "-Package",
+    package_name,
+    "-SourceSo",
+    source_so_win,
+  }
+end
+
 function M.ai_context(engine_root)
   engine_root = norm(trim(engine_root or ""))
   if engine_root == "" then
@@ -6864,8 +7079,17 @@ function M.ai_context(engine_root)
   local kind = target_kind(engine_root, project_root, uproject, platform)
   local target_name = build_target_name(project_root, uproject, kind)
   local build_command, build_error = android_build_command(ctx)
+  local so_build_command, so_build_error
+  if platform == "Android" then
+    so_build_command, so_build_error = android_build_command(ctx, { skip_deploy = true })
+  else
+    so_build_error = "UEBuildAndroidSO requires target platform Android."
+  end
   local apk = find_apk(ctx)
   local selected_android_serial = require("utils.android_device").get()
+  local so_deploy_command, so_deploy_error = android_so_deploy_command(
+    ctx, selected_android_serial, state.android_package
+  )
   local install_command = apk and selected_android_serial and require("utils.android_device").adb_args(
     "adb", selected_android_serial, { "install", "-r", to_windows_path(apk) or apk }) or nil
   local install_native_action
@@ -6902,6 +7126,10 @@ function M.ai_context(engine_root)
     artifacts = {
       build_command = build_command,
       build_error = build_error,
+      so_build_command = so_build_command,
+      so_build_error = so_build_error,
+      so_deploy_command = so_deploy_command,
+      so_deploy_error = so_deploy_error,
       latest_apk = apk,
       install_command = install_command,
       compile_commands = join(engine_root, "compile_commands.json"),
@@ -6914,6 +7142,20 @@ function M.ai_context(engine_root)
         purpose = "Build the active UE target using the persisted platform and configuration.",
         native_command = build_command,
         native_action = build_error,
+      },
+      {
+        key = "<Space>us",
+        nvim_command = ":UEBuildAndroidSO",
+        purpose = "Compile and link the Android target without UBT's APK deployment phase.",
+        native_command = so_build_command,
+        native_action = so_build_error,
+      },
+      {
+        key = "<Space>uq",
+        nvim_command = ":UEDeployAndroidSO",
+        purpose = "Strip and atomically replace libUE4.so on the selected rooted Android device.",
+        native_command = so_deploy_command,
+        native_action = so_deploy_error,
       },
       {
         key = "<Space>ui",
@@ -6995,6 +7237,42 @@ end
 
 local function android_install_argv(adb, serial, apk)
   return require("utils.android_device").adb_args(adb, serial, { "install", "-r", apk })
+end
+
+local function deploy_android_so()
+  local ctx, err = resolve_context()
+  if not ctx then
+    vim.notify(err, vim.log.levels.WARN)
+    return
+  end
+  if target_platform(ctx.engine_root, nil) ~= "Android" then
+    vim.notify("UEDeployAndroidSO requires target platform Android", vim.log.levels.WARN)
+    return
+  end
+
+  local android_device = require("utils.android_device")
+  local serial = android_device.get()
+  if not serial then
+    android_device.ensure({ prompt = "Select Android device for SO deploy:" }, function(selected)
+      if selected then deploy_android_so() end
+    end)
+    return
+  end
+
+  local state = read_state(ctx.engine_root)
+  local cmd, command_err = android_so_deploy_command(ctx, serial, state.android_package)
+  if not cmd then
+    require("utils.log").notify_error("ue.android", command_err)
+    return
+  end
+
+  require("ue.dap").stop_android_debugger({ kill_orphans = true })
+  open_terminal_command(cmd, {
+    cwd = windows_host_cwd(),
+    quickfix_title = "UEDeployAndroidSO",
+    quickfix_root = workspace_root(ctx),
+    tail_limit = 20,
+  })
 end
 
 local function install_android()
@@ -7318,6 +7596,7 @@ local function prepare()
 
   table.sort(workspace_all)
   write_lines(ctx.paths.workspace_all_list, workspace_all)
+  update_state_field(ctx.engine_root, "project_scan_roots", CORE_RT.project_index_dirs(ctx))
 
   local ok_workspace, workspace_err = build_gtags_db(root, ctx.paths.workspace_list, ctx.paths.workspace_db, "workspace")
   if not ok_workspace then
@@ -7439,6 +7718,12 @@ local function prepare_async(opts)
     return
   end
 
+  local cdb_pipeline = require("ue.cdb.pipeline")
+  if M._prepare_running or cdb_pipeline.is_running() then
+    vim.notify("UEPrepare is already running", vim.log.levels.INFO)
+    return
+  end
+
   if CORE_RT.prepare_jobid then
     local ok_wait, result = pcall(vim.fn.jobwait, { CORE_RT.prepare_jobid }, 0)
     if ok_wait and result and result[1] == -1 then
@@ -7520,6 +7805,11 @@ local function prepare_async(opts)
     end
   end
 
+  -- Cover the entire fast path, including async CDB generation and the writer
+  -- pipeline. Previously only the cold GTAGS phase set this flag, so two quick
+  -- :UEPrepare calls could concurrently rewrite compile_commands.json.
+  set_prepare_running(true)
+
   -- ── Cache fast-path ──────────────────────────────────────────────────
   if prepare_cache_ready(ctx) then
     CORE_RT.trace_mark("FAST_PATH_TAKEN")
@@ -7536,6 +7826,7 @@ local function prepare_async(opts)
         if not ok_compile then
           invalidate_status_cache()
           refresh_statusline()
+          set_prepare_running(false)
           populate_quickfix_from_output("UEPrepare compile_commands", compile_path, { root = root })
           vim.notify("UEPrepare compile_commands failed: " .. compile_path, vim.log.levels.WARN)
           if handle then handle.message = "FAILED"; handle:finish() end
@@ -7554,7 +7845,16 @@ local function prepare_async(opts)
         -- partition START fell inside [pipeline START, pipeline EXIT].
         -- Fix: hand partition to the pipeline's on_done so it is strictly
         -- serialized after expand→pch→resolve→unify→prune finishes.
-        run_compile_commands_pipeline(targets_main[1], targets_main, function()
+        run_compile_commands_pipeline(targets_main[1], targets_main, function(ok_pipeline, pipeline_err)
+          if not ok_pipeline then
+            invalidate_status_cache()
+            refresh_statusline()
+            set_prepare_running(false)
+            if handle then handle.message = "FAILED"; handle:finish() end
+            vim.notify("UEPrepare compile_commands pipeline failed: " .. tostring(pipeline_err),
+              vim.log.levels.ERROR, { title = "UE" })
+            return
+          end
           -- Partition base CDB by (plat, cfg) so clangd's gd on macros like
           -- UE_BUILD_DEVELOPMENT does not jump into stale Dev generated headers
           -- when the current build is Test. See INDEX_FN.partition_base_cdb.
@@ -7563,11 +7863,15 @@ local function prepare_async(opts)
             vim.notify("UEPrepare: cdb_partition failed -- " .. tostring(msg_p),
               vim.log.levels.WARN, { title = "ue.cdb" })
           end
+          clear_index_dirty(ctx)
+          INDEX_FN.schedule_index_refresh(ctx,
+            { current = true, hot = true, full = true, current_delay_ms = 50, hot_delay_ms = 2500 })
+          invalidate_status_cache()
+          refresh_statusline()
+          set_prepare_running(false)
+          if handle then handle.message = "done"; handle.percentage = 100; handle:finish() end
+          vim.notify(prepare_summary(ctx, compile_path, { reused_cache = true }))
         end)
-        clear_index_dirty(ctx)
-        INDEX_FN.schedule_index_refresh(ctx, { current = true, hot = true, full = true, current_delay_ms = 50, hot_delay_ms = 2500 })
-        invalidate_status_cache()
-        refresh_statusline()
 
         -- csearch index rebuild (same logic as before, just moved here).
         local code_search_fp = require("utils.code_search")
@@ -7645,8 +7949,6 @@ local function prepare_async(opts)
           end
         end
 
-        if handle then handle.message = "done"; handle.percentage = 100; handle:finish() end
-        vim.notify(prepare_summary(ctx, compile_path, { reused_cache = true }))
       end)
     return
   end
@@ -7662,7 +7964,6 @@ local function prepare_async(opts)
     require("utils.log").notify_error("ue.prepare", "UEPrepare failed: " .. msg)
   end
 
-  set_prepare_running(true)
   start_phase()
 
   local function continue_after_scan(project_rel, engine_rel)
@@ -7730,6 +8031,7 @@ local function prepare_async(opts)
 
       table.sort(workspace_all)
       write_lines(ctx.paths.workspace_all_list, workspace_all)
+      update_state_field(ctx.engine_root, "project_scan_roots", CORE_RT.project_index_dirs(ctx))
     end)
 
     end_phase("lists")
@@ -8262,6 +8564,10 @@ function M._android_install_argv_for_test(adb, serial, apk)
   return android_install_argv(adb, serial, apk)
 end
 
+function M._android_so_deploy_command_for_test(ctx, serial, package_name)
+  return android_so_deploy_command(ctx, serial, package_name)
+end
+
 function M.setup()
   if CORE_RT.setup_done then
     return
@@ -8436,6 +8742,10 @@ function M.setup()
   vim.api.nvim_create_user_command("UEGenerateFromRSP", prepare_async, {})
   vim.api.nvim_create_user_command("UEBuild", build_android, {})
   vim.api.nvim_create_user_command("UEBuildAndroid", build_android, {})
+  vim.api.nvim_create_user_command("UEBuildAndroidSO", function()
+    build_android({ skip_deploy = true })
+  end, {})
+  vim.api.nvim_create_user_command("UEDeployAndroidSO", deploy_android_so, {})
   vim.api.nvim_create_user_command("UELaunch", function()
     M.launch_app()
   end, {})

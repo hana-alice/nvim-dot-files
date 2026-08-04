@@ -24,9 +24,6 @@ return {
       clangd = vim.tbl_deep_extend("force", clangd, {
         mason = false,
         cmd = require("ue").clangd_cmd(),
-        capabilities = {
-          offsetEncoding = { "utf-16" },
-        },
         on_new_config = function(new_config, root_dir)
           new_config.cmd = require("ue").clangd_cmd(root_dir)
         end,

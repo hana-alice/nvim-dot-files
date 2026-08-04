@@ -148,6 +148,8 @@ go install ./...   # 需 Go >= 1.22，且 $GOBIN 在 PATH
 | 工程级 grep | `<leader>/` |
 | 文件 picker | `<leader><leader>` |
 | 编译（当前平台） | `<leader>ub` / `:UEBuild` |
+| 仅编译 Android SO（跳过 APK） | `<leader>us` / `:UEBuildAndroidSO` |
+| Android SO 快速部署（root 设备） | `<leader>uq` / `:UEDeployAndroidSO` |
 | 启动 Editor | `:UELaunch` |
 | 增删文件后重建索引 | `:UEPrepareIncremental` |
 | Android：选择设备（名称 + serial，会话全局） | `<leader>uA` / `:UESetAndroidDevice` |

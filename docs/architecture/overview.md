@@ -20,6 +20,7 @@
 | 核心工具 | `lua/ue/core/` | fs / proc 纯函数 | 无副作用，可 headless 断言 |
 | DAP 调试 | `lua/ue/dap/` | codelldb 适配 + 各平台 attach/launch | `platforms` 注册表是唯一 dispatch seam |
 | Android device | `lua/utils/android_device.lua` | `adb devices -l` 枚举、会话级 serial 选择、`adb -s` argv | `vim.g.ue_android_device_serial` 是交互操作真相；活跃任务捕获 serial |
+| Android SO 迭代 | `lua/ue.lua` + `scripts/ue_android_so_*.ps1` | SO-only UBT action 执行、root 原子替换与加载验证 | 不改引擎/项目；只适用于 root 测试设备；正常 APK 流程保持独立 |
 | 符号解析栈 | `lua/utils/ue_goto/` + `lsp_fallback.lua` | gd/gr 的 5 层 fallback | clangd 权威；TS 只省调用；csearch/gtags 兜底 |
 | 代码搜索 | `lua/utils/code_search/` | csearch 亚秒级 grep | 兜底非主路；clangd MISS 时才用 |
 | 平台驱动 | `lua/utils/platform/` | OS 分支唯一收口 | 四驱动同接口；其余代码不做 OS 分支 |
@@ -37,6 +38,9 @@
 - **Android device**：`<Space>uA` / 首次 Android 操作 → `utils.android_device` 异步执行
   `adb devices -l` → picker 展示名称 + serial → `vim.g.ue_android_device_serial`；install / launch /
   logcat / 新 DAP session 捕获该值并统一形成 `adb -s <serial> ...`。
+- **Android SO 快速迭代**：`<Space>us` → UBT 导出/执行 outdated action graph，不进入 Gradle；
+  `<Space>uq` → 对当前配置 SO 生成与 APK 一致的 stripped 临时副本 → 按 selected serial 动态解析
+  `nativeLibraryDir` → 备份、原子替换、metadata/hash/PID/maps 验证，失败自动回滚。
 - **DAP**：`UEDAP*` 命令 → `ue.dap.platforms` 按当前平台 dispatch → 具体平台 `attach/launch`
   → codelldb（Win64/Android）。Android 走 platform 模式 + serial connect URL；K30 URL 与本次
   session 捕获的 ADB serial 必须一致，切换全局值不改变活跃 session 的 poll/cleanup。
@@ -53,7 +57,9 @@
 - 外部工具链版本钉死见 `docs/CONSTRAINTS.md §三 C1`（clangd/LLVM 22.1.x、codelldb 1.12.2、
   NDK lldb-server、Neovim 0.10+）。
 - CDB 生成器（`tools/*.py` + `lua/ue/cdb/*`）：super-unity / prune / inject，写前比对跳过。
+- CDB mutation 由 `lua/ue/cdb/pipeline.lua` 单 writer slot 串行化；UEPrepare fast path 持有该生命周期直到 pipeline/partition 完成，禁止并发撕裂 JSON。
 - csearch 索引：`tools/cindex-uefilter`（Go fork）`-files-from` 干净建索引。
+- Android SO-only：`scripts/ue_android_so_build.ps1` 两阶段执行 UBT action graph；部署脚本只在 root 设备上替换已安装 native library，主机未 strip SO 始终保留为符号源。
 - 端到端搭建流程见 `docs/skills/ue-ide-bootstrap.md`。
 
 ## 5. 关键归属边界（ownership boundaries）
@@ -61,6 +67,8 @@
 - **OS 分支**只在 `lua/utils/platform/`。
 - **Android 设备选择**只在 `lua/utils/android_device.lua`；调用点消费 selected serial，
   活跃长流程只消费启动时捕获的 serial，禁止中途重读 global 后跨设备。
+- **Android SO 快速部署**只在 `scripts/ue_android_so_deploy.ps1` 执行 root 文件替换；Lua 层只解析上下文、serial、包名和当前配置产物，不把设备路径写死进配置。
+- **CDB 写入**只允许一个 pipeline writer；任何后续 partition/mirror 必须通过完成回调串行衔接。
 - **LSP 行为改动**只走 `lua/utils/lsp_fallback.lua` 或 `lua/workarounds/clangd/*`（禁全局 handler 覆盖）。
 - **上游 bug 补丁**只进 `lua/workarounds/<scope>/<name>.lua`（禁 inline monkey-patch）。
 - **goto 精度**只信 clangd（TS 不给答案，csearch/gtags 只兜底）。

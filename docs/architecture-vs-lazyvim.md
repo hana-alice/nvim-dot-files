@@ -117,7 +117,7 @@ ue/
 
 ---
 
-## 2. Instant goto-definition (`lua/utils/ue_goto/`)
+## 2. Contextual C++ goto-definition (`lua/utils/ue_goto/`)
 
 ### LazyVim default
 `gd` -> `vim.lsp.buf.definition()`. On clangd-against-UE this means:
@@ -129,39 +129,39 @@ ue/
   alphabetically, not the right one.
 
 ### What we do instead
-A tier-2 split of what used to be one god module. Five resolution
-layers in a router (`lua/utils/lsp_fallback.lua`):
+C++ `gd` has a compiler-identity authority boundary; non-C++ keeps a
+separate compatibility chain. The implementation is split by responsibility:
 
 ```
 ue_goto/
-  jumper.lua          HARD-contract buffer/cursor switch + jumplist hygiene
-  symbol.lua          symbol identification at cursor (treesitter-first)
-  location.lua        precise location resolution + drift correction
-  ranking.lua         candidate scoring (UE-aware: Engine/Plugins/Project)
-  provider.lua        LSP / ws-symbol / ctags / fallback fan-out
-  cache.lua           result cache so 70%+ requests skip the LSP call
-  csearch_fallback.lua trigram-index fallback for "clangd timed out"
-  syntax_filter.lua   treesitter pre-LSP early-bail for dependent names
-  pair_picker.lua     header/source pair switcher with UE-aware ranking
-  ui.lua              picker + preview
+  semantic_context.lua  pure proven-context / compiler-evidence model
+  semantic_protocol.lua versioned NDJSON request/response contract
+  semantic_sidecar.lua  libclang CDB/TU/canonical-USR resolution
+  semantic_client.lua   async process, stale tokens, overlays, contexts
+  provider.lua          exact-cursor clangd requests for source TUs
+  jumper.lua            HARD-contract buffer/cursor switch + jumplist hygiene
+  location.lua          location normalization/dedup
+  cache.lua             non-C++ compatibility cache only
+  csearch_fallback.lua  non-C++ compatibility fallback only
+  ui.lua                progress/picker UI
 ```
 
 ### Why
-- **Treesitter pre-LSP early-bail**: for C++ template-dependent names
-  clangd cannot answer, but treesitter knows the declaration is two
-  blocks above. We return in **~5 ms** instead of waiting on clangd
-  to time out.
+- **Correct overload identity**: source calls require clangd's exact-cursor
+  unique USR; headers are parsed by libclang in a compiler-emitted origin TU.
+  Function name, arity, candidate order and text indexes never select a C++ target.
+- **Honest terminal states**: missing/invalid/ambiguous semantic context keeps
+  the cursor in place instead of silently choosing a same-name declaration.
+- **Async warm-TU reuse**: cold parse and overlay reparse run in a headless
+  sidecar; repeated queries reuse the same TU without a compiler process per keypress.
 - **Hard jumper contract**: one `<Ctrl-O>` returns to source, exactly
   one jumplist entry, no spurious `(target_buf, 1, 0)` ghost. Written
   as a post-condition in `jumper.lua` and verified in CI.
-- **UE-aware ranking**: when multiple definitions exist (Engine vs
-  Plugin vs Project), the picker shows them in dependency order.
 
 ### Where
 - `lua/utils/ue_goto/jumper.lua` — the contract. Single responsibility.
-- `lua/utils/lsp_fallback.lua` — the router that fans out across the
-  five layers and collapses transient "Resolving..." notifications into
-  one slot.
+- `lua/utils/lsp_fallback.lua` — the C++ authority boundary and non-C++ router.
+- `scripts/ue_clang_semanticd.lua` — isolated libclang process entry.
 - `docs/architecture-symbol-resolution.md` — the long-form architecture
   doc for this stack.
 

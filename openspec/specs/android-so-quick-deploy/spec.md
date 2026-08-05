@@ -91,19 +91,26 @@
 
 #### Scenario: 替换后验证失败
 
-- **WHEN** hash、应用启动、进程存活或运行时映射验证失败
+- **WHEN** metadata 或设备端 hash 验证失败
 - **THEN** 系统 MUST 自动恢复备份的原始 SO
 - **AND** 清理 staging 和同目录临时文件
 
-### Requirement: 部署成功必须有运行时加载证据
+### Requirement: 安装、部署与启动必须显式分离
 
-系统 SHALL 在替换后重新启动应用，并验证运行进程确实映射了动态解析目标路径中的新 `libUE4.so`。
+系统 MUST NOT 在 APK 安装或 SO 替换完成后自动启动应用；应用启动 SHALL 只由用户显式执行 `<leader>ul` / `:UELaunch` 触发。
 
-#### Scenario: 新 SO 已加载
+#### Scenario: APK 安装成功后保持停止
 
-- **WHEN** 应用启动后保持运行
-- **THEN** 系统 SHALL 从 `/proc/<pid>/maps` 找到目标 `libUE4.so` 路径
-- **AND** 在短暂稳定性等待后再次确认进程仍然存活
+- **WHEN** 用户执行 `<leader>ui` / `:UEInstallAndroid` 且安装成功
+- **THEN** 系统 SHALL 在 `adb install -r` 完成后结束操作
+- **AND** 系统 MUST NOT 调用 `monkey`、`am start` 或其他应用启动命令
+
+#### Scenario: SO 替换成功后保持停止
+
+- **WHEN** 用户执行 `<leader>uq` / `:UEDeployAndroidSO` 且 metadata 与 hash 验证成功
+- **THEN** 系统 SHALL 保持应用停止并结束部署
+- **AND** 系统 MUST NOT 启动应用或读取 `/proc/<pid>/maps` 作为部署完成条件
+- **AND** 用户随后可显式执行 `<leader>ul` / `:UELaunch` 启动应用
 
 ### Requirement: 用户入口必须简短且不破坏现有工作流
 

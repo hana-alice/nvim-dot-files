@@ -217,7 +217,7 @@ end
 
 map("n", "gd", function()
   require("utils.lsp_fallback").definition()
-end, { desc = "Definition (LSP -> GTAGS)" })
+end, { desc = "Definition (contextual C++ / LSP fallback)" })
 
 -- Generic background-task manager (list/stop any registered job). Not under
 -- <leader>u* (that namespace is UE-specific); this is a general editor feature.
@@ -228,13 +228,9 @@ map("n", "<leader>Xs", "<cmd>TaskStop<cr>",    { desc = "Tasks: stop one (auto i
 map("n", "<leader>XA", "<cmd>TaskStopAll<cr>", { desc = "Tasks: stop all (confirms first)", nowait = true })
 
 -- Eagerly load utils.lsp_fallback so its :UEDef* user_commands
--- (UEDefTrace / UEDefSelfTest / UEDefReload) are registered at startup
+-- (UEDefTrace / UEDefSelfTest / UEDefReload / UEDefCancel) are registered at startup
 -- — otherwise they only appear after the first gd. ~5ms cost.
 pcall(require, "utils.lsp_fallback")
-
-vim.keymap.set("n", "<leader>gP", function()
-  require("utils.lsp_fallback").jump_to_precise()
-end, { desc = "Jump to precise definition (after instant jump)" })
 
 vim.api.nvim_create_user_command("UEDefStatus", function()
   require("utils.lsp_fallback").status()

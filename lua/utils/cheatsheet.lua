@@ -92,7 +92,6 @@ local tabs = {
           { "<leader>cd",     "Line diagnostics" },
           { "<leader>cl",     "LSP info" },
           { "<leader>ch",     "Switch source / header (clangd)" },
-          { "<leader>gP",     "Switch instant → precise def" },
         },
       },
       {
@@ -203,7 +202,7 @@ local tabs = {
           { "n / N",           "Next / prev match" },
           { "* / #",           "Search word fwd / back" },
           { ":noh",            "Clear search highlight" },
-          { "gd",              "Definition (TS arity filter → LSP → GTAGS → rg)" },
+          { "gd",              "Definition (contextual C++ / LSP fallback)" },
           { "gr",              "References (LSP→GTAGS)" },
           { "gD",              "Declaration" },
           { "gI",              "Implementation" },
@@ -516,7 +515,7 @@ local tabs = {
           { ":UESetPlatform","Select platform + config" },
           { "<leader>ub",    "UEBuild (build current platform)" },
           { "<leader>us",    "Build Android SO only (skip APK)" },
-          { "<leader>uq",    "Quick deploy Android SO (root device)" },
+          { "<leader>uq",    "Deploy Android SO; keep app stopped" },
           { "<leader>uB",    "UEPrepare (CDB + index + clangd)" },
           { ":UEPrepareIncremental", "Prepare dirty files only" },
           { "<leader>uc",    "Export compile_commands" },
@@ -526,7 +525,7 @@ local tabs = {
       {
         title = "Run / Logs",
         mappings = {
-          { "<leader>ui",   "Install APK to selected device" },
+          { "<leader>ui",   "Install APK; keep app stopped" },
           { "<leader>ul",   "Launch app (no debug)" },
           { "<leader>ug/uL","Toggle app log" },
           { "<leader>uD",   "Toggle Win debug log" },

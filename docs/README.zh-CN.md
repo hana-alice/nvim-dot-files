@@ -9,8 +9,8 @@
 
 - **Super-unity 索引**：把 11,593 个翻译单元折叠成约 23 个聚合 TU，在
   Windows/NTFS 上把全量冷索引从**几小时压到约 3 分钟**，且保留 ≥90% 符号。
-- **亚 100ms 跳定义**：UE 量级工程上的 5 层解析链
-  （treesitter → cache → clangd → csearch → gtags）。
+- **上下文感知 C++ 跳定义**：source 用 clangd exact-cursor identity；header 在
+  compiler-emitted evidence 证明的真实 origin TU 中由异步 libclang sidecar 解析重载。
 - **亚秒级工程 grep**：对工程文件清单建 trigram 索引（`FRDGBuilder` 约
   365ms，对比 NTFS 目录遍历的约 14s）。
 - **CDB 超级流水线**：对 `compile_commands.json` 做 expand / PCH 预编译 / 裁剪
@@ -149,11 +149,11 @@ go install ./...   # 需 Go >= 1.22，且 $GOBIN 在 PATH
 | 文件 picker | `<leader><leader>` |
 | 编译（当前平台） | `<leader>ub` / `:UEBuild` |
 | 仅编译 Android SO（跳过 APK） | `<leader>us` / `:UEBuildAndroidSO` |
-| Android SO 快速部署（root 设备） | `<leader>uq` / `:UEDeployAndroidSO` |
+| Android SO 快速部署（root 设备；替换后不启动） | `<leader>uq` / `:UEDeployAndroidSO` |
 | 启动 Editor | `:UELaunch` |
 | 增删文件后重建索引 | `:UEPrepareIncremental` |
 | Android：选择设备（名称 + serial，会话全局） | `<leader>uA` / `:UESetAndroidDevice` |
-| Android：在所选设备安装 / attach / 断点 | `<leader>ui` / `:UEDAPAttach` / `F9` |
+| Android：安装（不启动）/ attach / 断点 | `<leader>ui` / `:UEDAPAttach` / `F9` |
 | 后台任务：列出 / 停止 | `<leader>X` / `:Tasks` / `:TaskStopAll` |
 | 全部命令速查 | `<leader>?` / `:UECheatsheet` |
 

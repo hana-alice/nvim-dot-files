@@ -53,6 +53,60 @@ t.describe("ue.cdb.shaders", function()
   end)
 end)
 
+t.describe("ue.cdb.shards active selection", function()
+  local shards = require("ue.cdb.shards")
+
+  local function manifest(active)
+    return {
+      active = active,
+      shards = {
+        ["Android-Main-Development"] = {
+          platform = "Android", target = "Main", config = "Development",
+          mtime = 100, entry_count = 16000,
+        },
+        ["Android-Hot-Development"] = {
+          platform = "Android", target = "Hot", config = "Development",
+          mtime = 101, entry_count = 1,
+        },
+        ["Win64-Game-Development"] = {
+          platform = "Win64", target = "Game", config = "Development",
+          mtime = 300,
+        },
+        ["Win64-GameEditor-Development"] = {
+          platform = "Win64", target = "GameEditor", config = "Development",
+          mtime = 200,
+        },
+      },
+    }
+  end
+
+  t.it("matching manifest.active beats a newer sibling target", function()
+    local key = shards.active_key({
+      state = { target_platform = "Android", target_configuration = "Development" },
+    }, manifest("Android-Main-Development"))
+    t.assert_eq(key, "Android-Main-Development")
+  end)
+
+  t.it("Editor suffix selects the editor build class when active platform differs", function()
+    local key = shards.active_key({
+      state = { target_platform = "Win64", target_configuration = "Development Editor" },
+    }, manifest("Android-Main-Development"))
+    t.assert_eq(key, "Win64-GameEditor-Development")
+  end)
+
+  t.it("explicit target_name selects that target instead of mtime", function()
+    local key = shards.active_key({
+      state = {
+        target_platform = "Android",
+        target_configuration = "Development",
+        target = "",
+        target_name = "Main",
+      },
+    }, manifest("Win64-Game-Development"))
+    t.assert_eq(key, "Android-Main-Development")
+  end)
+end)
+
 t.describe("ue.cdb.pipeline lifecycle", function()
   local pipeline = require("ue.cdb.pipeline")
 

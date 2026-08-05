@@ -42,7 +42,7 @@ do
   pcall(dofile, cfg .. "/lua/config/keymaps.lua")
   for _, c in ipairs({
     "UEDefStatus", "UEDefTrace", "UEDefSelfTest", "UEDefDiag",
-    "UEDefReload", "UEDefCacheClear",
+    "UEDefReload", "UEDefCacheClear", "UEDefCancel", "UEDefContextClear",
   }) do
     if vim.fn.exists(":" .. c) == 2 then UE_COMMANDS[c] = true end
   end

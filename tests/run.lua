@@ -106,15 +106,9 @@ end
 -- 改为各自 fork 一个 nvim --headless 子进程，用其退出码判定 PASS/FAIL。
 --   * 仅纳入纯 headless（无需 clangd / socket / 真机）且当前稳定通过的脚本，
 --     与 scripts/run_all_tests.ps1 的排除逻辑保持一致；
---   * 需要外部资源或仍在开发中的脚本（test_jumper_real / test_jumplist_fix /
---     test_tier2_wireup / test_dependent_name）显式排除。
+--   * 需要外部资源的脚本（test_jumper_real / test_jumplist_fix）显式排除。
 -- 通过环境变量 NO_LEGACY=1 可跳过本旁路（CI 上若担心子进程开销）。
 local LEGACY_STABLE = {
-  "test_call_arity.lua",
-  "test_declarator_arity.lua",
-  "test_syntax_filter.lua",
-  "test_pair_picker.lua",
-  "test_ranking_sort.lua",
   "test_jumper_headless.lua",
 }
 

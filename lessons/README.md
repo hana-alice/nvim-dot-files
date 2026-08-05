@@ -1,7 +1,7 @@
 # Lessons · 平台怪癖与调试硬知识
 
 > **lessons/** 区：付出过真实调试成本的陷阱与硬知识。
-> 出处优先：权威踩坑清单在 `docs/CONSTRAINTS.md §二（踩过的坑 K1–K41）`，
+> 出处优先：权威踩坑清单在 `docs/CONSTRAINTS.md §二（踩过的坑 K1–K46）`，
 > 本文件是**主题导航**，按领域聚合指回出处，不复制原文。
 
 ## 什么属于这里 / 不属于这里
@@ -41,6 +41,12 @@ load-bearing**（K37，`UE_DAP_NO_SLIDE` 开关供其他设备复验；wait-laun
   `2026-06-15-android-dap-live-breakpoints`；ADR `../docs/plans/2026-06-15-android-dap-live-breakpoints.md`；
   证据 `../tools/evidence/android-f9/livebp-*.json`
 
+### Android SO 快速部署（K44–K46）
+SO-only 产物必须与已安装 APK 的 package/versionCode 基线一致（K44）；项目名/Target 必须动态派生，
+不能把具体项目名当目录协议（K45）；APK 安装、SO 文件替换和应用启动必须是三个显式动作，`ui` / `uq`
+不得自动启动或用 PID/maps 再耦合启动时序，运行只由 `ul` 触发（K46）。
+→ `../docs/CONSTRAINTS.md §二 K44–K46`；`../openspec/specs/android-so-quick-deploy/spec.md`
+
 ### 工具链 / LLVM（K14–K15、K41）
 LLVM 22.0–22.1.5 的 `lldb-dap.exe` Windows 启动崩（`STATUS_STACK_BUFFER_OVERRUN`）；
 适配器迁移弧线（lldb-dap 21.1.8 → codelldb 1.12.2 → **LLVM 22.1.6+ lldb-dap forward-only，
@@ -54,9 +60,11 @@ clangd 非 `file://` URI 刷屏、~~Lazy float invalid buffer~~（上游已修�
 `q` 关失效 buffer、Neovide 残留进程、blink.cmp 换行破坏 undo。
 → 各 `lua/workarounds/<scope>/*.lua` frontmatter（权威）；`../docs/CONSTRAINTS.md §二 snacks/clangd/lazy`
 
-### goto-def / cursor（K25）
+### goto-def / cursor（K25、K42）
 跨 buffer 跳转 cursor 漂移；解法砍 snacks.scroll + PreserveBufferView，jumper `_on_reassert` 校正。
-→ `../docs/architecture-symbol-resolution.md §2.7`
+裸 symbol cache、arity filter 与 standalone header parse 均不能证明 C++ overload；唯一合法答案来自
+active build 的 compiler identity，header 必须在 proven origin TU 中求值。
+→ `../docs/CONSTRAINTS.md §二 goto-def / cursor`；`../docs/architecture-symbol-resolution.md`
 
 ### grep 缓存 / csearch 失效（K26–K27）
 负探测被永久缓存 → `<leader>/` 静默走最慢目录遍历搜不全（修：负探测不缓存 + 重探 + 回落可见）；

@@ -146,11 +146,31 @@ function Assert-RemoteLibraryMetadata {
   }
 }
 
-function Start-Package {
-  Invoke-Adb -Arguments @(
-    "shell", "monkey", "-p", $script:Package,
-    "-c", "android.intent.category.LAUNCHER", "1"
-  ) | Out-Null
+function Get-PackageProcessIds {
+  $result = Invoke-Adb -Arguments @("shell", "pidof", $script:Package) -AllowFailure
+  if ($result.Code -ne 0 -or [string]::IsNullOrWhiteSpace($result.Text)) {
+    return @()
+  }
+  return @(
+    $result.Text.Trim() -split "\s+" |
+      Where-Object { $_ -match "^\d+$" }
+  )
+}
+
+function Wait-PackageStopped {
+  param(
+    [int]$TimeoutSeconds = 10,
+    [int]$PollMilliseconds = 250
+  )
+
+  $timer = [Diagnostics.Stopwatch]::StartNew()
+  while ($timer.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+    if (@(Get-PackageProcessIds).Count -eq 0) {
+      return
+    }
+    Start-Sleep -Milliseconds $PollMilliseconds
+  }
+  throw "Package processes did not stop within ${TimeoutSeconds}s"
 }
 
 function Get-SourcePackageIdentity {
@@ -266,6 +286,7 @@ try {
   Write-Host "[UE SO deploy] stripped size=$localSize sha256=$localHash"
 
   Invoke-Adb -Arguments @("shell", "am", "force-stop", $Package) | Out-Null
+  Wait-PackageStopped
   Invoke-Adb -Arguments @("shell", "su", "0", "mkdir", "-p", $backupDir) | Out-Null
   if ((Invoke-Adb -Arguments @("shell", "su", "0", "test", "-f", $backupSo) -AllowFailure).Code -ne 0) {
     Write-Host "[UE SO deploy] preserving installed original: $backupSo"
@@ -288,43 +309,20 @@ try {
     throw "Remote SO hash mismatch: local=$localHash remote=$remoteHash"
   }
 
-  Write-Host "[UE SO deploy] launching $Package"
-  Start-Package
-  Start-Sleep -Seconds 8
-
-  $pidResult = Invoke-Adb -Arguments @("shell", "pidof", $Package) -AllowFailure
-  $processId = ($pidResult.Text.Trim() -split "\s+")[0]
-  if ($pidResult.Code -ne 0 -or [string]::IsNullOrWhiteSpace($processId)) {
-    throw "Package did not stay running after SO replacement"
-  }
-
-  $maps = Invoke-Adb -Arguments @("shell", "su", "0", "cat", "/proc/$processId/maps")
-  $loadedLine = ($maps.Text -split "`n" | Where-Object { $_ -match "libUE4\.so" } | Select-Object -First 1)
-  if ([string]::IsNullOrWhiteSpace($loadedLine) -or $loadedLine -notlike "*$targetSo*") {
-    throw "Running process does not map the replaced libUE4.so: pid=$processId"
-  }
-
-  Start-Sleep -Seconds 4
-  $stillRunning = Invoke-Adb -Arguments @("shell", "pidof", $Package) -AllowFailure
-  if ($stillRunning.Code -ne 0 -or [string]::IsNullOrWhiteSpace($stillRunning.Text)) {
-    throw "Package crashed shortly after loading the replaced SO"
-  }
-
-  Write-Host "[UE SO deploy] verified pid=$processId"
-  Write-Host "[UE SO deploy] mapped: $loadedLine"
-  Write-Host "[UE SO deploy] success; original backup: $backupSo"
+  Write-Host "[UE SO deploy] replacement verified; package remains stopped"
+  Write-Host "[UE SO deploy] launch explicitly with <Space>ul; original backup: $backupSo"
 }
 catch {
   $failure = $_
   if ($replaced) {
-    Write-Warning "SO validation failed; restoring the installed original"
+    Write-Warning "SO deploy failed after replacement; restoring the installed original"
     try {
       Invoke-Adb -Arguments @("shell", "am", "force-stop", $Package) | Out-Null
+      Wait-PackageStopped
       Invoke-Adb -Arguments @("shell", "su", "0", "cp", $backupSo, $targetNew) | Out-Null
       Set-RemoteLibraryMetadata -Path $targetNew -Metadata $originalMetadata
       Invoke-Adb -Arguments @("shell", "su", "0", "mv", "-f", $targetNew, $targetSo) | Out-Null
       Assert-RemoteLibraryMetadata -Path $targetSo -Expected $originalMetadata
-      Start-Package
       Write-Warning "Installed original restored from: $backupSo"
     }
     catch {

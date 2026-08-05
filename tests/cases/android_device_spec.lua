@@ -121,7 +121,7 @@ t.describe("utils.android_device: adb argv", function()
     t.assert_contains(err or "", ":UESetAndroidDevice")
   end)
 
-  t.it("UEInstallAndroid 与 UELaunch 都显式路由到所选 serial", function()
+  t.it("UEInstallAndroid 只安装，UELaunch 才显式启动，且都路由到所选 serial", function()
     local install = assert(require("ue")._android_install_argv_for_test(
       "adb", "SERIAL-002", "Game.apk"))
     t.assert_eq(table.concat(install, " "), "adb -s SERIAL-002 install -r Game.apk")

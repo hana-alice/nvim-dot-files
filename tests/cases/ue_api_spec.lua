@@ -316,8 +316,35 @@ t.describe("ue.android_build_command（SO-only）", function()
     t.assert_contains(script, '"stat", "-c", "%C"')
     t.assert_contains(script, '"chcon", $Metadata.Context')
     t.assert_contains(script, "Assert-RemoteLibraryMetadata")
+    t.assert_contains(script, "function Wait-PackageStopped")
+    t.assert_contains(script, "replacement verified; package remains stopped")
+    t.assert_false(script:find("function Start-Package", 1, true) ~= nil,
+      "SO deploy 不得拥有隐式启动入口")
+    t.assert_false(script:find('"shell", "monkey"', 1, true) ~= nil,
+      "SO deploy 完成或回滚后不得自动启动应用")
+    t.assert_false(script:find("Wait-ForMappedLibrary", 1, true) ~= nil,
+      "启动与部署分离后不得保留运行时 maps 验证")
+    t.assert_false(script:find('"/proc/', 1, true) ~= nil,
+      "SO deploy 不得通过读取运行进程来隐式耦合启动")
     t.assert_false(script:find("system:system", 1, true) ~= nil,
       "不得假设设备安装目录固定属于 system:system")
+  end)
+
+  t.it("SO deploy 替换前等待旧 PID 消失且等待有界", function()
+    local config = vim.fn.stdpath("config")
+    local result = vim.system({
+      "powershell.exe",
+      "-NoLogo",
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      config .. "/tests/fixtures/android_so_deploy/process_wait_spec.ps1",
+      "-DeployScript",
+      config .. "/scripts/ue_android_so_deploy.ps1",
+    }, { text = true }):wait()
+    t.assert_eq(result.code, 0, result.stderr or result.stdout)
+    t.assert_contains(result.stdout or "", "PASS package stop polling + bounded timeout")
   end)
 end)
 

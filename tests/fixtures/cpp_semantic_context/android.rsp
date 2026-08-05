@@ -1,0 +1,1 @@
+clang++ --target=aarch64-none-linux-android -I "C:/Fixture/include" "C:/Fixture/Intermediate/Build/Android/Module.Renderer.1_of_2.cpp"

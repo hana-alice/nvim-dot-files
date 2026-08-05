@@ -64,6 +64,17 @@ platform server（替代已证伪的 `gdbserver --attach`，后者从不绑定�
 - **AND** 下发 `target modules load --file libUE4.so --slide 0x<base>`
 - **AND** hex 字符串用拼接构造，MUST NOT 用 `string.format("%x", addr)`
 
+### Requirement: Android 项目和符号包发现不得固定项目名
+
+系统 SHALL 从显式 `.uproject` 或唯一的 `Source/<Project>/*.uproject` 派生 Android 输出目录，并从符号包实际目录发现 `<Target>-arm64`，不得假设项目或 Target 名为固定字符串。
+
+#### Scenario: 非 Client 项目的 nested layout
+
+- **WHEN** 项目位于 `<repo>/Source/<Project>/<Project>.uproject` 且 Android 输出位于该项目的 `Binaries/Android`
+- **THEN** packageInfo 与符号库发现 SHALL 使用该项目目录
+- **AND** versionCode 精确匹配 SHALL 接受任意 `<Target>_Symbols_v<code>/<Target>-arm64` 目录
+- **AND** 多个 nested 项目同时具有 Android 输出且没有显式 `.uproject` 时 SHALL 不猜测项目
+
 ### Requirement: F9 断点真实 resolved 并命中
 
 系统 SHALL 让 Android file:line 断点真实下发、resolve 并在目标运行到对应代码时命中，

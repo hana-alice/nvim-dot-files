@@ -837,10 +837,11 @@ local function find_uproject_in_dir(dir)
     return norm(matches[1])
   end
 
-  -- P4 workspace fixed layout: <workspace>/Source/Client/*.uproject
-  local client_dir = join(dir, "Source", "Client")
-  if _ufs.is_dir(client_dir) then
-    local m2 = vim.fn.globpath(client_dir, "*.uproject", false, true)
+  -- Nested workspace layout: <workspace>/Source/<Project>/*.uproject.
+  -- Reuse the unique-project detector instead of assuming a project name.
+  local nested_dir = CORE_RT.project_module_anchor and CORE_RT.project_module_anchor(dir) or dir
+  if nested_dir ~= norm(dir) and _ufs.is_dir(nested_dir) then
+    local m2 = vim.fn.globpath(nested_dir, "*.uproject", false, true)
     if type(m2) == "table" and #m2 > 0 then
       table.sort(m2)
       return norm(m2[1])
@@ -1891,7 +1892,7 @@ end
 
 -- Project-specific scan whitelist. Path = `<project_root>/.ueprepare-scan-paths`,
 -- one entry per line, # for comments. Each entry is a root-relative directory
--- (e.g. `Source/Client/Source`, `Source/Protocol`). When the file exists, it
+-- (e.g. `Source/SampleGame/Source`, `Source/Protocol`). When the file exists, it
 -- REPLACES UE_CONST.PROJECT_INDEX_DIRS for this project. When absent, the
 -- default PROJECT_INDEX_DIRS is used. For the supported nested layout
 -- (<project_root>/Source/<Project>/<Project>.uproject), defaults are resolved
@@ -2837,7 +2838,7 @@ end
 -- Resolve the directory that actually contains Binaries/ and Intermediate/.
 -- In some workspaces (P4 layouts especially), `ctx.project_root` is the repo
 -- root (e.g. `<repo-root>`) while the `.uproject` and ALL of its
--- build outputs live a few dirs down (`Source/Client/`). Using project_root
+-- build outputs live a few dirs down (`Source/<Project>/`). Using project_root
 -- directly makes Binaries/Intermediate globs miss everything. Prefer the
 -- directory containing the uproject; fall back to project_root for legacy
 -- flat layouts where they coincide.
@@ -3043,8 +3044,8 @@ end
 local function detect_target_names(project_root, uproject)
   -- Two layouts to support:
   --   1. Standard:  <project_root>/<Project>.uproject + <project_root>/Source/*.Target.cs
-  --   2. P4 nested: <project_root>/Source/Client/Client.uproject
-  --                 + <project_root>/Source/Client/Source/*.Target.cs
+  --   2. Nested: <project_root>/Source/<Project>/<Project>.uproject
+  --              + <project_root>/Source/<Project>/Source/*.Target.cs
   --
   -- Prefer the directory next to the .uproject (matches what UBT itself
   -- does), fall back to <project_root>/Source for the standard layout.
@@ -3990,7 +3991,7 @@ local function collect_rsp_files(ctx)
     add_root(join(ctx.project_root, "Intermediate", "Build"))
   end
   -- P4 workspace layout: project_root is the workspace mount, but the uproject
-  -- (and therefore Intermediate/Build) lives under <workspace>/Source/Client/.
+  -- (and therefore Intermediate/Build) lives under <workspace>/Source/<Project>/.
   -- Always include the .uproject parent dir so game-side rsp gets collected.
   if ctx.uproject and ctx.uproject ~= "" then
     add_root(join(_ufs.dirname(ctx.uproject), "Intermediate", "Build"))
@@ -6959,7 +6960,7 @@ end
 
 -- Find the newest APK in project build outputs.
 -- Searches under uproject's directory (NOT ctx.project_root — see uproject_dir
--- comment for why these can differ in P4 / Source/Client layouts).
+-- comment for why these can differ in nested Source/<Project> layouts).
 local function find_apk(ctx)
   local pr = uproject_dir(ctx)
   if not pr or pr == "" then
@@ -6986,6 +6987,59 @@ local function find_apk(ctx)
   return best
 end
 
+local function android_so_from_receipt(project_dir, target, platform, configuration)
+  local binaries_dir = join(project_dir, "Binaries", "Android")
+  local receipt_path = join(binaries_dir, target .. ".target")
+  if not _ufs.is_file(receipt_path) then return nil, false end
+
+  local file = io.open(receipt_path, "rb")
+  if not file then return nil, true end
+  local content = file:read("*a")
+  file:close()
+
+  local ok, receipt = pcall(vim.json.decode, content or "")
+  if not ok or type(receipt) ~= "table" then return nil, true end
+  if receipt.TargetName ~= target
+      or receipt.Platform ~= platform
+      or receipt.Configuration ~= configuration then
+    return nil, true
+  end
+
+  local expected_basenames = {
+    [(target .. "-arm64.so"):lower()] = true,
+    [("%s-%s-%s-arm64.so"):format(target, platform, configuration):lower()] = true,
+  }
+
+  local function resolve_product(raw_path)
+    if type(raw_path) ~= "string" then return nil end
+    local normalized = norm(raw_path)
+    local project_prefix = "$(ProjectDir)/"
+    if normalized:sub(1, #project_prefix) ~= project_prefix then return nil end
+
+    local candidate = join(project_dir, normalized:sub(#project_prefix + 1))
+    local basename = vim.fs.basename(candidate):lower()
+    if not _ufs.path_has_prefix(candidate, binaries_dir)
+        or not expected_basenames[basename] then
+      return nil
+    end
+    return _ufs.is_file(candidate) and candidate or nil
+  end
+
+  local launch = resolve_product(receipt.Launch)
+  if launch then return launch, true end
+  local candidates, seen = {}, {}
+  for _, product in ipairs(receipt.BuildProducts or {}) do
+    if type(product) == "table" and product.Type == "Executable" then
+      local candidate = resolve_product(product.Path)
+      if candidate and not seen[candidate] then
+        seen[candidate] = true
+        candidates[#candidates + 1] = candidate
+      end
+    end
+  end
+  return #candidates == 1 and candidates[1] or nil, true
+end
+
 local function find_android_so(ctx)
   local pr = uproject_dir(ctx)
   if not pr or pr == "" then return nil end
@@ -6996,6 +7050,16 @@ local function find_android_so(ctx)
   local configuration = target_configuration(ctx.engine_root, ctx.project_root, uproject, platform)
   local kind = target_kind(ctx.engine_root, ctx.project_root, uproject, platform)
   local target = build_target_name(ctx.project_root, uproject, kind)
+
+  -- UE4 commonly emits a configuration-neutral `<Target>-arm64.so` filename.
+  -- The adjacent UBT receipt is the authoritative identity:
+  -- only accept its product after target/platform/configuration all match the
+  -- active build selection. This avoids both the old false "SO not found" and
+  -- a dangerous wildcard fallback to a stale artifact from another config.
+  local receipt_so, receipt_present = android_so_from_receipt(pr, target, platform, configuration)
+  if receipt_present then return receipt_so end
+
+  -- Compatibility with engines that encode target identity in the filename.
   local exact = join(pr, "Binaries", "Android", ("%s-Android-%s-arm64.so"):format(target, configuration))
   return _ufs.is_file(exact) and exact or nil
 end

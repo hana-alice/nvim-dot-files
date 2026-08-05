@@ -39,8 +39,10 @@
   `adb devices -l` → picker 展示名称 + serial → `vim.g.ue_android_device_serial`；install / launch /
   logcat / 新 DAP session 捕获该值并统一形成 `adb -s <serial> ...`。
 - **Android SO 快速迭代**：`<Space>us` → UBT 导出/执行 outdated action graph，不进入 Gradle；
-  `<Space>uq` → 对当前配置 SO 生成与 APK 一致的 stripped 临时副本 → 按 selected serial 动态解析
-  `nativeLibraryDir` → 备份、原子替换、metadata/hash/PID/maps 验证，失败自动回滚。
+  `<Space>uq` → 由匹配 Target/Platform/Configuration 的 UBT receipt 解析实际 SO → 校验设备 APK
+  versionCode 与 `packageInfo.txt` 基线一致 → 生成与 APK 一致的 stripped 临时副本 → 按 selected serial 动态解析
+  `nativeLibraryDir` → 备份、原子替换、metadata/hash/PID/maps 验证，失败自动回滚；项目目录、Target 和符号包
+  均从 `.uproject`/receipt/目录结构派生，不固定项目名。
 - **DAP**：`UEDAP*` 命令 → `ue.dap.platforms` 按当前平台 dispatch → 具体平台 `attach/launch`
   → codelldb（Win64/Android）。Android 走 platform 模式 + serial connect URL；K30 URL 与本次
   session 捕获的 ADB serial 必须一致，切换全局值不改变活跃 session 的 poll/cleanup。

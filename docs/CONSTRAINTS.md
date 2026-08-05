@@ -280,6 +280,39 @@
   `:StallReport` 排除 DAP 后仍有 train 即怀疑 watcher 类自激。
   → `lua/plugins/gitsigns.lua`; `docs/changelog.md` 2026-07-24（gitsigns 卡顿条目）
 
+- **K43 — Windows libuv 把 LAST_ACCESS/属性事件折叠为 `UV_CHANGE` → dirty overlay 洪水**
+  症状: `dirty-set-flood/cap-hit` 探针反复出现，`dirty.json` 达 1000 上限，picker 每次搜索
+  背着巨大 rg-on-dirty 集合；现场 1000 条中 965 个文件的 LAST_WRITE 仍停在 2026-06-22，
+  而 csearch 索引生成于 2026-08-04，证明不是索引后的内容修改。
+  根因: libuv Windows backend 的 `ReadDirectoryChangesW` 同时订阅 `LAST_ACCESS`、
+  `ATTRIBUTES`、`SECURITY`、`LAST_WRITE`，却统一映射成 `UV_CHANGE`；原 watcher 对所有
+  `change` 只做“文件存在”判断，元数据扫描也被当作内容变化。
+  解决约束: rename/create/delete 始终保守记录；已有文件的纯 `change` 只有 LAST_WRITE
+  晚于当前 `csearch.idx` 才进入 `persistent_dirty`。无可用索引或无 mtime 证据时保持记录，
+  不得为降噪漏掉首次构建前/新建文件。
+  → `lua/utils/ue_watch.lua`; `openspec/specs/ue-code-search/spec.md`
+
+- **K44 — Android SO 热替换必须匹配已安装 APK 的 Java/JNI 基线**
+  症状: 新 SO 能成功 strip、push、通过 hash/metadata/maps 校验，却在启动后因
+  `NoSuchMethodError` 主动 SIGABRT；实机证据为 native 调用了旧 APK 中不存在的新 Java 方法。
+  根因: SO-only 构建只更新 native action graph，不会更新 APK 内 Java/manifest/Gradle
+  产物；把新 JNI 调用的 SO 注入旧 APK 在 ELF 层可加载，但运行时接口不兼容。
+  解决约束: 部署前必须校验源 SO 同目录 `packageInfo.txt` 与设备安装包的 package/versionCode；
+  不一致时在 strip/push/替换前拒绝，并要求先安装一次匹配 APK。之后仅 C++ 迭代可继续
+  `us`→`uq`；涉及 Java/JNI/manifest/Gradle 输入变化时必须重新建立 APK 基线。
+  → `scripts/ue_android_so_deploy.ps1`; `openspec/specs/android-so-quick-deploy/spec.md`
+
+- **K45 — `Client` 是项目/Target 名，不是 Android 目录协议**
+  症状: 非 `Client` 项目能正常编译，但 nested `.uproject`、packageInfo、symbol package 或 SO
+  receipt 发现失败；测试若也只用 `Client` fixture，会把该耦合隐藏起来。
+  根因: 旧路径把现场项目布局 `Source/Client`、`Client_Symbols_v*`、`Client-arm64` 当成 UE 固定约定。
+  解决约束: 从显式 `.uproject` 或唯一 `Source/<Project>/*.uproject` 派生项目目录；SO 主产物从
+  matching receipt 和动态 Target 派生；符号包扫描实际 `<Target>_Symbols_v*/<Target>-arm64` 目录。
+  多项目/多主产物歧义必须拒绝，不能按目录或 receipt 顺序猜测。回归 fixture 必须使用非
+  `Client` 的虚构项目名。
+  → `lua/ue.lua`; `lua/ue/dap/android.lua`; `openspec/specs/android-so-quick-deploy/spec.md`;
+  `openspec/specs/android-dap-attach/spec.md`
+
 ### 工具链 / LLVM
 
 - **K41 — 跨盘 project root 缺 `.clangd` → UEPrepare 后 clangd background-index 吃满 CPU/内存**

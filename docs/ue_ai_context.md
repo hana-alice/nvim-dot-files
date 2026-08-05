@@ -23,7 +23,7 @@ nvim --headless -l scripts/export_ue_context.lua D:\path\to\UnrealEngine C:\tmp\
 The exporter treats the supplied engine directory as authoritative and reads
 `<engine-root>/.cache/nvim-ue/state.json` for the selected project. A persisted
 `uproject` path is preferred because P4 workspaces can place it below
-`<project-root>/Source/Client/`.
+`<project-root>/Source/<Project>/`.
 
 Selection precedence matches the live Neovim UE integration:
 

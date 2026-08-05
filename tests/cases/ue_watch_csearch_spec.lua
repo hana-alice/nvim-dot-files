@@ -149,3 +149,35 @@ t3.describe("ue_watch: persistent_dirty cap 打满可见（F2）", function()
     end)
   end)
 end)
+
+-- ── Windows metadata-event flood guard ─────────────────────────────────────
+-- libuv's Windows backend subscribes LAST_ACCESS / ATTRIBUTES / SECURITY and
+-- folds all of them into UV_CHANGE. Files whose content mtime predates the
+-- current csearch index are therefore metadata noise, not post-index edits.
+t3.describe("ue_watch: Windows metadata change 不污染 dirty overlay", function()
+  local should_track = watch._should_track_existing_event_for_test
+  local index_mtime = { sec = 200, nsec = 500 }
+
+  t3.it("早于或等于索引的 change 被过滤", function()
+    t3.assert_false(should_track({ mtime = { sec = 100, nsec = 0 } },
+      { change = true }, index_mtime))
+    t3.assert_false(should_track({ mtime = { sec = 200, nsec = 500 } },
+      { change = true }, index_mtime))
+  end)
+
+  t3.it("索引后的内容修改继续进入 dirty", function()
+    t3.assert_true(should_track({ mtime = { sec = 200, nsec = 501 } },
+      { change = true }, index_mtime))
+    t3.assert_true(should_track({ mtime = { sec = 201, nsec = 0 } },
+      { change = true }, index_mtime))
+  end)
+
+  t3.it("rename/create 与无索引场景保持保守记录", function()
+    t3.assert_true(should_track({ mtime = { sec = 100, nsec = 0 } },
+      { rename = true }, index_mtime), "新文件即使保留旧 mtime 也不能漏")
+    t3.assert_true(should_track({ mtime = { sec = 100, nsec = 0 } },
+      { change = true }, nil), "首次建索引前没有可靠 anchor，必须记录")
+    t3.assert_true(should_track({}, { change = true }, index_mtime),
+      "stat 缺 mtime 时必须保守记录")
+  end)
+end)

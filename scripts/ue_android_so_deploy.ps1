@@ -77,6 +77,23 @@ function Resolve-LlvmStrip {
   throw "llvm-strip.exe not found under NDKROOT/ANDROID_NDK_ROOT/NDK_ROOT"
 }
 
+function Get-Sha256Hex {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path
+  )
+
+  $stream = [IO.File]::OpenRead($Path)
+  $sha256 = [Security.Cryptography.SHA256]::Create()
+  try {
+    return ([BitConverter]::ToString($sha256.ComputeHash($stream)) -replace "-", "").ToLowerInvariant()
+  }
+  finally {
+    $sha256.Dispose()
+    $stream.Dispose()
+  }
+}
+
 function Get-RemoteLibraryMetadata {
   param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -136,6 +153,31 @@ function Start-Package {
   ) | Out-Null
 }
 
+function Get-SourcePackageIdentity {
+  $packageInfoPath = Join-Path (Split-Path -Parent $script:SourceSo) "packageInfo.txt"
+  if (-not (Test-Path -LiteralPath $packageInfoPath -PathType Leaf)) {
+    throw "Android SO baseline identity not found: $packageInfoPath. Build and install one matching APK before SO-only deploys."
+  }
+
+  $lines = @(
+    Get-Content -LiteralPath $packageInfoPath |
+      ForEach-Object { $_.Trim() } |
+      Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+  )
+  if ($lines.Count -lt 2 -or $lines[1] -notmatch "^\d+$") {
+    throw "Invalid Android package identity file: $packageInfoPath"
+  }
+  if ($lines[0] -ne $script:Package) {
+    throw "Android package mismatch: build output=$($lines[0]) selected=$($script:Package)"
+  }
+
+  return [PSCustomObject]@{
+    Path = $packageInfoPath
+    Package = $lines[0]
+    VersionCode = $lines[1]
+  }
+}
+
 if (-not (Test-Path -LiteralPath $SourceSo -PathType Leaf)) {
   throw "Source SO not found: $SourceSo"
 }
@@ -151,6 +193,20 @@ if ($rootId.Text -notmatch "uid=0\(root\)") {
 }
 
 $packageDump = Invoke-Adb -Arguments @("shell", "dumpsys", "package", $Package)
+$sourceIdentity = Get-SourcePackageIdentity
+$installedVersionMatch = [regex]::Match(
+  $packageDump.Text,
+  "(?m)^\s*versionCode=(\d+)\b"
+)
+if (-not $installedVersionMatch.Success) {
+  throw "Installed APK versionCode not found for package: $Package"
+}
+$installedVersionCode = $installedVersionMatch.Groups[1].Value
+if ($installedVersionCode -ne $sourceIdentity.VersionCode) {
+  throw "Installed APK baseline mismatch: device versionCode=$installedVersionCode, build output versionCode=$($sourceIdentity.VersionCode). Install the matching APK once (:UEInstallAndroid / <Space>ui), then use SO-only deploys until Java/manifest/Gradle inputs change."
+}
+Write-Host "[UE SO deploy] APK baseline verified package=$Package versionCode=$installedVersionCode"
+
 $nativeDirMatch = [regex]::Match(
   $packageDump.Text,
   "(?m)^\s*(?:legacyNativeLibraryDir|nativeLibraryDir)=(\S+)\s*$"
@@ -205,7 +261,7 @@ try {
   )
   if ($stripResult.Text) { Write-Host $stripResult.Text }
 
-  $localHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $hostTempSo).Hash.ToLowerInvariant()
+  $localHash = Get-Sha256Hex -Path $hostTempSo
   $localSize = (Get-Item -LiteralPath $hostTempSo).Length
   Write-Host "[UE SO deploy] stripped size=$localSize sha256=$localHash"
 

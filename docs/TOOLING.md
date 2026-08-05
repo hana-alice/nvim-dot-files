@@ -246,7 +246,7 @@ retained only as diagnostic background.
 | Host adapter     | LLVM 22.1.6+ `lldb-dap.exe` (forward-only)                      |
 | Device server    | **NDK 27 LLDB 18.x** `lldb-server` platform server (arm64)      |
 | Device           | arm64-v8a, app **DEBUGGABLE**, `run-as <pkg>` usable            |
-| Host symbol .so  | symbol-rich `libUE4.so` (e.g. `.../Client_Symbols_v*/Client-arm64/libUE4.so`) |
+| Host symbol .so  | symbol-rich `libUE4.so` (e.g. `.../<Target>_Symbols_v*/<Target>-arm64/libUE4.so`) |
 | Validation scope | adb serial `a3ad86f3` only (other devices need their own proof) |
 
 

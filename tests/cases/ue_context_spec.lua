@@ -10,22 +10,22 @@ local function fixture()
   local root = ("C:/tmp/nvim-ue-context-%d-%d"):format(vim.fn.getpid(), vim.uv.hrtime())
   local engine = root .. "/UE"
   local project = root .. "/Project"
-  local uproject = project .. "/Source/Client/Client.uproject"
+  local uproject = project .. "/Source/SampleGame/SampleGame.uproject"
 
   write_file(engine .. "/Engine/Build/BatchFiles/Build.bat", "@echo off")
   for _, dir in ipairs({ "Binaries", "Build", "Config", "Plugins", "Shaders", "Source" }) do
     vim.fn.mkdir(engine .. "/Engine/" .. dir, "p")
   end
   write_file(uproject, "{}")
-  write_file(project .. "/Source/Client/Source/Client.Target.cs", "public class ClientTarget {}")
-  write_file(project .. "/Source/Client/Binaries/Android/Client-arm64.apk", "apk")
+  write_file(project .. "/Source/SampleGame/Source/SampleGame.Target.cs", "public class SampleGameTarget {}")
+  write_file(project .. "/Source/SampleGame/Binaries/Android/SampleGame-arm64.apk", "apk")
   write_file(engine .. "/.cache/nvim-ue/state.json", vim.json.encode({
     engine_root = engine,
     project_root = project,
     uproject = uproject,
     target_platform = "Android",
     target_configuration = "Development",
-    android_package = "com.example.client",
+    android_package = "com.example.samplegame",
     updated_at = "2026-07-13T00:00:00Z",
   }))
 
@@ -51,11 +51,11 @@ t.describe("ue.ai_context", function()
     t.assert_eq(context.target.selected_configuration, "Development")
     t.assert_eq(context.target.ubt_configuration, "Development")
     t.assert_eq(context.target.kind, "Game")
-    t.assert_eq(context.target.name, "Client")
-    t.assert_eq(context.state.android_package, "com.example.client")
+    t.assert_eq(context.target.name, "SampleGame")
+    t.assert_eq(context.state.android_package, "com.example.samplegame")
     t.assert_eq(context.android_device_serial, "SERIAL-CONTEXT")
     t.assert_eq(context.artifacts.build_command[1], "cmd.exe")
-    t.assert_contains(context.artifacts.build_command[4], "Build.bat Client Android Development")
+    t.assert_contains(context.artifacts.build_command[4], "Build.bat SampleGame Android Development")
     t.assert_eq(context.artifacts.install_command[1], "adb")
     t.assert_eq(context.artifacts.install_command[2], "-s")
     t.assert_eq(context.artifacts.install_command[3], "SERIAL-CONTEXT")

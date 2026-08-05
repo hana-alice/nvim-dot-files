@@ -50,10 +50,10 @@ t.describe("ue.dap.android: breakpoint preseed", function()
   t.it("K10: collects buffer-id and path keyed breakpoints", function()
     local android = require("ue.dap.android")
     local buf = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_buf_set_name(buf, "D:/proj/Source/Client/Foo.cpp")
+    vim.api.nvim_buf_set_name(buf, "D:/proj/Source/SampleGame/Foo.cpp")
     with_breakpoints({
       [buf] = { { line = 17 } },
-      ["D:/proj/Source/Client/Bar.cpp"] = { { line = 29 } },
+      ["D:/proj/Source/SampleGame/Bar.cpp"] = { { line = 29 } },
     }, function()
       local cmds = android._current_breakpoint_commands_for_test()
       t.assert_contains(cmds, '?breakpoint set -f "Bar.cpp" -l 29')
@@ -65,7 +65,7 @@ t.describe("ue.dap.android: breakpoint preseed", function()
   t.it("K33: inserts preseed breakpoints after ASLR rebase and emits breakpoint list", function()
     local android = require("ue.dap.android")
     with_breakpoints({
-      ["D:/proj/Source/Client/Foo.cpp"] = { { line = 17 } },
+      ["D:/proj/Source/SampleGame/Foo.cpp"] = { { line = 17 } },
     }, function()
       local cfg = {
         attachCommands = {
@@ -276,7 +276,7 @@ t.describe("ue.dap.android: breakpoint preseed", function()
   t.it("sourceMap keeps build Engine paths local when project Engine is absent", function()
     local android = require("ue.dap.android")
     local root = vim.fn.tempname()
-    local proot = root .. "/Project/Source/Client"
+    local proot = root .. "/Project/Source/SampleGame"
     local build = root .. "/BuildRoot"
     vim.fn.mkdir(proot .. "/Binaries/Android", "p")
     vim.fn.mkdir(build .. "/Engine", "p")
@@ -357,15 +357,23 @@ t.describe("ue.dap.android: pick_symbol_lib（K35 + 3.4 假线索防护）", fun
   local android = require("ue.dap.android")
   local cfg = require("ue.config")
 
+  t.it("项目目录和符号包发现不固定 Client 项目名", function()
+    local source = table.concat(vim.fn.readfile(
+      vim.fn.stdpath("config") .. "/lua/ue/dap/android.lua"), "\n")
+    t.assert_false(source:find("Source/Client", 1, true) ~= nil)
+    t.assert_false(source:find("Client_Symbols", 1, true) ~= nil)
+    t.assert_false(source:find("Client-arm64", 1, true) ~= nil)
+  end)
+
   t.it("K35: 优先用 packageInfo versionCode 精确匹配的 symbol lib", function()
     cfg.reset_for_test()
-    local proot = tmpdir() .. "/Project/Source/Client"
+    local proot = tmpdir() .. "/Project/Source/SampleGame"
     local android_dir = proot .. "/Binaries/Android"
     -- cook 产物：packageInfo.txt 第二行 versionCode = 169723198
     touch(android_dir .. "/packageInfo.txt", "com.example.game\n169723198\n1.0.0\n")
     -- 精确匹配的符号包 + 一个更新但版本不符的干扰包
-    local exact = android_dir .. "/Client_Symbols_v169723198/Client-arm64/libUE4.so"
-    local decoy = android_dir .. "/Client_Symbols_v999999999/Client-arm64/libUE4.so"
+    local exact = android_dir .. "/SampleGame_Symbols_v169723198/SampleGame-arm64/libUE4.so"
+    local decoy = android_dir .. "/SampleGame_Symbols_v999999999/SampleGame-arm64/libUE4.so"
     touch(exact, "EXACT")
     touch(decoy, "DECOY-NEWER")
 
@@ -378,12 +386,12 @@ t.describe("ue.dap.android: pick_symbol_lib（K35 + 3.4 假线索防护）", fun
 
   t.it("无精确匹配时按 mtime 取最新符号包（best-guess 回落）", function()
     cfg.reset_for_test()
-    local proot = tmpdir() .. "/Project/Source/Client"
+    local proot = tmpdir() .. "/Project/Source/SampleGame"
     local android_dir = proot .. "/Binaries/Android"
     touch(android_dir .. "/packageInfo.txt", "com.example.game\n111\n1.0.0\n")
     -- 没有 v111 的精确包，只有两个 *Symbols* 包
-    local older = android_dir .. "/A_Symbols/Client-arm64/libUE4.so"
-    local newer = android_dir .. "/B_Symbols/Client-arm64/libUE4.so"
+    local older = android_dir .. "/A_Symbols/SampleGame-arm64/libUE4.so"
+    local newer = android_dir .. "/B_Symbols/SampleGame-arm64/libUE4.so"
     touch(older, "OLD")
     touch(newer, "NEW")
     -- 把 newer 的 mtime 推后，确保它"最新"
@@ -441,13 +449,26 @@ t.describe("ue.dap.android: pick_package（K-package 单一真相 packageInfo.tx
 
   t.it("从 packageInfo.txt 第一行解析 package 名", function()
     cfg.reset_for_test()
-    local proot = tmpdir() .. "/Project/Source/Client"
+    local proot = tmpdir() .. "/Project/Source/SampleGame"
     touch(proot .. "/Binaries/Android/packageInfo.txt",
       "com.example.game\n123\n3.4.0\n")
     t.assert_eq(android._pick_package_for_test({ project_root = proot }),
       "com.example.game")
     cfg.reset_for_test()
     pcall(vim.fn.delete, vim.fn.fnamemodify(proot, ":h:h:h"), "rf")
+  end)
+
+  t.it("从任意项目名的 Source/<Project> nested layout 解析 package", function()
+    cfg.reset_for_test()
+    local root = tmpdir() .. "/Workspace"
+    local project_dir = root .. "/Source/SampleGame"
+    touch(project_dir .. "/SampleGame.uproject", "{}")
+    touch(project_dir .. "/Binaries/Android/packageInfo.txt",
+      "com.example.samplegame\n456\n1.0.0\n")
+    t.assert_eq(android._pick_package_for_test({ project_root = root }),
+      "com.example.samplegame")
+    cfg.reset_for_test()
+    pcall(vim.fn.delete, vim.fn.fnamemodify(root, ":h"), "rf")
   end)
 end)
 
@@ -497,7 +518,7 @@ t.describe("ue.dap.android: effective_project_root（含 android marker 优先�
 
   t.it("优先返回带 Android marker 的候选根", function()
     cfg.reset_for_test()
-    local proot = tmpdir() .. "/Project/Source/Client"
+    local proot = tmpdir() .. "/Project/Source/SampleGame"
     touch(proot .. "/Binaries/Android/packageInfo.txt", "com.x\n1\n1.0\n")
     local got = android._effective_project_root_for_test({ project_root = proot })
     t.assert_eq(got and got:gsub("\\", "/"), proot:gsub("\\", "/"),
@@ -512,7 +533,7 @@ t.describe("ue.dap.android: attach_commands（K30/K34/K37 顺序与 slide 开关
 
   local function base_session()
     return {
-      symbol_lib = "D:/symbols/Client_Symbols_v1/Client-arm64/libUE4.so",
+      symbol_lib = "D:/symbols/SampleGame_Symbols_v1/SampleGame-arm64/libUE4.so",
       serial = "a3ad86f3",
       port = 5039,
       pid = 1234,
@@ -695,7 +716,7 @@ t.describe("ue.dap._persist_bp: F9 持久化往返（K10）", function()
   end)
 
   t.it("project_name sanitize：非法文件名字符替换为 _", function()
-    t.assert_eq(bp._project_name_for_test("E:/sample/Client.uproject", nil), "Client",
+    t.assert_eq(bp._project_name_for_test("E:/workspace/SampleGame.uproject", nil), "SampleGame",
       "uproject 取 basename 去 .uproject 后缀")
     t.assert_eq(bp._project_name_for_test(nil, "E:/sample/My Game"), "My_Game",
       "空格等非法字符替换为 _")

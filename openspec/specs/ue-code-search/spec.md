@@ -2,7 +2,11 @@
 
 ## Purpose
 
-TBD
+定义 UE 工作区代码搜索的完整性、性能与缓存一致性合同：`<leader>/` 使用 csearch
+索引，watcher 仅维护有界 dirty overlay，prepare 家族独占索引写入，并通过内容指纹、
+增量快照和事件降噪确保平台切换、批量文件变化及 Windows 元数据通知不会产生静默漏搜、
+并发损坏或持续卡顿。
+
 ## Requirements
 ### Requirement: `<leader>/` SHALL prefer complete indexed search
 
@@ -97,11 +101,22 @@ Project-scoped grep caches SHALL be invalidated when either the project root or 
 理由：cindex 的原子写协议把 staged 文件硬编码为 `<idx>~`，两个并发构建会抢同一个 `idx~`，
 在 merge/rename 阶段相互破坏，导致 `corrupt index: remove` 与 0 字节索引死循环。
 
-#### Scenario: 文件创建/修改被 watcher 观察到
+#### Scenario: 文件创建/内容修改被 watcher 观察到
 - **WHEN** watcher 的 fs_event debounce flush 处理一批 add 路径
 - **THEN** watcher SHALL 把这些路径记入 `persistent_dirty` 集合
 - **AND** watcher MUST NOT 调用 csearch 索引构建（不写 `csearch.idx` / `csearch.idx~`）
 - **AND** 这些新文件的可见性 SHALL 由 rg-on-dirty overlay 在下次手动 `:UEPrepare*` 前提供
+
+#### Scenario: Windows metadata-only change 早于当前索引
+- **WHEN** Windows/libuv 报告已有文件 `change`，但该文件的内容 mtime 早于或等于当前
+  `csearch.idx` mtime
+- **THEN** watcher SHALL 把它判为 last-access / attribute / security 类元数据噪声
+- **AND** watcher SHALL NOT 把该路径写入 `persistent_dirty`，避免 dirty overlay 洪水
+
+#### Scenario: 新建/重命名文件保留旧 mtime
+- **WHEN** fs_event 包含 rename/create 语义，或当前没有可用的 csearch 索引时间锚
+- **THEN** watcher SHALL 保守记录该路径，即使文件 mtime 较旧
+- **AND** 不得因 metadata 过滤器漏掉新文件
 
 #### Scenario: watcher 被重新接回 csearch 写入（防回归）
 - **WHEN** 代码改动让 watcher 的 csearch provider 重新写入索引
@@ -281,4 +296,3 @@ csearch trigram 索引 SHALL 全平台共用一份，路径为 `csearch/csearch.
 - **WHEN** 用户在 `<leader>/` 面板内触发「限定当前模块/插件」scope
 - **THEN** 搜索 SHALL 重跑并仅在该 scope 内命中
 - **AND** 标题栏 SHALL 反映该 scope
-

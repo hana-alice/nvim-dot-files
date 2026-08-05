@@ -86,6 +86,14 @@ local state = {
   -- Keys: lowercased forward-slash abs path. Values: true.
   persistent_dirty = {},
   persistent_dirty_loaded = false,
+  -- Content anchor for Windows fs_event noise suppression. libuv subscribes
+  -- LAST_ACCESS / ATTRIBUTES / SECURITY as well as LAST_WRITE, then exposes
+  -- all of them as the same `change` flag. An existing file whose content
+  -- mtime is not newer than the current csearch index cannot contain a
+  -- post-index edit, so that event must not enter the live dirty overlay.
+  csearch_index_mtime = nil,
+  csearch_index_checked_at = 0,
+  ignored_preindex_changes = 0,
 }
 
 -- Files we care about. Anything else is dropped at the watcher boundary so
@@ -130,6 +138,47 @@ end
 local function classify(path)
   local e = ext_of(path)
   return M.WATCHED_EXTS[e]
+end
+
+local function mtime_parts(value)
+  local mtime = value and (value.mtime or value) or nil
+  if type(mtime) ~= "table" or type(mtime.sec) ~= "number" then return nil end
+  return mtime.sec, tonumber(mtime.nsec) or 0
+end
+
+local function mtime_is_after(file_stat, index_mtime)
+  local file_sec, file_nsec = mtime_parts(file_stat)
+  local index_sec, index_nsec = mtime_parts(index_mtime)
+  if not file_sec or not index_sec then return nil end
+  if file_sec ~= index_sec then return file_sec > index_sec end
+  return file_nsec > index_nsec
+end
+
+-- On Windows, libuv maps content, last-access, attribute and security updates
+-- to the same UV_CHANGE flag. Keep rename events unconditionally so a newly
+-- created file with a preserved old timestamp is never lost. For an existing
+-- change, the csearch index mtime is a direct content anchor: if the file's
+-- LAST_WRITE is older/equal, the reported event did not introduce content
+-- after that index. Missing evidence stays conservative and records the file.
+local function should_track_existing_event(file_stat, events, index_mtime)
+  if not events or events.rename or not events.change then return true end
+  if not index_mtime then return true end
+  local after = mtime_is_after(file_stat, index_mtime)
+  if after == nil then return true end
+  return after
+end
+
+local function refresh_csearch_index_mtime()
+  local path = state.opts and state.opts.csearch_index or nil
+  local stat = path and uv.fs_stat(path) or nil
+  state.csearch_index_mtime = stat and stat.mtime or nil
+  state.csearch_index_checked_at = uv.now()
+end
+
+local function refresh_csearch_index_mtime_if_stale()
+  if uv.now() - (state.csearch_index_checked_at or 0) >= 2000 then
+    refresh_csearch_index_mtime()
+  end
 end
 
 local function log_debug(msg)
@@ -333,8 +382,15 @@ local function on_event(err, filename, events)
 
   -- libuv conflates create/modify/delete on Windows. We must stat to
   -- disambiguate. stat is cheap (fs metadata cache hot).
+  -- Refresh the index anchor at most once per debounce window so a build from
+  -- another nvim process is observed without adding one stat per file event.
+  refresh_csearch_index_mtime_if_stale()
   local st = uv.fs_stat(abs)
   if st then
+    if not should_track_existing_event(st, events, state.csearch_index_mtime) then
+      state.ignored_preindex_changes = state.ignored_preindex_changes + 1
+      return
+    end
     -- Exists → treat as add (idempotent providers handle "already indexed").
     state.pending_add[abs] = true
   else
@@ -356,6 +412,8 @@ function M.start(opts)
   if state.handle then M.stop() end
 
   state.opts = vim.tbl_extend("force", { debounce_ms = 1500 }, opts)
+  state.ignored_preindex_changes = 0
+  refresh_csearch_index_mtime()
   state.handle = uv.new_fs_event()
   if not state.handle then
     log_warn("start: uv.new_fs_event() returned nil")
@@ -407,6 +465,7 @@ function M.status()
     pending_dels = count(state.pending_del),
     last_event_at = state.last_event_at,
     watch_root = state.opts and state.opts.root or nil,
+    ignored_preindex_changes = state.ignored_preindex_changes,
   }
 end
 
@@ -565,6 +624,10 @@ function M.clear_persistent_dirty(reason)
       vim.uv.fs_rename(tmp, p)
     end
   end
+  -- A successful prepare calls this after the new index is installed. Advance
+  -- the change-event anchor so queued/pre-index metadata notifications cannot
+  -- immediately repopulate the set that was just cleared.
+  refresh_csearch_index_mtime()
   log_info(("persistent_dirty cleared (reason=%s)"):format(reason or "?"))
 end
 
@@ -622,5 +685,6 @@ end
 M._save_persistent_dirty_for_test = function()
   save_persistent_dirty()
 end
+M._should_track_existing_event_for_test = should_track_existing_event
 
 return M

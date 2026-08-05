@@ -134,7 +134,7 @@ t2.describe("ue.foreign_buffer_key（跨 checkout buffer 识别）", function()
 
   t2.it("pinned project 内的文件 → nil（不告警）", function()
     t2.assert_nil(ue._foreign_buffer_key_for_test(
-      "E:/aki/projA/Source/Client/X.cpp", "E:/aki/projA", "D:/engine"))
+      "E:/workspace/projA/Source/SampleGame/X.cpp", "E:/workspace/projA", "D:/engine"))
   end)
 
   t2.it("engine root 内的文件 → nil", function()
@@ -144,9 +144,9 @@ t2.describe("ue.foreign_buffer_key（跨 checkout buffer 识别）", function()
 
   t2.it("两个根都不含 → 返回稳定 dedup key", function()
     local k1 = ue._foreign_buffer_key_for_test(
-      "E:/aki/projB/Source/Client/Plugins/K/A.cpp", "E:/aki/projA", "D:/engine")
+      "E:/workspace/projB/Source/SampleGame/Plugins/K/A.cpp", "E:/workspace/projA", "D:/engine")
     local k2 = ue._foreign_buffer_key_for_test(
-      "E:/aki/projB/Source/Client/Plugins/K/B.cpp", "E:/aki/projA", "D:/engine")
+      "E:/workspace/projB/Source/SampleGame/Plugins/K/B.cpp", "E:/workspace/projA", "D:/engine")
     t2.assert_true(k1 ~= nil, "外部文件应产生 key")
     t2.assert_eq(k1, k2, "同一外部目录下的文件应共用 dedup key")
   end)

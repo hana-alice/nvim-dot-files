@@ -13,7 +13,7 @@
 #### Scenario: 增量构建成功
 
 - **WHEN** 用户在已配置 Android Target 和 Configuration 的项目中执行 `:UEBuildAndroidSO`
-- **THEN** 系统仅更新对应的 `Binaries/Android/<Target>-Android-<Configuration>-arm64.so`
+- **THEN** 系统仅更新 UBT receipt 中与当前 Target/Platform/Configuration 匹配的 Android arm64 SO build product
 - **AND** 不生成或更新时间戳变更最终 APK
 
 #### Scenario: 构建失败
@@ -25,10 +25,31 @@
 
 系统 SHALL 从当前项目、Target 和 Configuration 精确选择源 SO，并在主机临时文件上执行与当前 Android Gradle 打包链一致的 native library strip；系统 MUST 保留原始未 strip SO 供符号解析使用。
 
+#### Scenario: 项目名和 Target 名不是固定值
+
+- **WHEN** `.uproject` 位于 `<project-root>/Source/<Project>/` 且当前 Target 不是 `Client`
+- **THEN** 构建与部署 SHALL 从当前 `.uproject`、Target 选择和 `<Target>.target` receipt 派生全部路径
+- **AND** 运行时逻辑 MUST NOT 固定某个项目名或 Target 名
+
 #### Scenario: 当前配置产物存在
 
 - **WHEN** 当前配置为 Development、Test 或 Shipping 且对应 arm64 SO 已生成
-- **THEN** `:UEDeployAndroidSO` SHALL 使用该配置的精确文件而不是其他配置或仅按最新时间猜测
+- **THEN** `:UEDeployAndroidSO` SHALL 校验 `<Target>.target` receipt 的 TargetName、Platform、Configuration
+- **AND** 使用 receipt 声明的实际 SO build product（包括 UE4 的 `<Target>-arm64.so` 通用文件名）
+- **AND** 不得降级选择其他配置或仅按最新时间猜测
+
+#### Scenario: receipt 同时声明插件 SO
+
+- **WHEN** matching receipt 的 BuildProducts 同时包含插件动态库和当前 Target 主产物
+- **THEN** 部署 SHALL 仅接受文件名匹配当前 Target 且类型为 Executable 的主产物
+- **AND** 多个主产物候选仍然有效时 SHALL 拒绝部署，不得按列表顺序猜测
+
+#### Scenario: 已安装 APK 与 SO 构建基线不匹配
+
+- **WHEN** 源 SO 同目录 `packageInfo.txt` 的 package/versionCode 与设备已安装包不一致
+- **THEN** 部署 SHALL 在 strip、push 和设备文件替换前失败
+- **AND** 错误 SHALL 指引用户先安装一次匹配 APK，再继续 SO-only 迭代
+- **AND** 不得把需要新 Java/JNI 接口的 SO 注入旧 APK
 
 #### Scenario: 生成部署副本
 

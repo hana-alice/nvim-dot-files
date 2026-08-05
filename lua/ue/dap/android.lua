@@ -37,7 +37,7 @@
 --     C:/tools/lldb-22/install/bin/, or pointed to by
 --     ue.config.dap.lldb_dap_path.
 --   * A symbol-rich libUE4.so (DWARF) available locally — either the
---     Binaries/Android/Client_Symbols_v* tree or the Intermediate jni
+--     Binaries/Android/<Target>_Symbols_v* tree or the Intermediate jni
 --     output. Pointed to by ue.config dap.android_symbol_lib OR auto-
 --     detected from the project root. Strictly optional but strongly
 --     recommended: without it lldb-dap will pull stripped libUE4.so from
@@ -153,36 +153,66 @@ end
 
 -- ── project root + packageInfo.txt auto-discovery ────────────────────────
 --
--- UE's Android packaging writes Source/Client/Binaries/Android/packageInfo.txt
+-- UE's Android packaging writes <Project>/Binaries/Android/packageInfo.txt
 -- on every cook. Layout:
 --   line 1: package name      (e.g. com.example.mygame)
---   line 2: versionCode       (e.g. 169723198) — matches Client_Symbols_v<code>/
+--   line 2: versionCode       (e.g. 169723198) — matches <Target>_Symbols_v<code>/
 --   line 3: versionName
 --
 -- This is the single source of truth for both pick_package and pick_symbol_lib,
 -- so we never have to prompt the user when a cooked APK exists on disk. Falls
 -- through to ctx/cfg/input only when there is no cooked output.
 
-local function android_marker_path(root)
+local function android_marker_path(root, uproject)
   if type(root) ~= "string" or root == "" then return nil end
   root = fs.norm(root)
-  local direct = root .. "/Source/Client/Binaries/Android"
-  if fs.is_file(direct .. "/packageInfo.txt") or fs.is_dir(direct) then
-    return direct
+
+  local function output_dir(project_dir)
+    if type(project_dir) ~= "string" or project_dir == "" then return nil end
+    local candidate = fs.norm(project_dir) .. "/Binaries/Android"
+    if fs.is_file(candidate .. "/packageInfo.txt") or fs.is_dir(candidate) then
+      return candidate
+    end
+    return nil
   end
-  -- Some projects store the .uproject under <repo>/Source/Client, and
-  -- ue.resolve_context().project_root points there (for example
-  -- E:/.../Source/Client). In that shape the Android marker lives directly
-  -- under project_root/Binaries/Android, not project_root/Source/Client/... .
-  local in_project = root .. "/Binaries/Android"
-  if fs.is_file(in_project .. "/packageInfo.txt") or fs.is_dir(in_project) then
-    return in_project
+
+  -- An explicit .uproject is authoritative when context carries one.
+  if type(uproject) == "string" and uproject ~= "" then
+    local explicit = output_dir(vim.fn.fnamemodify(fs.norm(uproject), ":h"))
+    if explicit then return explicit end
   end
-  return nil
+
+  local direct = output_dir(root)
+  if direct then return direct end
+
+  -- Repository-root layout: <repo>/Source/<Project>/<Project>.uproject.
+  -- Accept only one cooked nested project; multiple matches are ambiguous and
+  -- must be resolved by the explicit ctx.uproject path instead of guessing.
+  local source_dir = root .. "/Source"
+  if not fs.is_dir(source_dir) then return nil end
+  local nested = {}
+  for name, kind in vim.fs.dir(source_dir) do
+    if kind == "directory" then
+      local project_dir = source_dir .. "/" .. name
+      local has_uproject = false
+      for child, child_kind in vim.fs.dir(project_dir) do
+        if child_kind == "file" and child:lower():match("%.uproject$") then
+          has_uproject = true
+          break
+        end
+      end
+      if has_uproject then
+        local candidate = output_dir(project_dir)
+        if candidate then nested[#nested + 1] = candidate end
+      end
+    end
+  end
+  table.sort(nested)
+  return #nested == 1 and nested[1] or nil
 end
 
-local function read_package_info(proot)
-  local android_dir = android_marker_path(proot)
+local function read_package_info(proot, uproject)
+  local android_dir = android_marker_path(proot, uproject)
   if not android_dir then return nil end
   local path = android_dir .. "/packageInfo.txt"
   if not fs.is_file(path) then return nil end
@@ -198,9 +228,8 @@ local function read_package_info(proot)
 end
 
 -- Walk up from `start` looking for the Android cook output marker. Supports
--- both repo-root layout (<repo>/Source/Client/Binaries/Android) and the
--- common UE project-root layout (<repo>/Source/Client/Binaries/Android where
--- project_root itself is Source/Client).
+-- both repo-root layout (<repo>/Source/<Project>/Binaries/Android) and the
+-- common UE project-root layout (<project>/Binaries/Android).
 local function discover_project_root(start)
   if not start or start == "" then return nil end
   local cur = fs.norm(start)
@@ -234,8 +263,8 @@ local function effective_project_root(ctx)
       add(project_grandparent)
     end
     -- Only use engine_root as a discovery START point, never as an immediate
-    -- project root: otherwise buffers opened under D:/project/uetemp make us
-    -- build D:/project/uetemp/Source/Client/... and prompt unnecessarily.
+    -- project root: otherwise an engine buffer can resolve an unrelated
+    -- nested game project and prompt unnecessarily.
     local from_engine = ctx.engine_root and discover_project_root(ctx.engine_root) or nil
     add(from_engine)
   end
@@ -246,7 +275,7 @@ local function effective_project_root(ctx)
   add(discover_project_root(vim.fn.getcwd()))
 
   for _, root in ipairs(roots) do
-    if android_marker_path(root) then return root end
+    if android_marker_path(root, ctx and ctx.uproject or nil) then return root end
   end
   return roots[1]
 end
@@ -273,7 +302,7 @@ local function pick_package(ctx)
   -- 3. packageInfo.txt under the discovered project root — written by
   --    UE on every Android cook, single source of truth.
   local proot = effective_project_root(ctx)
-  local info = read_package_info(proot)
+  local info = read_package_info(proot, ctx and ctx.uproject or nil)
   if info and info.package ~= "" then
     -- Persist for next time so we never re-discover. Best-effort, ignore
     -- failures (no engine_root, immutable FS, etc).
@@ -306,18 +335,33 @@ local function pick_symbol_lib(ctx)
   end
   local proot = effective_project_root(ctx)
   if proot then
-    local android_dir = android_marker_path(proot)
+    local android_dir = android_marker_path(proot, ctx and ctx.uproject or nil)
     -- 2. Exact match against packageInfo.txt versionCode — guarantees the
     --    symbols correspond to the installed APK.
-    local info = read_package_info(proot)
+    local info = read_package_info(proot, ctx and ctx.uproject or nil)
     if android_dir and info and info.version_code ~= "" then
-      local exact = {
-        android_dir .. "/Client_Symbols_v" .. info.version_code .. "/Client-arm64/libUE4.so",
-        android_dir .. "/Client_Symbols_v" .. info.version_code .. "/Client-arm64/libUnreal.so",
-      }
-      for _, p in ipairs(exact) do
-        if fs.is_file(p) then return p end
+      local suffix = "_Symbols_v" .. info.version_code
+      local exact = {}
+      for name, kind in vim.fs.dir(android_dir) do
+        if kind == "directory" and #name >= #suffix
+            and name:sub(-#suffix) == suffix then
+          local package_dir = android_dir .. "/" .. name
+          for arch_name, arch_kind in vim.fs.dir(package_dir) do
+            if arch_kind == "directory" and arch_name:lower():match("%-arm64$") then
+              local arch_dir = package_dir .. "/" .. arch_name
+              local preferred = arch_dir .. "/libUE4.so"
+              local fallback = arch_dir .. "/libUnreal.so"
+              if fs.is_file(preferred) then
+                exact[#exact + 1] = preferred
+              elseif fs.is_file(fallback) then
+                exact[#exact + 1] = fallback
+              end
+            end
+          end
+        end
       end
+      table.sort(exact)
+      if #exact == 1 then return exact[1] end
     end
     -- 3. Scan all symbol packages, pick the newest by mtime (best guess
     --    when no packageInfo or no exact match). Use fs.dir for the immediate
@@ -327,16 +371,26 @@ local function pick_symbol_lib(ctx)
     if android_dir and fs.is_dir(android_dir) then
       for name, kind in vim.fs.dir(android_dir) do
         if kind == "directory" and name:find("Symbols", 1, true) then
-          discovered[#discovered + 1] = android_dir .. "/" .. name .. "/Client-arm64/libUE4.so"
-          discovered[#discovered + 1] = android_dir .. "/" .. name .. "/Client-arm64/libUnreal.so"
+          local package_dir = android_dir .. "/" .. name
+          for arch_name, arch_kind in vim.fs.dir(package_dir) do
+            if arch_kind == "directory" and arch_name:lower():match("%-arm64$") then
+              local arch_dir = package_dir .. "/" .. arch_name
+              local preferred = arch_dir .. "/libUE4.so"
+              local fallback = arch_dir .. "/libUnreal.so"
+              if fs.is_file(preferred) then
+                discovered[#discovered + 1] = preferred
+              elseif fs.is_file(fallback) then
+                discovered[#discovered + 1] = fallback
+              end
+            end
+          end
         end
       end
     end
+    local project_dir = android_dir and fs.norm(vim.fn.fnamemodify(android_dir, ":h:h")) or proot
     local glob_patterns = {
-      proot .. "/Source/Client/Intermediate/Android/arm64/jni/arm64-v8a/libUE4.so",
-      proot .. "/Source/Client/Intermediate/Android/arm64/jni/arm64-v8a/libUnreal.so",
-      proot .. "/Intermediate/Android/arm64/jni/arm64-v8a/libUE4.so",
-      proot .. "/Intermediate/Android/arm64/jni/arm64-v8a/libUnreal.so",
+      project_dir .. "/Intermediate/Android/arm64/jni/arm64-v8a/libUE4.so",
+      project_dir .. "/Intermediate/Android/arm64/jni/arm64-v8a/libUnreal.so",
     }
     local best_path, best_mtime = nil, -1
     for _, path in ipairs(discovered) do

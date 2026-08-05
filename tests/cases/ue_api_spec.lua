@@ -70,12 +70,12 @@ t.describe("ue.android_build_command（SO-only）", function()
     local old_target = vim.env.UE_BUILD_TARGET
     vim.env.UE_TARGET_PLATFORM = "Android"
     vim.env.UE_TARGET_CONFIGURATION = "Test"
-    vim.env.UE_BUILD_TARGET = "Client"
+    vim.env.UE_BUILD_TARGET = "SampleGame"
 
     local ctx = {
       engine_root = "C:/FakeUE",
       project_root = "C:/FakeProject",
-      uproject = "C:/FakeProject/Client.uproject",
+      uproject = "C:/FakeProject/SampleGame.uproject",
     }
     local normal_cmd, normal_err = ue._android_build_command_for_test(ctx)
     local so_cmd, so_err = ue._android_build_command_for_test(ctx, { skip_deploy = true })
@@ -88,10 +88,10 @@ t.describe("ue.android_build_command（SO-only）", function()
     t.assert_true(so_cmd ~= nil, tostring(so_err))
     local normal_text = table.concat(normal_cmd, " ")
     local so_text = table.concat(so_cmd, " ")
-    t.assert_contains(normal_text, "Build.bat Client Android Test")
+    t.assert_contains(normal_text, "Build.bat SampleGame Android Test")
     t.assert_false(normal_text:find("ue_android_so_build.ps1", 1, true) ~= nil)
     t.assert_contains(so_text, "ue_android_so_build.ps1")
-    t.assert_contains(so_text, "-Target Client")
+    t.assert_contains(so_text, "-Target SampleGame")
     t.assert_contains(so_text, "-Platform Android")
     t.assert_contains(so_text, "-Configuration Test")
     t.assert_false(so_text:find("-SkipDeploy", 1, true) ~= nil)
@@ -105,25 +105,33 @@ t.describe("ue.android_build_command（SO-only）", function()
     t.assert_false(script:find('"-SkipDeploy"', 1, true) ~= nil)
   end)
 
+  t.it("项目和 SO 发现不固定 Client 项目路径", function()
+    local source = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
+    t.assert_false(source:find("Source/Client", 1, true) ~= nil,
+      "项目发现必须从 .uproject 派生，不能固定 Source/Client")
+    t.assert_false(source:find("Client-arm64.so", 1, true) ~= nil,
+      "SO 发现必须从动态 Target 派生")
+  end)
+
   t.it("SO deploy 命令锁定 serial/package/当前配置产物", function()
     local root = vim.fn.tempname()
-    local project_dir = root .. "/Source/Client"
-    local so = project_dir .. "/Binaries/Android/Client-Android-Test-arm64.so"
+    local project_dir = root .. "/Source/SampleGame"
+    local so = project_dir .. "/Binaries/Android/SampleGame-Android-Test-arm64.so"
     vim.fn.mkdir(vim.fs.dirname(so), "p")
     vim.fn.writefile({ "so" }, so)
-    vim.fn.writefile({ "{}" }, project_dir .. "/Client.uproject")
+    vim.fn.writefile({ "{}" }, project_dir .. "/SampleGame.uproject")
 
     local old_platform = vim.env.UE_TARGET_PLATFORM
     local old_configuration = vim.env.UE_TARGET_CONFIGURATION
     local old_target = vim.env.UE_BUILD_TARGET
     vim.env.UE_TARGET_PLATFORM = "Android"
     vim.env.UE_TARGET_CONFIGURATION = "Test"
-    vim.env.UE_BUILD_TARGET = "Client"
+    vim.env.UE_BUILD_TARGET = "SampleGame"
     local cmd, err = ue._android_so_deploy_command_for_test({
       engine_root = "C:/FakeUE",
       project_root = root,
-      uproject = project_dir .. "/Client.uproject",
-    }, "SERIAL-USB", "com.example.client")
+      uproject = project_dir .. "/SampleGame.uproject",
+    }, "SERIAL-USB", "com.example.samplegame")
     vim.env.UE_TARGET_PLATFORM = old_platform
     vim.env.UE_TARGET_CONFIGURATION = old_configuration
     vim.env.UE_BUILD_TARGET = old_target
@@ -133,29 +141,157 @@ t.describe("ue.android_build_command（SO-only）", function()
     local text = table.concat(cmd, " ")
     t.assert_contains(text, "ue_android_so_deploy.ps1")
     t.assert_contains(text, "-Serial SERIAL-USB")
-    t.assert_contains(text, "-Package com.example.client")
-    t.assert_contains(text, "Client-Android-Test-arm64.so")
+    t.assert_contains(text, "-Package com.example.samplegame")
+    t.assert_contains(text, "SampleGame-Android-Test-arm64.so")
   end)
 
-  t.it("SO deploy 不降级使用其他配置或通用文件名产物", function()
+  t.it("SO deploy 从匹配配置的 UBT receipt 解析真实通用文件名", function()
     local root = vim.fn.tempname()
-    local project_dir = root .. "/Source/Client"
-    local generic_so = project_dir .. "/Binaries/Android/Client-arm64.so"
-    vim.fn.mkdir(vim.fs.dirname(generic_so), "p")
-    vim.fn.writefile({ "wrong configuration" }, generic_so)
-    vim.fn.writefile({ "{}" }, project_dir .. "/Client.uproject")
+    local project_dir = root .. "/Source/SampleGame"
+    local binaries_dir = project_dir .. "/Binaries/Android"
+    local generic_so = binaries_dir .. "/SampleGame-arm64.so"
+    vim.fn.mkdir(binaries_dir, "p")
+    vim.fn.writefile({ "so" }, generic_so)
+    vim.fn.writefile({ "{}" }, project_dir .. "/SampleGame.uproject")
+    vim.fn.writefile({ vim.json.encode({
+      TargetName = "SampleGame",
+      Platform = "Android",
+      Configuration = "Test",
+      Launch = "$(ProjectDir)/Binaries/Android/SampleGame-arm64.so",
+      BuildProducts = {
+        { Path = "$(ProjectDir)/Binaries/Android/SampleGame-arm64.so", Type = "Executable" },
+      },
+    }) }, binaries_dir .. "/SampleGame.target")
 
     local old_platform = vim.env.UE_TARGET_PLATFORM
     local old_configuration = vim.env.UE_TARGET_CONFIGURATION
     local old_target = vim.env.UE_BUILD_TARGET
     vim.env.UE_TARGET_PLATFORM = "Android"
     vim.env.UE_TARGET_CONFIGURATION = "Test"
-    vim.env.UE_BUILD_TARGET = "Client"
+    vim.env.UE_BUILD_TARGET = "SampleGame"
     local cmd, err = ue._android_so_deploy_command_for_test({
       engine_root = "C:/FakeUE",
       project_root = root,
-      uproject = project_dir .. "/Client.uproject",
-    }, "SERIAL-USB", "com.example.client")
+      uproject = project_dir .. "/SampleGame.uproject",
+    }, "SERIAL-USB", "com.example.samplegame")
+    vim.env.UE_TARGET_PLATFORM = old_platform
+    vim.env.UE_TARGET_CONFIGURATION = old_configuration
+    vim.env.UE_BUILD_TARGET = old_target
+    vim.fn.delete(root, "rf")
+
+    t.assert_true(cmd ~= nil, tostring(err))
+    t.assert_contains(table.concat(cmd, " "), "SampleGame-arm64.so")
+  end)
+
+  t.it("SO deploy 不把 receipt 中的插件 SO 当成主目标", function()
+    local root = vim.fn.tempname()
+    local project_dir = root .. "/Source/SampleGame"
+    local binaries_dir = project_dir .. "/Binaries/Android"
+    local target_so = binaries_dir .. "/SampleGame-arm64.so"
+    local plugin_so = binaries_dir .. "/libTelemetryPlugin.so"
+    vim.fn.mkdir(binaries_dir, "p")
+    vim.fn.writefile({ "target" }, target_so)
+    vim.fn.writefile({ "plugin" }, plugin_so)
+    vim.fn.writefile({ "{}" }, project_dir .. "/SampleGame.uproject")
+    vim.fn.writefile({ vim.json.encode({
+      TargetName = "SampleGame",
+      Platform = "Android",
+      Configuration = "Test",
+      BuildProducts = {
+        { Path = "$(ProjectDir)/Binaries/Android/libTelemetryPlugin.so", Type = "DynamicLibrary" },
+        { Path = "$(ProjectDir)/Binaries/Android/SampleGame-arm64.so", Type = "Executable" },
+      },
+    }) }, binaries_dir .. "/SampleGame.target")
+
+    local old_platform = vim.env.UE_TARGET_PLATFORM
+    local old_configuration = vim.env.UE_TARGET_CONFIGURATION
+    local old_target = vim.env.UE_BUILD_TARGET
+    vim.env.UE_TARGET_PLATFORM = "Android"
+    vim.env.UE_TARGET_CONFIGURATION = "Test"
+    vim.env.UE_BUILD_TARGET = "SampleGame"
+    local cmd, err = ue._android_so_deploy_command_for_test({
+      engine_root = "C:/FakeUE",
+      project_root = root,
+      uproject = project_dir .. "/SampleGame.uproject",
+    }, "SERIAL-USB", "com.example.samplegame")
+    vim.env.UE_TARGET_PLATFORM = old_platform
+    vim.env.UE_TARGET_CONFIGURATION = old_configuration
+    vim.env.UE_BUILD_TARGET = old_target
+    vim.fn.delete(root, "rf")
+
+    t.assert_true(cmd ~= nil, tostring(err))
+    local text = table.concat(cmd, " ")
+    t.assert_contains(text, "SampleGame-arm64.so")
+    t.assert_false(text:find("libTelemetryPlugin.so", 1, true) ~= nil,
+      "receipt fallback 不得按 BuildProducts 顺序误选插件 SO")
+  end)
+
+  t.it("SO deploy 遇到多个主产物候选时拒绝猜测", function()
+    local root = vim.fn.tempname()
+    local project_dir = root .. "/Source/SampleGame"
+    local binaries_dir = project_dir .. "/Binaries/Android"
+    vim.fn.mkdir(binaries_dir, "p")
+    vim.fn.writefile({ "generic" }, binaries_dir .. "/SampleGame-arm64.so")
+    vim.fn.writefile({ "configured" }, binaries_dir .. "/SampleGame-Android-Test-arm64.so")
+    vim.fn.writefile({ "{}" }, project_dir .. "/SampleGame.uproject")
+    vim.fn.writefile({ vim.json.encode({
+      TargetName = "SampleGame",
+      Platform = "Android",
+      Configuration = "Test",
+      BuildProducts = {
+        { Path = "$(ProjectDir)/Binaries/Android/SampleGame-arm64.so", Type = "Executable" },
+        { Path = "$(ProjectDir)/Binaries/Android/SampleGame-Android-Test-arm64.so", Type = "Executable" },
+      },
+    }) }, binaries_dir .. "/SampleGame.target")
+
+    local old_platform = vim.env.UE_TARGET_PLATFORM
+    local old_configuration = vim.env.UE_TARGET_CONFIGURATION
+    local old_target = vim.env.UE_BUILD_TARGET
+    vim.env.UE_TARGET_PLATFORM = "Android"
+    vim.env.UE_TARGET_CONFIGURATION = "Test"
+    vim.env.UE_BUILD_TARGET = "SampleGame"
+    local cmd, err = ue._android_so_deploy_command_for_test({
+      engine_root = "C:/FakeUE",
+      project_root = root,
+      uproject = project_dir .. "/SampleGame.uproject",
+    }, "SERIAL-USB", "com.example.samplegame")
+    vim.env.UE_TARGET_PLATFORM = old_platform
+    vim.env.UE_TARGET_CONFIGURATION = old_configuration
+    vim.env.UE_BUILD_TARGET = old_target
+    vim.fn.delete(root, "rf")
+
+    t.assert_nil(cmd, "多个匹配主产物时不得按 receipt 顺序猜测")
+    t.assert_contains(tostring(err), "Android SO not found")
+  end)
+
+  t.it("SO deploy 不降级使用其他配置或通用文件名产物", function()
+    local root = vim.fn.tempname()
+    local project_dir = root .. "/Source/SampleGame"
+    local generic_so = project_dir .. "/Binaries/Android/SampleGame-arm64.so"
+    vim.fn.mkdir(vim.fs.dirname(generic_so), "p")
+    vim.fn.writefile({ "wrong configuration" }, generic_so)
+    vim.fn.writefile({ "{}" }, project_dir .. "/SampleGame.uproject")
+    vim.fn.writefile({ vim.json.encode({
+      TargetName = "SampleGame",
+      Platform = "Android",
+      Configuration = "Development",
+      Launch = "$(ProjectDir)/Binaries/Android/SampleGame-arm64.so",
+      BuildProducts = {
+        { Path = "$(ProjectDir)/Binaries/Android/SampleGame-arm64.so", Type = "Executable" },
+      },
+    }) }, project_dir .. "/Binaries/Android/SampleGame.target")
+
+    local old_platform = vim.env.UE_TARGET_PLATFORM
+    local old_configuration = vim.env.UE_TARGET_CONFIGURATION
+    local old_target = vim.env.UE_BUILD_TARGET
+    vim.env.UE_TARGET_PLATFORM = "Android"
+    vim.env.UE_TARGET_CONFIGURATION = "Test"
+    vim.env.UE_BUILD_TARGET = "SampleGame"
+    local cmd, err = ue._android_so_deploy_command_for_test({
+      engine_root = "C:/FakeUE",
+      project_root = root,
+      uproject = project_dir .. "/SampleGame.uproject",
+    }, "SERIAL-USB", "com.example.samplegame")
     vim.env.UE_TARGET_PLATFORM = old_platform
     vim.env.UE_TARGET_CONFIGURATION = old_configuration
     vim.env.UE_BUILD_TARGET = old_target
@@ -167,6 +303,13 @@ t.describe("ue.android_build_command（SO-only）", function()
 
   t.it("SO deploy 捕获并精确恢复已安装文件 metadata", function()
     local script = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/scripts/ue_android_so_deploy.ps1"), "\n")
+    t.assert_contains(script, "packageInfo.txt")
+    t.assert_contains(script, "Installed APK baseline mismatch")
+    t.assert_contains(script, "versionCode=")
+    t.assert_contains(script, "function Get-Sha256Hex")
+    t.assert_contains(script, "$sha256.ComputeHash($stream)")
+    t.assert_false(script:find("Get-FileHash", 1, true) ~= nil,
+      "部署脚本不得依赖可能未加载的 Microsoft.PowerShell.Utility cmdlet")
     t.assert_contains(script, '"stat", "-c", "%u"')
     t.assert_contains(script, '"stat", "-c", "%g"')
     t.assert_contains(script, '"stat", "-c", "%a"')
@@ -200,17 +343,17 @@ t.describe("ue.project_index_dirs（nested project scan scope）", function()
 
   t.it("nested uproject 默认只扫描项目锚点，不吞掉 project_root/Source 旁支", function()
     local root = vim.fn.tempname():gsub("\\", "/") .. "_nested_project"
-    mkdir(root .. "/Source/Client/Source")
-    mkdir(root .. "/Source/Client/Plugins")
-    mkdir(root .. "/Source/Client/TypeScript")
-    mkdir(root .. "/Source/Client/typescript")
+    mkdir(root .. "/Source/SampleGame/Source")
+    mkdir(root .. "/Source/SampleGame/Plugins")
+    mkdir(root .. "/Source/SampleGame/TypeScript")
+    mkdir(root .. "/Source/SampleGame/typescript")
     mkdir(root .. "/Source/Config/Raw/Tables")
-    write_file(root .. "/Source/Client/Client.uproject", "{}")
+    write_file(root .. "/Source/SampleGame/SampleGame.uproject", "{}")
 
     local dirs = ue._project_index_dirs_for_test({ project_root = root })
-    t.assert_true(contains(dirs, "Source/Client/Source"),
+    t.assert_true(contains(dirs, "Source/SampleGame/Source"),
       "应扫描 nested 项目的 Source，实际=" .. vim.inspect(dirs))
-    t.assert_true(contains(dirs, "Source/Client/Plugins"), "应扫描 nested 项目的 Plugins")
+    t.assert_true(contains(dirs, "Source/SampleGame/Plugins"), "应扫描 nested 项目的 Plugins")
     t.assert_false(contains(dirs, "Source"),
       "不得退回扫描整个 project_root/Source（会把 Config/SDK/生成数据吞进 cindex）")
     t.assert_false(ue._project_scan_roots_match_for_test({ project_root = root }, nil),
@@ -218,8 +361,8 @@ t.describe("ue.project_index_dirs（nested project scan scope）", function()
     t.assert_true(ue._project_scan_roots_match_for_test({ project_root = root }, dirs),
       "相同 scan roots 才能复用缓存")
     local case_dirs = ue._existing_relative_dirs_for_test(root, {
-      "Source/Client/TypeScript",
-      "Source/Client/typescript",
+      "Source/SampleGame/TypeScript",
+      "Source/SampleGame/typescript",
     })
     t.assert_eq(#case_dirs, vim.fn.has("win32") == 1 and 1 or 2,
       "Windows 上大小写等价的扫描根不得让 fd 重复遍历同一棵树")
@@ -242,13 +385,13 @@ t.describe("ue.project_index_dirs（nested project scan scope）", function()
 
   t.it("nested layout 有多个 uproject 时保守回退根级目录", function()
     local root = vim.fn.tempname():gsub("\\", "/") .. "_ambiguous_nested_project"
-    mkdir(root .. "/Source/Client/Source")
-    write_file(root .. "/Source/Client/A.uproject", "{}")
-    write_file(root .. "/Source/Client/B.uproject", "{}")
+    mkdir(root .. "/Source/SampleGame/Source")
+    write_file(root .. "/Source/SampleGame/A.uproject", "{}")
+    write_file(root .. "/Source/SampleGame/B.uproject", "{}")
 
     local dirs = ue._project_index_dirs_for_test({ project_root = root })
     t.assert_true(contains(dirs, "Source"), "多个 .uproject 时不得擅自选择项目锚点")
-    t.assert_false(contains(dirs, "Source/Client/Source"))
+    t.assert_false(contains(dirs, "Source/SampleGame/Source"))
 
     pcall(vim.fn.delete, root, "rf")
   end)

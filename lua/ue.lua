@@ -6254,13 +6254,13 @@ do
 end
 
 -- ---------------------------------------------------------------------------
--- Public platform query API (consumed by lsp_fallback for smart gd ranking).
+-- Public platform query API. Path priorities remain for API compatibility and
+-- explicit platform-aware consumers; C++ gd never uses path ranking.
 -- Wrapped in do-end to avoid main-chunk local budget pressure.
 -- ---------------------------------------------------------------------------
 
 do
-  -- Path keyword priority list for ranking implementation candidates.
-  -- Earlier entries = higher preference. lsp_fallback scores hits by index.
+  -- Path keyword priority list retained as a public platform hint API.
   local PLATFORM_PATH_HINTS = {
     Win64    = { "D3D12RHI", "D3D11RHI", "VulkanRHI", "WindowsRHI", "WindowsPlatform", "Windows/" },
     Win32    = { "D3D11RHI", "D3D12RHI", "VulkanRHI", "WindowsRHI", "WindowsPlatform", "Windows/" },
@@ -7217,7 +7217,7 @@ function M.ai_context(engine_root)
       {
         key = "<Space>uq",
         nvim_command = ":UEDeployAndroidSO",
-        purpose = "Strip and atomically replace libUE4.so on the selected rooted Android device.",
+        purpose = "Strip and atomically replace libUE4.so, leaving the Android package stopped.",
         native_command = so_deploy_command,
         native_action = so_deploy_error,
       },

@@ -1,9 +1,9 @@
 -- utils/ue_goto/csearch_fallback.lua
 -- ============================================================================
--- Last-resort definition lookup via Google codesearch (csearch) index.
+-- Last-resort non-C++ compatibility lookup via Google codesearch (csearch).
 --
--- Used as path-B step 3 (after cache miss + gtags miss) before giving up.
--- Asynchronous, never blocks the editor.
+-- C/C++ gd MUST NOT call this module. Explicit code search, references, and
+-- non-C++ compatibility paths retain it. Asynchronous, never blocks the editor.
 --
 -- Strategy:
 --   csearch is an identifier-only trigram index, so we cannot push fancy

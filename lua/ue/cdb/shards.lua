@@ -209,34 +209,43 @@ end
 -- MERGE
 -- ==========================================================================
 
---- Compute the active shard key from ctx.state. Falls back to manifest.active
---- if state.target_platform isn't set yet. Returns "" when no shard exists.
+--- Compute the active shard key from ctx.state and the manifest's explicit
+--- selection. Returns "" when no shard exists.
 function M.active_key(ctx, manifest)
-  -- TODO(2026-05-15): when state.target_configuration is "Development Editor"
-  -- vs "Development", we currently strip " Editor" and match config only —
-  -- so Win64+"Development Editor" and Win64+"Development" both pick whichever
-  -- of Win64-Client-Development / Win64-UE4Editor-Development sorts first by
-  -- mtime/name. Should also bias target name (*Editor suffix wins when " Editor"
-  -- suffix is present, non-Editor target wins when it isn't) so :UESetPlatform
-  -- "Win64 Development" reliably picks the game shard. Tracked under the
-  -- per-platform fast-swap work session.
+  manifest = manifest or { active = nil, shards = {} }
   local state = ctx.state or {}
   local plat = (state.target_platform or ""):gsub("^%s+", ""):gsub("%s+$", "")
   local conf_raw = (state.target_configuration or ""):gsub("^%s+", ""):gsub("%s+$", "")
-  -- If we have an explicit platform but no target, search the manifest for
-  -- the most recent shard matching that platform.
+  local conf = conf_raw:gsub(" Editor$", "")
+  local target_value = state.target
+  if target_value == nil or tostring(target_value):match("^%s*$") then
+    target_value = state.target_name
+  end
+  local target = tostring(target_value or "")
+    :gsub("^%s+", ""):gsub("%s+$", "")
+  local wants_editor = conf_raw:match(" Editor$") ~= nil
+
+  local function matches(meta)
+    if type(meta) ~= "table" or meta.platform ~= plat or meta.config ~= conf then
+      return false
+    end
+    if target ~= "" then return meta.target == target end
+    local is_editor = tostring(meta.target or ""):lower():match("editor$") ~= nil
+    return wants_editor == is_editor
+  end
+
   if plat ~= "" and conf_raw ~= "" then
-    -- Try every known target in the manifest with matching platform+config.
+    -- `manifest.active` is an explicit selection written by prepare/switch.
+    -- Preserve it when it still satisfies the requested build class. Picking
+    -- the newest sibling here can select a one-file hot shard from another
+    -- target and falsely make the real active CDB appear incomplete.
+    local active_meta = manifest.shards and manifest.shards[manifest.active]
+    if matches(active_meta) then return manifest.active end
+
     local best_key, best_mtime = nil, -1
     for key, meta in pairs(manifest.shards or {}) do
-      if meta.platform == plat then
-        -- Configuration is encoded as "Development" / "Development Editor".
-        -- The shard side splits "Development Editor" → config=Development, target=...Editor.
-        -- Match by stripping " Editor" suffix from conf_raw and comparing config.
-        local stripped = conf_raw:gsub(" Editor$", "")
-        if meta.config == stripped and (meta.mtime or 0) > best_mtime then
-          best_key, best_mtime = key, meta.mtime or 0
-        end
+      if matches(meta) and (meta.mtime or 0) > best_mtime then
+        best_key, best_mtime = key, meta.mtime or 0
       end
     end
     if best_key then return best_key end

@@ -21,8 +21,8 @@
 | DAP 调试 | `lua/ue/dap/` | codelldb 适配 + 各平台 attach/launch | `platforms` 注册表是唯一 dispatch seam |
 | Android device | `lua/utils/android_device.lua` | `adb devices -l` 枚举、会话级 serial 选择、`adb -s` argv | `vim.g.ue_android_device_serial` 是交互操作真相；活跃任务捕获 serial |
 | Android SO 迭代 | `lua/ue.lua` + `scripts/ue_android_so_*.ps1` | SO-only UBT action 执行、root 原子替换与加载验证 | 不改引擎/项目；只适用于 root 测试设备；正常 APK 流程保持独立 |
-| 符号解析栈 | `lua/utils/ue_goto/` + `lsp_fallback.lua` | gd/gr 的 5 层 fallback | clangd 权威；TS 只省调用；csearch/gtags 兜底 |
-| 代码搜索 | `lua/utils/code_search/` | csearch 亚秒级 grep | 兜底非主路；clangd MISS 时才用 |
+| 符号解析栈 | `lua/utils/ue_goto/` + `lsp_fallback.lua` | C++ compiler identity；非 C++ compatibility | header 必须有 proven origin TU；非 resolved 不猜测 |
+| 代码搜索 | `lua/utils/code_search/` | csearch 亚秒级 grep | 显式搜索、references 与非 C++ 兼容路径 |
 | 平台驱动 | `lua/utils/platform/` | OS 分支唯一收口 | 四驱动同接口；其余代码不做 OS 分支 |
 | workaround 注册表 | `lua/workarounds/` | 上游 bug 隔离补丁 | 带 frontmatter；`:WorkaroundList` 可见 |
 | 配置层 | `lua/config/` | keymaps/options/autocmds/lazy | LazyVim 自动加载，勿在 init 重复 require |
@@ -32,8 +32,8 @@
 
 - **索引/CDB**：`:UEPrepare` → UBT `-SkipBuild` 取编译参数 → `ue/cdb/*` 生成/裁剪/inject
   compile_commands.json → cindex 建 csearch 索引 → clangd reload。全程 async + 进度 UI。
-- **goto-definition**：`gd` → `treesitter 早退判定` → `cache(~70% 命中)` → `clangd LSP(权威)`
-  → `csearch` → `gtags`，逐层 fall-through，最终兜底 toast「no def」。详见
+- **goto-definition**：C++ source 走 active-CDB + clangd exact-cursor USR；header 走 proven origin TU +
+  libclang sidecar canonical USR。非 C++ 兼容路径保留 cache/LSP/csearch/GTAGS；详见
   `docs/architecture-symbol-resolution.md`。
 - **Android device**：`<Space>uA` / 首次 Android 操作 → `utils.android_device` 异步执行
   `adb devices -l` → picker 展示名称 + serial → `vim.g.ue_android_device_serial`；install / launch /
@@ -41,7 +41,8 @@
 - **Android SO 快速迭代**：`<Space>us` → UBT 导出/执行 outdated action graph，不进入 Gradle；
   `<Space>uq` → 由匹配 Target/Platform/Configuration 的 UBT receipt 解析实际 SO → 校验设备 APK
   versionCode 与 `packageInfo.txt` 基线一致 → 生成与 APK 一致的 stripped 临时副本 → 按 selected serial 动态解析
-  `nativeLibraryDir` → 备份、原子替换、metadata/hash/PID/maps 验证，失败自动回滚；项目目录、Target 和符号包
+  `nativeLibraryDir` → force-stop 并确认旧 PID 清空 → 备份、原子替换、metadata/hash 校验后保持停止；失败自动回滚。
+  `<Space>ui` 同样只安装不启动，运行统一由用户显式 `<Space>ul` 触发。项目目录、Target 和符号包
   均从 `.uproject`/receipt/目录结构派生，不固定项目名。
 - **DAP**：`UEDAP*` 命令 → `ue.dap.platforms` 按当前平台 dispatch → 具体平台 `attach/launch`
   → codelldb（Win64/Android）。Android 走 platform 模式 + serial connect URL；K30 URL 与本次

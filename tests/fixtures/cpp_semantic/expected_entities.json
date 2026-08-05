@@ -1,0 +1,11 @@
+{
+  "QUERY:source_pick": "pick(Widget)",
+  "QUERY:zero": "zero()",
+  "QUERY:default": "with_default(int,int)",
+  "QUERY:cvref_mutable": "refpick(Widget&)",
+  "QUERY:cvref_const": "refpick(const Widget&)",
+  "QUERY:template_nontemplate": "templated(Widget)",
+  "QUERY:template_generic": "templated<Another>(Another)",
+  "QUERY:adl": "fixture_adl::adl_pick(Token)",
+  "QUERY:inherited": "Base::inherited(Widget) const"
+}

@@ -34,7 +34,7 @@ return {
           {
             "gd",
             definition_fallback,
-            desc = "Definition (LSP -> GTAGS)",
+            desc = "Definition (contextual C++ / LSP fallback)",
             nowait = true,
           },
           {

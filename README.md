@@ -10,8 +10,9 @@
 - **Super-unity indexing** — collapses 11,593 translation units into ~23
   aggregator TUs, cutting a full cold index from **hours to ~3 minutes** on
   Windows/NTFS while keeping ≥90% of symbols.
-- **Sub-100ms goto-definition** on UE-scale projects, via a 5-tier resolver
-  (treesitter → cache → clangd → csearch → gtags).
+- **Context-aware C++ goto-definition**: source calls use clangd's exact-cursor
+  identity; headers resolve in a compiler-proven origin TU through an async
+  libclang sidecar.
 - **Sub-second project grep** using a trigram index over the project file list
   (`FRDGBuilder`: ~365ms versus ~14s for an NTFS tree walk).
 - **CDB super-pipeline** that expands, PCH-prebuilds and prunes
@@ -160,11 +161,11 @@ Variants: `:UEPrepareIncremental` (dirty files only), `:UEPrepareReindex`
 | File picker | `<leader><leader>` |
 | Build (current platform) | `<leader>ub` / `:UEBuild` |
 | Android SO only (skip APK) | `<leader>us` / `:UEBuildAndroidSO` |
-| Android quick SO deploy (root device) | `<leader>uq` / `:UEDeployAndroidSO` |
+| Android quick SO deploy (root device; does not launch) | `<leader>uq` / `:UEDeployAndroidSO` |
 | Launch the Editor | `:UELaunch` |
 | Re-index after adding/removing files | `:UEPrepareIncremental` |
 | Android: select device (name + serial, session-global) | `<leader>uA` / `:UESetAndroidDevice` |
-| Android: install / attach / breakpoint on selected device | `<leader>ui` / `:UEDAPAttach` / `F9` |
+| Android: install without launch / attach / breakpoint | `<leader>ui` / `:UEDAPAttach` / `F9` |
 | Background tasks: list / stop | `<leader>X` / `:Tasks` / `:TaskStopAll` |
 | All commands cheatsheet | `<leader>?` / `:UECheatsheet` |
 
@@ -228,7 +229,7 @@ lua/
   plugins/                per-plugin setup (snacks-only)
   ue.lua                  UE engine hub (~10k lines)
   ue/{cdb,core,dap}/      CDB pipeline, pure functions, multi-platform DAP
-  utils/ue_goto/          5-tier goto-definition
+  utils/ue_goto/          contextual C++ + non-C++ compatibility navigation
   utils/code_search/      csearch sub-second grep
   utils/platform/         the only place OS branching is allowed
   workarounds/            isolated upstream-bug patches and registry

@@ -36,8 +36,8 @@
 | P8 | **codelldb 不用 `request="custom"`** | codelldb 1.12.2 会回 `Malformed message`；改用 `request="launch"` + `targetCreateCommands` + `processCreateCommands`。 | `docs/TOOLING.md` §Pitfalls #1 |
 | P9 | **不用 which-key 自动 cheatsheet** | 会泄漏我们从未绑定的 plugin 键位；自渲染 `:UECheatsheet`。 | `docs/architecture-vs-lazyvim.md` §"What we deliberately *don't* do" |
 | P10 | **不在配置内集成 copilot/codeium** | 推理交给外部 CLI（Claude Code / Codex），编辑器保持是编辑器。 | `docs/architecture-vs-lazyvim.md` §"What we deliberately *don't* do" |
-| P11 | **goto-def 不让 treesitter 给"答案"** | TS 没语义，跨翻译单元 / 模板 / macro 都看不见；TS 只做"省调用"判定，绝不替代 LSP 给精确定义（racing-goto-definition 死路）。 | `docs/architecture-symbol-resolution.md` §5、§6 |
-| P12 | **csearch / gtags 不做主路** | 文本/ctags 搜索分不清重载、同名、namespace；只能在 clangd MISS 时兜底。 | `docs/architecture-symbol-resolution.md` §6 |
+| P11 | **C++ goto-def 不让 Tree-sitter 决定或否决目标** | TS 没有 build TU 的类型、宏与 name lookup；C++ `gd` 必须由 compiler identity 决定。TS 可服务非 C++ 兼容路径，但不得给 C++ 语义答案或以语法规则制造失败。 | `docs/architecture-symbol-resolution.md` §1、§2 |
+| P12 | **C++ `gd` 禁止自动 csearch / GTAGS fallback** | 文本/ctags 搜索分不清重载、同名、namespace；Clang 语义失败必须诚实失败。显式搜索、references 和非 C++ 路径仍可使用它们。 | `docs/architecture-symbol-resolution.md` §1、§6 |
 | P13 | **不用 zoekt 替代 csearch** | Windows 不可用，已论证为死胡同。 | `docs/architecture-symbol-resolution.md` §6 (`zoekt-on-windows-dead-end`) |
 | P14 | **不用 PreserveBufferView / BufEnter winrestview 类 cursor 守护** | workaround 反噬模式；Vim 原生 cursor 行为已足够（见坑 K10）。 | `docs/architecture-symbol-resolution.md` §6; commit `252e9e0` |
 | P15 | **不在 `init.lua` 重复 require LazyVim 自动加载的 config 模块** | `config.options`/`autocmds`/`keymaps` 由 LazyVim 自动加载，重复 require 会双执行。 | `init.lua` NOTE (line ~44); 约束 C3 |
@@ -313,6 +313,13 @@
   → `lua/ue.lua`; `lua/ue/dap/android.lua`; `openspec/specs/android-so-quick-deploy/spec.md`;
   `openspec/specs/android-dap-attach/spec.md`
 
+- **K46 — Android 安装、SO 替换与启动必须分离**
+  症状: `uq` 替换后自动启动并用 PID/maps 验证，把文件部署与冷启动时序耦合；首次冷启动可能误回滚，且命令会
+  在用户未要求时占用设备前台。
+  解决约束: `ui` 只执行 APK 安装，`uq` 只负责 force-stop、原子替换、metadata/hash 校验和必要回滚；二者成功或
+  回滚后都不得自动启动应用。启动唯一由用户显式执行 `ul`。不得用固定 sleep、PID/maps 轮询或自动重试重新耦合。
+  → `scripts/ue_android_so_deploy.ps1`; `openspec/specs/android-so-quick-deploy/spec.md`
+
 ### 工具链 / LLVM
 
 - **K41 — 跨盘 project root 缺 `.clangd` → UEPrepare 后 clangd background-index 吃满 CPU/内存**
@@ -395,7 +402,16 @@
   cursor 改走。
   解决: 砍掉 snacks.scroll + PreserveBufferView（见禁止 P14）；jumper 内
   `_on_reassert` 钩子在跳完 ~10ms 后 verify 并必要时 reassert。
-  → `docs/architecture-symbol-resolution.md` §2.7; commit `252e9e0`
+  → `docs/architecture-symbol-resolution.md` §6; commit `252e9e0`
+
+- **K42 — 裸 symbol / arity / standalone header 不能完成 C++ overload resolution**
+  症状: 先解析无参 overload 后，按裸 symbol 缓存的 location 使另一个同名调用不请求
+  clangd 就原地跳回 sibling；非自包含 UE header 的 standalone AST 同时出现
+  `OverloadedDeclRef` / recovery，而真实 donor TU 能得到唯一 overload identity。
+  解决: C++ source 只接受 active-CDB clangd exact-cursor USR；header 只在 compiler-emitted
+  evidence 证明的 origin TU 中由 libclang 求 canonical USR。非 resolved 诚实失败，禁止
+  cache / arity / ranking / text fallback 猜目标。
+  → `docs/architecture-symbol-resolution.md`; `openspec/changes/archive/2026-08-05-replace-cpp-goto-with-contextual-clang-resolution/`
 
 ### grep 缓存 / csearch 失效
 
@@ -527,14 +543,19 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 
 ### C5 — 符号解析分层契约
 
-- 链路: `treesitter 早退` → `cache` → `clangd(LSP)` → `csearch` → `gtags`，按
-  "省调用 → 命中精度 → 兜底覆盖" 串成单链。
-- cache 承载约 **70%** 请求；cache HIT 路径 = lua table lookup + jumper.jump，**不动任何子进程**。
-- `.usf` / `.py` / `.Build.cs` 直接走 gtags，跳过 clangd 与 csearch。
-- **每一层失败都必须 fall through**，绝不让用户看到 `lua error in lsp_fallback`；最终兜底 toast "no def"。
-- clangd 永远是权威源但永不前台阻塞: spinner 600ms 后才显示，30s 硬超时。
+- **C++ source TU**：active CDB 证明 → clangd exact-cursor USR + 单次 definition；零个或多个
+  target 都保持当前位置，不读写 definition-location cache，不进入文本 fallback。
+- **C++ header**：必须继承或选择 compiler-emitted dependency evidence 证明的 origin TU，
+  由异步 libclang sidecar 在真实 argv / cwd 中解析 canonical USR；standalone header 不是 build truth。
+- C++ 终态仅 `resolved / ambiguous-context / invalid-semantic-context / unavailable`；只有
+  `resolved` 可跳转，Tree-sitter、arity、ranking、workspace symbol、csearch、GTAGS 不得选择或否决结果。
+- 允许缓存的是 live TU，key 绑定 active build、origin TU、exact compile fingerprint 与 toolchain；
+  不允许按 symbol / receiver / arity 持久化 C++ location。
+- 所有 parse/reparse 在 sidecar 进程；spinner 600ms 后显示，UI 主循环不得同步等待。
+- 非 C++ compatibility path 保留 cache/LSP/csearch/GTAGS；`.usf` / `.py` / `.Build.cs`
+  可直接走 GTAGS。显式搜索和 references 不受 C++ authority invariant 影响。
 - jumper 后置条件: 一个 `<Ctrl-O>` 回到源、恰好一条 jumplist 条目、无 `(target_buf,1,0)` 幽灵。
-→ `docs/architecture-symbol-resolution.md` §1、§5、§2.7
+→ `docs/architecture-symbol-resolution.md` §1–§6
 
 ### C5b — grep 缓存按平台分路径 + 失效契约
 

@@ -55,7 +55,7 @@ function M.render_markdown(context)
     "3. `UE_TARGET_PLATFORM`, `UE_TARGET_CONFIGURATION`, and `UE_BUILD_TARGET` override persisted values.",
     "4. A configuration such as `Development Editor` is split into UBT configuration `Development` and target kind `Editor`.",
     "5. `<Space>uA` selects `vim.g.ue_android_device_serial`; Android operations use `adb -s <serial>`.",
-    "6. `<Space>ui` installs the newest APK under the active `.uproject` onto that selected device.",
+    "6. `<Space>ui` installs the newest APK without launching it; `<Space>uq` replaces the SO and leaves the package stopped; `<Space>ul` is the explicit launch action.",
     "",
     "## Common UE Commands",
     "",

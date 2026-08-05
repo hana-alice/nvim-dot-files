@@ -1,19 +1,10 @@
 -- utils/ue_goto/cache.lua
 -- ============================================================================
--- Per-project definition cache for the path-B fallback chain.
+-- Per-project definition cache for the non-C++ compatibility fallback chain.
 --
--- Why this exists:
---   When the active clangd CDB doesn't cover a buffer/region (e.g. you're on
---   the Win64 Editor config but the cursor is inside a `#if PLATFORM_ANDROID`
---   block, or you opened an Android-only cpp directly), clangd cannot answer
---   `textDocument/definition`. The previous gd path then went straight to
---   GTAGS / csearch — every single time, even for symbols you've already
---   queried under a different active config.
---
---   This cache remembers successful resolutions (from EITHER path A's clangd
---   answer OR path B's gtags/csearch answer) so a second gd on the same
---   symbol — even after switching configs — hits a single jsonl read instead
---   of re-running gtags/csearch.
+-- C/C++ gd MUST NOT call this module: a symbol/receiver location key cannot
+-- encode overload resolution, macros, templates, ADL, or build context. The
+-- C++ authority boundary in lsp_fallback reuses live compiler TUs instead.
 --
 -- Scoping:
 --   * Per-project. Two different UE projects share NO cache entries (same

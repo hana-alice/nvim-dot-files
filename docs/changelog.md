@@ -56,6 +56,74 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-08-05 — 分离 Android 安装、SO 替换与显式启动
+
+**Task**
+
+让 `<Space>ui` / `<Space>uq` 完成文件操作后保持应用停止，运行统一由用户显式 `<Space>ul` 触发，避免部署命令擅自占用设备前台。
+
+**Implemented**
+
+- `scripts/ue_android_so_deploy.ps1` 删除成功路径和回滚路径的 `monkey` 启动，以及与启动耦合的 PID/maps/稳定窗口验证。
+- `<Space>uq` 现在只执行基线校验、force-stop、等待旧进程退出、strip/push、原子替换、metadata/hash 校验和必要回滚；成功后明确保持应用停止并提示使用 `<Space>ul`。
+- `<Space>ui` 的既有实现经回归确认仍严格只有 `adb -s <serial> install -r <apk>`，不包含启动动作；`<Space>ul` / `:UELaunch` 是唯一显式启动入口。
+- 同步 Android SO 主规格、架构数据流和 K46 教训；没有修改引擎或项目源码。
+
+**Pitfalls / Gotchas**
+
+- 文件部署命令若自动启动并要求运行时加载证据，就必然把部署结果与 Android 冷启动时序耦合；这与用户要求的显式启动边界冲突。
+- 去掉自动启动后不能保留伪装成部署校验的 `/proc/<pid>/maps` 检查；静态完成判据是远端 metadata 与 SHA-256，实际运行由后续显式 `ul` 承担。
+
+**Validation**
+
+- PowerShell AST parser：通过。
+- 无设备 mock：force-stop 延迟三轮后成功，永久不退出时在 1 秒内有界失败。
+- `nvim --headless -l tests/run.lua ue_api`：52/52 passed。
+- `nvim --headless -l tests/run.lua android_device`：13/13 passed。
+- `nvim --headless -l tests/run.lua`：721/721 passed。
+- `openspec validate android-so-quick-deploy --type spec --strict`：valid。
+- 真机操作未执行：设备正在使用，按用户要求不触碰设备。
+
+**Follow-ups**
+
+- 无。
+
+### 2026-08-05 — 让 C++ gd 服从当前 TU 的 Clang 实体身份
+
+**Task**
+
+修复 C++ 重载调用按裸 symbol cache 复用 sibling 落点的问题，并为非自包含 UE 头文件建立可证明的真实编译 TU 上下文；不修改引擎或项目源码，不加入 arity/ranking/text fallback workaround。
+
+**Implemented**
+
+- `lua/utils/lsp_fallback.lua` 将 C/C++ `gd` 从 legacy cache/csearch/GTAGS 链中隔离：source TU 只接受 active CDB 证明后的 clangd exact-position USR + 唯一 definition，header 只接受 contextual libclang 的 canonical USR 与同身份 definition/declaration。
+- `lua/utils/ue_goto/semantic_{context,protocol,client,sidecar}*.lua` 与 `scripts/ue_clang_semanticd.lua` 实现 proven context、严格 NDJSON、异步 sidecar、unsaved overlays、stale request gate、live-TU LRU/idle eviction 和脱敏性能指标；source proof 要求明确 active shard 成员身份与 merged CDB freshness，并使用 clangd 消费的 post-processed merged command，模块按 context/client runtime/libclang/TU/catalog 边界拆分且均低于 800 行。
+- `lua/ue/cdb/shards.lua` 修正 active shard 选择：匹配当前 platform/config/build class 时保留 `manifest.active`，显式 target 优先，并区分 Editor / non-Editor build class，避免较新的单文件 sibling shard 冒充当前构建。
+- 头文件 context 只消费 active build 的真实 CDB 与 compiler-emitted `.cpp.json`、`.d`、rsp、unity membership；active-build 路径校验复用 `ue.cdb.shards.classify_rsp_path` 的 UBT grammar，不做 basename、目录距离、最近使用或路径子串猜测。
+- 删除 C++ `gd` 已失效的 `syntax_filter`、arity、ranking、pair winner、自动 csearch/GTAGS 路径及对应脚本；保留非 C++ compatibility 与显式文本搜索入口。
+- 新增真实 libclang fixtures、请求 stale/overlay/process 回归、只读 `scripts/ue_cpp_semantic_smoke.lua` 与脱敏证据；同步架构、约束、测试索引、cheatsheet、memory/decisions/lessons，将 OpenSpec delta 合并到主规格并归档 change。
+
+**Pitfalls / Gotchas**
+
+- standalone header clangd parse 在缺失真实 include/macro 前置上下文时会产生 recovery AST；只有被 build dependency evidence 证明的 origin TU 才有权决定 header 落点。
+- 旧 LLVM/NDK 组合会在到达目标 AST 前触发诊断数量上限；sidecar 仅为语义 parse 添加 `-Wno-error -ferror-limit=0`，不改变原始 argv fingerprint 或实体选择。
+- 光标移开再移回也必须永久 supersede 旧 token；只在回调时比较最终坐标会误放行 stale 跳转。
+- source→header 的 origin context 必须直接来自已证明的 source CDB entry；用 `catalog(source.cpp)` 反推会在 cpp.json 只记录 includes 的正常形态下返回空。sidecar stop 也必须显式进入 stopping 状态，否则飞行中请求会被退出回调误当成可重试任务并重启进程。
+- 初版 source proof 错误要求 raw active shard 与 merged CDB argv 完全相等。现场同一源文件分别为 189 / 622 个参数；回到 CDB pipeline 源码确认 merged CDB 会经过 slim/PCH/resolve/unify/prune 后处理，因此 exact equality 不是 provenance。现改为 active membership + merged freshness，并由 merged command 驱动查询。
+- 单个 UE TU 的 libclang working set 很大。单点重复 warm 查询稳定不等于 reparse 内存已解决；最终完整 smoke 仍观察到 content-changing reparse 约 2.888 GB，因此只采用 max-TU=1、30 秒 idle eviction、版本不变内容复用与成功响应不携带 diagnostics 等有证据的边界控制。
+
+**Validation**
+
+- `ue_cdb` 15/15、`cpp_semantic_context` 10/10、`cpp_semantic_client` 10/10、`cpp_semantic_sidecar` 9/9、`ue_goto_behavior` 2/2、`utils` 44/44 passed；覆盖 active manifest/target/build-class 选择、同 arity 不同类型、默认参数、cv/ref、模板、ADL、继承、多 context、invalid AST、overlay、LRU、source→header origin、飞行中 stop、raw/merged command 分离、active membership 缺失拒绝、真实 sidecar 进程和 active-build 假前缀拒绝。
+- 当前 live Nvim 在 `VulkanCommands.cpp:250` 的 source proof 返回 `resolved` 且携带 compile command；实际触发 `gd` 落到 `VulkanCommandBuffer.h:421`，没有 `active-compile-command-missing`。
+- 已连接目标工作区的只读 smoke：两处嵌套双参数调用得到同一 canonical USR hash 并落到 `VulkanCommandBuffer.cpp:645`；无参调用得到不同 USR hash 并落到 `VulkanCommandBuffer.h:421`；exit 0，未写引擎/项目源码。
+- 性能实测：cold parse 8,953 ms，warm query 复用同一 TU 且不按键 spawn compiler，content-changing reparse 15,437 ms；宽 evidence root 的精确预筛 + artifact 复核 1,998 ms。
+- `nvim --headless -l tests/run.lua`：720/720 passed（包含保留的 `test_jumper_headless.lua`）；`openspec validate replace-cpp-goto-with-contextual-clang-resolution --strict`：valid。
+
+**Follow-ups**
+
+- high-water reparse working set 是已记录的剩余成本，不宣称已消除；若后续数据证明 max-TU/idle eviction 仍不足，另立 change 评估 clangd extension，禁止回加 symbol/arity/path ranking workaround。
+
 ### 2026-08-05 — 泛化 Android 项目标识并修复 SO receipt/APK 基线
 
 **Task**

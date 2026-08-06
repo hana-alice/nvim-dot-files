@@ -14,8 +14,22 @@ t.describe("smoke: 核心模块加载", function()
   t.it("require('utils.platform') 返回 table", function()
     t.assert_type(require("utils.platform"), "table")
   end)
+  t.it("require('utils.android_device') 返回 table", function()
+    t.assert_type(require("utils.android_device"), "table")
+  end)
   t.it("require('utils.log') 返回 table", function()
     t.assert_type(require("utils.log"), "table")
+  end)
+end)
+
+t.describe("smoke: clangd capabilities", function()
+  t.it("不再发送 clangd 已弃用的 offsetEncoding 扩展", function()
+    local path = vim.fn.stdpath("config") .. "/lua/plugins/ue.lua"
+    local f = assert(io.open(path, "rb"))
+    local source = f:read("*a")
+    f:close()
+    t.assert_false(source:find("offsetEncoding", 1, true) ~= nil,
+      "Neovim 已通过 LSP 3.17 general.positionEncodings 协商编码")
   end)
 end)
 

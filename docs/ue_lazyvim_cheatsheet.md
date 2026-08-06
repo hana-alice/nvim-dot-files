@@ -76,7 +76,7 @@ The keymap surface follows a few rules so muscle memory stays cheap:
    LazyVim keybind, the custom one is removed. Example: terminal toggle
    is `<C-/>` (built-in), not `<leader>tt`.
 2. **Avoid `<leader>` + mixed-case two-letter combos** (e.g. `<leader>fE`,
-   `<leader>gP`) where possible — they kill muscle memory. Existing ones
+   `<leader>gA`) where possible — they kill muscle memory. Existing ones
    are kept for backwards compat but new keys should be lowercase pairs
    or single-letter under a clear prefix.
 3. **Prefix groups:** `b` buffer, `c` code/LSP, `d` debug/DAP, `f` files,
@@ -262,11 +262,11 @@ functions, `zo` to open the section you want, `zR` to reset.
 ## 🧭 LSP Navigation
 
 Source: `lua/plugins/ue.lua` (`gd`, `<leader>ch`),
-`lua/config/keymaps.lua` (`gr`, `<leader>gP`, `<C-LeftMouse>`).
+`lua/config/keymaps.lua` (`gr`, `<C-LeftMouse>`).
 
 | Key              | Action                                  |
 |------------------|-----------------------------------------|
-| `gd`             | Definition (LSP → GTAGS → rg fallback chain) |
+| `gd`             | Definition (contextual C++ / non-C++ fallback) |
 | `gr`             | References (LSP → GTAGS fallback)       |
 | `gD`             | Go to declaration (LazyVim)             |
 | `gI`             | Go to implementation (LazyVim)          |
@@ -275,7 +275,6 @@ Source: `lua/plugins/ue.lua` (`gd`, `<leader>ch`),
 | `gK`             | Signature help (LazyVim)                |
 | `<C-k>` (insert) | Signature help in insert mode (LazyVim) |
 | `<C-LeftMouse>`  | Smart jump: `gf` if file ref, else `gd` |
-| `<leader>gP`     | Switch instant → precise definition     |
 | `<leader>ch`     | Switch source / header (clangd, UE)     |
 | `<leader>ca`     | Code action (LazyVim)                   |
 | `<leader>cr`     | Rename symbol (LazyVim)                 |
@@ -288,23 +287,15 @@ Source: `lua/plugins/ue.lua` (`gd`, `<leader>ch`),
 | `gc` / `gcc`     | Comment operator / current line         |
 | `gco` / `gcO`    | Insert comment line below / above       |
 
-LSP fallback chain: LSP → GTAGS index → ripgrep word search.
-Status: `:UEDefStatus`. Trace: `:UEDefTrace`. Self-test:
-`:UEDefSelfTest`. Diag: `:UEDefDiag`. Reload: `:UEDefReload`.
+C++ `gd` uses compiler identity only. Source files require an active CDB entry and
+clangd's exact-cursor USR; headers run in a proven origin TU reconstructed from
+compiler-emitted dependency evidence. No symbol cache, arity filter, workspace-symbol,
+csearch or GTAGS fallback is allowed to choose a C++ target. A non-resolved semantic
+state keeps the cursor in place. Non-C++ files and explicit search/reference commands
+retain their existing LSP/csearch/GTAGS behavior.
 
-`gd` overload disambiguation (since 2026-04 syntax-filter-v1):
-treesitter parses cursor's call_expression for argument count K, then
-for each candidate parses its function_declarator for params P/D/V.
-Drops mismatched candidates pre-jump. Spinner tag indicates path:
-
-  ⚡ ... (instant·syntax·pair_h_cpp, N→1) — pair_picker auto-picks `.cpp`
-  ⚡ ... (instant·syntax·sole_cpp, N→1)  — N hdr + 1 cpp, jumps to cpp
-  ⚡ ... (instant·syntax)  — ws/symbol + filter, single match → jumped
-  ⚡ ... (instant)         — ws/symbol, filter inactive (cursor not in call)
-  ✓ ... (precise·syntax)   — textDocument/definition + filter
-  ✓ ... (N candidates, ...) — filter + pair_picker undecided → quickfix
-  ⊘ ... — dependent-name early-bail (template parameter)
-  ● already at ... — cursor IS the definition site
+Status: `:UEDefStatus`. Trace: `:UEDefTrace`. Cancel the current UI action with
+`:UEDefCancel`; clear inherited header contexts with `:UEDefContextClear`.
 
 ## 🔍 Picker / Search (Snacks)
 
@@ -556,7 +547,6 @@ Source: `lua/plugins/diffview.lua`, `lua/plugins/neogit.lua`,
 | `<leader>g0`       | **Open `:0` (staged) version of current file**   | fugitive |
 | `<leader>gl`       | Commits touching this file → quickfix            | fugitive |
 | `<leader>gL`       | All commits → quickfix                           | fugitive |
-| `<leader>gP`       | LSP: switch to precise definition (re-uses `g`)  | (LSP) |
 
 ### Inside Neogit status (`<leader>gn`)
 
@@ -640,13 +630,19 @@ wrapper with the plain `<cmd>...<cr>` form.
 ## 🎨 UI / Toggles
 
 Source: `lua/plugins/zen-mode.lua` (`<leader>z`),
-`lua/config/keymaps.lua` (`<leader>ut`, `<leader>?`).
+`lua/config/keymaps.lua` (`<leader>ut`, `<leader>uC`, `<leader>?`).
+
+Theme picker、命令补全和直接设置统一只暴露以下 6 个 canonical name：
+`monokai_ristretto`、`rider-light`、`ubuntu-terminal`、`unokai`、`catppuccin`、
+`sonokai-espresso`。最后一项固定加载 `sainnhe/sonokai` 的 Espresso variant，
+不会暴露其他 Sonokai variants。
 
 | Key              | Action                                  |
 |------------------|-----------------------------------------|
 | `<leader>ut`     | Theme picker (`:ThemePicker`)           |
+| `<leader>uC`     | 同一个受限 theme picker（覆盖上游入口） |
 | `:Theme`         | Open theme picker                       |
-| `:Theme <name>`  | Set and persist theme                   |
+| `:Theme <name>`  | Set and persist one of the six themes   |
 | `<leader>uf`     | Toggle format on save (LazyVim)         |
 | `<leader>uF`     | Force format mode (LazyVim)             |
 | `<leader>ud`     | Toggle diagnostics (LazyVim)            |
@@ -706,19 +702,22 @@ saved/aborted before the old session exits.
 ## 🎮 UE Workflow
 
 Source: `lua/config/keymaps.lua` (static `<leader>uB / uc / uP`,
-runtime `ub / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.lua`
+runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.lua`
 (`<leader>uo / uO`), all `:UE*` user commands in `lua/ue.lua`.
 
 | Key / Command             | Action                              |
 |---------------------------|-------------------------------------|
 | `<leader>uP`              | `:UESetProject` — set project root  |
+| `<leader>uA`              | `:UESetAndroidDevice` — select Android device (name + serial) for this Neovim session |
 | `:UESetPlatform`          | Interactive platform+config select  |
 | `:UESetPlatform Win64 Development Editor` | Direct set         |
 | `<leader>ub`              | `:UEBuild` (platform from `:UESetPlatform`) |
+| `<leader>us`              | `:UEBuildAndroidSO` — export + execute UBT compile/link actions (no Deploy/Gradle/APK) |
+| `<leader>uq`              | `:UEDeployAndroidSO` — strip, push, atomically replace and verify `libUE4.so`; leaves the app stopped |
 | `<leader>uB`              | `:UEPrepare` (symbols + compile_commands) |
 | `<leader>uc`              | `:UEExportCompileCommands`          |
 | `<leader>ul`              | `:UELaunch` (no debugger)           |
-| `<leader>ui`              | `:UEInstallAndroid` (APK to device) |
+| `<leader>ui`              | `:UEInstallAndroid` (APK to selected device via `adb -s`; does not launch) |
 | `<leader>ug`              | `:UELogToggle` (toggle app log)     |
 | `<leader>uL`              | `:UELogToggle` (alias)              |
 | `<leader>uD`              | `:UEDebugLogToggle` (Windows debug log) |
@@ -726,6 +725,10 @@ runtime `ub / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.lua`
 | `<leader>uO`              | UE: grep in current module / plugin  |
 | `<leader>up`              | `:UEPaths` (show UE paths)          |
 | `<leader>?`               | `:UECheatsheet` (open this cheatsheet) |
+
+Android 选择写入当前 Neovim 会话的全局变量
+`vim.g.ue_android_device_serial`。APK install、launch、logcat 与 DAP 随后都显式使用
+`adb -s <serial>`；切换设备时再次执行 `<leader>uA`。该值不会跨 Neovim 重启持久化。
 
 ### Less-common UE commands
 
@@ -760,12 +763,14 @@ have no key bound by default:
 | `:UEResetLayout`       | Reset window layout (DAP or default)    |
 | `:UESetAndroidPackage` | Set Android attach package name         |
 | `:UECheatsheetEdit`    | Edit this markdown file                 |
-| `:UEDefStatus`         | Show LSP→GTAGS→rg fallback state        |
+| `:UEDefStatus`         | Show semantic sidecar + compatibility state |
 | `:UEDefTrace`          | Toggle goto-def tracing                 |
 | `:UEDefSelfTest`       | Run goto-def self-test                  |
 | `:UEDefDiag`           | Goto-def diagnostics dump               |
 | `:UEDefReload`         | Reload goto-def module                  |
-| `:UEDefCacheClear`     | Clear goto-def cache                     |
+| `:UEDefCacheClear`     | Clear non-C++ goto-def cache            |
+| `:UEDefCancel`         | Cancel current semantic UI action       |
+| `:UEDefContextClear`   | Clear inherited header TU contexts      |
 
 Typical first-run workflow (see the README for the full step list):
 
@@ -894,7 +899,6 @@ auto-cleans the DAP session.
 Active workarounds (see `lua/workarounds/`):
 - `lazyvim.close_with_q_invalid_buf` — guards LazyVim's `q` autocmd
 - `neovide.exit_with_gui` — clean Neovide exit on `:qa`
-- `lazy.float_vimresized_invalid_buf` — Lazy.nvim float resize guard
 - **`clangd.non_file_uri_detach`** — clangd attaches to git/diff/oil
   buffers (e.g. `fugitive://...`, `diffview://...`) and floods the
   notification area with `-32602 clangd only supports file:// URIs`

@@ -256,7 +256,10 @@ t.describe("utils.ue_paths", function()
 end)
 
 t.describe("utils.ue_goto 子模块", function()
-  for _, sub in ipairs({ "jumper", "provider", "location", "symbol", "cache" }) do
+  for _, sub in ipairs({
+    "jumper", "provider", "location", "symbol", "cache",
+    "semantic_context", "semantic_protocol", "semantic_client", "semantic_sidecar",
+  }) do
     t.it("utils.ue_goto." .. sub .. " 返回 table", function()
       t.assert_type(require("utils.ue_goto." .. sub), "table")
     end)
@@ -266,5 +269,11 @@ t.describe("utils.ue_goto 子模块", function()
   end)
   t.it("provider.sync_locations 是 function", function()
     t.assert_type(require("utils.ue_goto.provider").sync_locations, "function")
+  end)
+  t.it("semantic context/protocol/client/sidecar 核心 API 是 function", function()
+    t.assert_type(require("utils.ue_goto.semantic_context").make_proven_context, "function")
+    t.assert_type(require("utils.ue_goto.semantic_protocol").validate_request, "function")
+    t.assert_type(require("utils.ue_goto.semantic_client").resolve_header, "function")
+    t.assert_type(require("utils.ue_goto.semantic_sidecar").new, "function")
   end)
 end)

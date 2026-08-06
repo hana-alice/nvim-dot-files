@@ -37,7 +37,7 @@
 --     C:/tools/lldb-22/install/bin/, or pointed to by
 --     ue.config.dap.lldb_dap_path.
 --   * A symbol-rich libUE4.so (DWARF) available locally — either the
---     Binaries/Android/Client_Symbols_v* tree or the Intermediate jni
+--     Binaries/Android/<Target>_Symbols_v* tree or the Intermediate jni
 --     output. Pointed to by ue.config dap.android_symbol_lib OR auto-
 --     detected from the project root. Strictly optional but strongly
 --     recommended: without it lldb-dap will pull stripped libUE4.so from
@@ -45,11 +45,14 @@
 --   * Optional: source-map entries (DAP "sourceMap") so DWARF build-machine
 --     paths (e.g. D:\project\uetemp\Engine\) resolve to the local checkout.
 
-local C   = require("ue.dap._common")
-local fs  = require("ue.core.fs")
-local log = require("utils.log")
+local C              = require("ue.dap._common")
+local fs             = require("ue.core.fs")
+local log            = require("utils.log")
+local android_device = require("utils.android_device")
 
 local M = {}
+
+local UE_MODULE_BASENAME = "libUE4.so"
 
 -- ── shared session state ──────────────────────────────────────────────────
 M._session = {
@@ -150,36 +153,66 @@ end
 
 -- ── project root + packageInfo.txt auto-discovery ────────────────────────
 --
--- UE's Android packaging writes Source/Client/Binaries/Android/packageInfo.txt
+-- UE's Android packaging writes <Project>/Binaries/Android/packageInfo.txt
 -- on every cook. Layout:
 --   line 1: package name      (e.g. com.example.mygame)
---   line 2: versionCode       (e.g. 169723198) — matches Client_Symbols_v<code>/
+--   line 2: versionCode       (e.g. 169723198) — matches <Target>_Symbols_v<code>/
 --   line 3: versionName
 --
 -- This is the single source of truth for both pick_package and pick_symbol_lib,
 -- so we never have to prompt the user when a cooked APK exists on disk. Falls
 -- through to ctx/cfg/input only when there is no cooked output.
 
-local function android_marker_path(root)
+local function android_marker_path(root, uproject)
   if type(root) ~= "string" or root == "" then return nil end
   root = fs.norm(root)
-  local direct = root .. "/Source/Client/Binaries/Android"
-  if fs.is_file(direct .. "/packageInfo.txt") or fs.is_dir(direct) then
-    return direct
+
+  local function output_dir(project_dir)
+    if type(project_dir) ~= "string" or project_dir == "" then return nil end
+    local candidate = fs.norm(project_dir) .. "/Binaries/Android"
+    if fs.is_file(candidate .. "/packageInfo.txt") or fs.is_dir(candidate) then
+      return candidate
+    end
+    return nil
   end
-  -- Some projects store the .uproject under <repo>/Source/Client, and
-  -- ue.resolve_context().project_root points there (for example
-  -- E:/.../Source/Client). In that shape the Android marker lives directly
-  -- under project_root/Binaries/Android, not project_root/Source/Client/... .
-  local in_project = root .. "/Binaries/Android"
-  if fs.is_file(in_project .. "/packageInfo.txt") or fs.is_dir(in_project) then
-    return in_project
+
+  -- An explicit .uproject is authoritative when context carries one.
+  if type(uproject) == "string" and uproject ~= "" then
+    local explicit = output_dir(vim.fn.fnamemodify(fs.norm(uproject), ":h"))
+    if explicit then return explicit end
   end
-  return nil
+
+  local direct = output_dir(root)
+  if direct then return direct end
+
+  -- Repository-root layout: <repo>/Source/<Project>/<Project>.uproject.
+  -- Accept only one cooked nested project; multiple matches are ambiguous and
+  -- must be resolved by the explicit ctx.uproject path instead of guessing.
+  local source_dir = root .. "/Source"
+  if not fs.is_dir(source_dir) then return nil end
+  local nested = {}
+  for name, kind in vim.fs.dir(source_dir) do
+    if kind == "directory" then
+      local project_dir = source_dir .. "/" .. name
+      local has_uproject = false
+      for child, child_kind in vim.fs.dir(project_dir) do
+        if child_kind == "file" and child:lower():match("%.uproject$") then
+          has_uproject = true
+          break
+        end
+      end
+      if has_uproject then
+        local candidate = output_dir(project_dir)
+        if candidate then nested[#nested + 1] = candidate end
+      end
+    end
+  end
+  table.sort(nested)
+  return #nested == 1 and nested[1] or nil
 end
 
-local function read_package_info(proot)
-  local android_dir = android_marker_path(proot)
+local function read_package_info(proot, uproject)
+  local android_dir = android_marker_path(proot, uproject)
   if not android_dir then return nil end
   local path = android_dir .. "/packageInfo.txt"
   if not fs.is_file(path) then return nil end
@@ -195,9 +228,8 @@ local function read_package_info(proot)
 end
 
 -- Walk up from `start` looking for the Android cook output marker. Supports
--- both repo-root layout (<repo>/Source/Client/Binaries/Android) and the
--- common UE project-root layout (<repo>/Source/Client/Binaries/Android where
--- project_root itself is Source/Client).
+-- both repo-root layout (<repo>/Source/<Project>/Binaries/Android) and the
+-- common UE project-root layout (<project>/Binaries/Android).
 local function discover_project_root(start)
   if not start or start == "" then return nil end
   local cur = fs.norm(start)
@@ -231,8 +263,8 @@ local function effective_project_root(ctx)
       add(project_grandparent)
     end
     -- Only use engine_root as a discovery START point, never as an immediate
-    -- project root: otherwise buffers opened under D:/project/uetemp make us
-    -- build D:/project/uetemp/Source/Client/... and prompt unnecessarily.
+    -- project root: otherwise an engine buffer can resolve an unrelated
+    -- nested game project and prompt unnecessarily.
     local from_engine = ctx.engine_root and discover_project_root(ctx.engine_root) or nil
     add(from_engine)
   end
@@ -243,7 +275,7 @@ local function effective_project_root(ctx)
   add(discover_project_root(vim.fn.getcwd()))
 
   for _, root in ipairs(roots) do
-    if android_marker_path(root) then return root end
+    if android_marker_path(root, ctx and ctx.uproject or nil) then return root end
   end
   return roots[1]
 end
@@ -270,7 +302,7 @@ local function pick_package(ctx)
   -- 3. packageInfo.txt under the discovered project root — written by
   --    UE on every Android cook, single source of truth.
   local proot = effective_project_root(ctx)
-  local info = read_package_info(proot)
+  local info = read_package_info(proot, ctx and ctx.uproject or nil)
   if info and info.package ~= "" then
     -- Persist for next time so we never re-discover. Best-effort, ignore
     -- failures (no engine_root, immutable FS, etc).
@@ -303,35 +335,71 @@ local function pick_symbol_lib(ctx)
   end
   local proot = effective_project_root(ctx)
   if proot then
-    local android_dir = android_marker_path(proot)
+    local android_dir = android_marker_path(proot, ctx and ctx.uproject or nil)
     -- 2. Exact match against packageInfo.txt versionCode — guarantees the
     --    symbols correspond to the installed APK.
-    local info = read_package_info(proot)
+    local info = read_package_info(proot, ctx and ctx.uproject or nil)
     if android_dir and info and info.version_code ~= "" then
-      local exact = {
-        android_dir .. "/Client_Symbols_v" .. info.version_code .. "/Client-arm64/libUE4.so",
-        android_dir .. "/Client_Symbols_v" .. info.version_code .. "/Client-arm64/libUnreal.so",
-      }
-      for _, p in ipairs(exact) do
-        if fs.is_file(p) then return p end
+      local suffix = "_Symbols_v" .. info.version_code
+      local exact = {}
+      for name, kind in vim.fs.dir(android_dir) do
+        if kind == "directory" and #name >= #suffix
+            and name:sub(-#suffix) == suffix then
+          local package_dir = android_dir .. "/" .. name
+          for arch_name, arch_kind in vim.fs.dir(package_dir) do
+            if arch_kind == "directory" and arch_name:lower():match("%-arm64$") then
+              local arch_dir = package_dir .. "/" .. arch_name
+              local preferred = arch_dir .. "/libUE4.so"
+              local fallback = arch_dir .. "/libUnreal.so"
+              if fs.is_file(preferred) then
+                exact[#exact + 1] = preferred
+              elseif fs.is_file(fallback) then
+                exact[#exact + 1] = fallback
+              end
+            end
+          end
+        end
+      end
+      table.sort(exact)
+      if #exact == 1 then return exact[1] end
+    end
+    -- 3. Scan all symbol packages, pick the newest by mtime (best guess
+    --    when no packageInfo or no exact match). Use fs.dir for the immediate
+    --    package directories: vim.fn.glob wildcard expansion is unreliable
+    --    for Windows short (8.3) temp paths, including headless tests.
+    local discovered = {}
+    if android_dir and fs.is_dir(android_dir) then
+      for name, kind in vim.fs.dir(android_dir) do
+        if kind == "directory" and name:find("Symbols", 1, true) then
+          local package_dir = android_dir .. "/" .. name
+          for arch_name, arch_kind in vim.fs.dir(package_dir) do
+            if arch_kind == "directory" and arch_name:lower():match("%-arm64$") then
+              local arch_dir = package_dir .. "/" .. arch_name
+              local preferred = arch_dir .. "/libUE4.so"
+              local fallback = arch_dir .. "/libUnreal.so"
+              if fs.is_file(preferred) then
+                discovered[#discovered + 1] = preferred
+              elseif fs.is_file(fallback) then
+                discovered[#discovered + 1] = fallback
+              end
+            end
+          end
+        end
       end
     end
-    -- 3. Glob over all symbol packages, pick the newest by mtime (best
-    --    guess when no packageInfo or no exact match).
-    local glob_patterns = {}
-    if android_dir then
-      vim.list_extend(glob_patterns, {
-        android_dir .. "/*Symbols*/Client-arm64/libUE4.so",
-        android_dir .. "/*Symbols*/Client-arm64/libUnreal.so",
-      })
-    end
-    vim.list_extend(glob_patterns, {
-      proot .. "/Source/Client/Intermediate/Android/arm64/jni/arm64-v8a/libUE4.so",
-      proot .. "/Source/Client/Intermediate/Android/arm64/jni/arm64-v8a/libUnreal.so",
-      proot .. "/Intermediate/Android/arm64/jni/arm64-v8a/libUE4.so",
-      proot .. "/Intermediate/Android/arm64/jni/arm64-v8a/libUnreal.so",
-    })
+    local project_dir = android_dir and fs.norm(vim.fn.fnamemodify(android_dir, ":h:h")) or proot
+    local glob_patterns = {
+      project_dir .. "/Intermediate/Android/arm64/jni/arm64-v8a/libUE4.so",
+      project_dir .. "/Intermediate/Android/arm64/jni/arm64-v8a/libUnreal.so",
+    }
     local best_path, best_mtime = nil, -1
+    for _, path in ipairs(discovered) do
+      if fs.is_file(path) then
+        local st = vim.uv and vim.uv.fs_stat(path)
+        local mt = (st and st.mtime and st.mtime.sec) or 0
+        if mt > best_mtime then best_path, best_mtime = path, mt end
+      end
+    end
     for _, pat in ipairs(glob_patterns) do
       local hit = vim.fn.glob(pat)
       if hit and hit ~= "" then
@@ -460,94 +528,74 @@ local function append_bp_diag(lines)
 end
 
 
--- Parse `adb devices` into { {serial, status, model?}, ... }.
--- status ∈ { "device", "unauthorized", "offline", "no permissions", ... }
-local function list_devices(adb)
-  local out = adb_run(adb, { "devices", "-l" })
-  local rows = {}
-  for line in out:gmatch("[^\n]+") do
-    if not line:match("^List of devices") and line ~= "" then
-      local serial, status, rest = line:match("^(%S+)%s+(%S+)%s*(.*)$")
-      if serial and status and serial ~= "List" then
-        local model = rest and rest:match("model:(%S+)") or nil
-        rows[#rows + 1] = { serial = serial, status = status, model = model }
-      end
-    end
-  end
-  return rows
-end
-
--- Resolve the adb serial to use for this session.
--- Behavior (per user policy "多设备你给我选,不要自己决定"):
---   * 0 ready devices  → notify + nil (with hints for unauthorized/offline)
---   * 1 ready device   → return it silently
---   * >1 ready devices → vim.ui.select, ALWAYS prompt, never cache a default
--- `done(serial|nil)` is called with the picked serial or nil on cancel/empty.
--- Returns the serial synchronously when possible (0 or 1 device); for the
--- multi-device case it returns nil and dispatches `done` asynchronously.
+-- Device discovery/selection is shared with install, launch, and logcat.
+-- It always presents model/name + serial, even when only one device is ready,
+-- and persists the user's choice in vim.g.ue_android_device_serial.
 local function pick_serial_async(adb, done)
-  local rows = list_devices(adb)
-  local ready, not_ready = {}, {}
-  for _, r in ipairs(rows) do
-    if r.status == "device" then ready[#ready + 1] = r
-    else not_ready[#not_ready + 1] = r end
-  end
-
-  if #ready == 0 then
-    if #not_ready > 0 then
-      local parts = {}
-      for _, r in ipairs(not_ready) do
-        local hint = r.status
-        if r.status == "unauthorized" then
-          hint = "unauthorized (tap 'Allow USB debugging' on device)"
-        elseif r.status == "offline" then
-          hint = "offline (try `adb kill-server && adb devices`)"
-        end
-        parts[#parts + 1] = string.format("  %s  %s", r.serial, hint)
-      end
-      vim.notify("No ready Android device. Detected:\n" .. table.concat(parts, "\n"),
-        vim.log.levels.WARN)
-    else
-      vim.notify("No Android device found in `adb devices`.\n" ..
-        "Connect a device with USB debugging enabled.", vim.log.levels.WARN)
-    end
-    done(nil)
-    return nil
-  end
-
-  if #ready == 1 then
-    done(ready[1].serial)
-    return ready[1].serial
-  end
-
-  -- Multi-device: ALWAYS prompt. No silent default.
-  local items = {}
-  for _, r in ipairs(ready) do items[#items + 1] = r end
-  vim.ui.select(items, {
+  android_device.select({
+    adb = adb,
     prompt = "Select Android device for DAP attach:",
-    format_item = function(r)
-      if r.model then return ("%s  [%s]"):format(r.serial, r.model) end
-      return r.serial
-    end,
-  }, function(choice)
-    done(choice and choice.serial or nil)
+  }, function(serial)
+    done(serial)
   end)
-  return nil
 end
 
--- Sync wrapper retained for tests/legacy callers that don't expect async.
--- For the multi-device case this returns nil; production code MUST use
--- pick_serial_async via bootstrap_session (which is already async-friendly).
-local function pick_serial(adb)
-  local picked
-  pick_serial_async(adb, function(s) picked = s end)
-  return picked
+local function resolve_session_serial(ctx, opts)
+  ctx = ctx or {}
+  opts = opts or {}
+  return ctx.android_serial or opts.serial or opts.android_serial
+    or android_device.get()
 end
 
 local function pidof(adb, serial, pkg)
   local out = adb_run(adb, { "-s", serial, "shell", "pidof", "-s", pkg })
   local digits = (out or ""):match("(%d+)")
   return digits and tonumber(digits) or nil
+end
+
+-- Async pid poll (F4, health-check 2026-07): the old launch/reattach paths
+-- looped `pidof + vim.wait(200)` up to 50 times — a half-blocking wait
+-- (fast events run, but user input freezes for up to 10s while each
+-- synchronous adb round-trip stacks on top). Same fix pattern as K40:
+-- uv timer + vim.system, `in_flight` against overlap, done() on main loop.
+-- done(pid|nil) fires exactly once — pid found, or nil after timeout_ms.
+local function pidof_async(adb, serial, pkg, timeout_ms, done)
+  local timer = vim.uv.new_timer()
+  if not timer then
+    -- Degenerate fallback: single synchronous probe.
+    done(pidof(adb, serial, pkg))
+    return
+  end
+  local deadline = vim.uv.now() + (timeout_ms or 10000)
+  local in_flight, finished = false, false
+  local function finish(pid)
+    if finished then return end
+    finished = true
+    pcall(function() timer:stop() end)
+    pcall(function() timer:close() end)
+    done(pid)
+  end
+  timer:start(0, 200, function()
+    -- FAST EVENT CONTEXT: spawn only; results handled on the main loop.
+    if finished or in_flight then return end
+    if vim.uv.now() >= deadline then
+      vim.schedule(function() finish(nil) end)
+      return
+    end
+    in_flight = true
+    local ok_spawn = pcall(vim.system,
+      { adb, "-s", serial, "shell", "pidof", "-s", pkg },
+      { text = true },
+      function(res)
+        vim.schedule(function()
+          in_flight = false
+          if finished then return end
+          local digits = res and res.code == 0 and (res.stdout or ""):match("(%d+)") or nil
+          if digits then finish(tonumber(digits)) end
+        end)
+      end)
+    if not ok_spawn then in_flight = false end
+  end)
 end
 
 -- Read the ASLR load base of a shared object from the device process maps.
@@ -794,6 +842,11 @@ local function wait_notice(key, msg, level)
   if M._wait_notice_seen[key] then return end
   M._wait_notice_seen[key] = true
   append_bp_diag({ "== wait-for-debugger notice ==", "key=" .. key, msg })
+  -- Probe: wait-launch failures are exactly the evidence the next session
+  -- must read before touching this file (probe-feedback-loop spec #1).
+  pcall(function()
+    require("utils.probe").record("android-wait-launch", key, msg:sub(1, 120))
+  end)
   log.notify("dap.android", msg, level or vim.log.levels.WARN)
 end
 
@@ -859,7 +912,7 @@ end
 function M._start_late_rebase_poller(sess)
   M._stop_late_rebase_poller()
   if not (sess and sess.wait_mode and sess.pid and sess.serial and sess.package_name) then return end
-  local so = sess.symbol_lib and vim.fs.basename(sess.symbol_lib) or "libUE4.so"
+  local so = sess.symbol_lib and vim.fs.basename(sess.symbol_lib) or UE_MODULE_BASENAME
   local pid, serial, pkg, adb = sess.pid, sess.serial, sess.package_name, sess.adb
   local attempts, in_flight = 0, false
   local max_attempts = 90 -- × 700ms ≈ 63s of app init budget
@@ -947,6 +1000,13 @@ local function arm_wait_mode_followup(sess)
   dap.listeners.after.event_continued[WAIT_LISTENER_KEY] = function(session)
     if dap.session() ~= session then return end
     disarm_wait_mode_followup()
+    -- Probe: success-path evidence — wait-launch reached the gate-release
+    -- stage (pairs with the failure records from wait_notice; both feed
+    -- the next session's report-first workflow).
+    pcall(function()
+      require("utils.probe").record("android-wait-launch", "gate-release-ok",
+        { pkg = sess.package_name, pid = sess.pid })
+    end)
     start_jdwp_release(sess)
     M._start_late_rebase_poller(sess)
   end
@@ -1513,18 +1573,22 @@ end
 
 local function bootstrap_session(opts, on_ready)
   opts = opts or {}
-  local ctx = opts.context or {}
+  -- Never write session choices back into resolve_context()'s cached table:
+  -- doing so would pin the first serial in ctx.android_serial and make a later
+  -- :UESetAndroidDevice switch lose to that stale "explicit" value.
+  local ctx = vim.tbl_extend("force", {}, opts.context or {})
   -- Programmatic/headless retries should not block forever on vim.fn.input()
   -- for values that are stable for this workspace and already known.
-  -- Priority: explicit context/opts -> last successful session -> workspace default.
+  -- Priority: explicit context/opts -> session-global selected device. A normal
+  -- attach/launch never guesses from last-session history; without either it
+  -- opens the shared device picker below. Reattach has its own explicit replay.
   ctx.android_package = ctx.android_package or opts.package_name or opts.package
     or (M._last_session and M._last_session.package_name)
   -- When none of the above sources provides a package name, leave it nil
   -- so pick_package() falls through to persisted state → project discovery
   -- → config → user prompt, instead of treating a placeholder as a real
   -- Android package name.
-  ctx.android_serial = ctx.android_serial or opts.serial or opts.android_serial
-    or (M._last_session and M._last_session.serial)
+  ctx.android_serial = resolve_session_serial(ctx, opts)
   -- NOTE: do NOT hardcode a symbol_lib fallback here. A literal path short-
   -- circuits pick_symbol_lib() (its step 0 returns any existing ctx path
   -- verbatim, skipping the packageInfo.txt versionCode exact-match step), so a
@@ -1807,37 +1871,34 @@ function M.launch(opts)
     P.step("starting activity (waiting at debugger gate) …")
     pcall(adb_run, sess.adb, vim.list_extend({ "-s", sess.serial }, steps.start))
 
-    local pid
-    for _ = 1, 50 do
-      pid = pidof(sess.adb, sess.serial, sess.package_name)
-      if pid then break end
-      vim.wait(200)
-    end
-    -- One-shot: clear the debug-app flag as soon as the process exists (or
-    -- we give up), so a later manual launch of the app is NOT gated. The
-    -- already-spawned process keeps waiting regardless.
-    pcall(adb_run, sess.adb, vim.list_extend({ "-s", sess.serial }, steps.clear_wait))
-    if not pid then
-      P.error(("%s did not start within 10s"):format(pkg))
-      wait_notice("wait-launch-no-pid",
-        ("%s did not appear within 10s after set-debug-app -w + start "
-          .. "(serial=%s). See ue-dap-bp-diag.log."):format(pkg, sess.serial),
-        vim.log.levels.ERROR)
-      M._attach_in_progress = false
-      M.stop_android_debugger()
-      return
-    end
+    -- Async pid poll (F4): does not freeze user input while the process spawns.
+    pidof_async(sess.adb, sess.serial, sess.package_name, 10000, function(pid)
+      -- One-shot: clear the debug-app flag as soon as the process exists (or
+      -- we give up), so a later manual launch of the app is NOT gated. The
+      -- already-spawned process keeps waiting regardless.
+      pcall(adb_run, sess.adb, vim.list_extend({ "-s", sess.serial }, steps.clear_wait))
+      if not pid then
+        P.error(("%s did not start within 10s"):format(pkg))
+        wait_notice("wait-launch-no-pid",
+          ("%s did not appear within 10s after set-debug-app -w + start "
+            .. "(serial=%s). See ue-dap-bp-diag.log."):format(pkg, sess.serial),
+          vim.log.levels.ERROR)
+        M._attach_in_progress = false
+        M.stop_android_debugger()
+        return
+      end
 
-    sess.wait_mode = true
-    _finalize_session(sess, pid, "UE Android Launch (wait-for-debugger)", "UEDAP android launch")
-    arm_wait_mode_followup(sess)
-    M._attach_in_progress = false
-    M._start_liveness_poller()
-    vim.notify(
-      "[ue.dap.android] launched " .. pkg .. " frozen at the debugger gate.\n"
-      .. "Set breakpoints, then F5: the JDWP gate is released automatically and\n"
-      .. "the earliest engine init runs under the debugger.",
-      vim.log.levels.INFO)
+      sess.wait_mode = true
+      _finalize_session(sess, pid, "UE Android Launch (wait-for-debugger)", "UEDAP android launch")
+      arm_wait_mode_followup(sess)
+      M._attach_in_progress = false
+      M._start_liveness_poller()
+      vim.notify(
+        "[ue.dap.android] launched " .. pkg .. " frozen at the debugger gate.\n"
+        .. "Set breakpoints, then F5: the JDWP gate is released automatically and\n"
+        .. "the earliest engine init runs under the debugger.",
+        vim.log.levels.INFO)
+    end)
   end)
 end
 
@@ -1869,7 +1930,7 @@ function M.reattach()
   -- Replay state into the live session table.
   local sess = M._session
   sess.adb               = last.adb or "adb"
-  sess.serial            = last.serial
+  sess.serial            = android_device.get() or last.serial
   sess.package_name      = last.package_name
   sess.symbol_lib        = last.symbol_lib
   sess.lldb_server_local = last.lldb_server_local
@@ -1880,37 +1941,33 @@ function M.reattach()
   sess.port              = pick_port()
 
   local P = require("ue.dap._progress")
-  P.step(("reattach: waiting for %s on %s …"):format(last.package_name, last.serial))
+  P.step(("reattach: waiting for %s on %s …"):format(sess.package_name, sess.serial))
 
-  -- Poll up to 10s for the app to be running.
-  local pid
-  for _ = 1, 50 do
-    pid = pidof(sess.adb, sess.serial, sess.package_name)
-    if pid then break end
-    vim.wait(200)
-  end
-  if not pid then
-    P.error(("%s not running on %s after 10s"):format(last.package_name, last.serial))
+  -- Async pid poll up to 10s (F4 — no half-blocking vim.wait loop).
+  pidof_async(sess.adb, sess.serial, sess.package_name, 10000, function(pid)
+    if not pid then
+      P.error(("%s not running on %s after 10s"):format(sess.package_name, sess.serial))
+      M._attach_in_progress = false
+      return
+    end
+
+    -- Ensure lldb-server is still in the sandbox (Android may have cleared
+    -- /data/data/<pkg> on user-data wipe / reinstall).
+    local ok_push, push_msg = ensure_lldb_server_pushed(
+      sess.adb, sess.serial, sess.package_name, sess.lldb_server_local)
+    if not ok_push then
+      P.error("lldb-server re-stage failed: " .. tostring(push_msg))
+      M._attach_in_progress = false
+      return
+    end
+    sess.remote_lldb_server = push_msg
+    sess.lldb_server_mode = "platform"
+
+    _finalize_session(sess, pid,
+      "UE Android Attach (lldb-dap)", "UEDAP android reattach")
     M._attach_in_progress = false
-    return
-  end
-
-  -- Ensure lldb-server is still in the sandbox (Android may have cleared
-  -- /data/data/<pkg> on user-data wipe / reinstall).
-  local ok_push, push_msg = ensure_lldb_server_pushed(
-    sess.adb, sess.serial, sess.package_name, sess.lldb_server_local)
-  if not ok_push then
-    P.error("lldb-server re-stage failed: " .. tostring(push_msg))
-    M._attach_in_progress = false
-    return
-  end
-  sess.remote_lldb_server = push_msg
-  sess.lldb_server_mode = "platform"
-
-  _finalize_session(sess, pid,
-    "UE Android Attach (lldb-dap)", "UEDAP android reattach")
-  M._attach_in_progress = false
-  M._start_liveness_poller()
+    M._start_liveness_poller()
+  end)
 end
 
 -- ── public: liveness poller ───────────────────────────────────────────────
@@ -2079,6 +2136,10 @@ end
 
 function M._wait_launch_device_steps_for_test(pkg)
   return wait_launch_device_steps(pkg)
+end
+
+function M._resolve_session_serial_for_test(ctx, opts)
+  return resolve_session_serial(ctx, opts)
 end
 
 function M._jdb_connect_argv_for_test(jdb, port)

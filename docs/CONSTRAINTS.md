@@ -36,8 +36,8 @@
 | P8 | **codelldb 不用 `request="custom"`** | codelldb 1.12.2 会回 `Malformed message`；改用 `request="launch"` + `targetCreateCommands` + `processCreateCommands`。 | `docs/TOOLING.md` §Pitfalls #1 |
 | P9 | **不用 which-key 自动 cheatsheet** | 会泄漏我们从未绑定的 plugin 键位；自渲染 `:UECheatsheet`。 | `docs/architecture-vs-lazyvim.md` §"What we deliberately *don't* do" |
 | P10 | **不在配置内集成 copilot/codeium** | 推理交给外部 CLI（Claude Code / Codex），编辑器保持是编辑器。 | `docs/architecture-vs-lazyvim.md` §"What we deliberately *don't* do" |
-| P11 | **goto-def 不让 treesitter 给"答案"** | TS 没语义，跨翻译单元 / 模板 / macro 都看不见；TS 只做"省调用"判定，绝不替代 LSP 给精确定义（racing-goto-definition 死路）。 | `docs/architecture-symbol-resolution.md` §5、§6 |
-| P12 | **csearch / gtags 不做主路** | 文本/ctags 搜索分不清重载、同名、namespace；只能在 clangd MISS 时兜底。 | `docs/architecture-symbol-resolution.md` §6 |
+| P11 | **C++ goto-def 不让 Tree-sitter 决定或否决目标** | TS 没有 build TU 的类型、宏与 name lookup；C++ `gd` 必须由 compiler identity 决定。TS 可服务非 C++ 兼容路径，但不得给 C++ 语义答案或以语法规则制造失败。 | `docs/architecture-symbol-resolution.md` §1、§2 |
+| P12 | **C++ `gd` 禁止自动 csearch / GTAGS fallback** | 文本/ctags 搜索分不清重载、同名、namespace；Clang 语义失败必须诚实失败。显式搜索、references 和非 C++ 路径仍可使用它们。 | `docs/architecture-symbol-resolution.md` §1、§6 |
 | P13 | **不用 zoekt 替代 csearch** | Windows 不可用，已论证为死胡同。 | `docs/architecture-symbol-resolution.md` §6 (`zoekt-on-windows-dead-end`) |
 | P14 | **不用 PreserveBufferView / BufEnter winrestview 类 cursor 守护** | workaround 反噬模式；Vim 原生 cursor 行为已足够（见坑 K10）。 | `docs/architecture-symbol-resolution.md` §6; commit `252e9e0` |
 | P15 | **不在 `init.lua` 重复 require LazyVim 自动加载的 config 模块** | `config.options`/`autocmds`/`keymaps` 由 LazyVim 自动加载，重复 require 会双执行。 | `init.lua` NOTE (line ~44); 约束 C3 |
@@ -265,6 +265,98 @@
   → `lua/ue/dap/android.lua` `_start_liveness_poller`; `lua/utils/stall_probe.lua`;
     `docs/changelog.md` 2026-07-24（卡顿修复条目）
 
+- **K42 — gitsigns watch_gitdir × git fsmonitor = 自激振荡 spawn 循环 → 全程 UI 卡顿**
+  症状: `<C-f>/<C-b>` 翻页、picker 输入持续卡顿；stall train 在 DAP 会话结束后仍在
+  （排除 K40 后仍 ~40 stalls/min）。jit.profile 8s 采样实锤: gitsigns async spawn +
+  `git/repo/watcher.lua` 占主循环 ~1600/4300 样本。
+  根因: 本机 UE 仓开了 **git fsmonitor**（`core.fsmonitor=true`）。每次 git 子进程运行都
+  会在 `.git/` 里落 fsmonitor cookie 文件 → gitsigns 的 gitdir watcher 观察到变化 →
+  refresh → spawn git → 又落 cookie → watcher 再触发——自激振荡，永不收敛。Windows 上
+  每次 spawn 主循环开销数十 ms，叠加 200ms 的 current_line_blame（每次悬停一个
+  `git blame -L` spawn）雪上加霜。
+  解决约束: 本机 gitsigns **必须 `watch_gitdir.enable=false`**（外部 git 操作靠
+  BufWritePost/FocusGained 刷新，可接受）；`current_line_blame_opts.delay` ≥ 500ms。
+  诊断入口: `jit.profile` 8s 采样（`profe_prof` 模式脚本）看 spawn 栈占比；或
+  `:StallReport` 排除 DAP 后仍有 train 即怀疑 watcher 类自激。
+  → `lua/plugins/gitsigns.lua`; `docs/changelog.md` 2026-07-24（gitsigns 卡顿条目）
+
+- **K43 — Windows libuv 把 LAST_ACCESS/属性事件折叠为 `UV_CHANGE` → dirty overlay 洪水**
+  症状: `dirty-set-flood/cap-hit` 探针反复出现，`dirty.json` 达 1000 上限，picker 每次搜索
+  背着巨大 rg-on-dirty 集合；现场 1000 条中 965 个文件的 LAST_WRITE 仍停在 2026-06-22，
+  而 csearch 索引生成于 2026-08-04，证明不是索引后的内容修改。
+  根因: libuv Windows backend 的 `ReadDirectoryChangesW` 同时订阅 `LAST_ACCESS`、
+  `ATTRIBUTES`、`SECURITY`、`LAST_WRITE`，却统一映射成 `UV_CHANGE`；原 watcher 对所有
+  `change` 只做“文件存在”判断，元数据扫描也被当作内容变化。
+  解决约束: rename/create/delete 始终保守记录；已有文件的纯 `change` 只有 LAST_WRITE
+  晚于当前 `csearch.idx` 才进入 `persistent_dirty`。无可用索引或无 mtime 证据时保持记录，
+  不得为降噪漏掉首次构建前/新建文件。
+  → `lua/utils/ue_watch.lua`; `openspec/specs/ue-code-search/spec.md`
+
+- **K44 — Android SO 热替换必须匹配已安装 APK 的 Java/JNI 基线**
+  症状: 新 SO 能成功 strip、push、通过 hash/metadata/maps 校验，却在启动后因
+  `NoSuchMethodError` 主动 SIGABRT；实机证据为 native 调用了旧 APK 中不存在的新 Java 方法。
+  根因: SO-only 构建只更新 native action graph，不会更新 APK 内 Java/manifest/Gradle
+  产物；把新 JNI 调用的 SO 注入旧 APK 在 ELF 层可加载，但运行时接口不兼容。
+  解决约束: 部署前必须校验源 SO 同目录 `packageInfo.txt` 与设备安装包的 package/versionCode。
+  root 原地替换在不一致时继续拒绝；app-private agent 路径不修改 APK，versionCode 差异只作为明确
+  警告，不能伪装成 Java/JNI 兼容证明。两条路径都只支持 native-only 迭代；涉及新 Java 方法、
+  manifest 或 Gradle 产物时，SO 注入本身无法让旧 APK 获得这些接口。
+  → `scripts/ue_android_so_deploy.ps1`; `openspec/specs/android-so-quick-deploy/spec.md`
+
+- **K45 — `Client` 是项目/Target 名，不是 Android 目录协议**
+  症状: 非 `Client` 项目能正常编译，但 nested `.uproject`、packageInfo、symbol package 或 SO
+  receipt 发现失败；测试若也只用 `Client` fixture，会把该耦合隐藏起来。
+  根因: 旧路径把现场项目布局 `Source/Client`、`Client_Symbols_v*`、`Client-arm64` 当成 UE 固定约定。
+  解决约束: 从显式 `.uproject` 或唯一 `Source/<Project>/*.uproject` 派生项目目录；SO 主产物从
+  matching receipt 和动态 Target 派生；符号包扫描实际 `<Target>_Symbols_v*/<Target>-arm64` 目录。
+  多项目/多主产物歧义必须拒绝，不能按目录或 receipt 顺序猜测。回归 fixture 必须使用非
+  `Client` 的虚构项目名。
+  → `lua/ue.lua`; `lua/ue/dap/android.lua`; `openspec/specs/android-so-quick-deploy/spec.md`;
+  `openspec/specs/android-dap-attach/spec.md`
+
+- **K46 — Android 安装、SO 替换与启动必须分离**
+  症状: `uq` 替换后自动启动并用 PID/maps 验证，把文件部署与冷启动时序耦合；首次冷启动可能误回滚，且命令会
+  在用户未要求时占用设备前台。
+  解决约束: `ui` 只执行 APK 安装，`uq` 只负责 force-stop、root 原子替换或 app-private staging、
+  metadata/hash 校验和必要回滚；二者成功或回滚后都不得自动启动应用。启动唯一由用户显式执行 `ul`。
+  运行时 ClassLoader/maps 验证属于 `ul`，不得重新塞回 `uq`。
+  → `scripts/ue_android_so_deploy.ps1`; `openspec/specs/android-so-quick-deploy/spec.md`
+
+- **K47 — Android root transport 不能写死为 `su 0`**
+  症状: `<leader>uq` 在没有 `su` 的设备直接报 `/system/bin/sh: su: inaccessible or not found`；同时 root adbd 设备本可直接执行特权命令，却也被无条件 `su 0` 阻断。
+  根因: root 是设备能力，不是固定命令形状；设备全局 `ro.debuggable=0` 也不等于某个已安装 APK
+  没有 `DEBUGGABLE` flag。实测目标设备为 `uid=2000(shell)`、`build_type=user`、无 `su`，但现有包
+  可 `run-as` 且自身 debuggable。
+  解决约束: 部署副作用前先用 `id -u` 选择 root adbd，失败后再验证 `su 0 id -u`；两者都失败时
+  继续验证 package `DEBUGGABLE`、`run-as` app UID 与 `--attach-agent-bind`，满足则走 app-private agent，
+  不修改 installed SO。只有 root 与 app-private 两类 transport 都失败时才拒绝。
+  → `scripts/ue_android_so_deploy.ps1`; `openspec/specs/android-so-quick-deploy/spec.md`
+
+- **K48 — 预先 `dlopen` 私有 `libUE4.so` 不能替代 ClassLoader 的绝对路径加载**
+  症状: agent 报私有 SO 已 `dlopen`，随后 `System.loadLibrary("UE4")` 仍可能加载 `/data/app/.../libUE4.so`，
+  形成两份映射；手工 `dlopen` 也没有完成 ART 的 classloader native-library bookkeeping 与 `JNI_OnLoad` 语义。
+  根因: Android 14 `Runtime.loadLibrary0` 先调用 `ClassLoader.findLibrary` 得到绝对路径；bionic 对含 `/`
+  的 `dlopen` 请求不走 SONAME 已加载复用。晚附加 agent 也错过了 zygote 阶段已发生的
+  `Runtime.nativeLoad` NativeMethodBind，不能靠事件回放拿到原函数。
+  解决约束: app-private agent 只能在 `ClassPrepare`（类已 prepared、尚未执行代码）阶段识别真正能把
+  `UE4` 解析到 installed SO 的 app ClassLoader，调用 `addNativePath` 后把新增
+  `nativeLibraryPathElements` 元素移到首位，并验证前/后绝对路径。真正加载仍由项目原有
+  `System.loadLibrary` 完成；agent/host maps 必须证明私有路径存在且 installed 路径不存在，否则 fail closed。
+  → `scripts/ue_android_so_agent.c`; `scripts/ue_android_so_launch.ps1`;
+    `openspec/specs/android-so-quick-deploy/spec.md`
+
+- **K49 — app-private SO 与 agent 不能作为两个独立“当前文件”发布**
+  症状: 并发 `uq`/`ul` 或进程中途退出时，启动可能观察到新 SO + 旧 agent、残留 `.new`，或把半成品
+  staging 当成“从未部署”而静默启动 installed SO；substring maps 判断还会把 `.previous` 误认成映射成功。
+  根因: 多文件更新没有单一原子提交点；固定临时文件名与共享 status 也不具备跨进程隔离。
+  解决约束: 同一 serial/package 的 `uq`/`ul` 必须用 OS mutex 串行化；每次部署写唯一 generation，
+  校验 SO/agent hash 与 manifest 后只用原子 `current` pointer 发布。`ul` 必须复算 current generation
+  文件 hash，并核对 installed versionCode 与 APK path/stat/lastUpdateTime 摘要；工具目录部分存在必须拒绝。
+  maps 必须解析 pathname 精确比较（仅容许 ` (deleted)`），
+  启动/验证失败必须 force-stop 并确认错误进程退出。
+  → `scripts/ue_android_so_deploy.ps1`; `scripts/ue_android_so_launch.ps1`;
+    `scripts/ue_android_so_agent.c`; `openspec/specs/android-so-quick-deploy/spec.md`
+
 ### 工具链 / LLVM
 
 - **K41 — 跨盘 project root 缺 `.clangd` → UEPrepare 后 clangd background-index 吃满 CPU/内存**
@@ -298,7 +390,7 @@
   git log（`b9cce1d` merge `feat/lldb-dap-migration`、
   `7c70462`、release_1.0.3）
 
-### snacks / clangd / lazy（活跃 workaround，共 9 个文件）
+### snacks / clangd / lazy（活跃 workaround，共 8 个文件）
 
 - **K16 — snacks picker 冷启动首开卡死**
   症状: Neovide 冷启后第一次开 picker 卡约 1s。
@@ -321,10 +413,12 @@
   `clangd: -32602: ... clangd only supports file:// URIs`；Neovide 上每次 notify 强制重绘更糟。
   → `lua/workarounds/clangd/non_file_uri_detach.lua`（已在 `init.lua` eager apply）
 
-- **K21 — Lazy float 在 VimResized 时 invalid buffer**
+- **K21 — Lazy float 在 VimResized 时 invalid buffer（已退役 2026-07-26）**
   症状: 刚关掉 Lazy float 后窗口 resize（Neovide 启动 / zen-mode / split），报
   `lazy/view/float.lua:180: Invalid buffer id: N`。
-  → `lua/workarounds/lazy/float_vimresized_invalid_buf.lua`（init.lua eager apply）
+  现状: 上游 lazy.nvim（本机 stable）`float.lua` VimResized 回调已自带 win+buf
+  双重 validity guard（校验失败 return true 自删 autocmd）——workaround 已删除
+  （health-check 2026-07 F6）。若上游回归，按原 frontmatter 重建。
 
 - **K22 — `q` 关闭已失效 buffer**
   症状: 在 snacks/noice picker 候选间导航、或 notify 气泡快速消失时报
@@ -345,7 +439,16 @@
   cursor 改走。
   解决: 砍掉 snacks.scroll + PreserveBufferView（见禁止 P14）；jumper 内
   `_on_reassert` 钩子在跳完 ~10ms 后 verify 并必要时 reassert。
-  → `docs/architecture-symbol-resolution.md` §2.7; commit `252e9e0`
+  → `docs/architecture-symbol-resolution.md` §6; commit `252e9e0`
+
+- **K42 — 裸 symbol / arity / standalone header 不能完成 C++ overload resolution**
+  症状: 先解析无参 overload 后，按裸 symbol 缓存的 location 使另一个同名调用不请求
+  clangd 就原地跳回 sibling；非自包含 UE header 的 standalone AST 同时出现
+  `OverloadedDeclRef` / recovery，而真实 donor TU 能得到唯一 overload identity。
+  解决: C++ source 只接受 active-CDB clangd exact-cursor USR；header 只在 compiler-emitted
+  evidence 证明的 origin TU 中由 libclang 求 canonical USR。非 resolved 诚实失败，禁止
+  cache / arity / ranking / text fallback 猜目标。
+  → `docs/architecture-symbol-resolution.md`; `openspec/changes/archive/2026-08-05-replace-cpp-goto-with-contextual-clang-resolution/`
 
 ### grep 缓存 / csearch 失效
 
@@ -477,14 +580,19 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 
 ### C5 — 符号解析分层契约
 
-- 链路: `treesitter 早退` → `cache` → `clangd(LSP)` → `csearch` → `gtags`，按
-  "省调用 → 命中精度 → 兜底覆盖" 串成单链。
-- cache 承载约 **70%** 请求；cache HIT 路径 = lua table lookup + jumper.jump，**不动任何子进程**。
-- `.usf` / `.py` / `.Build.cs` 直接走 gtags，跳过 clangd 与 csearch。
-- **每一层失败都必须 fall through**，绝不让用户看到 `lua error in lsp_fallback`；最终兜底 toast "no def"。
-- clangd 永远是权威源但永不前台阻塞: spinner 600ms 后才显示，30s 硬超时。
+- **C++ source TU**：active CDB 证明 → clangd exact-cursor USR + 单次 definition；零个或多个
+  target 都保持当前位置，不读写 definition-location cache，不进入文本 fallback。
+- **C++ header**：必须继承或选择 compiler-emitted dependency evidence 证明的 origin TU，
+  由异步 libclang sidecar 在真实 argv / cwd 中解析 canonical USR；standalone header 不是 build truth。
+- C++ 终态仅 `resolved / ambiguous-context / invalid-semantic-context / unavailable`；只有
+  `resolved` 可跳转，Tree-sitter、arity、ranking、workspace symbol、csearch、GTAGS 不得选择或否决结果。
+- 允许缓存的是 live TU，key 绑定 active build、origin TU、exact compile fingerprint 与 toolchain；
+  不允许按 symbol / receiver / arity 持久化 C++ location。
+- 所有 parse/reparse 在 sidecar 进程；spinner 600ms 后显示，UI 主循环不得同步等待。
+- 非 C++ compatibility path 保留 cache/LSP/csearch/GTAGS；`.usf` / `.py` / `.Build.cs`
+  可直接走 GTAGS。显式搜索和 references 不受 C++ authority invariant 影响。
 - jumper 后置条件: 一个 `<Ctrl-O>` 回到源、恰好一条 jumplist 条目、无 `(target_buf,1,0)` 幽灵。
-→ `docs/architecture-symbol-resolution.md` §1、§5、§2.7
+→ `docs/architecture-symbol-resolution.md` §1–§6
 
 ### C5b — grep 缓存按平台分路径 + 失效契约
 

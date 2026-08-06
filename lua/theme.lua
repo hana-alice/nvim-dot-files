@@ -1,83 +1,69 @@
 local M = {}
 
-local DEFAULT = "tokyonight"
-local ALIASES = {
-  ubokai = "unokai",
-  ubuntu = "ubuntu-terminal",
-  catppuccin_frappe = "catppuccin-frappe",
-  catppuccin_latte = "catppuccin-latte",
-  catppuccin_macchiato = "catppuccin-macchiato",
-  catppuccin_mocha = "catppuccin-mocha",
-  rider = "rider-light",
-  rider_light = "rider-light",
-  ["rider light"] = "rider-light",
-  white = "porcelain-white",
-  porcelain = "porcelain-white",
-  porcelain_white = "porcelain-white",
-  ["porcelain white"] = "porcelain-white",
+local DEFAULT = "monokai_ristretto"
+local THEMES = {
+  { name = "monokai_ristretto", label = "Monokai Ristretto", plugin = "monokai.nvim" },
+  { name = "rider-light", label = "Rider Light" },
+  { name = "ubuntu-terminal", label = "Ubuntu Terminal" },
+  { name = "unokai", label = "Unokai" },
+  {
+    name = "catppuccin",
+    label = "Catppuccin",
+    plugin = "catppuccin",
+    current_pattern = "^catppuccin%-",
+  },
+  {
+    name = "sonokai-espresso",
+    label = "Sonokai Espresso",
+    plugin = "sonokai",
+    colorscheme = "sonokai",
+    before = function()
+      vim.g.sonokai_style = "espresso"
+      -- Avoid Sonokai's synchronous first-use syntax-cache generation (the
+      -- upstream docs allow up to five seconds); normal mode costs only tens
+      -- of milliseconds and respects this config's no-main-loop-stall rule.
+      vim.g.sonokai_better_performance = 0
+    end,
+  },
 }
+local THEME_BY_NAME = {}
+for _, theme in ipairs(THEMES) do
+  THEME_BY_NAME[theme.name] = theme
+end
+
 local picker = nil
-
-local LABELS = {
-  tokyonight = "Tokyo Night",
-  catppuccin = "Catppuccin",
-  ["catppuccin-frappe"] = "Catppuccin Frappe",
-  ["catppuccin-latte"] = "Catppuccin Latte",
-  ["catppuccin-macchiato"] = "Catppuccin Macchiato",
-  ["catppuccin-mocha"] = "Catppuccin Mocha",
-  kanagawa = "Kanagawa",
-  monokai = "Monokai",
-  monokai_pro = "Monokai Pro",
-  monokai_soda = "Monokai Soda",
-  monokai_ristretto = "Monokai Ristretto",
-  unokai = "Unokai",
-  ["ubuntu-terminal"] = "Ubuntu Terminal",
-  ["rider-light"] = "Rider Light",
-  ["porcelain-white"] = "Porcelain White",
-  apprentice = "Apprentice",
-}
-
-local PLUGIN_BY_THEME = {
-  tokyonight = "tokyonight.nvim",
-  catppuccin = "catppuccin",
-  ["catppuccin-frappe"] = "catppuccin",
-  ["catppuccin-latte"] = "catppuccin",
-  ["catppuccin-macchiato"] = "catppuccin",
-  ["catppuccin-mocha"] = "catppuccin",
-  kanagawa = "kanagawa.nvim",
-  monokai = "monokai.nvim",
-  monokai_pro = "monokai.nvim",
-  monokai_soda = "monokai.nvim",
-  monokai_ristretto = "monokai.nvim",
-}
+local state_path_override = nil
 
 local function state_path()
-  return vim.fn.stdpath("state") .. "/theme.txt"
+  return state_path_override or (vim.fn.stdpath("state") .. "/theme.txt")
 end
 
 local function normalize_name(name)
-  name = vim.trim(tostring(name or ""))
-  return ALIASES[name] or name
+  return vim.trim(tostring(name or ""))
 end
 
-local function known_colors()
-  local names = {}
-  for name in pairs(LABELS) do
-    table.insert(names, name)
-  end
-  return names
-end
-
-local function ensure_theme_loaded(name)
-  local plugin = PLUGIN_BY_THEME[name]
-  if not plugin then
+local function ensure_theme_loaded(theme)
+  if not theme or not theme.plugin then
     return
   end
 
   local ok, lazy = pcall(require, "lazy")
   if ok and lazy and type(lazy.load) == "function" then
-    lazy.load({ plugins = { plugin } })
+    lazy.load({ plugins = { theme.plugin } })
   end
+end
+
+local function load_theme(name)
+  local theme = THEME_BY_NAME[name]
+  if not theme then
+    return false, "unknown theme"
+  end
+
+  ensure_theme_loaded(theme)
+  if theme.before then
+    theme.before()
+  end
+  return pcall(vim.cmd.colorscheme, theme.colorscheme or theme.name)
 end
 
 local function read_state()
@@ -95,66 +81,24 @@ local function write_state(name)
 end
 
 local function theme_names()
-  local ordered = {}
-  local seen = {}
-  local function add(name)
-    name = normalize_name(name)
-    if name ~= "" and not seen[name] then
-      seen[name] = true
-      table.insert(ordered, name)
-    end
+  local names = {}
+  for _, theme in ipairs(THEMES) do
+    names[#names + 1] = theme.name
   end
-
-  for _, name in ipairs(known_colors()) do
-    add(name)
-  end
-  add(read_state())
-
-  if vim.tbl_isempty(ordered) then
-    ordered = { DEFAULT }
-  end
-
-  table.sort(ordered, function(a, b)
-    if a == DEFAULT then
-      return true
-    end
-    if b == DEFAULT then
-      return false
-    end
-    return a < b
-  end)
-
-  return ordered
+  return names
 end
 
 local function has_theme(name)
-  name = normalize_name(name)
-  for _, item in ipairs(theme_names()) do
-    if item == name then
-      return true
-    end
-  end
-  return false
-end
-
-local function theme_label(name)
-  if LABELS[name] then
-    return LABELS[name]
-  end
-  local label = name:gsub("[_-]+", " ")
-  label = label:gsub("(%a)([%w']*)", function(first, rest)
-    return string.upper(first) .. string.lower(rest)
-  end)
-  return label
+  return THEME_BY_NAME[normalize_name(name)] ~= nil
 end
 
 function M.available()
   local items = {}
-  for _, name in ipairs(theme_names()) do
-    table.insert(items, {
-      name = name,
-      label = theme_label(name),
-    })
+  for _, theme in ipairs(THEMES) do
+    items[#items + 1] = {
+      name = theme.name,
+      label = theme.label,
+    }
   end
   return items
 end
@@ -165,33 +109,25 @@ end
 
 function M.startup()
   local saved = normalize_name(read_state())
-  if saved ~= "" then
+  if has_theme(saved) then
     return saved
   end
   return DEFAULT
 end
 
-local function colorscheme_for(name)
-  if name == "kanagawa" then
-    return "kanagawa-dragon"
-  end
-  return name
-end
-
 function M.load_startup()
-  local name = normalize_name(M.startup())
-  if name == "" then
-    name = DEFAULT
+  local saved = normalize_name(read_state())
+  local name = M.startup()
+  if saved ~= "" and saved ~= name then
+    write_state(name)
   end
 
-  ensure_theme_loaded(name)
-  local ok, err = pcall(vim.cmd.colorscheme, colorscheme_for(name))
+  local ok, err = load_theme(name)
   if ok then
     return
   end
 
   write_state(DEFAULT)
-  ensure_theme_loaded(DEFAULT)
   vim.schedule(function()
     vim.notify(
       "Failed to load theme " .. name .. "; fell back to " .. DEFAULT .. "\n" .. tostring(err),
@@ -199,15 +135,22 @@ function M.load_startup()
     )
   end)
 
-  vim.cmd.colorscheme(DEFAULT)
+  local fallback_ok, fallback_err = load_theme(DEFAULT)
+  if not fallback_ok then
+    error(fallback_err)
+  end
 end
 
 function M.current()
-  local current = vim.g.colors_name
-  if has_theme(current) then
-    return current
+  local current = normalize_name(vim.g.colors_name)
+  for _, theme in ipairs(THEMES) do
+    if current == (theme.colorscheme or theme.name)
+      or (theme.current_pattern and current:match(theme.current_pattern))
+    then
+      return theme.name
+    end
   end
-  return normalize_name(M.startup())
+  return M.startup()
 end
 
 function M.apply(name, opts)
@@ -221,8 +164,7 @@ function M.apply(name, opts)
     return false
   end
 
-  ensure_theme_loaded(name)
-  local ok, err = pcall(vim.cmd.colorscheme, colorscheme_for(name))
+  local ok, err = load_theme(name)
   if not ok then
     require("utils.log").notify_error("theme", "Failed to load theme " .. name .. ": " .. tostring(err))
     return false
@@ -414,6 +356,10 @@ end
 
 function M.close()
   cancel_picker()
+end
+
+function M._set_state_path_for_test(path)
+  state_path_override = path
 end
 
 return M

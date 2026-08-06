@@ -13,6 +13,10 @@ UE 专用 DAP：`_common`（adapter 接线 + env 清洗）、`_persist_bp`（断
 - **codelldb 不用 `request="custom"`** → 用 `launch` + `targetCreateCommands` + `processCreateCommands`。→ P8/K1
 - **Android attach 唯一正解**：platform 模式 + `connect://[<serial>]:<port>` serial URL；
   **不用** `gdbserver --attach`（从不 listen）；**不用** localhost URL（被 getopt 吞空）。→ P16/P17/K30–K32
+- **设备 serial 单一来源**：程序化 `context/opts` 显式值优先，否则读
+  `utils.android_device` 的 `vim.g.ue_android_device_serial`；普通 attach 缺值就 picker，
+  不猜 last-session。活跃 session 的 poll/cleanup 始终使用捕获的 `session.serial`，且
+  K30 URL 与设备端全部 `adb -s` 必须一致。
 - **ASLR `--slide` 必须在 `processCreateCommands` 内、先于 setBreakpoints**（基于事件太晚）。→ K11
 - **ASLR `--slide` 是 load-bearing，别删**：真机 `UE_DAP_NO_SLIDE=1` 复验显示去掉它 attach 直接
   超时 / adapter `3221226505`。删除前必须在目标设备复验「无 slide 仍 resolved+命中」。→ K37

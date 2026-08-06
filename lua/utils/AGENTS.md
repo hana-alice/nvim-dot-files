@@ -7,13 +7,14 @@
 跨子系统复用的工具：`platform`（OS 分支唯一收口）、`log`（旋转日志）、`lsp_fallback`（gd/gr 兜底）、
 `ue_goto/`（goto 解析栈）、`code_search/`（csearch）、`ue_paths`（路径分类）、`sidebar`/`cheatsheet`/
 `restart`/`recent_projects`/`async_launcher`/`ue_watch`/`ue_launch`/`ue_logs`/`dirty_files`/
-`task_registry`（后台任务列出/停止）等。
+`task_registry`（后台任务列出/停止）、`android_device`（会话级 ADB serial 选择与路由）等。
 
 ## 专属约定
 
 - **OS 分支只在 `platform/`**：其余 utils 读 `platform.is_*` 或 `platform.driver()`，不自己分支。→ 见 `platform/AGENTS.md`
+- **Android 设备选择只走 `android_device.lua`**：新流程复用其 picker、`vim.g.ue_android_device_serial` 与 `adb_args`；`adb devices -l` 发现命令及 DAP 活跃 session 内捕获 serial 后的生命周期命令除外。
 - **LSP 行为只走 `lsp_fallback.lua`**，不全局覆盖 `vim.lsp.handlers`。→ P3
-- 纯函数模块（`ue_paths`、`ue_goto/ranking|pair_picker|location`）有行为回归，改契约前看断言。
+- 纯函数模块（`ue_paths`、`ue_goto/location|semantic_context|semantic_protocol`）有行为回归，改契约前看断言。
 - 单一职责、小文件：新功能优先新模块而非堆进现有大文件。
 - **新增后台 job（`jobstart`/`vim.system`/`termopen`）接入 `task_registry`**：唯一允许的接入是在 job
   创建语句**之后**加一行 `pcall(require("utils.task_registry").register, { name, group, kind="job"|"system", handle })`。
@@ -23,7 +24,9 @@
 
 ## 改动 → 必跑回归
 
-- 改 `ue_goto/**` / `code_search/**` / `ue_paths.lua` → `ue_goto_behavior` `ue_paths` `utils`
+- 改 `ue_goto/**` → `cpp_semantic_context` `cpp_semantic_client` `cpp_semantic_sidecar`
+  `ue_goto_behavior` `utils`
+- 改 `code_search/**` / `ue_paths.lua` → `ue_goto_behavior` `ue_paths` `utils`
 - 改 `platform/**` → `platform`（另见子目录 `AGENTS.md`）
 - 改被广泛复用的 helper（如 `log`、`ue_paths`）→ 提交前全量
 

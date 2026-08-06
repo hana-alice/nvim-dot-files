@@ -1,5 +1,6 @@
 local M = {}
 
+local android_device = require("utils.android_device")
 local MAX_LOG_LINES = 12000
 
 local state = {
@@ -42,22 +43,6 @@ local function powershell_command(script)
     "-Command",
     script,
   }
-end
-
-local function adb_connected_serials(run_lines, adb)
-  local code, lines = run_lines({ adb, "devices" })
-  if code ~= 0 then
-    return {}
-  end
-
-  local serials = {}
-  for _, line in ipairs(lines or {}) do
-    local serial = tostring(line):match("^(%S+)%s+device$")
-    if serial and serial ~= "List" then
-      serials[#serials + 1] = serial
-    end
-  end
-  return serials
 end
 
 local function prune_state()
@@ -386,12 +371,10 @@ local function android_logcat_spec(env, ctx)
     return nil, "adb not found in PATH"
   end
 
-  local serials = adb_connected_serials(env.run_lines, adb)
-  if #serials == 0 then
-    return nil, "No Android device found"
+  local serial = android_device.get()
+  if not serial then
+    return nil, "Android device is not selected; run :UESetAndroidDevice"
   end
-
-  local serial = serials[1]
   local script = ([[
 $ErrorActionPreference = 'Stop'
 $adb = %s
@@ -698,6 +681,12 @@ end
 function M.toggle_main_log(env)
   local spec, err = resolve_spec(env, "main")
   if not spec then
+    if err == "Android device is not selected; run :UESetAndroidDevice" then
+      android_device.ensure({ prompt = "Select Android device for UE logcat:" }, function(serial)
+        if serial then M.toggle_main_log(env) end
+      end)
+      return
+    end
     vim.notify(err, vim.log.levels.WARN)
     return
   end
@@ -711,6 +700,10 @@ function M.toggle_debug_log(env)
     return
   end
   toggle_spec(env, spec)
+end
+
+function M._android_logcat_spec_for_test(env, ctx)
+  return android_logcat_spec(env, ctx)
 end
 
 return M

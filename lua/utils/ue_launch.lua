@@ -180,15 +180,27 @@ local function desktop_launch_spec(env, ctx)
 end
 
 local function android_launch_argv(adb, serial, package_name)
-  return android_device.adb_args(adb, serial, {
-    "shell",
-    "monkey",
-    "-p",
+  local script = vim.fs.joinpath(
+    vim.fn.stdpath("config"), "scripts", "ue_android_so_launch.ps1"
+  )
+  if vim.fn.filereadable(script) ~= 1 then
+    return nil, "Android launch script not found: " .. script
+  end
+  return {
+    "powershell.exe",
+    "-NoLogo",
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    script,
+    "-Adb",
+    adb,
+    "-Serial",
+    serial,
+    "-Package",
     package_name,
-    "-c",
-    "android.intent.category.LAUNCHER",
-    "1",
-  })
+  }
 end
 
 local function android_launch_command(env, ctx, serial)

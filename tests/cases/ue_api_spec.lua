@@ -316,6 +316,11 @@ t.describe("ue.android_build_command（SO-only）", function()
     t.assert_contains(script, '"stat", "-c", "%C"')
     t.assert_contains(script, '"chcon", $Metadata.Context')
     t.assert_contains(script, "Assert-RemoteLibraryMetadata")
+    t.assert_contains(script, "function Resolve-RootTransport")
+    t.assert_contains(script, "function Invoke-AdbRoot")
+    local _, rawSuCount = script:gsub('"shell", "su", "0"', "")
+    t.assert_eq(rawSuCount, 2,
+      "su 0 只允许出现在能力探测和统一 root wrapper 中")
     t.assert_contains(script, "function Wait-PackageStopped")
     t.assert_contains(script, "replacement verified; package remains stopped")
     t.assert_false(script:find("function Start-Package", 1, true) ~= nil,
@@ -345,6 +350,61 @@ t.describe("ue.android_build_command（SO-only）", function()
     }, { text = true }):wait()
     t.assert_eq(result.code, 0, result.stderr or result.stdout)
     t.assert_contains(result.stdout or "", "PASS package stop polling + bounded timeout")
+  end)
+
+  t.it("SO deploy 按设备实测能力选择 root transport", function()
+    local config = vim.fn.stdpath("config")
+    local result = vim.system({
+      "powershell.exe",
+      "-NoLogo",
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      config .. "/tests/fixtures/android_so_deploy/root_transport_spec.ps1",
+      "-DeployScript",
+      config .. "/scripts/ue_android_so_deploy.ps1",
+    }, { text = true }):wait()
+    t.assert_eq(result.code, 0, result.stderr or result.stdout)
+    t.assert_contains(result.stdout or "", "PASS root transport capability selection")
+  end)
+
+  t.it("SO deploy 在 debuggable 无 root 设备走 run-as startup-agent transport", function()
+    local config = vim.fn.stdpath("config")
+    local result = vim.system({
+      "powershell.exe",
+      "-NoLogo",
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      config .. "/tests/fixtures/android_so_deploy/run_as_transport_spec.ps1",
+      "-DeployScript",
+      config .. "/scripts/ue_android_so_deploy.ps1",
+    }, { text = true }):wait()
+    t.assert_eq(result.code, 0, result.stderr or result.stdout)
+    t.assert_contains(result.stdout or "", "PASS debuggable run-as transport")
+  end)
+
+  t.it("SO startup agent 保持 APK identity 不变并在应用类执行前重定向 ClassLoader", function()
+    local config = vim.fn.stdpath("config")
+    local result = vim.system({
+      "powershell.exe",
+      "-NoLogo",
+      "-NoProfile",
+      "-ExecutionPolicy",
+      "Bypass",
+      "-File",
+      config .. "/tests/fixtures/android_so_deploy/startup_agent_spec.ps1",
+      "-DeployScript",
+      config .. "/scripts/ue_android_so_deploy.ps1",
+      "-LaunchScript",
+      config .. "/scripts/ue_android_so_launch.ps1",
+      "-AgentSource",
+      config .. "/scripts/ue_android_so_agent.c",
+    }, { text = true }):wait()
+    t.assert_eq(result.code, 0, result.stderr or result.stdout)
+    t.assert_contains(result.stdout or "", "PASS app-private startup agent contract")
   end)
 end)
 

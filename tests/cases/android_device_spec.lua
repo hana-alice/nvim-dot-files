@@ -128,10 +128,11 @@ t.describe("utils.android_device: adb argv", function()
 
     local launch = assert(require("utils.ue_launch")._android_launch_argv_for_test(
       "adb", "SERIAL-002", "com.example.game"))
-    t.assert_eq(table.concat(launch, " "), table.concat({
-      "adb", "-s", "SERIAL-002", "shell", "monkey", "-p", "com.example.game",
-      "-c", "android.intent.category.LAUNCHER", "1",
-    }, " "))
+    local launch_text = table.concat(launch, " ")
+    t.assert_contains(launch_text, "powershell.exe -NoLogo -NoProfile")
+    t.assert_contains(launch_text, "ue_android_so_launch.ps1")
+    t.assert_contains(launch_text, "-Adb adb -Serial SERIAL-002")
+    t.assert_contains(launch_text, "-Package com.example.game")
   end)
 
   t.it("Android logcat spec 不取第一台设备，脚本固定使用全局 serial", function()

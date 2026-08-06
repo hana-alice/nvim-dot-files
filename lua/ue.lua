@@ -7217,7 +7217,7 @@ function M.ai_context(engine_root)
       {
         key = "<Space>uq",
         nvim_command = ":UEDeployAndroidSO",
-        purpose = "Strip and atomically replace libUE4.so, leaving the Android package stopped.",
+        purpose = "Strip and stage libUE4.so through root or a debuggable app-private ClassLoader startup agent, leaving the package stopped.",
         native_command = so_deploy_command,
         native_action = so_deploy_error,
       },

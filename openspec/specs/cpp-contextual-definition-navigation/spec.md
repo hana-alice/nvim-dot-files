@@ -33,6 +33,13 @@ C++ `gd` SHALL 只接受当前 active build context 下由 Clang 语义分析返
 - **WHEN** 用户直接打开头文件，且 active build dependency evidence 只证明一个可解析 source TU context
 - **THEN** 系统 SHALL 使用该 context 求解语义目标
 
+#### Scenario: Proven origin TU contains only the declaration
+- **WHEN** libclang 在 proven origin TU 中解析出唯一 canonical USR 与 declaration，但该 TU AST 不包含位于另一 source TU 的 out-of-line definition
+- **THEN** 系统 SHALL 以头文件精确光标向 clangd 请求 compiler-owned USR，并仅在其与 libclang canonical USR 完全相等时请求跨 TU definition
+- **AND** definition 请求 SHALL 只发送给实际返回该 USR 的 clangd client，其他 LSP client MUST NOT 贡献候选
+- **AND** 系统 SHALL 只接受去重后唯一、且不同于原 declaration / 当前光标位置的 definition location
+- **AND** USR 缺失或不相等、definition 为零个或多个时 MUST NOT 按名称或返回顺序猜选目标
+
 #### Scenario: Header has multiple proven contexts and none was inherited
 - **WHEN** 用户直接打开头文件，且多个 source TU context 均由 active build evidence 证明
 - **THEN** 系统 SHALL 要求用户选择具体 context，或展示按 context 分组的真实语义结果

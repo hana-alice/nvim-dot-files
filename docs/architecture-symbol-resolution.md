@@ -82,6 +82,16 @@ file + line + column
 不同 USR 都不能降级成“第一候选”。本地缺少匹配 semantic tooling 时返回
 `unavailable`，不会写引擎或项目源码，也不会生成 forced-include 补丁。
 
+`clang_getCursorDefinition` 的可见域是当前 origin TU 的 AST。若头文件 declaration
+对应的 out-of-line body 位于另一 source TU，sidecar 仍返回该 declaration 的 canonical
+USR，但 `definition` 合法为空。此时跨 TU 补全只允许走 clangd project index：先在头文件
+精确光标请求 `textDocument/symbolInfo`，要求 USR 与 sidecar 完全相等，再请求一次
+`textDocument/definition`；definition 只发给实际返回该 USR 的 clangd client，过滤原
+declaration 与当前位置后只剩唯一 location 才跳转。
+USR 不一致、零个或多个 location 都不按名称或响应顺序猜选。若当前光标不在 declaration
+本身，仍可安全退到 sidecar 已证明为同一 USR 的 declaration；已经位于该 declaration 时
+则保持当前位置并报告跨 TU definition 不可用。
+
 ## 4. Terminal states 与 UI 副作用
 
 每个 C++ 请求只能结束为：

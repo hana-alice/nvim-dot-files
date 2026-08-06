@@ -62,6 +62,10 @@ local function build_compile_commands(root)
       args = { "clang++", "-std=c++20", "-c", vim.fs.normalize(root .. "/direct.cpp") },
     },
     {
+      file = vim.fs.normalize(root .. "/caller.cpp"),
+      args = { "clang++", "-std=c++20", "-c", vim.fs.normalize(root .. "/caller.cpp") },
+    },
+    {
       file = vim.fs.normalize(root .. "/overlay.cpp"),
       args = { "clang++", "-std=c++20", "-c", vim.fs.normalize(root .. "/overlay.cpp") },
     },
@@ -110,6 +114,7 @@ local function with_temp_fixture(fn)
   local files = {
     "direct.hpp",
     "direct.cpp",
+    "caller.cpp",
     "overlay.cpp",
     "contextual.hpp",
     "donor_one.cpp",
@@ -484,6 +489,31 @@ t.describe("semantic sidecar integration", function()
         "cv/ref overloads must have distinct compiler identities")
       t.assert_true(by_id["template-nontemplate"].usr ~= by_id["template-generic"].usr,
         "non-template and template specializations must have distinct compiler identities")
+      sidecar:shutdown()
+    end)
+  end)
+
+  t.it("keeps canonical USR when an origin TU can see only the header declaration", function()
+    with_temp_fixture(function(root)
+      local sidecar = semantic_sidecar.new()
+      local declaration = find_marker_position(
+        root .. "/direct.hpp", "DECL:pick_widget", "pick")
+      local response = sidecar:handle_request({
+        v = protocol.VERSION,
+        id = "declaration-only-origin",
+        op = "query",
+        query = vim.tbl_extend("force", declaration, { document_version = 1 }),
+        contexts = {
+          { id = "ctx-caller", origin_tu = root .. "/caller.cpp", cdb_dir = root },
+        },
+      })
+
+      t.assert_eq(response.state, "resolved")
+      t.assert_true(type(response.usr) == "string" and response.usr ~= "")
+      t.assert_eq(vim.fs.normalize(response.declaration.path),
+        vim.fs.normalize(root .. "/direct.hpp"))
+      t.assert_true(response.definition == nil,
+        "libclang must not invent a body absent from the selected origin TU AST")
       sidecar:shutdown()
     end)
   end)

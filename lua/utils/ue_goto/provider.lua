@@ -59,8 +59,10 @@ end
 -- Async LSP request (single method scatter/gather)
 -- ---------------------------------------------------------------------------
 
--- Fire one LSP request round across all clients. Calls on_result(locations)
--- exactly once on the main thread. locations is nil iff every client failed
+-- Fire one LSP request round across all clients, or only the explicit
+-- opts.client_ids subset when compiler-identity verification has already
+-- selected the authoritative responders. Calls on_result(locations) exactly
+-- once on the main thread. locations is nil iff every selected client failed
 -- or returned no result.
 --
 -- HARD CONTRACT (Tier-2 hardening, 2026-04-18):
@@ -75,8 +77,13 @@ end
 --   without leaking notices when the LSP server misbehaves.
 local REQUEST_HARD_CEILING_MS = 30000
 
-function M.async_lsp_request(bufnr, method, on_result)
-  local clients = vim.lsp.get_clients({ bufnr = bufnr, method = method })
+function M.async_lsp_request(bufnr, method, on_result, opts)
+  local clients = vim.lsp.get_clients({ bufnr = bufnr, method = method }) or {}
+  if opts and type(opts.client_ids) == "table" then
+    local allowed = {}
+    for _, id in ipairs(opts.client_ids) do allowed[id] = true end
+    clients = vim.tbl_filter(function(client) return allowed[client.id] == true end, clients)
+  end
   if not clients or vim.tbl_isempty(clients) then
     vim.schedule(function() on_result(nil) end)
     return
@@ -132,9 +139,10 @@ function M.async_lsp_request(bufnr, method, on_result)
   end
 end
 
--- clangd extension: return the unique USR for the exact cursor position.
--- This is trace/identity evidence for the source-TU path; no rendered symbol
--- text is used to choose a target.
+-- clangd extension: return the unique USR for the exact cursor position plus
+-- the ids of clients that returned that identity. Callers pass those ids into
+-- async_lsp_request so an unrelated LSP client cannot contribute a location.
+-- No rendered symbol text is used to choose a target.
 function M.async_clangd_symbol_info(bufnr, on_result)
   local clients = {}
   for _, client in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
@@ -147,14 +155,20 @@ function M.async_clangd_symbol_info(bufnr, on_result)
     return
   end
 
-  local pending, done, usrs = #clients, false, {}
+  local pending, done, usr_clients = #clients, false, {}
   local timer
   local function finish()
     if done then return end
     done = true
     if timer and not timer:is_closing() then timer:stop(); timer:close() end
-    local values = vim.tbl_keys(usrs)
-    vim.schedule(function() on_result(#values == 1 and values[1] or nil) end)
+    local values = vim.tbl_keys(usr_clients)
+    local usr = #values == 1 and values[1] or nil
+    local client_ids = {}
+    if usr then
+      client_ids = vim.tbl_keys(usr_clients[usr])
+      table.sort(client_ids)
+    end
+    vim.schedule(function() on_result(usr, client_ids) end)
   end
   local function complete_one()
     pending = pending - 1
@@ -173,7 +187,8 @@ function M.async_clangd_symbol_info(bufnr, on_result)
           if not done and not err and type(result) == "table" then
             local item = result.usr and result or result[1]
             if type(item) == "table" and type(item.usr) == "string" and item.usr ~= "" then
-              usrs[item.usr] = true
+              usr_clients[item.usr] = usr_clients[item.usr] or {}
+              if client.id ~= nil then usr_clients[item.usr][client.id] = true end
             end
           end
           complete_one()

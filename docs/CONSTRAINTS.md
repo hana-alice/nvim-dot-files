@@ -297,9 +297,10 @@
   `NoSuchMethodError` 主动 SIGABRT；实机证据为 native 调用了旧 APK 中不存在的新 Java 方法。
   根因: SO-only 构建只更新 native action graph，不会更新 APK 内 Java/manifest/Gradle
   产物；把新 JNI 调用的 SO 注入旧 APK 在 ELF 层可加载，但运行时接口不兼容。
-  解决约束: 部署前必须校验源 SO 同目录 `packageInfo.txt` 与设备安装包的 package/versionCode；
-  不一致时在 strip/push/替换前拒绝，并要求先安装一次匹配 APK。之后仅 C++ 迭代可继续
-  `us`→`uq`；涉及 Java/JNI/manifest/Gradle 输入变化时必须重新建立 APK 基线。
+  解决约束: 部署前必须校验源 SO 同目录 `packageInfo.txt` 与设备安装包的 package/versionCode。
+  root 原地替换在不一致时继续拒绝；app-private agent 路径不修改 APK，versionCode 差异只作为明确
+  警告，不能伪装成 Java/JNI 兼容证明。两条路径都只支持 native-only 迭代；涉及新 Java 方法、
+  manifest 或 Gradle 产物时，SO 注入本身无法让旧 APK 获得这些接口。
   → `scripts/ue_android_so_deploy.ps1`; `openspec/specs/android-so-quick-deploy/spec.md`
 
 - **K45 — `Client` 是项目/Target 名，不是 Android 目录协议**
@@ -316,9 +317,45 @@
 - **K46 — Android 安装、SO 替换与启动必须分离**
   症状: `uq` 替换后自动启动并用 PID/maps 验证，把文件部署与冷启动时序耦合；首次冷启动可能误回滚，且命令会
   在用户未要求时占用设备前台。
-  解决约束: `ui` 只执行 APK 安装，`uq` 只负责 force-stop、原子替换、metadata/hash 校验和必要回滚；二者成功或
-  回滚后都不得自动启动应用。启动唯一由用户显式执行 `ul`。不得用固定 sleep、PID/maps 轮询或自动重试重新耦合。
+  解决约束: `ui` 只执行 APK 安装，`uq` 只负责 force-stop、root 原子替换或 app-private staging、
+  metadata/hash 校验和必要回滚；二者成功或回滚后都不得自动启动应用。启动唯一由用户显式执行 `ul`。
+  运行时 ClassLoader/maps 验证属于 `ul`，不得重新塞回 `uq`。
   → `scripts/ue_android_so_deploy.ps1`; `openspec/specs/android-so-quick-deploy/spec.md`
+
+- **K47 — Android root transport 不能写死为 `su 0`**
+  症状: `<leader>uq` 在没有 `su` 的设备直接报 `/system/bin/sh: su: inaccessible or not found`；同时 root adbd 设备本可直接执行特权命令，却也被无条件 `su 0` 阻断。
+  根因: root 是设备能力，不是固定命令形状；设备全局 `ro.debuggable=0` 也不等于某个已安装 APK
+  没有 `DEBUGGABLE` flag。实测目标设备为 `uid=2000(shell)`、`build_type=user`、无 `su`，但现有包
+  可 `run-as` 且自身 debuggable。
+  解决约束: 部署副作用前先用 `id -u` 选择 root adbd，失败后再验证 `su 0 id -u`；两者都失败时
+  继续验证 package `DEBUGGABLE`、`run-as` app UID 与 `--attach-agent-bind`，满足则走 app-private agent，
+  不修改 installed SO。只有 root 与 app-private 两类 transport 都失败时才拒绝。
+  → `scripts/ue_android_so_deploy.ps1`; `openspec/specs/android-so-quick-deploy/spec.md`
+
+- **K48 — 预先 `dlopen` 私有 `libUE4.so` 不能替代 ClassLoader 的绝对路径加载**
+  症状: agent 报私有 SO 已 `dlopen`，随后 `System.loadLibrary("UE4")` 仍可能加载 `/data/app/.../libUE4.so`，
+  形成两份映射；手工 `dlopen` 也没有完成 ART 的 classloader native-library bookkeeping 与 `JNI_OnLoad` 语义。
+  根因: Android 14 `Runtime.loadLibrary0` 先调用 `ClassLoader.findLibrary` 得到绝对路径；bionic 对含 `/`
+  的 `dlopen` 请求不走 SONAME 已加载复用。晚附加 agent 也错过了 zygote 阶段已发生的
+  `Runtime.nativeLoad` NativeMethodBind，不能靠事件回放拿到原函数。
+  解决约束: app-private agent 只能在 `ClassPrepare`（类已 prepared、尚未执行代码）阶段识别真正能把
+  `UE4` 解析到 installed SO 的 app ClassLoader，调用 `addNativePath` 后把新增
+  `nativeLibraryPathElements` 元素移到首位，并验证前/后绝对路径。真正加载仍由项目原有
+  `System.loadLibrary` 完成；agent/host maps 必须证明私有路径存在且 installed 路径不存在，否则 fail closed。
+  → `scripts/ue_android_so_agent.c`; `scripts/ue_android_so_launch.ps1`;
+    `openspec/specs/android-so-quick-deploy/spec.md`
+
+- **K49 — app-private SO 与 agent 不能作为两个独立“当前文件”发布**
+  症状: 并发 `uq`/`ul` 或进程中途退出时，启动可能观察到新 SO + 旧 agent、残留 `.new`，或把半成品
+  staging 当成“从未部署”而静默启动 installed SO；substring maps 判断还会把 `.previous` 误认成映射成功。
+  根因: 多文件更新没有单一原子提交点；固定临时文件名与共享 status 也不具备跨进程隔离。
+  解决约束: 同一 serial/package 的 `uq`/`ul` 必须用 OS mutex 串行化；每次部署写唯一 generation，
+  校验 SO/agent hash 与 manifest 后只用原子 `current` pointer 发布。`ul` 必须复算 current generation
+  文件 hash，并核对 installed versionCode 与 APK path/stat/lastUpdateTime 摘要；工具目录部分存在必须拒绝。
+  maps 必须解析 pathname 精确比较（仅容许 ` (deleted)`），
+  启动/验证失败必须 force-stop 并确认错误进程退出。
+  → `scripts/ue_android_so_deploy.ps1`; `scripts/ue_android_so_launch.ps1`;
+    `scripts/ue_android_so_agent.c`; `openspec/specs/android-so-quick-deploy/spec.md`
 
 ### 工具链 / LLVM
 

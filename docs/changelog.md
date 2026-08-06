@@ -56,6 +56,120 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-08-06 — 在非 root 设备保留原签名并以 ClassLoader generation 替换 SO
+
+**Task**
+
+让已安装且自身 debuggable 的 APK 在 production user / 无 `su` 设备上复用原签名与安装数据，直接消费
+app-private 新 SO；不修改引擎、项目源码、APK 或 `/data/app`。
+
+**Implemented**
+
+- `ue_android_so_deploy.ps1` 在 root 不可用时验证 package `DEBUGGABLE`、`run-as` app UID、
+  `--attach-agent-bind`、API 34、设备 ABI 与 app `primaryCpuAbi=arm64-v8a`；源 SO 同时校验
+  ELF64/AArch64 与 `DT_SONAME=libUE4.so`。
+- `ue_android_so_agent.c` 以 startup JVMTI `ClassPrepare` 找到原本精确解析到 installed `libUE4.so` 的
+  app ClassLoader，调用 `addNativePath` 并把新增 native path element 移到首位；原项目
+  `System.loadLibrary("UE4")` 仍走 ART nativeLoad、原 linker namespace 与正常 `JNI_OnLoad` 路径。
+- 非 root 发布改为唯一 generation：SO、agent 与 hash manifest 全部验证后才原子切换 `current` pointer；
+  `ul` 会实际复算两个文件 hash。manifest 记录 installed versionCode 及 APK lastUpdateTime/path/stat 摘要，
+  同 versionCode 重装或 APK 文件身份变化也会在启动前拒绝。
+- `uq` 与 `ul` 对同一 serial/package 共用 Windows OS mutex；并发操作直接拒绝，异常进程退出后不留锁文件。
+- `ue_android_so_launch.ps1` 只在工具目录完全不存在时走普通 APK 启动；partial generation、损坏 manifest
+  或 baseline 漂移一律 fail closed。attach 后失败会 force-stop 并有界确认错误进程已退出。
+- agent/host 都解析 `/proc/*/maps` pathname 后精确比较（允许 ` (deleted)`），不再用 substring；agent 在
+  私有 SO 映射后继续监控 installed SO。状态改称 `mapped`，不冒充 `JNI_OnLoad` / 引擎初始化已返回。
+- 删除了要求重签/重装的 wrapper baseline 路线和相关入口；运行时代码与 fixture 不保存现场包名、项目名或
+  设备序列号，测试身份全部为虚构值。
+
+**Pitfalls / Gotchas**
+
+- 预先 `dlopen` 私有 SO 不能替代 Android 14 `Runtime.loadLibrary0` 的 ClassLoader 绝对路径解析，也不能
+  代替 ART 的 native-library bookkeeping；晚注册 `NativeMethodBind` 又不会回放 zygote 期已有绑定。
+- “data unchanged” 是不准确表述：该方案会更新工具自有 `code_cache/nvim-ue-so`；准确边界是 APK、签名、
+  `/data/app` 与工具目录之外的既有业务数据不变。
+- 修正上一条日志中“production user build 只能 root”的过度结论：设备全局不可调试不等于已安装 APK
+  不可调试；现有 APK 自带 `DEBUGGABLE` 且具备 `run-as` / attach-agent-bind 时存在非 root 官方能力路径。
+
+**Validation**
+
+- PowerShell 5.1：startup-agent、root transport、run-as transport 三个 fixture 全部通过；额外独立实验
+  证明同名 OS mutex 能跨两个 PowerShell 进程互斥。
+- `ue_api` 55/55 passed；`openspec validate android-so-quick-deploy --type spec --strict` passed。
+- agent 以 NDK clang `-std=c11 -Wall -Wextra -Werror` 成功交叉编译；`llvm-readelf` 证明产物为
+  ELF64/AArch64、SONAME `libnvim_ue_so_agent.so`，依赖仅 `libdl` / `liblog` / `libc`。
+- 唯一允许测试的已连接设备只执行显式 serial 的只读 preflight：确认 Android 14/API34、arm64、
+  debuggable `run-as` 与 attach-agent-bind transport，输出 `no device state was changed`。
+- 全量 `nvim --headless -l tests/run.lua`：727/727 passed。
+
+**Follow-ups**
+
+- 设备仍在使用，本轮没有执行真实 `uq` staging、force-stop 或 `ul` 启动；最终端到端 maps / 引擎存活证据
+  留待设备可动时，只能在用户指定的唯一 serial 上执行。
+
+### 2026-08-06 — 按设备能力选择 Android SO root transport
+
+**Task**
+
+修复 `<Space>uq` 把 root 执行写死为 `su 0`，导致无 `su` 设备在部署前抛出底层 shell 错误的问题。
+
+**Implemented**
+
+- `scripts/ue_android_so_deploy.ps1` 新增 `Resolve-RootTransport`：先验证 direct `adb shell id -u`，再验证 `su 0 id -u`，只接受明确返回 UID 0 的 transport。
+- 新增 `Invoke-AdbRoot`，stat/test/mkdir/cp/chown/chmod/chcon/mv/sha256sum/rm 与回滚全部统一路由，不再各自写死 `su 0`。
+- 两种 root transport 都不可用时，在 force-stop、strip、push、备份和替换前失败；错误包含 shell UID、build type、`ro.debuggable` 与 `:UESetAndroidDevice` 指引。
+- `root_transport_spec.ps1` 覆盖 root adbd、verified `su 0`、production user build 无 root 三条路径，并验证无 root 路径只执行四条只读 probe。
+- 同步 Android SO 主规格、架构边界与 K47 教训；没有修改引擎或项目源码。
+
+**Pitfalls / Gotchas**
+
+- “设备支持 root”不能等价成“设备存在 `su 0`”：engineering/root-adbd 设备不需要 `su`，production user build 则可能两者都没有。
+- 当前所选设备实测为 shell UID 2000、`build_type=user`、`ro.debuggable=0` 且无 `su`；该设备不能执行原地 SO 替换，脚本修复只能准确拒绝，不能凭配置绕过 Android 权限模型。
+
+**Validation**
+
+- 回归先以 `ue_api` 52/53 失败复现缺少 root transport abstraction；实现后 53/53 passed。
+- `structure` 38/38 passed；全量 `nvim --headless -l tests/run.lua` 725/725 passed。
+- `openspec validate android-so-quick-deploy --type spec --strict` passed。
+- 当前设备只读实测：`id -u=2000`、`build_type=user`、`ro.debuggable=0`、`command -v su` 失败。
+- 以当前设备执行部署 preflight：在任何 installed SO 修改前返回新的 root-unavailable 证据错误。
+
+**Follow-ups**
+
+- 要在该设备使用 `<Space>uq`，必须先让设备本身提供 root adbd / `su 0`，或通过 `:UESetAndroidDevice` 选择 rooted test device；production user build 不能由本脚本提升权限。
+
+### 2026-08-05 — 让头文件声明继续解析唯一的跨 TU 定义
+
+**Task**
+
+修复 C++ `gd` 到达 `SubmitActiveCmdBuffer` 头文件声明后原地终止的问题，同时保持 compiler identity 是唯一跳转依据。
+
+**Implemented**
+
+- `lua/utils/lsp_fallback.lua` 在 libclang 只能看到 declaration 时，以同一精确光标请求 clangd `symbolInfo`；只有 clangd USR 与 sidecar canonical USR 完全相等，才继续请求跨 TU definition。
+- `lua/utils/ue_goto/provider.lua` 把返回该 USR 的 clangd client id 一并交给 definition 请求；未通过身份校验的其他 LSP client 不能贡献 location。
+- definition location 先去重，再排除原 declaration 与当前位置；仅剩唯一 location 时才跳转。USR 缺失/不一致、零个或多个 definition 都保持当前位置，不按名称、arity 或返回顺序猜选。
+- 从其他头文件调用点出发时，跨 TU 定义不可证明仍可退到 libclang 已证明同一 USR 的 declaration；已经位于该 declaration 时不制造自跳。
+- `tests/fixtures/cpp_semantic/caller.cpp` 建立“origin TU 只含声明、body 位于另一 TU”的真实 libclang fixture；`ue_goto_behavior_spec.lua` 覆盖 USR 相等、USR 不一致、只回声明和多 definition 四条分支。
+- 同步 C++ contextual navigation 主规格与符号解析架构文档；没有修改引擎或项目源码。
+
+**Pitfalls / Gotchas**
+
+- `clang_getCursorDefinition` 只在当前 origin TU AST 中找 definition；canonical USR 已解析成功不代表另一 `.cpp` TU 的 out-of-line body 会出现在该 AST。
+- 直接信任 clangd 跨 TU index 会重新引入上下文漂移风险；libclang/clangd 的精确 USR 相等是跨 provider 交接的必要门禁。
+
+**Validation**
+
+- 两条回归均先失败：旧 header 路径完全没有发出 clangd USR/definition 请求，旧 provider 也会接收未校验 client 的 location；最终 `ue_goto_behavior` 4/4 passed。
+- 真实 libclang fixture：`cpp_semantic_sidecar` 10/10 passed，并证明 declaration-only origin TU 返回非空 canonical USR、合法 declaration 与 `definition=nil`。
+- `cpp_semantic_context` 10/10、`cpp_semantic_client` 10/10、`utils` 44/44、`structure` 38/38 passed。
+- `nvim --headless -l tests/run.lua`：724/724 passed。
+- `openspec validate cpp-contextual-definition-navigation --type spec --strict`：valid。
+
+**Follow-ups**
+
+- 当前已打开的 Neovim 会话需执行一次 `:UEDefReload`（revision `contextual-clang-v2`）或重启后再在 line 419 实测；实现不会触碰 Android 设备。
+
 ### 2026-08-05 — 分离 Android 安装、SO 替换与显式启动
 
 **Task**

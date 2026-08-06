@@ -4,10 +4,11 @@
 --
 -- C/C++ is an isolated semantic-authority path. Source TUs must be proven by
 -- the active compilation database before one precise clangd request is
--- accepted; its location must agree with the libclang-owned USR target.
--- Headers are evaluated by libclang inside an inherited or build-proven
--- source TU. No C++ result is selected by symbol cache, arity, ranking,
--- csearch, GTAGS, workspace symbol, or first-candidate ordering.
+-- accepted. Headers are evaluated by libclang inside an inherited or
+-- build-proven source TU; a cross-TU clangd definition is accepted only when
+-- clangd exposes the exact same canonical USR as libclang. No C++ result is
+-- selected by symbol cache, arity, ranking, csearch, GTAGS, workspace symbol,
+-- or first-candidate ordering.
 --
 -- The legacy cache -> LSP -> csearch -> GTAGS chain below is retained only
 -- for non-C++ compatibility and explicit reference/search surfaces.
@@ -41,7 +42,7 @@ local CSEARCH_TIMEOUT_MS     = 4000
 -- ---------------------------------------------------------------------------
 -- Persistent debug ring-buffer.
 -- ---------------------------------------------------------------------------
-local MODULE_REVISION = "contextual-clang-v1"
+local MODULE_REVISION = "contextual-clang-v2"
 local TRACE_MAX = 200
 local trace_ring = {}
 local trace_idx = 0
@@ -268,10 +269,26 @@ local function semantic_location(value)
   }
 end
 
-local function semantic_target(response)
-  if type(response) ~= "table" then return nil end
-  return semantic_location(response.definition)
-    or semantic_location(response.declaration)
+local function location_is_on_line(location, path, line)
+  if not location or not path or not line then return false end
+  local target_path = location_mod.normalize_path(
+    location_mod.location_path(location)):lower()
+  return target_path == location_mod.normalize_path(path):lower()
+    and location_mod.location_line(location) == line
+end
+
+local function without_semantic_declaration(locations, declaration, ref_file, ref_line)
+  local declaration_path = declaration and location_mod.location_path(declaration) or nil
+  local declaration_line = declaration and location_mod.location_line(declaration) or nil
+  local out = {}
+  for _, location in ipairs(locations or {}) do
+    if not location_is_on_line(location, ref_file, ref_line)
+      and not location_is_on_line(location, declaration_path, declaration_line)
+    then
+      out[#out + 1] = location
+    end
+  end
+  return out
 end
 
 local function semantic_terminal_notice(sym, status, reason)
@@ -319,16 +336,89 @@ local function cpp_definition(sym, bufnr, ref_file, ext)
         return
       end
       if response.state ~= "resolved" then return end
-      local target = semantic_target(response)
-      if not target then
+      local definition = semantic_location(response.definition)
+      local declaration = semantic_location(response.declaration)
+      if definition then
+        if jump_to_location(definition) then
+          vim.notify(format_jump_msg(sym, definition, "libclang·USR"), vim.log.levels.INFO,
+            { title = "C++ definition", timeout = 3000 })
+        end
+        return
+      end
+      if not declaration then
         semantic_terminal_notice(sym, "invalid-semantic-context",
           "resolved response has no location")
         return
       end
-      if jump_to_location(target) then
-        vim.notify(format_jump_msg(sym, target, "libclang·USR"), vim.log.levels.INFO,
-          { title = "C++ definition", timeout = 3000 })
+
+      local function declaration_or_notice(status, reason)
+        if not location_is_on_line(declaration, ref_file, snapshot.cursor[1])
+          and jump_to_location(declaration)
+        then
+          dtrace("semantic provider=libclang usr=%s state=resolved target=declaration",
+            tostring(response.usr or "?"))
+          vim.notify(format_jump_msg(sym, declaration, "libclang·declaration"),
+            vim.log.levels.INFO, { title = "C++ definition", timeout = 3000 })
+          return
+        end
+        semantic_terminal_notice(sym, status, reason)
       end
+
+      local authoritative_usr = response.usr
+      if type(authoritative_usr) ~= "string" or authoritative_usr == "" then
+        declaration_or_notice("invalid-semantic-context",
+          "libclang resolved a declaration without a canonical USR")
+        return
+      end
+
+      -- clang_getCursorDefinition only searches the origin TU AST.  An
+      -- out-of-line body in another TU is therefore absent even though the
+      -- declaration's canonical identity is known.  clangd owns the project
+      -- index, so it may supply the cross-TU location, but only after its
+      -- exact-cursor USR proves it is talking about the same entity.
+      dtrace("semantic provider=clangd request=symbolInfo context=header-cross-tu usr=%s",
+        authoritative_usr)
+      provider.async_clangd_symbol_info(bufnr, function(clangd_usr, clangd_client_ids)
+        local identity_current, identity_stale = semantic.snapshot_is_current(snapshot)
+        if not identity_current then
+          dtrace("semantic provider=clangd state=stale reason=%s", identity_stale)
+          return
+        end
+        if clangd_usr ~= authoritative_usr then
+          dtrace("semantic provider=clangd state=invalid-semantic-context usr-mismatch=%s/%s",
+            tostring(authoritative_usr), tostring(clangd_usr))
+          declaration_or_notice("invalid-semantic-context",
+            clangd_usr and "clangd and libclang disagree on the canonical USR"
+              or "clangd did not expose one compiler-owned USR for this declaration")
+          return
+        end
+
+        provider.async_lsp_request(bufnr, "textDocument/definition", function(locations)
+          local still_current, reason = semantic.snapshot_is_current(snapshot)
+          if not still_current then
+            dtrace("semantic provider=clangd state=stale reason=%s", reason)
+            return
+          end
+          locations = location_mod.dedup_locations(locations or {})
+          locations = without_semantic_declaration(
+            locations, declaration, ref_file, snapshot.cursor[1])
+          if #locations ~= 1 then
+            dtrace("semantic provider=clangd state=invalid-semantic-context n=%d usr=%s",
+              #locations, authoritative_usr)
+            declaration_or_notice("unavailable",
+              #locations == 0 and "no cross-TU definition exists in the clangd index"
+                or ("clangd returned " .. tostring(#locations)
+                  .. " cross-TU definitions for the same USR"))
+            return
+          end
+          if jump_to_location(locations[1]) then
+            dtrace("semantic provider=clangd usr=%s state=resolved target=cross-tu-definition",
+              authoritative_usr)
+            vim.notify(format_jump_msg(sym, locations[1], "clangd·USR-verified"),
+              vim.log.levels.INFO, { title = "C++ definition", timeout = 3000 })
+          end
+        end, { client_ids = clangd_client_ids })
+      end)
     end)
     return
   end
@@ -360,7 +450,7 @@ local function cpp_definition(sym, bufnr, ref_file, ext)
     end
     dtrace("semantic provider=clangd request=symbolInfo+definition context=%s",
       tostring(proof.context_id or "?"))
-    provider.async_clangd_symbol_info(bufnr, function(usr)
+    provider.async_clangd_symbol_info(bufnr, function(usr, clangd_client_ids)
       local identity_current, identity_stale = semantic.snapshot_is_current(snapshot)
       if not identity_current then
         dtrace("semantic provider=clangd state=stale reason=%s", identity_stale)
@@ -400,7 +490,7 @@ local function cpp_definition(sym, bufnr, ref_file, ext)
         vim.notify(format_jump_msg(sym, locs[1], "clangd·semantic"), vim.log.levels.INFO,
           { title = "C++ definition", timeout = 3000 })
       end
-      end)
+      end, { client_ids = clangd_client_ids })
     end)
   end)
 end

@@ -1,7 +1,7 @@
 # Lessons · 平台怪癖与调试硬知识
 
 > **lessons/** 区：付出过真实调试成本的陷阱与硬知识。
-> 出处优先：权威踩坑清单在 `docs/CONSTRAINTS.md §二（踩过的坑 K1–K46）`，
+> 出处优先：权威踩坑清单在 `docs/CONSTRAINTS.md §二（踩过的坑 K1–K49）`，
 > 本文件是**主题导航**，按领域聚合指回出处，不复制原文。
 
 ## 什么属于这里 / 不属于这里
@@ -41,11 +41,16 @@ load-bearing**（K37，`UE_DAP_NO_SLIDE` 开关供其他设备复验；wait-laun
   `2026-06-15-android-dap-live-breakpoints`；ADR `../docs/plans/2026-06-15-android-dap-live-breakpoints.md`；
   证据 `../tools/evidence/android-f9/livebp-*.json`
 
-### Android SO 快速部署（K44–K46）
-SO-only 产物必须与已安装 APK 的 package/versionCode 基线一致（K44）；项目名/Target 必须动态派生，
-不能把具体项目名当目录协议（K45）；APK 安装、SO 文件替换和应用启动必须是三个显式动作，`ui` / `uq`
-不得自动启动或用 PID/maps 再耦合启动时序，运行只由 `ul` 触发（K46）。
-→ `../docs/CONSTRAINTS.md §二 K44–K46`；`../openspec/specs/android-so-quick-deploy/spec.md`
+### Android SO 快速部署（K44–K49）
+SO-only 不能为旧 APK 补出新的 Java/JNI/manifest 产物，versionCode 差异在 root 路径拒绝、app-private
+路径明确警告（K44）；项目名/Target 必须动态派生，不能把具体项目名当目录协议（K45）；APK 安装、SO
+staging 和应用启动必须是显式动作，`ui` / `uq` 不得自动启动，运行时验证只由 `ul` 触发（K46）；
+root transport 先实测 root adbd / `su 0`，均不可用时仍须验证已安装包自身的 debuggable + `run-as` +
+startup-agent 能力（K47）；非 root 不能靠预 `dlopen`/SONAME 猜复用，必须重排 app ClassLoader native
+搜索路径并让原 `System.loadLibrary` 完成 ART/JNI 加载，以唯一 maps 路径为成功证据（K48）；多文件发布
+必须用唯一 generation + 原子 pointer，并以 OS mutex 串行化 `uq`/`ul`，部分 staging 不得静默回落，
+启动必须复算 generation hash 并核对 APK 文件系统身份；maps 必须精确比较 pathname，失败启动必须停进程（K49）。
+→ `../docs/CONSTRAINTS.md §二 K44–K49`；`../openspec/specs/android-so-quick-deploy/spec.md`
 
 ### 工具链 / LLVM（K14–K15、K41）
 LLVM 22.0–22.1.5 的 `lldb-dap.exe` Windows 启动崩（`STATUS_STACK_BUFFER_OVERRUN`）；

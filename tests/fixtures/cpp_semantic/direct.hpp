@@ -3,7 +3,7 @@
 struct Widget {};
 struct Another {};
 
-int pick(Widget value);
+int pick(Widget value); // DECL:pick_widget
 int pick(Another value);
 int zero();
 int with_default(int value, int scale = 2);

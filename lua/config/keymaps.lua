@@ -200,7 +200,10 @@ end
 local function apply_ue_runtime_overrides()
   local opts = { nowait = true }
 
+  map("n", "<leader>uA", "<cmd>UESetAndroidDevice<cr>", vim.tbl_extend("force", opts, { desc = "UE: Select global Android device" }))
   map("n", "<leader>ub", "<cmd>UEBuild<cr>", vim.tbl_extend("force", opts, { desc = "UE: Build (platform from UESetPlatform)" }))
+  map("n", "<leader>us", "<cmd>UEBuildAndroidSO<cr>", vim.tbl_extend("force", opts, { desc = "UE: Build Android SO only (skip APK)" }))
+  map("n", "<leader>uq", "<cmd>UEDeployAndroidSO<cr>", vim.tbl_extend("force", opts, { desc = "UE: Quick deploy Android SO" }))
   map("n", "<leader>ug", "<cmd>UELogToggle<cr>", vim.tbl_extend("force", opts, { desc = "UE: Toggle app log" }))
   map("n", "<leader>ui", "<cmd>UEInstallAndroid<cr>", vim.tbl_extend("force", opts, { desc = "UE: Install APK to device" }))
   map("n", "<leader>ul", "<cmd>UELaunch<cr>", vim.tbl_extend("force", opts, { desc = "UE: Launch app (no debugger)" }))
@@ -209,11 +212,12 @@ local function apply_ue_runtime_overrides()
   map("n", "<leader>uN", "<cmd>NotificationHistory<cr>", vim.tbl_extend("force", opts, { desc = "UI: Notification history" }))
   map("n", "<leader>up", "<cmd>UEPaths<cr>", vim.tbl_extend("force", opts, { desc = "UE: Show paths" }))
   map("n", "<leader>ut", "<cmd>ThemePicker<cr>", vim.tbl_extend("force", opts, { desc = "UI: Theme picker" }))
+  map("n", "<leader>uC", "<cmd>ThemePicker<cr>", vim.tbl_extend("force", opts, { desc = "UI: Theme picker" }))
 end
 
 map("n", "gd", function()
   require("utils.lsp_fallback").definition()
-end, { desc = "Definition (LSP -> GTAGS)" })
+end, { desc = "Definition (contextual C++ / LSP fallback)" })
 
 -- Generic background-task manager (list/stop any registered job). Not under
 -- <leader>u* (that namespace is UE-specific); this is a general editor feature.
@@ -224,13 +228,9 @@ map("n", "<leader>Xs", "<cmd>TaskStop<cr>",    { desc = "Tasks: stop one (auto i
 map("n", "<leader>XA", "<cmd>TaskStopAll<cr>", { desc = "Tasks: stop all (confirms first)", nowait = true })
 
 -- Eagerly load utils.lsp_fallback so its :UEDef* user_commands
--- (UEDefTrace / UEDefSelfTest / UEDefReload) are registered at startup
+-- (UEDefTrace / UEDefSelfTest / UEDefReload / UEDefCancel) are registered at startup
 -- — otherwise they only appear after the first gd. ~5ms cost.
 pcall(require, "utils.lsp_fallback")
-
-vim.keymap.set("n", "<leader>gP", function()
-  require("utils.lsp_fallback").jump_to_precise()
-end, { desc = "Jump to precise definition (after instant jump)" })
 
 vim.api.nvim_create_user_command("UEDefStatus", function()
   require("utils.lsp_fallback").status()
@@ -263,10 +263,12 @@ map("n", "<leader>bc", close_current_target, { desc = "Buffer/Window: Smart clos
 map("n", "<leader>bn", "<cmd>confirm enew<cr>", { desc = "Buffer: New empty buffer" })
 -- Static UE keymaps. Keys that need {nowait=true} are set by
 -- apply_ue_runtime_overrides() on VeryLazy (see below).
+map("n", "<leader>uA", "<cmd>UESetAndroidDevice<cr>", { desc = "UE: Select global Android device" })
 map("n", "<leader>uB", "<cmd>UEPrepare<cr>", { desc = "UE: Prepare symbols + compile_commands" })
 map("n", "<leader>uc", "<cmd>UEExportCompileCommands<cr>", { desc = "UE: Export compile_commands" })
 map("n", "<leader>uP", "<cmd>UESetProject<cr>", { desc = "UE: Set project" })
 map("n", "<leader>ut", "<cmd>ThemePicker<cr>", { desc = "UI: Theme picker" })
+map("n", "<leader>uC", "<cmd>ThemePicker<cr>", { desc = "UI: Theme picker" })
 map("n", "<leader>va", sidebar_pick, { desc = "Sidebar: Choose view" })
 map("n", "<leader>vv", sidebar_toggle(), { desc = "Sidebar: Toggle last view" })
 map("n", "<leader>vb", sidebar_toggle("buffers"), { desc = "Sidebar: Buffers" })

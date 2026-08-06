@@ -11,17 +11,9 @@ $nvim = "C:\Program Files\Neovim\bin\nvim.exe"
 $nvimDir = "<LOCAL_APPDATA>\nvim"
 $scripts = Join-Path $nvimDir "scripts"
 
-# Tests scoped to the syntax-overload-filter branch.
-# (test_jumper_real / test_jumper_headless / test_jumplist_fix / test_dependent_name
-#  / test_tier2_wireup are pre-existing — included to confirm no regression.)
+# Stable legacy jump tests not covered by tests/cases.
 $tests = @(
-  "test_call_arity.lua",
-  "test_declarator_arity.lua",
-  "test_syntax_filter.lua",
-  "test_pair_picker.lua",
-  "test_ranking_sort.lua",
   "test_dependent_name.lua",
-  "test_tier2_wireup.lua",
   "test_jumper_headless.lua"
   # test_jumper_real.lua intentionally excluded — needs running clangd against UEOff.
   # test_jumplist_fix.lua intentionally excluded — needs live nvim instance via socket.

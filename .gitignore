@@ -21,3 +21,6 @@ claude/
 
 # graphify local output (knowledge-graph artifacts, machine-local)
 graphify-out/
+
+# health-scan working output (one-shot audit artifact)
+tools/health_scan_output.txt

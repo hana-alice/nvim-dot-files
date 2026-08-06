@@ -1,7 +1,7 @@
 -- ue_goto.location — pure Location-object utilities.
 --
 -- Stateless. No vim.fn.* (only vim.uri_*, vim.deepcopy, vim.lsp.util
--- for the qf items grouping). Used by ranking, provider, ui.
+-- for quickfix grouping). Used by provider, UI, and semantic navigation.
 --
 -- Vocab:
 --   Location: { uri | targetUri, range | targetRange | targetSelectionRange }

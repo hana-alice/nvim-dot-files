@@ -14,11 +14,13 @@
 | 改动位置 | 最小必跑 filter |
 |---|---|
 | `lua/config/keymaps.lua` / 命令定义 | `keymaps` `commands` |
+| `lua/utils/android_device.lua` / Android ADB device 路由 | `android_device` `dap` `ue_context` |
 | `lua/ue/config.lua`（schema） | `ue_config` `smoke` |
 | `lua/ue.lua` 项目选择 / context 解析 | `ue_project_context` `ue_api` `smoke` |
 | `lua/ue/cdb/**` | `ue_cdb` |
 | `lua/ue/dap/**` / `lua/utils/platform/**` | `dap` `platform` |
-| `lua/utils/ue_goto/**` / `code_search/**` / `ue_paths.lua` | `ue_goto_behavior` `ue_paths` `utils` |
+| `lua/utils/ue_goto/**` / C++ `gd` | `cpp_semantic_context` `cpp_semantic_client` `cpp_semantic_sidecar` `ue_goto_behavior` `utils` |
+| `code_search/**` / `ue_paths.lua` | `ue_goto_behavior` `ue_paths` `utils` |
 | `lua/config/options.lua` / `autocmds.lua` | `options` `autocmds` |
 | `lua/theme.lua` / `lua/highlights.lua` / `colors/**` | `theme` `smoke` |
 | `lua/utils/stall_probe.lua` | `stall_probe` |
@@ -84,6 +86,7 @@ tests/
 ├── harness/init.lua     # 纯 Lua 框架：断言 + describe/it + 报告 + 自举
 └── cases/
     ├── smoke_spec.lua            # 配置加载冒烟 + ue.setup() 命令注册
+    ├── android_device_spec.lua   # Android device picker + 全局 serial + adb -s 路由
     ├── platform_spec.lua         # utils.platform 四驱动接口契约
     ├── ue_api_spec.lua           # ue 公共表/函数冻结
     ├── ue_config_spec.lua        # ue.config schema 默认值/override/reset
@@ -91,13 +94,16 @@ tests/
     ├── dap_spec.lua              # ue.dap.platforms 注册 + 各平台 attach/launch
     ├── utils_spec.lua            # utils.code_search/log/ue_paths/ue_goto 加载
     ├── keymaps_spec.lua          # 快捷键绑定（DAP 功能键多模式 / leader / gd/gr/gc / Win <C-v>）
-    ├── commands_spec.lua         # 69 个 UE* 命令 + Restart/Workaround* 注册（冻结清单）
+    ├── commands_spec.lua         # 70 个 UE* 命令 + Restart/Workaround* 注册（冻结清单）
     ├── options_spec.lua          # expandtab/shiftwidth/number/sessionoptions
     ├── autocmds_spec.lua         # usf→hlsl、cindent 切换、commentstring 回退
     ├── workarounds_spec.lua      # 注册表发现/无 error/frontmatter/status 形状
     ├── fs_proc_spec.lua          # ue.core.fs/proc 纯函数行为
     ├── ue_paths_spec.lua         # utils.ue_paths is_blocked/is_searchable/filter
-    ├── ue_goto_behavior_spec.lua # ranking 排序 / pair_picker 配对 / location 去重
+    ├── cpp_semantic_context_spec.lua # CDB / dependency provenance / context fingerprint
+    ├── cpp_semantic_client_spec.lua  # process manager / stale token / overlay / context lifecycle
+    ├── cpp_semantic_sidecar_spec.lua # NDJSON / libclang USR / overload / dep+rsp+unity
+    ├── ue_goto_behavior_spec.lua # C++ 不缓存/不 fallback + location 去重
     └── stability_spec.lua        # 重复 require/setup 幂等、多轮 reset 无泄漏
 ```
 
@@ -106,6 +112,7 @@ tests/
 | 功能域 | 用例文件 | 覆盖口径 |
 |--------|----------|----------|
 | 配置加载 | smoke_spec | 关键模块 require + setup 不报错 |
+| Android device | android_device_spec | `adb devices -l` 解析、名称+serial picker、全局 serial、install/launch/logcat/DAP `-s` 路由 |
 | 平台驱动 | platform_spec | 四驱动接口形状一致 |
 | ue API | ue_api_spec | 公共表/函数冻结 |
 | ue.config | ue_config_spec | 默认值/override/reset |
@@ -134,7 +141,7 @@ leader 必须先于 `dofile` 设置，否则 `<leader>xx` 会以字面 `<leader>
 
 ### 命令冻结清单维护约定
 
-`commands_spec.lua` 内的 `UE_COMMANDS` 是 69 个 `UE*` 命令的**冻结清单**。新增或重命名 `UE*` 命令时**必须同步**此清单——这是有意的「防误删」契约：清单与实际注册不一致即 FAIL。
+`commands_spec.lua` 内的 `UE_COMMANDS` 是 70 个 `UE*` 命令的**冻结清单**。新增或重命名 `UE*` 命令时**必须同步**此清单——这是有意的「防误删」契约：清单与实际注册不一致即 FAIL。
 
 
 
@@ -193,18 +200,22 @@ leader 必须先于 `dofile` 设置，否则 `<leader>xx` 会以字面 `<leader>
 - `ue` 公共表/函数、`ue.config` schema、平台驱动接口、DAP 平台注册等**契约不被重构误删**。
 - 新增功能时**约定**同步新增 `*_spec.lua`，把覆盖完整性变成开发习惯。
 
-**不覆盖**：需要真机 / adb / 运行中 clangd / 网络的端到端流程（保留在 `tools/` 手动运行）。
+**不覆盖**：需要真机 / adb / active UE workspace / 网络的端到端流程。C++ sidecar 使用本机
+libclang fixture 自动验证；active UE build 的只读验证走 `scripts/ue_cpp_semantic_smoke.lua`。
 
 ## Legacy 脚本旁路
 
-`tests/run.lua` 末尾会 fork 子进程执行 `scripts/test_*.lua` 中**纯 headless 且稳定**的 `ue_goto` 子集：
+`tests/run.lua` 末尾会 fork 子进程执行仍属**纯 headless 且稳定**的 legacy `ue_goto` 脚本：
 
-- 纳入：`test_call_arity`、`test_declarator_arity`、`test_syntax_filter`、`test_pair_picker`、`test_ranking_sort`、`test_jumper_headless`。
-- 排除（需外部资源 / 开发中）：`test_jumper_real`（需 clangd）、`test_jumplist_fix`（需 socket）、`test_tier2_wireup`、`test_dependent_name`。
+- 纳入：`test_jumper_headless`。
+- 已删除：以 arity / syntax filter / ranking / pair winner 选择 C++ overload 的旧脚本；这些行为与
+  compiler-identity authority invariant 冲突。
+- 排除（需外部资源 / 开发中）：`test_jumper_real`（需 clangd）、`test_jumplist_fix`（需 socket）、`test_dependent_name`。
 
 跳过旁路：`NO_LEGACY=1 nvim --headless -l tests/run.lua`。
 
 ## 与旧入口的关系
 
 - `scripts/headless_smoke.lua`：保留为兼容入口，可继续 `nvim --headless -l scripts/headless_smoke.lua` 直接运行；其断言已等价迁入 `tests/cases/ue_*_spec.lua`、`platform_spec.lua`、`dap_spec.lua`。
-- `scripts/run_all_tests.ps1`：遗留的 `ue_goto` 子集编排器，保留不动；新权威入口为 `tests/run.lua` / `scripts/run_regression.ps1`。
+- `scripts/run_all_tests.ps1`：保留的 jumper / dependent-name 便捷入口；新权威入口为
+  `tests/run.lua` / `scripts/run_regression.ps1`。

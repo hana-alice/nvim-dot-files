@@ -55,6 +55,10 @@ Do not ask for confirmation during normal local development unless:
 
 进入本仓、**动任何代码之前**，按序读完以下文件——这是强制前置步骤，不是建议：
 
+0. **探针反馈**（`openspec/specs/probe-feedback-loop/spec.md` 第一条 requirement）：
+   读 `stdpath('state')/ue_probes.json`（或 nvim 内 `:UEProbeReport`）。存在失败类
+   证据时，**处置它（修复 / 立 change / 记录不处理理由）先于任何新工作**。
+   探针由已落地改动主动埋设（`lua/utils/probe.lua`），不等用户反馈。
 1. [`docs/CONSTRAINTS.md`](docs/CONSTRAINTS.md) — 禁止 / 踩过的坑 / 约束（权威索引）。
 2. [`memory/project_overview.md`](memory/project_overview.md) — 项目总览 + 子系统速查 + 知识库导航。
 3. **当前改动目录的本地规则** — 每个主要目录一份 `AGENTS.md`（单一内容源）+ 一个

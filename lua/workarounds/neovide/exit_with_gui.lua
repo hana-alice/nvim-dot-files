@@ -134,7 +134,11 @@ function M.apply()
   -- Belt-and-suspenders: also poll every 2s. UILeave should be enough
   -- on a clean disconnect, but if Neovide crashes (Skia GPU error etc.)
   -- the channel can vanish without a clean event. Polling catches that.
+  -- Handle kept on M so disable() can stop it (F7, health-check 2026-07:
+  -- previously the timer was a local — disable() removed the augroup but
+  -- the poll kept running forever).
   local timer = (vim.uv or vim.loop).new_timer()
+  M._poll_timer = timer
   timer:start(2000, 2000, function()
     vim.schedule(function()
       if not watched_chan then
@@ -154,6 +158,11 @@ end
 
 function M.disable()
   pcall(vim.api.nvim_del_augroup_by_name, AUGROUP_NAME)
+  if M._poll_timer then
+    pcall(function() M._poll_timer:stop() end)
+    pcall(function() M._poll_timer:close() end)
+    M._poll_timer = nil
+  end
 end
 
 function M.status()

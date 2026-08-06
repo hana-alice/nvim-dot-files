@@ -18,6 +18,13 @@
 -- 抑制 LazyVim 的 stdin 启动路径（与 headless_smoke.lua 一致）。
 vim.g.started_with_stdin = true
 
+-- 回归中的 probe 调用必须写入临时隔离文件，绝不能污染真实的
+-- stdpath('state')/ue_probes.json。probe.lua 也会在测试 seam 切换时取消
+-- 尚未触发的防抖 timer，避免旧测试 payload 延迟写到新路径。
+local probe_test_dir = vim.fn.tempname():gsub("\\", "/")
+vim.fn.mkdir(probe_test_dir, "p")
+vim.env.NVIM_UE_PROBE_PATH = probe_test_dir .. "/ue_probes.json"
+
 -- 自举：require("tests.harness") 之前必须先把配置根目录挂上 rtp/package.path，
 -- 否则 tests.* / ue / utils.* 均无法解析。这里手工做一次最小自举，
 -- 拿到 harness 后由它统一负责后续 require 的解析。
@@ -99,15 +106,9 @@ end
 -- 改为各自 fork 一个 nvim --headless 子进程，用其退出码判定 PASS/FAIL。
 --   * 仅纳入纯 headless（无需 clangd / socket / 真机）且当前稳定通过的脚本，
 --     与 scripts/run_all_tests.ps1 的排除逻辑保持一致；
---   * 需要外部资源或仍在开发中的脚本（test_jumper_real / test_jumplist_fix /
---     test_tier2_wireup / test_dependent_name）显式排除。
+--   * 需要外部资源的脚本（test_jumper_real / test_jumplist_fix）显式排除。
 -- 通过环境变量 NO_LEGACY=1 可跳过本旁路（CI 上若担心子进程开销）。
 local LEGACY_STABLE = {
-  "test_call_arity.lua",
-  "test_declarator_arity.lua",
-  "test_syntax_filter.lua",
-  "test_pair_picker.lua",
-  "test_ranking_sort.lua",
   "test_jumper_headless.lua",
 }
 
@@ -139,6 +140,13 @@ local function run_legacy()
 end
 
 run_legacy()
+
+vim.api.nvim_create_autocmd("VimLeavePre", {
+  once = true,
+  callback = function()
+    pcall(vim.fn.delete, probe_test_dir, "rf")
+  end,
+})
 
 -- ── 汇总并退出（quit / cquit 1）──────────────────────────────────────────
 harness.run()

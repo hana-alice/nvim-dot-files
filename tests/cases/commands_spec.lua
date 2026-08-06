@@ -5,9 +5,9 @@
 local t = require("tests.harness")
 local cfg = t.bootstrap()
 
--- 69 个 UE* 命令冻结清单（来自 lua/ue.lua + lua/ue/*.lua）。
+-- 72 个 UE* 命令冻结清单（来自 lua/ue.lua + lua/ue/*.lua）。
 local UE_COMMANDS = {
-  "UEBuild", "UEBuildAndroid", "UEBuildPCH", "UECachePaths", "UECDBPartition",
+  "UEBuild", "UEBuildAndroid", "UEBuildAndroidSO", "UEBuildPCH", "UECachePaths", "UECDBPartition",
   "UECDBStatus", "UECDBSwitch", "UECheatsheet", "UECheatsheetEdit", "UEClearCache",
   "UEDAPAttach", "UEDAPClearBreakpoints", "UEDAPCondBreakpoint", "UEDAPContinue",
   "UEDAPDiag", "UEDAPEval", "UEDAPFrameDown", "UEDAPFrameUp", "UEDAPHover",
@@ -16,19 +16,19 @@ local UE_COMMANDS = {
   "UEDAPRunToCursor", "UEDAPStatus", "UEDAPStepIn", "UEDAPStepOut", "UEDAPStepOver",
   "UEDAPStop", "UEDAPTab", "UEDAPToggleBreakpoint", "UEDAPToggleUI", "UEDAPWatchAdd",
   "UEDAPWatchUE", "UEDebugLogToggle", "UEDirtyClear", "UEDirtyStatus",
-  "UEExportCompileCommands", "UEGenerateFromRSP", "UEGrepDiagDump",
+  "UEDeployAndroidSO", "UEExportCompileCommands", "UEGenerateFromRSP", "UEGrepDiagDump",
   "UEGrepGroupingToggle", "UEGrepTraceShow", "UEGrepTraceToggle", "UEIndexFull",
   "UEIndexHot", "UEIndexNow", "UEIndexStatus", "UEIndexTimings", "UEInstallAndroid",
   "UELaunch", "UELogToggle", "UEPaths", "UEPrepare", "UEPrepareIncremental",
-  "UEPrepareReindex", "UEPrepareSync", "UEResetLayout", "UESetAndroidPackage",
-  "UESetPlatform", "UESetProject", "UESetUprojectRelativePath", "UEWatchFlush",
+  "UEPrepareReindex", "UEPrepareSync", "UEResetLayout", "UESetAndroidDevice",
+  "UESetAndroidPackage", "UESetPlatform", "UESetProject", "UESetUprojectRelativePath", "UEWatchFlush",
   "UEWatchStatus", "UEWatchStop",
 }
 
 t.describe("commands: UE* 全量注册", function()
   require("ue").setup()
-  t.it("冻结清单含 69 个命令", function()
-    t.assert_eq(#UE_COMMANDS, 69)
+  t.it("冻结清单含 72 个命令", function()
+    t.assert_eq(#UE_COMMANDS, 72)
   end)
   for _, c in ipairs(UE_COMMANDS) do
     t.it(":" .. c .. " 已注册", function()
@@ -62,7 +62,10 @@ t.describe("commands: 辅助命令（keymaps.lua 注册）", function()
   require("ue").setup()
   require("utils.log").install_commands()
   pcall(dofile, cfg .. "/lua/config/keymaps.lua")
-  for _, c in ipairs({ "Restart", "RestartDetect", "UEDefStatus", "NotificationHistory", "NotificationHistoryClear" }) do
+  for _, c in ipairs({
+    "Restart", "RestartDetect", "UEDefStatus", "UEDefCancel", "UEDefContextClear",
+    "NotificationHistory", "NotificationHistoryClear",
+  }) do
     t.it(":" .. c .. " 已注册", function()
       t.assert_eq(vim.fn.exists(":" .. c), 2, c .. " 未注册")
     end)

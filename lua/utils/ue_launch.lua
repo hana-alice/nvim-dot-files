@@ -1,5 +1,7 @@
 local M = {}
 
+local android_device = require("utils.android_device")
+
 local function project_name_from_uproject(trim, uproject)
   local name = trim(vim.fs.basename(uproject or ""))
   if name == "" then
@@ -177,63 +179,28 @@ local function desktop_launch_spec(env, ctx)
   }
 end
 
-local function adb_connected_devices(run_lines, adb)
-  local code, lines = run_lines({ adb, "devices", "-l" })
-  if code ~= 0 then
-    return {}
+local function android_launch_argv(adb, serial, package_name)
+  local script = vim.fs.joinpath(
+    vim.fn.stdpath("config"), "scripts", "ue_android_so_launch.ps1"
+  )
+  if vim.fn.filereadable(script) ~= 1 then
+    return nil, "Android launch script not found: " .. script
   end
-
-  local devices = {}
-  for _, line in ipairs(lines or {}) do
-    local serial, status, rest = tostring(line):match("^(%S+)%s+(%S+)%s*(.*)$")
-    if serial and status and serial ~= "List" then
-      local model = rest and rest:match("model:(%S+)") or nil
-      devices[#devices + 1] = { serial = serial, status = status, model = model }
-    end
-  end
-  return devices
-end
-
-local function pick_android_serial(env, adb, on_done)
-  local rows = adb_connected_devices(env.run_lines, adb)
-  local ready, not_ready = {}, {}
-  for _, r in ipairs(rows) do
-    if r.status == "device" then ready[#ready + 1] = r
-    else not_ready[#not_ready + 1] = r end
-  end
-
-  if #ready == 0 then
-    if #not_ready > 0 then
-      local parts = {}
-      for _, r in ipairs(not_ready) do
-        local hint = r.status
-        if r.status == "unauthorized" then
-          hint = "unauthorized (tap 'Allow USB debugging' on device)"
-        elseif r.status == "offline" then
-          hint = "offline (try `adb kill-server && adb devices`)"
-        end
-        parts[#parts + 1] = string.format("  %s  %s", r.serial, hint)
-      end
-      return nil, "No ready Android device. Detected:\n" .. table.concat(parts, "\n")
-    end
-    return nil, "No Android device found"
-  end
-
-  if #ready == 1 then
-    on_done(ready[1].serial)
-    return ready[1].serial
-  end
-
-  vim.ui.select(ready, {
-    prompt = "Select Android device for UE launch:",
-    format_item = function(r)
-      if r.model then return ("%s  [%s]"):format(r.serial, r.model) end
-      return r.serial
-    end,
-  }, function(choice)
-    on_done(choice and choice.serial or nil)
-  end)
-  return nil
+  return {
+    "powershell.exe",
+    "-NoLogo",
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    script,
+    "-Adb",
+    adb,
+    "-Serial",
+    serial,
+    "-Package",
+    package_name,
+  }
 end
 
 local function android_launch_command(env, ctx, serial)
@@ -260,18 +227,8 @@ local function android_launch_command(env, ctx, serial)
     return nil, "Android serial is required"
   end
 
-  local cmd = {
-    adb,
-    "-s",
-    serial,
-    "shell",
-    "monkey",
-    "-p",
-    package_name,
-    "-c",
-    "android.intent.category.LAUNCHER",
-    "1",
-  }
+  local cmd, cmd_err = android_launch_argv(adb, serial, package_name)
+  if not cmd then return nil, cmd_err end
 
   return {
     package_name = package_name,
@@ -424,20 +381,11 @@ function M.resolve_spec(env)
 
   local platform = env.target_platform(ctx.engine_root, nil)
   if platform == "Android" then
-    local adb = vim.fn.exepath("adb")
-    adb = adb ~= "" and adb or "adb"
-    local rows = adb_connected_devices(env.run_lines, adb)
-    local ready = {}
-    for _, r in ipairs(rows) do
-      if r.status == "device" then ready[#ready + 1] = r end
+    local serial = android_device.get()
+    if not serial then
+      return nil, "Android device is not selected; run :UESetAndroidDevice"
     end
-    if #ready == 0 then
-      return nil, "No Android device found"
-    end
-    if #ready > 1 then
-      return nil, "Multiple Android devices connected; use :UELaunch to pick one"
-    end
-    local spec, launch_err = android_launch_command(env, ctx, ready[1].serial)
+    local spec, launch_err = android_launch_command(env, ctx, serial)
     if not spec then
       return nil, launch_err
     end
@@ -470,10 +418,7 @@ function M.launch(env)
     end
 
     local function launch_on_serial(serial)
-      if not serial or serial == "" then
-        require("utils.log").notify_error("ue_launch", "No Android device selected")
-        return
-      end
+      if not serial or serial == "" then return end
       local spec, launch_err = android_launch_command(env, ctx, serial)
       if not spec then
         require("utils.log").notify_error("ue_launch", launch_err)
@@ -485,12 +430,10 @@ function M.launch(env)
       end
     end
 
-    local immediate, pick_err = pick_android_serial(env, adb, launch_on_serial)
-    if pick_err then
-      require("utils.log").notify_error("ue_launch", pick_err)
-    elseif immediate then
-      -- pick_android_serial already called launch_on_serial for the one-device case.
-    end
+    android_device.ensure({
+      adb = adb,
+      prompt = "Select Android device for UE launch:",
+    }, launch_on_serial)
     return
   end
 
@@ -513,6 +456,11 @@ function M.launch(env)
     ("Launched %s: %s%s (pid %s)"):format(spec.platform, target, args, detail),
     vim.log.levels.INFO
   )
+end
+
+-- Pure command-shape seam for headless regression (no adb/device required).
+function M._android_launch_argv_for_test(adb, serial, package_name)
+  return android_launch_argv(adb, serial, package_name)
 end
 
 return M

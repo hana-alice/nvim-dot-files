@@ -92,7 +92,6 @@ local tabs = {
           { "<leader>cd",     "Line diagnostics" },
           { "<leader>cl",     "LSP info" },
           { "<leader>ch",     "Switch source / header (clangd)" },
-          { "<leader>gP",     "Switch instant → precise def" },
         },
       },
       {
@@ -203,7 +202,7 @@ local tabs = {
           { "n / N",           "Next / prev match" },
           { "* / #",           "Search word fwd / back" },
           { ":noh",            "Clear search highlight" },
-          { "gd",              "Definition (TS arity filter → LSP → GTAGS → rg)" },
+          { "gd",              "Definition (contextual C++ / LSP fallback)" },
           { "gr",              "References (LSP→GTAGS)" },
           { "gD",              "Declaration" },
           { "gI",              "Implementation" },
@@ -467,8 +466,8 @@ local tabs = {
       {
         title = "Toggles",
         mappings = {
-          { "<leader>ut",   "Theme picker" },
-          { ":Theme <name>","Set + persist theme" },
+          { "<leader>ut/uC", "Theme picker (six themes only)" },
+          { ":Theme <name>", "Ristretto / Rider / Ubuntu / Unokai / Catppuccin / Sonokai Espresso" },
           { "<leader>uf",   "Format on save" },
           { "<leader>uF",   "Force format mode" },
           { "<leader>ud",   "Diagnostics" },
@@ -512,8 +511,11 @@ local tabs = {
         title = "Setup & Prepare",
         mappings = {
           { "<leader>uP",    "UESetProject (project + engine)" },
+          { "<leader>uA",    "Select Android device (name + serial)" },
           { ":UESetPlatform","Select platform + config" },
           { "<leader>ub",    "UEBuild (build current platform)" },
+          { "<leader>us",    "Build Android SO only (skip APK)" },
+          { "<leader>uq",    "Deploy Android SO; keep app stopped" },
           { "<leader>uB",    "UEPrepare (CDB + index + clangd)" },
           { ":UEPrepareIncremental", "Prepare dirty files only" },
           { "<leader>uc",    "Export compile_commands" },
@@ -523,7 +525,7 @@ local tabs = {
       {
         title = "Run / Logs",
         mappings = {
-          { "<leader>ui",   "Install APK to device" },
+          { "<leader>ui",   "Install APK; keep app stopped" },
           { "<leader>ul",   "Launch app (no debug)" },
           { "<leader>ug/uL","Toggle app log" },
           { "<leader>uD",   "Toggle Win debug log" },

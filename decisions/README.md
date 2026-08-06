@@ -30,8 +30,14 @@
 
 | ADR | 主题 | 出处 |
 |---|---|---|
-| 即时 goto 架构 | 5 层 fallback 解析栈 | `docs/plans/2026-04-17-instant-goto-architecture.md` |
-| 语法重载消歧 | 同名重载的语法过滤 | `docs/plans/2026-04-20-syntax-overload-disambiguation.md` |
+| 即时 goto 架构（历史，C++ 路径已取代） | 旧 5 层 fallback 解析栈 | `docs/plans/2026-04-17-instant-goto-architecture.md` |
+| 语法重载消歧（历史，已证伪） | 旧同名重载语法过滤 | `docs/plans/2026-04-20-syntax-overload-disambiguation.md` |
+
+### C++ 语义导航（2026-08）
+
+| ADR | 主题 | 出处 |
+|---|---|---|
+| Contextual Clang definition authority | source exact-cursor USR；header proven origin TU + libclang sidecar；删除 symbol/arity/ranking 猜测 | `openspec/changes/archive/2026-08-05-replace-cpp-goto-with-contextual-clang-resolution/design.md` |
 
 ### 迭代日志（先读这个看「改了什么 + 为什么」）
 

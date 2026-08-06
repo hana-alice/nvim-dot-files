@@ -1,7 +1,7 @@
 # Lessons · 平台怪癖与调试硬知识
 
 > **lessons/** 区：付出过真实调试成本的陷阱与硬知识。
-> 出处优先：权威踩坑清单在 `docs/CONSTRAINTS.md §二（踩过的坑 K1–K41）`，
+> 出处优先：权威踩坑清单在 `docs/CONSTRAINTS.md §二（踩过的坑 K1–K49）`，
 > 本文件是**主题导航**，按领域聚合指回出处，不复制原文。
 
 ## 什么属于这里 / 不属于这里
@@ -41,6 +41,17 @@ load-bearing**（K37，`UE_DAP_NO_SLIDE` 开关供其他设备复验；wait-laun
   `2026-06-15-android-dap-live-breakpoints`；ADR `../docs/plans/2026-06-15-android-dap-live-breakpoints.md`；
   证据 `../tools/evidence/android-f9/livebp-*.json`
 
+### Android SO 快速部署（K44–K49）
+SO-only 不能为旧 APK 补出新的 Java/JNI/manifest 产物，versionCode 差异在 root 路径拒绝、app-private
+路径明确警告（K44）；项目名/Target 必须动态派生，不能把具体项目名当目录协议（K45）；APK 安装、SO
+staging 和应用启动必须是显式动作，`ui` / `uq` 不得自动启动，运行时验证只由 `ul` 触发（K46）；
+root transport 先实测 root adbd / `su 0`，均不可用时仍须验证已安装包自身的 debuggable + `run-as` +
+startup-agent 能力（K47）；非 root 不能靠预 `dlopen`/SONAME 猜复用，必须重排 app ClassLoader native
+搜索路径并让原 `System.loadLibrary` 完成 ART/JNI 加载，以唯一 maps 路径为成功证据（K48）；多文件发布
+必须用唯一 generation + 原子 pointer，并以 OS mutex 串行化 `uq`/`ul`，部分 staging 不得静默回落，
+启动必须复算 generation hash 并核对 APK 文件系统身份；maps 必须精确比较 pathname，失败启动必须停进程（K49）。
+→ `../docs/CONSTRAINTS.md §二 K44–K49`；`../openspec/specs/android-so-quick-deploy/spec.md`
+
 ### 工具链 / LLVM（K14–K15、K41）
 LLVM 22.0–22.1.5 的 `lldb-dap.exe` Windows 启动崩（`STATUS_STACK_BUFFER_OVERRUN`）；
 适配器迁移弧线（lldb-dap 21.1.8 → codelldb 1.12.2 → **LLVM 22.1.6+ lldb-dap forward-only，
@@ -48,15 +59,17 @@ LLVM 22.0–22.1.5 的 `lldb-dap.exe` Windows 启动崩（`STATUS_STACK_BUFFER_O
 吃满 CPU/内存，`sync_dot_clangd` 须 engine+project 双写（K41）。
 → `../docs/CONSTRAINTS.md §二 工具链/LLVM`；`../docs/TOOLING.md`
 
-### snacks / clangd / lazy（K16–K24，活跃 workaround）
+### snacks / clangd / lazy（K16–K24，活跃 workaround；K21 已退役 2026-07-26）
 picker 冷启卡死、projects picker 卡数十秒、str_byteindex 越界、smart picker 死 buffer、
-clangd 非 `file://` URI 刷屏、Lazy float invalid buffer、`q` 关失效 buffer、
-Neovide 残留进程、blink.cmp 换行破坏 undo。
+clangd 非 `file://` URI 刷屏、~~Lazy float invalid buffer~~（上游已修，workaround 删除）、
+`q` 关失效 buffer、Neovide 残留进程、blink.cmp 换行破坏 undo。
 → 各 `lua/workarounds/<scope>/*.lua` frontmatter（权威）；`../docs/CONSTRAINTS.md §二 snacks/clangd/lazy`
 
-### goto-def / cursor（K25）
+### goto-def / cursor（K25、K42）
 跨 buffer 跳转 cursor 漂移；解法砍 snacks.scroll + PreserveBufferView，jumper `_on_reassert` 校正。
-→ `../docs/architecture-symbol-resolution.md §2.7`
+裸 symbol cache、arity filter 与 standalone header parse 均不能证明 C++ overload；唯一合法答案来自
+active build 的 compiler identity，header 必须在 proven origin TU 中求值。
+→ `../docs/CONSTRAINTS.md §二 goto-def / cursor`；`../docs/architecture-symbol-resolution.md`
 
 ### grep 缓存 / csearch 失效（K26–K27）
 负探测被永久缓存 → `<leader>/` 静默走最慢目录遍历搜不全（修：负探测不缓存 + 重探 + 回落可见）；

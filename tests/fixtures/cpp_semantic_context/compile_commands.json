@@ -1,0 +1,40 @@
+[
+  {
+    "directory": "C:/Fixture/build/win64",
+    "file": "C:/Fixture/src/same_arity_value.cpp",
+    "arguments": [
+      "clang++",
+      "-I",
+      "C:/Fixture/include",
+      "-DVALUE_OVERLOAD=1",
+      "C:/Fixture/src/same_arity_value.cpp"
+    ]
+  },
+  {
+    "directory": "C:/Fixture/build/win64",
+    "file": "C:/Fixture/src/same_arity_pointer.cpp",
+    "command": "clang++ -I \"C:/Fixture/include\" -DPOINTER_OVERLOAD=1 \"C:/Fixture/src/same_arity_pointer.cpp\""
+  },
+  {
+    "directory": "C:/Fixture/build/win64",
+    "file": "C:/Fixture/src/solo_context.cpp",
+    "arguments": [
+      "clang++",
+      "-I",
+      "C:/Fixture/include",
+      "-DSOLO_CONTEXT=1",
+      "C:/Fixture/src/solo_context.cpp"
+    ]
+  },
+  {
+    "directory": "C:/Fixture/build/android",
+    "file": "C:/Fixture/Intermediate/Build/Android/Module.Renderer.1_of_2.cpp",
+    "arguments": [
+      "clang++",
+      "--target=aarch64-none-linux-android",
+      "-I",
+      "C:/Fixture/include",
+      "C:/Fixture/Intermediate/Build/Android/Module.Renderer.1_of_2.cpp"
+    ]
+  }
+]

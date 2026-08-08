@@ -101,6 +101,12 @@ t.describe("ue.dap.android: breakpoint preseed", function()
       "setBreakpoints must not silently detach and reattach")
   end)
 
+  t.it("无 active DAP session 的 build preflight 不谎报 adapter 已停止", function()
+    local path = vim.fn.stdpath("config") .. "/lua/ue/dap/android.lua"
+    local text = table.concat(vim.fn.readfile(path), "\n")
+    t.assert_contains(text, "result.adapter_killed = sess_active ~= nil")
+  end)
+
   t.it("K34/3.4: bootstrap does not hardcode a symbol_lib fallback path", function()
     -- A literal symbol_lib short-circuits pick_symbol_lib() (its step 0 returns
     -- any existing ctx path verbatim, skipping the packageInfo versionCode

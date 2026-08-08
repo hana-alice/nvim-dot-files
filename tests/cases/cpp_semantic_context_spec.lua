@@ -264,4 +264,38 @@ t.describe("semantic_context: window selection reuse", function()
     })
     t.assert_nil(sc.reuse_window_selection(selected, changed))
   end)
+
+  t.it("tracks subject membership in lineage and rejects unrelated headers", function()
+    local contexts = sc.proven_contexts_from_cpp_json({
+      project_root = "C:/Fixture",
+      active_build_key = "Win64-Development-Editor",
+      toolchain_identity = "clang-18",
+      compile_db = compile_db(),
+      header = "C:/Fixture/include/SoloHeader.h",
+      records = {
+        { record = read_json("solo_context.cpp.json"), evidence_path = "solo_context.cpp.json" },
+      },
+    })
+
+    local record = assert(sc.make_lineage_record({
+      context = contexts[1],
+      build_fingerprint = "build-a",
+      source_action_token = 17,
+    }))
+    t.assert_eq(record.subject_membership[1], "C:/Fixture/include/SoloHeader.h")
+    local ok_same = sc.context_supports_subject(record, "C:/Fixture/include/SoloHeader.h")
+    local ok_other, reason_other = sc.context_supports_subject(record, "C:/Fixture/include/OtherHeader.h")
+    t.assert_true(ok_same)
+    t.assert_false(ok_other)
+    t.assert_eq(reason_other, "context-not-member")
+    t.assert_nil(sc.reuse_window_selection(sc.remember_window_selection(contexts[1]), contexts,
+      "C:/Fixture/include/OtherHeader.h"))
+
+    local empty_ok, empty_reason = sc.context_supports_subject({
+      origin_tu = "C:/Fixture/src/solo_context.cpp",
+      subject_membership = {},
+    }, "C:/Fixture/include/SoloHeader.h")
+    t.assert_false(empty_ok)
+    t.assert_eq(empty_reason, "subject-membership-unproven")
+  end)
 end)

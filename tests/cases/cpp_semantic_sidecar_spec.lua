@@ -108,6 +108,39 @@ local function build_compile_commands(root)
   return vim.fs.normalize(cdb_path)
 end
 
+local function portable_suffix(root, relative)
+  local tail = (relative:gsub("\\", "/"))
+  if tail == "" then
+    return vim.fs.basename(root)
+  end
+  return table.concat({ vim.fs.basename(root), tail }, "/")
+end
+
+local function write_controlled_cdb(root, name, members, files)
+  local cdb_path = vim.fs.normalize(root .. "/" .. name)
+  local entries = {}
+  for _, file in ipairs(files) do
+    local absolute = vim.fs.normalize(root .. "/" .. file.name)
+    local args = { "clang++", "-std=c++20" }
+    for _, arg in ipairs(file.extra_args or {}) do
+      args[#args + 1] = arg
+    end
+    args[#args + 1] = "-c"
+    args[#args + 1] = absolute
+    entries[#entries + 1] = {
+      directory = vim.fs.normalize(root),
+      file = absolute,
+      arguments = args,
+      nvim_ue_module_root = portable_suffix(root, ""),
+      nvim_ue_members = vim.tbl_map(function(member)
+        return portable_suffix(root, member)
+      end, members),
+    }
+  end
+  assert(vim.fn.writefile({ vim.json.encode(entries) }, cdb_path) == 0)
+  return cdb_path
+end
+
 local function with_temp_fixture(fn)
   local tmp = vim.fs.normalize(vim.fn.tempname())
   assert(vim.fn.mkdir(tmp, "p") == 1)
@@ -140,6 +173,56 @@ t.describe("semantic_protocol", function()
     local ok, err = protocol.validate_request({ v = protocol.VERSION, op = "query" })
     t.assert_false(ok)
     t.assert_contains(err, "request.id")
+  end)
+
+  t.it("accepts lookup-definition request/response and validates handshake ops", function()
+    local request_ok, request_err = protocol.validate_request({
+      v = protocol.VERSION,
+      id = "lookup-1",
+      op = "lookup-definition",
+      usr = "c:@F@target#",
+      subject = "D:/fixture/source.cpp",
+      cdb_paths = { "D:/fixture/current/compile_commands.json" },
+      document_version = 3,
+      overlays = {
+        { path = "D:/fixture/source.cpp", contents = "int main();\n", version = 3 },
+      },
+    })
+    t.assert_true(request_ok, tostring(request_err))
+
+    local response_ok, response_err = protocol.validate_response({
+      v = protocol.VERSION,
+      id = "lookup-1",
+      op = "lookup-definition",
+      ok = true,
+      state = "resolved",
+      declaration = { path = "D:/fixture/header.hpp", line = 8, column = 3 },
+      definition = { path = "D:/fixture/source.cpp", line = 42, column = 1 },
+      metrics = {},
+    })
+    t.assert_true(response_ok, tostring(response_err))
+
+    local handshake_ok, handshake_err = protocol.validate_response({
+      v = protocol.VERSION,
+      id = "hello",
+      op = "handshake",
+      ok = true,
+      capabilities = {
+        query_states = { "resolved", "unavailable" },
+        ops = { "handshake", "lookup-definition", "query", "shutdown" },
+      },
+    })
+    t.assert_true(handshake_ok, tostring(handshake_err))
+
+    local bad_handshake_ok, bad_handshake_err = protocol.validate_response({
+      v = protocol.VERSION,
+      id = "hello",
+      op = "handshake",
+      ok = true,
+      capabilities = { ops = { "handshake", "bogus-op" } },
+    })
+    t.assert_false(bad_handshake_ok)
+    t.assert_contains(bad_handshake_err, "invalid op")
   end)
 
   t.it("recovers after invalid NDJSON input", function()
@@ -404,6 +487,8 @@ t.describe("semantic sidecar integration", function()
       t.assert_eq(source.state, "resolved")
       t.assert_true(source.definition.path:find("direct.cpp", 1, true) ~= nil)
       t.assert_true(source.declaration.path:find("direct.hpp", 1, true) ~= nil)
+      t.assert_eq(source.cursor_role, "reference")
+      t.assert_eq(source.canonical_identity.usr, source.usr)
       t.assert_true(source.metrics.cold_parse_ms >= 0)
       t.assert_true(type(source.metrics.compile_command_fingerprints[1]) == "string")
       t.assert_true(source.metrics.compile_commands == nil,
@@ -463,13 +548,25 @@ t.describe("semantic sidecar integration", function()
         { id = "template-generic", query = "QUERY:template_generic", token = "templated", def = "DEF:templated_generic", def_file = "direct.hpp" },
         { id = "adl", query = "QUERY:adl", token = "adl_pick", def = "DEF:adl_pick" },
         { id = "inherited", query = "QUERY:inherited", token = "inherited", def = "DEF:inherited" },
+        { id = "virtual-derived", query = "QUERY:virtual_derived_static", token = "dyn_pick", def = "DEF:virtual_derived" },
+        { id = "virtual-base", query = "QUERY:virtual_base_static", token = "dyn_pick", def = "DEF:virtual_base" },
         { id = "same-arity-widget", query = "QUERY:source_pick", token = "pick", def = "int pick(Widget value) {" },
+        { id = "type-alias", query = "QUERY:type_alias", token = "WidgetAlias", def = "DEF:widget_alias", def_file = "direct.hpp" },
+        { id = "constructor", query = "QUERY:constructor", token = "Entity", def = "DEF:entity_ctor" },
+        { id = "field", query = "QUERY:field", token = "field", def = "DEF:entity_field", def_file = "direct.hpp" },
+        { id = "variable", query = "QUERY:variable", token = "global_value", def = "DEF:global_value" },
+        { id = "enum-member", query = "QUERY:enum_member", token = "Red", def = "DEF:enum_red", def_file = "direct.hpp" },
+        { id = "namespace-alias", query = "QUERY:namespace_alias", token = "fixture_alias", def = "DEF:namespace_target", def_file = "direct.hpp", def_token = "fixture_alias_target" },
+        { id = "macro", query = "QUERY:macro", token = "FIXTURE_SCALE", def = "DEF:macro_scale", def_file = "direct.hpp" },
+        { id = "template-specialization", query = "QUERY:template_specialization", token = "identity", def = "DEF:identity_widget_specialization", def_file = "direct.hpp" },
+        { id = "operator", query = "QUERY:operator", token = "+ 3", def = "DEF:entity_plus", def_token = "operator+" },
+        { id = "destructor", query = "QUERY:destructor", token = "~Entity", def = "DEF:entity_dtor", def_token = "~Entity" },
       }
       local by_id = {}
       for _, case in ipairs(cases) do
         local query = find_marker_position(root .. "/direct.cpp", case.query, case.token)
         local def_file = case.def_file or "direct.cpp"
-        local expected = find_marker_position(root .. "/" .. def_file, case.def, case.token)
+        local expected = find_marker_position(root .. "/" .. def_file, case.def, case.def_token or case.token)
         local response = sidecar:handle_request({
           v = protocol.VERSION,
           id = case.id,
@@ -481,6 +578,7 @@ t.describe("semantic sidecar integration", function()
         })
         t.assert_eq(response.state, "resolved", case.id .. " must resolve")
         t.assert_true(type(response.usr) == "string" and response.usr ~= "", case.id .. " must expose USR")
+        t.assert_eq(response.cursor_role, "reference")
         t.assert_eq(vim.fs.normalize(response.definition.path), vim.fs.normalize(root .. "/" .. def_file))
         t.assert_eq(response.definition.line, expected.line, case.id .. " definition line")
         by_id[case.id] = response
@@ -489,6 +587,8 @@ t.describe("semantic sidecar integration", function()
         "cv/ref overloads must have distinct compiler identities")
       t.assert_true(by_id["template-nontemplate"].usr ~= by_id["template-generic"].usr,
         "non-template and template specializations must have distinct compiler identities")
+      t.assert_true(by_id["virtual-derived"].usr ~= by_id["virtual-base"].usr,
+        "derived-static and base-static virtual calls must keep distinct identities")
       sidecar:shutdown()
     end)
   end)
@@ -510,10 +610,230 @@ t.describe("semantic sidecar integration", function()
 
       t.assert_eq(response.state, "resolved")
       t.assert_true(type(response.usr) == "string" and response.usr ~= "")
+      t.assert_eq(response.cursor_role, "declaration")
       t.assert_eq(vim.fs.normalize(response.declaration.path),
         vim.fs.normalize(root .. "/direct.hpp"))
       t.assert_true(response.definition == nil,
         "libclang must not invent a body absent from the selected origin TU AST")
+      sidecar:shutdown()
+    end)
+  end)
+
+  t.it("lookup-definition resolves declaration to the unique body and warm hits cache without rereading CDB/TUs", function()
+    with_temp_fixture(function(root)
+      local sidecar = semantic_sidecar.new()
+      local sidecar_libclang = require("utils.ue_goto.semantic_sidecar_libclang")
+      local declaration = find_marker_position(root .. "/direct.hpp", "DECL:pick_widget", "pick")
+      local query = sidecar:handle_request({
+        v = protocol.VERSION,
+        id = "lookup-query",
+        op = "query",
+        query = vim.tbl_extend("force", declaration, { document_version = 1 }),
+        contexts = {
+          { id = "ctx-caller", origin_tu = root .. "/caller.cpp", cdb_dir = root },
+        },
+      })
+      t.assert_eq(query.state, "resolved")
+      t.assert_eq(query.cursor_role, "declaration")
+      t.assert_true(query.definition == nil)
+
+      local controlled = write_controlled_cdb(root, "controlled-module.json", {
+        "direct.hpp",
+        "direct.cpp",
+        "caller.cpp",
+      }, {
+        { name = "caller.cpp" },
+        { name = "direct.cpp" },
+      })
+      local expected = find_marker_position(root .. "/direct.cpp", "int pick(Widget value) {", "pick")
+      local first = sidecar:handle_request({
+        v = protocol.VERSION,
+        id = "lookup-first",
+        op = "lookup-definition",
+        usr = query.usr,
+        subject = vim.fs.normalize(root .. "/caller.cpp"),
+        cdb_paths = { controlled },
+        document_version = 1,
+      })
+      t.assert_eq(first.state, "resolved")
+      t.assert_false(first.metrics.cache_hit)
+      t.assert_eq(first.metrics.shim_abi_version, 1)
+      t.assert_eq(first.document_version, 1)
+      t.assert_eq(vim.fs.normalize(first.definition.path), vim.fs.normalize(root .. "/direct.cpp"))
+      t.assert_eq(first.definition.line, expected.line)
+      local stats_after_first = sidecar:handle_request({
+        v = protocol.VERSION, id = "lookup-stats-first", op = "stats",
+      })
+      local tu_count_after_first = stats_after_first.metrics.tu_count
+
+      local original_read_controlled = sidecar._read_controlled_cdb
+      local original_ensure_tu = sidecar._ensure_tu
+      local original_ensure_shim = sidecar_libclang.ensure_cursor_shim
+      sidecar._read_controlled_cdb = function()
+        error("warm cache must not reread controlled cdb")
+      end
+      sidecar._ensure_tu = function()
+        error("warm cache must not rebuild translation units")
+      end
+      sidecar_libclang.ensure_cursor_shim = function()
+        error("warm cache must not recompile or reload cursor shim")
+      end
+      local second = sidecar:handle_request({
+        v = protocol.VERSION,
+        id = "lookup-second",
+        op = "lookup-definition",
+        usr = query.usr,
+        subject = vim.fs.normalize(root .. "/direct.hpp"),
+        cdb_paths = { controlled },
+        document_version = 9,
+      })
+      sidecar._read_controlled_cdb = original_read_controlled
+      sidecar._ensure_tu = original_ensure_tu
+      sidecar_libclang.ensure_cursor_shim = original_ensure_shim
+
+      t.assert_eq(second.state, "resolved")
+      t.assert_true(second.metrics.cache_hit)
+      t.assert_eq(second.metrics.query_kinds[1].kind, "warm-cache")
+      t.assert_eq(second.subject, vim.fs.normalize(root .. "/direct.hpp"))
+      t.assert_eq(second.document_version, 9)
+      t.assert_eq(vim.fs.normalize(second.definition.path), vim.fs.normalize(first.definition.path))
+      local stats_after_second = sidecar:handle_request({
+        v = protocol.VERSION, id = "lookup-stats-second", op = "stats",
+      })
+      t.assert_eq(stats_after_second.metrics.tu_count, tu_count_after_first)
+
+      local evicted = sidecar:handle_request({
+        v = protocol.VERSION, id = "lookup-evict", op = "evict", all = true,
+      })
+      t.assert_eq(evicted.metrics.lookup_cache_entries, 0)
+      local third = sidecar:handle_request({
+        v = protocol.VERSION,
+        id = "lookup-third",
+        op = "lookup-definition",
+        usr = query.usr,
+        subject = vim.fs.normalize(root .. "/caller.cpp"),
+        cdb_paths = { controlled },
+        document_version = 1,
+      })
+      t.assert_false(third.metrics.cache_hit)
+      sidecar:shutdown()
+    end)
+  end)
+
+  t.it("lookup-definition returns structured unavailable when no module context defines the USR", function()
+    with_temp_fixture(function(root)
+      local sidecar = semantic_sidecar.new()
+      local declaration = find_marker_position(root .. "/direct.hpp", "DECL:pick_widget", "pick")
+      local query = sidecar:handle_request({
+        v = protocol.VERSION,
+        id = "lookup-none-query",
+        op = "query",
+        query = vim.tbl_extend("force", declaration, { document_version = 1 }),
+        contexts = {
+          { id = "ctx-caller", origin_tu = root .. "/caller.cpp", cdb_dir = root },
+        },
+      })
+      local controlled = write_controlled_cdb(root, "controlled-caller-only.json", {
+        "direct.hpp",
+        "caller.cpp",
+      }, {
+        { name = "caller.cpp" },
+      })
+      local response = sidecar:handle_request({
+        v = protocol.VERSION,
+        id = "lookup-none",
+        op = "lookup-definition",
+        usr = query.usr,
+        subject = vim.fs.normalize(root .. "/caller.cpp"),
+        cdb_paths = { controlled },
+        document_version = 1,
+      })
+      t.assert_eq(response.state, "unavailable")
+      t.assert_eq(response.reason, "definition-not-found")
+      local stats = sidecar:handle_request({
+        v = protocol.VERSION, id = "lookup-none-stats", op = "stats",
+      })
+      t.assert_eq(stats.metrics.lookup_cache_entries, 0,
+        "negative module evidence must not be cached across subjects")
+      sidecar:shutdown()
+    end)
+  end)
+
+  t.it("lookup-definition fails closed on multiple distinct definitions", function()
+    with_temp_fixture(function(root)
+      local duplicate_text = read_all(root .. "/direct.cpp")
+        :gsub("int pick%(", "int pick(", 1)
+        :gsub("return 11;", "return 111;", 1)
+      assert(vim.fn.writefile(vim.split(duplicate_text, "\n", { plain = true }),
+        root .. "/direct_duplicate.cpp") == 0)
+
+      local sidecar = semantic_sidecar.new()
+      local declaration = find_marker_position(root .. "/direct.hpp", "DECL:pick_widget", "pick")
+      local query = sidecar:handle_request({
+        v = protocol.VERSION,
+        id = "lookup-multi-query",
+        op = "query",
+        query = vim.tbl_extend("force", declaration, { document_version = 1 }),
+        contexts = {
+          { id = "ctx-caller", origin_tu = root .. "/caller.cpp", cdb_dir = root },
+        },
+      })
+      local controlled = write_controlled_cdb(root, "controlled-multi.json", {
+        "direct.hpp",
+        "direct.cpp",
+        "direct_duplicate.cpp",
+        "caller.cpp",
+      }, {
+        { name = "caller.cpp" },
+        { name = "direct.cpp" },
+        { name = "direct_duplicate.cpp" },
+      })
+      local response = sidecar:handle_request({
+        v = protocol.VERSION,
+        id = "lookup-multi",
+        op = "lookup-definition",
+        usr = query.usr,
+        subject = vim.fs.normalize(root .. "/caller.cpp"),
+        cdb_paths = { controlled },
+        document_version = 1,
+      })
+      t.assert_eq(response.state, "unavailable")
+      t.assert_eq(response.reason, "multiple-definitions")
+      t.assert_eq(#response.definitions, 2)
+      local stats = sidecar:handle_request({
+        v = protocol.VERSION, id = "lookup-multi-stats", op = "stats",
+      })
+      t.assert_eq(stats.metrics.lookup_cache_entries, 0,
+        "ambiguous module evidence must not be cached across subjects")
+      sidecar:shutdown()
+    end)
+  end)
+
+  t.it("preserves per-context unresolved evidence instead of collapsing to the first failure", function()
+    with_temp_fixture(function(root)
+      local sidecar = semantic_sidecar.new()
+      local invalid_pick = find_marker_position(root .. "/invalid.hpp", "QUERY:invalid_call", "missing_symbol")
+      local response = sidecar:handle_request({
+        v = protocol.VERSION,
+        id = "invalid-mixed",
+        op = "query",
+        query = vim.tbl_extend("force", invalid_pick, { document_version = 1 }),
+        contexts = {
+          { id = "ctx-invalid", origin_tu = root .. "/invalid.cpp", cdb_dir = root },
+          { id = "ctx-missing-file", origin_tu = root .. "/direct.cpp", cdb_dir = root },
+        },
+      })
+
+      t.assert_eq(response.state, "invalid-semantic-context")
+      t.assert_eq(response.reason, "multiple-context-failures")
+      t.assert_eq(#response.contexts, 2)
+      local reasons = {}
+      for _, context in ipairs(response.contexts) do
+        reasons[context.reason] = true
+      end
+      t.assert_true(reasons["invalid-empty-usr"])
+      t.assert_true(reasons["invalid-cursor"])
+      t.assert_true(#(response.diagnostics or {}) >= #(response.contexts[1].diagnostics or {}))
       sidecar:shutdown()
     end)
   end)

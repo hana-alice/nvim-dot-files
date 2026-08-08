@@ -12,6 +12,8 @@
 -- nil; callers decide what to do.
 
 local location = require("utils.ue_goto.location")
+local transaction = require("utils.ue_goto.semantic_transaction")
+local clangd_commands = require("ue.clangd_commands")
 
 local M = {}
 
@@ -77,6 +79,40 @@ end
 --   without leaking notices when the LSP server misbehaves.
 local REQUEST_HARD_CEILING_MS = 30000
 
+local function supports_method(client, method)
+  if type(client.supports_method) == "function" then
+    local ok, supported = pcall(client.supports_method, client, method)
+    if ok then return supported end
+  end
+  return true
+end
+
+local function make_position_params(bufnr, encoding, opts)
+  if opts and opts.snapshot then
+    return transaction.make_position_params(opts.snapshot, bufnr, encoding)
+  end
+  return vim.lsp.util.make_position_params(0, encoding)
+end
+
+local function structured_reason(records, has_value, empty_reason)
+  if has_value then return "ok" end
+  if #records == 0 then return "provider-method-unsupported" end
+  local supported = 0
+  for _, record in ipairs(records) do
+    if record.status == "timeout" then return "provider-timeout" end
+    if record.status == "compile-command-unavailable" then
+      return record.error and record.error.reason or "compile-command-unavailable"
+    end
+    if record.status == "error" or record.status == "request-threw"
+        or record.status == "make-params-failed" then
+      return "provider-error"
+    end
+    if record.supported then supported = supported + 1 end
+  end
+  if supported == 0 then return "provider-method-unsupported" end
+  return empty_reason
+end
+
 function M.async_lsp_request(bufnr, method, on_result, opts)
   local clients = vim.lsp.get_clients({ bufnr = bufnr, method = method }) or {}
   if opts and type(opts.client_ids) == "table" then
@@ -85,24 +121,60 @@ function M.async_lsp_request(bufnr, method, on_result, opts)
     clients = vim.tbl_filter(function(client) return allowed[client.id] == true end, clients)
   end
   if not clients or vim.tbl_isempty(clients) then
-    vim.schedule(function() on_result(nil) end)
+    vim.schedule(function()
+      if opts and opts.structured then
+        on_result({
+          method = method,
+          locations = {},
+          client_results = {},
+          reason = "provider-method-unsupported",
+          document_version = opts.snapshot and (
+            opts.snapshot.subject and opts.snapshot.subject.document_version
+              or opts.snapshot.document_version) or nil,
+          elapsed_ms = 0,
+        })
+      else
+        on_result(nil)
+      end
+    end)
     return
   end
 
   local pending = #clients
   local all_items = {}
+  local client_results = {}
   local done = false
   local ceiling_timer = nil
+  local started_at = vim.uv.hrtime()
 
-  local function finish()
+  local function finish(timed_out)
     if done then return end
     done = true
+    if timed_out then
+      for _, record in ipairs(client_results) do
+        if not record.status then record.status = "timeout" end
+      end
+    end
     if ceiling_timer and not ceiling_timer:is_closing() then
       ceiling_timer:stop()
       ceiling_timer:close()
     end
     vim.schedule(function()
-      on_result(#all_items > 0 and all_items or nil)
+      local deduped = location.dedup_locations(all_items)
+      if opts and opts.structured then
+        on_result({
+          method = method,
+          locations = (#deduped > 0) and deduped or {},
+          client_results = client_results,
+          reason = structured_reason(client_results, #deduped > 0, "empty"),
+          document_version = opts.snapshot and (
+            opts.snapshot.subject and opts.snapshot.subject.document_version
+              or opts.snapshot.document_version) or nil,
+          elapsed_ms = math.floor((vim.uv.hrtime() - started_at) / 1000000),
+        })
+      else
+        on_result(#deduped > 0 and deduped or nil)
+      end
     end)
   end
 
@@ -114,26 +186,60 @@ function M.async_lsp_request(bufnr, method, on_result, opts)
   -- Hard ceiling: if any client never replies (clangd preamble crash,
   -- network LSP died, etc.) finish anyway with whatever we collected.
   ceiling_timer = vim.defer_fn(function()
-    if not done then finish() end
+    if not done then finish(true) end
   end, REQUEST_HARD_CEILING_MS)
 
   for _, client in ipairs(clients) do
     local enc = client.offset_encoding or "utf-16"
-    local ok_make, params = pcall(vim.lsp.util.make_position_params, 0, enc)
-    if not ok_make or not params then
+    local record = {
+      client_id = client.id,
+      client_name = client.name,
+      method = method,
+      supported = supports_method(client, method),
+      document_version = opts and opts.snapshot and (
+        opts.snapshot.subject and opts.snapshot.subject.document_version
+          or opts.snapshot.document_version) or nil,
+    }
+    client_results[#client_results + 1] = record
+    if not record.supported then
+      record.status = "unsupported"
       dec_pending()
     else
-      local ok_req = pcall(function()
-        client:request(method, params, function(err, result)
-          if done then return end -- ceiling already fired
-          if not err and result and type(result) == "table" then
-            vim.list_extend(all_items, location.normalize_locations(result, enc))
-          end
-          dec_pending()
-        end, bufnr)
-      end)
-      if not ok_req then
+      local ok_make, params = pcall(make_position_params, bufnr, enc, opts)
+      if not ok_make or not params then
+        record.status = "make-params-failed"
         dec_pending()
+      else
+        clangd_commands.ensure(client, bufnr, function(command_ok, command_reason)
+          if done then return end
+          if not command_ok then
+            record.status = "compile-command-unavailable"
+            record.error = { reason = command_reason }
+            dec_pending()
+            return
+          end
+          local request_started = vim.uv.hrtime()
+          local ok_req = pcall(function()
+            client:request(method, params, function(err, result)
+              if done then return end -- ceiling already fired
+              record.elapsed_ms = math.floor((vim.uv.hrtime() - request_started) / 1000000)
+              record.error = err
+              if not err and result and type(result) == "table" then
+                record.locations = location.normalize_locations(result, enc)
+                vim.list_extend(all_items, record.locations)
+                record.status = #record.locations > 0 and "ok" or "empty"
+              else
+                record.locations = {}
+                record.status = err and "error" or "empty"
+              end
+              dec_pending()
+            end, bufnr)
+          end)
+          if not ok_req then
+            record.status = "request-threw"
+            dec_pending()
+          end
+        end, opts)
       end
     end
   end
@@ -143,7 +249,7 @@ end
 -- the ids of clients that returned that identity. Callers pass those ids into
 -- async_lsp_request so an unrelated LSP client cannot contribute a location.
 -- No rendered symbol text is used to choose a target.
-function M.async_clangd_symbol_info(bufnr, on_result)
+function M.async_clangd_symbol_info(bufnr, on_result, opts)
   local clients = {}
   for _, client in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
     if tostring(client.name or ""):lower():find("clangd", 1, true) then
@@ -151,15 +257,38 @@ function M.async_clangd_symbol_info(bufnr, on_result)
     end
   end
   if #clients == 0 then
-    vim.schedule(function() on_result(nil) end)
+    vim.schedule(function()
+      if opts and opts.structured then
+        on_result({
+          client_results = {},
+          identities = {},
+          usr = nil,
+          client_ids = {},
+          reason = "provider-method-unsupported",
+          document_version = opts and opts.snapshot and (
+            opts.snapshot.subject and opts.snapshot.subject.document_version
+              or opts.snapshot.document_version) or nil,
+          elapsed_ms = 0,
+        })
+      else
+        on_result(nil)
+      end
+    end)
     return
   end
 
   local pending, done, usr_clients = #clients, false, {}
+  local client_results = {}
   local timer
-  local function finish()
+  local started_at = vim.uv.hrtime()
+  local function finish(timed_out)
     if done then return end
     done = true
+    if timed_out then
+      for _, record in ipairs(client_results) do
+        if not record.status then record.status = "timeout" end
+      end
+    end
     if timer and not timer:is_closing() then timer:stop(); timer:close() end
     local values = vim.tbl_keys(usr_clients)
     local usr = #values == 1 and values[1] or nil
@@ -168,33 +297,97 @@ function M.async_clangd_symbol_info(bufnr, on_result)
       client_ids = vim.tbl_keys(usr_clients[usr])
       table.sort(client_ids)
     end
-    vim.schedule(function() on_result(usr, client_ids) end)
+    vim.schedule(function()
+      if opts and opts.structured then
+        local identities = {}
+        for known_usr, known_clients in pairs(usr_clients) do
+          identities[#identities + 1] = {
+            usr = known_usr,
+            client_ids = vim.tbl_keys(known_clients),
+          }
+        end
+        table.sort(identities, function(a, b) return a.usr < b.usr end)
+        on_result({
+          client_results = client_results,
+          identities = identities,
+          usr = usr,
+          client_ids = client_ids,
+          reason = usr and "ok" or (#values > 1 and "identity-conflict"
+            or structured_reason(client_results, false, "identity-missing")),
+          document_version = opts and opts.snapshot and (
+            opts.snapshot.subject and opts.snapshot.subject.document_version
+              or opts.snapshot.document_version) or nil,
+          elapsed_ms = math.floor((vim.uv.hrtime() - started_at) / 1000000),
+        })
+      else
+        on_result(usr, client_ids)
+      end
+    end)
   end
   local function complete_one()
     pending = pending - 1
     if pending == 0 then finish() end
   end
-  timer = vim.defer_fn(finish, 5000)
+  timer = vim.defer_fn(function() finish(true) end, 5000)
 
   for _, client in ipairs(clients) do
     local enc = client.offset_encoding or "utf-16"
-    local ok_params, params = pcall(vim.lsp.util.make_position_params, 0, enc)
-    if not ok_params or not params then
+    local record = {
+      client_id = client.id,
+      client_name = client.name,
+      method = "textDocument/symbolInfo",
+      supported = supports_method(client, "textDocument/symbolInfo"),
+      document_version = opts and opts.snapshot and (
+        opts.snapshot.subject and opts.snapshot.subject.document_version
+          or opts.snapshot.document_version) or nil,
+    }
+    client_results[#client_results + 1] = record
+    if not record.supported then
+      record.status = "unsupported"
       complete_one()
     else
-      local ok_request = pcall(function()
-        client:request("textDocument/symbolInfo", params, function(err, result)
-          if not done and not err and type(result) == "table" then
-            local item = result.usr and result or result[1]
-            if type(item) == "table" and type(item.usr) == "string" and item.usr ~= "" then
-              usr_clients[item.usr] = usr_clients[item.usr] or {}
-              if client.id ~= nil then usr_clients[item.usr][client.id] = true end
-            end
+      local ok_params, params = pcall(make_position_params, bufnr, enc, opts)
+      if not ok_params or not params then
+        record.status = "make-params-failed"
+        complete_one()
+      else
+        clangd_commands.ensure(client, bufnr, function(command_ok, command_reason)
+          if done then return end
+          if not command_ok then
+            record.status = "compile-command-unavailable"
+            record.error = { reason = command_reason }
+            complete_one()
+            return
           end
-          complete_one()
-        end, bufnr)
-      end)
-      if not ok_request then complete_one() end
+          local request_started = vim.uv.hrtime()
+          local ok_request = pcall(function()
+            client:request("textDocument/symbolInfo", params, function(err, result)
+              if done then return end
+              record.elapsed_ms = math.floor((vim.uv.hrtime() - request_started) / 1000000)
+              record.error = err
+              record.identity = nil
+              if not done and not err and type(result) == "table" then
+                local item = result.usr and result or result[1]
+                if type(item) == "table" and type(item.usr) == "string" and item.usr ~= "" then
+                  usr_clients[item.usr] = usr_clients[item.usr] or {}
+                  if client.id ~= nil then usr_clients[item.usr][client.id] = true end
+                  record.identity = { usr = item.usr, id = item.id }
+                  record.status = "ok"
+                else
+                  record.status = "empty"
+                end
+              else
+                record.status = err and "error" or "empty"
+              end
+              complete_one()
+            end, bufnr)
+          end)
+          if not ok_request then
+            record.status = "request-threw"
+            complete_one()
+          end
+        end, opts)
+      end
     end
   end
 end

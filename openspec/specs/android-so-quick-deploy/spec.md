@@ -21,6 +21,12 @@
 - **WHEN** action graph 导出或执行返回非零退出码
 - **THEN** 系统 SHALL 报告失败并且不得继续部署旧 SO
 
+#### Scenario: 构建时关闭输出窗口
+
+- **WHEN** `:UEBuildAndroidSO` 的 action graph 仍在运行且用户关闭 terminal 输出窗口
+- **THEN** 构建任务 SHALL 在隐藏 buffer 中继续运行，不得因窗口生命周期收到终止信号
+- **AND** 只有显式任务取消或底层编译失败才可产生非零退出码
+
 ### Requirement: 快速部署必须匹配当前构建配置和正常 APK strip 行为
 
 系统 SHALL 从当前项目、Target 和 Configuration 精确选择源 SO，并在主机临时文件上执行与当前 Android Gradle 打包链一致的 native library strip；系统 MUST 保留原始未 strip SO 供符号解析使用。
@@ -110,7 +116,7 @@
 #### Scenario: 非 root app-private staging 成功
 
 - **WHEN** 选择 debuggable app-private startup-agent transport
-- **AND** 设备 API 为 34、ABI 列表包含 `arm64-v8a`、installed app `primaryCpuAbi=arm64-v8a`，源 SO 为 ELF64/AArch64 且 `DT_SONAME=libUE4.so`
+- **AND** ActivityManager 暴露 `--attach-agent-bind`、ABI 列表包含 `arm64-v8a`、installed app `primaryCpuAbi=arm64-v8a`，源 SO 为 ELF64/AArch64 且 `DT_SONAME=libUE4.so`
 - **THEN** 系统 SHALL 将 stripped `libUE4.so`、nvim 自带的 arm64 JVMTI agent 与 hash manifest 写入唯一 generation 目录
 - **AND** 两个文件 SHALL 以 app UID 校验 SHA-256
 - **AND** 仅在 generation 完整后以原子 `current` pointer 发布，启动流程不得观察到 SO/agent 半更新组合

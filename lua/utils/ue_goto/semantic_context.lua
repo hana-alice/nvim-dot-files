@@ -37,6 +37,13 @@ local function copy_list(list)
   return out
 end
 
+local function list_contains(list, wanted)
+  for _, value in ipairs(list or {}) do
+    if value == wanted then return true end
+  end
+  return false
+end
+
 local function trim(text)
   return tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
 end
@@ -215,6 +222,28 @@ local function dedup_contexts(contexts)
   table.sort(out, function(a, b)
     return a.fingerprint < b.fingerprint
   end)
+  return out
+end
+
+local function normalize_subject_membership(value)
+  local raw = value
+  if type(raw) == "string" then
+    raw = { raw }
+  end
+  if not is_list(raw) then
+    return {}
+  end
+  local out = {}
+  local seen = {}
+  for _, path in ipairs(raw) do
+    local normalized = normalize_path(path)
+    local key = match_key(normalized)
+    if normalized ~= "" and not seen[key] then
+      seen[key] = true
+      out[#out + 1] = normalized
+    end
+  end
+  table.sort(out)
   return out
 end
 
@@ -526,6 +555,10 @@ function M.make_proven_context(spec)
 
   ctx.proven = true
   ctx.kind = "proven-context"
+  ctx.evidence_fingerprint = sha256(ctx.evidence)
+  ctx.subject_membership = normalize_subject_membership(
+    spec.subject_membership or ctx.evidence.header
+  )
   ctx.fingerprint = sha256({
     project_root = ctx.project_root,
     active_build_key = ctx.active_build_key,
@@ -537,6 +570,72 @@ function M.make_proven_context(spec)
   })
   ctx.context_id = ctx.fingerprint
   return ctx
+end
+
+function M.context_subject_membership(context)
+  if type(context) ~= "table" then
+    return {}
+  end
+  local membership = normalize_subject_membership(context.subject_membership)
+  if #membership > 0 then
+    return membership
+  end
+  local evidence = type(context.evidence) == "table" and context.evidence or {}
+  return normalize_subject_membership(evidence.header)
+end
+
+function M.context_supports_subject(context, subject_path)
+  local subject = normalize_path(subject_path)
+  if subject == "" then
+    return false, "missing-subject-path"
+  end
+  local membership = M.context_subject_membership(context)
+  if #membership == 0 then
+    return false, "subject-membership-unproven"
+  end
+  if list_contains(membership, subject) then
+    return true
+  end
+  return false, "context-not-member"
+end
+
+function M.make_lineage_record(spec)
+  if type(spec) ~= "table" then
+    return nil, "lineage-not-table"
+  end
+  local context = spec.context
+  if type(context) ~= "table" then
+    return nil, "missing-context"
+  end
+  local origin_tu = normalize_path(context.origin_tu)
+  if origin_tu == "" then
+    return nil, "missing-origin-tu"
+  end
+  local build_fingerprint = trim(spec.build_fingerprint or context.build_fingerprint)
+  if build_fingerprint == "" then
+    return nil, "missing-build-fingerprint"
+  end
+  local record = {
+    build_fingerprint = build_fingerprint,
+    context_id = trim(context.context_id or context.id or context.fingerprint),
+    origin_tu = origin_tu,
+    compile = type(context.compile) == "table" and vim.deepcopy(context.compile) or nil,
+    cdb_dir = normalize_path(context.cdb_dir),
+    compile_command_fingerprint = trim(
+      context.compile_command_fingerprint or (context.compile and context.compile.fingerprint) or ""
+    ),
+    evidence_fingerprint = trim(context.evidence_fingerprint or ""),
+    subject_membership = M.context_subject_membership(context),
+    source_action_token = tonumber(spec.source_action_token or context.source_action_token or 0) or 0,
+  }
+  record.id = record.context_id ~= "" and record.context_id or sha256({
+    record.origin_tu,
+    record.compile_command_fingerprint,
+    record.subject_membership,
+    record.build_fingerprint,
+  })
+  record.context_id = record.id
+  return record
 end
 
 function M.proven_contexts_from_cpp_json(opts)
@@ -668,16 +767,28 @@ function M.remember_window_selection(context)
   end
   return {
     fingerprint = context.fingerprint,
+    subject_membership = M.context_subject_membership(context),
   }
 end
 
-function M.reuse_window_selection(selection, contexts)
+function M.reuse_window_selection(selection, contexts, subject_path)
   if type(selection) ~= "table" or trim(selection.fingerprint) == "" then
     return nil
   end
   for _, ctx in ipairs(dedup_contexts(contexts)) do
     if ctx.fingerprint == selection.fingerprint then
-      return ctx
+      local ok = true
+      if subject_path and subject_path ~= "" then
+        ok = M.context_supports_subject(ctx, subject_path)
+      else
+        local selection_membership = normalize_subject_membership(selection.subject_membership)
+        if #selection_membership > 0 then
+          ok = M.context_supports_subject(ctx, selection_membership[1])
+        end
+      end
+      if ok then
+        return ctx
+      end
     end
   end
   return nil

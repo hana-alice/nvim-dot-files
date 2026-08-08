@@ -1,4 +1,4 @@
-# lua/ue/index/ — clangd 离线索引子系统（前 ue.lua INDEX_FN/INDEX_RT）
+# lua/ue/index/ — clangd 受控 BackgroundIndex 子系统（前 ue.lua INDEX_FN/INDEX_RT）
 
 > 继承 `../AGENTS.md`（ue 中枢）→ `../../AGENTS.md`（lua 总规则）。只写增量。
 > 来历：F1 split phase-1（health-check 2026-07）——从 10k 行 ue.lua 机械切出的
@@ -6,9 +6,9 @@
 
 ## 用途
 
-current / hot / full 三相 clangd 离线索引：模块记录与 tier（`_state`）、
-subset CDB + partition + phase build 调度（`_build`）、clangd 重启 /
-active index promote / `.clangd` 双写同步（`_clangd`）。
+current / hot / full 三相受控 BackgroundIndex：模块记录/持久化（`_state`），generation
+manifest 与 coverage selector（`_generation`），compiler-authored UBT unity / exact fallback CDB 生成与
+phase 调度（`_build`），以及只跟随 chosen manifest fingerprint 的 clangd 重启（`_clangd`）。
 
 ## 结构契约
 
@@ -21,19 +21,22 @@ active index promote / `.clangd` 双写同步（`_clangd`）。
   不得反向 `require("ue")`（会循环）。
 - `M._rt` 与 ue.lua 的 `INDEX_RT` 是**同一张表**（活引用）；:UESetProject
   清理、status cache 直接改它。别做防御性拷贝。
-- 加载顺序 `_state → _clangd → _build`：`core.h.*` 在 `_state` 里定义，
-  兄弟模块顶部 alias。新 helper 先落 `_state` 再消费。
+- 加载顺序 `_state → _generation → _clangd → _build`：基础 helper 在 `_state` 定义，
+  generation/selector helper 在 `_generation` 定义，兄弟模块顶部 alias；不得反向依赖后加载模块。
 
 ## 宪法级坑（权威在 ../../../docs/CONSTRAINTS.md）
 
-- `.clangd` 必须 engine + 引擎树外 project root **双写**（K41）。
-- 索引 mtime 必须 ≥ compile_commands.json mtime 才可 attach（ghost 跳转）。
+- clangd 固定 `--enable-config=false`；不得恢复 `.clangd` `External.File`、`--index-file`
+  或把 monolithic binary index 当作 definition authority（K41）。
+- current/hot/full 只允许同 generation 覆盖超集晋升；较窄 phase 完成不得替换已有 full。
+- controlled CDB 必须保留 active build 的 exact argv/cwd，并携带 portable
+  `nvim_ue_members` / `nvim_ue_module_root`；不得靠目录或文件名猜 unity membership。
 - partition 与 pipeline 串行（2026-06-25 撕裂）；build_phase 单 job（RT.job）。
 
 ## 改动 → 必跑回归
 
-改 `index/**` → `ue_api` `ue_cdb` `smoke`；跨 ue.lua 接缝（setup deps /
-re-export）→ 提交前全量。
+改 `index/**` → `index_generation` `cpp_semantic_index` `clangd_commands` `ue_api`；
+跨 ue.lua 接缝（setup deps / re-export）→ 提交前全量。
 
 ## 先读
 

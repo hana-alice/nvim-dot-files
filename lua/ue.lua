@@ -671,7 +671,8 @@ function M.clangd_cmd(root_dir)
     "--completion-parse=auto",          -- text-based completion while preamble builds
     "--header-insertion=never",
     "--pch-storage=memory",
-    "--clang-tidy=false",               -- 显式关 tidy（.clangd 已 Remove '*'，cmdline 兜底防回归）
+    "--clang-tidy=false",               -- explicit because project/user config is disabled below
+    "--enable-config=false",             -- reject stale project/user External.File fragments
     "--function-arg-placeholders=true",
     "--limit-results=200",
     "--limit-references=200",
@@ -687,30 +688,24 @@ function M.clangd_cmd(root_dir)
       local cc_path = join(engine_root, "compile_commands.json")
       local cc_mtime = 0
       if _ufs.is_file(cc_path) then
-        table.insert(cmd, "--compile-commands-dir=" .. engine_root)
         local st = vim.uv.fs_stat(cc_path)
         cc_mtime = st and st.mtime and st.mtime.sec or 0
       end
-      -- Use staged offline indexes if available; active index wins.
-      -- CRITICAL: only attach indexes that are AT LEAST as fresh as the
-      -- compile_commands.json. A stale index references TUs that no
-      -- longer exist after CDB regeneration; clangd will not clean it
-      -- and gd can jump to phantom locations in deleted files.
-      local idx_candidates = {
-        cache_paths(engine_root).active_index,
-        cache_paths(engine_root).hot_index,
-        cache_paths(engine_root).current_index,
-        cache_paths(engine_root).full_index,
-      }
-      for _, idx_path in ipairs(idx_candidates) do
-        if _ufs.is_file(idx_path) then
-          local st = vim.uv.fs_stat(idx_path)
-          local idx_mtime = st and st.mtime and st.mtime.sec or 0
-          if cc_mtime == 0 or idx_mtime >= cc_mtime then
-            table.insert(cmd, "--index-file=" .. idx_path)
-            break
-          end
-        end
+      -- Broad cross-TU coverage comes from controlled BackgroundIndex CDBs
+      -- built from compiler-authored UBT unity membership plus exact per-file
+      -- fallback. clangd 22's monolithic
+      -- External.File path was independently proven to return only the header
+      -- declaration even when its YAML Symbol has a .cpp Definition.  Prefer
+      -- the generated CDB only while it is at least as fresh as the active CDB.
+      -- Canonical-USR destination lookup additionally uses these same proven
+      -- module AST contexts, so correctness does not depend on queue timing.
+      local semantic_cdb = cache_paths(engine_root).semantic_cdb
+      local semantic_stat = _ufs.is_file(semantic_cdb) and vim.uv.fs_stat(semantic_cdb) or nil
+      local semantic_mtime = semantic_stat and semantic_stat.mtime and semantic_stat.mtime.sec or 0
+      if semantic_mtime > 0 and (cc_mtime == 0 or semantic_mtime >= cc_mtime) then
+        table.insert(cmd, "--compile-commands-dir=" .. vim.fs.dirname(semantic_cdb))
+      elseif _ufs.is_file(cc_path) then
+        table.insert(cmd, "--compile-commands-dir=" .. engine_root)
       end
     end
   end
@@ -1315,6 +1310,11 @@ cache_paths = function(engine_root, platform_key)
     current_index = join(active_index_dir, project_name .. ".current.idx"),
     hot_index = join(active_index_dir, project_name .. ".hot.idx"),
     full_index = join(active_index_dir, project_name .. ".full.idx"),
+    semantic_cdb_dir = join(clangd_dir, "background-cdb"),
+    semantic_cdb = join(clangd_dir, "background-cdb", "compile_commands.json"),
+    semantic_current_cdb = join(clangd_dir, "background-cdb", "current", "compile_commands.json"),
+    semantic_hot_cdb = join(clangd_dir, "background-cdb", "hot", "compile_commands.json"),
+    semantic_full_cdb = join(clangd_dir, "background-cdb", "full", "compile_commands.json"),
     pch_dir = pch_dir,
     pch_build_bat = join(pch_dir, "build_pch.bat"),
   }
@@ -2082,15 +2082,6 @@ local ensure_index_state = INDEX_FN.ensure_index_state
 local save_index_state = INDEX_FN.save_index_state
 local sorted_module_records = INDEX_FN.sorted_module_records
 local module_tier_label = INDEX_FN.module_tier_label
-
--- Test seams: .clangd sync (engine + external project root).
-function M._sync_one_dot_clangd_for_test(path, file, mount)
-  return INDEX_FN.sync_one_dot_clangd(path, file, mount)
-end
-function M._sync_dot_clangd_for_test(ctx)
-  return INDEX_FN.sync_dot_clangd(ctx)
-end
-
 
 local function index_output_paths(ctx)
   local outputs = {}
@@ -4851,7 +4842,12 @@ local function open_terminal_command(cmd, opts)
   local buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_win_set_buf(win, buf)
   track_state(buf, win)
-  vim.bo[buf].bufhidden = "wipe"
+  -- Closing the terminal window is a presentation action, not task
+  -- cancellation. `bufhidden=wipe` terminates a live terminal job (reported
+  -- by Neovim as exit 143), so keep the buffer hidden while the build runs.
+  -- The exit callback restores the old cleanup behavior once no process can
+  -- be killed by wiping the buffer.
+  vim.bo[buf].bufhidden = "hide"
   vim.bo[buf].buflisted = false
   vim.bo[buf].swapfile = false
 
@@ -4874,6 +4870,9 @@ local function open_terminal_command(cmd, opts)
     end,
     on_exit = function(_, code)
       vim.schedule(function()
+        if vim.api.nvim_buf_is_valid(buf) then
+          vim.bo[buf].bufhidden = "wipe"
+        end
         stdout_pending = flush_job_output(output_lines, stdout_pending)
         stderr_pending = flush_job_output(output_lines, stderr_pending)
         if CORE_RT.build_term_jobid == active_jobid then
@@ -5936,6 +5935,12 @@ function M.index_status(opts)
     "  mode: " .. mode_token(ctx),
     "  phase: " .. summary.phase_label .. " (" .. summary.phase .. ")",
     "  build: " .. summary.status,
+    "  coverage: " .. (trim(summary.coverage_level) ~= "" and summary.coverage_level or "-")
+      .. " base=" .. (trim(summary.selected_phase) ~= "" and summary.selected_phase or "-")
+      .. " freshness=" .. (trim(summary.freshness) ~= "" and summary.freshness or "-")
+      .. " converging=" .. (summary.converging and "yes" or "no"),
+    "  generation: " .. (trim(summary.generation_short) ~= "" and summary.generation_short or "-")
+      .. ", selected modules=" .. tostring(summary.selected_module_count or 0),
     "  active: " .. summary.active .. " [" .. summary.active_tier .. "/" .. summary.active_kind .. "]",
     "  dirty: root=" .. (summary.root_dirty and "yes" or "no") .. ", modules=" .. tostring(summary.dirty),
     "  queue: " .. queue_text,
@@ -5964,6 +5969,16 @@ function M.index_status(opts)
   local msg = table.concat(lines, "\n")
   vim.notify(msg, vim.log.levels.INFO)
   return msg
+end
+
+-- Read-only semantic-navigation contract.  This deliberately exposes only
+-- fingerprints, coverage, readiness and a module label: callers must never
+-- learn cache/index absolute paths from diagnostic state.
+function M.semantic_index_snapshot(opts)
+  opts = opts or {}
+  local ctx, err = resolve_context(opts)
+  if not ctx then return nil, err end
+  return INDEX_FN.semantic_index_snapshot(ctx, opts.subject_path or opts.bufname)
 end
 
 function M.index_now(opts)
@@ -6486,7 +6501,12 @@ local function invalidate_project_scoped_cache(engine_root, reason)
     local glob = vim.fn.globpath(paths.active_index_dir, "*.idx", false, true)
     for _, f in ipairs(glob) do
       if pcall(os.remove, f) then removed = removed + 1 end
+      local manifest = f .. ".manifest.json"
+      if _ufs.is_file(manifest) and pcall(os.remove, manifest) then removed = removed + 1 end
     end
+  end
+  if _ufs.is_dir(paths.semantic_cdb_dir) then
+    if pcall(vim.fn.delete, paths.semantic_cdb_dir, "rf") then removed = removed + 1 end
   end
 
   -- Force prepare_freshness to re-read from disk on next call.
@@ -8439,6 +8459,10 @@ local function clear_cache(opts)
       table.insert(removed, "  " .. f)
     end
   end
+  if _ufs.is_dir(ctx.paths.semantic_cdb_dir) then
+    pcall(vim.fn.delete, ctx.paths.semantic_cdb_dir, "rf")
+    table.insert(removed, "  " .. ctx.paths.semantic_cdb_dir .. "/ (controlled background CDBs)")
+  end
   local gtags_dir = join(ctx.paths.cache, "gtags")
   if _ufs.is_dir(gtags_dir) then
     pcall(vim.fn.delete, gtags_dir, "rf")
@@ -8463,6 +8487,11 @@ local function clear_cache(opts)
       if _ufs.is_file(idx) then
         pcall(vim.fn.delete, idx)
         table.insert(removed, "  " .. idx .. " (offline index)")
+      end
+      local manifest = idx .. ".manifest.json"
+      if _ufs.is_file(manifest) then
+        pcall(vim.fn.delete, manifest)
+        table.insert(removed, "  " .. manifest .. " (offline index manifest)")
       end
     end
   end

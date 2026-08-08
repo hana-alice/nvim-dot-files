@@ -32,8 +32,10 @@
 
 - **索引/CDB**：`:UEPrepare` → UBT `-SkipBuild` 取编译参数 → `ue/cdb/*` 生成/裁剪/inject
   compile_commands.json → cindex 建 csearch 索引 → clangd reload。全程 async + 进度 UI。
-- **goto-definition**：C++ source 走 active-CDB + clangd exact-cursor USR；header 走 proven origin TU +
-  libclang sidecar canonical USR。非 C++ 兼容路径保留 cache/LSP/csearch/GTAGS；详见
+- **goto-definition**：C++ source/header 都先在 proven TU 中取得 libclang exact-cursor
+  canonical USR，再在同 generation controlled module AST 中查唯一 body；clangd 仅在 module
+  contexts 暂不可用时作 identity-verified secondary provider。非 C++ 兼容路径保留
+  cache/LSP/csearch/GTAGS；详见
   `docs/architecture-symbol-resolution.md`。
 - **Android device**：`<Space>uA` / 首次 Android 操作 → `utils.android_device` 异步执行
   `adb devices -l` → picker 展示名称 + serial → `vim.g.ue_android_device_serial`；install / launch /
@@ -81,7 +83,8 @@
 - **CDB 写入**只允许一个 pipeline writer；任何后续 partition/mirror 必须通过完成回调串行衔接。
 - **LSP 行为改动**只走 `lua/utils/lsp_fallback.lua` 或 `lua/workarounds/clangd/*`（禁全局 handler 覆盖）。
 - **上游 bug 补丁**只进 `lua/workarounds/<scope>/<name>.lua`（禁 inline monkey-patch）。
-- **goto 精度**只信 clangd（TS 不给答案，csearch/gtags 只兜底）。
+- **C++ goto 精度**只信 proven libclang canonical USR + module AST 唯一 body；TS 不给答案，
+  csearch/GTAGS 不参与 C++ destination。非 C++ 保留既有 LSP/csearch/GTAGS 兼容链。
 - **启动顺序**固定，见 `docs/CONSTRAINTS.md §三 C3` 与 `init.lua`。
 
 ## 6. 开发纪律入口

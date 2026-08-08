@@ -13,7 +13,7 @@ from collections import defaultdict
 
 
 def winpath_local(p):
-    if len(p) >= 2 and p[1] == ':' and os.path.isdir('/mnt/c'):
+    if sys.platform.startswith('linux') and len(p) >= 2 and p[1] == ':' and os.path.isdir('/mnt/c'):
         return f'/mnt/{p[0].lower()}/' + p[2:].replace('\\', '/').lstrip('/')
     return p
 

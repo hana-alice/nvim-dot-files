@@ -157,9 +157,6 @@ function Resolve-RunAsTransport {
   $apiLevel = (Invoke-Adb -Arguments @(
     "shell", "getprop", "ro.build.version.sdk"
   )).Text.Trim()
-  if ($apiLevel -ne "34") {
-    throw "App-private startup-agent transport is verified only for Android API 34; device reports API $apiLevel. No device state was changed."
-  }
   $abiList = (Invoke-Adb -Arguments @(
     "shell", "getprop", "ro.product.cpu.abilist"
   )).Text.Trim()
@@ -593,7 +590,7 @@ if ($transport.Kind -eq "root") {
   Write-Host "[UE SO deploy] preserving metadata uid=$($originalMetadata.Uid) gid=$($originalMetadata.Gid) mode=$($originalMetadata.Mode) context=$($originalMetadata.Context)"
 }
 elseif ($transport.Kind -eq "run-as-agent") {
-  Write-Host "[UE SO deploy] transport=run-as/startup-agent uid=$($transport.AppUid)"
+  Write-Host "[UE SO deploy] transport=run-as/startup-agent uid=$($transport.AppUid) api=$($transport.ApiLevel)"
   $installedCandidates = @(
     "$nativeDir/arm64/libUE4.so",
     "$nativeDir/libUE4.so"

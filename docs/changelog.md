@@ -56,6 +56,111 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-08-08 — 让 C++ `gd` 从 canonical entity 完整到达唯一函数体
+
+**Task**
+
+修复 overload、头文件 declaration 与 derived virtual call 已取得正确实体身份却仍停在声明处的问题；
+建立不依赖名称/arity/path ranking 的完整语义链，并以真实 Android Vulkan 源码验证。
+
+**Implemented**
+
+- source/header 都先以 active CDB 或 compiler-emitted origin evidence 建立不可变 transaction，在
+  proven TU 的 exact cursor 取得 libclang canonical USR；异步 provider 只能使用 snapshot 的
+  URI/position/version，stale 响应没有 UI 副作用。
+- `lookup-definition` 使用同 generation 的 controlled current→hot→full CDB，在 subject module 的
+  compiler-authored UBT unity / exact fallback AST 中按相同 USR 找唯一 body。LuaJIT 无法可靠传递
+  by-value `CXCursor` callback，因此按 LLVM toolchain + source hash 懒编译最小 C ABI shim；shim
+  复用当前 libclang/TU，不加载第二份库、不重新 parse，超长路径/overflow/零或多个 body 均 fail closed。
+- resolved cache 只绑定 canonical USR、CDB signatures、overlays 与 toolchain；同一实体换调用点/声明可
+  复用，negative/ambiguous 结果不跨 subject 缓存。新增 `:UEDefExplain`、稳定 stage/reason 和失败/
+  性能 probe，保留 150ms 可取消进度与 stale gate。
+- current/hot/full 改为 generation manifest + coverage-superset selector；clangd 固定
+  `--enable-config=false`，打开文件 exact argv/cwd 经官方 `compilationDatabaseChanges` 传输。
+  不再写 `.clangd` 或把 `External.File`/`--index-file` 当 definition authority；受控 CDB 只接受
+  active build 的真实 UBT unity membership，无法证明时保留 exact per-file TU。
+- 为保持 800 行结构门禁，将 generation、C++ navigation coordinator、module definition lookup 分拆为
+  `_generation.lua`、`semantic_navigation.lua`、`semantic_sidecar_definition.lua`；入口 API 与非 C++
+  cache/LSP/csearch/GTAGS compatibility path 不变。
+
+**Pitfalls / Gotchas**
+
+- `clangd-indexer` YAML 记录 `.cpp` Definition 不代表 monolithic External index 的 LSP definition
+  会返回 body；真实实验仍只到 declaration，故该路线已证伪。
+- 人工跨 module/same-module argument union 会产生真实 Clang diagnostics；只有 UBT 自己写出的 unity
+  wrapper + 匹配 `.o.rsp` 是可接受 membership evidence，不用 workaround 掩盖 parse error。
+- 默认 `max_tus=1` 下真实 4-wrapper module lookup 的三个 cold USR 各约 29–31 秒，sidecar RSS
+  1797–1818 MiB；这是已记录的冷路径成本。同一 canonical USR 的下一 subject 为 0ms，不通过并发
+  多个大 TU 换速度。
+
+**Validation**
+
+- 真实 Android Vulkan 只读 smoke 6/6 PASS：二参数 `SubmitActiveCmdBuffer` call/declaration 都到
+  `VulkanCommandBuffer.cpp:645`；无参 overload 都到 inline `VulkanCommandBuffer.h:421`；
+  `FVulkanCommandListContext&` call 与 `final override` declaration 都到 `VulkanCommands.cpp:1098`。
+  三组 canonical USR hash 互异、组内一致，shim ABI=1、`tu_count=1`；未写引擎/项目源码，未访问设备。
+- 聚焦回归：`cpp_semantic_context` 11/11、`cpp_semantic_client` 15/15、
+  `cpp_semantic_sidecar` 15/15、`cpp_semantic_transaction` 5/5、`ue_goto_behavior` 7/7、
+  `index_generation` 15/15、`clangd_commands` 2/2、`cpp_semantic_index` 1/1、`ue_api` 54/54、
+  `utils` 45/45、`stability` 9/9，全部通过；Python 生成器 syntax compile 通过。
+- `openspec validate make-cpp-gd-semantically-complete --strict` passed；新增/修改行脱敏扫描 clean。
+- 全量 `nvim --headless -l tests/run.lua`：765/765 passed。
+
+**Follow-ups**
+
+- cold module parse 的 29–31 秒与约 1.8 GiB RSS 是剩余性能边界；后续优化必须保持 canonical-USR
+  authority、真实 compile context 与 fail-closed 合同，禁止回加 symbol/arity/path ranking。
+
+### 2026-08-07 — 关闭 build terminal 不再终止 `<Space>us`
+
+**Task**
+
+修复 `<Space>us` 偶发以 exit code 143 结束的问题，并让 Android build preflight 只报告真实发生的 DAP 清理。
+
+**Implemented**
+
+- 运行中的 UE build terminal 使用 `bufhidden=hide`；关闭窗口只隐藏输出 buffer，不再 wipe buffer 并向
+  PowerShell/UBT 发送终止信号。任务退出后恢复 `bufhidden=wipe`，保持既有的已完成 terminal 清理语义。
+- Android DAP cleanup 仅在确有 active DAP session 时返回 `adapter_killed=true`，空闲状态的 `<Space>us`
+  不再错误提示 “stopped lldb-dap adapter”。
+- 增加 terminal 生命周期与 DAP cleanup 结果回归，防止重新引入关窗即取消和虚假清理提示。
+
+**Validation**
+
+- 历史 `nvim-debug.log` 记录 `<Space>us` exit 143；独立 terminal 实验复现 `bufhidden=wipe` 在 buffer
+  删除时稳定返回 143。
+- 使用当前真实 Android Development build state 完整执行两阶段 action graph：两阶段均 exit 0，
+  `Target is up to date`，未进入 Gradle/APK/ADB。
+- 真实 `:UEBuildAndroidSO` 启动后立即关闭 terminal：buffer 仍有效、job 仍运行，最终 `status=BOK`、exit 0；
+  退出后 `bufhidden` 恢复为 `wipe`，且不再虚报停止 lldb-dap adapter。
+- `ue_api` 56/56 passed；`dap` 56/56 passed。
+- `openspec validate android-so-quick-deploy --type spec --strict` passed；全量
+  `nvim --headless -l tests/run.lua` 729/729 passed。
+
+### 2026-08-07 — 以实测能力而非 Android API 白名单选择 startup-agent transport
+
+**Task**
+
+修复 `<Space>uq` 在具备所需能力的 Android 15 / API 35 设备上被 `sdk == 34` 旧验证门禁提前拒绝的问题。
+
+**Implemented**
+
+- `ue_android_so_deploy.ps1` 与 `ue_android_so_launch.ps1` 不再把 Android API 精确版本当作 transport
+  能力；继续 fail closed 检查 package `DEBUGGABLE`、`run-as` UID、ActivityManager
+  `--attach-agent-bind`、设备/app ABI 以及发布 generation 的 identity/hash。
+- startup agent 的 ClassLoader 错误与注释改为描述所需运行时契约，不再错误声称该契约只属于 API 34。
+- 主 spec 将 app-private staging 前置条件改为可观测 capability；fixture 使用 API 35 锁定未来版本不会因版本号
+  被拒绝，同时保留“缺少 attach-agent-bind 必须拒绝”的负例。
+
+**Validation**
+
+- PowerShell 5.1 `run_as_transport_spec.ps1`：API 35 capability-positive 与 capability-negative 用例通过。
+- PowerShell 5.1 `startup_agent_spec.ps1`：deploy/launch/agent contract 通过，精确 API 34 门禁被列为禁止模式。
+- `ue_api` 55/55 passed；`openspec validate android-so-quick-deploy --type spec --strict` passed。
+- 全量 `nvim --headless -l tests/run.lua`：727/727 passed。
+- 指定唯一设备的只读 preflight 未执行：验证时 ADB 返回 `device not found`；未切换到其他设备，
+  未执行 staging、force-stop 或启动。
+
 ### 2026-08-06 — 在非 root 设备保留原签名并以 ClassLoader generation 替换 SO
 
 **Task**

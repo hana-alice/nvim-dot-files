@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -20,6 +21,8 @@ static char g_directory[PATH_MAX];
 static char g_status[PATH_MAX];
 static volatile int g_claimed;
 static volatile int g_redirected;
+static volatile int g_mapping_confirmed;
+static volatile int g_agent_initialized;
 static _Thread_local int g_in_callback;
 
 static void copy_option(char *destination, size_t capacity, const char *begin,
@@ -200,6 +203,14 @@ static int find_library(jvmtiEnv *jvmti, JNIEnv *env, jobject loader,
   if (base_class == NULL || clear_exception(env)) {
     return -1;
   }
+  // ClassPrepare also fires for boot classes. Their loader may be BootClassLoader,
+  // which is not a BaseDexClassLoader; calling a BaseDex method on it makes CheckJNI
+  // abort the process instead of raising a catchable Java exception.
+  if (loader == NULL || !(*env)->IsInstanceOf(env, loader, base_class)) {
+    clear_exception(env);
+    (*env)->DeleteLocalRef(env, base_class);
+    return 0;
+  }
   jmethodID method = find_method_id(
       jvmti, base_class, "findLibrary", "(Ljava/lang/String;)Ljava/lang/String;");
   if (method == NULL) {
@@ -270,7 +281,7 @@ static void prepend_private_directory(jvmtiEnv *jvmti, JNIEnv *env,
   if (path_list_field == NULL || elements_field == NULL ||
       add_native_path == NULL || list_constructor == NULL || list_add == NULL ||
       clear_exception(env)) {
-    fail_process("Android class-loader layout does not match the API 34 contract");
+    fail_process("Android class-loader layout does not match the required contract");
   }
 
   jobject path_list = (*env)->GetObjectField(env, loader, path_list_field);
@@ -362,6 +373,35 @@ static char *mapping_path(char *line) {
   return cursor;
 }
 
+static int paths_equivalent(const char *left, const char *right) {
+  if (strcmp(left, right) == 0) {
+    return 1;
+  }
+  // Android's linker may record app-private mappings under /data/data even when
+  // BaseDexClassLoader returned the equivalent /data/user/0 path. realpath()
+  // is not reliable for this comparison on all vendor builds, so handle the
+  // well-known Android CE-storage alias explicitly.
+  static const char data_user_prefix[] = "/data/user/0/";
+  static const char data_data_prefix[] = "/data/data/";
+  if (strncmp(left, data_user_prefix, sizeof(data_user_prefix) - 1) == 0 &&
+      strncmp(right, data_data_prefix, sizeof(data_data_prefix) - 1) == 0 &&
+      strcmp(left + sizeof(data_user_prefix) - 1,
+             right + sizeof(data_data_prefix) - 1) == 0) {
+    return 1;
+  }
+  if (strncmp(right, data_user_prefix, sizeof(data_user_prefix) - 1) == 0 &&
+      strncmp(left, data_data_prefix, sizeof(data_data_prefix) - 1) == 0 &&
+      strcmp(right + sizeof(data_user_prefix) - 1,
+             left + sizeof(data_data_prefix) - 1) == 0) {
+    return 1;
+  }
+  char canonical_left[PATH_MAX];
+  char canonical_right[PATH_MAX];
+  return realpath(left, canonical_left) != NULL &&
+         realpath(right, canonical_right) != NULL &&
+         strcmp(canonical_left, canonical_right) == 0;
+}
+
 static int maps_contains_exact_path(const char *path) {
   FILE *maps = fopen("/proc/self/maps", "re");
   if (maps == NULL) {
@@ -371,7 +411,7 @@ static int maps_contains_exact_path(const char *path) {
   int found = 0;
   while (fgets(line, sizeof(line), maps) != NULL) {
     char *mapped = mapping_path(line);
-    if (mapped != NULL && strcmp(mapped, path) == 0) {
+    if (mapped != NULL && paths_equivalent(mapped, path)) {
       found = 1;
       break;
     }
@@ -391,7 +431,11 @@ static void *watch_library_maps(void *unused) {
     if (original_mapped) {
       fail_process("installed APK libUE4.so was mapped; redirection failed closed");
     }
-    if (!mapped && __atomic_load_n(&g_redirected, __ATOMIC_ACQUIRE)) {
+    if (!mapped) {
+      // ActivityManager can load this agent into more than one linker namespace.
+      // A duplicate instance has independent globals and may not be the instance
+      // that performed ClassLoader redirection, but it must still accept the
+      // already-mapped target instead of killing the process on timeout.
       int target_mapped = maps_contains_exact_path(g_target);
       if (target_mapped < 0) {
         fail_process("unable to read /proc/self/maps");
@@ -406,8 +450,14 @@ static void *watch_library_maps(void *unused) {
         }
         __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "mapped %s", g_target);
         write_status("mapped", g_target);
+        __atomic_store_n(&g_mapping_confirmed, 1, __ATOMIC_RELEASE);
         mapped = 1;
       }
+    }
+    // ActivityManager may invoke Agent_OnAttach more than once for one bind on
+    // this vivo build. A duplicate watcher must honor another watcher's proof.
+    if (!mapped && __atomic_load_n(&g_mapping_confirmed, __ATOMIC_ACQUIRE)) {
+      mapped = 1;
     }
     if (!mapped && attempt + 1 >= MAP_POLL_LIMIT) {
       fail_process("private libUE4.so mapping did not appear before timeout");
@@ -470,6 +520,11 @@ static void JNICALL on_class_prepare(jvmtiEnv *jvmti, JNIEnv *env,
 JNIEXPORT jint JNICALL Agent_OnAttach(JavaVM *vm, char *options,
                                       void *reserved) {
   (void)reserved;
+  if (!__sync_bool_compare_and_swap(&g_agent_initialized, 0, 1)) {
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
+                        "duplicate Agent_OnAttach ignored");
+    return AGENT_OK;
+  }
   if (options == NULL) {
     _exit(86);
   }

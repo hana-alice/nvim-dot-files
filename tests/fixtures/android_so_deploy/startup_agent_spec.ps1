@@ -55,7 +55,8 @@ foreach ($forbidden in @(
   "JVM_NativeLoad",
   "RegisterNatives",
   "class_suffix",
-  "strstr(line, path)"
+  "strstr(line, path)",
+  "API 34 contract"
 )) {
   if ($agent.IndexOf($forbidden, [StringComparison]::Ordinal) -ge 0) {
     throw "startup agent uses a rejected preload/native-hook mechanism: $forbidden"
@@ -109,6 +110,15 @@ foreach ($required in @(
 )) {
   if ($launch.IndexOf($required, [StringComparison]::Ordinal) -lt 0) {
     throw "launch contract is missing: $required"
+  }
+}
+
+foreach ($scriptText in @($deploy, $launch)) {
+  if ([regex]::IsMatch(
+      $scriptText,
+      '\$apiLevel\s+-(?:eq|ne|in|notin|gt|ge|lt|le|match|notmatch|like|notlike)\b',
+      [Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+    throw "startup-agent transport gates an observed capability on an API-level comparison"
   }
 }
 

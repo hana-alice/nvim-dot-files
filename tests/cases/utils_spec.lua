@@ -258,7 +258,7 @@ end)
 t.describe("utils.ue_goto 子模块", function()
   for _, sub in ipairs({
     "jumper", "provider", "location", "symbol", "cache",
-    "semantic_context", "semantic_protocol", "semantic_client", "semantic_sidecar",
+    "semantic_context", "semantic_protocol", "semantic_client", "semantic_navigation", "semantic_sidecar",
   }) do
     t.it("utils.ue_goto." .. sub .. " 返回 table", function()
       t.assert_type(require("utils.ue_goto." .. sub), "table")

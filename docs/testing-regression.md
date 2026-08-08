@@ -19,6 +19,7 @@
 | `lua/ue.lua` 项目选择 / context 解析 | `ue_project_context` `ue_api` `smoke` |
 | `lua/ue/cdb/**` | `ue_cdb` |
 | `lua/ue/dap/**` / `lua/utils/platform/**` | `dap` `platform` |
+| `lua/ue/index/**` / `lua/ue/clangd_commands.lua` / controlled CDB generators | `index_generation` `cpp_semantic_index` `clangd_commands` `ue_api` |
 | `lua/utils/ue_goto/**` / C++ `gd` | `cpp_semantic_context` `cpp_semantic_client` `cpp_semantic_sidecar` `ue_goto_behavior` `utils` |
 | `code_search/**` / `ue_paths.lua` | `ue_goto_behavior` `ue_paths` `utils` |
 | `lua/config/options.lua` / `autocmds.lua` | `options` `autocmds` |
@@ -28,7 +29,7 @@
 | 文档 / 规则 / 知识库结构 | `structure` |
 | **跨子系统 / 公共 helper / 重构 / 拿不准** | **全量（不带 filter）** |
 
-> 与 `tests/CLAUDE.md` 的 CHANGE-TO-FILTER MAP 保持一致；新增/重命名 spec 时两处同步。
+> 与 `tests/AGENTS.md` 的 CHANGE-TO-FILTER MAP 保持一致；新增/重命名 spec 时两处同步。
 
 ### 配套要求
 

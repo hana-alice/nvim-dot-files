@@ -1,4 +1,5 @@
 local M = {}
+local semantic_context = require("utils.ue_goto.semantic_context")
 
 local TERMINAL = {
   resolved = true,
@@ -128,27 +129,42 @@ function M.install(client, deps)
 
   function client.note_origin(winid, origin_tu, build_fingerprint, context_id)
     winid = winid or vim.api.nvim_get_current_win()
-    local context
+    local lineage
     if type(origin_tu) == "table" then
-      context = vim.deepcopy(origin_tu)
-      context.build_fingerprint = build_fingerprint or context.build_fingerprint
+      lineage = semantic_context.make_lineage_record({
+        context = origin_tu,
+        build_fingerprint = build_fingerprint or origin_tu.build_fingerprint,
+        source_action_token = origin_tu.source_action_token,
+      })
+      if not lineage then
+        lineage = vim.deepcopy(origin_tu)
+        lineage.build_fingerprint = build_fingerprint or lineage.build_fingerprint
+      end
     else
-      context = {
+      lineage = {
         origin_tu = origin_tu,
         id = context_id,
         context_id = context_id,
         build_fingerprint = build_fingerprint,
+        subject_membership = {},
       }
     end
-    state.window_contexts[winid] = context
+    state.window_contexts[winid] = lineage
   end
 
-  function client.window_origin(winid, build_fingerprint)
+  function client.window_origin(winid, build_fingerprint, subject_path)
     winid = winid or vim.api.nvim_get_current_win()
     local origin = state.window_contexts[winid]
     if origin and origin.build_fingerprint ~= build_fingerprint then
       state.window_contexts[winid] = nil
       return nil
+    end
+    if origin and subject_path then
+      local ok = semantic_context.context_supports_subject(origin, subject_path)
+      if not ok then
+        state.window_contexts[winid] = nil
+        return nil
+      end
     end
     return origin
   end
@@ -202,6 +218,8 @@ function M.install(client, deps)
       origin_tu = origin_tu,
       cdb_dir = context.cdb_dir or environment.cdb_dir,
       compile = context.compile,
+      evidence_fingerprint = context.evidence_fingerprint,
+      subject_membership = semantic_context.context_subject_membership(context),
     }
   end
 
@@ -213,10 +231,35 @@ function M.install(client, deps)
         path = spec.path,
         line = spec.line,
         column = spec.column,
-        document_version = snapshot.document_version,
+        document_version = snapshot and snapshot.document_version or nil,
       },
       contexts = { request_context },
       overlays = client.collect_unsaved_overlays(environment),
+    }, callback, environment)
+  end
+
+  function client.lookup_definition(spec, callback)
+    local environment = spec.environment
+    local cdb_paths = environment.semantic_cdb_paths or {}
+    if #cdb_paths == 0 then
+      for _, candidate in ipairs(environment.controlled_candidates or {}) do
+        if candidate.background_cdb_path then
+          cdb_paths[#cdb_paths + 1] = candidate.background_cdb_path
+        end
+      end
+    end
+    if #cdb_paths == 0 then
+      vim.schedule(function()
+        callback(unavailable("no-proven-module-contexts", "lookup-definition"))
+      end)
+      return
+    end
+    client.request("lookup-definition", {
+      usr = spec.usr,
+      subject = spec.path,
+      cdb_paths = cdb_paths,
+      overlays = client.collect_unsaved_overlays(environment),
+      document_version = spec.snapshot and spec.snapshot.document_version or nil,
     }, callback, environment)
   end
 
@@ -249,19 +292,80 @@ function M.install(client, deps)
       callback(response)
     end
 
-    local function dispatch(context)
+    local dispatch
+
+    local function catalog_contexts(allow_select)
+      client.request("catalog", {
+        header = spec.path,
+        cdb_dir = environment.cdb_dir,
+        active_cdb_path = environment.active_cdb_path,
+        active_manifest_path = environment.active_manifest_path,
+        project_root = environment.project_root,
+        engine_root = environment.engine_root,
+        active_build_key = environment.active_build_key,
+        active_build = environment.active_build,
+        evidence_roots = environment.evidence_roots,
+      }, function(catalog)
+        local current, stale_reason = client.snapshot_is_current(snapshot)
+        if not current then
+          finish_progress(timer)
+          emit_trace("stale", {
+            request_id = catalog.id,
+            provider = "sidecar",
+            terminal_state = catalog.state,
+            stale_reason = stale_reason,
+          })
+          callback(nil, stale_reason)
+          return
+        end
+        local contexts = catalog.contexts or {}
+        if catalog.state == "unavailable" or #contexts == 0 then
+          finish(catalog)
+        elseif #contexts == 1 or allow_select == false then
+          dispatch(contexts[1], false)
+        else
+          finish_progress(timer)
+          vim.ui.select(contexts, {
+            prompt = "Select proven translation-unit context",
+            format_item = function(item)
+              return tostring(item.label or vim.fn.fnamemodify(item.origin_tu or "", ":t"))
+            end,
+          }, function(choice)
+            if not choice then
+              notify_terminal(catalog)
+              callback(catalog)
+              return
+            end
+            dispatch(choice, false)
+          end)
+        end
+      end, environment)
+    end
+
+    dispatch = function(context, allow_recatalog)
       query(spec, context, function(response)
+        if response and response.reason == "invalid-query-file-not-in-tu" and allow_recatalog then
+          state.window_contexts[snapshot.winid] = nil
+          catalog_contexts(true)
+          return
+        end
         if response and response.state == "resolved" then
-          context.build_fingerprint = environment.build_fingerprint
-          client.note_origin(snapshot.winid, context, environment.build_fingerprint)
+          local lineage = vim.deepcopy(context)
+          lineage.build_fingerprint = environment.build_fingerprint
+          lineage.source_action_token = snapshot.token
+          lineage.subject_membership = semantic_context.context_subject_membership(context)
+          if #lineage.subject_membership == 0 then
+            lineage.subject_membership = { spec.path }
+          end
+          client.note_origin(snapshot.winid, lineage, environment.build_fingerprint)
         end
         finish(response)
       end)
     end
 
-    local inherited = client.window_origin(snapshot.winid, environment.build_fingerprint)
+    local inherited = client.window_origin(snapshot.winid, environment.build_fingerprint, spec.path)
     if inherited and inherited.origin_tu then
-      dispatch(inherited)
+      dispatch(inherited, true)
       return
     end
 
@@ -269,51 +373,7 @@ function M.install(client, deps)
       finish(unavailable("no active build dependency roots", "catalog"))
       return
     end
-    client.request("catalog", {
-      header = spec.path,
-      cdb_dir = environment.cdb_dir,
-      active_cdb_path = environment.active_cdb_path,
-      active_manifest_path = environment.active_manifest_path,
-      project_root = environment.project_root,
-      engine_root = environment.engine_root,
-      active_build_key = environment.active_build_key,
-      active_build = environment.active_build,
-      evidence_roots = environment.evidence_roots,
-    }, function(catalog)
-      local current, stale_reason = client.snapshot_is_current(snapshot)
-      if not current then
-        finish_progress(timer)
-        emit_trace("stale", {
-          request_id = catalog.id,
-          provider = "sidecar",
-          terminal_state = catalog.state,
-          stale_reason = stale_reason,
-        })
-        callback(nil, stale_reason)
-        return
-      end
-      local contexts = catalog.contexts or {}
-      if catalog.state == "unavailable" or #contexts == 0 then
-        finish(catalog)
-      elseif #contexts == 1 then
-        dispatch(contexts[1])
-      else
-        finish_progress(timer)
-        vim.ui.select(contexts, {
-          prompt = "Select proven translation-unit context",
-          format_item = function(item)
-            return tostring(item.label or vim.fn.fnamemodify(item.origin_tu or "", ":t"))
-          end,
-        }, function(choice)
-          if not choice then
-            notify_terminal(catalog)
-            callback(catalog)
-            return
-          end
-          dispatch(choice)
-        end)
-      end
-    end, environment)
+    catalog_contexts(true)
   end
 
   function client.prove_source(spec, callback)
@@ -327,16 +387,34 @@ function M.install(client, deps)
       active_manifest_path = env.active_manifest_path,
       context_id = context_id,
     }, function(proof)
-      if proof and proof.state == "resolved" then
-        proof.origin_context = {
-          id = proof.context_id,
-          context_id = proof.context_id,
-          origin_tu = proof.origin_tu,
-          cdb_dir = env.cdb_dir,
-          compile = proof.compile,
-        }
+      if not proof or proof.state ~= "resolved" then
+        callback(proof)
+        return
       end
-      callback(proof)
+      local origin_context = {
+        id = proof.context_id,
+        context_id = proof.context_id,
+        origin_tu = proof.origin_tu,
+        cdb_dir = env.cdb_dir,
+        compile = proof.compile,
+      }
+      query({
+        snapshot = spec.snapshot,
+        environment = env,
+        path = spec.source,
+        line = spec.line,
+        column = spec.column,
+      }, origin_context, function(entity)
+        if not entity or entity.state ~= "resolved" then
+          callback(entity or proof)
+          return
+        end
+        entity.origin_tu = proof.origin_tu
+        entity.compile = proof.compile
+        entity.compile_command_fingerprint = proof.compile_command_fingerprint
+        entity.origin_context = origin_context
+        callback(entity)
+      end)
     end, env)
   end
 

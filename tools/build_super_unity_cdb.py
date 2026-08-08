@@ -20,7 +20,7 @@ RE_FI_PCH = re.compile(r'/FI"([^"]*(?:SharedPCH|PCH)\.[^"]*)"')
 RE_API_DEF = re.compile(r'^\s*#\s*define\s+(\w+_API|\w+_NON_ATTRIBUTED_API)\s+(DLLEXPORT|DLLIMPORT)\s*$')
 
 def winpath_local(p):
-    if len(p) >= 2 and p[1] == ':' and os.path.isdir('/mnt/c'):
+    if sys.platform.startswith('linux') and len(p) >= 2 and p[1] == ':' and os.path.isdir('/mnt/c'):
         return f'/mnt/{p[0].lower()}/' + p[2:].replace('\\', '/').lstrip('/')
     return p
 

@@ -1470,7 +1470,7 @@ function M.stop_android_debugger(opts)
     if cleanup_done then return end
     cleanup_done = true
     M._cleanup_device_side()
-    result.adapter_killed = true
+    result.adapter_killed = sess_active ~= nil
     reset_session()
   end
 

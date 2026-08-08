@@ -55,8 +55,9 @@ startup-agent 能力（K47）；非 root 不能靠预 `dlopen`/SONAME 猜复用�
 ### 工具链 / LLVM（K14–K15、K41）
 LLVM 22.0–22.1.5 的 `lldb-dap.exe` Windows 启动崩（`STATUS_STACK_BUFFER_OVERRUN`）；
 适配器迁移弧线（lldb-dap 21.1.8 → codelldb 1.12.2 → **LLVM 22.1.6+ lldb-dap forward-only，
-当前 Android DAP**）；跨盘 project root 缺 `.clangd` → UEPrepare 后 clangd background-index
-吃满 CPU/内存，`sync_dot_clangd` 须 engine+project 双写（K41）。
+当前 Android DAP**）；依赖路径向上发现的 `.clangd` 会让跨根 TU 漏掉资源门禁，而 monolithic
+External index 又不能证明 LSP definition 可达 body。现状固定 `--enable-config=false`，由
+generation manifest + controlled BackgroundIndex CDB 管理覆盖，禁止恢复 `.clangd` 双写（K41）。
 → `../docs/CONSTRAINTS.md §二 工具链/LLVM`；`../docs/TOOLING.md`
 
 ### snacks / clangd / lazy（K16–K24，活跃 workaround；K21 已退役 2026-07-26）

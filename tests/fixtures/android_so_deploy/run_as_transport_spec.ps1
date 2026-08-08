@@ -65,7 +65,7 @@ function Invoke-Adb {
     return [PSCustomObject]@{ Code = 1; Text = "--attach-agent-bind <agent>" }
   }
   if ($key -eq "shell getprop ro.build.version.sdk") {
-    return [PSCustomObject]@{ Code = 0; Text = "34" }
+    return [PSCustomObject]@{ Code = 0; Text = "35" }
   }
   if ($key -eq "shell getprop ro.product.cpu.abilist") {
     return [PSCustomObject]@{ Code = 0; Text = "arm64-v8a,armeabi-v7a" }
@@ -78,8 +78,8 @@ function Invoke-Adb {
 
 $transport = Resolve-DeployTransport -PackageDump $packageDump
 if ($transport.Kind -ne "run-as-agent" -or $transport.AppUid -ne "10123" -or
-    $transport.ApiLevel -ne "34") {
-  throw "debuggable run-as transport was not selected"
+    $transport.ApiLevel -ne "35") {
+  throw "debuggable run-as transport was not selected on a capability-compatible API level"
 }
 Invoke-AdbRunAs -Arguments @("stat", "code_cache/nvim-ue-so/libUE4.so") | Out-Null
 if ($script:Calls[-1] -ne "shell run-as com.example.samplegame stat code_cache/nvim-ue-so/libUE4.so") {

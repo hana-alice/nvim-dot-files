@@ -45,6 +45,7 @@ function M.setup(deps)
 end
 
 require("ue.index._state")(M, core)
+require("ue.index._generation")(M, core)
 require("ue.index._clangd")(M, core)
 require("ue.index._build")(M, core)
 

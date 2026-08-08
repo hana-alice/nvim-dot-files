@@ -38,12 +38,12 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 | 子系统 | 位置 | 本地规则（内容源） | 一句话 |
 |---|---|---|---|
 | UE 引擎中枢 | `lua/ue.lua` + `lua/ue/` | `lua/ue/AGENTS.md` | 索引 / CDB / DAP / 命令注册的中枢 |
-| clangd 离线索引 | `lua/ue/index/` | `lua/ue/index/AGENTS.md` | current/hot/full 三相索引 + .clangd 同步（F1 切分） |
+| clangd 语义覆盖 | `lua/ue/index/` | `lua/ue/index/AGENTS.md` | current/hot/full controlled BackgroundIndex + generation 单调选择 |
 | CDB 流水线 | `lua/ue/cdb/` | `lua/ue/cdb/AGENTS.md` | compile_commands.json 生成/裁剪/注入 |
 | DAP 调试 | `lua/ue/dap/` | `lua/ue/dap/AGENTS.md` | codelldb + Android platform 模式 |
 | Android device | `lua/utils/android_device.lua` | `lua/utils/AGENTS.md` | 名称+serial picker；会话全局 serial；统一 `adb -s` |
 | Android SO 快速迭代 | `lua/ue.lua` + `scripts/ue_android_so_*.ps1` | `scripts/AGENTS.md` | `<leader>us` 只编 SO；`<leader>uq` root 替换、回滚、验证 |
-| goto 解析栈 | `lua/utils/ue_goto/` | `lua/utils/ue_goto/AGENTS.md` | C++ compiler identity + proven-TU sidecar；非 C++ compatibility fallback |
+| goto 解析栈 | `lua/utils/ue_goto/` | `lua/utils/ue_goto/AGENTS.md` | proven-TU canonical USR + module AST 唯一 body；非 C++ compatibility fallback |
 | 代码搜索 | `lua/utils/code_search/` | `lua/utils/code_search/AGENTS.md` | csearch 亚秒级 grep（兜底，非主路） |
 | 平台驱动 | `lua/utils/platform/` | `lua/utils/platform/AGENTS.md` | 唯一允许做 OS 分支的地方 |
 | workaround 注册表 | `lua/workarounds/` | `lua/workarounds/AGENTS.md` | 上游 bug 补丁，带 frontmatter |

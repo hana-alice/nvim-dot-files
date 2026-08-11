@@ -116,12 +116,60 @@ end)
 
 -- ── live grep 启动阈值 ──────────────────────────────────────────────────
 t.describe("UE grep live 输入保护", function()
-  t.it("空输入与单字符输入不启动重搜索", function()
+  t.it("空输入与单字符标识符不启动重搜索，但 literal 标点可以精确搜索", function()
     t.assert_false(ue._grep_live_search_ready_for_test("", 2), "空输入不应搜索")
     t.assert_false(ue._grep_live_search_ready_for_test(" ", 2), "空白输入不应搜索")
     t.assert_false(ue._grep_live_search_ready_for_test("R", 2), "单字符输入不应搜索")
+    t.assert_true(ue._grep_live_search_ready_for_test(".", 2, true), "literal 点号应允许单字符搜索")
+    t.assert_true(ue._grep_live_search_ready_for_test("/", 2, true), "literal 斜杠应允许单字符搜索")
+    t.assert_false(ue._grep_live_search_ready_for_test(".", 2, false), "regex 点号仍应受阈值保护")
     t.assert_true(ue._grep_live_search_ready_for_test("RD", 2), "两个字符后才搜索")
     t.assert_true(ue._grep_live_search_ready_for_test("  RD  ", 2), "阈值应按 trim 后内容判断")
+  end)
+end)
+
+t.describe("UE grep 结果信息架构与预览定位", function()
+  t.it("文件分组只标注真实命中，不插入不可预览的伪 header item", function()
+    local items = {
+      { file = "C:/UE/Game/Source/Foo.cpp", pos = { 12, 3 }, line = "first hit" },
+      { file = "C:/UE/Game/Source/Foo.cpp", pos = { 13, 5 }, line = "second hit" },
+    }
+    local got = ue._grep_annotate_file_group_for_test(items, {
+      engine_root = "C:/UE",
+      project_root = "C:/UE/Game",
+    })
+
+    t.assert_eq(#got, 2, "两条命中只能产生两条 picker item")
+    t.assert_eq(got[1].file, items[1].file, "首项仍是可跳转的真实命中")
+    t.assert_eq(got[1]._grep_group.index, 1)
+    t.assert_eq(got[1]._grep_group.count, 2)
+    t.assert_eq(got[1]._grep_group.scope, "Project")
+    t.assert_eq(got[1]._grep_group.path, "Source/Foo.cpp")
+    t.assert_eq(got[2]._grep_group.index, 2)
+
+    local first = ue._grep_format_grouped_for_test(got[1])
+    local second = ue._grep_format_grouped_for_test(got[2])
+    local function text(chunks)
+      local parts = {}
+      for _, chunk in ipairs(chunks) do parts[#parts + 1] = chunk[1] end
+      return table.concat(parts)
+    end
+    t.assert_contains(text(first), "Project")
+    t.assert_contains(text(first), "Source/Foo.cpp")
+    t.assert_contains(text(first), "(2)")
+    t.assert_contains(text(first), "first hit")
+    t.assert_contains(text(second), "second hit")
+  end)
+
+  t.it("literal 命中提供精确 end_pos，preview 不再把 raw 输入当 Vim regex", function()
+    local literal = ue._grep_hit_item_for_test("C:/UE/Foo.cpp", 8, 5, "lhs.value", ".", false)
+    t.assert_eq(literal.pos[1], 8)
+    t.assert_eq(literal.pos[2], 4)
+    t.assert_eq(literal.end_pos[1], 8)
+    t.assert_eq(literal.end_pos[2], 5)
+
+    local regex = ue._grep_hit_item_for_test("C:/UE/Foo.cpp", 8, 5, "lhs.value", ".", true)
+    t.assert_eq(regex.end_pos, nil, "regex 模式仍由 regex preview 计算真实匹配宽度")
   end)
 end)
 

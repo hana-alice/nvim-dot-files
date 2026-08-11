@@ -16,7 +16,9 @@ param(
 
   [string]$NdkRoot = $env:NDKROOT,
 
-  [switch]$PreflightOnly
+  [switch]$PreflightOnly,
+
+  [switch]$PreferRunAs
 )
 
 Set-StrictMode -Version Latest
@@ -172,6 +174,10 @@ function Resolve-RunAsTransport {
 
 function Resolve-DeployTransport {
   param([Parameter(Mandatory = $true)][string]$PackageDump)
+
+  if ($script:PreferRunAs) {
+    return Resolve-RunAsTransport -PackageDump $PackageDump
+  }
 
   $root = Resolve-RootTransport -AllowUnavailable
   if (-not [string]::IsNullOrWhiteSpace($root)) {

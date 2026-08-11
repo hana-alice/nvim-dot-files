@@ -300,7 +300,9 @@
   解决约束: 部署前必须校验源 SO 同目录 `packageInfo.txt` 与设备安装包的 package/versionCode。
   root 原地替换在不一致时继续拒绝；app-private agent 路径不修改 APK，versionCode 差异只作为明确
   警告，不能伪装成 Java/JNI 兼容证明。两条路径都只支持 native-only 迭代；涉及新 Java 方法、
-  manifest 或 Gradle 产物时，SO 注入本身无法让旧 APK 获得这些接口。
+  manifest 或 Gradle 产物时，SO 注入本身无法让旧 APK 获得这些接口。任务已声明 SO-only 时，
+  后续“重编/再试”仍只能解释为重编、部署 SO；基线不兼容是阻塞证据，不是擅自打包或安装 APK 的
+  授权。只有用户明确要求“打包/装包”时才能进入 `<Space>ui` 或等价 APK 安装流程。
   → `scripts/ue_android_so_deploy.ps1`; `openspec/specs/android-so-quick-deploy/spec.md`
 
 - **K45 — `Client` 是项目/Target 名，不是 Android 目录协议**

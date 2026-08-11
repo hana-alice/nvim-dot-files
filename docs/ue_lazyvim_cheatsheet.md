@@ -5,7 +5,7 @@
 
 **Two surfaces, one source of truth:**
 
-- 🪟 **Floating cheatsheet** — `<leader>?` / `:UECheatsheet` (tabbed cards).
+- 🪟 **Floating cheatsheet** — `<leader>?` / `:UECheatsheet` (searchable, classified cards).
 - 📄 **This document** — `:UECheatsheetEdit`, the full reference.
 
 Both are tested: `tests/cases/cheatsheet_spec.lua` fails if a command listed
@@ -99,6 +99,10 @@ and update **both** this doc and `lua/utils/cheatsheet.lua`.
 | Visual   | `v` `V` `<C-v>`    | Select regions                |
 | Command  | `:`                | Ex commands (`:w` `:q` `:s`)  |
 | Terminal | `<C-/>` toggle     | Shell input, `<Esc>` to exit  |
+
+Common insert-entry pairs: `i` / `I` insert before the cursor / at line start;
+`a` / `A` insert after the cursor / at line end. In the floating cheatsheet,
+search `aA` to find that pair directly.
 
 ## Vim Fundamentals — Motions
 
@@ -358,10 +362,17 @@ press inside the picker (the active ones show as icons in the title):
 
 | Key | Toggle |
 |---|---|
-| `<a-r>` / `<a-g>` | regex on/off (off = literal) — shows **R** |
+| `<a-r>` / `<a-g>` | regex on/off — default literal shows **L**, regex shows **R** |
 | `<a-w>` / `<a-x>` | whole-word — shows **W** |
 | `<a-c>` | case-sensitive (default ignore-case) — shows **C** |
 | `<a-s>` | restrict to current module/plugin **scope** — shows **S** |
+
+Literal mode is exact: characters such as `.`, `/`, `[`, and `(` are searched
+as themselves. A single punctuation character is allowed; a one-character
+identifier and a one-character regex stay gated to avoid unbounded result sets.
+Results are grouped as `Project` / `Engine` / `Workspace`; the first real hit
+shows the relative path and per-file count, and every row previews and opens its
+actual match location.
 
 If there's no csearch index, `<leader>/` shows an error telling you to run
 `:UEPrepare` (it will NOT silently fall back to a slow rg search).
@@ -396,9 +407,9 @@ If there's no csearch index, `<leader>/` shows an error telling you to run
    | `<leader>sy` / `<leader>sY` | live grep with current word **prefilled** (then edit + add `-- flags`) |
    | `<leader>sg` / `<leader>sG` | grep workspace code / all files |
 
-So the answer to "Space `/` then whole-word capital": either launch with
-`<leader>sx`, or in the `<leader>/` box type `pattern -- -w` (add `-s` for
-capital/case-sensitive).
+So the answer to "Space `/` then whole-word capital" is: open `<leader>/`, type
+the literal pattern, then press `<a-w>` for whole-word and `<a-c>` for
+case-sensitive. Inline `--` flags belong only to the explicit rg pickers.
 
 ### Picker matcher (this config)
 
@@ -941,12 +952,20 @@ Source: `lua/utils/cheatsheet.lua` (set when `:UECheatsheet` opens).
 
 | Key                  | Action         |
 |----------------------|----------------|
-| `q` / `<Esc>`        | Close          |
+| `q`                  | Close          |
+| `<Esc>`              | Clear an active search; otherwise close |
+| `/`                  | Live-search every shortcut and description |
+| `<C-l>`              | Clear the search and return to the active category |
 | `<Tab>` / `<S-Tab>`  | Next / prev category tab |
 | `1` … `9`            | Jump to tab N  |
 | `j` / `k`            | Move           |
 | `<C-f>` / `<C-b>`    | Page down / up |
 | `gg` / `G`           | Top / bottom   |
+
+Search results keep their original `Tab › Section` classification instead of
+becoming a flat list. Display separators are ignored for exact key lookup, so
+`wW` immediately finds `Basics › Motions` → `w / W`, and `aA` finds
+`Basics › Modes` → `a / A`. Matching is case-insensitive.
 
 ---
 

@@ -56,6 +56,143 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-08-11 — 同步并归档已完成的任务管理与 Android F9 规格
+
+**Task**
+
+收尾两个长期处于 complete 状态的 OpenSpec change，使已落地行为进入主规格并清理 active change 列表。
+
+**Implemented**
+
+- 新建 `openspec/specs/task-management/spec.md`，同步 `ue-task-manager` 的 11 条任务注册、派生状态、取消、picker/命令、statusline 与竞态消除要求。
+- 新建 `openspec/specs/android-f9-breakpoint-hit/spec.md`，同步 Android F9 单一 owner、端到端命中、LLDB 证据、address 等价与诊断要求。
+- `android-dap-attach` 主规格已经完整覆盖 delta，且包含后来落地的全局 serial 与 live F9 更强合同；同步保持当前主规格，没有用旧 delta 降级。
+- 将 38/38 tasks 完成的 `ue-task-manager` 归档至 `openspec/changes/archive/2026-08-11-ue-task-manager/`，将 31/31 tasks 完成的 `fix-android-f9-breakpoint-hit` 归档至 `openspec/changes/archive/2026-08-11-fix-android-f9-breakpoint-hit/`。
+
+**Pitfalls / Gotchas**
+
+- delta 是变更当时的意图，不是覆盖当前主规格的快照；Android attach 主规格已演进到“不重连即时生效”，因此只核对 requirement/scenario 覆盖，不反向恢复旧的“提示手动 reattach”终态。
+- 本次搜索/cheatsheet 改动没有对应 active change；不得为了执行 archive 指令而擅自归到两个无关历史 change 中。
+
+**Validation**
+
+- tasks 审计：`ue-task-manager` 38/38、`fix-android-f9-breakpoint-hit` 31/31，均无未完成项；artifacts 均为 done。
+- requirements 交叉检查：`task-management` 11/11、`android-f9-breakpoint-hit` 6/6、`android-dap-attach` 2/2，无缺失。
+- `openspec validate ue-task-manager|fix-android-f9-breakpoint-hit --strict`：归档前均 valid；`task-management` 与 `android-f9-breakpoint-hit` 主规格 strict validation 均通过。
+- `nvim --headless -l tests/run.lua`：776/776 passed；公开仓库已知 serial/package/user-profile/private-key/API-secret 扫描 0 命中，`git diff --check` 通过。
+
+**Follow-ups**
+
+- 无。
+
+### 2026-08-10 — 让快捷键帮助可以按键位实时搜索并保留分类
+
+**Task**
+
+回归 `<leader>?` 的快捷键入口与界面信息架构，让 `wW`、`aA` 这类成对大小写键位无需猜 tab，输入后立即找到对应操作和原始分类。
+
+**Implemented**
+
+- `lua/utils/cheatsheet.lua` 新增 `/` 实时搜索和 `<C-l>` 清除筛选；匹配覆盖键位、说明、tab 与 section，并按相关度排序。
+- 搜索结果继续以 `Tab › Section` 分组；`wW` 顶部命中 `Basics › Motions` 的 `w / W`，`aA` 顶部命中 `Basics › Modes` 的 `a / A`。
+- 将 word/WORD motions 与 insert-entry modes 改成逐动作的大小写成对展示，空格包围的展示分隔符不参与精确键位匹配，实际 `/` 键仍可搜索。
+- `tests/cases/cheatsheet_spec.lua` 新增全表可发现性/分类审计及真实 `/wW<CR>`、`/aA<CR>` 浮窗交互；`tests/cases/keymaps_spec.lua` 锁定 `<leader>?` → `UECheatsheet`。
+- `openspec/specs/keymap-command-regression/spec.md` 与 `docs/ue_lazyvim_cheatsheet.md` 同步搜索及分类合同。
+
+**Pitfalls / Gotchas**
+
+- Snacks 的 keymap picker 只看实际映射，无法覆盖 `w/W/a/A` 等 Vim built-in；因此入口必须基于 cheatsheet 的完整教学数据，而不是复用 `<leader>sk`。
+- 普通 lowercase 搜索会把 `wW` 折叠成 `ww`；只有先把 `w / W` 这类展示分隔符归一化，才能既保持大小写不敏感又命中成对键位。
+
+**Validation**
+
+- TDD 红灯：`nvim --headless -l tests/run.lua cheatsheet` 初始 `119/124`，5 条搜索/分类合同按预期失败。
+- 定向：`cheatsheet` `126/126`、`keymaps` `53/53`；真实按键输入后 extmark 可见内容包含预期 `Tab › Section` 与键位。
+- 静态/规格：`lint_no_bare_globals` 115 files OK；`openspec validate keymap-command-regression --type spec --strict` PASS；`git diff --check` PASS。
+- 全量：`nvim --headless -l tests/run.lua` `776/776` PASS。
+
+**Follow-ups**
+
+- 无。
+
+### 2026-08-10 — 让 `<Space>/` 默认真正 literal，并让每条结果都可预览
+
+**Task**
+
+修复默认搜索单个 `.` / `/` 不启动、literal 命中在 preview 中仍像 regex 一样高亮，以及按文件插入
+synthetic header 导致结果分类重复、首项和大量列表项没有真实源码预览的问题。
+
+**Implemented**
+
+- `lua/utils/code_search/init.lua` 的 literal quote 改为与 RE2 `regexp.QuoteMeta` 一致，只转义真正
+  metacharacter；`/`、`-`、`%` 保持字面值。
+- `lua/ue.lua` 允许默认 literal 模式下的单字符标点搜索，同时继续拦截单字符 identifier 和单字符
+  regex；literal hit 写入精确 `end_pos`，Snacks preview 不再用 raw 输入二次执行 Vim regex。
+- 删除可选中的 synthetic file-header item。csearch 按文件流式输出时仅缓冲当前文件，给真实命中标注
+  Project / Engine / Workspace、相对路径、组内序号与命中数；首行承担分组标题但仍是实际命中，后续行
+  保留缩进层级，因此任意结果都能 preview/confirm 到准确位置。
+- picker 标题明确显示 `[scope: all]` 或当前模块/plugin scope；literal 与 regex 分别显示 `L` / `R`。
+  `docs/ue_lazyvim_cheatsheet.md` 同步修正 visual toggles 与旧的 inline-rg-flags 误导。
+
+**Pitfalls / Gotchas**
+
+- backend 已按 literal 转义并不等于整个 UI 是 literal：Snacks 在没有 `end_pos` 时会把
+  `filter.search` 再交给 `vim.regex`，所以 `.` 的结果集合正确但 preview 高亮仍像“任意字符”。
+- synthetic header 看似能分组，但它也是 picker selection；初始项必落 header，单命中文件又让约一半
+  列表项没有真实 match preview。分组信息必须附着在真实 hit 上。
+
+**Validation**
+
+- 真实 csearch 小索引证明 `/` 与 `\\/` 都只命中字面 slash，`\\.` 只命中字面 dot，`.` regex
+  会扩展到任意字符；实现回归锁定 RE2 quote 集和 literal exact span。
+- `grep_cache` 27/27、`utils` 46/46、`ue_api` 54/54、`smoke` 18/18、`commands` 90/90 passed。
+- `openspec validate ue-code-search --type spec --strict` passed；
+  `nvim -l scripts/lint_no_bare_globals.lua lua` 115 files OK；全量回归 768/768 passed。
+
+**Follow-ups**
+
+- 无；保留 `:UEGrepGroupingToggle` 作为 structured presentation 的诊断 A/B 开关。
+
+### 2026-08-10 — Root 设备可显式选择可回滚的 app 私有 SO 注入
+
+**Task**
+
+在不修改已安装 APK/native library 的前提下，为 root 调试设备提供显式的 app 私有 SO 验证路径，
+同时保留既有 root 原子替换作为默认行为。
+
+**Implemented**
+
+- `scripts/ue_android_so_deploy.ps1` 新增 `-PreferRunAs`；仅在显式传入时优先选择
+  `run-as/startup-agent`，未传入时的 root/run-as 自动选择顺序不变。
+- `tests/fixtures/android_so_deploy/run_as_transport_spec.ps1` 固定默认选择前提，并新增
+  root-capable 场景的显式 run-as 选择合同，禁止该路径探测或使用 root transport。
+
+**Pitfalls / Gotchas**
+
+- app 私有 SO 能发布并被 `/proc/<pid>/maps` 证明已映射，不代表它与已安装 APK 的 Java/JNI
+  基线兼容。实机运行在 `GameActivity.getDid()` 上得到 `NoSuchMethodError`，随后 ART 因 pending
+  exception 中的 JNI 调用中止；该失败不能归因于 VRS 或锁屏。
+- 作用域错误留底：用户已要求 SO-only 后，“编一下再试试”只能重编/部署 SO；本次错误地把 JNI
+  mismatch 扩成 APK 打包并执行 `adb install -r -d`。今后版本不兼容只能 fail closed，禁止把它
+  当成打包/装包授权；必须等用户明确说“打包/装包”。
+- 设备 `versionCode=176314399`，本地 build metadata 已被中止的 package flow 改写为 `1`；
+  warning-only 的 app 私有路径只证明 transport 可用，不能绕过版本/JNI 兼容性验证。
+
+**Validation**
+
+- fixture `run_as_transport_spec.ps1`：PASS；`nvim --headless -l tests/run.lua ue_api`：54/54 passed。
+- 实机 `10.102.99.54:43581` preflight 证明选择 `run-as/startup-agent` 且不改变设备状态；实际发布后
+  maps 证明只映射 app 私有 SO。失败后只删除本次 347 MB staging 目录，已安装 `libUE4.so`
+  SHA-256 仍为 `e26864ba506d0bdeb46d3678b611917bb708fd4cb099fc8a4f606cc09e447dfe`；
+  不带 agent 的 15 秒 control launch 保持前台存活。
+- 新 SO 日志证明设备支持 `VK_KHR_fragment_shading_rate`（`pipeline=1, rates=7`）；因 JNI 中止发生在
+  PSO 创建前，尚未证明 fixed-VRS PSO 的 `2x2` 执行路径。
+
+**Follow-ups**
+
+- 取得与 native build 同基线、包含 `GameActivity.getDid()` 且版本匹配的 APK 后，再验证
+  `r.Mobile.OnePassShadowMask.ShadingRate=2` 与 `fragmentSize=2x2` PSO 日志。
+
 ### 2026-08-08 — 让 C++ `gd` 从 canonical entity 完整到达唯一函数体
 
 **Task**

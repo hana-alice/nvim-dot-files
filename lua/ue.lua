@@ -5059,9 +5059,102 @@ function M._foreign_buffer_key_for_test(path, proot, eroot)
   return CORE_RT.foreign_buffer_key(path, proot, eroot)
 end
 
-function CORE_RT.grep_live_search_ready(pattern, min_chars)
+function CORE_RT.grep_live_search_ready(pattern, min_chars, literal)
   min_chars = tonumber(min_chars) or 2
-  return #trim(tostring(pattern or "")) >= min_chars
+  local query = trim(tostring(pattern or ""))
+  if query == "" then return false end
+  if #query >= min_chars then return true end
+  -- Single alphanumeric searches explode into thousands of results, but a
+  -- single punctuation character is often the exact token being sought in
+  -- source code. Permit it only in literal mode; regex "." must remain gated.
+  return literal == true and query:find("[%w_]") == nil
+end
+
+function CORE_RT.grep_result_context(ctx, file)
+  ctx = ctx or {}
+  local path = norm(file)
+  local compare_path = path:lower()
+
+  local function classify(root, scope, token)
+    root = norm(root)
+    if root == "" then return nil end
+    local compare_root = root:lower()
+    if compare_path ~= compare_root
+        and compare_path:sub(1, #compare_root + 1) ~= compare_root .. "/" then
+      return nil
+    end
+    local relative = compare_path == compare_root and "." or path:sub(#root + 2)
+    return { scope = scope, token = token, path = relative }
+  end
+
+  -- A project may live below the engine root, so the narrower project scope
+  -- must win before the engine check.
+  return classify(ctx.project_root, "Project", "P")
+    or classify(ctx.engine_root, "Engine", "E")
+    or classify(workspace_root(ctx), "Workspace", "W")
+    or { scope = "External", token = "X", path = path }
+end
+
+function CORE_RT.grep_annotate_file_group(items, ctx)
+  local count = #(items or {})
+  local annotated = {}
+  for index, item in ipairs(items or {}) do
+    local copy = vim.tbl_extend("force", {}, item)
+    local context = CORE_RT.grep_result_context(ctx, item.file)
+    copy._grep_group = {
+      index = index,
+      count = count,
+      scope = context.scope,
+      token = context.token,
+      path = context.path,
+    }
+    annotated[#annotated + 1] = copy
+  end
+  return annotated
+end
+
+function CORE_RT.grep_format_grouped(item)
+  local group = item._grep_group or {
+    index = 1,
+    count = 1,
+    scope = "Workspace",
+    token = "W",
+    path = norm(item.file),
+  }
+  local pos = item.pos or { 1, 0 }
+  local line = tostring(item.line or ""):gsub("^%s+", "")
+  local chunks = {}
+
+  if group.index == 1 then
+    chunks[#chunks + 1] = { "▼ ", "SnacksPickerDir" }
+    chunks[#chunks + 1] = { group.scope, "SnacksPickerSpecial" }
+    chunks[#chunks + 1] = { " " }
+    chunks[#chunks + 1] = { group.path, "SnacksPickerFile" }
+    chunks[#chunks + 1] = { (" (%d)  "):format(group.count), "SnacksPickerComment" }
+  else
+    chunks[#chunks + 1] = { "  ├ ", "SnacksPickerDir" }
+  end
+
+  chunks[#chunks + 1] = { tostring(pos[1] or 1), "SnacksPickerRow" }
+  chunks[#chunks + 1] = { ":", "SnacksPickerDelim" }
+  chunks[#chunks + 1] = { tostring((pos[2] or 0) + 1), "SnacksPickerCol" }
+  chunks[#chunks + 1] = { " │ ", "SnacksPickerDelim" }
+  chunks[#chunks + 1] = { line }
+  return chunks
+end
+
+function CORE_RT.grep_hit_item(file, lnum, col, text, pattern, regex)
+  local start_col = math.max(0, (tonumber(col) or 1) - 1)
+  local item = {
+    text = file .. ":" .. lnum .. ":" .. col .. ":" .. text,
+    line = text,
+    pos = { lnum, start_col },
+    file = file,
+  }
+  if regex ~= true and tostring(pattern or "") ~= "" then
+    item.end_pos = { lnum, start_col + #tostring(pattern) }
+  end
+  return item
 end
 
 function CORE_RT.grep_backend_title(base, backend_label)
@@ -5302,89 +5395,52 @@ function M.cached_grep(opts)
     return esc
   end
 
+  local function grep_picker_title(scoped)
+    local base = CORE_RT.grep_backend_title(opts.title or "Grep All Code", backend_label)
+    if scoped and grep_scope then
+      return base .. " [scope: " .. tostring(grep_scope.label or grep_scope.name or "current") .. "]"
+    end
+    return base .. " [scope: all]"
+  end
+
   local title_default = CORE_RT.grep_backend_title("Grep All Code", backend_label)
   local live_min_chars = opts.live_min_chars or 2
   local live_max_count = opts.max_count or 5000
   local short_live_max_count = opts.short_live_max_count or 1200
 
   -- ─ Helpers shared by both csearch and rg paths ──────────────────────
-  -- Dev toggle: lets us A/B compare against vanilla snacks behavior to
-  -- isolate whether grouping/format/preview/throttle changes are the cause
-  -- of perceived lag. When false, finder cb is unwrapped, format/preview/
-  -- throttle are not installed, and Tab keeps snacks default behavior.
+  -- Dev toggle: lets us A/B compare against vanilla snacks behavior. The
+  -- structured path/count formatter and preview throttle are disabled when
+  -- false, while every picker item remains a real match in either mode.
   -- Toggle at runtime with :UEGrepGroupingToggle.
   local grouping_enabled = (vim.g.ue_grep_grouping_enabled ~= false)
 
-  -- Wrap a `cb(item)` so that whenever a new file appears in the stream
-  -- (compared to the previous item), we first emit a header item for that
-  -- file. csearch outputs in file-grouped order; rg --with-filename does
-  -- too — so this gives a cheap "tree-like" grouping without buffering.
-  -- The header item carries _is_grep_header=true so the format function
-  -- and confirm hook can treat it specially.
-  --
-  -- DESIGN NOTE
-  -- This is intentionally NOT a real recursive directory tree. Doing that
-  -- would require buffering all matches, sorting by path, and emitting
-  -- intermediate dir nodes — losing the live-streaming UX. The two-level
-  -- grouping (file header + indented hit lines) covers ~90% of the value
-  -- ("which files contain this") at a fraction of the complexity.
-  local function make_grouping_cb(cb)
-    local last_file = nil
-    return function(item)
-      -- Drop nil items defensively — snacks finder.add() does
-      -- `item.idx, item.score = ...` and crashes on nil. We've seen this
-      -- crop up rarely from upstream proc.proc transforms returning nil.
-      if item == nil then return end
-      if item.file and item.file ~= last_file then
-        last_file = item.file
-        cb({
-          text = item.file,
-          file = item.file,
-          pos  = { 1, 0 },
-          _is_grep_header = true,
-        })
+  -- csearch emits hits grouped by file. Buffer only the current file so its
+  -- count is known, then annotate and emit the original match rows. Unlike
+  -- the old synthetic header design, this never creates a selectable item
+  -- without a source location, so every cursor position has a code preview.
+  local function make_file_grouping_cb(cb)
+    local current_file = nil
+    local current_items = {}
+
+    local function flush()
+      if #current_items == 0 then return end
+      for _, item in ipairs(CORE_RT.grep_annotate_file_group(current_items, ctx)) do
+        cb(item)
       end
-      cb(item)
+      current_items = {}
     end
-  end
 
-  -- Hoist snacks default formatter once (require cache is fast but per-item
-  -- lookup adds up across thousands of redraws on every Tab press).
-  local snacks_format_file = require("snacks.picker.format").file
-
-  -- Format: file headers get a bold prefix + path; hit lines get a thin
-  -- left margin so they visually nest under the preceding header.
-  local function format_grouped(item, picker)
-    if item._is_grep_header then
-      return {
-        { "▼ ", "SnacksPickerDir" },
-        { tostring(item.file or item.text or "?"), "SnacksPickerFile" },
-      }
+    local function push(item)
+      if item == nil then return end
+      if current_file ~= nil and item.file ~= current_file then
+        flush()
+      end
+      current_file = item.file
+      current_items[#current_items + 1] = item
     end
-    -- Default grep format, but indented two spaces.
-    local default = snacks_format_file(item, picker)
-    table.insert(default, 1, { "  ", "SnacksPickerDir" })
-    return default
-  end
 
-  -- Preview: header items have no useful preview (file line 1 is rarely
-  -- where you want to start). Show a placeholder instead — this avoids the
-  -- per-Tab cost of opening a fresh buffer + treesitter highlighting just
-  -- to flash a line-1 view that the user is going to scroll past.
-  local function preview_grouped(ctx)
-    local item = ctx.item
-    if item and item._is_grep_header then
-      ctx.preview:reset()
-      ctx.preview:set_lines({
-        "── " .. (item.file or "?") .. " ──",
-        "",
-        "  (file header — press <CR> to open at line 1)",
-      })
-      ctx.preview:set_title(vim.fn.fnamemodify(item.file or "", ":t"))
-      return
-    end
-    -- Default file preview for hit items.
-    return require("snacks.picker.preview").file(ctx)
+    return push, flush
   end
 
   -- Per-picker keymap override:
@@ -5414,22 +5470,6 @@ function M.cached_grep(opts)
         if this then this:_show_preview() end
       end, { ms = 200, name = "preview" })
     end)
-  end
-
-  -- Confirm: header → jump to file line 1; hit → snacks default jump.
-  -- snacks `confirm` callback signature is (picker, item, action) where
-  -- action is the keymap entry (e.g. { cmd = "edit" }). When forwarding
-  -- to snacks's own jump action we MUST pass it (or a sane default) —
-  -- jump() does `action.cmd` at line 89 and crashes on nil.
-  local function confirm_grouped(picker, item, action)
-    if item and item._is_grep_header then
-      picker:close()
-      vim.schedule(function()
-        vim.cmd("edit " .. vim.fn.fnameescape(item.file))
-      end)
-      return
-    end
-    return require("snacks.picker.actions").jump(picker, item, action or { cmd = "edit" })
   end
 
   -- ─ Diagnostic trace (opt-in via vim.g.ue_grep_trace) ────────────────
@@ -5493,7 +5533,7 @@ function M.cached_grep(opts)
   if has_index then
     snacks.picker.pick({
       source = "ue_grep_csearch",
-      title = CORE_RT.grep_backend_title(opts.title or title_default, backend_label),
+      title = grep_picker_title(false),
       search = opts.search or "",
       live = true,
       need_search = true,
@@ -5513,11 +5553,13 @@ function M.cached_grep(opts)
       -- Without overriding regex here, snacks' default value=false would
       -- show R when LITERAL mode is on, which is reverse intuition.
       regex = false,
+      literal = true,
       word = false,
       case = false,
       scoped = false,
       toggles = {
         regex = { icon = "R", value = true },
+        literal = { icon = "L", value = true },
         word  = { icon = "W", value = true },
         case  = { icon = "C", value = true },
         scoped = { icon = "S", value = true },
@@ -5543,6 +5585,7 @@ function M.cached_grep(opts)
       actions = {
         ue_grep_toggle_regex = function(picker)
           picker.opts.regex = not picker.opts.regex
+          picker.opts.literal = not picker.opts.regex
           require("snacks").notify((picker.opts.regex and "✓ regex ON " or "✗ regex OFF (literal)"),
             { title = "UE grep", level = "info" })
           picker.list:set_target(); picker:find()
@@ -5568,6 +5611,8 @@ function M.cached_grep(opts)
             return
           end
           picker.opts.scoped = not picker.opts.scoped
+          picker.title = grep_picker_title(picker.opts.scoped)
+          picker:update_titles()
           require("snacks").notify(
             (picker.opts.scoped
               and ("✓ scope: " .. (grep_scope.label or grep_scope.name or "current"))
@@ -5576,22 +5621,17 @@ function M.cached_grep(opts)
           picker.list:set_target(); picker:find()
         end,
       },
-      format = grouping_enabled and format_grouped or nil,
-      preview = grouping_enabled and preview_grouped or nil,
+      format = grouping_enabled and CORE_RT.grep_format_grouped or nil,
       on_show = grouping_enabled and on_show_picker or nil,
-      confirm = grouping_enabled and confirm_grouped or nil,
       finder = function(_picker_opts, finder_ctx)
         local pattern = finder_ctx.filter.search
-        if not CORE_RT.grep_live_search_ready(pattern, live_min_chars) then
+        local _picker = finder_ctx and finder_ctx.picker
+        local _po = _picker and _picker.opts or {}
+        if not CORE_RT.grep_live_search_ready(pattern, live_min_chars, _po.regex ~= true) then
           return function() end
         end
         trace("finder START pattern=%q", pattern)
         return function(cb)
-          -- Wrap cb to inject file-header items between file groups.
-          if grouping_enabled then
-            cb = make_grouping_cb(cb)
-          end
-
           -- snacks finder protocol: this function MUST block until ALL
           -- callbacks have been emitted, otherwise snacks marks the finder
           -- "done" and any later cb call trips its "yielded after done"
@@ -5605,13 +5645,21 @@ function M.cached_grep(opts)
           local items_received = 0
           local items_emitted = 0
 
+          local function enqueue(item)
+            pending_len = pending_len + 1
+            pending[pending_len] = item
+          end
+          local queue_item = enqueue
+          local flush_file_group = function() end
+          if grouping_enabled then
+            queue_item, flush_file_group = make_file_grouping_cb(enqueue)
+          end
+
           local t_cs_spawn_0 = vim.loop.hrtime()
           local cs_first_line_logged = false
           -- Read mode toggles from picker.opts (Alt-r/Alt-x/Alt-c flip
           -- these in place via snacks auto-generated toggle_<name> actions,
           -- then picker:find() restarts this finder so we see the new values).
-          local _picker = finder_ctx and finder_ctx.picker
-          local _po = _picker and _picker.opts or {}
           local pattern_len = #trim(tostring(pattern or ""))
           local mode_case = _po.case == true
           local mode_ignore_case = not mode_case
@@ -5636,17 +5684,18 @@ function M.cached_grep(opts)
                 trace("PHASE csearch_first_line=%.2fms after_spawn",
                   (vim.loop.hrtime() - t_cs_spawn_0) / 1e6)
               end
-              -- Buffer the item; we drain inside the sleep loop below
-              -- where it's safe to call cb (we're guaranteed not yet done).
-              pending_len = pending_len + 1
-              pending[pending_len] = {
-                text = file .. ":" .. lnum .. ":" .. col .. ":" .. text,
-                pos  = { lnum, math.max(0, col - 1) },
-                file = file,
-              }
+              -- Buffer only real match items. The literal path carries an
+              -- exact end_pos so Snacks preview never reinterprets raw input
+              -- such as "." as Vim regex syntax.
+              queue_item(CORE_RT.grep_hit_item(
+                file, lnum, col, text, pattern, _po.regex == true))
               items_received = items_received + 1
             end,
             on_done = function(code, err)
+              -- csearch output is file-grouped. Close the final group before
+              -- done=true so the normal budgeted drain sees every annotated
+              -- real hit and never needs a synthetic header row.
+              flush_file_group()
               done = true
               trace("csearch DONE pat=%q recv=%d code=%s err=%s elapsed=%.1fms",
                 pattern, items_received, tostring(code),
@@ -5816,6 +5865,7 @@ function M.cached_grep(opts)
           local aborted = (final_cur ~= nil and final_cur ~= pattern)
 
           if not aborted then
+            flush_file_group()
             -- Final drain after done (still safe — we haven't returned).
             -- Resume from read_idx so we don't double-cb earlier items.
             local final_drain_t0 = vim.loop.hrtime()
@@ -8612,6 +8662,9 @@ M.platform_key_from_state = CORE_RT.platform_key_from_state
 M.migrate_legacy_csearch_if_needed = CORE_RT.migrate_legacy_csearch_if_needed
 M._grep_live_search_ready_for_test = CORE_RT.grep_live_search_ready
 M._grep_backend_title_for_test = CORE_RT.grep_backend_title
+M._grep_annotate_file_group_for_test = CORE_RT.grep_annotate_file_group
+M._grep_format_grouped_for_test = CORE_RT.grep_format_grouped
+M._grep_hit_item_for_test = CORE_RT.grep_hit_item
 M.android_dap_launch = dap_mod.android_dap_launch
 M._dap_filter_scopes = dap_mod._dap_filter_scopes
 M.ensure_dap_loaded = dap_mod.ensure_dap_loaded
@@ -8715,11 +8768,11 @@ function M.setup()
     vim.g.ue_grep_grouping_enabled = not (vim.g.ue_grep_grouping_enabled ~= false)
     local now = vim.g.ue_grep_grouping_enabled
     vim.notify(
-      string.format("UE grep grouping/preview/Tab tweaks: %s",
+      string.format("UE grep structured groups/preview throttle/Tab tweaks: %s",
         now and "ON (default)" or "OFF (vanilla snacks)"),
       vim.log.levels.INFO,
       { title = "UE", timeout = 4000 })
-  end, { desc = "Toggle UE grep file-grouping + preview throttle + Tab=list_down" })
+  end, { desc = "Toggle UE grep structured grouping + preview throttle + Tab=list_down" })
 
   vim.api.nvim_create_user_command("UEGrepTraceToggle", function()
     vim.g.ue_grep_trace = not (vim.g.ue_grep_trace == true)

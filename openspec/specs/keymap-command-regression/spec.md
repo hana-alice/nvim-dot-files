@@ -19,7 +19,7 @@
 #### Scenario: leader 系列绑定存在且指向预期命令
 
 - **WHEN** keymap 用例查询 normal 模式映射
-- **THEN** `<leader>db` → `UEDAPToggleBreakpoint`、`<leader>dc` → `UEDAPContinue`、`<leader>da` 含 `UEDAPAttach`
+- **THEN** `<leader>?` → `UECheatsheet`、`<leader>db` → `UEDAPToggleBreakpoint`、`<leader>dc` → `UEDAPContinue`、`<leader>da` 含 `UEDAPAttach`
 - **AND** `<leader>vv`/`<leader>vb`/`<leader>vg` 等 sidebar 键均有映射
 - **AND** `<leader>ub` → `UEBuild`、`<leader>ul` → `UELaunch`（由 VeryLazy 覆盖应用后）
 
@@ -34,6 +34,26 @@
 - **WHEN** 用例通过 harness 的 keymap 查询辅助按 `(mode, lhs)` 检索
 - **THEN** 返回该映射的 rhs/callback 信息或 nil
 - **AND** 查询不存在的映射返回 nil 而非报错
+
+### Requirement: 快捷键帮助可搜索且保留分类
+
+浮动 cheatsheet SHALL 提供 `/` 实时搜索入口；搜索 SHALL 同时覆盖快捷键、描述和原始分类，并在结果界面保留 `Tab › Section` 两级分类。用于展示成对大小写命令的空格分隔符 SHALL 不妨碍直接组合查询。
+
+#### Scenario: mixed-case 成对快捷键可直接发现
+
+- **WHEN** 用户在 `<leader>?` 浮窗按 `/` 并输入 `wW`
+- **THEN** 结果直接包含 `w / W`
+- **AND** 该结果显示为 `Basics › Motions`
+- **WHEN** 用户输入 `aA`
+- **THEN** 结果直接包含 `a / A`
+- **AND** 该结果显示为 `Basics › Modes`
+
+#### Scenario: 搜索交互与分类回归
+
+- **WHEN** 回归套件真实喂入 `/wW<CR>`
+- **THEN** cheatsheet 进入 `wW` 搜索状态
+- **AND** 实际浮窗 extmark 内容包含 `Basics › Motions` 与 `w / W`
+- **AND** 搜索大小写不敏感，每条命中均携带非空 tab 与 section 分类
 
 ### Requirement: 用户命令注册回归
 

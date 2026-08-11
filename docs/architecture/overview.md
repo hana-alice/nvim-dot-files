@@ -70,9 +70,11 @@
   driver 规划 UAT BuildCookRun（Build/Cook/Stage/Package/Archive，不含 Deploy/Run）；
   `:UESetIOSDevice` / `:UEInstallIOS` / `:UELaunch` 使用结构化 CoreDevice JSON、当前 package task 的
   `Binaries/IOS/Payload/<Target>.app` provenance 与真实 bundle id。iOS run 不隐式进入 DAP。
-- **DAP**：`UEDAP*` 命令 → `ue.dap.platforms` 按当前平台 dispatch → 具体平台 `attach/launch`
-  → codelldb（Win64/Android）。Android 走 platform 模式 + serial connect URL；K30 URL 与本次
-  session 捕获的 ADB serial 必须一致，切换当前进程的选择值不改变活跃 session 的 poll/cleanup。
+- **DAP**：setup 先按 host-target-operation matrix 过滤 handler，再由 `UEDAP*` 命令经
+  `ue.dap.platforms` dispatch → 具体平台 `attach/launch` → codelldb（Win64/Android）。iOS DAP
+  未实现，因此 macOS 也不注册 IOS handler，更不会借用 Mac process attach。Android 走 platform
+  模式 + serial connect URL；K30 URL 与本次 session 捕获的 ADB serial 必须一致，切换当前进程的
+  选择值不改变活跃 session 的 poll/cleanup。
 
 ### 2.1 状态归属清单
 
@@ -87,14 +89,33 @@
 
 ## 3. 平台分层（platform layers）
 
-- **Host layer** `lua/utils/platform/`：`windows/macos/linux/stub` 四驱动只共享基础 shell/path 与
-  UE 入口契约；Xcode tools 是 macOS-only capability，PowerShell 是 Windows-only capability。
+- **Host layer** `lua/utils/platform/`：`windows/macos/linux/stub` 四驱动共享 path/process/tool
+  入口契约；Xcode tools 是 macOS-only capability，PowerShell/debug-output/PCH build 是
+  Windows-only capability。
   **这是唯一允许 OS 分支的地方**，不要求各 host 伪装成同一工具集。
+- **Shell layer** `lua/utils/platform/shell.lua`：只接受显式 `posix/powershell/cmd` kind 与 host
+  已选 executable，负责 quote 和 argv；不探测 OS。CDB Python phases 直接以 argv 顺序执行，
+  不再拼 `&&` shell string；Windows-only `prebuild_pch_v2.py` 在非 Windows host 自动跳过。
 - **Target layer** `lua/ue/targets/`：`android/ios/mac/win64/linux` 分别拥有目标平台参数、产物、
-  设备与失败语义。共享 `_common.lua` 只能做 policy-free 的 argv/path/schema 操作；任一 target
-  driver 不得调用另一个 target driver。
+  设备、runtime strategy 与失败语义。共享 `_common.lua` 只能做 policy-free 的 argv/path/schema
+  操作；任一 target driver 不得调用另一个 target driver。
+- **Composition resolver** `ue.targets.resolve(target, operation, host_driver)`：以各 target 的
+  `host_operations` 为唯一兼容性真相。`:UESetPlatform` 的候选也由 `build` operation 过滤；模块可
+  import、磁盘上有 foreign artifact 或 host 恰好有某工具，都不能绕过 matrix。
 - `lua/ue.lua` 只解析上下文、查 registry、执行结构化 plan；不得承载 IOS/Android/Mac 命令参数。
-- DAP 平台层 `lua/ue/dap/<platform>.lua`（win64/mac/linux/ios/android）经 `platforms` 注册表接入。
+- runtime orchestrator 读取 target driver 的 `runtime.launch/main_log/debug_log.strategy`，不按 target
+  名写 `if/else`；DAP 平台层经 matrix-filtered `platforms` 注册表接入。
+
+### 当前 host-target-operation matrix
+
+| Host | 可执行 targets / operations | 明确不可用 |
+|---|---|---|
+| Windows | Win64：build/launch/log/debug-log/DAP；Android：build/SO build+deploy/install/launch/log/DAP | IOS、Mac、Linux |
+| macOS | Mac：build/launch/log/DAP；IOS：build/package/device/install/launch | Android、Win64、Linux；IOS DAP |
+| Linux | Linux：build/launch/log/DAP | Android、IOS、Mac、Win64 |
+
+此表描述当前已实现能力，不代表 UE 理论上不能支持更多组合；新增组合必须先增加独立 host adapter、
+matrix 声明与回归，不能在 generic orchestration 中添加 shell/path 猜测。
 
 ## 4. 构建流水线（build pipeline）
 
@@ -102,8 +123,9 @@
   NDK lldb-server、Neovim 0.10+）。
 - CDB 生成器（`tools/*.py` + `lua/ue/cdb/*`）：super-unity / prune / inject，写前比对跳过。
 - CDB mutation 由 `lua/ue/cdb/pipeline.lua` 进程内 slot + filesystem lease 双层串行化；
-  UEPrepare 持有 project-scoped prepare lease 到 pipeline/partition 完成，controlled index phase
-  另持 project+platform build lease，禁止不同 Neovim 并发撕裂 JSON/csearch/index artifact。
+  每个 Python phase 使用 argv 顺序启动，任一步失败即停止。UEPrepare 持有 project-scoped prepare
+  lease 到 pipeline/partition 完成，controlled index phase 另持 project+platform build lease，
+  禁止不同 Neovim 并发撕裂 JSON/csearch/index artifact。
 - csearch 索引：`tools/cindex-uefilter`（Go fork）`-files-from` 干净建索引。
 - Android SO-only（Windows host compatibility path）：`android_windows.lua` 通过 Windows-only
   `powershell_entry` 调用 `scripts/ue_android_so_build.ps1`，两阶段执行 UBT action graph；部署脚本先以

@@ -50,7 +50,14 @@ function M.is_running()
 end
 
 local function python_exe()
-  return (vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1) and "python" or "python3"
+  local candidates = require("utils.platform").driver().python_candidates()
+  for _, candidate in ipairs(candidates) do
+    local resolved = vim.fn.exepath(candidate)
+    if resolved ~= "" then
+      return resolved
+    end
+  end
+  return candidates[1] or "python3"
 end
 
 local function tool_path(name)
@@ -167,14 +174,11 @@ function M.run(path, targets, on_done)
   local python = python_exe()
 
   local CANONICAL_ARGS = {
-    ["expand_response_cdb.py"] = function(p) return '"' .. p .. '"' end,
-    ["prebuild_pch_v2.py"]     = function(p) return '"' .. p .. '"' end,
-    ["resolve_cdb_paths.py"]   = function(p) return '"' .. p .. '"' end,
-    ["unify_include_dirs.py"]  = function(p) return '"' .. p .. '" --max-overhead=200' end,
-    ["prune_include_dirs.py"]  = function(p, isolate)
-      isolate.value = true
-      return '"' .. p .. '" --sample 20'
-    end,
+    ["expand_response_cdb.py"] = function(p) return { p } end,
+    ["prebuild_pch_v2.py"] = function(p) return { p } end,
+    ["resolve_cdb_paths.py"] = function(p) return { p } end,
+    ["unify_include_dirs.py"] = function(p) return { p, "--max-overhead=200" } end,
+    ["prune_include_dirs.py"] = function(p) return { p, "--sample", "20" }, true end,
   }
 
   -- Read the configured pipeline; fall back to canonical recipe if config
@@ -195,28 +199,38 @@ function M.run(path, targets, on_done)
   local path_lower = path:gsub("\\", "/"):lower()
   local engine_only = path_lower:find("/engine/") ~= nil
 
-  local cmds = {}
+  local host_driver = require("utils.platform").driver()
+  local steps = {}
   for _, name in ipairs(script_names) do
     local script_path = tool_path(name)
-    if fs.is_file(script_path) then
+    local host_supports_step = name ~= "prebuild_pch_v2.py"
+      or type(host_driver.pch_build_plan) == "function"
+    if host_supports_step and fs.is_file(script_path) then
       local arg_builder = CANONICAL_ARGS[name]
-      local isolate_flag = { value = false }
       local args
+      local isolate = false
       if arg_builder then
-        args = arg_builder(path, isolate_flag)
+        args, isolate = arg_builder(path)
         if name == "unify_include_dirs.py" and engine_only then
-          args = args .. " --include-engine"
+          args[#args + 1] = "--include-engine"
         end
       else
-        -- Unknown script: pass the cdb path as a single quoted arg.
-        args = '"' .. path .. '"'
+        -- Unknown scripts receive the CDB path as one argv item.
+        args = { path }
       end
-      local prefix = isolate_flag.value and (python .. ' -I "') or (python .. ' "')
-      table.insert(cmds, prefix .. script_path .. '" ' .. args)
+
+      local command = { python }
+      if isolate then command[#command + 1] = "-I" end
+      command[#command + 1] = script_path
+      vim.list_extend(command, args)
+      steps[#steps + 1] = {
+        name = name:gsub("%.py$", ""),
+        command = command,
+      }
     end
   end
 
-  if #cmds == 0 then
+  if #steps == 0 then
     if on_done then on_done(true) end
     return 0
   end
@@ -229,11 +243,15 @@ function M.run(path, targets, on_done)
     return nil, msg
   end
 
-  _rt.notify("compile_commands pipeline: expand+pch+resolve+unify+prune in background...", vim.log.levels.INFO)
+  local phase_names = {}
+  for _, step in ipairs(steps) do phase_names[#phase_names + 1] = step.name end
+  _rt.notify(
+    "compile_commands pipeline: " .. table.concat(phase_names, "+") .. " in background...",
+    vim.log.levels.INFO
+  )
 
   local stat_before = vim.uv.fs_stat(path)
   local mtime_before = (stat_before and stat_before.mtime and stat_before.mtime.sec) or 0
-  local shell_cmd = table.concat(cmds, " && ")
 
   running = true
   local finished = false
@@ -249,42 +267,67 @@ function M.run(path, targets, on_done)
     if on_done then on_done(ok, err) end
   end
 
-  local jobid = _rt.jobstart(shell_cmd, "ue-pipeline", {
-    cdb = path,
-    on_exit = function(_, _, _)
-      local stat_after = vim.uv.fs_stat(path)
-      local mtime_after = (stat_after and stat_after.mtime and stat_after.mtime.sec) or 0
-      if mtime_after == mtime_before then
-        _rt.notify("compile_commands pipeline: no changes, skipping clangd restart", vim.log.levels.INFO)
-        finish(true)
-        return
-      end
-      -- Mirror to secondary targets ASYNC, then restart clangd + hand off.
-      -- on_done (→ partition_base_cdb) must not run until mirrors settle —
-      -- partition rewrites `path` in place and a concurrent reader would
-      -- mirror a torn file.
-      mirror_targets_then(path, targets, function()
-        _rt.notify("compile_commands pipeline: done. Restarting clangd...", vim.log.levels.INFO)
-        restart_clangd()
-        finish(true)
-      end)
-    end,
-    on_fail = function(code, log_lines, log_path)
-      local tail = {}
-      for i = math.max(1, #log_lines - 4), #log_lines do
-        tail[#tail + 1] = log_lines[i]
-      end
-      local msg = ("ue-pipeline failed (exit %d)\nlog: %s\n--- last lines ---\n%s")
-        :format(code, log_path, table.concat(tail, "\n"))
-      _rt.log_error("ue.runner", msg)
-      finish(false, msg)
-    end,
-  })
-  if not jobid or jobid <= 0 then
-    local msg = "compile_commands pipeline failed to start"
+  local function finish_success()
+    local stat_after = vim.uv.fs_stat(path)
+    local mtime_after = (stat_after and stat_after.mtime and stat_after.mtime.sec) or 0
+    if mtime_after == mtime_before then
+      _rt.notify("compile_commands pipeline: no changes, skipping clangd restart", vim.log.levels.INFO)
+      finish(true)
+      return
+    end
+    -- Mirror to secondary targets ASYNC, then restart clangd + hand off.
+    -- on_done (→ partition_base_cdb) must not run until mirrors settle —
+    -- partition rewrites `path` in place and a concurrent reader would
+    -- mirror a torn file.
+    mirror_targets_then(path, targets, function()
+      _rt.notify("compile_commands pipeline: done. Restarting clangd...", vim.log.levels.INFO)
+      restart_clangd()
+      finish(true)
+    end)
+  end
+
+  local function fail_step(step, code, log_lines, log_path)
+    local tail = {}
+    log_lines = log_lines or {}
+    for i = math.max(1, #log_lines - 4), #log_lines do
+      tail[#tail + 1] = log_lines[i]
+    end
+    local msg = ("ue-pipeline-%s failed (exit %d)\nlog: %s\n--- last lines ---\n%s")
+      :format(step.name, tonumber(code) or -1, tostring(log_path or ""), table.concat(tail, "\n"))
     _rt.log_error("ue.runner", msg)
     finish(false, msg)
-    return nil, msg
+  end
+
+  local start_step
+  start_step = function(index)
+    if finished then return nil, finish_err end
+    local step = steps[index]
+    local tag = "ue-pipeline-" .. step.name
+    local jobid = _rt.jobstart(step.command, tag, {
+      cdb = path,
+      on_exit = function()
+        if index == #steps then
+          finish_success()
+          return
+        end
+        start_step(index + 1)
+      end,
+      on_fail = function(code, log_lines, log_path)
+        fail_step(step, code, log_lines, log_path)
+      end,
+    })
+    if not jobid or jobid <= 0 then
+      local msg = tag .. " failed to start"
+      _rt.log_error("ue.runner", msg)
+      finish(false, msg)
+      return nil, msg
+    end
+    return jobid
+  end
+
+  local jobid, start_err = start_step(1)
+  if not jobid then
+    return nil, start_err or finish_err
   end
   if finished and not finish_ok then
     return nil, finish_err

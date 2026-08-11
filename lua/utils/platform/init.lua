@@ -35,22 +35,29 @@ M.is_linux   = M.id == "linux"
 ---@class PlatformDriver
 ---@field id        '"windows"'|'"macos"'|'"linux"'
 ---@field shell     fun(): string
+---@field shell_entry fun(kind: string): string|nil, string|nil
 ---@field path_sep  string
 ---@field list_sep  string
 ---@field exe_suffix string
 ---@field open_path fun(path: string)
 ---@field reveal_file fun(path: string)
 ---@field default_clangd_candidates fun(): string[]
+---@field python_candidates fun(): string[]
 ---@field default_lldb_dap_paths    fun(): string[]
 ---@field default_lldb_server_paths fun(): string[]
 ---@field cmd_quote fun(value: string): string
 ---@field host_path fun(path: string): string
+---@field default_target fun(): string
+---@field launch_process_plan fun(spec: table): table
+---@field follow_file_plan fun(path: string): table|nil, string|nil
+---@field debug_log_plan? fun(spec: table): table Windows-only OutputDebugString stream
+---@field pch_build_plan? fun(path: string): table Windows-only generated build_pch.bat runner
 ---@field ue_build_entry fun(engine_root: string): string|table|nil, string|nil
 ---@field ue_uat_entry fun(engine_root: string): string|table|nil, string|nil
 ---@field xcrun_entry? fun(): string|table|nil, string|nil macOS-only capability
 ---@field security_entry? fun(): string|table|nil, string|nil macOS-only capability
 ---@field plutil_entry? fun(): string|table|nil, string|nil macOS-only capability
----@field powershell_entry? fun(): string|table|nil, string|nil Windows-only capability
+---@field powershell_entry? fun(): string|table|nil, string|nil legacy Windows-only compatibility alias
 
 local _drivers = {}
 local _warned_stub = {}

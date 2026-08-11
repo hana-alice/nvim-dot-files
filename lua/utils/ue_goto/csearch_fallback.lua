@@ -40,8 +40,7 @@ local code_search = require("utils.code_search")
 -- LSP's range model.
 local function make_location(file, lnum, col)
   local norm = file:gsub("\\", "/")
-  -- vim.uri_from_fname expects native sep; pass the original.
-  local uri = vim.uri_from_fname(file:gsub("/", "\\"))
+  local uri = vim.uri_from_fname(norm)
   -- vim.uri_from_fname on linux gives file:///path; on Windows file:///D:/...
   -- Either way it's a valid LSP uri.
   local line0 = math.max(0, (lnum or 1) - 1)
@@ -56,6 +55,8 @@ local function make_location(file, lnum, col)
     _path = norm,
   }
 end
+
+M._make_location_for_test = make_location
 
 -- Try to require ue.csearch_ctx; if ue.lua isn't loaded yet (e.g. very early
 -- startup), bail safely.

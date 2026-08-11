@@ -5,9 +5,10 @@ local t = require("tests.harness")
 t.bootstrap()
 
 local IFACE = {
-  "shell", "open_path", "reveal_file", "cmd_quote", "host_path",
+  "shell", "shell_entry", "open_path", "reveal_file", "cmd_quote", "host_path",
+  "launch_process_plan", "follow_file_plan", "default_target",
   "default_clangd_candidates", "default_lldb_dap_paths",
-  "default_lldb_server_paths", "ue_build_entry", "ue_uat_entry",
+  "default_lldb_server_paths", "python_candidates", "ue_build_entry", "ue_uat_entry",
 }
 
 local function assert_entry(driver, fn_name, expected_path, expected_reason)
@@ -54,6 +55,10 @@ t.describe("platform: host tool 解析", function()
     assert_entry(m, "security_entry", "/usr/bin/security", nil)
     assert_entry(m, "plutil_entry", "/usr/bin/plutil", nil)
     t.assert_eq(m.powershell_entry, nil)
+    local powershell, powershell_err = m.shell_entry("powershell")
+    t.assert_eq(powershell, nil)
+    t.assert_contains(powershell_err, "unsupported shell")
+    t.assert_eq(#m.default_lldb_server_paths(), 0)
   end)
 
   t.it("Linux 不伪装 Apple 或 Windows 宿主能力", function()
@@ -74,6 +79,58 @@ t.describe("platform: host tool 解析", function()
     t.assert_eq(m.security_entry, nil)
     t.assert_eq(m.plutil_entry, nil)
     t.assert_eq(m.powershell_entry, nil)
+  end)
+end)
+
+t.describe("platform: shell 是独立执行维度", function()
+  local shell = require("utils.platform.shell")
+
+  t.it("Windows host 区分 cmd 与 PowerShell", function()
+    local m = require("utils.platform.windows")
+    local cmd = m.shell_entry("cmd")
+    local powershell = m.shell_entry("powershell")
+    t.assert_eq(cmd, "cmd.exe")
+    t.assert_true(powershell == "pwsh" or powershell == "powershell.exe")
+  end)
+
+  t.it("Windows process plan 只转换 host path，不改写 UE 参数", function()
+    local plan = require("utils.platform.windows").launch_process_plan({
+      executable = "C:/UE/UnrealEditor.exe",
+      cwd = "C:/UE",
+      args = { "C:/Project/Game.uproject", "/Game/Maps/Main", "-log" },
+    })
+    local script = table.concat(plan.args, " ")
+    t.assert_contains(script, "C:\\Project\\Game.uproject")
+    t.assert_contains(script, "/Game/Maps/Main")
+    t.assert_false(script:find("\\Game\\Maps\\Main", 1, true) ~= nil)
+  end)
+
+  t.it("Windows file follow 在转换分隔符前解析 cwd", function()
+    local plan = require("utils.platform.windows").follow_file_plan("C:/Project/Saved/Logs/Game.log")
+    t.assert_eq(plan.cwd, "C:\\Project\\Saved\\Logs")
+  end)
+
+  t.it("macOS host 的默认与 posix shell 一致", function()
+    local m = require("utils.platform.macos")
+    t.assert_eq(m.shell_entry("default"), m.shell_entry("posix"))
+    t.assert_true(m.shell_entry("posix"):match("zsh$") ~= nil)
+  end)
+
+  t.it("未声明 Android DAP 的 host 不暴露 NDK server", function()
+    t.assert_eq(#require("utils.platform.macos").default_lldb_server_paths(), 0)
+    t.assert_eq(#require("utils.platform.linux").default_lldb_server_paths(), 0)
+  end)
+
+  t.it("shell command builder 只负责 shell argv，不选择 host", function()
+    local posix = shell.command("posix", "/bin/zsh", "printf ok")
+    local pwsh = shell.command("powershell", "pwsh", "Write-Output ok")
+    local cmd = shell.command("cmd", "cmd.exe", "call Build.bat")
+    t.assert_eq(posix.executable, "/bin/zsh")
+    t.assert_contains(posix.args, "printf ok")
+    t.assert_eq(pwsh.executable, "pwsh")
+    t.assert_contains(pwsh.args, "Write-Output ok")
+    t.assert_eq(cmd.executable, "cmd.exe")
+    t.assert_contains(cmd.args, "call Build.bat")
   end)
 end)
 

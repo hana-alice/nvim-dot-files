@@ -2,6 +2,23 @@ local C = require("ue.targets._common")
 
 local M = {
   id = "Android",
+  host_operations = {
+    windows = {
+      build = true,
+      so_build = true,
+      so_deploy = true,
+      install = true,
+      launch = true,
+      log = true,
+      dap_attach = true,
+      dap_launch = true,
+    },
+  },
+  runtime = {
+    launch = { strategy = "android-device" },
+    main_log = { strategy = "android-logcat" },
+    debug_log = { strategy = "unavailable" },
+  },
 }
 
 local HOST_ADAPTERS = {
@@ -184,6 +201,57 @@ function M.so_deploy_plan(context, host_driver)
   return adapter.so_deploy_plan(adapter_context)
 end
 
+local function adapter_plan(operation, context, host_driver)
+  context = context or {}
+  local serial = C.trim(context.device_id or context.serial)
+  local package_name = C.trim(context.package_name or context.android_package)
+  if serial == "" then
+    return C.unavailable(M.id, operation, "Android device is not selected; run :UESetAndroidDevice")
+  end
+  if package_name == "" then
+    return C.unavailable(M.id, operation, "Android package is not configured; run :UESetAndroidPackage")
+  end
+  local adapter, unavailable = host_adapter(host_driver, operation)
+  if not adapter then
+    return unavailable
+  end
+  local adapter_context = C.deepcopy(context)
+  adapter_context.device_id = serial
+  adapter_context.package_name = package_name
+  adapter_context.host_driver = host_driver
+  adapter_context.is_file = is_file
+  return adapter[operation .. "_plan"](adapter_context)
+end
+
+function M.launch_plan(context, host_driver)
+  return adapter_plan("launch", context, host_driver)
+end
+
+function M.log_plan(context, host_driver)
+  return adapter_plan("log", context, host_driver)
+end
+
+function M.install_plan(context, host_driver)
+  context = context or {}
+  local serial = C.trim(context.device_id or context.serial)
+  local apk = C.trim(context.apk or context.artifact)
+  if serial == "" then
+    return C.unavailable(M.id, "install", "Android device is not selected; run :UESetAndroidDevice")
+  end
+  if apk == "" then
+    return C.unavailable(M.id, "install", "Android APK artifact is missing")
+  end
+  local adapter, unavailable = host_adapter(host_driver, "install")
+  if not adapter then
+    return unavailable
+  end
+  local adapter_context = C.deepcopy(context)
+  adapter_context.device_id = serial
+  adapter_context.apk = apk
+  adapter_context.host_driver = host_driver
+  return adapter.install_plan(adapter_context)
+end
+
 function M.before_build(context, runtime)
   runtime = runtime or {}
   local cleanup = type(runtime.stop_debugger) == "function" and runtime.stop_debugger({ kill_orphans = true }) or {}
@@ -212,8 +280,6 @@ end
 
 M.package_plan = C.unsupported_operation(M.id, "package")
 M.device_list_plan = C.unsupported_operation(M.id, "device")
-M.install_plan = C.unsupported_operation(M.id, "install")
-M.launch_plan = C.unsupported_operation(M.id, "launch")
 
 function M.preflight_descriptors()
   return {

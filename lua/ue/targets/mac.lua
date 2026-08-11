@@ -2,6 +2,25 @@ local C = require("ue.targets._common")
 
 local M = {
   id = "Mac",
+  host_operations = {
+    macos = {
+      build = true,
+      launch = true,
+      log = true,
+      dap_attach = true,
+      dap_launch = true,
+    },
+  },
+  runtime = {
+    launch = {
+      strategy = "desktop",
+      executable_suffix = "",
+      editor_names = { "UnrealEditor", "UE4Editor" },
+      editor_app_bundles = true,
+    },
+    main_log = { strategy = "desktop-file" },
+    debug_log = { strategy = "unavailable" },
+  },
 }
 
 function M.capabilities()

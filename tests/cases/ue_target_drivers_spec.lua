@@ -74,6 +74,41 @@ t.describe("ue.targets registry and contract", function()
     end
   end)
 
+  t.it("enforces the host-target-operation compatibility matrix", function()
+    local macos = host_stub()
+    local windows = {
+      id = "windows",
+      ue_build_entry = function()
+        return { executable = "cmd.exe", args = { "/d", "/c", "call Build.bat" } }
+      end,
+    }
+
+    local ios = targets.resolve("IOS", "build", macos)
+    local android = targets.resolve("Android", "build", windows)
+    local _, mac_android = targets.resolve("Android", "build", macos)
+    local _, win_ios = targets.resolve("IOS", "build", windows)
+    local _, mac_win64 = targets.resolve("Win64", "build", macos)
+    local _, ios_dap = targets.resolve("IOS", "dap_attach", macos)
+
+    t.assert_eq(ios.id, "IOS")
+    t.assert_eq(android.id, "Android")
+    t.assert_eq(mac_android.status, "unavailable")
+    t.assert_eq(mac_android.host_id, "macos")
+    t.assert_eq(win_ios.status, "unavailable")
+    t.assert_eq(mac_win64.status, "unavailable")
+    t.assert_eq(ios_dap.status, "unavailable")
+  end)
+
+  t.it("keeps runtime routing policy in target drivers", function()
+    t.assert_eq(targets.must_get("Android").runtime.launch.strategy, "android-device")
+    t.assert_eq(targets.must_get("IOS").runtime.launch.strategy, "managed-device")
+    t.assert_eq(targets.must_get("Mac").runtime.launch.strategy, "desktop")
+    t.assert_true(targets.must_get("Mac").runtime.launch.editor_app_bundles)
+    t.assert_eq(targets.must_get("Win64").runtime.launch.executable_suffix, ".exe")
+    t.assert_eq(targets.must_get("Win64").runtime.debug_log.strategy, "desktop-debug")
+    t.assert_eq(targets.must_get("Linux").runtime.main_log.strategy, "desktop-file")
+  end)
+
   t.it("does not expose iOS lifecycle methods from Mac or Android via fallback", function()
     local mac = targets.must_get("Mac")
     local android = targets.must_get("Android")
@@ -174,6 +209,47 @@ t.describe("ue.targets build planners", function()
     t.assert_eq(plan.status, "unavailable")
     t.assert_eq(plan.host_id, "macos")
     t.assert_contains(plan.reason, "host adapter")
+  end)
+
+  t.it("Android install argv is owned by the Windows target adapter", function()
+    local plan = targets.plan("Android", "install", {
+      adb = "C:/Android/adb.exe",
+      apk = "C:/Build/Game.apk",
+      cwd = "C:/Build",
+      device_id = "SERIAL-002",
+    }, windows_host_stub())
+
+    t.assert_eq(plan.executable, "C:\\Android\\adb.exe")
+    t.assert_eq(table.concat(plan.args, " "), "-s SERIAL-002 install -r C:\\Build\\Game.apk")
+    t.assert_eq(plan.metadata.workflow, "android-install")
+  end)
+
+  t.it("ordinary Android build has no macOS Build.sh fallback", function()
+    local plan = targets.build_plan("Android", {
+      target = "SampleGame",
+      configuration = "Development",
+      uproject = "/Project/Sample.uproject",
+    }, host_stub())
+
+    t.assert_eq(plan.status, "unavailable")
+    t.assert_eq(plan.host_id, "macos")
+    t.assert_eq(plan.operation, "build")
+  end)
+
+  t.it("keeps shell names out of generic target and launch/log modules", function()
+    local config = vim.fn.stdpath("config")
+    for _, relative in ipairs({
+      "/lua/ue/targets/android.lua",
+      "/lua/utils/ue_launch.lua",
+      "/lua/utils/ue_logs.lua",
+    }) do
+      local source = table.concat(vim.fn.readfile(config .. relative), "\n"):lower()
+      t.assert_false(source:find("powershell.exe", 1, true) ~= nil, relative .. " leaked powershell.exe")
+      t.assert_false(source:find('"pwsh"', 1, true) ~= nil, relative .. " leaked pwsh")
+      if relative:find("/utils/ue_", 1, true) then
+        t.assert_false(source:find("platform ==", 1, true) ~= nil, relative .. " hard-coded target dispatch")
+      end
+    end
   end)
 
   t.it("returns structured unavailable when the host capability is missing", function()

@@ -481,7 +481,11 @@ t.describe("semantic sidecar integration", function()
 
       local hello = by_id.hello
       t.assert_true(hello.ok)
-      t.assert_eq(hello.toolchain.libclang_path, discovery.libclang_path)
+      t.assert_eq(
+        vim.fs.basename(hello.toolchain.libclang_path),
+        vim.fs.basename(discovery.libclang_path),
+        "parent and sidecar may resolve the same loader library through different absolute aliases"
+      )
 
       local source = by_id.source
       t.assert_eq(source.state, "resolved")

@@ -5,10 +5,11 @@
 local t = require("tests.harness")
 local cfg = t.bootstrap()
 
--- 72 个 UE* 命令冻结清单（来自 lua/ue.lua + lua/ue/*.lua）。
+-- 77 个 UE* 命令冻结清单（来自 lua/ue.lua + lua/ue/*.lua）。
 local UE_COMMANDS = {
-  "UEBuild", "UEBuildAndroid", "UEBuildAndroidSO", "UEBuildPCH", "UECachePaths", "UECDBPartition",
+  "UEBuild", "UEBuildAndroid", "UEBuildAndroidSO", "UEBuildIOS", "UEBuildPCH", "UECachePaths", "UECDBPartition",
   "UECDBStatus", "UECDBSwitch", "UECheatsheet", "UECheatsheetEdit", "UEClearCache",
+  "UECompileForNvim",
   "UEDAPAttach", "UEDAPClearBreakpoints", "UEDAPCondBreakpoint", "UEDAPContinue",
   "UEDAPDiag", "UEDAPEval", "UEDAPFrameDown", "UEDAPFrameUp", "UEDAPHover",
   "UEDAPLaunch", "UEDAPListBreakpoints", "UEDAPLogpoint", "UEDAPNextTab",
@@ -18,17 +19,17 @@ local UE_COMMANDS = {
   "UEDAPWatchUE", "UEDebugLogToggle", "UEDirtyClear", "UEDirtyStatus",
   "UEDeployAndroidSO", "UEExportCompileCommands", "UEGenerateFromRSP", "UEGrepDiagDump",
   "UEGrepGroupingToggle", "UEGrepTraceShow", "UEGrepTraceToggle", "UEIndexFull",
-  "UEIndexHot", "UEIndexNow", "UEIndexStatus", "UEIndexTimings", "UEInstallAndroid",
-  "UELaunch", "UELogToggle", "UEPaths", "UEPrepare", "UEPrepareIncremental",
+  "UEIndexHot", "UEIndexNow", "UEIndexStatus", "UEIndexTimings", "UEInstallAndroid", "UEInstallIOS",
+  "UELaunch", "UELogToggle", "UEPackageIOS", "UEPaths", "UEPrepare", "UEPrepareIncremental",
   "UEPrepareReindex", "UEPrepareSync", "UEResetLayout", "UESetAndroidDevice",
-  "UESetAndroidPackage", "UESetPlatform", "UESetProject", "UESetUprojectRelativePath", "UEWatchFlush",
+  "UESetAndroidPackage", "UESetIOSDevice", "UESetPlatform", "UESetProject", "UESetUprojectRelativePath", "UEWatchFlush",
   "UEWatchStatus", "UEWatchStop",
 }
 
 t.describe("commands: UE* 全量注册", function()
   require("ue").setup()
-  t.it("冻结清单含 72 个命令", function()
-    t.assert_eq(#UE_COMMANDS, 72)
+  t.it("冻结清单含 77 个命令", function()
+    t.assert_eq(#UE_COMMANDS, 77)
   end)
   for _, c in ipairs(UE_COMMANDS) do
     t.it(":" .. c .. " 已注册", function()

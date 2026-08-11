@@ -19,5 +19,8 @@ function M.default_clangd_candidates() return {} end
 function M.default_lldb_dap_paths() return {} end
 function M.default_lldb_server_paths() return {} end
 function M.cmd_quote(value) return tostring(value or "") end
+function M.host_path(path) return tostring(path or "") end
+function M.ue_build_entry(_) return nil, "unavailable" end
+function M.ue_uat_entry(_) return nil, "unavailable" end
 
 return M

@@ -69,6 +69,39 @@ Do **not** downgrade clang/clangd/libclang to 21.x — controlled BackgroundInde
 the official `compilationDatabaseChanges` transport, and the libclang/shim ABI
 are verified as one LLVM 22.x toolchain identity.
 
+On macOS, the Xcode-provided Apple clangd is not a substitute for the pinned
+LLVM build. `:UECompileForNvim` checks `clangd --version` before starting a UE
+build and accepts only 22.1.x; Tree-sitter highlighting remains available when
+that compiler-semantic gate is not met.
+
+## macOS host and iOS application workflow
+
+The macOS host driver uses only native engine and Xcode entry points:
+
+- `<engine>/Engine/Build/BatchFiles/Mac/Build.sh` for UBT target builds.
+- `<engine>/Engine/Build/BatchFiles/RunUAT.sh BuildCookRun` for iOS
+  build/cook/stage/package/archive.
+- `/usr/bin/xcrun devicectl` with `--json-output <file>` for physical-device
+  discovery, `.app` install and process launch.
+- `/usr/bin/security` for a read-only code-sign identity gate and
+  `/usr/bin/plutil` for `CFBundleIdentifier` extraction.
+
+Requirements:
+
+- Full Xcode selected by `xcode-select`, with an iPhoneOS SDK visible through
+  `xcrun --sdk iphoneos --show-sdk-path`.
+- The engine-bundled .NET environment used by `Build.sh` and `RunUAT.sh`.
+- At least one valid code-signing identity plus project provisioning for
+  package/install.
+- A paired, connected physical iOS device for install/launch.
+
+The installable app produced by this engine lives at
+`<project>/Binaries/IOS/Payload/<Target>.app`. The similarly named
+`Saved/StagedBuilds/IOS` tree is raw stage input, not the signed app bundle.
+The workflow deliberately does not use UE's legacy
+fastlane/ideviceinstaller/instruments deploy/run route and does not implement
+iOS DAP.
+
 ## Historical lldb-dap 21 side-load (DAP debugger adapter, Windows)
 
 - **Required**: LLVM **21.1.8** — **NOT 22.x**

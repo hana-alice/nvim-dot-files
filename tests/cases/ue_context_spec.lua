@@ -54,8 +54,16 @@ t.describe("ue.ai_context", function()
     t.assert_eq(context.target.name, "SampleGame")
     t.assert_eq(context.state.android_package, "com.example.samplegame")
     t.assert_eq(context.android_device_serial, "SERIAL-CONTEXT")
-    t.assert_eq(context.artifacts.build_command[1], "cmd.exe")
-    t.assert_contains(context.artifacts.build_command[4], "Build.bat SampleGame Android Development")
+    local build_text = table.concat(context.artifacts.build_command, " ")
+    local host_id = require("utils.platform").driver().id
+    if host_id == "windows" then
+      t.assert_eq(context.artifacts.build_command[1], "cmd.exe")
+      t.assert_contains(build_text, "Build.bat")
+    elseif host_id == "macos" then
+      t.assert_contains(context.artifacts.build_command[1], "/Engine/Build/BatchFiles/Mac/Build.sh")
+      t.assert_false(build_text:lower():find("powershell", 1, true) ~= nil)
+    end
+    t.assert_contains(build_text, "SampleGame Android Development")
     t.assert_eq(context.artifacts.install_command[1], "adb")
     t.assert_eq(context.artifacts.install_command[2], "-s")
     t.assert_eq(context.artifacts.install_command[3], "SERIAL-CONTEXT")

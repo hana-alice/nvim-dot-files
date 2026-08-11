@@ -11,6 +11,14 @@ local M = {
   exe_suffix = "",
 }
 
+local function join_engine_path(engine_root, suffix)
+  local root = tostring(engine_root or "")
+  if root:sub(-1) == "/" then
+    return root .. suffix
+  end
+  return root .. "/" .. suffix
+end
+
 function M.shell()
   if vim.fn.executable("bash") == 1 then return "/bin/bash" end
   if vim.fn.executable("zsh") == 1 then return "/bin/zsh" end
@@ -20,6 +28,10 @@ end
 function M.cmd_quote(value)
   local s = tostring(value or "")
   return "'" .. s:gsub("'", [['\'']]) .. "'"
+end
+
+function M.host_path(path)
+  return tostring(path or ""):gsub("\\", "/")
 end
 
 function M.open_path(path)
@@ -74,6 +86,14 @@ function M.default_lldb_server_paths()
     home .. "/Android/Sdk/ndk/*/toolchains/llvm/prebuilt/*/lib64/clang/*/lib/linux/aarch64/lldb-server",
     home .. "/Android/Sdk/ndk/*/toolchains/llvm/prebuilt/*/lib/clang/*/lib/linux/aarch64/lldb-server",
   }
+end
+
+function M.ue_build_entry(engine_root)
+  return join_engine_path(engine_root, "Engine/Build/BatchFiles/Linux/Build.sh"), nil
+end
+
+function M.ue_uat_entry(engine_root)
+  return join_engine_path(engine_root, "Engine/Build/BatchFiles/RunUAT.sh"), nil
 end
 
 return M

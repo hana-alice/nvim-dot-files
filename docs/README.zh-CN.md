@@ -1,6 +1,6 @@
 # hana-alice's Neovim — Unreal Engine 版
 
-> 基于 LazyVim 的 Neovim 配置，用于在 Windows 上编辑超大型 Unreal Engine 5
+> 基于 LazyVim 的 Neovim 配置，用于在 Windows 与 macOS 上编辑超大型 Unreal Engine
 > C++ 工程——并为长期 AI 辅助开发而设计。
 
 [English](../README.md) · **中文**
@@ -16,6 +16,9 @@
 - **CDB 超级流水线**：对 `compile_commands.json` 做 expand / PCH 预编译 / 裁剪
   include（删掉 60–90% 的 `-I`），让 clangd 解析更少。
 - **多平台 DAP**：Win64 与 Android（headless attach）调试，断点按工程持久化。
+- **Host/target 双层构建驱动**：Windows/macOS/Linux 宿主执行与
+  Win64/Android/Mac/IOS/Linux target 策略分离。
+- **macOS/iOS 原生流程**：UBT 编译、UAT 打包归档、物理设备选择、安装与启动。
 - **基于文件的 AI 知识库**：逐目录规则、SESSION START 协议、回归门禁的
   Definition of Done。
 
@@ -56,20 +59,22 @@ FRHICommandList grep（越低越好）
 
 ## 平台支持
 
-**仅支持 Windows 10/11。** macOS 与 Linux 未适配：配置能加载、基础编辑器可用，但
-UE 子系统（CDB 流水线、索引、DAP、启动器）是针对 Windows 工具链编写的，其它平台
-不受支持。
+- **Windows 10/11**：主环境，支持 UE 构建/索引与 Win64/Android 工作流。
+- **macOS**：支持原生 UE `Build.sh`、Mac/IOS target、CDB 语义流水线及 iOS
+  打包/安装/启动；尚未实现 iOS 真机 DAP。
+- **Linux**：基础编辑器与原生 UBT build planner 可用；设备与 DAP 能力取决于 target。
 
 ## 环境要求
 
 | 组件 | 版本 / 说明 |
 | --- | --- |
-| 操作系统 | Windows 10/11 |
+| 操作系统 | Windows 10/11，或安装完整 Xcode 的 macOS |
 | Neovim | 0.10+ |
 | 工具链 | clangd/LLVM 22.1.x —— 钉死；不要使用 mason auto-install |
 | Android DAP | LLVM 22.1.6+ `lldb-dap` + NDK 27 `lldb-server` |
 | 可选 | Go ≥ 1.22，用于构建 grep 索引工具 |
 | 构建前置 | 目标平台可用的 Unreal Build Tool 环境 |
+| iOS | Xcode、iPhoneOS SDK、签名/provisioning、已配对物理设备 |
 
 钉死版本的权威清单见 [`CONSTRAINTS.md` §C1](CONSTRAINTS.md) 与
 [`TOOLING.md`](TOOLING.md)。
@@ -86,6 +91,13 @@ nvim
 
 `setup.ps1` 安装工具链、字体与插件（在管理员 PowerShell 中运行）。参数：
 `-SkipFonts`、`-SkipCapslock`、`-SkipPlugins`、`-Force`。
+
+macOS 使用标准配置目录；Xcode 与钉死版本的 LLVM 工具链需另行管理：
+
+```sh
+git clone https://github.com/hana-alice/nvim-dot-files.git ~/.config/nvim
+nvim
+```
 
 可选：构建 grep 索引工具。
 
@@ -119,14 +131,17 @@ go install ./...   # 需 Go >= 1.22，且 $GOBIN 在 PATH
 选择 `Win64`、`Android`、`Mac`、`IOS` 或 `Linux`。不设则按当前 OS。缓存按
 `<Platform>-<Config>` 分别存储，切换平台不会使其它平台缓存失效。
 
-### 3. 先对目标平台编译一次（必需）
+### 3. 为编辑器语义编译
 
 ```
 <leader>ub        " （space u b）→ :UEBuild
 ```
 
-`:UEPrepare` 的编译参数来自目标平台的一次真实编译。**索引前必须已有一次成功的平台
-编译**，否则没有 compile commands 可供处理。Android 用 `:UEBuildAndroid` 编译。
+推荐直接执行 `:UECompileForNvim`：先验证仓库钉死的 clangd 22.1.x，再编译当前 target，
+最后从真实 `.rsp` 准备 CDB 与索引。Tree-sitter 语法高亮不依赖这一步；clangd 导航、诊断和
+编译器语义需要 CDB。
+
+`:UEBuild` 仍然只构建；已有新鲜 `.rsp` 时可单独执行 `:UEPrepare`。
 
 ### 4. 构建索引
 
@@ -149,9 +164,13 @@ go install ./...   # 需 Go >= 1.22，且 $GOBIN 在 PATH
 | 工程级 grep | `<leader>/` |
 | 文件 picker | `<leader><leader>` |
 | 编译（当前平台） | `<leader>ub` / `:UEBuild` |
+| 编译并准备 Neovim 编译器语义 | `:UECompileForNvim` |
+| 只编译 IOS | `:UEBuildIOS` |
+| IOS 打包/归档 | `:UEPackageIOS` |
+| IOS 选设备 / 安装 / 启动 | `:UESetIOSDevice` / `:UEInstallIOS` / `:UELaunch` |
 | 仅编译 Android SO（跳过 APK） | `<leader>us` / `:UEBuildAndroidSO` |
 | Android SO 快速部署（root 设备；替换后不启动） | `<leader>uq` / `:UEDeployAndroidSO` |
-| 启动 Editor | `:UELaunch` |
+| 启动当前 target 应用 | `:UELaunch` |
 | 增删文件后重建索引 | `:UEPrepareIncremental` |
 | Android：选择设备（名称 + serial，仅当前 Neovim 进程） | `<leader>uA` / `:UESetAndroidDevice` |
 | Android：安装（不启动）/ attach / 断点 | `<leader>ui` / `:UEDAPAttach` / `F9` |

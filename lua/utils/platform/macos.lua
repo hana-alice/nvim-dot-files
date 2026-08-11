@@ -1,8 +1,7 @@
 -- utils.platform.macos — macOS driver.
 --
--- Phase A: bare-but-correct defaults. Subsequent phases will exercise
--- these once a real Mac host is available; for now this keeps headless
--- tests on Mac green.
+-- Owns only native macOS host behavior; foreign host capabilities are absent
+-- rather than represented by fake stubs.
 
 local M = {
   id         = "macos",
@@ -10,6 +9,14 @@ local M = {
   list_sep   = ":",
   exe_suffix = "",
 }
+
+local function join_engine_path(engine_root, suffix)
+  local root = tostring(engine_root or "")
+  if root:sub(-1) == "/" then
+    return root .. suffix
+  end
+  return root .. "/" .. suffix
+end
 
 function M.shell()
   if vim.fn.executable("zsh") == 1 then return "/bin/zsh" end
@@ -21,6 +28,10 @@ function M.cmd_quote(value)
   -- POSIX single-quote: wrap and escape any embedded single quote.
   local s = tostring(value or "")
   return "'" .. s:gsub("'", [['\'']]) .. "'"
+end
+
+function M.host_path(path)
+  return tostring(path or ""):gsub("\\", "/")
 end
 
 function M.open_path(path)
@@ -67,6 +78,26 @@ function M.default_lldb_server_paths()
     home .. "/Library/Android/sdk/ndk/*/toolchains/llvm/prebuilt/*/lib64/clang/*/lib/linux/aarch64/lldb-server",
     home .. "/Library/Android/sdk/ndk/*/toolchains/llvm/prebuilt/*/lib/clang/*/lib/linux/aarch64/lldb-server",
   }
+end
+
+function M.ue_build_entry(engine_root)
+  return join_engine_path(engine_root, "Engine/Build/BatchFiles/Mac/Build.sh"), nil
+end
+
+function M.ue_uat_entry(engine_root)
+  return join_engine_path(engine_root, "Engine/Build/BatchFiles/RunUAT.sh"), nil
+end
+
+function M.xcrun_entry()
+  return "/usr/bin/xcrun", nil
+end
+
+function M.security_entry()
+  return "/usr/bin/security", nil
+end
+
+function M.plutil_entry()
+  return "/usr/bin/plutil", nil
 end
 
 return M

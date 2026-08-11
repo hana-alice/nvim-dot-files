@@ -35,6 +35,7 @@ end
 -- 冻结清单：新增子系统目录需同步此处（防误删/防漏规则）。
 local MAJOR_DIRS = {
   "lua", "lua/ue", "lua/ue/cdb", "lua/ue/core", "lua/ue/dap", "lua/ue/index",
+  "lua/ue/targets",
   "lua/utils", "lua/utils/ue_goto", "lua/utils/code_search", "lua/utils/platform",
   "lua/config", "lua/plugins", "lua/workarounds", "lua/trouble", "lua/nio",
   "tools", "scripts", "tests", "docs",

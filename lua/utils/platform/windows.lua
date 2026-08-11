@@ -22,8 +22,20 @@ local function to_windows_path(path)
   return tostring(path or ""):gsub("/", "\\")
 end
 
+local function join_engine_path(engine_root, suffix)
+  local root = to_windows_path(engine_root)
+  if root:sub(-1) == "\\" then
+    return root .. suffix
+  end
+  return root .. "\\" .. suffix
+end
+
 function M.cmd_quote(value)
   return '"' .. tostring(value or ""):gsub('"', '""') .. '"'
+end
+
+function M.host_path(path)
+  return to_windows_path(path)
 end
 
 local function start_with_explorer(path, select_file)
@@ -114,6 +126,30 @@ function M.default_lldb_server_paths()
       .. "/Programs/Android Studio*/plugins/android-ndk/resources/lldb/android/arm64-v8a/lldb-server"
   end
   return out
+end
+
+function M.ue_build_entry(engine_root)
+  local build_bat = join_engine_path(engine_root, "Engine\\Build\\BatchFiles\\Build.bat")
+  return {
+    executable = "cmd.exe",
+    args = { "/d", "/c", "call " .. M.cmd_quote(build_bat) },
+    cwd = to_windows_path(engine_root),
+    metadata = { script = build_bat },
+  }, nil
+end
+
+function M.ue_uat_entry(engine_root)
+  local run_uat = join_engine_path(engine_root, "Engine\\Build\\BatchFiles\\RunUAT.bat")
+  return {
+    executable = "cmd.exe",
+    args = { "/d", "/c", "call " .. M.cmd_quote(run_uat) },
+    cwd = to_windows_path(engine_root),
+    metadata = { script = run_uat },
+  }, nil
+end
+
+function M.powershell_entry()
+  return "powershell.exe", nil
 end
 
 return M

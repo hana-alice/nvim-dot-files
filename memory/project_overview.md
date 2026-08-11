@@ -43,7 +43,8 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 | CDB 流水线 | `lua/ue/cdb/` | `lua/ue/cdb/AGENTS.md` | compile_commands.json 生成/裁剪/注入 |
 | DAP 调试 | `lua/ue/dap/` | `lua/ue/dap/AGENTS.md` | codelldb + Android platform 模式 |
 | Android device | `lua/utils/android_device.lua` | `lua/utils/AGENTS.md` | 名称+serial picker；当前 Neovim 进程 serial；统一 `adb -s` |
-| Android SO 快速迭代 | `lua/ue.lua` + `scripts/ue_android_so_*.ps1` | `scripts/AGENTS.md` | `<leader>us` 只编 SO；`<leader>uq` root 替换、回滚、验证 |
+| Android SO 快速迭代 | `lua/ue/targets/android.lua` + `android_windows.lua` + `scripts/ue_android_so_*.ps1` | `lua/ue/targets/AGENTS.md` + `scripts/AGENTS.md` | Windows-only PowerShell compatibility path；root 或已验证的 debuggable app-private transport；不支持 macOS→Android |
+| UE target drivers | `lua/ue/targets/` | `lua/ue/targets/AGENTS.md` | Android/IOS/Mac/Win64/Linux 目标策略彼此隔离；host tools 由 `utils/platform` 注入 |
 | goto 解析栈 | `lua/utils/ue_goto/` | `lua/utils/ue_goto/AGENTS.md` | proven-TU canonical USR + module AST 唯一 body；非 C++ compatibility fallback |
 | 代码搜索 | `lua/utils/code_search/` | `lua/utils/code_search/AGENTS.md` | csearch 亚秒级 grep（兜底，非主路） |
 | 平台驱动 | `lua/utils/platform/` | `lua/utils/platform/AGENTS.md` | 唯一允许做 OS 分支的地方 |
@@ -54,7 +55,10 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 
 > 每个主要目录同时有一份 `CLAUDE.md`（内容为 `@AGENTS.md` 导入 stub），供 Claude 读取。
 
-详见 `docs/architecture/overview.md`（数据流 / 平台层 / 构建流水线 / 归属边界）。Android SO 快速部署按能力选择 root 或已验证的 debuggable app-private transport；正常 APK 安装和未 strip 主机符号文件仍是正式流程与调试真相。
+详见 `docs/architecture/overview.md`（数据流 / 平台层 / 构建流水线 / 归属边界）。Android SO
+快速部署按能力选择 root 或已验证的 debuggable app-private transport；正常 APK 安装和未 strip
+主机符号文件仍是正式流程与调试真相。macOS host 只新增 IOS 支持；Mac 与 IOS target 独立，
+Android PowerShell transport 继续保持 Windows-only。
 
 ## 知识库各区
 

@@ -49,6 +49,54 @@ function M.known_platforms()
   return out
 end
 
+--- Register only DAP handlers supported by the current host-target matrix.
+--- Importability is not compatibility: for example, loading the iOS module on
+--- macOS must not make an unsupported iOS attach appear available.
+---@param host_driver table
+---@param ue_api table
+function M.register_supported(host_driver, ue_api)
+  local targets = require("ue.targets")
+  local specs = {
+    { target = "Android", module = "android" },
+    { target = "Win64", module = "win64" },
+    { target = "Mac", module = "mac" },
+    { target = "Linux", module = "linux" },
+    { target = "IOS", module = "ios" },
+  }
+
+  -- Re-resolving must remove stale built-in handlers from a previous host
+  -- fixture/setup pass while preserving unrelated user registrations.
+  for _, spec in ipairs(specs) do
+    _attach[spec.module] = nil
+    _launch[spec.module] = nil
+  end
+
+  for _, spec in ipairs(specs) do
+    local attach = targets.supports(spec.target, "dap_attach", host_driver)
+    local launch = targets.supports(spec.target, "dap_launch", host_driver)
+    if attach or launch then
+      local handlers
+      if spec.target == "Android" then
+        handlers = {
+          attach = function() ue_api.android_dap_attach() end,
+          launch = function() ue_api.android_dap_launch() end,
+        }
+      else
+        local ok, module = pcall(require, "ue.dap." .. spec.module)
+        if ok and type(module) == "table" then handlers = module end
+      end
+      if handlers then
+        if attach and type(handlers.attach) == "function" then
+          M.register_attach(spec.module, handlers.attach)
+        end
+        if launch and type(handlers.launch) == "function" then
+          M.register_launch(spec.module, handlers.launch)
+        end
+      end
+    end
+  end
+end
+
 --- Test seam.
 function M._reset_for_test()
   _attach = {}

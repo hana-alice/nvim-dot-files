@@ -18,7 +18,11 @@ function M.norm(path)
     return ""
   end
   path = tostring(path):gsub("\\", "/")
+  local unc = path:sub(1, 2) == "//"
   path = path:gsub("/+", "/")
+  if unc then
+    path = "/" .. path
+  end
   if #path > 1 and path:sub(-1) == "/" then
     path = path:sub(1, -2)
   end

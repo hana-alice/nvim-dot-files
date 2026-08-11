@@ -11,6 +11,12 @@ UBT/UAT argv、RSP 归属判断、以及各 target 自有的生命周期 planner
 ## 专属约定
 
 - **host 与 target 正交**：本目录只回答 Unreal target 策略；宿主工具入口来自 `utils.platform/*`。
+- **兼容性由 matrix 决定**：每个 driver 必须声明 `host_operations[host][operation] = true`；
+  所有 build/package/device/install/launch/log/DAP 入口先经 `ue.targets.resolve`，不得以模块可加载、
+  文件扩展名或 path 形状推测兼容性。
+- **runtime dispatch 也归 target**：每个 driver 的 `runtime.launch/main_log/debug_log.strategy`
+  决定通用 orchestrator 的策略；desktop executable suffix、editor app bundle 规则也写在对应 target，
+  `utils/ue_launch.lua` / `utils/ue_logs.lua` 不得硬编码 target 名分支。
 - **driver 彼此独立**：`android.lua` / `ios.lua` / `mac.lua` / `win64.lua` / `linux.lua`
   不得互相调用、读取彼此状态或作为 fallback。
 - **`_common.lua` 必须 policy-free**：只允许放 argv/path/schema 校验、plan 组装、
@@ -24,6 +30,8 @@ UBT/UAT argv、RSP 归属判断、以及各 target 自有的生命周期 planner
   逻辑；`mac.lua` 只实现 Mac target build/RSP 规则，不承载 iOS 生命周期。
 - **不扩展 macOS→Android**：本变更只支持 macOS host 上的 Mac/IOS 目标。既有 Android SO
   PowerShell 兼容逻辑只允许位于 `android_windows.lua`，不得成为 macOS 依赖或 fallback。
+- **DAP 注册也受 matrix 约束**：foreign target 模块可 import 不等于可执行；`ue.dap.platforms`
+  只注册当前 host 声明支持的 attach/launch handler，IOS 未实现时不得借用 Mac handler。
 
 ## 改动 → 必跑回归
 

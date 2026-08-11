@@ -5,6 +5,16 @@
 local t = require("tests.harness")
 t.bootstrap()
 
+t.describe("utils.ue_goto.csearch_fallback", function()
+  t.it("location URI 使用当前 host 的规范路径，不把 POSIX 路径改成反斜杠", function()
+    local fallback = require("utils.ue_goto.csearch_fallback")
+    local path = "/tmp/source.cpp"
+    local location = fallback._make_location_for_test(path, 4, 2)
+    t.assert_eq(location.uri, vim.uri_from_fname(path))
+    t.assert_eq(location._path, path)
+  end)
+end)
+
 t.describe("utils.code_search", function()
   local cs = require("utils.code_search")
   t.it("返回 table", function() t.assert_type(cs, "table") end)

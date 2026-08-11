@@ -106,7 +106,7 @@ end
 -- ==========================================================================
 
 local function is_native_windows()
-  return vim.fn.has("win32") == 1
+  return _uplat.is_windows
 end
 
 local function clangd_candidates(root_dir)
@@ -133,25 +133,7 @@ local function clangd_candidates(root_dir)
     end
   end
 
-  vim.list_extend(candidates, {
-    "clangd",
-    "/usr/local/bin/clangd",
-    "/usr/bin/clangd",
-  })
-
-  root_dir = norm(root_dir or "")
-  if root_dir:match("^/mnt/[a-z]/") then
-    table.insert(candidates, "/mnt/c/Program Files/LLVM/bin/clangd.exe")
-  end
-
-  -- Windows native paths: when running nvim on Windows directly (not under
-  -- WSL), `clangd` may not be on PATH (the user installs LLVM into Program
-  -- Files but doesn't always add bin/ to PATH). Try the canonical install
-  -- location explicitly.
-  if vim.fn.has("win32") == 1 then
-    table.insert(candidates, "C:/Program Files/LLVM/bin/clangd.exe")
-    table.insert(candidates, "C:/Program Files (x86)/LLVM/bin/clangd.exe")
-  end
+  vim.list_extend(candidates, _uplat.driver().default_clangd_candidates())
 
   return candidates
 end
@@ -975,12 +957,27 @@ local function solution_configuration_data(project_root, uproject)
   return parse_solution_configurations(solution)
 end
 
-local function available_platform_choices(project_root, uproject)
+local function available_platform_choices(project_root, uproject, host_driver)
   local solution = solution_configuration_data(project_root, uproject)
-  if solution and #solution.platforms > 0 then
-    return copy_list(solution.platforms)
+  local candidates = {}
+  local seen = {}
+  for _, candidate in ipairs(solution and solution.platforms or {}) do
+    push_unique(candidates, seen, candidate)
   end
-  return copy_list(UE_CONST.DEFAULT_PLATFORM_CHOICES)
+  -- A checked-out .sln may describe a different host. Always merge canonical
+  -- targets before applying the host matrix so macOS is not left with an empty
+  -- picker merely because the repository also contains Win64/Android entries.
+  for _, candidate in ipairs(UE_CONST.DEFAULT_PLATFORM_CHOICES) do
+    push_unique(candidates, seen, candidate)
+  end
+  host_driver = host_driver or _uplat.driver()
+  local supported = {}
+  for _, candidate in ipairs(candidates) do
+    if require("ue.targets").supports(candidate, "build", host_driver) then
+      supported[#supported + 1] = candidate
+    end
+  end
+  return supported
 end
 
 local function available_configuration_choices(project_root, uproject, platform)
@@ -3284,14 +3281,15 @@ local function target_platform(engine_root, cmd)
       return persisted
     end
   end
-  local exe = trim((cmd or {})[1])
-  if exe ~= "" and (exe:lower():match("%.exe$") or exe:lower():match("%.bat$")) then
-    return "Win64"
+  local driver = _uplat.driver()
+  if type(driver.default_target) == "function" then
+    local detected = trim(driver.default_target())
+    if detected ~= "" then
+      return detected
+    end
   end
-  if engine_root and engine_root:match("^/mnt/[a-z]/") then
-    return "Win64"
-  end
-  return "Linux"
+  -- A failed/unknown host driver must not silently masquerade as Linux.
+  return ""
 end
 
 local function selected_target_configuration(engine_root, project_root, uproject, platform)
@@ -3334,201 +3332,12 @@ end
 -- BUILD COMMANDS — Windows wrappers, UBT, Build.bat
 -- ==========================================================================
 
-local function command_is_windows(cmd)
-  local exe = trim((cmd or {})[1])
-  if exe == "" then
-    return false
-  end
-  exe = exe:lower()
-  return exe:match("%.exe$") ~= nil
-end
-
-local function command_needs_windows_wrapper(cmd)
-  local exe = norm(trim((cmd or {})[1]))
-  return exe ~= "" and exe:lower():match("%.exe$") ~= nil and not exe:match("^/mnt/[a-z]/")
-end
-
-local function powershell_quote(value)
-  return "'" .. tostring(value or ""):gsub("'", "''") .. "'"
-end
-
-local function cmd_quote(value)
-  return '"' .. tostring(value or ""):gsub('"', '""') .. '"'
-end
-
-local function is_windows_path(path)
-  path = trim(path)
-  return path:match("^[A-Za-z]:[\\/]") ~= nil or path:match("^\\\\") ~= nil
-end
-
-local function to_windows_path(path)
-  path = trim(path)
-  if path == "" then
-    return nil
-  end
-  if is_windows_path(path) then
-    return (path:gsub("/", "\\"))
-  end
-
-  -- Historical: this used to spawn `wslpath -w` to convert /mnt/d/... into
-  -- D:\... when ue.lua ran inside WSL. WSL is no longer a supported host
-  -- (Windows-native + Mac-native only), so a non-Windows path here means
-  -- the caller passed a malformed path (e.g. drive-relative like "E:aki/"
-  -- or a posix absolute that doesn't make sense on this host). Fail
-  -- loudly instead of silently spawning a missing helper.
-  return nil
-end
-
-local function windows_host_cwd()
-  for _, candidate in ipairs({ "/mnt/c/Windows", "/mnt/c" }) do
-    if _ufs.is_dir(candidate) then
-      return candidate
-    end
-  end
-  return cwd()
-end
-
-local function build_bat_path(engine_root)
-  if is_windows_path(engine_root) then
-    return engine_root:gsub("/", "\\") .. "\\Engine\\Build\\BatchFiles\\Build.bat"
-  end
-  return join(engine_root, "Engine", "Build", "BatchFiles", "Build.bat")
-end
-
-local function ubt_exe_path(engine_root)
-  if is_windows_path(engine_root) then
-    return engine_root:gsub("/", "\\") .. "\\Engine\\Binaries\\DotNET\\UnrealBuildTool.exe"
-  end
-  return join(engine_root, "Engine", "Binaries", "DotNET", "UnrealBuildTool.exe")
-end
-
-local function ensure_executable(path)
-  if is_windows_path(path) then
-    return true
-  end
-  if vim.fn.executable(path) == 1 then
-    return true
-  end
-  local code = select(1, run_lines({ "chmod", "+x", path }))
-  if code == 0 and vim.fn.executable(path) == 1 then
-    return true
-  end
-  return false, "Failed to mark executable: " .. path
-end
-
-local function direct_ubt_command(engine_root, args)
-  local exe = ubt_exe_path(engine_root)
-  if not _ufs.is_file(exe) then
-    return nil, "UnrealBuildTool.exe not found under engine root: " .. exe
-  end
-
-  local ok_exec, exec_err = ensure_executable(exe)
-  if not ok_exec then
-    return nil, exec_err
-  end
-
-  local cmd = { exe }
-  vim.list_extend(cmd, args or {})
-  return cmd
-end
-
-local function build_bat_windows_command(engine_root, args)
-  local engine_root_win = to_windows_path(engine_root)
-  if not engine_root_win then
-    return nil, "Failed to convert engine root to Windows path: " .. engine_root
-  end
-
-  local build_bat_win = to_windows_path(build_bat_path(engine_root))
-  if not build_bat_win then
-    return nil, "Failed to convert Build.bat path to Windows path: " .. build_bat_path(engine_root)
-  end
-
-  local function direct_cmd_token(value)
-    value = tostring(value or "")
-    if value:find("%s") then
-      return cmd_quote(value)
-    end
-    return value
-  end
-
-  local function shell_cmd_token(value)
-    value = tostring(value or "")
-    if value:find("%s") then
-      return '\\"' .. value:gsub('"', '\\"') .. '\\"'
-    end
-    return value
-  end
-
-  local direct_parts = {
-    "call " .. direct_cmd_token(build_bat_win),
-  }
-
-  for _, arg in ipairs(args or {}) do
-    table.insert(direct_parts, direct_cmd_token(arg))
-  end
-
-  if _uplat.is_windows then
-    return { "cmd.exe", "/d", "/c", table.concat(direct_parts, " ") }
-  end
-
-  local parts = {
-    "call " .. shell_cmd_token(build_bat_win),
-  }
-
-  for _, arg in ipairs(args or {}) do
-    table.insert(parts, shell_cmd_token(arg))
-  end
-
-  local shell = _uproc.first_executable({ "zsh", "bash", "sh" })
-  if not shell then
-    return { "cmd.exe", "/d", "/c", table.concat(direct_parts, " ") }
-  end
-  local shell_name = vim.fs.basename(shell)
-  local shell_flag = shell_name == "sh" and "-c" or "-lc"
-  local shell_cmd = ('cd %s && cmd.exe /d /c "%s"'):format(
-    vim.fn.shellescape(windows_host_cwd()),
-    table.concat(parts, " ")
-  )
-
-  return { shell, shell_flag, shell_cmd }
-end
-
-local function wrap_windows_command(cmd)
-  local exe_win = to_windows_path((cmd or {})[1])
-  if not exe_win then
-    return nil, "Failed to convert Windows executable path: " .. tostring((cmd or {})[1])
-  end
-
-  local parts = { "& " .. powershell_quote(exe_win) }
-  for index = 2, #cmd do
-    table.insert(parts, powershell_quote(cmd[index]))
-  end
-
-  return {
-    "powershell.exe",
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-Command",
-    table.concat(parts, " "),
-  }
-end
-
 -- ==========================================================================
 -- COMPILE_COMMANDS.JSON GENERATION
 -- ==========================================================================
 
 local function compile_commands_targets(ctx)
   return require("ue.cdb.paths").targets(ctx)
-end
-
-local function windows_engine_root(ctx)
-  local override = trim(vim.env.UE_WINDOWS_ENGINE_ROOT)
-  if override ~= "" then
-    return to_windows_path(override)
-  end
-
-  return to_windows_path(ctx.engine_root)
 end
 
 local function compile_commands_candidates(ctx)
@@ -4879,11 +4688,22 @@ do
     if not target_ctx then
       return nil, context_err
     end
+    local host_driver = (opts and opts.host_driver) or require("utils.platform").driver()
+    local platform = target_ctx.platform
+    local resolved, unavailable = require("ue.targets").resolve(platform, operation, host_driver)
+    if not resolved then
+      return nil, ("%s %s unavailable on host %s: %s"):format(
+        platform,
+        operation,
+        tostring(unavailable.host_id or "<unknown>"),
+        tostring(unavailable.reason)
+      )
+    end
+    driver = resolved
     local planner = driver[operation .. "_plan"]
     if type(planner) ~= "function" then
       return nil, ("Target %s does not implement %s"):format(driver.id, operation)
     end
-    local host_driver = (opts and opts.host_driver) or require("utils.platform").driver()
     local plan = planner(target_ctx, host_driver)
     local command, plan_err = require("ue.target_tasks").command(plan)
     if not command then
@@ -6561,6 +6381,14 @@ function M._target_plan_for_test(operation, ctx, platform, opts)
   return CORE_RT.target_plan(operation, ctx, platform, opts)
 end
 
+function M._target_platform_for_test(engine_root)
+  return target_platform(engine_root, nil)
+end
+
+function M._available_platform_choices_for_test(host_driver, project_root, uproject)
+  return available_platform_choices(project_root, uproject, host_driver)
+end
+
 function M._clangd_version_compatible_for_test(output)
   return CORE_RT.clangd_version_compatible(output)
 end
@@ -6995,6 +6823,20 @@ local function set_platform(input)
   input = trim(input or "")
   if input ~= "" then
     local plat, conf = split_platform_input(input)
+    if plat and plat ~= "" then
+      local _, unavailable = require("ue.targets").resolve(plat, "build", _uplat.driver())
+      if unavailable then
+        vim.notify(
+          ("Target %s cannot build on host %s: %s"):format(
+            plat,
+            tostring(_uplat.driver().id),
+            tostring(unavailable.reason)
+          ),
+          vim.log.levels.WARN
+        )
+        return
+      end
+    end
     local ok_update, update_err = CORE_RT.project_state.update_target(
       engine_root,
       (plat and plat ~= "") and plat or current_plat,
@@ -7255,15 +7097,19 @@ local function find_apk(ctx)
 end
 
 local function android_so_deploy_command(ctx, serial, package_name, host_driver)
-  local target_ctx, context_err, driver = CORE_RT.target_context(ctx, "Android")
+  local target_ctx, context_err = CORE_RT.target_context(ctx, "Android")
   if not target_ctx then return nil, context_err end
   target_ctx.device_id = serial
   target_ctx.package_name = package_name
-  local plan = driver.so_deploy_plan(
+  local selected_host = host_driver or require("utils.platform").driver()
+  local plan = require("ue.targets").plan(
+    "Android",
+    "so_deploy",
     target_ctx,
-    host_driver or require("utils.platform").driver()
+    selected_host
   )
-  return require("ue.target_tasks").command(plan)
+  local command, command_err = require("ue.target_tasks").command(plan)
+  return command, command_err, plan
 end
 
 function M.ai_context(engine_root)
@@ -7305,21 +7151,46 @@ function M.ai_context(engine_root)
   local kind = target_kind(engine_root, project_root, uproject, platform)
   local target_name = build_target_name(project_root, uproject, kind)
   local build_command, build_error = android_build_command(ctx)
+  local targets = require("ue.targets")
+  local host_driver = _uplat.driver()
+  local android_active = platform == targets.must_get("Android").id
   local so_build_command, so_build_error
-  if platform == "Android" then
+  if android_active then
     so_build_command, so_build_error = android_build_command(ctx, { operation = "so_build" })
   else
     so_build_error = "UEBuildAndroidSO requires target platform Android."
   end
-  local apk = find_apk(ctx)
+  local apk = android_active and find_apk(ctx) or nil
   local selected_android_serial = require("utils.android_device").get()
-  local so_deploy_command, so_deploy_error = android_so_deploy_command(
-    ctx, selected_android_serial, state.android_package
-  )
-  local install_command = apk and selected_android_serial and require("utils.android_device").adb_args(
-    "adb", selected_android_serial, { "install", "-r", to_windows_path(apk) or apk }) or nil
+  local so_deploy_command, so_deploy_error
+  if android_active then
+    so_deploy_command, so_deploy_error = android_so_deploy_command(
+      ctx, selected_android_serial, state.android_package
+    )
+  else
+    so_deploy_error = "UEDeployAndroidSO requires target platform Android."
+  end
+  local _, install_unavailable = targets.resolve("Android", "install", host_driver)
+  local install_plan = android_active
+      and not install_unavailable
+      and apk
+      and selected_android_serial
+      and targets.plan("Android", "install", {
+        adb = "adb",
+        apk = apk,
+        cwd = engine_root,
+        device_id = selected_android_serial,
+      }, host_driver)
+    or nil
+  local install_command = install_plan and require("ue.target_tasks").command(install_plan) or nil
   local install_native_action
-  if not apk then
+  if not android_active then
+    install_native_action = "UEInstallAndroid requires target platform Android."
+  elseif install_unavailable then
+    install_native_action = ("Android install is unavailable on host %s: %s"):format(
+      tostring(host_driver.id), tostring(install_unavailable.reason)
+    )
+  elseif not apk then
     install_native_action = "No APK found under the active uproject build outputs."
   elseif not selected_android_serial then
     install_native_action = "Android device is not selected; run :UESetAndroidDevice."
@@ -7432,10 +7303,9 @@ local function ue_runtime_env()
     find_uproject_in_dir = find_uproject_in_dir,
     glob_paths = glob_paths,
     is_file = _ufs.is_file,
-    is_windows_path = is_windows_path,
+    host_driver = require("utils.platform").driver(),
     join = join,
     norm = norm,
-    powershell_quote = powershell_quote,
     resolve_context = resolve_context,
     run_lines = run_lines,
     selected_target_configuration = selected_target_configuration,
@@ -7540,6 +7410,12 @@ do
       return
     end
     local host_driver = require("utils.platform").driver()
+    local resolved, unavailable = require("ue.targets").resolve(driver.id, "package", host_driver)
+    if not resolved then
+      target_error("ue.package", unavailable.reason)
+      return
+    end
+    driver = resolved
     CORE_RT.run_target_preflight(driver, "package", target_ctx, host_driver, function(ok, preflight_err)
       if not ok then
         target_error("ue.package", preflight_err)
@@ -7598,7 +7474,15 @@ do
       target_error("ue.device", context_err)
       return
     end
-    local plan = driver.device_list_plan(target_ctx, require("utils.platform").driver())
+    local host_driver = require("utils.platform").driver()
+    local resolved, unavailable = require("ue.targets").resolve(driver.id, "device", host_driver)
+    if not resolved then
+      pcall(os.remove, output_path)
+      target_error("ue.device", unavailable.reason)
+      return
+    end
+    driver = resolved
+    local plan = driver.device_list_plan(target_ctx, host_driver)
     local handle, run_err = require("ue.target_tasks").run(plan, {
       name = "UE " .. driver.id .. " device discovery",
       on_exit = function(result)
@@ -7703,6 +7587,13 @@ do
       return
     end
     local host_driver = require("utils.platform").driver()
+    local resolved, unavailable = require("ue.targets").resolve(driver.id, "install", host_driver)
+    if not resolved then
+      pcall(os.remove, output_path)
+      target_error("ue.install", unavailable.reason)
+      return
+    end
+    driver = resolved
     CORE_RT.run_target_preflight(driver, "install", target_ctx, host_driver, function(ok, preflight_err)
       if not ok then
         target_error("ue.install", preflight_err)
@@ -7766,6 +7657,13 @@ do
       return
     end
     local host_driver = require("utils.platform").driver()
+    local resolved, unavailable = require("ue.targets").resolve(driver.id, "launch", host_driver)
+    if not resolved then
+      pcall(os.remove, output_path)
+      target_error("ue.launch", unavailable.reason)
+      return
+    end
+    driver = resolved
     CORE_RT.run_target_preflight(driver, "launch", target_ctx, host_driver, function(ok, preflight_err)
       if not ok then target_error("ue.launch", preflight_err); return end
       with_target_bundle_id(ctx, driver, target_ctx, host_driver, function(bundle_id, artifacts, bundle_err)
@@ -7813,7 +7711,19 @@ function M.launch_app()
   local ctx = resolve_context()
   if ctx then
     local platform = target_platform(ctx.engine_root, nil)
-    local driver = require("ue.targets").driver(platform)
+    local host_driver = require("utils.platform").driver()
+    local driver, unavailable = require("ue.targets").resolve(platform, "launch", host_driver)
+    if not driver then
+      require("utils.log").notify_error(
+        "ue.launch",
+        ("%s launch unavailable on %s: %s"):format(
+          platform,
+          tostring(host_driver.id),
+          tostring(unavailable.reason)
+        )
+      )
+      return
+    end
     local capabilities = driver and driver.capabilities(ctx) or {}
     if capabilities.launch then
       return CORE_RT.launch_target(platform)
@@ -7824,15 +7734,31 @@ function M.launch_app()
 end
 
 function M.toggle_log()
+  local ctx = resolve_context()
+  if ctx then
+    local platform = target_platform(ctx.engine_root, nil)
+    local host_driver = require("utils.platform").driver()
+    local _, unavailable = require("ue.targets").resolve(platform, "log", host_driver)
+    if unavailable then
+      require("utils.log").notify_error("ue.log", unavailable.reason)
+      return
+    end
+  end
   return require("utils.ue_logs").toggle_main_log(ue_runtime_env())
 end
 
 function M.toggle_debug_log()
+  local ctx = resolve_context()
+  if ctx then
+    local platform = target_platform(ctx.engine_root, nil)
+    local host_driver = require("utils.platform").driver()
+    local _, unavailable = require("ue.targets").resolve(platform, "debug_log", host_driver)
+    if unavailable then
+      require("utils.log").notify_error("ue.debug_log", unavailable.reason)
+      return
+    end
+  end
   return require("utils.ue_logs").toggle_debug_log(ue_runtime_env())
-end
-
-local function android_install_argv(adb, serial, apk)
-  return require("utils.android_device").adb_args(adb, serial, { "install", "-r", apk })
 end
 
 local function deploy_android_so()
@@ -7856,7 +7782,7 @@ local function deploy_android_so()
   end
 
   local state = read_state(ctx.engine_root)
-  local cmd, command_err = android_so_deploy_command(ctx, serial, state.android_package)
+  local cmd, command_err, plan = android_so_deploy_command(ctx, serial, state.android_package)
   if not cmd then
     require("utils.log").notify_error("ue.android", command_err)
     return
@@ -7864,7 +7790,7 @@ local function deploy_android_so()
 
   require("ue.dap").stop_android_debugger({ kill_orphans = true })
   open_terminal_command(cmd, {
-    cwd = windows_host_cwd(),
+    cwd = plan.cwd or ctx.engine_root,
     quickfix_title = "UEDeployAndroidSO",
     quickfix_root = workspace_root(ctx),
     tail_limit = 20,
@@ -7879,6 +7805,13 @@ local function install_android()
   end
   if not ctx.project_root then
     vim.notify("No project configured. Run :UESetProject [path]", vim.log.levels.WARN)
+    return
+  end
+
+  local host_driver = require("utils.platform").driver()
+  local _, unavailable = require("ue.targets").resolve("Android", "install", host_driver)
+  if unavailable then
+    require("utils.log").notify_error("ue.android", unavailable.reason)
     return
   end
 
@@ -7897,8 +7830,13 @@ local function install_android()
     return
   end
 
-  local apk_win = to_windows_path(apk) or apk
-  local install_cmd, install_err = android_install_argv("adb", serial, apk_win)
+  local plan = require("ue.targets").plan("Android", "install", {
+    adb = "adb",
+    apk = apk,
+    cwd = ctx.engine_root,
+    device_id = serial,
+  }, host_driver)
+  local install_cmd, install_err = require("ue.target_tasks").command(plan)
   if not install_cmd then
     require("utils.log").notify_error("ue.android", install_err)
     return
@@ -7916,7 +7854,7 @@ local function install_android()
 
   local progress = require("fidget.progress")
   local install_start_msg = ("Installing APK: %s (built %s) on %s"):format(
-    vim.fn.fnamemodify(apk_win, ":t"), age_str, serial)
+    vim.fn.fnamemodify(plan.metadata.artifact, ":t"), age_str, serial)
   pcall(function()
     require("utils.notification_history").record({
       scope = "ue.install",
@@ -7926,7 +7864,7 @@ local function install_android()
   end)
   local handle = progress.handle.create({
     title = "Installing APK",
-    message = ("built %s — %s"):format(age_str, vim.fn.fnamemodify(apk_win, ":t")),
+    message = ("built %s — %s"):format(age_str, vim.fn.fnamemodify(plan.metadata.artifact, ":t")),
     lsp_client = { name = "adb" },
     percentage = 0,
   })
@@ -7979,7 +7917,7 @@ local function install_android()
             require("utils.notification_history").record({
               scope = "ue.install",
               level = vim.log.levels.INFO,
-              message = ("Installed successfully: %s"):format(vim.fn.fnamemodify(apk_win, ":t")),
+              message = ("Installed successfully: %s"):format(vim.fn.fnamemodify(plan.metadata.artifact, ":t")),
             })
           end)
           handle:finish()
@@ -8045,7 +7983,7 @@ local function install_android()
         local ok_log, log = pcall(require, "utils.log")
         if ok_log and log.error then
           log.error("ue.install", ("adb install failed (exit %d): %s\n--- stderr ---\n%s\n--- stdout ---\n%s\nLog: see :NvimLog"):format(
-            code, vim.fn.fnamemodify(apk_win, ":t"), stderr_blob, stdout_blob
+            code, vim.fn.fnamemodify(plan.metadata.artifact, ":t"), stderr_blob, stdout_blob
           ))
         end
 
@@ -9197,7 +9135,13 @@ M.setup_dap = dap_mod.setup_dap
 -- ==========================================================================
 
 function M._android_install_argv_for_test(adb, serial, apk)
-  return android_install_argv(adb, serial, apk)
+  local plan = require("ue.targets").plan("Android", "install", {
+    adb = adb,
+    apk = apk,
+    cwd = vim.fn.getcwd(),
+    device_id = serial,
+  }, require("utils.platform.windows"))
+  return require("ue.target_tasks").command(plan)
 end
 
 function M._android_so_deploy_command_for_test(ctx, serial, package_name)
@@ -9742,6 +9686,14 @@ function M.setup()
   vim.api.nvim_create_user_command("UECheatsheet", show_cheatsheet, {})
   vim.api.nvim_create_user_command("UECheatsheetEdit", edit_cheatsheet, {})
   vim.api.nvim_create_user_command("UEBuildPCH", function()
+    local host_driver = _uplat.driver()
+    if type(host_driver.pch_build_plan) ~= "function" then
+      vim.notify(
+        "UEBuildPCH is unavailable on " .. tostring(host_driver.id) .. "; the PCH cache pipeline is Windows-only.",
+        vim.log.levels.WARN
+      )
+      return
+    end
     local ctx, err = resolve_context({ detect_project = false })
     if not ctx then
       vim.notify(err, vim.log.levels.WARN)
@@ -9761,11 +9713,15 @@ function M.setup()
       )
       return
     end
-    -- Convert forward → backslash for cmd.exe
-    local bat_win = bat:gsub("/", "\\")
-    vim.notify("UE: rebuilding PCH (background) — " .. bat_win, vim.log.levels.INFO)
-    vim.fn.jobstart({ "cmd.exe", "/c", bat_win }, {
-      cwd = vim.fs.dirname(bat),
+    local plan = host_driver.pch_build_plan(bat)
+    local command, command_err = require("ue.target_tasks").command(plan)
+    if not command then
+      vim.notify("UEBuildPCH: " .. tostring(command_err), vim.log.levels.WARN)
+      return
+    end
+    vim.notify("UE: rebuilding PCH (background) — " .. bat, vim.log.levels.INFO)
+    vim.fn.jobstart(command, {
+      cwd = plan.cwd,
       detach = false,
       on_stdout = function(_, data)
         for _, line in ipairs(data or {}) do
@@ -9802,22 +9758,28 @@ function M.setup()
   -- ─ Phase F.1+F.2+H: platform-neutral UEDAP* aliases via dispatch table ─
   -- F.1 introduced the UEDAP* command names with hard-coded android branch.
   -- F.2 moved the per-platform handler decision into ue.dap.platforms.
-  -- H registers concrete handlers for win64 / mac / linux / ios alongside
-  -- the existing android implementation. New platforms still register here
-  -- — this is the single seam the dispatch flows through.
+  -- Registration is filtered by the host-target compatibility matrix;
+  -- importable foreign modules do not become executable capabilities.
   local dap_platforms = require("ue.dap.platforms")
-  dap_platforms.register_attach("android", function() M.android_dap_attach() end)
-  dap_platforms.register_launch("android", function() M.android_dap_launch() end)
-  for _, id in ipairs({ "win64", "mac", "linux", "ios" }) do
-    local ok, plat_mod = pcall(require, "ue.dap." .. id)
-    if ok and type(plat_mod) == "table" then
-      if type(plat_mod.attach) == "function" then dap_platforms.register_attach(id, plat_mod.attach) end
-      if type(plat_mod.launch) == "function" then dap_platforms.register_launch(id, plat_mod.launch) end
-    end
-  end
+  dap_platforms.register_supported(require("utils.platform").driver(), M)
 
   local function dap_dispatch(kind, platform)
     platform = (platform ~= "" and platform) or (M.current_platform() or "")
+    local host_driver = require("utils.platform").driver()
+    local operation = kind == "attach" and "dap_attach" or "dap_launch"
+    local _, unavailable = require("ue.targets").resolve(platform, operation, host_driver)
+    if unavailable then
+      vim.notify(
+        ("UEDAP%s: target %q is unavailable on host %q (%s)"):format(
+          kind == "attach" and "Attach" or "Launch",
+          platform,
+          tostring(host_driver.id),
+          tostring(unavailable.reason)
+        ),
+        vim.log.levels.WARN
+      )
+      return
+    end
     local handler = (kind == "attach")
       and dap_platforms.attach_handler(platform)
       or  dap_platforms.launch_handler(platform)

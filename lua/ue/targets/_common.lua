@@ -23,12 +23,17 @@ function M.normalize_path(path)
     return ""
   end
   path = path:gsub("\\", "/")
+  local unc = path:sub(1, 2) == "//"
   path = path:gsub("/+", "/")
+  if unc then
+    path = "/" .. path
+  end
   return path
 end
 
 function M.join_path(...)
   local parts = { ... }
+  local first = M.normalize_path(parts[1])
   local out = ""
   for _, part in ipairs(parts) do
     part = M.normalize_path(part):gsub("^/+", ""):gsub("/+$", "")
@@ -36,7 +41,9 @@ function M.join_path(...)
       out = out == "" and part or (out .. "/" .. part)
     end
   end
-  if M.normalize_path(parts[1]):sub(1, 1) == "/" then
+  if first:sub(1, 2) == "//" then
+    out = "//" .. out
+  elseif first:sub(1, 1) == "/" then
     out = "/" .. out
   end
   return out
@@ -196,6 +203,36 @@ function M.resolve_host_entry(host_driver, method_name, context, driver_id, oper
   metadata.host_id = metadata.host_id or host_driver.id
 
   return M.plan(result.executable, result.args or {}, result.cwd or (context and context.cwd), metadata)
+end
+
+function M.resolve_host_shell(host_driver, shell_kind, context, driver_id, operation)
+  if type(host_driver) == "table"
+    and shell_kind == "powershell"
+    and type(host_driver.shell_entry) ~= "function"
+    and type(host_driver.powershell_entry) == "function"
+  then
+    return M.resolve_host_entry(host_driver, "powershell_entry", context, driver_id, operation)
+  end
+  if type(host_driver) ~= "table" or type(host_driver.shell_entry) ~= "function" then
+    return nil,
+      M.unavailable(driver_id, operation, "host shell resolver missing", {
+        host_id = type(host_driver) == "table" and host_driver.id or nil,
+        shell_kind = shell_kind,
+      })
+  end
+  local ok, executable, detail = pcall(host_driver.shell_entry, shell_kind)
+  if not ok or not executable or executable == "" then
+    return nil,
+      M.unavailable(driver_id, operation, "host shell unavailable", {
+        host_id = host_driver.id,
+        shell_kind = shell_kind,
+        detail = ok and detail or executable,
+      })
+  end
+  return M.plan(executable, {}, context and context.cwd or nil, {
+    host_id = host_driver.id,
+    shell_kind = shell_kind,
+  })
 end
 
 function M.classify_candidate(candidate)

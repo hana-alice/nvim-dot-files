@@ -33,6 +33,7 @@
 local M = {}
 
 local uv = vim.uv or vim.loop
+local platform = require("utils.platform")
 
 local L
 local function log()
@@ -48,11 +49,11 @@ local function log()
 end
 
 local function is_windows()
-  return vim.fn.has("win32") == 1 or vim.fn.has("win32unix") == 1
+  return platform.is_windows
 end
 
 local function is_mac()
-  return vim.fn.has("macunix") == 1
+  return platform.is_mac
 end
 
 local function executable(bin)

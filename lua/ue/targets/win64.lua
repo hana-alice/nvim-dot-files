@@ -2,6 +2,26 @@ local C = require("ue.targets._common")
 
 local M = {
   id = "Win64",
+  host_operations = {
+    windows = {
+      build = true,
+      launch = true,
+      log = true,
+      debug_log = true,
+      dap_attach = true,
+      dap_launch = true,
+    },
+  },
+  runtime = {
+    launch = {
+      strategy = "desktop",
+      executable_suffix = ".exe",
+      editor_names = { "UnrealEditor.exe", "UE4Editor.exe" },
+      editor_app_bundles = false,
+    },
+    main_log = { strategy = "desktop-file" },
+    debug_log = { strategy = "desktop-debug" },
+  },
 }
 
 function M.capabilities()

@@ -1,30 +1,13 @@
 local M = {}
 
 local is_windows = require("utils.platform").is_windows
+local windows_driver = require("utils.platform.windows")
 
 local function current_cwd()
   if vim.uv and vim.uv.cwd then
     return vim.uv.cwd()
   end
   return vim.fn.getcwd()
-end
-
-local function terminal_shell()
-  if vim.fn.executable("pwsh") == 1 then
-    return "pwsh"
-  end
-  if vim.fn.executable("powershell") == 1 then
-    return "powershell"
-  end
-  return vim.o.shell ~= "" and vim.o.shell or "cmd.exe"
-end
-
-local function windows_path(path)
-  return tostring(path or ""):gsub("/", "\\")
-end
-
-local function cmd_quote(value)
-  return '"' .. tostring(value or ""):gsub('"', '""') .. '"'
 end
 
 local function get_term_state()
@@ -88,29 +71,10 @@ local function term_cd(dir)
   term_send_line('cd "' .. dir .. '"')
 end
 
-local function open_in_explorer(path, select_file)
-  path = windows_path(path)
-  if path == "" then
-    return
-  end
-
-  local command
-  if select_file then
-    command = 'start "" explorer.exe /select,' .. cmd_quote(path)
-  else
-    command = 'start "" explorer.exe ' .. cmd_quote(path)
-  end
-
-  local job = vim.fn.jobstart({ "cmd.exe", "/c", command }, { detach = true })
-  if job <= 0 then
-    require("utils.log").notify_error("windows", "Failed to launch Explorer for: " .. path)
-  end
-end
-
 local function reveal_current_file()
   local file = vim.api.nvim_buf_get_name(0)
   if file ~= "" and vim.fn.filereadable(file) == 1 then
-    open_in_explorer(file, true)
+    windows_driver.reveal_file(file)
     return
   end
 
@@ -123,7 +87,7 @@ local function reveal_current_file()
     return
   end
 
-  open_in_explorer(dir, false)
+  windows_driver.open_path(dir)
 end
 
 local function setup_options()
@@ -142,8 +106,9 @@ local function setup_options()
   vim.o.foldenable = false
   vim.o.statusline = "%f %m%r %= %{get(g:,'ueindex_status','')} %l:%c"
 
-  if vim.fn.executable("pwsh") == 1 then
-    vim.opt.shell = "pwsh"
+  local powershell = windows_driver.shell_entry("powershell")
+  if powershell then
+    vim.opt.shell = powershell
     vim.opt.shellcmdflag = "-NoLogo -NoProfile -ExecutionPolicy RemoteSigned -Command"
     vim.opt.shellquote = ""
     vim.opt.shellxquote = ""

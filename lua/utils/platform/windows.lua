@@ -12,14 +12,41 @@ local M = {
   exe_suffix = ".exe",
 }
 
+local shell = require("utils.platform.shell")
+
+function M.shell_entry(kind)
+  kind = kind or "default"
+  if kind == "cmd" then
+    return "cmd.exe"
+  end
+  if kind == "powershell" then
+    if vim.fn.executable("pwsh") == 1 then return "pwsh" end
+    if vim.fn.executable("powershell.exe") == 1 or vim.fn.executable("powershell") == 1 then
+      return "powershell.exe"
+    end
+    return "powershell.exe"
+  end
+  if kind == "default" then
+    if vim.fn.executable("pwsh") == 1 then return "pwsh" end
+    return "cmd.exe"
+  end
+  return nil, "unsupported shell on Windows host: " .. tostring(kind)
+end
+
 function M.shell()
-  if vim.fn.executable("pwsh") == 1 then return "pwsh" end
-  if vim.fn.executable("powershell") == 1 then return "powershell" end
-  return vim.o.shell ~= "" and vim.o.shell or "cmd.exe"
+  return M.shell_entry("default")
 end
 
 local function to_windows_path(path)
   return tostring(path or ""):gsub("/", "\\")
+end
+
+local function to_windows_argument(value)
+  value = tostring(value or "")
+  if value:match("^[A-Za-z]:[/\\]") or value:match("^[/\\][/\\]") then
+    return to_windows_path(value)
+  end
+  return value
 end
 
 local function join_engine_path(engine_root, suffix)
@@ -31,11 +58,132 @@ local function join_engine_path(engine_root, suffix)
 end
 
 function M.cmd_quote(value)
-  return '"' .. tostring(value or ""):gsub('"', '""') .. '"'
+  return shell.quote("cmd", value)
 end
 
 function M.host_path(path)
   return to_windows_path(path)
+end
+
+function M.default_target()
+  return "Win64"
+end
+
+function M.launch_process_plan(spec)
+  spec = spec or {}
+  local executable = M.host_path(spec.executable or spec.exe)
+  local working_dir = M.host_path(spec.cwd or "")
+  local quoted_args = {}
+  for _, arg in ipairs(spec.args or {}) do
+    quoted_args[#quoted_args + 1] = shell.quote("powershell", to_windows_argument(arg))
+  end
+
+  local start_process = "Start-Process -FilePath " .. shell.quote("powershell", executable)
+  if working_dir ~= "" then
+    start_process = start_process .. " -WorkingDirectory " .. shell.quote("powershell", working_dir)
+  end
+  start_process = start_process .. " -ArgumentList $argsList -PassThru"
+  local script = table.concat({
+    "$ErrorActionPreference = 'Stop'",
+    "$argsList = @(" .. table.concat(quoted_args, ", ") .. ")",
+    "$proc = " .. start_process,
+    "if (-not $proc -or -not $proc.Id) { throw 'Start-Process did not return a process id' }",
+    "Start-Sleep -Milliseconds 200",
+    "if (-not (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) { throw ('Process exited immediately: ' + $proc.Id) }",
+    "Write-Output ('pid=' + $proc.Id)",
+  }, "; ")
+  local plan = shell.command("powershell", M.shell_entry("powershell"), script, {
+    cwd = working_dir ~= "" and working_dir or nil,
+    no_logo = false,
+    metadata = { launch_mode = "wait", pid_pattern = "pid=(%d+)" },
+  })
+  return plan
+end
+
+function M.follow_file_plan(path)
+  local native = M.host_path(path)
+  local cwd = M.host_path(vim.fs.dirname(tostring(path or "")))
+  return shell.follow_file("powershell", M.shell_entry("powershell"), native, cwd)
+end
+
+function M.debug_log_plan(spec)
+  spec = spec or {}
+  local source_executable = spec.executable or spec.exe
+  local executable = M.host_path(source_executable)
+  local command_needle = M.host_path(spec.command_needle or ""):lower()
+  local cwd = spec.cwd or vim.fs.dirname(tostring(source_executable or ""))
+  local script = ([[$ErrorActionPreference = 'Continue'
+$exePath = %s
+$cmdNeedle = %s
+function Write-Status($text) {
+  if ($script:lastStatus -ne $text) {
+    $script:lastStatus = $text
+    Write-Output ('[' + (Get-Date -Format 'HH:mm:ss') + '] ' + $text)
+  }
+}
+function Get-TargetPids {
+  $query = Get-CimInstance Win32_Process | Where-Object {
+    $_.ExecutablePath -and $_.ExecutablePath.ToLowerInvariant() -eq $exePath.ToLowerInvariant()
+  }
+  if ($cmdNeedle -ne '') {
+    $query = $query | Where-Object {
+      $cmd = '' + $_.CommandLine
+      $cmd -and $cmd.ToLowerInvariant().Contains($cmdNeedle)
+    }
+  }
+  @($query | Sort-Object CreationDate | Select-Object -ExpandProperty ProcessId)
+}
+$script:lastStatus = ''
+$bufferReady = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'DBWIN_BUFFER_READY')
+$dataReady = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'DBWIN_DATA_READY')
+$mmf = [System.IO.MemoryMappedFiles.MemoryMappedFile]::CreateOrOpen('DBWIN_BUFFER', 4096)
+$view = $mmf.CreateViewStream()
+$reader = New-Object System.IO.BinaryReader($view, [System.Text.Encoding]::Default)
+$encoding = [System.Text.Encoding]::Default
+$targetPids = @()
+$nextRefresh = Get-Date
+Write-Output ('Listening for OutputDebugString: ' + $exePath)
+while ($true) {
+  if ((Get-Date) -ge $nextRefresh) {
+    $targetPids = @(Get-TargetPids)
+    if ($targetPids.Count -eq 0) {
+      Write-Status 'waiting for target process...'
+    } else {
+      Write-Status ('attached to pid(s): ' + ($targetPids -join ', '))
+    }
+    $nextRefresh = (Get-Date).AddSeconds(2)
+  }
+  $null = $bufferReady.Set()
+  if (-not $dataReady.WaitOne(200)) {
+    continue
+  }
+  if ($targetPids.Count -eq 0) {
+    continue
+  }
+  $null = $view.Seek(0, [System.IO.SeekOrigin]::Begin)
+  $pid = $reader.ReadInt32()
+  $bytes = $reader.ReadBytes(4092)
+  if ($targetPids -notcontains $pid) {
+    continue
+  }
+  $nul = [Array]::IndexOf($bytes, [byte]0)
+  if ($nul -lt 0) {
+    $nul = $bytes.Length
+  }
+  $text = $encoding.GetString($bytes, 0, $nul).TrimEnd("`r", "`n")
+  if ([string]::IsNullOrWhiteSpace($text)) {
+    continue
+  }
+  Write-Output ('[' + (Get-Date -Format 'HH:mm:ss.fff') + '] [' + $pid + '] ' + $text)
+}]]):format(
+    shell.quote("powershell", executable),
+    shell.quote("powershell", command_needle)
+  )
+  return shell.command("powershell", M.shell_entry("powershell"), script, {
+    cwd = M.host_path(cwd),
+    no_logo = false,
+    metadata = { stream = "debug-output" },
+  })
 end
 
 local function start_with_explorer(path, select_file)
@@ -43,7 +191,10 @@ local function start_with_explorer(path, select_file)
   if path == "" then return end
   local arg = select_file and ("/select," .. M.cmd_quote(path)) or M.cmd_quote(path)
   local cmd = 'start "" explorer.exe ' .. arg
-  local job = vim.fn.jobstart({ "cmd.exe", "/c", cmd }, { detach = true })
+  local plan = shell.command("cmd", M.shell_entry("cmd"), cmd)
+  local command = { plan.executable }
+  vim.list_extend(command, plan.args)
+  local job = vim.fn.jobstart(command, { detach = true })
   if job <= 0 then
     local ok, log = pcall(require, "utils.log")
     if ok then log.notify_error("platform.windows", "explorer.exe failed: " .. path) end
@@ -65,6 +216,10 @@ function M.default_clangd_candidates()
     "clangd.exe",
     "clangd",
   }
+end
+
+function M.python_candidates()
+  return { "python" }
 end
 
 function M.default_lldb_dap_paths()
@@ -130,26 +285,30 @@ end
 
 function M.ue_build_entry(engine_root)
   local build_bat = join_engine_path(engine_root, "Engine\\Build\\BatchFiles\\Build.bat")
-  return {
-    executable = "cmd.exe",
-    args = { "/d", "/c", "call " .. M.cmd_quote(build_bat) },
+  return shell.command("cmd", M.shell_entry("cmd"), "call " .. M.cmd_quote(build_bat), {
     cwd = to_windows_path(engine_root),
     metadata = { script = build_bat },
-  }, nil
+  }), nil
 end
 
 function M.ue_uat_entry(engine_root)
   local run_uat = join_engine_path(engine_root, "Engine\\Build\\BatchFiles\\RunUAT.bat")
-  return {
-    executable = "cmd.exe",
-    args = { "/d", "/c", "call " .. M.cmd_quote(run_uat) },
+  return shell.command("cmd", M.shell_entry("cmd"), "call " .. M.cmd_quote(run_uat), {
     cwd = to_windows_path(engine_root),
     metadata = { script = run_uat },
-  }, nil
+  }), nil
+end
+
+function M.pch_build_plan(path)
+  local native = M.host_path(path)
+  return shell.command("cmd", M.shell_entry("cmd"), "call " .. M.cmd_quote(native), {
+    cwd = M.host_path(vim.fs.dirname(tostring(path or ""))),
+    metadata = { script = native, operation = "pch-build" },
+  })
 end
 
 function M.powershell_entry()
-  return "powershell.exe", nil
+  return M.shell_entry("powershell")
 end
 
 return M

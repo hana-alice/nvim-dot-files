@@ -184,6 +184,33 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - 无。
 
+### 2026-08-11 — Make host, target, and shell compatibility explicit
+
+**Task**
+
+- Audit and correct platform adaptation across iOS/Android/Win64/Mac/Linux targets, macOS/Windows/Linux hosts, and PowerShell/cmd/POSIX shells.
+
+**Implemented**
+
+- Added a central host-target-operation matrix and filtered target selection, lifecycle planning, runtime launch/log routing, and DAP registration through it.
+- Added target-owned runtime strategies so generic launch/log modules no longer dispatch on hard-coded target names; kept IOS, Mac, and Android implementations independent.
+- Added a host-neutral shell argv/quoting layer; moved PowerShell launch/log/debug-output behavior into Windows or Android-Windows adapters and removed PowerShell/cmd assumptions from macOS paths.
+- Made CDB phases sequential argv jobs, skipped the Windows-only PCH generator on non-Windows hosts, preserved UNC/POSIX URIs, and delegated PCH execution to the Windows host driver.
+
+**Pitfalls / Gotchas**
+
+- An importable target module is not evidence that its operation can execute on the current host. iOS DAP remains explicitly unavailable and never falls back to Mac attach.
+- Windows argv conversion must distinguish host filesystem paths from Unreal object paths such as `/Game/Maps/Main`.
+
+**Validation**
+
+- Focused: `platform`, `ue_target_drivers`, `ue_target_integration`, `ue_cdb`, `dap`, `android_device`, `task_registry`, and `commands` passed.
+- Full: `nvim --headless -l tests/run.lua` — 824/824 passed.
+
+**Follow-ups**
+
+- On-device iOS build/install/launch and native Windows/Android execution remain environment-dependent verification lanes.
+
 ### 2026-08-11 — 同步并归档已完成的任务管理与 Android F9 规格
 
 **Task**

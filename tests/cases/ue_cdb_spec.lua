@@ -147,13 +147,13 @@ t.describe("ue.cdb.pipeline lifecycle", function()
 
   t.it("运行中拒绝第二个 writer，完成后释放", function()
     local path = temp_cdb()
-    local captured
+    local captured = {}
     local starts = 0
     local second_result
     pipeline.set_runtime({
       jobstart = function(_, _, opts)
         starts = starts + 1
-        captured = opts
+        captured[#captured + 1] = opts
         return 23
       end,
       notify = function() end,
@@ -168,8 +168,51 @@ t.describe("ue.cdb.pipeline lifecycle", function()
     t.assert_eq(second_jobid, nil, "被拒调用不得返回伪 jobid")
     t.assert_contains(tostring(second_err), "already running")
 
-    captured.on_exit(23, 0, "exit")
+    local index = 1
+    while pipeline.is_running() do
+      local callback = captured[index]
+      t.assert_true(callback ~= nil, "each pipeline step must expose an exit callback")
+      callback.on_exit(23, 0, "exit")
+      index = index + 1
+    end
     t.assert_false(pipeline.is_running(), "成功完成后应释放 writer 锁")
+    pcall(os.remove, path)
+  end)
+
+
+  t.it("每个 CDB phase 使用 argv 顺序执行，不拼接 host shell 字符串", function()
+    local path = temp_cdb()
+    local commands = {}
+    local callbacks = {}
+    pipeline.set_runtime({
+      jobstart = function(command, _, opts)
+        commands[#commands + 1] = command
+        callbacks[#callbacks + 1] = opts
+        return 31
+      end,
+      notify = function() end,
+      log_error = function() end,
+    })
+
+    pipeline.run(path, { path }, function() end)
+    local index = 1
+    while pipeline.is_running() do
+      local callback = callbacks[index]
+      t.assert_true(callback ~= nil)
+      callback.on_exit(31, 0, "exit")
+      index = index + 1
+    end
+
+    t.assert_true(#commands > 0)
+    for _, command in ipairs(commands) do
+      t.assert_type(command, "table")
+      t.assert_false(table.concat(command, " "):find(" && ", 1, true) ~= nil)
+    end
+    if require("utils.platform").is_mac then
+      for _, command in ipairs(commands) do
+        t.assert_false(table.concat(command, " "):find("prebuild_pch_v2.py", 1, true) ~= nil)
+      end
+    end
     pcall(os.remove, path)
   end)
 

@@ -509,11 +509,26 @@ local function target_plan_check()
   if table.concat(ids, ",") ~= table.concat(expected, ",") then
     return result("FAIL", "target registry does not expose the expected platform identities", { ids = ids })
   end
-  local host = {
-    id = "fixture-host",
-    ue_build_entry = function()
-      return "/fixture/Build.sh"
-    end,
+  local hosts = {
+    windows = {
+      id = "windows",
+      ue_build_entry = function() return "/fixture/windows/Build.bat" end,
+    },
+    macos = {
+      id = "macos",
+      ue_build_entry = function() return "/fixture/macos/Build.sh" end,
+    },
+    linux = {
+      id = "linux",
+      ue_build_entry = function() return "/fixture/linux/Build.sh" end,
+    },
+  }
+  local host_for_target = {
+    Android = hosts.windows,
+    IOS = hosts.macos,
+    Linux = hosts.linux,
+    Mac = hosts.macos,
+    Win64 = hosts.windows,
   }
   local platforms = {}
   for _, id in ipairs(ids) do
@@ -523,9 +538,11 @@ local function target_plan_check()
       target = "Game",
       configuration = "Development",
       cwd = "/fixture",
-    }, host)
+    }, host_for_target[id])
     local args = type(plan) == "table" and plan.args or {}
-    local valid = plan and plan.executable == "/fixture/Build.sh" and args[2] == id
+    local valid = plan
+      and plan.executable == host_for_target[id].ue_build_entry()
+      and args[2] == id
     if not valid then
       return result("FAIL", id .. " target did not produce an isolated structured build plan", {
         platform = id,
@@ -534,9 +551,15 @@ local function target_plan_check()
     end
     platforms[#platforms + 1] = args[2]
   end
-  return result("PASS", "all platform drivers produced distinct structured build plans", {
+  local _, mac_android = targets.resolve("Android", "build", hosts.macos)
+  local _, windows_ios = targets.resolve("IOS", "build", hosts.windows)
+  if mac_android.status ~= "unavailable" or windows_ios.status ~= "unavailable" then
+    return result("FAIL", "target matrix did not reject incompatible fixture hosts")
+  end
+  return result("PASS", "all compatible host-target pairs produced isolated plans; foreign pairs were rejected", {
     platforms = platforms,
     ios_mac_distinct = platforms[2] == "IOS" and platforms[4] == "Mac",
+    incompatible_pairs_rejected = true,
   })
 end
 

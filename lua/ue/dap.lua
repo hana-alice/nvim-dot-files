@@ -1433,12 +1433,15 @@ function D.setup_dap(dap, dapui)
     require("ue.dap._common").ensure_adapter(dap, lldb_dap)
   end
 
-  -- Register a generic cpp configuration so a plain `:DapContinue` / `<F5>`
-  -- from any C/C++ buffer drops the user into the UE Android attach picker.
+  -- Register the Android convenience entry only on a host that explicitly
+  -- supports Android DAP. A macOS host must not inherit the Windows Android
+  -- transport merely because the target module is importable.
   -- The attach driver builds the real lldb-dap config inside
   -- ue.dap.android.attach (which mutates dap.adapters.lldb if needed); this
   -- entry is just the launcher.
-  do
+  if require("ue.targets").supports(
+    "Android", "dap_attach", require("utils.platform").driver()
+  ) then
     -- Idempotent registration: only inject our entry if not already
     -- present. Users can append their own configurations.cpp items;
     -- we never overwrite the table.

@@ -2,6 +2,20 @@ local C = require("ue.targets._common")
 
 local M = {
   id = "IOS",
+  host_operations = {
+    macos = {
+      build = true,
+      package = true,
+      device = true,
+      install = true,
+      launch = true,
+    },
+  },
+  runtime = {
+    launch = { strategy = "managed-device" },
+    main_log = { strategy = "unavailable" },
+    debug_log = { strategy = "unavailable" },
+  },
 }
 
 local function normalize_bundle_id(value)

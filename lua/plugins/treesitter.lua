@@ -7,7 +7,7 @@
 -- means clang/gcc/cl must be on PATH. LLVM ships with UE workflows but
 -- isn't on user PATH by default. Inject it here so :TSInstall works.
 local llvm_bin = "C:\\Program Files\\LLVM\\bin"
-if vim.fn.has("win32") == 1 and vim.fn.isdirectory(llvm_bin) == 1 then
+if require("utils.platform").is_windows and vim.fn.isdirectory(llvm_bin) == 1 then
   if not (vim.env.PATH or ""):find(llvm_bin, 1, true) then
     vim.env.PATH = llvm_bin .. ";" .. (vim.env.PATH or "")
   end

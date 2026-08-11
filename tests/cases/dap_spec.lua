@@ -735,6 +735,7 @@ t.describe("ue.dap._persist_bp: F9 持久化往返（K10）", function()
     -- mock dap.breakpoints：当前只有一个已开 buffer 的断点
     local buf = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_buf_set_name(buf, "D:/proj/Source/Opened.cpp")
+    local opened_key = bp._norm_for_test(vim.api.nvim_buf_get_name(buf))
     local old = package.loaded["dap.breakpoints"]
     package.loaded["dap.breakpoints"] = {
       get = function() return { [buf] = { { line = 10 } } } end,
@@ -749,7 +750,7 @@ t.describe("ue.dap._persist_bp: F9 持久化往返（K10）", function()
     pcall(vim.api.nvim_buf_delete, buf, { force = true })
 
     t.assert_true(back ~= nil, "save 后应能读回")
-    t.assert_true(back.breakpoints["D:/proj/Source/Opened.cpp"] ~= nil,
+    t.assert_true(back.breakpoints[opened_key] ~= nil,
       "已开文件的断点应被写入")
     t.assert_true(back.breakpoints["D:/proj/Source/Unopened.cpp"] ~= nil,
       "未开文件的 pending 断点必须保留（K10 灾难场景守护）")

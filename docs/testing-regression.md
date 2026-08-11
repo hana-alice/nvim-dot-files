@@ -22,6 +22,7 @@
 | `lua/ue/cdb/**` | `ue_cdb` |
 | `lua/ue/dap/**` / `lua/utils/platform/**` | `dap` `platform` |
 | `lua/ue/index/**` / `lua/ue/clangd_commands.lua` / controlled CDB generators | `index_generation` `cpp_semantic_index` `clangd_commands` `ue_api` |
+| `lua/ue/targets/**` / `lua/ue/target_tasks.lua` | `ue_target_drivers` `ue_target_integration` `ue_target_tasks` `platform` `commands` |
 | `lua/utils/ue_goto/**` / C++ `gd` | `cpp_semantic_context` `cpp_semantic_client` `cpp_semantic_sidecar` `ue_goto_behavior` `utils` |
 | `code_search/**` / `ue_paths.lua` | `ue_goto_behavior` `ue_paths` `utils` |
 | `lua/config/options.lua` / `autocmds.lua` | `options` `autocmds` |
@@ -92,6 +93,9 @@ tests/
     ├── android_device_spec.lua   # Android device picker + 进程内 serial + adb -s 路由
     ├── multi_instance_state_spec.lua # 项目/target 隔离 + 跨进程原子/merge/lease
     ├── platform_spec.lua         # utils.platform 四驱动接口契约
+    ├── ue_target_drivers_spec.lua # host/target 隔离 + IOS plan/parser/provenance
+    ├── ue_target_integration_spec.lua # ue.lua registry dispatch + target 隔离
+    ├── ue_target_tasks_spec.lua  # 结构化 argv 的异步执行边界
     ├── ue_api_spec.lua           # ue 公共表/函数冻结
     ├── ue_config_spec.lua        # ue.config schema 默认值/override/reset
     ├── ue_cdb_spec.lua           # ue.cdb.json/paths/shaders 契约

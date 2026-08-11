@@ -33,6 +33,7 @@ pwsh -File scripts/run_regression.ps1       # 本机一键（转发 + 退出码�
 | `lua/ue/cdb/**` | `ue_cdb` |
 | `lua/ue/dap/**` / `lua/utils/platform/**` | `dap` `platform` |
 | `lua/ue/index/**` / `lua/ue/clangd_commands.lua` / controlled CDB generators | `index_generation` `cpp_semantic_index` `clangd_commands` `ue_api` |
+| `lua/ue/targets/**` / `lua/ue/target_tasks.lua` | `ue_target_drivers` `ue_target_integration` `ue_target_tasks` `platform` `commands` |
 | `lua/utils/ue_goto/**` / C++ `gd` | `cpp_semantic_context` `cpp_semantic_client` `cpp_semantic_sidecar` `ue_goto_behavior` `utils` |
 | `code_search/**` / `ue_paths.lua` | `ue_goto_behavior` `ue_paths` `utils` |
 | `lua/config/options.lua` / `autocmds.lua` | `options` `autocmds` |

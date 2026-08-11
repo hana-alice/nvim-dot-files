@@ -5,16 +5,21 @@
 ## 用途
 
 平台驱动注册表：`init`（id / is_windows|mac|linux / driver() / 兼容标志）+ 四个具体驱动
-`windows` `macos` `linux` `stub`，统一接口。**这是全仓唯一允许做 OS 分支的地方。**
+`windows` `macos` `linux` `stub`。共享基础接口统一，宿主专属工具作为可选 capability。
+**这是全仓唯一允许做 OS 分支的地方。**
 
 ## 专属约定 / 接口契约
 
-- **四驱动同形状**：每个驱动 `id` 与模块名一致，且实现 `shell` / `open_path` / `reveal_file` /
+- **共享基础同形状**：每个驱动 `id` 与模块名一致，且实现 `shell` / `open_path` / `reveal_file` /
   `cmd_quote` / `default_clangd_candidates` / `default_lldb_dap_paths` / `default_lldb_server_paths`
   （有契约回归 `tests/cases/platform_spec.lua`）。
+- **专属 capability 不伪装**：`xcrun/security/plutil` 只由 macOS 驱动暴露，PowerShell 只由
+  Windows 驱动暴露；其他驱动不得添加返回 `unavailable` 的同名假方法。调用方通过 capability
+  resolver 得到结构化 unavailable。
 - **其余代码不做 OS 分支**：读 `platform.is_*` 或调 `platform.driver()`，新增 OS 差异**只在此扩**。
 - 向后兼容标志 `is_windows/is_mac/is_linux` 为 boolean，`id` 为非空 string——勿改类型。
-- 新增驱动方法 → 四个驱动同步实现（含 `stub`），否则破契约回归。
+- 新增共享基础方法 → 四个驱动同步实现（含 `stub`）；新增宿主专属工具 → 只在拥有该工具的
+  驱动实现，并补 ownership/缺失 capability 回归。
 
 ## 改动 → 必跑回归
 

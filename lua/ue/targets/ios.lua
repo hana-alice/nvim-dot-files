@@ -1,0 +1,606 @@
+local C = require("ue.targets._common")
+
+local M = {
+  id = "IOS",
+}
+
+local function normalize_bundle_id(value)
+  local bundle_id = C.trim(value)
+  if bundle_id == "" then
+    return nil, "bundle identifier is required"
+  end
+  if bundle_id:find("..", 1, true) then
+    return nil, "bundle identifier cannot contain empty segments"
+  end
+  if bundle_id:sub(1, 1) == "." or bundle_id:sub(-1) == "." then
+    return nil, "bundle identifier cannot start or end with a dot"
+  end
+  if not bundle_id:match("^[A-Za-z0-9%.%-]+$") then
+    return nil, "bundle identifier contains unsupported characters"
+  end
+  for segment in bundle_id:gmatch("[^%.]+") do
+    if not segment:match("^[A-Za-z0-9][A-Za-z0-9%-]*$") then
+      return nil, "bundle identifier contains an invalid segment"
+    end
+  end
+  return bundle_id
+end
+
+local function artifact_tuple(context)
+  return {
+    project = C.trim(context and (context.project or context.uproject)),
+    target = C.context_target(context),
+    platform = M.id,
+    configuration = C.context_configuration(context),
+  }
+end
+
+local function make_provenance(path, context, metadata)
+  return {
+    path = C.normalize_path(path),
+    tuple = artifact_tuple(context),
+    metadata = C.deepcopy(metadata or {}),
+  }
+end
+
+local function select_candidate_app(candidates, context)
+  local expected = artifact_tuple(context)
+  local matches = {}
+  local ipa_only = false
+
+  for _, candidate in ipairs(candidates or {}) do
+    local path = C.normalize_path(candidate.path or candidate.app_path or candidate.ipa_path)
+    local tuple = candidate.tuple or {}
+    local platform = C.trim(tuple.platform or candidate.platform)
+    local target = C.trim(tuple.target or candidate.target)
+    local configuration = C.trim(tuple.configuration or candidate.configuration)
+
+    if path:sub(-4) == ".ipa" then
+      ipa_only = true
+    end
+
+    if
+      path:sub(-4) == ".app"
+      and platform == expected.platform
+      and (expected.target == "" or target == expected.target)
+      and (expected.configuration == "" or configuration == expected.configuration)
+    then
+      matches[#matches + 1] = {
+        path = path,
+        tuple = {
+          platform = platform,
+          target = target,
+          configuration = configuration,
+        },
+        metadata = C.deepcopy(candidate.metadata or {}),
+      }
+    end
+  end
+
+  if #matches == 1 then
+    local selected = matches[1]
+    return {
+      ok = true,
+      app_path = selected.path,
+      provenance = make_provenance(selected.path, context, selected.metadata),
+    }
+  end
+
+  if #matches > 1 then
+    return C.unavailable(M.id, "install", "multiple staged apps match current tuple", {
+      candidate_count = #matches,
+    })
+  end
+
+  if ipa_only then
+    return C.unavailable(M.id, "install", "staged .app missing for current tuple", {
+      suggestion = "re-run stage/package to produce a staged .app",
+    })
+  end
+
+  return C.unavailable(M.id, "install", "no staged app matches current tuple")
+end
+
+function M.capabilities()
+  return C.default_capabilities(M.id, {
+    build = true,
+    package = true,
+    device = true,
+    install = true,
+    launch = true,
+  })
+end
+
+function M.build_plan(context, host_driver)
+  local entry, unavailable = C.resolve_host_entry(host_driver, "ue_build_entry", context, M.id, "build")
+  if not entry then
+    return unavailable
+  end
+
+  local target_name = C.context_target(context)
+  local configuration = C.context_configuration(context)
+  return C.with_appended_args(entry, {
+    target_name,
+    M.id,
+    configuration,
+    "-Project=" .. C.trim(context.uproject),
+  }, {
+    target = target_name,
+    platform = M.id,
+    configuration = configuration,
+  })
+end
+
+function M.package_plan(context, host_driver)
+  local entry, unavailable = C.resolve_host_entry(host_driver, "ue_uat_entry", context, M.id, "package")
+  if not entry then
+    return unavailable
+  end
+
+  local archive_dir = C.trim(context.archive_dir)
+  if archive_dir == "" then
+    return C.unavailable(M.id, "package", "archive_dir is required for iOS packaging", {
+      required = { "archive_dir" },
+    })
+  end
+
+  local target_name = C.context_target(context)
+  local configuration = C.context_configuration(context)
+  return C.with_appended_args(entry, {
+    "-ScriptsForProject=" .. C.trim(context.uproject),
+    "BuildCookRun",
+    "-nop4",
+    "-project=" .. C.trim(context.uproject),
+    "-target=" .. target_name,
+    "-targetplatform=" .. M.id,
+    "-clientconfig=" .. configuration,
+    "-build",
+    "-cook",
+    "-stage",
+    "-package",
+    "-archive",
+    "-archivedirectory=" .. archive_dir,
+    "-utf8output",
+  }, {
+    target = target_name,
+    platform = M.id,
+    configuration = configuration,
+    archive_dir = archive_dir,
+    stages = { "build", "cook", "stage", "package", "archive" },
+  })
+end
+
+function M.device_list_plan(context, host_driver)
+  local entry, unavailable = C.resolve_host_entry(host_driver, "xcrun_entry", context, M.id, "device")
+  if not entry then
+    return unavailable
+  end
+
+  local output = C.trim((context or {}).json_output or (context or {}).output_path)
+  if output == "" then
+    return C.unavailable(M.id, "device", "json_output is required for devicectl list", {
+      required = { "json_output" },
+    })
+  end
+
+  return C.with_appended_args(entry, {
+    "devicectl",
+    "list",
+    "devices",
+    "--json-output",
+    output,
+  }, {
+    json_output = output,
+    parser = "parse_device_list",
+  })
+end
+
+function M.bundle_id_plan(app_path, host_driver, context)
+  local plist_entry, unavailable = C.resolve_host_entry(host_driver, "plutil_entry", context or {}, M.id, "launch")
+  if not plist_entry then
+    return unavailable
+  end
+
+  local plist_path = C.normalize_path(app_path) .. "/Info.plist"
+  return C.with_appended_args(plist_entry, {
+    "-extract",
+    "CFBundleIdentifier",
+    "raw",
+    "-o",
+    "-",
+    plist_path,
+  }, {
+    app_path = C.normalize_path(app_path),
+    plist_path = plist_path,
+    parser = "validate_bundle_id",
+  })
+end
+
+function M.install_plan(context, host_driver)
+  local selected = M.select_staged_artifact(context and context.artifacts or {}, context)
+  if not selected.ok then
+    return selected
+  end
+
+  local device_id = C.trim(context and context.device_id)
+  if device_id == "" then
+    return C.unavailable(M.id, "install", "device_id is required for install", {
+      required = { "device_id" },
+    })
+  end
+
+  local entry, unavailable = C.resolve_host_entry(host_driver, "xcrun_entry", context, M.id, "install")
+  if not entry then
+    return unavailable
+  end
+
+  local output = C.trim(context and context.json_output)
+  if output == "" then
+    return C.unavailable(M.id, "install", "json_output is required for devicectl install", {
+      required = { "json_output" },
+    })
+  end
+
+  return C.with_appended_args(entry, {
+    "devicectl",
+    "device",
+    "install",
+    "app",
+    "--device",
+    device_id,
+    selected.app_path,
+    "--json-output",
+    output,
+  }, {
+    device_id = device_id,
+    app_path = selected.app_path,
+    provenance = selected.provenance,
+    parser = "parse_install_result",
+    json_output = output,
+  })
+end
+
+function M.launch_plan(context, host_driver)
+  local device_id = C.trim(context and context.device_id)
+  if device_id == "" then
+    return C.unavailable(M.id, "launch", "device_id is required for launch", {
+      required = { "device_id" },
+    })
+  end
+
+  local bundle_id, err = normalize_bundle_id(context and context.bundle_id)
+  if not bundle_id then
+    return C.unavailable(M.id, "launch", err, {
+      required = { "bundle_id" },
+    })
+  end
+
+  local entry, unavailable = C.resolve_host_entry(host_driver, "xcrun_entry", context, M.id, "launch")
+  if not entry then
+    return unavailable
+  end
+
+  local output = C.trim(context and context.json_output)
+  if output == "" then
+    return C.unavailable(M.id, "launch", "json_output is required for devicectl launch", {
+      required = { "json_output" },
+    })
+  end
+
+  return C.with_appended_args(entry, {
+    "devicectl",
+    "device",
+    "process",
+    "launch",
+    "--device",
+    device_id,
+    bundle_id,
+    "--json-output",
+    output,
+  }, {
+    device_id = device_id,
+    bundle_id = bundle_id,
+    parser = "parse_launch_result",
+    json_output = output,
+  })
+end
+
+function M.classify_rsp(candidate, context)
+  return C.classify_for_platform(M.id, M.id, candidate, context)
+end
+
+function M.validate_bundle_id(value)
+  local bundle_id, err = normalize_bundle_id(value)
+  if not bundle_id then
+    return C.unavailable(M.id, "launch", err, {
+      input = value,
+    })
+  end
+  return {
+    ok = true,
+    bundle_id = bundle_id,
+  }
+end
+
+function M.select_staged_artifact(candidates, context)
+  return select_candidate_app(candidates, context or {})
+end
+
+function M.artifact_candidates(context)
+  context = context or {}
+  local project_dir = C.normalize_path(context.project_dir)
+  local archive_dir = C.normalize_path(context.archive_dir)
+  local target_name = C.context_target(context)
+  local configuration = C.context_configuration(context)
+  if project_dir == "" or target_name == "" then
+    return C.unavailable(M.id, "artifact", "project_dir and target are required", {
+      required = { "project_dir", "target" },
+    })
+  end
+
+  local tuple = {
+    platform = M.id,
+    target = target_name,
+    configuration = configuration,
+  }
+  local candidates = {
+    {
+      path = C.join_path(project_dir, "Binaries", M.id, "Payload", target_name .. ".app"),
+      tuple = tuple,
+      metadata = { kind = "staged-app", source = "uat-package-payload" },
+    },
+    {
+      path = C.join_path(project_dir, "Binaries", M.id, target_name .. ".ipa"),
+      tuple = tuple,
+      metadata = { kind = "ipa", source = "project-binaries" },
+    },
+    {
+      path = C.join_path(project_dir, "Binaries", M.id, target_name .. ".dSYM"),
+      tuple = tuple,
+      metadata = { kind = "dsym", source = "project-binaries" },
+    },
+  }
+  if archive_dir ~= "" then
+    candidates[#candidates + 1] = {
+      path = C.join_path(archive_dir, target_name .. ".ipa"),
+      tuple = tuple,
+      metadata = { kind = "ipa", source = "archive" },
+    }
+  end
+  return { ok = true, candidates = candidates }
+end
+
+function M.parse_device_list(payload)
+  local decoded = payload
+  if type(payload) == "string" then
+    local ok, parsed = pcall(vim.json.decode, payload)
+    if not ok then
+      return C.unavailable(M.id, "device", "failed to parse devicectl device list json", {
+        detail = parsed,
+      })
+    end
+    decoded = parsed
+  end
+
+  local devices = decoded and (decoded.devices or decoded.result and decoded.result.devices)
+  if type(devices) ~= "table" then
+    return C.unavailable(M.id, "device", "devicectl device list schema missing devices")
+  end
+
+  local available = {}
+  for _, item in ipairs(devices) do
+    local hardware = item.hardwareProperties or {}
+    local connection = item.connectionProperties or {}
+    local properties = item.deviceProperties or {}
+    local platform = C.trim(item.platform or item.operatingSystem or item.runtimePlatform or hardware.platform or "")
+    local tunnel = C.trim(connection.tunnelState):lower()
+    local available_now = item.available == true
+      or C.trim(item.availability):lower() == "available"
+      or (connection.pairingState == "paired" and tunnel == "connected")
+    local physical = item.physical == true
+      or hardware.reality == "physical"
+      or hardware.deviceType == "iPhone"
+      or hardware.deviceType == "iPad"
+    if available_now and physical and platform:match("^iOS") then
+      available[#available + 1] = {
+        id = item.identifier or item.udid,
+        name = item.name or item.displayName or properties.name or hardware.marketingName,
+        platform = platform,
+        os_version = properties.osVersionNumber,
+      }
+    end
+  end
+
+  return {
+    ok = true,
+    devices = available,
+  }
+end
+
+function M.parse_install_result(payload, expected)
+  local decoded = payload
+  if type(payload) == "string" then
+    local ok, parsed = pcall(vim.json.decode, payload)
+    if not ok then
+      return C.unavailable(M.id, "install", "failed to parse devicectl install json", {
+        detail = parsed,
+      })
+    end
+    decoded = parsed
+  end
+
+  local result = decoded and (decoded.result or decoded)
+  local installed = result
+      and (result.installedApplication or result.application or type(result.installedApplications) == "table" and result.installedApplications[1])
+    or nil
+  local device_id = C.trim(result and (result.deviceIdentifier or result.device or result.targetDeviceIdentifier))
+  local bundle_id = C.trim(
+    result
+      and (
+        result.bundleIdentifier
+        or result.bundleID
+        or result.installedBundleIdentifier
+        or installed and (installed.bundleIdentifier or installed.bundleID or installed.applicationIdentifier)
+      )
+  )
+
+  if device_id == "" or bundle_id == "" then
+    return C.unavailable(M.id, "install", "devicectl install result missing identity")
+  end
+  if expected and expected.device_id and device_id ~= expected.device_id then
+    return C.unavailable(M.id, "install", "devicectl install result device mismatch", {
+      expected_device_id = expected.device_id,
+      actual_device_id = device_id,
+    })
+  end
+  if expected and expected.bundle_id and bundle_id ~= expected.bundle_id then
+    return C.unavailable(M.id, "install", "devicectl install result bundle mismatch", {
+      expected_bundle_id = expected.bundle_id,
+      actual_bundle_id = bundle_id,
+    })
+  end
+
+  return {
+    ok = true,
+    device_id = device_id,
+    bundle_id = bundle_id,
+  }
+end
+
+function M.parse_launch_result(payload, expected)
+  local decoded = payload
+  if type(payload) == "string" then
+    local ok, parsed = pcall(vim.json.decode, payload)
+    if not ok then
+      return C.unavailable(M.id, "launch", "failed to parse devicectl launch json", {
+        detail = parsed,
+      })
+    end
+    decoded = parsed
+  end
+
+  local result = decoded and (decoded.result or decoded)
+  local process = result and (result.process or result.launchedProcess or result.applicationProcess) or nil
+  local device_id = C.trim(result and (result.deviceIdentifier or result.device or result.targetDeviceIdentifier))
+  local bundle_id = C.trim(
+    result
+      and (
+        result.bundleIdentifier
+        or result.bundleID
+        or process and (process.bundleIdentifier or process.bundleID or process.applicationIdentifier)
+      )
+  )
+  local process_id = result
+    and (result.processIdentifier or result.pid or process and (process.processIdentifier or process.pid))
+
+  if device_id == "" or bundle_id == "" or process_id == nil then
+    return C.unavailable(M.id, "launch", "devicectl launch result missing process identity")
+  end
+  if expected and expected.device_id and device_id ~= expected.device_id then
+    return C.unavailable(M.id, "launch", "devicectl launch result device mismatch", {
+      expected_device_id = expected.device_id,
+      actual_device_id = device_id,
+    })
+  end
+  if expected and expected.bundle_id and bundle_id ~= expected.bundle_id then
+    return C.unavailable(M.id, "launch", "devicectl launch result bundle mismatch", {
+      expected_bundle_id = expected.bundle_id,
+      actual_bundle_id = bundle_id,
+    })
+  end
+
+  return {
+    ok = true,
+    device_id = device_id,
+    bundle_id = bundle_id,
+    process_id = process_id,
+  }
+end
+
+function M.preflight_descriptors()
+  return {
+    {
+      stage = "build",
+      requires = {
+        { host_capability = "ue_build_entry", reason = "native UBT entry" },
+        { host_capability = "xcrun_entry", reason = "Xcode / SDK discovery" },
+      },
+    },
+    {
+      stage = "package",
+      requires = {
+        { host_capability = "ue_uat_entry", reason = "BuildCookRun entry" },
+        { host_capability = "xcrun_entry", reason = "Xcode / SDK discovery" },
+        { host_capability = "security_entry", reason = "code-sign identity probe" },
+      },
+    },
+    {
+      stage = "install",
+      requires = {
+        { host_capability = "xcrun_entry", reason = "devicectl install" },
+        { host_capability = "plutil_entry", reason = "Info.plist bundle id probe" },
+        { host_capability = "security_entry", reason = "signed artifact preflight" },
+      },
+    },
+    {
+      stage = "launch",
+      requires = {
+        { host_capability = "xcrun_entry", reason = "devicectl launch" },
+        { host_capability = "plutil_entry", reason = "Info.plist bundle id probe" },
+      },
+    },
+  }
+end
+
+function M.preflight_plans(stage, context, host_driver)
+  local plans = {}
+  local xcrun, xcrun_unavailable = C.resolve_host_entry(host_driver, "xcrun_entry", context, M.id, stage)
+  if not xcrun then
+    return xcrun_unavailable
+  end
+  plans[#plans + 1] = C.with_appended_args(xcrun, {
+    "--sdk",
+    "iphoneos",
+    "--show-sdk-path",
+  }, { preflight = "iphoneos-sdk" })
+
+  if stage == "package" or stage == "install" then
+    local security, security_unavailable = C.resolve_host_entry(host_driver, "security_entry", context, M.id, stage)
+    if not security then
+      return security_unavailable
+    end
+    plans[#plans + 1] = C.with_appended_args(security, {
+      "find-identity",
+      "-v",
+      "-p",
+      "codesigning",
+    }, { preflight = "codesign-identity" })
+  end
+
+  return { ok = true, plans = plans }
+end
+
+function M.validate_preflight(stage, results)
+  for _, result in ipairs(results or {}) do
+    if tonumber(result.code) ~= 0 then
+      return C.unavailable(M.id, stage, "toolchain preflight command failed", {
+        preflight = result.plan and result.plan.metadata and result.plan.metadata.preflight,
+        exit_code = result.code,
+      })
+    end
+    local kind = result.plan and result.plan.metadata and result.plan.metadata.preflight
+    if kind == "iphoneos-sdk" and C.trim(result.stdout) == "" then
+      return C.unavailable(M.id, stage, "iPhoneOS SDK path was empty")
+    end
+    if kind == "codesign-identity" then
+      local output = tostring(result.stdout or "") .. "\n" .. tostring(result.stderr or "")
+      local count = tonumber(output:match("(%d+)%s+valid identities found"))
+      if not count or count < 1 then
+        return C.unavailable(M.id, stage, "no valid code-sign identity found")
+      end
+    end
+  end
+  return { ok = true, stage = stage }
+end
+
+return M

@@ -44,6 +44,13 @@ M.is_linux   = M.id == "linux"
 ---@field default_lldb_dap_paths    fun(): string[]
 ---@field default_lldb_server_paths fun(): string[]
 ---@field cmd_quote fun(value: string): string
+---@field host_path fun(path: string): string
+---@field ue_build_entry fun(engine_root: string): string|table|nil, string|nil
+---@field ue_uat_entry fun(engine_root: string): string|table|nil, string|nil
+---@field xcrun_entry? fun(): string|table|nil, string|nil macOS-only capability
+---@field security_entry? fun(): string|table|nil, string|nil macOS-only capability
+---@field plutil_entry? fun(): string|table|nil, string|nil macOS-only capability
+---@field powershell_entry? fun(): string|table|nil, string|nil Windows-only capability
 
 local _drivers = {}
 local _warned_stub = {}

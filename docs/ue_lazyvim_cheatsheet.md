@@ -726,6 +726,11 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `:UESetPlatform`          | Interactive platform+config select  |
 | `:UESetPlatform Win64 Development Editor` | Direct set         |
 | `<leader>ub`              | `:UEBuild` (platform from `:UESetPlatform`) |
+| `:UECompileForNvim`       | Build current target, then prepare its RSP-backed clangd/CDB semantics |
+| `:UEBuildIOS`             | Build only the IOS target through native macOS UBT |
+| `:UEPackageIOS`           | Build/cook/stage/package/archive IOS; never deploy or run |
+| `:UESetIOSDevice`         | Select an available physical iOS device from CoreDevice JSON |
+| `:UEInstallIOS`           | Install the current package task's `.app`; does not launch |
 | `<leader>us`              | `:UEBuildAndroidSO` — export + execute UBT compile/link actions (no Deploy/Gradle/APK) |
 | `<leader>uq`              | `:UEDeployAndroidSO` — strip, push, atomically replace and verify `libUE4.so`; leaves the app stopped |
 | `<leader>uB`              | `:UEPrepare` (symbols + compile_commands) |
@@ -745,6 +750,11 @@ Android 选择写入当前 Neovim **进程内**的全局变量
 `adb -s <serial>`；切换设备时再次执行 `<leader>uA`。该值既不会跨 Neovim 重启持久化，
 也不会影响同时运行的另一个 Neovim 实例。
 
+iOS 的设备、artifact、bundle id 与 process 状态保存于 IOS-scoped runtime state，
+不与 Android 或 Mac target 共用。推荐顺序是 `:UEPackageIOS` → `:UESetIOSDevice` →
+`:UEInstallIOS` → `:UELaunch`。package/install 需要有效签名；无签名或无可用真机时会在只读
+preflight 失败，不会回退到 UE legacy fastlane/ideviceinstaller/instruments。
+
 ### Less-common UE commands
 
 These exist (`grep create_user_command lua/ue.lua` to verify) but
@@ -757,6 +767,11 @@ have no key bound by default:
 | `:UEPrepareSync`       | Synchronous prepare (debug)             |
 | `:UEGenerateFromRSP`   | Re-export ccjson from cached `.rsp`     |
 | `:UEBuildAndroid`      | Force Android build target              |
+| `:UEBuildIOS`          | Build only the IOS target                |
+| `:UECompileForNvim`    | Build + RSP/CDB semantic prepare         |
+| `:UEPackageIOS`        | Package/archive IOS without deploy/run   |
+| `:UESetIOSDevice`      | Select physical IOS device               |
+| `:UEInstallIOS`        | Install current tuple's packaged app     |
 | `:UEBuildPCH`          | Build PCH only                          |
 | `:UEDirtyStatus`       | Show files awaiting reindex             |
 | `:UEDirtyClear`        | Clear dirty file set                    |

@@ -1,7 +1,7 @@
 # hana-alice's Neovim — Unreal Engine Edition
 
-> A LazyVim-based Neovim configuration for editing massive Unreal Engine 5 C++
-> projects on Windows — and engineered for long-term AI-assisted development.
+> A LazyVim-based Neovim configuration for editing massive Unreal Engine C++
+> projects on Windows and macOS — engineered for long-term AI-assisted development.
 
 **English** · [中文 / Chinese](docs/README.zh-CN.md)
 
@@ -19,6 +19,10 @@
   `compile_commands.json` (60–90% of `-I` flags removed) so clangd parses less.
 - **Multi-platform DAP** debugging for Win64 and Android (headless attach), with
   per-project breakpoint persistence.
+- **Host/target build drivers** that keep Windows, macOS and Linux execution
+  separate from Win64, Android, Mac, IOS and Linux target policy.
+- **Native macOS/iOS workflow** for UBT build, UAT package/archive, physical
+  device selection, install and launch through Xcode `devicectl`.
 - **File-based knowledge base** for AI agents: per-directory rules, a SESSION
   START protocol, and a regression-gated Definition of Done.
 
@@ -62,21 +66,23 @@ FRHICommandList grep (lower is better)
 
 ## Platform support
 
-**Windows 10/11 only.** macOS and Linux are not adapted: the configuration loads
-and the base editor works, but the UE subsystems (CDB pipeline, indexing, DAP,
-launchers) are written against the Windows toolchain and are not supported
-elsewhere.
+- **Windows 10/11:** primary environment; UE build/index and Win64/Android workflows.
+- **macOS:** native UE `Build.sh`, Mac/IOS target builds, the CDB semantic pipeline,
+  and iOS package/install/launch are supported. Native iOS DAP is not implemented.
+- **Linux:** the base editor and native UBT build planner are available; device and
+  DAP workflows remain target-dependent.
 
 ## Requirements
 
 | Component | Version / Note |
 | --- | --- |
-| OS | Windows 10/11 |
+| OS | Windows 10/11 or macOS with full Xcode |
 | Neovim | 0.10+ |
 | Toolchain | clangd/LLVM 22.1.x — pinned; do not use mason auto-install |
 | Android DAP | LLVM 22.1.6+ `lldb-dap` + NDK 27 `lldb-server` |
 | Optional | Go ≥ 1.22, to build the grep index tool |
 | Build prerequisite | A working Unreal Build Tool setup for the target platform |
+| iOS | Xcode, iPhoneOS SDK, signing identity/provisioning, and a paired physical device |
 
 Pinned versions are authoritative in
 [`docs/CONSTRAINTS.md` §C1](docs/CONSTRAINTS.md) and
@@ -94,6 +100,14 @@ nvim
 
 `setup.ps1` installs the toolchain, fonts and plugins (run from an Administrator
 PowerShell). Flags: `-SkipFonts`, `-SkipCapslock`, `-SkipPlugins`, `-Force`.
+
+On macOS, clone to the standard config path and start Neovim; Xcode and the
+pinned LLVM toolchain are managed separately:
+
+```sh
+git clone https://github.com/hana-alice/nvim-dot-files.git ~/.config/nvim
+nvim
+```
 
 Optionally build the grep index tool:
 
@@ -129,15 +143,19 @@ Choose `Win64`, `Android`, `Mac`, `IOS` or `Linux`. If unset, the current OS is
 used. Caches are stored per `<Platform>-<Config>`, so switching platforms does
 not invalidate other platforms' caches.
 
-### 3. Build once for the target platform (required)
+### 3. Compile for editor semantics
 
 ```
 <leader>ub        " (space u b) → :UEBuild
 ```
 
-`:UEPrepare` derives compile flags from a real build of the selected platform.
-**A successful platform build must exist before indexing**; without it there are
-no compile commands to process. Build Android with `:UEBuildAndroid`.
+Use `:UECompileForNvim` for the complete compiler-semantic workflow: it verifies
+the pinned clangd 22.1.x toolchain, builds the selected target, then prepares the
+RSP-backed CDB and index. Tree-sitter syntax highlighting works without this;
+clangd navigation and diagnostics require the compiler database.
+
+`:UEBuild` remains build-only. `:UEPrepare` remains prepare-only for users who
+already have fresh RSP output.
 
 ### 4. Build the index
 
@@ -161,9 +179,13 @@ Variants: `:UEPrepareIncremental` (dirty files only), `:UEPrepareReindex`
 | Project-wide grep | `<leader>/` |
 | File picker | `<leader><leader>` |
 | Build (current platform) | `<leader>ub` / `:UEBuild` |
+| Build + prepare compiler semantics | `:UECompileForNvim` |
+| Build IOS only | `:UEBuildIOS` |
+| Package/archive IOS | `:UEPackageIOS` |
+| IOS device / install / launch | `:UESetIOSDevice` / `:UEInstallIOS` / `:UELaunch` |
 | Android SO only (skip APK) | `<leader>us` / `:UEBuildAndroidSO` |
 | Android quick SO deploy (root device; does not launch) | `<leader>uq` / `:UEDeployAndroidSO` |
-| Launch the Editor | `:UELaunch` |
+| Launch the selected target app | `:UELaunch` |
 | Re-index after adding/removing files | `:UEPrepareIncremental` |
 | Android: select device (name + serial, current Neovim only) | `<leader>uA` / `:UESetAndroidDevice` |
 | Android: install without launch / attach / breakpoint | `<leader>ui` / `:UEDAPAttach` / `F9` |

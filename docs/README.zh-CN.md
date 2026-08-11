@@ -264,6 +264,17 @@ pwsh -File scripts\run_regression.ps1       # Windows 包装
 退出码 `0` 表示通过，`1` 表示失败。政策与 change→filter 映射见
 [`../tests/CLAUDE.md`](../tests/CLAUDE.md)。
 
+若要把 mock/fixture 回归与“本机真实能力”分开检查，可运行：
+
+```sh
+nvim --headless -l scripts/nvim_core_health.lua
+nvim --headless -l scripts/nvim_core_health.lua --json
+```
+
+Neovim 内对应命令为 `:NvimCoreHealth`。报告分别验证真实启动、Tree-sitter parser、
+rg/csearch、clangd/CDB 与只读 UE 集成；`DEGRADED` 表示基础编辑器通过，但某个外部能力被
+阻塞。详见 [`core-health.md`](core-health.md)。
+
 ## 致谢
 
 [LazyVim](https://github.com/LazyVim/LazyVim)、

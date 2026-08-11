@@ -62,10 +62,11 @@ t.describe("commands: 辅助命令（keymaps.lua 注册）", function()
   vim.g.maplocalleader = " "
   require("ue").setup()
   require("utils.log").install_commands()
+  require("utils.core_health").setup()
   pcall(dofile, cfg .. "/lua/config/keymaps.lua")
   for _, c in ipairs({
     "Restart", "RestartDetect", "UEDefStatus", "UEDefCancel", "UEDefContextClear",
-    "NotificationHistory", "NotificationHistoryClear", "WindowTitle", "WindowTitleReset",
+    "NotificationHistory", "NotificationHistoryClear", "NvimCoreHealth", "WindowTitle", "WindowTitleReset",
   }) do
     t.it(":" .. c .. " 已注册", function()
       t.assert_eq(vim.fn.exists(":" .. c), 2, c .. " 未注册")

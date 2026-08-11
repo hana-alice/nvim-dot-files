@@ -1,4 +1,5 @@
 local lazypath = vim.fn.stdpath("data") .. "/lazy/lazy.nvim"
+local health_no_mutate = vim.env.NVIM_CORE_HEALTH_NO_MUTATE == "1"
 if not (vim.uv or vim.loop).fs_stat(lazypath) then
   local lazyrepo = "https://github.com/folke/lazy.nvim.git"
   local out = vim.fn.system({ "git", "clone", "--filter=blob:none", "--branch=stable", lazyrepo, lazypath })
@@ -30,14 +31,17 @@ require("lazy").setup({
     version = false, -- always use the latest git commit
     -- version = "*", -- try installing the latest stable version for plugins that support semver
   },
-  install = { colorscheme = { "monokai_ristretto", "habamax" } },
+  install = {
+    missing = not health_no_mutate,
+    colorscheme = { "monokai_ristretto", "habamax" },
+  },
   checker = {
-    enabled = true, -- check for plugin updates
+    enabled = not health_no_mutate, -- health startup probes must remain read-only
     notify = false,
     frequency = 86400, -- check at most once a day (was: every hour)
   },
   change_detection = {
-    enabled = true,
+    enabled = not health_no_mutate,
     notify = false, -- silence "config reloaded" toasts
   },
   performance = {

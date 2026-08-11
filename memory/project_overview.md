@@ -47,6 +47,7 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 | UE target drivers | `lua/ue/targets/` | `lua/ue/targets/AGENTS.md` | Android/IOS/Mac/Win64/Linux 目标策略彼此隔离；host tools 由 `utils/platform` 注入 |
 | goto 解析栈 | `lua/utils/ue_goto/` | `lua/utils/ue_goto/AGENTS.md` | proven-TU canonical USR + module AST 唯一 body；非 C++ compatibility fallback |
 | 代码搜索 | `lua/utils/code_search/` | `lua/utils/code_search/AGENTS.md` | csearch 亚秒级 grep（兜底，非主路） |
+| 核心健康审计 | `lua/utils/core_health*.lua` + `scripts/nvim_core_health.lua` | `lua/utils/AGENTS.md` + `scripts/AGENTS.md` | 隔离、只读、可机器判定的启动/编辑/AST/搜索/clangd/CDB/target plan 证据 |
 | 平台驱动 | `lua/utils/platform/` | `lua/utils/platform/AGENTS.md` | 唯一允许做 OS 分支的地方 |
 | workaround 注册表 | `lua/workarounds/` | `lua/workarounds/AGENTS.md` | 上游 bug 补丁，带 frontmatter |
 | 配置层 | `lua/config/` | `lua/config/AGENTS.md` | keymaps / options / autocmds / lazy |

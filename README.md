@@ -283,6 +283,19 @@ pwsh -File scripts\run_regression.ps1       # Windows wrapper
 Exit code `0` indicates success, `1` indicates failure. Policy and the
 change-to-filter map are in [`tests/CLAUDE.md`](tests/CLAUDE.md).
 
+To check the real local startup, Tree-sitter parsers, rg/csearch backends,
+clangd/CDB prerequisites and read-only UE integration separately from mocked
+regressions:
+
+```sh
+nvim --headless -l scripts/nvim_core_health.lua
+nvim --headless -l scripts/nvim_core_health.lua --json
+```
+
+The same audit is available inside Neovim as `:NvimCoreHealth`. `DEGRADED`
+means the editor core passed while an external capability such as csearch or
+the pinned clangd is blocked. See [`docs/core-health.md`](docs/core-health.md).
+
 ## Credits
 
 [LazyVim](https://github.com/LazyVim/LazyVim),

@@ -497,6 +497,7 @@ local tabs = {
           { "<leader>qq",   "Quit all" },
           { "<leader>fn",   "New file" },
           { "<leader>un",   "Dismiss notifications" },
+          { ":NvimCoreHealth", "Read-only core capability audit" },
           { "<C-a>/<C-x>",  "Increment / decrement" },
           { "gf",           "Go to file under cursor" },
           { "gx",           "Open URL under cursor" },

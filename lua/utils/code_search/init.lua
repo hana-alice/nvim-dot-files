@@ -637,6 +637,7 @@ end
 --                   Use "add" for watcher-driven dirty file flushes so the
 --                   trigram index stays current without re-walking the whole
 --                   workspace.
+-- Returns a stop() function for bounded callers; existing callers may ignore it.
 function M.build_index(ctx, abs_list_path, cb, opts)
   opts = opts or {}
   local mode = opts.mode or "reset"
@@ -648,7 +649,7 @@ function M.build_index(ctx, abs_list_path, cb, opts)
          "  cd <nvim-config>/tools/cindex-uefilter && go install ./...",
          {})
     end)
-    return
+    return function() end
   end
 
   local idx = M.index_path(ctx)
@@ -665,7 +666,7 @@ function M.build_index(ctx, abs_list_path, cb, opts)
          "csearch index unusable (missing/0-byte/corrupt) — run :UEPrepare for a full rebuild",
          { index_size = 0 })
     end)
-    return
+    return function() end
   end
 
   local env = {}
@@ -680,6 +681,7 @@ function M.build_index(ctx, abs_list_path, cb, opts)
   local stderr_buf = {}
   local handle
   local started = vim.loop.hrtime()
+  local stopped = false
 
   local args = {}
   if mode == "reset" then
@@ -695,8 +697,10 @@ function M.build_index(ctx, abs_list_path, cb, opts)
   }, function(code)
     if stderr then pcall(stderr.close, stderr) end
     if handle then handle:close() end
+    if stopped then return end
     local ms = math.floor((vim.loop.hrtime() - started) / 1e6)
     vim.schedule(function()
+      if stopped then return end
       if code ~= 0 then
         cb(false, "cindex-uefilter exit=" .. code .. ": " .. table.concat(stderr_buf, ""), { ms = ms })
         return
@@ -717,12 +721,23 @@ function M.build_index(ctx, abs_list_path, cb, opts)
   if not handle then
     if stderr then pcall(stderr.close, stderr) end
     vim.schedule(function() cb(false, "failed to spawn cindex-uefilter", {}) end)
-    return
+    return function() end
   end
 
   stderr:read_start(function(_, data)
-    if data then table.insert(stderr_buf, data) end
+    if not stopped and data then table.insert(stderr_buf, data) end
   end)
+
+  return function()
+    if stopped then return end
+    stopped = true
+    if handle and not handle:is_closing() then
+      pcall(handle.kill, handle, "sigterm")
+    end
+    if stderr and not stderr:is_closing() then
+      pcall(stderr.read_stop, stderr)
+    end
+  end
 end
 
 return M

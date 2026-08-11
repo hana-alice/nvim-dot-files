@@ -28,6 +28,7 @@
 | `lua/config/options.lua` / `autocmds.lua` | `options` `autocmds` |
 | `lua/theme.lua` / `lua/highlights.lua` / `colors/**` | `theme` `smoke` |
 | `lua/utils/stall_probe.lua` | `stall_probe` |
+| `lua/utils/core_health*.lua` / `scripts/nvim_core_health.lua` | `core_health` |
 | `lua/workarounds/**` | `workarounds` `smoke` |
 | 文档 / 规则 / 知识库结构 | `structure` |
 | **跨子系统 / 公共 helper / 重构 / 拿不准** | **全量（不带 filter）** |
@@ -47,6 +48,20 @@
 ```
 nvim --headless -l tests/run.lua
 ```
+
+## 本机真实能力健康检查
+
+全量回归主要证明契约、纯逻辑和 fixture 行为；真实 startup、Tree-sitter parser、搜索 backend
+与 clangd/CDB 前置条件使用独立的只读 health runner：
+
+```sh
+nvim --headless -l scripts/nvim_core_health.lua
+nvim --headless -l scripts/nvim_core_health.lua --json
+nvim --headless -l scripts/nvim_core_health.lua --filter syntax
+```
+
+`FAIL` 表示 deterministic 基础能力失败；`DEGRADED` 表示基础能力通过，但 csearch、钉死版本
+clangd 或 live workspace 等外部能力被 `BLOCKED`。它补充而不替代本页的全量回归。
 
 Windows 本机便捷入口（仅转发，不含测试逻辑）：
 

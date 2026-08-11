@@ -40,6 +40,7 @@ pwsh -File scripts/run_regression.ps1       # 本机一键（转发 + 退出码�
 | `lua/theme.lua` / `lua/highlights.lua` / `colors/**` | `theme` `smoke` |
 | `lua/utils/cheatsheet.lua` / `docs/ue_lazyvim_cheatsheet.md` | `cheatsheet` |
 | `lua/utils/stall_probe.lua` | `stall_probe` |
+| `lua/utils/core_health*.lua` / `scripts/nvim_core_health.lua` | `core_health` |
 | `lua/workarounds/**` | `workarounds` `smoke` |
 | 文档 / 规则 / 知识库结构 | `structure` |
 | **跨子系统 / 公共 helper / 重构 / 拿不准** | **全量（不带 filter）** |

@@ -25,6 +25,7 @@
 | UE target drivers | `lua/ue/targets/` | Android / IOS / Mac / Win64 / Linux 的 UBT、UAT、产物和设备策略 | 各 target 独立实现；不得跨 driver fallback |
 | 符号解析栈 | `lua/utils/ue_goto/` + `lsp_fallback.lua` | C++ compiler identity；非 C++ compatibility | header 必须有 proven origin TU；非 resolved 不猜测 |
 | 代码搜索 | `lua/utils/code_search/` | csearch 亚秒级 grep | 显式搜索、references 与非 C++ 兼容路径 |
+| 核心健康审计 | `lua/utils/core_health*.lua` + `scripts/nvim_core_health.lua` | 真实启动、编辑、AST、搜索、clangd/CDB/target plan 的分层证据 | 交互入口只异步启动隔离 headless runner；live workspace 只读 |
 | 平台驱动 | `lua/utils/platform/` | OS 分支唯一收口 | 共享基础接口 + host-owned 可选能力；其余代码不做 OS 分支 |
 | workaround 注册表 | `lua/workarounds/` | 上游 bug 隔离补丁 | 带 frontmatter；`:WorkaroundList` 可见 |
 | 配置层 | `lua/config/` | keymaps/options/autocmds/lazy | LazyVim 自动加载，勿在 init 重复 require |
@@ -61,6 +62,10 @@
 - **编译器语义**：`:UECompileForNvim` → clangd 22.1.x 预检 → 当前 target driver 生成原生 UBT
   build plan → 成功后复用 `:UEPrepare` 的 RSP/CDB/index 流程。Tree-sitter 语法解析与此分离，
   不会被 clangd/CDB 缺失伪装成失败。
+- **核心健康审计**：`:NvimCoreHealth` 异步启动 `scripts/nvim_core_health.lua` → 隔离临时目录验证真实
+  init、编辑事务、mandatory Tree-sitter AST、rg/csearch、clangd/CDB 与 target driver 纯计划 → 按
+  `PASS/FAIL/BLOCKED/SKIP` 输出脱敏报告并清理。`--live` 只读取显式提供的既有 tuple/artifact，
+  不触发安装、更新、UE build/package/device 或 DAP。
 - **iOS 应用**：`:UEBuildIOS` 只经 IOS target driver 调 macOS `Build.sh`；`:UEPackageIOS` 经同一
   driver 规划 UAT BuildCookRun（Build/Cook/Stage/Package/Archive，不含 Deploy/Run）；
   `:UESetIOSDevice` / `:UEInstallIOS` / `:UELaunch` 使用结构化 CoreDevice JSON、当前 package task 的

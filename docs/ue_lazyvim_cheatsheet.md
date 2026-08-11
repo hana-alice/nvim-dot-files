@@ -713,6 +713,19 @@ saved/aborted before the old session exits.
 
 ---
 
+## 🩺 Core Functionality Health
+
+| Command | Action |
+|---|---|
+| `:NvimCoreHealth` | Run the read-only startup/editor/Tree-sitter/search/clangd/UE capability audit asynchronously |
+
+The headless equivalent is
+`nvim --headless -l scripts/nvim_core_health.lua [--json] [--filter <prefix>] [--live]`.
+`DEGRADED` means deterministic editor checks passed while an external backend
+such as csearch or clangd 22.1.x is blocked. See `docs/core-health.md`.
+
+---
+
 ## 🎮 UE Workflow
 
 Source: `lua/config/keymaps.lua` (static `<leader>uB / uc / uP`,

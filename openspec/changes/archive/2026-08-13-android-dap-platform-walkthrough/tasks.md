@@ -1,9 +1,9 @@
 ## 1. 真机验证连接组合（apply 第一步，定方案）
 
-- [ ] 1.1 clean env：`am force-stop` + 重启 app 取新 pid；动态取 device serial（限 a3ad86f3）。
+- [ ] 1.1 clean env：`am force-stop` + 重启 app 取新 pid；动态取 device serial（限 `<test-device>`）。
 - [ ] 1.2 扩展 `tools/dap_platform_structured.py` 支持组合：device 纯 listen `gdbserver 127.0.0.1:<port>` + host `gdb-remote-port=<port>` + attachCommands `process attach --pid <pid>`。
 - [ ] 1.3 真机跑该组合，取 fresh protocol log，判定是否到 `initialized`+`threads`。
-- [ ] 1.4 若失败：读 `D:/project/llvm-lldb-sparse` 的 `AttachRequestHandler` 在 gdb-remote-port + attachCommands 并存时的执行序，定位 connect→vAttach 失败点。
+- [ ] 1.4 若失败：读 `<local-llvm-source>` 的 `AttachRequestHandler` 在 gdb-remote-port + attachCommands 并存时的执行序，定位 connect→vAttach 失败点。
 - [ ] 1.5 确定 device server 版本（LLDB21 r29 / 其它）与 host 22 兼容。
 
 ## 2. 改 attach 实现（方案定型后）
@@ -25,7 +25,7 @@
 - [ ] 4.2 `docs/TOOLING.md` / `docs/CONSTRAINTS.md`：更新 device server 版本、连接方式、getopt URL bug、gdbserver --attach 不绑端口。
 - [ ] 4.3 以真机结论 MODIFY 主 spec `android-dap-attach`（纯 listen vs platform server 定稿）。
 
-## 5. 验证（仅 a3ad86f3）
+## 5. 验证（仅 `<test-device>`）
 
 - [ ] 5.1 headless smoke：android.lua / dap.lua / windows.lua / require。
 - [ ] 5.2 真机 `<space>da` 端到端：initialized/threads，无 Invalid URL / 超时 / 3221226505。

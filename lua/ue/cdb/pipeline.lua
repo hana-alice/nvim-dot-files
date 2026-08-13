@@ -18,6 +18,7 @@
 --   M.run(path, targets, on_done?)    -> jobid|0|nil, error? (background)
 
 local fs = require("ue.core.fs")
+local file_lock = require("ue.file_lock")
 
 local M = {}
 local running = false
@@ -220,6 +221,14 @@ function M.run(path, targets, on_done)
     return 0
   end
 
+  local lease, lease_err = file_lock.acquire(path .. ".writer.lock")
+  if not lease then
+    local msg = "compile_commands pipeline is owned by another Neovim: " .. tostring(lease_err)
+    _rt.notify(msg, vim.log.levels.WARN)
+    if on_done then on_done(false, msg) end
+    return nil, msg
+  end
+
   _rt.notify("compile_commands pipeline: expand+pch+resolve+unify+prune in background...", vim.log.levels.INFO)
 
   local stat_before = vim.uv.fs_stat(path)
@@ -236,6 +245,7 @@ function M.run(path, targets, on_done)
     finish_ok = ok
     finish_err = err
     running = false
+    file_lock.release(lease)
     if on_done then on_done(ok, err) end
   end
 

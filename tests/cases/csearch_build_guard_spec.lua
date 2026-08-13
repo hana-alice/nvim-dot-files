@@ -193,6 +193,8 @@ t.describe("csearch smart_build 端到端（D11，mock build_index）", function
   local function setup_dir()
     local dir = vim.fn.tempname():gsub("\\", "/")
     vim.fn.mkdir(dir, "p")
+    assert(require("ue.project_state").select(
+      dir, dir .. "/project", dir .. "/project/Test.uproject", { persist_default = false }))
     return dir
   end
   local function write_lines(path, lines)

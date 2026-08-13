@@ -69,7 +69,7 @@ local function cleanup_ctx(ctx)
   if not ctx then
     return
   end
-  local key = ctx.engine_root .. "\31" .. ctx.project_root
+  local key = ctx.engine_root .. "\31" .. ctx.project_root .. "\31" .. ctx.paths.platform_key
   index._rt.module_state[key] = nil
   index._rt.contexts[key] = nil
   pcall(vim.fn.delete, ctx._root, "rf")
@@ -116,6 +116,17 @@ local function make_manifest(ctx, state, phase, content, keys, completed_at)
 end
 
 t.describe("ue.index generation manifests", function()
+  t.it("rejects a phase build while another Neovim owns the platform artifacts", function()
+    local ctx = make_ctx("foreign_writer")
+    local lock = require("ue.file_lock")
+    local owner = assert(lock.acquire(ctx.paths.index_state .. ".build.lock"))
+    local ok, err = index.build_phase_async(ctx, "current")
+    t.assert_false(ok)
+    t.assert_contains(tostring(err), "another Neovim")
+    lock.release(owner)
+    cleanup_ctx(ctx)
+  end)
+
   t.it("hot controlled background CDB adds portable members/module-root metadata without mutating input", function()
     local root = vim.fn.tempname():gsub("\\", "/") .. "_hot_super_metadata"
     local source_dir = root .. "/Engine/Source/Runtime/Sample/Private"

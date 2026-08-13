@@ -5,10 +5,10 @@ UE Android DAP attach 路线已通过本次会话的真机 + LLVM 22.1.6 源码�
 攻坚"结构化，避免重复发现。
 
 关键约束（用户给定 + `docs/CONSTRAINTS.md`）：host adapter LLDB **22.1.6+ forward-only**
-是唯一硬约束；其余原则本任务内可放宽以跑通路线。设备仅 a3ad86f3。host lldb-dap 是
+是唯一硬约束；其余原则本任务内可放宽以跑通路线。设备仅 `<test-device>`。host lldb-dap 是
 nopython 构建（E3），任何 host python 方案排除。
 
-源码与证据脚本已在仓：`D:/project/llvm-lldb-sparse`（tag llvmorg-22.1.6，sparse 含
+源码与证据脚本已在仓：`<local-llvm-source>`（tag llvmorg-22.1.6，sparse 含
 Platform/Android、Interpreter、Host/common、tools/lldb-dap）；
 `tools/dap_probe_android.py` / `dap_platform_probe.py` / `dap_platform_structured.py`。
 
@@ -44,7 +44,7 @@ nvim-dap 层绕 E4 或上游补丁。先有可用的 attach，再谈锦上添花
 
 **D4 — clean-env 协议固化**
 每轮 probe：`am force-stop` + 重启 app 取新 pid；动态取当前 device serial（不写死
-a3ad86f3 字面量到 probe 逻辑，但验证仍限这台）；random host port；结束必 kill host
+`<test-device>` 字面量到 probe 逻辑，但验证仍限这台）；random host port；结束必 kill host
 lldb-dap + device lldb-server + 清 forward。
 
 ## Risks / Trade-offs
@@ -54,7 +54,7 @@ lldb-dap + device lldb-server + 清 forward。
   `AttachRequestHandler` 在 gdb-remote-port + attachCommands 并存时的执行序。
 - [用户坚持必须 platform server] → 升级到 D2 的 nvim-dap 层绕 E4（更曲折），单独评估。
 - [device server 版本不兼容 host 22] → 逐版本真机验证握手层。
-- [仅单机] → 明确 a3ad86f3。
+- [仅单机] → 明确 `<test-device>`。
 
 ## Migration Plan
 

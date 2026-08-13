@@ -517,7 +517,7 @@ local function append_bp_diag(lines)
   if type(lines) == "string" then lines = { lines } end
   if type(lines) ~= "table" then return end
   pcall(function()
-    local path = vim.fn.stdpath("cache") .. "/ue-dap-bp-diag.log"
+    local path = vim.fn.stdpath("cache") .. ("/ue-dap-bp-diag.%d.log"):format(vim.fn.getpid())
     local fh = io.open(path, "a")
     if not fh then return end
     for _, line in ipairs(lines) do

@@ -1,4 +1,4 @@
-# Grep 缓存失效与平台分路径 · 模块设计
+# Grep 缓存失效、项目分桶与平台分路径 · 模块设计
 
 > 子系统：`lua/utils/code_search/` + `lua/ue.lua`（cache_paths / resolve_context /
 > set_project / set_platform / prepare / **prepare_freshness**）+ `lua/utils/ue_watch.lua`
@@ -49,41 +49,45 @@ picker 标题为 `Grep All Code (Engine+Project)`（**无 `[csearch]`/`[rg]` 后
 - `ue_project_grep` 回落分支标题改为 `Grep All Code (slow fallback — run :UEPrepare)`，
   让缺后缀不被误认为完整结果。
 
-### D3 — csearch/workspace_all **按平台+配置分路径**（`cache_paths`）
+### D3 — canonical project bucket 优先，平台相关工件再分路径（`cache_paths`）
 
-与 cdb shard 的平台维度对齐。**只有 grep-facing 工件**分平台：
-- `csearch_idx` → `csearch/<platform_key>/csearch.idx`
+第一层边界是 `<engine>/.cache/nvim-ue/projects/<canonical-project-key>/`，因此同一 engine 下
+不同项目（包括同 basename checkout）不共享状态或索引。project bucket 内：
+
+- `csearch_idx` → `csearch/csearch.idx`（同一项目内平台无关）
 - `workspace_all_list` / `workspace_list` / `project_list` / `engine_list` → `gtags/<platform_key>/*.files`
 - `workspace_db`（GTAGS DB）→ `gtags/<platform_key>/workspace/`
+- active CDB、controlled index scheduler/CDB、clangd index/PCH → 各自 `<platform_key>/`
+- CDB shard catalog → project bucket 内跨平台共享，key 自带 platform/target/config
 
-`platform_key` 空时**回落旧单一路径**（向后兼容 + 迁移源）。
-`state.json` / cdb shards（已内部按 key 分）/ clangd index / pch / logs / runtime **不分平台**。
+`platform_key` 空时使用 `default`/旧扁平路径作为兼容入口；project state、csearch、共享 shard
+catalog 与 runtime dirty 集合不分平台，但绝不越过 project bucket。
 
 `platform_key` 由 `CORE_RT.platform_key_from_state(state)` 生成：
 `"<Platform>-<Config>"`，config 剥离 ` Editor` 后缀（与 shard config 段一致），
 无 platform → `""`。**与 `ue.cdb.shards.shard_key` 同源的平台维度**（无 target 段，
 因 state 只有 platform+config）。
 
-理由：用户切平台（Android↔Win64）应保留两边 csearch 索引，切平台不删重来——
-与 cdb shard 模型一致（用户既往明确诉求）。
+理由：csearch 输入文件集合不含平台维度，切平台无需复制或重建；编译参数、宏、controlled
+semantic index 则含平台维度，必须隔离。项目 identity 与平台 identity 是两层不同边界。
 
 ### D4 — 旧缓存自动迁移（`CORE_RT.migrate_legacy_csearch_if_needed`）
 
-参照 `shards.migrate_legacy_if_needed`。检测旧单一路径
-（`csearch/csearch.idx` + `gtags/*.files`）存在、且当前 platform_key 目录为空时，
-**move（os.rename，同卷）**进平台目录。`resolve_context` 末尾幂等调用（platform_key≠"" 时）。
-幂等：移完旧路径即空，后续 no-op。新目录已有索引时**不覆盖**。
+参照 `shards.migrate_legacy_if_needed`。旧顶层 project state 只读导入 canonical project bucket；
+旧扁平 `gtags/*.files` 在 filesystem lease 下 move 到当前平台目录，新目录已有工件时不覆盖。
+旧 per-platform csearch 不提升为真相：扁平 project-scoped csearch 缺失时判 stale，由下一次
+`:UEPrepare` 重建。迁移幂等并保留无法证明安全的旧工件。
 
 ### D5 — 失效触发矩阵
 
 | 触发 | engine 变 | project 变 | platform 变 |
 |---|---|---|---|
-| **入口** | `set_project`（比对 state.engine_root） | `set_project`（比对 state.project_root） | `set_platform` |
-| **csearch/workspace_all** | 删全平台（`invalidate_project_scoped_cache` rm `csearch/`+`gtags/` 整树） | 删全平台 | **不删**（切到 `csearch/<新key>/`，旧平台保留） |
-| **cdb shards** | 删 `shards/` 整树 | 删 `shards/` 整树 | fast-swap flip active（不删） |
+| **入口** | 当前 buffer/cwd 解析 engine | `set_project` 更新进程选择 | `set_platform` 更新进程选择 |
+| **csearch/workspace_all** | 路由新 engine bucket，不删旧 | 路由新 canonical project bucket，不删旧 | csearch 复用；gtags 切到新平台目录 |
+| **cdb shards** | 新 engine bucket | 新 project bucket | fast-swap 读共享 catalog，写平台隔离 active CDB |
 | **context_cache** | 清 | 清 | 清 |
 | **probe cache** | 重探 | 重探 | 重探 |
-| **engine_root 持久化** | `persist_project` 写入 state.engine_root，使 engine 维度判定有据 | — | — |
+| **live selection** | 新 engine 独立解析 | 当前进程捕获；`selection.json` 仅未来进程默认 | 当前进程捕获，不受其他实例改写 |
 
 UEPrepare（同步 + 异步 finalize）完成后：清 `context_cache`+`freshness_notified`+重探——
 修复"重建期建立的无索引 ctx 在 TTL 内被命中"（#1 同源）。
@@ -142,13 +146,15 @@ csearch.idx 的写者收敛为**唯一所有者：用户显式触发的 prepare 
 这把「0 字节 idx → add → corrupt → remove」的死循环在源头切断。`recover_staged_index` 仍作
 构建后兜底（从 `idx~~` 提升）。
 
-**清理层 — 全量构建成功后 dirty 集合必归零**：β 把 watcher 降级为记账员后，「构建成功 ⇒
-dirty 归零」的清理责任完全转移到 prepare 家族，且**必须在每条全量成功路径都清**
+**清理层 — 成功后只退役本次覆盖的 dirty snapshot**：β 把 watcher 降级为记账员后，清理责任
+完全转移到 prepare 家族，且**必须在每条成功路径处理**
 （cache fast-path / cold full / sync），统一走 `CORE_RT.clear_persistent_dirty_safe`。
-只有 cold-full 清、其它路径漏清会引出两个直接症状：(1) `prepare_freshness` 的第一道闸
+writer 拿到 csearch lease 时捕获 dirty snapshot；成功后在 dirty-file lease 下只 subtract 这些路径，
+并以 build-start mtime guard 保留构建期间再次修改的同一路径；reset 可退役已覆盖的 missing/deleted
+路径，从而不制造永久 stale。只有 cold-full 处理、其它路径漏处理会引出两个直接症状：(1) `prepare_freshness` 的第一道闸
 （`persistent_dirty_status().count > 0 → "stale"`）恒真——刚 prepare 完仍弹「stale」+ ue_watch
 提示；(2) rg-on-dirty overlay 每次 grep 背着巨大脏集合（实测 dirty.json 110 KB）重复扫 → picker
-变卡。失败则**不清**（脏文件仍需 overlay 兜底可见，直到下次成功构建）。
+变卡。失败则**不删**；`:UEPrepare!` 也禁止在启动 rebuild 前预清（脏文件仍需 overlay 兜底可见）。
 
 为什么不是加锁 / 双索引 / 排队：见 change `fix-csearch-index-single-writer` 的 design.md
 Rejected Alternatives（α 锁仍需崩溃恢复且任意两写者重叠仍损坏；γ 双索引查询期 merge 成本永久；
@@ -185,7 +191,7 @@ prepare_freshness 稳态：
 ```
 
 - **记录点**：csearch 全量构建**成功**后，`CORE_RT.on_full_csearch_success(ctx, reason)`
-  在三条全量成功路径（sync / fast-path / cold-full）统一调用，一并做 D-3b 清 dirty + D10 写
+  在三条成功路径（sync / fast-path / cold-full）统一调用，一并做 D-3b 退役 captured dirty + D10 写
   `state.csearch_input_hash = list_fingerprint(workspace_all.files)`。失败不写（指纹不得前移
   于已建成的索引）。
 - **成本**：sha256(22 MB) 实测 46ms；`CORE_RT.list_fingerprint` 用 list 自身 `(mtime,size)`
@@ -222,7 +228,7 @@ idx）；缺的是 **diff 基准**：上次索引到底喂了哪些文件。
 
 - **单一入口**：`CORE_RT.csearch_smart_build(ctx, cs_ctx, abs_list, cb)` 替换三条 prepare
   路径（sync / fast-path / cold-full）的裸 `build_index` 调用。begin/done 串行闸与
-  `on_full_csearch_success`（清 dirty + 写指纹）仍归调用点——smart_build 只额外负责快照刷新。
+  `on_full_csearch_success`（退役 captured dirty + 写指纹）仍归调用点——smart_build 只额外负责快照刷新。
 - **与 D9 的关系**：写者仍只有 prepare 家族（smart_build 是 prepare 的实现细节，不是新写者）；
   watcher 仍是记账员。`UEPrepareIncremental`（手动挡）保留，语义不变。
 - **正确性边界**：删除必须 reset——cindex merge 只能加不能减，留 ghost 会让 `<leader>/`
@@ -233,10 +239,10 @@ skip/add/reset 端到端 with mock build_index + 快照往返）。
 
 ## 3. 失效正确性论证
 
-- **engine 变**：旧 `set_project` 只比 project_root；engine 换了（同 project 指向新引擎）
-  缓存不失效。现持久化 engine_root + 比对 → 修复。
-- **platform 变不删**：D3 让不同平台落不同路径，天然隔离；新平台无索引时 D2 可见回落
-  提示 `:UEPrepare`，不给残缺静默结果。
+- **engine/project 变**：canonical bucket 路由保证旧工件既不误用也不删除；live selection 在进程
+  内捕获，另一个 Neovim 更新 startup default 不会重定向当前实例。
+- **platform 变不删**：D3 让 csearch 在项目内复用、gtags/CDB/clangd/index 落平台路径；
+  新平台缺编译相关工件时 D2 可见提示，不给残缺静默结果。
 - **重建期负探测**：D1（不缓存负探测）+ UEPrepare finalize 重探，双保险。
 - **stream 尾部命中**：D6 让 backend 只从一个 flusher 交付命中和 done，消除 callback
   调度顺序竞争。
@@ -249,10 +255,10 @@ skip/add/reset 端到端 with mock build_index + 快照往返）。
 
 | 风险 | 缓解 |
 |---|---|
-| `cache_paths` 布局变更影响面大 | platform_key="" 完全回落旧路径，老缓存零破坏；D4 move-once 幂等；spec 守护布局 |
+| `cache_paths` 布局变更影响面大 | 旧 state 只读迁移、旧工件不删除；D4 move-once 幂等；spec 守护 project/platform 两层布局 |
 | 跨盘绝对路径（E 工程/D 引擎） | 迁移/分路径仅改缓存落点，不碰路径内容生成；既有 cross-drive guard 不受影响 |
-| watch 模块索引路径 | `ue_watch.start` 的 `csearch_index` 入参随 ctx.paths 自动指向平台目录，无需额外改 |
-| csearch.idx 并发写损坏（watcher×UEPrepare 抢 `<idx>~`） | D9 β：watcher 退回记账员不写索引；Policy A：构建串行拒绝并发；韧性：增量前校验 idx 可用。spec 静态+行为守护「不复活 csearch 写者」 |
+| watch 模块索引路径 | `ue_watch.start` 的 `csearch_index` 自动指向当前 project bucket；dirty JSON 在 lease 下 merge |
+| csearch.idx 并发写损坏（watcher×UEPrepare/多实例） | D9 β：watcher 退回记账员不写索引；进程内 slot + filesystem lease 拒绝所有第二 writer；增量清单在拿 lease 后才生成唯一临时路径 |
 | 删除自动增量后新文件到下次 prepare 才识别 | 用户已确认可接受；persistent_dirty + rg-on-dirty overlay 使其非静默丢失 |
 | fsmonitor/TortoiseGit 后台改 index、编译产物 touch 目录 → 假 stale | D10：freshness 改 `workspace_all.files` 内容指纹（确定性），退役所有 mtime 代理（git index/commit-state/dir_mtime）；会话内集合变化由 watcher dirty 捕获，会话间由指纹捕获 |
 
@@ -267,10 +273,12 @@ skip/add/reset 端到端 with mock build_index + 快照往返）。
   不裸 cindex」+ 行为守护「有/无 dirty 路径都不触发 build_index」。
 - `tests/cases/csearch_build_guard_spec.lua`（D9，8 例）：构建串行（begin 占用 / 第二次拒绝 /
   done 后可再 begin / 失败也清标志）+ 增量遇 0 字节·缺失 idx 被拒不 spawn + `_usable_index_for_test`
-  + 全量成功清 dirty（D-3b）。
+  + 成功后仅退役 captured dirty（D-3b）。
 - `tests/cases/freshness_fingerprint_spec.lua`（D10，7 例）：`list_fingerprint` 内容同/异 +
   缺失→nil + (mtime,size) 缓存命中；防回归——`prepare_freshness` 源不再引用任何 mtime 代理
   anchor（git index/commit-state/dir_mtime）+ `on_full_csearch_success` 记录指纹。
+- `tests/cases/multi_instance_state_spec.lua`：两个及以上 headless Neovim 并发验证 project/target
+  隔离、writer lease、dirty/probe/recent 集合 merge 与 definition-cache per-key 发布。
 - 回归范围：跨子系统（ue.lua + code_search + ue_watch + snacks）→ 提交前全量
   `nvim --headless -l tests/run.lua`。
 

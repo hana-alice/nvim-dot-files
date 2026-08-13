@@ -66,7 +66,7 @@
 - **THEN** 系统 SHALL 使用 `--strip-unneeded` 生成临时部署副本
 - **AND** 不修改 `Binaries/Android` 下的原始 SO
 
-### Requirement: 部署必须复用会话全局 Android 设备
+### Requirement: 部署必须复用当前 Neovim 进程的 Android 设备
 
 系统 SHALL 使用现有 Android device picker 保存的 serial，并对所有 ADB 操作显式传递该 serial。
 

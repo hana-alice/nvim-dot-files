@@ -114,9 +114,10 @@ Open a C++ file inside the UE project, then proceed in order.
 :UESetProject
 ```
 
-Confirms the project root (containing `.uproject`) and the engine root. Both are
-persisted. Use `:UESetUprojectRelativePath` if `.uproject` is not directly under
-the project root.
+Confirms the project root (containing `.uproject`) and the engine root. The
+selection is captured by the current Neovim process; its persisted selector is
+only the startup default for future processes. Use `:UESetUprojectRelativePath`
+if `.uproject` is not directly under the project root.
 
 ### 2. Select the platform
 
@@ -164,7 +165,7 @@ Variants: `:UEPrepareIncremental` (dirty files only), `:UEPrepareReindex`
 | Android quick SO deploy (root device; does not launch) | `<leader>uq` / `:UEDeployAndroidSO` |
 | Launch the Editor | `:UELaunch` |
 | Re-index after adding/removing files | `:UEPrepareIncremental` |
-| Android: select device (name + serial, session-global) | `<leader>uA` / `:UESetAndroidDevice` |
+| Android: select device (name + serial, current Neovim only) | `<leader>uA` / `:UESetAndroidDevice` |
 | Android: install without launch / attach / breakpoint | `<leader>ui` / `:UEDAPAttach` / `F9` |
 | Background tasks: list / stop | `<leader>X` / `:Tasks` / `:TaskStopAll` |
 | All commands cheatsheet | `<leader>?` / `:UECheatsheet` |

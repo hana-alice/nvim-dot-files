@@ -4,7 +4,7 @@
 
 UE Android DAP attach、断点与设备路由的目标行为契约。当前以 host
 LLVM 22.1.6+ `lldb-dap`、device `lldb-server platform`、K30 serial-form URL 为准；
-交互式流程消费会话全局选择的 Android serial，程序化显式 serial 保持最高优先级。
+交互式流程消费当前 Neovim 进程内选择的 Android serial，程序化显式 serial 保持最高优先级。
 ## Requirements
 ### Requirement: device 端用 lldb-server platform 模式
 
@@ -20,7 +20,7 @@ platform server（替代已证伪的 `gdbserver --attach`，后者从不绑定�
 
 ### Requirement: platform 连接使用 K30 serial-form 路线
 
-系统 SHALL 使用已验证的 Android platform-mode serial-form 连接路线建立 attach 会话，不得回退到已证伪的 `gdbserver --attach`。交互式 DAP attach/launch SHALL 优先使用会话全局选择的 `vim.g.ue_android_device_serial`；程序化调用显式传入的 `context.android_serial` / `opts.serial` SHALL 保持最高优先级。选定后，该 serial SHALL 同时用于 `platform connect connect://[<serial>]:<port>` 与本次 session 的全部设备定向 ADB 命令。禁止 localhost / 127.0.0.1 形式与已证伪的 `gdbserver --attach` 路线。
+系统 SHALL 使用已验证的 Android platform-mode serial-form 连接路线建立 attach 会话，不得回退到已证伪的 `gdbserver --attach`。交互式 DAP attach/launch SHALL 优先使用当前 Neovim 进程选择的 `vim.g.ue_android_device_serial`；程序化调用显式传入的 `context.android_serial` / `opts.serial` SHALL 保持最高优先级。选定后，该 serial SHALL 同时用于 `platform connect connect://[<serial>]:<port>` 与本次 session 的全部设备定向 ADB 命令。禁止 localhost / 127.0.0.1 形式与已证伪的 `gdbserver --attach` 路线。
 
 #### Scenario: 用全局 serial-form platform connect 建立连接
 

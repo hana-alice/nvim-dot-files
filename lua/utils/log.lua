@@ -48,9 +48,9 @@
 -- Default threshold: WARN. ERROR/WARN always land; INFO/DEBUG/TRACE are
 -- dropped unless raised via :NvimLogLevel debug or log.set_level("info").
 --
--- File location: <stdpath('log')>/nvim/nvim-debug.log
---   On Windows that resolves to %LOCALAPPDATA%\nvim-data\nvim\nvim-debug.log
---   Backups: nvim-debug.log.1 (newest backup) ... nvim-debug.log.5 (oldest).
+-- File location: <stdpath('log')>/nvim/nvim-debug.<pid>.log
+-- Per-process names prevent two Neovim instances from racing rotation and
+-- writing through stale handles. :NvimLog always opens the current process.
 
 local M = {}
 
@@ -103,6 +103,22 @@ end
 -- vim.uv.fs_* are safe in fast events; vim.fn.* are not. Prefer uv where we can.
 local uv = vim.uv or vim.loop
 
+local function prune_old_process_logs(dir)
+  local scan = uv.fs_scandir(dir)
+  if not scan then return end
+  local cutoff = os.time() - 14 * 86400
+  while true do
+    local name, kind = uv.fs_scandir_next(scan)
+    if not name then break end
+    if kind == "file" and name:match("^nvim%-debug%.%d+%.log%.?%d*$") then
+      local path = join(dir, name)
+      local stat = uv.fs_stat(path)
+      local mtime = stat and stat.mtime and stat.mtime.sec or 0
+      if mtime > 0 and mtime < cutoff then pcall(uv.fs_unlink, path) end
+    end
+  end
+end
+
 local function ensure_dir_uv(dir)
   local stat = uv.fs_stat(dir)
   if stat and stat.type == "directory" then return true end
@@ -142,7 +158,8 @@ local function resolve_path_main()
     dir = join(ok2 and c or ".", "log")
   end
   ensure_dir_uv(dir)
-  resolved_path = join(dir, "nvim-debug.log")
+  prune_old_process_logs(dir)
+  resolved_path = join(dir, ("nvim-debug.%d.log"):format(vim.fn.getpid()))
   return resolved_path
 end
 

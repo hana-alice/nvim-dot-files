@@ -54,3 +54,27 @@ t.describe("workarounds: status 查询", function()
     t.assert_nil(w.status("nonexistent.nonexistent"))
   end)
 end)
+
+t.describe("workarounds: nvim-dap 日志按进程隔离", function()
+  local isolation = require("workarounds.dap.pid_scoped_logs")
+
+  t.it("主日志与 adapter 日志都插入 PID", function()
+    t.assert_eq(isolation._scoped_name_for_test("dap.log", 4242), "dap.4242.log")
+    t.assert_eq(isolation._scoped_name_for_test("dap-codelldb-stderr.log", 4242),
+      "dap-codelldb-stderr.4242.log")
+  end)
+
+  t.it("重复安装不会双重改名", function()
+    local seen = {}
+    local fake = {
+      create_logger = function(name)
+        seen[#seen + 1] = name
+        return name
+      end,
+    }
+    t.assert_true(isolation._install_for_test(fake, 77))
+    t.assert_true(isolation._install_for_test(fake, 77))
+    fake.create_logger("dap.log")
+    t.assert_eq(seen[1], "dap.77.log")
+  end)
+end)

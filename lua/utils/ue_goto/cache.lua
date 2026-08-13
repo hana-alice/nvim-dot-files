@@ -7,11 +7,10 @@
 -- C++ authority boundary in lsp_fallback reuses live compiler TUs instead.
 --
 -- Scoping:
---   * Per-project. Two different UE projects share NO cache entries (same
---     symbol name -> different file in different project trees).
---   * Project key = engine_root resolved by ue.clangd_root(bufnr). If we
---     can't resolve a project root, the cache is silently disabled for that
---     query (still works, just no caching benefit).
+--   * Per-project. Two different UE projects under the same engine share NO
+--     cache entries (same symbol name -> different file in different trees).
+--   * UE projects use ue.project_state's canonical project bucket. Non-UE
+--     roots retain the historical hashed stdpath('data') fallback.
 --
 -- Key design:
 --   * primary_key   = "<receiver>::<symbol>"  when we know the receiver
@@ -32,8 +31,13 @@
 --   Failures are dropped from the cache permanently.
 --
 -- Persistence:
---   ~/AppData/Local/nvim-data/ue_def_cache/<hash8>-<basename>/cache.json
+--   <engine>/.cache/nvim-ue/projects/<project-key>/definition-cache/entries/
+--   Each key is an independent atomic JSON file. This avoids shared-JSON
+--   read/modify/write races entirely; the lease is retained for migration,
+--   pruning, and clear operations.
 --   Debounced writes (2s) to avoid IO storm during burst of gd presses.
+--   Cross-process writes merge under a filesystem lease and replace the JSON
+--   atomically, so two Neovim instances cannot truncate or lose distinct keys.
 --   LRU bounded at 1000 entries.
 --
 -- Invalidation:
@@ -42,6 +46,8 @@
 -- ============================================================================
 
 local M = {}
+
+local file_lock = require("ue.file_lock")
 
 local LRU_MAX        = 1000
 local PERSIST_DEBOUNCE_MS = 2000
@@ -75,9 +81,18 @@ local function hash8(s)
 end
 
 local function project_dir_for(bufnr)
-  local root = project_root_for(bufnr)
-  if not root then return nil, nil end
-  local norm = root:gsub("\\", "/"):gsub("/+$", "")
+  local engine_root = project_root_for(bufnr)
+  if not engine_root then return nil, nil end
+  local ok, project_state = pcall(require, "ue.project_state")
+  if ok then
+    local selection = project_state.current(engine_root)
+    local project_cache = selection and project_state.project_cache_root(engine_root, selection)
+    if project_cache then
+      return project_cache .. "/definition-cache", selection.project_root or engine_root
+    end
+  end
+
+  local norm = engine_root:gsub("\\", "/"):gsub("/+$", "")
   local base = norm:match("([^/]+)$") or "unknown"
   -- sanitize basename for filesystem (drop weird chars)
   base = base:gsub("[^%w%-_.]", "_")
@@ -95,9 +110,11 @@ end
 --   loaded = bool,
 --   dirty = bool,
 --   timer = uv_timer | nil,
+--   pending = { [key] = entry|false }, -- mutations since the last disk merge
 -- }
 -- ---------------------------------------------------------------------------
 local stores = {}
+local read_payload
 
 local function now_s()
   return math.floor((vim.uv or vim.loop).hrtime() / 1e9)
@@ -105,7 +122,9 @@ end
 
 local function ensure_store(pdir)
   if stores[pdir] then return stores[pdir] end
-  stores[pdir] = { data = {}, order = {}, loaded = false, dirty = false, timer = nil }
+  stores[pdir] = {
+    data = {}, order = {}, loaded = false, dirty = false, timer = nil, pending = {},
+  }
   return stores[pdir]
 end
 
@@ -113,26 +132,135 @@ local function load_from_disk(pdir)
   local store = ensure_store(pdir)
   if store.loaded then return store end
   store.loaded = true
-  local path = pdir .. "/cache.json"
-  local f = io.open(path, "r")
-  if not f then return store end
-  local txt = f:read("*a")
-  f:close()
-  if not txt or txt == "" then return store end
-  local ok, decoded = pcall(vim.fn.json_decode, txt)
-  if not ok or type(decoded) ~= "table" then return store end
-  local data = decoded.data or {}
-  local order = decoded.order or {}
-  -- Sanitize: keep only entries that exist in both data and order.
-  local seen = {}
-  for _, k in ipairs(order) do
-    if data[k] and not seen[k] then
-      seen[k] = true
-      table.insert(store.order, k)
-      store.data[k] = data[k]
+  local data = {}
+
+  -- Read the v1 monolithic file for compatibility. The first subsequent
+  -- persist migrates its entries to the v2 per-key representation.
+  local legacy = read_payload(pdir .. "/cache.json")
+  for key, entry in pairs(legacy.data or {}) do data[key] = entry end
+
+  local entries_dir = pdir .. "/entries"
+  if vim.uv.fs_stat(entries_dir) then
+    for name, kind in vim.fs.dir(entries_dir) do
+      if kind == "file" and name:match("%.json$") then
+        local f = io.open(entries_dir .. "/" .. name, "rb")
+        local raw = f and f:read("*a") or nil
+        if f then f:close() end
+        local ok, record = pcall(vim.json.decode, raw or "")
+        if ok and type(record) == "table" and type(record.key) == "string"
+            and type(record.entry) == "table" then
+          data[record.key] = record.entry
+        end
+      end
     end
   end
+  store.data = data
+  for key in pairs(data) do store.order[#store.order + 1] = key end
+  table.sort(store.order, function(a, b)
+    local ae, be = data[a] or {}, data[b] or {}
+    local at = tonumber(ae.last_hit) or tonumber(ae.ts) or 0
+    local bt = tonumber(be.last_hit) or tonumber(be.ts) or 0
+    if at == bt then return a < b end
+    return at > bt
+  end)
   return store
+end
+
+read_payload = function(path)
+  local f = io.open(path, "rb")
+  if not f then return { data = {}, order = {} } end
+  local raw = f:read("*a")
+  f:close()
+  local ok, decoded = pcall(vim.json.decode, raw or "")
+  if not ok or type(decoded) ~= "table" then return { data = {}, order = {} } end
+  decoded.data = type(decoded.data) == "table" and decoded.data or {}
+  decoded.order = type(decoded.order) == "table" and decoded.order or {}
+  return decoded
+end
+
+local function entry_path(pdir, key)
+  return pdir .. "/entries/" .. vim.fn.sha256(key) .. ".json"
+end
+
+local function atomic_write(path, payload)
+  local temp = string.format("%s.tmp.%d.%s", path, vim.fn.getpid(), tostring(vim.uv.hrtime()))
+  local f = assert(io.open(temp, "wb"))
+  f:write(vim.json.encode(payload))
+  f:close()
+  local renamed, rename_err = vim.uv.fs_rename(temp, path)
+  if not renamed then
+    pcall(vim.fn.delete, temp)
+    error(rename_err or ("cannot replace " .. path))
+  end
+end
+
+local function persist_store(pdir, store)
+  local legacy_path = pdir .. "/cache.json"
+  local lease = file_lock.acquire(pdir .. ".writer.lock")
+  if not lease then return false end
+
+  local ok = xpcall(function()
+    pcall(vim.fn.mkdir, pdir .. "/entries", "p")
+    local merged = {}
+    local legacy_exists = vim.uv.fs_stat(legacy_path) ~= nil
+    local legacy = read_payload(legacy_path)
+    for key, entry in pairs(legacy.data) do merged[key] = entry end
+    local entries_dir = pdir .. "/entries"
+    for name, kind in vim.fs.dir(entries_dir) do
+      if kind == "file" and name:match("%.json$") then
+        local f = io.open(entries_dir .. "/" .. name, "rb")
+        local raw = f and f:read("*a") or nil
+        if f then f:close() end
+        local decoded, record = pcall(vim.json.decode, raw or "")
+        if decoded and type(record) == "table" and type(record.key) == "string"
+            and type(record.entry) == "table" then
+          merged[record.key] = record.entry
+        end
+      end
+    end
+    for key, value in pairs(store.pending) do
+      merged[key] = value or nil
+    end
+
+    local order = {}
+    for key in pairs(merged) do order[#order + 1] = key end
+    table.sort(order, function(a, b)
+      local ae, be = merged[a] or {}, merged[b] or {}
+      local at = tonumber(ae.last_hit) or tonumber(ae.ts) or 0
+      local bt = tonumber(be.last_hit) or tonumber(be.ts) or 0
+      if at == bt then return a < b end
+      return at > bt
+    end)
+    local evicted = {}
+    while #order > LRU_MAX do
+      local key = table.remove(order)
+      merged[key] = nil
+      evicted[key] = true
+    end
+
+    -- Write only this process's mutations during steady state. During v1
+    -- migration write the full merged set before retiring cache.json.
+    local writes = legacy_exists and merged or store.pending
+    for key, entry in pairs(writes) do
+      local path = entry_path(pdir, key)
+      if entry then
+        atomic_write(path, { key = key, entry = entry, version = 2 })
+      else
+        pcall(vim.fn.delete, path)
+      end
+    end
+    for key, value in pairs(store.pending) do
+      if value == false then pcall(vim.fn.delete, entry_path(pdir, key)) end
+    end
+    for key in pairs(evicted) do pcall(vim.fn.delete, entry_path(pdir, key)) end
+    pcall(vim.fn.delete, legacy_path)
+    store.data = merged
+    store.order = order
+    store.pending = {}
+    store.dirty = false
+  end, debug.traceback)
+  file_lock.release(lease)
+  return ok
 end
 
 local function schedule_persist(pdir)
@@ -148,11 +276,9 @@ local function schedule_persist(pdir)
     pcall(function() timer:stop(); timer:close() end)
     store.timer = nil
     if not store.dirty then return end
-    store.dirty = false
-    pcall(vim.fn.mkdir, pdir, "p")
-    local payload = vim.fn.json_encode({ data = store.data, order = store.order, version = 1 })
-    local f = io.open(pdir .. "/cache.json", "w")
-    if f then f:write(payload); f:close() end
+    if not persist_store(pdir, store) then
+      schedule_persist(pdir)
+    end
   end))
 end
 
@@ -172,6 +298,7 @@ local function touch(store, key)
   while #store.order > LRU_MAX do
     local victim = table.remove(store.order)
     store.data[victim] = nil
+    store.pending[victim] = false
   end
 end
 
@@ -238,13 +365,16 @@ local function validate_and_filter(store, key, symbol)
   end
   if #kept == 0 then
     store.data[key] = nil
+    store.pending[key] = false
     for i, k in ipairs(store.order) do
       if k == key then table.remove(store.order, i); break end
     end
+    schedule_persist_for_store(store)
     return nil
   end
   if #kept ~= #entry.locations then
     entry.locations = kept
+    store.pending[key] = entry
     schedule_persist_for_store(store)  -- forward decl
   end
   return kept
@@ -270,6 +400,7 @@ function M.get(symbol, receiver, bufnr)
       local kept = validate_and_filter(store, key, symbol)
       if kept then
         store.data[key].last_hit = now_s()
+        store.pending[key] = store.data[key]
         touch(store, key)
         schedule_persist(pdir)
         return kept, key, store.data[key].source
@@ -317,6 +448,7 @@ function M.put(symbol, receiver, locations, source, bufnr)
       ts = ts,
       last_hit = ts,
     }
+    store.pending[key] = store.data[key]
     touch(store, key)
   end
   schedule_persist(pdir)
@@ -327,8 +459,11 @@ function M.clear(bufnr)
   local pdir = project_dir_for(bufnr)
   if not pdir then return false, "no project root" end
   stores[pdir] = nil
-  pcall(vim.fn.delete, pdir .. "/cache.json")
-  return true
+  local lease, err = file_lock.acquire(pdir .. ".writer.lock")
+  if not lease then return false, err end
+  local ok, delete_result = pcall(vim.fn.delete, pdir, "rf")
+  file_lock.release(lease)
+  return ok and delete_result == 0, ok and nil or delete_result
 end
 
 -- Diagnostics: snapshot of current project's cache.
@@ -352,6 +487,18 @@ end
 -- For tests: drop in-memory state without touching disk.
 function M._reset_memory()
   stores = {}
+end
+
+-- For tests: bypass the debounce while exercising cross-process persistence.
+function M._flush_for_test(bufnr)
+  local pdir = project_dir_for(bufnr)
+  if not pdir then return false end
+  local store = ensure_store(pdir)
+  if store.timer then
+    pcall(function() store.timer:stop(); store.timer:close() end)
+    store.timer = nil
+  end
+  return not store.dirty or persist_store(pdir, store)
 end
 
 return M

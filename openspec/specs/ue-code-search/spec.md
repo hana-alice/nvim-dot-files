@@ -63,19 +63,22 @@ csearch 与 cindex-uefilter 的 executable probing SHALL cache only successful e
 - **THEN** 系统 SHALL reset csearch/cindex probe cache
 - **AND** 下一次 `<leader>/` SHALL re-evaluate backend availability
 
-### Requirement: project or engine switch SHALL invalidate project-scoped grep caches
+### Requirement: project or engine switch SHALL select an isolated cache bucket
 
-Project-scoped grep caches SHALL be invalidated when either the project root or engine root changes.
+Project-scoped grep caches SHALL be keyed by canonical project identity beneath the engine cache root.
+Changing project or engine SHALL invalidate only process-local context/probe state and route future work
+to the newly selected bucket; it MUST NOT delete another project's reusable on-disk cache.
 
 #### Scenario: project root changes
-- **WHEN** `UESetProject` records a different project root than the persisted state
-- **THEN** all platform-specific csearch and gtags grep caches for that engine cache root SHALL be invalidated
-- **AND** cdb shard caches tied to the old project SHALL be invalidated
+- **WHEN** `UESetProject` selects a different project root in the current Neovim process
+- **THEN** future csearch/gtags/CDB paths SHALL resolve below the new canonical project bucket
+- **AND** in-memory context and executable probe caches SHALL be reset
+- **AND** the old project's on-disk cache SHALL remain intact
 
 #### Scenario: engine root changes
-- **WHEN** `UESetProject` records the same project root but a different engine root than persisted state
-- **THEN** all project-scoped grep caches SHALL be invalidated
-- **AND** the new `engine_root` SHALL be persisted in state for future comparisons
+- **WHEN** the same project path is selected under a different engine root
+- **THEN** paths SHALL resolve below that engine's own project bucket
+- **AND** the other engine's cache SHALL NOT be used or deleted
 
 ### Requirement: legacy grep caches SHALL migrate without data loss
 
@@ -244,7 +247,7 @@ hash 缓存键：缓存命中时仅 stat 不重算，仅当清单文件被改写
 
 csearch trigram 索引 SHALL 全平台共用一份，路径为 `csearch/csearch.idx`（不再按 `platform_key` 分片）。gtags workspace DB 与 cdb compile-db 资产 SHALL 仍按 `platform_key` 分片——它们是平台相关产物（编译参数 / 宏 / include / 条件编译符号按平台不同）。
 
-理由：csearch 索引的输入文件集（`workspace_all.files`）由 `engine_root` + `project_root` + 平台无关常量（`ENGINE_PICKER_DIRS` / `SCAN_EXCLUDES`）+ 平台无关白名单（`.ueprepare-scan-paths`）决定，不含任何平台维度。per-platform 分片是 cache layout v3.1 让 csearch 搭便车的结果，去之使「索引维度」与「`csearch_input_hash` 校验维度（per-engine_root，本就一份）」对齐，并令切平台不再重建 csearch 索引。
+理由：csearch 索引的输入文件集（`workspace_all.files`）由 `engine_root` + `project_root` + 平台无关常量（`ENGINE_PICKER_DIRS` / `SCAN_EXCLUDES`）+ 平台无关白名单（`.ueprepare-scan-paths`）决定，不含任何平台维度。per-platform 分片是 cache layout v3.1 让 csearch 搭便车的结果，去之使「索引维度」与「`csearch_input_hash` 校验维度（per-project，本就一份）」对齐，并令切平台不再重建 csearch 索引。不同 project 即使共用 engine 仍 MUST 使用不同 project bucket，不能共享该索引。
 
 #### Scenario: 解析 csearch 索引路径
 - **WHEN** 系统为任一平台 / 配置解析 csearch 索引路径

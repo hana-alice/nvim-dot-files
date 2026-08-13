@@ -2,6 +2,7 @@
 -- Extracted verbatim from lua/ue.lua (F1 split phase-1).
 return function(M, core)
   local fs = require("ue.core.fs")
+  local file_lock = require("ue.file_lock")
   local _ufs = fs
   local _uplat = require("utils.platform")
   local RT = core.RT
@@ -20,6 +21,10 @@ return function(M, core)
   local normalize_index_state = core.h.normalize_index_state
 
 M.base_compile_commands_path = function(ctx)
+  local active = ctx.paths and ctx.paths.active_cdb or nil
+  if active and _ufs.is_file(active) then
+    return active
+  end
   local path = fs.join(ctx.engine_root, "compile_commands.json")
   if _ufs.is_file(path) then
     return path
@@ -357,6 +362,15 @@ M.build_phase_async = function(ctx, phase)
     return false, "busy"
   end
 
+  local phase_lease, lease_err = file_lock.acquire(ctx.paths.index_state .. ".build.lock")
+  if not phase_lease then
+    return false, "index artifacts are owned by another Neovim: " .. tostring(lease_err)
+  end
+  local function fail_before_spawn(message)
+    file_lock.release(phase_lease)
+    return false, message
+  end
+
   -- Phase split:
   --   full        → build_full_cdb.py over the complete active CDB.
   --   hot/current → build_clangd_index.py over a prioritized module subset.
@@ -387,7 +401,7 @@ M.build_phase_async = function(ctx, phase)
     save_index_state(ctx, state)
     core.deps.invalidate_status_cache()
     core.deps.refresh_statusline()
-    return false, err
+    return fail_before_spawn(err)
   end
 
   -- Pin to Python 3.12 absolute path on Windows: relying on PATH `python`
@@ -423,7 +437,7 @@ M.build_phase_async = function(ctx, phase)
     build_script = tools_dir .. "/build_clangd_index.py"
   end
   if not _ufs.is_file(build_script) then
-    return false, build_script .. " not found"
+    return fail_before_spawn(build_script .. " not found")
   end
 
   local _, out_idx = M.index_phase_paths(ctx, phase)
@@ -558,6 +572,7 @@ M.build_phase_async = function(ctx, phase)
       end
       core.deps.invalidate_status_cache()
       core.deps.refresh_statusline()
+      file_lock.release(phase_lease)
       M.try_start_queued_build()
     end)
   end)

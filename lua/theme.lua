@@ -76,8 +76,12 @@ local function read_state()
 end
 
 local function write_state(name)
-  vim.fn.mkdir(vim.fn.fnamemodify(state_path(), ":h"), "p")
-  vim.fn.writefile({ name }, state_path())
+  local path = state_path()
+  vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
+  local temp = path .. (".tmp.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
+  vim.fn.writefile({ name }, temp)
+  local ok = vim.uv.fs_rename(temp, path)
+  if not ok then pcall(os.remove, temp) end
 end
 
 local function theme_names()

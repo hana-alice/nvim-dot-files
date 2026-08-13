@@ -474,6 +474,7 @@ local tabs = {
           { "<leader>ud",   "Diagnostics" },
           { "<leader>us",   "Spelling" },
           { "<leader>uw",   "Word wrap" },
+          { "<leader>uW",   "Name system window title" },
           { "<leader>uh",   "Inlay hints" },
           { "<leader>uG",   "Git signs" },
           { "<leader>uT",   "Treesitter" },

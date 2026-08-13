@@ -641,7 +641,7 @@ wrapper with the plain `<cmd>...<cr>` form.
 ## 🎨 UI / Toggles
 
 Source: `lua/plugins/zen-mode.lua` (`<leader>z`),
-`lua/config/keymaps.lua` (`<leader>ut`, `<leader>uC`, `<leader>?`).
+`lua/config/keymaps.lua` (`<leader>ut`, `<leader>uC`, `<leader>uW`, `<leader>?`).
 
 Theme picker、命令补全和直接设置统一只暴露以下 6 个 canonical name：
 `monokai_ristretto`、`rider-light`、`ubuntu-terminal`、`unokai`、`catppuccin`、
@@ -659,6 +659,9 @@ Theme picker、命令补全和直接设置统一只暴露以下 6 个 canonical 
 | `<leader>ud`     | Toggle diagnostics (LazyVim)            |
 | `<leader>us`     | Toggle spelling (LazyVim)               |
 | `<leader>uw`     | Toggle word wrap (LazyVim)              |
+| `<leader>uW`     | Name this Neovim/Neovide system window  |
+| `:WindowTitle [name]` | Prompt for / directly set the window title |
+| `:WindowTitle!` / `:WindowTitleReset` | Restore Neovim's automatic title |
 | `<leader>uh`     | Toggle inlay hints (LazyVim)            |
 | `<leader>uG`     | Toggle git signs (LazyVim)              |
 | `<leader>uT`     | Toggle treesitter (LazyVim)             |

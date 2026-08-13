@@ -37,6 +37,7 @@
 --   M.setup()                     -- install :UEProbe* commands
 
 local M = {}
+local file_lock = require("ue.file_lock")
 
 local DEFAULT_ARM_DAYS = 14
 local DEFAULT_MAX_RECORDS = 200
@@ -46,6 +47,8 @@ local SAVE_DEBOUNCE_MS = 2000
 local state = {
   loaded = false,
   data = nil,      -- { version=1, topics={ [t]={armed_until,max_records,records={ [k]={count,first,last,data} }} } }
+  base = nil,      -- disk snapshot used to turn local counts into deltas
+  topic_updates = {},
   save_timer = nil,
   path_override = nil, -- test seam
 }
@@ -115,20 +118,82 @@ local function load()
   if ok and type(decoded) == "table" and type(decoded.topics) == "table" then
     state.data = compact_store(decoded)
   end
+  state.base = vim.deepcopy(state.data)
 end
 
+local schedule_save
 local function save_now()
   if not state.data then return end
   compact_store(state.data)
   local p = probe_path()
   local dir = vim.fn.fnamemodify(p, ":h")
   if vim.fn.isdirectory(dir) == 0 then vim.fn.mkdir(dir, "p") end
-  local tmp = p .. ".tmp"
-  local f = io.open(tmp, "w")
-  if not f then return end
-  f:write(vim.json.encode(state.data))
+  local lease = file_lock.acquire(p .. ".lock")
+  if not lease then schedule_save(25); return end
+
+  local latest = empty_store()
+  local source = io.open(p, "rb")
+  if source then
+    local ok, decoded = pcall(vim.json.decode, source:read("*a") or "")
+    source:close()
+    if ok and type(decoded) == "table" and type(decoded.topics) == "table" then latest = decoded end
+  end
+  local base = state.base or empty_store()
+  for topic, local_topic in pairs(state.data.topics or {}) do
+    local disk_topic = latest.topics[topic]
+    if not disk_topic then
+      disk_topic = { records = {} }
+      latest.topics[topic] = disk_topic
+    end
+    disk_topic.records = disk_topic.records or {}
+    local base_topic = (base.topics or {})[topic] or { records = {} }
+    for key, local_record in pairs(local_topic.records or {}) do
+      local base_record = (base_topic.records or {})[key] or {}
+      local delta = math.max(0, (local_record.count or 0) - (base_record.count or 0))
+      if delta > 0 then
+        local disk_record = disk_topic.records[key] or {
+          count = 0, first = local_record.first, last = 0,
+        }
+        disk_record.count = (disk_record.count or 0) + delta
+        disk_record.first = math.min(disk_record.first or local_record.first, local_record.first or now())
+        if (local_record.last or 0) >= (disk_record.last or 0) then
+          disk_record.last = local_record.last
+          disk_record.data = local_record.data
+        end
+        disk_topic.records[key] = disk_record
+      end
+    end
+    if not latest.topics[topic].max_records then
+      latest.topics[topic].max_records = local_topic.max_records
+    end
+    if not latest.topics[topic].armed_until then
+      latest.topics[topic].armed_until = local_topic.armed_until
+    end
+  end
+  for topic in pairs(state.topic_updates) do
+    local local_topic = state.data.topics[topic]
+    if local_topic then
+      latest.topics[topic] = latest.topics[topic] or { records = {} }
+      latest.topics[topic].armed_until = local_topic.armed_until
+      latest.topics[topic].max_records = local_topic.max_records
+    end
+  end
+  compact_store(latest)
+
+  local tmp = p .. (".tmp.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
+  local f = io.open(tmp, "wb")
+  if not f then file_lock.release(lease); return end
+  f:write(vim.json.encode(latest))
+  f:flush()
   f:close()
-  pcall(vim.uv.fs_rename, tmp, p)
+  local replaced = vim.uv.fs_rename(tmp, p)
+  if not replaced then pcall(os.remove, tmp) end
+  file_lock.release(lease)
+  if replaced then
+    state.data = latest
+    state.base = vim.deepcopy(latest)
+    state.topic_updates = {}
+  end
 end
 
 local function cancel_save_timer()
@@ -138,13 +203,13 @@ local function cancel_save_timer()
   state.save_timer = nil
 end
 
-local function schedule_save()
+schedule_save = function(delay_ms)
   -- One-shot debounce; always stop+close the previous timer (F5 lesson).
   cancel_save_timer()
   local timer = vim.uv.new_timer()
   if not timer then save_now(); return end
   state.save_timer = timer
-  timer:start(SAVE_DEBOUNCE_MS, 0, vim.schedule_wrap(function()
+  timer:start(delay_ms or SAVE_DEBOUNCE_MS, 0, vim.schedule_wrap(function()
     if state.save_timer == timer then
       pcall(function() timer:stop() end)
       pcall(function() timer:close() end)
@@ -171,13 +236,18 @@ function M.arm(topic, opts)
   local t = topic_of(state.data, topic, true)
   t.armed_until = now() + (opts.days or DEFAULT_ARM_DAYS) * 86400
   if opts.max_records then t.max_records = opts.max_records end
+  state.topic_updates[topic] = true
   schedule_save()
 end
 
 function M.sleep(topic)
   load()
   local t = state.data.topics[topic]
-  if t then t.armed_until = nil; schedule_save() end
+  if t then
+    t.armed_until = nil
+    state.topic_updates[topic] = true
+    schedule_save()
+  end
 end
 
 function M.is_armed(topic)
@@ -196,6 +266,7 @@ function M.record(topic, key, data)
   else
     -- First-ever record auto-arms the topic (proactive by default).
     t = topic_of(state.data, topic, true)
+    state.topic_updates[topic] = true
   end
   key = tostring(key or "?")
   local r = t.records[key]
@@ -210,6 +281,7 @@ function M.record(topic, key, data)
     for _ in pairs(t.records) do n = n + 1 end
     if n >= (t.max_records or DEFAULT_MAX_RECORDS) then
       t.armed_until = nil
+      state.topic_updates[topic] = true
       t.records["_overflow"] = t.records["_overflow"]
         or { count = 0, first = now(), last = now(), data = "max_records hit; topic slept" }
       t.records["_overflow"].count = t.records["_overflow"].count + 1
@@ -326,6 +398,8 @@ function M._set_path_for_test(p)
   state.path_override = p
   state.loaded = false
   state.data = nil
+  state.base = nil
+  state.topic_updates = {}
 end
 function M._flush_for_test()
   cancel_save_timer()

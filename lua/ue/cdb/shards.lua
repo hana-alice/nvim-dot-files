@@ -132,7 +132,7 @@ local function manifest_path(shards_dir)
 end
 
 function M.shards_dir(ctx)
-  return fs.join(ctx.paths.index_cdb_dir, "shards")
+  return ctx.paths.cdb_shards_dir or fs.join(ctx.paths.index_cdb_dir, "shards")
 end
 
 function M.shard_path(ctx, key)
@@ -152,10 +152,24 @@ end
 
 local function write_json(path, value)
   fs.ensure_dir(fs.dirname(path))
-  local f = io.open(path, "wb")
-  if not f then return false, "cannot open " .. path end
-  f:write(vim.json.encode(value))
+  local raw = vim.json.encode(value)
+  local current = io.open(path, "rb")
+  if current then
+    local old = current:read("*a")
+    current:close()
+    if old == raw then return true end
+  end
+  local temp = path .. (".tmp.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
+  local f = io.open(temp, "wb")
+  if not f then return false, "cannot open " .. temp end
+  f:write(raw)
+  f:flush()
   f:close()
+  local ok, err = vim.uv.fs_rename(temp, path)
+  if not ok then
+    pcall(os.remove, temp)
+    return false, err or ("cannot replace " .. path)
+  end
   return true
 end
 

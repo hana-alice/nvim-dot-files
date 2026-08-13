@@ -740,9 +740,10 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `<leader>up`              | `:UEPaths` (show UE paths)          |
 | `<leader>?`               | `:UECheatsheet` (open this cheatsheet) |
 
-Android 选择写入当前 Neovim 会话的全局变量
+Android 选择写入当前 Neovim **进程内**的全局变量
 `vim.g.ue_android_device_serial`。APK install、launch、logcat 与 DAP 随后都显式使用
-`adb -s <serial>`；切换设备时再次执行 `<leader>uA`。该值不会跨 Neovim 重启持久化。
+`adb -s <serial>`；切换设备时再次执行 `<leader>uA`。该值既不会跨 Neovim 重启持久化，
+也不会影响同时运行的另一个 Neovim 实例。
 
 ### Less-common UE commands
 

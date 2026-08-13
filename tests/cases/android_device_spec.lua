@@ -5,6 +5,23 @@ t.bootstrap()
 
 local devices = require("utils.android_device")
 
+t.describe("utils.android_device: process isolation", function()
+  t.it("selection is session-local and is not persisted", function()
+    devices.clear()
+    assert(devices.set("INSTANCE-A"))
+    local result = vim.system({
+      vim.v.progpath, "--headless", "-u", "NONE",
+      "--cmd", "set rtp+=" .. vim.fn.stdpath("config"),
+      "-c", [[lua print(tostring(require("utils.android_device").get()))]],
+      "-c", "qa!",
+    }, { text = true }):wait()
+    t.assert_eq(result.code, 0, result.stderr)
+    t.assert_contains((result.stdout or "") .. (result.stderr or ""), "nil")
+    t.assert_eq(devices.get(), "INSTANCE-A")
+    devices.clear()
+  end)
+end)
+
 local SAMPLE = table.concat({
   "List of devices attached",
   "SERIAL-001 device product:husky model:Pixel_8 device:husky transport_id:1",
@@ -38,7 +55,7 @@ t.describe("utils.android_device: adb devices -l", function()
   end)
 end)
 
-t.describe("utils.android_device: session-global picker", function()
+t.describe("utils.android_device: current-process picker", function()
   t.it("即使只有一台 ready device 也打开 picker，选择后写 vim.g", function()
     devices.clear()
     local picker_calls, label, selected = 0, nil, nil
@@ -157,7 +174,7 @@ t.describe("utils.android_device: adb argv", function()
   end)
 end)
 
-t.describe("ue.dap.android: global serial precedence", function()
+t.describe("ue.dap.android: process-local serial precedence", function()
   local android = require("ue.dap.android")
 
   t.it("显式 context/opts > 全局选择；缺值时不猜 last session", function()

@@ -1,5 +1,6 @@
 -- Shared Android device selection for every adb-backed UE workflow.
--- The selected serial is intentionally session-global (vim.g), not persisted.
+-- The selected serial is intentionally Neovim-process-local (vim.g), not
+-- persisted. `vim.g` is not shared between two Neovim OS processes.
 
 local M = {}
 
@@ -204,7 +205,7 @@ function M.select(opts, done)
   end)
 end
 
----Use the explicit session-global selection, or ask once and persist the choice.
+---Use the explicit process-local selection, or ask once for this process.
 function M.ensure(opts, done)
   opts = opts or {}
   done = done or function() end

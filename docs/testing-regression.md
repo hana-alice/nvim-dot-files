@@ -18,6 +18,7 @@
 | `lua/utils/android_device.lua` / Android ADB device 路由 | `android_device` `dap` `ue_context` |
 | `lua/ue/config.lua`（schema） | `ue_config` `smoke` |
 | `lua/ue.lua` 项目选择 / context 解析 | `ue_project_context` `ue_api` `smoke` |
+| `lua/ue/project_state.lua` / `lua/ue/file_lock.lua` / 共享持久状态 | `multi_instance_state` |
 | `lua/ue/cdb/**` | `ue_cdb` |
 | `lua/ue/dap/**` / `lua/utils/platform/**` | `dap` `platform` |
 | `lua/ue/index/**` / `lua/ue/clangd_commands.lua` / controlled CDB generators | `index_generation` `cpp_semantic_index` `clangd_commands` `ue_api` |
@@ -88,7 +89,8 @@ tests/
 ├── harness/init.lua     # 纯 Lua 框架：断言 + describe/it + 报告 + 自举
 └── cases/
     ├── smoke_spec.lua            # 配置加载冒烟 + ue.setup() 命令注册
-    ├── android_device_spec.lua   # Android device picker + 全局 serial + adb -s 路由
+    ├── android_device_spec.lua   # Android device picker + 进程内 serial + adb -s 路由
+    ├── multi_instance_state_spec.lua # 项目/target 隔离 + 跨进程原子/merge/lease
     ├── platform_spec.lua         # utils.platform 四驱动接口契约
     ├── ue_api_spec.lua           # ue 公共表/函数冻结
     ├── ue_config_spec.lua        # ue.config schema 默认值/override/reset
@@ -115,7 +117,8 @@ tests/
 | 功能域 | 用例文件 | 覆盖口径 |
 |--------|----------|----------|
 | 配置加载 | smoke_spec | 关键模块 require + setup 不报错 |
-| Android device | android_device_spec | `adb devices -l` 解析、名称+serial picker、全局 serial、install/launch/logcat/DAP `-s` 路由 |
+| Android device | android_device_spec | `adb devices -l` 解析、名称+serial picker、进程内 serial、install/launch/logcat/DAP `-s` 路由 |
+| 多实例状态 | multi_instance_state_spec | live selection 隔离、project bucket、target 原子对、共享集合 merge、writer lease |
 | 平台驱动 | platform_spec | 四驱动接口形状一致 |
 | ue API | ue_api_spec | 公共表/函数冻结 |
 | ue.config | ue_config_spec | 默认值/override/reset |

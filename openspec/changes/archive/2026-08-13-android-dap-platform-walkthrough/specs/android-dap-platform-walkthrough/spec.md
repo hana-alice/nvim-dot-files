@@ -2,7 +2,7 @@
 
 ### Requirement: 真机验证收窄的连接组合
 
-系统 SHALL 在 a3ad86f3 上验证 "纯 listen gdbserver + 结构化 `gdb-remote-port` +
+系统 SHALL 在 `<test-device>` 上验证 "纯 listen gdbserver + 结构化 `gdb-remote-port` +
 attachCommands `process attach --pid`" 组合能否端到端到 `threads`，并据此定最终连接方案。
 
 #### Scenario: 收窄组合到 threads
@@ -48,14 +48,14 @@ attachCommands `process attach --pid`" 组合能否端到端到 `threads`，并�
 
 ### Requirement: 环境与设备约束
 
-系统 SHALL 仅在 a3ad86f3 验证，host adapter 维持 22.1.6+，且不把 device serial 写死进
+系统 SHALL 仅在 `<test-device>` 验证，host adapter 维持 22.1.6+，且不把 device serial 写死进
 probe/运行时逻辑（测试机重连后 serial 会变）。
 
 #### Scenario: clean env + 动态 serial
 
 - **WHEN** 执行任何真机 probe
 - **THEN** 先 `am force-stop` + 重启 app 取新 pid，用随机 host 端口，结束必清理 host lldb-dap + device lldb-server + forward
-- **AND** serial 动态取当前在线设备，不硬编码字面量到逻辑（验证范围仍限 a3ad86f3）
+- **AND** serial 动态取当前在线设备，不硬编码字面量到逻辑（验证范围仍限 `<test-device>`）
 
 ### Requirement: 最终方案文档化
 

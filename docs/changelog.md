@@ -56,6 +56,77 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-08-13 — 隔离多 Neovim 实例的 UE 状态与共享 writer
+
+**Task**
+
+审计当前配置中 process-global / project-scoped / user-global 状态，修复两个 Neovim 同时使用
+同一 engine 时可能发生的项目/平台串扰、共享 JSON 丢更新与 cache writer 竞争。
+
+**Implemented**
+
+- 新增 `lua/ue/project_state.lua`：live project 与 target 捕获在当前 Neovim 进程；
+  `selection.json` 只作为未来进程的启动默认；持久状态按 canonical uproject path 分 bucket，
+  target platform/configuration 作为原子 pair，旧顶层 state 只读迁移。
+- 新增 `lua/ue/file_lock.lua`：PID/token owner 的 filesystem lease、live-owner 拒绝、stale-owner
+  回收与 token-checked release；UEPrepare、CDB pipeline、csearch、controlled semantic-index phase
+  均增加跨进程 single-writer 门禁。
+- `lua/ue.lua` / `ue.cdb.*` 将 active CDB、index scheduler/controlled CDB、clangd index/PCH
+  放入 canonical project + platform 路径；CDB shard catalog 仅在同 project 内跨平台共享；
+  project switch 只切换 live bucket，保留旧缓存。
+- Android device 明确为当前 Neovim 进程内 `vim.g`；新增独立 child-process 回归，证明一个实例
+  的 `:UESetAndroidDevice` 不会修改另一个实例。
+- breakpoint persistence 改为 canonical project bucket，并在 lease 内合并当前打开 buffer 的改动；
+  definition cache 改为 per-key atomic JSON，避免 shared monolithic JSON RMW 丢 key。
+- probe、recent projects、watch dirty overlay 改为 lease 下重读+merge+atomic replace；csearch 成功后
+  只退役 build-start captured dirty，保留其他实例新增或 build 期间再次修改的路径；
+  `:UEPrepare!` 不再在 rebuild 成功前预清 dirty evidence。
+- debug/grep/DAP protocol 日志改为 PID 路径；UE job log 增加 PID+hrtime；AI context 双文件导出
+  由 lease 保护；content-addressed libclang cursor shim 先编译到 PID 临时文件再原子发布。
+- 复扫发现 nvim-dap 上游 logger 仍以 `w+` 打开固定 `dap*.log`；新增
+  `workarounds.dap.pid_scoped_logs` 在 dap 加载前统一插入 PID，`:UEDAPDiag` 改读当前
+  PID 的 nvim-dap / protocol / breakpoint 诊断日志。
+- 新增 `openspec/specs/multi-instance-state-isolation/spec.md`，同步约束、架构、测试映射、Android
+  device/UE search 主规格与中英文使用文档。
+- OpenSpec main specs 已直接同步当前实现。两个旧 active change 未污染主规格：
+  `android-dap-platform-walkthrough` 保留已被证伪路线的未完成任务，
+  `add-architecture-boundary-regression` 保留未拍板的 DRAFT；两者脱敏后归档到
+  `openspec/changes/archive/2026-08-13-*`，均明确记录为 archive-without-sync。
+
+**Pitfalls / Gotchas**
+
+- `vim.g` 只在一个 Neovim OS process 内“全局”，不会跨实例；真正的串扰来自旧的 engine 顶层
+  `state.json` 和共享 cache 文件，而不是 `vim.g.ue_android_device_serial`。
+- 单次并发测试曾复现偶发丢 key，复跑变绿不能证明修复；definition cache 最终改为一 key 一文件，
+  5 轮连续 8-writer 压测才稳定全绿。
+- 只给最终 JSON 做 atomic rename 不能阻止 stale read-modify-write；共享集合必须在 lease 内重读并
+  merge，独立字段/key 则应从结构上拆文件。
+- csearch 增量路径旧实现先写固定 `csearch_incremental.txt` 再拿 writer slot，失败实例可能删除
+  正在被另一实例读取的清单；现在顺序固定为先拿跨进程 lease，再生成唯一临时清单。
+- 只扫自己写的日志不够；nvim-dap 的固定路径由上游 logger 内部生成，需在
+  `require('dap')` 之前改写 logger filename，否则首次 `w+` 已经造成截断。
+
+**Validation**
+
+- 并发：`multi_instance_state` 11/11 passed；其中 definition-cache 8 writers 连跑 5 轮均通过，
+  project/target/probe/recent/dirty/lease child-process 用例全绿。
+- 定向：`grep_cache` 27/27、`ue_watch_csearch` 13/13、`csearch_build_guard` 21/21、
+  `ue_cdb` 17/17、`index_generation` 16/16、`android_device` 14/14、`dap` 56/56、
+  `ue_project_context` 7/7、`ue_context` 3/3、`ue_api` 54/54、`smoke` 18/18、
+  `utils` 46/46、`probe` 19/19、`theme` 11/11、`cpp_semantic_sidecar` 15/15、`structure` 38/38。
+- 静态/规格：`lint_no_bare_globals` 119 files OK；5 个受影响 OpenSpec main specs strict validation
+  均 valid；`git diff --check` passed。
+- nvim-dap 真实加载实验：`dap.log.create_logger('dap.log'):get_path()` 返回
+  `.../dap.<pid>.log`；`workarounds` 15/15、`dap` 56/56、`smoke` 18/18 passed。
+- OpenSpec：当前五个受影响 main specs strict validation 均 valid；归档前
+  `android-dap-platform-walkthrough` strict valid；`add-architecture-boundary-regression` 按其
+  DRAFT 状态保留“无 delta section”验证失败，未伪造完成状态。
+- 全量：`nvim --headless -l tests/run.lua` 806/806 passed。
+
+**Follow-ups**
+
+- 无。
+
 ### 2026-08-13 — 为当前 Neovim 窗口设置会话名称
 
 **Task**

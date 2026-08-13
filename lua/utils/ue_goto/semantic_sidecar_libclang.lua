@@ -494,15 +494,31 @@ end
 
 local function compile_cursor_shim(compiler, source, output)
   local driver = platform.driver()
+  local staged = output .. (".tmp.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
   local cmd
   if driver.id == "windows" then
-    cmd = { compiler, "-shared", "-O2", "-std=c11", source, "-o", output }
+    cmd = { compiler, "-shared", "-O2", "-std=c11", source, "-o", staged }
   elseif driver.id == "macos" then
-    cmd = { compiler, "-dynamiclib", "-O2", "-std=c11", source, "-o", output }
+    cmd = { compiler, "-dynamiclib", "-O2", "-std=c11", source, "-o", staged }
   else
-    cmd = { compiler, "-shared", "-fPIC", "-O2", "-std=c11", source, "-o", output }
+    cmd = { compiler, "-shared", "-fPIC", "-O2", "-std=c11", source, "-o", staged }
   end
-  return vim.system(cmd, { text = true }):wait()
+  local result = vim.system(cmd, { text = true }):wait()
+  if result.code ~= 0 then
+    pcall(vim.fn.delete, staged)
+    return result
+  end
+  local replaced, replace_err = vim.uv.fs_rename(staged, output)
+  if not replaced then
+    pcall(vim.fn.delete, staged)
+    -- Another process may have completed the identical content-addressed
+    -- build first. Its proven output is safe to reuse.
+    if not M.file_exists(output) then
+      result.code = 1
+      result.stderr = tostring(result.stderr or "") .. "\natomic publish failed: " .. tostring(replace_err)
+    end
+  end
+  return result
 end
 
 function M.ensure_cursor_shim(toolchain)

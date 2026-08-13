@@ -27,7 +27,7 @@ local MODULE_REVISION = "contextual-clang-v2"
 local TRACE_MAX = 200
 local trace_ring = {}
 local trace_idx = 0
-local DISK_LOG = vim.fn.stdpath("cache") .. "/ue_def_trace.log"
+local DISK_LOG = vim.fn.stdpath("cache") .. ("/ue_def_trace.%d.log"):format(vim.fn.getpid())
 
 pcall(function()
   local f = io.open(DISK_LOG, "w")

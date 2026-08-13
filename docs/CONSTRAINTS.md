@@ -456,6 +456,26 @@
   → `docs/architecture-symbol-resolution.md`;
     `openspec/changes/make-cpp-gd-semantically-complete/`
 
+- **K43 — 把“会话全局”和磁盘全局混为一谈 → 多实例串项目 / 丢状态 / 撕裂缓存**
+  症状: 两个 Neovim 指向同一 engine 时，旧的顶层 `state.json` 让后写实例改变另一个实例的
+  project/platform；共享 JSON 的无锁 read-modify-write 丢字段；两个 prepare/cindex writer
+  争用同一输出；固定日志名互相 truncate/rotate。
+  解决: `vim.g` 只作为**当前 Neovim 进程**状态；project/platform 选择在进程内捕获，
+  `selection.json` 只给未来进程提供启动默认值；持久数据按 canonical project path 分桶，
+  platform-sensitive CDB/clangd 产物再按 platform 分桶；独立字段/definition cache 使用原子
+  per-key 文件，共享集合用 lease 下 merge，prepare/CDB/csearch 用跨进程 writer lease，诊断日志
+  带 PID。旧顶层 state 只读迁移，禁止继续作为写入真相。
+  → `lua/ue/project_state.lua`; `lua/ue/file_lock.lua`;
+    `openspec/specs/multi-instance-state-isolation/spec.md`
+
+- **K50 — nvim-dap 固定 `dap*.log` 且以 `w+` 打开 → 两实例互相截断调试证据**
+  症状: 自定义 UE 日志已按 PID 分路，但 nvim-dap 上游 `dap.log.create_logger()` 仍在
+  首次创建时直接 `io.open(stdpath('cache')/<name>, 'w+')`，同时调试的第二个 Neovim
+  会清空第一个的 main/stdout/stderr log。
+  解决: `workarounds.dap.pid_scoped_logs` 必须在 `require('dap')` 前安装，统一将
+  `*.log` 改写为 `*.<pid>.log`；`:UEDAPDiag` 只读当前 PID 的真实路径。
+  → `lua/workarounds/dap/pid_scoped_logs.lua`; `lua/plugins/dap.lua`
+
 ### grep 缓存 / csearch 失效
 
 - **K26 — csearch 负探测被永久缓存 → `<leader>/` 静默搜不全**
@@ -470,13 +490,13 @@
   → `docs/architecture/grep-cache-invalidation.md`; `lua/utils/code_search/init.lua`;
     `lua/ue.lua` cached_grep / finalize_after_csearch; `lua/plugins/snacks.lua` ue_project_grep
 
-- **K27 — 切平台/换引擎后 grep 缓存不失效**
+- **K27 — 切项目/平台后 grep 缓存维度错误**
   症状: `UESetPlatform` 走 fast-swap 只 flip cdb shard，csearch/workspace_all 原封不动；
   `UESetProject` 换引擎（engine_root 未持久化）时 engine 维度判不出"变了"。
-  解决: csearch/workspace_all **按平台+配置分路径**（`cache_paths(root, platform_key)`，
-  key 同源 `shards` 平台维度），切平台落不同目录、旧平台保留、不删重来；旧单一路径
-  首次按当前平台 **自动 move 迁移**（`migrate_legacy_csearch_if_needed`）。
-  `engine_root` 持久化进 state.json，`set_project` 比对 project+engine 任一变即失效全平台。
+  解决: canonical project path 是第一层缓存维度；不同 project（即使共用 engine 或同名）
+  落不同 bucket。csearch/workspace_all 在**同一 project 内平台无关**，切平台复用；gtags 与
+  CDB/clangd/PCH 在 project bucket 内继续按 platform+configuration 分片。切项目只切换活跃
+  bucket 并保留旧项目缓存，不删除、不把旧 project 的状态带入当前进程。
   → `docs/architecture/grep-cache-invalidation.md`; `lua/ue.lua` cache_paths /
     platform_key_from_state / invalidate_project_scoped_cache / set_platform
 

@@ -148,6 +148,45 @@ t3.describe("ue_watch: persistent_dirty cap 打满可见（F2）", function()
       t3.assert_false(st.capped)
     end)
   end)
+
+  t3.it("完成增量索引只移除 covered snapshot，保留并发新增 dirty", function()
+    with_tmp_dirty(function()
+      local path = watch.persistent_dirty_status().path
+      watch._seed_persistent_dirty_for_test({ "D:/z/a.cpp", "D:/z/b.cpp" })
+      watch._save_persistent_dirty_for_test()
+      vim.fn.writefile({ vim.json.encode({ "D:/z/a.cpp", "D:/z/b.cpp", "D:/z/c.cpp" }) }, path)
+      t3.assert_true(watch.remove_persistent_dirty({ "D:/z/a.cpp" }, "test:covered"))
+      local decoded = vim.json.decode(table.concat(vim.fn.readfile(path), "\n"))
+      local seen = {}
+      for _, item in ipairs(decoded) do seen[item:lower()] = true end
+      t3.assert_false(seen["d:/z/a.cpp"] == true)
+      t3.assert_true(seen["d:/z/b.cpp"] == true)
+      t3.assert_true(seen["d:/z/c.cpp"] == true)
+    end)
+  end)
+
+  t3.it("同一路径在 build 开始后再次修改时继续保持 dirty", function()
+    with_tmp_dirty(function()
+      local dir = vim.fn.fnamemodify(watch.persistent_dirty_status().path, ":h")
+      local old_path = dir .. "/old.cpp"
+      local changed_path = dir .. "/changed.cpp"
+      vim.fn.writefile({ "old" }, old_path)
+      vim.fn.writefile({ "changed" }, changed_path)
+      local started_at = os.time()
+      vim.uv.fs_utime(old_path, started_at - 10, started_at - 10)
+      vim.uv.fs_utime(changed_path, started_at, started_at)
+      watch._seed_persistent_dirty_for_test({ old_path, changed_path })
+      watch._save_persistent_dirty_for_test()
+      t3.assert_true(watch.remove_persistent_dirty(
+        { old_path, changed_path }, "test:mtime-guard", started_at))
+      local decoded = vim.json.decode(table.concat(vim.fn.readfile(
+        watch.persistent_dirty_status().path), "\n"))
+      local seen = {}
+      for _, item in ipairs(decoded) do seen[item:lower()] = true end
+      t3.assert_false(seen[old_path:lower()] == true)
+      t3.assert_true(seen[changed_path:lower()] == true)
+    end)
+  end)
 end)
 
 -- ── Windows metadata-event flood guard ─────────────────────────────────────

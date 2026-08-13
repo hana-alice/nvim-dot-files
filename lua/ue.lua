@@ -19,6 +19,9 @@ local CORE_RT = {
   dirty_index_roots = {},
   engine_root_cache = {}, -- dir -> engine_root (or false)
   context_cache = {}, -- key -> { ctx, ts }
+  project_state = require("ue.project_state"),
+  file_lock = require("ue.file_lock"),
+  prepare_lease = nil,
 }
 -- ── Trace API (permanently no-op) ────────────────────────────────────────
 -- These were used during :UEPrepare main-thread blocking diagnosis. The
@@ -679,13 +682,18 @@ function M.clangd_cmd(root_dir)
     "--query-driver=**/clang*.exe,**/clang*,**/gcc,**/g++,**/cc,**/c++,**/cl.exe",
   }
 
-  -- Point clangd to the engine root's compile_commands.json explicitly.
-  -- Without this, clangd searches from the file's directory upward and may
-  -- find a stale copy or miss the one we maintain at the engine root.
+  -- Point clangd at this process's project+platform CDB bucket. Without an
+  -- explicit directory clangd may discover a different Neovim instance's
+  -- legacy engine-root compile_commands.json.
   if root_dir and root_dir ~= "" then
     local engine_root = find_engine_root(root_dir)
     if engine_root then
-      local cc_path = join(engine_root, "compile_commands.json")
+      local state = CORE_RT.project_state.read(engine_root)
+      local plat = trim(state.target_platform or "")
+      local conf = trim(state.target_configuration or ""):gsub(" Editor$", "")
+      local platform_key = plat ~= "" and (conf ~= "" and (plat .. "-" .. conf) or plat) or nil
+      local scoped_paths = cache_paths(engine_root, platform_key)
+      local cc_path = scoped_paths.active_cdb
       local cc_mtime = 0
       if _ufs.is_file(cc_path) then
         local st = vim.uv.fs_stat(cc_path)
@@ -699,13 +707,13 @@ function M.clangd_cmd(root_dir)
       -- the generated CDB only while it is at least as fresh as the active CDB.
       -- Canonical-USR destination lookup additionally uses these same proven
       -- module AST contexts, so correctness does not depend on queue timing.
-      local semantic_cdb = cache_paths(engine_root).semantic_cdb
+      local semantic_cdb = scoped_paths.semantic_cdb
       local semantic_stat = _ufs.is_file(semantic_cdb) and vim.uv.fs_stat(semantic_cdb) or nil
       local semantic_mtime = semantic_stat and semantic_stat.mtime and semantic_stat.mtime.sec or 0
       if semantic_mtime > 0 and (cc_mtime == 0 or semantic_mtime >= cc_mtime) then
         table.insert(cmd, "--compile-commands-dir=" .. vim.fs.dirname(semantic_cdb))
       elseif _ufs.is_file(cc_path) then
-        table.insert(cmd, "--compile-commands-dir=" .. engine_root)
+        table.insert(cmd, "--compile-commands-dir=" .. vim.fs.dirname(cc_path))
       end
     end
   end
@@ -795,13 +803,27 @@ end
 
 local function write_all(path, content)
   _ufs.ensure_dir(_ufs.dirname(path))
-  local file, err = io.open(path, "wb")
+  local existing = io.open(path, "rb")
+  if existing then
+    local current = existing:read("*a")
+    existing:close()
+    if current == content then return true end
+  end
+  local temp = path .. (".tmp.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
+  local file, err = io.open(temp, "wb")
   if not file then
     require("utils.log").notify_error("ue.io", "write_all failed: " .. (err or path))
     return false
   end
   file:write(content)
+  file:flush()
   file:close()
+  local ok, rename_err = vim.uv.fs_rename(temp, path)
+  if not ok then
+    pcall(os.remove, temp)
+    require("utils.log").notify_error("ue.io", "atomic replace failed: " .. tostring(rename_err or path))
+    return false
+  end
   return true
 end
 
@@ -816,8 +838,7 @@ local function read_all(path)
 end
 
 local function write_lines(path, lines)
-  _ufs.ensure_dir(_ufs.dirname(path))
-  vim.fn.writefile(lines, path)
+  return write_all(path, table.concat(lines, "\n") .. "\n")
 end
 
 -- ==========================================================================
@@ -1020,7 +1041,7 @@ end
 -- p4 workspace mount point) and have the .uproject located by joining a
 -- previously-recorded relative subpath.
 --
--- Stored per engine_root in state.json under `uproject_relative_path` (e.g.
+-- Stored in the selected project bucket under `uproject_relative_path` (e.g.
 -- "Source/Foo/Foo.uproject" -- never hard-coded here, the value comes from
 -- whatever the user passes to `:UESetUprojectRelativePath`).
 local function set_uproject_relative_path(engine_root, rel)
@@ -1215,10 +1236,12 @@ function CORE_RT.platform_key_from_state(state)
   return plat .. "-" .. conf
 end
 
--- Cache layout v3 (2026-05-09; v3.2 de-platforms csearch):
---   .cache/nvim-ue/                           -- single root, all cache lives here
---     state.json                              -- top-level (scanner-friendly)
---     csearch/csearch.idx                     -- trigram index (PLATFORM-INDEPENDENT, v3.2)
+-- Cache layout v4 (multi-instance/project isolation):
+--   .cache/nvim-ue/
+--     selection.json                          -- startup default only
+--     projects/<canonical-project-key>/       -- no basename collisions
+--       state-fields/                         -- atomic field-level state
+--       csearch/csearch.idx                   -- platform-independent per project
 --     gtags/<platform_key>/                   -- gtags input lists + DB (per-platform, v3.1)
 --       workspace/         (GTAGS DB)
 --       workspace.files / workspace_all.files / engine.files / project.files
@@ -1233,9 +1256,10 @@ end
 --     clangd/                                 -- clangd-consumed artifacts (was: $root/.clangd-{index,pch})
 --       index/<project>.{idx,current.idx,hot.idx,full.idx}
 --       pch/<*.pch + build_pch.bat>
---     logs/                                   -- ue.lua _logged_jobstart sink + indexer logs
---     runtime/dirty.json                      -- watcher persistence
---     legacy/                                 -- pre-v2 holdouts (manual prune)
+--       clangd/<platform_key>/                 -- platform-isolated CDB/index/PCH
+--       logs/                                  -- ue.lua job/indexer logs
+--       runtime/dirty.json                     -- merge-safe watcher persistence
+--       legacy/                                -- pre-v2 holdouts (manual prune)
 -- cache_paths(engine_root, platform_key)
 --
 -- platform_key (optional): a "<Platform>-<Target>-<Config>" string (same shape
@@ -1248,35 +1272,46 @@ end
 -- preserves backward compat AND is the migration source (see
 -- migrate_legacy_csearch_if_needed).
 --
--- Only the grep-facing artifacts (csearch index + workspace/project/engine
--- file lists + gtags DB) are sharded by platform. state.json, cdb shards
--- (already platform-keyed internally), clangd index, pch, logs, runtime stay
--- at the single top-level location.
-cache_paths = function(engine_root, platform_key)
-  local cache = join(engine_root, ".cache", "nvim-ue")
+-- The canonical project bucket is the primary isolation boundary. Within it,
+-- gtags and clangd/CDB/PCH artifacts are platform-scoped; csearch is shared
+-- only by platforms of that same project because its input set is platform
+-- independent.
+cache_paths = function(engine_root, platform_key, selection)
+  local engine_cache = join(engine_root, ".cache", "nvim-ue")
+  selection = selection or CORE_RT.project_state.current(engine_root)
+  local cache = CORE_RT.project_state.project_cache_root(engine_root, selection) or engine_cache
   platform_key = (type(platform_key) == "string" and platform_key ~= "") and platform_key or nil
-  -- csearch index is PLATFORM-INDEPENDENT (single shared index for all
-  -- platforms/configs). Its input file set (workspace_all.files) is derived
+  -- csearch index is PLATFORM-INDEPENDENT within the selected project. Its
+  -- input file set (workspace_all.files) is derived
   -- from engine_root + project_root + platform-agnostic constants/whitelist
   -- (ENGINE_PICKER_DIRS / SCAN_EXCLUDES / .ueprepare-scan-paths), so the
   -- trigram index has no platform dimension. The flat `csearch/` path also
-  -- aligns with csearch_input_hash (stored per-engine_root in state.json).
+  -- aligns with csearch_input_hash stored in the project state bucket.
   -- See change `refactor-search-system` (de-platforming) for the proof.
   -- gtags/cdb REMAIN per-platform (compile args/macros/includes differ).
   local csearch_dir = join(cache, "csearch")
   local gtags_root = platform_key and join(cache, "gtags", platform_key) or join(cache, "gtags")
   local cdb_dir = join(cache, "cdb")
-  local cdb_files_dir = join(cdb_dir, "compile_commands")
+  -- The shard catalog intentionally spans platforms so fast-swap can select
+  -- existing shards. Index scheduling state and controlled subset CDBs do
+  -- depend on platform/configuration and must not be shared by live instances.
+  local cdb_shards_dir = join(cdb_dir, "compile_commands", "shards")
+  local index_runtime_dir = join(cdb_dir, "index", platform_key or "default")
+  local cdb_files_dir = join(index_runtime_dir, "compile_commands")
   local logs_dir = join(cache, "logs")
   local runtime_dir = join(cache, "runtime")
   local legacy_dir = join(cache, "legacy")
-  local clangd_dir = join(cache, "clangd")
+  local clangd_dir = join(cache, "clangd", platform_key or "default")
   local active_index_dir = join(clangd_dir, "index")
   local pch_dir = join(clangd_dir, "pch")
-  local project_name = vim.fn.fnamemodify(engine_root, ":t")
+  local project_name = selection and vim.fn.fnamemodify(selection.project_root, ":t")
+    or vim.fn.fnamemodify(engine_root, ":t")
   return {
+    engine_cache = engine_cache,
     cache = cache,
-    state = join(cache, "state.json"),
+    project_key = selection and selection.project_key or nil,
+    state = CORE_RT.project_state.state_path(engine_root, selection) or join(engine_cache, "state.json"),
+    state_revision = CORE_RT.project_state.revision_path(engine_root, selection) or join(engine_cache, "state.json"),
     platform_key = platform_key,
     -- gtags (per-platform when platform_key set)
     gtags_root = gtags_root,
@@ -1290,13 +1325,15 @@ cache_paths = function(engine_root, platform_key)
     csearch_idx = join(csearch_dir, "csearch.idx"),
     -- cdb (was: index/)
     index_dir = cdb_dir,                   -- back-compat alias
-    index_state = join(cdb_dir, "modules.json"),
-    index_queue = join(cdb_dir, "queue.json"),
+    index_state = join(index_runtime_dir, "modules.json"),
+    index_queue = join(index_runtime_dir, "queue.json"),
     index_cdb_dir = cdb_files_dir,
+    cdb_shards_dir = cdb_shards_dir,
     index_current_cdb = join(cdb_files_dir, "current.json"),
     index_hot_cdb = join(cdb_files_dir, "hot.json"),
     index_full_cdb = join(cdb_files_dir, "full.json"),
     index_inject_full_cdb = join(cdb_files_dir, "inject_full.json"),
+    active_cdb = join(cdb_dir, "active", platform_key or "default", "compile_commands.json"),
     -- logs / runtime / legacy
     logs_dir = logs_dir,
     runtime_dir = runtime_dir,
@@ -1320,8 +1357,8 @@ cache_paths = function(engine_root, platform_key)
   }
 end
 
--- Migrate the legacy single-path csearch + gtags caches into the active
--- per-platform subdir (v3.1). Parallels ue.cdb.shards.migrate_legacy_if_needed.
+-- Migrate legacy flat gtags caches into the active platform subdir. csearch
+-- remains platform-independent inside the selected project bucket.
 --
 -- Before v3.1 grep caches lived at csearch/csearch.idx and gtags/*.files.
 -- v3.1 shards them by platform_key (csearch/<key>/, gtags/<key>/). On first
@@ -1336,6 +1373,8 @@ function CORE_RT.migrate_legacy_csearch_if_needed(engine_root, platform_key)
   if not platform_key or platform_key == "" then return false end
   local legacy = cache_paths(engine_root)            -- platform_key=nil → flat layout
   local active = cache_paths(engine_root, platform_key)
+  local migration_lease = CORE_RT.file_lock.acquire(join(active.cache, "legacy-migration.lock"))
+  if not migration_lease then return false end
   local moved = false
 
   local function move_if(src, dst)
@@ -1345,14 +1384,15 @@ function CORE_RT.migrate_legacy_csearch_if_needed(engine_root, platform_key)
       -- os.rename works within the same volume (cache always lives under one
       -- engine_root, so src/dst share a drive). Fall back to copy+remove only
       -- if rename fails (defensive; shouldn't happen on same volume).
-      local ok = pcall(os.rename, src, dst)
+      local called, renamed = pcall(os.rename, src, dst)
+      local ok = called and renamed ~= nil
       if not ok then
         local data = nil
         local f = io.open(src, "rb")
         if f then data = f:read("*a"); f:close() end
-        if data then
-          local o = io.open(dst, "wb")
-          if o then o:write(data); o:close(); pcall(os.remove, src); ok = true end
+        if data and write_all(dst, data) then
+          pcall(os.remove, src)
+          ok = true
         end
       end
       if ok then moved = true end
@@ -1377,56 +1417,22 @@ function CORE_RT.migrate_legacy_csearch_if_needed(engine_root, platform_key)
     move_if(join(legacy.workspace_db, name), join(active.workspace_db, name))
   end
 
+  CORE_RT.file_lock.release(migration_lease)
   return moved
 end
 
 read_state = function(engine_root)
-  local paths = cache_paths(engine_root)
-  if not _ufs.is_file(paths.state) then
-    return {}
-  end
-
-  local ok, decoded = pcall(vim.json.decode, table.concat(vim.fn.readfile(paths.state), "\n"))
-  if not ok or type(decoded) ~= "table" then
-    return {}
-  end
-
-  if decoded.project_root then
-    decoded.project_root = norm(decoded.project_root)
-  end
-  if decoded.engine_root then
-    decoded.engine_root = norm(decoded.engine_root)
-  end
-  return decoded
+  return CORE_RT.project_state.read(engine_root)
 end
 
 local function persist_project(engine_root, project_root, uproject)
-  local paths = cache_paths(engine_root)
-  _ufs.ensure_dir(paths.cache)
-
-  -- Merge into existing state to preserve extra fields (android_package, etc.)
-  local existing = read_state(engine_root)
-  existing.project_root = norm(project_root)
-  -- Persist engine_root too. Without it the "did the engine change?"
-  -- invalidation dimension has no on-disk anchor (engine_root used to be
-  -- re-derived from the buffer every session, so a project pinned against a
-  -- DIFFERENT engine could silently reuse stale caches). cache_paths is keyed
-  -- by engine_root, so the engine that owns this state.json IS engine_root.
-  existing.engine_root = norm(engine_root)
-  existing.uproject = uproject and norm(uproject) or nil
-  existing.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
-
-  write_all(paths.state, vim.json.encode(existing))
-  return existing
+  local selection, err = CORE_RT.project_state.select(engine_root, project_root, uproject)
+  if not selection then return nil, err end
+  return read_state(engine_root)
 end
 
 update_state_field = function(engine_root, key, value)
-  local paths = cache_paths(engine_root)
-  _ufs.ensure_dir(paths.cache)
-  local existing = read_state(engine_root)
-  existing[key] = value
-  existing.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
-  write_all(paths.state, vim.json.encode(existing))
+  return CORE_RT.project_state.update(engine_root, key, value)
 end
 
 -- ==========================================================================
@@ -1447,14 +1453,13 @@ local function resolve_context(opts)
   local now = vim.uv.hrtime() / 1e9
   local cached = CORE_RT.context_cache[cache_key]
   if cached and (now - cached.ts) < _CONTEXT_TTL then
-    -- Stale-state guard: if state.json on disk is newer than when this
+    -- Stale-state guard: if the project revision changed since this
     -- ctx was built, drop the cache entry. Without this guard external
     -- writers (other nvim processes, build scripts) would be invisible
     -- for up to _CONTEXT_TTL seconds.
-    if cached.ctx and cached.state_path then
-      local mtime = vim.uv.fs_stat(cached.state_path)
-      mtime = mtime and mtime.mtime and mtime.mtime.sec or 0
-      if mtime <= (cached.state_mtime or 0) then
+    if cached.ctx and cached.state_revision_path then
+      local revision = read_all(cached.state_revision_path) or ""
+      if revision == (cached.state_revision or "") then
         return cached.ctx, cached.err
       end
     else
@@ -1469,6 +1474,7 @@ local function resolve_context(opts)
     return nil, err
   end
 
+  local selection = CORE_RT.project_state.current(engine_root)
   local state = read_state(engine_root)
   local project_root, uproject
 
@@ -1494,9 +1500,8 @@ local function resolve_context(opts)
   if platform_key ~= "" then
     pcall(CORE_RT.migrate_legacy_csearch_if_needed, engine_root, platform_key)
   end
-  local paths = cache_paths(engine_root, platform_key)
-  local state_stat = vim.uv.fs_stat(paths.state)
-  local state_mtime = state_stat and state_stat.mtime and state_stat.mtime.sec or 0
+  local paths = cache_paths(engine_root, platform_key, selection)
+  local state_revision = read_all(paths.state_revision) or ""
 
   local ctx = {
     engine_root = engine_root,
@@ -1509,8 +1514,8 @@ local function resolve_context(opts)
     ctx = ctx,
     err = nil,
     ts = now,
-    state_path = paths.state,
-    state_mtime = state_mtime,
+    state_revision_path = paths.state_revision,
+    state_revision = state_revision,
   }
   return ctx
 end
@@ -2085,8 +2090,8 @@ local module_tier_label = INDEX_FN.module_tier_label
 
 local function index_output_paths(ctx)
   local outputs = {}
-  local compile_commands = join(ctx.engine_root, "compile_commands.json")
-  if compile_commands ~= "" then
+  local compile_commands = ctx.paths and ctx.paths.active_cdb or nil
+  if compile_commands and compile_commands ~= "" then
     table.insert(outputs, compile_commands)
   end
   if ctx.paths and ctx.paths.active_index then
@@ -2105,6 +2110,7 @@ status_root_key = function(ctx)
   return table.concat({
     norm(ctx.engine_root),
     norm(ctx.project_root),
+    tostring(ctx.paths and ctx.paths.platform_key or "default"),
   }, "\31")
 end
 
@@ -2381,6 +2387,10 @@ local function set_prepare_running(value)
     return
   end
   M._prepare_running = value
+  if not value and CORE_RT.prepare_lease then
+    CORE_RT.file_lock.release(CORE_RT.prepare_lease)
+    CORE_RT.prepare_lease = nil
+  end
   invalidate_status_cache()
   refresh_statusline()
 end
@@ -2396,7 +2406,7 @@ end
 --
 -- Defined on CORE_RT (not a main-chunk local) to stay under LuaJIT's 200-local
 -- cap on the main function (see CONSTRAINTS luajit-200-local-cap).
-function CORE_RT.csearch_build_begin(label)
+function CORE_RT.csearch_build_begin(label, index_path)
   if CORE_RT.csearch_build_running then
     vim.schedule(function()
       vim.notify(
@@ -2405,12 +2415,34 @@ function CORE_RT.csearch_build_begin(label)
     end)
     return false
   end
+  if index_path and index_path ~= "" then
+    local lease, lease_err = CORE_RT.file_lock.acquire(index_path .. ".writer.lock")
+    if not lease then
+      vim.schedule(function()
+        vim.notify(
+          ("[ue] csearch build owned by another Neovim — %s skipped (%s)"):format(
+            label or "build", tostring(lease_err)),
+          vim.log.levels.WARN, { title = "UE", replace = "ue.csearch.build" })
+      end)
+      return false
+    end
+    CORE_RT.csearch_build_lease = lease
+  end
   CORE_RT.csearch_build_running = true
+  CORE_RT.csearch_build_started_at = os.time()
+  local ok_watch, watch = pcall(require, "utils.ue_watch")
+  CORE_RT.csearch_build_dirty_snapshot = ok_watch
+      and type(watch.snapshot_persistent_dirty) == "function"
+      and watch.snapshot_persistent_dirty() or {}
   return true
 end
 
 function CORE_RT.csearch_build_done()
   CORE_RT.csearch_build_running = false
+  if CORE_RT.csearch_build_lease then
+    CORE_RT.file_lock.release(CORE_RT.csearch_build_lease)
+    CORE_RT.csearch_build_lease = nil
+  end
 end
 
 -- Clear the watcher's persistent dirty set after a SUCCESSFUL full csearch
@@ -2423,24 +2455,37 @@ end
 -- and (2) makes the rg-on-dirty overlay re-grep a huge stale set on every
 -- <leader>/ / <space><space> (picker lag). Only call on SUCCESS — a failed
 -- build leaves the dirty set so the overlay keeps those files visible.
-function CORE_RT.clear_persistent_dirty_safe(reason)
+function CORE_RT.clear_persistent_dirty_safe(reason, covered_paths, covered_before, remove_missing)
   local ok_watch, watch = pcall(require, "utils.ue_watch")
-  if ok_watch and type(watch.clear_persistent_dirty) == "function" then
-    watch.clear_persistent_dirty(reason or "prepare")
+  if not ok_watch then return false end
+  if type(covered_paths) == "table" and type(watch.remove_persistent_dirty) == "function" then
+    return watch.remove_persistent_dirty(
+      covered_paths, reason or "prepare", covered_before, remove_missing)
   end
+  if type(watch.clear_persistent_dirty) == "function" then
+    return watch.clear_persistent_dirty(reason or "prepare")
+  end
+  return false
 end
 
 -- Called once on EVERY full csearch build SUCCESS path (sync / cache fast-path /
 -- cold full). Bundles the two post-success obligations so the three call sites
 -- can't drift:
---   D-3b: clear the watcher dirty set (it's logically empty — full build indexed
---         everything).
+--   D-3b: subtract the dirty snapshot captured when this writer started. A
+--         different Neovim may add paths while cindex is running; those must
+--         remain visible after publication.
 --   D10:  record the content fingerprint of the list we just indexed, so
 --         prepare_freshness can compare future list bytes against it.
 -- MUST only be called on SUCCESS. On failure neither obligation applies (dirty
 -- files must stay visible; the fingerprint must not move ahead of a built index).
-function CORE_RT.on_full_csearch_success(ctx, reason)
-  CORE_RT.clear_persistent_dirty_safe(reason)
+function CORE_RT.on_full_csearch_success(ctx, reason, stats)
+  CORE_RT.clear_persistent_dirty_safe(
+    reason,
+    CORE_RT.csearch_build_dirty_snapshot or {},
+    CORE_RT.csearch_build_started_at,
+    stats and stats.mode == "reset")
+  CORE_RT.csearch_build_dirty_snapshot = nil
+  CORE_RT.csearch_build_started_at = nil
   local list_path = ctx and ctx.paths and ctx.paths.workspace_all_list
   if not list_path or not ctx.engine_root then return end
   local hash = CORE_RT.list_fingerprint(list_path)
@@ -2642,7 +2687,7 @@ function CORE_RT.csearch_smart_build(ctx, cs_ctx, abs_list, cb)
   end
 
   -- mode == "add": feed ONLY the delta.
-  local add_list_path = abs_list .. ".add"
+  local add_list_path = abs_list .. (".add.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
   local fout = io.open(add_list_path, "w")
   if not fout then
     run_reset("cannot write add-list")
@@ -4455,7 +4500,8 @@ function M._logged_jobstart(cmd, tag, opts)
   opts = opts or {}
   local log_dir = vim.fn.stdpath("log") .. "/" .. tag
   vim.fn.mkdir(log_dir, "p")
-  local log_path = log_dir .. "/" .. os.date("%Y%m%d-%H%M%S") .. ".log"
+  local log_path = log_dir .. ("/%s.%d.%s.log"):format(
+    os.date("%Y%m%d-%H%M%S"), vim.fn.getpid(), tostring(vim.uv.hrtime()))
   local log_lines = {}
 
   local function on_data(_, data)
@@ -4643,8 +4689,8 @@ end
 -- BUILD COMMAND (UBT/Build.bat — platform from state.target_platform)
 -- ==========================================================================
 
--- Build a UBT/Build.bat command for the platform+configuration persisted in
--- state.json (set via :UESetPlatform). Despite the legacy name, this is
+-- Build a UBT/Build.bat command for the process-local platform+configuration
+-- initialized from project state (set via :UESetPlatform). Despite the legacy name, this is
 -- platform-agnostic — Win64/Android/IOS/Linux all flow through the same
 -- "Build.bat <Target> <Platform> <Configuration> -Project=..." invocation.
 -- Kept as `android_build_command` for now to avoid breaking the public
@@ -5480,7 +5526,7 @@ function M.cached_grep(opts)
   -- Toggle: :UEGrepTraceToggle  (or set vim.g.ue_grep_trace = true)
   -- Log:    vim.fn.stdpath("state") .. "/ue_grep_trace.log"
   local trace_enabled = vim.g.ue_grep_trace == true
-  local trace_log_path = vim.fn.stdpath("state") .. "/ue_grep_trace.log"
+  local trace_log_path = vim.fn.stdpath("state") .. ("/ue_grep_trace.%d.log"):format(vim.fn.getpid())
   local trace_t0 = vim.loop.hrtime()
   local function trace(fmt, ...)
     if not trace_enabled then return end
@@ -5505,7 +5551,7 @@ function M.cached_grep(opts)
   -- vim.g.ue_grep_trace flag so a normal grep writes nothing to disk (P5: no
   -- silent per-action side-effects). Enable with :UEGrepTraceToggle when
   -- debugging backend/mode/result-count.
-  local debug_log_path = vim.fn.stdpath("state") .. "/ue_grep_backend_debug.log"
+  local debug_log_path = vim.fn.stdpath("state") .. ("/ue_grep_backend_debug.%d.log"):format(vim.fn.getpid())
   local function grep_debug(fmt, ...)
     if vim.g.ue_grep_trace ~= true then return end
     local ok, line = pcall(string.format, fmt, ...)
@@ -6391,7 +6437,7 @@ local function show_paths()
     "Configuration: " .. selected_conf .. " (" .. conf_source .. ")",
     "GTAGS Root: " .. workspace_root(ctx),
     "Compile Commands: " .. compile_commands_targets(ctx)[1],
-    "Compile Commands (Engine): " .. compile_commands_targets(ctx)[2],
+    "Compile Commands Scope: " .. (ctx.paths.project_key or "legacy-engine"),
     "State: " .. ctx.paths.state,
     "Project List: " .. ctx.paths.project_list,
     "Engine List: " .. ctx.paths.engine_list,
@@ -6476,89 +6522,12 @@ local function show_cheatsheet()
   require("utils.cheatsheet").open()
 end
 
--- Wipe all project-scoped cache artifacts when the active project changes.
+-- Reset only process-local consumers when the active project changes.
 -- (Wrapped in do/end so neither this helper NOR set_project occupies a
 -- LuaJIT main-chunk local slot — see skill luajit-200-local-cap-with-loader-cache-mask.
 -- We expose set_project through CORE_RT instead.)
 do
--- Wipe all project-scoped cache artifacts when the active project changes.
--- Engine-only artifacts (engine.files, engine .git mtime probe) survive — the
--- engine tree itself hasn't moved. List files, csearch index, gtags DB, and
--- per-platform cdb shards all reflect the OLD project's content and would
--- silently feed `<space><space>` / grep stale results until the next full
--- :UEPrepare. We delete them eagerly so callers see "never" (not "fresh") and
--- get a loud `notify_freshness` banner until they rerun :UEPrepare manually.
---
--- NOTE: by design this does NOT auto-trigger UEPrepare. Per-user rule:
--- :UEPrepare runs only on explicit user request. Our job is to invalidate so
--- the staleness signal becomes truthful — not to second-guess timing.
-local function invalidate_project_scoped_cache(engine_root, reason)
-  local paths = cache_paths(engine_root)
-  local victims = {
-    -- legacy single-path file lists + csearch (pre-v3.1 layout)
-    paths.project_list,
-    paths.workspace_list,
-    paths.workspace_all_list,
-    paths.csearch_idx,
-    paths.csearch_idx .. "~",
-    paths.csearch_idx .. "~~",
-    -- gtags DB (project-scoped; tags from old project tree are wrong)
-    join(paths.gtags_root, "GTAGS"),
-    join(paths.gtags_root, "GPATH"),
-    join(paths.gtags_root, "GRTAGS"),
-    join(paths.workspace_db, "GTAGS"),
-    join(paths.workspace_db, "GPATH"),
-    join(paths.workspace_db, "GRTAGS"),
-    -- cdb shards (per-platform compile_commands referencing old project paths)
-    paths.index_current_cdb,
-    paths.index_hot_cdb,
-    paths.index_full_cdb,
-    paths.index_inject_full_cdb,
-    paths.index_state,
-    paths.index_queue,
-    -- runtime dirty set tied to old project
-    paths.dirty_json,
-  }
-  local removed = 0
-  for _, p in ipairs(victims) do
-    if p and _ufs.is_file(p) then
-      if pcall(os.remove, p) then removed = removed + 1 end
-    end
-  end
-
-  -- v3.1: csearch + gtags lists now live in per-platform subdirs
-  -- (csearch/<key>/, gtags/<key>/). A PROJECT switch invalidates EVERY
-  -- platform's grep cache (they all index the old project's files), so wipe
-  -- the whole per-platform tree, not just the active one.
-  for _, sub in ipairs({ "csearch", "gtags" }) do
-    local dir = join(paths.cache, sub)
-    if _ufs.is_dir(dir) then
-      if pcall(vim.fn.delete, dir, "rf") then removed = removed + 1 end
-    end
-  end
-
-  -- Also wipe per-shard cdb files (per-platform CDB shards reference old
-  -- project source paths). The shards live under cdb/compile_commands/shards/.
-  local shards_dir = join(paths.index_cdb_dir, "shards")
-  if _ufs.is_dir(shards_dir) then
-    if pcall(vim.fn.delete, shards_dir, "rf") then removed = removed + 1 end
-  end
-
-  -- Also nuke clangd index .idx files keyed by old project_name. Engine_root
-  -- → project_name derivation is in cache_paths; the .idx filename embeds
-  -- it. We list and rm by glob since multiple suffix variants exist.
-  if _ufs.is_dir(paths.active_index_dir) then
-    local glob = vim.fn.globpath(paths.active_index_dir, "*.idx", false, true)
-    for _, f in ipairs(glob) do
-      if pcall(os.remove, f) then removed = removed + 1 end
-      local manifest = f .. ".manifest.json"
-      if _ufs.is_file(manifest) and pcall(os.remove, manifest) then removed = removed + 1 end
-    end
-  end
-  if _ufs.is_dir(paths.semantic_cdb_dir) then
-    if pcall(vim.fn.delete, paths.semantic_cdb_dir, "rf") then removed = removed + 1 end
-  end
-
+local function invalidate_project_scoped_cache(_, reason)
   -- Force prepare_freshness to re-read from disk on next call.
   CORE_RT.freshness_notified = {}
   CORE_RT.context_cache = {}
@@ -6567,17 +6536,14 @@ local function invalidate_project_scoped_cache(engine_root, reason)
   -- cold start would otherwise keep is_indexed() false for the session).
   pcall(function() require("utils.code_search")._reset_probe_cache() end)
 
-  -- Tell ue_watch (if running) to flush its dirty set — it referred to old
-  -- project's files. Best-effort; module may not be loaded yet.
+  -- Stop the old process-local watcher. Persistent dirty state is already in
+  -- the old project's bucket and must be preserved for that project.
   local ok_watch, watch = pcall(require, "utils.ue_watch")
-  if ok_watch and type(watch.clear_persistent_dirty) == "function" then
-    watch.clear_persistent_dirty("set_project:" .. (reason or "switch"))
-  end
   if ok_watch and type(watch.stop) == "function" then
     pcall(watch.stop)  -- old watch handle was rooted at previous project_root
   end
 
-  return removed
+  return 0
 end
 
 local function set_project(input)
@@ -6600,35 +6566,35 @@ local function set_project(input)
     return
   end
 
-  -- Detect actual project switch BEFORE persisting (persist overwrites state).
-  local prev = read_state(engine_root)
+  -- The previous selection is process-local; selection.json is only the
+  -- startup default and may have been changed by another Neovim process.
+  local prev = CORE_RT.project_state.current(engine_root) or {}
   local prev_project = prev and prev.project_root or nil
-  local prev_engine = prev and prev.engine_root or nil
-  -- Switch = project_root changed OR the engine_root recorded in this
-  -- state.json no longer matches the live engine_root. The engine dimension
-  -- matters because caches (csearch/gtags/cdb) index BOTH the project and the
-  -- engine tree; pointing the same state.json at a different engine makes them
-  -- stale even if the project path is unchanged.
   local project_switched = prev_project and norm(prev_project) ~= norm(project_root) or false
-  local engine_switched = prev_engine and prev_engine ~= "" and norm(prev_engine) ~= norm(engine_root) or false
-  local switched = project_switched or engine_switched
+  local switched = project_switched
 
-  persist_project(engine_root, project_root, uproject)
+  local persisted_bp = package.loaded["ue.dap._persist_bp"]
+  if switched and persisted_bp and type(persisted_bp.save) == "function" then
+    pcall(persisted_bp.save)
+  end
+  local persisted, persist_err = persist_project(engine_root, project_root, uproject)
+  if not persisted then
+    vim.notify("Failed to set UE project: " .. tostring(persist_err), vim.log.levels.ERROR)
+    return
+  end
 
-  local removed = 0
   if switched then
-    removed = invalidate_project_scoped_cache(engine_root, project_switched and "project-switch" or "engine-switch")
+    invalidate_project_scoped_cache(engine_root, "project-switch")
   end
 
   invalidate_status_cache()
   refresh_statusline()
 
-  local msg = "UE project set:\nEngine: " .. engine_root .. "\nProject: " .. project_root
+  local msg = "UE project set for this Neovim session:\nEngine: " .. engine_root .. "\nProject: " .. project_root
   if switched then
-    local what = project_switched and ("Project CHANGED (was: %s)"):format(prev_project or "?")
-      or ("Engine CHANGED (was: %s)"):format(prev_engine or "?")
-    msg = msg .. ("\n\n%s\n  → invalidated %d cache entries (lists / csearch / gtags / cdb shards, all platforms)\n  → run :UEPrepare to rebuild (or :UEPrepare! to force a clean full pass)"):format(what, removed)
-    vim.notify(msg, vim.log.levels.WARN, { title = "UE" })
+    msg = msg .. ("\n\nProject CHANGED (was: %s)\n  → previous project caches preserved\n  → active cache bucket: %s"):format(
+      prev_project or "?", cache_paths(engine_root).cache)
+    vim.notify(msg, vim.log.levels.INFO, { title = "UE" })
   else
     vim.notify(msg, vim.log.levels.INFO, { title = "UE" })
   end
@@ -6659,8 +6625,8 @@ local function set_android_package(input)
 end
 
 -- Tell ue.lua how to find the .uproject when only a workspace root is given
--- to :UESetProject. Stored per engine_root in state.json so different engines
--- can have different conventions and the value never appears in source code.
+-- to :UESetProject. Stored in the selected project's state bucket so it never
+-- appears in source code or leaks to another project under the same engine.
 local function set_uproject_relative_path_command(input)
   local engine_root = current_engine_root()
   if not engine_root then
@@ -6754,7 +6720,8 @@ local function set_platform_completions(arg_lead)
 end
 
 -- Fast platform swap: when shards already exist for the requested (platform,
--- configuration), flip manifest.active + re-merge into the top-level cdb
+-- configuration), select it from process-local state and re-merge into the
+-- process's project+platform CDB
 -- WITHOUT re-running :UEPrepare. Returns ok, new_active_key, stats|err.
 --
 -- Preconditions:
@@ -6763,10 +6730,9 @@ end
 --   * <cache>/cdb/compile_commands/shards/<plat>-<target>-<config>.json exists.
 --
 -- Side effects on success:
---   * manifest.active set to the best matching shard key + written to disk.
---   * Top-level engine_root/compile_commands.json (and Engine/compile_commands.json)
---     rewritten to be the merged result from all shards, with the new
---     active key winning conflicts.
+--   * manifest.active set in-memory only; active selection is process-local.
+--   * The isolated ctx.paths.active_cdb is rewritten from all shards, with
+--     the selected key winning conflicts.
 --   * run_compile_commands_pipeline executes the standard slim/pch/resolve/
 --     unify/prune chain so clangd sees the same shape it would after a full
 --     :UEPrepare.
@@ -6777,20 +6743,20 @@ end
 -- `luajit-200-local-cap-with-loader-cache-mask` Fix D.
 function CORE_RT.fast_swap_active_platform(engine_root)
   -- Prefer resolve_context (gives full ctx with paths cached); fall back to
-  -- a synthetic ctx built from state.json when called without a buffer in
+  -- a synthetic ctx built from project state when called without a buffer in
   -- the project (rare, but happens for headless tests / engine-root cwd).
   local ctx = resolve_context({ detect_project = true })
   if not ctx or norm(ctx.engine_root or "") ~= norm(engine_root) then
     local state = read_state(engine_root)
     if not state.project_root or state.project_root == "" then
-      return false, nil, "no project_root in state.json — open a file in the project first or run :UEPrepare"
+      return false, nil, "no project selected in this Neovim — open a project file or run :UESetProject"
     end
     ctx = {
       engine_root = engine_root,
       project_root = state.project_root,
       uproject = state.uproject or find_uproject_in_dir(state.project_root) or "",
       state = state,
-      paths = cache_paths(engine_root),
+      paths = cache_paths(engine_root, CORE_RT.platform_key_from_state(state)),
     }
   end
   -- ctx.state was loaded BEFORE set_platform's update_state_field calls
@@ -6822,9 +6788,15 @@ function CORE_RT.fast_swap_active_platform(engine_root)
       table.concat(have, ", "))
   end
 
-  -- Flip + persist BEFORE merge so merge_shards' active-bonus picks the new winner.
+  local swap_lease, swap_lease_err = CORE_RT.file_lock.acquire(
+    join(ctx.paths.runtime_dir, "prepare.lock"))
+  if not swap_lease then
+    return false, nil, "project CDB is being written by another Neovim: " .. tostring(swap_lease_err)
+  end
+
+  -- Select in-memory only. Persisting one global `manifest.active` would let
+  -- two live Neovim processes redirect each other across platforms.
   manifest.active = new_key
-  shards.write_manifest(ctx, manifest)
 
   local merged, stats = shards.merge_shards(ctx, manifest)
   local json = vim.json.encode(merged)
@@ -6836,8 +6808,11 @@ function CORE_RT.fast_swap_active_platform(engine_root)
 
   -- Run the standard post-process chain (slim + PCH FI inject + resolve +
   -- unify + prune) so clangd sees the same cdb shape as after :UEPrepare.
-  local pipeline_jobid, pipeline_err = run_compile_commands_pipeline(targets[1], targets)
+  local pipeline_jobid, pipeline_err = run_compile_commands_pipeline(targets[1], targets, function()
+    CORE_RT.file_lock.release(swap_lease)
+  end)
   if pipeline_jobid == nil then
+    CORE_RT.file_lock.release(swap_lease)
     return false, nil, pipeline_err or "compile_commands pipeline failed to start"
   end
 
@@ -6865,11 +6840,13 @@ local function set_platform(input)
   input = trim(input or "")
   if input ~= "" then
     local plat, conf = split_platform_input(input)
-    if plat and plat ~= "" then
-      update_state_field(engine_root, "target_platform", plat)
-    end
-    if conf and conf ~= "" then
-      update_state_field(engine_root, "target_configuration", conf)
+    local ok_update, update_err = CORE_RT.project_state.update_target(
+      engine_root,
+      (plat and plat ~= "") and plat or current_plat,
+      (conf and conf ~= "") and conf or current_conf)
+    if not ok_update then
+      vim.notify("Failed to set target: " .. tostring(update_err), vim.log.levels.ERROR)
+      return
     end
     invalidate_status_cache()
     refresh_statusline()
@@ -6926,8 +6903,11 @@ local function set_platform(input)
       if not conf then
         return
       end
-      update_state_field(engine_root, "target_platform", plat)
-      update_state_field(engine_root, "target_configuration", conf)
+      local ok_update, update_err = CORE_RT.project_state.update_target(engine_root, plat, conf)
+      if not ok_update then
+        vim.notify("Failed to set target: " .. tostring(update_err), vim.log.levels.ERROR)
+        return
+      end
       invalidate_status_cache()
       refresh_statusline()
       CORE_RT.context_cache = {}
@@ -7266,7 +7246,7 @@ function M.ai_context(engine_root)
       so_deploy_error = so_deploy_error,
       latest_apk = apk,
       install_command = install_command,
-      compile_commands = join(engine_root, "compile_commands.json"),
+      compile_commands = ctx.paths.active_cdb,
       clangd_index = ctx.paths.active_index,
     },
     commands = {
@@ -7326,7 +7306,7 @@ function M.ai_context(engine_root)
         key = "<Space>uP",
         nvim_command = ":UESetProject",
         purpose = "Select and persist the project associated with this engine root.",
-        native_action = "Writes project_root and uproject to the engine state.json.",
+        native_action = "Updates this process and the startup-default selector; project state stays in its canonical bucket.",
       },
     },
   }
@@ -7788,12 +7768,12 @@ local function prepare()
           end
         end
         fout:close()
-        if not CORE_RT.csearch_build_begin("UEPrepare (sync)") then
+        if not CORE_RT.csearch_build_begin("UEPrepare (sync)", ctx.paths.csearch_idx) then
           pcall(os.remove, abs_list)
         else
-          local cs_done, cs_ok, cs_err = false, false, nil
-          CORE_RT.csearch_smart_build(ctx, cs_ctx_p, abs_list, function(ok_cs, err_cs, _st)
-            cs_ok, cs_err = ok_cs, err_cs
+          local cs_done, cs_ok, cs_err, cs_stats = false, false, nil, nil
+          CORE_RT.csearch_smart_build(ctx, cs_ctx_p, abs_list, function(ok_cs, err_cs, stats)
+            cs_ok, cs_err, cs_stats = ok_cs, err_cs, stats
             cs_done = true
           end)
           vim.wait(180000, function() return cs_done end, 100)
@@ -7803,8 +7783,8 @@ local function prepare()
             vim.notify("UEPrepare: csearch index failed: " .. (cs_err or "timeout"),
               vim.log.levels.WARN, { title = "UE" })
           else
-            -- Full build succeeded (D-3b + D10): clear dirty + record fingerprint.
-            CORE_RT.on_full_csearch_success(ctx, "prepare:sync")
+            -- Full build succeeded (D-3b + D10): retire covered dirty + record fingerprint.
+            CORE_RT.on_full_csearch_success(ctx, "prepare:sync", cs_stats)
           end
         end
       end
@@ -7832,6 +7812,24 @@ local function prepare()
     return
   end
   vim.notify(summary)
+end
+
+function CORE_RT.prepare_sync()
+  local ctx, err = resolve_context()
+  if not ctx then vim.notify(err, vim.log.levels.WARN); return false end
+  local lease, lease_err = CORE_RT.file_lock.acquire(join(ctx.paths.runtime_dir, "prepare.lock"))
+  if not lease then
+    vim.notify("UEPrepare is running in another Neovim: " .. tostring(lease_err),
+      vim.log.levels.WARN, { title = "UE" })
+    return false
+  end
+  local ok, result = xpcall(prepare, debug.traceback)
+  CORE_RT.file_lock.release(lease)
+  if not ok then
+    require("utils.log").notify_error("ue.prepare", tostring(result))
+    return false
+  end
+  return result ~= false
 end
 
 
@@ -7942,6 +7940,15 @@ local function prepare_async(opts)
   -- Cover the entire fast path, including async CDB generation and the writer
   -- pipeline. Previously only the cold GTAGS phase set this flag, so two quick
   -- :UEPrepare calls could concurrently rewrite compile_commands.json.
+  local prepare_lease, prepare_lease_err = CORE_RT.file_lock.acquire(
+    join(ctx.paths.runtime_dir, "prepare.lock"))
+  if not prepare_lease then
+    if handle then handle.message = "BUSY"; handle:finish() end
+    vim.notify("UEPrepare is running in another Neovim: " .. tostring(prepare_lease_err),
+      vim.log.levels.WARN, { title = "UE" })
+    return
+  end
+  CORE_RT.prepare_lease = prepare_lease
   set_prepare_running(true)
 
   -- ── Cache fast-path ──────────────────────────────────────────────────
@@ -8052,7 +8059,7 @@ local function prepare_async(opts)
               end
             end
             fout:close()
-            if not CORE_RT.csearch_build_begin("UEPrepare (cache fast-path)") then
+            if not CORE_RT.csearch_build_begin("UEPrepare (cache fast-path)", ctx.paths.csearch_idx) then
               pcall(os.remove, abs_list)
             else
               vim.notify(("UEPrepare: refreshing csearch index in background (reason: %s)..."):format(stale_reason),
@@ -8072,8 +8079,8 @@ local function prepare_async(opts)
                       stats.delta or "", mb, (stats.ms or 0) / 1000),
                       vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
                   end
-                  -- Full/incremental build succeeded (D-3b + D10): clear dirty + fingerprint.
-                  CORE_RT.on_full_csearch_success(ctx, "prepare:fast-path")
+                  -- Successful build: retire its captured dirty snapshot + fingerprint.
+                  CORE_RT.on_full_csearch_success(ctx, "prepare:fast-path", stats)
                 else
                   vim.notify("UEPrepare: csearch rebuild failed: " .. (err_cs or "unknown"),
                     vim.log.levels.WARN, { title = "UE", replace = "ue.csearch.build" })
@@ -8374,7 +8381,7 @@ local function prepare_async(opts)
             fout:close()
           end)
 
-          if not CORE_RT.csearch_build_begin("UEPrepare (cold full build)") then
+          if not CORE_RT.csearch_build_begin("UEPrepare (cold full build)", ctx.paths.csearch_idx) then
             pcall(os.remove, abs_list)
             finalize_after_csearch()
             return
@@ -8396,8 +8403,8 @@ local function prepare_async(opts)
                   stats.delta or "", mb, (stats.ms or 0) / 1000),
                   vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
               end
-              -- Full/incremental build succeeded (D-3b + D10): clear dirty + fingerprint.
-              CORE_RT.on_full_csearch_success(ctx, "prepare:cold-full")
+              -- Successful build: retire its captured dirty snapshot + fingerprint.
+              CORE_RT.on_full_csearch_success(ctx, "prepare:cold-full", stats)
             else
               vim.notify("UEPrepare: csearch index failed: " .. (err_cs or "unknown"),
                 vim.log.levels.WARN, { title = "UE" })
@@ -8649,8 +8656,8 @@ M.lldb_dap_path = dap_mod.lldb_dap_path
 M.android_dap_attach = dap_mod.android_dap_attach
 
 -- Expose state helpers so peripheral modules (ue/dap/android.lua's pick_package,
--- external probes, future plugins) can read/write the persisted .cache/nvim-ue/
--- state.json without re-implementing the path resolution. These are forward-
+-- external probes, future plugins) can read/write the selected project's
+-- persisted state without re-implementing canonical bucket resolution. These are forward-
 -- declared locals upthread; they exist by the time setup_dap / require returns.
 M.read_state = read_state
 M.update_state_field = update_state_field
@@ -8740,14 +8747,14 @@ function M.setup()
   end, { nargs = "?" })
   vim.api.nvim_create_user_command("UESetAndroidDevice", function()
     require("utils.android_device").select({
-      prompt = "Select global Android device:",
+      prompt = "Select Android device for this Neovim:",
     }, function(serial, device)
       if serial then
         vim.notify(("Android device selected: %s"):format(
           require("utils.android_device").format_item(device)), vim.log.levels.INFO)
       end
     end)
-  end, { desc = "Select the session-global Android device (name + serial)" })
+  end, { desc = "Select the process-local Android device (name + serial)" })
   vim.api.nvim_create_user_command("UESetUprojectRelativePath", function(opts)
     set_uproject_relative_path_command(opts.args)
   end, {
@@ -8777,7 +8784,7 @@ function M.setup()
   vim.api.nvim_create_user_command("UEGrepTraceToggle", function()
     vim.g.ue_grep_trace = not (vim.g.ue_grep_trace == true)
     local on = vim.g.ue_grep_trace
-    local path = vim.fn.stdpath("state") .. "/ue_grep_trace.log"
+    local path = vim.fn.stdpath("state") .. ("/ue_grep_trace.%d.log"):format(vim.fn.getpid())
 
     -- Error sink: poll :messages and tee Error/E5/attempt patterns to disk.
     -- We DO NOT override vim.notify (noice would warn about that and ding
@@ -8787,7 +8794,7 @@ function M.setup()
     -- a P5-adjacent leak. Handle lives on CORE_RT so repeated toggles reuse
     -- one slot; OFF stops AND closes it.
     if on and not CORE_RT.err_sink_timer then
-      local err_log = vim.fn.stdpath("state") .. "/ue_errors.log"
+      local err_log = vim.fn.stdpath("state") .. ("/ue_errors.%d.log"):format(vim.fn.getpid())
       local f = io.open(err_log, "w")
       if f then f:write("=== installed " .. os.date() .. " ===\n"); f:close() end
       local timer = vim.uv.new_timer()
@@ -8818,7 +8825,7 @@ function M.setup()
   end, { desc = "Toggle UE grep finder trace logging + error sink" })
 
   vim.api.nvim_create_user_command("UEGrepTraceShow", function()
-    local path = vim.fn.stdpath("state") .. "/ue_grep_trace.log"
+    local path = vim.fn.stdpath("state") .. ("/ue_grep_trace.%d.log"):format(vim.fn.getpid())
     if vim.fn.filereadable(path) == 0 then
       vim.notify("no trace log at " .. path, vim.log.levels.WARN, { title = "UE" })
       return
@@ -8833,9 +8840,9 @@ function M.setup()
   vim.api.nvim_create_user_command("UEGrepDiagDump", function()
     -- One-shot bundle: trace + errors + tail of :messages + Snacks notifier
     -- history into a single file the user can paste back in one go.
-    local out_path = vim.fn.stdpath("state") .. "/ue_grep_diag.txt"
-    local trace_path = vim.fn.stdpath("state") .. "/ue_grep_trace.log"
-    local err_path = vim.fn.stdpath("state") .. "/ue_errors.log"
+    local out_path = vim.fn.stdpath("state") .. ("/ue_grep_diag.%d.txt"):format(vim.fn.getpid())
+    local trace_path = vim.fn.stdpath("state") .. ("/ue_grep_trace.%d.log"):format(vim.fn.getpid())
+    local err_path = vim.fn.stdpath("state") .. ("/ue_errors.%d.log"):format(vim.fn.getpid())
 
     local function read_file(p, max_bytes)
       max_bytes = max_bytes or 50000
@@ -8943,11 +8950,9 @@ function M.setup()
             if key and key ~= "" then
               CORE_RT.dirty_index_roots[key] = true
             end
-            -- Also clear watcher dirty set; cold rebuild covers everything.
-            local ok_watch, watch = pcall(require, "utils.ue_watch")
-            if ok_watch and type(watch.clear_persistent_dirty) == "function" then
-              watch.clear_persistent_dirty("UEPrepare!")
-            end
+            -- Do not clear dirty state before the rebuild succeeds. The
+            -- csearch writer captures a snapshot at start and subtracts only
+            -- that covered snapshot after successful publication.
           end
           prepare_async({ force_csearch = true })
         else
@@ -8982,18 +8987,19 @@ function M.setup()
       vim.notify("cindex-uefilter not found — build it first", vim.log.levels.WARN, { title = "UE" })
       return
     end
-    local abs_list = ctx.paths.cache .. "/csearch_incremental.txt"
+    if not CORE_RT.csearch_build_begin("UEPrepareIncremental", ctx.paths.csearch_idx) then
+      return
+    end
+    local abs_list = ctx.paths.cache .. ("/csearch_incremental.%d.%s.txt"):format(
+      vim.fn.getpid(), tostring(vim.uv.hrtime()))
     local fout = io.open(abs_list, "w")
     if not fout then
+      CORE_RT.csearch_build_done()
       vim.notify("UEPrepareIncremental: cannot write " .. abs_list, vim.log.levels.WARN)
       return
     end
     for _, p in ipairs(dirty) do fout:write(p, "\n") end
     fout:close()
-    if not CORE_RT.csearch_build_begin("UEPrepareIncremental") then
-      pcall(os.remove, abs_list)
-      return
-    end
     vim.notify(("UEPrepareIncremental: adding %d dirty files to csearch index ..."):format(#dirty),
       vim.log.levels.INFO, { title = "UE", timeout = 3000, replace = "ue.csearch.build" })
     local cs_ctx = { workspace_root = workspace_root(ctx), csearch_idx = ctx.paths.csearch_idx }
@@ -9001,9 +9007,10 @@ function M.setup()
       CORE_RT.csearch_build_done()
       pcall(os.remove, abs_list)
       if ok_cs then
-        if type(watch.clear_persistent_dirty) == "function" then
-          watch.clear_persistent_dirty("UEPrepareIncremental")
+        if type(watch.remove_persistent_dirty) == "function" then
+          watch.remove_persistent_dirty(dirty, "UEPrepareIncremental", CORE_RT.csearch_build_started_at)
         end
+        CORE_RT.csearch_build_started_at = nil
         local mb = math.floor((stats.index_size or 0) / 1024 / 1024)
         vim.notify(("✓ csearch +%d files (%.1fs, idx now %d MB)"):format(
           #dirty, (stats.ms or 0) / 1000, mb),
@@ -9033,7 +9040,7 @@ function M.setup()
     vim.notify(
       "UEPrepareSync will block the UI; use :UEPrepare for async",
       vim.log.levels.WARN, { title = "ue" })
-    prepare()
+    CORE_RT.prepare_sync()
   end, { desc = "UEPrepare synchronous (blocks UI; debug only)" })
   vim.api.nvim_create_user_command("UECDBPartition", function(cmd)
     -- Manually re-run partition. Optional arg: "Android/Test" to also set active.

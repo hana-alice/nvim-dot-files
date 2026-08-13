@@ -1,4 +1,5 @@
 local M = {}
+local file_lock = require("ue.file_lock")
 
 local function command_text(argv)
   if type(argv) ~= "table" then
@@ -51,10 +52,10 @@ function M.render_markdown(context)
     "## Resolution Rules",
     "",
     "1. The engine root is the directory supplied to the exporter.",
-    "2. Project root and `.uproject` come from `<engine>/.cache/nvim-ue/state.json`.",
+    "2. Project root and `.uproject` are captured by this Neovim process; persisted state lives in `<engine>/.cache/nvim-ue/projects/<project-key>/`.",
     "3. `UE_TARGET_PLATFORM`, `UE_TARGET_CONFIGURATION`, and `UE_BUILD_TARGET` override persisted values.",
     "4. A configuration such as `Development Editor` is split into UBT configuration `Development` and target kind `Editor`.",
-    "5. `<Space>uA` selects `vim.g.ue_android_device_serial`; Android operations use `adb -s <serial>`.",
+    "5. `<Space>uA` selects process-local `vim.g.ue_android_device_serial`; Android operations use `adb -s <serial>`.",
     "6. `<Space>ui` installs the newest APK without launching it; `<Space>uq` replaces the SO and leaves the package stopped; `<Space>ul` is the explicit launch action.",
     "",
     "## Common UE Commands",
@@ -98,11 +99,28 @@ end
 function M.write(context, output_dir)
   output_dir = vim.fs.normalize(output_dir)
   vim.fn.mkdir(output_dir, "p")
+  local lease, lease_err = file_lock.acquire(output_dir .. "/.ue-nvim-context.lock")
+  if not lease then error("AI context export owned by another Neovim: " .. tostring(lease_err)) end
 
   local json_path = output_dir .. "/ue-nvim-context.json"
   local markdown_path = output_dir .. "/ue-nvim-context.md"
-  vim.fn.writefile({ vim.json.encode(context) }, json_path)
-  vim.fn.writefile(vim.split(M.render_markdown(context), "\n", { plain = true }), markdown_path)
+  local function atomic_write(path, content)
+    local temp = path .. (".tmp.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
+    local file = assert(io.open(temp, "wb"))
+    file:write(content)
+    file:close()
+    local ok, err = vim.uv.fs_rename(temp, path)
+    if not ok then
+      pcall(vim.fn.delete, temp)
+      error("cannot atomically replace " .. path .. ": " .. tostring(err))
+    end
+  end
+  local ok, write_err = xpcall(function()
+    atomic_write(json_path, vim.json.encode(context) .. "\n")
+    atomic_write(markdown_path, M.render_markdown(context) .. "\n")
+  end, debug.traceback)
+  file_lock.release(lease)
+  if not ok then error(write_err) end
   return {
     json = json_path,
     markdown = markdown_path,

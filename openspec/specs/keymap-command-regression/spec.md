@@ -19,7 +19,7 @@
 #### Scenario: leader 系列绑定存在且指向预期命令
 
 - **WHEN** keymap 用例查询 normal 模式映射
-- **THEN** `<leader>?` → `UECheatsheet`、`<leader>db` → `UEDAPToggleBreakpoint`、`<leader>dc` → `UEDAPContinue`、`<leader>da` 含 `UEDAPAttach`
+- **THEN** `<leader>?` → `UECheatsheet`、`<leader>uW` → `WindowTitle`、`<leader>db` → `UEDAPToggleBreakpoint`、`<leader>dc` → `UEDAPContinue`、`<leader>da` 含 `UEDAPAttach`
 - **AND** `<leader>vv`/`<leader>vb`/`<leader>vg` 等 sidebar 键均有映射
 - **AND** `<leader>ub` → `UEBuild`、`<leader>ul` → `UELaunch`（由 VeryLazy 覆盖应用后）
 
@@ -68,7 +68,31 @@
 #### Scenario: 辅助命令注册
 
 - **WHEN** 用例加载 `lua/config/keymaps.lua` 后查询
-- **THEN** `Restart`、`RestartDetect`、`UEDefStatus` 均 `exists == 2`
+- **THEN** `Restart`、`RestartDetect`、`UEDefStatus`、`WindowTitle`、`WindowTitleReset` 均 `exists == 2`
+
+### Requirement: 系统窗口标题命名
+
+配置 SHALL 允许为当前 Neovim/Neovide 系统窗口设置会话级名称，并 SHALL 提供恢复 Neovim 自动标题的明确路径。自定义名称进入 `'titlestring'` 时 SHALL 按字面显示，不得把用户输入当作 statusline 表达式执行；终端控制字符 SHALL 被移除。
+
+#### Scenario: 快捷键输入名称
+
+- **WHEN** 用户按 `<leader>uW` 并确认一个非空名称
+- **THEN** 当前系统窗口标题立即显示该名称
+- **AND** 名称仅作用于当前 Neovim 会话
+
+#### Scenario: 命令直接设置与恢复自动标题
+
+- **WHEN** 用户执行 `:WindowTitle Build Window`
+- **THEN** 系统窗口标题按字面显示 `Build Window`
+- **WHEN** 用户执行 `:WindowTitle!`、`:WindowTitleReset`，或在输入框确认空值
+- **THEN** 自定义名称被清除并恢复 Neovim 自动标题
+- **AND** 取消输入框不改变现有标题
+
+#### Scenario: 标题输入安全且有界
+
+- **WHEN** 名称含 `%{...}`、换行或终端控制字符
+- **THEN** 百分号按字面显示，控制字符被折叠为空格
+- **AND** 标题最多保留 80 个 Unicode 字符且不会切坏 UTF-8
 
 #### Scenario: workarounds 命令在 setup 后注册
 

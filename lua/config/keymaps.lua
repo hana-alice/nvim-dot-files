@@ -1,4 +1,6 @@
 local map = vim.keymap.set
+local window_title = require("utils.window_title")
+window_title.setup()
 
 local function live_grep_with(opts)
   return function()
@@ -269,6 +271,7 @@ map("n", "<leader>uc", "<cmd>UEExportCompileCommands<cr>", { desc = "UE: Export 
 map("n", "<leader>uP", "<cmd>UESetProject<cr>", { desc = "UE: Set project" })
 map("n", "<leader>ut", "<cmd>ThemePicker<cr>", { desc = "UI: Theme picker" })
 map("n", "<leader>uC", "<cmd>ThemePicker<cr>", { desc = "UI: Theme picker" })
+map("n", "<leader>uW", "<cmd>WindowTitle<cr>", { desc = "UI: Name window title" })
 map("n", "<leader>va", sidebar_pick, { desc = "Sidebar: Choose view" })
 map("n", "<leader>vv", sidebar_toggle(), { desc = "Sidebar: Toggle last view" })
 map("n", "<leader>vb", sidebar_toggle("buffers"), { desc = "Sidebar: Buffers" })

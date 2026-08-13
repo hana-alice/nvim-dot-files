@@ -14,6 +14,7 @@
 | 改动位置 | 最小必跑 filter |
 |---|---|
 | `lua/config/keymaps.lua` / 命令定义 | `keymaps` `commands` |
+| `lua/utils/window_title.lua` | `window_title` `keymaps` `commands` `cheatsheet` |
 | `lua/utils/android_device.lua` / Android ADB device 路由 | `android_device` `dap` `ue_context` |
 | `lua/ue/config.lua`（schema） | `ue_config` `smoke` |
 | `lua/ue.lua` 项目选择 / context 解析 | `ue_project_context` `ue_api` `smoke` |
@@ -96,6 +97,7 @@ tests/
     ├── utils_spec.lua            # utils.code_search/log/ue_paths/ue_goto 加载
     ├── keymaps_spec.lua          # 快捷键绑定（DAP 功能键多模式 / leader / gd/gr/gc / Win <C-v>）
     ├── commands_spec.lua         # 70 个 UE* 命令 + Restart/Workaround* 注册（冻结清单）
+    ├── window_title_spec.lua     # 系统窗口标题 literal/sanitize/reset/prompt 契约
     ├── options_spec.lua          # expandtab/shiftwidth/number/sessionoptions
     ├── autocmds_spec.lua         # usf→hlsl、cindent 切换、commentstring 回退
     ├── workarounds_spec.lua      # 注册表发现/无 error/frontmatter/status 形状
@@ -121,6 +123,7 @@ tests/
 | DAP | dap_spec | 平台注册 seam + attach/launch 导出 |
 | **快捷键** | keymaps_spec | 绑定存在 + 指向预期命令（不触发动作） |
 | **用户命令** | commands_spec | 全部 UE*/Restart/Workaround* 已注册 |
+| **窗口标题** | window_title_spec | literal titlestring、安全清理、命令与 prompt/reset 语义 |
 | **options** | options_spec | 关键 option 取值 |
 | **autocmd/filetype** | autocmds_spec | usf→hlsl、cindent、commentstring |
 | **workarounds** | workarounds_spec | 注册表完整性 + frontmatter |

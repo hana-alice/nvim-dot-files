@@ -56,6 +56,35 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-08-13 — 为当前 Neovim 窗口设置会话名称
+
+**Task**
+
+为并行工作的 Neovim/Neovide 窗口提供可辨识的系统标题，并保留一键恢复自动标题的路径。
+
+**Implemented**
+
+- 新增 `lua/utils/window_title.lua`，提供 `set` / `reset` / `prompt` / `setup`，名称只作用于当前会话；`%` 按字面转义，C0/DEL 控制字符被清理，长度限制为 80 个 Unicode 字符。
+- 新增 `:WindowTitle [name]`、`:WindowTitle!`、`:WindowTitleReset`；无参数打开输入框，确认空值恢复自动标题，取消不改变已有标题。
+- `lua/config/keymaps.lua` 新增 `<leader>uW` 输入入口；浮动 cheatsheet、Markdown 速查和 keymap/command 主规格同步该行为。
+- 新增 `tests/cases/window_title_spec.lua`，并将新模块加入测试范围映射；现有 keymap/command 冻结回归同步更新。
+
+**Pitfalls / Gotchas**
+
+- `'titlestring'` 使用 statusline 语法，原样写入 `%{...}` 会被求值；实现必须双写 `%`，不能只做终端控制字符过滤。
+- `titlestring=""` 且 `title=true` 才是 Neovim 的自动标题；reset 不应关闭 `'title'`。
+
+**Validation**
+
+- TDD 红灯：新增 `window_title` spec 后因 `utils.window_title` 尚不存在而按预期失败；实现后 `window_title` 7/7 passed。
+- 定向：`keymaps` 54/54、`commands` 92/92、`cheatsheet` 126/126、`structure` 38/38 passed。
+- 静态/规格：`lint_no_bare_globals` 116 files OK；`openspec validate keymap-command-regression --type spec --strict` valid；`git diff --check` passed。
+- 全量：`nvim --headless -l tests/run.lua` passed。
+
+**Follow-ups**
+
+- 无。
+
 ### 2026-08-11 — 同步并归档已完成的任务管理与 Android F9 规格
 
 **Task**

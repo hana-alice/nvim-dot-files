@@ -738,10 +738,11 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `<leader>uA`              | `:UESetAndroidDevice` — select Android device (name + serial) for this Neovim session |
 | `:UESetPlatform`          | Interactive platform+config select  |
 | `:UESetPlatform Win64 Development Editor` | Direct set         |
-| `<leader>ub`              | `:UEBuild` (platform from `:UESetPlatform`) |
-| `:UECompileForNvim`       | Build current target, then prepare its RSP-backed clangd/CDB semantics |
-| `:UEBuildIOS`             | Build only the IOS target through native macOS UBT |
-| `:UEPackageIOS`           | Build/cook/stage/package/archive IOS; never deploy or run |
+| `<leader>ub`              | `:UEBuild` (platform from `:UESetPlatform`); on macOS, silent stages show a process-tree heartbeat in the same terminal |
+| `:UECompileForNvim`       | Build current target, generate tuple-scoped IOS CDB evidence when RSP is absent, then prepare clangd semantics |
+| `:UEBuildIOS`             | Build IOS C++ through native macOS UBT; safely reuse unchanged AOT outputs and defer dSYM |
+| `:UEPackageIOS`           | Reuse existing cooked data, then stage/package IOS; never build, cook, archive, deploy, or run |
+| `:UEIOSSymbols`           | Generate the current IOS binary's dSYM on demand and verify Mach-O UUIDs; no ZIP |
 | `:UESetIOSDevice`         | Select an available physical iOS device from CoreDevice JSON |
 | `:UEInstallIOS`           | Install the current package task's `.app`; does not launch |
 | `<leader>us`              | `:UEBuildAndroidSO` — export + execute UBT compile/link actions (no Deploy/Gradle/APK) |
@@ -764,9 +765,14 @@ Android 选择写入当前 Neovim **进程内**的全局变量
 也不会影响同时运行的另一个 Neovim 实例。
 
 iOS 的设备、artifact、bundle id 与 process 状态保存于 IOS-scoped runtime state，
-不与 Android 或 Mac target 共用。推荐顺序是 `:UEPackageIOS` → `:UESetIOSDevice` →
+不与 Android 或 Mac target 共用。C++ 日常迭代顺序是 `:UEBuildIOS` → `:UEPackageIOS` → `:UESetIOSDevice` →
 `:UEInstallIOS` → `:UELaunch`。package/install 需要有效签名；无签名或无可用真机时会在只读
 preflight 失败，不会回退到 UE legacy fastlane/ideviceinstaller/instruments。
+
+`:UEBuildIOS` 的第一次构建（或 AOT 输入、工具链、SDK、framework 产物发生变化后）仍执行完整 AOT；
+只有输入指纹相同且上次成功构建记录的 framework 路径与内容 hash 全部匹配时，Nvim 才注入
+`bSkipAOTProcess=true`。日常构建固定以命令行 INI override 关闭自动 dSYM；需要调试/符号化时再执行
+`:UEIOSSymbols`，避免每次编译都支付 `dsymutil` 与 ZIP 的时间和磁盘成本。
 
 ### Less-common UE commands
 
@@ -782,7 +788,8 @@ have no key bound by default:
 | `:UEBuildAndroid`      | Force Android build target              |
 | `:UEBuildIOS`          | Build only the IOS target                |
 | `:UECompileForNvim`    | Build + RSP/CDB semantic prepare         |
-| `:UEPackageIOS`        | Package/archive IOS without deploy/run   |
+| `:UEPackageIOS`        | Stage/package existing IOS cooked data   |
+| `:UEIOSSymbols`        | Generate + UUID-check IOS dSYM on demand |
 | `:UESetIOSDevice`      | Select physical IOS device               |
 | `:UEInstallIOS`        | Install current tuple's packaged app     |
 | `:UEBuildPCH`          | Build PCH only                          |

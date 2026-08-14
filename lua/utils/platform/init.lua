@@ -57,6 +57,8 @@ M.is_linux   = M.id == "linux"
 ---@field xcrun_entry? fun(): string|table|nil, string|nil macOS-only capability
 ---@field security_entry? fun(): string|table|nil, string|nil macOS-only capability
 ---@field plutil_entry? fun(): string|table|nil, string|nil macOS-only capability
+---@field folder_picker_plan? fun(prompt?: string): table macOS-only native folder chooser
+---@field build_process_snapshot_plan? fun(root_pid?: integer): table macOS-only process-tree heartbeat snapshot
 ---@field powershell_entry? fun(): string|table|nil, string|nil legacy Windows-only compatibility alias
 
 local _drivers = {}

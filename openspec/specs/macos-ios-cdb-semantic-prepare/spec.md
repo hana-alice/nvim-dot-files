@@ -8,7 +8,7 @@
 
 ### Requirement: 系统必须准确区分语法解析与编译器语义
 
-系统必须把 Tree-sitter 语法解析和 clangd 编译语义作为两个独立状态；不得声称 `compile_commands.json` 是 Tree-sitter 工作的前置条件。
+MUST：系统必须把 Tree-sitter 语法解析和 clangd 编译语义作为两个独立状态；不得声称 `compile_commands.json` 是 Tree-sitter 工作的前置条件。
 
 #### Scenario: 编译数据库不可用但 Tree-sitter 可用
 
@@ -18,7 +18,7 @@
 
 ### Requirement: 系统必须提供显式的 Neovim 语义编译入口
 
-系统必须提供 `:UECompileForNvim`，在当前 tuple 上执行宿主原生 UBT 增量编译，并且仅在编译成功后进入 CDB 准备和 clangd 刷新。
+MUST：系统必须提供 `:UECompileForNvim`，在当前 tuple 上执行宿主原生 UBT 增量编译，并且仅在编译成功后进入 CDB 准备和 clangd 刷新。
 
 #### Scenario: macOS 上编译 IOS 目标
 
@@ -26,6 +26,13 @@
 - **THEN** 系统必须使用 `Engine/Build/BatchFiles/Mac/Build.sh`
 - **AND** 必须以 argv 数组传递 target、platform、configuration 与 `-Project=<UPROJECT>`
 - **AND** 不得调用 Windows path converter、PowerShell 或 `UnrealBuildTool.exe`
+
+#### Scenario: IOS 构建不保留 response files
+
+- **WHEN** 原生 IOS 编译成功但 Apple toolchain 没有留下当前 tuple 的 C++ response files
+- **THEN** IOS target driver 必须规划 tuple-scoped UBT `GenerateClangDatabase`
+- **AND** 该计划必须使用 `-NoExecCodeGenActions`，且不得执行 compile、Cook、Package、Deploy 或 Run
+- **AND** 生成结果必须在同一构建输出 surface 可观察，经 provenance 校验后才可原子发布
 
 #### Scenario: 编译失败
 
@@ -35,23 +42,29 @@
 
 ### Requirement: UEPrepare 必须保持纯准备语义
 
-`UEPrepare` 必须只读取和转换已有 response files；不得触发 UBT 编译或任何应用生命周期命令。
+MUST：`UEPrepare` 必须只读取和转换已有 response files 或由显式语义编译阶段发布的 tuple-scoped CDB source；不得触发 UBT、编译或任何应用生命周期命令。
 
 #### Scenario: 缺少 response files
 
-- **WHEN** 当前 tuple 没有可证明来源的 response files
+- **WHEN** 当前 tuple 既没有可证明来源的 response files，也没有已验证的 tuple-scoped CDB source
 - **THEN** `UEPrepare` 必须失败并建议运行 `:UECompileForNvim`
 - **AND** 不得自动执行编译、Cook、Package、Deploy 或 Run
 
-#### Scenario: response files 已存在
+#### Scenario: 编译证据已存在
 
-- **WHEN** 当前 tuple 存在有效 response files
+- **WHEN** 当前 tuple 存在有效 response files 或已验证的 tuple-scoped CDB source
 - **THEN** `UEPrepare` 必须直接生成或复用 CDB
 - **AND** 不得仅为准备语义而触发 UBT
 
 ### Requirement: 编译上下文必须严格隔离
 
-系统必须按 project、target、platform、configuration 精确选择 response files，并保留编译器真实 argv 与 cwd。
+MUST：系统必须按 project、target、platform、configuration 精确选择 response files 或 tuple-scoped CDB source，并保留编译器真实 argv 与 cwd。
+
+#### Scenario: 引擎内存在第三方 CDB 测试夹具
+
+- **WHEN** 第三方源码或测试目录包含名为 `compile_commands.json` 的嵌套夹具
+- **THEN** 候选发现不得递归拾取该文件
+- **AND** 任何文件条目落在当前 engine/project roots 之外的 CDB 必须在发布前拒绝
 
 #### Scenario: 同时存在 Mac 与 IOS 响应文件
 
@@ -67,7 +80,7 @@
 
 ### Requirement: 准备结果必须可追溯且增量稳定
 
-系统必须记录当前 tuple、response file provenance、输入指纹、输出指纹与 clangd 工具链身份。
+MUST：系统必须记录当前 tuple、response file provenance、输入指纹、输出指纹与 clangd 工具链身份。
 
 #### Scenario: 输入和输出均未变化
 
@@ -89,7 +102,7 @@
 
 ### Requirement: clangd 工具链必须经过版本预检
 
-系统必须按仓库声明的约束验证实际 clangd 路径和版本；不得静默接受不兼容版本或自动安装工具链。
+MUST：系统必须按仓库声明的约束验证实际 clangd 路径和版本；不得静默接受不兼容版本或自动安装工具链。
 
 #### Scenario: 系统 clangd 版本不足
 
@@ -99,7 +112,7 @@
 
 ### Requirement: 编译与准备必须异步且可取消
 
-系统必须在不阻塞 Neovim UI 的任务生命周期中执行预检、编译、准备与刷新。
+MUST：系统必须在不阻塞 Neovim UI 的任务生命周期中执行预检、编译、准备与刷新。
 
 #### Scenario: 用户取消编译
 
@@ -109,7 +122,7 @@
 
 ### Requirement: host OS 与 Unreal target platform 必须分层
 
-系统必须使用独立 host driver 表达 Windows/macOS/Linux 宿主工具能力，并使用独立 target driver 表达 Android/IOS/Mac/Win64/Linux 目标策略；不得用一个 platform 分支同时表达两个维度。
+MUST：系统必须使用独立 host driver 表达 Windows/macOS/Linux 宿主工具能力，并使用独立 target driver 表达 Android/IOS/Mac/Win64/Linux 目标策略；不得用一个 platform 分支同时表达两个维度。
 
 #### Scenario: macOS host 构建 IOS target
 
@@ -125,7 +138,7 @@
 
 ### Requirement: 每个 Unreal target 的平台策略必须独立实现
 
-Android、IOS、Mac、Win64、Linux 必须分别拥有 target-driver 模块；平台特定的脚本、argv、RSP 分类、产物、设备与生命周期策略只能存在于对应模块。
+MUST：Android、IOS、Mac、Win64、Linux 必须分别拥有 target-driver 模块；平台特定的脚本、argv、RSP 分类、产物、设备与生命周期策略只能存在于对应模块。
 
 #### Scenario: IOS 与 Mac 都运行在 macOS
 
@@ -141,7 +154,7 @@ Android、IOS、Mac、Win64、Linux 必须分别拥有 target-driver 模块；�
 
 ### Requirement: 核心调度层不得包含 target-specific 实现
 
-`lua/ue.lua` 或其后继核心调度模块必须只负责上下文解析、命令注册、任务编排和 target-driver dispatch。
+MUST：`lua/ue.lua` 或其后继核心调度模块必须只负责上下文解析、命令注册、任务编排和 target-driver dispatch。
 
 #### Scenario: 注册通用 UEBuild 命令
 

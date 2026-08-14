@@ -87,10 +87,13 @@ t.describe("ue target integration", function()
     end)
 
     t.assert_eq(err, nil)
-    t.assert_eq(command[1], "/UE Root/Engine/Build/BatchFiles/Mac/Build.sh")
+    t.assert_eq(command[1], "/bin/zsh")
+    t.assert_contains(command, vim.fn.stdpath("config") .. "/scripts/ue_ios_cpp_iteration.zsh")
+    t.assert_contains(command, "/UE Root/Engine/Build/BatchFiles/Mac/Build.sh")
     t.assert_contains(command, "IOS")
     t.assert_contains(command, "-Project=/Project Root/Sample.uproject")
     t.assert_eq(plan.metadata.platform, "IOS")
+    t.assert_eq(plan.metadata.optimization, "cpp-iteration")
   end)
 
   t.it("Mac target uses its own driver and never receives IOS argv", function()
@@ -141,6 +144,28 @@ t.describe("ue target integration", function()
     t.assert_true(compatible)
     t.assert_false(apple)
     t.assert_false(future_minor)
+  end)
+
+  t.it("routes IOS semantic generation before prepare without changing UEPrepare semantics", function()
+    local source = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
+    local compile_start = assert(source:find("function CORE_RT%.compile_for_nvim", 1))
+    local compile_end = assert(source:find("%-%- Find the newest APK", compile_start))
+    local compile_body = source:sub(compile_start, compile_end)
+    local semantic_pos = compile_body:find("generate_semantic_cdb_after_build", 1, true)
+    local prepare_pos = compile_body:find("CORE_RT.prepare_async", 1, true)
+
+    t.assert_true(semantic_pos ~= nil, "UECompileForNvim must generate Apple semantic evidence after build")
+    t.assert_true(prepare_pos ~= nil and semantic_pos < prepare_pos)
+    t.assert_contains(compile_body, "force_cdb_restart")
+    t.assert_contains(compile_body, "semantic_info.no_op ~= true")
+
+    local prepare_start = assert(source:find("local function prepare_async", 1, true))
+    local prepare_end = assert(source:find("export_compile_commands = prepare_async", prepare_start, true))
+    local prepare_body = source:sub(prepare_start, prepare_end)
+    t.assert_false(
+      prepare_body:find("GenerateClangDatabase", 1, true) ~= nil,
+      "UEPrepare must remain read/transform-only"
+    )
   end)
 
   t.it("keeps IOS command strings out of other target drivers", function()

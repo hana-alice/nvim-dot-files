@@ -138,10 +138,12 @@ go install ./...   # 需 Go >= 1.22，且 $GOBIN 在 PATH
 ```
 
 推荐直接执行 `:UECompileForNvim`：先验证仓库钉死的 clangd 22.1.x，再编译当前 target，
-最后从真实 `.rsp` 准备 CDB 与索引。Tree-sitter 语法高亮不依赖这一步；clangd 导航、诊断和
-编译器语义需要 CDB。
+最后准备 CDB 与索引。IOS 编译不会保留 C++ response file，因此 build 成功后会在同一个构建
+终端继续执行 tuple-scoped UBT `GenerateClangDatabase` action-graph 阶段；它不执行编译、Cook 或
+Package。Tree-sitter 语法高亮不依赖这一步；clangd 导航、诊断和编译器语义需要 CDB。
 
-`:UEBuild` 仍然只构建；已有新鲜 `.rsp` 时可单独执行 `:UEPrepare`。
+`:UEBuild` 仍然只构建；已有新鲜 response file 或已验证的 tuple-scoped semantic source 时可单独
+执行 `:UEPrepare`。
 
 ### 4. 构建索引
 
@@ -165,8 +167,9 @@ go install ./...   # 需 Go >= 1.22，且 $GOBIN 在 PATH
 | 文件 picker | `<leader><leader>` |
 | 编译（当前平台） | `<leader>ub` / `:UEBuild` |
 | 编译并准备 Neovim 编译器语义 | `:UECompileForNvim` |
-| 只编译 IOS | `:UEBuildIOS` |
-| IOS 打包/归档 | `:UEPackageIOS` |
+| 只编译 IOS C++（安全复用 AOT，默认不生成 dSYM） | `:UEBuildIOS` |
+| 复用已有 cooked 数据组 IOS 包 | `:UEPackageIOS` |
+| 按需生成并校验 IOS dSYM | `:UEIOSSymbols` |
 | IOS 选设备 / 安装 / 启动 | `:UESetIOSDevice` / `:UEInstallIOS` / `:UELaunch` |
 | 仅编译 Android SO（跳过 APK） | `<leader>us` / `:UEBuildAndroidSO` |
 | Android SO 快速部署（root 设备；替换后不启动） | `<leader>uq` / `:UEDeployAndroidSO` |

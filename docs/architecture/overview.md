@@ -60,14 +60,20 @@
   才保持普通 APK 启动；部分 staging 必须拒绝。项目目录、Target、包名、设备 serial
   和 data/native 目录均动态派生，不固定现场身份。
 - **编译器语义**：`:UECompileForNvim` → clangd 22.1.x 预检 → 当前 target driver 生成原生 UBT
-  build plan → 成功后复用 `:UEPrepare` 的 RSP/CDB/index 流程。Tree-sitter 语法解析与此分离，
-  不会被 clangd/CDB 缺失伪装成失败。
+  build plan → 成功后，保留 response file 的 target 直接复用证据；IOS driver 则追加一个不执行
+  compile/cook/package 的 tuple-scoped `GenerateClangDatabase` action-graph plan，并先原子发布到
+  `.cache/nvim-ue/cdb/sources/<tuple>/` → 最后复用 `:UEPrepare` 的纯读取/CDB/index 流程。候选只来自
+  受控路径，并按工程根与 target compiler evidence 校验；不得递归捡取 ThirdParty 测试夹具。
+  Tree-sitter 语法解析与此分离，不会被 clangd/CDB 缺失伪装成失败。
 - **核心健康审计**：`:NvimCoreHealth` 异步启动 `scripts/nvim_core_health.lua` → 隔离临时目录验证真实
   init、编辑事务、mandatory Tree-sitter AST、rg/csearch、clangd/CDB 与 target driver 纯计划 → 按
   `PASS/FAIL/BLOCKED/SKIP` 输出脱敏报告并清理。`--live` 只读取显式提供的既有 tuple/artifact，
   不触发安装、更新、UE build/package/device 或 DAP。
-- **iOS 应用**：`:UEBuildIOS` 只经 IOS target driver 调 macOS `Build.sh`；`:UEPackageIOS` 经同一
-  driver 规划 UAT BuildCookRun（Build/Cook/Stage/Package/Archive，不含 Deploy/Run）；
+- **iOS 应用**：`:UEBuildIOS` 经 IOS target driver 和 macOS zsh wrapper 调原生 `Build.sh`；wrapper
+  只在 AOT 输入指纹、SDK/工具链与上次成功 framework 产物全部匹配时注入 `bSkipAOTProcess=true`，
+  并用稳定 INI override 延后 dSYM。`:UEPackageIOS` 规划 UAT BuildCookRun
+  （SkipBuild/SkipCook/Stage/NoCleanStage/Package，不含 Cook/Archive/Deploy/Run）；`:UEIOSSymbols`
+  按需运行 dsymutil 并比较 binary/dSYM UUID；
   `:UESetIOSDevice` / `:UEInstallIOS` / `:UELaunch` 使用结构化 CoreDevice JSON、当前 package task 的
   `Binaries/IOS/Payload/<Target>.app` provenance 与真实 bundle id。iOS run 不隐式进入 DAP。
 - **DAP**：setup 先按 host-target-operation matrix 过滤 handler，再由 `UEDAP*` 命令经
@@ -132,7 +138,9 @@ matrix 声明与回归，不能在 generic orchestration 中添加 shell/path �
   只读 probe 选择 root adbd / verified `su 0` 或 debuggable `run-as` + startup-agent transport。
   本次 macOS 能力只面向 IOS，不实现或暗示 macOS→Android。
 - macOS/iOS：host driver 提供原生 `Build.sh` / `RunUAT.sh` / Xcode executable；IOS target driver
-  独占 BuildCookRun、SDK/签名预检、packaged app provenance、devicectl install/launch。
+  独占 C++ iteration wrapper、只复用 cooked data 的 BuildCookRun、按需 dSYM、SDK/签名预检、
+  packaged app provenance、devicectl install/launch。AOT 指纹只写 engine `.cache/nvim-ue`，不修改
+  工程或引擎代码。
 - 端到端搭建流程见 `docs/skills/ue-ide-bootstrap.md`。
 
 ## 5. 关键归属边界（ownership boundaries）

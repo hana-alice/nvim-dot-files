@@ -18,7 +18,7 @@ Neovim now has one isolated, machine-readable health audit for real config start
 - `core_health`: **28/28 passed**, including real `-u init.lua` startup, two consecutive audits, CLI parsing,
   caller-owned directory preservation, invalid/missing parser behavior and read-only live provenance/freshness fixtures.
 - Real deterministic audit: startup/editor/C/C++/HLSL AST/rg/CDB/five target plans/cleanup all `PASS`.
-- Current external gates are explicit: csearch/cindex are absent and Apple clangd 17.0.0 does not satisfy 22.1.x,
+- Current external gates are explicit: csearch/cindex are absent and the host-provided Apple clangd does not satisfy 22.1.x,
   so the machine report is `DEGRADED`, not a false all-green result.
 - Scoped `stylua --check`, `git diff --check`, commands/cheatsheet/smoke/structure/task-registry and code-search
   regressions pass.

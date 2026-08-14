@@ -11,6 +11,12 @@ local function write_file(path, content)
   f:close()
 end
 
+local function canonical_temp_root(suffix)
+  local root = vim.fn.tempname():gsub("\\", "/") .. suffix
+  vim.fn.mkdir(root, "p")
+  return vim.fs.normalize(vim.uv.fs_realpath(root) or root)
+end
+
 local function read_json(path)
   local f = assert(io.open(path, "rb"))
   local decoded = vim.json.decode(f:read("*a"))
@@ -25,9 +31,14 @@ local function python_command(script, ...)
   if python ~= "" then
     cmd = { python, "-I", script }
   else
-    local py = vim.fn.exepath("py")
-    assert(py ~= "", "python or py launcher is required")
-    cmd = { py, "-3", "-I", script }
+    local python3 = vim.fn.exepath("python3")
+    if python3 ~= "" then
+      cmd = { python3, "-I", script }
+    else
+      local py = vim.fn.exepath("py")
+      assert(py ~= "", "python, python3, or py launcher is required")
+      cmd = { py, "-3", "-I", script }
+    end
   end
   vim.list_extend(cmd, args)
   return cmd
@@ -128,7 +139,7 @@ t.describe("ue.index generation manifests", function()
   end)
 
   t.it("hot controlled background CDB adds portable members/module-root metadata without mutating input", function()
-    local root = vim.fn.tempname():gsub("\\", "/") .. "_hot_super_metadata"
+    local root = canonical_temp_root("_hot_super_metadata")
     local source_dir = root .. "/Engine/Source/Runtime/Sample/Private"
     local unity_root = root .. "/Build/Intermediate/Build/Android/Target/Development"
     local unity_file = unity_root .. "/Sample/Module.Sample.1_of_1.cpp"
@@ -282,7 +293,7 @@ t.describe("ue.index generation manifests", function()
   end)
 
   t.it("groups sources only through unity membership emitted by the active build", function()
-    local root = vim.fn.tempname():gsub("\\", "/") .. "_active_unity"
+    local root = canonical_temp_root("_active_unity")
     local source_dir = root .. "/Engine/Source/Runtime/Sample/Private"
     local unity_root = root .. "/Build/Intermediate/Build/Android/Target/Development"
     local unity_file = unity_root .. "/Sample/Module.Sample.1_of_1.cpp"

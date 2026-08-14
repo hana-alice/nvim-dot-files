@@ -17,8 +17,8 @@ macOS now builds UE Mac and IOS targets through native host tools, while IOS own
 - Full regression: `nvim --headless -l tests/run.lua` → **774/774 passed**.
 - New target/host isolation, IOS plan/artifact/device/runtime, commands/API and cross-platform portability tests pass.
 - Scoped formatting and `git diff --check` pass.
-- Xcode, iPhoneOS 26.0 SDK, CoreDevice and UE native scripts were detected locally; generated plans contain no PowerShell or implicit Deploy/Run.
-- Real IOS device E2E remains explicitly gated by the absence of a valid code-sign identity and a connected CoreDevice tunnel.
+- A read-only capability probe found the required Xcode, iPhoneOS SDK, CoreDevice, and UE native entry points; generated plans contain no PowerShell or implicit Deploy/Run.
+- Real IOS device E2E remains an environment-gated lane; no signing identity, device identifier, or project-specific probe output is recorded here.
 - Git tag `v1.4.0` is intentionally pending explicit user confirmation.
 
 ---
@@ -52,8 +52,8 @@ macOS now builds UE Mac and IOS targets through native host tools, while IOS own
 
 - macOS host、Mac target 与 IOS target 是三个不同概念；同一宿主不能成为共享 target policy 的理由。
 - UE raw staged app 不等于可安装的签名 app；设备流程必须绑定成功 package task 的 tuple/provenance。
-- 本机 Apple clangd 为 17.0.0，不满足仓库钉死的 22.1.x；codesign identity 为 0，已配对设备的
-  CoreDevice tunnel 也均 unavailable，因此不能宣称真实 Build→Package→Install→Launch E2E 已完成。
+- host 自带 Apple clangd 不满足仓库钉死的 22.1.x；签名与真机条件也未满足，因此不能宣称真实
+  Build→Package→Install→Launch E2E 已完成。具体本机版本、身份数量和设备状态不写入公开记录。
 - 内部飞书页面在当前会话不可读取；UE 4.26.2-derived 本地源码、Xcode/SDK 和实际 argv 作为实现依据。
 
 **Validation**
@@ -61,7 +61,7 @@ macOS now builds UE Mac and IOS targets through native host tools, while IOS own
 - 完整回归：`nvim --headless -l tests/run.lua` → **774/774 passed**。
 - target/platform/commands/API/DAP/CDB 专项均通过；新增 Lua 文件通过 scoped `stylua --check`，
   `git diff --check` 通过。
-- 本机只读探测确认 Xcode、iPhoneOS 26.0 SDK、`devicectl` 与 UE 的 `Build.sh`/`RunUAT.sh` 可用；
+- 只读能力探测确认 Xcode、iPhoneOS SDK、`devicectl` 与 UE 的 `Build.sh`/`RunUAT.sh` 可用；
   实际 MobileStarterContent plan 全程使用原生 shell argv，未包含 PowerShell、Deploy 或 Run。
 
 **Follow-ups**

@@ -78,9 +78,14 @@ that compiler-semantic gate is not met.
 
 The macOS host driver uses only native engine and Xcode entry points:
 
-- `<engine>/Engine/Build/BatchFiles/Mac/Build.sh` for UBT target builds.
-- `<engine>/Engine/Build/BatchFiles/RunUAT.sh BuildCookRun` for iOS
-  build/cook/stage/package/archive.
+- `<engine>/Engine/Build/BatchFiles/Mac/Build.sh` for UBT target builds; the
+  Nvim-owned zsh wrapper only adds a fail-closed AOT fingerprint cache and the
+  stable daily no-dSYM override before invoking this native entry.
+- `<engine>/Engine/Build/BatchFiles/RunUAT.sh BuildCookRun` for local iOS
+  `-skipbuild -skipcook -stage -nocleanstage -package`; cooked data must already
+  exist and Nvim never starts a local Cook.
+- `xcrun dsymutil` plus `xcrun dwarfdump --uuid` for explicit
+  `:UEIOSSymbols`; daily builds do not create or ZIP dSYM bundles.
 - `/usr/bin/xcrun devicectl` with `--json-output <file>` for physical-device
   discovery, `.app` install and process launch.
 - `/usr/bin/security` for a read-only code-sign identity gate and

@@ -44,6 +44,48 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-08-14 — 将 macOS/iOS 开发链路安全整合到最新主线
+
+**Task**
+
+把当前 macOS/iOS 开发分支 rebase 到最新 `main`，保留主线的 project-bucket、多实例 writer
+与 target matrix 契约，并确保公开 PR 不携带用户名、项目名、设备、签名或本机绝对路径。
+
+**Implemented**
+
+- 合并主线的 project-scoped state/lease 与本分支的 iOS target、AOT 复用、build monitor 和
+  Neovide 适配；冲突按当前架构边界解决，没有恢复已退役的全局状态写法。
+- iOS 增量脚本改为在项目内容目录下唯一发现 `ScriptAssemblies`，不再硬编码私有项目目录名；
+  缺失或存在多个候选时 fail closed。
+- 修复 POSIX wrapper CDB 从 staging 迁移到稳定目录时的路径重写、真实路径 canonicalization、
+  macOS `xcrun` 编译 cursor shim 与测试侧 `python3` 发现。
+- 修复多 Neovim 并发创建嵌套缓存目录的 `E739` 竞争，并强化 recent-project 异步重试与
+  definition-cache 并发测试 flush，避免短命子进程退出前丢写。
+- 测试夹具、发布记录和脚本说明统一改为合成示例；不记录私有项目、用户、设备、签名、SDK
+  小版本、精确包体数量或耗时。
+
+**Pitfalls / Gotchas**
+
+- `mkdir(..., "p")` 在多个进程同时创建不同深度的同一目录树时，可能因中间父目录被抢先创建而
+  抛出 `E739`，此时最终目标目录尚未出现，不能只检查一次 `isdirectory()`。
+- Windows 风格反斜杠替换无法命中 macOS/Linux 生成的 wrapper CDB；稳定目录发布必须同时识别
+  POSIX 与 Windows 两种路径拼写。
+- rebase 后远端 feature branch 历史已变化，推送必须使用带 lease 保护的 force push。
+
+**Validation**
+
+- 定向：`index_generation` 16/16 passed；`multi_instance_state` 双路并发压力复跑均 11/11 passed；
+  Python CDB 工具 `py_compile` passed。
+- 全量：`nvim --headless -l tests/run.lua` 936/936 passed。
+- 静态/规格：`lint_no_bare_globals` 135 files OK；三个新增 OpenSpec main specs 在官方 CLI 1.9.0
+  下 strict validation 均 valid；`git diff --check` passed。
+- 脱敏：公开 PR 新增行通过仓库 secret hook；私有用户名、项目名、域名、bundle、设备/签名、包号
+  与本机绝对路径扩展扫描均为零命中，保留项仅为明确的合成测试 identity。
+
+**Follow-ups**
+
+- 物理 iOS 设备上的签名、安装、启动与增量动态库替换仍需在私有环境验证；公开记录不包含其输出。
+
 ### 2026-08-14 — 保留 project-bucket 升级前的 UE 索引与 CDB
 
 **Task**
@@ -183,6 +225,133 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 **Follow-ups**
 
 - 无。
+### 2026-08-12 — Restore complete IOS/Metal clangd compilation evidence
+
+**Task**
+
+- Fix the incomplete IOS semantic parse after a successful MetalRHI build and `:UEPrepare`, without changing project or engine source/configuration.
+
+**Implemented**
+
+- Stopped recursively discovering arbitrary nested `compile_commands.json` files; the previously published three-entry database was an LLVM Python test fixture under `Engine/Source/ThirdParty`.
+- Added root-ownership and IOS compiler-evidence validation before any existing CDB can replace the canonical database.
+- Added an IOS target-driver `semantic_cdb` plan. After `:UECompileForNvim` builds successfully, it runs UBT `GenerateClangDatabase` with `-NoExecCodeGenActions` in the existing build terminal, validates the full tuple, atomically publishes it under `.cache/nvim-ue/cdb/sources/<tuple>/`, and then invokes the existing prepare-only pipeline.
+- Prioritized that tuple-owned source over derived canonical mirrors, required every IOS entry to match the active target/configuration, and carried source-publication state into the pipeline so an unchanged post-process still restarts clangd. This fixes `gd` on macros such as `CompiledMetalFx` remaining attached to the previous three-entry database.
+- Kept `:UEPrepare` read/transform-only: it can consume response files or a validated tuple-scoped source but never invokes UBT, Cook, Package, Deploy, or Run.
+
+**Pitfalls / Gotchas**
+
+- `MetalRHI` belongs to the IOS game/client target and is covered. `MetalShaderFormat` is a host-side developer/editor module and is intentionally not mixed into the device-target database.
+- The host-provided Apple clangd remains below the repository's pinned LLVM clangd 22.1.x contract; accurate CDB coverage and clangd compatibility are separate gates.
+
+**Validation**
+
+- A sanitized local `SampleGame / IOS / Development` probe produced a tuple-complete database covering the target's MetalRHI sources without Cook, Package, or compile actions.
+- The final canonical CDB retained complete IOS compiler evidence and rejected all foreign fixture entries; project-specific entry counts and timings are intentionally omitted.
+- Focused headless regressions: `ue_cdb` 24/24, `ue_target_drivers` 31/31, `ue_target_integration` 10/10, plus real init startup passed.
+- Full headless regression: `nvim --headless -l tests/run.lua` — 855/855 passed.
+
+### 2026-08-11 — Shorten local iOS C++ iteration without touching the project
+
+**Task**
+
+- Apply the iOS build-time improvements that can live entirely in Nvim/scripts, with local packaging explicitly reusing cooked data and never cooking.
+
+**Implemented**
+
+- Wrapped native IOS `Build.sh` in a macOS zsh helper that fingerprints AOT DLLs, runtime inputs, AOT tools, postprocessing code, SDK/toolchain identity, and the adapter build file.
+- Injected `bSkipAOTProcess=true` only after a prior successful build published a matching manifest and every recorded framework path and content hash still match; cache misses clear inherited AOT skip/disable variables and run the full process.
+- Added stable command-line INI overrides that suppress automatic dSYM generation/bundling during daily C++ builds.
+- Changed `:UEPackageIOS` to `-skipbuild -skipcook -stage -nocleanstage -package -nodebuginfo`, removing local build/cook/archive/deploy/run stages.
+- Added `:UEIOSSymbols` to run `dsymutil` only when needed, print binary/dSYM UUID evidence, and reject mismatches without producing a ZIP.
+
+**Pitfalls / Gotchas**
+
+- The first build, any input/toolchain change, or any missing recorded framework intentionally pays the full AOT cost; the cache fails closed rather than guessing freshness.
+- `-nocleanstage` is a local C++ iteration optimization. A release/distribution pipeline remains responsible for a clean content build outside this command.
+- These changes write only engine `.cache/nvim-ue` state and normal build outputs; no project or engine source/config file is modified.
+
+**Validation**
+
+- Focused: `ue_target_drivers` 28/28, `ue_target_integration` 9/9, `ue_target_tasks` 4/4, `platform` 22/22, `commands` 95/95, `ue_api` 55/55, `smoke` 18/18, `structure` 39/39, and `ue_ios_cpp_iteration` 3/3 passed.
+- Full: `nvim --headless -l tests/run.lua` — 843/843 passed.
+
+### 2026-08-11 — Show silent UE build activity in the existing terminal
+
+**Task**
+
+- Keep `<leader>ub` build diagnostics inside its existing terminal window instead of opening a separate monitor view.
+
+**Implemented**
+
+- Added a macOS-owned process snapshot capability using native `/bin/ps`; Windows and Linux drivers do not pretend to support it.
+- Added an asynchronous, build-scoped process-tree monitor that identifies the active child tool/file, CPU use, elapsed time, process count, and the two preceding stage observations.
+- Rendered the heartbeat as terminal-buffer virtual lines, preserving the real UBT output, terminal stdin, exit code, and quickfix behavior.
+- Bound monitor startup/cleanup to the existing `termopen` job, including job exit and terminal-buffer wipeout.
+
+**Pitfalls / Gotchas**
+
+- This exposes activity while a child process buffers its own output; it cannot recover log lines that the project process has not emitted.
+- The process snapshot capability is intentionally macOS-only until another host receives its own native driver implementation.
+
+**Validation**
+
+- Added parser, descendant filtering, active-stage selection, lifecycle, same-buffer virtual-line, platform ownership, and UE terminal integration regressions.
+- Real macOS terminal probe observed `[UE heartbeat] ... sleep ...` from a live child process and cleaned it up without touching terminal output.
+- Focused: `ue_build_monitor` 7/7, `platform` 22/22, `commands` 94/94, `ue_api` 55/55, and `smoke` 18/18 passed.
+- Full: `nvim --headless -l tests/run.lua` — 836/836 passed.
+
+### 2026-08-11 — Clear LazyHealth package-provider warnings
+
+**Task**
+
+- Resolve all current `:checkhealth lazy` errors and warnings.
+
+**Implemented**
+
+- Disabled Lazy's unused LuaRocks/hererocks provider because no configured plugin requires LuaRocks.
+- Removed the empty legacy `site/pack/core/opt` directory that Lazy reported as an existing package root.
+
+**Pitfalls / Gotchas**
+
+- Installing hererocks would add an unused second Lua runtime without helping any current plugin.
+- The legacy package path was verified empty before removal.
+
+**Validation**
+
+- `:checkhealth lazy` — 0 errors, 0 warnings.
+- Focused: `core_health` 28/28 passed.
+- Full: `nvim --headless -l tests/run.lua` — 828/828 passed.
+
+**Follow-ups**
+
+- Re-enable `rocks` only if a future plugin explicitly requires LuaRocks.
+
+### 2026-08-11 — Expose Neovide and restore native Open Folder
+
+**Task**
+
+- Make the installed Neovide app callable from zsh and add the missing `o` Open Folder action on the macOS Neovide dashboard.
+
+**Implemented**
+
+- Added the Neovide app-bundle CLI directory to the login zsh PATH.
+- Added a macOS-owned native folder-picker plan and an async Neovide handoff that changes cwd before opening the Snacks file picker.
+- Added one idempotent dashboard `o` entry, visible only in Neovide on macOS; native dialog cancellation is a silent no-op.
+
+**Pitfalls / Gotchas**
+
+- `/Applications/Neovide.app` was already installed; Homebrew did not expose its bundled executable on PATH.
+- Native AppleScript selection remains in the macOS host driver rather than leaking into the dashboard/plugin layer.
+
+**Validation**
+
+- Focused: `neovide` 3/3, `platform` 21/21, and `smoke` 18/18 passed.
+- Full: `nvim --headless -l tests/run.lua` — 828/828 passed.
+
+**Follow-ups**
+
+- None.
 
 ### 2026-08-11 — Make host, target, and shell compatibility explicit
 

@@ -7,6 +7,9 @@ local contract = require("ue.targets.contract")
 local function host_stub()
   return {
     id = "macos",
+    shell_entry = function(kind)
+      if kind == "posix" then return "/bin/zsh" end
+    end,
     ue_build_entry = function()
       return {
         executable = "/UE/Engine/Build/BatchFiles/Mac/Build.sh",
@@ -84,6 +87,7 @@ t.describe("ue.targets registry and contract", function()
     }
 
     local ios = targets.resolve("IOS", "build", macos)
+    local ios_semantic = targets.resolve("IOS", "semantic_cdb", macos)
     local android = targets.resolve("Android", "build", windows)
     local _, mac_android = targets.resolve("Android", "build", macos)
     local _, win_ios = targets.resolve("IOS", "build", windows)
@@ -91,6 +95,7 @@ t.describe("ue.targets registry and contract", function()
     local _, ios_dap = targets.resolve("IOS", "dap_attach", macos)
 
     t.assert_eq(ios.id, "IOS")
+    t.assert_eq(ios_semantic.id, "IOS")
     t.assert_eq(android.id, "Android")
     t.assert_eq(mac_android.status, "unavailable")
     t.assert_eq(mac_android.host_id, "macos")
@@ -147,6 +152,10 @@ t.describe("ue.targets build planners", function()
 
     t.assert_eq(plan.executable, "/UE/Engine/Build/BatchFiles/Mac/Build.sh")
     t.assert_contains(plan.args, "IOS")
+    t.assert_contains(
+      plan.args,
+      "-ini:Engine:[/Script/IOSRuntimeSettings.IOSRuntimeSettings]:bGeneratedSYMFile=False,[/Script/IOSRuntimeSettings.IOSRuntimeSettings]:bGeneratedSYMBundle=False"
+    )
     t.assert_false(
       vim.deep_equal(
         plan.args,
@@ -158,6 +167,84 @@ t.describe("ue.targets build planners", function()
       ),
       "iOS and Mac target argv must remain independent"
     )
+  end)
+
+  t.it("IOS semantic CDB plan builds only the tuple action graph", function()
+    local plan = targets.plan("IOS", "semantic_cdb", {
+      engine_root = "/UE",
+      target = "SampleGame",
+      configuration = "Development",
+      uproject = "/Project/Sample.uproject",
+      semantic_cdb_output_dir = "/UE/.cache/nvim-ue/cdb/sources/IOS-SampleGame-Development",
+      semantic_cdb_output_filename = "compile_commands.pending.json",
+    }, host_stub())
+
+    t.assert_eq(plan.executable, "/UE/Engine/Build/BatchFiles/Mac/Build.sh")
+    t.assert_contains(plan.args, "SampleGame")
+    t.assert_contains(plan.args, "IOS")
+    t.assert_contains(plan.args, "Development")
+    t.assert_contains(plan.args, "-Mode=GenerateClangDatabase")
+    t.assert_contains(plan.args, "-NoExecCodeGenActions")
+    t.assert_contains(plan.args, "-UsePCH")
+    t.assert_contains(plan.args, "-OutputFilename=compile_commands.pending.json")
+    t.assert_false(vim.tbl_contains(plan.args, "BuildCookRun"))
+    t.assert_false(vim.tbl_contains(plan.args, "-cook"))
+    t.assert_false(vim.tbl_contains(plan.args, "-package"))
+  end)
+
+  t.it("IOS semantic CDB validator requires IOS compiler evidence", function()
+    local ios = targets.must_get("IOS")
+    local ios_result = ios.validate_semantic_cdb({
+      {
+        file = "/UE/Engine/Source/Runtime/Apple/MetalRHI/Private/MetalBuffer.cpp",
+        output = "/Project/Intermediate/Build/IOS/SampleGame/Development/MetalRHI/MetalBuffer.cpp.o",
+        command = "clang++ -isysroot /Xcode/iPhoneOS.platform/SDK -miphoneos-version-min=14.0",
+      },
+    }, { target = "SampleGame", configuration = "Development" })
+    local mac_result = ios.validate_semantic_cdb({
+      {
+        file = "/UE/Engine/Source/Runtime/Core/Private/Core.cpp",
+        command = "clang++ -isysroot /Xcode/MacOSX.platform/SDK",
+      },
+    }, { target = "SampleGame", configuration = "Development" })
+
+    t.assert_true(ios_result.ok)
+    t.assert_eq(ios_result.matched, 1)
+    t.assert_false(mac_result.ok)
+    t.assert_contains(mac_result.reason, "IOS")
+  end)
+
+  t.it("IOS semantic CDB validator rejects a different target/config tuple", function()
+    local result = targets.must_get("IOS").validate_semantic_cdb({
+      {
+        file = "/UE/Engine/Source/Runtime/Apple/MetalRHI/Private/MetalBuffer.cpp",
+        output = "/Project/Intermediate/Build/IOS/OtherGame/Shipping/MetalRHI/MetalBuffer.cpp.o",
+        command = "clang++ -isysroot /Xcode/iPhoneOS.platform/SDK",
+      },
+    }, { target = "SampleGame", configuration = "Development" })
+
+    t.assert_false(result.ok)
+    t.assert_contains(result.reason, "SampleGame/Development")
+  end)
+
+  t.it("wraps the native IOS build with the Nvim-owned safe AOT cache when config_root is available", function()
+    local plan = targets.build_plan("IOS", {
+      engine_root = "/UE",
+      project_dir = "/Project Root",
+      target = "SampleGame",
+      configuration = "Development",
+      uproject = "/Project Root/Sample.uproject",
+      config_root = "/Nvim Config",
+    }, host_stub())
+
+    t.assert_eq(plan.executable, "/bin/zsh")
+    t.assert_eq(plan.args[1], "/Nvim Config/scripts/ue_ios_cpp_iteration.zsh")
+    t.assert_contains(plan.args, "build")
+    t.assert_contains(plan.args, "/UE/Engine/Build/BatchFiles/Mac/Build.sh")
+    t.assert_contains(plan.args, "--project-dir")
+    t.assert_contains(plan.args, "/Project Root")
+    t.assert_contains(plan.args, "--cache-dir")
+    t.assert_contains(plan.args, "/UE/.cache/nvim-ue/ios-aot")
   end)
 
   t.it("Win64 build retains WaitMutex and FromMsBuild flags", function()
@@ -353,20 +440,47 @@ end)
 t.describe("ue.targets.ios package/device/install/launch planners", function()
   local ios = targets.must_get("IOS")
 
-  t.it("builds a pure BuildCookRun plan without deploy/run", function()
+  t.it("packages existing cooked data without build, cook, archive, deploy, or run", function()
     local plan = ios.package_plan({
       target = "SampleGame",
       configuration = "Development",
       uproject = "/Project/Sample.uproject",
-      archive_dir = "/Archives/SampleGame",
     }, host_stub())
 
     t.assert_eq(plan.executable, "/UE/Engine/Build/BatchFiles/RunUAT.sh")
     t.assert_contains(plan.args, "BuildCookRun")
     t.assert_contains(plan.args, "-targetplatform=IOS")
-    t.assert_contains(plan.args, "-archive")
+    t.assert_contains(plan.args, "-skipbuild")
+    t.assert_contains(plan.args, "-skipcook")
+    t.assert_contains(plan.args, "-nocleanstage")
+    t.assert_contains(plan.args, "-stage")
+    t.assert_contains(plan.args, "-package")
+    t.assert_contains(plan.args, "-nodebuginfo")
+    t.assert_false(vim.tbl_contains(plan.args, "-build"))
+    t.assert_false(vim.tbl_contains(plan.args, "-cook"))
+    t.assert_false(vim.tbl_contains(plan.args, "-archive"))
     t.assert_false(vim.tbl_contains(plan.args, "-deploy"))
     t.assert_false(vim.tbl_contains(plan.args, "-run"))
+    t.assert_eq(table.concat(plan.metadata.stages, ","), "stage,package")
+    t.assert_true(plan.metadata.reuses_cooked_data)
+  end)
+
+  t.it("builds an on-demand dSYM plan that verifies Mach-O UUIDs in the same terminal", function()
+    local plan = ios.symbols_plan({
+      engine_root = "/UE",
+      project_dir = "/Project Root",
+      target = "SampleGame",
+      configuration = "Development",
+      uproject = "/Project Root/Sample.uproject",
+      config_root = "/Nvim Config",
+    }, host_stub())
+
+    t.assert_eq(plan.executable, "/bin/zsh")
+    t.assert_eq(plan.args[1], "/Nvim Config/scripts/ue_ios_cpp_iteration.zsh")
+    t.assert_contains(plan.args, "symbols")
+    t.assert_contains(plan.args, "/usr/bin/xcrun")
+    t.assert_contains(plan.args, "/Project Root/Binaries/IOS/SampleGame")
+    t.assert_eq(plan.metadata.output, "/Project Root/Binaries/IOS/SampleGame.dSYM")
   end)
 
   t.it("builds devicectl list/install/launch plans from xcrun entries", function()
@@ -612,11 +726,12 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
 
   t.it("exposes stage-specific preflight descriptors owned by the iOS driver", function()
     local preflights = ios.preflight_descriptors()
-    t.assert_eq(#preflights, 4)
+    t.assert_eq(#preflights, 5)
     t.assert_eq(preflights[1].stage, "build")
     t.assert_eq(preflights[2].stage, "package")
-    t.assert_eq(preflights[3].stage, "install")
-    t.assert_eq(preflights[4].stage, "launch")
+    t.assert_eq(preflights[3].stage, "symbols")
+    t.assert_eq(preflights[4].stage, "install")
+    t.assert_eq(preflights[5].stage, "launch")
     t.assert_eq(preflights[2].requires[3].host_capability, "security_entry")
   end)
 end)

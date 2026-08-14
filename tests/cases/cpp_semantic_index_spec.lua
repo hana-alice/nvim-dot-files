@@ -54,6 +54,10 @@ local function python_cmd()
   if python ~= "" then
     return { normalize(python), runner }
   end
+  local python3 = vim.fn.exepath("python3")
+  if python3 ~= "" then
+    return { normalize(python3), runner }
+  end
   local py = vim.fn.exepath("py")
   if py ~= "" then
     return { normalize(py), "-3", runner }

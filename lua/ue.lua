@@ -3340,10 +3340,9 @@ local function compile_commands_targets(ctx)
   return require("ue.cdb.paths").targets(ctx)
 end
 
-local function compile_commands_candidates(ctx)
+local function compile_commands_candidates(ctx, tuple)
   return require("ue.cdb.paths").candidates(ctx, {
-    first_executable = first_executable,
-    run_lines        = run_lines,
+    tuple = tuple,
   })
 end
 
@@ -4504,7 +4503,7 @@ end
 ---        pipeline — otherwise the two writers tear the file mid-write and the
 ---        pipeline's resolve stage hits a JSONDecodeError. See changelog
 ---        2026-06-25 "cdb_partition race".
-local function run_compile_commands_pipeline(path, targets, on_done)
+local function run_compile_commands_pipeline(path, targets, on_done, opts)
   -- ue.cdb.pipeline drives the expand → pch → resolve → unify → prune
   -- chain. We inject `_logged_jobstart` here so the pipeline module stays
   -- import-safe (no circular require to ue.lua) and headlessly testable.
@@ -4514,7 +4513,7 @@ local function run_compile_commands_pipeline(path, targets, on_done)
     notify    = function(msg, level) vim.notify(msg, level) end,
     log_error = function(scope, msg) require("utils.log").notify_error(scope, msg) end,
   })
-  return pipeline.run(path, targets, on_done)
+  return pipeline.run(path, targets, on_done, opts)
 end
 
 local function write_compile_commands_targets(ctx, content)
@@ -4554,15 +4553,27 @@ local function write_compile_commands_targets(ctx, content)
 end
 
 local function export_compile_commands_to_engine_root(ctx)
-  local candidates = compile_commands_candidates(ctx)
-  for _, candidate in ipairs(candidates) do
-    local content = read_all(candidate)
-    if content then
-      return write_compile_commands_targets(ctx, content)
-    end
+  local target_ctx, target_err, driver = CORE_RT.target_context(ctx)
+  if not target_ctx then
+    return false, "cannot validate compile_commands provenance: " .. tostring(target_err)
   end
 
-  return false, "compile_commands.json not found at any candidate path"
+  local source = require("ue.cdb.source")
+  local rejected = {}
+  local candidates = compile_commands_candidates(ctx, target_ctx)
+  for _, candidate in ipairs(candidates) do
+    local ok, info = source.read_valid(candidate, ctx, target_ctx, driver)
+    if ok then
+      return write_compile_commands_targets(ctx, info.content)
+    end
+    rejected[#rejected + 1] = candidate .. ": " .. tostring(info.reason)
+  end
+
+  if #rejected > 0 then
+    return false, "no trusted compile_commands source for the active tuple; rejected "
+      .. table.concat(rejected, " | ")
+  end
+  return false, "compile_commands.json not found at any controlled candidate path"
 end
 
 local function generate_compile_commands(ctx, progress)
@@ -4574,7 +4585,9 @@ local function generate_compile_commands(ctx, progress)
   local targets = compile_commands_targets(ctx)
 
   local function start_pipeline(path)
-    local jobid, pipeline_err = run_compile_commands_pipeline(path, targets)
+    local jobid, pipeline_err = run_compile_commands_pipeline(path, targets, nil, {
+      force_restart = ctx._force_cdb_restart == true,
+    })
     if jobid == nil then
       return false, pipeline_err or "compile_commands pipeline failed to start"
     end
@@ -4600,18 +4613,9 @@ local function generate_compile_commands(ctx, progress)
     return true, rsp_path .. " (" .. rsp_count .. " entries from .rsp files)"
   end
 
-  -- FALLBACK: an existing UBT-generated compile_commands.json at a target path.
-  -- Only used if no rsp files are present (fresh clone / pre-build).
-  for _, target in ipairs(targets) do
-    if _ufs.is_file(target) and vim.fn.getfsize(target) > 1024 then
-      slim_compile_commands_file(target)
-      local ok_pipeline, pipeline_err = start_pipeline(target)
-      if not ok_pipeline then return false, pipeline_err end
-      return true, target .. " (UBT, existing)"
-    end
-  end
-
-  -- FALLBACK 2: search candidate locations (Engine/Intermediate/Build/, project root, fd search)
+  -- FALLBACK: reuse only a provenance-checked CDB from a controlled location.
+  -- Apple semantic compilation stores its tuple-specific UBT database under
+  -- .cache/nvim-ue/cdb/sources; arbitrary recursive fixtures are never eligible.
   local ok_existing, existing_path = export_compile_commands_to_engine_root(ctx)
   if ok_existing then
     local ok_pipeline, pipeline_err = start_pipeline(targets[1])
@@ -4868,6 +4872,7 @@ local function open_terminal_command(cmd, opts)
     set_build_status("B...")
   end
 
+  local build_monitor
   local active_jobid
   active_jobid = vim.fn.termopen(cmd, {
     cwd = opts.cwd,
@@ -4879,6 +4884,10 @@ local function open_terminal_command(cmd, opts)
     end,
     on_exit = function(_, code)
       vim.schedule(function()
+        if build_monitor then
+          build_monitor:stop()
+          build_monitor = nil
+        end
         if vim.api.nvim_buf_is_valid(buf) then
           vim.bo[buf].bufhidden = "wipe"
         end
@@ -4897,7 +4906,9 @@ local function open_terminal_command(cmd, opts)
           set_build_status(code == 0 and "BOK" or ("B" .. tostring(code)))
         end
         local level = code == 0 and vim.log.levels.INFO or vim.log.levels.ERROR
-        local msg = ("UE build finished with exit code %d"):format(code)
+        local msg = ("%s finished with exit code %d"):format(
+          opts.finish_label or "UE build", code
+        )
         vim.notify(msg, level)
         if code ~= 0 then require("utils.log").error("ue.build", msg) end
         if type(opts.on_exit) == "function" then
@@ -4926,6 +4937,12 @@ local function open_terminal_command(cmd, opts)
       kind = "job",
       handle = active_jobid,
       started_at = os.time(),
+    })
+  end)
+  pcall(function()
+    build_monitor = require("ue.build_monitor").start({
+      jobid = active_jobid,
+      bufnr = buf,
     })
   end)
   startinsert_in_window(win)
@@ -7021,6 +7038,97 @@ function CORE_RT.clangd_version_compatible(output)
   return major == 22 and minor == 1, major, minor
 end
 
+-- Apple toolchains do not reliably retain per-action response files after a
+-- successful build. :UECompileForNvim therefore asks the active target driver
+-- for a semantic action-graph plan, publishes its tuple-scoped CDB only after
+-- validation, then lets the ordinary (prepare-only) pipeline consume it.
+function CORE_RT.generate_semantic_cdb_after_build(on_done)
+  on_done = on_done or function() end
+  local ctx, context_err = resolve_context()
+  if not ctx then
+    on_done(false, context_err)
+    return nil
+  end
+
+  local target_ctx, target_err = CORE_RT.target_context(ctx)
+  if not target_ctx then
+    on_done(false, target_err)
+    return nil
+  end
+
+  local host_driver = require("utils.platform").driver()
+  local targets = require("ue.targets")
+  if not targets.supports(target_ctx.platform, "semantic_cdb", host_driver) then
+    on_done(true, { skipped = true, reason = "target uses response-file evidence" })
+    return true
+  end
+
+  local cdb_paths = require("ue.cdb.paths")
+  local stable_path = cdb_paths.semantic_source(ctx, target_ctx)
+  local output_dir = _ufs.dirname(stable_path)
+  _ufs.ensure_dir(output_dir)
+  local pending_name = ("compile_commands.pending-%d-%s.json"):format(
+    vim.fn.getpid(), tostring(vim.uv.hrtime())
+  )
+  local pending_path = join(output_dir, pending_name)
+  local semantic_ctx = vim.deepcopy(target_ctx)
+  semantic_ctx.semantic_cdb_output_dir = output_dir
+  semantic_ctx.semantic_cdb_output_filename = pending_name
+
+  local plan = targets.plan(target_ctx.platform, "semantic_cdb", semantic_ctx, host_driver)
+  local command, plan_err = require("ue.target_tasks").command(plan)
+  if not command then
+    on_done(false, plan_err)
+    return nil
+  end
+
+  vim.notify(
+    ("Generating %s semantic CDB (no cook/package/compile actions)..."):format(target_ctx.platform),
+    vim.log.levels.INFO,
+    { title = "UECompileForNvim" }
+  )
+  local jobid = open_terminal_command(command, {
+    cwd = plan.cwd or ctx.engine_root,
+    quickfix_title = ("UECompileForNvim semantic CDB %s %s"):format(
+      target_ctx.platform, target_ctx.configuration
+    ),
+    quickfix_root = workspace_root(ctx),
+    tail_limit = 32,
+    finish_label = "UE semantic CDB",
+    on_exit = function(code)
+      if code ~= 0 then
+        pcall(os.remove, pending_path)
+        local message = ("semantic CDB generation failed with exit code %d"):format(code)
+        on_done(false, message)
+        return
+      end
+
+      local ok_publish, info = require("ue.cdb.source").promote(
+        pending_path, stable_path, ctx, target_ctx, targets.must_get(target_ctx.platform)
+      )
+      if not ok_publish then
+        pcall(os.remove, pending_path)
+        on_done(false, info.reason)
+        return
+      end
+
+      vim.notify(
+        ("Semantic CDB ready: %d entries%s"):format(
+          info.entry_count, info.no_op and " (unchanged)" or ""
+        ),
+        vim.log.levels.INFO,
+        { title = "UECompileForNvim" }
+      )
+      on_done(true, info)
+    end,
+  })
+  if not jobid then
+    pcall(os.remove, pending_path)
+    on_done(false, "failed to start semantic CDB task")
+  end
+  return jobid
+end
+
 function CORE_RT.compile_for_nvim()
   local clangd_cmd = M.clangd_cmd()
   local executable = type(clangd_cmd) == "table" and clangd_cmd[1] or nil
@@ -7055,11 +7163,23 @@ function CORE_RT.compile_for_nvim()
         title = "UECompileForNvim",
         on_exit = function(code)
           if code == 0 then
-            if type(CORE_RT.prepare_async) == "function" then
-              CORE_RT.prepare_async()
-            else
-              require("utils.log").notify_error("ue.semantic", "UEPrepare entry is unavailable")
-            end
+            CORE_RT.generate_semantic_cdb_after_build(function(ok_semantic, semantic_info)
+              if not ok_semantic then
+                require("utils.log").notify_error(
+                  "ue.semantic", tostring(semantic_info or "semantic CDB generation failed")
+                )
+                return
+              end
+              if type(CORE_RT.prepare_async) == "function" then
+                CORE_RT.prepare_async({
+                  force_cdb_restart = type(semantic_info) == "table"
+                    and semantic_info.skipped ~= true
+                    and semantic_info.no_op ~= true,
+                })
+              else
+                require("utils.log").notify_error("ue.semantic", "UEPrepare entry is unavailable")
+              end
+            end)
           end
         end,
       })
@@ -7423,7 +7543,6 @@ do
       end
       local command, plan_err, plan = CORE_RT.target_plan("package", ctx, platform, {
         host_driver = host_driver,
-        archive_dir = target_ctx.archive_dir,
       })
       if not command then
         target_error("ue.package", plan_err)
@@ -7450,7 +7569,6 @@ do
             artifact.metadata.package_exit_code = 0
           end
           CORE_RT.update_target_runtime(ctx.engine_root, driver.id, {
-            archive_dir = target_ctx.archive_dir,
             artifacts = artifacts,
             target = target_ctx.target,
             configuration = target_ctx.configuration,
@@ -7458,6 +7576,27 @@ do
         end,
       })
     end)
+  end
+
+  function CORE_RT.generate_target_symbols(platform)
+    local ctx, err = resolve_context()
+    if not ctx or not ctx.project_root then
+      target_error("ue.symbols", err or "No project configured. Run :UESetProject [path]")
+      return
+    end
+    local command, plan_err, plan, _, target_ctx = CORE_RT.target_plan("symbols", ctx, platform, {
+      host_driver = require("utils.platform").driver(),
+    })
+    if not command then
+      target_error("ue.symbols", plan_err)
+      return
+    end
+    return open_terminal_command(command, {
+      cwd = plan.cwd or ctx.engine_root,
+      quickfix_title = ("UESymbols %s %s"):format(target_ctx.platform, target_ctx.configuration),
+      quickfix_root = workspace_root(ctx),
+      tail_limit = 20,
+    })
   end
 
   function CORE_RT.select_target_device(platform)
@@ -8289,6 +8428,11 @@ local function prepare_async(opts)
   -- can honor :UEPrepareReindex (force a csearch rebuild even when the
   -- regular UEPrepare cache is fresh).
   ctx._force_csearch = opts.force_csearch and true or false
+  -- The semantic source is published before UEPrepare starts.  Pipeline mtime
+  -- comparison alone cannot observe that earlier replacement, so carry the
+  -- provenance event across the async subprocess boundary and reload clangd
+  -- after canonical publication even when post-processing is a no-op.
+  ctx._force_cdb_restart = opts.force_cdb_restart and true or false
 
   _ufs.ensure_dir(ctx.paths.cache)
 
@@ -8432,7 +8576,7 @@ local function prepare_async(opts)
           set_prepare_running(false)
           if handle then handle.message = "done"; handle.percentage = 100; handle:finish() end
           vim.notify(prepare_summary(ctx, compile_path, { reused_cache = true }))
-        end)
+        end, { force_restart = ctx._force_cdb_restart })
 
         -- csearch index rebuild (same logic as before, just moved here).
         local code_search_fp = require("utils.code_search")
@@ -9335,7 +9479,10 @@ function M.setup()
   })
   vim.api.nvim_create_user_command("UEPackageIOS", function()
     CORE_RT.package_target("IOS")
-  end, { desc = "Build, cook, stage, package, and archive the IOS target" })
+  end, { desc = "Package the IOS target from existing cooked data without building or cooking" })
+  vim.api.nvim_create_user_command("UEIOSSymbols", function()
+    CORE_RT.generate_target_symbols("IOS")
+  end, { desc = "Generate and UUID-verify the current IOS binary's dSYM on demand" })
   vim.api.nvim_create_user_command("UESetIOSDevice", function()
     CORE_RT.select_target_device("IOS")
   end, { desc = "Select an available physical IOS device through its target driver" })
@@ -10088,8 +10235,14 @@ function M._ccjson_subprocess_run(ctx, progress)
   if rsp_count and rsp_count > 0 then
     return true, rsp_path
   end
-  return false, rsp_path
-    or "no RSP entries for the active tuple; run :UECompileForNvim to build and prepare it"
+  progress("semantic_source", 45, "checking tuple-scoped semantic CDB...")
+  local ok_existing, existing_path = export_compile_commands_to_engine_root(ctx)
+  if ok_existing then
+    return true, existing_path
+  end
+  return false, tostring(rsp_path or "no RSP entries for the active tuple")
+    .. "; " .. tostring(existing_path)
+    .. "; run :UECompileForNvim to build and prepare it"
 end
 
 -- Spawn a headless nvim subprocess that runs the ccjson pipeline.

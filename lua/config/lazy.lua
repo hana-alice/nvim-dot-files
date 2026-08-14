@@ -44,6 +44,11 @@ require("lazy").setup({
     enabled = not health_no_mutate,
     notify = false, -- silence "config reloaded" toasts
   },
+  -- This config has no LuaRocks-backed plugins. Disable the unused provider
+  -- instead of provisioning a second Lua runtime through hererocks.
+  rocks = {
+    enabled = false,
+  },
   performance = {
     rtp = {
       -- disable some rtp plugins

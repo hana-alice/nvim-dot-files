@@ -5,10 +5,11 @@
 local t = require("tests.harness")
 local cfg = t.bootstrap()
 
--- 72 个 UE* 命令冻结清单（来自 lua/ue.lua + lua/ue/*.lua）。
+-- 78 个 UE* 命令冻结清单（来自 lua/ue.lua + lua/ue/*.lua）。
 local UE_COMMANDS = {
-  "UEBuild", "UEBuildAndroid", "UEBuildAndroidSO", "UEBuildPCH", "UECachePaths", "UECDBPartition",
+  "UEBuild", "UEBuildAndroid", "UEBuildAndroidSO", "UEBuildIOS", "UEBuildPCH", "UECachePaths", "UECDBPartition",
   "UECDBStatus", "UECDBSwitch", "UECheatsheet", "UECheatsheetEdit", "UEClearCache",
+  "UECompileForNvim",
   "UEDAPAttach", "UEDAPClearBreakpoints", "UEDAPCondBreakpoint", "UEDAPContinue",
   "UEDAPDiag", "UEDAPEval", "UEDAPFrameDown", "UEDAPFrameUp", "UEDAPHover",
   "UEDAPLaunch", "UEDAPListBreakpoints", "UEDAPLogpoint", "UEDAPNextTab",
@@ -18,17 +19,17 @@ local UE_COMMANDS = {
   "UEDAPWatchUE", "UEDebugLogToggle", "UEDirtyClear", "UEDirtyStatus",
   "UEDeployAndroidSO", "UEExportCompileCommands", "UEGenerateFromRSP", "UEGrepDiagDump",
   "UEGrepGroupingToggle", "UEGrepTraceShow", "UEGrepTraceToggle", "UEIndexFull",
-  "UEIndexHot", "UEIndexNow", "UEIndexStatus", "UEIndexTimings", "UEInstallAndroid",
-  "UELaunch", "UELogToggle", "UEPaths", "UEPrepare", "UEPrepareIncremental",
+  "UEIndexHot", "UEIndexNow", "UEIndexStatus", "UEIndexTimings", "UEInstallAndroid", "UEInstallIOS",
+  "UEIOSSymbols", "UELaunch", "UELogToggle", "UEPackageIOS", "UEPaths", "UEPrepare", "UEPrepareIncremental",
   "UEPrepareReindex", "UEPrepareSync", "UEResetLayout", "UESetAndroidDevice",
-  "UESetAndroidPackage", "UESetPlatform", "UESetProject", "UESetUprojectRelativePath", "UEWatchFlush",
+  "UESetAndroidPackage", "UESetIOSDevice", "UESetPlatform", "UESetProject", "UESetUprojectRelativePath", "UEWatchFlush",
   "UEWatchStatus", "UEWatchStop",
 }
 
 t.describe("commands: UE* 全量注册", function()
   require("ue").setup()
-  t.it("冻结清单含 72 个命令", function()
-    t.assert_eq(#UE_COMMANDS, 72)
+  t.it("冻结清单含 78 个命令", function()
+    t.assert_eq(#UE_COMMANDS, 78)
   end)
   for _, c in ipairs(UE_COMMANDS) do
     t.it(":" .. c .. " 已注册", function()
@@ -61,10 +62,11 @@ t.describe("commands: 辅助命令（keymaps.lua 注册）", function()
   vim.g.maplocalleader = " "
   require("ue").setup()
   require("utils.log").install_commands()
+  require("utils.core_health").setup()
   pcall(dofile, cfg .. "/lua/config/keymaps.lua")
   for _, c in ipairs({
     "Restart", "RestartDetect", "UEDefStatus", "UEDefCancel", "UEDefContextClear",
-    "NotificationHistory", "NotificationHistoryClear", "WindowTitle", "WindowTitleReset",
+    "NotificationHistory", "NotificationHistoryClear", "NvimCoreHealth", "WindowTitle", "WindowTitleReset",
   }) do
     t.it(":" .. c .. " 已注册", function()
       t.assert_eq(vim.fn.exists(":" .. c), 2, c .. " 未注册")

@@ -22,29 +22,6 @@ local function project_name_from_uproject(trim, uproject)
   return name:gsub("%.uproject$", "")
 end
 
-local function is_windows_host()
-  return vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1
-end
-
-local function windows_native_path(value)
-  value = tostring(value or "")
-  if value:match("^[A-Za-z]:/") or value:match("^//") then
-    return value:gsub("/", "\\")
-  end
-  return value
-end
-
-local function powershell_command(script)
-  return {
-    "powershell.exe",
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-Command",
-    script,
-  }
-end
-
 local function prune_state()
   if state.win and not vim.api.nvim_win_is_valid(state.win) then
     state.win = nil
@@ -288,58 +265,20 @@ local function desktop_ue_log_spec(env, ctx)
     return nil, detail
   end
 
-  if is_windows_host() or env.is_windows_path(path) then
-    local path_win = windows_native_path(path)
-    local script = ([[
-$ErrorActionPreference = 'Continue'
-$path = %s
-Write-Output ('Following UE log: ' + $path)
-$announced = $false
-while (-not (Test-Path -LiteralPath $path)) {
-  if (-not $announced) {
-    Write-Output ('Waiting for log file: ' + $path)
-    $announced = $true
-  }
-  Start-Sleep -Seconds 1
-}
-Get-Content -LiteralPath $path -Encoding UTF8 -Wait -Tail 200
-]]):format(env.powershell_quote(path_win))
-
-    return {
-      kind = "ue_log",
-      source_id = env.norm(path),
-      title = "UE Log",
-      summary = path_win,
-      cmd = powershell_command(script),
-      cwd = env.dirname(path),
-    }
+  local host_driver = env.host_driver or require("utils.platform").driver()
+  local plan, plan_err = host_driver.follow_file_plan(path)
+  local cmd, command_err = require("ue.target_tasks").command(plan)
+  if not cmd then
+    return nil, plan_err or command_err
   end
-
-  local shell = vim.fn.exepath("sh")
-  if shell == "" then
-    shell = vim.fn.exepath("bash")
-  end
-  if shell == "" then
-    return nil, "No shell found for desktop log follow"
-  end
-
-  local path_quoted = vim.fn.shellescape(path)
-  local script = ([[printf 'Following UE log: %s\n'
-if [ ! -f %s ]; then
-  printf 'Waiting for log file: %s\n'
-fi
-while [ ! -f %s ]; do
-  sleep 1
-done
-tail -n 200 -F %s]]):format(path, path_quoted, path, path_quoted, path_quoted)
 
   return {
     kind = "ue_log",
     source_id = env.norm(path),
     title = "UE Log",
-    summary = path,
-    cmd = { shell, "-lc", script },
-    cwd = env.dirname(path),
+    summary = host_driver.host_path(path),
+    cmd = cmd,
+    cwd = plan.cwd or env.dirname(path),
   }
 end
 
@@ -375,52 +314,37 @@ local function android_logcat_spec(env, ctx)
   if not serial then
     return nil, "Android device is not selected; run :UESetAndroidDevice"
   end
-  local script = ([[
-$ErrorActionPreference = 'Stop'
-$adb = %s
-$serial = %s
-$pkg = %s
-$uidLine = ((& $adb -s $serial shell cmd package list packages -U $pkg 2>$null) | Out-String)
-$uidMatch = [regex]::Match($uidLine, 'uid:(\d+)')
-if (-not $uidMatch.Success) {
-  $dump = ((& $adb -s $serial shell dumpsys package $pkg 2>$null) | Out-String)
-  $uidMatch = [regex]::Match($dump, 'userId=(\d+)')
-}
-if (-not $uidMatch.Success) {
-  throw ('Failed to resolve app uid for ' + $pkg)
-}
-$uid = $uidMatch.Groups[1].Value
-Write-Output ('Following Android logcat for ' + $pkg + ' (uid=' + $uid + ', serial=' + $serial + ')')
-& $adb -s $serial logcat --uid=$uid -v time
-exit $LASTEXITCODE
-]]):format(
-      env.powershell_quote(windows_native_path(adb)),
-      env.powershell_quote(serial),
-      env.powershell_quote(package_name)
-    )
+  local host_driver = env.host_driver or require("utils.platform").driver()
+  local plan = require("ue.targets").plan("Android", "log", {
+    cwd = vim.fn.getcwd(),
+    adb = adb,
+    device_id = serial,
+    package_name = package_name,
+  }, host_driver)
+  local cmd, command_err = require("ue.target_tasks").command(plan)
+  if not cmd then
+    return nil, command_err
+  end
 
   return {
     kind = "android_logcat",
     source_id = serial .. ":" .. package_name,
     title = "Android Logcat",
     summary = ("%s on %s"):format(package_name, serial),
-    cmd = powershell_command(script),
-    cwd = vim.fn.getcwd(),
+    cmd = cmd,
+    cwd = plan.cwd or vim.fn.getcwd(),
   }
 end
 
 local function desktop_debug_log_spec(env)
-  if not is_windows_host() then
-    return nil, "Program debug log is only supported on Windows"
+  local host_driver = env.host_driver or require("utils.platform").driver()
+  if type(host_driver.debug_log_plan) ~= "function" then
+    return nil, "Program debug log is unavailable on host: " .. tostring(host_driver.id)
   end
-
   local launch = require("utils.ue_launch")
   local spec, resolve_ctx = launch.resolve_spec(env)
   if not spec then
     return nil, resolve_ctx
-  end
-  if spec.platform == "Android" then
-    return nil, "Android only supports app logcat"
   end
 
   local exe = env.trim(spec.exe or "")
@@ -430,86 +354,25 @@ local function desktop_debug_log_spec(env)
 
   local cmd_needle = ""
   if spec.kind == "Editor" and spec.args and spec.args[1] then
-    cmd_needle = windows_native_path(spec.args[1]):lower()
+    cmd_needle = host_driver.host_path(spec.args[1]):lower()
   end
-
-  local script = ([[
-$ErrorActionPreference = 'Continue'
-$exePath = %s
-$cmdNeedle = %s
-function Write-Status($text) {
-  if ($script:lastStatus -ne $text) {
-    $script:lastStatus = $text
-    Write-Output ('[' + (Get-Date -Format 'HH:mm:ss') + '] ' + $text)
-  }
-}
-function Get-TargetPids {
-  $query = Get-CimInstance Win32_Process | Where-Object {
-    $_.ExecutablePath -and $_.ExecutablePath.ToLowerInvariant() -eq $exePath.ToLowerInvariant()
-  }
-  if ($cmdNeedle -ne '') {
-    $query = $query | Where-Object {
-      $cmd = '' + $_.CommandLine
-      $cmd -and $cmd.ToLowerInvariant().Contains($cmdNeedle)
-    }
-  }
-  @($query | Sort-Object CreationDate | Select-Object -ExpandProperty ProcessId)
-}
-$script:lastStatus = ''
-$bufferReady = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'DBWIN_BUFFER_READY')
-$dataReady = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::AutoReset, 'DBWIN_DATA_READY')
-$mmf = [System.IO.MemoryMappedFiles.MemoryMappedFile]::CreateOrOpen('DBWIN_BUFFER', 4096)
-$view = $mmf.CreateViewStream()
-$reader = New-Object System.IO.BinaryReader($view, [System.Text.Encoding]::Default)
-$encoding = [System.Text.Encoding]::Default
-$targetPids = @()
-$nextRefresh = Get-Date
-Write-Output ('Listening for OutputDebugString: ' + $exePath)
-while ($true) {
-  if ((Get-Date) -ge $nextRefresh) {
-    $targetPids = @(Get-TargetPids)
-    if ($targetPids.Count -eq 0) {
-      Write-Status 'waiting for target process...'
-    } else {
-      Write-Status ('attached to pid(s): ' + ($targetPids -join ', '))
-    }
-    $nextRefresh = (Get-Date).AddSeconds(2)
-  }
-  $null = $bufferReady.Set()
-  if (-not $dataReady.WaitOne(200)) {
-    continue
-  }
-  if ($targetPids.Count -eq 0) {
-    continue
-  }
-  $null = $view.Seek(0, [System.IO.SeekOrigin]::Begin)
-  $pid = $reader.ReadInt32()
-  $bytes = $reader.ReadBytes(4092)
-  if ($targetPids -notcontains $pid) {
-    continue
-  }
-  $nul = [Array]::IndexOf($bytes, [byte]0)
-  if ($nul -lt 0) {
-    $nul = $bytes.Length
-  }
-  $text = $encoding.GetString($bytes, 0, $nul).TrimEnd("`r", "`n")
-  if ([string]::IsNullOrWhiteSpace($text)) {
-    continue
-  }
-  Write-Output ('[' + (Get-Date -Format 'HH:mm:ss.fff') + '] [' + $pid + '] ' + $text)
-}
-]]):format(
-      env.powershell_quote(windows_native_path(exe)),
-      env.powershell_quote(cmd_needle)
-    )
+  local plan = host_driver.debug_log_plan({
+    executable = exe,
+    command_needle = cmd_needle,
+    cwd = spec.cwd or env.dirname(exe),
+  })
+  local cmd, command_err = require("ue.target_tasks").command(plan)
+  if not cmd then
+    return nil, command_err
+  end
 
   return {
     kind = "debug_log",
-    source_id = windows_native_path(exe) .. "|" .. cmd_needle,
+    source_id = host_driver.host_path(exe) .. "|" .. cmd_needle,
     title = "Program Debug Log",
-    summary = windows_native_path(exe),
-    cmd = powershell_command(script),
-    cwd = spec.cwd or env.dirname(exe),
+    summary = host_driver.host_path(exe),
+    cmd = cmd,
+    cwd = plan.cwd or spec.cwd or env.dirname(exe),
   }
 end
 
@@ -657,6 +520,15 @@ local function toggle_spec(env, spec)
   start_stream(env, spec)
 end
 
+local LOG_STRATEGIES = {
+  ["android-logcat"] = android_logcat_spec,
+  ["desktop-file"] = desktop_ue_log_spec,
+  ["desktop-debug"] = desktop_debug_log_spec,
+  unavailable = function(_, _, driver)
+    return nil, driver.id .. " log mode is unavailable"
+  end,
+}
+
 local function resolve_spec(env, mode)
   local ctx, err = env.resolve_context()
   if not ctx then
@@ -664,24 +536,26 @@ local function resolve_spec(env, mode)
   end
 
   local platform = env.target_platform(ctx.engine_root, nil)
-  if platform == "Android" then
-    if mode == "debug" then
-      return nil, "Android only supports app logcat"
-    end
-    return android_logcat_spec(env, ctx)
+  local host_driver = env.host_driver or require("utils.platform").driver()
+  local operation = mode == "debug" and "debug_log" or "log"
+  local policy_key = mode == "debug" and "debug_log" or "main_log"
+  local driver, unavailable = require("ue.targets").resolve(platform, operation, host_driver)
+  if not driver then
+    return nil, unavailable.reason
   end
-
-  if mode == "debug" then
-    return desktop_debug_log_spec(env, ctx)
+  local strategy = driver.runtime[policy_key].strategy
+  local resolver = LOG_STRATEGIES[strategy]
+  if not resolver then
+    return nil, "Unknown log strategy: " .. tostring(strategy), strategy
   end
-
-  return desktop_ue_log_spec(env, ctx)
+  local spec, spec_err = resolver(env, ctx, driver)
+  return spec, spec_err, strategy
 end
 
 function M.toggle_main_log(env)
-  local spec, err = resolve_spec(env, "main")
+  local spec, err, strategy = resolve_spec(env, "main")
   if not spec then
-    if err == "Android device is not selected; run :UESetAndroidDevice" then
+    if strategy == "android-logcat" and err == "Android device is not selected; run :UESetAndroidDevice" then
       android_device.ensure({ prompt = "Select Android device for UE logcat:" }, function(serial)
         if serial then M.toggle_main_log(env) end
       end)

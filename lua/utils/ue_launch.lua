@@ -56,26 +56,27 @@ local function glob_launch_candidates(env, patterns)
   return candidates
 end
 
-local function desktop_editor_executable(env, engine_root, platform)
-  local platform_dir = env.join(engine_root, "Engine", "Binaries", platform)
-  local candidates = existing_launch_candidates(env, {
-    env.join(platform_dir, "UnrealEditor.exe"),
-    env.join(platform_dir, "UE4Editor.exe"),
-    env.join(platform_dir, "UnrealEditor"),
-    env.join(platform_dir, "UE4Editor"),
-  })
+local function desktop_editor_executable(env, engine_root, driver)
+  local policy = driver.runtime.launch
+  local platform_dir = env.join(engine_root, "Engine", "Binaries", driver.id)
+  local explicit = {}
+  for _, name in ipairs(policy.editor_names or {}) do
+    explicit[#explicit + 1] = env.join(platform_dir, name)
+  end
+  local candidates = existing_launch_candidates(env, explicit)
 
-  if platform == "Mac" then
-    vim.list_extend(candidates, glob_launch_candidates(env, {
-      env.join(platform_dir, "*.app", "Contents", "MacOS", "UnrealEditor"),
-      env.join(platform_dir, "*.app", "Contents", "MacOS", "UE4Editor"),
-    }))
+  if policy.editor_app_bundles then
+    local patterns = {}
+    for _, name in ipairs(policy.editor_names or {}) do
+      patterns[#patterns + 1] = env.join(platform_dir, "*.app", "Contents", "MacOS", name)
+    end
+    vim.list_extend(candidates, glob_launch_candidates(env, patterns))
   end
 
   return candidates[1]
 end
 
-local function desktop_project_executable(env, ctx, platform, configuration, kind)
+local function desktop_project_executable(env, ctx, driver, configuration, kind)
   local uproject = ctx.uproject or env.find_uproject_in_dir(ctx.project_root)
   if not uproject then
     return nil
@@ -83,8 +84,9 @@ local function desktop_project_executable(env, ctx, platform, configuration, kin
 
   local target_name = env.build_target_name(ctx.project_root, uproject, kind)
   local project_name = project_name_from_uproject(env.trim, uproject)
+  local platform = driver.id
   local bin_dir = env.join(ctx.project_root, "Binaries", platform)
-  local extension = platform == "Win64" and ".exe" or ""
+  local extension = driver.runtime.launch.executable_suffix or ""
   local base_names = {}
 
   local function add_name(name)
@@ -119,7 +121,7 @@ local function desktop_project_executable(env, ctx, platform, configuration, kin
   return globbed[1]
 end
 
-local function desktop_launch_spec(env, ctx)
+local function desktop_launch_spec(env, ctx, driver)
   if not ctx.project_root then
     return nil, "No project configured for engine root. Run :UESetProject [path]"
   end
@@ -129,20 +131,13 @@ local function desktop_launch_spec(env, ctx)
     return nil, "No .uproject found in project root: " .. ctx.project_root
   end
 
-  local platform = env.target_platform(ctx.engine_root, nil)
+  local platform = driver.id
   local configuration = env.target_configuration(ctx.engine_root, ctx.project_root, uproject, platform)
   local selected_configuration = env.selected_target_configuration(ctx.engine_root, ctx.project_root, uproject, platform)
   local kind = env.target_kind(ctx.engine_root, ctx.project_root, uproject, platform)
 
-  if platform == "Android" then
-    return nil, "Android should be launched through adb"
-  end
-  if platform == "IOS" then
-    return nil, "iOS launch is not supported from this command"
-  end
-
   if kind == "Editor" then
-    local editor = desktop_editor_executable(env, ctx.engine_root, platform)
+    local editor = desktop_editor_executable(env, ctx.engine_root, driver)
     if not editor then
       return nil, ("Editor executable not found for %s under engine root: %s"):format(platform, ctx.engine_root)
     end
@@ -157,7 +152,7 @@ local function desktop_launch_spec(env, ctx)
     }
   end
 
-  local exe = desktop_project_executable(env, ctx, platform, configuration, kind)
+  local exe = desktop_project_executable(env, ctx, driver, configuration, kind)
   if not exe then
     local target_name = env.build_target_name(ctx.project_root, uproject, kind)
     return nil, ("Launch binary not found for %s %s (%s) under %s"):format(
@@ -176,30 +171,6 @@ local function desktop_launch_spec(env, ctx)
     exe = exe,
     cwd = env.dirname(exe),
     args = {},
-  }
-end
-
-local function android_launch_argv(adb, serial, package_name)
-  local script = vim.fs.joinpath(
-    vim.fn.stdpath("config"), "scripts", "ue_android_so_launch.ps1"
-  )
-  if vim.fn.filereadable(script) ~= 1 then
-    return nil, "Android launch script not found: " .. script
-  end
-  return {
-    "powershell.exe",
-    "-NoLogo",
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-File",
-    script,
-    "-Adb",
-    adb,
-    "-Serial",
-    serial,
-    "-Package",
-    package_name,
   }
 end
 
@@ -227,55 +198,22 @@ local function android_launch_command(env, ctx, serial)
     return nil, "Android serial is required"
   end
 
-  local cmd, cmd_err = android_launch_argv(adb, serial, package_name)
+  local host_driver = env.host_driver or require("utils.platform").driver()
+  local plan = require("ue.targets").plan("Android", "launch", {
+    config_root = vim.fn.stdpath("config"),
+    cwd = vim.fn.getcwd(),
+    adb = adb,
+    device_id = serial,
+    package_name = package_name,
+  }, host_driver)
+  local cmd, cmd_err = require("ue.target_tasks").command(plan)
   if not cmd then return nil, cmd_err end
 
   return {
     package_name = package_name,
     serial = serial,
     cmd = cmd,
-  }
-end
-
-local function powershell_start_process_command(powershell_quote, exe, args, working_dir)
-  local function windows_native_path(value)
-    value = tostring(value or "")
-    if value:match("^[A-Za-z]:/") or value:match("^//") then
-      return value:gsub("/", "\\")
-    end
-    return value
-  end
-
-  exe = windows_native_path(exe)
-  working_dir = windows_native_path(working_dir)
-  local quoted_args = {}
-  for _, arg in ipairs(args or {}) do
-    quoted_args[#quoted_args + 1] = powershell_quote(windows_native_path(arg))
-  end
-
-  local start_process = "Start-Process -FilePath " .. powershell_quote(exe)
-  if working_dir and working_dir ~= "" then
-    start_process = start_process .. " -WorkingDirectory " .. powershell_quote(working_dir)
-  end
-  start_process = start_process .. " -ArgumentList $argsList -PassThru"
-
-  local ps = {
-    "$ErrorActionPreference = 'Stop'",
-    "$argsList = @(" .. table.concat(quoted_args, ", ") .. ")",
-    "$proc = " .. start_process,
-    "if (-not $proc -or -not $proc.Id) { throw 'Start-Process did not return a process id' }",
-    "Start-Sleep -Milliseconds 200",
-    "if (-not (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue)) { throw ('Process exited immediately: ' + $proc.Id) }",
-    "Write-Output ('pid=' + $proc.Id)",
-  }
-
-  return {
-    "powershell.exe",
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-Command",
-    table.concat(ps, "; "),
+    plan = plan,
   }
 end
 
@@ -288,26 +226,33 @@ local function launch_desktop_process(env, spec)
     return false, "Launch executable not found: " .. exe
   end
 
-  local cmd
-  if env.is_windows_path(exe) then
-    cmd = powershell_start_process_command(env.powershell_quote, exe, spec.args or {}, spec.cwd or env.dirname(exe))
+  local host_driver = env.host_driver or require("utils.platform").driver()
+  local plan = host_driver.launch_process_plan({
+    executable = exe,
+    args = spec.args or {},
+    cwd = spec.cwd or env.dirname(exe),
+  })
+  local cmd, plan_err = require("ue.target_tasks").command(plan)
+  if not cmd then
+    return false, plan_err
+  end
+
+  if plan.metadata and plan.metadata.launch_mode == "wait" then
     local result = vim.system(cmd, { text = true }):wait()
     local output = ((result.stdout or "") .. "\n" .. (result.stderr or "")):gsub("^%s+", ""):gsub("%s+$", "")
     if (result.code or 0) ~= 0 then
       return false, output ~= "" and output or ("Launch failed with exit code " .. tostring(result.code))
     end
 
-    local pid = output:match("pid=(%d+)")
+    local pid = output:match(plan.metadata.pid_pattern or "pid=(%d+)")
     if not pid then
       return false, output ~= "" and output or "Launch did not report a process id"
     end
     return true, pid
   end
 
-  cmd = { exe }
-  vim.list_extend(cmd, spec.args or {})
   local ok, jobid = pcall(vim.fn.jobstart, cmd, {
-    cwd = spec.cwd,
+    cwd = plan.cwd or spec.cwd,
     detach = true,
   })
   if not ok or not jobid or jobid <= 0 then
@@ -373,14 +318,18 @@ local function launch_android_process(env, spec)
   return true
 end
 
-function M.resolve_spec(env)
-  local ctx, err = env.resolve_context()
-  if not ctx then
-    return nil, err
-  end
-
+local function resolve_driver(env, ctx)
   local platform = env.target_platform(ctx.engine_root, nil)
-  if platform == "Android" then
+  local host_driver = env.host_driver or require("utils.platform").driver()
+  local driver, unavailable = require("ue.targets").resolve(platform, "launch", host_driver)
+  if not driver then
+    return nil, unavailable.reason
+  end
+  return driver
+end
+
+local RESOLVE_STRATEGIES = {
+  ["android-device"] = function(env, ctx, driver)
     local serial = android_device.get()
     if not serial then
       return nil, "Android device is not selected; run :UESetAndroidDevice"
@@ -389,32 +338,31 @@ function M.resolve_spec(env)
     if not spec then
       return nil, launch_err
     end
-    spec.platform = platform
-    spec.kind = "Android"
+    spec.platform = driver.id
+    spec.kind = driver.id
     return spec, ctx
-  end
+  end,
+  desktop = function(env, ctx, driver)
+    local spec, launch_err = desktop_launch_spec(env, ctx, driver)
+    if not spec then
+      return nil, launch_err
+    end
+    return spec, ctx
+  end,
+  ["managed-device"] = function(_, _, driver)
+    return nil, driver.id .. " launch is owned by the managed-device lifecycle"
+  end,
+  unavailable = function(_, _, driver)
+    return nil, driver.id .. " launch is unavailable"
+  end,
+}
 
-  local spec, launch_err = desktop_launch_spec(env, ctx)
-  if not spec then
-    return nil, launch_err
-  end
-  return spec, ctx
-end
-
-function M.launch(env)
-  local ctx, err = env.resolve_context()
-  if not ctx then
-    require("utils.log").notify("ue_launch", err, vim.log.levels.WARN)
-    return
-  end
-
-  local platform = env.target_platform(ctx.engine_root, nil)
-  if platform == "Android" then
+local LAUNCH_STRATEGIES = {
+  ["android-device"] = function(env, ctx)
     local adb = vim.fn.exepath("adb")
     adb = adb ~= "" and adb or "adb"
     if vim.fn.executable(adb) ~= 1 and not env.is_file(adb) then
-      require("utils.log").notify_error("ue_launch", "adb not found in PATH")
-      return
+      return false, "adb not found in PATH"
     end
 
     local function launch_on_serial(serial)
@@ -434,33 +382,89 @@ function M.launch(env)
       adb = adb,
       prompt = "Select Android device for UE launch:",
     }, launch_on_serial)
+    return true
+  end,
+  desktop = function(env, ctx, driver)
+    local spec, launch_err = desktop_launch_spec(env, ctx, driver)
+    if not spec then
+      return false, launch_err
+    end
+
+    local ok, detail = launch_desktop_process(env, spec)
+    if not ok then
+      return false, detail
+    end
+
+    local target = vim.fn.fnamemodify(spec.exe, ":t")
+    local args = #spec.args > 0 and (" " .. table.concat(spec.args, " ")) or ""
+    require("utils.log").notify(
+      "ue_launch",
+      ("Launched %s: %s%s (pid %s)"):format(spec.platform, target, args, detail),
+      vim.log.levels.INFO
+    )
+    return true
+  end,
+  ["managed-device"] = function(_, _, driver)
+    return false, driver.id .. " launch is owned by the managed-device lifecycle"
+  end,
+  unavailable = function(_, _, driver)
+    return false, driver.id .. " launch is unavailable"
+  end,
+}
+
+function M.resolve_spec(env)
+  local ctx, err = env.resolve_context()
+  if not ctx then
+    return nil, err
+  end
+
+  local driver, driver_err = resolve_driver(env, ctx)
+  if not driver then
+    return nil, driver_err
+  end
+  local strategy = driver.runtime.launch.strategy
+  local resolver = RESOLVE_STRATEGIES[strategy]
+  if not resolver then
+    return nil, "Unknown launch strategy: " .. tostring(strategy)
+  end
+  return resolver(env, ctx, driver)
+end
+
+function M.launch(env)
+  local ctx, err = env.resolve_context()
+  if not ctx then
+    require("utils.log").notify("ue_launch", err, vim.log.levels.WARN)
     return
   end
 
-  local spec, launch_err = desktop_launch_spec(env, ctx)
-  if not spec then
+  local driver, driver_err = resolve_driver(env, ctx)
+  if not driver then
+    require("utils.log").notify_error("ue_launch", driver_err)
+    return
+  end
+  local strategy = driver.runtime.launch.strategy
+  local launcher = LAUNCH_STRATEGIES[strategy]
+  if not launcher then
+    require("utils.log").notify_error("ue_launch", "Unknown launch strategy: " .. tostring(strategy))
+    return
+  end
+  local ok, launch_err = launcher(env, ctx, driver)
+  if not ok and launch_err then
     require("utils.log").notify_error("ue_launch", launch_err)
-    return
   end
-
-  local ok, detail = launch_desktop_process(env, spec)
-  if not ok then
-    require("utils.log").notify_error("ue_launch", detail)
-    return
-  end
-
-  local target = vim.fn.fnamemodify(spec.exe, ":t")
-  local args = #spec.args > 0 and (" " .. table.concat(spec.args, " ")) or ""
-  require("utils.log").notify(
-    "ue_launch",
-    ("Launched %s: %s%s (pid %s)"):format(spec.platform, target, args, detail),
-    vim.log.levels.INFO
-  )
 end
 
 -- Pure command-shape seam for headless regression (no adb/device required).
 function M._android_launch_argv_for_test(adb, serial, package_name)
-  return android_launch_argv(adb, serial, package_name)
+  local host_driver = require("utils.platform.windows")
+  local plan = require("ue.targets").plan("Android", "launch", {
+    config_root = vim.fn.stdpath("config"),
+    cwd = vim.fn.getcwd(),
+    adb = adb,
+    device_id = serial,
+    package_name = package_name,
+  }, host_driver)
+  return require("ue.target_tasks").command(plan)
 end
 
 return M

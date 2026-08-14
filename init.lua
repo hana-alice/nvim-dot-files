@@ -27,7 +27,9 @@ local function cleanup_stale_shada_tmp()
   end
 end
 
-cleanup_stale_shada_tmp()
+if vim.env.NVIM_CORE_HEALTH_NO_MUTATE ~= "1" then
+  cleanup_stale_shada_tmp()
+end
 
 -- Initialise the rotating debug logger early so it is available to every
 -- subsequent setup call. Eager require also installs :NvimLog* commands.
@@ -82,3 +84,4 @@ require("workarounds.neovide.exit_with_gui").apply()
 -- validity itself (health-check F6; K21 retired).
 require("workarounds.clangd.non_file_uri_detach").apply()
 require("ue").setup()
+require("utils.core_health").setup()

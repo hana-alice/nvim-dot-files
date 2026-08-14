@@ -1,8 +1,7 @@
 -- utils.platform.macos — macOS driver.
 --
--- Phase A: bare-but-correct defaults. Subsequent phases will exercise
--- these once a real Mac host is available; for now this keeps headless
--- tests on Mac green.
+-- Owns only native macOS host behavior; foreign host capabilities are absent
+-- rather than represented by fake stubs.
 
 local M = {
   id         = "macos",
@@ -11,16 +10,61 @@ local M = {
   exe_suffix = "",
 }
 
-function M.shell()
+local shell = require("utils.platform.shell")
+
+local function join_engine_path(engine_root, suffix)
+  local root = tostring(engine_root or "")
+  if root:sub(-1) == "/" then
+    return root .. suffix
+  end
+  return root .. "/" .. suffix
+end
+
+local function applescript_string(value)
+  value = tostring(value or "")
+  value = value:gsub("\\", "\\\\"):gsub('"', '\\"')
+  return '"' .. value .. '"'
+end
+
+function M.shell_entry(kind)
+  kind = kind or "default"
+  if kind ~= "default" and kind ~= "posix" then
+    return nil, "unsupported shell on macOS host: " .. tostring(kind)
+  end
   if vim.fn.executable("zsh") == 1 then return "/bin/zsh" end
   if vim.fn.executable("bash") == 1 then return "/bin/bash" end
   return vim.o.shell ~= "" and vim.o.shell or "/bin/sh"
 end
 
+function M.shell()
+  return M.shell_entry("default")
+end
+
 function M.cmd_quote(value)
-  -- POSIX single-quote: wrap and escape any embedded single quote.
-  local s = tostring(value or "")
-  return "'" .. s:gsub("'", [['\'']]) .. "'"
+  return shell.quote("posix", value)
+end
+
+function M.host_path(path)
+  return tostring(path or ""):gsub("\\", "/")
+end
+
+function M.default_target()
+  return "Mac"
+end
+
+function M.launch_process_plan(spec)
+  spec = spec or {}
+  return {
+    executable = M.host_path(spec.executable or spec.exe),
+    args = vim.deepcopy(spec.args or {}),
+    cwd = M.host_path(spec.cwd or ""),
+    metadata = { launch_mode = "detach" },
+  }
+end
+
+function M.follow_file_plan(path)
+  path = M.host_path(path)
+  return shell.follow_file("posix", M.shell_entry("posix"), path, vim.fs.dirname(path))
 end
 
 function M.open_path(path)
@@ -33,6 +77,24 @@ function M.reveal_file(path)
   vim.fn.jobstart({ "open", "-R", path }, { detach = true })
 end
 
+function M.folder_picker_plan(prompt)
+  local script = "POSIX path of (choose folder with prompt "
+      .. applescript_string(prompt or "Open Folder") .. ")"
+  return {
+    executable = "/usr/bin/osascript",
+    args = { "-e", script },
+    metadata = { operation = "choose-folder" },
+  }
+end
+
+function M.build_process_snapshot_plan()
+  return {
+    executable = "/bin/ps",
+    args = { "-ww", "-Ao", "pid=,ppid=,state=,etime=,%cpu=,%mem=,command=" },
+    metadata = { operation = "build-process-snapshot" },
+  }
+end
+
 function M.default_clangd_candidates()
   -- Order: Homebrew LLVM (Apple Silicon), Homebrew LLVM (Intel),
   -- Xcode toolchain, system PATH.
@@ -42,6 +104,10 @@ function M.default_clangd_candidates()
     "/Library/Developer/CommandLineTools/usr/bin/clangd",
     "clangd",
   }
+end
+
+function M.python_candidates()
+  return { "python3", "python" }
 end
 
 function M.default_lldb_dap_paths()
@@ -56,17 +122,28 @@ function M.default_lldb_dap_paths()
 end
 
 function M.default_lldb_server_paths()
-  -- macOS native debugging uses `lldb-dap` directly. For
-  -- Android targets users typically install NDK side-by-side under
-  -- ~/Library/Android/sdk/ndk/*. Globs resolved by callers.
-  -- See utils/platform/windows.lua for the NDK r21 ordering rationale.
-  local home = (vim.uv or vim.loop).os_homedir() or ""
-  if home == "" then return {} end
-  return {
-    home .. "/Library/Android/sdk/ndk/21.*/toolchains/llvm/prebuilt/*/lib64/clang/*/lib/linux/aarch64/lldb-server",
-    home .. "/Library/Android/sdk/ndk/*/toolchains/llvm/prebuilt/*/lib64/clang/*/lib/linux/aarch64/lldb-server",
-    home .. "/Library/Android/sdk/ndk/*/toolchains/llvm/prebuilt/*/lib/clang/*/lib/linux/aarch64/lldb-server",
-  }
+  -- This repository intentionally does not support macOS-hosted Android DAP.
+  return {}
+end
+
+function M.ue_build_entry(engine_root)
+  return join_engine_path(engine_root, "Engine/Build/BatchFiles/Mac/Build.sh"), nil
+end
+
+function M.ue_uat_entry(engine_root)
+  return join_engine_path(engine_root, "Engine/Build/BatchFiles/RunUAT.sh"), nil
+end
+
+function M.xcrun_entry()
+  return "/usr/bin/xcrun", nil
+end
+
+function M.security_entry()
+  return "/usr/bin/security", nil
+end
+
+function M.plutil_entry()
+  return "/usr/bin/plutil", nil
 end
 
 return M

@@ -1,25 +1,19 @@
--- ue.dap.ios — iOS DAP attach via lldb-dap.
+-- ue.dap.ios — explicit unsupported boundary for native iOS DAP.
 --
--- Real iOS attach needs `xcrun devicectl` plus an Xcode debugserver
--- forwarded over USB; that orchestration is out of scope here. Forward
--- to the macOS handler so :UEDAPAttach ios doesn't WARN, with a clear
--- notify so the user knows it's a passthrough.
-
-local mac = require("ue.dap.mac")
+-- A macOS host does not make an iOS target a Mac process. Real device attach
+-- needs a separate CoreDevice/debugserver lifecycle, so this module must never
+-- fall through to the Mac target handler.
 
 return {
   attach = function()
     vim.notify(
-      "UEDAP ios: forwarding to mac handler. Native iOS device attach " ..
-      "(USB/Wi-Fi via Xcode + lldb-dap remote-platform) is a future phase.",
-      vim.log.levels.INFO
+      "UEDAP ios: native iOS device attach is not implemented; Mac DAP is not a valid fallback.",
+      vim.log.levels.WARN
     )
-    mac.attach()
   end,
   launch = function()
     vim.notify(
-      "UEDAP ios: launch unsupported. Use Xcode `xcrun devicectl` to install + " ..
-      "launch, then UEDAPAttach ios.",
+      "UEDAP ios: debug launch is not implemented. :UELaunch supports app launch without DAP.",
       vim.log.levels.WARN
     )
   end,

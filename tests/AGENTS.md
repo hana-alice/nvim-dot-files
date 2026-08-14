@@ -33,12 +33,14 @@ pwsh -File scripts/run_regression.ps1       # 本机一键（转发 + 退出码�
 | `lua/ue/cdb/**` | `ue_cdb` |
 | `lua/ue/dap/**` / `lua/utils/platform/**` | `dap` `platform` |
 | `lua/ue/index/**` / `lua/ue/clangd_commands.lua` / controlled CDB generators | `index_generation` `cpp_semantic_index` `clangd_commands` `ue_api` |
+| `lua/ue/targets/**` / `lua/ue/target_tasks.lua` | `ue_target_drivers` `ue_target_integration` `ue_target_tasks` `platform` `commands` |
 | `lua/utils/ue_goto/**` / C++ `gd` | `cpp_semantic_context` `cpp_semantic_client` `cpp_semantic_sidecar` `ue_goto_behavior` `utils` |
 | `code_search/**` / `ue_paths.lua` | `ue_goto_behavior` `ue_paths` `utils` |
 | `lua/config/options.lua` / `autocmds.lua` | `options` `autocmds` |
 | `lua/theme.lua` / `lua/highlights.lua` / `colors/**` | `theme` `smoke` |
 | `lua/utils/cheatsheet.lua` / `docs/ue_lazyvim_cheatsheet.md` | `cheatsheet` |
 | `lua/utils/stall_probe.lua` | `stall_probe` |
+| `lua/utils/core_health*.lua` / `scripts/nvim_core_health.lua` | `core_health` |
 | `lua/workarounds/**` | `workarounds` `smoke` |
 | 文档 / 规则 / 知识库结构 | `structure` |
 | **跨子系统 / 公共 helper / 重构 / 拿不准** | **全量（不带 filter）** |

@@ -131,7 +131,7 @@ def compile_context_key(entry):
 # ---- compiler-authored unity discovery ------------------------------------
 
 UNITY_ROOT_RE = re.compile(
-    r'((?:[A-Za-z]:|/mnt/[A-Za-z])[/\\].*?[/\\]Intermediate[/\\]Build[/\\].*?'
+    r'((?:(?:[A-Za-z]:|/mnt/[A-Za-z])[/\\]|/).*?[/\\]Intermediate[/\\]Build[/\\].*?'
     r'[/\\](?:DebugGame|Development|Shipping|Debug|Test))(?=[/\\])',
     re.IGNORECASE,
 )
@@ -377,7 +377,11 @@ def main():
             ).encode('utf-8')
         ).hexdigest()[:20]
         wrapper_local = os.path.join(super_dir_local, f'SuperUnity.UBT.{digest}.cpp')
-        wrapper = winpath_from_local(wrapper_local).replace('/', '\\')
+        wrapper = winpath_from_local(wrapper_local)
+        if len(wrapper) >= 2 and wrapper[1] == ':':
+            wrapper = wrapper.replace('/', '\\')
+        else:
+            wrapper = wrapper.replace('\\', '/')
         with open(wrapper_local, 'w', encoding='utf-8', newline='\n') as stream:
             stream.write('// Compiler-authored UBT unity membership; copied into nvim cache.\n')
             for member_path in member_paths:

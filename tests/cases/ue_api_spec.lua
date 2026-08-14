@@ -86,8 +86,12 @@ t.describe("ue.android_build_command（SO-only）", function()
       project_root = "C:/FakeProject",
       uproject = "C:/FakeProject/SampleGame.uproject",
     }
-    local normal_cmd, normal_err = ue._android_build_command_for_test(ctx)
-    local so_cmd, so_err = ue._android_build_command_for_test(ctx, { skip_deploy = true })
+    local windows_host = require("utils.platform.windows")
+    local normal_cmd, normal_err = ue._android_build_command_for_test(ctx, { host_driver = windows_host })
+    local so_cmd, so_err = ue._android_build_command_for_test(ctx, {
+      skip_deploy = true,
+      host_driver = windows_host,
+    })
 
     vim.env.UE_TARGET_PLATFORM = old_platform
     vim.env.UE_TARGET_CONFIGURATION = old_configuration
@@ -97,7 +101,8 @@ t.describe("ue.android_build_command（SO-only）", function()
     t.assert_true(so_cmd ~= nil, tostring(so_err))
     local normal_text = table.concat(normal_cmd, " ")
     local so_text = table.concat(so_cmd, " ")
-    t.assert_contains(normal_text, "Build.bat SampleGame Android Test")
+    t.assert_contains(normal_text, "Build.bat")
+    t.assert_contains(normal_text, "SampleGame Android Test")
     t.assert_false(normal_text:find("ue_android_so_build.ps1", 1, true) ~= nil)
     t.assert_contains(so_text, "ue_android_so_build.ps1")
     t.assert_contains(so_text, "-Target SampleGame")
@@ -360,6 +365,7 @@ t.describe("ue.android_build_command（SO-only）", function()
   end)
 
   t.it("SO deploy 替换前等待旧 PID 消失且等待有界", function()
+    if vim.fn.executable("powershell.exe") ~= 1 then return end
     local config = vim.fn.stdpath("config")
     local result = vim.system({
       "powershell.exe",
@@ -377,6 +383,7 @@ t.describe("ue.android_build_command（SO-only）", function()
   end)
 
   t.it("SO deploy 按设备实测能力选择 root transport", function()
+    if vim.fn.executable("powershell.exe") ~= 1 then return end
     local config = vim.fn.stdpath("config")
     local result = vim.system({
       "powershell.exe",
@@ -394,6 +401,7 @@ t.describe("ue.android_build_command（SO-only）", function()
   end)
 
   t.it("SO deploy 在 debuggable 无 root 设备走 run-as startup-agent transport", function()
+    if vim.fn.executable("powershell.exe") ~= 1 then return end
     local config = vim.fn.stdpath("config")
     local result = vim.system({
       "powershell.exe",
@@ -411,6 +419,7 @@ t.describe("ue.android_build_command（SO-only）", function()
   end)
 
   t.it("SO startup agent 保持 APK identity 不变并在应用类执行前重定向 ClassLoader", function()
+    if vim.fn.executable("powershell.exe") ~= 1 then return end
     local config = vim.fn.stdpath("config")
     local result = vim.system({
       "powershell.exe",

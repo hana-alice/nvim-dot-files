@@ -39,7 +39,7 @@ local function find_command(context, nvim_command)
 end
 
 t.describe("ue.ai_context", function()
-  t.it("按引擎 state 解析项目、Android Development 和原生命令", function()
+  t.it("按引擎 state 解析项目，并服从 host-target matrix", function()
     local root, engine = fixture()
     require("utils.android_device").set("SERIAL-CONTEXT")
     local context, err = require("ue").ai_context(engine)
@@ -54,14 +54,24 @@ t.describe("ue.ai_context", function()
     t.assert_eq(context.target.name, "SampleGame")
     t.assert_eq(context.state.android_package, "com.example.samplegame")
     t.assert_eq(context.android_device_serial, "SERIAL-CONTEXT")
-    t.assert_eq(context.artifacts.build_command[1], "cmd.exe")
-    t.assert_contains(context.artifacts.build_command[4], "Build.bat SampleGame Android Development")
-    t.assert_eq(context.artifacts.install_command[1], "adb")
-    t.assert_eq(context.artifacts.install_command[2], "-s")
-    t.assert_eq(context.artifacts.install_command[3], "SERIAL-CONTEXT")
-    t.assert_eq(context.artifacts.install_command[4], "install")
-    t.assert_eq(context.artifacts.install_command[5], "-r")
-    t.assert_nil(assert(find_command(context, ":UEInstallAndroid")).native_action)
+    local host_id = require("utils.platform").driver().id
+    if host_id == "windows" then
+      local build_text = table.concat(context.artifacts.build_command, " ")
+      t.assert_eq(context.artifacts.build_command[1], "cmd.exe")
+      t.assert_contains(build_text, "Build.bat")
+      t.assert_contains(build_text, "SampleGame Android Development")
+      t.assert_eq(context.artifacts.install_command[1], "adb")
+      t.assert_eq(context.artifacts.install_command[2], "-s")
+      t.assert_eq(context.artifacts.install_command[3], "SERIAL-CONTEXT")
+      t.assert_eq(context.artifacts.install_command[4], "install")
+      t.assert_eq(context.artifacts.install_command[5], "-r")
+      t.assert_nil(assert(find_command(context, ":UEInstallAndroid")).native_action)
+    else
+      t.assert_nil(context.artifacts.build_command)
+      t.assert_contains(context.artifacts.build_error, "unavailable on host " .. host_id)
+      t.assert_nil(context.artifacts.install_command)
+      t.assert_contains(assert(find_command(context, ":UEInstallAndroid")).native_action, "unavailable on host")
+    end
   end)
 
   t.it("Markdown 同时包含键位、Neovim 命令和解析结果", function()
@@ -77,7 +87,11 @@ t.describe("ue.ai_context", function()
     t.assert_contains(markdown, "Android")
     t.assert_contains(markdown, "Development")
     t.assert_contains(markdown, "Android device serial: `SERIAL-CONTEXT`")
-    t.assert_contains(markdown, "adb -s SERIAL-CONTEXT install -r")
+    if require("utils.platform").is_windows then
+      t.assert_contains(markdown, "adb -s SERIAL-CONTEXT install -r")
+    else
+      t.assert_contains(markdown, "Android install is unavailable on host")
+    end
   end)
 
   t.it("未选择设备时不生成裸 adb install，并给出设置指引", function()
@@ -88,6 +102,10 @@ t.describe("ue.ai_context", function()
 
     t.assert_nil(context.artifacts.install_command)
     local install = assert(find_command(context, ":UEInstallAndroid"))
-    t.assert_contains(install.native_action or "", ":UESetAndroidDevice")
+    if require("utils.platform").is_windows then
+      t.assert_contains(install.native_action or "", ":UESetAndroidDevice")
+    else
+      t.assert_contains(install.native_action or "", "unavailable on host")
+    end
   end)
 end)

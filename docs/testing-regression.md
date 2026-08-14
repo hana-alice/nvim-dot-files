@@ -22,11 +22,13 @@
 | `lua/ue/cdb/**` | `ue_cdb` |
 | `lua/ue/dap/**` / `lua/utils/platform/**` | `dap` `platform` |
 | `lua/ue/index/**` / `lua/ue/clangd_commands.lua` / controlled CDB generators | `index_generation` `cpp_semantic_index` `clangd_commands` `ue_api` |
+| `lua/ue/targets/**` / `lua/ue/target_tasks.lua` | `ue_target_drivers` `ue_target_integration` `ue_target_tasks` `platform` `commands` |
 | `lua/utils/ue_goto/**` / C++ `gd` | `cpp_semantic_context` `cpp_semantic_client` `cpp_semantic_sidecar` `ue_goto_behavior` `utils` |
 | `code_search/**` / `ue_paths.lua` | `ue_goto_behavior` `ue_paths` `utils` |
 | `lua/config/options.lua` / `autocmds.lua` | `options` `autocmds` |
 | `lua/theme.lua` / `lua/highlights.lua` / `colors/**` | `theme` `smoke` |
 | `lua/utils/stall_probe.lua` | `stall_probe` |
+| `lua/utils/core_health*.lua` / `scripts/nvim_core_health.lua` | `core_health` |
 | `lua/workarounds/**` | `workarounds` `smoke` |
 | 文档 / 规则 / 知识库结构 | `structure` |
 | **跨子系统 / 公共 helper / 重构 / 拿不准** | **全量（不带 filter）** |
@@ -46,6 +48,20 @@
 ```
 nvim --headless -l tests/run.lua
 ```
+
+## 本机真实能力健康检查
+
+全量回归主要证明契约、纯逻辑和 fixture 行为；真实 startup、Tree-sitter parser、搜索 backend
+与 clangd/CDB 前置条件使用独立的只读 health runner：
+
+```sh
+nvim --headless -l scripts/nvim_core_health.lua
+nvim --headless -l scripts/nvim_core_health.lua --json
+nvim --headless -l scripts/nvim_core_health.lua --filter syntax
+```
+
+`FAIL` 表示 deterministic 基础能力失败；`DEGRADED` 表示基础能力通过，但 csearch、钉死版本
+clangd 或 live workspace 等外部能力被 `BLOCKED`。它补充而不替代本页的全量回归。
 
 Windows 本机便捷入口（仅转发，不含测试逻辑）：
 
@@ -92,6 +108,9 @@ tests/
     ├── android_device_spec.lua   # Android device picker + 进程内 serial + adb -s 路由
     ├── multi_instance_state_spec.lua # 项目/target 隔离 + 跨进程原子/merge/lease
     ├── platform_spec.lua         # utils.platform 四驱动接口契约
+    ├── ue_target_drivers_spec.lua # host/target 隔离 + IOS plan/parser/provenance
+    ├── ue_target_integration_spec.lua # ue.lua registry dispatch + target 隔离
+    ├── ue_target_tasks_spec.lua  # 结构化 argv 的异步执行边界
     ├── ue_api_spec.lua           # ue 公共表/函数冻结
     ├── ue_config_spec.lua        # ue.config schema 默认值/override/reset
     ├── ue_cdb_spec.lua           # ue.cdb.json/paths/shaders 契约

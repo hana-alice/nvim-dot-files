@@ -34,6 +34,17 @@ t.describe("ue.dap: 各平台模块导出 attach/launch", function()
       t.assert_type(m.launch, "function", id .. ".launch")
     end)
   end
+
+
+  t.it("IOS DAP 明确 unsupported，不借用 Mac handler", function()
+    local config = vim.fn.stdpath("config")
+    local source = table.concat(vim.fn.readfile(config .. "/lua/ue/dap/ios.lua"), "\n")
+    t.assert_false(source:find('require("ue.dap.mac")', 1, true) ~= nil)
+    local _, unavailable = require("ue.targets").resolve(
+      "IOS", "dap_attach", require("utils.platform.macos")
+    )
+    t.assert_eq(unavailable.status, "unavailable")
+  end)
 end)
 
 t.describe("ue.dap.android: breakpoint preseed", function()
@@ -309,28 +320,37 @@ t.describe("ue.dap: setup() 后平台已注册", function()
   local function ensure_platforms_registered()
     require("ue").setup()
     local p = require("ue.dap.platforms")
-    -- 若被前序用例 reset 清空，手动重放注册（与 ue.lua setup 内一致）。
-    if type(p.attach_handler("win64")) ~= "function" then
-      local ue = require("ue")
-      p.register_attach("android", function() ue.android_dap_attach() end)
-      p.register_launch("android", function() ue.android_dap_launch() end)
-      for _, id in ipairs({ "win64", "mac", "linux", "ios" }) do
-        local ok, m = pcall(require, "ue.dap." .. id)
-        if ok and type(m) == "table" then
-          if type(m.attach) == "function" then p.register_attach(id, m.attach) end
-          if type(m.launch) == "function" then p.register_launch(id, m.launch) end
-        end
-      end
-    end
+    -- 若被前序用例 reset 清空，按当前 host matrix 重放注册。
+    p.register_supported(require("utils.platform").driver(), require("ue"))
     return p
   end
 
-  t.it("平台注册 seam 注册 win64/mac/linux/ios/android", function()
+  t.it("平台注册 seam 只注册当前 host 支持的 target", function()
     local p = ensure_platforms_registered()
-    for _, id in ipairs({ "win64", "mac", "linux", "ios", "android" }) do
-      t.assert_type(p.attach_handler(id), "function", id .. " attach 未注册")
-      t.assert_type(p.launch_handler(id), "function", id .. " launch 未注册")
+    local host_driver = require("utils.platform").driver()
+    local targets = require("ue.targets")
+    local ids = { Android = "android", Win64 = "win64", Mac = "mac", Linux = "linux", IOS = "ios" }
+    for target, id in pairs(ids) do
+      local attach = p.attach_handler(id)
+      local launch = p.launch_handler(id)
+      t.assert_eq(type(attach) == "function", targets.supports(target, "dap_attach", host_driver))
+      t.assert_eq(type(launch) == "function", targets.supports(target, "dap_launch", host_driver))
     end
+  end)
+
+  t.it("重复注册会移除 foreign host 的陈旧 built-in handler", function()
+    local p = require("ue.dap.platforms")
+    local ue = require("ue")
+    p._reset_for_test()
+    p.register_supported(require("utils.platform.windows"), ue)
+    t.assert_type(p.attach_handler("android"), "function")
+    t.assert_type(p.attach_handler("win64"), "function")
+
+    p.register_supported(require("utils.platform.macos"), ue)
+    t.assert_nil(p.attach_handler("android"))
+    t.assert_nil(p.attach_handler("win64"))
+    t.assert_type(p.attach_handler("mac"), "function")
+    t.assert_nil(p.attach_handler("ios"))
   end)
 
   t.it("_common.find_lldb_dap 返回 string 或 nil", function()
@@ -735,6 +755,7 @@ t.describe("ue.dap._persist_bp: F9 持久化往返（K10）", function()
     -- mock dap.breakpoints：当前只有一个已开 buffer 的断点
     local buf = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_buf_set_name(buf, "D:/proj/Source/Opened.cpp")
+    local opened_key = bp._norm_for_test(vim.api.nvim_buf_get_name(buf))
     local old = package.loaded["dap.breakpoints"]
     package.loaded["dap.breakpoints"] = {
       get = function() return { [buf] = { { line = 10 } } } end,
@@ -749,7 +770,7 @@ t.describe("ue.dap._persist_bp: F9 持久化往返（K10）", function()
     pcall(vim.api.nvim_buf_delete, buf, { force = true })
 
     t.assert_true(back ~= nil, "save 后应能读回")
-    t.assert_true(back.breakpoints["D:/proj/Source/Opened.cpp"] ~= nil,
+    t.assert_true(back.breakpoints[opened_key] ~= nil,
       "已开文件的断点应被写入")
     t.assert_true(back.breakpoints["D:/proj/Source/Unopened.cpp"] ~= nil,
       "未开文件的 pending 断点必须保留（K10 灾难场景守护）")

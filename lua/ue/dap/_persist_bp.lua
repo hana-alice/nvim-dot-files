@@ -31,7 +31,8 @@
 --                file we never open.
 --
 -- Pitfalls handled:
---   * Path keys normalized via vim.fs.normalize (forward slashes, no '..').
+--   * Path keys normalized via vim.fs.normalize plus an explicit forward-slash
+--     canonical form (vim.fs.normalize preserves foreign separators on POSIX).
 --     Avoids the classic "D:\foo\bar" vs "D:/foo/bar" mis-match across
 --     Windows / Git Bash / WSL.
 --   * Save is debounced; rapid F9 toggles don't thrash disk.
@@ -54,7 +55,8 @@ local state = {
 
 local function norm(p)
   if not p or p == "" then return p end
-  return vim.fs.normalize(p)
+  local forward = tostring(p):gsub("\\", "/")
+  return vim.fs.normalize(forward):gsub("\\", "/")
 end
 
 local function read_json_file(path)

@@ -5,8 +5,8 @@
 gdbserver 模式没有的能力）。除 "host adapter 必须 LLDB 22.1.6+" 外，其余项目原则本任务
 内可放宽，目标是真正跑通。
 
-本设计基于一连串真机（a3ad86f3 / Android 16 / arm64 / `<android-package>`）+
-LLVM 22.1.6 源码（已 sparse-clone 到 `D:/project/llvm-lldb-sparse`，tag llvmorg-22.1.6）
+本设计基于一连串真机（授权测试设备 / Android 16 / arm64 / `<android-package>`）+
+LLVM 22.1.6 源码（官方 tag `llvmorg-22.1.6`）
 的实证。证据脚本在 `tools/dap_probe_android.py`、`tools/dap_platform_probe.py`。
 
 ### 已确证的事实
@@ -25,7 +25,7 @@ server 全复现。→ 这是之前所有 "连不上" 的真因。
 → **device 端 platform 模式可行，没有任何缺陷。**
 
 **E3 — host lldb-dap 是 nopython 构建**
-`C:/tools/lldb-22/install/lib/site-packages/lldb` 不存在，`script ...` 命令静默无效。
+`<lldb-install>/lib/site-packages/lldb` 不存在，`script ...` 命令静默无效。
 任何依赖 host python 的方案排除。
 
 **E4 — `platform connect <url>` 命令字符串在 22.1.6 被 getopt permute 吃掉 URL（host 卡点）**
@@ -65,7 +65,7 @@ server 全复现。→ 这是之前所有 "连不上" 的真因。
   无 `3221226505`。
 - F9 file:line 断点真实 resolved（platform 模式 + ASLR rebase 后）。
 - 连上无 `Source missing` 噪音。
-- 仅 a3ad86f3 验证；host adapter 维持 22.1.6+。
+- 仅在授权测试设备验证；host adapter 维持 22.1.6+。
 
 **Non-Goals**
 - 不回退到 gdbserver `--attach`（已证伪）。

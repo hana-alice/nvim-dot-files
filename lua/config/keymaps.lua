@@ -1,4 +1,6 @@
 local map = vim.keymap.set
+local window_title = require("utils.window_title")
+window_title.setup()
 
 local function live_grep_with(opts)
   return function()
@@ -200,7 +202,7 @@ end
 local function apply_ue_runtime_overrides()
   local opts = { nowait = true }
 
-  map("n", "<leader>uA", "<cmd>UESetAndroidDevice<cr>", vim.tbl_extend("force", opts, { desc = "UE: Select global Android device" }))
+  map("n", "<leader>uA", "<cmd>UESetAndroidDevice<cr>", vim.tbl_extend("force", opts, { desc = "UE: Select Android device (this Nvim)" }))
   map("n", "<leader>ub", "<cmd>UEBuild<cr>", vim.tbl_extend("force", opts, { desc = "UE: Build (platform from UESetPlatform)" }))
   map("n", "<leader>us", "<cmd>UEBuildAndroidSO<cr>", vim.tbl_extend("force", opts, { desc = "UE: Build Android SO only (skip APK)" }))
   map("n", "<leader>uq", "<cmd>UEDeployAndroidSO<cr>", vim.tbl_extend("force", opts, { desc = "UE: Quick deploy Android SO" }))
@@ -263,12 +265,13 @@ map("n", "<leader>bc", close_current_target, { desc = "Buffer/Window: Smart clos
 map("n", "<leader>bn", "<cmd>confirm enew<cr>", { desc = "Buffer: New empty buffer" })
 -- Static UE keymaps. Keys that need {nowait=true} are set by
 -- apply_ue_runtime_overrides() on VeryLazy (see below).
-map("n", "<leader>uA", "<cmd>UESetAndroidDevice<cr>", { desc = "UE: Select global Android device" })
+map("n", "<leader>uA", "<cmd>UESetAndroidDevice<cr>", { desc = "UE: Select Android device (this Nvim)" })
 map("n", "<leader>uB", "<cmd>UEPrepare<cr>", { desc = "UE: Prepare symbols + compile_commands" })
 map("n", "<leader>uc", "<cmd>UEExportCompileCommands<cr>", { desc = "UE: Export compile_commands" })
 map("n", "<leader>uP", "<cmd>UESetProject<cr>", { desc = "UE: Set project" })
 map("n", "<leader>ut", "<cmd>ThemePicker<cr>", { desc = "UI: Theme picker" })
 map("n", "<leader>uC", "<cmd>ThemePicker<cr>", { desc = "UI: Theme picker" })
+map("n", "<leader>uW", "<cmd>WindowTitle<cr>", { desc = "UI: Name window title" })
 map("n", "<leader>va", sidebar_pick, { desc = "Sidebar: Choose view" })
 map("n", "<leader>vv", sidebar_toggle(), { desc = "Sidebar: Toggle last view" })
 map("n", "<leader>vb", sidebar_toggle("buffers"), { desc = "Sidebar: Buffers" })

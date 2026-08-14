@@ -196,7 +196,7 @@ local function append_android_bp_diag(lines)
   if type(lines) == "string" then lines = { lines } end
   if type(lines) ~= "table" then return end
   pcall(function()
-    local path = vim.fn.stdpath("cache") .. "/ue-dap-bp-diag.log"
+    local path = vim.fn.stdpath("cache") .. ("/ue-dap-bp-diag.%d.log"):format(vim.fn.getpid())
     local fh = io.open(path, "a")
     if not fh then return end
     for _, line in ipairs(lines) do
@@ -1219,11 +1219,14 @@ function D.dap_diagnose()
   -- ── D. log files: paths + last 20 lines of each ──────────────────────
   do
     local lines = {}
+    local pid = vim.fn.getpid()
     local logs = {
       { name = "dap.log (nvim-dap)",
-        path = vim.fn.stdpath("cache") .. "/dap.log" },
-      { name = "ue_dap_e2e.log (lldb-dap trace)",
-        path = (vim.uv or vim.loop).os_tmpdir() .. "/ue_dap_e2e.log" },
+        path = vim.fn.stdpath("cache") .. ("/dap.%d.log"):format(pid) },
+      { name = "lldb-dap protocol",
+        path = vim.fn.stdpath("cache") .. ("/lldb-dap-protocol.%d.log"):format(pid) },
+      { name = "UE DAP breakpoint diagnostics",
+        path = vim.fn.stdpath("cache") .. ("/ue-dap-bp-diag.%d.log"):format(pid) },
     }
     for _, l in ipairs(logs) do
       lines[#lines + 1] = ("── %s ──"):format(l.name)

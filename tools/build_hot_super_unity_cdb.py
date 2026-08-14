@@ -1,78 +1,65 @@
 #!/usr/bin/env python3
-"""build_hot_super_unity_cdb.py — super-unity for per-file hot subset CDBs.
+"""build_hot_super_unity_cdb.py — compiler-authored UBT unity wrappers plus
+exact per-file fallback for controlled BackgroundIndex.
 
-Companion to build_super_unity_cdb.py. The full pipeline's super-unity input
-is UE's unity-build products (Module.<Mod>.cpp). The hot/current subset is
-plain per-file .cpp (e.g. ApplicationCore.cpp). This script groups per-file
-entries by (SharedPCH, module) and merges each group into a SuperUnity.<pch>.<chunk>.cpp
-that #include's its member .cpp files, with API-macro re-injection per member.
+The full/current/hot pipelines feed this script exact per-file compile commands.
+It discovers unity membership only from wrappers and response files emitted by
+the active UBT build, then copies each proven member set into nvim's cache.
 
-Output: a super-only CDB whose entries reference synthesised SuperUnity.*.cpp
-files in <stage_dir>/super_unity_cpps/. Fed to clangd-indexer instead of
-the original per-file hot.json, this collapses 2985 TUs into ~15 super-TUs
-(200× preamble share for SharedPCH.Engine etc), with the same symbol
-coverage.
+Output: a controlled BackgroundIndex CDB whose entries reference wrapper
+SuperUnity.*.cpp files in <stage_dir>/super_unity_cpps/ when active-build UBT
+unity evidence exists, and exact per-file entries otherwise. The resulting CDB
+keeps active source coverage complete without guessing new unity groupings.
 
 INPUT  : per-file CDB (after prebuild_pch_v2 / resolve_cdb_paths /
          unify_include_dirs / prune_include_dirs), already inject'd with -D
          from Definitions.<Mod>.h by inject_definitions_to_cdb.py.
-OUTPUT : <out_cdb> super-only CDB.
+OUTPUT : <out_cdb> controlled BackgroundIndex CDB.
 
 USAGE  : python build_hot_super_unity_cdb.py <per_file_cdb> <out_cdb>
                   [--max-mods N] [--super-dir <dir>]
 
 DESIGN NOTES
-  - module name comes from the file path .../Source/<Group>/<Module>/(Private|Public|Classes)/...
-  - SharedPCH name comes from scanning each entry's args for either:
-        '-include <...SharedPCH.X.h>'      (A-fix post-2026-05-18 form)
-        '-include-pch <...SharedPCH.X.pch>' (legacy / parallel form)
-    if neither is present, the TU is bucketed as 'NONE' and gets its own
-    no-PCH chunk (rare in hot subset post A-fix; we still keep them since
-    they parse fine).
-  - chunk size is the number of MEMBER .cpps per super-TU (default 80).
-    Engine has 1209 .cpps in hot → 1209/80 = ~16 chunks for that PCH bucket.
-    Smaller chunks = less RAM per indexer process but more preamble work.
-  - per-member API macros: read Definitions.<Mod>.h once per distinct
-    module across the whole CDB, cache, re-emit at top of each member's
-    #include block in the super-TU. This is the same scheme the full
-    pipeline already uses.
+  - A group is accepted only when a current-build UBT unity wrapper includes
+    exact active-CDB members and its matching `.o.rsp` reconstructs one exact
+    compiler context. No synthetic cross-module argument union is allowed.
+  - `--max-mods` bounds accepted UBT member count; it never creates new chunks
+    or changes compiler-authored membership.
+  - Sources without valid unity evidence retain their original file, cwd, and
+    argv as exact per-file fallbacks, so coverage is complete without guessing.
+  - Portable member/module metadata lets the semantic sidecar select subject
+    module contexts without writing private workspace roots into manifests.
 
 PITFALLS HANDLED
-  - args glued vs split form (-IPATH vs -I PATH, etc.): union must use a
-    single walker. Same logic as build_super_unity_cdb.py, deduplicated.
-  - module discovery from per-file paths must tolerate edge cases:
+  - module metadata from per-file paths tolerates edge cases:
         .../Source/Runtime/<Mod>/Private/...    (most common)
         .../Source/Runtime/<Mod>/Public/...     (Public/Classes counted as same module)
         .../Source/Developer/<Mod>/Private/...
         .../Source/Editor/<Mod>/Private/...
         .../Plugins/.../Source/<Mod>/Private/...
     All resolve to <Mod> (the directory containing Private/Public/Classes).
+  - Files outside that conventional layout are assigned to a deterministic
+    path bucket. They are never dropped: controlled background indexing must
+    preserve the input CDB's complete source set.
 """
 
 import argparse
+import ctypes
+import glob
+import hashlib
 import json
 import os
 import re
+import shlex
 import sys
-from collections import defaultdict, OrderedDict
-
-RE_API_DEF = re.compile(
-    r'^\s*#\s*define\s+(\w+_API|\w+_NON_ATTRIBUTED_API)\s+(DLLEXPORT|DLLIMPORT)\s*$'
-)
-# Match SharedPCH.X.h, SharedPCH.X.Y.h, PCH.X.h, PCH.X.Y.h forms in -include
-# or -include-pch arguments. We treat per-module PCH.<Mod>.h as its own bucket
-# (one Module = one bucket = no preamble share inside a module, only across
-# its TUs). SharedPCH.<Variant> covers the cross-module preamble share that
-# gives the bulk of the speed-up.
-RE_PCH_HEADER = re.compile(r'(SharedPCH|PCH)\.([\w.]+?)\.h\b', re.IGNORECASE)
-RE_PCH_BINARY = re.compile(r'(SharedPCH|PCH)\.([\w.]+?)\.pch\b', re.IGNORECASE)
+from collections import defaultdict
 
 
 # ---- path helpers ----------------------------------------------------------
 
 def winpath_local(p):
     """Translate D:\foo or D:/foo into /mnt/d/foo when running under WSL."""
-    if len(p) >= 2 and p[1] == ':' and os.path.isdir('/mnt/c'):
+    if sys.platform.startswith('linux') and len(p) >= 2 and p[1] == ':' and os.path.isdir('/mnt/c'):
         return f'/mnt/{p[0].lower()}/' + p[2:].replace('\\', '/').lstrip('/')
     return p
 
@@ -85,139 +72,252 @@ def winpath_from_local(p):
     return p
 
 
-# ---- module discovery ------------------------------------------------------
+# ---- portable module metadata ---------------------------------------------
 
 # Common UE source layout markers; the module name is the directory IMMEDIATELY
 # above one of these subdirectories.
 _MODULE_MARKER_DIRS = ('Private', 'Public', 'Classes', 'Internal')
 
 
-def get_module_from_perfile(file_path):
-    """For .../Source/.../<Module>/<Private|Public|Classes|Internal>/...
-    return <Module>. Returns None if no marker found.
+def _portable_parts(file_path):
+    normalized = file_path.replace('\\', '/').strip('/')
+    return [part for part in normalized.split('/') if part]
+
+
+def portable_member_path(file_path):
+    """Return a suffix-stable member path without workspace-specific roots."""
+    parts = _portable_parts(file_path)
+    for index in range(len(parts) - 1, -1, -1):
+        if parts[index] == 'Source' and index + 1 < len(parts):
+            return '/'.join(parts[index:])
+    marker = next((i for i, part in enumerate(parts) if part in _MODULE_MARKER_DIRS), None)
+    if marker is not None and marker >= 1:
+        return '/'.join(parts[marker - 1:])
+    if len(parts) <= 3:
+        return '/'.join(parts)
+    return '/'.join(parts[-3:])
+
+
+def portable_module_root(file_path):
+    """Infer the module root from UE markers without absolute workspace paths."""
+    parts = _portable_parts(file_path)
+    for index, segment in enumerate(parts):
+        if segment in _MODULE_MARKER_DIRS and index >= 1:
+            for source_index in range(index - 1, -1, -1):
+                if parts[source_index] == 'Source':
+                    return '/'.join(parts[source_index:index])
+            return parts[index - 1]
+    member_path = portable_member_path(file_path)
+    parent = os.path.dirname(member_path.replace('\\', '/')).replace('\\', '/')
+    return parent.strip('/')
+
+
+def compile_context_key(entry):
+    """Fingerprint every semantic argument except the source spelling.
+
+    Entries with different command lines must not share an AST. Keeping this
+    key exact is intentionally conservative: less compression is acceptable;
+    silently combining incompatible macro/include environments is not.
     """
-    fp = file_path.replace('\\', '/')
-    parts = fp.split('/')
-    for i, seg in enumerate(parts):
-        if seg in _MODULE_MARKER_DIRS and i >= 1:
-            return parts[i - 1]
+    source = os.path.normcase(entry.get('file', '').replace('\\', '/'))
+    normalized = []
+    for arg in entry.get('arguments', []):
+        candidate = os.path.normcase(str(arg).replace('\\', '/'))
+        normalized.append('<SOURCE>' if candidate == source else arg)
+    payload = json.dumps(normalized, ensure_ascii=False, separators=(',', ':'))
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]
+
+
+# ---- compiler-authored unity discovery ------------------------------------
+
+UNITY_ROOT_RE = re.compile(
+    r'((?:[A-Za-z]:|/mnt/[A-Za-z])[/\\].*?[/\\]Intermediate[/\\]Build[/\\].*?'
+    r'[/\\](?:DebugGame|Development|Shipping|Debug|Test))(?=[/\\])',
+    re.IGNORECASE,
+)
+UNITY_INCLUDE_RE = re.compile(r'^\s*#\s*include\s+"([^"]+\.cpp)"', re.IGNORECASE)
+
+
+def discover_active_unity_root(cdb):
+    """Return the build-intermediate root proven by active command args.
+
+    We deliberately do not scan hard-coded platform/configuration paths. The
+    only candidates are roots literally present in this CDB's compiler-owned
+    arguments; repeated references provide a deterministic evidence score.
+    """
+    evidence = defaultdict(int)
+    for entry in cdb:
+        for arg in entry.get('arguments', []):
+            for match in UNITY_ROOT_RE.finditer(str(arg)):
+                root = match.group(1).replace('\\', '/')
+                local = winpath_local(root)
+                if os.path.isdir(local):
+                    evidence[root] += 1
+    if not evidence:
+        return None, 0
+    return sorted(evidence.items(), key=lambda item: (-item[1], item[0].casefold()))[0]
+
+
+def source_suffix_lookup(cdb):
+    """Build an exact suffix lookup for compiler-generated unity includes."""
+    lookup = defaultdict(list)
+    for index, entry in enumerate(cdb):
+        path = entry.get('file', '').replace('\\', '/').strip('/')
+        parts = path.split('/')
+        for start in range(max(0, len(parts) - 12), len(parts) - 1):
+            lookup['/'.join(parts[start:]).casefold()].append(index)
+        lookup[path.casefold()].append(index)
+    return lookup
+
+
+def resolve_unity_member(include_path, lookup):
+    key = include_path.replace('\\', '/').lstrip('./').casefold()
+    matches = sorted(set(lookup.get(key, [])))
+    return matches[0] if len(matches) == 1 else None
+
+
+def split_response_file(text):
+    if os.name != 'nt':
+        return shlex.split(text, posix=True)
+    argc = ctypes.c_int()
+    split = ctypes.windll.shell32.CommandLineToArgvW
+    split.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+    split.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    argv = split(text, ctypes.byref(argc))
+    if not argv:
+        raise OSError('CommandLineToArgvW failed')
+    try:
+        return [argv[index] for index in range(argc.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(ctypes.cast(argv, ctypes.c_void_p))
+
+
+def option_value(args, prefix):
+    for index, arg in enumerate(args):
+        if arg.startswith(prefix + '='):
+            return arg[len(prefix) + 1:]
+        if arg == prefix and index + 1 < len(args):
+            return args[index + 1]
     return None
 
 
-# ---- PCH discovery (from args, no rsp lookup) ------------------------------
-
-def get_pch_key_from_args(args):
-    """Walk an entry's arguments, return a PCH bucket key like
-    'SharedPCH.Engine.ShadowErrors' / 'PCH.CoreUObject' / 'NONE'. We keep
-    the full prefix (SharedPCH vs PCH) so per-module PCH buckets stay
-    isolated from cross-module SharedPCH ones — they have wildly different
-    include sets.
-    """
-    for i, a in enumerate(args):
-        if a == '-include' and i + 1 < len(args):
-            m = RE_PCH_HEADER.search(args[i + 1])
-            if m:
-                return f'{m.group(1)}.{m.group(2)}'
-        if a == '-include-pch' and i + 1 < len(args):
-            m = RE_PCH_BINARY.search(args[i + 1])
-            if m:
-                return f'{m.group(1)}.{m.group(2)}'
-        # glued: -include=path or /FIpath (very rare in clang form post-prep)
-        if a.startswith('-include'):
-            m = RE_PCH_HEADER.search(a) or RE_PCH_BINARY.search(a)
-            if m:
-                return f'{m.group(1)}.{m.group(2)}'
-    return 'NONE'
-
-
-# ---- API-macro extraction --------------------------------------------------
-
-def get_module_api_defines(engine_source_roots, mod, _cache={}):
-    """Find Definitions.<Mod>.h in the standard UE Intermediate path and
-    extract API-export macros. Memoised across calls.
-
-    engine_source_roots: iterable of project source root candidates to probe
-    so we don't hard-code project layouts. We just need the per-module
-    `Definitions.<Mod>.h` file; UBT writes that next to Module.<Mod>.cpp
-    under Engine/Intermediate/Build/.../<Mod>/.
-    """
-    if mod in _cache:
-        return _cache[mod]
-    out = []
-    for root in engine_source_roots:
-        candidate = f'{root}/{mod}/Definitions.{mod}.h'
-        if not os.path.isfile(candidate):
-            continue
+def unity_response_args(unity_path, template):
+    """Return compiler-authored response args compatible with active CDB."""
+    template_args = template.get('arguments', [])
+    template_target = option_value(template_args, '--target')
+    template_std = next((arg for arg in template_args if arg.startswith('-std=')), None)
+    unity_normalized = os.path.normcase(unity_path.replace('\\', '/'))
+    candidates = sorted(
+        glob.glob(unity_path + '*.o.rsp'),
+        key=lambda path: (-os.path.getmtime(path), path.casefold()),
+    )
+    for rsp_path in candidates:
         try:
-            with open(candidate, encoding='utf-8', errors='replace') as f:
-                for line in f:
-                    m = RE_API_DEF.match(line)
-                    if m:
-                        out.append((m.group(1), m.group(2)))
-            break
+            with open(rsp_path, encoding='utf-8', errors='replace') as stream:
+                rsp_args = split_response_file(stream.read())
+        except (OSError, ValueError):
+            continue
+        rsp_target = option_value(rsp_args, '--target')
+        rsp_std = next((arg for arg in rsp_args if arg.startswith('-std=')), None)
+        if template_target and rsp_target != template_target:
+            continue
+        if template_std and rsp_std != template_std:
+            continue
+        if not any(
+            os.path.normcase(str(arg).replace('\\', '/')) == unity_normalized
+            for arg in rsp_args
+        ):
+            continue
+        return rsp_args
+    return None
+
+
+def compiler_authored_unity_groups(cdb, root):
+    """Map active UBT unity manifests to exact CDB entries.
+
+    A group is accepted only when every include maps uniquely into the active
+    CDB and every member has the same exact compile-context fingerprint.
+    Anything not proven this way remains an original per-file entry.
+    """
+    if not root:
+        return []
+    root_local = winpath_local(root)
+    lookup = source_suffix_lookup(cdb)
+    groups = []
+    claimed = set()
+    patterns = (
+        os.path.join(root_local, '*', 'Module.*.cpp'),
+        os.path.join(root_local, '*', '*', 'Module.*.cpp'),
+    )
+    unity_files = []
+    for pattern in patterns:
+        unity_files.extend(glob.glob(pattern))
+    for unity_path in sorted(set(unity_files), key=str.casefold):
+        try:
+            with open(unity_path, encoding='utf-8', errors='replace') as stream:
+                includes = [
+                    match.group(1)
+                    for line in stream
+                    for match in [UNITY_INCLUDE_RE.match(line)]
+                    if match
+                ]
         except OSError:
             continue
-    _cache[mod] = out
-    return out
-
-
-def discover_engine_intermediate_roots(cdb):
-    """Heuristic: scan first ~300 entries for paths like
-    `.../Intermediate/Build/<Platform>/<Target>/<Config>/<Module>/Definitions.<Module>.h`
-    inside -include args or -I paths. Return a deduped list of candidate
-    `<Config>` parent dirs that get_module_api_defines will probe for
-    Definitions.<Mod>.h.
-
-    We avoid hard-coding 'Win64' or 'UE4Editor' segments — UE projects use
-    arbitrary Target names (UE4Editor, UE5Editor, ClientGame, ServerGame,
-    or even the cross-project resolve-leak's 'Client' here). The marker we
-    rely on is 'Intermediate/Build/.../Definitions.<X>.h' presence.
-    """
-    seen = OrderedDict()
-    rx = re.compile(
-        r'(.+?Intermediate[/\\]Build[/\\][^/\\]+[/\\][^/\\]+[/\\][^/\\]+)[/\\][^/\\]+[/\\]Definitions\.',
-        re.IGNORECASE,
-    )
-    for e in cdb[:500]:
-        for a in e.get('arguments', []):
-            m = rx.search(a)
-            if m:
-                root = m.group(1).replace('\\', '/')
-                seen[winpath_local(root)] = None
-    return list(seen.keys())
-
-
-# ---- arg walker (split / glued form aware) ---------------------------------
-
-def walk_args(args):
-    """Yield ('inc'|'def'|'other', tuple_of_tokens) preserving original form.
-    Same semantics as the full-pipeline build_super_unity_cdb.py.
-    """
-    n = len(args)
-    i = 0
-    while i < n:
-        a = args[i]
-        if a in ('-I', '-D', '-U', '-include', '-isystem', '-imacros') and i + 1 < n:
-            kind = 'inc' if a in ('-I', '-include', '-isystem', '-imacros') else 'def'
-            yield kind, (a, args[i + 1])
-            i += 2
+        members = [resolve_unity_member(include, lookup) for include in includes]
+        if not members or any(member is None for member in members):
             continue
-        if (a.startswith('-I') and len(a) > 2) or a.startswith('-isystem='):
-            yield 'inc', (a,)
-            i += 1
+        if len(set(members)) != len(members) or any(member in claimed for member in members):
             continue
-        if (a.startswith('-D') and len(a) > 2) or (a.startswith('-U') and len(a) > 2):
-            yield 'def', (a,)
-            i += 1
+        contexts = {compile_context_key(cdb[member]) for member in members}
+        if len(contexts) != 1:
             continue
-        if a == '-include-pch' and i + 1 < n:
-            # Drop -include-pch entirely from super-TUs. The .pch was per-TU;
-            # the super-TU includes raw .cpps so the original SharedPCH header
-            # gets pulled in via the surviving '-include <SharedPCH.h>' token.
-            i += 2
+        rsp_args = unity_response_args(unity_path, cdb[members[0]])
+        if not rsp_args:
             continue
-        yield 'other', (a,)
-        i += 1
+        groups.append((unity_path, members, rsp_args))
+        claimed.update(members)
+    groups.sort(key=lambda group: min(group[1]))
+    return groups
+
+
+def rewritten_arguments(entry, new_source):
+    args = list(entry.get('arguments', []))
+    old_source = os.path.normcase(entry.get('file', '').replace('\\', '/'))
+    replaced = False
+    for index, arg in enumerate(args):
+        normalized = os.path.normcase(str(arg).replace('\\', '/'))
+        if normalized == old_source:
+            args[index] = new_source
+            replaced = True
+    if not replaced:
+        args.append(new_source)
+    return args
+
+
+def rewritten_response_arguments(template, unity_path, rsp_args, new_source):
+    """Build a clangd command from UBT's response file without output/PCH IO."""
+    driver = template.get('arguments', [None])[0]
+    if not driver:
+        return None
+    unity_normalized = os.path.normcase(unity_path.replace('\\', '/'))
+    args = [driver]
+    replaced = False
+    index = 0
+    while index < len(rsp_args):
+        arg = rsp_args[index]
+        if arg in ('-include-pch', '-o', '-MF') and index + 1 < len(rsp_args):
+            index += 2
+            continue
+        if arg == '-MD' or arg.startswith('-MF'):
+            index += 1
+            continue
+        if os.path.normcase(str(arg).replace('\\', '/')) == unity_normalized:
+            args.append(new_source)
+            replaced = True
+        else:
+            args.append(arg)
+        index += 1
+    return args if replaced else None
 
 
 # ---- main ------------------------------------------------------------------
@@ -225,9 +325,9 @@ def walk_args(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('src', help='per-file CDB (hot.json)')
-    ap.add_argument('out', help='output super-unity CDB path')
+    ap.add_argument('out', help='output controlled BackgroundIndex CDB path')
     ap.add_argument('--max-mods', type=int, default=80,
-                    help='max member .cpps per super-TU (default 80)')
+                    help='max member .cpps per wrapper TU (default 80)')
     ap.add_argument('--super-dir', default=None,
                     help='where to write SuperUnity.*.cpp (default: <out_dir>/super_unity_cpps)')
     args = ap.parse_args()
@@ -242,40 +342,10 @@ def main():
         print('[hot-super] empty CDB, nothing to do', file=sys.stderr)
         return 0
 
-    # Discover Engine Intermediate roots for Definitions.<Mod>.h lookup
-    intermediate_roots = discover_engine_intermediate_roots(cdb)
-    print(f'[hot-super] Intermediate roots probed: {len(intermediate_roots)}',
-          file=sys.stderr)
-    for r in intermediate_roots[:4]:
-        print(f'  - {r}', file=sys.stderr)
-
-    # Group entries by (pch_key, module_name)
-    # NOTE: we deliberately do NOT split by per-entry args differences
-    # within the same (pch, mod) bucket — the union-merge step downstream
-    # consolidates -I/-D/-U across all members. Cross-module bucketing
-    # via shared PCH is what gives the 200× preamble share win.
-    groups = defaultdict(list)  # (pch_key, mod) -> [entry]
-    no_mod = 0
-    for e in cdb:
-        f_ = e.get('file', '')
-        mod = get_module_from_perfile(f_)
-        if not mod:
-            no_mod += 1
-            continue
-        pch = get_pch_key_from_args(e.get('arguments', []))
-        groups[(pch, mod)].append(e)
-
-    if no_mod:
-        print(f'[hot-super] WARN: {no_mod} entries had no Private/Public/Classes/Internal '
-              f'parent — skipped', file=sys.stderr)
-
-    # Print group distribution before chunking
-    pch_to_count = defaultdict(int)
-    for (pch, _mod), entries in groups.items():
-        pch_to_count[pch] += len(entries)
-    print(f'[hot-super] PCH buckets:', file=sys.stderr)
-    for pch, n in sorted(pch_to_count.items(), key=lambda x: -x[1]):
-        print(f'  {n:5d}  {pch}', file=sys.stderr)
+    for index, entry in enumerate(cdb):
+        if not isinstance(entry.get('arguments'), list) or not entry.get('file'):
+            print(f'ERROR: entry {index} lacks structured arguments/file', file=sys.stderr)
+            return 1
 
     # Output dir for SuperUnity.*.cpp
     out_dir = os.path.dirname(out_local) or '.'
@@ -291,99 +361,66 @@ def main():
             except OSError:
                 pass
 
+    active_root, root_evidence = discover_active_unity_root(cdb)
+    groups = compiler_authored_unity_groups(cdb, active_root)
+    claimed = {member for _unity, members, _rsp in groups for member in members}
     new_cdb = []
-    n_super = 0
 
-    # Iterate by PCH bucket so we get nice SuperUnity.<pch>.<N>.cpp names,
-    # but chunk inside each bucket across all its modules. To keep RAM
-    # bounded we chunk by absolute member count (--max-mods), not by module.
-    # Across-module chunking is fine because each member's -D/-I goes
-    # through the union step below.
-    by_pch = defaultdict(list)  # pch -> [(mod, entry)]
-    for (pch, mod), entries in groups.items():
-        for e in entries:
-            by_pch[pch].append((mod, e))
+    for unity_path, members, rsp_args in groups:
+        template = cdb[members[0]]
+        member_paths = [cdb[index]['file'].replace('\\', '/') for index in members]
+        digest = hashlib.sha256(
+            (
+                '\0'.join(member_paths)
+                + '\0' + compile_context_key(template)
+                + '\0' + json.dumps(rsp_args, ensure_ascii=False, separators=(',', ':'))
+            ).encode('utf-8')
+        ).hexdigest()[:20]
+        wrapper_local = os.path.join(super_dir_local, f'SuperUnity.UBT.{digest}.cpp')
+        wrapper = winpath_from_local(wrapper_local).replace('/', '\\')
+        with open(wrapper_local, 'w', encoding='utf-8', newline='\n') as stream:
+            stream.write('// Compiler-authored UBT unity membership; copied into nvim cache.\n')
+            for member_path in member_paths:
+                stream.write(f'#include "{member_path}"\n')
+        command = rewritten_response_arguments(template, unity_path, rsp_args, wrapper)
+        if not command:
+            print('ERROR: accepted unity response no longer rewrites its source', file=sys.stderr)
+            return 1
+        new_cdb.append({
+            'directory': template.get('directory', ''),
+            'arguments': command,
+            'file': wrapper,
+            'nvim_ue_members': [portable_member_path(member_path) for member_path in member_paths],
+            'nvim_ue_module_root': portable_module_root(member_paths[0]),
+        })
 
-    for pch_key, members in by_pch.items():
-        pch_tag = pch_key if pch_key != 'NONE' else 'NONE'
-        pch_tag = pch_tag.replace('.', '_')
-        for chunk_idx, start in enumerate(range(0, len(members), args.max_mods)):
-            chunk = members[start:start + args.max_mods]
-            n_super += 1
-            template_entry = chunk[0][1]
+    # A source without current-build UBT unity evidence stays an exact original
+    # TU. This is slower but semantics-preserving and makes coverage complete.
+    for index, entry in enumerate(cdb):
+        if index not in claimed:
+            fallback_entry = {
+                'directory': entry.get('directory', ''),
+                'arguments': list(entry.get('arguments', [])),
+                'file': entry.get('file', ''),
+                'nvim_ue_members': [portable_member_path(entry.get('file', ''))],
+                'nvim_ue_module_root': portable_module_root(entry.get('file', '')),
+            }
+            new_cdb.append(fallback_entry)
 
-            # Synthesise the SuperUnity .cpp containing #include's of all
-            # chunk members plus per-module API-macro re-injection.
-            super_cpp_local = f'{super_dir_local}/SuperUnity.{pch_tag}.{chunk_idx}.cpp'
-            super_cpp_win = winpath_from_local(super_cpp_local).replace('/', '\\')
-            with open(super_cpp_local, 'w', encoding='utf-8', newline='\n') as fp:
-                fp.write(f'// Super-unity for SharedPCH={pch_tag}, chunk {chunk_idx}\n')
-                fp.write(f'// Members: {len(chunk)} per-file TUs\n\n')
-                last_mod = None
-                for mod, e in chunk:
-                    member_path = e['file'].replace('\\', '/')
-                    if mod != last_mod:
-                        api = get_module_api_defines(intermediate_roots, mod)
-                        fp.write(f'\n// ---- {mod} ({len(api)} API macros) ----\n')
-                        for name, val in api:
-                            fp.write(f'#undef {name}\n#define {name} {val}\n')
-                        last_mod = mod
-                    fp.write(f'#include "{member_path}"\n')
+    covered = len(claimed) + (len(cdb) - len(claimed))
+    if covered != len(cdb):
+        print(f'ERROR: source coverage mismatch: input={len(cdb)} covered={covered}',
+              file=sys.stderr)
+        return 1
 
-            # Merge args: union of -I/-D/-U across chunk members; -include /
-            # -isystem / -imacros also dedup'd into the 'inc' bucket. Other
-            # flags inherited from template_entry (chunk[0]).
-            base_args = list(template_entry.get('arguments', []))
-            all_inc = []
-            seen_inc = set()
-            all_def = []
-            seen_def = set()
-            for _, mem_e in chunk:
-                for kind, payload in walk_args(mem_e.get('arguments', [])):
-                    key = '\x00'.join(payload)
-                    if kind == 'inc' and key not in seen_inc:
-                        seen_inc.add(key)
-                        all_inc.append(payload)
-                    elif kind == 'def' and key not in seen_def:
-                        seen_def.add(key)
-                        all_def.append(payload)
-
-            # Strip every -I/-D/-U/-include/-include-pch from template,
-            # keep only 'other' tokens (driver path, -std=, -x, etc.)
-            new_args = []
-            for kind, payload in walk_args(base_args):
-                if kind == 'other':
-                    new_args.extend(payload)
-
-            # Re-insert merged union after the driver path (new_args[0]).
-            flat_inc = [tok for tup in all_inc for tok in tup]
-            flat_def = [tok for tup in all_def for tok in tup]
-            if new_args:
-                new_args = new_args[:1] + flat_inc + flat_def + new_args[1:]
-            else:
-                new_args = flat_inc + flat_def
-
-            # Swap the file path token to point at SuperUnity .cpp
-            old_cpp = template_entry.get('file', '')
-            replaced = False
-            for i, a in enumerate(new_args):
-                if a == old_cpp:
-                    new_args[i] = super_cpp_win
-                    replaced = True
-                    break
-            if not replaced:
-                # template's args didn't carry the source path as a positional
-                # token (some forms put it elsewhere). Append it.
-                new_args.append(super_cpp_win)
-
-            new_cdb.append({
-                'directory': template_entry.get('directory', ''),
-                'arguments': new_args,
-                'file': super_cpp_win,
-            })
-
-    print(f'[hot-super] super-TUs created: {n_super} (compression {len(cdb)/max(n_super,1):.1f}x)',
-          file=sys.stderr)
+    print(
+        f'[hot-super] active unity root evidence: {root_evidence}; '
+        f'proven groups: {len(groups)}; grouped sources: {len(claimed)}; '
+        f'exact per-file fallback: {len(cdb) - len(claimed)}',
+        file=sys.stderr,
+    )
+    print(f'[hot-super] background TUs: {len(new_cdb)} '
+          f'(compression {len(cdb)/max(len(new_cdb),1):.1f}x)', file=sys.stderr)
 
     with open(out_local, 'w', encoding='utf-8') as f:
         json.dump(new_cdb, f)

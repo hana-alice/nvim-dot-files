@@ -2,13 +2,14 @@
 
 ## Purpose
 
-为当前 Neovim 会话提供唯一、显式的 Android device 目标：从 `adb devices -l`
-按名称 + serial 选择并写入全局变量，让 APK install、launch、logcat 与 DAP 的所有
-设备定向命令统一使用 `adb -s <serial>`，同时保证运行中流程不会因重选而跨设备。
+为当前 Neovim **进程**提供唯一、显式的 Android device 目标：从 `adb devices -l`
+按名称 + serial 选择并写入进程内 `vim.g` 变量，让 APK install、launch、logcat 与 DAP 的所有
+设备定向命令统一使用 `adb -s <serial>`，同时保证运行中流程不会因重选而跨设备；
+不同 Neovim 实例互不影响。
 ## Requirements
 ### Requirement: 从 ADB ready devices 显式选择全局 Android device
 
-系统 SHALL 注册 `:UESetAndroidDevice`，执行时 SHALL 调用 `adb devices -l` 枚举设备，只把状态为 `device` 的 ready rows 作为可选项，并 SHALL 打开选择 UI；每个可选项 MUST 同时显示可读 device 名称与 serial。选择成功后系统 SHALL 把 serial 写入会话全局变量 `vim.g.ue_android_device_serial`。
+系统 SHALL 注册 `:UESetAndroidDevice`，执行时 SHALL 调用 `adb devices -l` 枚举设备，只把状态为 `device` 的 ready rows 作为可选项，并 SHALL 打开选择 UI；每个可选项 MUST 同时显示可读 device 名称与 serial。选择成功后系统 SHALL 把 serial 写入当前 Neovim 进程的 `vim.g.ue_android_device_serial`；这里的“全局”只表示该进程内的 Vim global scope，MUST NOT 持久化或传播到其他 Neovim 进程。
 
 #### Scenario: 多设备候选显示名称和 serial
 
@@ -33,6 +34,12 @@
 - **WHEN** 已设置全局 serial，用户再次执行命令后取消选择
 - **THEN** 原 `vim.g.ue_android_device_serial` SHALL 保持不变
 - **AND** 系统 MUST NOT 自动选中列表第一项
+
+#### Scenario: 两个 Neovim 实例选择不同设备
+
+- **WHEN** 实例 A 设置 serial `SERIAL-A`，实例 B 设置 serial `SERIAL-B`
+- **THEN** 实例 A 后续读取仍 SHALL 为 `SERIAL-A`
+- **AND** 实例 B 的 `vim.g` 写入 MUST NOT 改变实例 A
 
 #### Scenario: 无 ready device
 

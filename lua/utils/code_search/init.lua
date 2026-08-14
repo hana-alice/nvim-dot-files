@@ -193,6 +193,38 @@ function M._compose_file_regex(opts)
   return nil
 end
 
+-- Quote literal input for csearch's RE2 parser. This mirrors Go's
+-- regexp.QuoteMeta set exactly: punctuation such as slash, hyphen and percent
+-- is already literal outside a character class and must not gain regex syntax.
+local RE2_META = {
+  ["\\"] = true,
+  ["."] = true,
+  ["+"] = true,
+  ["*"] = true,
+  ["?"] = true,
+  ["("] = true,
+  [")"] = true,
+  ["|"] = true,
+  ["["] = true,
+  ["]"] = true,
+  ["{"] = true,
+  ["}"] = true,
+  ["^"] = true,
+  ["$"] = true,
+}
+
+local function escape_re2_literal(value)
+  value = tostring(value or "")
+  local escaped = {}
+  for index = 1, #value do
+    local byte = value:sub(index, index)
+    escaped[#escaped + 1] = RE2_META[byte] and ("\\" .. byte) or byte
+  end
+  return table.concat(escaped)
+end
+
+M._escape_re2_literal_for_test = escape_re2_literal
+
 local function stream_csearch(ctx, pattern, opts, callbacks)
   local cs = csearch_exe()
   if not cs then
@@ -226,12 +258,7 @@ local function stream_csearch(ctx, pattern, opts, callbacks)
   -- range: `\Pr`"). Anything the user types is matched verbatim.
   local is_regex = opts.regex ~= false
   if not is_regex then
-    -- RE2 has the same metaset as PCRE for escaping purposes. \Q...\E is
-    -- the cleanest escape — RE2 supports it and it survives word-wrapping
-    -- as long as the wrapping happens at boundary points.
-    -- BUT \b...\Q...\E\b doesn't work universally in RE2 (some engines
-    -- treat \Q inside \b oddly), so do byte-level escape instead.
-    pattern = pattern:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?%{%}%|%\\])", "\\%1")
+    pattern = escape_re2_literal(pattern)
   end
 
   if opts.word then

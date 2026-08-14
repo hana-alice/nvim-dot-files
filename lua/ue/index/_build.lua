@@ -2,9 +2,9 @@
 -- Extracted verbatim from lua/ue.lua (F1 split phase-1).
 return function(M, core)
   local fs = require("ue.core.fs")
+  local file_lock = require("ue.file_lock")
   local _ufs = fs
   local _uplat = require("utils.platform")
-  local _uproc = require("ue.core.proc")
   local RT = core.RT
   local unix_now = core.h.unix_now
   local write_json_file = core.h.write_json_file
@@ -13,8 +13,18 @@ return function(M, core)
   local module_key_from_path = core.h.module_key_from_path
   local sorted_module_records = core.h.sorted_module_records
   local seed_core_modules = core.h.seed_core_modules
+  local make_index_manifest = core.h.make_index_manifest
+  local select_active_artifact = core.h.select_active_artifact
+  local update_index_selection = core.h.update_index_selection
+  local generation_for_context = core.h.generation_for_context
+  local index_manifest_path = core.h.index_manifest_path
+  local normalize_index_state = core.h.normalize_index_state
 
 M.base_compile_commands_path = function(ctx)
+  local active = ctx.paths and ctx.paths.active_cdb or nil
+  if active and _ufs.is_file(active) then
+    return active
+  end
   local path = fs.join(ctx.engine_root, "compile_commands.json")
   if _ufs.is_file(path) then
     return path
@@ -24,6 +34,107 @@ M.base_compile_commands_path = function(ctx)
     return path
   end
   return nil
+end
+core.h.base_compile_commands_path = M.base_compile_commands_path
+
+local function artifact_freshness(state, selection)
+  if not selection then
+    return "missing"
+  end
+  local dirty = false
+  if state.root_dirty then
+    dirty = true
+  else
+    for _, rec in pairs(state.modules or {}) do
+      if rec.dirty then
+        dirty = true
+        break
+      end
+    end
+  end
+  return dirty and "overlay" or "fresh"
+end
+
+local function persist_index_selection(state, selection, generation)
+  local _, snapshot = update_index_selection(state, selection, generation, artifact_freshness(state, selection))
+  return snapshot
+end
+
+local function phase_background_cdb(ctx, phase)
+  if phase == "current" then return ctx.paths.semantic_current_cdb end
+  if phase == "hot" then return ctx.paths.semantic_hot_cdb end
+  return ctx.paths.semantic_full_cdb
+end
+
+local function read_cdb(path)
+  if not path or path == "" or not _ufs.is_file(path) then return nil end
+  local content = core.deps.read_all(path)
+  local ok, decoded = pcall(vim.json.decode, content or "")
+  if not ok or type(decoded) ~= "table" then return nil end
+  return decoded
+end
+
+local function atomic_write_json(path, value)
+  _ufs.ensure_dir(vim.fs.dirname(path))
+  local tmp = path .. ".tmp." .. tostring(vim.uv.hrtime())
+  if not core.deps.write_all(tmp, vim.json.encode(value)) then
+    pcall(vim.fn.delete, tmp)
+    return false, "temporary write failed"
+  end
+  local ok, err = (vim.uv or vim.loop).fs_rename(tmp, path)
+  if not ok then
+    pcall(vim.fn.delete, tmp)
+    return false, "atomic rename failed: " .. tostring(err)
+  end
+  return true
+end
+
+-- Publish one controlled, coverage-complete database for clangd BackgroundIndex.
+-- Exact open-buffer commands are supplied separately through clangd's
+-- compilationDatabaseChanges protocol extension. Compiler-authored UBT unity
+-- groups are used when fully proven; exact per-file entries retain coverage
+-- elsewhere. Every completed phase is additive; current/hot entries lead the
+-- queue for responsiveness but can never remove the broad full baseline.
+M.publish_semantic_cdb = function(ctx, state, generation)
+  local base_path = M.base_compile_commands_path(ctx)
+  if not base_path or not _ufs.is_file(base_path) then
+    return false, "base compile_commands.json is unreadable"
+  end
+
+  local merged, seen = {}, {}
+  local function add_entries(entries)
+    for _, entry in ipairs(entries or {}) do
+      local file = M.normalize_cdb_file(entry)
+      local key = file:lower()
+      if key ~= "" and not seen[key] then
+        seen[key] = true
+        merged[#merged + 1] = entry
+      end
+    end
+  end
+  local controlled_count = 0
+  for _, phase in ipairs({ "current", "hot", "full" }) do
+    local artifact = state.index_artifacts and state.index_artifacts[phase] or nil
+    if artifact and artifact.generation_id == generation.generation_id then
+      local entries = read_cdb(artifact.background_cdb_path)
+      if not entries then
+        return false, phase .. " controlled background CDB is unreadable"
+      end
+      local before = #merged
+      add_entries(entries)
+      controlled_count = controlled_count + (#merged - before)
+    end
+  end
+  if controlled_count == 0 then
+    return false, "no same-generation controlled translation units"
+  end
+
+  local ok, err = atomic_write_json(ctx.paths.semantic_cdb, merged)
+  if not ok then return false, err end
+  return true, {
+    entry_count = #merged,
+    controlled_entry_count = controlled_count,
+  }
 end
 
 -- CDB partition by (platform, config) -- see docs/changelog.md 2026-05-28 (#5)
@@ -43,8 +154,8 @@ end
 --
 -- Pipeline placement: invoked right after run_compile_commands_pipeline (which
 -- expands rsps / injects defs / unifies includes) and BEFORE
--- M.schedule_index_refresh -- so the per-phase subset CDBs and the
--- clangd-indexer feed all see the already-partitioned base. Failure here is
+-- M.schedule_index_refresh -- so every controlled BackgroundIndex phase and
+-- exact-command transport sees the already-partitioned base. Failure here is
 -- non-fatal: we surface a WARN and leave the base CDB untouched (clangd
 -- continues to work, just with the old multi-group mix).
 M.partition_base_cdb = function(ctx, opts)
@@ -66,7 +177,7 @@ M.partition_base_cdb = function(ctx, opts)
   local python
   if _uplat.is_windows then
     local cands = {
-      vim.env.UE_PYTHON,
+      vim.env.UE_PYTHON or "",
       vim.fn.expand("~/AppData/Local/Programs/Python/Python312/python.exe"),
       vim.fn.expand("~/AppData/Local/Programs/Python/Python313/python.exe"),
       "C:/Python312/python.exe",
@@ -151,12 +262,9 @@ M.select_phase_module_keys = function(ctx, state, phase)
     end
   end
 
-  for _, rec in ipairs(ordered) do
-    if rec.tier == "core" then
-      add(rec.key)
-    end
-  end
-
+  -- Current/hot exist to make the user's active semantic context ready first.
+  -- Broad core coverage remains additive, but must not occupy the front of
+  -- the BackgroundIndex queue ahead of the file that triggered the refresh.
   if state.active_module then
     add(state.active_module)
   end
@@ -172,6 +280,9 @@ M.select_phase_module_keys = function(ctx, state, phase)
     end
   elseif phase == "hot" then
     for _, rec in ipairs(ordered) do
+      if rec.tier == "core" then add(rec.key) end
+    end
+    for _, rec in ipairs(ordered) do
       if rec.tier ~= "cold" or rec.dirty or rec.key == state.active_module then
         add(rec.key)
       end
@@ -184,6 +295,11 @@ M.select_phase_module_keys = function(ctx, state, phase)
       add(rec.key)
     end
   end
+
+  -- A scheduled current build normally has an active/dirty module. Keep a
+  -- deterministic fallback for non-editor callers without widening every
+  -- ordinary current refresh to the whole core tier.
+  if #selected == 0 and ordered[1] then add(ordered[1].key) end
 
   return selected
 end
@@ -210,13 +326,20 @@ M.write_subset_compile_commands = function(ctx, phase)
   end
 
   local subset = {}
+  local buckets = {}
+  for _, key in ipairs(selected_keys) do buckets[key] = {} end
   for _, entry in ipairs(decoded) do
     local file = M.normalize_cdb_file(entry)
     local key = module_key_from_path(ctx, file)
     if phase == "full" then
       subset[#subset + 1] = entry
     elseif key ~= "" and selected_set[key] then
-      subset[#subset + 1] = entry
+      buckets[key][#buckets[key] + 1] = entry
+    end
+  end
+  if phase ~= "full" then
+    for _, key in ipairs(selected_keys) do
+      vim.list_extend(subset, buckets[key])
     end
   end
 
@@ -239,16 +362,24 @@ M.build_phase_async = function(ctx, phase)
     return false, "busy"
   end
 
+  local phase_lease, lease_err = file_lock.acquire(ctx.paths.index_state .. ".build.lock")
+  if not phase_lease then
+    return false, "index artifacts are owned by another Neovim: " .. tostring(lease_err)
+  end
+  local function fail_before_spawn(message)
+    file_lock.release(phase_lease)
+    return false, message
+  end
+
   -- Phase split:
-  --   full       → build_full_cdb.py (single entry: rsp + inject + super-unity
-  --                 sidecar + clangd-indexer). Operates on the engine-root
-  --                 base CDB directly; no per-module subset because full == all.
-  --   hot/current → build_clangd_index.py with a per-module subset CDB
-  --                 (per-file entries only — small N, super-unity overhead
-  --                 not worth it).
+  --   full        → build_full_cdb.py over the complete active CDB.
+  --   hot/current → build_clangd_index.py over a prioritized module subset.
+  -- Both produce controlled BackgroundIndex CDBs. Sources are grouped only
+  -- through compiler-authored UBT unity membership with the matching response
+  -- file; entries lacking that proof remain exact per-file TUs.
   local subset_cdb, selected_keys, err
   if phase == "full" then
-    selected_keys = {}  -- full has no per-module selection; #selected_keys == 0 is fine
+    selected_keys = M.select_phase_module_keys(ctx, state, phase)
     local base = M.base_compile_commands_path(ctx)
     if not base then
       err = "base compile_commands.json not found at engine root"
@@ -270,7 +401,7 @@ M.build_phase_async = function(ctx, phase)
     save_index_state(ctx, state)
     core.deps.invalidate_status_cache()
     core.deps.refresh_statusline()
-    return false, err
+    return fail_before_spawn(err)
   end
 
   -- Pin to Python 3.12 absolute path on Windows: relying on PATH `python`
@@ -284,7 +415,7 @@ M.build_phase_async = function(ctx, phase)
     -- Falls back to PATH `python` if nothing matches (caller can override
     -- via UE_PYTHON env var for non-standard installs).
     local candidates = {
-      vim.env.UE_PYTHON,
+      vim.env.UE_PYTHON or "",
       vim.fn.expand("~/AppData/Local/Programs/Python/Python312/python.exe"),
       vim.fn.expand("~/AppData/Local/Programs/Python/Python313/python.exe"),
       "C:/Python312/python.exe",
@@ -306,39 +437,37 @@ M.build_phase_async = function(ctx, phase)
     build_script = tools_dir .. "/build_clangd_index.py"
   end
   if not _ufs.is_file(build_script) then
-    return false, build_script .. " not found"
+    return fail_before_spawn(build_script .. " not found")
   end
 
   local _, out_idx = M.index_phase_paths(ctx, phase)
+  local background_cdb = phase_background_cdb(ctx, phase)
   if _ufs.is_file(out_idx) then
     pcall(vim.fn.delete, out_idx)
   end
-  local indexer = _uproc.first_executable({
-    "/mnt/c/Program Files/LLVM/bin/clangd-indexer.exe",
-    "clangd-indexer",
-    "clangd-indexer.exe",
-    "C:/Program Files/LLVM/bin/clangd-indexer.exe",
-  })
+  if _ufs.is_file(background_cdb) then
+    pcall(vim.fn.delete, background_cdb)
+  end
 
   local cmd
   if phase == "full" then
-    -- build_full_cdb.py <src> <dst_active> --idx-output <idx>
+    -- build_full_cdb.py <src> <dst_active> --idx-output <marker>
     -- Single entry that produces:
-    --   * dst_active           (per-file CDB for LSP, == src in our wiring)
-    --   * dst_active.indexer   (super-unity sidecar for indexer)
-    --   * idx                  (clangd-indexer output, written from sidecar)
-    cmd = { python, build_script, subset_cdb, subset_cdb, "--idx-output", out_idx }
-    if indexer then
-      cmd[#cmd + 1] = "--indexer"
-      cmd[#cmd + 1] = indexer
-    end
+    --   * index_full_cdb       (post-processed per-file scratch CDB)
+    --   * background_cdb       (super-unity-only CDB for clangd shards)
+    --   * marker               (small completion artifact; not loaded by clangd)
+    cmd = {
+      python, build_script, subset_cdb, ctx.paths.index_full_cdb,
+      "--idx-output", out_idx,
+      "--background-output", background_cdb,
+    }
   else
-    -- hot/current: per-file subset → indexer, no unity/super-unity.
-    cmd = { python, build_script, subset_cdb, "--output", out_idx }
-    if indexer then
-      cmd[#cmd + 1] = "--indexer"
-      cmd[#cmd + 1] = indexer
-    end
+    -- hot/current: subset → compiler-proven wrappers + exact TU fallback.
+    cmd = {
+      python, build_script, subset_cdb,
+      "--output", out_idx,
+      "--background-output", background_cdb,
+    }
   end
 
   state.queue[phase] = nil
@@ -371,9 +500,12 @@ M.build_phase_async = function(ctx, phase)
     local elapsed_s = (vim.uv.hrtime() - t_build_0) / 1e9
     vim.schedule(function()
       local live_state = ensure_index_state(ctx)
+      normalize_index_state(live_state)
       RT.job = nil
       local stderr = fs.trim((result.stderr or "") .. "\n" .. (result.stdout or ""))
-      local ok_result = (result.code == 0) and _ufs.is_file(out_idx)
+      local ok_result = (result.code == 0)
+        and _ufs.is_file(out_idx)
+        and _ufs.is_file(background_cdb)
       -- Persist per-phase timing so :UEIndexTimings (and post-mortem
       -- inspection of state.json) can answer "how long did the last
       -- :UEIndexFull take" without relying on console output.
@@ -382,27 +514,51 @@ M.build_phase_async = function(ctx, phase)
         elapsed_s = math.floor(elapsed_s * 100 + 0.5) / 100,
         modules = #selected_keys,
         status = ok_result and "ready" or "error",
-        super_unity = (phase == "full"),
+        controlled_background = true,
         finished_at = unix_now(),
       }
-      if ok_result and M.promote_active_index(ctx, out_idx) then
-        -- Keep .clangd's External.File in lockstep with the freshly
-        -- promoted active_index. Without this, clangd reads a stale
-        -- pre-v3-cache-migration path and silently falls back to
-        -- --background-index (17 GB RAM / 32 min CPU symptom).
-        pcall(M.sync_dot_clangd, ctx)
+      if ok_result then
+        local prev_fingerprint = live_state.index_selection and live_state.index_selection.artifact_fingerprint or ""
+        local prev_active_index = live_state.build and live_state.build.active_index or ""
+        local manifest = make_index_manifest(ctx, live_state, phase, out_idx, selected_keys, {
+          base_cdb_path = M.base_compile_commands_path(ctx),
+          background_cdb_path = background_cdb,
+          index_kind = "controlled-background",
+          completed_at = live_state.index_timings[phase].finished_at,
+        })
+        live_state.index_artifacts[phase] = manifest
+        write_json_file(index_manifest_path(out_idx), manifest)
+        local generation = generation_for_context(ctx, { base_cdb_path = M.base_compile_commands_path(ctx) })
+        local selection = select_active_artifact(live_state, generation)
+        local snapshot = persist_index_selection(live_state, selection, generation)
+        local promoted = selection and M.publish_semantic_cdb(ctx, live_state, generation) or false
+        local selection_changed = selection
+          and snapshot.artifact_fingerprint ~= ""
+          and snapshot.artifact_fingerprint ~= prev_fingerprint
         M.clear_module_dirty_flags(ctx, selected_keys)
         live_state.stats[phase .. "_runs"] = (tonumber(live_state.stats[phase .. "_runs"]) or 0) + 1
         live_state.build = {
           phase = phase,
-          status = "ready",
+          status = (selection and promoted) and "ready" or "error",
           started_at = live_state.build.started_at or unix_now(),
           finished_at = unix_now(),
-          message = string.format("%s ready (%d modules) in %.1fs", phase, #selected_keys, elapsed_s),
-          active_index = ctx.paths.active_index,
+          message = (selection and promoted) and string.format(
+            "%s ready (%d modules, base=%s, coverage=%s) in %.1fs",
+            phase,
+            #selected_keys,
+            snapshot.phase ~= "" and snapshot.phase or "-",
+            snapshot.coverage_level ~= "" and snapshot.coverage_level or "-",
+            elapsed_s
+          ) or (stderr ~= "" and stderr or "failed to select/promote active semantic index"),
+          active_index = (selection and promoted) and ctx.paths.semantic_cdb or prev_active_index,
         }
         save_index_state(ctx, live_state)
-        M.maybe_restart_clangd_for_index()
+        if selection_changed and promoted then
+          M.maybe_restart_clangd_for_index()
+        end
+        if not (selection and promoted) then
+          ok_result = false
+        end
       else
         live_state.build = {
           phase = phase,
@@ -416,6 +572,7 @@ M.build_phase_async = function(ctx, phase)
       end
       core.deps.invalidate_status_cache()
       core.deps.refresh_statusline()
+      file_lock.release(phase_lease)
       M.try_start_queued_build()
     end)
   end)

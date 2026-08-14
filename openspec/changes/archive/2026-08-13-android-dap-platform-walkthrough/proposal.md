@@ -14,7 +14,7 @@
 
 ## 已确证结论（不要重新发现）
 
-- **E1** `lldb-server gdbserver --attach <pid>` 在 a3ad86f3 从不绑定监听端口（ptrace
+- **E1** `lldb-server gdbserver --attach <pid>` 在 `<test-device>` 从不绑定监听端口（ptrace
   附上但永不 listen/serve），host gdb 握手零响应。LLDB9/18/19/21 全复现。→ 此形态作废。
 - **E2** 纯 `lldb-server gdbserver 127.0.0.1:<port>`（无 --attach）正常 listen，裸协议
   `QStartNoAckMode→OK`、`qSupported→PacketSize=20000;...`、`vAttach;<pidhex>→+`。
@@ -67,7 +67,7 @@ host:   attach 配置 gdb-remote-port=<port>            # 结构化键 SBAPI 连
 - **诊断脚本（已在仓）**：`tools/dap_probe_android.py`、`tools/dap_platform_probe.py`、
   `tools/dap_platform_structured.py`。
 - **文档**：`docs/plans/`、`docs/TOOLING.md`、`docs/CONSTRAINTS.md`。
-- **设备**：仅 a3ad86f3；host adapter 维持 LLDB 22.1.6+；每轮 probe 前 `am force-stop`
+- **设备**：仅 `<test-device>`；host adapter 维持 LLDB 22.1.6+；每轮 probe 前 `am force-stop`
   + 重启 app 取新 pid，probe 用随机 host 端口且必清理，收尾清 device lldb-server + forward。
 
 ## 剩余未决问题清单（本 change 要解决）
@@ -82,4 +82,4 @@ host:   attach 配置 gdb-remote-port=<port>            # 结构化键 SBAPI 连
    address 断点（`image lookup --line`→`breakpoint set --address`）；判据见
    `android-dap-handshake-diagnostics`（正解 vs workaround）。
 5. **入口噪音**：消除 `Source missing, cannot jump to ...`（入口 PC-only 合成帧不 jump）。
-6. **设备 serial 漂移**：测试机重连后 serial 变（a3ad86f3 ↔ 其它），代码/probe 不应写死。
+6. **设备 serial 漂移**：测试机重连后 serial 会变，代码/probe 不应写死。

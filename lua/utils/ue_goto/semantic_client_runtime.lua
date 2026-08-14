@@ -246,7 +246,70 @@ function M.install(client, deps)
     return nil
   end
 
-  local function active_build(ctx)
+  local function read_json_file(path)
+    if not path or path == "" then return nil end
+    local fd = io.open(path, "rb")
+    if not fd then return nil end
+    local content = fd:read("*a")
+    fd:close()
+    local ok, decoded = pcall(vim.json.decode, content or "")
+    if ok and type(decoded) == "table" then
+      return decoded
+    end
+    return nil
+  end
+
+  local function file_identity(path)
+    path = path and vim.fs.normalize(path) or ""
+    if path == "" then
+      return { path = "", size = 0, mtime = 0 }
+    end
+    local stat = uv.fs_stat(path)
+    return {
+      path = path,
+      size = stat and tonumber(stat.size) or 0,
+      mtime = stat and stat.mtime and tonumber(stat.mtime.sec) or 0,
+    }
+  end
+
+  local function controlled_phase_manifests(ctx, generation_id)
+    if type(ctx) ~= "table" or type(ctx.paths) ~= "table"
+        or type(generation_id) ~= "string" or generation_id == "" then
+      return {}
+    end
+    local matches = {}
+    for _, phase in ipairs({ "current", "hot", "full" }) do
+      local index_path = ctx.paths[phase .. "_index"]
+      if type(index_path) == "string" and index_path ~= "" then
+        local normalized_index_path = vim.fs.normalize(index_path)
+        local manifest_path = normalized_index_path .. ".manifest.json"
+        local manifest = read_json_file(manifest_path)
+        if type(manifest) == "table"
+            and tostring(manifest.generation_id or "") == generation_id
+            and tostring(manifest.index_kind or "") == "controlled-background"
+            and vim.fs.normalize(tostring(manifest.index_path or "")) == normalized_index_path
+            and tostring(manifest.phase or "") == phase
+            and tostring(manifest.coverage_level or "") == phase
+        then
+          local background_cdb_path = vim.fs.normalize(tostring(manifest.background_cdb_path or ""))
+          local background_stat = uv.fs_stat(background_cdb_path)
+          if background_cdb_path ~= "" and background_stat and background_stat.type == "file" then
+            matches[#matches + 1] = {
+              phase = phase,
+              manifest = manifest,
+              manifest_path = manifest_path,
+              background_cdb_path = background_cdb_path,
+              manifest_identity = file_identity(manifest_path),
+              background_identity = file_identity(background_cdb_path),
+            }
+          end
+        end
+      end
+    end
+    return matches
+  end
+
+  local function active_build(ctx, index_snapshot)
     local persisted = ctx.state or {}
     local result = {
       platform = tostring(persisted.target_platform or ""),
@@ -256,6 +319,7 @@ function M.install(client, deps)
     local key = table.concat({ result.platform, result.target, result.configuration }, "|")
     local active_cdb_path
     local active_manifest_path
+    local controlled_candidates = {}
     local ok, shards = pcall(require, "ue.cdb.shards")
     if ok then
       local manifest_path = vim.fs.joinpath(shards.shards_dir(ctx), "manifest.json")
@@ -276,7 +340,9 @@ function M.install(client, deps)
         result.target = tostring(metadata.target or result.target)
       end
     end
-    return key, result, active_cdb_path, active_manifest_path
+    controlled_candidates = controlled_phase_manifests(ctx,
+      type(index_snapshot) == "table" and tostring(index_snapshot.generation_id or "") or "")
+    return key, result, active_cdb_path, active_manifest_path, controlled_candidates
   end
 
   local function evidence_roots(ctx, build)
@@ -315,12 +381,23 @@ function M.install(client, deps)
     if not libclang then return nil, "matching libclang unavailable next to clangd" end
     local cdb_path, cdb_stat = first_cdb(ctx)
     if not cdb_path then return nil, "active compile_commands.json unavailable" end
+    local index_snapshot = type(ue.semantic_index_snapshot) == "function"
+      and ue.semantic_index_snapshot({ bufname = bufname, subject_path = bufname }) or nil
 
-    local build_key, build, active_cdb_path, active_manifest_path = active_build(ctx)
+    local build_key, build, active_cdb_path, active_manifest_path, controlled_candidates
+      = active_build(ctx, index_snapshot)
     active_cdb_path = active_cdb_path or cdb_path
     local active_cdb_stat = uv.fs_stat(active_cdb_path)
     local active_manifest_stat = active_manifest_path and uv.fs_stat(active_manifest_path) or nil
     local state_stat = ctx.paths and ctx.paths.state and uv.fs_stat(ctx.paths.state) or nil
+    local controlled_signature = {}
+    for _, candidate in ipairs(controlled_candidates or {}) do
+      controlled_signature[#controlled_signature + 1] = {
+        phase = candidate.phase,
+        manifest = candidate.manifest_identity,
+        background = candidate.background_identity,
+      }
+    end
     local build_fingerprint = hash_text(vim.json.encode({
       tostring(ctx.project_root or ""), build_key, cdb_path,
       tostring(cdb_stat.mtime and cdb_stat.mtime.sec or 0), tostring(cdb_stat.size or 0),
@@ -330,8 +407,12 @@ function M.install(client, deps)
       tostring(active_manifest_path or ""),
       tostring(active_manifest_stat and active_manifest_stat.mtime
         and active_manifest_stat.mtime.sec or 0),
+      tostring(active_manifest_stat and active_manifest_stat.size or 0),
       tostring(state_stat and state_stat.mtime and state_stat.mtime.sec or 0),
       clangd, libclang,
+      index_snapshot and index_snapshot.generation_id or "",
+      index_snapshot and index_snapshot.artifact_fingerprint or "",
+      controlled_signature,
     }))
 
     if state.last_build_fingerprint and state.last_build_fingerprint ~= build_fingerprint then
@@ -341,6 +422,11 @@ function M.install(client, deps)
       end
     end
     state.last_build_fingerprint = build_fingerprint
+
+    local semantic_cdb_paths = {}
+    for _, candidate in ipairs(controlled_candidates or {}) do
+      semantic_cdb_paths[#semantic_cdb_paths + 1] = candidate.background_cdb_path
+    end
 
     return {
       project_root = ctx.project_root or ctx.engine_root,
@@ -355,8 +441,43 @@ function M.install(client, deps)
       libclang_path = libclang,
       toolchain_identity = hash_text(vim.json.encode({ clangd, libclang })),
       build_fingerprint = build_fingerprint,
+      index = index_snapshot or {
+        generation_id = "",
+        artifact_fingerprint = "",
+        coverage_level = "",
+        readiness = "missing",
+        freshness = "missing",
+        partial = true,
+        complete = false,
+      },
+      controlled_cdb_path = controlled_candidates[1] and controlled_candidates[1].background_cdb_path or nil,
+      controlled_manifest_path = controlled_candidates[1] and controlled_candidates[1].manifest_path or nil,
+      controlled_candidates = controlled_candidates,
+      semantic_cdb_paths = semantic_cdb_paths,
       evidence_roots = evidence_roots(ctx, build),
     }
+  end
+
+  function client.index_snapshot_is_current(expected, bufnr)
+    if type(expected) ~= "table" then return true end
+    local ok_ue, ue = pcall(require, "ue")
+    if not ok_ue or type(ue.semantic_index_snapshot) ~= "function" then
+      return false, "index-status-unavailable"
+    end
+    local bufname = vim.api.nvim_buf_get_name(bufnr or 0)
+    local current = ue.semantic_index_snapshot({
+      bufname = bufname ~= "" and bufname or nil,
+      subject_path = bufname,
+    })
+    if type(current) ~= "table" then return false, "index-status-unavailable" end
+    if tostring(current.generation_id or "") ~= tostring(expected.generation_id or "") then
+      return false, "index-generation-changed"
+    end
+    if tostring(current.artifact_fingerprint or "")
+        ~= tostring(expected.artifact_fingerprint or "") then
+      return false, "index-base-changed"
+    end
+    return true
   end
 
   local function sidecar_script()
@@ -610,6 +731,8 @@ function M.install(client, deps)
     state.last_build_fingerprint = nil
     state.last_response = nil
   end
+
+  client._discover_controlled_phase_manifests_for_test = controlled_phase_manifests
 
   return {
     now_ms = now_ms,

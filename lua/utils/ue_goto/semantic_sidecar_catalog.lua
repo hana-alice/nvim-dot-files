@@ -270,6 +270,8 @@ function M.install(Sidecar)
           cdb_dir = libclang.normalize(request.cdb_dir),
           compile = context.compile,
           compile_command_fingerprint = context.compile_command_fingerprint,
+          evidence_fingerprint = context.evidence_fingerprint,
+          subject_membership = context.subject_membership,
           evidence_kind = context.evidence and context.evidence.kind,
           label = vim.fn.fnamemodify(context.origin_tu, ":t"),
         }

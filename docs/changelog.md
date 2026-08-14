@@ -56,6 +56,388 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-08-14 — 保留 project-bucket 升级前的 UE 索引与 CDB
+
+**Task**
+
+修复升级到 canonical project bucket 后，已有 checkout 的 `<Space>/` 因新 bucket 无 csearch index
+而失效，并同时处置探针记录的 `active-compile-command-missing`。
+
+**Implemented**
+
+- `lua/ue.lua` 新增显式 pre-v4 engine-wide cache path model；迁移不再经当前 project-aware
+  `cache_paths()` 错把新 bucket 当作 legacy source。
+- `migrate_legacy_csearch_if_needed()` 先比较旧 state 与当前 bucket 的 canonical project key，
+  只导入同一项目的 csearch snapshot、active-platform GTAGS、engine-root active CDB 与 controlled CDB state。
+- 大型索引/CDB 通过同文件系统 hard link + 唯一临时名 + atomic rename 发布；保留旧路径供已运行的
+  旧 Neovim 使用，并让并发 canonical writer 优先，避免 UI 主线程复制数百 MB/GB 文件。
+- `tests/cases/grep_cache_spec.lua` 新增同项目导入、旧路径保留和异项目拒绝回归；
+  `multi-instance-state-isolation` 主规格补齐旧工件迁移与身份隔离契约。
+
+**Pitfalls / Gotchas**
+
+- v4 的旧迁移函数仍调用 project-aware `cache_paths()`；项目被捕获后 legacy/active 实际指向同一路径，
+  现有平台迁移测试未建立 project selection，因而没有覆盖这个确定回归。
+- 当前实例位于另一个已有 engine checkout；先前 checkout 重建成功不能证明迁移正确，每个未导入的
+  checkout 都会再次表现为 `<Space>/` 无 picker。
+- `multi_instance_state` 与其他测试进程并行时会争用全局 probe 测试文件并出现 8→7；串行复跑
+  11/11 通过，提交门禁继续使用仓库规定的串行全量入口。
+
+**Validation**
+
+- TDD：新增 legacy project-bucket 场景先稳定复现 `28/29`（迁移返回 false），实现后
+  `grep_cache` 29/29 passed。
+- 定向：`multi_instance_state` 11/11、`ue_project_context` 7/7、`ue_api` 54/54、`smoke` 18/18 passed。
+- 真实实例：后台 `:UEPrepare` 生成 331,301,737-byte csearch index，`indexed=true`；
+  `<Space>/` 等价搜索 `SubmitActiveCmdBuffer` 返回 34 个真实 csearch hits，preview window/buffer 均存在。
+- 全量：`nvim --headless -l tests/run.lua` 808/808 passed。
+
+**Follow-ups**
+
+- 无。
+
+### 2026-08-13 — 隔离多 Neovim 实例的 UE 状态与共享 writer
+
+**Task**
+
+审计当前配置中 process-global / project-scoped / user-global 状态，修复两个 Neovim 同时使用
+同一 engine 时可能发生的项目/平台串扰、共享 JSON 丢更新与 cache writer 竞争。
+
+**Implemented**
+
+- 新增 `lua/ue/project_state.lua`：live project 与 target 捕获在当前 Neovim 进程；
+  `selection.json` 只作为未来进程的启动默认；持久状态按 canonical uproject path 分 bucket，
+  target platform/configuration 作为原子 pair，旧顶层 state 只读迁移。
+- 新增 `lua/ue/file_lock.lua`：PID/token owner 的 filesystem lease、live-owner 拒绝、stale-owner
+  回收与 token-checked release；UEPrepare、CDB pipeline、csearch、controlled semantic-index phase
+  均增加跨进程 single-writer 门禁。
+- `lua/ue.lua` / `ue.cdb.*` 将 active CDB、index scheduler/controlled CDB、clangd index/PCH
+  放入 canonical project + platform 路径；CDB shard catalog 仅在同 project 内跨平台共享；
+  project switch 只切换 live bucket，保留旧缓存。
+- Android device 明确为当前 Neovim 进程内 `vim.g`；新增独立 child-process 回归，证明一个实例
+  的 `:UESetAndroidDevice` 不会修改另一个实例。
+- breakpoint persistence 改为 canonical project bucket，并在 lease 内合并当前打开 buffer 的改动；
+  definition cache 改为 per-key atomic JSON，避免 shared monolithic JSON RMW 丢 key。
+- probe、recent projects、watch dirty overlay 改为 lease 下重读+merge+atomic replace；csearch 成功后
+  只退役 build-start captured dirty，保留其他实例新增或 build 期间再次修改的路径；
+  `:UEPrepare!` 不再在 rebuild 成功前预清 dirty evidence。
+- debug/grep/DAP protocol 日志改为 PID 路径；UE job log 增加 PID+hrtime；AI context 双文件导出
+  由 lease 保护；content-addressed libclang cursor shim 先编译到 PID 临时文件再原子发布。
+- 复扫发现 nvim-dap 上游 logger 仍以 `w+` 打开固定 `dap*.log`；新增
+  `workarounds.dap.pid_scoped_logs` 在 dap 加载前统一插入 PID，`:UEDAPDiag` 改读当前
+  PID 的 nvim-dap / protocol / breakpoint 诊断日志。
+- 新增 `openspec/specs/multi-instance-state-isolation/spec.md`，同步约束、架构、测试映射、Android
+  device/UE search 主规格与中英文使用文档。
+- OpenSpec main specs 已直接同步当前实现。两个旧 active change 未污染主规格：
+  `android-dap-platform-walkthrough` 保留已被证伪路线的未完成任务，
+  `add-architecture-boundary-regression` 保留未拍板的 DRAFT；两者脱敏后归档到
+  `openspec/changes/archive/2026-08-13-*`，均明确记录为 archive-without-sync。
+
+**Pitfalls / Gotchas**
+
+- `vim.g` 只在一个 Neovim OS process 内“全局”，不会跨实例；真正的串扰来自旧的 engine 顶层
+  `state.json` 和共享 cache 文件，而不是 `vim.g.ue_android_device_serial`。
+- 单次并发测试曾复现偶发丢 key，复跑变绿不能证明修复；definition cache 最终改为一 key 一文件，
+  5 轮连续 8-writer 压测才稳定全绿。
+- 只给最终 JSON 做 atomic rename 不能阻止 stale read-modify-write；共享集合必须在 lease 内重读并
+  merge，独立字段/key 则应从结构上拆文件。
+- csearch 增量路径旧实现先写固定 `csearch_incremental.txt` 再拿 writer slot，失败实例可能删除
+  正在被另一实例读取的清单；现在顺序固定为先拿跨进程 lease，再生成唯一临时清单。
+- 只扫自己写的日志不够；nvim-dap 的固定路径由上游 logger 内部生成，需在
+  `require('dap')` 之前改写 logger filename，否则首次 `w+` 已经造成截断。
+
+**Validation**
+
+- 并发：`multi_instance_state` 11/11 passed；其中 definition-cache 8 writers 连跑 5 轮均通过，
+  project/target/probe/recent/dirty/lease child-process 用例全绿。
+- 定向：`grep_cache` 27/27、`ue_watch_csearch` 13/13、`csearch_build_guard` 21/21、
+  `ue_cdb` 17/17、`index_generation` 16/16、`android_device` 14/14、`dap` 56/56、
+  `ue_project_context` 7/7、`ue_context` 3/3、`ue_api` 54/54、`smoke` 18/18、
+  `utils` 46/46、`probe` 19/19、`theme` 11/11、`cpp_semantic_sidecar` 15/15、`structure` 38/38。
+- 静态/规格：`lint_no_bare_globals` 119 files OK；5 个受影响 OpenSpec main specs strict validation
+  均 valid；`git diff --check` passed。
+- nvim-dap 真实加载实验：`dap.log.create_logger('dap.log'):get_path()` 返回
+  `.../dap.<pid>.log`；`workarounds` 15/15、`dap` 56/56、`smoke` 18/18 passed。
+- OpenSpec：当前五个受影响 main specs strict validation 均 valid；归档前
+  `android-dap-platform-walkthrough` strict valid；`add-architecture-boundary-regression` 按其
+  DRAFT 状态保留“无 delta section”验证失败，未伪造完成状态。
+- 全量：`nvim --headless -l tests/run.lua` 806/806 passed。
+
+**Follow-ups**
+
+- 无。
+
+### 2026-08-13 — 为当前 Neovim 窗口设置会话名称
+
+**Task**
+
+为并行工作的 Neovim/Neovide 窗口提供可辨识的系统标题，并保留一键恢复自动标题的路径。
+
+**Implemented**
+
+- 新增 `lua/utils/window_title.lua`，提供 `set` / `reset` / `prompt` / `setup`，名称只作用于当前会话；`%` 按字面转义，C0/DEL 控制字符被清理，长度限制为 80 个 Unicode 字符。
+- 新增 `:WindowTitle [name]`、`:WindowTitle!`、`:WindowTitleReset`；无参数打开输入框，确认空值恢复自动标题，取消不改变已有标题。
+- `lua/config/keymaps.lua` 新增 `<leader>uW` 输入入口；浮动 cheatsheet、Markdown 速查和 keymap/command 主规格同步该行为。
+- 新增 `tests/cases/window_title_spec.lua`，并将新模块加入测试范围映射；现有 keymap/command 冻结回归同步更新。
+
+**Pitfalls / Gotchas**
+
+- `'titlestring'` 使用 statusline 语法，原样写入 `%{...}` 会被求值；实现必须双写 `%`，不能只做终端控制字符过滤。
+- `titlestring=""` 且 `title=true` 才是 Neovim 的自动标题；reset 不应关闭 `'title'`。
+
+**Validation**
+
+- TDD 红灯：新增 `window_title` spec 后因 `utils.window_title` 尚不存在而按预期失败；实现后 `window_title` 7/7 passed。
+- 定向：`keymaps` 54/54、`commands` 92/92、`cheatsheet` 126/126、`structure` 38/38 passed。
+- 静态/规格：`lint_no_bare_globals` 116 files OK；`openspec validate keymap-command-regression --type spec --strict` valid；`git diff --check` passed。
+- 全量：`nvim --headless -l tests/run.lua` passed。
+
+**Follow-ups**
+
+- 无。
+
+### 2026-08-11 — 同步并归档已完成的任务管理与 Android F9 规格
+
+**Task**
+
+收尾两个长期处于 complete 状态的 OpenSpec change，使已落地行为进入主规格并清理 active change 列表。
+
+**Implemented**
+
+- 新建 `openspec/specs/task-management/spec.md`，同步 `ue-task-manager` 的 11 条任务注册、派生状态、取消、picker/命令、statusline 与竞态消除要求。
+- 新建 `openspec/specs/android-f9-breakpoint-hit/spec.md`，同步 Android F9 单一 owner、端到端命中、LLDB 证据、address 等价与诊断要求。
+- `android-dap-attach` 主规格已经完整覆盖 delta，且包含后来落地的全局 serial 与 live F9 更强合同；同步保持当前主规格，没有用旧 delta 降级。
+- 将 38/38 tasks 完成的 `ue-task-manager` 归档至 `openspec/changes/archive/2026-08-11-ue-task-manager/`，将 31/31 tasks 完成的 `fix-android-f9-breakpoint-hit` 归档至 `openspec/changes/archive/2026-08-11-fix-android-f9-breakpoint-hit/`。
+
+**Pitfalls / Gotchas**
+
+- delta 是变更当时的意图，不是覆盖当前主规格的快照；Android attach 主规格已演进到“不重连即时生效”，因此只核对 requirement/scenario 覆盖，不反向恢复旧的“提示手动 reattach”终态。
+- 本次搜索/cheatsheet 改动没有对应 active change；不得为了执行 archive 指令而擅自归到两个无关历史 change 中。
+
+**Validation**
+
+- tasks 审计：`ue-task-manager` 38/38、`fix-android-f9-breakpoint-hit` 31/31，均无未完成项；artifacts 均为 done。
+- requirements 交叉检查：`task-management` 11/11、`android-f9-breakpoint-hit` 6/6、`android-dap-attach` 2/2，无缺失。
+- `openspec validate ue-task-manager|fix-android-f9-breakpoint-hit --strict`：归档前均 valid；`task-management` 与 `android-f9-breakpoint-hit` 主规格 strict validation 均通过。
+- `nvim --headless -l tests/run.lua`：776/776 passed；公开仓库已知 serial/package/user-profile/private-key/API-secret 扫描 0 命中，`git diff --check` 通过。
+
+**Follow-ups**
+
+- 无。
+
+### 2026-08-10 — 让快捷键帮助可以按键位实时搜索并保留分类
+
+**Task**
+
+回归 `<leader>?` 的快捷键入口与界面信息架构，让 `wW`、`aA` 这类成对大小写键位无需猜 tab，输入后立即找到对应操作和原始分类。
+
+**Implemented**
+
+- `lua/utils/cheatsheet.lua` 新增 `/` 实时搜索和 `<C-l>` 清除筛选；匹配覆盖键位、说明、tab 与 section，并按相关度排序。
+- 搜索结果继续以 `Tab › Section` 分组；`wW` 顶部命中 `Basics › Motions` 的 `w / W`，`aA` 顶部命中 `Basics › Modes` 的 `a / A`。
+- 将 word/WORD motions 与 insert-entry modes 改成逐动作的大小写成对展示，空格包围的展示分隔符不参与精确键位匹配，实际 `/` 键仍可搜索。
+- `tests/cases/cheatsheet_spec.lua` 新增全表可发现性/分类审计及真实 `/wW<CR>`、`/aA<CR>` 浮窗交互；`tests/cases/keymaps_spec.lua` 锁定 `<leader>?` → `UECheatsheet`。
+- `openspec/specs/keymap-command-regression/spec.md` 与 `docs/ue_lazyvim_cheatsheet.md` 同步搜索及分类合同。
+
+**Pitfalls / Gotchas**
+
+- Snacks 的 keymap picker 只看实际映射，无法覆盖 `w/W/a/A` 等 Vim built-in；因此入口必须基于 cheatsheet 的完整教学数据，而不是复用 `<leader>sk`。
+- 普通 lowercase 搜索会把 `wW` 折叠成 `ww`；只有先把 `w / W` 这类展示分隔符归一化，才能既保持大小写不敏感又命中成对键位。
+
+**Validation**
+
+- TDD 红灯：`nvim --headless -l tests/run.lua cheatsheet` 初始 `119/124`，5 条搜索/分类合同按预期失败。
+- 定向：`cheatsheet` `126/126`、`keymaps` `53/53`；真实按键输入后 extmark 可见内容包含预期 `Tab › Section` 与键位。
+- 静态/规格：`lint_no_bare_globals` 115 files OK；`openspec validate keymap-command-regression --type spec --strict` PASS；`git diff --check` PASS。
+- 全量：`nvim --headless -l tests/run.lua` `776/776` PASS。
+
+**Follow-ups**
+
+- 无。
+
+### 2026-08-10 — 让 `<Space>/` 默认真正 literal，并让每条结果都可预览
+
+**Task**
+
+修复默认搜索单个 `.` / `/` 不启动、literal 命中在 preview 中仍像 regex 一样高亮，以及按文件插入
+synthetic header 导致结果分类重复、首项和大量列表项没有真实源码预览的问题。
+
+**Implemented**
+
+- `lua/utils/code_search/init.lua` 的 literal quote 改为与 RE2 `regexp.QuoteMeta` 一致，只转义真正
+  metacharacter；`/`、`-`、`%` 保持字面值。
+- `lua/ue.lua` 允许默认 literal 模式下的单字符标点搜索，同时继续拦截单字符 identifier 和单字符
+  regex；literal hit 写入精确 `end_pos`，Snacks preview 不再用 raw 输入二次执行 Vim regex。
+- 删除可选中的 synthetic file-header item。csearch 按文件流式输出时仅缓冲当前文件，给真实命中标注
+  Project / Engine / Workspace、相对路径、组内序号与命中数；首行承担分组标题但仍是实际命中，后续行
+  保留缩进层级，因此任意结果都能 preview/confirm 到准确位置。
+- picker 标题明确显示 `[scope: all]` 或当前模块/plugin scope；literal 与 regex 分别显示 `L` / `R`。
+  `docs/ue_lazyvim_cheatsheet.md` 同步修正 visual toggles 与旧的 inline-rg-flags 误导。
+
+**Pitfalls / Gotchas**
+
+- backend 已按 literal 转义并不等于整个 UI 是 literal：Snacks 在没有 `end_pos` 时会把
+  `filter.search` 再交给 `vim.regex`，所以 `.` 的结果集合正确但 preview 高亮仍像“任意字符”。
+- synthetic header 看似能分组，但它也是 picker selection；初始项必落 header，单命中文件又让约一半
+  列表项没有真实 match preview。分组信息必须附着在真实 hit 上。
+
+**Validation**
+
+- 真实 csearch 小索引证明 `/` 与 `\\/` 都只命中字面 slash，`\\.` 只命中字面 dot，`.` regex
+  会扩展到任意字符；实现回归锁定 RE2 quote 集和 literal exact span。
+- `grep_cache` 27/27、`utils` 46/46、`ue_api` 54/54、`smoke` 18/18、`commands` 90/90 passed。
+- `openspec validate ue-code-search --type spec --strict` passed；
+  `nvim -l scripts/lint_no_bare_globals.lua lua` 115 files OK；全量回归 768/768 passed。
+
+**Follow-ups**
+
+- 无；保留 `:UEGrepGroupingToggle` 作为 structured presentation 的诊断 A/B 开关。
+
+### 2026-08-10 — Root 设备可显式选择可回滚的 app 私有 SO 注入
+
+**Task**
+
+在不修改已安装 APK/native library 的前提下，为 root 调试设备提供显式的 app 私有 SO 验证路径，
+同时保留既有 root 原子替换作为默认行为。
+
+**Implemented**
+
+- `scripts/ue_android_so_deploy.ps1` 新增 `-PreferRunAs`；仅在显式传入时优先选择
+  `run-as/startup-agent`，未传入时的 root/run-as 自动选择顺序不变。
+- `tests/fixtures/android_so_deploy/run_as_transport_spec.ps1` 固定默认选择前提，并新增
+  root-capable 场景的显式 run-as 选择合同，禁止该路径探测或使用 root transport。
+
+**Pitfalls / Gotchas**
+
+- app 私有 SO 能发布并被 `/proc/<pid>/maps` 证明已映射，不代表它与已安装 APK 的 Java/JNI
+  基线兼容。实机运行在 `GameActivity.getDid()` 上得到 `NoSuchMethodError`，随后 ART 因 pending
+  exception 中的 JNI 调用中止；该失败不能归因于 VRS 或锁屏。
+- 作用域错误留底：用户已要求 SO-only 后，“编一下再试试”只能重编/部署 SO；本次错误地把 JNI
+  mismatch 扩成 APK 打包并执行 `adb install -r -d`。今后版本不兼容只能 fail closed，禁止把它
+  当成打包/装包授权；必须等用户明确说“打包/装包”。
+- 设备 `versionCode=176314399`，本地 build metadata 已被中止的 package flow 改写为 `1`；
+  warning-only 的 app 私有路径只证明 transport 可用，不能绕过版本/JNI 兼容性验证。
+
+**Validation**
+
+- fixture `run_as_transport_spec.ps1`：PASS；`nvim --headless -l tests/run.lua ue_api`：54/54 passed。
+- 实机 `<PRIVATE_IP>:43581` preflight 证明选择 `run-as/startup-agent` 且不改变设备状态；实际发布后
+  maps 证明只映射 app 私有 SO。失败后只删除本次 347 MB staging 目录，已安装 `libUE4.so`
+  SHA-256 仍为 `e26864ba506d0bdeb46d3678b611917bb708fd4cb099fc8a4f606cc09e447dfe`；
+  不带 agent 的 15 秒 control launch 保持前台存活。
+- 新 SO 日志证明设备支持 `VK_KHR_fragment_shading_rate`（`pipeline=1, rates=7`）；因 JNI 中止发生在
+  PSO 创建前，尚未证明 fixed-VRS PSO 的 `2x2` 执行路径。
+
+**Follow-ups**
+
+- 取得与 native build 同基线、包含 `GameActivity.getDid()` 且版本匹配的 APK 后，再验证
+  `r.Mobile.OnePassShadowMask.ShadingRate=2` 与 `fragmentSize=2x2` PSO 日志。
+
+### 2026-08-08 — 让 C++ `gd` 从 canonical entity 完整到达唯一函数体
+
+**Task**
+
+修复 overload、头文件 declaration 与 derived virtual call 已取得正确实体身份却仍停在声明处的问题；
+建立不依赖名称/arity/path ranking 的完整语义链，并以真实 Android Vulkan 源码验证。
+
+**Implemented**
+
+- source/header 都先以 active CDB 或 compiler-emitted origin evidence 建立不可变 transaction，在
+  proven TU 的 exact cursor 取得 libclang canonical USR；异步 provider 只能使用 snapshot 的
+  URI/position/version，stale 响应没有 UI 副作用。
+- `lookup-definition` 使用同 generation 的 controlled current→hot→full CDB，在 subject module 的
+  compiler-authored UBT unity / exact fallback AST 中按相同 USR 找唯一 body。LuaJIT 无法可靠传递
+  by-value `CXCursor` callback，因此按 LLVM toolchain + source hash 懒编译最小 C ABI shim；shim
+  复用当前 libclang/TU，不加载第二份库、不重新 parse，超长路径/overflow/零或多个 body 均 fail closed。
+- resolved cache 只绑定 canonical USR、CDB signatures、overlays 与 toolchain；同一实体换调用点/声明可
+  复用，negative/ambiguous 结果不跨 subject 缓存。新增 `:UEDefExplain`、稳定 stage/reason 和失败/
+  性能 probe，保留 150ms 可取消进度与 stale gate。
+- current/hot/full 改为 generation manifest + coverage-superset selector；clangd 固定
+  `--enable-config=false`，打开文件 exact argv/cwd 经官方 `compilationDatabaseChanges` 传输。
+  不再写 `.clangd` 或把 `External.File`/`--index-file` 当 definition authority；受控 CDB 只接受
+  active build 的真实 UBT unity membership，无法证明时保留 exact per-file TU。
+- 为保持 800 行结构门禁，将 generation、C++ navigation coordinator、module definition lookup 分拆为
+  `_generation.lua`、`semantic_navigation.lua`、`semantic_sidecar_definition.lua`；入口 API 与非 C++
+  cache/LSP/csearch/GTAGS compatibility path 不变。
+
+**Pitfalls / Gotchas**
+
+- `clangd-indexer` YAML 记录 `.cpp` Definition 不代表 monolithic External index 的 LSP definition
+  会返回 body；真实实验仍只到 declaration，故该路线已证伪。
+- 人工跨 module/same-module argument union 会产生真实 Clang diagnostics；只有 UBT 自己写出的 unity
+  wrapper + 匹配 `.o.rsp` 是可接受 membership evidence，不用 workaround 掩盖 parse error。
+- 默认 `max_tus=1` 下真实 4-wrapper module lookup 的三个 cold USR 各约 29–31 秒，sidecar RSS
+  1797–1818 MiB；这是已记录的冷路径成本。同一 canonical USR 的下一 subject 为 0ms，不通过并发
+  多个大 TU 换速度。
+
+**Validation**
+
+- 真实 Android Vulkan 只读 smoke 6/6 PASS：二参数 `SubmitActiveCmdBuffer` call/declaration 都到
+  `VulkanCommandBuffer.cpp:645`；无参 overload 都到 inline `VulkanCommandBuffer.h:421`；
+  `FVulkanCommandListContext&` call 与 `final override` declaration 都到 `VulkanCommands.cpp:1098`。
+  三组 canonical USR hash 互异、组内一致，shim ABI=1、`tu_count=1`；未写引擎/项目源码，未访问设备。
+- 聚焦回归：`cpp_semantic_context` 11/11、`cpp_semantic_client` 15/15、
+  `cpp_semantic_sidecar` 15/15、`cpp_semantic_transaction` 5/5、`ue_goto_behavior` 7/7、
+  `index_generation` 15/15、`clangd_commands` 2/2、`cpp_semantic_index` 1/1、`ue_api` 54/54、
+  `utils` 45/45、`stability` 9/9，全部通过；Python 生成器 syntax compile 通过。
+- `openspec validate make-cpp-gd-semantically-complete --strict` passed；新增/修改行脱敏扫描 clean。
+- 全量 `nvim --headless -l tests/run.lua`：765/765 passed。
+
+**Follow-ups**
+
+- cold module parse 的 29–31 秒与约 1.8 GiB RSS 是剩余性能边界；后续优化必须保持 canonical-USR
+  authority、真实 compile context 与 fail-closed 合同，禁止回加 symbol/arity/path ranking。
+
+### 2026-08-07 — 关闭 build terminal 不再终止 `<Space>us`
+
+**Task**
+
+修复 `<Space>us` 偶发以 exit code 143 结束的问题，并让 Android build preflight 只报告真实发生的 DAP 清理。
+
+**Implemented**
+
+- 运行中的 UE build terminal 使用 `bufhidden=hide`；关闭窗口只隐藏输出 buffer，不再 wipe buffer 并向
+  PowerShell/UBT 发送终止信号。任务退出后恢复 `bufhidden=wipe`，保持既有的已完成 terminal 清理语义。
+- Android DAP cleanup 仅在确有 active DAP session 时返回 `adapter_killed=true`，空闲状态的 `<Space>us`
+  不再错误提示 “stopped lldb-dap adapter”。
+- 增加 terminal 生命周期与 DAP cleanup 结果回归，防止重新引入关窗即取消和虚假清理提示。
+
+**Validation**
+
+- 历史 `nvim-debug.log` 记录 `<Space>us` exit 143；独立 terminal 实验复现 `bufhidden=wipe` 在 buffer
+  删除时稳定返回 143。
+- 使用当前真实 Android Development build state 完整执行两阶段 action graph：两阶段均 exit 0，
+  `Target is up to date`，未进入 Gradle/APK/ADB。
+- 真实 `:UEBuildAndroidSO` 启动后立即关闭 terminal：buffer 仍有效、job 仍运行，最终 `status=BOK`、exit 0；
+  退出后 `bufhidden` 恢复为 `wipe`，且不再虚报停止 lldb-dap adapter。
+- `ue_api` 56/56 passed；`dap` 56/56 passed。
+- `openspec validate android-so-quick-deploy --type spec --strict` passed；全量
+  `nvim --headless -l tests/run.lua` 729/729 passed。
+
+### 2026-08-07 — 以实测能力而非 Android API 白名单选择 startup-agent transport
+
+**Task**
+
+修复 `<Space>uq` 在具备所需能力的 Android 15 / API 35 设备上被 `sdk == 34` 旧验证门禁提前拒绝的问题。
+
+**Implemented**
+
+- `ue_android_so_deploy.ps1` 与 `ue_android_so_launch.ps1` 不再把 Android API 精确版本当作 transport
+  能力；继续 fail closed 检查 package `DEBUGGABLE`、`run-as` UID、ActivityManager
+  `--attach-agent-bind`、设备/app ABI 以及发布 generation 的 identity/hash。
+- startup agent 的 ClassLoader 错误与注释改为描述所需运行时契约，不再错误声称该契约只属于 API 34。
+- 主 spec 将 app-private staging 前置条件改为可观测 capability；fixture 使用 API 35 锁定未来版本不会因版本号
+  被拒绝，同时保留“缺少 attach-agent-bind 必须拒绝”的负例。
+
+**Validation**
+
+- PowerShell 5.1 `run_as_transport_spec.ps1`：API 35 capability-positive 与 capability-negative 用例通过。
+- PowerShell 5.1 `startup_agent_spec.ps1`：deploy/launch/agent contract 通过，精确 API 34 门禁被列为禁止模式。
+- `ue_api` 55/55 passed；`openspec validate android-so-quick-deploy --type spec --strict` passed。
+- 全量 `nvim --headless -l tests/run.lua`：727/727 passed。
+- 指定唯一设备的只读 preflight 未执行：验证时 ADB 返回 `device not found`；未切换到其他设备，
+  未执行 staging、force-stop 或启动。
+
 ### 2026-08-06 — 在非 root 设备保留原签名并以 ClassLoader generation 替换 SO
 
 **Task**

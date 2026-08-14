@@ -9,12 +9,16 @@ local fs = require("ue.core.fs")
 
 local M = {}
 
---- Canonical compile_commands.json target paths under `ctx.engine_root`.
---- Order matters: the engine-root copy wins over the Engine/ subdir copy
---- because that's where the slim/PCH/prune pipeline writes its result.
----@param ctx { engine_root: string }
+--- Canonical compile_commands.json target for the active project/session.
+--- New contexts write only inside their project+platform cache bucket so two
+--- Neovim processes cannot overwrite each other's active CDB. The two legacy
+--- engine-root targets remain only for callers that do not provide ctx.paths.
+---@param ctx { engine_root: string, paths?: { active_cdb?: string } }
 ---@return string[]
 function M.targets(ctx)
+  if ctx.paths and ctx.paths.active_cdb and ctx.paths.active_cdb ~= "" then
+    return { fs.norm(ctx.paths.active_cdb) }
+  end
   return {
     fs.join(ctx.engine_root, "compile_commands.json"),
     fs.join(ctx.engine_root, "Engine", "compile_commands.json"),
@@ -49,6 +53,10 @@ function M.candidates(ctx, deps)
   end
 
   for _, target in ipairs(M.targets(ctx)) do add(target) end
+  -- Engine/project copies are inputs only. They may be emitted by UBT or an
+  -- older nvim-ue version, but are never canonical write targets now.
+  add(fs.join(ctx.engine_root, "compile_commands.json"))
+  add(fs.join(ctx.engine_root, "Engine", "compile_commands.json"))
   if ctx.project_root and ctx.project_root ~= "" then
     add(fs.join(ctx.project_root, "compile_commands.json"))
   end

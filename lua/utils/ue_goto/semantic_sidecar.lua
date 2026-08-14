@@ -7,6 +7,65 @@ local M = {}
 local Sidecar = {}
 Sidecar.__index = Sidecar
 
+local function location_key(loc)
+  if type(loc) ~= "table" then return nil end
+  return table.concat({
+    tostring(loc.path or ""),
+    tostring(loc.line or ""),
+    tostring(loc.column or ""),
+    tostring(loc.offset or ""),
+  }, "\0")
+end
+
+local function aggregate_diagnostics(contexts)
+  local out, seen = {}, {}
+  for _, context in ipairs(contexts or {}) do
+    for _, diagnostic in ipairs(context.diagnostics or {}) do
+      if type(diagnostic) == "string" and diagnostic ~= "" and not seen[diagnostic] then
+        seen[diagnostic] = true
+        out[#out + 1] = diagnostic
+      end
+    end
+  end
+  return out
+end
+
+local function summarize_unresolved(unresolved)
+  local state_counts, reason_counts = {}, {}
+  for _, context in ipairs(unresolved or {}) do
+    local state = tostring(context.state or "unavailable")
+    local reason = tostring(context.reason or "unknown")
+    state_counts[state] = (state_counts[state] or 0) + 1
+    reason_counts[reason] = (reason_counts[reason] or 0) + 1
+  end
+
+  local state = "unavailable"
+  local has_unavailable = state_counts.unavailable ~= nil
+  local has_invalid = state_counts["invalid-semantic-context"] ~= nil
+  local has_ambiguous = state_counts["ambiguous-context"] ~= nil
+  if has_invalid and not has_unavailable then
+    state = "invalid-semantic-context"
+  elseif has_ambiguous and not has_unavailable and not has_invalid then
+    state = "ambiguous-context"
+  end
+
+  local reasons = vim.tbl_keys(reason_counts)
+  table.sort(reasons)
+  return state, (#reasons == 1 and reasons[1] or "multiple-context-failures")
+end
+
+local function select_identity_winner(results)
+  table.sort(results, function(a, b)
+    local a_has_def = a.definition ~= nil
+    local b_has_def = b.definition ~= nil
+    if a_has_def ~= b_has_def then
+      return a_has_def
+    end
+    return tostring(a.context_id or "") < tostring(b.context_id or "")
+  end)
+  return results[1]
+end
+
 require("utils.ue_goto.semantic_sidecar_tu").install(Sidecar)
 require("utils.ue_goto.semantic_sidecar_catalog").install(Sidecar)
 
@@ -36,7 +95,10 @@ function Sidecar:handle_handshake(request)
         "invalid-semantic-context",
         "unavailable",
       },
-      ops = { "handshake", "catalog", "prove", "query", "stats", "evict", "shutdown" },
+      ops = {
+        "handshake", "catalog", "prove", "query", "lookup-definition",
+        "stats", "evict", "shutdown",
+      },
     }
   else
     frame.state = "unavailable"
@@ -166,13 +228,7 @@ function Sidecar:handle_query(request)
   for _, result in ipairs(contexts) do
     if result.state == "resolved" then
       resolved[#resolved + 1] = result
-      local identity = result.usr
-        .. "\0"
-        .. result.declaration.path
-        .. "\0"
-        .. tostring(result.declaration.line)
-        .. "\0"
-        .. tostring(result.declaration.column)
+      local identity = result.canonical_identity and result.canonical_identity.key or result.usr
       by_identity[identity] = by_identity[identity] or {}
       table.insert(by_identity[identity], result)
     else
@@ -193,7 +249,28 @@ function Sidecar:handle_query(request)
   local identities = vim.tbl_keys(by_identity)
   local frame
   if #resolved == 1 or #identities == 1 then
-    local winner = resolved[1]
+    local bucket = #identities == 1 and by_identity[identities[1]] or resolved
+    local winner = select_identity_winner(bucket)
+    local definition_keys = {}
+    for _, result in ipairs(bucket) do
+      local key = location_key(result.definition)
+      if key then definition_keys[key] = true end
+    end
+    local unique_definition_keys = vim.tbl_keys(definition_keys)
+    if #unique_definition_keys > 1 then
+      frame = {
+        v = protocol.VERSION,
+        id = request.id,
+        op = "query",
+        ok = true,
+        state = "ambiguous-context",
+        contexts = bucket,
+        diagnostics = aggregate_diagnostics(bucket),
+        metrics = metrics,
+      }
+      self:_log_metrics("query", metrics)
+      return frame
+    end
     frame = {
       v = protocol.VERSION,
       id = request.id,
@@ -202,10 +279,15 @@ function Sidecar:handle_query(request)
       state = "resolved",
       context_id = winner.context_id,
       usr = winner.usr,
+      cursor_role = winner.cursor_role,
+      cursor_kind = winner.cursor_kind,
+      entity_kind = winner.entity_kind,
+      canonical_identity = winner.canonical_identity,
       declaration = winner.declaration,
       definition = winner.definition,
       document_version = winner.document_version,
       epoch = winner.epoch,
+      contexts = bucket,
       metrics = metrics,
     }
   elseif #resolved > 1 then
@@ -216,10 +298,11 @@ function Sidecar:handle_query(request)
       ok = true,
       state = "ambiguous-context",
       contexts = resolved,
+      diagnostics = aggregate_diagnostics(resolved),
       metrics = metrics,
     }
   elseif #unresolved > 0 then
-    local state = unresolved[1].state
+    local state, reason = summarize_unresolved(unresolved)
     frame = {
       v = protocol.VERSION,
       id = request.id,
@@ -227,9 +310,9 @@ function Sidecar:handle_query(request)
       ok = true,
       state = state,
       contexts = unresolved,
-      reason = unresolved[1].reason,
+      reason = reason,
       probes = state == "unavailable" and self.toolchain.probes or nil,
-      diagnostics = unresolved[1].diagnostics,
+      diagnostics = aggregate_diagnostics(unresolved),
       metrics = metrics,
     }
   else
@@ -273,6 +356,8 @@ function Sidecar:handle_stats(request)
 end
 
 function Sidecar:handle_evict(request)
+  self.lookup_cache = {}
+  self.controlled_cdb_cache = {}
   local evicted = 0
   if request.all then
     for key, entry in pairs(self.tus) do
@@ -332,6 +417,9 @@ function Sidecar:handle_request(request)
   if request.op == "query" then
     return self:handle_query(request)
   end
+  if request.op == "lookup-definition" then
+    return self:handle_lookup_definition(request)
+  end
   if request.op == "stats" then
     return self:handle_stats(request)
   end
@@ -357,6 +445,8 @@ function M.new(opts)
     toolchain = toolchain,
     protocol = protocol,
     tus = {},
+    lookup_cache = {},
+    controlled_cdb_cache = {},
     cdbs = {},
     max_tus = math.max(1, math.floor(max_tus)),
     idle_evict_ms = math.max(1000, math.floor(idle_evict_ms)),

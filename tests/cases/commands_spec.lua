@@ -64,7 +64,7 @@ t.describe("commands: 辅助命令（keymaps.lua 注册）", function()
   pcall(dofile, cfg .. "/lua/config/keymaps.lua")
   for _, c in ipairs({
     "Restart", "RestartDetect", "UEDefStatus", "UEDefCancel", "UEDefContextClear",
-    "NotificationHistory", "NotificationHistoryClear",
+    "NotificationHistory", "NotificationHistoryClear", "WindowTitle", "WindowTitleReset",
   }) do
     t.it(":" .. c .. " 已注册", function()
       t.assert_eq(vim.fn.exists(":" .. c), 2, c .. " 未注册")

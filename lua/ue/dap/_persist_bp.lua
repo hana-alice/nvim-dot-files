@@ -1,13 +1,13 @@
 -- Persistent breakpoints, scoped to the current UE *project* (not engine).
 --
 -- Storage layout
---   <engine_root>/.cache/nvim-ue/breakpoints/<project_name>.json
+--   <engine_root>/.cache/nvim-ue/projects/<project-key>/breakpoints.json
 --
 -- Why per-project (not per-engine):
 --   one engine can host multiple game projects; each ships its own gameplay
---   code and accumulates its own breakpoints.  Bucketing by project_name
---   keeps them isolated and avoids a foreign project's stale paths
---   polluting your set when you switch checkouts.
+--   code and accumulates its own breakpoints. The canonical path-derived
+--   project key avoids both foreign-project leakage and same-basename
+--   collisions across different checkouts.
 --
 -- File format (versioned, future-proof)
 --   {
@@ -39,6 +39,7 @@
 --     pointing at a deleted line should not crash BufReadPost.
 
 local M = {}
+local file_lock = require("ue.file_lock")
 
 local SAVE_DEBOUNCE_MS = 250
 
@@ -48,6 +49,7 @@ local state = {
   data = nil,             -- decoded { version, project, breakpoints = {} }
   pending_paths = {},     -- file -> bp[]  waiting for BufReadPost
   save_timer = nil,
+  clear_all_pending = false,
 }
 
 local function norm(p)
@@ -70,10 +72,17 @@ local function write_json_file(path, tbl)
   local dir = vim.fs.dirname(path)
   vim.fn.mkdir(dir, "p")
   local raw = vim.json.encode(tbl)
-  local fh, err = io.open(path, "w")
+  local temp = path .. (".tmp.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
+  local fh, err = io.open(temp, "wb")
   if not fh then return false, err end
   fh:write(raw)
+  fh:flush()
   fh:close()
+  local ok, rename_err = vim.uv.fs_rename(temp, path)
+  if not ok then
+    pcall(os.remove, temp)
+    return false, rename_err
+  end
   return true
 end
 
@@ -99,17 +108,23 @@ local function resolve_cache_path()
   end
   -- sanitize: filename-safe
   project_name = project_name:gsub("[^%w%._%-]", "_")
-  local cache = norm(ctx.engine_root) .. "/.cache/nvim-ue/breakpoints/" .. project_name .. ".json"
+  local cache_root = ctx.paths and ctx.paths.cache
+    or (norm(ctx.engine_root) .. "/.cache/nvim-ue")
+  local cache = cache_root .. "/breakpoints.json"
   return cache, project_name
 end
 
 -- ── load on session start ────────────────────────────────────────────────
 function M.load()
-  if state.loaded then return end
-  state.loaded = true
   local cache, project_name = resolve_cache_path()
   if not cache then return end
+  if state.loaded and state.cache_path == cache then return end
+  if state.save_timer then pcall(function() state.save_timer:stop() end) end
+  state.save_timer = nil
+  state.loaded = true
   state.cache_path = cache
+  state.pending_paths = {}
+  state.clear_all_pending = false
   local data = read_json_file(cache) or {
     version = 1, project = project_name, breakpoints = {},
   }
@@ -164,6 +179,8 @@ end
 
 -- ── snapshot current bps and persist ─────────────────────────────────────
 function M.save()
+  local live_cache = resolve_cache_path()
+  if live_cache and live_cache ~= state.cache_path then M.load() end
   if not state.cache_path then
     -- First save in this session may run before load() (e.g. user toggles
     -- in a pristine nvim).  Resolve lazily.
@@ -178,11 +195,18 @@ function M.save()
   if not ok_dapbp then return end
   -- dap.breakpoints.get() -> { [bufnr] = { { line, condition?, ... }, ... } }
   local raw = dapbp.get()
-  local out = {}
+  local lease = file_lock.acquire(state.cache_path .. ".lock")
+  if not lease then return end
+  local latest = read_json_file(state.cache_path) or {
+    version = 1, project = state.data.project, breakpoints = {},
+  }
+  local out = state.clear_all_pending and {} or (latest.breakpoints or {})
+  local seen_buffers = {}
   for bufnr, bps in pairs(raw) do
     local name = vim.api.nvim_buf_get_name(bufnr)
     if name and name ~= "" then
       local key = norm(name)
+      seen_buffers[key] = true
       local list = {}
       for _, bp in ipairs(bps) do
         local entry = { line = bp.line }
@@ -191,18 +215,33 @@ function M.save()
         if bp.logMessage and bp.logMessage ~= "" then entry.log_message = bp.logMessage end
         table.insert(list, entry)
       end
-      if #list > 0 then out[key] = list end
+      out[key] = #list > 0 and list or nil
     end
   end
-  -- Merge with pending_paths (bps for files not yet opened this session).
-  -- Without this merge, opening one file and then saving would erase every
-  -- bp for files we haven't opened — disaster.
-  for k, v in pairs(state.pending_paths) do
-    if not out[k] then out[k] = v end
+  -- A loaded file absent from dap.breakpoints means its breakpoints were
+  -- cleared here. Unopened files stay exactly as the latest disk version, so
+  -- another Neovim's newer edits cannot be overwritten by stale pending data.
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(bufnr) then
+      local name = vim.api.nvim_buf_get_name(bufnr)
+      local key = name ~= "" and norm(name) or nil
+      if key then
+        if not seen_buffers[key] then out[key] = nil end
+        seen_buffers[key] = true
+      end
+    end
   end
+  state.clear_all_pending = false
   state.data.breakpoints = out
   state.data.saved_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
-  pcall(write_json_file, state.cache_path, state.data)
+  local ok_write = write_json_file(state.cache_path, state.data)
+  file_lock.release(lease)
+  if ok_write then
+    state.pending_paths = {}
+    for key, bps in pairs(out) do
+      if not seen_buffers[key] then state.pending_paths[key] = vim.deepcopy(bps) end
+    end
+  end
 end
 
 function M.save_debounced()
@@ -251,6 +290,7 @@ function M.clear_all()
   dap.clear_breakpoints()
   -- Also wipe persisted state for files we haven't opened.
   state.pending_paths = {}
+  state.clear_all_pending = true
   M.save_debounced()
 end
 
@@ -348,6 +388,10 @@ function M._save_with_state_for_test(cache_path, pending_paths)
   state.cache_path = cache_path
   state.data = { version = 1, project = "test", breakpoints = {} }
   state.pending_paths = pending_paths or {}
+  state.clear_all_pending = false
+  write_json_file(cache_path, {
+    version = 1, project = "test", breakpoints = pending_paths or {},
+  })
   M.save()
   return read_json_file(cache_path)
 end
@@ -358,6 +402,7 @@ function M._reset_state_for_test()
   state.cache_path = nil
   state.data = nil
   state.pending_paths = {}
+  state.clear_all_pending = false
   if state.save_timer then pcall(function() state.save_timer:stop() end) end
   state.save_timer = nil
 end

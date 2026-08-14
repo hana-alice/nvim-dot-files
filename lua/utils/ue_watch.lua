@@ -57,13 +57,10 @@
 
 local uv = vim.uv or vim.loop
 local M = {}
+local file_lock = require("ue.file_lock")
 
--- Forward declarations for helpers defined later in the file but referenced
--- earlier (Lua silently treats undeclared names as globals → nil at call time).
--- See skill `ue-lua-engine-only-maintenance` Pitfalls section: must be plain
--- assignment (`name = function(...)`) at the definition site, NOT
--- `local function name(...)` which creates a SECOND local that shadows this
--- forward-decl and leaves the upper closure bound to nil forever.
+-- Defined later via assignment so earlier closures bind this local rather than a
+-- shadowing declaration (an undeclared name would instead resolve as a global).
 local add_to_persistent_dirty
 
 -- ---------------------------------------------------------------------------
@@ -94,6 +91,7 @@ local state = {
   csearch_index_mtime = nil,
   csearch_index_checked_at = 0,
   ignored_preindex_changes = 0,
+  dirty_save_retry = nil,
 }
 
 -- Files we care about. Anything else is dropped at the watcher boundary so
@@ -243,14 +241,18 @@ local function provider_csearch_mark_stale(paths)
     return false, "no csearch_index configured"
   end
   local stale_file = state.opts.csearch_index .. ".stale"
-  -- Append; leave dedup to the consumer. Crash-safety: open in append mode
-  -- so a partial write is recoverable as truncation, not corruption.
+  local lease, lock_err = file_lock.acquire(stale_file .. ".lock")
+  if not lease then return false, "stale-file writer busy: " .. tostring(lock_err) end
+  -- Append one buffered chunk under a cross-process lease; leave dedup to the
+  -- consumer. A watcher in another Neovim cannot interleave partial lines.
   local f, err = io.open(stale_file, "a")
-  if not f then return false, "open stale file: " .. (err or "?") end
-  for _, p in ipairs(paths) do
-    f:write(p, "\n")
+  if not f then
+    file_lock.release(lease)
+    return false, "open stale file: " .. (err or "?")
   end
+  f:write(table.concat(paths, "\n"), "\n")
   f:close()
+  file_lock.release(lease)
   return true
 end
 
@@ -513,9 +515,37 @@ local function load_persistent_dirty()
   end
 end
 
+local function merge_persistent_dirty_from_disk(p)
+  local fd = io.open(p, "rb")
+  if not fd then return end
+  local content = fd:read("*a")
+  fd:close()
+  local ok, decoded = pcall(vim.json.decode, content or "")
+  if ok and type(decoded) == "table" then
+    for _, abs in ipairs(decoded) do
+      if type(abs) == "string" and abs ~= "" then
+        state.persistent_dirty[abs:lower()] = abs
+      end
+    end
+  end
+end
+
 local function save_persistent_dirty()
   local p = persistent_dirty_path()
   if not p then return end
+  local lease = file_lock.acquire(p .. ".lock")
+  if not lease then
+    if not state.dirty_save_retry then
+      state.dirty_save_retry = vim.defer_fn(function()
+        state.dirty_save_retry = nil
+        save_persistent_dirty()
+      end, 25)
+    end
+    return
+  end
+  -- The in-memory set may have been loaded before another Neovim wrote its
+  -- changes. Re-read under the lease and union before publishing.
+  merge_persistent_dirty_from_disk(p)
   -- Build sorted array (deterministic ordering -> no spurious git diffs if
   -- somebody ever puts this file under VCS for debugging).
   local arr = {}
@@ -559,16 +589,21 @@ local function save_persistent_dirty()
   -- Atomic write: tmp + rename.
   local dir = vim.fn.fnamemodify(p, ":h")
   if vim.fn.isdirectory(dir) == 0 then vim.fn.mkdir(dir, "p") end
-  local tmp = p .. ".tmp"
+  local tmp = p .. (".tmp.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
   local fd, err = io.open(tmp, "w")
   if not fd then
+    file_lock.release(lease)
     log_debug("save dirty.json open failed: " .. tostring(err))
     return
   end
   fd:write(vim.json.encode(arr))
   fd:close()
   local ok, rename_err = vim.uv.fs_rename(tmp, p)
-  if not ok then log_debug("save dirty.json rename failed: " .. tostring(rename_err)) end
+  if not ok then
+    pcall(vim.fn.delete, tmp)
+    log_debug("save dirty.json rename failed: " .. tostring(rename_err))
+  end
+  file_lock.release(lease)
   -- Nag once per crossing — caller can debounce externally if needed.
   if #arr >= PERSISTENT_DIRTY_WARN and not state._warned_dirty_high then
     state._warned_dirty_high = true
@@ -598,37 +633,111 @@ end
 -- file missing / cleared.
 function M.snapshot_persistent_dirty()
   load_persistent_dirty()
+  local p = persistent_dirty_path()
+  if p then merge_persistent_dirty_from_disk(p) end
   local arr = {}
   for _, abs in pairs(state.persistent_dirty) do arr[#arr + 1] = abs end
   return arr
 end
 
+-- Remove only paths proven covered by a completed index operation. Re-read
+-- and subtract under the same lease used by writers so dirty paths added by a
+-- different Neovim while the build was running remain visible.
+function M.remove_persistent_dirty(paths, reason, covered_before, remove_missing)
+  local remove = {}
+  for _, path in ipairs(paths or {}) do
+    local normalized = tostring(path)
+    local covered = true
+    if covered_before then
+      local stat = vim.uv.fs_stat(normalized)
+      local modified_at = stat and stat.mtime and tonumber(stat.mtime.sec) or nil
+      -- Missing/deleted files and files changed during the build stay dirty.
+      -- A one-second equality is kept conservatively because os.time() has
+      -- coarser resolution than filesystem mtimes on supported hosts.
+      covered = (modified_at ~= nil and modified_at < covered_before)
+        or (modified_at == nil and remove_missing == true)
+    end
+    if covered then remove[normalized:lower()] = true end
+  end
+  if not next(remove) then return true end
+  local p = persistent_dirty_path()
+  if not p then
+    for key in pairs(remove) do state.persistent_dirty[key] = nil end
+    return true
+  end
+
+  local lease, lock_err = file_lock.acquire(p .. ".lock")
+  if not lease then
+    log_warn("dirty.json remains conservative; another Neovim owns it: " .. tostring(lock_err))
+    return false
+  end
+  merge_persistent_dirty_from_disk(p)
+  for key in pairs(remove) do state.persistent_dirty[key] = nil end
+  local arr = {}
+  for _, abs in pairs(state.persistent_dirty) do arr[#arr + 1] = abs end
+  table.sort(arr)
+
+  local tmp = p .. (".tmp.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
+  local fd = io.open(tmp, "w")
+  if not fd then
+    file_lock.release(lease)
+    return false
+  end
+  fd:write(vim.json.encode(arr))
+  fd:close()
+  local replaced = vim.uv.fs_rename(tmp, p)
+  if not replaced then pcall(vim.fn.delete, tmp) end
+  file_lock.release(lease)
+  if not replaced then return false end
+  state.persistent_dirty_loaded = true
+  log_info(("persistent_dirty removed covered paths (reason=%s, remaining=%d)"):format(
+    reason or "?", #arr))
+  return true
+end
+
 -- Public API: clear the dirty set. Called from :UEPrepare on success.
 -- 'reason' is logged for debugging — pass "prepare" / "reindex" / "manual".
 function M.clear_persistent_dirty(reason)
+  local p = persistent_dirty_path()
+  if p then
+    -- Empty array, serialized and atomically replaced. The prepare-family
+    -- writer lease ensures only one index publication performs this reset.
+    local dir = vim.fn.fnamemodify(p, ":h")
+    if vim.fn.isdirectory(dir) == 0 then vim.fn.mkdir(dir, "p") end
+    local lease, lock_err = file_lock.acquire(p .. ".lock")
+    if lease then
+      local tmp = p .. (".tmp.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
+      local fd = io.open(tmp, "w")
+      if not fd then
+        file_lock.release(lease)
+        log_warn("cannot create dirty.json reset file: " .. tmp)
+        return false
+      end
+      fd:write("[]")
+      fd:close()
+      local replaced, replace_err = vim.uv.fs_rename(tmp, p)
+      if not replaced then pcall(vim.fn.delete, tmp) end
+      file_lock.release(lease)
+      if not replaced then
+        log_warn("cannot reset dirty.json: " .. tostring(replace_err))
+        return false
+      end
+    else
+      log_warn("dirty.json remains conservative; another Neovim owns it: " .. tostring(lock_err))
+      return false
+    end
+  end
   state.persistent_dirty = {}
   state.persistent_dirty_loaded = true
   state._warned_dirty_high = false
   state._warned_dirty_capped = false
   state._dirty_capped = false
-  local p = persistent_dirty_path()
-  if p then
-    -- Empty array, atomic write.
-    local dir = vim.fn.fnamemodify(p, ":h")
-    if vim.fn.isdirectory(dir) == 0 then vim.fn.mkdir(dir, "p") end
-    local tmp = p .. ".tmp"
-    local fd = io.open(tmp, "w")
-    if fd then
-      fd:write("[]")
-      fd:close()
-      vim.uv.fs_rename(tmp, p)
-    end
-  end
   -- A successful prepare calls this after the new index is installed. Advance
   -- the change-event anchor so queued/pre-index metadata notifications cannot
   -- immediately repopulate the set that was just cleared.
   refresh_csearch_index_mtime()
   log_info(("persistent_dirty cleared (reason=%s)"):format(reason or "?"))
+  return true
 end
 
 -- Public API: stats for :UEDirtyStatus.

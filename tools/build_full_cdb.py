@@ -2,21 +2,21 @@
 """
 build_full_cdb.py — Single source of truth for clangd CDB on Unreal Engine.
 
-ARCHITECTURE (v2 — two-artefact split):
-  LSP and clangd-indexer have OPPOSITE needs:
+ARCHITECTURE (v3 — exact commands plus controlled background CDB):
+  Interactive clangd and background indexing have different needs:
     - LSP must answer goto-def / completion / diagnostics on the EXACT buffer
       the user is editing → it needs the per-file entry for that .cpp/.h.
-      If LSP only sees super-TUs, it returns multiple symbol candidates
-      (the same UClass appears in 13 different super-TU translation units).
-    - clangd-indexer parses every TU in the CDB exhaustively. Per-file with
-      14k+ TUs takes ~165 minutes. Super-unity (13 fat TUs) takes ~50s for
-      the same symbol coverage.
+      If LSP only sees wrapper TUs, it returns multiple symbol candidates
+      (the same UClass appears in multiple wrapper translation units).
+    - clangd BackgroundIndex needs a controlled, coverage-complete CDB.
+      Compiler-authored UBT unity groups reduce repeated preambles; sources
+      without matching active-build unity evidence remain exact per-file TUs.
 
   Therefore we produce TWO CDBs from one input:
     1. <out_active>          — per-file entries only (LSP)
-    2. <out_active>.indexer  — super-unity entries only (clangd-indexer)
-                                (path lives next to active CDB so the
-                                 :UEIndexFull command can stage it)
+    2. <out_active>.indexer  — compiler-authored UBT unity wrapper entries
+                               plus exact per-file fallback; the same entries
+                               are published to --background-output
 
 PIPELINE:
   raw UBT compile_commands.json (per-file)
@@ -26,10 +26,11 @@ PIPELINE:
     │      ↓
     │   (per-file CDB, post-fix) → write to <out_active>     [LSP artefact]
     │      ↓
-    ├── build_unity_cdb.py           — derive throwaway unity CDB
-    └── build_super_unity_cdb.py     — group unity → ~13 super-TUs
+    └── build_hot_super_unity_cdb.py — wrap only compiler-authored active-build
+                                       UBT unity groups and keep all other TUs
+                                       exact per-file
            ↓
-        (super-only CDB) → write to <out_active>.indexer     [indexer artefact]
+        (controlled background CDB) → clangd BackgroundIndex input
 
 USAGE:
   python build_full_cdb.py <raw_perfile_cdb> <out_active> [--no-rsp] [--max-mods=50]
@@ -43,15 +44,18 @@ USAGE:
 EXIT 0 on success.
 
 DESIGN HISTORY:
-  v1 (deprecated): appended super-TUs to per-file in ONE CDB. LSP saw both,
+  v1 (deprecated): appended wrapper TUs to per-file in ONE CDB. LSP saw both,
     indexer saw both. Worked for indexer but indexer treated each entry as
     its own TU (--executor=all-TUs) → 14347 TUs → ~110 minutes, defeating
-    the entire point of super-unity. The 50s commit (181c4ee) actually used
+    the entire point of compiler-authored unity wrapping. The 50s commit (181c4ee) actually used
     a 13-entry-only CDB; that the same CDB also drove LSP was an accident
     of the old single-pipeline design that hurt LSP precision.
-  v2 (this): two artefacts. ue.lua's :UEIndexFull stages the .indexer file
-    as compile_commands.json into a temp dir before running clangd-indexer,
-    leaving the active CDB (per-file) untouched for LSP.
+  v2: derived UE unity products before grouping. That silently selected stale
+    or different platform/configuration unity products and could omit active
+    Android TUs entirely.
+  v3 (this): transforms the normalized active per-file CDB directly and
+    verifies every input entry is emitted. Exact interactive commands are
+    delivered separately over clangd's compilationDatabaseChanges extension.
 """
 import argparse
 import json
@@ -169,14 +173,17 @@ def main():
     ap.add_argument('--no-inject', action='store_true',
                     help='Skip inject_definitions step (only for debugging)')
     ap.add_argument('--no-super', action='store_true',
-                    help='Skip super-unity sidecar; only produce per-file active CDB')
+                    help='Skip controlled BackgroundIndex sidecar; only produce per-file active CDB')
     ap.add_argument('--max-mods', type=int, default=50,
-                    help='Max modules per super-unity TU (default 50)')
+                    help='Max member sources per compiler-authored unity wrapper TU (default 50)')
     ap.add_argument('--keep-staging', action='store_true',
                     help='Keep intermediate staging dir for inspection')
     ap.add_argument('--idx-output', default=None,
                     help='If set, run clangd-indexer on the sidecar and write '
                          '.idx to this path. Single-shot mode for :UEIndexFull.')
+    ap.add_argument('--background-output', default=None,
+                    help='Write the controlled coverage-complete CDB here and a marker to '
+                         '--idx-output; do not run clangd-indexer')
     ap.add_argument('--indexer', default=None,
                     help='clangd-indexer executable path (auto-probed if omitted)')
     ap.add_argument('--jobs', '-j', type=int, default=0,
@@ -233,40 +240,42 @@ def main():
     atomic_write(dst_active, perfile, label='active CDB')
 
     if args.no_super:
-        print('[skip super-unity sidecar (--no-super)]')
+        if args.background_output:
+            print('ERROR: --background-output requires controlled BackgroundIndex output', file=sys.stderr)
+            return 1
+        print('[skip controlled BackgroundIndex sidecar (--no-super)]')
         if not args.keep_staging:
             shutil.rmtree(stage, ignore_errors=True)
         return 0
 
-    # ---- Step 3: derive throwaway unity CDB (input to super-unity)
-    unity_cdb = os.path.join(stage, 'compile_commands.unity.json')
-    bu = os.path.join(tools, 'build_unity_cdb.py')
-    if not os.path.isfile(bu):
-        print(f'\nERROR: build_unity_cdb.py missing → no super-unity sidecar', file=sys.stderr)
-        return 1
-    print('\n[3/4] build_unity_cdb (intermediate, throwaway)')
-    rc = run([py, '-I', bu, work, unity_cdb])
-    if rc != 0 or not os.path.isfile(unity_cdb):
-        print(f'ERROR: build_unity_cdb failed (rc={rc})', file=sys.stderr)
-        return 1
-    print(f'[unity] {len(load_cdb(unity_cdb))} unity TUs')
-
-    # ---- Step 4: build super-unity TUs from the unity CDB
+    # ---- Step 3: losslessly group the active per-file CDB. Deriving input
+    # from existing UE unity products is forbidden here: those products may
+    # belong to another platform/configuration and are not coverage evidence.
     super_cdb = os.path.join(stage, 'compile_commands.super.json')
-    bs = os.path.join(tools, 'build_super_unity_cdb.py')
+    bs = os.path.join(tools, 'build_hot_super_unity_cdb.py')
     if not os.path.isfile(bs):
-        print(f'\nERROR: build_super_unity_cdb.py missing', file=sys.stderr)
+        print(f'\nERROR: build_hot_super_unity_cdb.py missing', file=sys.stderr)
         return 1
-    print('\n[4/4] build_super_unity_cdb')
-    rc = run([py, '-I', bs, unity_cdb, super_cdb, str(args.max_mods)])
+    print('\n[3/3] build controlled BackgroundIndex CDB from active commands')
+    rc = run([
+        py, '-I', bs, work, super_cdb,
+        '--max-mods', str(args.max_mods),
+        '--super-dir', os.path.join(stage, 'super_unity_cpps'),
+    ])
     if rc != 0 or not os.path.isfile(super_cdb):
-        print(f'ERROR: build_super_unity_cdb failed (rc={rc})', file=sys.stderr)
+        print(f'ERROR: build_hot_super_unity_cdb failed (rc={rc})', file=sys.stderr)
         return 1
     super_entries = load_cdb(super_cdb)
-    print(f'[super-unity] {len(super_entries)} super-TUs')
+    print(f'[background-cdb] {len(super_entries)} controlled entries')
+    if args.background_output and (not super_entries or any(
+            not entry.get('file') or not isinstance(entry.get('arguments'), list)
+            for entry in super_entries)):
+        print('ERROR: refusing malformed controlled background CDB', file=sys.stderr)
+        return 1
 
-    # ---- ARTEFACT 2: write super-only indexer CDB ----
-    # The super-TU entries reference .cpp files in <stage>/super_unity_cpps/.
+    # ---- ARTEFACT 2: write controlled BackgroundIndex/indexer CDB ----
+    # Compiler-authored wrapper entries reference .cpp files in
+    # <stage>/super_unity_cpps/.
     # Move that dir to a stable location next to the active CDB BEFORE we
     # rewrite paths, so the indexer can find the actual .cpp files later.
     dst_dir = os.path.dirname(dst_active)
@@ -278,7 +287,7 @@ def main():
         shutil.copytree(src_super_dir, stable_super_dir)
         print(f'[super_cpps] {stable_super_dir}')
 
-        # Patch super-TU paths from staging to stable
+        # Patch wrapper-TU paths from staging to stable
         from_dir = src_super_dir.replace('/', '\\')
         to_dir = stable_super_dir.replace('/', '\\')
         patched = 0
@@ -293,7 +302,7 @@ def main():
                 new_args.append(a)
             e['arguments'] = new_args
         if patched:
-            print(f'[patched] {patched} super-TU file paths to stable dir')
+            print(f'[patched] {patched} wrapper-TU file paths to stable dir')
 
     print('\n[indexer] writing super-only CDB for clangd-indexer')
     atomic_write(dst_indexer, super_entries, label='indexer CDB')
@@ -306,6 +315,24 @@ def main():
     print(f'\n[summary]')
     print(f'  active  (LSP)     : {dst_active}    {len(perfile)} entries')
     print(f'  indexer (clangd)  : {dst_indexer}    {len(super_entries)} entries')
+
+    if args.background_output:
+        background_out = os.path.abspath(args.background_output)
+        atomic_write(background_out, super_entries, label='controlled background CDB')
+        if args.idx_output:
+            marker = {
+                'schema': 1,
+                'index_kind': 'controlled-background',
+                'cdb_name': os.path.basename(background_out),
+                'entry_count': len(super_entries),
+                'unity_entry_count': sum(
+                    'super_unity_cpps' in str(entry.get('file', '')).replace('\\', '/')
+                    for entry in super_entries
+                ),
+            }
+            atomic_write(os.path.abspath(args.idx_output), marker, label='index marker')
+        print(f'  background (clangd): {background_out}    {len(super_entries)} entries')
+        return 0
 
     # ---- OPTIONAL Step 5: run clangd-indexer on the sidecar ----
     if args.idx_output:

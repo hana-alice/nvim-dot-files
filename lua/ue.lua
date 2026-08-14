@@ -1357,8 +1357,42 @@ cache_paths = function(engine_root, platform_key, selection)
   }
 end
 
--- Migrate legacy flat gtags caches into the active platform subdir. csearch
--- remains platform-independent inside the selected project bucket.
+-- Resolve the pre-v4 engine-wide cache layout without consulting the current
+-- project selection. cache_paths() can no longer represent this layout once a
+-- project is captured, because it correctly returns the canonical project
+-- bucket. Migration must keep an explicit source model or it silently compares
+-- the project bucket with itself and leaves every legacy artifact behind.
+function CORE_RT.legacy_engine_cache_paths(engine_root, platform_key)
+  local cache = join(engine_root, ".cache", "nvim-ue")
+  local gtags_root = platform_key and platform_key ~= ""
+      and join(cache, "gtags", platform_key) or join(cache, "gtags")
+  local cdb = join(cache, "cdb")
+  local controlled = join(cdb, "compile_commands")
+  return {
+    cache = cache,
+    state = join(cache, "state.json"),
+    csearch_idx = join(cache, "csearch", "csearch.idx"),
+    platform_csearch_idx = platform_key and platform_key ~= ""
+        and join(cache, "csearch", platform_key, "csearch.idx") or nil,
+    gtags_root = gtags_root,
+    project_list = join(gtags_root, "project.files"),
+    engine_list = join(gtags_root, "engine.files"),
+    workspace_list = join(gtags_root, "workspace.files"),
+    workspace_all_list = join(gtags_root, "workspace_all.files"),
+    workspace_db = join(gtags_root, "workspace"),
+    flat_gtags_root = join(cache, "gtags"),
+    active_cdb = join(engine_root, "compile_commands.json"),
+    index_state = join(cdb, "modules.json"),
+    index_queue = join(cdb, "queue.json"),
+    index_current_cdb = join(controlled, "current.json"),
+    index_hot_cdb = join(controlled, "hot.json"),
+    index_full_cdb = join(controlled, "full.json"),
+    index_inject_full_cdb = join(controlled, "inject_full.json"),
+  }
+end
+
+-- Migrate legacy grep/CDB artifacts into the canonical project bucket and the
+-- old flat gtags layout into its active platform directory.
 --
 -- Before v3.1 grep caches lived at csearch/csearch.idx and gtags/*.files.
 -- v3.1 shards them by platform_key (csearch/<key>/, gtags/<key>/). On first
@@ -1371,8 +1405,25 @@ end
 -- never migrates. Parked on CORE_RT to stay under the LuaJIT local cap.
 function CORE_RT.migrate_legacy_csearch_if_needed(engine_root, platform_key)
   if not platform_key or platform_key == "" then return false end
-  local legacy = cache_paths(engine_root)            -- platform_key=nil → flat layout
   local active = cache_paths(engine_root, platform_key)
+  local project_scoped = norm(active.cache) ~= norm(active.engine_cache)
+  local legacy = project_scoped
+      and CORE_RT.legacy_engine_cache_paths(engine_root, platform_key)
+      or cache_paths(engine_root)                    -- pre-v3.1 flat layout
+
+  -- An engine-wide v3 cache has no bucket in its path. Import it only when its
+  -- persisted canonical project identity matches the selected v4 bucket.
+  -- Otherwise a project switch could seed project B with project A's index.
+  if project_scoped then
+    local raw = read_all(legacy.state)
+    local ok_state, legacy_state = pcall(vim.json.decode, raw or "")
+    local legacy_key = ok_state and type(legacy_state) == "table"
+        and CORE_RT.project_state.project_key(legacy_state.project_root, legacy_state.uproject) or nil
+    if not legacy_key or legacy_key ~= active.project_key then
+      return false
+    end
+  end
+
   local migration_lease = CORE_RT.file_lock.acquire(join(active.cache, "legacy-migration.lock"))
   if not migration_lease then return false end
   local moved = false
@@ -1397,6 +1448,76 @@ function CORE_RT.migrate_legacy_csearch_if_needed(engine_root, platform_key)
       end
       if ok then moved = true end
     end
+  end
+
+  -- v4 migration must not remove engine-wide files: an older Neovim process
+  -- may still be using them. Source and destination are guaranteed to share a
+  -- filesystem (both live below engine_root), so a hard link publishes even a
+  -- multi-GB csearch/CDB artifact in O(1). Future writers atomically replace
+  -- the project-bucket pathname and therefore do not mutate the legacy inode.
+  local function link_if(src, dst)
+    if not src or not dst or src == dst then return false end
+    if not _ufs.is_file(src) or _ufs.is_file(dst) then return false end
+    _ufs.ensure_dir(_ufs.dirname(dst))
+    local temp = dst .. (".migrate.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
+    local linked = vim.uv.fs_link(src, temp)
+    if not linked then return false end
+    -- A concurrent canonical writer wins; migration never overwrites it.
+    if _ufs.is_file(dst) then
+      pcall(vim.uv.fs_unlink, temp)
+      return false
+    end
+    local published = vim.uv.fs_rename(temp, dst)
+    if not published then
+      pcall(vim.uv.fs_unlink, temp)
+      return false
+    end
+    moved = true
+    return true
+  end
+
+  local function first_existing(paths)
+    for _, path in ipairs(paths) do
+      if path and _ufs.is_file(path) then return path end
+    end
+    return nil
+  end
+
+  if project_scoped then
+    local legacy_idx = first_existing({ legacy.csearch_idx, legacy.platform_csearch_idx })
+    link_if(legacy_idx, active.csearch_idx)
+    link_if(legacy_idx and (legacy_idx .. ".files") or nil, active.csearch_idx .. ".files")
+
+    local function legacy_gtags_file(name)
+      return first_existing({
+        join(legacy.gtags_root, name),
+        join(legacy.flat_gtags_root, name),
+      })
+    end
+    link_if(legacy_gtags_file("project.files"), active.project_list)
+    link_if(legacy_gtags_file("engine.files"), active.engine_list)
+    link_if(legacy_gtags_file("workspace.files"), active.workspace_list)
+    link_if(legacy_gtags_file("workspace_all.files"), active.workspace_all_list)
+    for _, name in ipairs({ "GTAGS", "GPATH", "GRTAGS" }) do
+      link_if(first_existing({
+        join(legacy.workspace_db, name),
+        join(legacy.flat_gtags_root, "workspace", name),
+      }), join(active.workspace_db, name))
+    end
+
+    -- The engine-root compile_commands.json was the proven active consumer in
+    -- v3. Preserve it as the v4 process-local active CDB; controlled subsets
+    -- are imported independently when present.
+    link_if(legacy.active_cdb, active.active_cdb)
+    link_if(legacy.index_state, active.index_state)
+    link_if(legacy.index_queue, active.index_queue)
+    link_if(legacy.index_current_cdb, active.index_current_cdb)
+    link_if(legacy.index_hot_cdb, active.index_hot_cdb)
+    link_if(legacy.index_full_cdb, active.index_full_cdb)
+    link_if(legacy.index_inject_full_cdb, active.index_inject_full_cdb)
+
+    CORE_RT.file_lock.release(migration_lease)
+    return moved
   end
 
   -- csearch index is now PLATFORM-INDEPENDENT (flat csearch/csearch.idx for

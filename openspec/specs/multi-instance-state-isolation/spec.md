@@ -108,3 +108,16 @@ bucket，并保留旧文件以便回滚。迁移后所有新写入 SHALL 进入�
 - **WHEN** engine 只有旧 `.cache/nvim-ue/state.json` 且包含 project_root/uproject
 - **THEN** 首次解析 SHALL 建立对应 canonical bucket 并读到旧字段
 - **AND** 后续 update SHALL 只写 project bucket
+
+#### Scenario: 已有索引与 active CDB 升级时不重建
+
+- **WHEN** 旧顶层 state 的 canonical project identity 等于当前 project bucket
+- **AND** 旧布局存在 csearch/GTAGS 或 engine-root active CDB，而新 bucket 尚无对应工件
+- **THEN** 首次解析 SHALL 以同文件系统原子发布方式导入对应工件
+- **AND** 导入 MUST NOT 删除或改写旧路径，保证已运行的旧 Neovim 实例继续可用
+- **AND** 大型索引/CDB 的迁移 MUST NOT 在 UI 主线程复制文件内容
+
+#### Scenario: 旧缓存属于另一项目
+
+- **WHEN** 旧顶层 state 的 canonical project identity 与当前 project bucket 不同
+- **THEN** 系统 MUST NOT 把旧索引、GTAGS 或 CDB 导入当前 bucket

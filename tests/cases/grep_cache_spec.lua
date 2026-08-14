@@ -257,6 +257,66 @@ end)
 
 -- ── 旧缓存迁移（v3.2：csearch 平台无关，迁移仅作用于 gtags lists/DB）─────────
 t.describe("ue.migrate_legacy_csearch_if_needed", function()
+  t.it("v4 project bucket imports matching legacy grep index and active CDB without removing legacy files", function()
+    local eng = tmpdir()
+    local project = eng .. "/Project"
+    local uproject = project .. "/Game.uproject"
+    local key = "Android-Test"
+    write_file(uproject, "{}")
+    write_file(eng .. "/.cache/nvim-ue/state.json", vim.json.encode({
+      engine_root = eng,
+      project_root = project,
+      uproject = uproject,
+      target_platform = "Android",
+      target_configuration = "Test",
+    }))
+
+    local project_state = require("ue.project_state")
+    assert(project_state.select(eng, project, uproject, { persist_default = false }))
+    local active = ue.cache_paths(eng, key)
+    local legacy_idx = eng .. "/.cache/nvim-ue/csearch/csearch.idx"
+    local legacy_snapshot = legacy_idx .. ".files"
+    local legacy_list = eng .. "/.cache/nvim-ue/gtags/" .. key .. "/workspace_all.files"
+    local legacy_cdb = eng .. "/compile_commands.json"
+    write_file(legacy_idx, string.rep("I", 2048))
+    write_file(legacy_snapshot, "Source/Foo.cpp\n")
+    write_file(legacy_list, "Source/Foo.cpp\n")
+    write_file(legacy_cdb, '[{"file":"Source/Foo.cpp"}]')
+
+    t.assert_true(ue.migrate_legacy_csearch_if_needed(eng, key), "matching legacy artifacts should migrate")
+    t.assert_true(is_file(active.csearch_idx), "project bucket should receive csearch.idx")
+    t.assert_true(is_file(active.csearch_idx .. ".files"), "project bucket should receive csearch snapshot")
+    t.assert_true(is_file(active.workspace_all_list), "project bucket should receive active-platform grep list")
+    t.assert_true(is_file(active.active_cdb), "project bucket should receive the proven legacy active CDB")
+    t.assert_true(is_file(legacy_idx), "legacy index must remain for an already-running old Neovim")
+    t.assert_true(is_file(legacy_cdb), "legacy CDB must remain for an already-running old Neovim")
+    pcall(vim.fn.delete, eng, "rf")
+  end)
+
+  t.it("v4 project bucket rejects legacy artifacts owned by another project", function()
+    local eng = tmpdir()
+    local selected_project = eng .. "/Selected"
+    local selected_uproject = selected_project .. "/Selected.uproject"
+    local foreign_project = eng .. "/Foreign"
+    local foreign_uproject = foreign_project .. "/Foreign.uproject"
+    write_file(selected_uproject, "{}")
+    write_file(foreign_uproject, "{}")
+    write_file(eng .. "/.cache/nvim-ue/state.json", vim.json.encode({
+      engine_root = eng,
+      project_root = foreign_project,
+      uproject = foreign_uproject,
+    }))
+    write_file(eng .. "/.cache/nvim-ue/csearch/csearch.idx", string.rep("X", 2048))
+
+    assert(require("ue.project_state").select(
+      eng, selected_project, selected_uproject, { persist_default = false }))
+    local active = ue.cache_paths(eng, "Android-Test")
+    t.assert_false(ue.migrate_legacy_csearch_if_needed(eng, "Android-Test"),
+      "foreign legacy cache must not cross project identity")
+    t.assert_false(is_file(active.csearch_idx), "foreign index must not enter selected project bucket")
+    pcall(vim.fn.delete, eng, "rf")
+  end)
+
   t.it("旧单一路径 gtags lists 被 move 到平台目录，旧路径清空", function()
     local eng = tmpdir()
     local key = "Android-Development"

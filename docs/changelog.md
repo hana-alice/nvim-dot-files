@@ -56,6 +56,46 @@ keep this file rolling forward as the unreleased section.
 
 ## Unreleased
 
+### 2026-08-14 — 保留 project-bucket 升级前的 UE 索引与 CDB
+
+**Task**
+
+修复升级到 canonical project bucket 后，已有 checkout 的 `<Space>/` 因新 bucket 无 csearch index
+而失效，并同时处置探针记录的 `active-compile-command-missing`。
+
+**Implemented**
+
+- `lua/ue.lua` 新增显式 pre-v4 engine-wide cache path model；迁移不再经当前 project-aware
+  `cache_paths()` 错把新 bucket 当作 legacy source。
+- `migrate_legacy_csearch_if_needed()` 先比较旧 state 与当前 bucket 的 canonical project key，
+  只导入同一项目的 csearch snapshot、active-platform GTAGS、engine-root active CDB 与 controlled CDB state。
+- 大型索引/CDB 通过同文件系统 hard link + 唯一临时名 + atomic rename 发布；保留旧路径供已运行的
+  旧 Neovim 使用，并让并发 canonical writer 优先，避免 UI 主线程复制数百 MB/GB 文件。
+- `tests/cases/grep_cache_spec.lua` 新增同项目导入、旧路径保留和异项目拒绝回归；
+  `multi-instance-state-isolation` 主规格补齐旧工件迁移与身份隔离契约。
+
+**Pitfalls / Gotchas**
+
+- v4 的旧迁移函数仍调用 project-aware `cache_paths()`；项目被捕获后 legacy/active 实际指向同一路径，
+  现有平台迁移测试未建立 project selection，因而没有覆盖这个确定回归。
+- 当前实例位于另一个已有 engine checkout；先前 checkout 重建成功不能证明迁移正确，每个未导入的
+  checkout 都会再次表现为 `<Space>/` 无 picker。
+- `multi_instance_state` 与其他测试进程并行时会争用全局 probe 测试文件并出现 8→7；串行复跑
+  11/11 通过，提交门禁继续使用仓库规定的串行全量入口。
+
+**Validation**
+
+- TDD：新增 legacy project-bucket 场景先稳定复现 `28/29`（迁移返回 false），实现后
+  `grep_cache` 29/29 passed。
+- 定向：`multi_instance_state` 11/11、`ue_project_context` 7/7、`ue_api` 54/54、`smoke` 18/18 passed。
+- 真实实例：后台 `:UEPrepare` 生成 331,301,737-byte csearch index，`indexed=true`；
+  `<Space>/` 等价搜索 `SubmitActiveCmdBuffer` 返回 34 个真实 csearch hits，preview window/buffer 均存在。
+- 全量：`nvim --headless -l tests/run.lua` 808/808 passed。
+
+**Follow-ups**
+
+- 无。
+
 ### 2026-08-13 — 隔离多 Neovim 实例的 UE 状态与共享 writer
 
 **Task**

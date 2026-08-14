@@ -5,7 +5,8 @@
 ## 用途
 
 不依赖 Neovim 运行的独立工具：CDB 生成/裁剪（`build_*_cdb.py`、`prune_*`、`slim_*`、`inject_*`）、
-PCH 预编译（`prebuild_pch*.py`）、clangd 索引（`build_clangd_index.py`）、DAP 探针（`dap_*probe*.py`）、
+PCH 预编译（`prebuild_pch*.py`）、clangd controlled BackgroundIndex CDB
+（`build_{clangd_index,full_cdb,hot_super_unity_cdb}.py`）、DAP 探针（`dap_*probe*.py`）、
 csearch 索引器 `cindex-uefilter/`（Go fork），及若干 `.lua` headless 探针/e2e。
 
 ## 什么属于这里 / 不属于这里
@@ -22,7 +23,8 @@ csearch 索引器 `cindex-uefilter/`（Go fork），及若干 `.lua` headless �
 
 ## 改动 → 必跑回归
 
-工具本身不在 headless 套件内；改动后手动跑对应工具验证，并在 `../docs/changelog.md` 记录（含验证方式）。
+controlled BackgroundIndex 生成器由 `index_generation` / `cpp_semantic_index` 覆盖；其他工具
+改动后手动跑对应工具验证，并在 `../docs/changelog.md` 记录（含验证方式）。
 
 ## 先读
 

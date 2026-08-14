@@ -70,12 +70,15 @@ t.describe("ue.cache_paths 平台分路径", function()
       "gtags 仍 per-platform，路径必须不同")
   end)
 
-  t.it("非 grep 类工件（state/cdb/clangd）不随平台分目录", function()
+  t.it("project state/CDB shard catalog共享，但 index runtime/clangd 消费物按平台隔离", function()
     local a = ue.cache_paths("/eng", "Android-Development")
     local w = ue.cache_paths("/eng", "Win64-Development")
     t.assert_eq(a.state, w.state, "state.json 单一路径")
-    t.assert_eq(a.index_current_cdb, w.index_current_cdb, "cdb current 单一路径")
-    t.assert_eq(a.active_index, w.active_index, "clangd index 单一路径")
+    t.assert_eq(a.cdb_shards_dir, w.cdb_shards_dir, "跨平台 shard catalog 应共享")
+    t.assert_true(a.index_current_cdb ~= w.index_current_cdb, "controlled CDB 必须按平台隔离")
+    t.assert_true(a.index_state ~= w.index_state, "index scheduler state 必须按平台隔离")
+    t.assert_true(a.active_index ~= w.active_index, "clangd index 必须按平台隔离")
+    t.assert_true(a.active_cdb ~= w.active_cdb, "active CDB 必须按平台隔离")
   end)
 end)
 
@@ -116,12 +119,60 @@ end)
 
 -- ── live grep 启动阈值 ──────────────────────────────────────────────────
 t.describe("UE grep live 输入保护", function()
-  t.it("空输入与单字符输入不启动重搜索", function()
+  t.it("空输入与单字符标识符不启动重搜索，但 literal 标点可以精确搜索", function()
     t.assert_false(ue._grep_live_search_ready_for_test("", 2), "空输入不应搜索")
     t.assert_false(ue._grep_live_search_ready_for_test(" ", 2), "空白输入不应搜索")
     t.assert_false(ue._grep_live_search_ready_for_test("R", 2), "单字符输入不应搜索")
+    t.assert_true(ue._grep_live_search_ready_for_test(".", 2, true), "literal 点号应允许单字符搜索")
+    t.assert_true(ue._grep_live_search_ready_for_test("/", 2, true), "literal 斜杠应允许单字符搜索")
+    t.assert_false(ue._grep_live_search_ready_for_test(".", 2, false), "regex 点号仍应受阈值保护")
     t.assert_true(ue._grep_live_search_ready_for_test("RD", 2), "两个字符后才搜索")
     t.assert_true(ue._grep_live_search_ready_for_test("  RD  ", 2), "阈值应按 trim 后内容判断")
+  end)
+end)
+
+t.describe("UE grep 结果信息架构与预览定位", function()
+  t.it("文件分组只标注真实命中，不插入不可预览的伪 header item", function()
+    local items = {
+      { file = "C:/UE/Game/Source/Foo.cpp", pos = { 12, 3 }, line = "first hit" },
+      { file = "C:/UE/Game/Source/Foo.cpp", pos = { 13, 5 }, line = "second hit" },
+    }
+    local got = ue._grep_annotate_file_group_for_test(items, {
+      engine_root = "C:/UE",
+      project_root = "C:/UE/Game",
+    })
+
+    t.assert_eq(#got, 2, "两条命中只能产生两条 picker item")
+    t.assert_eq(got[1].file, items[1].file, "首项仍是可跳转的真实命中")
+    t.assert_eq(got[1]._grep_group.index, 1)
+    t.assert_eq(got[1]._grep_group.count, 2)
+    t.assert_eq(got[1]._grep_group.scope, "Project")
+    t.assert_eq(got[1]._grep_group.path, "Source/Foo.cpp")
+    t.assert_eq(got[2]._grep_group.index, 2)
+
+    local first = ue._grep_format_grouped_for_test(got[1])
+    local second = ue._grep_format_grouped_for_test(got[2])
+    local function text(chunks)
+      local parts = {}
+      for _, chunk in ipairs(chunks) do parts[#parts + 1] = chunk[1] end
+      return table.concat(parts)
+    end
+    t.assert_contains(text(first), "Project")
+    t.assert_contains(text(first), "Source/Foo.cpp")
+    t.assert_contains(text(first), "(2)")
+    t.assert_contains(text(first), "first hit")
+    t.assert_contains(text(second), "second hit")
+  end)
+
+  t.it("literal 命中提供精确 end_pos，preview 不再把 raw 输入当 Vim regex", function()
+    local literal = ue._grep_hit_item_for_test("C:/UE/Foo.cpp", 8, 5, "lhs.value", ".", false)
+    t.assert_eq(literal.pos[1], 8)
+    t.assert_eq(literal.pos[2], 4)
+    t.assert_eq(literal.end_pos[1], 8)
+    t.assert_eq(literal.end_pos[2], 5)
+
+    local regex = ue._grep_hit_item_for_test("C:/UE/Foo.cpp", 8, 5, "lhs.value", ".", true)
+    t.assert_eq(regex.end_pos, nil, "regex 模式仍由 regex preview 计算真实匹配宽度")
   end)
 end)
 
@@ -206,6 +257,66 @@ end)
 
 -- ── 旧缓存迁移（v3.2：csearch 平台无关，迁移仅作用于 gtags lists/DB）─────────
 t.describe("ue.migrate_legacy_csearch_if_needed", function()
+  t.it("v4 project bucket imports matching legacy grep index and active CDB without removing legacy files", function()
+    local eng = tmpdir()
+    local project = eng .. "/Project"
+    local uproject = project .. "/Game.uproject"
+    local key = "Android-Test"
+    write_file(uproject, "{}")
+    write_file(eng .. "/.cache/nvim-ue/state.json", vim.json.encode({
+      engine_root = eng,
+      project_root = project,
+      uproject = uproject,
+      target_platform = "Android",
+      target_configuration = "Test",
+    }))
+
+    local project_state = require("ue.project_state")
+    assert(project_state.select(eng, project, uproject, { persist_default = false }))
+    local active = ue.cache_paths(eng, key)
+    local legacy_idx = eng .. "/.cache/nvim-ue/csearch/csearch.idx"
+    local legacy_snapshot = legacy_idx .. ".files"
+    local legacy_list = eng .. "/.cache/nvim-ue/gtags/" .. key .. "/workspace_all.files"
+    local legacy_cdb = eng .. "/compile_commands.json"
+    write_file(legacy_idx, string.rep("I", 2048))
+    write_file(legacy_snapshot, "Source/Foo.cpp\n")
+    write_file(legacy_list, "Source/Foo.cpp\n")
+    write_file(legacy_cdb, '[{"file":"Source/Foo.cpp"}]')
+
+    t.assert_true(ue.migrate_legacy_csearch_if_needed(eng, key), "matching legacy artifacts should migrate")
+    t.assert_true(is_file(active.csearch_idx), "project bucket should receive csearch.idx")
+    t.assert_true(is_file(active.csearch_idx .. ".files"), "project bucket should receive csearch snapshot")
+    t.assert_true(is_file(active.workspace_all_list), "project bucket should receive active-platform grep list")
+    t.assert_true(is_file(active.active_cdb), "project bucket should receive the proven legacy active CDB")
+    t.assert_true(is_file(legacy_idx), "legacy index must remain for an already-running old Neovim")
+    t.assert_true(is_file(legacy_cdb), "legacy CDB must remain for an already-running old Neovim")
+    pcall(vim.fn.delete, eng, "rf")
+  end)
+
+  t.it("v4 project bucket rejects legacy artifacts owned by another project", function()
+    local eng = tmpdir()
+    local selected_project = eng .. "/Selected"
+    local selected_uproject = selected_project .. "/Selected.uproject"
+    local foreign_project = eng .. "/Foreign"
+    local foreign_uproject = foreign_project .. "/Foreign.uproject"
+    write_file(selected_uproject, "{}")
+    write_file(foreign_uproject, "{}")
+    write_file(eng .. "/.cache/nvim-ue/state.json", vim.json.encode({
+      engine_root = eng,
+      project_root = foreign_project,
+      uproject = foreign_uproject,
+    }))
+    write_file(eng .. "/.cache/nvim-ue/csearch/csearch.idx", string.rep("X", 2048))
+
+    assert(require("ue.project_state").select(
+      eng, selected_project, selected_uproject, { persist_default = false }))
+    local active = ue.cache_paths(eng, "Android-Test")
+    t.assert_false(ue.migrate_legacy_csearch_if_needed(eng, "Android-Test"),
+      "foreign legacy cache must not cross project identity")
+    t.assert_false(is_file(active.csearch_idx), "foreign index must not enter selected project bucket")
+    pcall(vim.fn.delete, eng, "rf")
+  end)
+
   t.it("旧单一路径 gtags lists 被 move 到平台目录，旧路径清空", function()
     local eng = tmpdir()
     local key = "Android-Development"
@@ -263,11 +374,9 @@ end)
 
 -- ── engine_root / project_root 往返持久化 ───────────────────────────────
 t.describe("ue.read_state 往返 engine_root", function()
-  t.it("update_state_field 写入 engine_root 后可读回并归一化", function()
+  t.it("project selection 注入归一化的 engine_root/project_root", function()
     local eng = tmpdir()
-    -- 写入混合分隔符的 engine_root，read_state 应 norm 成正斜杠
-    ue.update_state_field(eng, "engine_root", eng)
-    ue.update_state_field(eng, "project_root", eng .. "/proj")
+    assert(require("ue.project_state").select(eng, eng .. "/proj", eng .. "/proj/Test.uproject"))
     local s = ue.read_state(eng)
     t.assert_eq(s.engine_root, eng:gsub("\\", "/"), "engine_root 归一化往返")
     t.assert_eq(s.project_root, (eng .. "/proj"):gsub("\\", "/"), "project_root 归一化往返")

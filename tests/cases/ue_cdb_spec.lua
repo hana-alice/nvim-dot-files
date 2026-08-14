@@ -31,6 +31,15 @@ t.describe("ue.cdb.paths", function()
     t.assert_eq(#tg, 2)
     t.assert_eq(tg[1], "/x/compile_commands.json")
   end)
+
+  t.it("project context writes only to its isolated active CDB", function()
+    local tg = paths.targets({
+      engine_root = "/x",
+      paths = { active_cdb = "/x/.cache/nvim-ue/projects/game/cdb/active/Android/compile_commands.json" },
+    })
+    t.assert_eq(#tg, 1)
+    t.assert_eq(tg[1], "/x/.cache/nvim-ue/projects/game/cdb/active/Android/compile_commands.json")
+  end)
   t.it("candidates 不存在 root 返回 table", function()
     local c = paths.candidates({ engine_root = "/nonexistent_xyz_12345" }, {})
     t.assert_type(c, "table")
@@ -181,11 +190,31 @@ t.describe("ue.cdb.pipeline lifecycle", function()
     pcall(os.remove, path)
   end)
 
+  t.it("跨进程 writer lease 存在时不启动 pipeline", function()
+    local path = temp_cdb()
+    local lock = require("ue.file_lock")
+    local lease = assert(lock.acquire(path .. ".writer.lock"))
+    local starts, result = 0, nil
+    pipeline.set_runtime({
+      jobstart = function() starts = starts + 1; return 31 end,
+      notify = function() end,
+      log_error = function() end,
+    })
+    local jobid, err = pipeline.run(path, { path }, function(ok) result = ok end)
+    t.assert_eq(jobid, nil)
+    t.assert_eq(starts, 0, "live foreign lease must reject before spawn")
+    t.assert_false(result)
+    t.assert_contains(tostring(err), "another Neovim")
+    t.assert_false(pipeline.is_running())
+    lock.release(lease)
+    pcall(os.remove, path)
+  end)
+
   t.it("同步入口检查 writer slot 并传播 pipeline 启动结果", function()
     local source = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
     t.assert_contains(source, 'if pipeline.is_running() then\n    return false, "compile_commands pipeline is already running"')
     t.assert_contains(source, 'local jobid, pipeline_err = run_compile_commands_pipeline(path, targets)')
-    t.assert_contains(source, 'local pipeline_jobid, pipeline_err = run_compile_commands_pipeline(targets[1], targets)')
+    t.assert_contains(source, 'local pipeline_jobid, pipeline_err = run_compile_commands_pipeline(targets[1], targets, function()')
     t.assert_contains(source, 'return false, nil, pipeline_err or "compile_commands pipeline failed to start"')
   end)
 end)

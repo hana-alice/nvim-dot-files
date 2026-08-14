@@ -20,10 +20,11 @@ nvim --headless -l scripts/export_ue_context.lua D:\path\to\UnrealEngine C:\tmp\
 
 ## Resolution Contract
 
-The exporter treats the supplied engine directory as authoritative and reads
-`<engine-root>/.cache/nvim-ue/state.json` for the selected project. A persisted
-`uproject` path is preferred because P4 workspaces can place it below
-`<project-root>/Source/<Project>/`.
+The exporter treats the supplied engine directory as authoritative. A new
+headless process reads `<engine-root>/.cache/nvim-ue/selection.json` as its
+startup default, then reads state from the selected canonical project bucket
+under `projects/<project-key>/`. A persisted `uproject` path is preferred
+because P4 workspaces can place it below `<project-root>/Source/<Project>/`.
 
 Selection precedence matches the live Neovim UE integration:
 

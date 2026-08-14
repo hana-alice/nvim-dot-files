@@ -7,6 +7,9 @@ return {
       "nvim-neotest/nvim-nio",
     },
     config = function()
+      local log_isolation = require("workarounds.dap.pid_scoped_logs")
+      local ok_logs, log_err = log_isolation.apply(true)
+      assert(ok_logs, "failed to isolate nvim-dap logs: " .. tostring(log_err))
       local dap = require("dap")
       local dapui = require("dapui")
       dapui.setup({

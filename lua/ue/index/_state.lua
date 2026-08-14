@@ -80,6 +80,14 @@ local function write_json_file(path, value)
   return core.deps.write_all(path, vim.json.encode(value or {}))
 end
 
+local function read_text_file(path)
+  local content = core.deps.read_all(path)
+  if type(content) ~= "string" or content == "" then
+    return nil
+  end
+  return content
+end
+
 -- Reverse-map a unity TU path back to the originating module name.
 -- UBT emits unity .cpp files at:
 --   <root>/Intermediate/Build/<Plat>/<Target>/<Conf>/[<PlatGroup>/]<Module>/Module.<Module>[.gen][.N_of_M].cpp
@@ -275,11 +283,13 @@ end
 
 local function index_state_default()
   return {
-    version = 1,
+    version = 2,
     active_module = nil,
     root_dirty = false,
     modules = {},
     queue = {},
+    index_artifacts = {},
+    index_selection = {},
     build = {
       phase = "idle",
       status = "idle",
@@ -324,6 +334,9 @@ local function ensure_index_state(ctx)
   end
   if type(state.queue) ~= "table" then
     state.queue = {}
+  end
+  if core.h.normalize_index_state then
+    core.h.normalize_index_state(state)
   end
   if state.root_dirty == nil then
     state.root_dirty = false
@@ -519,59 +532,6 @@ M.index_phase_paths = function(ctx, phase)
   return ctx.paths.index_full_cdb, ctx.paths.full_index
 end
 
-
-M.index_status_summary = function(ctx)
-  local state = ensure_index_state(ctx)
-  local dirty = 0
-  local total = 0
-  local tier_counts = { core = 0, warm = 0, cold = 0 }
-  for _, rec in pairs(state.modules or {}) do
-    total = total + 1
-    local tier = rec.tier or "warm"
-    if tier_counts[tier] ~= nil then
-      tier_counts[tier] = tier_counts[tier] + 1
-    end
-    if rec.dirty then
-      dirty = dirty + 1
-    end
-  end
-  local active_name = "-"
-  local active_tier = "-"
-  local active_kind = "-"
-  if state.active_module and state.modules[state.active_module] then
-    local active = state.modules[state.active_module]
-    active_name = active.name or active_name
-    active_tier = module_tier_label(active.tier)
-    active_kind = active.kind or active_kind
-  end
-  local queued = {}
-  for _, phase_name in ipairs({ "current", "hot", "full" }) do
-    if state.queue and state.queue[phase_name] then
-      queued[#queued + 1] = index_phase_label(phase_name)
-    end
-  end
-  local phase = state.build and state.build.phase or "idle"
-  return {
-    active = active_name,
-    active_tier = active_tier,
-    active_kind = active_kind,
-    dirty = dirty,
-    total = total,
-    core = tier_counts.core,
-    warm = tier_counts.warm,
-    cold = tier_counts.cold,
-    queued = queued,
-    queue_count = #queued,
-    root_dirty = (state.root_dirty or false) or (core.deps.core_rt.dirty_index_roots[core.deps.status_root_key(ctx)] and true or false),
-    phase = phase,
-    phase_label = index_phase_label(phase),
-    status = state.build and state.build.status or "idle",
-    message = state.build and state.build.message or "",
-    active_index = state.build and state.build.active_index or "",
-    active_index_name = fs.trim(vim.fs.basename(state.build and state.build.active_index or "")),
-  }
-end
-
   -- Shared helpers for sibling loaders (_build/_clangd) + public re-exports
   -- for ue.lua call sites that used these as file-locals before the split.
   core.h.unix_now = unix_now
@@ -579,6 +539,7 @@ end
   core.h.module_tier_label = module_tier_label
   core.h.read_json_file = read_json_file
   core.h.write_json_file = write_json_file
+  core.h.read_text_file = read_text_file
   core.h.ensure_index_state = ensure_index_state
   core.h.save_index_state = save_index_state
   core.h.index_state_default = index_state_default

@@ -14,11 +14,14 @@
 | 改动位置 | 最小必跑 filter |
 |---|---|
 | `lua/config/keymaps.lua` / 命令定义 | `keymaps` `commands` |
+| `lua/utils/window_title.lua` | `window_title` `keymaps` `commands` `cheatsheet` |
 | `lua/utils/android_device.lua` / Android ADB device 路由 | `android_device` `dap` `ue_context` |
 | `lua/ue/config.lua`（schema） | `ue_config` `smoke` |
 | `lua/ue.lua` 项目选择 / context 解析 | `ue_project_context` `ue_api` `smoke` |
+| `lua/ue/project_state.lua` / `lua/ue/file_lock.lua` / 共享持久状态 | `multi_instance_state` |
 | `lua/ue/cdb/**` | `ue_cdb` |
 | `lua/ue/dap/**` / `lua/utils/platform/**` | `dap` `platform` |
+| `lua/ue/index/**` / `lua/ue/clangd_commands.lua` / controlled CDB generators | `index_generation` `cpp_semantic_index` `clangd_commands` `ue_api` |
 | `lua/utils/ue_goto/**` / C++ `gd` | `cpp_semantic_context` `cpp_semantic_client` `cpp_semantic_sidecar` `ue_goto_behavior` `utils` |
 | `code_search/**` / `ue_paths.lua` | `ue_goto_behavior` `ue_paths` `utils` |
 | `lua/config/options.lua` / `autocmds.lua` | `options` `autocmds` |
@@ -28,7 +31,7 @@
 | 文档 / 规则 / 知识库结构 | `structure` |
 | **跨子系统 / 公共 helper / 重构 / 拿不准** | **全量（不带 filter）** |
 
-> 与 `tests/CLAUDE.md` 的 CHANGE-TO-FILTER MAP 保持一致；新增/重命名 spec 时两处同步。
+> 与 `tests/AGENTS.md` 的 CHANGE-TO-FILTER MAP 保持一致；新增/重命名 spec 时两处同步。
 
 ### 配套要求
 
@@ -86,7 +89,8 @@ tests/
 ├── harness/init.lua     # 纯 Lua 框架：断言 + describe/it + 报告 + 自举
 └── cases/
     ├── smoke_spec.lua            # 配置加载冒烟 + ue.setup() 命令注册
-    ├── android_device_spec.lua   # Android device picker + 全局 serial + adb -s 路由
+    ├── android_device_spec.lua   # Android device picker + 进程内 serial + adb -s 路由
+    ├── multi_instance_state_spec.lua # 项目/target 隔离 + 跨进程原子/merge/lease
     ├── platform_spec.lua         # utils.platform 四驱动接口契约
     ├── ue_api_spec.lua           # ue 公共表/函数冻结
     ├── ue_config_spec.lua        # ue.config schema 默认值/override/reset
@@ -95,6 +99,7 @@ tests/
     ├── utils_spec.lua            # utils.code_search/log/ue_paths/ue_goto 加载
     ├── keymaps_spec.lua          # 快捷键绑定（DAP 功能键多模式 / leader / gd/gr/gc / Win <C-v>）
     ├── commands_spec.lua         # 70 个 UE* 命令 + Restart/Workaround* 注册（冻结清单）
+    ├── window_title_spec.lua     # 系统窗口标题 literal/sanitize/reset/prompt 契约
     ├── options_spec.lua          # expandtab/shiftwidth/number/sessionoptions
     ├── autocmds_spec.lua         # usf→hlsl、cindent 切换、commentstring 回退
     ├── workarounds_spec.lua      # 注册表发现/无 error/frontmatter/status 形状
@@ -112,7 +117,8 @@ tests/
 | 功能域 | 用例文件 | 覆盖口径 |
 |--------|----------|----------|
 | 配置加载 | smoke_spec | 关键模块 require + setup 不报错 |
-| Android device | android_device_spec | `adb devices -l` 解析、名称+serial picker、全局 serial、install/launch/logcat/DAP `-s` 路由 |
+| Android device | android_device_spec | `adb devices -l` 解析、名称+serial picker、进程内 serial、install/launch/logcat/DAP `-s` 路由 |
+| 多实例状态 | multi_instance_state_spec | live selection 隔离、project bucket、target 原子对、共享集合 merge、writer lease |
 | 平台驱动 | platform_spec | 四驱动接口形状一致 |
 | ue API | ue_api_spec | 公共表/函数冻结 |
 | ue.config | ue_config_spec | 默认值/override/reset |
@@ -120,6 +126,7 @@ tests/
 | DAP | dap_spec | 平台注册 seam + attach/launch 导出 |
 | **快捷键** | keymaps_spec | 绑定存在 + 指向预期命令（不触发动作） |
 | **用户命令** | commands_spec | 全部 UE*/Restart/Workaround* 已注册 |
+| **窗口标题** | window_title_spec | literal titlestring、安全清理、命令与 prompt/reset 语义 |
 | **options** | options_spec | 关键 option 取值 |
 | **autocmd/filetype** | autocmds_spec | usf→hlsl、cindent、commentstring |
 | **workarounds** | workarounds_spec | 注册表完整性 + frontmatter |

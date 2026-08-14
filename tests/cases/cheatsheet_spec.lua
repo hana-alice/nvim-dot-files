@@ -94,6 +94,114 @@ t.describe("cheatsheet: float 版 UE 命令不死链", function()
   end
 end)
 
+-- ── 快捷键发现：混合大小写组合必须直接命中并保留分类 ───────────────────────
+t.describe("cheatsheet: 快捷键搜索与界面分类", function()
+  local sheet = require("utils.cheatsheet")
+
+  local function first_exact(query, key)
+    for _, hit in ipairs(sheet.search(query)) do
+      if hit.key == key then return hit end
+    end
+    return nil
+  end
+
+  t.it("wW 直接命中 word/WORD motion，并标出 Basics › Motions", function()
+    local hit = first_exact("wW", "w / W")
+    t.assert_true(hit ~= nil, "wW 应直接找到 w / W")
+    t.assert_eq(hit.tab, "Basics")
+    t.assert_eq(hit.section, "Motions")
+    t.assert_eq(hit.group, "Basics › Motions")
+  end)
+
+  t.it("aA 直接命中 insert-after/line-end mode，并标出 Basics › Modes", function()
+    local hit = first_exact("aA", "a / A")
+    t.assert_true(hit ~= nil, "aA 应直接找到 a / A")
+    t.assert_eq(hit.tab, "Basics")
+    t.assert_eq(hit.section, "Modes")
+    t.assert_eq(hit.group, "Basics › Modes")
+  end)
+
+  t.it("搜索不区分大小写，且所有结果都有 tab/section 分类", function()
+    local lower = sheet.search("ww")
+    local mixed = sheet.search("wW")
+    t.assert_true(#mixed > 0, "wW 应有结果")
+    t.assert_eq(#lower, #mixed, "ww 与 wW 的命中集合应一致")
+    for _, hit in ipairs(mixed) do
+      t.assert_true(type(hit.tab) == "string" and hit.tab ~= "", "结果缺 tab 分类")
+      t.assert_true(type(hit.section) == "string" and hit.section ~= "", "结果缺 section 分类")
+    end
+  end)
+
+  t.it("全部 cheatsheet 条目都可按原键位找回，且分类/说明非空", function()
+    for _, tab in ipairs(sheet.tabs) do
+      t.assert_true(type(tab.name) == "string" and tab.name ~= "", "存在无名 tab")
+      for _, section in ipairs(tab.sections or {}) do
+        t.assert_true(type(section.title) == "string" and section.title ~= "", "存在无名 section")
+        for _, mapping in ipairs(section.mappings or {}) do
+          local key, desc = tostring(mapping[1] or ""), tostring(mapping[2] or "")
+          t.assert_true(key ~= "", tab.name .. " › " .. section.title .. " 存在空键位")
+          t.assert_true(desc ~= "", tab.name .. " › " .. section.title .. " › " .. key .. " 缺说明")
+          local found = false
+          for _, hit in ipairs(sheet.search(key)) do
+            if hit.key == key and hit.tab == tab.name and hit.section == section.title then
+              found = true
+              break
+            end
+          end
+          t.assert_true(found, tab.name .. " › " .. section.title .. " › " .. key .. " 无法按原键位找回")
+        end
+      end
+    end
+  end)
+
+  t.it("搜索结果按分类生成界面 section，不退化成无分类平铺", function()
+    local sections, count = sheet.search_sections("wW")
+    t.assert_true(count > 0, "wW 应有界面结果")
+    t.assert_true(#sections > 0, "搜索界面应至少有一个分类")
+    t.assert_eq(sections[1].title, "Basics › Motions")
+    t.assert_true(#sections[1].mappings > 0, "分类内应有快捷键")
+  end)
+
+  t.it("帮助浮窗把 / 暴露为搜索入口", function()
+    sheet.open()
+    local state = sheet._state_for_test()
+    t.assert_true(state.buf ~= nil and vim.api.nvim_buf_is_valid(state.buf), "cheatsheet buffer 未创建")
+    local found = false
+    for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(state.buf, "n")) do
+      if mapping.lhs == "/" then found = true; break end
+    end
+    t.assert_true(found, "cheatsheet 内 / 应启动快捷键搜索")
+    sheet.close()
+  end)
+
+  t.it("真实按键 /wW<CR> 与 /aA<CR> 都落到带分类的搜索界面", function()
+    for _, case in ipairs({
+      { query = "wW", group = "Basics › Motions", key = "w / W" },
+      { query = "aA", group = "Basics › Modes", key = "a / A" },
+    }) do
+      sheet.open()
+      local keys = vim.api.nvim_replace_termcodes("/" .. case.query .. "<CR>", true, false, true)
+      vim.api.nvim_feedkeys(keys, "xt", false)
+      vim.wait(500, function()
+        return sheet._state_for_test().query == case.query
+      end, 10)
+
+      local state = sheet._state_for_test()
+      t.assert_eq(state.query, case.query, "真实输入没有进入 cheatsheet 搜索状态")
+      local visible = {}
+      for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(state.buf, state.ns, 0, -1, { details = true })) do
+        for _, chunk in ipairs(mark[4].virt_text or {}) do
+          visible[#visible + 1] = chunk[1]
+        end
+      end
+      visible = table.concat(visible, "\n")
+      t.assert_contains(visible, case.group)
+      t.assert_contains(visible, case.key)
+      sheet.close()
+    end
+  end)
+end)
+
 -- ── ② markdown 版命令在冻结清单内 ─────────────────────────────────────────
 t.describe("cheatsheet: markdown 版 UE 命令不死链", function()
   local md = read("docs/ue_lazyvim_cheatsheet.md")

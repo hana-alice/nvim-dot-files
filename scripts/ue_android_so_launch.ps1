@@ -275,6 +275,14 @@ function Test-MapsExactPath {
     if ($mappedPath.Equals($Path, [StringComparison]::Ordinal)) {
       return $true
     }
+    # Android may canonicalize /data/user/0/<pkg> to its /data/data/<pkg>
+    # symlink when the dynamic linker records the mapping in /proc/<pid>/maps.
+    $dataUserPrefix = "/data/user/0/$script:Package/"
+    $dataDataPrefix = "/data/data/$script:Package/"
+    if ($Path.StartsWith($dataUserPrefix, [StringComparison]::Ordinal) -and
+        $mappedPath.Equals($dataDataPrefix + $Path.Substring($dataUserPrefix.Length), [StringComparison]::Ordinal)) {
+      return $true
+    }
   }
   return $false
 }
@@ -401,12 +409,6 @@ try {
   $installedApkFingerprint = Get-InstalledApkFingerprint -PackageDump $packageDump.Text
   if ($installedApkFingerprint -ne $deployment.InstalledApkFingerprint) {
     throw "Installed APK filesystem identity changed after app-private SO staging. Run <Space>uq again before launching."
-  }
-  $apiLevel = (Invoke-Adb -Arguments @(
-    "shell", "getprop", "ro.build.version.sdk"
-  )).Text.Trim()
-  if ($apiLevel -ne "34") {
-    throw "App-private startup-agent launch is verified only for Android API 34; device reports API $apiLevel."
   }
   $abiList = (Invoke-Adb -Arguments @(
     "shell", "getprop", "ro.product.cpu.abilist"

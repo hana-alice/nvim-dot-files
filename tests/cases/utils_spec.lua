@@ -25,6 +25,17 @@ t.describe("utils.code_search", function()
     t.assert_false(res, "不存在索引应判 false")
   end)
 
+  t.it("csearch literal 只转义 RE2 元字符，不污染 slash/hyphen/percent", function()
+    local escape = cs._escape_re2_literal_for_test
+    t.assert_type(escape, "function")
+    t.assert_eq(escape("."), "\\.")
+    t.assert_eq(escape("/"), "/")
+    t.assert_eq(escape("-"), "-")
+    t.assert_eq(escape("%"), "%")
+    t.assert_eq(escape("[a-z]+(x)?"), "\\[a-z\\]\\+\\(x\\)\\?")
+    t.assert_eq(escape("a\\b"), "a\\\\b")
+  end)
+
   t.it("staged csearch.idx~~ 有效而 csearch.idx 为空时自动恢复", function()
     local dir = vim.fn.tempname():gsub("\\", "/")
     vim.fn.mkdir(dir, "p")
@@ -258,7 +269,7 @@ end)
 t.describe("utils.ue_goto 子模块", function()
   for _, sub in ipairs({
     "jumper", "provider", "location", "symbol", "cache",
-    "semantic_context", "semantic_protocol", "semantic_client", "semantic_sidecar",
+    "semantic_context", "semantic_protocol", "semantic_client", "semantic_navigation", "semantic_sidecar",
   }) do
     t.it("utils.ue_goto." .. sub .. " 返回 table", function()
       t.assert_type(require("utils.ue_goto." .. sub), "table")

@@ -2,23 +2,9 @@
 -- ============================================================================
 -- gd orchestrator.
 --
--- C/C++ is an isolated semantic-authority path. Source TUs must be proven by
--- the active compilation database before one precise clangd request is
--- accepted. Headers are evaluated by libclang inside an inherited or
--- build-proven source TU; a cross-TU clangd definition is accepted only when
--- clangd exposes the exact same canonical USR as libclang. No C++ result is
--- selected by symbol cache, arity, ranking, csearch, GTAGS, workspace symbol,
--- or first-candidate ordering.
---
--- The legacy cache -> LSP -> csearch -> GTAGS chain below is retained only
--- for non-C++ compatibility and explicit reference/search surfaces.
---
--- Public surface (CALL-SITE COMPATIBLE):
---   M.definition()   gd entry
---   M.references()   <leader>gr / kept verbatim
---   M.status()       :UEDefStatus diagnostic
---   M.dump_trace()   :UEDefTrace dump ring buffer
---   M.self_test()    :UEDefSelfTest
+-- C/C++ is delegated to utils.ue_goto.semantic_navigation. This file keeps
+-- public commands/API, trace plumbing, jump helpers, and the non-C++
+-- compatibility chain (cache -> LSP -> csearch -> GTAGS).
 -- ============================================================================
 
 local M = {}
@@ -31,22 +17,18 @@ local jumper       = require("utils.ue_goto.jumper")
 local cache        = require("utils.ue_goto.cache")
 local csearch_fb   = require("utils.ue_goto.csearch_fallback")
 local semantic     = require("utils.ue_goto.semantic_client")
+local semantic_nav = require("utils.ue_goto.semantic_navigation")
 
--- ---------------------------------------------------------------------------
--- Tunables
--- ---------------------------------------------------------------------------
 local LSP_PROGRESS_NOTICE_MS = 600
 local OVERALL_TIMEOUT_MS     = 30000
 local CSEARCH_TIMEOUT_MS     = 4000
 
--- ---------------------------------------------------------------------------
--- Persistent debug ring-buffer.
--- ---------------------------------------------------------------------------
 local MODULE_REVISION = "contextual-clang-v2"
 local TRACE_MAX = 200
 local trace_ring = {}
 local trace_idx = 0
-local DISK_LOG = vim.fn.stdpath("cache") .. "/ue_def_trace.log"
+local DISK_LOG = vim.fn.stdpath("cache") .. ("/ue_def_trace.%d.log"):format(vim.fn.getpid())
+
 pcall(function()
   local f = io.open(DISK_LOG, "w")
   if f then
@@ -55,6 +37,7 @@ pcall(function()
     f:close()
   end
 end)
+
 local function dtrace(fmt, ...)
   trace_idx = trace_idx + 1
   local line = string.format("[%s #%d] " .. fmt, os.date("%H:%M:%S"), trace_idx, ...)
@@ -64,6 +47,7 @@ local function dtrace(fmt, ...)
     if f then f:write(line .. "\n"); f:close() end
   end)
 end
+
 M._dtrace = dtrace
 M.MODULE_REVISION = MODULE_REVISION
 
@@ -86,7 +70,6 @@ function M.dump_trace()
   vim.bo.swapfile = false
   vim.api.nvim_buf_set_name(0, "UEDefTrace")
 end
-vim.api.nvim_create_user_command("UEDefTrace", function() M.dump_trace() end, {})
 
 function M.self_test()
   local checks = {
@@ -98,6 +81,8 @@ function M.self_test()
     { "location",      pcall(require, "utils.ue_goto.location") },
     { "ui",            pcall(require, "utils.ue_goto.ui") },
     { "semantic",      pcall(require, "utils.ue_goto.semantic_client") },
+    { "semantic_nav",  pcall(require, "utils.ue_goto.semantic_navigation") },
+    { "transaction",   pcall(require, "utils.ue_goto.semantic_transaction") },
   }
   local lines = { "=== UEDefSelfTest  module_rev=" .. MODULE_REVISION }
   local all_ok = true
@@ -110,9 +95,7 @@ function M.self_test()
   for _, l in ipairs(lines) do print(l) end
   return all_ok
 end
-vim.api.nvim_create_user_command("UEDefSelfTest", function() M.self_test() end, {})
 
--- :UEDefReload — drop ue_goto bytecode + utils.lsp_fallback, re-require.
 local function reload_ue_def()
   local dropped = {}
   for k in pairs(package.loaded) do
@@ -133,11 +116,13 @@ local function reload_ue_def()
     print("FAIL re-require: " .. tostring(fresh))
   end
 end
+
+vim.api.nvim_create_user_command("UEDefTrace", function() M.dump_trace() end, {})
+vim.api.nvim_create_user_command("UEDefSelfTest", function() M.self_test() end, {})
 vim.api.nvim_create_user_command("UEDefReload", reload_ue_def, {
   desc = "Hot-reload ue_goto/lsp_fallback modules + run self-test",
 })
 
--- :UEDefDiag — cursor context + last 40 trace entries.
 vim.api.nvim_create_user_command("UEDefDiag", function()
   local sym  = symbol_mod.current_symbol()
   local recv = symbol_mod.current_receiver()
@@ -153,7 +138,6 @@ vim.api.nvim_create_user_command("UEDefDiag", function()
     tostring(at_def), tostring(dk), tostring(dn)))
   print(string.format("dependent: %s (root=%s chain=%s)",
     tostring(dep), tostring(droot), tostring(dchain)))
-  -- cache stats
   local ok, st = pcall(cache.stats, 0)
   if ok and st then
     print(string.format("cache:  entries=%d project=%s",
@@ -170,7 +154,6 @@ vim.api.nvim_create_user_command("UEDefDiag", function()
   for _, l in ipairs(lines) do print(l) end
 end, { desc = "Diagnose stuck gd: cursor context + last 40 trace lines" })
 
--- :UEDefCacheClear — drop the entire on-disk + memory cache for current project.
 vim.api.nvim_create_user_command("UEDefCacheClear", function()
   if cache.clear then
     local ok, msg = pcall(cache.clear, 0)
@@ -195,15 +178,8 @@ vim.api.nvim_create_user_command("UEDefContextClear", function()
     vim.log.levels.INFO, { title = "C++ definition", timeout = 2500 })
 end, { desc = "Forget inherited/selected C++ translation-unit contexts" })
 
--- ---------------------------------------------------------------------------
--- Internal helpers
--- ---------------------------------------------------------------------------
-
--- Wrap jumper.jump with the dtrace-friendly reassert hook.
 local function jump_to_location(location)
   if not location then return false end
-  -- Pre-jump trace: where we are + where we're aiming. Knowing the source
-  -- file/line in the trace makes "wrong-place" reports trivial to triage.
   local pre_name = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(0), ":t")
   local pre_pos = vim.api.nvim_win_get_cursor(0)
   local cw = vim.fn.expand("<cword>")
@@ -227,9 +203,9 @@ local function jump_to_location(location)
   end
   return ok
 end
-M._test_jump_to_location = jump_to_location  -- regression tests
 
--- Format a one-line "✓ sym → file:line (tag)" status string.
+M._test_jump_to_location = jump_to_location
+
 local function format_jump_msg(sym, loc, tag, n_more)
   local p = location_mod.location_path(loc)
   local short = p:match("([^/\\]+)$") or "?"
@@ -240,264 +216,13 @@ local function format_jump_msg(sym, loc, tag, n_more)
   return string.format("✓ %s → %s (%s)", sym or "?", label, tag)
 end
 
--- C/C++ gd has a separate authority contract: only the compiler-owned
--- semantic identity for the exact position may drive a jump.  The legacy
--- cache/csearch/GTAGS chain below remains solely for non-C++ compatibility.
-local CPP_SOURCE_EXTS = {
-  c = true, cc = true, cpp = true, cxx = true, m = true, mm = true,
-}
-local CPP_HEADER_EXTS = {
-  h = true, hh = true, hpp = true, hxx = true, inl = true, ipp = true,
-  ixx = true,
-}
+local navigation = semantic_nav.install(M, {
+  dtrace = dtrace,
+  jump_to_location = jump_to_location,
+  format_jump_msg = format_jump_msg,
+})
 
-local function semantic_location(value)
-  if type(value) ~= "table" then return nil end
-  if value.uri and (value.range or value.targetSelectionRange or value.targetRange) then
-    return value
-  end
-  local path = value.path or value.file or value.filename
-  local line = tonumber(value.line)
-  local column = tonumber(value.column or value.col or 1)
-  if not path or not line then return nil end
-  return {
-    uri = vim.uri_from_fname(path),
-    range = {
-      start = { line = math.max(0, line - 1), character = math.max(0, column - 1) },
-      ["end"] = { line = math.max(0, line - 1), character = math.max(0, column - 1) },
-    },
-  }
-end
-
-local function location_is_on_line(location, path, line)
-  if not location or not path or not line then return false end
-  local target_path = location_mod.normalize_path(
-    location_mod.location_path(location)):lower()
-  return target_path == location_mod.normalize_path(path):lower()
-    and location_mod.location_line(location) == line
-end
-
-local function without_semantic_declaration(locations, declaration, ref_file, ref_line)
-  local declaration_path = declaration and location_mod.location_path(declaration) or nil
-  local declaration_line = declaration and location_mod.location_line(declaration) or nil
-  local out = {}
-  for _, location in ipairs(locations or {}) do
-    if not location_is_on_line(location, ref_file, ref_line)
-      and not location_is_on_line(location, declaration_path, declaration_line)
-    then
-      out[#out + 1] = location
-    end
-  end
-  return out
-end
-
-local function semantic_terminal_notice(sym, status, reason)
-  vim.notify(string.format("C++ definition %s%s%s",
-    tostring(status or "unavailable"),
-    sym and sym ~= "" and (" for `" .. sym .. "`") or "",
-    reason and reason ~= "" and (": " .. tostring(reason)) or ""),
-    status == "unavailable" and vim.log.levels.WARN or vim.log.levels.INFO,
-    { title = "C++ definition", timeout = 5000 })
-end
-
-local function setup_semantic_trace()
-  semantic.set_trace(function(fields)
-    dtrace(
-      "semantic event=%s request=%s context=%s provider=%s usr=%s state=%s elapsed=%s stale=%s",
-      tostring(fields.event or "?"), tostring(fields.request_id or "?"),
-      tostring(fields.context_id or "?"), tostring(fields.provider or "?"),
-      tostring(fields.usr or "?"), tostring(fields.terminal_state or "?"),
-      tostring(fields.elapsed_ms or "?"), tostring(fields.stale_reason or "?"))
-  end)
-end
-
-local function cpp_definition(sym, bufnr, ref_file, ext)
-  setup_semantic_trace()
-  local snapshot = semantic.begin_action(bufnr)
-  local environment, env_err = semantic.discover_toolchain(bufnr)
-  if not environment then
-    dtrace("semantic state=unavailable reason=toolchain-or-context")
-    semantic_terminal_notice(sym, "unavailable", env_err)
-    return
-  end
-
-  if CPP_HEADER_EXTS[ext] then
-    semantic.resolve_header({
-      snapshot = snapshot,
-      environment = environment,
-      header = ref_file,
-      line = snapshot.cursor[1],
-      column = snapshot.cursor[2] + 1,
-    }, function(response, stale_reason)
-      if not response then
-        if stale_reason then
-          dtrace("semantic provider=libclang state=stale reason=%s", stale_reason)
-        end
-        return
-      end
-      if response.state ~= "resolved" then return end
-      local definition = semantic_location(response.definition)
-      local declaration = semantic_location(response.declaration)
-      if definition then
-        if jump_to_location(definition) then
-          vim.notify(format_jump_msg(sym, definition, "libclang·USR"), vim.log.levels.INFO,
-            { title = "C++ definition", timeout = 3000 })
-        end
-        return
-      end
-      if not declaration then
-        semantic_terminal_notice(sym, "invalid-semantic-context",
-          "resolved response has no location")
-        return
-      end
-
-      local function declaration_or_notice(status, reason)
-        if not location_is_on_line(declaration, ref_file, snapshot.cursor[1])
-          and jump_to_location(declaration)
-        then
-          dtrace("semantic provider=libclang usr=%s state=resolved target=declaration",
-            tostring(response.usr or "?"))
-          vim.notify(format_jump_msg(sym, declaration, "libclang·declaration"),
-            vim.log.levels.INFO, { title = "C++ definition", timeout = 3000 })
-          return
-        end
-        semantic_terminal_notice(sym, status, reason)
-      end
-
-      local authoritative_usr = response.usr
-      if type(authoritative_usr) ~= "string" or authoritative_usr == "" then
-        declaration_or_notice("invalid-semantic-context",
-          "libclang resolved a declaration without a canonical USR")
-        return
-      end
-
-      -- clang_getCursorDefinition only searches the origin TU AST.  An
-      -- out-of-line body in another TU is therefore absent even though the
-      -- declaration's canonical identity is known.  clangd owns the project
-      -- index, so it may supply the cross-TU location, but only after its
-      -- exact-cursor USR proves it is talking about the same entity.
-      dtrace("semantic provider=clangd request=symbolInfo context=header-cross-tu usr=%s",
-        authoritative_usr)
-      provider.async_clangd_symbol_info(bufnr, function(clangd_usr, clangd_client_ids)
-        local identity_current, identity_stale = semantic.snapshot_is_current(snapshot)
-        if not identity_current then
-          dtrace("semantic provider=clangd state=stale reason=%s", identity_stale)
-          return
-        end
-        if clangd_usr ~= authoritative_usr then
-          dtrace("semantic provider=clangd state=invalid-semantic-context usr-mismatch=%s/%s",
-            tostring(authoritative_usr), tostring(clangd_usr))
-          declaration_or_notice("invalid-semantic-context",
-            clangd_usr and "clangd and libclang disagree on the canonical USR"
-              or "clangd did not expose one compiler-owned USR for this declaration")
-          return
-        end
-
-        provider.async_lsp_request(bufnr, "textDocument/definition", function(locations)
-          local still_current, reason = semantic.snapshot_is_current(snapshot)
-          if not still_current then
-            dtrace("semantic provider=clangd state=stale reason=%s", reason)
-            return
-          end
-          locations = location_mod.dedup_locations(locations or {})
-          locations = without_semantic_declaration(
-            locations, declaration, ref_file, snapshot.cursor[1])
-          if #locations ~= 1 then
-            dtrace("semantic provider=clangd state=invalid-semantic-context n=%d usr=%s",
-              #locations, authoritative_usr)
-            declaration_or_notice("unavailable",
-              #locations == 0 and "no cross-TU definition exists in the clangd index"
-                or ("clangd returned " .. tostring(#locations)
-                  .. " cross-TU definitions for the same USR"))
-            return
-          end
-          if jump_to_location(locations[1]) then
-            dtrace("semantic provider=clangd usr=%s state=resolved target=cross-tu-definition",
-              authoritative_usr)
-            vim.notify(format_jump_msg(sym, locations[1], "clangd·USR-verified"),
-              vim.log.levels.INFO, { title = "C++ definition", timeout = 3000 })
-          end
-        end, { client_ids = clangd_client_ids })
-      end)
-    end)
-    return
-  end
-
-  -- A clangd attachment is not proof that a source file is covered by the
-  -- active CDB: clangd can silently use a fallback command.  Ask the sidecar
-  -- to prove the exact compile command before accepting clangd's response.
-  semantic.prove_source({
-    source = ref_file,
-    environment = environment,
-    snapshot = snapshot,
-    line = snapshot.cursor[1],
-    column = snapshot.cursor[2] + 1,
-  }, function(proof)
-    local current, stale_reason = semantic.snapshot_is_current(snapshot, proof)
-    if not current then
-      dtrace("semantic provider=clangd state=stale reason=%s", stale_reason)
-      return
-    end
-    if not proof or proof.state ~= "resolved" then
-      semantic_terminal_notice(sym, proof and proof.state or "unavailable",
-        proof and proof.reason or "source TU has no proven active compile command")
-      return
-    end
-    local clients = vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/definition" })
-    if not clients or vim.tbl_isempty(clients) then
-      semantic_terminal_notice(sym, "unavailable", "clangd definition provider unavailable")
-      return
-    end
-    dtrace("semantic provider=clangd request=symbolInfo+definition context=%s",
-      tostring(proof.context_id or "?"))
-    provider.async_clangd_symbol_info(bufnr, function(usr, clangd_client_ids)
-      local identity_current, identity_stale = semantic.snapshot_is_current(snapshot)
-      if not identity_current then
-        dtrace("semantic provider=clangd state=stale reason=%s", identity_stale)
-        return
-      end
-      if not usr then
-        semantic_terminal_notice(sym, "invalid-semantic-context",
-          "clangd did not expose one compiler-owned USR for this position")
-        dtrace("semantic provider=clangd context=%s state=invalid-semantic-context usr=missing",
-          tostring(proof.context_id or "?"))
-        return
-      end
-      provider.async_lsp_request(bufnr, "textDocument/definition", function(locs)
-      local still_current, reason = semantic.snapshot_is_current(snapshot)
-      if not still_current then
-        dtrace("semantic provider=clangd state=stale reason=%s", reason)
-        return
-      end
-      locs = location_mod.dedup_locations(locs or {})
-      if #locs ~= 1 then
-        semantic_terminal_notice(sym, "invalid-semantic-context",
-          #locs == 0 and "clangd returned no semantic target"
-            or ("clangd returned " .. tostring(#locs) .. " targets"))
-        dtrace("semantic provider=clangd state=invalid-semantic-context n=%d", #locs)
-        return
-      end
-      local target_path = location_mod.location_path(locs[1]):lower()
-      if CPP_HEADER_EXTS[target_path:match("%.([^./\\]+)$") or ""] then
-        if proof.origin_context then
-          semantic.note_origin(snapshot.winid, proof.origin_context,
-            environment.build_fingerprint)
-        end
-      end
-      if jump_to_location(locs[1]) then
-        dtrace("semantic provider=clangd context=%s usr=%s state=resolved",
-          tostring(proof.context_id or "?"), tostring(usr))
-        vim.notify(format_jump_msg(sym, locs[1], "clangd·semantic"), vim.log.levels.INFO,
-          { title = "C++ definition", timeout = 3000 })
-      end
-      end, { client_ids = clangd_client_ids })
-    end)
-  end)
-end
-
--- ---------------------------------------------------------------------------
--- M.definition — gd entry.
--- ---------------------------------------------------------------------------
+vim.api.nvim_create_user_command("UEDefExplain", function() M.explain() end, {})
 
 local request_token = 0
 
@@ -512,12 +237,11 @@ function M.definition()
     vim.fn.fnamemodify(ref_file, ":t"), ref_line)
 
   local ext = ui.buf_extension(bufnr)
-  if CPP_SOURCE_EXTS[ext] or CPP_HEADER_EXTS[ext] then
-    cpp_definition(sym, bufnr, ref_file, ext)
+  if navigation.CPP_SOURCE_EXTS[ext] or navigation.CPP_HEADER_EXTS[ext] then
+    navigation.cpp_definition(sym, bufnr, ref_file, ext)
     return
   end
 
-  -- Early bail #1: cursor sits ON the definition site itself.
   local at_def, def_kind, def_name = symbol_mod.is_at_definition_at_cursor()
   if at_def then
     vim.notify(string.format("● already at %s definition of `%s`",
@@ -526,7 +250,6 @@ function M.definition()
     return
   end
 
-  -- Early bail #2: dependent name rooted at template parameter.
   local dep, dep_root, dep_chain = symbol_mod.is_dependent_at_cursor()
   if dep then
     vim.notify(string.format(
@@ -536,9 +259,6 @@ function M.definition()
     return
   end
 
-  -- Early bail #3: cursor inside a syntactic dead-zone (comment / string /
-  -- number / char literal). LSP cannot resolve these and would otherwise
-  -- spend a 30s timeout returning empty. Toast + bail.
   local in_dead, dead_kind = symbol_mod.is_in_unresolvable_context_at_cursor()
   if in_dead then
     dtrace("dead-zone bail: kind=%s", tostring(dead_kind))
@@ -567,6 +287,7 @@ function M.definition()
     if notice then pcall(notice.clear); notice = nil end
     if M._active_notice then M._active_notice = nil end
   end
+
   local function done(success_msg, lifetime_ms)
     resolved = true
     clear_notice()
@@ -576,12 +297,10 @@ function M.definition()
     end
   end
 
-  -- ----- cache short-circuit -------------------------------------------------
   local ch_locs, ch_key, ch_source = cache.get(sym, receiver, bufnr)
   if ch_locs and #ch_locs > 0 then
     dtrace("cache HIT key=%q source=%s n=%d",
       tostring(ch_key), tostring(ch_source), #ch_locs)
-    -- Stamp transient fields so downstream debug shows the right name.
     ch_locs[1]._origin_cword = sym
     ch_locs[1]._sym_name     = sym
     if jump_to_location(ch_locs[1]) then
@@ -593,7 +312,6 @@ function M.definition()
     dtrace("cache: jump failed; proceeding to live resolve")
   end
 
-  -- ----- non-clangd ext (shaders, Build.cs, Python) -> GTAGS direct ----------
   if ui.NON_CLANGD_EXTS[ext] then
     dtrace("non-clangd ext=%s -> GTAGS direct", tostring(ext))
     provider.gtags_fallback_async(sym, function(ok)
@@ -608,14 +326,12 @@ function M.definition()
 
   local has_def_client = #vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/definition" }) > 0
 
-  -- Spinner: only show after 600ms so fast precise / cache hits don't flash.
   vim.defer_fn(function()
     if not still_current() or resolved or jumped then return end
     notice = ui.progress_notice(string.format("⏳ resolving %s ...", sym or "?"))
     M._active_notice = notice
   end, LSP_PROGRESS_NOTICE_MS)
 
-  -- Hard timeout: 30s ceiling.
   vim.defer_fn(function()
     if not still_current() or resolved then return end
     done()
@@ -625,10 +341,6 @@ function M.definition()
     end
   end, OVERALL_TIMEOUT_MS)
 
-  -- ----- the cache+csearch fallback chain ------------------------------------
-  -- Tried in order when path-A returns empty:
-  --   (1) csearch_fb.find  (RE2 def-shaped pattern, scored)
-  --   (2) provider.gtags_fallback_async  (jumps internally)
   local function csearch_then_gtags()
     if jumped or resolved then return end
     dtrace("path-B: csearch dispatch sym=%q recv=%q", sym, tostring(receiver))
@@ -654,7 +366,6 @@ function M.definition()
         dtrace("path-B: csearch jump failed; falling through to GTAGS")
       end
 
-      -- csearch empty or jump failed -> GTAGS (last resort).
       provider.gtags_fallback_async(sym, function(g_jumped)
         if not still_current() or resolved then clear_notice(); return end
         if g_jumped then
@@ -676,57 +387,38 @@ function M.definition()
     return
   end
 
-  -- ----- path-A: textDocument/definition -------------------------------------
   dtrace("path-A: dispatching textDocument/definition")
-  provider.async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_current,
-    function(locs)
-      if not still_current() then clear_notice(); return end
-      dtrace("path-A: back n=%d", locs and #locs or 0)
+  provider.async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_current, function(locs)
+    if not still_current() then clear_notice(); return end
+    dtrace("path-A: back n=%d", locs and #locs or 0)
 
-      if not locs or #locs == 0 then
-        csearch_then_gtags()
-        return
-      end
+    if not locs or #locs == 0 then
+      csearch_then_gtags()
+      return
+    end
 
-      -- N>=1 — pick first (locations from clangd are ordered: definition
-      -- before declaration). On N>1 (overloads / virtuals), present a picker.
-      if #locs == 1 then
-        locs[1]._origin_cword = sym
-        locs[1]._sym_name     = sym
-        if jump_to_location(locs[1]) then
-          jumped = true
-          cache.put(sym, receiver, locs, "lsp", bufnr)
-          done(format_jump_msg(sym, locs[1], "precise"), 3000)
-          return
-        end
-        -- jump failed -> path-B
-        csearch_then_gtags()
-        return
-      end
-
-      -- N>1 candidates -> picker UI. User selects → ui.try_jump executes
-      -- the jump itself; if successful, write the *picked* location back
-      -- to cache (we don't know which one until the picker finishes, so
-      -- ui.try_jump's outcome is "true"/"open_failed" but doesn't return
-      -- the chosen location). We fallback to caching the entire candidate
-      -- set under the same keys; cache.get's first-element semantics will
-      -- replay locs[1] which may not be what the user picked. To avoid
-      -- that footgun, we DON'T cache when N>1 — wait for an unambiguous
-      -- next gd to record the right answer.
-      local outcome = ui.try_jump(locs, "LSP definitions")
-      if outcome == true or outcome == "open_failed" then
+    if #locs == 1 then
+      locs[1]._origin_cword = sym
+      locs[1]._sym_name     = sym
+      if jump_to_location(locs[1]) then
         jumped = true
-        done(format_jump_msg(sym, locs[1], "precise·picker", #locs), 3000)
-      else
-        -- picker dismissed without a selection
-        done()
+        cache.put(sym, receiver, locs, "lsp", bufnr)
+        done(format_jump_msg(sym, locs[1], "precise"), 3000)
+        return
       end
-    end)
-end
+      csearch_then_gtags()
+      return
+    end
 
--- ---------------------------------------------------------------------------
--- M.status
--- ---------------------------------------------------------------------------
+    local outcome = ui.try_jump(locs, "LSP definitions")
+    if outcome == true or outcome == "open_failed" then
+      jumped = true
+      done(format_jump_msg(sym, locs[1], "precise·picker", #locs), 3000)
+    else
+      done()
+    end
+  end)
+end
 
 function M.status()
   local bufnr = vim.api.nvim_get_current_buf()
@@ -762,10 +454,6 @@ function M.status()
     tostring(semantic_status.tu_count or "?"), tostring(semantic_status.last_state or "?")))
   vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO, { title = "LSP fallback status" })
 end
-
--- ---------------------------------------------------------------------------
--- M.references — sync, qf-only. Unchanged from prior implementation.
--- ---------------------------------------------------------------------------
 
 function M.references()
   local sym = symbol_mod.current_symbol()

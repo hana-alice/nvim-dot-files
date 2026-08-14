@@ -48,17 +48,13 @@ t.describe("ue.resolve_context project selection", function()
     write_file(new_uproject, "{}")
     write_file(old_source, "int OldProjectFile;")
 
-    ue.update_state_field(engine, "engine_root", engine)
-    ue.update_state_field(engine, "project_root", new_project)
-    ue.update_state_field(engine, "uproject", new_uproject)
+    assert(require("ue.project_state").select(engine, new_project, new_uproject))
 
     local ok, err = pcall(function()
       vim.cmd("cd " .. vim.fn.fnameescape(engine))
       local actual_engine = vim.uv.cwd():gsub("\\", "/")
       if actual_engine ~= engine then
-        ue.update_state_field(actual_engine, "engine_root", actual_engine)
-        ue.update_state_field(actual_engine, "project_root", new_project)
-        ue.update_state_field(actual_engine, "uproject", new_uproject)
+        assert(require("ue.project_state").select(actual_engine, new_project, new_uproject))
       end
       test_buf = vim.api.nvim_create_buf(true, false)
       vim.api.nvim_buf_set_name(test_buf, old_source)

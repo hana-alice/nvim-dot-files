@@ -54,6 +54,17 @@ t.describe("keymaps: leader 代表键", function()
     return m and (m.rhs or "") or nil
   end
 
+  t.it("<leader>? → UECheatsheet（可搜索快捷键帮助）", function()
+    local r = rhs_of("n", "<leader>?")
+    t.assert_true(r ~= nil, "<leader>? 未绑定")
+    t.assert_contains(r, "UECheatsheet")
+  end)
+  t.it("<leader>uW → WindowTitle（命名系统窗口）", function()
+    local r = rhs_of("n", "<leader>uW")
+    t.assert_true(r ~= nil, "<leader>uW 未绑定")
+    t.assert_contains(r, "WindowTitle")
+  end)
+
   t.it("<leader>db → UEDAPToggleBreakpoint", function()
     local r = rhs_of("n", "<leader>db")
     t.assert_true(r ~= nil, "<leader>db 未绑定")

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """
-build_clangd_index.py - 为 clangd 离线预建索引（hot/current 子集专用）
+build_clangd_index.py - 为 clangd 生成受控 BackgroundIndex CDB 或 legacy .idx
 
 NOTE: 这个脚本现在**只服务 :UEIndexHot / :UEIndexCurrent**，输入是
 per-file 的小子集 CDB（几百到几千 TU）。:UEIndexFull 走 build_full_cdb.py
-（rsp + inject + super-unity sidecar + clangd-indexer 一条龙）。
+（rsp + inject + compiler-authored UBT unity wrappers + controlled
+BackgroundIndex/clangd-indexer 一条龙）。
 
-使用 clangd-indexer 预先索引所有 TU，生成 .idx 文件。
-配合 .clangd 的 Index.External.File 或 clangd-index-server 使用，
-可跳过后台索引，大幅加速 clangd 启动体验。
+默认仍可生成旧的 clangd-indexer `.idx`。传入
+`--background-output` 时改为输出“compiler-authored UBT unity wrappers +
+exact per-file fallback”的受控 CDB，交给 clangd 自己的 BackgroundIndex
+生成 shard。这是跨 TU 函数体定义的权威路径；
+clangd 22 的 monolithic External.File 在实测中只返回头文件声明。
 
 流程:
   1. 读取 compile_commands.json（已 inject 过 -D 的 per-file 子集）
@@ -87,12 +90,13 @@ def main():
                         help="Path to clangd-indexer executable")
     parser.add_argument("--output", "-o", default=None,
                         help="Output .idx file path")
+    parser.add_argument("--background-output", default=None,
+                        help="Write the controlled BackgroundIndex CDB here and write a "
+                             "small marker to --output; do not run indexer")
     parser.add_argument("--no-super-unity", action="store_true",
-                        help="Disable super-unity collapse (per-file mode, "
-                             "~20x slower; only use for debugging). When "
-                             "enabled (default), per-file CDB is collapsed "
-                             "to ~13-50 SuperUnity.<pch>.<N>.cpp before "
-                             "running clangd-indexer.")
+                        help="Disable compiler-authored unity wrapping and keep "
+                             "the subset in exact per-file form. Only use for "
+                             "debugging controlled BackgroundIndex behavior.")
     args = parser.parse_args()
 
     cdb_path = os.path.abspath(args.compile_commands)
@@ -100,12 +104,15 @@ def main():
         print(f"ERROR: {cdb_path} not found", file=sys.stderr)
         return 1
 
-    # Find tools
-    indexer = args.indexer or find_clangd_indexer()
-    if not indexer:
-        print("ERROR: clangd-indexer not found. Install from:", file=sys.stderr)
-        print("  https://github.com/clangd/clangd/releases", file=sys.stderr)
-        return 1
+    # The controlled BackgroundIndex route deliberately does not use
+    # clangd-indexer. Resolve it only for the legacy .idx mode.
+    indexer = None
+    if not args.background_output:
+        indexer = args.indexer or find_clangd_indexer()
+        if not indexer:
+            print("ERROR: clangd-indexer not found. Install from:", file=sys.stderr)
+            print("  https://github.com/clangd/clangd/releases", file=sys.stderr)
+            return 1
 
     project_root = detect_project_root(cdb_path)
 
@@ -130,14 +137,16 @@ def main():
     print(f"compile_commands.json: {len(cdb)} entries")
     print(f"Project root: {project_root}")
     print(f"Output: {idx_path}")
-    print(f"Indexer: {indexer}")
+    print(f"Mode: {'controlled-background' if args.background_output else 'legacy-idx'}")
+    if indexer:
+        print(f"Indexer: {indexer}")
 
     # NOTE: previously this script supported --use-unity / --use-super-unity
     # to convert the per-file CDB into Module.<X>.cpp / SuperUnity.<PCH>.<N>.cpp
-    # super-TUs in-process. Those code paths now live in build_full_cdb.py
+    # wrapper TUs in-process. Those code paths now live in build_full_cdb.py
     # (which is the single entry for :UEIndexFull). This script is now reserved
-    # for hot/current phases — small per-module subsets that don't benefit from
-    # super-unity grouping.
+    # for hot/current phases — small per-module subsets whose controlled
+    # BackgroundIndex wrapping is delegated to build_hot_super_unity_cdb.py.
 
     # CRITICAL: Inject Definitions.<Module>.h #defines as explicit -D into CDB.
     # clangd-indexer's disableUnsupportedOptions() strips -include-pch, which
@@ -145,13 +154,13 @@ def main():
     # produces a useless index. We expand the .h file's #defines into -D args
     # so the indexer sees the macros without needing PCH support.
     #
-    # ORDER MATTERS: inject MUST run BEFORE super-unity. Inject's
+    # ORDER MATTERS: inject MUST run BEFORE compiler-authored unity wrapping. Inject's
     # get_module_from_filepath only understands `Module.<X>.cpp` paths; the
-    # synthetic `SuperUnity.<PCH>.<N>.cpp` files super-unity emits would all
+    # wrapper `SuperUnity.<PCH>.<N>.cpp` files emitted later would all
     # return None → 0 -D injected → indexer hits #error on every TU. By
-    # injecting first, super-unity's per-chunk -I/-D/-U union (see
+    # injecting first, the wrapper step's per-chunk -I/-D/-U union (see
     # build_super_unity_cdb.py) then carries the per-module DLLEXPORT macros
-    # into each super-TU.
+    # into each wrapper TU.
     inject_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inject_definitions_to_cdb.py")
     if os.path.isfile(inject_script):
         print("\n[inject] Injecting Definitions.h #defines into CDB...")
@@ -181,20 +190,18 @@ def main():
     shutil.copyfile(cdb_path, staged_cdb)
     print(f"  Staged subset CDB at: {staged_cdb}")
 
-    # Super-unity collapse: group per-file TUs by SharedPCH/PCH and emit
-    # SuperUnity.<pch>.<N>.cpp aggregators. ~20x speedup on hot subsets
-    # because each SharedPCH gets parsed once per chunk instead of once
-    # per TU. Verified 2026-05-18 on UE engine hot.json (2985 TU):
-    #     per-file path:    22 min  36 s, 98.5 MB idx
-    #     super-unity path:  1 min   9 s, 105.2 MB idx (+6.7% coverage)
-    # See build_hot_super_unity_cdb.py for grouping algorithm and pitfalls.
+    # Controlled BackgroundIndex wrapping: use compiler-authored active-build
+    # UBT unity groups when they can be proven against this subset CDB, and
+    # keep all unmatched files exact per-file. See
+    # build_hot_super_unity_cdb.py for the current grouping contract.
+    super_ready = False
     if not args.no_super_unity:
         super_script = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
             "build_hot_super_unity_cdb.py",
         )
         if os.path.isfile(super_script):
-            print("\n[super-unity] collapsing per-file → super-TUs...")
+            print("\n[background-cdb] wrapping compiler-authored unity groups...")
             super_cdb = os.path.join(stage_dir, "compile_commands.super.json")
             rc = subprocess.call([
                 sys.executable, "-I", super_script,
@@ -202,20 +209,66 @@ def main():
                 "--super-dir", os.path.join(stage_dir, "super_unity_cpps"),
             ])
             if rc == 0 and os.path.isfile(super_cdb):
-                # Swap the staged CDB for the super-unity one. clangd-indexer
-                # will then see only the SuperUnity.*.cpp TUs (each pulling
-                # in 50-80 real .cpps via #include) instead of every original
-                # per-file entry. Same symbol coverage, ~20x faster.
+                # Swap the staged CDB for the controlled BackgroundIndex one.
+                # The result contains wrapper entries only where active-build
+                # UBT unity evidence exists, and exact per-file entries
+                # everywhere else.
                 shutil.move(super_cdb, staged_cdb)
-                print(f"  swapped CDB → super-unity form")
+                print(f"  swapped CDB → controlled BackgroundIndex form")
+                super_ready = True
             else:
-                print(f"  WARN: super-unity step failed (rc={rc}), "
+                if args.background_output:
+                    print(f"  ERROR: controlled background requires compiler-authored unity output (rc={rc})",
+                          file=sys.stderr)
+                    return 1
+                print(f"  WARN: controlled background wrapping step failed (rc={rc}), "
                       f"falling back to per-file mode")
         else:
+            if args.background_output:
+                print(f"  ERROR: controlled background requires {super_script}", file=sys.stderr)
+                return 1
             print(f"  WARN: {super_script} not found, "
                   f"falling back to per-file mode")
     else:
-        print("\n[super-unity] disabled via --no-super-unity, per-file mode")
+        if args.background_output:
+            print("ERROR: --background-output cannot be combined with --no-super-unity",
+                  file=sys.stderr)
+            return 1
+        print("\n[background-cdb] compiler-authored unity wrapping disabled, per-file mode")
+
+    if args.background_output:
+        background_path = os.path.abspath(args.background_output)
+        os.makedirs(os.path.dirname(background_path), exist_ok=True)
+        with open(staged_cdb, "r", encoding="utf-8") as source:
+            background_cdb = json.load(source)
+        if not super_ready or not background_cdb or any(
+            not entry.get("file") or not isinstance(entry.get("arguments"), list)
+            for entry in background_cdb
+        ):
+            print("ERROR: refusing malformed controlled background CDB", file=sys.stderr)
+            return 1
+        background_tmp = background_path + f".tmp.{os.getpid()}"
+        with open(background_tmp, "w", encoding="utf-8", newline="\n") as target:
+            json.dump(background_cdb, target, ensure_ascii=False, separators=(",", ":"))
+        os.replace(background_tmp, background_path)
+
+        marker = {
+            "schema": 1,
+            "index_kind": "controlled-background",
+            "cdb_name": os.path.basename(background_path),
+            "entry_count": len(background_cdb),
+            "unity_entry_count": sum(
+                "super_unity_cpps" in str(entry.get("file", "")).replace("\\", "/")
+                for entry in background_cdb
+            ),
+        }
+        marker_tmp = idx_path + f".tmp.{os.getpid()}"
+        with open(marker_tmp, "w", encoding="utf-8", newline="\n") as target:
+            json.dump(marker, target, ensure_ascii=False, separators=(",", ":"))
+        os.replace(marker_tmp, idx_path)
+        print(f"\nControlled BackgroundIndex CDB: {background_path}")
+        print(f"  Controlled entries: {len(background_cdb)}")
+        return 0
 
     cmd = [indexer, "--executor=all-TUs"]
     # If user didn't specify --jobs, default to CPU count clamped to [8, 24].

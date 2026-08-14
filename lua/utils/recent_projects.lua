@@ -10,12 +10,14 @@
 -- (snacks accepts a static list, no fd scan, no git spawn — instant).
 
 local M = {}
+local file_lock = require("ue.file_lock")
 
 local MAX_ENTRIES = 50
 local MARKERS = { ".git", ".uproject", ".uplugin", "package.json", "Cargo.toml", "go.mod" }
 
 local function state_path()
-  return vim.fn.stdpath("state") .. "/recent_projects.txt"
+  return vim.env.NVIM_RECENT_PROJECTS_PATH
+    or (vim.fn.stdpath("state") .. "/recent_projects.txt")
 end
 
 local function read_lines(path)
@@ -27,7 +29,28 @@ end
 
 local function write_lines(path, lines)
   vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
-  vim.fn.writefile(lines, path)
+  local temp = path .. (".tmp.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
+  local ok, err = pcall(vim.fn.writefile, lines, temp)
+  if not ok then return false, err end
+  local renamed, rename_err = vim.uv.fs_rename(temp, path)
+  if not renamed then pcall(os.remove, temp); return false, rename_err end
+  return true
+end
+
+local function update_file(transform, attempt)
+  local path = state_path()
+  local lease = file_lock.acquire(path .. ".lock")
+  if not lease then
+    attempt = (attempt or 0) + 1
+    if attempt <= 5 then
+      vim.defer_fn(function() update_file(transform, attempt) end, attempt * 25)
+    end
+    return false
+  end
+  local ok, result = pcall(transform, read_lines(path))
+  if ok and type(result) == "table" then ok = write_lines(path, result) end
+  file_lock.release(lease)
+  return ok
 end
 
 local function normalize(p)
@@ -98,12 +121,20 @@ function M.bootstrap_from_oldfiles(max_files)
     end
   end
   if added > 0 then
-    -- Truncate before write
-    local trimmed = {}
-    for i = 1, math.min(#existing, MAX_ENTRIES) do
-      trimmed[i] = existing[i]
-    end
-    write_lines(state_path(), trimmed)
+    local discovered = vim.deepcopy(existing)
+    update_file(function(latest)
+      local merged, merged_seen = {}, {}
+      for _, source in ipairs({ latest, discovered }) do
+        for _, p in ipairs(source) do
+          p = normalize(vim.trim(p))
+          if p and not merged_seen[p] and #merged < MAX_ENTRIES then
+            merged_seen[p] = true
+            merged[#merged + 1] = p
+          end
+        end
+      end
+      return merged
+    end)
   end
   return added
 end
@@ -113,14 +144,14 @@ function M.record(path)
   if not root then
     return
   end
-  local current = M.list()
-  local new = { root }
-  for _, p in ipairs(current) do
-    if p ~= root and #new < MAX_ENTRIES then
-      table.insert(new, p)
+  update_file(function(current)
+    local new = { root }
+    for _, p in ipairs(current) do
+      p = normalize(vim.trim(p))
+      if p and p ~= root and #new < MAX_ENTRIES then table.insert(new, p) end
     end
-  end
-  write_lines(state_path(), new)
+    return new
+  end)
 end
 
 local function record_current()

@@ -300,7 +300,9 @@
   解决约束: 部署前必须校验源 SO 同目录 `packageInfo.txt` 与设备安装包的 package/versionCode。
   root 原地替换在不一致时继续拒绝；app-private agent 路径不修改 APK，versionCode 差异只作为明确
   警告，不能伪装成 Java/JNI 兼容证明。两条路径都只支持 native-only 迭代；涉及新 Java 方法、
-  manifest 或 Gradle 产物时，SO 注入本身无法让旧 APK 获得这些接口。
+  manifest 或 Gradle 产物时，SO 注入本身无法让旧 APK 获得这些接口。任务已声明 SO-only 时，
+  后续“重编/再试”仍只能解释为重编、部署 SO；基线不兼容是阻塞证据，不是擅自打包或安装 APK 的
+  授权。只有用户明确要求“打包/装包”时才能进入 `<Space>ui` 或等价 APK 安装流程。
   → `scripts/ue_android_so_deploy.ps1`; `openspec/specs/android-so-quick-deploy/spec.md`
 
 - **K45 — `Client` 是项目/Target 名，不是 Android 目录协议**
@@ -359,18 +361,19 @@
 
 ### 工具链 / LLVM
 
-- **K41 — 跨盘 project root 缺 `.clangd` → UEPrepare 后 clangd background-index 吃满 CPU/内存**
+- **K41 — 依赖路径向上发现的 `.clangd` / monolithic External index → 覆盖漂移与资源失控**
   症状: UEPrepare 重生成 CDB 后 clangd `-j=24` 高 CPU/内存常驻（历史同类症状 17GB/32min）；
-  `%LocalAppData%/clangd/index` 万级 shard 持续增长。
-  根因: `.clangd` 按源文件路径**向上查找**。engine root（D:）的 `.clangd` 覆盖不到
-  project（E:）侧 TU（本例 54% 的 CDB）——那半边没有 `Background: Skip`，每次 CDB 变
-  即全量后台索引。诊断要点: shard 回落目录位置——TU 在 compile-commands 目录内 →
-  `<root>/.cache/clangd/index`；外 → `%LocalAppData%/clangd/index`；后者暴涨 = 有一片
-  TU 未被任何 `.clangd` 覆盖。
-  解决: `sync_dot_clangd` 双写——engine root + 引擎树外的 project root 各一份 `.clangd`
-  （同一 active idx、mount 各自根、`Background: Skip`）；树内 project 跳过。
-  → `lua/ue.lua` `sync_one_dot_clangd` / `sync_dot_clangd`; `docs/changelog.md` 2026-07-24;
-    行为测 `tests/cases/ue_api_spec.lua`「sync_dot_clangd（跨盘 project root 双写）」
+  `%LocalAppData%/clangd/index` shard 无界增长，或 `gd` 只有正确 USR 却停在 declaration。
+  根因: `.clangd` 按源文件路径向上查找，跨根 TU 可漏掉 `Background: Skip`；另一方面，
+  真实实验已证明 `clangd-indexer` YAML 中存在 `.cpp` Definition 不等于 `External.File`
+  经 LSP 一定返回 body，不能把 binary index 当跨 TU definition authority。
+  解决: clangd 固定 `--enable-config=false`，不再写 `.clangd`、不传 `--index-file`；current/hot/full
+  发布带 generation/coverage manifest 的 controlled BackgroundIndex CDB，只接受
+  compiler-authored UBT unity membership 或 exact per-file fallback，并通过官方
+  `compilationDatabaseChanges` 注入打开文件 exact command。definition 的最终权威是
+  canonical USR + subject module AST 唯一 body，clangd 仅作 identity-verified secondary provider。
+  → `lua/ue.lua` `clangd_cmd`; `lua/ue/index/`; `lua/ue/clangd_commands.lua`;
+    `tests/cases/{ue_api,index_generation,cpp_semantic_index,clangd_commands}_spec.lua`
 
 - **K14 — LLVM 22.0–22.1.5 的 `lldb-dap.exe` 在 Windows 启动崩溃**
   症状: DAP client 一发 `initialize` 就 `STATUS_STACK_BUFFER_OVERRUN`(`0xC0000409`)。
@@ -441,14 +444,37 @@
   `_on_reassert` 钩子在跳完 ~10ms 后 verify 并必要时 reassert。
   → `docs/architecture-symbol-resolution.md` §6; commit `252e9e0`
 
-- **K42 — 裸 symbol / arity / standalone header 不能完成 C++ overload resolution**
+- **K42 — 裸 symbol / arity / standalone header / declaration-self 不能完成 C++ definition resolution**
   症状: 先解析无参 overload 后，按裸 symbol 缓存的 location 使另一个同名调用不请求
   clangd 就原地跳回 sibling；非自包含 UE header 的 standalone AST 同时出现
   `OverloadedDeclRef` / recovery，而真实 donor TU 能得到唯一 overload identity。
-  解决: C++ source 只接受 active-CDB clangd exact-cursor USR；header 只在 compiler-emitted
-  evidence 证明的 origin TU 中由 libclang 求 canonical USR。非 resolved 诚实失败，禁止
-  cache / arity / ranking / text fallback 猜目标。
-  → `docs/architecture-symbol-resolution.md`; `openspec/changes/archive/2026-08-05-replace-cpp-goto-with-contextual-clang-resolution/`
+  解决: source/header 都在 proven TU 里由 libclang 求 exact-cursor canonical USR；用同一 USR
+  在 controlled module 的真实 UBT TU AST 中找唯一 body，声明处也必须继续。derived-static
+  virtual call 保留派生 override identity；base-static 动态类型未知时不猜派生类。只缓存绑定
+  USR/CDB/overlay/toolchain 的唯一 resolved destination；negative/ambiguous 不缓存。禁止
+  symbol / arity / ranking / text fallback 猜目标。
+  → `docs/architecture-symbol-resolution.md`;
+    `openspec/changes/make-cpp-gd-semantically-complete/`
+
+- **K43 — 把“会话全局”和磁盘全局混为一谈 → 多实例串项目 / 丢状态 / 撕裂缓存**
+  症状: 两个 Neovim 指向同一 engine 时，旧的顶层 `state.json` 让后写实例改变另一个实例的
+  project/platform；共享 JSON 的无锁 read-modify-write 丢字段；两个 prepare/cindex writer
+  争用同一输出；固定日志名互相 truncate/rotate。
+  解决: `vim.g` 只作为**当前 Neovim 进程**状态；project/platform 选择在进程内捕获，
+  `selection.json` 只给未来进程提供启动默认值；持久数据按 canonical project path 分桶，
+  platform-sensitive CDB/clangd 产物再按 platform 分桶；独立字段/definition cache 使用原子
+  per-key 文件，共享集合用 lease 下 merge，prepare/CDB/csearch 用跨进程 writer lease，诊断日志
+  带 PID。旧顶层 state 只读迁移，禁止继续作为写入真相。
+  → `lua/ue/project_state.lua`; `lua/ue/file_lock.lua`;
+    `openspec/specs/multi-instance-state-isolation/spec.md`
+
+- **K50 — nvim-dap 固定 `dap*.log` 且以 `w+` 打开 → 两实例互相截断调试证据**
+  症状: 自定义 UE 日志已按 PID 分路，但 nvim-dap 上游 `dap.log.create_logger()` 仍在
+  首次创建时直接 `io.open(stdpath('cache')/<name>, 'w+')`，同时调试的第二个 Neovim
+  会清空第一个的 main/stdout/stderr log。
+  解决: `workarounds.dap.pid_scoped_logs` 必须在 `require('dap')` 前安装，统一将
+  `*.log` 改写为 `*.<pid>.log`；`:UEDAPDiag` 只读当前 PID 的真实路径。
+  → `lua/workarounds/dap/pid_scoped_logs.lua`; `lua/plugins/dap.lua`
 
 ### grep 缓存 / csearch 失效
 
@@ -464,13 +490,13 @@
   → `docs/architecture/grep-cache-invalidation.md`; `lua/utils/code_search/init.lua`;
     `lua/ue.lua` cached_grep / finalize_after_csearch; `lua/plugins/snacks.lua` ue_project_grep
 
-- **K27 — 切平台/换引擎后 grep 缓存不失效**
+- **K27 — 切项目/平台后 grep 缓存维度错误**
   症状: `UESetPlatform` 走 fast-swap 只 flip cdb shard，csearch/workspace_all 原封不动；
   `UESetProject` 换引擎（engine_root 未持久化）时 engine 维度判不出"变了"。
-  解决: csearch/workspace_all **按平台+配置分路径**（`cache_paths(root, platform_key)`，
-  key 同源 `shards` 平台维度），切平台落不同目录、旧平台保留、不删重来；旧单一路径
-  首次按当前平台 **自动 move 迁移**（`migrate_legacy_csearch_if_needed`）。
-  `engine_root` 持久化进 state.json，`set_project` 比对 project+engine 任一变即失效全平台。
+  解决: canonical project path 是第一层缓存维度；不同 project（即使共用 engine 或同名）
+  落不同 bucket。csearch/workspace_all 在**同一 project 内平台无关**，切平台复用；gtags 与
+  CDB/clangd/PCH 在 project bucket 内继续按 platform+configuration 分片。切项目只切换活跃
+  bucket 并保留旧项目缓存，不删除、不把旧 project 的状态带入当前进程。
   → `docs/architecture/grep-cache-invalidation.md`; `lua/ue.lua` cache_paths /
     platform_key_from_state / invalidate_project_scoped_cache / set_platform
 
@@ -541,7 +567,7 @@
 
 | 组件 | 版本 | 备注 | 出处 |
 |------|------|------|------|
-| clangd / clang | **LLVM 22.1.x**（22.1.5 verified） | **不要降级到 21.x** —— super-unity CDB pipeline 与 `.idx` 格式依赖 22.x 行为 | `docs/TOOLING.md` §clangd |
+| clangd / clang | **LLVM 22.1.x**（22.1.5 verified） | **不要降级到 21.x** —— exact-command transport、controlled BackgroundIndex、libclang cursor ABI 与 C shim 都按 22.x 验证 | `docs/TOOLING.md` §clangd |
 | DAP 适配器（Android） | **LLVM 22.1.6+ `lldb-dap.exe`**（forward-only，当前） | Android platform-mode attach 以 `lua/utils/platform/windows.lua` `default_lldb_dap_paths()` 为准；首选 `C:/tools/lldb-22/install/bin/lldb-dap.exe`。不得静默降级到 LLVM 21 或历史 codelldb 路线。 | `docs/TOOLING.md` §"Current Android DAP status" |
 | lldb-server（Android） | **NDK 27 LLDB 18.x**（aarch64-android，platform server） | 当前 K30 路线使用 `/data/local/tmp/lldb-server platform --server --listen`，由 host serial-form `platform connect` 拉起目标 gdbserver；`gdbserver --attach` 路线已证伪。`default_lldb_server_paths()` 以 NDK27 platform server 为首选。 | `docs/TOOLING.md` §"Current Android DAP status" |
 | adb | Platform-Tools 35.x+ | | `docs/TOOLING.md` §adb |
@@ -575,19 +601,26 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 3. **workaround 隔离** —— 仅为绕过上游 bug 的代码进 `lua/workarounds/<scope>/<name>.lua`。
 4. **可自验证模块** —— 公共 API 挂 `M.*`，可 headless 测试（`nvim --headless -l`）。
 5. **不做周期性 ticker 通知** —— 至多 start + 中段更新，成功后自然消退，不刷 `:messages`。
-6. **未变更时跳过写入** —— 每个生成器（CDB / PCH / .clangd）写前先比对，避免使下游 cache 失效。
+6. **未变更时跳过写入** —— 每个生成器（CDB / manifest / PCH）写前先比对，避免使下游 cache 失效。
 → `README.md` §Conventions
 
 ### C5 — 符号解析分层契约
 
-- **C++ source TU**：active CDB 证明 → clangd exact-cursor USR + 单次 definition；零个或多个
-  target 都保持当前位置，不读写 definition-location cache，不进入文本 fallback。
+- **C++ source TU**：active CDB 证明 → proven TU 中的 libclang exact-cursor canonical USR；
+  不以 clangd 单次 definition 或 source 文件名代替 identity proof。
 - **C++ header**：必须继承或选择 compiler-emitted dependency evidence 证明的 origin TU，
   由异步 libclang sidecar 在真实 argv / cwd 中解析 canonical USR；standalone header 不是 build truth。
+- **跨 TU destination**：先在 subject 所属 controlled module 的 compiler-authored UBT unity /
+  exact fallback AST 中按 canonical USR 找唯一 body；只有 module contexts 暂不可用时才允许
+  identity-verified clangd 协助。declaration-self 不是终点，零个或多个 body 都不猜。
 - C++ 终态仅 `resolved / ambiguous-context / invalid-semantic-context / unavailable`；只有
   `resolved` 可跳转，Tree-sitter、arity、ranking、workspace symbol、csearch、GTAGS 不得选择或否决结果。
-- 允许缓存的是 live TU，key 绑定 active build、origin TU、exact compile fingerprint 与 toolchain；
-  不允许按 symbol / receiver / arity 持久化 C++ location。
+- 允许缓存 live TU，以及 canonical USR + controlled CDB signatures + overlays + toolchain 绑定的
+  唯一 resolved destination；negative/ambiguous 结果不跨 subject 缓存，绝不按 symbol /
+  receiver / arity 持久化 C++ location。
+- clangd 固定 `--enable-config=false`；semantic coverage 只来自同 generation 的 controlled
+  BackgroundIndex manifests，current/hot 不得降级已有 full，打开文件 exact argv/cwd 走官方
+  `compilationDatabaseChanges`。
 - 所有 parse/reparse 在 sidecar 进程；spinner 600ms 后显示，UI 主循环不得同步等待。
 - 非 C++ compatibility path 保留 cache/LSP/csearch/GTAGS；`.usf` / `.py` / `.Build.cs`
   可直接走 GTAGS。显式搜索和 references 不受 C++ authority invariant 影响。

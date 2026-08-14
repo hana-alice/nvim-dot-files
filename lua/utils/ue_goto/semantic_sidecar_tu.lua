@@ -3,6 +3,35 @@ local libclang = require("utils.ue_goto.semantic_sidecar_libclang")
 local M = {}
 
 function M.install(Sidecar)
+  local function location_key(loc)
+    if type(loc) ~= "table" then return nil end
+    return table.concat({
+      tostring(loc.path or ""),
+      tostring(loc.line or ""),
+      tostring(loc.column or ""),
+      tostring(loc.offset or ""),
+    }, "\0")
+  end
+
+  local function classify_cursor_role(query, declaration, definition)
+    local query_loc = {
+      path = libclang.normalize(query.path),
+      line = tonumber(query.line),
+      column = tonumber(query.column),
+    }
+    if definition and query_loc.path == definition.path
+        and query_loc.line == definition.line
+        and query_loc.column == definition.column then
+      return "definition"
+    end
+    if declaration and query_loc.path == declaration.path
+        and query_loc.line == declaration.line
+        and query_loc.column == declaration.column then
+      return "declaration"
+    end
+    return "reference"
+  end
+
   function Sidecar:_tu_count()
     local count = 0
     for _ in pairs(self.tus) do
@@ -27,6 +56,8 @@ function M.install(Sidecar)
     extra.process_rss_bytes = self:_rss_bytes()
     extra.max_tus = self.max_tus
     extra.idle_evict_ms = self.idle_evict_ms
+    extra.lookup_cache_entries = vim.tbl_count(self.lookup_cache or {})
+    extra.controlled_cdb_entries = vim.tbl_count(self.controlled_cdb_cache or {})
     return extra
   end
 
@@ -56,6 +87,8 @@ function M.install(Sidecar)
       self:_dispose_tu(entry)
     end
     self.tus = {}
+    self.lookup_cache = {}
+    self.controlled_cdb_cache = {}
     for _, cdb in pairs(self.cdbs) do
       self:_dispose_cdb(cdb)
     end
@@ -238,7 +271,9 @@ function M.install(Sidecar)
         #parse_args,
         unsaved_files,
         #overlays,
-        libclang.CX_TRANSLATION_UNIT_KEEP_GOING + libclang.CX_TRANSLATION_UNIT_PRECOMPILED_PREAMBLE,
+        libclang.CX_TRANSLATION_UNIT_DETAILED_PREPROCESSING_RECORD
+          + libclang.CX_TRANSLATION_UNIT_KEEP_GOING
+          + libclang.CX_TRANSLATION_UNIT_PRECOMPILED_PREAMBLE,
         out
       )
       pcall(libclang.uv.chdir, previous_cwd)
@@ -357,7 +392,58 @@ function M.install(Sidecar)
     end
 
     local canonical = self.toolchain.lib.clang_getCanonicalCursor(base)
+    local canonical_kind = libclang.cxstring_to_string(
+      self.toolchain.lib,
+      self.toolchain.lib.clang_getCursorKindSpelling(canonical.kind)
+    )
+    local definition_cursor = self.toolchain.lib.clang_getCursorDefinition(base)
+    if self.toolchain.lib.clang_Cursor_isNull(definition_cursor) ~= 0 then
+      definition_cursor = self.toolchain.lib.clang_getCursorDefinition(cursor)
+    end
+    local definition = nil
+    if self.toolchain.lib.clang_Cursor_isNull(definition_cursor) == 0 then
+      definition = libclang.location_from_cursor(self.toolchain.lib, definition_cursor)
+    end
     local usr = libclang.cxstring_to_string(self.toolchain.lib, self.toolchain.lib.clang_getCursorUSR(canonical))
+    local declaration = libclang.location_from_cursor(self.toolchain.lib, canonical)
+
+    -- libclang intentionally exposes no USR for preprocessing entities.
+    -- MacroExpansion still carries a compiler-owned referenced/definition
+    -- cursor, spelling and source location, so form a stable opaque identity
+    -- from those structured fields. No token text or regex participates.
+    if usr == "" and (kind_spelling:find("Macro", 1, true)
+        or canonical_kind:find("Macro", 1, true)) then
+      local semantic_cursor = canonical
+      if self.toolchain.lib.clang_Cursor_isNull(definition_cursor) == 0 then
+        semantic_cursor = self.toolchain.lib.clang_getCanonicalCursor(definition_cursor)
+        canonical_kind = libclang.cxstring_to_string(
+          self.toolchain.lib,
+          self.toolchain.lib.clang_getCursorKindSpelling(semantic_cursor.kind)
+        )
+      end
+      local semantic_location = libclang.location_from_cursor(self.toolchain.lib, semantic_cursor)
+      local spelling = libclang.cxstring_to_string(
+        self.toolchain.lib,
+        self.toolchain.lib.clang_getCursorSpelling(semantic_cursor)
+      )
+      if spelling == "" then
+        spelling = libclang.cxstring_to_string(
+          self.toolchain.lib,
+          self.toolchain.lib.clang_getCursorSpelling(cursor)
+        )
+      end
+      if semantic_location and spelling ~= "" then
+        declaration = semantic_location
+        definition = definition or semantic_location
+        usr = "macro:" .. vim.fn.sha256(table.concat({
+          canonical_kind,
+          spelling,
+          semantic_location.path,
+          tostring(semantic_location.line),
+          tostring(semantic_location.column),
+        }, "\0"))
+      end
+    end
     if usr == "" then
       return {
         context_id = ctx.id,
@@ -369,7 +455,6 @@ function M.install(Sidecar)
       }, vim.tbl_extend("force", compile_meta, { query_ms = libclang.duration_ms(started) })
     end
 
-    local declaration = libclang.location_from_cursor(self.toolchain.lib, canonical)
     if not declaration then
       return {
         context_id = ctx.id,
@@ -381,17 +466,22 @@ function M.install(Sidecar)
       }, vim.tbl_extend("force", compile_meta, { query_ms = libclang.duration_ms(started) })
     end
 
-    local definition_cursor = self.toolchain.lib.clang_getCursorDefinition(canonical)
-    local definition = nil
-    if self.toolchain.lib.clang_Cursor_isNull(definition_cursor) == 0 then
-      definition = libclang.location_from_cursor(self.toolchain.lib, definition_cursor)
-    end
+    local cursor_role = classify_cursor_role(query, declaration, definition)
 
     local query_ms = libclang.duration_ms(started)
     return {
       context_id = ctx.id,
+      origin_tu = ctx.origin_tu,
       state = "resolved",
       usr = usr,
+      cursor_role = cursor_role,
+      cursor_kind = kind_spelling,
+      entity_kind = canonical_kind,
+      canonical_identity = {
+        key = usr,
+        usr = usr,
+        kind = canonical_kind,
+      },
       declaration = declaration,
       definition = definition,
       document_version = query.document_version or 0,
@@ -399,6 +489,10 @@ function M.install(Sidecar)
       compile_command_fingerprint = compile_meta.compile_command_fingerprint,
     }, vim.tbl_extend("force", compile_meta, { query_ms = query_ms })
   end
+
+  require("utils.ue_goto.semantic_sidecar_definition").install(Sidecar, {
+    location_key = location_key,
+  })
 end
 
 return M

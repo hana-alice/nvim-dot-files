@@ -98,8 +98,9 @@ local tabs = {
         title = "Motions",
         mappings = {
           { "h j k l",     "Left Down Up Right" },
-          { "w / b / e",   "Word start / prev / end" },
-          { "W / B / E",   "WORD start / prev / end" },
+          { "w / W",       "Next word / WORD start" },
+          { "b / B",       "Prev word / WORD start" },
+          { "e / E",       "Word / WORD end" },
           { "0 / ^ / $",   "Line start / first char / end" },
           { "gg / G",      "File start / end" },
           { "42G",         "Go to line 42" },
@@ -120,8 +121,8 @@ local tabs = {
       {
         title = "Modes",
         mappings = {
-          { "i / a",        "Insert before / after" },
-          { "I / A",        "Insert line start / end" },
+          { "i / I",        "Insert before / at line start" },
+          { "a / A",        "Insert after / at line end" },
           { "o / O",        "New line below / above" },
           { "<Esc>",        "Back to Normal" },
           { "v / V / <C-v>","Visual char / line / block" },
@@ -473,6 +474,7 @@ local tabs = {
           { "<leader>ud",   "Diagnostics" },
           { "<leader>us",   "Spelling" },
           { "<leader>uw",   "Word wrap" },
+          { "<leader>uW",   "Name system window title" },
           { "<leader>uh",   "Inlay hints" },
           { "<leader>uG",   "Git signs" },
           { "<leader>uT",   "Treesitter" },
@@ -620,6 +622,98 @@ local tabs = {
   },
 }
 
+-- Search is deliberately data-driven: every hit carries both levels of the
+-- cheatsheet taxonomy, so filtering never turns the UI into an unlabelled
+-- flat list. A display separator surrounded by spaces ("w / W") is ignored
+-- for exact-key matching, while a literal slash without surrounding spaces
+-- ("<leader>/") remains searchable as an actual key.
+local function search_text(value)
+  return tostring(value or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function compact_key(value)
+  return search_text(value):gsub("%s+/%s+", ""):gsub("%s+", "")
+end
+
+local function subsequence(needle, haystack)
+  local at = 1
+  for index = 1, #needle do
+    at = haystack:find(needle:sub(index, index), at, true)
+    if not at then return false end
+    at = at + 1
+  end
+  return true
+end
+
+local function search_score(query, key, desc, tab, section)
+  local plain_query = search_text(query)
+  if plain_query == "" then return nil end
+
+  local compact_query = compact_key(query)
+  local plain_key = search_text(key)
+  local compact = compact_key(key)
+  local description = search_text(desc)
+  local category = search_text(tab .. " " .. section)
+
+  if compact_query ~= "" and compact == compact_query then return 0 end
+  if compact_query ~= "" and compact:sub(1, #compact_query) == compact_query then return 10 end
+  if compact_query ~= "" and compact:find(compact_query, 1, true) then return 20 end
+  if plain_key:find(plain_query, 1, true) then return 25 end
+  if description:find(plain_query, 1, true) then return 30 end
+  if category:find(plain_query, 1, true) then return 40 end
+
+  local searchable = compact .. " " .. description .. " " .. category
+  if compact_query ~= "" and subsequence(compact_query, searchable) then return 50 end
+  return nil
+end
+
+
+function M.search(query)
+  local hits = {}
+  local order = 0
+  for _, tab in ipairs(tabs) do
+    for _, section in ipairs(tab.sections) do
+      for _, mapping in ipairs(section.mappings) do
+        order = order + 1
+        local score = search_score(query, mapping[1], mapping[2], tab.name, section.title)
+        if score then
+          hits[#hits + 1] = {
+            key = mapping[1],
+            desc = mapping[2],
+            tab = tab.name,
+            section = section.title,
+            group = tab.name .. " › " .. section.title,
+            score = score,
+            order = order,
+          }
+        end
+      end
+    end
+  end
+  table.sort(hits, function(left, right)
+    if left.score ~= right.score then return left.score < right.score end
+    return left.order < right.order
+  end)
+  return hits
+end
+
+
+function M.search_sections(query)
+  local sections = {}
+  local by_group = {}
+  local hits = M.search(query)
+  for _, hit in ipairs(hits) do
+    local section = by_group[hit.group]
+    if not section then
+      section = { title = hit.group, mappings = {} }
+      by_group[hit.group] = section
+      sections[#sections + 1] = section
+    end
+    section.mappings[#section.mappings + 1] = { hit.key, hit.desc }
+  end
+  return sections, #hits
+end
+
 -- ══════════════════════════════════════════════════════════════════════
 -- RENDERING
 -- ══════════════════════════════════════════════════════════════════════
@@ -628,6 +722,8 @@ local state = {
   win = nil,
   ns = nil,
   current_tab = 1,
+  query = "",
+  searching = false,
 }
 
 local function is_valid()
@@ -646,6 +742,8 @@ local function close()
   end
   state.buf = nil
   state.win = nil
+  state.query = ""
+  state.searching = false
 end
 
 local ascii = {
@@ -672,7 +770,22 @@ local function render(tab_idx)
   api.nvim_buf_clear_namespace(buf, ns, 0, -1)
 
   -- ── Compute column layout ──
+  local search_mode = state.query ~= ""
+  local search_count = 0
   local tab = tabs[tab_idx]
+  if search_mode then
+    local sections
+    sections, search_count = M.search_sections(state.query)
+    if #sections == 0 then
+      sections = {
+        {
+          title = "No matches",
+          mappings = { { state.query, "No shortcut matched; press / to edit the query" } },
+        },
+      }
+    end
+    tab = { name = "Search", sections = sections }
+  end
   if not tab then return end
 
   -- Find max key+desc width across all sections
@@ -743,11 +856,19 @@ local function render(tab_idx)
 
   -- ── Tab bar ──
   local tab_parts = {}
-  for ti, t in ipairs(tabs) do
-    local label = " " .. ti .. ":" .. t.name .. " "
-    local hl = ti == tab_idx and "CheatTabActive" or "CheatTabInact"
-    table.insert(tab_parts, { label, hl })
-    table.insert(tab_parts, { " ", "CheatBg" })
+  if search_mode then
+    local suffix = search_count == 1 and " result" or " results"
+    table.insert(tab_parts, {
+      " / " .. state.query .. "  ·  " .. tostring(search_count) .. suffix .. " ",
+      "CheatTabActive",
+    })
+  else
+    for ti, t in ipairs(tabs) do
+      local label = " " .. ti .. ":" .. t.name .. " "
+      local hl = ti == tab_idx and "CheatTabActive" or "CheatTabInact"
+      table.insert(tab_parts, { label, hl })
+      table.insert(tab_parts, { " ", "CheatBg" })
+    end
   end
   -- Center the tab bar
   local tab_total_w = 0
@@ -819,7 +940,12 @@ local function render(tab_idx)
   end
 
   -- ── Footer ──
-  local footer = " <Tab>/<S-Tab> 切换分类   1-9 跳转   j/k 滚动   q/<Esc> 关闭 "
+  local footer
+  if search_mode then
+    footer = " / 修改搜索   <C-l>/<Esc> 清除筛选   结果按 Tab › Section 分类   q 关闭 "
+  else
+    footer = " / 搜索全部快捷键   <Tab>/<S-Tab> 切换分类   1-9 跳转   q/<Esc> 关闭 "
+  end
   local footer_row = total_lines - 1
   if footer_row > 0 then
     local fpad = math.max(0, math.floor((win_w - fn.strdisplaywidth(footer)) / 2))
@@ -832,6 +958,28 @@ local function render(tab_idx)
   vim.bo[buf].modifiable = false
 end
 
+local function start_search()
+  if state.searching or not is_valid() then return end
+  state.searching = true
+
+  local group = api.nvim_create_augroup("CheatsheetSearch" .. tostring(state.buf), { clear = true })
+  api.nvim_create_autocmd("CmdlineChanged", {
+    group = group,
+    callback = function()
+      if not state.searching or fn.getcmdtype() ~= "@" then return end
+      state.query = fn.getcmdline()
+      render(state.current_tab)
+      pcall(vim.cmd, "redraw")
+    end,
+  })
+
+  local ok, query = pcall(fn.input, " Shortcut search: ", state.query)
+  state.searching = false
+  pcall(api.nvim_del_augroup_by_id, group)
+  state.query = ok and tostring(query or "") or ""
+  render(state.current_tab)
+end
+
 -- ══════════════════════════════════════════════════════════════════════
 -- KEYMAPS
 -- ══════════════════════════════════════════════════════════════════════
@@ -840,14 +988,28 @@ local function setup_keymaps()
   local opts = { buffer = buf, noremap = true, silent = true }
 
   vim.keymap.set("n", "q", close, opts)
-  vim.keymap.set("n", "<Esc>", close, opts)
+  vim.keymap.set("n", "<Esc>", function()
+    if state.query ~= "" then
+      state.query = ""
+      render(state.current_tab)
+    else
+      close()
+    end
+  end, opts)
+  vim.keymap.set("n", "/", start_search, opts)
+  vim.keymap.set("n", "<C-l>", function()
+    state.query = ""
+    render(state.current_tab)
+  end, opts)
 
   vim.keymap.set("n", "<Tab>", function()
+    state.query = ""
     state.current_tab = (state.current_tab % #tabs) + 1
     render(state.current_tab)
   end, opts)
 
   vim.keymap.set("n", "<S-Tab>", function()
+    state.query = ""
     state.current_tab = ((state.current_tab - 2) % #tabs) + 1
     render(state.current_tab)
   end, opts)
@@ -855,6 +1017,7 @@ local function setup_keymaps()
   -- Number keys 1-9 for direct tab switching
   for i = 1, math.min(#tabs, 9) do
     vim.keymap.set("n", tostring(i), function()
+      state.query = ""
       render(i)
     end, opts)
   end
@@ -914,6 +1077,8 @@ function M.open(tab_idx)
   state.win = win
   state.ns = api.nvim_create_namespace("cheatsheet")
   state.current_tab = tab_idx or 1
+  state.query = ""
+  state.searching = false
 
   setup_keymaps()
   render(state.current_tab)
@@ -952,5 +1117,9 @@ end
 
 --- Provide the raw tabs data for extension
 M.tabs = tabs
+M.close = close
+function M._state_for_test()
+  return state
+end
 
 return M

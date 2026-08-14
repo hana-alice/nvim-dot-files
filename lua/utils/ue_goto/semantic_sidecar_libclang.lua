@@ -8,6 +8,7 @@ local uv = vim.uv or vim.loop
 
 M.ffi = ffi
 M.uv = uv
+M.CX_TRANSLATION_UNIT_DETAILED_PREPROCESSING_RECORD = 0x01
 M.CX_TRANSLATION_UNIT_KEEP_GOING = 0x200
 M.CX_TRANSLATION_UNIT_PRECOMPILED_PREAMBLE = 0x04
 
@@ -24,6 +25,7 @@ typedef struct CXDiagnosticImpl *CXDiagnostic;
 typedef struct CXCompilationDatabaseImpl *CXCompilationDatabase;
 typedef struct CXCompileCommandsImpl *CXCompileCommands;
 typedef struct CXCompileCommandImpl *CXCompileCommand;
+typedef void *CXClientData;
 
 typedef struct {
   const void *ptr_data[2];
@@ -49,6 +51,7 @@ const char *clang_getCString(CXString string);
 void clang_disposeString(CXString string);
 CXString clang_getClangVersion(void);
 CXString clang_getCursorUSR(CXCursor);
+CXString clang_getCursorSpelling(CXCursor);
 CXString clang_getCursorKindSpelling(unsigned kind);
 CXString clang_getFileName(CXFile file);
 CXString clang_formatDiagnostic(CXDiagnostic Diagnostic, unsigned Options);
@@ -104,14 +107,64 @@ void clang_getExpansionLocation(
 CXCursor clang_getCursor(CXTranslationUnit, CXSourceLocation);
 unsigned clang_Cursor_isNull(CXCursor cursor);
 unsigned clang_isInvalid(unsigned kind);
+unsigned clang_isDeclaration(unsigned kind);
 CXCursor clang_getCursorReferenced(CXCursor);
 CXCursor clang_getCanonicalCursor(CXCursor);
 CXCursor clang_getCursorDefinition(CXCursor);
 CXSourceLocation clang_getCursorLocation(CXCursor);
+CXCursor clang_getTranslationUnitCursor(CXTranslationUnit tu);
+unsigned clang_visitChildren(CXCursor parent, void *visitor, void *client_data);
 
 unsigned clang_getNumDiagnostics(CXTranslationUnit Unit);
 CXDiagnostic clang_getDiagnostic(CXTranslationUnit Unit, unsigned Index);
 void clang_disposeDiagnostic(CXDiagnostic Diagnostic);
+
+typedef struct {
+  const char *(*clang_getCString)(CXString string);
+  void (*clang_disposeString)(CXString string);
+  unsigned (*clang_isDeclaration)(unsigned kind);
+  CXCursor (*clang_getTranslationUnitCursor)(CXTranslationUnit tu);
+  unsigned (*clang_visitChildren)(CXCursor parent, void *visitor, void *client_data);
+  CXCursor (*clang_getCanonicalCursor)(CXCursor cursor);
+  CXString (*clang_getCursorUSR)(CXCursor cursor);
+  CXCursor (*clang_getCursorDefinition)(CXCursor cursor);
+  unsigned (*clang_Cursor_isNull)(CXCursor cursor);
+  CXSourceLocation (*clang_getCursorLocation)(CXCursor cursor);
+  void (*clang_getExpansionLocation)(
+    CXSourceLocation location,
+    CXFile *file,
+    unsigned *line,
+    unsigned *column,
+    unsigned *offset
+  );
+  CXString (*clang_getFileName)(CXFile file);
+} UECursorShimFns;
+
+typedef struct {
+  char path[4096];
+  unsigned line;
+  unsigned column;
+  unsigned offset;
+} UECursorShimLocation;
+
+typedef struct {
+  unsigned abi_version;
+  unsigned capacity;
+  unsigned count;
+  unsigned overflow;
+  unsigned visited_declarations;
+  unsigned matched_declarations;
+  unsigned error_code;
+  UECursorShimLocation definitions[64];
+} UECursorShimResult;
+
+unsigned ue_clang_cursor_shim_abi_version(void);
+int ue_clang_cursor_shim_lookup_definitions(
+  const UECursorShimFns *fns,
+  CXTranslationUnit tu,
+  const char *target_usr,
+  UECursorShimResult *result
+);
 ]])
 
 function M.normalize(path)
@@ -156,6 +209,19 @@ function M.read_json(path)
   if not contents or contents == "" then return nil end
   local ok, decoded = pcall(vim.json.decode, contents)
   return ok and decoded or nil
+end
+
+function M.file_signature(path)
+  local stat = uv.fs_stat(path)
+  if not stat or stat.type ~= "file" then
+    return nil
+  end
+  return M.sha256(vim.json.encode({
+    M.normalize(path),
+    tostring(stat.size or 0),
+    tostring(stat.mtime and stat.mtime.sec or 0),
+    tostring(stat.mtime and stat.mtime.nsec or 0),
+  }))
 end
 
 local function mtime_before(left, right)
@@ -256,6 +322,17 @@ function M.sibling_libclang_candidates(clangd_path)
     M.join(parent, "lib", "libclang." .. suffix),
     M.join(parent, "lib64", "libclang." .. suffix),
     "libclang." .. suffix,
+  })
+end
+
+function M.sibling_clang_candidates(clangd_path)
+  local driver = platform.driver()
+  local bin_dir = M.dirname(clangd_path)
+  local stem = driver.id == "windows" and "clang.exe" or "clang"
+  return M.unique_strings({
+    M.join(bin_dir, stem),
+    stem,
+    "clang",
   })
 end
 
@@ -404,6 +481,111 @@ function M.collect_diagnostics(lib, tu)
     lib.clang_disposeDiagnostic(diag)
   end
   return out
+end
+
+local cursor_shim_cache = {}
+
+local function cursor_shim_ext()
+  local driver = platform.driver()
+  if driver.id == "windows" then return ".dll" end
+  if driver.id == "macos" then return ".dylib" end
+  return ".so"
+end
+
+local function compile_cursor_shim(compiler, source, output)
+  local driver = platform.driver()
+  local staged = output .. (".tmp.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
+  local cmd
+  if driver.id == "windows" then
+    cmd = { compiler, "-shared", "-O2", "-std=c11", source, "-o", staged }
+  elseif driver.id == "macos" then
+    cmd = { compiler, "-dynamiclib", "-O2", "-std=c11", source, "-o", staged }
+  else
+    cmd = { compiler, "-shared", "-fPIC", "-O2", "-std=c11", source, "-o", staged }
+  end
+  local result = vim.system(cmd, { text = true }):wait()
+  if result.code ~= 0 then
+    pcall(vim.fn.delete, staged)
+    return result
+  end
+  local replaced, replace_err = vim.uv.fs_rename(staged, output)
+  if not replaced then
+    pcall(vim.fn.delete, staged)
+    -- Another process may have completed the identical content-addressed
+    -- build first. Its proven output is safe to reuse.
+    if not M.file_exists(output) then
+      result.code = 1
+      result.stderr = tostring(result.stderr or "") .. "\natomic publish failed: " .. tostring(replace_err)
+    end
+  end
+  return result
+end
+
+function M.ensure_cursor_shim(toolchain)
+  local clangd_path = toolchain and toolchain.clangd_path or nil
+  local toolchain_identity = toolchain and toolchain.toolchain_identity or ""
+  local source = M.normalize(vim.fs.joinpath(vim.fn.stdpath("config"), "scripts", "ue_clang_cursor_shim.c"))
+  local source_text = M.read_all(source)
+  if not source_text or source_text == "" then
+    return nil, { reason = "cursor-shim-source-unreadable" }
+  end
+  local build_key = M.sha256(vim.json.encode({
+    toolchain_identity,
+    M.sha256(source_text),
+    cursor_shim_ext(),
+  }))
+  if cursor_shim_cache[build_key] then
+    return cursor_shim_cache[build_key]
+  end
+
+  local out_dir = M.normalize(vim.fs.joinpath(vim.fn.stdpath("cache"), "ue_cursor_shim", build_key))
+  vim.fn.mkdir(out_dir, "p")
+  local output = M.normalize(vim.fs.joinpath(out_dir, "ue_clang_cursor_shim" .. cursor_shim_ext()))
+  if not M.file_exists(output) then
+    local compiler
+    for _, candidate in ipairs(M.sibling_clang_candidates(clangd_path or "")) do
+      compiler = M.resolve_executable(candidate)
+      if compiler then break end
+    end
+    if not compiler then
+      return nil, { reason = "cursor-shim-compiler-not-found" }
+    end
+    local result = compile_cursor_shim(compiler, source, output)
+    if result.code ~= 0 or not M.file_exists(output) then
+      return nil, {
+        reason = "cursor-shim-compile-failed",
+        stderr = tostring(result.stderr or ""),
+        stdout = tostring(result.stdout or ""),
+      }
+    end
+  end
+
+  local ok_load, shim = pcall(ffi.load, output)
+  if not ok_load or not shim then
+    return nil, { reason = "cursor-shim-load-failed", detail = tostring(shim) }
+  end
+  local ok_abi, abi = pcall(function() return tonumber(shim.ue_clang_cursor_shim_abi_version()) end)
+  if not ok_abi or abi ~= 1 then
+    return nil, {
+      reason = "cursor-shim-abi-mismatch",
+      abi = ok_abi and abi or nil,
+    }
+  end
+
+  local record = {
+    handle = shim,
+    abi_version = abi,
+    output = output,
+    cache_key = build_key,
+  }
+  cursor_shim_cache[build_key] = record
+  return record
+end
+
+function M.cursor_shim_cache_clear()
+  for key in pairs(cursor_shim_cache) do
+    cursor_shim_cache[key] = nil
+  end
 end
 
 function M.semantic_parse_args(argv)

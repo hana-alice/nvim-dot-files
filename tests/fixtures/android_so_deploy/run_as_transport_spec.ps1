@@ -35,6 +35,7 @@ foreach ($function in $functions) { Invoke-Expression $function.Extent.Text }
 $script:Mode = "run-as"
 $script:Calls = @()
 $script:Package = "com.example.samplegame"
+$script:PreferRunAs = $false
 $packageDump = @"
     appId=10123
     primaryCpuAbi=arm64-v8a
@@ -65,7 +66,7 @@ function Invoke-Adb {
     return [PSCustomObject]@{ Code = 1; Text = "--attach-agent-bind <agent>" }
   }
   if ($key -eq "shell getprop ro.build.version.sdk") {
-    return [PSCustomObject]@{ Code = 0; Text = "34" }
+    return [PSCustomObject]@{ Code = 0; Text = "35" }
   }
   if ($key -eq "shell getprop ro.product.cpu.abilist") {
     return [PSCustomObject]@{ Code = 0; Text = "arm64-v8a,armeabi-v7a" }
@@ -78,13 +79,43 @@ function Invoke-Adb {
 
 $transport = Resolve-DeployTransport -PackageDump $packageDump
 if ($transport.Kind -ne "run-as-agent" -or $transport.AppUid -ne "10123" -or
-    $transport.ApiLevel -ne "34") {
-  throw "debuggable run-as transport was not selected"
+    $transport.ApiLevel -ne "35") {
+  throw "debuggable run-as transport was not selected on a capability-compatible API level"
 }
 Invoke-AdbRunAs -Arguments @("stat", "code_cache/nvim-ue-so/libUE4.so") | Out-Null
 if ($script:Calls[-1] -ne "shell run-as com.example.samplegame stat code_cache/nvim-ue-so/libUE4.so") {
   throw "run-as command shape is wrong"
 }
+
+$script:Calls = @()
+$script:PreferRunAs = $true
+function Invoke-Adb {
+  param([string[]]$Arguments, [switch]$AllowFailure)
+  $key = $Arguments -join " "
+  $script:Calls += $key
+  if ($key -eq "shell run-as com.example.samplegame id -u") {
+    return [PSCustomObject]@{ Code = 0; Text = "10123" }
+  }
+  if ($key -eq "shell am help") {
+    return [PSCustomObject]@{ Code = 0; Text = "--attach-agent-bind <agent>" }
+  }
+  if ($key -eq "shell getprop ro.build.version.sdk") {
+    return [PSCustomObject]@{ Code = 0; Text = "35" }
+  }
+  if ($key -eq "shell getprop ro.product.cpu.abilist") {
+    return [PSCustomObject]@{ Code = 0; Text = "arm64-v8a,armeabi-v7a" }
+  }
+  throw "prefer-run-as unexpectedly probed root or used unsupported adb arguments: $key"
+}
+$preferred = Resolve-DeployTransport -PackageDump $packageDump
+if ($preferred.Kind -ne "run-as-agent" -or $preferred.AppUid -ne "10123") {
+  throw "PreferRunAs did not select app-private transport"
+}
+if (($script:Calls -join "|") -like "*shell id -u*" -or
+    ($script:Calls -join "|") -like "*shell su 0 id -u*") {
+  throw "PreferRunAs probed root transport"
+}
+$script:PreferRunAs = $false
 
 $script:Calls = @()
 $failed = $false

@@ -63,19 +63,22 @@ csearch 与 cindex-uefilter 的 executable probing SHALL cache only successful e
 - **THEN** 系统 SHALL reset csearch/cindex probe cache
 - **AND** 下一次 `<leader>/` SHALL re-evaluate backend availability
 
-### Requirement: project or engine switch SHALL invalidate project-scoped grep caches
+### Requirement: project or engine switch SHALL select an isolated cache bucket
 
-Project-scoped grep caches SHALL be invalidated when either the project root or engine root changes.
+Project-scoped grep caches SHALL be keyed by canonical project identity beneath the engine cache root.
+Changing project or engine SHALL invalidate only process-local context/probe state and route future work
+to the newly selected bucket; it MUST NOT delete another project's reusable on-disk cache.
 
 #### Scenario: project root changes
-- **WHEN** `UESetProject` records a different project root than the persisted state
-- **THEN** all platform-specific csearch and gtags grep caches for that engine cache root SHALL be invalidated
-- **AND** cdb shard caches tied to the old project SHALL be invalidated
+- **WHEN** `UESetProject` selects a different project root in the current Neovim process
+- **THEN** future csearch/gtags/CDB paths SHALL resolve below the new canonical project bucket
+- **AND** in-memory context and executable probe caches SHALL be reset
+- **AND** the old project's on-disk cache SHALL remain intact
 
 #### Scenario: engine root changes
-- **WHEN** `UESetProject` records the same project root but a different engine root than persisted state
-- **THEN** all project-scoped grep caches SHALL be invalidated
-- **AND** the new `engine_root` SHALL be persisted in state for future comparisons
+- **WHEN** the same project path is selected under a different engine root
+- **THEN** paths SHALL resolve below that engine's own project bucket
+- **AND** the other engine's cache SHALL NOT be used or deleted
 
 ### Requirement: legacy grep caches SHALL migrate without data loss
 
@@ -244,7 +247,7 @@ hash 缓存键：缓存命中时仅 stat 不重算，仅当清单文件被改写
 
 csearch trigram 索引 SHALL 全平台共用一份，路径为 `csearch/csearch.idx`（不再按 `platform_key` 分片）。gtags workspace DB 与 cdb compile-db 资产 SHALL 仍按 `platform_key` 分片——它们是平台相关产物（编译参数 / 宏 / include / 条件编译符号按平台不同）。
 
-理由：csearch 索引的输入文件集（`workspace_all.files`）由 `engine_root` + `project_root` + 平台无关常量（`ENGINE_PICKER_DIRS` / `SCAN_EXCLUDES`）+ 平台无关白名单（`.ueprepare-scan-paths`）决定，不含任何平台维度。per-platform 分片是 cache layout v3.1 让 csearch 搭便车的结果，去之使「索引维度」与「`csearch_input_hash` 校验维度（per-engine_root，本就一份）」对齐，并令切平台不再重建 csearch 索引。
+理由：csearch 索引的输入文件集（`workspace_all.files`）由 `engine_root` + `project_root` + 平台无关常量（`ENGINE_PICKER_DIRS` / `SCAN_EXCLUDES`）+ 平台无关白名单（`.ueprepare-scan-paths`）决定，不含任何平台维度。per-platform 分片是 cache layout v3.1 让 csearch 搭便车的结果，去之使「索引维度」与「`csearch_input_hash` 校验维度（per-project，本就一份）」对齐，并令切平台不再重建 csearch 索引。不同 project 即使共用 engine 仍 MUST 使用不同 project bucket，不能共享该索引。
 
 #### Scenario: 解析 csearch 索引路径
 - **WHEN** 系统为任一平台 / 配置解析 csearch 索引路径
@@ -262,12 +265,18 @@ csearch trigram 索引 SHALL 全平台共用一份，路径为 `csearch/csearch.
 
 ### Requirement: `<leader>/` 结果呈现 SHALL 提供分组、计数与后端状态
 
-`<leader>/` 的结果面板 SHALL 按文件分组，每文件 SHALL 显示命中计数；picker 标题 SHALL 标识当前后端（`[csearch]`）与当前 scope。
+`<leader>/` 的结果面板 SHALL 按文件分组，每文件 SHALL 显示命中计数，并 SHALL 以 Project / Engine / Workspace scope 与对应根目录相对路径分类。分组中的每一行 MUST 是带真实 file/line/column 的可跳转命中；系统 MUST NOT 插入可被选中但没有真实命中位置的 synthetic header。picker 标题 SHALL 标识当前后端（`[csearch]`）与当前 scope。
 
 #### Scenario: 多文件多命中
 - **WHEN** 一次 `<leader>/` 搜索在多个文件命中
 - **THEN** 结果 SHALL 按文件分组
 - **AND** 每个文件分组 SHALL 显示该文件内的命中数
+- **AND** 首行 SHALL 显示 scope、相对路径与计数，后续行 SHALL 显示该文件内的真实命中
+
+#### Scenario: 选择任意分组行
+- **WHEN** 用户选中首条或后续任意一条结果
+- **THEN** 该 item SHALL 始终包含真实 file/line/column，并预览对应命中上下文
+- **AND** 首条结果 MUST NOT 因 synthetic file header 而预览文件第一行或空占位内容
 
 #### Scenario: 标题反映后端与 scope
 - **WHEN** `<leader>/` 面板打开并完成一次搜索
@@ -276,7 +285,16 @@ csearch trigram 索引 SHALL 全平台共用一份，路径为 `csearch/csearch.
 
 ### Requirement: `<leader>/` SHALL 提供可视化搜索修饰开关
 
-`<leader>/` 面板 SHALL 提供可视化的 大小写 / 全词 / 正则 开关（无需用户手输 `-- -w/-s/-F`），开关状态 SHALL 在标题栏可见，切换后 SHALL 以新修饰重跑当前搜索。开关 SHALL 翻译为底层后端等价语义。
+`<leader>/` 面板 SHALL 提供可视化的 literal / 大小写 / 全词 / 正则开关（无需用户手输 `-- -w/-s/-F`），默认 SHALL 为 literal；开关状态 SHALL 在标题栏可见，切换后 SHALL 以新修饰重跑当前搜索。开关 SHALL 翻译为底层后端等价语义。literal 模式 SHALL 只转义 RE2 真正的 metacharacter，并 SHALL 以精确 match span 驱动预览高亮，不能让 Snacks/Vim 再把用户原始输入解释为另一层 regex。
+
+#### Scenario: 默认搜索特殊符号
+- **WHEN** 用户在默认 literal 模式输入 `.`、`/` 或其他单字符标点
+- **THEN** 搜索 SHALL 启动并只匹配该字面字符
+- **AND** 预览 SHALL 只高亮该字面命中，不能把 `.` 解释为“任意字符”
+
+#### Scenario: 单字符 regex 仍受保护
+- **WHEN** 用户开启 regex 后输入单个 `.`
+- **THEN** 系统 SHALL 保持短查询保护，不执行会匹配几乎所有源码字符的搜索
 
 #### Scenario: 切换全词
 - **WHEN** 用户在 `<leader>/` 面板内切换「全词」开关

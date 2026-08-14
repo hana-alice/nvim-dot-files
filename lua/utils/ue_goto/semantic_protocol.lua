@@ -15,6 +15,7 @@ local REQUEST_OPS = {
   catalog = true,
   prove = true,
   query = true,
+  ["lookup-definition"] = true,
   stats = true,
   evict = true,
   shutdown = true,
@@ -93,6 +94,65 @@ local function validate_overlay(overlay)
   return true
 end
 
+local function validate_lookup_payload(frame, label)
+  if type(frame.query) ~= "table" then
+    return false, label .. " payload is required"
+  end
+  local ok, err = validate_location(frame.query)
+  if not ok then return false, err end
+  if frame.query.document_version ~= nil
+    and (type(frame.query.document_version) ~= "number" or frame.query.document_version < 0)
+  then
+    return false, label .. ".document_version must be nil or >= 0"
+  end
+  if not is_array(frame.contexts) or #frame.contexts == 0 then
+    return false, label .. " requires a non-empty contexts array"
+  end
+  for _, ctx in ipairs(frame.contexts) do
+    local ctx_ok, ctx_err = validate_context(ctx)
+    if not ctx_ok then return false, ctx_err end
+  end
+  if frame.overlays ~= nil then
+    if not is_array(frame.overlays) then
+      return false, "overlays must be an array"
+    end
+    for _, overlay in ipairs(frame.overlays) do
+      local overlay_ok, overlay_err = validate_overlay(overlay)
+      if not overlay_ok then return false, overlay_err end
+    end
+  end
+  return true
+end
+
+local function validate_definition_lookup_payload(frame)
+  if type(frame.usr) ~= "string" or frame.usr == "" then
+    return false, "lookup-definition.usr must be a non-empty string"
+  end
+  if type(frame.subject) ~= "string" or frame.subject == "" then
+    return false, "lookup-definition.subject must be a non-empty string"
+  end
+  if not is_array(frame.cdb_paths) or #frame.cdb_paths == 0 then
+    return false, "lookup-definition.cdb_paths must be a non-empty array"
+  end
+  for _, path in ipairs(frame.cdb_paths) do
+    if type(path) ~= "string" or path == "" then
+      return false, "lookup-definition.cdb_paths entries must be non-empty strings"
+    end
+  end
+  if frame.document_version ~= nil
+      and (type(frame.document_version) ~= "number" or frame.document_version < 0) then
+    return false, "lookup-definition.document_version must be nil or >= 0"
+  end
+  if frame.overlays ~= nil then
+    if not is_array(frame.overlays) then return false, "overlays must be an array" end
+    for _, overlay in ipairs(frame.overlays) do
+      local ok, err = validate_overlay(overlay)
+      if not ok then return false, err end
+    end
+  end
+  return true
+end
+
 function M.validate_request(frame)
   if type(frame) ~= "table" then
     return false, "frame must decode to a table"
@@ -149,32 +209,11 @@ function M.validate_request(frame)
       end
     end
   elseif frame.op == "query" then
-    if type(frame.query) ~= "table" then
-      return false, "query payload is required"
-    end
-    local ok, err = validate_location(frame.query)
+    local ok, err = validate_lookup_payload(frame, frame.op)
     if not ok then return false, err end
-    if frame.query.document_version ~= nil
-      and (type(frame.query.document_version) ~= "number" or frame.query.document_version < 0)
-    then
-      return false, "query.document_version must be nil or >= 0"
-    end
-    if not is_array(frame.contexts) or #frame.contexts == 0 then
-      return false, "query requires a non-empty contexts array"
-    end
-    for _, ctx in ipairs(frame.contexts) do
-      local ctx_ok, ctx_err = validate_context(ctx)
-      if not ctx_ok then return false, ctx_err end
-    end
-    if frame.overlays ~= nil then
-      if not is_array(frame.overlays) then
-        return false, "overlays must be an array"
-      end
-      for _, overlay in ipairs(frame.overlays) do
-        local overlay_ok, overlay_err = validate_overlay(overlay)
-        if not overlay_ok then return false, overlay_err end
-      end
-    end
+  elseif frame.op == "lookup-definition" then
+    local ok, err = validate_definition_lookup_payload(frame)
+    if not ok then return false, err end
   elseif frame.op == "evict" then
     if frame.context_ids ~= nil then
       if not is_array(frame.context_ids) then
@@ -210,6 +249,38 @@ function M.validate_query_response(frame)
   return true
 end
 
+local function validate_lookup_response(frame)
+  if type(frame) ~= "table" then
+    return false, "response must be a table"
+  end
+  if frame.v ~= M.VERSION then
+    return false, "response version mismatch"
+  end
+  if frame.op ~= "lookup-definition" then
+    return false, "response.op must be lookup-definition"
+  end
+  if not QUERY_STATES[frame.state] then
+    return false, "response.state is invalid"
+  end
+  if type(frame.metrics) ~= "table" then
+    return false, "response.metrics is required"
+  end
+  if frame.declaration ~= nil then
+    local ok, err = validate_location(frame.declaration)
+    if not ok then return false, "lookup-definition declaration: " .. err end
+  end
+  if frame.definition ~= nil then
+    local ok, err = validate_location(frame.definition)
+    if not ok then return false, "lookup-definition definition: " .. err end
+  end
+  if frame.state == "resolved" then
+    if frame.declaration == nil and frame.definition == nil then
+      return false, "resolved lookup-definition requires declaration or definition"
+    end
+  end
+  return true
+end
+
 function M.validate_response(frame)
   if type(frame) ~= "table" then
     return false, "response must be a table"
@@ -232,6 +303,9 @@ function M.validate_response(frame)
   if frame.op == "query" then
     local ok, err = M.validate_query_response(frame)
     if not ok then return false, err end
+  elseif frame.op == "lookup-definition" then
+    local ok, err = validate_lookup_response(frame)
+    if not ok then return false, err end
   elseif frame.op == "catalog" then
     if not QUERY_STATES[frame.state] then
       return false, "catalog response.state is invalid"
@@ -242,6 +316,31 @@ function M.validate_response(frame)
   elseif frame.op == "handshake" then
     if type(frame.ok) ~= "boolean" then
       return false, "handshake response.ok is required"
+    end
+    if frame.capabilities ~= nil then
+      if type(frame.capabilities) ~= "table" then
+        return false, "handshake response.capabilities must be a table"
+      end
+      if frame.capabilities.query_states ~= nil then
+        if not is_array(frame.capabilities.query_states) then
+          return false, "handshake response.capabilities.query_states must be an array"
+        end
+        for _, state_name in ipairs(frame.capabilities.query_states) do
+          if type(state_name) ~= "string" or not QUERY_STATES[state_name] then
+            return false, "handshake response.capabilities.query_states contains an invalid state"
+          end
+        end
+      end
+      if frame.capabilities.ops ~= nil then
+        if not is_array(frame.capabilities.ops) then
+          return false, "handshake response.capabilities.ops must be an array"
+        end
+        for _, op in ipairs(frame.capabilities.ops) do
+          if type(op) ~= "string" or not REQUEST_OPS[op] then
+            return false, "handshake response.capabilities.ops contains an invalid op"
+          end
+        end
+      end
     end
   elseif frame.op == "prove" then
     if not QUERY_STATES[frame.state] then

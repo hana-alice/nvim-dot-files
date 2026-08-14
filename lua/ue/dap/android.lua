@@ -517,7 +517,7 @@ local function append_bp_diag(lines)
   if type(lines) == "string" then lines = { lines } end
   if type(lines) ~= "table" then return end
   pcall(function()
-    local path = vim.fn.stdpath("cache") .. "/ue-dap-bp-diag.log"
+    local path = vim.fn.stdpath("cache") .. ("/ue-dap-bp-diag.%d.log"):format(vim.fn.getpid())
     local fh = io.open(path, "a")
     if not fh then return end
     for _, line in ipairs(lines) do
@@ -1470,7 +1470,7 @@ function M.stop_android_debugger(opts)
     if cleanup_done then return end
     cleanup_done = true
     M._cleanup_device_side()
-    result.adapter_killed = true
+    result.adapter_killed = sess_active ~= nil
     reset_session()
   end
 

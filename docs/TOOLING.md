@@ -57,15 +57,17 @@ load-bearing on this device (K37); `UE_DAP_NO_SLIDE=1` skips it for re-verificat
 > reference. For current Android behavior, follow **Current Android DAP status**
 > above and the source in `lua/ue/dap/android.lua`.
 
-## clangd / clang (C++ LSP + indexer)
+## clangd / clang / libclang (C++ LSP + semantic sidecar)
 
 - **Required**: LLVM **22.1.x** (22.1.5 verified)
 - **Source**: `winget install LLVM.LLVM`
 - **Install path** (Windows): `C:\Program Files\LLVM\bin\`
-- Used by: clangd LSP, custom `clangd-indexer` super-unity pipeline.
+- Used by: clangd controlled BackgroundIndex, exact-command transport, libclang
+  canonical-USR sidecar, and the on-demand cursor-walk C ABI shim.
 
-Do **not** downgrade clang/clangd to 21.x — the super-unity CDB pipeline
-and `.idx` format depend on 22.x behavior.
+Do **not** downgrade clang/clangd/libclang to 21.x — controlled BackgroundIndex,
+the official `compilationDatabaseChanges` transport, and the libclang/shim ABI
+are verified as one LLVM 22.x toolchain identity.
 
 ## Historical lldb-dap 21 side-load (DAP debugger adapter, Windows)
 

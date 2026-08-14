@@ -44,6 +44,155 @@ t.describe("ue.cdb.paths", function()
     local c = paths.candidates({ engine_root = "/nonexistent_xyz_12345" }, {})
     t.assert_type(c, "table")
   end)
+
+  t.it("候选只来自受控位置，不递归拾取 ThirdParty 测试夹具", function()
+    local root = vim.fn.tempname() .. "-cdb-candidates"
+    local fixture = root .. "/Engine/Source/ThirdParty/Fixture/tests/INPUTS/compile_commands.json"
+    vim.fn.mkdir(vim.fs.dirname(fixture), "p")
+    vim.fn.writefile({ "[]" }, fixture)
+
+    local scanned = false
+    local candidates = paths.candidates({ engine_root = root }, {
+      first_executable = function() return "fd" end,
+      run_lines = function()
+        scanned = true
+        return 0, { fixture }
+      end,
+    })
+
+    vim.fn.delete(root, "rf")
+    t.assert_false(scanned, "CDB 候选不得递归扫描任意嵌套 compile_commands.json")
+    t.assert_eq(#candidates, 0)
+  end)
+
+  t.it("semantic source 按完整 tuple 隔离", function()
+    local path = paths.semantic_source({
+      engine_root = "/UE",
+      paths = { cache = "/UE/.cache/nvim-ue" },
+    }, {
+      platform = "IOS",
+      target = "Sample Client",
+      configuration = "Development",
+    })
+    t.assert_eq(
+      path,
+      "/UE/.cache/nvim-ue/cdb/sources/IOS-Sample_Client-Development/compile_commands.json"
+    )
+  end)
+
+  t.it("当前 tuple semantic source 优先于 canonical 镜像", function()
+    local root = vim.fn.tempname() .. "-cdb-priority"
+    local tuple = { platform = "IOS", target = "Game", configuration = "Development" }
+    local ctx = { engine_root = root, paths = { cache = root .. "/.cache/nvim-ue" } }
+    local semantic = paths.semantic_source(ctx, tuple)
+    local canonical = root .. "/compile_commands.json"
+    vim.fn.mkdir(vim.fs.dirname(semantic), "p")
+    vim.fn.writefile({ "[]" }, semantic)
+    vim.fn.writefile({ "[]" }, canonical)
+
+    local candidates = paths.candidates(ctx, { tuple = tuple })
+    vim.fn.delete(root, "rf")
+    t.assert_eq(candidates[1], semantic)
+    t.assert_eq(candidates[2], canonical)
+  end)
+end)
+
+t.describe("ue.cdb.source provenance", function()
+  local source = require("ue.cdb.source")
+
+  local ctx = {
+    engine_root = "/UE",
+    project_root = "/Project",
+    uproject = "/Project/Game.uproject",
+  }
+  local tuple = {
+    platform = "IOS",
+    target = "Game",
+    configuration = "Development",
+  }
+  local driver = {
+    validate_semantic_cdb = function(entries)
+      for _, entry in ipairs(entries) do
+        local command = tostring(entry.command or "")
+        if command:find("iPhoneOS.platform", 1, true) then
+          return { ok = true, matched = 1 }
+        end
+      end
+      return { ok = false, reason = "missing IOS compiler evidence" }
+    end,
+  }
+
+  t.it("accepts owned entries with target-driver tuple evidence", function()
+    local ok, info = source.validate_content(vim.json.encode({
+      {
+        file = "/UE/Engine/Source/Runtime/Apple/MetalRHI/Private/MetalBuffer.cpp",
+        directory = "/UE/Engine/Source",
+        command = "clang++ -isysroot /Xcode/iPhoneOS.platform/SDK -c MetalBuffer.cpp",
+      },
+    }), ctx, tuple, driver)
+
+    t.assert_true(ok)
+    t.assert_eq(info.entry_count, 1)
+  end)
+
+  t.it("rejects foreign fixtures before they can replace the canonical CDB", function()
+    local ok, info = source.validate_content(vim.json.encode({
+      {
+        file = "/home/example/Projects/SampleGame/project.cpp",
+        directory = "/home/example/Projects/SampleGame",
+        command = "clang++ -c project.cpp",
+      },
+    }), ctx, tuple, driver)
+
+    t.assert_false(ok)
+    t.assert_contains(info.reason, "outside current engine/project roots")
+  end)
+
+  t.it("rejects owned but foreign-platform databases", function()
+    local ok, info = source.validate_content(vim.json.encode({
+      {
+        file = "/UE/Engine/Source/Runtime/Core/Private/Core.cpp",
+        directory = "/UE/Engine/Source",
+        command = "clang++ -isysroot /Xcode/MacOSX.platform/SDK -c Core.cpp",
+      },
+    }), ctx, tuple, driver)
+
+    t.assert_false(ok)
+    t.assert_contains(info.reason, "missing IOS compiler evidence")
+  end)
+
+  t.it("publishes a validated pending source and skips identical rewrites", function()
+    local root = vim.fn.tempname() .. "-semantic-publish"
+    local local_ctx = {
+      engine_root = root .. "/UE",
+      project_root = root .. "/Project",
+      uproject = root .. "/Project/Game.uproject",
+    }
+    local stable = root .. "/cache/compile_commands.json"
+    local pending1 = root .. "/cache/pending-1.json"
+    local pending2 = root .. "/cache/pending-2.json"
+    local content = vim.json.encode({
+      {
+        file = local_ctx.engine_root .. "/Engine/Source/Runtime/Apple/MetalRHI/Private/MetalBuffer.cpp",
+        directory = local_ctx.engine_root .. "/Engine/Source",
+        command = "clang++ -isysroot /Xcode/iPhoneOS.platform/SDK -c MetalBuffer.cpp",
+      },
+    })
+    vim.fn.mkdir(vim.fs.dirname(stable), "p")
+    vim.fn.writefile({ content }, pending1)
+
+    local ok_first, first = source.promote(pending1, stable, local_ctx, tuple, driver)
+    t.assert_true(ok_first)
+    t.assert_false(first.no_op)
+    t.assert_eq(vim.fn.filereadable(stable), 1)
+
+    vim.fn.writefile({ content }, pending2)
+    local ok_second, second = source.promote(pending2, stable, local_ctx, tuple, driver)
+    t.assert_true(ok_second)
+    t.assert_true(second.no_op)
+    t.assert_eq(vim.fn.filereadable(pending2), 0)
+    vim.fn.delete(root, "rf")
+  end)
 end)
 
 t.describe("ue.cdb.shaders", function()
@@ -147,13 +296,13 @@ t.describe("ue.cdb.pipeline lifecycle", function()
 
   t.it("运行中拒绝第二个 writer，完成后释放", function()
     local path = temp_cdb()
-    local captured
+    local captured = {}
     local starts = 0
     local second_result
     pipeline.set_runtime({
       jobstart = function(_, _, opts)
         starts = starts + 1
-        captured = opts
+        captured[#captured + 1] = opts
         return 23
       end,
       notify = function() end,
@@ -168,8 +317,76 @@ t.describe("ue.cdb.pipeline lifecycle", function()
     t.assert_eq(second_jobid, nil, "被拒调用不得返回伪 jobid")
     t.assert_contains(tostring(second_err), "already running")
 
-    captured.on_exit(23, 0, "exit")
+    local index = 1
+    while pipeline.is_running() do
+      local callback = captured[index]
+      t.assert_true(callback ~= nil, "each pipeline step must expose an exit callback")
+      callback.on_exit(23, 0, "exit")
+      index = index + 1
+    end
     t.assert_false(pipeline.is_running(), "成功完成后应释放 writer 锁")
+    pcall(os.remove, path)
+  end)
+
+  t.it("source 已替换时即使 pipeline 无改写也强制重启 clangd", function()
+    local path = temp_cdb()
+    local callbacks = {}
+    local restarts = 0
+    pipeline.set_runtime({
+      jobstart = function(_, _, opts)
+        callbacks[#callbacks + 1] = opts
+        return 29
+      end,
+      notify = function() end,
+      log_error = function() end,
+      restart_clangd = function() restarts = restarts + 1 end,
+    })
+
+    pipeline.run(path, { path }, function() end, { force_restart = true })
+    local index = 1
+    while pipeline.is_running() do
+      callbacks[index].on_exit(29, 0, "exit")
+      index = index + 1
+    end
+
+    t.assert_eq(restarts, 1)
+    pcall(os.remove, path)
+  end)
+
+
+  t.it("每个 CDB phase 使用 argv 顺序执行，不拼接 host shell 字符串", function()
+    local path = temp_cdb()
+    local commands = {}
+    local callbacks = {}
+    pipeline.set_runtime({
+      jobstart = function(command, _, opts)
+        commands[#commands + 1] = command
+        callbacks[#callbacks + 1] = opts
+        return 31
+      end,
+      notify = function() end,
+      log_error = function() end,
+    })
+
+    pipeline.run(path, { path }, function() end)
+    local index = 1
+    while pipeline.is_running() do
+      local callback = callbacks[index]
+      t.assert_true(callback ~= nil)
+      callback.on_exit(31, 0, "exit")
+      index = index + 1
+    end
+
+    t.assert_true(#commands > 0)
+    for _, command in ipairs(commands) do
+      t.assert_type(command, "table")
+      t.assert_false(table.concat(command, " "):find(" && ", 1, true) ~= nil)
+    end
+    if require("utils.platform").is_mac then
+      for _, command in ipairs(commands) do
+        t.assert_false(table.concat(command, " "):find("prebuild_pch_v2.py", 1, true) ~= nil)
+      end
+    end
     pcall(os.remove, path)
   end)
 
@@ -213,7 +430,8 @@ t.describe("ue.cdb.pipeline lifecycle", function()
   t.it("同步入口检查 writer slot 并传播 pipeline 启动结果", function()
     local source = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
     t.assert_contains(source, 'if pipeline.is_running() then\n    return false, "compile_commands pipeline is already running"')
-    t.assert_contains(source, 'local jobid, pipeline_err = run_compile_commands_pipeline(path, targets)')
+    t.assert_contains(source, 'local jobid, pipeline_err = run_compile_commands_pipeline(path, targets, nil, {')
+    t.assert_contains(source, 'force_restart = ctx._force_cdb_restart == true')
     t.assert_contains(source, 'local pipeline_jobid, pipeline_err = run_compile_commands_pipeline(targets[1], targets, function()')
     t.assert_contains(source, 'return false, nil, pipeline_err or "compile_commands pipeline failed to start"')
   end)

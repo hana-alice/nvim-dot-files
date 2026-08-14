@@ -106,7 +106,7 @@ end
 -- ==========================================================================
 
 local function is_native_windows()
-  return vim.fn.has("win32") == 1
+  return _uplat.is_windows
 end
 
 local function clangd_candidates(root_dir)
@@ -133,25 +133,7 @@ local function clangd_candidates(root_dir)
     end
   end
 
-  vim.list_extend(candidates, {
-    "clangd",
-    "/usr/local/bin/clangd",
-    "/usr/bin/clangd",
-  })
-
-  root_dir = norm(root_dir or "")
-  if root_dir:match("^/mnt/[a-z]/") then
-    table.insert(candidates, "/mnt/c/Program Files/LLVM/bin/clangd.exe")
-  end
-
-  -- Windows native paths: when running nvim on Windows directly (not under
-  -- WSL), `clangd` may not be on PATH (the user installs LLVM into Program
-  -- Files but doesn't always add bin/ to PATH). Try the canonical install
-  -- location explicitly.
-  if vim.fn.has("win32") == 1 then
-    table.insert(candidates, "C:/Program Files/LLVM/bin/clangd.exe")
-    table.insert(candidates, "C:/Program Files (x86)/LLVM/bin/clangd.exe")
-  end
+  vim.list_extend(candidates, _uplat.driver().default_clangd_candidates())
 
   return candidates
 end
@@ -975,12 +957,27 @@ local function solution_configuration_data(project_root, uproject)
   return parse_solution_configurations(solution)
 end
 
-local function available_platform_choices(project_root, uproject)
+local function available_platform_choices(project_root, uproject, host_driver)
   local solution = solution_configuration_data(project_root, uproject)
-  if solution and #solution.platforms > 0 then
-    return copy_list(solution.platforms)
+  local candidates = {}
+  local seen = {}
+  for _, candidate in ipairs(solution and solution.platforms or {}) do
+    push_unique(candidates, seen, candidate)
   end
-  return copy_list(UE_CONST.DEFAULT_PLATFORM_CHOICES)
+  -- A checked-out .sln may describe a different host. Always merge canonical
+  -- targets before applying the host matrix so macOS is not left with an empty
+  -- picker merely because the repository also contains Win64/Android entries.
+  for _, candidate in ipairs(UE_CONST.DEFAULT_PLATFORM_CHOICES) do
+    push_unique(candidates, seen, candidate)
+  end
+  host_driver = host_driver or _uplat.driver()
+  local supported = {}
+  for _, candidate in ipairs(candidates) do
+    if require("ue.targets").supports(candidate, "build", host_driver) then
+      supported[#supported + 1] = candidate
+    end
+  end
+  return supported
 end
 
 local function available_configuration_choices(project_root, uproject, platform)
@@ -3284,14 +3281,15 @@ local function target_platform(engine_root, cmd)
       return persisted
     end
   end
-  local exe = trim((cmd or {})[1])
-  if exe ~= "" and (exe:lower():match("%.exe$") or exe:lower():match("%.bat$")) then
-    return "Win64"
+  local driver = _uplat.driver()
+  if type(driver.default_target) == "function" then
+    local detected = trim(driver.default_target())
+    if detected ~= "" then
+      return detected
+    end
   end
-  if engine_root and engine_root:match("^/mnt/[a-z]/") then
-    return "Win64"
-  end
-  return "Linux"
+  -- A failed/unknown host driver must not silently masquerade as Linux.
+  return ""
 end
 
 local function selected_target_configuration(engine_root, project_root, uproject, platform)
@@ -3334,186 +3332,6 @@ end
 -- BUILD COMMANDS — Windows wrappers, UBT, Build.bat
 -- ==========================================================================
 
-local function command_is_windows(cmd)
-  local exe = trim((cmd or {})[1])
-  if exe == "" then
-    return false
-  end
-  exe = exe:lower()
-  return exe:match("%.exe$") ~= nil
-end
-
-local function command_needs_windows_wrapper(cmd)
-  local exe = norm(trim((cmd or {})[1]))
-  return exe ~= "" and exe:lower():match("%.exe$") ~= nil and not exe:match("^/mnt/[a-z]/")
-end
-
-local function powershell_quote(value)
-  return "'" .. tostring(value or ""):gsub("'", "''") .. "'"
-end
-
-local function cmd_quote(value)
-  return '"' .. tostring(value or ""):gsub('"', '""') .. '"'
-end
-
-local function is_windows_path(path)
-  path = trim(path)
-  return path:match("^[A-Za-z]:[\\/]") ~= nil or path:match("^\\\\") ~= nil
-end
-
-local function to_windows_path(path)
-  path = trim(path)
-  if path == "" then
-    return nil
-  end
-  if is_windows_path(path) then
-    return (path:gsub("/", "\\"))
-  end
-
-  -- Historical: this used to spawn `wslpath -w` to convert /mnt/d/... into
-  -- D:\... when ue.lua ran inside WSL. WSL is no longer a supported host
-  -- (Windows-native + Mac-native only), so a non-Windows path here means
-  -- the caller passed a malformed path (e.g. drive-relative like "E:aki/"
-  -- or a posix absolute that doesn't make sense on this host). Fail
-  -- loudly instead of silently spawning a missing helper.
-  return nil
-end
-
-local function windows_host_cwd()
-  for _, candidate in ipairs({ "/mnt/c/Windows", "/mnt/c" }) do
-    if _ufs.is_dir(candidate) then
-      return candidate
-    end
-  end
-  return cwd()
-end
-
-local function build_bat_path(engine_root)
-  if is_windows_path(engine_root) then
-    return engine_root:gsub("/", "\\") .. "\\Engine\\Build\\BatchFiles\\Build.bat"
-  end
-  return join(engine_root, "Engine", "Build", "BatchFiles", "Build.bat")
-end
-
-local function ubt_exe_path(engine_root)
-  if is_windows_path(engine_root) then
-    return engine_root:gsub("/", "\\") .. "\\Engine\\Binaries\\DotNET\\UnrealBuildTool.exe"
-  end
-  return join(engine_root, "Engine", "Binaries", "DotNET", "UnrealBuildTool.exe")
-end
-
-local function ensure_executable(path)
-  if is_windows_path(path) then
-    return true
-  end
-  if vim.fn.executable(path) == 1 then
-    return true
-  end
-  local code = select(1, run_lines({ "chmod", "+x", path }))
-  if code == 0 and vim.fn.executable(path) == 1 then
-    return true
-  end
-  return false, "Failed to mark executable: " .. path
-end
-
-local function direct_ubt_command(engine_root, args)
-  local exe = ubt_exe_path(engine_root)
-  if not _ufs.is_file(exe) then
-    return nil, "UnrealBuildTool.exe not found under engine root: " .. exe
-  end
-
-  local ok_exec, exec_err = ensure_executable(exe)
-  if not ok_exec then
-    return nil, exec_err
-  end
-
-  local cmd = { exe }
-  vim.list_extend(cmd, args or {})
-  return cmd
-end
-
-local function build_bat_windows_command(engine_root, args)
-  local engine_root_win = to_windows_path(engine_root)
-  if not engine_root_win then
-    return nil, "Failed to convert engine root to Windows path: " .. engine_root
-  end
-
-  local build_bat_win = to_windows_path(build_bat_path(engine_root))
-  if not build_bat_win then
-    return nil, "Failed to convert Build.bat path to Windows path: " .. build_bat_path(engine_root)
-  end
-
-  local function direct_cmd_token(value)
-    value = tostring(value or "")
-    if value:find("%s") then
-      return cmd_quote(value)
-    end
-    return value
-  end
-
-  local function shell_cmd_token(value)
-    value = tostring(value or "")
-    if value:find("%s") then
-      return '\\"' .. value:gsub('"', '\\"') .. '\\"'
-    end
-    return value
-  end
-
-  local direct_parts = {
-    "call " .. direct_cmd_token(build_bat_win),
-  }
-
-  for _, arg in ipairs(args or {}) do
-    table.insert(direct_parts, direct_cmd_token(arg))
-  end
-
-  if _uplat.is_windows then
-    return { "cmd.exe", "/d", "/c", table.concat(direct_parts, " ") }
-  end
-
-  local parts = {
-    "call " .. shell_cmd_token(build_bat_win),
-  }
-
-  for _, arg in ipairs(args or {}) do
-    table.insert(parts, shell_cmd_token(arg))
-  end
-
-  local shell = _uproc.first_executable({ "zsh", "bash", "sh" })
-  if not shell then
-    return { "cmd.exe", "/d", "/c", table.concat(direct_parts, " ") }
-  end
-  local shell_name = vim.fs.basename(shell)
-  local shell_flag = shell_name == "sh" and "-c" or "-lc"
-  local shell_cmd = ('cd %s && cmd.exe /d /c "%s"'):format(
-    vim.fn.shellescape(windows_host_cwd()),
-    table.concat(parts, " ")
-  )
-
-  return { shell, shell_flag, shell_cmd }
-end
-
-local function wrap_windows_command(cmd)
-  local exe_win = to_windows_path((cmd or {})[1])
-  if not exe_win then
-    return nil, "Failed to convert Windows executable path: " .. tostring((cmd or {})[1])
-  end
-
-  local parts = { "& " .. powershell_quote(exe_win) }
-  for index = 2, #cmd do
-    table.insert(parts, powershell_quote(cmd[index]))
-  end
-
-  return {
-    "powershell.exe",
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-Command",
-    table.concat(parts, " "),
-  }
-end
-
 -- ==========================================================================
 -- COMPILE_COMMANDS.JSON GENERATION
 -- ==========================================================================
@@ -3522,19 +3340,9 @@ local function compile_commands_targets(ctx)
   return require("ue.cdb.paths").targets(ctx)
 end
 
-local function windows_engine_root(ctx)
-  local override = trim(vim.env.UE_WINDOWS_ENGINE_ROOT)
-  if override ~= "" then
-    return to_windows_path(override)
-  end
-
-  return to_windows_path(ctx.engine_root)
-end
-
-local function compile_commands_candidates(ctx)
+local function compile_commands_candidates(ctx, tuple)
   return require("ue.cdb.paths").candidates(ctx, {
-    first_executable = first_executable,
-    run_lines        = run_lines,
+    tuple = tuple,
   })
 end
 
@@ -4263,6 +4071,7 @@ local function collect_rsp_files(ctx)
 
   local rsp_files = {}
   local kept_by_target = false
+  local rsp_driver = platform ~= "" and require("ue.targets").driver(platform) or nil
   for _, line in ipairs(lines) do
     local p = norm(trim(line))
     if p ~= "" then
@@ -4282,9 +4091,16 @@ local function collect_rsp_files(ctx)
       if is_compile and not is_backup and not is_linker then
         local dominated = true
 
-        -- Platform filter: `/<Platform>/` must appear in the path.
+        -- Platform/config ownership is delegated to the selected Unreal
+        -- target driver. Host OS and target platform are intentionally
+        -- orthogonal; IOS never falls through to the Mac target classifier.
         if platform ~= "" then
-          if not p:find("/" .. platform .. "/", 1, true) then
+          local classified = rsp_driver and rsp_driver.classify_rsp(p, {
+            configuration = config_filter,
+          }) or nil
+          if classified and not classified.match then
+            dominated = false
+          elseif not classified and not p:find("/" .. platform .. "/", 1, true) then
             dominated = false
           end
         end
@@ -4306,8 +4122,8 @@ local function collect_rsp_files(ctx)
           end
         end
 
-        -- Configuration filter (Development / DebugGame / Shipping / Test).
-        if dominated and config_filter and config_filter ~= "" then
+        -- Unknown/legacy targets retain the old generic configuration guard.
+        if dominated and not rsp_driver and config_filter and config_filter ~= "" then
           if not p:find("/" .. config_filter .. "/", 1, true) then
             dominated = false
           end
@@ -4687,7 +4503,7 @@ end
 ---        pipeline — otherwise the two writers tear the file mid-write and the
 ---        pipeline's resolve stage hits a JSONDecodeError. See changelog
 ---        2026-06-25 "cdb_partition race".
-local function run_compile_commands_pipeline(path, targets, on_done)
+local function run_compile_commands_pipeline(path, targets, on_done, opts)
   -- ue.cdb.pipeline drives the expand → pch → resolve → unify → prune
   -- chain. We inject `_logged_jobstart` here so the pipeline module stays
   -- import-safe (no circular require to ue.lua) and headlessly testable.
@@ -4697,7 +4513,7 @@ local function run_compile_commands_pipeline(path, targets, on_done)
     notify    = function(msg, level) vim.notify(msg, level) end,
     log_error = function(scope, msg) require("utils.log").notify_error(scope, msg) end,
   })
-  return pipeline.run(path, targets, on_done)
+  return pipeline.run(path, targets, on_done, opts)
 end
 
 local function write_compile_commands_targets(ctx, content)
@@ -4737,15 +4553,27 @@ local function write_compile_commands_targets(ctx, content)
 end
 
 local function export_compile_commands_to_engine_root(ctx)
-  local candidates = compile_commands_candidates(ctx)
-  for _, candidate in ipairs(candidates) do
-    local content = read_all(candidate)
-    if content then
-      return write_compile_commands_targets(ctx, content)
-    end
+  local target_ctx, target_err, driver = CORE_RT.target_context(ctx)
+  if not target_ctx then
+    return false, "cannot validate compile_commands provenance: " .. tostring(target_err)
   end
 
-  return false, "compile_commands.json not found at any candidate path"
+  local source = require("ue.cdb.source")
+  local rejected = {}
+  local candidates = compile_commands_candidates(ctx, target_ctx)
+  for _, candidate in ipairs(candidates) do
+    local ok, info = source.read_valid(candidate, ctx, target_ctx, driver)
+    if ok then
+      return write_compile_commands_targets(ctx, info.content)
+    end
+    rejected[#rejected + 1] = candidate .. ": " .. tostring(info.reason)
+  end
+
+  if #rejected > 0 then
+    return false, "no trusted compile_commands source for the active tuple; rejected "
+      .. table.concat(rejected, " | ")
+  end
+  return false, "compile_commands.json not found at any controlled candidate path"
 end
 
 local function generate_compile_commands(ctx, progress)
@@ -4757,7 +4585,9 @@ local function generate_compile_commands(ctx, progress)
   local targets = compile_commands_targets(ctx)
 
   local function start_pipeline(path)
-    local jobid, pipeline_err = run_compile_commands_pipeline(path, targets)
+    local jobid, pipeline_err = run_compile_commands_pipeline(path, targets, nil, {
+      force_restart = ctx._force_cdb_restart == true,
+    })
     if jobid == nil then
       return false, pipeline_err or "compile_commands pipeline failed to start"
     end
@@ -4783,18 +4613,9 @@ local function generate_compile_commands(ctx, progress)
     return true, rsp_path .. " (" .. rsp_count .. " entries from .rsp files)"
   end
 
-  -- FALLBACK: an existing UBT-generated compile_commands.json at a target path.
-  -- Only used if no rsp files are present (fresh clone / pre-build).
-  for _, target in ipairs(targets) do
-    if _ufs.is_file(target) and vim.fn.getfsize(target) > 1024 then
-      slim_compile_commands_file(target)
-      local ok_pipeline, pipeline_err = start_pipeline(target)
-      if not ok_pipeline then return false, pipeline_err end
-      return true, target .. " (UBT, existing)"
-    end
-  end
-
-  -- FALLBACK 2: search candidate locations (Engine/Intermediate/Build/, project root, fd search)
+  -- FALLBACK: reuse only a provenance-checked CDB from a controlled location.
+  -- Apple semantic compilation stores its tuple-specific UBT database under
+  -- .cache/nvim-ue/cdb/sources; arbitrary recursive fixtures are never eligible.
   local ok_existing, existing_path = export_compile_commands_to_engine_root(ctx)
   if ok_existing then
     local ok_pipeline, pipeline_err = start_pipeline(targets[1])
@@ -4803,101 +4624,126 @@ local function generate_compile_commands(ctx, progress)
   end
 
   return false,
-    "No engine compile_commands source found. Build the project once (UBT writes Module.*.rsp under Intermediate/Build) or place a compile_commands.json at the engine root."
+    "No engine compile_commands source found. Run :UECompileForNvim to build the active target and prepare its RSP-backed database, or place a compile_commands.json at the engine root."
 end
 
 -- ==========================================================================
 -- BUILD COMMAND (UBT/Build.bat — platform from state.target_platform)
 -- ==========================================================================
 
--- Build a UBT/Build.bat command for the process-local platform+configuration
--- initialized from project state (set via :UESetPlatform). Despite the legacy name, this is
--- platform-agnostic — Win64/Android/IOS/Linux all flow through the same
--- "Build.bat <Target> <Platform> <Configuration> -Project=..." invocation.
+do
+  local function target_runtime_state(ctx, platform)
+    local runtime = ctx and ctx.state and ctx.state.target_runtime or {}
+    return type(runtime) == "table" and type(runtime[platform]) == "table" and runtime[platform] or {}
+  end
+
+  function CORE_RT.target_context(ctx, platform_override, opts)
+    opts = opts or {}
+    local uproject = ctx.uproject or find_uproject_in_dir(ctx.project_root)
+    if not uproject then
+      return nil, "No .uproject found in project root: " .. tostring(ctx.project_root)
+    end
+
+    local platform = trim(platform_override or "")
+    if platform == "" then
+      platform = target_platform(ctx.engine_root, nil)
+    end
+    local driver = require("ue.targets").driver(platform)
+    if not driver then
+      return nil, "No Unreal target driver registered for platform: " .. platform
+    end
+
+    local configuration = target_configuration(
+      ctx.engine_root, ctx.project_root, uproject, platform
+    )
+    local kind = target_kind(ctx.engine_root, ctx.project_root, uproject, platform)
+    local target_name = build_target_name(ctx.project_root, uproject, kind)
+    local project_dir = _ufs.dirname(uproject)
+    local runtime = target_runtime_state(ctx, platform)
+    local archive_dir = trim(opts.archive_dir or runtime.archive_dir or "")
+    if archive_dir == "" then
+      archive_dir = join(project_dir, "Saved", "Archives", platform, target_name .. "-" .. configuration)
+    end
+
+    return {
+      engine_root = ctx.engine_root,
+      project_root = ctx.project_root,
+      project_dir = project_dir,
+      project = uproject,
+      uproject = uproject,
+      target = target_name,
+      platform = platform,
+      target_platform = platform,
+      configuration = configuration,
+      cwd = ctx.engine_root,
+      archive_dir = archive_dir,
+      config_root = vim.fn.stdpath("config"),
+      device_id = opts.device_id or runtime.device_id,
+      bundle_id = opts.bundle_id or runtime.bundle_id,
+      artifacts = opts.artifacts or runtime.artifacts,
+      json_output = opts.json_output,
+      skip_deploy = opts.skip_deploy == true,
+      operation = opts.operation,
+    }, nil, driver
+  end
+
+  function CORE_RT.target_plan(operation, ctx, platform_override, opts)
+    local target_ctx, context_err, driver = CORE_RT.target_context(ctx, platform_override, opts)
+    if not target_ctx then
+      return nil, context_err
+    end
+    local host_driver = (opts and opts.host_driver) or require("utils.platform").driver()
+    local platform = target_ctx.platform
+    local resolved, unavailable = require("ue.targets").resolve(platform, operation, host_driver)
+    if not resolved then
+      return nil, ("%s %s unavailable on host %s: %s"):format(
+        platform,
+        operation,
+        tostring(unavailable.host_id or "<unknown>"),
+        tostring(unavailable.reason)
+      )
+    end
+    driver = resolved
+    local planner = driver[operation .. "_plan"]
+    if type(planner) ~= "function" then
+      return nil, ("Target %s does not implement %s"):format(driver.id, operation)
+    end
+    local plan = planner(target_ctx, host_driver)
+    local command, plan_err = require("ue.target_tasks").command(plan)
+    if not command then
+      return nil, ("%s %s unavailable: %s"):format(driver.id, operation, plan_err)
+    end
+    return command, nil, plan, driver, target_ctx
+  end
+
+  function CORE_RT.update_target_runtime(engine_root, platform, values)
+    local state = read_state(engine_root)
+    local all = type(state.target_runtime) == "table" and vim.deepcopy(state.target_runtime) or {}
+    local current = type(all[platform]) == "table" and vim.deepcopy(all[platform]) or {}
+    for key, value in pairs(values or {}) do
+      current[key] = value
+    end
+    current.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
+    all[platform] = current
+    update_state_field(engine_root, "target_runtime", all)
+    CORE_RT.context_cache = {}
+    return current
+  end
+end
+
+-- Build the platform+configuration persisted in state.json (set via
+-- :UESetPlatform). The legacy public name remains, but executable selection is
+-- host-owned (`Build.bat` on Windows, `Build.sh` on macOS/Linux) and target argv
+-- comes exclusively from the selected target driver.
 -- Kept as `android_build_command` for now to avoid breaking the public
 -- M.android_build_command API surface; rename together when there are
 -- no external callers left.
 local function android_build_command(ctx, opts)
   opts = opts or {}
-  local uproject = ctx.uproject or find_uproject_in_dir(ctx.project_root)
-  if not uproject then
-    return nil, "No .uproject found in project root: " .. ctx.project_root
-  end
-
-  local uproject_win = to_windows_path(uproject)
-  if not uproject_win then
-    return nil, "Failed to convert UE build paths to Windows paths"
-  end
-
-  local plat = target_platform(ctx.engine_root, nil)
-  local conf = target_configuration(ctx.engine_root, ctx.project_root, uproject, plat)
-  local kind = target_kind(ctx.engine_root, ctx.project_root, uproject, plat)
-  local target_name = build_target_name(ctx.project_root, uproject, kind)
-
-  if opts.skip_deploy == true then
-    if plat ~= "Android" then
-      return nil, "UEBuildAndroidSO requires target platform Android; current platform: " .. plat
-    end
-    if not is_windows_path(ctx.engine_root) then
-      return nil, "UEBuildAndroidSO currently requires a Windows UE host"
-    end
-
-    local engine_root_win = windows_engine_root(ctx)
-    local script = join(vim.fn.stdpath("config"), "scripts", "ue_android_so_build.ps1")
-    local script_win = to_windows_path(script)
-    if not engine_root_win or engine_root_win == "" or not script_win then
-      return nil, "Failed to resolve Windows paths for Android SO build"
-    end
-    if not _ufs.is_file(script) then
-      return nil, "Android SO build script not found: " .. script
-    end
-
-    return {
-      "powershell.exe",
-      "-NoLogo",
-      "-NoProfile",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-File",
-      script_win,
-      "-EngineRoot",
-      engine_root_win,
-      "-Project",
-      uproject_win,
-      "-Target",
-      target_name,
-      "-Platform",
-      plat,
-      "-Configuration",
-      conf,
-      "-WaitMutex",
-      "-FromMsBuild",
-    }
-  end
-
-  local build_args = {
-    target_name,
-    plat,
-    conf,
-    "-Project=" .. uproject_win,
-    "-WaitMutex",
-    "-FromMsBuild",
-  }
-  if is_windows_path(ctx.engine_root) then
-    local engine_root_win = windows_engine_root(ctx)
-    if not engine_root_win or engine_root_win == "" then
-      return nil, "Failed to resolve Windows engine root for build command"
-    end
-
-    local build_bat_file = build_bat_path(engine_root_win)
-    if not is_windows_path(build_bat_file) and not _ufs.is_file(build_bat_file) then
-      return nil, "Build.bat not found under engine root: " .. build_bat_file
-    end
-
-    return build_bat_windows_command(engine_root_win, build_args)
-  end
-
-  return direct_ubt_command(ctx.engine_root, build_args)
+  local operation = opts.operation or (opts.skip_deploy == true and "so_build" or "build")
+  opts.operation = operation
+  local command, err = CORE_RT.target_plan(operation, ctx, nil, opts)
+  return command, err
 end
 
 -- ==========================================================================
@@ -5026,6 +4872,7 @@ local function open_terminal_command(cmd, opts)
     set_build_status("B...")
   end
 
+  local build_monitor
   local active_jobid
   active_jobid = vim.fn.termopen(cmd, {
     cwd = opts.cwd,
@@ -5037,6 +4884,10 @@ local function open_terminal_command(cmd, opts)
     end,
     on_exit = function(_, code)
       vim.schedule(function()
+        if build_monitor then
+          build_monitor:stop()
+          build_monitor = nil
+        end
         if vim.api.nvim_buf_is_valid(buf) then
           vim.bo[buf].bufhidden = "wipe"
         end
@@ -5055,9 +4906,14 @@ local function open_terminal_command(cmd, opts)
           set_build_status(code == 0 and "BOK" or ("B" .. tostring(code)))
         end
         local level = code == 0 and vim.log.levels.INFO or vim.log.levels.ERROR
-        local msg = ("UE build finished with exit code %d"):format(code)
+        local msg = ("%s finished with exit code %d"):format(
+          opts.finish_label or "UE build", code
+        )
         vim.notify(msg, level)
         if code ~= 0 then require("utils.log").error("ue.build", msg) end
+        if type(opts.on_exit) == "function" then
+          opts.on_exit(code, vim.deepcopy(output_lines))
+        end
       end)
     end,
   })
@@ -5067,7 +4923,7 @@ local function open_terminal_command(cmd, opts)
       set_build_status("BERR")
     end
     require("utils.log").notify_error("ue.build", "Failed to start UE build terminal")
-    return
+    return nil
   end
 
   CORE_RT.build_term_jobid = active_jobid
@@ -5083,7 +4939,14 @@ local function open_terminal_command(cmd, opts)
       started_at = os.time(),
     })
   end)
+  pcall(function()
+    build_monitor = require("ue.build_monitor").start({
+      jobid = active_jobid,
+      bufnr = buf,
+    })
+  end)
   startinsert_in_window(win)
+  return active_jobid
 end
 
 -- ==========================================================================
@@ -6531,6 +6394,22 @@ function M._android_build_command_for_test(ctx, opts)
   return android_build_command(ctx, opts)
 end
 
+function M._target_plan_for_test(operation, ctx, platform, opts)
+  return CORE_RT.target_plan(operation, ctx, platform, opts)
+end
+
+function M._target_platform_for_test(engine_root)
+  return target_platform(engine_root, nil)
+end
+
+function M._available_platform_choices_for_test(host_driver, project_root, uproject)
+  return available_platform_choices(project_root, uproject, host_driver)
+end
+
+function M._clangd_version_compatible_for_test(output)
+  return CORE_RT.clangd_version_compatible(output)
+end
+
 -- ==========================================================================
 -- USER COMMANDS — paths, cheatsheet, project, platform, build, prepare
 -- ==========================================================================
@@ -6961,6 +6840,20 @@ local function set_platform(input)
   input = trim(input or "")
   if input ~= "" then
     local plat, conf = split_platform_input(input)
+    if plat and plat ~= "" then
+      local _, unavailable = require("ue.targets").resolve(plat, "build", _uplat.driver())
+      if unavailable then
+        vim.notify(
+          ("Target %s cannot build on host %s: %s"):format(
+            plat,
+            tostring(_uplat.driver().id),
+            tostring(unavailable.reason)
+          ),
+          vim.log.levels.WARN
+        )
+        return
+      end
+    end
     local ok_update, update_err = CORE_RT.project_state.update_target(
       engine_root,
       (plat and plat ~= "") and plat or current_plat,
@@ -7063,9 +6956,9 @@ local export_compile_commands
 -- `require("ue.dap").stop_android_debugger(...)` directly. The previous
 -- forward-declaration pattern relied on dap.lua doing a bare global write
 -- to fill this local, which silently broke after the tiered split (different
--- main chunks don't share locals). See build_android() below.
+-- main chunks don't share locals). See build_target() below.
 
-local function build_android(opts)
+local function build_target(opts)
   opts = opts or {}
   local ctx, err = resolve_context()
   if not ctx then
@@ -7080,52 +6973,217 @@ local function build_android(opts)
     return
   end
 
-  local plat = target_platform(ctx.engine_root, nil)
+  local plat = trim(opts.platform or "")
+  if plat == "" then plat = target_platform(ctx.engine_root, nil) end
   local conf = selected_target_configuration(ctx.engine_root, ctx.project_root, ctx.uproject, plat)
-  local so_only = opts.skip_deploy == true
-  if so_only and plat ~= "Android" then
-    vim.notify("UEBuildAndroidSO requires target platform Android; current platform: " .. plat,
-      vim.log.levels.WARN)
-    return
-  end
-  local title = ((so_only and "UEBuildAndroidSO" or "UEBuild") .. " %s %s"):format(plat, conf)
+  local operation = opts.operation or (opts.skip_deploy == true and "so_build" or "build")
+  opts.operation = operation
+  local so_only = operation == "so_build"
+  local title_prefix = opts.title or (so_only and "UEBuildAndroidSO" or "UEBuild")
+  local title = (title_prefix .. " %s %s"):format(plat, conf)
 
-  local cmd, build_err = android_build_command(ctx, { skip_deploy = so_only })
+  local host_driver = opts.host_driver or require("utils.platform").driver()
+  opts.host_driver = host_driver
+  local cmd, build_err, plan, driver, target_ctx = CORE_RT.target_plan(operation, ctx, plat, opts)
   if not cmd then
     set_build_status("BERR")
     require("utils.log").notify_error("ue.build", title .. " failed: " .. build_err)
     return
   end
 
-  if plat == "Android" then
-    local cleanup = require("ue.dap").stop_android_debugger({ kill_orphans = true })
-    -- SO-only builds never enter UBT's DeployAfterCompile/MakeApk phase, so
-    -- deleting Gradle packaging state here would only slow the next real APK.
-    if not so_only then
-      cleanup_gradle_debug_artifacts(ctx)
+  target_ctx.source_context = ctx
+  if type(driver.before_build) == "function" then
+    local preflight = driver.before_build(target_ctx, {
+      stop_debugger = function(cleanup_opts)
+        return require("ue.dap").stop_android_debugger(cleanup_opts)
+      end,
+      cleanup_gradle = cleanup_gradle_debug_artifacts,
+    })
+    if preflight and preflight.ok == false then
+      require("utils.log").notify_error("ue.build", preflight.reason or "target pre-build failed")
+      return
     end
-    if cleanup.disconnected or cleanup.adapter_killed or cleanup.orphan_killed > 0 then
-      local parts = {}
-      if cleanup.disconnected then
-        table.insert(parts, "detached active DAP")
-      end
-      if cleanup.adapter_killed then
-        table.insert(parts, "stopped lldb-dap adapter")
-      end
-      if cleanup.orphan_killed > 0 then
-        table.insert(parts, ("killed %d stale lldb-dap process%s"):format(
-          cleanup.orphan_killed,
-          cleanup.orphan_killed == 1 and "" or "es"
-        ))
-      end
-      vim.notify("Android build preflight: " .. table.concat(parts, ", "), vim.log.levels.INFO)
+    if preflight and preflight.message then
+      vim.notify(preflight.message, vim.log.levels.INFO)
     end
   end
-  open_terminal_command(cmd, {
-    cwd = windows_host_cwd(),
-    quickfix_title = title,
+  local function start_build()
+    return open_terminal_command(cmd, {
+      cwd = plan.cwd or ctx.engine_root,
+      quickfix_title = title,
+      quickfix_root = workspace_root(ctx),
+      tail_limit = 16,
+      on_exit = opts.on_exit,
+    })
+  end
+
+  if type(driver.preflight_plans) == "function" and type(CORE_RT.run_target_preflight) == "function" then
+    CORE_RT.run_target_preflight(driver, "build", target_ctx, host_driver, function(ok, preflight_err)
+      if not ok then
+        set_build_status("BERR")
+        require("utils.log").notify_error("ue.build", title .. " failed: " .. tostring(preflight_err))
+        return
+      end
+      start_build()
+    end)
+    return
+  end
+
+  return start_build()
+end
+
+function CORE_RT.clangd_version_compatible(output)
+  local major, minor = tostring(output or ""):match("[Vv]ersion%s+(%d+)%.(%d+)")
+  major, minor = tonumber(major), tonumber(minor)
+  return major == 22 and minor == 1, major, minor
+end
+
+-- Apple toolchains do not reliably retain per-action response files after a
+-- successful build. :UECompileForNvim therefore asks the active target driver
+-- for a semantic action-graph plan, publishes its tuple-scoped CDB only after
+-- validation, then lets the ordinary (prepare-only) pipeline consume it.
+function CORE_RT.generate_semantic_cdb_after_build(on_done)
+  on_done = on_done or function() end
+  local ctx, context_err = resolve_context()
+  if not ctx then
+    on_done(false, context_err)
+    return nil
+  end
+
+  local target_ctx, target_err = CORE_RT.target_context(ctx)
+  if not target_ctx then
+    on_done(false, target_err)
+    return nil
+  end
+
+  local host_driver = require("utils.platform").driver()
+  local targets = require("ue.targets")
+  if not targets.supports(target_ctx.platform, "semantic_cdb", host_driver) then
+    on_done(true, { skipped = true, reason = "target uses response-file evidence" })
+    return true
+  end
+
+  local cdb_paths = require("ue.cdb.paths")
+  local stable_path = cdb_paths.semantic_source(ctx, target_ctx)
+  local output_dir = _ufs.dirname(stable_path)
+  _ufs.ensure_dir(output_dir)
+  local pending_name = ("compile_commands.pending-%d-%s.json"):format(
+    vim.fn.getpid(), tostring(vim.uv.hrtime())
+  )
+  local pending_path = join(output_dir, pending_name)
+  local semantic_ctx = vim.deepcopy(target_ctx)
+  semantic_ctx.semantic_cdb_output_dir = output_dir
+  semantic_ctx.semantic_cdb_output_filename = pending_name
+
+  local plan = targets.plan(target_ctx.platform, "semantic_cdb", semantic_ctx, host_driver)
+  local command, plan_err = require("ue.target_tasks").command(plan)
+  if not command then
+    on_done(false, plan_err)
+    return nil
+  end
+
+  vim.notify(
+    ("Generating %s semantic CDB (no cook/package/compile actions)..."):format(target_ctx.platform),
+    vim.log.levels.INFO,
+    { title = "UECompileForNvim" }
+  )
+  local jobid = open_terminal_command(command, {
+    cwd = plan.cwd or ctx.engine_root,
+    quickfix_title = ("UECompileForNvim semantic CDB %s %s"):format(
+      target_ctx.platform, target_ctx.configuration
+    ),
     quickfix_root = workspace_root(ctx),
-    tail_limit = 16,
+    tail_limit = 32,
+    finish_label = "UE semantic CDB",
+    on_exit = function(code)
+      if code ~= 0 then
+        pcall(os.remove, pending_path)
+        local message = ("semantic CDB generation failed with exit code %d"):format(code)
+        on_done(false, message)
+        return
+      end
+
+      local ok_publish, info = require("ue.cdb.source").promote(
+        pending_path, stable_path, ctx, target_ctx, targets.must_get(target_ctx.platform)
+      )
+      if not ok_publish then
+        pcall(os.remove, pending_path)
+        on_done(false, info.reason)
+        return
+      end
+
+      vim.notify(
+        ("Semantic CDB ready: %d entries%s"):format(
+          info.entry_count, info.no_op and " (unchanged)" or ""
+        ),
+        vim.log.levels.INFO,
+        { title = "UECompileForNvim" }
+      )
+      on_done(true, info)
+    end,
+  })
+  if not jobid then
+    pcall(os.remove, pending_path)
+    on_done(false, "failed to start semantic CDB task")
+  end
+  return jobid
+end
+
+function CORE_RT.compile_for_nvim()
+  local clangd_cmd = M.clangd_cmd()
+  local executable = type(clangd_cmd) == "table" and clangd_cmd[1] or nil
+  if not executable or executable == "" then
+    require("utils.log").notify_error("ue.semantic", "clangd executable is unavailable")
+    return
+  end
+
+  return require("ue.target_tasks").run({
+    executable = executable,
+    args = { "--version" },
+    metadata = { operation = "clangd-version-preflight" },
+  }, {
+    name = "UECompileForNvim clangd preflight",
+    on_exit = function(result)
+      if result.code ~= 0 then
+        require("utils.log").notify_error(
+          "ue.semantic", require("ue.target_tasks").error_message(result)
+        )
+        return
+      end
+      local version_output = result.stdout ~= "" and result.stdout or result.stderr
+      local compatible, major, minor = CORE_RT.clangd_version_compatible(version_output)
+      if not compatible then
+        require("utils.log").notify_error("ue.semantic", (
+          "clangd %s.%s is incompatible; this repository requires LLVM clangd 22.1.x. "
+            .. "Tree-sitter syntax highlighting remains available, but compiler semantics were not prepared."
+        ):format(tostring(major or "?"), tostring(minor or "?")))
+        return
+      end
+      build_target({
+        title = "UECompileForNvim",
+        on_exit = function(code)
+          if code == 0 then
+            CORE_RT.generate_semantic_cdb_after_build(function(ok_semantic, semantic_info)
+              if not ok_semantic then
+                require("utils.log").notify_error(
+                  "ue.semantic", tostring(semantic_info or "semantic CDB generation failed")
+                )
+                return
+              end
+              if type(CORE_RT.prepare_async) == "function" then
+                CORE_RT.prepare_async({
+                  force_cdb_restart = type(semantic_info) == "table"
+                    and semantic_info.skipped ~= true
+                    and semantic_info.no_op ~= true,
+                })
+              else
+                require("utils.log").notify_error("ue.semantic", "UEPrepare entry is unavailable")
+              end
+            end)
+          end
+        end,
+      })
+    end,
   })
 end
 
@@ -7158,121 +7216,20 @@ local function find_apk(ctx)
   return best
 end
 
-local function android_so_from_receipt(project_dir, target, platform, configuration)
-  local binaries_dir = join(project_dir, "Binaries", "Android")
-  local receipt_path = join(binaries_dir, target .. ".target")
-  if not _ufs.is_file(receipt_path) then return nil, false end
-
-  local file = io.open(receipt_path, "rb")
-  if not file then return nil, true end
-  local content = file:read("*a")
-  file:close()
-
-  local ok, receipt = pcall(vim.json.decode, content or "")
-  if not ok or type(receipt) ~= "table" then return nil, true end
-  if receipt.TargetName ~= target
-      or receipt.Platform ~= platform
-      or receipt.Configuration ~= configuration then
-    return nil, true
-  end
-
-  local expected_basenames = {
-    [(target .. "-arm64.so"):lower()] = true,
-    [("%s-%s-%s-arm64.so"):format(target, platform, configuration):lower()] = true,
-  }
-
-  local function resolve_product(raw_path)
-    if type(raw_path) ~= "string" then return nil end
-    local normalized = norm(raw_path)
-    local project_prefix = "$(ProjectDir)/"
-    if normalized:sub(1, #project_prefix) ~= project_prefix then return nil end
-
-    local candidate = join(project_dir, normalized:sub(#project_prefix + 1))
-    local basename = vim.fs.basename(candidate):lower()
-    if not _ufs.path_has_prefix(candidate, binaries_dir)
-        or not expected_basenames[basename] then
-      return nil
-    end
-    return _ufs.is_file(candidate) and candidate or nil
-  end
-
-  local launch = resolve_product(receipt.Launch)
-  if launch then return launch, true end
-  local candidates, seen = {}, {}
-  for _, product in ipairs(receipt.BuildProducts or {}) do
-    if type(product) == "table" and product.Type == "Executable" then
-      local candidate = resolve_product(product.Path)
-      if candidate and not seen[candidate] then
-        seen[candidate] = true
-        candidates[#candidates + 1] = candidate
-      end
-    end
-  end
-  return #candidates == 1 and candidates[1] or nil, true
-end
-
-local function find_android_so(ctx)
-  local pr = uproject_dir(ctx)
-  if not pr or pr == "" then return nil end
-
-  local uproject = ctx.uproject or find_uproject_in_dir(ctx.project_root)
-  if not uproject then return nil end
-  local platform = target_platform(ctx.engine_root, nil)
-  local configuration = target_configuration(ctx.engine_root, ctx.project_root, uproject, platform)
-  local kind = target_kind(ctx.engine_root, ctx.project_root, uproject, platform)
-  local target = build_target_name(ctx.project_root, uproject, kind)
-
-  -- UE4 commonly emits a configuration-neutral `<Target>-arm64.so` filename.
-  -- The adjacent UBT receipt is the authoritative identity:
-  -- only accept its product after target/platform/configuration all match the
-  -- active build selection. This avoids both the old false "SO not found" and
-  -- a dangerous wildcard fallback to a stale artifact from another config.
-  local receipt_so, receipt_present = android_so_from_receipt(pr, target, platform, configuration)
-  if receipt_present then return receipt_so end
-
-  -- Compatibility with engines that encode target identity in the filename.
-  local exact = join(pr, "Binaries", "Android", ("%s-Android-%s-arm64.so"):format(target, configuration))
-  return _ufs.is_file(exact) and exact or nil
-end
-
-local function android_so_deploy_command(ctx, serial, package_name)
-  serial = trim(serial)
-  package_name = trim(package_name)
-  if serial == "" then return nil, "Android device is not selected; run :UESetAndroidDevice" end
-  if package_name == "" then return nil, "Android package is not configured; run :UESetAndroidPackage" end
-
-  local source_so = find_android_so(ctx)
-  if not source_so then
-    return nil, "Android SO not found; run :UEBuildAndroidSO first"
-  end
-
-  local script = join(vim.fn.stdpath("config"), "scripts", "ue_android_so_deploy.ps1")
-  if not _ufs.is_file(script) then
-    return nil, "Android SO deploy script not found: " .. script
-  end
-  local script_win = to_windows_path(script)
-  local source_so_win = to_windows_path(source_so)
-  if not script_win or not source_so_win then
-    return nil, "Failed to resolve Windows paths for Android SO deploy"
-  end
-
-  return {
-    "powershell.exe",
-    "-NoLogo",
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-File",
-    script_win,
-    "-Adb",
-    "adb",
-    "-Serial",
-    serial,
-    "-Package",
-    package_name,
-    "-SourceSo",
-    source_so_win,
-  }
+local function android_so_deploy_command(ctx, serial, package_name, host_driver)
+  local target_ctx, context_err = CORE_RT.target_context(ctx, "Android")
+  if not target_ctx then return nil, context_err end
+  target_ctx.device_id = serial
+  target_ctx.package_name = package_name
+  local selected_host = host_driver or require("utils.platform").driver()
+  local plan = require("ue.targets").plan(
+    "Android",
+    "so_deploy",
+    target_ctx,
+    selected_host
+  )
+  local command, command_err = require("ue.target_tasks").command(plan)
+  return command, command_err, plan
 end
 
 function M.ai_context(engine_root)
@@ -7314,21 +7271,46 @@ function M.ai_context(engine_root)
   local kind = target_kind(engine_root, project_root, uproject, platform)
   local target_name = build_target_name(project_root, uproject, kind)
   local build_command, build_error = android_build_command(ctx)
+  local targets = require("ue.targets")
+  local host_driver = _uplat.driver()
+  local android_active = platform == targets.must_get("Android").id
   local so_build_command, so_build_error
-  if platform == "Android" then
-    so_build_command, so_build_error = android_build_command(ctx, { skip_deploy = true })
+  if android_active then
+    so_build_command, so_build_error = android_build_command(ctx, { operation = "so_build" })
   else
     so_build_error = "UEBuildAndroidSO requires target platform Android."
   end
-  local apk = find_apk(ctx)
+  local apk = android_active and find_apk(ctx) or nil
   local selected_android_serial = require("utils.android_device").get()
-  local so_deploy_command, so_deploy_error = android_so_deploy_command(
-    ctx, selected_android_serial, state.android_package
-  )
-  local install_command = apk and selected_android_serial and require("utils.android_device").adb_args(
-    "adb", selected_android_serial, { "install", "-r", to_windows_path(apk) or apk }) or nil
+  local so_deploy_command, so_deploy_error
+  if android_active then
+    so_deploy_command, so_deploy_error = android_so_deploy_command(
+      ctx, selected_android_serial, state.android_package
+    )
+  else
+    so_deploy_error = "UEDeployAndroidSO requires target platform Android."
+  end
+  local _, install_unavailable = targets.resolve("Android", "install", host_driver)
+  local install_plan = android_active
+      and not install_unavailable
+      and apk
+      and selected_android_serial
+      and targets.plan("Android", "install", {
+        adb = "adb",
+        apk = apk,
+        cwd = engine_root,
+        device_id = selected_android_serial,
+      }, host_driver)
+    or nil
+  local install_command = install_plan and require("ue.target_tasks").command(install_plan) or nil
   local install_native_action
-  if not apk then
+  if not android_active then
+    install_native_action = "UEInstallAndroid requires target platform Android."
+  elseif install_unavailable then
+    install_native_action = ("Android install is unavailable on host %s: %s"):format(
+      tostring(host_driver.id), tostring(install_unavailable.reason)
+    )
+  elseif not apk then
     install_native_action = "No APK found under the active uproject build outputs."
   elseif not selected_android_serial then
     install_native_action = "Android device is not selected; run :UESetAndroidDevice."
@@ -7441,10 +7423,9 @@ local function ue_runtime_env()
     find_uproject_in_dir = find_uproject_in_dir,
     glob_paths = glob_paths,
     is_file = _ufs.is_file,
-    is_windows_path = is_windows_path,
+    host_driver = require("utils.platform").driver(),
     join = join,
     norm = norm,
-    powershell_quote = powershell_quote,
     resolve_context = resolve_context,
     run_lines = run_lines,
     selected_target_configuration = selected_target_configuration,
@@ -7457,21 +7438,466 @@ local function ue_runtime_env()
   }
 end
 
+do
+  local function target_error(scope, message)
+    require("utils.log").notify_error(scope, tostring(message or "target operation failed"))
+  end
+
+  local function read_result_file(path)
+    local content = read_all(path)
+    pcall(os.remove, path)
+    if not content or trim(content) == "" then
+      return nil, "structured result file was not produced: " .. tostring(path)
+    end
+    return content
+  end
+
+  local function collect_existing_artifacts(driver, target_ctx)
+    if type(driver.artifact_candidates) ~= "function" then
+      return {}, nil
+    end
+    local result = driver.artifact_candidates(target_ctx)
+    if type(result) ~= "table" or result.ok == false then
+      return nil, result and result.reason or "artifact discovery unavailable"
+    end
+    local existing = {}
+    for _, candidate in ipairs(result.candidates or {}) do
+      local stat = vim.uv.fs_stat(candidate.path)
+      if stat then
+        local verified = vim.deepcopy(candidate)
+        verified.evidence = {
+          mtime = stat.mtime and stat.mtime.sec or nil,
+          size = stat.size,
+          type = stat.type,
+        }
+        existing[#existing + 1] = verified
+      end
+    end
+    return existing
+  end
+
+  function CORE_RT.run_target_preflight(driver, stage, target_ctx, host_driver, on_done)
+    if type(driver.preflight_plans) ~= "function" then
+      on_done(true, {})
+      return
+    end
+    local descriptor = driver.preflight_plans(stage, target_ctx, host_driver)
+    if type(descriptor) ~= "table" or descriptor.ok == false then
+      on_done(false, descriptor and descriptor.reason or "preflight planning failed")
+      return
+    end
+
+    local plans = descriptor.plans or {}
+    local results = {}
+    local index = 1
+    local function advance()
+      local plan = plans[index]
+      if not plan then
+        local validation = type(driver.validate_preflight) == "function"
+            and driver.validate_preflight(stage, results)
+          or { ok = true }
+        on_done(validation.ok == true, validation.reason, results)
+        return
+      end
+      local handle, run_err = require("ue.target_tasks").run(plan, {
+        name = ("UE %s %s preflight"):format(driver.id, stage),
+        on_exit = function(result)
+          results[#results + 1] = result
+          if result.code ~= 0 then
+            on_done(false, require("ue.target_tasks").error_message(result), results)
+            return
+          end
+          index = index + 1
+          advance()
+        end,
+      })
+      if not handle then
+        on_done(false, run_err or "preflight task failed to start", results)
+      end
+    end
+    advance()
+  end
+
+  function CORE_RT.package_target(platform)
+    local ctx, err = resolve_context()
+    if not ctx or not ctx.project_root then
+      target_error("ue.package", err or "No project configured. Run :UESetProject [path]")
+      return
+    end
+    local target_ctx, context_err, driver = CORE_RT.target_context(ctx, platform)
+    if not target_ctx then
+      target_error("ue.package", context_err)
+      return
+    end
+    local host_driver = require("utils.platform").driver()
+    local resolved, unavailable = require("ue.targets").resolve(driver.id, "package", host_driver)
+    if not resolved then
+      target_error("ue.package", unavailable.reason)
+      return
+    end
+    driver = resolved
+    CORE_RT.run_target_preflight(driver, "package", target_ctx, host_driver, function(ok, preflight_err)
+      if not ok then
+        target_error("ue.package", preflight_err)
+        return
+      end
+      local command, plan_err, plan = CORE_RT.target_plan("package", ctx, platform, {
+        host_driver = host_driver,
+      })
+      if not command then
+        target_error("ue.package", plan_err)
+        return
+      end
+      local package_job_id
+      package_job_id = open_terminal_command(command, {
+        cwd = plan.cwd or ctx.engine_root,
+        quickfix_title = ("UEPackage %s %s"):format(target_ctx.platform, target_ctx.configuration),
+        quickfix_root = workspace_root(ctx),
+        tail_limit = 30,
+        on_exit = function(code)
+          if code ~= 0 then return end
+          local artifacts, artifact_err = collect_existing_artifacts(driver, target_ctx)
+          if not artifacts or #artifacts == 0 then
+            target_error("ue.package", artifact_err or "package succeeded but no tuple-scoped artifact was found")
+            return
+          end
+          local completed_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
+          for _, artifact in ipairs(artifacts) do
+            artifact.metadata = type(artifact.metadata) == "table" and artifact.metadata or {}
+            artifact.metadata.package_job_id = package_job_id
+            artifact.metadata.package_completed_at = completed_at
+            artifact.metadata.package_exit_code = 0
+          end
+          CORE_RT.update_target_runtime(ctx.engine_root, driver.id, {
+            artifacts = artifacts,
+            target = target_ctx.target,
+            configuration = target_ctx.configuration,
+          })
+        end,
+      })
+    end)
+  end
+
+  function CORE_RT.generate_target_symbols(platform)
+    local ctx, err = resolve_context()
+    if not ctx or not ctx.project_root then
+      target_error("ue.symbols", err or "No project configured. Run :UESetProject [path]")
+      return
+    end
+    local command, plan_err, plan, _, target_ctx = CORE_RT.target_plan("symbols", ctx, platform, {
+      host_driver = require("utils.platform").driver(),
+    })
+    if not command then
+      target_error("ue.symbols", plan_err)
+      return
+    end
+    return open_terminal_command(command, {
+      cwd = plan.cwd or ctx.engine_root,
+      quickfix_title = ("UESymbols %s %s"):format(target_ctx.platform, target_ctx.configuration),
+      quickfix_root = workspace_root(ctx),
+      tail_limit = 20,
+    })
+  end
+
+  function CORE_RT.select_target_device(platform)
+    local ctx, err = resolve_context()
+    if not ctx then
+      target_error("ue.device", err)
+      return
+    end
+    local output_path = vim.fn.tempname() .. ".devices.json"
+    local target_ctx, context_err, driver = CORE_RT.target_context(ctx, platform, {
+      json_output = output_path,
+    })
+    if not target_ctx then
+      target_error("ue.device", context_err)
+      return
+    end
+    local host_driver = require("utils.platform").driver()
+    local resolved, unavailable = require("ue.targets").resolve(driver.id, "device", host_driver)
+    if not resolved then
+      pcall(os.remove, output_path)
+      target_error("ue.device", unavailable.reason)
+      return
+    end
+    driver = resolved
+    local plan = driver.device_list_plan(target_ctx, host_driver)
+    local handle, run_err = require("ue.target_tasks").run(plan, {
+      name = "UE " .. driver.id .. " device discovery",
+      on_exit = function(result)
+        if result.code ~= 0 then
+          pcall(os.remove, output_path)
+          target_error("ue.device", require("ue.target_tasks").error_message(result))
+          return
+        end
+        local payload, payload_err = read_result_file(output_path)
+        if not payload then
+          target_error("ue.device", payload_err)
+          return
+        end
+        local parsed = driver.parse_device_list(payload)
+        if not parsed.ok then
+          target_error("ue.device", parsed.reason)
+          return
+        end
+        if #parsed.devices == 0 then
+          target_error("ue.device", "no available physical " .. driver.id .. " device")
+          return
+        end
+        vim.ui.select(parsed.devices, {
+          prompt = "Select " .. driver.id .. " device:",
+          format_item = function(device)
+            return ("%s (%s, %s)"):format(
+              device.name or "unnamed", device.os_version or device.platform or "unknown", device.id
+            )
+          end,
+        }, function(device)
+          if not device then return end
+          CORE_RT.update_target_runtime(ctx.engine_root, driver.id, {
+            device_id = device.id,
+            device_name = device.name,
+          })
+          vim.notify(("%s device selected: %s"):format(driver.id, device.name or device.id))
+        end)
+      end,
+    })
+    if not handle then target_error("ue.device", run_err) end
+    return handle
+  end
+
+  local function with_target_bundle_id(ctx, driver, target_ctx, host_driver, on_done)
+    local artifacts = target_ctx.artifacts
+    if type(artifacts) ~= "table" or #artifacts == 0 then
+      on_done(nil, nil,
+        "no artifact provenance from a successful package task; run :UEPackage" .. driver.id)
+      return
+    end
+    local selected = driver.select_staged_artifact(artifacts, target_ctx)
+    if not selected.ok then
+      on_done(nil, nil, selected.reason)
+      return
+    end
+    local validated = type(driver.validate_bundle_id) == "function"
+        and driver.validate_bundle_id(target_ctx.bundle_id)
+      or { ok = false }
+    if validated.ok then
+      on_done(validated.bundle_id, artifacts)
+      return
+    end
+    local probe = driver.bundle_id_plan(selected.app_path, host_driver, target_ctx)
+    local handle, run_err = require("ue.target_tasks").run(probe, {
+      name = "UE " .. driver.id .. " bundle identifier",
+      on_exit = function(result)
+        if result.code ~= 0 then
+          on_done(nil, nil, require("ue.target_tasks").error_message(result))
+          return
+        end
+        local bundle = driver.validate_bundle_id(trim(result.stdout))
+        if not bundle.ok then
+          on_done(nil, nil, bundle.reason)
+          return
+        end
+        on_done(bundle.bundle_id, artifacts)
+      end,
+    })
+    if not handle then
+      on_done(nil, nil, run_err or "bundle identifier probe failed to start")
+    end
+  end
+
+  function CORE_RT.install_target(platform)
+    local ctx, err = resolve_context()
+    if not ctx or not ctx.project_root then
+      target_error("ue.install", err or "No project configured. Run :UESetProject [path]")
+      return
+    end
+    local output_path = vim.fn.tempname() .. ".install.json"
+    local target_ctx, context_err, driver = CORE_RT.target_context(ctx, platform, {
+      json_output = output_path,
+    })
+    if not target_ctx then
+      target_error("ue.install", context_err)
+      return
+    end
+    if not target_ctx.device_id then
+      target_error("ue.install", (
+        "no %s device selected; run :UESet%sDevice"
+      ):format(driver.id, driver.id))
+      return
+    end
+    local host_driver = require("utils.platform").driver()
+    local resolved, unavailable = require("ue.targets").resolve(driver.id, "install", host_driver)
+    if not resolved then
+      pcall(os.remove, output_path)
+      target_error("ue.install", unavailable.reason)
+      return
+    end
+    driver = resolved
+    CORE_RT.run_target_preflight(driver, "install", target_ctx, host_driver, function(ok, preflight_err)
+      if not ok then
+        target_error("ue.install", preflight_err)
+        return
+      end
+      with_target_bundle_id(ctx, driver, target_ctx, host_driver, function(bundle_id, artifacts, bundle_err)
+        if not bundle_id then
+          target_error("ue.install", bundle_err)
+          return
+        end
+        target_ctx.bundle_id = bundle_id
+        target_ctx.artifacts = artifacts
+        target_ctx.json_output = output_path
+        local plan = driver.install_plan(target_ctx, host_driver)
+        local handle, run_err = require("ue.target_tasks").run(plan, {
+          name = "UE " .. driver.id .. " install",
+          on_exit = function(result)
+            if result.code ~= 0 then
+              pcall(os.remove, output_path)
+              target_error("ue.install", require("ue.target_tasks").error_message(result))
+              return
+            end
+            local payload, payload_err = read_result_file(output_path)
+            if not payload then target_error("ue.install", payload_err); return end
+            local parsed = driver.parse_install_result(payload, {
+              device_id = target_ctx.device_id,
+              bundle_id = bundle_id,
+            })
+            if not parsed.ok then target_error("ue.install", parsed.reason); return end
+            CORE_RT.update_target_runtime(ctx.engine_root, driver.id, {
+              device_id = target_ctx.device_id,
+              bundle_id = bundle_id,
+              artifacts = artifacts,
+            })
+            vim.notify(("Installed %s on %s"):format(bundle_id, target_ctx.device_id))
+          end,
+        })
+        if not handle then
+          pcall(os.remove, output_path)
+          target_error("ue.install", run_err or "install task failed to start")
+        end
+      end)
+    end)
+  end
+
+  function CORE_RT.launch_target(platform)
+    local ctx, err = resolve_context()
+    if not ctx or not ctx.project_root then
+      target_error("ue.launch", err or "No project configured. Run :UESetProject [path]")
+      return
+    end
+    local output_path = vim.fn.tempname() .. ".launch.json"
+    local target_ctx, context_err, driver = CORE_RT.target_context(ctx, platform, {
+      json_output = output_path,
+    })
+    if not target_ctx then target_error("ue.launch", context_err); return end
+    if not target_ctx.device_id then
+      target_error("ue.launch", (
+        "no %s device selected; run :UESet%sDevice"
+      ):format(driver.id, driver.id))
+      return
+    end
+    local host_driver = require("utils.platform").driver()
+    local resolved, unavailable = require("ue.targets").resolve(driver.id, "launch", host_driver)
+    if not resolved then
+      pcall(os.remove, output_path)
+      target_error("ue.launch", unavailable.reason)
+      return
+    end
+    driver = resolved
+    CORE_RT.run_target_preflight(driver, "launch", target_ctx, host_driver, function(ok, preflight_err)
+      if not ok then target_error("ue.launch", preflight_err); return end
+      with_target_bundle_id(ctx, driver, target_ctx, host_driver, function(bundle_id, artifacts, bundle_err)
+        if not bundle_id then target_error("ue.launch", bundle_err); return end
+        target_ctx.bundle_id = bundle_id
+        target_ctx.artifacts = artifacts
+        target_ctx.json_output = output_path
+        local plan = driver.launch_plan(target_ctx, host_driver)
+        local handle, run_err = require("ue.target_tasks").run(plan, {
+          name = "UE " .. driver.id .. " launch",
+          on_exit = function(result)
+            if result.code ~= 0 then
+              pcall(os.remove, output_path)
+              target_error("ue.launch", require("ue.target_tasks").error_message(result))
+              return
+            end
+            local payload, payload_err = read_result_file(output_path)
+            if not payload then target_error("ue.launch", payload_err); return end
+            local parsed = driver.parse_launch_result(payload, {
+              device_id = target_ctx.device_id,
+              bundle_id = bundle_id,
+            })
+            if not parsed.ok then target_error("ue.launch", parsed.reason); return end
+            CORE_RT.update_target_runtime(ctx.engine_root, driver.id, {
+              device_id = target_ctx.device_id,
+              bundle_id = bundle_id,
+              artifacts = artifacts,
+              process_id = parsed.process_id,
+            })
+            vim.notify(("Launched %s on %s (pid %s)"):format(
+              bundle_id, target_ctx.device_id, tostring(parsed.process_id)
+            ))
+          end,
+        })
+        if not handle then
+          pcall(os.remove, output_path)
+          target_error("ue.launch", run_err or "launch task failed to start")
+        end
+      end)
+    end)
+  end
+end
+
 function M.launch_app()
+  local ctx = resolve_context()
+  if ctx then
+    local platform = target_platform(ctx.engine_root, nil)
+    local host_driver = require("utils.platform").driver()
+    local driver, unavailable = require("ue.targets").resolve(platform, "launch", host_driver)
+    if not driver then
+      require("utils.log").notify_error(
+        "ue.launch",
+        ("%s launch unavailable on %s: %s"):format(
+          platform,
+          tostring(host_driver.id),
+          tostring(unavailable.reason)
+        )
+      )
+      return
+    end
+    local capabilities = driver and driver.capabilities(ctx) or {}
+    if capabilities.launch then
+      return CORE_RT.launch_target(platform)
+    end
+  end
   package.loaded["utils.ue_launch"] = nil
   return require("utils.ue_launch").launch(ue_runtime_env())
 end
 
 function M.toggle_log()
+  local ctx = resolve_context()
+  if ctx then
+    local platform = target_platform(ctx.engine_root, nil)
+    local host_driver = require("utils.platform").driver()
+    local _, unavailable = require("ue.targets").resolve(platform, "log", host_driver)
+    if unavailable then
+      require("utils.log").notify_error("ue.log", unavailable.reason)
+      return
+    end
+  end
   return require("utils.ue_logs").toggle_main_log(ue_runtime_env())
 end
 
 function M.toggle_debug_log()
+  local ctx = resolve_context()
+  if ctx then
+    local platform = target_platform(ctx.engine_root, nil)
+    local host_driver = require("utils.platform").driver()
+    local _, unavailable = require("ue.targets").resolve(platform, "debug_log", host_driver)
+    if unavailable then
+      require("utils.log").notify_error("ue.debug_log", unavailable.reason)
+      return
+    end
+  end
   return require("utils.ue_logs").toggle_debug_log(ue_runtime_env())
-end
-
-local function android_install_argv(adb, serial, apk)
-  return require("utils.android_device").adb_args(adb, serial, { "install", "-r", apk })
 end
 
 local function deploy_android_so()
@@ -7495,7 +7921,7 @@ local function deploy_android_so()
   end
 
   local state = read_state(ctx.engine_root)
-  local cmd, command_err = android_so_deploy_command(ctx, serial, state.android_package)
+  local cmd, command_err, plan = android_so_deploy_command(ctx, serial, state.android_package)
   if not cmd then
     require("utils.log").notify_error("ue.android", command_err)
     return
@@ -7503,7 +7929,7 @@ local function deploy_android_so()
 
   require("ue.dap").stop_android_debugger({ kill_orphans = true })
   open_terminal_command(cmd, {
-    cwd = windows_host_cwd(),
+    cwd = plan.cwd or ctx.engine_root,
     quickfix_title = "UEDeployAndroidSO",
     quickfix_root = workspace_root(ctx),
     tail_limit = 20,
@@ -7518,6 +7944,13 @@ local function install_android()
   end
   if not ctx.project_root then
     vim.notify("No project configured. Run :UESetProject [path]", vim.log.levels.WARN)
+    return
+  end
+
+  local host_driver = require("utils.platform").driver()
+  local _, unavailable = require("ue.targets").resolve("Android", "install", host_driver)
+  if unavailable then
+    require("utils.log").notify_error("ue.android", unavailable.reason)
     return
   end
 
@@ -7536,8 +7969,13 @@ local function install_android()
     return
   end
 
-  local apk_win = to_windows_path(apk) or apk
-  local install_cmd, install_err = android_install_argv("adb", serial, apk_win)
+  local plan = require("ue.targets").plan("Android", "install", {
+    adb = "adb",
+    apk = apk,
+    cwd = ctx.engine_root,
+    device_id = serial,
+  }, host_driver)
+  local install_cmd, install_err = require("ue.target_tasks").command(plan)
   if not install_cmd then
     require("utils.log").notify_error("ue.android", install_err)
     return
@@ -7555,7 +7993,7 @@ local function install_android()
 
   local progress = require("fidget.progress")
   local install_start_msg = ("Installing APK: %s (built %s) on %s"):format(
-    vim.fn.fnamemodify(apk_win, ":t"), age_str, serial)
+    vim.fn.fnamemodify(plan.metadata.artifact, ":t"), age_str, serial)
   pcall(function()
     require("utils.notification_history").record({
       scope = "ue.install",
@@ -7565,7 +8003,7 @@ local function install_android()
   end)
   local handle = progress.handle.create({
     title = "Installing APK",
-    message = ("built %s — %s"):format(age_str, vim.fn.fnamemodify(apk_win, ":t")),
+    message = ("built %s — %s"):format(age_str, vim.fn.fnamemodify(plan.metadata.artifact, ":t")),
     lsp_client = { name = "adb" },
     percentage = 0,
   })
@@ -7618,7 +8056,7 @@ local function install_android()
             require("utils.notification_history").record({
               scope = "ue.install",
               level = vim.log.levels.INFO,
-              message = ("Installed successfully: %s"):format(vim.fn.fnamemodify(apk_win, ":t")),
+              message = ("Installed successfully: %s"):format(vim.fn.fnamemodify(plan.metadata.artifact, ":t")),
             })
           end)
           handle:finish()
@@ -7684,7 +8122,7 @@ local function install_android()
         local ok_log, log = pcall(require, "utils.log")
         if ok_log and log.error then
           log.error("ue.install", ("adb install failed (exit %d): %s\n--- stderr ---\n%s\n--- stdout ---\n%s\nLog: see :NvimLog"):format(
-            code, vim.fn.fnamemodify(apk_win, ":t"), stderr_blob, stdout_blob
+            code, vim.fn.fnamemodify(plan.metadata.artifact, ":t"), stderr_blob, stdout_blob
           ))
         end
 
@@ -7990,6 +8428,11 @@ local function prepare_async(opts)
   -- can honor :UEPrepareReindex (force a csearch rebuild even when the
   -- regular UEPrepare cache is fresh).
   ctx._force_csearch = opts.force_csearch and true or false
+  -- The semantic source is published before UEPrepare starts.  Pipeline mtime
+  -- comparison alone cannot observe that earlier replacement, so carry the
+  -- provenance event across the async subprocess boundary and reload clangd
+  -- after canonical publication even when post-processing is a no-op.
+  ctx._force_cdb_restart = opts.force_cdb_restart and true or false
 
   _ufs.ensure_dir(ctx.paths.cache)
 
@@ -8133,7 +8576,7 @@ local function prepare_async(opts)
           set_prepare_running(false)
           if handle then handle.message = "done"; handle.percentage = 100; handle:finish() end
           vim.notify(prepare_summary(ctx, compile_path, { reused_cache = true }))
-        end)
+        end, { force_restart = ctx._force_cdb_restart })
 
         -- csearch index rebuild (same logic as before, just moved here).
         local code_search_fp = require("utils.code_search")
@@ -8596,6 +9039,7 @@ end
 
 -- export_compile_commands is now an alias for the unified prepare flow
 export_compile_commands = prepare_async
+CORE_RT.prepare_async = prepare_async
 
 function M.prepare_headless()
   local ok, err = xpcall(prepare, debug.traceback)
@@ -8835,11 +9279,19 @@ M.setup_dap = dap_mod.setup_dap
 -- ==========================================================================
 
 function M._android_install_argv_for_test(adb, serial, apk)
-  return android_install_argv(adb, serial, apk)
+  local plan = require("ue.targets").plan("Android", "install", {
+    adb = adb,
+    apk = apk,
+    cwd = vim.fn.getcwd(),
+    device_id = serial,
+  }, require("utils.platform.windows"))
+  return require("ue.target_tasks").command(plan)
 end
 
 function M._android_so_deploy_command_for_test(ctx, serial, package_name)
-  return android_so_deploy_command(ctx, serial, package_name)
+  return android_so_deploy_command(
+    ctx, serial, package_name, require("utils.platform.windows")
+  )
 end
 
 function M.setup()
@@ -9014,11 +9466,29 @@ function M.setup()
       vim.log.levels.INFO, { title = "UE", timeout = 5000 })
   end, { desc = "Bundle UE grep trace + errors + messages into one diag file" })
   vim.api.nvim_create_user_command("UEGenerateFromRSP", prepare_async, {})
-  vim.api.nvim_create_user_command("UEBuild", build_android, {})
-  vim.api.nvim_create_user_command("UEBuildAndroid", build_android, {})
+  vim.api.nvim_create_user_command("UEBuild", build_target, {})
+  vim.api.nvim_create_user_command("UEBuildAndroid", build_target, {})
+  vim.api.nvim_create_user_command("UEBuildIOS", function()
+    build_target({ platform = "IOS", title = "UEBuildIOS" })
+  end, { desc = "Build the IOS target through the IOS target driver" })
   vim.api.nvim_create_user_command("UEBuildAndroidSO", function()
-    build_android({ skip_deploy = true })
+    build_target({ operation = "so_build" })
   end, {})
+  vim.api.nvim_create_user_command("UECompileForNvim", CORE_RT.compile_for_nvim, {
+    desc = "Compile the active target, then prepare its RSP-backed clangd database",
+  })
+  vim.api.nvim_create_user_command("UEPackageIOS", function()
+    CORE_RT.package_target("IOS")
+  end, { desc = "Package the IOS target from existing cooked data without building or cooking" })
+  vim.api.nvim_create_user_command("UEIOSSymbols", function()
+    CORE_RT.generate_target_symbols("IOS")
+  end, { desc = "Generate and UUID-verify the current IOS binary's dSYM on demand" })
+  vim.api.nvim_create_user_command("UESetIOSDevice", function()
+    CORE_RT.select_target_device("IOS")
+  end, { desc = "Select an available physical IOS device through its target driver" })
+  vim.api.nvim_create_user_command("UEInstallIOS", function()
+    CORE_RT.install_target("IOS")
+  end, { desc = "Install the current tuple's staged IOS app through its target driver" })
   vim.api.nvim_create_user_command("UEDeployAndroidSO", deploy_android_so, {})
   vim.api.nvim_create_user_command("UELaunch", function()
     M.launch_app()
@@ -9363,6 +9833,14 @@ function M.setup()
   vim.api.nvim_create_user_command("UECheatsheet", show_cheatsheet, {})
   vim.api.nvim_create_user_command("UECheatsheetEdit", edit_cheatsheet, {})
   vim.api.nvim_create_user_command("UEBuildPCH", function()
+    local host_driver = _uplat.driver()
+    if type(host_driver.pch_build_plan) ~= "function" then
+      vim.notify(
+        "UEBuildPCH is unavailable on " .. tostring(host_driver.id) .. "; the PCH cache pipeline is Windows-only.",
+        vim.log.levels.WARN
+      )
+      return
+    end
     local ctx, err = resolve_context({ detect_project = false })
     if not ctx then
       vim.notify(err, vim.log.levels.WARN)
@@ -9382,11 +9860,15 @@ function M.setup()
       )
       return
     end
-    -- Convert forward → backslash for cmd.exe
-    local bat_win = bat:gsub("/", "\\")
-    vim.notify("UE: rebuilding PCH (background) — " .. bat_win, vim.log.levels.INFO)
-    vim.fn.jobstart({ "cmd.exe", "/c", bat_win }, {
-      cwd = vim.fs.dirname(bat),
+    local plan = host_driver.pch_build_plan(bat)
+    local command, command_err = require("ue.target_tasks").command(plan)
+    if not command then
+      vim.notify("UEBuildPCH: " .. tostring(command_err), vim.log.levels.WARN)
+      return
+    end
+    vim.notify("UE: rebuilding PCH (background) — " .. bat, vim.log.levels.INFO)
+    vim.fn.jobstart(command, {
+      cwd = plan.cwd,
       detach = false,
       on_stdout = function(_, data)
         for _, line in ipairs(data or {}) do
@@ -9423,22 +9905,28 @@ function M.setup()
   -- ─ Phase F.1+F.2+H: platform-neutral UEDAP* aliases via dispatch table ─
   -- F.1 introduced the UEDAP* command names with hard-coded android branch.
   -- F.2 moved the per-platform handler decision into ue.dap.platforms.
-  -- H registers concrete handlers for win64 / mac / linux / ios alongside
-  -- the existing android implementation. New platforms still register here
-  -- — this is the single seam the dispatch flows through.
+  -- Registration is filtered by the host-target compatibility matrix;
+  -- importable foreign modules do not become executable capabilities.
   local dap_platforms = require("ue.dap.platforms")
-  dap_platforms.register_attach("android", function() M.android_dap_attach() end)
-  dap_platforms.register_launch("android", function() M.android_dap_launch() end)
-  for _, id in ipairs({ "win64", "mac", "linux", "ios" }) do
-    local ok, plat_mod = pcall(require, "ue.dap." .. id)
-    if ok and type(plat_mod) == "table" then
-      if type(plat_mod.attach) == "function" then dap_platforms.register_attach(id, plat_mod.attach) end
-      if type(plat_mod.launch) == "function" then dap_platforms.register_launch(id, plat_mod.launch) end
-    end
-  end
+  dap_platforms.register_supported(require("utils.platform").driver(), M)
 
   local function dap_dispatch(kind, platform)
     platform = (platform ~= "" and platform) or (M.current_platform() or "")
+    local host_driver = require("utils.platform").driver()
+    local operation = kind == "attach" and "dap_attach" or "dap_launch"
+    local _, unavailable = require("ue.targets").resolve(platform, operation, host_driver)
+    if unavailable then
+      vim.notify(
+        ("UEDAP%s: target %q is unavailable on host %q (%s)"):format(
+          kind == "attach" and "Attach" or "Launch",
+          platform,
+          tostring(host_driver.id),
+          tostring(unavailable.reason)
+        ),
+        vim.log.levels.WARN
+      )
+      return
+    end
     local handler = (kind == "attach")
       and dap_platforms.attach_handler(platform)
       or  dap_platforms.launch_handler(platform)
@@ -9747,7 +10235,14 @@ function M._ccjson_subprocess_run(ctx, progress)
   if rsp_count and rsp_count > 0 then
     return true, rsp_path
   end
-  return false, rsp_path or "no rsp entries"
+  progress("semantic_source", 45, "checking tuple-scoped semantic CDB...")
+  local ok_existing, existing_path = export_compile_commands_to_engine_root(ctx)
+  if ok_existing then
+    return true, existing_path
+  end
+  return false, tostring(rsp_path or "no RSP entries for the active tuple")
+    .. "; " .. tostring(existing_path)
+    .. "; run :UECompileForNvim to build and prepare it"
 end
 
 -- Spawn a headless nvim subprocess that runs the ccjson pipeline.

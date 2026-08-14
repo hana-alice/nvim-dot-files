@@ -155,8 +155,8 @@ t.describe("utils.android_device: adb argv", function()
   t.it("Android logcat spec 不取第一台设备，脚本固定使用全局 serial", function()
     devices.set("SERIAL-LOG")
     local env = {
+      host_driver = require("utils.platform.windows"),
       is_file = function() return true end,
-      powershell_quote = function(value) return "'" .. tostring(value) .. "'" end,
       trim = function(value)
         return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
       end,

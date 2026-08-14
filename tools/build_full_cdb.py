@@ -287,18 +287,31 @@ def main():
         shutil.copytree(src_super_dir, stable_super_dir)
         print(f'[super_cpps] {stable_super_dir}')
 
-        # Patch wrapper-TU paths from staging to stable
-        from_dir = src_super_dir.replace('/', '\\')
-        to_dir = stable_super_dir.replace('/', '\\')
+        # Patch wrapper-TU paths from staging to stable.  The source CDB may
+        # use either native POSIX paths or Windows paths, depending on which
+        # host produced it, so cover both spellings without changing the
+        # spelling already present in each entry.
+        path_pairs = [
+            (src_super_dir.replace('\\', '/'), stable_super_dir.replace('\\', '/')),
+            (src_super_dir.replace('/', '\\'), stable_super_dir.replace('/', '\\')),
+        ]
+        path_pairs = list(dict.fromkeys(path_pairs))
         patched = 0
         for e in super_entries:
-            if from_dir in e.get('file', ''):
-                e['file'] = e['file'].replace(from_dir, to_dir)
-                patched += 1
+            file_path = e.get('file', '')
+            for from_dir, to_dir in path_pairs:
+                if from_dir in file_path:
+                    file_path = file_path.replace(from_dir, to_dir)
+                    patched += 1
+                    break
+            e['file'] = file_path
             new_args = []
             for a in e.get('arguments', []):
-                if isinstance(a, str) and from_dir in a:
-                    a = a.replace(from_dir, to_dir)
+                if isinstance(a, str):
+                    for from_dir, to_dir in path_pairs:
+                        if from_dir in a:
+                            a = a.replace(from_dir, to_dir)
+                            break
                 new_args.append(a)
             e['arguments'] = new_args
         if patched:

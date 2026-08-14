@@ -1,5 +1,76 @@
 local M = {}
 
+local function notify(message, level)
+  vim.notify(message, level or vim.log.levels.INFO)
+end
+
+local function normalize_folder(stdout)
+  local folder = vim.trim(tostring(stdout or "")):gsub("\\", "/")
+  if #folder > 1 then
+    folder = folder:gsub("/+$", "")
+  end
+  return folder
+end
+
+local function open_folder_in_editor(folder)
+  vim.cmd("cd " .. vim.fn.fnameescape(folder))
+  local ok, snacks = pcall(require, "snacks")
+  if not ok then
+    notify("Opened folder: " .. folder)
+    return
+  end
+  snacks.picker.files({ cwd = folder, title = "Open Folder" })
+end
+
+---Open a native macOS folder chooser and switch this Neovide instance to it.
+---Optional dependencies are injectable so the async boundary stays testable.
+---@param opts? table
+---@return boolean, any|string
+function M.open_folder(opts)
+  opts = opts or {}
+  local driver = opts.driver or require("utils.platform").driver()
+  if type(driver.folder_picker_plan) ~= "function" then
+    local message = "Native folder picker is unavailable on this host"
+    (opts.notify or notify)(message, vim.log.levels.WARN)
+    return false, message
+  end
+
+  local plan = driver.folder_picker_plan(opts.prompt or "Open Folder")
+  local command = { plan.executable }
+  vim.list_extend(command, plan.args or {})
+  local run = opts.run or vim.system
+  local schedule = opts.schedule or vim.schedule
+  local is_directory = opts.is_directory or vim.fn.isdirectory
+  local on_open = opts.on_open or open_folder_in_editor
+  local emit = opts.notify or notify
+
+  local ok, handle = pcall(run, command, { text = true, cwd = plan.cwd }, function(result)
+    local stderr = tostring(result.stderr or "")
+    if result.code ~= 0 then
+      -- AppleScript uses -128 when the user cancels the native dialog.
+      if stderr:find("User canceled", 1, true) or stderr:find("-128", 1, true) then return end
+      schedule(function()
+        emit("Open Folder failed: " .. vim.trim(stderr), vim.log.levels.ERROR)
+      end)
+      return
+    end
+
+    local folder = normalize_folder(result.stdout)
+    schedule(function()
+      if folder == "" or is_directory(folder) ~= 1 then
+        emit("Open Folder returned an invalid directory", vim.log.levels.ERROR)
+        return
+      end
+      on_open(folder)
+    end)
+  end)
+  if not ok then
+    emit("Open Folder failed to start: " .. tostring(handle), vim.log.levels.ERROR)
+    return false, handle
+  end
+  return true, handle
+end
+
 local function map(modes, lhs, rhs, desc)
   vim.keymap.set(modes, lhs, rhs, { silent = true, desc = desc })
 end

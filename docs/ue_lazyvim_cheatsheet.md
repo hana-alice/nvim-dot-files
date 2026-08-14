@@ -713,6 +713,19 @@ saved/aborted before the old session exits.
 
 ---
 
+## 🩺 Core Functionality Health
+
+| Command | Action |
+|---|---|
+| `:NvimCoreHealth` | Run the read-only startup/editor/Tree-sitter/search/clangd/UE capability audit asynchronously |
+
+The headless equivalent is
+`nvim --headless -l scripts/nvim_core_health.lua [--json] [--filter <prefix>] [--live]`.
+`DEGRADED` means deterministic editor checks passed while an external backend
+such as csearch or clangd 22.1.x is blocked. See `docs/core-health.md`.
+
+---
+
 ## 🎮 UE Workflow
 
 Source: `lua/config/keymaps.lua` (static `<leader>uB / uc / uP`,
@@ -725,7 +738,13 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `<leader>uA`              | `:UESetAndroidDevice` — select Android device (name + serial) for this Neovim session |
 | `:UESetPlatform`          | Interactive platform+config select  |
 | `:UESetPlatform Win64 Development Editor` | Direct set         |
-| `<leader>ub`              | `:UEBuild` (platform from `:UESetPlatform`) |
+| `<leader>ub`              | `:UEBuild` (platform from `:UESetPlatform`); on macOS, silent stages show a process-tree heartbeat in the same terminal |
+| `:UECompileForNvim`       | Build current target, generate tuple-scoped IOS CDB evidence when RSP is absent, then prepare clangd semantics |
+| `:UEBuildIOS`             | Build IOS C++ through native macOS UBT; safely reuse unchanged AOT outputs and defer dSYM |
+| `:UEPackageIOS`           | Reuse existing cooked data, then stage/package IOS; never build, cook, archive, deploy, or run |
+| `:UEIOSSymbols`           | Generate the current IOS binary's dSYM on demand and verify Mach-O UUIDs; no ZIP |
+| `:UESetIOSDevice`         | Select an available physical iOS device from CoreDevice JSON |
+| `:UEInstallIOS`           | Install the current package task's `.app`; does not launch |
 | `<leader>us`              | `:UEBuildAndroidSO` — export + execute UBT compile/link actions (no Deploy/Gradle/APK) |
 | `<leader>uq`              | `:UEDeployAndroidSO` — strip, push, atomically replace and verify `libUE4.so`; leaves the app stopped |
 | `<leader>uB`              | `:UEPrepare` (symbols + compile_commands) |
@@ -745,6 +764,16 @@ Android 选择写入当前 Neovim **进程内**的全局变量
 `adb -s <serial>`；切换设备时再次执行 `<leader>uA`。该值既不会跨 Neovim 重启持久化，
 也不会影响同时运行的另一个 Neovim 实例。
 
+iOS 的设备、artifact、bundle id 与 process 状态保存于 IOS-scoped runtime state，
+不与 Android 或 Mac target 共用。C++ 日常迭代顺序是 `:UEBuildIOS` → `:UEPackageIOS` → `:UESetIOSDevice` →
+`:UEInstallIOS` → `:UELaunch`。package/install 需要有效签名；无签名或无可用真机时会在只读
+preflight 失败，不会回退到 UE legacy fastlane/ideviceinstaller/instruments。
+
+`:UEBuildIOS` 的第一次构建（或 AOT 输入、工具链、SDK、framework 产物发生变化后）仍执行完整 AOT；
+只有输入指纹相同且上次成功构建记录的 framework 路径与内容 hash 全部匹配时，Nvim 才注入
+`bSkipAOTProcess=true`。日常构建固定以命令行 INI override 关闭自动 dSYM；需要调试/符号化时再执行
+`:UEIOSSymbols`，避免每次编译都支付 `dsymutil` 与 ZIP 的时间和磁盘成本。
+
 ### Less-common UE commands
 
 These exist (`grep create_user_command lua/ue.lua` to verify) but
@@ -757,6 +786,12 @@ have no key bound by default:
 | `:UEPrepareSync`       | Synchronous prepare (debug)             |
 | `:UEGenerateFromRSP`   | Re-export ccjson from cached `.rsp`     |
 | `:UEBuildAndroid`      | Force Android build target              |
+| `:UEBuildIOS`          | Build only the IOS target                |
+| `:UECompileForNvim`    | Build + RSP/CDB semantic prepare         |
+| `:UEPackageIOS`        | Stage/package existing IOS cooked data   |
+| `:UEIOSSymbols`        | Generate + UUID-check IOS dSYM on demand |
+| `:UESetIOSDevice`      | Select physical IOS device               |
+| `:UEInstallIOS`        | Install current tuple's packaged app     |
 | `:UEBuildPCH`          | Build PCH only                          |
 | `:UEDirtyStatus`       | Show files awaiting reindex             |
 | `:UEDirtyClear`        | Clear dirty file set                    |

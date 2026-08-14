@@ -9,8 +9,19 @@
 
 local function P(...) io.stdout:write(table.concat({...}, " ") .. "\n") end
 
-local SRC = "C:/temp/jumper_src.txt"
-local TGT = "C:/temp/jumper_tgt.txt"
+local TEST_ROOT = vim.fs.normalize(vim.fn.tempname())
+vim.fn.mkdir(TEST_ROOT, "p")
+local SRC = TEST_ROOT .. "/jumper_src.txt"
+local TGT = TEST_ROOT .. "/jumper_tgt.txt"
+
+local function numbered_lines(count)
+  local lines = {}
+  for index = 1, count do lines[index] = ("line %d"):format(index) end
+  return lines
+end
+
+vim.fn.writefile(numbered_lines(20), SRC)
+vim.fn.writefile(numbered_lines(120), TGT)
 
 -- Disable swapfile so we don't trip over the user's live Neovide buffers.
 vim.opt.swapfile = false
@@ -59,7 +70,7 @@ for i = math.max(1, n - 2), n do
   end
 end
 
--- assertion: most recent entry should be the SOURCE (src_buf, 500, 4)
+-- assertion: most recent entry should be the source buffer position
 -- jumplist behavior: m' pushes the source pos; getjumplist tail reflects it.
 local last = jl[n]
 if last.bufnr == src_buf and last.lnum == src_pos[1] then
@@ -115,6 +126,8 @@ if ok3 or ok4 then
   P("[T3] !! FAIL: bad input did not return false")
   fail = true
 end
+
+pcall(vim.fn.delete, TEST_ROOT, "rf")
 
 if fail then
   P("\n=== TEST FAILED ===")

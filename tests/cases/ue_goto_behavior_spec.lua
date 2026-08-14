@@ -103,6 +103,7 @@ t.describe("provider: compiler identity 必须绑定响应客户端", function()
     local second = vim.api.nvim_create_buf(true, false)
     vim.api.nvim_buf_set_name(first, "C:/fixture/first.cpp")
     vim.api.nvim_buf_set_name(second, "C:/fixture/second.cpp")
+    local first_path = vim.api.nvim_buf_get_name(first)
     vim.api.nvim_buf_set_lines(first, 0, -1, false, { "first();", "second();" })
     vim.api.nvim_buf_set_lines(second, 0, -1, false, { "other();" })
     vim.api.nvim_set_current_buf(first)
@@ -155,7 +156,7 @@ t.describe("provider: compiler identity 必须绑定响应客户端", function()
     t.assert_eq(result.usr, "usr:first")
     t.assert_eq(result.document_version, 7)
     t.assert_eq(result.client_results[1].document_version, 7)
-    t.assert_eq(captured.textDocument.uri, vim.uri_from_fname("C:/fixture/first.cpp"))
+    t.assert_eq(captured.textDocument.uri, vim.uri_from_fname(first_path))
     t.assert_eq(captured.position.line, 0)
     t.assert_eq(captured.position.character, 2)
   end)
@@ -497,10 +498,16 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
     for _, name in ipairs(mocked) do saved[name] = package.loaded[name] end
 
     local original_buf = vim.api.nvim_get_current_buf()
+    local fixture_root = vim.fs.normalize(vim.fn.tempname())
+    vim.fn.mkdir(fixture_root, "p")
     local test_buf = vim.api.nvim_create_buf(true, false)
-    local header = "C:/fixture/VulkanCommandBuffer.h"
-    local source = "C:/fixture/VulkanCommandBuffer.cpp"
+    local header = fixture_root .. "/VulkanCommandBuffer.h"
     vim.api.nvim_buf_set_name(test_buf, header)
+    -- macOS may canonicalize /var to /private/var when naming a buffer. Use
+    -- Neovim's resolved name so self-location comparisons stay host-neutral.
+    header = vim.api.nvim_buf_get_name(test_buf)
+    local fixture_dir = vim.fs.dirname(header)
+    local source = fixture_dir .. "/VulkanCommandBuffer.cpp"
     vim.api.nvim_set_current_buf(test_buf)
     vim.api.nvim_buf_set_lines(test_buf, 0, -1, false, {
       "void SubmitActiveCmdBuffer();",
@@ -572,7 +579,7 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
         return { token = 1, winid = 0, cursor = { snapshot_line, 5 }, document_version = 1 }
       end,
       discover_toolchain = function()
-        return { build_fingerprint = "fixture", cdb_dir = "C:/fixture" }
+        return { build_fingerprint = "fixture", cdb_dir = fixture_dir }
       end,
       lookup_definition = function(spec, callback)
         module_lookup_requests = module_lookup_requests + 1
@@ -672,6 +679,7 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
     if vim.api.nvim_buf_is_valid(test_buf) then
       vim.api.nvim_buf_delete(test_buf, { force = true })
     end
+    pcall(vim.fn.delete, fixture_root, "rf")
     for _, name in ipairs(mocked) do package.loaded[name] = saved[name] end
     for _, cmd in ipairs({
       "UEDefTrace", "UEDefSelfTest", "UEDefReload", "UEDefDiag",

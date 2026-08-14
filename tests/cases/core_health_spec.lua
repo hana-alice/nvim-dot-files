@@ -464,6 +464,7 @@ t.describe("core_health: fixture and mutation safety", function()
     t.assert_contains(lazy_source, "enabled = not health_no_mutate")
     local _, enabled_count = lazy_source:gsub("enabled = not health_no_mutate", "")
     t.assert_eq(enabled_count, 2, "checker and change detection must both be disabled")
+    t.assert_match(lazy_source, "rocks%s*=%s*{%s*enabled%s*=%s*false", "unused LuaRocks provider must stay disabled")
   end)
 end)
 

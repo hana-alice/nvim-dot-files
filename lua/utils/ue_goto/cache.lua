@@ -498,7 +498,16 @@ function M._flush_for_test(bufnr)
     pcall(function() store.timer:stop(); store.timer:close() end)
     store.timer = nil
   end
-  return not store.dirty or persist_store(pdir, store)
+  if not store.dirty then return true end
+  -- Production writes retry asynchronously through schedule_persist().  The
+  -- test hook deliberately waits for the same short-lived cross-process lease
+  -- so a child process cannot exit before its independent key is published.
+  local persisted = false
+  vim.wait(500, function()
+    persisted = persist_store(pdir, store)
+    return persisted
+  end, 10)
+  return persisted
 end
 
 return M

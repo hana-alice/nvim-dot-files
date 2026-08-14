@@ -13,11 +13,15 @@ import shlex
 import sys
 
 
+def canonical_path(path):
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+
 def absolute_file(entry):
     path = entry.get("file", "")
     if not os.path.isabs(path):
         path = os.path.join(entry.get("directory", ""), path)
-    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    return canonical_path(path)
 
 
 def split_command(command):
@@ -44,7 +48,7 @@ def main():
                         help="Associate the donor command with this subject path")
     args = parser.parse_args()
 
-    wanted = os.path.normcase(os.path.normpath(os.path.abspath(args.source_file)))
+    wanted = canonical_path(args.source_file)
     with open(args.compile_commands, "r", encoding="utf-8") as handle:
         database = json.load(handle)
 
@@ -68,11 +72,11 @@ def main():
                 candidate = value
                 if not os.path.isabs(candidate):
                     candidate = os.path.join(directory, candidate)
-                if os.path.normcase(os.path.normpath(candidate)) == wanted:
+                if canonical_path(candidate) == wanted:
                     value = subject
                 rewritten.append(value)
             command = rewritten
-        fingerprint = (os.path.normcase(os.path.normpath(directory)), tuple(command))
+        fingerprint = (canonical_path(directory), tuple(command))
         if fingerprint not in seen:
             seen.add(fingerprint)
             matches.append({

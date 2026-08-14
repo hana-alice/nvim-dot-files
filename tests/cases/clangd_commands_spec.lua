@@ -12,6 +12,8 @@ end
 
 local function fixture(entries)
   local root = vim.fs.normalize(vim.fn.tempname() .. "-clangd-command")
+  vim.fn.mkdir(root, "p")
+  root = vim.fs.normalize(vim.uv.fs_realpath(root) or root)
   local semantic = root .. "/.cache/nvim-ue/clangd/background-cdb"
   local source = root .. "/Source/Runtime/Fixture/Private/subject.cpp"
   write(source, "int subject() { return 1; }\n")

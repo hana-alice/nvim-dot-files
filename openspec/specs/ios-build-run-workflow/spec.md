@@ -8,7 +8,7 @@
 
 ### Requirement: iOS 应用流水线必须与编辑器语义准备分离
 
-系统必须把 iOS Build/Package/Install/Launch 作为应用生命周期能力；不得将其作为生成 CDB 或 Tree-sitter 解析的隐式副作用。
+MUST：系统必须把 iOS Build/Package/Install/Launch 作为应用生命周期能力；不得将其作为生成 CDB 或 Tree-sitter 解析的隐式副作用。
 
 #### Scenario: 用户只打包 iOS 应用
 
@@ -23,7 +23,7 @@
 
 ### Requirement: IOS 平台策略必须由独立 target driver 实现
 
-所有 IOS-specific UBT/UAT 参数、签名预检、产物识别、设备发现、安装与启动规则必须由 IOS target-driver 模块拥有；核心调度层及其他 target driver 不得包含这些实现。
+MUST：所有 IOS-specific UBT/UAT 参数、签名预检、产物识别、设备发现、安装与启动规则必须由 IOS target-driver 模块拥有；核心调度层及其他 target driver 不得包含这些实现。
 
 #### Scenario: 核心层分派 iOS Package
 
@@ -49,14 +49,14 @@
 - **THEN** helper 必须无状态且不包含 target 选择、默认值、工具选择、设备或产物策略
 - **AND** contract 测试必须检查该边界
 
-### Requirement: iOS 编译必须使用 macOS 原生 Unreal 入口
+### Requirement: iOS 编译必须最终使用 macOS 原生 Unreal 入口
 
-当 active platform 为 `IOS` 时，`UEBuild` 与 `UEBuildIOS` 必须使用 macOS `Build.sh` 规划当前 target/configuration 的 UBT 编译。
+MUST：当 active platform 为 `IOS` 时，`UEBuild` 与 `UEBuildIOS` 必须使用 macOS `Build.sh` 规划当前 target/configuration 的 UBT 编译。
 
 #### Scenario: 只编译 IOS target
 
 - **WHEN** 用户执行 `:UEBuildIOS` 且工程上下文有效
-- **THEN** 系统必须以 argv 数组调用 `Engine/Build/BatchFiles/Mac/Build.sh`
+- **THEN** 系统必须以 argv 数组通过 Nvim-owned macOS wrapper 最终调用 `Engine/Build/BatchFiles/Mac/Build.sh`
 - **AND** 不得包含 Cook、Stage、Package、Archive、Install 或 Run 阶段
 - **AND** 不得调用 Windows `.exe`、PowerShell 或 Windows path converter
 
@@ -66,17 +66,45 @@
 - **THEN** 调用方必须把包装脚本结果作为 build 进程状态
 - **AND** 不得在 Neovim 层重新解释未直接暴露的原始 UBT 状态码
 
-### Requirement: iOS 打包必须使用结构化 BuildCookRun 计划
+### Requirement: iOS C++ 日常编译必须安全复用 AOT 并延后 dSYM
 
-`UEPackageIOS` 必须通过 macOS `RunUAT.sh BuildCookRun` 执行当前工程的 Build、Cook、Stage、Package 和 Archive。
+MUST：Nvim 可以通过构建环境复用工程既有的 AOT 产物，但只有输入、SDK/工具链与上次成功产物均可证明未变时才允许跳过 AOT。日常编译必须通过命令行 override 关闭自动 dSYM；符号必须由独立命令按需生成。
+
+#### Scenario: 首次构建或 AOT 输入变化
+
+- **WHEN** AOT cache manifest 不存在、任一输入指纹变化、工具链/SDK 变化或记录的 framework 缺失
+- **THEN** wrapper 必须清除继承的 skip/disable AOT 环境并执行完整 AOT
+- **AND** 只有原生构建成功且 framework 产物存在后才可原子发布新 manifest
+
+#### Scenario: AOT 输入与产物均可证明未变
+
+- **WHEN** 当前指纹与上次成功 manifest 一致，且全部记录产物的路径与内容 hash 均匹配
+- **THEN** wrapper 可以仅为当前 build 子进程设置 `bSkipAOTProcess=true`
+- **AND** cache 状态必须写在 engine `.cache/nvim-ue`，不得修改工程或引擎代码
+
+#### Scenario: 日常 C++ 编译
+
+- **WHEN** 用户执行 `:UEBuildIOS`
+- **THEN** Build.sh argv 必须稳定关闭 `bGeneratedSYMFile` 与 `bGeneratedSYMBundle`
+- **AND** 不得关闭对象文件中的编译调试信息
+
+#### Scenario: 用户需要符号化
+
+- **WHEN** 用户执行 `:UEIOSSymbols`
+- **THEN** 系统必须对当前 tuple 的 IOS binary 运行 `dsymutil`，且不生成 ZIP
+- **AND** 必须用 `dwarfdump --uuid` 验证 binary 与 dSYM UUID 集合一致
+
+### Requirement: iOS 本地组包必须使用既有 cooked 数据
+
+MUST：`UEPackageIOS` 必须通过 macOS `RunUAT.sh BuildCookRun` 复用已存在的 cooked 数据，只执行 Stage 与 Package。该本地 C++ 迭代入口不得触发 Build、Cook、Archive、Deploy 或 Run。
 
 #### Scenario: 规划 Development 包
 
-- **WHEN** 当前 target、IOS platform、Development configuration 与 archive directory 均有效
-- **THEN** 计划必须包含 `-project`、`-target`、`-targetplatform=IOS`、`-clientconfig=Development`、`-build`、`-cook`、`-stage`、`-package` 与 `-archive`
+- **WHEN** 当前 target、IOS platform、Development configuration 与既有 cooked 数据均有效
+- **THEN** 计划必须包含 `-project`、`-target`、`-targetplatform=IOS`、`-clientconfig=Development`、`-skipbuild`、`-skipcook`、`-stage`、`-nocleanstage`、`-package` 与 `-nodebuginfo`
 - **AND** 必须使用 argv 数组而非 shell 拼接
 - **AND** 工程身份和路径不得硬编码在实现中
-- **AND** 不得启用 UAT Deploy 或 Run
+- **AND** 不得包含 `-build`、`-cook`、`-archive`、`-deploy` 或 `-run`
 
 #### Scenario: UAT 打包失败
 
@@ -86,7 +114,7 @@
 
 ### Requirement: 签名与工具链必须只读预检
 
-系统必须按阶段检查 iOS 工具链：Build 前检查 Xcode、iPhoneOS SDK、引擎自带 dotnet 与原生编译入口；Package/Install 前额外检查 code-sign identity、工程 iOS settings 与 UBT/UAT provisioning 推导可解析性。
+MUST：系统必须按阶段检查 iOS 工具链：Build 前检查 Xcode、iPhoneOS SDK、引擎自带 dotnet 与原生编译入口；Package/Install 前额外检查 code-sign identity、工程 iOS settings 与 UBT/UAT provisioning 推导可解析性。
 
 #### Scenario: 没有有效签名身份但只执行编译
 
@@ -108,7 +136,7 @@
 
 ### Requirement: 设备发现必须使用结构化 devicectl 输出
 
-`UESetIOSDevice` 必须从 devicectl JSON 文件输出中选择可用物理 iOS 设备，不得解析面向人的表格文本，也不得调用 UE legacy fastlane 设备发现。
+MUST：`UESetIOSDevice` 必须从 devicectl JSON 文件输出中选择可用物理 iOS 设备，不得解析面向人的表格文本，也不得调用 UE legacy fastlane 设备发现。
 
 #### Scenario: 存在多个可用设备
 
@@ -124,7 +152,7 @@
 
 ### Requirement: 单次设备任务必须固定目标设备
 
-Install 或 Launch 必须在任务开始时捕获一次 selected device identifier，并在整个任务中保持不变。
+MUST：Install 或 Launch 必须在任务开始时捕获一次 selected device identifier，并在整个任务中保持不变。
 
 #### Scenario: 全局设备选择在安装期间改变
 
@@ -134,7 +162,7 @@ Install 或 Launch 必须在任务开始时捕获一次 selected device identifi
 
 ### Requirement: 安装产物必须与当前 tuple 一致
 
-系统必须安装当前 project/target/IOS/configuration 对应的 staged `.app`，并从其 `Info.plist` 读取真实 bundle identifier。
+MUST：系统必须安装当前 project/target/IOS/configuration 对应的 staged `.app`，并从其 `Info.plist` 读取真实 bundle identifier。
 
 #### Scenario: 磁盘存在多个配置的 app
 
@@ -150,7 +178,7 @@ Install 或 Launch 必须在任务开始时捕获一次 selected device identifi
 
 ### Requirement: 安装必须由设备结果确认
 
-`UEInstallIOS` 必须使用外置 `xcrun devicectl device install app --device <CAPTURED_ID> <APP>` 后端，并以退出码和结构化结果共同判定成功；不得调用或静默回退到 UE legacy ideviceinstaller 后端。
+MUST：`UEInstallIOS` 必须使用外置 `xcrun devicectl device install app --device <CAPTURED_ID> <APP>` 后端，并以退出码和结构化结果共同判定成功；不得调用或静默回退到 UE legacy ideviceinstaller 后端。
 
 #### Scenario: devicectl 报告安装成功
 
@@ -165,7 +193,7 @@ Install 或 Launch 必须在任务开始时捕获一次 selected device identifi
 
 ### Requirement: 启动必须使用真实 bundle identifier 且不进入 DAP
 
-IOS `UELaunch` 必须使用捕获设备和 staged app 的实际 bundle identifier 调用 devicectl process launch；不得调用 UE legacy instruments Run 后端。
+MUST：IOS `UELaunch` 必须使用捕获设备和 staged app 的实际 bundle identifier 调用 devicectl process launch；不得调用 UE legacy instruments Run 后端。
 
 #### Scenario: 应用成功启动
 
@@ -181,7 +209,7 @@ IOS `UELaunch` 必须使用捕获设备和 staged app 的实际 bundle identifie
 
 ### Requirement: iOS 长任务必须异步、可取消且不误报成功
 
-Build、Package、Install 与 Launch 必须使用非阻塞任务生命周期，并按依赖顺序阻止失败后的下游阶段。
+MUST：Build、Package、Install 与 Launch 必须使用非阻塞任务生命周期，并按依赖顺序阻止失败后的下游阶段。
 
 #### Scenario: 用户取消 Package
 
@@ -197,7 +225,7 @@ Build、Package、Install 与 Launch 必须使用非阻塞任务生命周期，�
 
 ### Requirement: iOS 状态与日志必须保护秘密
 
-系统可以记录脱敏 argv、阶段、退出码、设备显示名与 artifact identity，但不得记录私钥、密码、完整个人证书身份或未脱敏用户路径。
+MUST：系统可以记录脱敏 argv、阶段、退出码、设备显示名与 artifact identity，但不得记录私钥、密码、完整个人证书身份或未脱敏用户路径。
 
 #### Scenario: 预检读取签名配置
 

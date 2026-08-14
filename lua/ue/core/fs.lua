@@ -65,9 +65,21 @@ function M.is_file(path)
 end
 
 function M.ensure_dir(path)
-  if path ~= "" and not M.is_dir(path) then
-    vim.fn.mkdir(path, "p")
+  if path == "" or M.is_dir(path) then return end
+
+  local last_err
+  for attempt = 1, 8 do
+    local ok, result = pcall(vim.fn.mkdir, path, "p")
+    if M.is_dir(path) then return end
+    last_err = ok and ("mkdir returned " .. tostring(result)) or result
+    -- mkdir(..., "p") can report E739 when another process creates one of
+    -- the intermediate parents.  Retry the remaining suffix after yielding
+    -- briefly; a single final is_dir() check is not enough in that race.
+    if attempt < 8 then
+      vim.wait(math.min(10, attempt * 2))
+    end
   end
+  error(last_err or ("cannot create directory " .. path))
 end
 
 function M.file_stat(path)

@@ -8,6 +8,7 @@ local REQUIRED_FUNCTIONS = {
 
 local OPTIONAL_FUNCTIONS = {
   "package_plan",
+  "symbols_plan",
   "device_list_plan",
   "install_plan",
   "launch_plan",
@@ -20,6 +21,8 @@ local OPTIONAL_FUNCTIONS = {
   "so_build_plan",
   "so_deploy_plan",
   "log_plan",
+  "semantic_cdb_plan",
+  "validate_semantic_cdb",
 }
 
 function M.required_functions()

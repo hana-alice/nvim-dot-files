@@ -151,11 +151,14 @@ not invalidate other platforms' caches.
 
 Use `:UECompileForNvim` for the complete compiler-semantic workflow: it verifies
 the pinned clangd 22.1.x toolchain, builds the selected target, then prepares the
-RSP-backed CDB and index. Tree-sitter syntax highlighting works without this;
-clangd navigation and diagnostics require the compiler database.
+compiler database and index. On IOS, where Apple builds do not retain C++
+response files, the same build terminal continues with UBT's tuple-scoped
+`GenerateClangDatabase` action-graph pass; this does not compile, cook, or
+package. Tree-sitter syntax highlighting works without this; clangd navigation
+and diagnostics require the compiler database.
 
 `:UEBuild` remains build-only. `:UEPrepare` remains prepare-only for users who
-already have fresh RSP output.
+already have fresh response files or a validated tuple-scoped semantic source.
 
 ### 4. Build the index
 
@@ -180,8 +183,9 @@ Variants: `:UEPrepareIncremental` (dirty files only), `:UEPrepareReindex`
 | File picker | `<leader><leader>` |
 | Build (current platform) | `<leader>ub` / `:UEBuild` |
 | Build + prepare compiler semantics | `:UECompileForNvim` |
-| Build IOS only | `:UEBuildIOS` |
-| Package/archive IOS | `:UEPackageIOS` |
+| Build IOS C++ only (safe AOT reuse, no automatic dSYM) | `:UEBuildIOS` |
+| Package IOS from existing cooked data | `:UEPackageIOS` |
+| Generate and UUID-check IOS dSYM on demand | `:UEIOSSymbols` |
 | IOS device / install / launch | `:UESetIOSDevice` / `:UEInstallIOS` / `:UELaunch` |
 | Android SO only (skip APK) | `<leader>us` / `:UEBuildAndroidSO` |
 | Android quick SO deploy (root device; does not launch) | `<leader>uq` / `:UEDeployAndroidSO` |

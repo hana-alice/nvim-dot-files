@@ -5,7 +5,9 @@ local M = {
   host_operations = {
     macos = {
       build = true,
+      semantic_cdb = true,
       package = true,
+      symbols = true,
       device = true,
       install = true,
       launch = true,
@@ -17,6 +19,15 @@ local M = {
     debug_log = { strategy = "unavailable" },
   },
 }
+
+local DAILY_SYMBOL_OVERRIDE =
+  "-ini:Engine:[/Script/IOSRuntimeSettings.IOSRuntimeSettings]:bGeneratedSYMFile=False,[/Script/IOSRuntimeSettings.IOSRuntimeSettings]:bGeneratedSYMBundle=False"
+
+local function iteration_script(context)
+  local config_root = C.normalize_path(context and context.config_root)
+  if config_root == "" then return nil end
+  return C.join_path(config_root, "scripts", "ue_ios_cpp_iteration.zsh")
+end
 
 local function normalize_bundle_id(value)
   local bundle_id = C.trim(value)
@@ -119,6 +130,7 @@ function M.capabilities()
   return C.default_capabilities(M.id, {
     build = true,
     package = true,
+    symbols = true,
     device = true,
     install = true,
     launch = true,
@@ -133,29 +145,144 @@ function M.build_plan(context, host_driver)
 
   local target_name = C.context_target(context)
   local configuration = C.context_configuration(context)
-  return C.with_appended_args(entry, {
+  local native_plan = C.with_appended_args(entry, {
     target_name,
     M.id,
     configuration,
     "-Project=" .. C.trim(context.uproject),
+    DAILY_SYMBOL_OVERRIDE,
   }, {
     target = target_name,
     platform = M.id,
     configuration = configuration,
   })
+
+  local script = iteration_script(context)
+  if not script then return native_plan end
+
+  local shell_entry, shell_unavailable = C.resolve_host_shell(host_driver, "posix", context, M.id, "build")
+  if not shell_entry then return shell_unavailable end
+  local xcrun, xcrun_unavailable = C.resolve_host_entry(host_driver, "xcrun_entry", context, M.id, "build")
+  if not xcrun then return xcrun_unavailable end
+
+  local args = {
+    script,
+    "build",
+    "--project-dir",
+    C.normalize_path(context.project_dir),
+    "--cache-dir",
+    C.join_path(C.normalize_path(context.engine_root), ".cache", "nvim-ue", "ios-aot"),
+    "--target",
+    target_name,
+    "--configuration",
+    configuration,
+    "--xcrun",
+    xcrun.executable,
+    "--",
+    native_plan.executable,
+  }
+  vim.list_extend(args, native_plan.args)
+  return C.with_appended_args(shell_entry, args, {
+    target = target_name,
+    platform = M.id,
+    configuration = configuration,
+    optimization = "cpp-iteration",
+    underlying = {
+      executable = native_plan.executable,
+      args = native_plan.args,
+    },
+  })
+end
+
+function M.semantic_cdb_plan(context, host_driver)
+  local entry, unavailable = C.resolve_host_entry(
+    host_driver, "ue_build_entry", context, M.id, "semantic_cdb"
+  )
+  if not entry then return unavailable end
+
+  local output_dir = C.normalize_path(context and context.semantic_cdb_output_dir)
+  local output_filename = C.trim(context and context.semantic_cdb_output_filename)
+  if output_dir == "" or output_filename == "" then
+    return C.unavailable(M.id, "semantic_cdb", "semantic CDB output path is required", {
+      required = { "semantic_cdb_output_dir", "semantic_cdb_output_filename" },
+    })
+  end
+
+  local target_name = C.context_target(context)
+  local configuration = C.context_configuration(context)
+  return C.with_appended_args(entry, {
+    target_name,
+    M.id,
+    configuration,
+    "-Project=" .. C.trim(context.uproject),
+    "-Mode=GenerateClangDatabase",
+    "-OutputDir=" .. output_dir,
+    "-OutputFilename=" .. output_filename,
+    "-NoExecCodeGenActions",
+    "-UsePCH",
+  }, {
+    operation = "semantic_cdb",
+    target = target_name,
+    platform = M.id,
+    configuration = configuration,
+    output = C.join_path(output_dir, output_filename),
+    compiles = false,
+    cooks = false,
+    packages = false,
+  })
+end
+
+function M.validate_semantic_cdb(entries, context)
+  local target = C.context_target(context)
+  local configuration = C.context_configuration(context)
+  local tuple_marker = target ~= "" and configuration ~= ""
+    and ("/Intermediate/Build/IOS/" .. target .. "/" .. configuration .. "/")
+    or nil
+  local matched = 0
+  for _, entry in ipairs(entries or {}) do
+    local command = entry.command
+    if not command and type(entry.arguments) == "table" then
+      command = table.concat(entry.arguments, " ")
+    end
+    local evidence = table.concat({
+      tostring(entry.file or ""),
+      tostring(entry.output or ""),
+      tostring(command or ""),
+    }, " "):gsub("\\", "/")
+    local has_ios_evidence = evidence:find("/Intermediate/Build/IOS/", 1, true)
+      or evidence:find("iPhoneOS.platform", 1, true)
+      or evidence:find("-miphoneos-version-min=", 1, true)
+    local has_tuple_evidence = tuple_marker == nil or evidence:find(tuple_marker, 1, true)
+    if has_ios_evidence and has_tuple_evidence then
+      matched = matched + 1
+    end
+  end
+
+  if matched == 0 then
+    local expected = tuple_marker and (target .. "/" .. configuration) or "IOS"
+    return {
+      ok = false,
+      reason = "missing IOS compiler tuple evidence for " .. expected,
+      matched = 0,
+    }
+  end
+  if matched ~= #(entries or {}) then
+    local expected = tuple_marker and (target .. "/" .. configuration) or "IOS"
+    return {
+      ok = false,
+      reason = ("mixed or unproven IOS compiler evidence for %s (%d/%d entries)"):format(
+        expected, matched, #(entries or {})
+      ),
+      matched = matched,
+    }
+  end
+  return { ok = true, matched = matched }
 end
 
 function M.package_plan(context, host_driver)
   local entry, unavailable = C.resolve_host_entry(host_driver, "ue_uat_entry", context, M.id, "package")
   if not entry then
     return unavailable
-  end
-
-  local archive_dir = C.trim(context.archive_dir)
-  if archive_dir == "" then
-    return C.unavailable(M.id, "package", "archive_dir is required for iOS packaging", {
-      required = { "archive_dir" },
-    })
   end
 
   local target_name = C.context_target(context)
@@ -168,19 +295,49 @@ function M.package_plan(context, host_driver)
     "-target=" .. target_name,
     "-targetplatform=" .. M.id,
     "-clientconfig=" .. configuration,
-    "-build",
-    "-cook",
+    "-skipbuild",
+    "-skipcook",
     "-stage",
+    "-nocleanstage",
     "-package",
-    "-archive",
-    "-archivedirectory=" .. archive_dir,
+    "-nodebuginfo",
     "-utf8output",
   }, {
     target = target_name,
     platform = M.id,
     configuration = configuration,
-    archive_dir = archive_dir,
-    stages = { "build", "cook", "stage", "package", "archive" },
+    stages = { "stage", "package" },
+    reuses_cooked_data = true,
+  })
+end
+
+function M.symbols_plan(context, host_driver)
+  local script = iteration_script(context)
+  if not script then
+    return C.unavailable(M.id, "symbols", "config_root is required for the iOS symbol helper", {
+      required = { "config_root" },
+    })
+  end
+  local shell_entry, shell_unavailable = C.resolve_host_shell(host_driver, "posix", context, M.id, "symbols")
+  if not shell_entry then return shell_unavailable end
+  local xcrun, xcrun_unavailable = C.resolve_host_entry(host_driver, "xcrun_entry", context, M.id, "symbols")
+  if not xcrun then return xcrun_unavailable end
+
+  local target_name = C.context_target(context)
+  local binary = C.join_path(C.normalize_path(context.project_dir), "Binaries", M.id, target_name)
+  return C.with_appended_args(shell_entry, {
+    script,
+    "symbols",
+    "--xcrun",
+    xcrun.executable,
+    "--binary",
+    binary,
+  }, {
+    target = target_name,
+    platform = M.id,
+    configuration = C.context_configuration(context),
+    binary = binary,
+    output = binary .. ".dSYM",
   })
 end
 
@@ -343,7 +500,6 @@ end
 function M.artifact_candidates(context)
   context = context or {}
   local project_dir = C.normalize_path(context.project_dir)
-  local archive_dir = C.normalize_path(context.archive_dir)
   local target_name = C.context_target(context)
   local configuration = C.context_configuration(context)
   if project_dir == "" or target_name == "" then
@@ -368,19 +524,7 @@ function M.artifact_candidates(context)
       tuple = tuple,
       metadata = { kind = "ipa", source = "project-binaries" },
     },
-    {
-      path = C.join_path(project_dir, "Binaries", M.id, target_name .. ".dSYM"),
-      tuple = tuple,
-      metadata = { kind = "dsym", source = "project-binaries" },
-    },
   }
-  if archive_dir ~= "" then
-    candidates[#candidates + 1] = {
-      path = C.join_path(archive_dir, target_name .. ".ipa"),
-      tuple = tuple,
-      metadata = { kind = "ipa", source = "archive" },
-    }
-  end
   return { ok = true, candidates = candidates }
 end
 
@@ -546,6 +690,12 @@ function M.preflight_descriptors()
         { host_capability = "ue_uat_entry", reason = "BuildCookRun entry" },
         { host_capability = "xcrun_entry", reason = "Xcode / SDK discovery" },
         { host_capability = "security_entry", reason = "code-sign identity probe" },
+      },
+    },
+    {
+      stage = "symbols",
+      requires = {
+        { host_capability = "xcrun_entry", reason = "dsymutil and dwarfdump discovery" },
       },
     },
     {

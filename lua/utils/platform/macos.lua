@@ -20,6 +20,12 @@ local function join_engine_path(engine_root, suffix)
   return root .. "/" .. suffix
 end
 
+local function applescript_string(value)
+  value = tostring(value or "")
+  value = value:gsub("\\", "\\\\"):gsub('"', '\\"')
+  return '"' .. value .. '"'
+end
+
 function M.shell_entry(kind)
   kind = kind or "default"
   if kind ~= "default" and kind ~= "posix" then
@@ -69,6 +75,24 @@ end
 function M.reveal_file(path)
   if not path or path == "" then return end
   vim.fn.jobstart({ "open", "-R", path }, { detach = true })
+end
+
+function M.folder_picker_plan(prompt)
+  local script = "POSIX path of (choose folder with prompt "
+      .. applescript_string(prompt or "Open Folder") .. ")"
+  return {
+    executable = "/usr/bin/osascript",
+    args = { "-e", script },
+    metadata = { operation = "choose-folder" },
+  }
+end
+
+function M.build_process_snapshot_plan()
+  return {
+    executable = "/bin/ps",
+    args = { "-ww", "-Ao", "pid=,ppid=,state=,etime=,%cpu=,%mem=,command=" },
+    metadata = { operation = "build-process-snapshot" },
+  }
 end
 
 function M.default_clangd_candidates()

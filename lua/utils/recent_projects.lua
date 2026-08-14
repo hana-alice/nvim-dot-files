@@ -13,6 +13,7 @@ local M = {}
 local file_lock = require("ue.file_lock")
 
 local MAX_ENTRIES = 50
+local MAX_UPDATE_ATTEMPTS = 20
 local MARKERS = { ".git", ".uproject", ".uplugin", "package.json", "Cargo.toml", "go.mod" }
 
 local function state_path()
@@ -42,8 +43,12 @@ local function update_file(transform, attempt)
   local lease = file_lock.acquire(path .. ".lock")
   if not lease then
     attempt = (attempt or 0) + 1
-    if attempt <= 5 then
-      vim.defer_fn(function() update_file(transform, attempt) end, attempt * 25)
+    if attempt <= MAX_UPDATE_ATTEMPTS then
+      -- Keep this asynchronous: several Neovim instances can discover a
+      -- project at once, and a short PID-skewed retry avoids a thundering herd
+      -- without ever blocking the UI thread.
+      local delay_ms = math.min(25, attempt * 3) + (vim.fn.getpid() % 5)
+      vim.defer_fn(function() update_file(transform, attempt) end, delay_ms)
     end
     return false
   end

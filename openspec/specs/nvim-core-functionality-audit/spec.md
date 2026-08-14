@@ -9,7 +9,7 @@ csearch/rg、clangd/CDB、UE 集成与异步稳定性，并准确表达外部能
 
 ### Requirement: 健康审计必须按 capability 独立报告
 
-系统必须为每个检查生成稳定 id、状态、阶段、耗时、摘要和可行动下一步；不得用单一成功布尔值掩盖部分失败或外部阻塞。
+MUST：系统必须为每个检查生成稳定 id、状态、阶段、耗时、摘要和可行动下一步；不得用单一成功布尔值掩盖部分失败或外部阻塞。
 
 #### Scenario: 基础编辑正常但 clangd 版本不兼容
 
@@ -26,7 +26,7 @@ csearch/rg、clangd/CDB、UE 集成与异步稳定性，并准确表达外部能
 
 ### Requirement: 审计必须验证真实配置启动和最小编辑事务
 
-系统必须以真实配置启动隔离 Neovim 进程，并在临时目录完成 create/open/edit/write/reopen；不得仅以 Lua module 可 require 代替启动和编辑证据。
+MUST：系统必须以真实配置启动隔离 Neovim 进程，并在临时目录完成 create/open/edit/write/reopen；不得仅以 Lua module 可 require 代替启动和编辑证据。
 
 #### Scenario: 配置完整启动
 
@@ -43,7 +43,7 @@ csearch/rg、clangd/CDB、UE 集成与异步稳定性，并准确表达外部能
 
 ### Requirement: Tree-sitter 检查必须解析真实语法树
 
-系统必须从配置声明得到 mandatory parser 集合，加载每个真实 parser 并解析合法 fixture；不得只检查 parser 名称出现在配置中。
+MUST：系统必须从配置声明得到 mandatory parser 集合，加载每个真实 parser 并解析合法 fixture；不得只检查 parser 名称出现在配置中。
 
 #### Scenario: C++ parser 正常
 
@@ -66,7 +66,7 @@ csearch/rg、clangd/CDB、UE 集成与异步稳定性，并准确表达外部能
 
 ### Requirement: 搜索检查必须覆盖 rg fallback 和真实 csearch 闭环
 
-系统必须在临时语料上验证公共搜索 dispatcher 的命中内容、完成时序和 backend identity；工具齐备时必须执行真实 cindex/csearch 查询。
+MUST：系统必须在临时语料上验证公共搜索 dispatcher 的命中内容、完成时序和 backend identity；工具齐备时必须执行真实 cindex/csearch 查询。
 
 #### Scenario: csearch 和 cindex 均可用
 
@@ -89,7 +89,7 @@ csearch/rg、clangd/CDB、UE 集成与异步稳定性，并准确表达外部能
 
 ### Requirement: clangd、CDB 与 UE 检查必须区分 fixture 和 live 证据
 
-系统必须在 deterministic 模式验证 schema、provenance 和纯规划契约，并且只在用户显式提供 live context 时读取真实 workspace 证据。
+MUST：系统必须在 deterministic 模式验证 schema、provenance 和纯规划契约，并且只在用户显式提供 live context 时读取真实 workspace 证据。
 
 #### Scenario: deterministic 模式
 
@@ -106,7 +106,7 @@ csearch/rg、clangd/CDB、UE 集成与异步稳定性，并准确表达外部能
 
 ### Requirement: 所有探测必须有界、可清理且保护现场身份
 
-系统必须为子进程和异步探测设置 deadline，清理自己创建的 process/handle/temp artifact，并对报告中的用户身份进行脱敏。
+MUST：系统必须为子进程和异步探测设置 deadline，清理自己创建的 process/handle/temp artifact，并对报告中的用户身份进行脱敏。
 
 #### Scenario: probe 超时
 
@@ -122,7 +122,7 @@ csearch/rg、clangd/CDB、UE 集成与异步稳定性，并准确表达外部能
 
 ### Requirement: 健康审计必须可重复且不改变系统状态
 
-连续运行审计必须产生相同 capability 集合，且第二次运行不得依赖第一次留下的 cache、global、临时文件或后台任务。
+MUST：连续运行审计必须产生相同 capability 集合，且第二次运行不得依赖第一次留下的 cache、global、临时文件或后台任务。
 
 #### Scenario: 连续运行两次 deterministic audit
 

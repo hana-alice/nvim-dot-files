@@ -9,7 +9,7 @@ local fs = require("ue.core.fs")
 local function tmpdir()
   local dir = fs.norm(vim.fn.tempname())
   vim.fn.mkdir(dir, "p")
-  return dir
+  return fs.norm(vim.uv.fs_realpath(dir) or dir)
 end
 
 local function write(path, content)
@@ -22,6 +22,7 @@ local function child_lua(code)
     vim.v.progpath,
     "--headless",
     "-u", "NONE",
+    "-i", "NONE",
     "--cmd", "set rtp+=" .. vim.fn.stdpath("config"),
     "-c", "lua " .. code,
     "-c", "qa!",
@@ -119,7 +120,7 @@ t.describe("multi-instance project state", function()
         "ue.project_state", engine, project, uproject, engine, "field_" .. index, index
       )
       jobs[index] = vim.system({
-        vim.v.progpath, "--headless", "-u", "NONE",
+        vim.v.progpath, "--headless", "-u", "NONE", "-i", "NONE",
         "--cmd", "set rtp+=" .. vim.fn.stdpath("config"),
         "-c", "lua " .. code, "-c", "qa!",
       }, { text = true })
@@ -127,6 +128,7 @@ t.describe("multi-instance project state", function()
     for _, job in ipairs(jobs) do
       local result = job:wait()
       t.assert_eq(result.code, 0, result.stderr)
+      t.assert_eq(vim.trim(result.stderr or ""), "", result.stderr)
     end
 
     local persisted = state.read(engine)
@@ -174,7 +176,7 @@ t.describe("multi-instance project state", function()
         "ue.project_state", engine, project, uproject, engine, "Platform" .. index, "Config" .. index
       )
       jobs[index] = vim.system({
-        vim.v.progpath, "--headless", "-u", "NONE",
+        vim.v.progpath, "--headless", "-u", "NONE", "-i", "NONE",
         "--cmd", "set rtp+=" .. vim.fn.stdpath("config"),
         "-c", "lua " .. code, "-c", "qa!",
       }, { text = true })
@@ -182,6 +184,7 @@ t.describe("multi-instance project state", function()
     for _, job in ipairs(jobs) do
       local result = job:wait()
       t.assert_eq(result.code, 0, result.stderr)
+      t.assert_eq(vim.trim(result.stderr or ""), "", result.stderr)
     end
     local state = require("ue.project_state")
     state._reset_for_test()
@@ -220,7 +223,7 @@ t.describe("multi-instance project state", function()
         "utils.probe", path, "multi-instance", "same-key", index
       )
       jobs[index] = vim.system({
-        vim.v.progpath, "--headless", "-u", "NONE",
+        vim.v.progpath, "--headless", "-u", "NONE", "-i", "NONE",
         "--cmd", "set rtp+=" .. vim.fn.stdpath("config"),
         "-c", "lua " .. code, "-c", "qa!",
       }, { text = true })
@@ -246,7 +249,7 @@ t.describe("multi-instance project state", function()
         path, "utils.recent_projects", project
       )
       jobs[index] = vim.system({
-        vim.v.progpath, "--headless", "-u", "NONE",
+        vim.v.progpath, "--headless", "-u", "NONE", "-i", "NONE",
         "--cmd", "set rtp+=" .. vim.fn.stdpath("config"),
         "-c", "lua " .. code, "-c", "qa!",
       }, { text = true })
@@ -281,7 +284,7 @@ t.describe("multi-instance project state", function()
         "utils.ue_goto.cache", "Symbol" .. index, vim.uri_from_fname(project .. "/Source.cpp"), "lsp"
       )
       jobs[index] = vim.system({
-        vim.v.progpath, "--headless", "-u", "NONE",
+        vim.v.progpath, "--headless", "-u", "NONE", "-i", "NONE",
         "--cmd", "set rtp+=" .. vim.fn.stdpath("config"),
         "-c", "lua " .. code, "-c", "qa!",
       }, { text = true })
@@ -289,6 +292,7 @@ t.describe("multi-instance project state", function()
     for _, job in ipairs(jobs) do
       local result = job:wait()
       t.assert_eq(result.code, 0, result.stderr)
+      t.assert_eq(vim.trim(result.stderr or ""), "", result.stderr)
     end
 
     local state = require("ue.project_state")
@@ -320,7 +324,7 @@ t.describe("multi-instance project state", function()
         "utils.ue_watch", path, dirty
       )
       jobs[index] = vim.system({
-        vim.v.progpath, "--headless", "-u", "NONE",
+        vim.v.progpath, "--headless", "-u", "NONE", "-i", "NONE",
         "--cmd", "set rtp+=" .. vim.fn.stdpath("config"),
         "-c", "lua " .. code, "-c", "qa!",
       }, { text = true })

@@ -13,7 +13,7 @@
 -- and is trivially mockable in headless tests.
 --
 -- Public surface:
---   M.set_runtime({ jobstart = ..., notify = ..., log_error = ... })
+--   M.set_runtime({ jobstart = ..., notify = ..., log_error = ..., restart_clangd = ... })
 --   M.slim(path)                      -> bool          (synchronous)
 --   M.run(path, targets, on_done?)    -> jobid|0|nil, error? (background)
 
@@ -33,15 +33,17 @@ local _rt = {
   log_error = function(scope, msg)
     pcall(function() require("utils.log").notify_error(scope, msg) end)
   end,
+  restart_clangd = nil,
 }
 
 --- Configure the runtime. ue.lua should call this once during setup;
 --- tests can call it with stub functions.
----@param opts { jobstart: fun(cmd:any, tag:string, opts:table):integer, notify: fun(msg:string, level:integer?), log_error: fun(scope:string, msg:string)? }
+---@param opts { jobstart: fun(cmd:any, tag:string, opts:table):integer, notify: fun(msg:string, level:integer?), log_error: fun(scope:string, msg:string)?, restart_clangd: fun()? }
 function M.set_runtime(opts)
   if opts.jobstart  then _rt.jobstart  = opts.jobstart  end
   if opts.notify    then _rt.notify    = opts.notify    end
   if opts.log_error then _rt.log_error = opts.log_error end
+  if opts.restart_clangd then _rt.restart_clangd = opts.restart_clangd end
 end
 
 --- Whether a compile_commands writer pipeline currently owns the mutation slot.
@@ -149,6 +151,16 @@ local function restart_clangd()
   end
 end
 
+local function restart_active_clangd()
+  return (_rt.restart_clangd or restart_clangd)()
+end
+
+local function mtime_key(path)
+  local stat = vim.uv.fs_stat(path)
+  local mtime = stat and stat.mtime or {}
+  return tostring(mtime.sec or 0) .. ":" .. tostring(mtime.nsec or 0)
+end
+
 --- Background pipeline: expand → pch → resolve → unify → prune. Each step
 --- is skipped if its python script is absent. After success, syncs `path`
 --- to every other entry in `targets` and restarts clangd. Returns the
@@ -161,9 +173,11 @@ end
 ---@param path string CDB file to mutate in-place
 ---@param targets string[]? sibling CDB targets to copy `path` into on success
 ---@param on_done fun(ok:boolean, err:string?)? optional completion callback (after clangd restart)
+---@param opts? { force_restart?: boolean } force reload when the source changed before this pipeline started
 ---@return integer? jobid
 ---@return string? error
-function M.run(path, targets, on_done)
+function M.run(path, targets, on_done, opts)
+  opts = opts or {}
   if running then
     local msg = "compile_commands pipeline is already running"
     _rt.notify(msg, vim.log.levels.WARN)
@@ -231,6 +245,9 @@ function M.run(path, targets, on_done)
   end
 
   if #steps == 0 then
+    if opts.force_restart then
+      restart_active_clangd()
+    end
     if on_done then on_done(true) end
     return 0
   end
@@ -250,8 +267,7 @@ function M.run(path, targets, on_done)
     vim.log.levels.INFO
   )
 
-  local stat_before = vim.uv.fs_stat(path)
-  local mtime_before = (stat_before and stat_before.mtime and stat_before.mtime.sec) or 0
+  local mtime_before = mtime_key(path)
 
   running = true
   local finished = false
@@ -268,9 +284,8 @@ function M.run(path, targets, on_done)
   end
 
   local function finish_success()
-    local stat_after = vim.uv.fs_stat(path)
-    local mtime_after = (stat_after and stat_after.mtime and stat_after.mtime.sec) or 0
-    if mtime_after == mtime_before then
+    local mtime_after = mtime_key(path)
+    if not opts.force_restart and mtime_after == mtime_before then
       _rt.notify("compile_commands pipeline: no changes, skipping clangd restart", vim.log.levels.INFO)
       finish(true)
       return
@@ -281,7 +296,7 @@ function M.run(path, targets, on_done)
     -- mirror a torn file.
     mirror_targets_then(path, targets, function()
       _rt.notify("compile_commands pipeline: done. Restarting clangd...", vim.log.levels.INFO)
-      restart_clangd()
+      restart_active_clangd()
       finish(true)
     end)
   end

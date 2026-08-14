@@ -499,7 +499,15 @@ local function compile_cursor_shim(compiler, source, output)
   if driver.id == "windows" then
     cmd = { compiler, "-shared", "-O2", "-std=c11", source, "-o", staged }
   elseif driver.id == "macos" then
-    cmd = { compiler, "-dynamiclib", "-O2", "-std=c11", source, "-o", staged }
+    local xcrun = type(driver.xcrun_entry) == "function" and driver.xcrun_entry() or nil
+    if type(xcrun) == "string" and xcrun ~= "" then
+      cmd = {
+        xcrun, "--sdk", "macosx", "clang", "-dynamiclib",
+        "-O2", "-std=c11", source, "-o", staged,
+      }
+    else
+      cmd = { compiler, "-dynamiclib", "-O2", "-std=c11", source, "-o", staged }
+    end
   else
     cmd = { compiler, "-shared", "-fPIC", "-O2", "-std=c11", source, "-o", staged }
   end

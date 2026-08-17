@@ -96,6 +96,31 @@ t.describe("ue target integration", function()
     t.assert_eq(plan.metadata.optimization, "cpp-iteration")
   end)
 
+  t.it("captures the project-scoped IOS signing identity in the build plan", function()
+    local identity = {
+      fingerprint = "0123456789ABCDEF0123456789ABCDEF01234567",
+      name = "Apple Development: Example User (TEAM123456)",
+    }
+    local command = with_target_env("IOS", "Development", "SampleGame", function()
+      return ue._target_plan_for_test(
+        "build",
+        {
+          engine_root = "/UE",
+          project_root = "/Project",
+          uproject = "/Project/Sample.uproject",
+          state = { ios_signing_identity = identity },
+        },
+        "IOS",
+        { host_driver = require("utils.platform.macos") }
+      )
+    end)
+
+    t.assert_contains(
+      command,
+      "-ini:Engine:[/Script/IOSRuntimeSettings.IOSRuntimeSettings]:SigningCertificate=" .. identity.name
+    )
+  end)
+
   t.it("Mac target uses its own driver and never receives IOS argv", function()
     local command = with_target_env("Mac", "Development", "SampleEditor", function()
       return ue._target_plan_for_test(
@@ -166,6 +191,19 @@ t.describe("ue target integration", function()
       prepare_body:find("GenerateClangDatabase", 1, true) ~= nil,
       "UEPrepare must remain read/transform-only"
     )
+  end)
+
+  t.it("consults PrepareIOSQADebug metadata before the no-argument signing picker", function()
+    local source = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
+    local start = assert(source:find("function CORE_RT.select_ios_signing_certificate", 1, true))
+    local finish = assert(source:find("function CORE_RT.select_target_device", start, true))
+    local body = source:sub(start, finish)
+    local prepared_pos = body:find("driver.prepared_signing_identity", 1, true)
+    local probe_pos = body:find("driver.signing_identity_list_plan", 1, true)
+
+    t.assert_true(prepared_pos ~= nil and probe_pos ~= nil and prepared_pos < probe_pos)
+    t.assert_contains(body, 'query = prepared.identity.fingerprint')
+    t.assert_contains(body, 'prepared.reason .. "; rerun PrepareIOSQADebug.sh')
   end)
 
   t.it("keeps IOS command strings out of other target drivers", function()

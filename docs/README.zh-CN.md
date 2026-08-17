@@ -168,6 +168,7 @@ Package。Tree-sitter 语法高亮不依赖这一步；clangd 导航、诊断和
 | 编译（当前平台） | `<leader>ub` / `:UEBuild` |
 | 编译并准备 Neovim 编译器语义 | `:UECompileForNvim` |
 | 只编译 IOS C++（安全复用 AOT，默认不生成 dSYM） | `:UEBuildIOS` |
+| 为当前工程导入 prepared identity 或选择 / 清除 IOS 签名证书 | `:UESetIOSSigningCertificate` / `:UESetIOSSigningCertificate!` |
 | 复用已有 cooked 数据组 IOS 包 | `:UEPackageIOS` |
 | 按需生成并校验 IOS dSYM | `:UEIOSSymbols` |
 | IOS 选设备 / 安装 / 启动 | `:UESetIOSDevice` / `:UEInstallIOS` / `:UELaunch` |

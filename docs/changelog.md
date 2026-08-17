@@ -44,6 +44,116 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-08-14 — 落地 iOS 签名选择与可证明的增量前置
+
+**Task**
+
+在只聚焦 macOS 本机 Neovim/iOS debug 的工作中，修正两个前置假设：签名证书必须由命令显式
+设置；增量编译必须按可证明的阶段跳过工作，而不是把整个 Build.sh 省略。同时把真机 DAP 接线
+隔离为可审计的 protocol probe，未取得设备证据前不开放生产能力。
+
+**Implemented**
+
+- 新增 `:UESetIOSSigningCertificate[!] [identity]`：支持 picker、完整证书名/SHA-1 精确选择和清除，
+  将选择保存到 project state；build 捕获当次 identity 并通过结构化 INI argv 注入，Package/Install
+  则在未选择或 keychain 精确复验失败时 fail closed。
+- 与 `PrepareIOSQADebug.sh` 的重签流程对齐：无参数命令优先读取标准项目或
+  `workspace/Source/Client` 上层 workspace 的 `Saved/IOSQADebug/signing.json`，验证 v1、完整
+  identity、profile/Bundle/Team 和 `get-task-allow=true` 后再精确复验 keychain；没有 manifest 时
+  才打开 picker，损坏/stale/多份 manifest 不静默降级。
+- iOS C++ iteration 的 AOT 指纹升级为 v2 input manifest：path/device/inode/size/纳秒
+  mtime/ctime 全匹配时复用 content digest，否则仅重算变化输入；输出 frameworks 每次仍做 SHA-256
+  校验，任何证据缺失均退回完整 AOT。Build.sh/UBT 仍每次执行且从不传 `-SkipBuild`。
+- 新增独立 `tools/ios_dap_protocol_probe.py`，冻结 Xcode/Apple `lldb-dap`、host binary↔dSYM UUID、
+  CoreDevice process identity、raw DAP 断点命中、源码帧、non-terminating detach 与进程存活证据；
+  preflight 证据已脱敏写入 `tools/evidence/ios-dap/`。
+- 增加显式 `legacy-preflight --device ... --symbols ...`：对 CoreDevice 不可达的 pre-iOS17 设备验证
+  MobileDevice USB、`ios-deploy`、精确 ProductType/OS/build DeviceSupport 与 LLDB `remote-ios`，并补齐
+  40-hex/现代连字符两类 Apple UDID 的统一脱敏。实机 partial evidence 已证明 DeveloperDiskImage、
+  debugserver listener 和 target create；设备端明确阻塞于 development profile 未被用户信任，现有重签包
+  也不含 source DWARF，因此仍未开放生产 DAP。
+- 新增/更新 driver、integration、command、script 与 probe 回归，并同步 OpenSpec、cheatsheet、tooling
+  和架构文档；签名解析/preflight 独立到 `ios_signing.lua`，使 target driver 保持在 800 行门禁内。
+  当前 preflight 发现 0 台可用物理 iOS 设备，因此保持 IOS DAP matrix unavailable，未修改生产
+  `lua/ue/dap/ios.lua`。
+
+**Pitfalls / Gotchas**
+
+- keychain 中“至少有一张有效证书”不能证明当前 project 使用了正确 identity；Package/Install/debug
+  必须要求显式选择，长任务只使用开始时捕获的 identity。
+- 证书 display name 暂不接受逗号：本地 UE `ConfigFile(string)` 会按逗号拆分 INI override，静默
+  接受会改变实际传入值；SHA-1 选择最终也会解析到同一 display name，因此同样 fail closed。
+- AOT 输入 hash 的 metadata fast path 只有 path/device/inode/size/mtime/ctime 全匹配才可复用；任何
+  miss 仍完整 AOT，output artifact 始终逐个验证。
+- UBT 的 `-SkipBuild` 会跳过 compile actions，只适用于另有产物证据的准备/打包路径，不是 C++
+  incremental build 开关。
+- CoreDevice 的 available 记录不等于当前 USB 设备可调试：本机 pre-iOS17 设备只出现在 MobileDevice，
+  对应 legacy backend 必须固定精确 DeviceSupport `Symbols`；backend 失败不能在同一 session 内 fallback。
+- 本地严格验签、证书/profile/entitlements/device membership 全部一致仍可能被设备拒绝；本次设备日志
+  给出 `Needs Explicit User Trust`，该设置只能在设备上完成，不能由 probe 伪造或绕过。
+- transport/listener/target create 通过也不等于 source debug 通过；没有 DWARF/dSYM 的重签包不能满足
+  resolved breakpoint、真实命中与正确源码帧门禁。
+
+**Validation**
+
+- 实机本地 parser probe：`security find-identity -v -p codesigning` 输出可解析，发现 2 个有效 identity；
+  测试及持久化证据不记录证书名。
+- Protocol probe：`self-test` 通过；`preflight` 正确以 exit 2 fail closed，并输出脱敏 blocker
+  `no-available-physical-ios-device`；显式 `legacy-preflight` exit 0，确认 pre-iOS17 USB、精确 Symbols 与
+  LLDB `remote-ios` ready，partial transport 则诚实记录 `explicit-user-trust-required` 与
+  `source-dwarf-unavailable`。
+- 实机 transport：从设备抓取并解包精确 DeviceSupport 成功，DeveloperDiskImage mount、debugserver
+  loopback listener、LLDB `remote-ios` 与 target create 均通过；设备 SpringBoard 明确报告 profile
+  `Needs Explicit User Trust`，因此 launch/attach 未伪造为通过。
+- 工程真实增量 build：完整 AOT 后进入 UBT/clang，最终 exit 6；唯一 fatal 是已生成 wrapper 引用不存在的
+  project/engine header。未修改业务源码，也未用手工拼 app 绕过；该结果不计为 repo regression 失败。
+- 定向：`ue_target_drivers` 36/36、`ue_target_integration` 12/12、`ue_ios_cpp_iteration` 3/3、
+  `ios_dap_probe` 3/3、`commands` 100/100、`ue_target_tasks` 4/4、`ue_api` 54/54、`smoke` 18/18、
+  `platform` 22/22、`cheatsheet` 139/139、`multi_instance_state` 11/11、`structure` 39/39 passed。
+- 全量：`nvim --headless -l tests/run.lua` 950/950 passed；`zsh -n scripts/ue_ios_cpp_iteration.zsh`
+  passed；`git diff --check` passed。
+- 当前环境无 `openspec` executable，未运行 CLI strict validate；change 已按 canonical requirement
+  和 scenario 结构人工核对。
+
+**Follow-ups**
+
+- 在设备上显式信任 development profile 后，先重跑 legacy launch/attach transport；再生成本地
+  binary+dSYM/source evidence 并运行严格 attach probe。只有 breakpoint、源码帧、detach 和 app-survival
+  证据全部通过，才实现/注册生产 IOS DAP。
+- 当前 checkout 还需通过其正式 wrapper 生成流程移除/重建对缺失 header 的 stale generated wrapper，
+  再重跑 `:UEBuildIOS`；本变更不直接修改工程生成物。
+
+### 2026-08-14 — 修复 Neovide 早期启动遗漏 UE 快捷键
+
+**Task**
+
+修复 Neovide 启动阶段 `<Space>ub` 偶发完全无响应；按用户复查结果，dashboard `p` 已恢复，
+不纳入本次改动。
+
+**Implemented**
+
+- `config/keymaps.lua` 在自身加载阶段立即安装带 `nowait=true` 的 `<leader>u*` runtime overrides，
+  不再根据 `vim_did_enter` 等待另一次 `VeryLazy`。
+- 新增真实子进程回归，在 `vim_did_enter=0` 时直接加载 keymaps，冻结 `<Space>ub -> :UEBuild`
+  必须立即可见的启动契约。
+
+**Pitfalls / Gotchas**
+
+- LazyVim 已按「默认 keymaps → 用户 keymaps」顺序加载该文件；用户文件内部再次等待
+  `VeryLazy` 不会增加排序保障，反而会在 Neovide 的早期启动窗口留下未安装映射。
+- 当前 Neovide 实例检查确认 `:UEBuild` 与 `<Space>ub` 均存在；本次只消除启动时序窗口，
+  不触发真实 iOS build，也不改 dashboard / picker。
+
+**Validation**
+
+- TDD：新启动时序用例先复现 `mapped=false`，实现后 `keymaps` 53/53 passed。
+- 定向：`commands` 99/99 passed；独立 pre-VimEnter 探针得到 `did=0 ub=1`。
+- 全量：`nvim --headless -l tests/run.lua` 937/937 passed；`git diff --check` passed。
+
+**Follow-ups**
+
+- 无。
+
 ### 2026-08-14 — 将 macOS/iOS 开发链路安全整合到最新主线
 
 **Task**

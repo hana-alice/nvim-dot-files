@@ -741,6 +741,7 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `<leader>ub`              | `:UEBuild` (platform from `:UESetPlatform`); on macOS, silent stages show a process-tree heartbeat in the same terminal |
 | `:UECompileForNvim`       | Build current target, generate tuple-scoped IOS CDB evidence when RSP is absent, then prepare clangd semantics |
 | `:UEBuildIOS`             | Build IOS C++ through native macOS UBT; safely reuse unchanged AOT outputs and defer dSYM |
+| `:UESetIOSSigningCertificate` | Import this workspace's prepared debug identity when present, otherwise select one; exact name/SHA-1 supported, `!` clears |
 | `:UEPackageIOS`           | Reuse existing cooked data, then stage/package IOS; never build, cook, archive, deploy, or run |
 | `:UEIOSSymbols`           | Generate the current IOS binary's dSYM on demand and verify Mach-O UUIDs; no ZIP |
 | `:UESetIOSDevice`         | Select an available physical iOS device from CoreDevice JSON |
@@ -764,7 +765,13 @@ Android 选择写入当前 Neovim **进程内**的全局变量
 `adb -s <serial>`；切换设备时再次执行 `<leader>uA`。该值既不会跨 Neovim 重启持久化，
 也不会影响同时运行的另一个 Neovim 实例。
 
-iOS 的设备、artifact、bundle id 与 process 状态保存于 IOS-scoped runtime state，
+iOS 签名 identity 通过 `:UESetIOSSigningCertificate` 设置。无参数时，如果
+`PrepareIOSQADebug.sh` 已在标准项目或 `workspace/Source/Client` 布局写入
+`Saved/IOSQADebug/signing.json`，命令会先验证 debug/profile 存在性/Bundle/Team 契约，再按 SHA-1 和显示名
+精确复验 keychain 并导入；没有 manifest 时才显示异步 picker。也可以显式传入精确证书名或 SHA-1；
+选择按 project 保存，`:UESetIOSSigningCertificate!` 清除。manifest 存在但损坏或 stale 时不会回退
+到其他证书。纯 `:UEBuildIOS` 在未选证书时仍可 compile/link；`:UEPackageIOS` / `:UEInstallIOS` 必须
+精确复验已选 identity，不会使用 keychain 中“第一张有效证书”。设备、artifact、bundle id 与 process 状态保存于 IOS-scoped runtime state，
 不与 Android 或 Mac target 共用。C++ 日常迭代顺序是 `:UEBuildIOS` → `:UEPackageIOS` → `:UESetIOSDevice` →
 `:UEInstallIOS` → `:UELaunch`。package/install 需要有效签名；无签名或无可用真机时会在只读
 preflight 失败，不会回退到 UE legacy fastlane/ideviceinstaller/instruments。
@@ -772,7 +779,10 @@ preflight 失败，不会回退到 UE legacy fastlane/ideviceinstaller/instrumen
 `:UEBuildIOS` 的第一次构建（或 AOT 输入、工具链、SDK、framework 产物发生变化后）仍执行完整 AOT；
 只有输入指纹相同且上次成功构建记录的 framework 路径与内容 hash 全部匹配时，Nvim 才注入
 `bSkipAOTProcess=true`。日常构建固定以命令行 INI override 关闭自动 dSYM；需要调试/符号化时再执行
-`:UEIOSSymbols`，避免每次编译都支付 `dsymutil` 与 ZIP 的时间和磁盘成本。
+`:UEIOSSymbols`，避免每次编译都支付 `dsymutil` 与 ZIP 的时间和磁盘成本。AOT 输入的 content hash
+另有 path/device/inode/size/纳秒 mtime/ctime metadata cache；metadata 全同才复用摘要，任何变化都会
+重新 hash，framework output 始终逐个校验。Build.sh 本身始终执行，由 UBT action graph 跳过未变化的
+C++ compile/link action；`:UEBuildIOS` 不使用 `-SkipBuild`。
 
 ### Less-common UE commands
 
@@ -787,6 +797,7 @@ have no key bound by default:
 | `:UEGenerateFromRSP`   | Re-export ccjson from cached `.rsp`     |
 | `:UEBuildAndroid`      | Force Android build target              |
 | `:UEBuildIOS`          | Build only the IOS target                |
+| `:UESetIOSSigningCertificate` | Select/clear project IOS signing identity |
 | `:UECompileForNvim`    | Build + RSP/CDB semantic prepare         |
 | `:UEPackageIOS`        | Stage/package existing IOS cooked data   |
 | `:UEIOSSymbols`        | Generate + UUID-check IOS dSYM on demand |

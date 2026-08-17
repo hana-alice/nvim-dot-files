@@ -89,23 +89,36 @@ The macOS host driver uses only native engine and Xcode entry points:
 - `/usr/bin/xcrun devicectl` with `--json-output <file>` for physical-device
   discovery, `.app` install and process launch.
 - `/usr/bin/security` for a read-only code-sign identity gate and
-  `/usr/bin/plutil` for `CFBundleIdentifier` extraction.
+  `:UESetIOSSigningCertificate[!] [exact-name-or-SHA1]`; the selected identity
+  is project-scoped and injected through an argv-only Engine ini override.
+  With no argument, a valid `Saved/IOSQADebug/signing.json` produced by
+  `PrepareIOSQADebug.sh` wins over the picker so UE build/package and the later
+  re-sign/install step cannot silently choose different certificates.
+  `/usr/bin/plutil` remains the `CFBundleIdentifier` extractor.
+- `python3 tools/ios_dap_protocol_probe.py preflight` for a redacted Apple
+  LLDB/CoreDevice gate. An explicit `legacy-preflight --device ... --symbols ...`
+  additionally checks a pre-iOS17 MobileDevice/`ios-deploy` candidate and exact
+  ProductType/OS/build DeviceSupport layout without persisting the device id or
+  personal path. Only a passing explicit `attach` probe may unlock the IOS DAP
+  matrix; either tool-only preflight or partial debugserver transport is insufficient.
 
 Requirements:
 
 - Full Xcode selected by `xcode-select`, with an iPhoneOS SDK visible through
   `xcrun --sdk iphoneos --show-sdk-path`.
 - The engine-bundled .NET environment used by `Build.sh` and `RunUAT.sh`.
-- At least one valid code-signing identity plus project provisioning for
-  package/install.
+- A project identity selected with `:UESetIOSSigningCertificate`, still valid
+  in the current keychain, plus compatible provisioning for package/install.
 - A paired, connected physical iOS device for install/launch.
 
 The installable app produced by this engine lives at
 `<project>/Binaries/IOS/Payload/<Target>.app`. The similarly named
 `Saved/StagedBuilds/IOS` tree is raw stage input, not the signed app bundle.
-The workflow deliberately does not use UE's legacy
+The normal build/install/launch workflow deliberately does not use UE's legacy
 fastlane/ideviceinstaller/instruments deploy/run route and does not implement
-iOS DAP.
+iOS DAP. The isolated debugger spike may use `ios-deploy` only for a pre-iOS17
+Xcode DeveloperDiskImage/debugserver loopback bridge when CoreDevice has no
+connected tunnel; this is not a production capability or an in-session fallback.
 
 ## Historical lldb-dap 21 side-load (DAP debugger adapter, Windows)
 

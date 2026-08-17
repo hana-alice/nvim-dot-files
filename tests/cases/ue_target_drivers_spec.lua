@@ -4,6 +4,15 @@ t.bootstrap()
 local targets = require("ue.targets")
 local contract = require("ue.targets.contract")
 
+local SIGNING_IDENTITY = {
+  fingerprint = "0123456789ABCDEF0123456789ABCDEF01234567",
+  name = "Apple Development: Example User (TEAM123456)",
+}
+
+local SIGNING_OVERRIDE =
+  "-ini:Engine:[/Script/IOSRuntimeSettings.IOSRuntimeSettings]:SigningCertificate="
+  .. SIGNING_IDENTITY.name
+
 local function host_stub()
   return {
     id = "macos",
@@ -148,6 +157,7 @@ t.describe("ue.targets build planners", function()
       target = "SampleGame",
       configuration = "Shipping",
       uproject = "/Project/Sample.uproject",
+      signing_identity = SIGNING_IDENTITY,
     }, host_stub())
 
     t.assert_eq(plan.executable, "/UE/Engine/Build/BatchFiles/Mac/Build.sh")
@@ -156,6 +166,8 @@ t.describe("ue.targets build planners", function()
       plan.args,
       "-ini:Engine:[/Script/IOSRuntimeSettings.IOSRuntimeSettings]:bGeneratedSYMFile=False,[/Script/IOSRuntimeSettings.IOSRuntimeSettings]:bGeneratedSYMBundle=False"
     )
+    t.assert_contains(plan.args, SIGNING_OVERRIDE)
+    t.assert_false(vim.tbl_contains(plan.args, "-SkipBuild"))
     t.assert_false(
       vim.deep_equal(
         plan.args,
@@ -235,6 +247,7 @@ t.describe("ue.targets build planners", function()
       configuration = "Development",
       uproject = "/Project Root/Sample.uproject",
       config_root = "/Nvim Config",
+      signing_identity = SIGNING_IDENTITY,
     }, host_stub())
 
     t.assert_eq(plan.executable, "/bin/zsh")
@@ -245,6 +258,8 @@ t.describe("ue.targets build planners", function()
     t.assert_contains(plan.args, "/Project Root")
     t.assert_contains(plan.args, "--cache-dir")
     t.assert_contains(plan.args, "/UE/.cache/nvim-ue/ios-aot")
+    t.assert_contains(plan.args, SIGNING_OVERRIDE)
+    t.assert_false(vim.tbl_contains(plan.args, "-SkipBuild"))
   end)
 
   t.it("Win64 build retains WaitMutex and FromMsBuild flags", function()
@@ -445,6 +460,7 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
       target = "SampleGame",
       configuration = "Development",
       uproject = "/Project/Sample.uproject",
+      signing_identity = SIGNING_IDENTITY,
     }, host_stub())
 
     t.assert_eq(plan.executable, "/UE/Engine/Build/BatchFiles/RunUAT.sh")
@@ -456,6 +472,7 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
     t.assert_contains(plan.args, "-stage")
     t.assert_contains(plan.args, "-package")
     t.assert_contains(plan.args, "-nodebuginfo")
+    t.assert_contains(plan.args, SIGNING_OVERRIDE)
     t.assert_false(vim.tbl_contains(plan.args, "-build"))
     t.assert_false(vim.tbl_contains(plan.args, "-cook"))
     t.assert_false(vim.tbl_contains(plan.args, "-archive"))
@@ -463,6 +480,17 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
     t.assert_false(vim.tbl_contains(plan.args, "-run"))
     t.assert_eq(table.concat(plan.metadata.stages, ","), "stage,package")
     t.assert_true(plan.metadata.reuses_cooked_data)
+  end)
+
+  t.it("requires an explicitly selected signing identity before packaging", function()
+    local plan = ios.package_plan({
+      target = "SampleGame",
+      configuration = "Development",
+      uproject = "/Project/Sample.uproject",
+    }, host_stub())
+
+    t.assert_eq(plan.status, "unavailable")
+    t.assert_contains(plan.reason, "UESetIOSSigningCertificate")
   end)
 
   t.it("builds an on-demand dSYM plan that verifies Mach-O UUIDs in the same terminal", function()
@@ -690,7 +718,12 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
   end)
 
   t.it("owns iOS SDK and signing preflight plans and validation", function()
-    local descriptor = ios.preflight_plans("package", {}, host_stub())
+    local missing = ios.preflight_plans("package", {}, host_stub())
+    t.assert_eq(missing.status, "unavailable")
+    t.assert_contains(missing.reason, "UESetIOSSigningCertificate")
+
+    local context = { signing_identity = SIGNING_IDENTITY }
+    local descriptor = ios.preflight_plans("package", context, host_stub())
     t.assert_true(descriptor.ok)
     t.assert_eq(#descriptor.plans, 2)
     t.assert_contains(descriptor.plans[1].args, "iphoneos")
@@ -704,10 +737,11 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
       },
       {
         code = 0,
-        stdout = "1 valid identities found\n",
+        stdout = '  1) 0123456789ABCDEF0123456789ABCDEF01234567 "Apple Development: Example User (TEAM123456)"\n'
+          .. "     1 valid identities found\n",
         plan = descriptor.plans[2],
       },
-    })
+    }, context)
     local unsigned = ios.validate_preflight("package", {
       {
         code = 0,
@@ -719,9 +753,97 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
         stdout = "0 valid identities found\n",
         plan = descriptor.plans[2],
       },
-    })
+    }, context)
     t.assert_true(valid.ok)
     t.assert_eq(unsigned.status, "unavailable")
+  end)
+
+  t.it("parses identities and resolves only exact name or fingerprint matches", function()
+    local parsed = ios.parse_signing_identities(table.concat({
+      '  1) 0123456789abcdef0123456789abcdef01234567 "Apple Development: Example User (TEAM123456)"',
+      '  2) 89abcdef0123456789abcdef0123456789abcdef "Apple Distribution: Example Studio (TEAM123456)"',
+      "     2 valid identities found",
+    }, "\n"))
+    local by_name = ios.resolve_signing_identity(parsed.identities, SIGNING_IDENTITY.name)
+    local by_fingerprint = ios.resolve_signing_identity(
+      parsed.identities,
+      "89ABCDEF0123456789ABCDEF0123456789ABCDEF"
+    )
+    local partial = ios.resolve_signing_identity(parsed.identities, "Example")
+    local comma = ios.validate_signing_identity({
+      fingerprint = SIGNING_IDENTITY.fingerprint,
+      name = "Apple Development: Example, User (TEAM123456)",
+    })
+
+    t.assert_true(parsed.ok)
+    t.assert_eq(#parsed.identities, 2)
+    t.assert_eq(by_name.identity.fingerprint, SIGNING_IDENTITY.fingerprint)
+    t.assert_eq(by_fingerprint.identity.name, "Apple Distribution: Example Studio (TEAM123456)")
+    t.assert_eq(partial.status, "unavailable")
+    t.assert_eq(comma.status, "unavailable")
+    t.assert_contains(comma.reason, "commas")
+  end)
+
+  t.it("imports the exact identity selected by PrepareIOSQADebug signing metadata", function()
+    local root = vim.fn.tempname()
+    local config_dir = root .. "/Saved/IOSQADebug"
+    local nested_project = root .. "/Source/Client"
+    local provision = root .. "/Development.mobileprovision"
+    vim.fn.mkdir(config_dir, "p")
+    vim.fn.mkdir(nested_project, "p")
+    vim.fn.writefile({ "fixture" }, provision)
+    vim.fn.writefile({ vim.json.encode({
+      formatVersion = 1,
+      identitySha1 = SIGNING_IDENTITY.fingerprint:lower(),
+      identityName = SIGNING_IDENTITY.name,
+      provision = provision,
+      bundleIdentifier = "com.example.iosqadebug",
+      teamIdentifier = "TEAM123456",
+      getTaskAllow = true,
+    }) }, config_dir .. "/signing.json")
+
+    local imported = targets.must_get("IOS").prepared_signing_identity(nested_project)
+
+    vim.fn.delete(root, "rf")
+    t.assert_true(imported.ok)
+    t.assert_true(imported.found)
+    t.assert_eq(imported.identity.fingerprint, SIGNING_IDENTITY.fingerprint)
+    t.assert_eq(imported.identity.name, SIGNING_IDENTITY.name)
+    t.assert_eq(imported.provision, provision)
+    t.assert_eq(imported.bundle_identifier, "com.example.iosqadebug")
+    t.assert_eq(imported.team_identifier, "TEAM123456")
+  end)
+
+  t.it("fails closed on incompatible PrepareIOSQADebug signing metadata", function()
+    local root = vim.fn.tempname()
+    local config_dir = root .. "/Saved/IOSQADebug"
+    vim.fn.mkdir(config_dir, "p")
+    vim.fn.writefile({ vim.json.encode({
+      formatVersion = 1,
+      identitySha1 = SIGNING_IDENTITY.fingerprint,
+      identityName = SIGNING_IDENTITY.name,
+      provision = "/Profiles/Development.mobileprovision",
+      bundleIdentifier = "com.example.iosqadebug",
+      teamIdentifier = "TEAM123456",
+      getTaskAllow = false,
+    }) }, config_dir .. "/signing.json")
+
+    local invalid = targets.must_get("IOS").prepared_signing_identity(root)
+
+    vim.fn.delete(root, "rf")
+    t.assert_false(invalid.ok)
+    t.assert_contains(invalid.reason, "get-task-allow=true")
+  end)
+
+  t.it("allows unsigned build preflight but verifies an explicit build identity", function()
+    local unsigned = ios.preflight_plans("build", {}, host_stub())
+    local signed = ios.preflight_plans("build", { signing_identity = SIGNING_IDENTITY }, host_stub())
+
+    t.assert_true(unsigned.ok)
+    t.assert_eq(#unsigned.plans, 1)
+    t.assert_true(signed.ok)
+    t.assert_eq(#signed.plans, 2)
+    t.assert_contains(signed.plans[2].args, "codesigning")
   end)
 
   t.it("exposes stage-specific preflight descriptors owned by the iOS driver", function()

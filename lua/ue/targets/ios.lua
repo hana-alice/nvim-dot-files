@@ -1,4 +1,5 @@
 local C = require("ue.targets._common")
+local Signing = require("ue.targets.ios_signing")
 
 local M = {
   id = "IOS",
@@ -145,16 +146,21 @@ function M.build_plan(context, host_driver)
 
   local target_name = C.context_target(context)
   local configuration = C.context_configuration(context)
-  local native_plan = C.with_appended_args(entry, {
+  local signing_arg, signing_unavailable, signing_identity = Signing.override(context, false)
+  if signing_unavailable then return signing_unavailable end
+  local native_args = {
     target_name,
     M.id,
     configuration,
     "-Project=" .. C.trim(context.uproject),
     DAILY_SYMBOL_OVERRIDE,
-  }, {
+  }
+  if signing_arg then native_args[#native_args + 1] = signing_arg end
+  local native_plan = C.with_appended_args(entry, native_args, {
     target = target_name,
     platform = M.id,
     configuration = configuration,
+    signing_identity_configured = signing_identity ~= nil,
   })
 
   local script = iteration_script(context)
@@ -287,6 +293,8 @@ function M.package_plan(context, host_driver)
 
   local target_name = C.context_target(context)
   local configuration = C.context_configuration(context)
+  local signing_arg, signing_unavailable = Signing.override(context, true)
+  if not signing_arg then return signing_unavailable end
   return C.with_appended_args(entry, {
     "-ScriptsForProject=" .. C.trim(context.uproject),
     "BuildCookRun",
@@ -301,6 +309,7 @@ function M.package_plan(context, host_driver)
     "-nocleanstage",
     "-package",
     "-nodebuginfo",
+    signing_arg,
     "-utf8output",
   }, {
     target = target_name,
@@ -309,6 +318,28 @@ function M.package_plan(context, host_driver)
     stages = { "stage", "package" },
     reuses_cooked_data = true,
   })
+end
+
+function M.parse_signing_identities(output)
+  return Signing.parse(output)
+end
+
+function M.validate_signing_identity(value)
+  local identity, err = Signing.validate(value)
+  if not identity then return C.unavailable(M.id, "signing", err) end
+  return { ok = true, identity = identity }
+end
+
+function M.resolve_signing_identity(identities, query)
+  return Signing.resolve(identities, query)
+end
+
+function M.signing_identity_list_plan(context, host_driver)
+  return Signing.list_plan(context, host_driver)
+end
+
+function M.prepared_signing_identity(project_root)
+  return Signing.load_prepared_config(project_root)
 end
 
 function M.symbols_plan(context, host_driver)
@@ -717,54 +748,11 @@ function M.preflight_descriptors()
 end
 
 function M.preflight_plans(stage, context, host_driver)
-  local plans = {}
-  local xcrun, xcrun_unavailable = C.resolve_host_entry(host_driver, "xcrun_entry", context, M.id, stage)
-  if not xcrun then
-    return xcrun_unavailable
-  end
-  plans[#plans + 1] = C.with_appended_args(xcrun, {
-    "--sdk",
-    "iphoneos",
-    "--show-sdk-path",
-  }, { preflight = "iphoneos-sdk" })
-
-  if stage == "package" or stage == "install" then
-    local security, security_unavailable = C.resolve_host_entry(host_driver, "security_entry", context, M.id, stage)
-    if not security then
-      return security_unavailable
-    end
-    plans[#plans + 1] = C.with_appended_args(security, {
-      "find-identity",
-      "-v",
-      "-p",
-      "codesigning",
-    }, { preflight = "codesign-identity" })
-  end
-
-  return { ok = true, plans = plans }
+  return Signing.preflight_plans(stage, context, host_driver)
 end
 
-function M.validate_preflight(stage, results)
-  for _, result in ipairs(results or {}) do
-    if tonumber(result.code) ~= 0 then
-      return C.unavailable(M.id, stage, "toolchain preflight command failed", {
-        preflight = result.plan and result.plan.metadata and result.plan.metadata.preflight,
-        exit_code = result.code,
-      })
-    end
-    local kind = result.plan and result.plan.metadata and result.plan.metadata.preflight
-    if kind == "iphoneos-sdk" and C.trim(result.stdout) == "" then
-      return C.unavailable(M.id, stage, "iPhoneOS SDK path was empty")
-    end
-    if kind == "codesign-identity" then
-      local output = tostring(result.stdout or "") .. "\n" .. tostring(result.stderr or "")
-      local count = tonumber(output:match("(%d+)%s+valid identities found"))
-      if not count or count < 1 then
-        return C.unavailable(M.id, stage, "no valid code-sign identity found")
-      end
-    end
-  end
-  return { ok = true, stage = stage }
+function M.validate_preflight(stage, results, context)
+  return Signing.validate_preflight(stage, results, context)
 end
 
 return M

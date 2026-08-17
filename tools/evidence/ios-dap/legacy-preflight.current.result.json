@@ -1,0 +1,42 @@
+{
+  "blockers": [],
+  "checks": {
+    "adapter": {
+      "digest": "5b3c0fcb8a37",
+      "name": "lldb-dap",
+      "system_path": "/Applications/Xcode.app/Contents/Developer/usr/bin/lldb-dap"
+    },
+    "adapter_version": "lldb-dap: LLVM (http://llvm.org/):",
+    "device": {
+      "architecture": "arm64e",
+      "build_version": "19E258",
+      "product_type": "iPhone13,2",
+      "product_version": "15.4.1"
+    },
+    "device_digest": "0ab56083ef5d",
+    "exact_device_support_layout": true,
+    "explicit_usb_device_detected": true,
+    "ios_deploy": {
+      "digest": "9e3255c23865",
+      "name": "ios-deploy"
+    },
+    "ios_deploy_version": "1.12.2",
+    "lldb_remote_ios_sysroot": true,
+    "pre_ios17": true,
+    "selected_xcode": {
+      "digest": "c7228ff971f3",
+      "name": "Developer",
+      "system_path": "/Applications/Xcode.app/Contents/Developer"
+    },
+    "symbols": {
+      "digest": "64f0e4cc0127",
+      "name": "Symbols"
+    },
+    "system_symbols_present": true,
+    "xcode_version": "Xcode 26.0.1"
+  },
+  "mode": "legacy-preflight",
+  "note": "Legacy preflight never unlocks the Neovim IOS DAP matrix; the strict source breakpoint attach gate is still required.",
+  "schema": "ue-ios-dap-probe-v1",
+  "status": "ready-for-legacy-transport-probe"
+}

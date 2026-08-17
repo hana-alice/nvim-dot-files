@@ -263,8 +263,8 @@ map("n", "<leader>ss", open_symbol_picker(), { desc = "Search: Symbols" })
 map("n", "<leader>sS", open_symbol_picker({ workspace = true }), { desc = "Search: Workspace Symbols" })
 map("n", "<leader>bc", close_current_target, { desc = "Buffer/Window: Smart close current target" })
 map("n", "<leader>bn", "<cmd>confirm enew<cr>", { desc = "Buffer: New empty buffer" })
--- Static UE keymaps. Keys that need {nowait=true} are set by
--- apply_ue_runtime_overrides() on VeryLazy (see below).
+-- Static UE keymaps. Prefix-sensitive entries are replaced with
+-- {nowait=true} by apply_ue_runtime_overrides() at the end of this file.
 map("n", "<leader>uA", "<cmd>UESetAndroidDevice<cr>", { desc = "UE: Select Android device (this Nvim)" })
 map("n", "<leader>uB", "<cmd>UEPrepare<cr>", { desc = "UE: Prepare symbols + compile_commands" })
 map("n", "<leader>uc", "<cmd>UEExportCompileCommands<cr>", { desc = "UE: Export compile_commands" })
@@ -412,18 +412,8 @@ map("n", "<leader>dj", "<cmd>UEDAPFrameDown<cr>",        { desc = "DAP: Stack fr
 map("n", "<leader>dR", "<cmd>UEDAPRestartFrame<cr>",     { desc = "DAP: Restart frame" })
 map("n", "<leader>ui", "<cmd>UEInstallAndroid<cr>", { desc = "UE: Install APK to device" })
 
--- Deferred: apply {nowait=true} overrides once LazyVim has finished loading
--- its own <leader>u* mappings, so ours take priority without delay.
--- CRITICAL: if VeryLazy already fired by the time this file loads (which
--- can happen because LazyVim auto-loads config/keymaps.lua ON the
--- VeryLazy event itself), the once-handler would never run. Apply
--- immediately in that case.
-if vim.v.vim_did_enter == 1 then
-  apply_ue_runtime_overrides()
-else
-  vim.api.nvim_create_autocmd("User", {
-    pattern = "VeryLazy",
-    once = true,
-    callback = apply_ue_runtime_overrides,
-  })
-end
+-- LazyVim loads user keymaps after its defaults, so the override is already
+-- in the correct order. Apply it in the same load pass: Neovide can source
+-- this file before VimEnter, and waiting for another VeryLazy would leave the
+-- prefix-sensitive mappings absent for the rest of that session.
+apply_ue_runtime_overrides()

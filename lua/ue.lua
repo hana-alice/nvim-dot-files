@@ -4746,6 +4746,7 @@ do
       cwd = ctx.engine_root,
       archive_dir = archive_dir,
       config_root = vim.fn.stdpath("config"),
+      signing_identity = opts.signing_identity or (ctx.state and ctx.state.ios_signing_identity),
       device_id = opts.device_id or runtime.device_id,
       bundle_id = opts.bundle_id or runtime.bundle_id,
       artifacts = opts.artifacts or runtime.artifacts,
@@ -7641,7 +7642,7 @@ do
       local plan = plans[index]
       if not plan then
         local validation = type(driver.validate_preflight) == "function"
-            and driver.validate_preflight(stage, results)
+            and driver.validate_preflight(stage, results, target_ctx)
           or { ok = true }
         on_done(validation.ok == true, validation.reason, results)
         return
@@ -7744,6 +7745,128 @@ do
       quickfix_root = workspace_root(ctx),
       tail_limit = 20,
     })
+  end
+
+  function CORE_RT.select_ios_signing_certificate(query, clear)
+    query = trim(query or "")
+    local ctx, err = resolve_context()
+    if not ctx or not ctx.project_root then
+      target_error(
+        "ue.ios.signing",
+        err or "No project configured. Run :UESetProject [path]"
+      )
+      return
+    end
+    if clear then
+      if query ~= "" then
+        target_error("ue.ios.signing", "bang clears the selection and cannot be combined with an identity")
+        return
+      end
+      local ok, update_err = update_state_field(ctx.engine_root, "ios_signing_identity", nil)
+      if not ok then
+        target_error("ue.ios.signing", update_err)
+        return
+      end
+      CORE_RT.context_cache = {}
+      vim.notify("IOS signing certificate selection cleared", vim.log.levels.INFO)
+      return true
+    end
+
+    local host_driver = require("utils.platform").driver()
+    local driver, unavailable = require("ue.targets").resolve("IOS", "package", host_driver)
+    if not driver then
+      target_error("ue.ios.signing", unavailable.reason)
+      return
+    end
+
+    local prepared_identity
+    if query == "" then
+      local prepared = driver.prepared_signing_identity(ctx.project_root)
+      if not prepared.ok then
+        target_error(
+          "ue.ios.signing",
+          prepared.reason .. "; rerun PrepareIOSQADebug.sh or pass an identity explicitly"
+        )
+        return
+      end
+      if prepared.found then
+        prepared_identity = prepared.identity
+        query = prepared.identity.fingerprint
+      end
+    end
+
+    local plan = driver.signing_identity_list_plan(ctx, host_driver)
+    if type(plan) ~= "table" or plan.ok == false then
+      target_error("ue.ios.signing", plan and plan.reason or "signing identity probe is unavailable")
+      return
+    end
+
+    local function persist(identity)
+      local validated = driver.validate_signing_identity(identity)
+      if not validated.ok then
+        target_error("ue.ios.signing", validated.reason)
+        return
+      end
+      identity = validated.identity
+      local value = {
+        fingerprint = identity.fingerprint,
+        name = identity.name,
+        selected_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        selected_from = prepared_identity and "PrepareIOSQADebug" or "keychain",
+      }
+      local ok, update_err = update_state_field(ctx.engine_root, "ios_signing_identity", value)
+      if not ok then
+        target_error("ue.ios.signing", update_err)
+        return
+      end
+      CORE_RT.context_cache = {}
+      local suffix = prepared_identity and " from PrepareIOSQADebug metadata" or ""
+      vim.notify("IOS signing certificate selected for the current project" .. suffix, vim.log.levels.INFO)
+    end
+
+    local handle, run_err = require("ue.target_tasks").run(plan, {
+      name = "UE IOS signing identity discovery",
+      on_exit = function(result)
+        if result.code ~= 0 then
+          target_error("ue.ios.signing", require("ue.target_tasks").error_message(result))
+          return
+        end
+        local parsed = driver.parse_signing_identities(
+          tostring(result.stdout or "") .. "\n" .. tostring(result.stderr or "")
+        )
+        if not parsed.ok then
+          target_error("ue.ios.signing", parsed.reason)
+          return
+        end
+        if #parsed.identities == 0 then
+          target_error("ue.ios.signing", "no valid code-sign identity found in the current keychain")
+          return
+        end
+        if query ~= "" then
+          local resolved = driver.resolve_signing_identity(parsed.identities, query)
+          if not resolved.ok then
+            target_error("ue.ios.signing", resolved.reason)
+            return
+          end
+          if prepared_identity and resolved.identity.name ~= prepared_identity.name then
+            target_error("ue.ios.signing", "PrepareIOSQADebug identity does not match the current keychain")
+            return
+          end
+          persist(resolved.identity)
+          return
+        end
+        vim.ui.select(parsed.identities, {
+          prompt = "Select IOS signing certificate:",
+          format_item = function(identity)
+            return ("%s [%s]"):format(identity.name, identity.fingerprint:sub(-8))
+          end,
+        }, function(identity)
+          if identity then persist(identity) end
+        end)
+      end,
+    })
+    if not handle then target_error("ue.ios.signing", run_err) end
+    return handle
   end
 
   function CORE_RT.select_target_device(platform)
@@ -9651,6 +9774,13 @@ function M.setup()
   vim.api.nvim_create_user_command("UEIOSSymbols", function()
     CORE_RT.generate_target_symbols("IOS")
   end, { desc = "Generate and UUID-verify the current IOS binary's dSYM on demand" })
+  vim.api.nvim_create_user_command("UESetIOSSigningCertificate", function(cmd)
+    CORE_RT.select_ios_signing_certificate(cmd.args, cmd.bang)
+  end, {
+    bang = true,
+    nargs = "*",
+    desc = "Select the current project's IOS code-sign identity; bang clears it",
+  })
   vim.api.nvim_create_user_command("UESetIOSDevice", function()
     CORE_RT.select_target_device("IOS")
   end, { desc = "Select an available physical IOS device through its target driver" })

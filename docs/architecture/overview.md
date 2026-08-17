@@ -76,7 +76,13 @@
   不触发安装、更新、UE build/package/device 或 DAP。
 - **iOS 应用**：`:UEBuildIOS` 经 IOS target driver 和 macOS zsh wrapper 调原生 `Build.sh`；wrapper
   只在 AOT 输入指纹、SDK/工具链与上次成功 framework 产物全部匹配时注入 `bSkipAOTProcess=true`，
-  并用稳定 INI override 延后 dSYM。`:UEPackageIOS` 规划 UAT BuildCookRun
+  输入 content hash 可在 path/device/inode/size/纳秒 mtime/ctime 全同后复用，但 output 仍逐个 hash；
+  Build.sh 始终运行并由 UBT action graph 判断过期 C++ action。`:UESetIOSSigningCertificate` 把当前
+  keychain 中精确匹配的 identity 保存到 project bucket；无参数时优先 fail-closed 导入
+  `PrepareIOSQADebug.sh` 的 `Saved/IOSQADebug/signing.json`，并兼容 `workspace/Source/Client` 布局，
+  没有 manifest 时才显示 picker。Build/Package 用 argv-only INI override 捕获，
+  Package/Install 精确 preflight，绝不选择第一张证书。日常 build 另用稳定 INI override 延后 dSYM。
+  `:UEPackageIOS` 规划 UAT BuildCookRun
   （SkipBuild/SkipCook/Stage/NoCleanStage/Package，不含 Cook/Archive/Deploy/Run）；`:UEIOSSymbols`
   按需运行 dsymutil 并比较 binary/dSYM UUID；
   `:UESetIOSDevice` / `:UEInstallIOS` / `:UELaunch` 使用结构化 CoreDevice JSON、当前 package task 的
@@ -86,6 +92,10 @@
   未实现，因此 macOS 也不注册 IOS handler，更不会借用 Mac process attach。Android 走 platform
   模式 + serial connect URL；K30 URL 与本次 session 捕获的 ADB serial 必须一致，切换当前进程的
   选择值不改变活跃 session 的 poll/cleanup。
+  `tools/ios_dap_protocol_probe.py` 已提供脱敏 CoreDevice preflight、显式 pre-iOS17 legacy preflight 与
+  参数化 CLI/raw-DAP attach gate。当前 legacy 实机已证明精确 DeviceSupport、DeveloperDiskImage、
+  debugserver listener、LLDB `remote-ios` 和 target create，但设备 profile 尚未显式信任，且现有重签包
+  不含 source DWARF；因此只记录 partial/blocked evidence，IOS matrix 仍保持 unavailable。
 
 ### 2.1 状态归属清单
 

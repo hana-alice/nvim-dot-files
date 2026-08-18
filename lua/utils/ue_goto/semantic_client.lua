@@ -38,7 +38,7 @@ local runtime = runtime_helper.install(M, {
   state = state,
   uv = vim.uv or vim.loop,
   SIDECAR_NAME = "ue-clang-semanticd",
-  REQUEST_TIMEOUT_MS = 180000,
+  REQUEST_TIMEOUT_MS = 30000,
   IDLE_EVICT_MS = 30000,
 })
 
@@ -59,5 +59,6 @@ end
 M.PROTOCOL_VERSION = protocol.VERSION
 M.TERMINAL = actions.TERMINAL
 M.IDLE_EVICT_MS = runtime.IDLE_EVICT_MS
+M.REQUEST_TIMEOUT_MS = runtime.REQUEST_TIMEOUT_MS
 
 return M

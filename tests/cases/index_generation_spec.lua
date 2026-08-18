@@ -210,6 +210,14 @@ t.describe("ue.index generation manifests", function()
     t.assert_eq(wrapper.nvim_ue_members[1], "Source/Runtime/Sample/Private/A.cpp")
     t.assert_eq(wrapper.nvim_ue_members[2], "Source/Runtime/Sample/Private/B.cpp")
     t.assert_eq(wrapper.nvim_ue_module_root, "Source/Runtime/Sample")
+    local has_attached_mf = false
+    for _, arg in ipairs(wrapper.arguments) do
+      if type(arg) == "string" and vim.startswith(arg, "-MF") then
+        has_attached_mf = true
+        break
+      end
+    end
+    t.assert_false(has_attached_mf, "grouped rsp argv must not keep attached dependency outputs")
 
     t.assert_eq(#fallback.nvim_ue_members, 1)
     t.assert_eq(fallback.nvim_ue_members[1], "Generated/Standalone/Loose.cpp")
@@ -222,6 +230,202 @@ t.describe("ue.index generation manifests", function()
     for _, entry in ipairs(input_after) do
       t.assert_nil(entry.nvim_ue_members, "input compile_commands must stay unmodified")
       t.assert_nil(entry.nvim_ue_module_root, "input compile_commands must stay unmodified")
+    end
+
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("groups AppleClang unity wrappers without rsp by reusing exact active argv", function()
+    local root = canonical_temp_root("_apple_no_rsp_group")
+    local source_dir = root .. "/Engine/Source/Runtime/AppleSample/Private"
+    local unity_root = root .. "/Build/Intermediate/Build/Mac/Game/Development"
+    local unity_file = unity_root .. "/AppleSample/Module.AppleSample.1_of_1.cpp"
+    local sysroot = "/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator18.0.sdk"
+    local pch = unity_root .. "/AppleSample/SharedPCH.Sample.pch"
+    local sources = { source_dir .. "/A.cpp", source_dir .. "/B.cpp" }
+    for _, source in ipairs(sources) do write_file(source, "// apple grouped\n") end
+    write_file(unity_file, table.concat({
+      '#include "Runtime/AppleSample/Private/A.cpp"',
+      '#include "Runtime/AppleSample/Private/B.cpp"',
+      "",
+    }, "\n"))
+
+    local input_entries = {}
+    for index, source in ipairs(sources) do
+      input_entries[#input_entries + 1] = {
+        directory = root .. "/Engine/Source",
+        file = source,
+        arguments = {
+          "clang++",
+          "--target=arm64-apple-ios16.0-simulator",
+          "-arch", "arm64",
+          "-openmp",
+          "-isysroot", sysroot,
+          "-std=c++20",
+          "-DPLATFORM_IOS=1",
+          "-I", root .. "/Engine/Source",
+          "-include-pch", pch,
+          "-Winvalid-pch",
+          "-c", source,
+          "-o", root .. "/out/obj/" .. index .. ".o",
+          "-MMD",
+          "-MF", root .. "/out/dep/" .. index .. ".d",
+        },
+      }
+    end
+    local input = root .. "/compile_commands.json"
+    local output = root .. "/out/apple.hot.super.json"
+    write_file(input, vim.json.encode(input_entries))
+
+    local result = vim.system(python_command(
+      vim.fn.stdpath("config") .. "/tools/build_hot_super_unity_cdb.py",
+      input,
+      output,
+      "--super-dir",
+      root .. "/out/super_unity_cpps"
+    ), { text = true }):wait()
+    t.assert_eq(result.code, 0, result.stderr or result.stdout)
+
+    local output_entries = read_json(output)
+    t.assert_eq(#output_entries, 1, "identical AppleClang commands should collapse into one wrapper")
+    local wrapper = output_entries[1]
+    local normalized_wrapper = wrapper.file:gsub("\\", "/")
+    t.assert_contains(normalized_wrapper, "/super_unity_cpps/SuperUnity.UBT.")
+    t.assert_contains(wrapper.arguments, "--target=arm64-apple-ios16.0-simulator")
+    t.assert_contains(wrapper.arguments, "-arch")
+    t.assert_contains(wrapper.arguments, "arm64")
+    t.assert_contains(wrapper.arguments, "-openmp")
+    t.assert_contains(wrapper.arguments, "-isysroot")
+    t.assert_contains(wrapper.arguments, sysroot)
+    t.assert_contains(wrapper.arguments, "-include-pch")
+    t.assert_contains(wrapper.arguments, pch)
+    t.assert_contains(wrapper.arguments, wrapper.file)
+    t.assert_false(vim.tbl_contains(wrapper.arguments, "-o"), "grouped argv must not emit object files")
+    t.assert_false(vim.tbl_contains(wrapper.arguments, "-MMD"), "grouped argv must not emit dependency files")
+    t.assert_false(vim.tbl_contains(wrapper.arguments, "-MF"), "grouped argv must not emit dependency paths")
+    for index = 1, #sources do
+      t.assert_false(vim.tbl_contains(wrapper.arguments, root .. "/out/obj/" .. index .. ".o"))
+      t.assert_false(vim.tbl_contains(wrapper.arguments, root .. "/out/dep/" .. index .. ".d"))
+    end
+    for _, source in ipairs(sources) do
+      t.assert_false(vim.tbl_contains(wrapper.arguments, source), "wrapper argv must replace member sources")
+    end
+
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("falls back to exact per-file entries when AppleClang unity members differ semantically", function()
+    local root = canonical_temp_root("_apple_no_rsp_fallback")
+    local source_dir = root .. "/Engine/Source/Runtime/MacSample/Private"
+    local unity_root = root .. "/Build/Intermediate/Build/Mac/Game/Development"
+    local unity_file = unity_root .. "/MacSample/Module.MacSample.1_of_1.cpp"
+    local sysroot = "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX14.0.sdk"
+    local pch = unity_root .. "/MacSample/SharedPCH.Sample.pch"
+    local sources = { source_dir .. "/A.cpp", source_dir .. "/B.cpp" }
+    for _, source in ipairs(sources) do write_file(source, "// apple fallback\n") end
+    write_file(unity_file, table.concat({
+      '#include "Runtime/MacSample/Private/A.cpp"',
+      '#include "Runtime/MacSample/Private/B.cpp"',
+      "",
+    }, "\n"))
+
+    local input_entries = {}
+    for index, source in ipairs(sources) do
+      input_entries[#input_entries + 1] = {
+        directory = root .. "/Engine/Source",
+        file = source,
+        arguments = {
+          "clang++",
+          "--target=arm64-apple-macosx14.0",
+          "-arch", "arm64",
+          "-isysroot", sysroot,
+          "-std=c++20",
+          "-DAPPLE_VARIANT=" .. index,
+          "-I", root .. "/Engine/Source",
+          "-include-pch", pch,
+          "-Winvalid-pch",
+          "-c", source,
+          "-o", root .. "/out/obj/" .. index .. ".o",
+          "-MMD",
+          "-MF", root .. "/out/dep/" .. index .. ".d",
+        },
+      }
+    end
+    local input = root .. "/compile_commands.json"
+    local output = root .. "/out/apple.fallback.hot.super.json"
+    write_file(input, vim.json.encode(input_entries))
+
+    local result = vim.system(python_command(
+      vim.fn.stdpath("config") .. "/tools/build_hot_super_unity_cdb.py",
+      input,
+      output,
+      "--super-dir",
+      root .. "/out/super_unity_cpps"
+    ), { text = true }):wait()
+    t.assert_eq(result.code, 0, result.stderr or result.stdout)
+
+    local output_entries = read_json(output)
+    t.assert_eq(#output_entries, 2, "semantic differences must keep exact per-file entries")
+    for index, entry in ipairs(output_entries) do
+      t.assert_eq(entry.file, sources[index])
+      t.assert_false(entry.file:gsub("\\", "/"):find("/super_unity_cpps/SuperUnity.UBT.", 1, true) ~= nil,
+        "differing AppleClang members must not be grouped")
+    end
+
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("does not enable no-rsp exact grouping for arch-only non-Apple commands", function()
+    local root = canonical_temp_root("_non_apple_arch_only_fallback")
+    local source_dir = root .. "/Engine/Source/Runtime/LinuxishSample/Private"
+    local unity_root = root .. "/Build/Intermediate/Build/Mac/Game/Development"
+    local unity_file = unity_root .. "/LinuxishSample/Module.LinuxishSample.1_of_1.cpp"
+    local sources = { source_dir .. "/A.cpp", source_dir .. "/B.cpp" }
+    for _, source in ipairs(sources) do write_file(source, "// non apple arch only\n") end
+    write_file(unity_file, table.concat({
+      '#include "Runtime/LinuxishSample/Private/A.cpp"',
+      '#include "Runtime/LinuxishSample/Private/B.cpp"',
+      "",
+    }, "\n"))
+
+    local input_entries = {}
+    for index, source in ipairs(sources) do
+      input_entries[#input_entries + 1] = {
+        directory = root .. "/Engine/Source",
+        file = source,
+        arguments = {
+          "clang++",
+          "--target=x86_64-unknown-linux-gnu",
+          "-arch", "x86_64",
+          "-std=c++20",
+          "-DLINUXISH=1",
+          "-I", root .. "/Engine/Source",
+          "-c", source,
+          "-o", root .. "/out/obj/" .. index .. ".o",
+          "-MMD",
+          "-MF", root .. "/out/dep/" .. index .. ".d",
+        },
+      }
+    end
+    local input = root .. "/compile_commands.json"
+    local output = root .. "/out/non.apple.arch.only.hot.super.json"
+    write_file(input, vim.json.encode(input_entries))
+
+    local result = vim.system(python_command(
+      vim.fn.stdpath("config") .. "/tools/build_hot_super_unity_cdb.py",
+      input,
+      output,
+      "--super-dir",
+      root .. "/out/super_unity_cpps"
+    ), { text = true }):wait()
+    t.assert_eq(result.code, 0, result.stderr or result.stdout)
+
+    local output_entries = read_json(output)
+    t.assert_eq(#output_entries, 2, "arch-only non-Apple commands must stay exact per-file")
+    for index, entry in ipairs(output_entries) do
+      t.assert_eq(entry.file, sources[index])
+      t.assert_false(entry.file:gsub("\\", "/"):find("/super_unity_cpps/SuperUnity.UBT.", 1, true) ~= nil,
+        "non-Apple arch-only commands must not enter the exact Apple grouping path")
     end
 
     pcall(vim.fn.delete, root, "rf")
@@ -288,6 +492,76 @@ t.describe("ue.index generation manifests", function()
     local marker_json = read_json(marker)
     t.assert_eq(marker_json.entry_count, #controlled_background)
     t.assert_eq(marker_json.index_kind, "controlled-background")
+
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("full background CDB normalizes command-only entries before controlled generation", function()
+    local root = canonical_temp_root("_command_only_cdb")
+    local source = root .. "/Engine/Source/Runtime/Sample/Private/Command Only.cpp"
+    local input = root .. "/compile_commands.json"
+    local active = root .. "/out/active.json"
+    local background = root .. "/out/background/compile_commands.json"
+    local marker = root .. "/out/full.idx"
+    write_file(source, "// fixture\n")
+    write_file(input, vim.json.encode({ {
+      directory = root,
+      file = source,
+      command = 'clang++ -std=c++20 -c "' .. source .. '"',
+    } }))
+
+    local result = vim.system(python_command(
+      vim.fn.stdpath("config") .. "/tools/build_full_cdb.py",
+      input,
+      active,
+      "--no-rsp",
+      "--no-inject",
+      "--background-output",
+      background,
+      "--idx-output",
+      marker
+    ), { text = true }):wait()
+
+    t.assert_eq(result.code, 0, result.stderr or result.stdout)
+    for _, path in ipairs({ active, background }) do
+      local entries = read_json(path)
+      t.assert_eq(#entries, 1)
+      t.assert_type(entries[1].arguments, "table", path .. " must contain structured argv")
+      t.assert_contains(entries[1].arguments, source)
+      t.assert_nil(entries[1].command, path .. " must not retain ambiguous command strings")
+    end
+
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("current and hot background CDB normalize command-only subsets before injection", function()
+    local root = canonical_temp_root("_command_only_subset")
+    local source = root .. "/Engine/Source/Runtime/Sample/Private/Subset Command.cpp"
+    local input = root .. "/compile_commands.json"
+    local background = root .. "/out/background/compile_commands.json"
+    local marker = root .. "/out/current.idx"
+    write_file(source, "// fixture\n")
+    write_file(input, vim.json.encode({ {
+      directory = root,
+      file = source,
+      command = 'clang++ -std=c++20 -c "' .. source .. '"',
+    } }))
+
+    local result = vim.system(python_command(
+      vim.fn.stdpath("config") .. "/tools/build_clangd_index.py",
+      input,
+      "--output",
+      marker,
+      "--background-output",
+      background
+    ), { text = true }):wait()
+
+    t.assert_eq(result.code, 0, result.stderr or result.stdout)
+    local entries = read_json(background)
+    t.assert_eq(#entries, 1)
+    t.assert_type(entries[1].arguments, "table")
+    t.assert_contains(entries[1].arguments, source)
+    t.assert_nil(entries[1].command)
 
     pcall(vim.fn.delete, root, "rf")
   end)

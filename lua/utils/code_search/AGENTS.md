@@ -23,6 +23,10 @@ trigram 索引（google/codesearch 的 csearch）驱动的亚秒级 live grep，
   `csearch_input_hash`（per-engine_root）与单份索引天然对齐。**gtags/cdb 仍 per-platform**
   （编译相关）。切平台不重建、不删 csearch；旧 `csearch/<key>/` 残留靠 freshness 判 stale
   → 下次 `:UEPrepare` 重建。见 change `refactor-search-system`。
+- **增量 merge 只支持新增/替换**：fork 的 add 模式必须把 `-files-from` 中每个文件作为
+  exact merge path 写入 staged index，才能替换同路径旧 trigram；删除无法由 upstream
+  `index.Merge` 表达，必须走 reset。不得退回“staged names 存在但 Paths 为空”的实现，
+  否则原生 merge 会 panic `inconsistent index`。
 - **`<leader>/` 是 csearch-only 入口，从不加 rg**：无索引时弹可见 ERROR 引导 `:UEPrepare`、
   不开任何 picker。rg 仅存在于 ① `stream()` 内部供 gd/gr 兜底（P12）、② `<leader>sG` 显式入口。
 

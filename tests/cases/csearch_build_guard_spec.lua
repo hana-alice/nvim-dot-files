@@ -7,7 +7,8 @@
 --   韧性层：增量 build_index{mode="add"} 在目标 idx 不可用（0 字节/缺失）时
 --     拒绝、不 spawn；全量 mode="reset" 不受此约束。
 --
--- 纯逻辑 + stub，不触真实 cindex；headless 可跑。
+-- 逻辑/stub 守卫始终运行；工具链存在时另跑一次真实 Lua → cindex → csearch
+-- 增量替换，避免 mock 掩盖原生 merge 契约回归。
 
 local t = require("tests.harness")
 t.bootstrap()
@@ -123,6 +124,70 @@ t.describe("csearch 增量遇不可用 idx 被拒（D9 韧性）", function()
     t.assert_false(cs._usable_index_for_test(dir .. "/missing.idx"), "缺失 idx 不可用")
     t.assert_true(cs._usable_index_for_test(good), "足够大的 idx 可用")
     pcall(vim.fn.delete, dir, "rf")
+  end)
+end)
+
+t.describe("csearch 原生增量 merge", function()
+  local function build(ctx, list_path, mode)
+    local done, ok_result, error_result = false, false, nil
+    cs.build_index(ctx, list_path, function(ok, err)
+      ok_result, error_result, done = ok, err, true
+    end, { mode = mode })
+    t.assert_true(vim.wait(10000, function() return done end, 20), mode .. " build timeout")
+    t.assert_true(ok_result, error_result or (mode .. " build failed"))
+  end
+
+  local function search(ctx, pattern)
+    local matches, done, exit_code = {}, false, nil
+    cs.stream(ctx, pattern, { regex = false, case = true, code_only = true }, {
+      on_line = function(file, line)
+        matches[#matches + 1] = { file = file, line = line }
+      end,
+      on_done = function(code)
+        exit_code, done = code, true
+      end,
+    })
+    t.assert_true(vim.wait(5000, function() return done end, 20), "search timeout")
+    return matches, exit_code
+  end
+
+  t.it("新增与修改文件替换旧 trigram，且路径可含空格", function()
+    if not cs.csearch_exe() or not cs.cindex_uefilter_exe() then return end
+    local function fixture_lines(token, prefix)
+      local lines = { "int " .. token .. " = 1;" }
+      for index = 1, 400 do
+        lines[#lines + 1] = ("int %s_filler_%04d = %d;"):format(prefix, index, index)
+      end
+      return lines
+    end
+    local root = vim.fn.tempname():gsub("\\", "/") .. "_native merge"
+    local source_dir = root .. "/Source With Spaces"
+    local keep = source_dir .. "/Keep.cpp"
+    local replace = source_dir .. "/Replace.cpp"
+    local added = source_dir .. "/Added.cpp"
+    local idx = root .. "/csearch.idx"
+    local initial_list = root .. "/initial.files"
+    local update_list = root .. "/update.files"
+    vim.fn.mkdir(source_dir, "p")
+    vim.fn.writefile(fixture_lines("KEEP_NATIVE_TOKEN", "keep"), keep)
+    vim.fn.writefile(fixture_lines("OLD_NATIVE_TOKEN", "old"), replace)
+    vim.fn.writefile({ keep, replace }, initial_list)
+    local ctx = { workspace_root = root, csearch_idx = idx }
+    build(ctx, initial_list, "reset")
+
+    vim.fn.writefile(fixture_lines("FRESH_NATIVE_TOKEN", "fresh"), replace)
+    vim.fn.writefile(fixture_lines("ADDED_NATIVE_TOKEN", "added"), added)
+    vim.fn.writefile({ added, replace, added }, update_list)
+    build(ctx, update_list, "add")
+
+    local fresh = search(ctx, "FRESH_NATIVE_TOKEN")
+    local added_hits = search(ctx, "ADDED_NATIVE_TOKEN")
+    local old, old_code = search(ctx, "OLD_NATIVE_TOKEN")
+    t.assert_eq(#fresh, 1, "modified file must expose fresh trigrams")
+    t.assert_eq(#added_hits, 1, "new file must be searchable after add")
+    t.assert_eq(#old, 0, "replacement must remove stale trigrams")
+    t.assert_true(old_code == 0 or old_code == 1, "no-hit csearch should exit cleanly")
+    pcall(vim.fn.delete, root, "rf")
   end)
 end)
 

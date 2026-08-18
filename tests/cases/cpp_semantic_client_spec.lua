@@ -543,6 +543,29 @@ t.describe("cpp semantic client: NDJSON framing", function()
   end)
 end)
 
+t.describe("cpp semantic client: request timeout", function()
+  t.it("aborts an unresponsive sidecar instead of leaving future requests queued", function()
+    client._reset_for_test()
+    t.assert_true(client.REQUEST_TIMEOUT_MS <= 32000,
+      "semantic request timeout must stay inside the live-health budget")
+    local job = vim.fn.jobstart({
+      vim.v.progpath, "--headless", "-u", "NONE", "-c", "sleep 10", "-c", "qa",
+    })
+    t.assert_true(job > 0, "fixture sidecar must start")
+    client._set_process_for_test(job, true)
+    local response
+    client._inject_pending_for_test(11, function(value) response = value end)
+
+    t.assert_true(client._expire_pending_for_test(11))
+    t.assert_eq(response.state, "unavailable")
+    t.assert_eq(response.reason, "semantic sidecar request timed out")
+    t.assert_eq(client.status().pending, 0)
+    local exit = vim.fn.jobwait({ job }, 1000)[1]
+    t.assert_true(exit ~= -1, "timed-out sidecar must be terminated immediately")
+    client._reset_for_test()
+  end)
+end)
+
 t.describe("cpp semantic client: real process manager", function()
   local discovery = require("utils.ue_goto.semantic_sidecar")._discover_toolchain_for_test()
   if not discovery.ok then

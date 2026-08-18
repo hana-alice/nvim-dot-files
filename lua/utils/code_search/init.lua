@@ -15,6 +15,10 @@
 --
 --   require("utils.code_search").current_backend(ctx) → "csearch" | "rg" | nil
 --
+--   require("utils.code_search").csearch_exe() → executable path | nil
+--   require("utils.code_search").cindex_uefilter_exe() → executable path | nil
+--   require("utils.code_search").install_hint() → host-appropriate install command
+--
 --   require("utils.code_search").stream(ctx, pattern, opts, callbacks)
 --       Spawn a search; callbacks = { on_line, on_done }.
 --       on_line(file, lnum, col, text)
@@ -55,16 +59,28 @@ function M._reset_probe_cache()
   _cindex_path = nil
 end
 
+local function go_tool_candidates(base)
+  local suffix = platform.is_windows and ".exe" or ""
+  local name = base .. suffix
+  local candidates = {}
+  local function add(path)
+    if path and path ~= "" then candidates[#candidates + 1] = path end
+  end
+  add(vim.fn.exepath(base))
+  add(vim.fn.exepath(base .. ".exe"))
+  add(vim.env.GOBIN and (vim.env.GOBIN .. "/" .. name) or nil)
+  local separator = platform.is_windows and ";" or ":"
+  for _, root in ipairs(vim.split(vim.env.GOPATH or "", separator, { plain = true, trimempty = true })) do
+    add(root .. "/bin/" .. name)
+  end
+  add(vim.env.USERPROFILE and (vim.env.USERPROFILE .. "/go/bin/" .. name) or nil)
+  add(vim.env.HOME and (vim.env.HOME .. "/go/bin/" .. name) or nil)
+  return candidates
+end
+
 local function csearch_exe()
   if _csearch_path then return _csearch_path end
-  local candidates = {
-    vim.fn.exepath("csearch"),
-    vim.fn.exepath("csearch.exe"),
-    vim.env.GOPATH and (vim.env.GOPATH .. (platform.is_windows and "\\bin\\csearch.exe" or "/bin/csearch")) or nil,
-    vim.env.USERPROFILE and (vim.env.USERPROFILE .. "\\go\\bin\\csearch.exe") or nil,
-    vim.env.HOME and (vim.env.HOME .. "/go/bin/csearch") or nil,
-  }
-  for _, c in ipairs(candidates) do
+  for _, c in ipairs(go_tool_candidates("csearch")) do
     if c and c ~= "" and vim.fn.executable(c) == 1 then
       _csearch_path = c  -- cache success only
       return c
@@ -73,22 +89,31 @@ local function csearch_exe()
   return nil  -- do NOT cache the miss
 end
 
+function M.csearch_exe()
+  return csearch_exe()
+end
+
 function M.cindex_uefilter_exe()
   if _cindex_path then return _cindex_path end
-  local candidates = {
-    vim.fn.exepath("cindex-uefilter"),
-    vim.fn.exepath("cindex-uefilter.exe"),
-    vim.env.GOPATH and (vim.env.GOPATH .. (platform.is_windows and "\\bin\\cindex-uefilter.exe" or "/bin/cindex-uefilter")) or nil,
-    vim.env.USERPROFILE and (vim.env.USERPROFILE .. "\\go\\bin\\cindex-uefilter.exe") or nil,
-    vim.env.HOME and (vim.env.HOME .. "/go/bin/cindex-uefilter") or nil,
-  }
-  for _, c in ipairs(candidates) do
+  for _, c in ipairs(go_tool_candidates("cindex-uefilter")) do
     if c and c ~= "" and vim.fn.executable(c) == 1 then
       _cindex_path = c  -- cache success only
       return c
     end
   end
   return nil  -- do NOT cache the miss
+end
+
+function M.install_hint()
+  local config = vim.fn.stdpath("config")
+  if platform.is_windows then
+    return 'powershell -ExecutionPolicy Bypass -File "' .. config .. '/scripts/install_windows.ps1"'
+  end
+  return "sh " .. vim.fn.shellescape(config .. "/scripts/install_csearch.sh")
+end
+
+function M._go_tool_candidates_for_test(base)
+  return go_tool_candidates(base)
 end
 
 -- Per-workspace index path. Lives next to UEPrepare's other caches.
@@ -101,19 +126,13 @@ end
 function M.index_path(ctx)
   -- v2: caller supplied an explicit path (single source of truth in ue.lua)
   if ctx.csearch_idx and ctx.csearch_idx ~= "" then
-    local dir = vim.fn.fnamemodify(ctx.csearch_idx, ":h")
-    if vim.fn.isdirectory(dir) == 0 then vim.fn.mkdir(dir, "p") end
     return ctx.csearch_idx
   end
   local root = ctx.workspace_root or ctx.root
   if not root or root == "" then
     return nil
   end
-  local csearch_dir = root .. "/.cache/nvim-ue/csearch"
-  if vim.fn.isdirectory(csearch_dir) == 0 then
-    vim.fn.mkdir(csearch_dir, "p")
-  end
-  return csearch_dir .. "/csearch.idx"
+  return root .. "/.cache/nvim-ue/csearch/csearch.idx"
 end
 
 local function usable_index_stat(path)
@@ -645,14 +664,24 @@ function M.build_index(ctx, abs_list_path, cb, opts)
   if not cindex then
     vim.schedule(function()
       cb(false,
-         "cindex-uefilter not found. Build it via:\n" ..
-         "  cd <nvim-config>/tools/cindex-uefilter && go install ./...",
+         "cindex-uefilter not found. Install it via:\n" ..
+         "  " .. M.install_hint(),
          {})
     end)
     return function() end
   end
 
   local idx = M.index_path(ctx)
+  if not idx then
+    vim.schedule(function() cb(false, "csearch index path is unavailable", {}) end)
+    return function() end
+  end
+  local parent = vim.fn.fnamemodify(idx, ":h")
+  local dir_ok = pcall(vim.fn.mkdir, parent, "p")
+  if not dir_ok or vim.fn.isdirectory(parent) == 0 then
+    vim.schedule(function() cb(false, "cannot create csearch index directory: " .. parent, {}) end)
+    return function() end
+  end
 
   -- Resilience (D9): an incremental "add" against an unusable target index
   -- (missing / 0-byte / corrupt) makes cindex `merge` read a broken header →

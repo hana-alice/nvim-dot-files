@@ -158,20 +158,37 @@ function M.install(client, deps)
 
   client._consume_stdout_for_test = consume_stdout
 
+  local function abort_stuck_process()
+    close_timer(state.idle_timer)
+    state.idle_timer = nil
+    local job = state.job
+    if not job then
+      state.ready, state.starting, state.stopping = false, false, false
+      return
+    end
+    state.stopping = true
+    pcall(vim.fn.jobstop, job)
+  end
+
+  local function expire_pending(pending)
+    local id = pending and pending.payload and pending.payload.id
+    if not id or state.pending[id] ~= pending then return false end
+    state.pending[id] = nil
+    close_timer(pending.timeout)
+    emit_trace("response", {
+      request_id = id,
+      provider = "sidecar",
+      terminal_state = "unavailable",
+      stale_reason = "request-timeout",
+      elapsed_ms = math.floor(now_ms() - pending.started_ms),
+    })
+    abort_stuck_process()
+    pending.callback(unavailable("semantic sidecar request timed out", pending.payload.op, id))
+    return true
+  end
+
   local function arm_timeout(pending)
-    pending.timeout = vim.defer_fn(function()
-      local id = pending.payload.id
-      if state.pending[id] ~= pending then return end
-      state.pending[id] = nil
-      emit_trace("response", {
-        request_id = id,
-        provider = "sidecar",
-        terminal_state = "unavailable",
-        stale_reason = "request-timeout",
-        elapsed_ms = math.floor(now_ms() - pending.started_ms),
-      })
-      pending.callback(unavailable("semantic sidecar request timed out", pending.payload.op, id))
-    end, REQUEST_TIMEOUT_MS)
+    pending.timeout = vim.defer_fn(function() expire_pending(pending) end, REQUEST_TIMEOUT_MS)
   end
 
   local function send_pending(pending)
@@ -708,6 +725,15 @@ function M.install(client, deps)
     }
   end
 
+  function client._expire_pending_for_test(id)
+    return expire_pending(state.pending[id])
+  end
+
+  function client._set_process_for_test(job, ready)
+    state.job = job
+    state.ready = ready == true
+  end
+
   local function reset()
     for _, pending in pairs(state.pending) do close_timer(pending.timeout) end
     close_timer(state.idle_timer)
@@ -742,6 +768,7 @@ function M.install(client, deps)
     close_timer = close_timer,
     reset = reset,
     IDLE_EVICT_MS = IDLE_EVICT_MS,
+    REQUEST_TIMEOUT_MS = REQUEST_TIMEOUT_MS,
   }
 end
 

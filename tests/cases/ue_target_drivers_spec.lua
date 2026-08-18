@@ -181,6 +181,43 @@ t.describe("ue.targets build planners", function()
     )
   end)
 
+  t.it("IOS build owns its UBT flag matrix instead of inheriting another target", function()
+    local context = {
+      target = "SampleGame",
+      configuration = "Development",
+      uproject = "/Project/Sample.uproject",
+    }
+    local ios_plan = targets.build_plan("IOS", context, host_stub())
+    local mac_plan = targets.build_plan("Mac", context, host_stub())
+
+    t.assert_contains(ios_plan.args, "-WaitMutex")
+    t.assert_contains(ios_plan.args, "-FromMsBuild")
+    t.assert_contains(ios_plan.args, "-disablev8pointercompression")
+    t.assert_false(vim.tbl_contains(mac_plan.args, "-WaitMutex"))
+    t.assert_false(vim.tbl_contains(mac_plan.args, "-FromMsBuild"))
+    t.assert_false(vim.tbl_contains(mac_plan.args, "-disablev8pointercompression"))
+
+    local windows_build_host = {
+      id = "windows",
+      ue_build_entry = function()
+        return { executable = "Build.bat", args = {}, cwd = "C:/UE" }
+      end,
+    }
+    local linux_build_host = {
+      id = "linux",
+      ue_build_entry = function()
+        return { executable = "/UE/Build.sh", args = {}, cwd = "/UE" }
+      end,
+    }
+    for _, plan in ipairs({
+      targets.build_plan("Android", context, windows_build_host),
+      targets.build_plan("Win64", context, windows_build_host),
+      targets.build_plan("Linux", context, linux_build_host),
+    }) do
+      t.assert_false(vim.tbl_contains(plan.args, "-disablev8pointercompression"))
+    end
+  end)
+
   t.it("IOS semantic CDB plan builds only the tuple action graph", function()
     local plan = targets.plan("IOS", "semantic_cdb", {
       engine_root = "/UE",
@@ -539,6 +576,9 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
     t.assert_contains(install_plan.args, "install")
     t.assert_contains(install_plan.args, "/Stage/IOS/Development/Payload/SampleGame.app")
     t.assert_contains(install_plan.args, "/tmp/install.json")
+    t.assert_false(vim.tbl_contains(install_plan.args, "uninstall"))
+    t.assert_false(vim.tbl_contains(install_plan.args, "delete"))
+    t.assert_false(vim.tbl_contains(install_plan.args, "remove"))
     t.assert_contains(launch_plan.args, "process")
     t.assert_contains(launch_plan.args, "com.example.samplegame")
     t.assert_contains(launch_plan.args, "/tmp/launch.json")

@@ -66,6 +66,14 @@ MUST：当 active platform 为 `IOS` 时，`UEBuild` 与 `UEBuildIOS` 必须使�
 - **THEN** 调用方必须把包装脚本结果作为 build 进程状态
 - **AND** 不得在 Neovim 层重新解释未直接暴露的原始 UBT 状态码
 
+#### Scenario: 通用构建快捷键选择 IOS
+
+- **WHEN** active platform 为 `IOS` 且用户执行 `<leader>ub` / `:UEBuild`
+- **THEN** IOS driver 交给 `Build.sh` 的 argv 必须依次包含 target、`IOS`、configuration、
+  `-Project=<UPROJECT>`、`-WaitMutex`、`-FromMsBuild` 与 `-disablev8pointercompression`
+- **AND** `-disablev8pointercompression` 必须由 IOS target policy 拥有，不得从共享 host/core 层
+  泄漏到 Mac、Win64、Linux 或 Android target
+
 ### Requirement: iOS C++ 日常编译必须安全复用 AOT 并延后 dSYM
 
 MUST：Nvim 可以通过构建环境复用工程既有的 AOT 产物，但只有输入、SDK/工具链与上次成功产物均可证明未变时才允许跳过 AOT。日常编译必须通过命令行 override 关闭自动 dSYM；符号必须由独立命令按需生成。
@@ -178,7 +186,14 @@ MUST：系统必须安装当前 project/target/IOS/configuration 对应的 stage
 
 ### Requirement: 安装必须由设备结果确认
 
-MUST：`UEInstallIOS` 必须使用外置 `xcrun devicectl device install app --device <CAPTURED_ID> <APP>` 后端，并以退出码和结构化结果共同判定成功；不得调用或静默回退到 UE legacy ideviceinstaller 后端。
+MUST：`UEInstallIOS` 以及 active target 为 IOS 时的 `<Space>ui` / `UEInstall` 必须使用外置 `xcrun devicectl device install app --device <CAPTURED_ID> <APP>` 后端，并以退出码和结构化结果共同判定成功；不得调用或静默回退到 UE legacy ideviceinstaller 后端。
+
+#### Scenario: 通用安装键在 IOS target 下原地更新
+
+- **WHEN** active target 为 IOS 且用户执行 `<Space>ui` / `UEInstall`
+- **THEN** 系统必须把操作分派到 IOS target driver，并安装当前 tuple 已签名的 staged `.app`
+- **AND** 安装计划不得先执行 uninstall、delete 或 remove；不得重签名或清除既有应用数据
+- **AND** 系统不得把该操作分派到 Android APK 安装链
 
 #### Scenario: devicectl 报告安装成功
 

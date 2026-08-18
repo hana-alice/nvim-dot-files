@@ -153,6 +153,9 @@ function M.build_plan(context, host_driver)
     M.id,
     configuration,
     "-Project=" .. C.trim(context.uproject),
+    "-WaitMutex",
+    "-FromMsBuild",
+    "-disablev8pointercompression",
     DAILY_SYMBOL_OVERRIDE,
   }
   if signing_arg then native_args[#native_args + 1] = signing_arg end

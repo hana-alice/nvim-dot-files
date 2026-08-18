@@ -45,6 +45,76 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-08-18 — 让 `<leader>ui` 按 active target 安装
+
+**Task**
+
+统一安装快捷键的平台语义：Android 保持替换 APK，IOS 使用当前 tuple 已签名 staged app
+原地更新，不在安装前卸载应用。
+
+**Implemented**
+
+- 新增 `:UEInstall` 平台分派入口，并让静态与 runtime `<leader>ui` 映射都只调用该入口；
+  Android 复用既有 `adb install -r`，IOS 复用 target-driver `devicectl device install app`。
+- 保留 `:UEInstallAndroid` / `:UEInstallIOS` 作为显式兼容命令；Mac 等桌面 target 明确报告不支持，
+  不猜测设备工作流。
+- IOS 安装继续消费 package provenance 对应的已签名 `.app`，不重签名、不启动，并新增禁止
+  uninstall/delete/remove 的 planner 回归。
+- 同步命令冻结表、快捷键、AI context、速查文档和 Android/IOS 主规格。
+
+**Pitfalls / Gotchas**
+
+- “增量安装”在这里指保留应用身份与数据的原地更新，不承诺传输层只发送二进制差量；CoreDevice
+  是否优化传输由 Xcode/devicectl 决定。
+- IOS 安装仍要求当前 tuple 已成功 package、已选择物理设备且 package/install 签名预检通过。
+
+**Validation**
+
+- 安装核心：`keymaps` 54/54、`commands` 103/103、`ue_target_integration` 14/14、
+  `ue_target_drivers` 37/37、`ue_target_tasks` 4/4、`ue_context` 3/3。
+- 关联边界：`platform` 22/22、`ue_project_context` 7/7、`ue_api` 54/54、`smoke` 19/19、
+  `cheatsheet` 140/140、`structure` 39/39。
+- `git diff --check` 与脱敏扫描通过；全量 `nvim --headless -l tests/run.lua` → 970/970。
+
+**Follow-ups**
+
+- 未执行真实 iOS 设备安装；配置回归只验证路由、计划 argv、结果解析契约与无卸载边界。
+
+### 2026-08-18 — 恢复 `<leader>ub` 的 IOS 专属 UBT 参数
+
+**Task**
+
+确保当前 target 为 IOS 时，通用构建快捷键 `<leader>ub` / `:UEBuild` 最终调用 macOS
+`Build.sh` 的参数与其他 target 明确分层，并恢复 target-driver 拆分时遗漏的日常构建参数。
+
+**Implemented**
+
+- IOS `build_plan` 在 project 参数后稳定追加 `-WaitMutex`、`-FromMsBuild` 与
+  `-disablev8pointercompression`；现有 AOT wrapper、日常 dSYM override 和可选签名 override 保持不变。
+- Mac 不继承上述三个参数；`-disablev8pointercompression` 明确保持 IOS-only，不泄漏到
+  Android、Win64 或 Linux driver。
+- 新增纯 planner 与 `<leader>ub → UEBuild → IOS driver → macOS wrapper → Build.sh` 集成断言，
+  并把参数顺序与平台边界同步到 iOS build 主规格。
+
+**Pitfalls / Gotchas**
+
+- target-driver 拆分前的通用 build 路径包含 `-WaitMutex/-FromMsBuild`，拆分后 IOS planner 没有保留；
+  仅凭参数名称把 `-FromMsBuild` 判断为 Windows-only 会掩盖这个行为回归。
+- `-disablev8pointercompression` 此前从未进入仓库，必须由 IOS driver 显式拥有，不能放到 host entry
+  或共享 helper，否则其他平台会被静默污染。
+
+**Validation**
+
+- TDD：新增 planner 用例先以缺少 `-WaitMutex` 失败（36/37），实现后 `ue_target_drivers` 37/37。
+- `ue_target_integration` 12/12、`ue_target_tasks` 4/4、`platform` 22/22、`commands` 102/102、
+  `keymaps` 53/53。
+- `structure` 39/39；全量 `nvim --headless -l tests/run.lua` → 965/965。
+
+**Follow-ups**
+
+- 未启动真实外部工程构建；该验证会产生工程工件，不属于配置回归。现有长驻 Neovim 会话需重新加载
+  配置后才会采用新的 IOS driver argv。
+
 ### 2026-08-18 — 补齐 macOS csearch 与 Apple super-unity 运行链
 
 **Task**

@@ -373,12 +373,12 @@ Trigram lookup is **O(answers)**, not O(workspace). The
 post-filter step is on a few hundred files instead of forty thousand.
 
 ### Where
-- `tools/cindex-uefilter/` — Go fork. `go install ./...` builds the
-  binary; `:UEPrepare` detects it and writes
-  `.cache/nvim-ue/csearch.idx` (~70 MB on a representative UE
-  project).
-- `lua/utils/code_search/init.lua` — picker integration; falls back
-  to `rg --files-from` when the index is missing.
+- `tools/cindex-uefilter/` — Go fork. `scripts/install_csearch.sh` installs it
+  together with the pinned `csearch` query binary on POSIX hosts; `:UEPrepare`
+  writes the project-bucket `csearch/csearch.idx` artifact.
+- `lua/utils/code_search/init.lua` — picker integration; the generic dispatcher
+  can fall back to rg when the index is missing, while the dedicated
+  `<leader>/` surface stays csearch-only and reports the missing capability.
 
 ---
 

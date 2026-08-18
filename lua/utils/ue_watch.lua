@@ -77,9 +77,9 @@ local state = {
   flush_running = false,
   -- Persistent dirty set (in-memory mirror of dirty.json on disk).
   -- Holds every add we've seen since the last :UEPrepare, even AFTER flush.
-  -- WHY: cindex's modify-is-no-op bug means a flushed-into-csearch path may
-  -- still have stale trigrams. The rg-on-dirty overlay needs the full
-  -- post-prepare cumulative set, not just the in-flight pre-flush queue.
+  -- WHY: the watcher is record-only and never publishes csearch updates.
+  -- The rg-on-dirty overlay therefore needs the full post-prepare cumulative
+  -- set, not just the in-flight pre-flush queue.
   -- Keys: lowercased forward-slash abs path. Values: true.
   persistent_dirty = {},
   persistent_dirty_loaded = false,

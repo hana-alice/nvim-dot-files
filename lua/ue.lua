@@ -607,15 +607,9 @@ end
 -- PUBLIC: CLANGD
 -- ==========================================================================
 
--- Forward declaration for find_engine_root, which is defined further below
--- (line ~1152). Without this forward decl, the call inside clangd_cmd
--- (around line 771) resolves to global _G.find_engine_root (nil) and
--- raises "attempt to call global 'find_engine_root' (a nil value)" the
--- first time clangd_cmd is called with a non-nil root_dir (e.g. via
--- on_new_config). The historical reason this didn't fire in practice is
--- that LazyVim's ue.lua plugin wrapper invokes clangd_cmd() with no
--- args, which skips the offending branch. Forward-declaring keeps it
--- correct for all entry points.
+-- Forward declaration for find_engine_root, which is defined further below.
+-- clangd_cmd receives the root resolved by vim.lsp's dynamic cmd factory;
+-- keep this chunk-local binding available before that factory can run.
 local find_engine_root
 
 function M.clangd_cmd(root_dir)
@@ -8620,7 +8614,7 @@ local function prepare()
     else
       vim.notify(
         "UEPrepare: cindex-uefilter not found — grep will use slow rg fallback.\n" ..
-        "  Build it via: cd " .. vim.fn.stdpath("config") .. "/tools/cindex-uefilter && go install ./...",
+        "  Install it via: " .. code_search_p.install_hint(),
         vim.log.levels.WARN, { title = "UE" })
     end
     -- Index rebuilt (sync path): drop ctx cache + re-probe toolchain so the
@@ -9199,7 +9193,7 @@ local function prepare_async(opts)
           if not code_search.cindex_uefilter_exe() then
             vim.notify(
               "UEPrepare: cindex-uefilter not found — grep will use slow rg fallback.\n" ..
-              "  Build it via: cd " .. vim.fn.stdpath("config") .. "/tools/cindex-uefilter && go install ./...",
+              "  Install it via: " .. code_search.install_hint(),
               vim.log.levels.WARN, { title = "UE" })
             finalize_after_csearch()
             return
@@ -9873,7 +9867,8 @@ function M.setup()
     end
     local code_search = require("utils.code_search")
     if not code_search.cindex_uefilter_exe() then
-      vim.notify("cindex-uefilter not found — build it first", vim.log.levels.WARN, { title = "UE" })
+      vim.notify("cindex-uefilter not found — install it via: " .. code_search.install_hint(),
+        vim.log.levels.WARN, { title = "UE" })
       return
     end
     if not CORE_RT.csearch_build_begin("UEPrepareIncremental", ctx.paths.csearch_idx) then
@@ -10016,7 +10011,7 @@ function M.setup()
   end, { desc = "Bypass debounce; immediately apply pending watcher events" })
   vim.api.nvim_create_user_command("UEDirtyStatus", function()
     -- Show the cumulative-since-last-:UEPrepare dirty set (rg-on-dirty
-    -- overlay's source of truth for the cindex modify-no-op workaround).
+    -- overlay's source of truth until the next csearch publish).
     local ok, watch = pcall(require, "utils.ue_watch")
     if not ok then vim.notify("ue_watch module missing", vim.log.levels.WARN); return end
     local st = (watch.persistent_dirty_status and watch.persistent_dirty_status()) or { count = 0 }

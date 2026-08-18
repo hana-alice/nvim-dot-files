@@ -45,6 +45,112 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-08-18 — 补齐 macOS csearch 与 Apple super-unity 运行链
+
+**Task**
+
+审计并修复此前只按 Windows 环境验证的 csearch/cindex 与 super-unity：让 macOS 能完整安装、
+发现和增量更新 trigram 索引，并在 Apple 构建不保留 `.o.rsp` 时仍安全压缩受控 background CDB。
+
+**Implemented**
+
+- 新增 POSIX `scripts/install_csearch.sh`，把仓内 `cindex-uefilter` 与固定版本
+  `csearch v1.2.0` 一并安装；运行时统一发现 PATH、`GOBIN`、多段 `GOPATH/bin` 与 `~/go/bin`，
+  health/live health 和 UEPrepare 缺工具提示复用同一安装入口。
+- `cindex-uefilter -files-from` 的非 reset 路径把每个输入文件登记为 exact merge path，
+  修复 staged index 有 names 却无 Paths 导致的 `merge: inconsistent index` panic；新增和修改文件
+  现在都会替换旧 trigram，删除仍保守升级为 reset。reset 不复制全量 path table，避免大型 UE 索引膨胀。
+- csearch index 路径探测改为只读；只有实际 build 创建父目录，避免工具安装后
+  `is_indexed()` 在不可写缺失路径上抛错。
+- Apple 无 `.o.rsp` 时，super-unity 仅在 active UBT wrapper 的 include 全部唯一映射、member cwd
+  相同且 compiler-authored argv 在剥离逐文件写出参数后完全一致时复用 exact argv；保留
+  target/arch/sysroot/defines/includes/PCH，证据不足继续 exact per-file fallback。
+- 补 Go 原生 merge 集成、Lua→cindex→csearch 往返、POSIX 安装器、AppleClang no-rsp grouping、
+  语义漂移 fallback、非 Apple `-arch` 拒绝及 write-only flag 清理回归，并同步 README/skill 契约。
+- 将新增合同同步到 `ue-code-search`、`macos-ios-cdb-semantic-prepare` 与
+  `cpp-contextual-definition-navigation` 主规格，并归档完成的
+  `restore-macos-unreal-semantics-and-search` change；未混入仍受真机证据门禁约束的 iOS DAP change。
+
+**Pitfalls / Gotchas**
+
+- upstream `index.Merge` 依赖 staged `Paths` 划定替换区间；只有 `AddFile` 会在任何平台 panic，
+  而只靠 mock 的 Lua 回归看不见这个错误。
+- `-o` 不能按字符串前缀粗暴剥离，否则会误删 `-openmp` 等语义参数；仅精确剥离成对 `-o`，
+  dependency 输出则保留无歧义的 `-MF/-MT/-MQ/-MJ` attached-form 处理。
+- 探针中的 `provider|missing/partial` 是本轮开始前语义索引尚未收敛的历史记录；本轮没有新增
+  provider 失败，后续 warm/cold 记录已 resolved，因此不把它误归因到 csearch/super-unity。
+
+**Validation**
+
+- 原生工具：`go test -count=1 ./...` 通过；`python3 -m py_compile`（受控 CDB 工具链）通过；
+  `sh -n scripts/install_csearch.sh` 与 `git diff --check` 通过。
+- 定向回归：`csearch_build_guard` 22/22、`index_generation` 21/21、`utils` 51/51、
+  `core_health` 28/28、`ue_watch_csearch` 13/13、`grep_cache` 29/29、`ue_api` 54/54、
+  `structure` 39/39；合计 257/257。
+- 全量门禁：`nvim --headless -l tests/run.lua` → 964/964。
+- OpenSpec CLI 在本机不可用；已逐块比对 archived delta 与主规格同步内容，并由 `structure` 与全量
+  回归覆盖仓库结构，归档内容通过 staged privacy/secret scan。
+- macOS 实机：安装后 deterministic search health 为 PASS；真实工程 csearch reset 索引
+  227,614 文件、325,869,011 bytes、29.3s，运行时判定 `backend=csearch` 且已验证真实查询命中。
+- 真实 IOS hot CDB：2648 输入源中 2616 个进入 142 个 proven groups，32 个 exact fallback，
+  输出 174 TUs（15.2x）；2648 member 全覆盖且无重复，wrapper 中对象/依赖写出 flag 为 0。
+
+**Follow-ups**
+
+- 当前磁盘上的旧 IOS controlled CDB 仍是语义正确的 exact fallback；下次正常 hot/full index refresh
+  会按新契约重发压缩产物。独立真实数据生成已验证新产物，不为追求即时压缩破坏现有可用索引。
+- 完整 headless `UEPrepare` 被本机缺少 GTAGS 阻断；未新增依赖，改用 csearch 自身受控 API 完成
+  索引与 snapshot 发布。GTAGS 能力与本任务无关。
+
+### 2026-08-18 — 修复原生 LSP 下 UE 语义解析与受控 CDB 启动链
+
+**Task**
+
+修复大型 Unreal Engine 源码树中语义解析整体失效：clangd 未使用 project-scoped 编译数据库，
+当前文件退回 fallback command，并在错误的全量数据库上产生不可接受的索引开销。
+
+**Implemented**
+
+- clangd 配置改用 Neovim 原生 LSP `cmd` factory，在 `root_dir` 解析后生成 project-scoped argv；
+  移除原生配置不会执行的 legacy `on_new_config`，并保留实际 argv 供精确命令 transport 判定。
+- 精确编译命令 transport 支持 project-bucket 的 platform-scoped active CDB，不再按旧缓存层级
+  猜测根目录；成功通知不再错误附带失败原因。
+- 新增共享 CDB argv normalization，将 macOS/POSIX 与 Windows `command` 字符串按宿主规则转换为
+  无歧义的 `arguments`，再进入 current/hot/full 受控索引生成，避免定义注入阶段破坏引号。
+- libclang semantic sidecar 请求上限收紧到 30 秒；超时立即终止无响应进程并完成结构化失败，
+  不再让卡死进程持续占用 CPU、使后续 `gd` 永久排队。
+- 增加 native cmd factory、project-bucket 路径、精确命令传输及 command-only CDB 的回归覆盖。
+
+**Pitfalls / Gotchas**
+
+- nvim-lspconfig 的原生 `vim.lsp.config` 路径目前不执行 `on_new_config`；仅在静态配置时调用
+  `clangd_cmd()` 会把 scoped CDB 静默降级成工程根下的 legacy CDB。
+- `cmd` 变为 factory 后，`client.config.cmd` 是函数而非 argv；精确命令 transport 必须读取启动时
+  保留的 resolved argv。
+- CDB 同时允许 `command` 与 `arguments`，但受控 super-unity/definition 注入只接受结构化 argv；
+  对 command string 直接重新拼引号会改变编译器原始语义。
+- 仅从 pending map 移除超时请求不足以恢复 sidecar：libclang 正在原生 parse 时无法读取后续 cancel，
+  必须回收整个进程；下一次请求再按现有 process manager 冷启动。
+
+**Validation**
+
+- TDD：native cmd factory、command-only CDB、project-bucket active CDB 与成功回调原因用例均先红后绿。
+- 定向：`smoke` 19/19、`index_generation` 18/18、`clangd_commands` 4/4、
+  `cpp_semantic_index` 1/1、`ue_api` 54/54、`cpp_semantic_context` 11/11、
+  `cpp_semantic_client` 16/16、`cpp_semantic_sidecar` 15/15、`ue_goto_behavior` 7/7、
+  `utils` 47/47 passed。
+- 真实 UE 会话：重启后 clangd 使用受控 platform-scoped background CDB，自动收到当前文件精确命令；
+  Tree-sitter captures 与 LSP semantic tokens 同时存在，`CoreMinimal.h` 缺失类 fallback 诊断消失，
+  仅保留 3 条真实工程诊断；受控 full phase ready，clangd 稳态 RSS 约 1.2 GB（错误路径曾约 15.8 GB）。
+- 语义导航探针：同一真实缓冲区完成 `resolved`，新 evidence 为 ready/partial generation；卡死 sidecar
+  在 30 秒边界被回收且 pending 清零，导航随后由同 generation clangd provider 完成，不遗留后台进程。
+- 全量：`nvim --headless -l tests/run.lua` 956/956 passed；`git diff --check` passed。
+
+**Follow-ups**
+
+- 当前机器未发现仓库约束指定的 LLVM 22.1.x clangd，运行时使用系统 clangd 17；功能已通过真实会话，
+  但工具链版本仍需在环境层补齐。
+
 ### 2026-08-14 — 落地 iOS 签名选择与可证明的增量前置
 
 **Task**

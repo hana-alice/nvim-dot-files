@@ -44,6 +44,86 @@ var (
 	filesFromFlag = flag.String("files-from", "", "read paths from FILE (or stdin if -)")
 )
 
+func uniqueSortedStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	sort.Strings(values)
+	out := values[:0]
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if len(out) > 0 && out[len(out)-1] == value {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
+func readFilesFromList(name string) ([]string, int, error) {
+	var (
+		scanner *bufio.Scanner
+		file    *os.File
+		err     error
+	)
+	if name == "-" {
+		scanner = bufio.NewScanner(os.Stdin)
+	} else {
+		file, err = os.Open(name)
+		if err != nil {
+			return nil, 0, fmt.Errorf("open %s: %w", name, err)
+		}
+		defer file.Close()
+		scanner = bufio.NewScanner(file)
+	}
+
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	seen := make(map[string]struct{})
+	files := make([]string, 0)
+	skipped := 0
+	for scanner.Scan() {
+		path := strings.TrimSpace(scanner.Text())
+		if path == "" {
+			continue
+		}
+		info, statErr := os.Stat(path)
+		if statErr != nil || info.IsDir() {
+			skipped++
+			continue
+		}
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		files = append(files, path)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, skipped, fmt.Errorf("read %s: %w", name, err)
+	}
+	return uniqueSortedStrings(files), skipped, nil
+}
+
+func filesFromIndexPaths(args, files []string, reset bool) []string {
+	if !reset {
+		// Merge treats every staged Path as a replacement prefix. Broad CLI
+		// roots would therefore delete untouched names from the old index when
+		// the files-from list contains only a delta. Exact files are the only
+		// safe shadow keys for add mode.
+		return uniqueSortedStrings(append([]string{}, files...))
+	}
+	paths := append([]string{}, args...)
+	for i, arg := range paths {
+		abs, err := filepath.Abs(arg)
+		if err == nil {
+			paths[i] = abs
+		}
+	}
+	return uniqueSortedStrings(paths)
+}
+
 func main() {
 	flag.Usage = usage
 	flag.Parse()
@@ -86,53 +166,21 @@ func main() {
 
 	// ─── -files-from mode ────────────────────────────────────────────
 	if *filesFromFlag != "" {
-		var rd *bufio.Scanner
-		if *filesFromFlag == "-" {
-			rd = bufio.NewScanner(os.Stdin)
-		} else {
-			f, err := os.Open(*filesFromFlag)
-			if err != nil {
-				log.Fatalf("open %s: %v", *filesFromFlag, err)
-			}
-			defer f.Close()
-			rd = bufio.NewScanner(f)
+		files, skipped, err := readFilesFromList(*filesFromFlag)
+		if err != nil {
+			log.Fatal(err)
 		}
-		// Allow long lines (UE paths can be deep).
-		rd.Buffer(make([]byte, 1024*1024), 1024*1024)
 
-		// Treat any path roots from CLI as auxiliary "indexed paths"
-		// that show up in cindex -list (so users know what's covered).
-		paths := args
-		for i, arg := range paths {
-			abs, err := filepath.Abs(arg)
-			if err == nil {
-				paths[i] = abs
-			}
-		}
-		sort.Strings(paths)
-		ix.AddPaths(paths)
+		ix.AddPaths(filesFromIndexPaths(args, files, *resetFlag))
 
 		log.Printf("indexing from %s", *filesFromFlag)
 		count := 0
-		skipped := 0
-		for rd.Scan() {
-			path := strings.TrimSpace(rd.Text())
-			if path == "" {
-				continue
-			}
-			info, err := os.Stat(path)
-			if err != nil || info.IsDir() {
-				skipped++
-				continue
-			}
+		for _, path := range files {
 			ix.AddFile(path)
 			count++
 			if count%5000 == 0 {
 				log.Printf("indexed %d files...", count)
 			}
-		}
-		if err := rd.Err(); err != nil {
-			log.Fatalf("read %s: %v", *filesFromFlag, err)
 		}
 		log.Printf("indexed %d files (%d skipped)", count, skipped)
 	} else {

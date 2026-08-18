@@ -24,9 +24,17 @@ return {
       end
       clangd = vim.tbl_deep_extend("force", clangd, {
         mason = false,
-        cmd = require("ue").clangd_cmd(),
-        on_new_config = function(new_config, root_dir)
-          new_config.cmd = require("ue").clangd_cmd(root_dir)
+        -- Native vim.lsp resolves root_dir before invoking a cmd factory.
+        -- nvim-lspconfig's legacy on_new_config hook is not available on this
+        -- path, so build the project-scoped CDB argv from the resolved config.
+        cmd = function(dispatchers, config)
+          local resolved_cmd = require("ue").clangd_cmd(config.root_dir)
+          config._ue_resolved_cmd = resolved_cmd
+          return vim.lsp.rpc.start(resolved_cmd, dispatchers, {
+            cwd = config.cmd_cwd,
+            env = config.cmd_env,
+            detached = config.detached,
+          })
         end,
         root_dir = function(bufnr, on_dir)
           on_dir(require("ue").clangd_root(bufnr))
@@ -59,6 +67,7 @@ return {
           },
         },
       })
+      clangd.on_new_config = nil
 
      opts.servers.clangd = clangd
      return opts

@@ -366,12 +366,8 @@ local function rg_check(ctx)
 end
 
 local function csearch_check(ctx)
-  local home = vim.env.HOME or ""
-  local csearch = executable({
-    vim.fn.exepath("csearch"),
-    home ~= "" and join(home, "go", "bin", "csearch") or nil,
-  })
   local code_search = require("utils.code_search")
+  local csearch = code_search.csearch_exe()
   local cindex = code_search.cindex_uefilter_exe()
   local classified =
     require("utils.core_health").classify_search_tools(vim.fn.executable("rg") == 1, csearch ~= nil, cindex ~= nil)
@@ -379,7 +375,7 @@ local function csearch_check(ctx)
     return result("BLOCKED", classified.summary, {
       backend = classified.backend,
       missing = classified.missing,
-    }, "Install csearch and cindex-uefilter outside the audit to enable indexed search.")
+    }, "Install the indexed-search tools via: " .. code_search.install_hint())
   end
 
   local root, files = prepare_search_fixture(ctx)

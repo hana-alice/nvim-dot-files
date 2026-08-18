@@ -3,12 +3,11 @@
 -- Collect the "dirty" file set for the rg-on-dirty grep overlay.
 --
 -- WHY this exists:
---   Google codesearch's `cindex` deduplicates by path key and SKIPS already-
---   indexed files even when their mtime is newer (proven via /c/temp/
---   csearch_modify_test/ POC, see memories). That means when the user
---   adds a class to MyFile.h and immediately tries `<leader>/MyNewClass`,
---   csearch returns 0 hits — the trigrams for the new code aren't in
---   the index yet, and append-mode cindex won't fix that.
+--   The published csearch index is a point-in-time snapshot, and the watcher
+--   deliberately never mutates it: user-triggered prepare commands are its
+--   single writer. When the user adds a class to MyFile.h and immediately
+--   tries `<leader>/MyNewClass`, the new trigrams are therefore absent until
+--   the next successful incremental/full publish.
 --
 --   Workaround ε: csearch (potentially-stale, whole-tree) PLUS a parallel
 --   rg pass over JUST the dirty files. This module is the "JUST the dirty
@@ -21,18 +20,16 @@
 --                                    flushed yet, csearch hasn't ingested it
 --   3. ue_watch persistent_dirty  — cumulative add-set since last :UEPrepare,
 --                                    persisted to .cache/.../runtime/dirty.json
---                                    so it survives nvim restarts. THIS IS
---                                    THE ONE THAT MATTERS for the cindex
---                                    modify-no-op bug.
+--                                    so it survives nvim restarts and covers
+--                                    the complete unpublished interval.
 --
 -- WHY git was removed:
 --   `git status --porcelain` on the UE tree is 195-200ms (warm fs cache).
 --   `<leader>/` runs the finder with live=true, so EVERY keystroke would
 --   pay that cost. Worse, git status doesn't actually answer the right
---   question — it tells you "things uncommitted right now", but the cindex
---   modify-no-op affects "things modified since the last cindex -reset",
---   which is anchored on :UEPrepare, NOT on commits. The new dirty.json
---   tracks the right anchor.
+--   question — it tells you "things uncommitted right now", while grep needs
+--   "things modified since the last successful csearch publish", which is
+--   anchored on :UEPrepare, NOT on commits. dirty.json tracks that anchor.
 --
 -- DEDUPE KEY: forward-slash + lowercase absolute path. Windows is case-
 -- insensitive on disk so "Foo.h" and "foo.h" must collapse to one entry,
@@ -160,8 +157,8 @@ local function watcher_pending()
 end
 
 -- ── Source 3: persistent dirty.json ─────────────────────────────────────
--- Cumulative since last :UEPrepare. Anchored correctly to the cindex -reset
--- moment. This is the source that actually fixes the modify-no-op bug.
+-- Cumulative since the last successful csearch publish. This keeps the live
+-- overlay complete across debounce flushes and Neovim restarts.
 local function persistent_dirty()
   local ok, watch = pcall(require, "utils.ue_watch")
   if not ok then return {} end

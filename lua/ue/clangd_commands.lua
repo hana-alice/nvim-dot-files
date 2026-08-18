@@ -13,7 +13,10 @@ local function norm(path)
 end
 
 local function controlled_cdb_dir(client)
-  for _, arg in ipairs(client and client.config and client.config.cmd or {}) do
+  local config = client and client.config or {}
+  local cmd = type(config._ue_resolved_cmd) == "table" and config._ue_resolved_cmd
+    or (type(config.cmd) == "table" and config.cmd or {})
+  for _, arg in ipairs(cmd) do
     local value = tostring(arg):match("^%-%-compile%-commands%-dir=(.+)$")
     if value then
       value = norm(value)
@@ -27,9 +30,12 @@ local function controlled_cdb_dir(client)
 end
 
 local function base_cdb(semantic_dir)
+  local platform_dir = vim.fs.dirname(semantic_dir)
+  local project_bucket = vim.fs.dirname(vim.fs.dirname(platform_dir))
   local root = semantic_dir
   for _ = 1, 4 do root = vim.fs.dirname(root) end
   for _, candidate in ipairs({
+    project_bucket .. "/cdb/active/" .. vim.fs.basename(platform_dir) .. "/compile_commands.json",
     root .. "/compile_commands.json",
     root .. "/Engine/compile_commands.json",
   }) do
@@ -61,14 +67,18 @@ local function deliver(client, source, command, callback)
     callback(false, "clangd-client-stale")
     return
   end
-  local ok = pcall(live.notify, live, "workspace/didChangeConfiguration", {
+  local called, accepted = pcall(live.notify, live, "workspace/didChangeConfiguration", {
     settings = {
       compilationDatabaseChanges = {
         [source] = command,
       },
     },
   })
-  callback(ok, ok and nil or "compile-command-notify-failed")
+  if called and accepted ~= false then
+    callback(true)
+  else
+    callback(false, "compile-command-notify-failed")
+  end
 end
 
 function M.ensure(client, bufnr, callback, opts)

@@ -10,14 +10,21 @@ local function write(path, value)
   file:close()
 end
 
-local function fixture(entries)
+local function fixture(entries, opts)
+  opts = opts or {}
   local root = vim.fs.normalize(vim.fn.tempname() .. "-clangd-command")
   vim.fn.mkdir(root, "p")
   root = vim.fs.normalize(vim.uv.fs_realpath(root) or root)
-  local semantic = root .. "/.cache/nvim-ue/clangd/background-cdb"
+  local project_bucket = root .. "/.cache/nvim-ue/projects/Sample-key"
+  local semantic = opts.project_bucket
+      and project_bucket .. "/clangd/IOS-Development/background-cdb"
+    or root .. "/.cache/nvim-ue/clangd/background-cdb"
+  local source_cdb = opts.project_bucket
+      and project_bucket .. "/cdb/active/IOS-Development/compile_commands.json"
+    or root .. "/compile_commands.json"
   local source = root .. "/Source/Runtime/Fixture/Private/subject.cpp"
   write(source, "int subject() { return 1; }\n")
-  write(root .. "/compile_commands.json", entries(source, root))
+  write(source_cdb, entries(source, root))
   write(semantic .. "/compile_commands.json", {
     {
       directory = semantic,
@@ -59,6 +66,7 @@ t.describe("clangd exact compile-command transport", function()
     commands.ensure(client, bufnr, function(value, why) done, ok, reason = true, value, why end)
     t.assert_true(vim.wait(10000, function() return done end, 10), "compile command query timed out")
     t.assert_true(ok, tostring(reason))
+    t.assert_eq(reason, nil)
     t.assert_eq(#notifications, 1)
     t.assert_eq(notifications[1].method, "workspace/didChangeConfiguration")
     local sent = notifications[1].params.settings.compilationDatabaseChanges[source]
@@ -83,6 +91,65 @@ t.describe("clangd exact compile-command transport", function()
     local header_command = notifications[3].params.settings.compilationDatabaseChanges[header]
     t.assert_eq(vim.fs.normalize(header_command.compilationCommand[#header_command.compilationCommand]), header)
     pcall(vim.api.nvim_buf_delete, header_buf, { force = true })
+    cleanup(root, bufnr)
+  end)
+
+  t.it("finds the scoped active CDB beside a project-bucket semantic index", function()
+    local root, semantic, source, bufnr = fixture(function(path, cwd)
+      return { {
+        directory = cwd,
+        file = path,
+        arguments = { "clang++", "-std=c++20", "-DSCOPED_CDB=1", "-c", path },
+      } }
+    end, { project_bucket = true })
+    local notifications = {}
+    local client = {
+      config = { _ue_resolved_cmd = { "clangd", "--compile-commands-dir=" .. semantic } },
+      notify = function(_, method, params)
+        notifications[#notifications + 1] = { method = method, params = params }
+        return true
+      end,
+    }
+
+    local done, ok, reason = false, nil, nil
+    commands.ensure(client, bufnr, function(value, why) done, ok, reason = true, value, why end)
+    t.assert_true(vim.wait(10000, function() return done end, 10), "compile command query timed out")
+    t.assert_true(ok, tostring(reason))
+    t.assert_eq(reason, nil)
+    local sent = notifications[1].params.settings.compilationDatabaseChanges[source]
+    t.assert_eq(sent.compilationCommand[3], "-DSCOPED_CDB=1")
+
+    cleanup(root, bufnr)
+  end)
+
+  t.it("recognizes the resolved argv retained by a native LSP cmd factory", function()
+    local root, semantic, _, bufnr = fixture(function(path, cwd)
+      return { {
+        directory = cwd,
+        file = path,
+        arguments = { "clang++", "-std=c++20", "-c", path },
+      } }
+    end)
+    local notifications = {}
+    local client = {
+      id = -1,
+      config = {
+        cmd = function() end,
+        _ue_resolved_cmd = { "clangd", "--compile-commands-dir=" .. semantic },
+      },
+      notify = function(_, method, params)
+        notifications[#notifications + 1] = { method = method, params = params }
+        return true
+      end,
+    }
+
+    local done, ok, reason = false, nil, nil
+    commands.ensure(client, bufnr, function(value, why) done, ok, reason = true, value, why end)
+    t.assert_true(vim.wait(10000, function() return done end, 10), "compile command query timed out")
+    t.assert_true(ok, tostring(reason))
+    t.assert_eq(reason, nil)
+    t.assert_eq(#notifications, 1)
+
     cleanup(root, bufnr)
   end)
 

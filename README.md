@@ -109,14 +109,19 @@ git clone https://github.com/hana-alice/nvim-dot-files.git ~/.config/nvim
 nvim
 ```
 
-Optionally build the grep index tool:
+Optionally install the indexed-grep toolchain on macOS/Linux. The installer
+builds this repository's `cindex-uefilter` and the matching pinned
+`csearch v1.2.0` into `$GOBIN` (or the default `$(go env GOPATH)/bin`):
 
-```powershell
-cd tools\cindex-uefilter
-go install ./...   # requires Go >= 1.22 with $GOBIN on PATH
+```sh
+sh scripts/install_csearch.sh   # requires Go >= 1.22
 ```
 
-Without it, project grep falls back to a slower ripgrep path.
+The runtime also discovers these binaries directly from `$GOBIN`, every
+`$GOPATH/bin`, and the conventional `~/go/bin`, so the install directory does
+not have to be added to Neovim's inherited `PATH`. Without both binaries,
+generic project search falls back to ripgrep and the csearch-only picker stays
+blocked until an index is prepared.
 
 ## Usage
 
@@ -154,8 +159,11 @@ the pinned clangd 22.1.x toolchain, builds the selected target, then prepares th
 compiler database and index. On IOS, where Apple builds do not retain C++
 response files, the same build terminal continues with UBT's tuple-scoped
 `GenerateClangDatabase` action-graph pass; this does not compile, cook, or
-package. Tree-sitter syntax highlighting works without this; clangd navigation
-and diagnostics require the compiler database.
+package. Controlled background indexing can still reuse an active UBT unity
+wrapper when every included member resolves uniquely and has the same exact
+Apple compiler argv after ignoring only per-file output writes; otherwise it
+keeps the original per-file commands. Tree-sitter syntax highlighting works
+without this; clangd navigation and diagnostics require the compiler database.
 
 `:UEBuild` remains build-only. `:UEPrepare` remains prepare-only for users who
 already have fresh response files or a validated tuple-scoped semantic source.

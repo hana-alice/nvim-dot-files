@@ -171,13 +171,14 @@ Package。Tree-sitter 语法高亮不依赖这一步；clangd 导航、诊断和
 | 为当前工程导入 prepared identity 或选择 / 清除 IOS 签名证书 | `:UESetIOSSigningCertificate` / `:UESetIOSSigningCertificate!` |
 | 复用已有 cooked 数据组 IOS 包 | `:UEPackageIOS` |
 | 按需生成并校验 IOS dSYM | `:UEIOSSymbols` |
-| IOS 选设备 / 安装 / 启动 | `:UESetIOSDevice` / `:UEInstallIOS` / `:UELaunch` |
+| IOS 选设备 / 原地安装更新 / 启动 | `:UESetIOSDevice` / `<leader>ui`（或 `:UEInstallIOS`）/ `:UELaunch` |
 | 仅编译 Android SO（跳过 APK） | `<leader>us` / `:UEBuildAndroidSO` |
 | Android SO 快速部署（root 设备；替换后不启动） | `<leader>uq` / `:UEDeployAndroidSO` |
 | 启动当前 target 应用 | `:UELaunch` |
 | 增删文件后重建索引 | `:UEPrepareIncremental` |
 | Android：选择设备（名称 + serial，仅当前 Neovim 进程） | `<leader>uA` / `:UESetAndroidDevice` |
-| Android：安装（不启动）/ attach / 断点 | `<leader>ui` / `:UEDAPAttach` / `F9` |
+| 当前平台安装（不启动） | `<leader>ui` / `:UEInstall`（Android 替换 APK；IOS 保留应用身份原地更新、不先卸载） |
+| Android：attach / 断点 | `:UEDAPAttach` / `F9` |
 | 后台任务：列出 / 停止 | `<leader>X` / `:Tasks` / `:TaskStopAll` |
 | 全部命令速查 | `<leader>?` / `:UECheatsheet` |
 

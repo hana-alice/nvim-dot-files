@@ -207,7 +207,7 @@ local function apply_ue_runtime_overrides()
   map("n", "<leader>us", "<cmd>UEBuildAndroidSO<cr>", vim.tbl_extend("force", opts, { desc = "UE: Build Android SO only (skip APK)" }))
   map("n", "<leader>uq", "<cmd>UEDeployAndroidSO<cr>", vim.tbl_extend("force", opts, { desc = "UE: Quick deploy Android SO" }))
   map("n", "<leader>ug", "<cmd>UELogToggle<cr>", vim.tbl_extend("force", opts, { desc = "UE: Toggle app log" }))
-  map("n", "<leader>ui", "<cmd>UEInstallAndroid<cr>", vim.tbl_extend("force", opts, { desc = "UE: Install APK to device" }))
+  map("n", "<leader>ui", "<cmd>UEInstall<cr>", vim.tbl_extend("force", opts, { desc = "UE: Install for active target" }))
   map("n", "<leader>ul", "<cmd>UELaunch<cr>", vim.tbl_extend("force", opts, { desc = "UE: Launch app (no debugger)" }))
   map("n", "<leader>uL", "<cmd>UELogToggle<cr>", vim.tbl_extend("force", opts, { desc = "UE: Toggle app log" }))
   map("n", "<leader>uD", "<cmd>UEDebugLogToggle<cr>", vim.tbl_extend("force", opts, { desc = "UE: Toggle Windows debug log" }))
@@ -410,7 +410,7 @@ map("n", "<leader>dt", "<cmd>UEDAPRunToCursor<cr>",      { desc = "DAP: Run to c
 map("n", "<leader>dk", "<cmd>UEDAPFrameUp<cr>",          { desc = "DAP: Stack frame up" })
 map("n", "<leader>dj", "<cmd>UEDAPFrameDown<cr>",        { desc = "DAP: Stack frame down" })
 map("n", "<leader>dR", "<cmd>UEDAPRestartFrame<cr>",     { desc = "DAP: Restart frame" })
-map("n", "<leader>ui", "<cmd>UEInstallAndroid<cr>", { desc = "UE: Install APK to device" })
+map("n", "<leader>ui", "<cmd>UEInstall<cr>", { desc = "UE: Install for active target" })
 
 -- LazyVim loads user keymaps after its defaults, so the override is already
 -- in the correct order. Apply it in the same load pass: Neovide can source

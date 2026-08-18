@@ -65,12 +65,12 @@ t.describe("ue.ai_context", function()
       t.assert_eq(context.artifacts.install_command[3], "SERIAL-CONTEXT")
       t.assert_eq(context.artifacts.install_command[4], "install")
       t.assert_eq(context.artifacts.install_command[5], "-r")
-      t.assert_nil(assert(find_command(context, ":UEInstallAndroid")).native_action)
+      t.assert_nil(assert(find_command(context, ":UEInstall")).native_action)
     else
       t.assert_nil(context.artifacts.build_command)
       t.assert_contains(context.artifacts.build_error, "unavailable on host " .. host_id)
       t.assert_nil(context.artifacts.install_command)
-      t.assert_contains(assert(find_command(context, ":UEInstallAndroid")).native_action, "unavailable on host")
+      t.assert_contains(assert(find_command(context, ":UEInstall")).native_action, "unavailable on host")
     end
   end)
 
@@ -101,7 +101,7 @@ t.describe("ue.ai_context", function()
     vim.fn.delete(root, "rf")
 
     t.assert_nil(context.artifacts.install_command)
-    local install = assert(find_command(context, ":UEInstallAndroid"))
+    local install = assert(find_command(context, ":UEInstall"))
     if require("utils.platform").is_windows then
       t.assert_contains(install.native_action or "", ":UESetAndroidDevice")
     else

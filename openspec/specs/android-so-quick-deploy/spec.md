@@ -192,7 +192,7 @@
 
 #### Scenario: APK 安装成功后保持停止
 
-- **WHEN** 用户执行 `<leader>ui` / `:UEInstallAndroid` 且安装成功
+- **WHEN** active target 为 Android，用户执行 `<leader>ui` / `:UEInstall` 或 `:UEInstallAndroid` 且安装成功
 - **THEN** 系统 SHALL 在 `adb install -r` 完成后结束操作
 - **AND** 系统 MUST NOT 调用 `monkey`、`am start` 或其他应用启动命令
 

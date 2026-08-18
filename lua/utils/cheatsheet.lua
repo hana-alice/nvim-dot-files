@@ -532,10 +532,10 @@ local tabs = {
       {
         title = "Run / Logs",
         mappings = {
-          { "<leader>ui",   "Install APK; keep app stopped" },
+          { "<leader>ui",   "Install active target; Android replace / IOS in-place update" },
           { "<leader>ul",   "Launch app (no debug)" },
           { ":UESetIOSDevice", "Select physical IOS device" },
-          { ":UEInstallIOS", "Install packaged IOS app" },
+          { ":UEInstallIOS", "Install signed packaged IOS app in place" },
           { "<leader>ug/uL","Toggle app log" },
           { "<leader>uD",   "Toggle Win debug log" },
           { "<leader>uo/uO","Module find file / grep" },

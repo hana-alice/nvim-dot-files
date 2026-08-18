@@ -745,13 +745,13 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `:UEPackageIOS`           | Reuse existing cooked data, then stage/package IOS; never build, cook, archive, deploy, or run |
 | `:UEIOSSymbols`           | Generate the current IOS binary's dSYM on demand and verify Mach-O UUIDs; no ZIP |
 | `:UESetIOSDevice`         | Select an available physical iOS device from CoreDevice JSON |
-| `:UEInstallIOS`           | Install the current package task's `.app`; does not launch |
+| `:UEInstallIOS`           | Install the current package task's signed `.app` in place; does not uninstall or launch |
 | `<leader>us`              | `:UEBuildAndroidSO` — export + execute UBT compile/link actions (no Deploy/Gradle/APK) |
 | `<leader>uq`              | `:UEDeployAndroidSO` — strip, push, atomically replace and verify `libUE4.so`; leaves the app stopped |
 | `<leader>uB`              | `:UEPrepare` (symbols + compile_commands) |
 | `<leader>uc`              | `:UEExportCompileCommands`          |
 | `<leader>ul`              | `:UELaunch` (no debugger)           |
-| `<leader>ui`              | `:UEInstallAndroid` (APK to selected device via `adb -s`; does not launch) |
+| `<leader>ui`              | `:UEInstall` (active Android → `adb install -r`; active IOS → signed staged `.app` in-place update; neither launches) |
 | `<leader>ug`              | `:UELogToggle` (toggle app log)     |
 | `<leader>uL`              | `:UELogToggle` (alias)              |
 | `<leader>uD`              | `:UEDebugLogToggle` (Windows debug log) |

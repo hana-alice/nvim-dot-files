@@ -7286,6 +7286,7 @@ function M.ai_context(engine_root)
     so_deploy_error = "UEDeployAndroidSO requires target platform Android."
   end
   local _, install_unavailable = targets.resolve("Android", "install", host_driver)
+  local ios_active = platform == targets.must_get("IOS").id
   local install_plan = android_active
       and not install_unavailable
       and apk
@@ -7299,8 +7300,17 @@ function M.ai_context(engine_root)
     or nil
   local install_command = install_plan and require("ue.target_tasks").command(install_plan) or nil
   local install_native_action
-  if not android_active then
-    install_native_action = "UEInstallAndroid requires target platform Android."
+  if ios_active then
+    local _, ios_install_unavailable = targets.resolve("IOS", "install", host_driver)
+    if ios_install_unavailable then
+      install_native_action = ("IOS install is unavailable on host %s: %s"):format(
+        tostring(host_driver.id), tostring(ios_install_unavailable.reason)
+      )
+    else
+      install_native_action = "Installs the current tuple's signed staged app in place; does not uninstall or launch."
+    end
+  elseif not android_active then
+    install_native_action = "UEInstall supports active Android and IOS targets."
   elseif install_unavailable then
     install_native_action = ("Android install is unavailable on host %s: %s"):format(
       tostring(host_driver.id), tostring(install_unavailable.reason)
@@ -7371,8 +7381,8 @@ function M.ai_context(engine_root)
       },
       {
         key = "<Space>ui",
-        nvim_command = ":UEInstallAndroid",
-        purpose = "Install the newest APK from the active project with replacement enabled.",
+        nvim_command = ":UEInstall",
+        purpose = "Install for the active platform: replace the Android APK or update the signed IOS app in place.",
         native_command = install_command,
         native_action = install_native_action,
       },
@@ -8265,6 +8275,41 @@ local function install_android()
       })
     end)
   end
+end
+
+local function install_active_target(opts)
+  opts = opts or {}
+  local ctx, err = (opts.resolve_context or resolve_context)()
+  if not ctx then
+    local message = err or "No project configured. Run :UESetProject [path]"
+    if type(opts.notify_error) == "function" then
+      opts.notify_error(message)
+    else
+      require("utils.log").notify_error("ue.install", message)
+    end
+    return nil, message
+  end
+
+  local platform = (opts.target_platform or target_platform)(ctx.engine_root, nil)
+  if platform == "Android" then
+    return (opts.install_android or install_android)()
+  end
+  if platform == "IOS" then
+    return (opts.install_target or CORE_RT.install_target)("IOS")
+  end
+
+  local message = ("install is unavailable for active target %s; supported targets: Android, IOS")
+    :format(platform ~= "" and tostring(platform) or "<unset>")
+  if type(opts.notify_error) == "function" then
+    opts.notify_error(message)
+  else
+    require("utils.log").notify_error("ue.install", message)
+  end
+  return nil, message
+end
+
+function M._install_active_target_for_test(opts)
+  return install_active_target(opts)
 end
 
 local function prepare()
@@ -9623,6 +9668,9 @@ function M.setup()
   vim.api.nvim_create_user_command("UEDebugLogToggle", function()
     M.toggle_debug_log()
   end, {})
+  vim.api.nvim_create_user_command("UEInstall", install_active_target, {
+    desc = "Install for the active Android or IOS target without launching",
+  })
   vim.api.nvim_create_user_command("UEInstallAndroid", install_android, {})
   vim.api.nvim_create_user_command("UEPrepare", function(cmd)
     local bang = cmd.bang and true or false

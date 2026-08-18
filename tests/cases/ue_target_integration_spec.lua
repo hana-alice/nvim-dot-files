@@ -41,6 +41,51 @@ t.describe("ue target integration", function()
     t.assert_eq(detected, "")
   end)
 
+  t.it("dispatches install by active target and keeps IOS on the target-driver path", function()
+    local calls = {}
+    local function dispatch(platform)
+      return ue._install_active_target_for_test({
+        resolve_context = function()
+          return { engine_root = "/UE" }
+        end,
+        target_platform = function()
+          return platform
+        end,
+        install_android = function()
+          calls[#calls + 1] = "android"
+          return "android-result"
+        end,
+        install_target = function(selected)
+          calls[#calls + 1] = "target:" .. selected
+          return "ios-result"
+        end,
+      })
+    end
+
+    t.assert_eq(dispatch("Android"), "android-result")
+    t.assert_eq(dispatch("IOS"), "ios-result")
+    t.assert_eq(table.concat(calls, ","), "android,target:IOS")
+  end)
+
+  t.it("rejects install for desktop targets instead of guessing a device workflow", function()
+    local notified
+    local result, err = ue._install_active_target_for_test({
+      resolve_context = function()
+        return { engine_root = "/UE" }
+      end,
+      target_platform = function()
+        return "Mac"
+      end,
+      notify_error = function(message)
+        notified = message
+      end,
+    })
+
+    t.assert_eq(result, nil)
+    t.assert_contains(err, "active target Mac")
+    t.assert_eq(notified, err)
+  end)
+
   t.it("offers only build targets supported by the current host", function()
     local mac = ue._available_platform_choices_for_test(require("utils.platform.macos"))
     local windows = ue._available_platform_choices_for_test(require("utils.platform.windows"))
@@ -92,6 +137,19 @@ t.describe("ue target integration", function()
     t.assert_contains(command, "/UE Root/Engine/Build/BatchFiles/Mac/Build.sh")
     t.assert_contains(command, "IOS")
     t.assert_contains(command, "-Project=/Project Root/Sample.uproject")
+    t.assert_contains(command, "-WaitMutex")
+    t.assert_contains(command, "-FromMsBuild")
+    t.assert_contains(command, "-disablev8pointercompression")
+    local function argv_position(value)
+      for index, arg in ipairs(command) do
+        if arg == value then
+          return index
+        end
+      end
+    end
+    t.assert_true(argv_position("-Project=/Project Root/Sample.uproject") < argv_position("-WaitMutex"))
+    t.assert_true(argv_position("-WaitMutex") < argv_position("-FromMsBuild"))
+    t.assert_true(argv_position("-FromMsBuild") < argv_position("-disablev8pointercompression"))
     t.assert_eq(plan.metadata.platform, "IOS")
     t.assert_eq(plan.metadata.optimization, "cpp-iteration")
   end)
@@ -140,6 +198,9 @@ t.describe("ue target integration", function()
 
     t.assert_contains(command, "Mac")
     t.assert_false(vim.tbl_contains(command, "IOS"))
+    t.assert_false(vim.tbl_contains(command, "-WaitMutex"))
+    t.assert_false(vim.tbl_contains(command, "-FromMsBuild"))
+    t.assert_false(vim.tbl_contains(command, "-disablev8pointercompression"))
   end)
 
   t.it("rejects incompatible host-target pairs before command planning", function()

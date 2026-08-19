@@ -68,6 +68,28 @@ target platform/configuration SHALL 作为一个原子 pair 写入，MUST NOT �
 - **THEN** 磁盘最终值 SHALL 完整来自某一个 writer
 - **AND** MUST NOT 组合一个 writer 的 platform 与另一个 writer 的 configuration
 
+### Requirement: engine-level target preference SHALL suggest, never inherit
+
+engine 级 target preference（`.cache/nvim-ue/target-default.json`）SHALL 在每次显式
+`update_target` 时镜像最新 `(platform, configuration)` pair（last-writer-wins，原子替换）。
+它 SHALL 仅作为交互 picker 的排序建议；`read_state()` 与任何构建/缓存路径 MUST NOT 将其
+作为 platform 来源。新 project bucket 在用户显式选择前 SHALL 视为未设置 target；
+需要 platform 的操作（如 UEBuild）MUST NOT 在未设置时静默采用任何默认值构建，SHALL 先
+要求一次显式选择。
+
+#### Scenario: 新 bucket 不自动继承
+
+- **WHEN** 项目 A 显式设置 `(Android, Test)` 后用户切换到从未设置过 target 的项目 B
+- **THEN** B 的 `read_state().target_platform` SHALL 为空且 `target_is_set` SHALL 为 false
+- **AND** engine preference SHALL 仍返回 `(Android, Test)` 供 picker 置顶建议
+
+#### Scenario: 未设置时构建先提示
+
+- **WHEN** 用户在 target 未设置的项目上触发 UEBuild
+- **THEN** 系统 SHALL 先弹出 platform/configuration 选择（建议项置顶）
+- **AND** 用户确认后 SHALL 持久化到该 project bucket 并继续原构建
+- **AND** 用户取消时 MUST NOT 以猜测的 platform 继续构建
+
 ### Requirement: destructive cache writers SHALL hold cross-process leases
 
 UEPrepare、CDB pipeline、csearch build 与 controlled semantic-index phase 的 writer ownership SHALL 同时覆盖进程内与跨进程。

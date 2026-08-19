@@ -2499,6 +2499,20 @@ local function set_build_status(value)
   refresh_statusline()
 end
 
+-- True while the UEBuild/UEBuildAndroidSO terminal job is alive. Used to
+-- enforce build ⇄ prepare mutual exclusion: the prepare family READS build
+-- products (Module.*.rsp, receipts, binaries) that the build is WRITING —
+-- running them concurrently is a write-after-write/read-during-write hazard
+-- that yields torn CDBs and wastes CPU the build needs. Parked on CORE_RT
+-- (LuaJIT 200-local cap, see CONSTRAINTS).
+function CORE_RT.ue_build_running()
+  if not CORE_RT.build_term_jobid then
+    return false
+  end
+  local ok, result = pcall(vim.fn.jobwait, { CORE_RT.build_term_jobid }, 0)
+  return ok and type(result) == "table" and result[1] == -1
+end
+
 local function set_prepare_running(value)
   value = not not value
   if M._prepare_running == value then
@@ -3288,7 +3302,19 @@ local function target_platform(engine_root, cmd)
       return detected
     end
   end
+  local driver = _uplat.driver()
+  if type(driver.default_target) == "function" then
+    local detected = trim(driver.default_target())
+    if detected ~= "" then
+      return detected
+    end
+  end
   -- A failed/unknown host driver must not silently masquerade as Linux.
+  -- (2026-08-18 incident: the old bottom fallback returned "Linux" — a
+  -- retired-WSL leftover — sending UBT after a Linux cross-compile SDK on a
+  -- fresh checkout: `<Target> Linux Development` → "Unable to find valid
+  -- SDK(s) for Linux" → exit 6. Main's platform-driver default_target()
+  -- supersedes the inline drive-letter heuristic.)
   return ""
 end
 
@@ -4433,6 +4459,7 @@ end
 ---   env     = table?
 --- }
 --- @return integer jobid
+--- @return string log_path
 function M._logged_jobstart(cmd, tag, opts)
   opts = opts or {}
   local log_dir = vim.fn.stdpath("log") .. "/" .. tag
@@ -4441,30 +4468,64 @@ function M._logged_jobstart(cmd, tag, opts)
     os.date("%Y%m%d-%H%M%S"), vim.fn.getpid(), tostring(vim.uv.hrtime()))
   local log_lines = {}
 
-  local function on_data(_, data)
-    if not data then return end
-    for _, line in ipairs(data) do
-      if line and line ~= "" then table.insert(log_lines, line) end
+  -- Stream the log to disk as lines arrive (open once, append + flush per
+  -- batch) so a long-running job can be tailed LIVE. Previously the file was
+  -- only written at exit, which made multi-minute pipelines look frozen: no
+  -- log on disk, no output, until the process died. The exit code moves to a
+  -- footer line since it is only known at the end.
+  local log_file = io.open(log_path, "w")
+  if log_file then
+    log_file:write("# ue.lua " .. tag .. "\n")
+    log_file:write("# cmd: " .. (type(cmd) == "table" and table.concat(cmd, " ") or tostring(cmd)) .. "\n")
+    if opts.cdb then log_file:write("# cdb: " .. tostring(opts.cdb) .. "\n") end
+    log_file:write(("# time: %s\n\n"):format(os.date("%Y-%m-%d %H:%M:%S")))
+    log_file:flush()
+  end
+
+  -- jobstart on_stdout/on_stderr chunks are NOT line-aligned: data[1]
+  -- continues the previous chunk's unfinished line and data[#data] may be an
+  -- unfinished line ("" means the chunk ended exactly on a newline). Without
+  -- stitching, one long print() lands in the log as several broken lines
+  -- (observed in the ue_cdb behavioral test: "live-line-1" → "live-line"+
+  -- "-1"). Keep one pending buffer per stream.
+  local pending = { stdout = "", stderr = "" }
+
+  local function emit(line)
+    if line == "" then return end
+    table.insert(log_lines, line)
+    if log_file then
+      log_file:write(line, "\n")
+    end
+  end
+
+  local function on_data(stream)
+    return function(_, data)
+      if not data then return end
+      local buf = pending[stream] .. (data[1] or "")
+      for i = 2, #data do
+        emit(buf)
+        buf = data[i]
+      end
+      pending[stream] = buf
+      if log_file then log_file:flush() end
     end
   end
 
   local function flush_log(code)
-    local f = io.open(log_path, "w")
-    if not f then return end
-    f:write("# ue.lua " .. tag .. "\n")
-    f:write("# cmd: " .. (type(cmd) == "table" and table.concat(cmd, " ") or tostring(cmd)) .. "\n")
-    f:write("# exit: " .. tostring(code) .. "\n")
-    if opts.cdb then f:write("# cdb: " .. tostring(opts.cdb) .. "\n") end
-    f:write(("# time: %s\n\n"):format(os.date("%Y-%m-%d %H:%M:%S")))
-    for _, line in ipairs(log_lines) do f:write(line, "\n") end
-    f:close()
+    -- Flush any unfinished trailing lines before the footer.
+    emit(pending.stdout); pending.stdout = ""
+    emit(pending.stderr); pending.stderr = ""
+    if not log_file then return end
+    log_file:write(("\n# exit: %s (%s)\n"):format(tostring(code), os.date("%Y-%m-%d %H:%M:%S")))
+    log_file:close()
+    log_file = nil
   end
 
   local job_opts = {
     stdout_buffered = false,
     stderr_buffered = false,
-    on_stdout = on_data,
-    on_stderr = on_data,
+    on_stdout = on_data("stdout"),
+    on_stderr = on_data("stderr"),
     on_exit = function(_, code)
       vim.schedule(function()
         flush_log(code)
@@ -4490,7 +4551,14 @@ function M._logged_jobstart(cmd, tag, opts)
   if opts.cwd then job_opts.cwd = opts.cwd end
   if opts.env then job_opts.env = opts.env end
 
-  return vim.fn.jobstart(cmd, job_opts)
+  local jobid = vim.fn.jobstart(cmd, job_opts)
+  if (not jobid or jobid <= 0) and log_file then
+    -- Job never spawned: close the streamed header so the handle doesn't leak.
+    log_file:write("\n# exit: jobstart failed (" .. tostring(jobid) .. ")\n")
+    log_file:close()
+    log_file = nil
+  end
+  return jobid, log_path
 end
 
 --- Run PCH prebuild + include-dir unification in background after slim.
@@ -6823,7 +6891,8 @@ function CORE_RT.fast_swap_active_platform(engine_root)
   return true, new_key, stats
 end
 
-local function set_platform(input)
+local function set_platform(input, opts)
+  opts = opts or {}
   local engine_root, project_root, uproject, state = platform_selection_context()
   if not engine_root then
     vim.notify("No Unreal Engine root found from current buffer or cwd", vim.log.levels.WARN)
@@ -6901,25 +6970,67 @@ local function set_platform(input)
     return
   end
 
-  -- Interactive: select platform then configuration
-  vim.ui.select(available_platform_choices(project_root, uproject), {
+  -- Interactive: select platform then configuration.
+  -- Suggestion (not authority): float the engine-level last-used pair to the
+  -- top of the picker so a fresh bucket is one <CR> away from the platform
+  -- the user habitually builds on this engine. Selection is still explicit —
+  -- nothing is inherited without a keypress.
+  local suggestion = CORE_RT.project_state.engine_target_default
+    and CORE_RT.project_state.engine_target_default(engine_root) or nil
+  local platform_choices = available_platform_choices(project_root, uproject)
+  if suggestion and suggestion.target_platform then
+    for i, p in ipairs(platform_choices) do
+      if p == suggestion.target_platform and i > 1 then
+        table.remove(platform_choices, i)
+        table.insert(platform_choices, 1, p)
+        break
+      end
+    end
+  end
+  vim.ui.select(platform_choices, {
     prompt = "Target Platform (current: " .. (current_plat ~= "" and current_plat or "auto") .. "):",
+    format_item = function(item)
+      if suggestion and item == suggestion.target_platform then
+        return item .. "  (last used on this engine)"
+      end
+      return item
+    end,
   }, function(plat)
     if not plat then
+      if opts.on_done then opts.on_done(false) end
       return
     end
 
     local current_for_platform = current_conf ~= "" and current_conf
       or selected_target_configuration(engine_root, project_root, uproject, plat)
-    vim.ui.select(available_configuration_choices(project_root, uproject, plat), {
+    local config_choices = available_configuration_choices(project_root, uproject, plat)
+    if suggestion and plat == suggestion.target_platform and suggestion.target_configuration then
+      for i, c in ipairs(config_choices) do
+        if c == suggestion.target_configuration and i > 1 then
+          table.remove(config_choices, i)
+          table.insert(config_choices, 1, c)
+          break
+        end
+      end
+    end
+    vim.ui.select(config_choices, {
       prompt = "Target Configuration (current: " .. current_for_platform .. "):",
+      format_item = function(item)
+        if suggestion and plat == suggestion.target_platform
+            and item == suggestion.target_configuration then
+          return item .. "  (last used on this engine)"
+        end
+        return item
+      end,
     }, function(conf)
       if not conf then
+        if opts.on_done then opts.on_done(false) end
         return
       end
       local ok_update, update_err = CORE_RT.project_state.update_target(engine_root, plat, conf)
       if not ok_update then
         vim.notify("Failed to set target: " .. tostring(update_err), vim.log.levels.ERROR)
+        if opts.on_done then opts.on_done(false) end
         return
       end
       invalidate_status_cache()
@@ -6945,6 +7056,7 @@ local function set_platform(input)
           plat, conf, info or "Run :UEPrepare to regenerate for this platform"),
           vim.log.levels.WARN, { title = "UE", timeout = 6000 })
       end
+      if opts.on_done then opts.on_done(true) end
     end)
   end)
 end
@@ -6973,6 +7085,30 @@ local function build_target(opts)
     return
   end
 
+  -- Fresh-bucket gate: never build on a silently-guessed platform. A project
+  -- bucket that has NEVER had an explicit target set (fresh checkout after
+  -- :UESetProject) previously fell through target_platform()'s default and
+  -- built whatever that guessed (2026-08-18: Linux → UBT exit 6). Prompt the
+  -- picker once — the engine-level last-used pair is floated to the top so
+  -- it's a single <CR> — then resume this exact build. An explicit
+  -- opts.platform (caller already chose) bypasses the gate.
+  if not opts._platform_prompted
+      and trim(opts.platform or "") == ""
+      and vim.g.ue_prepare_headless ~= 1
+      and CORE_RT.project_state.target_is_set
+      and not CORE_RT.project_state.target_is_set(ctx.engine_root) then
+    vim.notify("This project has no target platform set yet — choose one to build.",
+      vim.log.levels.WARN, { title = "UE" })
+    set_platform(nil, {
+      on_done = function(ok)
+        if ok then
+          build_target(vim.tbl_extend("force", opts, { _platform_prompted = true }))
+        end
+      end,
+    })
+    return
+  end
+
   local plat = trim(opts.platform or "")
   if plat == "" then plat = target_platform(ctx.engine_root, nil) end
   local conf = selected_target_configuration(ctx.engine_root, ctx.project_root, ctx.uproject, plat)
@@ -6981,6 +7117,17 @@ local function build_target(opts)
   local so_only = operation == "so_build"
   local title_prefix = opts.title or (so_only and "UEBuildAndroidSO" or "UEBuild")
   local title = (title_prefix .. " %s %s"):format(plat, conf)
+
+  -- Build ⇄ prepare mutual exclusion (WAW): the cdb pipeline / UEPrepare
+  -- READ build products (Module.*.rsp, receipts) that this build is about to
+  -- REWRITE — a pipeline running across a build produces a CDB derived from
+  -- half-old half-new inputs. The build wins: cancel the in-flight pipeline
+  -- (its writer slot + cross-process lease are released through its normal
+  -- on_fail path) and rerun :UEPrepare after the build succeeds.
+  if require("ue.cdb.pipeline").cancel(title .. " started (build products are being rewritten)") then
+    vim.notify("Re-run :UEPrepare after the build to refresh the CDB.",
+      vim.log.levels.INFO, { title = "UE" })
+  end
 
   local host_driver = opts.host_driver or require("utils.platform").driver()
   opts.host_driver = host_driver
@@ -8409,6 +8556,19 @@ local function prepare_async(opts)
     return
   end
 
+  -- Build ⇄ prepare mutual exclusion (WAW): prepare's primary CDB source is
+  -- the Module.*.rsp files UBT rewrites during a build — scanning them
+  -- mid-build yields a CDB derived from a torn snapshot. Refuse (never
+  -- queue, same policy as csearch_build_begin): the user reruns :UEPrepare
+  -- once the build finishes, with final rsp/receipts on disk.
+  if CORE_RT.ue_build_running() then
+    vim.notify(
+      "UE build is running — :UEPrepare reads build products (Module.*.rsp) the build is rewriting. "
+        .. "Run :UEPrepare after the build finishes.",
+      vim.log.levels.WARN, { title = "UE" })
+    return
+  end
+
   local cdb_pipeline = require("ue.cdb.pipeline")
   if M._prepare_running or cdb_pipeline.is_running() then
     vim.notify("UEPrepare is already running", vim.log.levels.INFO)
@@ -9286,6 +9446,14 @@ function M._android_install_argv_for_test(adb, serial, apk)
     device_id = serial,
   }, require("utils.platform.windows"))
   return require("ue.target_tasks").command(plan)
+end
+
+function M._target_platform_for_test(engine_root, cmd)
+  return target_platform(engine_root, cmd)
+end
+
+function M._set_platform_for_test(input, opts)
+  return set_platform(input, opts)
 end
 
 function M._android_so_deploy_command_for_test(ctx, serial, package_name)

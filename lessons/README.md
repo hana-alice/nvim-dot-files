@@ -1,7 +1,7 @@
 # Lessons · 平台怪癖与调试硬知识
 
 > **lessons/** 区：付出过真实调试成本的陷阱与硬知识。
-> 出处优先：权威踩坑清单在 `docs/CONSTRAINTS.md §二（踩过的坑 K1–K49）`，
+> 出处优先：权威踩坑清单在 `docs/CONSTRAINTS.md §二（踩过的坑 K1–K51）`，
 > 本文件是**主题导航**，按领域聚合指回出处，不复制原文。
 
 ## 什么属于这里 / 不属于这里
@@ -51,6 +51,12 @@ startup-agent 能力（K47）；非 root 不能靠预 `dlopen`/SONAME 猜复用�
 必须用唯一 generation + 原子 pointer，并以 OS mutex 串行化 `uq`/`ul`，部分 staging 不得静默回落，
 启动必须复算 generation hash 并核对 APK 文件系统身份；maps 必须精确比较 pathname，失败启动必须停进程（K49）。
 → `../docs/CONSTRAINTS.md §二 K44–K49`；`../openspec/specs/android-so-quick-deploy/spec.md`
+
+### CDB pipeline × UE build（K51）
+prepare 家族读编译产物（Module.*.rsp/receipts），与 UBT build 并跑是 WAW 冒险且 prune 满线程抢核；
+解法 build 赢——build 启动 cancel 在飞 pipeline、prepare 在 build 运行时拒绝启动；pipeline python
+必须 `-u` + 分步 banner + 流式日志（jobstart data 块非行对齐要拼行）。
+→ `../docs/CONSTRAINTS.md §二 K51`；`../docs/changelog.md` 2026-08-18
 
 ### 工具链 / LLVM（K14–K15、K41）
 LLVM 22.0–22.1.5 的 `lldb-dap.exe` Windows 启动崩（`STATUS_STACK_BUFFER_OVERRUN`）；

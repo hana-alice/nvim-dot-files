@@ -109,3 +109,41 @@ t.describe("ue.ai_context", function()
     end
   end)
 end)
+
+t.describe("target_platform 无持久状态时的默认值", function()
+  local ue = require("ue")
+
+  t.it("Windows host / 盘符 engine root 默认 Win64（不再回落 Linux）", function()
+    -- Fresh checkout: engine root exists but has no persisted state at all.
+    local root = ("C:/tmp/nvim-ue-plat-%d-%d"):format(vim.fn.getpid(), vim.uv.hrtime())
+    vim.fn.mkdir(root, "p")
+    local saved = vim.env.UE_TARGET_PLATFORM
+    vim.env.UE_TARGET_PLATFORM = nil
+    local plat = ue._target_platform_for_test(root, nil)
+    vim.env.UE_TARGET_PLATFORM = saved
+    vim.fn.delete(root, "rf")
+    -- On a Windows host this must never be Linux (2026-08-18: bare-state
+    -- UEBuild produced `<Target> Linux Development` → UBT exit 6,
+    -- "Unable to find valid SDK(s) for Linux").
+    t.assert_eq(plat, "Win64")
+  end)
+
+  t.it("env override 仍最高优先", function()
+    local saved = vim.env.UE_TARGET_PLATFORM
+    vim.env.UE_TARGET_PLATFORM = "Android"
+    local plat = ue._target_platform_for_test("C:/nonexistent-engine", nil)
+    vim.env.UE_TARGET_PLATFORM = saved
+    t.assert_eq(plat, "Android")
+  end)
+
+  t.it("UEBuild 新 bucket 未设 platform 时先弹 picker 再续跑（源断言）", function()
+    local source = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
+    -- Fresh-bucket gate exists in build_android and resumes the build after
+    -- an explicit choice; never builds a guessed platform silently.
+    t.assert_contains(source, "not CORE_RT.project_state.target_is_set(ctx.engine_root)")
+    t.assert_contains(source, "_platform_prompted = true")
+    -- Picker floats the engine-level last-used pair as suggestion only.
+    t.assert_contains(source, "engine_target_default(engine_root)")
+    t.assert_contains(source, "(last used on this engine)")
+  end)
+end)

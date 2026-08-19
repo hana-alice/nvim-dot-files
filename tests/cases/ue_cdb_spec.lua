@@ -435,4 +435,141 @@ t.describe("ue.cdb.pipeline lifecycle", function()
     t.assert_contains(source, 'local pipeline_jobid, pipeline_err = run_compile_commands_pipeline(targets[1], targets, function()')
     t.assert_contains(source, 'return false, nil, pipeline_err or "compile_commands pipeline failed to start"')
   end)
+
+  t.it("每步 python 带 -u 无缓冲、独立 step tag（实时日志可归因）", function()
+    local path = temp_cdb()
+    local calls = {}
+    pipeline.set_runtime({
+      jobstart = function(cmd, tag, opts)
+        table.insert(calls, { cmd = cmd, tag = tag, opts = opts })
+        -- Complete each step immediately so the chain drains and the writer
+        -- slot is released for later cases.
+        vim.schedule(function() end)
+        opts.on_exit(0, {}, tag .. ".log")
+        return 40 + #calls
+      end,
+      notify = function() end,
+      log_error = function() end,
+    })
+    pipeline.run(path, { path }, function() end)
+    t.assert_true(#calls >= 1, "至少应启动一个 step job")
+    for _, call in ipairs(calls) do
+      t.assert_type(call.cmd, "table")
+      -- Every python step must run unbuffered, otherwise a long step logs
+      -- nothing until exit (looks like a hang).
+      t.assert_eq(call.cmd[2], "-u", "python 必须带 -u 取消 stdout 缓冲: " .. call.tag)
+      -- Per-step tag names the script → the log dir/failure message point at
+      -- the actual culprit step.
+      t.assert_true(call.tag:find("^ue%-pipeline%-") ~= nil, "step tag 必须带步骤名: " .. call.tag)
+      if call.tag:find("prune_include_dirs", 1, true) then
+        t.assert_eq(call.cmd[3], "-I", "prune 需同时保留 -I 隔离与 -u")
+      end
+    end
+    t.assert_false(pipeline.is_running())
+    pcall(os.remove, path)
+  end)
+
+  t.it("启动成功后注册进 task_registry（:Tasks 可停）", function()
+    local path = temp_cdb()
+    local tr = require("utils.task_registry")
+    tr._reset_for_test()
+    tr._set_probe_for_test(function() return "running" end)
+    local pending = {}
+    pipeline.set_runtime({
+      jobstart = function(_, _, opts)
+        table.insert(pending, opts)
+        return 60 + #pending
+      end,
+      notify = function() end,
+      log_error = function() end,
+    })
+    pipeline.run(path, { path }, function() end)
+    t.assert_true(pipeline.is_running())
+    local rows = tr.list()
+    local found = false
+    for _, row in ipairs(rows) do
+      if tostring(row.name):find("cdb pipeline", 1, true) and row.group == "ue" then
+        found = true
+      end
+    end
+    t.assert_true(found, "pipeline 任务必须出现在 :Tasks 列表")
+    -- Drain the sequential step chain: each on_exit starts the next step and
+    -- appends its opts to `pending`.
+    local i = 0
+    while i < #pending do
+      i = i + 1
+      pending[i].on_exit(0, {}, "step.log")
+    end
+    t.assert_false(pipeline.is_running(), "全部 step 完成后应释放 writer 锁")
+    tr._set_probe_for_test(nil)
+    tr._reset_for_test()
+    pcall(os.remove, path)
+  end)
+
+  t.it("cancel 停掉在飞 pipeline 并经 on_fail 释放 writer（build WAW 互斥）", function()
+    local path = temp_cdb()
+    local pending = {}
+    local result
+    pipeline.set_runtime({
+      jobstart = function(_, _, opts)
+        table.insert(pending, opts)
+        return 80 + #pending
+      end,
+      notify = function() end,
+      log_error = function() end,
+    })
+    pipeline.run(path, { path }, function(ok) result = ok end)
+    t.assert_true(pipeline.is_running())
+    t.assert_true(#pending >= 1, "pipeline 应已启动首个 step")
+    t.assert_true(pipeline.cancel("test build started"), "在飞时 cancel 应返回 true")
+    -- jobstop drives the real runner's on_exit; simulate the kill exit of the
+    -- CURRENT (last-started) step here.
+    pending[#pending].on_fail(143, { "killed" }, path .. ".log")
+    t.assert_false(pipeline.is_running(), "cancel 后经 on_fail 必须释放 writer 锁")
+    t.assert_false(result, "被 cancel 的 pipeline 必须回调 false")
+    t.assert_false(pipeline.cancel("idle"), "无在飞任务时 cancel 应返回 false")
+    pcall(os.remove, path)
+  end)
+
+  t.it("build ⇄ prepare 互斥入口存在（源断言）", function()
+    local source = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
+    -- UEBuild entry cancels the in-flight pipeline (build wins the WAW).
+    t.assert_contains(source, 'require("ue.cdb.pipeline").cancel(title')
+    -- prepare_async refuses to start while the build terminal job is alive.
+    t.assert_contains(source, "if CORE_RT.ue_build_running() then")
+    t.assert_contains(source, "function CORE_RT.ue_build_running()")
+  end)
+
+  t.it("_logged_jobstart 边跑边落盘（可 tail）并返回 log_path", function()
+    local ue = require("ue")
+    -- argv-list form bypasses vim.o.shell entirely (the harness may run under
+    -- bash while shellcmdflag is still cmd-style). Child = nvim -l printing
+    -- two lines: portable on every machine that can run this suite.
+    local child = vim.fn.tempname() .. ".lua"
+    do
+      local f = assert(io.open(child, "w"))
+      f:write('print("live-line-1")\nprint("live-line-2")\n')
+      f:close()
+    end
+    local script = { vim.v.progpath, "--clean", "--headless", "-l", child }
+    local finished = false
+    local log_path_seen
+    local jobid, log_path = ue._logged_jobstart(script, "ue-pipeline-test", {
+      on_exit = function(_, _, lp)
+        finished = true
+        log_path_seen = lp
+      end,
+    })
+    t.assert_true(type(jobid) == "number" and jobid > 0, "jobstart 应返回有效 jobid")
+    t.assert_type(log_path, "string")
+    vim.wait(5000, function() return finished end, 50)
+    t.assert_true(finished, "测试 job 应在 5s 内退出")
+    t.assert_eq(log_path_seen, log_path)
+    local content = table.concat(vim.fn.readfile(log_path), "\n")
+    t.assert_contains(content, "live-line-1")
+    t.assert_contains(content, "live-line-2")
+    t.assert_contains(content, "# exit: 0")
+    pcall(os.remove, log_path)
+    pcall(os.remove, child)
+  end)
 end)

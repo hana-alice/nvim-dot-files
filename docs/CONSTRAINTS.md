@@ -359,6 +359,19 @@
   → `scripts/ue_android_so_deploy.ps1`; `scripts/ue_android_so_launch.ps1`;
     `scripts/ue_android_so_agent.c`; `openspec/specs/android-so-quick-deploy/spec.md`
 
+- **K51 — cdb pipeline × UE build 并跑 = WAW 冒险 + prune 满线程抢核（2026-08-18 实测）**
+  症状: `<Space>ub` 编译期间 python（prune_include_dirs 的 `min(20,cpu)` 线程 include 扫描 +
+  310MB CDB `json.load`）吃满 CPU、编译卡顿；且 pipeline 静默（日志 exit 时才落盘、python
+  stdout 管道全缓冲），kill 后才弹 `ue-pipeline failed (exit 1)`。
+  根因: prepare 家族（含 cdb pipeline）**读取编译产物**（Module.*.rsp / receipts），与正在
+  重写这些产物的 UBT build 并跑，产出半新半旧的脏 CDB——写后写冒险，不只是抢 CPU。
+  解决约束: **build 赢**——`build_android` 启动时 `pipeline.cancel()` 掉在飞 pipeline（经
+  on_fail 正常释放 writer 槽/lease）；`prepare_async` 在 `CORE_RT.ue_build_running()` 时拒绝
+  启动（不排队）。pipeline python 步骤必须 `-u` + 分步 banner + 流式落盘日志（jobstart data
+  块非行对齐，须 pending-buffer 拼行）；prune 用 `--sample 4 --workers 4`。
+  → `lua/ue/cdb/pipeline.lua` `M.cancel`; `lua/ue.lua` `ue_build_running` / `_logged_jobstart`;
+    行为测 `tests/cases/ue_cdb_spec.lua`; `docs/changelog.md` 2026-08-18
+
 ### 工具链 / LLVM
 
 - **K41 — 依赖路径向上发现的 `.clangd` / monolithic External index → 覆盖漂移与资源失控**

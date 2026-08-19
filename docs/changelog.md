@@ -41,6 +41,7 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 - `v1.3.0` → `docs/release_1.3.0.md` (tag pending explicit confirmation)
 - `v1.4.0` → `docs/release_1.4.0.md` (tag pending explicit confirmation)
 - `v1.5.0` → `docs/release_1.5.0.md` (tag pending explicit confirmation)
+- `v1.6.0` → `docs/release_1.6.0.md` (tag pending explicit confirmation)
 
 ## Unreleased
 

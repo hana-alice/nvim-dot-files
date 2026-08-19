@@ -163,6 +163,44 @@ t.describe("multi-instance project state", function()
     pcall(vim.fn.delete, root, "rf")
   end)
 
+  t.it("engine target default 是建议不是权威：新 bucket 不自动继承", function()
+    local root = tmpdir()
+    local engine = root .. "/engine"
+    local project_a = root .. "/A"
+    local project_b = root .. "/B"
+    local uproject_a = project_a .. "/A.uproject"
+    local uproject_b = project_b .. "/B.uproject"
+    write(uproject_a)
+    write(uproject_b)
+    local state = require("ue.project_state")
+    state._reset_for_test()
+
+    -- Project A explicitly sets a target → engine-level preference mirrors it.
+    assert(state.select(engine, project_a, uproject_a))
+    assert(state.update_target(engine, "Android", "Test"))
+    t.assert_true(state.target_is_set(engine), "A 显式设置后 target_is_set 应为 true")
+    local suggestion = state.engine_target_default(engine)
+    t.assert_eq(suggestion.target_platform, "Android")
+    t.assert_eq(suggestion.target_configuration, "Test")
+
+    -- Switch to fresh project B: suggestion available, but B's own state
+    -- MUST NOT inherit it — read_state has no platform, target_is_set false.
+    assert(state.select(engine, project_b, uproject_b))
+    t.assert_false(state.target_is_set(engine), "新 bucket 不得被视为已设置")
+    t.assert_nil(state.read(engine).target_platform, "新 bucket 不得自动继承 platform")
+    -- Engine-level suggestion survives the project switch (orthogonal axis).
+    local still = state.engine_target_default(engine)
+    t.assert_eq(still.target_platform, "Android")
+
+    -- B explicitly sets a different pair → suggestion follows the latest
+    -- explicit choice, A's own bucket is untouched.
+    assert(state.update_target(engine, "Win64", "Development Editor"))
+    t.assert_eq(state.engine_target_default(engine).target_platform, "Win64")
+    assert(state.select(engine, project_a, uproject_a))
+    t.assert_eq(state.read(engine).target_platform, "Android", "A 的 bucket 不受 B 影响")
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
   t.it("persisted target platform and configuration never tear across writers", function()
     local root = tmpdir()
     local engine = root .. "/engine"

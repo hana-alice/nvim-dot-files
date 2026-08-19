@@ -184,6 +184,42 @@ local function target_path(engine_root, selection)
   return fs.join(fields_dir(engine_root, selection), "target-selection.json")
 end
 
+-- Engine-level target preference (orthogonal axis, NOT authority).
+-- Written on every explicit UESetPlatform; read only as the SUGGESTED default
+-- when a project bucket has never had a target set (fresh checkout picker).
+-- Deliberately engine-scoped, not global: two engines can have different
+-- habitual platforms, and per-spec "preference globals MAY share a
+-- last-writer-wins file but SHALL atomic replace". The per-project
+-- target-selection.json remains the only authority read_state() honors.
+local function engine_target_default_path(engine_root)
+  local _, engine = engine_key(engine_root)
+  return fs.join(engine_cache_root(engine), "target-default.json")
+end
+
+function M.engine_target_default(engine_root)
+  local value = read_json(engine_target_default_path(engine_root))
+  if type(value) ~= "table" then return nil end
+  local platform = value.target_platform
+  if type(platform) ~= "string" or platform == "" then return nil end
+  return {
+    target_platform = platform,
+    target_configuration = type(value.target_configuration) == "string"
+      and value.target_configuration or nil,
+  }
+end
+
+--- Whether the ACTIVE project bucket has ever had an explicit target set.
+--- Distinguishes "user chose a platform" from "code fell back to a default" —
+--- fresh buckets must prompt, not silently build a guessed platform.
+function M.target_is_set(engine_root)
+  local selection = M.current(engine_root)
+  if not selection then return false end
+  local value = read_json(target_path(engine_root, selection))
+  return type(value) == "table"
+    and type(value.target_platform) == "string"
+    and value.target_platform ~= ""
+end
+
 function M.revision_path(engine_root, selection)
   local root = M.project_cache_root(engine_root, selection)
   return root and fs.join(root, "state.revision.json") or nil
@@ -276,6 +312,15 @@ function M.update_target(engine_root, platform, configuration)
     writer_pid = vim.fn.getpid(),
   })
   if not ok then return false, err end
+  -- Mirror the pair into the engine-level preference (suggestion-only; see
+  -- engine_target_default). Best-effort: a failed mirror must not fail the
+  -- authoritative per-project write.
+  pcall(atomic_write, engine_target_default_path(engine_root), {
+    target_platform = platform,
+    target_configuration = configuration,
+    updated_at = updated_at,
+    writer_pid = vim.fn.getpid(),
+  })
   local session_key = engine_key(engine_root)
   session_values[session_key] = session_values[session_key] or {}
   session_values[session_key].target_platform = platform

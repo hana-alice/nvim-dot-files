@@ -22,6 +22,7 @@ local file_lock = require("ue.file_lock")
 
 local M = {}
 local running = false
+local current_jobid = nil
 
 -- Runtime injection table. Defaults assume no fancy logger so that even
 -- pre-`set_runtime` calls degrade gracefully.
@@ -49,6 +50,25 @@ end
 --- Whether a compile_commands writer pipeline currently owns the mutation slot.
 function M.is_running()
   return running
+end
+
+--- Cancel the in-flight pipeline job (if any). Build ⇄ prepare mutual
+--- exclusion: the pipeline reads build products (rsp/receipts) and rewrites
+--- the CDB; once a build starts rewriting those inputs the pipeline's output
+--- is garbage (WAW hazard), so the build entrypoint kills it. jobstop drives
+--- the runner's normal on_exit → on_fail → finish(false) path, which releases
+--- the writer slot and the cross-process lease — nothing is force-reset here.
+---@param reason string? human-readable cause for the notification
+---@return boolean cancelled true when a live job was asked to stop
+function M.cancel(reason)
+  if not running or not current_jobid then
+    return false
+  end
+  _rt.notify(
+    "compile_commands pipeline cancelled: " .. (reason or "superseded"),
+    vim.log.levels.WARN)
+  pcall(vim.fn.jobstop, current_jobid)
+  return true
 end
 
 local function python_exe()
@@ -192,7 +212,15 @@ function M.run(path, targets, on_done, opts)
     ["prebuild_pch_v2.py"] = function(p) return { p } end,
     ["resolve_cdb_paths.py"] = function(p) return { p } end,
     ["unify_include_dirs.py"] = function(p) return { p, "--max-overhead=200" } end,
-    ["prune_include_dirs.py"] = function(p) return { p, "--sample", "20" }, true end,
+    -- --sample 4: the script's own default is 2 ("per-module groups have
+    -- 1-3 distinct -I sets; 2 is enough" — prune_include_dirs.py main());
+    -- the old 20 predates module-grouping and cost ~5x the IO for no
+    -- observed keep-set difference. 4 keeps a safety margin over 2.
+    -- --workers 4: the previous min(20, cpu_count) thread pool saturated
+    -- every core during UBT builds (2026-08-18 incident). The scan is
+    -- IO-bound os.walk + file reads; 4 threads keep it reasonable while
+    -- leaving cores for a concurrent build.
+    ["prune_include_dirs.py"] = function(p) return { p, "--sample", "4", "--workers", "4" }, true end,
   }
 
   -- Read the configured pipeline; fall back to canonical recipe if config
@@ -233,7 +261,11 @@ function M.run(path, targets, on_done, opts)
         args = { path }
       end
 
-      local command = { python }
+      -- `-u`: unbuffered stdout. Python fully buffers stdout when piped, so a
+      -- long step (prune's threaded include scan can run minutes on a 300MB
+      -- CDB) produced ZERO log output until exit — indistinguishable from a
+      -- hang. With -u every print() reaches the streamed log immediately.
+      local command = { python, "-u" }
       if isolate then command[#command + 1] = "-I" end
       command[#command + 1] = script_path
       vim.list_extend(command, args)
@@ -279,6 +311,7 @@ function M.run(path, targets, on_done, opts)
     finish_ok = ok
     finish_err = err
     running = false
+    current_jobid = nil
     file_lock.release(lease)
     if on_done then on_done(ok, err) end
   end
@@ -337,6 +370,9 @@ function M.run(path, targets, on_done, opts)
       finish(false, msg)
       return nil, msg
     end
+    -- Track the CURRENT step's job so M.cancel() (build ⇄ prepare mutual
+    -- exclusion) kills whichever step is in flight, not just the first.
+    current_jobid = jobid
     return jobid
   end
 
@@ -347,6 +383,20 @@ function M.run(path, targets, on_done, opts)
   if finished and not finish_ok then
     return nil, finish_err
   end
+  -- Register the pipeline in the generic task registry so :Tasks can
+  -- list/cancel it. Register-only side path per task_registry contract:
+  -- single pcall AFTER job creation, nothing added to on_exit callbacks.
+  -- (Each step streams its own live log under stdpath('log')/ue-pipeline-*;
+  -- failures carry the exact per-step log path.)
+  pcall(function()
+    require("utils.task_registry").register({
+      name = "UE cdb pipeline (" .. #steps .. " steps)",
+      group = "ue",
+      kind = "job",
+      handle = jobid,
+      started_at = os.time(),
+    })
+  end)
   return jobid
 end
 

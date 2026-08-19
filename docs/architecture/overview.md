@@ -38,6 +38,11 @@
 - **状态/缓存**：`:UESetProject` 把选择捕获在当前 Neovim 进程，同时更新未来进程读取的
   `selection.json` 默认值；project state/CDB/index/breakpoints/definition cache 写入 canonical-path
   project bucket。平台选择同样在进程内固定，另一个实例的修改不会重定向 live context。
+  target platform 是双轴：per-project `target-selection.json` 是唯一权威；engine 级
+  `target-default.json` 只作 picker 置顶建议（suggest, never inherit），新 bucket 未显式选择前
+  UEBuild 先弹 picker，不以任何默认值静默构建。UBT build 与 prepare/CDB pipeline 互斥
+  （build 赢：启动时 cancel 在飞 pipeline；build 运行中 prepare 拒绝启动）——prepare 读的
+  Module.*.rsp/receipts 正是 build 在写的产物（WAW，见 CONSTRAINTS K51）。
 - **goto-definition**：C++ source/header 都先在 proven TU 中取得 libclang exact-cursor
   canonical USR，再在同 generation controlled module AST 中查唯一 body；clangd 仅在 module
   contexts 暂不可用时作 identity-verified secondary provider。非 C++ 兼容路径保留

@@ -145,7 +145,10 @@ t.describe("ue target integration", function()
 
     t.assert_eq(err, nil)
     t.assert_eq(command[1], "/bin/zsh")
-    t.assert_contains(command, vim.fn.stdpath("config") .. "/scripts/ue_ios_cpp_iteration.zsh")
+    t.assert_contains(
+      command,
+      vim.fn.stdpath("config"):gsub("\\", "/") .. "/scripts/ue_ios_cpp_iteration.zsh"
+    )
     t.assert_contains(command, "/UE Root/Engine/Build/BatchFiles/Mac/Build.sh")
     t.assert_contains(command, "IOS")
     t.assert_contains(command, "-Project=/Project Root/Sample.uproject")
@@ -428,6 +431,46 @@ t.describe("ue target integration", function()
     t.assert_contains(body, "IOS setup ready")
   end)
 
+  t.it("revalidates the legacy IOS install helper before treating setup as ready", function()
+    local ctx = {
+      engine_root = "/UE",
+      project_root = "/Project",
+    }
+    local dependencies = {
+      read_state = function()
+        return {
+          ios_signing_identity = {
+            fingerprint = "ABC123",
+          },
+          target_runtime = {
+            IOS = {
+              device_id = "LEGACY-DEVICE",
+              device_backend = "legacy-mobiledevice",
+              setup_verified_at = "2026-08-20T08:00:00Z",
+              setup_signing_fingerprint = "ABC123",
+            },
+          },
+        }
+      end,
+      driver = {
+        prepared_signing_identity = function()
+          return {
+            ok = true,
+            found = true,
+            identity = { fingerprint = "ABC123" },
+          }
+        end,
+      },
+    }
+
+    t.assert_false(ue._ios_setup_is_ready_for_test(ctx, vim.tbl_extend("force", dependencies, {
+      resolve_legacy_install_script = function() return nil, "missing helper" end,
+    })))
+    t.assert_true(ue._ios_setup_is_ready_for_test(ctx, vim.tbl_extend("force", dependencies, {
+      resolve_legacy_install_script = function() return "/Tools/InstallIOSClient.sh" end,
+    })))
+  end)
+
   t.it("propagates target runtime persistence failures", function()
     local missing_engine = vim.fn.tempname() .. "-unselected-engine"
     local runtime, err = ue._update_target_runtime_for_test(missing_engine, "IOS", {
@@ -455,6 +498,69 @@ t.describe("ue target integration", function()
     t.assert_contains(body, "Checking pre-iOS17 USB MobileDevice")
     t.assert_contains(body, "Recovering legacy IOS USB route")
     t.assert_contains(body, "resolve_ios_usb_reset_script")
+  end)
+
+  t.it("reads the selected staged IOS app bundle id instead of reusing persisted runtime state", function()
+    local seen = {
+      validated = {},
+    }
+    local resolved_bundle
+    local resolved_artifacts
+    local resolved_error
+    local artifacts = {
+      {
+        path = "/Stage/IOS/Development/Payload/NewBuild.app",
+      },
+    }
+
+    ue._with_target_bundle_id_for_test({}, {
+      id = "IOS",
+      select_staged_artifact = function(received_artifacts)
+        t.assert_eq(received_artifacts, artifacts)
+        return {
+          ok = true,
+          app_path = "/Stage/IOS/Development/Payload/NewBuild.app",
+        }
+      end,
+      bundle_id_plan = function(app_path)
+        t.assert_eq(app_path, "/Stage/IOS/Development/Payload/NewBuild.app")
+        return { app_path = app_path }
+      end,
+      validate_bundle_id = function(value)
+        seen.validated[#seen.validated + 1] = value
+        if value == "com.example.newbuild" then
+          return { ok = true, bundle_id = value }
+        end
+        return { ok = false, reason = "unexpected bundle id: " .. tostring(value) }
+      end,
+    }, {
+      artifacts = artifacts,
+      bundle_id = "com.example.persisted-runtime",
+    }, require("utils.platform.macos"), function(bundle_id, callback_artifacts, bundle_err)
+      resolved_bundle = bundle_id
+      resolved_artifacts = callback_artifacts
+      resolved_error = bundle_err
+    end, {
+      task_runner = {
+        run = function(plan, opts)
+          t.assert_eq(plan.app_path, "/Stage/IOS/Development/Payload/NewBuild.app")
+          opts.on_exit({
+            code = 0,
+            stdout = "com.example.newbuild",
+          })
+          return true
+        end,
+        error_message = function(result)
+          return tostring(result.stderr or result.stdout or "bundle probe failed")
+        end,
+      },
+    })
+
+    t.assert_eq(resolved_bundle, "com.example.newbuild")
+    t.assert_eq(resolved_artifacts, artifacts)
+    t.assert_nil(resolved_error)
+    t.assert_eq(#seen.validated, 1)
+    t.assert_eq(seen.validated[1], "com.example.newbuild")
   end)
 
   t.it("carries a selected legacy backend into fail-closed IOS launch planning", function()

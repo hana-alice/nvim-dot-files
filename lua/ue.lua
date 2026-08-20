@@ -6619,6 +6619,8 @@ function M._clangd_version_compatible_for_test(output)
   return CORE_RT.clangd_version_compatible(output)
 end
 
+local resolve_ios_legacy_install_script
+
 -- ==========================================================================
 -- USER COMMANDS — paths, cheatsheet, project, platform, build, prepare
 -- ==========================================================================
@@ -7589,8 +7591,10 @@ function CORE_RT.generate_semantic_cdb_after_build(on_done, expected)
   return jobid
 end
 
-function CORE_RT.ios_setup_is_ready(ctx)
-  local state = read_state(ctx.engine_root)
+function CORE_RT.ios_setup_is_ready(ctx, dependencies)
+  dependencies = dependencies or {}
+  local state_reader = dependencies.read_state or read_state
+  local state = state_reader(ctx.engine_root)
   local signing = type(state.ios_signing_identity) == "table" and state.ios_signing_identity or {}
   local runtimes = type(state.target_runtime) == "table" and state.target_runtime or {}
   local runtime = type(runtimes.IOS) == "table" and runtimes.IOS or {}
@@ -7602,11 +7606,31 @@ function CORE_RT.ios_setup_is_ready(ctx)
     return false
   end
 
-  local driver = require("ue.targets").must_get("IOS")
+  local driver = dependencies.driver or require("ue.targets").must_get("IOS")
   local prepared = driver.prepared_signing_identity(ctx.project_root)
-  return prepared.ok == true
+  if not (
+    prepared.ok == true
     and prepared.found == true
     and prepared.identity.fingerprint == signing.fingerprint
+  ) then
+    return false
+  end
+  if runtime.device_backend == "legacy-mobiledevice" then
+    local resolve_install_script = dependencies.resolve_legacy_install_script
+      or resolve_ios_legacy_install_script
+    if type(resolve_install_script) ~= "function" then
+      return false
+    end
+    local script = resolve_install_script(ctx)
+    if not script then
+      return false
+    end
+  end
+  return true
+end
+
+function M._ios_setup_is_ready_for_test(ctx, dependencies)
+  return CORE_RT.ios_setup_is_ready(ctx, dependencies)
 end
 
 local function apple_build_evidence_tuple_matches(ctx, target_ctx, evidence)
@@ -8062,7 +8086,7 @@ do
     return existing
   end
 
-  local function resolve_ios_legacy_install_script(ctx)
+  resolve_ios_legacy_install_script = function(ctx)
     local configured = trim(vim.g.ue_ios_install_script or vim.env.UE_IOS_INSTALL_SCRIPT)
     local candidates = {}
     if configured ~= "" then
@@ -8711,7 +8735,8 @@ do
     })
   end
 
-  local function with_target_bundle_id(ctx, driver, target_ctx, host_driver, on_done)
+  local function with_target_bundle_id(ctx, driver, target_ctx, host_driver, on_done, dependencies)
+    dependencies = dependencies or {}
     local artifacts = target_ctx.artifacts
     if type(artifacts) ~= "table" or #artifacts == 0 then
       on_done(nil, nil,
@@ -8733,19 +8758,24 @@ do
       on_done(nil, nil, selected.reason)
       return
     end
-    local validated = type(driver.validate_bundle_id) == "function"
-        and driver.validate_bundle_id(target_ctx.bundle_id)
-      or { ok = false }
-    if validated.ok then
-      on_done(validated.bundle_id, artifacts)
+    if type(driver.bundle_id_plan) ~= "function" then
+      local validated = type(driver.validate_bundle_id) == "function"
+          and driver.validate_bundle_id(target_ctx.bundle_id)
+        or { ok = false }
+      if validated.ok then
+        on_done(validated.bundle_id, artifacts)
+        return
+      end
+      on_done(nil, nil, "bundle identifier probe is unavailable for the selected staged artifact")
       return
     end
     local probe = driver.bundle_id_plan(selected.app_path, host_driver, target_ctx)
-    local handle, run_err = require("ue.target_tasks").run(probe, {
+    local task_runner = dependencies.task_runner or require("ue.target_tasks")
+    local handle, run_err = task_runner.run(probe, {
       name = "UE " .. driver.id .. " bundle identifier",
       on_exit = function(result)
         if result.code ~= 0 then
-          on_done(nil, nil, require("ue.target_tasks").error_message(result))
+          on_done(nil, nil, task_runner.error_message(result))
           return
         end
         local bundle = driver.validate_bundle_id(trim(result.stdout))
@@ -8759,6 +8789,10 @@ do
     if not handle then
       on_done(nil, nil, run_err or "bundle identifier probe failed to start")
     end
+  end
+
+  function M._with_target_bundle_id_for_test(ctx, driver, target_ctx, host_driver, on_done, dependencies)
+    return with_target_bundle_id(ctx, driver, target_ctx, host_driver, on_done, dependencies)
   end
 
   function CORE_RT.install_target(platform)

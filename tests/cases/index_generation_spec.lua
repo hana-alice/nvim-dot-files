@@ -524,7 +524,8 @@ t.describe("ue.index generation manifests", function()
     write_file(input, vim.json.encode({ {
       directory = root,
       file = source,
-      command = 'clang++ -std=c++20 -c "' .. source .. '"',
+      provenance = { host_os = "Darwin" },
+      command = "clang++ -std=c++20 -DNAME='hello world' -c '" .. source .. "'",
     } }))
 
     local result = vim.system(python_command(
@@ -545,6 +546,7 @@ t.describe("ue.index generation manifests", function()
       t.assert_eq(#entries, 1)
       t.assert_type(entries[1].arguments, "table", path .. " must contain structured argv")
       t.assert_contains(entries[1].arguments, source)
+      t.assert_contains(entries[1].arguments, "-DNAME=hello world")
       t.assert_nil(entries[1].command, path .. " must not retain ambiguous command strings")
     end
 
@@ -579,6 +581,63 @@ t.describe("ue.index generation manifests", function()
     t.assert_type(entries[1].arguments, "table")
     t.assert_contains(entries[1].arguments, source)
     t.assert_nil(entries[1].command)
+
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("command-only normalization keeps Windows quoting while accepting POSIX producer syntax", function()
+    local root = canonical_temp_root("_command_parser_styles")
+    local input = root .. "/input.json"
+    local output = root .. "/output.json"
+    local script = root .. "/normalize.py"
+    local tools_dir = (vim.fn.stdpath("config") .. "/tools"):gsub("\\", "/")
+    local posix_source = root .. "/Engine/Source/Runtime/Sample/Private/Posix Command.cpp"
+    local windows_source = root .. "/Engine/Source/Runtime/Sample/Private/Windows Command.cpp"
+    write_file(posix_source, "// fixture\n")
+    write_file(windows_source, "// fixture\n")
+    write_file(input, vim.json.encode({
+      {
+        directory = root,
+        file = posix_source,
+        provenance = { host_os = "Darwin" },
+        command = "clang++ -DNAME='hello world' -c '" .. posix_source .. "'",
+      },
+      {
+        directory = root,
+        file = windows_source,
+        provenance = { host_os = "Windows" },
+        command = 'clang++.exe -DNAME="hello world" -c "' .. windows_source .. '"',
+      },
+    }))
+    write_file(script, table.concat({
+      "import json",
+      "import sys",
+      "sys.path.insert(0, " .. string.format("%q", tools_dir) .. ")",
+      "from cdb_argv import normalize_cdb, split_windows_command_line, split_windows_command_line_native",
+      "if sys.platform == 'win32':",
+      "    samples = [",
+      "        r'clang-cl.exe /DNAME=\\\"value with spaces\\\" \\\"C:\\\\Source Dir\\\\file.cpp\\\"',",
+      "        r'program \\\"a b\\\" c\\\\\\\\\\\"d \\\"e\\\\\\\\f\\\"',",
+      "        r'program \\\"\\\" tail',",
+      "    ]",
+      "    for sample in samples:",
+      "        assert split_windows_command_line(sample) == split_windows_command_line_native(sample)",
+      "with open(sys.argv[1], 'r', encoding='utf-8') as handle:",
+      "    entries = json.load(handle)",
+      "normalized, converted = normalize_cdb(entries)",
+      "with open(sys.argv[2], 'w', encoding='utf-8') as handle:",
+      "    json.dump({'entries': normalized, 'converted': converted}, handle)",
+      "",
+    }, "\n"))
+
+    local result = vim.system(python_command(script, input, output), { text = true }):wait()
+    t.assert_eq(result.code, 0, result.stderr or result.stdout)
+    local parsed = read_json(output)
+    t.assert_eq(parsed.converted, 2)
+    t.assert_eq(parsed.entries[1].arguments[#parsed.entries[1].arguments], posix_source)
+    t.assert_contains(parsed.entries[1].arguments, "-DNAME=hello world")
+    t.assert_eq(parsed.entries[2].arguments[#parsed.entries[2].arguments], windows_source)
+    t.assert_contains(parsed.entries[2].arguments, "-DNAME=hello world")
 
     pcall(vim.fn.delete, root, "rf")
   end)

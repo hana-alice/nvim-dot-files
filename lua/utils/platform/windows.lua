@@ -20,10 +20,6 @@ function M.shell_entry(kind)
     return "cmd.exe"
   end
   if kind == "powershell" then
-    if vim.fn.executable("pwsh") == 1 then return "pwsh" end
-    if vim.fn.executable("powershell.exe") == 1 or vim.fn.executable("powershell") == 1 then
-      return "powershell.exe"
-    end
     return "powershell.exe"
   end
   if kind == "default" then

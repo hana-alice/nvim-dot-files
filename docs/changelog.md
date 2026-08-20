@@ -45,6 +45,51 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-08-20 — Close self-review portability and evidence gaps before PR
+
+**Task**
+
+拉取 `origin` 最新 `feat/macos-ios-nvim` 后做合并前自审，将 fresh Windows 回归、Go 工具测试和独立代码审查
+揭示的问题在提 PR 前闭环。
+
+**Implemented**
+
+- `tools/cindex-uefilter/main.go` 在 Windows 增量发布时用短命子进程执行 upstream `index.Merge`，等 mmap/
+  writer handle 随子进程退出释放后再原子替换主索引；Go 回归锁住修改文件旧 trigram 消失、新文件可查且
+  无 `~`/`~~`/`.bak` 残留。
+- `lua/utils/platform/{macos,windows}.lua` 恢复确定性 host 契约：macOS POSIX shell 固定 `/bin/zsh`，显式
+  PowerShell capability 固定 `powershell.exe`；`lua/ue/targets/ios_signing.lua` 保留 prepared metadata 中的原始
+  provision path，仅用归一化副本做文件校验。
+- `lua/ue.lua` 在 IOS install/launch 前从当前 staged `.app/Info.plist` 重新解析 bundle id，不复用持久化旧值；
+  legacy setup readiness 每次重验 `InstallIOSClient.sh` 存在与可执行性。
+- `lua/utils/ue_goto/semantic_client.lua` 将 sidecar deadline 与已记录的 29–31s 冷查询对齐为 32s；
+  `tools/cdb_argv.py` 依 producer provenance/引号语法选 POSIX 或 Windows parser，并用无 Win32 API 依赖的
+  portable Windows splitter 支持跨 host 规范化。
+- `tools/ios_dap_protocol_probe.py` 只持久 PID digest，原始 PID 仅留在当次 attach 内存执行路径；同时修正
+  Windows 测试中 CDB candidate 路径归一化断言。
+
+**Pitfalls / Gotchas**
+
+- 历史条目记录的 `1021/1021` 是旧验证环境结果；本次 fresh Windows 全量实测为 `1014/1023`，直接证伪了
+  “当前远端 tip 跨环境全绿”这一推广。其中 8 项是 host/path/state 契约回归，1 项是 cindex 增量 merge 真实损坏；
+  修复后重跑而不保留旧结论。
+- `google/codesearch/index.Merge` 内部 mmap 无公开 close API；Windows 不能像 POSIX 一样在映射存活时 rename。
+  本仓不复制 upstream merge 实现，也不用 reflection/unsafe 穿透私有字段。
+- iOS DAP 生产 handler 仍保持 fail-closed unavailable；本次只修证据工具的隐私契约，不声称真机 DAP 已就绪。
+
+**Validation**
+
+- 定向：`platform` 23/23、`ue_target_drivers` 45/45、`ue_target_integration` 24/24、`ue_cdb` 31/31、
+  `csearch_build_guard` 22/22、`cpp_semantic_client` 15/15、`index_generation` 25/25、`ios_dap_probe` 3/3。
+- 工具：`go test ./...`、`go vet ./...`、Python `py_compile` 通过；`lint_no_bare_globals` 140 files OK；
+  `git diff --check` 通过。
+- 全量：`nvim --headless -l tests/run.lua` 1026/1026。
+
+**Follow-ups**
+
+- 32s semantic deadline 只比已观测的 31s 上界多 1s；若探针再出现合法冷查询 timeout，应基于新分位数证据
+  同步调整 request 与 live-health budget，不凭猜测继续放大。
+
 ### 2026-08-20 — Preserve target install progress in notification history
 
 **Task**

@@ -93,7 +93,7 @@ t.describe("ue.cdb.paths", function()
     local candidates = paths.candidates(ctx, { tuple = tuple })
     vim.fn.delete(root, "rf")
     t.assert_eq(candidates[1], semantic)
-    t.assert_eq(candidates[2], canonical)
+    t.assert_eq(candidates[2], require("ue.core.fs").norm(canonical))
   end)
 end)
 

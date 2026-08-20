@@ -546,8 +546,8 @@ end)
 t.describe("cpp semantic client: request timeout", function()
   t.it("aborts an unresponsive sidecar instead of leaving future requests queued", function()
     client._reset_for_test()
-    t.assert_true(client.REQUEST_TIMEOUT_MS <= 32000,
-      "semantic request timeout must stay inside the live-health budget")
+    t.assert_eq(client.REQUEST_TIMEOUT_MS, 32000,
+      "documented 31s cold lookups need 1s of slack without exceeding the 32s live-health budget")
     local job = vim.fn.jobstart({
       vim.v.progpath, "--headless", "-u", "NONE", "-c", "sleep 10", "-c", "qa",
     })

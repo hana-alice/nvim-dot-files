@@ -195,15 +195,16 @@ function M.load_prepared_config(project_root)
     })
   end
 
-  local provision = C.normalize_path(decoded.provision)
+  local provision = tostring(decoded.provision or "")
+  local provision_check_path = C.normalize_path(provision)
   local bundle_identifier = C.trim(decoded.bundleIdentifier)
   local team_identifier = C.trim(decoded.teamIdentifier)
-  if provision == "" or bundle_identifier == "" or team_identifier == "" then
+  if provision_check_path == "" or bundle_identifier == "" or team_identifier == "" then
     return C.unavailable(TARGET, "signing", "prepared signing metadata is missing profile or application identity", {
       path = path,
     })
   end
-  local provision_stat = vim.uv.fs_stat(provision)
+  local provision_stat = vim.uv.fs_stat(provision_check_path)
   if not provision_stat or provision_stat.type ~= "file" then
     return C.unavailable(TARGET, "signing", "prepared signing profile is no longer available", {
       path = path,

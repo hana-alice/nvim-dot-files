@@ -15,7 +15,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"runtime/pprof"
 	"sort"
 	"strings"
@@ -30,6 +32,8 @@ Like cindex, but with -files-from FILE: read absolute file paths
 exactly those files. Skips the walk entirely. Other cindex flags work
 identically.
 `
+
+const windowsIncrementalWorkerEnv = "CINDEX_UEFILTER_WINDOWS_INCREMENTAL_WORKER"
 
 func usage() {
 	fmt.Fprint(os.Stderr, usageMessage)
@@ -124,6 +128,52 @@ func filesFromIndexPaths(args, files []string, reset bool) []string {
 	return uniqueSortedStrings(paths)
 }
 
+func runIncrementalWorker() bool {
+	return os.Getenv(windowsIncrementalWorkerEnv) == "1"
+}
+
+func runIncrementalInChild() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	args := append([]string{}, os.Args[1:]...)
+	if os.Getenv("GO_WANT_CINDEX_UEFILTER_HELPER") == "1" {
+		args = append([]string{"-test.run=TestHelperProcess", "--"}, args...)
+	}
+	cmd := exec.Command(exe, args...)
+	cmd.Env = append(os.Environ(), windowsIncrementalWorkerEnv+"=1")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("incremental worker failed: %w", err)
+	}
+	return nil
+}
+
+func exactReplaceFile(dst, src string) error {
+	backup := dst + ".bak"
+	_ = os.Remove(backup)
+	hadDst := false
+	if err := os.Rename(dst, backup); err == nil {
+		hadDst = true
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("backup %s: %w", dst, err)
+	}
+	if err := os.Rename(src, dst); err != nil {
+		if hadDst {
+			_ = os.Rename(backup, dst)
+		}
+		return fmt.Errorf("publish %s: %w", dst, err)
+	}
+	if hadDst {
+		if err := os.Remove(backup); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("cleanup backup %s: %w", backup, err)
+		}
+	}
+	return nil
+}
+
 func main() {
 	flag.Usage = usage
 	flag.Parse()
@@ -153,9 +203,27 @@ func main() {
 	}
 
 	master := index.File()
-	if _, err := os.Stat(master); err != nil {
+	_, statErr := os.Stat(master)
+	masterExists := statErr == nil
+	if !masterExists {
 		*resetFlag = true
 	}
+	if runtime.GOOS == "windows" && masterExists && !*resetFlag && !runIncrementalWorker() {
+		if err := runIncrementalInChild(); err != nil {
+			log.Fatal(err)
+		}
+		file := master + "~"
+		merged := file + "~"
+		if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
+			log.Fatal(err)
+		}
+		if err := exactReplaceFile(master, merged); err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("done")
+		return
+	}
+
 	file := master
 	if !*resetFlag {
 		file += "~"
@@ -164,7 +232,7 @@ func main() {
 	ix := index.Create(file)
 	ix.Verbose = *verboseFlag
 
-	// ─── -files-from mode ────────────────────────────────────────────
+	// ─── -files-from mode ───────────────────────────
 	if *filesFromFlag != "" {
 		files, skipped, err := readFilesFromList(*filesFromFlag)
 		if err != nil {
@@ -184,7 +252,7 @@ func main() {
 		}
 		log.Printf("indexed %d files (%d skipped)", count, skipped)
 	} else {
-		// ─── Original walk mode (unchanged from cindex) ──────────────
+		// ─── Original walk mode (unchanged from cindex) ─────────────
 		if len(args) == 0 {
 			ix2 := index.Open(index.File())
 			for _, arg := range ix2.Paths() {
@@ -232,10 +300,17 @@ func main() {
 	ix.Flush()
 
 	if !*resetFlag {
+		merged := file + "~"
 		log.Printf("merge %s %s", master, file)
-		index.Merge(file+"~", master, file)
-		os.Remove(file)
-		os.Rename(file+"~", master)
+		if runtime.GOOS == "windows" && runIncrementalWorker() {
+			index.Merge(merged, master, file)
+		} else if runtime.GOOS == "windows" {
+			log.Fatal("windows incremental merge must run in worker mode")
+		} else {
+			index.Merge(merged, master, file)
+			os.Remove(file)
+			os.Rename(merged, master)
+		}
 	}
 	log.Printf("done")
 }

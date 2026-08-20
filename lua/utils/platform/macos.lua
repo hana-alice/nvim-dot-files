@@ -31,9 +31,7 @@ function M.shell_entry(kind)
   if kind ~= "default" and kind ~= "posix" then
     return nil, "unsupported shell on macOS host: " .. tostring(kind)
   end
-  if vim.fn.executable("zsh") == 1 then return "/bin/zsh" end
-  if vim.fn.executable("bash") == 1 then return "/bin/bash" end
-  return vim.o.shell ~= "" and vim.o.shell or "/bin/sh"
+  return "/bin/zsh"
 end
 
 function M.shell()

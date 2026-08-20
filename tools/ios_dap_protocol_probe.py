@@ -44,6 +44,10 @@ def digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", "surrogateescape")).hexdigest()[:12]
 
 
+def pid_digest(value: int | str) -> str:
+    return digest(f"pid:{value}")
+
+
 def redact_text(value: str, *sensitive: str) -> str:
     redacted = value
     for item in sorted((item for item in sensitive if item), key=len, reverse=True):
@@ -58,6 +62,18 @@ def path_evidence(value: str) -> dict[str, str]:
     if resolved.startswith(("/Applications/", "/usr/", "/Library/")):
         evidence["system_path"] = resolved
     return evidence
+
+
+def attach_identity(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "device_digest": digest(args.device),
+        "bundle_digest": digest(args.bundle_id),
+        "pid_digest": pid_digest(args.pid),
+        "binary": path_evidence(args.binary),
+        "dsym": path_evidence(args.dsym),
+        "source": {"name": Path(args.source).name, "line": args.line},
+        "adapter": path_evidence(args.adapter),
+    }
 
 
 def command(
@@ -673,15 +689,7 @@ def attach(args: argparse.Namespace) -> int:
         "schema": SCHEMA,
         "mode": "attach",
         "status": "failed",
-        "identity": {
-            "device_digest": digest(args.device),
-            "bundle_digest": digest(args.bundle_id),
-            "pid": args.pid,
-            "binary": path_evidence(args.binary),
-            "dsym": path_evidence(args.dsym),
-            "source": {"name": Path(args.source).name, "line": args.line},
-            "adapter": path_evidence(args.adapter),
-        },
+        "identity": attach_identity(args),
         "checks": {},
         "errors": [],
     }
@@ -731,6 +739,7 @@ def attach(args: argparse.Namespace) -> int:
             str(error),
             args.device,
             args.bundle_id,
+            str(args.pid),
             args.binary,
             args.dsym,
             args.source,
@@ -790,7 +799,27 @@ def self_test(args: argparse.Namespace) -> int:
     assert "DeviceIdentifier" not in legacy_evidence
     assert "DeviceName" not in legacy_evidence
     assert expected_legacy_symbols_root(legacy) == "iPhone13,2 15.4.1 (19E258)"
-    payload = {"schema": SCHEMA, "mode": "self-test", "status": "passed"}
+    attach_identity_example = attach_identity(argparse.Namespace(
+        device="PRIVATE-DEVICE-ID",
+        bundle_id="com.example.game",
+        pid=4242,
+        binary="/private/example/MyGame",
+        dsym="/private/example/MyGame.dSYM",
+        source="/private/example/Game.cpp",
+        line=7,
+        adapter="/Applications/Xcode.app/Contents/Developer/usr/bin/lldb-dap",
+    ))
+    encoded_identity = json.dumps(attach_identity_example, sort_keys=True)
+    assert '"pid":' not in encoded_identity
+    assert '"pid_digest":' in encoded_identity
+    assert "4242" not in encoded_identity
+    assert attach_identity_example["pid_digest"] == pid_digest(4242)
+    payload = {
+        "schema": SCHEMA,
+        "mode": "self-test",
+        "status": "passed",
+        "attach_identity_example": attach_identity_example,
+    }
     emit(payload, args.output)
     return 0
 

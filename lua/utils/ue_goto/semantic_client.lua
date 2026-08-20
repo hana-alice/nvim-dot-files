@@ -10,6 +10,12 @@ local runtime_helper = require("utils.ue_goto.semantic_client_runtime")
 
 local M = {}
 
+-- Cold UE module lookups are documented at ~29-31s, so the host-side deadline
+-- keeps 1s of slack while staying within the 32s live-health budget.
+local COLD_LOOKUP_EVIDENCE_MS = 31000
+local REQUEST_TIMEOUT_SLACK_MS = 1000
+local REQUEST_TIMEOUT_MS = COLD_LOOKUP_EVIDENCE_MS + REQUEST_TIMEOUT_SLACK_MS
+
 local state = {
   job = nil,
   stdout_tail = "",
@@ -38,7 +44,7 @@ local runtime = runtime_helper.install(M, {
   state = state,
   uv = vim.uv or vim.loop,
   SIDECAR_NAME = "ue-clang-semanticd",
-  REQUEST_TIMEOUT_MS = 30000,
+  REQUEST_TIMEOUT_MS = REQUEST_TIMEOUT_MS,
   IDLE_EVICT_MS = 30000,
 })
 

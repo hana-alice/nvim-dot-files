@@ -218,6 +218,51 @@ t.describe("ue.targets build planners", function()
     end
   end)
 
+  t.it("recovers IOS build evidence only from an exact UBT receipt with its launch product", function()
+    local project_dir = vim.fn.tempname() .. "-ios-build-evidence"
+    local binaries_dir = project_dir .. "/Binaries/IOS"
+    vim.fn.mkdir(binaries_dir, "p")
+    vim.fn.writefile({ "fixture" }, binaries_dir .. "/SampleGame")
+    vim.fn.writefile({ vim.json.encode({
+      TargetName = "SampleGame",
+      Platform = "IOS",
+      Configuration = "Development",
+      Launch = "$(ProjectDir)/Binaries/IOS/SampleGame",
+    }) }, binaries_dir .. "/SampleGame.target")
+
+    local ios = targets.must_get("IOS")
+    local evidence, err = ios.build_receipt_evidence({
+      project_dir = project_dir,
+      target = "SampleGame",
+      platform = "IOS",
+      configuration = "Development",
+    })
+    local wrong_configuration = ios.build_receipt_evidence({
+      project_dir = project_dir,
+      target = "SampleGame",
+      platform = "IOS",
+      configuration = "Shipping",
+    })
+    vim.fn.delete(binaries_dir .. "/SampleGame")
+    local missing_product = ios.build_receipt_evidence({
+      project_dir = project_dir,
+      target = "SampleGame",
+      platform = "IOS",
+      configuration = "Development",
+    })
+    vim.fn.delete(project_dir, "rf")
+
+    t.assert_eq(err, nil)
+    t.assert_eq(evidence.target, "SampleGame")
+    t.assert_eq(evidence.platform, "IOS")
+    t.assert_eq(evidence.configuration, "Development")
+    t.assert_contains(evidence.receipt_path, "/Binaries/IOS/SampleGame.target")
+    t.assert_contains(evidence.launch_path, "/Binaries/IOS/SampleGame")
+    t.assert_true(type(evidence.completed_at) == "string" and evidence.completed_at ~= "")
+    t.assert_nil(wrong_configuration)
+    t.assert_nil(missing_product)
+  end)
+
   t.it("IOS semantic CDB plan builds only the tuple action graph", function()
     local plan = targets.plan("IOS", "semantic_cdb", {
       engine_root = "/UE",
@@ -239,6 +284,7 @@ t.describe("ue.targets build planners", function()
     t.assert_false(vim.tbl_contains(plan.args, "BuildCookRun"))
     t.assert_false(vim.tbl_contains(plan.args, "-cook"))
     t.assert_false(vim.tbl_contains(plan.args, "-package"))
+    t.assert_eq(plan.env.bSkipAOTProcess, "true")
   end)
 
   t.it("IOS semantic CDB validator requires IOS compiler evidence", function()
@@ -584,6 +630,187 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
     t.assert_contains(launch_plan.args, "/tmp/launch.json")
   end)
 
+  t.it("discovers connected pre-iOS17 USB devices through structured xcdevice fallback", function()
+    local plan = ios.fallback_device_list_plan({}, host_stub())
+    local parsed = ios.parse_fallback_device_list(vim.json.encode({
+      {
+        simulator = false,
+        available = true,
+        platform = "com.apple.platform.iphoneos",
+        interface = "usb",
+        identifier = "00008101-000C699E2640001E",
+        name = "Legacy iPhone",
+        modelName = "iPhone 12",
+        operatingSystemVersion = "15.4.1 (19E258)",
+      },
+      {
+        simulator = false,
+        available = true,
+        platform = "com.apple.platform.iphoneos",
+        interface = "usb",
+        identifier = "MODERN-DEVICE",
+        name = "Modern iPhone",
+        operatingSystemVersion = "18.5 (22F76)",
+      },
+      {
+        simulator = true,
+        available = true,
+        platform = "com.apple.platform.iphonesimulator",
+        identifier = "SIMULATOR",
+        operatingSystemVersion = "15.4",
+      },
+      {
+        simulator = false,
+        available = true,
+        platform = "com.apple.platform.iphoneos",
+        interface = "network",
+        identifier = "NETWORK-LEGACY",
+        operatingSystemVersion = "16.6",
+      },
+      {
+        simulator = false,
+        available = false,
+        platform = "com.apple.platform.iphoneos",
+        interface = "usb",
+        identifier = "OFFLINE-LEGACY",
+        operatingSystemVersion = "16.6",
+      },
+    }))
+
+    t.assert_eq(plan.executable, "/usr/bin/xcrun")
+    t.assert_eq(table.concat(plan.args, " "), "xcdevice list --timeout 5")
+    t.assert_eq(plan.metadata.result_source, "stdout")
+    t.assert_true(parsed.ok)
+    t.assert_eq(#parsed.devices, 1)
+    t.assert_eq(parsed.devices[1].id, "00008101-000C699E2640001E")
+    t.assert_eq(parsed.devices[1].name, "Legacy iPhone")
+    t.assert_eq(parsed.devices[1].os_version, "15.4.1")
+    t.assert_eq(parsed.devices[1].backend, "legacy-mobiledevice")
+  end)
+
+  t.it("routes a tuple-scoped app through the prepared legacy install helper", function()
+    local install = ios.install_plan({
+      device_id = "LEGACY-DEVICE",
+      device_backend = "legacy-mobiledevice",
+      legacy_install_script = "/Tools/InstallIOSClient.sh",
+      legacy_signing = {
+        identity = SIGNING_IDENTITY,
+        provision = "/Profiles/development.mobileprovision",
+        bundle_identifier = "com.example.legacy",
+      },
+      project_dir = "/Project",
+      target = "SampleGame",
+      configuration = "Development",
+      artifacts = {
+        {
+          path = "/Stage/IOS/Development/Payload/SampleGame.app",
+          platform = "IOS",
+          target = "SampleGame",
+          configuration = "Development",
+        },
+      },
+    }, host_stub())
+    local launch = ios.launch_plan({
+      device_id = "LEGACY-DEVICE",
+      device_backend = "legacy-mobiledevice",
+      bundle_id = "com.example.samplegame",
+      json_output = "/tmp/launch.json",
+    }, host_stub())
+
+    t.assert_eq(install.executable, "/Tools/InstallIOSClient.sh")
+    t.assert_eq(install.metadata.backend, "legacy-mobiledevice")
+    t.assert_eq(install.metadata.bundle_id, "com.example.legacy")
+    t.assert_contains(install.args, "--app")
+    t.assert_contains(install.args, "/Stage/IOS/Development/Payload/SampleGame.app")
+    t.assert_contains(install.args, "--identity")
+    t.assert_contains(install.args, SIGNING_IDENTITY.fingerprint)
+    t.assert_contains(install.args, "--provision")
+    t.assert_contains(install.args, "/Profiles/development.mobileprovision")
+    t.assert_contains(install.args, "--bundle-id")
+    t.assert_contains(install.args, "com.example.legacy")
+    t.assert_contains(install.args, "--device-backend")
+    t.assert_contains(install.args, "legacy")
+    t.assert_eq(launch.status, "unavailable")
+    t.assert_contains(launch.reason, "CoreDevice")
+  end)
+
+  t.it("fails closed when legacy install lacks prepared signing evidence", function()
+    local plan = ios.install_plan({
+      device_id = "LEGACY-DEVICE",
+      device_backend = "legacy-mobiledevice",
+      legacy_install_script = "/Tools/InstallIOSClient.sh",
+      target = "SampleGame",
+      configuration = "Development",
+      artifacts = {
+        {
+          path = "/Stage/IOS/Development/Payload/SampleGame.app",
+          platform = "IOS",
+          target = "SampleGame",
+          configuration = "Development",
+        },
+      },
+    }, host_stub())
+
+    t.assert_eq(plan.status, "unavailable")
+    t.assert_contains(plan.reason, "prepared signing")
+  end)
+
+  t.it("turns the opaque keychain signing failure into an actionable legacy install error", function()
+    local reason = ios.install_failure_reason({
+      code = 1,
+      stderr = "/tmp/Client.app: errSecInternalComponent",
+    }, {
+      metadata = { backend = "legacy-mobiledevice" },
+    })
+
+    t.assert_contains(reason, "unlock the login keychain")
+    t.assert_contains(reason, "/usr/bin/codesign")
+  end)
+
+  t.it("explains when a legacy iPhone is physically attached but blocked below usbmuxd", function()
+    local precise = ios.install_failure_reason({
+      code = 1,
+      stderr = "Device '00008101-000C699E2640001E' is physically connected over USB "
+        .. "but unavailable to usbmuxd/MobileDevice.",
+    }, {
+      metadata = { backend = "legacy-mobiledevice" },
+    })
+
+    local legacy = ios.install_failure_reason({
+      code = 1,
+      stderr = "Unable to select a usable legacy USB device: device "
+        .. "'00008101-000C699E2640001E' matched 0 usable legacy USB devices",
+    }, {
+      metadata = { backend = "legacy-mobiledevice" },
+    })
+
+    for _, reason in ipairs({ precise, legacy }) do
+      t.assert_contains(reason, "unlock the iPhone")
+      t.assert_contains(reason, "Trust This Computer")
+      t.assert_contains(reason, "USB accessories")
+    end
+  end)
+
+  t.it("streams legacy signing and device upgrade stages into install progress", function()
+    local events = {}
+    local feed = ios.install_progress_tracker(function(message, percentage)
+      events[#events + 1] = { message = message, percentage = percentage }
+    end)
+
+    feed("\27[36m==> Clone and sign code app\27[0m\n")
+    feed("Copying '/tmp/legacy-install.ipa' to device...\nUpgrade: Verif")
+    feed("yingApplication (40%)\rUpgrade: Complete\n")
+    feed("\27[32m[OK] Legacy app update installed without uninstall\27[0m\n")
+
+    t.assert_eq(events[1].message, "Signing iOS app")
+    t.assert_eq(events[1].percentage, 20)
+    t.assert_eq(events[2].message, "Uploading iOS app")
+    t.assert_eq(events[3].message, "Installing on iPhone: VerifyingApplication")
+    t.assert_eq(events[3].percentage, 68)
+    t.assert_eq(events[#events].message, "iOS app installed")
+    t.assert_eq(events[#events].percentage, 100)
+  end)
+
   t.it("selects the staged app by tuple provenance and rejects ipa-only fallbacks", function()
     local selected = ios.select_staged_artifact({
       {
@@ -762,12 +989,19 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
     t.assert_eq(missing.status, "unavailable")
     t.assert_contains(missing.reason, "UESetIOSSigningCertificate")
 
-    local context = { signing_identity = SIGNING_IDENTITY }
+    local context = {
+      config_root = "/NvimConfig",
+      signing_identity = SIGNING_IDENTITY,
+    }
     local descriptor = ios.preflight_plans("package", context, host_stub())
     t.assert_true(descriptor.ok)
-    t.assert_eq(#descriptor.plans, 2)
+    t.assert_eq(#descriptor.plans, 3)
     t.assert_contains(descriptor.plans[1].args, "iphoneos")
     t.assert_contains(descriptor.plans[2].args, "codesigning")
+    t.assert_eq(descriptor.plans[3].executable, "/bin/zsh")
+    t.assert_eq(descriptor.plans[3].args[1], "/NvimConfig/scripts/ue_ios_codesign_probe.zsh")
+    t.assert_eq(descriptor.plans[3].args[2], SIGNING_IDENTITY.fingerprint)
+    t.assert_eq(descriptor.plans[3].metadata.preflight, "codesign-private-key")
 
     local valid = ios.validate_preflight("package", {
       {
@@ -780,6 +1014,11 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
         stdout = '  1) 0123456789ABCDEF0123456789ABCDEF01234567 "Apple Development: Example User (TEAM123456)"\n'
           .. "     1 valid identities found\n",
         plan = descriptor.plans[2],
+      },
+      {
+        code = 0,
+        stdout = "codesign private-key probe passed\n",
+        plan = descriptor.plans[3],
       },
     }, context)
     local unsigned = ios.validate_preflight("package", {
@@ -877,13 +1116,28 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
 
   t.it("allows unsigned build preflight but verifies an explicit build identity", function()
     local unsigned = ios.preflight_plans("build", {}, host_stub())
-    local signed = ios.preflight_plans("build", { signing_identity = SIGNING_IDENTITY }, host_stub())
+    local signed = ios.preflight_plans("build", {
+      config_root = "/NvimConfig",
+      signing_identity = SIGNING_IDENTITY,
+    }, host_stub())
 
     t.assert_true(unsigned.ok)
     t.assert_eq(#unsigned.plans, 1)
     t.assert_true(signed.ok)
-    t.assert_eq(#signed.plans, 2)
+    t.assert_eq(#signed.plans, 3)
     t.assert_contains(signed.plans[2].args, "codesigning")
+    t.assert_eq(signed.plans[3].metadata.preflight, "codesign-private-key")
+  end)
+
+  t.it("keeps the private-key probe scoped to an owned temporary Mach-O", function()
+    local path = vim.fn.stdpath("config") .. "/scripts/ue_ios_codesign_probe.zsh"
+    local source = table.concat(vim.fn.readfile(path), "\n")
+
+    t.assert_contains(source, "/usr/bin/mktemp -d")
+    t.assert_contains(source, 'trap cleanup EXIT HUP INT TERM')
+    t.assert_contains(source, '/bin/cp /usr/bin/true "$probe_root/probe"')
+    t.assert_contains(source, '/usr/bin/codesign --force --sign "$identity"')
+    t.assert_contains(source, '/bin/rm -rf -- "$probe_root"')
   end)
 
   t.it("exposes stage-specific preflight descriptors owned by the iOS driver", function()

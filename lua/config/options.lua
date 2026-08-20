@@ -1,6 +1,10 @@
 vim.g.root_spec = { "cwd" }
 vim.g.autoformat = false
 
+-- Persistent Zellij sessions can hide SSH_TTY from Nvim's OSC 52 detection.
+-- Install the provider before LazyVim initializes clipboard support.
+require("config.clipboard").setup()
+
 local opt = vim.opt
 
 -- Keep sessions from silently restoring a different cwd without replaying fold state.
@@ -89,6 +93,30 @@ vim.api.nvim_create_autocmd({ "FileType", "BufEnter" }, {
   group = commentstring_group,
   callback = function(args)
     ensure_commentstring(args.buf)
+  end,
+})
+
+-- Apple UBT can compile files whose extension is still .cpp/.h with
+-- `-x objective-c++`. Resolve only the current buffer's existing exact command
+-- so mixed ObjC++ syntax remains available whenever clangd is deferred for
+-- missing/stale artifacts; this lookup does not build, index, or launch LSP.
+local compile_language_group = vim.api.nvim_create_augroup("UECompileLanguageSyntax", { clear = true })
+vim.api.nvim_create_autocmd({ "FileType", "BufEnter" }, {
+  group = compile_language_group,
+  callback = function(args)
+    local bufnr = args.buf
+    if not vim.api.nvim_buf_is_valid(bufnr) or not vim.api.nvim_buf_is_loaded(bufnr) then return end
+    local bo = vim.bo[bufnr]
+    if (bo.filetype ~= "cpp" and bo.filetype ~= "c") or bo.buftype ~= "" then return end
+    if vim.api.nvim_buf_get_name(bufnr) == "" then return end
+
+    local ok_ue, ue = pcall(require, "ue")
+    if not ok_ue then return end
+    local ok_root, root = pcall(ue.clangd_root, bufnr)
+    if not ok_root or not root then return end
+    local ok_cmd, resolved_cmd = pcall(ue.clangd_cmd, root)
+    if not ok_cmd or type(resolved_cmd) ~= "table" then return end
+    pcall(require("ue.clangd_commands").detect_syntax, bufnr, resolved_cmd)
   end,
 })
 

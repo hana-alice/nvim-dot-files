@@ -127,6 +127,23 @@ local function make_manifest(ctx, state, phase, content, keys, completed_at)
 end
 
 t.describe("ue.index generation manifests", function()
+  t.it("hashes generation maps with canonical key ordering", function()
+    local first = index._stable_hash_for_test({
+      toolchain_identity = "toolchain",
+      build_key = "build",
+      cdb_digest = "cdb",
+    })
+    local second = index._stable_hash_for_test({
+      cdb_digest = "cdb",
+      toolchain_identity = "toolchain",
+      build_key = "build",
+    })
+    local canonical = '{"build_key":"build","cdb_digest":"cdb","toolchain_identity":"toolchain"}'
+    t.assert_eq(first, vim.fn.sha256(canonical))
+    t.assert_eq(second, first,
+      "generation identity must survive Lua hash randomization across Nvim processes")
+  end)
+
   t.it("rejects a phase build while another Neovim owns the platform artifacts", function()
     local ctx = make_ctx("foreign_writer")
     local lock = require("ue.file_lock")
@@ -844,8 +861,50 @@ t.describe("ue.index selector monotonicity", function()
 end)
 
 t.describe("ue.index status summary", function()
+  t.it("publishes only standard compilation-database fields to clangd", function()
+    local ctx = make_ctx("clangd_cdb_schema")
+    local state = seed_state(ctx)
+    local generation = index.generation_for_context(ctx)
+    local full = make_manifest(ctx, state, "full", "full-schema", {
+      "module:/A", "module:/B", "module:/C",
+    }, 10)
+    state.index_artifacts.full = full
+
+    local controlled = read_json(full.background_cdb_path)
+    controlled[1].output = "SuperUnity.full.o"
+    controlled[1].nvim_ue_members = { "Source/Runtime/A/Private/A.cpp" }
+    controlled[1].nvim_ue_module_root = "Source/Runtime/A"
+    write_file(full.background_cdb_path, vim.json.encode(controlled))
+
+    t.assert_true(index.publish_semantic_cdb(ctx, state, generation))
+    local published = read_json(ctx.paths.semantic_cdb)
+    t.assert_eq(#published, 1)
+    t.assert_eq(published[1].output, "SuperUnity.full.o",
+      "the standard optional output field must survive publication")
+    t.assert_nil(published[1].nvim_ue_members,
+      "clangd rejects provenance extensions in compile_commands.json")
+    t.assert_nil(published[1].nvim_ue_module_root,
+      "portable provenance belongs in phase artifacts, not clangd's CDB")
+    for key in pairs(published[1]) do
+      t.assert_true(({
+        directory = true,
+        file = true,
+        arguments = true,
+        command = true,
+        output = true,
+      })[key] == true, "unexpected clangd CDB field: " .. tostring(key))
+    end
+
+    cleanup_ctx(ctx)
+  end)
+
   t.it("provides a cheap navigation snapshot and rejects a changed CDB", function()
     local ctx = make_ctx("semantic_snapshot")
+    ctx.state = {
+      target = "SampleGame",
+      target_platform = "Android",
+      target_configuration = "Test",
+    }
     local state = seed_state(ctx)
     local full = make_manifest(ctx, state, "full", "full-navigation", {
       "module:/A", "module:/B", "module:/C",
@@ -860,6 +919,12 @@ t.describe("ue.index status summary", function()
     t.assert_eq(ready.readiness, "ready")
     t.assert_eq(ready.coverage_level, "full")
     t.assert_true(ready.complete)
+
+    ctx.state.target = "SampleGameClient"
+    local wrong_tuple = index.semantic_index_snapshot(ctx)
+    t.assert_eq(wrong_tuple.readiness, "stale")
+    t.assert_eq(wrong_tuple.freshness, "stale")
+    ctx.state.target = "SampleGame"
 
     write_file(ctx.engine_root .. "/compile_commands.json",
       '[{"file":"A.cpp","directory":"C:/fake","arguments":["clang++","A.cpp","-DSTALE=1"]}]')
@@ -937,5 +1002,28 @@ t.describe("ue.index status summary", function()
       "coverage summary must not expose absolute paths")
 
     cleanup_ctx(ctx)
+  end)
+end)
+
+t.describe("ue.index clangd promotion wake", function()
+  t.it("starts loaded C++ buffers when a new prepared artifact appears before any clangd client", function()
+    local started = {}
+    index._rt.last_restart_at = 0
+    index.maybe_restart_clangd_for_index({
+      now = function() return 100 end,
+      get_clients = function() return {} end,
+      list_bufs = function() return { 17, 18 } end,
+      buffer_valid = function() return true end,
+      buffer_loaded = function() return true end,
+      buffer_filetype = function(bufnr) return bufnr == 17 and "cpp" or "lua" end,
+      defer_fn = function(callback, delay)
+        t.assert_eq(delay, 500)
+        callback()
+      end,
+      start_clangd = function(bufnr) started[#started + 1] = bufnr end,
+    })
+
+    t.assert_eq(#started, 1)
+    t.assert_eq(started[1], 17)
   end)
 end)

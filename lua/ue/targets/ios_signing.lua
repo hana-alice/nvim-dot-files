@@ -262,6 +262,21 @@ function M.preflight_plans(stage, context, host_driver)
       "-p",
       "codesigning",
     }, { preflight = "codesign-identity" })
+
+    local config_root = C.normalize_path(context and context.config_root)
+    if config_root == "" then
+      return C.unavailable(TARGET, stage, "config_root is required for the codesign private-key probe", {
+        required = { "config_root" },
+      })
+    end
+    local shell, shell_unavailable = C.resolve_host_shell(host_driver, "posix", context, TARGET, stage)
+    if not shell then
+      return shell_unavailable
+    end
+    plans[#plans + 1] = C.with_appended_args(shell, {
+      C.join_path(config_root, "scripts", "ue_ios_codesign_probe.zsh"),
+      signing_identity.fingerprint,
+    }, { preflight = "codesign-private-key" })
   end
 
   return { ok = true, plans = plans }

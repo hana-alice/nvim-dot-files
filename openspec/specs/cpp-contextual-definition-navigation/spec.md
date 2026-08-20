@@ -15,6 +15,22 @@ C++ `gd` SHALL 只接受当前 active build generation 下由 compiler-owned ide
 - **THEN** 系统 SHALL 跳转到该 definition
 - **AND** 跳转结果 SHALL NOT 被任何文本候选覆盖
 
+#### Scenario: Source TU uses the transported exact command
+- **WHEN** 当前 source TU 已由 controlled active CDB 提供 exact compile command 并传给 clangd
+- **THEN** `gd` SHALL 在不可变光标 snapshot 上向同一 clangd client 请求 canonical USR 与 definition
+- **AND** MUST NOT 为每次 source `gd` 在 sidecar 中重新读取或解析全量 CDB
+- **AND** 进入 header 时 SHALL 把该 exact command 记录为后续 header-in-context 的 origin TU evidence
+
+#### Scenario: First gd follows a cold clangd restart
+- **WHEN** source 不属于 synthetic background CDB，clangd 已先用邻近 TU 推断命令打开该 buffer
+- **THEN** exact-command transport SHALL 对同一 client/command 有界执行一次 `didClose → command update → didOpen`
+- **AND** canonical USR 请求 SHALL 等待冷 UE preamble 的统一 provider hard ceiling，第一次 `gd` 即可得到语义结果
+
+#### Scenario: A C++-extension source is compiled as Objective-C++
+- **WHEN** exact compile command 以 `-x objective-c++` 或 `-x objective-c++-header` 证明 `.cpp` / `.h` 的真实语言
+- **THEN** buffer SHALL 保留 `cpp` filetype 与 C++ Tree-sitter parser，并叠加 mixed `objcpp` syntax
+- **AND** 普通 C/C++ compile command 与其他平台 SHALL NOT 启用该 Objective-C syntax overlay
+
 #### Scenario: Only a declaration is currently reachable
 - **WHEN** canonical entity 已证明，但当前 index coverage 只能提供 declaration
 - **THEN** 系统 MAY 跳转到同一 identity 的 declaration，并 SHALL 标注 definition destination 尚未闭环的结构化原因

@@ -125,7 +125,8 @@ blocked until an index is prepared.
 
 ## Usage
 
-Open a C++ file inside the UE project, then proceed in order.
+Open a C++ file inside the UE project. Project and platform selection are
+independent: steps 1 and 2 may be performed in either order.
 
 ### 1. Bind the project
 
@@ -148,25 +149,15 @@ Choose `Win64`, `Android`, `Mac`, `IOS` or `Linux`. If unset, the current OS is
 used. Caches are stored per `<Platform>-<Config>`, so switching platforms does
 not invalidate other platforms' caches.
 
-### 3. Compile for editor semantics
+### 3. Build the selected target
 
 ```
 <leader>ub        " (space u b) → :UEBuild
 ```
 
-Use `:UECompileForNvim` for the complete compiler-semantic workflow: it verifies
-the pinned clangd 22.1.x toolchain, builds the selected target, then prepares the
-compiler database and index. On IOS, where Apple builds do not retain C++
-response files, the same build terminal continues with UBT's tuple-scoped
-`GenerateClangDatabase` action-graph pass; this does not compile, cook, or
-package. Controlled background indexing can still reuse an active UBT unity
-wrapper when every included member resolves uniquely and has the same exact
-Apple compiler argv after ignoring only per-file output writes; otherwise it
-keeps the original per-file commands. Tree-sitter syntax highlighting works
-without this; clangd navigation and diagnostics require the compiler database.
-
-`:UEBuild` remains build-only. `:UEPrepare` remains prepare-only for users who
-already have fresh response files or a validated tuple-scoped semantic source.
+`:UEBuild` remains build-only. With IOS selected, `<leader>ub` uses the same IOS
+target driver as `:UEBuildIOS`. Wait for it to finish before preparing; build and
+prepare intentionally never overlap.
 
 ### 4. Build the index
 
@@ -174,10 +165,18 @@ already have fresh response files or a validated tuple-scoped semantic source.
 :UEPrepare
 ```
 
-Runs asynchronously with a progress UI: generates `compile_commands.json`, runs
-the CDB pipeline (expand → PCH → resolve → unify → prune), builds the csearch
-index, and reloads clangd. On completion, goto-definition, project grep and
-clangd are ready.
+Runs asynchronously with a progress UI. For an IOS target on macOS, it first
+validates the pinned clangd 22.1.x toolchain and generates the tuple-scoped UBT
+semantic CDB that the IOS build does not retain; it also imports prepared signing
+evidence and selects the device on first use. This IOS prelude uses `GenerateClangDatabase` with no compile,
+cook, package, deploy, or run actions. All targets then generate
+`compile_commands.json`, run the CDB pipeline (expand → PCH → resolve → unify →
+prune), build the csearch index, and reload clangd.
+
+`:UECompileForNvim` remains as a compatibility convenience that performs a build
+and then delegates to this same `:UEPrepare` path; it is not required by the
+normal workflow. Tree-sitter syntax highlighting works without a CDB, while
+clangd navigation and diagnostics require it.
 
 Variants: `:UEPrepareIncremental` (dirty files only), `:UEPrepareReindex`
 (rebuild the index), `:UEPrepareSync` (blocking).
@@ -190,7 +189,7 @@ Variants: `:UEPrepareIncremental` (dirty files only), `:UEPrepareReindex`
 | Project-wide grep | `<leader>/` |
 | File picker | `<leader><leader>` |
 | Build (current platform) | `<leader>ub` / `:UEBuild` |
-| Build + prepare compiler semantics | `:UECompileForNvim` |
+| Compatibility: build, then run the normal prepare path | `:UECompileForNvim` |
 | Build IOS C++ only (safe AOT reuse, no automatic dSYM) | `:UEBuildIOS` |
 | Package IOS from existing cooked data | `:UEPackageIOS` |
 | Generate and UUID-check IOS dSYM on demand | `:UEIOSSymbols` |
@@ -203,6 +202,11 @@ Variants: `:UEPrepareIncremental` (dirty files only), `:UEPrepareReindex`
 | Android: install without launch / attach / breakpoint | `<leader>ui` / `:UEDAPAttach` / `F9` |
 | Background tasks: list / stop | `<leader>X` / `:Tasks` / `:TaskStopAll` |
 | All commands cheatsheet | `<leader>?` / `:UECheatsheet` |
+
+After `PrepareIOSQADebug.sh` and `InstallIOSClient.sh` succeed, the complete IOS
+flow is `:UESetProject` and `:UESetPlatform IOS` in either order, then
+`<leader>ub` → `:UEPrepare` → `<leader>ui`. The IOS prepare branch owns the
+one-time signing/private-key/device setup and Apple semantic CDB generation.
 
 Full keymap and workflow handbook:
 [`docs/ue_lazyvim_cheatsheet.md`](docs/ue_lazyvim_cheatsheet.md).

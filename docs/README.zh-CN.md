@@ -110,7 +110,7 @@ go install ./...   # 需 Go >= 1.22，且 $GOBIN 在 PATH
 
 ## 使用
 
-在 UE 工程内打开一个 C++ 文件，按顺序操作。
+在 UE 工程内打开一个 C++ 文件。工程与平台选择已经解耦，步骤 1、2 可按任意顺序执行。
 
 ### 1. 绑定工程
 
@@ -131,19 +131,14 @@ go install ./...   # 需 Go >= 1.22，且 $GOBIN 在 PATH
 选择 `Win64`、`Android`、`Mac`、`IOS` 或 `Linux`。不设则按当前 OS。缓存按
 `<Platform>-<Config>` 分别存储，切换平台不会使其它平台缓存失效。
 
-### 3. 为编辑器语义编译
+### 3. 编译当前 target
 
 ```
 <leader>ub        " （space u b）→ :UEBuild
 ```
 
-推荐直接执行 `:UECompileForNvim`：先验证仓库钉死的 clangd 22.1.x，再编译当前 target，
-最后准备 CDB 与索引。IOS 编译不会保留 C++ response file，因此 build 成功后会在同一个构建
-终端继续执行 tuple-scoped UBT `GenerateClangDatabase` action-graph 阶段；它不执行编译、Cook 或
-Package。Tree-sitter 语法高亮不依赖这一步；clangd 导航、诊断和编译器语义需要 CDB。
-
-`:UEBuild` 仍然只构建；已有新鲜 response file 或已验证的 tuple-scoped semantic source 时可单独
-执行 `:UEPrepare`。
+`:UEBuild` 仍然只构建。选中 IOS 后，`<leader>ub` 与 `:UEBuildIOS` 使用同一个 IOS target
+driver。必须等编译结束后再 prepare；build 与 prepare 按 WAW 约束不允许重叠。
 
 ### 4. 构建索引
 
@@ -151,9 +146,14 @@ Package。Tree-sitter 语法高亮不依赖这一步；clangd 导航、诊断和
 :UEPrepare
 ```
 
-全程异步并带进度 UI：生成 `compile_commands.json`、运行 CDB 流水线
-（expand → PCH → resolve → unify → prune）、构建 csearch 索引、重启 clangd。完成
-后跳定义、工程 grep 与 clangd 均就绪。
+全程异步并带进度 UI。macOS 主机上的 IOS target 分支先检查 clangd 22.1.x，并为 IOS 构建补充当前
+tuple 的 UBT semantic CDB；IOS 首次还会自动导入 prepared 签名、实测私钥访问并选择设备。该 IOS
+前置阶段使用 `GenerateClangDatabase`，不会触发 compile、Cook、Package、Deploy 或 Run。随后所有
+平台统一生成 `compile_commands.json`、运行 CDB 流水线（expand → PCH → resolve → unify → prune）、
+构建 csearch 索引并重启 clangd。
+
+`:UECompileForNvim` 作为兼容入口保留：它先 build，再委托同一条 `:UEPrepare` 路径；正常流程不再
+需要单独调用它。Tree-sitter 语法高亮不依赖 CDB；clangd 导航、诊断和编译器语义需要 CDB。
 
 变体：`:UEPrepareIncremental`（仅脏文件）、`:UEPrepareReindex`（重建索引）、
 `:UEPrepareSync`（阻塞）。
@@ -166,8 +166,9 @@ Package。Tree-sitter 语法高亮不依赖这一步；clangd 导航、诊断和
 | 工程级 grep | `<leader>/` |
 | 文件 picker | `<leader><leader>` |
 | 编译（当前平台） | `<leader>ub` / `:UEBuild` |
-| 编译并准备 Neovim 编译器语义 | `:UECompileForNvim` |
+| 兼容入口：编译后进入正常 prepare 路径 | `:UECompileForNvim` |
 | 只编译 IOS C++（安全复用 AOT，默认不生成 dSYM） | `:UEBuildIOS` |
+| 一次性导入 IOS prepared 签名、实测私钥访问并选择设备 | `:UEIOSSetup` |
 | 为当前工程导入 prepared identity 或选择 / 清除 IOS 签名证书 | `:UESetIOSSigningCertificate` / `:UESetIOSSigningCertificate!` |
 | 复用已有 cooked 数据组 IOS 包 | `:UEPackageIOS` |
 | 按需生成并校验 IOS dSYM | `:UEIOSSymbols` |
@@ -184,6 +185,11 @@ Package。Tree-sitter 语法高亮不依赖这一步；clangd 导航、诊断和
 
 完整键位与工作流手册见
 [`ue_lazyvim_cheatsheet.md`](ue_lazyvim_cheatsheet.md)。
+
+iOS 在外部 `PrepareIOSQADebug.sh` / `InstallIOSClient.sh` 成功后，完整流程就是：
+`:UESetProject <workspace>` 与 `:UESetPlatform IOS` 任意顺序 → `<leader>ub` → `:UEPrepare` →
+`<leader>ui`。IOS prepare 分支自动完成一次性签名/私钥/设备 setup 与 Apple semantic CDB 生成；
+prepared 清单缺失、执行中切换工程或状态落盘失败时都会中止，不会误报 ready。
 
 ## 为长期 AI 辅助开发而建
 

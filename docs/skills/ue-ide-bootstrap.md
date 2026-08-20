@@ -147,8 +147,9 @@ UBT 在第 2 步 build 时已为每个 unity TU 写了一份 `Module.<Mod>.{cpp.
 - rsp 路径对所有平台同口径（Android NDK 用 `.cppa8.o.rsp`，Win64 用 `.cpp.obj.rsp`，Linux/Mac 用 `.cpp.o.rsp`），不依赖 Build.bat
 - 没有任何 rebuild 成本——读硬盘上已存在的 rsp 文件而已
 
-IOS 是明确例外：Apple 构建不会保留 C++ `.o.rsp`，因此 `:UECompileForNvim` 在同一终端
-追加 tuple-scoped UBT `GenerateClangDatabase` action-graph pass。受控 background CDB 只有在
+IOS 是明确例外：Apple 构建不会可靠保留 C++ `.o.rsp`，因此完成 `<leader>ub` 后，
+`:UEPrepare` 会追加 tuple-scoped UBT `GenerateClangDatabase` action-graph pass；该 pass 不执行
+compile、Cook、Package、Deploy 或 Run。受控 background CDB 只有在
 unity include 可唯一映射、所有 member 的 exact Apple argv（忽略对象/依赖输出路径后）完全一致时
 才复用 wrapper；证据不足仍保留逐文件命令。
 
@@ -160,8 +161,9 @@ unity include 可唯一映射、所有 member 的 exact Apple argv（忽略对�
 
 **fallback**：若 `.rsp` 一个都收不到（fresh clone / 还没 build），才回退到查找已存在的
 `compile_commands.json`（UBT 旧产物 / 手放）。`Build.bat -Mode=GenerateClangDatabase`
-不再是普通 `:UEPrepare` 的隐式 fallback——它的覆盖率劣于 rsp 路径；仅 IOS 的
-`:UECompileForNvim` 按已选 tuple 显式使用 action-graph pass 补足 Apple 缺失 rsp 的语义源。
+不再是非 Apple `:UEPrepare` 的隐式 fallback——它的覆盖率劣于 rsp 路径；仅声明
+`semantic_cdb` capability 的 IOS prepare 分支按已选 tuple 使用 action-graph pass，补足 Apple
+缺失 rsp 的语义源，并要求当前 tuple 已有成功 build evidence。
 
 ---
 

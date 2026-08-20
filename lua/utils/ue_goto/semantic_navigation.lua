@@ -547,137 +547,101 @@ function M.install(owner, deps)
       return
     end
 
-    semantic.prove_source({
-      source = ref_file,
-      environment = environment,
-      snapshot = snapshot,
-      line = snapshot.cursor[1],
-      column = snapshot.cursor[2] + 1,
-    }, function(proof)
-      local current, stale_reason = request_is_current(proof)
-      if not current then
-        finish_stale(stale_reason)
+    local clients = vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/definition" })
+    if not clients or vim.tbl_isempty(clients) then
+      finish(transaction.terminal("unavailable", "provider", "provider-method-unsupported"))
+      return
+    end
+
+    -- Source TUs already have an exact command transported to clangd from the
+    -- controlled active CDB. Query clangd at the immutable cursor snapshot;
+    -- do not make every gd parse the 200MB+ CDB again in the libclang sidecar.
+    dtrace("semantic provider=clangd request=symbolInfo+definition context=source-exact-command")
+    provider.async_clangd_symbol_info(bufnr, function(symbol_info)
+      local identity_current, identity_stale = request_is_current(symbol_info)
+      if not identity_current then
+        finish_stale(identity_stale)
         return
       end
-      if not proof or proof.state ~= "resolved" then
-        finish(semantic_failure(proof or {
-          state = "unavailable",
-          reason = "active-compile-command-missing",
-        }, "context"))
+      local usr = symbol_info.usr
+      local clangd_client_ids = symbol_info.client_ids
+      local provider_terminal = provider_failure(symbol_info)
+      if provider_terminal then finish(provider_terminal); return end
+      if not usr then
+        finish(transaction.terminal("invalid-semantic-context", "entity",
+          symbol_info.reason == "identity-conflict" and "identity-conflict" or "identity-missing", {
+            provider = "clangd",
+            provider_result = symbol_info,
+          }))
         return
-      end
-      local declaration = semantic_location(proof.declaration)
-      local definition = semantic_location(proof.definition)
-      local role = transaction.subject_role(tx, declaration, definition)
-      if definition then
-        jump_resolved(definition, "clangd·semantic", {
-          provider = "libclang",
-          destination_role = "definition",
-          subject_role = role,
-        })
-        return
-      end
-      local authoritative_usr = proof.usr
-      local function clangd_cross_tu()
-        local clients = vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/definition" })
-        if not clients or vim.tbl_isempty(clients) then
-          finish(transaction.terminal("unavailable", "provider", "provider-method-unsupported"))
-          return
-        end
-        dtrace("semantic provider=clangd request=symbolInfo+definition context=%s",
-          tostring(proof.context_id or "?"))
-        provider.async_clangd_symbol_info(bufnr, function(symbol_info)
-          local identity_current, identity_stale = request_is_current()
-          if not identity_current then
-            finish_stale(identity_stale)
-            return
-          end
-          local usr = symbol_info.usr
-          local clangd_client_ids = symbol_info.client_ids
-          local provider_terminal = provider_failure(symbol_info)
-          if provider_terminal then finish(provider_terminal); return end
-          if not usr then
-            dtrace("semantic provider=clangd context=%s state=invalid-semantic-context usr=missing",
-              tostring(proof.context_id or "?"))
-            finish(transaction.terminal("invalid-semantic-context", "entity",
-              symbol_info.reason == "identity-conflict"
-                and "identity-conflict" or "identity-missing", {
-                provider = "clangd",
-                subject_role = role,
-                provider_result = symbol_info,
-              }))
-            return
-          end
-          if authoritative_usr and usr ~= authoritative_usr then
-            finish(transaction.terminal("invalid-semantic-context", "entity", "identity-conflict", {
-              provider = "clangd",
-              subject_role = role,
-              identity = authoritative_usr,
-              provider_result = symbol_info,
-            }))
-            return
-          end
-          provider.async_lsp_request(bufnr, "textDocument/definition", function(definition_result)
-            local still_current, reason = request_is_current()
-            if not still_current then
-              finish_stale(reason)
-              return
-            end
-            local definition_failure = provider_failure(definition_result)
-            if definition_failure then finish(definition_failure); return end
-            local locs = transaction.filter_definition_locations(
-              tx, definition_result.locations or {}, declaration)
-            if #locs ~= 1 then
-              dtrace("semantic provider=clangd state=invalid-semantic-context n=%d", #locs)
-              if #locs == 0 then
-                declaration_fallback(role, declaration, {
-                  provider = "clangd",
-                  subject_role = role,
-                  stage = "destination",
-                  reason = "definition-not-found",
-                  provider_result = definition_result,
-                  origin_context = proof.origin_context,
-                })
-                return
-              end
-              finish(transaction.terminal("unavailable", "destination", "multiple-definitions", {
-                provider = "clangd",
-                subject_role = role,
-                provider_result = definition_result,
-              }))
-              return
-            end
-            local target_path = location_mod.location_path(locs[1]):lower()
-            if M.CPP_HEADER_EXTS[target_path:match("%.([^./\\]+)$") or ""] then
-              if proof.origin_context then
-                local lineage = vim.deepcopy(proof.origin_context)
-                lineage.subject_membership = { [target_path] = true }
-                semantic.note_origin(snapshot.winid, lineage, environment.build_fingerprint)
-              end
-            end
-            dtrace("semantic provider=clangd context=%s usr=%s state=resolved",
-              tostring(proof.context_id or "?"), tostring(usr))
-            jump_resolved(locs[1], "clangd·semantic", {
-              provider = "clangd",
-              destination_role = "definition",
-              subject_role = role,
-              identity = usr,
-            })
-          end, {
-            client_ids = clangd_client_ids,
-            snapshot = tx,
-            structured = true,
-            compile_command_source = proof.origin_tu,
-          })
-        end, {
-          snapshot = tx,
-          structured = true,
-          compile_command_source = proof.origin_tu,
-        })
       end
 
-      lookup_module_definition(authoritative_usr, role, clangd_cross_tu)
-    end)
+      provider.async_lsp_request(bufnr, "textDocument/definition", function(definition_result)
+        local still_current, reason = request_is_current(definition_result)
+        if not still_current then
+          finish_stale(reason)
+          return
+        end
+        local definition_failure = provider_failure(definition_result)
+        if definition_failure then finish(definition_failure); return end
+        local locs = transaction.filter_definition_locations(
+          tx, definition_result.locations or {}, nil)
+        if #locs == 0 then
+          finish(transaction.terminal("unavailable", "index", definition_miss_reason(), {
+            provider = "clangd",
+            identity = usr,
+            provider_result = definition_result,
+          }))
+          return
+        end
+        if #locs > 1 then
+          finish(transaction.terminal("unavailable", "destination", "multiple-definitions", {
+            provider = "clangd",
+            identity = usr,
+            provider_result = definition_result,
+          }))
+          return
+        end
+
+        local target_path = location_mod.location_path(locs[1]):lower()
+        if M.CPP_HEADER_EXTS[target_path:match("%.([^./\\]+)$") or ""]
+            and type(symbol_info.exact_command) == "table" then
+          local exact = symbol_info.exact_command
+          local compile = {
+            directory = exact.workingDirectory,
+            file = ref_file,
+            argv = vim.deepcopy(exact.compilationCommand or {}),
+          }
+          local compile_fingerprint = vim.fn.sha256(vim.json.encode(compile))
+          local lineage = {
+            context_id = compile_fingerprint,
+            origin_tu = ref_file,
+            cdb_dir = environment.cdb_dir,
+            compile = compile,
+            compile_command_fingerprint = compile_fingerprint,
+            subject_membership = { [target_path] = true },
+          }
+          semantic.note_origin(snapshot.winid, lineage, environment.build_fingerprint)
+        end
+        dtrace("semantic provider=clangd context=source-exact-command usr=%s state=resolved",
+          tostring(usr))
+        jump_resolved(locs[1], "clangd·semantic", {
+          provider = "clangd",
+          destination_role = "definition",
+          subject_role = "reference",
+          identity = usr,
+        })
+      end, {
+        client_ids = clangd_client_ids,
+        snapshot = tx,
+        structured = true,
+        compile_command_source = ref_file,
+      })
+    end, {
+      snapshot = tx,
+      structured = true,
+      compile_command_source = ref_file,
+    })
   end
 
   return M

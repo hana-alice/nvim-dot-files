@@ -60,7 +60,10 @@ load-bearing on this device (K37); `UE_DAP_NO_SLIDE=1` skips it for re-verificat
 ## clangd / clang / libclang (C++ LSP + semantic sidecar)
 
 - **Required**: LLVM **22.1.x** (22.1.5 verified)
-- **Source**: `winget install LLVM.LLVM`
+- **Source** (Windows): `winget install LLVM.LLVM`
+- **Source** (macOS): `brew install llvm@22`; if the Homebrew bottle registry is
+  unavailable, install the official macOS ARM64 release under
+  `~/.local/opt/llvm@22`.
 - **Install path** (Windows): `C:\Program Files\LLVM\bin\`
 - Used by: clangd controlled BackgroundIndex, exact-command transport, libclang
   canonical-USR sidecar, and the on-demand cursor-walk C ABI shim.
@@ -70,9 +73,11 @@ the official `compilationDatabaseChanges` transport, and the libclang/shim ABI
 are verified as one LLVM 22.x toolchain identity.
 
 On macOS, the Xcode-provided Apple clangd is not a substitute for the pinned
-LLVM build. `:UECompileForNvim` checks `clangd --version` before starting a UE
-build and accepts only 22.1.x; Tree-sitter highlighting remains available when
-that compiler-semantic gate is not met.
+LLVM build. The IOS-target `:UEPrepare` branch on macOS checks `clangd --version`
+before generating Apple semantic evidence and accepts only 22.1.x; Tree-sitter
+highlighting remains available when that compiler-semantic gate is not met.
+Nvim checks the user-local versioned
+install first, then the Apple Silicon and Intel Homebrew `llvm@22` kegs.
 
 ## macOS host and iOS application workflow
 
@@ -106,6 +111,9 @@ Requirements:
 
 - Full Xcode selected by `xcode-select`, with an iPhoneOS SDK visible through
   `xcrun --sdk iphoneos --show-sdk-path`.
+- Versioned LLVM 22 from `brew install llvm@22` and GNU Global from
+  `brew install global`; the IOS `:UEPrepare` prelude needs clangd 22.1.x and
+  its final index phase needs `gtags`.
 - The engine-bundled .NET environment used by `Build.sh` and `RunUAT.sh`.
 - A project identity selected with `:UESetIOSSigningCertificate`, still valid
   in the current keychain, plus compatible provisioning for package/install.

@@ -174,7 +174,9 @@ local function open_file_reference_under_cursor()
   if cfile == nil or cfile == "" then
     return false
   end
-  if not (cfile:find("[/\\]") or cfile:find("%.[%w_%-]+$")) then
+  local has_path_separator = cfile:find("[/\\]") ~= nil
+  local known_filetype = vim.filetype.match({ filename = cfile })
+  if not has_path_separator and not known_filetype then
     return false
   end
 

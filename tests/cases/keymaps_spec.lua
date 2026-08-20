@@ -174,6 +174,41 @@ end)
 t.describe("keymaps: 核心编辑/导航键", function()
   t.it("gd 存在", function() t.assert_true(t.get_keymap("n", "gd") ~= nil) end)
   t.it("gr 存在", function() t.assert_true(t.get_keymap("n", "gr") ~= nil) end)
+  t.it("<C-LeftMouse> 不把 dotted member 当文件交给 gf", function()
+    local mapping = t.get_keymap("n", "<C-LeftMouse>")
+    t.assert_true(mapping ~= nil and type(mapping.callback) == "function")
+
+    local original_buf = vim.api.nvim_get_current_buf()
+    local bufnr = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_set_current_buf(bufnr)
+    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
+      "[ParallelRenderCommandEncoder.GetPtr() setLabel:@\"fixture\"]",
+    })
+    vim.api.nvim_win_set_cursor(0, { 1, 2 })
+
+    local original_fallback = package.loaded["utils.lsp_fallback"]
+    local original_normal = vim.cmd.normal
+    local definitions = 0
+    local normal_calls = 0
+    package.loaded["utils.lsp_fallback"] = {
+      definition = function() definitions = definitions + 1 end,
+    }
+    vim.cmd.normal = function()
+      normal_calls = normal_calls + 1
+    end
+    vim.v.errmsg = ""
+    mapping.callback()
+    local errmsg = vim.v.errmsg
+    vim.cmd.normal = original_normal
+    package.loaded["utils.lsp_fallback"] = original_fallback
+
+    vim.api.nvim_set_current_buf(original_buf)
+    pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+    t.assert_eq(normal_calls, 0, "dotted member must not attempt gf")
+    t.assert_eq(definitions, 1, "dotted member must route directly to semantic definition")
+    t.assert_false(errmsg:find("E447", 1, true) ~= nil,
+      "smart mouse jump must not emit a failed file lookup before gd")
+  end)
   t.it("gc (n) 存在", function() t.assert_true(t.get_keymap("n", "gc") ~= nil) end)
   t.it("gc (x) 存在", function() t.assert_true(t.get_keymap("x", "gc") ~= nil) end)
   t.it("gcc 存在", function() t.assert_true(t.get_keymap("n", "gcc") ~= nil) end)

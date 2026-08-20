@@ -210,7 +210,7 @@ function M.async_lsp_request(bufnr, method, on_result, opts)
         record.status = "make-params-failed"
         dec_pending()
       else
-        clangd_commands.ensure(client, bufnr, function(command_ok, command_reason)
+        clangd_commands.ensure(client, bufnr, function(command_ok, command_reason, exact_command)
           if done then return end
           if not command_ok then
             record.status = "compile-command-unavailable"
@@ -218,6 +218,7 @@ function M.async_lsp_request(bufnr, method, on_result, opts)
             dec_pending()
             return
           end
+          record.exact_command = exact_command
           local request_started = vim.uv.hrtime()
           local ok_req = pcall(function()
             client:request(method, params, function(err, result)
@@ -293,9 +294,16 @@ function M.async_clangd_symbol_info(bufnr, on_result, opts)
     local values = vim.tbl_keys(usr_clients)
     local usr = #values == 1 and values[1] or nil
     local client_ids = {}
+    local exact_command
     if usr then
       client_ids = vim.tbl_keys(usr_clients[usr])
       table.sort(client_ids)
+      for _, record in ipairs(client_results) do
+        if record.identity and record.identity.usr == usr and record.exact_command then
+          exact_command = record.exact_command
+          break
+        end
+      end
     end
     vim.schedule(function()
       if opts and opts.structured then
@@ -312,6 +320,7 @@ function M.async_clangd_symbol_info(bufnr, on_result, opts)
           identities = identities,
           usr = usr,
           client_ids = client_ids,
+          exact_command = exact_command,
           reason = usr and "ok" or (#values > 1 and "identity-conflict"
             or structured_reason(client_results, false, "identity-missing")),
           document_version = opts and opts.snapshot and (
@@ -328,7 +337,7 @@ function M.async_clangd_symbol_info(bufnr, on_result, opts)
     pending = pending - 1
     if pending == 0 then finish() end
   end
-  timer = vim.defer_fn(function() finish(true) end, 5000)
+  timer = vim.defer_fn(function() finish(true) end, REQUEST_HARD_CEILING_MS)
 
   for _, client in ipairs(clients) do
     local enc = client.offset_encoding or "utf-16"
@@ -351,7 +360,7 @@ function M.async_clangd_symbol_info(bufnr, on_result, opts)
         record.status = "make-params-failed"
         complete_one()
       else
-        clangd_commands.ensure(client, bufnr, function(command_ok, command_reason)
+        clangd_commands.ensure(client, bufnr, function(command_ok, command_reason, exact_command)
           if done then return end
           if not command_ok then
             record.status = "compile-command-unavailable"
@@ -359,6 +368,7 @@ function M.async_clangd_symbol_info(bufnr, on_result, opts)
             complete_one()
             return
           end
+          record.exact_command = exact_command
           local request_started = vim.uv.hrtime()
           local ok_request = pcall(function()
             client:request("textDocument/symbolInfo", params, function(err, result)

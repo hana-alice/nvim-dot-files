@@ -1,6 +1,8 @@
 local C = require("ue.targets._common")
+local Device = require("ue.targets.ios_device")
+local Install = require("ue.targets.ios_install")
 local Signing = require("ue.targets.ios_signing")
-
+local BuildEvidence = require("ue.targets.ios_build_evidence")
 local M = {
   id = "IOS",
   host_operations = {
@@ -20,7 +22,6 @@ local M = {
     debug_log = { strategy = "unavailable" },
   },
 }
-
 local DAILY_SYMBOL_OVERRIDE =
   "-ini:Engine:[/Script/IOSRuntimeSettings.IOSRuntimeSettings]:bGeneratedSYMFile=False,[/Script/IOSRuntimeSettings.IOSRuntimeSettings]:bGeneratedSYMBundle=False"
 
@@ -203,6 +204,7 @@ function M.build_plan(context, host_driver)
   })
 end
 
+M.build_receipt_evidence = BuildEvidence.from_receipt
 function M.semantic_cdb_plan(context, host_driver)
   local entry, unavailable = C.resolve_host_entry(
     host_driver, "ue_build_entry", context, M.id, "semantic_cdb"
@@ -219,7 +221,7 @@ function M.semantic_cdb_plan(context, host_driver)
 
   local target_name = C.context_target(context)
   local configuration = C.context_configuration(context)
-  return C.with_appended_args(entry, {
+  local plan = C.with_appended_args(entry, {
     target_name,
     M.id,
     configuration,
@@ -239,6 +241,11 @@ function M.semantic_cdb_plan(context, host_driver)
     cooks = false,
     packages = false,
   })
+  -- Sharphereal.build.cs performs AOT directly while UBT constructs its
+  -- action graph. GenerateClangDatabase needs the module graph, never the AOT
+  -- outputs, so suppress that project hook only for this semantic subprocess.
+  plan.env = { bSkipAOTProcess = "true" }
+  return plan
 end
 
 function M.validate_semantic_cdb(entries, context)
@@ -400,6 +407,15 @@ function M.device_list_plan(context, host_driver)
   })
 end
 
+M.fallback_device_list_plan = Device.fallback_device_list_plan
+M.install_progress_tracker = Install.progress_tracker
+
+function M.install_failure_reason(result, plan)
+  if plan and plan.metadata and plan.metadata.backend == "legacy-mobiledevice" then
+    return Install.failure_reason(result)
+  end
+end
+
 function M.bundle_id_plan(app_path, host_driver, context)
   local plist_entry, unavailable = C.resolve_host_entry(host_driver, "plutil_entry", context or {}, M.id, "launch")
   if not plist_entry then
@@ -431,6 +447,18 @@ function M.install_plan(context, host_driver)
   if device_id == "" then
     return C.unavailable(M.id, "install", "device_id is required for install", {
       required = { "device_id" },
+    })
+  end
+  local device_backend = C.trim(context and context.device_backend)
+  if device_backend == "legacy-mobiledevice" then
+    return Install.legacy_plan(context, selected, {
+      validate_signing = Signing.validate,
+      validate_bundle_id = normalize_bundle_id,
+    })
+  end
+  if device_backend ~= "" and device_backend ~= "coredevice" then
+    return C.unavailable(M.id, "install", "selected IOS device backend is unsupported", {
+      device_backend = device_backend,
     })
   end
 
@@ -470,6 +498,13 @@ function M.launch_plan(context, host_driver)
   if device_id == "" then
     return C.unavailable(M.id, "launch", "device_id is required for launch", {
       required = { "device_id" },
+    })
+  end
+  local device_backend = C.trim(context and context.device_backend)
+  if device_backend ~= "" and device_backend ~= "coredevice" then
+    return C.unavailable(M.id, "launch", "selected IOS device has no CoreDevice transport", {
+      device_backend = device_backend,
+      suggestion = "ordinary pre-iOS17 MobileDevice launch is not implemented",
     })
   end
 
@@ -599,6 +634,7 @@ function M.parse_device_list(payload)
         name = item.name or item.displayName or properties.name or hardware.marketingName,
         platform = platform,
         os_version = properties.osVersionNumber,
+        backend = "coredevice",
       }
     end
   end
@@ -608,6 +644,8 @@ function M.parse_device_list(payload)
     devices = available,
   }
 end
+
+M.parse_fallback_device_list = Device.parse_fallback_device_list
 
 function M.parse_install_result(payload, expected)
   local decoded = payload

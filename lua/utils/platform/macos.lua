@@ -96,9 +96,14 @@ function M.build_process_snapshot_plan()
 end
 
 function M.default_clangd_candidates()
-  -- Order: Homebrew LLVM (Apple Silicon), Homebrew LLVM (Intel),
-  -- Xcode toolchain, system PATH.
+  -- Prefer versioned LLVM 22 installs, including the user-local fallback used
+  -- when Homebrew's bottle registry is unavailable. Keep the unversioned
+  -- formula as a compatible fallback when it is also on LLVM 22.1.x; the
+  -- UECompileForNvim preflight remains the final version gate.
   return {
+    vim.fn.expand("~/.local/opt/llvm@22/bin/clangd"),
+    "/opt/homebrew/opt/llvm@22/bin/clangd",
+    "/usr/local/opt/llvm@22/bin/clangd",
     "/opt/homebrew/opt/llvm/bin/clangd",
     "/usr/local/opt/llvm/bin/clangd",
     "/Library/Developer/CommandLineTools/usr/bin/clangd",

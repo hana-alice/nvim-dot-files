@@ -11,7 +11,7 @@ local PUBLIC_TABLES = {
 }
 
 local PUBLIC_FUNCTIONS = {
-  "clangd_cmd", "clangd_root", "current_platform", "platform_path_priorities",
+  "clangd_cmd", "clangd_root", "clangd_start_root", "current_platform", "platform_path_priorities",
   "android_build_command", "picker_options", "picker_project_options",
   "current_scope_picker_options", "cached_grep_file_list", "cached_code_file_list",
   "cached_files", "cached_grep", "statusline_status", "index_status", "semantic_index_snapshot", "index_now",

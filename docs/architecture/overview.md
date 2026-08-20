@@ -34,18 +34,24 @@
 ## 2. 数据流（data flow）
 
 - **索引/CDB**：`:UEPrepare` → UBT `-SkipBuild` 取编译参数 → `ue/cdb/*` 生成/裁剪/inject
-  compile_commands.json → cindex 建 csearch 索引 → clangd reload。全程 async + 进度 UI。
+  compile_commands.json → cindex 建 csearch 索引 → clangd reload。UE root 的 clangd LSP 使用持久化 artifact
+  gate：当前 project/target/platform/configuration 的 selection、manifest、controlled CDB 与源 CDB 签名
+  仍有效时，新 Neovim 直接复用并启动；仅工件缺失、stale 或 tuple 变化时等待下一次 `:UEPrepare`。
+  非 UE C++ root 不经过该 gate。全程 async + 进度 UI。
 - **状态/缓存**：`:UESetProject` 把选择捕获在当前 Neovim 进程，同时更新未来进程读取的
   `selection.json` 默认值；project state/CDB/index/breakpoints/definition cache 写入 canonical-path
   project bucket。平台选择同样在进程内固定，另一个实例的修改不会重定向 live context。
   target platform 是双轴：per-project `target-selection.json` 是唯一权威；engine 级
   `target-default.json` 只作 picker 置顶建议（suggest, never inherit），新 bucket 未显式选择前
-  UEBuild 先弹 picker，不以任何默认值静默构建。UBT build 与 prepare/CDB pipeline 互斥
+  UEBuild 先弹 picker，不以任何默认值静默构建。显式 `:UESetPlatform` 还会在当前进程保留一个
+  one-shot target intent，供下一次 `:UESetProject` 消费，因此两个命令先后顺序等价；该 intent 不落成
+  engine authority，也不跨 Neovim 进程传播。UBT build 与 prepare/CDB pipeline 互斥
   （build 赢：启动时 cancel 在飞 pipeline；build 运行中 prepare 拒绝启动）——prepare 读的
   Module.*.rsp/receipts 正是 build 在写的产物（WAW，见 CONSTRAINTS K51）。
-- **goto-definition**：C++ source/header 都先在 proven TU 中取得 libclang exact-cursor
-  canonical USR，再在同 generation controlled module AST 中查唯一 body；clangd 仅在 module
-  contexts 暂不可用时作 identity-verified secondary provider。非 C++ 兼容路径保留
+- **goto-definition**：C++ source 以 controlled active CDB transport 的 exact command 在 clangd
+  精确光标取得 canonical USR，并只向同 identity client 查询唯一 definition；不再为每次 source `gd`
+  让 sidecar 重读全量 CDB。header 仍在 proven origin TU 中取得 libclang exact-cursor canonical USR，
+  再在同 generation controlled module AST 中查唯一 body。非 C++ 兼容路径保留
   cache/LSP/csearch/GTAGS；详见
   `docs/architecture-symbol-resolution.md`。
 - **Android device**：`<Space>uA` / 首次 Android 操作 → `utils.android_device` 异步执行
@@ -64,10 +70,18 @@
   host 按 maps pathname 精确要求仅出现私有路径，失败时 host 强制停止错误进程。仅当工具目录完全不存在时
   才保持普通 APK 启动；部分 staging 必须拒绝。项目目录、Target、包名、设备 serial
   和 data/native 目录均动态派生，不固定现场身份。
-- **编译器语义**：`:UECompileForNvim` → clangd 22.1.x 预检 → 当前 target driver 生成原生 UBT
-  build plan → 成功后，保留 response file 的 target 直接复用证据；IOS driver 则追加一个不执行
-  compile/cook/package 的 tuple-scoped `GenerateClangDatabase` action-graph plan，并先原子发布到
-  `.cache/nvim-ue/cdb/sources/<tuple>/` → 最后复用 `:UEPrepare` 的纯读取/CDB/index 流程。候选只来自
+- **编译器语义**：用户先以 `<Space>ub` 完成当前 target 的原生 UBT build；macOS 主机上的 IOS
+  `:UEPrepare` capability 分支先执行 clangd 22.1.x 预检，再通过 target driver 运行不执行
+  compile/cook/package 的 tuple-scoped `GenerateClangDatabase` action-graph plan，原子发布到
+  `.cache/nvim-ue/cdb/sources/<tuple>/`，随后进入公共 CDB/index 流程。IOS 首次 prepare 还在生成
+  semantic source 前完成 prepared signing/private-key/device setup。IOS driver 会为 semantic 子进程
+  设置工程已有的 `bSkipAOTProcess=true`，避免 Build.cs 在 action-graph 构造期执行 AOT；该变量不进入
+  正常 build。若 Nvim marker 晚于已有构建上线，则只在 UBT `.target` 精确匹配 tuple 且 launch product
+  存在时迁移一次 build evidence。成功发布 semantic source 后同时保存精确 tuple、build completion 与
+  文件 size/纳秒 mtime；同一 build 重复 prepare 直接复用，不再启动 `Build.sh`/UBT，任一签名变化才重建。
+  prepare 完成后通过原生 `FileType` autocmd 唤醒已加载 UE C/C++ buffer 的 clangd，不依赖插件命令。
+  `:UECompileForNvim` 仅作为
+  build → 同一 `:UEPrepare` 路径的兼容入口。其他 target 完全保留已有 response-file 路径。候选只来自
   受控路径，并按工程根与 target compiler evidence 校验；不得递归捡取 ThirdParty 测试夹具。
   Tree-sitter 语法解析与此分离，不会被 clangd/CDB 缺失伪装成失败。
 - **核心健康审计**：`:NvimCoreHealth` 异步启动 `scripts/nvim_core_health.lua` → 隔离临时目录验证真实
@@ -77,7 +91,12 @@
 - **iOS 应用**：`:UEBuildIOS` 经 IOS target driver 和 macOS zsh wrapper 调原生 `Build.sh`；wrapper
   只在 AOT 输入指纹、SDK/工具链与上次成功 framework 产物全部匹配时注入 `bSkipAOTProcess=true`，
   输入 content hash 可在 path/device/inode/size/纳秒 mtime/ctime 全同后复用，但 output 仍逐个 hash；
-  Build.sh 始终运行并由 UBT action graph 判断过期 C++ action。`:UESetIOSSigningCertificate` 把当前
+  Build.sh 始终运行并由 UBT action graph 判断过期 C++ action。IOS `:UEPrepare` 在尚无有效 setup
+  evidence 时自动执行 prepared identity → 临时 Mach-O 非交互私钥实签 → 唯一设备/backend → legacy
+  helper 验证；`:UEIOSSetup` 保留为显式重跑/诊断入口。
+  只有整条链通过才报告 daily build/install ready。临时签名副本无条件清理，不读取/保存 keychain 密码，
+  相同快速探针也在已配置 build/package/install 重签大型 artifact 前执行。
+  `:UESetIOSSigningCertificate` 把当前
   keychain 中精确匹配的 identity 保存到 project bucket；无参数时优先 fail-closed 导入
   `PrepareIOSQADebug.sh` 的 `Saved/IOSQADebug/signing.json`，并兼容 `workspace/Source/Client` 布局，
   没有 manifest 时才显示 picker。Build/Package 用 argv-only INI override 捕获，
@@ -85,8 +104,16 @@
   `:UEPackageIOS` 规划 UAT BuildCookRun
   （SkipBuild/SkipCook/Stage/NoCleanStage/Package，不含 Cook/Archive/Deploy/Run）；`:UEIOSSymbols`
   按需运行 dsymutil 并比较 binary/dSYM UUID；
-  `:UESetIOSDevice` / `:UEInstallIOS` / `:UELaunch` 使用结构化 CoreDevice JSON、当前 package task 的
-  `Binaries/IOS/Payload/<Target>.app` provenance 与真实 bundle id。iOS run 不隐式进入 DAP。
+  `:UESetIOSDevice` 先使用结构化 CoreDevice JSON；没有 connected tunnel 时，再以 `xcdevice` JSON
+  只发现 available、物理、USB、pre-iOS17 设备，并把 `coredevice` / `legacy-mobiledevice` backend
+  与 identifier 一起保存；单一进度句柄持续显示 CoreDevice、legacy fallback、IOUSBHost recovery 与
+  重探测阶段，legacy 路径为空时自动调用 branch 的 `ResetIOSUSB.sh` 后重试。`:UEInstallIOS` 的
+  CoreDevice 路径继续消费当前 package task 的
+  `Binaries/IOS/Payload/<Target>.app` provenance；legacy 路径只在当前 tuple app、匹配的
+  `Saved/IOSQADebug/signing.json` 与 branch 对应 `InstallIOSClient.sh` 同时存在时，克隆并重签临时副本，
+  再用 MobileDevice 原地更新；helper stdout/stderr 被流式解析为签名、上传和 device Upgrade 百分比。
+  源 app 与设备 container 不被删除。`:UELaunch` 仍只接受 CoreDevice，
+  legacy 选择会明确 fail closed；iOS run 不隐式进入 DAP。
 - **DAP**：setup 先按 host-target-operation matrix 过滤 handler，再由 `UEDAP*` 命令经
   `ue.dap.platforms` dispatch → 具体平台 `attach/launch` → codelldb（Win64/Android）。iOS DAP
   未实现，因此 macOS 也不注册 IOS handler，更不会借用 Mac process attach。Android 走 platform

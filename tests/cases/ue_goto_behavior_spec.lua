@@ -22,6 +22,45 @@ t.describe("location: dedup_locations 去重", function()
 end)
 
 t.describe("provider: compiler identity 必须绑定响应客户端", function()
+  t.it("symbolInfo cold preamble shares the provider hard ceiling", function()
+    local provider = require("utils.ue_goto.provider")
+    local old_get_clients = vim.lsp.get_clients
+    local old_defer_fn = vim.defer_fn
+    local timeout_ms
+    vim.defer_fn = function(_, delay)
+      timeout_ms = delay
+      return {
+        is_closing = function() return false end,
+        stop = function() end,
+        close = function() end,
+      }
+    end
+    vim.lsp.get_clients = function()
+      return { {
+        id = 41,
+        name = "clangd",
+        offset_encoding = "utf-16",
+        request = function(_, method, _, callback)
+          t.assert_eq(method, "textDocument/symbolInfo")
+          callback(nil, { usr = "usr:cold-preamble" })
+          return true
+        end,
+      } }
+    end
+
+    local done, usr = false, nil
+    provider.async_clangd_symbol_info(0, function(value)
+      done, usr = true, value
+    end)
+    t.assert_true(vim.wait(1000, function() return done end, 10))
+    vim.lsp.get_clients = old_get_clients
+    vim.defer_fn = old_defer_fn
+
+    t.assert_eq(timeout_ms, 30000,
+      "an exact-command reopen may need more than five seconds to rebuild a UE preamble")
+    t.assert_eq(usr, "usr:cold-preamble")
+  end)
+
   t.it("structured provider 保留 unsupported 而不是折叠成 nil", function()
     local provider = require("utils.ue_goto.provider")
     local old_get_clients = vim.lsp.get_clients
@@ -178,7 +217,7 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
     }
     for _, name in ipairs(mocked) do saved[name] = package.loaded[name] end
 
-    local calls, jumps = 0, {}
+    local calls, jumps, sidecar_calls = 0, {}, 0
     local fail_semantic = false
     local legacy_calls = { cache_get = 0, cache_put = 0, csearch = 0, gtags = 0 }
     local cached
@@ -208,7 +247,15 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
         else
           local usr = calls == 0 and "usr:noargs" or "usr:args"
           if opts and opts.structured then
-            callback({ usr = usr, client_ids = { 17 }, reason = "ok" })
+            callback({
+              usr = usr,
+              client_ids = { 17 },
+              reason = "ok",
+              exact_command = {
+                workingDirectory = "/fixture",
+                compilationCommand = { "clang++", "-c", "/fixture/Overloads.cpp" },
+              },
+            })
           else
             callback(usr)
           end
@@ -276,20 +323,9 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
       discover_toolchain = function()
         return { build_fingerprint = "fixture", cdb_dir = "/fixture" }
       end,
-      prove_source = function(_, callback)
-        local target = loc("file:///fixture/Overloads.h", calls == 0 and 420 or 422)
-        callback({
-          state = "resolved",
-          context_id = "ctx",
-          usr = calls == 0 and "usr:noargs" or "usr:args",
-          definition = nil,
-          declaration = target,
-          origin_context = {
-            context_id = "ctx",
-            origin_tu = "/fixture/Overloads.cpp",
-            cdb_dir = "/fixture",
-          },
-        })
+      prove_source = function()
+        sidecar_calls = sidecar_calls + 1
+        error("source TU gd must use clangd's exact-command proof, not parse the CDB in the sidecar")
       end,
       snapshot_is_current = function() return true end,
       note_origin = function(_, context)
@@ -319,6 +355,8 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
         "第二次 gd 不得重放第一次无参 overload 的缓存落点")
       t.assert_eq(origin_notes, 2,
         "source TU 跳入 header 后必须记录 proven origin context")
+      t.assert_eq(sidecar_calls, 0,
+        "source TU 不得为每次 gd 在 sidecar 中重复读取并解析全量 CDB")
       t.assert_true(noted_memberships[1]["/fixture/overloads.h"] == true)
       t.assert_true(noted_memberships[2]["/fixture/overloads.h"] == true)
       t.assert_eq(legacy_calls.cache_get, 0, "C++ gd 不得读取 definition location cache")

@@ -1,5 +1,7 @@
 local M = {}
 
+local progress_sequence = 0
+
 local function trim(value)
   return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
 end
@@ -37,6 +39,64 @@ function M.command(plan)
   return command
 end
 
+function M.progress(opts)
+  opts = opts or {}
+  local title = trim(opts.title) ~= "" and trim(opts.title) or "UE"
+  local message = trim(opts.message) ~= "" and trim(opts.message) or "starting"
+  local percentage = tonumber(opts.percentage)
+  local done = false
+  local fidget_handle
+  local ok, fidget = pcall(require, "fidget.progress")
+  if ok and fidget and fidget.handle and type(fidget.handle.create) == "function" then
+    local created, handle = pcall(fidget.handle.create, {
+      title = title,
+      message = message,
+      lsp_client = { name = "ue" },
+      percentage = percentage,
+    })
+    if created then fidget_handle = handle end
+  end
+
+  progress_sequence = progress_sequence + 1
+  local replace = opts.replace or ("ue.target.progress.%d"):format(progress_sequence)
+  if not fidget_handle then
+    vim.notify(message, vim.log.levels.INFO, { title = title, replace = replace })
+  end
+
+  local controller = {}
+  function controller:report(next_message, next_percentage)
+    if done then return end
+    next_message = trim(next_message) ~= "" and trim(next_message) or message
+    next_percentage = tonumber(next_percentage)
+    message = next_message
+    if next_percentage then percentage = next_percentage end
+    if fidget_handle then
+      pcall(fidget_handle.report, fidget_handle, {
+        message = message,
+        percentage = percentage,
+      })
+    else
+      vim.notify(message, vim.log.levels.INFO, { title = title, replace = replace })
+    end
+  end
+
+  function controller:finish(final_message, final_percentage, level)
+    if done then return end
+    self:report(final_message or message, final_percentage)
+    done = true
+    if fidget_handle then
+      pcall(fidget_handle.finish, fidget_handle)
+    else
+      vim.notify(final_message or message, level or vim.log.levels.INFO, {
+        title = title,
+        replace = replace,
+      })
+    end
+  end
+
+  return controller
+end
+
 function M.run(plan, opts)
   opts = opts or {}
   local command, err = M.command(plan)
@@ -44,18 +104,37 @@ function M.run(plan, opts)
     return nil, err
   end
 
-  local ok, handle = pcall(vim.system, command, {
+  local stdout_chunks = {}
+  local stderr_chunks = {}
+  local function stream(chunks, callback)
+    return function(_, data)
+      if type(data) ~= "string" or data == "" then return end
+      chunks[#chunks + 1] = data
+      vim.schedule(function()
+        callback(data)
+      end)
+    end
+  end
+  local system_opts = {
     cwd = plan.cwd,
     text = true,
     env = opts.env,
-  }, function(result)
+  }
+  if type(opts.on_stdout) == "function" then
+    system_opts.stdout = stream(stdout_chunks, opts.on_stdout)
+  end
+  if type(opts.on_stderr) == "function" then
+    system_opts.stderr = stream(stderr_chunks, opts.on_stderr)
+  end
+
+  local ok, handle = pcall(vim.system, command, system_opts, function(result)
     vim.schedule(function()
       if type(opts.on_exit) == "function" then
         opts.on_exit({
           code = result.code,
           signal = result.signal,
-          stdout = result.stdout or "",
-          stderr = result.stderr or "",
+          stdout = system_opts.stdout and table.concat(stdout_chunks) or result.stdout or "",
+          stderr = system_opts.stderr and table.concat(stderr_chunks) or result.stderr or "",
           plan = plan,
         })
       end

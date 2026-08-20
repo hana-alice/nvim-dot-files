@@ -16,9 +16,11 @@ MUST：系统必须把 Tree-sitter 语法解析和 clangd 编译语义作为两�
 - **THEN** 系统必须允许语法高亮继续工作
 - **AND** 只将 clangd 导航、诊断、补全和索引标记为未准备
 
-### Requirement: 系统必须提供显式的 Neovim 语义编译入口
+### Requirement: 构建与 Neovim 语义准备必须组成显式两阶段流程
 
-MUST：系统必须提供 `:UECompileForNvim`，在当前 tuple 上执行宿主原生 UBT 增量编译，并且仅在编译成功后进入 CDB 准备和 clangd 刷新。
+MUST：正常工作流必须先以 `:UEBuild` / `<leader>ub` 在当前 tuple 上执行宿主原生 UBT 增量编译，
+再由 `:UEPrepare` 生成 CDB 并刷新 clangd。`:UECompileForNvim` MAY 作为顺序执行这两个阶段的兼容入口，
+但 Apple semantic CDB 的生成所有权必须属于 `:UEPrepare`。
 
 #### Scenario: macOS 上编译 IOS 目标
 
@@ -27,12 +29,19 @@ MUST：系统必须提供 `:UECompileForNvim`，在当前 tuple 上执行宿主�
 - **AND** 必须以 argv 数组传递 target、platform、configuration 与 `-Project=<UPROJECT>`
 - **AND** 不得调用 Windows path converter、PowerShell 或 `UnrealBuildTool.exe`
 
-#### Scenario: IOS 构建不保留 response files
+#### Scenario: IOS 构建后进入 prepare
 
 - **WHEN** 原生 IOS 编译成功但 Apple toolchain 没有留下当前 tuple 的 C++ response files
+- **AND** 用户随后执行 `:UEPrepare`
 - **THEN** IOS target driver 必须规划 tuple-scoped UBT `GenerateClangDatabase`
 - **AND** 该计划必须使用 `-NoExecCodeGenActions`，且不得执行 compile、Cook、Package、Deploy 或 Run
 - **AND** 生成结果必须在同一构建输出 surface 可观察，经 provenance 校验后才可原子发布
+
+#### Scenario: 工程 action-graph 构造包含自定义 AOT 副作用
+
+- **WHEN** IOS `GenerateClangDatabase` 加载的工程规则支持 `bSkipAOTProcess`
+- **THEN** semantic-CDB 子进程必须单独设置 `bSkipAOTProcess=true`
+- **AND** 该环境不得泄漏到 `<leader>ub` 或其他 target 的 build/prepare
 
 #### Scenario: 编译失败
 
@@ -40,21 +49,46 @@ MUST：系统必须提供 `:UECompileForNvim`，在当前 tuple 上执行宿主�
 - **THEN** 系统必须将任务标记为 failed 并显示退出码与失败阶段
 - **AND** 不得运行准备阶段、替换最后成功 CDB 或重启 clangd
 
-### Requirement: UEPrepare 必须保持纯准备语义
+### Requirement: UEPrepare 不得触发编译但必须拥有 Apple semantic source 生成
 
-MUST：`UEPrepare` 必须只读取和转换已有 response files 或由显式语义编译阶段发布的 tuple-scoped CDB source；不得触发 UBT、编译或任何应用生命周期命令。
+MUST：`UEPrepare` 不得触发 compile、Cook、Package、Deploy 或 Run。对保留 response files 的 target，
+它必须继续只读转换已有证据；对 macOS 主机上声明 `semantic_cdb` capability 的 IOS target，它必须在确认当前
+tuple 已有成功 build evidence 后执行不包含 compile action 的 UBT `GenerateClangDatabase`，再进入公共
+CDB/index pipeline。IOS 首次 prepare 还必须在 semantic source 生成前完成 prepared signing、私钥访问与
+设备 route setup。
 
-#### Scenario: 缺少 response files
+#### Scenario: Apple target 缺少当前 tuple build evidence
 
-- **WHEN** 当前 tuple 既没有可证明来源的 response files，也没有已验证的 tuple-scoped CDB source
-- **THEN** `UEPrepare` 必须失败并建议运行 `:UECompileForNvim`
+- **WHEN** 当前 IOS tuple 没有成功 build evidence
+- **THEN** `UEPrepare` 必须失败并建议先运行 `<leader>ub`
 - **AND** 不得自动执行编译、Cook、Package、Deploy 或 Run
+
+#### Scenario: 状态 marker 上线前已经成功构建
+
+- **WHEN** project bucket 没有 Nvim build marker，但当前 tuple 存在精确匹配的 UBT `.target` receipt
+- **AND** receipt 声明的 launch product 仍存在
+- **THEN** `UEPrepare` 必须把该 receipt 迁移为 project-scoped build evidence 并继续
+- **AND** 不得要求用户为补写 marker 重复执行相同构建
 
 #### Scenario: 编译证据已存在
 
 - **WHEN** 当前 tuple 存在有效 response files 或已验证的 tuple-scoped CDB source
 - **THEN** `UEPrepare` 必须直接生成或复用 CDB
-- **AND** 不得仅为准备语义而触发 UBT
+- **AND** 非 Apple target 不得仅为准备语义而触发 UBT
+
+#### Scenario: 重复 prepare 复用当前 build 的 Apple semantic source
+
+- **WHEN** project/uproject/target/platform/configuration 与 build completion evidence 均精确匹配
+- **AND** 已验证的 tuple-scoped CDB source 路径、大小与纳秒 mtime 均未变化
+- **THEN** `UEPrepare` 必须直接复用该 semantic source
+- **AND** 不得再次启动 `Build.sh` 或 UnrealBuildTool
+- **AND** 新 build evidence 或 source 文件签名变化后必须重新生成并验证
+
+#### Scenario: 其他平台执行 prepare
+
+- **WHEN** 当前 target 不声明 `semantic_cdb` capability
+- **THEN** `UEPrepare` 必须保持原有 response-file 路径
+- **AND** 不得执行 IOS setup、Apple clangd prelude 或 `GenerateClangDatabase`
 
 ### Requirement: 编译上下文必须严格隔离
 

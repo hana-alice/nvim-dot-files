@@ -95,6 +95,20 @@ end
 -- groups are used when fully proven; exact per-file entries retain coverage
 -- elsewhere. Every completed phase is additive; current/hot entries lead the
 -- queue for responsiveness but can never remove the broad full baseline.
+local function clangd_cdb_entry(entry)
+  local published = {
+    directory = entry.directory,
+    file = entry.file,
+  }
+  if type(entry.arguments) == "table" then
+    published.arguments = vim.deepcopy(entry.arguments)
+  elseif type(entry.command) == "string" then
+    published.command = entry.command
+  end
+  if entry.output ~= nil then published.output = entry.output end
+  return published
+end
+
 M.publish_semantic_cdb = function(ctx, state, generation)
   local base_path = M.base_compile_commands_path(ctx)
   if not base_path or not _ufs.is_file(base_path) then
@@ -108,7 +122,11 @@ M.publish_semantic_cdb = function(ctx, state, generation)
       local key = file:lower()
       if key ~= "" and not seen[key] then
         seen[key] = true
-        merged[#merged + 1] = entry
+        -- Phase artifacts retain nvim_ue_members/nvim_ue_module_root for the
+        -- semantic sidecar. clangd's JSONCompilationDatabase parser rejects
+        -- unknown keys, so its published view must contain standard fields
+        -- only or the entire controlled BackgroundIndex silently disappears.
+        merged[#merged + 1] = clangd_cdb_entry(entry)
       end
     end
   end

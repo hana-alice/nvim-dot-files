@@ -10,6 +10,7 @@ local OPTIONAL_FUNCTIONS = {
   "package_plan",
   "symbols_plan",
   "device_list_plan",
+  "fallback_device_list_plan",
   "install_plan",
   "launch_plan",
   "preflight_descriptors",
@@ -23,6 +24,7 @@ local OPTIONAL_FUNCTIONS = {
   "log_plan",
   "semantic_cdb_plan",
   "validate_semantic_cdb",
+  "build_receipt_evidence",
 }
 
 function M.required_functions()

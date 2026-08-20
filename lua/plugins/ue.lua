@@ -37,7 +37,8 @@ return {
           })
         end,
         root_dir = function(bufnr, on_dir)
-          on_dir(require("ue").clangd_root(bufnr))
+          local root = require("ue").clangd_start_root(bufnr)
+          if root then on_dir(root) end
         end,
         on_attach = function(client, bufnr)
           if type(inherited_on_attach) == "function" then

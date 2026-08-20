@@ -110,6 +110,124 @@ t.describe("ue.ai_context", function()
   end)
 end)
 
+t.describe("UE clangd durable prepare gate", function()
+  local ue = require("ue")
+  local engine = "/Workspace/UE"
+  local project = "/Workspace/Game"
+
+  t.it("gates UE buffers by current tuple artifact readiness", function()
+    t.assert_false(ue._clangd_gate_allows_for_test(
+      "/Workspace/Game/Source/Game.cpp", project, engine, false))
+    t.assert_false(ue._clangd_gate_allows_for_test(
+      "/Workspace/UE/Engine/Source/Runtime/Core.cpp", project, engine, false))
+    t.assert_true(ue._clangd_gate_allows_for_test(
+      "/Workspace/Game/Source/Game.cpp", project, engine, true))
+  end)
+
+  t.it("does not gate ordinary C++ buffers outside the pinned UE roots", function()
+    t.assert_true(ue._clangd_gate_allows_for_test(
+      "/Workspace/Other/main.cpp", project, engine, false))
+  end)
+
+  t.it("reuses valid tuple artifacts after a Nvim restart", function()
+    local unique = tostring(vim.uv.hrtime())
+    local ctx = {
+      engine_root = "/Workspace/UE-" .. unique,
+      project_root = "/Workspace/Game-" .. unique,
+      paths = { clangd_dir = "/Workspace/cache/clangd/IOS-Development-" .. unique },
+    }
+    local snapshot_calls = 0
+    local ready = ue._clangd_artifacts_ready_for_test(ctx, {
+      semantic_index_snapshot = function(received)
+        t.assert_eq(received, ctx)
+        snapshot_calls = snapshot_calls + 1
+        return { readiness = "ready", generation_id = "persisted-generation" }
+      end,
+    })
+
+    t.assert_true(ready)
+    t.assert_eq(snapshot_calls, 1)
+  end)
+
+  t.it("revalidates the tuple when prepared artifacts change in the same process", function()
+    local ctx = {
+      engine_root = "/Workspace/UE-revalidate",
+      project_root = "/Workspace/Game-revalidate",
+      paths = { clangd_dir = "/Workspace/cache/clangd/revalidate" },
+    }
+    local readiness = "ready"
+    local dependencies = {
+      semantic_index_snapshot = function()
+        return { readiness = readiness }
+      end,
+    }
+
+    t.assert_true(ue._clangd_artifacts_ready_for_test(ctx, dependencies))
+    readiness = "stale"
+    t.assert_false(ue._clangd_artifacts_ready_for_test(ctx, dependencies))
+  end)
+
+  t.it("rejects missing or stale tuple artifacts", function()
+    local function context(suffix)
+      return {
+        engine_root = "/Workspace/UE-" .. suffix,
+        project_root = "/Workspace/Game-" .. suffix,
+        paths = { clangd_dir = "/Workspace/cache/clangd/" .. suffix },
+      }
+    end
+    for _, readiness in ipairs({ "missing", "stale", "building" }) do
+      local ready = ue._clangd_artifacts_ready_for_test(context(readiness .. vim.uv.hrtime()), {
+        semantic_index_snapshot = function()
+          return { readiness = readiness }
+        end,
+      })
+      t.assert_false(ready, readiness)
+    end
+  end)
+
+  t.it("routes lspconfig through the durable artifact root gate", function()
+    local config = vim.fn.stdpath("config")
+    local plugin = table.concat(vim.fn.readfile(config .. "/lua/plugins/ue.lua"), "\n")
+    local core = table.concat(vim.fn.readfile(config .. "/lua/ue.lua"), "\n")
+    t.assert_contains(plugin, "clangd_start_root(bufnr)")
+    t.assert_contains(core, "clangd_artifacts_ready")
+    t.assert_contains(core, "start_deferred_clangd")
+    t.assert_contains(core, 'pcall(exec_autocmds, "FileType"')
+    t.assert_false(core:find("LspStart clangd", 1, true) ~= nil)
+    t.assert_contains(core, "if not cdb_pipeline_done then")
+    t.assert_contains(core, "if cdb_pipeline_ok then")
+  end)
+
+  t.it("retries the native FileType wake until clangd is attached", function()
+    local callbacks = {}
+    local exec_count = 0
+    local attached = false
+    ue._wake_deferred_clangd_for_test(42, {
+      buffer_ready = function() return true end,
+      get_clients = function()
+        return attached and { { name = "clangd" } } or {}
+      end,
+      exec_autocmds = function(event, opts)
+        t.assert_eq(event, "FileType")
+        t.assert_eq(opts.buffer, 42)
+        exec_count = exec_count + 1
+        attached = exec_count == 2
+      end,
+      defer_fn = function(callback, delay)
+        t.assert_eq(delay, 250)
+        callbacks[#callbacks + 1] = callback
+      end,
+      max_attempts = 3,
+    })
+
+    t.assert_eq(exec_count, 1)
+    t.assert_eq(#callbacks, 1)
+    callbacks[1]()
+    t.assert_eq(exec_count, 2)
+    t.assert_eq(#callbacks, 1)
+  end)
+end)
+
 t.describe("target_platform 无持久状态时的默认值", function()
   local ue = require("ue")
 
@@ -118,10 +236,15 @@ t.describe("target_platform 无持久状态时的默认值", function()
     local root = ("C:/tmp/nvim-ue-plat-%d-%d"):format(vim.fn.getpid(), vim.uv.hrtime())
     vim.fn.mkdir(root, "p")
     local saved = vim.env.UE_TARGET_PLATFORM
+    local platform = require("utils.platform")
+    local saved_driver = platform.driver
     vim.env.UE_TARGET_PLATFORM = nil
-    local plat = ue._target_platform_for_test(root, nil)
+    platform.driver = function() return require("utils.platform.windows") end
+    local ok, plat = pcall(ue._target_platform_for_test, root, nil)
+    platform.driver = saved_driver
     vim.env.UE_TARGET_PLATFORM = saved
     vim.fn.delete(root, "rf")
+    assert(ok, plat)
     -- On a Windows host this must never be Linux (2026-08-18: bare-state
     -- UEBuild produced `<Target> Linux Development` → UBT exit 6,
     -- "Unable to find valid SDK(s) for Linux").

@@ -4638,16 +4638,19 @@ local function export_compile_commands_to_engine_root(ctx)
   return false, "compile_commands.json not found at any controlled candidate path"
 end
 
-local function generate_compile_commands(ctx, progress)
+local function generate_compile_commands(ctx, progress, on_pipeline_done)
   local pipeline = require("ue.cdb.pipeline")
   if pipeline.is_running() then
     return false, "compile_commands pipeline is already running"
   end
 
   local targets = compile_commands_targets(ctx)
+  on_pipeline_done = on_pipeline_done or function(ok_pipeline)
+    if ok_pipeline then CORE_RT.start_deferred_clangd(ctx) end
+  end
 
   local function start_pipeline(path)
-    local jobid, pipeline_err = run_compile_commands_pipeline(path, targets, nil, {
+    local jobid, pipeline_err = run_compile_commands_pipeline(path, targets, on_pipeline_done, {
       force_restart = ctx._force_cdb_restart == true,
     })
     if jobid == nil then
@@ -4742,6 +4745,7 @@ do
       config_root = vim.fn.stdpath("config"),
       signing_identity = opts.signing_identity or (ctx.state and ctx.state.ios_signing_identity),
       device_id = opts.device_id or runtime.device_id,
+      device_backend = opts.device_backend or runtime.device_backend,
       bundle_id = opts.bundle_id or runtime.bundle_id,
       artifacts = opts.artifacts or runtime.artifacts,
       json_output = opts.json_output,
@@ -4788,9 +4792,16 @@ do
     end
     current.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
     all[platform] = current
-    update_state_field(engine_root, "target_runtime", all)
+    local updated, update_err = update_state_field(engine_root, "target_runtime", all)
+    if not updated then return nil, update_err end
     CORE_RT.context_cache = {}
     return current
+  end
+
+  function CORE_RT.target_context_matches(ctx, expected_engine_root, expected_project_root)
+    if type(ctx) ~= "table" then return false end
+    return norm(ctx.engine_root or "") == norm(expected_engine_root or "")
+      and norm(ctx.project_root or "") == norm(expected_project_root or "")
   end
 end
 
@@ -4939,6 +4950,7 @@ local function open_terminal_command(cmd, opts)
   local active_jobid
   active_jobid = vim.fn.termopen(cmd, {
     cwd = opts.cwd,
+    env = opts.env,
     on_stdout = function(_, data)
       stdout_pending = append_job_output(output_lines, stdout_pending, data)
     end,
@@ -6198,6 +6210,136 @@ function M.clangd_root(bufnr)
   return vim.fs.root(bufname ~= "" and bufname or cwd(), { "compile_commands.json", ".clangd", ".git" }) or cwd()
 end
 
+CORE_RT.clangd_deferred_notified = CORE_RT.clangd_deferred_notified or {}
+
+local function clangd_artifact_key(ctx)
+  if not ctx then return nil end
+  local platform_scope = ctx.paths and ctx.paths.clangd_dir
+    or target_platform(ctx.engine_root, nil)
+  return table.concat({
+    norm(ctx.engine_root or ""),
+    norm(ctx.project_root or ""),
+    norm(platform_scope or ""),
+  }, "|")
+end
+
+function CORE_RT.clangd_gate_allows(path, project_root, engine_root, ready)
+  path = trim(path)
+  if path == "" then return true end
+  local inside_ue_roots = CORE_RT.foreign_buffer_key(path, project_root, engine_root) == nil
+  return not inside_ue_roots or ready == true
+end
+
+function CORE_RT.clangd_artifacts_ready(ctx, dependencies)
+  local key = clangd_artifact_key(ctx)
+  if not key then return false end
+
+  dependencies = dependencies or {}
+  local semantic_index_snapshot = dependencies.semantic_index_snapshot
+    or INDEX_FN.semantic_index_snapshot
+  local ok, snapshot = pcall(semantic_index_snapshot, ctx)
+  local ready = ok and type(snapshot) == "table" and snapshot.readiness == "ready"
+  if ready then CORE_RT.clangd_deferred_notified[key] = nil end
+  return ready
+end
+
+function CORE_RT.wake_deferred_clangd_buffer(bufnr, dependencies)
+  dependencies = dependencies or {}
+  local buffer_ready = dependencies.buffer_ready or function(buffer)
+    return vim.api.nvim_buf_is_valid(buffer) and vim.api.nvim_buf_is_loaded(buffer)
+  end
+  local get_clients = dependencies.get_clients or vim.lsp.get_clients
+  local exec_autocmds = dependencies.exec_autocmds or vim.api.nvim_exec_autocmds
+  local defer_fn = dependencies.defer_fn or vim.defer_fn
+  local max_attempts = tonumber(dependencies.max_attempts) or 4
+  local retry_delay_ms = tonumber(dependencies.retry_delay_ms) or 250
+
+  local function clangd_attached()
+    local ok, clients = pcall(get_clients, { bufnr = bufnr, name = "clangd" })
+    return ok and type(clients) == "table" and #clients > 0
+  end
+
+  local function wake(attempt)
+    if not buffer_ready(bufnr) or clangd_attached() then return end
+    pcall(exec_autocmds, "FileType", {
+      buffer = bufnr,
+      modeline = false,
+    })
+    if attempt < max_attempts and not clangd_attached() then
+      defer_fn(function() wake(attempt + 1) end, retry_delay_ms)
+    end
+  end
+
+  wake(1)
+end
+
+function M._wake_deferred_clangd_for_test(bufnr, dependencies)
+  return CORE_RT.wake_deferred_clangd_buffer(bufnr, dependencies)
+end
+
+function CORE_RT.start_deferred_clangd(ctx)
+  if not CORE_RT.clangd_artifacts_ready(ctx) then return end
+  if #vim.api.nvim_list_uis() == 0 then
+    vim.api.nvim_create_autocmd("UIEnter", {
+      once = true,
+      callback = function() CORE_RT.start_deferred_clangd(ctx) end,
+    })
+    return
+  end
+  local allowed_filetypes = {
+    c = true,
+    cpp = true,
+    objc = true,
+    objcpp = true,
+    cuda = true,
+  }
+  vim.schedule(function()
+    for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+      if vim.api.nvim_buf_is_valid(bufnr)
+          and vim.api.nvim_buf_is_loaded(bufnr)
+          and allowed_filetypes[vim.bo[bufnr].filetype] then
+        local path = vim.api.nvim_buf_get_name(bufnr)
+        if CORE_RT.foreign_buffer_key(path, ctx.project_root, ctx.engine_root) == nil then
+          CORE_RT.wake_deferred_clangd_buffer(bufnr)
+        end
+      end
+    end
+  end)
+end
+
+function M.clangd_start_root(bufnr)
+  local root = M.clangd_root(bufnr)
+  local path = vim.api.nvim_buf_get_name(bufnr or 0)
+  local ctx = resolve_context({ bufname = path ~= "" and path or nil })
+  if not ctx then return root end
+  local key = clangd_artifact_key(ctx)
+  local ready = CORE_RT.clangd_artifacts_ready(ctx)
+  if CORE_RT.clangd_gate_allows(path, ctx.project_root, ctx.engine_root, ready) then
+    return root
+  end
+  if key and not CORE_RT.clangd_deferred_notified[key] then
+    CORE_RT.clangd_deferred_notified[key] = true
+    vim.schedule(function()
+      vim.notify(
+        "clangd deferred because the current UE tuple has no valid prepared artifacts; "
+          .. "run :UEPrepare once after the tuple or build evidence changes. "
+          .. "Tree-sitter highlighting remains available.",
+        vim.log.levels.INFO,
+        { title = "UE", timeout = 5000, replace = "ue.clangd.deferred" }
+      )
+    end)
+  end
+  return nil
+end
+
+function M._clangd_artifacts_ready_for_test(ctx, dependencies)
+  return CORE_RT.clangd_artifacts_ready(ctx, dependencies)
+end
+
+function M._clangd_gate_allows_for_test(path, project_root, engine_root, ready)
+  return CORE_RT.clangd_gate_allows(path, project_root, engine_root, ready)
+end
+
 -- Build the minimum-viable ctx that utils.code_search.stream / .is_indexed
 -- need: { workspace_root, csearch_idx }. Returns nil when bufnr is not in a
 -- recognized UE project (so callers can short-circuit gracefully).
@@ -6463,6 +6605,10 @@ end
 
 function M._target_platform_for_test(engine_root)
   return target_platform(engine_root, nil)
+end
+
+function M._update_target_runtime_for_test(engine_root, platform, values)
+  return CORE_RT.update_target_runtime(engine_root, platform, values)
 end
 
 function M._available_platform_choices_for_test(host_driver, project_root, uproject)
@@ -6918,7 +7064,10 @@ local function set_platform(input, opts)
         return
       end
     end
-    local ok_update, update_err = CORE_RT.project_state.update_target(
+    local target_update = opts.stage_next == false
+        and CORE_RT.project_state.update_target
+      or CORE_RT.project_state.stage_target
+    local ok_update, update_err = target_update(
       engine_root,
       (plat and plat ~= "") and plat or current_plat,
       (conf and conf ~= "") and conf or current_conf)
@@ -6930,6 +7079,12 @@ local function set_platform(input, opts)
     refresh_statusline()
     CORE_RT.context_cache = {}
     CORE_RT.freshness_notified = {}
+    if trim(project_root or "") == "" then
+      vim.notify(("UE target staged for the next project: %s %s"):format(
+        plat or default_plat or "(auto)", conf or default_conf),
+        vim.log.levels.INFO, { title = "UE" })
+      return true
+    end
     -- Switching platform repoints gtags/cdb at their <new-key>/ shards, but
     -- the csearch index is PLATFORM-INDEPENDENT (v3.2) — the same shared
     -- csearch/csearch.idx serves every platform, so switching platform does
@@ -6962,7 +7117,7 @@ local function set_platform(input, opts)
         info or "fast-swap failed — run :UEPrepare to generate this platform's shard"),
         vim.log.levels.WARN, { title = "UE", timeout = 6000 })
     end
-    return
+    return true
   end
 
   -- Interactive: select platform then configuration.
@@ -7022,7 +7177,10 @@ local function set_platform(input, opts)
         if opts.on_done then opts.on_done(false) end
         return
       end
-      local ok_update, update_err = CORE_RT.project_state.update_target(engine_root, plat, conf)
+      local target_update = opts.stage_next == false
+          and CORE_RT.project_state.update_target
+        or CORE_RT.project_state.stage_target
+      local ok_update, update_err = target_update(engine_root, plat, conf)
       if not ok_update then
         vim.notify("Failed to set target: " .. tostring(update_err), vim.log.levels.ERROR)
         if opts.on_done then opts.on_done(false) end
@@ -7031,6 +7189,12 @@ local function set_platform(input, opts)
       invalidate_status_cache()
       refresh_statusline()
       CORE_RT.context_cache = {}
+      if trim(project_root or "") == "" then
+        vim.notify(("UE target staged for the next project: %s %s"):format(plat, conf),
+          vim.log.levels.INFO, { title = "UE" })
+        if opts.on_done then opts.on_done(true) end
+        return
+      end
       CORE_RT.freshness_notified = {}
       pcall(function() require("utils.code_search")._reset_probe_cache() end)
       do
@@ -7150,12 +7314,30 @@ local function build_target(opts)
     end
   end
   local function start_build()
+    local function on_exit(code, output)
+      if code == 0
+          and require("ue.targets").supports(target_ctx.platform, "semantic_cdb", host_driver) then
+        local recorded, record_err = update_state_field(ctx.engine_root, "apple_semantic_build", {
+          project_root = ctx.project_root,
+          uproject = ctx.uproject,
+          target = target_ctx.target,
+          platform = target_ctx.platform,
+          configuration = target_ctx.configuration,
+          completed_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        })
+        if not recorded then
+          require("utils.log").notify_error(
+            "ue.build", "failed to record Apple build evidence: " .. tostring(record_err))
+        end
+      end
+      if type(opts.on_exit) == "function" then opts.on_exit(code, output) end
+    end
     return open_terminal_command(cmd, {
       cwd = plan.cwd or ctx.engine_root,
       quickfix_title = title,
       quickfix_root = workspace_root(ctx),
       tail_limit = 16,
-      on_exit = opts.on_exit,
+      on_exit = on_exit,
     })
   end
 
@@ -7180,15 +7362,114 @@ function CORE_RT.clangd_version_compatible(output)
   return major == 22 and minor == 1, major, minor
 end
 
+function CORE_RT.run_clangd_preflight(on_done)
+  on_done = on_done or function() end
+  local clangd_cmd = M.clangd_cmd()
+  local executable = type(clangd_cmd) == "table" and clangd_cmd[1] or nil
+  if not executable or executable == "" then
+    on_done(false, "clangd executable is unavailable")
+    return nil
+  end
+
+  local handle, run_err = require("ue.target_tasks").run({
+    executable = executable,
+    args = { "--version" },
+    metadata = { operation = "clangd-version-preflight" },
+  }, {
+    name = "UEPrepare clangd preflight",
+    on_exit = function(result)
+      if result.code ~= 0 then
+        on_done(false, require("ue.target_tasks").error_message(result))
+        return
+      end
+      local version_output = result.stdout ~= "" and result.stdout or result.stderr
+      local compatible, major, minor = CORE_RT.clangd_version_compatible(version_output)
+      if not compatible then
+        on_done(false, (
+          "clangd %s.%s is incompatible; this repository requires LLVM clangd 22.1.x. "
+            .. "Tree-sitter syntax highlighting remains available, but compiler semantics were not prepared."
+        ):format(tostring(major or "?"), tostring(minor or "?")))
+        return
+      end
+      on_done(true)
+    end,
+  })
+  if not handle then on_done(false, run_err or "failed to start clangd preflight") end
+  return handle
+end
+
 -- Apple toolchains do not reliably retain per-action response files after a
--- successful build. :UECompileForNvim therefore asks the active target driver
--- for a semantic action-graph plan, publishes its tuple-scoped CDB only after
--- validation, then lets the ordinary (prepare-only) pipeline consume it.
-function CORE_RT.generate_semantic_cdb_after_build(on_done)
+-- successful build. :UEPrepare asks the active target driver for a semantic
+-- action-graph plan, publishes its tuple-scoped CDB only after validation,
+-- then lets the ordinary preparation pipeline consume it.
+function CORE_RT.apple_semantic_source_signature(path, fs_stat)
+  local stat = (fs_stat or vim.uv.fs_stat)(path)
+  if type(stat) ~= "table" or stat.type ~= "file" then return nil end
+  local mtime = type(stat.mtime) == "table" and stat.mtime or {}
+  return {
+    path = norm(path),
+    size = tonumber(stat.size) or 0,
+    mtime_sec = tonumber(mtime.sec) or 0,
+    mtime_nsec = tonumber(mtime.nsec) or 0,
+  }
+end
+
+function CORE_RT.apple_semantic_source_marker(ctx, target_ctx, build_evidence, path, entry_count, fs_stat)
+  local source = CORE_RT.apple_semantic_source_signature(path, fs_stat)
+  if not source or trim(build_evidence and build_evidence.completed_at or "") == "" then return nil end
+  return {
+    project_root = ctx.project_root,
+    uproject = ctx.uproject,
+    target = target_ctx.target,
+    platform = target_ctx.platform,
+    configuration = target_ctx.configuration,
+    build_completed_at = build_evidence.completed_at,
+    generated_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    entry_count = tonumber(entry_count) or 0,
+    source = source,
+  }
+end
+
+function CORE_RT.apple_semantic_source_reusable(ctx, target_ctx, path, build_evidence, dependencies)
+  dependencies = dependencies or {}
+  local state = (dependencies.read_state or read_state)(ctx.engine_root)
+  local marker = type(state) == "table" and state.apple_semantic_cdb or nil
+  local source = type(marker) == "table" and marker.source or nil
+  local current = CORE_RT.apple_semantic_source_signature(path, dependencies.fs_stat)
+  if type(source) ~= "table" or not current then return false end
+  local reusable = norm(marker.project_root or "") == norm(ctx.project_root or "")
+    and norm(marker.uproject or "") == norm(ctx.uproject or "")
+    and marker.target == target_ctx.target
+    and marker.platform == target_ctx.platform
+    and marker.configuration == target_ctx.configuration
+    and marker.build_completed_at == (build_evidence and build_evidence.completed_at)
+    and norm(source.path or "") == current.path
+    and tonumber(source.size) == current.size
+    and tonumber(source.mtime_sec) == current.mtime_sec
+    and tonumber(source.mtime_nsec) == current.mtime_nsec
+  if not reusable then return false end
+  return true, {
+    path = current.path,
+    entry_count = tonumber(marker.entry_count) or 0,
+    no_op = true,
+    reused = true,
+  }
+end
+
+function M._apple_semantic_source_reusable_for_test(ctx, target_ctx, path, build_evidence, dependencies)
+  return CORE_RT.apple_semantic_source_reusable(ctx, target_ctx, path, build_evidence, dependencies)
+end
+
+function CORE_RT.generate_semantic_cdb_after_build(on_done, expected)
   on_done = on_done or function() end
   local ctx, context_err = resolve_context()
   if not ctx then
     on_done(false, context_err)
+    return nil
+  end
+  if expected and not CORE_RT.target_context_matches(
+      ctx, expected.engine_root, expected.project_root) then
+    on_done(false, "project changed before Apple semantic CDB generation")
     return nil
   end
 
@@ -7207,6 +7488,21 @@ function CORE_RT.generate_semantic_cdb_after_build(on_done)
 
   local cdb_paths = require("ue.cdb.paths")
   local stable_path = cdb_paths.semantic_source(ctx, target_ctx)
+  local build_evidence = read_state(ctx.engine_root).apple_semantic_build
+  local reusable, reuse_info = CORE_RT.apple_semantic_source_reusable(
+    ctx, target_ctx, stable_path, build_evidence
+  )
+  if reusable then
+    vim.notify(
+      ("Reusing validated %s semantic CDB for the current build (%d entries)."):format(
+        target_ctx.platform, reuse_info.entry_count
+      ),
+      vim.log.levels.INFO,
+      { title = "UEPrepare" }
+    )
+    on_done(true, reuse_info)
+    return true
+  end
   local output_dir = _ufs.dirname(stable_path)
   _ufs.ensure_dir(output_dir)
   local pending_name = ("compile_commands.pending-%d-%s.json"):format(
@@ -7227,11 +7523,12 @@ function CORE_RT.generate_semantic_cdb_after_build(on_done)
   vim.notify(
     ("Generating %s semantic CDB (no cook/package/compile actions)..."):format(target_ctx.platform),
     vim.log.levels.INFO,
-    { title = "UECompileForNvim" }
+    { title = "UEPrepare" }
   )
   local jobid = open_terminal_command(command, {
     cwd = plan.cwd or ctx.engine_root,
-    quickfix_title = ("UECompileForNvim semantic CDB %s %s"):format(
+    env = plan.env,
+    quickfix_title = ("UEPrepare semantic CDB %s %s"):format(
       target_ctx.platform, target_ctx.configuration
     ),
     quickfix_root = workspace_root(ctx),
@@ -7244,6 +7541,12 @@ function CORE_RT.generate_semantic_cdb_after_build(on_done)
         on_done(false, message)
         return
       end
+      if expected and not CORE_RT.target_context_matches(
+          resolve_context(), expected.engine_root, expected.project_root) then
+        pcall(os.remove, pending_path)
+        on_done(false, "project changed during Apple semantic CDB generation")
+        return
+      end
 
       local ok_publish, info = require("ue.cdb.source").promote(
         pending_path, stable_path, ctx, target_ctx, targets.must_get(target_ctx.platform)
@@ -7254,12 +7557,27 @@ function CORE_RT.generate_semantic_cdb_after_build(on_done)
         return
       end
 
+      local marker = CORE_RT.apple_semantic_source_marker(
+        ctx, target_ctx, build_evidence, stable_path, info.entry_count
+      )
+      local marker_ok, marker_err
+      if marker then
+        marker_ok, marker_err = update_state_field(ctx.engine_root, "apple_semantic_cdb", marker)
+      else
+        marker_err = "semantic CDB source signature is unavailable"
+      end
+      if not marker_ok then
+        require("utils.log").notify_error(
+          "ue.prepare", "failed to record reusable Apple semantic CDB evidence: " .. tostring(marker_err)
+        )
+      end
+
       vim.notify(
         ("Semantic CDB ready: %d entries%s"):format(
           info.entry_count, info.no_op and " (unchanged)" or ""
         ),
         vim.log.levels.INFO,
-        { title = "UECompileForNvim" }
+        { title = "UEPrepare" }
       )
       on_done(true, info)
     end,
@@ -7271,62 +7589,178 @@ function CORE_RT.generate_semantic_cdb_after_build(on_done)
   return jobid
 end
 
-function CORE_RT.compile_for_nvim()
-  local clangd_cmd = M.clangd_cmd()
-  local executable = type(clangd_cmd) == "table" and clangd_cmd[1] or nil
-  if not executable or executable == "" then
-    require("utils.log").notify_error("ue.semantic", "clangd executable is unavailable")
+function CORE_RT.ios_setup_is_ready(ctx)
+  local state = read_state(ctx.engine_root)
+  local signing = type(state.ios_signing_identity) == "table" and state.ios_signing_identity or {}
+  local runtimes = type(state.target_runtime) == "table" and state.target_runtime or {}
+  local runtime = type(runtimes.IOS) == "table" and runtimes.IOS or {}
+  if trim(signing.fingerprint or "") == ""
+      or trim(runtime.device_id or "") == ""
+      or trim(runtime.device_backend or "") == ""
+      or trim(runtime.setup_verified_at or "") == ""
+      or runtime.setup_signing_fingerprint ~= signing.fingerprint then
+    return false
+  end
+
+  local driver = require("ue.targets").must_get("IOS")
+  local prepared = driver.prepared_signing_identity(ctx.project_root)
+  return prepared.ok == true
+    and prepared.found == true
+    and prepared.identity.fingerprint == signing.fingerprint
+end
+
+local function apple_build_evidence_tuple_matches(ctx, target_ctx, evidence)
+  if type(evidence) ~= "table" then return false end
+  return norm(evidence.project_root or "") == norm(ctx.project_root or "")
+    and norm(evidence.uproject or "") == norm(ctx.uproject or "")
+    and evidence.target == target_ctx.target
+    and evidence.platform == target_ctx.platform
+    and evidence.configuration == target_ctx.configuration
+    and trim(evidence.completed_at or "") ~= ""
+end
+
+function CORE_RT.apple_build_evidence_matches(ctx, target_ctx, dependencies)
+  dependencies = dependencies or {}
+  local state_reader = dependencies.read_state or read_state
+  local evidence = state_reader(ctx.engine_root).apple_semantic_build
+  if apple_build_evidence_tuple_matches(ctx, target_ctx, evidence) then
+    return true, evidence
+  end
+
+  -- The project may have been built before tuple markers were introduced (or
+  -- in another Nvim process). Recover once from UBT's own successful-build
+  -- receipt; the target driver validates the exact tuple and launch product.
+  local driver = dependencies.driver or require("ue.targets").driver(target_ctx.platform)
+  if not driver or type(driver.build_receipt_evidence) ~= "function" then
+    return false, "no target-specific UBT receipt recovery is available"
+  end
+  local recovered, recovery_err = driver.build_receipt_evidence(target_ctx)
+  if type(recovered) ~= "table" then
+    return false, recovery_err
+  end
+  recovered = vim.deepcopy(recovered)
+  recovered.project_root = ctx.project_root
+  recovered.uproject = ctx.uproject
+  if not apple_build_evidence_tuple_matches(ctx, target_ctx, recovered) then
+    return false, "recovered UBT receipt does not match the current project tuple"
+  end
+
+  local state_writer = dependencies.update_state_field or update_state_field
+  local recorded, record_err = state_writer(ctx.engine_root, "apple_semantic_build", recovered)
+  if not recorded then
+    return false, "successful UBT receipt found but could not persist build evidence: " .. tostring(record_err)
+  end
+  local notify = dependencies.notify or vim.notify
+  notify(
+    ("Recovered successful %s %s build evidence from UBT receipt."):format(
+      target_ctx.platform, target_ctx.configuration
+    ),
+    vim.log.levels.INFO,
+    { title = "UEPrepare" }
+  )
+  return true, recovered
+end
+
+function M._apple_build_evidence_matches_for_test(ctx, target_ctx, dependencies)
+  return CORE_RT.apple_build_evidence_matches(ctx, target_ctx, dependencies)
+end
+
+-- Apple-only prelude owned by :UEPrepare. It validates the pinned clangd,
+-- performs one-time IOS setup when necessary, and publishes a tuple-scoped
+-- semantic CDB. It deliberately never calls build_target: <leader>ub remains
+-- the compile step, and UEPrepare continues to reject a build in progress.
+function CORE_RT.prepare_apple_semantics(ctx, opts, on_done)
+  opts = opts or {}
+  on_done = on_done or function() end
+  local target_ctx, target_err = CORE_RT.target_context(ctx)
+  if not target_ctx then
+    on_done(false, target_err)
+    return nil
+  end
+
+  local targets = require("ue.targets")
+  local host_driver = require("utils.platform").driver()
+  if not targets.supports(target_ctx.platform, "semantic_cdb", host_driver) then
+    on_done(true, { skipped = true })
+    return true
+  end
+  local evidence_ok, evidence_err = CORE_RT.apple_build_evidence_matches(ctx, target_ctx)
+  if not evidence_ok then
+    local message = ("No successful %s %s build evidence for the current tuple; "
+      .. "run <leader>ub and wait for it to finish, then run :UEPrepare."):format(
+      target_ctx.platform, target_ctx.configuration)
+    if trim(evidence_err or "") ~= "" then
+      message = message .. " " .. tostring(evidence_err)
+    end
+    on_done(false, message)
+    return nil
+  end
+
+  local expected = {
+    engine_root = ctx.engine_root,
+    project_root = ctx.project_root,
+  }
+  local function generate()
+    if CORE_RT.ue_build_running() then
+      on_done(false, "UE build started while UEPrepare was preparing Apple semantic evidence")
+      return
+    end
+    CORE_RT.generate_semantic_cdb_after_build(function(ok, info)
+      on_done(ok, info)
+    end, expected)
+  end
+  local function after_setup()
+    if opts._clangd_verified then
+      generate()
+      return
+    end
+    CORE_RT.run_clangd_preflight(function(ok, preflight_err)
+      if not ok then
+        on_done(false, preflight_err)
+        return
+      end
+      generate()
+    end)
+  end
+
+  if target_ctx.platform == "IOS" and not CORE_RT.ios_setup_is_ready(ctx) then
+    CORE_RT.setup_ios({
+      on_done = function(ok, setup_err)
+        if not ok then
+          on_done(false, setup_err, true)
+          return
+        end
+        after_setup()
+      end,
+    })
     return
   end
 
-  return require("ue.target_tasks").run({
-    executable = executable,
-    args = { "--version" },
-    metadata = { operation = "clangd-version-preflight" },
-  }, {
-    name = "UECompileForNvim clangd preflight",
-    on_exit = function(result)
-      if result.code ~= 0 then
-        require("utils.log").notify_error(
-          "ue.semantic", require("ue.target_tasks").error_message(result)
-        )
-        return
-      end
-      local version_output = result.stdout ~= "" and result.stdout or result.stderr
-      local compatible, major, minor = CORE_RT.clangd_version_compatible(version_output)
-      if not compatible then
-        require("utils.log").notify_error("ue.semantic", (
-          "clangd %s.%s is incompatible; this repository requires LLVM clangd 22.1.x. "
-            .. "Tree-sitter syntax highlighting remains available, but compiler semantics were not prepared."
-        ):format(tostring(major or "?"), tostring(minor or "?")))
-        return
-      end
-      build_target({
-        title = "UECompileForNvim",
-        on_exit = function(code)
-          if code == 0 then
-            CORE_RT.generate_semantic_cdb_after_build(function(ok_semantic, semantic_info)
-              if not ok_semantic then
-                require("utils.log").notify_error(
-                  "ue.semantic", tostring(semantic_info or "semantic CDB generation failed")
-                )
-                return
-              end
-              if type(CORE_RT.prepare_async) == "function" then
-                CORE_RT.prepare_async({
-                  force_cdb_restart = type(semantic_info) == "table"
-                    and semantic_info.skipped ~= true
-                    and semantic_info.no_op ~= true,
-                })
-              else
-                require("utils.log").notify_error("ue.semantic", "UEPrepare entry is unavailable")
-              end
-            end)
-          end
-        end,
-      })
-    end,
-  })
+  after_setup()
+end
+
+-- Compatibility convenience: compile once, then delegate all semantic/CDB
+-- ownership to the same :UEPrepare path users invoke directly.
+function CORE_RT.compile_for_nvim()
+  return CORE_RT.run_clangd_preflight(function(ok, preflight_err)
+    if not ok then
+      require("utils.log").notify_error("ue.semantic", tostring(preflight_err))
+      return
+    end
+    build_target({
+      title = "UECompileForNvim",
+      on_exit = function(code)
+        if code ~= 0 then
+          return
+        end
+        if type(CORE_RT.prepare_async) ~= "function" then
+          require("utils.log").notify_error("ue.semantic", "UEPrepare entry is unavailable")
+          return
+        end
+        CORE_RT.prepare_async({ _clangd_verified = true })
+      end,
+    })
+  end)
 end
 
 -- Find the newest APK in project build outputs.
@@ -7628,6 +8062,83 @@ do
     return existing
   end
 
+  local function resolve_ios_legacy_install_script(ctx)
+    local configured = trim(vim.g.ue_ios_install_script or vim.env.UE_IOS_INSTALL_SCRIPT)
+    local candidates = {}
+    if configured ~= "" then
+      candidates[#candidates + 1] = vim.fn.expand(configured)
+    else
+      local project_name = vim.fs.basename(ctx.project_root or "")
+      local branch_version = project_name:match("(%d+%.%d+)")
+      if branch_version then
+        candidates[#candidates + 1] = join(
+          vim.fn.expand("~/Documents/temp"), branch_version, "InstallIOSClient.sh"
+        )
+      end
+    end
+
+    for _, candidate in ipairs(candidates) do
+      local stat = vim.uv.fs_stat(candidate)
+      if stat and stat.type == "file" and vim.fn.executable(candidate) == 1 then
+        return norm(candidate)
+      end
+    end
+
+    if configured ~= "" then
+      return nil, "configured legacy InstallIOSClient.sh is missing or not executable: " .. configured
+    end
+    return nil,
+      "legacy InstallIOSClient.sh was not found for this branch; set vim.g.ue_ios_install_script"
+  end
+
+  local function resolve_ios_usb_reset_script(ctx)
+    local install_script, install_err = resolve_ios_legacy_install_script(ctx)
+    if not install_script then return nil, install_err end
+    local reset_script = join(_ufs.dirname(install_script), "ResetIOSUSB.sh")
+    local stat = vim.uv.fs_stat(reset_script)
+    if stat and stat.type == "file" and vim.fn.executable(reset_script) == 1 then
+      return norm(reset_script)
+    end
+    return nil, "legacy ResetIOSUSB.sh is missing or not executable: " .. reset_script
+  end
+
+  local function prepare_legacy_ios_install(ctx, driver, target_ctx)
+    local script, script_err = resolve_ios_legacy_install_script(ctx)
+    if not script then return nil, script_err end
+
+    local prepared = driver.prepared_signing_identity(ctx.project_root)
+    if not prepared.ok then return nil, prepared.reason end
+    if not prepared.found then
+      return nil, "prepared signing metadata is missing; run PrepareIOSQADebug.sh"
+    end
+
+    local selected = driver.validate_signing_identity(target_ctx.signing_identity)
+    if not selected.ok then return nil, selected.reason end
+    if selected.identity.fingerprint ~= prepared.identity.fingerprint then
+      return nil, "selected IOS signing identity does not match PrepareIOSQADebug metadata"
+    end
+
+    local artifacts = target_ctx.artifacts
+    if type(artifacts) ~= "table" or #artifacts == 0 then
+      local artifact_err
+      artifacts, artifact_err = collect_existing_artifacts(driver, target_ctx)
+      if not artifacts or #artifacts == 0 then
+        return nil, artifact_err
+          or "no tuple-scoped IOS app exists; run :UEBuildIOS before legacy install"
+      end
+      for _, artifact in ipairs(artifacts) do
+        artifact.metadata = type(artifact.metadata) == "table" and artifact.metadata or {}
+        artifact.metadata.source = "legacy-existing-tuple-app"
+        artifact.metadata.discovered_for = "legacy-install"
+      end
+    end
+
+    target_ctx.artifacts = artifacts
+    target_ctx.legacy_install_script = script
+    target_ctx.legacy_signing = prepared
+    return true
+  end
+
   function CORE_RT.run_target_preflight(driver, stage, target_ctx, host_driver, on_done)
     if type(driver.preflight_plans) ~= "function" then
       on_done(true, {})
@@ -7720,11 +8231,12 @@ do
             artifact.metadata.package_completed_at = completed_at
             artifact.metadata.package_exit_code = 0
           end
-          CORE_RT.update_target_runtime(ctx.engine_root, driver.id, {
+          local runtime, update_err = CORE_RT.update_target_runtime(ctx.engine_root, driver.id, {
             artifacts = artifacts,
             target = target_ctx.target,
             configuration = target_ctx.configuration,
           })
+          if not runtime then target_error("ue.package", update_err) end
         end,
       })
     end)
@@ -7751,24 +8263,26 @@ do
     })
   end
 
-  function CORE_RT.select_ios_signing_certificate(query, clear)
+  function CORE_RT.select_ios_signing_certificate(query, clear, opts)
+    opts = type(opts) == "table" and opts or { on_selected = opts }
+    local function fail(message)
+      target_error("ue.ios.signing", message)
+      if type(opts.on_error) == "function" then opts.on_error(message) end
+    end
     query = trim(query or "")
     local ctx, err = resolve_context()
     if not ctx or not ctx.project_root then
-      target_error(
-        "ue.ios.signing",
-        err or "No project configured. Run :UESetProject [path]"
-      )
+      fail(err or "No project configured. Run :UESetProject [path]")
       return
     end
     if clear then
       if query ~= "" then
-        target_error("ue.ios.signing", "bang clears the selection and cannot be combined with an identity")
+        fail("bang clears the selection and cannot be combined with an identity")
         return
       end
       local ok, update_err = update_state_field(ctx.engine_root, "ios_signing_identity", nil)
       if not ok then
-        target_error("ue.ios.signing", update_err)
+        fail(update_err)
         return
       end
       CORE_RT.context_cache = {}
@@ -7779,7 +8293,7 @@ do
     local host_driver = require("utils.platform").driver()
     local driver, unavailable = require("ue.targets").resolve("IOS", "package", host_driver)
     if not driver then
-      target_error("ue.ios.signing", unavailable.reason)
+      fail(unavailable.reason)
       return
     end
 
@@ -7787,10 +8301,11 @@ do
     if query == "" then
       local prepared = driver.prepared_signing_identity(ctx.project_root)
       if not prepared.ok then
-        target_error(
-          "ue.ios.signing",
-          prepared.reason .. "; rerun PrepareIOSQADebug.sh or pass an identity explicitly"
-        )
+        fail(prepared.reason .. "; rerun PrepareIOSQADebug.sh or pass an identity explicitly")
+        return
+      end
+      if opts.require_prepared and not prepared.found then
+        fail("prepared signing metadata is missing; rerun PrepareIOSQADebug.sh, then rerun :UEPrepare")
         return
       end
       if prepared.found then
@@ -7801,59 +8316,98 @@ do
 
     local plan = driver.signing_identity_list_plan(ctx, host_driver)
     if type(plan) ~= "table" or plan.ok == false then
-      target_error("ue.ios.signing", plan and plan.reason or "signing identity probe is unavailable")
+      fail(plan and plan.reason or "signing identity probe is unavailable")
       return
     end
 
     local function persist(identity)
+      if
+        opts.expected_engine_root
+        and not CORE_RT.target_context_matches(
+          resolve_context(),
+          opts.expected_engine_root,
+          opts.expected_project_root
+        )
+      then
+        fail("project changed during IOS setup; rerun :UEPrepare")
+        return
+      end
       local validated = driver.validate_signing_identity(identity)
       if not validated.ok then
-        target_error("ue.ios.signing", validated.reason)
+        fail(validated.reason)
         return
       end
       identity = validated.identity
-      local value = {
-        fingerprint = identity.fingerprint,
-        name = identity.name,
-        selected_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-        selected_from = prepared_identity and "PrepareIOSQADebug" or "keychain",
-      }
-      local ok, update_err = update_state_field(ctx.engine_root, "ios_signing_identity", value)
-      if not ok then
-        target_error("ue.ios.signing", update_err)
+      local target_ctx, context_err = CORE_RT.target_context(ctx, "IOS", {
+        signing_identity = identity,
+      })
+      if not target_ctx then
+        fail(context_err)
         return
       end
-      CORE_RT.context_cache = {}
-      local suffix = prepared_identity and " from PrepareIOSQADebug metadata" or ""
-      vim.notify("IOS signing certificate selected for the current project" .. suffix, vim.log.levels.INFO)
+      CORE_RT.run_target_preflight(driver, "build", target_ctx, host_driver, function(ok, preflight_err)
+        if not ok then
+          fail("IOS signing access preflight failed: " .. tostring(preflight_err))
+          return
+        end
+        if
+          opts.expected_engine_root
+          and not CORE_RT.target_context_matches(
+            resolve_context(),
+            opts.expected_engine_root,
+            opts.expected_project_root
+          )
+        then
+          fail("project changed during IOS setup; rerun :UEPrepare")
+          return
+        end
+        local value = {
+          fingerprint = identity.fingerprint,
+          name = identity.name,
+          selected_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+          selected_from = prepared_identity and "PrepareIOSQADebug" or "keychain",
+        }
+        local updated, update_err = update_state_field(ctx.engine_root, "ios_signing_identity", value)
+        if not updated then
+          fail(update_err)
+          return
+        end
+        CORE_RT.context_cache = {}
+        local suffix = prepared_identity and " from PrepareIOSQADebug metadata" or ""
+        vim.notify(
+          "IOS signing certificate and private-key access verified for the current project" .. suffix,
+          vim.log.levels.INFO
+        )
+        if type(opts.on_selected) == "function" then opts.on_selected(identity) end
+      end)
     end
 
     local handle, run_err = require("ue.target_tasks").run(plan, {
       name = "UE IOS signing identity discovery",
       on_exit = function(result)
         if result.code ~= 0 then
-          target_error("ue.ios.signing", require("ue.target_tasks").error_message(result))
+          fail(require("ue.target_tasks").error_message(result))
           return
         end
         local parsed = driver.parse_signing_identities(
           tostring(result.stdout or "") .. "\n" .. tostring(result.stderr or "")
         )
         if not parsed.ok then
-          target_error("ue.ios.signing", parsed.reason)
+          fail(parsed.reason)
           return
         end
         if #parsed.identities == 0 then
-          target_error("ue.ios.signing", "no valid code-sign identity found in the current keychain")
+          fail("no valid code-sign identity found in the current keychain")
           return
         end
         if query ~= "" then
           local resolved = driver.resolve_signing_identity(parsed.identities, query)
           if not resolved.ok then
-            target_error("ue.ios.signing", resolved.reason)
+            fail(resolved.reason)
             return
           end
           if prepared_identity and resolved.identity.name ~= prepared_identity.name then
-            target_error("ue.ios.signing", "PrepareIOSQADebug identity does not match the current keychain")
+            fail("PrepareIOSQADebug identity does not match the current keychain")
             return
           end
           persist(resolved.identity)
@@ -7865,18 +8419,52 @@ do
             return ("%s [%s]"):format(identity.name, identity.fingerprint:sub(-8))
           end,
         }, function(identity)
-          if identity then persist(identity) end
+          if identity then
+            persist(identity)
+          else
+            fail("IOS signing certificate selection cancelled")
+          end
         end)
       end,
     })
-    if not handle then target_error("ue.ios.signing", run_err) end
+    if not handle then fail(run_err) end
     return handle
   end
 
-  function CORE_RT.select_target_device(platform)
+  function CORE_RT.select_target_device(platform, opts)
+    opts = opts or {}
+    local task_runner = require("ue.target_tasks")
+    local workflow_progress = task_runner.progress({
+      title = "IOS device discovery",
+      message = "Starting device discovery",
+      percentage = 0,
+      replace = "ue.ios.device.discovery",
+    })
+    local progress_finished = false
+    local function finish_progress(message, percentage, level)
+      if progress_finished then return end
+      progress_finished = true
+      workflow_progress:finish(message, percentage, level)
+    end
+    local function fail(message)
+      finish_progress("IOS device discovery failed", nil, vim.log.levels.ERROR)
+      target_error("ue.device", message)
+      if type(opts.on_error) == "function" then opts.on_error(message) end
+    end
     local ctx, err = resolve_context()
     if not ctx then
-      target_error("ue.device", err)
+      fail(err)
+      return
+    end
+    if
+      opts.expected_engine_root
+      and not CORE_RT.target_context_matches(
+        ctx,
+        opts.expected_engine_root,
+        opts.expected_project_root
+      )
+    then
+      fail("project changed during IOS setup; rerun :UEPrepare")
       return
     end
     local output_path = vim.fn.tempname() .. ".devices.json"
@@ -7884,59 +8472,243 @@ do
       json_output = output_path,
     })
     if not target_ctx then
-      target_error("ue.device", context_err)
+      fail(context_err)
       return
     end
     local host_driver = require("utils.platform").driver()
     local resolved, unavailable = require("ue.targets").resolve(driver.id, "device", host_driver)
     if not resolved then
       pcall(os.remove, output_path)
-      target_error("ue.device", unavailable.reason)
+      fail(unavailable.reason)
       return
     end
     driver = resolved
+
+    local function persist_device(device)
+      if
+        opts.expected_engine_root
+        and not CORE_RT.target_context_matches(
+          resolve_context(),
+          opts.expected_engine_root,
+          opts.expected_project_root
+        )
+      then
+        fail("project changed during IOS setup; rerun :UEPrepare")
+        return
+      end
+      local runtime, update_err = CORE_RT.update_target_runtime(ctx.engine_root, driver.id, {
+        device_id = device.id,
+        device_name = device.name,
+        device_backend = device.backend,
+      })
+      if not runtime then
+        fail(update_err)
+        return
+      end
+      finish_progress("IOS device ready: " .. (device.name or device.id), 100)
+      vim.notify(("%s device selected: %s"):format(driver.id, device.name or device.id))
+      if type(opts.on_selected) == "function" then opts.on_selected(device, driver) end
+    end
+
+    local function choose(devices)
+      if #devices == 0 then return false end
+      if opts.auto_select_single == true and #devices == 1 then
+        persist_device(devices[1])
+        return true
+      end
+      workflow_progress:report("Waiting for IOS device selection", 90)
+      vim.ui.select(devices, {
+        prompt = "Select " .. driver.id .. " device:",
+        format_item = function(device)
+          local backend = device.backend and (", " .. device.backend) or ""
+          return ("%s (%s%s, %s)"):format(
+            device.name or "unnamed",
+            device.os_version or device.platform or "unknown",
+            backend,
+            device.id
+          )
+        end,
+      }, function(device)
+        if not device then
+          fail(driver.id .. " device selection cancelled")
+          return
+        end
+        persist_device(device)
+      end)
+      return true
+    end
+
+    local function run_fallback(primary_reason, recovery_attempted)
+      pcall(os.remove, output_path)
+      if
+        type(driver.fallback_device_list_plan) ~= "function"
+        or type(driver.parse_fallback_device_list) ~= "function"
+      then
+        fail(primary_reason)
+        return
+      end
+
+      workflow_progress:report("Checking pre-iOS17 USB MobileDevice", recovery_attempted and 75 or 35)
+      local fallback_plan = driver.fallback_device_list_plan(target_ctx, host_driver)
+      local fallback_handle, fallback_err = task_runner.run(fallback_plan, {
+        name = "UE " .. driver.id .. " fallback device discovery",
+        on_exit = function(result)
+          if result.code ~= 0 then
+            fail(primary_reason .. "; fallback " .. task_runner.error_message(result))
+            return
+          end
+          local parsed = driver.parse_fallback_device_list(result.stdout)
+          if not parsed.ok then
+            fail(primary_reason .. "; fallback " .. parsed.reason)
+            return
+          end
+          if not choose(parsed.devices) then
+            if driver.id == "IOS" and not recovery_attempted then
+              local reset_script, reset_err = resolve_ios_usb_reset_script(ctx)
+              if not reset_script then
+                fail(primary_reason .. "; no available pre-iOS17 USB device; " .. tostring(reset_err))
+                return
+              end
+              workflow_progress:report("Recovering legacy IOS USB route", 55)
+              local reset_args = {}
+              if trim(target_ctx.device_id or "") ~= "" then
+                reset_args = { "--force", target_ctx.device_id }
+              end
+              local reset_handle, reset_run_err = task_runner.run({
+                executable = reset_script,
+                args = reset_args,
+                cwd = _ufs.dirname(reset_script),
+                metadata = { platform = "IOS", operation = "device-recovery" },
+              }, {
+                name = "UE IOS USB recovery",
+                on_exit = function(reset_result)
+                  if reset_result.code ~= 0 then
+                    fail("IOS USB recovery failed: " .. task_runner.error_message(reset_result))
+                    return
+                  end
+                  workflow_progress:report("Rechecking recovered IOS device", 70)
+                  run_fallback(primary_reason, true)
+                end,
+              })
+              if not reset_handle then
+                fail("IOS USB recovery failed to start: " .. tostring(reset_run_err))
+              end
+              return
+            end
+            fail(primary_reason .. "; no available pre-iOS17 USB device")
+          end
+        end,
+      })
+      if not fallback_handle then
+        fail(primary_reason .. "; fallback " .. tostring(fallback_err))
+      end
+    end
+
+    workflow_progress:report("Checking CoreDevice", 10)
     local plan = driver.device_list_plan(target_ctx, host_driver)
-    local handle, run_err = require("ue.target_tasks").run(plan, {
+    local handle, run_err = task_runner.run(plan, {
       name = "UE " .. driver.id .. " device discovery",
       on_exit = function(result)
         if result.code ~= 0 then
-          pcall(os.remove, output_path)
-          target_error("ue.device", require("ue.target_tasks").error_message(result))
+          run_fallback(task_runner.error_message(result))
           return
         end
         local payload, payload_err = read_result_file(output_path)
         if not payload then
-          target_error("ue.device", payload_err)
+          run_fallback(payload_err)
           return
         end
         local parsed = driver.parse_device_list(payload)
         if not parsed.ok then
-          target_error("ue.device", parsed.reason)
+          run_fallback(parsed.reason)
           return
         end
-        if #parsed.devices == 0 then
-          target_error("ue.device", "no available physical " .. driver.id .. " device")
-          return
+        if not choose(parsed.devices) then
+          run_fallback("no available physical " .. driver.id .. " CoreDevice")
         end
-        vim.ui.select(parsed.devices, {
-          prompt = "Select " .. driver.id .. " device:",
-          format_item = function(device)
-            return ("%s (%s, %s)"):format(
-              device.name or "unnamed", device.os_version or device.platform or "unknown", device.id
-            )
-          end,
-        }, function(device)
-          if not device then return end
-          CORE_RT.update_target_runtime(ctx.engine_root, driver.id, {
-            device_id = device.id,
-            device_name = device.name,
-          })
-          vim.notify(("%s device selected: %s"):format(driver.id, device.name or device.id))
-        end)
       end,
     })
-    if not handle then target_error("ue.device", run_err) end
+    if not handle then run_fallback(run_err or "primary device discovery failed to start") end
     return handle
+  end
+
+  function CORE_RT.setup_ios(opts)
+    opts = opts or {}
+    local settled = false
+    local function finish(ok, detail)
+      if settled then return end
+      settled = true
+      if type(opts.on_done) == "function" then opts.on_done(ok, detail) end
+    end
+    local function fail(message)
+      target_error("ue.ios.setup", message)
+      finish(false, message)
+    end
+    local ctx, err = resolve_context()
+    if not ctx or not ctx.project_root then
+      fail(err or "No project configured. Run :UESetProject [path]")
+      return
+    end
+    local setup_engine_root = ctx.engine_root
+    local setup_project_root = ctx.project_root
+    if target_platform(setup_engine_root, nil) ~= "IOS" then
+      -- This is setup's internal normalization, not an explicit
+      -- :UESetPlatform intent. Keep it scoped to the current project instead
+      -- of handing IOS to a later :UESetProject invocation.
+      if not set_platform("IOS", { stage_next = false }) then
+        fail("failed to set IOS target")
+        return
+      end
+    end
+
+    CORE_RT.select_ios_signing_certificate("", false, {
+      require_prepared = true,
+      expected_engine_root = setup_engine_root,
+      expected_project_root = setup_project_root,
+      on_error = function(setup_err)
+        finish(false, setup_err)
+      end,
+      on_selected = function(identity)
+        CORE_RT.select_target_device("IOS", {
+          auto_select_single = true,
+          expected_engine_root = setup_engine_root,
+          expected_project_root = setup_project_root,
+          on_error = function(setup_err)
+            finish(false, setup_err)
+          end,
+          on_selected = function(device, driver)
+            local current = resolve_context()
+            if not CORE_RT.target_context_matches(current, setup_engine_root, setup_project_root) then
+              fail("project changed during IOS setup; rerun :UEPrepare")
+              return
+            end
+            if device.backend == "legacy-mobiledevice" then
+              local script, script_err = resolve_ios_legacy_install_script(current)
+              if not script then
+                fail(script_err)
+                return
+              end
+            end
+            local runtime, update_err = CORE_RT.update_target_runtime(setup_engine_root, driver.id, {
+              setup_verified_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+              setup_signing_fingerprint = identity.fingerprint,
+            })
+            if not runtime then
+              fail(update_err)
+              return
+            end
+            vim.notify((
+              "IOS setup ready: signing/private key and %s device route verified; "
+                .. "UEPrepare will continue with Apple compiler semantics"
+            ):format(device.backend or "coredevice"), vim.log.levels.INFO)
+            finish(true, {
+              device = device,
+              signing_identity = identity,
+            })
+          end,
+        })
+      end,
+    })
   end
 
   local function with_target_bundle_id(ctx, driver, target_ctx, host_driver, on_done)
@@ -7944,6 +8716,16 @@ do
     if type(artifacts) ~= "table" or #artifacts == 0 then
       on_done(nil, nil,
         "no artifact provenance from a successful package task; run :UEPackage" .. driver.id)
+      return
+    end
+    if target_ctx.device_backend == "legacy-mobiledevice" then
+      local signing = target_ctx.legacy_signing or {}
+      local validated = driver.validate_bundle_id(signing.bundle_identifier)
+      if not validated.ok then
+        on_done(nil, nil, validated.reason)
+        return
+      end
+      on_done(validated.bundle_id, artifacts)
       return
     end
     local selected = driver.select_staged_artifact(artifacts, target_ctx)
@@ -8007,46 +8789,110 @@ do
       return
     end
     driver = resolved
-    CORE_RT.run_target_preflight(driver, "install", target_ctx, host_driver, function(ok, preflight_err)
-      if not ok then
-        target_error("ue.install", preflight_err)
+    local task_runner = require("ue.target_tasks")
+    local install_progress = task_runner.progress({
+      title = driver.id .. " install",
+      message = "Validating signing and install inputs",
+      percentage = 0,
+      replace = "ue.target.install." .. driver.id:lower(),
+    })
+    local install_progress_finished = false
+    local function finish_install_progress(message, percentage, level)
+      if install_progress_finished then return end
+      install_progress_finished = true
+      install_progress:finish(message, percentage, level)
+    end
+    local function install_error(message)
+      finish_install_progress(driver.id .. " install failed", nil, vim.log.levels.ERROR)
+      target_error("ue.install", message)
+    end
+    if target_ctx.device_backend == "legacy-mobiledevice" then
+      local prepared, prepared_err = prepare_legacy_ios_install(ctx, driver, target_ctx)
+      if not prepared then
+        pcall(os.remove, output_path)
+        install_error(prepared_err)
         return
       end
+    end
+    install_progress:report("Checking SDK, signing identity, and private key", 8)
+    CORE_RT.run_target_preflight(driver, "install", target_ctx, host_driver, function(ok, preflight_err)
+      if not ok then
+        install_error(preflight_err)
+        return
+      end
+      install_progress:report("Resolving bundle and tuple artifact", 12)
       with_target_bundle_id(ctx, driver, target_ctx, host_driver, function(bundle_id, artifacts, bundle_err)
         if not bundle_id then
-          target_error("ue.install", bundle_err)
+          install_error(bundle_err)
           return
         end
         target_ctx.bundle_id = bundle_id
         target_ctx.artifacts = artifacts
         target_ctx.json_output = output_path
         local plan = driver.install_plan(target_ctx, host_driver)
-        local handle, run_err = require("ue.target_tasks").run(plan, {
+        install_progress:report("Starting container-preserving install", 15)
+        local function progress_report(message, percentage)
+          install_progress:report(message, percentage)
+        end
+        local stdout_progress = type(driver.install_progress_tracker) == "function"
+            and driver.install_progress_tracker(progress_report)
+          or function() end
+        local stderr_progress = type(driver.install_progress_tracker) == "function"
+            and driver.install_progress_tracker(progress_report)
+          or function() end
+        local handle, run_err = task_runner.run(plan, {
           name = "UE " .. driver.id .. " install",
+          on_stdout = stdout_progress,
+          on_stderr = stderr_progress,
           on_exit = function(result)
             if result.code ~= 0 then
               pcall(os.remove, output_path)
-              target_error("ue.install", require("ue.target_tasks").error_message(result))
+              local failure = type(driver.install_failure_reason) == "function"
+                  and driver.install_failure_reason(result, plan)
+                or nil
+              install_error(failure or task_runner.error_message(result))
+              return
+            end
+            if plan.metadata and plan.metadata.backend == "legacy-mobiledevice" then
+              pcall(os.remove, output_path)
+              local runtime, update_err = CORE_RT.update_target_runtime(ctx.engine_root, driver.id, {
+                device_id = target_ctx.device_id,
+                device_backend = target_ctx.device_backend,
+                bundle_id = bundle_id,
+              })
+              if not runtime then
+                install_error(update_err)
+                return
+              end
+              finish_install_progress("IOS app installed", 100)
+              vim.notify(("Installed %s on %s via legacy MobileDevice"):format(
+                bundle_id, target_ctx.device_id
+              ))
               return
             end
             local payload, payload_err = read_result_file(output_path)
-            if not payload then target_error("ue.install", payload_err); return end
+            if not payload then install_error(payload_err); return end
             local parsed = driver.parse_install_result(payload, {
               device_id = target_ctx.device_id,
               bundle_id = bundle_id,
             })
-            if not parsed.ok then target_error("ue.install", parsed.reason); return end
-            CORE_RT.update_target_runtime(ctx.engine_root, driver.id, {
+            if not parsed.ok then install_error(parsed.reason); return end
+            local runtime, update_err = CORE_RT.update_target_runtime(ctx.engine_root, driver.id, {
               device_id = target_ctx.device_id,
               bundle_id = bundle_id,
               artifacts = artifacts,
             })
+            if not runtime then
+              install_error(update_err)
+              return
+            end
+            finish_install_progress(driver.id .. " app installed", 100)
             vim.notify(("Installed %s on %s"):format(bundle_id, target_ctx.device_id))
           end,
         })
         if not handle then
           pcall(os.remove, output_path)
-          target_error("ue.install", run_err or "install task failed to start")
+          install_error(run_err or "install task failed to start")
         end
       end)
     end)
@@ -8100,12 +8946,16 @@ do
               bundle_id = bundle_id,
             })
             if not parsed.ok then target_error("ue.launch", parsed.reason); return end
-            CORE_RT.update_target_runtime(ctx.engine_root, driver.id, {
+            local runtime, update_err = CORE_RT.update_target_runtime(ctx.engine_root, driver.id, {
               device_id = target_ctx.device_id,
               bundle_id = bundle_id,
               artifacts = artifacts,
               process_id = parsed.process_id,
             })
+            if not runtime then
+              target_error("ue.launch", update_err)
+              return
+            end
             vim.notify(("Launched %s on %s (pid %s)"):format(
               bundle_id, target_ctx.device_id, tostring(parsed.process_id)
             ))
@@ -8746,6 +9596,51 @@ local function prepare_async(opts)
     CORE_RT.prepare_jobid = nil
   end
 
+  -- Apple-only semantic prelude. The prepare lease begins before IOS setup /
+  -- GenerateClangDatabase and is handed into the ordinary pipeline, so two
+  -- Neovim instances cannot publish the same tuple source concurrently.
+  -- Non-Apple targets skip this entire branch and retain their existing RSP
+  -- path byte-for-byte.
+  if not opts._semantic_ready then
+    local target_ctx = CORE_RT.target_context(ctx)
+    local targets = require("ue.targets")
+    local host_driver = require("utils.platform").driver()
+    if target_ctx and targets.supports(target_ctx.platform, "semantic_cdb", host_driver) then
+      if CORE_RT.prepare_bootstrap_running then
+        vim.notify("UEPrepare Apple semantic setup is already running", vim.log.levels.INFO)
+        return
+      end
+      local bootstrap_lease, bootstrap_lease_err = CORE_RT.file_lock.acquire(
+        join(ctx.paths.runtime_dir, "prepare.lock"))
+      if not bootstrap_lease then
+        vim.notify("UEPrepare is running in another Neovim: " .. tostring(bootstrap_lease_err),
+          vim.log.levels.WARN, { title = "UE" })
+        return
+      end
+      CORE_RT.prepare_bootstrap_running = true
+      CORE_RT.prepare_apple_semantics(ctx, opts, function(ok, semantic_info, already_reported)
+        CORE_RT.prepare_bootstrap_running = false
+        if not ok then
+          CORE_RT.file_lock.release(bootstrap_lease)
+          if not already_reported then
+            require("utils.log").notify_error(
+              "ue.prepare", tostring(semantic_info or "Apple semantic preparation failed"))
+          end
+          return
+        end
+        local next_opts = vim.tbl_extend("force", opts, {
+          _semantic_ready = true,
+          _prepare_lease = bootstrap_lease,
+          force_cdb_restart = type(semantic_info) == "table"
+            and semantic_info.skipped ~= true
+            and semantic_info.no_op ~= true,
+        })
+        prepare_async(next_opts)
+      end)
+      return
+    end
+  end
+
   -- Stash force flags so the cache fast-path csearch staleness check
   -- can honor :UEPrepareReindex (force a csearch rebuild even when the
   -- regular UEPrepare cache is fresh).
@@ -8826,8 +9721,12 @@ local function prepare_async(opts)
   -- Cover the entire fast path, including async CDB generation and the writer
   -- pipeline. Previously only the cold GTAGS phase set this flag, so two quick
   -- :UEPrepare calls could concurrently rewrite compile_commands.json.
-  local prepare_lease, prepare_lease_err = CORE_RT.file_lock.acquire(
-    join(ctx.paths.runtime_dir, "prepare.lock"))
+  local prepare_lease = opts._prepare_lease
+  local prepare_lease_err
+  if not prepare_lease then
+    prepare_lease, prepare_lease_err = CORE_RT.file_lock.acquire(
+      join(ctx.paths.runtime_dir, "prepare.lock"))
+  end
   if not prepare_lease then
     if handle then handle.message = "BUSY"; handle:finish() end
     vim.notify("UEPrepare is running in another Neovim: " .. tostring(prepare_lease_err),
@@ -8896,6 +9795,7 @@ local function prepare_async(opts)
           invalidate_status_cache()
           refresh_statusline()
           set_prepare_running(false)
+          CORE_RT.start_deferred_clangd(ctx)
           if handle then handle.message = "done"; handle.percentage = 100; handle:finish() end
           vim.notify(prepare_summary(ctx, compile_path, { reused_cache = true }))
         end, { force_restart = ctx._force_cdb_restart })
@@ -9069,10 +9969,27 @@ local function prepare_async(opts)
     update("generating compile_commands...", 30)
     start_phase()
 
+    local cdb_pipeline_done = false
+    local cdb_pipeline_ok = false
+    local cdb_pipeline_err
+    local finalize_waiting = false
+    local finalize_after_csearch
+    local function on_compile_pipeline_done(ok_pipeline, pipeline_err)
+      cdb_pipeline_done = true
+      cdb_pipeline_ok = ok_pipeline == true
+      cdb_pipeline_err = pipeline_err
+      if finalize_waiting and finalize_after_csearch then
+        finalize_after_csearch()
+      end
+    end
+
     local ok_compile, compile_path = CORE_RT.trace_seg("cold.ccjson", function()
-      return generate_compile_commands(ctx)
+      return generate_compile_commands(ctx, nil, on_compile_pipeline_done)
     end)
     if not ok_compile then
+      cdb_pipeline_done = true
+      cdb_pipeline_ok = false
+      cdb_pipeline_err = compile_path
       vim.notify("UEPrepare: compile_commands failed (non-fatal): " .. (compile_path or "unknown"), vim.log.levels.WARN)
     end
 
@@ -9168,7 +10085,12 @@ local function prepare_async(opts)
           update("building csearch index...", 85)
 
           local code_search = require("utils.code_search")
-          local function finalize_after_csearch()
+          finalize_after_csearch = function()
+            if not cdb_pipeline_done then
+              finalize_waiting = true
+              update("finishing compile_commands pipeline...", 95)
+              return
+            end
             end_phase("csearch")
 
             -- ── Finalize ───────────────────────────────────────────
@@ -9176,6 +10098,16 @@ local function prepare_async(opts)
             invalidate_status_cache()
             refresh_statusline()
             set_prepare_running(false)
+            if cdb_pipeline_ok then
+              CORE_RT.start_deferred_clangd(ctx)
+            else
+              vim.notify(
+                "UEPrepare finished non-clangd indexes, but the CDB pipeline failed; "
+                  .. "clangd remains deferred: " .. tostring(cdb_pipeline_err or "unknown error"),
+                vim.log.levels.WARN,
+                { title = "UE" }
+              )
+            end
 
             -- Index just rebuilt: drop the resolve_context cache so the next
             -- grep re-reads is_indexed() fresh, and re-probe the csearch
@@ -9805,7 +10737,7 @@ function M.setup()
     build_target({ operation = "so_build" })
   end, {})
   vim.api.nvim_create_user_command("UECompileForNvim", CORE_RT.compile_for_nvim, {
-    desc = "Compile the active target, then prepare its RSP-backed clangd database",
+    desc = "Compatibility entry: build the active target, then run the normal UEPrepare path",
   })
   vim.api.nvim_create_user_command("UEPackageIOS", function()
     CORE_RT.package_target("IOS")
@@ -9813,6 +10745,11 @@ function M.setup()
   vim.api.nvim_create_user_command("UEIOSSymbols", function()
     CORE_RT.generate_target_symbols("IOS")
   end, { desc = "Generate and UUID-verify the current IOS binary's dSYM on demand" })
+  vim.api.nvim_create_user_command("UEIOSSetup", function()
+    CORE_RT.setup_ios()
+  end, {
+    desc = "One-time IOS setup from PrepareIOSQADebug signing evidence and the connected device",
+  })
   vim.api.nvim_create_user_command("UESetIOSSigningCertificate", function(cmd)
     CORE_RT.select_ios_signing_certificate(cmd.args, cmd.bang)
   end, {
@@ -9843,7 +10780,7 @@ function M.setup()
   vim.api.nvim_create_user_command("UEPrepare", function(cmd)
     local bang = cmd.bang and true or false
     require("utils.async_launcher").launch({
-      name  = bang and "UE: Prepare (FORCE full rebuild)" or "UE: Prepare (rsp + ccjson + index)",
+      name  = bang and "UE: Prepare (FORCE full rebuild)" or "UE: Prepare (semantic + ccjson + index)",
       group = "ue",
       cancel = function()
         -- <C-c> on the launcher float cancels the prepare jobs registered in

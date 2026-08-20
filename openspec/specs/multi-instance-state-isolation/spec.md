@@ -77,6 +77,10 @@ engine 级 target preference（`.cache/nvim-ue/target-default.json`）SHALL 在�
 需要 platform 的操作（如 UEBuild）MUST NOT 在未设置时静默采用任何默认值构建，SHALL 先
 要求一次显式选择。
 
+同一 Neovim 进程内，显式 `:UESetPlatform` SHALL 额外捕获一个 one-shot target intent：若尚未
+执行目标 `:UESetProject`，下一次显式 project selection SHALL 将该 pair 写入所选 project bucket 后消费。
+该 intent MUST NOT 跨进程持久化为 build authority，也 MUST NOT 导致之后未关联的 project switch 继承。
+
 #### Scenario: 新 bucket 不自动继承
 
 - **WHEN** 项目 A 显式设置 `(Android, Test)` 后用户切换到从未设置过 target 的项目 B
@@ -89,6 +93,13 @@ engine 级 target preference（`.cache/nvim-ue/target-default.json`）SHALL 在�
 - **THEN** 系统 SHALL 先弹出 platform/configuration 选择（建议项置顶）
 - **AND** 用户确认后 SHALL 持久化到该 project bucket 并继续原构建
 - **AND** 用户取消时 MUST NOT 以猜测的 platform 继续构建
+
+#### Scenario: 先设置平台再设置工程
+
+- **WHEN** 用户先显式选择 `(IOS, Development)`，再执行 `:UESetProject` 选择项目 B
+- **THEN** B 的 per-project target selection SHALL 原子写入 `(IOS, Development)`
+- **AND** 后续再切换到项目 C 时 MUST NOT 重放已经消费的 one-shot intent
+- **AND** 另一个 Neovim 进程 MUST NOT 观察到该 live intent
 
 ### Requirement: destructive cache writers SHALL hold cross-process leases
 

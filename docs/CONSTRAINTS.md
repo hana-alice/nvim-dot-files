@@ -383,7 +383,16 @@
   解决: clangd 固定 `--enable-config=false`，不再写 `.clangd`、不传 `--index-file`；current/hot/full
   发布带 generation/coverage manifest 的 controlled BackgroundIndex CDB，只接受
   compiler-authored UBT unity membership 或 exact per-file fallback，并通过官方
-  `compilationDatabaseChanges` 注入打开文件 exact command。definition 的最终权威是
+  `compilationDatabaseChanges` 注入打开文件 exact command。phase artifact 可携带 portable
+  unity provenance，但发布给 clangd 的 JSON CDB 必须剥离非标准字段；generation hash 的 map
+  key 必须 canonical 排序，不能受 Lua 进程 hash randomization 影响。source 不在 synthetic CDB 时，
+  exact-command 首次传输必须有界重开已 attached buffer，使 cold AST 不继续使用邻近 TU 推断命令。
+  clangd 的 prepare gate 必须消费持久化 tuple artifact readiness：selection/manifest/controlled CDB 与
+  源 CDB 签名仍匹配时，Nvim 重启后直接复用；不得把“当前 Lua 进程执行过 UEPrepare”当作资格。
+  同进程内工件发生变化也必须重新验证，缺失/stale 才 defer。
+  exact argv 证明 `.cpp/.h` 实际为 Objective-C++ 时，必须保留 C++ Tree-sitter 并叠加内置 `objcpp`
+  syntax；禁止把 mixed source 整体交给仅继承 C 的 `objc` Tree-sitter grammar，普通平台不得受影响。
+  definition 的最终权威是
   canonical USR + subject module AST 唯一 body，clangd 仅作 identity-verified secondary provider。
   → `lua/ue.lua` `clangd_cmd`; `lua/ue/index/`; `lua/ue/clangd_commands.lua`;
     `tests/cases/{ue_api,index_generation,cpp_semantic_index,clangd_commands}_spec.lua`

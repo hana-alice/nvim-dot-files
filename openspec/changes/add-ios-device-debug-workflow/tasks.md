@@ -11,6 +11,9 @@
   变化重新 hash、输出仍逐个校验，且 miss 始终完整 AOT。
 - [x] 1.5 用 driver/script 测试冻结增量 skip matrix：Build.sh 始终执行；不得给 `:UEBuildIOS` 使用
   `-SkipBuild`；AOT/dSYM/Package Build/Cook/clean-stage 只按各自证据跳过。
+- [x] 1.6 新增 `:UEIOSSetup` 一次性配置入口：设置 IOS target、导入 prepared identity、用临时 Mach-O
+  实测非交互私钥访问、自动选择唯一设备并验证 legacy helper；所有已配置 build/install 在重签大型 app
+  前复用同一私钥探针；缺少 prepared manifest、异步切 project 或状态写入失败时 fail closed。
 ## 2. 真机 protocol spike
 
 - [x] 2.1 新增参数化 LLDB CLI/raw-DAP probe；不得包含现场 device、bundle、证书或绝对工程路径。
@@ -19,6 +22,9 @@
 - [x] 2.2a 证明 pre-iOS17/CoreDevice 不可达设备的显式 legacy preflight：MobileDevice USB、
   `ios-deploy`、精确 ProductType/OS/build DeviceSupport、DeveloperDiskImage、debugserver listener 与
   LLDB `remote-ios` 可用；记录设备 profile 未信任与 source DWARF 缺失 blocker，保持 matrix unavailable。
+- [x] 2.2b `:UESetIOSDevice` 在 CoreDevice 为空时使用结构化 `xcdevice` JSON 列出 available physical USB
+  pre-iOS17 设备并保存 legacy backend；install 复用 `InstallIOSClient.sh` 的 prepared-signing、只读源 app、
+  无 uninstall MobileDevice 更新契约，普通 launch 继续 CoreDevice-only、明确 fail closed。
 - [ ] 2.3 在已运行 app 上证明 device/bundle/PID、Developer Mode、debug entitlement、
   binary/dSYM/loaded-image UUID、threads、resolved breakpoint、真实 stop frame。
 - [ ] 2.4 证明 `disconnect(terminateDebuggee=false)` 后 app 存活且无残留 helper；覆盖 adapter crash、

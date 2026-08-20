@@ -45,6 +45,36 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-08-20 — Sync/archive iOS build-device OpenSpec contract
+
+**Task**
+
+按 `sync → archive → commit → push` 收口本轮 iOS build/setup/device/install 与 fail-closed debug gate 契约。
+
+**Implemented**
+
+- 将 active change 的 3 个 `ios-build-run-workflow` MODIFIED requirements 同步到 canonical spec：安全 AOT/
+  dSYM/package 复用、prepared signing/private-key setup，以及 CoreDevice/pre-iOS17 legacy 设备分流。
+- 发布 canonical `ios-device-debug-workflow`，明确真机 protocol/breakpoint/frame/UUID/cleanup evidence 完成前
+  IOS DAP 保持 unavailable。
+- 将 change 归档到 `openspec/changes/archive/2026-08-20-add-ios-device-debug-workflow`；未完成 DAP tasks 原样
+  保留为 deferred history，archive note 不把它们误报为已实现。
+
+**Pitfalls / Gotchas**
+
+- 本机没有 `openspec` CLI，因此按仓库既有 manual sync/archive 流程逐 requirement 比对。
+- archive 表示当前已实现范围与 fail-closed 边界收口，不代表物理 iOS DAP 已解锁。
+
+**Validation**
+
+- canonical/delta requirement comparison：3 个 modified blocks 与 1 个 added capability 一致。
+- `structure` 39/39；全量 `nvim --headless -l tests/run.lua` 1020/1020；bare-global lint 140 files OK；
+  `git diff --check` 通过。
+
+**Follow-ups**
+
+- iOS DAP 需新的 active change 消费 canonical 真机 evidence gates 后才能实现。
+
 ### 2026-08-20 — 让 prepare 工件跨 Nvim 重启复用并修正成员 Ctrl-click
 
 **Task**

@@ -42,10 +42,21 @@ end
 function M.progress(opts)
   opts = opts or {}
   local title = trim(opts.title) ~= "" and trim(opts.title) or "UE"
+  local scope = trim(opts.scope) ~= "" and trim(opts.scope) or "ue.target"
   local message = trim(opts.message) ~= "" and trim(opts.message) or "starting"
   local percentage = tonumber(opts.percentage)
   local done = false
   local fidget_handle
+  local function record_history(next_message, level)
+    pcall(function()
+      require("utils.notification_history").record({
+        scope = scope,
+        title = title,
+        message = next_message,
+        level = level or vim.log.levels.INFO,
+      })
+    end)
+  end
   local ok, fidget = pcall(require, "fidget.progress")
   if ok and fidget and fidget.handle and type(fidget.handle.create) == "function" then
     local created, handle = pcall(fidget.handle.create, {
@@ -62,6 +73,7 @@ function M.progress(opts)
   if not fidget_handle then
     vim.notify(message, vim.log.levels.INFO, { title = title, replace = replace })
   end
+  record_history(message, vim.log.levels.INFO)
 
   local controller = {}
   function controller:report(next_message, next_percentage)
@@ -84,6 +96,7 @@ function M.progress(opts)
     if done then return end
     self:report(final_message or message, final_percentage)
     done = true
+    record_history(final_message or message, level)
     if fidget_handle then
       pcall(fidget_handle.finish, fidget_handle)
     else

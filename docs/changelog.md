@@ -45,6 +45,35 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-08-20 — Preserve target install progress in notification history
+
+**Task**
+
+修复 `<leader>ui` 的 IOS target install 只显示短暂 Fidget/notify、但 `:NotificationHistory` 查不到记录的问题。
+
+**Implemented**
+
+- `lua/ue/target_tasks.lua` 的 progress controller 现在记录用户触发流程的开始与终态，并保留调用方 scope；
+  中间百分比更新不入历史，避免把高频 progress 变成 history spam。
+- `lua/ue.lua` 为 target install 指定 `ue.install` scope，并让成功终态携带 bundle id、device id 以及 legacy
+  MobileDevice backend（如适用），使 `<leader>ui` 的最终结果可在历史中完整复查。
+- `tests/cases/ue_target_tasks_spec.lua` 增加 Fidget 存在时的回归，证明 history 仍收到且只收到开始/终态两条。
+
+**Pitfalls / Gotchas**
+
+- Fidget progress 不经过 `vim.notify`；而本仓为避免插件冲突也不会 monkey-patch `vim.notify`，所以必须在
+  progress controller 边界显式写 notification history。
+
+**Validation**
+
+- 定向：`ue_target_tasks` 7/7、`ue_target_drivers` 45/45、`ue_target_integration` 22/22、`platform` 23/23、
+  `commands` 105/105、`ue_api` 55/55、`smoke` 19/19、`utils` 51/51、`structure` 39/39。
+- 全量 `nvim --headless -l tests/run.lua` 1021/1021；bare-global lint 140 files OK。
+
+**Follow-ups**
+
+- 无。
+
 ### 2026-08-20 — Sync/archive iOS build-device OpenSpec contract
 
 **Task**

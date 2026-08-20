@@ -8792,6 +8792,7 @@ do
     local task_runner = require("ue.target_tasks")
     local install_progress = task_runner.progress({
       title = driver.id .. " install",
+      scope = "ue.install",
       message = "Validating signing and install inputs",
       percentage = 0,
       replace = "ue.target.install." .. driver.id:lower(),
@@ -8864,10 +8865,11 @@ do
                 install_error(update_err)
                 return
               end
-              finish_install_progress("IOS app installed", 100)
-              vim.notify(("Installed %s on %s via legacy MobileDevice"):format(
+              local message = ("Installed %s on %s via legacy MobileDevice"):format(
                 bundle_id, target_ctx.device_id
-              ))
+              )
+              finish_install_progress(message, 100)
+              vim.notify(message)
               return
             end
             local payload, payload_err = read_result_file(output_path)
@@ -8886,8 +8888,9 @@ do
               install_error(update_err)
               return
             end
-            finish_install_progress(driver.id .. " app installed", 100)
-            vim.notify(("Installed %s on %s"):format(bundle_id, target_ctx.device_id))
+            local message = ("Installed %s on %s"):format(bundle_id, target_ctx.device_id)
+            finish_install_progress(message, 100)
+            vim.notify(message)
           end,
         })
         if not handle then

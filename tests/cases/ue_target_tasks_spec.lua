@@ -106,4 +106,38 @@ t.describe("ue.target_tasks", function()
     t.assert_eq(reports[3].message, "installed")
     t.assert_eq(finished, 1)
   end)
+
+  t.it("records user-triggered progress start and terminal state without history spam", function()
+    local saved = package.loaded["fidget.progress"]
+    local history = require("utils.notification_history")
+    history._reset_for_test()
+    package.loaded["fidget.progress"] = {
+      handle = {
+        create = function()
+          return {
+            report = function() end,
+            finish = function() end,
+          }
+        end,
+      },
+    }
+
+    local progress = tasks.progress({
+      title = "IOS install",
+      scope = "ue.install",
+      message = "Validating signing and install inputs",
+      percentage = 0,
+    })
+    progress:report("Checking SDK, signing identity, and private key", 8)
+    progress:report("Starting container-preserving install", 15)
+    progress:finish("Installed com.example.Game on device-1", 100)
+    package.loaded["fidget.progress"] = saved
+
+    local records = history.list()
+    t.assert_eq(#records, 2)
+    t.assert_eq(records[1].scope, "ue.install")
+    t.assert_eq(records[1].message, "Installed com.example.Game on device-1")
+    t.assert_eq(records[2].scope, "ue.install")
+    t.assert_eq(records[2].message, "Validating signing and install inputs")
+  end)
 end)

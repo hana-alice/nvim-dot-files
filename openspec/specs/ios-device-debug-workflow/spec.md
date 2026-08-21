@@ -40,7 +40,7 @@ MUST：在独立 LLDB CLI 与 raw-DAP probe 证明完整 attach、断点与 clea
 ### Requirement: iOS debug 必须消费不可变且可追溯的 context
 
 MUST：每次 attach/launch 必须在开始时冻结 project tuple、selected signing identity、package artifact、
-`.app`/bundle、device、PID/launch token、local binary/dSYM/UUID、adapter/Xcode 与 source roots。
+`.app`/bundle、device、PID/launch token、local binary/debug-map 或 dSYM/UUID、adapter/Xcode 与 source roots。
 
 #### Scenario: session 开始后选择发生变化
 
@@ -50,7 +50,8 @@ MUST：每次 attach/launch 必须在开始时冻结 project tuple、selected si
 
 #### Scenario: context 中存在 stale 或 mismatch identity
 
-- **WHEN** PID 不存活、device/bundle 不匹配、artifact 不属于当前 tuple、dSYM 缺失或 UUID 不一致
+- **WHEN** PID 不存活、device/bundle 不匹配、artifact 不属于当前 tuple、local debug artifact 缺失或
+  loaded image 不匹配
 - **THEN** 系统必须在首次 continue 前失败
 - **AND** 不得用磁盘上“最新”文件、历史 PID 或其他设备补齐
 
@@ -131,7 +132,7 @@ MUST：DAP stop、terminated/exited、adapter error、device disconnect 与 Vim 
 
 - **WHEN** 用户停止 attach-owned iOS session
 - **THEN** 系统必须 disconnect 且 `terminateDebuggee=false`
-- **AND** 必须证明 app 继续存活并清理本次 CoreDevice/debug helper/temp 状态
+- **AND** detach 完成后必须终止并复查本次 bundle 的设备进程，同时清理 debug helper/temp 状态
 
 #### Scenario: cleanup 重复触发
 

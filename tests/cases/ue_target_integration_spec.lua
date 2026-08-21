@@ -498,6 +498,22 @@ t.describe("ue target integration", function()
     t.assert_contains(body, "Checking pre-iOS17 USB MobileDevice")
     t.assert_contains(body, "Recovering legacy IOS USB route")
     t.assert_contains(body, "resolve_ios_usb_reset_script")
+    t.assert_contains(body, "mobiledevice_device_list_plans")
+    t.assert_contains(body, "parse_mobiledevice_device_list")
+    t.assert_contains(body, "preferred_device_id")
+    t.assert_contains(body, "saved, offline")
+    t.assert_contains(body, "local plan = mobile_plan")
+    t.assert_contains(body, "plan.metadata.transport")
+    t.assert_contains(body, "local function refresh_offline_device")
+    t.assert_contains(body, '{ "--force", device.id }')
+    t.assert_contains(body, "IOS USB route refreshed; rediscovering selected device")
+    t.assert_contains(body, "IOS USB route is still offline; refreshed device list")
+    t.assert_contains(body, "CORE_RT.select_target_device(platform, opts)")
+    t.assert_contains(body, "refresh_offline_device(device)")
+    t.assert_contains(body, "next_opts.offline_refresh_attempted = true")
+    t.assert_contains(body, "remains offline after one refresh")
+    t.assert_false(body:find('fail("IOS USB refresh failed:', 1, true) ~= nil,
+      "offline selection must refresh the picker even when physical recovery fails")
   end)
 
   t.it("reads the selected staged IOS app bundle id instead of reusing persisted runtime state", function()
@@ -563,8 +579,8 @@ t.describe("ue target integration", function()
     t.assert_eq(seen.validated[1], "com.example.newbuild")
   end)
 
-  t.it("carries a selected legacy backend into fail-closed IOS launch planning", function()
-    local command, err = with_target_env("IOS", "Development", "SampleGame", function()
+  t.it("routes a selected legacy backend through the installed-app launch helper", function()
+    local command, err, plan = with_target_env("IOS", "Development", "SampleGame", function()
       return ue._target_plan_for_test(
         "launch",
         {
@@ -582,15 +598,27 @@ t.describe("ue target integration", function()
           },
         },
         "IOS",
-        { host_driver = require("utils.platform.macos") }
+        {
+          host_driver = {
+            id = "macos",
+            shell_entry = function() return "/bin/zsh" end,
+            ios_deploy_entry = function() return "/opt/homebrew/bin/ios-deploy" end,
+          },
+          legacy_launch_script = "/NvimConfig/scripts/ue_ios_legacy_launch.zsh",
+          legacy_signing = { prepared_app = "/Prepared/Client.app" },
+          json_output = "/tmp/ios-launch.json",
+        }
       )
     end)
 
-    t.assert_eq(command, nil)
-    t.assert_contains(err, "CoreDevice")
+    t.assert_nil(err)
+    t.assert_type(command, "table")
+    t.assert_contains(plan.args, "/NvimConfig/scripts/ue_ios_legacy_launch.zsh")
+    t.assert_contains(plan.args, "--bundle-id")
+    t.assert_eq(plan.metadata.backend, "legacy-mobiledevice")
   end)
 
-  t.it("rehydrates the current tuple app only for the prepared legacy installer", function()
+  t.it("rehydrates legacy install and launch evidence after a Nvim restart", function()
     local source = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
     local helper_start = assert(source:find("local function prepare_legacy_ios_install", 1, true))
     local helper_finish = assert(source:find("function CORE_RT.run_target_preflight", helper_start, true))
@@ -598,15 +626,28 @@ t.describe("ue target integration", function()
     local install_start = assert(source:find("function CORE_RT.install_target", helper_finish, true))
     local install_finish = assert(source:find("function CORE_RT.launch_target", install_start, true))
     local install = source:sub(install_start, install_finish)
+    local launch_finish = assert(source:find("\nend\n\nfunction M.launch_app", install_finish, true))
+    local launch = source:sub(install_finish, launch_finish)
 
     t.assert_contains(install, 'target_ctx.device_backend == "legacy-mobiledevice"')
     t.assert_contains(helper, "collect_existing_artifacts(driver, target_ctx)")
     t.assert_contains(helper, "legacy_install_script")
     t.assert_contains(helper, "legacy_signing")
+    t.assert_contains(helper, "prepare_legacy_ios_launch")
+    t.assert_contains(helper, "prepared.prepared_app")
     t.assert_contains(install, "install_progress_tracker")
     t.assert_contains(install, "on_stdout = stdout_progress")
     t.assert_contains(install, "on_stderr = stderr_progress")
     t.assert_contains(install, "Starting container-preserving install")
+    t.assert_contains(launch, "prepare_legacy_ios_launch(ctx, driver, target_ctx)")
+    t.assert_contains(launch, "IOS launch")
+    t.assert_contains(launch, "launch_progress:report")
+    t.assert_contains(launch, "Waiting for selected IOS device")
+    t.assert_contains(launch, "Verifying launched IOS process")
+    t.assert_contains(launch, "finish_launch_progress")
+    t.assert_contains(launch, "target_launch_running")
+    t.assert_contains(launch, "launch is already in progress")
+    t.assert_contains(launch, "ensure_legacy_ios_launch_device")
   end)
 
   t.it("keeps IOS command strings out of other target drivers", function()

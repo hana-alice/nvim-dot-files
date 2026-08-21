@@ -330,10 +330,10 @@ map("c", "<C-v>", "<C-r>+", { desc = "Cmdline: paste from system clipboard" })
 map("i", "<C-v>", "<C-r><C-o>+", { desc = "Insert: paste from system clipboard (literal)" })
 
 -- DAP keymaps
-map("n", "<leader>da", "<cmd>UEDAPAttach android<cr>", { desc = "DAP: Android Attach" })
+map("n", "<leader>da", "<cmd>UEDAPAttach<cr>", { desc = "DAP: Attach active target" })
 map("n", "<leader>db", "<cmd>UEDAPToggleBreakpoint<cr>", { desc = "DAP: Toggle Breakpoint" })
 map("n", "<leader>dc", "<cmd>UEDAPContinue<cr>", { desc = "DAP: Continue" })
-map("n", "<leader>dl", "<cmd>UEDAPLaunch android<cr>", { desc = "DAP: Android Launch Debug" })
+map("n", "<leader>dl", "<cmd>UEDAPLaunch<cr>", { desc = "DAP: Launch active target" })
 map("n", "<leader>dn", "<cmd>UEDAPStepOver<cr>", { desc = "DAP: Step Over" })
 map("n", "<leader>dp", "<cmd>UEDAPPause<cr>", { desc = "DAP: Pause" })
 map("n", "<leader>dx", "<cmd>UEResetLayout<cr>", { desc = "Reset Layout (DAP or default)" })

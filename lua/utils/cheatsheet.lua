@@ -585,7 +585,7 @@ local tabs = {
       {
         title = "Session",
         mappings = {
-          { "<leader>da",   "Attach (UEDAPAttach android)" },
+          { "<leader>da",   "Attach active target (UEDAPAttach)" },
           { "<leader>dl",   "Launch + auto attach" },
           { "<leader>dc / F5", "Continue" },
           { "<leader>dp / F6", "Pause" },

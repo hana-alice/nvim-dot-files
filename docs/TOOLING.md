@@ -89,8 +89,10 @@ The macOS host driver uses only native engine and Xcode entry points:
 - `<engine>/Engine/Build/BatchFiles/RunUAT.sh BuildCookRun` for local iOS
   `-skipbuild -skipcook -stage -nocleanstage -package`; cooked data must already
   exist and Nvim never starts a local Cook.
-- `xcrun dsymutil` plus `xcrun dwarfdump --uuid` for explicit
-  `:UEIOSSymbols`; daily builds do not create or ZIP dSYM bundles.
+- `xcrun dsymutil --linker parallel --verify-dwarf=output` plus
+  `xcrun dwarfdump --uuid` for explicit `:UEIOSSymbols`; daily builds do not
+  create or ZIP dSYM bundles. The parallel/output-verification pair prevents a
+  >4 GiB monolithic UE `.debug_info` overflow from passing on UUID alone.
 - `/usr/bin/xcrun devicectl` with `--json-output <file>` for physical-device
   discovery, `.app` install and process launch.
 - `/usr/bin/security` for a read-only code-sign identity gate and
@@ -104,8 +106,8 @@ The macOS host driver uses only native engine and Xcode entry points:
   LLDB/CoreDevice gate. An explicit `legacy-preflight --device ... --symbols ...`
   additionally checks a pre-iOS17 MobileDevice/`ios-deploy` candidate and exact
   ProductType/OS/build DeviceSupport layout without persisting the device id or
-  personal path. Only a passing explicit `attach` probe may unlock the IOS DAP
-  matrix; either tool-only preflight or partial debugserver transport is insufficient.
+  personal path. The production `:UEDAPAttach` / `:UEDAPLaunch` handler uses the
+  same validated legacy route and fails closed on a different backend.
 
 Requirements:
 
@@ -118,15 +120,18 @@ Requirements:
 - A project identity selected with `:UESetIOSSigningCertificate`, still valid
   in the current keychain, plus compatible provisioning for package/install.
 - A paired, connected physical iOS device for install/launch.
+- `idevice_id`, `ios-deploy`, `ideviceinfo`, and `ideviceinstaller` on PATH; legacy launch follows the explicitly selected USB/Wi-Fi transport, while DAP remains USB-scoped.
 
 The installable app produced by this engine lives at
 `<project>/Binaries/IOS/Payload/<Target>.app`. The similarly named
 `Saved/StagedBuilds/IOS` tree is raw stage input, not the signed app bundle.
-The normal build/install/launch workflow deliberately does not use UE's legacy
-fastlane/ideviceinstaller/instruments deploy/run route and does not implement
-iOS DAP. The isolated debugger spike may use `ios-deploy` only for a pre-iOS17
-Xcode DeveloperDiskImage/debugserver loopback bridge when CoreDevice has no
-connected tunnel; this is not a production capability or an in-session fallback.
+The normal build/install/launch workflow still does not use UE's legacy
+fastlane/instruments deploy route. Legacy launch uses `ios-deploy --noinstall
+--justlaunch` against the prepared signed app on the explicitly selected transport, then verifies the installed bundle PID.
+iOS DAP is a separate production operation:
+`ios-deploy --nolldb` exposes the pre-iOS17 Xcode DeveloperDiskImage/debugserver
+loopback bridge, while Xcode `lldb-dap` owns target creation, attach/launch,
+breakpoints and expression evaluation. It is never a Mac-process fallback.
 
 ## Historical lldb-dap 21 side-load (DAP debugger adapter, Windows)
 

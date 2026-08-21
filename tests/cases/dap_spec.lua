@@ -36,14 +36,113 @@ t.describe("ue.dap: 各平台模块导出 attach/launch", function()
   end
 
 
-  t.it("IOS DAP 明确 unsupported，不借用 Mac handler", function()
+  t.it("IOS DAP 使用独立 device handler，不借用 Mac handler", function()
     local config = vim.fn.stdpath("config")
     local source = table.concat(vim.fn.readfile(config .. "/lua/ue/dap/ios.lua"), "\n")
     t.assert_false(source:find('require("ue.dap.mac")', 1, true) ~= nil)
-    local _, unavailable = require("ue.targets").resolve(
+    local driver, unavailable = require("ue.targets").resolve(
       "IOS", "dap_attach", require("utils.platform.macos")
     )
-    t.assert_eq(unavailable.status, "unavailable")
+    t.assert_eq(driver.id, "IOS")
+    t.assert_nil(unavailable)
+  end)
+end)
+
+t.describe("ue.dap.ios: legacy MobileDevice lldb-dap config", function()
+  local ios = require("ue.dap.ios")
+  local base = {
+    binary = "/Project Root/Binaries/IOS/SampleGame",
+    cwd = "/Project Root",
+    device_app_path = "/private/var/containers/Bundle/Application/ABC/SampleGame.app",
+    executable_name = "SampleGame",
+    port = 12345,
+    symbols = "/Device Support/iPhone13,2 15.4.1 (19E258)/Symbols",
+  }
+
+  t.it("attach-at-launch creates the local symbol target before RemoteLaunch", function()
+    local opts = vim.tbl_extend("force", base, { mode = "launch" })
+    local cfg, err = ios._build_config_for_test(opts)
+    t.assert_nil(err)
+    t.assert_eq(cfg.request, "attach")
+    t.assert_eq(cfg.stopOnEntry, true)
+    t.assert_eq(cfg._ue_ios_session_owner, "legacy-mobiledevice")
+    t.assert_contains(cfg.initCommands, "settings set target.memory-module-load-level partial")
+    t.assert_contains(cfg.attachCommands,
+      'platform select remote-ios --sysroot "/Device Support/iPhone13,2 15.4.1 (19E258)/Symbols"')
+    t.assert_contains(cfg.attachCommands,
+      'target create "/Project Root/Binaries/IOS/SampleGame"')
+    local all = table.concat(cfg.attachCommands, "\n")
+    local target_i = assert(all:find("target create", 1, true))
+    local remote_i = assert(all:find("SetPlatformFileSpec", 1, true))
+    local connect_i = assert(all:find("ConnectRemote", 1, true))
+    local launch_i = assert(all:find("RemoteLaunch", 1, true))
+    t.assert_true(target_i < remote_i and remote_i < connect_i and connect_i < launch_i)
+    t.assert_contains(all,
+      "/private/var/containers/Bundle/Application/ABC/SampleGame.app/SampleGame")
+    t.assert_contains(all, "True, ios_error")
+    t.assert_contains(all, "local iOS binary did not match the loaded device image")
+    t.assert_contains(all, "lldb.debugger.GetListener()")
+    t.assert_contains(all, "time.sleep(0.1)")
+    t.assert_false(all:find("StartListeningForEventClass", 1, true) ~= nil)
+  end)
+
+  t.it("ordinary attach waits for the async RemoteAttach stop", function()
+    local opts = vim.tbl_extend("force", base, { mode = "attach", pid = 4242 })
+    local cfg, err = ios._build_config_for_test(opts)
+    t.assert_nil(err)
+    local all = table.concat(cfg.attachCommands, "\n")
+    t.assert_contains(all, "RemoteAttachToProcessWithID(4242, ios_error)")
+    t.assert_contains(all, "ios_state != lldb.eStateStopped")
+    t.assert_false(all:find("RemoteLaunch", 1, true) ~= nil)
+  end)
+
+  t.it("fails closed instead of inventing project, device, or pid defaults", function()
+    local missing_binary, binary_err = ios._build_config_for_test(vim.tbl_extend(
+      "force", base, { mode = "launch", binary = "" }
+    ))
+    local missing_pid, pid_err = ios._build_config_for_test(vim.tbl_extend(
+      "force", base, { mode = "attach" }
+    ))
+    t.assert_nil(missing_binary)
+    t.assert_contains(binary_err, "binary")
+    t.assert_nil(missing_pid)
+    t.assert_contains(pid_err, "pid")
+  end)
+
+  t.it("parses one exact installed bundle and its executable", function()
+    local app, err = ios._parse_installed_apps_for_test(vim.json.encode({
+      {
+        CFBundleIdentifier = "com.example.other",
+        CFBundleExecutable = "Other",
+        Path = "/private/Other.app",
+      },
+      {
+        CFBundleIdentifier = "com.example.game",
+        CFBundleExecutable = "SampleGame",
+        Path = "/private/SampleGame.app",
+      },
+    }), "com.example.game")
+    t.assert_nil(err)
+    t.assert_eq(app.app_path, "/private/SampleGame.app")
+    t.assert_eq(app.executable_name, "SampleGame")
+  end)
+
+  t.it("keeps stdout-only libimobiledevice failures actionable", function()
+    local detail = require("ue.dap._ios_process").device_unavailable("TEST-UDID", {
+      code = 255,
+      stdout = "ERROR: Device TEST-UDID not found!\n",
+      stderr = "",
+    })
+    t.assert_contains(detail, "Device TEST-UDID not found")
+    t.assert_contains(detail, "legacy USB")
+  end)
+
+  t.it("freezes the selected Xcode adapter instead of using Homebrew fallback", function()
+    local source = table.concat(vim.fn.readfile(
+      vim.fn.stdpath("config") .. "/lua/ue/dap/ios.lua"), "\n")
+    t.assert_contains(source, 'runtime.tools.xcrun, "--find", "lldb-dap"')
+    t.assert_contains(source, "runtime.adapter")
+    t.assert_contains(source, "initialize_timeout_sec = 90")
   end)
 end)
 
@@ -350,7 +449,7 @@ t.describe("ue.dap: setup() 后平台已注册", function()
     t.assert_nil(p.attach_handler("android"))
     t.assert_nil(p.attach_handler("win64"))
     t.assert_type(p.attach_handler("mac"), "function")
-    t.assert_nil(p.attach_handler("ios"))
+    t.assert_type(p.attach_handler("ios"), "function")
   end)
 
   t.it("_common.find_lldb_dap 返回 string 或 nil", function()

@@ -61,7 +61,7 @@ FRHICommandList grep（越低越好）
 
 - **Windows 10/11**：主环境，支持 UE 构建/索引与 Win64/Android 工作流。
 - **macOS**：支持原生 UE `Build.sh`、Mac/IOS target、CDB 语义流水线及 iOS
-  打包/安装/启动；尚未实现 iOS 真机 DAP。
+  打包/安装/启动，以及 legacy USB 真机 iOS DAP。
 - **Linux**：基础编辑器与原生 UBT build planner 可用；设备与 DAP 能力取决于 target。
 
 ## 环境要求
@@ -72,6 +72,7 @@ FRHICommandList grep（越低越好）
 | Neovim | 0.10+ |
 | 工具链 | clangd/LLVM 22.1.x —— 钉死；不要使用 mason auto-install |
 | Android DAP | LLVM 22.1.6+ `lldb-dap` + NDK 27 `lldb-server` |
+| iOS DAP | Xcode `lldb-dap` + `ios-deploy` + libimobiledevice |
 | 可选 | Go ≥ 1.22，用于构建 grep 索引工具 |
 | 构建前置 | 目标平台可用的 Unreal Build Tool 环境 |
 | iOS | Xcode、iPhoneOS SDK、签名/provisioning、已配对物理设备 |

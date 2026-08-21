@@ -149,4 +149,28 @@ function M.plutil_entry()
   return "/usr/bin/plutil", nil
 end
 
+function M.ios_deploy_entry()
+  local path = vim.fn.exepath("ios-deploy")
+  if path == "" then
+    return nil, "ios-deploy is not installed or not executable"
+  end
+  return path, nil
+end
+
+function M.idevice_id_entry()
+  local path = vim.fn.exepath("idevice_id")
+  if path == "" then
+    return nil, "idevice_id is not installed or not executable"
+  end
+  return path, nil
+end
+
+function M.ideviceinfo_entry()
+  local path = vim.fn.exepath("ideviceinfo")
+  if path == "" then
+    return nil, "ideviceinfo is not installed or not executable"
+  end
+  return path, nil
+end
+
 return M

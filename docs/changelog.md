@@ -90,6 +90,155 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 - 32s semantic deadline 只比已观测的 31s 上界多 1s；若探针再出现合法冷查询 timeout，应基于新分位数证据
   同步调整 request 与 live-health budget，不凭猜测继续放大。
 
+### 2026-08-21 — Require explicit IOS device choice when the saved route is offline
+
+**Task**
+
+修复 `<leader>ul` 在保存设备不可用时把另一个可见设备当作结论的问题；设备不确定时必须弹窗选择。
+
+**Implemented**
+
+- IOS 选择器现在合并 connected CoreDevice、实时 MobileDevice USB 与实时 MobileDevice Wi-Fi，并用
+  `ideviceinfo` 补齐设备名、系统版本和型号。
+- launch 会先验证保存的 UDID 是否仍在实时结果中；精确命中才直接继续，否则 picker 同时列出实时设备与
+  `saved, offline` 设备，绝不自动替换。
+- 选择结果持久化 backend 与 transport；legacy launch 根据显式 transport 决定是否使用 `--no-wifi`，
+  USB 仍保持 USB-only，Wi-Fi 不再被错误屏蔽。
+- MobileDevice 双路异步 discovery 为每个回调固化其 plan，避免 LuaJIT generic-for 变量在任务完成时已经
+  前进或变成 nil，导致所有探测都结束却没有提交 picker。
+- picker 中选择 `saved, offline` 的 USB 设备不再立即报错；它会对该精确 UDID 执行 branch
+  `ResetIOSUSB.sh --force` 并始终重新探测。目标不在 IOKit、helper 无法恢复时只保留 warning 证据并
+  在单次重新探测后结束当前操作，不重复打开相同 picker，也绝不改选其他设备。
+
+**Pitfalls / Gotchas**
+
+- 物理线缆已连接不等于 macOS 已枚举设备；当前主机的 IOUSB 与 `idevice_id -l` 都为空，因此保存的 USB
+  设备必须在 picker 中标成 offline，而不能被唯一 Wi-Fi 候选静默覆盖。
+
+**Validation**
+
+- 定向：`platform` 23/23、`ue_target_drivers` 46/46、`ue_target_integration` 22/22、
+  `ue_ios_cpp_iteration` 4/4。
+- 全量 `nvim --headless -l tests/run.lua`：1030/1030；bare-global lint、iOS 新增 Lua 模块的
+  Stylua check、legacy launch helper 的 Zsh syntax check 与 `git diff --check` 均通过。
+- 当前真实状态 smoke test 的 picker 精确展示 `iPhone (34) / network / available` 与
+  `iPhone / usb / saved, offline`，取消选择不会启动 `ios-deploy`。
+- offline-refresh 真实 smoke 自动选择保存的 USB 项并实际调用 3.6 helper；当前 IOKit 不含该 UDID、helper
+  返回 1 后只完成一次重新探测并以 warning 结束，picker 总计只出现一次且没有 terminal refresh error。
+
+**Follow-ups**
+
+- 当前保存的 USB 设备仍未进入 macOS IOUSB/usbmuxd；picker 会如实展示该状态，不代替用户选择。
+
+### 2026-08-21 — Launch installed pre-iOS17 apps after Nvim restart
+
+**Task**
+
+自查并修复 IOS `<leader>ul` 在 legacy MobileDevice 设备上报错的问题。
+
+**Implemented**
+
+- IOS launch planner 现在按持久化 backend 分派：CoreDevice 保持 `devicectl`；legacy 使用 prepared signed
+  app 调用 `ios-deploy --noinstall --justlaunch`，随后轮询精确 bundle PID 并发布结构化结果。
+- legacy launch 从 `Saved/IOSQADebug/signing.json` 恢复 app/bundle，不再依赖当前 Nvim 进程内的 package
+  artifact；启动已安装 App 也不再执行无关的 codesign 私钥预检。
+- macOS host driver 独占 `ios-deploy` executable 解析；IOS launch 纯规划/解析拆入 `ios_launch.lua`，
+  保持其他 target driver 与 CoreDevice 行为不变。
+- helper 会验证 prepared app 的 Info.plist bundle、固定 USB UDID、保留 ios-deploy 原始失败，并仅在真实
+  PID 可查询时报告成功。
+- `UELaunch` 现在从同步校验开始就创建单一进度项，并连续展示签名证据加载、launch preflight、bundle
+  解析、等待设备和 PID 校验；失败和成功都在同一进度项收口，不再出现 20 秒“按下没反应”。
+- 每个平台的 launch 现在是 single-flight；已有启动未结束时重复触发只显示“already in progress”，不会
+  并行堆叠多个 `ios-deploy`。
+
+**Pitfalls / Gotchas**
+
+- 原实现同时存在两道必现门禁：重启 Nvim 后先报 package artifact 不在内存，绕过后 legacy backend 又被
+  CoreDevice-only planner 拒绝；二者都不是重新 build/package 能正确解决的问题。
+- target task 本身一直在后台运行，但 launch 路径此前没有像 install 那样持有进度 controller，导致
+  `ios-deploy --timeout 20` 期间 UI 完全静默。
+
+**Validation**
+
+- 定向：`ue_target_tasks` 7/7、`ue_target_drivers` 45/45、`ue_target_integration` 22/22、
+  `ue_ios_cpp_iteration` 4/4、`platform` 23/23、`structure` 39/39、`stability` 9/9；
+  新 launch 模块 Stylua check、Zsh syntax、
+  bare-global lint 与 `git diff --check` 通过。
+- 全量 `nvim --headless -l tests/run.lua`：1029/1029。
+- 当前真实持久化 tuple 已越过 artifact/CoreDevice 门禁，最终准确报告 ios-deploy 等待 20 秒后设备超时。
+
+**Follow-ups**
+
+- 目标 iPhone 当前仍未重新出现在 macOS IOUSB/usbmuxd，恢复设备枚举后才能完成真机 PID 成功验收。
+
+### 2026-08-21 — Preserve the real legacy USB failure in IOS DAP launch
+
+**Task**
+
+自查 `<leader>dl` 启动失败，并确保 legacy MobileDevice 在设备不可用时给出可操作的真实错误。
+
+**Implemented**
+
+- `ue.dap.ios` 统一使用 target-task process error formatter，不再只读 `stderr`；
+  `ideviceinfo` 把失败写到 `stdout` 时也会展示退出码和 `Device ... not found`。
+- 把 IOS process error formatting 拆到可独立回归的 `_ios_process` helper，未改变其他 target 的 DAP 路由。
+- 增加 stdout-only libimobiledevice 失败回归，防止 `<leader>dl` 再次退化为空白错误。
+
+**Pitfalls / Gotchas**
+
+- 选中的 UDID 和持久化 IOS tuple 正确；运行时故障发生在 DAP adapter 启动前：设备未被 usbmuxd
+  暴露，因此 `ideviceinfo` / `ios-deploy` 都无法建立 legacy USB transport。
+
+**Validation**
+
+- 定向：`dap` 67/67、`platform` 23/23；Stylua check、bare-global lint 与 `git diff --check` 通过。
+- 全量 `nvim --headless -l tests/run.lua`：1028/1028。
+- 新 Nvim 进程实测 `<leader>dl` 等价入口会显示完整 `exit=255: ERROR: Device ... not found!`，不再空白。
+
+**Follow-ups**
+
+- 当前真机在定向软件 USB re-enumerate 后尚未重新出现在 IORegistry；重新接线/解锁或重启 host 后才能继续
+  真机 attach-at-launch，代码侧不自动重启系统 USB 服务。
+
+### 2026-08-20 — Run the physical-device IOS DAP workflow end to end
+
+**Task**
+
+跑通 Nvim 的 IOS DAP ordinary attach、attach-at-launch、source breakpoint 与 LLDB expression，并在
+调试器不用设备时终止 Client。
+
+**Implemented**
+
+- `ue.dap.ios` 现在从 active project state 读取 legacy MobileDevice 设备与 bundle，异步解析精确
+  DeviceSupport/installed app metadata，启动无 bundle 参数的 `ios-deploy --nolldb` bridge，并由 Xcode
+  `lldb-dap` 的 `SBProcess` API 执行 RemoteLaunch/RemoteAttach。
+- attach-at-launch 保持 entry stop，让 nvim-dap 在首次 continue 前下发断点；ordinary attach 显式等待
+  异步 attach 进入 stopped。两条路径都使用本地 symbol-rich Client Mach-O 并映射设备 executable。
+- remote memory module load 改为 `partial`，避免通过 USB 下载完整符号表；本地 Client DWARF 不降级。
+  `<leader>da` / `<leader>dl` 改为按当前 target 分派，IOS 的 `UEDAPStop` 非终止式 detach 后 kill 并复查 PID。
+- `UEIOSSymbols` 改用 parallel dsymutil + output DWARF verification，避免 UUID 匹配但 `.debug_info` 已损坏。
+
+**Pitfalls / Gotchas**
+
+- `ios-deploy --nolldb --bundle <app>` 在当前 Xcode/旧设备组合会空指针崩溃；bridge 不传 bundle，设备 app
+  path 从 `ideviceinstaller` plist 精确解析。
+- `RemoteAttachToProcessWithID` 返回成功时仍可能处于 attaching，必须继续消费 state event 到 stopped。
+- UUID 相同不足以证明 dSYM 可用；classic dsymutil 曾生成 5.1GB 损坏 DWARF，因此增加输出验证。
+
+**Validation**
+
+- 真机底层：attach-at-launch 约 25s，`LaunchIOS.cpp` resolved breakpoint 命中，`1+2 = 3`、`argc = 1`；
+  ordinary attach 约 21s，`LaunchEngineLoop.cpp` resolved breakpoint 命中，`1+2 = 3`、`GFrameCounter = 4259`。
+- Nvim 真机入口：attach-at-launch 与 ordinary attach 均得到 `status=ok`、verified source breakpoint、
+  breakpoint stop、LLDB expression 与 `cleanup.ok=true`；收尾独立复查 `ios-deploy --get_pid` 为 `-1`。
+- 定向：`dap` 66/66、`ue_target_drivers` 45/45、`keymaps` 56/56、`commands` 105/105、
+  `cheatsheet` 142/142、`ue_ios_cpp_iteration` 3/3、`structure` 39/39；bare-global lint 与
+  `git diff --check` 通过。全量 `nvim --headless -l tests/run.lua`：1027/1027。
+
+**Follow-ups**
+
+- CoreDevice/iOS 17+ DAP 仍需独立 transport，不从 legacy handler 或 Mac attach 猜测回退。
+
 ### 2026-08-20 — Preserve target install progress in notification history
 
 **Task**

@@ -197,6 +197,7 @@ function M.load_prepared_config(project_root)
 
   local provision = tostring(decoded.provision or "")
   local provision_check_path = C.normalize_path(provision)
+  local prepared_app = C.normalize_path(decoded.preparedApp)
   local bundle_identifier = C.trim(decoded.bundleIdentifier)
   local team_identifier = C.trim(decoded.teamIdentifier)
   if provision_check_path == "" or bundle_identifier == "" or team_identifier == "" then
@@ -217,6 +218,8 @@ function M.load_prepared_config(project_root)
     path = path,
     identity = identity,
     provision = provision,
+    prepared_app = prepared_app,
+    device_id = C.trim(decoded.deviceUDID),
     bundle_identifier = bundle_identifier,
     team_identifier = team_identifier,
   }
@@ -224,7 +227,8 @@ end
 
 function M.preflight_plans(stage, context, host_driver)
   local signing_identity
-  if context and context.signing_identity ~= nil then
+  local needs_signing_identity = stage == "build" or stage == "package" or stage == "install"
+  if needs_signing_identity and context and context.signing_identity ~= nil then
     local signing_err
     signing_identity, signing_err = M.validate(context.signing_identity)
     if not signing_identity then

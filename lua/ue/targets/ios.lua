@@ -1,6 +1,7 @@
 local C = require("ue.targets._common")
 local Device = require("ue.targets.ios_device")
 local Install = require("ue.targets.ios_install")
+local Launch = require("ue.targets.ios_launch")
 local Signing = require("ue.targets.ios_signing")
 local BuildEvidence = require("ue.targets.ios_build_evidence")
 local M = {
@@ -14,6 +15,7 @@ local M = {
       device = true,
       install = true,
       launch = true,
+      dap_attach = true, dap_launch = true,
     },
   },
   runtime = {
@@ -408,6 +410,10 @@ function M.device_list_plan(context, host_driver)
 end
 
 M.fallback_device_list_plan = Device.fallback_device_list_plan
+M.mobiledevice_device_list_plans = Device.mobiledevice_device_list_plans
+M.parse_mobiledevice_device_list = Device.parse_mobiledevice_device_list
+M.mobiledevice_info_plan = Device.mobiledevice_info_plan
+M.parse_mobiledevice_info = Device.parse_mobiledevice_info
 M.install_progress_tracker = Install.progress_tracker
 
 function M.install_failure_reason(result, plan)
@@ -494,55 +500,8 @@ function M.install_plan(context, host_driver)
 end
 
 function M.launch_plan(context, host_driver)
-  local device_id = C.trim(context and context.device_id)
-  if device_id == "" then
-    return C.unavailable(M.id, "launch", "device_id is required for launch", {
-      required = { "device_id" },
-    })
-  end
-  local device_backend = C.trim(context and context.device_backend)
-  if device_backend ~= "" and device_backend ~= "coredevice" then
-    return C.unavailable(M.id, "launch", "selected IOS device has no CoreDevice transport", {
-      device_backend = device_backend,
-      suggestion = "ordinary pre-iOS17 MobileDevice launch is not implemented",
-    })
-  end
-
   local bundle_id, err = normalize_bundle_id(context and context.bundle_id)
-  if not bundle_id then
-    return C.unavailable(M.id, "launch", err, {
-      required = { "bundle_id" },
-    })
-  end
-
-  local entry, unavailable = C.resolve_host_entry(host_driver, "xcrun_entry", context, M.id, "launch")
-  if not entry then
-    return unavailable
-  end
-
-  local output = C.trim(context and context.json_output)
-  if output == "" then
-    return C.unavailable(M.id, "launch", "json_output is required for devicectl launch", {
-      required = { "json_output" },
-    })
-  end
-
-  return C.with_appended_args(entry, {
-    "devicectl",
-    "device",
-    "process",
-    "launch",
-    "--device",
-    device_id,
-    bundle_id,
-    "--json-output",
-    output,
-  }, {
-    device_id = device_id,
-    bundle_id = bundle_id,
-    parser = "parse_launch_result",
-    json_output = output,
-  })
+  return Launch.plan(context, host_driver, bundle_id, err)
 end
 
 function M.classify_rsp(candidate, context)
@@ -698,53 +657,7 @@ function M.parse_install_result(payload, expected)
 end
 
 function M.parse_launch_result(payload, expected)
-  local decoded = payload
-  if type(payload) == "string" then
-    local ok, parsed = pcall(vim.json.decode, payload)
-    if not ok then
-      return C.unavailable(M.id, "launch", "failed to parse devicectl launch json", {
-        detail = parsed,
-      })
-    end
-    decoded = parsed
-  end
-
-  local result = decoded and (decoded.result or decoded)
-  local process = result and (result.process or result.launchedProcess or result.applicationProcess) or nil
-  local device_id = C.trim(result and (result.deviceIdentifier or result.device or result.targetDeviceIdentifier))
-  local bundle_id = C.trim(
-    result
-      and (
-        result.bundleIdentifier
-        or result.bundleID
-        or process and (process.bundleIdentifier or process.bundleID or process.applicationIdentifier)
-      )
-  )
-  local process_id = result
-    and (result.processIdentifier or result.pid or process and (process.processIdentifier or process.pid))
-
-  if device_id == "" or bundle_id == "" or process_id == nil then
-    return C.unavailable(M.id, "launch", "devicectl launch result missing process identity")
-  end
-  if expected and expected.device_id and device_id ~= expected.device_id then
-    return C.unavailable(M.id, "launch", "devicectl launch result device mismatch", {
-      expected_device_id = expected.device_id,
-      actual_device_id = device_id,
-    })
-  end
-  if expected and expected.bundle_id and bundle_id ~= expected.bundle_id then
-    return C.unavailable(M.id, "launch", "devicectl launch result bundle mismatch", {
-      expected_bundle_id = expected.bundle_id,
-      actual_bundle_id = bundle_id,
-    })
-  end
-
-  return {
-    ok = true,
-    device_id = device_id,
-    bundle_id = bundle_id,
-    process_id = process_id,
-  }
+  return Launch.parse_result(payload, expected)
 end
 
 function M.preflight_descriptors()

@@ -68,7 +68,7 @@ FRHICommandList grep (lower is better)
 
 - **Windows 10/11:** primary environment; UE build/index and Win64/Android workflows.
 - **macOS:** native UE `Build.sh`, Mac/IOS target builds, the CDB semantic pipeline,
-  and iOS package/install/launch are supported. Native iOS DAP is not implemented.
+  iOS package/install/launch, and legacy-USB physical-device iOS DAP are supported.
 - **Linux:** the base editor and native UBT build planner are available; device and
   DAP workflows remain target-dependent.
 
@@ -80,6 +80,7 @@ FRHICommandList grep (lower is better)
 | Neovim | 0.10+ |
 | Toolchain | clangd/LLVM 22.1.x — pinned; do not use mason auto-install |
 | Android DAP | LLVM 22.1.6+ `lldb-dap` + NDK 27 `lldb-server` |
+| iOS DAP | Xcode `lldb-dap` + `ios-deploy` + libimobiledevice |
 | Optional | Go ≥ 1.22, to build the grep index tool |
 | Build prerequisite | A working Unreal Build Tool setup for the target platform |
 | iOS | Xcode, iPhoneOS SDK, signing identity/provisioning, and a paired physical device |

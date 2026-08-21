@@ -2,6 +2,98 @@ local C = require("ue.targets._common")
 
 local M = {}
 
+function M.mobiledevice_device_list_plans(context, host_driver)
+  local entry, unavailable = C.resolve_host_entry(host_driver, "idevice_id_entry", context, "IOS", "device")
+  if not entry then
+    return unavailable
+  end
+
+  return {
+    C.with_appended_args(entry, { "-l" }, {
+      parser = "parse_mobiledevice_device_list",
+      result_source = "stdout",
+      backend = "legacy-mobiledevice",
+      transport = "usb",
+    }),
+    C.with_appended_args(entry, { "--network" }, {
+      parser = "parse_mobiledevice_device_list",
+      result_source = "stdout",
+      backend = "legacy-mobiledevice",
+      transport = "network",
+    }),
+  }
+end
+
+function M.parse_mobiledevice_device_list(payload, transport)
+  transport = C.trim(transport):lower()
+  if transport ~= "usb" and transport ~= "network" then
+    return C.unavailable("IOS", "device", "MobileDevice transport must be usb or network")
+  end
+
+  local devices = {}
+  local seen = {}
+  for line in tostring(payload or ""):gmatch("[^\r\n]+") do
+    local device_id = C.trim(line)
+    if device_id:match("^[A-Fa-f0-9%-]+$") and not seen[device_id] then
+      seen[device_id] = true
+      devices[#devices + 1] = {
+        id = device_id,
+        name = device_id,
+        platform = "iOS",
+        backend = "legacy-mobiledevice",
+        transport = transport,
+        available = true,
+      }
+    end
+  end
+
+  return {
+    ok = true,
+    devices = devices,
+  }
+end
+
+function M.mobiledevice_info_plan(device, context, host_driver)
+  local entry, unavailable = C.resolve_host_entry(host_driver, "ideviceinfo_entry", context, "IOS", "device")
+  if not entry then
+    return unavailable
+  end
+  local device_id = C.trim(device and device.id)
+  local transport = C.trim(device and device.transport):lower()
+  if device_id == "" or (transport ~= "usb" and transport ~= "network") then
+    return C.unavailable("IOS", "device", "MobileDevice info requires an id and transport")
+  end
+  local args = {}
+  if transport == "network" then
+    args[#args + 1] = "--network"
+  end
+  vim.list_extend(args, { "--udid", device_id })
+  return C.with_appended_args(entry, args, {
+    parser = "parse_mobiledevice_info",
+    result_source = "stdout",
+    device_id = device_id,
+    transport = transport,
+  })
+end
+
+function M.parse_mobiledevice_info(payload, device)
+  local fields = {}
+  for line in tostring(payload or ""):gmatch("[^\r\n]+") do
+    local key, value = line:match("^([^:]+):%s*(.*)$")
+    if key then
+      fields[C.trim(key)] = C.trim(value)
+    end
+  end
+  local resolved = vim.deepcopy(device or {})
+  resolved.name = fields.DeviceName ~= "" and fields.DeviceName or resolved.name
+  resolved.os_version = fields.ProductVersion ~= "" and fields.ProductVersion or resolved.os_version
+  resolved.model = fields.ProductType ~= "" and fields.ProductType or resolved.model
+  return {
+    ok = true,
+    device = resolved,
+  }
+end
+
 function M.fallback_device_list_plan(context, host_driver)
   local entry, unavailable = C.resolve_host_entry(host_driver, "xcrun_entry", context, "IOS", "device")
   if not entry then

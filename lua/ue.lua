@@ -19,6 +19,7 @@ local CORE_RT = {
   dirty_index_roots = {},
   engine_root_cache = {}, -- dir -> engine_root (or false)
   context_cache = {}, -- key -> { ctx, ts }
+  target_launch_running = {}, -- target id -> true while one launch owns the route
   project_state = require("ue.project_state"),
   file_lock = require("ue.file_lock"),
   prepare_lease = nil,
@@ -4745,12 +4746,16 @@ do
       config_root = vim.fn.stdpath("config"),
       signing_identity = opts.signing_identity or (ctx.state and ctx.state.ios_signing_identity),
       device_id = opts.device_id or runtime.device_id,
+      device_name = opts.device_name or runtime.device_name,
       device_backend = opts.device_backend or runtime.device_backend,
+      device_transport = opts.device_transport or runtime.device_transport,
       bundle_id = opts.bundle_id or runtime.bundle_id,
       artifacts = opts.artifacts or runtime.artifacts,
       json_output = opts.json_output,
       skip_deploy = opts.skip_deploy == true,
       operation = opts.operation,
+      legacy_launch_script = opts.legacy_launch_script,
+      legacy_signing = opts.legacy_signing,
     }, nil, driver
   end
 
@@ -8126,6 +8131,15 @@ do
     return nil, "legacy ResetIOSUSB.sh is missing or not executable: " .. reset_script
   end
 
+  local function resolve_ios_legacy_launch_script()
+    local script = join(vim.fn.stdpath("config"), "scripts", "ue_ios_legacy_launch.zsh")
+    local stat = vim.uv.fs_stat(script)
+    if stat and stat.type == "file" then
+      return norm(script)
+    end
+    return nil, "legacy IOS launch helper is missing: " .. script
+  end
+
   local function prepare_legacy_ios_install(ctx, driver, target_ctx)
     local script, script_err = resolve_ios_legacy_install_script(ctx)
     if not script then return nil, script_err end
@@ -8159,6 +8173,26 @@ do
 
     target_ctx.artifacts = artifacts
     target_ctx.legacy_install_script = script
+    target_ctx.legacy_signing = prepared
+    return true
+  end
+
+  local function prepare_legacy_ios_launch(ctx, driver, target_ctx)
+    local script, script_err = resolve_ios_legacy_launch_script()
+    if not script then return nil, script_err end
+
+    local prepared = driver.prepared_signing_identity(ctx.project_root)
+    if not prepared.ok then return nil, prepared.reason end
+    if not prepared.found then
+      return nil, "prepared signing metadata is missing; run PrepareIOSQADebug.sh"
+    end
+    local app = norm(prepared.prepared_app or "")
+    local stat = app ~= "" and vim.uv.fs_stat(app) or nil
+    if not stat or stat.type ~= "directory" or not vim.uv.fs_stat(join(app, "Info.plist")) then
+      return nil, "prepared signed IOS app is unavailable; rerun PrepareIOSQADebug.sh"
+    end
+
+    target_ctx.legacy_launch_script = script
     target_ctx.legacy_signing = prepared
     return true
   end
@@ -8524,6 +8558,7 @@ do
         device_id = device.id,
         device_name = device.name,
         device_backend = device.backend,
+        device_transport = device.transport,
       })
       if not runtime then
         fail(update_err)
@@ -8534,8 +8569,104 @@ do
       if type(opts.on_selected) == "function" then opts.on_selected(device, driver) end
     end
 
+    local function refresh_offline_device(device)
+      local function rediscover(message, level, detail)
+        if trim(detail or "") ~= "" then
+          pcall(function()
+            require("utils.notification_history").record({
+              scope = "ue.device",
+              title = "IOS USB refresh",
+              message = message,
+              detail = detail,
+              level = level or vim.log.levels.INFO,
+            })
+          end)
+        end
+        pcall(os.remove, output_path)
+        finish_progress(message, 100, level)
+        local next_opts = vim.deepcopy(opts)
+        next_opts.offline_refresh_attempted = true
+        vim.schedule(function()
+          CORE_RT.select_target_device(platform, next_opts)
+        end)
+      end
+
+      local transport = trim(device and device.transport):lower()
+      if driver.id ~= "IOS" or transport ~= "usb" then
+        rediscover(("Refreshed IOS device list; saved %s route is still offline")
+          :format(transport ~= "" and transport or "unknown"), vim.log.levels.WARN)
+        return
+      end
+      local reset_script, reset_err = resolve_ios_usb_reset_script(ctx)
+      if not reset_script then
+        rediscover(
+          "Refreshed IOS device list; USB recovery helper is unavailable",
+          vim.log.levels.WARN,
+          tostring(reset_err)
+        )
+        return
+      end
+
+      workflow_progress:report("Refreshing selected IOS USB route: " .. device.id, 92)
+      local reset_handle, reset_run_err = task_runner.run({
+        executable = reset_script,
+        args = { "--force", device.id },
+        cwd = _ufs.dirname(reset_script),
+        metadata = {
+          platform = "IOS",
+          operation = "device-refresh",
+          device_id = device.id,
+        },
+      }, {
+        name = "UE IOS selected device refresh",
+        on_exit = function(result)
+          if result.code ~= 0 then
+            rediscover(
+              "IOS USB route is still offline; refreshed device list",
+              vim.log.levels.WARN,
+              task_runner.error_message(result)
+            )
+            return
+          end
+          rediscover("IOS USB route refreshed; rediscovering selected device")
+        end,
+      })
+      if not reset_handle then
+        rediscover(
+          "Refreshed IOS device list; USB recovery could not start",
+          vim.log.levels.WARN,
+          tostring(reset_run_err)
+        )
+      end
+    end
+
     local function choose(devices)
-      if #devices == 0 then return false end
+      local preferred_device_id = trim(opts.preferred_device_id or "")
+      if #devices == 0 and preferred_device_id == "" then return false end
+      if preferred_device_id ~= "" then
+        for _, device in ipairs(devices) do
+          if device.id == preferred_device_id and device.available ~= false then
+            persist_device(device)
+            return true
+          end
+        end
+        devices[#devices + 1] = {
+          id = preferred_device_id,
+          name = target_ctx.device_name or preferred_device_id,
+          platform = "iOS",
+          backend = target_ctx.device_backend or "legacy-mobiledevice",
+          transport = target_ctx.device_transport or "usb",
+          available = false,
+        }
+      end
+      if preferred_device_id ~= "" and opts.offline_refresh_attempted == true then
+        local message = ("Selected IOS USB device remains offline after one refresh: %s")
+          :format(preferred_device_id)
+        pcall(os.remove, output_path)
+        finish_progress(message, 100, vim.log.levels.WARN)
+        if type(opts.on_error) == "function" then opts.on_error(message) end
+        return true
+      end
       if opts.auto_select_single == true and #devices == 1 then
         persist_device(devices[1])
         return true
@@ -8545,16 +8676,24 @@ do
         prompt = "Select " .. driver.id .. " device:",
         format_item = function(device)
           local backend = device.backend and (", " .. device.backend) or ""
-          return ("%s (%s%s, %s)"):format(
+          local transport = device.transport and (", " .. device.transport) or ""
+          local availability = device.available == false and ", saved, offline" or ""
+          return ("%s (%s%s%s%s, %s)"):format(
             device.name or "unnamed",
             device.os_version or device.platform or "unknown",
             backend,
+            transport,
+            availability,
             device.id
           )
         end,
       }, function(device)
         if not device then
           fail(driver.id .. " device selection cancelled")
+          return
+        end
+        if device.available == false then
+          refresh_offline_device(device)
           return
         end
         persist_device(device)
@@ -8628,31 +8767,144 @@ do
       end
     end
 
+    local function run_mobiledevice(primary_devices, primary_reason)
+      if
+        type(driver.mobiledevice_device_list_plans) ~= "function"
+        or type(driver.parse_mobiledevice_device_list) ~= "function"
+      then
+        if not choose(primary_devices) then run_fallback(primary_reason) end
+        return
+      end
+
+      local plans = driver.mobiledevice_device_list_plans(target_ctx, host_driver)
+      if type(plans) ~= "table" or plans.ok == false or #plans == 0 then
+        if not choose(primary_devices) then
+          run_fallback(primary_reason .. "; MobileDevice discovery is unavailable")
+        end
+        return
+      end
+
+      workflow_progress:report("Checking USB and Wi-Fi MobileDevice routes", 35)
+      local devices = vim.deepcopy(primary_devices or {})
+      local positions = {}
+      for index, device in ipairs(devices) do
+        positions[device.id] = index
+      end
+      local pending = #plans
+      local function present_choices()
+        if not choose(devices) then run_fallback(primary_reason) end
+      end
+      local function enrich_mobiledevice_names()
+        if
+          type(driver.mobiledevice_info_plan) ~= "function"
+          or type(driver.parse_mobiledevice_info) ~= "function"
+        then
+          present_choices()
+          return
+        end
+        local pending_info = 0
+        for _, device in ipairs(devices) do
+          if device.backend == "legacy-mobiledevice" then
+            pending_info = pending_info + 1
+          end
+        end
+        if pending_info == 0 then
+          present_choices()
+          return
+        end
+        local function complete_info()
+          pending_info = pending_info - 1
+          if pending_info == 0 then present_choices() end
+        end
+        for index, device in ipairs(devices) do
+          if device.backend == "legacy-mobiledevice" then
+            local device_index = index
+            local candidate = device
+            local info_plan = driver.mobiledevice_info_plan(candidate, target_ctx, host_driver)
+            local info_handle = task_runner.run(info_plan, {
+              name = "UE IOS device identity",
+              on_exit = function(result)
+                if result.code == 0 then
+                  local parsed = driver.parse_mobiledevice_info(result.stdout, candidate)
+                  if parsed.ok then devices[device_index] = parsed.device end
+                end
+                complete_info()
+              end,
+            })
+            if not info_handle then complete_info() end
+          end
+        end
+      end
+      local function append(device)
+        local position = positions[device.id]
+        if not position then
+          devices[#devices + 1] = device
+          positions[device.id] = #devices
+        elseif devices[position].transport == "network" and device.transport == "usb" then
+          devices[position] = device
+        end
+      end
+      local function complete_one()
+        pending = pending - 1
+        if pending > 0 then return end
+        enrich_mobiledevice_names()
+      end
+
+      for _, mobile_plan in ipairs(plans) do
+        -- LuaJIT closures share the generic-for control variable. Keep a
+        -- per-iteration reference so the async callback cannot observe the
+        -- loop variable after it has advanced (or become nil).
+        local plan = mobile_plan
+        local handle = task_runner.run(plan, {
+          name = "UE IOS " .. tostring(plan.metadata.transport) .. " device discovery",
+          on_exit = function(result)
+            if result.code == 0 then
+              local parsed = driver.parse_mobiledevice_device_list(
+                result.stdout,
+                plan.metadata.transport
+              )
+              if parsed.ok then
+                for _, device in ipairs(parsed.devices) do
+                  append(device)
+                end
+              end
+            end
+            complete_one()
+          end,
+        })
+        if not handle then complete_one() end
+      end
+    end
+
     workflow_progress:report("Checking CoreDevice", 10)
     local plan = driver.device_list_plan(target_ctx, host_driver)
     local handle, run_err = task_runner.run(plan, {
       name = "UE " .. driver.id .. " device discovery",
       on_exit = function(result)
         if result.code ~= 0 then
-          run_fallback(task_runner.error_message(result))
+          run_mobiledevice({}, task_runner.error_message(result))
           return
         end
         local payload, payload_err = read_result_file(output_path)
         if not payload then
-          run_fallback(payload_err)
+          run_mobiledevice({}, payload_err)
           return
         end
         local parsed = driver.parse_device_list(payload)
         if not parsed.ok then
-          run_fallback(parsed.reason)
+          run_mobiledevice({}, parsed.reason)
           return
         end
-        if not choose(parsed.devices) then
-          run_fallback("no available physical " .. driver.id .. " CoreDevice")
-        end
+        pcall(os.remove, output_path)
+        run_mobiledevice(
+          parsed.devices,
+          "no available physical " .. driver.id .. " CoreDevice"
+        )
       end,
     })
-    if not handle then run_fallback(run_err or "primary device discovery failed to start") end
+    if not handle then
+      run_mobiledevice({}, run_err or "primary device discovery failed to start")
+    end
     return handle
   end
 
@@ -8738,11 +8990,6 @@ do
   local function with_target_bundle_id(ctx, driver, target_ctx, host_driver, on_done, dependencies)
     dependencies = dependencies or {}
     local artifacts = target_ctx.artifacts
-    if type(artifacts) ~= "table" or #artifacts == 0 then
-      on_done(nil, nil,
-        "no artifact provenance from a successful package task; run :UEPackage" .. driver.id)
-      return
-    end
     if target_ctx.device_backend == "legacy-mobiledevice" then
       local signing = target_ctx.legacy_signing or {}
       local validated = driver.validate_bundle_id(signing.bundle_identifier)
@@ -8750,7 +8997,17 @@ do
         on_done(nil, nil, validated.reason)
         return
       end
-      on_done(validated.bundle_id, artifacts)
+      local installed = driver.validate_bundle_id(target_ctx.bundle_id)
+      if installed.ok and installed.bundle_id ~= validated.bundle_id then
+        on_done(nil, nil, "installed IOS bundle does not match prepared signing metadata")
+        return
+      end
+      on_done(validated.bundle_id, type(artifacts) == "table" and artifacts or {})
+      return
+    end
+    if type(artifacts) ~= "table" or #artifacts == 0 then
+      on_done(nil, nil,
+        "no artifact provenance from a successful package task; run :UEPackage" .. driver.id)
       return
     end
     local selected = driver.select_staged_artifact(artifacts, target_ctx)
@@ -8935,7 +9192,19 @@ do
     end)
   end
 
-  function CORE_RT.launch_target(platform)
+  local function ensure_legacy_ios_launch_device(ctx, target_ctx, on_selected)
+    return CORE_RT.select_target_device("IOS", {
+      preferred_device_id = target_ctx.device_id,
+      expected_engine_root = ctx.engine_root,
+      expected_project_root = ctx.project_root,
+      on_selected = function(device)
+        on_selected(device)
+      end,
+    })
+  end
+
+  function CORE_RT.launch_target(platform, opts)
+    opts = opts or {}
     local ctx, err = resolve_context()
     if not ctx or not ctx.project_root then
       target_error("ue.launch", err or "No project configured. Run :UESetProject [path]")
@@ -8960,29 +9229,76 @@ do
       return
     end
     driver = resolved
+    if
+      driver.id == "IOS"
+      and target_ctx.device_backend == "legacy-mobiledevice"
+      and opts.device_verified ~= true
+    then
+      pcall(os.remove, output_path)
+      return ensure_legacy_ios_launch_device(ctx, target_ctx, function()
+        CORE_RT.launch_target(platform, { device_verified = true })
+      end)
+    end
+    if CORE_RT.target_launch_running[driver.id] then
+      pcall(os.remove, output_path)
+      vim.notify(driver.id .. " launch is already in progress", vim.log.levels.INFO)
+      return
+    end
+    CORE_RT.target_launch_running[driver.id] = true
+    local task_runner = require("ue.target_tasks")
+    local launch_progress = task_runner.progress({
+      title = driver.id .. " launch",
+      scope = "ue.launch",
+      message = "Validating installed IOS app and device route",
+      percentage = 0,
+      replace = "ue.target.launch." .. driver.id:lower(),
+    })
+    local launch_progress_finished = false
+    local function finish_launch_progress(message, percentage, level)
+      if launch_progress_finished then return end
+      launch_progress_finished = true
+      CORE_RT.target_launch_running[driver.id] = nil
+      launch_progress:finish(message, percentage, level)
+    end
+    local function launch_error(message)
+      pcall(os.remove, output_path)
+      finish_launch_progress(driver.id .. " launch failed", nil, vim.log.levels.ERROR)
+      target_error("ue.launch", message)
+    end
+    if target_ctx.device_backend == "legacy-mobiledevice" then
+      launch_progress:report("Loading persisted IOS signing and app evidence", 5)
+      local prepared, prepare_err = prepare_legacy_ios_launch(ctx, driver, target_ctx)
+      if not prepared then
+        launch_error(prepare_err)
+        return
+      end
+    end
+    launch_progress:report("Checking IOS launch prerequisites", 10)
     CORE_RT.run_target_preflight(driver, "launch", target_ctx, host_driver, function(ok, preflight_err)
-      if not ok then target_error("ue.launch", preflight_err); return end
+      if not ok then launch_error(preflight_err); return end
+      launch_progress:report("Resolving installed IOS bundle", 20)
       with_target_bundle_id(ctx, driver, target_ctx, host_driver, function(bundle_id, artifacts, bundle_err)
-        if not bundle_id then target_error("ue.launch", bundle_err); return end
+        if not bundle_id then launch_error(bundle_err); return end
         target_ctx.bundle_id = bundle_id
         target_ctx.artifacts = artifacts
         target_ctx.json_output = output_path
         local plan = driver.launch_plan(target_ctx, host_driver)
-        local handle, run_err = require("ue.target_tasks").run(plan, {
+        launch_progress:report("Waiting for selected IOS device", 30)
+        local handle, run_err = task_runner.run(plan, {
           name = "UE " .. driver.id .. " launch",
           on_exit = function(result)
             if result.code ~= 0 then
-              pcall(os.remove, output_path)
-              target_error("ue.launch", require("ue.target_tasks").error_message(result))
+              launch_error(task_runner.error_message(result))
               return
             end
+            launch_progress:report("Verifying launched IOS process", 85)
             local payload, payload_err = read_result_file(output_path)
-            if not payload then target_error("ue.launch", payload_err); return end
+            if not payload then launch_error(payload_err); return end
             local parsed = driver.parse_launch_result(payload, {
               device_id = target_ctx.device_id,
               bundle_id = bundle_id,
             })
-            if not parsed.ok then target_error("ue.launch", parsed.reason); return end
+            if not parsed.ok then launch_error(parsed.reason); return end
             local runtime, update_err = CORE_RT.update_target_runtime(ctx.engine_root, driver.id, {
               device_id = target_ctx.device_id,
               bundle_id = bundle_id,
@@ -8990,17 +9306,18 @@ do
               process_id = parsed.process_id,
             })
             if not runtime then
-              target_error("ue.launch", update_err)
+              launch_error(update_err)
               return
             end
-            vim.notify(("Launched %s on %s (pid %s)"):format(
+            local message = ("Launched %s on %s (pid %s)"):format(
               bundle_id, target_ctx.device_id, tostring(parsed.process_id)
-            ))
+            )
+            finish_launch_progress(message, 100)
+            vim.notify(message)
           end,
         })
         if not handle then
-          pcall(os.remove, output_path)
-          target_error("ue.launch", run_err or "launch task failed to start")
+          launch_error(run_err or "launch task failed to start")
         end
       end)
     end)
@@ -11313,9 +11630,17 @@ function M.setup()
   vim.api.nvim_create_user_command("UEDAPToggleUI",        function() M.dap_toggle_ui()        end, { desc = "DAP: Toggle UI" })
   vim.api.nvim_create_user_command("UEDAPREPL",            function() M.dap_toggle_repl()      end, { desc = "DAP: Toggle REPL" })
   vim.api.nvim_create_user_command("UEDAPStop", function()
+    local ok_dap, dap = pcall(require, "dap")
+    local session = ok_dap and dap.session and dap.session() or nil
+    local session_config = session and session.config or nil
+    if (session_config and session_config._ue_ios_session_owner == "legacy-mobiledevice")
+      or M.current_platform() == "IOS" then
+      require("ue.dap.ios").stop()
+      return
+    end
     M.stop_android_debugger({ kill_orphans = true })
     vim.notify("[ue.dap] session stopped", vim.log.levels.INFO)
-  end, { desc = "DAP: Stop / detach (Android: keeps app running)" })
+  end, { desc = "DAP: Stop / detach (IOS also kills the device app)" })
   vim.api.nvim_create_user_command("UEDAPReattach", function()
     if type(M.android_dap_reattach) == "function" then
       M.android_dap_reattach()

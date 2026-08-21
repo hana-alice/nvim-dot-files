@@ -94,6 +94,12 @@ local function is_ue_android_lldb_session(session)
     and tostring(cfg.name or ""):match("UE Android Attach") ~= nil
 end
 
+local function is_ue_ios_lldb_session(session)
+  local cfg = session and session.config or nil
+  return cfg and cfg.type == "lldb"
+    and cfg._ue_ios_session_owner == "legacy-mobiledevice"
+end
+
 
 -- ─── UPSTREAM ROOT CAUSE: nvim-dap synthetic-frame handling ──────────────
 -- ANCHOR(ue-synthetic-frame-guard). Three sites in this file defend against the
@@ -1983,7 +1989,7 @@ function D.setup_dap(dap, dapui)
     end
   end
 
-  dap.listeners.after.event_initialized["dapui_config"] = function()
+  dap.listeners.after.event_initialized["dapui_config"] = function(session)
     close_explorer()
     save_layout()
     -- Guarantee the editor area holds a real file buffer (NOT a leftover
@@ -1996,8 +2002,14 @@ function D.setup_dap(dap, dapui)
     end
     open_debug_layout({ reset = true })
     start_logcat()
-    -- Mark progress popup as done.
-    pcall(function() require("ue.dap._progress").done("debugger attached") end)
+    local config = session and session.config or nil
+    if config and config._ue_ios_session_owner == "legacy-mobiledevice" then
+      pcall(function()
+        require("ue.dap._progress").step("iOS transport attached; arming source breakpoints …")
+      end)
+    else
+      pcall(function() require("ue.dap._progress").done("debugger attached") end)
+    end
   end
   dap.listeners.before.event_terminated["dapui_config"] = function() on_session_end() end
   dap.listeners.before.event_exited["dapui_config"]     = function() on_session_end() end
@@ -2021,9 +2033,13 @@ function D.setup_dap(dap, dapui)
     dap.terminate = function(opts, terminate_opts, cb)
       local sess = dap.session()
       local cfg = sess and sess.config or nil
-      local is_ue_attach =
-        cfg and tostring(cfg.name or ""):match("UE Android Attach") ~= nil
-      if is_ue_attach then
+      local name = cfg and tostring(cfg.name or "") or ""
+      local is_android_attach = name:match("UE Android Attach") ~= nil
+      local is_ios_session = cfg and cfg._ue_ios_session_owner == "legacy-mobiledevice"
+      if is_ios_session then
+        return require("ue.dap.ios").stop()
+      end
+      if is_android_attach then
         return dap.disconnect({ terminateDebuggee = false }, cb)
       end
       return orig_terminate(opts, terminate_opts, cb)
@@ -2045,7 +2061,8 @@ function D.setup_dap(dap, dapui)
     local orig_frame_set = session_mod._ue_android_orig_frame_set
     session_mod._ue_android_invalid_frame_guard = true
     session_mod._frame_set = function(session, frame)
-      if is_ue_android_lldb_session(session) and frame_is_synthetic_or_invalid(frame) then
+      if (is_ue_android_lldb_session(session) or is_ue_ios_lldb_session(session))
+        and frame_is_synthetic_or_invalid(frame) then
         return
       end
       return orig_frame_set(session, frame)
@@ -2154,6 +2171,11 @@ function D.setup_dap(dap, dapui)
   end
   dap.listeners.after.event_stopped["ue-dap-source-nav"] = function(session, body)
     if dap.session() ~= session then return end
+    local cfg = session.config or {}
+    local is_ios_entry_stop = cfg._ue_ios_session_owner == "legacy-mobiledevice"
+      and body and (body.reason == "entry"
+        or tostring(body.description or ""):find("SIGSTOP", 1, true) ~= nil)
+    if is_ios_entry_stop then return end
     if is_ue_android_lldb_session(session) then
       local frame = session.current_frame
       append_android_bp_diag({
@@ -2258,7 +2280,8 @@ function D.setup_dap(dap, dapui)
     -- single load-bearing fix; the _frame_set patch and bp-response remap are
     -- only thin defence-in-depth around it.
     if err or not response or not response.stackFrames then return end
-    local is_android = is_ue_android_lldb_session(session)
+    local sanitize_synthetic = is_ue_android_lldb_session(session)
+      or is_ue_ios_lldb_session(session)
     local filtered = nil
     local sanitized = nil
     for _, frame in ipairs(response.stackFrames) do
@@ -2281,7 +2304,7 @@ function D.setup_dap(dap, dapui)
       -- preserves frameId/scopes without opening dap-src:// or notifying
       -- "Source missing". Real local-file frames and breakpoint hits are kept
       -- untouched.
-      if is_android then
+      if sanitize_synthetic then
         if frame_is_synthetic_or_invalid(frame) then
           local copy = vim.deepcopy(frame)
           copy.line = -1
@@ -2297,7 +2320,7 @@ function D.setup_dap(dap, dapui)
         end
       end
     end
-    if is_android then
+    if sanitize_synthetic then
       if filtered and #filtered > 0 then
         response.stackFrames = filtered
       else

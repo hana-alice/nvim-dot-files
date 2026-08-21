@@ -266,7 +266,11 @@ run_symbols() {
 
   local dsym="$binary.dSYM"
   print -r -- "[UE iOS] Generating dSYM on demand (no ZIP): $dsym"
-  "$xcrun" dsymutil "$binary" -o "$dsym" || return $?
+  # The classic linker can emit an invalid >4 GiB .debug_info section for the
+  # monolithic UE image while still returning success and matching UUIDs.
+  # Parallel DWARF linking avoids that overflow; output verification makes a
+  # malformed bundle fail here instead of surfacing later as pending DAP BPs.
+  "$xcrun" dsymutil --linker parallel --verify-dwarf=output "$binary" -o "$dsym" || return $?
 
   local binary_probe dsym_probe binary_uuids dsym_uuids
   binary_probe=$("$xcrun" dwarfdump --uuid "$binary") || return $?

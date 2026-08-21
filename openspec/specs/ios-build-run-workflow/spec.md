@@ -247,12 +247,11 @@ IOS `:UEPrepare` 必须把一次性 Nvim 配置收敛为其 Apple 前置分支�
 - **THEN** 系统必须停止当前任务并报告探测结果
 - **AND** 不得回退到 Windows 或未知工具链
 
-### Requirement: 设备选择必须区分 CoreDevice 与 pre-iOS17 MobileDevice
+### Requirement: 设备选择必须区分 CoreDevice 与 MobileDevice transport
 
-MUST：`:UESetIOSDevice` 必须先使用 devicectl 结构化 JSON 选择已连接的 CoreDevice；当且仅当没有
-可用 CoreDevice 时，可以使用 `xcdevice` 结构化 JSON 发现 `available=true`、物理、USB 连接且
-系统版本低于 iOS 17 的设备。选择结果必须保存稳定 identifier 和 backend，不能解析人类表格文本、
-选择 unavailable 历史设备或把 legacy identity 冒充 CoreDevice identity。
+MUST：`:UESetIOSDevice` 必须合并 devicectl 的 connected CoreDevice、`idevice_id -l` 的实时 USB
+MobileDevice 与 `idevice_id --network` 的实时 Wi-Fi MobileDevice。选择结果必须保存稳定 identifier、
+backend 与 transport；已保存设备不在实时结果中时必须进入 picker，不能自动改选另一台设备。
 
 #### Scenario: iOS 15 USB 设备只有 MobileDevice 可见
 
@@ -262,9 +261,18 @@ MUST：`:UESetIOSDevice` 必须先使用 devicectl 结构化 JSON 选择已连�
 
 #### Scenario: xcdevice 只包含 simulator、unavailable 或现代历史设备
 
-- **WHEN** fallback 输出没有 available physical USB pre-iOS17 设备
-- **THEN** 系统必须继续报告 no available device
-- **AND** 不得选择 simulator、网络设备、iOS 17+ CoreDevice-unavailable 历史记录
+- **WHEN** xcdevice fallback 没有 available physical USB pre-iOS17 设备
+- **THEN** 系统仍必须使用 MobileDevice 实时 USB/Wi-Fi 结果构造 picker
+- **AND** 不得把 simulator 或 CoreDevice-unavailable 历史记录伪装成实时设备
+
+#### Scenario: 已保存设备离线但存在其他实时设备
+
+- **WHEN** Install/Launch 保存的 UDID 不在实时 USB、Wi-Fi 或 connected CoreDevice 结果中
+- **THEN** picker 必须同时展示实时候选与带 `saved, offline` 标记的保存设备
+- **AND** 系统不得自动切换到唯一的其他设备；用户选择实时候选后才更新 backend/transport
+- **AND** 用户选择保存的 offline USB 设备时，系统必须以该精确 UDID 刷新 USB/MobileDevice 路由并重新探测
+- **AND** 刷新不得改选其他设备；物理恢复失败必须保留 warning 证据，单次重新探测后仍离线必须结束当前操作
+- **AND** 系统不得重复打开相同 picker；只有用户下一次显式 Launch/设备选择才可开始新一轮选择
 
 #### Scenario: legacy 设备安装当前 tuple app
 
@@ -283,9 +291,13 @@ MUST：`:UESetIOSDevice` 必须先使用 devicectl 结构化 JSON 选择已连�
 
 #### Scenario: legacy 设备被普通 launch 消费
 
-- **WHEN** 当前选择的 backend 是 `legacy-mobiledevice` 且用户执行 `UELaunch`
-- **THEN** CoreDevice-only launch planner 必须明确 fail closed
-- **AND** 不得静默引入未经验证的普通启动 fallback
+- **WHEN** 当前选择的 backend 是 `legacy-mobiledevice`、持久化 runtime 仍有安装成功的精确 device/bundle，
+  且用户在当前或重启后的 Nvim 执行 `UELaunch`
+- **THEN** planner 必须验证 `Saved/IOSQADebug/signing.json` 的 prepared signed app 与 bundle，随后通过
+  host-owned `ios-deploy` 在用户选择的 USB 或 Wi-Fi transport 执行 `--noinstall --justlaunch`
+- **AND** USB transport 必须固定 `--no-wifi`；Wi-Fi transport 不得注入 `--no-wifi`
+- **AND** launch helper 必须再次查询精确 bundle PID 并发布结构化 device/bundle/process evidence
+- **AND** 不得要求当前进程仍持有 package artifact、重新安装、卸载、进入 DAP 或调用 UE legacy Run 后端
 
 ### Requirement: 单次设备任务必须固定目标设备
 
@@ -337,11 +349,13 @@ MUST：`UEInstallIOS` 以及 active target 为 IOS 时的 `<Space>ui` / `UEInsta
 
 ### Requirement: 启动必须使用真实 bundle identifier 且不进入 DAP
 
-MUST：IOS `UELaunch` 必须使用捕获设备和 staged app 的实际 bundle identifier 调用 devicectl process launch；不得调用 UE legacy instruments Run 后端。
+MUST：IOS `UELaunch` 必须使用捕获设备和已安装 app 的实际 bundle identifier。CoreDevice backend 调用
+`devicectl device process launch`；pre-iOS17 legacy backend 使用 prepared signed app 驱动
+`ios-deploy --noinstall --justlaunch`，并在返回前复查 PID。两者都不得调用 UE legacy Run 后端或进入 DAP。
 
 #### Scenario: 应用成功启动
 
-- **WHEN** devicectl 返回零退出码且结构化结果确认 bundle 已启动并提供进程证据
+- **WHEN** 对应 backend 的 launch transport 返回成功且结构化结果确认 device、bundle 与 PID
 - **THEN** 系统必须把 launch 标记为 succeeded
 - **AND** 不得自动调用 `UEDAPAttach`
 

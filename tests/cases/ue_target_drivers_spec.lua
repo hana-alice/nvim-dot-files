@@ -57,6 +57,27 @@ local function host_stub()
         cwd = "/tmp",
       }
     end,
+    ios_deploy_entry = function()
+      return {
+        executable = "/opt/homebrew/bin/ios-deploy",
+        args = {},
+        cwd = "/tmp",
+      }
+    end,
+    idevice_id_entry = function()
+      return {
+        executable = "/opt/homebrew/bin/idevice_id",
+        args = {},
+        cwd = "/tmp",
+      }
+    end,
+    ideviceinfo_entry = function()
+      return {
+        executable = "/opt/homebrew/bin/ideviceinfo",
+        args = {},
+        cwd = "/tmp",
+      }
+    end,
   }
 end
 
@@ -101,7 +122,7 @@ t.describe("ue.targets registry and contract", function()
     local _, mac_android = targets.resolve("Android", "build", macos)
     local _, win_ios = targets.resolve("IOS", "build", windows)
     local _, mac_win64 = targets.resolve("Win64", "build", macos)
-    local _, ios_dap = targets.resolve("IOS", "dap_attach", macos)
+    local ios_dap, ios_dap_error = targets.resolve("IOS", "dap_attach", macos)
 
     t.assert_eq(ios.id, "IOS")
     t.assert_eq(ios_semantic.id, "IOS")
@@ -110,7 +131,8 @@ t.describe("ue.targets registry and contract", function()
     t.assert_eq(mac_android.host_id, "macos")
     t.assert_eq(win_ios.status, "unavailable")
     t.assert_eq(mac_win64.status, "unavailable")
-    t.assert_eq(ios_dap.status, "unavailable")
+    t.assert_eq(ios_dap.id, "IOS")
+    t.assert_nil(ios_dap_error)
   end)
 
   t.it("keeps runtime routing policy in target drivers", function()
@@ -688,6 +710,40 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
     t.assert_eq(parsed.devices[1].backend, "legacy-mobiledevice")
   end)
 
+  t.it("discovers every live MobileDevice transport without choosing one", function()
+    local plans = ios.mobiledevice_device_list_plans({}, host_stub())
+    local usb = ios.parse_mobiledevice_device_list(
+      "00008101-000C699E2640001E\n00008102-000D700F3750002F\n",
+      "usb"
+    )
+    local network = ios.parse_mobiledevice_device_list(
+      "00008110-00183508019A801E\n",
+      "network"
+    )
+    local info_plan = ios.mobiledevice_info_plan(network.devices[1], {}, host_stub())
+    local info = ios.parse_mobiledevice_info(table.concat({
+      "DeviceName: iPhone (34)",
+      "ProductType: iPhone14,2",
+      "ProductVersion: 17.6.1",
+    }, "\n"), network.devices[1])
+
+    t.assert_eq(#plans, 2)
+    t.assert_eq(table.concat(plans[1].args, " "), "-l")
+    t.assert_eq(table.concat(plans[2].args, " "), "--network")
+    t.assert_true(usb.ok)
+    t.assert_eq(#usb.devices, 2)
+    t.assert_eq(usb.devices[1].transport, "usb")
+    t.assert_eq(usb.devices[1].backend, "legacy-mobiledevice")
+    t.assert_true(network.ok)
+    t.assert_eq(network.devices[1].id, "00008110-00183508019A801E")
+    t.assert_eq(network.devices[1].transport, "network")
+    t.assert_contains(info_plan.args, "--network")
+    t.assert_contains(info_plan.args, "00008110-00183508019A801E")
+    t.assert_true(info.ok)
+    t.assert_eq(info.device.name, "iPhone (34)")
+    t.assert_eq(info.device.os_version, "17.6.1")
+  end)
+
   t.it("routes a tuple-scoped app through the prepared legacy install helper", function()
     local install = ios.install_plan({
       device_id = "LEGACY-DEVICE",
@@ -713,7 +769,12 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
     local launch = ios.launch_plan({
       device_id = "LEGACY-DEVICE",
       device_backend = "legacy-mobiledevice",
+      device_transport = "network",
       bundle_id = "com.example.samplegame",
+      legacy_launch_script = "/NvimConfig/scripts/ue_ios_legacy_launch.zsh",
+      legacy_signing = {
+        prepared_app = "/Prepared/Client.app",
+      },
       json_output = "/tmp/launch.json",
     }, host_stub())
 
@@ -730,8 +791,17 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
     t.assert_contains(install.args, "com.example.legacy")
     t.assert_contains(install.args, "--device-backend")
     t.assert_contains(install.args, "legacy")
-    t.assert_eq(launch.status, "unavailable")
-    t.assert_contains(launch.reason, "CoreDevice")
+    t.assert_eq(launch.executable, "/bin/zsh")
+    t.assert_contains(launch.args, "/NvimConfig/scripts/ue_ios_legacy_launch.zsh")
+    t.assert_contains(launch.args, "/opt/homebrew/bin/ios-deploy")
+    t.assert_contains(launch.args, "LEGACY-DEVICE")
+    t.assert_contains(launch.args, "--transport")
+    t.assert_contains(launch.args, "network")
+    t.assert_contains(launch.args, "com.example.samplegame")
+    t.assert_contains(launch.args, "/Prepared/Client.app")
+    t.assert_contains(launch.args, "/tmp/launch.json")
+    t.assert_eq(launch.metadata.backend, "legacy-mobiledevice")
+    t.assert_eq(launch.metadata.transport, "network")
   end)
 
   t.it("fails closed when legacy install lacks prepared signing evidence", function()
@@ -933,11 +1003,21 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
         bundle_id = "com.example.samplegame",
       }
     )
+    local legacy_launch = ios.parse_launch_result(vim.json.encode({
+      deviceIdentifier = "LEGACY-DEVICE",
+      bundleIdentifier = "com.example.legacy",
+      processIdentifier = 4242,
+    }), {
+      device_id = "LEGACY-DEVICE",
+      bundle_id = "com.example.legacy",
+    })
 
     t.assert_true(devices.ok)
     t.assert_eq(#devices.devices, 1)
     t.assert_true(install_ok.ok)
     t.assert_eq(launch_bad.status, "unavailable")
+    t.assert_true(legacy_launch.ok)
+    t.assert_eq(legacy_launch.process_id, 4242)
   end)
 
   t.it("parses the current CoreDevice schema and excludes disconnected hardware", function()
@@ -1035,6 +1115,11 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
     }, context)
     t.assert_true(valid.ok)
     t.assert_eq(unsigned.status, "unavailable")
+
+    local launch = ios.preflight_plans("launch", context, host_stub())
+    t.assert_true(launch.ok)
+    t.assert_eq(#launch.plans, 1)
+    t.assert_eq(launch.plans[1].metadata.preflight, "iphoneos-sdk")
   end)
 
   t.it("parses identities and resolves only exact name or fingerprint matches", function()

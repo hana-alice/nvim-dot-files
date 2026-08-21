@@ -750,7 +750,7 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `:UESetIOSSigningCertificate` | Import this workspace's prepared debug identity when present, otherwise select one; exact name/SHA-1 supported, `!` clears |
 | `:UEPackageIOS`           | Reuse existing cooked data, then stage/package IOS; never build, cook, archive, deploy, or run |
 | `:UEIOSSymbols`           | Generate the current IOS binary's dSYM on demand and verify Mach-O UUIDs; no ZIP |
-| `:UESetIOSDevice`         | Show live CoreDevice → legacy USB → software recovery progress, then select/persist the physical device |
+| `:UESetIOSDevice`         | Merge live CoreDevice/USB/Wi-Fi candidates and open a picker; saved offline devices are labeled and never auto-substituted |
 | `:UEInstallIOS`           | CoreDevice: install current packaged `.app`; pre-iOS17: stream signing/upload/Upgrade progress through prepared `InstallIOSClient.sh`; never uninstall or launch |
 | `<leader>us`              | `:UEBuildAndroidSO` — export + execute UBT compile/link actions (no Deploy/Gradle/APK) |
 | `<leader>uq`              | `:UEDeployAndroidSO` — strip, push, atomically replace and verify `libUE4.so`; leaves the app stopped |
@@ -801,7 +801,12 @@ iOS 签名 identity 也可通过 `:UESetIOSSigningCertificate` 单独设置。�
 设备可在 `:UEBuildIOS` 后直接安装当前 tuple app，但必须存在匹配的 `Saved/IOSQADebug/signing.json`
 和 `~/Documents/temp/<branch>/InstallIOSClient.sh`。helper 只克隆/重签、封装临时 IPA 并原地更新，
 不会修改源 app、卸载旧 app 或启动进程；设备发现和安装都使用持续更新的进度句柄，legacy usbmux
-失联会先调用同目录 `ResetIOSUSB.sh` 软件恢复再重新探测；legacy `:UELaunch` 仍 fail closed。
+失联会先调用同目录 `ResetIOSUSB.sh` 软件恢复再重新探测；picker 中选择 `saved, offline` 的 USB 设备也会
+以该精确 UDID 尝试刷新路由并始终重新探测，不会改选其他设备。目标不在 IOKit、无法物理恢复时只记录
+warning；单次重新探测后仍离线便结束当前操作，不会重复弹出相同 picker。legacy `:UELaunch` 会复用 manifest 中的
+prepared signed app；若保存的设备不在实时 USB/Wi-Fi/CoreDevice 结果中，会先弹 picker 而不是改选唯一
+候选。确认选择后以对应 transport 执行 `ios-deploy --noinstall --justlaunch` 并复查 PID；Nvim 重启后
+也不要求重新 package/install，且不会触发 codesign 私钥探测或 DAP。
 
 `:UEBuildIOS` 的第一次构建（或 AOT 输入、工具链、SDK、framework 产物发生变化后）仍执行完整 AOT；
 只有输入指纹相同且上次成功构建记录的 framework 路径与内容 hash 全部匹配时，Nvim 才注入
@@ -899,8 +904,9 @@ Notes:
 
 Source: `lua/config/keymaps.lua` (`<leader>d*` block + `dap_fkeys` table). All
 keys call the **platform-neutral `:UEDAP*` user commands** defined in
-`lua/ue.lua`. `:UEDAPAttach android` dispatches to the Android handler; on
-Win64 the same commands target the local debugger. (The older
+`lua/ue.lua`. With no argument they dispatch to the active target; explicit
+arguments such as `:UEDAPAttach android` still force one handler. IOS uses its
+own physical-device handler, while Win64 targets the local debugger. (The older
 `UEAndroidDAP*` route is gone — do not look for it.)
 
 The `<F5/F6/F9/F10/F11/S-F11>` set is bound in **n / i / t / v** modes
@@ -911,8 +917,8 @@ literal `<F5>` in insert mode).
 
 | Key | Command | Action |
 |---|---|---|
-| `<leader>da` | `:UEDAPAttach android` | Attach to the Android process |
-| `<leader>dl` | `:UEDAPLaunch android` | Launch + auto-attach |
+| `<leader>da` | `:UEDAPAttach` | Attach to the active target process |
+| `<leader>dl` | `:UEDAPLaunch` | Launch active target + auto-attach |
 | `<leader>dc` / `F5` | `:UEDAPContinue` | Continue |
 | `<leader>dp` / `F6` | `:UEDAPPause` | Pause |
 | `<leader>dn` / `F10` | `:UEDAPStepOver` | Step over |

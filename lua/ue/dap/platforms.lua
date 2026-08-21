@@ -50,8 +50,8 @@ function M.known_platforms()
 end
 
 --- Register only DAP handlers supported by the current host-target matrix.
---- Importability is not compatibility: for example, loading the iOS module on
---- macOS must not make an unsupported iOS attach appear available.
+--- Importability is not compatibility: the iOS device handler is available on
+--- macOS only because the IOS target explicitly owns both DAP operations.
 ---@param host_driver table
 ---@param ue_api table
 function M.register_supported(host_driver, ue_api)

@@ -103,26 +103,32 @@
   Package/Install 精确 preflight，绝不选择第一张证书。日常 build 另用稳定 INI override 延后 dSYM。
   `:UEPackageIOS` 规划 UAT BuildCookRun
   （SkipBuild/SkipCook/Stage/NoCleanStage/Package，不含 Cook/Archive/Deploy/Run）；`:UEIOSSymbols`
-  按需运行 dsymutil 并比较 binary/dSYM UUID；
-  `:UESetIOSDevice` 先使用结构化 CoreDevice JSON；没有 connected tunnel 时，再以 `xcdevice` JSON
-  只发现 available、物理、USB、pre-iOS17 设备，并把 `coredevice` / `legacy-mobiledevice` backend
-  与 identifier 一起保存；单一进度句柄持续显示 CoreDevice、legacy fallback、IOUSBHost recovery 与
-  重探测阶段，legacy 路径为空时自动调用 branch 的 `ResetIOSUSB.sh` 后重试。`:UEInstallIOS` 的
+  按需运行 parallel dsymutil、验证 DWARF 输出并比较 binary/dSYM UUID；
+  `:UESetIOSDevice` 合并结构化 CoreDevice JSON、`idevice_id` 的实时 USB/Wi-Fi MobileDevice 与
+  pre-iOS17 `xcdevice` fallback，并把 identifier/backend/transport 一起保存；保存设备未实时出现时，
+  picker 会同时展示 live 候选与 `saved, offline` 项，禁止自动替换。单一进度句柄持续显示 CoreDevice、
+  MobileDevice、legacy fallback、IOUSBHost recovery 与重探测阶段。`:UEInstallIOS` 的
   CoreDevice 路径继续消费当前 package task 的
   `Binaries/IOS/Payload/<Target>.app` provenance；legacy 路径只在当前 tuple app、匹配的
   `Saved/IOSQADebug/signing.json` 与 branch 对应 `InstallIOSClient.sh` 同时存在时，克隆并重签临时副本，
   再用 MobileDevice 原地更新；helper stdout/stderr 被流式解析为签名、上传和 device Upgrade 百分比。
-  源 app 与设备 container 不被删除。`:UELaunch` 仍只接受 CoreDevice，
-  legacy 选择会明确 fail closed；iOS run 不隐式进入 DAP。
+  源 app 与设备 container 不被删除。`:UELaunch` 的 CoreDevice 路径消费 devicectl JSON；legacy 路径
+  从 prepared signing manifest 恢复已签名 app 与已安装 bundle，在显式选择的 USB/Wi-Fi transport 上
+  用 host-owned `ios-deploy --noinstall --justlaunch` 启动后复查 PID，因此 Nvim 重启不要求重做 package/install，也不触发签名
+  私钥检查；两条 iOS run 路径都不隐式进入 DAP。
 - **DAP**：setup 先按 host-target-operation matrix 过滤 handler，再由 `UEDAP*` 命令经
-  `ue.dap.platforms` dispatch → 具体平台 `attach/launch` → codelldb（Win64/Android）。iOS DAP
-  未实现，因此 macOS 也不注册 IOS handler，更不会借用 Mac process attach。Android 走 platform
+  `ue.dap.platforms` dispatch → 具体平台 `attach/launch` → `lldb-dap`。iOS 不借用 Mac process
+  attach：`ios-deploy --nolldb` 只负责 legacy USB debugserver loopback bridge，Apple LLDB 选择
+  `remote-ios` + 精确 DeviceSupport sysroot，以本地 symbol-rich Mach-O 创建 target，并映射设备 app
+  executable。`UEDAPLaunch` 经 `SBProcess.RemoteLaunch(..., stop_at_entry=true)` 在断点下发前保持停住；
+  `UEDAPAttach` 取已运行 bundle PID，再等待异步 RemoteAttach 进入 stopped。内存模块使用 `partial`
+  load level，避免通过 USB 下载完整远程符号表；本地 Client DWARF 仍保持完整。`UEDAPStop` 非终止式
+  detach 后杀掉并复查设备进程。Android 走 platform
   模式 + serial connect URL；K30 URL 与本次 session 捕获的 ADB serial 必须一致，切换当前进程的
   选择值不改变活跃 session 的 poll/cleanup。
-  `tools/ios_dap_protocol_probe.py` 已提供脱敏 CoreDevice preflight、显式 pre-iOS17 legacy preflight 与
-  参数化 CLI/raw-DAP attach gate。当前 legacy 实机已证明精确 DeviceSupport、DeveloperDiskImage、
-  debugserver listener、LLDB `remote-ios` 和 target create，但设备 profile 尚未显式信任，且现有重签包
-  不含 source DWARF；因此只记录 partial/blocked evidence，IOS matrix 仍保持 unavailable。
+  `tools/ios_dap_protocol_probe.py` 保留为脱敏 CoreDevice/legacy preflight 与协议诊断入口；生产路径已在
+  legacy 真机分别验证 attach-at-launch、ordinary attach、resolved source breakpoint、source frame、
+  LLDB expression 和 cleanup。
 
 ### 2.1 状态归属清单
 
@@ -159,7 +165,7 @@
 | Host | 可执行 targets / operations | 明确不可用 |
 |---|---|---|
 | Windows | Win64：build/launch/log/debug-log/DAP；Android：build/SO build+deploy/install/launch/log/DAP | IOS、Mac、Linux |
-| macOS | Mac：build/launch/log/DAP；IOS：build/package/device/install/launch | Android、Win64、Linux；IOS DAP |
+| macOS | Mac：build/launch/log/DAP；IOS：build/package/device/install/launch/DAP | Android、Win64、Linux |
 | Linux | Linux：build/launch/log/DAP | Android、IOS、Mac、Win64 |
 
 此表描述当前已实现能力，不代表 UE 理论上不能支持更多组合；新增组合必须先增加独立 host adapter、

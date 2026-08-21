@@ -192,19 +192,25 @@ function M.lldb_dap_config(opts)
 end
 
 --- Run a config via nvim-dap; degrade to a notify when nvim-dap is
---- unavailable so headless smoke tests don't crash.
-function M.run(config, fallback_msg)
+--- unavailable so headless smoke tests don't crash. Platform handlers with a
+--- protocol-proven adapter (notably IOS/Xcode) may freeze its absolute path.
+function M.run(config, fallback_msg, adapter_override, adapter_options)
   local dap, err = M.require_dap()
   if not dap then
     vim.notify((fallback_msg or "DAP unavailable") .. ": " .. err, vim.log.levels.WARN)
     return false
   end
-  local adapter = M.find_lldb_dap()
+  local adapter = adapter_override or M.find_lldb_dap()
   if not adapter then
     vim.notify("lldb-dap adapter not found on this host", vim.log.levels.ERROR)
     return false
   end
   M.ensure_adapter(dap, adapter)
+  if type(adapter_options) == "table" then
+    dap.adapters.lldb.options = vim.tbl_extend(
+      "force", dap.adapters.lldb.options or {}, adapter_options
+    )
+  end
   dap.run(config)
   return true
 end

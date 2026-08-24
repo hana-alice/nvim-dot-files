@@ -29,4 +29,4 @@
   - 当前 `android.lua` **没有** ASLR `target modules load --slide` rebase，与 MEMORY/历史教训（断点须先 rebase 模块基址）不一致。
   - host adapter 锁定 LLVM 22.1.6+ forward-only；device `lldb-server` 为独立 live-probe 变量（见 `docs/changelog.md` 2026-06-02 多条）。
 - **受众**：后续修复的实现者（人或 agent），用于在动协议前先验证假设。
-- **设备范围**：验证限定当前连接的 adb serial（如 `a3ad86f3`）。
+- **设备范围**：验证限定当前连接的 adb serial（如 `ANDROID-SERIAL-A`）。

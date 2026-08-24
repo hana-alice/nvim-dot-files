@@ -52,10 +52,10 @@
 
 ### Requirement: 设备验证范围限定
 
-诊断 SHALL 仅在 adb serial `a3ad86f3` 上验证，并在报告中标注其它设备需各自取证。
+诊断 SHALL 仅在 adb serial `ANDROID-SERIAL-A` 上验证，并在报告中标注其它设备需各自取证。
 
 #### Scenario: 单机取证
 
 - **WHEN** 执行任何设备侧 probe
-- **THEN** 命令均指定 `-s a3ad86f3`
+- **THEN** 命令均指定 `-s ANDROID-SERIAL-A`
 - **AND** 收尾清理：`killall lldb-server`、移除 adb forward、目标 `TracerPid=0`

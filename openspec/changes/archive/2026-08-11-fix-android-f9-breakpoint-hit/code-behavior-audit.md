@@ -105,9 +105,9 @@ before.stackTrace["ue_source_path_rewrite"]
 ### 6. 2026-06-15 最新 LLDB 证据
 
 - `MobileShadingRenderer.cpp:1367` 和 `:1369` 在
-  `Client_Symbols_v170300916/Client-arm64/libUE4.so` 的 DWARF line table 中都会解析到
+  `SampleGame_Symbols_v100000001/SampleGame-arm64/libUE4.so` 的 DWARF line table 中都会解析到
   `FMobileSceneRenderer::Render + 672/+676/+712/+720 at MobileShadingRenderer.cpp:1369:8`。
-- 本地 `D:/project/uetemp/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp`
+- 本地 `D:/UE/EngineWorktree/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp`
   当前第 1367 行是 `Scene->UpdateMobileShadowSpotlight(nullptr);`，但 `lldb disassemble`
   显示 `+672` 附近是 `ShouldRenderSkyAtmosphere` 后的 sky-atmosphere 代码块。
 - 因此当前 1367/1369 smoke 的“resolved but not hit”不能证明这条本地源码语句未执行；
@@ -120,7 +120,7 @@ before.stackTrace["ue_source_path_rewrite"]
   `648da3d17f2ac45ad0a6c5c1166cb248ae0baa1c`；旧 3.4 symbol lib 的 build-id 是
   `ad3d4e7c5f83823edbea33d7a9d5b13cb9153afc`，不能作为 F9 命中证明的符号源。
 - 匹配的 symbol-rich lib 是
-  `E:/aki/zeqiang_aki_3.5/Source/Client/Binaries/Android/Client_Symbols_v171457238/Client-arm64/libUE4.so`，
+  `E:/Projects/SampleGame-3.5/Source/SampleGame/Binaries/Android/SampleGame_Symbols_v100000002/SampleGame-arm64/libUE4.so`，
   build-id 同为 `648da3d17f2ac45ad0a6c5c1166cb248ae0baa1c`。
 - 使用匹配 3.5 symbols 后，`image lookup --file MobileShadingRenderer.cpp --line 1367`
   只有一个语义匹配：
@@ -130,6 +130,6 @@ before.stackTrace["ue_source_path_rewrite"]
   继续运行后收到 `reason="breakpoint"` / `description="breakpoint 1.1 2.1"`，
   `hitBreakpointIds=[1,2]`。
 - 同一 stop 的 stackTrace 栈顶为
-  `D:/project/uetemp/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp:1367`，
+  `D:/UE/EngineWorktree/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp:1367`，
   函数 `FMobileSceneRenderer::Render(...)`，证明 local source mapping 可用；该结论不依赖
   app business output。

@@ -23,8 +23,8 @@
 
 - [ ] 4.1 写 `docs/plans/2026-06-03-android-dap-handshake-rootcause.md`：本轮 live 证据、分层结论、复现命令、正解 vs workaround 判据、修复方向建议。
 
-## 5. 核验（仅 a3ad86f3）
+## 5. 核验（仅 ANDROID-SERIAL-A）
 
-- [ ] 5.1 所有设备命令 `-s a3ad86f3`；收尾 `killall lldb-server` + 移除 forward + 目标 `TracerPid=0`。
+- [ ] 5.1 所有设备命令 `-s ANDROID-SERIAL-A`；收尾 `killall lldb-server` + 移除 forward + 目标 `TracerPid=0`。
 - [ ] 5.2 `git status` 仅 `docs/`、`tools/`、`openspec/`；无 `lua/` 改动。
 - [ ] 5.3 `openspec validate android-dap-attach-handshake-rootcause` 通过。

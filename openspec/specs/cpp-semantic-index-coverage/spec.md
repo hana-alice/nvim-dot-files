@@ -29,6 +29,18 @@
 
 每个供导航消费的 generation SHALL 至少绑定 active target/platform/configuration、CDB 内容 fingerprint、toolchain identity、manifest gate、exact-command map 摘要与覆盖集合。导航请求开始后发生的 generation 切换 MUST 使旧响应 stale；旧 generation 的定义位置不得在新 generation 中自动生效。
 
+#### Scenario: Generation identity survives a Nvim restart
+- **WHEN** active target、CDB 内容与 toolchain 均未变化，但 Lua table 的迭代顺序因新进程而改变
+- **THEN** generation fingerprint SHALL 保持完全相同
+- **AND** 系统 SHALL 使用 canonical key ordering 序列化 hash payload，不得把运行时 hash 顺序当作 build evidence
+
+#### Scenario: Prepared tuple artifacts survive a Nvim restart
+- **WHEN** 当前 project/target/platform/configuration 的 selection、manifest、controlled CDB、semantic CDB
+  与源 CDB 签名仍可证明为 ready，随后 Neovim 重启
+- **THEN** clangd SHALL 直接消费这些持久化工件并为 UE C/C++ buffer 启动
+- **AND** 系统 MUST NOT 因新的 Lua 进程尚未执行 `UEPrepare` 而要求重复 prepare
+- **AND** 工件缺失、stale 或 tuple/build evidence 变化时 SHALL 继续 defer；同一进程内也必须重新验证
+
 #### Scenario: Compile database changes during navigation
 - **WHEN** `gd` 发出后 active CDB fingerprint 发生变化，旧索引响应随后返回
 - **THEN** 旧响应 SHALL 被标记为 stale 且 MUST NOT 跳转
@@ -62,6 +74,18 @@
 - **WHEN** clangd 尚未完成 controlled BackgroundIndex baseline、exact-command transport 尚未生效、正在重启或无法回答查询
 - **THEN** 导航 SHALL 返回 provider/index readiness reason
 - **AND** MUST NOT 把暂时性 provider 状态包装成实体不存在
+
+### Requirement: Published clangd CDB SHALL use the standard JSON compilation database schema
+
+current/hot/full phase artifact MAY 携带 `nvim_ue_members`、`nvim_ue_module_root` 等内部 provenance，
+但发布给 clangd 的 `compile_commands.json` SHALL 只包含标准的 `directory`、`file`、
+`arguments`/`command` 与可选 `output` 字段。内部 provenance MUST 在发布边界剥离；否则 clangd
+拒绝整份数据库时不得回退到 active per-file CDB。
+
+#### Scenario: Controlled phase entries contain portable provenance
+- **WHEN** SuperUnity phase artifact 包含 member/module-root metadata 并被合并到 clangd background CDB
+- **THEN** phase artifact SHALL 保留这些字段供 semantic sidecar 使用
+- **AND** clangd 发布视图 SHALL 剥离所有非标准字段，同时保持 exact argv、cwd、file 与 output 不变
 
 ### Requirement: Live file freshness SHALL overlay rather than replace broad coverage
 

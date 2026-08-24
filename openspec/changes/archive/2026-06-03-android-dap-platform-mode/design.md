@@ -105,11 +105,11 @@ lldb-dap、结束必 kill；动态取当前 device serial；收尾清 device lld
 - [platform 路径下 source-file 断点可能仍崩 3221226505] → 复用 address 断点结论
   （image lookup --line → breakpoint set --address）。
 - [server 版本与 host 22 的 platform 协议不完全兼容] → 真机逐版本验证握手层。
-- [仅单机] → 明确 a3ad86f3。
+- [仅单机] → 明确 ANDROID-SERIAL-A。
 
 ## Migration Plan
 
-1. apply 阶段先用 `tools/dap_platform_probe.py` 在 a3ad86f3 验证 D2 三方案，定连接途径。
+1. apply 阶段先用 `tools/dap_platform_probe.py` 在 ANDROID-SERIAL-A 验证 D2 三方案，定连接途径。
 2. 改 `lua/ue/dap/android.lua`：server 启动改 platform；attach 改不走 getopt 的连接途径
    + `process attach` + ASLR。
 3. 改 `lua/ue/dap.lua`：会话识别 / 入口不 jump / 断点响应按 platform 路径。

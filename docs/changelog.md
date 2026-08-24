@@ -45,6 +45,1129 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-08-24 — Re-sanitize the public branch before rewriting its history
+
+**Task**
+
+拉取 `feat/macos-ios-nvim` 最新远端后重新审计公开历史，移除提交元数据与 tracked 内容中残留的
+公司身份、真实工程环境和设备标识，再将分支压缩为单个可审计提交。
+
+**Implemented**
+
+- 将文档、OpenSpec 归档、测试 fixture、DAP probe 与 `tools/evidence/android-f9/` 中的真实项目根、
+  Android serial、个人用户路径、私有 IP、固定 `Client` 产物布局替换为稳定的 `SampleGame` /
+  `EngineWorktree` / `ANDROID-SERIAL-*` 占位语汇；保留调试结论和证据结构。
+- `lua/ue/dap/android.lua` 不再把某台工作站的 build root 当默认值；未显式配置
+  `dap.android_build_root` 时使用当前 project root，并由 `tests/cases/dap_spec.lua` 锁住。
+- `scripts/check_secrets.sh` 增加个人路径、历史私有工程根和 RFC1918 地址检测，防止同类 added-line
+  再进入公开分支；squash commit 使用公开 noreply 身份，移除分支旧提交中的公司邮箱元数据。
+
+**Pitfalls / Gotchas**
+
+- 未发现私钥、PAT、AWS key 等可直接利用的 secret；实际暴露面是项目路径、设备 serial、私有 IP
+  与公司邮箱。只新增“修复提交”不能清掉这些历史元数据，必须 squash 并 force-push。
+- 原始 Android F9 JSON 是单行大证据文件；脱敏只替换身份/路径字段，不删除 stop、breakpoint、
+  address 与结果结构，避免把历史可复验证据降成口头结论。
+
+**Validation**
+
+- 全 tracked 文本（排除检测器规则本身）经 `scripts/check_secrets.sh`：通过；已知旧标识定向 `rg`：0 命中。
+- `tools/evidence/android-f9/*.json` 全部可解析；`git diff HEAD --check`：通过。
+- `nvim --headless -l tests/run.lua dap`：72/72 passed；按用户指示本次不再跑全量回归。
+
+**Follow-ups**
+
+- 无；远端更新后以精确 lease 核验单提交拓扑与公开作者身份。
+
+### 2026-08-24 — Canonicalize and archive the UE platform boundary contract
+
+**Task**
+
+将已完成的 `establish-ue-platform-workflow-boundaries` delta specs 同步到主规格，归档 change，
+并保证后续功能开发能从细颗粒 capability 直接读取 host、target、workflow 与 DAP owner 边界。
+
+**Implemented**
+
+- 新增 `host-platform-driver`、`shell-command-planning`、`platform-tool-resolution`、
+  `ue-target-driver-boundary`、`ue-target-workflow-boundary` 与 `dap-platform-dispatch` 六份 canonical specs。
+- 将 Android attach/F9/SO deployment、iOS build/run、Apple semantic prepare 与 multi-instance owner
+  freeze 的 delta 合并回既有主规格；从 Apple semantic spec 移除三条已被独立 capability 取代的重复架构要求。
+- 将 52/52 tasks 完成的 change 原样归档到
+  `openspec/changes/archive/2026-08-24-establish-ue-platform-workflow-boundaries/`，并保留其 schema、proposal、
+  design、tasks 与全部 delta specs。
+- 补全 `notification-history` 的 Purpose，使仓库所有主规格都满足 strict validation；运行时行为未改变。
+
+**Pitfalls / Gotchas**
+
+- 首轮 `openspec validate --all --strict` 唯一失败是未改动的 `notification-history` Purpose 过短警告；
+  该问题会使全仓 strict 门禁永久非零，已用一处目的说明补全收口。
+- OpenSpec archive 在 git 中表现为 active change 删除与 dated archive 新增；内容和 `.openspec.yaml` 均保留，
+  不是丢弃 change 工件。
+
+**Validation**
+
+- `openspec validate --all --strict`：36/36 passed；`openspec list --json`：active changes 为空。
+- `nvim --headless -l tests/run.lua structure`：40/40；`git diff --check`：通过。
+- 全量 `nvim --headless -l tests/run.lua`：1079/1079。
+
+**Follow-ups**
+
+- 无新增 follow-up；目标平台硬件验收限制与后续要求继续保留在 dated archive 和前一条实现记录中。
+
+### 2026-08-21 — Establish enforceable UE host, target, workflow, and DAP boundaries
+
+**Task**
+
+审计既有 platform/target 分层是否落实，把持续回流 `lua/ue.lua` 的 host tool、Android/iOS lifecycle 与 DAP
+session policy 迁回明确 owner，并以更细 OpenSpec capability 和 repo-wide AST 门禁防止后续开发顾此失彼。
+
+**Implemented**
+
+- 新增 `lua/ue/workflows/` registry、immutable operation snapshot、policy-free runtime，以及按 operation 拆分的
+  Android build/install/deploy/launch/log 与 iOS semantic/signing/device/setup/install/launch owner；`lua/ue.lua`
+  只保留兼容 façade、context 注入与 generic dispatch，公共 API、81 个 UE commands、状态键和 cache path 不变。
+- 将 clipboard、code search、Python/clangd/libclang/lldb/CDB tool resolution 与 shell/executable 选择收口到
+  `utils.platform` capability/resolver；target driver 继续只产 structured plan，host-target-operation matrix 保持
+  fail closed 且不跨 target fallback。
+- DAP lifecycle 绑定 immutable session owner metadata，stop/status/reattach/cleanup 不再按 live selection 猜 target；
+  Android F9 保持 live breakpoint 通道，不再提示 reattach。
+- 新增六类 Lua Tree-sitter AST boundary rules，扫描全部 production Lua 并要求零 active exception；将
+  `lua/ue.lua` ratchet 从 12,002 下调到 10,562 行，新增 workflow 保持 800 行上限，并用 synthetic +1/801
+  fixtures 证明门禁会失败。
+- 更新 architecture、CONSTRAINTS、测试映射、本地 `AGENTS.md` 与历史 ADR 状态；新增 OpenSpec change
+  `establish-ue-platform-workflow-boundaries`，把 host/tool、target driver、workflow、DAP 和 boundary guard
+  拆成独立 canonical capability。
+
+**Pitfalls / Gotchas**
+
+- 全量首轮发现 AI context 会把 structured unavailable table 当字符串渲染；`lua/ue/ai_context.lua` 现在统一
+  取 `reason/message` 后再输出，避免对非字符串调用 `gsub`。
+- 当前验证 host 是 macOS；依赖 `powershell.exe` 的 Windows fake-runner 分支会按既有 guard 跳过，真实
+  Android/iOS 设备 install/launch/DAP 也未执行。本次不改变这些脚本与真机路线，只迁移 owner 和 dispatch。
+- 仓库历史 Lua 并非全量 Stylua-clean；本次只格式化并检查 21 个新增非-fixture Lua 文件，避免无关整仓重排。
+
+**Validation**
+
+- Host/tool：`platform` 39/39、`utils` 49/49、`grep_cache` 29/29、`csearch_build_guard` 22/22、
+  `ue_goto_behavior` 8/8、`ue_paths` 9/9、`index_generation` 25/25、`cpp_semantic_index` 1/1、
+  `clangd_commands` 5/5。
+- Workflow/core：`ue_workflows` 24/24、`ue_target_drivers` 46/46、`ue_target_integration` 26/26、
+  `ue_target_tasks` 7/7、`android_device` 14/14、`multi_instance_state` 13/13、`ue_project_context` 7/7、
+  `ue_context` 13/13、`ue_api` 55/55、`commands` 105/105、`smoke` 19/19。
+- DAP/structure：`dap` 71/71、`ue_platform_boundary` 9/9、`structure` 40/40、`keymaps` 56/56、
+  `stability` 10/10。
+- 静态/规格：`lint_no_bare_globals` 160 files OK；21 个新增非-fixture Lua 文件 `stylua --check` 通过；
+  `openspec validate establish-ue-platform-workflow-boundaries --strict` valid；`git diff --check` 通过。
+- 全量：`nvim --headless -l tests/run.lua` 1079/1079。
+
+**Follow-ups**
+
+- 在 Windows + Android 真机与 macOS + iOS 真机环境分别补一次 install/launch/DAP 手工验收；自动化边界、
+  plan/argv、snapshot、failure/cleanup 契约已覆盖，硬件 transport 仍以目标环境实测为准。
+
+### 2026-08-20 — Close self-review portability and evidence gaps before PR
+
+**Task**
+
+拉取 `origin` 最新 `feat/macos-ios-nvim` 后做合并前自审，将 fresh Windows 回归、Go 工具测试和独立代码审查
+揭示的问题在提 PR 前闭环。
+
+**Implemented**
+
+- `tools/cindex-uefilter/main.go` 在 Windows 增量发布时用短命子进程执行 upstream `index.Merge`，等 mmap/
+  writer handle 随子进程退出释放后再原子替换主索引；Go 回归锁住修改文件旧 trigram 消失、新文件可查且
+  无 `~`/`~~`/`.bak` 残留。
+- `lua/utils/platform/{macos,windows}.lua` 恢复确定性 host 契约：macOS POSIX shell 固定 `/bin/zsh`，显式
+  PowerShell capability 固定 `powershell.exe`；`lua/ue/targets/ios_signing.lua` 保留 prepared metadata 中的原始
+  provision path，仅用归一化副本做文件校验。
+- `lua/ue.lua` 在 IOS install/launch 前从当前 staged `.app/Info.plist` 重新解析 bundle id，不复用持久化旧值；
+  legacy setup readiness 每次重验 `InstallIOSClient.sh` 存在与可执行性。
+- `lua/utils/ue_goto/semantic_client.lua` 将 sidecar deadline 与已记录的 29–31s 冷查询对齐为 32s；
+  `tools/cdb_argv.py` 依 producer provenance/引号语法选 POSIX 或 Windows parser，并用无 Win32 API 依赖的
+  portable Windows splitter 支持跨 host 规范化。
+- `tools/ios_dap_protocol_probe.py` 只持久 PID digest，原始 PID 仅留在当次 attach 内存执行路径；同时修正
+  Windows 测试中 CDB candidate 路径归一化断言。
+
+**Pitfalls / Gotchas**
+
+- 历史条目记录的 `1021/1021` 是旧验证环境结果；本次 fresh Windows 全量实测为 `1014/1023`，直接证伪了
+  “当前远端 tip 跨环境全绿”这一推广。其中 8 项是 host/path/state 契约回归，1 项是 cindex 增量 merge 真实损坏；
+  修复后重跑而不保留旧结论。
+- `google/codesearch/index.Merge` 内部 mmap 无公开 close API；Windows 不能像 POSIX 一样在映射存活时 rename。
+  本仓不复制 upstream merge 实现，也不用 reflection/unsafe 穿透私有字段。
+- iOS DAP 生产 handler 仍保持 fail-closed unavailable；本次只修证据工具的隐私契约，不声称真机 DAP 已就绪。
+
+**Validation**
+
+- 定向：`platform` 23/23、`ue_target_drivers` 45/45、`ue_target_integration` 24/24、`ue_cdb` 31/31、
+  `csearch_build_guard` 22/22、`cpp_semantic_client` 15/15、`index_generation` 25/25、`ios_dap_probe` 3/3。
+- 工具：`go test ./...`、`go vet ./...`、Python `py_compile` 通过；`lint_no_bare_globals` 140 files OK；
+  `git diff --check` 通过。
+- 全量：`nvim --headless -l tests/run.lua` 1026/1026。
+
+**Follow-ups**
+
+- 32s semantic deadline 只比已观测的 31s 上界多 1s；若探针再出现合法冷查询 timeout，应基于新分位数证据
+  同步调整 request 与 live-health budget，不凭猜测继续放大。
+
+### 2026-08-21 — Require explicit IOS device choice when the saved route is offline
+
+**Task**
+
+修复 `<leader>ul` 在保存设备不可用时把另一个可见设备当作结论的问题；设备不确定时必须弹窗选择。
+
+**Implemented**
+
+- IOS 选择器现在合并 connected CoreDevice、实时 MobileDevice USB 与实时 MobileDevice Wi-Fi，并用
+  `ideviceinfo` 补齐设备名、系统版本和型号。
+- launch 会先验证保存的 UDID 是否仍在实时结果中；精确命中才直接继续，否则 picker 同时列出实时设备与
+  `saved, offline` 设备，绝不自动替换。
+- 选择结果持久化 backend 与 transport；legacy launch 根据显式 transport 决定是否使用 `--no-wifi`，
+  USB 仍保持 USB-only，Wi-Fi 不再被错误屏蔽。
+- MobileDevice 双路异步 discovery 为每个回调固化其 plan，避免 LuaJIT generic-for 变量在任务完成时已经
+  前进或变成 nil，导致所有探测都结束却没有提交 picker。
+- picker 中选择 `saved, offline` 的 USB 设备不再立即报错；它会对该精确 UDID 执行 branch
+  `ResetIOSUSB.sh --force` 并始终重新探测。目标不在 IOKit、helper 无法恢复时只保留 warning 证据并
+  在单次重新探测后结束当前操作，不重复打开相同 picker，也绝不改选其他设备。
+
+**Pitfalls / Gotchas**
+
+- 物理线缆已连接不等于 macOS 已枚举设备；当前主机的 IOUSB 与 `idevice_id -l` 都为空，因此保存的 USB
+  设备必须在 picker 中标成 offline，而不能被唯一 Wi-Fi 候选静默覆盖。
+
+**Validation**
+
+- 定向：`platform` 23/23、`ue_target_drivers` 46/46、`ue_target_integration` 22/22、
+  `ue_ios_cpp_iteration` 4/4。
+- 全量 `nvim --headless -l tests/run.lua`：1030/1030；bare-global lint、iOS 新增 Lua 模块的
+  Stylua check、legacy launch helper 的 Zsh syntax check 与 `git diff --check` 均通过。
+- 当前真实状态 smoke test 的 picker 精确展示 `iPhone (34) / network / available` 与
+  `iPhone / usb / saved, offline`，取消选择不会启动 `ios-deploy`。
+- offline-refresh 真实 smoke 自动选择保存的 USB 项并实际调用 3.6 helper；当前 IOKit 不含该 UDID、helper
+  返回 1 后只完成一次重新探测并以 warning 结束，picker 总计只出现一次且没有 terminal refresh error。
+
+**Follow-ups**
+
+- 当前保存的 USB 设备仍未进入 macOS IOUSB/usbmuxd；picker 会如实展示该状态，不代替用户选择。
+
+### 2026-08-21 — Launch installed pre-iOS17 apps after Nvim restart
+
+**Task**
+
+自查并修复 IOS `<leader>ul` 在 legacy MobileDevice 设备上报错的问题。
+
+**Implemented**
+
+- IOS launch planner 现在按持久化 backend 分派：CoreDevice 保持 `devicectl`；legacy 使用 prepared signed
+  app 调用 `ios-deploy --noinstall --justlaunch`，随后轮询精确 bundle PID 并发布结构化结果。
+- legacy launch 从 `Saved/IOSQADebug/signing.json` 恢复 app/bundle，不再依赖当前 Nvim 进程内的 package
+  artifact；启动已安装 App 也不再执行无关的 codesign 私钥预检。
+- macOS host driver 独占 `ios-deploy` executable 解析；IOS launch 纯规划/解析拆入 `ios_launch.lua`，
+  保持其他 target driver 与 CoreDevice 行为不变。
+- helper 会验证 prepared app 的 Info.plist bundle、固定 USB UDID、保留 ios-deploy 原始失败，并仅在真实
+  PID 可查询时报告成功。
+- `UELaunch` 现在从同步校验开始就创建单一进度项，并连续展示签名证据加载、launch preflight、bundle
+  解析、等待设备和 PID 校验；失败和成功都在同一进度项收口，不再出现 20 秒“按下没反应”。
+- 每个平台的 launch 现在是 single-flight；已有启动未结束时重复触发只显示“already in progress”，不会
+  并行堆叠多个 `ios-deploy`。
+
+**Pitfalls / Gotchas**
+
+- 原实现同时存在两道必现门禁：重启 Nvim 后先报 package artifact 不在内存，绕过后 legacy backend 又被
+  CoreDevice-only planner 拒绝；二者都不是重新 build/package 能正确解决的问题。
+- target task 本身一直在后台运行，但 launch 路径此前没有像 install 那样持有进度 controller，导致
+  `ios-deploy --timeout 20` 期间 UI 完全静默。
+
+**Validation**
+
+- 定向：`ue_target_tasks` 7/7、`ue_target_drivers` 45/45、`ue_target_integration` 22/22、
+  `ue_ios_cpp_iteration` 4/4、`platform` 23/23、`structure` 39/39、`stability` 9/9；
+  新 launch 模块 Stylua check、Zsh syntax、
+  bare-global lint 与 `git diff --check` 通过。
+- 全量 `nvim --headless -l tests/run.lua`：1029/1029。
+- 当前真实持久化 tuple 已越过 artifact/CoreDevice 门禁，最终准确报告 ios-deploy 等待 20 秒后设备超时。
+
+**Follow-ups**
+
+- 目标 iPhone 当前仍未重新出现在 macOS IOUSB/usbmuxd，恢复设备枚举后才能完成真机 PID 成功验收。
+
+### 2026-08-21 — Preserve the real legacy USB failure in IOS DAP launch
+
+**Task**
+
+自查 `<leader>dl` 启动失败，并确保 legacy MobileDevice 在设备不可用时给出可操作的真实错误。
+
+**Implemented**
+
+- `ue.dap.ios` 统一使用 target-task process error formatter，不再只读 `stderr`；
+  `ideviceinfo` 把失败写到 `stdout` 时也会展示退出码和 `Device ... not found`。
+- 把 IOS process error formatting 拆到可独立回归的 `_ios_process` helper，未改变其他 target 的 DAP 路由。
+- 增加 stdout-only libimobiledevice 失败回归，防止 `<leader>dl` 再次退化为空白错误。
+
+**Pitfalls / Gotchas**
+
+- 选中的 UDID 和持久化 IOS tuple 正确；运行时故障发生在 DAP adapter 启动前：设备未被 usbmuxd
+  暴露，因此 `ideviceinfo` / `ios-deploy` 都无法建立 legacy USB transport。
+
+**Validation**
+
+- 定向：`dap` 67/67、`platform` 23/23；Stylua check、bare-global lint 与 `git diff --check` 通过。
+- 全量 `nvim --headless -l tests/run.lua`：1028/1028。
+- 新 Nvim 进程实测 `<leader>dl` 等价入口会显示完整 `exit=255: ERROR: Device ... not found!`，不再空白。
+
+**Follow-ups**
+
+- 当前真机在定向软件 USB re-enumerate 后尚未重新出现在 IORegistry；重新接线/解锁或重启 host 后才能继续
+  真机 attach-at-launch，代码侧不自动重启系统 USB 服务。
+
+### 2026-08-20 — Run the physical-device IOS DAP workflow end to end
+
+**Task**
+
+跑通 Nvim 的 IOS DAP ordinary attach、attach-at-launch、source breakpoint 与 LLDB expression，并在
+调试器不用设备时终止 Client。
+
+**Implemented**
+
+- `ue.dap.ios` 现在从 active project state 读取 legacy MobileDevice 设备与 bundle，异步解析精确
+  DeviceSupport/installed app metadata，启动无 bundle 参数的 `ios-deploy --nolldb` bridge，并由 Xcode
+  `lldb-dap` 的 `SBProcess` API 执行 RemoteLaunch/RemoteAttach。
+- attach-at-launch 保持 entry stop，让 nvim-dap 在首次 continue 前下发断点；ordinary attach 显式等待
+  异步 attach 进入 stopped。两条路径都使用本地 symbol-rich Client Mach-O 并映射设备 executable。
+- remote memory module load 改为 `partial`，避免通过 USB 下载完整符号表；本地 Client DWARF 不降级。
+  `<leader>da` / `<leader>dl` 改为按当前 target 分派，IOS 的 `UEDAPStop` 非终止式 detach 后 kill 并复查 PID。
+- `UEIOSSymbols` 改用 parallel dsymutil + output DWARF verification，避免 UUID 匹配但 `.debug_info` 已损坏。
+
+**Pitfalls / Gotchas**
+
+- `ios-deploy --nolldb --bundle <app>` 在当前 Xcode/旧设备组合会空指针崩溃；bridge 不传 bundle，设备 app
+  path 从 `ideviceinstaller` plist 精确解析。
+- `RemoteAttachToProcessWithID` 返回成功时仍可能处于 attaching，必须继续消费 state event 到 stopped。
+- UUID 相同不足以证明 dSYM 可用；classic dsymutil 曾生成 5.1GB 损坏 DWARF，因此增加输出验证。
+
+**Validation**
+
+- 真机底层：attach-at-launch 约 25s，`LaunchIOS.cpp` resolved breakpoint 命中，`1+2 = 3`、`argc = 1`；
+  ordinary attach 约 21s，`LaunchEngineLoop.cpp` resolved breakpoint 命中，`1+2 = 3`、`GFrameCounter = 4259`。
+- Nvim 真机入口：attach-at-launch 与 ordinary attach 均得到 `status=ok`、verified source breakpoint、
+  breakpoint stop、LLDB expression 与 `cleanup.ok=true`；收尾独立复查 `ios-deploy --get_pid` 为 `-1`。
+- 定向：`dap` 66/66、`ue_target_drivers` 45/45、`keymaps` 56/56、`commands` 105/105、
+  `cheatsheet` 142/142、`ue_ios_cpp_iteration` 3/3、`structure` 39/39；bare-global lint 与
+  `git diff --check` 通过。全量 `nvim --headless -l tests/run.lua`：1027/1027。
+
+**Follow-ups**
+
+- CoreDevice/iOS 17+ DAP 仍需独立 transport，不从 legacy handler 或 Mac attach 猜测回退。
+
+### 2026-08-20 — Preserve target install progress in notification history
+
+**Task**
+
+修复 `<leader>ui` 的 IOS target install 只显示短暂 Fidget/notify、但 `:NotificationHistory` 查不到记录的问题。
+
+**Implemented**
+
+- `lua/ue/target_tasks.lua` 的 progress controller 现在记录用户触发流程的开始与终态，并保留调用方 scope；
+  中间百分比更新不入历史，避免把高频 progress 变成 history spam。
+- `lua/ue.lua` 为 target install 指定 `ue.install` scope，并让成功终态携带 bundle id、device id 以及 legacy
+  MobileDevice backend（如适用），使 `<leader>ui` 的最终结果可在历史中完整复查。
+- `tests/cases/ue_target_tasks_spec.lua` 增加 Fidget 存在时的回归，证明 history 仍收到且只收到开始/终态两条。
+
+**Pitfalls / Gotchas**
+
+- Fidget progress 不经过 `vim.notify`；而本仓为避免插件冲突也不会 monkey-patch `vim.notify`，所以必须在
+  progress controller 边界显式写 notification history。
+
+**Validation**
+
+- 定向：`ue_target_tasks` 7/7、`ue_target_drivers` 45/45、`ue_target_integration` 22/22、`platform` 23/23、
+  `commands` 105/105、`ue_api` 55/55、`smoke` 19/19、`utils` 51/51、`structure` 39/39。
+- 全量 `nvim --headless -l tests/run.lua` 1021/1021；bare-global lint 140 files OK。
+
+**Follow-ups**
+
+- 无。
+
+### 2026-08-20 — Sync/archive iOS build-device OpenSpec contract
+
+**Task**
+
+按 `sync → archive → commit → push` 收口本轮 iOS build/setup/device/install 与 fail-closed debug gate 契约。
+
+**Implemented**
+
+- 将 active change 的 3 个 `ios-build-run-workflow` MODIFIED requirements 同步到 canonical spec：安全 AOT/
+  dSYM/package 复用、prepared signing/private-key setup，以及 CoreDevice/pre-iOS17 legacy 设备分流。
+- 发布 canonical `ios-device-debug-workflow`，明确真机 protocol/breakpoint/frame/UUID/cleanup evidence 完成前
+  IOS DAP 保持 unavailable。
+- 将 change 归档到 `openspec/changes/archive/2026-08-20-add-ios-device-debug-workflow`；未完成 DAP tasks 原样
+  保留为 deferred history，archive note 不把它们误报为已实现。
+
+**Pitfalls / Gotchas**
+
+- 本机没有 `openspec` CLI，因此按仓库既有 manual sync/archive 流程逐 requirement 比对。
+- archive 表示当前已实现范围与 fail-closed 边界收口，不代表物理 iOS DAP 已解锁。
+
+**Validation**
+
+- canonical/delta requirement comparison：3 个 modified blocks 与 1 个 added capability 一致。
+- `structure` 39/39；全量 `nvim --headless -l tests/run.lua` 1020/1020；bare-global lint 140 files OK；
+  `git diff --check` 通过。
+
+**Follow-ups**
+
+- iOS DAP 需新的 active change 消费 canonical 真机 evidence gates 后才能实现。
+
+### 2026-08-20 — 让 prepare 工件跨 Nvim 重启复用并修正成员 Ctrl-click
+
+**Task**
+
+修复已经执行过 `UEPrepare`、当前 tuple 工件仍有效，但重启 Nvim 后 clangd 又被进程内 gate 拦截的问题；
+同时修复 `<C-LeftMouse>` 把 `ParallelRenderCommandEncoder.GetPtr()` 的点号成员误判成文件扩展名并执行 `gf`。
+
+**Implemented**
+
+- clangd root gate 改为验证持久化的 tuple build key、index selection/artifact、controlled/semantic CDB 与源 CDB
+  签名；ready 工件跨 Nvim 重启直接复用，missing/stale/building 才 defer，且同进程内每次重新验证。
+- 新 controlled artifact 在尚无 clangd client 时发布，也会唤醒已加载的 UE C/C++ buffer；不会因 client list
+  为空提前 return。
+- smart Ctrl-click 仅在 `<cfile>` 含路径分隔符或能由 `vim.filetype.match()` 识别为真实文件名时走 `gf`；
+  `object.Method` 交还 LSP definition，普通显式文件引用保持原行为。
+- mixed Apple `.cpp` 即使 clangd 暂时 defer，也从既有 exact CDB 异步恢复 `objcpp` lexical overlay；不构建、
+  不索引、不启动 LSP。
+
+**Pitfalls / Gotchas**
+
+- “磁盘上有 compile_commands.json”本身不是充分证据；必须同时绑定当前 tuple、artifact fingerprint 与源 CDB
+  签名，避免复用另一个 target/configuration 或已变化的 build。
+- positive readiness 不能永久缓存在 Lua table，否则同一进程里 CDB 更新后会继续误放行旧 artifact。
+- `object.Method` 的最后一段形似扩展名，但 `vim.filetype.match()` 不认识它；用任意 `.<word>` 判文件会截断 LSP。
+
+**Validation**
+
+- TDD：`ue_context` 新增重启复用、同进程重验证与 stale/missing 拒绝；`index_generation` 新增无 client 的
+  artifact promotion wake；`keymaps` 新增 dotted-member 不调用 `gf`；`autocmds`/`clangd_commands` 覆盖
+  deferred 状态下 mixed syntax 恢复。
+- 真实当前 Nvim 未重跑 `UEPrepare`：持久 snapshot `readiness=ready`，`MetalCommandEncoder.cpp` 自动恢复
+  `clangd attached=1`、`ft=cpp`、`syntax=objcpp`；`GetPtr` definition 返回 `ThirdParty/mtlpp/.../ns.hpp:66`。
+- 独立新 headless Nvim 打开同一 source，未执行 prepare 即返回 `snapshot=ready` 与当前 engine root。
+- 目标回归：`ue_context` 13/13、`index_generation` 24/24、`keymaps` 55/55、`commands` 105/105、
+  `options` 14/14、`autocmds` 7/7、`clangd_commands` 5/5、`cpp_semantic_index` 1/1、
+  `ue_api` 55/55、`smoke` 19/19、`structure` 39/39。
+- 全量回归：`nvim --headless -l tests/run.lua` 1020/1020；bare-global lint 140 files OK；
+  `git diff --check` 通过。
+
+**Follow-ups**
+
+- 无。
+
+### 2026-08-20 — 补齐 Apple UBT mixed Objective-C++ 语法
+
+**Task**
+
+修复 iOS exact CDB 已以 Objective-C++ 编译 `.cpp/.h`，但 Neovim 仍只按扩展名使用 `cpp` Tree-sitter，
+导致 `@autoreleasepool`、message expression 与 interface 等 Objective-C 构造没有语法高亮的问题。
+
+**Implemented**
+
+- `lua/ue/clangd_commands.lua` 从 exact `compilationCommand` 读取 `-x objective-c[++]` language evidence。
+- 对 `.cpp/.h` mixed buffer 保留原 `cpp` filetype 和 Tree-sitter，只叠加 Nvim 内置 `objcpp` syntax；
+  command 回到普通 C/C++ 时仅撤销本模块拥有的 overlay，不覆盖用户手动 syntax 设置。
+- 普通 C/C++、Android、Win64 与不含 Objective-C language flag 的命令保持原行为；未新增 parser/dependency。
+
+**Pitfalls / Gotchas**
+
+- `tree-sitter-objc` 只继承 C grammar；把 `objcpp` 直接映射过去会让 Objective-C 可见，却破坏同文件的 C++。
+- UE Apple toolchain 会给扩展名仍为 `.cpp` 的文件传 `-x objective-c++`，所以不能只靠扩展名判定语言。
+
+**Validation**
+
+- TDD：`clangd_commands` 从 4/5 到 5/5；同时守护普通 C++ syntax 不变、filetype 仍为 `cpp`、
+  `@autoreleasepool` 命中 `objcPool`。
+- 真实当前 Nvim：`MetalRenderPass.cpp` 保持 `ft=cpp`、C++ Tree-sitter active、`syntax=objcpp`、
+  `@autoreleasepool` 命中 `objcPool`，clangd attached=1。
+- 全量回归：`nvim --headless -l tests/run.lua` 1014/1014；裸全局 lint 扫描 140 个文件通过；
+  `git diff --check` 通过。
+
+**Follow-ups**
+
+- 无。
+
+### 2026-08-20 — 让 clangd 真正消费 SuperUnity background CDB
+
+**Task**
+
+修复 IOS `:UEPrepare` 已生成 SuperUnity，但 clangd 仍显示数千条后台索引的问题。
+
+**Implemented**
+
+- current/hot/full phase artifact 继续保留 `nvim_ue_members` / `nvim_ue_module_root` provenance；发布给
+  clangd 的合并 CDB 只保留标准 JSON compilation database 字段，避免一个未知 key 拒绝整份数据库。
+- generation、CDB digest、toolchain identity 与 artifact fingerprint 改用递归 canonical JSON key ordering，
+  相同 build evidence 跨 Nvim 进程得到相同 generation ID。
+- exact command 首次交付给一个已 attached source buffer 时，按协议顺序执行一次
+  `didClose → didChangeConfiguration → didOpen`，防止 synthetic CDB 中没有该 source 时 clangd 长期保留
+  邻近 TU 的错误推断 AST；重复 `gd` 不重复 reopen。
+- `symbolInfo` 的冷 preamble timeout 从独立 5 秒对齐到 provider 统一 30 秒 hard ceiling。
+- 重新发布并重建当前 IOS full artifact；当前 clangd 已自动重载标准 CDB。
+
+**Pitfalls / Gotchas**
+
+- SuperUnity 文件存在不等于 clangd 已使用它：现场日志先显示 active CDB `Enqueueing 9407 commands`，
+  后又因 `Unknown key: \"nvim_ue_module_root\"` 拒绝受控 background CDB。
+- provenance 对 semantic sidecar 是必要证据，但 clangd 的 JSON parser 不允许扩展字段，因此必须保留
+  “富 phase artifact / 标准发布视图”双层边界。
+- `vim.json.encode()` 不保证 Lua map key 顺序；直接 hash 编码结果会让同一 CDB 跨进程产生不同 generation。
+- command update 到达 clangd 不会主动重建已经 didOpen 的 AST；现场 exact source preamble 用时 7.9 秒，
+  因而既需要有序 reopen，也不能沿用 5 秒 identity timeout。
+
+**Validation**
+
+- TDD：`index_generation` 从 21/22 到 22/22（CDB schema），再从 22/23 到 23/23（canonical hash）。
+- 真实当前 IOS CDB：active 9,407 条；修复后 full background 625 条（490 SuperUnity + 135 个安全
+  exact fallback），字段仅 `arguments/directory/file`；clangd 日志确认 `Loaded compilation database`、
+  `Enqueueing 625 commands`。
+- 两个独立 headless Nvim 对当前 build 计算出相同 generation
+  `466b73dd12b06d2f6053c8d50bdd06ff97be6f833b02ad6b0a4c15cb1df71c44`。
+- 目标回归：`cpp_semantic_index` 1/1、`clangd_commands` 4/4、`ue_api` 55/55、`structure` 39/39；
+- cold exact-command TDD：`clangd_commands` 从 3/4 到 4/4；`ue_goto_behavior` 从 7/8 到 8/8；
+  `cpp_semantic_client` 16/16。
+- 真实当前 Nvim：重启 clangd 后第一次 `gd` 有序 reopen，7.9 秒完成 exact IOS preamble 并跳到
+  `blit_command_encoder.hpp:64`；最后恢复 `MetalRenderPass.cpp:1893:24`。
+- 全量回归：`nvim --headless -l tests/run.lua` 1013/1013；裸全局 lint 扫描 140 个文件通过；
+  `git diff --check` 通过。
+
+**Follow-ups**
+
+- 无。
+
+### 2026-08-20 — 修复 prepare 完成后 clangd 未附着与 source gd 假死
+
+**Task**
+
+修复 build/`:UEPrepare` 已完成、CDB 也有效，但当前 UE C++ buffer 没有 clangd client，导致 `gd` 仍无法
+跳转；同时消除 source `gd` 每次让 sidecar 重读约 290MB CDB、等待十余秒后因 libclang parse-failed 终止。
+
+**Implemented**
+
+- prepare 标记 clangd session ready 后，以 250ms 有界重试原生 `FileType` wake，直到 clangd 已附着；
+  prepare 早于 UI attach 时挂一次性 `UIEnter` 恢复，不依赖不存在的 `:LspStart`。
+- exact compile-command transport 的成功回调同时返回已发送给 clangd 的 compiler evidence；provider 将其
+  与 exact-cursor canonical USR、client identity 绑定。
+- source TU 的 `gd` 直接使用该 controlled exact command 调 clangd `symbolInfo` + `definition`，不再进入
+  sidecar 全量 CDB/LibClang parse；跳进 header 时继续把 exact command 保存为 proven origin context。
+  header-in-context、无文本 fallback、其他平台与非 C++ 导航逻辑不变。
+
+**Pitfalls / Gotchas**
+
+- `UEPrepare` 的 pipeline/task 全部 done 不等于 LSP 已附着；现场 buffer 的 client list 为空，而手动重放
+  `FileType` 立即成功，说明一次性 wake 会丢失，必须以实际 client attachment 作为完成条件。
+- clangd 对现场两个 `GenerateMipmaps` 调用都能立即给出唯一正确目标；失败来自上层 source 路径仍先调用
+  sidecar，后者每次解析全量 CDB 约 15 秒并以 `parse-failed` 终止，不能把它误判为 build/CDB 无效。
+
+**Validation**
+
+- TDD：`ue_context` 从 9/10 到 10/10；`clangd_commands` 从 3/4 到 4/4；`ue_goto_behavior`
+  从 6/7 到 7/7；`cpp_semantic_client` 16/16。
+- 真实当前 Nvim：clangd client 已附着；`MetalRenderPass.cpp:1896` 的实际 `gd` 跳到
+  `blit_command_encoder.hpp:64`，暖路径 `:1897` 在 1 秒内跳到 `MetalBlitCommandEncoder.h:45`；最后恢复
+  用户原 buffer/cursor。
+- 全量回归 `nvim --headless -l tests/run.lua`：1010/1010；bare-global lint：140 files OK；
+  `git diff --check`：通过。
+
+**Follow-ups**
+
+- 无。
+
+### 2026-08-20 — 接纳既有 IOS UBT 构建证据并隔离 prepare 的 AOT 副作用
+
+**Task**
+
+修复已经成功执行 `Client / IOS / Development` build 后，`:UEPrepare` 仍因 Nvim marker 缺失而要求重复
+`<leader>ub`；同时确保 semantic CDB 的 action-graph 生成不会触发工程 Build.cs 内的 AOT 编译。
+
+**Implemented**
+
+- IOS driver 可从 `Binaries/IOS/<Target>.target` 恢复旧构建证据，但仅接受 target/platform/configuration
+  精确匹配且 receipt 声明的 launch binary 仍存在的结果；恢复后写入当前 project bucket，之后仍走原有
+  tuple evidence 校验；解析器独立在 IOS 专属子模块，主 driver 保持 800 行门禁以内。
+- IOS semantic-CDB plan 仅为自身子进程设置工程已支持的 `bSkipAOTProcess=true`，并由通用 terminal runner
+  透传 plan env；正常 `<leader>ub` 的 AOT 指纹/cache 策略以及其他平台路径不变。
+- 成功发布 IOS semantic source 后记录精确 tuple、build completion 和文件 size/纳秒 mtime；同一 build
+  重复 `:UEPrepare` 直接复用，不再启动 `Build.sh`/UBT，证据或文件变化才重新生成。
+- prepare 完成后以原生 `FileType` autocmd 唤醒已加载 UE C/C++ buffer 的 clangd，移除对未注册
+  `:LspStart` 插件命令的依赖。
+- 已把当前 `Client / IOS / Development` 的 2026-08-19 UBT receipt 迁移进真实 project bucket，无需重编。
+
+**Pitfalls / Gotchas**
+
+- `-NoExecCodeGenActions` 只能阻止 UBT 执行 action，无法阻止项目 ModuleRules 构造器自行启动外部 AOT；
+  必须使用该工程已有的 `bSkipAOTProcess` 开关，而且只能限制在 semantic 子进程。
+- 仅凭 `.app` 目录或文件时间不能证明 tuple 构建成功，因此恢复证据以 UBT receipt + launch product 为双门。
+- semantic source 复用同时绑定 build completion 与源文件签名，不能只因路径存在就跨 build 复用。
+
+**Validation**
+
+- TDD：`ue_target_drivers` 从 44/45 到 45/45；`ue_target_integration` 先从 20/21 到 21/21，
+  semantic reuse 用例再从 21/22 到 22/22；clangd 原生唤醒约束 `ue_context` 9/9；
+  `ue_target_tasks` 6/6。
+- 真实 receipt 恢复后复核 state 为 `Client / IOS / Development`，build completion 为
+  `2026-08-19T12:52:44Z`；真实 `UEPrepare` semantic UBT 输出确认
+  `Enable AOT: True, Skip AOT Process: True`，且未启动 `mono-aot-cross`。
+- 全新 headless Nvim 对同一 tuple 执行真实 `UEPrepare`，报告复用 14073 条 semantic CDB，pipeline no-op；
+  prepare 前后进程树均无 `Build.sh`、UBT、`GenerateClangDatabase`、AOT 或 clang++。
+- `platform` 23/23、`commands` 104/104、`ue_api` 55/55、`structure` 39/39、`smoke` 19/19、
+  `stability` 9/9、`ue_cdb` 31/31、`cheatsheet` 142/142；Lua bare-global lint 扫描 140 个文件通过，
+  `git diff --check` 通过；全量 `nvim --headless -l tests/run.lua` → 1009/1009。
+
+**Follow-ups**
+
+- 无。
+
+### 2026-08-20 — 补齐 iOS 设备/安装进度并延后 UE clangd 启动
+
+**Task**
+
+消除 `:UESetIOSDevice` 和 `<leader>ui` 异步执行期间的无反馈空档，并阻止 UE 工程 clangd 在本次
+`:UEPrepare` 发布有效 CDB/index 前自行启动并扫描数千文件。
+
+**Implemented**
+
+- target task runner 新增可复用的 fidget progress controller，以及不丢失最终 stdout/stderr 的流式输出
+  callback；没有 fidget 时使用同 ID replace notification，避免阶段通知堆叠。
+- `:UESetIOSDevice` 从触发当帧开始显示单一进度，依次报告 CoreDevice、pre-iOS17 MobileDevice、
+  `ResetIOSUSB.sh` 软件恢复、重新探测和 picker/完成阶段；仅 IOS 路径进入恢复，其他 target 不变。
+- `<leader>ui` 显示 signing/private-key preflight、artifact 解析和安装启动阶段；legacy helper 输出被
+  增量解析为签名、上传、`ideviceinstaller Upgrade` 百分比和完成状态，stdout/stderr 各自保留分片缓冲。
+- lspconfig 的 clangd root callback 增加 project/target/platform/configuration artifact gate：当前 tuple 的
+  持久 selection/manifest/CDB readiness 有效时直接启动；无有效工件时等待 prepare 完成后唤醒已加载的
+  UE C/C++ buffer。Tree-sitter 始终可用，非 UE C++ root 不受 gate 影响。
+
+**Pitfalls / Gotchas**
+
+- prepare gate 不能只检查 CDB 存在，也不能只看进程内布尔值；它必须验证当前 tuple 的持久 artifact
+  fingerprint 与源 CDB 签名，避免另一个 tuple 的完成状态提前启动 clangd，也避免重启后无故重复 prepare。
+- legacy helper 的 stdout 和 stderr 不能共用同一个残行缓冲，否则两个 fd 的交错 chunk 会拼出假阶段；
+  两条流分别解析，但汇报到同一 workflow progress controller。
+
+**Validation**
+
+- TDD 基线：`ue_target_tasks` 4/6、`ue_target_drivers` 43/44、`ue_context` 6/9、
+  `ue_target_integration` 19/20；实现后分别 6/6、44/44、9/9、20/20。
+- 关联回归：`ue_cdb` 31/31、`ue_api` 55/55、`cheatsheet` 142/142、`structure` 39/39、
+  `smoke` 19/19。
+- Lua bare-global lint 扫描 139 个文件通过；`git diff --check` 通过；全量
+  `nvim --headless -l tests/run.lua` → 1006/1006。
+
+**Follow-ups**
+
+- 无。
+
+### 2026-08-20 — 区分 iPhone 物理连接与 MobileDevice 可安装状态
+
+**Task**
+
+修复 legacy iOS 安装在 USB 设备已被 IOKit 枚举、但 `usbmuxd/MobileDevice` 数据通道不可用时，
+仍只报告 `matched 0 usable legacy USB devices`，导致用户误以为 Nvim 没有识别已连接设备。
+
+**Implemented**
+
+- 3.6 外部 `InstallIOSClient.sh` 先用 IOKit 精确核对目标 UDID；设备物理存在时短暂等待
+  `usbmuxd`，只把 `ideviceinfo` 可读的设备视为 usable。若数据通道丢失，自动复用 3.6 已有的
+  `ResetIOSUSB.sh --force <UDID>`，通过 `IOUSBHostDevice resetWithError` 重新枚举精确目标；恢复后继续
+  原签名与 container-preserving update install，无需解锁、重插数据线或重启 Mac。
+- Nvim legacy install failure mapping 同时识别新诊断与旧 helper 的 `matched 0 usable legacy USB devices`
+  输出，将 `<leader>ui` 错误统一转成可操作的 MobileDevice 恢复提示；CoreDevice 和其他平台路径不变。
+
+**Pitfalls / Gotchas**
+
+- IOKit 能读取 USB descriptors 只证明物理链路已枚举，不证明 usbmux 数据端点健康；系统日志中的
+  `MuxInterfaceVersionSend ... kIOReturnNotResponding` 可由精确目标的 IOUSBHost re-enumeration 恢复。
+  reset helper 只匹配 `SupportsIPhoneOS` 设备，不重置其他 USB 外设，也不接触 App/资源。
+- 已启动且载入旧 Lua module 的 Nvim 需要重启或重新加载配置后才会使用新的错误映射；外部 helper 修改
+  会在下一次 `<leader>ui` 子进程中立即生效。
+
+**Validation**
+
+- `ue_target_drivers` 43/43，覆盖新旧两类 helper 输出，并验证解锁、USB accessories 与 Trust 提示。
+- 3.6 helper 通过 `bash -n`；真实目标 UDID 验证命中 IOKit 物理设备、等待 usbmux 后输出新的精确诊断，
+  随后由 `ResetIOSUSB.sh` 原地恢复，`ideviceinfo` 再次返回 `iPhone`。
+- 3.6 Python 全量回归 30/30；真实 `Client.app` 完成签名、临时 IPA 封装与 legacy upgrade，安装进度
+  到达 `Complete`，exit 0；未 uninstall、未启动 App、未主动删除 Documents/Library。
+- Lua bare-global lint 扫描 139 个文件通过；`git diff --check` 通过；全量
+  `nvim --headless -l tests/run.lua` → 999/999。
+
+**Follow-ups**
+
+- 无。
+
+### 2026-08-19 — 收敛为 build → UEPrepare → install 的 iOS 日常流程
+
+**Task**
+
+外部 `PrepareIOSQADebug.sh` 与 `InstallIOSClient.sh` 完成后，允许 `:UESetProject`、
+`:UESetPlatform IOS` 任意顺序执行，并把 Nvim 侧的一次性 IOS setup 与 semantic CDB 生成收进
+`:UEPrepare`；`:UEPrepare` 本身不得触发编译，其他 target 除 project/platform 解耦外保持原逻辑。
+
+**Implemented**
+
+- `:UESetPlatform` 的显式选择通过进程内 one-shot intent 与下一次 `:UESetProject` 对接；project bucket
+  仍是唯一 target authority，engine 默认仍只作建议，意图不会跨 Neovim 实例传播。
+- IOS build 成功后记录精确 project/uproject/target/platform/configuration evidence；IOS `:UEPrepare`
+  仅在 evidence 匹配且没有 build 在飞时继续，否则要求先完成 `<leader>ub`，绝不隐式编译。
+- macOS 主机上的 IOS prepare capability 分支自动完成 clangd 22.1.x 预检、prepared identity/private-key/
+  device/helper setup，再生成并验证 tuple-scoped `GenerateClangDatabase` source，最后进入公共 CDB/index
+  流水线；`:UEIOSSetup` 与 `:UECompileForNvim` 只保留为可选诊断/兼容入口。
+- IOS setup 的内部 platform normalization 只更新当前 project，不会伪装成用户的显式
+  `:UESetPlatform` 并把 IOS 意图泄漏到之后切换的工程。
+- Win64、Android、Linux、Mac target 不进入 IOS semantic/setup 分支，原 response-file prepare 路径不变；
+  同时修正 Windows-host 默认 target 用例，使其显式注入 Windows driver，不再依赖运行测试的宿主 OS。
+
+**Pitfalls / Gotchas**
+
+- build 与 prepare 继续执行 WAW 互斥；必须等待 `<leader>ub` 完整成功后再运行 `:UEPrepare`。
+- project/platform 解耦的 handoff 仅属于当前 Neovim 进程；内部 IOS setup 明确使用 current-only 更新，
+  避免把隐式操作传播给下一个工程。
+
+**Validation**
+
+- TDD/目标回归：`multi_instance_state` 13/13、`ue_target_integration` 20/20、
+  `ue_target_drivers` 42/42、`ue_target_tasks` 4/4、`ue_context` 6/6。
+- 关联回归：`commands` 104/104、`ue_api` 54/54、`ue_project_context` 7/7、`ue_cdb` 31/31、
+  `keymaps` 54/54、`cheatsheet` 142/142、`platform` 23/23、`structure` 39/39、`stability` 9/9、
+  `smoke` 19/19、`options` 14/14。
+- Lua bare-global lint 扫描 139 个文件通过；`git diff --check` 通过；全量
+  `nvim --headless -l tests/run.lua` → 998/998。
+- 本机没有 `openspec` CLI；OpenSpec 结构由 `structure` 回归覆盖。本轮未重复触发真实 UE build/设备安装；
+  同日上一条记录已覆盖同一 IOS target 的真实 build、semantic CDB、setup 与 install 证据。
+
+**Follow-ups**
+
+- 无。
+
+### 2026-08-19 — 将 iOS 外部前置条件收敛到一次性 setup
+
+**Task**
+
+在运行 `PrepareIOSQADebug.sh` 与 `InstallIOSClient.sh` 后，把 Nvim 的必要配置和真实 readiness 验证
+收敛到一个入口，避免设备、prepared identity、私钥 ACL、helper 与 artifact 问题在日常写代码后才逐个暴露。
+
+**Implemented**
+
+- 新增 `:UEIOSSetup`：自动设置 IOS target、导入当前 workspace 的 prepared identity、自动选择唯一可用
+  CoreDevice/pre-iOS17 USB 设备，并在 legacy backend 下验证 branch 对应 `InstallIOSClient.sh`。
+- 签名选择不再把 `security find-identity` 当作私钥可用证明；保存选择前会复制一个 Nvim 自有临时 Mach-O，
+  用精确 SHA-1 执行非交互 `/usr/bin/codesign`，验证后无条件清理。
+- 已配置 identity 的 build/package/install 复用同一快速私钥探针，在克隆或重签大型 app、触碰设备前暴露
+  keychain/ACL 问题；不读取、不传递、不保存 keychain 密码。
+- 一次性 Nvim 入口收敛为 `:UESetProject` → `:UEIOSSetup` → `:UECompileForNvim`；之后日常 legacy 循环为
+  `:UEBuildIOS` → `<leader>ui`。当前 tuple app 继续自动发现，无需先伪造 package provenance。
+- Setup 现在严格要求当前 workspace 的 prepared signing manifest；异步探测期间切换 project 会中止，且
+  device/package/install/launch 任一 project-state 写入失败都会报错，不再显示虚假的 selected/ready/success。
+- macOS clangd 发现顺序新增用户级 `~/.local/opt/llvm@22` 与 Apple Silicon/Intel Homebrew `llvm@22`
+  versioned keg，仍由 `:UECompileForNvim` 对最终二进制执行 22.1.x fail-closed 版本门禁。
+
+**Pitfalls / Gotchas**
+
+- 证书出现在 `security find-identity` 只证明证书/私钥配对存在，不证明 SSH/Zellij 中的非交互
+  `/usr/bin/codesign` 已获授权；必须以真实签名探针为准。
+- macOS keychain 锁定策略属于系统安全边界；setup 不会保存密码或静默降低 keychain 安全设置。
+- Xcode 自带 Apple clangd 17 不满足仓库 LLVM 22.1.x 合同；clangd 门禁通过后，最终 index 阶段还要求
+  GNU Global 的 `gtags`，两者都是一次性宿主工具链前置。
+
+**Validation**
+
+- TDD 基线：`ue_target_drivers` 39/41、`ue_target_integration` 16/18、`commands` 103/104；实现后分别
+  42/42、19/19、104/104。
+- 关联回归：`ue_target_tasks` 4/4、`platform` 23/23、`keymaps` 54/54、`structure` 39/39、
+  `cheatsheet` 142/142；zsh 语法检查通过，Lua bare-global lint 扫描 139 个文件通过。
+- 解锁 login keychain 后，精确 identity 私钥探针通过；真实 3.6 workspace 的 `:UEIOSSetup` 完整通过，
+  选择 `legacy-mobiledevice` 的唯一 iPhone，并验证 branch 对应 helper；当前 tuple 自动发现既有
+  `Binaries/IOS/Payload/Client.app`。
+- 安装并解析 Homebrew arm64 clangd 22.1.8 后，真实 `:UECompileForNvim` 的 IOS Development build 与
+  semantic CDB 均 exit 0，发布 14073 条 tuple evidence；安装 GNU Global 6.7 后单独重跑 `:UEPrepare`
+  成功，active CDB 保留 9407 条，GTAGS/GRTAGS/GPATH 与 csearch index 均已落盘。
+- 再次执行 `:UEIOSSetup` 全绿；真实 `:UEInstallIOS` 自动发现 `Client.app`，复用 prepared
+  identity/provision 与 branch helper，通过 legacy MobileDevice 成功安装
+  脱敏后的 iOS bundle id 到所选 iPhone。
+- `git diff --check` 通过；全量 `nvim --headless -l tests/run.lua` → 987/987。
+
+**Follow-ups**
+
+- 当前 login keychain 保留系统 `lock-on-sleep` 策略；睡眠后若被锁定，需要再次由用户在本机解锁。
+  配置不保存密码，也不静默降低这项系统安全策略。
+
+### 2026-08-19 — 在 SSH/Zellij 中强制使用 OSC 52 copy
+
+**Task**
+
+避免持久 Zellij session 丢失 `SSH_TTY` 后 Neovim 自动检测失败，让远程 yank 稳定穿透到 Windows
+终端剪贴板，同时禁止 OSC 52 反向读取造成等待。
+
+**Implemented**
+
+- 新增 `config.clipboard`：在 `SSH_TTY`、`SSH_CONNECTION` 或 `ZELLIJ` 环境中提前设置
+  `clipboard=unnamedplus` 和显式 OSC 52 `+/*` copy provider。
+- `+/*` paste callback 只同步返回 unnamed register；Windows → 远程 Nvim 继续使用 Rio 终端粘贴与
+  bracketed paste，不发 OSC 52 clipboard read。
+- 原生 Windows 与 Neovide 不启用该覆盖，保留各自的系统剪贴板 provider。
+
+**Pitfalls / Gotchas**
+
+- `config.options` 由 LazyVim 在 clipboard provider 初始化前自动加载；本配置从 options 内调用 helper，
+  没有在 `init.lua` 重复 require 自动加载模块。
+- `"+p` 在 OSC 52 模式下不是读取 Windows 当前剪贴板，而是回退到 Nvim unnamed register；外部内容
+  必须由终端 paste 注入。
+
+**Validation**
+
+- TDD 基线：`options` 因缺少 `config.clipboard` 为 0/1；实现后 `options` 14/14。
+- 关联回归：`autocmds` 6/6、`structure` 39/39；Lua bare-global lint 扫描 139 个文件通过，
+  `git diff --check` 通过。
+- 模拟 Zellij 完整启动并触发 `User VeryLazy` 后得到 `clipboard=unnamedplus`、provider=`OSC 52`。
+- 全量 `nvim --headless -l tests/run.lua` → 980/980。
+
+**Follow-ups**
+
+- 无。
+
+### 2026-08-19 — 让 Nvim 识别 pre-iOS17 USB 设备
+
+**Task**
+
+修复 macOS 已通过 USB/MobileDevice 识别 iOS 15 真机，但 `:UESetIOSDevice` 因只检查
+CoreDevice tunnel 而报告 `no available device`。
+
+**Implemented**
+
+- 新增结构化 `xcrun xcdevice list --timeout 5` fallback，只接纳可用、物理、USB 连接且
+  低于 iOS 17 的 iPhoneOS 设备，并标记为 `legacy-mobiledevice` backend。
+- 设备选择仍以 `devicectl` CoreDevice 为主；主命令失败、结果文件不可用、解析失败或设备列表为空时，
+  才异步执行 fallback，并把设备 ID、名称和 backend 一并持久化到 runtime。
+- CoreDevice 设备显式标记 backend；legacy `UEInstallIOS` 在没有 package provenance 时只重新发现
+  当前 tuple app，并把精确 UDID、prepared identity/profile/bundle 交给 branch 对应的
+  `InstallIOSClient.sh`。helper 克隆/重签临时副本后通过 MobileDevice 原地更新，不改源 app、不卸载、
+  不启动；legacy `UELaunch` 继续 fail closed。
+- 将 legacy `codesign` 的 `errSecInternalComponent` 转成可操作的 login keychain / `/usr/bin/codesign`
+  解锁提示，避免只暴露 Security framework 的不透明错误码。
+- 新增 driver 与 integration 回归，并同步 iOS workflow change spec、任务清单和架构说明。
+
+**Pitfalls / Gotchas**
+
+- 当前 iOS 15.4.1 真机可通过 MobileDevice/`xcdevice` 使用，但没有 iOS 17+ CoreDevice tunnel；
+  `devicectl` 中的 unavailable 历史记录不能等同于 USB 未连接。
+- legacy 安装允许消费当前 tuple 的现有 app，但它不被持久化或伪装成 package provenance；缺少
+  Prepare metadata、匹配证书/profile 或 helper 时仍 fail closed。
+- `security find-identity` 只证明证书/私钥配对存在，不证明当前非交互进程可以使用私钥；login keychain
+  锁定或 ACL 未授权时，真实签名仍会在触碰设备前失败。
+- 已加载旧 Lua module 的 Nvim 进程需要重启或重新加载配置后才能使用新发现路径。
+
+**Validation**
+
+- 设备发现 TDD 基线：`ue_target_drivers` 37/39、`ue_target_integration` 14/16；实现后继续扩展到
+  41/41、17/17。legacy install 新增用例的实现前基线分别为 38/40、16/17。
+- 关联回归：`ue_target_tasks` 4/4、`platform` 22/22、`commands` 103/103、`structure` 39/39、
+  `stability` 9/9。
+- 真实 `xcdevice` JSON 解析得到 1 台 `iPhone`（iOS 15.4.1，`legacy-mobiledevice`）；
+  `idevicepair validate` 成功，`ideviceinstaller -l` 可读取应用列表。
+- 当前 3.6 workspace + iPhone 12 的真实 helper dry-run 通过：精确命中当前 tuple app、UDID、profile、
+  Bundle ID，并规划 container-preserving `ideviceinstaller -i`，无 uninstall/launch。
+- 真实安装验证在签第一个 framework 时因 login keychain 拒绝非交互私钥访问而停止
+  (`errSecInternalComponent`)；尚未封装 IPA，也未改动设备。来自正在运行 Nvim 的同一探针得到相同结果。
+- `lua` bare-global lint 扫描 138 个文件通过；`git diff --check` 通过；
+  全量 `nvim --headless -l tests/run.lua` → 977/977。
+- 本机没有 `openspec` CLI，未执行其严格校验；OpenSpec 文件结构已由仓库 `structure` 回归覆盖。
+
+**Follow-ups**
+
+- pre-iOS17 的普通启动仍需要独立 lifecycle evidence；当前 `:UELaunch` 继续 fail closed。
+
+### 2026-08-18 — 让 `<leader>ui` 按 active target 安装
+
+**Task**
+
+统一安装快捷键的平台语义：Android 保持替换 APK，IOS 使用当前 tuple 已签名 staged app
+原地更新，不在安装前卸载应用。
+
+**Implemented**
+
+- 新增 `:UEInstall` 平台分派入口，并让静态与 runtime `<leader>ui` 映射都只调用该入口；
+  Android 复用既有 `adb install -r`，IOS 复用 target-driver `devicectl device install app`。
+- 保留 `:UEInstallAndroid` / `:UEInstallIOS` 作为显式兼容命令；Mac 等桌面 target 明确报告不支持，
+  不猜测设备工作流。
+- IOS 安装继续消费 package provenance 对应的已签名 `.app`，不重签名、不启动，并新增禁止
+  uninstall/delete/remove 的 planner 回归。
+- 同步命令冻结表、快捷键、AI context、速查文档和 Android/IOS 主规格。
+
+**Pitfalls / Gotchas**
+
+- “增量安装”在这里指保留应用身份与数据的原地更新，不承诺传输层只发送二进制差量；CoreDevice
+  是否优化传输由 Xcode/devicectl 决定。
+- IOS 安装仍要求当前 tuple 已成功 package、已选择物理设备且 package/install 签名预检通过。
+
+**Validation**
+
+- 安装核心：`keymaps` 54/54、`commands` 103/103、`ue_target_integration` 14/14、
+  `ue_target_drivers` 37/37、`ue_target_tasks` 4/4、`ue_context` 3/3。
+- 关联边界：`platform` 22/22、`ue_project_context` 7/7、`ue_api` 54/54、`smoke` 19/19、
+  `cheatsheet` 140/140、`structure` 39/39。
+- `git diff --check` 与脱敏扫描通过；全量 `nvim --headless -l tests/run.lua` → 970/970。
+
+**Follow-ups**
+
+- 未执行真实 iOS 设备安装；配置回归只验证路由、计划 argv、结果解析契约与无卸载边界。
+
+### 2026-08-18 — 恢复 `<leader>ub` 的 IOS 专属 UBT 参数
+
+**Task**
+
+确保当前 target 为 IOS 时，通用构建快捷键 `<leader>ub` / `:UEBuild` 最终调用 macOS
+`Build.sh` 的参数与其他 target 明确分层，并恢复 target-driver 拆分时遗漏的日常构建参数。
+
+**Implemented**
+
+- IOS `build_plan` 在 project 参数后稳定追加 `-WaitMutex`、`-FromMsBuild` 与
+  `-disablev8pointercompression`；现有 AOT wrapper、日常 dSYM override 和可选签名 override 保持不变。
+- Mac 不继承上述三个参数；`-disablev8pointercompression` 明确保持 IOS-only，不泄漏到
+  Android、Win64 或 Linux driver。
+- 新增纯 planner 与 `<leader>ub → UEBuild → IOS driver → macOS wrapper → Build.sh` 集成断言，
+  并把参数顺序与平台边界同步到 iOS build 主规格。
+
+**Pitfalls / Gotchas**
+
+- target-driver 拆分前的通用 build 路径包含 `-WaitMutex/-FromMsBuild`，拆分后 IOS planner 没有保留；
+  仅凭参数名称把 `-FromMsBuild` 判断为 Windows-only 会掩盖这个行为回归。
+- `-disablev8pointercompression` 此前从未进入仓库，必须由 IOS driver 显式拥有，不能放到 host entry
+  或共享 helper，否则其他平台会被静默污染。
+
+**Validation**
+
+- TDD：新增 planner 用例先以缺少 `-WaitMutex` 失败（36/37），实现后 `ue_target_drivers` 37/37。
+- `ue_target_integration` 12/12、`ue_target_tasks` 4/4、`platform` 22/22、`commands` 102/102、
+  `keymaps` 53/53。
+- `structure` 39/39；全量 `nvim --headless -l tests/run.lua` → 965/965。
+
+**Follow-ups**
+
+- 未启动真实外部工程构建；该验证会产生工程工件，不属于配置回归。现有长驻 Neovim 会话需重新加载
+  配置后才会采用新的 IOS driver argv。
+
+### 2026-08-18 — 补齐 macOS csearch 与 Apple super-unity 运行链
+
+**Task**
+
+审计并修复此前只按 Windows 环境验证的 csearch/cindex 与 super-unity：让 macOS 能完整安装、
+发现和增量更新 trigram 索引，并在 Apple 构建不保留 `.o.rsp` 时仍安全压缩受控 background CDB。
+
+**Implemented**
+
+- 新增 POSIX `scripts/install_csearch.sh`，把仓内 `cindex-uefilter` 与固定版本
+  `csearch v1.2.0` 一并安装；运行时统一发现 PATH、`GOBIN`、多段 `GOPATH/bin` 与 `~/go/bin`，
+  health/live health 和 UEPrepare 缺工具提示复用同一安装入口。
+- `cindex-uefilter -files-from` 的非 reset 路径把每个输入文件登记为 exact merge path，
+  修复 staged index 有 names 却无 Paths 导致的 `merge: inconsistent index` panic；新增和修改文件
+  现在都会替换旧 trigram，删除仍保守升级为 reset。reset 不复制全量 path table，避免大型 UE 索引膨胀。
+- csearch index 路径探测改为只读；只有实际 build 创建父目录，避免工具安装后
+  `is_indexed()` 在不可写缺失路径上抛错。
+- Apple 无 `.o.rsp` 时，super-unity 仅在 active UBT wrapper 的 include 全部唯一映射、member cwd
+  相同且 compiler-authored argv 在剥离逐文件写出参数后完全一致时复用 exact argv；保留
+  target/arch/sysroot/defines/includes/PCH，证据不足继续 exact per-file fallback。
+- 补 Go 原生 merge 集成、Lua→cindex→csearch 往返、POSIX 安装器、AppleClang no-rsp grouping、
+  语义漂移 fallback、非 Apple `-arch` 拒绝及 write-only flag 清理回归，并同步 README/skill 契约。
+- 将新增合同同步到 `ue-code-search`、`macos-ios-cdb-semantic-prepare` 与
+  `cpp-contextual-definition-navigation` 主规格，并归档完成的
+  `restore-macos-unreal-semantics-and-search` change；未混入仍受真机证据门禁约束的 iOS DAP change。
+
+**Pitfalls / Gotchas**
+
+- upstream `index.Merge` 依赖 staged `Paths` 划定替换区间；只有 `AddFile` 会在任何平台 panic，
+  而只靠 mock 的 Lua 回归看不见这个错误。
+- `-o` 不能按字符串前缀粗暴剥离，否则会误删 `-openmp` 等语义参数；仅精确剥离成对 `-o`，
+  dependency 输出则保留无歧义的 `-MF/-MT/-MQ/-MJ` attached-form 处理。
+- 探针中的 `provider|missing/partial` 是本轮开始前语义索引尚未收敛的历史记录；本轮没有新增
+  provider 失败，后续 warm/cold 记录已 resolved，因此不把它误归因到 csearch/super-unity。
+
+**Validation**
+
+- 原生工具：`go test -count=1 ./...` 通过；`python3 -m py_compile`（受控 CDB 工具链）通过；
+  `sh -n scripts/install_csearch.sh` 与 `git diff --check` 通过。
+- 定向回归：`csearch_build_guard` 22/22、`index_generation` 21/21、`utils` 51/51、
+  `core_health` 28/28、`ue_watch_csearch` 13/13、`grep_cache` 29/29、`ue_api` 54/54、
+  `structure` 39/39；合计 257/257。
+- 全量门禁：`nvim --headless -l tests/run.lua` → 964/964。
+- OpenSpec CLI 在本机不可用；已逐块比对 archived delta 与主规格同步内容，并由 `structure` 与全量
+  回归覆盖仓库结构，归档内容通过 staged privacy/secret scan。
+- macOS 实机：安装后 deterministic search health 为 PASS；真实工程 csearch reset 索引
+  227,614 文件、325,869,011 bytes、29.3s，运行时判定 `backend=csearch` 且已验证真实查询命中。
+- 真实 IOS hot CDB：2648 输入源中 2616 个进入 142 个 proven groups，32 个 exact fallback，
+  输出 174 TUs（15.2x）；2648 member 全覆盖且无重复，wrapper 中对象/依赖写出 flag 为 0。
+
+**Follow-ups**
+
+- 当前磁盘上的旧 IOS controlled CDB 仍是语义正确的 exact fallback；下次正常 hot/full index refresh
+  会按新契约重发压缩产物。独立真实数据生成已验证新产物，不为追求即时压缩破坏现有可用索引。
+- 完整 headless `UEPrepare` 被本机缺少 GTAGS 阻断；未新增依赖，改用 csearch 自身受控 API 完成
+  索引与 snapshot 发布。GTAGS 能力与本任务无关。
+
+### 2026-08-18 — 修复原生 LSP 下 UE 语义解析与受控 CDB 启动链
+
+**Task**
+
+修复大型 Unreal Engine 源码树中语义解析整体失效：clangd 未使用 project-scoped 编译数据库，
+当前文件退回 fallback command，并在错误的全量数据库上产生不可接受的索引开销。
+
+**Implemented**
+
+- clangd 配置改用 Neovim 原生 LSP `cmd` factory，在 `root_dir` 解析后生成 project-scoped argv；
+  移除原生配置不会执行的 legacy `on_new_config`，并保留实际 argv 供精确命令 transport 判定。
+- 精确编译命令 transport 支持 project-bucket 的 platform-scoped active CDB，不再按旧缓存层级
+  猜测根目录；成功通知不再错误附带失败原因。
+- 新增共享 CDB argv normalization，将 macOS/POSIX 与 Windows `command` 字符串按宿主规则转换为
+  无歧义的 `arguments`，再进入 current/hot/full 受控索引生成，避免定义注入阶段破坏引号。
+- libclang semantic sidecar 请求上限收紧到 30 秒；超时立即终止无响应进程并完成结构化失败，
+  不再让卡死进程持续占用 CPU、使后续 `gd` 永久排队。
+- 增加 native cmd factory、project-bucket 路径、精确命令传输及 command-only CDB 的回归覆盖。
+
+**Pitfalls / Gotchas**
+
+- nvim-lspconfig 的原生 `vim.lsp.config` 路径目前不执行 `on_new_config`；仅在静态配置时调用
+  `clangd_cmd()` 会把 scoped CDB 静默降级成工程根下的 legacy CDB。
+- `cmd` 变为 factory 后，`client.config.cmd` 是函数而非 argv；精确命令 transport 必须读取启动时
+  保留的 resolved argv。
+- CDB 同时允许 `command` 与 `arguments`，但受控 super-unity/definition 注入只接受结构化 argv；
+  对 command string 直接重新拼引号会改变编译器原始语义。
+- 仅从 pending map 移除超时请求不足以恢复 sidecar：libclang 正在原生 parse 时无法读取后续 cancel，
+  必须回收整个进程；下一次请求再按现有 process manager 冷启动。
+
+**Validation**
+
+- TDD：native cmd factory、command-only CDB、project-bucket active CDB 与成功回调原因用例均先红后绿。
+- 定向：`smoke` 19/19、`index_generation` 18/18、`clangd_commands` 4/4、
+  `cpp_semantic_index` 1/1、`ue_api` 54/54、`cpp_semantic_context` 11/11、
+  `cpp_semantic_client` 16/16、`cpp_semantic_sidecar` 15/15、`ue_goto_behavior` 7/7、
+  `utils` 47/47 passed。
+- 真实 UE 会话：重启后 clangd 使用受控 platform-scoped background CDB，自动收到当前文件精确命令；
+  Tree-sitter captures 与 LSP semantic tokens 同时存在，`CoreMinimal.h` 缺失类 fallback 诊断消失，
+  仅保留 3 条真实工程诊断；受控 full phase ready，clangd 稳态 RSS 约 1.2 GB（错误路径曾约 15.8 GB）。
+- 语义导航探针：同一真实缓冲区完成 `resolved`，新 evidence 为 ready/partial generation；卡死 sidecar
+  在 30 秒边界被回收且 pending 清零，导航随后由同 generation clangd provider 完成，不遗留后台进程。
+- 全量：`nvim --headless -l tests/run.lua` 956/956 passed；`git diff --check` passed。
+
+**Follow-ups**
+
+- 当前机器未发现仓库约束指定的 LLVM 22.1.x clangd，运行时使用系统 clangd 17；功能已通过真实会话，
+  但工具链版本仍需在环境层补齐。
+
+### 2026-08-14 — 落地 iOS 签名选择与可证明的增量前置
+
+**Task**
+
+在只聚焦 macOS 本机 Neovim/iOS debug 的工作中，修正两个前置假设：签名证书必须由命令显式
+设置；增量编译必须按可证明的阶段跳过工作，而不是把整个 Build.sh 省略。同时把真机 DAP 接线
+隔离为可审计的 protocol probe，未取得设备证据前不开放生产能力。
+
+**Implemented**
+
+- 新增 `:UESetIOSSigningCertificate[!] [identity]`：支持 picker、完整证书名/SHA-1 精确选择和清除，
+  将选择保存到 project state；build 捕获当次 identity 并通过结构化 INI argv 注入，Package/Install
+  则在未选择或 keychain 精确复验失败时 fail closed。
+- 与 `PrepareIOSQADebug.sh` 的重签流程对齐：无参数命令优先读取标准项目或
+  `workspace/Source/SampleGame` 上层 workspace 的 `Saved/IOSQADebug/signing.json`，验证 v1、完整
+  identity、profile/Bundle/Team 和 `get-task-allow=true` 后再精确复验 keychain；没有 manifest 时
+  才打开 picker，损坏/stale/多份 manifest 不静默降级。
+- iOS C++ iteration 的 AOT 指纹升级为 v2 input manifest：path/device/inode/size/纳秒
+  mtime/ctime 全匹配时复用 content digest，否则仅重算变化输入；输出 frameworks 每次仍做 SHA-256
+  校验，任何证据缺失均退回完整 AOT。Build.sh/UBT 仍每次执行且从不传 `-SkipBuild`。
+- 新增独立 `tools/ios_dap_protocol_probe.py`，冻结 Xcode/Apple `lldb-dap`、host binary↔dSYM UUID、
+  CoreDevice process identity、raw DAP 断点命中、源码帧、non-terminating detach 与进程存活证据；
+  preflight 证据已脱敏写入 `tools/evidence/ios-dap/`。
+- 增加显式 `legacy-preflight --device ... --symbols ...`：对 CoreDevice 不可达的 pre-iOS17 设备验证
+  MobileDevice USB、`ios-deploy`、精确 ProductType/OS/build DeviceSupport 与 LLDB `remote-ios`，并补齐
+  40-hex/现代连字符两类 Apple UDID 的统一脱敏。实机 partial evidence 已证明 DeveloperDiskImage、
+  debugserver listener 和 target create；设备端明确阻塞于 development profile 未被用户信任，现有重签包
+  也不含 source DWARF，因此仍未开放生产 DAP。
+- 新增/更新 driver、integration、command、script 与 probe 回归，并同步 OpenSpec、cheatsheet、tooling
+  和架构文档；签名解析/preflight 独立到 `ios_signing.lua`，使 target driver 保持在 800 行门禁内。
+  当前 preflight 发现 0 台可用物理 iOS 设备，因此保持 IOS DAP matrix unavailable，未修改生产
+  `lua/ue/dap/ios.lua`。
+
+**Pitfalls / Gotchas**
+
+- keychain 中“至少有一张有效证书”不能证明当前 project 使用了正确 identity；Package/Install/debug
+  必须要求显式选择，长任务只使用开始时捕获的 identity。
+- 证书 display name 暂不接受逗号：本地 UE `ConfigFile(string)` 会按逗号拆分 INI override，静默
+  接受会改变实际传入值；SHA-1 选择最终也会解析到同一 display name，因此同样 fail closed。
+- AOT 输入 hash 的 metadata fast path 只有 path/device/inode/size/mtime/ctime 全匹配才可复用；任何
+  miss 仍完整 AOT，output artifact 始终逐个验证。
+- UBT 的 `-SkipBuild` 会跳过 compile actions，只适用于另有产物证据的准备/打包路径，不是 C++
+  incremental build 开关。
+- CoreDevice 的 available 记录不等于当前 USB 设备可调试：本机 pre-iOS17 设备只出现在 MobileDevice，
+  对应 legacy backend 必须固定精确 DeviceSupport `Symbols`；backend 失败不能在同一 session 内 fallback。
+- 本地严格验签、证书/profile/entitlements/device membership 全部一致仍可能被设备拒绝；本次设备日志
+  给出 `Needs Explicit User Trust`，该设置只能在设备上完成，不能由 probe 伪造或绕过。
+- transport/listener/target create 通过也不等于 source debug 通过；没有 DWARF/dSYM 的重签包不能满足
+  resolved breakpoint、真实命中与正确源码帧门禁。
+
+**Validation**
+
+- 实机本地 parser probe：`security find-identity -v -p codesigning` 输出可解析，发现 2 个有效 identity；
+  测试及持久化证据不记录证书名。
+- Protocol probe：`self-test` 通过；`preflight` 正确以 exit 2 fail closed，并输出脱敏 blocker
+  `no-available-physical-ios-device`；显式 `legacy-preflight` exit 0，确认 pre-iOS17 USB、精确 Symbols 与
+  LLDB `remote-ios` ready，partial transport 则诚实记录 `explicit-user-trust-required` 与
+  `source-dwarf-unavailable`。
+- 实机 transport：从设备抓取并解包精确 DeviceSupport 成功，DeveloperDiskImage mount、debugserver
+  loopback listener、LLDB `remote-ios` 与 target create 均通过；设备 SpringBoard 明确报告 profile
+  `Needs Explicit User Trust`，因此 launch/attach 未伪造为通过。
+- 工程真实增量 build：完整 AOT 后进入 UBT/clang，最终 exit 6；唯一 fatal 是已生成 wrapper 引用不存在的
+  project/engine header。未修改业务源码，也未用手工拼 app 绕过；该结果不计为 repo regression 失败。
+- 定向：`ue_target_drivers` 36/36、`ue_target_integration` 12/12、`ue_ios_cpp_iteration` 3/3、
+  `ios_dap_probe` 3/3、`commands` 100/100、`ue_target_tasks` 4/4、`ue_api` 54/54、`smoke` 18/18、
+  `platform` 22/22、`cheatsheet` 139/139、`multi_instance_state` 11/11、`structure` 39/39 passed。
+- 全量：`nvim --headless -l tests/run.lua` 950/950 passed；`zsh -n scripts/ue_ios_cpp_iteration.zsh`
+  passed；`git diff --check` passed。
+- 当前环境无 `openspec` executable，未运行 CLI strict validate；change 已按 canonical requirement
+  和 scenario 结构人工核对。
+
+**Follow-ups**
+
+- 在设备上显式信任 development profile 后，先重跑 legacy launch/attach transport；再生成本地
+  binary+dSYM/source evidence 并运行严格 attach probe。只有 breakpoint、源码帧、detach 和 app-survival
+  证据全部通过，才实现/注册生产 IOS DAP。
+- 当前 checkout 还需通过其正式 wrapper 生成流程移除/重建对缺失 header 的 stale generated wrapper，
+  再重跑 `:UEBuildIOS`；本变更不直接修改工程生成物。
+
+### 2026-08-14 — 修复 Neovide 早期启动遗漏 UE 快捷键
+
+**Task**
+
+修复 Neovide 启动阶段 `<Space>ub` 偶发完全无响应；按用户复查结果，dashboard `p` 已恢复，
+不纳入本次改动。
+
+**Implemented**
+
+- `config/keymaps.lua` 在自身加载阶段立即安装带 `nowait=true` 的 `<leader>u*` runtime overrides，
+  不再根据 `vim_did_enter` 等待另一次 `VeryLazy`。
+- 新增真实子进程回归，在 `vim_did_enter=0` 时直接加载 keymaps，冻结 `<Space>ub -> :UEBuild`
+  必须立即可见的启动契约。
+
+**Pitfalls / Gotchas**
+
+- LazyVim 已按「默认 keymaps → 用户 keymaps」顺序加载该文件；用户文件内部再次等待
+  `VeryLazy` 不会增加排序保障，反而会在 Neovide 的早期启动窗口留下未安装映射。
+- 当前 Neovide 实例检查确认 `:UEBuild` 与 `<Space>ub` 均存在；本次只消除启动时序窗口，
+  不触发真实 iOS build，也不改 dashboard / picker。
+
+**Validation**
+
+- TDD：新启动时序用例先复现 `mapped=false`，实现后 `keymaps` 53/53 passed。
+- 定向：`commands` 99/99 passed；独立 pre-VimEnter 探针得到 `did=0 ub=1`。
+- 全量：`nvim --headless -l tests/run.lua` 937/937 passed；`git diff --check` passed。
+
+**Follow-ups**
+
+- 无。
+
 ### 2026-08-14 — 将 macOS/iOS 开发链路安全整合到最新主线
 
 **Task**
@@ -506,7 +1629,7 @@ synthetic header 导致结果分类重复、首项和大量列表项没有真实
 **Validation**
 
 - fixture `run_as_transport_spec.ps1`：PASS；`nvim --headless -l tests/run.lua ue_api`：54/54 passed。
-- 实机 `10.102.99.54:43581` preflight 证明选择 `run-as/startup-agent` 且不改变设备状态；实际发布后
+- 实机 `<PRIVATE_IP>:43581` preflight 证明选择 `run-as/startup-agent` 且不改变设备状态；实际发布后
   maps 证明只映射 app 私有 SO。失败后只删除本次 347 MB staging 目录，已安装 `libUE4.so`
   SHA-256 仍为 `e26864ba506d0bdeb46d3678b611917bb708fd4cb099fc8a4f606cc09e447dfe`；
   不带 agent 的 15 秒 control launch 保持前台存活。

@@ -1,5 +1,5 @@
 -- AUTO-GENERATED colored pixel header. Edit Temp/img2pixblock.py, not this.
--- Source image: C:/Users/lizeqiang/Downloads/20260520-150031.jpg
+-- Source image: C:/Users/<USER>/Downloads/20260520-150031.jpg
 local M = {}
 
 -- Highlight color definitions: name -> hex color.

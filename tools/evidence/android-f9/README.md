@@ -1,7 +1,7 @@
 # Android F9 breakpoint — smoke evidence
 
 Result JSON captured by `tools/nvim_android_dap_smoketest.lua` while proving the
-attach-before F9 path on device `2e2df4cb` / `<android-package>`.
+attach-before F9 path on device `ANDROID-SERIAL-B` / `<android-package>`.
 Moved here from `tools/` to keep the tool dir clean; the trail is referenced by
 `openspec/changes/fix-android-f9-breakpoint-hit/code-behavior-audit.md`.
 

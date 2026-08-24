@@ -1,6 +1,6 @@
 ## 1. 根目录卫生
 
-- [x] 1.1 `git status` 确认根目录 `""`（空名文件）、`UserslizeqiangAppDataLocalTempmr17757.html`、`lua/ue.lua.bak-20260528-185201` 均为 untracked
+- [x] 1.1 `git status` 确认根目录 `""`（空名文件）、`UsersUSERAppDataLocalTemp-artifact.html`、`lua/ue.lua.bak-20260528-185201` 均为 untracked
 - [x] 1.2 删除上述游离物（或移入 `.gitignore` 已忽略位置）；删后 `git status` 复核未误删跟踪文件
 
 ## 2. 知识库骨架

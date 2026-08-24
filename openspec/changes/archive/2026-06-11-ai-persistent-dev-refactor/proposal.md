@@ -14,7 +14,7 @@
   - `decisions/`：架构决策记录（ADR）的归位 —— 将 `docs/plans/` 中的 ADR 性质文档归类索引。
   - `lessons/`：平台怪癖 / 调试硬知识（Android ASLR、codelldb、Windows pipe 等），从 CONSTRAINTS §二与 MEMORY 索引。
   - `docs/architecture/`：架构总览（major subsystems / data flow / platform layers / build pipeline / ownership boundaries）。
-- **根目录卫生**：清理/隔离明显的历史游离物（根目录空名文件 `""`、`UserslizeqiangAppDataLocalTempmr17757.html`、`lua/ue.lua.bak-20260528-185201`），归入 `.gitignore` 或删除（均为 untracked，无 git 历史风险）。
+- **根目录卫生**：清理/隔离明显的历史游离物（根目录空名文件 `""`、`UsersUSERAppDataLocalTemp-artifact.html`、`lua/ue.lua.bak-20260528-185201`），归入 `.gitignore` 或删除（均为 untracked，无 git 历史风险）。
 - **交叉链接与导航**：知识库各根 README 互链，`CLAUDE.md`（根）与 `docs/CONSTRAINTS.md` 指向新知识库；保持「出处优先、索引不复制原文」的既有维护契约。
 - **可发现性验证**：新增一个 headless 回归用例，断言每个主要目录都存在本地规则文件，且知识库四根（memory/decisions/lessons/docs/architecture）的 README 存在、关键内部链接可解析——把「规则就地可发现」变成回归守护项，防止腐烂。
 

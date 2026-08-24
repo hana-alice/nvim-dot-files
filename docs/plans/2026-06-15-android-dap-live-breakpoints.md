@@ -1,7 +1,7 @@
 # Android DAP session-time live breakpoints · 架构决策记录 (ADR)
 
 > 日期: 2026-06-15
-> 设备: **仅在 `2e2df4cb` 上验证**（`<android-package>`, arm64-v8a, Android, SELinux Enforcing）
+> 设备: **仅在 `ANDROID-SERIAL-B` 上验证**（`<android-package>`, arm64-v8a, Android, SELinux Enforcing）
 > 路线: K30 platform 模式 + serial-form `connect://[<serial>]:<port>`（宪法级，见 CONSTRAINTS K30）
 > 关联 change: `openspec/changes/archive/2026-06-15-android-dap-live-breakpoints/`
 > 关联代码: `lua/ue/dap.lua`、`lua/ue/dap/android.lua`
@@ -145,5 +145,5 @@ design 原假设 `target modules load --slide` 冗余（旧注释「5/22 无 sli
 
 阶段 0 清理（死代码 / no-op / 注释 / 合成帧收敛）独立可 revert。live 接通若在其他设备回归
 不过，回到诚实-warning（即本 change 之前的 working tree 状态）是零风险回滚点——但注意：在
-**本设备** `2e2df4cb` 上 live 已实证可行，回滚意味着退回到更差的 UX，仅在新设备证伪 live 时
+**本设备** `ANDROID-SERIAL-B` 上 live 已实证可行，回滚意味着退回到更差的 UX，仅在新设备证伪 live 时
 才考虑。

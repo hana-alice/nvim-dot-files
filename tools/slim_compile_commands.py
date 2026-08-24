@@ -54,7 +54,7 @@ INTERMEDIATE_RE = re.compile(r"[/\\]Intermediate[/\\]", re.IGNORECASE)
 
 # uetemp 目录
 # UETEMP_RE removed — see categorize_entry() comment. Engine roots are
-# sometimes literally named "uetemp" (D:/project/uetemp), so blanket-skipping
+# sometimes literally named "uetemp" (D:/UE/EngineWorktree), so blanket-skipping
 # any path containing /uetemp/ was a false positive.
 
 
@@ -90,7 +90,7 @@ def categorize_entry(entry: dict) -> str:
 
     # 4. (removed) UETEMP_RE — historically skipped /uetemp/ as a temp build
     #    cache; but engine roots are now sometimes literally named "uetemp"
-    #    (D:/project/uetemp). The rule was a false positive; rely on
+    #    (D:/UE/EngineWorktree). The rule was a false positive; rely on
     #    INTERMEDIATE_RE and explicit Engine root scoping instead.
 
     # 5. NDK/SDK

@@ -60,7 +60,8 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 快速部署按能力选择 root 或已验证的 debuggable app-private transport；正常 APK 安装和未 strip
 主机符号文件仍是正式流程与调试真相。当前 matrix：macOS 只执行 Mac/IOS，Windows 只执行
 Win64/Android，Linux 只执行 Linux；Mac 与 IOS target 独立，Android PowerShell transport 继续
-保持 Windows-only，iOS DAP 未实现且不 fallback 到 Mac。
+保持 Windows-only；iOS DAP 在 macOS 上通过独立 legacy MobileDevice/debugserver handler 执行，
+不 fallback 到 Mac process attach。
 
 ## 知识库各区
 

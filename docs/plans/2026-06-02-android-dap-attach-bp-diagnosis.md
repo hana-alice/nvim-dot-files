@@ -1,7 +1,14 @@
 # Android DAP attach 失败 + F9 断点失效 · 诊断报告
 
+> **状态：Historical / superseded evidence。** 本文冻结 2026-06-02 的失败现场，
+> 其中 sandbox `gdbserver --attach`、F9 short-circuit 与固定设备 serial 不是现行实现要求。
+> 当前路线以 [`android-dap-attach`](../../openspec/specs/android-dap-attach/spec.md)、
+> [`android-dap-live-breakpoints`](../../openspec/specs/android-dap-live-breakpoints/spec.md)
+> 和 `docs/CONSTRAINTS.md` K30/K36/K37 为准：设备端使用 `lldb-server platform`，
+> session 捕获显式 serial，active-session F9 走 live 通道且不要求 reattach。
+
 > 日期: 2026-06-02
-> 设备: **仅在 `a3ad86f3` 上验证**（abi `arm64-v8a`, sdk 36 / Android 16, SELinux Enforcing）
+> 历史取证设备: **仅在 `ANDROID-SERIAL-A` 上验证**（证据范围，不是脚本默认值；abi `arm64-v8a`, sdk 36 / Android 16, SELinux Enforcing）
 > 目标进程: `<android-package>`（DEBUGGABLE，run-as 可用，idle 时 `State=S` `TracerPid=0`，Threads=17）
 > 约束: 遵守 `docs/CONSTRAINTS.md` —— host adapter 22.1.6+ forward-only、`stopOnEntry=true` 不动、
 >   attachCommands/postRunCommands 不加 `process continue`、SIGSEGV/SIGBUS `--pass true --stop false` 不动、
@@ -34,23 +41,23 @@ attach 连不上有**两个独立的设备端根因**叠加，F9 断不上是**�
 ## 2. attach 失败 —— 分层定位（真机已验证）
 
 ### 层 1: host adapter ✅ 正常
-- 设备唯一就绪（`adb -s a3ad86f3 get-state` = device）。
+- 设备唯一就绪（`adb -s ANDROID-SERIAL-A get-state` = device）。
 - host adapter 版本策略不在本次失败链路上（失败发生在设备端，见层 3/4）。
 
 ### 层 2: adb / forward ✅ 正常
-- `adb -s a3ad86f3 forward tcp:<port> tcp:<port>` 建立成功（rc=0）。
+- `adb -s ANDROID-SERIAL-A forward tcp:<port> tcp:<port>` 建立成功（rc=0）。
 - run-as 可用，uid = `u0_a429`，SELinux context = `runas_app`。
 
 ### 层 3: 设备端 lldb-server 可执行性 ⛔ **确定性 bug #1**
 
 **症状（真机复现）**：
 ```
-$ adb -s a3ad86f3 shell run-as <pkg> sh -c 'cd files && ./lldb-server version'
+$ adb -s ANDROID-SERIAL-A shell run-as <pkg> sh -c 'cd files && ./lldb-server version'
 /system/bin/sh: ./lldb-server: inaccessible or not found
 ```
 但绝对/相对前缀路径可执行：
 ```
-$ adb -s a3ad86f3 shell run-as <pkg> sh -c 'files/lldb-server version'
+$ adb -s ANDROID-SERIAL-A shell run-as <pkg> sh -c 'files/lldb-server version'
 lldb version 19.0.1   ← OK
 ```
 
@@ -85,14 +92,14 @@ Segmentation fault          ← exit 139
 
 **判定**：层 4 是真正的 attach 拦路虎，且属设备/server 二进制层面，**不能纯靠改 nvim 代码解决**。
 
-**待验证项（apply 阶段在 `a3ad86f3` 上做）**：
+**待验证项（apply 阶段在 `ANDROID-SERIAL-A` 上做）**：
 - 换 server 二进制：NDK 21 LLDB（历史 changelog 称其在 platform 模式有过成功）、Android Studio bundled、termux server 逐一试 `gdbserver --attach`，记录哪种不崩。
 - 换 attach 方式：`gdbserver --attach <pid>` vs 先 `platform` 再 attach（注意 changelog 记录 platform 模式在本机 `process attach` 也 `lost connection`，故两条路都需 fresh log）。
 - 缩小目标：对同 uid 的小进程（如 `:pushservice` pid）attach，区分"是 UE 大进程特性"还是"server 普遍崩"。本次对 pushservice 也未拿到干净 `Listening`（超时），倾向 server 二进制问题而非目标体积。
 
 ### 层 5: 模块基址 / ASLR（attach 成功后才生效，预置风险）
 - 设备 `libUE4.so` 首映射 base（来自 `run-as <pkg> cat /proc/22232/maps`）= **`0x6c9fe21000`**。
-- host 符号 so 存在：`E:/aki/zeqiang_aki_3.4/Source/Client/Binaries/Android/Client_Symbols_v170300916/Client-arm64/libUE4.so`（3192229608 B）。
+- host 符号 so 存在：`E:/Projects/SampleGame-3.4/Source/SampleGame/Binaries/Android/SampleGame_Symbols_v100000001/SampleGame-arm64/libUE4.so`（3192229608 B）。
 - 当前代码无 `--slide`（F6）。一旦 attach 通了，file:line 断点很可能仍解析到错地址。
 - **验证法**：attach 成功后 `image list libUE4.so` 的 base 应等于 `0x6c9fe21000`；不等就需补
   `target modules load --file libUE4.so --slide 0x6c9fe21000`（hex 用拼接，禁 `string.format("%x")`，见 K4/P7）。
@@ -124,7 +131,7 @@ post-attach `setBreakpoints` 会 `STATUS_STACK_BUFFER_OVERRUN` 崩）。
 ## 4. 排查 / 修复顺序（每步需 fresh protocol log）
 
 1. **修层 3（确定性）**：spawn 命令去掉 `cd files && ./`，改 `files/lldb-server` 或绝对路径。
-2. **攻层 4（设备 server）**：在 `a3ad86f3` 上逐个 server 二进制试 `gdbserver --attach`，
+2. **攻层 4（设备 server）**：在 `ANDROID-SERIAL-A` 上逐个 server 二进制试 `gdbserver --attach`，
    选不崩的；记录 `TracerPid` 变化与 `Listening` 输出；崩溃后必 `killall lldb-server` 清理。
 3. **attach 通到 `initialized` + `threads`** 后，再验层 5 ASLR base。
 4. **接通断点**：preseed（attachCommands）→ bare lldb 验 `resolved` → 回 DAP 路径，
@@ -140,11 +147,11 @@ post-attach `setBreakpoints` 会 `STATUS_STACK_BUFFER_OVERRUN` 崩）。
 - 不动 `stopOnEntry=true`；
 - attachCommands/postRunCommands 不加 `process continue`；
 - 不动 SIGSEGV/SIGBUS `--notify false --pass true --stop false`；
-- 所有设备验证仅在 `a3ad86f3` 上进行。
+- 所有设备验证仅在 `ANDROID-SERIAL-A` 上进行。
 
 ---
 
-## 6. 真机证据附录（a3ad86f3, 2026-06-02）
+## 6. 真机证据附录（ANDROID-SERIAL-A, 2026-06-02）
 
 ```
 abi=arm64-v8a sdk=36 selinux=Enforcing
@@ -162,5 +169,5 @@ run-as <pkg> sh -c 'files/lldb-server gdbserver --attach 22232 *:N'   -> Segment
 
 # 层5 ASLR:
 run-as <pkg> cat /proc/22232/maps | first libUE4.so r--p  -> base 0x6c9fe21000
-host symbol so: .../Client_Symbols_v170300916/Client-arm64/libUE4.so (3192229608 B)
+host symbol so: .../SampleGame_Symbols_v100000001/SampleGame-arm64/libUE4.so (3192229608 B)
 ```

@@ -69,7 +69,7 @@ resolve 结果，MUST NOT 永远返回 `verified=false` 的合成响应。
 
 - **WHEN** 读者查阅 `docs/TOOLING.md`
 - **THEN** 其中说明 device lldb-server 必须为 NDK 21.4.7075529 LLDB 9.0.9，并给出 host glob 路径
-- **AND** 说明为何不能用 NDK27/Android Studio bundled（attach Segfault，真机 `a3ad86f3` 证据）
+- **AND** 说明为何不能用 NDK27/Android Studio bundled（attach Segfault，真机 `ANDROID-SERIAL-A` 证据）
 
 ### Requirement: 仅改 nvim 配置且不改既有协议边界
 

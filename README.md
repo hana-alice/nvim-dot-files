@@ -68,7 +68,7 @@ FRHICommandList grep (lower is better)
 
 - **Windows 10/11:** primary environment; UE build/index and Win64/Android workflows.
 - **macOS:** native UE `Build.sh`, Mac/IOS target builds, the CDB semantic pipeline,
-  and iOS package/install/launch are supported. Native iOS DAP is not implemented.
+  iOS package/install/launch, and legacy-USB physical-device iOS DAP are supported.
 - **Linux:** the base editor and native UBT build planner are available; device and
   DAP workflows remain target-dependent.
 
@@ -80,6 +80,7 @@ FRHICommandList grep (lower is better)
 | Neovim | 0.10+ |
 | Toolchain | clangd/LLVM 22.1.x — pinned; do not use mason auto-install |
 | Android DAP | LLVM 22.1.6+ `lldb-dap` + NDK 27 `lldb-server` |
+| iOS DAP | Xcode `lldb-dap` + `ios-deploy` + libimobiledevice |
 | Optional | Go ≥ 1.22, to build the grep index tool |
 | Build prerequisite | A working Unreal Build Tool setup for the target platform |
 | iOS | Xcode, iPhoneOS SDK, signing identity/provisioning, and a paired physical device |
@@ -109,18 +110,24 @@ git clone https://github.com/hana-alice/nvim-dot-files.git ~/.config/nvim
 nvim
 ```
 
-Optionally build the grep index tool:
+Optionally install the indexed-grep toolchain on macOS/Linux. The installer
+builds this repository's `cindex-uefilter` and the matching pinned
+`csearch v1.2.0` into `$GOBIN` (or the default `$(go env GOPATH)/bin`):
 
-```powershell
-cd tools\cindex-uefilter
-go install ./...   # requires Go >= 1.22 with $GOBIN on PATH
+```sh
+sh scripts/install_csearch.sh   # requires Go >= 1.22
 ```
 
-Without it, project grep falls back to a slower ripgrep path.
+The runtime also discovers these binaries directly from `$GOBIN`, every
+`$GOPATH/bin`, and the conventional `~/go/bin`, so the install directory does
+not have to be added to Neovim's inherited `PATH`. Without both binaries,
+generic project search falls back to ripgrep and the csearch-only picker stays
+blocked until an index is prepared.
 
 ## Usage
 
-Open a C++ file inside the UE project, then proceed in order.
+Open a C++ file inside the UE project. Project and platform selection are
+independent: steps 1 and 2 may be performed in either order.
 
 ### 1. Bind the project
 
@@ -143,22 +150,15 @@ Choose `Win64`, `Android`, `Mac`, `IOS` or `Linux`. If unset, the current OS is
 used. Caches are stored per `<Platform>-<Config>`, so switching platforms does
 not invalidate other platforms' caches.
 
-### 3. Compile for editor semantics
+### 3. Build the selected target
 
 ```
 <leader>ub        " (space u b) → :UEBuild
 ```
 
-Use `:UECompileForNvim` for the complete compiler-semantic workflow: it verifies
-the pinned clangd 22.1.x toolchain, builds the selected target, then prepares the
-compiler database and index. On IOS, where Apple builds do not retain C++
-response files, the same build terminal continues with UBT's tuple-scoped
-`GenerateClangDatabase` action-graph pass; this does not compile, cook, or
-package. Tree-sitter syntax highlighting works without this; clangd navigation
-and diagnostics require the compiler database.
-
-`:UEBuild` remains build-only. `:UEPrepare` remains prepare-only for users who
-already have fresh response files or a validated tuple-scoped semantic source.
+`:UEBuild` remains build-only. With IOS selected, `<leader>ub` uses the same IOS
+target driver as `:UEBuildIOS`. Wait for it to finish before preparing; build and
+prepare intentionally never overlap.
 
 ### 4. Build the index
 
@@ -166,10 +166,18 @@ already have fresh response files or a validated tuple-scoped semantic source.
 :UEPrepare
 ```
 
-Runs asynchronously with a progress UI: generates `compile_commands.json`, runs
-the CDB pipeline (expand → PCH → resolve → unify → prune), builds the csearch
-index, and reloads clangd. On completion, goto-definition, project grep and
-clangd are ready.
+Runs asynchronously with a progress UI. For an IOS target on macOS, it first
+validates the pinned clangd 22.1.x toolchain and generates the tuple-scoped UBT
+semantic CDB that the IOS build does not retain; it also imports prepared signing
+evidence and selects the device on first use. This IOS prelude uses `GenerateClangDatabase` with no compile,
+cook, package, deploy, or run actions. All targets then generate
+`compile_commands.json`, run the CDB pipeline (expand → PCH → resolve → unify →
+prune), build the csearch index, and reload clangd.
+
+`:UECompileForNvim` remains as a compatibility convenience that performs a build
+and then delegates to this same `:UEPrepare` path; it is not required by the
+normal workflow. Tree-sitter syntax highlighting works without a CDB, while
+clangd navigation and diagnostics require it.
 
 Variants: `:UEPrepareIncremental` (dirty files only), `:UEPrepareReindex`
 (rebuild the index), `:UEPrepareSync` (blocking).
@@ -182,7 +190,7 @@ Variants: `:UEPrepareIncremental` (dirty files only), `:UEPrepareReindex`
 | Project-wide grep | `<leader>/` |
 | File picker | `<leader><leader>` |
 | Build (current platform) | `<leader>ub` / `:UEBuild` |
-| Build + prepare compiler semantics | `:UECompileForNvim` |
+| Compatibility: build, then run the normal prepare path | `:UECompileForNvim` |
 | Build IOS C++ only (safe AOT reuse, no automatic dSYM) | `:UEBuildIOS` |
 | Package IOS from existing cooked data | `:UEPackageIOS` |
 | Generate and UUID-check IOS dSYM on demand | `:UEIOSSymbols` |
@@ -195,6 +203,11 @@ Variants: `:UEPrepareIncremental` (dirty files only), `:UEPrepareReindex`
 | Android: install without launch / attach / breakpoint | `<leader>ui` / `:UEDAPAttach` / `F9` |
 | Background tasks: list / stop | `<leader>X` / `:Tasks` / `:TaskStopAll` |
 | All commands cheatsheet | `<leader>?` / `:UECheatsheet` |
+
+After `PrepareIOSQADebug.sh` and `InstallIOSClient.sh` succeed, the complete IOS
+flow is `:UESetProject` and `:UESetPlatform IOS` in either order, then
+`<leader>ub` → `:UEPrepare` → `<leader>ui`. The IOS prepare branch owns the
+one-time signing/private-key/device setup and Apple semantic CDB generation.
 
 Full keymap and workflow handbook:
 [`docs/ue_lazyvim_cheatsheet.md`](docs/ue_lazyvim_cheatsheet.md).

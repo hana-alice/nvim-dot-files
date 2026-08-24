@@ -10,7 +10,7 @@
 
 - [x] 2.1 创建 `docs/plans/2026-06-02-android-dap-attach-bp-diagnosis.md` 头部（背景、设备 serial、约束引用 `docs/CONSTRAINTS.md`）。
 - [x] 2.2 写"现状事实"小节（任务组 1 的 5 条）。
-- [x] 2.3 写"attach 失败分层假设"：host adapter / adb·forward / 设备端 lldb-server / ptrace·进程架构，每层给验证命令 + 判定标准（已用 `a3ad86f3` 真机验证）。
+- [x] 2.3 写"attach 失败分层假设"：host adapter / adb·forward / 设备端 lldb-server / ptrace·进程架构，每层给验证命令 + 判定标准（已用 `ANDROID-SERIAL-A` 真机验证）。
 - [x] 2.4 写"F9 断不上"小节：合成 setBreakpoints + 注释 preseed 两处直接原因 + 接通断点的判定标准（DAP `verified=true` 且 lldb `breakpoint list` resolved>0）。
 - [x] 2.5 写"ASLR slide 缺失"小节：`image list libUE4.so` base vs `/proc/<pid>/maps` 首映射的比对法（device base 实测 `0x6c9fe21000`）。
 - [x] 2.6 写"排查顺序与修复路线建议"：先 attach 稳定到 `initialized`+`threads`，再接通断点（preseed vs 安全 post-attach），必要时先补 `--slide`；每步需 fresh protocol log。
@@ -19,5 +19,5 @@
 ## 3. 核验
 
 - [x] 3.1 运行 `git status`，确认仅 `docs/plans/`、`openspec/` 改动，无 `lua/ue/dap/*.lua` 改动。
-- [x] 3.2 核对文档每条假设都有可执行验证命令与期望输出；设备验证均限定单一 serial（`a3ad86f3`）。
+- [x] 3.2 核对文档每条假设都有可执行验证命令与期望输出；设备验证均限定单一 serial（`ANDROID-SERIAL-A`）。
 - [x] 3.3 `openspec validate android-dap-attach-bp-diagnosis` 通过。

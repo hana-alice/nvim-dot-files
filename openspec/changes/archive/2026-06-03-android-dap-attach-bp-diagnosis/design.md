@@ -6,7 +6,7 @@
 - **已知证据**（`docs/changelog.md` 2026-06-02 多条）：`platform connect` 成功；`process attach --pid` 在设备端报 `Cannot get process architecture`（当前设备 server）或 `lost connection`（NDK r27 server 回归探针）；bare `lldb-server gdbserver --attach` 在设置 `TracerPid` 前就返回/崩溃。说明失败在**设备端 server / ptrace 边界**，不是 dapui。
 - **F9 断点链路**：`lua/ue/dap.lua` ~1958 把 Android 会话的 `setBreakpoints` 请求整体拦截，返回 `ue_android_synthetic_breakpoint_response`（`verified=false`，带 "cannot safely plant post-attach source breakpoints" 消息）；`android.lua` ~1225 的 `preseed_breakpoints_into_attach_commands(cfg)` 被**注释掉**。也就是说当前 F9 在 Android 上**根本没有真正下发到 lldb**——这是设计上的"先保 attach 稳定"取舍，不是新 bug。
 - **ASLR**：当前 `android.lua` **没有** `target modules load --slide` rebase，而 MEMORY/历史教训（`docs/CONSTRAINTS.md` K2/K11）指出 gdb-remote attach 后必须显式 rebase 模块基址，否则断点解析到错地址。
-- **设备**：当前连接 `a3ad86f3`。
+- **设备**：当前连接 `ANDROID-SERIAL-A`。
 
 约束（`docs/CONSTRAINTS.md`）：不改 host adapter 版本策略（22.1.6+ forward-only）、不动 `stopOnEntry=true`、不在 attachCommands/postRunCommands 加 `process continue`、不动 SIGSEGV/SIGBUS `--pass true --stop false`、改协议前必须有 fresh protocol proof。
 
@@ -37,7 +37,7 @@
 
 **D3 — 把"已知必然失败点"显式写进 spec 的可验证 Scenario。** 让后续实现者一眼看到：F9 在 Android 当前是被设计性短路的，不能用"环境问题"解释；接通断点需要在 attach 稳定后选择 preseed（attachCommands 内 `?breakpoint set -f file -l N`）或安全的 post-attach 路径，且很可能需要先补 ASLR rebase。
 
-**D4 — 设备验证限定单一 serial。** 与历史一致（`a3ad86f3`），避免多设备误选（changelog 已有 `<space>ul` 多设备回归）。
+**D4 — 设备验证限定单一 serial。** 与历史一致（`ANDROID-SERIAL-A`），避免多设备误选（changelog 已有 `<space>ul` 多设备回归）。
 
 ## Risks / Trade-offs
 

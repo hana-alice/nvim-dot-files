@@ -8,7 +8,7 @@
 #   process handle SIG* ...
 import socket, subprocess, json, threading, time, sys, contextlib
 DAP = r"C:/tools/lldb-22/install/bin/lldb-dap.exe"
-SYMSO = r"E:/aki/zeqiang_aki_3.4/Source/Client/Binaries/Android/Client_Symbols_v170300916/Client-arm64/libUE4.so"
+SYMSO = r"E:/Projects/SampleGame-3.4/Source/SampleGame/Binaries/Android/SampleGame_Symbols_v100000001/SampleGame-arm64/libUE4.so"
 
 def free_port():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); pp = s.getsockname()[1]; s.close(); return pp

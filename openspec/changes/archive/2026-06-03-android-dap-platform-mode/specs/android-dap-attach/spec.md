@@ -67,11 +67,11 @@ platform server（替代已证伪的 `gdbserver --attach`），并 `adb forward`
 ### Requirement: 仅改 nvim 配置且保持 host adapter 约束
 
 本 change SHALL 仅改 nvim 配置与文档，host adapter 维持 LLDB 22.1.6+ forward-only，
-设备验证仅在 a3ad86f3。
+设备验证仅在 ANDROID-SERIAL-A。
 
 #### Scenario: 边界保持
 
 - **WHEN** 本 change 被应用
 - **THEN** host adapter 维持 LLVM 22.1.6+
 - **AND** 改动文件集限于 `lua/ue/dap/*.lua`、`lua/utils/platform/windows.lua`、`docs/`、`tools/`（诊断脚本）
-- **AND** 所有设备命令指定 `-s a3ad86f3`，收尾清理 device lldb-server + forward
+- **AND** 所有设备命令指定 `-s ANDROID-SERIAL-A`，收尾清理 device lldb-server + forward

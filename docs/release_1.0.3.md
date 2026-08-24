@@ -30,7 +30,7 @@ every divergence from the upstream LazyVim baseline.
   LLVM toolchain we already require for clangd.
 - **Android attach is one command.** `:UEDAPAttach android` now
   resolves package + symbol_lib + lldb-server from
-  `Source/Client/Binaries/Android/packageInfo.txt` (written by UE on
+  `Source/SampleGame/Binaries/Android/packageInfo.txt` (written by UE on
   every cook). Zero prompts on the happy path.
 - **F10 client throttle.** Mirror of `request_dap_continue`'s
   pending+debounce+resuming guard onto `request_step`. Held F10 /
@@ -247,16 +247,16 @@ package name 和 host libUE4.so 路径，违反"减心智负担"。
 
 **Implemented**
 - `lua/ue/dap/android.lua`:
-  - 新增 `read_package_info(proot)` 读 `Source/Client/Binaries/Android/packageInfo.txt`
+  - 新增 `read_package_info(proot)` 读 `Source/SampleGame/Binaries/Android/packageInfo.txt`
     （UE 在每次 Android cook 时写：line1=package, line2=versionCode, line3=versionName）。
-  - 新增 `discover_project_root(start)` 沿目录树向上找 `Source/Client/Binaries/Android`
+  - 新增 `discover_project_root(start)` 沿目录树向上找 `Source/SampleGame/Binaries/Android`
     标记。
   - 新增 `effective_project_root(ctx)` 优先级链：ctx → ue.config.project_root →
     bufname 探测 → cwd 探测。
   - `pick_package` 优先级: state → cfg → **packageInfo.txt → input**。命中
     packageInfo 后用 `ue.update_state_field` 持久化，下次直接复用 state 分支。
   - `pick_symbol_lib` 优先级: cfg → **packageInfo.versionCode 精确匹配
-    `Client_Symbols_v<code>/Client-arm64/libUE4.so`** → glob 按 mtime 取最新
+    `Client_Symbols_v<code>/SampleGame-arm64/libUE4.so`** → glob 按 mtime 取最新
     （从前的字典序首选 → mtime 修正）→ input。
   - 新增 test hooks `M._pick_package_for_test` / `M._pick_symbol_lib_for_test` /
     `M._effective_project_root_for_test`。
@@ -271,12 +271,12 @@ package name 和 host libUE4.so 路径，违反"减心智负担"。
   剥 `\n` 但 `\r` 残留——`read_package_info` 里加了 trim。
 
 **Validation**
-- Headless RPC probe (`/c/Users/lizeqiang/AppData/Local/Temp/probe_picker2_run.lua`)
+- Headless RPC probe (`/c/Users/<USER>/AppData/Local/Temp/probe_picker2_run.lua`)
   把 picker 经 `_for_test` 直接调三种 ctx 形态：
-  - Case A: ctx=nil, cwd=E:/aki/zeqiang_aki_3.4 →
+  - Case A: ctx=nil, cwd=E:/Projects/SampleGame-3.4 →
     package=`com.example.mygame`, sym=`Client_Symbols_v<code>/.../libUE4.so`, 0 prompts
-  - Case B: ctx={project_root="E:/aki/zeqiang_aki_3.4"} → 同上, 0 prompts
-  - Case C: ctx={engine_root="E:/aki/zeqiang_aki_3.3"} 但 cwd=3.4 → fallback 到
+  - Case B: ctx={project_root="E:/Projects/SampleGame-3.4"} → 同上, 0 prompts
+  - Case C: ctx={engine_root="E:/Projects/SampleGame-3.3"} 但 cwd=3.4 → fallback 到
     cwd 探测命中 3.4, 0 prompts
 - Hot-reloaded 到 PID 56396 nvim，下次 `<space>da` 不再弹两个 input。
 
@@ -667,7 +667,7 @@ DAP 协议；本次在 user 实际 Neovide nvim (PID 45484, --embed) 里跑
 - 完整 attach 拿到：`has_session=true initialized=true thread_count=174`
   (qm-thread, CrashSightThread, V8 worker, hwuiTask, OkHttp 等都在)
 - `_last_session` 全字段填齐 (serial=<emulator>, package=com.example.mygame,
-  symbol_lib=<project>/Source/Client/Binaries/Android/<sym-dir>/Client-arm64/libUE4.so,
+  symbol_lib=<project>/Source/SampleGame/Binaries/Android/<sym-dir>/SampleGame-arm64/libUE4.so,
   source-map <build-host-path> ↔ <local-project-path>)
 - `$__lldb_version: 22.1.6 fc4aad7b` 在 trace 里确认
 - `:UEDAPStop` → disconnect 异步 ~3s 后 `dap.session()=nil` 干净
@@ -875,12 +875,12 @@ platform mode 下可用）。**结论：迁移驳回。lldb-dap 22.1.6 + platfor
 - `C:\tools\lldb-22\install\bin\lldb-dap.exe` (LLVM 22.1.6 私有安装, 7z 抽 NSIS)
 - 设备 `/data/local/tmp/lldb-server` 替为 NDK 21.4.7075529 LLDB 9.0.9
 - probe 脚本三件套：
-  - `probe_attach.py` v2 — attach happy path（170 threads, Client-arm64.so 3GB
+  - `probe_attach.py` v2 — attach happy path（170 threads, SampleGame-arm64.so 3GB
     DWARF, configurationDone + deferred attach response, threads enumerated）✅
   - `probe_bp.py` v3 — DAP `setFunctionBreakpoints` → lldb-dap 进程 hard crash ❌
   - `probe_bp_v4.py` v4 — `evaluate "breakpoint set --name X"`（绕开 DAP）→
     同样 hard crash ❌
-  - v5 加 `--shlib Client-arm64.so` 范围限定 → 仍 hard crash ❌
+  - v5 加 `--shlib SampleGame-arm64.so` 范围限定 → 仍 hard crash ❌
 - 复现率 100%（连续 3 次，不同 BP 名 / 不同 scope）
 
 **Findings 固化**
@@ -896,7 +896,7 @@ platform mode 下可用）。**结论：迁移驳回。lldb-dap 22.1.6 + platfor
 clone `llvm-project @ llvmorg-22.1.6` (commit fc4aad7b) sparse-checkout 到
 `/c/src/llvm-project`。三个对照实验排除掉了 DWARF / device server 版本 / SIGSEGV
 三个早先假设：
-- probe v8 (host-only 3.92GB Client-arm64.so, 无 device, 无 platform mode):
+- probe v8 (host-only 3.92GB SampleGame-arm64.so, 无 device, 无 platform mode):
   `breakpoint set` <1 秒返回带 inlined frame + 源码行 + address ✅ → **DWARF parser 没问题**
 - probe v9 (NDK 27 LLDB 18 替换 NDK 21 LLDB 9 在 device 上): 完全一样的 hang →
   **device-side server 版本不是变量**
@@ -931,7 +931,7 @@ skill `lldb-dap-22-platform-mode-breakpoint-crash` 同步更新 "Root cause anal
 ### 2026-05-21 — Snacks dashboard 加彩色像素头像
 
 **Task** 用户想把 dashboard 默认 golden ASCII art 换成自己的彩色像素头像
-(`C:/Users/lizeqiang/Downloads/20260520-150031.jpg`)。需要在 terminal/Neovide
+(`C:/Users/<USER>/Downloads/20260520-150031.jpg`)。需要在 terminal/Neovide
 里能正常渲染（不依赖图片协议），且不破坏 snacks dashboard 的 keys/startup section。
 
 **Implemented**
@@ -1218,7 +1218,7 @@ class range: \Pr` 的 csearch warn — 因为输入直传 RE2，`\P{...}` 当 Un
   `Background: Skip` 冲突 (clangd 行为：.clangd 覆盖 CLI，所以是 cosmetic
   not functional)。可选清理。
 - state.json 残留 project_root=`E:/proj/other_project_dev` (跨项目)，对当
-  前 D:/project/UnrealEngine 场景无害但要 follow-up 修 (resolve_context
+  前 D:/UE/UnrealEngine 场景无害但要 follow-up 修 (resolve_context
   没 invalidate)。
 
 ### 2026-05-25 — F10 hold/spam crashes Android DAP inferior

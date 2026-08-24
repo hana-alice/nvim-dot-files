@@ -71,8 +71,8 @@ t.describe("ue_watch csearch provider 行为（record-only no-op）", function()
     watch._set_opts_for_test({ csearch_index = idx })
 
     local ok = watch._provider_csearch_add_for_test({
-      "D:/project/uetemp/Engine/Source/Runtime/VulkanRHI/Private/VulkanCommandBuffer.cpp",
-      "D:/project/uetemp/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp",
+      "D:/UE/EngineWorktree/Engine/Source/Runtime/VulkanRHI/Private/VulkanCommandBuffer.cpp",
+      "D:/UE/EngineWorktree/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp",
     })
     t.assert_true(ok, "provider 应返回 true（record-only no-op 成功）")
     t.assert_false(called, "MUST NOT 调用 build_index —— watcher 不是索引器")

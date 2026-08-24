@@ -9,7 +9,7 @@
 
 ## 2. 复现与证据链
 
-- [x] 2.1 记录当前失败基线：在授权真机 `2e2df4cb` 上复现 attach 前 F9 未 stop，保存 fresh pid、port、DAP log、LLDB console output、adapter exit code / timeout 状态。
+- [x] 2.1 记录当前失败基线：在授权真机 `ANDROID-SERIAL-B` 上复现 attach 前 F9 未 stop，保存 fresh pid、port、DAP log、LLDB console output、adapter exit code / timeout 状态。
 - [x] 2.2 增加或扩展诊断 probe，输出 nvim 断点表、最终 attachCommands、`setBreakpoints` 响应、`breakpoint list`、stop event 与 selected frame。
 - [x] 2.3 用 probe 区分失败层级：断点命令未发出、LLDB pending、resolved 但未命中、已命中但 UI 未跳转。
 - [x] 2.4 确认用户失败场景属于 attach 前已有断点、attach 后新增断点，或两者都失败，并分别记录。
@@ -33,7 +33,7 @@
 - [x] 5.1 验证 `target create <symbol-rich libUE4.so>` 实际发生在 attach 前，并记录 module UUID / symbol status。
 - [x] 5.2 验证 `target modules load --file libUE4.so --slide 0x<base>` 的 base 来自当前 pid maps，且未用 `string.format("%x")` 截断。
 - [x] 5.3 对重复 basename 场景记录 LLDB resolved compile-unit 路径；若匹配错误，改用更精确路径或 address 断点。
-- [x] 5.4 确认 sourceMap / local path resolver 能把 stop frame 映射回本地源码行：`MobileShadingRenderer.cpp:1367` breakpoint stop 栈顶映射到 `D:/project/uetemp/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp:1367`。
+- [x] 5.4 确认 sourceMap / local path resolver 能把 stop frame 映射回本地源码行：`MobileShadingRenderer.cpp:1367` breakpoint stop 栈顶映射到 `D:/UE/EngineWorktree/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp:1367`。
 
 ## 6. spec 与文档同步
 

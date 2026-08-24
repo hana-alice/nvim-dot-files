@@ -59,7 +59,7 @@ around，回到根因解。除此之外，断点路径上还堆了一批互相�
   helper）、`lua/ue/dap/_common.lua`（死代码）、`lua/ue/dap/_persist_bp.lua`（no-op push）。
 - **测试**：`tests/cases/dap_spec.lua` 需新增 live-breakpoint 路径断言、warning 移除断言、
   冗余 slide 移除断言；冻结清单按需同步。
-- **真机验证**：需在授权设备 `2e2df4cb` / `<android-package>` 上复验 K33 崩溃是否复现，
+- **真机验证**：需在授权设备 `ANDROID-SERIAL-B` / `<android-package>` 上复验 K33 崩溃是否复现，
   这是选 file:line 还是 address 通道的决定性证据；无真机时本 change 不得标记完成。
 - **文档**：`docs/CONSTRAINTS.md`（K33/K34 状态更新、新增 live 路径约束）、`docs/TOOLING.md`、
   `docs/changelog.md`；`openspec/specs/android-dap-attach/spec.md` delta。

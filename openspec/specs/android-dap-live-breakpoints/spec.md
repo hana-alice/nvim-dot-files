@@ -4,7 +4,7 @@
 
 会话中（attach 完成、`configurationDone` 之后）即时下发/移除 UE Android file:line
 断点并真实命中的行为契约：live 路径成功/失败判据、attach-time preseed 降级为初始种子、
-`verified` 真实性、不再依赖 `:UEDAPReattach`。2026-06-15 真机 `2e2df4cb` 经闸门 +
+`verified` 真实性、不再依赖 `:UEDAPReattach`。2026-06-15 真机 `ANDROID-SERIAL-B` 经闸门 +
 端到端验证：lldb-dap evaluate backtick `breakpoint set -f/-l` 通道在 K30 platform route +
 3.5 匹配符号下 `resolved=1` 且命中（详见 `docs/CONSTRAINTS.md` K36、change
 `android-dap-live-breakpoints`）。

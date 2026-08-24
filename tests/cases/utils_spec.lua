@@ -21,12 +21,68 @@ t.describe("utils.code_search", function()
   t.it("stream 是 function", function() t.assert_type(cs.stream, "function") end)
   t.it("is_indexed 是 function", function() t.assert_type(cs.is_indexed, "function") end)
   t.it("current_backend 是 function", function() t.assert_type(cs.current_backend, "function") end)
+  t.it("csearch_exe 是 function", function() t.assert_type(cs.csearch_exe, "function") end)
   t.it("cindex_uefilter_exe 是 function", function() t.assert_type(cs.cindex_uefilter_exe, "function") end)
+  t.it("install_hint 是 function", function() t.assert_type(cs.install_hint, "function") end)
   -- 负探测策略：探测失败不得污染整个会话（冷启动 PATH 未就绪不应永久禁用 csearch）。
   t.it("_reset_probe_cache 是 function", function() t.assert_type(cs._reset_probe_cache, "function") end)
   t.it("_reset_probe_cache 幂等可调", function()
     cs._reset_probe_cache()
     cs._reset_probe_cache()  -- 二次调用不报错
+  end)
+  t.it("Go tool 探测包含 GOBIN 与多段 GOPATH", function()
+    local platform = require("utils.platform")
+    local old_gobin, old_gopath = vim.env.GOBIN, vim.env.GOPATH
+    local separator = platform.is_windows and ";" or ":"
+    local roots = platform.is_windows and { "C:/go-a", "D:/go-b" } or { "/tmp/go-a", "/tmp/go-b" }
+    vim.env.GOBIN = platform.is_windows and "C:/custom-go-bin" or "/tmp/custom-go-bin"
+    vim.env.GOPATH = table.concat(roots, separator)
+    local ok, candidates = pcall(cs._go_tool_candidates_for_test, "csearch")
+    vim.env.GOBIN, vim.env.GOPATH = old_gobin, old_gopath
+    if not ok then error(candidates) end
+
+    local suffix = platform.is_windows and ".exe" or ""
+    t.assert_contains(candidates, (platform.is_windows and "C:/custom-go-bin" or "/tmp/custom-go-bin")
+      .. "/csearch" .. suffix)
+    t.assert_contains(candidates, roots[1] .. "/bin/csearch" .. suffix)
+    t.assert_contains(candidates, roots[2] .. "/bin/csearch" .. suffix)
+  end)
+  t.it("POSIX installer 同时安装 fork 与固定版本 csearch", function()
+    if require("utils.platform").is_windows then return end
+    local root = vim.fn.tempname():gsub("\\", "/")
+    local fake_bin, install_bin = root .. "/fake-bin", root .. "/install-bin"
+    local log_path = root .. "/go.log"
+    vim.fn.mkdir(fake_bin, "p")
+    vim.fn.mkdir(install_bin, "p")
+    local fake_go = fake_bin .. "/go"
+    local file = assert(io.open(fake_go, "wb"))
+    file:write(table.concat({
+      "#!/bin/sh",
+      'printf "%s\\n" "$*" >> "$FAKE_GO_LOG"',
+      'mkdir -p "$GOBIN"',
+      ': > "$GOBIN/cindex-uefilter"',
+      ': > "$GOBIN/csearch"',
+      'chmod 755 "$GOBIN/cindex-uefilter" "$GOBIN/csearch"',
+      "",
+    }, "\n"))
+    file:close()
+    vim.loop.fs_chmod(fake_go, 493)
+
+    local result = vim.system({ "sh", vim.fn.stdpath("config") .. "/scripts/install_csearch.sh" }, {
+      text = true,
+      env = {
+        PATH = fake_bin .. ":" .. (vim.env.PATH or ""),
+        GOBIN = install_bin,
+        FAKE_GO_LOG = log_path,
+      },
+    }):wait()
+    local lines = vim.fn.readfile(log_path)
+    pcall(vim.fn.delete, root, "rf")
+
+    t.assert_eq(result.code, 0, result.stderr or result.stdout)
+    local log = table.concat(lines, "\n")
+    t.assert_contains(log, " install ./...")
+    t.assert_contains(log, "github.com/google/codesearch/cmd/csearch@v1.2.0")
   end)
   t.it("is_indexed 在无 index 路径时返回 false 而非抛错", function()
     -- 不存在的索引：不应抛错，应安静返回 false（保证 fall through）。
@@ -243,24 +299,6 @@ t.describe("utils.notification_history", function()
     local lines = table.concat(hist.render_lines(), "\n")
     t.assert_contains(lines, "Notification History")
     t.assert_contains(lines, "(empty)")
-  end)
-end)
-
-t.describe("notification history: Android install source contract", function()
-  local cfg = vim.fn.stdpath("config")
-  local text = table.concat(vim.fn.readfile(cfg .. "/lua/ue.lua"), "\n")
-
-  t.it("UEInstallAndroid 记录安装开始、成功、失败历史", function()
-    t.assert_contains(text, "Installing APK:")
-    t.assert_contains(text, "Installed successfully:")
-    t.assert_contains(text, "adb install failed (exit %d)")
-    t.assert_contains(text, "scope = \"ue.install\"")
-  end)
-
-  t.it("UEInstallAndroid 失败详情仍指向 :NvimLog", function()
-    t.assert_contains(text, "--- stderr ---")
-    t.assert_contains(text, "--- stdout ---")
-    t.assert_contains(text, "See :NvimLog")
   end)
 end)
 

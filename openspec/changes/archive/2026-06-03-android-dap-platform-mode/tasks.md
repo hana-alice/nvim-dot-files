@@ -26,7 +26,7 @@
 - [ ] 4.2 `docs/CONSTRAINTS.md`：增补 gdbserver --attach 不绑端口、platform connect getopt 吞 URL 两条坑。
 - [ ] 4.3 `docs/plans/2026-06-03-android-dap-platform-mode.md`：固化 E1–E5 证据链 + 最终方案。
 
-## 5. 验证（仅 a3ad86f3）
+## 5. 验证（仅 ANDROID-SERIAL-A）
 
 - [ ] 5.1 headless smoke：android.lua / dap.lua / windows.lua / require。
 - [ ] 5.2 真机 `<space>da`：platform attach 到 `initialized`+`threads`，无 Invalid URL / 握手超时 / 3221226505。

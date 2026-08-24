@@ -15,6 +15,22 @@ C++ `gd` SHALL 只接受当前 active build generation 下由 compiler-owned ide
 - **THEN** 系统 SHALL 跳转到该 definition
 - **AND** 跳转结果 SHALL NOT 被任何文本候选覆盖
 
+#### Scenario: Source TU uses the transported exact command
+- **WHEN** 当前 source TU 已由 controlled active CDB 提供 exact compile command 并传给 clangd
+- **THEN** `gd` SHALL 在不可变光标 snapshot 上向同一 clangd client 请求 canonical USR 与 definition
+- **AND** MUST NOT 为每次 source `gd` 在 sidecar 中重新读取或解析全量 CDB
+- **AND** 进入 header 时 SHALL 把该 exact command 记录为后续 header-in-context 的 origin TU evidence
+
+#### Scenario: First gd follows a cold clangd restart
+- **WHEN** source 不属于 synthetic background CDB，clangd 已先用邻近 TU 推断命令打开该 buffer
+- **THEN** exact-command transport SHALL 对同一 client/command 有界执行一次 `didClose → command update → didOpen`
+- **AND** canonical USR 请求 SHALL 等待冷 UE preamble 的统一 provider hard ceiling，第一次 `gd` 即可得到语义结果
+
+#### Scenario: A C++-extension source is compiled as Objective-C++
+- **WHEN** exact compile command 以 `-x objective-c++` 或 `-x objective-c++-header` 证明 `.cpp` / `.h` 的真实语言
+- **THEN** buffer SHALL 保留 `cpp` filetype 与 C++ Tree-sitter parser，并叠加 mixed `objcpp` syntax
+- **AND** 普通 C/C++ compile command 与其他平台 SHALL NOT 启用该 Objective-C syntax overlay
+
 #### Scenario: Only a declaration is currently reachable
 - **WHEN** canonical entity 已证明，但当前 index coverage 只能提供 declaration
 - **THEN** 系统 MAY 跳转到同一 identity 的 declaration，并 SHALL 标注 definition destination 尚未闭环的结构化原因
@@ -238,3 +254,20 @@ Clang 解析、TU 创建、reparse 与索引构建 SHALL 在 Neovim UI 主循环
 - **WHEN** active Android build 中 `FVulkanCommandListContext&` receiver 调用其 `RHISubmitCommandsHint()` final override 并触发 `gd`
 - **THEN** identity SHALL 为 `FVulkanCommandListContext` 派生 override，而不是 base RHI virtual method
 - **AND** destination SHALL 为该 override 的 `VulkanCommands.cpp` out-of-line definition，而不是停在 `VulkanContext.h` declaration
+
+### Requirement: Semantic sidecar deadlines SHALL terminate stalled native work
+
+每个 semantic sidecar 请求 SHALL 有明确的 host-side deadline。请求超时后，client SHALL 完成该
+请求的结构化失败、清除 pending 状态，并回收仍卡在 native parse 中而无法读取 cancel 的 sidecar
+进程；不得让无响应进程继续占用 CPU 或永久阻塞后续导航。下一次请求 SHALL 能按现有 process
+manager 冷启动新 sidecar。
+
+#### Scenario: libclang parse 超过请求期限
+- **WHEN** sidecar 在 native parse 中超过配置的 request timeout 且无法处理协议 cancel
+- **THEN** client SHALL 终止该 sidecar，并以 timeout/provider-unavailable 完成请求
+- **AND** pending map SHALL 清空，旧响应不得再产生跳转或状态覆盖
+
+#### Scenario: 超时后的下一次语义请求
+- **WHEN** 前一 sidecar 已因超时被回收，用户再次触发语义导航
+- **THEN** process manager SHALL 启动新的 sidecar 并接受请求
+- **AND** 系统 MUST NOT 因旧进程或旧 pending entry 永久保持 unavailable

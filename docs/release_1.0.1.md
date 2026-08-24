@@ -128,8 +128,8 @@ above are preserved in date-ordered form below.
    没拉进来 → FGlobalShader 找不到。
 2. **顺带发现**：`tools/resolve_cdb_paths.py` 把 `..\Intermediate\..`
    相对路径 resolve 到了 `E:\proj\other_project_dev`（完全不同的盘符 +
-   项目）。cdb directory 是 `D:/project/UnrealEngine/Engine/Source`，按
-   定义该 resolve 到 `D:/project/UnrealEngine/...`。说明 resolve 有
+   项目）。cdb directory 是 `D:/UE/UnrealEngine/Engine/Source`，按
+   定义该 resolve 到 `D:/UE/UnrealEngine/...`。说明 resolve 有
    跨项目搜索 fallback 漏。**这是另一个独立 bug**，本条不修，单独跟。
 
 **Fix plan**（✅ 已落地）
@@ -260,7 +260,7 @@ UBT 出 cdb 时 (a) 只写 .cpp 不写 .h，clangd header inference 选不到正
   `state.target_platform=Android` → `active_key` 选
   `Android-Client-Development` → merged 中 MGRasterizer.cpp `aarch64=true`
   ✅；切回 `Win64 Development Editor` → `aarch64=false` ✅。
-- 顶层 cdb 文件 `D:/project/UnrealEngine/compile_commands.json` 入盘
+- 顶层 cdb 文件 `D:/UE/UnrealEngine/compile_commands.json` 入盘
   35813 entries（3 shards merge）。
 - 用户活 nvim 实测 pending（等 luac dir 修复后重启）。
 
@@ -283,7 +283,7 @@ luac/...restart.luac`。
 
 **Implemented**
 - 一行修复：`mkdir -p
-  /c/Users/lizeqiang/AppData/Local/Temp/nvim/luac`。
+  /c/Users/<USER>/AppData/Local/Temp/nvim/luac`。
 
 **Pitfalls / Gotchas**
 - `vim.loader.enable()` 写字节码缓存时 `assert(io.open(path, "wb"))` 不

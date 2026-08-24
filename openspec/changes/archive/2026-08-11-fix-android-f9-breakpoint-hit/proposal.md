@@ -41,4 +41,4 @@ nvim 断点状态到 LLDB `breakpoint list` 再到真机命中的端到端证明
   以捕获 breakpoint request、`breakpoint list`、stop event 与 adapter 存活状态。
 - 文档与约束：`docs/CONSTRAINTS.md`、`docs/TOOLING.md`、`docs/changelog.md`、
   `openspec/specs/android-dap-attach/spec.md`。
-- 设备验证：仍限定在 `a3ad86f3`；host adapter 维持 LLVM 22.1.6+ forward-only；不引入新依赖。
+- 设备验证：仍限定在 `ANDROID-SERIAL-A`；host adapter 维持 LLVM 22.1.6+ forward-only；不引入新依赖。

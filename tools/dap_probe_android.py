@@ -21,7 +21,7 @@
 import socket, subprocess, json, threading, time, sys, os
 
 DAP   = r"C:/tools/lldb-22/install/bin/lldb-dap.exe"
-SYMSO = r"E:/aki/zeqiang_aki_3.4/Source/Client/Binaries/Android/Client_Symbols_v170300916/Client-arm64/libUE4.so"
+SYMSO = r"E:/Projects/SampleGame-3.4/Source/SampleGame/Binaries/Android/SampleGame_Symbols_v100000001/SampleGame-arm64/libUE4.so"
 PKG   = "<android-package>"
 SRC_FILE = "MobileShadingRenderer.cpp"
 SRC_LINE = 1345

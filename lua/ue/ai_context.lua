@@ -24,6 +24,89 @@ local function display(value)
   return tostring(value)
 end
 
+local function diagnostic_text(value)
+  if type(value) ~= "table" then
+    return value
+  end
+  return tostring(value.reason or value.message or vim.inspect(value))
+end
+
+---Build the target-specific, read-only command summary used by the exported AI
+---context. This report owner may compare target ids for presentation, while the
+---facade remains limited to context resolution and dependency injection.
+function M.resolve_target_artifacts(ctx, platform_id, state, deps)
+  local targets = deps.targets or require("ue.targets")
+  local host_driver = deps.host_driver or require("utils.platform").driver()
+  local build_command, build_error = deps.android_build_command(ctx)
+  local android_active = platform_id == targets.must_get("Android").id
+  local so_build_command, so_build_error
+  if android_active then
+    so_build_command, so_build_error = deps.android_build_command(ctx, { operation = "so_build" })
+  else
+    so_build_error = "UEBuildAndroidSO requires target platform Android."
+  end
+
+  local apk = android_active and deps.find_apk(ctx) or nil
+  local selected_android_serial = deps.android_device.get()
+  local so_deploy_command, so_deploy_error
+  if android_active then
+    so_deploy_command, so_deploy_error = deps.android_so_deploy_command(
+      ctx, selected_android_serial, state.android_package, host_driver
+    )
+  else
+    so_deploy_error = "UEDeployAndroidSO requires target platform Android."
+  end
+
+  local _, install_unavailable = targets.resolve("Android", "install", host_driver)
+  local ios_active = platform_id == targets.must_get("IOS").id
+  local install_plan = android_active
+      and not install_unavailable
+      and apk
+      and selected_android_serial
+      and targets.plan("Android", "install", {
+        adb = deps.android_device.adb_executable(),
+        apk = apk,
+        cwd = ctx.engine_root,
+        device_id = selected_android_serial,
+      }, host_driver)
+    or nil
+  local install_command = install_plan and deps.target_tasks.command(install_plan) or nil
+  local install_native_action
+  if ios_active then
+    local _, ios_install_unavailable = targets.resolve("IOS", "install", host_driver)
+    if ios_install_unavailable then
+      install_native_action = ("IOS install is unavailable on host %s: %s"):format(
+        tostring(host_driver.id), tostring(ios_install_unavailable.reason)
+      )
+    else
+      install_native_action = "Installs the current tuple's signed staged app in place; does not uninstall or launch."
+    end
+  elseif not android_active then
+    install_native_action = "UEInstall supports active Android and IOS targets."
+  elseif install_unavailable then
+    install_native_action = ("Android install is unavailable on host %s: %s"):format(
+      tostring(host_driver.id), tostring(install_unavailable.reason)
+    )
+  elseif not apk then
+    install_native_action = "No APK found under the active uproject build outputs."
+  elseif not selected_android_serial then
+    install_native_action = "Android device is not selected; run :UESetAndroidDevice."
+  end
+
+  return {
+    android_device_serial = selected_android_serial,
+    build_command = build_command,
+    build_error = diagnostic_text(build_error),
+    so_build_command = so_build_command,
+    so_build_error = diagnostic_text(so_build_error),
+    so_deploy_command = so_deploy_command,
+    so_deploy_error = diagnostic_text(so_deploy_error),
+    latest_apk = apk,
+    install_command = install_command,
+    install_native_action = install_native_action,
+  }
+end
+
 function M.render_markdown(context)
   local target = context.target or {}
   local state = context.state or {}
@@ -68,6 +151,7 @@ function M.render_markdown(context)
     local native = command.native_command and command_text(command.native_command)
       or command.native_action
       or "<internal Neovim/Lua operation>"
+    native = diagnostic_text(native)
     native = native:gsub("|", "\\|")
     lines[#lines + 1] = ("| `%s` | `%s` | %s | `%s` |"):format(
       command.key,

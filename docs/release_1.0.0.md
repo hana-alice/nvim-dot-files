@@ -432,7 +432,7 @@ nvim 1.1 可以:
 - 上游: LazyVim, lazy.nvim, snacks.nvim, blink.cmp, nvim-dap, nvim-dap-ui, codelldb,
   fidget.nvim, gitsigns, treesitter, trouble.nvim, dropbar
 - 工具: clangd 22.1 trunk, UnrealBuildTool, Python 3.12, ripgrep, csearch
-- 配置作者: hana-alice <zeqiang-li@outlook.com>
+- 配置作者: hana-alice <hana-alice@users.noreply.github.com>
 - 仓库: https://github.com/hana-alice/nvim
 - 许可证: 见仓库 LICENSE
 

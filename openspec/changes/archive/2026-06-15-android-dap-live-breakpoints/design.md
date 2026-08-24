@@ -30,7 +30,7 @@ session-time 变更的本质区别，已在 working tree 被推翻为诚实-warn
 - K34/K35：必须先 `target create <symbol-rich libUE4.so>` 再 attach。
 - P4/C2：work around 必须隔离到 `lua/workarounds/`；但本 change 的目标是**消除** work
   around 改正解，正解放主逻辑（C2 "何时不该隔离"）。
-- host adapter 维持 LLVM 22.1.6+ forward-only；真机仅 `2e2df4cb`。
+- host adapter 维持 LLVM 22.1.6+ forward-only；真机仅 `ANDROID-SERIAL-B`。
 
 ## Goals / Non-Goals
 
@@ -142,7 +142,7 @@ resolved，`target create`+platform attach 自动重定位"。删除前置条件
 
 1. **（阻塞）** session-time `breakpoint set` 在当前 K30 route + 3.5 匹配符号下是否能写入
    并命中？`361b9e7` 说不能，但那是旧路线/旧符号的观测——必须 D1 闸门复验。
-   **已解（2026-06-15 真机 `2e2df4cb` 闸门实验）：可行。** 目标
+   **已解（2026-06-15 真机 `ANDROID-SERIAL-B` 闸门实验）：可行。** 目标
    `MobileShadingRenderer.cpp:1367`、3.5 匹配符号、attach 后 continue、不 preseed 目标断点，
    两条通道均 **命中**：
    - 通道 B（evaluate backtick `breakpoint set -f/-l`）：`live_plant_sent=true`、
@@ -160,7 +160,7 @@ resolved，`target create`+platform attach 自动重定位"。删除前置条件
    **已解：不复现。** 闸门 evaluate 通道 `adapter_alive=true`、无 `3221226505`/`0xC0000409`。
    K33 崩溃是旧 gdb-remote 直连 attach 路径的产物，K30 platform route 下安全。
 3. 冗余 ASLR slide 是否真可删？（D5 复验）
-   **已解：不删（证据不支持删除）。** 2026-06-15 真机 `2e2df4cb` 跑 `UE_DAP_NO_SLIDE=1`
+   **已解：不删（证据不支持删除）。** 2026-06-15 真机 `ANDROID-SERIAL-B` 跑 `UE_DAP_NO_SLIDE=1`
    三次（含设备清场 `pkill lldb-server` + `adb forward --remove-all`），不下发
    `target modules load --slide` 时 attach 在 `android_attach_start` 后即超时、adapter
    早退 `3221226505`，从未到 `initialized`/命中；而紧随其后的 slide-present baseline

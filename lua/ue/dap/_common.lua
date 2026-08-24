@@ -10,43 +10,21 @@
 --   2. utils.platform.driver().default_lldb_dap_paths()
 --   3. PATH lookup for "lldb-dap" / "lldb-dap.exe"
 
-local fs = require("ue.core.fs")
-
 local M = {}
-
-local function executable_on_path(name)
-  if vim.fn.executable(name) == 1 then
-    local p = vim.fn.exepath(name)
-    if p and p ~= "" then return p end
-  end
-  return nil
-end
 
 --- Resolve an lldb-dap executable.
 --- Returns the first readable file path, or nil.
 function M.find_lldb_dap()
-  -- 1. explicit user override
-  local ok_cfg, cfg = pcall(require, "ue.config")
-  if ok_cfg and cfg and cfg.get then
-    local override = cfg.get("dap.lldb_dap_path")
-    if type(override) == "string" and override ~= "" and fs.is_file(override) then
-      return override
-    end
-  end
-
-  -- 2. per-OS defaults from the platform driver
-  local ok_plat, plat = pcall(require, "utils.platform")
-  if ok_plat and plat and plat.driver then
-    local driver = plat.driver()
-    if driver and driver.default_lldb_dap_paths then
-      for _, p in ipairs(driver.default_lldb_dap_paths() or {}) do
-        if fs.is_file(p) then return p end
-      end
-    end
-  end
-
-  -- 3. PATH lookup
-  return executable_on_path("lldb-dap") or executable_on_path("lldb-dap.exe")
+  local platform = require("utils.platform")
+  local resolved = platform.resolve_tool({
+    name = "lldb-dap",
+    env = { "UE_LLDB_DAP" },
+    config = { "dap.lldb_dap_path" },
+    driver_candidates = function(driver)
+      return driver.default_lldb_dap_paths()
+    end,
+  })
+  return resolved.ok and resolved.path or nil
 end
 
 --- Build the env table that lldb-dap needs at spawn time.
@@ -188,23 +166,33 @@ function M.lldb_dap_config(opts)
   end
   if opts.initCommands   then cfg.initCommands   = opts.initCommands   end
   if opts.preRunCommands then cfg.preRunCommands = opts.preRunCommands end
+  cfg._ue_session_owner = opts._ue_session_owner
+  cfg._ue_session_operation = opts._ue_session_operation
+  cfg._ue_device_id = opts._ue_device_id
+  cfg._ue_process_id = opts._ue_process_id
   return cfg
 end
 
 --- Run a config via nvim-dap; degrade to a notify when nvim-dap is
---- unavailable so headless smoke tests don't crash.
-function M.run(config, fallback_msg)
+--- unavailable so headless smoke tests don't crash. Platform handlers with a
+--- protocol-proven adapter (notably IOS/Xcode) may freeze its absolute path.
+function M.run(config, fallback_msg, adapter_override, adapter_options)
   local dap, err = M.require_dap()
   if not dap then
     vim.notify((fallback_msg or "DAP unavailable") .. ": " .. err, vim.log.levels.WARN)
     return false
   end
-  local adapter = M.find_lldb_dap()
+  local adapter = adapter_override or M.find_lldb_dap()
   if not adapter then
     vim.notify("lldb-dap adapter not found on this host", vim.log.levels.ERROR)
     return false
   end
   M.ensure_adapter(dap, adapter)
+  if type(adapter_options) == "table" then
+    dap.adapters.lldb.options = vim.tbl_extend(
+      "force", dap.adapters.lldb.options or {}, adapter_options
+    )
+  end
   dap.run(config)
   return true
 end

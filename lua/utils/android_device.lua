@@ -17,6 +17,10 @@ local function adb_executable(adb)
   return resolved ~= "" and resolved or "adb"
 end
 
+function M.adb_executable(adb)
+  return adb_executable(adb)
+end
+
 local function normalize_lines(output)
   if type(output) == "table" then return output end
   local lines = {}

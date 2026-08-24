@@ -24,6 +24,93 @@ t.describe("ue.dap.platforms: 注册与查找", function()
     t.assert_nil(p.launch_handler("xtest"))
     p._reset_for_test()
   end)
+
+  t.it("freezes lifecycle dispatch on the bound session owner", function()
+    p._reset_for_test()
+    local calls = {}
+    p.register_attach("alpha", function() calls[#calls + 1] = "attach:alpha" end)
+    p.register_attach("beta", function() calls[#calls + 1] = "attach:beta" end)
+    p.register_lifecycle("alpha", {
+      stop = function(opts) calls[#calls + 1] = "stop:" .. opts.owner.owner end,
+      status = function(opts) calls[#calls + 1] = "status:" .. opts.owner.owner end,
+      reattach = function(opts) calls[#calls + 1] = "reattach:" .. opts.owner.owner end,
+      cleanup = function(opts) calls[#calls + 1] = "cleanup:" .. opts.owner.owner end,
+    })
+    p.register_lifecycle("beta", {
+      stop = function(opts) calls[#calls + 1] = "stop:" .. opts.owner.owner end,
+    })
+
+    local started = p.begin("attach", "alpha", { device_id = "DEVICE-A" })
+    t.assert_true(started)
+    local session = {
+      config = {
+        type = "lldb",
+        _ue_session_owner = "alpha",
+        _ue_session_operation = "attach",
+      },
+    }
+    local owner, bind_err = p.bind_session(session, { device_id = "DEVICE-A", process_id = 4242 })
+    t.assert_nil(bind_err)
+    t.assert_eq(owner.owner, "alpha")
+    t.assert_eq(owner.process_id, 4242)
+
+    -- A later UI/platform choice may prepare another invocation, but the
+    -- existing session lifecycle remains bound to alpha.
+    p.begin("attach", "beta")
+    local stopped, stop_err = p.dispatch_lifecycle("stop", { session = session })
+    t.assert_true(stopped, stop_err and stop_err.reason)
+    t.assert_eq(calls[#calls], "stop:alpha")
+
+    local cleaned, cleanup_err = p.dispatch_lifecycle("cleanup", { session = session, reason = "device-disconnect" })
+    t.assert_true(cleaned, cleanup_err and cleanup_err.reason)
+    t.assert_eq(calls[#calls], "cleanup:alpha")
+
+    local ended = p.end_session(session)
+    t.assert_eq(ended.owner, "alpha")
+    t.assert_nil(session._ue_session_owner_record)
+    t.assert_nil(p.session_owner(session))
+    local reattached, reattach_err = p.dispatch_lifecycle("reattach")
+    t.assert_true(reattached, reattach_err and reattach_err.reason)
+    t.assert_eq(calls[#calls], "reattach:alpha")
+    p._reset_for_test()
+  end)
+
+  t.it("never falls back to another target for an unsupported owner lifecycle", function()
+    p._reset_for_test()
+    local foreign_calls = 0
+    p.register_attach("ios", function() end)
+    p.register_lifecycle("ios", {
+      stop = function() end,
+    })
+    p.register_lifecycle("mac", {
+      reattach = function() foreign_calls = foreign_calls + 1 end,
+    })
+    p.begin("attach", "ios")
+    local session = { config = { type = "lldb", _ue_session_owner = "ios" } }
+    p.bind_session(session)
+
+    local handled, err = p.dispatch_lifecycle("reattach", { session = session })
+    t.assert_nil(handled)
+    t.assert_eq(err.owner, "ios")
+    t.assert_contains(err.reason, "does not provide")
+    t.assert_eq(foreign_calls, 0)
+    p._reset_for_test()
+  end)
+
+  t.it("fails closed when lifecycle owner metadata is missing", function()
+    p._reset_for_test()
+    p.register_attach("stale", function() end)
+    p.begin("attach", "stale")
+    local unmanaged, bind_err = p.bind_session({ config = { type = "lldb" } })
+    t.assert_nil(unmanaged)
+    t.assert_eq(bind_err.reason, "session owner metadata is missing")
+    p._reset_for_test()
+    local handled, err = p.dispatch_lifecycle("stop")
+    t.assert_nil(handled)
+    t.assert_eq(err.kind, "stop")
+    t.assert_contains(err.reason, "owner metadata")
+    p._reset_for_test()
+  end)
 end)
 
 t.describe("ue.dap: 各平台模块导出 attach/launch", function()
@@ -32,18 +119,138 @@ t.describe("ue.dap: 各平台模块导出 attach/launch", function()
       local m = require("ue.dap." .. id)
       t.assert_type(m.attach, "function", id .. ".attach")
       t.assert_type(m.launch, "function", id .. ".launch")
+      if id == "ios" then
+        t.assert_type(m.cleanup, "function", "ios.cleanup")
+      end
     end)
   end
 
 
-  t.it("IOS DAP 明确 unsupported，不借用 Mac handler", function()
+  t.it("IOS DAP 使用独立 device handler，不借用 Mac handler", function()
     local config = vim.fn.stdpath("config")
     local source = table.concat(vim.fn.readfile(config .. "/lua/ue/dap/ios.lua"), "\n")
     t.assert_false(source:find('require("ue.dap.mac")', 1, true) ~= nil)
-    local _, unavailable = require("ue.targets").resolve(
+    local driver, unavailable = require("ue.targets").resolve(
       "IOS", "dap_attach", require("utils.platform.macos")
     )
-    t.assert_eq(unavailable.status, "unavailable")
+    t.assert_eq(driver.id, "IOS")
+    t.assert_nil(unavailable)
+  end)
+end)
+
+t.describe("ue.dap: generic owner lifecycle compatibility", function()
+  t.it("desktop toolbar terminate preserves nvim-dap native terminate behavior", function()
+    local dap_mod = require("ue.dap")
+    local fallback_calls = 0
+    local result = dap_mod.dap_stop_session({
+      source = "terminate",
+      fallback = function()
+        fallback_calls = fallback_calls + 1
+        return "native-terminate"
+      end,
+    })
+    t.assert_eq(result, "native-terminate")
+    t.assert_eq(fallback_calls, 1)
+  end)
+end)
+
+t.describe("ue.dap.ios: legacy MobileDevice lldb-dap config", function()
+  local ios = require("ue.dap.ios")
+  local base = {
+    binary = "/Project Root/Binaries/IOS/SampleGame",
+    cwd = "/Project Root",
+    device_app_path = "/private/var/containers/Bundle/Application/ABC/SampleGame.app",
+    executable_name = "SampleGame",
+    port = 12345,
+    symbols = "/Device Support/iPhone13,2 15.4.1 (19E258)/Symbols",
+  }
+
+  t.it("attach-at-launch creates the local symbol target before RemoteLaunch", function()
+    local opts = vim.tbl_extend("force", base, { mode = "launch" })
+    local cfg, err = ios._build_config_for_test(opts)
+    t.assert_nil(err)
+    t.assert_eq(cfg.request, "attach")
+    t.assert_eq(cfg.stopOnEntry, true)
+    t.assert_eq(cfg._ue_ios_session_owner, "legacy-mobiledevice")
+    t.assert_eq(cfg._ue_session_owner, "ios")
+    t.assert_eq(cfg._ue_session_operation, "launch")
+    t.assert_contains(cfg.initCommands, "settings set target.memory-module-load-level partial")
+    t.assert_contains(cfg.attachCommands,
+      'platform select remote-ios --sysroot "/Device Support/iPhone13,2 15.4.1 (19E258)/Symbols"')
+    t.assert_contains(cfg.attachCommands,
+      'target create "/Project Root/Binaries/IOS/SampleGame"')
+    local all = table.concat(cfg.attachCommands, "\n")
+    local target_i = assert(all:find("target create", 1, true))
+    local remote_i = assert(all:find("SetPlatformFileSpec", 1, true))
+    local connect_i = assert(all:find("ConnectRemote", 1, true))
+    local launch_i = assert(all:find("RemoteLaunch", 1, true))
+    t.assert_true(target_i < remote_i and remote_i < connect_i and connect_i < launch_i)
+    t.assert_contains(all,
+      "/private/var/containers/Bundle/Application/ABC/SampleGame.app/SampleGame")
+    t.assert_contains(all, "True, ios_error")
+    t.assert_contains(all, "local iOS binary did not match the loaded device image")
+    t.assert_contains(all, "lldb.debugger.GetListener()")
+    t.assert_contains(all, "time.sleep(0.1)")
+    t.assert_false(all:find("StartListeningForEventClass", 1, true) ~= nil)
+  end)
+
+  t.it("ordinary attach waits for the async RemoteAttach stop", function()
+    local opts = vim.tbl_extend("force", base, { mode = "attach", pid = 4242 })
+    local cfg, err = ios._build_config_for_test(opts)
+    t.assert_nil(err)
+    local all = table.concat(cfg.attachCommands, "\n")
+    t.assert_contains(all, "RemoteAttachToProcessWithID(4242, ios_error)")
+    t.assert_contains(all, "ios_state != lldb.eStateStopped")
+    t.assert_false(all:find("RemoteLaunch", 1, true) ~= nil)
+  end)
+
+  t.it("fails closed instead of inventing project, device, or pid defaults", function()
+    local missing_binary, binary_err = ios._build_config_for_test(vim.tbl_extend(
+      "force", base, { mode = "launch", binary = "" }
+    ))
+    local missing_pid, pid_err = ios._build_config_for_test(vim.tbl_extend(
+      "force", base, { mode = "attach" }
+    ))
+    t.assert_nil(missing_binary)
+    t.assert_contains(binary_err, "binary")
+    t.assert_nil(missing_pid)
+    t.assert_contains(pid_err, "pid")
+  end)
+
+  t.it("parses one exact installed bundle and its executable", function()
+    local app, err = ios._parse_installed_apps_for_test(vim.json.encode({
+      {
+        CFBundleIdentifier = "com.example.other",
+        CFBundleExecutable = "Other",
+        Path = "/private/Other.app",
+      },
+      {
+        CFBundleIdentifier = "com.example.game",
+        CFBundleExecutable = "SampleGame",
+        Path = "/private/SampleGame.app",
+      },
+    }), "com.example.game")
+    t.assert_nil(err)
+    t.assert_eq(app.app_path, "/private/SampleGame.app")
+    t.assert_eq(app.executable_name, "SampleGame")
+  end)
+
+  t.it("keeps stdout-only libimobiledevice failures actionable", function()
+    local detail = require("ue.dap._ios_process").device_unavailable("TEST-UDID", {
+      code = 255,
+      stdout = "ERROR: Device TEST-UDID not found!\n",
+      stderr = "",
+    })
+    t.assert_contains(detail, "Device TEST-UDID not found")
+    t.assert_contains(detail, "legacy USB")
+  end)
+
+  t.it("freezes the selected Xcode adapter instead of using Homebrew fallback", function()
+    local source = table.concat(vim.fn.readfile(
+      vim.fn.stdpath("config") .. "/lua/ue/dap/ios.lua"), "\n")
+    t.assert_contains(source, 'runtime.tools.xcrun, "--find", "lldb-dap"')
+    t.assert_contains(source, "runtime.adapter")
+    t.assert_contains(source, "initialize_timeout_sec = 90")
   end)
 end)
 
@@ -82,7 +289,7 @@ t.describe("ue.dap.android: breakpoint preseed", function()
         attachCommands = {
           'target create "D:/symbols/libUE4.so"',
           "platform select remote-android",
-          "platform connect connect://[a3ad86f3]:5039",
+          "platform connect connect://[ANDROID-SERIAL-A]:5039",
           "process attach --pid 1234",
           "process handle SIGSEGV --notify false --pass true --stop false",
           "process handle SIGBUS  --notify false --pass true --stop false",
@@ -165,7 +372,7 @@ t.describe("ue.dap.android: breakpoint preseed", function()
     -- A UE Android absolute Windows path must be rewritten to basename only —
     -- the exact shape attach-time preseed uses and that resolves against DWARF.
     local cmd, file = D._live_plant_command_for_test(
-      { path = "D:/project/uetemp/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp",
+      { path = "D:/UE/EngineWorktree/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp",
         name = "MobileShadingRenderer.cpp" }, 1367)
     t.assert_eq(cmd, '`breakpoint set -f "MobileShadingRenderer.cpp" -l 1367',
       "live-plant must emit a backtick `breakpoint set -f <basename> -l <line>` command")
@@ -310,6 +517,18 @@ t.describe("ue.dap.android: breakpoint preseed", function()
     t.assert_eq(sm[2].to, vim.fs.normalize(proot))
     vim.fn.delete(root, "rf")
   end)
+
+  t.it("sourceMap defaults to the selected project when no build root is configured", function()
+    local android = require("ue.dap.android")
+    local proot = vim.fn.tempname() .. "/Project/Source/SampleGame"
+    vim.fn.mkdir(proot, "p")
+
+    local sm = android._pick_source_map_for_test({ project_root = proot })
+    local normalized = vim.fs.normalize(proot)
+    t.assert_eq(sm[#sm].from, normalized)
+    t.assert_eq(sm[#sm].to, normalized)
+    vim.fn.delete(proot, "rf")
+  end)
 end)
 
 t.describe("ue.dap: setup() 后平台已注册", function()
@@ -350,7 +569,7 @@ t.describe("ue.dap: setup() 后平台已注册", function()
     t.assert_nil(p.attach_handler("android"))
     t.assert_nil(p.attach_handler("win64"))
     t.assert_type(p.attach_handler("mac"), "function")
-    t.assert_nil(p.attach_handler("ios"))
+    t.assert_type(p.attach_handler("ios"), "function")
   end)
 
   t.it("_common.find_lldb_dap 返回 string 或 nil", function()
@@ -386,9 +605,9 @@ t.describe("ue.dap.android: pick_symbol_lib（K35 + 3.4 假线索防护）", fun
   t.it("项目目录和符号包发现不固定 Client 项目名", function()
     local source = table.concat(vim.fn.readfile(
       vim.fn.stdpath("config") .. "/lua/ue/dap/android.lua"), "\n")
-    t.assert_false(source:find("Source/Client", 1, true) ~= nil)
+    t.assert_false(source:find("Source/SampleGame", 1, true) ~= nil)
     t.assert_false(source:find("Client_Symbols", 1, true) ~= nil)
-    t.assert_false(source:find("Client-arm64", 1, true) ~= nil)
+    t.assert_false(source:find("SampleGame-arm64", 1, true) ~= nil)
   end)
 
   t.it("K35: 优先用 packageInfo versionCode 精确匹配的 symbol lib", function()
@@ -560,7 +779,7 @@ t.describe("ue.dap.android: attach_commands（K30/K34/K37 顺序与 slide 开关
   local function base_session()
     return {
       symbol_lib = "D:/symbols/SampleGame_Symbols_v1/SampleGame-arm64/libUE4.so",
-      serial = "a3ad86f3",
+      serial = "ANDROID-SERIAL-A",
       port = 5039,
       pid = 1234,
       _module_rebase_cmd =
@@ -593,7 +812,7 @@ t.describe("ue.dap.android: attach_commands（K30/K34/K37 顺序与 slide 开关
   t.it("K30: connect URL 是 serial 方括号形式 connect://[<serial>]:<port>", function()
     local cmds = android._attach_commands_for_test(base_session())
     local connect = cmds[index_of(cmds, function(c) return c:find("platform connect", 1, true) end)]
-    t.assert_eq(connect, "platform connect connect://[a3ad86f3]:5039",
+    t.assert_eq(connect, "platform connect connect://[ANDROID-SERIAL-A]:5039",
       "必须 serial 方括号形式，禁 localhost（K30/K32）")
     -- 反向守护：不得出现 localhost/127.0.0.1 形式
     t.assert_true(connect:find("localhost", 1, true) == nil)
@@ -744,7 +963,7 @@ t.describe("ue.dap._persist_bp: F9 持久化往返（K10）", function()
   t.it("project_name sanitize：非法文件名字符替换为 _", function()
     t.assert_eq(bp._project_name_for_test("E:/workspace/SampleGame.uproject", nil), "SampleGame",
       "uproject 取 basename 去 .uproject 后缀")
-    t.assert_eq(bp._project_name_for_test(nil, "E:/aki/My Game"), "My_Game",
+    t.assert_eq(bp._project_name_for_test(nil, "E:/Projects/My Game"), "My_Game",
       "空格等非法字符替换为 _")
     t.assert_eq(bp._project_name_for_test(nil, nil), "default",
       "无 uproject/project_root 回落 default")

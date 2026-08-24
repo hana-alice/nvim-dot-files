@@ -43,7 +43,7 @@
 --     recommended: without it lldb-dap will pull stripped libUE4.so from
 --     the device into ~/.lldb/module_cache (no source lines).
 --   * Optional: source-map entries (DAP "sourceMap") so DWARF build-machine
---     paths (e.g. D:\project\uetemp\Engine\) resolve to the local checkout.
+--     paths (e.g. D:\UE\EngineWorktree\Engine\) resolve to the local checkout.
 
 local C              = require("ue.dap._common")
 local fs             = require("ue.core.fs")
@@ -456,8 +456,9 @@ local function pick_source_map(ctx)
   -- ue.config.dap.android_source_map = { { from, to }, ... }
   local cfg_sm = ue_cfg_get("dap.android_source_map")
   if type(cfg_sm) == "table" and #cfg_sm > 0 then return cfg_sm end
-  -- DWARF on UE Android builds bakes the build-machine root into
-  -- DW_AT_comp_dir (observed: "D:\project\uetemp\Engine\Source").
+  -- DWARF on UE Android builds may bake the build-machine root into
+  -- DW_AT_comp_dir. Configure dap.android_build_root when that root differs
+  -- from the selected project root.
   --
   -- We only register the BACKSLASH form of the build root, not both
   -- backslash and forward-slash variants. lldb-dap on Windows normalizes
@@ -476,7 +477,7 @@ local function pick_source_map(ctx)
   if not proot then return nil end
   local build_root = fs.norm((ctx and ctx.android_build_root)
     or ue_cfg_get("dap.android_build_root")
-    or "D:/project/uetemp")
+    or proot)
   local sm = {}
   local build_engine = build_root .. "/Engine"
   local project_engine = proot .. "/Engine"
@@ -611,7 +612,7 @@ end
 --
 -- The base is the start of the FIRST mapping of the .so in /proc/<pid>/maps.
 -- We read it via `run-as <pkg> cat /proc/<pid>/maps` (verified readable on
--- a3ad86f3; plain `adb shell cat` fails under hidepid on Android 10+).
+-- ANDROID-SERIAL-A; plain `adb shell cat` fails under hidepid on Android 10+).
 --
 -- CRITICAL: the returned value is a STRING built by text extraction, never via
 -- string.format("%x", n) — LuaJIT truncates %x to 32 bits and a UE .so base
@@ -821,16 +822,14 @@ local function find_jdb()
   if type(cfg_path) == "string" and cfg_path ~= "" and fs.is_file(cfg_path) then
     return cfg_path
   end
-  local exe = vim.fn.exepath("jdb")
-  if exe ~= nil and exe ~= "" then return exe end
-  local jh = vim.env.JAVA_HOME
-  if jh and jh ~= "" then
-    for _, name in ipairs({ "jdb.exe", "jdb" }) do
-      local p = jh .. "/bin/" .. name
-      if fs.is_file(p) then return p end
-    end
-  end
-  return nil
+  local platform = require("utils.platform")
+  local resolved = platform.resolve_tool({
+    name = "jdb",
+    driver_candidates = function(driver)
+      return platform.java_debugger_candidates(driver)
+    end,
+  })
+  return resolved.ok and resolved.path or nil
 end
 
 -- One-shot diagnostics for the wait-launch path. Every failure is recorded
@@ -1086,8 +1085,7 @@ local function init_commands(session)
   if dap_exe and dap_exe ~= "" then
     local install_root = vim.fs.dirname(vim.fs.dirname(dap_exe))  -- strip /bin/lldb-dap.exe
     if install_root and install_root ~= "" then
-      for _, sub in ipairs({ "lib/site-packages/lldb", "Lib/site-packages/lldb",
-                              "lib/python3/dist-packages/lldb" }) do
+      for _, sub in ipairs(require("utils.platform").driver().lldb_python_relative_paths()) do
         local probe = install_root .. "/" .. sub
         local st = vim.uv and vim.uv.fs_stat(probe) or vim.loop.fs_stat(probe)
         if st and st.type == "directory" then
@@ -1705,6 +1703,10 @@ local function _finalize_session(sess, pid, cfg_name, run_label)
 
   local cfg = lldb_dap_attach_config(sess, sess.source_map)
   cfg.name = cfg_name
+  cfg._ue_session_owner = "android"
+  cfg._ue_session_operation = cfg_name:find("Launch", 1, true) and "launch" or "attach"
+  cfg._ue_device_id = sess.serial
+  cfg._ue_process_id = pid
   -- K33 diagnosis: pick the first current nvim breakpoint as the post-attach
   -- probe so post_run_commands logs `image lookup` + `breakpoint list` to
   -- stdpath('cache')/ue-dap-bp-diag.log. Non-mutating, does not resume.

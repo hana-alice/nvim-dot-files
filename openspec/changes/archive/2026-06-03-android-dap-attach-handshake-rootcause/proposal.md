@@ -1,7 +1,7 @@
 ## Why
 
 `<space>da` 连真机后两层问题，上一轮"修复"未解决且踩回已知崩溃坑。本轮 live probe
-（a3ad86f3，未改代码）暴露出一个**比断点更前置**的事实：attach 本身没稳。
+（ANDROID-SERIAL-A，未改代码）暴露出一个**比断点更前置**的事实：attach 本身没稳。
 
 证据（受控 DAP probe + 裸 gdb 握手）：
 - `lldb-server gdbserver --attach <pid>` 起来了、`TracerPid` 附上了、进程存活 11s 不崩；
@@ -43,7 +43,7 @@
 - **新增文件**：`docs/plans/2026-06-03-android-dap-handshake-rootcause.md`（诊断报告）；
   可选 `tools/dap_probe_android.py`（受控 DAP probe，纯诊断、可重复运行）。
 - **不改**：`lua/ue/dap/*.lua` 运行时；host adapter / device server 版本策略；设备系统；UE 工程。
-- **设备范围**：仅 `a3ad86f3`（arm64-v8a / Android 16；目标 `<android-package>`）。
+- **设备范围**：仅 `ANDROID-SERIAL-A`（arm64-v8a / Android 16；目标 `<android-package>`）。
 - **关键 live 证据（本轮）**：gdbserver 存活但 gdb 握手零响应；`Connection shut down by
   remote side while waiting for reply to initial handshake`；小进程同样零响应；libUE4.so
   base 每次冷启变（本轮 `0x6ca9e1d000`）。

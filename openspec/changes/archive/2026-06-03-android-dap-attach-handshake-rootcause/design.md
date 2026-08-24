@@ -1,6 +1,6 @@
 ## Context
 
-用户要求"be sure 这不是 workaround"。本轮 live probe（a3ad86f3，未改运行时代码）发现
+用户要求"be sure 这不是 workaround"。本轮 live probe（ANDROID-SERIAL-A，未改运行时代码）发现
 attach 比之前以为的更不稳——这改变了优先级：先查 root cause，再谈修复。
 
 本轮 live 证据（受控 DAP probe + 裸 socket 握手）：
@@ -19,7 +19,7 @@ lldb-dap 22.1.6 直连 gdb-remote 路径下崩溃 `3221226505`；这是第二个
 
 约束（`docs/CONSTRAINTS.md`）：host adapter 22.1.6+ forward-only、`stopOnEntry` 不动、
 无 `process continue`、SIGSEGV/SIGBUS 不动、改协议需 fresh protocol proof、hex 拼接
-禁 `string.format("%x")`、设备验证仅 a3ad86f3。
+禁 `string.format("%x")`、设备验证仅 ANDROID-SERIAL-A。
 
 ## Goals / Non-Goals
 
@@ -72,12 +72,12 @@ cause。备选（直接上 address 断点）被否：在握手都没通的情况
 - [3221226505 在握手不通时测不了] → 先解 root cause #1；#2 排在其后。
 - [probe 与真实 nvim 路径有差异] → probe 复刻 `lldb_dap_attach_config` 的命令序，
   结论需在真实 `<space>da` 复验。
-- [仅单机] → 明确 a3ad86f3。
+- [仅单机] → 明确 ANDROID-SERIAL-A。
 
 ## Migration Plan
 
 1. 写 `tools/dap_probe_android.py`（受控 attach + 分层 probe，参数化 MODE）。
-2. 在 a3ad86f3 跑 D2/D3 各层，收集 protocol log。
+2. 在 ANDROID-SERIAL-A 跑 D2/D3 各层，收集 protocol log。
 3. 写 `docs/plans/2026-06-03-android-dap-handshake-rootcause.md`（证据 + 结论 + 正解判据）。
 4. `git status` 仅 `docs/`、`tools/`、`openspec/`；无 `lua/` 改动。
 5. 回滚：删两个新文件。

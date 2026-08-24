@@ -1,7 +1,5 @@
 local M = {}
 
-local android_device = require("utils.android_device")
-
 local function project_name_from_uproject(trim, uproject)
   local name = trim(vim.fs.basename(uproject or ""))
   if name == "" then
@@ -174,49 +172,6 @@ local function desktop_launch_spec(env, ctx, driver)
   }
 end
 
-local function android_launch_command(env, ctx, serial)
-  local engine_root = ctx.engine_root or ""
-  local state = ctx.state or {}
-  local package_name = env.trim(state.android_package or "")
-  if package_name == "" then
-    package_name = env.trim(vim.fn.input("Android package name: ", ""))
-  end
-  if package_name == "" then
-    return nil, "Android package name is required"
-  end
-  if engine_root ~= "" and package_name ~= env.trim(state.android_package or "") then
-    env.update_state_field(engine_root, "android_package", package_name)
-  end
-
-  local adb = vim.fn.exepath("adb")
-  adb = adb ~= "" and adb or "adb"
-  if vim.fn.executable(adb) ~= 1 and not env.is_file(adb) then
-    return nil, "adb not found in PATH"
-  end
-
-  if not serial or serial == "" then
-    return nil, "Android serial is required"
-  end
-
-  local host_driver = env.host_driver or require("utils.platform").driver()
-  local plan = require("ue.targets").plan("Android", "launch", {
-    config_root = vim.fn.stdpath("config"),
-    cwd = vim.fn.getcwd(),
-    adb = adb,
-    device_id = serial,
-    package_name = package_name,
-  }, host_driver)
-  local cmd, cmd_err = require("ue.target_tasks").command(plan)
-  if not cmd then return nil, cmd_err end
-
-  return {
-    package_name = package_name,
-    serial = serial,
-    cmd = cmd,
-    plan = plan,
-  }
-end
-
 local function launch_desktop_process(env, spec)
   local exe = env.trim(spec and spec.exe or "")
   if exe == "" then
@@ -261,63 +216,6 @@ local function launch_desktop_process(env, spec)
   return true, tostring(jobid)
 end
 
-local function launch_android_process(env, spec)
-  local output = {}
-
-  local function append(data)
-    for _, line in ipairs(data or {}) do
-      line = env.trim(env.strip_ansi(line))
-      if line ~= "" then
-        output[#output + 1] = line
-      end
-    end
-  end
-
-  local ok, jobid = pcall(vim.fn.jobstart, spec.cmd, {
-    stdout_buffered = true,
-    stderr_buffered = true,
-    on_stdout = function(_, data)
-      append(data)
-    end,
-    on_stderr = function(_, data)
-      append(data)
-    end,
-    on_exit = function(_, code)
-      vim.schedule(function()
-        if code == 0 then
-          local device = spec.serial and (" on " .. spec.serial) or ""
-          require("utils.log").notify(
-            "ue_launch",
-            ("Android app launched: %s%s"):format(spec.package_name, device),
-            vim.log.levels.INFO
-          )
-          return
-        end
-        local detail = #output > 0 and ("\n" .. table.concat(output, "\n")) or ""
-        require("utils.log").notify_error("ue_launch", ("Android launch failed (exit %d)%s"):format(code, detail))
-      end)
-    end,
-  })
-  if not ok or not jobid or jobid <= 0 then
-    return false, "Failed to start adb launch job"
-  end
-  -- Register the adb-launch job for :Tasks list/cancel. Pure side-path:
-  -- register only, after job creation; on_exit above is untouched. (The
-  -- desktop launch_desktop_process job is intentionally detach=true /
-  -- fire-and-forget and NOT registered — same rationale as the short-lived
-  -- detach jobs excluded by the task-registry design.)
-  pcall(function()
-    require("utils.task_registry").register({
-      name = "UELaunch (" .. (spec.package_name or "android") .. ")",
-      group = "android",
-      kind = "job",
-      handle = jobid,
-      started_at = os.time(),
-    })
-  end)
-  return true
-end
-
 local function resolve_driver(env, ctx)
   local platform = env.target_platform(ctx.engine_root, nil)
   local host_driver = env.host_driver or require("utils.platform").driver()
@@ -329,18 +227,25 @@ local function resolve_driver(env, ctx)
 end
 
 local RESOLVE_STRATEGIES = {
-  ["android-device"] = function(env, ctx, driver)
-    local serial = android_device.get()
-    if not serial then
-      return nil, "Android device is not selected; run :UESetAndroidDevice"
+  workflow = function(env, _, driver)
+    local owner = require("ue.workflows").lookup(driver.id, "launch")
+    if not owner or type(owner.prepare) ~= "function" then
+      return nil, driver.id .. " launch workflow is unavailable"
     end
-    local spec, launch_err = android_launch_command(env, ctx, serial)
-    if not spec then
-      return nil, launch_err
-    end
-    spec.platform = driver.id
-    spec.kind = driver.id
-    return spec, ctx
+    local prepared, err = owner.prepare({
+      target_id = driver.id,
+      host_driver = env.host_driver,
+      context = env,
+    }, { prompt_device = false })
+    if not prepared then return nil, err end
+    return {
+      platform = driver.id,
+      kind = driver.id,
+      serial = prepared.snapshot.device.serial,
+      package_name = prepared.snapshot.runtime.package_name,
+      cmd = prepared.command,
+      plan = prepared.plan,
+    }, prepared.snapshot
   end,
   desktop = function(env, ctx, driver)
     local spec, launch_err = desktop_launch_spec(env, ctx, driver)
@@ -358,30 +263,19 @@ local RESOLVE_STRATEGIES = {
 }
 
 local LAUNCH_STRATEGIES = {
-  ["android-device"] = function(env, ctx)
-    local adb = vim.fn.exepath("adb")
-    adb = adb ~= "" and adb or "adb"
-    if vim.fn.executable(adb) ~= 1 and not env.is_file(adb) then
-      return false, "adb not found in PATH"
+  workflow = function(env, _, driver)
+    local function dispatch()
+      local context = vim.tbl_extend("force", {}, env, { reinvoke = dispatch })
+      return require("ue.workflows").dispatch(driver.id, "launch", {
+        host_driver = env.host_driver,
+        context = context,
+      })
     end
-
-    local function launch_on_serial(serial)
-      if not serial or serial == "" then return end
-      local spec, launch_err = android_launch_command(env, ctx, serial)
-      if not spec then
-        require("utils.log").notify_error("ue_launch", launch_err)
-        return
-      end
-      local ok, err_msg = launch_android_process(env, spec)
-      if not ok then
-        require("utils.log").notify_error("ue_launch", err_msg)
-      end
+    local result, err = dispatch()
+    if result == nil then
+      if type(err) ~= "table" then return true end
+      return false, err and (err.reason or err)
     end
-
-    android_device.ensure({
-      adb = adb,
-      prompt = "Select Android device for UE launch:",
-    }, launch_on_serial)
     return true
   end,
   desktop = function(env, ctx, driver)
@@ -456,15 +350,10 @@ end
 
 -- Pure command-shape seam for headless regression (no adb/device required).
 function M._android_launch_argv_for_test(adb, serial, package_name)
-  local host_driver = require("utils.platform.windows")
-  local plan = require("ue.targets").plan("Android", "launch", {
-    config_root = vim.fn.stdpath("config"),
-    cwd = vim.fn.getcwd(),
-    adb = adb,
-    device_id = serial,
-    package_name = package_name,
-  }, host_driver)
-  return require("ue.target_tasks").command(plan)
+  local host_driver = require("utils.platform")._driver_for_test("windows")
+  return require("ue.workflows").invoke(
+    "Android", "launch", "command", { adb, serial, package_name, host_driver }, host_driver
+  )
 end
 
 return M

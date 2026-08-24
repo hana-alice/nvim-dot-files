@@ -214,7 +214,7 @@ adb USB 往返 200–1000ms（调试会话期间 lldb-dap 抢占 adb server 更�
 
 ### 2026-07-14 — fix(ue): make project selection manual-only
 
-**Task** — `:UESetProject E:/aki/android_3.6_debug` was immediately ignored by `:UEBuild` while cwd/current buffer still belonged to `zeqiang_aki_3.6`, and a later `:UEPrepare` persisted the old project back into state.
+**Task** — `:UESetProject E:/Projects/SampleGame-Android-Debug` was immediately ignored by `:UEBuild` while cwd/current buffer still belonged to `SampleGame-3.6`, and a later `:UEPrepare` persisted the old project back into state.
 
 **Implemented**
 - `lua/ue.lua`: removed cwd/buffer project auto-discovery from `resolve_context()`; a project now comes only from the per-engine `state.json` written by `:UESetProject`.
@@ -232,7 +232,7 @@ adb USB 往返 200–1000ms（调试会话期间 lldb-dap 抢占 adb server 更�
 - `nvim --headless -l tests/run.lua ue_api` → 35/35 passed.
 - `nvim --headless -l tests/run.lua smoke` → 16/16 passed.
 - Full `nvim --headless -l tests/run.lua` → exit code 0 (27 spec files).
-- Re-ran `:UESetProject E:/aki/android_3.6_debug` under `D:/project/UEAKiDebug`; state now resolves `E:/aki/android_3.6_debug/Source/Client/Client.uproject`.
+- Re-ran `:UESetProject E:/Projects/SampleGame-Android-Debug` under `D:/UE/EngineWorktree`; state now resolves `E:/Projects/SampleGame-Android-Debug/Source/SampleGame/SampleGame.uproject`.
 
 **Follow-ups**
 - None.
@@ -250,7 +250,7 @@ adb USB 往返 200–1000ms（调试会话期间 lldb-dap 抢占 adb server 更�
 - Generated `.omx/context/ue-nvim-context.{json,md}` under the requested engine checkout.
 
 **Pitfalls / Gotchas**
-- `project_root` is not necessarily the `.uproject` directory. The current P4 layout stores `Client.uproject` under `Source/Client`, so the persisted exact `uproject` path must win over flat-root scanning.
+- `project_root` is not necessarily the `.uproject` directory. The current P4 layout stores `SampleGame.uproject` under `Source/SampleGame`, so the persisted exact `uproject` path must win over flat-root scanning.
 - Lua's `apk and nil or fallback` expression always selects the fallback when the true branch is `nil`; install fallback text is assigned explicitly instead.
 
 **Validation**
@@ -258,7 +258,7 @@ adb USB 往返 200–1000ms（调试会话期间 lldb-dap 抢占 adb server 更�
 - `nvim --headless -l tests/run.lua ue_api` → 35/35 passed.
 - `nvim --headless -l tests/run.lua keymaps` → 48/48 passed.
 - `nvim --headless -l tests/run.lua commands` → 83/83 passed.
-- Real export for the requested engine resolved the persisted P4 project, `Client.uproject`, `Android Development`, target `Client`, the engine's `Build.bat` argv, and `Client-arm64.apk`.
+- Real export for the requested engine resolved the persisted P4 project, `SampleGame.uproject`, `Android Development`, target `Client`, the engine's `Build.bat` argv, and `SampleGame-arm64.apk`.
 - Full `nvim --headless -l tests/run.lua` → exit code 0 (26 spec files; existing DAP prompt/noise only).
 - `git diff --check` → clean apart from pre-existing CRLF normalization warnings.
 
@@ -628,7 +628,7 @@ adb USB 往返 200–1000ms（调试会话期间 lldb-dap 抢占 adb server 更�
 
 **Task** — On a UE git worktree, `<space><space>` / `<leader>/` kept warning `:UEPrepare is stale (worktree changed since last run)` immediately after a successful `:UEPrepare`, even though no source file had changed. User report: "我已经 UEPrepare! 了为什么 space space 找文件还会提示 stale".
 
-**Root cause** — `prepare_freshness` anchored list freshness on `.git/index` mtime. On UE worktrees the engine `.git` is a `gitdir:` pointer into the main repo's `worktrees/<name>/` (here `D:/project/uetemp/.git` → `D:/project/UnrealEngine/.git/worktrees/uetemp`), and that per-worktree `index` is re-touched minutes after UEPrepare by git's always-on `fsmonitor--daemon` and TortoiseGit background refresh — without the working-tree file SET changing. So `index_mtime > list_mtime` → false "stale". (Observed: list 18:35:44, index re-touched 18:46:40 → 18:57:20 by background tooling.)
+**Root cause** — `prepare_freshness` anchored list freshness on `.git/index` mtime. On UE worktrees the engine `.git` is a `gitdir:` pointer into the main repo's `worktrees/<name>/` (here `D:/UE/EngineWorktree/.git` → `D:/UE/UnrealEngine/.git/worktrees/EngineWorktree`), and that per-worktree `index` is re-touched minutes after UEPrepare by git's always-on `fsmonitor--daemon` and TortoiseGit background refresh — without the working-tree file SET changing. So `index_mtime > list_mtime` → false "stale". (Observed: list 18:35:44, index re-touched 18:46:40 → 18:57:20 by background tooling.)
 
 **Implemented**
 - `lua/ue.lua`: replaced `git_index_mtime(repo_root)` with `git_commit_state_mtime(repo_root)` — same worktree-aware `.git` / `gitdir:` resolution, but anchors on the newest mtime of `HEAD` + `logs/HEAD` (commit-state) instead of `index` (staging area). `logs/HEAD` appends on every ref movement (commit / pull / merge / rebase / reset / checkout), so it captures fast-forwards that leave `HEAD`'s symref text unchanged.
@@ -692,7 +692,7 @@ adb USB 往返 200–1000ms（调试会话期间 lldb-dap 抢占 adb server 更�
 - Device residue (stray `lldb-server`, accumulated `adb forward`) caused false no-slide timeouts; `pkill -f lldb-server` + `adb forward --remove-all` between runs is required for clean D5 measurement.
 
 **Validation**
-- D1 gate (device `2e2df4cb`, target `MobileShadingRenderer.cpp:1367`, 3.5 matching symbols): channel B (evaluate) `resolved_after_plant=1`, `saw_breakpoint`, `stop.reason="breakpoint"`, `adapter_alive` → `livebp-gate.evaluate.result.json`; channel A (setBreakpoints) same hit → `livebp-gate.setbreakpoints.result.json`. **Conclusion: live feasible → 2A branch.**
+- D1 gate (device `ANDROID-SERIAL-B`, target `MobileShadingRenderer.cpp:1367`, 3.5 matching symbols): channel B (evaluate) `resolved_after_plant=1`, `saw_breakpoint`, `stop.reason="breakpoint"`, `adapter_alive` → `livebp-gate.evaluate.result.json`; channel A (setBreakpoints) same hit → `livebp-gate.setbreakpoints.result.json`. **Conclusion: live feasible → 2A branch.**
 - Production E2E (`livebp-e2e.result.json`): `production_live_plant_diag=true`, `saw_reattach_warning=false`, `breakpoint list resolved=1`, `stop.reason="breakpoint"` hits.
 - D5 slide check: `UE_DAP_NO_SLIDE=1` → attach timeout / `3221226505` (`noslide-preseed.result.json`); slide-present baseline immediately hits (`slide-recheck.result.json`) → slide kept.
 - `nvim --headless -l tests/run.lua dap` → 17/17 passed.
@@ -707,7 +707,7 @@ adb USB 往返 200–1000ms（调试会话期间 lldb-dap 抢占 adb server 更�
 **Task** — Remove the hardcoded banned 3.4 symbol library fallback that could silently short-circuit symbol auto-discovery, and tidy the F9 smoke evidence trail.
 
 **Implemented**
-- `lua/ue/dap/android.lua` `bootstrap_session`: removed the literal `E:/aki/zeqiang_aki_3.4/.../Client_Symbols_v170300916/Client-arm64/libUE4.so` fallback from the `ctx.android_symbol_lib` assignment. A literal path makes `pick_symbol_lib()` step 0 return it verbatim and skip the `packageInfo.txt` versionCode exact-match, so a stale build-id (`ad3d4e7c…`, 3.4) would attach and resolve breakpoints against the wrong source revision. Now falls through to config → packageInfo versionCode → newest-by-mtime glob → prompt (mirrors the `pick_package` nil fallthrough from `361b9e7`).
+- `lua/ue/dap/android.lua` `bootstrap_session`: removed the literal `E:/Projects/SampleGame-3.4/.../SampleGame_Symbols_v100000001/SampleGame-arm64/libUE4.so` fallback from the `ctx.android_symbol_lib` assignment. A literal path makes `pick_symbol_lib()` step 0 return it verbatim and skip the `packageInfo.txt` versionCode exact-match, so a stale build-id (`ad3d4e7c…`, 3.4) would attach and resolve breakpoints against the wrong source revision. Now falls through to config → packageInfo versionCode → newest-by-mtime glob → prompt (mirrors the `pick_package` nil fallthrough from `361b9e7`).
 - `tests/cases/dap_spec.lua`: added "bootstrap does not hardcode a symbol_lib fallback path" guarding against any `or "...libUE4.so"` fallback or string-literal `android_symbol_lib` assignment in `android.lua`.
 - `tools/evidence/android-f9/`: moved the five `nvim_android_dap_smoketest.*.result.json` smoke captures out of `tools/` into a dedicated evidence dir with a `README.md` index; updated the reference in `openspec/changes/fix-android-f9-breakpoint-hit/code-behavior-audit.md`.
 
@@ -720,7 +720,7 @@ adb USB 往返 200–1000ms（调试会话期间 lldb-dap 抢占 adb server 更�
 - `nvim --headless -l tests/run.lua structure` → 36/36 passed (evidence move did not break dir/structure guards).
 - `nvim --headless -l tests/run.lua` → 368/368 passed (full regression).
 - `openspec validate fix-android-f9-breakpoint-hit` → passed.
-- Source grep confirms no remaining `zeqiang_aki_3.4` / `Client_Symbols_v170300916` literal outside an explanatory comment.
+- Source grep confirms no remaining `SampleGame-3.4` / `SampleGame_Symbols_v100000001` literal outside an explanatory comment.
 
 **Follow-ups**
 - Optional: cross-check the picked symbol lib build-id against the device `libUE4.so` build-id at attach time and WARN on mismatch (honest-first), rather than trusting mtime alone.
@@ -750,23 +750,23 @@ adb USB 往返 200–1000ms（调试会话期间 lldb-dap 抢占 adb server 更�
 - The smoke harness must install the same `ue.setup_dap()` listeners used by real Neovim before attach; otherwise stackTrace/source guards are absent and line-0 attach frames create harness-only noise.
 - nvim-dap's initial `setBreakpoints` sync happens during session configuration even for attach-before breakpoints that were already preseeded into LLDB. Treating every Android `setBreakpoints` response as a session-time F9 change creates a false warning on the successful path.
 - Stripping `source` from all-synthetic Android frames avoids dap-src cursor errors but makes upstream nvim-dap emit `Source missing`; `line=-1` placeholder sources are the quieter non-jumpable shape.
-- The current `MobileShadingRenderer.cpp` on disk does not match the line table embedded in `Client_Symbols_v170300916/Client-arm64/libUE4.so`: local line 1367 is `Scene->UpdateMobileShadowSpotlight(nullptr);`, but LLDB resolves both source lines 1367 and 1369 to the compiled block at `FMobileSceneRenderer::Render + 672`, whose surrounding disassembly is the sky-atmosphere path. This is a source/symbol revision mismatch, not app-output evidence.
-- The matching symbol lib is the 3.5 `Client_Symbols_v171457238/Client-arm64/libUE4.so` build-id `648da3d17f2ac45ad0a6c5c1166cb248ae0baa1c`; with that symbol source, `MobileShadingRenderer.cpp:1367` resolves to the user's target line and hits.
+- The current `MobileShadingRenderer.cpp` on disk does not match the line table embedded in `SampleGame_Symbols_v100000001/SampleGame-arm64/libUE4.so`: local line 1367 is `Scene->UpdateMobileShadowSpotlight(nullptr);`, but LLDB resolves both source lines 1367 and 1369 to the compiled block at `FMobileSceneRenderer::Render + 672`, whose surrounding disassembly is the sky-atmosphere path. This is a source/symbol revision mismatch, not app-output evidence.
+- The matching symbol lib is the 3.5 `SampleGame_Symbols_v100000002/SampleGame-arm64/libUE4.so` build-id `648da3d17f2ac45ad0a6c5c1166cb248ae0baa1c`; with that symbol source, `MobileShadingRenderer.cpp:1367` resolves to the user's target line and hits.
 
 **Validation**
 - `nvim --headless -l tests/run.lua dap` -> 14/14 passed after the smoke parser and synthetic-frame guard updates.
-- Live Android smoke on `2e2df4cb`, `<android-package>`, fresh pid `25401`: `LaunchEngineLoop.cpp:4803` preseeded after ASLR rebase, `breakpoint list` resolved to `FEngineLoop::Tick() + 88`, DAP `setBreakpoints` returned `verified=true`, continue succeeded, and no `3221226505`; no breakpoint stop within 180s.
-- Live Android smoke on `2e2df4cb`, fresh pid `27308`: `MobileShadingRenderer.cpp:1361` preseeded after ASLR rebase, `breakpoint list` resolved to `FMobileSceneRenderer::Render(...) + 588`, DAP `setBreakpoints` returned `verified=true`, continue succeeded, and no `3221226505`; no breakpoint stop within 180s.
-- Live Android smoke on `2e2df4cb`, fresh pid `27308`: after entry-stop debounce, `LaunchEngineLoop.cpp:4803` preseeded after ASLR rebase, `breakpoint list` resolved to `FEngineLoop::Tick() + 88`, continue succeeded after 174 entry stops, adapter stayed alive, and no `invalid thread` storm; no breakpoint stop within 120s while the device remained on the GM/login screen.
-- Live Android smoke on `2e2df4cb`, active pid `27308`, target `MobileShadingRenderer.cpp:1369`: result JSON captured `breakpoint list` with `locations=1`, `resolved=1`, `hit count=0`, location `FMobileSceneRenderer::Render(...) + 672 at MobileShadingRenderer.cpp:1369:8`, address `0x0000007838794c4c`; target `image lookup` returned four line matches; DAP `setBreakpoints` returned adapter-native `verified=true` and local source mapping; no `reason="breakpoint"` stop within 120s.
+- Live Android smoke on `ANDROID-SERIAL-B`, `<android-package>`, fresh pid `25401`: `LaunchEngineLoop.cpp:4803` preseeded after ASLR rebase, `breakpoint list` resolved to `FEngineLoop::Tick() + 88`, DAP `setBreakpoints` returned `verified=true`, continue succeeded, and no `3221226505`; no breakpoint stop within 180s.
+- Live Android smoke on `ANDROID-SERIAL-B`, fresh pid `27308`: `MobileShadingRenderer.cpp:1361` preseeded after ASLR rebase, `breakpoint list` resolved to `FMobileSceneRenderer::Render(...) + 588`, DAP `setBreakpoints` returned `verified=true`, continue succeeded, and no `3221226505`; no breakpoint stop within 180s.
+- Live Android smoke on `ANDROID-SERIAL-B`, fresh pid `27308`: after entry-stop debounce, `LaunchEngineLoop.cpp:4803` preseeded after ASLR rebase, `breakpoint list` resolved to `FEngineLoop::Tick() + 88`, continue succeeded after 174 entry stops, adapter stayed alive, and no `invalid thread` storm; no breakpoint stop within 120s while the device remained on the GM/login screen.
+- Live Android smoke on `ANDROID-SERIAL-B`, active pid `27308`, target `MobileShadingRenderer.cpp:1369`: result JSON captured `breakpoint list` with `locations=1`, `resolved=1`, `hit count=0`, location `FMobileSceneRenderer::Render(...) + 672 at MobileShadingRenderer.cpp:1369:8`, address `0x0000007838794c4c`; target `image lookup` returned four line matches; DAP `setBreakpoints` returned adapter-native `verified=true` and local source mapping; no `reason="breakpoint"` stop within 120s.
 - The same `1369` smoke emitted the active-session reattach warning, did not emit `Vim:E474` or `Source missing`, left `<android-package>` alive with `TracerPid=0`, and left no `lldb-server` process.
 - Local LLDB symbol audit with `C:/tools/llvm-22.1.6/bin/lldb.exe`: `image lookup --file MobileShadingRenderer.cpp --line 1367` and `--line 1369` both resolve to `FMobileSceneRenderer::Render(...) + 672/+676/+712/+720 at MobileShadingRenderer.cpp:1369:8`; disassembly around `libUE4.so[0xef74c4c]` shows the resolved block is gated by `ShouldRenderSkyAtmosphere`, while the currently checked-out local source has `Scene->UpdateMobileShadowSpotlight(nullptr);` at line 1367.
-- Build-id audit: device `libUE4.so` is `648da3d17f2ac45ad0a6c5c1166cb248ae0baa1c`; old 3.4 symbol lib is `ad3d4e7c5f83823edbea33d7a9d5b13cb9153afc`; 3.5 `Client_Symbols_v171457238/Client-arm64/libUE4.so` matches the device build-id.
+- Build-id audit: device `libUE4.so` is `648da3d17f2ac45ad0a6c5c1166cb248ae0baa1c`; old 3.4 symbol lib is `ad3d4e7c5f83823edbea33d7a9d5b13cb9153afc`; 3.5 `SampleGame_Symbols_v100000002/SampleGame-arm64/libUE4.so` matches the device build-id.
 - Local LLDB symbol audit with the matching 3.5 lib: `image lookup --file MobileShadingRenderer.cpp --line 1367` returns one match, `FMobileSceneRenderer::Render(...) + 616 at MobileShadingRenderer.cpp:1367:2`, address offset `libUE4.so[0x00000000166e9a80]`.
-- Live Android smoke on `2e2df4cb`, active pid `27308`, target `D:/project/uetemp/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp:1367`, matching 3.5 symbols: preseeded breakpoint resolved to `address=0x000000783ff09a80`, continue ran after 179 attach SIGSTOP entry stops, then DAP emitted `reason="breakpoint"` / `description="breakpoint 1.1 2.1"` with `hitBreakpointIds=[1,2]`.
-- The same matching-symbol smoke captured stackTrace frame 0 as `FMobileSceneRenderer::Render(FRHICommandListImmediate&, bool)` at local source `D:/project/uetemp/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp:1367`, proving the stop-frame local source mapping.
+- Live Android smoke on `ANDROID-SERIAL-B`, active pid `27308`, target `D:/UE/EngineWorktree/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp:1367`, matching 3.5 symbols: preseeded breakpoint resolved to `address=0x000000783ff09a80`, continue ran after 179 attach SIGSTOP entry stops, then DAP emitted `reason="breakpoint"` / `description="breakpoint 1.1 2.1"` with `hitBreakpointIds=[1,2]`.
+- The same matching-symbol smoke captured stackTrace frame 0 as `FMobileSceneRenderer::Render(FRHICommandListImmediate&, bool)` at local source `D:/UE/EngineWorktree/Engine/Source/Runtime/Renderer/Private/MobileShadingRenderer.cpp:1367`, proving the stop-frame local source mapping.
 - Post-smoke system cleanup: `<android-package>` remained alive at pid `27308`, `/proc/27308/status` reported `State: S (sleeping)` and `TracerPid: 0`, `pidof lldb-server` returned none, and host `Get-Process lldb/lldb-dap` returned none.
-- Local LLDB symbol audit with `C:/tools/llvm-22.1.6/bin/lldb.exe`: `image lookup --name FEngineLoop::Tick` resolved to `D:\project\uetemp\Engine\Source\Runtime\Launch\Private\LaunchEngineLoop.cpp:4802`; source-file `breakpoint set -f LaunchEngineLoop.cpp -l 4802/4803` resolved under K30 without adapter crash, so address fallback remains intentionally unimplemented.
+- Local LLDB symbol audit with `C:/tools/llvm-22.1.6/bin/lldb.exe`: `image lookup --name FEngineLoop::Tick` resolved to `D:\UE\EngineWorktree\Engine\Source\Runtime\Launch\Private\LaunchEngineLoop.cpp:4802`; source-file `breakpoint set -f LaunchEngineLoop.cpp -l 4802/4803` resolved under K30 without adapter crash, so address fallback remains intentionally unimplemented.
 - Full regression `nvim --headless -l tests/run.lua` -> 366/366 passed.
 - `openspec validate fix-android-f9-breakpoint-hit` -> passed.
 
@@ -793,8 +793,8 @@ adb USB 往返 200–1000ms（调试会话期间 lldb-dap 抢占 adb server 更�
 **Validation**
 - `nvim --headless -l tests/run.lua utils` → 30/30 passed.
 - `nvim --headless -l tests/run.lua grep_cache` → 21/21 passed.
-- Real csearch stream probe from `D:/project/uetemp` for `r.useLandscape` with `ignore_case=true` → 14 hits, `code=0`.
-- Direct `rg -n -i -F "r.useLandscape"` over `D:/project/uetemp/Engine` + `E:/aki/zeqiang_aki_3.5/Source/Client` → 14 hits.
+- Real csearch stream probe from `D:/UE/EngineWorktree` for `r.useLandscape` with `ignore_case=true` → 14 hits, `code=0`.
+- Direct `rg -n -i -F "r.useLandscape"` over `D:/UE/EngineWorktree/Engine` + `E:/Projects/SampleGame-3.5/Source/SampleGame` → 14 hits.
 - Full regression: `nvim --headless -l tests/run.lua` → 360/360 passed.
 
 **Follow-ups**
@@ -822,8 +822,8 @@ adb USB 往返 200–1000ms（调试会话期间 lldb-dap 抢占 adb server 更�
 - `nvim --headless -l tests/run.lua ue_api` → 34/34 passed.
 - `nvim --headless -l tests/run.lua grep_cache` → 19/19 passed.
 - `nvim --headless -l tests/run.lua utils` → 29/29 passed.
-- Real cache repair: restored `D:/project/uetemp/.cache/nvim-ue/csearch/Android-Development/csearch.idx` from the valid staged index; final index is >300 MB.
-- Real backend probe from `D:/project/uetemp`: `current_backend(...)` → `csearch`, title seam → `Grep All Code (Engine+Project) [csearch]`.
+- Real cache repair: restored `D:/UE/EngineWorktree/.cache/nvim-ue/csearch/Android-Development/csearch.idx` from the valid staged index; final index is >300 MB.
+- Real backend probe from `D:/UE/EngineWorktree`: `current_backend(...)` → `csearch`, title seam → `Grep All Code (Engine+Project) [csearch]`.
 - Real csearch stream probe for `VulkanRHI` with `max_count=1` → 1 hit, `on_done=true`.
 - Full regression: `nvim --headless -l tests/run.lua` → 357/357 passed.
 
@@ -939,20 +939,20 @@ adb USB 往返 200–1000ms（调试会话期间 lldb-dap 抢占 adb server 更�
 **Follow-ups**
 - 归档本 openspec change `ai-persistent-dev-refactor`；`decisions/` 是否物理收纳 `docs/plans/` ADR 留作后续 `git mv` change。
 
-### 2026-06-02 — fix(dap/android): resolve Source/Client project-root layout for <space>da
+### 2026-06-02 — fix(dap/android): resolve Source/SampleGame project-root layout for <space>da
 
-**Task** — User reported `<space>da` / `:UEDAPAttach android` error and asked to read the local docs plus config rules before fixing. The captured DAP protocol log showed `process attach --pid ...` failed with `lost connection`, followed by `target symbols add ... does not match any existing module`; the earlier probe also showed context project_root was `E:/aki/zeqiang_aki_3.4/Source/Client`.
+**Task** — User reported `<space>da` / `:UEDAPAttach android` error and asked to read the local docs plus config rules before fixing. The captured DAP protocol log showed `process attach --pid ...` failed with `lost connection`, followed by `target symbols add ... does not match any existing module`; the earlier probe also showed context project_root was `E:/Projects/SampleGame-3.4/Source/SampleGame`.
 
 **Implemented**
 - `lua/ue/dap/android.lua`
-  - Added `android_marker_path(root)` so Android cook outputs are resolved from both repository-root layout (`<root>/Source/Client/Binaries/Android`) and UE project-root layout (`<root>/Binaries/Android`).
-  - Updated `read_package_info`, `discover_project_root`, `effective_project_root`, and `pick_symbol_lib` to use that marker instead of hard-coding `Source/Client` under every candidate root.
+  - Added `android_marker_path(root)` so Android cook outputs are resolved from both repository-root layout (`<root>/Source/SampleGame/Binaries/Android`) and UE project-root layout (`<root>/Binaries/Android`).
+  - Updated `read_package_info`, `discover_project_root`, `effective_project_root`, and `pick_symbol_lib` to use that marker instead of hard-coding `Source/SampleGame` under every candidate root.
   - `effective_project_root(ctx)` now probes `ctx.project_root`, `ctx.uproject` dir, project parent/grandparent, config roots, buffer, and cwd; it treats `engine_root` only as a discovery start, not as a project root fallback.
-  - `pick_source_map(ctx)` now also goes through `effective_project_root(ctx)`, so DWARF root `D:\project\uetemp` maps to the actual local project root instead of accidentally using engine_root when the current buffer is under Engine.
+  - `pick_source_map(ctx)` now also goes through `effective_project_root(ctx)`, so DWARF root `D:\UE\EngineWorktree` maps to the actual local project root instead of accidentally using engine_root when the current buffer is under Engine.
   - Added `_pick_source_map_for_test` alongside existing test hooks.
 
 **Pitfalls / Gotchas**
-- `ue.resolve_context()` can legitimately return project_root as the `.uproject` directory (`.../Source/Client`), not the repository root. Appending `/Source/Client/Binaries/Android` to that doubles the path and causes package/symbol discovery to miss cooked outputs.
+- `ue.resolve_context()` can legitimately return project_root as the `.uproject` directory (`.../Source/SampleGame`), not the repository root. Appending `/Source/SampleGame/Binaries/Android` to that doubles the path and causes package/symbol discovery to miss cooked outputs.
 - `nvim --headless -u NONE` does not load the normal `ue` setup state, so context-driven verification must pass an explicit ctx table; otherwise the picker prompts and the script appears to hang.
 - The recorded `target symbols add ... does not match any existing module` was downstream of failed attach (`lost connection`), not primary proof that the symbol file was wrong. The fixed discovery is still required because the previous root contract could pick/prompt wrong paths before attach.
 
@@ -961,10 +961,10 @@ adb USB 往返 200–1000ms（调试会话期间 lldb-dap 抢占 adb server 更�
 - `loadfile("lua/ue/dap/android.lua")` exits 0.
 - `require("ue.dap.android")` succeeds and `_pick_source_map_for_test` is registered.
 - Headless explicit-ctx probe:
-  - `effective_project_root=E:/aki/zeqiang_aki_3.4/Source/Client`
+  - `effective_project_root=E:/Projects/SampleGame-3.4/Source/SampleGame`
   - `package=<android-package>`
-  - `symbol=E:/aki/zeqiang_aki_3.4/Source/Client/Binaries/Android/Client_Symbols_v170300916/Client-arm64/libUE4.so`
-  - attach config includes `target symbols add` for that exact host DWARF file and sourceMap `D:\project\uetemp -> E:/aki/zeqiang_aki_3.4/Source/Client`.
+  - `symbol=E:/Projects/SampleGame-3.4/Source/SampleGame/Binaries/Android/SampleGame_Symbols_v100000001/SampleGame-arm64/libUE4.so`
+  - attach config includes `target symbols add` for that exact host DWARF file and sourceMap `D:\UE\EngineWorktree -> E:/Projects/SampleGame-3.4/Source/SampleGame`.
 
 **Follow-ups**
 - Full user-path verification still requires live Neovide/device `<space>da`: the protocol-level log currently proves the old attach reached `platform connect` then lost connection at `process attach`; this patch fixes the project-root discovery contract and stale path construction, but cannot guarantee the device-side lldb-server connection without a live attach run.
@@ -972,7 +972,7 @@ adb USB 往返 200–1000ms（调试会话期间 lldb-dap 抢占 adb server 更�
 
 ### 2026-05-28 — UE cache invalidation: setproject auto-invalidates, freshness uses external anchors, picker lazy-starts watcher
 
-**Task** — The `<space><space>` picker and `:UEPrepare` were silently returning 5/14-era results on `D:\project\uetemp` after `z uetemp` + `:UESetProject E:\aki\zeqiang_aki_3.4` + build. Three compounding bugs hid behind one symptom.
+**Task** — The `<space><space>` picker and `:UEPrepare` were silently returning 5/14-era results on `D:\UE\EngineWorktree` after `z uetemp` + `:UESetProject E:\Projects\SampleGame-3.4` + build. Three compounding bugs hid behind one symptom.
 
 **Implemented**
 - `lua/ue.lua` — `set_project()` wrapped in `do ... end` + exposed as `CORE_RT.set_project` (dodges the 200-local LuaJIT cap). When `state.project_root` differs from incoming `project_root`, calls new `invalidate_project_scoped_cache(engine_root, "switch")` which removes the project file lists (project.files / workspace.files / workspace_all.files), csearch index (idx + ~ + ~~), gtags DBs under both `gtags_root` and `workspace_db`, all 4 cdb shards, `index_state` / `index_queue`, `dirty.json`, and every `*.idx` under `clangd/index/`. Clears `freshness_notified` + `context_cache` and stops/clears the watcher. Loud WARN toast lists what was invalidated and instructs the user to run `:UEPrepare` (or `:UEPrepare!`). **No auto-prepare** — explicit user-rule.
@@ -993,11 +993,11 @@ adb USB 往返 200–1000ms（调试会话期间 lldb-dap 抢占 adb server 更�
 - `luac -p` silent pass on both `lua/ue.lua` (9473 lines) and `lua/utils/code_search/init.lua` (499 lines).
 - `nvim --headless ... loadfile()` returns a function for both (LuaJIT parse).
 - Live nvim `M.setup()` registers all 5 expected commands with correct bang flag: `UEPrepare BANG-OK`, `UEPrepareIncremental noBang`, `UEPrepareReindex noBang`, `UESetProject noBang`, `UEWatchStatus noBang`.
-- worktree-aware `git_index_mtime("D:/project/uetemp")` returned `1779855279` (vs old broken path returning `0`).
+- worktree-aware `git_index_mtime("D:/UE/EngineWorktree")` returned `1779855279` (vs old broken path returning `0`).
 - Live anchor comparison on the actual failure case: list mtime 1778734024 (5/14) vs project_root dir mtime 1779351832, engine_root dir mtime 1779937352, state.updated_at epoch ~ 1779887792 -> max anchor far exceeds list -> `prepare_freshness` correctly returns `stale`.
 
 **Follow-ups**
-- Run `:UESetProject E:\aki\zeqiang_aki_3.4` on `D:\project\uetemp` and confirm: WARN toast with invalidation summary, then the picker shows freshness banner, then `:UEPrepare` / `:UEPrepareIncremental` both work.
+- Run `:UESetProject E:\Projects\SampleGame-3.4` on `D:\UE\EngineWorktree` and confirm: WARN toast with invalidation summary, then the picker shows freshness banner, then `:UEPrepare` / `:UEPrepareIncremental` both work.
 - Update `hermes-windows-io-traps` skill with the "hermes stderr noise appended into edited file" trap.
 - Extend invalidation hook to `:UESetUproject` and other state-changing config commands.
 
@@ -1007,7 +1007,7 @@ adb USB 往返 200–1000ms（调试会话期间 lldb-dap 抢占 adb server 更�
 ## 2026-05-28 (#2) - Engine/Config 没进文件 picker / csearch
 
 **Issue**
-`<space><space>` 文件 picker 找不到 engine 那份 `AndroidEngine.ini`（`D:\project\uetemp\Engine\Config\Android\AndroidEngine.ini`），只能找到 project 那份。`rg AndroidEngine.ini workspace_all.files` 确认 engine 那份**根本没进 list**。
+`<space><space>` 文件 picker 找不到 engine 那份 `AndroidEngine.ini`（`D:\UE\EngineWorktree\Engine\Config\Android\AndroidEngine.ini`），只能找到 project 那份。`rg AndroidEngine.ini workspace_all.files` 确认 engine 那份**根本没进 list**。
 
 **Root cause**
 `UE_CONST.ENGINE_INDEX_DIRS = { "Engine/Source", "Engine/Plugins", "Engine/Shaders" }` —— **没有 `Engine/Config`**。project 侧 `PROJECT_INDEX_DIRS` 有 `Config`，engine 侧没有，不对称。`scan_relative_files` 走 `fd --search-path <whitelist>`，目录不在白名单就永远扫不到。文件扩展名层面没过滤（fd 全收），所以单纯加目录就够。
@@ -1018,7 +1018,7 @@ adb USB 往返 200–1000ms（调试会话期间 lldb-dap 抢占 adb server 更�
 **Validation**
 - `luac -p lua/ue.lua` silent pass (9474 lines)
 - nvim --headless `require("ue").setup()` ENGINE_INDEX_DIRS 内容: `Engine/Source, Engine/Plugins, Engine/Shaders, Engine/Config`，5 commands 全 REG
-- `D:\project\uetemp\Engine\Config` 文件总数 = 85（list 增量可忽略）
+- `D:\UE\EngineWorktree\Engine\Config` 文件总数 = 85（list 增量可忽略）
 
 **Follow-ups**
 - 用户重启 nvim 后必须 `:UEPrepare!`（bang 强制重扫），否则 ENGINE_INDEX_DIRS 改了但 anchor mtime 没变，freshness 仍判 fresh，list 不会重生
@@ -1031,10 +1031,10 @@ adb USB 往返 200–1000ms（调试会话期间 lldb-dap 抢占 adb server 更�
 ## 2026-05-28 (#3) - csearch 漏 project 侧整个 CSharpScript / TypeScript / Config 树
 
 **Issue**
-用户希望 csearch 收 .ini / .ts / .cs，结果发现 csearch grep 完全搜不到 `E:\aki\zeqiang_aki_3.4\Source\Client\CSharpScript\...` 下的内容（GameSettingsConfig 0 hits），也搜不到 .ini 里的常见 token（AndroidPackageName 在 .ini 0 hits / .cpp 40 hits）。但 workspace_all.files 里这些路径都在。
+用户希望 csearch 收 .ini / .ts / .cs，结果发现 csearch grep 完全搜不到 `E:\Projects\SampleGame-3.4\Source\SampleGame\CSharpScript\...` 下的内容（GameSettingsConfig 0 hits），也搜不到 .ini 里的常见 token（AndroidPackageName 在 .ini 0 hits / .cpp 40 hits）。但 workspace_all.files 里这些路径都在。
 
 **Root cause**
-跨盘符 (project 在 E:，engine 在 D:) 导致 `workspace_root()` 退化为 `engine_root = D:/project/uetemp`，然后 `_ufs.relative_to(root, project_abs_path)` 因 `path_has_prefix` false → **返回原绝对路径**，所以 workspace_all 列表里 project 侧文件全是绝对路径 `E:/aki/...` 开头。但 ue.lua 三处构造 cindex `csearch_filelist.txt` 时无脑 `fout:write(cs_root, "/", rel, "\n")`，对 project 文件拼出 `D:/project/uetemp/E:/aki/.../GameSettingsConfig.cs` 这种荒诞路径 → cindex `os.Stat` fail → skipped++ → **整个 project 树（含 CSharpScript / TypeScript / Source / Config / Plugins）在 csearch 索引里完全不存在**。
+跨盘符 (project 在 E:，engine 在 D:) 导致 `workspace_root()` 退化为 `engine_root = D:/UE/EngineWorktree`，然后 `_ufs.relative_to(root, project_abs_path)` 因 `path_has_prefix` false → **返回原绝对路径**，所以 workspace_all 列表里 project 侧文件全是绝对路径 `E:/Projects/...` 开头。但 ue.lua 三处构造 cindex `csearch_filelist.txt` 时无脑 `fout:write(cs_root, "/", rel, "\n")`，对 project 文件拼出 `D:/UE/EngineWorktree/E:/Projects/.../GameSettingsConfig.cs` 这种荒诞路径 → cindex `os.Stat` fail → skipped++ → **整个 project 树（含 CSharpScript / TypeScript / Source / Config / Plugins）在 csearch 索引里完全不存在**。
 
 只有 engine 侧（`Engine/...` 相对路径）拼出来是有效的，所以 csearch 看起来"能工作"，掩盖了 50%+ 文件缺失。
 
@@ -1046,7 +1046,7 @@ adb USB 往返 200–1000ms（调试会话期间 lldb-dap 抢占 adb server 更�
 **Validation**
 - `luac -p` 两文件 silent pass (ue.lua 9497 行 / code_search 502 行)
 - nvim --headless setup() 5 commands 全 REG
-- `is_absolute_path("E:/aki/x.cs") = "E:/"` (truthy), `"Engine/Source/X.cpp" = nil` (falsy)
+- `is_absolute_path("E:/Projects/x.cs") = "E:/"` (truthy), `"Engine/Source/X.cpp" = nil` (falsy)
 
 **Validation pending (用户重启 nvim 后)**
 - `:UEPrepare!` 强制重建（必须 bang，老 list/idx mtime 不能触发 freshness）
@@ -1090,7 +1090,7 @@ adb USB 往返 200–1000ms（调试会话期间 lldb-dap 抢占 adb server 更�
 
 **Issue**
 `gd UE_BUILD_DEVELOPMENT` in nvim jumped into
-`E:\aki\zeqiang_aki_3.4\Source\Client\Intermediate\Build\Android\Client\Development\VulkanRHI\Definitions.VulkanRHI.h`
+`E:\Projects\SampleGame-3.4\Source\SampleGame\Intermediate\Build\Android\Client\Development\VulkanRHI\Definitions.VulkanRHI.h`
 even though the current build config was Test (the .so was Test-built, the
 `Test/VulkanRHI/Definitions.VulkanRHI.h` exists with `#define UE_BUILD_TEST 1`,
 no `UE_BUILD_DEVELOPMENT` anywhere in Test/).
@@ -1164,7 +1164,7 @@ Three pieces:
 - `loadfile()` on ue.lua returns function (LuaJIT parse OK).
 - `nvim --headless` setup() registers 4 commands: `UECDBPartition REG`,
   `UECDBSwitch REG`, `UECDBStatus REG`, `UEPrepare REG` (no stderr noise).
-- Standalone partition script tested on real CDB (`D:\project\uetemp\compile_commands.json`,
+- Standalone partition script tested on real CDB (`D:\UE\EngineWorktree\compile_commands.json`,
   15756 cmds): produces 5 per-group files, base shrinks from 217.9 MB →
   215.6 MB (15614 cmds = 13640 Android-Test + 1974 shaders), manifest
   correct, collision logic puts `(Android,Client,Dev)` 30 cmds and
@@ -1205,7 +1205,7 @@ Three pieces:
 
 **Issue**
 
-After the Source/Client project-root fix, live `<space>da` still failed. Fresh logs at 11:19 showed `platform connect` succeeded, but `process attach --pid 20595` returned `error: attach failed: lost connection`; the adapter then emitted `process exited during launch or attach`, `failed to retrieve threads from process`, and dap-ui's threads panel crashed on the failed response.
+After the Source/SampleGame project-root fix, live `<space>da` still failed. Fresh logs at 11:19 showed `platform connect` succeeded, but `process attach --pid 20595` returned `error: attach failed: lost connection`; the adapter then emitted `process exited during launch or attach`, `failed to retrieve threads from process`, and dap-ui's threads panel crashed on the failed response.
 
 **Root cause**
 
@@ -1319,23 +1319,23 @@ Validation:
 Follow-up:
 - Next fix should target the device/ptrace attach boundary, not dapui. Do not change `stopOnEntry`, `process continue`, or SIGSEGV/SIGBUS policy without a fresh protocol proof.
 
-## 2026-06-02 — Android DAP gdbserver attach on a3ad86f3
+## 2026-06-02 — Android DAP gdbserver attach on ANDROID-SERIAL-A
 
-- Task: continue the UE Android nvim-dap/lldb-dap attach fix, with validation limited to adb serial `a3ad86f3`.
+- Task: continue the UE Android nvim-dap/lldb-dap attach fix, with validation limited to adb serial `ANDROID-SERIAL-A`.
 - Completed:
   - Replaced the Android attach command path from `platform select/connect` + `process attach --pid` with a pre-spawned `lldb-server gdbserver --attach <pid>` and lldb-dap `gdb-remote 127.0.0.1:<port>` attach command.
   - Stage `lldb-server` through `/data/local/tmp/lldb-server`, then copy it into the app sandbox as `files/lldb-server`; Android 16 rejects executing the public `/data/local/tmp` binary through `run-as`, while the sandbox copy executes correctly.
   - Cleanup now kills app-uid lldb-server via `run-as`, removes the adb forward, and sends `kill -CONT` as the app uid when possible.
   - `:UEDAPStatus` now reports the server mode (`gdbserver`).
 - Pitfalls / evidence:
-  - On `a3ad86f3`, platform mode connected but `process attach --pid` reported `lost connection`, then the deferred DAP attach response failed with `process exited during launch or attach`; `threads` failed.
+  - On `ANDROID-SERIAL-A`, platform mode connected but `process attach --pid` reported `lost connection`, then the deferred DAP attach response failed with `process exited during launch or attach`; `threads` failed.
   - `settings set target.memory-module-load-level minimal` did not solve the platform path: attach still stalled while the target was in `t (tracing stop)` with a live lldb-server tracer.
-  - Bare gdbserver attach on `a3ad86f3` reached `initialized`, `configurationDone`, a successful `attach` response, and successful `threads` enumeration through lldb-dap.
+  - Bare gdbserver attach on `ANDROID-SERIAL-A` reached `initialized`, `configurationDone`, a successful `attach` response, and successful `threads` enumeration through lldb-dap.
   - `disconnect` in the bare probe can still leave the process in `T (stopped)`; recovery was `am force-stop` + relaunch. Keep using the production two-phase stop path and app-uid cleanup.
 - Verification:
   - Headless Neovim parse/load smoke passed for `lua/ue/dap/android.lua`.
   - Headless config smoke confirmed first attach command is `gdb-remote 127.0.0.1:5039` and no `platform connect` / `process attach --pid` command is emitted.
-  - Device-only verification was performed on adb serial `a3ad86f3`; final device state: app relaunched, `TracerPid: 0`, no `lldb-server` process, no adb forwards.
+  - Device-only verification was performed on adb serial `ANDROID-SERIAL-A`; final device state: app relaunched, `TracerPid: 0`, no `lldb-server` process, no adb forwards.
 - Follow-up:
   - Validate once through the real user entry path (`<space>da` / `:UEDAPAttach android`) in Neovide, because headless/bare-DAP probes cannot fully prove the UI path.
 
@@ -1351,8 +1351,8 @@ Follow-up:
   - A bare "failed to stage" message hid whether public staging, run-as copy, chmod, or stat failed; include expected/got size and run-as directory details.
 - Verification:
   - Headless Lua parse/load smoke passed for `utils.ue_launch` and `ue.dap.android`.
-  - Headless simulated multi-device launch selected `a3ad86f3` and produced `adb -s a3ad86f3 shell monkey ...`.
-  - Real-device checks were limited to adb serial `a3ad86f3`: monkey launch succeeded; target process was alive with `TracerPid: 0`; sandbox `files/lldb-server` exists and runs `version`.
+  - Headless simulated multi-device launch selected `ANDROID-SERIAL-A` and produced `adb -s ANDROID-SERIAL-A shell monkey ...`.
+  - Real-device checks were limited to adb serial `ANDROID-SERIAL-A`: monkey launch succeeded; target process was alive with `TracerPid: 0`; sandbox `files/lldb-server` exists and runs `version`.
 - Follow-up:
   - Current Neovide may need restart/manual reload because it runs embedded and may keep stale Lua closures.
 
@@ -1369,28 +1369,28 @@ Follow-up:
   - Passing a single remote shell string (`run-as <pkg> sh -c '<cmd>'`) correctly starts in `/data/user/0/<pkg>`.
 - Verification:
   - Headless Lua parse passed for `lua/ue/dap/android.lua`.
-  - Real-device staging command on adb serial `a3ad86f3` now reports `PWD=/data/user/0/<android-package>`, `STAT_SIZE=17190248`, and `files/lldb-server version` succeeds.
-  - Cleanup verified on `a3ad86f3`: no adb forwards, no lldb-server, target `TracerPid: 0`.
+  - Real-device staging command on adb serial `ANDROID-SERIAL-A` now reports `PWD=/data/user/0/<android-package>`, `STAT_SIZE=17190248`, and `files/lldb-server version` succeeds.
+  - Cleanup verified on `ANDROID-SERIAL-A`: no adb forwards, no lldb-server, target `TracerPid: 0`.
 - Follow-up:
   - Running Neovide is still embedded, so restart Neovide to load this patch before retesting `<space>da`.
 
 ## 2026-06-02 - Android DAP lldb-server latest-version probe
 
-Task: temporarily test the Android DAP path on adb serial `a3ad86f3` with the newest available device-side `lldb-server` instead of the UE/NDK21-pinned binary.
+Task: temporarily test the Android DAP path on adb serial `ANDROID-SERIAL-A` with the newest available device-side `lldb-server` instead of the UE/NDK21-pinned binary.
 
 Completed:
-- Cleaned the active debugger state only on `a3ad86f3` (`lldb-server` processes and adb forwards), leaving the game process alive.
+- Cleaned the active debugger state only on `ANDROID-SERIAL-A` (`lldb-server` processes and adb forwards), leaving the game process alive.
 - Probed local Android lldb-server candidates on-device and selected the newest runnable binary:
-  `C:/Users/lizeqiang/AppData/Local/Programs/Android Studio 2/plugins/android-ndk/resources/lldb/android/arm64-v8a/lldb-server`
+  `C:/Users/<USER>/AppData/Local/Programs/Android Studio 2/plugins/android-ndk/resources/lldb/android/arm64-v8a/lldb-server`
   (`lldb version 19.0.1`, size `45818944`).
 - Staged that LLDB 19 binary to both `/data/local/tmp/lldb-server` and the app sandbox `files/lldb-server` via `run-as <android-package>`.
 - Temporarily changed `lua/utils/platform/windows.lua` candidate priority so `:UEDAPAttach android` will pick the Android Studio bundled LLDB 19 binary first during this probe instead of immediately re-staging NDK21.
-- Verified with a bare DAP probe using host `C:/tools/lldb-22/install/bin/lldb-dap.exe` + device `lldb-server gdbserver --attach` on `a3ad86f3`: `initialize`, `gdb-remote`, `configurationDone`, `attach`, `threads`, and `disconnect` all succeeded.
+- Verified with a bare DAP probe using host `C:/tools/lldb-22/install/bin/lldb-dap.exe` + device `lldb-server gdbserver --attach` on `ANDROID-SERIAL-A`: `initialize`, `gdb-remote`, `configurationDone`, `attach`, `threads`, and `disconnect` all succeeded.
 
 Verification:
 - `/data/local/tmp/lldb-server version` and app sandbox `files/lldb-server version` both report `lldb version 19.0.1`.
 - Bare DAP probe enumerated UE threads and detached cleanly.
-- Post-cleanup state on `a3ad86f3`: target process `State: S (sleeping)`, `TracerPid: 0`, adb forwards removed.
+- Post-cleanup state on `ANDROID-SERIAL-A`: target process `State: S (sleeping)`, `TracerPid: 0`, adb forwards removed.
 
 Caveat:
 - This is an experiment override, not a proven permanent policy. If LLDB 19 causes regressions, revert the `windows.lua` priority change to put NDK21 first again.
@@ -1415,7 +1415,7 @@ Follow-up:
 
 ## 2026-06-02 - Android DAP synthetic frame E474 guard
 
-- Task: keep investigating the post-attach `Vim:E474: Invalid argument` popup on the real Android DAP path (`a3ad86f3` only).
+- Task: keep investigating the post-attach `Vim:E474: Invalid argument` popup on the real Android DAP path (`ANDROID-SERIAL-A` only).
 - Completed: traced the live Neovim error through Snacks notifier and an instrumented `nvim_win_set_cursor()` wrapper. The remaining popup came from upstream `nvim-dap` (`dap/session.lua:set_cursor`) trying to jump to LLDB PC-only synthetic frames with `sourceReference` and `line=0`, not from the local `ue-dap-source-nav` listener.
 - Fix: `lua/ue/dap.lua` now installs an idempotent UE Android guard around `dap.session._frame_set` and drops synthetic/invalid UE Android frames before nvim-dap opens `dap-src://...` and tries cursor `{0, 0}`. Local source frames are still allowed.
 - Verification: syntax check passed with `nvim --headless -u NONE`; hot-reloaded the running Neovim pipe `nvim.39212.0`; self-test called `_frame_set()` with a synthetic `line=0/sourceReference` frame and returned without E474, without changing buffer, and with empty `v:errmsg`.
@@ -1431,18 +1431,18 @@ Follow-up:
 
 ## 2026-06-02 - Android DAP breakpoint rejection diagnosis
 
-- Investigated F9 breakpoints on `a3ad86f3` after the sign changed from `DapBreakpoint` (`●`) to `DapBreakpointRejected` (`R`).
+- Investigated F9 breakpoints on `ANDROID-SERIAL-A` after the sign changed from `DapBreakpoint` (`●`) to `DapBreakpointRejected` (`R`).
 - Confirmed nvim-dap is sending `setBreakpoints` and lldb-dap is responding successfully, but every breakpoint is `verified=false`; the `R` sign is nvim-dap's rejected-breakpoint state, not a sign rendering bug.
 - Added a UE Android `setBreakpoints` source-path rewrite guard that can convert local Windows UE source paths to basename-only DAP requests before lldb-dap sees them, while remapping adapter responses back to local paths for editor display.
 - Live test on the active session showed basename requests are now sent (`source.path = "MobileShadingRenderer.cpp"`), but lldb still returns `verified=false` because the current LLDB target reports `image list -> target has no associated executable images`; `image list libUE4.so` has no module and `target symbols add .../libUE4.so` says the symbol file does not match any existing module.
-- Follow-up: fix Android attach module/executable registration first (the target currently has `arch=aarch64-unknown-linux-android`, `pid=12554`, but no images), then re-test F9 verification on `a3ad86f3`.
+- Follow-up: fix Android attach module/executable registration first (the target currently has `arch=aarch64-unknown-linux-android`, `pid=12554`, but no images), then re-test F9 verification on `ANDROID-SERIAL-A`.
 ## 2026-06-02 — Android DAP F9 rejected breakpoint: create target before gdb-remote
 
-- Task: continue Android nvim DAP fix, testing only on adb serial `a3ad86f3`.
+- Task: continue Android nvim DAP fix, testing only on adb serial `ANDROID-SERIAL-A`.
 - Root cause confirmed: direct `gdb-remote` custom attach succeeded but left LLDB with `target #0: <none>` / no executable images, so lldb-dap returned `verified=false` and nvim-dap changed the sign from `DapBreakpoint` (`●`) to `DapBreakpointRejected` (`R`).
 - Source check: lldb-dap 22 `AttachRequestHandler.cpp` only supports custom target creation inside `attachCommands`; the earlier `targetCreateCommands` key is not parsed for attach requests.
 - Fix: `lua/ue/dap/android.lua` now prepends `target create "<symbol-rich libUE4.so>"` before `gdb-remote 127.0.0.1:<port>` when `session.symbol_lib` is available, and removes the later `target symbols add` path that cannot work without an existing module.
-- Verification on `a3ad86f3`: bare `lldb.exe --batch` with the exact command order `target create <Client_Symbols.../libUE4.so>` then `gdb-remote` produced `image list libUE4.so` with UUID `C8800DF4-7600-D609-D706-ADDCE90C2AB8-7E8291C9` and resolved `breakpoint set -f MobileShadingRenderer.cpp -l 1345` to `libUE4.so` address `0x00000061e57b005c` with `locations = 1`.
+- Verification on `ANDROID-SERIAL-A`: bare `lldb.exe --batch` with the exact command order `target create <Client_Symbols.../libUE4.so>` then `gdb-remote` produced `image list libUE4.so` with UUID `C8800DF4-7600-D609-D706-ADDCE90C2AB8-7E8291C9` and resolved `breakpoint set -f MobileShadingRenderer.cpp -l 1345` to `libUE4.so` address `0x00000061e57b005c` with `locations = 1`.
 - Live Neovide nvim PID `6036` was hot-reloaded after the patch.
 - Follow-up: full lldb-dap JSON probe still floods per-thread SIGSTOP console output and can close stdin before post-attach evaluate; rely on the bare LLDB attach proof plus next user F9 in live nvim to confirm final `verified=true` UI state.
 ## 2026-06-02 — Android DAP attach warning: quiet lldb-dap attach output flood
@@ -1451,7 +1451,7 @@ Follow-up:
 - Live nvim probe (PID `27628`) captured Snacks warnings: `Debug adapter didn't respond...` followed by `command C:/tools/lldb-22/install/bin/lldb-dap.exe exited with 3221226505`.
 - Protocol log showed `target create` and `gdb-remote` succeeded, then lldb-dap emitted one console/disassembly output block per stopped thread (~700+ DAP `output` events) and died right after `setBreakpoints` was queued.
 - Fix: prefix Android custom `attachCommands` with lldb-dap's quiet-on-success marker `?` for `target create`, `gdb-remote`, and `process handle` commands. This keeps the commands but suppresses successful console output so the Windows stdio adapter is not flooded before `setBreakpoints` responds.
-- Reloaded live Neovide nvim PID `27628`; cleaned only adb serial `a3ad86f3` (`forward --remove-all`, killed app-sandbox `lldb-server`, verified game `TracerPid: 0`).
+- Reloaded live Neovide nvim PID `27628`; cleaned only adb serial `ANDROID-SERIAL-A` (`forward --remove-all`, killed app-sandbox `lldb-server`, verified game `TracerPid: 0`).
 - Follow-up: user should retry `<space>da`; if another warning flashes, dump live Snacks/DAP protocol history again before changing config.
 
 
@@ -1460,7 +1460,7 @@ Follow-up:
 
 - Task: Prevent `<space>da` / agent-driven Android attach from prompting for values already known in this workspace.
 - Completed:
-  - `ue.dap.android` now carries default attach context for `<android-package>`, device serial supplied by caller, and the known Android symbol lib path `E:/aki/zeqiang_aki_3.4/Source/Client/Binaries/Android/Client_Symbols_v170300916/Client-arm64/libUE4.so`.
+  - `ue.dap.android` now carries default attach context for `<android-package>`, device serial supplied by caller, and the known Android symbol lib path `E:/Projects/SampleGame-3.4/Source/SampleGame/Binaries/Android/SampleGame_Symbols_v100000001/SampleGame-arm64/libUE4.so`.
   - `pick_package()` and `pick_symbol_lib()` accept explicit context overrides before falling back to discovery or input.
   - Fixed `_progress.lua` hidden-buffer reload trap where stale `[ue-dap progress]` buffer name raised `E95` and aborted attach bootstrap.
 - Pitfall: missing context previously fell through to `vim.fn.input()` for package/symbol values, which is wrong for this fixed Android attach workflow.
@@ -1478,7 +1478,7 @@ Follow-up:
 - Verification:
   - Parse checks passed for `lua/ue/dap/android.lua` and `lua/ue/dap.lua`.
   - Hot reload into live nvim PID 23252 succeeded; `string.dump(dap.session.request)` confirmed the synthetic setBreakpoints wrapper is active.
-  - Device cleanup was limited to adb serial `a3ad86f3`; target process remained healthy with `TracerPid: 0`.
+  - Device cleanup was limited to adb serial `ANDROID-SERIAL-A`; target process remained healthy with `TracerPid: 0`.
 
 
 ## 2026-06-02 - Android DAP synthetic breakpoint response core fallback
@@ -1525,12 +1525,12 @@ Follow-up:
 - Task: Avoid lldb-dap 22.1.6 crashing when breakpoint preseed commands are injected immediately after `gdb-remote`.
 - Evidence: after fixing bufnr-keyed breakpoint discovery, the next attachCommands contained `?breakpoint set ...` directly after `?gdb-remote` and lldb-dap exited with `3221226505` before logging those commands. A live post-attach evaluate of `breakpoint set` also reproduced the same crash, confirming this command path is fragile in the direct gdb-remote attach flow.
 - Completed: breakpoint preseed insertion now happens after the `process handle SIG*` commands, preserving the safe attach order: target create -> gdb-remote -> signal disposition -> breakpoint set. This still runs inside attachCommands, before nvim-dap's post-attach DAP `setBreakpoints` path.
-- Verification: parse checks passed and live nvim was hot-reloaded. Requires another user-path attach to validate on device `a3ad86f3`.
+- Verification: parse checks passed and live nvim was hot-reloaded. Requires another user-path attach to validate on device `ANDROID-SERIAL-A`.
 
 
 ## 2026-06-02 - Android DAP disable unsafe source breakpoint preseed
 
 - Task: Stop repeated lldb-dap `3221226505` crashes when F9 breakpoints are present during UE Android attach.
-- Evidence: live protocol logs on `a3ad86f3` showed attachCommands with `?breakpoint set -f "MobileShadingRenderer.cpp" ...` reaching symbol/DWARF indexing and then lldb-dap exiting with `3221226505` before any attach response or breakpoint command output. Moving preseed after signal handlers did not prevent the crash. A post-attach evaluate `breakpoint set` also crashed the adapter earlier, so both post-attach source breakpoints and attachCommands source-file breakpoint preseed are unsafe in this direct gdb-remote path.
+- Evidence: live protocol logs on `ANDROID-SERIAL-A` showed attachCommands with `?breakpoint set -f "MobileShadingRenderer.cpp" ...` reaching symbol/DWARF indexing and then lldb-dap exiting with `3221226505` before any attach response or breakpoint command output. Moving preseed after signal handlers did not prevent the crash. A post-attach evaluate `breakpoint set` also crashed the adapter earlier, so both post-attach source breakpoints and attachCommands source-file breakpoint preseed are unsafe in this direct gdb-remote path.
 - Completed: disabled source-file breakpoint preseed in `lua/ue/dap/android.lua` to keep attach stable; changed the UE Android synthetic `setBreakpoints` response to `verified=false` with an explicit message instead of falsely marking F9 as wired when LLDB has no breakpoint.
-- Verification: parse checks passed, live nvim was hot-reloaded, and only adb serial `a3ad86f3` was cleaned (`lldb-server` killed, forwards removed, game SIGCONT'd). Follow-up needed: design a different validated breakpoint mechanism (likely function/address based, or another adapter command order) rather than source-file `breakpoint set` in lldb-dap 22.1.6.
+- Verification: parse checks passed, live nvim was hot-reloaded, and only adb serial `ANDROID-SERIAL-A` was cleaned (`lldb-server` killed, forwards removed, game SIGCONT'd). Follow-up needed: design a different validated breakpoint mechanism (likely function/address based, or another adapter command order) rather than source-file `breakpoint set` in lldb-dap 22.1.6.

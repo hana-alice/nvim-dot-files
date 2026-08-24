@@ -1,5 +1,10 @@
 # Phase H — DAP Real Platforms (Win64 / macOS / Linux / iOS)
 
+> **Historical snapshot / superseded.** 本文的 codelldb、stub handler 与 iOS-as-Mac
+> 假设已过时。当前实现统一使用 lldb-dap，iOS 拥有独立真机 handler；现行契约见
+> [`../architecture/overview.md`](../architecture/overview.md) 和 OpenSpec
+> `dap-platform-dispatch`。
+
 > **Status**: Proposed → H.1 (stub modules + dispatch wiring) approved
 > **Branch**: `feat/multi-platform-foundation`
 > **Owner**: config maintainer

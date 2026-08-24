@@ -135,7 +135,7 @@ t2.describe("ue.foreign_buffer_key（跨 checkout buffer 识别）", function()
 
   t2.it("engine root 内的文件 → nil", function()
     t2.assert_nil(ue._foreign_buffer_key_for_test(
-      "D:/engine/Engine/Source/Y.cpp", "E:/aki/projA", "D:/engine"))
+      "D:/engine/Engine/Source/Y.cpp", "E:/Projects/projA", "D:/engine"))
   end)
 
   t2.it("两个根都不含 → 返回稳定 dedup key", function()
@@ -149,7 +149,7 @@ t2.describe("ue.foreign_buffer_key（跨 checkout buffer 识别）", function()
 
   t2.it("前缀相似但非子路径不误判为内部（projA vs projA_debug）", function()
     t2.assert_true(ue._foreign_buffer_key_for_test(
-      "E:/aki/projA_debug/Source/X.cpp", "E:/aki/projA", "D:/engine") ~= nil,
+      "E:/Projects/projA_debug/Source/X.cpp", "E:/Projects/projA", "D:/engine") ~= nil,
       "projA_debug 不是 projA 的子路径，必须判外部")
   end)
 

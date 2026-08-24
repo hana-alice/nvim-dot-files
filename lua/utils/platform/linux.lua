@@ -36,6 +36,56 @@ function M.shell()
   return M.shell_entry("default")
 end
 
+function M.allows_osc52()
+  return true
+end
+
+function M.path_key(path)
+  return tostring(path or "")
+end
+
+function M.query_driver_globs()
+  return { "**/clang*", "**/gcc", "**/g++", "**/cc", "**/c++" }
+end
+
+function M.cdb_compiler_candidates()
+  return { "clang++", "clang", "gcc", "g++", "cc", "c++" }
+end
+
+function M.lldb_python_relative_paths()
+  return { "lib/python3/dist-packages/lldb", "lib/site-packages/lldb" }
+end
+
+function M.restart_fallback_candidates(cwd, env)
+  local candidates = {}
+  if env and env.TERMINAL and env.TERMINAL ~= "" then
+    candidates[#candidates + 1] = {
+      client = "linux",
+      bin = env.TERMINAL,
+      args = { "-e", "nvim" },
+      cwd = cwd,
+      reason = "$TERMINAL=" .. env.TERMINAL,
+    }
+  end
+  vim.list_extend(candidates, {
+    { client = "linux", bin = "kitty", args = { "--directory", cwd, "nvim" }, cwd = cwd, reason = "kitty fallback" },
+    { client = "linux", bin = "alacritty", args = { "--working-directory", cwd, "-e", "nvim" }, cwd = cwd, reason = "alacritty fallback" },
+    { client = "linux", bin = "wezterm", args = { "start", "--cwd", cwd, "--", "nvim" }, cwd = cwd, reason = "wezterm fallback" },
+    { client = "linux", bin = "foot", args = { "--working-directory=" .. cwd, "nvim" }, cwd = cwd, reason = "foot fallback" },
+    { client = "linux", bin = "xterm", args = { "-e", "sh", "-c", "cd " .. vim.fn.shellescape(cwd) .. " && nvim" }, cwd = cwd, reason = "xterm fallback" },
+  })
+  return candidates
+end
+
+function M.restart_shutdown_delay_ms()
+  return 400
+end
+
+function M.code_search_install_hint(config_root)
+  local script = tostring(config_root or "") .. "/scripts/install_csearch.sh"
+  return "sh " .. shell.quote("posix", script)
+end
+
 function M.cmd_quote(value)
   return shell.quote("posix", value)
 end
@@ -91,6 +141,19 @@ function M.python_candidates()
   return { "python3", "python" }
 end
 
+function M.clangd_indexer_candidates()
+  return {
+    "/mnt/c/Program Files/LLVM/bin/clangd-indexer.exe",
+    "clangd-indexer",
+    "clangd-indexer.exe",
+    "C:/Program Files/LLVM/bin/clangd-indexer.exe",
+  }
+end
+
+function M.shared_library_extension()
+  return ".so"
+end
+
 function M.default_lldb_dap_paths()
   -- Apt-installed LLVM lays down /usr/bin/lldb-dap-<ver>; LLVM tarballs
   -- land in /usr/lib/llvm-<ver>/bin. Try the most common newer versions
@@ -107,6 +170,7 @@ function M.default_lldb_dap_paths()
     "/usr/bin/lldb-dap-19",
     "/usr/bin/lldb-dap-18",
     "/usr/bin/lldb-dap",
+    "lldb-dap",
   }
 end
 

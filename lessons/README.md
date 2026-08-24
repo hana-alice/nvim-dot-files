@@ -30,7 +30,7 @@ F9 成功判据 = LLDB resolved + stop event（K33）；source-file `breakpoint 
 gdb-remote 路线崩 lldb-dap，**K30 platform route + 3.5 匹配符号下不复现**（K34）；
 file:line 断点需先 `target create` symbol-rich host libUE4.so（K35）。
 **会话中 F9 即时下断点经 lldb-dap evaluate backtick `breakpoint set -f/-l` 通道是正解**
-（K36，真机 `2e2df4cb` 闸门+端到端实证；`361b9e7` 的「内核静默丢弃」不适用当前路线，
+（K36，真机 `ANDROID-SERIAL-B` 闸门+端到端实证；`361b9e7` 的「内核静默丢弃」不适用当前路线，
 不再需 `:UEDAPReattach`）；**不下发 `target modules load --slide` 则 attach 失败，slide 为
 load-bearing**（K37，`UE_DAP_NO_SLIDE` 开关供其他设备复验；wait-launch 例外＝slide「晚到」）。
 `/data/local/tmp/lldb-server` root-owned 残留 chmod EPERM → rm-then-push / reuse（K38）；

@@ -1,6 +1,6 @@
 ## Context
 
-诊断报告 `docs/plans/2026-06-02-android-dap-attach-bp-diagnosis.md` 已在真机 `a3ad86f3` 定位三个根因并验证了关键修复假设。本 design 说明如何在 **nvim 配置内**最小改动落地，且把环境要求落到 `docs/TOOLING.md`。
+诊断报告 `docs/plans/2026-06-02-android-dap-attach-bp-diagnosis.md` 已在真机 `ANDROID-SERIAL-A` 定位三个根因并验证了关键修复假设。本 design 说明如何在 **nvim 配置内**最小改动落地，且把环境要求落到 `docs/TOOLING.md`。
 
 现状代码事实：
 - `lua/ue/dap/android.lua:609` spawn：`cd files && ./lldb-server gdbserver --attach <pid> *:<port>`（run-as）。
@@ -12,7 +12,7 @@
 真机已验证：
 - run-as `cd` 不生效（cwd=`/`），`files/lldb-server version` 可执行（LLDB19）。
 - NDK21 LLDB 9.0.9 server `gdbserver --attach 22232` tracer 稳定存活、未崩；LLDB18/19 会 Segfault。
-- device `libUE4.so` base = `0x6c9fe21000`；host 符号 so 在 `Client_Symbols_v170300916/Client-arm64/libUE4.so`。
+- device `libUE4.so` base = `0x6c9fe21000`；host 符号 so 在 `SampleGame_Symbols_v100000001/SampleGame-arm64/libUE4.so`。
 
 约束（`docs/CONSTRAINTS.md`）：host adapter 22.1.6+ forward-only、`stopOnEntry` 不动、无 `process continue`、SIGSEGV/SIGBUS 不动、hex 用拼接禁 `string.format("%x")`、改协议需 protocol proof。
 
@@ -22,7 +22,7 @@
 - attach 能稳定到 `initialized` + `threads`（修 spawn 路径 + 钉死 NDK21 server）。
 - F9 file:line 断点真正 resolved（preseed + ASLR rebase + 放开合成短路）。
 - 仅改 nvim 配置文件 + 文档；环境要求写入 `docs/TOOLING.md`。
-- 全程仅在 `a3ad86f3` 验证。
+- 全程仅在 `ANDROID-SERIAL-A` 验证。
 
 **Non-Goals:**
 - 不改设备系统、UE 工程、host adapter 版本。
@@ -54,7 +54,7 @@ run-as cwd 已是 `/data/user/0/<pkg>`，`files/lldb-server` 直接可执行；`
 - [放开合成短路触发 lldb-dap 22 崩溃] → D4 回退方案（preseed-only + 合成 verified=true）；先 bare lldb 验 resolved 再走 DAP。
 - [ASLR base 读取失败/格式错] → 用 run-as `cat /proc/<pid>/maps`（已验证可读）+ 拼接 hex；失败时 toast 并跳过 rebase，不阻断 attach。
 - [NDK21 未安装的机器] → `default_lldb_server_paths()` 仍有 fallback；`docs/TOOLING.md` 记录硬性要求，缺失时报清晰错误。
-- [仅单机验证] → 明确范围 `a3ad86f3`；其它设备需各自 protocol proof。
+- [仅单机验证] → 明确范围 `ANDROID-SERIAL-A`；其它设备需各自 protocol proof。
 
 ## Migration Plan
 
@@ -63,7 +63,7 @@ run-as cwd 已是 `/data/user/0/<pkg>`，`files/lldb-server` 直接可执行；`
 3. 改 `lua/ue/dap.lua`（放开 Android setBreakpoints 合成短路）。
 4. 更新 `docs/TOOLING.md` 环境要求。
 5. headless 加载 smoke：`nvim --headless -u NONE -c "luafile lua/ue/dap/android.lua" -c qa` 等。
-6. 真机 `a3ad86f3` 跑 `<space>da`，取 fresh protocol log，验 `initialized`/`threads`/断点 resolved。
+6. 真机 `ANDROID-SERIAL-A` 跑 `<space>da`，取 fresh protocol log，验 `initialized`/`threads`/断点 resolved。
 7. 回滚：`git checkout` 这 3 个 lua + `docs/TOOLING.md`；零设备侧残留（push/run-as 暂存自带清理）。
 
 ## Open Questions

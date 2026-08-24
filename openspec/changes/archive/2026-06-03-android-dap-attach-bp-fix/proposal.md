@@ -1,6 +1,6 @@
 ## Why
 
-诊断（`docs/plans/2026-06-02-android-dap-attach-bp-diagnosis.md`，真机 `a3ad86f3` 验证）定位到 `<space>da` 连不上 + F9 断不上的具体根因，且全部可在 **nvim 配置内**修复：
+诊断（`docs/plans/2026-06-02-android-dap-attach-bp-diagnosis.md`，真机 `ANDROID-SERIAL-A` 验证）定位到 `<space>da` 连不上 + F9 断不上的具体根因，且全部可在 **nvim 配置内**修复：
 
 1. 设备端 server spawn 用 `cd files && ./lldb-server ...`，但 Android 16 `runas_app` SELinux 域下 `cd` 不生效、cwd 卡在 `/`，`./lldb-server` 找不到 → attach 第一步就失败（确定性 bug）。
 2. `gdbserver --attach` 用 LLDB 18/19 server 在该 UE 目标上 Segfault；改用 **NDK21 LLDB 9.0.9**（与 libUE4.so 构建 NDK 匹配）后，tracer 稳定存活、不崩（真机已验证）。
@@ -32,9 +32,9 @@
   - `lua/utils/platform/windows.lua`：device lldb-server 候选恢复 NDK21 首选。
 - **文档**：`docs/TOOLING.md` 增补 Android device server = NDK21 LLDB 9.0.9 的环境要求；`docs/CONSTRAINTS.md` 若涉及可同步一行。
 - **不改**：host adapter 版本策略（22.1.6+ forward-only）、`stopOnEntry=true`、SIGSEGV/SIGBUS 信号处置、postRunCommands 不加 `process continue`。
-- **设备验证范围**：仅 `a3ad86f3`（abi arm64-v8a, sdk 36 / Android 16, SELinux Enforcing）。
+- **设备验证范围**：仅 `ANDROID-SERIAL-A`（abi arm64-v8a, sdk 36 / Android 16, SELinux Enforcing）。
 - **环境要求（记录用）**：
   - host adapter：LLVM 22.1.6 `lldb-dap.exe`（forward-only）。
   - device lldb-server：**NDK 21.4.7075529 LLDB 9.0.9**（`%LOCALAPPDATA%/Android/Sdk/ndk/21.4.7075529/.../aarch64/lldb-server`）。
   - app 必须 DEBUGGABLE，run-as 可用。
-  - host 符号 so：`.../Client_Symbols_v*/Client-arm64/libUE4.so`。
+  - host 符号 so：`.../Client_Symbols_v*/SampleGame-arm64/libUE4.so`。

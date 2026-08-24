@@ -11,7 +11,7 @@
 已勘察确认的承重事实：
 
 1. **`lua/` 布局是 runtime 契约**：Neovim 用 `runtimepath` + `lua/?.lua;lua/?/init.lua` 解析 `require("ue")`/`require("utils.platform")`。移动 `lua/` 下任何文件都会断 require，并违反 CONSTRAINTS「不做无关重构」。`tests/run.lua`、`scripts/headless_smoke.lua`、`.github/workflows/headless.yml` 均依赖此布局。
-2. **游离物均 untracked**：根目录 `""`、`UserslizeqiangAppDataLocalTempmr17757.html`、`lua/ue.lua.bak-20260528-185201` 都不在 git 跟踪内（`.gitignore` 已忽略 `data`/`*.log`/`.hermes/` 等），清理无历史风险。
+2. **游离物均 untracked**：根目录 `""`、`UsersUSERAppDataLocalTemp-artifact.html`、`lua/ue.lua.bak-20260528-185201` 都不在 git 跟踪内（`.gitignore` 已忽略 `data`/`*.log`/`.hermes/` 等），清理无历史风险。
 3. **现有回归框架可复用**：`tests/run.lua` 自动发现 `tests/cases/*_spec.lua`，harness 提供断言——可发现性回归直接落为一个新 spec 文件。
 4. **CLAUDE.md 是 Claude Code 原生目录级指令**：放在子目录会被自动识别为该目录上下文规则，无需额外机制。
 
@@ -131,7 +131,7 @@
 
 ### 决策 9：根目录卫生——清理 untracked 游离物
 
-- 删除/隔离：根 `""`（空名文件）、`UserslizeqiangAppDataLocalTempmr17757.html`、`lua/ue.lua.bak-20260528-185201`。均 untracked，删除无 git 历史损失。
+- 删除/隔离：根 `""`（空名文件）、`UsersUSERAppDataLocalTemp-artifact.html`、`lua/ue.lua.bak-20260528-185201`。均 untracked，删除无 git 历史损失。
 - `.bak` 若想留存可移入 `.gitignore` 已忽略的位置；倾向直接删（git 历史里有 `lua/ue.lua` 各版本）。
 - 理由：refra「historical or unused files」分类 + success criteria「intentionally organized」。
 

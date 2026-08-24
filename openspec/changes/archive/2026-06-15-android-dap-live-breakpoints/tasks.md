@@ -14,7 +14,7 @@
 - [x] 2.3 确认 `tests/cases/dap_spec.lua` 现有合成帧断言（`copy.line = -1`、`<synthetic>` 名）仍通过；按收敛结果更新断言指向。
 - [x] 2.4 跑 `nvim --headless -l tests/run.lua dap`。
 
-## 3. 阶段 1 — live 可行性闸门实验（需真机 2e2df4cb）
+## 3. 阶段 1 — live 可行性闸门实验（需真机 ANDROID-SERIAL-B）
 
 - [x] 3.1 扩展 `tools/nvim_android_dap_smoketest.lua`：支持 attach 后（continue 之后）在活跃会话经三通道各下发一次断点并采集结果（通道 A=DAP setBreakpoints / B=evaluate backtick `breakpoint set -f/-l` / C=image lookup→breakpoint set --address）。【实现为独立闸门 harness `tools/nvim_android_dap_livebp_gate.lua`，由 `NVIM_DAP_LIVEBP_CHANNEL` 选通道；smoketest 也补了 image lookup / address 采集 plumbing】
 - [x] 3.2 真机跑闸门实验，目标 `MobileShadingRenderer.cpp:1367`，匹配 3.5 符号；每通道记录 `breakpoint list resolved`、是否命中 `reason="breakpoint"`、adapter 是否存活（无 `3221226505`），落 `tools/evidence/android-f9/live-bp-gate.*.json`。【证据：`livebp-gate.evaluate.result.json` / `livebp-gate.setbreakpoints.result.json`】
@@ -26,11 +26,11 @@
 - [x] 4.2 改 `dap.lua` 的 `after.setBreakpoints["ue_android_bp_local_response"]`：`configurationDone` 之后的 setBreakpoints 改为经 live 通道下发，**取代** warning；保留 `ue-dap-bp-diag.log` 真实响应记录。
 - [x] 4.3 删除 active-session F9 warning（`dap.lua:2031-2044`）与其专属节流 `D._ue_android_bp_notice_until_ms`；保留 configurationDone gate 仅用于区分初始 sync vs live 下发。【warning 已删；`_ue_android_bp_notice_until_ms` 复用为 live 失败诚实反馈的节流（仅失败时触发，非"会话中变更"警告）】
 - [x] 4.4 确保 `verified` 反映真实 LLDB 状态：live 下发后回读 `breakpoint list resolved`，失败回 `verified=false` 且给可定位反馈，MUST NOT 假成功、MUST NOT detach+reattach。【live plant 回读 `breakpoint list` 的 `resolved=N`；resolved=0 或命令报错 → vim.notify 诚实反馈，不 detach+reattach】
-- [x] 4.5 真机验证会话中新增断点即时命中、会话中删除断点即时移除、live 失败诚实反馈（对应三条 spec scenario）。【真机 `2e2df4cb` 跑 `tools/nvim_android_dap_livebp_e2e.lua` 驱动真实 F9 流：`production_live_plant_diag=true`、`saw_reattach_warning=false`、`breakpoint list resolved=1`、`stop.reason="breakpoint"` hit；证据 `livebp-e2e.result.json`】
+- [x] 4.5 真机验证会话中新增断点即时命中、会话中删除断点即时移除、live 失败诚实反馈（对应三条 spec scenario）。【真机 `ANDROID-SERIAL-B` 跑 `tools/nvim_android_dap_livebp_e2e.lua` 驱动真实 F9 流：`production_live_plant_diag=true`、`saw_reattach_warning=false`、`breakpoint list resolved=1`、`stop.reason="breakpoint"` hit；证据 `livebp-e2e.result.json`】
 
 ## 5. 阶段 2A — 冗余 ASLR slide 删除（仅当 D5 复验通过）
 
-- [x] 5.1 真机复验一次**不下发** `target modules load --slide`，确认 `breakpoint list resolved=1` 且命中（design D5 前置条件）。【真机 `2e2df4cb` 跑 `UE_DAP_NO_SLIDE=1` ×3（含设备清场）：不下发 slide → attach 超时/adapter `3221226505`、从未命中；slide-present baseline 立即命中。证据 `noslide-preseed.result.json`(timeout) vs `slide-recheck.result.json`(ok)】
+- [x] 5.1 真机复验一次**不下发** `target modules load --slide`，确认 `breakpoint list resolved=1` 且命中（design D5 前置条件）。【真机 `ANDROID-SERIAL-B` 跑 `UE_DAP_NO_SLIDE=1` ×3（含设备清场）：不下发 slide → attach 超时/adapter `3221226505`、从未命中；slide-present baseline 立即命中。证据 `noslide-preseed.result.json`(timeout) vs `slide-recheck.result.json`(ok)】
 - [~] 5.2 复验通过则删除 `android.lua:923-932` 的 slide 追加，并清理 `read_so_base_hex`、`module_rebase_command`、`_module_rebase_cmd`、`_finalize_session` 内 base 解析 plumbing。【**复验未通过 → 不删除**。slide 在本设备 load-bearing；仅新增 `UE_DAP_NO_SLIDE` 复验开关供后续在其他设备/版本再验。design OQ#3 已记结论】
 - [~] 5.3 跑 `nvim --headless -l tests/run.lua dap`，补/改断言反映 slide 已移除。【N/A — slide 未移除；保留现有 slide 相关断言不变】
 

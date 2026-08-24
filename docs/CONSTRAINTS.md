@@ -130,7 +130,7 @@
   症状: app 卡在 state T，需要重启。
   → MEMORY `feedback_android_dap_env_residue.md`
 
-### Android DAP attach 路线（platform 模式，真机 a3ad86f3 实证 2026-06-03）
+### Android DAP attach 路线（platform 模式，真机 ANDROID-SERIAL-A 实证 2026-06-03）
 
 - **K30 — Android attach 唯一正解是 platform 模式 + serial-based connect URL（宪法级）**
   背景: 5/21（commit `e51cbe6`）用 **lldb-dap 22.1.6 + lldb-server platform 模式**真机
@@ -183,7 +183,7 @@
   解决: 接通断点需在 attach 稳定后先证明 source-file 路径在当前 K30 platform route 下
   不崩且 resolved；若不稳定，只能在 `image lookup --line` → `breakpoint set --address`
   与 stop frame 语义等价被证明后采用 address 断点。不能把“碰巧不崩”或“UI 变绿”作为正解。
-  **现状（2026-06-15 真机 `2e2df4cb` 复验）: 在 K30 platform route + 3.5 匹配符号下
+  **现状（2026-06-15 真机 `ANDROID-SERIAL-B` 复验）: 在 K30 platform route + 3.5 匹配符号下
   source-file `breakpoint set -f/-l` 不复现该崩溃**——闸门 evaluate 通道
   `adapter_alive=true`、`resolved=1`、命中，端到端 live F9 亦命中。该崩溃为旧
   gdb-remote 直连路线产物。session-time live 断点经 lldb-dap evaluate backtick 通道
@@ -204,7 +204,7 @@
 - **K36 — session-time live 断点经 lldb-dap evaluate 通道可行（本设备实证，非 work around）**
   症状/背景: 历史 `361b9e7` 记录"attach 后写断点指令被内核静默丢弃，session-time live
   断点物理不可行"，但那是旧 gdb-remote 直连路线/旧符号的观测。
-  解决/现状: 2026-06-15 真机 `2e2df4cb` D1 闸门 + 端到端复验——在 K30 platform route +
+  解决/现状: 2026-06-15 真机 `ANDROID-SERIAL-B` D1 闸门 + 端到端复验——在 K30 platform route +
   3.5 匹配符号下，attach 后 continue、再经 **lldb-dap evaluate backtick
   `breakpoint set -f/-l`**（或 DAP setBreakpoints）下发断点 **resolved=1 且命中**，
   adapter 存活（无 `3221226505`）。故会话中 F9 变更走 live evaluate 通道即时下发为正解，
@@ -231,7 +231,7 @@
 
 - **K38 — `/data/local/tmp/lldb-server` root-owned 残留 → shell 用户 chmod EPERM**
   症状: `lldb-server bootstrap failed: chmod ... to 0755: Operation not permitted`
-  （2026-07-24 真机 a3ad86f3 日志）。旧 `adb root` 会话推的文件 owner 是 root:root，
+  （2026-07-24 真机 ANDROID-SERIAL-A 日志）。旧 `adb root` 会话推的文件 owner 是 root:root，
   非 root adb 的 shell 用户 chmod 必 EPERM。
   解决: unlink 看**父目录**权限（/data/local/tmp 为 shell-owned）——尺寸不符先 `rm -f` 再
   push；同尺寸且 `test -x` 通过直接 reuse（chmod 都不需要）；chmod EPERM 但已可执行 →
@@ -308,7 +308,7 @@
 - **K45 — `Client` 是项目/Target 名，不是 Android 目录协议**
   症状: 非 `Client` 项目能正常编译，但 nested `.uproject`、packageInfo、symbol package 或 SO
   receipt 发现失败；测试若也只用 `Client` fixture，会把该耦合隐藏起来。
-  根因: 旧路径把现场项目布局 `Source/Client`、`Client_Symbols_v*`、`Client-arm64` 当成 UE 固定约定。
+  根因: 旧路径把现场项目布局 `Source/SampleGame`、`Client_Symbols_v*`、`SampleGame-arm64` 当成 UE 固定约定。
   解决约束: 从显式 `.uproject` 或唯一 `Source/<Project>/*.uproject` 派生项目目录；SO 主产物从
   matching receipt 和动态 Target 派生；符号包扫描实际 `<Target>_Symbols_v*/<Target>-arm64` 目录。
   多项目/多主产物歧义必须拒绝，不能按目录或 receipt 顺序猜测。回归 fixture 必须使用非
@@ -383,7 +383,16 @@
   解决: clangd 固定 `--enable-config=false`，不再写 `.clangd`、不传 `--index-file`；current/hot/full
   发布带 generation/coverage manifest 的 controlled BackgroundIndex CDB，只接受
   compiler-authored UBT unity membership 或 exact per-file fallback，并通过官方
-  `compilationDatabaseChanges` 注入打开文件 exact command。definition 的最终权威是
+  `compilationDatabaseChanges` 注入打开文件 exact command。phase artifact 可携带 portable
+  unity provenance，但发布给 clangd 的 JSON CDB 必须剥离非标准字段；generation hash 的 map
+  key 必须 canonical 排序，不能受 Lua 进程 hash randomization 影响。source 不在 synthetic CDB 时，
+  exact-command 首次传输必须有界重开已 attached buffer，使 cold AST 不继续使用邻近 TU 推断命令。
+  clangd 的 prepare gate 必须消费持久化 tuple artifact readiness：selection/manifest/controlled CDB 与
+  源 CDB 签名仍匹配时，Nvim 重启后直接复用；不得把“当前 Lua 进程执行过 UEPrepare”当作资格。
+  同进程内工件发生变化也必须重新验证，缺失/stale 才 defer。
+  exact argv 证明 `.cpp/.h` 实际为 Objective-C++ 时，必须保留 C++ Tree-sitter 并叠加内置 `objcpp`
+  syntax；禁止把 mixed source 整体交给仅继承 C 的 `objc` Tree-sitter grammar，普通平台不得受影响。
+  definition 的最终权威是
   canonical USR + subject module AST 唯一 body，clangd 仅作 identity-verified secondary provider。
   → `lua/ue.lua` `clangd_cmd`; `lua/ue/index/`; `lua/ue/clangd_commands.lua`;
     `tests/cases/{ue_api,index_generation,cpp_semantic_index,clangd_commands}_spec.lua`
@@ -615,6 +624,11 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 4. **可自验证模块** —— 公共 API 挂 `M.*`，可 headless 测试（`nvim --headless -l`）。
 5. **不做周期性 ticker 通知** —— 至多 start + 中段更新，成功后自然消退，不刷 `:messages`。
 6. **未变更时跳过写入** —— 每个生成器（CDB / manifest / PCH）写前先比对，避免使下游 cache 失效。
+7. **Facade / workflow 归属可审计** —— `ue.lua` 只做公共上下文、registry 查询与命令入口；
+   target-specific 副作用编排必须落在 `lua/ue/workflows/<target>/`；`lua/ue/targets/<target>.lua`
+   只允许 pure plan/parser/policy contract，不得执行命令或 UI。`ue_platform_boundary` 的 Tree-sitter AST
+   contract 守门 façade / workflow / target 边界，`tests/cases/stability_spec.lua` 负责 `ue.lua`
+   numeric ratchet 与新 workflow 文件 800 行上限。
 → `README.md` §Conventions
 
 ### C5 — 符号解析分层契约

@@ -4,7 +4,7 @@
 因为需求复杂、对标 IDE，未来还会扩展（platform 模式天然支持 file transfer、多进程、
 launch、qLaunchGDBServer 等 gdbserver 模式没有的能力）。
 
-诊断（`docs/plans/2026-06-03-...`，真机 a3ad86f3）已证明当前 `lldb-server gdbserver
+诊断（`docs/plans/2026-06-03-...`，真机 ANDROID-SERIAL-A）已证明当前 `lldb-server gdbserver
 --attach` 路径的硬缺陷：**`--attach` 形态从不绑定监听端口**（ptrace 附上但永不进入
 listen+serve），host 握手零响应 → attach 永远超时。而 `lldb-server platform --server
 --listen` 与纯 `gdbserver`（无 --attach）实测**正常绑定 + gdb 握手全通**。
@@ -52,7 +52,7 @@ listen+serve），host 握手零响应 → attach 永远超时。而 `lldb-serve
 - **可放宽（用户授权）**：其余项目原则（workaround 隔离、最小改动、不碰 nvim 外、
   `stopOnEntry`/信号处置等既有边界）在本任务内可按"跑通 platform"需要调整，但每处改动
   需有真机 protocol log 支撑、不是盲改。
-- **设备验证范围**：仅 `a3ad86f3`（arm64-v8a / Android 16 / SELinux Enforcing），
+- **设备验证范围**：仅 `ANDROID-SERIAL-A`（arm64-v8a / Android 16 / SELinux Enforcing），
   目标 `<android-package>`。
 - **成功判定**：`<space>da` platform attach 到 `initialized` + `threads`、无 attach
   超时/`3221226505`；F9 断点 `verified=true` 且 lldb `breakpoint list` resolved>0、

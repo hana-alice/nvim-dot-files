@@ -21,7 +21,7 @@
 - [x] 4.1 `docs/TOOLING.md`：device server 段改为 NDK 21.4.7075529 LLDB 9.0.9 首选 + host glob + 为何不用 NDK27/AS bundled（真机 Segfault 证据）+ spawn 路径禁 `cd && ./` + 新增"Environment requirements (Android DAP)"表。
 - [x] 4.2 `docs/CONSTRAINTS.md`：C1 表 device server 行更新为 NDK21，指向 TOOLING.md。
 
-## 5. 验证（仅 a3ad86f3）
+## 5. 验证（仅 ANDROID-SERIAL-A）
 
 - [x] 5.1 headless 加载 smoke 全过（android.lua / dap.lua / windows.lua / require ue.dap + ue.dap.android）。
 - [x] 5.2 真机分步验证：NDK21 `files/lldb-server gdbserver --attach 22232` tracer 稳定存活 6s、无 Segfault dump、`lldb-server` 进程数=1；新 spawn 路径形式可执行（旧 `cd && ./` 形式已确认失败）。

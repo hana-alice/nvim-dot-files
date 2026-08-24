@@ -147,6 +147,12 @@ UBT 在第 2 步 build 时已为每个 unity TU 写了一份 `Module.<Mod>.{cpp.
 - rsp 路径对所有平台同口径（Android NDK 用 `.cppa8.o.rsp`，Win64 用 `.cpp.obj.rsp`，Linux/Mac 用 `.cpp.o.rsp`），不依赖 Build.bat
 - 没有任何 rebuild 成本——读硬盘上已存在的 rsp 文件而已
 
+IOS 是明确例外：Apple 构建不会可靠保留 C++ `.o.rsp`，因此完成 `<leader>ub` 后，
+`:UEPrepare` 会追加 tuple-scoped UBT `GenerateClangDatabase` action-graph pass；该 pass 不执行
+compile、Cook、Package、Deploy 或 Run。受控 background CDB 只有在
+unity include 可唯一映射、所有 member 的 exact Apple argv（忽略对象/依赖输出路径后）完全一致时
+才复用 wrapper；证据不足仍保留逐文件命令。
+
 ⚠️ 仅扫 compile rsp（后缀 `.obj.rsp` / `.o.rsp`），跳过 link / lib / def rsp。
 ⚠️ P4 workspace 布局：`.uproject` 在 `<workspace>/Source/<Game>/` 下而非 workspace 根，
    `collect_rsp_files` 已自动把 `dirname(uproject)/Intermediate/Build` 加进搜索路径。
@@ -155,7 +161,9 @@ UBT 在第 2 步 build 时已为每个 unity TU 写了一份 `Module.<Mod>.{cpp.
 
 **fallback**：若 `.rsp` 一个都收不到（fresh clone / 还没 build），才回退到查找已存在的
 `compile_commands.json`（UBT 旧产物 / 手放）。`Build.bat -Mode=GenerateClangDatabase`
-路径已从 ue.lua 删除——它的覆盖率劣于 rsp 路径。
+不再是非 Apple `:UEPrepare` 的隐式 fallback——它的覆盖率劣于 rsp 路径；仅声明
+`semantic_cdb` capability 的 IOS prepare 分支按已选 tuple 使用 action-graph pass，补足 Apple
+缺失 rsp 的语义源，并要求当前 tuple 已有成功 build evidence。
 
 ---
 
@@ -227,7 +235,8 @@ python <path>/inject_h_entries.py
 | 磁盘新增 | **~250-400 MB**（trigram index） |
 | 产出 | csearch index（全文 grep 数据源） |
 
-⚠️ csearch 不支持真增量（cindex `-files-from` 模式有 path-key dedup 静默 no-op）。新文件必须 `-reset` 全量。
+`cindex-uefilter -files-from` 的 add 模式把每个输入文件记录为精确 merge path：新增文件可追加，
+已存在文件会替换旧 trigram。删除仍无法由 codesearch merge 表达，检测到删除时必须 `-reset` 全量。
 
 ---
 
@@ -328,7 +337,8 @@ csearch (按需 spawn, 不常驻)      0 (临时进程 ~200 MB)
 2. ⚠️ **GenerateProjectFiles 的 configuration 必须和 build 的对上** —— 错配 UBT 直接 crash（→ skill `ue-cdb-missing-new-files`）
 3. ⚠️ **clangd-indexer 必须打过 `-include-pch` 补丁** —— 否则 97% TU 静默失败（→ skill `clangd-indexer-ue-defs-injection`）
 4. ⚠️ **不能让 LSP clangd 吃 unity CDB** —— gd 跳到 forward decl + 满屏红线（→ skill `clangd-asymmetric-diag-vs-gd-cdb-shape-mismatch`）
-5. ⚠️ **csearch 不支持真增量** —— 必须 `-reset` 全量重跑（→ skill `codesearch-cindex-incremental-merge-traps`）
+5. **csearch 增量有边界** —— 新增/修改走精确 path replacement；删除必须 `-reset` 全量重跑
+   （→ skill `codesearch-cindex-incremental-merge-traps`）
 6. ⚠️ **ghost clangd-indexer 进程** —— bench 前必须 `tasklist /fi "imagename eq clangd-indexer.exe"` 清场，不然 24 核被吃光（→ skill `clangd-lsp-benchmark-isolation`）
 7. ⚠️ **uv-managed Python 跑 inject 脚本会 crash** —— `_sre.MAGIC` 不匹配。pin 绝对 Python 3.12 路径 + 清空 `PYTHONHOME/PYTHONPATH`（→ skill `nvim-spawn-python-pin-absolute`）
 

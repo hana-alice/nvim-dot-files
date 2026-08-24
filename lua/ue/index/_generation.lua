@@ -4,6 +4,7 @@ return function(M, core)
   local fs = require("ue.core.fs")
   local _ufs = fs
   local _uproc = require("ue.core.proc")
+  local _uplat = require("utils.platform")
   local RT = core.RT
 
   local INDEX_COVERAGE_RANK = {
@@ -30,9 +31,38 @@ return function(M, core)
     return nil
   end
 
+  local function canonical_json(value, seen)
+    local kind = type(value)
+    if kind ~= "table" then return vim.json.encode(value) end
+
+    seen = seen or {}
+    if seen[value] then error("cannot hash cyclic table") end
+    seen[value] = true
+
+    local encoded = {}
+    if vim.islist(value) then
+      for _, item in ipairs(value) do
+        encoded[#encoded + 1] = canonical_json(item, seen)
+      end
+      seen[value] = nil
+      return "[" .. table.concat(encoded, ",") .. "]"
+    end
+
+    local keys = {}
+    for key in pairs(value) do
+      if type(key) ~= "string" then error("generation maps require string keys") end
+      keys[#keys + 1] = key
+    end
+    table.sort(keys)
+    for _, key in ipairs(keys) do
+      encoded[#encoded + 1] = vim.json.encode(key) .. ":" .. canonical_json(value[key], seen)
+    end
+    seen[value] = nil
+    return "{" .. table.concat(encoded, ",") .. "}"
+  end
+
   local function stable_hash(payload)
-    local encoded = vim.json.encode(payload or {})
-    return sha256_text(encoded)
+    return sha256_text(canonical_json(payload or {}))
   end
 
   local function canonical_cdb_path(dir, path)
@@ -184,17 +214,27 @@ return function(M, core)
       TOOLCHAIN_IDENTITY_CACHE[cache_key] = identity
       return identity
     end
-    local clangd = vim.fn.exepath("clangd") or ""
-    local indexer = _uproc.first_executable({
-      "/mnt/c/Program Files/LLVM/bin/clangd-indexer.exe",
-      "clangd-indexer",
-      "clangd-indexer.exe",
-      "C:/Program Files/LLVM/bin/clangd-indexer.exe",
-    }) or ""
+    local clangd_resolved = _uplat.resolve_tool({
+      name = "clangd",
+      env = { "UE_CLANGD" },
+      config = { "clangd.candidates_extra" },
+      driver_candidates = function(driver)
+        return driver.default_clangd_candidates()
+      end,
+    })
+    local indexer_resolved = _uplat.resolve_tool({
+      name = "clangd-indexer",
+      env = { "UE_CLANGD_INDEXER" },
+      driver_candidates = function(driver)
+        return driver.clangd_indexer_candidates()
+      end,
+    })
+    local clangd = clangd_resolved.ok and clangd_resolved.path or ""
+    local indexer = indexer_resolved.ok and indexer_resolved.path or ""
     return stable_hash({
       clangd = executable_identity(clangd),
       clangd_indexer = executable_identity(indexer),
-      os = jit and jit.os or "",
+      os = (_uplat.driver() or {}).id or _uplat.id or "",
     }) or ""
   end
 
@@ -510,7 +550,10 @@ return function(M, core)
 
     local readiness = "missing"
     local freshness = "missing"
-    if artifact and _ufs.is_file(artifact.index_path)
+    if artifact and artifact.build_key ~= build_key_from_ctx(ctx) then
+      readiness = "stale"
+      freshness = "stale"
+    elseif artifact and _ufs.is_file(artifact.index_path)
         and _ufs.is_file(artifact.background_cdb_path or "")
         and _ufs.is_file(ctx.paths and ctx.paths.semantic_cdb or "") then
       readiness = "ready"
@@ -649,6 +692,7 @@ return function(M, core)
   M.read_index_manifest = read_index_manifest
   M.index_manifest_path = index_manifest_path
   M.generation_for_context = generation_for_context
+  M._stable_hash_for_test = stable_hash
   M.make_index_manifest = make_index_manifest
   M.select_active_artifact = select_active_artifact
   M.update_index_selection = update_index_selection

@@ -341,5 +341,5 @@ CDB 里只有 A 侧路径（B 侧 0 条），clangd 对 B 的文件报
 - `ue_project_context` filter → exit 0（新增 5 例全绿）；全量 → exit 0。
 
 **Follow-ups**
-- 用户确认：如果确实要在 android_3.6_debug 工作，`:UESetProject
-  E:/aki/android_3.6_debug` + `:UEPrepare` 后 diag 应消失。
+- 用户确认：如果确实要在 SampleGame-Android-Debug 工作，`:UESetProject
+  E:/Projects/SampleGame-Android-Debug` + `:UEPrepare` 后 diag 应消失。

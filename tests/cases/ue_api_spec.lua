@@ -11,7 +11,7 @@ local PUBLIC_TABLES = {
 }
 
 local PUBLIC_FUNCTIONS = {
-  "clangd_cmd", "clangd_root", "current_platform", "platform_path_priorities",
+  "clangd_cmd", "clangd_root", "clangd_start_root", "current_platform", "platform_path_priorities",
   "android_build_command", "picker_options", "picker_project_options",
   "current_scope_picker_options", "cached_grep_file_list", "cached_code_file_list",
   "cached_files", "cached_grep", "statusline_status", "index_status", "semantic_index_snapshot", "index_now",
@@ -136,9 +136,9 @@ t.describe("ue.android_build_command（SO-only）", function()
 
   t.it("项目和 SO 发现不固定 Client 项目路径", function()
     local source = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
-    t.assert_false(source:find("Source/Client", 1, true) ~= nil,
-      "项目发现必须从 .uproject 派生，不能固定 Source/Client")
-    t.assert_false(source:find("Client-arm64.so", 1, true) ~= nil,
+    t.assert_false(source:find("Source/SampleGame", 1, true) ~= nil,
+      "项目发现必须从 .uproject 派生，不能固定 Source/SampleGame")
+    t.assert_false(source:find("SampleGame-arm64.so", 1, true) ~= nil,
       "SO 发现必须从动态 Target 派生")
   end)
 

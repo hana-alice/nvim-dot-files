@@ -29,6 +29,8 @@ function M.attach()
   C.run(C.lldb_dap_config({
     name = "UE Win64 Attach",
     request = "attach",
+    _ue_session_owner = "win64",
+    _ue_session_operation = "attach",
     pid = pid,
     initCommands = INIT,
   }), "UEDAP win64 attach")
@@ -42,6 +44,8 @@ function M.launch()
   C.run(C.lldb_dap_config({
     name = "UE Win64 Launch",
     request = "launch",
+    _ue_session_owner = "win64",
+    _ue_session_operation = "launch",
     program = program,
     initCommands = INIT,
   }), "UEDAP win64 launch")

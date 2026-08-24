@@ -83,7 +83,7 @@
 
 ### Requirement: 设备部署必须按能力选择安全且可回滚的 transport
 
-系统 MUST 先以只读 probe 选择 root 原地替换或 debuggable app-private startup agent。两条路径都必须动态解析已安装应用的 native library 目录、校验主机/设备 hash，并在失败时恢复各自被修改的目标；非 root 路径 MUST NOT 修改已安装 APK、签名、`/data/app` 文件或工具目录之外的既有应用数据。
+系统 MUST 先以只读 probe 选择 root 原地替换或 debuggable app-private startup agent；选择结果必须由 Android deployment workflow owner 消费当前 target driver 产出的 structured plan 与当前 Neovim 进程保存的 Android serial 后确定。两条路径都必须动态解析已安装应用的 native library 目录、校验主机/设备 hash，并在失败时恢复各自被修改的目标；核心调度层不得拥有 transport 选择、APK/SO 生命周期、设备发现或重试策略。非 root 路径 MUST NOT 修改已安装 APK、签名、`/data/app` 文件或工具目录之外的既有应用数据。
 
 #### Scenario: 安全替换成功
 
@@ -99,6 +99,12 @@
 - **WHEN** 普通 shell 非 root，但 `adb shell su 0 id -u` 返回 `0`
 - **THEN** 所有特权命令 SHALL 统一通过已验证的 `su 0` transport 执行
 - **AND** 特权命令 MUST NOT 在 capability probe 之外各自写死 root transport
+
+#### Scenario: workflow owner 消费 live serial 与 plan
+
+- **WHEN** `vim.g.ue_android_device_serial` 已设置且 deployment workflow owner 收到当前 target driver 的部署 plan
+- **THEN** workflow owner 必须用该 serial 进行 transport probe 与所有 ADB 操作
+- **AND** 核心层不得自己重建 transport、serial 或 SO/APK 生命周期步骤
 
 #### Scenario: 两类 transport 都不满足前置条件
 

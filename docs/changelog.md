@@ -45,6 +45,41 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-08-24 — Canonicalize and archive the UE platform boundary contract
+
+**Task**
+
+将已完成的 `establish-ue-platform-workflow-boundaries` delta specs 同步到主规格，归档 change，
+并保证后续功能开发能从细颗粒 capability 直接读取 host、target、workflow 与 DAP owner 边界。
+
+**Implemented**
+
+- 新增 `host-platform-driver`、`shell-command-planning`、`platform-tool-resolution`、
+  `ue-target-driver-boundary`、`ue-target-workflow-boundary` 与 `dap-platform-dispatch` 六份 canonical specs。
+- 将 Android attach/F9/SO deployment、iOS build/run、Apple semantic prepare 与 multi-instance owner
+  freeze 的 delta 合并回既有主规格；从 Apple semantic spec 移除三条已被独立 capability 取代的重复架构要求。
+- 将 52/52 tasks 完成的 change 原样归档到
+  `openspec/changes/archive/2026-08-24-establish-ue-platform-workflow-boundaries/`，并保留其 schema、proposal、
+  design、tasks 与全部 delta specs。
+- 补全 `notification-history` 的 Purpose，使仓库所有主规格都满足 strict validation；运行时行为未改变。
+
+**Pitfalls / Gotchas**
+
+- 首轮 `openspec validate --all --strict` 唯一失败是未改动的 `notification-history` Purpose 过短警告；
+  该问题会使全仓 strict 门禁永久非零，已用一处目的说明补全收口。
+- OpenSpec archive 在 git 中表现为 active change 删除与 dated archive 新增；内容和 `.openspec.yaml` 均保留，
+  不是丢弃 change 工件。
+
+**Validation**
+
+- `openspec validate --all --strict`：36/36 passed；`openspec list --json`：active changes 为空。
+- `nvim --headless -l tests/run.lua structure`：40/40；`git diff --check`：通过。
+- 全量 `nvim --headless -l tests/run.lua`：1079/1079。
+
+**Follow-ups**
+
+- 无新增 follow-up；目标平台硬件验收限制与后续要求继续保留在 dated archive 和前一条实现记录中。
+
 ### 2026-08-21 — Establish enforceable UE host, target, workflow, and DAP boundaries
 
 **Task**

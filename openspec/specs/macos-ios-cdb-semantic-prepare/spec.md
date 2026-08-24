@@ -51,11 +51,7 @@ MUST：正常工作流必须先以 `:UEBuild` / `<leader>ub` 在当前 tuple 上
 
 ### Requirement: UEPrepare 不得触发编译但必须拥有 Apple semantic source 生成
 
-MUST：`UEPrepare` 不得触发 compile、Cook、Package、Deploy 或 Run。对保留 response files 的 target，
-它必须继续只读转换已有证据；对 macOS 主机上声明 `semantic_cdb` capability 的 IOS target，它必须在确认当前
-tuple 已有成功 build evidence 后执行不包含 compile action 的 UBT `GenerateClangDatabase`，再进入公共
-CDB/index pipeline。IOS 首次 prepare 还必须在 semantic source 生成前完成 prepared signing、私钥访问与
-设备 route setup。
+MUST：`UEPrepare` 不得触发 compile、Cook、Package、Deploy 或 Run。对保留 response files 的 target，它必须继续只读转换已有证据；对 macOS 主机上声明 `semantic_cdb` capability 的 IOS target，它必须在确认当前 tuple 已有成功 build evidence 后，显式委托 iOS readiness workflow 完成 prepared signing、私钥访问与设备 route setup，再执行不包含 compile action 的 UBT `GenerateClangDatabase`，然后进入公共 CDB/index pipeline。该委托必须保持现有 `:UEPrepare` / `<leader>up` 的用户行为不变，不得改变 build/package/install/launch 语义。
 
 #### Scenario: Apple target 缺少当前 tuple build evidence
 
@@ -83,6 +79,13 @@ CDB/index pipeline。IOS 首次 prepare 还必须在 semantic source 生成前�
 - **THEN** `UEPrepare` 必须直接复用该 semantic source
 - **AND** 不得再次启动 `Build.sh` 或 UnrealBuildTool
 - **AND** 新 build evidence 或 source 文件签名变化后必须重新生成并验证
+
+#### Scenario: IOS 首次 prepare 显式委托 readiness workflow
+
+- **WHEN** 当前 IOS tuple 已有成功 build evidence，但 prepared signing、私钥访问或 device route setup 尚未完成
+- **THEN** `UEPrepare` 必须先显式委托 iOS readiness workflow 完成这些前置条件
+- **AND** readiness workflow 成功后才可继续 semantic source 生成
+- **AND** 用户观察到的 `:UEPrepare` / `<leader>up` 行为必须与现有流程一致
 
 #### Scenario: 其他平台执行 prepare
 
@@ -153,54 +156,6 @@ MUST：系统必须在不阻塞 Neovim UI 的任务生命周期中执行预检�
 - **WHEN** 用户在 compile 或 prepare 阶段取消任务
 - **THEN** 系统必须终止后续阶段并标记 cancelled
 - **AND** 必须保留最后成功 CDB 和 clangd 会话可恢复状态
-
-### Requirement: host OS 与 Unreal target platform 必须分层
-
-MUST：系统必须使用独立 host driver 表达 Windows/macOS/Linux 宿主工具能力，并使用独立 target driver 表达 Android/IOS/Mac/Win64/Linux 目标策略；不得用一个 platform 分支同时表达两个维度。
-
-#### Scenario: macOS host 构建 IOS target
-
-- **WHEN** 当前 host 为 macOS 且 target 为 IOS
-- **THEN** 核心层必须组合 macOS host driver 与 IOS target driver
-- **AND** 不得把 Mac target driver 当作 IOS target 的实现
-
-#### Scenario: 不支持的 host-target 组合
-
-- **WHEN** target driver 请求 host driver 不具备的工具能力
-- **THEN** 系统必须返回结构化 unavailable 与缺失 capability
-- **AND** 不得隐式切换 host 或调用另一个 target driver
-
-### Requirement: 每个 Unreal target 的平台策略必须独立实现
-
-MUST：Android、IOS、Mac、Win64、Linux 必须分别拥有 target-driver 模块；平台特定的脚本、argv、RSP 分类、产物、设备与生命周期策略只能存在于对应模块。
-
-#### Scenario: IOS 与 Mac 都运行在 macOS
-
-- **WHEN** IOS driver 与 Mac driver 都请求 macOS `Build.sh`
-- **THEN** 两者必须分别构造和验证自己的 target argv 与 RSP 分类
-- **AND** 任一 driver 不得调用另一个 driver 的实现或读取其状态
-
-#### Scenario: 使用共享辅助函数
-
-- **WHEN** 多个 target driver 复用路径归一化或 argv 校验
-- **THEN** 共享 helper 必须无状态且不包含 target 选择、默认值、工具选择或产物策略
-- **AND** 平台策略仍必须保留在调用方 driver 内
-
-### Requirement: 核心调度层不得包含 target-specific 实现
-
-MUST：`lua/ue.lua` 或其后继核心调度模块必须只负责上下文解析、命令注册、任务编排和 target-driver dispatch。
-
-#### Scenario: 注册通用 UEBuild 命令
-
-- **WHEN** 核心层为当前 target 规划 build
-- **THEN** 必须通过 registry 解析 target driver 并调用统一 contract
-- **AND** 核心层不得包含 Android/IOS/Mac 脚本名称或 target 条件分支
-
-#### Scenario: 迁移现有 Android 实现
-
-- **WHEN** Android build/PowerShell/SO 策略从核心层迁入 Android driver
-- **THEN** 其既有 executable、argv、cwd、错误和用户命令行为必须保持兼容
-- **AND** 回归测试必须证明该迁移没有借机改变 Android 行为
 
 ### Requirement: clangd 启动必须绑定已解析工程的受控 CDB
 

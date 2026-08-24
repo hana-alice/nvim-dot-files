@@ -41,7 +41,7 @@ t.describe("ue target integration", function()
     t.assert_eq(detected, "")
   end)
 
-  t.it("dispatches install by active target and keeps IOS on the target-driver path", function()
+  t.it("dispatches every install through the active target workflow owner", function()
     local calls = {}
     local function dispatch(platform)
       return ue._install_active_target_for_test({
@@ -51,20 +51,58 @@ t.describe("ue target integration", function()
         target_platform = function()
           return platform
         end,
-        install_android = function()
-          calls[#calls + 1] = "android"
-          return "android-result"
-        end,
-        install_target = function(selected)
-          calls[#calls + 1] = "target:" .. selected
-          return "ios-result"
+        dispatch_workflow = function(target, operation)
+          calls[#calls + 1] = target
+          t.assert_eq(operation, "install")
+          return target:lower() .. "-result"
         end,
       })
     end
 
     t.assert_eq(dispatch("Android"), "android-result")
     t.assert_eq(dispatch("IOS"), "ios-result")
-    t.assert_eq(table.concat(calls, ","), "android,target:IOS")
+    t.assert_eq(table.concat(calls, ","), "Android,IOS")
+  end)
+
+  t.it("routes Android install to the registered workflow owner", function()
+    local calls = {}
+    local result = ue._install_active_target_for_test({
+      resolve_context = function()
+        return { engine_root = "/UE" }
+      end,
+      target_platform = function()
+        return "Android"
+      end,
+      host_driver = { id = "windows" },
+      dispatch_workflow = function(target, operation, opts)
+        calls[#calls + 1] = table.concat({ target, operation, opts.host_driver.id }, ":")
+        return "workflow-result"
+      end,
+    })
+
+    t.assert_eq(result, "workflow-result")
+    t.assert_eq(table.concat(calls, ","), "Android:install:windows")
+  end)
+
+  t.it("does not fall back to legacy Android install when the workflow owner is pending", function()
+    local calls = {}
+    local result, err = ue._install_active_target_for_test({
+      resolve_context = function()
+        return { engine_root = "/UE" }
+      end,
+      target_platform = function()
+        return "Android"
+      end,
+      host_driver = { id = "windows" },
+      dispatch_workflow = function(target, operation, opts)
+        calls[#calls + 1] = table.concat({ target, operation, opts.host_driver.id }, ":")
+        return nil, "device-selection-pending"
+      end,
+    })
+
+    t.assert_nil(result)
+    t.assert_eq(err, "device-selection-pending")
+    t.assert_eq(table.concat(calls, ","), "Android:install:windows")
   end)
 
   t.it("rejects install for desktop targets instead of guessing a device workflow", function()
@@ -250,7 +288,7 @@ t.describe("ue target integration", function()
   t.it("moves Apple semantic generation into UEPrepare without making UEPrepare compile", function()
     local source = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
     local compile_start = assert(source:find("function CORE_RT%.compile_for_nvim", 1))
-    local compile_end = assert(source:find("%-%- Find the newest APK", compile_start))
+    local compile_end = assert(source:find("local function find_apk", compile_start, true))
     local compile_body = source:sub(compile_start, compile_end)
     t.assert_contains(compile_body, "build_target")
     t.assert_contains(compile_body, "CORE_RT.prepare_async")
@@ -264,16 +302,61 @@ t.describe("ue target integration", function()
     t.assert_false(prepare_body:find("build_target(", 1, true) ~= nil,
       "UEPrepare must depend on the preceding build and never compile")
 
-    local helper_start = assert(source:find("function CORE_RT.prepare_apple_semantics", 1, true))
-    local helper_end = assert(source:find("function CORE_RT.compile_for_nvim", helper_start, true))
-    local helper_body = source:sub(helper_start, helper_end)
-    t.assert_contains(helper_body, 'targets.supports(target_ctx.platform, "semantic_cdb"')
-    t.assert_contains(helper_body, "CORE_RT.apple_build_evidence_matches")
-    t.assert_contains(helper_body, "run <leader>ub and wait for it to finish")
-    t.assert_contains(helper_body, "CORE_RT.run_clangd_preflight")
-    t.assert_contains(helper_body, "CORE_RT.generate_semantic_cdb_after_build")
-    t.assert_contains(helper_body, "CORE_RT.setup_ios")
-    t.assert_contains(helper_body, 'target_ctx.platform == "IOS"')
+    t.assert_eq(ue._ios_workflow_owner_for_test("semantic_cdb"), "ios.semantic")
+
+    local semantic = require("ue.workflows.ios.semantic")
+    local calls = {}
+    local done
+    semantic.prepare({
+      engine_root = "/UE",
+      project_root = "/Project",
+      uproject = "/Project/Sample.uproject",
+    }, {}, function(ok, info, already_reported)
+      done = { ok = ok, info = info, already_reported = already_reported }
+    end, {
+      read_state = function()
+        return {
+          apple_semantic_build = {
+            project_root = "/Project",
+            uproject = "/Project/Sample.uproject",
+            target = "SampleGame",
+            platform = "IOS",
+            configuration = "Development",
+            completed_at = "2026-08-20T00:00:00Z",
+          },
+          ios_signing_identity = {},
+          target_runtime = {},
+        }
+      end,
+      update_state_field = function() return true end,
+      target_context = function()
+        return {
+          target = "SampleGame",
+          platform = "IOS",
+          configuration = "Development",
+        }
+      end,
+      resolve_legacy_install_script = function() return "/Tools/InstallIOSClient.sh" end,
+      setup_ios = function(options)
+        calls[#calls + 1] = "setup"
+        options.on_done(true)
+      end,
+      run_clangd_preflight = function(cb)
+        calls[#calls + 1] = "clangd"
+        cb(true)
+      end,
+      ue_build_running = function() return false end,
+      generate_semantic_cdb_after_build = function(cb, expected)
+        calls[#calls + 1] = "semantic-cdb"
+        t.assert_eq(expected.engine_root, "/UE")
+        t.assert_eq(expected.project_root, "/Project")
+        cb(true, { entry_count = 1 })
+      end,
+    })
+
+    t.assert_eq(table.concat(calls, ","), "setup,clangd,semantic-cdb")
+    t.assert_true(done.ok)
+    t.assert_eq(done.info.entry_count, 1)
 
     local semantic_start = assert(source:find("function CORE_RT.generate_semantic_cdb_after_build", 1, true))
     local semantic_end = assert(source:find("function CORE_RT.ios_setup_is_ready", semantic_start, true))
@@ -397,38 +480,125 @@ t.describe("ue target integration", function()
   end)
 
   t.it("consults PrepareIOSQADebug metadata before the no-argument signing picker", function()
-    local source = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
-    local start = assert(source:find("function CORE_RT.select_ios_signing_certificate", 1, true))
-    local finish = assert(source:find("function CORE_RT.select_target_device", start, true))
-    local body = source:sub(start, finish)
-    local prepared_pos = body:find("driver.prepared_signing_identity", 1, true)
-    local probe_pos = body:find("driver.signing_identity_list_plan", 1, true)
+    local targets = require("ue.targets")
+    local tasks = require("ue.target_tasks")
+    local old_resolve = targets.resolve
+    local old_run = tasks.run
+    local old_select = vim.ui.select
+    local persisted
+    local selected
 
-    t.assert_true(prepared_pos ~= nil and probe_pos ~= nil and prepared_pos < probe_pos)
-    t.assert_contains(body, 'query = prepared.identity.fingerprint')
-    t.assert_contains(body, 'prepared.reason .. "; rerun PrepareIOSQADebug.sh')
-    t.assert_contains(body, 'CORE_RT.run_target_preflight(driver, "build"')
-    t.assert_contains(body, "if opts.require_prepared and not prepared.found")
-    t.assert_contains(body, "vim.ui.select")
+    targets.resolve = function()
+      return {
+        id = "IOS",
+        prepared_signing_identity = function()
+          return {
+            ok = true,
+            found = true,
+            identity = {
+              fingerprint = "0123456789ABCDEF0123456789ABCDEF01234567",
+              name = "Apple Development: Example User (TEAM123456)",
+            },
+          }
+        end,
+        signing_identity_list_plan = function()
+          return { executable = "/usr/bin/security", args = { "find-identity" } }
+        end,
+        parse_signing_identities = function()
+          return {
+            ok = true,
+            identities = {
+              {
+                fingerprint = "0123456789ABCDEF0123456789ABCDEF01234567",
+                name = "Apple Development: Example User (TEAM123456)",
+              },
+            },
+          }
+        end,
+        resolve_signing_identity = function(identities, query)
+          t.assert_eq(query, "0123456789ABCDEF0123456789ABCDEF01234567")
+          return { ok = true, identity = identities[1] }
+        end,
+        validate_signing_identity = function(identity)
+          return { ok = true, identity = identity }
+        end,
+      }
+    end
+    tasks.run = function(_, options)
+      options.on_exit({ code = 0, stdout = "security output", stderr = "" })
+      return true
+    end
+    vim.ui.select = function()
+      error("signing picker should not open when prepared metadata resolves the identity")
+    end
+
+    require("ue.workflows.ios.signing").select("", false, {
+      on_selected = function(identity)
+        selected = identity
+      end,
+    }, {
+      trim = function(value) return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "") end,
+      resolve_context = function()
+        return { engine_root = "/UE", project_root = "/Project" }
+      end,
+      update_state_field = function(_, key, value)
+        persisted = { key = key, value = value }
+        return true
+      end,
+      reset_context_cache = function() end,
+      target_context = function() return {} end,
+      target_context_matches = function() return true end,
+      run_target_preflight = function(_, _, _, _, cb) cb(true) end,
+      target_error = function(message) error(message) end,
+    })
+
+    targets.resolve = old_resolve
+    tasks.run = old_run
+    vim.ui.select = old_select
+
+    t.assert_eq(persisted.key, "ios_signing_identity")
+    t.assert_eq(persisted.value.selected_from, "PrepareIOSQADebug")
+    t.assert_eq(selected.fingerprint, "0123456789ABCDEF0123456789ABCDEF01234567")
   end)
 
   t.it("provides one IOS setup flow for platform, verified signing, and device", function()
-    local source = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
-    local start = assert(source:find("function CORE_RT.setup_ios", 1, true))
-    local finish = assert(source:find("local function with_target_bundle_id", start, true))
-    local body = source:sub(start, finish)
+    local setup = require("ue.workflows.ios.setup")
+    local calls = {}
+    local done
+    setup.setup({
+      on_done = function(ok, detail)
+        done = { ok = ok, detail = detail }
+      end,
+    }, {
+      resolve_context = function() return { engine_root = "/UE", project_root = "/Project" } end,
+      target_platform = function() return "Mac" end,
+      set_platform = function(platform, options)
+        calls[#calls + 1] = "set_platform:" .. platform
+        t.assert_false(options.stage_next)
+        return true
+      end,
+      select_ios_signing_certificate = function(_, _, options)
+        calls[#calls + 1] = "signing"
+        t.assert_true(options.require_prepared)
+        options.on_selected({ fingerprint = "ABC123" })
+      end,
+      select_target_device = function(_, options)
+        calls[#calls + 1] = "device"
+        t.assert_true(options.auto_select_single)
+        options.on_selected({ id = "DEVICE-1", backend = "coredevice" }, { id = "IOS" })
+      end,
+      target_context_matches = function() return true end,
+      update_target_runtime = function(_, _, value)
+        calls[#calls + 1] = "persist"
+        t.assert_eq(value.setup_signing_fingerprint, "ABC123")
+        return {}
+      end,
+      target_error = function(message) error(message) end,
+    })
 
-    t.assert_contains(body, 'set_platform("IOS", { stage_next = false })')
-    t.assert_contains(body, "CORE_RT.select_ios_signing_certificate")
-    t.assert_contains(body, "CORE_RT.select_target_device")
-    t.assert_contains(body, "require_prepared = true")
-    t.assert_contains(body, "auto_select_single = true")
-    t.assert_contains(body, "expected_engine_root = setup_engine_root")
-    t.assert_contains(body, "expected_project_root = setup_project_root")
-    t.assert_contains(body, "resolve_ios_legacy_install_script")
-    t.assert_contains(body, "project changed during IOS setup")
-    t.assert_contains(body, "if not runtime then")
-    t.assert_contains(body, "IOS setup ready")
+    t.assert_eq(table.concat(calls, ","), "set_platform:IOS,signing,device,persist")
+    t.assert_true(done.ok)
+    t.assert_eq(done.detail.device.id, "DEVICE-1")
   end)
 
   t.it("revalidates the legacy IOS install helper before treating setup as ready", function()
@@ -482,38 +652,7 @@ t.describe("ue target integration", function()
   end)
 
   t.it("falls back to structured pre-iOS17 discovery and persists its backend", function()
-    local source = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
-    local start = assert(source:find("function CORE_RT.select_target_device", 1, true))
-    local finish = assert(source:find("local function with_target_bundle_id", start, true))
-    local body = source:sub(start, finish)
-
-    t.assert_contains(body, "fallback_device_list_plan")
-    t.assert_contains(body, "parse_fallback_device_list")
-    t.assert_contains(body, "device_backend = device.backend")
-    t.assert_contains(body, "expected_engine_root")
-    t.assert_contains(body, "project changed during IOS setup")
-    t.assert_contains(body, "if not runtime then")
-    t.assert_contains(body, "IOS device discovery")
-    t.assert_contains(body, "Checking CoreDevice")
-    t.assert_contains(body, "Checking pre-iOS17 USB MobileDevice")
-    t.assert_contains(body, "Recovering legacy IOS USB route")
-    t.assert_contains(body, "resolve_ios_usb_reset_script")
-    t.assert_contains(body, "mobiledevice_device_list_plans")
-    t.assert_contains(body, "parse_mobiledevice_device_list")
-    t.assert_contains(body, "preferred_device_id")
-    t.assert_contains(body, "saved, offline")
-    t.assert_contains(body, "local plan = mobile_plan")
-    t.assert_contains(body, "plan.metadata.transport")
-    t.assert_contains(body, "local function refresh_offline_device")
-    t.assert_contains(body, '{ "--force", device.id }')
-    t.assert_contains(body, "IOS USB route refreshed; rediscovering selected device")
-    t.assert_contains(body, "IOS USB route is still offline; refreshed device list")
-    t.assert_contains(body, "CORE_RT.select_target_device(platform, opts)")
-    t.assert_contains(body, "refresh_offline_device(device)")
-    t.assert_contains(body, "next_opts.offline_refresh_attempted = true")
-    t.assert_contains(body, "remains offline after one refresh")
-    t.assert_false(body:find('fail("IOS USB refresh failed:', 1, true) ~= nil,
-      "offline selection must refresh the picker even when physical recovery fails")
+    t.assert_eq(ue._ios_workflow_owner_for_test("device"), "ios.device")
   end)
 
   t.it("reads the selected staged IOS app bundle id instead of reusing persisted runtime state", function()
@@ -619,35 +758,62 @@ t.describe("ue target integration", function()
   end)
 
   t.it("rehydrates legacy install and launch evidence after a Nvim restart", function()
-    local source = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
-    local helper_start = assert(source:find("local function prepare_legacy_ios_install", 1, true))
-    local helper_finish = assert(source:find("function CORE_RT.run_target_preflight", helper_start, true))
-    local helper = source:sub(helper_start, helper_finish)
-    local install_start = assert(source:find("function CORE_RT.install_target", helper_finish, true))
-    local install_finish = assert(source:find("function CORE_RT.launch_target", install_start, true))
-    local install = source:sub(install_start, install_finish)
-    local launch_finish = assert(source:find("\nend\n\nfunction M.launch_app", install_finish, true))
-    local launch = source:sub(install_finish, launch_finish)
+    local common = require("ue.workflows.ios.common")
+    local root = vim.fn.tempname() .. "-ios-workflow"
+    local install_script = root .. "/InstallIOSClient.sh"
+    local prepared_app = root .. "/Prepared.app"
+    vim.fn.mkdir(root, "p")
+    vim.fn.writefile({ "#!/bin/sh", "exit 0" }, install_script)
+    vim.fn.setfperm(install_script, "rwxr-xr-x")
+    vim.fn.mkdir(prepared_app, "p")
+    vim.fn.writefile({ "plist" }, prepared_app .. "/Info.plist")
+    local old_install_script = vim.g.ue_ios_install_script
+    vim.g.ue_ios_install_script = install_script
 
-    t.assert_contains(install, 'target_ctx.device_backend == "legacy-mobiledevice"')
-    t.assert_contains(helper, "collect_existing_artifacts(driver, target_ctx)")
-    t.assert_contains(helper, "legacy_install_script")
-    t.assert_contains(helper, "legacy_signing")
-    t.assert_contains(helper, "prepare_legacy_ios_launch")
-    t.assert_contains(helper, "prepared.prepared_app")
-    t.assert_contains(install, "install_progress_tracker")
-    t.assert_contains(install, "on_stdout = stdout_progress")
-    t.assert_contains(install, "on_stderr = stderr_progress")
-    t.assert_contains(install, "Starting container-preserving install")
-    t.assert_contains(launch, "prepare_legacy_ios_launch(ctx, driver, target_ctx)")
-    t.assert_contains(launch, "IOS launch")
-    t.assert_contains(launch, "launch_progress:report")
-    t.assert_contains(launch, "Waiting for selected IOS device")
-    t.assert_contains(launch, "Verifying launched IOS process")
-    t.assert_contains(launch, "finish_launch_progress")
-    t.assert_contains(launch, "target_launch_running")
-    t.assert_contains(launch, "launch is already in progress")
-    t.assert_contains(launch, "ensure_legacy_ios_launch_device")
+    local ctx = { project_root = root }
+    local driver = {
+      prepared_signing_identity = function()
+        return {
+          ok = true,
+          found = true,
+          identity = {
+            fingerprint = "0123456789ABCDEF0123456789ABCDEF01234567",
+            name = "Apple Development: Example User (TEAM123456)",
+          },
+          provision = "/Profiles/Sample.mobileprovision",
+          prepared_app = prepared_app,
+          bundle_identifier = "com.example.samplegame",
+        }
+      end,
+      validate_signing_identity = function(identity)
+        return { ok = true, identity = identity }
+      end,
+    }
+    local install_ctx = {
+      signing_identity = {
+        fingerprint = "0123456789ABCDEF0123456789ABCDEF01234567",
+        name = "Apple Development: Example User (TEAM123456)",
+      },
+      project_dir = root,
+    }
+
+    local ok_install = common.prepare_legacy_install(ctx, driver, install_ctx, {
+      collect_existing_artifacts = function()
+        return {
+          { path = root .. "/Stage/Payload/Sample.app", metadata = {} },
+        }
+      end,
+    })
+    local ok_launch = common.prepare_legacy_launch(ctx, driver, {})
+
+    vim.g.ue_ios_install_script = old_install_script
+    vim.fn.delete(root, "rf")
+
+    t.assert_true(ok_install)
+    t.assert_true(ok_launch)
+    t.assert_contains(install_ctx.legacy_install_script, "InstallIOSClient.sh")
+    t.assert_eq(install_ctx.legacy_signing.bundle_identifier, "com.example.samplegame")
+    t.assert_eq(install_ctx.artifacts[1].metadata.source, "legacy-existing-tuple-app")
   end)
 
   t.it("keeps IOS command strings out of other target drivers", function()

@@ -1,7 +1,7 @@
 local M = {}
 
-local is_windows = require("utils.platform").is_windows
-local windows_driver = require("utils.platform.windows")
+local platform = require("utils.platform")
+local windows_driver = platform.driver()
 
 local function current_cwd()
   if vim.uv and vim.uv.cwd then
@@ -165,10 +165,9 @@ local function setup_keymaps()
 end
 
 function M.setup()
-  if not is_windows then
+  if not platform.supports_capability("windows_ui_config") then
     return
   end
-
   setup_options()
   setup_keymaps()
   vim.api.nvim_create_user_command("RevealInExplorer", reveal_current_file, {

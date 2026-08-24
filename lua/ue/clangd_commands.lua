@@ -4,6 +4,7 @@
 -- BackgroundIndex work is bounded. Exact commands for open files travel over
 -- clangd's compiler-owned compilationDatabaseChanges protocol extension.
 local M = {}
+local platform = require("utils.platform")
 
 local cache = {}
 local pending = {}
@@ -98,19 +99,14 @@ local function base_cdb(semantic_dir)
 end
 
 local function python_command()
-  for _, candidate in ipairs({
-    vim.env.UE_PYTHON or "",
-    vim.fn.expand("~/AppData/Local/Programs/Python/Python312/python.exe"),
-    vim.fn.expand("~/AppData/Local/Programs/Python/Python313/python.exe"),
-    vim.fn.exepath("python"),
-    vim.fn.exepath("python3"),
-  }) do
-    if candidate and candidate ~= "" then
-      local path = norm(candidate)
-      if (vim.uv or vim.loop).fs_stat(path) then return path end
-    end
-  end
-  return nil
+  local resolved = platform.resolve_tool({
+    name = "python",
+    env = { "UE_PYTHON" },
+    driver_candidates = function(driver)
+      return driver.python_candidates()
+    end,
+  })
+  return resolved.ok and norm(resolved.path) or nil
 end
 
 local function notify(client, method, params, bufnr)

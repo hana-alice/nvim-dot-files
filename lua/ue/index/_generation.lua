@@ -4,6 +4,7 @@ return function(M, core)
   local fs = require("ue.core.fs")
   local _ufs = fs
   local _uproc = require("ue.core.proc")
+  local _uplat = require("utils.platform")
   local RT = core.RT
 
   local INDEX_COVERAGE_RANK = {
@@ -213,17 +214,27 @@ return function(M, core)
       TOOLCHAIN_IDENTITY_CACHE[cache_key] = identity
       return identity
     end
-    local clangd = vim.fn.exepath("clangd") or ""
-    local indexer = _uproc.first_executable({
-      "/mnt/c/Program Files/LLVM/bin/clangd-indexer.exe",
-      "clangd-indexer",
-      "clangd-indexer.exe",
-      "C:/Program Files/LLVM/bin/clangd-indexer.exe",
-    }) or ""
+    local clangd_resolved = _uplat.resolve_tool({
+      name = "clangd",
+      env = { "UE_CLANGD" },
+      config = { "clangd.candidates_extra" },
+      driver_candidates = function(driver)
+        return driver.default_clangd_candidates()
+      end,
+    })
+    local indexer_resolved = _uplat.resolve_tool({
+      name = "clangd-indexer",
+      env = { "UE_CLANGD_INDEXER" },
+      driver_candidates = function(driver)
+        return driver.clangd_indexer_candidates()
+      end,
+    })
+    local clangd = clangd_resolved.ok and clangd_resolved.path or ""
+    local indexer = indexer_resolved.ok and indexer_resolved.path or ""
     return stable_hash({
       clangd = executable_identity(clangd),
       clangd_indexer = executable_identity(indexer),
-      os = jit and jit.os or "",
+      os = (_uplat.driver() or {}).id or _uplat.id or "",
     }) or ""
   end
 

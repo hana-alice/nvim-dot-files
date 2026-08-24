@@ -45,6 +45,57 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-08-21 — Establish enforceable UE host, target, workflow, and DAP boundaries
+
+**Task**
+
+审计既有 platform/target 分层是否落实，把持续回流 `lua/ue.lua` 的 host tool、Android/iOS lifecycle 与 DAP
+session policy 迁回明确 owner，并以更细 OpenSpec capability 和 repo-wide AST 门禁防止后续开发顾此失彼。
+
+**Implemented**
+
+- 新增 `lua/ue/workflows/` registry、immutable operation snapshot、policy-free runtime，以及按 operation 拆分的
+  Android build/install/deploy/launch/log 与 iOS semantic/signing/device/setup/install/launch owner；`lua/ue.lua`
+  只保留兼容 façade、context 注入与 generic dispatch，公共 API、81 个 UE commands、状态键和 cache path 不变。
+- 将 clipboard、code search、Python/clangd/libclang/lldb/CDB tool resolution 与 shell/executable 选择收口到
+  `utils.platform` capability/resolver；target driver 继续只产 structured plan，host-target-operation matrix 保持
+  fail closed 且不跨 target fallback。
+- DAP lifecycle 绑定 immutable session owner metadata，stop/status/reattach/cleanup 不再按 live selection 猜 target；
+  Android F9 保持 live breakpoint 通道，不再提示 reattach。
+- 新增六类 Lua Tree-sitter AST boundary rules，扫描全部 production Lua 并要求零 active exception；将
+  `lua/ue.lua` ratchet 从 12,002 下调到 10,562 行，新增 workflow 保持 800 行上限，并用 synthetic +1/801
+  fixtures 证明门禁会失败。
+- 更新 architecture、CONSTRAINTS、测试映射、本地 `AGENTS.md` 与历史 ADR 状态；新增 OpenSpec change
+  `establish-ue-platform-workflow-boundaries`，把 host/tool、target driver、workflow、DAP 和 boundary guard
+  拆成独立 canonical capability。
+
+**Pitfalls / Gotchas**
+
+- 全量首轮发现 AI context 会把 structured unavailable table 当字符串渲染；`lua/ue/ai_context.lua` 现在统一
+  取 `reason/message` 后再输出，避免对非字符串调用 `gsub`。
+- 当前验证 host 是 macOS；依赖 `powershell.exe` 的 Windows fake-runner 分支会按既有 guard 跳过，真实
+  Android/iOS 设备 install/launch/DAP 也未执行。本次不改变这些脚本与真机路线，只迁移 owner 和 dispatch。
+- 仓库历史 Lua 并非全量 Stylua-clean；本次只格式化并检查 21 个新增非-fixture Lua 文件，避免无关整仓重排。
+
+**Validation**
+
+- Host/tool：`platform` 39/39、`utils` 49/49、`grep_cache` 29/29、`csearch_build_guard` 22/22、
+  `ue_goto_behavior` 8/8、`ue_paths` 9/9、`index_generation` 25/25、`cpp_semantic_index` 1/1、
+  `clangd_commands` 5/5。
+- Workflow/core：`ue_workflows` 24/24、`ue_target_drivers` 46/46、`ue_target_integration` 26/26、
+  `ue_target_tasks` 7/7、`android_device` 14/14、`multi_instance_state` 13/13、`ue_project_context` 7/7、
+  `ue_context` 13/13、`ue_api` 55/55、`commands` 105/105、`smoke` 19/19。
+- DAP/structure：`dap` 71/71、`ue_platform_boundary` 9/9、`structure` 40/40、`keymaps` 56/56、
+  `stability` 10/10。
+- 静态/规格：`lint_no_bare_globals` 160 files OK；21 个新增非-fixture Lua 文件 `stylua --check` 通过；
+  `openspec validate establish-ue-platform-workflow-boundaries --strict` valid；`git diff --check` 通过。
+- 全量：`nvim --headless -l tests/run.lua` 1079/1079。
+
+**Follow-ups**
+
+- 在 Windows + Android 真机与 macOS + iOS 真机环境分别补一次 install/launch/DAP 手工验收；自动化边界、
+  plan/argv、snapshot、failure/cleanup 契约已覆盖，硬件 transport 仍以目标环境实测为准。
+
 ### 2026-08-20 — Close self-review portability and evidence gaps before PR
 
 **Task**

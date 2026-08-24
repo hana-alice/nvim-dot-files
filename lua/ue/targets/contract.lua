@@ -18,7 +18,6 @@ local OPTIONAL_FUNCTIONS = {
   "validate_preflight",
   "artifact_candidates",
   "bundle_id_plan",
-  "before_build",
   "so_build_plan",
   "so_deploy_plan",
   "log_plan",

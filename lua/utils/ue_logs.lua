@@ -1,6 +1,5 @@
 local M = {}
 
-local android_device = require("utils.android_device")
 local MAX_LOG_LINES = 12000
 
 local state = {
@@ -282,60 +281,6 @@ local function desktop_ue_log_spec(env, ctx)
   }
 end
 
-local function android_package_name(env, ctx)
-  local package_name = env.trim((ctx.state or {}).android_package or "")
-  if package_name == "" then
-    package_name = env.trim(vim.fn.input("Android package name: ", ""))
-  end
-  if package_name == "" then
-    return nil, "Android package name is required"
-  end
-
-  if ctx.engine_root and package_name ~= env.trim((ctx.state or {}).android_package or "") then
-    env.update_state_field(ctx.engine_root, "android_package", package_name)
-  end
-
-  return package_name
-end
-
-local function android_logcat_spec(env, ctx)
-  local package_name, package_err = android_package_name(env, ctx)
-  if not package_name then
-    return nil, package_err
-  end
-
-  local adb = vim.fn.exepath("adb")
-  adb = adb ~= "" and adb or "adb"
-  if vim.fn.executable(adb) ~= 1 and not env.is_file(adb) then
-    return nil, "adb not found in PATH"
-  end
-
-  local serial = android_device.get()
-  if not serial then
-    return nil, "Android device is not selected; run :UESetAndroidDevice"
-  end
-  local host_driver = env.host_driver or require("utils.platform").driver()
-  local plan = require("ue.targets").plan("Android", "log", {
-    cwd = vim.fn.getcwd(),
-    adb = adb,
-    device_id = serial,
-    package_name = package_name,
-  }, host_driver)
-  local cmd, command_err = require("ue.target_tasks").command(plan)
-  if not cmd then
-    return nil, command_err
-  end
-
-  return {
-    kind = "android_logcat",
-    source_id = serial .. ":" .. package_name,
-    title = "Android Logcat",
-    summary = ("%s on %s"):format(package_name, serial),
-    cmd = cmd,
-    cwd = plan.cwd or vim.fn.getcwd(),
-  }
-end
-
 local function desktop_debug_log_spec(env)
   local host_driver = env.host_driver or require("utils.platform").driver()
   if type(host_driver.debug_log_plan) ~= "function" then
@@ -521,7 +466,16 @@ local function toggle_spec(env, spec)
 end
 
 local LOG_STRATEGIES = {
-  ["android-logcat"] = android_logcat_spec,
+  ["android-logcat"] = function(env, ctx, driver, host_driver)
+    return require("ue.workflows").dispatch(driver.id, "log", {
+      host_driver = host_driver,
+      payload = {
+        env = env,
+        context = ctx,
+        reinvoke = function() M.toggle_main_log(env) end,
+      },
+    })
+  end,
   ["desktop-file"] = desktop_ue_log_spec,
   ["desktop-debug"] = desktop_debug_log_spec,
   unavailable = function(_, _, driver)
@@ -548,20 +502,13 @@ local function resolve_spec(env, mode)
   if not resolver then
     return nil, "Unknown log strategy: " .. tostring(strategy), strategy
   end
-  local spec, spec_err = resolver(env, ctx, driver)
-  return spec, spec_err, strategy
+  return resolver(env, ctx, driver, host_driver)
 end
 
 function M.toggle_main_log(env)
-  local spec, err, strategy = resolve_spec(env, "main")
+  local spec, err = resolve_spec(env, "main")
   if not spec then
-    if strategy == "android-logcat" and err == "Android device is not selected; run :UESetAndroidDevice" then
-      android_device.ensure({ prompt = "Select Android device for UE logcat:" }, function(serial)
-        if serial then M.toggle_main_log(env) end
-      end)
-      return
-    end
-    vim.notify(err, vim.log.levels.WARN)
+    if err then vim.notify(err, vim.log.levels.WARN) end
     return
   end
   toggle_spec(env, spec)
@@ -577,7 +524,7 @@ function M.toggle_debug_log(env)
 end
 
 function M._android_logcat_spec_for_test(env, ctx)
-  return android_logcat_spec(env, ctx)
+  return require("ue.workflows").invoke("Android", "log", "resolve", { env, ctx }, env.host_driver)
 end
 
 return M

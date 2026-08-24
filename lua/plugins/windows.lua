@@ -1,4 +1,4 @@
-if not require("utils.platform").is_windows then
+if not require("utils.platform").supports_capability("windows_ui_config") then
   return {}
 end
 

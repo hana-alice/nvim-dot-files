@@ -234,15 +234,8 @@ function M.install(client, deps)
 
   local function sibling_libclang(clangd)
     if not clangd then return nil end
-    local bin = vim.fs.dirname(clangd)
-    local parent = vim.fs.dirname(bin)
-    for _, candidate in ipairs({
-      vim.fs.joinpath(bin, "libclang.dll"),
-      vim.fs.joinpath(bin, "libclang.so"),
-      vim.fs.joinpath(bin, "libclang.dylib"),
-      vim.fs.joinpath(parent, "lib", "libclang.so"),
-      vim.fs.joinpath(parent, "lib", "libclang.dylib"),
-    }) do
+    local platform = require("utils.platform")
+    for _, candidate in ipairs(platform.libclang_candidates(clangd)) do
       if uv.fs_stat(candidate) then return vim.fs.normalize(candidate) end
     end
     return nil

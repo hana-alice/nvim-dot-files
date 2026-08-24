@@ -1,5 +1,9 @@
 # Phase I — `ue.config` Schema Expansion
 
+> **Historical snapshot / superseded.** 本文记录最初 schema 设计，`codelldb_path`
+> 等键名和 inline-location 描述不再是当前事实。现行 schema 以 `lua/ue/config.lua`
+> 与 OpenSpec `platform-tool-resolution` 为准。
+
 > **Status**: Proposed → I.1 (schema spec frozen) approved
 > **Branch**: `feat/multi-platform-foundation`
 > **Owner**: config maintainer

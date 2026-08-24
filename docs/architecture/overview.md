@@ -19,7 +19,7 @@
 | CDB 流水线 | `lua/ue/cdb/` | compile_commands.json 生成/裁剪/shader/inject | 纯函数 + 子进程；写前 skip-if-unchanged |
 | 配置 schema | `lua/ue/config.lua` | `index/context/clangd/dap/cdb` 默认值 + override | `get/setup/options/reset_for_test` |
 | 核心工具 | `lua/ue/core/` | fs / proc 纯函数 | 无副作用，可 headless 断言 |
-| DAP 调试 | `lua/ue/dap/` | codelldb 适配 + 各平台 attach/launch | `platforms` 注册表是唯一 dispatch seam |
+| DAP 调试 | `lua/ue/dap/` | session-owner dispatch + 各平台 attach/launch | `platforms` 注册表是唯一 dispatch seam |
 | Android device | `lua/utils/android_device.lua` | `adb devices -l` 枚举、当前进程 serial 选择、`adb -s` argv | `vim.g.ue_android_device_serial` 是本 Neovim 进程的交互真相；活跃任务捕获 serial |
 | Android SO 迭代 | `lua/ue/targets/android.lua` + `android_windows.lua` + `scripts/ue_android_so_*.ps1` + `scripts/ue_android_so_agent.c` | Windows host 上的 SO-only UBT action 执行；root 原子替换或 debuggable app-private ClassLoader 重定向 | Windows-only compatibility adapter；不增加 macOS→Android；正常 APK 流程保持独立 |
 | UE target drivers | `lua/ue/targets/` | Android / IOS / Mac / Win64 / Linux 的 UBT、UAT、产物和设备策略 | 各 target 独立实现；不得跨 driver fallback |
@@ -117,7 +117,9 @@
   用 host-owned `ios-deploy --noinstall --justlaunch` 启动后复查 PID，因此 Nvim 重启不要求重做 package/install，也不触发签名
   私钥检查；两条 iOS run 路径都不隐式进入 DAP。
 - **DAP**：setup 先按 host-target-operation matrix 过滤 handler，再由 `UEDAP*` 命令经
-  `ue.dap.platforms` dispatch → 具体平台 `attach/launch` → `lldb-dap`。iOS 不借用 Mac process
+  `ue.dap.platforms` dispatch → 具体平台 `attach/launch` → `lldb-dap`。attach/launch 开始时
+  捕获不可变的 session owner；后续 stop/status/reattach/cleanup 只按该 owner dispatch，UI 的当前
+  target 或 device selection 改变不得劫持活跃会话。iOS 不借用 Mac process
   attach：`ios-deploy --nolldb` 只负责 legacy USB debugserver loopback bridge，Apple LLDB 选择
   `remote-ios` + 精确 DeviceSupport sysroot，以本地 symbol-rich Mach-O 创建 target，并映射设备 app
   executable。`UEDAPLaunch` 经 `SBProcess.RemoteLaunch(..., stop_at_entry=true)` 在断点下发前保持停住；
@@ -141,7 +143,18 @@
 | Neovim 内建 | shada、persistent undo、swap | 保持 Neovim 原生语义，不用 UE project selector 重定向 |
 | 纯诊断 | custom debug/grep/DAP trace、`nvim-dap` main/stdout/stderr logs | 全部按 PID 分文件；任一实例不会 truncate/rotate 另一实例 |
 
-## 3. 平台分层（platform layers）
+## 3. 平台与工作流分层（platform and workflow layers）
+
+平台相关功能按以下五层单向组合：
+
+1. host capability 解析可执行文件、路径和宿主能力；
+2. target driver 生成不含副作用的结构化 plan；
+3. target workflow 拥有目标平台的设备交互、UI 决策、异步阶段与 rollback；
+4. generic runner 只执行显式 plan，不解释 target 名称；
+5. `ue.lua` facade 只解析公共上下文、查 registry 并调用上述入口。
+
+依赖只能由后层指向前层。host capability 不得 import UE 模块，target driver 不得执行命令或调用
+workflow，generic runner 与 facade 不得通过 target literal 重建平台策略。
 
 - **Host layer** `lua/utils/platform/`：`windows/macos/linux/stub` 四驱动共享 path/process/tool
   入口契约；Xcode tools 是 macOS-only capability，PowerShell/debug-output/PCH build 是
@@ -153,12 +166,22 @@
 - **Target layer** `lua/ue/targets/`：`android/ios/mac/win64/linux` 分别拥有目标平台参数、产物、
   设备、runtime strategy 与失败语义。共享 `_common.lua` 只能做 policy-free 的 argv/path/schema
   操作；任一 target driver 不得调用另一个 target driver。
+- **Target workflow layer** `lua/ue/workflows/<target>/`：拥有 target-specific 的 UI、设备 I/O、
+  install/launch/signing/deploy 阶段、取消与 rollback。workflow 必须先捕获 immutable snapshot，后续
+  callback 不得重读 mutable project/target/device selection；跨目标复用只允许 policy-free runtime
+  helper，不允许从一个 target workflow fallback 到另一个 target workflow。
+- **Workflow registry** `lua/ue/workflows/`：以 `(target, operation)` 为 key 注册 workflow owner；
+  facade 只能通过 registry dispatch，generic 层与 `ue.lua` 都不得手写 target `if/else` 旁路。
 - **Composition resolver** `ue.targets.resolve(target, operation, host_driver)`：以各 target 的
   `host_operations` 为唯一兼容性真相。`:UESetPlatform` 的候选也由 `build` operation 过滤；模块可
   import、磁盘上有 foreign artifact 或 host 恰好有某工具，都不能绕过 matrix。
-- `lua/ue.lua` 只解析上下文、查 registry、执行结构化 plan；不得承载 IOS/Android/Mac 命令参数。
-- runtime orchestrator 读取 target driver 的 `runtime.launch/main_log/debug_log.strategy`，不按 target
-  名写 `if/else`；DAP 平台层经 matrix-filtered `platforms` 注册表接入。
+- **Generic runner** 执行 plan 与 workflow 声明的通用 async 生命周期，不按 target 名写 `if/else`；
+  所有 mutable 输入都必须在启动时冻结进 snapshot。
+- **Facade** `lua/ue.lua` 只解析公共上下文、查 registry 并调用结构化入口；不得承载
+  IOS/Android/Mac 命令参数、设备策略、签名流程或 rollback。
+- runtime orchestrator 读取 target driver 的 `runtime.launch/main_log/debug_log.strategy`；DAP 平台层经
+  matrix-filtered `platforms` 注册表接入，并以冻结的 session owner 路由 stop/status/reattach/cleanup
+  生命周期，后续不得回退到“当前 target/platform”推断。
 
 ### 当前 host-target-operation matrix
 
@@ -173,7 +196,7 @@ matrix 声明与回归，不能在 generic orchestration 中添加 shell/path �
 
 ## 4. 构建流水线（build pipeline）
 
-- 外部工具链版本钉死见 `docs/CONSTRAINTS.md §三 C1`（clangd/LLVM 22.1.x、codelldb 1.12.2、
+- 外部工具链版本钉死见 `docs/CONSTRAINTS.md §三 C1`（clangd/LLVM 22.1.x、`lldb-dap`、
   NDK lldb-server、Neovim 0.10+）。
 - CDB 生成器（`tools/*.py` + `lua/ue/cdb/*`）：super-unity / prune / inject，写前比对跳过。
 - CDB mutation 由 `lua/ue/cdb/pipeline.lua` 进程内 slot + filesystem lease 双层串行化；
@@ -196,6 +219,12 @@ matrix 声明与回归，不能在 generic orchestration 中添加 shell/path �
 - **OS 分支**只在 `lua/utils/platform/`。
 - **Target-specific 策略**只在对应的 `lua/ue/targets/<target>.lua`；共享宿主不等于共享 target
   （尤其 IOS 与 Mac），禁止跨 driver 调用或 fallback。
+- **Target-specific 副作用编排**只在对应的 `lua/ue/workflows/<target>/`；`ue.lua` 与 generic runner
+  不能持有 target literal、平台命令模板、设备恢复或签名状态机。每个异步 workflow 只消费启动时
+  捕获的 snapshot，并明确完成、失败、取消与 rollback terminal state。
+- **Production boundary guard** 由 `tests/cases/ue_platform_boundary_spec.lua` 的 Tree-sitter AST contract
+  维护；`ue.lua` 的 numeric ratchet 与新增 workflow 文件 800 行上限由 `tests/cases/structure_spec.lua`
+  共同守门，禁止把 target policy 重新塞回 facade。
 - **Android 设备选择**只在 `lua/utils/android_device.lua`；调用点消费 selected serial，
   `vim.g` 的 global 明确指当前 Neovim 进程而非所有实例；活跃长流程只消费启动时捕获的 serial，
   禁止中途重读后跨设备。
@@ -217,3 +246,9 @@ matrix 声明与回归，不能在 generic orchestration 中添加 shell/path �
 
 完成的硬标准在根 `CLAUDE.md` 的 Definition of Done（回归 / changelog / milestone）。
 进入任意子系统目录先读其 `CLAUDE.md`（无则回落最近祖先）。
+
+平台边界由 `ue_platform_boundary` filter 使用 Lua Tree-sitter AST 执行：禁止 generic production Lua
+直接探测 OS、用兼容 boolean 决定行为、按 concrete target literal 分支、构造宿主 executable/path、
+持有 target policy literal 或 import concrete/cross-target owner。registry 数据、命令声明与 UI 文本只能
+使用绑定规则、精确文件和理由的 AST-context allowlist；不得目录级放行。`stability` filter 同时对
+`lua/ue.lua` 使用只减不增的数值 ratchet，并维持新 workflow Lua 文件 800 行上限。

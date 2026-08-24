@@ -24,6 +24,93 @@ t.describe("ue.dap.platforms: 注册与查找", function()
     t.assert_nil(p.launch_handler("xtest"))
     p._reset_for_test()
   end)
+
+  t.it("freezes lifecycle dispatch on the bound session owner", function()
+    p._reset_for_test()
+    local calls = {}
+    p.register_attach("alpha", function() calls[#calls + 1] = "attach:alpha" end)
+    p.register_attach("beta", function() calls[#calls + 1] = "attach:beta" end)
+    p.register_lifecycle("alpha", {
+      stop = function(opts) calls[#calls + 1] = "stop:" .. opts.owner.owner end,
+      status = function(opts) calls[#calls + 1] = "status:" .. opts.owner.owner end,
+      reattach = function(opts) calls[#calls + 1] = "reattach:" .. opts.owner.owner end,
+      cleanup = function(opts) calls[#calls + 1] = "cleanup:" .. opts.owner.owner end,
+    })
+    p.register_lifecycle("beta", {
+      stop = function(opts) calls[#calls + 1] = "stop:" .. opts.owner.owner end,
+    })
+
+    local started = p.begin("attach", "alpha", { device_id = "DEVICE-A" })
+    t.assert_true(started)
+    local session = {
+      config = {
+        type = "lldb",
+        _ue_session_owner = "alpha",
+        _ue_session_operation = "attach",
+      },
+    }
+    local owner, bind_err = p.bind_session(session, { device_id = "DEVICE-A", process_id = 4242 })
+    t.assert_nil(bind_err)
+    t.assert_eq(owner.owner, "alpha")
+    t.assert_eq(owner.process_id, 4242)
+
+    -- A later UI/platform choice may prepare another invocation, but the
+    -- existing session lifecycle remains bound to alpha.
+    p.begin("attach", "beta")
+    local stopped, stop_err = p.dispatch_lifecycle("stop", { session = session })
+    t.assert_true(stopped, stop_err and stop_err.reason)
+    t.assert_eq(calls[#calls], "stop:alpha")
+
+    local cleaned, cleanup_err = p.dispatch_lifecycle("cleanup", { session = session, reason = "device-disconnect" })
+    t.assert_true(cleaned, cleanup_err and cleanup_err.reason)
+    t.assert_eq(calls[#calls], "cleanup:alpha")
+
+    local ended = p.end_session(session)
+    t.assert_eq(ended.owner, "alpha")
+    t.assert_nil(session._ue_session_owner_record)
+    t.assert_nil(p.session_owner(session))
+    local reattached, reattach_err = p.dispatch_lifecycle("reattach")
+    t.assert_true(reattached, reattach_err and reattach_err.reason)
+    t.assert_eq(calls[#calls], "reattach:alpha")
+    p._reset_for_test()
+  end)
+
+  t.it("never falls back to another target for an unsupported owner lifecycle", function()
+    p._reset_for_test()
+    local foreign_calls = 0
+    p.register_attach("ios", function() end)
+    p.register_lifecycle("ios", {
+      stop = function() end,
+    })
+    p.register_lifecycle("mac", {
+      reattach = function() foreign_calls = foreign_calls + 1 end,
+    })
+    p.begin("attach", "ios")
+    local session = { config = { type = "lldb", _ue_session_owner = "ios" } }
+    p.bind_session(session)
+
+    local handled, err = p.dispatch_lifecycle("reattach", { session = session })
+    t.assert_nil(handled)
+    t.assert_eq(err.owner, "ios")
+    t.assert_contains(err.reason, "does not provide")
+    t.assert_eq(foreign_calls, 0)
+    p._reset_for_test()
+  end)
+
+  t.it("fails closed when lifecycle owner metadata is missing", function()
+    p._reset_for_test()
+    p.register_attach("stale", function() end)
+    p.begin("attach", "stale")
+    local unmanaged, bind_err = p.bind_session({ config = { type = "lldb" } })
+    t.assert_nil(unmanaged)
+    t.assert_eq(bind_err.reason, "session owner metadata is missing")
+    p._reset_for_test()
+    local handled, err = p.dispatch_lifecycle("stop")
+    t.assert_nil(handled)
+    t.assert_eq(err.kind, "stop")
+    t.assert_contains(err.reason, "owner metadata")
+    p._reset_for_test()
+  end)
 end)
 
 t.describe("ue.dap: 各平台模块导出 attach/launch", function()
@@ -32,6 +119,9 @@ t.describe("ue.dap: 各平台模块导出 attach/launch", function()
       local m = require("ue.dap." .. id)
       t.assert_type(m.attach, "function", id .. ".attach")
       t.assert_type(m.launch, "function", id .. ".launch")
+      if id == "ios" then
+        t.assert_type(m.cleanup, "function", "ios.cleanup")
+      end
     end)
   end
 
@@ -45,6 +135,22 @@ t.describe("ue.dap: 各平台模块导出 attach/launch", function()
     )
     t.assert_eq(driver.id, "IOS")
     t.assert_nil(unavailable)
+  end)
+end)
+
+t.describe("ue.dap: generic owner lifecycle compatibility", function()
+  t.it("desktop toolbar terminate preserves nvim-dap native terminate behavior", function()
+    local dap_mod = require("ue.dap")
+    local fallback_calls = 0
+    local result = dap_mod.dap_stop_session({
+      source = "terminate",
+      fallback = function()
+        fallback_calls = fallback_calls + 1
+        return "native-terminate"
+      end,
+    })
+    t.assert_eq(result, "native-terminate")
+    t.assert_eq(fallback_calls, 1)
   end)
 end)
 
@@ -66,6 +172,8 @@ t.describe("ue.dap.ios: legacy MobileDevice lldb-dap config", function()
     t.assert_eq(cfg.request, "attach")
     t.assert_eq(cfg.stopOnEntry, true)
     t.assert_eq(cfg._ue_ios_session_owner, "legacy-mobiledevice")
+    t.assert_eq(cfg._ue_session_owner, "ios")
+    t.assert_eq(cfg._ue_session_operation, "launch")
     t.assert_contains(cfg.initCommands, "settings set target.memory-module-load-level partial")
     t.assert_contains(cfg.attachCommands,
       'platform select remote-ios --sysroot "/Device Support/iPhone13,2 15.4.1 (19E258)/Symbols"')

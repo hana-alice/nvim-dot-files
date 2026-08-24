@@ -60,31 +60,20 @@ function M._reset_probe_cache()
 end
 
 local function go_tool_candidates(base)
-  local suffix = platform.is_windows and ".exe" or ""
-  local name = base .. suffix
-  local candidates = {}
-  local function add(path)
-    if path and path ~= "" then candidates[#candidates + 1] = path end
-  end
-  add(vim.fn.exepath(base))
-  add(vim.fn.exepath(base .. ".exe"))
-  add(vim.env.GOBIN and (vim.env.GOBIN .. "/" .. name) or nil)
-  local separator = platform.is_windows and ";" or ":"
-  for _, root in ipairs(vim.split(vim.env.GOPATH or "", separator, { plain = true, trimempty = true })) do
-    add(root .. "/bin/" .. name)
-  end
-  add(vim.env.USERPROFILE and (vim.env.USERPROFILE .. "/go/bin/" .. name) or nil)
-  add(vim.env.HOME and (vim.env.HOME .. "/go/bin/" .. name) or nil)
-  return candidates
+  return platform.go_tool_candidates(base, vim.env, platform.driver())
 end
 
 local function csearch_exe()
   if _csearch_path then return _csearch_path end
-  for _, c in ipairs(go_tool_candidates("csearch")) do
-    if c and c ~= "" and vim.fn.executable(c) == 1 then
-      _csearch_path = c  -- cache success only
-      return c
-    end
+  local resolved = platform.resolve_tool({
+    name = "csearch",
+    driver_candidates = function()
+      return go_tool_candidates("csearch")
+    end,
+  })
+  if resolved.ok then
+    _csearch_path = resolved.path  -- cache success only
+    return resolved.path
   end
   return nil  -- do NOT cache the miss
 end
@@ -95,21 +84,22 @@ end
 
 function M.cindex_uefilter_exe()
   if _cindex_path then return _cindex_path end
-  for _, c in ipairs(go_tool_candidates("cindex-uefilter")) do
-    if c and c ~= "" and vim.fn.executable(c) == 1 then
-      _cindex_path = c  -- cache success only
-      return c
-    end
+  local resolved = platform.resolve_tool({
+    name = "cindex-uefilter",
+    driver_candidates = function()
+      return go_tool_candidates("cindex-uefilter")
+    end,
+  })
+  if resolved.ok then
+    _cindex_path = resolved.path  -- cache success only
+    return resolved.path
   end
   return nil  -- do NOT cache the miss
 end
 
 function M.install_hint()
   local config = vim.fn.stdpath("config")
-  if platform.is_windows then
-    return 'powershell -ExecutionPolicy Bypass -File "' .. config .. '/scripts/install_windows.ps1"'
-  end
-  return "sh " .. vim.fn.shellescape(config .. "/scripts/install_csearch.sh")
+  return platform.driver().code_search_install_hint(config)
 end
 
 function M._go_tool_candidates_for_test(base)

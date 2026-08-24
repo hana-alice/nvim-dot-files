@@ -1,5 +1,10 @@
 # Multi-Platform Foundation — Migration ADR
 
+> **Historical snapshot / superseded.** 本文保留 2026-05-06 的迁移计划与决策背景，
+> 其中 Phase 0、stub 状态和旧 driver interface 不再描述当前代码。现行平台边界以
+> [`../architecture/overview.md`](../architecture/overview.md) 与 OpenSpec 的
+> `host-platform-driver`、`ue-target-driver-boundary`、`ue-target-workflow-boundary` 为准。
+
 > **Status**: Proposed → Phase 0 in progress
 > **Branch**: `feat/multi-platform-foundation`
 > **Worktree**: `<LOCAL_APPDATA>/nvim-multiplatform`

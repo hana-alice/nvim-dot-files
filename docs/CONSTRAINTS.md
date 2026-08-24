@@ -624,6 +624,11 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 4. **可自验证模块** —— 公共 API 挂 `M.*`，可 headless 测试（`nvim --headless -l`）。
 5. **不做周期性 ticker 通知** —— 至多 start + 中段更新，成功后自然消退，不刷 `:messages`。
 6. **未变更时跳过写入** —— 每个生成器（CDB / manifest / PCH）写前先比对，避免使下游 cache 失效。
+7. **Facade / workflow 归属可审计** —— `ue.lua` 只做公共上下文、registry 查询与命令入口；
+   target-specific 副作用编排必须落在 `lua/ue/workflows/<target>/`；`lua/ue/targets/<target>.lua`
+   只允许 pure plan/parser/policy contract，不得执行命令或 UI。`ue_platform_boundary` 的 Tree-sitter AST
+   contract 守门 façade / workflow / target 边界，`tests/cases/stability_spec.lua` 负责 `ue.lua`
+   numeric ratchet 与新 workflow 文件 800 行上限。
 → `README.md` §Conventions
 
 ### C5 — 符号解析分层契约

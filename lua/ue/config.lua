@@ -1,6 +1,8 @@
 -- ue.config — central schema for tunables that previously lived inline in
 -- `lua/ue.lua` (INDEX_RT.* timing constants, context TTL, paths derived
--- from `vim.fn.stdpath`, planned multi-platform defaults).
+-- from `vim.fn.stdpath`). Host/target support is owned by the platform and
+-- target registries; this schema intentionally contains no parallel platform
+-- enable/default list.
 --
 -- Phase C scope: introduce the schema and migrate the smallest possible
 -- set of constants (the index timing block) so the schema is exercised
@@ -40,15 +42,11 @@ local function defaults()
       state_dir = function() return vim.fn.stdpath("state") .. "/ue" end,
       cache_dir = function() return vim.fn.stdpath("cache") .. "/ue" end,
     },
-    platforms = {
-      enabled = { "Win64", "Android", "Mac", "IOS", "Linux" },
-      default = nil,  -- nil = auto-detect from current_platform()
-    },
     -- Phase I additions ────────────────────────────────────────────────
     clangd = {
-      -- Extra candidate paths tried BEFORE the platform driver defaults
-      -- and before the env-var override. Highest priority. Empty means
-      -- ue.lua's existing clangd_candidates() runs unchanged.
+      -- Extra candidate paths tried after UE_CLANGD and before platform
+      -- driver defaults (canonical priority: env -> config -> driver).
+      -- Empty means the driver candidates remain unchanged.
       candidates_extra = {},
       -- Extra args appended to the clangd command line. Empty means
       -- behaviour unchanged.

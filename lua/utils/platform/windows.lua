@@ -33,6 +33,63 @@ function M.shell()
   return M.shell_entry("default")
 end
 
+function M.allows_osc52()
+  return false
+end
+
+function M.mixed_eol_guard()
+  return true
+end
+
+function M.treesitter_compiler_bin()
+  return "C:\\Program Files\\LLVM\\bin"
+end
+
+function M.windows_ui_config()
+  return true
+end
+
+function M.path_key(path)
+  return tostring(path or ""):lower()
+end
+
+function M.query_driver_globs()
+  return { "**/clang*.exe", "**/clang*", "**/gcc", "**/g++", "**/cc", "**/c++", "**/cl.exe" }
+end
+
+function M.cdb_compiler_candidates()
+  return { "clang++", "clang", "clang++.exe", "clang.exe", "cl.exe", "cl" }
+end
+
+function M.lldb_python_relative_paths()
+  return { "lib/site-packages/lldb", "Lib/site-packages/lldb" }
+end
+
+function M.restart_fallback_candidates(cwd, _)
+  return {
+    {
+      client = "windows",
+      bin = "nvim",
+      args = {},
+      cwd = cwd,
+      reason = "Windows fallback; resolved to %s",
+    },
+  }
+end
+
+function M.restart_requires_spawn_reprobe()
+  return true
+end
+
+function M.restart_shutdown_delay_ms()
+  return 800
+end
+
+function M.code_search_install_hint(config_root)
+  local script = tostring(config_root or "") .. "/scripts/install_windows.ps1"
+  return "powershell -ExecutionPolicy Bypass -File " .. shell.quote("powershell", script)
+end
+
 local function to_windows_path(path)
   return tostring(path or ""):gsub("/", "\\")
 end
@@ -215,7 +272,26 @@ function M.default_clangd_candidates()
 end
 
 function M.python_candidates()
-  return { "python" }
+  return {
+    vim.fn.expand("~/AppData/Local/Programs/Python/Python312/python.exe"),
+    vim.fn.expand("~/AppData/Local/Programs/Python/Python313/python.exe"),
+    "C:/Python312/python.exe",
+    "C:/Python313/python.exe",
+    "python.exe",
+    "python",
+  }
+end
+
+function M.clangd_indexer_candidates()
+  return {
+    "C:/Program Files/LLVM/bin/clangd-indexer.exe",
+    "clangd-indexer.exe",
+    "clangd-indexer",
+  }
+end
+
+function M.shared_library_extension()
+  return ".dll"
 end
 
 function M.default_lldb_dap_paths()
@@ -244,6 +320,8 @@ function M.default_lldb_dap_paths()
     pf .. "/LLVM/bin/lldb-dap.exe",
     "C:/Program Files/LLVM/bin/lldb-dap.exe",
     "C:/Program Files (x86)/LLVM/bin/lldb-dap.exe",
+    "lldb-dap.exe",
+    "lldb-dap",
   }
 end
 

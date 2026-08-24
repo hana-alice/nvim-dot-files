@@ -1,4 +1,5 @@
 local M = {}
+local platform = require("utils.platform")
 
 local function present(value)
   return type(value) == "string" and value ~= ""
@@ -7,11 +8,11 @@ end
 function M.should_use_osc52(env, host)
   env = env or vim.env
   host = host or {
-    is_windows = vim.fn.has("win32") == 1,
+    allows_osc52 = platform.driver().allows_osc52(),
     is_neovide = vim.g.neovide == true,
   }
 
-  if host.is_windows or host.is_neovide then
+  if host.allows_osc52 == false or host.is_neovide then
     return false
   end
   return present(env.SSH_TTY) or present(env.SSH_CONNECTION) or present(env.ZELLIJ)

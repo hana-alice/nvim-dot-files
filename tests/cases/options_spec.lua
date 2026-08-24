@@ -27,7 +27,7 @@ t.describe("options: session 与 list", function()
 end)
 
 t.describe("options: SSH/Zellij OSC 52 clipboard", function()
-  local terminal_host = { is_windows = false, is_neovide = false }
+  local terminal_host = { allows_osc52 = true, is_neovide = false }
 
   t.it("Zellij 没有 SSH_TTY 时仍强制启用", function()
     t.assert_true(clipboard.should_use_osc52({ ZELLIJ = "/run/user/1000/zellij" }, terminal_host))
@@ -37,11 +37,11 @@ t.describe("options: SSH/Zellij OSC 52 clipboard", function()
 
   t.it("不覆盖 Windows 或 Neovide 的原生剪贴板", function()
     t.assert_false(clipboard.should_use_osc52({ ZELLIJ = "1" }, {
-      is_windows = true,
+      allows_osc52 = false,
       is_neovide = false,
     }))
     t.assert_false(clipboard.should_use_osc52({ SSH_TTY = "/dev/pts/2" }, {
-      is_windows = false,
+      allows_osc52 = true,
       is_neovide = true,
     }))
   end)

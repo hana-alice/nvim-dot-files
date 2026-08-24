@@ -38,6 +38,56 @@ function M.shell()
   return M.shell_entry("default")
 end
 
+function M.allows_osc52()
+  return true
+end
+
+function M.path_key(path)
+  return tostring(path or "")
+end
+
+function M.query_driver_globs()
+  return { "**/clang*", "**/gcc", "**/g++", "**/cc", "**/c++" }
+end
+
+function M.cdb_compiler_candidates()
+  return { "clang++", "clang", "cc", "c++" }
+end
+
+function M.lldb_python_relative_paths()
+  return { "lib/site-packages/lldb", "lib/python3/dist-packages/lldb" }
+end
+
+function M.restart_fallback_candidates(cwd, env)
+  local candidates = {}
+  if env and env.TERMINAL and env.TERMINAL ~= "" then
+    candidates[#candidates + 1] = {
+      client = "mac",
+      bin = env.TERMINAL,
+      args = { "-e", "nvim" },
+      cwd = cwd,
+      reason = "$TERMINAL=" .. env.TERMINAL,
+    }
+  end
+  candidates[#candidates + 1] = {
+    client = "mac",
+    bin = "kitty",
+    args = { "--directory", cwd, "nvim" },
+    cwd = cwd,
+    reason = "kitty fallback",
+  }
+  return candidates
+end
+
+function M.restart_shutdown_delay_ms()
+  return 400
+end
+
+function M.code_search_install_hint(config_root)
+  local script = tostring(config_root or "") .. "/scripts/install_csearch.sh"
+  return "sh " .. shell.quote("posix", script)
+end
+
 function M.cmd_quote(value)
   return shell.quote("posix", value)
 end
@@ -113,6 +163,14 @@ function M.python_candidates()
   return { "python3", "python" }
 end
 
+function M.clangd_indexer_candidates()
+  return { "clangd-indexer" }
+end
+
+function M.shared_library_extension()
+  return ".dylib"
+end
+
 function M.default_lldb_dap_paths()
   -- Homebrew LLVM (Apple Silicon then Intel), then Xcode CLT lldb-dap
   -- (Xcode 15+ ships it). PATH fallback caught upstream.
@@ -121,6 +179,7 @@ function M.default_lldb_dap_paths()
     "/usr/local/opt/llvm/bin/lldb-dap",
     "/Library/Developer/CommandLineTools/usr/bin/lldb-dap",
     "/Applications/Xcode.app/Contents/Developer/usr/bin/lldb-dap",
+    "lldb-dap",
   }
 end
 

@@ -136,7 +136,7 @@ t.describe("ue.targets registry and contract", function()
   end)
 
   t.it("keeps runtime routing policy in target drivers", function()
-    t.assert_eq(targets.must_get("Android").runtime.launch.strategy, "android-device")
+    t.assert_eq(targets.must_get("Android").runtime.launch.strategy, "workflow")
     t.assert_eq(targets.must_get("IOS").runtime.launch.strategy, "managed-device")
     t.assert_eq(targets.must_get("Mac").runtime.launch.strategy, "desktop")
     t.assert_true(targets.must_get("Mac").runtime.launch.editor_app_bundles)

@@ -1154,8 +1154,7 @@ function D.dap_diagnose()
         local root = vim.fs.dirname(vim.fs.dirname(dap_exe))
         local has_py = false
         if root then
-          for _, sub in ipairs({ "lib/site-packages/lldb", "Lib/site-packages/lldb",
-                                  "lib/python3/dist-packages/lldb" }) do
+          for _, sub in ipairs(require("utils.platform").driver().lldb_python_relative_paths()) do
             local st = (vim.uv or vim.loop).fs_stat(root .. "/" .. sub)
             if st and st.type == "directory" then has_py = true; break end
           end
@@ -1186,8 +1185,9 @@ function D.dap_diagnose()
     if not serial or serial == "" then
       lines[#lines + 1] = "(no serial — device probes skipped)"
     else
+      local adb_tool = s.adb or require("utils.android_device").adb_executable()
       local function adb(args)
-        local cmd = { "adb", "-s", serial }
+        local cmd = { adb_tool, "-s", serial }
         for _, a in ipairs(args) do cmd[#cmd + 1] = a end
         local out = vim.fn.systemlist(cmd)
         return out, vim.v.shell_error
@@ -1419,6 +1419,45 @@ function D.android_dap_status()
   else
     vim.notify("[dap] status not available in this build", vim.log.levels.WARN)
   end
+end
+
+--- Generic owner-preserving stop for host targets that do not need a custom
+--- transport teardown. The registry only calls this after resolving the
+--- frozen session owner; it never consults the live target selection.
+function D.dap_stop_session(opts)
+  opts = type(opts) == "table" and opts or {}
+  -- Keep nvim-dap's native terminate semantics for desktop owners. Android
+  -- and iOS register target-owned stop handlers, so only this generic handler
+  -- receives the fallback from the toolbar's terminate path.
+  if opts.source == "terminate" and type(opts.fallback) == "function" then
+    return opts.fallback()
+  end
+  local ok_dap, dap = pcall(require, "dap")
+  local owner = opts.owner
+  local session = owner and owner.session
+    or (ok_dap and dap.session and dap.session())
+  if not ok_dap or not session then
+    return nil, "no active DAP session for the frozen owner"
+  end
+  if type(dap.disconnect) == "function" then
+    dap.disconnect({ terminateDebuggee = false })
+    return { disconnected = true, owner = owner and owner.owner }
+  end
+  return nil, "DAP disconnect is unavailable"
+end
+
+function D.dap_status_session(opts)
+  opts = type(opts) == "table" and opts or {}
+  local owner = opts.owner or {}
+  local state = owner.session and "ACTIVE" or "idle"
+  local message = ("[ue.dap] %s session owner=%s operation=%s adapter=%s"):format(
+    state,
+    tostring(owner.owner or "unknown"),
+    tostring(owner.operation or "unknown"),
+    tostring(owner.adapter or "unknown")
+  )
+  vim.notify(message, vim.log.levels.INFO)
+  return message
 end
 
 -- ─────────────────────────────────────────────────────────────────────
@@ -1839,7 +1878,9 @@ function D.setup_dap(dap, dapui)
   start_logcat = function()
     stop_logcat()
     local state = current_android_state()
-    local pid, adb, serial = state.pid, state.adb or "adb", state.serial or ""
+    local pid = state.pid
+    local adb = state.adb or require("utils.android_device").adb_executable()
+    local serial = state.serial or ""
     if not pid or pid == "" or serial == "" then return end
     logcat_buf = vim.api.nvim_create_buf(false, true)
     vim.bo[logcat_buf].buftype = "nofile"
@@ -1940,16 +1981,17 @@ function D.setup_dap(dap, dapui)
   end
 
   -- ─── nvim-dap listeners ───────────────────────────────────────────
-  local function on_session_end()
+  local function on_session_end(session)
     stop_logcat()
     restore_layout()
     source_path_cache = {}
     D._ue_android_pending_bps = {}  -- clear pending breakpoints on session end
-    -- Hand cleanup of remote lldb-server / adb forward to ue.dap.android.
-    local ok, android = pcall(require, "ue.dap.android")
-    if ok and android.cleanup then
-      pcall(android.cleanup, D._dap_session_state)
-    end
+    local platforms = require("ue.dap.platforms")
+    platforms.dispatch_lifecycle("cleanup", {
+      session = session,
+      session_state = D._dap_session_state,
+    })
+    platforms.end_session(session)
     reset_session_state()
   end
 
@@ -1990,6 +2032,15 @@ function D.setup_dap(dap, dapui)
   end
 
   dap.listeners.after.event_initialized["dapui_config"] = function(session)
+    local owner, owner_err = require("ue.dap.platforms").bind_session(session)
+    -- Non-UE dap configurations remain unmanaged and retain native nvim-dap
+    -- behavior. Only malformed explicit UE owner metadata is actionable.
+    if not owner and owner_err and owner_err.owner then
+      require("utils.log").notify_error(
+        "dap.owner",
+        tostring(owner_err and owner_err.reason or "session owner metadata is missing")
+      )
+    end
     close_explorer()
     save_layout()
     -- Guarantee the editor area holds a real file buffer (NOT a leftover
@@ -2011,36 +2062,34 @@ function D.setup_dap(dap, dapui)
       pcall(function() require("ue.dap._progress").done("debugger attached") end)
     end
   end
-  dap.listeners.before.event_terminated["dapui_config"] = function() on_session_end() end
-  dap.listeners.before.event_exited["dapui_config"]     = function() on_session_end() end
-  dap.listeners.after.disconnect["dapui_config"]        = function() on_session_end() end
+  dap.listeners.before.event_terminated["dapui_config"] = function(session) on_session_end(session) end
+  dap.listeners.before.event_exited["dapui_config"]     = function(session) on_session_end(session) end
+  dap.listeners.after.disconnect["dapui_config"]        = function(session) on_session_end(session) end
 
-  -- ─── Rewire `dap.terminate` for UE Android Attach sessions ────────
+  -- ─── Rewire `dap.terminate` through the frozen session owner ─────
   -- The dapui controls bar's ■ button (and any plain `:lua require("dap")
   -- .terminate()` invocation) issues a DAP `terminate` request.  lldb-dap
   -- maps `terminate` to SIGKILL the inferior — fine for `launch` but
   -- catastrophic for `attach` (it kills the game we just attached to).
   --
-  -- Our "UE Android Attach" sessions use `request = "attach"` with custom
-  -- attachCommands (see lua/ue/dap/android.lua lldb_dap_attach_config). We
-  -- transparently redirect terminate -> disconnect{terminateDebuggee=false},
-  -- i.e. a clean detach that leaves the device-side process running.  Other
-  -- sessions (Win64 Launch / Linux Launch) keep the original terminate
-  -- semantics. Selection is by cfg.name ("UE Android Attach"), not request
-  -- type, so it stays correct regardless of the request field.
+  -- Android/iOS owners perform their target-specific detach and transport
+  -- cleanup. Generic desktop owners delegate back to nvim-dap's original
+  -- terminate implementation, preserving launch/attach behavior without
+  -- consulting the current UI platform selection.
   if not D._dap_terminate_rewired then
     local orig_terminate = dap.terminate
     dap.terminate = function(opts, terminate_opts, cb)
       local sess = dap.session()
-      local cfg = sess and sess.config or nil
-      local name = cfg and tostring(cfg.name or "") or ""
-      local is_android_attach = name:match("UE Android Attach") ~= nil
-      local is_ios_session = cfg and cfg._ue_ios_session_owner == "legacy-mobiledevice"
-      if is_ios_session then
-        return require("ue.dap.ios").stop()
-      end
-      if is_android_attach then
-        return dap.disconnect({ terminateDebuggee = false }, cb)
+      local handled, result = require("ue.dap.platforms").dispatch_lifecycle("stop", {
+        session = sess,
+        callback = cb,
+        source = "terminate",
+        fallback = function()
+          return orig_terminate(opts, terminate_opts, cb)
+        end,
+      })
+      if handled then
+        return result
       end
       return orig_terminate(opts, terminate_opts, cb)
     end
@@ -2373,10 +2422,12 @@ function D.setup_dap(dap, dapui)
           session:request("disconnect", { terminateDebuggee = false })
         end)
       end
-      local ok, android = pcall(require, "ue.dap.android")
-      if ok and android.cleanup then
-        pcall(android.cleanup, D._dap_session_state)
-      end
+      local platforms = require("ue.dap.platforms")
+      platforms.dispatch_lifecycle("cleanup", {
+        session = session,
+        session_state = D._dap_session_state,
+      })
+      platforms.end_session(session)
       reset_session_state()
     end,
   })

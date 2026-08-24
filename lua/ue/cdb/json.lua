@@ -40,7 +40,8 @@ function M.program(entry)
     return command:match("^(%S+)")
   end
 
-  return proc.first_executable({ "clang++", "clang", "clang++.exe", "clang.exe", "cl.exe", "cl" }) or "clang++"
+  local candidates = require("utils.platform").driver().cdb_compiler_candidates()
+  return proc.first_executable(candidates) or candidates[1] or "clang++"
 end
 
 --- Pick a "template" entry to clone when synthesising new entries (e.g.

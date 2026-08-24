@@ -7,8 +7,11 @@ t.bootstrap()
 local IFACE = {
   "shell", "shell_entry", "open_path", "reveal_file", "cmd_quote", "host_path",
   "launch_process_plan", "follow_file_plan", "default_target",
-  "default_clangd_candidates", "default_lldb_dap_paths",
+  "default_clangd_candidates", "clangd_indexer_candidates", "default_lldb_dap_paths",
   "default_lldb_server_paths", "python_candidates", "ue_build_entry", "ue_uat_entry",
+  "shared_library_extension", "allows_osc52", "code_search_install_hint",
+  "path_key", "query_driver_globs", "restart_fallback_candidates", "restart_shutdown_delay_ms",
+  "cdb_compiler_candidates", "lldb_python_relative_paths",
 }
 
 local function assert_entry(driver, fn_name, expected_path, expected_reason)
@@ -106,6 +109,109 @@ t.describe("platform: host tool 解析", function()
     t.assert_eq(m.ideviceinfo_entry, nil)
     t.assert_eq(m.powershell_entry, nil)
   end)
+
+  t.it("optional capability query 对缺失能力 fail closed", function()
+    local platform = require("utils.platform")
+    local windows = require("utils.platform.windows")
+    local macos = require("utils.platform.macos")
+
+    local missing = platform.optional_capability(windows, "xcrun_entry")
+    t.assert_false(missing.ok)
+    t.assert_eq(missing.status, "unavailable")
+    t.assert_eq(missing.capability, "xcrun_entry")
+    t.assert_eq(missing.host_id, "windows")
+    t.assert_eq(missing.reason, "host-capability-missing")
+
+    local available = platform.optional_capability(macos, "xcrun_entry")
+    t.assert_true(available.ok)
+    t.assert_eq(available.value, "/usr/bin/xcrun")
+  end)
+
+  t.it("Windows-only configuration capabilities do not leak to other hosts", function()
+    local platform = require("utils.platform")
+    local windows = require("utils.platform.windows")
+    local macos = require("utils.platform.macos")
+
+    t.assert_true(platform.optional_capability(windows, "mixed_eol_guard").ok)
+    t.assert_true(platform.optional_capability(windows, "windows_ui_config").ok)
+    t.assert_eq(platform.optional_capability(windows, "treesitter_compiler_bin").value,
+      "C:\\Program Files\\LLVM\\bin")
+    t.assert_false(platform.optional_capability(macos, "mixed_eol_guard").ok)
+    t.assert_false(platform.optional_capability(macos, "windows_ui_config").ok)
+    t.assert_false(platform.optional_capability(macos, "treesitter_compiler_bin").ok)
+  end)
+
+  t.it("tool resolver 保留无效高优先级 override 诊断并继续回退", function()
+    local platform = require("utils.platform")
+    local old_env = vim.env.UE_TEST_TOOL
+    vim.env.UE_TEST_TOOL = "/missing/tool"
+
+    local resolved = platform.resolve_tool({
+      name = "demo-tool",
+      env = { "UE_TEST_TOOL" },
+      config = { "demo.path" },
+      driver = { id = "linux" },
+      config_getter = function(key)
+        if key == "demo.path" then
+          return { "/config/tool" }
+        end
+        return nil
+      end,
+      driver_candidates = function()
+        return { "/driver/tool" }
+      end,
+      probe = function(candidate)
+        if candidate == "/config/tool" then
+          return "/resolved/config-tool"
+        end
+        return nil, "missing"
+      end,
+    })
+
+    vim.env.UE_TEST_TOOL = old_env
+
+    t.assert_true(resolved.ok)
+    t.assert_eq(resolved.source, "config")
+    t.assert_eq(resolved.path, "/resolved/config-tool")
+    t.assert_eq(resolved.diagnostics[1].source, "env")
+    t.assert_eq(resolved.diagnostics[1].candidate, "/missing/tool")
+    t.assert_eq(resolved.diagnostics[1].reason, "missing")
+  end)
+
+  t.it("tool resolver 优先采用有效 env override", function()
+    local platform = require("utils.platform")
+    local old_env = vim.env.UE_TEST_TOOL
+    vim.env.UE_TEST_TOOL = "/env/tool"
+
+    local resolved = platform.resolve_tool({
+      name = "demo-tool",
+      env = { "UE_TEST_TOOL" },
+      config = { "demo.path" },
+      driver = { id = "linux" },
+      config_getter = function(key)
+        if key == "demo.path" then
+          return { "/config/tool" }
+        end
+        return nil
+      end,
+      driver_candidates = function()
+        return { "/driver/tool" }
+      end,
+      probe = function(candidate)
+        if candidate == "/env/tool" then
+          return candidate
+        end
+        return nil, "missing"
+      end,
+    })
+
+    vim.env.UE_TEST_TOOL = old_env
+
+    t.assert_true(resolved.ok)
+    t.assert_eq(resolved.source, "env")
+    t.assert_eq(resolved.path, "/env/tool")
+    t.assert_eq(resolved.diagnostics[1].candidate, "/env/tool")
+  end)
 end)
 
 t.describe("platform: shell 是独立执行维度", function()
@@ -178,6 +284,18 @@ t.describe("platform: shell 是独立执行维度", function()
     t.assert_eq(cmd.executable, "cmd.exe")
     t.assert_contains(cmd.args, "call Build.bat")
   end)
+
+  t.it("shell command builder 拒绝空 executable", function()
+    local ok, err = pcall(shell.command, "posix", "", "printf ok")
+    t.assert_false(ok)
+    t.assert_contains(err, "shell executable must be non-empty")
+  end)
+
+  t.it("shell command builder 拒绝未知 shell kind", function()
+    local ok, err = pcall(shell.command, "fish", "fish", "echo ok")
+    t.assert_false(ok)
+    t.assert_contains(err, "unknown shell kind")
+  end)
 end)
 
 t.describe("platform: 顶层模块", function()
@@ -202,5 +320,13 @@ t.describe("platform: 顶层模块", function()
   end)
   t.it("driver().cmd_quote() 非 nil", function()
     t.assert_true(p.driver().cmd_quote("a b") ~= nil)
+  end)
+
+  t.it("test fixture drivers load through the registry without changing active host", function()
+    local platform = require("utils.platform")
+    local active = platform.driver()
+    local fixture = platform._driver_for_test("windows")
+    t.assert_eq(fixture.id, "windows")
+    t.assert_true(platform.driver() == active)
   end)
 end)

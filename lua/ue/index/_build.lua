@@ -9,6 +9,20 @@ return function(M, core)
   local unix_now = core.h.unix_now
   local write_json_file = core.h.write_json_file
   local ensure_index_state = core.h.ensure_index_state
+
+  local function resolve_python()
+    local resolved = _uplat.resolve_tool({
+      name = "python",
+      env = { "UE_PYTHON" },
+      driver_candidates = function(driver)
+        return driver.python_candidates()
+      end,
+    })
+    if resolved.ok then
+      return resolved.path, resolved
+    end
+    return nil, resolved
+  end
   local save_index_state = core.h.save_index_state
   local module_key_from_path = core.h.module_key_from_path
   local sorted_module_records = core.h.sorted_module_records
@@ -192,21 +206,9 @@ M.partition_base_cdb = function(ctx, opts)
   -- Reuse the same Python probe sequence used elsewhere in this file for the
   -- ccjson / pch subprocesses (Python 3.12 absolute path on Windows to dodge
   -- PYTHONHOME contamination from outer shells).
-  local python
-  if _uplat.is_windows then
-    local cands = {
-      vim.env.UE_PYTHON or "",
-      vim.fn.expand("~/AppData/Local/Programs/Python/Python312/python.exe"),
-      vim.fn.expand("~/AppData/Local/Programs/Python/Python313/python.exe"),
-      "C:/Python312/python.exe",
-      "C:/Python313/python.exe",
-    }
-    for _, c in ipairs(cands) do
-      if c and c ~= "" and _ufs.is_file(c) then python = c; break end
-    end
-    python = python or "python"
-  else
-    python = "python3"
+  local python, resolved = resolve_python()
+  if not python then
+    return false, "python unavailable for cdb_partition.py (" .. tostring(resolved and resolved.reason or "tool-not-found") .. ")"
   end
 
   local cmd = { python, script, base }
@@ -427,24 +429,9 @@ M.build_phase_async = function(ctx, phase)
   -- pointing at a different minor (3.11/3.14) — child explodes with
   -- `_sre.MAGIC mismatch` from the stdlib loader. Absolute path + scrubbed
   -- env is the only reliable combo.
-  local python
-  if _uplat.is_windows then
-    -- Probe well-known per-user / system Python 3.12 install locations.
-    -- Falls back to PATH `python` if nothing matches (caller can override
-    -- via UE_PYTHON env var for non-standard installs).
-    local candidates = {
-      vim.env.UE_PYTHON or "",
-      vim.fn.expand("~/AppData/Local/Programs/Python/Python312/python.exe"),
-      vim.fn.expand("~/AppData/Local/Programs/Python/Python313/python.exe"),
-      "C:/Python312/python.exe",
-      "C:/Python313/python.exe",
-    }
-    for _, p in ipairs(candidates) do
-      if p and p ~= "" and _ufs.is_file(p) then python = p; break end
-    end
-    python = python or "python"
-  else
-    python = "python3"
+  local python, resolved = resolve_python()
+  if not python then
+    return fail_before_spawn("python unavailable for index build (" .. tostring(resolved and resolved.reason or "tool-not-found") .. ")")
   end
 
   local tools_dir = vim.fn.stdpath("config") .. "/tools"

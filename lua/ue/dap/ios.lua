@@ -3,13 +3,10 @@
 -- Independent from ue.dap.mac: pair the local symbol-rich Mach-O with the
 -- installed executable, expose legacy debugserver through ios-deploy, then
 -- RemoteLaunch(stop_at_entry=true) or RemoteAttachToProcessWithID via LLDB.
-
 local C = require("ue.dap._common")
 local IOSProcess = require("ue.dap._ios_process")
 local Progress = require("ue.dap._progress")
-
 local M = { _session = nil, _starting = false, _stopping = false, _listeners_installed = false }
-
 local INIT_COMMANDS = {
   "settings set stop-disassembly-display never",
   "settings set target.inline-breakpoint-strategy always",
@@ -18,21 +15,17 @@ local INIT_COMMANDS = {
   -- Avoid downloading all remote images; local Client DWARF remains complete.
   "settings set target.memory-module-load-level partial",
 }
-
 local function trim(value)
   return vim.trim(tostring(value or ""))
 end
-
 local function notify(message, level)
   vim.notify("[ue.dap] " .. tostring(message), level or vim.log.levels.INFO)
 end
-
 local function progress(method, message)
   pcall(function()
     Progress[method](message)
   end)
 end
-
 local function lldb_quote(value)
   local escaped = tostring(value or ""):gsub("\\", "\\\\"):gsub('"', '\\"')
   return '"' .. escaped .. '"'
@@ -150,6 +143,10 @@ local function build_config(opts)
   return {
     name = mode == "launch" and "UE IOS Attach at Launch" or "UE IOS Attach",
     _ue_ios_session_owner = "legacy-mobiledevice",
+    _ue_session_owner = "ios",
+    _ue_session_operation = mode,
+    _ue_device_id = opts.device_id,
+    _ue_process_id = opts.pid,
     type = "lldb",
     -- attachCommands drives the externally managed remote debugserver.
     request = "attach",
@@ -637,6 +634,7 @@ local function run_with_metadata(mode, runtime, app, symbols, pid)
       mode = mode,
       binary = runtime.binary,
       cwd = runtime.cwd,
+      device_id = runtime.device_id,
       device_app_path = app.app_path,
       executable_name = app.executable_name,
       pid = pid,
@@ -788,6 +786,8 @@ function M.stop(opts)
   end
   finalize()
 end
+
+function M.cleanup(opts) return end_unexpected_session(type(opts) == "table" and opts.session or nil) end
 
 function M._build_config_for_test(opts)
   return build_config(opts)

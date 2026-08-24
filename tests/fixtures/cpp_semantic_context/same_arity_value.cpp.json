@@ -1,0 +1,10 @@
+{
+  "Data": {
+    "Source": "C:/Fixture/src/same_arity_value.cpp",
+    "PCH": "C:/Fixture/build/SharedPCH.Engine.h.pch",
+    "Includes": [
+      "C:/Fixture/include/NonSelfContained.h",
+      "C:/Fixture/include/Common.h"
+    ]
+  }
+}

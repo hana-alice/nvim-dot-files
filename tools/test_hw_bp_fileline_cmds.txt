@@ -1,0 +1,23 @@
+settings set auto-confirm true
+settings set plugin.jit-loader.gdb.enable off
+settings set stop-disassembly-display never
+settings set target.inline-breakpoint-strategy always
+settings set target.move-to-nearest-code true
+platform select remote-android
+platform connect "unix-abstract-connect://[device-serial]/data/data/com.example.game/lldb/lldb-platform.sock"
+target create "D:\UE\ProjectRoot\Intermediate\Android\arm64\jni\arm64-v8a\libUE4.so"
+settings append target.exec-search-paths "D:\UE\ProjectRoot\Intermediate\Android\arm64\jni\arm64-v8a"
+settings append target.exec-search-paths "D:\UE\ProjectRoot\Intermediate\Android\arm64\gradle\app\src\main\jniLibs\arm64-v8a"
+settings append target.exec-search-paths "D:\UE\ProjectRoot\Intermediate\Android\arm64\gradle\app\src\main\libs\arm64-v8a"
+settings append target.exec-search-paths "D:\UE\ProjectRoot\Binaries\Android"
+process attach -p <pid>
+settings set target.process.thread.step-avoid-regexp ''
+process handle SIGSTOP -p true -s false -n false
+process handle SIGSEGV -p true -s false -n false
+process handle SIGBUS -p true -s false -n false
+process handle SIGPIPE -p true -s false -n false
+script exec("ci=lldb.debugger.GetCommandInterpreter()\nro=lldb.SBCommandReturnObject()\nci.HandleCommand(\'platform shell cat /proc/<pid>/maps\',ro)\no=ro.GetOutput() if ro.Succeeded() else \'\'\nlines=[l for l in o.splitlines() if \'libUE4.so\' in l]\nbase=int(lines[0].split(\'-\')[0],16) if lines else 0\nci.HandleCommand(\'target modules load --file libUE4.so --slide 0x%x\'%base,lldb.SBCommandReturnObject()) if base else None")
+image list libUE4.so
+breakpoint set -H --file "VulkanCommandBuffer.cpp" --line 334
+breakpoint list -v
+process continue

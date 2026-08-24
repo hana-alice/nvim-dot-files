@@ -1,0 +1,19 @@
+schema: spec-driven
+
+context: |
+  语言：中文（简体）
+  所有 proposal.md、design.md、tasks.md、spec.md 等 OpenSpec 产出物必须用简体中文撰写。
+
+  术语规则：
+  - 技术术语可以保留英文，例如 API、CLI、SDK、RHI、LSP、UE、PowerShell、Android、Vulkan。
+  - 文件名、路径、命令、代码标识符保持英文，不要翻译。
+  - Markdown 标题可以用中文，但 OpenSpec 需要识别的结构性关键词尽量保持原模板格式。
+  - 验收标准、任务描述、设计说明使用中文。
+
+  项目规则：
+  - 默认保持现有功能不变，除非 change 明确要求修改。
+  - 不做无关重构。
+  - 不格式化无关文件。
+  - 不引入新依赖，除非 design.md 明确说明必要性。
+  - 优先复用已有 helper/function/config。
+  - 最终输出只列 modified files 和关键变更摘要。

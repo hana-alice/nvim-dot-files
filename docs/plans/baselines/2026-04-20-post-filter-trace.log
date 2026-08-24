@@ -1,0 +1,23 @@
+=== module loaded rev=syntax-filter-v1 at 2026-04-20 13:23:25 ===
+[13:23:25 #1] M.definition() called sym="DrawGeometry" recv="" file=NaniteCullRaster.cpp:6290
+[13:23:25 #2] instant: dispatching ws/symbol q="DrawGeometry"
+[13:23:25 #3] precise: dispatching textDocument/definition
+[13:23:25 #4] instant: ws/symbol back n=7 still=true resolved=false
+[13:23:25 #5] instant: after filter_self n=7
+[13:23:25 #6] instant: cand[1] uri=ject/UEProj/Engine/Source/Runtime/Renderer/Private/Nanite/NaniteCullRaster.h line=219 kind=6
+[13:23:25 #7] instant: cand[2] uri=ject/UEProj/Engine/Source/Runtime/Renderer/Private/Nanite/NaniteCullRaster.h line=209 kind=6
+[13:23:25 #8] instant: cand[3] uri=ject/UEProj/Engine/Source/Runtime/Renderer/Private/Nanite/NaniteCullRaster.h line=241 kind=6
+[13:23:25 #9] instant: cand[4] uri=ject/UEProj/Engine/Source/Runtime/Renderer/Private/Nanite/NaniteCullRaster.h line=196 kind=6
+[13:23:25 #10] instant: cand[5] uri=ject/UEProj/Engine/Source/Runtime/Renderer/Private/Nanite/NaniteCullRaster.h line=229 kind=6
+[13:23:25 #11] instant: cand[6] uri=ct/UEProj/Engine/Source/Runtime/Renderer/Private/Nanite/NaniteCullRaster.cpp line=6256 kind=6
+[13:23:25 #12] instant: cand[7] uri=ct/UEProj/Engine/Source/Runtime/Renderer/Private/Nanite/NaniteCullRaster.cpp line=6299 kind=6
+[13:23:25 #13] syntax_filter: K=8 callee="DrawGeometry" candidates=7
+[13:23:25 #14] syntax_filter: cand[1] NaniteCullRaster.h:220 → P=3 D=0 V=false DROP (K=8)
+[13:23:25 #15] syntax_filter: cand[2] NaniteCullRaster.h:210 → P=5 D=0 V=false DROP (K=8)
+[13:23:25 #16] syntax_filter: cand[3] NaniteCullRaster.h:242 → P=4 D=0 V=false DROP (K=8)
+[13:23:25 #17] syntax_filter: cand[4] NaniteCullRaster.h:197 → P=8 D=0 V=false KEEP
+[13:23:25 #18] syntax_filter: cand[5] NaniteCullRaster.h:230 → P=4 D=0 V=false DROP (K=8)
+[13:23:25 #19] syntax_filter: cand[6] NaniteCullRaster.cpp:6257 → P=5 D=0 V=false DROP (K=8)
+[13:23:25 #20] syntax_filter: cand[7] NaniteCullRaster.cpp:6300 → P=8 D=0 V=false KEEP
+[13:23:25 #21] instant: syntax_filter applied=true K=8 before=7 after=2 skipped=0
+[13:24:05 #22] precise: back n=0 still=true jumped=true

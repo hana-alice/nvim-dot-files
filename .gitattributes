@@ -1,0 +1,10 @@
+# Normalize all text files to LF so git CLI and gitsigns
+# diff against the same content on Windows.
+* text=auto eol=lf
+*.py text eol=lf
+*.lua text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+
+# Binary files
+*.pyc binary

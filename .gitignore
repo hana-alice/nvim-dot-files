@@ -1,0 +1,26 @@
+tt.*
+.tests
+doc/tags
+debug
+.repro
+foo.*
+*.log
+data
+.omx/
+.tmp/
+__pycache__/
+*.pyc
+
+.hermes/
+tmp/
+
+# Claude Code runtime cache (CLI version copies / locks / staging) — never a project asset
+claude/
+# Machine-local Claude permission state (not for the public mirror)
+.claude/settings.local.json
+
+# graphify local output (knowledge-graph artifacts, machine-local)
+graphify-out/
+
+# health-scan working output (one-shot audit artifact)
+tools/health_scan_output.txt

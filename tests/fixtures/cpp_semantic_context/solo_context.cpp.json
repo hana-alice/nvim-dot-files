@@ -1,0 +1,10 @@
+{
+  "Data": {
+    "Source": "C:/Fixture/src/solo_context.cpp",
+    "PCH": "C:/Fixture/build/SharedPCH.Engine.h.pch",
+    "Includes": [
+      "C:/Fixture/include/SoloHeader.h",
+      "C:/Fixture/include/Common.h"
+    ]
+  }
+}

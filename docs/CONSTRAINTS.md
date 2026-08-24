@@ -384,7 +384,16 @@
   解决: clangd 固定 `--enable-config=false`，不再写 `.clangd`、不传 `--index-file`；current/hot/full
   发布带 generation/coverage manifest 的 controlled BackgroundIndex CDB，只接受
   compiler-authored UBT unity membership 或 exact per-file fallback，并通过官方
-  `compilationDatabaseChanges` 注入打开文件 exact command。definition 的最终权威是
+  `compilationDatabaseChanges` 注入打开文件 exact command。phase artifact 可携带 portable
+  unity provenance，但发布给 clangd 的 JSON CDB 必须剥离非标准字段；generation hash 的 map
+  key 必须 canonical 排序，不能受 Lua 进程 hash randomization 影响。source 不在 synthetic CDB 时，
+  exact-command 首次传输必须有界重开已 attached buffer，使 cold AST 不继续使用邻近 TU 推断命令。
+  clangd 的 prepare gate 必须消费持久化 tuple artifact readiness：selection/manifest/controlled CDB 与
+  源 CDB 签名仍匹配时，Nvim 重启后直接复用；不得把“当前 Lua 进程执行过 UEPrepare”当作资格。
+  同进程内工件发生变化也必须重新验证，缺失/stale 才 defer。
+  exact argv 证明 `.cpp/.h` 实际为 Objective-C++ 时，必须保留 C++ Tree-sitter 并叠加内置 `objcpp`
+  syntax；禁止把 mixed source 整体交给仅继承 C 的 `objc` Tree-sitter grammar，普通平台不得受影响。
+  definition 的最终权威是
   canonical USR + subject module AST 唯一 body，clangd 仅作 identity-verified secondary provider。
   → `lua/ue.lua` `clangd_cmd`; `lua/ue/index/`; `lua/ue/clangd_commands.lua`;
     `tests/cases/{ue_api,index_generation,cpp_semantic_index,clangd_commands}_spec.lua`
@@ -616,6 +625,11 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 4. **可自验证模块** —— 公共 API 挂 `M.*`，可 headless 测试（`nvim --headless -l`）。
 5. **不做周期性 ticker 通知** —— 至多 start + 中段更新，成功后自然消退，不刷 `:messages`。
 6. **未变更时跳过写入** —— 每个生成器（CDB / manifest / PCH）写前先比对，避免使下游 cache 失效。
+7. **Facade / workflow 归属可审计** —— `ue.lua` 只做公共上下文、registry 查询与命令入口；
+   target-specific 副作用编排必须落在 `lua/ue/workflows/<target>/`；`lua/ue/targets/<target>.lua`
+   只允许 pure plan/parser/policy contract，不得执行命令或 UI。`ue_platform_boundary` 的 Tree-sitter AST
+   contract 守门 façade / workflow / target 边界，`tests/cases/stability_spec.lua` 负责 `ue.lua`
+   numeric ratchet 与新 workflow 文件 800 行上限。
 → `README.md` §Conventions
 
 ### C5 — 符号解析分层契约

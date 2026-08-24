@@ -18,9 +18,74 @@ end
 t.describe("iOS C++ iteration script", function()
   t.it("passes zsh syntax validation", function()
     if vim.uv.os_uname().sysname ~= "Darwin" then return end
-    local script = vim.fn.stdpath("config") .. "/scripts/ue_ios_cpp_iteration.zsh"
-    local result = run({ "/bin/zsh", "-n", script })
+    for _, name in ipairs({ "ue_ios_cpp_iteration.zsh", "ue_ios_legacy_launch.zsh" }) do
+      local script = vim.fn.stdpath("config") .. "/scripts/" .. name
+      local result = run({ "/bin/zsh", "-n", script })
+      t.assert_eq(result.code, 0, name .. ": " .. tostring(result.stderr))
+    end
+  end)
+
+  t.it("launches an installed legacy app and publishes verified process identity", function()
+    if vim.uv.os_uname().sysname ~= "Darwin" then return end
+
+    local root = vim.fn.tempname() .. " ios legacy launch"
+    local app = root .. "/Prepared Client.app"
+    local ios_deploy = root .. "/fake-ios-deploy.zsh"
+    local args_log = root .. "/ios-deploy.args"
+    local output = root .. "/launch.json"
+    local script = vim.fn.stdpath("config") .. "/scripts/ue_ios_legacy_launch.zsh"
+    vim.fn.mkdir(app, "p")
+    vim.fn.writefile({
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+      '<plist version="1.0"><dict>',
+      '<key>CFBundleIdentifier</key><string>com.example.legacy</string>',
+      '</dict></plist>',
+    }, app .. "/Info.plist")
+    write_executable(ios_deploy, {
+      "#!/bin/zsh",
+      '[[ -n "${UE_TEST_ARGS_LOG-}" ]] && print -r -- "$*" >> "$UE_TEST_ARGS_LOG"',
+      'if [[ " $* " == *" --justlaunch "* ]]; then',
+      '  if [[ -n "${UE_TEST_FAIL_LAUNCH-}" ]]; then',
+      '    print -r -- "Timed out waiting for device"',
+      "    exit 253",
+      "  fi",
+      '  print -r -- "Application launched"',
+      "  exit 0",
+      "fi",
+      'if [[ " $* " == *" --get_pid "* ]]; then',
+      '  print -r -- "pid: 4242"',
+      "  exit 0",
+      "fi",
+      "exit 9",
+    })
+
+    local argv = {
+      "/bin/zsh", script,
+      "--ios-deploy", ios_deploy,
+      "--device", "00008101-000C699E2640001E",
+      "--bundle-id", "com.example.legacy",
+      "--app", app,
+      "--json-output", output,
+    }
+    local result = run(argv)
+    local decoded = vim.json.decode(table.concat(vim.fn.readfile(output), "\n"))
+    local network_argv = vim.deepcopy(argv)
+    vim.list_extend(network_argv, { "--transport", "network" })
+    local network = run(network_argv, { UE_TEST_ARGS_LOG = args_log })
+    local network_args = table.concat(vim.fn.readfile(args_log), "\n")
+    local failed = run(argv, { UE_TEST_FAIL_LAUNCH = "1" })
+    vim.fn.delete(root, "rf")
+
     t.assert_eq(result.code, 0, result.stderr)
+    t.assert_eq(decoded.deviceIdentifier, "00008101-000C699E2640001E")
+    t.assert_eq(decoded.bundleIdentifier, "com.example.legacy")
+    t.assert_eq(decoded.processIdentifier, 4242)
+    t.assert_contains(result.stdout, "IOS app running")
+    t.assert_eq(network.code, 0, network.stderr)
+    t.assert_false(network_args:find("--no-wifi", 1, true) ~= nil)
+    t.assert_eq(failed.code, 1)
+    t.assert_contains(failed.stderr, "Timed out waiting for device")
   end)
 
   t.it("skips AOT only after a successful fingerprinted build and invalidates changed inputs or outputs", function()
@@ -91,8 +156,10 @@ t.describe("iOS C++ iteration script", function()
     t.assert_eq(table.concat(observed, ","), "unset,true,unset,unset")
     t.assert_contains(first.stdout, "AOT cache miss")
     t.assert_contains(second.stdout, "AOT cache hit")
+    t.assert_contains(second.stdout, "reused 5, hashed 0")
     t.assert_contains(third.stdout, "AOT cache miss")
     t.assert_contains(fourth.stdout, "AOT cache miss")
+    t.assert_contains(fourth.stdout, "reused 4, hashed 1")
   end)
 
   t.it("generates a dSYM and prints both UUID probes", function()
@@ -107,8 +174,9 @@ t.describe("iOS C++ iteration script", function()
     write_executable(xcrun, {
       "#!/bin/zsh",
       'if [[ "$1" == "dsymutil" ]]; then',
-      '  mkdir -p "$4"',
-      '  print -r -- generated > "$4/marker"',
+      '  [[ "$2 $3 $4" == "--linker parallel --verify-dwarf=output" ]] || exit 8',
+      '  mkdir -p "$7"',
+      '  print -r -- generated > "$7/marker"',
       "  exit 0",
       "fi",
       'if [[ "$1" == "dwarfdump" ]]; then',

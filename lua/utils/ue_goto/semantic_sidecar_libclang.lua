@@ -312,23 +312,13 @@ function M.resolve_executable(candidate)
 end
 
 function M.sibling_libclang_candidates(clangd_path)
-  local driver = platform.driver()
-  local bin_dir = M.dirname(clangd_path)
-  local parent = M.dirname(bin_dir)
-  local suffix = driver.id == "windows" and "dll"
-    or (driver.id == "macos" and "dylib" or "so")
-  return M.unique_strings({
-    M.join(bin_dir, "libclang." .. suffix),
-    M.join(parent, "lib", "libclang." .. suffix),
-    M.join(parent, "lib64", "libclang." .. suffix),
-    "libclang." .. suffix,
-  })
+  return M.unique_strings(platform.libclang_candidates(clangd_path, platform.driver()))
 end
 
 function M.sibling_clang_candidates(clangd_path)
   local driver = platform.driver()
   local bin_dir = M.dirname(clangd_path)
-  local stem = driver.id == "windows" and "clang.exe" or "clang"
+  local stem = "clang" .. tostring(driver.exe_suffix or "")
   return M.unique_strings({
     M.join(bin_dir, stem),
     stem,
@@ -486,19 +476,17 @@ end
 local cursor_shim_cache = {}
 
 local function cursor_shim_ext()
-  local driver = platform.driver()
-  if driver.id == "windows" then return ".dll" end
-  if driver.id == "macos" then return ".dylib" end
-  return ".so"
+  return tostring(platform.driver().shared_library_extension() or ".so")
 end
 
 local function compile_cursor_shim(compiler, source, output)
   local driver = platform.driver()
   local staged = output .. (".tmp.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
   local cmd
-  if driver.id == "windows" then
+  local ext = cursor_shim_ext()
+  if ext == ".dll" then
     cmd = { compiler, "-shared", "-O2", "-std=c11", source, "-o", staged }
-  elseif driver.id == "macos" then
+  elseif ext == ".dylib" then
     local xcrun = type(driver.xcrun_entry) == "function" and driver.xcrun_entry() or nil
     if type(xcrun) == "string" and xcrun ~= "" then
       cmd = {

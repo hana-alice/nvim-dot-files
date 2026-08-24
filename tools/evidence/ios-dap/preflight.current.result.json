@@ -1,0 +1,29 @@
+{
+  "blockers": [
+    "no-available-physical-ios-device"
+  ],
+  "checks": {
+    "adapter": {
+      "digest": "5b3c0fcb8a37",
+      "name": "lldb-dap",
+      "system_path": "/Applications/Xcode.app/Contents/Developer/usr/bin/lldb-dap"
+    },
+    "adapter_version": "lldb-dap: LLVM (http://llvm.org/):",
+    "available_physical_ios_count": 0,
+    "devicectl_version": "518.31",
+    "known_device_count": 6,
+    "lldb_device_process_attach": true,
+    "lldb_device_select": true,
+    "selected_xcode": {
+      "digest": "c7228ff971f3",
+      "name": "Developer",
+      "system_path": "/Applications/Xcode.app/Contents/Developer"
+    },
+    "valid_signing_identity_count": 2,
+    "xcode_version": "Xcode 26.0.1"
+  },
+  "mode": "preflight",
+  "note": "Preflight never unlocks the Neovim IOS DAP matrix; only a passing attach probe can do that.",
+  "schema": "ue-ios-dap-probe-v1",
+  "status": "blocked"
+}

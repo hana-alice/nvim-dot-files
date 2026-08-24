@@ -8,8 +8,10 @@ the active UBT build, then copies each proven member set into nvim's cache.
 
 Output: a controlled BackgroundIndex CDB whose entries reference wrapper
 SuperUnity.*.cpp files in <stage_dir>/super_unity_cpps/ when active-build UBT
-unity evidence exists, and exact per-file entries otherwise. The resulting CDB
-keeps active source coverage complete without guessing new unity groupings.
+unity evidence proves either a matching compiler response file or an exact
+Apple active-argv reuse path, and exact per-file entries otherwise. The
+resulting CDB keeps active source coverage complete without guessing new unity
+groupings.
 
 INPUT  : per-file CDB (after prebuild_pch_v2 / resolve_cdb_paths /
          unify_include_dirs / prune_include_dirs), already inject'd with -D
@@ -21,10 +23,12 @@ USAGE  : python build_hot_super_unity_cdb.py <per_file_cdb> <out_cdb>
 
 DESIGN NOTES
   - A group is accepted only when a current-build UBT unity wrapper includes
-    exact active-CDB members and its matching `.o.rsp` reconstructs one exact
-    compiler context. No synthetic cross-module argument union is allowed.
-  - `--max-mods` bounds accepted UBT member count; it never creates new chunks
-    or changes compiler-authored membership.
+    exact active-CDB members and either its matching `.o.rsp` reconstructs one
+    exact compiler context or an Apple active argv can be reused exactly after
+    replacing the source and stripping write-only outputs. No synthetic
+    cross-module argument union is allowed.
+  - `--max-mods` is retained for CLI compatibility only; this script preserves
+    compiler-authored membership and does not rechunk accepted unity groups.
   - Sources without valid unity evidence retain their original file, cwd, and
     argv as exact per-file fallbacks, so coverage is complete without guessing.
   - Portable member/module metadata lets the semantic sidecar select subject
@@ -112,8 +116,43 @@ def portable_module_root(file_path):
     return parent.strip('/')
 
 
+WRITE_ONLY_FLAGS = frozenset({
+    '-MD', '-MMD', '-MP', '-MV',
+})
+WRITE_ONLY_FLAGS_WITH_VALUE = frozenset({
+    '-o', '-MF', '-MT', '-MQ', '-MJ',
+    '-dependency-file', '-serialize-diagnostics', '--serialize-diagnostics',
+})
+WRITE_ONLY_PREFIXES = (
+    '-MF', '-MT', '-MQ', '-MJ',
+    '-dependency-file=', '-serialize-diagnostics=', '--serialize-diagnostics=',
+)
+
+
+def strip_write_only_flags(args, strip_pch=False):
+    stripped = []
+    index = 0
+    while index < len(args):
+        arg = str(args[index])
+        if strip_pch and arg == '-include-pch':
+            index += 2 if index + 1 < len(args) else 1
+            continue
+        if arg in WRITE_ONLY_FLAGS_WITH_VALUE:
+            index += 2 if index + 1 < len(args) else 1
+            continue
+        if arg in WRITE_ONLY_FLAGS:
+            index += 1
+            continue
+        if any(arg.startswith(prefix) for prefix in WRITE_ONLY_PREFIXES):
+            index += 1
+            continue
+        stripped.append(args[index])
+        index += 1
+    return stripped
+
+
 def compile_context_key(entry):
-    """Fingerprint every semantic argument except the source spelling.
+    """Fingerprint every semantic compile input, ignoring per-file writes.
 
     Entries with different command lines must not share an AST. Keeping this
     key exact is intentionally conservative: less compression is acceptable;
@@ -121,10 +160,13 @@ def compile_context_key(entry):
     """
     source = os.path.normcase(entry.get('file', '').replace('\\', '/'))
     normalized = []
-    for arg in entry.get('arguments', []):
+    for arg in strip_write_only_flags(entry.get('arguments', [])):
         candidate = os.path.normcase(str(arg).replace('\\', '/'))
         normalized.append('<SOURCE>' if candidate == source else arg)
-    payload = json.dumps(normalized, ensure_ascii=False, separators=(',', ':'))
+    payload = json.dumps({
+        'directory': entry.get('directory', ''),
+        'arguments': normalized,
+    }, ensure_ascii=False, separators=(',', ':'))
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]
 
 
@@ -201,6 +243,26 @@ def option_value(args, prefix):
     return None
 
 
+def looks_like_apple_platform(args):
+    target = option_value(args, '--target') or option_value(args, '-target')
+    if target and 'apple' in target.casefold():
+        return True
+    for index, raw_arg in enumerate(args):
+        arg = str(raw_arg)
+        if arg == '-isysroot' and index + 1 < len(args):
+            sysroot = str(args[index + 1]).replace('\\', '/').casefold()
+        elif arg.startswith('--sysroot='):
+            sysroot = arg.split('=', 1)[1].replace('\\', '/').casefold()
+        else:
+            continue
+        if any(token in sysroot for token in (
+            'macosx', 'iphoneos', 'iphonesimulator', 'appletvos',
+            'watchos', 'xros', '.platform/developer/sdks/',
+        )):
+            return True
+    return False
+
+
 def unity_response_args(unity_path, template):
     """Return compiler-authored response args compatible with active CDB."""
     template_args = template.get('arguments', [])
@@ -268,20 +330,31 @@ def compiler_authored_unity_groups(cdb, root):
             continue
         if len(set(members)) != len(members) or any(member in claimed for member in members):
             continue
+        directories = {cdb[member].get('directory', '') for member in members}
+        if len(directories) != 1:
+            continue
         contexts = {compile_context_key(cdb[member]) for member in members}
         if len(contexts) != 1:
             continue
-        rsp_args = unity_response_args(unity_path, cdb[members[0]])
-        if not rsp_args:
+        template = cdb[members[0]]
+        rsp_args = unity_response_args(unity_path, template)
+        if rsp_args:
+            groups.append((unity_path, members, 'rsp', rsp_args))
+            claimed.update(members)
             continue
-        groups.append((unity_path, members, rsp_args))
+        if not looks_like_apple_platform(template.get('arguments', [])):
+            continue
+        exact_args = rewritten_arguments(template, unity_path)
+        if not exact_args:
+            continue
+        groups.append((unity_path, members, 'exact', list(template.get('arguments', []))))
         claimed.update(members)
     groups.sort(key=lambda group: min(group[1]))
     return groups
 
 
 def rewritten_arguments(entry, new_source):
-    args = list(entry.get('arguments', []))
+    args = strip_write_only_flags(list(entry.get('arguments', [])))
     old_source = os.path.normcase(entry.get('file', '').replace('\\', '/'))
     replaced = False
     for index, arg in enumerate(args):
@@ -289,9 +362,7 @@ def rewritten_arguments(entry, new_source):
         if normalized == old_source:
             args[index] = new_source
             replaced = True
-    if not replaced:
-        args.append(new_source)
-    return args
+    return args if replaced else None
 
 
 def rewritten_response_arguments(template, unity_path, rsp_args, new_source):
@@ -303,14 +374,9 @@ def rewritten_response_arguments(template, unity_path, rsp_args, new_source):
     args = [driver]
     replaced = False
     index = 0
-    while index < len(rsp_args):
-        arg = rsp_args[index]
-        if arg in ('-include-pch', '-o', '-MF') and index + 1 < len(rsp_args):
-            index += 2
-            continue
-        if arg == '-MD' or arg.startswith('-MF'):
-            index += 1
-            continue
+    filtered_rsp_args = strip_write_only_flags(rsp_args, strip_pch=True)
+    while index < len(filtered_rsp_args):
+        arg = filtered_rsp_args[index]
         if os.path.normcase(str(arg).replace('\\', '/')) == unity_normalized:
             args.append(new_source)
             replaced = True
@@ -363,17 +429,18 @@ def main():
 
     active_root, root_evidence = discover_active_unity_root(cdb)
     groups = compiler_authored_unity_groups(cdb, active_root)
-    claimed = {member for _unity, members, _rsp in groups for member in members}
+    claimed = {member for _unity, members, _kind, _args in groups for member in members}
     new_cdb = []
 
-    for unity_path, members, rsp_args in groups:
+    for unity_path, members, group_kind, group_args in groups:
         template = cdb[members[0]]
         member_paths = [cdb[index]['file'].replace('\\', '/') for index in members]
         digest = hashlib.sha256(
             (
                 '\0'.join(member_paths)
                 + '\0' + compile_context_key(template)
-                + '\0' + json.dumps(rsp_args, ensure_ascii=False, separators=(',', ':'))
+                + '\0' + group_kind
+                + '\0' + json.dumps(group_args, ensure_ascii=False, separators=(',', ':'))
             ).encode('utf-8')
         ).hexdigest()[:20]
         wrapper_local = os.path.join(super_dir_local, f'SuperUnity.UBT.{digest}.cpp')
@@ -386,9 +453,12 @@ def main():
             stream.write('// Compiler-authored UBT unity membership; copied into nvim cache.\n')
             for member_path in member_paths:
                 stream.write(f'#include "{member_path}"\n')
-        command = rewritten_response_arguments(template, unity_path, rsp_args, wrapper)
+        if group_kind == 'rsp':
+            command = rewritten_response_arguments(template, unity_path, group_args, wrapper)
+        else:
+            command = rewritten_arguments(template, wrapper)
         if not command:
-            print('ERROR: accepted unity response no longer rewrites its source', file=sys.stderr)
+            print('ERROR: accepted unity group no longer rewrites its source', file=sys.stderr)
             return 1
         new_cdb.append({
             'directory': template.get('directory', ''),

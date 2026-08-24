@@ -19,6 +19,7 @@
 
 local fs = require("ue.core.fs")
 local file_lock = require("ue.file_lock")
+local platform = require("utils.platform")
 
 local M = {}
 local running = false
@@ -72,14 +73,14 @@ function M.cancel(reason)
 end
 
 local function python_exe()
-  local candidates = require("utils.platform").driver().python_candidates()
-  for _, candidate in ipairs(candidates) do
-    local resolved = vim.fn.exepath(candidate)
-    if resolved ~= "" then
-      return resolved
-    end
-  end
-  return candidates[1] or "python3"
+  local resolved = platform.resolve_tool({
+    name = "python",
+    driver_candidates = function(driver)
+      return driver.python_candidates()
+    end,
+  })
+  if resolved.ok then return resolved.path end
+  return resolved.candidates and resolved.candidates[1] or nil
 end
 
 local function tool_path(name)
@@ -104,7 +105,12 @@ function M.slim(path)
     _rt.notify("slim_compile_commands.py not found: " .. script, vim.log.levels.WARN)
     return false
   end
-  local cmd = { python_exe(), script, path, "--keep-engine" }
+  local python = python_exe()
+  if not python then
+    _rt.notify("Python is unavailable for slim_compile_commands.py", vim.log.levels.WARN)
+    return false
+  end
+  local cmd = { python, script, path, "--keep-engine" }
   local result = vim.fn.system(cmd)
   if vim.v.shell_error == 0 then
     local removed = (result or ""):match("剔除: (%d+)")

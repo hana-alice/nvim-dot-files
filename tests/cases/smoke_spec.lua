@@ -31,6 +31,57 @@ t.describe("smoke: clangd capabilities", function()
     t.assert_false(source:find("offsetEncoding", 1, true) ~= nil,
       "Neovim 已通过 LSP 3.17 general.positionEncodings 协商编码")
   end)
+
+  t.it("clangd 启动时用原生 LSP 已解析的 root 生成 scoped CDB 命令", function()
+    local path = vim.fn.stdpath("config") .. "/lua/plugins/ue.lua"
+    local specs = dofile(path)
+    local lsp_spec = specs[2]
+    local opts = { servers = {} }
+    lsp_spec.opts(nil, opts)
+
+    local clangd = opts.servers.clangd
+    t.assert_type(clangd.cmd, "function",
+      "原生 vim.lsp 不执行 on_new_config；cmd 必须在 root_dir 解析后动态生成")
+    t.assert_nil(clangd.on_new_config,
+      "nvim-lspconfig 原生配置尚不支持 on_new_config")
+
+    local ue = require("ue")
+    local old_clangd_cmd = ue.clangd_cmd
+    local old_rpc_start = vim.lsp.rpc.start
+    local seen = {}
+    ue.clangd_cmd = function(root_dir)
+      seen.root_dir = root_dir
+      return { "/fake/clangd", "--compile-commands-dir=/fake/scoped-cdb" }
+    end
+    vim.lsp.rpc.start = function(cmd, dispatchers, spawn)
+      seen.cmd = cmd
+      seen.dispatchers = dispatchers
+      seen.spawn = spawn
+      return { fake = true }
+    end
+
+    local config = {
+      root_dir = "/fake/UnrealEngine",
+      cmd_cwd = "/fake/cwd",
+      cmd_env = { SAMPLE = "1" },
+      detached = false,
+    }
+    local dispatchers = { marker = true }
+    local ok, rpc = pcall(clangd.cmd, dispatchers, config)
+    ue.clangd_cmd = old_clangd_cmd
+    vim.lsp.rpc.start = old_rpc_start
+    if not ok then error(rpc) end
+
+    t.assert_eq(seen.root_dir, config.root_dir)
+    t.assert_eq(seen.dispatchers, dispatchers)
+    t.assert_eq(seen.spawn.cwd, config.cmd_cwd)
+    t.assert_eq(seen.spawn.env, config.cmd_env)
+    t.assert_eq(seen.spawn.detached, config.detached)
+    t.assert_contains(seen.cmd, "--compile-commands-dir=/fake/scoped-cdb")
+    t.assert_eq(config._ue_resolved_cmd, seen.cmd,
+      "exact-command transport must be able to inspect the argv used by the cmd factory")
+    t.assert_true(rpc.fake)
+  end)
 end)
 
 t.describe("smoke: ue.setup() 注册命令", function()

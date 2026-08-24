@@ -1,5 +1,10 @@
 # Multi-Platform Foundation — Iteration Log
 
+> **Historical snapshot / superseded.** 本文是 2026-05-07 分支时点记录；“未合并”、
+> `ue.lua` 行数、codelldb 与 iOS TODO 等内容不得用于判断当前实现。现行形状见
+> [`../architecture/overview.md`](../architecture/overview.md) 与 canonical OpenSpec
+> platform capabilities。
+
 > **Branch**: `feat/multi-platform-foundation`
 > **Span**: 2026-05-06 → 2026-05-07
 > **Commits**: 16 atomic

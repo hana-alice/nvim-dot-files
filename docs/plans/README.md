@@ -37,7 +37,7 @@ know "how this specific subsystem is shaped."
 
 | File | Subject |
 |---|---|
-| `2026-06-02-android-dap-attach-bp-diagnosis.md` | Diagnostic report: attach failure + F9 breakpoint short-circuit root causes (device `ANDROID-SERIAL-A`) |
+| `2026-06-02-android-dap-attach-bp-diagnosis.md` | Historical/superseded failure evidence for the retired sandbox gdbserver/F9 short-circuit route (device serial is evidence only) |
 | `2026-06-15-android-dap-live-breakpoints.md` | ADR: session-time live breakpoints via lldb-dap evaluate channel (K36); slide load-bearing (K37); D1 gate → 2A branch; synthetic-frame chokepoint convergence. On-device proof `ANDROID-SERIAL-B` |
 
 ### Baselines

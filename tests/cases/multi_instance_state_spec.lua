@@ -201,6 +201,48 @@ t.describe("multi-instance project state", function()
     pcall(vim.fn.delete, root, "rf")
   end)
 
+  t.it("explicit UESetPlatform intent binds to the next UESetProject regardless of command order", function()
+    local root = tmpdir()
+    local engine = root .. "/engine"
+    local project_a = root .. "/A"
+    local project_b = root .. "/B"
+    local project_c = root .. "/C"
+    local uproject_a = project_a .. "/A.uproject"
+    local uproject_b = project_b .. "/B.uproject"
+    local uproject_c = project_c .. "/C.uproject"
+    write(uproject_a)
+    write(uproject_b)
+    write(uproject_c)
+    local state = require("ue.project_state")
+    state._reset_for_test()
+
+    -- Platform first: no project bucket exists yet, so the explicit pair is
+    -- held only by this process until the next project selection.
+    assert(state.stage_target(engine, "IOS", "Development"))
+    assert(state.select(engine, project_a, uproject_a))
+    t.assert_true(state.target_is_set(engine))
+    t.assert_eq(state.read(engine).target_platform, "IOS")
+    t.assert_eq(state.read(engine).target_configuration, "Development")
+
+    -- Project first: the same API updates the active bucket immediately.
+    assert(state.select(engine, project_b, uproject_b))
+    assert(state.stage_target(engine, "Mac", "DebugGame"))
+    t.assert_eq(state.read(engine).target_platform, "Mac")
+    t.assert_eq(state.read(engine).target_configuration, "DebugGame")
+
+    -- A later reversed command order transfers that explicit intent once,
+    -- without turning the engine-level suggestion into implicit inheritance.
+    assert(state.stage_target(engine, "IOS", "Shipping"))
+    assert(state.select(engine, project_c, uproject_c))
+    t.assert_eq(state.read(engine).target_platform, "IOS")
+    t.assert_eq(state.read(engine).target_configuration, "Shipping")
+    assert(state.select(engine, project_a, uproject_a))
+    t.assert_eq(state.read(engine).target_configuration, "Development",
+      "consumed intent must not leak into a later project switch")
+
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
   t.it("persisted target platform and configuration never tear across writers", function()
     local root = tmpdir()
     local engine = root .. "/engine"

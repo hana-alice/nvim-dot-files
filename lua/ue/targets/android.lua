@@ -15,7 +15,7 @@ local M = {
     },
   },
   runtime = {
-    launch = { strategy = "android-device" },
+    launch = { strategy = "workflow" },
     main_log = { strategy = "android-logcat" },
     debug_log = { strategy = "unavailable" },
   },
@@ -250,32 +250,6 @@ function M.install_plan(context, host_driver)
   adapter_context.apk = apk
   adapter_context.host_driver = host_driver
   return adapter.install_plan(adapter_context)
-end
-
-function M.before_build(context, runtime)
-  runtime = runtime or {}
-  local cleanup = type(runtime.stop_debugger) == "function" and runtime.stop_debugger({ kill_orphans = true }) or {}
-  if context and context.operation ~= "so_build" and type(runtime.cleanup_gradle) == "function" then
-    runtime.cleanup_gradle(context.source_context or context)
-  end
-
-  local parts = {}
-  if cleanup.disconnected then
-    parts[#parts + 1] = "detached active DAP"
-  end
-  if cleanup.adapter_killed then
-    parts[#parts + 1] = "stopped lldb-dap adapter"
-  end
-  if tonumber(cleanup.orphan_killed or 0) > 0 then
-    parts[#parts + 1] = ("killed %d stale lldb-dap process%s"):format(
-      cleanup.orphan_killed,
-      cleanup.orphan_killed == 1 and "" or "es"
-    )
-  end
-  return {
-    ok = true,
-    message = #parts > 0 and ("Android build preflight: " .. table.concat(parts, ", ")) or nil,
-  }
 end
 
 M.package_plan = C.unsupported_operation(M.id, "package")

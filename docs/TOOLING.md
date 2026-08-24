@@ -60,7 +60,10 @@ load-bearing on this device (K37); `UE_DAP_NO_SLIDE=1` skips it for re-verificat
 ## clangd / clang / libclang (C++ LSP + semantic sidecar)
 
 - **Required**: LLVM **22.1.x** (22.1.5 verified)
-- **Source**: `winget install LLVM.LLVM`
+- **Source** (Windows): `winget install LLVM.LLVM`
+- **Source** (macOS): `brew install llvm@22`; if the Homebrew bottle registry is
+  unavailable, install the official macOS ARM64 release under
+  `~/.local/opt/llvm@22`.
 - **Install path** (Windows): `C:\Program Files\LLVM\bin\`
 - Used by: clangd controlled BackgroundIndex, exact-command transport, libclang
   canonical-USR sidecar, and the on-demand cursor-walk C ABI shim.
@@ -70,9 +73,11 @@ the official `compilationDatabaseChanges` transport, and the libclang/shim ABI
 are verified as one LLVM 22.x toolchain identity.
 
 On macOS, the Xcode-provided Apple clangd is not a substitute for the pinned
-LLVM build. `:UECompileForNvim` checks `clangd --version` before starting a UE
-build and accepts only 22.1.x; Tree-sitter highlighting remains available when
-that compiler-semantic gate is not met.
+LLVM build. The IOS-target `:UEPrepare` branch on macOS checks `clangd --version`
+before generating Apple semantic evidence and accepts only 22.1.x; Tree-sitter
+highlighting remains available when that compiler-semantic gate is not met.
+Nvim checks the user-local versioned
+install first, then the Apple Silicon and Intel Homebrew `llvm@22` kegs.
 
 ## macOS host and iOS application workflow
 
@@ -84,28 +89,49 @@ The macOS host driver uses only native engine and Xcode entry points:
 - `<engine>/Engine/Build/BatchFiles/RunUAT.sh BuildCookRun` for local iOS
   `-skipbuild -skipcook -stage -nocleanstage -package`; cooked data must already
   exist and Nvim never starts a local Cook.
-- `xcrun dsymutil` plus `xcrun dwarfdump --uuid` for explicit
-  `:UEIOSSymbols`; daily builds do not create or ZIP dSYM bundles.
+- `xcrun dsymutil --linker parallel --verify-dwarf=output` plus
+  `xcrun dwarfdump --uuid` for explicit `:UEIOSSymbols`; daily builds do not
+  create or ZIP dSYM bundles. The parallel/output-verification pair prevents a
+  >4 GiB monolithic UE `.debug_info` overflow from passing on UUID alone.
 - `/usr/bin/xcrun devicectl` with `--json-output <file>` for physical-device
   discovery, `.app` install and process launch.
 - `/usr/bin/security` for a read-only code-sign identity gate and
-  `/usr/bin/plutil` for `CFBundleIdentifier` extraction.
+  `:UESetIOSSigningCertificate[!] [exact-name-or-SHA1]`; the selected identity
+  is project-scoped and injected through an argv-only Engine ini override.
+  With no argument, a valid `Saved/IOSQADebug/signing.json` produced by
+  `PrepareIOSQADebug.sh` wins over the picker so UE build/package and the later
+  re-sign/install step cannot silently choose different certificates.
+  `/usr/bin/plutil` remains the `CFBundleIdentifier` extractor.
+- `python3 tools/ios_dap_protocol_probe.py preflight` for a redacted Apple
+  LLDB/CoreDevice gate. An explicit `legacy-preflight --device ... --symbols ...`
+  additionally checks a pre-iOS17 MobileDevice/`ios-deploy` candidate and exact
+  ProductType/OS/build DeviceSupport layout without persisting the device id or
+  personal path. The production `:UEDAPAttach` / `:UEDAPLaunch` handler uses the
+  same validated legacy route and fails closed on a different backend.
 
 Requirements:
 
 - Full Xcode selected by `xcode-select`, with an iPhoneOS SDK visible through
   `xcrun --sdk iphoneos --show-sdk-path`.
+- Versioned LLVM 22 from `brew install llvm@22` and GNU Global from
+  `brew install global`; the IOS `:UEPrepare` prelude needs clangd 22.1.x and
+  its final index phase needs `gtags`.
 - The engine-bundled .NET environment used by `Build.sh` and `RunUAT.sh`.
-- At least one valid code-signing identity plus project provisioning for
-  package/install.
+- A project identity selected with `:UESetIOSSigningCertificate`, still valid
+  in the current keychain, plus compatible provisioning for package/install.
 - A paired, connected physical iOS device for install/launch.
+- `idevice_id`, `ios-deploy`, `ideviceinfo`, and `ideviceinstaller` on PATH; legacy launch follows the explicitly selected USB/Wi-Fi transport, while DAP remains USB-scoped.
 
 The installable app produced by this engine lives at
 `<project>/Binaries/IOS/Payload/<Target>.app`. The similarly named
 `Saved/StagedBuilds/IOS` tree is raw stage input, not the signed app bundle.
-The workflow deliberately does not use UE's legacy
-fastlane/ideviceinstaller/instruments deploy/run route and does not implement
-iOS DAP.
+The normal build/install/launch workflow still does not use UE's legacy
+fastlane/instruments deploy route. Legacy launch uses `ios-deploy --noinstall
+--justlaunch` against the prepared signed app on the explicitly selected transport, then verifies the installed bundle PID.
+iOS DAP is a separate production operation:
+`ios-deploy --nolldb` exposes the pre-iOS17 Xcode DeveloperDiskImage/debugserver
+loopback bridge, while Xcode `lldb-dap` owns target creation, attach/launch,
+breakpoints and expression evaluation. It is never a Mac-process fallback.
 
 ## Historical lldb-dap 21 side-load (DAP debugger adapter, Windows)
 

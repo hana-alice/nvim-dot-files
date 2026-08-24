@@ -143,20 +143,16 @@ function M.definitions(deps)
         "Build or select a usable index outside the audit and rerun --live."
       )
     end
-    local home = vim.env.HOME or ""
-    local csearch = executable({
-      vim.fn.exepath("csearch"),
-      home ~= "" and join(home, "go", "bin", "csearch") or nil,
-    })
+    local code_search = require("utils.code_search")
+    local csearch = code_search.csearch_exe()
     if not csearch then
       return result(
         "BLOCKED",
         "csearch is unavailable for the read-only live query",
         nil,
-        "Install csearch outside the audit or omit the live indexed-search context."
+        "Install csearch via: " .. code_search.install_hint()
       )
     end
-    local code_search = require("utils.code_search")
     local context = { workspace_root = spec.workspace_root, csearch_idx = spec.csearch_index }
     if code_search.current_backend(context) ~= "csearch" then
       return result("BLOCKED", "public search dispatcher rejected the supplied live csearch index")

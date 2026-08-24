@@ -1,0 +1,25 @@
+{
+  "blockers": [
+    "explicit-user-trust-required",
+    "source-dwarf-unavailable"
+  ],
+  "checks": {
+    "app_signature_strict_valid": true,
+    "debug_entitlement_matches_profile": true,
+    "developer_image_mounted": true,
+    "device_in_profile": true,
+    "debugserver_listener": true,
+    "exact_device_support_symbols": true,
+    "host_source_dwarf_available": false,
+    "launch_request_reached_springboard": true,
+    "lldb_remote_ios_selected": true,
+    "lldb_target_created": true,
+    "profile_expired": false,
+    "rejection_reason": "needs-explicit-user-trust",
+    "signer_in_embedded_profile": true
+  },
+  "mode": "legacy-transport",
+  "note": "This partial transport proof does not unlock the IOS DAP matrix; app trust plus the strict source breakpoint attach/detach gate remain required.",
+  "schema": "ue-ios-dap-probe-v1",
+  "status": "blocked"
+}

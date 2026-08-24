@@ -174,7 +174,9 @@ local function open_file_reference_under_cursor()
   if cfile == nil or cfile == "" then
     return false
   end
-  if not (cfile:find("[/\\]") or cfile:find("%.[%w_%-]+$")) then
+  local has_path_separator = cfile:find("[/\\]") ~= nil
+  local known_filetype = vim.filetype.match({ filename = cfile })
+  if not has_path_separator and not known_filetype then
     return false
   end
 
@@ -207,7 +209,7 @@ local function apply_ue_runtime_overrides()
   map("n", "<leader>us", "<cmd>UEBuildAndroidSO<cr>", vim.tbl_extend("force", opts, { desc = "UE: Build Android SO only (skip APK)" }))
   map("n", "<leader>uq", "<cmd>UEDeployAndroidSO<cr>", vim.tbl_extend("force", opts, { desc = "UE: Quick deploy Android SO" }))
   map("n", "<leader>ug", "<cmd>UELogToggle<cr>", vim.tbl_extend("force", opts, { desc = "UE: Toggle app log" }))
-  map("n", "<leader>ui", "<cmd>UEInstallAndroid<cr>", vim.tbl_extend("force", opts, { desc = "UE: Install APK to device" }))
+  map("n", "<leader>ui", "<cmd>UEInstall<cr>", vim.tbl_extend("force", opts, { desc = "UE: Install for active target" }))
   map("n", "<leader>ul", "<cmd>UELaunch<cr>", vim.tbl_extend("force", opts, { desc = "UE: Launch app (no debugger)" }))
   map("n", "<leader>uL", "<cmd>UELogToggle<cr>", vim.tbl_extend("force", opts, { desc = "UE: Toggle app log" }))
   map("n", "<leader>uD", "<cmd>UEDebugLogToggle<cr>", vim.tbl_extend("force", opts, { desc = "UE: Toggle Windows debug log" }))
@@ -263,8 +265,8 @@ map("n", "<leader>ss", open_symbol_picker(), { desc = "Search: Symbols" })
 map("n", "<leader>sS", open_symbol_picker({ workspace = true }), { desc = "Search: Workspace Symbols" })
 map("n", "<leader>bc", close_current_target, { desc = "Buffer/Window: Smart close current target" })
 map("n", "<leader>bn", "<cmd>confirm enew<cr>", { desc = "Buffer: New empty buffer" })
--- Static UE keymaps. Keys that need {nowait=true} are set by
--- apply_ue_runtime_overrides() on VeryLazy (see below).
+-- Static UE keymaps. Prefix-sensitive entries are replaced with
+-- {nowait=true} by apply_ue_runtime_overrides() at the end of this file.
 map("n", "<leader>uA", "<cmd>UESetAndroidDevice<cr>", { desc = "UE: Select Android device (this Nvim)" })
 map("n", "<leader>uB", "<cmd>UEPrepare<cr>", { desc = "UE: Prepare symbols + compile_commands" })
 map("n", "<leader>uc", "<cmd>UEExportCompileCommands<cr>", { desc = "UE: Export compile_commands" })
@@ -328,10 +330,10 @@ map("c", "<C-v>", "<C-r>+", { desc = "Cmdline: paste from system clipboard" })
 map("i", "<C-v>", "<C-r><C-o>+", { desc = "Insert: paste from system clipboard (literal)" })
 
 -- DAP keymaps
-map("n", "<leader>da", "<cmd>UEDAPAttach android<cr>", { desc = "DAP: Android Attach" })
+map("n", "<leader>da", "<cmd>UEDAPAttach<cr>", { desc = "DAP: Attach active target" })
 map("n", "<leader>db", "<cmd>UEDAPToggleBreakpoint<cr>", { desc = "DAP: Toggle Breakpoint" })
 map("n", "<leader>dc", "<cmd>UEDAPContinue<cr>", { desc = "DAP: Continue" })
-map("n", "<leader>dl", "<cmd>UEDAPLaunch android<cr>", { desc = "DAP: Android Launch Debug" })
+map("n", "<leader>dl", "<cmd>UEDAPLaunch<cr>", { desc = "DAP: Launch active target" })
 map("n", "<leader>dn", "<cmd>UEDAPStepOver<cr>", { desc = "DAP: Step Over" })
 map("n", "<leader>dp", "<cmd>UEDAPPause<cr>", { desc = "DAP: Pause" })
 map("n", "<leader>dx", "<cmd>UEResetLayout<cr>", { desc = "Reset Layout (DAP or default)" })
@@ -410,20 +412,10 @@ map("n", "<leader>dt", "<cmd>UEDAPRunToCursor<cr>",      { desc = "DAP: Run to c
 map("n", "<leader>dk", "<cmd>UEDAPFrameUp<cr>",          { desc = "DAP: Stack frame up" })
 map("n", "<leader>dj", "<cmd>UEDAPFrameDown<cr>",        { desc = "DAP: Stack frame down" })
 map("n", "<leader>dR", "<cmd>UEDAPRestartFrame<cr>",     { desc = "DAP: Restart frame" })
-map("n", "<leader>ui", "<cmd>UEInstallAndroid<cr>", { desc = "UE: Install APK to device" })
+map("n", "<leader>ui", "<cmd>UEInstall<cr>", { desc = "UE: Install for active target" })
 
--- Deferred: apply {nowait=true} overrides once LazyVim has finished loading
--- its own <leader>u* mappings, so ours take priority without delay.
--- CRITICAL: if VeryLazy already fired by the time this file loads (which
--- can happen because LazyVim auto-loads config/keymaps.lua ON the
--- VeryLazy event itself), the once-handler would never run. Apply
--- immediately in that case.
-if vim.v.vim_did_enter == 1 then
-  apply_ue_runtime_overrides()
-else
-  vim.api.nvim_create_autocmd("User", {
-    pattern = "VeryLazy",
-    once = true,
-    callback = apply_ue_runtime_overrides,
-  })
-end
+-- LazyVim loads user keymaps after its defaults, so the override is already
+-- in the correct order. Apply it in the same load pass: Neovide can source
+-- this file before VimEnter, and waiting for another VeryLazy would leave the
+-- prefix-sensitive mappings absent for the rest of that session.
+apply_ue_runtime_overrides()

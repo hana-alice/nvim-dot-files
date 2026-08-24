@@ -14,6 +14,17 @@ fork lets us feed that same list directly into the trigram index.
 
 ## Build
 
+macOS/Linux installs both this fork and the pinned query binary:
+
+```sh
+sh scripts/install_csearch.sh
+```
+
+Run that command from the Neovim configuration root. Windows setup installs
+the same pair from `scripts/install_windows.ps1`.
+
+To build only this fork manually:
+
 ```pwsh
 $env:GOPROXY = 'https://goproxy.cn,direct'
 $env:GOSUMDB = 'off'
@@ -28,5 +39,10 @@ $env:CSEARCHINDEX = '<PROJ_DRIVE>\UEProj\.cache\nvim-ue\csearch.idx'
 cindex-uefilter -reset -files-from <PROJ_DRIVE>\UEProj\.cache\nvim-ue\workspace_all.txt
 csearch -n FRDGBuilder
 ```
+
+Without `-reset`, each listed file is also recorded as an exact merge path.
+That lets codesearch atomically add new files and replace the old trigrams for
+modified files. Deletions are not representable by upstream `index.Merge` and
+must trigger a reset build.
 
 When `-files-from` is omitted, behaves identically to upstream `cindex`.

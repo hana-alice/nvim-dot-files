@@ -12,6 +12,11 @@ local M = {}
 
 local sessions = {}
 local session_values = {}
+-- One-shot, process-local handoff from an explicit :UESetPlatform to the next
+-- :UESetProject. This is what makes the two commands order-independent without
+-- turning engine target-default.json into build authority or leaking intent to
+-- another live Neovim process.
+local staged_targets = {}
 local load_values
 local SESSION_LOCAL_FIELDS = {
   target_platform = true,
@@ -116,9 +121,21 @@ function M.select(engine_root, project_root, uproject, opts)
     if not ok then return nil, write_err end
   end
   local key = engine_key(engine_root)
+  local previous_session = sessions[key]
+  local previous_values = session_values[key]
   sessions[key] = selection
   session_values[key] = {}
-  if load_values then
+  local staged = staged_targets[key]
+  if staged and type(M.update_target) == "function" then
+    local ok, target_err = M.update_target(
+      engine_root, staged.target_platform, staged.target_configuration)
+    if not ok then
+      sessions[key] = previous_session
+      session_values[key] = previous_values
+      return nil, target_err
+    end
+    staged_targets[key] = nil
+  elseif load_values then
     local persisted = load_values(engine_root, selection)
     for field in pairs(SESSION_LOCAL_FIELDS) do
       session_values[key][field] = persisted[field]
@@ -331,9 +348,39 @@ function M.update_target(engine_root, platform, configuration)
   })
 end
 
+--- Capture an explicit :UESetPlatform intent independently from project
+--- selection. If a project is active, update its authoritative bucket now;
+--- either way, apply the same pair once to the next explicit :UESetProject.
+--- The one-shot handoff is process-local, so engine target-default.json stays
+--- suggestion-only and another Neovim cannot redirect this process.
+function M.stage_target(engine_root, platform, configuration)
+  local key = engine_key(engine_root)
+  staged_targets[key] = {
+    target_platform = platform,
+    target_configuration = configuration,
+  }
+
+  if M.current(engine_root) then
+    local ok, err = M.update_target(engine_root, platform, configuration)
+    if not ok then staged_targets[key] = nil end
+    return ok, err
+  end
+
+  local updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
+  local ok, err = atomic_write(engine_target_default_path(engine_root), {
+    target_platform = platform,
+    target_configuration = configuration,
+    updated_at = updated_at,
+    writer_pid = vim.fn.getpid(),
+  })
+  if not ok then staged_targets[key] = nil end
+  return ok, err
+end
+
 function M._reset_for_test()
   sessions = {}
   session_values = {}
+  staged_targets = {}
 end
 
 return M

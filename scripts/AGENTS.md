@@ -27,3 +27,7 @@
 ## 先读
 
 `../docs/testing-regression.md`（权威回归入口与分范围映射）、`../tests/AGENTS.md`。
+
+**治理 spec**（可观察行为的权威；与本文冲突时以 spec 为准）：
+`../openspec/specs/android-so-quick-deploy/spec.md`、
+`../openspec/specs/nvim-core-functionality-audit/spec.md`。

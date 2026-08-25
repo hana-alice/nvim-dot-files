@@ -37,3 +37,9 @@
 ## 先读
 
 `../../docs/architecture-symbol-resolution.md`、`../../docs/architecture/overview.md` §5。
+
+**治理 spec**（可观察行为的权威；与本文冲突时以 spec 为准）：
+`../../openspec/specs/probe-feedback-loop/spec.md`、
+`../../openspec/specs/task-management/spec.md`、
+`../../openspec/specs/global-android-device-selection/spec.md`、
+`../../openspec/specs/notification-history/spec.md`。

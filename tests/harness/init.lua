@@ -155,6 +155,36 @@ function M.get_keymap(mode, lhs)
   return nil
 end
 
+-- ── 宙主（host）能力守卫辅助 ────────────────────────────────
+-- 有些行为只在特定宙主上存在（如 IOS 工作流仅 macOS 可用；host/target matrix 在
+-- 其它宙主上按设计 **fail closed**）。要在任意宙主上验证这类分支，就得把「当前
+-- 宙主」显式换成目标宙主而不是伪造工具。
+--
+-- with_host(id, fn)：在 fn 执行期间把 `utils.platform.id` 换成 id（从而 `driver()`
+-- 返回对应宙主驱动），结束后**无论成败都还原**，避免污染后续用例。
+-- 注意：这不是「伪造宙主让断言碰巧通过」——目的是验证**目标宙主上的真实契约**；
+-- 当前宙主的 fail-closed 语义应另写用例断言。
+-- → openspec/specs/spec-authority-loop/spec.md（宙主相关失败按能力守卫）
+function M.with_host(id, fn)
+  local platform = require("utils.platform")
+  local saved = platform.id
+  platform.id = id
+  local ok, err = pcall(fn)
+  platform.id = saved
+  if not ok then error(err, 0) end
+end
+
+-- 当前宙主是否能解析到可执行的 POSIX shell 脚本（Windows 上 `executable()` 对 .sh 为 0，
+-- 因此任何依赖「.sh 可执行」的用例在 Windows 宙主上本质不适用）。
+function M.host_runs_posix_scripts()
+  local probe = vim.fn.tempname() .. "-posix-probe.sh"
+  vim.fn.writefile({ "#!/bin/sh", "exit 0" }, probe)
+  pcall(vim.fn.setfperm, probe, "rwxr-xr-x")
+  local ok = vim.fn.executable(probe) == 1
+  pcall(vim.fn.delete, probe)
+  return ok
+end
+
 -- ── 分组与用例 ────────────────────────────────────────────────────────────
 
 function M.describe(name, fn)

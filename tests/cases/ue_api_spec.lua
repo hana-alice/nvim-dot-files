@@ -136,10 +136,22 @@ t.describe("ue.android_build_command（SO-only）", function()
 
   t.it("项目和 SO 发现不固定 Client 项目路径", function()
     local source = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
-    t.assert_false(source:find("Source/SampleGame", 1, true) ~= nil,
-      "项目发现必须从 .uproject 派生，不能固定 Source/SampleGame")
-    t.assert_false(source:find("SampleGame-arm64.so", 1, true) ~= nil,
-      "SO 发现必须从动态 Target 派生")
+    -- 不变量是「**代码**不得固定项目路径」。文档注释里把 `Source/SampleGame/Source`
+    -- 当作 `.ueprepare-scan-paths` 的**用法示例**是合法的，全文 find 分不清代码与注释，
+    -- 所以只扫非注释行（跳过以 -- 开头的行）。
+    local offenders = {}
+    local lineno = 0
+    for line in (source .. "\n"):gmatch("([^\n]*)\n") do
+      lineno = lineno + 1
+      if not line:match("^%s*%-%-") then
+        if line:find("Source/SampleGame", 1, true) or line:find("SampleGame-arm64.so", 1, true) then
+          offenders[#offenders + 1] = lineno .. ": " .. line:gsub("^%s+", "")
+        end
+      end
+    end
+    t.assert_eq(#offenders, 0,
+      "项目/SO 发现必须从 .uproject / 动态 Target 派生，不能在代码里固定:\n  "
+        .. table.concat(offenders, "\n  "))
   end)
 
   t.it("SO deploy 命令锁定 serial/package/当前配置产物", function()

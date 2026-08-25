@@ -35,3 +35,7 @@ legacy 旁路只剩 `scripts/test_jumper_headless.lua`。
 ## 先读
 
 `../../../docs/architecture-symbol-resolution.md`（当前权威架构，必读）。
+
+**治理 spec**（可观察行为的权威；与本文冲突时以 spec 为准）：
+`../../../openspec/specs/cpp-contextual-definition-navigation/spec.md`、
+`../../../openspec/specs/cpp-semantic-highlighting/spec.md`。

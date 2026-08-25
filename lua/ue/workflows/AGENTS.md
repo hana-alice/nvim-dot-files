@@ -22,6 +22,6 @@
 
 ## 先读
 
-`../../../openspec/changes/establish-ue-platform-workflow-boundaries/design.md`、
-`../../../openspec/changes/establish-ue-platform-workflow-boundaries/specs/ue-target-workflow-boundary/spec.md`、
-`../../../openspec/changes/establish-ue-platform-workflow-boundaries/specs/ue-target-driver-boundary/spec.md`
+`../../../openspec/specs/ue-target-workflow-boundary/spec.md`（治理本目录的 capability）、
+`../../../openspec/specs/ue-target-driver-boundary/spec.md`、
+`../../../openspec/changes/archive/2026-08-24-establish-ue-platform-workflow-boundaries/design.md`

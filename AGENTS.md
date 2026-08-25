@@ -1,8 +1,13 @@
-# Local Workflow — Claude & GPT/Codex 共用入口
+# Local Workflow — Claude / Codex / pi 共用入口
 
-> **单一内容源（single source of truth）。** 本文件是 Claude Code 与 GPT/Codex 共用的
+> **单一内容源（single source of truth）。** 本文件是 Claude Code、Codex 与 pi **三端共用**的
 > 项目根级说明。Claude 端由根 [`CLAUDE.md`](CLAUDE.md)（内容仅 `@AGENTS.md` 导入）读取本文；
-> Codex 端原生读取本文。**只维护这一个文件**，改一次两端同步。
+> Codex 与 pi 端原生读取本文（pi 逐级向上拼接 `AGENTS.md`/`CLAUDE.md`）。
+> **只维护这一个文件**，改一次三端同步。
+>
+> **禁止为让某一个 agent 生效而新增第四份并行入口**（如 agent 专属规则文件、
+> `AGENTS.override.md`、重复的 spec 索引副本）——内容必须收敛回本文件层级；
+> 各目录 `CLAUDE.md` 只能是 `@AGENTS.md` 导入 stub，不承载独立内容。
 >
 > **动任何代码之前**，先读 [`docs/CONSTRAINTS.md`](docs/CONSTRAINTS.md)
 > —— 禁止（禁止）/ 踩过的坑（踩过的坑）/ 约束（约束）的权威索引。
@@ -62,12 +67,24 @@ Do not ask for confirmation during normal local development unless:
 1. [`docs/CONSTRAINTS.md`](docs/CONSTRAINTS.md) — 禁止 / 踩过的坑 / 约束（权威索引）。
 2. [`memory/project_overview.md`](memory/project_overview.md) — 项目总览 + 子系统速查 + 知识库导航。
 3. **当前改动目录的本地规则** — 每个主要目录一份 `AGENTS.md`（单一内容源）+ 一个
-   `CLAUDE.md`（内容为 `@AGENTS.md` 导入 stub）。Codex 读 `AGENTS.md`；Claude 读
+   `CLAUDE.md`（内容为 `@AGENTS.md` 导入 stub）。Codex 与 pi 读 `AGENTS.md`；Claude 读
    `CLAUDE.md` 并由其 stub 展开同一内容。该目录**无**本地规则时，适用**最近祖先目录**
    的规则（回落语义）。子级规则只写相对父级的增量。
+4. **改动范围对应的 spec** — `openspec/specs/<capability>/spec.md` 是**可观察行为的权威
+   契约**（不是「写完躺着的文档」）。从「我要改哪个目录」一步定位治理它的 spec：查
+   [`memory/project_overview.md`](memory/project_overview.md) 子系统速查表的
+   **「治理 spec」列**（与 [`tests/AGENTS.md`](tests/AGENTS.md) 的 CHANGE-TO-FILTER MAP 同源）。
+   **按改动范围读，不遍历 `openspec/specs/`**；本地规则或 CONSTRAINTS 与 spec 冲突时以 spec 为准
+   （若冲突源于 spec 陈旧，先更正 spec）。机制见
+   [`openspec/specs/spec-authority-loop/spec.md`](openspec/specs/spec-authority-loop/spec.md)。
+
+**回归红灯优先**：若全量回归存在任何 FAIL，**处置它（修复 / 立 change / 记录不处理理由）
+先于推进无关新工作**——与上面第 0 步的探针 report-first 同一哲学。宿主（host）相关失败按
+**宿主能力守卫**用例，禁止注入假可执行文件/假宿主让断言「碰巧通过」。
 
 知识库四区：[`memory/`](memory/project_overview.md) · [`decisions/`](decisions/README.md) ·
 [`lessons/`](lessons/README.md) · [`docs/architecture/overview.md`](docs/architecture/overview.md)。
+行为契约：[`openspec/specs/`](openspec/specs/spec-authority-loop/spec.md)。
 
 ## Repository Constraints
 
@@ -158,15 +175,22 @@ Do not stop after step 2 if steps 3 to 5 are available.
 
 一次改动只有同时满足下列条件才算「完成」。这是本仓所有开发政策的**强制执行入口**；
 其余文档（CONSTRAINTS / `tests/AGENTS.md` / `docs/testing-regression.md` /
-`docs/changelog.md`）是出处与细节。
+`docs/changelog.md` / `openspec/specs/`）是出处与细节。
 
 1. **跑回归并全绿** — 按改动范围跑对应 filter（映射见 [`tests/AGENTS.md`](tests/AGENTS.md)
    的 CHANGE-TO-FILTER MAP）；**提交/合并前必跑全量** `nvim --headless -l tests/run.lua`；
    **影响面不确定就升级到全量，不猜窄 filter**。权威：[`docs/testing-regression.md`](docs/testing-regression.md)。
-2. **记 changelog** — 在 [`docs/changelog.md`](docs/changelog.md) Unreleased 追加一条（用既有模板），
-   其 **Validation 字段写明所跑回归范围与结果**。
-3. **收尾版本走 milestone** — 满足 semver 触发时执行 milestone 政策（release 文档 + changelog 归档 +
-   全量回归门禁 + git tag〔须用户确认〕 + 架构变更同步知识库）。权威：`docs/CONSTRAINTS.md §三 C8`。
+2. **spec 与实现一致** — 改动改变了 spec 已声明的可观察行为时，**同步更新对应
+   `openspec/specs/<capability>/spec.md` 或立一个承载该 spec 变更的 change**；若发现 spec
+   落后于已验证正确的实现，则**反向更正 spec**。只改实现而不动 spec 的收尾**不算完成**。
+   判定为「无 spec 影响」时也要显式声明。权威：
+   [`openspec/specs/spec-authority-loop/spec.md`](openspec/specs/spec-authority-loop/spec.md)。
+3. **记 changelog** — 在 [`docs/changelog.md`](docs/changelog.md) Unreleased 追加一条（用既有模板），
+   其 **Validation 字段写明所跑回归范围与结果**，并写明本次 **spec 一致性处置**
+   （同步 spec / 立 change / 判定无 spec 影响）。
+4. **收尾版本走 milestone** — 满足 semver 触发时执行 milestone 政策（release 文档 + changelog 归档 +
+   全量回归门禁 + spec 无未同步漂移 + git tag〔须用户确认〕 + 架构变更同步知识库）。
+   权威：`docs/CONSTRAINTS.md §三 C8`。
 
 ## Reporting
 

@@ -32,8 +32,10 @@ trigram 索引（google/codesearch 的 csearch）驱动的亚秒级 live grep，
 
 ## 改动 → 必跑回归
 
-`utils`（加载）；行为相关另跑 `ue_goto_behavior`；`scripts/test_cached_grep.lua` 为更重场景。
+`utils`（加载）；行为相关另跑 `ue_goto_behavior`；更重场景跑 `csearch_build_guard`、
+`ue_watch_csearch`。
 
 ## 先读
 
-`../../../README.md §8`（csearch 集成）、`../../../docs/architecture-symbol-resolution.md §6`。
+`../../../openspec/specs/ue-code-search/spec.md`（治理本目录的 capability）、
+`../../../README.md`（csearch 集成）、`../../../docs/architecture-symbol-resolution.md`。

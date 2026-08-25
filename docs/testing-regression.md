@@ -1,13 +1,17 @@
 # Headless 回归测试套件
 
 > 本文档是本仓库**权威的回归测试方式**。每次开发完成后跑一遍，确认无回归。
-> 完成的硬标准（Definition of Done）在根 `CLAUDE.md`；本文件是其回归条目的权威细节。
+> 完成的硬标准（Definition of Done）在根 `AGENTS.md`（Claude 侧经根 `CLAUDE.md` 的
+> `@AGENTS.md` 展开读同一内容）；本文件是其回归条目的权威细节。
 
 ## 改动后回归政策（分范围）
 
 任何 `.lua` 运行时代码或 `tests/` 用例改动，**在视为完成前 MUST 跑对应范围回归并全绿**。
-按改动类型跑**最小必跑范围**即可（控制成本），但有两条兜底：
-**① 提交/合并前必跑全量；② 影响面不确定就升级到全量，不猜窄 filter。**
+按改动类型跑**最小必跑范围**即可（控制成本），但有四条兜底：
+**① 提交/合并前必跑全量；② 影响面不确定就升级到全量，不猜窄 filter；**
+**③ 全量回归存在任何 FAIL 时，先处置该失败（修复 / 立 change / 记录不处理理由），再推进无关新工作；**
+**④ 宿主（host）相关失败按宿主能力守卫用例（不具备该能力的宿主不执行该断言，或改断其
+fail-closed 语义），禁止注入假可执行文件/假宿主让断言「碰巧通过」。**
 
 ### 改动 → 必跑 spec filter 映射
 
@@ -31,10 +35,12 @@
 | `lua/utils/core_health*.lua` / `scripts/nvim_core_health.lua` | `core_health` |
 | `lua/workarounds/**` | `workarounds` `smoke` |
 | `lua/ue.lua` façade / workflow 边界 | `ue_platform_boundary` `structure` |
-| 文档 / 规则 / 知识库结构 | `structure` |
+| 文档 / 规则 / 知识库 / `openspec/specs/**` 结构 | `structure` |
 | **跨子系统 / 公共 helper / 重构 / 拿不准** | **全量（不带 filter）** |
 
 > 与 `tests/AGENTS.md` 的 CHANGE-TO-FILTER MAP 保持一致；新增/重命名 spec 时两处同步。
+> 同时与 `memory/project_overview.md` 子系统速查表的「治理 spec」列**同源对齐**——找 filter 看本表，
+> 找治理该改动的 spec 看那张表（`capability 覆盖映射回归` 守护两侧名称可解析）。
 
 ### 配套要求
 
@@ -42,7 +48,11 @@
 - **冻结清单同步**：`commands_spec.lua` 的 `UE_COMMANDS`、`structure_spec.lua` 的目录清单等，
   在相关项变化时必须同步，否则回归会 FAIL（这是有意的防误删契约）。
 - **changelog 联动**：改动完成后在 `docs/changelog.md` 追加记录，其 Validation 字段写明
-  **所跑回归范围（filter 或全量）与结果**。
+  **所跑回归范围（filter 或全量）与结果**，以及本次 **spec 一致性处置**
+  （同步 spec / 立 change / 判定无 spec 影响）。
+- **spec 一致性联动**：改动改变了 `openspec/specs/<capability>/spec.md` 已声明的可观察行为时，
+  MUST 同步该 spec 或立一个承载该变更的 change；发现 spec 落后于已验证正确的实现时**反向更正 spec**。
+  权威：`openspec/specs/spec-authority-loop/spec.md`、根 `AGENTS.md` 的 Definition of Done 第 2 条。
 
 ## 一键全量回归
 

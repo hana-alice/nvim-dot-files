@@ -304,6 +304,10 @@ t.describe("ue target integration", function()
 
     t.assert_eq(ue._ios_workflow_owner_for_test("semantic_cdb"), "ios.semantic")
 
+    -- IOS 工作流仅 macOS 宙主可用（host/target matrix 在其它宙主按设计 fail closed），
+    -- 而 `prepare` 经 invoke_workflow_api 解析**实时宙主驱动**。要在任意宙主上验证该
+    -- 分支，必须显式切到 macOS 宙主（而非伪造工具让断言碰巧通过）。
+    t.with_host("macos", function()
     local semantic = require("ue.workflows.ios.semantic")
     local calls = {}
     local done
@@ -357,6 +361,7 @@ t.describe("ue target integration", function()
     t.assert_eq(table.concat(calls, ","), "setup,clangd,semantic-cdb")
     t.assert_true(done.ok)
     t.assert_eq(done.info.entry_count, 1)
+    end)
 
     local semantic_start = assert(source:find("function CORE_RT.generate_semantic_cdb_after_build", 1, true))
     local semantic_end = assert(source:find("function CORE_RT.ios_setup_is_ready", semantic_start, true))
@@ -381,6 +386,8 @@ t.describe("ue target integration", function()
       launch_path = "/Project/Binaries/IOS/SampleGame",
       source = "ubt-receipt",
     }
+    -- 同上：经 invoke_workflow_api 的 IOS 路径需 macOS 宙主才能解析到 workflow owner。
+    t.with_host("macos", function()
     local ok, evidence = ue._apple_build_evidence_matches_for_test({
       engine_root = "/UE",
       project_root = "/Workspace",
@@ -411,6 +418,7 @@ t.describe("ue target integration", function()
     t.assert_eq(persisted_value.target, "SampleGame")
     t.assert_eq(persisted_value.platform, "IOS")
     t.assert_eq(persisted_value.configuration, "Development")
+    end)
   end)
 
   t.it("reuses a validated IOS semantic source only for the exact build evidence and file signature", function()
@@ -633,12 +641,15 @@ t.describe("ue target integration", function()
       },
     }
 
+    -- 同上：`_ios_setup_is_ready_for_test` 经 invoke_workflow_api 解析实时宙主驱动。
+    t.with_host("macos", function()
     t.assert_false(ue._ios_setup_is_ready_for_test(ctx, vim.tbl_extend("force", dependencies, {
       resolve_legacy_install_script = function() return nil, "missing helper" end,
     })))
     t.assert_true(ue._ios_setup_is_ready_for_test(ctx, vim.tbl_extend("force", dependencies, {
       resolve_legacy_install_script = function() return "/Tools/InstallIOSClient.sh" end,
     })))
+    end)
   end)
 
   t.it("propagates target runtime persistence failures", function()
@@ -758,6 +769,12 @@ t.describe("ue target integration", function()
   end)
 
   t.it("rehydrates legacy install and launch evidence after a Nvim restart", function()
+    -- 本用例依赖「文件系统上的 .sh 可执行」：`resolve_legacy_install_script` 按设计要求
+    -- `vim.fn.executable(candidate) == 1`，而 Windows 宙主对 POSIX 脚本永远返回 0
+    -- （setfperm 也无法赋予执行位）。这是**宙主能力缺失**，不是实现漂移；按能力
+    -- 守卫，并在不具备该能力的宙主上改断其 fail-closed 语义。
+    -- 禁止为让断言通过而注入假可执行文件。
+    -- → openspec/specs/spec-authority-loop/spec.md（宙主相关失败按能力守卫）
     local common = require("ue.workflows.ios.common")
     local root = vim.fn.tempname() .. "-ios-workflow"
     local install_script = root .. "/InstallIOSClient.sh"
@@ -808,6 +825,15 @@ t.describe("ue target integration", function()
 
     vim.g.ue_ios_install_script = old_install_script
     vim.fn.delete(root, "rf")
+
+    if not t.host_runs_posix_scripts() then
+      -- 宙主不能把 .sh 认作可执行：契约是 **fail closed**（返回 nil + 可读原因），
+      -- 而不是静默接受一个不可执行的 helper。
+      t.assert_nil(ok_install)
+      local _, script_err = common.resolve_legacy_install_script(ctx)
+      t.assert_contains(tostring(script_err), "InstallIOSClient.sh")
+      return
+    end
 
     t.assert_true(ok_install)
     t.assert_true(ok_launch)

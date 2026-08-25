@@ -42,3 +42,6 @@ phase 调度（`_build`），以及只跟随 chosen manifest fingerprint 的 cla
 
 `../../../docs/health-check-2026-07.md`（F1 切分大纲）、
 `../../../docs/architecture/overview.md`。
+
+**治理 spec**（可观察行为的权威；与本文冲突时以 spec 为准）：
+`../../../openspec/specs/cpp-semantic-index-coverage/spec.md`。

@@ -60,7 +60,12 @@ t.describe("ue.ai_context", function()
       t.assert_eq(context.artifacts.build_command[1], "cmd.exe")
       t.assert_contains(build_text, "Build.bat")
       t.assert_contains(build_text, "SampleGame Android Development")
-      t.assert_eq(context.artifacts.install_command[1], "adb")
+      -- argv[1] 是 `adb_executable()` 的结果：能解析到时为 `exepath("adb")` 的**绝对路径**
+      -- （本机可能是 C:\WINDOWS\adb.EXE），解析不到才回落字面量 "adb"。路径字面量取决于
+      -- 宙主 PATH，不是不变量；真正的不变量是 basename 为 adb 且 `-s <serial>` 在位且有序。
+      -- → openspec/specs/global-android-device-selection/spec.md（统一 `adb -s <serial>`）
+      local adb_argv0 = context.artifacts.install_command[1]
+      t.assert_match(adb_argv0:lower(), "adb%.?%a*$")
       t.assert_eq(context.artifacts.install_command[2], "-s")
       t.assert_eq(context.artifacts.install_command[3], "SERIAL-CONTEXT")
       t.assert_eq(context.artifacts.install_command[4], "install")
@@ -88,7 +93,8 @@ t.describe("ue.ai_context", function()
     t.assert_contains(markdown, "Development")
     t.assert_contains(markdown, "Android device serial: `SERIAL-CONTEXT`")
     if require("utils.platform").is_windows then
-      t.assert_contains(markdown, "adb -s SERIAL-CONTEXT install -r")
+      -- 同上：adb 可执行文件字面量由宙主 PATH 决定，不变量是 `-s <serial> install -r` 片段。
+      t.assert_contains(markdown, "-s SERIAL-CONTEXT install -r")
     else
       t.assert_contains(markdown, "Android install is unavailable on host")
     end

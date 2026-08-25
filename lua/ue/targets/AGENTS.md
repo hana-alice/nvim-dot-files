@@ -40,6 +40,9 @@ UBT/UAT argv、RSP 归属判断、以及各 target 自有的生命周期 planner
 
 ## 先读
 
-`../../../openspec/changes/add-macos-ios-cdb-semantic-prepare/design.md`、
-`../../../openspec/changes/add-ios-build-run-workflow/design.md`、
+`../../../openspec/specs/ue-target-driver-boundary/spec.md`（治理本目录的 capability）、
+`../../../openspec/specs/macos-ios-cdb-semantic-prepare/spec.md`、
+`../../../openspec/specs/ios-build-run-workflow/spec.md`、
+`../../../openspec/changes/archive/2026-08-11-add-macos-ios-cdb-semantic-prepare/design.md`、
+`../../../openspec/changes/archive/2026-08-11-add-ios-build-run-workflow/design.md`、
 `../AGENTS.md`

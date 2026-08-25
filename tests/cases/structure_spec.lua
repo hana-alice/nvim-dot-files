@@ -179,4 +179,206 @@ t.describe("structure: 强制入口与政策可发现", function()
     t.assert_contains(agents, "changelog.md")
     t.assert_contains(agents, "milestone")
   end)
+  -- spec 权威纪律（spec-authority-loop）：SESSION START 必读 spec + DoD 含一致性 + 红灯优先。
+  t.it("根 AGENTS.md 的 SESSION START 含 openspec/specs 必读一步", function()
+    local ss = agents:match("SESSION START.-\n## ") or agents:match("SESSION START.*$") or ""
+    t.assert_contains(ss, "openspec/specs")
+  end)
+  t.it("根 AGENTS.md 的 DoD 含 spec 一致性硬条件", function()
+    local dod = agents:match("Definition of Done.-\n## ") or agents:match("Definition of Done.*$") or ""
+    t.assert_contains(dod, "spec 与实现一致")
+  end)
+  t.it("根 AGENTS.md 含回归红灯优先", function()
+    t.assert_contains(agents, "回归红灯优先")
+  end)
+  t.it("CONSTRAINTS 含 spec 一致性约束 C9", function()
+    t.assert_contains(constraints, "C9")
+    t.assert_contains(constraints, "spec-authority-loop")
+  end)
+end)
+
+-- ── ⑤ spec 引用完整性 ──────────────────────────────────────
+-- spec 与规则文档里的「仓内路径引用」必须真实存在：防止 spec 继续声称产出一个已被
+-- 删除/重命名/归档的文件（本次审计的真实故障：docs/plans/... 已随脱敏移除、
+-- openspec/changes/<name>/ 已归档到 archive/、scripts/test_cached_grep.lua 已删）。
+--
+-- 策略（保守，宁漏不误报）：只检查反引号内、首段命中仓内顶层目录白名单的路径 token；
+-- 跳过一切模板/通配形态（含 < > * 或 ...）与 §锚点尾巴。未加反引号的路径不检查。
+local TOP_DIRS = {
+  lua = true, tests = true, docs = true, scripts = true, tools = true,
+  openspec = true, memory = true, decisions = true, lessons = true,
+  colors = true, data = true,
+}
+
+local function is_placeholder(tok)
+  -- 模板/通配形态：<capability>、lua/**、docs/plans/...、{a,b}_spec.lua、release_vX.Y.Z.md
+  if tok:find("[<>*{}]") ~= nil then return true end
+  if tok:find("%.%.%.") ~= nil then return true end
+  if tok:find("vX%.Y%.Z") ~= nil then return true end
+  return false
+end
+
+-- 只把「看起来像文件或目录」的 token 当路径校验：以 / 结尾的目录形态，或末段带
+-- 已知文件扩展名。像 `lua/utils/async_launcher.launch` 这类 `module.function` 引用
+-- 不是路径，跳过（宁漏不误报）。
+local PATH_EXTS = {
+  md = true, lua = true, json = true, ps1 = true, yaml = true, yml = true,
+  py = true, sh = true, c = true, h = true, txt = true, log = true,
+  toml = true, bat = true, files = true,
+}
+
+local function looks_like_path(tok)
+  if tok:sub(-1) == "/" then return true end
+  local ext = tok:match("%.([%w_]+)$")
+  return ext ~= nil and PATH_EXTS[ext:lower()] == true
+end
+
+-- 从一段文本里抽出所有反引号 token，筛出「仓内路径」形态的。
+local function repo_path_refs(content)
+  local out = {}
+  for tok in content:gmatch("`([^`]+)`") do
+    -- 剥掉 §锚点尾巴与尾随标点：`docs/CONSTRAINTS.md §三 C8` -> docs/CONSTRAINTS.md
+    local path = tok:gsub("%s*§.*$", ""):gsub("[%s,;:。、]+$", "")
+    if path ~= "" and not is_placeholder(path) and path:find("/", 1, true)
+      and looks_like_path(path) then
+      local first = path:match("^([^/]+)/")
+      if first and TOP_DIRS[first] then
+        out[#out + 1] = path
+      end
+    end
+  end
+  return out
+end
+
+t.describe("structure: spec 引用完整性", function()
+  local spec_files = vim.fn.globpath(cfg .. "/openspec/specs", "*/spec.md", false, true)
+
+  t.it("openspec/specs 下存在主规格文件", function()
+    t.assert_true(#spec_files > 0, "未发现任何 openspec/specs/*/spec.md")
+  end)
+
+  t.it("spec 内仓内路径引用均存在", function()
+    local dangling = {}
+    for _, abs in ipairs(spec_files) do
+      local rel = abs:gsub("^" .. vim.pesc(cfg) .. "/", "")
+      local content = table.concat(vim.fn.readfile(abs), "\n")
+      for _, path in ipairs(repo_path_refs(content)) do
+        if not (exists(path) or isdir(path)) then
+          dangling[#dangling + 1] = path .. "  ← " .. rel
+        end
+      end
+    end
+    t.assert_eq(#dangling, 0,
+      "spec 引用了不存在的仓内路径:\n  " .. table.concat(dangling, "\n  "))
+  end)
+
+  t.it("规则文档内仓内路径引用均存在", function()
+    local docs = { "AGENTS.md", "docs/CONSTRAINTS.md", "memory/project_overview.md" }
+    for _, d in ipairs(MAJOR_DIRS) do
+      docs[#docs + 1] = d .. "/AGENTS.md"
+    end
+    local dangling = {}
+    for _, rel in ipairs(docs) do
+      local content = read(rel)
+      if content then
+        -- 目录级 AGENTS.md 里的引用多为 ../ 相对形态，已被 TOP_DIRS 过滤掉；
+        -- 命中白名单者按「相对仓根」解释（与 spec 一致）。
+        for _, path in ipairs(repo_path_refs(content)) do
+          if not (exists(path) or isdir(path)) then
+            dangling[#dangling + 1] = path .. "  ← " .. rel
+          end
+        end
+      end
+    end
+    t.assert_eq(#dangling, 0,
+      "规则文档引用了不存在的仓内路径:\n  " .. table.concat(dangling, "\n  "))
+  end)
+end)
+
+-- ── ⑥ capability 覆盖映射 ────────────────────────────────────
+-- 守护「从改动目录一步定位治理 spec」这张映射自身不腐烂：
+--   · memory/project_overview.md「治理 spec」列里的 capability 必须有主规格文件
+--   · tests/AGENTS.md CHANGE-TO-FILTER MAP 里的 filter 必须能匹配到 *_spec.lua
+t.describe("structure: capability 覆盖映射", function()
+  local overview = read("memory/project_overview.md") or ""
+  local tests_rules_txt = read("tests/AGENTS.md") or ""
+
+  -- 速查表行：| 子系统 | 位置 | 本地规则 | 治理 spec | 必跑 filter | 一句话 |
+  local function coverage_rows()
+    local rows = {}
+    for line in overview:gmatch("[^\n]+") do
+      if line:find("^|") and not line:find("^|%-") and not line:find("子系统") then
+        local cells = {}
+        for cell in line:gmatch("|([^|]*)") do cells[#cells + 1] = cell end
+        if #cells >= 5 then rows[#rows + 1] = { spec = cells[4], filter = cells[5] } end
+      end
+    end
+    return rows
+  end
+
+  local rows = coverage_rows()
+
+  t.it("速查表含治理 spec 列且有数据行", function()
+    t.assert_contains(overview, "治理 spec")
+    t.assert_true(#rows > 0, "未解析到子系统速查表的数据行")
+  end)
+
+  t.it("映射中的 capability 均有主规格文件", function()
+    local missing = {}
+    local seen = 0
+    for _, r in ipairs(rows) do
+      for cap in r.spec:gmatch("`([a-z0-9%-]+)`") do
+        seen = seen + 1
+        if not exists("openspec/specs/" .. cap .. "/spec.md") then
+          missing[#missing + 1] = cap
+        end
+      end
+    end
+    t.assert_true(seen > 0, "治理 spec 列未解析出任何 capability")
+    t.assert_eq(#missing, 0,
+      "治理 spec 列引用了不存在的 capability:\n  " .. table.concat(missing, "\n  "))
+  end)
+
+  t.it("CHANGE-TO-FILTER MAP 中的 filter 均有对应用例文件", function()
+    local cases = vim.fn.globpath(cfg .. "/tests/cases", "*_spec.lua", false, true)
+    local names = {}
+    for _, abs in ipairs(cases) do
+      names[#names + 1] = vim.fn.fnamemodify(abs, ":t:r")
+    end
+    -- 只解析映射表段落，避免把正文里的反引号词当 filter
+    local map = tests_rules_txt:match("CHANGE%-TO%-FILTER MAP(.-)\n## ") or ""
+    local missing = {}
+    local seen = 0
+    for line in map:gmatch("[^\n]+") do
+      if line:find("^|") and not line:find("^|%-") and not line:find("改动位置") then
+        local last = line:match("|([^|]*)|%s*$") or ""
+        for f in last:gmatch("`([a-z0-9_]+)`") do
+          seen = seen + 1
+          local hit = false
+          for _, n in ipairs(names) do
+            if n:find(f, 1, true) then hit = true; break end
+          end
+          if not hit then missing[#missing + 1] = f end
+        end
+      end
+    end
+    t.assert_true(seen > 0, "未从 CHANGE-TO-FILTER MAP 解析出任何 filter")
+    t.assert_eq(#missing, 0,
+      "映射表中的 filter 无对应 tests/cases/*_spec.lua:\n  " .. table.concat(missing, "\n  "))
+  end)
+end)
+
+-- ── ⑦ 目录规则声明治理 spec ─────────────────────────────────
+t.describe("structure: 目录规则声明治理 spec", function()
+  for _, d in ipairs(MAJOR_DIRS) do
+    t.it(d .. "/AGENTS.md 声明治理 spec 或显式无", function()
+      local content = read(d .. "/AGENTS.md")
+      t.assert_true(content ~= nil, "读不到 " .. d .. "/AGENTS.md")
+      local has_ptr = content:find("openspec/specs/", 1, true) ~= nil
+      local has_none = content:find("无对应 capability", 1, true) ~= nil
+      t.assert_true(has_ptr or has_none,
+        d .. "/AGENTS.md 需在「先读」段列出 openspec/specs/<capability>/spec.md 指针，"
+          .. "或显式声明「无对应 capability」")
+    end)
+  end
 end)

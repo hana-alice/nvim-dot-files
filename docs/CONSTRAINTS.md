@@ -477,7 +477,7 @@
   USR/CDB/overlay/toolchain 的唯一 resolved destination；negative/ambiguous 不缓存。禁止
   symbol / arity / ranking / text fallback 猜目标。
   → `docs/architecture-symbol-resolution.md`;
-    `openspec/changes/make-cpp-gd-semantically-complete/`
+    `openspec/changes/archive/2026-08-08-make-cpp-gd-semantically-complete/`
 
 - **K43 — 把“会话全局”和磁盘全局混为一谈 → 多实例串项目 / 丢状态 / 撕裂缓存**
   症状: 两个 Neovim 指向同一 engine 时，旧的顶层 `state.json` 让后写实例改变另一个实例的
@@ -673,6 +673,8 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 任何 `.lua` 运行时代码或 `tests/` 改动，**完成前 MUST 跑对应范围回归并全绿**。按改动类型跑
 **最小必跑范围**（改动 → spec filter 映射），但 **① 提交/合并前必跑全量；② 影响面不确定升级到全量，不猜窄 filter**。
 新增功能 MUST 补 `*_spec.lua`；冻结清单（`commands_spec` 的 `UE_COMMANDS`、`structure_spec` 目录清单）随相关项变化同步。
+**回归红灯优先**：全量回归存在任何 FAIL 时，处置它（修复 / 立 change / 记录不处理理由）MUST 先于推进无关新工作；
+宿主相关失败 MUST 按**宿主能力守卫**用例（与 fail-closed 语义一致），MUST NOT 注入假可执行文件/假宿主让断言「碰巧通过」。
 **强制入口在根 `AGENTS.md` 的 Definition of Done**（Claude 侧经根 `CLAUDE.md` 的 `@AGENTS.md` 展开读同一内容）；映射速查在 `tests/AGENTS.md`；权威细则在 `docs/testing-regression.md`。
 → 根 `AGENTS.md` (Definition of Done); `docs/testing-regression.md`; `tests/AGENTS.md`
 
@@ -680,7 +682,8 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 
 每次落地的改动（即便一行补丁）**MUST 在 `docs/changelog.md` Unreleased 追加一条**，用既有模板
 （`### YYYY-MM-DD — 标题` + Task / Implemented / Pitfalls / Validation / Follow-ups）。Implemented 含具体
-文件路径与函数名；**Validation 写明所跑回归范围与结果**（与 C6 联动）。攒够 8–12 条或一项连贯工作收尾
+文件路径与函数名；**Validation 写明所跑回归范围与结果**（与 C6 联动）**以及本次 spec 一致性处置**
+（同步 spec / 立 change / 判定无 spec 影响，与 C9 联动）。攒够 8–12 条或一项连贯工作收尾
 即切片归档（见 C8）。
 → 根 `AGENTS.md` (Definition of Done); `docs/changelog.md` (Entry template / How to use)
 
@@ -689,10 +692,25 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 **触发**：按 semver——含 BREAKING → major、引入新能力 → minor、仅修复/小改 → patch；版本号续
 `v1.0.3` 不跳号。**产出物四件套（缺一不算 milestone）**：① 生成 `docs/release_vX.Y.Z.md`（沿用
 `docs/release_1.0.0.md` 格式）+ changelog Unreleased 切片归档 + Released 加交叉链接 + 清空 Unreleased；
-② milestone 前跑**全量回归门禁** `nvim --headless -l tests/run.lua` 全绿；③ 打 git tag `vX.Y.Z`
+② milestone 前跑**全量回归门禁** `nvim --headless -l tests/run.lua` 全绿，且确认所有已落地行为变更
+均已反映到 `openspec/specs/`（无未同步的 spec 漂移）；③ 打 git tag `vX.Y.Z`
 （**tag/commit 须用户确认**，遵守本仓 git 政策，不自动执行）；④ 若动了架构/子系统边界，同步
 `memory/` 与 `docs/architecture/overview.md`。
 → 根 `AGENTS.md` (Definition of Done); `docs/changelog.md` (Released); `docs/release_1.0.0.md` (格式范例)
+
+### C9 — spec 一致性属于完成定义（spec 是行为权威）
+
+`openspec/specs/<capability>/spec.md` 是**可观察行为的权威契约**。**SESSION START MUST 包含
+「读改动范围对应的 spec」一步**（按范围读，不遍历全部 spec；从 `memory/project_overview.md`
+子系统速查表的「治理 spec」列一步定位）。**改动落地前 MUST 满足 spec 与实现一致**：行为变更
+同步对应 spec 或立 change；**spec 落后于已验证正确的实现时反向更正 spec**；只改实现不动 spec
+的收尾不算完成。本文档与各目录本地规则**不得与 spec 冲突**（冲突以 spec 为准；冲突源于 spec
+陈旧则先更正 spec）。spec 与规则文档中的**仓内路径引用 MUST 真实存在**（`structure` filter 的
+spec 引用完整性用例守护）。强制力入口在根 `AGENTS.md` 的 Definition of Done 第 2 条。
+**禁止为让某一个 agent 生效而新增第四份并行入口文件**（Claude/Codex/pi 三端只从 `AGENTS.md`
+层级读取；各目录 `CLAUDE.md` 只能是 `@AGENTS.md` stub）。
+→ 根 `AGENTS.md` (Definition of Done); `openspec/specs/spec-authority-loop/spec.md`;
+  `memory/project_overview.md` (治理 spec 列); `tests/cases/structure_spec.lua`
 
 ---
 
@@ -700,10 +718,11 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 
 为让持续介入的 AI agent **从文件而非 chat 历史**发现规则，本仓提供：
 
-- **强制执行入口（单一内容源）**：根 `AGENTS.md` 是 Claude 与 GPT/Codex **共用的唯一内容源**
-  （SESSION START 协议：动代码前先读 `docs/CONSTRAINTS.md` → `memory/project_overview.md` →
-  当前目录本地规则；+ Definition of Done）。根 `CLAUDE.md` 内容仅为 `@AGENTS.md` 导入 stub
-  （Claude 只读 `CLAUDE.md`，由该 import 展开读同一内容；Codex 原生读 `AGENTS.md`）。
+- **强制执行入口（单一内容源）**：根 `AGENTS.md` 是 Claude Code / Codex / pi **三端共用的唯一内容源**
+  （SESSION START 协议：动代码前先读探针反馈 → `docs/CONSTRAINTS.md` → `memory/project_overview.md` →
+  当前目录本地规则 → **改动范围对应的 `openspec/specs/<capability>/spec.md`**；+ Definition of Done）。
+  根 `CLAUDE.md` 内容仅为 `@AGENTS.md` 导入 stub（Claude 只读 `CLAUDE.md`，由该 import 展开读同一
+  内容；Codex 与 pi 原生读 `AGENTS.md`）。**禁止为让某一个 agent 生效而新增第四份并行入口文件。**
 - **递归本地规则（单一内容源）**：每个主要目录一份 `AGENTS.md`（权威内容源），同目录一份
   `CLAUDE.md`（内容为 `@AGENTS.md` stub）。子级只写相对父级的增量；某目录无本地规则时，
   适用**最近祖先目录**的规则（回落语义）。**只维护 AGENTS.md 一个文件，改一次两端同步**——
@@ -713,8 +732,14 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
   - `decisions/README.md` — 架构决策(ADR)导航（权威正文在 `docs/plans/`）。
   - `lessons/README.md` — 平台怪癖/调试硬知识导航（权威在本文件 §二）。
   - `docs/architecture/overview.md` — 架构总览（子系统/数据流/平台层/构建流水线/归属边界）。
+- **行为契约权威（spec）**：`openspec/specs/<capability>/spec.md` 是**可观察行为的权威**；
+  本文档与各目录本地规则**不得与之冲突**（冲突时以 spec 为准；若冲突源于 spec 陈旧，
+  先更正 spec 再对齐规则）。从「改动哪个目录」一步定位治理它的 spec：见
+  `memory/project_overview.md` 子系统速查表的**「治理 spec」列**（与 `tests/AGENTS.md` 的
+  CHANGE-TO-FILTER MAP 同源对齐）。权威机制见 `openspec/specs/spec-authority-loop/spec.md`。
 - **可发现性回归**：`tests/cases/structure_spec.lua` 守护「目录规则存在（AGENTS.md 源 +
-  CLAUDE.md stub）+ 知识库结构完整 + 内链不悬空 + 政策可发现」，跑 `structure` filter。
+  CLAUDE.md stub）+ 知识库结构完整 + 内链不悬空 + spec 引用不悬空 + capability 覆盖映射
+  可解析 + 政策可发现」，跑 `structure` filter。
 
 ---
 
@@ -731,8 +756,13 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 4. **新增子系统目录 / 迁移知识** → 为新目录补一份本地 `AGENTS.md`（内容源，声明继承父级）
    **并补一个 `CLAUDE.md`（内容为 `@AGENTS.md` stub）**，
    在对应知识区 README 登记；`structure_spec` 的目录清单同步。
-5. **新增 spec / 改命令清单** → 同步 `tests/AGENTS.md` 与 `docs/testing-regression.md` 的 filter 映射，
-   及 `commands_spec` 冻结清单。
+5. **新增 spec / 改命令清单** → 同步 `tests/AGENTS.md` 与 `docs/testing-regression.md` 的 filter 映射、
+   `memory/project_overview.md` 的「治理 spec」列，及 `commands_spec` 冻结清单。
+5b. **改动改变了 spec 已声明的可观察行为** → 同步更新对应 `openspec/specs/<capability>/spec.md`
+   或立一个承载该 spec 变更的 change；若发现 spec 落后于已验证正确的实现，则**反向更正 spec**。
+   两种处置都必须在 `docs/changelog.md` 的 Validation 字段留痕（见 C7）。
+5c. **spec 或规则文档引用的仓内文件被删除/重命名/归档** → 同步更正该引用（或更正 spec 的产出物
+   要求）；`structure_spec` 的 spec 引用完整性用例守护「引用不悬空」。
 6. **milestone 收尾** → 须同步 `memory/` 与 `docs/architecture/overview.md`（若动架构），并按 C8 产出四件套。
 7. **出处优先**: 不在此复制原文；摘要与出处冲突时以出处为准。删除某 workaround/坑
    时，对应行随 `git rm` 一并删除。

@@ -45,6 +45,90 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-08-25 — 让 spec 真正生效，并收敛 spec ↔ 实现的既有漂移
+
+**Task**
+
+两个互为因果的问题：① 全量回归长期红灯（1074/1082，8 条 FAIL）且多处 spec/规则文档
+指向已不存在的文件，而 `openspec validate --all` 却 37/37 全绿——证明结构校验永远发现不了
+语义漂移；② `openspec/specs/` 不在任何 agent 的自动读取路径上（SESSION START 从未列为必读，
+22 份目录级 `AGENTS.md` 仅 3 份提到 openspec），spec 成了「写完就躺着的文档」。
+
+**Implemented**
+
+- 新 capability `openspec/specs/spec-authority-loop/spec.md`（6 requirement）：spec 为 SESSION START
+  强制前置、三 agent 经唯一内容源同时生效、capability 覆盖导航、spec 一致性属于完成定义、
+  回归红灯不得推进新工作、spec 引用完整性可回归发现。
+- **反向对齐 7 份陈旧 spec**（实现正确、spec 落后）：`test-regression-policy`（强制入口由
+  根 `CLAUDE.md` 改为根 `AGENTS.md`，DoD 三条→四条）、`local-subsystem-rules`、
+  `structure-discoverability-regression`（目录清单补齐 index/targets/workflows/trouble/nio）、
+  `project-constraints-doc`、`ai-knowledge-base`、`probe-feedback-loop`（补已实现的
+  `:UEProbeCompact`）、`android-dap-handshake-diagnostics`（不再要求已随脱敏移除的报告文件）。
+- 根 `AGENTS.md`：SESSION START 新增第 4 步「读改动范围对应的 spec」（含「按范围读、不遍历」
+  边界）+ 「回归红灯优先」；DoD 新增硬条件「spec 与实现一致」；单一内容源声明扩到
+  Claude/Codex/pi 三端并禁止新增第四份并行入口。
+- `memory/project_overview.md`：子系统速查表新增**「治理 spec」与「必跑 filter」两列**
+  （24 行子系统，无对应 capability 的显式写「无」）；先读顺序加入 spec 一步。
+- `docs/CONSTRAINTS.md`：新增约束 **C9（spec 一致性属于完成定义）**；C6 补红灯优先 + 宙主能力
+  守卫；C7 Validation 补 spec 处置；C8 milestone 门禁补「无未同步 spec 漂移」；§五 导航补
+  `openspec/specs/` 与覆盖映射；§六 维护契约补 5b/5c。
+- 22 份目录级 `AGENTS.md` 均声明治理 spec 指针或显式「无对应 capability」；
+  `tests/AGENTS.md` / `docs/testing-regression.md` 同步四条升级原则与同源对齐声明。
+- 修正悬空引用：`lua/ue/workflows/AGENTS.md`、`lua/ue/targets/AGENTS.md` 的 3 个
+  `openspec/changes/<name>/` 改指 `archive/<dated-name>/`；`lua/utils/code_search/AGENTS.md`
+  移除已删的 `scripts/test_cached_grep.lua`；`docs/CONSTRAINTS.md` 的
+  `openspec/changes/make-cpp-gd-semantically-complete/` 改指归档路径。
+- `tests/cases/structure_spec.lua` 新增三段守护（+31 断言，40→71）：⑤ spec 引用完整性
+  （反引号 + 顶层目录白名单 + 路径形态识别，跳过模板/通配/`§`锚点，宁漏不误报）、
+  ⑥ capability 覆盖映射不腐烂、⑦ 目录规则声明治理 spec；④ 段补 SESSION START/DoD/C9 标记。
+- `tests/harness/init.lua` 新增 `with_host(id, fn)`（临时切宙主并必还原）与
+  `host_runs_posix_scripts()`（宙主能否把 `.sh` 认作可执行）两个宙主能力守卫辅助。
+- 收敛 8 条既有 FAIL（**未改任何运行时 `.lua`**）：`platform_spec` Apple 工具改按宙主能力
+  守卫（能解析则断路径，否则断 fail-closed）；`ue_context_spec` ×2 把 `adb` 字面量改为
+  basename/片段断言（`exepath` 在本机解析到 `C:\WINDOWS\adb.EXE`）；`ue_api_spec` 只扫非注释行
+  （`lua/ue.lua:2037` 是 `.ueprepare-scan-paths` 的用法示例注释）；`ue_target_integration_spec` ×4
+  中 3 条用 `with_host("macos")`（`invoke_workflow_api` 解析实时宙主，Windows 上 IOS 按设计
+  fail closed）、1 条按 POSIX 脚本能力守卫并改断 fail-closed 语义。
+
+**Pitfalls / Gotchas**
+
+- **结构校验 ≠ 语义一致**：`openspec validate --all` 37/37 全绿与 8 条 FAIL 同时存在。spec ↔
+  实现的一致性只能由本仓回归 + DoD 承担，openspec CLI 永远不会拿到。
+- **8 条 FAIL 无一条是实现漂移**，全是「测试把宙主偶然事实当成了不变量」。因此修正必须能
+  指向一条 spec requirement 作为「为何这才是不变量」的依据；否则按实现漂移处理。
+- **禁止伪造宙主或假可执行文件让断言「碰巧通过」**——已固化为 spec scenario；否则本次修完，
+  换台机器又红。`with_host` 只用于验证**目标宙主上的真实契约**，且必须 pcall 后还原。
+- **引用完整性校验必须宁漏不误报**：首版误报了 `docs/release_vX.Y.Z.md`（模板）、
+  `lua/utils/async_launcher.launch`（`module.function` 而非路径）、`{a,b}_spec.lua`（brace 展开）。
+  误报会把 `structure` filter 变成噪音源而被绕过，所以加了 `looks_like_path` + 扩展名白名单。
+- **新守护上线当场拿到真问题**：就是它报出 `openspec/changes/make-cpp-gd-semantically-complete/`
+  已归档。已用注入一条假悬空引用反向验证该用例确实会 FAIL 并打印「引用 ← 所在文件」。
+- 编辑 Lua 用例时不要用 shell heredoc 写包含 `\n` 的 Lua pattern——会被展开成真正换行而打断
+  字符串（本次先翻车后回退重写）。
+
+**Validation**
+
+- 分范围回归（均全绿）：`structure` 71/71（改动前 40/40）、`platform` 39/39、
+  `ue_context` 13/13、`ue_api` 55/55、`ue_target_integration` 26/26。
+- **全量回归**：`nvim --headless -l tests/run.lua` → **1113/1113 passed, 0 failed，退出码 0**
+  （改动前基线：1074/1082，8 failed）。
+- `openspec validate --all` → 39/39 passed（含新主规格 `spec-authority-loop`）；
+  `openspec validate enforce-spec-as-source-of-truth --strict` → valid。
+- 三 agent 注入实测：Codex 原生读 `AGENTS.md`；pi 逐级向上加载 `AGENTS.md`（README §Context Files）；
+  Claude 读 `CLAUDE.md` → `@AGENTS.md` 展开。已确认仓内**无** `AGENTS.override.md` /
+  `.codex/AGENTS.md` / `.pi/SYSTEM.md` 等 per-agent 并行入口，且全部 `CLAUDE.md` 仍为 stub。
+- **spec 一致性处置（新 DoD 第 2 条）**：已同步——新增 1 份主规格 `spec-authority-loop`，
+  反向更正 7 份陈旧 spec；运行时行为零变更（`git diff` 确认未改任何运行时 `.lua`），
+  故无其它行为契约需同步。
+
+**Follow-ups**
+
+- 本次引入新能力（capability `spec-authority-loop`），按 semver 属 **minor**；若收尾为
+  milestone 则按 C8 产出四件套（git tag 需用户确认，不自动执行）。
+- change `enforce-spec-as-source-of-truth` 待 `/opsx-archive` 归档（delta 已同步至主规格）。
+- 引用完整性校验目前只覆盖**反引号包裹**的路径；未加反引号的裸路径仍不检查（有意为之，
+  避免误报）。如需收紧，应先补一批真实样本验证误报率。
+
 ### 2026-08-24 — Keep private keyword policy outside the public repository
 
 **Task**

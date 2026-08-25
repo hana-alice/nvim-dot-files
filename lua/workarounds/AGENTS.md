@@ -23,3 +23,5 @@
 ## 先读
 
 `README.md`、`TEMPLATE.lua`（同目录）、`../../docs/CONSTRAINTS.md §三 C2`。
+
+**治理 spec**：无对应 capability（本目录行为不由某个 `openspec/specs/` capability 治理）。

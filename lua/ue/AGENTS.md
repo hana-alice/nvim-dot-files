@@ -37,3 +37,7 @@ target-specific workflow policy；`targets/` 只保留 pure plan/parser/policy c
 ## 先读
 
 `../../docs/architecture/overview.md` §1、`../../docs/CONSTRAINTS.md`、`../../docs/plans/`（ADR）。
+
+**治理 spec**（可观察行为的权威；与本文冲突时以 spec 为准）：
+`../../openspec/specs/ue-target-workflow-boundary/spec.md`、
+`../../openspec/specs/multi-instance-state-isolation/spec.md`。

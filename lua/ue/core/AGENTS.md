@@ -22,3 +22,6 @@ common_ancestor/...）、`proc`（first_executable）。被全仓复用。
 ## 先读
 
 `../../../docs/plans/2026-05-06-multi-platform-foundation.md`（Phase B 抽取）。
+
+**治理 spec**：无对应 capability（本目录是被广泛复用的公共 helper 层；
+行为契约随调用方的 capability 一起被治理，见 `../AGENTS.md`）。

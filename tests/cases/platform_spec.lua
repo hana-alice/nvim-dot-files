@@ -60,15 +60,24 @@ t.describe("platform: host tool 解析", function()
     assert_entry(m, "xcrun_entry", "/usr/bin/xcrun", nil)
     assert_entry(m, "security_entry", "/usr/bin/security", nil)
     assert_entry(m, "plutil_entry", "/usr/bin/plutil", nil)
-    local ios_deploy, ios_deploy_err = m.ios_deploy_entry()
-    t.assert_nil(ios_deploy_err)
-    t.assert_contains(ios_deploy, "ios-deploy")
-    local idevice_id, idevice_id_err = m.idevice_id_entry()
-    t.assert_nil(idevice_id_err)
-    t.assert_contains(idevice_id, "idevice_id")
-    local ideviceinfo, ideviceinfo_err = m.ideviceinfo_entry()
-    t.assert_nil(ideviceinfo_err)
-    t.assert_contains(ideviceinfo, "ideviceinfo")
+    -- Apple 外部工具通过 exepath 解析，它们是否存在取决于**当前宙主**，不是驱动契约。
+    -- 驱动契约是：能解析到则返回含工具名的路径 + nil error；解析不到则 fail closed
+    -- （返回 nil + 可读 error）。按宙主能力守卫断言，禁止注入假可执行文件让它「碰巧通过」。
+    -- → openspec/specs/host-platform-driver/spec.md（能力不存在时 fail closed）
+    local function assert_host_tool(fn_name, tool)
+      local path, err = m[fn_name]()
+      if path ~= nil then
+        t.assert_nil(err, "macos." .. fn_name .. " 解析成功时 error 必为 nil")
+        t.assert_contains(path, tool)
+      else
+        t.assert_true(type(err) == "string" and err ~= "",
+          "macos." .. fn_name .. " 解析失败时必须 fail closed（返回可读 error）")
+        t.assert_contains(err, tool)
+      end
+    end
+    assert_host_tool("ios_deploy_entry", "ios-deploy")
+    assert_host_tool("idevice_id_entry", "idevice_id")
+    assert_host_tool("ideviceinfo_entry", "ideviceinfo")
     t.assert_eq(m.powershell_entry, nil)
     local powershell, powershell_err = m.shell_entry("powershell")
     t.assert_eq(powershell, nil)

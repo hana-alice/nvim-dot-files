@@ -70,6 +70,7 @@ local _CONTEXT_TTL = _ue_cfg.get("context.ttl_s") or 30 -- seconds (filesystem w
 
 -- Cached module tables (was 17 single-line wrappers; compacted to save LuaJIT local slots).
 local _ufs = require("ue.core.fs")
+local _uscan = require("ue.core.scan_roots")
 local _uproc = require("ue.core.proc")
 local _uplat = require("utils.platform")
 
@@ -2032,24 +2033,32 @@ function CORE_RT.project_module_anchor(project_root)
   return anchor
 end
 
--- Project-specific scan whitelist. Path = `<project_root>/.ueprepare-scan-paths`,
--- one entry per line, # for comments. Each entry is a root-relative directory
--- (e.g. `Source/SampleGame/Source`, `Source/Protocol`). When the file exists, it
--- REPLACES UE_CONST.PROJECT_INDEX_DIRS for this project. When absent, the
--- default PROJECT_INDEX_DIRS is used. For the supported nested layout
--- (<project_root>/Source/<Project>/<Project>.uproject), defaults are resolved
--- relative to the .uproject directory so a broad project_root/Source scan does
--- not pull sibling config tables, SDKs, and generated data into the index.
+-- Project-specific scan whitelist (`<project_root>/.ueprepare-scan-paths`) and
+-- the nested-layout anchor both feed scan-root resolution. Format, precedence
+-- and the union-with-discovery policy live in `ue.core.scan_roots`
+-- (read_whitelist / merge), together with their rationale.
 --
 -- Why whitelist > blacklist (.ueprepare-scan-ignore was deleted): some
 -- projects bury non-source data (config tables, SDK toolchains, art assets)
 -- under `Source/`. Blacklist plays whack-a-mole; whitelist is declarative
 -- and cuts scan input dramatically (verified 877k -> 116k on samplegame_dev).
 --
--- Cached per-project on CORE_RT to avoid repeated disk reads. Use
--- :UEReloadScanPaths to invalidate (see command below).
+-- Cached per-project on CORE_RT; :UEReloadScanPaths invalidates.
 CORE_RT.project_index_dirs_cache = CORE_RT.project_index_dirs_cache or {}
 
+-- Both the resolved dir list and the module anchor feeding discovery are cached,
+-- so editing .ueprepare-scan-paths or adding a module dir needs invalidation.
+function CORE_RT.invalidate_scan_root_caches()
+  local count = 0
+  for key in pairs(CORE_RT.project_index_dirs_cache) do
+    CORE_RT.project_index_dirs_cache[key] = nil
+    count = count + 1
+  end
+  for key in pairs(CORE_RT.project_module_anchor_cache) do
+    CORE_RT.project_module_anchor_cache[key] = nil
+  end
+  return count
+end
 function CORE_RT.project_index_dirs(ctx)
   local project_root = norm(ctx and ctx.project_root or "")
   if not project_root or project_root == "" then
@@ -2060,32 +2069,19 @@ function CORE_RT.project_index_dirs(ctx)
     return cached
   end
 
-  local dirs = nil
-  local f = io.open(project_root .. "/.ueprepare-scan-paths", "r")
-  if f then
-    dirs = {}
-    for line in f:lines() do
-      local s = line:gsub("\r$", ""):gsub("^%s+", ""):gsub("%s+$", "")
-      s = s:gsub("%s+#.*$", "")
-      if s ~= "" and not s:match("^#") then
-        table.insert(dirs, s)
-      end
-    end
-    f:close()
-    if #dirs == 0 then dirs = nil end -- empty file -> fall back to default
-  end
-
-  local result = dirs
+  local result = _uscan.read_whitelist(project_root)
   if not result then
     local anchor = CORE_RT.project_module_anchor(project_root)
+    local base
     if anchor ~= project_root and _ufs.path_has_prefix(anchor, project_root) then
       local prefix = _ufs.relative_to(project_root, anchor)
-      result = vim.tbl_map(function(relative)
+      base = vim.tbl_map(function(relative)
         return join(prefix, relative)
       end, UE_CONST.PROJECT_INDEX_DIRS)
     else
-      result = UE_CONST.PROJECT_INDEX_DIRS
+      base = UE_CONST.PROJECT_INDEX_DIRS
     end
+    result = _uscan.merge(project_root, base, UE_CONST.PROJECT_INDEX_DIRS, UE_CONST.SCAN_EXCLUDES)
   end
   CORE_RT.project_index_dirs_cache[project_root] = result
   return result
@@ -9931,6 +9927,10 @@ function M.setup()
     watch.clear_persistent_dirty("manual")
     vim.notify("UEDirty cleared")
   end, { desc = "Manually clear the cumulative dirty set (use after manual reindex)" })
+  vim.api.nvim_create_user_command("UEReloadScanPaths", function()
+    vim.notify(("Scan roots invalidated (%d project(s)); next query re-derives")
+      :format(CORE_RT.invalidate_scan_root_caches()))
+  end, { desc = "Invalidate cached scan roots (.ueprepare-scan-paths / new module dirs)" })
   vim.api.nvim_create_user_command("UECachePaths", function()
     -- Dump the v2 cache layout that ue.lua's cache_paths() resolved for
     -- the current ctx. Useful to verify migration / debug missing-path

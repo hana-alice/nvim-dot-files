@@ -38,4 +38,6 @@ trigram 索引（google/codesearch 的 csearch）驱动的亚秒级 live grep，
 ## 先读
 
 `../../../openspec/specs/ue-code-search/spec.md`（治理本目录的 capability）、
+`../../../openspec/specs/project-scan-root-discovery/spec.md`（扫描根推导：索引输入集的
+**范围完整性**——freshness 指纹只判集合变化，判不了集合一开始就漏了）、
 `../../../README.md`（csearch 集成）、`../../../docs/architecture-symbol-resolution.md`。

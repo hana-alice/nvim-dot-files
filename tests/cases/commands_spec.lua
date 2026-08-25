@@ -21,7 +21,7 @@ local UE_COMMANDS = {
   "UEGrepGroupingToggle", "UEGrepTraceShow", "UEGrepTraceToggle", "UEIndexFull",
   "UEIndexHot", "UEIndexNow", "UEIndexStatus", "UEIndexTimings", "UEInstall", "UEInstallAndroid", "UEInstallIOS",
   "UEIOSSetup", "UEIOSSymbols", "UELaunch", "UELogToggle", "UEPackageIOS", "UEPaths", "UEPrepare", "UEPrepareIncremental",
-  "UEPrepareReindex", "UEPrepareSync", "UEResetLayout", "UESetAndroidDevice",
+  "UEPrepareReindex", "UEPrepareSync", "UEReloadScanPaths", "UEResetLayout", "UESetAndroidDevice",
   "UESetAndroidPackage", "UESetIOSDevice", "UESetIOSSigningCertificate", "UESetPlatform", "UESetProject", "UESetUprojectRelativePath", "UEWatchFlush",
   "UEWatchStatus", "UEWatchStop",
 }
@@ -29,7 +29,7 @@ local UE_COMMANDS = {
 t.describe("commands: UE* 全量注册", function()
   require("ue").setup()
   t.it("冻结清单含 81 个命令", function()
-    t.assert_eq(#UE_COMMANDS, 81)
+    t.assert_eq(#UE_COMMANDS, 82)
   end)
   for _, c in ipairs(UE_COMMANDS) do
     t.it(":" .. c .. " 已注册", function()

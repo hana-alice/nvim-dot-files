@@ -37,6 +37,7 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 
 | 子系统 | 位置 | 本地规则（内容源） | 治理 spec（`openspec/specs/<name>/spec.md`） | 必跑 filter | 一句话 |
 |---|---|---|---|---|---|
+| 扫描根推导 | `lua/ue/core/scan_roots.lua` | `lua/ue/core/AGENTS.md` | `project-scan-root-discovery` | `ue_api` `fs_proc` | 从 Build.cs/uplugin/uproject 推导应扫目录；只扩不缩 |
 | UE 引擎中枢 | `lua/ue.lua` + `lua/ue/` | `lua/ue/AGENTS.md` | `ue-target-workflow-boundary` | `ue_platform_boundary` `ue_api` `smoke` | 索引 / CDB / DAP / 命令注册的中枢 |
 | 多实例状态 | `lua/ue/project_state.lua` + `file_lock.lua` | `lua/ue/AGENTS.md` | `multi-instance-state-isolation` | `multi_instance_state` | 进程内选择 + canonical project bucket + 跨进程 writer lease |
 | clangd 语义覆盖 | `lua/ue/index/` | `lua/ue/index/AGENTS.md` | `cpp-semantic-index-coverage` | `index_generation` `cpp_semantic_index` | current/hot/full controlled BackgroundIndex + generation 单调选择 |
@@ -47,7 +48,7 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 | UE target drivers | `lua/ue/targets/` | `lua/ue/targets/AGENTS.md` | `ue-target-driver-boundary`、`ios-build-run-workflow`、`ios-device-debug-workflow` | `ue_target_drivers` `ue_target_integration` `ue_target_tasks` | Android/IOS/Mac/Win64/Linux 目标策略彼此隔离；`host_operations` matrix + runtime strategy 是组合真相 |
 | UE workflows | `lua/ue/workflows/` | `lua/ue/workflows/AGENTS.md` | `ue-target-workflow-boundary` | `ue_workflows` `ue_target_tasks` | target-specific 异步/UI/设备状态机的 owner |
 | goto 解析栈 | `lua/utils/ue_goto/` | `lua/utils/ue_goto/AGENTS.md` | `cpp-contextual-definition-navigation`、`cpp-semantic-highlighting` | `cpp_semantic_context` `cpp_semantic_client` `ue_goto_behavior` | proven-TU canonical USR + module AST 唯一 body；非 C++ compatibility fallback |
-| 代码搜索 | `lua/utils/code_search/` | `lua/utils/code_search/AGENTS.md` | `ue-code-search` | `ue_goto_behavior` `ue_paths` `utils` | csearch 亚秒级 grep（兜底，非主路） |
+| 代码搜索 | `lua/utils/code_search/` | `lua/utils/code_search/AGENTS.md` | `ue-code-search`、`project-scan-root-discovery` | `ue_goto_behavior` `ue_paths` `utils` | csearch 亚秒级 grep（兜底，非主路） |
 | 核心健康审计 | `lua/utils/core_health*.lua` + `scripts/nvim_core_health.lua` | `lua/utils/AGENTS.md` + `scripts/AGENTS.md` | `nvim-core-functionality-audit`、`codebase-health-audit` | `core_health` | 隔离、只读、可机器判定的启动/编辑/AST/搜索/clangd/CDB/target plan 证据 |
 | 平台驱动 | `lua/utils/platform/` | `lua/utils/platform/AGENTS.md` | `host-platform-driver`、`platform-tool-resolution`、`shell-command-planning` | `platform` `ue_platform_boundary` | 唯一允许做 OS 分支的地方；host 选 shell executable，shell helper 只组 argv/quote |
 | 探针反馈 | `lua/utils/probe.lua` | `lua/utils/AGENTS.md` | `probe-feedback-loop` | `probe` | 主动埋证据；会话开头先读 `:UEProbeReport` |

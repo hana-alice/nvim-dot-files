@@ -45,6 +45,80 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-08-25 — 扫描根从 UE 构建元数据推导（修新增代码目录搜不到的根因）
+
+**Task**
+
+同事新增的代码目录在 csearch 与文件 picker 里都搜不到。经查不是索引过期，而是**扫描范围推导
+错误**：嵌套布局下 `project_module_anchor` 发现唯一 `Source/*/*.uproject` 时把 anchor 挑过去，
+导致全部扫描根被钉死在 `Source/<Proj>/` 子树内。该子树之外的模块**结构性不可见**——
+重跑 `:UEPrepare` 也永远修不好，因为它从未进入输入集。
+
+**Implemented**
+
+- 新增 `lua/ue/core/scan_roots.lua`：以 UE 自己的模块声明（`*.Build.cs` / `*.uplugin` /
+  `*.uproject`）为权威来源推导扫描根。只用「声明文件存在」这一事实，**不解析内容**
+  （无 C#/JSON 语义分析）。`discover_module_dirs` 有界浅扫（depth ≤ 6 + 复用 SCAN_EXCLUDES），
+  `converge` 按前缀收敛，`read_whitelist` 解析显式白名单，`merge` 定义合并策略。
+- `CORE_RT.project_index_dirs`（扫描根唯一收口点，10 个调用方透明受益）接入推导：
+  无白名单时取「既有 anchor/默认 ∪ 推导结果」**并集**；白名单非空时完全尊重它、不合并。
+- 新增 `:UEReloadScanPaths` + `CORE_RT.invalidate_scan_root_caches()`：兼典
+  `lua/ue.lua` 里**已承诺但不存在**的命令（原注释写着 「Use :UEReloadScanPaths to
+  invalidate」，而 `project_index_dirs_cache` 根本无任何失效点，改白名单/布局必须重启）。
+  `commands_spec` 冻结清单 81 → 82。
+- 新增主规格 `openspec/specs/project-scan-root-discovery/spec.md`（7 requirement）；
+  `ue-code-search` 补「索引输入集 SHALL 覆盖全部模块声明（范围完整性）」——堆上 freshness
+  指纹只能回答「集合变了吗」，回答不了「集合一开始就漏了吗」。
+- `tests/cases/ue_api_spec.lua` +8 用例（55 → 63）；`ue/core/AGENTS.md`、
+  `lua/utils/code_search/AGENTS.md`、`memory/project_overview.md` 同步。
+
+**Pitfalls / Gotchas**
+
+- **大小写自坑**：把文件名 `:lower()` 后又用含大写的 `%.Build%.cs$` 去 match，永不命中。
+  `.uproject`/`.uplugin` 因本身小写而“碰巧能跑”，所以场景 A **半对半错**很隔绝——已固化为
+  spec scenario（声明识别不受大小写影响）+ 回归用例。
+- **收敛必须剔除根级 `""`**：标准布局的 `.uproject` 就在 `project_root`，不剔除则收敛会把
+  一切吞成「扇全根」，直接引入 `Content/`（影视资源）与 `.git/` 全量遍历——**比原 bug 更
+  严重的回归**。已实测并结构性排除。
+- **并集与「歧义不得放大」一度互相矛盾**：歧义嵌套布局下 `base` 退化为裸 `Source`，并集反而
+  把 JDK/apktool 拖回来。解法是新增 `is_ambiguous_nested` 判定（数 uproject **文件**而非目录，
+  与 anchor 自身的「恰好一个」规则对齐），仅在该情形且推导非空时抵消 `base`。
+- **行数 ratchet 不得上调**：首版把逻辑内联进 `ue.lua` 导致 +249 行撞上 `stability` 门禁。
+  正确做法不是改阀值（它是单调下降的迁移 ratchet）而是**抽模块**；最终 `ue.lua`
+  回到 10562（与冻结基线持平，零上调），新逻辑 218 行全在 `ue/core/scan_roots.lua`。
+  附带收益：去掉三个纯转发 test seam，用例直接针对 owner 模块。
+- 不要给 `ue/core/` 加隐藏模块级状态（曾想用 `M._excludes`）——该目录规则是「零全局状态」，
+  策略输入必须显式传参。已同步更新 `ue/core/AGENTS.md`（该目录不再是“纯函数”，而是
+  “无状态”：`scan_roots` 读文件系统）。
+- **本次守护当场生效**：上一个 change 新增的「capability 覆盖映射回归」报出
+  `project-scan-root-discovery` 尚未同步到主规格，阻止了一份悬空引用落地。
+
+**Validation**
+
+- 分范围回归（均全绿）：`ue_api` 63/63（改动前 55/55）、`commands` 106/106、
+  `csearch_build_guard` 22/22、`ue_watch_csearch` 13/13、`utils` 49/49、`structure` 71/71、
+  `stability` 10/10。
+- **全量回归**：`nvim --headless -l tests/run.lua` → **1122/1122 passed, 0 failed，退出码 0**
+  （改动前基线 1113/1113）。
+- `openspec validate --all` → 40/40 passed；
+  `openspec validate discover-scan-roots-from-build-metadata --strict` → valid。
+- **真实故障项目验证**：推导 19 ms；扫描根新增 `Source/Client`（覆盖其下任何新增模块）；
+  **325/325 个 `*.Build.cs` 全部被扫描根覆盖（未覆盖=0）**。
+- 三大布局 fixture 均符合新契约：嵌套同层新增模块被发现；歧义双 uproject 不再回退裸
+  `Source`（JDK 不入集）；标准布局保留根级默认且不含项目根自身。
+- **spec 一致性处置（DoD 第 2 条）**：已同步——新增 1 份主规格
+  `project-scan-root-discovery`，`ue-code-search` 补 1 条 requirement；均已写入
+  `openspec/specs/`（非仅停留于 delta）。
+- 探针：`scan-root-coverage` 已记一条 FIXED 证据并休眠，不留悬空未处置证据。
+
+**Follow-ups**
+
+- 该项目的 csearch 索引仍是 8/13 旧索引且 `project_scan_roots` 为 nil；扫描根已变化，
+  下次 `:UEPrepare` 会自动判缓存不可复用并**刻意重建一次**（这是设计，非缺陷）。
+- 本次引入新 capability → semver 属 **minor**；若收尾 milestone 按 C8 四件套
+  （git tag 需用户确认）。
+- change `discover-scan-roots-from-build-metadata` 待 `/opsx-archive` 归档。
+
 ### 2026-08-25 — 让 spec 真正生效，并收敛 spec ↔ 实现的既有漂移
 
 **Task**

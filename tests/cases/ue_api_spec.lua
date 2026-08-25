@@ -455,6 +455,10 @@ end)
 
 t.describe("ue.project_index_dirs（nested project scan scope）", function()
   local ue = require("ue")
+  -- 扫描根推导的 owner 是 ue.core.scan_roots（契约：
+  -- openspec/specs/project-scan-root-discovery）；直接针对该模块断言，
+  -- 不经 ue.lua 再包一层 test seam。
+  local scan_roots = require("ue.core.scan_roots")
 
   local function mkdir(path)
     vim.fn.mkdir(path, "p")
@@ -515,15 +519,177 @@ t.describe("ue.project_index_dirs（nested project scan scope）", function()
     pcall(vim.fn.delete, root, "rf")
   end)
 
-  t.it("nested layout 有多个 uproject 时保守回退根级目录", function()
+  t.it("nested layout 有多个 uproject 时按模块声明界定范围（不回退根级）", function()
+    -- 契约变更（openspec/specs/project-scan-root-discovery）：anchor 歧义时旧行为是回退到
+    -- 裸 `Source`，那会把同层的配置表 / 内嵌 SDK / 打包工具重新吞进索引——正是白名单机制
+    -- 当初要消除的东西。新契约要求由构建元数据推导出的具体模块子树界定范围。
     local root = vim.fn.tempname():gsub("\\", "/") .. "_ambiguous_nested_project"
     mkdir(root .. "/Source/SampleGame/Source")
     write_file(root .. "/Source/SampleGame/A.uproject", "{}")
     write_file(root .. "/Source/SampleGame/B.uproject", "{}")
+    -- 同层工具链目录：无任何模块声明，不得被纳入
+    mkdir(root .. "/Source/JDK/bin")
+    write_file(root .. "/Source/JDK/bin/java.exe", "x")
 
     local dirs = ue._project_index_dirs_for_test({ project_root = root })
-    t.assert_true(contains(dirs, "Source"), "多个 .uproject 时不得擅自选择项目锚点")
-    t.assert_false(contains(dirs, "Source/SampleGame/Source"))
+    t.assert_true(scan_roots.is_ambiguous_nested(root),
+      "两个 .uproject（无论同目录还是分属两目录）都应判为歧义嵌套布局")
+    t.assert_false(contains(dirs, "Source"),
+      "歧义时不得退回裸 Source（会吞掉 Source/ 下的 SDK/配置表/打包工具）")
+    t.assert_false(contains(dirs, "Source/JDK"),
+      "不含模块声明的工具链目录不得成为扫描根，实际=" .. vim.inspect(dirs))
+    t.assert_true(contains(dirs, "Source/SampleGame"),
+      "应由推导给出含模块声明的具体子树，实际=" .. vim.inspect(dirs))
+
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  -- ── 扫描根推导（openspec/specs/project-scan-root-discovery）───────────────────
+  -- 本次真实故障：嵌套布局下 anchor 把范围钉死在 Source/<Proj>/ 子树内，同事在同层
+  -- 新增的模块目录永远不进索引（重跑 :UEPrepare 也无法修复，因范围本身不含它）。
+  t.it("嵌套布局同层新增的模块目录被发现", function()
+    local root = vim.fn.tempname():gsub("\\", "/") .. "_sibling_module"
+    mkdir(root .. "/Source/Client/Source/Runtime")
+    write_file(root .. "/Source/Client/Client.uproject", "{}")
+    write_file(root .. "/Source/Client/Source/Runtime/Runtime.Build.cs", "//")
+    -- 同事新增：anchor 子树之外的真实模块
+    mkdir(root .. "/Source/Tools/Source/ToolMod")
+    write_file(root .. "/Source/Tools/Source/ToolMod/ToolMod.Build.cs", "//")
+
+    local dirs = ue._project_index_dirs_for_test({ project_root = root })
+    t.assert_true(contains(dirs, "Source/Tools/Source/ToolMod"),
+      "anchor 子树之外的模块必须被推导发现，实际=" .. vim.inspect(dirs))
+    t.assert_true(contains(dirs, "Source/Client/Source"),
+      "并集不得丢掉既有 anchor 覆盖")
+
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("标准布局扫描根不得包含项目根自身", function()
+    -- 标准布局的 .uproject 就在 project_root，若把根级 "" 当扫描根，收敛会把一切吞成
+    -- 「扇全根」，直接引入 Content/（影视资源）与 .git/ 全量遍历——比原 bug 更严重的回归。
+    local root = vim.fn.tempname():gsub("\\", "/") .. "_std_no_root_scan"
+    mkdir(root .. "/Source/M1")
+    write_file(root .. "/Source/M1/M1.Build.cs", "//")
+    write_file(root .. "/Std.uproject", "{}")
+    mkdir(root .. "/Content/Movies")
+    write_file(root .. "/Content/Movies/a.mp4", "big")
+
+    local dirs = ue._project_index_dirs_for_test({ project_root = root })
+    t.assert_false(scan_roots.is_ambiguous_nested(root),
+      "根级持有 .uproject 是标准布局，不得判为歧义")
+    for _, d in ipairs(dirs) do
+      t.assert_true(d ~= "" and d ~= "." and d ~= "/",
+        "扫描根不得是项目根自身（会退化为全根遍历），实际=" .. vim.inspect(dirs))
+    end
+    t.assert_true(contains(dirs, "Source"), "标准布局仍应保留根级默认列表")
+
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("显式白名单优先于推导（不追加推导项）", function()
+    -- .ueprepare-scan-paths 的既有语义是「显式声明即最终答案」，用于让用户**收窄**范围
+    -- （877k -> 116k 的收益就来自收窄）。若合并推导结果，用户精心收窄的白名单会被自动放大回去。
+    local root = vim.fn.tempname():gsub("\\", "/") .. "_whitelist_wins"
+    mkdir(root .. "/Source/Client/Source/Runtime")
+    write_file(root .. "/Source/Client/Client.uproject", "{}")
+    write_file(root .. "/Source/Client/Source/Runtime/Runtime.Build.cs", "//")
+    mkdir(root .. "/Source/Other/Source/OtherMod")
+    write_file(root .. "/Source/Other/Source/OtherMod/OtherMod.Build.cs", "//")
+    write_file(root .. "/.ueprepare-scan-paths", "Source/Client/Source\n# 注释行\n")
+
+    local dirs = ue._project_index_dirs_for_test({ project_root = root })
+    t.assert_eq(#dirs, 1, "白名单非空时扫描根应完全等于它，实际=" .. vim.inspect(dirs))
+    t.assert_true(contains(dirs, "Source/Client/Source"))
+    t.assert_false(contains(dirs, "Source/Other/Source/OtherMod"),
+      "显式白名单不得被推导结果放大")
+
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("并集兜住推导盲区（无模块声明的 Shaders 仍被扫）", function()
+    -- 纯 shader / Config 树不含任何 *.Build.cs，推导看不到它们；并集是防止「把漏搜 A
+    -- 换成漏搜 B」的安全护欄。
+    local root = vim.fn.tempname():gsub("\\", "/") .. "_union_blindspot"
+    mkdir(root .. "/Source/Client/Source/Runtime")
+    write_file(root .. "/Source/Client/Client.uproject", "{}")
+    write_file(root .. "/Source/Client/Source/Runtime/Runtime.Build.cs", "//")
+    mkdir(root .. "/Source/Client/Shaders")
+    write_file(root .. "/Source/Client/Shaders/a.usf", "// shader")
+
+    local dirs = ue._project_index_dirs_for_test({ project_root = root })
+    t.assert_true(contains(dirs, "Source/Client/Shaders"),
+      "推导盲区必须由并集兜住，实际=" .. vim.inspect(dirs))
+
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("排除目录不产生扫描根（Intermediate 下的生成 Build.cs）", function()
+    local root = vim.fn.tempname():gsub("\\", "/") .. "_excluded_decl"
+    mkdir(root .. "/Source/Client/Source/Runtime")
+    write_file(root .. "/Source/Client/Client.uproject", "{}")
+    write_file(root .. "/Source/Client/Source/Runtime/Runtime.Build.cs", "//")
+    -- 构建产物里的生成副本：不得成为扫描根
+    mkdir(root .. "/Source/Client/Intermediate/Build/Gen")
+    write_file(root .. "/Source/Client/Intermediate/Build/Gen/Gen.Build.cs", "//")
+
+    local discovered = scan_roots.discover_module_dirs(root)
+    for _, d in ipairs(discovered) do
+      t.assert_false(d:find("Intermediate", 1, true) ~= nil,
+        "SCAN_EXCLUDES 目录不得产生扫描根，实际=" .. vim.inspect(discovered))
+    end
+
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("声明文件识别不受大小写影响", function()
+    local root = vim.fn.tempname():gsub("\\", "/") .. "_decl_case"
+    mkdir(root .. "/Source/Client/Source/Lower")
+    write_file(root .. "/Source/Client/Client.uproject", "{}")
+    -- 小写 build.cs：真实仓库里两种写法都出现过
+    write_file(root .. "/Source/Client/Source/Lower/Lower.build.cs", "//")
+
+    local discovered = scan_roots.discover_module_dirs(root)
+    t.assert_true(contains(discovered, "Source/Client/Source/Lower"),
+      "小写 .build.cs 也必须被识别，实际=" .. vim.inspect(discovered))
+
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("推导深度有界（不进入超深层）", function()
+    local root = vim.fn.tempname():gsub("\\", "/") .. "_depth_bound"
+    -- 造一棵超过上限的深树（depth 10）
+    local deep = root .. "/a/b/c/d/e/f/g/h/i/j"
+    mkdir(deep)
+    write_file(deep .. "/Deep.Build.cs", "//")
+
+    local discovered = scan_roots.discover_module_dirs(root)
+    t.assert_false(contains(discovered, "a/b/c/d/e/f/g/h/i/j"),
+      "超过 SCAN_ROOT_DISCOVERY_MAX_DEPTH 的目录不得被遍历，实际=" .. vim.inspect(discovered))
+
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it(":UEReloadScanPaths 使扫描根缓存失效（同会话生效）", function()
+    local root = vim.fn.tempname():gsub("\\", "/") .. "_reload_scan"
+    mkdir(root .. "/Source/Client/Source/Runtime")
+    write_file(root .. "/Source/Client/Client.uproject", "{}")
+    write_file(root .. "/Source/Client/Source/Runtime/Runtime.Build.cs", "//")
+
+    local before = ue._project_index_dirs_for_test({ project_root = root })
+    t.assert_true(#before > 1,
+      "前提：白名单未写时为 anchor 默认列表 + 推导并集（多条），实际=" .. vim.inspect(before))
+    -- 同一会话内写入白名单
+    write_file(root .. "/.ueprepare-scan-paths", "Source/Client/Config\n")
+    local cached = ue._project_index_dirs_for_test({ project_root = root })
+    t.assert_true(vim.deep_equal(cached, before),
+      "未失效前应仍返回缓存值（证明确实有缓存）")
+
+    require("ue").setup()
+    vim.cmd("UEReloadScanPaths")
+    local after = ue._project_index_dirs_for_test({ project_root = root })
+    t.assert_eq(#after, 1, "失效后应重读白名单，实际=" .. vim.inspect(after))
+    t.assert_true(contains(after, "Source/Client/Config"))
 
     pcall(vim.fn.delete, root, "rf")
   end)

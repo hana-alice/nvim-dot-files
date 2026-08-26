@@ -2399,14 +2399,14 @@ local function prepare_summary(ctx, compile_path, opts)
   local summary = ("UEPrepare done:\nProject files: %d\nEngine files: %d\nGTAGS files: %d\nGrep files: %d")
     :format(project_count, engine_count, workspace_count, workspace_all_count)
   summary = summary .. "\nMode: " .. (mode_token(ctx) == "PROJECT" and "project" or "engine-only")
-  if opts.reused_cache then
-    summary = summary .. "\nIndex cache: reused"
-  end
+  if opts.reused_cache then summary = summary .. "\nIndex cache: reused" end
   if compile_path and compile_path ~= "" then
     summary = summary .. "\ncompile_commands: " .. compile_path
   end
   summary = summary .. "\nCache: " .. ctx.paths.cache
-  return summary
+  -- MUST NOT imply semantic readiness while the index builds (index_delivery_line).
+  local ok_d, line = pcall(INDEX_FN.prepare_delivery_suffix, ctx)
+  return summary .. ((ok_d and line) or "")
 end
 
 local function index_status_token(ctx)

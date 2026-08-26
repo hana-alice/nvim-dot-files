@@ -53,10 +53,28 @@ local function semantic_terminal_notice(sym, result)
     ["target-is-current-declaration"] = "declaration has no proven out-of-line definition",
     ["stale-request"] = "semantic request became stale",
   })[reason] or reason
-  vim.notify(string.format("C++ definition %s%s%s",
+
+  -- Actionable remedy for the readiness family. A bare "unavailable" leaves the
+  -- user with no next step, which is how the original report ended up as "this
+  -- can obviously be located, why is it asking me to choose". The controlled
+  -- index is delivered BY UEPrepare -- users must not be expected to remember
+  -- platform-specific index commands, so the hint points at the habitual flow.
+  local remedy = ({
+    ["index-provider-not-ready"] =
+      "semantic index has not been delivered yet -- if :UEPrepare just finished, the index build may still be running (watch its progress); if it failed, see :NvimLog",
+    ["index-stale-for-module"] =
+      "semantic index is stale for this module -- re-run :UEPrepare after the build",
+    ["index-incomplete"] =
+      "index coverage has not reached this definition yet -- wait for the running index build to finish",
+    ["active-compile-command-missing"] =
+      "no compile command for this file in the active database -- re-run :UEPrepare for the current platform/configuration",
+  })[reason]
+
+  vim.notify(string.format("C++ definition %s%s%s%s",
     tostring(status),
     sym and sym ~= "" and (" for `" .. sym .. "`") or "",
-    label ~= "" and (": " .. tostring(label)) or ""),
+    label ~= "" and (": " .. tostring(label)) or "",
+    remedy and ("\n" .. remedy) or ""),
     status == "unavailable" and vim.log.levels.WARN or vim.log.levels.INFO,
     { title = "C++ definition", timeout = 5000 })
 end
@@ -92,6 +110,35 @@ local function record_semantic_probe(result, tx)
       process_rss_bytes = tonumber(metrics.process_rss_bytes),
       generation_class = generation_class,
     })
+end
+
+--- Readiness outranks the sidecar's own verdict when classifying a failure.
+---
+--- Pure and exposed so the invariant is provable headless instead of only
+--- reachable through a live sidecar. See the call site in `semantic_failure`
+--- for the full rationale; the short version: `semantic_sidecar` reports
+--- "ambiguous-context" whenever several contexts merely failed differently, and
+--- `ambiguous-context` is the one terminal state that legitimately shows the
+--- user a chooser -- so an index-readiness failure was being rendered as a
+--- pick-list of unity TUs for symbols that have exactly one definition (P12).
+--- @param state string terminal state proposed by the sidecar
+--- @param stage string
+--- @param reason string
+--- @param index table|nil transaction index snapshot ({ readiness, freshness, ... })
+--- @return string state, string stage, string reason
+function M._apply_readiness_override(state, stage, reason, index)
+  index = index or {}
+  if state ~= "ambiguous-context" then
+    return state, stage, reason
+  end
+  if index.readiness == "ready" then
+    return state, stage, reason
+  end
+  local stale = index.readiness == "stale"
+    or index.freshness == "stale"
+    or index.freshness == "stale-for-module"
+  return "unavailable", "context",
+    stale and "index-stale-for-module" or "index-provider-not-ready"
 end
 
 function M.install(owner, deps)
@@ -255,10 +302,32 @@ function M.install(owner, deps)
       end
       local state = response and response.state or "unavailable"
       if not transaction.TERMINAL_STATES[state] then state = "unavailable" end
+
+      -- READINESS OUTRANKS THE SIDECAR'S OWN VERDICT.
+      --
+      -- semantic_sidecar aggregates per-context outcomes and reports
+      -- "ambiguous-context" whenever several contexts merely failed differently
+      -- (semantic_sidecar.lua: has_ambiguous and not has_unavailable). Trusting
+      -- that verbatim mislabels an index-readiness problem as genuine ambiguity,
+      -- and "ambiguous" is the one state that legitimately shows the user a
+      -- chooser -- so a symbol with exactly ONE definition ends up presented as
+      -- a pick-list of unity TUs (observed on WrapAroundAllocateMemory, whose
+      -- module contains a single out-of-line definition).
+      --
+      -- ambiguous-context means "multiple PROVEN contexts resolve to different
+      -- entities". When the controlled index never got delivered there are no
+      -- proven contexts at all, so the honest state is `unavailable` with a
+      -- readiness reason (P12: Clang semantic failure must fail honestly; text
+      -- hits cannot distinguish overloads, same-name symbols or namespaces).
+      state, stage, reason = M._apply_readiness_override(state, stage, reason, tx.index)
+
       return transaction.terminal(state, stage, reason, {
         detail = raw ~= "" and raw or nil,
         diagnostics = response and response.diagnostics,
-        contexts = response and response.contexts,
+        -- Contexts are evidence for an ambiguity the user can actually act on.
+        -- Once we have downgraded to `unavailable` they are failure records, not
+        -- choices, so they MUST NOT be handed to a chooser.
+        contexts = state == "ambiguous-context" and response and response.contexts or nil,
         metrics = response and response.metrics,
       })
     end

@@ -322,7 +322,39 @@ function M.run(path, targets, on_done, opts)
     if on_done then on_done(ok, err) end
   end
 
+  -- Intermediate backups written by the python steps (prebuild_pch_v2 ->
+  -- `.pre-pch.bak`, unify_include_dirs -> `.pre-unify.bak`). They exist so a
+  -- failing step can be diagnosed against its input, but on SUCCESS they are
+  -- dead weight: each is a near-copy of a ~250MB CDB, and nothing ever removed
+  -- them. Observed on this machine: 492MB of stale `.bak` beside a 241MB active
+  -- CDB. C4-6 ("skip writes when unchanged") had no counterpart for "delete what
+  -- succeeded", so they accumulated silently.
+  --
+  -- Only remove on success, and only these two exact suffixes: never touch the
+  -- active CDB, another platform's shard, or another project bucket (K27/C5b).
+  local function cleanup_intermediate_backups()
+    local removed, freed = 0, 0
+    for _, bak in ipairs(M.intermediate_backup_paths(path)) do
+      local stat = vim.uv.fs_stat(bak)
+      if stat and stat.type == "file" then
+        local ok = pcall(vim.uv.fs_unlink, bak)
+        if ok then
+          removed = removed + 1
+          freed = freed + (stat.size or 0)
+        end
+      end
+    end
+    if removed > 0 then
+      _rt.notify(("compile_commands pipeline: removed %d intermediate backup(s), freed %.0f MB")
+        :format(removed, freed / 1024 / 1024), vim.log.levels.INFO)
+    end
+    return removed, freed
+  end
+
   local function finish_success()
+    -- Cleanup belongs to the success path: a failed run must keep its backups
+    -- so the failure remains diagnosable.
+    cleanup_intermediate_backups()
     local mtime_after = mtime_key(path)
     if not opts.force_restart and mtime_after == mtime_before then
       _rt.notify("compile_commands pipeline: no changes, skipping clangd restart", vim.log.levels.INFO)
@@ -404,6 +436,29 @@ function M.run(path, targets, on_done, opts)
     })
   end)
   return jobid
+end
+
+-- Suffixes of intermediate backups the python steps leave behind
+-- (prebuild_pch_v2 -> `.pre-pch.bak`, unify_include_dirs -> `.pre-unify.bak`).
+-- Module-level so the cleanup policy is inspectable and testable rather than
+-- hidden in a closure. Deliberately an exact suffix list: anything broader risks
+-- deleting an active CDB, another platform's shard, or another project bucket
+-- (K27/C5b invalidation matrix).
+M.INTERMEDIATE_BACKUP_SUFFIXES = { ".pre-pch.bak", ".pre-unify.bak" }
+
+--- Which paths should be removed after a SUCCESSFUL pipeline run.
+--- Pure: takes the active CDB path, returns the backup paths to unlink.
+--- @param path string active compile_commands.json path
+--- @return string[] paths
+function M.intermediate_backup_paths(path)
+  local out = {}
+  if type(path) ~= "string" or path == "" then
+    return out
+  end
+  for _, suffix in ipairs(M.INTERMEDIATE_BACKUP_SUFFIXES) do
+    out[#out + 1] = path .. suffix
+  end
+  return out
 end
 
 return M

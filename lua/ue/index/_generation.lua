@@ -359,6 +359,63 @@ return function(M, core)
     }
   end
 
+  -- Is the PID that claimed a build still alive? Mirrors ue.file_lock's own
+  -- liveness probe so orphan detection and lease reclamation agree.
+  local function build_owner_alive(pid)
+    pid = tonumber(pid)
+    if not pid or pid <= 0 then
+      return false
+    end
+    if pid == vim.fn.getpid() then
+      return true
+    end
+    local ok, alive = pcall(vim.uv.kill, pid, 0)
+    return ok and alive ~= nil and alive ~= false
+  end
+
+  --- Reset a build state orphaned by a dead process.
+  ---
+  --- WHY: the completion path (manifest write, stats, promotion) lives entirely
+  --- inside the child's callback, and `full` takes minutes over ~16k TUs. If
+  --- Neovim exits mid-build, `status="running"` / `finished_at=0` is persisted
+  --- forever, and `build_phase_async` then reports "busy" or the UI claims a
+  --- build is in flight that no process owns. Observed on a real bucket:
+  --- status stuck at "running" with stats all zero, i.e. never a single success.
+  ---
+  --- Only reclaim when the owner is provably gone: a second live Neovim may
+  --- legitimately own the build (multi-instance isolation, K43).
+  --- Pure enough to test: pass `alive_fn` to inject liveness.
+  --- @param state table persisted index state
+  --- @param alive_fn? fun(pid:integer|nil):boolean
+  --- @return boolean reset true when an orphan was cleared
+  local function reset_orphaned_build(state, alive_fn)
+    local build = state and state.build
+    if type(build) ~= "table" then
+      return false
+    end
+    if build.status ~= "running" then
+      return false
+    end
+    -- A finished_at already set means the record was closed out; leave it.
+    if tonumber(build.finished_at) and tonumber(build.finished_at) > 0 then
+      return false
+    end
+    local alive = (alive_fn or build_owner_alive)(build.owner_pid)
+    if alive then
+      return false
+    end
+    state.build = {
+      phase = build.phase or "",
+      status = "interrupted",
+      started_at = build.started_at or 0,
+      finished_at = os.time(),
+      message = string.format("%s index build was interrupted (owner process gone)",
+        build.phase ~= "" and build.phase or "index"),
+      active_index = build.active_index or "",
+    }
+    return true
+  end
+
   local function normalize_index_state(state)
     if type(state.index_artifacts) ~= "table" then
       state.index_artifacts = {}
@@ -366,6 +423,9 @@ return function(M, core)
     if type(state.index_selection) ~= "table" then
       state.index_selection = index_state_selection_default()
     end
+    -- Self-heal a build orphaned by a previous process before anything reads
+    -- `state.build` and concludes a build is still in flight.
+    reset_orphaned_build(state)
   end
 
   local function same_generation(a, b)
@@ -682,11 +742,18 @@ return function(M, core)
   core.h.base_cdb_digest = base_cdb_digest
   core.h.index_manifest_path = index_manifest_path
   core.h.read_index_manifest = read_index_manifest
+  -- Exported for _delivery's stale-artifact report: "same generation?" is the
+  -- single predicate that decides whether an on-disk CDB can back the active
+  -- tuple, so both selection and observability must use the SAME rule.
+  core.h.same_generation = same_generation
   core.h.generation_for_context = generation_for_context
   core.h.make_index_manifest = make_index_manifest
   core.h.select_active_artifact = select_active_artifact
   core.h.update_index_selection = update_index_selection
   core.h.normalize_index_state = normalize_index_state
+  -- Exposed for regression: orphan reclamation must be provable headless with an
+  -- injected liveness probe (a real dead PID is not reproducible in a test).
+  M._reset_orphaned_build = reset_orphaned_build
   core.h.module_names_for_keys = module_names_for_keys
 
   M.read_index_manifest = read_index_manifest

@@ -483,12 +483,54 @@ M.build_phase_async = function(ctx, phase)
     finished_at = 0,
     message = string.format("%s modules=%d", phase, #selected_keys),
     active_index = state.build and state.build.active_index or "",
+    -- Owner identity makes "running" falsifiable across processes: without it a
+    -- build interrupted by a Neovim exit stays "running" forever and nothing can
+    -- tell an in-flight build apart from an orphaned record.
+    owner_pid = vim.fn.getpid(),
   }
   save_index_state(ctx, state)
   core.deps.invalidate_status_cache()
   core.deps.refresh_statusline()
 
   RT.job = { root_key = root_key, phase = phase }
+
+  -- Visible progress for the controlled index build (P5-compliant).
+  --
+  -- WHY: this build is scheduled automatically by every UEPrepare completion
+  -- path, and `full` processes ~16k TUs / writes ~270MB -- minutes of work. It
+  -- previously ran as a completely silent fire-and-forget child: no progress, no
+  -- log, and the failure branch did not even notify. So when it was interrupted
+  -- (window closed) or failed, the user saw prepare finish, reasonably assumed
+  -- the semantic layer was ready, and then got a degraded `gd` with nothing on
+  -- screen explaining why. Delivery must be observable.
+  --
+  -- Uses the same fidget channel as UEPrepare (bottom-right, alongside LSP
+  -- progress) rather than async_launcher's floating window: this task starts on
+  -- its own, so it must inform without stealing screen space. P5 is honored --
+  -- start + coarse updates driven by real child output, no periodic ticker, and
+  -- it disappears on success.
+  local ok_fidget, fidget_progress = pcall(require, "fidget.progress")
+  local progress_handle
+  if ok_fidget then
+    progress_handle = fidget_progress.handle.create({
+      title = "UE index",
+      message = string.format("%s: %d module(s) starting...", phase, #selected_keys),
+      lsp_client = { name = "ue.index" },
+      percentage = nil, -- indeterminate: the child does not report a total
+    })
+  end
+  local function progress_report(msg)
+    if progress_handle then
+      progress_handle.message = string.format("%s: %s", phase, msg)
+    end
+  end
+  local function progress_finish(msg)
+    if not progress_handle then return end
+    if msg then progress_handle.message = msg end
+    pcall(function() progress_handle:finish() end)
+    progress_handle = nil
+  end
+
   -- Defensive env scrub: if our parent (hermes/wt/IDE) injected PYTHONHOME
   -- pointing at a different python minor than `python` on PATH, the child
   -- explodes with `_sre.MAGIC mismatch` from the stdlib loader. Strip it.
@@ -501,7 +543,36 @@ M.build_phase_async = function(ctx, phase)
   child_env.PYTHONPATH = ""
   child_env.PYTHONSTARTUP = ""
   local t_build_0 = vim.uv.hrtime()
-  vim.system(cmd, { text = true, cwd = ctx.engine_root, env = child_env }, function(result)
+
+  -- Stream child output into the progress message. jobstart/vim.system deliver
+  -- arbitrary chunks that are NOT line-aligned, so keep a pending buffer and
+  -- only surface complete lines (same lesson as K51's pipeline logging).
+  local pending_out = ""
+  local last_line = ""
+  local function consume(chunk)
+    if not chunk or chunk == "" then return end
+    pending_out = pending_out .. chunk
+    while true do
+      local nl = pending_out:find("\n")
+      if not nl then break end
+      local line = fs.trim(pending_out:sub(1, nl - 1))
+      pending_out = pending_out:sub(nl + 1)
+      if line ~= "" then
+        last_line = line
+        vim.schedule(function()
+          progress_report(line:sub(1, 120))
+        end)
+      end
+    end
+  end
+
+  vim.system(cmd, {
+    text = true,
+    cwd = ctx.engine_root,
+    env = child_env,
+    stdout = function(_, data) consume(data) end,
+    stderr = function(_, data) consume(data) end,
+  }, function(result)
     local elapsed_s = (vim.uv.hrtime() - t_build_0) / 1e9
     vim.schedule(function()
       local live_state = ensure_index_state(ctx)
@@ -562,6 +633,11 @@ M.build_phase_async = function(ctx, phase)
           M.maybe_restart_clangd_for_index()
         end
         if not (selection and promoted) then
+          -- Artifacts were produced but delivery did not complete
+          -- (manifest/selection/promotion). This is a FAILURE, not a quiet
+          -- partial success: the gate consumes persisted readiness, so leaving it
+          -- unreported is exactly how a 270MB full.json can sit on disk while
+          -- `gd` keeps degrading with no explanation.
           ok_result = false
         end
       else
@@ -575,6 +651,35 @@ M.build_phase_async = function(ctx, phase)
         }
         save_index_state(ctx, live_state)
       end
+
+      -- Failure MUST be visible. Previously both failure branches only wrote
+      -- status="error" into a JSON file: no notify, no log, and no index build
+      -- log has ever existed in this repository. The user therefore had no way
+      -- to learn that the semantic index they were implicitly waiting for had
+      -- failed -- the whole reason this defect stayed hidden.
+      if ok_result then
+        progress_finish()
+      else
+        local detail = fs.trim(live_state.build and live_state.build.message or "")
+        if detail == "" then detail = last_line end
+        pcall(function()
+          require("utils.log").error_ctx("ue.index", "controlled index build failed", {
+            phase = phase,
+            exit_code = result.code,
+            modules = #selected_keys,
+            elapsed_s = math.floor(elapsed_s * 10 + 0.5) / 10,
+            detail = detail ~= "" and detail:sub(1, 400) or nil,
+          })
+        end)
+        progress_finish(string.format("%s FAILED", phase))
+        vim.notify(string.format(
+          "UE index: %s build failed (exit %s) -- C++ definition navigation stays degraded.\n%s\nSee :NvimLog for details.",
+          phase,
+          tostring(result.code),
+          detail ~= "" and detail:sub(1, 200) or "no output captured"),
+          vim.log.levels.ERROR, { title = "UE index" })
+      end
+
       core.deps.invalidate_status_cache()
       core.deps.refresh_statusline()
       file_lock.release(phase_lease)

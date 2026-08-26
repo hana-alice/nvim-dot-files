@@ -43,6 +43,7 @@ pwsh -File scripts/run_regression.ps1       # 本机一键（转发 + 退出码�
 | `lua/theme.lua` / `lua/highlights.lua` / `colors/**` | `theme` `smoke` |
 | `lua/utils/cheatsheet.lua` / `docs/ue_lazyvim_cheatsheet.md` | `cheatsheet` |
 | `lua/utils/stall_probe.lua` | `stall_probe` |
+| `lua/config/ui_responsiveness.lua` / `lua/ue/clangd_jobs.lua` / clangd `-j` / 主循环余量 | `ui_responsiveness` `core_health` `ue_api` `stability` |
 | `lua/utils/core_health*.lua` / `scripts/nvim_core_health.lua` | `core_health` |
 | `lua/workarounds/**` | `workarounds` `smoke` |
 | `lua/ue.lua` façade / workflow 边界 | `ue_platform_boundary` `structure` |

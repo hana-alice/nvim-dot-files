@@ -641,31 +641,9 @@ local find_engine_root
 function M.clangd_cmd(root_dir)
   local clangd = _uproc.first_executable(clangd_candidates(root_dir or cwd())) or "clangd"
 
-  -- Adaptive -j: clangd preambles for UE TUs cost 1.5–3 GB each. With
-  -- --pch-storage=memory + N parallel workers, peak memory ~= N * 2 GB.
-  -- Default budget: 1 worker per 4 GB RAM, clamped to [8, 24]. Override
-  -- via UE_CLANGD_JOBS=N.
-  local jobs
-  local env_jobs = tonumber(vim.env.UE_CLANGD_JOBS or "")
-  if env_jobs and env_jobs > 0 then
-    jobs = math.floor(env_jobs)
-  else
-    local total_mb = 0
-    local ok, mem = pcall(function()
-      return vim.uv.get_total_memory and vim.uv.get_total_memory() or 0
-    end)
-    if ok and type(mem) == "number" and mem > 0 then
-      total_mb = math.floor(mem / (1024 * 1024))
-    end
-    if total_mb >= 1024 then
-      local total_gb = math.floor(total_mb / 1024)
-      jobs = math.floor(total_gb / 4)
-    else
-      jobs = 8
-    end
-    if jobs < 8 then jobs = 8 end
-    if jobs > 24 then jobs = 24 end
-  end
+  -- Parallel worker budget. Policy + UI core reservation live in ue.clangd_jobs
+  -- (RAM alone gave -j=23 on 24 cores, starving the UI — 2026-08-25, K52).
+  local jobs = require("ue.clangd_jobs").resolve()
 
   local cmd = {
     clangd,
@@ -6522,6 +6500,28 @@ do
             end
             rg_step()
           end)
+      end)
+  end
+
+  -- Async references twin of M.gtags_references. `gr` MUST NOT block: the sync
+  -- twin reaches vim.system(...):wait(); bare spawn floor here is 87ms p50 and
+  -- `global -r` 82ms p50 / 293ms max (2026-08-25, K52). on_done(true)=populated.
+  function M.gtags_references_async(symbol, on_done)
+    on_done = on_done or function() end
+    local ctx, err = resolve_context()
+    if not ctx then
+      vim.notify(err, vim.log.levels.WARN)
+      return on_done(false)
+    end
+    if not ctx.project_root or ctx.project_root == "" or not db_ready(ctx.paths.workspace_db) then
+      return on_done(false)
+    end
+    local root = workspace_root(ctx)
+    global_lines_async(root, ctx.paths.workspace_db,
+      { "-r", "--literal", "--result=grep", symbol }, function(code, lines)
+        local hit = (code == 0 or code == 1) and lines and #lines > 0
+          and populate_quickfix_from_global("GTAGS references: " .. symbol, root, lines)
+        on_done(hit and true or false)
       end)
   end
 end

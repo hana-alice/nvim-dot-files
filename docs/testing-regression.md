@@ -32,6 +32,7 @@ fail-closed 语义），禁止注入假可执行文件/假宿主让断言「碰�
 | `lua/config/options.lua` / `autocmds.lua` | `options` `autocmds` |
 | `lua/theme.lua` / `lua/highlights.lua` / `colors/**` | `theme` `smoke` |
 | `lua/utils/stall_probe.lua` | `stall_probe` |
+| `lua/config/ui_responsiveness.lua` / `lua/ue/clangd_jobs.lua` / clangd `-j` / 主循环余量 | `ui_responsiveness` `core_health` `ue_api` `stability` |
 | `lua/utils/core_health*.lua` / `scripts/nvim_core_health.lua` | `core_health` |
 | `lua/workarounds/**` | `workarounds` `smoke` |
 | `lua/ue.lua` façade / workflow 边界 | `ue_platform_boundary` `structure` |

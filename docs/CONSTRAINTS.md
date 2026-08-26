@@ -373,6 +373,56 @@
   → `lua/ue/cdb/pipeline.lua` `M.cancel`; `lua/ue.lua` `ue_build_running` / `_logged_jobstart`;
     行为测 `tests/cases/ue_cdb_spec.lua`; `docs/changelog.md` 2026-08-18
 
+- **K52 — 「持续偷主循环」三连：RAM-only `-j` / LSP stderr 每条 flush / 2s 配置轮询（2026-08-25 实测）**
+  症状: `:StallReport` 与日志 scope `[stall]` 累计 8643 条卡顿记录（p50 229ms / p90 504ms），
+  **8518 条在 0.3s 内没有任何按键**（=与按键动作无关），~2s 一次成串出现，`ft=cpp` 占 6536 条；
+  且**两个互不相干的 nvim 进程按小时计数完全相同**（325 vs 325）。
+  **诊断陷阱（比结论更值钱）**: 逐一测量后**全部证伪**了直觉候选——输入路径（活实例里每个导航键
+  p90 < 15ms）、snacks statuscolumn（warm 0.006ms、整窗 0.15ms）、lazy reloader 命中变更（21ms）、
+  合成 CPU 压力（23 个满转 worker 只把 33 文件扫描从 1.3ms 推到 2.9ms，**0 次迟到 tick**）、
+  合成磁盘写压力（1.2x，0 次迟到）、headless 下真实 clangd（17.4GB RSS、38 线程，**0 次卡顿**）。
+  **关键方法论**: `--headless` 无渲染线程、无 UI 管道，**结构上看不到 UI 争用**——6 次 headless
+  实验都报告「主循环很顺」而 GUI 会话正在卡。必须在**活的 GUI 实例**上用 `--server` 注入测量；
+  另外 `jit.profile` 在空闲时会把采样记到最后运行过的栈（本例 61% 记到 `vim.schedule_wrap`），
+  **它回答「哪段 Lua 跑得多」，不回答「这 250ms 是谁占的」**——判定归属要用 rusage CPU/gap 比值
+  （≈1 = 本进程内阻塞；≈0 = 被剥夺调度/宿主超订）。
+  根因（三个独立的**持续性**开销，都不是「某个回调很慢」）:
+  ① `-j` 只按 RAM 推导（`floor(94/4)=23`），24 核机器上给 clangd **96% 的核**，只剩 1 核给
+  主循环 + Neovide 渲染线程 + 合成器；索引时宿主 CPU 6%→60%、clangd 38 线程。
+  ② `vim/lsp/_transport.lua:36` 把 server 的**每条 stderr 按 ERROR** 记录，而 `vim/lsp/log.lua`
+  默认 WARN 门槛让 ERROR 恒通过，且每条 `write()` 后 `flush()`——现场 `lsp.log` 16.6MB / 58803 条
+  **全部是 clangd 的普通 `Indexed ...` 信息输出**，实测 0.045ms/条（batched 0.094ms、max 0.63ms），
+  合计约 2.6s 主循环时间，且**恰好在索引时成串爆发**。
+  ③ lazy.nvim `change_detection` 的 `start(2000, 2000)` 在主循环上同步 `fs_stat` 33 个 spec 文件
+  （空闲 1.2ms p50），命中变更再付 `Plugin.load()`+autocmd **21ms p50**；它还是**共享磁盘状态**，
+  所以多个 nvim 会在同一个 2s 窗口一起反应——这正是「两进程计数相同」的成因。
+  解决约束: **UI 余量是一等约束**（P6 的延伸：不只是「别阻塞」，还包括「别把资源占光到画不出帧」）。
+  `-j` MUST 同时受 RAM 与 CPU 两个预算约束，并为 UI 保留 `UI_RESERVED_CORES`（当前 4）个逻辑核；
+  `UE_CLANGD_JOBS` 显式覆盖仍优先。vim.lsp 日志级别 MUST 为 OFF（server 的 stderr 不是 error），
+  排查时用 `:LspLogLevel debug` 临时提级。`change_detection` MUST 显式 `false`——本仓行为大量由
+  启动**顺序**建立（C3），本就不能热重载，等于白付周期性主循环税。
+  → `lua/ue/clangd_jobs.lua`（`compute`/`resolve`/`UI_RESERVED_CORES`）; `lua/ue.lua` `clangd_cmd`;
+    `lua/config/ui_responsiveness.lua`; `lua/config/lazy.lua` `change_detection`;
+    诊断入口 `tools/stall_profile.lua` / `tools/stall_attribute.lua` / `tools/stall_repro.lua`;
+    行为测 `tests/cases/ui_responsiveness_spec.lua`; `docs/changelog.md` 2026-08-25
+
+- **K53 — Windows 上 `vim.system():wait()` 的光 spawn 底线就是 87ms：交互路径禁止同步子进程（2026-08-25 实测）**
+  症状: `gr`（references）偶发冻住数百 ms 至数秒，屏上无任何提示；卡顿日志里的多秒级极值
+  （122843ms / 36247ms / 12754ms / 8447ms）都落在导航与 `:UEPrepare` 动作上，而不是普通滚动。
+  根因: 两层同步阻塞叠在同一个日常按键上——`provider.sync_locations` 的
+  `client:request_sync(..., 5000)` 最多堵**5 秒**；随后 `ue.gtags_references` 经
+  `global_lines`→`run_lines` 进入 `vim.system(...):wait()`。**关键数据：本宿主上光是
+  `vim.system():wait()` 的空 spawn 就要 87ms p50**（`global -r` 82ms p50 / 293ms max）——
+  Windows 创建进程昂贵，**这笔底线即使查询一无所获也要付**。这也解释了为何卡顿分布
+  p50=229ms：约等于 2–3 次同步 spawn。
+  解决约束: 交互路径（按键/命令）MUST NOT 出现 `:wait()` 或 `request_sync`。新增
+  `M.gtags_references_async` 并把 `references()` 整条链路改异步（`async_lsp_request` +
+  async GTAGS 回退）。注意：换异步通道时必须补上 `includeDeclaration`（sync 版本一直在设，
+  `async_lsp_request` 原本没设），否则会静默改变返回集——这类**行为漂移比性能回退更难发现**。
+  → `lua/ue.lua` `gtags_references_async`; `lua/utils/lsp_fallback.lua` `M.references`;
+    `lua/utils/ue_goto/provider.lua` `async_lsp_request`（ReferenceContext）;
+    行为测 `tests/cases/ui_responsiveness_spec.lua`「交互路径禁止同步阻塞」
+
 ### 工具链 / LLVM
 
 - **K41 — 依赖路径向上发现的 `.clangd` / monolithic External index → 覆盖漂移与资源失控**

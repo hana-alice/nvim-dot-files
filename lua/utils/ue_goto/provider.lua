@@ -210,6 +210,13 @@ function M.async_lsp_request(bufnr, method, on_result, opts)
         record.status = "make-params-failed"
         dec_pending()
       else
+        -- textDocument/references requires a ReferenceContext per LSP spec.
+        -- The sync twin (M.sync_locations) always set includeDeclaration=true,
+        -- so set it here too: otherwise moving `gr` onto this async path would
+        -- silently change which results come back.
+        if method == "textDocument/references" then
+          params.context = params.context or { includeDeclaration = true }
+        end
         clangd_commands.ensure(client, bufnr, function(command_ok, command_reason, exact_command)
           if done then return end
           if not command_ok then

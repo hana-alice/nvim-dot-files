@@ -42,7 +42,7 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 | 多实例状态 | `lua/ue/project_state.lua` + `file_lock.lua` | `lua/ue/AGENTS.md` | `multi-instance-state-isolation` | `multi_instance_state` | 进程内选择 + canonical project bucket + 跨进程 writer lease |
 | clangd 语义覆盖 | `lua/ue/index/` | `lua/ue/index/AGENTS.md` | `cpp-semantic-index-coverage` | `index_generation` `cpp_semantic_index` | current/hot/full controlled BackgroundIndex + generation 单调选择 |
 | CDB 流水线 | `lua/ue/cdb/` | `lua/ue/cdb/AGENTS.md` | `macos-ios-cdb-semantic-prepare` | `ue_cdb` | compile_commands.json 生成/裁剪/注入 |
-| DAP 调试 | `lua/ue/dap/` | `lua/ue/dap/AGENTS.md` | `dap-platform-dispatch`、`android-dap-attach`、`android-dap-live-breakpoints` | `dap` `platform` | codelldb + Android platform 模式 |
+| DAP 调试 | `lua/ue/dap/` | `lua/ue/dap/AGENTS.md` | `dap-platform-dispatch`、`android-dap-attach`、`android-dap-live-breakpoints`、`ios-device-debug-workflow` | `dap` `platform` | Android platform 模式 + iOS CoreDevice/legacy 独立 route |
 | Android device | `lua/utils/android_device.lua` | `lua/utils/AGENTS.md` | `global-android-device-selection` | `android_device` `dap` `ue_context` | 名称+serial picker；当前 Neovim 进程 serial；统一 `adb -s` |
 | Android SO 快速迭代 | `lua/ue/targets/android.lua` + `android_windows.lua` + `scripts/ue_android_so_*.ps1` | `lua/ue/targets/AGENTS.md` + `scripts/AGENTS.md` | `android-so-quick-deploy` | `ue_target_drivers` `ue_target_integration` | Windows-only PowerShell compatibility path；root 或已验证的 debuggable app-private transport；不支持 macOS→Android |
 | UE target drivers | `lua/ue/targets/` | `lua/ue/targets/AGENTS.md` | `ue-target-driver-boundary`、`ios-build-run-workflow`、`ios-device-debug-workflow` | `ue_target_drivers` `ue_target_integration` `ue_target_tasks` | Android/IOS/Mac/Win64/Linux 目标策略彼此隔离；`host_operations` matrix + runtime strategy 是组合真相 |
@@ -70,8 +70,8 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 快速部署按能力选择 root 或已验证的 debuggable app-private transport；正常 APK 安装和未 strip
 主机符号文件仍是正式流程与调试真相。当前 matrix：macOS 只执行 Mac/IOS，Windows 只执行
 Win64/Android，Linux 只执行 Linux；Mac 与 IOS target 独立，Android PowerShell transport 继续
-保持 Windows-only；iOS DAP 在 macOS 上通过独立 legacy MobileDevice/debugserver handler 执行，
-不 fallback 到 Mac process attach。
+保持 Windows-only；iOS DAP 在 macOS 上冻结 selected backend：iOS 17+ 使用结构化 CoreDevice PID attach，
+pre-iOS17 使用 legacy MobileDevice/debugserver bridge，失败不跨 backend，也不 fallback 到 Mac process attach。
 
 ## 知识库各区
 

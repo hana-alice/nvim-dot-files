@@ -47,4 +47,29 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
-(empty — sliced into `docs/release_1.8.0.md` on 2026-08-27.)
+### 2026-08-27 — Keep clangd discovery retries callable after history reconciliation
+
+**Task**
+
+消除合入重写后的 origin 时由全量回归暴露的 `vim.defer_fn` 异步回调错误。
+
+**Implemented**
+
+- `clangd_resource_controller.discover_with_retry` 按 Neovim API 的 `(fn, timeout)` 顺序安排有界重试。
+- 回归注入使用同一真实签名，避免测试 mock 反向固化实现错误。
+- 既有 host-resource-discipline 可观察契约不变；这是实现对现有 spec 的一致性修复，无 delta spec。
+
+**Pitfalls / Gotchas**
+
+- 原全量统计仍显示全绿，但 `vim.wait` 期间的 scheduled callback 已打印 `fn: expected callable, got number`；
+  只看最终 pass 计数会漏掉异步错误。
+
+**Validation**
+
+- 定向 `nvim --headless -l tests/run.lua clangd_resource`：10/10；全量回归：1324/1324，且不再出现
+  scheduled callback 异常。
+- 现有 host resource OpenSpec 契约未变化；本次只修正实现与测试替身的 Neovim API 调用顺序。
+
+**Follow-ups**
+
+- 无。

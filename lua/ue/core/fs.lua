@@ -188,4 +188,52 @@ function M.relative_to(root, path)
   return path:sub(#root + 2)
 end
 
+
+-- Line count of a large text file, memoised on (mtime, size).
+--
+-- WHY THIS IS NOT `vim.fn.readfile`: readfile materialises the whole file as a
+-- Lua table of strings. Measured 2026-08-26 on this machine's
+-- `workspace_all.files` (27.5 MB / 262,875 lines): readfile blocks the main loop
+-- ~253 ms, and `prepare_summary` counted four lists per completion -> ~256 ms of
+-- UI freeze purely to print numbers.
+--
+-- Streaming newline counting removes the per-line allocation (263 -> 186 ms), but
+-- the decisive part is the cache: an unchanged 27 MB file must not be re-read at
+-- all. Keyed on (mtime, size) like `list_fingerprint`, so steady state is a stat.
+-- mtime is only a cache key here, never a freshness verdict (see K30g).
+local line_count_cache = {}
+
+--- @param path string
+--- @return integer count 0 when the file is missing or unreadable
+function M.count_lines_cached(path)
+  if not M.is_file(path) then
+    return 0
+  end
+  local st = (vim.uv or vim.loop).fs_stat(path)
+  local mt = st and st.mtime and (st.mtime.sec or 0) or 0
+  local size = st and st.size or 0
+  local cached = line_count_cache[path]
+  if cached and cached.mt == mt and cached.size == size then
+    return cached.count
+  end
+
+  local fh = io.open(path, "rb")
+  if not fh then
+    return 0
+  end
+  local count = 0
+  -- 1 MiB chunks: amortise syscalls without ever holding the whole file.
+  while true do
+    local chunk = fh:read(1024 * 1024)
+    if not chunk then
+      break
+    end
+    local _, n = chunk:gsub("\n", "")
+    count = count + n
+  end
+  fh:close()
+  line_count_cache[path] = { mt = mt, size = size, count = count }
+  return count
+end
+
 return M

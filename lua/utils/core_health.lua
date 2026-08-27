@@ -530,11 +530,13 @@ function M.run_async(opts)
   local process_handle
   local timer = uv.new_timer()
   local finished = false
+  local foreground_token
   local function finish(report, error_message)
     if finished then
       return
     end
     finished = true
+    if foreground_token then require("utils.host_admission").foreground_done(foreground_token) end
     if timer then
       pcall(timer.stop, timer)
       pcall(timer.close, timer)
@@ -558,6 +560,7 @@ function M.run_async(opts)
     end
     finish(nil, "outer audit process exceeded its 90000ms deadline")
   end)
+  foreground_token = require("utils.host_admission").foreground_begin("NvimCoreHealth")
   local ok, spawned = pcall(vim.system, argv, {
     text = true,
     env = vim.tbl_extend("force", vim.fn.environ(), {

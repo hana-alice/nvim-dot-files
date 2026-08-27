@@ -140,8 +140,13 @@ function M.run(plan, opts)
     system_opts.stderr = stream(stderr_chunks, opts.on_stderr)
   end
 
+  local foreground_token
   local ok, handle = pcall(vim.system, command, system_opts, function(result)
     vim.schedule(function()
+      if foreground_token then
+        require("utils.host_admission").foreground_done(foreground_token)
+        foreground_token = nil
+      end
       if type(opts.on_exit) == "function" then
         opts.on_exit({
           code = result.code,
@@ -155,6 +160,14 @@ function M.run(plan, opts)
   end)
   if not ok then
     return nil, tostring(handle)
+  end
+
+  local operation = plan.metadata and plan.metadata.operation
+  local admission = require("utils.host_admission")
+  local foreground = opts.foreground
+  if foreground == nil then foreground = admission.is_foreground_operation(operation) end
+  if handle and foreground then
+    foreground_token = admission.foreground_begin(opts.name or operation)
   end
 
   pcall(function()

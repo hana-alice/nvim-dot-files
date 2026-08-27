@@ -2252,15 +2252,12 @@ local function mode_token(ctx)
   return "ENGINE"
 end
 
+-- Entry count for a cached file list. Delegates to fs.count_lines_cached, which
+-- streams + memoises on (mtime,size): `vim.fn.readfile` on the 27.5 MB
+-- workspace_all.files blocked the main loop ~253 ms, four times per prepare
+-- summary (measured 2026-08-26).
 local function count_cached_entries(path)
-  if not _ufs.is_file(path) then
-    return 0
-  end
-  local ok, lines = pcall(vim.fn.readfile, path)
-  if not ok or type(lines) ~= "table" then
-    return 0
-  end
-  return #lines
+  return _ufs.count_lines_cached(path)
 end
 
 local function db_ready(db_dir)
@@ -2930,12 +2927,7 @@ local function scan_relative_files_async(root, search_paths, cb)
   end
 
   local cmd = { fd, "--type", "f", "--hidden", "--follow" }
-  -- Prune cache/asset/intermediate trees at fd level so we never even traverse
-  -- them. Without this, shipped UE projects with Content/ + node_modules/ +
-  -- Saved/ blow up to 5M+ files in Source/ subtree, and the downstream lists
-  -- pass spent ~55s on the main thread doing dedup+sort+write of ~700k paths.
-  -- See UE_CONST.SCAN_EXCLUDES for rationale (Content mandatory, ThirdParty
-  -- intentionally KEPT for grep into vendored sources).
+  -- Prune cache/assets before traversal; SCAN_EXCLUDES keeps ThirdParty source.
   for _, ex in ipairs(UE_CONST.SCAN_EXCLUDES) do
     table.insert(cmd, "--exclude")
     table.insert(cmd, ex)
@@ -2957,6 +2949,9 @@ local function scan_relative_files_async(root, search_paths, cb)
   end
 
   local system_opts = { text = true, cwd = root }
+  require("utils.host_admission").run_when_allowed({
+    name = "UE workspace file scan",
+    start = function()
   vim.system(cmd, system_opts, function(result)
     vim.schedule(function()
       if result.code ~= 0 then
@@ -2972,6 +2967,9 @@ local function scan_relative_files_async(root, search_paths, cb)
       cb(lines, nil)
     end)
   end)
+    end,
+    on_error = function(err) cb(nil, "workspace scan admission failed: " .. tostring(err)) end,
+  })
 end
 
 local function clean_db_dir(dir)
@@ -3012,52 +3010,13 @@ local function uproject_dir(ctx)
 end
 
 local function build_gtags_db(root, filelist, db_dir, label)
-  local gtags = _uproc.first_executable({ "gtags" })
-  if not gtags then
-    return false, "gtags not found in PATH"
-  end
-
-  if not _ufs.is_file(filelist) or vim.fn.getfsize(filelist) <= 0 then
-    clean_db_dir(db_dir)
-    return true, label .. ": no files to index"
-  end
-
-  clean_db_dir(db_dir)
-
-  -- Use repo-bundled gtags.conf with the `hlsl-cpp` label so that
-  -- .usf/.ush/.hlsl/.hlsli get parsed by the exuberant-ctags backend
-  -- as C++. Without this, gtags only sees C/C++/C# and silently skips
-  -- shaders (workspace_gtags.files contained 0 .usf entries before the
-  -- FT_GTAGS expansion). Falls back to system defaults if the bundled
-  -- file is missing — never hard-fails the indexer over config plumbing.
-  local env = nil
-  -- Resolve repo root from this very file's path (lua/ue.lua → ../..).
-  local source = debug.getinfo(1, "S").source or ""
-  if source:sub(1, 1) == "@" then source = source:sub(2) end
-  local plugin_root = norm(vim.fn.fnamemodify(source, ":h:h"))
-  local conf_path = plugin_root ~= "" and (plugin_root .. "/tools/gtags/gtags.conf") or ""
-  if conf_path ~= "" and _ufs.is_file(conf_path) then
-    env = {
-      GTAGSCONF = conf_path,
-      GTAGSLABEL = "hlsl-cpp",
-    }
-  end
-
-  local cmd = { gtags, "-f", filelist, "--skip-unreadable", "--skip-symlink", db_dir }
-  local code, lines = run_lines(cmd, { cwd = root, env = env })
-  if code ~= 0 then
-    return false, table.concat(lines or {}, "\n")
-  end
-
-  if not db_ready(db_dir) then
-    local output = table.concat(lines or {}, "\n")
-    if output ~= "" then
-      return false, output
-    end
-    return false, "GTAGS database not generated: " .. db_dir
-  end
-
-  return true
+  return require("ue.gtags").build_sync({
+    root = root,
+    filelist = filelist,
+    db_dir = db_dir,
+    label = label,
+    run_lines = run_lines,
+  })
 end
 
 local function global_lines(root, db_dir, args)
@@ -4899,6 +4858,7 @@ local function open_terminal_command(cmd, opts)
 
   local build_monitor
   local active_jobid
+  local foreground_token
   active_jobid = vim.fn.termopen(cmd, {
     cwd = opts.cwd,
     env = opts.env,
@@ -4922,6 +4882,7 @@ local function open_terminal_command(cmd, opts)
         if CORE_RT.build_term_jobid == active_jobid then
           CORE_RT.build_term_jobid = nil
         end
+        if foreground_token then require("utils.host_admission").foreground_done(foreground_token); foreground_token = nil end
         if code ~= 0 and opts.quickfix_title then
           populate_quickfix_from_output(opts.quickfix_title, output_lines, {
             root = opts.quickfix_root,
@@ -4953,9 +4914,8 @@ local function open_terminal_command(cmd, opts)
   end
 
   CORE_RT.build_term_jobid = active_jobid
-  -- Register with the generic task registry (list/cancel via :Tasks). This is
-  -- a pure side-path: only a register call AFTER job creation; on_exit above is
-  -- untouched. Status is derived live from the channel (see task_registry).
+  foreground_token = require("utils.host_admission").foreground_begin(opts.quickfix_title or opts.finish_label or "terminal task")
+  -- Register after job creation; status remains derived from the channel.
   pcall(function()
     require("utils.task_registry").register({
       name = opts.quickfix_title or "build",
@@ -6271,10 +6231,13 @@ function M.clangd_start_root(bufnr)
   if key and not CORE_RT.clangd_deferred_notified[key] then
     CORE_RT.clangd_deferred_notified[key] = true
     vim.schedule(function()
+      -- Keep this SHORT. A long single-line notify exceeds the cmdline width and
+      -- triggers Vim's hit-enter prompt, so the user had to press Enter on every
+      -- single startup (reported 2026-08-26; the old text was 187 chars). The
+      -- actionable part is "run :UEPrepare"; details belong in the log, not in a
+      -- modal-by-accident message.
       vim.notify(
-        "clangd deferred because the current UE tuple has no valid prepared artifacts; "
-          .. "run :UEPrepare once after the tuple or build evidence changes. "
-          .. "Tree-sitter highlighting remains available.",
+        "clangd deferred: run :UEPrepare (Tree-sitter still active)",
         vim.log.levels.INFO,
         { title = "UE", timeout = 5000, replace = "ue.clangd.deferred" }
       )
@@ -6305,18 +6268,22 @@ function M.csearch_ctx(bufnr)
   }
 end
 
--- Public hook called by lua/utils/ue_watch.lua when a shader file is added
--- or deleted between :UEPrepare runs. Idempotent — safe to call repeatedly.
--- Returns (ok, message). On a project with ~1500 shaders this is ~1.1s wall.
+-- Watcher hook: accepted work returns immediately; completion is async.
 function M.gtags_rebuild_shaders()
   local ctx, err = resolve_context()
   if not ctx then return false, err or "no UE context" end
   if not ctx.paths or not ctx.paths.workspace_list or not ctx.paths.workspace_db then
     return false, "ctx.paths missing workspace_list/workspace_db"
   end
-  local root = workspace_root(ctx)
-  local ok, msg = build_gtags_db(root, ctx.paths.workspace_list, ctx.paths.workspace_db, "workspace")
-  return ok, msg
+  return require("ue.gtags").rebuild_async({
+    root = workspace_root(ctx),
+    filelist = ctx.paths.workspace_list,
+    db_dir = ctx.paths.workspace_db,
+    label = "UE shader GTAGS rebuild",
+  }, function(ok, message)
+    if not ok then require("utils.log").warn_ctx(
+      "ue.gtags", "shader GTAGS rebuild failed", { reason = message }) end
+  end)
 end
 
 function M.gtags_references(symbol)
@@ -8231,7 +8198,7 @@ local function prepare()
       return
     end
     clear_index_dirty(ctx)
-    INDEX_FN.schedule_index_refresh(ctx, { current = true, hot = true, full = true, current_delay_ms = 50 })
+    INDEX_FN.schedule_prepare_delivery(ctx)
     invalidate_status_cache()
     refresh_statusline()
     local summary = prepare_summary(ctx, compile_path, { reused_cache = true })
@@ -8354,7 +8321,8 @@ local function prepare()
   end
 
   clear_index_dirty(ctx)
-  INDEX_FN.schedule_index_refresh(ctx, { current = true, hot = true, full = true, current_delay_ms = 50 })
+  -- Prepare PROMISED a usable index: short, starvation-proof deadlines.
+  INDEX_FN.schedule_prepare_delivery(ctx)
   invalidate_status_cache()
   refresh_statusline()
 
@@ -8683,20 +8651,20 @@ local function prepare_async(opts)
           -- Partition base CDB by (plat, cfg) so clangd's gd on macros like
           -- UE_BUILD_DEVELOPMENT does not jump into stale Dev generated headers
           -- when the current build is Test. See INDEX_FN.partition_base_cdb.
-          local ok_p, msg_p = INDEX_FN.partition_base_cdb(ctx)
+          INDEX_FN.partition_base_cdb_async(ctx, {}, function(ok_p, msg_p)
           if not ok_p then
             vim.notify("UEPrepare: cdb_partition failed -- " .. tostring(msg_p),
               vim.log.levels.WARN, { title = "ue.cdb" })
           end
           clear_index_dirty(ctx)
-          INDEX_FN.schedule_index_refresh(ctx,
-            { current = true, hot = true, full = true, current_delay_ms = 50, hot_delay_ms = 2500 })
+          INDEX_FN.schedule_prepare_delivery(ctx)
           invalidate_status_cache()
           refresh_statusline()
           set_prepare_running(false)
           CORE_RT.start_deferred_clangd(ctx)
           if handle then handle.message = "done"; handle.percentage = 100; handle:finish() end
           vim.notify(prepare_summary(ctx, compile_path, { reused_cache = true }))
+          end)
         end, { force_restart = ctx._force_cdb_restart })
 
         -- csearch index rebuild (same logic as before, just moved here).
@@ -8862,14 +8830,11 @@ local function prepare_async(opts)
 
     end_phase("lists")
 
-    -- ── Phase 3a: generate compile_commands (parallel with gtags) ────
-    -- compile_commands doesn't depend on gtags, so start it immediately.
-    -- The pipeline (slim → pch → unify) runs in background via jobstart.
+    -- ccjson and GTAGS are independent admitted batches; start both.
     update("generating compile_commands...", 30)
     start_phase()
 
-    local cdb_pipeline_done = false
-    local cdb_pipeline_ok = false
+    local cdb_pipeline_done, cdb_pipeline_ok = false, false
     local cdb_pipeline_err
     local finalize_waiting = false
     local finalize_after_csearch
@@ -8882,17 +8847,21 @@ local function prepare_async(opts)
       end
     end
 
-    local ok_compile, compile_path = CORE_RT.trace_seg("cold.ccjson", function()
-      return generate_compile_commands(ctx, nil, on_compile_pipeline_done)
-    end)
-    if not ok_compile then
-      cdb_pipeline_done = true
-      cdb_pipeline_ok = false
-      cdb_pipeline_err = compile_path
-      vim.notify("UEPrepare: compile_commands failed (non-fatal): " .. (compile_path or "unknown"), vim.log.levels.WARN)
-    end
-
-    end_phase("compile_commands")
+    local ok_compile, compile_path = false, nil
+    local cc_started = vim.uv.hrtime()
+    M.async_generate_compile_commands(ctx, function(_, pct, detail) update(detail, pct) end,
+      function(ok, path)
+        timings.compile_commands = (vim.uv.hrtime() - cc_started) / 1e9
+        ok_compile, compile_path = ok, path
+        if not ok then
+          on_compile_pipeline_done(false, path)
+          vim.notify("UEPrepare: compile_commands failed (non-fatal): " .. (path or "unknown"), vim.log.levels.WARN)
+          return
+        end
+        local targets = compile_commands_targets(ctx)
+        run_compile_commands_pipeline(targets[1], targets, on_compile_pipeline_done,
+          { force_restart = ctx._force_cdb_restart == true })
+      end)
 
     -- ── Phase 3b: build GTAGS (async, slow) ───────────────────────────
     update(("indexing %d files with gtags..."):format(#workspace_code), 35)
@@ -8906,7 +8875,8 @@ local function prepare_async(opts)
 
     local db_dir = ctx.paths.workspace_db
     local filelist = ctx.paths.workspace_list
-    clean_db_dir(db_dir)
+    local function start_gtags_phase()
+      clean_db_dir(db_dir)
 
     local gtags_cmd = { gtags, "-f", filelist, "--skip-unreadable", "--skip-symlink", db_dir }
     local gtags_output = {}
@@ -9154,6 +9124,18 @@ local function prepare_async(opts)
         })
       end)
     end
+    return CORE_RT.prepare_jobid
+    end
+
+    local admission = require("utils.host_admission")
+    admission.run_when_allowed({
+      name = "UEPrepare GTAGS",
+      start = start_gtags_phase,
+      on_defer = function() update("waiting for host CPU headroom before GTAGS...", 35) end,
+      on_error = function(err)
+        fail("GTAGS admission failed: " .. tostring(err))
+      end,
+    })
   end
 
   -- ── Phase 1: scan files (async) ──────────────────────────────────────
@@ -9822,10 +9804,10 @@ function M.setup()
     local opts = {}
     local arg = (cmd.args or ""):gsub("^%s+", ""):gsub("%s+$", "")
     if arg ~= "" then opts.active = arg end
-    local ok, msg = INDEX_FN.partition_base_cdb(ctx, opts)
-    local lvl = ok and vim.log.levels.INFO or vim.log.levels.WARN
-    vim.notify("UECDBPartition: " .. (msg or (ok and "ok" or "failed")),
-      lvl, { title = "ue.cdb" })
+    INDEX_FN.partition_base_cdb_async(ctx, opts, function(ok, msg)
+      vim.notify("UECDBPartition: " .. (msg or (ok and "ok" or "failed")),
+        ok and vim.log.levels.INFO or vim.log.levels.WARN, { title = "ue.cdb" })
+    end)
   end, { nargs = "?", desc = "Partition base CDB by (plat,cfg); optional Platform/Config arg" })
   vim.api.nvim_create_user_command("UECDBSwitch", function(cmd)
     -- Switch active (plat, cfg) group. Usage:
@@ -9841,14 +9823,13 @@ function M.setup()
         vim.log.levels.WARN, { title = "ue.cdb" }); return
     end
     local spec = args[1] .. "/" .. args[2]
-    local ok, msg = INDEX_FN.partition_base_cdb(ctx, { active = spec })
-    if not ok then
-      vim.notify("UECDBSwitch failed: " .. tostring(msg), vim.log.levels.WARN, { title = "ue.cdb" }); return
-    end
-    -- After switching active, the base CDB content changed -- re-kick clangd
-    -- so it re-reads. We piggy-back on the index refresh's existing restart.
-    INDEX_FN.maybe_restart_clangd_for_index()
-    vim.notify("UECDBSwitch: active=" .. spec, vim.log.levels.INFO, { title = "ue.cdb" })
+    INDEX_FN.partition_base_cdb_async(ctx, { active = spec }, function(ok, msg)
+      if not ok then
+        vim.notify("UECDBSwitch failed: " .. tostring(msg), vim.log.levels.WARN, { title = "ue.cdb" }); return
+      end
+      INDEX_FN.maybe_restart_clangd_for_index()
+      vim.notify("UECDBSwitch: active=" .. spec, vim.log.levels.INFO, { title = "ue.cdb" })
+    end)
   end, { nargs = "*", desc = "Switch CDB active (plat, cfg) group" })
   vim.api.nvim_create_user_command("UECDBStatus", function()
     local ctx = require_ctx_or_nil()
@@ -10050,7 +10031,8 @@ function M.setup()
       return
     end
     vim.notify("UE: rebuilding PCH (background) — " .. bat, vim.log.levels.INFO)
-    vim.fn.jobstart(command, {
+    local pch_token = require("utils.host_admission").foreground_begin("UEBuildPCH")
+    local pch_jobid = vim.fn.jobstart(command, {
       cwd = plan.cwd,
       detach = false,
       on_stdout = function(_, data)
@@ -10065,6 +10047,7 @@ function M.setup()
       end,
       on_exit = function(_, code)
         vim.schedule(function()
+          require("utils.host_admission").foreground_done(pch_token)
           if code == 0 then
             vim.notify("UE: PCH rebuild OK — restart clangd with :LspRestart", vim.log.levels.INFO)
           else
@@ -10073,6 +10056,7 @@ function M.setup()
         end)
       end,
     })
+    if pch_jobid <= 0 then require("utils.host_admission").foreground_done(pch_token) end
   end, { desc = "Rebuild clangd PCH cache (after LLVM/clangd version bump)" })
   vim.api.nvim_create_user_command("UEClearCache", function(cmd_opts)
     clear_cache({ bang = cmd_opts.bang })
@@ -10085,11 +10069,7 @@ function M.setup()
     M.dap_reset_layout()
   end, {})
 
-  -- ─ Phase F.1+F.2+H: platform-neutral UEDAP* aliases via dispatch table ─
-  -- F.1 introduced the UEDAP* command names with hard-coded android branch.
-  -- F.2 moved the per-platform handler decision into ue.dap.platforms.
-  -- Registration is filtered by the host-target compatibility matrix;
-  -- importable foreign modules do not become executable capabilities.
+  -- Platform-neutral UEDAP aliases; registry filters host-target compatibility.
   local dap_platforms = require("ue.dap.platforms")
   dap_platforms.register_supported(require("utils.platform").driver(), M)
 
@@ -10450,9 +10430,29 @@ end
 --   on_progress  — function(stage, pct, detail) called per PROGRESS line
 --   on_done      — function(ok, msg) called once when the subprocess exits
 -- Returns the vim.system handle so caller can keep a reference if needed.
-function M.async_generate_compile_commands(ctx, on_progress, on_done)
+function M.async_generate_compile_commands(ctx, on_progress, on_done, opts)
   on_progress = on_progress or function() end
   on_done = on_done or function() end
+  opts = opts or {}
+
+  -- Admission happens before temp-file materialization and process creation.
+  -- Recursive re-entry is tagged so every public caller shares this one seam.
+  if opts._host_admitted ~= true then
+    local admission = require("utils.host_admission")
+    local started, child, start_err, control = admission.run_when_allowed({
+      name = "compile_commands generation",
+      start = function()
+        return M.async_generate_compile_commands(ctx, on_progress, on_done,
+          vim.tbl_extend("force", opts, { _host_admitted = true }))
+      end,
+      on_defer = function() on_progress("admission", 25, "waiting for host CPU headroom...") end,
+      on_error = function(err)
+        on_done(false, "ccjson admission failed: " .. tostring(err))
+      end,
+    })
+    if started then return child, start_err end
+    return control
+  end
 
   -- 1. Dump ctx to a temp JSON file (argv has size limits on Windows).
   local tmp = vim.fn.tempname() .. ".ccjson-ctx.json"

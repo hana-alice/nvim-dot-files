@@ -223,9 +223,29 @@ function M.install(client, deps)
     }
   end
 
-  local function query(spec, context, callback)
+  -- Query one OR MANY contexts in a single round trip.
+  --
+  -- The sidecar's `handle_query` already accepts `contexts` (plural), evaluates
+  -- each one, groups the results by canonical identity (`by_identity`) and checks
+  -- whether they agree on a single definition (`unique_definition_keys`). That is
+  -- exactly the convergence a header needs -- and the client had never used it,
+  -- always sending `{ single_context }`.
+  --
+  -- Consequence of that omission: whenever a header had more than one candidate
+  -- origin TU, the client skipped straight to a chooser listing TU FILE NAMES.
+  -- But a non-self-contained header being included by many TUs is normal, not
+  -- ambiguity -- and the user cannot tell which `VulkanRHI_3.cpp` holds the
+  -- definition of the symbol under the cursor. Reported symptom: "gd waits a long
+  -- time, then pops a Module chooser", for a symbol with exactly ONE definition.
+  --
+  -- Passing every candidate lets the compiler decide, which is what C5 requires:
+  -- identity comes from canonical USR agreement, never from picking a file.
+  local function query_contexts(spec, contexts, callback)
     local snapshot, environment = spec.snapshot, spec.environment
-    local request_context = wire_context(context, environment)
+    local wire = {}
+    for _, context in ipairs(contexts) do
+      wire[#wire + 1] = wire_context(context, environment)
+    end
     client.request("query", {
       query = {
         path = spec.path,
@@ -233,9 +253,13 @@ function M.install(client, deps)
         column = spec.column,
         document_version = snapshot and snapshot.document_version or nil,
       },
-      contexts = { request_context },
+      contexts = wire,
       overlays = client.collect_unsaved_overlays(environment),
     }, callback, environment)
+  end
+
+  local function query(spec, context, callback)
+    return query_contexts(spec, { context }, callback)
   end
 
   function client.lookup_definition(spec, callback)
@@ -324,19 +348,79 @@ function M.install(client, deps)
         elseif #contexts == 1 or allow_select == false then
           dispatch(contexts[1], false)
         else
-          finish_progress(timer)
-          vim.ui.select(contexts, {
-            prompt = "Select proven translation-unit context",
-            format_item = function(item)
-              return tostring(item.label or vim.fn.fnamemodify(item.origin_tu or "", ":t"))
-            end,
-          }, function(choice)
-            if not choice then
-              notify_terminal(catalog)
-              callback(catalog)
+          -- CONVERGE FIRST, ASK ONLY IF THE COMPILER GENUINELY DISAGREES.
+          --
+          -- Several candidate origin TUs is the NORMAL state for a header that is
+          -- included widely; it means "we have not decided which TU to evaluate
+          -- in", not "this position denotes different entities". Prompting here
+          -- outsourced our job to the user, and gave them TU file names as the
+          -- only basis for a choice they cannot make.
+          --
+          -- So evaluate all candidates in one round trip and let the sidecar's
+          -- existing identity grouping decide: if every context agrees on one
+          -- canonical entity and one definition, it answers `resolved` and we jump
+          -- straight there. It only returns `ambiguous-context` when the results
+          -- really differ, which is the sole case worth asking about.
+          query_contexts(spec, contexts, function(response)
+            local still_current, why = client.snapshot_is_current(snapshot)
+            if not still_current then
+              finish_progress(timer)
+              callback(nil, why)
               return
             end
-            dispatch(choice, false)
+
+            if response and response.state == "resolved" then
+              -- Remember the proven TU so later navigations in this window skip
+              -- the catalog entirely.
+              local chosen = response.contexts and response.contexts[1] or nil
+              if chosen then
+                local lineage = vim.deepcopy(chosen)
+                lineage.build_fingerprint = environment.build_fingerprint
+                lineage.source_action_token = snapshot.token
+                lineage.subject_membership = semantic_context.context_subject_membership(chosen)
+                if #lineage.subject_membership == 0 then
+                  lineage.subject_membership = { spec.path }
+                end
+                client.note_origin(snapshot.winid, lineage, environment.build_fingerprint)
+              end
+              finish(response)
+              return
+            end
+
+            -- Genuine disagreement between proven contexts: this is the only
+            -- situation where the user has something real to decide.
+            if response and response.state == "ambiguous-context"
+                and type(response.contexts) == "table" and #response.contexts > 1 then
+              finish_progress(timer)
+              vim.ui.select(response.contexts, {
+                prompt = "Multiple proven contexts resolve differently",
+                format_item = function(item)
+                  -- Show WHAT differs (the target), not just which TU: the TU name
+                  -- alone is not actionable information for the user.
+                  local tu = tostring(item.label or vim.fn.fnamemodify(item.origin_tu or "", ":t"))
+                  local def = item.definition
+                  if type(def) == "table" and def.path then
+                    return ("%s  →  %s:%s"):format(
+                      tu,
+                      vim.fn.fnamemodify(tostring(def.path), ":t"),
+                      tostring(def.line or "?"))
+                  end
+                  return tu
+                end,
+              }, function(choice)
+                if not choice then
+                  notify_terminal(response)
+                  callback(response)
+                  return
+                end
+                dispatch(choice, false)
+              end)
+              return
+            end
+
+            -- Could not converge and disagreement was not proven: fail honestly
+            -- rather than handing back a list of TUs as if it were an answer (P12).
+            finish(response or catalog)
           end)
         end
       end, environment)

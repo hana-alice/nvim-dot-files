@@ -321,13 +321,33 @@ function M.install(owner, deps)
       -- hits cannot distinguish overloads, same-name symbols or namespaces).
       state, stage, reason = M._apply_readiness_override(state, stage, reason, tx.index)
 
+      -- Contexts are evidence for an ambiguity the user can actually act on: each
+      -- one must have RESOLVED to a real target. Failure records are not choices.
+      -- The sidecar only reaches `ambiguous-context` from its `#resolved > 1`
+      -- branch now, but this stays defensive: a chooser fed with unresolved
+      -- contexts is exactly the "pick one of these unity cpp files" symptom, and
+      -- P12 forbids presenting text/TU guesses as definition targets.
+      local ambiguous_contexts = nil
+      if state == "ambiguous-context" and response and type(response.contexts) == "table" then
+        local resolved_only = {}
+        for _, c in ipairs(response.contexts) do
+          if type(c) == "table" and c.state == "resolved" then
+            resolved_only[#resolved_only + 1] = c
+          end
+        end
+        if #resolved_only > 1 then
+          ambiguous_contexts = resolved_only
+        else
+          -- Not a real ambiguity after filtering: fail honestly instead of
+          -- offering a list the user cannot reason about.
+          state = "unavailable"
+        end
+      end
+
       return transaction.terminal(state, stage, reason, {
         detail = raw ~= "" and raw or nil,
         diagnostics = response and response.diagnostics,
-        -- Contexts are evidence for an ambiguity the user can actually act on.
-        -- Once we have downgraded to `unavailable` they are failure records, not
-        -- choices, so they MUST NOT be handed to a chooser.
-        contexts = state == "ambiguous-context" and response and response.contexts or nil,
+        contexts = ambiguous_contexts,
         metrics = response and response.metrics,
       })
     end

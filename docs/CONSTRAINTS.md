@@ -31,7 +31,7 @@
 | P3 | **不做全局 `vim.lsp.handlers[...] = ...` 覆盖** | 任何触碰 LSP 行为的改动必须走 `lua/utils/lsp_fallback.lua` 或 `lua/workarounds/clangd/*.lua`，否则无法定位、无法回退。 | `docs/architecture-vs-lazyvim.md` §"What we deliberately *don't* do" |
 | P4 | **不写 inline workaround** | 任何"因为别人的 bug 才存在"的补丁必须落到 `lua/workarounds/<scope>/<name>.lua` 并带 frontmatter；散落在 config 里的 monkey-patch 半年后无人能解释。 | `lua/workarounds/README.md`; 约束 C2 |
 | P5 | **不做周期性 ticker 通知** | 至多 start + 一次中段更新，成功后自然消退；禁止轮询式 toast 刷 `:messages`。 | `README.md` §Conventions |
-| P6 | **不阻塞主线程** | 多秒等待可接受，但必须 async（`nio` / 子进程）；UI 卡顿 = bug。 | `README.md` §Conventions; `docs/architecture-symbol-resolution.md` §5 |
+| P6 | **不阻塞主线程，且不得占满宿主**（首要原则） | 两个层面缺一不可：① 进程内——多秒等待可接受但必须 async（`nio` / 子进程），UI 卡顿 = bug；② **宿主级**——本配置启动的工作不得把机器资源占满到编辑器不可用。主循环空转再顺，若 24 核被我们自己 spawn 的子进程占满，编辑器一样卡。**资源让路优先于功能尽快完成。**只约束自己启动的进程，不得操作 rustc 等外部进程，也不得声称能保证宿主 CPU 上限。 | §三 C4 第 2 条; `openspec/specs/editor-behavior-regression/spec.md`（主循环余量）; 坑 K52/K54 |
 | P7 | **不用 `string.format("%x", addr)` 处理 64 位值** | LuaJIT 下会截断到 32 位；模块 slide 的 hex 字符串必须用拼接构造。 | `docs/TOOLING.md` §Pitfalls #4 |
 | P8 | **codelldb 不用 `request="custom"`** | codelldb 1.12.2 会回 `Malformed message`；改用 `request="launch"` + `targetCreateCommands` + `processCreateCommands`。 | `docs/TOOLING.md` §Pitfalls #1 |
 | P9 | **不用 which-key 自动 cheatsheet** | 会泄漏我们从未绑定的 plugin 键位；自渲染 `:UECheatsheet`。 | `docs/architecture-vs-lazyvim.md` §"What we deliberately *don't* do" |
@@ -423,6 +423,48 @@
     `lua/utils/ue_goto/provider.lua` `async_lsp_request`（ReferenceContext）;
     行为测 `tests/cases/ui_responsiveness_spec.lua`「交互路径禁止同步阻塞」
 
+- **K54 — 只给「我们调度的批任务」做准入控制，长驻服务与其余 spawn 点全裸奔（2026-08-26 实测）**
+  症状: 已实现宿主 CPU 准入控制（85% 高水位、双水位滞回，实测 42%→ALLOW / 100%→DEFER），
+  并宣称「已生效」；用户随后仍报「clangd 时不时把电脑卡死，复发了」。
+  证据: AppControl `app_sysmon.db`（`binary_monitoring`，`binary_id` 映射见 `app_data.db.binary`；
+  258 = `C:/Program Files/LLVM/bin/clangd.exe`）显示 clangd 当日
+  **17:56–18:46 连续 50 分钟满负荷**，而全部 CPU 相关改动落盘于 **16:03–16:05** ——
+  复发发生在修改之后，用户判断正确。
+  根因: 准入控制只挂在 `lua/ue/index/_schedule.lua`；`rg -l "admit_background_phase"` 仅命中
+  `_admission.lua`/`_schedule.lua`，而 spawn 点分散于 `ue.lua`(24)、`dap/android.lua`(16)、
+  `cdb/pipeline.lua`(10)、`index/_build.lua`(4)、`task_registry.lua`(4) 等十余文件 —— **结构性缺口，
+  不是漏改一处**。三类负载根本不在视野内: clangd 本体（仅启动时静态 `-j`）、UE build、Neovide 渲染。
+  次因: `-j` 只「保留 4 核」→ 24 核机器给 clangd 20 核（**83%**）。固定核数在不同规模宿主上语义不同
+  （保留 4/8 很激进，保留 4/64 形同没有），必须叠加**份额上限**。
+  另: `--background-index-priority=background` 按 clangd `--help` 为 *OS-specific*，
+  **Windows 未验证**，不得计入已有防线。
+  解决约束: P6 提升为**宿主级首要原则**（见 §一 P6、§三 C4-2）。判据必须**全仓共用一份**
+  （不得各子系统各写阈值）；按类型分策略——可推迟批任务→推迟启动；长驻交互服务→**可逆 OS 级降级，
+  MUST NOT kill/suspend**（杀掉丢 preamble，下次导航重付分钟级）；用户显式发起的前台任务→不得自动
+  推迟，但须抑制后台批任务。并发预算同时受 RAM、核数与**份额上限**约束
+  （`MAX_CORE_SHARE`，24 核: `-j` 20→12）。诚实边界: 只约束自身启动的进程，不动 rustc 等外部进程，
+  不承诺宿主 CPU 上限。
+  教训（比结论更可复用）: **「已实测生效」必须写清生效范围**。我实测的是 index 构建路径，
+  却表述为整体生效，用户因此白等一轮。声称修复时须同时说明**未覆盖什么**。
+  感知层教训: **负载感知必须常驻维护缓存，不能等重活到期才冷启动。**累计 CPU 计数至少需要两个
+  时间点；按需采样的第一次查询只能得到 `nil`，而旧准入将 `load-unknown` 放行，恰好让最该节流的
+  第一项重活穿透。正确结构是 UI 会话低频常驻采样、查询只读缓存，并把 `warming`（正在建立差分）
+  与 `unknown`（平台不可测）分开。`uv.getrusage()` 只含 Neovim 本进程、不含 live children，差值只能
+  标为 `unattributed`，不得伪装成「外部占用」。
+  动态纪律落地: `utils.host_admission` 是唯一水位/前台 ownership；workspace scan、ccjson、CDB
+  pipeline+partition、GTAGS、csearch、controlled index 全部只在 child start 前 gate。用户显式
+  build/install/deploy/PCH/core-health 不等 CPU，并在生命周期内抑制新的 batch。clangd 不能套 batch
+  策略：Windows driver 以 Toolhelp32 证明 `(parent nvim pid, executable name)` 后，仅在
+  `NORMAL ↔ BELOW_NORMAL` 间可逆切换 PriorityClass；发现后持有绑定原 process object 的 HANDLE，
+  每轮只查 `STILL_ACTIVE`（不重复 16ms Toolhelp 全机快照，也不受 PID reuse 影响），禁止
+  kill/suspend/affinity，禁止仅按进程名扫全机。
+  防复发: spawn audit 同时覆盖 `vim.system`/`jobstart`/`termopen`/`uv.spawn`/`vim.lsp.rpc.start`；
+  每个点必须有精确 anchor、类别、数量和理由，禁止整个文件/API whitelist。
+  → `lua/ue/clangd_jobs.lua`（`MAX_CORE_SHARE`）; `lua/utils/cpu_load.lua`;
+    `lua/ue/index/_admission.lua`; change `enforce-host-resource-discipline` /
+    `constrain-clangd-under-cpu-pressure`; 行为测 `tests/cases/ui_responsiveness_spec.lua`
+    「份额上限」与 `cpu_admission_spec.lua`
+
 ### 工具链 / LLVM
 
 - **K41 — 依赖路径向上发现的 `.clangd` / monolithic External index → 覆盖漂移与资源失控**
@@ -670,7 +712,7 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 ### C4 — 六条仓库约定（Conventions）
 
 1. **AST/treesitter 优先于 regex** —— 任何结构化代码问题。
-2. **async 优先于阻塞** —— 多秒等待 OK，阻塞主线程不 OK。
+2. **async 优先于阻塞，且不得占满宿主** —— 多秒等待 OK，阻塞主线程不 OK；本配置启动的重活也不得把机器 CPU 占满到编辑器不可用（P6 首要原则，资源让路优先于功能尽快完成）。
 3. **workaround 隔离** —— 仅为绕过上游 bug 的代码进 `lua/workarounds/<scope>/<name>.lua`。
 4. **可自验证模块** —— 公共 API 挂 `M.*`，可 headless 测试（`nvim --headless -l`）。
 5. **不做周期性 ticker 通知** —— 至多 start + 中段更新，成功后自然消退，不刷 `:messages`。

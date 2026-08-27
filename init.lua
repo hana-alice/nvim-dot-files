@@ -50,6 +50,11 @@ vim.api.nvim_create_autocmd("UIEnter", {
     pcall(function()
       require("utils.stall_probe").setup()
     end)
+    -- Continuous host-load awareness. UIEnter keeps headless runs timer-free;
+    -- setup only establishes cumulative-counter baselines and never waits.
+    pcall(function()
+      require("utils.cpu_load").setup()
+    end)
     -- Proactive evidence probes (:UEProbeReport / spec probe-feedback-loop).
     -- Session-start summary: surface pending evidence ONCE so the next
     -- session's first act is READING feedback, not waiting for it.

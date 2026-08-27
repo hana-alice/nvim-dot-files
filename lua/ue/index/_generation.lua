@@ -601,6 +601,10 @@ return function(M, core)
   M.semantic_index_snapshot = function(ctx, subject_path)
     local state = ensure_index_state(ctx)
     normalize_index_state(state)
+    -- Not ledger-only: rebuild from on-disk manifests when the in-process record
+    -- was lost (lua/ue/index/_recover.lua).
+    if M.maybe_recover_readiness then M.maybe_recover_readiness(ctx, state) end
+
     local selected = state.index_selection or index_state_selection_default()
     local artifact = state.index_artifacts and state.index_artifacts[selected.phase] or nil
     if type(artifact) ~= "table"
@@ -628,6 +632,28 @@ return function(M, core)
       end
     elseif state.build and state.build.status == "running" then
       readiness = "building"
+    end
+
+    -- A `ready` verdict MUST name the artifact backing it and that artifact MUST
+    -- exist. Without this, a selection whose fields are blank still yields
+    -- `ready` (observed 2026-08-26: ready with index_path="" while the only .idx
+    -- on disk was a month old and 0 bytes). Such a claim is unfalsifiable and
+    -- misleads every downstream consumer, including the clangd gate.
+    if readiness == "ready" and M.selection_is_self_evidencing then
+      local self_ok, self_reason = M.selection_is_self_evidencing(selected)
+      if not self_ok then
+        readiness = "missing"
+        freshness = "missing"
+        -- Log rather than swallow: a contradictory state is a defect elsewhere,
+        -- and silently downgrading it would hide the cause (as it did before).
+        pcall(function()
+          require("utils.log").warn_ctx("ue.index", "discarded self-contradictory ready state", {
+            reason = self_reason,
+            phase = selected.phase or "",
+            generation = selected.generation_short or "",
+          })
+        end)
+      end
     end
 
     local subject_module = nil
@@ -742,6 +768,9 @@ return function(M, core)
   core.h.base_cdb_digest = base_cdb_digest
   core.h.index_manifest_path = index_manifest_path
   core.h.read_index_manifest = read_index_manifest
+  -- Exported for _recover: rebuilding readiness from disk must compare the source
+  -- CDB signature using the SAME function that produced it, not a reimplementation.
+  core.h.file_signature = file_signature
   -- Exported for _delivery's stale-artifact report: "same generation?" is the
   -- single predicate that decides whether an on-disk CDB can back the active
   -- tuple, so both selection and observability must use the SAME rule.

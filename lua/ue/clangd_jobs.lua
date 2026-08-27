@@ -34,13 +34,29 @@
 
 local M = {}
 
--- Logical cores withheld from clangd so the editor can always draw:
---   1 for nvim's main loop
---   1 for the GUI render thread (Neovide/Skia)
---   1 for the compositor
---   1 of slack for everything else on the box (shells, git, adb, watchers)
--- Deliberately a named constant: it is the load-bearing number in this file.
+-- Logical cores withheld from clangd so the machine stays usable.
+--
+-- The original budget reserved 4 of 24 cores, i.e. clangd could take 83%. That
+-- was still too much: measured on this host (AppControl app_sysmon telemetry,
+-- binary_id=258 = LLVM clangd 22.1.5) clangd held the machine at full load for a
+-- continuous 50 minutes (17:56-18:46 on 2026-08-26), and the user reported the
+-- whole desktop becoming unusable. "4 cores for the UI" only holds when nothing
+-- else runs; on this box rustc, several zellij sessions, Chrome and AppControl are
+-- routinely busy, so those 4 reserved cores do not actually exist.
+--
+-- A share, not a fixed count, is the right model: reserving 4 of 8 cores is
+-- drastic while reserving 4 of 64 is negligible. Keep a fixed floor for small
+-- hosts and additionally cap clangd at MAX_CORE_SHARE of the machine.
 M.UI_RESERVED_CORES = 4
+
+-- Hard ceiling on the fraction of logical cores clangd may use.
+--
+-- Rationale for 0.5: background indexing is a batch job whose latency the user
+-- does not observe directly, whereas losing the desktop is immediately painful.
+-- Halving throughput to keep the machine responsive is the correct trade under
+-- "resource yielding outranks finishing sooner". On this 24-core host it means
+-- -j=12 instead of -j=20.
+M.MAX_CORE_SHARE = 0.5
 
 -- Never drop below this, or indexing a UE tree stops being viable.
 M.MIN_JOBS = 4
@@ -72,10 +88,11 @@ function M.compute(total_mb, cpus)
     ram_jobs = RAM_UNKNOWN_JOBS
   end
 
-  -- CPU ceiling: never claim the cores the UI needs to stay smooth.
+  -- CPU ceiling: never claim the cores the UI needs to stay smooth, and never
+  -- exceed MAX_CORE_SHARE of the machine regardless of how many cores exist.
   local cpu_jobs = math.huge
   if cpus > 0 then
-    cpu_jobs = cpus - M.UI_RESERVED_CORES
+    cpu_jobs = math.min(cpus - M.UI_RESERVED_CORES, math.floor(cpus * M.MAX_CORE_SHARE))
   end
 
   local jobs = math.min(ram_jobs, cpu_jobs)

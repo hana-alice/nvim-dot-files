@@ -33,6 +33,17 @@ local function defaults()
       restart_debounce_s = 45,
       status_ttl_s       = 30,
     },
+    -- One host-resource policy for every workload class. Sensor data lives in
+    -- utils.cpu_load; decisions and foreground ownership live in
+    -- utils.host_admission. Keep these values out of index.* so CDB/csearch/
+    -- GTAGS/clangd cannot silently drift onto different thresholds.
+    resources = {
+      cpu_admission = true,
+      cpu_high_pct = 85,
+      cpu_low_pct = 70,
+      cpu_defer_max = 20,
+      cpu_retry_ms = 5000,
+    },
     context = {
       ttl_s = 30,
     },

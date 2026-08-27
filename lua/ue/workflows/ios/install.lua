@@ -89,6 +89,7 @@ function M.install(platform, deps)
         or function() end
       local handle, run_err = task_runner.run(plan, {
         name = "UE " .. driver.id .. " install",
+        foreground = true,
         on_stdout = stdout_progress,
         on_stderr = stderr_progress,
         on_exit = function(result)

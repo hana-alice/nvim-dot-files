@@ -42,12 +42,22 @@ local function summarize_unresolved(unresolved)
   local state = "unavailable"
   local has_unavailable = state_counts.unavailable ~= nil
   local has_invalid = state_counts["invalid-semantic-context"] ~= nil
-  local has_ambiguous = state_counts["ambiguous-context"] ~= nil
   if has_invalid and not has_unavailable then
     state = "invalid-semantic-context"
-  elseif has_ambiguous and not has_unavailable and not has_invalid then
-    state = "ambiguous-context"
   end
+  -- NOTE: `ambiguous-context` is deliberately NOT reachable from here.
+  --
+  -- Every entry in `unresolved` FAILED to resolve. A per-context result can carry
+  -- state="ambiguous-context" simply because several candidate TUs might include
+  -- the header (semantic_context.catalog_contexts returns that whenever more than
+  -- one context survives dedup) -- that means "we could not narrow it down", NOT
+  -- "multiple proven contexts legitimately resolve to different entities".
+  --
+  -- Promoting that to a top-level `ambiguous-context` was the bug: ambiguous is
+  -- the one terminal state that legitimately shows the user a chooser, so a
+  -- symbol with exactly ONE definition was presented as a pick-list of unity TUs.
+  -- Genuine ambiguity is produced by the `#resolved > 1` branch below, where each
+  -- entry really did resolve. Failures must fail honestly (P12).
 
   local reasons = vim.tbl_keys(reason_counts)
   table.sort(reasons)

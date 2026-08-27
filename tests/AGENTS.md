@@ -44,6 +44,8 @@ pwsh -File scripts/run_regression.ps1       # 本机一键（转发 + 退出码�
 | `lua/utils/cheatsheet.lua` / `docs/ue_lazyvim_cheatsheet.md` | `cheatsheet` |
 | `lua/utils/stall_probe.lua` | `stall_probe` |
 | `lua/config/ui_responsiveness.lua` / `lua/ue/clangd_jobs.lua` / clangd `-j` / 主循环余量 | `ui_responsiveness` `core_health` `ue_api` `stability` |
+| `lua/utils/cpu_load.lua` / `lua/utils/host_admission.lua` / `lua/utils/clangd_resource_controller.lua` / `lua/ue/index/_admission.lua` / 宿主资源纪律 | `cpu_admission` `host_resource_discipline` `clangd_resource` `index_delivery` `ue_config` `stability` |
+| `lua/ue/index/_recover.lua` / `_delivery.lua` / `_schedule.lua` / 索引交付 | `index_delivery` `index_generation` `cpp_semantic_index` |
 | `lua/utils/core_health*.lua` / `scripts/nvim_core_health.lua` | `core_health` |
 | `lua/workarounds/**` | `workarounds` `smoke` |
 | `lua/ue.lua` façade / workflow 边界 | `ue_platform_boundary` `structure` |

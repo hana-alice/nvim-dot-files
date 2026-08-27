@@ -80,8 +80,14 @@ t.describe("降级为 unavailable 后不得携带候选（候选=可选定位目
     t.assert_type(body, "string", "未找到 semantic_failure 函数体")
     t.assert_true(body:find("_apply_readiness_override", 1, true) ~= nil,
       "semantic_failure 必须应用 readiness 覆盖")
-    t.assert_match(body, 'contexts = state == "ambiguous%-context"',
-      "contexts 必须以终态为条件透传，不得无条件传给候选渲染")
+    -- 更强的不变量（比原来的单行条件透传更严）：只有**真正 resolved** 的 context
+    -- 才能交给候选渲染，且过滤后不足两个则降为 unavailable。
+    -- 根因：sidecar 的 per-context 结果可能带 state="ambiguous-context"（仅表示
+    -- “有多个候选 TU 可能包含该 header”），那不是可供用户选择的真歧义。
+    t.assert_match(body, 'c%.state == "resolved"',
+      "只得透传真正 resolved 的 context")
+    t.assert_match(body, "#resolved_only > 1",
+      "过滤后不足两个即非真歧义，必须降级")
   end)
 
   t.it("readiness 类失败必须给出可执行的补救提示", function()
@@ -382,5 +388,518 @@ t.describe("陈旧 controlled CDB 必须可观测（存在 ≠ 可用）", funct
     local gsrc = table.concat(vim.fn.readfile(gpath), "\n")
     t.assert_match(gsrc, "core%.h%.same_generation = same_generation",
       "same_generation 必须导出给 _delivery")
+  end)
+end)
+
+t.describe("prepare 的索引调度不得被普通编辑饿死（真正的根因）", function()
+  -- 实测（2026-08-26）：prepare 三条完成路径都不传 full_delay_ms，`full` 落到
+  -- idle_cold_ms=120000（两分钟）；而 schedule_index_phase 会 stop+重建同 phase 的
+  -- timer，于是任何后续 refresh（BufWritePost 任一 C++ 文件都会触发）都把倒计时推后。
+  -- 实证：两次 schedule 相隔 300ms、延迟 1500ms，最终 1821ms 才触发 —— deadline 被推移。
+  -- 结果不是"晚"，而是"永远不到" —— 现场 stats 三项全零、零索引日志、用户走了三遍习惯
+  -- 链路都没拿到可用的 gd。
+  local idx = require("ue.index")
+
+  t.it("暴露纯判定 _may_rearm（headless 可测）", function()
+    t.assert_type(idx._may_rearm, "function")
+  end)
+
+  t.it("已保护的 deadline 不得被普通 refresh 重排（核心不变量）", function()
+    t.assert_false(idx._may_rearm(true, false),
+      "prepare 承诺的交付 deadline 不得被 BufWritePost 类刷新推后")
+  end)
+
+  t.it("保护请求之间仍可重排（prepare 再跑一次应生效）", function()
+    t.assert_true(idx._may_rearm(true, true))
+  end)
+
+  t.it("未保护时一切照旧（不扩大影响面）", function()
+    t.assert_true(idx._may_rearm(false, false))
+    t.assert_true(idx._may_rearm(false, true))
+  end)
+
+  t.it("prepare 交付调度使用短 deadline，而非 idle_cold_ms", function()
+    t.assert_type(idx.schedule_prepare_delivery, "function")
+    t.assert_type(idx.PREPARE_FULL_DELAY_MS, "number")
+    t.assert_true(idx.PREPARE_FULL_DELAY_MS <= 5000,
+      ("交付 deadline 必须是秒级，实际 %sms"):format(tostring(idx.PREPARE_FULL_DELAY_MS)))
+    local cfg = require("ue.config")
+    local c = cfg.get and cfg.get("index") or {}
+    if type(c.idle_cold_ms) == "number" then
+      t.assert_true(idx.PREPARE_FULL_DELAY_MS < c.idle_cold_ms,
+        "交付 deadline 必须显著短于 opportunistic 的 idle_cold_ms")
+    end
+  end)
+
+  t.it("prepare 完成路径全部改用 schedule_prepare_delivery（不得再落回 120s）", function()
+    local src = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
+    -- 三条 prepare 完成路径：fast-path / cold / pipeline。
+    local n = select(2, src:gsub("INDEX_FN%.schedule_prepare_delivery", ""))
+    t.assert_true(n >= 3,
+      ("prepare 的三条完成路径都应使用交付调度，实际 %d 处"):format(n))
+    -- 且这些路径不得再用带 full=true 的 refresh（那会落回 idle_cold_ms）。
+    for line in src:gmatch("[^\n]*schedule_index_refresh[^\n]*") do
+      if line:find("clear_index_dirty") then
+        t.assert_nil(line:match("full%s*=%s*true"),
+          "prepare 路径不得用 full=true 的 refresh：" .. line:sub(1, 80))
+      end
+    end
+  end)
+
+  t.it("交付调度为 full 传 protect（否则仍会被饿死）", function()
+    local src = table.concat(
+      vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue/index/_schedule.lua"), "\n")
+    local body = src:match("M%.schedule_prepare_delivery = function%(ctx%)(.-)\n  end")
+    t.assert_type(body, "string", "未找到 schedule_prepare_delivery 函数体")
+    t.assert_match(body, "protect = true", "full 阶段必须使用受保护的 deadline")
+  end)
+
+  t.it("被拒绝的重排不得写状态文件（避免无谓 IO 与状态抖动）", function()
+    local src = table.concat(
+      vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue/index/_schedule.lua"), "\n")
+    local body = src:match("M%.schedule_index_phase = function%(ctx, phase, delay_ms, opts%)(.-)\n\n    if RT%.timers")
+    t.assert_type(body, "string", "未找到 schedule_index_phase 前半段")
+    local guard_at = body:find("_may_rearm")
+    local save_at = body:find("save_index_state")
+    t.assert_true(guard_at ~= nil and save_at ~= nil and guard_at < save_at,
+      "保护判定必须早于 save_index_state")
+  end)
+end)
+
+t.describe("ready 必须自证（禁止内部矛盾的假就绪）", function()
+  -- 实测（2026-08-26 14:38）：readiness 报 ready，而同一份 index_selection 里
+  -- index_path=""、artifact_fingerprint=""、coverage_level=""，磁盘上唯一的 .idx
+  -- 是一个月前的 0 字节文件。这个 ready 无法被证伪，直接导致误判"索引已交付"。
+  local idx = require("ue.index")
+  local yes = function() return true end
+  local no = function() return false end
+  local full = { index_path = "C:/x.idx", artifact_fingerprint = "abc", coverage_level = "full" }
+
+  t.it("暴露纯判据 selection_is_self_evidencing", function()
+    t.assert_type(idx.selection_is_self_evidencing, "function")
+  end)
+
+  t.it("字段完整且产物存在 → 自证通过", function()
+    t.assert_true((idx.selection_is_self_evidencing(full, yes)))
+  end)
+
+  t.it("字段完整但产物文件不存在 → 不通过", function()
+    local ok, reason = idx.selection_is_self_evidencing(full, no)
+    t.assert_false(ok)
+    t.assert_eq(reason, "ready-with-missing-index-artifact")
+  end)
+
+  t.it("任一关键字段为空 → 不通过，且 reason 指名字段", function()
+    for field, want in pairs({
+      index_path = "ready-without-index-path",
+      artifact_fingerprint = "ready-without-artifact-fingerprint",
+      coverage_level = "ready-without-coverage-level",
+    }) do
+      local sel = vim.deepcopy(full)
+      sel[field] = ""
+      local ok, reason = idx.selection_is_self_evidencing(sel, yes)
+      t.assert_false(ok, field .. " 为空时不得自证通过")
+      t.assert_eq(reason, want)
+    end
+  end)
+
+  t.it("全空 selection（复现 14:38 现场）→ 不通过", function()
+    t.assert_false((idx.selection_is_self_evidencing({}, yes)))
+    t.assert_false((idx.selection_is_self_evidencing(nil, yes)))
+  end)
+
+  t.it("readiness 计算处应用该判据并落日志（不得静默降级）", function()
+    local path = vim.fn.stdpath("config") .. "/lua/ue/index/_generation.lua"
+    local src = table.concat(vim.fn.readfile(path), "\n")
+    t.assert_match(src, "selection_is_self_evidencing",
+      "semantic_index_snapshot 必须应用自证判据")
+    t.assert_match(src, "discarded self%-contradictory ready state",
+      "矛盾状态必须可诊断，不得静默降级")
+  end)
+end)
+
+t.describe("readiness 可从磁盘 manifest 自愈（不得要求重跑 prepare）", function()
+  -- 根因：readiness 只信进程内 state 账本。账本一坏（进程中途退出/并发写/脚本事故），
+  -- 261MB 受控 CDB 就"不存在"，用户唯一出路是重跑 388s 的 prepare。
+  -- 而 spec「Prepared tuple artifacts survive a Nvim restart」明确禁止这样要求用户。
+  local idx = require("ue.index")
+  local yes = function() return true end
+  local ev = { generation_id = "G1", build_key = "B1", cdb_source_signature = "S1" }
+  local function mf(over)
+    return vim.tbl_extend("force", {
+      generation_id = "G1", build_key = "B1", cdb_source_signature = "S1",
+      index_path = "C:/x.idx", background_cdb_path = "C:/bg.json",
+      artifact_fingerprint = "fp1", coverage_level = "full", phase = "full",
+    }, over or {})
+  end
+
+  t.it("暴露 classify_persisted_manifest / ledger_is_intact / recover_from_disk", function()
+    t.assert_type(idx.classify_persisted_manifest, "function")
+    t.assert_type(idx.ledger_is_intact, "function")
+    t.assert_type(idx.recover_from_disk, "function")
+    t.assert_type(idx.maybe_recover_readiness, "function")
+  end)
+
+  t.it("manifest 与当前 build 全匹配且产物在 → usable", function()
+    local v, r = idx.classify_persisted_manifest(mf(), ev, yes)
+    t.assert_eq(v, "usable")
+    t.assert_eq(r, "ok")
+  end)
+
+  t.it("generation / build_key / cdb 签名任一不匹配 → stale（绝不复活别的 build）", function()
+    for field, want in pairs({
+      generation_id = "manifest-generation-mismatch",
+      build_key = "manifest-build-key-mismatch",
+      cdb_source_signature = "manifest-cdb-signature-mismatch",
+    }) do
+      local v, r = idx.classify_persisted_manifest(mf({ [field] = "OTHER" }), ev, yes)
+      t.assert_eq(v, "stale", field .. " 不匹配必须判 stale")
+      t.assert_eq(r, want)
+    end
+  end)
+
+  t.it("证据缺失时不得当作匹配（fail closed）", function()
+    -- 当前 build 证据为空 → 无法证明匹配 → 不得 usable。
+    local v = idx.classify_persisted_manifest(mf(), { generation_id = "", build_key = "", cdb_source_signature = "" }, yes)
+    t.assert_eq(v, "stale")
+  end)
+
+  t.it("manifest 引用的产物不存在 → unusable（manifest 只是声明，文件才是证明）", function()
+    local v, r = idx.classify_persisted_manifest(mf(), ev, function(p) return p ~= "C:/x.idx" end)
+    t.assert_eq(v, "unusable")
+    t.assert_eq(r, "manifest-index-artifact-missing")
+
+    local v2, r2 = idx.classify_persisted_manifest(mf(), ev, function(p) return p ~= "C:/bg.json" end)
+    t.assert_eq(v2, "unusable")
+    t.assert_eq(r2, "manifest-background-cdb-missing")
+  end)
+
+  t.it("manifest 缺失/不可解析 → unusable", function()
+    t.assert_eq((idx.classify_persisted_manifest(nil, ev, yes)), "unusable")
+    t.assert_eq((idx.classify_persisted_manifest("not-a-table", ev, yes)), "unusable")
+  end)
+
+  t.it("缺 fingerprint 的 manifest 不可用（selection 无法自证）", function()
+    local v, r = idx.classify_persisted_manifest(mf({ artifact_fingerprint = "" }), ev, yes)
+    t.assert_eq(v, "unusable")
+    t.assert_eq(r, "manifest-missing-fingerprint")
+  end)
+
+  t.it("账本完好性判定：空表/空列表/缺 fingerprint 均视为已丢失", function()
+    t.assert_false(idx.ledger_is_intact({}))
+    -- vim.json 会把空 Lua table 编码成 []，被我的脚本事故复现过。
+    t.assert_false(idx.ledger_is_intact({ index_artifacts = {}, index_selection = { artifact_fingerprint = "x" } }))
+    t.assert_false(idx.ledger_is_intact({
+      index_artifacts = { full = {} }, index_selection = { artifact_fingerprint = "" } }))
+    t.assert_true(idx.ledger_is_intact({
+      index_artifacts = { full = {} }, index_selection = { artifact_fingerprint = "fp" } }))
+  end)
+
+  t.it("recover_from_disk 用注入依赖重建 artifacts（每 phase 给出 reason）", function()
+    local state = { index_artifacts = {} }
+    local recovered, verdicts = idx.recover_from_disk({ paths = {} }, state, {
+      manifest_path = function(p) return p .. ".manifest.json" end,
+      read_manifest = function(p) return p:find("full") and mf() or nil end,
+      phase_paths = function(_, phase) return nil, "C:/idx/" .. phase .. ".idx" end,
+      generation = { generation_id = "G1", build_key = "B1" },
+      cdb_source_signature = "S1",
+      exists = yes,
+    })
+    t.assert_eq(#recovered, 1, "只应恢复匹配的 full phase")
+    t.assert_eq(recovered[1], "full")
+    t.assert_type(state.index_artifacts.full, "table")
+    t.assert_eq(verdicts.full, "ok")
+    t.assert_eq(verdicts.hot, "manifest-missing-or-unparsable")
+  end)
+
+  t.it("semantic_index_snapshot 接入自愈（否则契约形同虚设）", function()
+    local path = vim.fn.stdpath("config") .. "/lua/ue/index/_generation.lua"
+    local src = table.concat(vim.fn.readfile(path), "\n")
+    t.assert_match(src, "maybe_recover_readiness",
+      "readiness 查询必须尝试从磁盘自愈")
+  end)
+end)
+
+t.describe("manifest 随产物落盘（不再等全链路成功）", function()
+  local src
+  local function build_src()
+    if not src then
+      src = table.concat(vim.fn.readfile(
+        vim.fn.stdpath("config") .. "/lua/ue/index/_build.lua"), "\n")
+    end
+    return src
+  end
+
+  t.it("manifest 写出不依赖 selection 提升/clangd 重启是否成功", function()
+    local s = build_src()
+    -- manifest 写出必须早于 promotion 的**调用点**。
+    -- 注意不能直接 find("publish_semantic_cdb") —— 那会先命中函数**定义**
+    -- （M.publish_semantic_cdb = function ...，位置远在前面），使断言失去意义。
+    local write_at = s:find("write_json_file%(index_manifest_path")
+    local promote_at = s:find("M%.publish_semantic_cdb%(ctx")
+    t.assert_type(write_at, "number", "未找到 manifest 写出")
+    t.assert_type(promote_at, "number", "未找到 promotion 调用点")
+    t.assert_true(write_at < promote_at,
+      "manifest 必须在提升之前落盘，否则产物无法自证归属")
+  end)
+
+  t.it("manifest 写失败必须可见（否则下次会话无法恢复）", function()
+    t.assert_match(build_src(), "failed to persist index manifest",
+      "写 manifest 失败必须落日志")
+  end)
+end)
+
+t.describe("失败集合不得被伪装成真歧义（16:46 探针的真实根因）", function()
+  -- 探针 08-26 16:46：state=ambiguous-context / reason=semantic-tu-unavailable /
+  -- **generation_class=complete**。索引这次是完整交付的（前几轮的 readiness 修复生效了），
+  -- 但 gd 依然弹候选 —— 说明还有一层独立缺陷。
+  --
+  -- 根因链：
+  --   semantic_context.catalog_contexts 在 dedup 后 >1 个候选 TU 就返回
+  --     state="ambiguous-context"（含义只是"没能缩小到唯一 TU"）
+  --   → 这些 per-context 结果全部 FAILED，落进 sidecar 的 `unresolved`
+  --   → summarize_unresolved 见到 state_counts["ambiguous-context"] 就把顶层终态
+  --     也报成 ambiguous-context
+  --   → ambiguous 是唯一会弹选择器的终态 → 唯一定义变成 unity TU 假候选列表（违背 P12）
+  --
+  -- 真歧义只能来自 sidecar 的 `#resolved > 1` 分支（每个都真的解析成功了）。
+
+  t.it("summarize_unresolved 不得输出 ambiguous-context（全是失败项）", function()
+    local path = vim.fn.stdpath("config") .. "/lua/utils/ue_goto/semantic_sidecar.lua"
+    local src = table.concat(vim.fn.readfile(path), "\n")
+    local body = src:match("local function summarize_unresolved%(unresolved%)(.-)\nend")
+    t.assert_type(body, "string", "未找到 summarize_unresolved 函数体")
+    -- 去掉注释后不得再有把 state 赋成 ambiguous-context 的可执行代码。
+    local code = body:gsub("%-%-[^\n]*", "")
+    t.assert_nil(code:match('state%s*=%s*"ambiguous%-context"'),
+      "失败集合不得被汇总成 ambiguous-context（那会弹出假候选）")
+    -- invalid-semantic-context 仍应保留（AST/identity 本身无效是另一回事）。
+    t.assert_match(code, 'invalid%-semantic%-context',
+      "AST/identity 无效的分类必须保留")
+  end)
+
+  t.it("真歧义分支（#resolved > 1）仍然保留", function()
+    local path = vim.fn.stdpath("config") .. "/lua/utils/ue_goto/semantic_sidecar.lua"
+    local src = table.concat(vim.fn.readfile(path), "\n")
+    t.assert_match(src, "elseif #resolved > 1 then",
+      "多个已解析 context 的真歧义必须仍可产生 ambiguous-context")
+  end)
+
+  t.it("catalog_contexts 的多候选语义只是'未缩小'，不构成可选目标", function()
+    -- 锁住语义来源，便于后来者理解为何不能直接采信它的 state。
+    local sc = require("utils.ue_goto.semantic_context")
+    t.assert_type(sc.catalog_contexts, "function")
+    local path = vim.fn.stdpath("config") .. "/lua/utils/ue_goto/semantic_context.lua"
+    local src = table.concat(vim.fn.readfile(path), "\n")
+    local body = src:match("function M%.catalog_contexts%(contexts%)(.-)\nend")
+    t.assert_type(body, "string")
+    t.assert_match(body, 'state = "ambiguous%-context"',
+      "此处产生的 ambiguous 仅表示候选 TU 未缩小，调用方不得当作用户可选目标")
+  end)
+end)
+
+t.describe("头文件多候选 TU：先收敛，唯一定义直接跳转（不弹选择框）", function()
+  -- 用户症状（08-26 17:18 新会话，已装载先前全部修复）：
+  --   "gd 给几个提示之后好久才跳出 Module 选框，一样的"
+  -- 且该次 gd **未产生任何 cpp-semantic-navigation 探针** —— 证明它走的是 catalog 路径，
+  -- 与先前修的 query 终态分类无关。
+  --
+  -- 真凶：semantic_client_actions 在 #contexts > 1 时**无条件**弹
+  -- vim.ui.select("Select proven translation-unit context")，format_item 只给 TU 文件名。
+  -- 但非自包含头文件被大量 TU include 是**正常现象**，不是歧义；用户也无法从
+  -- VulkanRHI_3.cpp 这类名字判断哪个含目标定义。
+  --
+  -- 关键发现：sidecar 的 handle_query **早就支持多 context**，并已用 by_identity /
+  -- unique_definition_keys 做收敛判定 —— 客户端却一直只传 { 单个 context }，
+  -- 白白浪费了这个能力。
+  local function read(rel)
+    return table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/" .. rel), "\n")
+  end
+  local CLI = "lua/utils/ue_goto/semantic_client_actions.lua"
+  local SIDE = "lua/utils/ue_goto/semantic_sidecar.lua"
+
+  t.it("sidecar 具备收敛能力（多 context + identity 分组 + 唯一 definition 判定）", function()
+    local s = read(SIDE)
+    t.assert_match(s, "request%.contexts", "handle_query 必须接受复数 contexts")
+    t.assert_match(s, "by_identity", "必须按 canonical identity 分组")
+    t.assert_match(s, "unique_definition_keys", "必须判定 definition 是否唯一")
+  end)
+
+  t.it("单一 identity + 唯一 definition → resolved（这是'直接跳转'的语义来源）", function()
+    local s = read(SIDE)
+    t.assert_match(s, "if #resolved == 1 or #identities == 1 then",
+      "同一 identity 的多个 context 必须走收敛分支")
+    t.assert_match(s, "if #unique_definition_keys > 1 then",
+      "只有 definition 不唯一才升级为 ambiguous")
+  end)
+
+  t.it("客户端在多候选时把所有 context 一起求值（不再只传一个）", function()
+    local c = read(CLI)
+    t.assert_match(c, "query_contexts%(spec, contexts,",
+      "多候选必须整批求值，交给编译器判定，而不是让用户挑文件")
+    -- 单 context 的旧入口应保留（dispatch 仍用它），但必须委派给复数实现。
+    t.assert_match(c, "return query_contexts%(spec, { context }, callback%)",
+      "单 context 查询应委派给同一实现，避免两套逻辑漂移")
+  end)
+
+  t.it("求值得到 resolved → 直接跳转，不呈现任何选择", function()
+    local c = read(CLI)
+    local body = c:match("query_contexts%(spec, contexts, function%(response%)(.-)\n          end%)")
+    t.assert_type(body, "string", "未找到收敛回调体")
+    local resolved_at = body:find('response%.state == "resolved"')
+    local select_at = body:find("vim%.ui%.select")
+    t.assert_type(resolved_at, "number", "必须处理 resolved")
+    if select_at then
+      t.assert_true(resolved_at < select_at,
+        "resolved 必须在任何选择框之前返回（唯一定义不得再问用户）")
+    end
+  end)
+
+  t.it("旧的无条件 TU 选择框已移除", function()
+    t.assert_nil(read(CLI):match("Select proven translation%-unit context"),
+      "不得再以'候选 TU 数量>1'为由弹选择框")
+  end)
+
+  t.it("仅在求值后确有分歧时才提示，且展示目标而非仅 TU 名", function()
+    local c = read(CLI)
+    t.assert_match(c, "Multiple proven contexts resolve differently",
+      "提示语必须表达'真的解析不同'")
+    t.assert_match(c, "#response%.contexts > 1",
+      "必须以求值后的 context 数量为门槛")
+    t.assert_match(c, "def%.line", "选项必须展示目标位置，TU 名对用户不可判断")
+  end)
+
+  t.it("无法收敛且未证明分歧 → 诚实失败，不给候选列表（P12）", function()
+    local c = read(CLI)
+    local body = c:match("query_contexts%(spec, contexts, function%(response%)(.-)\n          end%)")
+    t.assert_match(body, "finish%(response or catalog%)",
+      "既不能收敛也无真分歧时必须返回终态，而非 TU 列表")
+  end)
+
+  t.it("收敛 MUST NOT 依据文件名/路径/顺序启发式（P11/P12）", function()
+    local code = read(CLI):gsub("%-%-[^\n]*", "")
+    for _, bad in ipairs({ "levenshtein", "path_distance", "table%.sort%(contexts" }) do
+      t.assert_nil(code:match(bad), "收敛不得使用启发式：" .. bad)
+    end
+  end)
+
+  t.it("收敛成功后记住 origin，后续导航跳过 catalog", function()
+    local c = read(CLI)
+    local body = c:match("query_contexts%(spec, contexts, function%(response%)(.-)\n          end%)")
+    t.assert_match(body, "client%.note_origin",
+      "收敛结果应写入 window origin，避免重复付出 catalog 代价")
+  end)
+
+  t.it("收敛回调必须做 stale 校验（异步期间光标/buffer 可能已变）", function()
+    local c = read(CLI)
+    local body = c:match("query_contexts%(spec, contexts, function%(response%)(.-)\n          end%)")
+    t.assert_match(body, "client%.snapshot_is_current%(snapshot%)",
+      "异步返回必须校验 snapshot 仍有效")
+  end)
+end)
+
+t.describe("prepare 完成汇报不得为了打印计数而冻结 UI", function()
+  -- 实测（2026-08-26）：workspace_all.files 27.5 MB / 262,875 行。
+  -- 旧实现用 vim.fn.readfile（把整个文件物化成 Lua 字符串表）→ 单次阻塞主循环 ~253 ms，
+  -- 而 prepare_summary 要数 4 个列表 → 一次 prepare 完成白付 ~1012 ms 的 UI 冻结，
+  -- 仅仅为了在汇报里打印几个数字。
+  local fs = require("ue.core.fs")
+
+  t.it("暴露 count_lines_cached（流式 + 按 (mtime,size) 记忆）", function()
+    t.assert_type(fs.count_lines_cached, "function")
+  end)
+
+  t.it("计数正确（含末行无换行 / 空文件 / 缺失文件）", function()
+    local tmp = vim.fn.tempname()
+    local f = io.open(tmp, "wb"); f:write("a\nb\nc\n"); f:close()
+    t.assert_eq(fs.count_lines_cached(tmp), 3)
+
+    local tmp2 = vim.fn.tempname()
+    local f2 = io.open(tmp2, "wb"); f2:write(""); f2:close()
+    t.assert_eq(fs.count_lines_cached(tmp2), 0)
+
+    t.assert_eq(fs.count_lines_cached(vim.fn.tempname() .. "-missing"), 0,
+      "缺失文件必须返回 0，不得抛错")
+    t.assert_eq(fs.count_lines_cached(nil), 0)
+    os.remove(tmp); os.remove(tmp2)
+  end)
+
+  t.it("内容变化后重新计数（缓存键必须包含 size/mtime）", function()
+    local tmp = vim.fn.tempname()
+    local f = io.open(tmp, "wb"); f:write("x\n"); f:close()
+    t.assert_eq(fs.count_lines_cached(tmp), 1)
+    -- 追加内容 → size 变化 → 必须重算，不得返回陈旧计数
+    local f2 = io.open(tmp, "ab"); f2:write("y\nz\n"); f2:close()
+    t.assert_eq(fs.count_lines_cached(tmp), 3, "size 变化后必须重新计数")
+    os.remove(tmp)
+  end)
+
+  t.it("MUST NOT 用 vim.fn.readfile 数行（会物化整个文件）", function()
+    local src = table.concat(vim.fn.readfile(
+      vim.fn.stdpath("config") .. "/lua/ue/core/fs.lua"), "\n")
+    local body = src:match("function M%.count_lines_cached%(path%)(.-)\nend")
+    t.assert_type(body, "string", "未找到 count_lines_cached 函数体")
+    t.assert_nil(body:match("vim%.fn%.readfile"),
+      "不得用 readfile 数行：27MB 文件会阻塞主循环 ~253ms")
+    t.assert_match(body, "fh:read%(1024", "应分块流式读取")
+  end)
+
+  t.it("count_cached_entries 委派给该实现（不得各写一套）", function()
+    local src = table.concat(vim.fn.readfile(
+      vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
+    local body = src:match("local function count_cached_entries%(path%)(.-)\nend")
+    t.assert_type(body, "string")
+    t.assert_match(body, "count_lines_cached", "必须复用同一实现")
+    t.assert_nil(body:match("vim%.fn%.readfile"), "ue.lua 侧也不得 readfile")
+  end)
+end)
+
+t.describe("启动提示不得触发 hit-enter（每次启动都要按 Enter）", function()
+  -- 实测：clangd deferred 那条 notify 原文 187 字符单行，超出 cmdline 宽度 →
+  -- 触发 Vim 的 hit-enter prompt，用户**每次启动**都得按一下 Enter。
+  t.it("clangd deferred 提示足够短", function()
+    local src = table.concat(vim.fn.readfile(
+      vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
+    local msg = src:match('"(clangd deferred[^"]*)"')
+    t.assert_type(msg, "string", "未找到 clangd deferred 提示")
+    t.assert_true(#msg <= 100,
+      ("提示必须简短以免触发 hit-enter，实际 %d 字符：%s"):format(#msg, msg))
+    -- 仍须包含可执行动作。
+    t.assert_match(msg, "UEPrepare", "提示必须给出下一步动作")
+  end)
+
+  t.it("该提示未被拆成多段拼接（拼接后仍可能超长）", function()
+    local src = table.concat(vim.fn.readfile(
+      vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
+    local seg = src:match('"clangd deferred.-%)\n')
+    if seg then
+      local _, joins = seg:gsub("%.%.", "")
+      t.assert_true(joins == 0,
+        "提示不得用 .. 拼接多段长文本（原缺陷正是三段拼成 187 字符）")
+    end
+  end)
+end)
+
+t.describe("索引进度不得误报 per-file 数量为待索引单元", function()
+  -- 用户看到右下角 "16178"，据此认为 super-unity 没生效。实际上：
+  --   [input] 16178 per-file entries        ← 给 LSP 的 CDB（每文件一条编译命令）
+  --   Super-unity TUs created: 9 (vs 429)   ← 真正交给 clangd-indexer 的工作量（47.7x 压缩）
+  -- 这两个是不同产物；把前者原样转发到进度条会让人以为要索引 16k 个单元。
+  t.it("per-file 计数被改写为不会误读的措辞", function()
+    local src = table.concat(vim.fn.readfile(
+      vim.fn.stdpath("config") .. "/lua/ue/index/_build.lua"), "\n")
+    t.assert_match(src, "LSP compile entries",
+      "per-file 计数必须标注用途，不能裸报数字")
+    t.assert_match(src, "super%-unity", "应说明索引走 super-unity TU")
+  end)
+
+  t.it("只转发真正表示进度的行（不再逐行 forward 子进程输出）", function()
+    local src = table.concat(vim.fn.readfile(
+      vim.fn.stdpath("config") .. "/lua/ue/index/_build.lua"), "\n")
+    local body = src:match("local function progress_line%(line%)(.-)\n  end")
+    t.assert_type(body, "string", "未找到 progress_line 过滤器")
+    -- 源码里的模式本身是转义过的（"^%[indexer%]"），断言需匹配这个字面形式。
+    t.assert_true(body:find("indexer", 1, true) ~= nil, "indexer 进度应转发")
+    t.assert_match(body, "return nil", "其余输出应留在日志而非进度条")
   end)
 end)

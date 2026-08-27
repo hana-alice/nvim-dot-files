@@ -30,11 +30,17 @@ return {
         cmd = function(dispatchers, config)
           local resolved_cmd = require("ue").clangd_cmd(config.root_dir)
           config._ue_resolved_cmd = resolved_cmd
-          return vim.lsp.rpc.start(resolved_cmd, dispatchers, {
+          local rpc = vim.lsp.rpc.start(resolved_cmd, dispatchers, {
             cwd = config.cmd_cwd,
             env = config.cmd_env,
             detached = config.detached,
           })
+          -- Public RPC hides vim.SystemObj.pid. Bounded async discovery proves
+          -- direct-child ownership; failure never blocks the returned RPC.
+          pcall(function()
+            require("utils.clangd_resource_controller").discover_with_retry(resolved_cmd[1])
+          end)
+          return rpc
         end,
         root_dir = function(bufnr, on_dir)
           local root = require("ue").clangd_start_root(bufnr)

@@ -8,8 +8,9 @@
 
 current / hot / full 三相受控 BackgroundIndex：模块记录/持久化（`_state`），generation
 manifest 与 coverage selector（`_generation`），交付就绪判定与 prepare 汇报口径（`_delivery`），
-compiler-authored UBT unity / exact fallback CDB 生成与
-phase 调度（`_build`），以及只跟随 chosen manifest fingerprint 的 clangd 重启（`_clangd`）。
+compiler-authored UBT unity / exact fallback CDB 生成（`_build`），
+phase 调度与交付 deadline（`_schedule`），通用宿主策略薄委派（`_admission` → `utils.host_admission`），
+readiness 磁盘自愈（`_recover`），以及只跟随 chosen manifest fingerprint 的 clangd 重启（`_clangd`）。
 
 ## 结构契约
 
@@ -22,9 +23,21 @@ phase 调度（`_build`），以及只跟随 chosen manifest fingerprint 的 cla
   不得反向 `require("ue")`（会循环）。
 - `M._rt` 与 ue.lua 的 `INDEX_RT` 是**同一张表**（活引用）；:UESetProject
   清理、status cache 直接改它。别做防御性拷贝。
-- 加载顺序 `_state → _generation → _delivery → _clangd → _build`：基础 helper 在 `_state` 定义，
+- 加载顺序 `_state → _generation → _recover → _delivery → _clangd → _build → _admission → _schedule`：基础 helper 在 `_state` 定义，
   generation/selector helper 在 `_generation` 定义，`_delivery` 消费 `_generation` 的
-  `index_status_summary`；兄弟模块顶部 alias；不得反向依赖后加载模块。
+  `index_status_summary`，`_schedule` 消费 `_build` 的 `build_phase_async`；兄弟模块顶部 alias；
+  不得反向依赖后加载模块。
+- **后台重活必须让路**：受控索引在**启动前** MUST 经 `_admission` 薄委派到
+  `utils.host_admission`；阈值只能在通用模块/`ue.config.resources` 存一份，index 不得复制。
+  高于高水位推迟启动（双水位滞回 + 推迟上限防饿死）。负载采样 MUST NOT spawn 子进程（K40），
+  MUST NOT 用 `uv.loadavg`（Windows 恒 0）。已在跑的构建 MUST NOT 被杀。
+  我们只抑制**自己**的工作，MUST NOT 操作 rustc 等外部进程。
+- **readiness MUST NOT 只信进程内账本**：账本丢失时经 `_recover` 从磁盘 manifest
+  （generation/build_key/CDB 签名校验，fail closed）重建；MUST NOT 因账本丢失要求重跑 prepare。
+  报 `ready` MUST 自证（非空 index_path/fingerprint/coverage 且文件存在）。
+- **交付调度不得被普通编辑饿死**：prepare 的完成路径 MUST 走 `schedule_prepare_delivery`
+  （秒级 deadline + `protect`），MUST NOT 用 `full=true` 的 opportunistic refresh——后者落到
+  `idle_cold_ms`(120s) 且会被任何后续 refresh 重排，实测导致 `full` 永不触发。
 - **交付可观测是硬约束**：index 构建失败/中断 MUST notify + 落 `utils.log`；`running` 必须携带
   `owner_pid` 使其跨进程可 falsify；prepare 的完成汇报 MUST 经 `_delivery` 陈述 index 真实状态，
   MUST NOT 在构建中/失败时暗示语义层已就绪（用户不应被要求记住平台专属索引命令）。

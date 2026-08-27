@@ -17,7 +17,7 @@
 | UE 引擎中枢 | `lua/ue.lua` + `lua/ue/` | 索引 / CDB / DAP / 命令注册总入口 | 公共 API 挂 `M.*`；命令在 `ue.setup()` 注册 |
 | Project/session state | `lua/ue/project_state.lua` + `file_lock.lua` | 当前进程选择、canonical project bucket、跨进程 writer lease | live selection 不重读其他实例的默认值；共享写入必须 atomic/merge/lease |
 | CDB 流水线 | `lua/ue/cdb/` | compile_commands.json 生成/裁剪/shader/inject | 纯函数 + 子进程；写前 skip-if-unchanged |
-| 配置 schema | `lua/ue/config.lua` | `index/context/clangd/dap/cdb` 默认值 + override | `get/setup/options/reset_for_test` |
+| 配置 schema | `lua/ue/config.lua` | `index/resources/context/clangd/dap/cdb` 默认值 + override | `get/setup/options/reset_for_test` |
 | 核心工具 | `lua/ue/core/` | fs / proc 纯函数 | 无副作用，可 headless 断言 |
 | DAP 调试 | `lua/ue/dap/` | session-owner dispatch + 各平台 attach/launch | `platforms` 注册表是唯一 dispatch seam |
 | Android device | `lua/utils/android_device.lua` | `adb devices -l` 枚举、当前进程 serial 选择、`adb -s` argv | `vim.g.ue_android_device_serial` 是本 Neovim 进程的交互真相；活跃任务捕获 serial |
@@ -26,6 +26,7 @@
 | 符号解析栈 | `lua/utils/ue_goto/` + `lsp_fallback.lua` | C++ compiler identity；非 C++ compatibility | header 必须有 proven origin TU；非 resolved 不猜测 |
 | 代码搜索 | `lua/utils/code_search/` | csearch 亚秒级 grep | 显式搜索、references 与非 C++ 兼容路径 |
 | 核心健康审计 | `lua/utils/core_health*.lua` + `scripts/nvim_core_health.lua` | 真实启动、编辑、AST、搜索、clangd/CDB/target plan 的分层证据 | 交互入口只异步启动隔离 headless runner；live workspace 只读 |
+| 宿主资源纪律 | `lua/utils/cpu_load.lua` + `host_admission.lua` + `clangd_resource_controller.lua` | 轻量感知、统一双水位策略、前台 ownership、owned clangd 可逆降级 | batch 只在 start 前推迟；前台不等 CPU；不操作外部进程 |
 | 平台驱动 | `lua/utils/platform/` | OS 分支唯一收口 | 共享基础接口 + host-owned 可选能力；其余代码不做 OS 分支 |
 | workaround 注册表 | `lua/workarounds/` | 上游 bug 隔离补丁 | 带 frontmatter；`:WorkaroundList` 可见 |
 | 配置层 | `lua/config/` | keymaps/options/autocmds/lazy | LazyVim 自动加载，勿在 init 重复 require |
@@ -38,6 +39,14 @@
   gate：当前 project/target/platform/configuration 的 selection、manifest、controlled CDB 与源 CDB 签名
   仍有效时，新 Neovim 直接复用并启动；仅工件缺失、stale 或 tuple 变化时等待下一次 `:UEPrepare`。
   非 UE C++ root 不经过该 gate。全程 async + 进度 UI。
+- **宿主资源**：`UIEnter` 启动唯一 CPU sampler（host 1Hz、Neovim process 4Hz）→
+  `utils.host_admission` 用一份 85/70 双水位与 foreground registry 决定是否启动新 batch。
+  workspace scan、ccjson、CDB pipeline/partition、GTAGS、csearch 与 controlled index 均在 process creation
+  前消费该判定；高负载时 one-shot 重排，CPU 推迟有上限，用户 build/install/deploy 生命周期则不受
+  CPU gate 并抑制新的 batch。clangd 不可 kill/suspend：Windows driver 只枚举当前 Neovim 的 direct
+  clangd child 并持有原生 process HANDLE，以 `NORMAL` / `BELOW_NORMAL` PriorityClass 可逆切换；
+  1Hz reconcile 只查 HANDLE `STILL_ACTIVE`，不重复全机快照，回落即恢复。差值来源不可归属，
+  不操作 rustc/其他 IDE 进程，也不承诺宿主 CPU 上限。
 - **状态/缓存**：`:UESetProject` 把选择捕获在当前 Neovim 进程，同时更新未来进程读取的
   `selection.json` 默认值；project state/CDB/index/breakpoints/definition cache 写入 canonical-path
   project bucket。平台选择同样在进程内固定，另一个实例的修改不会重定向 live context。
@@ -158,7 +167,7 @@ workflow，generic runner 与 facade 不得通过 target literal 重建平台策
 
 - **Host layer** `lua/utils/platform/`：`windows/macos/linux/stub` 四驱动共享 path/process/tool
   入口契约；Xcode tools 是 macOS-only capability，PowerShell/debug-output/PCH build 是
-  Windows-only capability。
+  Windows-only capability；Toolhelp32 child discovery 与 PriorityClass 也是 Windows-only process capability。
   **这是唯一允许 OS 分支的地方**，不要求各 host 伪装成同一工具集。
 - **Shell layer** `lua/utils/platform/shell.lua`：只接受显式 `posix/powershell/cmd` kind 与 host
   已选 executable，负责 quote 和 argv；不探测 OS。CDB Python phases 直接以 argv 顺序执行，
@@ -200,7 +209,8 @@ matrix 声明与回归，不能在 generic orchestration 中添加 shell/path �
   NDK lldb-server、Neovim 0.10+）。
 - CDB 生成器（`tools/*.py` + `lua/ue/cdb/*`）：super-unity / prune / inject，写前比对跳过。
 - CDB mutation 由 `lua/ue/cdb/pipeline.lua` 进程内 slot + filesystem lease 双层串行化；
-  每个 Python phase 使用 argv 顺序启动，任一步失败即停止。UEPrepare 持有 project-scoped prepare
+  writer lease/第一步与后续 partition 均先经过通用 host admission，每个 Python phase 使用 argv 顺序启动，
+  任一步失败即停止。UEPrepare 持有 project-scoped prepare
   lease 到 pipeline/partition 完成，controlled index phase 另持 project+platform build lease，
   禁止不同 Neovim 并发撕裂 JSON/csearch/index artifact。
 - csearch 索引：`tools/cindex-uefilter`（Go fork）`-files-from` 干净建索引。

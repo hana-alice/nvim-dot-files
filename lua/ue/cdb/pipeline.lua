@@ -24,6 +24,8 @@ local platform = require("utils.platform")
 local M = {}
 local running = false
 local current_jobid = nil
+local pending_admission = nil
+local pending_done = nil
 
 -- Runtime injection table. Defaults assume no fancy logger so that even
 -- pre-`set_runtime` calls degrade gracefully.
@@ -62,12 +64,20 @@ end
 ---@param reason string? human-readable cause for the notification
 ---@return boolean cancelled true when a live job was asked to stop
 function M.cancel(reason)
-  if not running or not current_jobid then
-    return false
-  end
+  if not running then return false end
   _rt.notify(
     "compile_commands pipeline cancelled: " .. (reason or "superseded"),
     vim.log.levels.WARN)
+  if pending_admission then
+    pending_admission:cancel()
+    pending_admission = nil
+    running = false
+    local done = pending_done
+    pending_done = nil
+    if done then done(false, "compile_commands pipeline cancelled before start") end
+    return true
+  end
+  if not current_jobid then return false end
   pcall(vim.fn.jobstop, current_jobid)
   return true
 end
@@ -209,6 +219,47 @@ function M.run(path, targets, on_done, opts)
     _rt.notify(msg, vim.log.levels.WARN)
     if on_done then on_done(false, msg) end
     return nil, msg
+  end
+
+  -- Gate the whole chain once, before taking the writer lease or spawning its
+  -- first Python step. Later steps belong to the already-admitted unit and MUST
+  -- NOT independently re-enter policy (that could strand a half-written CDB).
+  if opts._host_admitted ~= true then
+    local admission = require("utils.host_admission")
+    local started, jobid, start_err, control = admission.run_when_allowed({
+      name = "compile_commands pipeline",
+      start = function()
+        running = false
+        pending_admission = nil
+        pending_done = nil
+        return M.run(path, targets, on_done,
+          vim.tbl_extend("force", opts, { _host_admitted = true }))
+      end,
+      on_defer = function(reason, reading, deferrals)
+        pcall(function()
+          require("utils.log").debug_ctx("host.admission", "deferred CDB pipeline", {
+            reason = reason,
+            deferrals = deferrals,
+            host_pct = reading and reading.host_pct or nil,
+          })
+        end)
+      end,
+      on_error = function(err)
+        running = false
+        pending_admission = nil
+        pending_done = nil
+        _rt.log_error("host.admission", "CDB admission failed: " .. tostring(err))
+        if on_done then on_done(false, tostring(err)) end
+      end,
+    })
+    if started then return jobid, start_err end
+    if control.finished then return nil, control.error or "CDB admission failed" end
+    running = true
+    pending_admission = control
+    pending_done = on_done
+    _rt.notify("compile_commands pipeline queued until host resources are available",
+      vim.log.levels.INFO)
+    return 0
   end
 
   local python = python_exe()

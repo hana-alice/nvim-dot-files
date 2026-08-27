@@ -79,6 +79,27 @@ t.describe("ue.target_tasks", function()
     t.assert_eq(completed.stderr, "stderr-one\n")
   end)
 
+  t.it("foreground operation marks its whole child lifetime without delaying spawn", function()
+    local admission = require("utils.host_admission")
+    admission._reset_for_test()
+    local original = vim.system
+    local exit_callback
+    vim.system = function(_, _, on_exit)
+      exit_callback = on_exit
+      return { kill = function() end }
+    end
+    local handle = tasks.run({ executable = "/installer", args = {} }, {
+      name = "install",
+      foreground = true, -- workflow-owned classification; plan metadata may omit operation
+    })
+    t.assert_true(handle ~= nil)
+    t.assert_true(admission.foreground_active(), "前台任务不得先等 CPU")
+    exit_callback({ code = 0, signal = 0, stdout = "", stderr = "" })
+    vim.wait(100, function() return not admission.foreground_active() end)
+    vim.system = original
+    t.assert_false(admission.foreground_active())
+  end)
+
   t.it("exposes one reusable fidget progress controller for multi-stage target workflows", function()
     local saved = package.loaded["fidget.progress"]
     local reports = {}

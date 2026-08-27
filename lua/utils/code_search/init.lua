@@ -649,6 +649,39 @@ end
 -- Returns a stop() function for bounded callers; existing callers may ignore it.
 function M.build_index(ctx, abs_list_path, cb, opts)
   opts = opts or {}
+
+  -- Gate at the single cindex spawn seam so cold, cache-fast and incremental
+  -- callers cannot drift. The existing csearch writer slot remains owned by
+  -- the caller across queued+running states; no child exists while deferred.
+  if opts._host_admitted ~= true then
+    local admission = require("utils.host_admission")
+    local started, stop, start_err, control = admission.run_when_allowed({
+      name = "csearch index build",
+      start = function()
+        return M.build_index(ctx, abs_list_path, cb,
+          vim.tbl_extend("force", opts, { _host_admitted = true }))
+      end,
+      on_defer = function(reason, reading, deferrals)
+        pcall(function()
+          require("utils.log").debug_ctx("host.admission", "deferred csearch build", {
+            reason = reason,
+            deferrals = deferrals,
+            host_pct = reading and reading.host_pct or nil,
+          })
+        end)
+      end,
+      on_error = function(err)
+        vim.schedule(function() cb(false, "csearch admission failed: " .. tostring(err), {}) end)
+      end,
+    })
+    if started then
+      if type(stop) == "function" then return stop end
+      vim.schedule(function() cb(false, tostring(start_err or "csearch admission failed"), {}) end)
+      return function() end
+    end
+    return function() control:cancel() end
+  end
+
   local mode = opts.mode or "reset"
   local cindex = M.cindex_uefilter_exe()
   if not cindex then

@@ -268,6 +268,8 @@ function M.run(request)
   )
 
   local stdout_lines, stderr_lines = {}, {}
+  local admission = require("utils.host_admission")
+  local foreground_token = admission.foreground_begin("UEInstallAndroid")
   local ok, install_jobid = pcall(d.jobstart, install_cmd, {
     stdout_buffered = true,
     stderr_buffered = true,
@@ -297,6 +299,10 @@ function M.run(request)
     end,
     on_exit = function(_, code)
       d.schedule(function()
+        if foreground_token then
+          admission.foreground_done(foreground_token)
+          foreground_token = nil
+        end
         timer:stop()
         timer:close()
         if code == 0 then
@@ -346,6 +352,8 @@ function M.run(request)
   })
 
   if not ok or not install_jobid or install_jobid <= 0 then
+    admission.foreground_done(foreground_token)
+    foreground_token = nil
     timer:stop()
     timer:close()
     if handle then

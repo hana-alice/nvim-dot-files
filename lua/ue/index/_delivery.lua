@@ -26,6 +26,41 @@
 local fs = require("ue.core.fs")
 
 return function(M, core)
+  --- Is a `ready` verdict backed by actual artifact evidence?
+  ---
+  --- WHY: readiness was computed purely from the `state` ledger, and a selection
+  --- whose fields were blank could still yield `ready`. Observed on 2026-08-26:
+  --- `verdict=ready` while the very same `index_selection` carried
+  --- `index_path=""`, `artifact_fingerprint=""`, `coverage_level=""`, and the
+  --- only .idx files on disk were a month old with `full.idx` at 0 bytes. I read
+  --- that `ready` and wrongly concluded the index had been delivered.
+  ---
+  --- A verdict that cannot be contradicted by evidence is not a verdict. `ready`
+  --- must therefore name the artifact backing it, and that artifact must exist.
+  ---
+  --- Pure except for the injectable `exists` probe, so the rule is testable
+  --- without staging real 260MB CDBs.
+  --- @param selection table active index selection
+  --- @param exists? fun(path:string):boolean file-existence probe (default: uv)
+  --- @return boolean ok
+  --- @return string|nil reason why the claim is not self-evidencing
+  M.selection_is_self_evidencing = function(selection, exists)
+    selection = selection or {}
+    exists = exists or function(p)
+      local st = vim.uv.fs_stat(p)
+      return st ~= nil and st.type == "file"
+    end
+    for _, field in ipairs({ "index_path", "artifact_fingerprint", "coverage_level" }) do
+      if fs.trim(tostring(selection[field] or "")) == "" then
+        return false, "ready-without-" .. field:gsub("_", "-")
+      end
+    end
+    if not exists(fs.trim(tostring(selection.index_path))) then
+      return false, "ready-with-missing-index-artifact"
+    end
+    return true, nil
+  end
+
   --- Verdict on whether the semantic index is delivered for the active tuple.
   ---
   --- Pure over an injected summary so the wording contract is headless-testable

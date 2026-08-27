@@ -29,11 +29,32 @@ t.describe("clangd -j：必须为 UI 保留 CPU 余量", function()
   end)
 
   t.it("大内存 + 多核：不得占满所有逻辑核（复现缺陷的那台机器）", function()
-    -- 94GB / 24 核：旧公式 floor(94/4)=23 → 只剩 1 核给 UI。
+    -- 94GB / 24 核：最初公式 floor(94/4)=23 → 只剩 1 核给 UI。
     local jobs = clangd_jobs.compute(96 * 1024, 24)
     t.assert_true(jobs <= 24 - clangd_jobs.UI_RESERVED_CORES,
       ("24 核必须保留 %d 核给 UI，实际 -j=%d"):format(clangd_jobs.UI_RESERVED_CORES, jobs))
     t.assert_true(jobs >= 4, "仍需保留可用的索引并发度")
+  end)
+
+  t.it("并发度不得超过宿主核数的 MAX_CORE_SHARE（保留 4 核仍不够）", function()
+    -- 实测：仅"保留 4 核"时 24 核机器给 clangd 20 核（83%），AppControl 遥测显示
+    -- clangd 连续 50 分钟满负荷、整机不可用。份额上限才是承重约束：
+    -- 保留 4/8 核很激进，保留 4/64 核形同没有。
+    t.assert_type(clangd_jobs.MAX_CORE_SHARE, "number")
+    t.assert_true(clangd_jobs.MAX_CORE_SHARE <= 0.5,
+      "后台索引不得占用过半宿主 CPU")
+    for _, cpus in ipairs({ 8, 12, 16, 24, 32, 64 }) do
+      local jobs = clangd_jobs.compute(96 * 1024, cpus)
+      t.assert_true(jobs <= math.floor(cpus * clangd_jobs.MAX_CORE_SHARE),
+        ("%d 核时 -j=%d 超过份额上限"):format(cpus, jobs))
+    end
+  end)
+
+  t.it("本机 24 核：-j 必须显著低于此前的 20", function()
+    -- 回归守卫：防止有人"为了索引快"把份额调回去。
+    local jobs = clangd_jobs.compute(96 * 1024, 24)
+    t.assert_true(jobs <= 12,
+      ("24 核 / 94GB 应 <=12（原 20 导致整机卡死），实际 %d"):format(jobs))
   end)
 
   t.it("核数是独立上限：大内存小核机器由 CPU 预算决定", function()

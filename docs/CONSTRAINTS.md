@@ -31,7 +31,7 @@
 | P3 | **不做全局 `vim.lsp.handlers[...] = ...` 覆盖** | 任何触碰 LSP 行为的改动必须走 `lua/utils/lsp_fallback.lua` 或 `lua/workarounds/clangd/*.lua`，否则无法定位、无法回退。 | `docs/architecture-vs-lazyvim.md` §"What we deliberately *don't* do" |
 | P4 | **不写 inline workaround** | 任何"因为别人的 bug 才存在"的补丁必须落到 `lua/workarounds/<scope>/<name>.lua` 并带 frontmatter；散落在 config 里的 monkey-patch 半年后无人能解释。 | `lua/workarounds/README.md`; 约束 C2 |
 | P5 | **不做周期性 ticker 通知** | 至多 start + 一次中段更新，成功后自然消退；禁止轮询式 toast 刷 `:messages`。 | `README.md` §Conventions |
-| P6 | **不阻塞主线程** | 多秒等待可接受，但必须 async（`nio` / 子进程）；UI 卡顿 = bug。 | `README.md` §Conventions; `docs/architecture-symbol-resolution.md` §5 |
+| P6 | **不阻塞主线程，且不得占满宿主**（首要原则） | 两个层面缺一不可：① 进程内——多秒等待可接受但必须 async（`nio` / 子进程），UI 卡顿 = bug；② **宿主级**——本配置启动的工作不得把机器资源占满到编辑器不可用。主循环空转再顺，若 24 核被我们自己 spawn 的子进程占满，编辑器一样卡。**资源让路优先于功能尽快完成。**只约束自己启动的进程，不得操作 rustc 等外部进程，也不得声称能保证宿主 CPU 上限。 | §三 C4 第 2 条; `openspec/specs/editor-behavior-regression/spec.md`（主循环余量）; 坑 K52/K54 |
 | P7 | **不用 `string.format("%x", addr)` 处理 64 位值** | LuaJIT 下会截断到 32 位；模块 slide 的 hex 字符串必须用拼接构造。 | `docs/TOOLING.md` §Pitfalls #4 |
 | P8 | **codelldb 不用 `request="custom"`** | codelldb 1.12.2 会回 `Malformed message`；改用 `request="launch"` + `targetCreateCommands` + `processCreateCommands`。 | `docs/TOOLING.md` §Pitfalls #1 |
 | P9 | **不用 which-key 自动 cheatsheet** | 会泄漏我们从未绑定的 plugin 键位；自渲染 `:UECheatsheet`。 | `docs/architecture-vs-lazyvim.md` §"What we deliberately *don't* do" |
@@ -373,6 +373,98 @@
   → `lua/ue/cdb/pipeline.lua` `M.cancel`; `lua/ue.lua` `ue_build_running` / `_logged_jobstart`;
     行为测 `tests/cases/ue_cdb_spec.lua`; `docs/changelog.md` 2026-08-18
 
+- **K52 — 「持续偷主循环」三连：RAM-only `-j` / LSP stderr 每条 flush / 2s 配置轮询（2026-08-25 实测）**
+  症状: `:StallReport` 与日志 scope `[stall]` 累计 8643 条卡顿记录（p50 229ms / p90 504ms），
+  **8518 条在 0.3s 内没有任何按键**（=与按键动作无关），~2s 一次成串出现，`ft=cpp` 占 6536 条；
+  且**两个互不相干的 nvim 进程按小时计数完全相同**（325 vs 325）。
+  **诊断陷阱（比结论更值钱）**: 逐一测量后**全部证伪**了直觉候选——输入路径（活实例里每个导航键
+  p90 < 15ms）、snacks statuscolumn（warm 0.006ms、整窗 0.15ms）、lazy reloader 命中变更（21ms）、
+  合成 CPU 压力（23 个满转 worker 只把 33 文件扫描从 1.3ms 推到 2.9ms，**0 次迟到 tick**）、
+  合成磁盘写压力（1.2x，0 次迟到）、headless 下真实 clangd（17.4GB RSS、38 线程，**0 次卡顿**）。
+  **关键方法论**: `--headless` 无渲染线程、无 UI 管道，**结构上看不到 UI 争用**——6 次 headless
+  实验都报告「主循环很顺」而 GUI 会话正在卡。必须在**活的 GUI 实例**上用 `--server` 注入测量；
+  另外 `jit.profile` 在空闲时会把采样记到最后运行过的栈（本例 61% 记到 `vim.schedule_wrap`），
+  **它回答「哪段 Lua 跑得多」，不回答「这 250ms 是谁占的」**——判定归属要用 rusage CPU/gap 比值
+  （≈1 = 本进程内阻塞；≈0 = 被剥夺调度/宿主超订）。
+  根因（三个独立的**持续性**开销，都不是「某个回调很慢」）:
+  ① `-j` 只按 RAM 推导（`floor(94/4)=23`），24 核机器上给 clangd **96% 的核**，只剩 1 核给
+  主循环 + Neovide 渲染线程 + 合成器；索引时宿主 CPU 6%→60%、clangd 38 线程。
+  ② `vim/lsp/_transport.lua:36` 把 server 的**每条 stderr 按 ERROR** 记录，而 `vim/lsp/log.lua`
+  默认 WARN 门槛让 ERROR 恒通过，且每条 `write()` 后 `flush()`——现场 `lsp.log` 16.6MB / 58803 条
+  **全部是 clangd 的普通 `Indexed ...` 信息输出**，实测 0.045ms/条（batched 0.094ms、max 0.63ms），
+  合计约 2.6s 主循环时间，且**恰好在索引时成串爆发**。
+  ③ lazy.nvim `change_detection` 的 `start(2000, 2000)` 在主循环上同步 `fs_stat` 33 个 spec 文件
+  （空闲 1.2ms p50），命中变更再付 `Plugin.load()`+autocmd **21ms p50**；它还是**共享磁盘状态**，
+  所以多个 nvim 会在同一个 2s 窗口一起反应——这正是「两进程计数相同」的成因。
+  解决约束: **UI 余量是一等约束**（P6 的延伸：不只是「别阻塞」，还包括「别把资源占光到画不出帧」）。
+  `-j` MUST 同时受 RAM 与 CPU 两个预算约束，并为 UI 保留 `UI_RESERVED_CORES`（当前 4）个逻辑核；
+  `UE_CLANGD_JOBS` 显式覆盖仍优先。vim.lsp 日志级别 MUST 为 OFF（server 的 stderr 不是 error），
+  排查时用 `:LspLogLevel debug` 临时提级。`change_detection` MUST 显式 `false`——本仓行为大量由
+  启动**顺序**建立（C3），本就不能热重载，等于白付周期性主循环税。
+  → `lua/ue/clangd_jobs.lua`（`compute`/`resolve`/`UI_RESERVED_CORES`）; `lua/ue.lua` `clangd_cmd`;
+    `lua/config/ui_responsiveness.lua`; `lua/config/lazy.lua` `change_detection`;
+    诊断入口 `tools/stall_profile.lua` / `tools/stall_attribute.lua` / `tools/stall_repro.lua`;
+    行为测 `tests/cases/ui_responsiveness_spec.lua`; `docs/changelog.md` 2026-08-25
+
+- **K53 — Windows 上 `vim.system():wait()` 的光 spawn 底线就是 87ms：交互路径禁止同步子进程（2026-08-25 实测）**
+  症状: `gr`（references）偶发冻住数百 ms 至数秒，屏上无任何提示；卡顿日志里的多秒级极值
+  （122843ms / 36247ms / 12754ms / 8447ms）都落在导航与 `:UEPrepare` 动作上，而不是普通滚动。
+  根因: 两层同步阻塞叠在同一个日常按键上——`provider.sync_locations` 的
+  `client:request_sync(..., 5000)` 最多堵**5 秒**；随后 `ue.gtags_references` 经
+  `global_lines`→`run_lines` 进入 `vim.system(...):wait()`。**关键数据：本宿主上光是
+  `vim.system():wait()` 的空 spawn 就要 87ms p50**（`global -r` 82ms p50 / 293ms max）——
+  Windows 创建进程昂贵，**这笔底线即使查询一无所获也要付**。这也解释了为何卡顿分布
+  p50=229ms：约等于 2–3 次同步 spawn。
+  解决约束: 交互路径（按键/命令）MUST NOT 出现 `:wait()` 或 `request_sync`。新增
+  `M.gtags_references_async` 并把 `references()` 整条链路改异步（`async_lsp_request` +
+  async GTAGS 回退）。注意：换异步通道时必须补上 `includeDeclaration`（sync 版本一直在设，
+  `async_lsp_request` 原本没设），否则会静默改变返回集——这类**行为漂移比性能回退更难发现**。
+  → `lua/ue.lua` `gtags_references_async`; `lua/utils/lsp_fallback.lua` `M.references`;
+    `lua/utils/ue_goto/provider.lua` `async_lsp_request`（ReferenceContext）;
+    行为测 `tests/cases/ui_responsiveness_spec.lua`「交互路径禁止同步阻塞」
+
+- **K54 — 只给「我们调度的批任务」做准入控制，长驻服务与其余 spawn 点全裸奔（2026-08-26 实测）**
+  症状: 已实现宿主 CPU 准入控制（85% 高水位、双水位滞回，实测 42%→ALLOW / 100%→DEFER），
+  并宣称「已生效」；用户随后仍报「clangd 时不时把电脑卡死，复发了」。
+  证据: AppControl `app_sysmon.db`（`binary_monitoring`，`binary_id` 映射见 `app_data.db.binary`；
+  258 = `C:/Program Files/LLVM/bin/clangd.exe`）显示 clangd 当日
+  **17:56–18:46 连续 50 分钟满负荷**，而全部 CPU 相关改动落盘于 **16:03–16:05** ——
+  复发发生在修改之后，用户判断正确。
+  根因: 准入控制只挂在 `lua/ue/index/_schedule.lua`；`rg -l "admit_background_phase"` 仅命中
+  `_admission.lua`/`_schedule.lua`，而 spawn 点分散于 `ue.lua`(24)、`dap/android.lua`(16)、
+  `cdb/pipeline.lua`(10)、`index/_build.lua`(4)、`task_registry.lua`(4) 等十余文件 —— **结构性缺口，
+  不是漏改一处**。三类负载根本不在视野内: clangd 本体（仅启动时静态 `-j`）、UE build、Neovide 渲染。
+  次因: `-j` 只「保留 4 核」→ 24 核机器给 clangd 20 核（**83%**）。固定核数在不同规模宿主上语义不同
+  （保留 4/8 很激进，保留 4/64 形同没有），必须叠加**份额上限**。
+  另: `--background-index-priority=background` 按 clangd `--help` 为 *OS-specific*，
+  **Windows 未验证**，不得计入已有防线。
+  解决约束: P6 提升为**宿主级首要原则**（见 §一 P6、§三 C4-2）。判据必须**全仓共用一份**
+  （不得各子系统各写阈值）；按类型分策略——可推迟批任务→推迟启动；长驻交互服务→**可逆 OS 级降级，
+  MUST NOT kill/suspend**（杀掉丢 preamble，下次导航重付分钟级）；用户显式发起的前台任务→不得自动
+  推迟，但须抑制后台批任务。并发预算同时受 RAM、核数与**份额上限**约束
+  （`MAX_CORE_SHARE`，24 核: `-j` 20→12）。诚实边界: 只约束自身启动的进程，不动 rustc 等外部进程，
+  不承诺宿主 CPU 上限。
+  教训（比结论更可复用）: **「已实测生效」必须写清生效范围**。我实测的是 index 构建路径，
+  却表述为整体生效，用户因此白等一轮。声称修复时须同时说明**未覆盖什么**。
+  感知层教训: **负载感知必须常驻维护缓存，不能等重活到期才冷启动。**累计 CPU 计数至少需要两个
+  时间点；按需采样的第一次查询只能得到 `nil`，而旧准入将 `load-unknown` 放行，恰好让最该节流的
+  第一项重活穿透。正确结构是 UI 会话低频常驻采样、查询只读缓存，并把 `warming`（正在建立差分）
+  与 `unknown`（平台不可测）分开。`uv.getrusage()` 只含 Neovim 本进程、不含 live children，差值只能
+  标为 `unattributed`，不得伪装成「外部占用」。
+  动态纪律落地: `utils.host_admission` 是唯一水位/前台 ownership；workspace scan、ccjson、CDB
+  pipeline+partition、GTAGS、csearch、controlled index 全部只在 child start 前 gate。用户显式
+  build/install/deploy/PCH/core-health 不等 CPU，并在生命周期内抑制新的 batch。clangd 不能套 batch
+  策略：Windows driver 以 Toolhelp32 证明 `(parent nvim pid, executable name)` 后，仅在
+  `NORMAL ↔ BELOW_NORMAL` 间可逆切换 PriorityClass；发现后持有绑定原 process object 的 HANDLE，
+  每轮只查 `STILL_ACTIVE`（不重复 16ms Toolhelp 全机快照，也不受 PID reuse 影响），禁止
+  kill/suspend/affinity，禁止仅按进程名扫全机。
+  防复发: spawn audit 同时覆盖 `vim.system`/`jobstart`/`termopen`/`uv.spawn`/`vim.lsp.rpc.start`；
+  每个点必须有精确 anchor、类别、数量和理由，禁止整个文件/API whitelist。
+  → `lua/ue/clangd_jobs.lua`（`MAX_CORE_SHARE`）; `lua/utils/cpu_load.lua`;
+    `lua/ue/index/_admission.lua`; change `enforce-host-resource-discipline` /
+    `constrain-clangd-under-cpu-pressure`; 行为测 `tests/cases/ui_responsiveness_spec.lua`
+    「份额上限」与 `cpu_admission_spec.lua`
+
 ### 工具链 / LLVM
 
 - **K41 — 依赖路径向上发现的 `.clangd` / monolithic External index → 覆盖漂移与资源失控**
@@ -384,7 +476,16 @@
   解决: clangd 固定 `--enable-config=false`，不再写 `.clangd`、不传 `--index-file`；current/hot/full
   发布带 generation/coverage manifest 的 controlled BackgroundIndex CDB，只接受
   compiler-authored UBT unity membership 或 exact per-file fallback，并通过官方
-  `compilationDatabaseChanges` 注入打开文件 exact command。definition 的最终权威是
+  `compilationDatabaseChanges` 注入打开文件 exact command。phase artifact 可携带 portable
+  unity provenance，但发布给 clangd 的 JSON CDB 必须剥离非标准字段；generation hash 的 map
+  key 必须 canonical 排序，不能受 Lua 进程 hash randomization 影响。source 不在 synthetic CDB 时，
+  exact-command 首次传输必须有界重开已 attached buffer，使 cold AST 不继续使用邻近 TU 推断命令。
+  clangd 的 prepare gate 必须消费持久化 tuple artifact readiness：selection/manifest/controlled CDB 与
+  源 CDB 签名仍匹配时，Nvim 重启后直接复用；不得把“当前 Lua 进程执行过 UEPrepare”当作资格。
+  同进程内工件发生变化也必须重新验证，缺失/stale 才 defer。
+  exact argv 证明 `.cpp/.h` 实际为 Objective-C++ 时，必须保留 C++ Tree-sitter 并叠加内置 `objcpp`
+  syntax；禁止把 mixed source 整体交给仅继承 C 的 `objc` Tree-sitter grammar，普通平台不得受影响。
+  definition 的最终权威是
   canonical USR + subject module AST 唯一 body，clangd 仅作 identity-verified secondary provider。
   → `lua/ue.lua` `clangd_cmd`; `lua/ue/index/`; `lua/ue/clangd_commands.lua`;
     `tests/cases/{ue_api,index_generation,cpp_semantic_index,clangd_commands}_spec.lua`
@@ -468,7 +569,7 @@
   USR/CDB/overlay/toolchain 的唯一 resolved destination；negative/ambiguous 不缓存。禁止
   symbol / arity / ranking / text fallback 猜目标。
   → `docs/architecture-symbol-resolution.md`;
-    `openspec/changes/make-cpp-gd-semantically-complete/`
+    `openspec/changes/archive/2026-08-08-make-cpp-gd-semantically-complete/`
 
 - **K43 — 把“会话全局”和磁盘全局混为一谈 → 多实例串项目 / 丢状态 / 撕裂缓存**
   症状: 两个 Neovim 指向同一 engine 时，旧的顶层 `state.json` 让后写实例改变另一个实例的
@@ -611,11 +712,16 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 ### C4 — 六条仓库约定（Conventions）
 
 1. **AST/treesitter 优先于 regex** —— 任何结构化代码问题。
-2. **async 优先于阻塞** —— 多秒等待 OK，阻塞主线程不 OK。
+2. **async 优先于阻塞，且不得占满宿主** —— 多秒等待 OK，阻塞主线程不 OK；本配置启动的重活也不得把机器 CPU 占满到编辑器不可用（P6 首要原则，资源让路优先于功能尽快完成）。
 3. **workaround 隔离** —— 仅为绕过上游 bug 的代码进 `lua/workarounds/<scope>/<name>.lua`。
 4. **可自验证模块** —— 公共 API 挂 `M.*`，可 headless 测试（`nvim --headless -l`）。
 5. **不做周期性 ticker 通知** —— 至多 start + 中段更新，成功后自然消退，不刷 `:messages`。
 6. **未变更时跳过写入** —— 每个生成器（CDB / manifest / PCH）写前先比对，避免使下游 cache 失效。
+7. **Facade / workflow 归属可审计** —— `ue.lua` 只做公共上下文、registry 查询与命令入口；
+   target-specific 副作用编排必须落在 `lua/ue/workflows/<target>/`；`lua/ue/targets/<target>.lua`
+   只允许 pure plan/parser/policy contract，不得执行命令或 UI。`ue_platform_boundary` 的 Tree-sitter AST
+   contract 守门 façade / workflow / target 边界，`tests/cases/stability_spec.lua` 负责 `ue.lua`
+   numeric ratchet 与新 workflow 文件 800 行上限。
 → `README.md` §Conventions
 
 ### C5 — 符号解析分层契约
@@ -659,6 +765,8 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 任何 `.lua` 运行时代码或 `tests/` 改动，**完成前 MUST 跑对应范围回归并全绿**。按改动类型跑
 **最小必跑范围**（改动 → spec filter 映射），但 **① 提交/合并前必跑全量；② 影响面不确定升级到全量，不猜窄 filter**。
 新增功能 MUST 补 `*_spec.lua`；冻结清单（`commands_spec` 的 `UE_COMMANDS`、`structure_spec` 目录清单）随相关项变化同步。
+**回归红灯优先**：全量回归存在任何 FAIL 时，处置它（修复 / 立 change / 记录不处理理由）MUST 先于推进无关新工作；
+宿主相关失败 MUST 按**宿主能力守卫**用例（与 fail-closed 语义一致），MUST NOT 注入假可执行文件/假宿主让断言「碰巧通过」。
 **强制入口在根 `AGENTS.md` 的 Definition of Done**（Claude 侧经根 `CLAUDE.md` 的 `@AGENTS.md` 展开读同一内容）；映射速查在 `tests/AGENTS.md`；权威细则在 `docs/testing-regression.md`。
 → 根 `AGENTS.md` (Definition of Done); `docs/testing-regression.md`; `tests/AGENTS.md`
 
@@ -666,7 +774,8 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 
 每次落地的改动（即便一行补丁）**MUST 在 `docs/changelog.md` Unreleased 追加一条**，用既有模板
 （`### YYYY-MM-DD — 标题` + Task / Implemented / Pitfalls / Validation / Follow-ups）。Implemented 含具体
-文件路径与函数名；**Validation 写明所跑回归范围与结果**（与 C6 联动）。攒够 8–12 条或一项连贯工作收尾
+文件路径与函数名；**Validation 写明所跑回归范围与结果**（与 C6 联动）**以及本次 spec 一致性处置**
+（同步 spec / 立 change / 判定无 spec 影响，与 C9 联动）。攒够 8–12 条或一项连贯工作收尾
 即切片归档（见 C8）。
 → 根 `AGENTS.md` (Definition of Done); `docs/changelog.md` (Entry template / How to use)
 
@@ -675,10 +784,25 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 **触发**：按 semver——含 BREAKING → major、引入新能力 → minor、仅修复/小改 → patch；版本号续
 `v1.0.3` 不跳号。**产出物四件套（缺一不算 milestone）**：① 生成 `docs/release_vX.Y.Z.md`（沿用
 `docs/release_1.0.0.md` 格式）+ changelog Unreleased 切片归档 + Released 加交叉链接 + 清空 Unreleased；
-② milestone 前跑**全量回归门禁** `nvim --headless -l tests/run.lua` 全绿；③ 打 git tag `vX.Y.Z`
+② milestone 前跑**全量回归门禁** `nvim --headless -l tests/run.lua` 全绿，且确认所有已落地行为变更
+均已反映到 `openspec/specs/`（无未同步的 spec 漂移）；③ 打 git tag `vX.Y.Z`
 （**tag/commit 须用户确认**，遵守本仓 git 政策，不自动执行）；④ 若动了架构/子系统边界，同步
 `memory/` 与 `docs/architecture/overview.md`。
 → 根 `AGENTS.md` (Definition of Done); `docs/changelog.md` (Released); `docs/release_1.0.0.md` (格式范例)
+
+### C9 — spec 一致性属于完成定义（spec 是行为权威）
+
+`openspec/specs/<capability>/spec.md` 是**可观察行为的权威契约**。**SESSION START MUST 包含
+「读改动范围对应的 spec」一步**（按范围读，不遍历全部 spec；从 `memory/project_overview.md`
+子系统速查表的「治理 spec」列一步定位）。**改动落地前 MUST 满足 spec 与实现一致**：行为变更
+同步对应 spec 或立 change；**spec 落后于已验证正确的实现时反向更正 spec**；只改实现不动 spec
+的收尾不算完成。本文档与各目录本地规则**不得与 spec 冲突**（冲突以 spec 为准；冲突源于 spec
+陈旧则先更正 spec）。spec 与规则文档中的**仓内路径引用 MUST 真实存在**（`structure` filter 的
+spec 引用完整性用例守护）。强制力入口在根 `AGENTS.md` 的 Definition of Done 第 2 条。
+**禁止为让某一个 agent 生效而新增第四份并行入口文件**（Claude/Codex/pi 三端只从 `AGENTS.md`
+层级读取；各目录 `CLAUDE.md` 只能是 `@AGENTS.md` stub）。
+→ 根 `AGENTS.md` (Definition of Done); `openspec/specs/spec-authority-loop/spec.md`;
+  `memory/project_overview.md` (治理 spec 列); `tests/cases/structure_spec.lua`
 
 ---
 
@@ -686,10 +810,11 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 
 为让持续介入的 AI agent **从文件而非 chat 历史**发现规则，本仓提供：
 
-- **强制执行入口（单一内容源）**：根 `AGENTS.md` 是 Claude 与 GPT/Codex **共用的唯一内容源**
-  （SESSION START 协议：动代码前先读 `docs/CONSTRAINTS.md` → `memory/project_overview.md` →
-  当前目录本地规则；+ Definition of Done）。根 `CLAUDE.md` 内容仅为 `@AGENTS.md` 导入 stub
-  （Claude 只读 `CLAUDE.md`，由该 import 展开读同一内容；Codex 原生读 `AGENTS.md`）。
+- **强制执行入口（单一内容源）**：根 `AGENTS.md` 是 Claude Code / Codex / pi **三端共用的唯一内容源**
+  （SESSION START 协议：动代码前先读探针反馈 → `docs/CONSTRAINTS.md` → `memory/project_overview.md` →
+  当前目录本地规则 → **改动范围对应的 `openspec/specs/<capability>/spec.md`**；+ Definition of Done）。
+  根 `CLAUDE.md` 内容仅为 `@AGENTS.md` 导入 stub（Claude 只读 `CLAUDE.md`，由该 import 展开读同一
+  内容；Codex 与 pi 原生读 `AGENTS.md`）。**禁止为让某一个 agent 生效而新增第四份并行入口文件。**
 - **递归本地规则（单一内容源）**：每个主要目录一份 `AGENTS.md`（权威内容源），同目录一份
   `CLAUDE.md`（内容为 `@AGENTS.md` stub）。子级只写相对父级的增量；某目录无本地规则时，
   适用**最近祖先目录**的规则（回落语义）。**只维护 AGENTS.md 一个文件，改一次两端同步**——
@@ -699,8 +824,14 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
   - `decisions/README.md` — 架构决策(ADR)导航（权威正文在 `docs/plans/`）。
   - `lessons/README.md` — 平台怪癖/调试硬知识导航（权威在本文件 §二）。
   - `docs/architecture/overview.md` — 架构总览（子系统/数据流/平台层/构建流水线/归属边界）。
+- **行为契约权威（spec）**：`openspec/specs/<capability>/spec.md` 是**可观察行为的权威**；
+  本文档与各目录本地规则**不得与之冲突**（冲突时以 spec 为准；若冲突源于 spec 陈旧，
+  先更正 spec 再对齐规则）。从「改动哪个目录」一步定位治理它的 spec：见
+  `memory/project_overview.md` 子系统速查表的**「治理 spec」列**（与 `tests/AGENTS.md` 的
+  CHANGE-TO-FILTER MAP 同源对齐）。权威机制见 `openspec/specs/spec-authority-loop/spec.md`。
 - **可发现性回归**：`tests/cases/structure_spec.lua` 守护「目录规则存在（AGENTS.md 源 +
-  CLAUDE.md stub）+ 知识库结构完整 + 内链不悬空 + 政策可发现」，跑 `structure` filter。
+  CLAUDE.md stub）+ 知识库结构完整 + 内链不悬空 + spec 引用不悬空 + capability 覆盖映射
+  可解析 + 政策可发现」，跑 `structure` filter。
 
 ---
 
@@ -717,8 +848,13 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 4. **新增子系统目录 / 迁移知识** → 为新目录补一份本地 `AGENTS.md`（内容源，声明继承父级）
    **并补一个 `CLAUDE.md`（内容为 `@AGENTS.md` stub）**，
    在对应知识区 README 登记；`structure_spec` 的目录清单同步。
-5. **新增 spec / 改命令清单** → 同步 `tests/AGENTS.md` 与 `docs/testing-regression.md` 的 filter 映射，
-   及 `commands_spec` 冻结清单。
+5. **新增 spec / 改命令清单** → 同步 `tests/AGENTS.md` 与 `docs/testing-regression.md` 的 filter 映射、
+   `memory/project_overview.md` 的「治理 spec」列，及 `commands_spec` 冻结清单。
+5b. **改动改变了 spec 已声明的可观察行为** → 同步更新对应 `openspec/specs/<capability>/spec.md`
+   或立一个承载该 spec 变更的 change；若发现 spec 落后于已验证正确的实现，则**反向更正 spec**。
+   两种处置都必须在 `docs/changelog.md` 的 Validation 字段留痕（见 C7）。
+5c. **spec 或规则文档引用的仓内文件被删除/重命名/归档** → 同步更正该引用（或更正 spec 的产出物
+   要求）；`structure_spec` 的 spec 引用完整性用例守护「引用不悬空」。
 6. **milestone 收尾** → 须同步 `memory/` 与 `docs/architecture/overview.md`（若动架构），并按 C8 产出四件套。
 7. **出处优先**: 不在此复制原文；摘要与出处冲突时以出处为准。删除某 workaround/坑
    时，对应行随 `git rm` 一并删除。

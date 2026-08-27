@@ -9,6 +9,20 @@ return function(M, core)
   local unix_now = core.h.unix_now
   local write_json_file = core.h.write_json_file
   local ensure_index_state = core.h.ensure_index_state
+
+  local function resolve_python()
+    local resolved = _uplat.resolve_tool({
+      name = "python",
+      env = { "UE_PYTHON" },
+      driver_candidates = function(driver)
+        return driver.python_candidates()
+      end,
+    })
+    if resolved.ok then
+      return resolved.path, resolved
+    end
+    return nil, resolved
+  end
   local save_index_state = core.h.save_index_state
   local module_key_from_path = core.h.module_key_from_path
   local sorted_module_records = core.h.sorted_module_records
@@ -95,6 +109,20 @@ end
 -- groups are used when fully proven; exact per-file entries retain coverage
 -- elsewhere. Every completed phase is additive; current/hot entries lead the
 -- queue for responsiveness but can never remove the broad full baseline.
+local function clangd_cdb_entry(entry)
+  local published = {
+    directory = entry.directory,
+    file = entry.file,
+  }
+  if type(entry.arguments) == "table" then
+    published.arguments = vim.deepcopy(entry.arguments)
+  elseif type(entry.command) == "string" then
+    published.command = entry.command
+  end
+  if entry.output ~= nil then published.output = entry.output end
+  return published
+end
+
 M.publish_semantic_cdb = function(ctx, state, generation)
   local base_path = M.base_compile_commands_path(ctx)
   if not base_path or not _ufs.is_file(base_path) then
@@ -108,7 +136,11 @@ M.publish_semantic_cdb = function(ctx, state, generation)
       local key = file:lower()
       if key ~= "" and not seen[key] then
         seen[key] = true
-        merged[#merged + 1] = entry
+        -- Phase artifacts retain nvim_ue_members/nvim_ue_module_root for the
+        -- semantic sidecar. clangd's JSONCompilationDatabase parser rejects
+        -- unknown keys, so its published view must contain standard fields
+        -- only or the entire controlled BackgroundIndex silently disappears.
+        merged[#merged + 1] = clangd_cdb_entry(entry)
       end
     end
   end
@@ -158,70 +190,70 @@ end
 -- exact-command transport sees the already-partitioned base. Failure here is
 -- non-fatal: we surface a WARN and leave the base CDB untouched (clangd
 -- continues to work, just with the old multi-group mix).
-M.partition_base_cdb = function(ctx, opts)
+local function partition_plan(ctx, opts)
   opts = opts or {}
   local base = M.base_compile_commands_path(ctx)
-  if not base then
-    return false, "no base compile_commands.json"
+  if not base then return nil, "no base compile_commands.json" end
+  local script = fs.join(vim.fn.fnamemodify(vim.fn.stdpath("config"), ":p"),
+    "tools", "cdb_partition.py")
+  if not _ufs.is_file(script) then return nil, "cdb_partition.py missing at " .. script end
+  local python, resolved = resolve_python()
+  if not python then
+    return nil, "python unavailable for cdb_partition.py ("
+      .. tostring(resolved and resolved.reason or "tool-not-found") .. ")"
   end
+  local command = { python, script, base }
+  if opts.active then vim.list_extend(command, { "--active", opts.active }) end
+  if opts.out_dir then vim.list_extend(command, { "--out-dir", opts.out_dir }) end
+  local env, env_list = vim.fn.environ(), {}
+  env.PYTHONPATH, env.PYTHONHOME = nil, nil
+  for key, value in pairs(env) do env_list[#env_list + 1] = key .. "=" .. value end
+  return { command = command, env = env_list }
+end
 
-  local nvim_root = vim.fn.fnamemodify(vim.fn.stdpath("config"), ":p")
-  local script = fs.join(nvim_root, "tools", "cdb_partition.py")
-  if not _ufs.is_file(script) then
-    return false, "cdb_partition.py missing at " .. script
-  end
+local function partition_result(result)
+  if result.code == 0 then return true, (result.stdout or ""):gsub("%s+$", "") end
+  if result.code == 3 then return true, "single-group CDB, no partition needed" end
+  return false, ("cdb_partition exit=%d stderr=%s"):format(
+    result.code or -1, (result.stderr or ""):gsub("%s+$", ""))
+end
 
-  -- Reuse the same Python probe sequence used elsewhere in this file for the
-  -- ccjson / pch subprocesses (Python 3.12 absolute path on Windows to dodge
-  -- PYTHONHOME contamination from outer shells).
-  local python
-  if _uplat.is_windows then
-    local cands = {
-      vim.env.UE_PYTHON or "",
-      vim.fn.expand("~/AppData/Local/Programs/Python/Python312/python.exe"),
-      vim.fn.expand("~/AppData/Local/Programs/Python/Python313/python.exe"),
-      "C:/Python312/python.exe",
-      "C:/Python313/python.exe",
-    }
-    for _, c in ipairs(cands) do
-      if c and c ~= "" and _ufs.is_file(c) then python = c; break end
-    end
-    python = python or "python"
-  else
-    python = "python3"
-  end
+-- Explicit blocking twin retained only for :UEPrepareSync/headless debugging.
+M.partition_base_cdb = function(ctx, opts)
+  local plan, err = partition_plan(ctx, opts)
+  if not plan then return false, err end
+  return partition_result(vim.system(plan.command, {
+    env = plan.env, text = true, timeout = 120000,
+  }):wait())
+end
 
-  local cmd = { python, script, base }
-  if opts.active then
-    table.insert(cmd, "--active")
-    table.insert(cmd, opts.active)
-  end
-  if opts.out_dir then
-    table.insert(cmd, "--out-dir")
-    table.insert(cmd, opts.out_dir)
-  end
-
-  -- Scrub PYTHONPATH/PYTHONHOME (same reason as the ccjson subprocess).
-  local env = vim.fn.environ()
-  env.PYTHONPATH = nil
-  env.PYTHONHOME = nil
-  local env_list = {}
-  for k, v in pairs(env) do
-    table.insert(env_list, k .. "=" .. v)
-  end
-
-  local result = vim.system(cmd, { env = env_list, text = true, timeout = 120000 }):wait()
-  if result.code == 0 then
-    return true, (result.stdout or ""):gsub("%s+$", "")
-  end
-  if result.code == 3 then
-    -- "no classifiable groups" -- single-config CDB, nothing to do.
-    return true, "single-group CDB, no partition needed"
-  end
-  local msg = ("cdb_partition exit=%d stderr=%s"):format(
-    result.code or -1,
-    (result.stderr or ""):gsub("%s+$", ""))
-  return false, msg
+-- Normal UI path: admitted and fully asynchronous.
+M.partition_base_cdb_async = function(ctx, opts, on_done)
+  on_done = on_done or function() end
+  local plan, err = partition_plan(ctx, opts)
+  if not plan then on_done(false, err); return nil, err end
+  local admission = require("utils.host_admission")
+  local _, _, _, control = admission.run_when_allowed({
+    name = "CDB partition",
+    start = function()
+      local handle = vim.system(plan.command, {
+        env = plan.env, text = true, timeout = 120000,
+      }, function(result)
+        vim.schedule(function() on_done(partition_result(result)) end)
+      end)
+      pcall(function()
+        require("utils.task_registry").register({
+          name = "UE CDB partition", group = "ue", kind = "system",
+          handle = handle, started_at = os.time(),
+        })
+      end)
+      return function()
+        if handle and not handle:is_closing() then pcall(handle.kill, handle, 15) end
+      end
+    end,
+    on_error = function(reason) on_done(false, tostring(reason)) end,
+  })
+  return control
 end
 
 -- Read the partition manifest to know what groups exist + which is active.
@@ -409,24 +441,9 @@ M.build_phase_async = function(ctx, phase)
   -- pointing at a different minor (3.11/3.14) — child explodes with
   -- `_sre.MAGIC mismatch` from the stdlib loader. Absolute path + scrubbed
   -- env is the only reliable combo.
-  local python
-  if _uplat.is_windows then
-    -- Probe well-known per-user / system Python 3.12 install locations.
-    -- Falls back to PATH `python` if nothing matches (caller can override
-    -- via UE_PYTHON env var for non-standard installs).
-    local candidates = {
-      vim.env.UE_PYTHON or "",
-      vim.fn.expand("~/AppData/Local/Programs/Python/Python312/python.exe"),
-      vim.fn.expand("~/AppData/Local/Programs/Python/Python313/python.exe"),
-      "C:/Python312/python.exe",
-      "C:/Python313/python.exe",
-    }
-    for _, p in ipairs(candidates) do
-      if p and p ~= "" and _ufs.is_file(p) then python = p; break end
-    end
-    python = python or "python"
-  else
-    python = "python3"
+  local python, resolved = resolve_python()
+  if not python then
+    return fail_before_spawn("python unavailable for index build (" .. tostring(resolved and resolved.reason or "tool-not-found") .. ")")
   end
 
   local tools_dir = vim.fn.stdpath("config") .. "/tools"
@@ -478,12 +495,54 @@ M.build_phase_async = function(ctx, phase)
     finished_at = 0,
     message = string.format("%s modules=%d", phase, #selected_keys),
     active_index = state.build and state.build.active_index or "",
+    -- Owner identity makes "running" falsifiable across processes: without it a
+    -- build interrupted by a Neovim exit stays "running" forever and nothing can
+    -- tell an in-flight build apart from an orphaned record.
+    owner_pid = vim.fn.getpid(),
   }
   save_index_state(ctx, state)
   core.deps.invalidate_status_cache()
   core.deps.refresh_statusline()
 
   RT.job = { root_key = root_key, phase = phase }
+
+  -- Visible progress for the controlled index build (P5-compliant).
+  --
+  -- WHY: this build is scheduled automatically by every UEPrepare completion
+  -- path, and `full` processes ~16k TUs / writes ~270MB -- minutes of work. It
+  -- previously ran as a completely silent fire-and-forget child: no progress, no
+  -- log, and the failure branch did not even notify. So when it was interrupted
+  -- (window closed) or failed, the user saw prepare finish, reasonably assumed
+  -- the semantic layer was ready, and then got a degraded `gd` with nothing on
+  -- screen explaining why. Delivery must be observable.
+  --
+  -- Uses the same fidget channel as UEPrepare (bottom-right, alongside LSP
+  -- progress) rather than async_launcher's floating window: this task starts on
+  -- its own, so it must inform without stealing screen space. P5 is honored --
+  -- start + coarse updates driven by real child output, no periodic ticker, and
+  -- it disappears on success.
+  local ok_fidget, fidget_progress = pcall(require, "fidget.progress")
+  local progress_handle
+  if ok_fidget then
+    progress_handle = fidget_progress.handle.create({
+      title = "UE index",
+      message = string.format("%s: %d module(s) starting...", phase, #selected_keys),
+      lsp_client = { name = "ue.index" },
+      percentage = nil, -- indeterminate: the child does not report a total
+    })
+  end
+  local function progress_report(msg)
+    if progress_handle then
+      progress_handle.message = string.format("%s: %s", phase, msg)
+    end
+  end
+  local function progress_finish(msg)
+    if not progress_handle then return end
+    if msg then progress_handle.message = msg end
+    pcall(function() progress_handle:finish() end)
+    progress_handle = nil
+  end
+
   -- Defensive env scrub: if our parent (hermes/wt/IDE) injected PYTHONHOME
   -- pointing at a different python minor than `python` on PATH, the child
   -- explodes with `_sre.MAGIC mismatch` from the stdlib loader. Strip it.
@@ -496,7 +555,61 @@ M.build_phase_async = function(ctx, phase)
   child_env.PYTHONPATH = ""
   child_env.PYTHONSTARTUP = ""
   local t_build_0 = vim.uv.hrtime()
-  vim.system(cmd, { text = true, cwd = ctx.engine_root, env = child_env }, function(result)
+
+  -- Stream child output into the progress message. jobstart/vim.system deliver
+  -- arbitrary chunks that are NOT line-aligned, so keep a pending buffer and
+  -- only surface complete lines (same lesson as K51's pipeline logging).
+  local pending_out = ""
+  local last_line = ""
+  -- The child prints many internal counts; forwarding them verbatim was actively
+  -- misleading. `[input] 16178 per-file entries` is the size of the LSP CDB (one
+  -- entry per file so clangd can answer "how do I compile THIS buffer"), not the
+  -- indexing workload -- super-unity compresses 429 unity TUs into 9 super-TUs
+  -- (47.7x) and only those 9 are handed to clangd-indexer. Surfacing 16178 made
+  -- it look as if super-unity were not working at all (reported 2026-08-26).
+  --
+  -- So only forward lines that describe real progress, and label the counts that
+  -- would otherwise be read as "units to index".
+  local function progress_line(line)
+    -- Step banners and indexer progress are the genuinely informative ones.
+    if line:match("^%[%d+/%d+%]") or line:match("^%[indexer%]") or line:match("^%[super%-unity%]") then
+      return line
+    end
+    local n = line:match("^%[input%] (%d+) per%-file entries")
+    if n then
+      return ("reading %s LSP compile entries (indexing uses super-unity TUs)"):format(n)
+    end
+    -- Everything else stays in the log; the progress line should not scroll noise.
+    return nil
+  end
+
+  local function consume(chunk)
+    if not chunk or chunk == "" then return end
+    pending_out = pending_out .. chunk
+    while true do
+      local nl = pending_out:find("\n")
+      if not nl then break end
+      local line = fs.trim(pending_out:sub(1, nl - 1))
+      pending_out = pending_out:sub(nl + 1)
+      if line ~= "" then
+        last_line = line
+        local shown = progress_line(line)
+        if shown then
+          vim.schedule(function()
+            progress_report(shown:sub(1, 120))
+          end)
+        end
+      end
+    end
+  end
+
+  vim.system(cmd, {
+    text = true,
+    cwd = ctx.engine_root,
+    env = child_env,
+    stdout = function(_, data) consume(data) end,
+    stderr = function(_, data) consume(data) end,
+  }, function(result)
     local elapsed_s = (vim.uv.hrtime() - t_build_0) / 1e9
     vim.schedule(function()
       local live_state = ensure_index_state(ctx)
@@ -517,17 +630,43 @@ M.build_phase_async = function(ctx, phase)
         controlled_background = true,
         finished_at = unix_now(),
       }
+      -- MANIFEST LANDS WITH THE ARTIFACT, not after the whole chain succeeds.
+      --
+      -- WHY: the manifest is the ONLY on-disk proof of which build a given index
+      -- artifact belongs to, and it is what lets a later process recover readiness
+      -- without re-running UEPrepare (spec: "Prepared tuple artifacts survive a
+      -- Nvim restart"). Writing it only after selection/promotion/clangd-restart
+      -- all succeed meant a produced artifact could sit on disk with no way to
+      -- prove its provenance -- exactly the state found on this machine: 261MB of
+      -- controlled CDB present, zero manifests anywhere, stats still {0,0,0}.
+      --
+      -- The artifact existing is sufficient evidence to describe it. Downstream
+      -- failures are recorded separately and MUST NOT erase this record.
+      local manifest = nil
       if ok_result then
-        local prev_fingerprint = live_state.index_selection and live_state.index_selection.artifact_fingerprint or ""
-        local prev_active_index = live_state.build and live_state.build.active_index or ""
-        local manifest = make_index_manifest(ctx, live_state, phase, out_idx, selected_keys, {
+        manifest = make_index_manifest(ctx, live_state, phase, out_idx, selected_keys, {
           base_cdb_path = M.base_compile_commands_path(ctx),
           background_cdb_path = background_cdb,
           index_kind = "controlled-background",
           completed_at = live_state.index_timings[phase].finished_at,
         })
         live_state.index_artifacts[phase] = manifest
-        write_json_file(index_manifest_path(out_idx), manifest)
+        local ok_write = write_json_file(index_manifest_path(out_idx), manifest)
+        if not ok_write then
+          -- Without the manifest the artifact is unrecoverable next session, so a
+          -- failed write must be visible rather than silently degrading.
+          pcall(function()
+            require("utils.log").error_ctx("ue.index", "failed to persist index manifest", {
+              phase = phase,
+              path = index_manifest_path(out_idx),
+            })
+          end)
+        end
+      end
+
+      if ok_result then
+        local prev_fingerprint = live_state.index_selection and live_state.index_selection.artifact_fingerprint or ""
+        local prev_active_index = live_state.build and live_state.build.active_index or ""
         local generation = generation_for_context(ctx, { base_cdb_path = M.base_compile_commands_path(ctx) })
         local selection = select_active_artifact(live_state, generation)
         local snapshot = persist_index_selection(live_state, selection, generation)
@@ -557,6 +696,11 @@ M.build_phase_async = function(ctx, phase)
           M.maybe_restart_clangd_for_index()
         end
         if not (selection and promoted) then
+          -- Artifacts were produced but delivery did not complete
+          -- (manifest/selection/promotion). This is a FAILURE, not a quiet
+          -- partial success: the gate consumes persisted readiness, so leaving it
+          -- unreported is exactly how a 270MB full.json can sit on disk while
+          -- `gd` keeps degrading with no explanation.
           ok_result = false
         end
       else
@@ -570,6 +714,35 @@ M.build_phase_async = function(ctx, phase)
         }
         save_index_state(ctx, live_state)
       end
+
+      -- Failure MUST be visible. Previously both failure branches only wrote
+      -- status="error" into a JSON file: no notify, no log, and no index build
+      -- log has ever existed in this repository. The user therefore had no way
+      -- to learn that the semantic index they were implicitly waiting for had
+      -- failed -- the whole reason this defect stayed hidden.
+      if ok_result then
+        progress_finish()
+      else
+        local detail = fs.trim(live_state.build and live_state.build.message or "")
+        if detail == "" then detail = last_line end
+        pcall(function()
+          require("utils.log").error_ctx("ue.index", "controlled index build failed", {
+            phase = phase,
+            exit_code = result.code,
+            modules = #selected_keys,
+            elapsed_s = math.floor(elapsed_s * 10 + 0.5) / 10,
+            detail = detail ~= "" and detail:sub(1, 400) or nil,
+          })
+        end)
+        progress_finish(string.format("%s FAILED", phase))
+        vim.notify(string.format(
+          "UE index: %s build failed (exit %s) -- C++ definition navigation stays degraded.\n%s\nSee :NvimLog for details.",
+          phase,
+          tostring(result.code),
+          detail ~= "" and detail:sub(1, 200) or "no output captured"),
+          vim.log.levels.ERROR, { title = "UE index" })
+      end
+
       core.deps.invalidate_status_cache()
       core.deps.refresh_statusline()
       file_lock.release(phase_lease)
@@ -605,6 +778,12 @@ M.try_start_queued_build = function()
     if not picked_phase or not picked_ctx or not picked_state then
       break
     end
+    -- Queue draining is a second start path and MUST share the scheduler gate.
+    -- If denied, the gate re-arms the phase; keep its persisted queue entry.
+    if M.admit_index_phase_start
+        and not M.admit_index_phase_start(picked_ctx, picked_phase) then
+      break
+    end
     local ok_started = M.build_phase_async(picked_ctx, picked_phase)
     if ok_started then
       started = true
@@ -614,46 +793,5 @@ M.try_start_queued_build = function()
     save_index_state(picked_ctx, picked_state)
   end
   return started
-end
-
-M.schedule_index_phase = function(ctx, phase, delay_ms)
-  if not ctx then
-    return
-  end
-  local state = ensure_index_state(ctx)
-  state.queue[phase] = unix_now()
-  save_index_state(ctx, state)
-  local timer_key = core.deps.status_root_key(ctx) .. "::" .. phase
-  if RT.timers[timer_key] then
-    RT.timers[timer_key]:stop()
-    RT.timers[timer_key]:close()
-    RT.timers[timer_key] = nil
-  end
-  local timer = vim.uv.new_timer()
-  RT.timers[timer_key] = timer
-  timer:start(delay_ms, 0, vim.schedule_wrap(function()
-    if RT.timers[timer_key] then
-      RT.timers[timer_key]:stop()
-      RT.timers[timer_key]:close()
-      RT.timers[timer_key] = nil
-    end
-    M.build_phase_async(ctx, phase)
-  end))
-end
-
-M.schedule_index_refresh = function(ctx, opts)
-  opts = opts or {}
-  if not ctx or not M.base_compile_commands_path(ctx) then
-    return
-  end
-  if opts.current ~= false then
-    M.schedule_index_phase(ctx, "current", opts.current_delay_ms or RT.debounce_current_ms)
-  end
-  if opts.hot then
-    M.schedule_index_phase(ctx, "hot", opts.hot_delay_ms or RT.debounce_hot_ms)
-  end
-  if opts.full then
-    M.schedule_index_phase(ctx, "full", opts.full_delay_ms or RT.idle_cold_ms)
-  end
 end
 end

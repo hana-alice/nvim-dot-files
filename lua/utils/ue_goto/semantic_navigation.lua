@@ -53,10 +53,28 @@ local function semantic_terminal_notice(sym, result)
     ["target-is-current-declaration"] = "declaration has no proven out-of-line definition",
     ["stale-request"] = "semantic request became stale",
   })[reason] or reason
-  vim.notify(string.format("C++ definition %s%s%s",
+
+  -- Actionable remedy for the readiness family. A bare "unavailable" leaves the
+  -- user with no next step, which is how the original report ended up as "this
+  -- can obviously be located, why is it asking me to choose". The controlled
+  -- index is delivered BY UEPrepare -- users must not be expected to remember
+  -- platform-specific index commands, so the hint points at the habitual flow.
+  local remedy = ({
+    ["index-provider-not-ready"] =
+      "semantic index has not been delivered yet -- if :UEPrepare just finished, the index build may still be running (watch its progress); if it failed, see :NvimLog",
+    ["index-stale-for-module"] =
+      "semantic index is stale for this module -- re-run :UEPrepare after the build",
+    ["index-incomplete"] =
+      "index coverage has not reached this definition yet -- wait for the running index build to finish",
+    ["active-compile-command-missing"] =
+      "no compile command for this file in the active database -- re-run :UEPrepare for the current platform/configuration",
+  })[reason]
+
+  vim.notify(string.format("C++ definition %s%s%s%s",
     tostring(status),
     sym and sym ~= "" and (" for `" .. sym .. "`") or "",
-    label ~= "" and (": " .. tostring(label)) or ""),
+    label ~= "" and (": " .. tostring(label)) or "",
+    remedy and ("\n" .. remedy) or ""),
     status == "unavailable" and vim.log.levels.WARN or vim.log.levels.INFO,
     { title = "C++ definition", timeout = 5000 })
 end
@@ -92,6 +110,35 @@ local function record_semantic_probe(result, tx)
       process_rss_bytes = tonumber(metrics.process_rss_bytes),
       generation_class = generation_class,
     })
+end
+
+--- Readiness outranks the sidecar's own verdict when classifying a failure.
+---
+--- Pure and exposed so the invariant is provable headless instead of only
+--- reachable through a live sidecar. See the call site in `semantic_failure`
+--- for the full rationale; the short version: `semantic_sidecar` reports
+--- "ambiguous-context" whenever several contexts merely failed differently, and
+--- `ambiguous-context` is the one terminal state that legitimately shows the
+--- user a chooser -- so an index-readiness failure was being rendered as a
+--- pick-list of unity TUs for symbols that have exactly one definition (P12).
+--- @param state string terminal state proposed by the sidecar
+--- @param stage string
+--- @param reason string
+--- @param index table|nil transaction index snapshot ({ readiness, freshness, ... })
+--- @return string state, string stage, string reason
+function M._apply_readiness_override(state, stage, reason, index)
+  index = index or {}
+  if state ~= "ambiguous-context" then
+    return state, stage, reason
+  end
+  if index.readiness == "ready" then
+    return state, stage, reason
+  end
+  local stale = index.readiness == "stale"
+    or index.freshness == "stale"
+    or index.freshness == "stale-for-module"
+  return "unavailable", "context",
+    stale and "index-stale-for-module" or "index-provider-not-ready"
 end
 
 function M.install(owner, deps)
@@ -255,10 +302,52 @@ function M.install(owner, deps)
       end
       local state = response and response.state or "unavailable"
       if not transaction.TERMINAL_STATES[state] then state = "unavailable" end
+
+      -- READINESS OUTRANKS THE SIDECAR'S OWN VERDICT.
+      --
+      -- semantic_sidecar aggregates per-context outcomes and reports
+      -- "ambiguous-context" whenever several contexts merely failed differently
+      -- (semantic_sidecar.lua: has_ambiguous and not has_unavailable). Trusting
+      -- that verbatim mislabels an index-readiness problem as genuine ambiguity,
+      -- and "ambiguous" is the one state that legitimately shows the user a
+      -- chooser -- so a symbol with exactly ONE definition ends up presented as
+      -- a pick-list of unity TUs (observed on WrapAroundAllocateMemory, whose
+      -- module contains a single out-of-line definition).
+      --
+      -- ambiguous-context means "multiple PROVEN contexts resolve to different
+      -- entities". When the controlled index never got delivered there are no
+      -- proven contexts at all, so the honest state is `unavailable` with a
+      -- readiness reason (P12: Clang semantic failure must fail honestly; text
+      -- hits cannot distinguish overloads, same-name symbols or namespaces).
+      state, stage, reason = M._apply_readiness_override(state, stage, reason, tx.index)
+
+      -- Contexts are evidence for an ambiguity the user can actually act on: each
+      -- one must have RESOLVED to a real target. Failure records are not choices.
+      -- The sidecar only reaches `ambiguous-context` from its `#resolved > 1`
+      -- branch now, but this stays defensive: a chooser fed with unresolved
+      -- contexts is exactly the "pick one of these unity cpp files" symptom, and
+      -- P12 forbids presenting text/TU guesses as definition targets.
+      local ambiguous_contexts = nil
+      if state == "ambiguous-context" and response and type(response.contexts) == "table" then
+        local resolved_only = {}
+        for _, c in ipairs(response.contexts) do
+          if type(c) == "table" and c.state == "resolved" then
+            resolved_only[#resolved_only + 1] = c
+          end
+        end
+        if #resolved_only > 1 then
+          ambiguous_contexts = resolved_only
+        else
+          -- Not a real ambiguity after filtering: fail honestly instead of
+          -- offering a list the user cannot reason about.
+          state = "unavailable"
+        end
+      end
+
       return transaction.terminal(state, stage, reason, {
         detail = raw ~= "" and raw or nil,
         diagnostics = response and response.diagnostics,
-        contexts = response and response.contexts,
+        contexts = ambiguous_contexts,
         metrics = response and response.metrics,
       })
     end
@@ -547,137 +636,101 @@ function M.install(owner, deps)
       return
     end
 
-    semantic.prove_source({
-      source = ref_file,
-      environment = environment,
-      snapshot = snapshot,
-      line = snapshot.cursor[1],
-      column = snapshot.cursor[2] + 1,
-    }, function(proof)
-      local current, stale_reason = request_is_current(proof)
-      if not current then
-        finish_stale(stale_reason)
+    local clients = vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/definition" })
+    if not clients or vim.tbl_isempty(clients) then
+      finish(transaction.terminal("unavailable", "provider", "provider-method-unsupported"))
+      return
+    end
+
+    -- Source TUs already have an exact command transported to clangd from the
+    -- controlled active CDB. Query clangd at the immutable cursor snapshot;
+    -- do not make every gd parse the 200MB+ CDB again in the libclang sidecar.
+    dtrace("semantic provider=clangd request=symbolInfo+definition context=source-exact-command")
+    provider.async_clangd_symbol_info(bufnr, function(symbol_info)
+      local identity_current, identity_stale = request_is_current(symbol_info)
+      if not identity_current then
+        finish_stale(identity_stale)
         return
       end
-      if not proof or proof.state ~= "resolved" then
-        finish(semantic_failure(proof or {
-          state = "unavailable",
-          reason = "active-compile-command-missing",
-        }, "context"))
+      local usr = symbol_info.usr
+      local clangd_client_ids = symbol_info.client_ids
+      local provider_terminal = provider_failure(symbol_info)
+      if provider_terminal then finish(provider_terminal); return end
+      if not usr then
+        finish(transaction.terminal("invalid-semantic-context", "entity",
+          symbol_info.reason == "identity-conflict" and "identity-conflict" or "identity-missing", {
+            provider = "clangd",
+            provider_result = symbol_info,
+          }))
         return
-      end
-      local declaration = semantic_location(proof.declaration)
-      local definition = semantic_location(proof.definition)
-      local role = transaction.subject_role(tx, declaration, definition)
-      if definition then
-        jump_resolved(definition, "clangd·semantic", {
-          provider = "libclang",
-          destination_role = "definition",
-          subject_role = role,
-        })
-        return
-      end
-      local authoritative_usr = proof.usr
-      local function clangd_cross_tu()
-        local clients = vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/definition" })
-        if not clients or vim.tbl_isempty(clients) then
-          finish(transaction.terminal("unavailable", "provider", "provider-method-unsupported"))
-          return
-        end
-        dtrace("semantic provider=clangd request=symbolInfo+definition context=%s",
-          tostring(proof.context_id or "?"))
-        provider.async_clangd_symbol_info(bufnr, function(symbol_info)
-          local identity_current, identity_stale = request_is_current()
-          if not identity_current then
-            finish_stale(identity_stale)
-            return
-          end
-          local usr = symbol_info.usr
-          local clangd_client_ids = symbol_info.client_ids
-          local provider_terminal = provider_failure(symbol_info)
-          if provider_terminal then finish(provider_terminal); return end
-          if not usr then
-            dtrace("semantic provider=clangd context=%s state=invalid-semantic-context usr=missing",
-              tostring(proof.context_id or "?"))
-            finish(transaction.terminal("invalid-semantic-context", "entity",
-              symbol_info.reason == "identity-conflict"
-                and "identity-conflict" or "identity-missing", {
-                provider = "clangd",
-                subject_role = role,
-                provider_result = symbol_info,
-              }))
-            return
-          end
-          if authoritative_usr and usr ~= authoritative_usr then
-            finish(transaction.terminal("invalid-semantic-context", "entity", "identity-conflict", {
-              provider = "clangd",
-              subject_role = role,
-              identity = authoritative_usr,
-              provider_result = symbol_info,
-            }))
-            return
-          end
-          provider.async_lsp_request(bufnr, "textDocument/definition", function(definition_result)
-            local still_current, reason = request_is_current()
-            if not still_current then
-              finish_stale(reason)
-              return
-            end
-            local definition_failure = provider_failure(definition_result)
-            if definition_failure then finish(definition_failure); return end
-            local locs = transaction.filter_definition_locations(
-              tx, definition_result.locations or {}, declaration)
-            if #locs ~= 1 then
-              dtrace("semantic provider=clangd state=invalid-semantic-context n=%d", #locs)
-              if #locs == 0 then
-                declaration_fallback(role, declaration, {
-                  provider = "clangd",
-                  subject_role = role,
-                  stage = "destination",
-                  reason = "definition-not-found",
-                  provider_result = definition_result,
-                  origin_context = proof.origin_context,
-                })
-                return
-              end
-              finish(transaction.terminal("unavailable", "destination", "multiple-definitions", {
-                provider = "clangd",
-                subject_role = role,
-                provider_result = definition_result,
-              }))
-              return
-            end
-            local target_path = location_mod.location_path(locs[1]):lower()
-            if M.CPP_HEADER_EXTS[target_path:match("%.([^./\\]+)$") or ""] then
-              if proof.origin_context then
-                local lineage = vim.deepcopy(proof.origin_context)
-                lineage.subject_membership = { [target_path] = true }
-                semantic.note_origin(snapshot.winid, lineage, environment.build_fingerprint)
-              end
-            end
-            dtrace("semantic provider=clangd context=%s usr=%s state=resolved",
-              tostring(proof.context_id or "?"), tostring(usr))
-            jump_resolved(locs[1], "clangd·semantic", {
-              provider = "clangd",
-              destination_role = "definition",
-              subject_role = role,
-              identity = usr,
-            })
-          end, {
-            client_ids = clangd_client_ids,
-            snapshot = tx,
-            structured = true,
-            compile_command_source = proof.origin_tu,
-          })
-        end, {
-          snapshot = tx,
-          structured = true,
-          compile_command_source = proof.origin_tu,
-        })
       end
 
-      lookup_module_definition(authoritative_usr, role, clangd_cross_tu)
-    end)
+      provider.async_lsp_request(bufnr, "textDocument/definition", function(definition_result)
+        local still_current, reason = request_is_current(definition_result)
+        if not still_current then
+          finish_stale(reason)
+          return
+        end
+        local definition_failure = provider_failure(definition_result)
+        if definition_failure then finish(definition_failure); return end
+        local locs = transaction.filter_definition_locations(
+          tx, definition_result.locations or {}, nil)
+        if #locs == 0 then
+          finish(transaction.terminal("unavailable", "index", definition_miss_reason(), {
+            provider = "clangd",
+            identity = usr,
+            provider_result = definition_result,
+          }))
+          return
+        end
+        if #locs > 1 then
+          finish(transaction.terminal("unavailable", "destination", "multiple-definitions", {
+            provider = "clangd",
+            identity = usr,
+            provider_result = definition_result,
+          }))
+          return
+        end
+
+        local target_path = location_mod.location_path(locs[1]):lower()
+        if M.CPP_HEADER_EXTS[target_path:match("%.([^./\\]+)$") or ""]
+            and type(symbol_info.exact_command) == "table" then
+          local exact = symbol_info.exact_command
+          local compile = {
+            directory = exact.workingDirectory,
+            file = ref_file,
+            argv = vim.deepcopy(exact.compilationCommand or {}),
+          }
+          local compile_fingerprint = vim.fn.sha256(vim.json.encode(compile))
+          local lineage = {
+            context_id = compile_fingerprint,
+            origin_tu = ref_file,
+            cdb_dir = environment.cdb_dir,
+            compile = compile,
+            compile_command_fingerprint = compile_fingerprint,
+            subject_membership = { [target_path] = true },
+          }
+          semantic.note_origin(snapshot.winid, lineage, environment.build_fingerprint)
+        end
+        dtrace("semantic provider=clangd context=source-exact-command usr=%s state=resolved",
+          tostring(usr))
+        jump_resolved(locs[1], "clangd·semantic", {
+          provider = "clangd",
+          destination_role = "definition",
+          subject_role = "reference",
+          identity = usr,
+        })
+      end, {
+        client_ids = clangd_client_ids,
+        snapshot = tx,
+        structured = true,
+        compile_command_source = ref_file,
+      })
+    end, {
+      snapshot = tx,
+      structured = true,
+      compile_command_source = ref_file,
+    })
   end
 
   return M

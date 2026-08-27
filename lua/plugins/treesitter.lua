@@ -6,8 +6,9 @@
 -- main branch compiles parsers from C source via cc -- on Windows that
 -- means clang/gcc/cl must be on PATH. LLVM ships with UE workflows but
 -- isn't on user PATH by default. Inject it here so :TSInstall works.
-local llvm_bin = "C:\\Program Files\\LLVM\\bin"
-if require("utils.platform").is_windows and vim.fn.isdirectory(llvm_bin) == 1 then
+local compiler_capability = require("utils.platform").optional_capability(nil, "treesitter_compiler_bin")
+local llvm_bin = compiler_capability.ok and compiler_capability.value or nil
+if llvm_bin and vim.fn.isdirectory(llvm_bin) == 1 then
   if not (vim.env.PATH or ""):find(llvm_bin, 1, true) then
     vim.env.PATH = llvm_bin .. ";" .. (vim.env.PATH or "")
   end

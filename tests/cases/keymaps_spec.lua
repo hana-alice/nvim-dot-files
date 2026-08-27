@@ -18,6 +18,32 @@ t.describe("keymaps: 加载", function()
   t.it("config/keymaps.lua 可 dofile 成功", function()
     t.assert_true(ok_km, "dofile keymaps 失败: " .. tostring(km_err))
   end)
+
+  t.it("VimEnter 前加载也会立即安装 UE runtime overrides", function()
+    local command = table.concat({
+      "local did = vim.v.vim_did_enter",
+      ("dofile(%q)"):format(cfg .. "/lua/config/keymaps.lua"),
+      "local mapped = vim.fn.maparg('<leader>ub', 'n') ~= ''",
+      "vim.api.nvim_out_write(('EARLY_KEYMAP did=%d mapped=%s\\n'):format(did, tostring(mapped)))",
+    }, "; ")
+    local result = vim.system({
+      vim.v.progpath,
+      "--headless",
+      "-i", "NONE",
+      "-u", cfg .. "/init.lua",
+      "-c", "lua " .. command,
+      "-c", "qa!",
+    }, {
+      text = true,
+      env = vim.tbl_extend("force", vim.fn.environ(), {
+        NVIM_CORE_HEALTH_NO_MUTATE = "1",
+      }),
+    }):wait(20000)
+
+    local output = (result.stdout or "") .. (result.stderr or "")
+    t.assert_eq(result.code, 0, output ~= "" and output or "child nvim failed")
+    t.assert_contains(output, "EARLY_KEYMAP did=0 mapped=true")
+  end)
 end)
 
 t.describe("keymaps: DAP 功能键多模式", function()
@@ -79,6 +105,13 @@ t.describe("keymaps: leader 代表键", function()
     local r = rhs_of("n", "<leader>da")
     t.assert_true(r ~= nil, "<leader>da 未绑定")
     t.assert_contains(r, "UEDAPAttach")
+    t.assert_false(r:find("android", 1, true) ~= nil, "attach 必须按 active target 分派")
+  end)
+  t.it("<leader>dl 含 active-target UEDAPLaunch", function()
+    local r = rhs_of("n", "<leader>dl")
+    t.assert_true(r ~= nil, "<leader>dl 未绑定")
+    t.assert_contains(r, "UEDAPLaunch")
+    t.assert_false(r:find("android", 1, true) ~= nil, "launch 必须按 active target 分派")
   end)
   for _, lhs in ipairs({ "<leader>vv", "<leader>vb", "<leader>vg" }) do
     t.it(lhs .. " 存在 (sidebar)", function()
@@ -90,10 +123,16 @@ t.describe("keymaps: leader 代表键", function()
     t.assert_true(r ~= nil, "<leader>uA 未绑定")
     t.assert_contains(r, "UESetAndroidDevice")
   end)
-  t.it("<leader>ub → UEBuild (VeryLazy 覆盖)", function()
+  t.it("<leader>ub → UEBuild (runtime override)", function()
     local r = rhs_of("n", "<leader>ub")
     t.assert_true(r ~= nil, "<leader>ub 未绑定")
     t.assert_contains(r, "UEBuild")
+  end)
+  t.it("<leader>ui → UEInstall (按当前平台分派)", function()
+    local r = rhs_of("n", "<leader>ui")
+    t.assert_true(r ~= nil, "<leader>ui 未绑定")
+    t.assert_contains(r, "UEInstall")
+    t.assert_false(r:find("UEInstallAndroid", 1, true) ~= nil)
   end)
   t.it("<leader>us → UEBuildAndroidSO (跳过 APK)", function()
     local r = rhs_of("n", "<leader>us")
@@ -105,18 +144,18 @@ t.describe("keymaps: leader 代表键", function()
     t.assert_true(r ~= nil, "<leader>uq 未绑定")
     t.assert_contains(r, "UEDeployAndroidSO")
   end)
-  t.it("<leader>ul → UELaunch (VeryLazy 覆盖)", function()
+  t.it("<leader>ul → UELaunch (runtime override)", function()
     local r = rhs_of("n", "<leader>ul")
     t.assert_true(r ~= nil, "<leader>ul 未绑定")
     t.assert_contains(r, "UELaunch")
   end)
-  t.it("<leader>uN → NotificationHistory (VeryLazy 覆盖)", function()
+  t.it("<leader>uN → NotificationHistory (runtime override)", function()
     local r = rhs_of("n", "<leader>uN")
     t.assert_true(r ~= nil, "<leader>uN 未绑定")
     t.assert_contains(r, "NotificationHistory")
   end)
   for _, lhs in ipairs({ "<leader>ut", "<leader>uC" }) do
-    t.it(lhs .. " → ThemePicker (VeryLazy 覆盖)", function()
+    t.it(lhs .. " → ThemePicker (runtime override)", function()
       local r = rhs_of("n", lhs)
       t.assert_true(r ~= nil, lhs .. " 未绑定")
       t.assert_contains(r, "ThemePicker")
@@ -142,6 +181,41 @@ end)
 t.describe("keymaps: 核心编辑/导航键", function()
   t.it("gd 存在", function() t.assert_true(t.get_keymap("n", "gd") ~= nil) end)
   t.it("gr 存在", function() t.assert_true(t.get_keymap("n", "gr") ~= nil) end)
+  t.it("<C-LeftMouse> 不把 dotted member 当文件交给 gf", function()
+    local mapping = t.get_keymap("n", "<C-LeftMouse>")
+    t.assert_true(mapping ~= nil and type(mapping.callback) == "function")
+
+    local original_buf = vim.api.nvim_get_current_buf()
+    local bufnr = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_set_current_buf(bufnr)
+    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, {
+      "[ParallelRenderCommandEncoder.GetPtr() setLabel:@\"fixture\"]",
+    })
+    vim.api.nvim_win_set_cursor(0, { 1, 2 })
+
+    local original_fallback = package.loaded["utils.lsp_fallback"]
+    local original_normal = vim.cmd.normal
+    local definitions = 0
+    local normal_calls = 0
+    package.loaded["utils.lsp_fallback"] = {
+      definition = function() definitions = definitions + 1 end,
+    }
+    vim.cmd.normal = function()
+      normal_calls = normal_calls + 1
+    end
+    vim.v.errmsg = ""
+    mapping.callback()
+    local errmsg = vim.v.errmsg
+    vim.cmd.normal = original_normal
+    package.loaded["utils.lsp_fallback"] = original_fallback
+
+    vim.api.nvim_set_current_buf(original_buf)
+    pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+    t.assert_eq(normal_calls, 0, "dotted member must not attempt gf")
+    t.assert_eq(definitions, 1, "dotted member must route directly to semantic definition")
+    t.assert_false(errmsg:find("E447", 1, true) ~= nil,
+      "smart mouse jump must not emit a failed file lookup before gd")
+  end)
   t.it("gc (n) 存在", function() t.assert_true(t.get_keymap("n", "gc") ~= nil) end)
   t.it("gc (x) 存在", function() t.assert_true(t.get_keymap("x", "gc") ~= nil) end)
   t.it("gcc 存在", function() t.assert_true(t.get_keymap("n", "gcc") ~= nil) end)

@@ -20,10 +20,6 @@ function M.shell_entry(kind)
     return "cmd.exe"
   end
   if kind == "powershell" then
-    if vim.fn.executable("pwsh") == 1 then return "pwsh" end
-    if vim.fn.executable("powershell.exe") == 1 or vim.fn.executable("powershell") == 1 then
-      return "powershell.exe"
-    end
     return "powershell.exe"
   end
   if kind == "default" then
@@ -35,6 +31,63 @@ end
 
 function M.shell()
   return M.shell_entry("default")
+end
+
+function M.allows_osc52()
+  return false
+end
+
+function M.mixed_eol_guard()
+  return true
+end
+
+function M.treesitter_compiler_bin()
+  return "C:\\Program Files\\LLVM\\bin"
+end
+
+function M.windows_ui_config()
+  return true
+end
+
+function M.path_key(path)
+  return tostring(path or ""):lower()
+end
+
+function M.query_driver_globs()
+  return { "**/clang*.exe", "**/clang*", "**/gcc", "**/g++", "**/cc", "**/c++", "**/cl.exe" }
+end
+
+function M.cdb_compiler_candidates()
+  return { "clang++", "clang", "clang++.exe", "clang.exe", "cl.exe", "cl" }
+end
+
+function M.lldb_python_relative_paths()
+  return { "lib/site-packages/lldb", "Lib/site-packages/lldb" }
+end
+
+function M.restart_fallback_candidates(cwd, _)
+  return {
+    {
+      client = "windows",
+      bin = "nvim",
+      args = {},
+      cwd = cwd,
+      reason = "Windows fallback; resolved to %s",
+    },
+  }
+end
+
+function M.restart_requires_spawn_reprobe()
+  return true
+end
+
+function M.restart_shutdown_delay_ms()
+  return 800
+end
+
+function M.code_search_install_hint(config_root)
+  local script = tostring(config_root or "") .. "/scripts/install_windows.ps1"
+  return "powershell -ExecutionPolicy Bypass -File " .. shell.quote("powershell", script)
 end
 
 local function to_windows_path(path)
@@ -209,6 +262,136 @@ function M.reveal_file(path)
   start_with_explorer(path, true)
 end
 
+-- Native process capability used by the clangd resource controller. It is
+-- intentionally lazy: merely loading the Windows driver must not touch kernel32.
+local process_api
+local process_api_error
+local function get_process_api()
+  if process_api or process_api_error then return process_api, process_api_error end
+  local ok_ffi, ffi = pcall(require, "ffi")
+  if not ok_ffi then process_api_error = tostring(ffi); return nil, process_api_error end
+  local ok_cdef, cdef_err = pcall(ffi.cdef, [[
+    typedef unsigned long UE_DWORD;
+    typedef int UE_BOOL;
+    typedef void* UE_HANDLE;
+    typedef struct {
+      UE_DWORD dwSize;
+      UE_DWORD cntUsage;
+      UE_DWORD th32ProcessID;
+      uintptr_t th32DefaultHeapID;
+      UE_DWORD th32ModuleID;
+      UE_DWORD cntThreads;
+      UE_DWORD th32ParentProcessID;
+      int32_t pcPriClassBase;
+      UE_DWORD dwFlags;
+      uint16_t szExeFile[260];
+    } UE_PROCESSENTRY32W;
+    UE_HANDLE CreateToolhelp32Snapshot(UE_DWORD, UE_DWORD);
+    UE_BOOL Process32FirstW(UE_HANDLE, UE_PROCESSENTRY32W*);
+    UE_BOOL Process32NextW(UE_HANDLE, UE_PROCESSENTRY32W*);
+    UE_HANDLE OpenProcess(UE_DWORD, UE_BOOL, UE_DWORD);
+    UE_BOOL SetPriorityClass(UE_HANDLE, UE_DWORD);
+    UE_DWORD GetPriorityClass(UE_HANDLE);
+    UE_BOOL GetExitCodeProcess(UE_HANDLE, UE_DWORD*);
+    UE_BOOL CloseHandle(UE_HANDLE);
+    UE_DWORD GetLastError(void);
+  ]])
+  if not ok_cdef then process_api_error = tostring(cdef_err); return nil, process_api_error end
+  local ok_kernel, kernel = pcall(ffi.load, "kernel32")
+  if not ok_kernel then process_api_error = tostring(kernel); return nil, process_api_error end
+  process_api = { ffi = ffi, kernel = kernel }
+  return process_api
+end
+
+local function wide_ascii(value)
+  local bytes = {}
+  for index = 0, 259 do
+    local code = tonumber(value[index]) or 0
+    if code == 0 then break end
+    bytes[#bytes + 1] = code < 128 and string.char(code) or "?"
+  end
+  return table.concat(bytes)
+end
+
+--- List matching direct children of one owned parent process.
+function M.child_processes(parent_pid, executable_name)
+  local api, err = get_process_api()
+  if not api then return nil, err end
+  parent_pid = tonumber(parent_pid)
+  if not parent_pid then return nil, "parent pid is unavailable" end
+  local ffi, kernel = api.ffi, api.kernel
+  local snapshot = kernel.CreateToolhelp32Snapshot(0x00000002, 0)
+  if snapshot == ffi.cast("UE_HANDLE", -1) then
+    return nil, "CreateToolhelp32Snapshot failed: " .. tonumber(kernel.GetLastError())
+  end
+
+  local wanted = tostring(executable_name or ""):lower()
+  local entry = ffi.new("UE_PROCESSENTRY32W[1]")
+  entry[0].dwSize = ffi.sizeof("UE_PROCESSENTRY32W")
+  local out = {}
+  local has_entry = kernel.Process32FirstW(snapshot, entry) ~= 0
+  while has_entry do
+    local item = entry[0]
+    local name = wide_ascii(item.szExeFile)
+    if tonumber(item.th32ParentProcessID) == parent_pid
+        and (wanted == "" or name:lower() == wanted) then
+      local pid = tonumber(item.th32ProcessID)
+      local handle = kernel.OpenProcess(0x00101200, 0, pid)
+      if handle ~= nil and handle ~= ffi.NULL then
+        out[#out + 1] = { pid = pid, name = name, native = { handle = handle, pid = pid } }
+      end
+    end
+    has_entry = kernel.Process32NextW(snapshot, entry) ~= 0
+  end
+  kernel.CloseHandle(snapshot)
+  return out
+end
+
+local function process_handle(api, process, access)
+  if type(process) == "table" and process.handle ~= nil then
+    return process.handle, false
+  end
+  local handle = api.kernel.OpenProcess(access, 0, tonumber(process) or 0)
+  if handle == nil or handle == api.ffi.NULL then return nil, false end
+  return handle, true
+end
+
+function M.process_exists(process)
+  local api, err = get_process_api()
+  if not api then return nil, err end
+  local handle, temporary = process_handle(api, process, 0x00101000)
+  if not handle then return false, "process unavailable" end
+  local exit_code = api.ffi.new("UE_DWORD[1]")
+  local queried = api.kernel.GetExitCodeProcess(handle, exit_code) ~= 0
+  local alive = queried and tonumber(exit_code[0]) == 259
+  if temporary then api.kernel.CloseHandle(handle) end
+  return alive, queried and nil or "GetExitCodeProcess failed"
+end
+
+--- Reversible priority class: low=BELOW_NORMAL, normal=NORMAL.
+function M.set_process_priority(process, level)
+  local api, err = get_process_api()
+  if not api then return false, err end
+  local classes = { low = 0x00004000, normal = 0x00000020 }
+  local priority = classes[level]
+  if not priority then return false, "unsupported priority: " .. tostring(level) end
+  local handle, temporary = process_handle(api, process, 0x00001200)
+  if not handle then return false, "OpenProcess failed: " .. tonumber(api.kernel.GetLastError()) end
+  local ok = api.kernel.SetPriorityClass(handle, priority) ~= 0
+  local native_err
+  if not ok then native_err = "SetPriorityClass failed: " .. tonumber(api.kernel.GetLastError()) end
+  if temporary then api.kernel.CloseHandle(handle) end
+  return ok, native_err
+end
+
+function M.close_process(process)
+  local api = get_process_api()
+  if not api or type(process) ~= "table" or process.handle == nil then return false end
+  local handle = process.handle
+  process.handle = nil
+  return api.kernel.CloseHandle(handle) ~= 0
+end
+
 function M.default_clangd_candidates()
   -- Hot lookup; let upstream `ue.clangd_cmd` keep its own richer search,
   -- this is the platform-default fallback.
@@ -219,7 +402,26 @@ function M.default_clangd_candidates()
 end
 
 function M.python_candidates()
-  return { "python" }
+  return {
+    vim.fn.expand("~/AppData/Local/Programs/Python/Python312/python.exe"),
+    vim.fn.expand("~/AppData/Local/Programs/Python/Python313/python.exe"),
+    "C:/Python312/python.exe",
+    "C:/Python313/python.exe",
+    "python.exe",
+    "python",
+  }
+end
+
+function M.clangd_indexer_candidates()
+  return {
+    "C:/Program Files/LLVM/bin/clangd-indexer.exe",
+    "clangd-indexer.exe",
+    "clangd-indexer",
+  }
+end
+
+function M.shared_library_extension()
+  return ".dll"
 end
 
 function M.default_lldb_dap_paths()
@@ -248,6 +450,8 @@ function M.default_lldb_dap_paths()
     pf .. "/LLVM/bin/lldb-dap.exe",
     "C:/Program Files/LLVM/bin/lldb-dap.exe",
     "C:/Program Files (x86)/LLVM/bin/lldb-dap.exe",
+    "lldb-dap.exe",
+    "lldb-dap",
   }
 end
 

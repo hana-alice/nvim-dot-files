@@ -1,7 +1,14 @@
 # Android DAP attach 失败 + F9 断点失效 · 诊断报告
 
+> **状态：Historical / superseded evidence。** 本文冻结 2026-06-02 的失败现场，
+> 其中 sandbox `gdbserver --attach`、F9 short-circuit 与固定设备 serial 不是现行实现要求。
+> 当前路线以 [`android-dap-attach`](../../openspec/specs/android-dap-attach/spec.md)、
+> [`android-dap-live-breakpoints`](../../openspec/specs/android-dap-live-breakpoints/spec.md)
+> 和 `docs/CONSTRAINTS.md` K30/K36/K37 为准：设备端使用 `lldb-server platform`，
+> session 捕获显式 serial，active-session F9 走 live 通道且不要求 reattach。
+
 > 日期: 2026-06-02
-> 设备: **仅在 `ANDROID-SERIAL-A` 上验证**（abi `arm64-v8a`, sdk 36 / Android 16, SELinux Enforcing）
+> 历史取证设备: **仅在 `ANDROID-SERIAL-A` 上验证**（证据范围，不是脚本默认值；abi `arm64-v8a`, sdk 36 / Android 16, SELinux Enforcing）
 > 目标进程: `<android-package>`（DEBUGGABLE，run-as 可用，idle 时 `State=S` `TracerPid=0`，Threads=17）
 > 约束: 遵守 `docs/CONSTRAINTS.md` —— host adapter 22.1.6+ forward-only、`stopOnEntry=true` 不动、
 >   attachCommands/postRunCommands 不加 `process continue`、SIGSEGV/SIGBUS `--pass true --stop false` 不动、

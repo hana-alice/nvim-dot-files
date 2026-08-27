@@ -32,3 +32,8 @@
 ## 先读
 
 `../../../docs/plans/2026-05-06-multi-platform-foundation.md`（Phase A 驱动拆分）。
+
+**治理 spec**（可观察行为的权威；与本文冲突时以 spec 为准）：
+`../../../openspec/specs/host-platform-driver/spec.md`、
+`../../../openspec/specs/platform-tool-resolution/spec.md`、
+`../../../openspec/specs/shell-command-planning/spec.md`。

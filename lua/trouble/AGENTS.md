@@ -19,3 +19,5 @@ trouble.nvim 的自定义 source（`sources/ue_sidebar.lua`），把 UE sidebar 
 ## 先读
 
 `../utils/sidebar.lua`（sidebar 实现）、`../../docs/architecture/overview.md`。
+
+**治理 spec**：无对应 capability（本目录行为不由某个 `openspec/specs/` capability 治理）。

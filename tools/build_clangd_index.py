@@ -38,6 +38,12 @@ import sys
 import time
 from pathlib import Path
 
+TOOLS_DIR = str(Path(__file__).resolve().parent)
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+
+from cdb_argv import normalize_cdb
+
 
 def find_clangd_indexer():
     """Find clangd-indexer executable."""
@@ -134,7 +140,19 @@ def main():
     # Count entries
     with open(cdb_path, "r", encoding="utf-8") as f:
         cdb = json.load(f)
+    try:
+        structured, converted = normalize_cdb(cdb)
+    except (OSError, ValueError) as error:
+        print(f"ERROR: cannot normalize input CDB: {error}", file=sys.stderr)
+        return 1
+    if converted or any("command" in entry for entry in cdb):
+        normalized_tmp = cdb_path + f".normalize.tmp.{os.getpid()}"
+        with open(normalized_tmp, "w", encoding="utf-8", newline="\n") as target:
+            json.dump(structured, target, ensure_ascii=False, separators=(",", ":"))
+        os.replace(normalized_tmp, cdb_path)
+    cdb = structured
     print(f"compile_commands.json: {len(cdb)} entries")
+    print(f"Structured argv: {len(cdb)} entries; command converted: {converted}")
     print(f"Project root: {project_root}")
     print(f"Output: {idx_path}")
     print(f"Mode: {'controlled-background' if args.background_output else 'legacy-idx'}")

@@ -49,7 +49,7 @@
 
 ### Requirement: 所有设备定向 ADB 命令显式使用全局 serial
 
-系统 SHALL 让仓内所有面向某一 Android device 的 ADB 操作在 argv 中显式包含 `-s <serial>`；这包括 `<Space>ui` / `:UEInstallAndroid`、Android `:UELaunch`、Android logcat、DAP attach/launch/reattach 的 shell/push/forward/pidof/cleanup。`adb devices -l` 作为发现命令 SHALL 是不加 `-s` 的例外。
+系统 SHALL 让仓内所有面向某一 Android device 的 ADB 操作在 argv 中显式包含 `-s <serial>`；这包括 active target 为 Android 时的 `<Space>ui` / `:UEInstall`、`:UEInstallAndroid`、Android `:UELaunch`、Android logcat、DAP attach/launch/reattach 的 shell/push/forward/pidof/cleanup。`adb devices -l` 作为发现命令 SHALL 是不加 `-s` 的例外。
 
 #### Scenario: Space ui 安装到所选设备
 

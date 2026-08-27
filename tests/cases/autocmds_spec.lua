@@ -41,3 +41,13 @@ t.describe("autocmd: commentstring 回退", function()
     t.assert_eq(cs, "// %s")
   end)
 end)
+
+t.describe("autocmd: compile language syntax", function()
+  t.it("BufEnter/FileType 会在 clangd 启动前探测 exact compile language", function()
+    local autocmds = vim.api.nvim_get_autocmds({ group = "UECompileLanguageSyntax" })
+    local events = {}
+    for _, autocmd in ipairs(autocmds) do events[autocmd.event] = true end
+    t.assert_true(events.BufEnter == true)
+    t.assert_true(events.FileType == true)
+  end)
+end)

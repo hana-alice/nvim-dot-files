@@ -4,6 +4,7 @@ return function(M, core)
   local fs = require("ue.core.fs")
   local _ufs = fs
   local _uproc = require("ue.core.proc")
+  local _uplat = require("utils.platform")
   local RT = core.RT
 
   local INDEX_COVERAGE_RANK = {
@@ -30,9 +31,38 @@ return function(M, core)
     return nil
   end
 
+  local function canonical_json(value, seen)
+    local kind = type(value)
+    if kind ~= "table" then return vim.json.encode(value) end
+
+    seen = seen or {}
+    if seen[value] then error("cannot hash cyclic table") end
+    seen[value] = true
+
+    local encoded = {}
+    if vim.islist(value) then
+      for _, item in ipairs(value) do
+        encoded[#encoded + 1] = canonical_json(item, seen)
+      end
+      seen[value] = nil
+      return "[" .. table.concat(encoded, ",") .. "]"
+    end
+
+    local keys = {}
+    for key in pairs(value) do
+      if type(key) ~= "string" then error("generation maps require string keys") end
+      keys[#keys + 1] = key
+    end
+    table.sort(keys)
+    for _, key in ipairs(keys) do
+      encoded[#encoded + 1] = vim.json.encode(key) .. ":" .. canonical_json(value[key], seen)
+    end
+    seen[value] = nil
+    return "{" .. table.concat(encoded, ",") .. "}"
+  end
+
   local function stable_hash(payload)
-    local encoded = vim.json.encode(payload or {})
-    return sha256_text(encoded)
+    return sha256_text(canonical_json(payload or {}))
   end
 
   local function canonical_cdb_path(dir, path)
@@ -184,17 +214,27 @@ return function(M, core)
       TOOLCHAIN_IDENTITY_CACHE[cache_key] = identity
       return identity
     end
-    local clangd = vim.fn.exepath("clangd") or ""
-    local indexer = _uproc.first_executable({
-      "/mnt/c/Program Files/LLVM/bin/clangd-indexer.exe",
-      "clangd-indexer",
-      "clangd-indexer.exe",
-      "C:/Program Files/LLVM/bin/clangd-indexer.exe",
-    }) or ""
+    local clangd_resolved = _uplat.resolve_tool({
+      name = "clangd",
+      env = { "UE_CLANGD" },
+      config = { "clangd.candidates_extra" },
+      driver_candidates = function(driver)
+        return driver.default_clangd_candidates()
+      end,
+    })
+    local indexer_resolved = _uplat.resolve_tool({
+      name = "clangd-indexer",
+      env = { "UE_CLANGD_INDEXER" },
+      driver_candidates = function(driver)
+        return driver.clangd_indexer_candidates()
+      end,
+    })
+    local clangd = clangd_resolved.ok and clangd_resolved.path or ""
+    local indexer = indexer_resolved.ok and indexer_resolved.path or ""
     return stable_hash({
       clangd = executable_identity(clangd),
       clangd_indexer = executable_identity(indexer),
-      os = jit and jit.os or "",
+      os = (_uplat.driver() or {}).id or _uplat.id or "",
     }) or ""
   end
 
@@ -319,6 +359,63 @@ return function(M, core)
     }
   end
 
+  -- Is the PID that claimed a build still alive? Mirrors ue.file_lock's own
+  -- liveness probe so orphan detection and lease reclamation agree.
+  local function build_owner_alive(pid)
+    pid = tonumber(pid)
+    if not pid or pid <= 0 then
+      return false
+    end
+    if pid == vim.fn.getpid() then
+      return true
+    end
+    local ok, alive = pcall(vim.uv.kill, pid, 0)
+    return ok and alive ~= nil and alive ~= false
+  end
+
+  --- Reset a build state orphaned by a dead process.
+  ---
+  --- WHY: the completion path (manifest write, stats, promotion) lives entirely
+  --- inside the child's callback, and `full` takes minutes over ~16k TUs. If
+  --- Neovim exits mid-build, `status="running"` / `finished_at=0` is persisted
+  --- forever, and `build_phase_async` then reports "busy" or the UI claims a
+  --- build is in flight that no process owns. Observed on a real bucket:
+  --- status stuck at "running" with stats all zero, i.e. never a single success.
+  ---
+  --- Only reclaim when the owner is provably gone: a second live Neovim may
+  --- legitimately own the build (multi-instance isolation, K43).
+  --- Pure enough to test: pass `alive_fn` to inject liveness.
+  --- @param state table persisted index state
+  --- @param alive_fn? fun(pid:integer|nil):boolean
+  --- @return boolean reset true when an orphan was cleared
+  local function reset_orphaned_build(state, alive_fn)
+    local build = state and state.build
+    if type(build) ~= "table" then
+      return false
+    end
+    if build.status ~= "running" then
+      return false
+    end
+    -- A finished_at already set means the record was closed out; leave it.
+    if tonumber(build.finished_at) and tonumber(build.finished_at) > 0 then
+      return false
+    end
+    local alive = (alive_fn or build_owner_alive)(build.owner_pid)
+    if alive then
+      return false
+    end
+    state.build = {
+      phase = build.phase or "",
+      status = "interrupted",
+      started_at = build.started_at or 0,
+      finished_at = os.time(),
+      message = string.format("%s index build was interrupted (owner process gone)",
+        build.phase ~= "" and build.phase or "index"),
+      active_index = build.active_index or "",
+    }
+    return true
+  end
+
   local function normalize_index_state(state)
     if type(state.index_artifacts) ~= "table" then
       state.index_artifacts = {}
@@ -326,6 +423,9 @@ return function(M, core)
     if type(state.index_selection) ~= "table" then
       state.index_selection = index_state_selection_default()
     end
+    -- Self-heal a build orphaned by a previous process before anything reads
+    -- `state.build` and concludes a build is still in flight.
+    reset_orphaned_build(state)
   end
 
   local function same_generation(a, b)
@@ -501,6 +601,10 @@ return function(M, core)
   M.semantic_index_snapshot = function(ctx, subject_path)
     local state = ensure_index_state(ctx)
     normalize_index_state(state)
+    -- Not ledger-only: rebuild from on-disk manifests when the in-process record
+    -- was lost (lua/ue/index/_recover.lua).
+    if M.maybe_recover_readiness then M.maybe_recover_readiness(ctx, state) end
+
     local selected = state.index_selection or index_state_selection_default()
     local artifact = state.index_artifacts and state.index_artifacts[selected.phase] or nil
     if type(artifact) ~= "table"
@@ -510,7 +614,10 @@ return function(M, core)
 
     local readiness = "missing"
     local freshness = "missing"
-    if artifact and _ufs.is_file(artifact.index_path)
+    if artifact and artifact.build_key ~= build_key_from_ctx(ctx) then
+      readiness = "stale"
+      freshness = "stale"
+    elseif artifact and _ufs.is_file(artifact.index_path)
         and _ufs.is_file(artifact.background_cdb_path or "")
         and _ufs.is_file(ctx.paths and ctx.paths.semantic_cdb or "") then
       readiness = "ready"
@@ -525,6 +632,28 @@ return function(M, core)
       end
     elseif state.build and state.build.status == "running" then
       readiness = "building"
+    end
+
+    -- A `ready` verdict MUST name the artifact backing it and that artifact MUST
+    -- exist. Without this, a selection whose fields are blank still yields
+    -- `ready` (observed 2026-08-26: ready with index_path="" while the only .idx
+    -- on disk was a month old and 0 bytes). Such a claim is unfalsifiable and
+    -- misleads every downstream consumer, including the clangd gate.
+    if readiness == "ready" and M.selection_is_self_evidencing then
+      local self_ok, self_reason = M.selection_is_self_evidencing(selected)
+      if not self_ok then
+        readiness = "missing"
+        freshness = "missing"
+        -- Log rather than swallow: a contradictory state is a defect elsewhere,
+        -- and silently downgrading it would hide the cause (as it did before).
+        pcall(function()
+          require("utils.log").warn_ctx("ue.index", "discarded self-contradictory ready state", {
+            reason = self_reason,
+            phase = selected.phase or "",
+            generation = selected.generation_short or "",
+          })
+        end)
+      end
     end
 
     local subject_module = nil
@@ -639,16 +768,27 @@ return function(M, core)
   core.h.base_cdb_digest = base_cdb_digest
   core.h.index_manifest_path = index_manifest_path
   core.h.read_index_manifest = read_index_manifest
+  -- Exported for _recover: rebuilding readiness from disk must compare the source
+  -- CDB signature using the SAME function that produced it, not a reimplementation.
+  core.h.file_signature = file_signature
+  -- Exported for _delivery's stale-artifact report: "same generation?" is the
+  -- single predicate that decides whether an on-disk CDB can back the active
+  -- tuple, so both selection and observability must use the SAME rule.
+  core.h.same_generation = same_generation
   core.h.generation_for_context = generation_for_context
   core.h.make_index_manifest = make_index_manifest
   core.h.select_active_artifact = select_active_artifact
   core.h.update_index_selection = update_index_selection
   core.h.normalize_index_state = normalize_index_state
+  -- Exposed for regression: orphan reclamation must be provable headless with an
+  -- injected liveness probe (a real dead PID is not reproducible in a test).
+  M._reset_orphaned_build = reset_orphaned_build
   core.h.module_names_for_keys = module_names_for_keys
 
   M.read_index_manifest = read_index_manifest
   M.index_manifest_path = index_manifest_path
   M.generation_for_context = generation_for_context
+  M._stable_hash_for_test = stable_hash
   M.make_index_manifest = make_index_manifest
   M.select_active_artifact = select_active_artifact
   M.update_index_selection = update_index_selection

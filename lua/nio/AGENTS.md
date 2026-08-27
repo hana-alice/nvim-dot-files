@@ -19,3 +19,5 @@
 ## 先读
 
 `../utils/log.lua`（旋转式调试日志，与本模块职责区分）。
+
+**治理 spec**：无对应 capability（本目录行为不由某个 `openspec/specs/` capability 治理）。

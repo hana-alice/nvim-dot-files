@@ -102,29 +102,56 @@ t4.describe("stability: timer 回调内禁同步 spawn（K40 固化）", functio
   end)
 end)
 
--- 文件行数：不硬卡存量（ue.lua 等 5 个白名单），只锁「不再新增超限文件」。
-t4.describe("stability: 不再新增 >800 行 lua 文件（存量白名单）", function()
+-- 文件行数：ue.lua 是平台 workflow 迁移的单调下降 ratchet；其他既有
+-- 超限文件暂时保留精确白名单。ratchet 只能随迁移下调，不能提高。
+t4.describe("stability: ue.lua 单调下降 ratchet 与新增文件 800 行上限", function()
   local cfg_root = vim.fn.stdpath("config")
+  local UE_LUA_LIMIT = 10562
   local GRANDFATHERED = {
-    ["lua/ue.lua"] = true,
+    ["lua/ue.lua"] = UE_LUA_LIMIT,
     ["lua/ue/dap.lua"] = true,
     ["lua/ue/dap/android.lua"] = true,
     ["lua/utils/cheatsheet.lua"] = true,
     ["lua/utils/ue_goto/symbol.lua"] = true,
   }
-  t4.it("新文件不超 800 行", function()
+
+  local function line_limit_violation(rel, line_count)
+    local allowance = GRANDFATHERED[rel]
+    if allowance == true then
+      return nil
+    end
+    local limit = type(allowance) == "number" and allowance or 800
+    if line_count <= limit then
+      return nil
+    end
+    return rel .. " (" .. line_count .. " lines; limit " .. limit .. ")"
+  end
+
+  t4.it("ue.lua 不超过冻结基线，其他新文件不超 800 行", function()
     local files = vim.fn.glob(cfg_root .. "/lua/**/*.lua", true, true)
     local viols = {}
     for _, path in ipairs(files) do
       local rel = path:sub(#cfg_root + 2):gsub("\\", "/")
-      if not GRANDFATHERED[rel] then
+      if GRANDFATHERED[rel] ~= true then
         local n = 0
         for _ in io.lines(path) do n = n + 1 end
-        if n > 800 then viols[#viols + 1] = rel .. " (" .. n .. " lines)" end
+        local violation = line_limit_violation(rel, n)
+        if violation then viols[#viols + 1] = violation end
       end
     end
     t4.assert_eq(#viols, 0,
-      "新增超 800 行文件（coding-style 上限；拆分或加入白名单需评审）：\n"
+      "Lua 文件超过行数门禁（ue.lua ratchet 不得上调；新文件须拆分）：\n"
       .. table.concat(viols, "\n"))
+  end)
+
+  t4.it("synthetic growth fixtures fail at ue.lua +1 and workflow line 801", function()
+    t4.assert_contains(
+      line_limit_violation("lua/ue.lua", UE_LUA_LIMIT + 1),
+      "limit " .. UE_LUA_LIMIT
+    )
+    t4.assert_contains(
+      line_limit_violation("lua/ue/workflows/android/future.lua", 801),
+      "limit 800"
+    )
   end)
 end)

@@ -16,9 +16,11 @@ MUST：系统必须把 Tree-sitter 语法解析和 clangd 编译语义作为两�
 - **THEN** 系统必须允许语法高亮继续工作
 - **AND** 只将 clangd 导航、诊断、补全和索引标记为未准备
 
-### Requirement: 系统必须提供显式的 Neovim 语义编译入口
+### Requirement: 构建与 Neovim 语义准备必须组成显式两阶段流程
 
-MUST：系统必须提供 `:UECompileForNvim`，在当前 tuple 上执行宿主原生 UBT 增量编译，并且仅在编译成功后进入 CDB 准备和 clangd 刷新。
+MUST：正常工作流必须先以 `:UEBuild` / `<leader>ub` 在当前 tuple 上执行宿主原生 UBT 增量编译，
+再由 `:UEPrepare` 生成 CDB 并刷新 clangd。`:UECompileForNvim` MAY 作为顺序执行这两个阶段的兼容入口，
+但 Apple semantic CDB 的生成所有权必须属于 `:UEPrepare`。
 
 #### Scenario: macOS 上编译 IOS 目标
 
@@ -27,12 +29,19 @@ MUST：系统必须提供 `:UECompileForNvim`，在当前 tuple 上执行宿主�
 - **AND** 必须以 argv 数组传递 target、platform、configuration 与 `-Project=<UPROJECT>`
 - **AND** 不得调用 Windows path converter、PowerShell 或 `UnrealBuildTool.exe`
 
-#### Scenario: IOS 构建不保留 response files
+#### Scenario: IOS 构建后进入 prepare
 
 - **WHEN** 原生 IOS 编译成功但 Apple toolchain 没有留下当前 tuple 的 C++ response files
+- **AND** 用户随后执行 `:UEPrepare`
 - **THEN** IOS target driver 必须规划 tuple-scoped UBT `GenerateClangDatabase`
 - **AND** 该计划必须使用 `-NoExecCodeGenActions`，且不得执行 compile、Cook、Package、Deploy 或 Run
 - **AND** 生成结果必须在同一构建输出 surface 可观察，经 provenance 校验后才可原子发布
+
+#### Scenario: 工程 action-graph 构造包含自定义 AOT 副作用
+
+- **WHEN** IOS `GenerateClangDatabase` 加载的工程规则支持 `bSkipAOTProcess`
+- **THEN** semantic-CDB 子进程必须单独设置 `bSkipAOTProcess=true`
+- **AND** 该环境不得泄漏到 `<leader>ub` 或其他 target 的 build/prepare
 
 #### Scenario: 编译失败
 
@@ -40,21 +49,49 @@ MUST：系统必须提供 `:UECompileForNvim`，在当前 tuple 上执行宿主�
 - **THEN** 系统必须将任务标记为 failed 并显示退出码与失败阶段
 - **AND** 不得运行准备阶段、替换最后成功 CDB 或重启 clangd
 
-### Requirement: UEPrepare 必须保持纯准备语义
+### Requirement: UEPrepare 不得触发编译但必须拥有 Apple semantic source 生成
 
-MUST：`UEPrepare` 必须只读取和转换已有 response files 或由显式语义编译阶段发布的 tuple-scoped CDB source；不得触发 UBT、编译或任何应用生命周期命令。
+MUST：`UEPrepare` 不得触发 compile、Cook、Package、Deploy 或 Run。对保留 response files 的 target，它必须继续只读转换已有证据；对 macOS 主机上声明 `semantic_cdb` capability 的 IOS target，它必须在确认当前 tuple 已有成功 build evidence 后，显式委托 iOS readiness workflow 完成 prepared signing、私钥访问与设备 route setup，再执行不包含 compile action 的 UBT `GenerateClangDatabase`，然后进入公共 CDB/index pipeline。该委托必须保持现有 `:UEPrepare` / `<leader>up` 的用户行为不变，不得改变 build/package/install/launch 语义。
 
-#### Scenario: 缺少 response files
+#### Scenario: Apple target 缺少当前 tuple build evidence
 
-- **WHEN** 当前 tuple 既没有可证明来源的 response files，也没有已验证的 tuple-scoped CDB source
-- **THEN** `UEPrepare` 必须失败并建议运行 `:UECompileForNvim`
+- **WHEN** 当前 IOS tuple 没有成功 build evidence
+- **THEN** `UEPrepare` 必须失败并建议先运行 `<leader>ub`
 - **AND** 不得自动执行编译、Cook、Package、Deploy 或 Run
+
+#### Scenario: 状态 marker 上线前已经成功构建
+
+- **WHEN** project bucket 没有 Nvim build marker，但当前 tuple 存在精确匹配的 UBT `.target` receipt
+- **AND** receipt 声明的 launch product 仍存在
+- **THEN** `UEPrepare` 必须把该 receipt 迁移为 project-scoped build evidence 并继续
+- **AND** 不得要求用户为补写 marker 重复执行相同构建
 
 #### Scenario: 编译证据已存在
 
 - **WHEN** 当前 tuple 存在有效 response files 或已验证的 tuple-scoped CDB source
 - **THEN** `UEPrepare` 必须直接生成或复用 CDB
-- **AND** 不得仅为准备语义而触发 UBT
+- **AND** 非 Apple target 不得仅为准备语义而触发 UBT
+
+#### Scenario: 重复 prepare 复用当前 build 的 Apple semantic source
+
+- **WHEN** project/uproject/target/platform/configuration 与 build completion evidence 均精确匹配
+- **AND** 已验证的 tuple-scoped CDB source 路径、大小与纳秒 mtime 均未变化
+- **THEN** `UEPrepare` 必须直接复用该 semantic source
+- **AND** 不得再次启动 `Build.sh` 或 UnrealBuildTool
+- **AND** 新 build evidence 或 source 文件签名变化后必须重新生成并验证
+
+#### Scenario: IOS 首次 prepare 显式委托 readiness workflow
+
+- **WHEN** 当前 IOS tuple 已有成功 build evidence，但 prepared signing、私钥访问或 device route setup 尚未完成
+- **THEN** `UEPrepare` 必须先显式委托 iOS readiness workflow 完成这些前置条件
+- **AND** readiness workflow 成功后才可继续 semantic source 生成
+- **AND** 用户观察到的 `:UEPrepare` / `<leader>up` 行为必须与现有流程一致
+
+#### Scenario: 其他平台执行 prepare
+
+- **WHEN** 当前 target 不声明 `semantic_cdb` capability
+- **THEN** `UEPrepare` 必须保持原有 response-file 路径
+- **AND** 不得执行 IOS setup、Apple clangd prelude 或 `GenerateClangDatabase`
 
 ### Requirement: 编译上下文必须严格隔离
 
@@ -120,50 +157,40 @@ MUST：系统必须在不阻塞 Neovim UI 的任务生命周期中执行预检�
 - **THEN** 系统必须终止后续阶段并标记 cancelled
 - **AND** 必须保留最后成功 CDB 和 clangd 会话可恢复状态
 
-### Requirement: host OS 与 Unreal target platform 必须分层
+### Requirement: clangd 启动必须绑定已解析工程的受控 CDB
 
-MUST：系统必须使用独立 host driver 表达 Windows/macOS/Linux 宿主工具能力，并使用独立 target driver 表达 Android/IOS/Mac/Win64/Linux 目标策略；不得用一个 platform 分支同时表达两个维度。
+MUST：clangd 命令必须在 LSP root 已解析后选择当前 project bucket 与 tuple 对应的 active
+controlled CDB，并把 resolved argv 保留给 exact-command transport。不得在静态配置加载时把
+CDB 固化到配置仓库或 engine root，也不得依赖原生 LSP 不执行的 legacy callback。
 
-#### Scenario: macOS host 构建 IOS target
+#### Scenario: 原生 LSP 为工程启动 clangd
+- **WHEN** Neovim 原生 LSP 为一个已选择 project root 创建 clangd client
+- **THEN** cmd factory 必须生成指向该 project-scoped active CDB 的 `--compile-commands-dir`
+- **AND** exact-command transport 必须读取实际 resolved argv，而不是把 cmd factory 函数当作 argv
 
-- **WHEN** 当前 host 为 macOS 且 target 为 IOS
-- **THEN** 核心层必须组合 macOS host driver 与 IOS target driver
-- **AND** 不得把 Mac target driver 当作 IOS target 的实现
+#### Scenario: CDB 只有 command 字段
+- **WHEN** compiler-authored CDB entry 只提供 POSIX 或 Windows `command` 字符串
+- **THEN** 受控 CDB 工具必须按该 command 的原始宿主语法转换为结构化 `arguments`
+- **AND** 后续 definition 注入与 super-unity 处理不得通过重新拼接引号改变编译语义
 
-#### Scenario: 不支持的 host-target 组合
+### Requirement: Apple no-response super-unity SHALL require exact context proof
 
-- **WHEN** target driver 请求 host driver 不具备的工具能力
-- **THEN** 系统必须返回结构化 unavailable 与缺失 capability
-- **AND** 不得隐式切换 host 或调用另一个 target driver
+MUST：Apple toolchain 没有保留 `.o.rsp` 时，super-unity 只能复用 active CDB 中 compiler-authored
+argv。一个 unity group 只有在所有 include member 都唯一映射、cwd 相同、剥离 source 与逐文件
+写出参数后的编译上下文完全一致，并且 argv 含可验证 Apple target 或 SDK/sysroot 证据时才可合并。
+系统不得合成 flags 的并集；任何证据不足都必须 exact per-file fallback。
 
-### Requirement: 每个 Unreal target 的平台策略必须独立实现
+#### Scenario: AppleClang 成员上下文完全一致
+- **WHEN** IOS/Mac unity members 的 active CDB argv 具有相同 target、arch、sysroot、defines、includes 与 PCH 上下文
+- **THEN** 系统必须从 exact argv 只替换原 source 并剥离对象/依赖写出参数
+- **AND** wrapper argv 必须保留其余编译器语义参数
 
-MUST：Android、IOS、Mac、Win64、Linux 必须分别拥有 target-driver 模块；平台特定的脚本、argv、RSP 分类、产物、设备与生命周期策略只能存在于对应模块。
+#### Scenario: 任一语义参数不同
+- **WHEN** unity members 的 define、include、target、sysroot、PCH、cwd 或其他语义参数不同
+- **THEN** 该 group 必须拒绝合并
+- **AND** 每个 member 必须继续使用自己的 exact compile command
 
-#### Scenario: IOS 与 Mac 都运行在 macOS
-
-- **WHEN** IOS driver 与 Mac driver 都请求 macOS `Build.sh`
-- **THEN** 两者必须分别构造和验证自己的 target argv 与 RSP 分类
-- **AND** 任一 driver 不得调用另一个 driver 的实现或读取其状态
-
-#### Scenario: 使用共享辅助函数
-
-- **WHEN** 多个 target driver 复用路径归一化或 argv 校验
-- **THEN** 共享 helper 必须无状态且不包含 target 选择、默认值、工具选择或产物策略
-- **AND** 平台策略仍必须保留在调用方 driver 内
-
-### Requirement: 核心调度层不得包含 target-specific 实现
-
-MUST：`lua/ue.lua` 或其后继核心调度模块必须只负责上下文解析、命令注册、任务编排和 target-driver dispatch。
-
-#### Scenario: 注册通用 UEBuild 命令
-
-- **WHEN** 核心层为当前 target 规划 build
-- **THEN** 必须通过 registry 解析 target driver 并调用统一 contract
-- **AND** 核心层不得包含 Android/IOS/Mac 脚本名称或 target 条件分支
-
-#### Scenario: 迁移现有 Android 实现
-
-- **WHEN** Android build/PowerShell/SO 策略从核心层迁入 Android driver
-- **THEN** 其既有 executable、argv、cwd、错误和用户命令行为必须保持兼容
-- **AND** 回归测试必须证明该迁移没有借机改变 Android 行为
+#### Scenario: 只有通用 arch 参数而无 Apple 证据
+- **WHEN** CDB argv 含 `-arch`，但没有 Apple target 或 Apple SDK/sysroot 证据
+- **THEN** 系统 MUST NOT 把它推断为 Apple compiler context
+- **AND** no-response grouping 必须 exact fallback

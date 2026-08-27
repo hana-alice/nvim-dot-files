@@ -25,6 +25,7 @@ function M.attach()
   if not pid then return end
   C.run(C.lldb_dap_config({
     name = "UE Mac Attach", request = "attach", pid = pid, initCommands = INIT,
+    _ue_session_owner = "mac", _ue_session_operation = "attach",
   }), "UEDAP mac attach")
 end
 
@@ -35,6 +36,7 @@ function M.launch()
   if not program then return end
   C.run(C.lldb_dap_config({
     name = "UE Mac Launch", request = "launch", program = program, initCommands = INIT,
+    _ue_session_owner = "mac", _ue_session_operation = "launch",
   }), "UEDAP mac launch")
 end
 

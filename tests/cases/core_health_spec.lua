@@ -461,9 +461,35 @@ t.describe("core_health: fixture and mutation safety", function()
     t.assert_match(init_source, 'NVIM_CORE_HEALTH_NO_MUTATE ~= "1"%s+then%s+cleanup_stale_shada_tmp%(%)')
     t.assert_contains(lazy_source, 'local health_no_mutate = vim.env.NVIM_CORE_HEALTH_NO_MUTATE == "1"')
     t.assert_contains(lazy_source, "missing = not health_no_mutate")
-    t.assert_contains(lazy_source, "enabled = not health_no_mutate")
-    local _, enabled_count = lazy_source:gsub("enabled = not health_no_mutate", "")
-    t.assert_eq(enabled_count, 2, "checker and change detection must both be disabled")
+
+    -- The invariant is "neither background mutator runs under the health probe",
+    -- NOT "both are spelled `not health_no_mutate`". Assert each one separately
+    -- and accept an unconditional `false` as strictly stronger than gating on
+    -- the env var: an always-off mutator cannot mutate in ANY mode.
+    --
+    -- change_detection became unconditionally false on 2026-08-25 because its
+    -- 2000ms/2000ms reloader stats 33 spec files SYNCHRONOUSLY on the main loop
+    -- (1.2ms p50 idle, 21ms p50 when it fires) — a standing P6 violation, not
+    -- just a health-probe concern. See lua/config/ui_responsiveness.lua.
+    local function block(name)
+      local body = lazy_source:match(name .. "%s*=%s*{(.-)}")
+      t.assert_type(body, "string", name .. " block not found in config/lazy.lua")
+      return body
+    end
+    local function disabled_under_health(name)
+      local body = block(name)
+      local gated = body:find("enabled = not health_no_mutate", 1, true) ~= nil
+      local always_off = body:match("enabled%s*=%s*false") ~= nil
+      t.assert_true(gated or always_off,
+        name .. " must be disabled under NVIM_CORE_HEALTH_NO_MUTATE (gated) or unconditionally")
+      return always_off
+    end
+
+    disabled_under_health("checker")
+    local cd_always_off = disabled_under_health("change_detection")
+    t.assert_true(cd_always_off,
+      "change_detection must stay unconditionally false: its 2s main-loop fs_stat poll violates P6")
+
     t.assert_match(lazy_source, "rocks%s*=%s*{%s*enabled%s*=%s*false", "unused LuaRocks provider must stay disabled")
   end)
 end)

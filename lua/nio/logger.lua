@@ -11,12 +11,6 @@ local log_date_format = "%FT%H:%M:%SZ%z"
 local LARGE = 1e9
 
 local function path_sep()
-  if jit then
-    local os = string.lower(jit.os)
-    if os == "linux" or os == "osx" or os == "bsd" then
-      return "/"
-    end
-  end
   return package.config:sub(1, 1)
 end
 

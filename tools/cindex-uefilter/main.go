@@ -15,7 +15,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"runtime/pprof"
 	"sort"
 	"strings"
@@ -31,6 +33,8 @@ exactly those files. Skips the walk entirely. Other cindex flags work
 identically.
 `
 
+const windowsIncrementalWorkerEnv = "CINDEX_UEFILTER_WINDOWS_INCREMENTAL_WORKER"
+
 func usage() {
 	fmt.Fprint(os.Stderr, usageMessage)
 	os.Exit(2)
@@ -43,6 +47,132 @@ var (
 	cpuProfile    = flag.String("cpuprofile", "", "write cpu profile to this file")
 	filesFromFlag = flag.String("files-from", "", "read paths from FILE (or stdin if -)")
 )
+
+func uniqueSortedStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	sort.Strings(values)
+	out := values[:0]
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if len(out) > 0 && out[len(out)-1] == value {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
+func readFilesFromList(name string) ([]string, int, error) {
+	var (
+		scanner *bufio.Scanner
+		file    *os.File
+		err     error
+	)
+	if name == "-" {
+		scanner = bufio.NewScanner(os.Stdin)
+	} else {
+		file, err = os.Open(name)
+		if err != nil {
+			return nil, 0, fmt.Errorf("open %s: %w", name, err)
+		}
+		defer file.Close()
+		scanner = bufio.NewScanner(file)
+	}
+
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	seen := make(map[string]struct{})
+	files := make([]string, 0)
+	skipped := 0
+	for scanner.Scan() {
+		path := strings.TrimSpace(scanner.Text())
+		if path == "" {
+			continue
+		}
+		info, statErr := os.Stat(path)
+		if statErr != nil || info.IsDir() {
+			skipped++
+			continue
+		}
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		files = append(files, path)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, skipped, fmt.Errorf("read %s: %w", name, err)
+	}
+	return uniqueSortedStrings(files), skipped, nil
+}
+
+func filesFromIndexPaths(args, files []string, reset bool) []string {
+	if !reset {
+		// Merge treats every staged Path as a replacement prefix. Broad CLI
+		// roots would therefore delete untouched names from the old index when
+		// the files-from list contains only a delta. Exact files are the only
+		// safe shadow keys for add mode.
+		return uniqueSortedStrings(append([]string{}, files...))
+	}
+	paths := append([]string{}, args...)
+	for i, arg := range paths {
+		abs, err := filepath.Abs(arg)
+		if err == nil {
+			paths[i] = abs
+		}
+	}
+	return uniqueSortedStrings(paths)
+}
+
+func runIncrementalWorker() bool {
+	return os.Getenv(windowsIncrementalWorkerEnv) == "1"
+}
+
+func runIncrementalInChild() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	args := append([]string{}, os.Args[1:]...)
+	if os.Getenv("GO_WANT_CINDEX_UEFILTER_HELPER") == "1" {
+		args = append([]string{"-test.run=TestHelperProcess", "--"}, args...)
+	}
+	cmd := exec.Command(exe, args...)
+	cmd.Env = append(os.Environ(), windowsIncrementalWorkerEnv+"=1")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("incremental worker failed: %w", err)
+	}
+	return nil
+}
+
+func exactReplaceFile(dst, src string) error {
+	backup := dst + ".bak"
+	_ = os.Remove(backup)
+	hadDst := false
+	if err := os.Rename(dst, backup); err == nil {
+		hadDst = true
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("backup %s: %w", dst, err)
+	}
+	if err := os.Rename(src, dst); err != nil {
+		if hadDst {
+			_ = os.Rename(backup, dst)
+		}
+		return fmt.Errorf("publish %s: %w", dst, err)
+	}
+	if hadDst {
+		if err := os.Remove(backup); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("cleanup backup %s: %w", backup, err)
+		}
+	}
+	return nil
+}
 
 func main() {
 	flag.Usage = usage
@@ -73,9 +203,27 @@ func main() {
 	}
 
 	master := index.File()
-	if _, err := os.Stat(master); err != nil {
+	_, statErr := os.Stat(master)
+	masterExists := statErr == nil
+	if !masterExists {
 		*resetFlag = true
 	}
+	if runtime.GOOS == "windows" && masterExists && !*resetFlag && !runIncrementalWorker() {
+		if err := runIncrementalInChild(); err != nil {
+			log.Fatal(err)
+		}
+		file := master + "~"
+		merged := file + "~"
+		if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
+			log.Fatal(err)
+		}
+		if err := exactReplaceFile(master, merged); err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("done")
+		return
+	}
+
 	file := master
 	if !*resetFlag {
 		file += "~"
@@ -84,59 +232,27 @@ func main() {
 	ix := index.Create(file)
 	ix.Verbose = *verboseFlag
 
-	// ─── -files-from mode ────────────────────────────────────────────
+	// ─── -files-from mode ───────────────────────────
 	if *filesFromFlag != "" {
-		var rd *bufio.Scanner
-		if *filesFromFlag == "-" {
-			rd = bufio.NewScanner(os.Stdin)
-		} else {
-			f, err := os.Open(*filesFromFlag)
-			if err != nil {
-				log.Fatalf("open %s: %v", *filesFromFlag, err)
-			}
-			defer f.Close()
-			rd = bufio.NewScanner(f)
+		files, skipped, err := readFilesFromList(*filesFromFlag)
+		if err != nil {
+			log.Fatal(err)
 		}
-		// Allow long lines (UE paths can be deep).
-		rd.Buffer(make([]byte, 1024*1024), 1024*1024)
 
-		// Treat any path roots from CLI as auxiliary "indexed paths"
-		// that show up in cindex -list (so users know what's covered).
-		paths := args
-		for i, arg := range paths {
-			abs, err := filepath.Abs(arg)
-			if err == nil {
-				paths[i] = abs
-			}
-		}
-		sort.Strings(paths)
-		ix.AddPaths(paths)
+		ix.AddPaths(filesFromIndexPaths(args, files, *resetFlag))
 
 		log.Printf("indexing from %s", *filesFromFlag)
 		count := 0
-		skipped := 0
-		for rd.Scan() {
-			path := strings.TrimSpace(rd.Text())
-			if path == "" {
-				continue
-			}
-			info, err := os.Stat(path)
-			if err != nil || info.IsDir() {
-				skipped++
-				continue
-			}
+		for _, path := range files {
 			ix.AddFile(path)
 			count++
 			if count%5000 == 0 {
 				log.Printf("indexed %d files...", count)
 			}
 		}
-		if err := rd.Err(); err != nil {
-			log.Fatalf("read %s: %v", *filesFromFlag, err)
-		}
 		log.Printf("indexed %d files (%d skipped)", count, skipped)
 	} else {
-		// ─── Original walk mode (unchanged from cindex) ──────────────
+		// ─── Original walk mode (unchanged from cindex) ─────────────
 		if len(args) == 0 {
 			ix2 := index.Open(index.File())
 			for _, arg := range ix2.Paths() {
@@ -184,10 +300,17 @@ func main() {
 	ix.Flush()
 
 	if !*resetFlag {
+		merged := file + "~"
 		log.Printf("merge %s %s", master, file)
-		index.Merge(file+"~", master, file)
-		os.Remove(file)
-		os.Rename(file+"~", master)
+		if runtime.GOOS == "windows" && runIncrementalWorker() {
+			index.Merge(merged, master, file)
+		} else if runtime.GOOS == "windows" {
+			log.Fatal("windows incremental merge must run in worker mode")
+		} else {
+			index.Merge(merged, master, file)
+			os.Remove(file)
+			os.Rename(merged, master)
+		}
 	}
 	log.Printf("done")
 }

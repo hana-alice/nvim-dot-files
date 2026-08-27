@@ -49,3 +49,8 @@ UE 专用 DAP：`_common`（adapter 接线 + env 清洗）、`_persist_bp`（断
 ADR `../../../docs/plans/2026-06-15-android-dap-live-breakpoints.md`（live 断点决策 + 不变量）、
 归档 change `openspec/changes/archive/2026-06-03-android-dap-*` / `2026-06-15-android-dap-live-breakpoints`、
 真机证据 `../../../tools/evidence/android-f9/`。
+
+**治理 spec**（可观察行为的权威；与本文冲突时以 spec 为准）：
+`../../../openspec/specs/dap-platform-dispatch/spec.md`、
+`../../../openspec/specs/android-dap-attach/spec.md`、
+`../../../openspec/specs/android-dap-live-breakpoints/spec.md`。

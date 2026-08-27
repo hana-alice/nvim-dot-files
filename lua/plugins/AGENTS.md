@@ -22,3 +22,5 @@
 ## 先读
 
 `../../docs/architecture-vs-lazyvim.md`（相对 LazyVim 的增量与「刻意不做」清单）。
+
+**治理 spec**：无对应 capability（本目录行为不由某个 `openspec/specs/` capability 治理）。

@@ -19,17 +19,31 @@ references 和非 C++ 文件仍可使用 csearch / GTAGS；这是另一条能力
 
 ### 2.1 Active CDB 覆盖的 source TU
 
-`.c/.cc/.cpp/.cxx/.m/.mm` 先由 sidecar 的 `prove` 操作确认文件同时存在于当前
-active shard 与 clangd 消费的 merged `compile_commands.json`。active shard 只证明
-当前构建成员身份；merged CDB 必须不早于 active shard / selection manifest，并以其
-post-processed file/directory/argv 作为 sidecar 与 clangd exact-command transport 的真实命令。
-identity 阶段在 proven TU 的精确光标执行：
+`.c/.cc/.cpp/.cxx/.m/.mm` 由 `ue.clangd_commands` 从当前 controlled active CDB 查询
+post-processed exact command，并通过 clangd 官方 `compilationDatabaseChanges` transport 绑定到
+打开的 source buffer。active CDB/selection manifest 证明当前构建成员身份；exact-command 查询失败时
+保持 unavailable，不退回文本猜测。identity 阶段在不可变精确光标 snapshot 上执行：
 
-1. sidecar `query` 解析 referenced/canonical cursor，要求唯一且非空的 canonical USR；
-2. 当前 TU 已有该 USR 的 body 时直接使用；
-3. 否则用同一 USR 请求 controlled module definition lookup；
-4. 只有 module contexts 暂不可用时，才向能在原精确光标返回相同 USR 的 clangd client
-   请求 secondary definition；过滤 declaration/当前位置后必须只剩一个 body。
+clangd 启动资格来自同一组持久化证据，而不是进程内“执行过 prepare”标志。当前 tuple 的 build key、
+selection/artifact、controlled/semantic CDB 与源 CDB 签名仍为 ready 时，Nvim 重启后直接复用；证据
+missing/stale 或 tuple 变化时才 defer。同进程内也逐次验证，避免更新 CDB 后沿用旧的 positive cache。
+
+1. 只向已接收 exact command 的 clangd client 请求 `textDocument/symbolInfo` canonical USR；
+2. definition 请求只允许同一 USR 的 client 参与；
+3. 去除当前位置后必须只剩一个 destination，否则返回结构化 empty/multiple reason；
+4. 目标为 header 时，把 exact command 记录为该窗口后续 header-in-context 查询的 origin TU evidence。
+
+若 clangd restart 后已先用 synthetic CDB 的邻近 TU 推断命令打开 source，首次 exact transport 会对
+同一 client/command 只执行一次有序 `didClose → didChangeConfiguration → didOpen`，用当前 buffer 全文
+重建 AST 后再回答 identity；symbolInfo 与 definition 共用 30 秒 provider hard ceiling，覆盖 UE 冷 preamble。
+
+Apple UBT 会把部分扩展名仍为 `.cpp/.h` 的 mixed source 用 `-x objective-c++[-header]` 编译。exact-command
+transport 同时消费这项 compiler language evidence：buffer 继续保持 `cpp` filetype 与 C++ Tree-sitter，另将
+内置 `objcpp` syntax 作为 lexical overlay，使 `@autoreleasepool`、Objective-C message/interface 等构造可见。
+普通 C/C++ argv 不启用 overlay；不能把 `objcpp` 整体映射到只继承 C grammar 的 `objc` Tree-sitter parser。
+
+source 路径不再为每次 `gd` 让 sidecar 重读 200MB+ 全量 CDB 或重复创建 libclang TU；sidecar 保留给
+必须在 proven origin TU 内求值的 header 路径。
 
 这条路径不会读取旧 location cache，也不会在 clangd 失败后进入文本 fallback。
 跳入头文件时直接携带这个已证明的 source compile context；不得通过
@@ -94,7 +108,9 @@ file + line + column
 对应的 out-of-line body 位于另一 source TU，identity query 仍返回 canonical USR，但
 `definition` 合法为空。`lookup-definition` 随后读取同 generation 的 current→hot→full
 controlled CDB；每条记录只来自 active build 的 compiler-authored UBT unity membership，
-无法构成真实 unity 时退回 exact per-file TU，并携带 portable module/member metadata。
+无法构成真实 unity 时退回 exact per-file TU。phase artifact 携带 portable module/member metadata；
+发布给 clangd 的 `compile_commands.json` 只保留标准字段，避免其 JSONCompilationDatabase parser
+因内部 provenance key 拒绝整份受控索引。
 
 LuaJIT FFI 不能可靠把 by-value `CXCursor` callback 传给 `clang_visitChildren`。因此 sidecar
 按当前 toolchain identity + C 源码 hash 懒编译一个最小 C ABI shim；shim 不加载第二份

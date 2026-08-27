@@ -48,14 +48,6 @@ local function log()
   return L
 end
 
-local function is_windows()
-  return platform.is_windows
-end
-
-local function is_mac()
-  return platform.is_mac
-end
-
 local function executable(bin)
   return vim.fn.executable(bin) == 1
 end
@@ -146,37 +138,6 @@ local function verify_alive(pid, get_early_exit, grace_ms)
   return true
 end
 
--- Windows fallback: cmd /C start "" /D <cwd> <exe> [args...]
--- The empty "" is the window title (mandatory because if the FIRST
--- positional arg of `start` is quoted, it's treated as the title; we
--- pass an empty title so the real exe is unambiguously the program).
-local function spawn_windows_start(exe, args, cwd)
-  -- vim.fn.jobstart with `cmd` form (not list) so quoting is handled
-  -- by Windows command parser; list form mangles `start`'s arguments.
-  local quoted_exe = '"' .. exe .. '"'
-  local pieces = { 'start', '""' }
-  if cwd then
-    table.insert(pieces, '/D')
-    table.insert(pieces, '"' .. cwd .. '"')
-  end
-  table.insert(pieces, quoted_exe)
-  for _, a in ipairs(args or {}) do
-    table.insert(pieces, '"' .. tostring(a):gsub('"', '\\"') .. '"')
-  end
-  local shell_cmd = table.concat(pieces, ' ')
-  log().debug("cmd /C " .. shell_cmd)
-
-  local job = vim.fn.jobstart({ "cmd", "/C", shell_cmd }, {
-    detach = true,
-  })
-  if job <= 0 then
-    log().warn("jobstart failed code=" .. tostring(job))
-    return false, "jobstart returned " .. tostring(job)
-  end
-  log().info(string.format("cmd /C start ok job=%s exe=%s", tostring(job), exe))
-  return true
-end
-
 -- ---------------------------------------------------------------------
 -- Detect (no side effects)
 -- ---------------------------------------------------------------------
@@ -226,75 +187,27 @@ function M.detect(cwd)
     }
   end
 
-  -- 3. Windows native console fallback
-  if is_windows() then
-    if not executable("nvim") then
-      return nil, "no 'nvim' on PATH"
-    end
-    local exe = resolve_exe("nvim")
-    return {
-      client = "windows",
-      cmd    = exe,
-      args   = {},
-      cwd    = cwd,
-      reason = "Windows fallback (cmd /C start); resolved to " .. exe,
-    }
+  -- 3. Host-owned fallback candidates. The caller only resolves the first
+  -- available executable and never branches on host identity.
+  local fallback = platform.optional_capability(nil, "restart_fallback_candidates", cwd, vim.env)
+  if not fallback.ok then
+    return nil, "restart fallback unavailable for current host"
   end
-
-  -- 4. macOS fallback
-  if is_mac() then
-    local term = vim.env.TERMINAL
-    if term and executable(term) then
+  for _, candidate in ipairs(fallback.value or {}) do
+    if executable(candidate.bin) then
+      local exe = resolve_exe(candidate.bin)
+      local reason = tostring(candidate.reason or (candidate.bin .. " fallback"))
+      if reason:find("%%s") then reason = reason:format(exe) end
       return {
-        client = "mac",
-        cmd    = resolve_exe(term),
-        args   = { "-e", "nvim" },
-        cwd    = cwd,
-        reason = "$TERMINAL=" .. term,
-      }
-    end
-    if executable("kitty") then
-      return {
-        client = "mac",
-        cmd    = resolve_exe("kitty"),
-        args   = { "--directory", cwd, "nvim" },
-        cwd    = cwd,
-        reason = "kitty fallback",
-      }
-    end
-    return nil, "set $TERMINAL or install kitty"
-  end
-
-  -- 5. Linux fallback
-  local term = vim.env.TERMINAL
-  if term and executable(term) then
-    return {
-      client = "linux",
-      cmd    = resolve_exe(term),
-      args   = { "-e", "nvim" },
-      cwd    = cwd,
-      reason = "$TERMINAL=" .. term,
-    }
-  end
-  local candidates = {
-    { bin = "kitty",     args = { "--directory", cwd, "nvim" } },
-    { bin = "alacritty", args = { "--working-directory", cwd, "-e", "nvim" } },
-    { bin = "wezterm",   args = { "start", "--cwd", cwd, "--", "nvim" } },
-    { bin = "foot",      args = { "--working-directory=" .. cwd, "nvim" } },
-    { bin = "xterm",     args = { "-e", "sh", "-c", "cd " .. vim.fn.shellescape(cwd) .. " && nvim" } },
-  }
-  for _, c in ipairs(candidates) do
-    if executable(c.bin) then
-      return {
-        client = "linux",
-        cmd    = resolve_exe(c.bin),
-        args   = c.args,
-        cwd    = cwd,
-        reason = c.bin .. " fallback",
+        client = candidate.client or "terminal",
+        cmd = exe,
+        args = candidate.args or {},
+        cwd = candidate.cwd or cwd,
+        reason = reason,
       }
     end
   end
-  return nil, "no terminal emulator found (set $TERMINAL or install one)"
+  return nil, "no host restart fallback executable is available"
 end
 
 local function unsaved_count()
@@ -358,8 +271,9 @@ function M.restart(opts)
       spawn_err = why
     end
   end
-  if not ok and is_windows() then
-    log().info("uv.spawn failed/died on Windows, trying cmd /C start fallback")
+  local reprobe = platform.optional_capability(nil, "restart_requires_spawn_reprobe")
+  if not ok and reprobe.ok and reprobe.value == true then
+    log().info("uv.spawn failed/died; host driver requests a strict second probe")
     -- Re-probe the args by uv.spawn-ing once more with strict verify.
     -- If THIS dies too, the args themselves are wrong; cmd /C start
     -- won't fix it (start would just dispatch the same broken args
@@ -400,7 +314,8 @@ function M.restart(opts)
   --     fire instantly anyway)
   --   * the placeholder window to read "Restart in cwd ..." for ≥250ms
   -- Old delay was 50ms which was racing all of the above.
-  local delay = is_windows() and 800 or 400
+  local delay_capability = platform.optional_capability(nil, "restart_shutdown_delay_ms")
+  local delay = delay_capability.ok and tonumber(delay_capability.value) or 400
   log().debug(string.format("scheduling qa in %dms (force=%s)",
     delay, tostring(opts.force)))
 

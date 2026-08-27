@@ -41,7 +41,20 @@ require("lazy").setup({
     frequency = 86400, -- check at most once a day (was: every hour)
   },
   change_detection = {
-    enabled = not health_no_mutate,
+    -- Disabled deliberately (2026-08-25, measured). lazy.manage.reloader arms a
+    -- 2000ms/2000ms timer that runs uv.fs_stat over all 33 spec module files
+    -- SYNCHRONOUSLY on the main loop (1.2ms p50 idle), and pays 21ms p50 when it
+    -- detects a change (Plugin.load + LazyRender/LazyReload autocmds).
+    --
+    -- The recorded stall trains have exactly this shape: ~2s cadence, no
+    -- keypress, and matching hourly counts across two independent Neovim PIDs
+    -- (they watch the SAME files, so they react in the same 2s window).
+    --
+    -- We never want the reload anyway: this config establishes much of its
+    -- behaviour through startup ORDER (CONSTRAINTS C3), which hot-reload cannot
+    -- reproduce, so config edits are followed by a deliberate restart.
+    -- Rationale of record: lua/config/ui_responsiveness.lua.
+    enabled = false,
     notify = false, -- silence "config reloaded" toasts
   },
   -- This config has no LuaRocks-backed plugins. Disable the unused provider

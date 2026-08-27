@@ -35,24 +35,34 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 
 ## 子系统速查
 
-| 子系统 | 位置 | 本地规则（内容源） | 一句话 |
-|---|---|---|---|
-| UE 引擎中枢 | `lua/ue.lua` + `lua/ue/` | `lua/ue/AGENTS.md` | 索引 / CDB / DAP / 命令注册的中枢 |
-| 多实例状态 | `lua/ue/project_state.lua` + `file_lock.lua` | `lua/ue/AGENTS.md` | 进程内选择 + canonical project bucket + 跨进程 writer lease |
-| clangd 语义覆盖 | `lua/ue/index/` | `lua/ue/index/AGENTS.md` | current/hot/full controlled BackgroundIndex + generation 单调选择 |
-| CDB 流水线 | `lua/ue/cdb/` | `lua/ue/cdb/AGENTS.md` | compile_commands.json 生成/裁剪/注入 |
-| DAP 调试 | `lua/ue/dap/` | `lua/ue/dap/AGENTS.md` | codelldb + Android platform 模式 |
-| Android device | `lua/utils/android_device.lua` | `lua/utils/AGENTS.md` | 名称+serial picker；当前 Neovim 进程 serial；统一 `adb -s` |
-| Android SO 快速迭代 | `lua/ue/targets/android.lua` + `android_windows.lua` + `scripts/ue_android_so_*.ps1` | `lua/ue/targets/AGENTS.md` + `scripts/AGENTS.md` | Windows-only PowerShell compatibility path；root 或已验证的 debuggable app-private transport；不支持 macOS→Android |
-| UE target drivers | `lua/ue/targets/` | `lua/ue/targets/AGENTS.md` | Android/IOS/Mac/Win64/Linux 目标策略彼此隔离；`host_operations` matrix + runtime strategy 是组合真相 |
-| goto 解析栈 | `lua/utils/ue_goto/` | `lua/utils/ue_goto/AGENTS.md` | proven-TU canonical USR + module AST 唯一 body；非 C++ compatibility fallback |
-| 代码搜索 | `lua/utils/code_search/` | `lua/utils/code_search/AGENTS.md` | csearch 亚秒级 grep（兜底，非主路） |
-| 核心健康审计 | `lua/utils/core_health*.lua` + `scripts/nvim_core_health.lua` | `lua/utils/AGENTS.md` + `scripts/AGENTS.md` | 隔离、只读、可机器判定的启动/编辑/AST/搜索/clangd/CDB/target plan 证据 |
-| 平台驱动 | `lua/utils/platform/` | `lua/utils/platform/AGENTS.md` | 唯一允许做 OS 分支的地方；host 选 shell executable，shell helper 只组 argv/quote |
-| workaround 注册表 | `lua/workarounds/` | `lua/workarounds/AGENTS.md` | 上游 bug 补丁，带 frontmatter |
-| 配置层 | `lua/config/` | `lua/config/AGENTS.md` | keymaps / options / autocmds / lazy |
-| 插件层 | `lua/plugins/` | `lua/plugins/AGENTS.md` | per-plugin setup（snacks-only） |
-| 回归测试 | `tests/` | `tests/AGENTS.md` | headless 套件 + 分范围回归映射 |
+| 子系统 | 位置 | 本地规则（内容源） | 治理 spec（`openspec/specs/<name>/spec.md`） | 必跑 filter | 一句话 |
+|---|---|---|---|---|---|
+| 扫描根推导 | `lua/ue/core/scan_roots.lua` | `lua/ue/core/AGENTS.md` | `project-scan-root-discovery` | `ue_api` `fs_proc` | 从 Build.cs/uplugin/uproject 推导应扫目录；只扩不缩 |
+| UE 引擎中枢 | `lua/ue.lua` + `lua/ue/` | `lua/ue/AGENTS.md` | `ue-target-workflow-boundary` | `ue_platform_boundary` `ue_api` `smoke` | 索引 / CDB / DAP / 命令注册的中枢 |
+| 多实例状态 | `lua/ue/project_state.lua` + `file_lock.lua` | `lua/ue/AGENTS.md` | `multi-instance-state-isolation` | `multi_instance_state` | 进程内选择 + canonical project bucket + 跨进程 writer lease |
+| clangd 语义覆盖 | `lua/ue/index/` | `lua/ue/index/AGENTS.md` | `cpp-semantic-index-coverage` | `index_generation` `cpp_semantic_index` | current/hot/full controlled BackgroundIndex + generation 单调选择 |
+| CDB 流水线 | `lua/ue/cdb/` | `lua/ue/cdb/AGENTS.md` | `macos-ios-cdb-semantic-prepare` | `ue_cdb` | compile_commands.json 生成/裁剪/注入 |
+| DAP 调试 | `lua/ue/dap/` | `lua/ue/dap/AGENTS.md` | `dap-platform-dispatch`、`android-dap-attach`、`android-dap-live-breakpoints` | `dap` `platform` | codelldb + Android platform 模式 |
+| Android device | `lua/utils/android_device.lua` | `lua/utils/AGENTS.md` | `global-android-device-selection` | `android_device` `dap` `ue_context` | 名称+serial picker；当前 Neovim 进程 serial；统一 `adb -s` |
+| Android SO 快速迭代 | `lua/ue/targets/android.lua` + `android_windows.lua` + `scripts/ue_android_so_*.ps1` | `lua/ue/targets/AGENTS.md` + `scripts/AGENTS.md` | `android-so-quick-deploy` | `ue_target_drivers` `ue_target_integration` | Windows-only PowerShell compatibility path；root 或已验证的 debuggable app-private transport；不支持 macOS→Android |
+| UE target drivers | `lua/ue/targets/` | `lua/ue/targets/AGENTS.md` | `ue-target-driver-boundary`、`ios-build-run-workflow`、`ios-device-debug-workflow` | `ue_target_drivers` `ue_target_integration` `ue_target_tasks` | Android/IOS/Mac/Win64/Linux 目标策略彼此隔离；`host_operations` matrix + runtime strategy 是组合真相 |
+| UE workflows | `lua/ue/workflows/` | `lua/ue/workflows/AGENTS.md` | `ue-target-workflow-boundary` | `ue_workflows` `ue_target_tasks` | target-specific 异步/UI/设备状态机的 owner |
+| goto 解析栈 | `lua/utils/ue_goto/` | `lua/utils/ue_goto/AGENTS.md` | `cpp-contextual-definition-navigation`、`cpp-semantic-highlighting` | `cpp_semantic_context` `cpp_semantic_client` `ue_goto_behavior` | proven-TU canonical USR + module AST 唯一 body；非 C++ compatibility fallback |
+| 代码搜索 | `lua/utils/code_search/` | `lua/utils/code_search/AGENTS.md` | `ue-code-search`、`project-scan-root-discovery` | `ue_goto_behavior` `ue_paths` `utils` | csearch 亚秒级 grep（兜底，非主路） |
+| 核心健康审计 | `lua/utils/core_health*.lua` + `scripts/nvim_core_health.lua` | `lua/utils/AGENTS.md` + `scripts/AGENTS.md` | `nvim-core-functionality-audit`、`codebase-health-audit` | `core_health` | 隔离、只读、可机器判定的启动/编辑/AST/搜索/clangd/CDB/target plan 证据 |
+| 平台驱动 | `lua/utils/platform/` | `lua/utils/platform/AGENTS.md` | `host-platform-driver`、`platform-tool-resolution`、`shell-command-planning` | `platform` `ue_platform_boundary` | 唯一允许做 OS 分支的地方；host 选 shell executable，shell helper 只组 argv/quote |
+| 探针反馈 | `lua/utils/probe.lua` | `lua/utils/AGENTS.md` | `probe-feedback-loop` | `probe` | 主动埋证据；会话开头先读 `:UEProbeReport` |
+| 宿主资源感知/动态纪律 | `lua/utils/cpu_load.lua` + `host_admission.lua` + `clangd_resource_controller.lua` + `lua/ue/index/_admission.lua` | `lua/utils/AGENTS.md` + `lua/ue/index/AGENTS.md` | `editor-behavior-regression`、`cpp-semantic-index-coverage` | `cpu_admission` `host_resource_discipline` `clangd_resource` `index_delivery` `ue_config` `stability` | host 1Hz / Neovim 4Hz 常驻感知；batch 推迟、前台优先、owned clangd 可逆降优先级 |
+| 任务管理 | `lua/utils/task_registry.lua` | `lua/utils/AGENTS.md` | `task-management` | `task_registry` `commands` | `Tasks`/`TaskStop`/`TaskStopAll` 通用后台任务 |
+| 通知历史 | `lua/utils/` 通知层 | `lua/utils/AGENTS.md` | `notification-history` | `utils` | 不做周期 ticker（P5） |
+| workaround 注册表 | `lua/workarounds/` | `lua/workarounds/AGENTS.md` | 无对应 capability | `workarounds` `smoke` | 上游 bug 补丁，带 frontmatter |
+| 配置层 | `lua/config/` | `lua/config/AGENTS.md` | `keymap-command-regression`、`editor-behavior-regression` | `keymaps` `commands` `options` `autocmds` | keymaps / options / autocmds / lazy |
+| 主题 | `lua/theme.lua` + `colors/` | `lua/AGENTS.md` | `curated-theme-entrypoints` | `theme` `smoke` | 策展式主题入口 |
+| 插件层 | `lua/plugins/` | `lua/plugins/AGENTS.md` | 无对应 capability | `smoke` | per-plugin setup（snacks-only） |
+| vendored 依赖 | `lua/nio/`、`lua/trouble/` | 各自 `AGENTS.md` | 无对应 capability | `smoke` | 第三方内联副本，不自行重构 |
+| 回归测试 | `tests/` | `tests/AGENTS.md` | `headless-test-harness`、`config-regression-suite`、`test-regression-policy`、`structure-discoverability-regression` | 改动对应域 + `structure` | headless 套件 + 分范围回归映射 |
+| 规则/知识库 | `AGENTS.md`、`docs/`、`memory/`、`decisions/`、`lessons/` | `docs/AGENTS.md` | `project-constraints-doc`、`ai-knowledge-base`、`local-subsystem-rules`、`spec-authority-loop` | `structure` | 单一内容源 + 四区知识库 + spec 权威 |
+| 公开镜像隐私 | 本地 git hooks（worktree 外） | 根 `AGENTS.md` | `public-mirror-privacy` | 不适用（本地门禁） | denylist 只在本机；fail closed |
 
 > 每个主要目录同时有一份 `CLAUDE.md`（内容为 `@AGENTS.md` 导入 stub），供 Claude 读取。
 
@@ -60,7 +70,8 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 快速部署按能力选择 root 或已验证的 debuggable app-private transport；正常 APK 安装和未 strip
 主机符号文件仍是正式流程与调试真相。当前 matrix：macOS 只执行 Mac/IOS，Windows 只执行
 Win64/Android，Linux 只执行 Linux；Mac 与 IOS target 独立，Android PowerShell transport 继续
-保持 Windows-only，iOS DAP 未实现且不 fallback 到 Mac。
+保持 Windows-only；iOS DAP 在 macOS 上通过独立 legacy MobileDevice/debugserver handler 执行，
+不 fallback 到 Mac process attach。
 
 ## 知识库各区
 

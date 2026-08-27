@@ -409,8 +409,9 @@ t.describe("cpp semantic client: runtime controlled manifests", function()
     }
     local root = vim.fn.tempname():gsub("\\", "/") .. "_semantic_runtime_fp"
     local ok, err = xpcall(function()
-      local clangd = root .. "/llvm/bin/clangd.exe"
-      local libclang = root .. "/llvm/bin/libclang.dll"
+      local host_driver = require("utils.platform").driver()
+      local clangd = root .. "/llvm/bin/clangd" .. tostring(host_driver.exe_suffix or "")
+      local libclang = root .. "/llvm/bin/libclang" .. host_driver.shared_library_extension()
       local compile_commands = root .. "/engine/compile_commands.json"
       local state_json = root .. "/state/state.json"
       local current_index = root .. "/indices/current.idx"
@@ -540,6 +541,29 @@ t.describe("cpp semantic client: NDJSON framing", function()
     })
     vim.wait(1000, function() return delivered ~= nil end)
     t.assert_eq(delivered.state, "unavailable")
+  end)
+end)
+
+t.describe("cpp semantic client: request timeout", function()
+  t.it("aborts an unresponsive sidecar instead of leaving future requests queued", function()
+    client._reset_for_test()
+    t.assert_eq(client.REQUEST_TIMEOUT_MS, 32000,
+      "documented 31s cold lookups need 1s of slack without exceeding the 32s live-health budget")
+    local job = vim.fn.jobstart({
+      vim.v.progpath, "--headless", "-u", "NONE", "-c", "sleep 10", "-c", "qa",
+    })
+    t.assert_true(job > 0, "fixture sidecar must start")
+    client._set_process_for_test(job, true)
+    local response
+    client._inject_pending_for_test(11, function(value) response = value end)
+
+    t.assert_true(client._expire_pending_for_test(11))
+    t.assert_eq(response.state, "unavailable")
+    t.assert_eq(response.reason, "semantic sidecar request timed out")
+    t.assert_eq(client.status().pending, 0)
+    local exit = vim.fn.jobwait({ job }, 1000)[1]
+    t.assert_true(exit ~= -1, "timed-out sidecar must be terminated immediately")
+    client._reset_for_test()
   end)
 end)
 

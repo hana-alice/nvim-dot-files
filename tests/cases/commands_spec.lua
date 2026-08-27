@@ -5,7 +5,7 @@
 local t = require("tests.harness")
 local cfg = t.bootstrap()
 
--- 78 个 UE* 命令冻结清单（来自 lua/ue.lua + lua/ue/*.lua）。
+-- 81 个 UE* 命令冻结清单（来自 lua/ue.lua + lua/ue/*.lua）。
 local UE_COMMANDS = {
   "UEBuild", "UEBuildAndroid", "UEBuildAndroidSO", "UEBuildIOS", "UEBuildPCH", "UECachePaths", "UECDBPartition",
   "UECDBStatus", "UECDBSwitch", "UECheatsheet", "UECheatsheetEdit", "UEClearCache",
@@ -19,17 +19,17 @@ local UE_COMMANDS = {
   "UEDAPWatchUE", "UEDebugLogToggle", "UEDirtyClear", "UEDirtyStatus",
   "UEDeployAndroidSO", "UEExportCompileCommands", "UEGenerateFromRSP", "UEGrepDiagDump",
   "UEGrepGroupingToggle", "UEGrepTraceShow", "UEGrepTraceToggle", "UEIndexFull",
-  "UEIndexHot", "UEIndexNow", "UEIndexStatus", "UEIndexTimings", "UEInstallAndroid", "UEInstallIOS",
-  "UEIOSSymbols", "UELaunch", "UELogToggle", "UEPackageIOS", "UEPaths", "UEPrepare", "UEPrepareIncremental",
-  "UEPrepareReindex", "UEPrepareSync", "UEResetLayout", "UESetAndroidDevice",
-  "UESetAndroidPackage", "UESetIOSDevice", "UESetPlatform", "UESetProject", "UESetUprojectRelativePath", "UEWatchFlush",
+  "UEIndexHot", "UEIndexNow", "UEIndexStatus", "UEIndexTimings", "UEInstall", "UEInstallAndroid", "UEInstallIOS",
+  "UEIOSSetup", "UEIOSSymbols", "UELaunch", "UELogToggle", "UEPackageIOS", "UEPaths", "UEPrepare", "UEPrepareIncremental",
+  "UEPrepareReindex", "UEPrepareSync", "UEReloadScanPaths", "UEResetLayout", "UESetAndroidDevice",
+  "UESetAndroidPackage", "UESetIOSDevice", "UESetIOSSigningCertificate", "UESetPlatform", "UESetProject", "UESetUprojectRelativePath", "UEWatchFlush",
   "UEWatchStatus", "UEWatchStop",
 }
 
 t.describe("commands: UE* 全量注册", function()
   require("ue").setup()
-  t.it("冻结清单含 78 个命令", function()
-    t.assert_eq(#UE_COMMANDS, 78)
+  t.it("冻结清单含 81 个命令", function()
+    t.assert_eq(#UE_COMMANDS, 82)
   end)
   for _, c in ipairs(UE_COMMANDS) do
     t.it(":" .. c .. " 已注册", function()

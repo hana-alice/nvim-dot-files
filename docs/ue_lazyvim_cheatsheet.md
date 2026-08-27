@@ -230,6 +230,11 @@ Use with `c`, `d`, `y`, `v`: `{operator}{a/i}{object}`
 | `@@`             | Repeat last macro                       |
 | `{n}@{a-z}`      | Play macro N times                      |
 
+SSH / Zellij TUI 会强制用 OSC 52 把 `y` / `"+y` 穿透到宿主终端剪贴板；即使持久 Zellij session
+没有 `SSH_TTY`，`ZELLIJ` 也会启用该路径。OSC 52 paste 被刻意禁用，避免终端拒绝剪贴板读取时卡顿；
+Windows → 远程 Nvim 请在 insert 模式使用 Rio 的终端粘贴（默认 `<C-S-v>`），由 bracketed paste
+直接送入 Nvim。原生 Windows 与 Neovide 保持各自的剪贴板 provider。
+
 ## Vim Fundamentals — Folds
 
 | Key              | Action                                  |
@@ -739,18 +744,20 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `:UESetPlatform`          | Interactive platform+config select  |
 | `:UESetPlatform Win64 Development Editor` | Direct set         |
 | `<leader>ub`              | `:UEBuild` (platform from `:UESetPlatform`); on macOS, silent stages show a process-tree heartbeat in the same terminal |
-| `:UECompileForNvim`       | Build current target, generate tuple-scoped IOS CDB evidence when RSP is absent, then prepare clangd semantics |
+| `:UECompileForNvim`       | Compatibility entry: build current target, then delegate to the normal `UEPrepare` path |
 | `:UEBuildIOS`             | Build IOS C++ through native macOS UBT; safely reuse unchanged AOT outputs and defer dSYM |
+| `:UEIOSSetup`             | Optional explicit rerun of IOS prepared identity/private-key/device setup |
+| `:UESetIOSSigningCertificate` | Import this workspace's prepared debug identity when present, otherwise select one; exact name/SHA-1 supported, `!` clears |
 | `:UEPackageIOS`           | Reuse existing cooked data, then stage/package IOS; never build, cook, archive, deploy, or run |
 | `:UEIOSSymbols`           | Generate the current IOS binary's dSYM on demand and verify Mach-O UUIDs; no ZIP |
-| `:UESetIOSDevice`         | Select an available physical iOS device from CoreDevice JSON |
-| `:UEInstallIOS`           | Install the current package task's `.app`; does not launch |
+| `:UESetIOSDevice`         | Merge live CoreDevice/USB/Wi-Fi candidates and open a picker; saved offline devices are labeled and never auto-substituted |
+| `:UEInstallIOS`           | CoreDevice: install current packaged `.app`; pre-iOS17: stream signing/upload/Upgrade progress through prepared `InstallIOSClient.sh`; never uninstall or launch |
 | `<leader>us`              | `:UEBuildAndroidSO` — export + execute UBT compile/link actions (no Deploy/Gradle/APK) |
 | `<leader>uq`              | `:UEDeployAndroidSO` — strip, push, atomically replace and verify `libUE4.so`; leaves the app stopped |
-| `<leader>uB`              | `:UEPrepare` (symbols + compile_commands) |
+| `<leader>uB`              | `:UEPrepare`; IOS on macOS also generates its semantic CDB and auto-runs first-use setup |
 | `<leader>uc`              | `:UEExportCompileCommands`          |
 | `<leader>ul`              | `:UELaunch` (no debugger)           |
-| `<leader>ui`              | `:UEInstallAndroid` (APK to selected device via `adb -s`; does not launch) |
+| `<leader>ui`              | `:UEInstall` (active Android → `adb install -r`; active IOS → signed staged `.app` in-place update; neither launches) |
 | `<leader>ug`              | `:UELogToggle` (toggle app log)     |
 | `<leader>uL`              | `:UELogToggle` (alias)              |
 | `<leader>uD`              | `:UEDebugLogToggle` (Windows debug log) |
@@ -764,15 +771,50 @@ Android 选择写入当前 Neovim **进程内**的全局变量
 `adb -s <serial>`；切换设备时再次执行 `<leader>uA`。该值既不会跨 Neovim 重启持久化，
 也不会影响同时运行的另一个 Neovim 实例。
 
-iOS 的设备、artifact、bundle id 与 process 状态保存于 IOS-scoped runtime state，
-不与 Android 或 Mac target 共用。C++ 日常迭代顺序是 `:UEBuildIOS` → `:UEPackageIOS` → `:UESetIOSDevice` →
-`:UEInstallIOS` → `:UELaunch`。package/install 需要有效签名；无签名或无可用真机时会在只读
-preflight 失败，不会回退到 UE legacy fastlane/ideviceinstaller/instruments。
+iOS 首次 `:UEPrepare` 会自动完成原 `:UEIOSSetup` 的职责：读取 `PrepareIOSQADebug.sh` 生成的
+`Saved/IOSQADebug/signing.json`，用临时复制的 `/usr/bin/true` 做一次真实 `codesign`（退出时无条件
+删除），并在只连接一台可用设备时自动保存 identifier/backend；legacy 设备还会验证 branch 对应
+`InstallIOSClient.sh`。`:UEIOSSetup` 保留为显式重跑/诊断入口。证书可被
+`security find-identity` 枚举并不代表私钥可用，因此 setup 和后续签名 preflight 都会在克隆/重签大型
+app 之前执行这个快速探针；它不读取或保存 keychain 密码。Setup 不会在缺少 prepared manifest 时退回
+人工 picker，异步期间切换 project 或 project-state 写入失败也会中止而不是误报 ready。
+
+完整流程是 `:UESetProject <workspace>` 与 `:UESetPlatform IOS` 任意顺序 → `<leader>ub` →
+`:UEPrepare` → `<leader>ui`。`UEPrepare` 不触发编译；它依赖前一步 build 的稳定产物，并为 IOS
+补充 tuple-scoped semantic CDB 后建立 clangd/CDB/index 环境。若该次 build 早于 Nvim build marker
+功能，`UEPrepare` 会从精确匹配 tuple 且 launch product 存在的 UBT `.target` receipt 迁移证据，不要求
+重复 build；生成 semantic CDB 时会仅对该子进程跳过工程 Build.cs 的 AOT 副作用。同一 build 已发布且
+文件签名未变时，后续 `UEPrepare` 直接复用 semantic source，不再启动 `Build.sh`/UBT。UE 工程的 clangd
+LSP 会验证当前 tuple 持久化的 selection/manifest/controlled CDB 与源 CDB 签名；这些工件仍为 ready 时，
+重启 Neovim 后直接由原生 `FileType` 事件启动，不要求重复 `UEPrepare`。只有工件缺失、stale 或 tuple/build
+evidence 变化时才继续 defer，避免按旧/空 CDB 扫描数千文件；普通非 UE C++ 工程仍按原规则自动启动 clangd。
+
+iOS 签名 identity 也可通过 `:UESetIOSSigningCertificate` 单独设置。无参数时，如果
+`PrepareIOSQADebug.sh` 已在标准项目或 `workspace/Source/SampleGame` 布局写入
+`Saved/IOSQADebug/signing.json`，命令会先验证 debug/profile 存在性/Bundle/Team 契约，再按 SHA-1 和显示名
+精确复验 keychain 并导入；没有 manifest 时才显示异步 picker。也可以显式传入精确证书名或 SHA-1；
+选择按 project 保存，`:UESetIOSSigningCertificate!` 清除。manifest 存在但损坏或 stale 时不会回退
+到其他证书。纯 `:UEBuildIOS` 在未选证书时仍可 compile/link；`:UEPackageIOS` / `:UEInstallIOS` 必须
+精确复验已选 identity，不会使用 keychain 中“第一张有效证书”。设备、artifact、bundle id 与 process
+状态保存于 IOS-scoped runtime state，不与 Android 或 Mac target 共用。CoreDevice 日常顺序是
+`:UEBuildIOS` → `:UEPackageIOS` → `:UESetIOSDevice` → `:UEInstallIOS` → `:UELaunch`；pre-iOS17 legacy
+设备可在 `:UEBuildIOS` 后直接安装当前 tuple app，但必须存在匹配的 `Saved/IOSQADebug/signing.json`
+和 `~/Documents/temp/<branch>/InstallIOSClient.sh`。helper 只克隆/重签、封装临时 IPA 并原地更新，
+不会修改源 app、卸载旧 app 或启动进程；设备发现和安装都使用持续更新的进度句柄，legacy usbmux
+失联会先调用同目录 `ResetIOSUSB.sh` 软件恢复再重新探测；picker 中选择 `saved, offline` 的 USB 设备也会
+以该精确 UDID 尝试刷新路由并始终重新探测，不会改选其他设备。目标不在 IOKit、无法物理恢复时只记录
+warning；单次重新探测后仍离线便结束当前操作，不会重复弹出相同 picker。legacy `:UELaunch` 会复用 manifest 中的
+prepared signed app；若保存的设备不在实时 USB/Wi-Fi/CoreDevice 结果中，会先弹 picker 而不是改选唯一
+候选。确认选择后以对应 transport 执行 `ios-deploy --noinstall --justlaunch` 并复查 PID；Nvim 重启后
+也不要求重新 package/install，且不会触发 codesign 私钥探测或 DAP。
 
 `:UEBuildIOS` 的第一次构建（或 AOT 输入、工具链、SDK、framework 产物发生变化后）仍执行完整 AOT；
 只有输入指纹相同且上次成功构建记录的 framework 路径与内容 hash 全部匹配时，Nvim 才注入
 `bSkipAOTProcess=true`。日常构建固定以命令行 INI override 关闭自动 dSYM；需要调试/符号化时再执行
-`:UEIOSSymbols`，避免每次编译都支付 `dsymutil` 与 ZIP 的时间和磁盘成本。
+`:UEIOSSymbols`，避免每次编译都支付 `dsymutil` 与 ZIP 的时间和磁盘成本。AOT 输入的 content hash
+另有 path/device/inode/size/纳秒 mtime/ctime metadata cache；metadata 全同才复用摘要，任何变化都会
+重新 hash，framework output 始终逐个校验。Build.sh 本身始终执行，由 UBT action graph 跳过未变化的
+C++ compile/link action；`:UEBuildIOS` 不使用 `-SkipBuild`。
 
 ### Less-common UE commands
 
@@ -787,7 +829,9 @@ have no key bound by default:
 | `:UEGenerateFromRSP`   | Re-export ccjson from cached `.rsp`     |
 | `:UEBuildAndroid`      | Force Android build target              |
 | `:UEBuildIOS`          | Build only the IOS target                |
-| `:UECompileForNvim`    | Build + RSP/CDB semantic prepare         |
+| `:UEIOSSetup`          | Explicitly rerun IOS signing/private-key/device setup |
+| `:UESetIOSSigningCertificate` | Select/clear project IOS signing identity |
+| `:UECompileForNvim`    | Compatibility: build then normal prepare |
 | `:UEPackageIOS`        | Stage/package existing IOS cooked data   |
 | `:UEIOSSymbols`        | Generate + UUID-check IOS dSYM on demand |
 | `:UESetIOSDevice`      | Select physical IOS device               |
@@ -824,8 +868,8 @@ have no key bound by default:
 
 Typical first-run workflow (see the README for the full step list):
 
-1. `:UESetProject` — bind project + engine root (persisted)
-2. `:UESetPlatform Win64 Development Editor`
+1. `:UESetProject` and `:UESetPlatform Win64 Development Editor` — either order
+2. Confirm both project and target selections
 3. Build once for the platform (`<leader>ub` / `:UEBuild`) — `:UEPrepare`
    derives its compile flags from a real platform build
 4. `:UEPrepare` — CDB pipeline + csearch index + clangd reload
@@ -860,8 +904,9 @@ Notes:
 
 Source: `lua/config/keymaps.lua` (`<leader>d*` block + `dap_fkeys` table). All
 keys call the **platform-neutral `:UEDAP*` user commands** defined in
-`lua/ue.lua`. `:UEDAPAttach android` dispatches to the Android handler; on
-Win64 the same commands target the local debugger. (The older
+`lua/ue.lua`. With no argument they dispatch to the active target; explicit
+arguments such as `:UEDAPAttach android` still force one handler. IOS uses its
+own physical-device handler, while Win64 targets the local debugger. (The older
 `UEAndroidDAP*` route is gone — do not look for it.)
 
 The `<F5/F6/F9/F10/F11/S-F11>` set is bound in **n / i / t / v** modes
@@ -872,8 +917,8 @@ literal `<F5>` in insert mode).
 
 | Key | Command | Action |
 |---|---|---|
-| `<leader>da` | `:UEDAPAttach android` | Attach to the Android process |
-| `<leader>dl` | `:UEDAPLaunch android` | Launch + auto-attach |
+| `<leader>da` | `:UEDAPAttach` | Attach to the active target process |
+| `<leader>dl` | `:UEDAPLaunch` | Launch active target + auto-attach |
 | `<leader>dc` / `F5` | `:UEDAPContinue` | Continue |
 | `<leader>dp` / `F6` | `:UEDAPPause` | Pause |
 | `<leader>dn` / `F10` | `:UEDAPStepOver` | Step over |

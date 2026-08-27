@@ -7,7 +7,8 @@
 跨子系统复用的工具：`platform`（OS 分支唯一收口）、`log`（旋转日志）、`lsp_fallback`（gd/gr 兜底）、
 `ue_goto/`（goto 解析栈）、`code_search/`（csearch）、`ue_paths`（路径分类）、`sidebar`/`cheatsheet`/
 `restart`/`recent_projects`/`async_launcher`/`ue_watch`/`ue_launch`/`ue_logs`/`dirty_files`/
-`task_registry`（后台任务列出/停止）、`android_device`（当前 Neovim 进程的 ADB serial 选择与路由）等。
+`task_registry`（后台任务列出/停止）、`cpu_load` / `host_admission` / `clangd_resource_controller`
+（宿主感知→统一决策→owned 长驻服务可逆降级）、`android_device`（当前 Neovim 进程的 ADB serial 选择与路由）等。
 
 ## 专属约定
 
@@ -20,6 +21,9 @@
 - **LSP 行为只走 `lsp_fallback.lua`**，不全局覆盖 `vim.lsp.handlers`。→ P3
 - 纯函数模块（`ue_paths`、`ue_goto/location|semantic_context|semantic_protocol`）有行为回归，改契约前看断言。
 - 单一职责、小文件：新功能优先新模块而非堆进现有大文件。
+- **新增 process spawn 必须先分类宿主资源语义**：`vim.system` / `jobstart` / `termopen` /
+  `vim.loop|uv.spawn` / `vim.lsp.rpc.start` 都受 `host_resource_discipline` 回归清单约束；新增点必须声明为
+  admitted batch / foreground / long-lived 或带精确理由的短命豁免，禁止按整个文件/API 放行。
 - **新增后台 job（`jobstart`/`vim.system`/`termopen`）接入 `task_registry`**：唯一允许的接入是在 job
   创建语句**之后**加一行 `pcall(require("utils.task_registry").register, { name, group, kind="job"|"system", handle })`。
   **不要**在 `on_exit`/完成回调里回写状态——状态是派生量，由 `task_registry.status()` 实时查句柄得出
@@ -37,3 +41,9 @@
 ## 先读
 
 `../../docs/architecture-symbol-resolution.md`、`../../docs/architecture/overview.md` §5。
+
+**治理 spec**（可观察行为的权威；与本文冲突时以 spec 为准）：
+`../../openspec/specs/probe-feedback-loop/spec.md`、
+`../../openspec/specs/task-management/spec.md`、
+`../../openspec/specs/global-android-device-selection/spec.md`、
+`../../openspec/specs/notification-history/spec.md`。

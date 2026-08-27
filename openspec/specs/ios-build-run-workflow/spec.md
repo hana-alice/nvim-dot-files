@@ -23,25 +23,31 @@ MUST：系统必须把 iOS Build/Package/Install/Launch 作为应用生命周期
 
 ### Requirement: IOS 平台策略必须由独立 target driver 实现
 
-MUST：所有 IOS-specific UBT/UAT 参数、签名预检、产物识别、设备发现、安装与启动规则必须由 IOS target-driver 模块拥有；核心调度层及其他 target driver 不得包含这些实现。
+MUST：所有 IOS-specific UBT/UAT 参数、签名预检、产物识别、设备发现、安装与启动规则必须由 IOS target workflow owner 拥有；IOS target driver 只负责产出可验证的 structured plan 和 policy contract，generic runner 负责执行该 plan。核心调度层及其他 target driver 不得包含这些实现，也不得以 `lua/ue.lua` 的源码位置、行号、函数名或局部实现片段作为归属或验收锚点。
 
 #### Scenario: 核心层分派 iOS Package
 
 - **WHEN** 用户执行 `:UEPackageIOS`
-- **THEN** 核心层必须通过 target registry 调用 IOS driver 的统一 contract
+- **THEN** 核心层必须通过 target registry 取得 IOS workflow owner 的 structured plan，并交给 generic runner 执行
 - **AND** 核心层不得构造 BuildCookRun 参数、iOS artifact 路径或签名策略
 
 #### Scenario: IOS 与 Mac 共享 macOS host tools
 
-- **WHEN** IOS driver 与 Mac driver 都使用 macOS host driver 提供的 executable/path primitive
-- **THEN** IOS package/device/install/launch 策略必须只存在于 IOS driver
-- **AND** Mac driver 不得调用 IOS driver 或保存 IOS 状态
+- **WHEN** IOS workflow owner 与 Mac driver 都使用 macOS host driver 提供的 executable/path primitive
+- **THEN** IOS package/device/install/launch 策略必须只存在于 IOS workflow owner
+- **AND** Mac driver 不得调用 IOS workflow owner 或保存 IOS 状态
 
 #### Scenario: IOS 与 Android 都支持设备生命周期
 
 - **WHEN** IOS 与 Android 都实现 device/install/launch capability
-- **THEN** 两者必须分别拥有设备状态、命令规划、结果解析和错误语义
-- **AND** 任一 driver 不得把另一 driver 作为 fallback
+- **THEN** 两者必须分别拥有各自的 workflow owner、设备状态、命令规划、结果解析和错误语义
+- **AND** 任一 owner 不得把另一 owner 作为 fallback
+
+#### Scenario: 验收不得绑定源码位置
+
+- **WHEN** 回归或评审验证 IOS workflow ownership
+- **THEN** 断言必须基于 contract / behavior / plan output，而不是 `lua/ue.lua` 的行号、函数名或源码片段
+- **AND** workflow controller 在不同文件间移动时，只要 contract 不变，结果必须保持一致
 
 #### Scenario: 多个 driver 使用共享 helper
 
@@ -66,33 +72,53 @@ MUST：当 active platform 为 `IOS` 时，`UEBuild` 与 `UEBuildIOS` 必须使�
 - **THEN** 调用方必须把包装脚本结果作为 build 进程状态
 - **AND** 不得在 Neovim 层重新解释未直接暴露的原始 UBT 状态码
 
+#### Scenario: 通用构建快捷键选择 IOS
+
+- **WHEN** active platform 为 `IOS` 且用户执行 `<leader>ub` / `:UEBuild`
+- **THEN** IOS driver 交给 `Build.sh` 的 argv 必须依次包含 target、`IOS`、configuration、
+  `-Project=<UPROJECT>`、`-WaitMutex`、`-FromMsBuild` 与 `-disablev8pointercompression`
+- **AND** `-disablev8pointercompression` 必须由 IOS target policy 拥有，不得从共享 host/core 层
+  泄漏到 Mac、Win64、Linux 或 Android target
+
 ### Requirement: iOS C++ 日常编译必须安全复用 AOT 并延后 dSYM
 
-MUST：Nvim 可以通过构建环境复用工程既有的 AOT 产物，但只有输入、SDK/工具链与上次成功产物均可证明未变时才允许跳过 AOT。日常编译必须通过命令行 override 关闭自动 dSYM；符号必须由独立命令按需生成。
+MUST：日常 iOS C++ 编译必须继续调用 Build.sh，让 UBT 的当前 target makefile/action graph 判定
+C++ compile/link actions；不得用 `-SkipBuild` 代替增量编译。AOT、自动 dSYM、Package Build/Cook 与
+clean-stage 只能按各自独立证据跳过，任一证据失效不得污染其他阶段的判定。
 
-#### Scenario: 首次构建或 AOT 输入变化
+#### Scenario: 只修改一个 C++ implementation 文件
 
-- **WHEN** AOT cache manifest 不存在、任一输入指纹变化、工具链/SDK 变化或记录的 framework 缺失
-- **THEN** wrapper 必须清除继承的 skip/disable AOT 环境并执行完整 AOT
-- **AND** 只有原生构建成功且 framework 产物存在后才可原子发布新 manifest
+- **WHEN** 用户执行 `:UEBuildIOS`，且只有当前 tuple 的部分 C++ action 过期
+- **THEN** wrapper 必须调用 Build.sh 并让 UBT 执行过期 action、复用未变化 action
+- **AND** 不得向该 build 添加 `-SkipBuild`
 
-#### Scenario: AOT 输入与产物均可证明未变
+#### Scenario: AOT 输入与上次成功输出均可证明未变
 
-- **WHEN** 当前指纹与上次成功 manifest 一致，且全部记录产物的路径与内容 hash 均匹配
-- **THEN** wrapper 可以仅为当前 build 子进程设置 `bSkipAOTProcess=true`
-- **AND** cache 状态必须写在 engine `.cache/nvim-ue`，不得修改工程或引擎代码
+- **WHEN** 当前 tuple、SDK/toolchain、全部 AOT 输入与上次成功 framework manifest 匹配
+- **THEN** wrapper 可以只为当前 build 子进程设置 `bSkipAOTProcess=true`
+- **AND** 只有 path/device/inode/size/mtime/ctime 全部未变化时，才可以复用输入的已记录 content hash
+- **AND** 必须继续验证全部记录的 output artifact
 
-#### Scenario: 日常 C++ 编译
+#### Scenario: AOT 输入 metadata 变化或证据不完整
+
+- **WHEN** 任一输入 path/size/mtime 变化、cache/manifest 缺失、工具链变化或 output 校验失败
+- **THEN** wrapper 必须重新计算对应输入 content hash
+- **AND** cache miss 必须清除继承的 skip/disable AOT 环境并执行完整 AOT
+- **AND** 只有原生构建成功且 framework 产物完整后才可原子发布新 manifest
+
+#### Scenario: 日常 build 不需要 dSYM
 
 - **WHEN** 用户执行 `:UEBuildIOS`
-- **THEN** Build.sh argv 必须稳定关闭 `bGeneratedSYMFile` 与 `bGeneratedSYMBundle`
-- **AND** 不得关闭对象文件中的编译调试信息
+- **THEN** Build.sh argv 必须稳定关闭自动 dSYM 与 dSYM bundle/ZIP
+- **AND** 不得关闭 object file 中的编译调试信息
+- **AND** `:UEIOSSymbols` 必须按需生成 dSYM 并验证 binary/dSYM UUID
 
-#### Scenario: 用户需要符号化
+#### Scenario: 本地增量 package
 
-- **WHEN** 用户执行 `:UEIOSSymbols`
-- **THEN** 系统必须对当前 tuple 的 IOS binary 运行 `dsymutil`，且不生成 ZIP
-- **AND** 必须用 `dwarfdump --uuid` 验证 binary 与 dSYM UUID 集合一致
+- **WHEN** 当前 tuple 已有成功 build 与明确可复用的 cooked data
+- **THEN** `:UEPackageIOS` 必须使用 `-skipbuild -skipcook -stage -nocleanstage -package -nodebuginfo`
+- **AND** 不得执行 Build、Cook、Archive、Deploy 或 Run
+- **AND** release/distribution 的 clean pipeline 不得复用该 local-iteration 假设
 
 ### Requirement: iOS 本地组包必须使用既有 cooked 数据
 
@@ -112,21 +138,114 @@ MUST：`UEPackageIOS` 必须通过 macOS `RunUAT.sh BuildCookRun` 复用已存�
 - **THEN** 系统必须将 package 标记为 failed 并显示失败阶段
 - **AND** 不得自动继续安装或启动
 
-### Requirement: 签名与工具链必须只读预检
+### Requirement: 签名与工具链必须非破坏预检
 
-MUST：系统必须按阶段检查 iOS 工具链：Build 前检查 Xcode、iPhoneOS SDK、引擎自带 dotnet 与原生编译入口；Package/Install 前额外检查 code-sign identity、工程 iOS settings 与 UBT/UAT provisioning 推导可解析性。
+MUST：系统必须按阶段检查 iOS 工具链，并提供 `:UESetIOSSigningCertificate[!] [identity]` 从当前
+macOS keychain 的有效 code-sign identities 中为当前 project 显式选择、直接设置或清除签名证书。
+无参数命令在 `PrepareIOSQADebug.sh` 已为当前 workspace 写入 `Saved/IOSQADebug/signing.json` 时，
+必须优先导入其中的精确 identity；没有该 manifest 时才显示 picker。
+Build 在存在显式选择时必须捕获并复验它；Package/Install/debug 必须要求、捕获并精确复验所选
+identity。系统不得仅验证“至少有一张有效证书”，不得静默选择第一张，也不得自动导入证书、读取
+私钥密码或修改工程签名配置。
 
-#### Scenario: 没有有效签名身份但只执行编译
+IOS `:UEPrepare` 必须把一次性 Nvim 配置收敛为其 Apple 前置分支：导入 prepared identity、
+使用 Nvim 自有临时 Mach-O 实际证明非交互 `/usr/bin/codesign` 能使用对应私钥、选择当前唯一可用设备，
+并在 legacy backend 下验证 branch helper 存在。私钥探针不得修改工程、prepared app、keychain 或设备，
+且必须无条件清理临时副本。`:UEIOSSetup` MAY 保留为显式重跑/诊断入口，但不得成为正常流程的必需步骤。
 
-- **WHEN** Xcode 与 SDK 可用、没有有效 code-sign identity，且用户只执行 `:UEBuildIOS`
-- **THEN** 系统必须允许不依赖签名的编译阶段继续
-- **AND** 必须将 Package/Install 的签名 gate 标记为未满足
+#### Scenario: 一次性配置通过后进入日常循环
 
-#### Scenario: 没有有效签名身份且准备打包
+- **WHEN** 用户已成功运行 `PrepareIOSQADebug.sh` 与 `InstallIOSClient.sh`，设置 project/IOS target、
+  完成 `<leader>ub`，随后执行 `:UEPrepare`
+- **THEN** 系统必须精确导入 prepared identity，并在只有一台可用设备时自动保存
+  device identifier 与 backend
+- **AND** 必须通过真实临时签名证明私钥可由非交互 `/usr/bin/codesign` 使用后才报告 ready
+- **AND** legacy backend 必须在报告 ready 前验证 branch 对应 `InstallIOSClient.sh` 存在且可执行
+- **AND** setup 成功后必须继续生成 Apple semantic CDB 并完成公共 prepare pipeline
+- **AND** 正常流程必须收敛为 project/platform 任意顺序 → `<leader>ub` → `:UEPrepare` → `<leader>ui`
 
-- **WHEN** keychain 中没有有效 code-sign identity 且用户执行需要签名的 Package/Install 阶段
-- **THEN** 系统必须在需要签名的阶段前失败并列出缺失条件和人工修复方向
-- **AND** 不得自动导入证书、读取私钥密码或修改工程签名配置
+#### Scenario: 证书可枚举但私钥不能用于非交互签名
+
+- **WHEN** `security find-identity` 能精确找到 prepared identity，但临时 Mach-O 的真实签名返回
+  `errSecInternalComponent`、interaction-not-allowed 或其他私钥访问错误
+- **THEN** `:UEIOSSetup`、显式签名选择及后续已配置 build/install 必须在重签工程 artifact 前失败
+- **AND** 不得保存新的已验证选择、修改 app 或触碰设备
+- **AND** 错误必须指向 login keychain 与 `/usr/bin/codesign` 的持久访问权限，不得把它误报成 device/artifact 问题
+
+#### Scenario: Setup 缺少 prepared 清单
+
+- **WHEN** 用户执行 `:UEIOSSetup`，但当前 workspace 没有有效的 prepared signing manifest
+- **THEN** setup 必须 fail closed 并指向 `PrepareIOSQADebug.sh`
+- **AND** 不得退回通用 signing picker；通用 `:UESetIOSSigningCertificate` 仍可保留 picker 行为
+
+#### Scenario: Setup 异步期间上下文或状态失效
+
+- **WHEN** signing/device 探测期间 active project 发生切换，或 project-scoped runtime state 无法原子落盘
+- **THEN** setup 必须中止且不得把结果写入另一个 project
+- **AND** device/package/install/launch 不得在状态写入失败后报告 selected、ready、installed 或 launched
+
+#### Scenario: 无参数复用 PrepareIOSQADebug 签名
+
+- **WHEN** 用户执行 `:UESetIOSSigningCertificate`
+- **AND** 当前 project 或 `workspace/Source/SampleGame` 布局的 workspace 已存在
+  `Saved/IOSQADebug/signing.json`
+- **THEN** 系统必须验证 manifest version、完整 identity、仍存在的 profile、Bundle/Team 字段与
+  `get-task-allow=true`
+- **AND** 必须在当前 keychain 中精确复验 manifest 的 SHA-1 与显示名后保存为 project-scoped identity
+- **AND** 必须先用自有临时 Mach-O 证明该 identity 的私钥可被非交互 `/usr/bin/codesign` 使用
+- **AND** manifest 损坏、歧义或 stale 时必须失败，不得退回 picker 或选择另一张证书
+
+#### Scenario: 无 Prepare manifest 时从 picker 选择
+
+- **WHEN** 用户执行 `:UESetIOSSigningCertificate`
+- **AND** 当前 project 及其受支持 workspace 布局中没有 prepared signing manifest
+- **THEN** 系统必须异步探测当前有效 code-sign identities 并显示 picker
+- **AND** 选择结果必须保存为 project-scoped fingerprint 与显示名
+- **AND** 不得读取、复制或保存私钥、密码或 `.p12`
+
+#### Scenario: 通过参数设置签名证书
+
+- **WHEN** 用户传入精确显示名或 SHA-1 fingerprint
+- **THEN** 系统必须把它解析为当前 keychain 中唯一有效 identity 后再保存
+- **AND** 空匹配、重复匹配或过期 identity 必须失败且不覆盖原选择
+
+#### Scenario: 清除显式签名选择
+
+- **WHEN** 用户执行 `:UESetIOSSigningCertificate!`
+- **THEN** 系统必须清除当前 project 的显式 identity
+- **AND** 后续 Package/Install/debug 必须报告未配置，不能退回 keychain 第一张证书
+
+#### Scenario: 规划 iOS build 或 package
+
+- **WHEN** 当前 project 已选择有效 identity
+- **THEN** IOS driver 必须通过 argv 中的 Engine ini override 设置
+  `[/Script/IOSRuntimeSettings.IOSRuntimeSettings]:SigningCertificate`
+- **AND** 不得修改工程或 Engine ini 文件
+- **AND** 日志不得暴露完整证书名称、team id 或 fingerprint
+
+#### Scenario: 没有显式签名身份但只执行编译
+
+- **WHEN** Xcode 与 SDK 可用、当前 project 没有选择 identity，且用户只执行 `:UEBuildIOS`
+- **THEN** 系统必须允许不依赖签名的 compile/link 阶段继续
+- **AND** 必须把 Package/Install/debug 的签名 gate 标记为未满足
+
+#### Scenario: 没有显式签名身份且准备打包或调试
+
+- **WHEN** 用户执行 Package/Install/debug 且当前 project 没有选择 identity
+- **THEN** 系统必须在该阶段前失败并提示执行 `:UESetIOSSigningCertificate`
+- **AND** 不得因为 keychain 中存在其他有效 identity 而继续
+
+#### Scenario: 长任务开始后证书选择改变
+
+- **WHEN** build/package/install/debug 已捕获 identity 后用户修改全局选择
+- **THEN** 当前任务必须继续使用开始时捕获的 identity
+- **AND** 新选择只影响后续任务
+
+#### Scenario: 所选证书失效或消失
+
+- **WHEN** preflight 重新探测时无法精确匹配已捕获 identity
+- **THEN** 需要该 identity 的阶段必须在执行前失败
+- **AND** 不得自动选择另一张有效证书
 
 #### Scenario: SDK 或 Xcode 不可用
 
@@ -134,21 +253,57 @@ MUST：系统必须按阶段检查 iOS 工具链：Build 前检查 Xcode、iPhon
 - **THEN** 系统必须停止当前任务并报告探测结果
 - **AND** 不得回退到 Windows 或未知工具链
 
-### Requirement: 设备发现必须使用结构化 devicectl 输出
+### Requirement: 设备选择必须区分 CoreDevice 与 MobileDevice transport
 
-MUST：`UESetIOSDevice` 必须从 devicectl JSON 文件输出中选择可用物理 iOS 设备，不得解析面向人的表格文本，也不得调用 UE legacy fastlane 设备发现。
+MUST：`:UESetIOSDevice` 必须合并 devicectl 的 connected CoreDevice、`idevice_id -l` 的实时 USB
+MobileDevice 与 `idevice_id --network` 的实时 Wi-Fi MobileDevice。选择结果必须保存稳定 identifier、
+backend 与 transport；已保存设备不在实时结果中时必须进入 picker，不能自动改选另一台设备。
 
-#### Scenario: 存在多个可用设备
+#### Scenario: iOS 15 USB 设备只有 MobileDevice 可见
 
-- **WHEN** JSON 结果包含多个可用物理 iOS 设备
-- **THEN** 系统必须允许用户按非敏感显示信息选择
-- **AND** 必须保存稳定 device identifier，而不是依赖名称匹配
+- **WHEN** devicectl 没有 connected tunnel，但 xcdevice 报告同一台物理 USB iOS 15 设备 available
+- **THEN** picker 必须列出该设备并保存其 UDID 与 `legacy-mobiledevice` backend
+- **AND** 不得要求设备支持不存在的 CoreDevice tunnel
 
-#### Scenario: 没有可用设备
+#### Scenario: xcdevice 只包含 simulator、unavailable 或现代历史设备
 
-- **WHEN** 结果为空或所有设备均 unavailable
-- **THEN** 系统必须阻止 install/launch 并报告 no available iOS device
-- **AND** 不得选择历史设备或自动 fallback
+- **WHEN** xcdevice fallback 没有 available physical USB pre-iOS17 设备
+- **THEN** 系统仍必须使用 MobileDevice 实时 USB/Wi-Fi 结果构造 picker
+- **AND** 不得把 simulator 或 CoreDevice-unavailable 历史记录伪装成实时设备
+
+#### Scenario: 已保存设备离线但存在其他实时设备
+
+- **WHEN** Install/Launch 保存的 UDID 不在实时 USB、Wi-Fi 或 connected CoreDevice 结果中
+- **THEN** picker 必须同时展示实时候选与带 `saved, offline` 标记的保存设备
+- **AND** 系统不得自动切换到唯一的其他设备；用户选择实时候选后才更新 backend/transport
+- **AND** 用户选择保存的 offline USB 设备时，系统必须以该精确 UDID 刷新 USB/MobileDevice 路由并重新探测
+- **AND** 刷新不得改选其他设备；物理恢复失败必须保留 warning 证据，单次重新探测后仍离线必须结束当前操作
+- **AND** 系统不得重复打开相同 picker；只有用户下一次显式 Launch/设备选择才可开始新一轮选择
+
+#### Scenario: legacy 设备安装当前 tuple app
+
+- **WHEN** 当前选择的 backend 是 `legacy-mobiledevice`，当前 tuple app 存在，且
+  `Saved/IOSQADebug/signing.json` 与 branch 对应 `InstallIOSClient.sh` 均通过验证
+- **THEN** `UEInstallIOS` / active IOS `<Space>ui` 必须把稳定 UDID、源 app 和精确 identity/profile/bundle
+  作为独立 argv 交给 helper 的 legacy backend
+- **AND** helper 必须克隆并重签临时副本、封装临时 IPA、执行 container-preserving update，禁止修改源 app、
+  uninstall、launch 或把 legacy identity 传给 devicectl
+
+#### Scenario: legacy 安装证据不完整
+
+- **WHEN** 当前 tuple app、prepared signing metadata、精确 identity/profile 或 helper 任一缺失/不匹配
+- **THEN** 安装必须 fail closed 并报告缺失证据
+- **AND** 不得把磁盘上的任意 `.app` 伪装成 package provenance
+
+#### Scenario: legacy 设备被普通 launch 消费
+
+- **WHEN** 当前选择的 backend 是 `legacy-mobiledevice`、持久化 runtime 仍有安装成功的精确 device/bundle，
+  且用户在当前或重启后的 Nvim 执行 `UELaunch`
+- **THEN** planner 必须验证 `Saved/IOSQADebug/signing.json` 的 prepared signed app 与 bundle，随后通过
+  host-owned `ios-deploy` 在用户选择的 USB 或 Wi-Fi transport 执行 `--noinstall --justlaunch`
+- **AND** USB transport 必须固定 `--no-wifi`；Wi-Fi transport 不得注入 `--no-wifi`
+- **AND** launch helper 必须再次查询精确 bundle PID 并发布结构化 device/bundle/process evidence
+- **AND** 不得要求当前进程仍持有 package artifact、重新安装、卸载、进入 DAP 或调用 UE legacy Run 后端
 
 ### Requirement: 单次设备任务必须固定目标设备
 
@@ -178,7 +333,14 @@ MUST：系统必须安装当前 project/target/IOS/configuration 对应的 stage
 
 ### Requirement: 安装必须由设备结果确认
 
-MUST：`UEInstallIOS` 必须使用外置 `xcrun devicectl device install app --device <CAPTURED_ID> <APP>` 后端，并以退出码和结构化结果共同判定成功；不得调用或静默回退到 UE legacy ideviceinstaller 后端。
+MUST：`UEInstallIOS` 以及 active target 为 IOS 时的 `<Space>ui` / `UEInstall` 必须使用外置 `xcrun devicectl device install app --device <CAPTURED_ID> <APP>` 后端，并以退出码和结构化结果共同判定成功；不得调用或静默回退到 UE legacy ideviceinstaller 后端。
+
+#### Scenario: 通用安装键在 IOS target 下原地更新
+
+- **WHEN** active target 为 IOS 且用户执行 `<Space>ui` / `UEInstall`
+- **THEN** 系统必须把操作分派到 IOS target driver，并安装当前 tuple 已签名的 staged `.app`
+- **AND** 安装计划不得先执行 uninstall、delete 或 remove；不得重签名或清除既有应用数据
+- **AND** 系统不得把该操作分派到 Android APK 安装链
 
 #### Scenario: devicectl 报告安装成功
 
@@ -193,11 +355,13 @@ MUST：`UEInstallIOS` 必须使用外置 `xcrun devicectl device install app --d
 
 ### Requirement: 启动必须使用真实 bundle identifier 且不进入 DAP
 
-MUST：IOS `UELaunch` 必须使用捕获设备和 staged app 的实际 bundle identifier 调用 devicectl process launch；不得调用 UE legacy instruments Run 后端。
+MUST：IOS `UELaunch` 必须使用捕获设备和已安装 app 的实际 bundle identifier。CoreDevice backend 调用
+`devicectl device process launch`；pre-iOS17 legacy backend 使用 prepared signed app 驱动
+`ios-deploy --noinstall --justlaunch`，并在返回前复查 PID。两者都不得调用 UE legacy Run 后端或进入 DAP。
 
 #### Scenario: 应用成功启动
 
-- **WHEN** devicectl 返回零退出码且结构化结果确认 bundle 已启动并提供进程证据
+- **WHEN** 对应 backend 的 launch transport 返回成功且结构化结果确认 device、bundle 与 PID
 - **THEN** 系统必须把 launch 标记为 succeeded
 - **AND** 不得自动调用 `UEDAPAttach`
 

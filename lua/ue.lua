@@ -1,9 +1,7 @@
 local M = {}
-
 -- ==========================================================================
 -- MODULE STATE
 -- ==========================================================================
-
 local CORE_RT = {
   setup_done = false,
   build_term_buf = nil,
@@ -19,6 +17,7 @@ local CORE_RT = {
   dirty_index_roots = {},
   engine_root_cache = {}, -- dir -> engine_root (or false)
   context_cache = {}, -- key -> { ctx, ts }
+  target_launch_running = {}, -- target id -> true while one launch owns the route
   project_state = require("ue.project_state"),
   file_lock = require("ue.file_lock"),
   prepare_lease = nil,
@@ -38,7 +37,6 @@ end
 function CORE_RT.trace_mark(_name) end
 CORE_RT.trace_path = nil
 CORE_RT.trace_t0 = nil
-
 -- F1 split phase-1: the clangd index subsystem now lives in lua/ue/index/.
 -- INDEX_FN keeps its historical name so ~60 call sites below are unchanged;
 -- INDEX_RT is the SAME table the module mutates (M._rt), so :UESetProject
@@ -72,8 +70,10 @@ local _CONTEXT_TTL = _ue_cfg.get("context.ttl_s") or 30 -- seconds (filesystem w
 
 -- Cached module tables (was 17 single-line wrappers; compacted to save LuaJIT local slots).
 local _ufs = require("ue.core.fs")
+local _uscan = require("ue.core.scan_roots")
 local _uproc = require("ue.core.proc")
 local _uplat = require("utils.platform")
+
 
 -- High-frequency aliases (kept short for readability).
 local trim = _ufs.trim
@@ -81,6 +81,32 @@ local norm = _ufs.norm
 local cwd = _ufs.cwd
 local join = _ufs.join
 
+local function dispatch_registered_workflow(target_id, operation, opts)
+  require("ue.workflows.bootstrap").ensure_registered()
+  local workflows = require("ue.workflows")
+  if not workflows.lookup(target_id, operation) then
+    return nil, nil, false
+  end
+  opts = opts or {}
+  local result, err = workflows.dispatch(target_id, operation, {
+    host_driver = opts.host_driver or require("utils.platform").driver(),
+    snapshot = opts.snapshot,
+    context = opts.context,
+    payload = opts.payload,
+    deps = opts.deps,
+  })
+  return result, err, true
+end
+
+function CORE_RT.invoke_workflow_api(target_id, operation, method, args, host_driver)
+  return require("ue.workflows").invoke(
+    target_id,
+    operation,
+    method,
+    args,
+    host_driver or require("utils.platform").driver()
+  )
+end
 
 local function focus_window(win)
   if not win or not vim.api.nvim_win_is_valid(win) then
@@ -607,45 +633,17 @@ end
 -- PUBLIC: CLANGD
 -- ==========================================================================
 
--- Forward declaration for find_engine_root, which is defined further below
--- (line ~1152). Without this forward decl, the call inside clangd_cmd
--- (around line 771) resolves to global _G.find_engine_root (nil) and
--- raises "attempt to call global 'find_engine_root' (a nil value)" the
--- first time clangd_cmd is called with a non-nil root_dir (e.g. via
--- on_new_config). The historical reason this didn't fire in practice is
--- that LazyVim's ue.lua plugin wrapper invokes clangd_cmd() with no
--- args, which skips the offending branch. Forward-declaring keeps it
--- correct for all entry points.
+-- Forward declaration for find_engine_root, which is defined further below.
+-- clangd_cmd receives the root resolved by vim.lsp's dynamic cmd factory;
+-- keep this chunk-local binding available before that factory can run.
 local find_engine_root
 
 function M.clangd_cmd(root_dir)
   local clangd = _uproc.first_executable(clangd_candidates(root_dir or cwd())) or "clangd"
 
-  -- Adaptive -j: clangd preambles for UE TUs cost 1.5–3 GB each. With
-  -- --pch-storage=memory + N parallel workers, peak memory ~= N * 2 GB.
-  -- Default budget: 1 worker per 4 GB RAM, clamped to [8, 24]. Override
-  -- via UE_CLANGD_JOBS=N.
-  local jobs
-  local env_jobs = tonumber(vim.env.UE_CLANGD_JOBS or "")
-  if env_jobs and env_jobs > 0 then
-    jobs = math.floor(env_jobs)
-  else
-    local total_mb = 0
-    local ok, mem = pcall(function()
-      return vim.uv.get_total_memory and vim.uv.get_total_memory() or 0
-    end)
-    if ok and type(mem) == "number" and mem > 0 then
-      total_mb = math.floor(mem / (1024 * 1024))
-    end
-    if total_mb >= 1024 then
-      local total_gb = math.floor(total_mb / 1024)
-      jobs = math.floor(total_gb / 4)
-    else
-      jobs = 8
-    end
-    if jobs < 8 then jobs = 8 end
-    if jobs > 24 then jobs = 24 end
-  end
+  -- Parallel worker budget. Policy + UI core reservation live in ue.clangd_jobs
+  -- (RAM alone gave -j=23 on 24 cores, starving the UI — 2026-08-25, K52).
+  local jobs = require("ue.clangd_jobs").resolve()
 
   local cmd = {
     clangd,
@@ -661,7 +659,7 @@ function M.clangd_cmd(root_dir)
     "--function-arg-placeholders=true",
     "--limit-results=200",
     "--limit-references=200",
-    "--query-driver=**/clang*.exe,**/clang*,**/gcc,**/g++,**/cc,**/c++,**/cl.exe",
+    "--query-driver=" .. table.concat(_uplat.driver().query_driver_globs(), ","),
   }
 
   -- Point clangd at this process's project+platform CDB bucket. Without an
@@ -1847,7 +1845,7 @@ local function existing_relative_dirs(root, search_paths)
   local seen = {}
   for _, search_path in ipairs(search_paths or {}) do
     local absolute = join(root, search_path)
-    local key = _uplat.is_windows and absolute:lower() or absolute
+    local key = _uplat.driver().path_key(absolute)
     if not seen[key] and _ufs.is_dir(absolute) then
       seen[key] = true
       table.insert(dirs, search_path)
@@ -2013,24 +2011,32 @@ function CORE_RT.project_module_anchor(project_root)
   return anchor
 end
 
--- Project-specific scan whitelist. Path = `<project_root>/.ueprepare-scan-paths`,
--- one entry per line, # for comments. Each entry is a root-relative directory
--- (e.g. `Source/SampleGame/Source`, `Source/Protocol`). When the file exists, it
--- REPLACES UE_CONST.PROJECT_INDEX_DIRS for this project. When absent, the
--- default PROJECT_INDEX_DIRS is used. For the supported nested layout
--- (<project_root>/Source/<Project>/<Project>.uproject), defaults are resolved
--- relative to the .uproject directory so a broad project_root/Source scan does
--- not pull sibling config tables, SDKs, and generated data into the index.
+-- Project-specific scan whitelist (`<project_root>/.ueprepare-scan-paths`) and
+-- the nested-layout anchor both feed scan-root resolution. Format, precedence
+-- and the union-with-discovery policy live in `ue.core.scan_roots`
+-- (read_whitelist / merge), together with their rationale.
 --
 -- Why whitelist > blacklist (.ueprepare-scan-ignore was deleted): some
 -- projects bury non-source data (config tables, SDK toolchains, art assets)
 -- under `Source/`. Blacklist plays whack-a-mole; whitelist is declarative
 -- and cuts scan input dramatically (verified 877k -> 116k on samplegame_dev).
 --
--- Cached per-project on CORE_RT to avoid repeated disk reads. Use
--- :UEReloadScanPaths to invalidate (see command below).
+-- Cached per-project on CORE_RT; :UEReloadScanPaths invalidates.
 CORE_RT.project_index_dirs_cache = CORE_RT.project_index_dirs_cache or {}
 
+-- Both the resolved dir list and the module anchor feeding discovery are cached,
+-- so editing .ueprepare-scan-paths or adding a module dir needs invalidation.
+function CORE_RT.invalidate_scan_root_caches()
+  local count = 0
+  for key in pairs(CORE_RT.project_index_dirs_cache) do
+    CORE_RT.project_index_dirs_cache[key] = nil
+    count = count + 1
+  end
+  for key in pairs(CORE_RT.project_module_anchor_cache) do
+    CORE_RT.project_module_anchor_cache[key] = nil
+  end
+  return count
+end
 function CORE_RT.project_index_dirs(ctx)
   local project_root = norm(ctx and ctx.project_root or "")
   if not project_root or project_root == "" then
@@ -2041,32 +2047,19 @@ function CORE_RT.project_index_dirs(ctx)
     return cached
   end
 
-  local dirs = nil
-  local f = io.open(project_root .. "/.ueprepare-scan-paths", "r")
-  if f then
-    dirs = {}
-    for line in f:lines() do
-      local s = line:gsub("\r$", ""):gsub("^%s+", ""):gsub("%s+$", "")
-      s = s:gsub("%s+#.*$", "")
-      if s ~= "" and not s:match("^#") then
-        table.insert(dirs, s)
-      end
-    end
-    f:close()
-    if #dirs == 0 then dirs = nil end -- empty file -> fall back to default
-  end
-
-  local result = dirs
+  local result = _uscan.read_whitelist(project_root)
   if not result then
     local anchor = CORE_RT.project_module_anchor(project_root)
+    local base
     if anchor ~= project_root and _ufs.path_has_prefix(anchor, project_root) then
       local prefix = _ufs.relative_to(project_root, anchor)
-      result = vim.tbl_map(function(relative)
+      base = vim.tbl_map(function(relative)
         return join(prefix, relative)
       end, UE_CONST.PROJECT_INDEX_DIRS)
     else
-      result = UE_CONST.PROJECT_INDEX_DIRS
+      base = UE_CONST.PROJECT_INDEX_DIRS
     end
+    result = _uscan.merge(project_root, base, UE_CONST.PROJECT_INDEX_DIRS, UE_CONST.SCAN_EXCLUDES)
   end
   CORE_RT.project_index_dirs_cache[project_root] = result
   return result
@@ -2259,15 +2252,12 @@ local function mode_token(ctx)
   return "ENGINE"
 end
 
+-- Entry count for a cached file list. Delegates to fs.count_lines_cached, which
+-- streams + memoises on (mtime,size): `vim.fn.readfile` on the 27.5 MB
+-- workspace_all.files blocked the main loop ~253 ms, four times per prepare
+-- summary (measured 2026-08-26).
 local function count_cached_entries(path)
-  if not _ufs.is_file(path) then
-    return 0
-  end
-  local ok, lines = pcall(vim.fn.readfile, path)
-  if not ok or type(lines) ~= "table" then
-    return 0
-  end
-  return #lines
+  return _ufs.count_lines_cached(path)
 end
 
 local function db_ready(db_dir)
@@ -2406,14 +2396,14 @@ local function prepare_summary(ctx, compile_path, opts)
   local summary = ("UEPrepare done:\nProject files: %d\nEngine files: %d\nGTAGS files: %d\nGrep files: %d")
     :format(project_count, engine_count, workspace_count, workspace_all_count)
   summary = summary .. "\nMode: " .. (mode_token(ctx) == "PROJECT" and "project" or "engine-only")
-  if opts.reused_cache then
-    summary = summary .. "\nIndex cache: reused"
-  end
+  if opts.reused_cache then summary = summary .. "\nIndex cache: reused" end
   if compile_path and compile_path ~= "" then
     summary = summary .. "\ncompile_commands: " .. compile_path
   end
   summary = summary .. "\nCache: " .. ctx.paths.cache
-  return summary
+  -- MUST NOT imply semantic readiness while the index builds (index_delivery_line).
+  local ok_d, line = pcall(INDEX_FN.prepare_delivery_suffix, ctx)
+  return summary .. ((ok_d and line) or "")
 end
 
 local function index_status_token(ctx)
@@ -2937,12 +2927,7 @@ local function scan_relative_files_async(root, search_paths, cb)
   end
 
   local cmd = { fd, "--type", "f", "--hidden", "--follow" }
-  -- Prune cache/asset/intermediate trees at fd level so we never even traverse
-  -- them. Without this, shipped UE projects with Content/ + node_modules/ +
-  -- Saved/ blow up to 5M+ files in Source/ subtree, and the downstream lists
-  -- pass spent ~55s on the main thread doing dedup+sort+write of ~700k paths.
-  -- See UE_CONST.SCAN_EXCLUDES for rationale (Content mandatory, ThirdParty
-  -- intentionally KEPT for grep into vendored sources).
+  -- Prune cache/assets before traversal; SCAN_EXCLUDES keeps ThirdParty source.
   for _, ex in ipairs(UE_CONST.SCAN_EXCLUDES) do
     table.insert(cmd, "--exclude")
     table.insert(cmd, ex)
@@ -2964,6 +2949,9 @@ local function scan_relative_files_async(root, search_paths, cb)
   end
 
   local system_opts = { text = true, cwd = root }
+  require("utils.host_admission").run_when_allowed({
+    name = "UE workspace file scan",
+    start = function()
   vim.system(cmd, system_opts, function(result)
     vim.schedule(function()
       if result.code ~= 0 then
@@ -2979,6 +2967,9 @@ local function scan_relative_files_async(root, search_paths, cb)
       cb(lines, nil)
     end)
   end)
+    end,
+    on_error = function(err) cb(nil, "workspace scan admission failed: " .. tostring(err)) end,
+  })
 end
 
 local function clean_db_dir(dir)
@@ -3018,98 +3009,14 @@ local function uproject_dir(ctx)
   return ctx and ctx.project_root or nil
 end
 
-local function cleanup_gradle_debug_artifacts(ctx)
-  local pr = uproject_dir(ctx)
-  if not pr or pr == "" then
-    return
-  end
-
-  -- Wipe Gradle packaging-stage artifacts that AGP's incremental task tracker
-  -- can desync against (last-build interrupted / shared cache stale). Symptoms:
-  --   "Zip file 'app-*.apk' already contains entry 'META-INF/.../app-metadata.properties'"
-  -- Root cause: the per-task incremental state thinks an entry is missing but
-  -- the final APK on disk still has it, so PackageAndroidArtifact tries to
-  -- re-add it and fails. Cleaning the output APKs PLUS the intermediates that
-  -- feed into packaging (app_metadata, merged_manifest, packaged_manifests,
-  -- incremental/packageDebug) forces AGP back to a clean packaging step.
-  local debug_dir = join(pr, "Intermediate", "Android", "*", "gradle", "app", "build")
-  local patterns = {
-    -- output APKs (debug + release variants, with and without variant subdir)
-    join(debug_dir, "outputs", "apk", "app-debug.apk"),
-    join(debug_dir, "outputs", "apk", "debug", "app-debug.apk"),
-    join(debug_dir, "outputs", "apk", "app-release.apk"),
-    join(debug_dir, "outputs", "apk", "release", "app-release.apk"),
-    join(debug_dir, "intermediates", "apk", "app-debug.apk"),
-    join(debug_dir, "intermediates", "apk", "debug", "app-debug.apk"),
-    -- packaging incremental state
-    join(debug_dir, "intermediates", "incremental", "packageDebug"),
-    join(debug_dir, "intermediates", "incremental", "debug", "packageDebug"),
-    join(debug_dir, "intermediates", "incremental", "packageRelease"),
-    join(debug_dir, "intermediates", "incremental", "release", "packageRelease"),
-    -- packaging input intermediates that frequently drift and produce
-    -- duplicate META-INF/com/android/build/gradle/app-metadata.properties
-    join(debug_dir, "intermediates", "app_metadata"),
-    join(debug_dir, "intermediates", "merged_manifest"),
-    join(debug_dir, "intermediates", "packaged_manifests"),
-  }
-
-  for _, pattern in ipairs(patterns) do
-    for _, path in ipairs(glob_paths(pattern)) do
-      local ok = pcall(vim.fn.delete, path, "rf")
-      if not ok then
-        vim.notify("Failed to clean stale Gradle artifact: " .. path, vim.log.levels.WARN)
-      end
-    end
-  end
-end
-
 local function build_gtags_db(root, filelist, db_dir, label)
-  local gtags = _uproc.first_executable({ "gtags" })
-  if not gtags then
-    return false, "gtags not found in PATH"
-  end
-
-  if not _ufs.is_file(filelist) or vim.fn.getfsize(filelist) <= 0 then
-    clean_db_dir(db_dir)
-    return true, label .. ": no files to index"
-  end
-
-  clean_db_dir(db_dir)
-
-  -- Use repo-bundled gtags.conf with the `hlsl-cpp` label so that
-  -- .usf/.ush/.hlsl/.hlsli get parsed by the exuberant-ctags backend
-  -- as C++. Without this, gtags only sees C/C++/C# and silently skips
-  -- shaders (workspace_gtags.files contained 0 .usf entries before the
-  -- FT_GTAGS expansion). Falls back to system defaults if the bundled
-  -- file is missing — never hard-fails the indexer over config plumbing.
-  local env = nil
-  -- Resolve repo root from this very file's path (lua/ue.lua → ../..).
-  local source = debug.getinfo(1, "S").source or ""
-  if source:sub(1, 1) == "@" then source = source:sub(2) end
-  local plugin_root = norm(vim.fn.fnamemodify(source, ":h:h"))
-  local conf_path = plugin_root ~= "" and (plugin_root .. "/tools/gtags/gtags.conf") or ""
-  if conf_path ~= "" and _ufs.is_file(conf_path) then
-    env = {
-      GTAGSCONF = conf_path,
-      GTAGSLABEL = "hlsl-cpp",
-    }
-  end
-
-  local cmd = { gtags, "-f", filelist, "--skip-unreadable", "--skip-symlink", db_dir }
-  local code, lines = run_lines(cmd, { cwd = root, env = env })
-  if code ~= 0 then
-    return false, table.concat(lines or {}, "\n")
-  end
-
-  if not db_ready(db_dir) then
-    local output = table.concat(lines or {}, "\n")
-    if output ~= "" then
-      return false, output
-    end
-    return false, "GTAGS database not generated: " .. db_dir
-  end
-
-  return true
+  return require("ue.gtags").build_sync({
+    root = root,
+    filelist = filelist,
+    db_dir = db_dir,
+    label = label,
+    run_lines = run_lines,
+  })
 end
 
 local function global_lines(root, db_dir, args)
@@ -3293,13 +3200,6 @@ local function target_platform(engine_root, cmd)
     local persisted = trim(state.target_platform or "")
     if persisted ~= "" then
       return persisted
-    end
-  end
-  local driver = _uplat.driver()
-  if type(driver.default_target) == "function" then
-    local detected = trim(driver.default_target())
-    if detected ~= "" then
-      return detected
     end
   end
   local driver = _uplat.driver()
@@ -4644,16 +4544,19 @@ local function export_compile_commands_to_engine_root(ctx)
   return false, "compile_commands.json not found at any controlled candidate path"
 end
 
-local function generate_compile_commands(ctx, progress)
+local function generate_compile_commands(ctx, progress, on_pipeline_done)
   local pipeline = require("ue.cdb.pipeline")
   if pipeline.is_running() then
     return false, "compile_commands pipeline is already running"
   end
 
   local targets = compile_commands_targets(ctx)
+  on_pipeline_done = on_pipeline_done or function(ok_pipeline)
+    if ok_pipeline then CORE_RT.start_deferred_clangd(ctx) end
+  end
 
   local function start_pipeline(path)
-    local jobid, pipeline_err = run_compile_commands_pipeline(path, targets, nil, {
+    local jobid, pipeline_err = run_compile_commands_pipeline(path, targets, on_pipeline_done, {
       force_restart = ctx._force_cdb_restart == true,
     })
     if jobid == nil then
@@ -4746,12 +4649,18 @@ do
       cwd = ctx.engine_root,
       archive_dir = archive_dir,
       config_root = vim.fn.stdpath("config"),
+      signing_identity = opts.signing_identity or (ctx.state and ctx.state.ios_signing_identity),
       device_id = opts.device_id or runtime.device_id,
+      device_name = opts.device_name or runtime.device_name,
+      device_backend = opts.device_backend or runtime.device_backend,
+      device_transport = opts.device_transport or runtime.device_transport,
       bundle_id = opts.bundle_id or runtime.bundle_id,
       artifacts = opts.artifacts or runtime.artifacts,
       json_output = opts.json_output,
       skip_deploy = opts.skip_deploy == true,
       operation = opts.operation,
+      legacy_launch_script = opts.legacy_launch_script,
+      legacy_signing = opts.legacy_signing,
     }, nil, driver
   end
 
@@ -4793,9 +4702,16 @@ do
     end
     current.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
     all[platform] = current
-    update_state_field(engine_root, "target_runtime", all)
+    local updated, update_err = update_state_field(engine_root, "target_runtime", all)
+    if not updated then return nil, update_err end
     CORE_RT.context_cache = {}
     return current
+  end
+
+  function CORE_RT.target_context_matches(ctx, expected_engine_root, expected_project_root)
+    if type(ctx) ~= "table" then return false end
+    return norm(ctx.engine_root or "") == norm(expected_engine_root or "")
+      and norm(ctx.project_root or "") == norm(expected_project_root or "")
   end
 end
 
@@ -4942,8 +4858,10 @@ local function open_terminal_command(cmd, opts)
 
   local build_monitor
   local active_jobid
+  local foreground_token
   active_jobid = vim.fn.termopen(cmd, {
     cwd = opts.cwd,
+    env = opts.env,
     on_stdout = function(_, data)
       stdout_pending = append_job_output(output_lines, stdout_pending, data)
     end,
@@ -4964,6 +4882,7 @@ local function open_terminal_command(cmd, opts)
         if CORE_RT.build_term_jobid == active_jobid then
           CORE_RT.build_term_jobid = nil
         end
+        if foreground_token then require("utils.host_admission").foreground_done(foreground_token); foreground_token = nil end
         if code ~= 0 and opts.quickfix_title then
           populate_quickfix_from_output(opts.quickfix_title, output_lines, {
             root = opts.quickfix_root,
@@ -4995,9 +4914,8 @@ local function open_terminal_command(cmd, opts)
   end
 
   CORE_RT.build_term_jobid = active_jobid
-  -- Register with the generic task registry (list/cancel via :Tasks). This is
-  -- a pure side-path: only a register call AFTER job creation; on_exit above is
-  -- untouched. Status is derived live from the channel (see task_registry).
+  foreground_token = require("utils.host_admission").foreground_begin(opts.quickfix_title or opts.finish_label or "terminal task")
+  -- Register after job creation; status remains derived from the channel.
   pcall(function()
     require("utils.task_registry").register({
       name = opts.quickfix_title or "build",
@@ -6203,6 +6121,139 @@ function M.clangd_root(bufnr)
   return vim.fs.root(bufname ~= "" and bufname or cwd(), { "compile_commands.json", ".clangd", ".git" }) or cwd()
 end
 
+CORE_RT.clangd_deferred_notified = CORE_RT.clangd_deferred_notified or {}
+
+local function clangd_artifact_key(ctx)
+  if not ctx then return nil end
+  local platform_scope = ctx.paths and ctx.paths.clangd_dir
+    or target_platform(ctx.engine_root, nil)
+  return table.concat({
+    norm(ctx.engine_root or ""),
+    norm(ctx.project_root or ""),
+    norm(platform_scope or ""),
+  }, "|")
+end
+
+function CORE_RT.clangd_gate_allows(path, project_root, engine_root, ready)
+  path = trim(path)
+  if path == "" then return true end
+  local inside_ue_roots = CORE_RT.foreign_buffer_key(path, project_root, engine_root) == nil
+  return not inside_ue_roots or ready == true
+end
+
+function CORE_RT.clangd_artifacts_ready(ctx, dependencies)
+  local key = clangd_artifact_key(ctx)
+  if not key then return false end
+
+  dependencies = dependencies or {}
+  local semantic_index_snapshot = dependencies.semantic_index_snapshot
+    or INDEX_FN.semantic_index_snapshot
+  local ok, snapshot = pcall(semantic_index_snapshot, ctx)
+  local ready = ok and type(snapshot) == "table" and snapshot.readiness == "ready"
+  if ready then CORE_RT.clangd_deferred_notified[key] = nil end
+  return ready
+end
+
+function CORE_RT.wake_deferred_clangd_buffer(bufnr, dependencies)
+  dependencies = dependencies or {}
+  local buffer_ready = dependencies.buffer_ready or function(buffer)
+    return vim.api.nvim_buf_is_valid(buffer) and vim.api.nvim_buf_is_loaded(buffer)
+  end
+  local get_clients = dependencies.get_clients or vim.lsp.get_clients
+  local exec_autocmds = dependencies.exec_autocmds or vim.api.nvim_exec_autocmds
+  local defer_fn = dependencies.defer_fn or vim.defer_fn
+  local max_attempts = tonumber(dependencies.max_attempts) or 4
+  local retry_delay_ms = tonumber(dependencies.retry_delay_ms) or 250
+
+  local function clangd_attached()
+    local ok, clients = pcall(get_clients, { bufnr = bufnr, name = "clangd" })
+    return ok and type(clients) == "table" and #clients > 0
+  end
+
+  local function wake(attempt)
+    if not buffer_ready(bufnr) or clangd_attached() then return end
+    pcall(exec_autocmds, "FileType", {
+      buffer = bufnr,
+      modeline = false,
+    })
+    if attempt < max_attempts and not clangd_attached() then
+      defer_fn(function() wake(attempt + 1) end, retry_delay_ms)
+    end
+  end
+
+  wake(1)
+end
+
+function M._wake_deferred_clangd_for_test(bufnr, dependencies)
+  return CORE_RT.wake_deferred_clangd_buffer(bufnr, dependencies)
+end
+
+function CORE_RT.start_deferred_clangd(ctx)
+  if not CORE_RT.clangd_artifacts_ready(ctx) then return end
+  if #vim.api.nvim_list_uis() == 0 then
+    vim.api.nvim_create_autocmd("UIEnter", {
+      once = true,
+      callback = function() CORE_RT.start_deferred_clangd(ctx) end,
+    })
+    return
+  end
+  local allowed_filetypes = {
+    c = true,
+    cpp = true,
+    objc = true,
+    objcpp = true,
+    cuda = true,
+  }
+  vim.schedule(function()
+    for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+      if vim.api.nvim_buf_is_valid(bufnr)
+          and vim.api.nvim_buf_is_loaded(bufnr)
+          and allowed_filetypes[vim.bo[bufnr].filetype] then
+        local path = vim.api.nvim_buf_get_name(bufnr)
+        if CORE_RT.foreign_buffer_key(path, ctx.project_root, ctx.engine_root) == nil then
+          CORE_RT.wake_deferred_clangd_buffer(bufnr)
+        end
+      end
+    end
+  end)
+end
+
+function M.clangd_start_root(bufnr)
+  local root = M.clangd_root(bufnr)
+  local path = vim.api.nvim_buf_get_name(bufnr or 0)
+  local ctx = resolve_context({ bufname = path ~= "" and path or nil })
+  if not ctx then return root end
+  local key = clangd_artifact_key(ctx)
+  local ready = CORE_RT.clangd_artifacts_ready(ctx)
+  if CORE_RT.clangd_gate_allows(path, ctx.project_root, ctx.engine_root, ready) then
+    return root
+  end
+  if key and not CORE_RT.clangd_deferred_notified[key] then
+    CORE_RT.clangd_deferred_notified[key] = true
+    vim.schedule(function()
+      -- Keep this SHORT. A long single-line notify exceeds the cmdline width and
+      -- triggers Vim's hit-enter prompt, so the user had to press Enter on every
+      -- single startup (reported 2026-08-26; the old text was 187 chars). The
+      -- actionable part is "run :UEPrepare"; details belong in the log, not in a
+      -- modal-by-accident message.
+      vim.notify(
+        "clangd deferred: run :UEPrepare (Tree-sitter still active)",
+        vim.log.levels.INFO,
+        { title = "UE", timeout = 5000, replace = "ue.clangd.deferred" }
+      )
+    end)
+  end
+  return nil
+end
+
+function M._clangd_artifacts_ready_for_test(ctx, dependencies)
+  return CORE_RT.clangd_artifacts_ready(ctx, dependencies)
+end
+
+function M._clangd_gate_allows_for_test(path, project_root, engine_root, ready)
+  return CORE_RT.clangd_gate_allows(path, project_root, engine_root, ready)
+end
+
 -- Build the minimum-viable ctx that utils.code_search.stream / .is_indexed
 -- need: { workspace_root, csearch_idx }. Returns nil when bufnr is not in a
 -- recognized UE project (so callers can short-circuit gracefully).
@@ -6217,18 +6268,22 @@ function M.csearch_ctx(bufnr)
   }
 end
 
--- Public hook called by lua/utils/ue_watch.lua when a shader file is added
--- or deleted between :UEPrepare runs. Idempotent — safe to call repeatedly.
--- Returns (ok, message). On a project with ~1500 shaders this is ~1.1s wall.
+-- Watcher hook: accepted work returns immediately; completion is async.
 function M.gtags_rebuild_shaders()
   local ctx, err = resolve_context()
   if not ctx then return false, err or "no UE context" end
   if not ctx.paths or not ctx.paths.workspace_list or not ctx.paths.workspace_db then
     return false, "ctx.paths missing workspace_list/workspace_db"
   end
-  local root = workspace_root(ctx)
-  local ok, msg = build_gtags_db(root, ctx.paths.workspace_list, ctx.paths.workspace_db, "workspace")
-  return ok, msg
+  return require("ue.gtags").rebuild_async({
+    root = workspace_root(ctx),
+    filelist = ctx.paths.workspace_list,
+    db_dir = ctx.paths.workspace_db,
+    label = "UE shader GTAGS rebuild",
+  }, function(ok, message)
+    if not ok then require("utils.log").warn_ctx(
+      "ue.gtags", "shader GTAGS rebuild failed", { reason = message }) end
+  end)
 end
 
 function M.gtags_references(symbol)
@@ -6414,6 +6469,28 @@ do
           end)
       end)
   end
+
+  -- Async references twin of M.gtags_references. `gr` MUST NOT block: the sync
+  -- twin reaches vim.system(...):wait(); bare spawn floor here is 87ms p50 and
+  -- `global -r` 82ms p50 / 293ms max (2026-08-25, K52). on_done(true)=populated.
+  function M.gtags_references_async(symbol, on_done)
+    on_done = on_done or function() end
+    local ctx, err = resolve_context()
+    if not ctx then
+      vim.notify(err, vim.log.levels.WARN)
+      return on_done(false)
+    end
+    if not ctx.project_root or ctx.project_root == "" or not db_ready(ctx.paths.workspace_db) then
+      return on_done(false)
+    end
+    local root = workspace_root(ctx)
+    global_lines_async(root, ctx.paths.workspace_db,
+      { "-r", "--literal", "--result=grep", symbol }, function(code, lines)
+        local hit = (code == 0 or code == 1) and lines and #lines > 0
+          and populate_quickfix_from_global("GTAGS references: " .. symbol, root, lines)
+        on_done(hit and true or false)
+      end)
+  end
 end
 
 -- ---------------------------------------------------------------------------
@@ -6423,17 +6500,7 @@ end
 -- ---------------------------------------------------------------------------
 
 do
-  -- Path keyword priority list retained as a public platform hint API.
-  local PLATFORM_PATH_HINTS = {
-    Win64    = { "D3D12RHI", "D3D11RHI", "VulkanRHI", "WindowsRHI", "WindowsPlatform", "Windows/" },
-    Win32    = { "D3D11RHI", "D3D12RHI", "VulkanRHI", "WindowsRHI", "WindowsPlatform", "Windows/" },
-    Android  = { "VulkanRHI", "OpenGLDrv", "AndroidRHI", "AndroidOpenGL", "AndroidVulkan", "Android/" },
-    Mac      = { "MetalRHI", "MacRHI", "MacPlatform", "Mac/", "Apple/" },
-    IOS      = { "MetalRHI", "IOSRHI", "IOSPlatform", "IOS/", "Apple/" },
-    TVOS     = { "MetalRHI", "TVOSPlatform", "TVOS/", "Apple/" },
-    Linux    = { "VulkanRHI", "LinuxRHI", "LinuxPlatform", "Linux/" },
-    LinuxArm64 = { "VulkanRHI", "LinuxRHI", "LinuxPlatform", "Linux/" },
-  }
+  local path_hints = require("ue.targets.path_hints")
 
   function M.current_platform()
     local ok, ctx = pcall(resolve_context)
@@ -6443,7 +6510,7 @@ do
 
   function M.platform_path_priorities(platform)
     platform = platform or M.current_platform() or ""
-    return PLATFORM_PATH_HINTS[platform] or {}
+    return path_hints.for_target(platform)
   end
 end
 
@@ -6468,6 +6535,10 @@ end
 
 function M._target_platform_for_test(engine_root)
   return target_platform(engine_root, nil)
+end
+
+function M._update_target_runtime_for_test(engine_root, platform, values)
+  return CORE_RT.update_target_runtime(engine_root, platform, values)
 end
 
 function M._available_platform_choices_for_test(host_driver, project_root, uproject)
@@ -6923,7 +6994,10 @@ local function set_platform(input, opts)
         return
       end
     end
-    local ok_update, update_err = CORE_RT.project_state.update_target(
+    local target_update = opts.stage_next == false
+        and CORE_RT.project_state.update_target
+      or CORE_RT.project_state.stage_target
+    local ok_update, update_err = target_update(
       engine_root,
       (plat and plat ~= "") and plat or current_plat,
       (conf and conf ~= "") and conf or current_conf)
@@ -6935,6 +7009,12 @@ local function set_platform(input, opts)
     refresh_statusline()
     CORE_RT.context_cache = {}
     CORE_RT.freshness_notified = {}
+    if trim(project_root or "") == "" then
+      vim.notify(("UE target staged for the next project: %s %s"):format(
+        plat or default_plat or "(auto)", conf or default_conf),
+        vim.log.levels.INFO, { title = "UE" })
+      return true
+    end
     -- Switching platform repoints gtags/cdb at their <new-key>/ shards, but
     -- the csearch index is PLATFORM-INDEPENDENT (v3.2) — the same shared
     -- csearch/csearch.idx serves every platform, so switching platform does
@@ -6967,7 +7047,7 @@ local function set_platform(input, opts)
         info or "fast-swap failed — run :UEPrepare to generate this platform's shard"),
         vim.log.levels.WARN, { title = "UE", timeout = 6000 })
     end
-    return
+    return true
   end
 
   -- Interactive: select platform then configuration.
@@ -7027,7 +7107,10 @@ local function set_platform(input, opts)
         if opts.on_done then opts.on_done(false) end
         return
       end
-      local ok_update, update_err = CORE_RT.project_state.update_target(engine_root, plat, conf)
+      local target_update = opts.stage_next == false
+          and CORE_RT.project_state.update_target
+        or CORE_RT.project_state.stage_target
+      local ok_update, update_err = target_update(engine_root, plat, conf)
       if not ok_update then
         vim.notify("Failed to set target: " .. tostring(update_err), vim.log.levels.ERROR)
         if opts.on_done then opts.on_done(false) end
@@ -7036,6 +7119,12 @@ local function set_platform(input, opts)
       invalidate_status_cache()
       refresh_statusline()
       CORE_RT.context_cache = {}
+      if trim(project_root or "") == "" then
+        vim.notify(("UE target staged for the next project: %s %s"):format(plat, conf),
+          vim.log.levels.INFO, { title = "UE" })
+        if opts.on_done then opts.on_done(true) end
+        return
+      end
       CORE_RT.freshness_notified = {}
       pcall(function() require("utils.code_search")._reset_probe_cache() end)
       do
@@ -7138,29 +7227,48 @@ local function build_target(opts)
     return
   end
 
-  target_ctx.source_context = ctx
-  if type(driver.before_build) == "function" then
-    local preflight = driver.before_build(target_ctx, {
+  local _, workflow_err = dispatch_registered_workflow(driver.id, operation, {
+    host_driver = host_driver,
+    payload = {
+      context = ctx,
+      configuration = target_ctx.configuration,
+    },
+    deps = {
       stop_debugger = function(cleanup_opts)
         return require("ue.dap").stop_android_debugger(cleanup_opts)
       end,
-      cleanup_gradle = cleanup_gradle_debug_artifacts,
-    })
-    if preflight and preflight.ok == false then
-      require("utils.log").notify_error("ue.build", preflight.reason or "target pre-build failed")
-      return
-    end
-    if preflight and preflight.message then
-      vim.notify(preflight.message, vim.log.levels.INFO)
-    end
+    },
+  })
+  if workflow_err then
+    set_build_status("BERR")
+    require("utils.log").notify_error("ue.build", title .. " failed: " .. tostring(workflow_err.reason or workflow_err))
+    return
   end
   local function start_build()
+    local function on_exit(code, output)
+      if code == 0
+          and require("ue.targets").supports(target_ctx.platform, "semantic_cdb", host_driver) then
+        local recorded, record_err = update_state_field(ctx.engine_root, "apple_semantic_build", {
+          project_root = ctx.project_root,
+          uproject = ctx.uproject,
+          target = target_ctx.target,
+          platform = target_ctx.platform,
+          configuration = target_ctx.configuration,
+          completed_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        })
+        if not recorded then
+          require("utils.log").notify_error(
+            "ue.build", "failed to record Apple build evidence: " .. tostring(record_err))
+        end
+      end
+      if type(opts.on_exit) == "function" then opts.on_exit(code, output) end
+    end
     return open_terminal_command(cmd, {
       cwd = plan.cwd or ctx.engine_root,
       quickfix_title = title,
       quickfix_root = workspace_root(ctx),
       tail_limit = 16,
-      on_exit = opts.on_exit,
+      on_exit = on_exit,
     })
   end
 
@@ -7185,15 +7293,117 @@ function CORE_RT.clangd_version_compatible(output)
   return major == 22 and minor == 1, major, minor
 end
 
+function CORE_RT.run_clangd_preflight(on_done)
+  on_done = on_done or function() end
+  local clangd_cmd = M.clangd_cmd()
+  local executable = type(clangd_cmd) == "table" and clangd_cmd[1] or nil
+  if not executable or executable == "" then
+    on_done(false, "clangd executable is unavailable")
+    return nil
+  end
+
+  local handle, run_err = require("ue.target_tasks").run({
+    executable = executable,
+    args = { "--version" },
+    metadata = { operation = "clangd-version-preflight" },
+  }, {
+    name = "UEPrepare clangd preflight",
+    on_exit = function(result)
+      if result.code ~= 0 then
+        on_done(false, require("ue.target_tasks").error_message(result))
+        return
+      end
+      local version_output = result.stdout ~= "" and result.stdout or result.stderr
+      local compatible, major, minor = CORE_RT.clangd_version_compatible(version_output)
+      if not compatible then
+        on_done(false, (
+          "clangd %s.%s is incompatible; this repository requires LLVM clangd 22.1.x. "
+            .. "Tree-sitter syntax highlighting remains available, but compiler semantics were not prepared."
+        ):format(tostring(major or "?"), tostring(minor or "?")))
+        return
+      end
+      on_done(true)
+    end,
+  })
+  if not handle then on_done(false, run_err or "failed to start clangd preflight") end
+  return handle
+end
+
 -- Apple toolchains do not reliably retain per-action response files after a
--- successful build. :UECompileForNvim therefore asks the active target driver
--- for a semantic action-graph plan, publishes its tuple-scoped CDB only after
--- validation, then lets the ordinary (prepare-only) pipeline consume it.
-function CORE_RT.generate_semantic_cdb_after_build(on_done)
+-- successful build. :UEPrepare asks the active target driver for a semantic
+-- action-graph plan, publishes its tuple-scoped CDB only after validation,
+-- then lets the ordinary preparation pipeline consume it.
+function CORE_RT.apple_semantic_source_signature(path, fs_stat)
+  local stat = (fs_stat or vim.uv.fs_stat)(path)
+  if type(stat) ~= "table" or stat.type ~= "file" then return nil end
+  local mtime = type(stat.mtime) == "table" and stat.mtime or {}
+  return {
+    path = norm(path),
+    size = tonumber(stat.size) or 0,
+    mtime_sec = tonumber(mtime.sec) or 0,
+    mtime_nsec = tonumber(mtime.nsec) or 0,
+  }
+end
+
+function CORE_RT.apple_semantic_source_marker(ctx, target_ctx, build_evidence, path, entry_count, fs_stat)
+  local source = CORE_RT.apple_semantic_source_signature(path, fs_stat)
+  if not source or trim(build_evidence and build_evidence.completed_at or "") == "" then return nil end
+  return {
+    project_root = ctx.project_root,
+    uproject = ctx.uproject,
+    target = target_ctx.target,
+    platform = target_ctx.platform,
+    configuration = target_ctx.configuration,
+    build_completed_at = build_evidence.completed_at,
+    generated_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    entry_count = tonumber(entry_count) or 0,
+    source = source,
+  }
+end
+
+function CORE_RT.apple_semantic_source_reusable(ctx, target_ctx, path, build_evidence, dependencies)
+  dependencies = dependencies or {}
+  local state = (dependencies.read_state or read_state)(ctx.engine_root)
+  local marker = type(state) == "table" and state.apple_semantic_cdb or nil
+  local source = type(marker) == "table" and marker.source or nil
+  local current = CORE_RT.apple_semantic_source_signature(path, dependencies.fs_stat)
+  if type(source) ~= "table" or not current then return false end
+  local reusable = norm(marker.project_root or "") == norm(ctx.project_root or "")
+    and norm(marker.uproject or "") == norm(ctx.uproject or "")
+    and marker.target == target_ctx.target
+    and marker.platform == target_ctx.platform
+    and marker.configuration == target_ctx.configuration
+    and marker.build_completed_at == (build_evidence and build_evidence.completed_at)
+    and norm(source.path or "") == current.path
+    and tonumber(source.size) == current.size
+    and tonumber(source.mtime_sec) == current.mtime_sec
+    and tonumber(source.mtime_nsec) == current.mtime_nsec
+  if not reusable then return false end
+  return true, {
+    path = current.path,
+    entry_count = tonumber(marker.entry_count) or 0,
+    no_op = true,
+    reused = true,
+  }
+end
+
+function M._apple_semantic_source_reusable_for_test(ctx, target_ctx, path, build_evidence, dependencies)
+  return CORE_RT.apple_semantic_source_reusable(ctx, target_ctx, path, build_evidence, dependencies)
+end
+
+local ensure_ios_workflows
+local ios_workflow_dependencies
+
+function CORE_RT.generate_semantic_cdb_after_build(on_done, expected)
   on_done = on_done or function() end
   local ctx, context_err = resolve_context()
   if not ctx then
     on_done(false, context_err)
+    return nil
+  end
+  if expected and not CORE_RT.target_context_matches(
+      ctx, expected.engine_root, expected.project_root) then
+    on_done(false, "project changed before Apple semantic CDB generation")
     return nil
   end
 
@@ -7212,6 +7422,21 @@ function CORE_RT.generate_semantic_cdb_after_build(on_done)
 
   local cdb_paths = require("ue.cdb.paths")
   local stable_path = cdb_paths.semantic_source(ctx, target_ctx)
+  local build_evidence = read_state(ctx.engine_root).apple_semantic_build
+  local reusable, reuse_info = CORE_RT.apple_semantic_source_reusable(
+    ctx, target_ctx, stable_path, build_evidence
+  )
+  if reusable then
+    vim.notify(
+      ("Reusing validated %s semantic CDB for the current build (%d entries)."):format(
+        target_ctx.platform, reuse_info.entry_count
+      ),
+      vim.log.levels.INFO,
+      { title = "UEPrepare" }
+    )
+    on_done(true, reuse_info)
+    return true
+  end
   local output_dir = _ufs.dirname(stable_path)
   _ufs.ensure_dir(output_dir)
   local pending_name = ("compile_commands.pending-%d-%s.json"):format(
@@ -7232,11 +7457,12 @@ function CORE_RT.generate_semantic_cdb_after_build(on_done)
   vim.notify(
     ("Generating %s semantic CDB (no cook/package/compile actions)..."):format(target_ctx.platform),
     vim.log.levels.INFO,
-    { title = "UECompileForNvim" }
+    { title = "UEPrepare" }
   )
   local jobid = open_terminal_command(command, {
     cwd = plan.cwd or ctx.engine_root,
-    quickfix_title = ("UECompileForNvim semantic CDB %s %s"):format(
+    env = plan.env,
+    quickfix_title = ("UEPrepare semantic CDB %s %s"):format(
       target_ctx.platform, target_ctx.configuration
     ),
     quickfix_root = workspace_root(ctx),
@@ -7249,6 +7475,12 @@ function CORE_RT.generate_semantic_cdb_after_build(on_done)
         on_done(false, message)
         return
       end
+      if expected and not CORE_RT.target_context_matches(
+          resolve_context(), expected.engine_root, expected.project_root) then
+        pcall(os.remove, pending_path)
+        on_done(false, "project changed during Apple semantic CDB generation")
+        return
+      end
 
       local ok_publish, info = require("ue.cdb.source").promote(
         pending_path, stable_path, ctx, target_ctx, targets.must_get(target_ctx.platform)
@@ -7259,12 +7491,27 @@ function CORE_RT.generate_semantic_cdb_after_build(on_done)
         return
       end
 
+      local marker = CORE_RT.apple_semantic_source_marker(
+        ctx, target_ctx, build_evidence, stable_path, info.entry_count
+      )
+      local marker_ok, marker_err
+      if marker then
+        marker_ok, marker_err = update_state_field(ctx.engine_root, "apple_semantic_cdb", marker)
+      else
+        marker_err = "semantic CDB source signature is unavailable"
+      end
+      if not marker_ok then
+        require("utils.log").notify_error(
+          "ue.prepare", "failed to record reusable Apple semantic CDB evidence: " .. tostring(marker_err)
+        )
+      end
+
       vim.notify(
         ("Semantic CDB ready: %d entries%s"):format(
           info.entry_count, info.no_op and " (unchanged)" or ""
         ),
         vim.log.levels.INFO,
-        { title = "UECompileForNvim" }
+        { title = "UEPrepare" }
       )
       on_done(true, info)
     end,
@@ -7276,107 +7523,88 @@ function CORE_RT.generate_semantic_cdb_after_build(on_done)
   return jobid
 end
 
-function CORE_RT.compile_for_nvim()
-  local clangd_cmd = M.clangd_cmd()
-  local executable = type(clangd_cmd) == "table" and clangd_cmd[1] or nil
-  if not executable or executable == "" then
-    require("utils.log").notify_error("ue.semantic", "clangd executable is unavailable")
-    return
-  end
-
-  return require("ue.target_tasks").run({
-    executable = executable,
-    args = { "--version" },
-    metadata = { operation = "clangd-version-preflight" },
-  }, {
-    name = "UECompileForNvim clangd preflight",
-    on_exit = function(result)
-      if result.code ~= 0 then
-        require("utils.log").notify_error(
-          "ue.semantic", require("ue.target_tasks").error_message(result)
-        )
-        return
-      end
-      local version_output = result.stdout ~= "" and result.stdout or result.stderr
-      local compatible, major, minor = CORE_RT.clangd_version_compatible(version_output)
-      if not compatible then
-        require("utils.log").notify_error("ue.semantic", (
-          "clangd %s.%s is incompatible; this repository requires LLVM clangd 22.1.x. "
-            .. "Tree-sitter syntax highlighting remains available, but compiler semantics were not prepared."
-        ):format(tostring(major or "?"), tostring(minor or "?")))
-        return
-      end
-      build_target({
-        title = "UECompileForNvim",
-        on_exit = function(code)
-          if code == 0 then
-            CORE_RT.generate_semantic_cdb_after_build(function(ok_semantic, semantic_info)
-              if not ok_semantic then
-                require("utils.log").notify_error(
-                  "ue.semantic", tostring(semantic_info or "semantic CDB generation failed")
-                )
-                return
-              end
-              if type(CORE_RT.prepare_async) == "function" then
-                CORE_RT.prepare_async({
-                  force_cdb_restart = type(semantic_info) == "table"
-                    and semantic_info.skipped ~= true
-                    and semantic_info.no_op ~= true,
-                })
-              else
-                require("utils.log").notify_error("ue.semantic", "UEPrepare entry is unavailable")
-              end
-            end)
-          end
-        end,
-      })
+function CORE_RT.ios_setup_is_ready(ctx, dependencies)
+  ensure_ios_workflows()
+  local owned_dependencies = vim.tbl_extend("force", {
+    read_state = read_state,
+    resolve_legacy_install_script = function(...)
+      return CORE_RT.invoke_workflow_api("IOS", "install", "resolve_legacy_install_script", { ... })
     end,
-  })
+  }, dependencies or {})
+  return CORE_RT.invoke_workflow_api("IOS", "semantic_cdb", "ios_setup_is_ready", { ctx, owned_dependencies })
 end
 
--- Find the newest APK in project build outputs.
--- Searches under uproject's directory (NOT ctx.project_root — see uproject_dir
--- comment for why these can differ in nested Source/<Project> layouts).
-local function find_apk(ctx)
-  local pr = uproject_dir(ctx)
-  if not pr or pr == "" then
-    return nil
-  end
-  local patterns = {
-    -- UE5 Gradle output (most common)
-    join(pr, "Binaries", "Android", "*.apk"),
-    join(pr, "Intermediate", "Android", "*", "gradle", "app", "build", "outputs", "apk", "*.apk"),
-    join(pr, "Intermediate", "Android", "*", "gradle", "app", "build", "outputs", "apk", "debug", "*.apk"),
-    join(pr, "Intermediate", "Android", "*", "gradle", "app", "build", "outputs", "apk", "release", "*.apk"),
-  }
-  local best = nil
-  local best_mtime = 0
-  for _, pattern in ipairs(patterns) do
-    for _, path in ipairs(glob_paths(pattern)) do
-      local mtime = vim.fn.getftime(path)
-      if not best or mtime > best_mtime then
-        best = path
-        best_mtime = mtime
-      end
+function M._ios_setup_is_ready_for_test(ctx, dependencies)
+  return CORE_RT.ios_setup_is_ready(ctx, dependencies)
+end
+
+function CORE_RT.apple_build_evidence_matches(ctx, target_ctx, dependencies)
+  ensure_ios_workflows()
+  local owned_dependencies = vim.tbl_extend("force", {
+    read_state = read_state,
+    update_state_field = update_state_field,
+  }, dependencies or {})
+  return CORE_RT.invoke_workflow_api(
+    "IOS", "semantic_cdb", "apple_build_evidence_matches", { ctx, target_ctx, owned_dependencies }
+  )
+end
+
+function M._apple_build_evidence_matches_for_test(ctx, target_ctx, dependencies)
+  return CORE_RT.apple_build_evidence_matches(ctx, target_ctx, dependencies)
+end
+
+-- Apple-only prelude owned by :UEPrepare. It validates the pinned clangd,
+-- performs one-time IOS setup when necessary, and publishes a tuple-scoped
+-- semantic CDB. It deliberately never calls build_target: <leader>ub remains
+-- the compile step, and UEPrepare continues to reject a build in progress.
+function CORE_RT.prepare_apple_semantics(ctx, opts, on_done)
+  ensure_ios_workflows()
+  return CORE_RT.invoke_workflow_api(
+    "IOS", "semantic_cdb", "prepare", { ctx, opts, on_done, ios_workflow_dependencies() }
+  )
+end
+
+-- Compatibility convenience: compile once, then delegate all semantic/CDB
+-- ownership to the same :UEPrepare path users invoke directly.
+function CORE_RT.compile_for_nvim()
+  return CORE_RT.run_clangd_preflight(function(ok, preflight_err)
+    if not ok then
+      require("utils.log").notify_error("ue.semantic", tostring(preflight_err))
+      return
     end
-  end
-  return best
+    build_target({
+      title = "UECompileForNvim",
+      on_exit = function(code)
+        if code ~= 0 then
+          return
+        end
+        if type(CORE_RT.prepare_async) ~= "function" then
+          require("utils.log").notify_error("ue.semantic", "UEPrepare entry is unavailable")
+          return
+        end
+        CORE_RT.prepare_async({ _clangd_verified = true })
+      end,
+    })
+  end)
+end
+
+local function find_apk(ctx)
+  return require("ue.workflows").invoke(
+    "Android", "install", "find_apk", { ctx }, require("utils.platform").driver()
+  )
 end
 
 local function android_so_deploy_command(ctx, serial, package_name, host_driver)
-  local target_ctx, context_err = CORE_RT.target_context(ctx, "Android")
-  if not target_ctx then return nil, context_err end
-  target_ctx.device_id = serial
-  target_ctx.package_name = package_name
   local selected_host = host_driver or require("utils.platform").driver()
-  local plan = require("ue.targets").plan(
-    "Android",
-    "so_deploy",
-    target_ctx,
-    selected_host
+  return require("ue.workflows").invoke(
+    "Android", "so_deploy", "command", {
+      ctx, serial, package_name, selected_host, {
+        target_context = function(resolved, platform)
+          return CORE_RT.target_context(resolved, platform)
+        end,
+      },
+    }, selected_host
   )
-  local command, command_err = require("ue.target_tasks").command(plan)
-  return command, command_err, plan
 end
 
 function M.ai_context(engine_root)
@@ -7417,51 +7645,15 @@ function M.ai_context(engine_root)
   local ubt_configuration = target_configuration(engine_root, project_root, uproject, platform)
   local kind = target_kind(engine_root, project_root, uproject, platform)
   local target_name = build_target_name(project_root, uproject, kind)
-  local build_command, build_error = android_build_command(ctx)
-  local targets = require("ue.targets")
-  local host_driver = _uplat.driver()
-  local android_active = platform == targets.must_get("Android").id
-  local so_build_command, so_build_error
-  if android_active then
-    so_build_command, so_build_error = android_build_command(ctx, { operation = "so_build" })
-  else
-    so_build_error = "UEBuildAndroidSO requires target platform Android."
-  end
-  local apk = android_active and find_apk(ctx) or nil
-  local selected_android_serial = require("utils.android_device").get()
-  local so_deploy_command, so_deploy_error
-  if android_active then
-    so_deploy_command, so_deploy_error = android_so_deploy_command(
-      ctx, selected_android_serial, state.android_package
-    )
-  else
-    so_deploy_error = "UEDeployAndroidSO requires target platform Android."
-  end
-  local _, install_unavailable = targets.resolve("Android", "install", host_driver)
-  local install_plan = android_active
-      and not install_unavailable
-      and apk
-      and selected_android_serial
-      and targets.plan("Android", "install", {
-        adb = "adb",
-        apk = apk,
-        cwd = engine_root,
-        device_id = selected_android_serial,
-      }, host_driver)
-    or nil
-  local install_command = install_plan and require("ue.target_tasks").command(install_plan) or nil
-  local install_native_action
-  if not android_active then
-    install_native_action = "UEInstallAndroid requires target platform Android."
-  elseif install_unavailable then
-    install_native_action = ("Android install is unavailable on host %s: %s"):format(
-      tostring(host_driver.id), tostring(install_unavailable.reason)
-    )
-  elseif not apk then
-    install_native_action = "No APK found under the active uproject build outputs."
-  elseif not selected_android_serial then
-    install_native_action = "Android device is not selected; run :UESetAndroidDevice."
-  end
+  local target_artifacts = require("ue.ai_context").resolve_target_artifacts(ctx, platform, state, {
+    android_build_command = android_build_command,
+    android_device = require("utils.android_device"),
+    android_so_deploy_command = android_so_deploy_command,
+    find_apk = find_apk,
+    host_driver = _uplat.driver(),
+    targets = require("ue.targets"),
+    target_tasks = require("ue.target_tasks"),
+  })
 
   return {
     schema_version = 1,
@@ -7470,7 +7662,7 @@ function M.ai_context(engine_root)
     project_root = project_root,
     uproject = uproject,
     state_path = ctx.paths.state,
-    android_device_serial = selected_android_serial,
+    android_device_serial = target_artifacts.android_device_serial,
     state = {
       target_platform = state.target_platform,
       target_configuration = state.target_configuration,
@@ -7488,14 +7680,14 @@ function M.ai_context(engine_root)
       target_source = trim(vim.env.UE_BUILD_TARGET) ~= "" and "environment" or "Target.cs/uproject",
     },
     artifacts = {
-      build_command = build_command,
-      build_error = build_error,
-      so_build_command = so_build_command,
-      so_build_error = so_build_error,
-      so_deploy_command = so_deploy_command,
-      so_deploy_error = so_deploy_error,
-      latest_apk = apk,
-      install_command = install_command,
+      build_command = target_artifacts.build_command,
+      build_error = target_artifacts.build_error,
+      so_build_command = target_artifacts.so_build_command,
+      so_build_error = target_artifacts.so_build_error,
+      so_deploy_command = target_artifacts.so_deploy_command,
+      so_deploy_error = target_artifacts.so_deploy_error,
+      latest_apk = target_artifacts.latest_apk,
+      install_command = target_artifacts.install_command,
       compile_commands = ctx.paths.active_cdb,
       clangd_index = ctx.paths.active_index,
     },
@@ -7504,29 +7696,29 @@ function M.ai_context(engine_root)
         key = "<Space>ub",
         nvim_command = ":UEBuild",
         purpose = "Build the active UE target using the persisted platform and configuration.",
-        native_command = build_command,
-        native_action = build_error,
+        native_command = target_artifacts.build_command,
+        native_action = target_artifacts.build_error,
       },
       {
         key = "<Space>us",
         nvim_command = ":UEBuildAndroidSO",
         purpose = "Compile and link the Android target without UBT's APK deployment phase.",
-        native_command = so_build_command,
-        native_action = so_build_error,
+        native_command = target_artifacts.so_build_command,
+        native_action = target_artifacts.so_build_error,
       },
       {
         key = "<Space>uq",
         nvim_command = ":UEDeployAndroidSO",
         purpose = "Strip and stage libUE4.so through root or a debuggable app-private ClassLoader startup agent, leaving the package stopped.",
-        native_command = so_deploy_command,
-        native_action = so_deploy_error,
+        native_command = target_artifacts.so_deploy_command,
+        native_action = target_artifacts.so_deploy_error,
       },
       {
         key = "<Space>ui",
-        nvim_command = ":UEInstallAndroid",
-        purpose = "Install the newest APK from the active project with replacement enabled.",
-        native_command = install_command,
-        native_action = install_native_action,
+        nvim_command = ":UEInstall",
+        purpose = "Install for the active platform: replace the Android APK or update the signed IOS app in place.",
+        native_command = target_artifacts.install_command,
+        native_action = target_artifacts.install_native_action,
       },
       {
         key = "<Space>ul",
@@ -7623,6 +7815,40 @@ do
     return existing
   end
 
+  ensure_ios_workflows = function()
+    return require("ue.workflows").lookup("IOS", "semantic_cdb")
+  end
+
+  ios_workflow_dependencies = function()
+    ensure_ios_workflows()
+    return {
+      trim = trim,
+      resolve_context = resolve_context,
+      target_context = function(...) return CORE_RT.target_context(...) end,
+      target_context_matches = function(...) return CORE_RT.target_context_matches(...) end,
+      target_platform = target_platform,
+      set_platform = set_platform,
+      update_target_runtime = function(...) return CORE_RT.update_target_runtime(...) end,
+      update_state_field = update_state_field,
+      read_state = read_state,
+      reset_context_cache = function() CORE_RT.context_cache = {} end,
+      run_target_preflight = function(...) return CORE_RT.run_target_preflight(...) end,
+      run_clangd_preflight = function(...) return CORE_RT.run_clangd_preflight(...) end,
+      generate_semantic_cdb_after_build = function(...) return CORE_RT.generate_semantic_cdb_after_build(...) end,
+      ue_build_running = function() return CORE_RT.ue_build_running() end,
+      setup_ios = function(...) return CORE_RT.setup_ios(...) end,
+      select_ios_signing_certificate = function(...) return CORE_RT.select_ios_signing_certificate(...) end,
+      select_target_device = function(...) return CORE_RT.select_target_device(...) end,
+      target_error = target_error,
+      read_result_file = read_result_file,
+      collect_existing_artifacts = collect_existing_artifacts,
+      target_launch_running = CORE_RT.target_launch_running,
+      resolve_legacy_install_script = function(...)
+        return CORE_RT.invoke_workflow_api("IOS", "install", "resolve_legacy_install_script", { ... })
+      end,
+    }
+  end
+
   function CORE_RT.run_target_preflight(driver, stage, target_ctx, host_driver, on_done)
     if type(driver.preflight_plans) ~= "function" then
       on_done(true, {})
@@ -7641,7 +7867,7 @@ do
       local plan = plans[index]
       if not plan then
         local validation = type(driver.validate_preflight) == "function"
-            and driver.validate_preflight(stage, results)
+            and driver.validate_preflight(stage, results, target_ctx)
           or { ok = true }
         on_done(validation.ok == true, validation.reason, results)
         return
@@ -7715,11 +7941,12 @@ do
             artifact.metadata.package_completed_at = completed_at
             artifact.metadata.package_exit_code = 0
           end
-          CORE_RT.update_target_runtime(ctx.engine_root, driver.id, {
+          local runtime, update_err = CORE_RT.update_target_runtime(ctx.engine_root, driver.id, {
             artifacts = artifacts,
             target = target_ctx.target,
             configuration = target_ctx.configuration,
           })
+          if not runtime then target_error("ue.package", update_err) end
         end,
       })
     end)
@@ -7746,250 +7973,61 @@ do
     })
   end
 
-  function CORE_RT.select_target_device(platform)
-    local ctx, err = resolve_context()
-    if not ctx then
-      target_error("ue.device", err)
-      return
-    end
-    local output_path = vim.fn.tempname() .. ".devices.json"
-    local target_ctx, context_err, driver = CORE_RT.target_context(ctx, platform, {
-      json_output = output_path,
+  function CORE_RT.select_ios_signing_certificate(query, clear, opts)
+    ensure_ios_workflows()
+    return dispatch_registered_workflow("IOS", "signing", {
+      payload = { query = query, clear = clear, opts = opts },
+      deps = ios_workflow_dependencies(),
     })
-    if not target_ctx then
-      target_error("ue.device", context_err)
-      return
-    end
-    local host_driver = require("utils.platform").driver()
-    local resolved, unavailable = require("ue.targets").resolve(driver.id, "device", host_driver)
-    if not resolved then
-      pcall(os.remove, output_path)
-      target_error("ue.device", unavailable.reason)
-      return
-    end
-    driver = resolved
-    local plan = driver.device_list_plan(target_ctx, host_driver)
-    local handle, run_err = require("ue.target_tasks").run(plan, {
-      name = "UE " .. driver.id .. " device discovery",
-      on_exit = function(result)
-        if result.code ~= 0 then
-          pcall(os.remove, output_path)
-          target_error("ue.device", require("ue.target_tasks").error_message(result))
-          return
-        end
-        local payload, payload_err = read_result_file(output_path)
-        if not payload then
-          target_error("ue.device", payload_err)
-          return
-        end
-        local parsed = driver.parse_device_list(payload)
-        if not parsed.ok then
-          target_error("ue.device", parsed.reason)
-          return
-        end
-        if #parsed.devices == 0 then
-          target_error("ue.device", "no available physical " .. driver.id .. " device")
-          return
-        end
-        vim.ui.select(parsed.devices, {
-          prompt = "Select " .. driver.id .. " device:",
-          format_item = function(device)
-            return ("%s (%s, %s)"):format(
-              device.name or "unnamed", device.os_version or device.platform or "unknown", device.id
-            )
-          end,
-        }, function(device)
-          if not device then return end
-          CORE_RT.update_target_runtime(ctx.engine_root, driver.id, {
-            device_id = device.id,
-            device_name = device.name,
-          })
-          vim.notify(("%s device selected: %s"):format(driver.id, device.name or device.id))
-        end)
-      end,
-    })
-    if not handle then target_error("ue.device", run_err) end
-    return handle
   end
 
-  local function with_target_bundle_id(ctx, driver, target_ctx, host_driver, on_done)
-    local artifacts = target_ctx.artifacts
-    if type(artifacts) ~= "table" or #artifacts == 0 then
-      on_done(nil, nil,
-        "no artifact provenance from a successful package task; run :UEPackage" .. driver.id)
-      return
-    end
-    local selected = driver.select_staged_artifact(artifacts, target_ctx)
-    if not selected.ok then
-      on_done(nil, nil, selected.reason)
-      return
-    end
-    local validated = type(driver.validate_bundle_id) == "function"
-        and driver.validate_bundle_id(target_ctx.bundle_id)
-      or { ok = false }
-    if validated.ok then
-      on_done(validated.bundle_id, artifacts)
-      return
-    end
-    local probe = driver.bundle_id_plan(selected.app_path, host_driver, target_ctx)
-    local handle, run_err = require("ue.target_tasks").run(probe, {
-      name = "UE " .. driver.id .. " bundle identifier",
-      on_exit = function(result)
-        if result.code ~= 0 then
-          on_done(nil, nil, require("ue.target_tasks").error_message(result))
-          return
-        end
-        local bundle = driver.validate_bundle_id(trim(result.stdout))
-        if not bundle.ok then
-          on_done(nil, nil, bundle.reason)
-          return
-        end
-        on_done(bundle.bundle_id, artifacts)
-      end,
+  function CORE_RT.select_target_device(platform, opts)
+    ensure_ios_workflows()
+    return dispatch_registered_workflow("IOS", "device", {
+      payload = { platform = platform, opts = opts },
+      deps = ios_workflow_dependencies(),
     })
-    if not handle then
-      on_done(nil, nil, run_err or "bundle identifier probe failed to start")
-    end
+  end
+
+  function CORE_RT.setup_ios(opts)
+    ensure_ios_workflows()
+    return dispatch_registered_workflow("IOS", "setup", {
+      payload = { opts = opts },
+      deps = ios_workflow_dependencies(),
+    })
+  end
+
+  function M._with_target_bundle_id_for_test(ctx, driver, target_ctx, host_driver, on_done, dependencies)
+    ensure_ios_workflows()
+    return CORE_RT.invoke_workflow_api(
+      "IOS",
+      "install",
+      "with_target_bundle_id",
+      { ctx, driver, target_ctx, host_driver, on_done, dependencies },
+      host_driver
+    )
+  end
+
+  function M._ios_workflow_owner_for_test(operation)
+    ensure_ios_workflows()
+    local workflow = require("ue.workflows").lookup("IOS", operation)
+    return workflow and workflow.owner or nil
   end
 
   function CORE_RT.install_target(platform)
-    local ctx, err = resolve_context()
-    if not ctx or not ctx.project_root then
-      target_error("ue.install", err or "No project configured. Run :UESetProject [path]")
-      return
-    end
-    local output_path = vim.fn.tempname() .. ".install.json"
-    local target_ctx, context_err, driver = CORE_RT.target_context(ctx, platform, {
-      json_output = output_path,
+    ensure_ios_workflows()
+    return dispatch_registered_workflow("IOS", "install", {
+      payload = { platform = platform },
+      deps = ios_workflow_dependencies(),
     })
-    if not target_ctx then
-      target_error("ue.install", context_err)
-      return
-    end
-    if not target_ctx.device_id then
-      target_error("ue.install", (
-        "no %s device selected; run :UESet%sDevice"
-      ):format(driver.id, driver.id))
-      return
-    end
-    local host_driver = require("utils.platform").driver()
-    local resolved, unavailable = require("ue.targets").resolve(driver.id, "install", host_driver)
-    if not resolved then
-      pcall(os.remove, output_path)
-      target_error("ue.install", unavailable.reason)
-      return
-    end
-    driver = resolved
-    CORE_RT.run_target_preflight(driver, "install", target_ctx, host_driver, function(ok, preflight_err)
-      if not ok then
-        target_error("ue.install", preflight_err)
-        return
-      end
-      with_target_bundle_id(ctx, driver, target_ctx, host_driver, function(bundle_id, artifacts, bundle_err)
-        if not bundle_id then
-          target_error("ue.install", bundle_err)
-          return
-        end
-        target_ctx.bundle_id = bundle_id
-        target_ctx.artifacts = artifacts
-        target_ctx.json_output = output_path
-        local plan = driver.install_plan(target_ctx, host_driver)
-        local handle, run_err = require("ue.target_tasks").run(plan, {
-          name = "UE " .. driver.id .. " install",
-          on_exit = function(result)
-            if result.code ~= 0 then
-              pcall(os.remove, output_path)
-              target_error("ue.install", require("ue.target_tasks").error_message(result))
-              return
-            end
-            local payload, payload_err = read_result_file(output_path)
-            if not payload then target_error("ue.install", payload_err); return end
-            local parsed = driver.parse_install_result(payload, {
-              device_id = target_ctx.device_id,
-              bundle_id = bundle_id,
-            })
-            if not parsed.ok then target_error("ue.install", parsed.reason); return end
-            CORE_RT.update_target_runtime(ctx.engine_root, driver.id, {
-              device_id = target_ctx.device_id,
-              bundle_id = bundle_id,
-              artifacts = artifacts,
-            })
-            vim.notify(("Installed %s on %s"):format(bundle_id, target_ctx.device_id))
-          end,
-        })
-        if not handle then
-          pcall(os.remove, output_path)
-          target_error("ue.install", run_err or "install task failed to start")
-        end
-      end)
-    end)
   end
 
-  function CORE_RT.launch_target(platform)
-    local ctx, err = resolve_context()
-    if not ctx or not ctx.project_root then
-      target_error("ue.launch", err or "No project configured. Run :UESetProject [path]")
-      return
-    end
-    local output_path = vim.fn.tempname() .. ".launch.json"
-    local target_ctx, context_err, driver = CORE_RT.target_context(ctx, platform, {
-      json_output = output_path,
+  function CORE_RT.launch_target(platform, opts)
+    ensure_ios_workflows()
+    return dispatch_registered_workflow("IOS", "launch", {
+      payload = { platform = platform, opts = opts },
+      deps = ios_workflow_dependencies(),
     })
-    if not target_ctx then target_error("ue.launch", context_err); return end
-    if not target_ctx.device_id then
-      target_error("ue.launch", (
-        "no %s device selected; run :UESet%sDevice"
-      ):format(driver.id, driver.id))
-      return
-    end
-    local host_driver = require("utils.platform").driver()
-    local resolved, unavailable = require("ue.targets").resolve(driver.id, "launch", host_driver)
-    if not resolved then
-      pcall(os.remove, output_path)
-      target_error("ue.launch", unavailable.reason)
-      return
-    end
-    driver = resolved
-    CORE_RT.run_target_preflight(driver, "launch", target_ctx, host_driver, function(ok, preflight_err)
-      if not ok then target_error("ue.launch", preflight_err); return end
-      with_target_bundle_id(ctx, driver, target_ctx, host_driver, function(bundle_id, artifacts, bundle_err)
-        if not bundle_id then target_error("ue.launch", bundle_err); return end
-        target_ctx.bundle_id = bundle_id
-        target_ctx.artifacts = artifacts
-        target_ctx.json_output = output_path
-        local plan = driver.launch_plan(target_ctx, host_driver)
-        local handle, run_err = require("ue.target_tasks").run(plan, {
-          name = "UE " .. driver.id .. " launch",
-          on_exit = function(result)
-            if result.code ~= 0 then
-              pcall(os.remove, output_path)
-              target_error("ue.launch", require("ue.target_tasks").error_message(result))
-              return
-            end
-            local payload, payload_err = read_result_file(output_path)
-            if not payload then target_error("ue.launch", payload_err); return end
-            local parsed = driver.parse_launch_result(payload, {
-              device_id = target_ctx.device_id,
-              bundle_id = bundle_id,
-            })
-            if not parsed.ok then target_error("ue.launch", parsed.reason); return end
-            CORE_RT.update_target_runtime(ctx.engine_root, driver.id, {
-              device_id = target_ctx.device_id,
-              bundle_id = bundle_id,
-              artifacts = artifacts,
-              process_id = parsed.process_id,
-            })
-            vim.notify(("Launched %s on %s (pid %s)"):format(
-              bundle_id, target_ctx.device_id, tostring(parsed.process_id)
-            ))
-          end,
-        })
-        if not handle then
-          pcall(os.remove, output_path)
-          target_error("ue.launch", run_err or "launch task failed to start")
-        end
-      end)
-    end)
   end
 end
 
@@ -8048,253 +8086,93 @@ function M.toggle_debug_log()
 end
 
 local function deploy_android_so()
-  local ctx, err = resolve_context()
-  if not ctx then
-    vim.notify(err, vim.log.levels.WARN)
-    return
-  end
-  if target_platform(ctx.engine_root, nil) ~= "Android" then
-    vim.notify("UEDeployAndroidSO requires target platform Android", vim.log.levels.WARN)
-    return
-  end
-
-  local android_device = require("utils.android_device")
-  local serial = android_device.get()
-  if not serial then
-    android_device.ensure({ prompt = "Select Android device for SO deploy:" }, function(selected)
-      if selected then deploy_android_so() end
-    end)
-    return
-  end
-
-  local state = read_state(ctx.engine_root)
-  local cmd, command_err, plan = android_so_deploy_command(ctx, serial, state.android_package)
-  if not cmd then
-    require("utils.log").notify_error("ue.android", command_err)
-    return
-  end
-
-  require("ue.dap").stop_android_debugger({ kill_orphans = true })
-  open_terminal_command(cmd, {
-    cwd = plan.cwd or ctx.engine_root,
-    quickfix_title = "UEDeployAndroidSO",
-    quickfix_root = workspace_root(ctx),
-    tail_limit = 20,
+  local host_driver = require("utils.platform").driver()
+  local dispatched, dispatch_err = dispatch_registered_workflow("Android", "so_deploy", {
+    host_driver = host_driver,
+    context = {
+      resolve_context = resolve_context,
+      read_state = read_state,
+      target_context = function(ctx, platform)
+        return CORE_RT.target_context(ctx, platform)
+      end,
+      open_terminal_command = open_terminal_command,
+      workspace_root = workspace_root,
+      reinvoke = deploy_android_so,
+    },
   })
+  if dispatched ~= nil then
+    return dispatched
+  end
+  if dispatch_err then
+    require("utils.log").notify_error("ue.android", dispatch_err.reason or dispatch_err)
+  end
+  return nil, dispatch_err
 end
 
 local function install_android()
-  local ctx, err = resolve_context()
-  if not ctx then
-    vim.notify(err, vim.log.levels.WARN)
-    return
-  end
-  if not ctx.project_root then
-    vim.notify("No project configured. Run :UESetProject [path]", vim.log.levels.WARN)
-    return
-  end
-
   local host_driver = require("utils.platform").driver()
-  local _, unavailable = require("ue.targets").resolve("Android", "install", host_driver)
-  if unavailable then
-    require("utils.log").notify_error("ue.android", unavailable.reason)
-    return
-  end
-
-  local apk = find_apk(ctx)
-  if not apk then
-    require("utils.log").notify_error("ue.android", "No APK found in project build outputs")
-    return
-  end
-
-  local android_device = require("utils.android_device")
-  local serial = android_device.get()
-  if not serial then
-    android_device.ensure({ prompt = "Select Android device for APK install:" }, function(selected)
-      if selected then install_android() end
-    end)
-    return
-  end
-
-  local plan = require("ue.targets").plan("Android", "install", {
-    adb = "adb",
-    apk = apk,
-    cwd = ctx.engine_root,
-    device_id = serial,
-  }, host_driver)
-  local install_cmd, install_err = require("ue.target_tasks").command(plan)
-  if not install_cmd then
-    require("utils.log").notify_error("ue.android", install_err)
-    return
-  end
-  local mtime = vim.fn.getftime(apk)
-  local age = os.time() - mtime
-  local age_str
-  if age < 60 then
-    age_str = age .. "s ago"
-  elseif age < 3600 then
-    age_str = math.floor(age / 60) .. "m ago"
-  else
-    age_str = math.floor(age / 3600) .. "h ago"
-  end
-
-  local progress = require("fidget.progress")
-  local install_start_msg = ("Installing APK: %s (built %s) on %s"):format(
-    vim.fn.fnamemodify(plan.metadata.artifact, ":t"), age_str, serial)
-  pcall(function()
-    require("utils.notification_history").record({
-      scope = "ue.install",
-      level = vim.log.levels.INFO,
-      message = install_start_msg,
-    })
-  end)
-  local handle = progress.handle.create({
-    title = "Installing APK",
-    message = ("built %s — %s"):format(age_str, vim.fn.fnamemodify(plan.metadata.artifact, ":t")),
-    lsp_client = { name = "adb" },
-    percentage = 0,
+  local dispatched, dispatch_err = dispatch_registered_workflow("Android", "install", {
+    host_driver = host_driver,
+    context = {
+      resolve_context = resolve_context,
+      reinvoke = install_android,
+    },
   })
+  if dispatched ~= nil then
+    return dispatched
+  end
+  if dispatch_err then
+    require("utils.log").notify_error("ue.android", dispatch_err.reason or dispatch_err)
+  end
+  return nil, dispatch_err
+end
 
-  local dots = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
-  local tick = 0
-  local timer = vim.uv.new_timer()
-  timer:start(0, 120, vim.schedule_wrap(function()
-    if handle then
-      tick = tick + 1
-      handle.message = dots[tick % #dots + 1] .. " installing..."
+local function install_active_target(opts)
+  opts = opts or {}
+  local ctx, err = (opts.resolve_context or resolve_context)()
+  if not ctx then
+    local message = err or "No project configured. Run :UESetProject [path]"
+    if type(opts.notify_error) == "function" then
+      opts.notify_error(message)
+    else
+      require("utils.log").notify_error("ue.install", message)
     end
-  end))
-
-  -- Accumulate full stdout / stderr so we can surface the REAL adb error on
-  -- failure (the per-line message overwrite would otherwise leave you with
-  -- just "Failed (exit 1)" and lose the actual "Failure [INSTALL_FAILED_*]"
-  -- line that adb prints).
-  local stdout_lines, stderr_lines = {}, {}
-  local install_jobid = vim.fn.jobstart(install_cmd, {
-    stdout_buffered = true,
-    stderr_buffered = true,
-    on_stdout = function(_, data)
-      for _, line in ipairs(data) do
-        if line ~= "" then
-          table.insert(stdout_lines, line)
-          vim.schedule(function()
-            if handle then handle.message = line end
-          end)
-        end
-      end
-    end,
-    on_stderr = function(_, data)
-      for _, line in ipairs(data) do
-        if line ~= "" then
-          table.insert(stderr_lines, line)
-          vim.schedule(function()
-            if handle then handle.message = line end
-          end)
-        end
-      end
-    end,
-    on_exit = function(_, code)
-      vim.schedule(function()
-        timer:stop()
-        timer:close()
-        if code == 0 then
-          handle.message = "Installed successfully"
-          pcall(function()
-            require("utils.notification_history").record({
-              scope = "ue.install",
-              level = vim.log.levels.INFO,
-              message = ("Installed successfully: %s"):format(vim.fn.fnamemodify(plan.metadata.artifact, ":t")),
-            })
-          end)
-          handle:finish()
-          return
-        end
-
-        -- Failure path: keep the fidget handle alive long enough for the user
-        -- to actually READ the adb error, then finish it. Show stderr first
-        -- (where adb writes "Failure [INSTALL_FAILED_*]"), fall back to
-        -- stdout, fall back to a placeholder. Full blob goes to utils.log
-        -- so `:NvimLog` always has the post-mortem.
-        local stderr_blob = table.concat(stderr_lines, "\n")
-        local stdout_blob = table.concat(stdout_lines, "\n")
-
-        -- Pick the most useful single line for the inline progress display:
-        -- prefer a line containing "Failure [", then any stderr line, then
-        -- the last stdout line. fidget collapses newlines so we keep it short.
-        local function pick_summary()
-          for _, line in ipairs(stderr_lines) do
-            if line:find("Failure %[") or line:find("^adb: ") then
-              return line
-            end
-          end
-          if #stderr_lines > 0 then return stderr_lines[#stderr_lines] end
-          if #stdout_lines > 0 then return stdout_lines[#stdout_lines] end
-          return "(no output captured)"
-        end
-
-        local summary = pick_summary()
-
-        -- Append a short hint for well-known failure codes so the user gets
-        -- an actionable next step inline, without having to grep docs.
-        local hint
-        if summary:find("INSTALL_FAILED_UPDATE_INCOMPATIBLE") then
-          hint = ("→ run: adb -s %s uninstall <your.package.id>  (signature mismatch from leftover PMS record)"):format(serial)
-        elseif summary:find("INSTALL_FAILED_INSUFFICIENT_STORAGE") then
-          hint = ("→ free space on /data or use adb -s %s install -r -d"):format(serial)
-        elseif summary:find("INSTALL_FAILED_VERSION_DOWNGRADE") then
-          hint = ("→ downgrade blocked; use adb -s %s install -r -d (allow downgrade) or uninstall first"):format(serial)
-        elseif summary:find("INSTALL_FAILED_NO_MATCHING_ABIS") then
-          hint = ("→ ABI mismatch; check device ABI with: adb -s %s shell getprop ro.product.cpu.abi"):format(serial)
-        elseif summary:find("INSTALL_PARSE_FAILED") then
-          hint = "→ APK corrupt or unsigned; rebuild + re-sign"
-        elseif summary:find("device offline") or summary:find("no devices/emulators") then
-          hint = "→ adb device gone; check: adb devices"
-        end
-
-        handle.message = ("✗ exit %d — %s%s"):format(code, summary, hint and ("  " .. hint) or "")
-        pcall(function()
-          require("utils.notification_history").record({
-            scope = "ue.install",
-            level = vim.log.levels.ERROR,
-            message = ("adb install failed (exit %d): %s%s. See :NvimLog"):format(
-              code,
-              summary,
-              hint and ("  " .. hint) or ""
-            ),
-          })
-        end)
-
-        -- Persist the full output to the rotating debug log BEFORE finishing
-        -- the handle, so even if fidget vanishes the user can `:NvimLog`.
-        local ok_log, log = pcall(require, "utils.log")
-        if ok_log and log.error then
-          log.error("ue.install", ("adb install failed (exit %d): %s\n--- stderr ---\n%s\n--- stdout ---\n%s\nLog: see :NvimLog"):format(
-            code, vim.fn.fnamemodify(plan.metadata.artifact, ":t"), stderr_blob, stdout_blob
-          ))
-        end
-
-        -- Delay finish() so the failure message stays on screen ~8s instead
-        -- of fidget's default ~3s. handle:finish() is what triggers fade-out.
-        vim.defer_fn(function()
-          if handle then handle:finish() end
-        end, 8000)
-      end)
-    end,
-  })
-
-  -- Register the adb install job for :Tasks list/cancel. Pure side-path:
-  -- register only, after job creation; on_exit above is untouched.
-  if install_jobid and install_jobid > 0 then
-    pcall(function()
-      require("utils.task_registry").register({
-        name = "UEInstallAndroid",
-        group = "android",
-        kind = "job",
-        handle = install_jobid,
-        started_at = os.time(),
-      })
-    end)
+    return nil, message
   end
+
+  local platform = (opts.target_platform or target_platform)(ctx.engine_root, nil)
+  local host_driver = type(opts.host_driver) == "table" and opts.host_driver or require("utils.platform").driver()
+  local dispatched, dispatch_err, owner_found = (opts.dispatch_workflow or dispatch_registered_workflow)(
+    platform,
+    "install",
+    {
+      host_driver = host_driver,
+      context = {
+        resolve_context = opts.resolve_context or resolve_context,
+        reinvoke = function()
+          return install_active_target(opts)
+        end,
+      },
+      payload = { platform = platform },
+      deps = opts.workflow_dependencies or ios_workflow_dependencies(),
+    }
+  )
+  if owner_found == true or dispatched ~= nil or dispatch_err ~= nil then
+    return dispatched, dispatch_err
+  end
+
+  local message = ("install workflow owner is unavailable for active target %s")
+    :format(platform ~= "" and tostring(platform) or "<unset>")
+  if type(opts.notify_error) == "function" then
+    opts.notify_error(message)
+  else
+    require("utils.log").notify_error("ue.install", message)
+  end
+  return nil, message
+end
+
+function M._install_active_target_for_test(opts)
+  return install_active_target(opts)
 end
 
 local function prepare()
@@ -8320,7 +8198,7 @@ local function prepare()
       return
     end
     clear_index_dirty(ctx)
-    INDEX_FN.schedule_index_refresh(ctx, { current = true, hot = true, full = true, current_delay_ms = 50 })
+    INDEX_FN.schedule_prepare_delivery(ctx)
     invalidate_status_cache()
     refresh_statusline()
     local summary = prepare_summary(ctx, compile_path, { reused_cache = true })
@@ -8443,7 +8321,8 @@ local function prepare()
   end
 
   clear_index_dirty(ctx)
-  INDEX_FN.schedule_index_refresh(ctx, { current = true, hot = true, full = true, current_delay_ms = 50 })
+  -- Prepare PROMISED a usable index: short, starvation-proof deadlines.
+  INDEX_FN.schedule_prepare_delivery(ctx)
   invalidate_status_cache()
   refresh_statusline()
 
@@ -8497,7 +8376,7 @@ local function prepare()
     else
       vim.notify(
         "UEPrepare: cindex-uefilter not found — grep will use slow rg fallback.\n" ..
-        "  Build it via: cd " .. vim.fn.stdpath("config") .. "/tools/cindex-uefilter && go install ./...",
+        "  Install it via: " .. code_search_p.install_hint(),
         vim.log.levels.WARN, { title = "UE" })
     end
     -- Index rebuilt (sync path): drop ctx cache + re-probe toolchain so the
@@ -8584,6 +8463,51 @@ local function prepare_async(opts)
     CORE_RT.prepare_jobid = nil
   end
 
+  -- Apple-only semantic prelude. The prepare lease begins before IOS setup /
+  -- GenerateClangDatabase and is handed into the ordinary pipeline, so two
+  -- Neovim instances cannot publish the same tuple source concurrently.
+  -- Non-Apple targets skip this entire branch and retain their existing RSP
+  -- path byte-for-byte.
+  if not opts._semantic_ready then
+    local target_ctx = CORE_RT.target_context(ctx)
+    local targets = require("ue.targets")
+    local host_driver = require("utils.platform").driver()
+    if target_ctx and targets.supports(target_ctx.platform, "semantic_cdb", host_driver) then
+      if CORE_RT.prepare_bootstrap_running then
+        vim.notify("UEPrepare Apple semantic setup is already running", vim.log.levels.INFO)
+        return
+      end
+      local bootstrap_lease, bootstrap_lease_err = CORE_RT.file_lock.acquire(
+        join(ctx.paths.runtime_dir, "prepare.lock"))
+      if not bootstrap_lease then
+        vim.notify("UEPrepare is running in another Neovim: " .. tostring(bootstrap_lease_err),
+          vim.log.levels.WARN, { title = "UE" })
+        return
+      end
+      CORE_RT.prepare_bootstrap_running = true
+      CORE_RT.prepare_apple_semantics(ctx, opts, function(ok, semantic_info, already_reported)
+        CORE_RT.prepare_bootstrap_running = false
+        if not ok then
+          CORE_RT.file_lock.release(bootstrap_lease)
+          if not already_reported then
+            require("utils.log").notify_error(
+              "ue.prepare", tostring(semantic_info or "Apple semantic preparation failed"))
+          end
+          return
+        end
+        local next_opts = vim.tbl_extend("force", opts, {
+          _semantic_ready = true,
+          _prepare_lease = bootstrap_lease,
+          force_cdb_restart = type(semantic_info) == "table"
+            and semantic_info.skipped ~= true
+            and semantic_info.no_op ~= true,
+        })
+        prepare_async(next_opts)
+      end)
+      return
+    end
+  end
+
   -- Stash force flags so the cache fast-path csearch staleness check
   -- can honor :UEPrepareReindex (force a csearch rebuild even when the
   -- regular UEPrepare cache is fresh).
@@ -8664,8 +8588,12 @@ local function prepare_async(opts)
   -- Cover the entire fast path, including async CDB generation and the writer
   -- pipeline. Previously only the cold GTAGS phase set this flag, so two quick
   -- :UEPrepare calls could concurrently rewrite compile_commands.json.
-  local prepare_lease, prepare_lease_err = CORE_RT.file_lock.acquire(
-    join(ctx.paths.runtime_dir, "prepare.lock"))
+  local prepare_lease = opts._prepare_lease
+  local prepare_lease_err
+  if not prepare_lease then
+    prepare_lease, prepare_lease_err = CORE_RT.file_lock.acquire(
+      join(ctx.paths.runtime_dir, "prepare.lock"))
+  end
   if not prepare_lease then
     if handle then handle.message = "BUSY"; handle:finish() end
     vim.notify("UEPrepare is running in another Neovim: " .. tostring(prepare_lease_err),
@@ -8723,19 +8651,20 @@ local function prepare_async(opts)
           -- Partition base CDB by (plat, cfg) so clangd's gd on macros like
           -- UE_BUILD_DEVELOPMENT does not jump into stale Dev generated headers
           -- when the current build is Test. See INDEX_FN.partition_base_cdb.
-          local ok_p, msg_p = INDEX_FN.partition_base_cdb(ctx)
+          INDEX_FN.partition_base_cdb_async(ctx, {}, function(ok_p, msg_p)
           if not ok_p then
             vim.notify("UEPrepare: cdb_partition failed -- " .. tostring(msg_p),
               vim.log.levels.WARN, { title = "ue.cdb" })
           end
           clear_index_dirty(ctx)
-          INDEX_FN.schedule_index_refresh(ctx,
-            { current = true, hot = true, full = true, current_delay_ms = 50, hot_delay_ms = 2500 })
+          INDEX_FN.schedule_prepare_delivery(ctx)
           invalidate_status_cache()
           refresh_statusline()
           set_prepare_running(false)
+          CORE_RT.start_deferred_clangd(ctx)
           if handle then handle.message = "done"; handle.percentage = 100; handle:finish() end
           vim.notify(prepare_summary(ctx, compile_path, { reused_cache = true }))
+          end)
         end, { force_restart = ctx._force_cdb_restart })
 
         -- csearch index rebuild (same logic as before, just moved here).
@@ -8901,20 +8830,38 @@ local function prepare_async(opts)
 
     end_phase("lists")
 
-    -- ── Phase 3a: generate compile_commands (parallel with gtags) ────
-    -- compile_commands doesn't depend on gtags, so start it immediately.
-    -- The pipeline (slim → pch → unify) runs in background via jobstart.
+    -- ccjson and GTAGS are independent admitted batches; start both.
     update("generating compile_commands...", 30)
     start_phase()
 
-    local ok_compile, compile_path = CORE_RT.trace_seg("cold.ccjson", function()
-      return generate_compile_commands(ctx)
-    end)
-    if not ok_compile then
-      vim.notify("UEPrepare: compile_commands failed (non-fatal): " .. (compile_path or "unknown"), vim.log.levels.WARN)
+    local cdb_pipeline_done, cdb_pipeline_ok = false, false
+    local cdb_pipeline_err
+    local finalize_waiting = false
+    local finalize_after_csearch
+    local function on_compile_pipeline_done(ok_pipeline, pipeline_err)
+      cdb_pipeline_done = true
+      cdb_pipeline_ok = ok_pipeline == true
+      cdb_pipeline_err = pipeline_err
+      if finalize_waiting and finalize_after_csearch then
+        finalize_after_csearch()
+      end
     end
 
-    end_phase("compile_commands")
+    local ok_compile, compile_path = false, nil
+    local cc_started = vim.uv.hrtime()
+    M.async_generate_compile_commands(ctx, function(_, pct, detail) update(detail, pct) end,
+      function(ok, path)
+        timings.compile_commands = (vim.uv.hrtime() - cc_started) / 1e9
+        ok_compile, compile_path = ok, path
+        if not ok then
+          on_compile_pipeline_done(false, path)
+          vim.notify("UEPrepare: compile_commands failed (non-fatal): " .. (path or "unknown"), vim.log.levels.WARN)
+          return
+        end
+        local targets = compile_commands_targets(ctx)
+        run_compile_commands_pipeline(targets[1], targets, on_compile_pipeline_done,
+          { force_restart = ctx._force_cdb_restart == true })
+      end)
 
     -- ── Phase 3b: build GTAGS (async, slow) ───────────────────────────
     update(("indexing %d files with gtags..."):format(#workspace_code), 35)
@@ -8928,7 +8875,8 @@ local function prepare_async(opts)
 
     local db_dir = ctx.paths.workspace_db
     local filelist = ctx.paths.workspace_list
-    clean_db_dir(db_dir)
+    local function start_gtags_phase()
+      clean_db_dir(db_dir)
 
     local gtags_cmd = { gtags, "-f", filelist, "--skip-unreadable", "--skip-symlink", db_dir }
     local gtags_output = {}
@@ -9006,7 +8954,12 @@ local function prepare_async(opts)
           update("building csearch index...", 85)
 
           local code_search = require("utils.code_search")
-          local function finalize_after_csearch()
+          finalize_after_csearch = function()
+            if not cdb_pipeline_done then
+              finalize_waiting = true
+              update("finishing compile_commands pipeline...", 95)
+              return
+            end
             end_phase("csearch")
 
             -- ── Finalize ───────────────────────────────────────────
@@ -9014,6 +8967,16 @@ local function prepare_async(opts)
             invalidate_status_cache()
             refresh_statusline()
             set_prepare_running(false)
+            if cdb_pipeline_ok then
+              CORE_RT.start_deferred_clangd(ctx)
+            else
+              vim.notify(
+                "UEPrepare finished non-clangd indexes, but the CDB pipeline failed; "
+                  .. "clangd remains deferred: " .. tostring(cdb_pipeline_err or "unknown error"),
+                vim.log.levels.WARN,
+                { title = "UE" }
+              )
+            end
 
             -- Index just rebuilt: drop the resolve_context cache so the next
             -- grep re-reads is_indexed() fresh, and re-probe the csearch
@@ -9076,7 +9039,7 @@ local function prepare_async(opts)
           if not code_search.cindex_uefilter_exe() then
             vim.notify(
               "UEPrepare: cindex-uefilter not found — grep will use slow rg fallback.\n" ..
-              "  Build it via: cd " .. vim.fn.stdpath("config") .. "/tools/cindex-uefilter && go install ./...",
+              "  Install it via: " .. code_search.install_hint(),
               vim.log.levels.WARN, { title = "UE" })
             finalize_after_csearch()
             return
@@ -9161,6 +9124,18 @@ local function prepare_async(opts)
         })
       end)
     end
+    return CORE_RT.prepare_jobid
+    end
+
+    local admission = require("utils.host_admission")
+    admission.run_when_allowed({
+      name = "UEPrepare GTAGS",
+      start = start_gtags_phase,
+      on_defer = function() update("waiting for host CPU headroom before GTAGS...", 35) end,
+      on_error = function(err)
+        fail("GTAGS admission failed: " .. tostring(err))
+      end,
+    })
   end
 
   -- ── Phase 1: scan files (async) ──────────────────────────────────────
@@ -9432,6 +9407,8 @@ M.dap_diagnose = dap_mod.dap_diagnose
 M.stop_android_debugger = dap_mod.stop_android_debugger
 M.android_dap_reattach  = dap_mod.android_dap_reattach
 M.android_dap_status    = dap_mod.android_dap_status
+M.dap_stop_session      = dap_mod.dap_stop_session
+M.dap_status_session    = dap_mod.dap_status_session
 M.setup_dap = dap_mod.setup_dap
 
 -- ==========================================================================
@@ -9444,7 +9421,7 @@ function M._android_install_argv_for_test(adb, serial, apk)
     apk = apk,
     cwd = vim.fn.getcwd(),
     device_id = serial,
-  }, require("utils.platform.windows"))
+  }, _uplat._driver_for_test("windows"))
   return require("ue.target_tasks").command(plan)
 end
 
@@ -9458,7 +9435,7 @@ end
 
 function M._android_so_deploy_command_for_test(ctx, serial, package_name)
   return android_so_deploy_command(
-    ctx, serial, package_name, require("utils.platform.windows")
+    ctx, serial, package_name, _uplat._driver_for_test("windows")
   )
 end
 
@@ -9643,7 +9620,7 @@ function M.setup()
     build_target({ operation = "so_build" })
   end, {})
   vim.api.nvim_create_user_command("UECompileForNvim", CORE_RT.compile_for_nvim, {
-    desc = "Compile the active target, then prepare its RSP-backed clangd database",
+    desc = "Compatibility entry: build the active target, then run the normal UEPrepare path",
   })
   vim.api.nvim_create_user_command("UEPackageIOS", function()
     CORE_RT.package_target("IOS")
@@ -9651,6 +9628,18 @@ function M.setup()
   vim.api.nvim_create_user_command("UEIOSSymbols", function()
     CORE_RT.generate_target_symbols("IOS")
   end, { desc = "Generate and UUID-verify the current IOS binary's dSYM on demand" })
+  vim.api.nvim_create_user_command("UEIOSSetup", function()
+    CORE_RT.setup_ios()
+  end, {
+    desc = "One-time IOS setup from PrepareIOSQADebug signing evidence and the connected device",
+  })
+  vim.api.nvim_create_user_command("UESetIOSSigningCertificate", function(cmd)
+    CORE_RT.select_ios_signing_certificate(cmd.args, cmd.bang)
+  end, {
+    bang = true,
+    nargs = "*",
+    desc = "Select the current project's IOS code-sign identity; bang clears it",
+  })
   vim.api.nvim_create_user_command("UESetIOSDevice", function()
     CORE_RT.select_target_device("IOS")
   end, { desc = "Select an available physical IOS device through its target driver" })
@@ -9667,11 +9656,14 @@ function M.setup()
   vim.api.nvim_create_user_command("UEDebugLogToggle", function()
     M.toggle_debug_log()
   end, {})
+  vim.api.nvim_create_user_command("UEInstall", install_active_target, {
+    desc = "Install for the active Android or IOS target without launching",
+  })
   vim.api.nvim_create_user_command("UEInstallAndroid", install_android, {})
   vim.api.nvim_create_user_command("UEPrepare", function(cmd)
     local bang = cmd.bang and true or false
     require("utils.async_launcher").launch({
-      name  = bang and "UE: Prepare (FORCE full rebuild)" or "UE: Prepare (rsp + ccjson + index)",
+      name  = bang and "UE: Prepare (FORCE full rebuild)" or "UE: Prepare (semantic + ccjson + index)",
       group = "ue",
       cancel = function()
         -- <C-c> on the launcher float cancels the prepare jobs registered in
@@ -9743,7 +9735,8 @@ function M.setup()
     end
     local code_search = require("utils.code_search")
     if not code_search.cindex_uefilter_exe() then
-      vim.notify("cindex-uefilter not found — build it first", vim.log.levels.WARN, { title = "UE" })
+      vim.notify("cindex-uefilter not found — install it via: " .. code_search.install_hint(),
+        vim.log.levels.WARN, { title = "UE" })
       return
     end
     if not CORE_RT.csearch_build_begin("UEPrepareIncremental", ctx.paths.csearch_idx) then
@@ -9811,10 +9804,10 @@ function M.setup()
     local opts = {}
     local arg = (cmd.args or ""):gsub("^%s+", ""):gsub("%s+$", "")
     if arg ~= "" then opts.active = arg end
-    local ok, msg = INDEX_FN.partition_base_cdb(ctx, opts)
-    local lvl = ok and vim.log.levels.INFO or vim.log.levels.WARN
-    vim.notify("UECDBPartition: " .. (msg or (ok and "ok" or "failed")),
-      lvl, { title = "ue.cdb" })
+    INDEX_FN.partition_base_cdb_async(ctx, opts, function(ok, msg)
+      vim.notify("UECDBPartition: " .. (msg or (ok and "ok" or "failed")),
+        ok and vim.log.levels.INFO or vim.log.levels.WARN, { title = "ue.cdb" })
+    end)
   end, { nargs = "?", desc = "Partition base CDB by (plat,cfg); optional Platform/Config arg" })
   vim.api.nvim_create_user_command("UECDBSwitch", function(cmd)
     -- Switch active (plat, cfg) group. Usage:
@@ -9830,14 +9823,13 @@ function M.setup()
         vim.log.levels.WARN, { title = "ue.cdb" }); return
     end
     local spec = args[1] .. "/" .. args[2]
-    local ok, msg = INDEX_FN.partition_base_cdb(ctx, { active = spec })
-    if not ok then
-      vim.notify("UECDBSwitch failed: " .. tostring(msg), vim.log.levels.WARN, { title = "ue.cdb" }); return
-    end
-    -- After switching active, the base CDB content changed -- re-kick clangd
-    -- so it re-reads. We piggy-back on the index refresh's existing restart.
-    INDEX_FN.maybe_restart_clangd_for_index()
-    vim.notify("UECDBSwitch: active=" .. spec, vim.log.levels.INFO, { title = "ue.cdb" })
+    INDEX_FN.partition_base_cdb_async(ctx, { active = spec }, function(ok, msg)
+      if not ok then
+        vim.notify("UECDBSwitch failed: " .. tostring(msg), vim.log.levels.WARN, { title = "ue.cdb" }); return
+      end
+      INDEX_FN.maybe_restart_clangd_for_index()
+      vim.notify("UECDBSwitch: active=" .. spec, vim.log.levels.INFO, { title = "ue.cdb" })
+    end)
   end, { nargs = "*", desc = "Switch CDB active (plat, cfg) group" })
   vim.api.nvim_create_user_command("UECDBStatus", function()
     local ctx = require_ctx_or_nil()
@@ -9886,7 +9878,7 @@ function M.setup()
   end, { desc = "Bypass debounce; immediately apply pending watcher events" })
   vim.api.nvim_create_user_command("UEDirtyStatus", function()
     -- Show the cumulative-since-last-:UEPrepare dirty set (rg-on-dirty
-    -- overlay's source of truth for the cindex modify-no-op workaround).
+    -- overlay's source of truth until the next csearch publish).
     local ok, watch = pcall(require, "utils.ue_watch")
     if not ok then vim.notify("ue_watch module missing", vim.log.levels.WARN); return end
     local st = (watch.persistent_dirty_status and watch.persistent_dirty_status()) or { count = 0 }
@@ -9916,6 +9908,10 @@ function M.setup()
     watch.clear_persistent_dirty("manual")
     vim.notify("UEDirty cleared")
   end, { desc = "Manually clear the cumulative dirty set (use after manual reindex)" })
+  vim.api.nvim_create_user_command("UEReloadScanPaths", function()
+    vim.notify(("Scan roots invalidated (%d project(s)); next query re-derives")
+      :format(CORE_RT.invalidate_scan_root_caches()))
+  end, { desc = "Invalidate cached scan roots (.ueprepare-scan-paths / new module dirs)" })
   vim.api.nvim_create_user_command("UECachePaths", function()
     -- Dump the v2 cache layout that ue.lua's cache_paths() resolved for
     -- the current ctx. Useful to verify migration / debug missing-path
@@ -10035,7 +10031,8 @@ function M.setup()
       return
     end
     vim.notify("UE: rebuilding PCH (background) — " .. bat, vim.log.levels.INFO)
-    vim.fn.jobstart(command, {
+    local pch_token = require("utils.host_admission").foreground_begin("UEBuildPCH")
+    local pch_jobid = vim.fn.jobstart(command, {
       cwd = plan.cwd,
       detach = false,
       on_stdout = function(_, data)
@@ -10050,6 +10047,7 @@ function M.setup()
       end,
       on_exit = function(_, code)
         vim.schedule(function()
+          require("utils.host_admission").foreground_done(pch_token)
           if code == 0 then
             vim.notify("UE: PCH rebuild OK — restart clangd with :LspRestart", vim.log.levels.INFO)
           else
@@ -10058,6 +10056,7 @@ function M.setup()
         end)
       end,
     })
+    if pch_jobid <= 0 then require("utils.host_admission").foreground_done(pch_token) end
   end, { desc = "Rebuild clangd PCH cache (after LLVM/clangd version bump)" })
   vim.api.nvim_create_user_command("UEClearCache", function(cmd_opts)
     clear_cache({ bang = cmd_opts.bang })
@@ -10070,11 +10069,7 @@ function M.setup()
     M.dap_reset_layout()
   end, {})
 
-  -- ─ Phase F.1+F.2+H: platform-neutral UEDAP* aliases via dispatch table ─
-  -- F.1 introduced the UEDAP* command names with hard-coded android branch.
-  -- F.2 moved the per-platform handler decision into ue.dap.platforms.
-  -- Registration is filtered by the host-target compatibility matrix;
-  -- importable foreign modules do not become executable capabilities.
+  -- Platform-neutral UEDAP aliases; registry filters host-target compatibility.
   local dap_platforms = require("ue.dap.platforms")
   dap_platforms.register_supported(require("utils.platform").driver(), M)
 
@@ -10099,7 +10094,16 @@ function M.setup()
       and dap_platforms.attach_handler(platform)
       or  dap_platforms.launch_handler(platform)
     if handler then
-      handler()
+      local started, start_err = dap_platforms.begin(kind, platform)
+      if not started then
+        vim.notify(
+          ("UEDAP%s: %s"):format(
+            kind == "attach" and "Attach" or "Launch",
+            tostring(start_err and start_err.reason or "dispatch failed")
+          ),
+          vim.log.levels.WARN
+        )
+      end
       return
     end
     local known = dap_platforms.known_platforms()
@@ -10165,24 +10169,32 @@ function M.setup()
     { desc = "DAP: previous right-bottom tab" })
   vim.api.nvim_create_user_command("UEDAPToggleUI",        function() M.dap_toggle_ui()        end, { desc = "DAP: Toggle UI" })
   vim.api.nvim_create_user_command("UEDAPREPL",            function() M.dap_toggle_repl()      end, { desc = "DAP: Toggle REPL" })
+  local function dap_lifecycle_dispatch(kind)
+    local ok_dap, dap = pcall(require, "dap")
+    local session = ok_dap and dap.session and dap.session() or nil
+    local handled, lifecycle_err = dap_platforms.dispatch_lifecycle(kind, { session = session })
+    if not handled then
+      vim.notify(
+        ("UEDAP%s unavailable: %s"):format(
+          kind:sub(1, 1):upper() .. kind:sub(2),
+          tostring(lifecycle_err and lifecycle_err.reason or "session owner is unavailable")
+        ),
+        vim.log.levels.WARN
+      )
+    end
+    return handled
+  end
   vim.api.nvim_create_user_command("UEDAPStop", function()
-    M.stop_android_debugger({ kill_orphans = true })
-    vim.notify("[ue.dap] session stopped", vim.log.levels.INFO)
-  end, { desc = "DAP: Stop / detach (Android: keeps app running)" })
+    if dap_lifecycle_dispatch("stop") then
+      vim.notify("[ue.dap] session stopped", vim.log.levels.INFO)
+    end
+  end, { desc = "DAP: Stop through the frozen session owner" })
   vim.api.nvim_create_user_command("UEDAPReattach", function()
-    if type(M.android_dap_reattach) == "function" then
-      M.android_dap_reattach()
-    else
-      vim.notify("UEDAPReattach unavailable", vim.log.levels.WARN)
-    end
-  end, { desc = "DAP: Reattach Android using last pkg/serial/symbol_lib" })
+    dap_lifecycle_dispatch("reattach")
+  end, { desc = "DAP: Reattach through the frozen session owner" })
   vim.api.nvim_create_user_command("UEDAPStatus", function()
-    if type(M.android_dap_status) == "function" then
-      M.android_dap_status()
-    else
-      vim.notify("UEDAPStatus unavailable", vim.log.levels.WARN)
-    end
-  end, { desc = "DAP: One-line status of the current Android session" })
+    dap_lifecycle_dispatch("status")
+  end, { desc = "DAP: Status of the frozen session owner" })
 
   -- ── Generic background-task management (:Tasks / :TaskStop / :TaskStopAll) ─
   -- Generic, non-UE feature: list and cancel any registered background job
@@ -10418,9 +10430,29 @@ end
 --   on_progress  — function(stage, pct, detail) called per PROGRESS line
 --   on_done      — function(ok, msg) called once when the subprocess exits
 -- Returns the vim.system handle so caller can keep a reference if needed.
-function M.async_generate_compile_commands(ctx, on_progress, on_done)
+function M.async_generate_compile_commands(ctx, on_progress, on_done, opts)
   on_progress = on_progress or function() end
   on_done = on_done or function() end
+  opts = opts or {}
+
+  -- Admission happens before temp-file materialization and process creation.
+  -- Recursive re-entry is tagged so every public caller shares this one seam.
+  if opts._host_admitted ~= true then
+    local admission = require("utils.host_admission")
+    local started, child, start_err, control = admission.run_when_allowed({
+      name = "compile_commands generation",
+      start = function()
+        return M.async_generate_compile_commands(ctx, on_progress, on_done,
+          vim.tbl_extend("force", opts, { _host_admitted = true }))
+      end,
+      on_defer = function() on_progress("admission", 25, "waiting for host CPU headroom...") end,
+      on_error = function(err)
+        on_done(false, "ccjson admission failed: " .. tostring(err))
+      end,
+    })
+    if started then return child, start_err end
+    return control
+  end
 
   -- 1. Dump ctx to a temp JSON file (argv has size limits on Windows).
   local tmp = vim.fn.tempname() .. ".ccjson-ctx.json"

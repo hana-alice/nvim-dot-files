@@ -9,13 +9,22 @@ cause 的分层定位、判定标准，以及区分"语义正解"与"workaround"
 
 ### Requirement: 诊断报告与可复现 probe
 
-仓库 SHALL 产出 `docs/plans/2026-06-03-android-dap-handshake-rootcause.md` 与一个可重复
-运行的诊断脚本，把 gdb 握手零响应与 source-file 断点 `3221226505` 两个 root cause 查实。
+诊断结论 SHALL 以可发现的形式存在于仓库，把 gdb 握手零响应与 source-file 断点
+`3221226505` 两个 root cause 查实。原始诊断报告已随公开镜像的历史脱敏被移除，因此本
+capability 的产出物要求 SHALL 表述为：诊断结论与判据必须在 `docs/CONSTRAINTS.md` 的
+踩坑条目与本 spec 中保留，而 MUST NOT 继续要求一个已不存在于工作树的报告文件。任何
+声称已产出的诊断文件 MUST 真实存在于仓库，否则该引用 MUST 被移除或改指现存出处。
+
+#### Scenario: 结论出处真实存在
+
+- **WHEN** AI agent 或贡献者查阅 Android DAP 握手 root cause 结论
+- **THEN** 结论可从本 spec 的 requirement 与 `docs/CONSTRAINTS.md` 的踩坑条目读到
+- **AND** 本 spec 不引用任何已从工作树移除的报告文件路径
 
 #### Scenario: 纯诊断、不改运行时
 
-- **WHEN** 本 change 被应用
-- **THEN** 仅新增 `docs/plans/...` 与 `tools/` 下的 probe 脚本
+- **WHEN** 一次新的握手层诊断被执行
+- **THEN** 它仅新增诊断记录与 `tools/` 下的 probe 脚本
 - **AND** 不修改任何 `lua/ue/dap/*.lua` 运行时文件
 
 ### Requirement: 定位 gdb 握手零响应 root cause
@@ -59,10 +68,11 @@ cause 的分层定位、判定标准，以及区分"语义正解"与"workaround"
 
 ### Requirement: 设备验证范围限定
 
-诊断 SHALL 仅在 adb serial `ANDROID-SERIAL-A` 上验证，并在报告中标注其它设备需各自取证。
+每次诊断 SHALL 显式接收并捕获一个 probe serial，并在报告中记录该 serial 的取证范围；所有设备命令、forward 与收尾清理 MUST 使用同一个捕获值。规范与脚本 MUST NOT 固定某台历史设备，也不得在 probe 运行中重读 live selection 后改投其他设备。
 
 #### Scenario: 单机取证
 
-- **WHEN** 执行任何设备侧 probe
-- **THEN** 命令均指定 `-s ANDROID-SERIAL-A`
-- **AND** 收尾清理：`killall lldb-server`、移除 adb forward、目标 `TracerPid=0`
+- **WHEN** 以 `SERIAL-PROBE` 执行任何设备侧 probe
+- **THEN** 所有设备命令 SHALL 指定 `-s SERIAL-PROBE`
+- **AND** 报告 SHALL 标明结论仅覆盖 `SERIAL-PROBE`，其他设备需各自取证
+- **AND** 收尾清理 SHALL 对同一 `SERIAL-PROBE` 执行 lldb-server 清理、移除本次 adb forward，并确认目标 `TracerPid=0`

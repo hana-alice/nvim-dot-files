@@ -9,9 +9,25 @@
 -- WHAT IT RECORDS per stall (ring buffer + utils.log scope "stall", WARN):
 --   * stall duration (ms over the expected tick)
 --   * wall-clock timestamp
+--   * CPU time this process burned DURING the gap, plus the resulting verdict
+--     (see ATTRIBUTION below) — this is what turns "something blocked" into
+--     "who blocked"
 --   * mode / buffer name / filetype at the moment the loop unblocked
 --   * the last few keys pressed with their age relative to the stall end
 --     (via vim.on_key) — this is what ties a stall to `y`/`p`/`gd`/etc.
+--
+-- ATTRIBUTION (added 2026-08-25, after its absence cost a full investigation):
+--   Duration alone cannot say WHO held the loop. The discriminator is how much
+--   CPU *this process* consumed during the gap:
+--     cpu/gap ≈ 1  → IN-PROCESS block: synchronous Lua/C, GC, blocking spawn, a
+--                    `:wait()` or `request_sync` on an interactive path.
+--                    Fixable inside this repository.
+--     cpu/gap ≈ 0  → DESCHEDULED: the process was runnable but not running, so
+--                    the host was oversubscribed (clangd -j too high, a UBT
+--                    build, another Neovim). No Lua callback is at fault; the
+--                    fix is resource budgeting.
+--   Without this ratio "who stalled us" is guesswork: K52 records how six
+--   separate experiments chased the wrong candidate for lack of it.
 --
 -- WHAT IT CANNOT SEE: client-side (Neovide) render lag. If the UI stutters
 -- but :StallReport shows nothing at that time, the block is in the GUI
@@ -30,6 +46,7 @@
 --   M.stop()         -- stop timer, remove on_key hook (records retained)
 --   M.status()       -- { enabled, interval_ms, threshold_ms, count }
 --   M.get_stalls()   -- copy of the ring buffer (oldest -> newest)
+--   M.summary()      -- aggregate: counts by attribution verdict / ft, worst, etc.
 --   M.clear()        -- drop recorded stalls
 
 local uv = vim.uv or vim.loop
@@ -48,6 +65,7 @@ local state = {
   opts = vim.deepcopy(DEFAULTS),
   timer = nil,
   last_tick = nil, -- uv.hrtime() of previous tick
+  last_cpu = nil, -- process CPU ms at previous tick (for attribution)
   stalls = {}, -- ring buffer of records (oldest first)
   keys = {}, -- ring of { key = "<translated>", t = hrtime }
   on_key_ns = nil,
@@ -69,6 +87,52 @@ function M._over_threshold(gap_ms, interval_ms, threshold_ms)
   end
   return nil
 end
+
+-- Verdict bands for the cpu/gap ratio. A MIXED band is kept deliberately rather
+-- than forcing a binary call: a gap can genuinely be part block, part
+-- descheduling, and pretending otherwise invites exactly the false confidence
+-- that made K52 expensive.
+local IN_PROCESS_MIN_SHARE = 0.6
+local DESCHEDULED_MAX_SHARE = 0.2
+
+--- Classify a stall by how much CPU this process burned during the gap.
+--- Pure, so the attribution rule itself is headless-testable.
+--- @param cpu_ms number|nil CPU (user+sys) consumed during the gap
+--- @param gap_ms number wall-clock length of the gap
+--- @return string verdict "in-process" | "descheduled" | "mixed" | "unknown"
+--- @return number|nil share cpu/gap ratio, nil when cpu data is unavailable
+function M._verdict(cpu_ms, gap_ms)
+  if type(cpu_ms) ~= "number" or type(gap_ms) ~= "number" or gap_ms <= 0 then
+    return "unknown", nil
+  end
+  -- Clamp: rusage granularity can round a fully-busy gap slightly above 1.0.
+  local share = math.min(cpu_ms / gap_ms, 1.0)
+  if share >= IN_PROCESS_MIN_SHARE then
+    return "in-process", share
+  end
+  if share <= DESCHEDULED_MAX_SHARE then
+    return "descheduled", share
+  end
+  return "mixed", share
+end
+
+--- Total CPU (user+sys) this process has consumed, in ms.
+--- Fast-event safe: pure libuv, touches no vim state.
+local function cpu_ms_now()
+  local ok, ru = pcall(uv.getrusage)
+  if not ok or type(ru) ~= "table" then
+    return nil
+  end
+  local function to_ms(t)
+    if type(t) ~= "table" then
+      return 0
+    end
+    return (t.sec or 0) * 1000 + (t.usec or 0) / 1000
+  end
+  return to_ms(ru.utime) + to_ms(ru.stime)
+end
+
+M._cpu_ms_now = cpu_ms_now
 
 --- Append a record to a ring buffer, dropping the oldest past `cap`.
 --- Returns the same table for convenience (mutates in place by design:
@@ -115,13 +179,18 @@ end
 
 --- Build + store a stall record. Runs on the main loop (scheduled).
 --- Exposed for specs (which call it directly without a timer).
-function M._capture_stall(over_ms)
+--- @param over_ms number lateness beyond the expected interval
+--- @param attr table|nil { cpu_ms, gap_ms } captured in the fast event, before
+---   scheduling: the CPU delta must cover the GAP itself, not the gap plus
+---   however long this callback waited to be scheduled.
+function M._capture_stall(over_ms, attr)
   local now = uv.hrtime()
   local bufnr = vim.api.nvim_get_current_buf()
   local name = vim.api.nvim_buf_get_name(bufnr)
   if name ~= "" then
     name = vim.fn.fnamemodify(name, ":t")
   end
+  local verdict, share = M._verdict(attr and attr.cpu_ms, attr and attr.gap_ms)
   local record = {
     time = os.date("%Y-%m-%d %H:%M:%S"),
     over_ms = math.floor(over_ms + 0.5),
@@ -129,6 +198,9 @@ function M._capture_stall(over_ms)
     buf = name ~= "" and name or ("[" .. (vim.bo[bufnr].buftype ~= "" and vim.bo[bufnr].buftype or "noname") .. "]"),
     ft = vim.bo[bufnr].filetype,
     keys = keys_snapshot(now),
+    verdict = verdict,
+    cpu_share = share,
+    cpu_ms = attr and attr.cpu_ms and math.floor(attr.cpu_ms + 0.5) or nil,
   }
   ring_push(state.stalls, record, state.opts.max_records)
   require("utils.log").warn_ctx("stall", "main-loop stall", {
@@ -137,25 +209,37 @@ function M._capture_stall(over_ms)
     buf = record.buf,
     ft = record.ft,
     keys = record.keys,
+    -- Attribution goes into the LOG too, not just the in-memory ring: the ring
+    -- dies with the session, and cross-session log analysis is how the 2s
+    -- cadence and the two-PID correlation were found in the first place.
+    verdict = record.verdict,
+    cpu_share = share and string.format("%.2f", share) or nil,
   })
   return record
 end
 
 local function on_tick()
-  -- FAST EVENT CONTEXT: uv.hrtime + arithmetic + vim.schedule only.
+  -- FAST EVENT CONTEXT: uv.hrtime + uv.getrusage + arithmetic + vim.schedule.
   local now = uv.hrtime()
-  local prev = state.last_tick
-  state.last_tick = now
+  local now_cpu = cpu_ms_now()
+  local prev, prev_cpu = state.last_tick, state.last_cpu
+  state.last_tick, state.last_cpu = now, now_cpu
   if not prev then
     return
   end
   local gap_ms = (now - prev) / 1e6
   local over = M._over_threshold(gap_ms, state.opts.interval_ms, state.opts.threshold_ms)
   if over then
+    -- Snapshot attribution NOW: by the time the scheduled callback runs, the
+    -- process has burned additional CPU that has nothing to do with this gap.
+    local attr = {
+      gap_ms = gap_ms,
+      cpu_ms = (now_cpu and prev_cpu) and (now_cpu - prev_cpu) or nil,
+    }
     vim.schedule(function()
       -- Probe may have been stopped between detection and capture.
       if state.enabled then
-        M._capture_stall(over)
+        M._capture_stall(over, attr)
       end
     end)
   end
@@ -164,6 +248,41 @@ end
 -- ---------------------------------------------------------------------------
 -- Report rendering
 -- ---------------------------------------------------------------------------
+
+-- Aggregate the ring into the shape a human actually needs first: how many
+-- stalls, how they attribute, and whether they correlate with keystrokes.
+-- Reading 200 individual rows to notice "these are all 2s apart and none has a
+-- key" is exactly the manual work that made K52 slow to find.
+--- @return table summary
+function M.summary()
+  local out = {
+    count = #state.stalls,
+    by_verdict = { ["in-process"] = 0, descheduled = 0, mixed = 0, unknown = 0 },
+    with_recent_key = 0,
+    no_recent_key = 0,
+    worst_ms = 0,
+    total_blocked_ms = 0,
+    by_ft = {},
+  }
+  for _, r in ipairs(state.stalls) do
+    local v = r.verdict or "unknown"
+    out.by_verdict[v] = (out.by_verdict[v] or 0) + 1
+    out.total_blocked_ms = out.total_blocked_ms + (r.over_ms or 0)
+    if (r.over_ms or 0) > out.worst_ms then
+      out.worst_ms = r.over_ms
+    end
+    -- "Fresh key" = a key within 0.3s of the stall ending. Its ABSENCE is the
+    -- signal that a stall is background-driven rather than action-driven.
+    if r.keys and r.keys:find("%(0%.[012]s%)") then
+      out.with_recent_key = out.with_recent_key + 1
+    else
+      out.no_recent_key = out.no_recent_key + 1
+    end
+    local ft = (r.ft ~= nil and r.ft ~= "") and r.ft or "(none)"
+    out.by_ft[ft] = (out.by_ft[ft] or 0) + 1
+  end
+  return out
+end
 
 local function report_lines()
   local lines = {
@@ -180,16 +299,39 @@ local function report_lines()
     lines[#lines + 1] = "(no stalls recorded this session)"
     return lines
   end
-  lines[#lines + 1] = string.format("%-19s  %8s  %-4s  %-28s  %-10s  recent keys(age at stall end)", "when", "blocked", "mode", "buffer", "filetype")
+
+  -- Summary FIRST: verdict distribution is the routing decision.
+  local s = M.summary()
+  lines[#lines + 1] = string.format(
+    "SUMMARY  %d stall(s), %.1fs blocked total, worst %dms",
+    s.count, s.total_blocked_ms / 1000, s.worst_ms)
+  lines[#lines + 1] = string.format(
+    "  attribution: in-process=%d  descheduled=%d  mixed=%d  unknown=%d",
+    s.by_verdict["in-process"], s.by_verdict.descheduled,
+    s.by_verdict.mixed, s.by_verdict.unknown)
+  lines[#lines + 1] = string.format(
+    "  keypress within 0.3s: yes=%d  no=%d%s",
+    s.with_recent_key, s.no_recent_key,
+    s.no_recent_key > s.with_recent_key and "   <- mostly BACKGROUND, not your keys" or "")
+  lines[#lines + 1] = "  in-process -> our Lua/C blocked (sync spawn, :wait, GC)."
+  lines[#lines + 1] = "  descheduled -> host oversubscribed (clangd -j, build); budget resources."
+  lines[#lines + 1] = ""
+
+  lines[#lines + 1] = string.format("%-19s  %8s  %-13s  %-4s  %-24s  %-9s  recent keys(age at stall end)",
+    "when", "blocked", "attribution", "mode", "buffer", "filetype")
   for i = #state.stalls, 1, -1 do
     local r = state.stalls[i]
+    local attribution = r.cpu_share
+      and string.format("%s %.0f%%", (r.verdict or "?"):sub(1, 7), r.cpu_share * 100)
+      or (r.verdict or "unknown")
     lines[#lines + 1] = string.format(
-      "%-19s  %6dms  %-4s  %-28s  %-10s  %s",
+      "%-19s  %6dms  %-13s  %-4s  %-24s  %-9s  %s",
       r.time,
       r.over_ms,
+      attribution,
       r.mode,
-      r.buf:sub(1, 28),
-      (r.ft or ""):sub(1, 10),
+      r.buf:sub(1, 24),
+      (r.ft or ""):sub(1, 9),
       r.keys
     )
   end
@@ -231,6 +373,7 @@ function M.stop()
   end
   state.enabled = false
   state.last_tick = nil
+  state.last_cpu = nil
 end
 
 local function start()
@@ -239,6 +382,7 @@ local function start()
   end
   state.timer = uv.new_timer()
   state.last_tick = nil
+  state.last_cpu = nil
   state.timer:start(state.opts.interval_ms, state.opts.interval_ms, on_tick)
   state.on_key_ns = state.on_key_ns or vim.api.nvim_create_namespace("ue_stall_probe")
   vim.on_key(record_key, state.on_key_ns)

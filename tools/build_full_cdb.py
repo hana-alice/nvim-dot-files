@@ -65,6 +65,13 @@ import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
+
+TOOLS_DIR = str(Path(__file__).resolve().parent)
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+
+from cdb_argv import normalize_cdb
 
 
 def run(cmd, **kw):
@@ -204,7 +211,16 @@ def main():
     print(f'[stage] {stage}', flush=True)
     work = os.path.join(stage, 'compile_commands.json')
     shutil.copyfile(src, work)
-    print(f'[input] {len(load_cdb(work))} per-file entries', flush=True)
+    raw = load_cdb(work)
+    print(f'[input] {len(raw)} per-file entries', flush=True)
+    try:
+        structured, converted = normalize_cdb(raw)
+    except (OSError, ValueError) as error:
+        print(f'ERROR: cannot normalize input CDB: {error}', file=sys.stderr)
+        return 1
+    write_cdb(work, structured)
+    print(f'[normalize] structured entries: {len(structured)}; command converted: {converted}',
+          flush=True)
 
     # ---- Step 1: replace -I with rsp truth (per-file CDB; in-place)
     if not args.no_rsp:

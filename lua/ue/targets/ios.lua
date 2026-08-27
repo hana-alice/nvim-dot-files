@@ -1,16 +1,23 @@
 local C = require("ue.targets._common")
-
+local Device = require("ue.targets.ios_device")
+local Install = require("ue.targets.ios_install")
+local Launch = require("ue.targets.ios_launch")
+local Signing = require("ue.targets.ios_signing")
+local BuildEvidence = require("ue.targets.ios_build_evidence")
 local M = {
   id = "IOS",
   host_operations = {
     macos = {
       build = true,
       semantic_cdb = true,
+      signing = true,
+      setup = true,
       package = true,
       symbols = true,
       device = true,
       install = true,
       launch = true,
+      dap_attach = true, dap_launch = true,
     },
   },
   runtime = {
@@ -19,7 +26,6 @@ local M = {
     debug_log = { strategy = "unavailable" },
   },
 }
-
 local DAILY_SYMBOL_OVERRIDE =
   "-ini:Engine:[/Script/IOSRuntimeSettings.IOSRuntimeSettings]:bGeneratedSYMFile=False,[/Script/IOSRuntimeSettings.IOSRuntimeSettings]:bGeneratedSYMBundle=False"
 
@@ -145,16 +151,24 @@ function M.build_plan(context, host_driver)
 
   local target_name = C.context_target(context)
   local configuration = C.context_configuration(context)
-  local native_plan = C.with_appended_args(entry, {
+  local signing_arg, signing_unavailable, signing_identity = Signing.override(context, false)
+  if signing_unavailable then return signing_unavailable end
+  local native_args = {
     target_name,
     M.id,
     configuration,
     "-Project=" .. C.trim(context.uproject),
+    "-WaitMutex",
+    "-FromMsBuild",
+    "-disablev8pointercompression",
     DAILY_SYMBOL_OVERRIDE,
-  }, {
+  }
+  if signing_arg then native_args[#native_args + 1] = signing_arg end
+  local native_plan = C.with_appended_args(entry, native_args, {
     target = target_name,
     platform = M.id,
     configuration = configuration,
+    signing_identity_configured = signing_identity ~= nil,
   })
 
   local script = iteration_script(context)
@@ -194,6 +208,7 @@ function M.build_plan(context, host_driver)
   })
 end
 
+M.build_receipt_evidence = BuildEvidence.from_receipt
 function M.semantic_cdb_plan(context, host_driver)
   local entry, unavailable = C.resolve_host_entry(
     host_driver, "ue_build_entry", context, M.id, "semantic_cdb"
@@ -210,7 +225,7 @@ function M.semantic_cdb_plan(context, host_driver)
 
   local target_name = C.context_target(context)
   local configuration = C.context_configuration(context)
-  return C.with_appended_args(entry, {
+  local plan = C.with_appended_args(entry, {
     target_name,
     M.id,
     configuration,
@@ -230,6 +245,11 @@ function M.semantic_cdb_plan(context, host_driver)
     cooks = false,
     packages = false,
   })
+  -- Sharphereal.build.cs performs AOT directly while UBT constructs its
+  -- action graph. GenerateClangDatabase needs the module graph, never the AOT
+  -- outputs, so suppress that project hook only for this semantic subprocess.
+  plan.env = { bSkipAOTProcess = "true" }
+  return plan
 end
 
 function M.validate_semantic_cdb(entries, context)
@@ -287,6 +307,8 @@ function M.package_plan(context, host_driver)
 
   local target_name = C.context_target(context)
   local configuration = C.context_configuration(context)
+  local signing_arg, signing_unavailable = Signing.override(context, true)
+  if not signing_arg then return signing_unavailable end
   return C.with_appended_args(entry, {
     "-ScriptsForProject=" .. C.trim(context.uproject),
     "BuildCookRun",
@@ -301,6 +323,7 @@ function M.package_plan(context, host_driver)
     "-nocleanstage",
     "-package",
     "-nodebuginfo",
+    signing_arg,
     "-utf8output",
   }, {
     target = target_name,
@@ -309,6 +332,28 @@ function M.package_plan(context, host_driver)
     stages = { "stage", "package" },
     reuses_cooked_data = true,
   })
+end
+
+function M.parse_signing_identities(output)
+  return Signing.parse(output)
+end
+
+function M.validate_signing_identity(value)
+  local identity, err = Signing.validate(value)
+  if not identity then return C.unavailable(M.id, "signing", err) end
+  return { ok = true, identity = identity }
+end
+
+function M.resolve_signing_identity(identities, query)
+  return Signing.resolve(identities, query)
+end
+
+function M.signing_identity_list_plan(context, host_driver)
+  return Signing.list_plan(context, host_driver)
+end
+
+function M.prepared_signing_identity(project_root)
+  return Signing.load_prepared_config(project_root)
 end
 
 function M.symbols_plan(context, host_driver)
@@ -366,6 +411,19 @@ function M.device_list_plan(context, host_driver)
   })
 end
 
+M.fallback_device_list_plan = Device.fallback_device_list_plan
+M.mobiledevice_device_list_plans = Device.mobiledevice_device_list_plans
+M.parse_mobiledevice_device_list = Device.parse_mobiledevice_device_list
+M.mobiledevice_info_plan = Device.mobiledevice_info_plan
+M.parse_mobiledevice_info = Device.parse_mobiledevice_info
+M.install_progress_tracker = Install.progress_tracker
+
+function M.install_failure_reason(result, plan)
+  if plan and plan.metadata and plan.metadata.backend == "legacy-mobiledevice" then
+    return Install.failure_reason(result)
+  end
+end
+
 function M.bundle_id_plan(app_path, host_driver, context)
   local plist_entry, unavailable = C.resolve_host_entry(host_driver, "plutil_entry", context or {}, M.id, "launch")
   if not plist_entry then
@@ -397,6 +455,18 @@ function M.install_plan(context, host_driver)
   if device_id == "" then
     return C.unavailable(M.id, "install", "device_id is required for install", {
       required = { "device_id" },
+    })
+  end
+  local device_backend = C.trim(context and context.device_backend)
+  if device_backend == "legacy-mobiledevice" then
+    return Install.legacy_plan(context, selected, {
+      validate_signing = Signing.validate,
+      validate_bundle_id = normalize_bundle_id,
+    })
+  end
+  if device_backend ~= "" and device_backend ~= "coredevice" then
+    return C.unavailable(M.id, "install", "selected IOS device backend is unsupported", {
+      device_backend = device_backend,
     })
   end
 
@@ -432,48 +502,8 @@ function M.install_plan(context, host_driver)
 end
 
 function M.launch_plan(context, host_driver)
-  local device_id = C.trim(context and context.device_id)
-  if device_id == "" then
-    return C.unavailable(M.id, "launch", "device_id is required for launch", {
-      required = { "device_id" },
-    })
-  end
-
   local bundle_id, err = normalize_bundle_id(context and context.bundle_id)
-  if not bundle_id then
-    return C.unavailable(M.id, "launch", err, {
-      required = { "bundle_id" },
-    })
-  end
-
-  local entry, unavailable = C.resolve_host_entry(host_driver, "xcrun_entry", context, M.id, "launch")
-  if not entry then
-    return unavailable
-  end
-
-  local output = C.trim(context and context.json_output)
-  if output == "" then
-    return C.unavailable(M.id, "launch", "json_output is required for devicectl launch", {
-      required = { "json_output" },
-    })
-  end
-
-  return C.with_appended_args(entry, {
-    "devicectl",
-    "device",
-    "process",
-    "launch",
-    "--device",
-    device_id,
-    bundle_id,
-    "--json-output",
-    output,
-  }, {
-    device_id = device_id,
-    bundle_id = bundle_id,
-    parser = "parse_launch_result",
-    json_output = output,
-  })
+  return Launch.plan(context, host_driver, bundle_id, err)
 end
 
 function M.classify_rsp(candidate, context)
@@ -565,6 +595,7 @@ function M.parse_device_list(payload)
         name = item.name or item.displayName or properties.name or hardware.marketingName,
         platform = platform,
         os_version = properties.osVersionNumber,
+        backend = "coredevice",
       }
     end
   end
@@ -574,6 +605,8 @@ function M.parse_device_list(payload)
     devices = available,
   }
 end
+
+M.parse_fallback_device_list = Device.parse_fallback_device_list
 
 function M.parse_install_result(payload, expected)
   local decoded = payload
@@ -626,53 +659,7 @@ function M.parse_install_result(payload, expected)
 end
 
 function M.parse_launch_result(payload, expected)
-  local decoded = payload
-  if type(payload) == "string" then
-    local ok, parsed = pcall(vim.json.decode, payload)
-    if not ok then
-      return C.unavailable(M.id, "launch", "failed to parse devicectl launch json", {
-        detail = parsed,
-      })
-    end
-    decoded = parsed
-  end
-
-  local result = decoded and (decoded.result or decoded)
-  local process = result and (result.process or result.launchedProcess or result.applicationProcess) or nil
-  local device_id = C.trim(result and (result.deviceIdentifier or result.device or result.targetDeviceIdentifier))
-  local bundle_id = C.trim(
-    result
-      and (
-        result.bundleIdentifier
-        or result.bundleID
-        or process and (process.bundleIdentifier or process.bundleID or process.applicationIdentifier)
-      )
-  )
-  local process_id = result
-    and (result.processIdentifier or result.pid or process and (process.processIdentifier or process.pid))
-
-  if device_id == "" or bundle_id == "" or process_id == nil then
-    return C.unavailable(M.id, "launch", "devicectl launch result missing process identity")
-  end
-  if expected and expected.device_id and device_id ~= expected.device_id then
-    return C.unavailable(M.id, "launch", "devicectl launch result device mismatch", {
-      expected_device_id = expected.device_id,
-      actual_device_id = device_id,
-    })
-  end
-  if expected and expected.bundle_id and bundle_id ~= expected.bundle_id then
-    return C.unavailable(M.id, "launch", "devicectl launch result bundle mismatch", {
-      expected_bundle_id = expected.bundle_id,
-      actual_bundle_id = bundle_id,
-    })
-  end
-
-  return {
-    ok = true,
-    device_id = device_id,
-    bundle_id = bundle_id,
-    process_id = process_id,
-  }
+  return Launch.parse_result(payload, expected)
 end
 
 function M.preflight_descriptors()
@@ -717,54 +704,11 @@ function M.preflight_descriptors()
 end
 
 function M.preflight_plans(stage, context, host_driver)
-  local plans = {}
-  local xcrun, xcrun_unavailable = C.resolve_host_entry(host_driver, "xcrun_entry", context, M.id, stage)
-  if not xcrun then
-    return xcrun_unavailable
-  end
-  plans[#plans + 1] = C.with_appended_args(xcrun, {
-    "--sdk",
-    "iphoneos",
-    "--show-sdk-path",
-  }, { preflight = "iphoneos-sdk" })
-
-  if stage == "package" or stage == "install" then
-    local security, security_unavailable = C.resolve_host_entry(host_driver, "security_entry", context, M.id, stage)
-    if not security then
-      return security_unavailable
-    end
-    plans[#plans + 1] = C.with_appended_args(security, {
-      "find-identity",
-      "-v",
-      "-p",
-      "codesigning",
-    }, { preflight = "codesign-identity" })
-  end
-
-  return { ok = true, plans = plans }
+  return Signing.preflight_plans(stage, context, host_driver)
 end
 
-function M.validate_preflight(stage, results)
-  for _, result in ipairs(results or {}) do
-    if tonumber(result.code) ~= 0 then
-      return C.unavailable(M.id, stage, "toolchain preflight command failed", {
-        preflight = result.plan and result.plan.metadata and result.plan.metadata.preflight,
-        exit_code = result.code,
-      })
-    end
-    local kind = result.plan and result.plan.metadata and result.plan.metadata.preflight
-    if kind == "iphoneos-sdk" and C.trim(result.stdout) == "" then
-      return C.unavailable(M.id, stage, "iPhoneOS SDK path was empty")
-    end
-    if kind == "codesign-identity" then
-      local output = tostring(result.stdout or "") .. "\n" .. tostring(result.stderr or "")
-      local count = tonumber(output:match("(%d+)%s+valid identities found"))
-      if not count or count < 1 then
-        return C.unavailable(M.id, stage, "no valid code-sign identity found")
-      end
-    end
-  end
-  return { ok = true, stage = stage }
+function M.validate_preflight(stage, results, context)
+  return Signing.validate_preflight(stage, results, context)
 end
 
 return M

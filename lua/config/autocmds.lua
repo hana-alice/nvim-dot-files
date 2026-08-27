@@ -23,9 +23,9 @@
 -- own zz/zt habits afterwards. Removing this autocmd also lets us drop
 -- the _restore_view_skip dance from snacks.lua picker jump wrapper.
 
-local is_windows = require("utils.platform").is_windows
+local platform = require("utils.platform")
 
-if is_windows then
+if platform.supports_capability("mixed_eol_guard") then
   local mixed_eol_group = vim.api.nvim_create_augroup("UEMixedEOLReload", { clear = true })
 
   local function has_trailing_cr(bufnr, max_lines)

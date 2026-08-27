@@ -50,6 +50,11 @@ vim.api.nvim_create_autocmd("UIEnter", {
     pcall(function()
       require("utils.stall_probe").setup()
     end)
+    -- Continuous host-load awareness. UIEnter keeps headless runs timer-free;
+    -- setup only establishes cumulative-counter baselines and never waits.
+    pcall(function()
+      require("utils.cpu_load").setup()
+    end)
     -- Proactive evidence probes (:UEProbeReport / spec probe-feedback-loop).
     -- Session-start summary: surface pending evidence ONCE so the next
     -- session's first act is READING feedback, not waiting for it.
@@ -70,6 +75,11 @@ vim.api.nvim_create_autocmd("UIEnter", {
 
 require("config.neovide").setup()
 require("config.snacks_global").setup()
+-- Main-loop headroom invariants (P6). MUST run before config.lazy so the LSP
+-- log level is already OFF when the first language server spawns: otherwise
+-- every clangd stderr chunk pays a synchronous write+flush on the main loop.
+-- Rationale + measurements: lua/config/ui_responsiveness.lua.
+require("config.ui_responsiveness").setup()
 require("config.lazy")
 -- NOTE: config.options / config.autocmds / config.keymaps are auto-loaded by
 -- LazyVim (options before lazy.setup, autocmds+keymaps on VeryLazy). Do NOT

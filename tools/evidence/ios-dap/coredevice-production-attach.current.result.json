@@ -1,0 +1,161 @@
+{
+  "adapter_output": [
+    "(lldb) settings set target.inline-breakpoint-strategy always\n"
+  ],
+  "backend": "coredevice",
+  "breakpoint_stop": true,
+  "cleanup": {
+    "ok": true
+  },
+  "evaluation": {
+    "ok": true,
+    "result_digest": "477867d1cfea",
+    "type_digest": "949f256d7401"
+  },
+  "events": [
+    {
+      "mode": "attach",
+      "name": "start"
+    },
+    {
+      "config_digest": "632278066ecb",
+      "name": "initialized"
+    },
+    {
+      "breakpoints": [
+        {
+          "id_digest": "0c8b5835f10e",
+          "line": 651,
+          "verified": true
+        },
+        {
+          "id_digest": "96e9856f6007",
+          "line": 651,
+          "verified": true
+        }
+      ],
+      "name": "setBreakpoints"
+    },
+    {
+      "description": "signal SIGSTOP",
+      "hit_breakpoint_count": 0,
+      "name": "stopped",
+      "reason": "exception",
+      "thread_digest": "3598af0da6d9"
+    },
+    {
+      "description": "signal SIGSTOP",
+      "hit_breakpoint_count": 0,
+      "name": "stopped",
+      "reason": "exception",
+      "thread_digest": "3598af0da6d9"
+    },
+    {
+      "name": "continue"
+    },
+    {
+      "description": "breakpoint 1.1",
+      "hit_breakpoint_count": 1,
+      "name": "stopped",
+      "reason": "breakpoint",
+      "thread_digest": "b5867cc0b7b4"
+    }
+  ],
+  "exact_source_frame": true,
+  "frames": [
+    {
+      "id_digest": "89fe34dfa75a",
+      "line": 4804,
+      "source": {
+        "digest": "79318d46cd85",
+        "name": "LaunchEngineLoop.cpp"
+      }
+    },
+    {
+      "id_digest": "c25859c2439b",
+      "line": 0
+    },
+    {
+      "id_digest": "07b7ffa8db7f",
+      "line": 0
+    },
+    {
+      "id_digest": "b99f2f386d86",
+      "line": 0
+    }
+  ],
+  "identity": {
+    "binary": {
+      "digest": "44dd5670c677",
+      "name": "Client"
+    },
+    "bundle_digest": "c72d992232e1",
+    "cwd": {
+      "digest": "1757fc3ef7e1",
+      "name": "Client"
+    },
+    "device_digest": "05e77b06c298",
+    "dsym": {
+      "digest": "fcb1a2f36b83",
+      "name": "Client.dev.branch36.Launch.dSYM"
+    },
+    "expression_digest": "89c375db9b45",
+    "pid_digest": "7a90f0cd5d80",
+    "project": {
+      "digest": "d8f9a92153dc",
+      "name": "Client.uproject"
+    }
+  },
+  "loaded_image_uuid_match": true,
+  "mode": "attach",
+  "notifications": [
+    {
+      "level": 2,
+      "message": "[ue.dap] iOS attach bootstrap started for <redacted>"
+    },
+    {
+      "level": 2,
+      "message": "[ue.dap] iOS transport attached; waiting for resolved source-breakpoint proof"
+    },
+    {
+      "level": 2,
+      "message": "[ue.dap] Attached. Stopped at entry — press F5 (or :DapContinue) to run."
+    },
+    {
+      "level": 2,
+      "message": "Source missing, cannot jump to frame: mach_msg2_trap",
+      "title": "DAP"
+    },
+    {
+      "level": 2,
+      "message": "Source missing, cannot jump to frame: mach_msg2_trap",
+      "title": "DAP"
+    },
+    {
+      "level": 2,
+      "message": "[ue.dap] iOS source breakpoint proven: <redacted>:4804; :UEDAPEval is ready"
+    },
+    {
+      "level": 2,
+      "message": "[ue.dap] iOS debugger detached; existing device process preserved"
+    }
+  ],
+  "schema": "ue-ios-production-dap-smoke-v1",
+  "source_frame": {
+    "line": 4804,
+    "source": {
+      "digest": "79318d46cd85",
+      "name": "LaunchEngineLoop.cpp"
+    }
+  },
+  "status": "passed",
+  "stop_reason": "breakpoint",
+  "target": {
+    "line": 4804,
+    "source": {
+      "digest": "79318d46cd85",
+      "name": "LaunchEngineLoop.cpp"
+    }
+  },
+  "verified_breakpoint": true
+}

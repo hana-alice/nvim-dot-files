@@ -207,9 +207,9 @@ function M.discover_with_retry(executable, deps)
     control.registered = control.registered + added
     control.reason = reason
     if added > 0 or reason == "already-registered" or last then control.done = true; return end
-    defer_fn(delays[control.attempts + 1], attempt)
+    defer_fn(attempt, delays[control.attempts + 1])
   end
-  if (delays[1] or 0) <= 0 then schedule(attempt) else defer_fn(delays[1], attempt) end
+  if (delays[1] or 0) <= 0 then schedule(attempt) else defer_fn(attempt, delays[1]) end
   return control
 end
 

@@ -15,7 +15,7 @@
   365ms，对比 NTFS 目录遍历的约 14s）。
 - **CDB 超级流水线**：对 `compile_commands.json` 做 expand / PCH 预编译 / 裁剪
   include（删掉 60–90% 的 `-I`），让 clangd 解析更少。
-- **多平台 DAP**：Win64 与 Android（headless attach）调试，断点按工程持久化。
+- **多平台 DAP**：Win64、Android 与 iOS 物理设备调试，断点按工程持久化。
 - **Host/target 双层构建驱动**：Windows/macOS/Linux 宿主执行与
   Win64/Android/Mac/IOS/Linux target 策略分离。
 - **macOS/iOS 原生流程**：UBT 编译、UAT 打包归档、物理设备选择、安装与启动。
@@ -61,7 +61,7 @@ FRHICommandList grep（越低越好）
 
 - **Windows 10/11**：主环境，支持 UE 构建/索引与 Win64/Android 工作流。
 - **macOS**：支持原生 UE `Build.sh`、Mac/IOS target、CDB 语义流水线及 iOS
-  打包/安装/启动，以及 legacy USB 真机 iOS DAP。
+  打包/安装/启动、iOS 17+ CoreDevice DAP 与 pre-iOS17 legacy USB DAP。
 - **Linux**：基础编辑器与原生 UBT build planner 可用；设备与 DAP 能力取决于 target。
 
 ## 环境要求
@@ -72,7 +72,7 @@ FRHICommandList grep（越低越好）
 | Neovim | 0.10+ |
 | 工具链 | clangd/LLVM 22.1.x —— 钉死；不要使用 mason auto-install |
 | Android DAP | LLVM 22.1.6+ `lldb-dap` + NDK 27 `lldb-server` |
-| iOS DAP | Xcode `lldb-dap` + `ios-deploy` + libimobiledevice |
+| iOS DAP | selected Xcode `lldb-dap` + CoreDevice（`devicectl`）；pre-iOS17 另需 `ios-deploy` + libimobiledevice |
 | 可选 | Go ≥ 1.22，用于构建 grep 索引工具 |
 | 构建前置 | 目标平台可用的 Unreal Build Tool 环境 |
 | iOS | Xcode、iPhoneOS SDK、签名/provisioning、已配对物理设备 |
@@ -174,6 +174,7 @@ tuple 的 UBT semantic CDB；IOS 首次还会自动导入 prepared 签名、实�
 | 复用已有 cooked 数据组 IOS 包 | `:UEPackageIOS` |
 | 按需生成并校验 IOS dSYM | `:UEIOSSymbols` |
 | IOS 选设备 / 原地安装更新 / 启动 | `:UESetIOSDevice` / `<leader>ui`（或 `:UEInstallIOS`）/ `:UELaunch` |
+| IOS debug attach / debug launch / stop | `:UEDAPAttach` / `:UEDAPLaunch` / `:UEDAPStop` |
 | 仅编译 Android SO（跳过 APK） | `<leader>us` / `:UEBuildAndroidSO` |
 | Android SO 快速部署（root 设备；替换后不启动） | `<leader>uq` / `:UEDeployAndroidSO` |
 | 启动当前 target 应用 | `:UELaunch` |
@@ -191,6 +192,15 @@ iOS 在外部 `PrepareIOSQADebug.sh` / `InstallIOSClient.sh` 成功后，完整�
 `:UESetProject <workspace>` 与 `:UESetPlatform IOS` 任意顺序 → `<leader>ub` → `:UEPrepare` →
 `<leader>ui`。IOS prepare 分支自动完成一次性签名/私钥/设备 setup 与 Apple semantic CDB 生成；
 prepared 清单缺失、执行中切换工程或状态落盘失败时都会中止，不会误报 ready。
+
+iOS 17+ DAP 会冻结已选 CoreDevice backend，并只消费结构化 `devicectl` app/process JSON。
+debug launch 以 start-stopped 启动；随后 Xcode `lldb-dap` 固定执行
+`target create` → `device select` → `device process attach -p`。本地 dSYM 必须通过
+`dwarfdump --verify --quiet`；只有 verified breakpoint、真实 breakpoint stop、精确 source:line frame、
+expression、loaded-image UUID 与 owner cleanup 全部成立，才算成功。headless 入口是
+`tools/nvim_ios_dap_smoketest.lua`，必须显式提供全部
+`NVIM_IOS_DAP_SMOKE_{MODE,DEVICE,BACKEND,BUNDLE,BINARY,DSYM,SOURCE,LINE}` 输入；落盘结果会脱敏，
+外部 artifact/device 前置不满足时只能写 `blocked`，不能写 `passed`。
 
 ## 为长期 AI 辅助开发而建
 

@@ -17,7 +17,7 @@
   (`FRDGBuilder`: ~365ms versus ~14s for an NTFS tree walk).
 - **CDB super-pipeline** that expands, PCH-prebuilds and prunes
   `compile_commands.json` (60–90% of `-I` flags removed) so clangd parses less.
-- **Multi-platform DAP** debugging for Win64 and Android (headless attach), with
+- **Multi-platform DAP** debugging for Win64, Android and physical iOS devices, with
   per-project breakpoint persistence.
 - **Host/target build drivers** that keep Windows, macOS and Linux execution
   separate from Win64, Android, Mac, IOS and Linux target policy.
@@ -68,7 +68,7 @@ FRHICommandList grep (lower is better)
 
 - **Windows 10/11:** primary environment; UE build/index and Win64/Android workflows.
 - **macOS:** native UE `Build.sh`, Mac/IOS target builds, the CDB semantic pipeline,
-  iOS package/install/launch, and legacy-USB physical-device iOS DAP are supported.
+  iOS package/install/launch, iOS 17+ CoreDevice DAP and pre-iOS17 legacy USB DAP.
 - **Linux:** the base editor and native UBT build planner are available; device and
   DAP workflows remain target-dependent.
 
@@ -80,7 +80,7 @@ FRHICommandList grep (lower is better)
 | Neovim | 0.10+ |
 | Toolchain | clangd/LLVM 22.1.x — pinned; do not use mason auto-install |
 | Android DAP | LLVM 22.1.6+ `lldb-dap` + NDK 27 `lldb-server` |
-| iOS DAP | Xcode `lldb-dap` + `ios-deploy` + libimobiledevice |
+| iOS DAP | selected Xcode `lldb-dap` + CoreDevice (`devicectl`); pre-iOS17 additionally uses `ios-deploy` + libimobiledevice |
 | Optional | Go ≥ 1.22, to build the grep index tool |
 | Build prerequisite | A working Unreal Build Tool setup for the target platform |
 | iOS | Xcode, iPhoneOS SDK, signing identity/provisioning, and a paired physical device |
@@ -195,6 +195,7 @@ Variants: `:UEPrepareIncremental` (dirty files only), `:UEPrepareReindex`
 | Package IOS from existing cooked data | `:UEPackageIOS` |
 | Generate and UUID-check IOS dSYM on demand | `:UEIOSSymbols` |
 | IOS device / install / launch | `:UESetIOSDevice` / `:UEInstallIOS` / `:UELaunch` |
+| IOS debug attach / debug launch / stop | `:UEDAPAttach` / `:UEDAPLaunch` / `:UEDAPStop` |
 | Android SO only (skip APK) | `<leader>us` / `:UEBuildAndroidSO` |
 | Android quick SO deploy (root device; does not launch) | `<leader>uq` / `:UEDeployAndroidSO` |
 | Launch the selected target app | `:UELaunch` |
@@ -208,6 +209,17 @@ After `PrepareIOSQADebug.sh` and `InstallIOSClient.sh` succeed, the complete IOS
 flow is `:UESetProject` and `:UESetPlatform IOS` in either order, then
 `<leader>ub` → `:UEPrepare` → `<leader>ui`. The IOS prepare branch owns the
 one-time signing/private-key/device setup and Apple semantic CDB generation.
+
+For iOS 17+, DAP freezes the selected CoreDevice backend and uses structured
+`devicectl` app/process JSON. Debug launch is start-stopped; Xcode `lldb-dap`
+then runs `target create` → `device select` → `device process attach -p`.
+The local dSYM must pass `dwarfdump --verify --quiet`, and a run is successful
+only after a verified breakpoint, real breakpoint stop, exact source:line frame,
+expression evaluation, loaded-image UUID proof and owner cleanup all pass.
+The headless gate is `tools/nvim_ios_dap_smoketest.lua`; provide every
+`NVIM_IOS_DAP_SMOKE_{MODE,DEVICE,BACKEND,BUNDLE,BINARY,DSYM,SOURCE,LINE}` input
+explicitly. Its persisted result is redacted and reports an external artifact or
+device prerequisite as `blocked`, never as `passed`.
 
 Full keymap and workflow handbook:
 [`docs/ue_lazyvim_cheatsheet.md`](docs/ue_lazyvim_cheatsheet.md).

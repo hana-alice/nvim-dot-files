@@ -465,6 +465,20 @@
     `constrain-clangd-under-cpu-pressure`; 行为测 `tests/cases/ui_responsiveness_spec.lua`
     「份额上限」与 `cpu_admission_spec.lua`
 
+- **K55 — iOS Mach-O/dSYM UUID 相等不代表 source debug 可用（2026-08-26 真机）**
+  症状: CoreDevice start-stopped、PID identity 与 Mach-O/dSYM UUID 都一致，但 LLDB source breakpoint
+  永远 pending；`dwarfdump --statistics` 报 0 functions / 0 line entries，大量 compilation unit 指向
+  invalid abbreviation offset。
+  根因: 超过 4 GiB 的 monolithic UE DWARF 可能生成 UUID 正确但结构损坏的 dSYM；只跑 `--uuid`
+  会把不可调试工件误判为可用，随后 adapter/真机符号加载耗时很久才失败。
+  解决约束: CoreDevice DAP 必须在启动 adapter 或创建 suspended process 前异步执行
+  `dwarfdump --verify --quiet`；失败即报告 external artifact blocker，不允许降级成 symbol-only 成功。
+  device attach 是异步的，loaded UUID 检查必须在 post-run `process status` 之后输出并消费唯一
+  OK/MISMATCH marker；把 `assert` 直接塞进 attach command 会过早执行，而且 lldb-dap 可能忽略其错误。
+  真机 evidence 只能记录摘要/digest，不得落真实 device、bundle、PID 或个人路径。
+  → `lua/ue/dap/_ios_coredevice.lua`; `tools/evidence/ios-dap/coredevice-*.current.result.json`;
+    `openspec/specs/ios-device-debug-workflow/spec.md`
+
 ### 工具链 / LLVM
 
 - **K41 — 依赖路径向上发现的 `.clangd` / monolithic External index → 覆盖漂移与资源失控**
@@ -684,6 +698,7 @@
 |------|------|------|------|
 | clangd / clang | **LLVM 22.1.x**（22.1.5 verified） | **不要降级到 21.x** —— exact-command transport、controlled BackgroundIndex、libclang cursor ABI 与 C shim 都按 22.x 验证 | `docs/TOOLING.md` §clangd |
 | DAP 适配器（Android） | **LLVM 22.1.6+ `lldb-dap.exe`**（forward-only，当前） | Android platform-mode attach 以 `lua/utils/platform/windows.lua` `default_lldb_dap_paths()` 为准；首选 `C:/tools/lldb-22/install/bin/lldb-dap.exe`。不得静默降级到 LLVM 21 或历史 codelldb 路线。 | `docs/TOOLING.md` §"Current Android DAP status" |
+| DAP 适配器（iOS） | **selected Xcode Apple `lldb-dap`** | iOS 17+ 使用 CoreDevice device/PID attach；pre-iOS17 使用 validated MobileDevice bridge。session 冻结 backend/adapter，禁止 Homebrew、Mac 或跨 backend fallback。 | `docs/TOOLING.md` §"macOS host and iOS application workflow" |
 | lldb-server（Android） | **NDK 27 LLDB 18.x**（aarch64-android，platform server） | 当前 K30 路线使用 `/data/local/tmp/lldb-server platform --server --listen`，由 host serial-form `platform connect` 拉起目标 gdbserver；`gdbserver --attach` 路线已证伪。`default_lldb_server_paths()` 以 NDK27 platform server 为首选。 | `docs/TOOLING.md` §"Current Android DAP status" |
 | adb | Platform-Tools 35.x+ | | `docs/TOOLING.md` §adb |
 | Neovim | **0.10+** | 用到 `vim.uv` / `vim.system` / `vim.api.nvim__redraw` | `docs/TOOLING.md` §Neovim |

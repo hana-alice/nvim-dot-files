@@ -106,8 +106,10 @@ The macOS host driver uses only native engine and Xcode entry points:
   LLDB/CoreDevice gate. An explicit `legacy-preflight --device ... --symbols ...`
   additionally checks a pre-iOS17 MobileDevice/`ios-deploy` candidate and exact
   ProductType/OS/build DeviceSupport layout without persisting the device id or
-  personal path. The production `:UEDAPAttach` / `:UEDAPLaunch` handler uses the
-  same validated legacy route and fails closed on a different backend.
+  personal path. The production `:UEDAPAttach` / `:UEDAPLaunch` handler freezes
+  the selected backend: iOS 17+ `coredevice` sessions use structured `devicectl`
+  JSON plus `target create` → `device select` → `device process attach -p`;
+  pre-iOS17 `legacy-mobiledevice` sessions retain the validated USB bridge.
 
 Requirements:
 
@@ -129,9 +131,15 @@ The normal build/install/launch workflow still does not use UE's legacy
 fastlane/instruments deploy route. Legacy launch uses `ios-deploy --noinstall
 --justlaunch` against the prepared signed app on the explicitly selected transport, then verifies the installed bundle PID.
 iOS DAP is a separate production operation:
-`ios-deploy --nolldb` exposes the pre-iOS17 Xcode DeveloperDiskImage/debugserver
-loopback bridge, while Xcode `lldb-dap` owns target creation, attach/launch,
-breakpoints and expression evaluation. It is never a Mac-process fallback.
+on iOS 17+, `devicectl` queries the exact installed app/process identity and
+debug-launches with `--terminate-existing --start-stopped`; selected Xcode
+`lldb-dap` then attaches to that frozen CoreDevice PID. The host Mach-O and dSYM
+must have equal UUIDs, the dSYM must pass `dwarfdump --verify --quiet`, and the
+loaded executable UUID must emit the post-run OK marker before first continue. Ordinary attach preserves and
+revalidates the existing process; debug-launch terminates only its captured PID. On pre-iOS17 devices,
+`ios-deploy --nolldb` exposes the validated DeveloperDiskImage/debugserver
+loopback bridge. Neither backend falls back to Mac process attach or to the other
+iOS backend after a session starts.
 
 ## Historical lldb-dap 21 side-load (DAP debugger adapter, Windows)
 

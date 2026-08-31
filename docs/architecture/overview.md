@@ -129,17 +129,21 @@
   `ue.dap.platforms` dispatch → 具体平台 `attach/launch` → `lldb-dap`。attach/launch 开始时
   捕获不可变的 session owner；后续 stop/status/reattach/cleanup 只按该 owner dispatch，UI 的当前
   target 或 device selection 改变不得劫持活跃会话。iOS 不借用 Mac process
-  attach：`ios-deploy --nolldb` 只负责 legacy USB debugserver loopback bridge，Apple LLDB 选择
-  `remote-ios` + 精确 DeviceSupport sysroot，以本地 symbol-rich Mach-O 创建 target，并映射设备 app
-  executable。`UEDAPLaunch` 经 `SBProcess.RemoteLaunch(..., stop_at_entry=true)` 在断点下发前保持停住；
-  `UEDAPAttach` 取已运行 bundle PID，再等待异步 RemoteAttach 进入 stopped。内存模块使用 `partial`
-  load level，避免通过 USB 下载完整远程符号表；本地 Client DWARF 仍保持完整。`UEDAPStop` 非终止式
-  detach 后杀掉并复查设备进程。Android 走 platform
+  attach：iOS 17+ `coredevice` route 以结构化 `devicectl` JSON 冻结 installed app、canonical device 与
+  正 PID；debug launch 使用 `--terminate-existing --start-stopped`，Apple `lldb-dap` 固定执行
+  `target create` → `device select` → `device process attach -p`。adapter 启动前验证 Mach-O/dSYM UUID 与
+  DWARF 完整性，attach 完成后的 post-run marker 再证明 loaded executable UUID，未得到 OK 时禁止首次
+  continue。pre-iOS17 route 继续由
+  `ios-deploy --nolldb` 暴露 legacy USB debugserver bridge，Apple LLDB 选择 `remote-ios` + 精确
+  DeviceSupport sysroot。两条 route 都冻结 backend，失败不互相 fallback；`UEDAPStop` 先
+  `disconnect{terminateDebuggee=false}`，debug-launch 再终止并复查 owned PID，ordinary attach 只复验既有
+  PID 仍存活。Android 走 platform
   模式 + serial connect URL；K30 URL 与本次 session 捕获的 ADB serial 必须一致，切换当前进程的
   选择值不改变活跃 session 的 poll/cleanup。
-  `tools/ios_dap_protocol_probe.py` 保留为脱敏 CoreDevice/legacy preflight 与协议诊断入口；生产路径已在
-  legacy 真机分别验证 attach-at-launch、ordinary attach、resolved source breakpoint、source frame、
-  LLDB expression 和 cleanup。
+  `tools/ios_dap_protocol_probe.py` 保留为脱敏 CoreDevice/legacy preflight 与协议诊断入口。legacy 真机
+  已验证 attach-at-launch、ordinary attach、resolved source breakpoint、source frame、LLDB expression
+  和 cleanup；当前 CoreDevice 真机已用 matching Mach-O/verified dSYM 证明 raw-DAP、production attach 与
+  debug-launch 的 loaded UUID、resolved breakpoint、精确 source frame、expression 与 owner cleanup 均通过。
 
 ### 2.1 状态归属清单
 

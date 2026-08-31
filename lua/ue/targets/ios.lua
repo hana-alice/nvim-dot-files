@@ -143,6 +143,35 @@ function M.capabilities()
   })
 end
 
+function M.dap_artifacts(context)
+  local project_dir = C.normalize_path(context and context.project_dir)
+  local target = C.context_target(context)
+  if project_dir == "" or target == "" then
+    return nil
+  end
+  local binary = C.join_path(project_dir, "Binaries", M.id, target)
+  return {
+    binary = binary,
+    dsym = binary .. ".dSYM",
+  }
+end
+
+function M.dap_tool_names(backend)
+  if backend == "coredevice" then
+    return { xcrun = "xcrun" }
+  end
+  if backend == "legacy-mobiledevice" then
+    return {
+      ios_deploy = "ios-deploy",
+      ideviceinfo = "ideviceinfo",
+      ideviceinstaller = "ideviceinstaller",
+      plutil = "plutil",
+      xcrun = "xcrun",
+    }
+  end
+  return nil
+end
+
 function M.build_plan(context, host_driver)
   local entry, unavailable = C.resolve_host_entry(host_driver, "ue_build_entry", context, M.id, "build")
   if not entry then

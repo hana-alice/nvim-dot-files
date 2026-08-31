@@ -58,6 +58,15 @@ prepare 家族读编译产物（Module.*.rsp/receipts），与 UBT build 并跑�
 必须 `-u` + 分步 banner + 流式日志（jobstart data 块非行对齐要拼行）。
 → `../docs/CONSTRAINTS.md §二 K51`；`../docs/changelog.md` 2026-08-18
 
+### iOS CoreDevice DAP（K55）
+
+CoreDevice tunnel、start-stopped 与正 PID 全部可用，甚至 Mach-O/dSYM UUID 相等，仍不能证明 dSYM
+含可解析的 source DWARF；超过 4 GiB 的 monolithic UE debug info 可能表现为 0 functions / 0 line entries。
+production handler 必须在 adapter/launch 前执行 `dwarfdump --verify --quiet`，失败诚实标记 artifact blocker，
+不得把 symbol-only attach 当 source-debug 成功。CoreDevice attach 命令异步返回；loaded-image UUID 必须在
+post-run stopped 状态输出 OK/MISMATCH marker 并由 listener 消费，不能依赖会被 lldb-dap 忽略的早期 assert。
+→ `../docs/CONSTRAINTS.md §二 K55`；`../tools/evidence/ios-dap/README.md`
+
 ### 工具链 / LLVM（K14–K15、K41）
 LLVM 22.0–22.1.5 的 `lldb-dap.exe` Windows 启动崩（`STATUS_STACK_BUFFER_OVERRUN`）；
 适配器迁移弧线（lldb-dap 21.1.8 → codelldb 1.12.2 → **LLVM 22.1.6+ lldb-dap forward-only，

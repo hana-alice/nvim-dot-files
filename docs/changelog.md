@@ -47,6 +47,40 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-08-31 — Sync and archive all active OpenSpec changes
+
+**Task**
+
+将四个活动 OpenSpec change 的 delta 同步到主规格并归档，同时在公开分支提交前检查商业敏感词。
+
+**Implemented**
+
+- 将后台索引 CPU 准入、磁盘工件自证 readiness、跨 checkout 候选标记、header TU 自动收敛四组契约
+  同步到 `cpp-semantic-index-coverage`、`ue-code-search` 与
+  `cpp-contextual-definition-navigation` 主规格；同时消除旧的“多个 TU 即提示选择”条款冲突。
+- 将四个 change 移入 `openspec/changes/archive/2026-08-31-*`，保留原始 task 勾选状态，不把未完成项
+  改写为已完成。
+- 收窄 iOS DAP smoke 脱敏回归中的短 PID 断言：直接检查结构化 `pid` 字段与错误消息，避免随机路径
+  摘要恰好含同一四位数字时误报；设备、bundle 与本地路径的完整序列化结果检查保持不变。
+
+**Pitfalls / Gotchas**
+
+- 四个归档 change 分别仍有 1、4、12、4 个未勾选任务；归档是用户明确要求的管理动作，不构成这些
+  实现/验收项已完成的证据，尤其 foreign checkout picker change 仍为 0/12。
+- 12 位十六进制摘要可能偶然包含任意四位数字；独立 SHA-256 实验在第 5019 个输入复现了 `4242`
+  出现在已脱敏摘要中的情况，因此不能把整段 JSON 的短数字子串搜索当作泄漏证明。
+
+**Validation**
+
+- `openspec validate --all`（归档后）：39/39；`nvim --headless -l tests/run.lua structure`：71/71；
+  `nvim --headless -l tests/run.lua ios_dap_probe`：6/6；全量回归：1325/1325。
+- 暂存新增内容通过本地 pre-commit 隐私门；完整暂存树按私有 denylist 扫描为 0 命中。
+- spec 一致性：四份 delta 已同步到上述三份主规格并完成归档；未勾选的实现/验收义务原样保留为风险。
+
+**Follow-ups**
+
+- 若继续实现归档中的剩余义务，应从对应 archive 恢复或新建后继 change，不能把本次归档视为验收通过。
+
 ### 2026-08-31 — Surface csearch queries in grep history
 
 **Task**

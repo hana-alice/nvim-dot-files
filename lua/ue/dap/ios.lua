@@ -1,12 +1,20 @@
--- ue.dap.ios — physical-device iOS DAP via legacy MobileDevice debugserver.
+-- ue.dap.ios — physical-device iOS DAP via CoreDevice or MobileDevice.
 --
 -- Independent from ue.dap.mac: pair the local symbol-rich Mach-O with the
 -- installed executable, expose legacy debugserver through ios-deploy, then
 -- RemoteLaunch(stop_at_entry=true) or RemoteAttachToProcessWithID via LLDB.
 local C = require("ue.dap._common")
+local CoreDevice = require("ue.dap._ios_coredevice")
 local IOSProcess = require("ue.dap._ios_process")
+local Runtime = require("ue.dap._ios_runtime")
+local IOSSession = require("ue.dap._ios_session")
 local Progress = require("ue.dap._progress")
-local M = { _session = nil, _starting = false, _stopping = false, _listeners_installed = false }
+local M = {
+  _session = nil,
+  _cleanup_runtime = nil,
+  _starting = false,
+  _stopping = false,
+}
 local INIT_COMMANDS = {
   "settings set stop-disassembly-display never",
   "settings set target.inline-breakpoint-strategy always",
@@ -204,92 +212,6 @@ local function system_async(argv, opts, callback)
     return nil
   end
   return handle_or_err
-end
-
-local function executable(name)
-  if vim.fn.executable(name) ~= 1 then
-    return nil
-  end
-  local path = vim.fn.exepath(name)
-  return path ~= "" and path or nil
-end
-
-local function resolve_runtime(opts)
-  opts = opts or {}
-  local ctx = opts.context
-  if type(ctx) ~= "table" then
-    local ok, value, err = pcall(function()
-      local ue = require("ue")
-      local resolved, resolve_err = ue.resolve_context()
-      return resolved, resolve_err
-    end)
-    if not ok then
-      return nil, tostring(value)
-    end
-    ctx, err = value, err
-    if not ctx then
-      return nil, err or "no UE project context"
-    end
-  end
-  local state = type(ctx.state) == "table" and ctx.state or {}
-  local runtimes = type(state.target_runtime) == "table" and state.target_runtime or {}
-  local persisted = type(runtimes.IOS) == "table" and runtimes.IOS or {}
-  local device_id = trim(opts.device_id or persisted.device_id)
-  local bundle_id = trim(opts.bundle_id or persisted.bundle_id)
-  local backend = trim(opts.device_backend or persisted.device_backend)
-  if device_id == "" then
-    return nil, "run :UESetIOSDevice first (missing persisted device id)"
-  end
-  if bundle_id == "" then
-    return nil, "run :UEInstallIOS first (missing persisted bundle id)"
-  end
-  if backend ~= "legacy-mobiledevice" then
-    return nil, "iOS DAP currently requires the selected legacy-mobiledevice USB route"
-  end
-  local uproject = trim(ctx.uproject or state.uproject)
-  if uproject == "" then
-    return nil, "iOS DAP could not resolve the active .uproject"
-  end
-  local project_dir = vim.fs.dirname(uproject)
-  local target = vim.fn.fnamemodify(uproject, ":t:r")
-  local binary = vim.fs.normalize(project_dir .. "/Binaries/IOS/" .. target)
-  if vim.fn.filereadable(binary) ~= 1 then
-    return nil, "local iOS symbol binary is missing: " .. binary
-  end
-  local tools = {
-    ios_deploy = executable("ios-deploy"),
-    ideviceinfo = executable("ideviceinfo"),
-    ideviceinstaller = executable("ideviceinstaller"),
-    plutil = executable("plutil"),
-    xcrun = executable("xcrun"),
-  }
-  for key, path in pairs(tools) do
-    if not path then
-      return nil, key:gsub("_", "-") .. " is not installed or not executable"
-    end
-  end
-  return {
-    backend = backend,
-    binary = binary,
-    bundle_id = bundle_id,
-    context = ctx,
-    cwd = project_dir,
-    device_id = device_id,
-    target = target,
-    tools = tools,
-  }
-end
-
-local function query_xcode_lldb_dap(runtime, callback)
-  system_async({ runtime.tools.xcrun, "--find", "lldb-dap" }, {}, function(result)
-    local adapter = trim(result.stdout)
-    if result.code ~= 0 or adapter == "" or vim.fn.executable(adapter) ~= 1 then
-      callback(nil, "selected Xcode does not provide an executable lldb-dap")
-      return
-    end
-    -- Xcode's xcrun is authoritative for Apple remote-ios sessions.
-    callback(vim.fs.normalize(adapter))
-  end)
 end
 
 local function parse_device_info(output)
@@ -510,107 +432,78 @@ local function kill_app(runtime, callback)
   end)
 end
 
-local function is_ios_dap_session(session)
-  local config = session and session.config or nil
-  return config and config._ue_ios_session_owner == "legacy-mobiledevice"
+local function stop_runtime(runtime, callback)
+  stop_bridge(runtime)
+  if runtime and runtime.backend == "coredevice" then
+    CoreDevice.stop(runtime, { system_async = system_async }, callback)
+  else
+    kill_app(runtime, callback)
+  end
 end
 
-local function end_unexpected_session(session)
-  if not is_ios_dap_session(session) or M._stopping then
-    return
+local function preserves_attached_process(runtime)
+  return runtime and runtime.backend == "coredevice" and runtime._ue_coredevice_owns_process ~= true
+end
+
+local function end_unexpected_session(session, on_done)
+  if not IOSSession.is_owned(session) or M._stopping then
+    return false
   end
-  local runtime = M._session
+  local runtime = M._session or M._cleanup_runtime
   if not runtime then
-    return
+    return false
   end
   M._session = nil
-  stop_bridge(runtime)
-  progress("step", "iOS debugger ended; stopping device process …")
-  kill_app(runtime, function(ok, err)
+  M._cleanup_runtime = runtime
+  local preserve = preserves_attached_process(runtime)
+  progress(
+    "step",
+    preserve and "iOS debugger ended; verifying attached device process …"
+      or "iOS debugger ended; stopping device process …"
+  )
+  stop_runtime(runtime, function(ok, err)
     if ok then
-      progress("done", "iOS debugger and device process stopped")
+      progress(
+        "done",
+        preserve and "iOS debugger ended; attached device process preserved"
+          or "iOS debugger and device process stopped"
+      )
     else
       progress("error", err)
       notify(err, vim.log.levels.ERROR)
     end
+    if type(on_done) == "function" then
+      on_done(ok, err)
+    end
   end)
+  return true
 end
 
-local function install_listeners()
-  if M._listeners_installed then
-    return
+local install_listeners
+
+local function run_coredevice(runtime, config)
+  M._session = runtime
+  M._starting = false
+  install_listeners()
+  progress("step", "4/4 LLDB attaching and validating the loaded image UUID …")
+  if
+    C.run(config, "UEDAP ios " .. config._ue_session_operation, runtime.adapter, {
+      initialize_timeout_sec = 90,
+      disconnect_timeout_sec = 10,
+    })
+  then
+    return true
   end
-  local dap = C.require_dap()
-  if not dap then
-    return
-  end
-  local key = "ue_ios_lifecycle"
-  dap.listeners.after.event_initialized[key] = function(session)
-    if not is_ios_dap_session(session) then
-      return
-    end
-    progress("step", "iOS transport attached; arming source breakpoints …")
-    notify("iOS transport attached; waiting for resolved source-breakpoint proof")
-  end
-  dap.listeners.after.setBreakpoints[key] = function(session, err, response, request)
-    if not is_ios_dap_session(session) or err or type(response) ~= "table" then
-      return
-    end
-    for _, breakpoint in ipairs(response.breakpoints or {}) do
-      if breakpoint.verified == true then
-        session._ue_ios_has_verified_breakpoint = true
-        local arguments = request and (request.arguments or request) or nil
-        local source = arguments and arguments.source or nil
-        local path = source and trim(source.path) or ""
-        if path ~= "" then
-          session._ue_ios_verified_sources = session._ue_ios_verified_sources or {}
-          session._ue_ios_verified_sources[path] = true
-        end
-        progress("step", "iOS source breakpoint resolved; waiting for the stop …")
-        break
-      end
-    end
-  end
-  dap.listeners.after.event_stopped[key] = function(session, body)
-    if not is_ios_dap_session(session) or type(body) ~= "table" then
-      return
-    end
-    if body.reason ~= "breakpoint" or session._ue_ios_has_verified_breakpoint ~= true then
-      return
-    end
-    local thread_id = tonumber(body.threadId)
-    if not thread_id or type(session.request) ~= "function" then
-      return
-    end
-    session:request("stackTrace", { threadId = thread_id, startFrame = 0, levels = 12 }, function(err, response)
-      if err or type(response) ~= "table" then
-        return
-      end
-      local frames = response.stackFrames or {}
-      local frame = frames[1]
-      for _, candidate in ipairs(frames) do
-        local candidate_path = candidate.source and trim(candidate.source.path) or ""
-        if session._ue_ios_verified_sources and session._ue_ios_verified_sources[candidate_path] then
-          frame = candidate
-          break
-        end
-      end
-      local source = frame and frame.source or nil
-      local path = source and trim(source.path) or ""
-      local line = frame and tonumber(frame.line) or nil
-      if path == "" or not line or line < 1 then
-        return
-      end
-      vim.schedule(function()
-        progress("done", ("iOS breakpoint proven at %s:%d"):format(vim.fs.basename(path), line))
-        notify(("iOS source breakpoint proven: %s:%d; :UEDAPEval is ready"):format(path, line))
-      end)
-    end)
-  end
-  dap.listeners.before.event_terminated[key] = end_unexpected_session
-  dap.listeners.before.event_exited[key] = end_unexpected_session
-  dap.listeners.after.disconnect[key] = end_unexpected_session
-  M._listeners_installed = true
+  M._session = nil
+  return false
+end
+
+install_listeners = function()
+  IOSSession.install({
+    notify = notify,
+    on_unexpected_end = end_unexpected_session,
+    progress = progress,
+  })
 end
 
 local function fail_start(message)
@@ -669,10 +562,17 @@ local function prepare(mode, opts)
     return
   end
   if M._session then
-    notify("an iOS DAP session already owns the USB bridge; run :UEDAPStop first", vim.log.levels.WARN)
+    notify("an iOS DAP session is already active; run :UEDAPStop first", vim.log.levels.WARN)
     return
   end
-  local runtime, err = resolve_runtime(opts)
+  if M._cleanup_runtime and M._cleanup_runtime._ue_coredevice_cleanup then
+    if not M._cleanup_runtime._ue_coredevice_cleanup.done then
+      notify("the previous iOS owner cleanup is still running", vim.log.levels.WARN)
+      return
+    end
+    M._cleanup_runtime = nil
+  end
+  local runtime, err = Runtime.resolve(opts)
   if not runtime then
     fail_start(err)
     return
@@ -681,13 +581,23 @@ local function prepare(mode, opts)
   notify(
     (mode == "launch" and "iOS attach-at-launch" or "iOS attach") .. " bootstrap started for " .. runtime.device_id
   )
-  progress("step", "1/4 resolving installed app and DeviceSupport symbols …")
-  query_xcode_lldb_dap(runtime, function(adapter, adapter_err)
+  progress("step", "1/4 resolving the frozen iOS debug context …")
+  Runtime.query_adapter(runtime, system_async, function(adapter, adapter_err)
     if not adapter then
       fail_start(adapter_err)
       return
     end
     runtime.adapter = adapter
+    if runtime.backend == "coredevice" then
+      CoreDevice.prepare(mode, runtime, {
+        fail = fail_start,
+        init_commands = INIT_COMMANDS,
+        progress = progress,
+        run = run_coredevice,
+        system_async = system_async,
+      })
+      return
+    end
     query_device_symbols(runtime, function(symbols, symbols_err)
       if not symbols then
         fail_start(symbols_err)
@@ -740,15 +650,11 @@ end
 function M.stop(opts)
   opts = opts or {}
   local on_done = type(opts.on_done) == "function" and opts.on_done or function() end
-  local runtime = M._session
+  local runtime = M._session or M._cleanup_runtime
   if not runtime then
-    local resolved, err = resolve_runtime(opts)
-    if not resolved then
-      notify(err, vim.log.levels.WARN)
-      on_done(false, err)
-      return
-    end
-    runtime = resolved
+    notify("no active iOS DAP owner to stop")
+    on_done(true)
+    return
   end
   M._stopping = true
   local finalized = false
@@ -758,13 +664,24 @@ function M.stop(opts)
     end
     finalized = true
     M._session = nil
-    stop_bridge(runtime)
-    progress("step", "stopping and verifying the iOS device process …")
-    kill_app(runtime, function(ok, err)
+    M._cleanup_runtime = runtime
+    local preserve = preserves_attached_process(runtime)
+    progress(
+      "step",
+      preserve and "detaching and verifying the iOS device process …"
+        or "stopping and verifying the iOS device process …"
+    )
+    stop_runtime(runtime, function(ok, err)
       M._stopping = false
       if ok then
-        progress("done", "iOS device process stopped (pid absent)")
-        notify("iOS debugger detached and device process stopped")
+        progress(
+          "done",
+          preserve and "iOS device process preserved after detach" or "iOS device process stopped (pid absent)"
+        )
+        notify(
+          preserve and "iOS debugger detached; existing device process preserved"
+            or "iOS debugger detached and device process stopped"
+        )
         on_done(true)
       else
         progress("error", err)
@@ -775,7 +692,7 @@ function M.stop(opts)
   end
   local dap = C.require_dap()
   local active = dap and dap.session and dap.session() or nil
-  if active and is_ios_dap_session(active) then
+  if active and IOSSession.is_owned(active) then
     local ok = pcall(dap.disconnect, { terminateDebuggee = false }, function()
       vim.schedule(finalize)
     end)
@@ -787,7 +704,23 @@ function M.stop(opts)
   finalize()
 end
 
-function M.cleanup(opts) return end_unexpected_session(type(opts) == "table" and opts.session or nil) end
+function M.cleanup(opts)
+  local session = type(opts) == "table" and opts.session or nil
+  local completed = false
+  local function done()
+    completed = true
+  end
+  local started = end_unexpected_session(session, done)
+  if not started and M._cleanup_runtime then
+    started = true
+    stop_runtime(M._cleanup_runtime, done)
+  end
+  if started then
+    vim.wait(65000, function()
+      return completed
+    end, 50)
+  end
+end
 
 function M._build_config_for_test(opts)
   return build_config(opts)
@@ -795,6 +728,14 @@ end
 
 function M._parse_installed_apps_for_test(payload, bundle_id)
   return parse_installed_apps(payload, bundle_id)
+end
+
+function M._build_coredevice_config_for_test(opts)
+  return CoreDevice.build_config(opts)
+end
+
+function M._resolve_runtime_for_test(opts)
+  return Runtime.resolve(opts)
 end
 
 return M

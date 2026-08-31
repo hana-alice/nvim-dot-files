@@ -117,6 +117,92 @@ t.describe("UE grep <leader>/ csearch-only（从不加 rg）", function()
   end)
 end)
 
+t.describe("UE grep history routes csearch records", function()
+  local function with_history_mock(records, body)
+    local old_history = package.loaded["snacks.picker.util.history"]
+    local old_snacks = package.loaded["snacks"]
+    local closed = {}
+
+    package.loaded["snacks.picker.util.history"] = {
+      new = function(name, opts)
+        local values = {}
+        for _, record in ipairs(records[name] or {}) do
+          if not opts or not opts.filter or opts.filter(record) then
+            values[#values + 1] = vim.deepcopy(record)
+          end
+        end
+        local history = {
+          idx = #values + 1,
+          cursor = #values + 1,
+          kv = { data = values, loaded_time = 1 },
+        }
+        function history:prev()
+          self.cursor = math.max(self.cursor - 1, 1)
+          return values[self.cursor]
+        end
+        function history.kv:close()
+          closed[name] = vim.deepcopy(self.data)
+        end
+        return history
+      end,
+    }
+
+    local picked
+    package.loaded["snacks"] = {
+      picker = {
+        pick = function(opts)
+          picked = opts
+          return opts
+        end,
+      },
+    }
+
+    local ok, err = xpcall(function()
+      local root = vim.fn.stdpath("config"):gsub("\\", "/")
+      local spec = dofile(root .. "/lua/plugins/snacks.lua")
+      local callbacks = {}
+      for _, key in ipairs(spec[1].keys or {}) do
+        callbacks[key[1]] = key[2]
+      end
+      body(callbacks, function() return picked end, closed)
+    end, debug.traceback)
+
+    package.loaded["snacks.picker.util.history"] = old_history
+    package.loaded["snacks"] = old_snacks
+    if not ok then error(err) end
+  end
+
+  t.it("<leader>sH merges csearch and regular grep history", function()
+    with_history_mock({
+      picker_ue_grep_csearch = {
+        { search = "from-csearch", pattern = "", live = true },
+      },
+      picker_grep = {
+        { search = "from-rg", pattern = "", live = true },
+      },
+    }, function(callbacks, picked)
+      t.assert_type(callbacks["<leader>sH"], "function")
+      callbacks["<leader>sH"]()
+      local picker = picked()
+      t.assert_true(picker ~= nil, "history picker should open")
+      t.assert_eq(#picker.items, 2, "csearch and regular grep records should both be visible")
+      t.assert_eq(picker.items[1].query, "from-csearch")
+      t.assert_eq(picker.items[2].query, "from-rg")
+    end)
+  end)
+
+  t.it("clear picker history also clears csearch history", function()
+    with_history_mock({}, function(callbacks, _, closed)
+      t.assert_type(callbacks["<leader>sC"], "function")
+      callbacks["<leader>sC"]()
+      t.assert_true(closed.picker_ue_grep_csearch ~= nil,
+        "clear action must clear the csearch picker store")
+      t.assert_true(closed.picker_grep ~= nil,
+        "clear action must keep clearing the regular grep store")
+    end)
+  end)
+end)
+
 -- ── live grep 启动阈值 ──────────────────────────────────────────────────
 t.describe("UE grep live 输入保护", function()
   t.it("空输入与单字符标识符不启动重搜索，但 literal 标点可以精确搜索", function()

@@ -413,15 +413,39 @@ def recursive_dicts(value: Any):
             yield from recursive_dicts(child)
 
 
-def process_identity_matches(payload: Any, pid: int, bundle_id: str) -> bool:
-    pid_keys = ("processIdentifier", "pid")
-    bundle_keys = ("bundleIdentifier", "bundleID", "applicationIdentifier")
-    for item in recursive_dicts(payload):
-        actual_pid = next((item.get(key) for key in pid_keys if item.get(key) is not None), None)
-        actual_bundle = next((item.get(key) for key in bundle_keys if item.get(key)), None)
-        if str(actual_pid) == str(pid) and actual_bundle == bundle_id:
-            return True
-    return False
+def app_identity(payload: Any, bundle_id: str) -> tuple[str, str] | None:
+    result = payload.get("result") if isinstance(payload, dict) else None
+    if not isinstance(result, dict):
+        return None
+    device_id = str(result.get("deviceIdentifier") or "")
+    apps = result.get("apps") or result.get("applications") or result.get("installedApplications")
+    matches = [
+        item for item in apps or []
+        if isinstance(item, dict)
+        and (item.get("bundleIdentifier") or item.get("bundleID") or item.get("applicationIdentifier")) == bundle_id
+    ]
+    if not device_id or len(matches) != 1:
+        return None
+    app_url = str(matches[0].get("url") or matches[0].get("path") or matches[0].get("bundleURL") or "").rstrip("/")
+    return (device_id, app_url) if app_url else None
+
+
+def process_identity_matches(payload: Any, pid: int, device_id: str, app_url: str) -> bool:
+    result = payload.get("result") if isinstance(payload, dict) else None
+    if not isinstance(result, dict) or result.get("deviceIdentifier") != device_id:
+        return False
+    processes = result.get("runningProcesses") or result.get("processes") or []
+    matches = [
+        item for item in processes
+        if isinstance(item, dict)
+        and str(item.get("processIdentifier") or item.get("pid")) == str(pid)
+    ]
+    if len(matches) != 1:
+        return False
+    executable = str(
+        matches[0].get("executable") or matches[0].get("executableURL") or matches[0].get("path") or ""
+    ).rstrip("/")
+    return executable.startswith(app_url + "/")
 
 
 def uuid_set(xcrun: str, path: str) -> set[str]:
@@ -436,6 +460,22 @@ def lldb_quote(value: str) -> str:
     if "\n" in value or "\r" in value or "\x00" in value:
         raise ValueError("LLDB command value contains a control character")
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def loaded_uuid_probe_command(expected_uuids: set[str]) -> str:
+    values = ",".join(json.dumps(item) for item in sorted(expected_uuids))
+    return "".join((
+        "script import lldb; ios_expected_uuids={",
+        values,
+        "}; ios_target=lldb.target; ios_main_name=ios_target.GetExecutable().GetFilename(); ",
+        "ios_loaded_main=[ios_module for ios_module in ios_target.modules ",
+        "if ios_module.GetFileSpec().GetFilename() == ios_main_name ",
+        "and ios_module.GetObjectFileHeaderAddress().GetLoadAddress(ios_target) ",
+        "!= lldb.LLDB_INVALID_ADDRESS]; print('__UE_IOS_LOADED_UUID_OK__' ",
+        "if len(ios_loaded_main) == 1 and ",
+        "(ios_loaded_main[0].GetUUIDString() or '').upper() in ios_expected_uuids ",
+        "else '__UE_IOS_LOADED_UUID_MISMATCH__')",
+    ))
 
 
 class DAPClient:
@@ -536,9 +576,35 @@ class DAPClient:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(f"DAP event timeout for {name}")
-                message = self.events.get(timeout=remaining)
+                try:
+                    message = self.events.get(timeout=remaining)
+                except queue.Empty as error:
+                    raise TimeoutError(f"DAP event timeout for {name}") from error
                 if message.get("event") == name:
                     return message
+                deferred.append(message)
+        finally:
+            for message in deferred:
+                self.events.put(message)
+
+    def output_marker(self, success: str, failure: str, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        deferred: list[dict[str, Any]] = []
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("DAP loaded-image UUID marker timed out")
+                try:
+                    message = self.events.get(timeout=remaining)
+                except queue.Empty as error:
+                    raise TimeoutError("DAP loaded-image UUID marker timed out") from error
+                body = message.get("body") or {}
+                output = str(body.get("output") or "").strip() if message.get("event") == "output" else ""
+                if output == success:
+                    return True
+                if output == failure:
+                    return False
                 deferred.append(message)
         finally:
             for message in deferred:
@@ -556,8 +622,29 @@ class DAPClient:
                 self.process.wait(timeout=2)
 
 
-def process_payload(args: argparse.Namespace) -> tuple[Any, bool]:
+def process_payload(args: argparse.Namespace) -> tuple[Any, bool, str | None]:
     with tempfile.TemporaryDirectory(prefix="ue-ios-process-probe-") as temporary:
+        app_output = Path(temporary) / "apps.json"
+        app_result = command([
+            args.xcrun,
+            "devicectl",
+            "device",
+            "info",
+            "apps",
+            "--device",
+            args.device,
+            "--bundle-id",
+            args.bundle_id,
+            "--quiet",
+            "--json-output",
+            str(app_output),
+        ], timeout=args.timeout)
+        if app_result.returncode != 0 or not app_output.is_file():
+            return None, False, None
+        identity = app_identity(read_json(app_output), args.bundle_id)
+        if identity is None:
+            return None, False, None
+        device_id, app_url = identity
         output = Path(temporary) / "processes.json"
         result = command([
             args.xcrun,
@@ -566,67 +653,173 @@ def process_payload(args: argparse.Namespace) -> tuple[Any, bool]:
             "info",
             "processes",
             "--device",
-            args.device,
+            device_id,
             "--quiet",
             "--json-output",
             str(output),
         ], timeout=args.timeout)
         if result.returncode != 0 or not output.is_file():
-            return None, False
+            return None, False, device_id
         payload = read_json(output)
-        return payload, process_identity_matches(payload, args.pid, args.bundle_id)
+        return payload, process_identity_matches(payload, args.pid, device_id, app_url), device_id
 
 
-def cli_attach_probe(args: argparse.Namespace, expected_uuids: set[str]) -> dict[str, bool]:
-    commands = [
-        "target create " + lldb_quote(args.binary),
-        "device select " + lldb_quote(args.device),
-        f"device process attach -p {args.pid}",
-        "thread list",
-        "image list -u -f -- " + lldb_quote(Path(args.binary).name),
-        "process detach",
-        "quit",
-    ]
-    argv = [args.xcrun, "lldb", "--batch"]
-    for item in commands:
-        argv.extend(["-o", item])
-    result = command(argv, timeout=args.timeout)
-    output = result.stdout + "\n" + result.stderr
-    loaded_uuids = {match.group(1).upper() for match in MODULE_UUID_RE.finditer(output)}
+def cli_attach_probe(args: argparse.Namespace, expected_uuids: set[str], device_id: str) -> dict[str, bool]:
+    process = subprocess.Popen(
+        [args.xcrun, "lldb"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    output = bytearray()
+    condition = threading.Condition()
+
+    def read_output() -> None:
+        assert process.stdout is not None
+        while True:
+            chunk = os.read(process.stdout.fileno(), 4096)
+            if not chunk:
+                break
+            with condition:
+                if len(output) < 4 * 1024 * 1024:
+                    output.extend(chunk[: 4 * 1024 * 1024 - len(output)])
+                condition.notify_all()
+
+    reader = threading.Thread(target=read_output, daemon=True)
+    reader.start()
+
+    def send(*commands: str) -> None:
+        if not process.stdin:
+            raise RuntimeError("LLDB CLI stdin is unavailable")
+        process.stdin.write(("\n".join(commands) + "\n").encode())
+        process.stdin.flush()
+
+    marker_index = 0
+
+    def marked(commands: list[str], timeout: float) -> str:
+        nonlocal marker_index
+        marker_index += 1
+        marker = f"__UE_IOS_CLI_PROBE_{marker_index}__"
+        with condition:
+            start = len(output)
+        send(*commands, "script print(" + json.dumps(marker) + ")")
+        deadline = time.monotonic() + timeout
+        with condition:
+            while marker.encode() not in output[start:]:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("LLDB CLI command marker timed out")
+                if process.poll() is not None:
+                    raise RuntimeError(f"LLDB CLI exited with {process.returncode}")
+                condition.wait(min(remaining, 0.25))
+            return bytes(output[start:]).decode("utf-8", "replace")
+
+    attached = False
+    threads = False
+    uuid_match = False
+    detached = False
+    exit_ok = False
+    deadline = time.monotonic() + args.timeout
+    try:
+        marked([
+            "settings set target.memory-module-load-level minimal",
+            "settings set symbols.enable-external-lookup false",
+            "target create " + lldb_quote(args.binary),
+            "device select " + lldb_quote(device_id),
+            f"device process attach -p {args.pid}",
+            "target symbols add " + lldb_quote(args.dsym),
+        ], min(args.timeout, 30))
+        while time.monotonic() < deadline and not (attached and threads and uuid_match):
+            time.sleep(2)
+            remaining = max(0.25, deadline - time.monotonic())
+            probe = marked([
+                "process status",
+                "thread list",
+                "image list -u -f -- " + lldb_quote(Path(args.binary).name),
+            ], min(remaining, 10))
+            loaded_uuids = {match.group(1).upper() for match in MODULE_UUID_RE.finditer(probe)}
+            attached = "Process" in probe and "stopped" in probe
+            threads = "thread #" in probe
+            uuid_match = bool(loaded_uuids) and loaded_uuids == expected_uuids
+        if attached:
+            detach_output = marked(["process detach"], min(max(0.25, deadline - time.monotonic()), 10))
+            detached = "detached" in detach_output.lower()
+        send("quit")
+        process.wait(timeout=min(max(0.25, deadline - time.monotonic()), 10))
+        exit_ok = process.returncode == 0
+    finally:
+        if process.poll() is None:
+            with contextlib.suppress(Exception):
+                send("process detach", "quit")
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=5)
+        if process.poll() is None:
+            process.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=2)
     return {
-        "exit_ok": result.returncode == 0,
-        "attached": "Process" in output and "stopped" in output,
-        "threads": "thread #" in output,
-        "loaded_image_uuid_match": bool(loaded_uuids) and loaded_uuids == expected_uuids,
-        "detached": "detached" in output.lower(),
+        "exit_ok": exit_ok,
+        "attached": attached,
+        "threads": threads,
+        "loaded_image_uuid_match": uuid_match,
+        "detached": detached,
     }
 
 
-def dap_attach_probe(args: argparse.Namespace) -> dict[str, Any]:
+def dap_attach_probe(
+    args: argparse.Namespace, expected_uuids: set[str], device_id: str
+) -> dict[str, Any]:
     client = DAPClient(args.adapter)
     attached = False
     disconnect_ack = False
     try:
         client.request("initialize", {
-            "adapterID": "lldb",
-            "clientID": "ue-ios-dap-probe",
-            "linesStartAt1": True,
+            "adapterID": "nvim-dap",
+            "clientID": "neovim",
+            "clientName": "neovim",
             "columnsStartAt1": True,
+            "linesStartAt1": True,
             "pathFormat": "path",
+            "supportsProgressReporting": True,
+            "supportsRunInTerminalRequest": True,
+            "supportsStartDebuggingRequest": True,
+            "supportsVariableType": True,
+            "locale": os.environ.get("LANG", "en_US"),
         }, args.timeout)
         attach_sequence = client.send("attach", {
             "name": "UE IOS protocol probe",
             "type": "lldb",
             "request": "attach",
             "stopOnEntry": True,
+            "cwd": str(Path(args.source).resolve().parent),
+            "timeout": max(240, int(args.timeout)),
+            "initCommands": [
+                "settings set stop-disassembly-display never",
+                "settings set target.inline-breakpoint-strategy always",
+                "settings set target.move-to-nearest-code true",
+                "settings set target.process.stop-on-sharedlibrary-events false",
+                "settings set target.memory-module-load-level partial",
+            ],
             "attachCommands": [
                 "target create " + lldb_quote(args.binary),
-                "device select " + lldb_quote(args.device),
+                "device select " + lldb_quote(device_id),
                 f"device process attach -p {args.pid}",
+                "target symbols add " + lldb_quote(args.dsym),
+            ],
+            "postRunCommands": [
+                "process status",
+                loaded_uuid_probe_command(expected_uuids),
             ],
         })
         client.event("initialized", args.timeout)
         attached = True
+        loaded_uuid_match = client.output_marker(
+            "__UE_IOS_LOADED_UUID_OK__",
+            "__UE_IOS_LOADED_UUID_MISMATCH__",
+            args.timeout,
+        )
+        if not loaded_uuid_match:
+            raise RuntimeError("loaded iOS executable UUID does not match the local debug artifact")
         breakpoint_response = client.request("setBreakpoints", {
             "source": {"path": str(Path(args.source).resolve())},
             "breakpoints": [{"line": args.line}],
@@ -644,8 +837,21 @@ def dap_attach_probe(args: argparse.Namespace) -> dict[str, Any]:
             thread_id = threads[0].get("id")
         if thread_id is None:
             raise RuntimeError("DAP returned no stopped thread")
-        client.request("continue", {"threadId": thread_id}, args.timeout)
-        stopped = client.event("stopped", args.hit_timeout)
+        max_bootstrap_stops = 8
+        stopped = initial_stop
+        for bootstrap_index in range(max_bootstrap_stops + 1):
+            stopped_body = stopped.get("body") or {}
+            reason = stopped_body.get("reason")
+            hit_ids = stopped_body.get("hitBreakpointIds") or []
+            if reason == "breakpoint" or hit_ids:
+                break
+            if bootstrap_index == max_bootstrap_stops:
+                raise RuntimeError(
+                    f"exceeded {max_bootstrap_stops} non-breakpoint bootstrap stops"
+                )
+            thread_id = stopped_body.get("threadId") or thread_id
+            client.request("continue", {"threadId": thread_id}, args.timeout)
+            stopped = client.event("stopped", args.hit_timeout)
         reason = (stopped.get("body") or {}).get("reason")
         stopped_thread = (stopped.get("body") or {}).get("threadId") or thread_id
         stack = client.request("stackTrace", {
@@ -668,6 +874,7 @@ def dap_attach_probe(args: argparse.Namespace) -> dict[str, Any]:
         disconnect_ack = True
         return {
             "attach_response": True,
+            "loaded_image_uuid_match": loaded_uuid_match,
             "breakpoint_verified": verified,
             "thread_count": len(threads),
             "stopped_reason": reason,
@@ -693,6 +900,7 @@ def attach(args: argparse.Namespace) -> int:
         "checks": {},
         "errors": [],
     }
+    canonical_device = ""
     try:
         for label, value in (("binary", args.binary), ("dsym", args.dsym), ("source", args.source)):
             if not Path(value).exists():
@@ -703,21 +911,25 @@ def attach(args: argparse.Namespace) -> int:
         payload["checks"]["uuid_count"] = len(binary_uuids)
         if binary_uuids != dsym_uuids:
             raise RuntimeError("host binary and dSYM UUIDs differ")
+        verified_dsym = command(
+            [args.xcrun, "dwarfdump", "--verify", "--quiet", args.dsym],
+            timeout=args.timeout,
+        )
+        payload["checks"]["dsym_verified"] = verified_dsym.returncode == 0
+        if verified_dsym.returncode != 0:
+            payload["status"] = "blocked"
+            raise RuntimeError("dSYM failed DWARF verification")
 
-        _, process_match = process_payload(args)
+        _, process_match, canonical_device = process_payload(args)
         payload["checks"]["process_identity_match"] = process_match
         if not process_match:
             raise RuntimeError("device process identity could not be proven")
 
-        cli = cli_attach_probe(args, binary_uuids)
-        payload["checks"]["lldb_cli"] = cli
-        if not all(cli.values()):
-            raise RuntimeError("LLDB CLI attach/thread/detach probe failed")
-
-        dap = dap_attach_probe(args)
+        dap = dap_attach_probe(args, binary_uuids, canonical_device)
         payload["checks"]["dap"] = dap
         if not (
             dap.get("attach_response")
+            and dap.get("loaded_image_uuid_match")
             and dap.get("breakpoint_verified")
             and dap.get("stopped_reason") == "breakpoint"
             and dap.get("source_frame_match")
@@ -725,7 +937,12 @@ def attach(args: argparse.Namespace) -> int:
         ):
             raise RuntimeError("raw DAP breakpoint/frame gate failed")
 
-        _, survived = process_payload(args)
+        cli = cli_attach_probe(args, binary_uuids, canonical_device)
+        payload["checks"]["lldb_cli"] = cli
+        if not all(cli.values()):
+            raise RuntimeError("LLDB CLI attach/thread/detach probe failed")
+
+        _, survived, _ = process_payload(args)
         payload["checks"]["app_survived_disconnect"] = survived
         if not survived:
             raise RuntimeError("application did not survive detach")
@@ -744,6 +961,7 @@ def attach(args: argparse.Namespace) -> int:
             args.dsym,
             args.source,
             args.adapter,
+            canonical_device,
         )[:240])
     emit(payload, args.output)
     return 1
@@ -769,9 +987,19 @@ def self_test(args: argparse.Namespace) -> int:
     devices = result_devices(fixture)
     assert len(devices) == 2
     assert len([item for item in devices if is_available_physical_ios(item)]) == 1
-    process_fixture = {"result": {"processes": [{"processIdentifier": 42, "bundleIdentifier": "com.example.game"}]}}
-    assert process_identity_matches(process_fixture, 42, "com.example.game")
-    assert not process_identity_matches(process_fixture, 43, "com.example.game")
+    app_fixture = {"result": {
+        "deviceIdentifier": "PRIVATE-DEVICE-ID",
+        "apps": [{"bundleIdentifier": "com.example.game", "url": "file:///private/Game.app"}],
+    }}
+    assert app_identity(app_fixture, "com.example.game") == (
+        "PRIVATE-DEVICE-ID", "file:///private/Game.app"
+    )
+    process_fixture = {"result": {
+        "deviceIdentifier": "PRIVATE-DEVICE-ID",
+        "runningProcesses": [{"processIdentifier": 42, "executable": "file:///private/Game.app/Game"}],
+    }}
+    assert process_identity_matches(process_fixture, 42, "PRIVATE-DEVICE-ID", "file:///private/Game.app")
+    assert not process_identity_matches(process_fixture, 43, "PRIVATE-DEVICE-ID", "file:///private/Game.app")
     assert MODULE_UUID_RE.search("[  0] 322CB148-C401-3EA0-A023-4B21A104D42F /tmp/Game")
     redacted = json.dumps(path_evidence("/private/example/Secret/Binary"))
     assert "/private/example" not in redacted

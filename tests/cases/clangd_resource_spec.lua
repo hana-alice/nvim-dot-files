@@ -115,7 +115,7 @@ t.describe("clangd controller: shared hysteresis -> reversible priority", functi
       foreground_active = false,
       delays = { 0, 1, 1 },
       schedule = function(fn) fn() end,
-      defer_fn = function(_, fn) fn() end,
+      defer_fn = function(fn, _) fn() end,
     })
     t.assert_true(control.done)
     t.assert_eq(control.attempts, 3)

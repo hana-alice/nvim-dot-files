@@ -1,0 +1,52 @@
+{
+  "checks": {
+    "app_survived_disconnect": true,
+    "dap": {
+      "attach_response": true,
+      "breakpoint_verified": true,
+      "disconnect_ack": true,
+      "loaded_image_uuid_match": true,
+      "source_frame_match": true,
+      "stopped_reason": "breakpoint",
+      "thread_count": 1
+    },
+    "dsym_verified": true,
+    "host_uuid_match": true,
+    "lldb_cli": {
+      "attached": true,
+      "detached": true,
+      "exit_ok": true,
+      "loaded_image_uuid_match": true,
+      "threads": true
+    },
+    "loaded_image_uuid_match": true,
+    "process_identity_match": true,
+    "uuid_count": 1
+  },
+  "errors": [],
+  "identity": {
+    "adapter": {
+      "digest": "5b3c0fcb8a37",
+      "name": "lldb-dap",
+      "system_path": "/Applications/Xcode.app/Contents/Developer/usr/bin/lldb-dap"
+    },
+    "binary": {
+      "digest": "d002f1b2ac63",
+      "name": "Client"
+    },
+    "bundle_digest": "2249f7739c06",
+    "device_digest": "5bb027e5444e",
+    "dsym": {
+      "digest": "9bda16dae1b6",
+      "name": "Client.dev.branch36.Launch.dSYM"
+    },
+    "pid_digest": "56b8877f3a51",
+    "source": {
+      "line": 4804,
+      "name": "LaunchEngineLoop.cpp"
+    }
+  },
+  "mode": "attach",
+  "schema": "ue-ios-dap-probe-v1",
+  "status": "passed"
+}

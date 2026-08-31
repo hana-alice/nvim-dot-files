@@ -23,3 +23,13 @@ adding `dap_attach` or `dap_launch` to the IOS target matrix. That requires a
 separate explicit `attach` run proving host/dSYM/loaded-image UUID equality,
 a verified breakpoint, a real breakpoint stop with the requested source frame,
 and non-terminating detach cleanup.
+
+The CoreDevice production gate writes three additional redacted artifacts:
+
+- `coredevice-raw-attach.current.result.json` from the strict CLI/raw-DAP probe;
+- `coredevice-production-attach.current.result.json` from the production handler in headless attach mode;
+- `coredevice-production-launch.current.result.json` from the production handler in headless debug-launch mode.
+
+These files must never be edited to `passed`. A passing artifact is written only by rerunning the corresponding
+probe with a `dwarfdump --verify --quiet`-clean dSYM and exact source/line. The current CoreDevice artifacts are
+such probe-generated passing results and include loaded-image UUID, breakpoint/frame, evaluation and cleanup gates.

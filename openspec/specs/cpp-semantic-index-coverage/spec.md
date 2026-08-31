@@ -29,6 +29,11 @@
 
 每个供导航消费的 generation SHALL 至少绑定 active target/platform/configuration、CDB 内容 fingerprint、toolchain identity、manifest gate、exact-command map 摘要与覆盖集合。导航请求开始后发生的 generation 切换 MUST 使旧响应 stale；旧 generation 的定义位置不得在新 generation 中自动生效。
 
+每个阶段产物 SHALL 在其 controlled CDB 与 index 产物确实生成后**立即**写出绑定
+`generation_id` / `build_key` / `cdb_source_signature` 的持久化 manifest。manifest 是“该产物属于
+哪一次 build”的自证，其写出 MUST NOT 依赖后续步骤（selection 提升、clangd 重启、其他阶段）是否
+成功——否则产物留在磁盘上却无法自证归属，readiness 只能依赖易失的进程内账本。
+
 #### Scenario: Generation identity survives a Nvim restart
 - **WHEN** active target、CDB 内容与 toolchain 均未变化，但 Lua table 的迭代顺序因新进程而改变
 - **THEN** generation fingerprint SHALL 保持完全相同
@@ -40,6 +45,12 @@
 - **THEN** clangd SHALL 直接消费这些持久化工件并为 UE C/C++ buffer 启动
 - **AND** 系统 MUST NOT 因新的 Lua 进程尚未执行 `UEPrepare` 而要求重复 prepare
 - **AND** 工件缺失、stale 或 tuple/build evidence 变化时 SHALL 继续 defer；同一进程内也必须重新验证
+
+#### Scenario: A phase produces artifacts but later delivery steps fail
+- **WHEN** 某阶段的 controlled CDB 与 index 产物已生成，但 selection 提升、clangd 重启或其他阶段
+  随后失败
+- **THEN** 该阶段的 manifest SHALL 已经落盘并可证明其 generation 归属
+- **AND** 后续进程 SHALL 能据此判定该产物可用或 stale，而不是把它视为不存在
 
 #### Scenario: Compile database changes during navigation
 - **WHEN** `gd` 发出后 active CDB fingerprint 发生变化，旧索引响应随后返回
@@ -55,6 +66,54 @@
 - **WHEN** controlled BackgroundIndex baseline、module AST 或 exact-command map 无法证明由当前 CDB/toolchain generation 产生
 - **THEN** 系统 SHALL 拒绝把该 baseline 作为语义 destination authority
 - **AND** 失败信息 SHALL 指明 generation/freshness 缺口，不得静默使用陈旧位置
+
+### Requirement: Readiness SHALL be provable from persisted artifacts, not only from in-process state
+
+索引就绪判定 MUST NOT 只依赖进程内/单文件的 `state` 账本。该账本会因进程中途退出、并发写入或
+状态文件损坏而丢失，而 controlled CDB、index 产物与 manifest 仍完好存在于磁盘。
+
+当 `state` 的 selection 或 artifact 记录缺失、类型错误或与磁盘不一致时，系统 SHALL 扫描当前 tuple
+的持久化 manifest，并在 `generation_id`、`build_key` 与 `cdb_source_signature` 均校验通过后重建
+selection。系统 MUST NOT 因账本丢失而要求用户重跑 `UEPrepare`。
+
+重建 MUST fail closed：manifest 缺失、无法解析、generation/build_key 不匹配，或其引用的产物文件
+不存在时，SHALL 继续判为非就绪并 defer，MUST NOT 猜测或降级校验。
+
+#### Scenario: State ledger is lost but artifacts remain on disk
+- **WHEN** `state.index_artifacts` 为空或类型错误，但该 tuple 的 manifest、controlled CDB 与
+  semantic CDB 仍存在且签名匹配当前 build
+- **THEN** 系统 SHALL 依据磁盘 manifest 重建 selection 并判定为 ready
+- **AND** 系统 MUST NOT 提示用户重跑 `UEPrepare`
+
+#### Scenario: Disk manifest does not match the active build
+- **WHEN** manifest 存在但其 `generation_id` / `build_key` / `cdb_source_signature` 与当前 tuple
+  或源 CDB 不匹配
+- **THEN** 系统 SHALL 判为 stale 并继续 defer
+- **AND** MUST NOT 用不匹配的 manifest 重建 selection
+
+#### Scenario: Manifest references a missing artifact
+- **WHEN** manifest 校验通过，但其引用的 index 产物或 background CDB 文件不存在
+- **THEN** 系统 SHALL 判为非就绪
+- **AND** MUST NOT 仅因 manifest 存在就宣称 ready
+
+### Requirement: A `ready` verdict SHALL be self-evidencing
+
+`ready` MUST 是可证伪的。系统报告 readiness 为 `ready` 时，active selection MUST 同时携带非空
+`index_path`、`artifact_fingerprint` 与 `coverage_level`，且 `index_path` 指向的文件 MUST 存在。
+
+任何内部矛盾的就绪状态（例如报 `ready` 却没有指向产物的证据）SHALL 被降级为非就绪并以可观测方式
+记录，MUST NOT 静默通过——假 `ready` 会让“已交付”不可证伪，并使下游误判索引可用。
+
+#### Scenario: Selection claims readiness without artifact evidence
+- **WHEN** readiness 计算得到 `ready`，但 selection 的 `index_path`、`artifact_fingerprint` 或
+  `coverage_level` 为空
+- **THEN** 系统 SHALL 将其降级为非就绪并附带可解释的 reason
+- **AND** SHALL 记录该矛盾以便诊断，MUST NOT 报告 `ready`
+
+#### Scenario: Selection references an artifact that no longer exists
+- **WHEN** selection 携带完整字段，但 `index_path` 指向的文件已被删除
+- **THEN** 系统 SHALL 判为非就绪
+- **AND** MUST NOT 依据陈旧 selection 宣称 ready
 
 ### Requirement: Definition misses SHALL distinguish incomplete coverage from semantic absence
 
@@ -200,6 +259,48 @@ platform 分片的有效产物（与 K27/C5b 的失效矩阵一致）。
 - **WHEN** controlled CDB 存在但其 generation 与当前源 CDB 签名不匹配，且无有效 manifest
 - **THEN** 该产物 SHALL 被视为失效，MUST NOT 被计入 coverage 或 readiness
 - **AND** 系统 SHALL 以可观测方式表明该产物已失效（而非静默忽略）
+
+### Requirement: Background index work SHALL yield to host CPU pressure
+
+后台受控索引构建 SHALL 在**启动前**评估宿主整体 CPU 负载，并在负载超过高水位时推迟启动，
+而不是无条件加压。静态并发预算（`-j` / 保留核数）只能防止“我们自己占满”，无法防止“在别人
+（外部编译器、其他工具链）已占满时我们继续加压”——共享机器上必须有动态准入。
+
+负载采样 MUST NOT 通过 spawn 子进程实现（周期性同步子进程往返会阻塞主循环，见 K40）。
+采样 SHALL 使用进程内可用的宿主统计信息，其开销 SHALL 可忽略。
+
+系统 MUST NOT 声称能保证宿主总体 CPU 低于任何阈值，也 MUST NOT 尝试挂起、降级或终止外部进程；
+契约仅限于**我们自己不在高负载期间主动启动新的重活**。
+
+#### Scenario: Host is under heavy external load when a phase becomes due
+- **WHEN** 某索引阶段的 deadline 到达，而宿主 CPU 使用率高于高水位
+- **THEN** 系统 SHALL 推迟该阶段启动，MUST NOT 启动新的构建子进程
+- **AND** 推迟原因 SHALL 可观测（进度/日志），MUST NOT 静默无响应
+
+#### Scenario: Load falls back after a deferral
+- **WHEN** 先前因高负载被推迟的阶段，其后宿主 CPU 回落到低水位以下
+- **THEN** 系统 SHALL 恢复该阶段的启动
+- **AND** 判定 SHALL 使用高/低双水位（滞回），MUST NOT 在单一阈值附近抖动式反复启停
+
+#### Scenario: A build is already running when load spikes
+- **WHEN** 构建已在进行中，随后宿主负载超过高水位
+- **THEN** 系统 SHALL 允许该构建继续完成，MUST NOT 杀掉它以致已完成的工作被浪费
+- **AND** 系统 SHALL NOT 在此期间启动额外阶段
+
+#### Scenario: Host stays busy for a long time
+- **WHEN** 宿主 CPU 长期高于高水位
+- **THEN** 推迟 SHALL 有上限，超过上限后 SHALL 允许交付推进
+- **AND** 系统 MUST NOT 因外部负载而无限期饿死索引交付
+
+#### Scenario: Load sampling is unavailable
+- **WHEN** 宿主 CPU 统计不可读（平台不支持或采样失败）
+- **THEN** 系统 SHALL 视为无压力并按既有 deadline 正常启动
+- **AND** MUST NOT 因无法测量而永久阻塞交付
+
+#### Scenario: Throttling is disabled by configuration
+- **WHEN** 用户在配置中关闭 CPU 准入控制
+- **THEN** 系统 SHALL 完全按既有 deadline 行为启动，不做负载判定
+- **AND** 阈值与开关 SHALL 可通过既有配置机制调整
 
 ### Requirement: The clangd process SHALL be constrained under host CPU pressure
 

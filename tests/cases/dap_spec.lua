@@ -246,11 +246,375 @@ t.describe("ue.dap.ios: legacy MobileDevice lldb-dap config", function()
   end)
 
   t.it("freezes the selected Xcode adapter instead of using Homebrew fallback", function()
-    local source = table.concat(vim.fn.readfile(
-      vim.fn.stdpath("config") .. "/lua/ue/dap/ios.lua"), "\n")
+    local source = table.concat({
+      table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue/dap/ios.lua"), "\n"),
+      table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue/dap/_ios_runtime.lua"), "\n"),
+    }, "\n")
     t.assert_contains(source, 'runtime.tools.xcrun, "--find", "lldb-dap"')
     t.assert_contains(source, "runtime.adapter")
     t.assert_contains(source, "initialize_timeout_sec = 90")
+  end)
+end)
+
+t.describe("ue.dap.ios: planned CoreDevice lldb-dap config", function()
+  local ios = require("ue.dap.ios")
+
+  local function build_coredevice_config(opts)
+    opts = vim.tbl_extend("force", {
+      backend = "coredevice",
+      binary = "/Project Root/Binaries/IOS/SampleGame",
+      dsym = "/Project Root/Binaries/IOS/SampleGame.dSYM",
+      bundle_id = "com.example.samplegame",
+      cwd = "/Project Root",
+      device_id = "CORE-DEVICE-1",
+      expected_uuids = { "322CB148-C401-3EA0-A023-4B21A104D42F" },
+      mode = "attach",
+      pid = 991,
+    }, opts or {})
+
+    if type(ios._build_coredevice_config_for_test) == "function" then
+      return ios._build_coredevice_config_for_test(opts)
+    end
+    if type(ios._build_config_for_test) == "function" then
+      return ios._build_config_for_test(opts)
+    end
+    error("ue.dap.ios must expose _build_coredevice_config_for_test() or backend-aware _build_config_for_test()")
+  end
+
+  t.it("launch config freezes the suspended CoreDevice process and uses device attach commands", function()
+    local cfg, err = build_coredevice_config({ mode = "launch", pid = 991 })
+    t.assert_nil(err)
+    t.assert_eq(cfg.request, "attach")
+    t.assert_eq(cfg.stopOnEntry, true)
+    t.assert_eq(cfg._ue_session_owner, "ios")
+    t.assert_eq(cfg._ue_session_operation, "launch")
+    t.assert_eq(cfg._ue_ios_backend, "coredevice")
+    t.assert_eq(cfg._ue_device_id, "CORE-DEVICE-1")
+    t.assert_eq(cfg._ue_process_id, 991)
+
+    local all = table.concat(cfg.attachCommands, "\n")
+    local target_i = assert(all:find("target create", 1, true))
+    local device_i = assert(all:find("device select", 1, true))
+    local attach_i = assert(all:find("device process attach -p 991", 1, true))
+    local symbols_i = assert(all:find("target symbols add", 1, true))
+    t.assert_true(target_i < device_i and device_i < attach_i and attach_i < symbols_i)
+    t.assert_contains(all, 'target symbols add "/Project Root/Binaries/IOS/SampleGame.dSYM"')
+    t.assert_contains(all, "CORE-DEVICE-1")
+    local post = table.concat(cfg.postRunCommands, "\n")
+    local status_i = assert(post:find("process status", 1, true))
+    local uuid_i = assert(post:find("GetUUIDString", 1, true))
+    t.assert_true(status_i < uuid_i)
+    t.assert_contains(post, "__UE_IOS_LOADED_UUID_OK__")
+    t.assert_contains(post, "__UE_IOS_LOADED_UUID_MISMATCH__")
+    t.assert_contains(post, "len(ios_loaded_main) == 1")
+    t.assert_false(all:find("platform select remote-ios", 1, true) ~= nil)
+    t.assert_false(all:find("ConnectRemote", 1, true) ~= nil)
+    t.assert_false(all:find("RemoteLaunch", 1, true) ~= nil)
+    t.assert_false(all:find("ios-deploy", 1, true) ~= nil)
+  end)
+
+  t.it("ordinary attach uses the same frozen owner/backend/device/pid metadata", function()
+    local cfg, err = build_coredevice_config({ mode = "attach", pid = 4242 })
+    t.assert_nil(err)
+    t.assert_eq(cfg._ue_session_owner, "ios")
+    t.assert_eq(cfg._ue_session_operation, "attach")
+    t.assert_eq(cfg._ue_ios_backend, "coredevice")
+    t.assert_eq(cfg._ue_device_id, "CORE-DEVICE-1")
+    t.assert_eq(cfg._ue_process_id, 4242)
+
+    local all = table.concat(cfg.attachCommands, "\n")
+    local target_i = assert(all:find("target create", 1, true))
+    local device_i = assert(all:find("device select", 1, true))
+    local attach_i = assert(all:find("device process attach -p 4242", 1, true))
+    local symbols_i = assert(all:find("target symbols add", 1, true))
+    t.assert_true(target_i < device_i and device_i < attach_i and attach_i < symbols_i)
+    t.assert_false(all:find("remote-ios", 1, true) ~= nil)
+    t.assert_false(all:find("RemoteAttachToProcessWithID", 1, true) ~= nil)
+  end)
+
+  t.it("CoreDevice config does not require legacy bridge-only symbols or port inputs", function()
+    local cfg, err = build_coredevice_config({
+      binary = "/Project Root/Binaries/IOS/SampleGame",
+      bundle_id = "com.example.samplegame",
+      cwd = "/Project Root",
+      device_id = "CORE-DEVICE-1",
+      mode = "attach",
+      pid = 991,
+    })
+    t.assert_nil(err)
+    t.assert_eq(cfg._ue_ios_backend, "coredevice")
+
+    local all = table.concat(cfg.attachCommands, "\n")
+    t.assert_false(all:find("DeviceSupport", 1, true) ~= nil)
+    t.assert_false(all:find("127.0.0.1", 1, true) ~= nil)
+    t.assert_false(all:find("ios-deploy", 1, true) ~= nil)
+  end)
+end)
+
+t.describe("ue.dap._ios_process: CoreDevice JSON parsers", function()
+  local ios_process = require("ue.dap._ios_process")
+
+  t.it("parses one exact CoreDevice installed app and rejects duplicates", function()
+    local app, err = ios_process.parse_coredevice_apps(
+      vim.json.encode({
+        result = {
+          deviceIdentifier = "CORE-DEVICE-1",
+          installedApplications = {
+            { bundleIdentifier = "com.example.other", url = "file:///private/Other.app" },
+            { bundleID = "com.example.samplegame", bundleURL = "file:///private/SampleGame.app" },
+          },
+        },
+      }),
+      {
+        canonical_device_id = "CORE-DEVICE-1",
+        bundle_id = "com.example.samplegame",
+      }
+    )
+    local duplicate, duplicate_err = ios_process.parse_coredevice_apps(
+      vim.json.encode({
+        result = {
+          deviceIdentifier = "CORE-DEVICE-1",
+          apps = {
+            { bundleIdentifier = "com.example.samplegame", url = "file:///private/A.app" },
+            { applicationIdentifier = "com.example.samplegame", path = "file:///private/B.app" },
+          },
+        },
+      }),
+      {
+        canonical_device_id = "CORE-DEVICE-1",
+        bundle_id = "com.example.samplegame",
+      }
+    )
+
+    t.assert_nil(err)
+    t.assert_eq(app.device_id, "CORE-DEVICE-1")
+    t.assert_eq(app.bundle_id, "com.example.samplegame")
+    t.assert_eq(app.app_url, "file:///private/SampleGame.app")
+    t.assert_nil(duplicate)
+    t.assert_contains(duplicate_err, "matched 2 installed apps")
+  end)
+
+  t.it("fails closed on CoreDevice app device mismatch", function()
+    local app, err = ios_process.parse_coredevice_apps(
+      vim.json.encode({
+        result = {
+          deviceIdentifier = "OTHER-DEVICE",
+          installedApplications = {
+            { bundleIdentifier = "com.example.samplegame", url = "file:///private/SampleGame.app" },
+          },
+        },
+      }),
+      {
+        canonical_device_id = "CORE-DEVICE-1",
+        bundle_id = "com.example.samplegame",
+      }
+    )
+    t.assert_nil(app)
+    t.assert_contains(err, "device identity mismatch")
+  end)
+
+  t.it("parses CoreDevice launch aliases and rejects nonpositive or mismatched identities", function()
+    local launched, err = ios_process.parse_coredevice_launch(
+      vim.json.encode({
+        result = {
+          targetDeviceIdentifier = "CORE-DEVICE-1",
+          launchedProcess = {
+            applicationIdentifier = "com.example.samplegame",
+            pid = 991,
+          },
+        },
+      }),
+      {
+        canonical_device_id = "CORE-DEVICE-1",
+        bundle_id = "com.example.samplegame",
+      }
+    )
+    local bad_pid, bad_pid_err = ios_process.parse_coredevice_launch(
+      vim.json.encode({
+        result = {
+          deviceIdentifier = "CORE-DEVICE-1",
+          process = {
+            bundleIdentifier = "com.example.samplegame",
+            processIdentifier = 0,
+          },
+        },
+      }),
+      {
+        canonical_device_id = "CORE-DEVICE-1",
+        bundle_id = "com.example.samplegame",
+      }
+    )
+    local mismatch, mismatch_err = ios_process.parse_coredevice_launch(
+      vim.json.encode({
+        result = {
+          deviceIdentifier = "CORE-DEVICE-1",
+          process = {
+            bundleIdentifier = "com.example.other",
+            processIdentifier = 991,
+          },
+        },
+      }),
+      {
+        canonical_device_id = "CORE-DEVICE-1",
+        bundle_id = "com.example.samplegame",
+      }
+    )
+
+    t.assert_nil(err)
+    t.assert_eq(launched.device_id, "CORE-DEVICE-1")
+    t.assert_eq(launched.bundle_id, "com.example.samplegame")
+    t.assert_eq(launched.process_id, 991)
+    t.assert_nil(bad_pid)
+    t.assert_contains(bad_pid_err, "positive PID")
+    t.assert_nil(mismatch)
+    t.assert_contains(mismatch_err, "bundle identity mismatch")
+  end)
+
+  t.it("parses exact running processes, reports absence, and rejects duplicates", function()
+    local exact, exact_err = ios_process.parse_coredevice_processes(
+      vim.json.encode({
+        result = {
+          deviceIdentifier = "CORE-DEVICE-1",
+          runningProcesses = {
+            { processIdentifier = 991, executableURL = "file:///private/SampleGame.app/SampleGame" },
+          },
+        },
+      }),
+      {
+        app_url = "file:///private/SampleGame.app",
+        canonical_device_id = "CORE-DEVICE-1",
+      }
+    )
+    local absent, absent_err = ios_process.parse_coredevice_processes(
+      vim.json.encode({
+        result = {
+          deviceIdentifier = "CORE-DEVICE-1",
+          runningProcesses = {},
+        },
+      }),
+      {
+        app_url = "file:///private/SampleGame.app",
+        canonical_device_id = "CORE-DEVICE-1",
+      }
+    )
+    local duplicate, duplicate_err = ios_process.parse_coredevice_processes(
+      vim.json.encode({
+        result = {
+          deviceIdentifier = "CORE-DEVICE-1",
+          runningProcesses = {
+            { processIdentifier = 991, executable = "file:///private/SampleGame.app/SampleGame" },
+            { processIdentifier = 992, path = "file:///private/SampleGame.app/SampleGame" },
+          },
+        },
+      }),
+      {
+        app_url = "file:///private/SampleGame.app",
+        canonical_device_id = "CORE-DEVICE-1",
+      }
+    )
+
+    t.assert_nil(exact_err)
+    t.assert_false(exact.absent)
+    t.assert_eq(exact.process_id, 991)
+    t.assert_eq(exact.executable, "file:///private/SampleGame.app/SampleGame")
+    t.assert_nil(absent_err)
+    t.assert_true(absent.absent)
+    t.assert_nil(duplicate)
+    t.assert_contains(duplicate_err, "matched 2 running processes")
+  end)
+
+  t.it("treats PID reuse as absence and rejects nonpositive or duplicate pid lookups", function()
+    local reused, reused_err = ios_process.parse_coredevice_processes(
+      vim.json.encode({
+        result = {
+          deviceIdentifier = "CORE-DEVICE-1",
+          processes = {
+            { pid = 991, executable = "file:///private/Other.app/Other" },
+          },
+        },
+      }),
+      {
+        app_url = "file:///private/SampleGame.app",
+        canonical_device_id = "CORE-DEVICE-1",
+        pid = 991,
+      }
+    )
+    local missing_pid, missing_pid_err = ios_process.parse_coredevice_processes(
+      vim.json.encode({
+        result = {
+          deviceIdentifier = "CORE-DEVICE-1",
+          processes = {},
+        },
+      }),
+      {
+        app_url = "file:///private/SampleGame.app",
+        canonical_device_id = "CORE-DEVICE-1",
+        pid = 991,
+      }
+    )
+    local bad_pid, bad_pid_err = ios_process.parse_coredevice_processes(
+      vim.json.encode({
+        result = {
+          deviceIdentifier = "CORE-DEVICE-1",
+          processes = {},
+        },
+      }),
+      {
+        app_url = "file:///private/SampleGame.app",
+        canonical_device_id = "CORE-DEVICE-1",
+        pid = 0,
+      }
+    )
+    local duplicate_pid, duplicate_pid_err = ios_process.parse_coredevice_processes(
+      vim.json.encode({
+        result = {
+          deviceIdentifier = "CORE-DEVICE-1",
+          processes = {
+            { pid = 991, executable = "file:///private/SampleGame.app/SampleGame" },
+            { processIdentifier = 991, executableURL = "file:///private/SampleGame.app/SampleGame" },
+          },
+        },
+      }),
+      {
+        app_url = "file:///private/SampleGame.app",
+        canonical_device_id = "CORE-DEVICE-1",
+        pid = 991,
+      }
+    )
+
+    t.assert_nil(reused_err)
+    t.assert_true(reused.absent)
+    t.assert_true(reused.reused)
+    t.assert_eq(reused.process_id, 991)
+    t.assert_nil(missing_pid_err)
+    t.assert_true(missing_pid.absent)
+    t.assert_nil(bad_pid)
+    t.assert_contains(bad_pid_err, "requires a positive PID")
+    t.assert_nil(duplicate_pid)
+    t.assert_contains(duplicate_pid_err, "duplicate PID")
+  end)
+
+  t.it("normalizes and compares UUID sets from dwarfdump output", function()
+    local uuids, err = ios_process.parse_uuid_output(table.concat({
+      "UUID: 322cb148-c401-3ea0-a023-4b21a104d42f (arm64) /tmp/SampleGame",
+      "UUID: 322CB148-C401-3EA0-A023-4B21A104D42F (arm64e) /tmp/SampleGame.dSYM",
+      "UUID: 2f18f0f2-c2df-4d84-8e50-2f51ec0ad481 (arm64) /tmp/Helper",
+    }, "\n"))
+    local none, none_err = ios_process.parse_uuid_output("not a uuid line")
+
+    t.assert_nil(err)
+    t.assert_eq(#uuids, 2)
+    t.assert_eq(uuids[1], "2F18F0F2-C2DF-4D84-8E50-2F51EC0AD481")
+    t.assert_eq(uuids[2], "322CB148-C401-3EA0-A023-4B21A104D42F")
+    t.assert_true(ios_process.uuid_sets_equal(uuids, {
+      "2F18F0F2-C2DF-4D84-8E50-2F51EC0AD481",
+      "322CB148-C401-3EA0-A023-4B21A104D42F",
+    }))
+    t.assert_false(ios_process.uuid_sets_equal(uuids, {
+      "322CB148-C401-3EA0-A023-4B21A104D42F",
+    }))
+    t.assert_nil(none)
+    t.assert_contains(none_err, "no UUID")
   end)
 end)
 

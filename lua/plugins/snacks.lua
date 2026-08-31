@@ -62,6 +62,8 @@ local function with_glob(opts, globs)
 end
 
 -- Keep grep/files history, but open pickers blank by default.
+local GREP_HISTORY_SOURCES = { "ue_grep_csearch", "grep", "ue_grep_rg" }
+
 local function history_record_query(record)
   if type(record) ~= "table" then
     return ""
@@ -209,19 +211,21 @@ end
 local function grep_history_items()
   local items = {}
   local seen = {}
-  for _, record in ipairs(picker_history_records("grep")) do
-    local query = history_record_query(record)
-    if query ~= "" and not seen[query] then
-      seen[query] = true
-      items[#items + 1] = {
-        text = query,
-        query = query,
-        live = record.live == true,
-        preview = {
+  for _, source in ipairs(GREP_HISTORY_SOURCES) do
+    for _, record in ipairs(picker_history_records(source)) do
+      local query = history_record_query(record)
+      if query ~= "" and not seen[query] then
+        seen[query] = true
+        items[#items + 1] = {
           text = query,
-          ft = "regex",
-        },
-      }
+          query = query,
+          live = record.live == true,
+          preview = {
+            text = query,
+            ft = "regex",
+          },
+        }
+      end
     end
   end
   return items
@@ -381,7 +385,14 @@ end
 
 local function ue_clear_picker_history()
   local ok_files, err_files = clear_picker_history("files")
-  local ok_grep, err_grep = clear_picker_history("grep")
+  local ok_grep, err_grep = true, nil
+  for _, source in ipairs(GREP_HISTORY_SOURCES) do
+    local ok, err = clear_picker_history(source)
+    if not ok then
+      ok_grep = false
+      err_grep = err_grep or err
+    end
+  end
   if not ok_files or not ok_grep then
     require("utils.log").notify_error("snacks", err_files or err_grep or "Failed to clear picker history")
     return

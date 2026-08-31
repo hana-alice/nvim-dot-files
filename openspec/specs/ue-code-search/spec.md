@@ -283,6 +283,21 @@ csearch trigram 索引 SHALL 全平台共用一份，路径为 `csearch/csearch.
 - **THEN** 标题 SHALL 包含后端标识 `[csearch]`
 - **AND** 标题 SHALL 包含当前 scope（全工程 / 当前模块 / 插件 / 目录）
 
+### Requirement: csearch queries SHALL participate in grep history
+
+`<leader>/` 的 csearch picker SHALL 将非空查询持久化到其 Snacks picker history；
+`<leader>sH` SHALL 合并展示 csearch 与显式 rg picker 的查询历史并按查询文本去重。
+清理 grep history 的动作 SHALL 同时清空这些 history source，不能留下只对 csearch 生效的隐形记录。
+
+#### Scenario: 查看 csearch 搜索历史
+- **WHEN** 用户在 `<leader>/` 中执行非空 csearch 查询并关闭 picker，随后触发 `<leader>sH`
+- **THEN** 历史面板 SHALL 展示该 csearch 查询
+- **AND** 同一查询同时存在于 rg history 时 SHALL 只展示一次
+
+#### Scenario: 清理搜索历史
+- **WHEN** 用户触发 picker history 清理动作
+- **THEN** csearch 与显式 rg 的 grep history SHALL 同时清空
+
 ### Requirement: `<leader>/` SHALL 提供可视化搜索修饰开关
 
 `<leader>/` 面板 SHALL 提供可视化的 literal / 大小写 / 全词 / 正则开关（无需用户手输 `-- -w/-s/-F`），默认 SHALL 为 literal；开关状态 SHALL 在标题栏可见，切换后 SHALL 以新修饰重跑当前搜索。开关 SHALL 翻译为底层后端等价语义。literal 模式 SHALL 只转义 RE2 真正的 metacharacter，并 SHALL 以精确 match span 驱动预览高亮，不能让 Snacks/Vim 再把用户原始输入解释为另一层 regex。

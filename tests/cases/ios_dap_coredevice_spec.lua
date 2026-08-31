@@ -71,7 +71,7 @@ local function bootstrap_system(calls)
 end
 
 t.describe("ue.dap iOS CoreDevice runtime", function()
-  t.it("freezes explicit CoreDevice inputs without requiring legacy tools", function()
+  t.it("freezes explicit CoreDevice inputs with real xcrun or fails closed without it", function()
     local root = vim.fn.tempname() .. "-ios-runtime"
     local binary = root .. "/Binaries/IOS/SampleGame"
     local dsym = binary .. ".dSYM"
@@ -82,6 +82,7 @@ t.describe("ue.dap iOS CoreDevice runtime", function()
     vim.fn.writefile({ "int sample = 1;" }, source)
 
     local roots = { project = root }
+    local xcrun = vim.fn.exepath("xcrun")
     local runtime, err = require("ue.dap._ios_runtime").resolve({
       device_backend = "coredevice",
       device_id = "DEVICE-1",
@@ -90,8 +91,15 @@ t.describe("ue.dap iOS CoreDevice runtime", function()
       dsym = dsym,
       source = source,
       source_roots = roots,
-      xcrun = vim.fn.exepath("true"),
+      xcrun = xcrun ~= "" and xcrun or nil,
     })
+
+    if xcrun == "" then
+      t.assert_nil(runtime)
+      t.assert_contains(err, "xcrun is not installed or not executable")
+      vim.fn.delete(root, "rf")
+      return
+    end
 
     t.assert_nil(err)
     t.assert_eq(runtime.backend, "coredevice")

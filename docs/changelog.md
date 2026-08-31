@@ -47,6 +47,41 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-08-31 — Surface csearch queries in grep history
+
+**Task**
+
+修复 `<leader>/` 的 csearch 查询已由 Snacks 持久化、但 `<leader>sH` 历史面板完全看不到的问题。
+
+**Implemented**
+
+- `lua/plugins/snacks.lua` 统一读取 csearch、常规 grep 与旧 rg picker 的 history source，按查询文本去重；
+  picker history 清理动作同步清空这些 grep source，不再留下隐形 csearch 记录。
+- `tests/cases/grep_cache_spec.lua` 用隔离的 Snacks history 替身锁住 csearch/rg 合并展示与清理行为；
+  用例在修复前分别以“只显示 1/2 条”和“未清理 csearch store”稳定失败。
+- `tests/cases/ios_dap_coredevice_spec.lua` 处置全量回归暴露的既有 Windows 红灯：只有真实 `xcrun`
+  可用时验证成功冻结路径，否则断言 CoreDevice resolver fail closed；不再用其他 executable 冒充 `xcrun`。
+- `openspec/specs/ue-code-search/spec.md` 同步 csearch 查询进入统一 grep history、去重与共同清理的可观察契约。
+
+**Pitfalls / Gotchas**
+
+- Snacks 按 picker `source` 分文件保存 history；csearch 使用 `ue_grep_csearch`，原历史面板却只读取 `grep`，
+  所以磁盘记录一直存在，缺失发生在读取路由而非写入。
+- 宿主相关回归不能靠注入无关 executable 让断言通过；Windows 没有真实 `xcrun` 时应验证 fail-closed。
+
+**Validation**
+
+- 修复前：`grep_cache` 基线 29/29；新增回归后 29/31（2 个预期失败）。修复后：`grep_cache` 31/31、
+  `smoke` 19/19、`keymaps` 58/58、`structure` 71/71、`ios_dap_coredevice` 10/10、`dap` 94/94。
+- 全量首次运行 1324/1325，唯一失败为 Windows 缺少 `xcrun` 时旧用例注入 `true` 失败；按宿主能力守卫
+  修正后全量 `nvim --headless -l tests/run.lua`：1325/1325。
+- `stylua --check` 未运行：本机未安装 `stylua`；相关 Lua 文件均已被上述 headless 用例实际加载。
+- spec 一致性：已同步 `ue-code-search` 主规格，无独立 delta change。
+
+**Follow-ups**
+
+- 无。
+
 ### 2026-08-27 — Keep clangd discovery retries callable after history reconciliation
 
 **Task**

@@ -114,6 +114,68 @@ t.describe("UE grep <leader>/ csearch-only（从不加 rg）", function()
     -- 新的 csearch-only 错误路径就位
     t.assert_contains(content, "csearch-only and will not")
     t.assert_contains(content, "Run :UEPrepare")
+    t.assert_contains(content, "matcher = grouping_enabled and { sort = false } or nil")
+  end)
+end)
+
+t.describe("Snacks picker clipboard paste keeps live search separate", function()
+  local function paste_action()
+    local root = vim.fn.stdpath("config"):gsub("\\", "/")
+    local spec = dofile(root .. "/lua/plugins/snacks.lua")
+    local opts = spec[1].opts(nil, {})
+    return opts.picker.actions.paste_clipboard
+  end
+
+  local function paste_into(live)
+    local old_clipboard = vim.fn.getreg("+")
+    local win = vim.api.nvim_get_current_win()
+    local buf = vim.api.nvim_win_get_buf(win)
+    local previous = vim.api.nvim_buf_get_lines(buf, 0, 1, false)
+    local previous_cursor = vim.api.nvim_win_get_cursor(win)
+    local previous_modified = vim.bo[buf].modified
+    local captured = {}
+    local finds = 0
+
+    vim.api.nvim_buf_set_lines(buf, 0, 1, false, { "" })
+    vim.api.nvim_win_set_cursor(win, { 1, 0 })
+    vim.fn.setreg("+", "pasted-query")
+
+    local ok, err = xpcall(function()
+      paste_action()({
+        opts = { live = live },
+        input = {
+          win = { win = win },
+          get = function() return "" end,
+          set = function(_, pattern, search)
+            captured.pattern = pattern
+            captured.search = search
+            vim.api.nvim_buf_set_lines(buf, 0, 1, false, { search or pattern or "" })
+          end,
+        },
+        find = function() finds = finds + 1 end,
+      })
+    end, debug.traceback)
+
+    vim.fn.setreg("+", old_clipboard)
+    vim.api.nvim_buf_set_lines(buf, 0, 1, false, previous)
+    vim.api.nvim_win_set_cursor(win, previous_cursor)
+    vim.bo[buf].modified = previous_modified
+    if not ok then error(err) end
+    return captured, finds
+  end
+
+  t.it("live picker paste updates search without creating a duplicate pattern tag", function()
+    local captured, finds = paste_into(true)
+    t.assert_eq(captured.pattern, nil)
+    t.assert_eq(captured.search, "pasted-query")
+    t.assert_eq(finds, 1)
+  end)
+
+  t.it("non-live picker paste continues to update the matcher pattern", function()
+    local captured, finds = paste_into(false)
+    t.assert_eq(captured.pattern, "pasted-query")
+    t.assert_eq(captured.search, nil)
+    t.assert_eq(finds, 1)
   end)
 end)
 
@@ -221,23 +283,26 @@ t.describe("UE grep 结果信息架构与预览定位", function()
   t.it("文件分组只标注真实命中，不插入不可预览的伪 header item", function()
     local items = {
       { file = "C:/UE/Game/Source/Foo.cpp", pos = { 12, 3 }, line = "first hit" },
-      { file = "C:/UE/Game/Source/Foo.cpp", pos = { 13, 5 }, line = "second hit" },
+      { file = "C:/UE/Game/Source/Foo.cpp", pos = { 13, 5 }, line = "middle hit" },
+      { file = "C:/UE/Game/Source/Foo.cpp", pos = { 14, 7 }, line = "last hit" },
     }
     local got = ue._grep_annotate_file_group_for_test(items, {
       engine_root = "C:/UE",
       project_root = "C:/UE/Game",
     })
 
-    t.assert_eq(#got, 2, "两条命中只能产生两条 picker item")
+    t.assert_eq(#got, 3, "三条命中只能产生三条 picker item")
     t.assert_eq(got[1].file, items[1].file, "首项仍是可跳转的真实命中")
     t.assert_eq(got[1]._grep_group.index, 1)
-    t.assert_eq(got[1]._grep_group.count, 2)
+    t.assert_eq(got[1]._grep_group.count, 3)
     t.assert_eq(got[1]._grep_group.scope, "Project")
     t.assert_eq(got[1]._grep_group.path, "Source/Foo.cpp")
     t.assert_eq(got[2]._grep_group.index, 2)
+    t.assert_eq(got[3]._grep_group.index, 3)
 
     local first = ue._grep_format_grouped_for_test(got[1])
-    local second = ue._grep_format_grouped_for_test(got[2])
+    local middle = ue._grep_format_grouped_for_test(got[2])
+    local last = ue._grep_format_grouped_for_test(got[3])
     local function text(chunks)
       local parts = {}
       for _, chunk in ipairs(chunks) do parts[#parts + 1] = chunk[1] end
@@ -245,9 +310,12 @@ t.describe("UE grep 结果信息架构与预览定位", function()
     end
     t.assert_contains(text(first), "Project")
     t.assert_contains(text(first), "Source/Foo.cpp")
-    t.assert_contains(text(first), "(2)")
+    t.assert_contains(text(first), "(3)")
     t.assert_contains(text(first), "first hit")
-    t.assert_contains(text(second), "second hit")
+    t.assert_contains(text(middle), "├")
+    t.assert_contains(text(middle), "middle hit")
+    t.assert_contains(text(last), "└")
+    t.assert_contains(text(last), "last hit")
   end)
 
   t.it("literal 命中提供精确 end_pos，preview 不再把 raw 输入当 Vim regex", function()

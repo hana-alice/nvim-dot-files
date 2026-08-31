@@ -47,6 +47,68 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-08-31 — Keep csearch file groups stable
+
+**Task**
+
+完善 `<leader>/` 按文件分组的稳定性与视觉边界，避免部分查询路径把同一文件的结果打散。
+
+**Implemented**
+
+- 分组启用时给 csearch picker 设置 `matcher.sort=false`：保留 csearch 的文件连续 source order，
+  matcher 仍可过滤，但不再按相关度重新排名。
+- 组内中间命中继续显示 `├`，最后一条命中改为 `└`；所有行仍是真实、可跳转、可预览的命中。
+- `grep_cache` 锁定 matcher 接线和首行 / 中间行 / 末行的分组呈现；主 spec 同步查询恢复路径下的
+  连续分组契约。
+
+**Pitfalls / Gotchas**
+
+- csearch 输出实测与上游源码均表明结果按文件连续交付；不稳定来自 Snacks 在 matcher pattern 非空时
+  按 score 重排，所以它只在粘贴或恢复出非空 matcher 状态等路径上显现为“有时”发生。
+- 未改为 picker 端全量按文件排序：这会破坏流式首屏延迟，且 Snacks 的有界结果列表不能保证大结果集
+  的全局排序。这里固定已有 source order 即可。
+
+**Validation**
+
+- 新回归修复前 `grep_cache`：31/33（matcher 接线与组尾标记按预期失败）；修复后：33/33。
+- `smoke`：19/19；`structure`：71/71；OpenSpec strict：39/39；全量回归：1327/1327。
+- 首次全量回归因 `ue.lua` 行数 ratchet 为 1326/1327；将同一逻辑压回冻结的 10562 行后重跑全绿，
+  未上调门限。
+- `stylua --check` 未运行：本机未安装 `stylua`；相关 Lua 文件由定向与全量 headless 用例实际加载。
+- spec 一致性：已同步 `ue-code-search` 主 spec，覆盖 source order、query restore 与组尾标记。
+
+**Follow-ups**
+
+- 无。
+
+### 2026-08-31 — Keep picker paste out of the hidden matcher
+
+**Task**
+
+修复 `<leader>/` 输入框用 `<C-v>` 粘贴后，左侧又出现一个与粘贴内容相同的 tag。
+
+**Implemented**
+
+- live Snacks picker 粘贴时只更新 finder `search`；non-live picker 只更新 matcher `pattern`，不再把同一
+  剪贴板文本同时写入两个字段。
+- `grep_cache` 新增 live/non-live 行为回归，并恢复夹具修改过的 buffer 内容、光标与 modified 状态。
+
+**Pitfalls / Gotchas**
+
+- Snacks 的 live picker 在输入行展示 `search`，同时把非空 `pattern` 放进 status column；旧 paste action
+  调用 `input:set(new, new)`，所以重复 tag 是确定行为，不是 csearch 返回的搜索结果或标签功能。
+
+**Validation**
+
+- 修复前 `grep_cache`：31/33（两个新增用例按预期失败）；修复后：33/33。
+- `smoke`：19/19；`structure`：71/71；全量回归：1327/1327。
+- `stylua --check` 未运行：本机未安装 `stylua`；相关 Lua 文件均由上述 headless 用例实际加载。
+- spec 一致性：未改变已声明的搜索语义，仅修正 paste 对 Snacks 双字段的错误接线；判定无 spec 影响。
+
+**Follow-ups**
+
+- 无。
+
 ### 2026-08-31 — Sync and archive all active OpenSpec changes
 
 **Task**

@@ -152,7 +152,11 @@ local function paste_picker_clipboard(picker)
   local col = math.min(vim.api.nvim_win_get_cursor(win)[2], #current)
   local new = current:sub(1, col) .. text .. current:sub(col + 1)
 
-  input:set(new, new)
+  if picker.opts.live then
+    input:set(nil, new)
+  else
+    input:set(new, nil)
+  end
   vim.api.nvim_win_set_cursor(win, { 1, col + #text })
   picker:find({ refresh = false })
 end

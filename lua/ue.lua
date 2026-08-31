@@ -5148,7 +5148,7 @@ function CORE_RT.grep_format_grouped(item)
     chunks[#chunks + 1] = { group.path, "SnacksPickerFile" }
     chunks[#chunks + 1] = { (" (%d)  "):format(group.count), "SnacksPickerComment" }
   else
-    chunks[#chunks + 1] = { "  ├ ", "SnacksPickerDir" }
+    chunks[#chunks + 1] = { group.index == group.count and "  └ " or "  ├ ", "SnacksPickerDir" }
   end
 
   chunks[#chunks + 1] = { tostring(pos[1] or 1), "SnacksPickerRow" }
@@ -5430,7 +5430,6 @@ function M.cached_grep(opts)
   -- false, while every picker item remains a real match in either mode.
   -- Toggle at runtime with :UEGrepGroupingToggle.
   local grouping_enabled = (vim.g.ue_grep_grouping_enabled ~= false)
-
   -- csearch emits hits grouped by file. Buffer only the current file so its
   -- count is known, then annotate and emit the original match rows. Unlike
   -- the old synthetic header design, this never creates a selectable item
@@ -5555,6 +5554,7 @@ function M.cached_grep(opts)
       need_search = true,
       limit = live_max_count,
       limit_live = live_max_count,
+      matcher = grouping_enabled and { sort = false } or nil, -- preserve csearch file groups
       layout = { preset = "telescope" },
       -- Search mode toggles. snacks auto-merges these with built-in toggles
       -- (regex, follow, hidden, ignored, modified — see snacks/picker/config/

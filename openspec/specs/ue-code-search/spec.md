@@ -265,13 +265,19 @@ csearch trigram 索引 SHALL 全平台共用一份，路径为 `csearch/csearch.
 
 ### Requirement: `<leader>/` 结果呈现 SHALL 提供分组、计数与后端状态
 
-`<leader>/` 的结果面板 SHALL 按文件分组，每文件 SHALL 显示命中计数，并 SHALL 以 Project / Engine / Workspace scope 与对应根目录相对路径分类。分组中的每一行 MUST 是带真实 file/line/column 的可跳转命中；系统 MUST NOT 插入可被选中但没有真实命中位置的 synthetic header。picker 标题 SHALL 标识当前后端（`[csearch]`）与当前 scope。
+`<leader>/` 的结果面板 SHALL 按文件分组，每文件 SHALL 显示命中计数，并 SHALL 以 Project / Engine / Workspace scope 与对应根目录相对路径分类。启用分组时，picker SHALL 保留 csearch 按文件连续交付的 source order；输入、粘贴、history 或 resume 产生的 matcher 状态 MUST NOT 通过相关度重排把不同文件的命中交错。分组中的每一行 MUST 是带真实 file/line/column 的可跳转命中；系统 MUST NOT 插入可被选中但没有真实命中位置的 synthetic header。picker 标题 SHALL 标识当前后端（`[csearch]`）与当前 scope。
 
 #### Scenario: 多文件多命中
 - **WHEN** 一次 `<leader>/` 搜索在多个文件命中
 - **THEN** 结果 SHALL 按文件分组
 - **AND** 每个文件分组 SHALL 显示该文件内的命中数
 - **AND** 首行 SHALL 显示 scope、相对路径与计数，后续行 SHALL 显示该文件内的真实命中
+- **AND** 组内中间行与末行 SHALL 使用可区分的 continuation / end marker
+
+#### Scenario: 查询从输入、粘贴、history 或 resume 恢复
+- **WHEN** 用户通过任一路径更新或恢复 `<leader>/` 查询
+- **THEN** 同一文件保留下来的命中 SHALL 连续显示，不得与其他文件的命中交错
+- **AND** picker MAY 过滤不匹配的命中，但 MUST NOT 通过 matcher 相关度对 csearch source order 重新排名
 
 #### Scenario: 选择任意分组行
 - **WHEN** 用户选中首条或后续任意一条结果

@@ -2063,6 +2063,19 @@ function D.setup_dap(dap, dapui)
     end
   end
   dap.listeners.before.event_terminated["dapui_config"] = function(session) on_session_end(session) end
+  -- NOTE: the `exited` body carries the only structured exit status we ever
+  -- get (`{"body":{"exitCode":9},"event":"exited"}`). The dapui hook below
+  -- historically dropped it; record it FIRST so the platform owner's cleanup
+  -- can tell "externally SIGKILLed" from "the app crashed on its own".
+  dap.listeners.before.event_exited["ue_exit_reason"] = function(session, body)
+    if not is_ue_android_lldb_session(session) then return end
+    local code = body and tonumber(body.exitCode)
+    if code then
+      pcall(function()
+        require("ue.dap.exit_reason").note({ status = code, source = "exited" })
+      end)
+    end
+  end
   dap.listeners.before.event_exited["dapui_config"]     = function(session) on_session_end(session) end
   dap.listeners.after.disconnect["dapui_config"]        = function(session) on_session_end(session) end
 
@@ -2315,6 +2328,15 @@ function D.setup_dap(dap, dapui)
     local out = body and body.output
     if type(out) ~= "string" or out == "" then return end
     append_android_bp_diag(out)
+    -- Truthful exit reporting: lldb announces the inferior's death only as
+    -- `Process <pid> exited with status = N (0x…)` on the console. Capture N
+    -- here so the owner can explain it instead of emitting a generic
+    -- "App … exited. Detaching." (see lua/ue/dap/exit_reason.lua).
+    pcall(function()
+      local er = require("ue.dap.exit_reason")
+      local status = er.parse_console_exit(out)
+      if status then er.note({ status = status, source = "console" }) end
+    end)
   end
 
   dap.listeners.before.scopes["ue_block_globals"] = function(_, _, body)

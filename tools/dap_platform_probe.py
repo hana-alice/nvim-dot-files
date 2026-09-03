@@ -6,8 +6,15 @@
 #  - always kills the spawned lldb-dap on exit
 #  - prints every DAP "output" event verbatim
 #
-# It assumes the device-side `lldb-server platform --server --listen 127.0.0.1:<pport>`
-# is already running and `adb forward tcp:<pport> tcp:<pport>` is set up by the caller.
+# It assumes the caller already started the device-side platform server and set up
+# `adb forward tcp:<pport> tcp:<pport>`. The PRODUCTION server form is app-uid:
+#   run-as <pkg> sh -c '/data/data/<pkg>/lldb-server platform --server --listen "*:<pport>"'
+# A shell-uid server (`/data/local/tmp/lldb-server`) cannot ptrace the app on a
+# user build and fails as `attach failed: lost connection` (CONSTRAINTS K56).
+#
+# NOTE: the localhost/127.0.0.1 connect-forms below are FALSIFIED for production
+# (CONSTRAINTS K30/K32/P17) and kept here only as differential probe variants.
+# The production form is serial-based: connect://[<serial>]:<port>.
 #
 # Usage:
 #   python tools/dap_platform_probe.py <pport> <pid> <connect-form>

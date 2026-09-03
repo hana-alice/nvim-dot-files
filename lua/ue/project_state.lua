@@ -318,6 +318,35 @@ function M.update(engine_root, key, value)
   })
 end
 
+--- Write one state field and PROVE the value reads back from the same bucket
+--- the readers use. Returns (true) or (false, err).
+---
+--- K61: `M.update` returns `false, "no project selected in this Neovim session"`
+--- whenever this process holds no selection. A caller that discards that return
+--- reports success while nothing is persisted, and every reader keeps resolving
+--- the PREVIOUS value — measured 2026-09-03 as `:UESetAndroidPackage` printing
+--- "UE Android package set: …" while `<Space>da` kept attaching the old package.
+--- The readback also catches a writer/reader bucket split, which no return code
+--- from a single write can express.
+function M.commit(engine_root, key, value)
+  local ok, err = M.update(engine_root, key, value)
+  if not ok then return false, err or "state update failed" end
+  -- Tables cannot be compared by identity across a JSON round-trip; for them a
+  -- successful atomic write plus a present key is all this layer can assert.
+  local seen = M.read(engine_root)[key]
+  if type(value) == "table" then
+    if type(seen) ~= "table" then
+      return false, ("read-back missing for %s"):format(tostring(key))
+    end
+    return true
+  end
+  if seen ~= value then
+    return false, ("read-back mismatch for %s (wrote %s, reads %s)")
+      :format(tostring(key), tostring(value), tostring(seen))
+  end
+  return true
+end
+
 function M.update_target(engine_root, platform, configuration)
   local selection = M.current(engine_root)
   if not selection then return false, "no project selected in this Neovim session" end

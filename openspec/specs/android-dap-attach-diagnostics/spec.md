@@ -27,9 +27,15 @@ Android DAP attach 失败与 F9 断点失效的诊断文档，记录当前代码
 - **WHEN** 读者按文档逐层排查当前 Android attach
 - **THEN** host adapter 层 SHALL 确认 `lldb-dap.exe` 为 LLVM 22.1.6+（不得回退 21）并成功 spawn
 - **AND** ADB 层 SHALL 确认本次捕获的 serial、`adb -s <serial>` 定向命令与 forward 状态一致
-- **AND** 设备端 server 层 SHALL 确认 `lldb-server platform --server --listen 127.0.0.1:<pport>` 正确启动并监听
+- **AND** 设备端 server 层 SHALL 确认 platform server 以 **app uid**（`run-as <package>`）
+  从 `/data/data/<package>/lldb-server` 启动并监听 `--listen "*:<port>"`；shell uid +
+  `/data/local/tmp` 启动形式与 `--listen 127.0.0.1:<port>` 形式均为已证伪的历史写法
+  （`android-dap-attach` app-uid Requirement，`docs/CONSTRAINTS.md` K56）
 - **AND** platform connect 层 SHALL 验证 `connect://[<session.serial>]:<port>`，不得使用 localhost route 或 `gdbserver --attach`
 - **AND** ptrace 层 SHALL 针对 `Cannot get process architecture` / `lost connection` 核对目标进程 arch（arm64）、server arch、`/proc/<pid>` 可读性、目标是否处于 state T 与 `TracerPid`
+- **AND** 遇到 `lost connection` 时 ptrace 层 SHALL **首先**核对 platform server 的运行 uid
+  （K56：shell uid 在 `ro.debuggable=0` 的 user build 上无权 ptrace app，LLDB 把该拒绝暴露成
+  子进程 SIGSEGV，host 只看到 `lost connection`），MUST NOT 把 device server 版本当作首要变量
 
 #### Scenario: 区分当前路线与历史诊断证据
 

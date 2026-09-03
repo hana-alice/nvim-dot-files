@@ -1,4 +1,4 @@
-# lua/ue/dap/ — DAP 调试（codelldb + Android platform 模式）
+# lua/ue/dap/ — DAP 调试（lldb-dap + Android platform 模式）
 
 > 继承 `../AGENTS.md`（ue 中枢）→ `../../AGENTS.md`（lua 总规则）。只写增量。
 > ⚠️ 本目录踩坑密度最高，改动前**务必**读 `../../../docs/CONSTRAINTS.md §二 DAP` 全段。
@@ -10,14 +10,22 @@ UE 专用 DAP：`_common`（adapter 接线 + env 清洗）、`_persist_bp`（断
 
 ## 专属约定 / 宪法级坑（权威见 CONSTRAINTS §二、§一）
 
-- **codelldb 不用 `request="custom"`** → 用 `launch` + `targetCreateCommands` + `processCreateCommands`。→ P8/K1
+- **host adapter = LLVM 22.1.6+ `lldb-dap.exe`，forward-only**；codelldb 已完全移除。
+  attach 形态 = `request="attach"` + `stopOnEntry=true` + `initCommands`/`attachCommands`/
+  `postRunCommands`（`request="custom"` / codelldb 的 `*CreateCommands` 是历史，见 P8/K1）。→ C1
 - **Android attach 唯一正解**：platform 模式 + `connect://[<serial>]:<port>` serial URL；
   **不用** `gdbserver --attach`（从不 listen）；**不用** localhost URL（被 getopt 吞空）。→ P16/P17/K30–K32
+- **device 端 platform server 必须以 app uid 运行**：`run-as <pkg>` +
+  `/data/data/<pkg>/lldb-server`（`/data/local/tmp` 仅作 `adb push` 中转，两跳 staging 用 `cat`
+  重定向而非 `cp`），listen 参数写 `--listen "*:<port>"`（不加引号会被 device shell glob）。
+  shell uid 在 `ro.debuggable=0` 的 user build 上无权 ptrace app，LLDB 只把该拒绝暴露成
+  `attach failed: lost connection`；**遇到 `lost connection` 先查 uid，不得把 device server
+  版本当首要变量**（LLDB 9/14/18 在 shell uid 下同样失败）。→ K56
 - **设备 serial 单一来源**：程序化 `context/opts` 显式值优先，否则读
   `utils.android_device` 的 `vim.g.ue_android_device_serial`；普通 attach 缺值就 picker，
   不猜 last-session。活跃 session 的 poll/cleanup 始终使用捕获的 `session.serial`，且
   K30 URL 与设备端全部 `adb -s` 必须一致。
-- **ASLR `--slide` 必须在 `processCreateCommands` 内、先于 setBreakpoints**（基于事件太晚）。→ K11
+- **ASLR `--slide` 必须在 attach 命令序列内、先于 setBreakpoints**（基于事件太晚）。→ K11
 - **ASLR `--slide` 是 load-bearing，别删**：真机 `UE_DAP_NO_SLIDE=1` 复验显示去掉它 attach 直接
   超时 / adapter `3221226505`。删除前必须在目标设备复验「无 slide 仍 resolved+命中」。→ K37
 - **不对 64 位 slide 用 `string.format("%x")`**（LuaJIT 截 32 位，用字符串拼接）。→ P7/K4

@@ -55,8 +55,9 @@
   auto-install（钉死工具链）；不做全局 `vim.lsp.handlers` 覆盖（走
   `lsp_fallback`/`workarounds`）；不写 inline workaround（必须用 registry）；
   不做周期性 ticker 通知；不阻塞主线程；不对 64 位值用
-  `string.format("%x", addr)`（LuaJIT 会截断到 32 位）；codelldb 不用
-  `request="custom"`；不用 which-key 自动 cheatsheet；不在配置内集成
+  `string.format("%x", addr)`（LuaJIT 会截断到 32 位）；DAP 不用
+  `request="custom"`；Windows lldb-dap pin 上不发裸 `script` 命令（只用
+  `command script import`）；不用 which-key 自动 cheatsheet；不在配置内集成
   copilot/codeium
 - **AND** 每条都包含简短理由和指向出处的链接
 
@@ -68,7 +69,7 @@
 #### Scenario: DAP, toolchain, and platform pitfalls are recorded
 
 - **WHEN** 读者查阅「踩过的坑」小节
-- **THEN** 它包含 codelldb 路线的坑（custom-request 被拒；手动
+- **THEN** 它包含 DAP 路线的坑（custom-request 被拒〔历史 codelldb 路线，须标注已退役〕；手动
   `target modules load --slide` rebase；强制
   `process handle SIGSEGV/SIGBUS -p true -s false`；LuaJIT hex 截断；
   Android 的 terminate-vs-disconnect；dap-repl F-key 多模式绑定；
@@ -77,6 +78,10 @@
 - **AND** 它包含 LLVM `STATUS_STACK_BUFFER_OVERRUN` 历史、Android ASLR
   `--slide` 须先于断点 的教训、snacks picker first-open 卡死、clangd 非
   `file://` URI 报错刷屏，以及 lldb-dap ⇄ codelldb 适配器迁移弧线
+- **AND** 它区分「历史 22.0–22.1.5 启动崩」与「当前 22.1.6 pin 上裸 `script` 命令崩
+  （`0xC0000409`，`launch` 无 response）」这两个不同的失败，并记录 `import lldb` 在当前 pin
+  上**仍然不可用**（缺 `lldb` python 包，而非 nopython liblldb），以免有人据「已修」删掉
+  native `type summary` 兜底
 
 #### Scenario: Each pitfall is traceable to a source
 
@@ -92,8 +97,8 @@
 #### Scenario: Version pins, conventions, and boot order are listed
 
 - **WHEN** 读者查阅「约束」小节
-- **THEN** 它列出工具链钉死项（clangd/LLVM 22.x —— 不要降级；codelldb
-  1.12.2；NDK 27 lldb-server；Neovim 0.10+）和六条约定（AST/treesitter 优先于
+- **THEN** 它列出工具链钉死项（clangd/LLVM 22.x —— 不要降级；host DAP 适配器
+  = LLVM 22.1.6+ `lldb-dap`，forward-only；NDK 27 lldb-server；Neovim 0.10+）和六条约定（AST/treesitter 优先于
   regex；async 优先于阻塞；workaround 隔离；可自验证的 `M.*` 模块；不做周期性
   ticker 通知；未变更时跳过写入）
 - **AND** 它引用 `lua/workarounds/README.md` 的 workaround frontmatter 契约

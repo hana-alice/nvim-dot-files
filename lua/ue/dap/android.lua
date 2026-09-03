@@ -84,7 +84,12 @@ M._last_session = nil
 
 local function snapshot_last_session()
   local s = M._session
-  if not (s.package_name and s.serial and s.symbol_lib) then return end
+  -- K59: `pid` is set only by _finalize_session, i.e. only after an attach
+  -- actually reached the device. Without this guard a FAILED attach (pkg/serial/
+  -- symbol_lib already picked, pid probe missed) still ran through
+  -- stop_android_debugger() → snapshot, poisoning _last_session with a package
+  -- that does not exist on the device and making :UEDAPReattach replay it.
+  if not (s.package_name and s.serial and s.symbol_lib and s.pid) then return end
   M._last_session = {
     package_name      = s.package_name,
     serial            = s.serial,
@@ -548,6 +553,16 @@ local function resolve_session_serial(ctx, opts)
     or android_device.get()
 end
 
+-- K59: package resolution for a normal attach/launch. Explicit callers win;
+-- everything else stays nil so pick_package() can consult PERSISTED state
+-- (which `:UESetAndroidPackage` rewrites). Deliberately NOT sourced from
+-- M._last_session — see the comment in bootstrap_session.
+local function resolve_session_package(ctx, opts)
+  ctx = ctx or {}
+  opts = opts or {}
+  return ctx.android_package or opts.package_name or opts.package
+end
+
 local function pidof(adb, serial, pkg)
   local out = adb_run(adb, { "-s", serial, "shell", "pidof", "-s", pkg })
   local digits = (out or ""):match("(%d+)")
@@ -660,12 +675,41 @@ local function module_rebase_command(adb, serial, pkg, pid, symbol_lib)
   return string.format('target modules load --file "%s" --slide 0x%s', so_basename, base_hex), base_hex
 end
 
--- Push lldb-server → /data/local/tmp/lldb-server (PUBLIC). Idempotent: skip
--- push when remote size matches. Platform mode does NOT need the server inside
--- the app sandbox — the platform server speaks to the host on one TCP port and
--- forks per-target gdbserver children itself; PUBLIC /data/local/tmp/ is
--- sufficient (verified 2026-06-03, docs/CONSTRAINTS.md K30). This restores the
--- 5/21 e51cbe6 working path. Returns (ok, remote_path_or_err).
+-- Stage lldb-server for an APP-UID platform server (K56). This block documents
+-- the whole staging pipeline below (the plan helpers, the script builders, and
+-- `ensure_lldb_server_pushed` which drives them).
+--
+-- Two hops, because `adb push` can only write world-reachable paths and the
+-- app sandbox is only reachable through `run-as`:
+--   1. adb push  → /data/local/tmp/lldb-server   (PUBLIC transport, shell uid)
+--   2. run-as <pkg> sh -c 'cat <public> > /data/data/<pkg>/lldb-server
+--                          && chmod 700 …'       (app uid, app sandbox)
+-- The platform server is then launched from the sandbox copy AS THE APP UID.
+--
+-- WHY the app uid and not the shell uid (K56, docs/CONSTRAINTS.md):
+-- On this `user` build (`ro.debuggable=0`, no `su`, no Yama ptrace_scope file)
+-- the shell user (uid 2000) CANNOT ptrace the app process even though the app
+-- is `pkgFlags=[DEBUGGABLE]`. NDK 27 LLDB 18's lldb-server does not surface
+-- that denial as an error — its forked per-target gdbserver child SIGSEGVs
+-- inside `vAttach`, and the host sees only `error: attach failed: lost
+-- connection`. Measured truth table (2026-09-03, 139=SIGSEGV, 124=`timeout`
+-- expired i.e. server still alive and serving = success):
+--     shell-uid server → shell-owned `sleep`    rc=124  ok
+--     shell-uid server → root-owned init (pid 1) rc=139  SEGV
+--     shell-uid server → app-owned game         rc=139  SEGV
+--     app-uid   server → app-owned game         rc=124  ok
+-- A control against a NONEXISTENT pid returns a clean rc=1 "No such process",
+-- so the SEGV is specific to permission-denied ptrace, not to bad input.
+-- End-to-end A/B on one healthy target (156 threads), same host, same device
+-- server build, only the server uid differing:
+--     shell-uid  3/3  rc=1  "attach failed: lost connection"  (~1s)
+--     app-uid    3/3  rc=0  full 155-thread stop + clean detach (6-7s)
+-- Device-server VERSION is NOT the variable (LLDB 9 / 14 / 18 all fail under
+-- the shell uid) — do NOT "fix" this by downgrading the pinned NDK 27 LLDB 18
+-- (docs/CONSTRAINTS.md C1).
+--
+-- `ensure_lldb_server_pushed` returns (ok, sandbox_path_or_err).
+
 -- Pure decision helper (unit-tested): given whether the remote copy matches
 -- the local binary size and whether it is already executable, decide the
 -- staging action.
@@ -678,10 +722,56 @@ end
 --   "repush" — size differs: rm -f the residue first (the /data/local/tmp
 --              DIRECTORY is shell-owned, so the shell user can unlink even a
 --              root-owned file), then push + chmod.
+--
+-- SCOPE (K58): this decides only the TRANSPORT hop. "reuse" means "skip the
+-- adb push", NOT "the server is ready to run" — the run path is the sandbox
+-- copy, decided by sandbox_stage_plan below.
 local function lldb_server_stage_plan(size_matches, is_executable)
   if size_matches and is_executable then return "reuse" end
   if size_matches then return "chmod" end
   return "repush"
+end
+
+-- Pure decision helper (unit-tested): whether the APP-UID run path — the
+-- sandbox copy — can be reused, or must be re-staged from the transport copy.
+--
+-- K58: only `test -x` UNDER `run-as` counts. The public transport copy is
+-- labelled `u:object_r:shell_data_file:s0`, which the app SELinux domain may
+-- read but MUST NOT execute, so a shell-side `test -x` on the public path says
+-- nothing about whether the app uid can run it. Measured 2026-09-03:
+--     app uid, /data/local/tmp/lldb-server  → test -x rc=1,
+--       exec → `sh: …: can't execute: Permission denied` (rc=126)
+--     app uid, /data/data/<pkg>/lldb-server → test -x rc=0, `lldb-server v` ok
+local function sandbox_stage_plan(size_matches, is_executable)
+  if size_matches and is_executable then return "reuse" end
+  return "restage"
+end
+
+-- Pure helper (unit-tested): the in-sandbox path the app-uid platform server
+-- runs from. `run-as <pkg>` lands in /data/data/<pkg> (== /data/user/0/<pkg>).
+local function sandbox_lldb_server_path(pkg)
+  if type(pkg) ~= "string" or pkg == "" then return nil end
+  return "/data/data/" .. pkg .. "/lldb-server"
+end
+
+-- Pure helper (unit-tested): the device-side `sh -c` body that copies the
+-- PUBLIC transport copy into the app sandbox and marks it executable.
+-- `cat > dst` (not `cp`) because the app uid may not read /data/local/tmp
+-- metadata for `cp -p`, and toybox `cp` across that boundary has historically
+-- failed with EACCES on this device class.
+local function sandbox_stage_script(public_path, sandbox_path)
+  return ("cat %s > %s && chmod 700 %s")
+    :format(public_path, sandbox_path, sandbox_path)
+end
+
+-- Pure helper (unit-tested): the device-side `sh -c` body that starts the
+-- APP-UID platform server from the sandbox copy.
+-- The listen wildcard is DOUBLE-QUOTED ("*:N") so the device shell cannot glob
+-- it against the sandbox directory contents — `cd`-ing into /data/data/<pkg>
+-- first means a bare `*` would expand to the first filename there (K30 note
+-- documented the same hazard for the /data/local/tmp form).
+local function platform_server_script(sandbox_path, port)
+  return ('%s platform --server --listen "*:%d"'):format(sandbox_path, port)
 end
 
 local function ensure_lldb_server_pushed(adb, serial, pkg, src)
@@ -699,9 +789,17 @@ local function ensure_lldb_server_pushed(adb, serial, pkg, src)
   end
 
   local plan = lldb_server_stage_plan(size_matches, size_matches and remote_is_executable())
-  if plan == "reuse" then
-    return true, remote
-  end
+
+  -- K58: `reuse` skips only the TRANSPORT push. It MUST NOT return the public
+  -- path as the run path — the app uid cannot execute a `shell_data_file`
+  -- (SELinux), so `start_lldb_server_platform` would emit
+  --   run-as <pkg> sh -c '/data/local/tmp/lldb-server platform --server …'
+  -- which dies with `can't execute: Permission denied` (rc=126). The device
+  -- then has no listener, `platform connect` reports "Connection shut down by
+  -- remote side while waiting for reply to initial handshake packet", and
+  -- `process attach` fails with "The parameter is incorrect" — the exact
+  -- <Space>da failure measured 2026-09-03. Fall through to the sandbox hop.
+  local skip_transport = (plan == "reuse")
 
   if plan == "repush" then
     pcall(adb_run, adb, { "-s", serial, "shell", "killall lldb-server 2>/dev/null; true" })
@@ -716,44 +814,98 @@ local function ensure_lldb_server_pushed(adb, serial, pkg, src)
     end
   end
 
-  local chmod_out, chmod_code = adb_run_raw(adb, { "-s", serial, "shell", "chmod", "755", remote })
-  if chmod_code ~= 0 then
-    -- chmod can EPERM on files we do not own. That is only fatal when the
-    -- binary is genuinely not executable; otherwise log once and proceed.
-    if remote_is_executable() then
-      log.warn("dap.android",
-        "chmod lldb-server EPERM (not owner) but binary already executable — proceeding: "
-        .. tostring(chmod_out))
-    else
-      return false, ("chmod lldb-server failed on %s (exit %s): %s")
-        :format(tostring(serial), tostring(chmod_code), tostring(chmod_out))
+  if not skip_transport then
+    local chmod_out, chmod_code = adb_run_raw(adb, { "-s", serial, "shell", "chmod", "755", remote })
+    if chmod_code ~= 0 then
+      -- chmod can EPERM on files we do not own. That is only fatal when the
+      -- binary is genuinely not executable; otherwise log once and proceed.
+      if remote_is_executable() then
+        log.warn("dap.android",
+          "chmod lldb-server EPERM (not owner) but binary already executable — proceeding: "
+          .. tostring(chmod_out))
+      else
+        return false, ("chmod lldb-server failed on %s (exit %s): %s")
+          :format(tostring(serial), tostring(chmod_code), tostring(chmod_out))
+      end
+    end
+    local check = adb_run(adb, { "-s", serial, "shell", "ls", remote })
+    if not check:match("lldb%-server") then
+      return false, "lldb-server not present after push"
     end
   end
-  local check = adb_run(adb, { "-s", serial, "shell", "ls", remote })
-  if not check:match("lldb%-server") then
-    return false, "lldb-server not present after push"
+
+  -- Hop 2 (K56): copy the PUBLIC transport binary into the app sandbox so the
+  -- platform server can run AS THE APP UID. See the block comment above for
+  -- the measured evidence that a shell-uid server cannot ptrace the app on
+  -- this build (its forked gdbserver SIGSEGVs inside vAttach).
+  local sandbox = sandbox_lldb_server_path(pkg)
+  if not sandbox then
+    return false, "cannot derive sandbox lldb-server path (empty package name)"
   end
-  return true, remote
+
+  -- K58: probe the SANDBOX copy under `run-as` — size AND `test -x` as the app
+  -- uid. Both must hold to skip the re-stage; a public-path `test -x` from the
+  -- shell uid proves nothing about app-uid execute permission (SELinux domain).
+  local function sandbox_probe()
+    local size_out = adb_run(adb, { "-s", serial, "shell",
+      "run-as " .. pkg .. " sh -c " .. shell_quote("stat -c %s " .. sandbox) })
+    local same = tostring(size_out):match("(%d+)%s*$") == tostring(local_size)
+    local _, x_code = adb_run_raw(adb, { "-s", serial, "shell",
+      "run-as " .. pkg .. " sh -c " .. shell_quote("test -x " .. sandbox) })
+    return same, x_code == 0
+  end
+
+  local sb_size_ok, sb_exec_ok = sandbox_probe()
+  if sandbox_stage_plan(sb_size_ok, sb_exec_ok) == "reuse" then
+    return true, sandbox
+  end
+
+  local stage_out, stage_code = adb_run_raw(adb, { "-s", serial, "shell",
+    "run-as " .. pkg .. " sh -c " .. shell_quote(sandbox_stage_script(remote, sandbox)) })
+  if stage_code ~= 0 then
+    return false, ("staging lldb-server into %s sandbox failed (exit %s): %s")
+      :format(pkg, tostring(stage_code), tostring(stage_out))
+  end
+  local _, sandbox_x = adb_run_raw(adb, { "-s", serial, "shell",
+    "run-as " .. pkg .. " sh -c " .. shell_quote("test -x " .. sandbox) })
+  if sandbox_x ~= 0 then
+    return false, "sandbox lldb-server not executable after staging: " .. sandbox
+  end
+  return true, sandbox
 end
 
--- Spawn `lldb-server platform --server --listen *:<port>` from PUBLIC
--- /data/local/tmp as a never-exiting background process; set up adb forward.
--- Returns (ok, err).
+-- Spawn `lldb-server platform --server --listen "*:<port>"` AS THE APP UID
+-- from the app sandbox copy, and set up adb forward. Returns (ok, err).
 --
--- This is the WORKING attach route (K30): platform mode, NOT gdbserver --attach
--- (K31: --attach never binds the listen port). The host then issues
+-- This is the WORKING attach route (K30 platform mode + K56 app uid), NOT
+-- gdbserver --attach (K31: --attach never binds the listen port). The host then
+-- issues
 --   platform select remote-android
 --   platform connect connect://[<serial>]:<port>   (K30/K32: serial form only)
 --   process attach --pid N
 -- and the device-side platform server forks the per-target gdbserver itself.
 --
--- DO NOT use `cd files && ./` (K: runas_app cd fails) nor a sandbox copy — the
--- public binary runs as the shell/debug user, which can ptrace a debuggable app.
--- `--listen *:N` wildcard works for platform mode. Use jobstart (detached, no
--- callbacks) — adb shell does NOT see stdout closed even with nohup on
--- Android 14+, so vim.fn.system would block forever (e51cbe6 note).
-local function start_lldb_server_platform(adb, serial, port)
+-- K56: the server MUST run as the app uid via `run-as <pkg>`. A shell-uid
+-- server cannot ptrace the app on this `user` build and its forked gdbserver
+-- child SIGSEGVs inside vAttach, surfacing to the host only as
+-- `error: attach failed: lost connection`. Measured 3/3 fail (shell uid) vs
+-- 3/3 pass (app uid) against the same healthy target — see the evidence table
+-- on ensure_lldb_server_pushed above. Do NOT "fix" a lost-connection attach by
+-- changing the device-server VERSION: LLDB 9 / 14 / 18 all fail identically
+-- under the shell uid, and NDK 27 LLDB 18 is pinned by docs/CONSTRAINTS.md C1.
+--
+-- Kill BOTH uids' servers first: a stale shell-uid server from an older build
+-- of this function would keep the port and silently reintroduce the SEGV path.
+-- `--listen "*:N"` is double-quoted so the device shell cannot glob it.
+-- Use jobstart (detached, no callbacks) — adb shell does NOT see stdout closed
+-- even with nohup on Android 14+, so vim.fn.system would block forever
+-- (e51cbe6 note).
+local function start_lldb_server_platform(adb, serial, port, pkg, sandbox_path)
   pcall(adb_run, adb, { "-s", serial, "shell", "killall lldb-server 2>/dev/null; true" })
+  if pkg then
+    pcall(adb_run, adb, { "-s", serial, "shell",
+      "run-as " .. pkg .. " sh -c " .. shell_quote("killall lldb-server 2>/dev/null || true") })
+  end
   vim.wait(150)
 
   adb_run(adb, { "-s", serial, "forward", "--remove", "tcp:" .. port })
@@ -761,8 +913,12 @@ local function start_lldb_server_platform(adb, serial, port)
     if vim.v.shell_error ~= 0 then return false, "adb forward failed" end
   end
 
-  local cmd = string.format(
-    "cd /data/local/tmp && ./lldb-server platform --server --listen \\*:%d", port)
+  local sandbox = sandbox_path or sandbox_lldb_server_path(pkg)
+  if not sandbox then
+    return false, "no sandbox lldb-server path for app-uid platform server"
+  end
+  local cmd = "run-as " .. pkg .. " sh -c "
+    .. shell_quote(platform_server_script(sandbox, port))
   local jobid = vim.fn.jobstart({ adb, "-s", serial, "shell", cmd }, { detach = false })
   if not jobid or jobid <= 0 then
     return false, "failed to spawn lldb-server platform (jobstart=" .. tostring(jobid) .. ")"
@@ -1279,6 +1435,33 @@ local function attach_commands(session)
     and (vim.env.UE_DAP_NO_SLIDE or "") == "" then
     cmds[#cmds + 1] = session._module_rebase_cmd
   end
+  -- ── Fatal-crash catchability (see docs/CONSTRAINTS.md K3) ───────────────
+  -- K3 forces SIGSEGV/SIGBUS to `--stop false` because ART uses userspace
+  -- SIGSEGV/SIGBUS traps (JIT read barriers, compacting-GC card-table
+  -- protect/unprotect, heap poisoning) through libsigchain.so; stopping on
+  -- them makes the app unusable. The cost is that a GENUINE UE fatal signal is
+  -- also hidden, so a crash looks like "the debugger just exited".
+  --
+  -- Signal NUMBER cannot separate the two, but the SYMBOL can: UE routes every
+  -- fatal signal through FFatalSignalHandler. Measured with NDK 27 llvm-nm on
+  -- the shipped symbol libUE4.so (1,178,567 defined symbols):
+  --   FFatalSignalHandler::OnTargetSignal(int, siginfo*, void*)      present
+  --   FFatalSignalHandler::HandleTargetSignal(int, siginfo*, void*)  present
+  -- OnTargetSignal runs ON THE FAULTING THREAD (installed via sigaction with
+  -- SA_SIGINFO|SA_ONSTACK), so breaking there yields the real crash stack,
+  -- while ART's benign traps never reach it.
+  --
+  -- The `?` prefix marks the command as non-fatal for lldb-dap: a build whose
+  -- symbols differ must not abort the whole attach.
+  --
+  -- Escape hatch: UE_DAP_NO_FATAL_BP=1 restores the pre-K60 behaviour.
+  -- Caveat (待验证): the forwarded handler thread polls
+  -- WaitForSignalHandlerToFinishOrExit() and calls exit(0) once
+  -- GAndroidSignalTimeOut elapses, so sitting at this breakpoint for a long
+  -- time may still let the app self-exit.
+  if (vim.env.UE_DAP_NO_FATAL_BP or "") == "" then
+    cmds[#cmds + 1] = '?breakpoint set --shlib libUE4.so --name "FFatalSignalHandler::OnTargetSignal"'
+  end
   return cmds
 end
 
@@ -1580,8 +1763,16 @@ local function bootstrap_session(opts, on_ready)
   -- Priority: explicit context/opts -> session-global selected device. A normal
   -- attach/launch never guesses from last-session history; without either it
   -- opens the shared device picker below. Reattach has its own explicit replay.
-  ctx.android_package = ctx.android_package or opts.package_name or opts.package
-    or (M._last_session and M._last_session.package_name)
+  --
+  -- K59: MUST NOT fall back to `M._last_session.package_name` here. That
+  -- snapshot is written by snapshot_last_session() on EVERY teardown — a failed
+  -- attach ("process <pkg> not running") runs stop_android_debugger() and
+  -- therefore persists the wrong package into process memory. Once seeded, it
+  -- short-circuits pick_package()'s whole chain, so a later
+  -- `:UESetAndroidPackage <corrected>` (which writes persisted state) stays
+  -- invisible for the rest of the Neovim session and <Space>da keeps reporting
+  -- the OLD package as "not running". Persisted state must win.
+  ctx.android_package = resolve_session_package(ctx, opts)
   -- When none of the above sources provides a package name, leave it nil
   -- so pick_package() falls through to persisted state → project discovery
   -- → config → user prompt, instead of treating a placeholder as a real
@@ -1662,7 +1853,8 @@ local function _finalize_session(sess, pid, cfg_name, run_label)
   sess.lldb_server_mode = "platform"
 
   P.step(("starting lldb-server platform (port=%d) …"):format(sess.port))
-  local ok_srv, srv_err = start_lldb_server_platform(sess.adb, sess.serial, sess.port)
+  local ok_srv, srv_err = start_lldb_server_platform(
+    sess.adb, sess.serial, sess.port, sess.package_name, sess.remote_lldb_server)
   if not ok_srv then
     P.error("lldb-server platform failed: " .. tostring(srv_err))
     log.notify_error("dap.android", "lldb-server platform failed: " .. tostring(srv_err))
@@ -1990,6 +2182,62 @@ function M._stop_liveness_poller()
   M._liveness_misses = 0
 end
 
+-- Explain WHY the debugged app died, instead of the old generic
+-- "App <pkg> exited on <serial>. Detaching.".
+--
+-- Two authorities are consulted:
+--   * lldb's own exit status, captured by ue.dap.exit_reason from the DAP
+--     `exited` event / console line ("Process N exited with status = 9").
+--   * Android's ApplicationExitInfo, via `dumpsys activity exit-info <pkg>`,
+--     which is the only source that names the KILLER (e.g.
+--     "reason=10 (USER REQUESTED) subreason=21 (FORCE STOP)
+--      description=stop <pkg> due to from pid 1976 (system)").
+--
+-- dumpsys accepts a package only (`dumpsys activity -h` documents
+-- `exit-info [PACKAGE_NAME]`), so the pid match happens in exit_reason.
+-- The probe is async and best-effort: an unreachable device (wifi ADB drop is
+-- exactly when this fires) must still produce the lldb half of the report.
+---@param ctx table { adb, serial, pkg, pid }
+function M._report_exit_reason(ctx)
+  local ok_er, er = pcall(require, "ue.dap.exit_reason")
+  local note = ok_er and er.take() or nil
+  local status = note and note.status or nil
+
+  local function emit(record)
+    local body = ok_er and er.compose({
+      status = status,
+      record = record,
+      -- Target-specific tooling literal is owned HERE, not in the generic
+      -- exit_reason module (ue_platform_boundary: target_policy_literal).
+      no_record_hint = ("No device exit record found for this pid. Check: "
+        .. "adb shell dumpsys activity exit-info %s"):format(ctx.pkg),
+    }) or nil
+    local msg = ("[ue.dap.android] App %s died on %s. Detaching."):format(ctx.pkg, ctx.serial)
+    if body and body ~= "" then msg = msg .. "\n" .. body end
+    msg = msg .. "\nUse :UEDAPReattach to reconnect."
+    vim.notify(msg, vim.log.levels.WARN)
+    pcall(function()
+      require("utils.probe").record("android-session-exit",
+        ("status=%s reason=%s"):format(tostring(status), record and record.reason or "unknown"),
+        (body or ""):sub(1, 200))
+    end)
+  end
+
+  local ok_spawn = pcall(vim.system,
+    { ctx.adb, "-s", ctx.serial, "shell", "dumpsys", "activity", "exit-info", ctx.pkg },
+    { text = true },
+    function(res)
+      vim.schedule(function()
+        local record = nil
+        if res and res.code == 0 and ok_er then
+          record = er.find_exit_info(res.stdout, ctx.pid)
+        end
+        emit(record)
+      end)
+    end)
+  if not ok_spawn then emit(nil) end
+end
+
 function M._start_liveness_poller()
   M._stop_liveness_poller()
   snapshot_last_session()  -- remember for :UEDAPReattach
@@ -2027,14 +2275,19 @@ function M._start_liveness_poller()
 
     -- App is gone. Stop everything, notify, snapshot for reattach.
     M._stop_liveness_poller()
-    local why
     if live and live ~= pid then
-      why = ("App %s restarted (new pid=%d). Detaching."):format(pkg, live)
-    else
-      why = ("App %s exited on %s. Detaching."):format(pkg, serial)
+      vim.notify(("[ue.dap.android] App %s restarted (new pid=%d). Detaching."):format(pkg, live)
+        .. "\nUse :UEDAPReattach to reconnect.", vim.log.levels.WARN)
+      pcall(M.stop_android_debugger)
+      return
     end
-    vim.notify("[ue.dap.android] " .. why .. "\nUse :UEDAPReattach to reconnect.",
-      vim.log.levels.WARN)
+    -- The app died. "exited. Detaching." on its own is what made a SIGKILL
+    -- look like "the debugger just exited", so ask the two authorities why:
+    --   1. lldb's console/exited status, recorded by ue.dap.exit_reason
+    --   2. Android's own post-mortem: dumpsys activity exit-info <pkg>
+    -- The adb round-trip is async so it never stalls the main loop; teardown
+    -- runs regardless of whether the probe answers.
+    M._report_exit_reason({ adb = adb, serial = serial, pkg = pkg, pid = pid })
     pcall(M.stop_android_debugger)
   end
   timer:start(2000, 1500, function()
@@ -2132,6 +2385,24 @@ function M._lldb_server_stage_plan_for_test(size_matches, is_executable)
   return lldb_server_stage_plan(size_matches, is_executable)
 end
 
+-- K58: run-path (sandbox) reuse decision — only app-uid `test -x` counts.
+function M._sandbox_stage_plan_for_test(size_matches, is_executable)
+  return sandbox_stage_plan(size_matches, is_executable)
+end
+
+-- K56 app-uid platform server: sandbox path + the two device-side sh -c bodies.
+function M._sandbox_lldb_server_path_for_test(pkg)
+  return sandbox_lldb_server_path(pkg)
+end
+
+function M._sandbox_stage_script_for_test(public_path, sandbox_path)
+  return sandbox_stage_script(public_path, sandbox_path)
+end
+
+function M._platform_server_script_for_test(sandbox_path, port)
+  return platform_server_script(sandbox_path, port)
+end
+
 function M._parse_maps_base_hex_for_test(maps, so_basename)
   return parse_maps_base_hex(maps, so_basename)
 end
@@ -2142,6 +2413,14 @@ end
 
 function M._resolve_session_serial_for_test(ctx, opts)
   return resolve_session_serial(ctx, opts)
+end
+
+function M._resolve_session_package_for_test(ctx, opts)
+  return resolve_session_package(ctx, opts)
+end
+
+function M._snapshot_last_session_for_test()
+  return snapshot_last_session()
 end
 
 function M._jdb_connect_argv_for_test(jdb, port)

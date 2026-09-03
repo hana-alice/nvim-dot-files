@@ -5429,7 +5429,7 @@ function M.cached_grep(opts)
   -- structured path/count formatter and preview throttle are disabled when
   -- false, while every picker item remains a real match in either mode.
   -- Toggle at runtime with :UEGrepGroupingToggle.
-  local grouping_enabled = (vim.g.ue_grep_grouping_enabled ~= false)
+  local grouping_enabled = (vim.g.ue_grep_grouping_enabled == true)
   -- csearch emits hits grouped by file. Buffer only the current file so its
   -- count is known, then annotate and emit the original match rows. Unlike
   -- the old synthetic header design, this never creates a selectable item
@@ -5637,7 +5637,7 @@ function M.cached_grep(opts)
           picker.list:set_target(); picker:find()
         end,
       },
-      format = grouping_enabled and CORE_RT.grep_format_grouped or nil,
+      format = grouping_enabled and CORE_RT.grep_format_grouped or "file",
       on_show = grouping_enabled and on_show_picker or nil,
       finder = function(_picker_opts, finder_ctx)
         local pattern = finder_ctx.filter.search
@@ -6750,17 +6750,17 @@ local function set_android_package(input)
 
   input = trim(input)
   if input == "" then
-    local state = read_state(engine_root)
-    input = vim.fn.input("Android package name: ", state.android_package or "")
+    input = vim.fn.input("Android package name: ", read_state(engine_root).android_package or "")
   end
-  if input == "" then
-    return
-  end
-
-  update_state_field(engine_root, "android_package", input)
+  if input == "" then return end
+  -- K61: commit() re-reads the field from the readers' bucket, so a failed or
+  -- misrouted write can never print a success toast (see project_state.commit).
+  local ok, err = CORE_RT.project_state.commit(engine_root, "android_package", input)
   invalidate_status_cache()
   refresh_statusline()
-  vim.notify("UE Android package set:\nEngine: " .. engine_root .. "\nPackage: " .. input)
+  local msg = ok and ("UE Android package set:\nEngine: " .. engine_root .. "\nPackage: " .. input)
+    or ("UE Android package NOT set: " .. tostring(err))
+  vim.notify(msg, ok and vim.log.levels.INFO or vim.log.levels.ERROR)
 end
 
 -- Tell ue.lua how to find the .uproject when only a workspace root is given
@@ -9347,11 +9347,11 @@ M._dap_run_state = dap_mod._dap_run_state
 M._continue_debounce_until_ms = dap_mod._continue_debounce_until_ms
 M._dap_source_file_cache = dap_mod._dap_source_file_cache
 
--- Delegate DAP public API.  We're back on codelldb (1.12.2) for the
--- Android route as of 2026-05; the lldb-dap experiment is retired.
--- The historical M.codelldb_paths / ASLR listeners / hand-written
--- breakpoint helpers stay deleted — codelldb handles all of that
--- natively, and persistence is owned by ue.dap._persist_bp instead.
+-- Delegate DAP public API.  Host adapter is LLVM 22.1.6+ `lldb-dap.exe`
+-- (forward-only, CONSTRAINTS C1); codelldb was removed 2026-05-21 and
+-- `M.codelldb_paths` no longer exists.  Historical ASLR listeners / hand-written
+-- breakpoint helpers stay deleted — the explicit `target modules load --slide`
+-- rides in `attachCommands` (K11/K37); persistence is ue.dap._persist_bp's.
 M.lldb_dap_path = dap_mod.lldb_dap_path
 M.android_dap_attach = dap_mod.android_dap_attach
 
@@ -9490,7 +9490,7 @@ function M.setup()
   vim.api.nvim_create_user_command("UEGrepGroupingToggle", function()
     -- Default is true; flip the global. Affects subsequent grep picker
     -- invocations (already-open pickers stay as they were).
-    vim.g.ue_grep_grouping_enabled = not (vim.g.ue_grep_grouping_enabled ~= false)
+    vim.g.ue_grep_grouping_enabled = not (vim.g.ue_grep_grouping_enabled == true)
     local now = vim.g.ue_grep_grouping_enabled
     vim.notify(
       string.format("UE grep structured groups/preview throttle/Tab tweaks: %s",

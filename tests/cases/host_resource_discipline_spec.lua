@@ -27,7 +27,7 @@ local SPAWN_AUDIT = {
   { p="lua/ue/cdb/pipeline.lua", api="jobstart", a="_rt.jobstart(step.command", class="deferrable", reason="admitted CDB chain", guard="host_admission" },
   { p="lua/ue/cdb/pipeline.lua", api="fn-system", a="vim.fn.system(cmd)", class="subprocess-only", reason="slim runs inside admitted ccjson or explicit sync path" },
   { p="lua/ue/clangd_commands.lua", api="vim.system", a="vim.system(cmd, { text = true }", class="interactive", reason="bounded compile-command query for active LSP request" },
-  { p="lua/ue/dap/android.lua", api="vim.system", a="local ok_spawn = pcall(vim.system", n=2, class="dap", reason="DAP protocol/process lifecycle exemption" },
+  { p="lua/ue/dap/android.lua", api="vim.system", a="local ok_spawn = pcall(vim.system", n=3, class="dap", reason="DAP protocol/process lifecycle exemption (liveness pidof probe, gate release, session-exit post-mortem)" },
   { p="lua/ue/dap/android.lua", api="jobstart", a="vim.fn.jobstart({ adb, \"-s\", serial, \"shell\", cmd }", class="dap", reason="DAP device process bridge" },
   { p="lua/ue/dap/android.lua", api="jobstart", a="vim.fn.jobstart(jdb_connect_argv", class="dap", reason="DAP JDWP bridge" },
   { p="lua/ue/dap/android.lua", api="vim.system", a="vim.system(", class="dap", reason="DAP bounded host operation" },

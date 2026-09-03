@@ -87,6 +87,43 @@ t.describe("multi-instance project state", function()
     pcall(vim.fn.delete, root, "rf")
   end)
 
+  -- K61 (2026-09-03 实测)：`M.update` 在本进程没有选中项目时返回
+  -- `false, "no project selected in this Neovim session"`。丢弃该返回值的写入方会
+  -- 报告成功而实际什么都没落盘，读取方继续解析旧值——这正是
+  -- `:UESetAndroidPackage` 报「已设置」而 `<Space>da` 仍 attach 旧包名的机制。
+  -- `commit()` 是「写入 + 从读取方同一 bucket 回读验证」的唯一入口。
+  t.it("commit 在未选中项目时失败，且不得声称写入成功", function()
+    local root = tmpdir()
+    local engine = root .. "/engine"
+    local state = require("ue.project_state")
+    state._reset_for_test()
+
+    t.assert_nil(state.current(engine), "precondition: no selection in this process")
+    local ok, err = state.commit(engine, "android_package", "com.example.never")
+    t.assert_false(ok, "commit must fail without a selected project")
+    t.assert_match(tostring(err), "no project selected")
+    t.assert_nil(state.read(engine).android_package, "nothing may be persisted")
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("commit 成功时值可从读取方 bucket 立刻回读", function()
+    local root = tmpdir()
+    local engine = root .. "/engine"
+    local project = root .. "/Project"
+    local uproject = project .. "/Game.uproject"
+    write(uproject)
+    local state = require("ue.project_state")
+    state._reset_for_test()
+    assert(state.select(engine, project, uproject, { persist_default = false }))
+
+    t.assert_true(state.commit(engine, "android_package", "com.example.stale"))
+    t.assert_eq(state.read(engine).android_package, "com.example.stale")
+    -- 纠正一次错误输入后，读取方必须立刻看到新值（无进程内缓存可挡）。
+    t.assert_true(state.commit(engine, "android_package", "com.example.fresh"))
+    t.assert_eq(state.read(engine).android_package, "com.example.fresh")
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
   t.it("ue context paths follow the process-local project bucket", function()
     local root = tmpdir()
     local engine = root .. "/engine"

@@ -280,6 +280,18 @@ t.describe("UE grep live 输入保护", function()
 end)
 
 t.describe("UE grep 结果信息架构与预览定位", function()
+  t.it("默认使用扁平 grep 行，文件分组只允许显式诊断开关启用", function()
+    local root = vim.fn.stdpath("config"):gsub("\\", "/")
+    local file = assert(io.open(root .. "/lua/ue.lua", "rb"))
+    local content = file:read("*a")
+    file:close()
+
+    t.assert_contains(content, "local grouping_enabled = (vim.g.ue_grep_grouping_enabled == true)")
+    t.assert_contains(content, 'format = grouping_enabled and CORE_RT.grep_format_grouped or "file"')
+    t.assert_contains(content, "matcher = grouping_enabled and { sort = false } or nil")
+    t.assert_contains(content, "vim.g.ue_grep_grouping_enabled = not (vim.g.ue_grep_grouping_enabled == true)")
+  end)
+
   t.it("文件分组只标注真实命中，不插入不可预览的伪 header item", function()
     local items = {
       { file = "C:/UE/Game/Source/Foo.cpp", pos = { 12, 3 }, line = "first hit" },

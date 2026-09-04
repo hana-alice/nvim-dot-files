@@ -50,6 +50,17 @@ local fs             = require("ue.core.fs")
 local log            = require("utils.log")
 local android_device = require("utils.android_device")
 
+-- 符号选择（K64/K65）：构建配置来自引擎 cache，build-id 是符号与产物的权威关联键。
+-- 在此处绑定（而不是跟 policy/transport 一起放到文件下方），因为 `pick_symbol_lib`
+-- 就在上方不远处使用它；Lua 的 upvalue 必须先定义。
+local symbols = require("ue.dap._android_symbols").bind({
+  read_build_id = function(path, n)
+    return require("ue.dap._android_policy").read_build_id(path, n)
+  end,
+  is_file = fs.is_file,
+  is_dir = fs.is_dir,
+})
+
 local M = {}
 
 local UE_MODULE_BASENAME = "libUE4.so"
@@ -341,8 +352,13 @@ local function pick_symbol_lib(ctx)
   local proot = effective_project_root(ctx)
   if proot then
     local android_dir = android_marker_path(proot, ctx and ctx.uproject or nil)
-    -- 2. Exact match against packageInfo.txt versionCode — guarantees the
-    --    symbols correspond to the installed APK.
+    -- 2. versionCode 先收窄候选，再用 **build-id** 定案（K64/K65）。
+    --
+    -- 旧注释曾写「versionCode 匹配 guarantees the symbols correspond to the
+    -- installed APK」——**该说法已被证伪**：同一 versionCode 下存在多个不同
+    -- build-id（versionCode 来自打包配置，build-id 来自链接产物）。更重要的是
+    -- **构建配置本来就在引擎 cache 里**（`target_configuration`），而此前它从未
+    -- 参与选择，导致在 Test 工程上静默选中 Shipping 的符号包。
     local info = read_package_info(proot, ctx and ctx.uproject or nil)
     if android_dir and info and info.version_code ~= "" then
       local suffix = "_Symbols_v" .. info.version_code
@@ -366,6 +382,31 @@ local function pick_symbol_lib(ctx)
         end
       end
       table.sort(exact)
+      -- 配置来自引擎 cache（ctx.state）——**不猜、不硬编码某个配置**。
+      local configuration = ctx and ctx.state and ctx.state.target_configuration or nil
+      local target_name = info.target or (ctx and ctx.state and ctx.state.target_name) or nil
+      if not target_name and ctx and ctx.uproject then
+        target_name = vim.fn.fnamemodify(ctx.uproject, ":t:r")
+      end
+      local expected = nil
+      if configuration and target_name then
+        expected = symbols.expected_build_id(android_dir, target_name, configuration)
+      end
+      local chosen, verdict = symbols.select_by_build_id(exact, expected)
+      if chosen then return chosen end
+      if verdict == "no-match" or verdict == "ambiguous" then
+        -- 有期望 build-id 却无候选命中（或多个命中）：**拒绕比选错安全**。
+        -- 错的符号会把断点解析到另一个构建，比「没有符号」更危险（K64）。
+        log.notify("dap.android",
+          ("symbol package does not match the %s build (%s); "
+            .. "pick the symbol package built from the same link, or set "
+            .. "ue.config dap.android_symbol_lib explicitly")
+            :format(tostring(configuration), verdict),
+          vim.log.levels.WARN)
+        return nil
+      end
+      -- verdict == "unknown"：拿不到期望 build-id（该配置的产物 so 不在本地等）。
+      -- 此时才退回 versionCode 弱匹配，且只在唯一候选时接受。
       if #exact == 1 then return exact[1] end
     end
     -- 3. Scan all symbol packages, pick the newest by mtime (best guess

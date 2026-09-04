@@ -72,7 +72,7 @@ end
 
 --- 纯函数（可单测）：从符号库路径抽出它所属的 versionCode。
 ---
---- UE 的 Android 符号包目录形如 `<Target>_Symbols_v<code>/`（见 packageInfo.txt
+--- UE 的 Android 符号包目录形如 `<Target>_Symbols_v<code>`/`（见 packageInfo.txt
 --- 第 2 行的约定）。这里只做字符串抽取——**不猜**：抽不到就返回 nil，让上层判
 --- 「未判定」而不是编一个版本号出来。
 function M.symbol_version_code(symbol_lib)
@@ -89,10 +89,73 @@ function M.version_code_verdict(device_code, symbol_code)
   if not device_code or not symbol_code then return "unknown" end
   return tostring(device_code) == tostring(symbol_code) and "match" or "mismatch"
 end
+--- 纯函数（可单测）：从一个 ELF 文件头部读出 GNU build-id（小写 hex）。
+---
+--- 为何需要它（K64，2026-09-04 实测）：**versionCode 相同不代表符号匹配**。
+--- 同一个 `versionCode=<code-A>` 下实测存在 **5 个不同 build-id**
+--- （Shipping / Test / Testarm64 / gpudiag / 裸 so 各不相同），因为 versionCode 来自
+--- 打包配置，而 build-id 来自链接产物。只比 versionCode 会给出「match」的**假信号**，
+--- 断点仍会解析到错误的二进制 —— 这与 K55 在 iOS 侧的教训同构：UUID 相等才是判据，
+--- 版本号相等不是。
+---
+--- 实现：只读文件头部若干 KB，在其中定位 `.note.gnu.build-id` 的 GNU note，
+--- 其后紧跟 descsz 字节的 build-id。不引入新依赖（仓库约束），不调用外部工具。
+--- 读不到就返回 nil —— **不猜**。
+function M.read_build_id(path, read_bytes)
+  if type(path) ~= "string" or path == "" then return nil end
+  local fh = io.open(path, "rb")
+  if not fh then return nil end
+  local head = fh:read(read_bytes or 8192)
+  fh:close()
+  if not head then return nil end
+  -- ELF note 布局: namesz(4) descsz(4) type(4) name("GNU" + NUL) desc(descsz)
+  -- 相对 name 起点 `at`：namesz 在 at-12、**descsz 在 at-8**、type 在 at-4。
+  -- （实测过一次偏移算错：把 descsz 读成 at-12 得到 4（那是 namesz），
+  -- 于是长度校验不过、函数静默返回 nil。）
+  local marker = "GNU" .. string.char(0)
+  local at = head:find(marker, 1, true)
+  while at do
+    if at >= 13 then
+      local descsz = 0
+      for i = 0, 3 do
+        descsz = descsz + head:byte(at - 8 + i) * (256 ^ i)
+      end
+      local ntype = head:byte(at - 4) or 0
+      -- type 3 = NT_GNU_BUILD_ID；descsz 合理范围内才认（防止误命中普通字符串）
+      if ntype == 3 and descsz >= 8 and descsz <= 64 then
+        local raw = head:sub(at + 4, at + 3 + descsz)
+        if #raw == descsz then
+          return (raw:gsub(".", function(c) return ("%02x"):format(c:byte()) end))
+        end
+      end
+    end
+    at = head:find(marker, at + 1, true)
+  end
+  return nil
+end
+
+--- 纯函数（可单测）：符号一致性的完整判定。
+---
+--- 判据优先级：**build-id 优先于 versionCode**。
+---   两个 build-id 都拿到 → 相等 = "match"，不等 = "mismatch"（**权威判据**）
+---   拿不到 build-id     → 退回 versionCode，相等只算 "weak-match"
+---                         （必要不充分，MUST NOT 宣称已验证）
+function M.symbol_match_verdict(opts)
+  opts = opts or {}
+  local dev_id, sym_id = opts.device_build_id, opts.symbol_build_id
+  if dev_id and sym_id then
+    return dev_id == sym_id and "match" or "mismatch"
+  end
+  local vc = M.version_code_verdict(opts.device_version_code, opts.symbol_version_code)
+  if vc == "mismatch" then return "mismatch" end
+  if vc == "match" then return "weak-match" end
+  return "unknown"
+end
 
 --- 本 target 的能力探针集合。ctx 需含 adb / serial / package_name / remote_lldb_server。
 -- 同一次探测内从 build_argv 传给 decide 的本地期望值（见 L4 探针注释）。
 local last_symbol_code = nil
+local last_symbol_build_id = nil
 
 function M.capability_probes()
   local cap = require("ue.dap.capability")
@@ -118,7 +181,19 @@ function M.capability_probes()
       summary = "the app identity can be entered via run-as",
       remedy = "confirm the installed package is debuggable; a non-debuggable build cannot be attached on a user build",
       build_argv = function(ctx) return probe_run_as(ctx, "id -u") end,
-      decide = function(rc, out) return verdict_from_rc(rc, out) end,
+      -- 区分两种完全不同的失败（2026-09-04 真机）：
+      --   `run-as: unknown package: <pkg>` ⇒ **根本没安装**（换设备/换工程的常见情形）
+      --   其他非零 rc          ⇒ 已安装但 run-as 被拒（通常是不可调试的构建）
+      -- 把前者报成「可能不是 debuggable」会把人往错方向引。
+      decide = function(rc, out)
+        local text = tostring(out or "")
+        if rc ~= nil and rc ~= 0 and text:find("unknown package", 1, true) then
+          return { verdict = V.FAIL,
+            detail = "the package is not installed on this device",
+            remedy = "install the build first (:UEInstallAndroid), then re-run the attach" }
+        end
+        return verdict_from_rc(rc, out)
+      end,
     },
     {
       -- K58：run path 就绪只能以 app uid 判定。这条探针就是那条「差 5 秒命令」。
@@ -236,13 +311,15 @@ function M.capability_probes()
       layer = F.L.SYMBOL, id = "symbol-build-matches-device",
       owner = "dap.android (symbols)",
       summary = "the selected symbol library matches the installed build",
-      remedy = "pick the symbol package whose versionCode equals the installed one; "
-        .. "a mismatch resolves breakpoints against the wrong source revision",
-      -- build_argv 把本次选中的符号包 versionCode 记到闭包外的 last_symbol_code，
+      remedy = "pick the symbol package built from the SAME link as the installed "
+        .. "binary (build-id equality, not just versionCode); a mismatch resolves "
+        .. "breakpoints against the wrong revision",
+      -- build_argv 把本次选中的符号包证据记到闭包外（versionCode + build-id），
       -- 因为 decide 的纯函数契约只收 (rc, out, err)。这是有意的取舍：探针命令与
       -- 判定都保持可单测，而「本地期望值」这个 ctx 派生量只在同一次探测内传递。
       build_argv = function(ctx)
         last_symbol_code = M.symbol_version_code(ctx.symbol_lib)
+        last_symbol_build_id = M.read_build_id(ctx.symbol_lib)
         return probe_shell(ctx, "dumpsys package " .. tostring(ctx.package_name or "")
           .. " | grep -m1 versionCode")
       end,
@@ -254,7 +331,14 @@ function M.capability_probes()
         if not device_code then
           return { verdict = V.UNDETERMINED, detail = out }
         end
-        local verdict = M.version_code_verdict(device_code, last_symbol_code)
+        -- 设备侧 build-id 需要从已安装 APK 里抽，成本高且需额外权限；本探针只持
+        -- 有符号侧的 build-id，因此得到的最强结论是 "weak-match"——它诚实地
+        -- 告知「versionCode 对得上，但这不证明同一次构建」（K64）。
+        local verdict = M.symbol_match_verdict({
+          device_version_code = device_code,
+          symbol_version_code = last_symbol_code,
+          symbol_build_id = nil, -- 只有一边时不进 build-id 分支
+        })
         if verdict == "unknown" then
           return { verdict = V.UNDETERMINED,
             detail = ("device versionCode=%s; no symbol package versionCode to compare")
@@ -268,8 +352,12 @@ function M.capability_probes()
             detail = ("device versionCode=%s but symbols are v%s")
               :format(device_code, tostring(last_symbol_code)) }
         end
+        -- weak-match：MUST NOT 宣称已验证。实测同一 versionCode 下存在 5 个不同
+        -- build-id，所以这里只能说「版本号一致」并把 build-id 一并呈现供人核对。
+        local detail = ("versionCode=%s matches; symbol build-id=%s")
+          :format(device_code, tostring(last_symbol_build_id or "unreadable"))
         return { verdict = V.PASS,
-          detail = ("versionCode=%s matches the selected symbols"):format(device_code) }
+          detail = detail .. " (versionCode equality alone does not prove same-build)" }
       end,
     },
   }

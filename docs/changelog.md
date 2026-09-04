@@ -47,6 +47,67 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-04 — L4 符号判据改以 build-id 为权威（K64）
+
+**Task**
+
+用户提供新环境：引擎 `<engine-root>`、工程 `<project-root>`、
+新接第二台设备 the second vendor's device。目标是拿到上一轮缺的那块——与设备匹配的符号包——
+从而验证 L4 一致性并尝试端到端 attach。
+
+**Implemented**
+
+- 环境摸清（3.6 工程）：`packageInfo.txt` = `<package>` / `<code-A>`；
+  自动发现逻辑精确选中 `<Target>_Symbols_v<code>/Client-arm64/libUE4.so`。
+- **新增 `read_build_id()`**（纯 Lua 读 ELF note，不引入新依赖、不调外部工具）与
+  **`symbol_match_verdict()`**：build-id 为权威判据，versionCode 降为必要条件。
+  两边 build-id 都有 → `match`/`mismatch`；只有 versionCode → 最强只能是 **`weak-match`**。
+- L4 探针接入上述判定；通过时的文本显式声明
+  `versionCode equality alone does not prove same-build`，并一并呈现符号侧 build-id 供人核对。
+- `run-as-available` 探针区分两种完全不同的失败：`run-as: unknown package` →
+  「**未安装**，去 `:UEInstallAndroid`」；其他非零 rc → 「已安装但 run-as 被拒」。
+- `docs/CONSTRAINTS.md` 新增坑 **K64**；新增 10 例回归
+  （`dap_failure_layer` 80 → 90）。
+
+**Pitfalls / Gotchas**
+
+- **本轮最重要的发现（K64）**：符号包与 `packageInfo` 的 versionCode **完全相等**
+  （都是 <code-A>），看起来完美匹配 —— 但 build-id 一比就崩：同一个 versionCode 下
+  存在 **5 个不同 build-id**（Shipping/符号包 `0517eb87…`、Test `4dbe8406…`、
+  Testarm64 `3f8a49ac…`、gpudiag `a8b76e22…`、裸 so `df611845…`）。
+  因为 **versionCode 来自打包配置，build-id 来自链接产物**。上一轮那个
+  「符号包终于对上了」的结论 **被自己提供的证据证伪** —— 与 K55（iOS 必须比 UUID）同构。
+- **实现坑（自己踩的）**：ELF note 的 `descsz` 在 `at-8`，`at-12` 是 `namesz`。
+  我最先写成 `at-12`，于是读到 4、长度校验不过、函数**静默返回 nil**——
+  表现成「这些 .so 都没有 build-id」。靠对比 Python 独立算出的值才定位到。
+  教训：**一个返回 nil 的“无结果”必须先怀疑自己的解析，而不是数据。**
+- **写入坑**：通过 shell heredoc 写 Lua 源码时，`"GNU\0"` 里的转义被层层剥成
+  **真 NUL 字节**落盘（`rg` 直接把文件当二进制）。反复用 Python `replace` 修不掉（模式
+  自身同样被转义）。正确做法：用 write 工具直接落盘，并在 Lua 里用
+  `"GNU" .. string.char(0)` 拼接，**不在字符串字面量里写 NUL 转义**。
+- 第二台设备上该包**未安装**（APK 1.8GB，本轮未装），因此端到端 attach 仍未跑成。
+  但这反而验证了门禁的设计意图：它直接给出 `run-as: unknown package` 并报「未安装」，
+  而不是让人在 L3 看到一句无信息量的错误。
+
+**Validation**
+
+- 纯 Lua `read_build_id` 与 Python 独立计算的 build-id **逐字一致**（5 个产物全部核对）。
+- `dap_failure_layer` → **90/90**（新增 10 例，含合成 ELF note fixture 与真机 build-id 值）
+- 全量 `nvim --headless -l tests/run.lua` → **1465/1465 passed, 0 failed**
+- **真机验证**（第二台设备 the second vendor's device，user build / 非 debuggable / Enforcing / arm64-v8a）：
+  自动发现选中 `<Target>_Symbols_v<code>` → L2 因「未安装」拦下，
+  证据为 `run-as: unknown package: …`，处置为「先安装」——**换设备未改一行代码**。
+- spec 一致性处置：**判定无 spec 影响**——`dap-failure-layering` 已声明「能力靠探测」
+  与「推断必须标注为推断」，本轮是把 L4 的判据从弱升到强，未新增可观察行为契约。
+
+**Follow-ups**
+
+- **端到端 attach 仍未跑**：需先向第二台设备安装 1.8GB APK。且注意：若装 **Test** 包，
+  其 build-id 是 `4dbe8406…` 而符号包是 `0517eb87…`（Shipping）——**两者不同构建**，
+  断点会解析到错误修订。要真正验证断点，需装 **Shipping** 包或取 Test 对应的符号包。
+- 设备侧 build-id 提取（从已安装 APK 或 `/proc/<pid>/maps` 对应文件）尚未实现，
+  所以当前最强结论是 `weak-match`；接通后可升为权威 `match`。
+
 ### 2026-09-04 — 补完 DAP 分层的 4 项 follow-up（2.4 / 2.5 / 4.3 / 5.4）
 
 **Task**
@@ -82,7 +143,7 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
   修法：**rc 与输出一致才下结论**，不一致判 `undetermined`。
 - **排查中踩到一个假信号（K63-B）**：怀疑 `pidof` 在该设备失效，改用 `pgrep -f` 验证 ——
   它对 `zzz_nonexistent_zzz` **也返回 pid**，因为匹配到了自己的命令行；同一时刻
-  `pgrep -f mingchao` 每次给不同 pid（28109/28143）而 `ps -A | grep -c` 为 0。
+  `pgrep -f <app-substring>` 每次给不同 pid（28109/28143）而 `ps -A | grep -c` 为 0。
   ⇒ `pgrep -f` 不能作存在性判据；`pidof` 其实正常（对 init 返回 `1 238`），
   当时 rc=1 是**正确**答案（应用确实没跑）。**先证伪自己的怀疑，再改代码。**
 - **报告措辞自相矛盾（K63-C）**：L4 错配被标 `<== BLOCKING` 而 `blocks_attach=false`，
@@ -97,7 +158,7 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 - **真机复验**（同一台小米 fuxi）：
   ① 应用未运行 → L2 正确判 FAIL 并拦下（rc=1 + 空输出 = 一致）；
   ② 启动应用（pid 28354）后 → L2 通过；
-  ③ 传入错配符号包 → **L4 检出 `device versionCode=178739401 but symbols are v178130152`**
+  ③ 传入错配符号包 → **L4 检出 `device versionCode=<code-A> but symbols are v<code-B>`**
   —— 与 2026-09-03 记录的未闭环 follow-up 数字完全一致，且 `blocks_attach=false` 正确。
 - spec 一致性处置：**判定无 spec 影响**——本轮全部是既有 requirement 的实现补齐
   （`dap-failure-layering` 已声明「失败先报层」「attach 先过门禁」「能力靠探测」）。
@@ -107,7 +168,7 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 - `openspec/changes/archive/2026-09-04-harden-dap-failure-layering/tasks.md` 的
   **全部 8 组任务已勾完**（0 项未完成）。
 - 真机 attach 端到端（走完 L3/L4 到 threads + bp resolved）**仍未跑**：那需要真启一次
-  调试会话，且当前设备的符号包与 `versionCode=178739401` 不匹配（L4 已能自动指出这一点）。
+  调试会话，且当前设备的符号包与 `versionCode=<code-A>` 不匹配（L4 已能自动指出这一点）。
 - iOS 侧 L2 探针未枚举（Apple 的 L2 是设备信任 / 开发者模式 / 签名）。
 
 ### 2026-09-04 — Android DAP owner 按层拆分（design D7 阶段 1–3）
@@ -429,7 +490,7 @@ refresh the cache」。原始症状（包名已脱敏）：用户先敲错一次
 - 符号断点的时序风险**待验证**：UE 的转发信号线程会轮询
   `WaitForSignalHandlerToFinishOrExit()`，`GAndroidSignalTimeOut` 到点会 `exit(0)`，
   长时间停在该断点上仍可能让 app 自退。
-- 设备构建 `versionCode=178739401` 与两个符号包（`…_v178130152`/`…_v178228633`）都不
+- 设备构建 `versionCode=<code-A>` 与两个符号包（`…_v<code-B>`/`…_v<code-C>`）都不
   匹配，符号错配问题独立于本次修复，**待验证**。
 
 **Validation**
@@ -447,7 +508,7 @@ refresh the cache」。原始症状（包名已脱敏）：用户先敲错一次
 
 - 真机复验：制造一次真实 UE 致命信号，确认 `FFatalSignalHandler::OnTargetSignal`
   断点确实 resolve + 命中，且不被 `GAndroidSignalTimeOut` 抢跑（待验证）。
-- 符号包与设备 `versionCode` 错配（178739401 vs 178130152/178228633）。
+- 符号包与设备 `versionCode` 错配（<code-A> vs <code-B>/<code-C>）。
 - `continue` 之后 nvim-dap 对陈旧 thread id 猛刷 `stackTrace` → 全部
   `invalid thread`，属独立缺陷。
 - `current_breakpoint_commands()` 里 `?breakpoint set` 的 `?` 前缀仍无仓内文档。
@@ -514,9 +575,9 @@ refresh the cache」。原始症状（包名已脱敏）：用户先敲错一次
 - ⚠️ **待验证（本次未闭环，不得当成结论）**：attach 成功后仍有
   `ASLR base unresolved for libUE4.so`。实测目标进程 `/proc/<pid>/maps` 里
   **一条 libUE4.so 映射都没有**（2350 行、`grep -c libUE4.so` = 0），而 APK
-  `lib/arm64/libUE4.so` 确实存在（347157120 B）。同时设备 `versionCode=178739401`
-  与被选中的符号包 `Client_Symbols_v178130152` 不一致（本地另有
-  `Client_Symbols_v178228633`，两者都不等于设备值）。这可能是「进程还没 dlopen 引擎
+  `lib/arm64/libUE4.so` 确实存在（347157120 B）。同时设备 `versionCode=<code-A>`
+  与被选中的符号包 `Client_Symbols_v<code-B>` 不一致（本地另有
+  `Client_Symbols_v<code-C>`，两者都不等于设备值）。这可能是「进程还没 dlopen 引擎
   主 so」「符号包版本不对」或两者叠加——**尚无证据区分**，需要单独排查。
 - `lua/ue/dap/ios.lua` 的裸 `script` 发射仍未在 macOS lldb 上验证（K57 scope）。
 - 复验日志里 stop 事件之后出现 `Vim:E474: Invalid argument` +

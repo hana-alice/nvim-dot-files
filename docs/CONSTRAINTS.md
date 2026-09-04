@@ -692,7 +692,7 @@
   两者不一致（命令未真正执行 / 输出被包装层吃掉）判 **undetermined**，不判 FAIL。
   症状 B（排查过程中的假信号，必须记下来）: 用 `pgrep -f <pattern>` 替代 `pidof` 时，
   它会匹配到**自己的命令行**——对 `zzz_nonexistent_zzz` 也返回 pid。实测同一时刻
-  `pgrep -f mingchao` 给 28109 / 28143（每次不同），而 `ps -A | grep -c` 为 0。
+  `pgrep -f <app-substring>` 给 28109 / 28143（每次不同），而 `ps -A | grep -c` 为 0。
   ⇒ **`pgrep -f` 不能用作进程存在性判据**；`pidof` 在该设备工作正常（对 init 返回
   `1 238`），当时 rc=1 是**正确**答案（应用确实没跑）。
   症状 C: L4 符号错配曾被标 `<== BLOCKING`，而同一份输出里 `blocks_attach=false`
@@ -701,6 +701,35 @@
   → `lua/ue/dap/_android_policy.lua`（rc/输出一致性判定）;
     `lua/ue/dap/capability.lua`（format_report 的两种标记）;
     行为测 `tests/cases/dap_failure_layer_spec.lua`
+
+- **K64 — versionCode 相同 ≠ 符号匹配：必须比 build-id（2026-09-04 实测）**
+  层归属: **L4 符号语义**。
+  症状: 3.6 工程的 `packageInfo.txt` 与符号包目录名都是 `<code-A>`，看起来完美匹配，
+  但它们**不是同一次构建**的产物。
+  决定性证据（同一 `versionCode=<code-A>` 下存在 **5 个不同 build-id**）:
+  | 产物 | build-id |
+  |---|---|
+  | Shipping so / 符号包 `<Target>_Symbols_v<code>` | `0517eb87…289ea1` |
+  | Test so / Test apk | `4dbe8406…a8a355` |
+  | Testarm64 apk | `3f8a49ac…3fc6a3` |
+  | gpudiag apk | `a8b76e22…050c36f3` |
+  | 裸 `<Target>-arm64.so` | `df611845…e87f4567` |
+  根因: **versionCode 来自打包配置，build-id 来自链接产物**。同一个版本号下可以反复
+  重链出任意多个不同二进制。只比 versionCode 会给出「match」的**假信号**，
+  而断点仍会解析到错误二进制 —— 与 **K55**（iOS: Mach-O/dSYM UUID 相等才是判据）同构。
+  解决约束: 符号一致性判据**以 build-id 为权威**，versionCode 只是必要条件：
+  两边 build-id 都拿到 ⇒ `match`/`mismatch`；只有 versionCode ⇒ 最强结论只能是
+  **`weak-match`**，MUST NOT 宣称已验证（反映到用户可见文本：
+  `versionCode equality alone does not prove same-build`）。
+  build-id 用**纯 Lua** 读 ELF note（不引入新依赖、不调外部工具）。
+  实现坑（实测踩过）: ELF note 布局是 `namesz(4) descsz(4) type(4) name desc`，
+  相对 name 起点 `at`，**descsz 在 `at-8`**（`at-12` 是 namesz）。把偏移写成 `at-12`
+  会读到 4，长度校验不过于是函数**静默返回 nil**——看起来像「该文件没有 build-id」。
+  另一条同时修正的措辞问题: `run-as: unknown package: <pkg>` 意为**根本没安装**（换设备/
+  换工程的常见情形），与「已安装但 run-as 被拒」是两件事，处置也不同
+  （去装 vs 去换可调试构建）；把前者报成「可能不是 debuggable」会把人往错方向引。
+  → `lua/ue/dap/_android_policy.lua`（`read_build_id` / `symbol_match_verdict` /
+    `run-as-available` 的 unknown-package 分支）; 行为测 `tests/cases/dap_failure_layer_spec.lua`
 
 ### 工具链 / LLVM
 

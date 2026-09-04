@@ -3,9 +3,7 @@
 ## Purpose
 
 诊断契约：UE Android DAP attach 失败与 F9 断点失效的分层定位、判定标准与出处。
-
 ## Requirements
-
 ### Requirement: 诊断文档存在且可发现
 
 仓库 SHALL 在 `docs/plans/2026-06-02-android-dap-attach-bp-diagnosis.md` 提供一份
@@ -87,3 +85,33 @@ Android DAP attach 失败与 F9 断点失效的诊断文档，记录当前代码
 - **WHEN** 该诊断 change 被应用
 - **THEN** 不修改 host adapter 版本策略（22.1.6+ forward-only）
 - **AND** 不修改 `stopOnEntry=true`、不在 attachCommands/postRunCommands 加 `process continue`、不动 SIGSEGV/SIGBUS 信号处置
+
+### Requirement: 分层定位 SHALL 有可执行判定，不只有文档排查顺序
+
+Android attach 的分层定位 SHALL 除文档排查顺序之外，提供**机器可判定**的逐层结论：
+每层给出通过 / 失败 / 不适用，并附带其判定所依据的确切命令与输出。首个失败层 SHALL 被
+明确标识为阻塞层。
+
+诊断输出 SHALL 携带层归属；MUST NOT 只给症状文本让读者自行推断层。该判定 SHALL 可在
+没有活跃调试会话时运行——历史上的诊断入口需要活会话才能给信息，导致「attach 都起不来」
+时恰恰拿不到诊断。
+
+#### Scenario: 无活跃会话也能取得逐层判定
+
+- **WHEN** 用户在没有任何活跃 DAP 会话时请求分层判定
+- **THEN** 系统 SHALL 逐层给出判定与 evidence
+- **AND** MUST NOT 因为缺少活跃会话而拒绝给出结论
+
+#### Scenario: 判定指认阻塞层
+
+- **WHEN** 某层判定为失败
+- **THEN** 该层 SHALL 被标识为阻塞层
+- **AND** 其后各层 MAY 标注为未判定
+- **AND** 输出 SHALL 给出该层 owner 与下一步动作
+
+#### Scenario: 诊断输出携带层归属
+
+- **WHEN** 诊断报告任何失败或异常
+- **THEN** 该条目 SHALL 带明确层归属
+- **AND** 层不可判定时 SHALL 显式标注未判定而非猜测
+

@@ -41,6 +41,32 @@ Hard constraints:
   server to "fix" a `lost connection` attach — LLDB 9 / 14 / 18 all fail
   identically under the shell uid, and all work under the app uid (K56).
 
+## Diagnosing a failed attach: start with the layer, not the symptom
+
+Run **`:UEDAPPreflight`** first. It needs no live session (unlike `:UEDAPDiag`,
+which is post-mortem) and reports a per-layer verdict L0→L4 with the exact
+command and exit code behind each one:
+
+| Layer | Question | Owner |
+|---|---|---|
+| L0 host toolchain | does the adapter resolve, is it ≥ 22.1.6, is the python package present? | `lua/utils/platform/*` |
+| L1 transport | is the device reachable, is a serial captured, can we forward? | `lua/utils/android_device.lua` |
+| L2 target OS policy | can the identity that must run the server execute it and ptrace the target? | `lua/ue/dap/android.lua` |
+| L3 debug engine | platform connect / process attach / command sequence | `lua/ue/dap/_common.lua` + lldb |
+| L4 symbol/semantic | slide resolved, breakpoints resolved, symbols match the build | `lua/ue/dap/android.lua` |
+
+**L2 is the only layer whose red light used to surface as an L3 symptom.**
+`attach failed: lost connection` (K56), `The parameter is incorrect` and
+`Connection shut down ... initial handshake packet` (K58) all pointed at nothing.
+Attach now refuses at L2 *before* connecting the engine, and reports the denying
+command. Override with `UE_DAP_SKIP_PREFLIGHT=1` (the skip is recorded in any
+subsequent failure so later forensics is not misled).
+
+`:UEDAPSmoke` runs the same gate on demand and writes redacted evidence to
+`tools/evidence/android-dap/`. With no device it reports `not_applicable`, never
+`pass`. Authority: `openspec/specs/dap-failure-layering/spec.md`;
+`docs/CONSTRAINTS.md` §三 C10.
+
 Android F9 breakpoint success requires evidence from the debugger, not just UI:
 
 - DAP `setBreakpoints` response must reflect the real state.

@@ -5,7 +5,7 @@
 local t = require("tests.harness")
 local cfg = t.bootstrap()
 
--- 81 个 UE* 命令冻结清单（来自 lua/ue.lua + lua/ue/*.lua）。
+-- 84 个 UE* 命令冻结清单（来自 lua/ue.lua + lua/ue/*.lua）。
 local UE_COMMANDS = {
   "UEBuild", "UEBuildAndroid", "UEBuildAndroidSO", "UEBuildIOS", "UEBuildPCH", "UECachePaths", "UECDBPartition",
   "UECDBStatus", "UECDBSwitch", "UECheatsheet", "UECheatsheetEdit", "UEClearCache",
@@ -13,9 +13,9 @@ local UE_COMMANDS = {
   "UEDAPAttach", "UEDAPClearBreakpoints", "UEDAPCondBreakpoint", "UEDAPContinue",
   "UEDAPDiag", "UEDAPEval", "UEDAPFrameDown", "UEDAPFrameUp", "UEDAPHover",
   "UEDAPLaunch", "UEDAPListBreakpoints", "UEDAPLogpoint", "UEDAPNextTab",
-  "UEDAPPause", "UEDAPPrevTab", "UEDAPReattach", "UEDAPREPL", "UEDAPRestartFrame",
+  "UEDAPPause", "UEDAPPreflight", "UEDAPPrevTab", "UEDAPReattach", "UEDAPREPL", "UEDAPRestartFrame",
   "UEDAPRunToCursor", "UEDAPStatus", "UEDAPStepIn", "UEDAPStepOut", "UEDAPStepOver",
-  "UEDAPStop", "UEDAPTab", "UEDAPToggleBreakpoint", "UEDAPToggleUI", "UEDAPWatchAdd",
+  "UEDAPSmoke", "UEDAPStop", "UEDAPTab", "UEDAPToggleBreakpoint", "UEDAPToggleUI", "UEDAPWatchAdd",
   "UEDAPWatchUE", "UEDebugLogToggle", "UEDirtyClear", "UEDirtyStatus",
   "UEDeployAndroidSO", "UEExportCompileCommands", "UEGenerateFromRSP", "UEGrepDiagDump",
   "UEGrepGroupingToggle", "UEGrepTraceShow", "UEGrepTraceToggle", "UEIndexFull",
@@ -28,8 +28,8 @@ local UE_COMMANDS = {
 
 t.describe("commands: UE* 全量注册", function()
   require("ue").setup()
-  t.it("冻结清单含 81 个命令", function()
-    t.assert_eq(#UE_COMMANDS, 82)
+  t.it("冻结清单含 84 个命令", function()
+    t.assert_eq(#UE_COMMANDS, 84)
   end)
   for _, c in ipairs(UE_COMMANDS) do
     t.it(":" .. c .. " 已注册", function()

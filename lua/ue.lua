@@ -5425,15 +5425,12 @@ function M.cached_grep(opts)
   local short_live_max_count = opts.short_live_max_count or 1200
 
   -- ─ Helpers shared by both csearch and rg paths ──────────────────────
-  -- Dev toggle: lets us A/B compare against vanilla snacks behavior. The
-  -- structured path/count formatter and preview throttle are disabled when
-  -- false, while every picker item remains a real match in either mode.
-  -- Toggle at runtime with :UEGrepGroupingToggle.
+  -- Dev toggle for A/B against vanilla snacks: structured path/count formatter and
+  -- preview throttle are off when false. Runtime: :UEGrepGroupingToggle.
   local grouping_enabled = (vim.g.ue_grep_grouping_enabled == true)
-  -- csearch emits hits grouped by file. Buffer only the current file so its
-  -- count is known, then annotate and emit the original match rows. Unlike
-  -- the old synthetic header design, this never creates a selectable item
-  -- without a source location, so every cursor position has a code preview.
+  -- csearch emits hits grouped by file. Buffer only the current file so its count is
+  -- known, then annotate and emit the original match rows. Unlike the old synthetic
+  -- header design, this never creates a selectable item without a source location.
   local function make_file_grouping_cb(cb)
     local current_file = nil
     local current_items = {}
@@ -9347,18 +9344,14 @@ M._dap_run_state = dap_mod._dap_run_state
 M._continue_debounce_until_ms = dap_mod._continue_debounce_until_ms
 M._dap_source_file_cache = dap_mod._dap_source_file_cache
 
--- Delegate DAP public API.  Host adapter is LLVM 22.1.6+ `lldb-dap.exe`
--- (forward-only, CONSTRAINTS C1); codelldb was removed 2026-05-21 and
--- `M.codelldb_paths` no longer exists.  Historical ASLR listeners / hand-written
--- breakpoint helpers stay deleted — the explicit `target modules load --slide`
--- rides in `attachCommands` (K11/K37); persistence is ue.dap._persist_bp's.
+-- Delegate DAP public API.  Host adapter = LLVM 22.1.6+ `lldb-dap.exe` (forward-only,
+-- C1); codelldb removed 2026-05-21.  `--slide` rides in `attachCommands` (K11/K37).
 M.lldb_dap_path = dap_mod.lldb_dap_path
 M.android_dap_attach = dap_mod.android_dap_attach
 
 -- Expose state helpers so peripheral modules (ue/dap/android.lua's pick_package,
--- external probes, future plugins) can read/write the selected project's
--- persisted state without re-implementing canonical bucket resolution. These are forward-
--- declared locals upthread; they exist by the time setup_dap / require returns.
+-- external probes, future plugins) can read/write the selected project's persisted
+-- state without re-implementing canonical buckets. Forward-declared locals upthread.
 M.read_state = read_state
 M.update_state_field = update_state_field
 M.resolve_context = resolve_context
@@ -9404,6 +9397,9 @@ M.dap_toggle_ui = dap_mod.dap_toggle_ui
 M.dap_reset_layout = dap_mod.dap_reset_layout
 M.dap_toggle_repl = dap_mod.dap_toggle_repl
 M.dap_diagnose = dap_mod.dap_diagnose
+-- Layered preflight (C10): unlike :UEDAPDiag it needs NO live session.
+M.dap_preflight = dap_mod.dap_preflight
+M.dap_smoke = dap_mod.dap_smoke
 M.stop_android_debugger = dap_mod.stop_android_debugger
 M.android_dap_reattach  = dap_mod.android_dap_reattach
 M.android_dap_status    = dap_mod.android_dap_status
@@ -10065,6 +10061,10 @@ function M.setup()
   vim.api.nvim_create_user_command("UEDAPDiag", function()
     M.dap_diagnose()
   end, {})
+  vim.api.nvim_create_user_command("UEDAPPreflight", function() M.dap_preflight() end,
+    { desc = "Layered L0-L4 DAP capability preflight (no live session needed)" })
+  vim.api.nvim_create_user_command("UEDAPSmoke", function() M.dap_smoke() end,
+    { desc = "On-demand real-device DAP verification with redacted evidence" })
   vim.api.nvim_create_user_command("UEResetLayout", function()
     M.dap_reset_layout()
   end, {})

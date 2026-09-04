@@ -13,6 +13,10 @@
 ## 按领域导航（权威在 CONSTRAINTS §二）
 
 ### DAP（K1–K10；K1 属已退役 codelldb 路线）
+**先看归属分层**：34 条 DAP 坑里只有 8 条是本仓自己的 bug，9 条目标 OS 策略（L2）、10 条
+调试引擎（L3）、6 条编辑器管道。失败先指认层再给处置，能力靠探测而非假设。
+→ `../docs/CONSTRAINTS.md §三 C10`；`../openspec/specs/dap-failure-layering/spec.md`（正文）
+
 custom-request 被拒（历史）、手动 `target modules load --slide` rebase、强制 `process handle SIG*`、
 LuaJIT hex 截断、Android terminate-vs-disconnect、dap-repl F-key 多模式、Neovide F11 冲突、
 disconnect 死循环、Windows pipe 正斜杠、per-project 断点持久化。

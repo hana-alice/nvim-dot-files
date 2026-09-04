@@ -1750,6 +1750,207 @@ function M.cleanup(_session_state)
   return { device_cleaned = true }
 end
 
+-- ── L0–L4 能力探针（capability probes，注册给 ue.dap.capability）─────────
+--
+-- 为何在这里而不是在通用模块里（docs/CONSTRAINTS.md §三 C10、
+-- openspec/specs/dap-failure-layering/spec.md）：
+-- `adb` / `run-as` / `getenforce` 这些都是 target policy 字面量，通用分层模块出现它们
+-- 会被 ue_platform_boundary 判为 target_policy_literal（本月实测 FAIL 过），而且把它们
+-- 写进通用层会让 iOS 复用退化成硬编码 target 分支（lua/ue/targets/AGENTS.md）。
+-- 所以：**编排在通用层，命令字面量在 target owner。**
+--
+-- 每条 L2 探针都对应一条真实付过代价的坑。它们存在的唯一目的，是让那条坑下次
+-- 在 5 秒内自报层，而不是再次表现为 `lost connection` / `The parameter is incorrect`。
+--
+-- 最小权限视角（K58）：判定「app uid 能否执行」必须以 `run-as <pkg>` 探测；
+-- shell uid 的 `test -x` 对 app uid 的执行权限**零信息量**（实测：shell 通过、
+-- app uid exec 得 126，标签分别是 shell_data_file 与 app_data_file）。
+
+local function probe_shell(ctx, script)
+  return { ctx.adb or "adb", "-s", tostring(ctx.serial or ""), "shell", script }
+end
+
+local function probe_run_as(ctx, script)
+  return probe_shell(ctx, "run-as " .. tostring(ctx.package_name or "")
+    .. " sh -c " .. shell_quote(script))
+end
+
+-- rc==0 ⇒ pass；有明确非零 rc ⇒ fail；rc 取不到（设备掉线等）⇒ undetermined。
+-- 「宁可漏拦不可误拦」在这里落地：没有明确拒绝证据就不判红。
+local function verdict_from_rc(rc, out, fail_remedy)
+  local V = require("ue.dap.capability").VERDICT
+  if rc == nil then
+    return { verdict = V.UNDETERMINED, detail = "no exit code (device unreachable?)" }
+  end
+  if rc == 0 then return { verdict = V.PASS } end
+  return { verdict = V.FAIL, detail = out, remedy = fail_remedy }
+end
+
+--- 本 target 的能力探针集合。ctx 需含 adb / serial / package_name / remote_lldb_server。
+function M.capability_probes()
+  local cap = require("ue.dap.capability")
+  local F = require("ue.dap.failure")
+  local V = cap.VERDICT
+  local OWNER = "dap.android (Android target policy)"
+
+  return {
+    -- ── L1 传输 ──────────────────────────────────────────────────────────
+    {
+      layer = F.L.TRANSPORT, id = "device-reachable",
+      owner = "utils.android_device",
+      summary = "selected device answers a shell command",
+      remedy = "reconnect the device (USB or wifi ADB) and re-select it with :UESetAndroidDevice",
+      build_argv = function(ctx) return probe_shell(ctx, "true") end,
+      decide = function(rc, out) return verdict_from_rc(rc, out) end,
+    },
+    -- ── L2 目标 OS 策略 ─────────────────────────────────────────────────
+    {
+      -- K47：root 是设备能力而非固定命令形状；`run-as` 可用性必须实测。
+      layer = F.L.TARGET_POLICY, id = "run-as-available",
+      owner = OWNER, identity = "app uid",
+      summary = "the app identity can be entered via run-as",
+      remedy = "confirm the installed package is debuggable; a non-debuggable build cannot be attached on a user build",
+      build_argv = function(ctx) return probe_run_as(ctx, "id -u") end,
+      decide = function(rc, out) return verdict_from_rc(rc, out) end,
+    },
+    {
+      -- K58：run path 就绪只能以 app uid 判定。这条探针就是那条「差 5 秒命令」。
+      layer = F.L.TARGET_POLICY, id = "app-uid-can-exec-server",
+      owner = OWNER, identity = "app uid",
+      summary = "the app identity can execute the staged debug server",
+      remedy = "re-stage the server into the app sandbox path (the public transport copy is "
+        .. "labelled shell_data_file and is readable-but-not-executable by the app domain)",
+      build_argv = function(ctx)
+        local sandbox = sandbox_lldb_server_path(ctx.package_name)
+        if not sandbox then return nil end
+        return probe_run_as(ctx, "test -x " .. sandbox)
+      end,
+      decide = function(rc, out)
+        local v = verdict_from_rc(rc, out)
+        -- 首次 attach 时沙箱副本还不存在，这不是策略拒绝，是「还没 stage」。
+        -- 判 undetermined 而非 fail，否则会误拦一次本来能成的首次 attach。
+        if v.verdict == V.FAIL then
+          return { verdict = V.UNDETERMINED,
+            detail = "not executable yet (staging happens later in bootstrap); "
+              .. "a FAIL here after staging means the SELinux label is wrong",
+            remedy = "run :UEDAPPreflight again after an attach attempt has staged the server" }
+        end
+        return v
+      end,
+    },
+    {
+      -- K56：这条是本月最贵的坑。shell uid 无权 ptrace app，LLDB 把该拒绝暴露成
+      -- 子进程 SIGSEGV，host 只看到 `lost connection`。用 app uid 直接问内核。
+      layer = F.L.TARGET_POLICY, id = "app-uid-can-ptrace-target",
+      owner = OWNER, identity = "app uid",
+      summary = "the app identity can read the target process, a prerequisite for ptrace",
+      remedy = "the debug server must run under the app identity (run-as); a shell-uid server "
+        .. "cannot ptrace the app on a user build and surfaces only as `lost connection`",
+      build_argv = function(ctx)
+        if not ctx.pid then return nil end
+        return probe_run_as(ctx, "cat /proc/" .. tostring(ctx.pid) .. "/status")
+      end,
+      decide = function(rc, out)
+        if rc == nil then
+          return { verdict = V.UNDETERMINED, detail = "no exit code (device unreachable?)" }
+        end
+        if rc ~= 0 then
+          return { verdict = V.FAIL, detail = out }
+        end
+        -- K13：目标已被别的 tracer 占用时 attach 也会失败，这同属 L2 策略层。
+        local tracer = tostring(out or ""):match("TracerPid:%s*(%d+)")
+        if tracer and tracer ~= "0" then
+          return { verdict = V.FAIL,
+            detail = "TracerPid=" .. tracer .. " (already being traced)",
+            remedy = "stop the other debugger/tracer, or run :UEDAPStop to clean up a stale session" }
+        end
+        return { verdict = V.PASS }
+      end,
+    },
+    {
+      -- 只作 evidence：Enforcing 本身不是失败，但它是解释 K58 的关键上下文。
+      layer = F.L.TARGET_POLICY, id = "mandatory-access-control-mode",
+      owner = OWNER, identity = "shell",
+      summary = "mandatory access control mode (context for execute-permission denials)",
+      build_argv = function(ctx) return probe_shell(ctx, "getenforce") end,
+      decide = function(rc, out)
+        if rc ~= 0 then
+          return { verdict = V.UNDETERMINED, detail = "could not read enforcement mode" }
+        end
+        return { verdict = V.PASS, detail = out }
+      end,
+    },
+    {
+      layer = F.L.TARGET_POLICY, id = "target-process-running",
+      owner = OWNER, identity = "shell",
+      summary = "the target process exists on the device",
+      remedy = "start the app first, or use :UEDAPLaunch for wait-for-debugger launch",
+      build_argv = function(ctx)
+        return probe_shell(ctx, "pidof -s " .. tostring(ctx.package_name or ""))
+      end,
+      decide = function(rc, out)
+        if rc == nil then
+          return { verdict = V.UNDETERMINED, detail = "no exit code (device unreachable?)" }
+        end
+        if tostring(out or ""):match("%d+") then return { verdict = V.PASS, detail = out } end
+        return { verdict = V.FAIL, detail = "no pid for the package" }
+      end,
+    },
+    -- ── L4 符号语义 ─────────────────────────────────────────────────────
+    {
+      -- 本月未闭环的 follow-up：设备 versionCode 与本地符号包不匹配。
+      -- 它不阻断 attach（断点解析才受影响），所以是 L4 而不是 L2。
+      layer = F.L.SYMBOL, id = "symbol-build-matches-device",
+      owner = "dap.android (symbols)",
+      summary = "the selected symbol library matches the installed build",
+      remedy = "pick the symbol package whose versionCode equals the installed one; "
+        .. "a mismatch resolves breakpoints against the wrong source revision",
+      build_argv = function(ctx) return probe_shell(ctx, "dumpsys package " .. tostring(ctx.package_name or "")
+          .. " | grep -m1 versionCode") end,
+      -- decide 只能看到 rc/out（纯函数契约），拿不到 ctx。本地符号包的
+      -- versionCode 因此由 preflight 在报告层比对；这里只忻实报设备值。
+      decide = function(rc, out)
+        if rc ~= 0 or not tostring(out or ""):match("versionCode") then
+          return { verdict = V.UNDETERMINED, detail = "could not read the installed versionCode" }
+        end
+        local device_code = tostring(out):match("versionCode=(%d+)")
+        if not device_code then
+          return { verdict = V.UNDETERMINED, detail = out }
+        end
+        return { verdict = V.PASS, detail = "device versionCode=" .. device_code }
+      end,
+    },
+  }
+end
+
+--- 本 target 的 probe context 富化（由通用层回调）。
+---
+--- 设备路由与应用身份是 **target 知识**：通用层不得自己 require
+--- `utils.android_device` 或读 `M._session`（那会在 target-generic 模块里制造具体
+--- target 引用，ue_platform_boundary 实测会 FAIL）。因此由本 owner 填。
+function M.probe_context(ctx)
+  ctx = ctx or {}
+  local out = vim.tbl_extend("force", {}, ctx)
+  if not out.serial or out.serial == "" then
+    local ok_dev, dev = pcall(require, "utils.android_device")
+    if ok_dev and dev then
+      local ok_get, serial = pcall(dev.get)
+      if ok_get then out.serial = serial end
+      if not out.adb then
+        local ok_adb, adb = pcall(dev.adb_executable)
+        if ok_adb then out.adb = adb end
+      end
+    end
+  end
+  out.adb = out.adb or M._session.adb or "adb"
+  if not out.package_name or out.package_name == "" then
+    out.package_name = M._session.package_name
+      or (M._last_session and M._last_session.package_name)
+  end
+  out.pid = out.pid or M._session.pid
+  return out
+end
+
 -- ── public: attach / launch ───────────────────────────────────────────────
 
 local function bootstrap_session(opts, on_ready)
@@ -1847,10 +2048,65 @@ end
 
 -- Common tail of attach/launch: spin up lldb-server gdbserver, then hand the
 -- lldb-dap config to nvim-dap. Mutates sess (records pid).
+--
+-- C10 L2 GATE: the target-OS-policy probes run HERE, immediately before the
+-- device server is started and `platform connect` is issued. This is the last
+-- point at which an L2 denial can still be reported as an L2 denial. Past this
+-- line the very same denial only ever surfaced as `attach failed: lost
+-- connection` (K56) or `The parameter is incorrect` (K58) — symptoms that point
+-- at nothing and cost hours of forensics each.
 local function _finalize_session(sess, pid, cfg_name, run_label)
   local P = require("ue.dap._progress")
   sess.pid = pid
   sess.lldb_server_mode = "platform"
+
+  -- The gate is async (P6) and deliberately fail-open: only an explicit denial
+  -- blocks. See preflight.blocks_attach — undetermined never blocks.
+  M._gate_then_start(sess, function()
+    M._finalize_session_after_gate(sess, pid, cfg_name, run_label)
+  end)
+end
+
+--- Run the L2 subset of the capability probes, then continue or refuse.
+--- Split out so the gate itself stays testable without a device.
+function M._gate_then_start(sess, continue_fn)
+  local preflight = require("ue.dap.preflight")
+  local F = require("ue.dap.failure")
+  local P = require("ue.dap._progress")
+
+  if preflight.skipped() then
+    sess._preflight_skipped = true
+    return continue_fn()
+  end
+
+  local l2 = {}
+  for _, d in ipairs(M.capability_probes()) do
+    if d.layer == F.L.TARGET_POLICY then l2[#l2 + 1] = d end
+  end
+
+  P.step("checking target OS policy (L2) …")
+  preflight.run({
+    probes = l2,
+    ctx = {
+      adb = sess.adb, serial = sess.serial,
+      package_name = sess.package_name, pid = sess.pid,
+    },
+    on_done = function(report)
+      if not preflight.blocks_attach(report) then return continue_fn() end
+      local fail = preflight.blocking_failure(report)
+      local text = F.format(fail)
+      P.error("attach refused at L2 (target OS policy)")
+      log.notify_error("dap.android",
+        "attach refused before connecting the debug engine:\n" .. text
+        .. "\n(run :UEDAPPreflight for all layers; UE_DAP_SKIP_PREFLIGHT=1 overrides)")
+      M._attach_in_progress = false
+      M.stop_android_debugger()
+    end,
+  })
+end
+
+function M._finalize_session_after_gate(sess, pid, cfg_name, run_label)
+  local P = require("ue.dap._progress")
 
   P.step(("starting lldb-server platform (port=%d) …"):format(sess.port))
   local ok_srv, srv_err = start_lldb_server_platform(

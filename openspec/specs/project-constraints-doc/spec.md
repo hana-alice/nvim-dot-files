@@ -3,9 +3,7 @@
 ## Purpose
 
 在 `docs/CONSTRAINTS.md` 提供一份权威的、统一归纳项目禁止项、踩过的坑与约束的参考文档，并使其可被发现、可溯源、可维护。该文档以索引/链接指向仓库既有出处，而非整段复制原文。
-
 ## Requirements
-
 ### Requirement: Consolidated constraints reference document
 
 仓库 SHALL 在 `docs/CONSTRAINTS.md` 提供一份权威文档，统一归纳项目的禁止项、
@@ -127,3 +125,27 @@
 - **WHEN** 某份 spec 或规则文档引用的仓内文件被删除、重命名或归档
 - **THEN** 维护契约要求同步更正该引用（或更正 spec 的产出物要求）
 - **AND** spec 引用完整性回归守护「引用不悬空」这一不变量
+
+### Requirement: 约束文档 SHALL 记录 DAP 归属分层契约与「失败先报层」纪律
+
+`docs/CONSTRAINTS.md` SHALL 在约束小节记录 DAP 五层归属契约（宿主工具链 / 传输 /
+目标 OS 策略 / 调试引擎 / 符号语义），每层给出 owner 与判定手段指针，并 SHALL 记录
+「任何 DAP 失败必须先指认层再给处置」这条纪律。
+
+该小节 SHALL 说明分层的目的：34 条 DAP 坑中仅少数属本仓代码，多数是外部契约
+（目标 OS 策略与调试引擎），分层的作用是让读者一步区分「不是我们能修的」与
+「我们的 bug」，而不必每次现场取证。
+
+#### Scenario: 读者查阅约束小节取得分层
+
+- **WHEN** 读者查阅约束小节
+- **THEN** 它列出 DAP 五层归属契约与每层 owner
+- **AND** 它声明失败先报层的纪律
+- **AND** 它指向治理该契约的 capability spec 作为权威出处
+
+#### Scenario: 踩坑条目可按层归类
+
+- **WHEN** 新增一条 DAP 坑
+- **THEN** 维护契约 SHALL 要求该条目标注其归属层
+- **AND** 标注 SHALL 使读者能判断该坑是外部契约还是本仓缺陷
+

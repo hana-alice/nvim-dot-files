@@ -3,6 +3,29 @@
 > 继承 `../AGENTS.md`（ue 中枢）→ `../../AGENTS.md`（lua 总规则）。只写增量。
 > ⚠️ 本目录踩坑密度最高，改动前**务必**读 `../../../docs/CONSTRAINTS.md §二 DAP` 全段。
 
+## 归属分层契约（先读这一节；权威 = 治理 spec，CONSTRAINTS §三 C10 为摘要）
+
+**为何存在**：34 条 DAP 坑里**只有 8 条是我们自己的 bug**（9 条目标 OS 策略、10 条调试引擎、
+6 条编辑器管道）。不先分层就修，结果就是每月现场取证。
+
+| 层 | 内容 | owner 模块 | 典型坑 |
+|---|---|---|---|
+| **L0** 宙主工具链 | adapter 可解析 / 版本 / python 包 | `../../utils/platform/*` | K14 K57 |
+| **L1** 传输 | adb 可达、serial 捕获、forward | `../../utils/android_device.lua` | K36 |
+| **L2** 目标 OS 策略 | 执行权限、ptrace、SELinux、sandbox、签名 | `android.lua` / `ios.lua`（per-target） | **K56 K58** K12 K38 K3 K55 |
+| **L3** 调试引擎 | platform connect / attach / 命令序列 | `_common.lua` + lldb 本身 | K31 K32 K37 K2 |
+| **L4** 符号语义 | slide、bp resolved、dSYM / versionCode | `android.lua`、`ios.lua` | K35 K37 K55 |
+
+- **失败必须先报层再给处置**：用户可见失败 MUST 携带 `{layer, owner, evidence, remedy}`，
+  先层与 owner、后处置；**不得发出无层失败**；层不可判定就**显式标 undetermined + 给判定手段**，
+  **不得猜层**。evidence MUST 是命令 + 输出，不是结论文本。
+- **设备能力靠探测，不靠假设**：判定「某身份能否做某事」必须以**该身份**探测
+  （例：app uid 用 `run-as`）；更高权限身份的同名探测结果**零信息量**（K58）。
+  不得把单台设备的结论当成其他设备的前提。
+- **attach 先过 L2 门禁再连接引擎**：L2 是唯一「红灯却表现为 L3 症状」的层——
+  `lost connection` / `The parameter is incorrect` / handshake 失败这三种症状**不指向任何根因**。
+  宁可漏拦不可误拦：探针自身失败默认 undetermined，只有**明确拒绕证据**才判红。
+
 ## 用途
 
 UE 专用 DAP：`_common`（adapter 接线 + env 清洗）、`_persist_bp`（断点持久化）、`_progress`、
@@ -48,7 +71,7 @@ UE 专用 DAP：`_common`（adapter 接线 + env 清洗）、`_persist_bp`（断
 
 ## 改动 → 必跑回归
 
-改 `dap/**` → `dap` `platform`；改 `_common` 等被多平台共用面 → 提交前全量。
+改 `dap/**` → `dap` `platform` `dap_failure_layer`；改 `_common` 等被多平台共用面 → 提交前全量。
 注意 `platforms._reset_for_test` 与 `ue.setup()` 幂等的交互（见 `tests/cases/dap_spec.lua`）。
 
 ## 先读
@@ -59,6 +82,7 @@ ADR `../../../docs/plans/2026-06-15-android-dap-live-breakpoints.md`（live 断�
 真机证据 `../../../tools/evidence/android-f9/`。
 
 **治理 spec**（可观察行为的权威；与本文冲突时以 spec 为准）：
+`../../../openspec/specs/dap-failure-layering/spec.md`（**归属分层契约正文**）、
 `../../../openspec/specs/dap-platform-dispatch/spec.md`、
 `../../../openspec/specs/android-dap-attach/spec.md`、
 `../../../openspec/specs/android-dap-live-breakpoints/spec.md`。

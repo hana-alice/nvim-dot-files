@@ -47,6 +47,99 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-03 — DAP 归属分层契约：preflight 门禁 + 失败必须先报层（C10）
+
+**Task**
+
+用户判断：「i just feel nvim debug this dap way is too fragile, i need to repair it
+every month」，并要求 ① 探索稳定实现 ② 调试必须分清是平台问题还是 lldb 问题
+③ 探索成为好的独立开发者 IDE 还要做什么。追加要求：**规则必须让所有 agent 第一次读就看到**。
+
+**Implemented**
+
+先量化再动手。34 条 DAP 坑（K1–K61）按契约归属方统计：**只有 8 条是本仓自己的 bug**，
+9 条目标 OS 策略、10 条调试引擎、6 条编辑器管道——即多数不是我们能修的，而是**没建模的
+外部契约**，且全部在 attach 现场以无信息量症状暴露。修复节奏 2026-05→16 / 06→28 / 07→2 /
+08→4 / 09→3，未加速，成本在**形态**而非数量。
+
+- **规则先可见（一份正文 + 三处指针）**：正文权威在新 capability spec；
+  `docs/CONSTRAINTS.md` 新增 **C10**（五层表 + 每层 owner + 纪律 + 分层目的）；
+  根 `AGENTS.md` SESSION START 加**一行指针**（不复制正文，避免第四份漂移副本）；
+  `lua/ue/dap/AGENTS.md` 置顶层表 + owner 模块；`memory/project_overview.md`、
+  `lessons/README.md`、`docs/TOOLING.md` 同步导航。
+  `structure_spec` 新增 4 例守护三处指针（删掉任一即 FAIL）。
+- **`lua/ue/dap/failure.lua`**（新）：五层枚举 + `{layer, owner, evidence, remedy}`
+  四元组。`new{}` **缺 layer 直接 error**（发出无层失败在开发期就崩）；`UNDETERMINED`
+  必须显式且**强制带 remedy**；evidence 必须是命令 + rc + 输出；`format()` 固定
+  「层与 owner 在前，remedy 在后」。零 target 字面量。
+- **`lua/ue/dap/capability.lua`**（新）：探针 = `build_argv(ctx)` + `decide(rc,out,err)`
+  两个纯函数 + **注入式执行器**，因此 K56/K58 那类设备语义可 fixture 化 headless 测。
+  三态判定，**宁可漏拦不可误拦**：探针出错/超时/无法识别一律 `undetermined`。
+- **`lua/ue/dap/preflight.lua`**（新）+ **`:UEDAPPreflight`**：L0→L4 逐层判定，同层并行，
+  首个 fail 标阻塞层、其后标 skipped；**无需活会话**（`:UEDAPDiag` 是事后取证且需活会话，
+  恰好在 attach 起不来时给不出信息）。逃生开关 `UE_DAP_SKIP_PREFLIGHT=1`，使用后留痕。
+- **attach 接入 L2 门禁**：`_finalize_session` 拆成 `_gate_then_start` +
+  `_finalize_session_after_gate`，L2 明确 FAIL 时在**启动 device server 与 `platform connect`
+  之前**以 L2 归属终止。只有 L2 强制（它是唯一「红灯却表现为 L3 症状」的层）。
+- **Android 注册 7 条探针**（每条对应一条真实付过代价的坑）：`run-as` 可用性（K47）、
+  app uid `test -x`（K58）、app uid ptrace + `TracerPid` 占用（K56/K13）、强制访问控制模式、
+  目标进程存在、设备 versionCode（L4）、设备可达（L1）。L2 探针**一律以 app 身份执行**。
+- **`lua/ue/dap/smoke.lua`**（新）+ **`:UEDAPSmoke`**：按需真机验证 + 脱敏证据落
+  `tools/evidence/android-dap/`；身份一律 digest 化，**写盘前强制脱敏自检**，
+  不合规拒绝写；无设备报 `not_applicable` 而非 pass。
+- 新增 `tests/cases/dap_failure_layer_spec.lua`（45 例）；`commands_spec` 冻结清单
+  82 → 84；`host_resource_discipline_spec` 显式登记 preflight 的唯一 spawn 点；
+  `tests/AGENTS.md` / `docs/testing-regression.md` 新增 `dap_failure_layer` filter。
+
+**Pitfalls / Gotchas**
+
+- **`ue_platform_boundary` 实测拦下一次真违例**：`_preflight_context` 在 target-generic 的
+  `dap.lua` 里直接 `require("ue.dap.android")` 并读其 `_session` → `target_literal_condition`
+  FAIL。**没有加 allowlist**，而是把 target 知识移回 owner：新增 `android.probe_context(ctx)`
+  由通用层回调，并给 `platforms.last_owner()` 一个只读访问器来选 owner（仅作探测提示，
+  lifecycle dispatch 仍要求冻结 owner 元数据）。这条正是本次分层要解决的问题在**架构层**的
+  同形态复现。
+- **`host_resource_discipline` 精确 spawn 计数棘轮再次生效**（设计文档已预判）：preflight 新增
+  `vim.system` 被判「未分类」。已显式登记并写明理由（bounded + async），未绕过。
+- **`lua/ue.lua` 10562 行冻结 ratchet 是硬约束**：注册两条命令 + 两处 delegate 共 +7 行，
+  必须在同文件内**折注释还回 7 行**才通过 `stability`。这迫使实现全部落在 `lua/ue/dap/`——
+  这也正是想要的边界。
+- **首次 attach 的沙箱副本尚未 stage**，若把 `test -x` 失败判 FAIL 会**误拦本可成功的首跑**。
+  已改判 `undetermined`——这是「宁可漏拦」原则的具体落点，并有回归锁定。
+- lldb 的 `exited with status` 与探针 rc 都可能**取不到**（设备掉线）。此时一律
+  `undetermined` 且**不阻断** attach，有回归断言 `blocks_attach == false`。
+- 分层来自真实坑归类，不是凭空设计；D 类（我们自己的 bug）**不设层**，因为它们本来就在
+  本仓可修。无法归类者用 `UNDETERMINED`，spec 已留位。
+
+**Validation**
+
+- `nvim --headless -l tests/run.lua dap_failure_layer` → **45/45 passed, 0 failed**
+- `nvim --headless -l tests/run.lua dap` → **169/169 passed, 0 failed**
+- `nvim --headless -l tests/run.lua ue_platform_boundary` → **9/9**（先 FAIL 1 条真违例，
+  按架构修复后转绿，未加 allowlist）
+- `nvim --headless -l tests/run.lua host_resource_discipline` → **13/13**（先 FAIL，
+  显式登记 spawn 后转绿）
+- `nvim --headless -l tests/run.lua commands` → **108/108**；`stability` → **10/10**
+  （`ue.lua` 回到 10562，ratchet 未上调）
+- 端到端行为验证（注入 fixture 执行器，无需手机）：**K58 语义**（rc=126 +
+  `can't execute: Permission denied`）→ L2 阻塞、L3/L4 skipped、输出含确切命令与处置；
+  **全通过** → 不拦；**设备掉线**（rc=nil）→ undetermined 且不拦。三者均已固化为回归。
+- `openspec validate --specs --strict` → **40/40**（归档后主 spec 生成，引用不再悬空）
+- 全量 `nvim --headless -l tests/run.lua` → **1412/1412 passed, 0 failed**
+- spec 一致性处置：**立 change 承载**（`openspec/changes/harden-dap-failure-layering`，
+  新 capability `dap-failure-layering` + 5 份 delta），随后归档并入主 spec。
+
+**Follow-ups**
+
+- 任务组 7（沿 L1/L2/L3 缝拆分 `android.lua`）**未做**：设计上刻意放最后，纯结构变更不与
+  行为变更混在一起提交，避免 review 与回归定位都变难。
+- 2.4/2.5：把余下 71 处 adb 调用点的失败发出点逐步迁到 `failure.*`（现只迁主路径 + 门禁）。
+- 4.3：L4 的 slide 可解析性判定与「符号包 versionCode 对比」尚未接通 ctx 比对
+  （现只忠实上报设备值，缺本地值时判 undetermined）。
+- iOS 侧 L2 探针未枚举（Apple 的 L2 是设备信任/开发者模式/签名，不是 uid/SELinux）。
+  spec 的层定义 target-agnostic，补 iOS 探针不需改 spec。
+- 真机复验 `:UEDAPPreflight` / `:UEDAPSmoke`：本轮全部以 fixture 验证，**尚未在真机跑过**。
+
 ### 2026-09-03 — 包名设置不得说谎：写入失败不得报成功（K59 / K61）
 
 **Task**

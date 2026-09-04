@@ -2460,4 +2460,195 @@ function D.setup_core(core_table)
   core = core_table
 end
 
+-- ────────────────────────────────────────────────────────────
+-- Layered preflight (docs/CONSTRAINTS.md C10;
+-- openspec/specs/dap-failure-layering/spec.md).
+--
+-- Distinct from D.dap_diagnose on purpose: diagnose is POST-MORTEM and needs a
+-- live session, which is exactly what you do not have when attach itself will
+-- not come up. Preflight answers "is this environment capable right now" with no
+-- session at all.
+-- ────────────────────────────────────────────────────────────
+
+--- Build the probe context from whatever is known right now.
+--- Deliberately tolerant: preflight must work BEFORE a session exists, so every
+--- field is optional and a probe that cannot build its argv reports
+--- "undetermined" rather than failing the layer.
+---
+--- Target-specific enrichment (device routing, application identity) is asked of
+--- the owner via `probe_context()` rather than reached for here — this module must
+--- not name or branch on a concrete target (ue_platform_boundary;
+--- lua/ue/targets/AGENTS.md: drivers stay independent).
+function D._preflight_context(owner_id)
+  local s = D._dap_session_state or {}
+  local ctx = {
+    adb = s.adb,
+    serial = s.serial,
+    package_name = s.package_name,
+    pid = s.pid,
+  }
+  local owner = D._session_owner_module(owner_id)
+  if owner and type(owner.probe_context) == "function" then
+    local ok_ctx, enriched = pcall(owner.probe_context, ctx)
+    if ok_ctx and type(enriched) == "table" then return enriched end
+  end
+  return ctx
+end
+
+--- Resolve the owner module for a session/probe run without naming any concrete
+--- target in this module. The id comes from the caller (session owner metadata or
+--- an explicit opts.owner); it is never inferred from a hardcoded branch.
+function D._session_owner_module(owner_id)
+  local id = tostring(owner_id or "")
+  if id == "" then
+    local session_owner = (D._dap_session_state or {})._ue_session_owner
+    id = tostring(session_owner or "")
+  end
+  if id == "" then
+    -- No frozen owner yet (preflight before any session). Fall back to the
+    -- registry's notion of the current target rather than a literal.
+    local ok_p, platforms = pcall(require, "ue.dap.platforms")
+    if ok_p and platforms and platforms.last_owner then
+      local ok_last, last = pcall(platforms.last_owner)
+      if ok_last then id = tostring(last or "") end
+    end
+  end
+  if id == "" then
+    local ok_ue, ue = pcall(require, "ue")
+    if ok_ue and ue and ue.current_platform then
+      local ok_cur, cur = pcall(ue.current_platform)
+      if ok_cur then id = tostring(cur or "") end
+    end
+  end
+  if id == "" then return nil end
+  local ok_owner, owner = pcall(require, "ue.dap." .. id:lower())
+  return ok_owner and owner or nil
+end
+
+--- Collect the L0 probes that are host-side and target-agnostic.
+--- These live here rather than in a target owner because the host adapter is
+--- shared by every target (C1: LLVM 22.1.6+ lldb-dap, forward-only).
+function D._host_toolchain_probes()
+  local F = require("ue.dap.failure")
+  local V = require("ue.dap.capability").VERDICT
+  return {
+    {
+      layer = F.L.HOST_TOOLCHAIN, id = "adapter-resolves",
+      owner = "utils.platform (host tool resolution)",
+      summary = "the debug adapter executable resolves and reports a version",
+      remedy = "install or repair a 22.1.6+ adapter; the host adapter policy is "
+        .. "forward-only and MUST NOT be downgraded (C1)",
+      build_argv = function()
+        local common = require("ue.dap._common")
+        local exe = common.find_lldb_dap()
+        if not exe then return nil end
+        return { exe, "--version" }
+      end,
+      decide = function(rc, out)
+        if rc == nil then
+          return { verdict = V.UNDETERMINED, detail = "adapter did not report an exit code" }
+        end
+        if rc ~= 0 then return { verdict = V.FAIL, detail = out } end
+        local ver = tostring(out or ""):match("version%s+([%d%.]+)")
+        if not ver then
+          return { verdict = V.UNDETERMINED, detail = "no parsable version in adapter output" }
+        end
+        local major = tonumber(ver:match("^(%d+)"))
+        local minor = tonumber(ver:match("^%d+%.(%d+)")) or 0
+        local patch = tonumber(ver:match("^%d+%.%d+%.(%d+)")) or 0
+        -- C1: forward-only from 22.1.6. Older adapters are a known-broken
+        -- configuration (K14: 22.0-22.1.5 crash at startup on Windows).
+        local ok_version = major and (major > 22
+          or (major == 22 and (minor > 1 or (minor == 1 and patch >= 6))))
+        if not ok_version then
+          return { verdict = V.FAIL, detail = "adapter version " .. ver .. " < 22.1.6" }
+        end
+        return { verdict = V.PASS, detail = "adapter version " .. ver }
+      end,
+    },
+  }
+end
+
+--- Gather every probe applicable to the current target owner.
+--- Target owners contribute their own probes so this module stays free of
+--- target command literals (ue_platform_boundary).
+function D._collect_probes(owner_id)
+  local probes = D._host_toolchain_probes()
+  local owner = D._session_owner_module(owner_id)
+  if owner and type(owner.capability_probes) == "function" then
+    local ok_list, list = pcall(owner.capability_probes)
+    if ok_list and type(list) == "table" then
+      vim.list_extend(probes, list)
+    end
+  end
+  return probes
+end
+
+--- Run the layered preflight and render the per-layer verdict.
+--- Async end to end (P6): never blocks the main loop on device commands.
+function D.dap_preflight(opts)
+  opts = opts or {}
+  local preflight = require("ue.dap.preflight")
+  local probes = D._collect_probes(opts.owner)
+  preflight.run({
+    probes = probes,
+    ctx = D._preflight_context(opts.owner),
+    executor = opts.executor,
+    on_done = function(report)
+      if opts.on_done then return opts.on_done(report) end
+      vim.schedule(function()
+        D._render_diag_buffer({ "=== UE DAP preflight (L0-L4) ===\n"
+          .. preflight.format(report) })
+      end)
+    end,
+  })
+end
+
+--- Run the on-demand real-device smoke and persist redacted evidence.
+---
+--- Honest by construction: with no device this reports `not_applicable`, never
+--- `pass`. Faking a host or an executable to make it "pass" is prohibited
+--- (host-capability guard; see the root AGENTS.md red-regression rule).
+function D.dap_smoke(opts)
+  opts = opts or {}
+  local smoke = require("ue.dap.smoke")
+  local preflight = require("ue.dap.preflight")
+  local ctx = D._preflight_context(opts.owner)
+
+  local function report_out(evidence, note)
+    local dir = opts.evidence_dir
+      or (vim.fn.stdpath("config") .. "/tools/evidence/android-dap")
+    local path, err = smoke.write_evidence(dir, "smoke.current.result.json", evidence)
+    local lines = { "=== UE DAP smoke ===", "status: " .. tostring(evidence.status) }
+    if evidence.reason then lines[#lines + 1] = "reason: " .. evidence.reason end
+    if note then lines[#lines + 1] = note end
+    lines[#lines + 1] = path and ("evidence: " .. path)
+      or ("evidence NOT written: " .. tostring(err))
+    if opts.on_done then return opts.on_done(evidence, path, err) end
+    vim.schedule(function() D._render_diag_buffer({ table.concat(lines, "\n") }) end)
+  end
+
+  local status, reason = smoke.applicability(ctx)
+  if status then
+    return report_out(smoke.build_evidence({ status = status, reason = reason }))
+  end
+
+  -- Phase 1: the layered gate. A blocking layer is already a complete answer;
+  -- there is no point attaching to rediscover it as an opaque L3 symptom.
+  preflight.run({
+    probes = D._collect_probes(opts.owner),
+    ctx = ctx,
+    executor = opts.executor,
+    on_done = function(report)
+      local blocked = preflight.blocks_attach(report)
+      report_out(smoke.build_evidence({
+        status = blocked and smoke.STATUS.FAILED or smoke.STATUS.PASS,
+        reason = blocked and ("blocked at " .. tostring(report.blocking_layer)) or nil,
+        report = report,
+        session = ctx,
+      }), blocked and preflight.format(report) or nil)
+    end,
+  })
+end
+
 return D

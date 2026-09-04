@@ -32,6 +32,11 @@ local SPAWN_AUDIT = {
   { p="lua/ue/dap/android.lua", api="jobstart", a="vim.fn.jobstart(jdb_connect_argv", class="dap", reason="DAP JDWP bridge" },
   { p="lua/ue/dap/android.lua", api="vim.system", a="vim.system(", class="dap", reason="DAP bounded host operation" },
   { p="lua/ue/dap/android.lua", api="fn-system", a="vim.fn.system(cmd)", n=2, class="dap", reason="DAP preflight fallback" },
+  -- C10 L2 gate: the layered capability preflight owns exactly ONE spawn point,
+  -- deliberately centralized here instead of spread across target owners so this
+  -- ratchet has a stable owner. Bounded by preflight.PROBE_TIMEOUT_MS; async only
+  -- (P6/K53: a synchronous probe would cost 87ms of main loop per call on Windows).
+  { p="lua/ue/dap/preflight.lua", api="vim.system", a="vim.system(argv, { text = true, timeout = M.PROBE_TIMEOUT_MS }", class="dap", reason="layered L0-L4 capability probe, bounded + async (C10 attach gate)" },
   { p="lua/ue/dap/ios.lua", api="vim.system", a="pcall(vim.system, argv", class="dap", reason="DAP adapter lifecycle" },
   { p="lua/ue/dap/ios.lua", api="jobstart", a="bridge.job_id = vim.fn.jobstart", class="dap", reason="DAP bridge lifecycle" },
   { p="lua/ue/dap.lua", api="jobstart", a="logcat_job = vim.fn.jobstart", class="dap", reason="DAP log stream" },

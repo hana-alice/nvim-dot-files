@@ -1023,6 +1023,30 @@ spec 引用完整性用例守护）。强制力入口在根 `AGENTS.md` 的 Defi
 → 根 `AGENTS.md` (Definition of Done); `openspec/specs/spec-authority-loop/spec.md`;
   `memory/project_overview.md` (治理 spec 列); `tests/cases/structure_spec.lua`
 
+### C10 — DAP 归属分层契约（失败先报层，再给处置）
+
+**为何分层**：34 条 DAP 坑（K1–K61）按契约归属方统计，**只有 8 条是本仓自己的 bug**；
+9 条是目标 OS 策略、10 条是调试引擎、6 条是编辑器管道——即**多数不是我们能修的，
+而是我们没建模的外部契约**。分层的作用是一步区分这两类，而不必每次现场取证。
+
+| 层 | 内容 | owner | 典型坑 |
+|---|---|---|---|
+| **L0** 宙主工具链 | adapter 可解析、版本、python 包 | `lua/utils/platform/*` | K14 K57 |
+| **L1** 传输 | adb/设备可达、serial 捕获、forward | `lua/utils/android_device.lua` | K36 |
+| **L2** 目标 OS 策略 | 执行权限、ptrace、SELinux、sandbox、签名 | 各 target owner（`dap/android.lua` 等） | **K56 K58** K12 K38 K3 K55 |
+| **L3** 调试引擎 | platform connect / attach / 命令序列 | `dap/_common.lua` + lldb | K31 K32 K37 K2 |
+| **L4** 符号语义 | slide 解析、bp resolved、dSYM/versionCode | `dap/android.lua`、`dap/ios.lua` | K35 K37 K55 |
+
+**纪律**：任何用户可见的 DAP 失败 MUST 携带 `{layer, owner, evidence, remedy}`，且
+**先呈现层与 owner，再呈现处置**；MUST NOT 发出不带层归属的失败；层不可判定时
+**显式标注未判定**并给出判定手段，**MUST NOT 猜一个层**。evidence MUST 是命令 + 输出，
+不是结论文本。设备能力 MUST 由**探测**得出（以将要执行动作的**那个身份**探测），
+MUST NOT 沿用单台设备的结论。attach MUST 先过 L2 门禁再连接调试引擎（L2 是唯一
+「红灯却表现为 L3 症状」的层）。
+**新增一条 DAP 坑时 MUST 标注其归属层**（见 §六 第 2 条）。
+→ `openspec/specs/dap-failure-layering/spec.md`（正文权威）; `lua/ue/dap/AGENTS.md`（就地可发现）;
+  `docs/TOOLING.md`（排查入口）; `tests/cases/dap_failure_layer_spec.lua`
+
 ---
 
 ## 五、持久化知识库与本地规则（AI 可发现性）
@@ -1061,7 +1085,8 @@ spec 引用完整性用例守护）。强制力入口在根 `AGENTS.md` 的 Defi
 1. **新增一个 workaround** → 在 [§二 snacks/clangd/lazy](#snacks--clangd--lazy活跃-workaround共-9-个文件) 加一行
    （症状 + 文件出处）；文件本身的 frontmatter 仍是权威出处。
 2. **踩到一个新坑** → 在 §二 对应分类加条目，必须含 **症状 + 解决约束 + 出处指针**；
-   并在 `lessons/README.md` 对应领域补一句主题导航。
+   并在 `lessons/README.md` 对应领域补一句主题导航。**DAP 类坑还 MUST 标注其归属层**
+   （L0–L4，见 §三 C10），使读者能判断该坑是**外部契约**还是**本仓缺陷**。
 3. **改动版本钉死项 / 约定 / 启动顺序** → 同步更新 §三，并保持指向 `docs/TOOLING.md`
    / `README.md` / `init.lua` 的出处链接。
 4. **新增子系统目录 / 迁移知识** → 为新目录补一份本地 `AGENTS.md`（内容源，声明继承父级）

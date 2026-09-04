@@ -82,11 +82,11 @@
 
 ## 7. 沿 L1/L2/L3 缝拆分 `android.lua`（纯结构，最后做）
 
-- [ ] 7.1 抽 `lua/ue/dap/android/_transport.lua`（L1：adb / forward / staging 传输跳）
-- [ ] 7.2 抽 `lua/ue/dap/android/_policy.lua`（L2：能力探针 + 沙箱 staging 判定）
-- [ ] 7.3 抽 `lua/ue/dap/android/_engine.lua`（L3：initCommands/attachCommands 序列构造）
-- [ ] 7.4 主 `android.lua` 只保留编排与 session 状态；新文件均 ≤ 800 行（`stability` 上限）
-- [ ] 7.5 跑全量回归，确认拆分零行为变更（用例数不减、无新 FAIL）
+- [x] 7.1 抽 `lua/ue/dap/android/_transport.lua`（L1：adb / forward / staging 传输跳）
+- [x] 7.2 抽 `lua/ue/dap/android/_policy.lua`（L2：能力探针 + 沙箱 staging 判定）
+- [x] 7.3 抽 `lua/ue/dap/android/_engine.lua`（L3：initCommands/attachCommands 序列构造）
+- [x] 7.4 主 `android.lua` 只保留编排与 session 状态；新文件均 ≤ 800 行（`stability` 上限）
+- [x] 7.5 跑全量回归，确认拆分零行为变更（用例数不减、无新 FAIL）
 
 ## 8. 收尾（Definition of Done）
 

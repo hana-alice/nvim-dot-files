@@ -11,10 +11,17 @@
 | 层 | 内容 | owner 模块 | 典型坑 |
 |---|---|---|---|
 | **L0** 宙主工具链 | adapter 可解析 / 版本 / python 包 | `../../utils/platform/*` | K14 K57 |
-| **L1** 传输 | adb 可达、serial 捕获、forward | `../../utils/android_device.lua` | K36 |
-| **L2** 目标 OS 策略 | 执行权限、ptrace、SELinux、sandbox、签名 | `android.lua` / `ios.lua`（per-target） | **K56 K58** K12 K38 K3 K55 |
-| **L3** 调试引擎 | platform connect / attach / 命令序列 | `_common.lua` + lldb 本身 | K31 K32 K37 K2 |
-| **L4** 符号语义 | slide、bp resolved、dSYM / versionCode | `android.lua`、`ios.lua` | K35 K37 K55 |
+| **L1** 传输 | adb 可达、serial 捕获、forward、两跳 staging、server 启动 | `_android_transport.lua`、`../../utils/android_device.lua` | K36 K38 K56 |
+| **L2** 目标 OS 策略 | 执行权限、ptrace、SELinux、sandbox、签名 | `_android_policy.lua` / `ios.lua`（per-target） | **K56 K58** K12 K38 K3 K55 |
+| **L3** 调试引擎 | platform connect / attach / 命令序列 | `_android_engine.lua`、`_common.lua` + lldb 本身 | K31 K32 K37 K2 K57 |
+| **L4** 符号语义 | slide、bp resolved、dSYM / versionCode | `_android_engine.lua`、`ios.lua` | K35 K37 K55 |
+
+**Android owner 已按层拆分**（2701 → ~1870 行）：`android.lua` 只保留编排与 session 生命周期；
+`_android_transport.lua`（L1）/ `_android_policy.lua`（L2）/ `_android_engine.lua`（L3）各自成文件，
+沿用本目录既有的 `_ios_*.lua` 平铺约定。三者**不反向 require owner**，依赖用 `bind()` 注入
+（否则循环依赖）。改命令序列前读 `_android_engine.lua` 顶部的**时序契约**（K3 → K11/K37 → K60）。
+⚠️ Lua 同名函数定义两次会**静默覆盖**——拆分时真踩过（`probe_context` 委派曾永不生效），
+`dap_failure_layer` 有重复定义守卫。
 
 - **失败必须先报层再给处置**：用户可见失败 MUST 携带 `{layer, owner, evidence, remedy}`，
   先层与 owner、后处置；**不得发出无层失败**；层不可判定就**显式标 undetermined + 给判定手段**，

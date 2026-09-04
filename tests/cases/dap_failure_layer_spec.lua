@@ -568,3 +568,78 @@ t.describe("ue.dap.preflight: 异步回调不得使用 fast-event 禁用的 API"
     end
   end)
 end)
+
+-- ════════════════════════════════════════════════════════════════════════
+-- 拆分后的归属与委派（2026-09-04，design D7 阶段 1–3）。
+--
+-- `android.lua` 从 2701 行拆到 ~1870 行，L1/L2/L3 各自成文件：
+--   _android_transport.lua  L1 传输 + 两跳 staging + platform server 启动
+--   _android_policy.lua     L2 目标 OS 策略（能力探针 + probe context）
+--   _android_engine.lua     L3 引擎命令序列 + attach 配置
+--
+-- 拆分过程中真实踩到的坑：`probe_context` 的切片边界没覆盖到它，于是它留在了
+-- owner 里，**同时**我又加了一个委派 stub —— 同名函数定义两次，后者静默覆盖前者，
+-- 委派永不生效。Lua 不会为此报错，所以必须有回归守住。
+-- ════════════════════════════════════════════════════════════════════════
+t.describe("ue.dap.android: 拆分后的归属与委派", function()
+  local function read(rel)
+    return table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/" .. rel), "\n")
+  end
+
+  local SPLIT_FILES = {
+    "lua/ue/dap/_android_transport.lua",
+    "lua/ue/dap/_android_policy.lua",
+    "lua/ue/dap/_android_engine.lua",
+  }
+
+  t.it("三个拆分文件都存在且可加载", function()
+    for _, rel in ipairs(SPLIT_FILES) do
+      local ok, mod = pcall(require, (rel:gsub("^lua/", ""):gsub("%.lua$", ""):gsub("/", ".")))
+      t.assert_true(ok and type(mod) == "table", rel .. " 应可加载并返回表")
+      t.assert_true(type(mod.bind) == "function", rel .. " 应暴露 bind() 注入入口")
+    end
+  end)
+
+  t.it("owner 内不得有同名函数重复定义（Lua 静默覆盖，必须机器守）", function()
+    local source = read("lua/ue/dap/android.lua")
+    local seen, dups = {}, {}
+    for name in source:gmatch("\nfunction M%.([%w_]+)%(") do
+      if seen[name] then dups[#dups + 1] = name end
+      seen[name] = true
+    end
+    for name in source:gmatch("\nlocal function ([%w_]+)%(") do
+      if seen["local:" .. name] then dups[#dups + 1] = "local " .. name end
+      seen["local:" .. name] = true
+    end
+    t.assert_eq(#dups, 0, "重复定义（后者静默覆盖前者）: " .. table.concat(dups, ", "))
+  end)
+
+  t.it("owner 的 capability_probes / probe_context 真的委派到 policy 层", function()
+    local android = require("ue.dap.android")
+    local policy = require("ue.dap._android_policy")
+    local orig_probes, orig_ctx = policy.capability_probes, policy.probe_context
+    policy.capability_probes = function() return { "SENTINEL" } end
+    policy.probe_context = function(ctx) return { delegated = true, mark = ctx and ctx.mark } end
+    local probes_ok = android.capability_probes()[1] == "SENTINEL"
+    local ctx = android.probe_context({ mark = "X" })
+    policy.capability_probes, policy.probe_context = orig_probes, orig_ctx
+    t.assert_true(probes_ok, "capability_probes 必须委派给 policy 层")
+    t.assert_true(ctx.delegated, "probe_context 必须委派给 policy 层")
+    t.assert_eq(ctx.mark, "X", "ctx 必须原样透传")
+  end)
+
+  t.it("拆分文件不反向 require owner（防循环依赖，依赖必须注入）", function()
+    for _, rel in ipairs(SPLIT_FILES) do
+      local source = read(rel)
+      t.assert_true(source:find('require("ue.dap.android")', 1, true) == nil,
+        rel .. " 不得反向 require owner；用 bind() 注入")
+    end
+  end)
+
+  t.it("platform server 的 jobid 由 transport 拥有，清理必须清它", function()
+    -- 拆分把 spawn 搬进 transport，若清理仍只清 owner 的镜像字段，设备上会留下
+    -- 活着的 server 占住端口（K56 记录该残留会静默把 shell-uid SEGV 路径带回来）。
+    local owner = read("lua/ue/dap/android.lua")
+    t.assert_contains(owner, "transport.lldb_server_jobid = nil")
+  end)
+end)

@@ -47,6 +47,78 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-04 — Android DAP owner 按层拆分（design D7 阶段 1–3）
+
+**Task**
+
+承接上一条的 C10 分层契约，执行刻意押后的任务组 7：把 2701 行的 `lua/ue/dap/android.lua`
+沿 L1/L2/L3 缝拆开。目标是**零行为变更的纯结构改动**，并分阶段验证。
+
+**Implemented**
+
+沿用本目录既有的 `_ios_*.lua` 平铺约定，不新造子目录（先尝试过 `android/` 子目录，
+但那会与既有约定分叉，且 `structure` 的目录规则清单要跟着膨胀）：
+
+- `lua/ue/dap/_android_policy.lua`（新，225 行）— **L2 目标 OS 策略**：7 条能力探针
+  + `probe_context`。这是 34 条坑里占 9 条的那一层，独立后每条 L2 语义可单独审阅。
+- `lua/ue/dap/_android_transport.lua`（新，289 行）— **L1 传输**：两跳 staging 的
+  6 个纯函数 + `ensure_lldb_server_pushed` + `start_lldb_server_platform`。
+- `lua/ue/dap/_android_engine.lua`（新，469 行）— **L3 引擎**：`init/attach/postRun`
+  命令序列 + attach 配置。零 adb 调用，却承载最密集的时序契约，文件顶部写明
+  K3 → K11/K37 → K60 的顺序要求与 K57 的禁裸 `script`。
+- `android.lua` **2701 → 1869 行（−31%）**，只保留编排与 session 生命周期；
+  三个拆分文件**不反向 require owner**，依赖经 `bind()` 注入（否则循环依赖）。
+- `tests/helpers/ue_platform_boundary.lua`：owner 识别认平铺拆分约定
+  （`_<target>_<concern>.lua`），并新增 8 例守住**放宽不过度**。
+- `tests/cases/dap_failure_layer_spec.lua` +5 例（拆分归属、委派生效、无反向 require、
+  jobid 归属、**重复定义守卫**）。
+- `host_resource_discipline_spec`：platform server 的 spawn anchor 随代码迁到
+  `_android_transport.lua`。`lua/ue/dap/AGENTS.md` 层表更新 owner 模块列。
+
+**Pitfalls / Gotchas**
+
+- **Lua 同名函数定义两次会静默覆盖，拆分时真踩到**：阶段 1 的切片边界没覆盖到
+  `probe_context`，它留在了 owner 里，**而我又加了一个委派 stub** —— 于是 `android.lua`
+  里出现两个 `M.probe_context`，后者静默胜出，**委派永不生效**。Lua 不报错、测试当时也全绿
+  （因为两份实现行为相同）。已把真实实现移进 policy 层，并加**重复定义守卫**回归；
+  全仓扫描确认其他 owner 无同类问题。
+- **等价性审查必须机器做，不能靠读**：我写了一个规范化比对脚本，把 15 个搬迁函数与 HEAD
+  版本逐字对比。首轮报 10 个 DIFFERS —— 其实是**我的规范化顺序写错了**（先替换
+  `function M.` 再替换调用点前缀）。修正后 **15/15 IDENTICAL**，`probe_context` 那条
+  MISSING 才是真问题（即上面那条）。**先怀疑自己的度量工具，再怀疑代码**。
+- **`ue_platform_boundary` 又一次给出正确压力**：`_android_policy.lua` 一开始被判 generic，
+  于是它自己的 `adb` 字面量被报违例。正确修法是**让 owner 识别认平铺约定**
+  （`_ios_*.lua` 早就在用），而不是加 allowlist —— 后者会把「拆分 owner」这件事推向错误方向。
+  同时补了反向断言：通用模块里的 target 字面量**仍然要被拦**，下划线前缀不得让任意文件变 owner。
+- **`_common` 应当直接 require 而非注入**：engine 层用到 `C.find_lldb_dap`，第一版漏了它
+  （运行时报 `attempt to index global 'C'`）。它是 target-agnostic 的共享管道，不是 target
+  知识，所以直接 require 才对；注入只用于**真正属于 owner 的**知识。
+- **拆分把 spawn 搬走会带走 jobid 归属**：`M._lldb_server_jobid` 现由 transport 拥有，
+  清理路径必须清**拥有方**字段，否则设备上留活 server 占住端口（K56 记录该残留会静默把
+  shell-uid SEGV 路径带回来）。owner 保留只读镜像供 `:UEDAPDiag`，并有回归守。
+
+**Validation**
+
+- 分阶段验证：阶段 1（policy）→ `dap` 174/174、`ue_platform_boundary` 17/17；
+  阶段 2（transport）→ 同上全绿 + `host_resource_discipline` 13/13；
+  阶段 3（engine）→ 7 个 filter 全绿。
+- **机器化等价性审查**：15 个搬迁函数与 HEAD 逐字对比 → **15/15 IDENTICAL**。
+- **命令序列时序实测**：`attach_commands` 输出仍为 K30 连接 → attach → K3 信号处置 →
+  K11/K37 slide → K60 符号断点，顺序未变。
+- **真机复验**（同一台小米 fuxi）：preflight 输出与拆分前**逐字一致**
+  （rc=10 未 stage → undetermined → 不拦）。
+- 全量 `nvim --headless -l tests/run.lua` → **1430/1430 passed, 0 failed**
+  （拆分前 1417，用例数只增不减）。
+- spec 一致性处置：**判定无 spec 影响**——纯结构变更，不改任何可观察行为；
+  `dap-failure-layering` 的层定义与 owner 归属描述已在上一条 change 落地。
+
+**Follow-ups**
+
+- 2.4/2.5 仍未做：余下 adb 调用点的失败发出点逐步迁到 `failure.*`（现只迁主路径 + 门禁）。
+- 4.3：L4 的 slide 可解析性与「符号包 versionCode 对比」仍只忠实上报设备值。
+- 5.4：「L2 红灯时断言未发起 connect」的用例仍缺（现由真机手工验证覆盖）。
+- 真机 attach 端到端（走完 L3/L4 到 threads + bp resolved）**仍未跑**。
+
 ### 2026-09-03 — DAP 归属分层契约：preflight 门禁 + 失败必须先报层（C10）
 
 **Task**

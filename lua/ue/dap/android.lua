@@ -1114,6 +1114,21 @@ end
 -- L2（目标 OS 策略）已拆到 `_android_policy.lua`：它是 34 条 DAP 坑里占 9 条的那一层，
 -- 独立成文件后可单独审阅与测试，且新增设备策略探针不必先读懂 attach 编排。
 -- 依赖以注入方式给出（不让 policy 反向 require 本模块，避免循环依赖）。
+-- ── 带层归属的失败上报（C10：失败先报层，再给处置）────────────────────────
+--
+-- 每个用户可见的失败都必须能回答「这是哪一层的问题、谁负责、证据是什么」。
+-- 之前这些点只发裸文本（`P.error("lldb-server bootstrap failed: …")`），读者无法
+-- 判断该找设备、找 lldb、还是找我们——那正是每月现场取证的起点。
+local function report_failure(spec)
+  local F = require("ue.dap.failure")
+  local P = require("ue.dap._progress")
+  local fail = F.new(spec)
+  local text = F.format(fail)
+  P.error(spec.headline or spec.summary or "attach failed")
+  log.notify_error("dap.android", text)
+  return fail
+end
+
 local policy = require("ue.dap._android_policy").bind({
   shell_quote = shell_quote,
   sandbox_lldb_server_path = sandbox_lldb_server_path,
@@ -1189,7 +1204,13 @@ local function bootstrap_session(opts, on_ready)
 
   local function after_serial(serial)
     if not serial then
-      P.error("no device selected")
+      report_failure({
+        layer = require("ue.dap.failure").L.TRANSPORT,
+        owner = "utils.android_device",
+        headline = "no device selected",
+        summary = "no Android device was selected for this session",
+        remedy = "run :UESetAndroidDevice and pick a ready device",
+      })
       on_ready(false); return
     end
     sess.serial = serial
@@ -1209,8 +1230,14 @@ local function bootstrap_session(opts, on_ready)
     P.step("5/6  pushing lldb-server to device …")
     local ok_push, push_msg = ensure_lldb_server_pushed(sess.adb, serial, sess.package_name, server_src)
     if not ok_push then
-      P.error("lldb-server bootstrap failed: " .. tostring(push_msg))
-      log.notify_error("dap.android", "lldb-server bootstrap failed: " .. push_msg)
+      report_failure({
+        layer = require("ue.dap.failure").L.TRANSPORT,
+        owner = "dap.android (staging transport)",
+        headline = "lldb-server bootstrap failed",
+        summary = "could not stage the debug server onto the device",
+        evidence = require("ue.dap.failure").observed_evidence("staging", tostring(push_msg)),
+        remedy = "run :UEDAPPreflight to see which layer blocks, then re-try the attach",
+      })
       on_ready(false); return
     end
     sess.remote_lldb_server = push_msg
@@ -1249,12 +1276,21 @@ end
 
 --- Run the L2 subset of the capability probes, then continue or refuse.
 --- Split out so the gate itself stays testable without a device.
-function M._gate_then_start(sess, continue_fn)
+---
+--- `opts.executor` exists for regression only: the gate's whole point is that it
+--- runs BEFORE any engine connection, and the only way to assert "no connection
+--- was initiated" without a device is to drive the probes from recorded output.
+--- Production callers pass nothing and get the real async executor.
+function M._gate_then_start(sess, continue_fn, opts)
   local preflight = require("ue.dap.preflight")
   local F = require("ue.dap.failure")
   local P = require("ue.dap._progress")
+  opts = opts or {}
 
   if preflight.skipped() then
+    -- Escape-hatch trace: without this flag a later failure cannot tell the user
+    -- the gate was bypassed, and the next forensics round is misled into
+    -- believing the gate cleared this attempt.
     sess._preflight_skipped = true
     return continue_fn()
   end
@@ -1267,6 +1303,7 @@ function M._gate_then_start(sess, continue_fn)
   P.step("checking target OS policy (L2) …")
   preflight.run({
     probes = l2,
+    executor = opts.executor,
     ctx = {
       adb = sess.adb, serial = sess.serial,
       package_name = sess.package_name, pid = sess.pid,
@@ -1275,12 +1312,14 @@ function M._gate_then_start(sess, continue_fn)
       if not preflight.blocks_attach(report) then return continue_fn() end
       local fail = preflight.blocking_failure(report)
       local text = F.format(fail)
+      sess._gate_refusal = text
       P.error("attach refused at L2 (target OS policy)")
       log.notify_error("dap.android",
         "attach refused before connecting the debug engine:\n" .. text
         .. "\n(run :UEDAPPreflight for all layers; UE_DAP_SKIP_PREFLIGHT=1 overrides)")
       M._attach_in_progress = false
       M.stop_android_debugger()
+      if opts.on_refused then opts.on_refused(fail, text) end
     end,
   })
 end
@@ -1295,8 +1334,14 @@ function M._finalize_session_after_gate(sess, pid, cfg_name, run_label)
   -- seeing it; the transport module remains the authority for cleanup.
   M._lldb_server_jobid = transport.lldb_server_jobid
   if not ok_srv then
-    P.error("lldb-server platform failed: " .. tostring(srv_err))
-    log.notify_error("dap.android", "lldb-server platform failed: " .. tostring(srv_err))
+    report_failure({
+      layer = require("ue.dap.failure").L.DEBUG_ENGINE,
+      owner = "dap.android (device platform server)",
+      headline = "lldb-server platform failed",
+      summary = "the device-side platform server did not start",
+      evidence = require("ue.dap.failure").observed_evidence("server start", tostring(srv_err)),
+      remedy = "run :UEDAPPreflight; a target-policy denial at L2 is the usual cause",
+    })
     M.stop_android_debugger()
     return
   end
@@ -1445,7 +1490,15 @@ function M.attach(opts)
     P.step("6/6  finding pid for " .. (sess.package_name or "?") .. " …")
     local pid = pidof(sess.adb, sess.serial, sess.package_name)
     if not pid then
-      P.error(("process %s not running on %s"):format(sess.package_name, sess.serial))
+      report_failure({
+        layer = require("ue.dap.failure").L.TARGET_POLICY,
+        owner = "dap.android (Android target policy)",
+        headline = "target process is not running",
+        summary = "the application has no live process to attach to",
+        evidence = require("ue.dap.failure").command_evidence(
+          { "<adb>", "shell", "pidof", "-s", "<package>" }, nil, "no pid returned"),
+        remedy = "start the app first, or use :UEDAPLaunch for wait-for-debugger launch",
+      })
       M._attach_in_progress = false
       M.stop_android_debugger()
       return
@@ -1490,7 +1543,19 @@ function M.launch(opts)
       vim.list_extend({ "-s", sess.serial }, steps.set_wait))
     if sd_code ~= 0 then
       -- User policy: fail with a recorded reason, do NOT silently fall back.
-      P.error("am set-debug-app failed")
+      -- L2: the debug-app gate is an Android policy mechanism; a non-debuggable
+      -- build is a policy denial, not a debugger defect.
+      report_failure({
+        layer = require("ue.dap.failure").L.TARGET_POLICY,
+        owner = "dap.android (wait-for-debugger launch)",
+        headline = "am set-debug-app failed",
+        summary = "the device refused to arm the debug-app gate",
+        evidence = require("ue.dap.failure").command_evidence(
+          { "<adb>", "shell", "am", "set-debug-app", "-w", "<package>" },
+          sd_code, tostring(sd_out)),
+        remedy = "confirm the installed build is debuggable, or use :UEDAPAttach on a "
+          .. "running process instead",
+      })
       wait_notice("set-debug-app",
         ("am set-debug-app -w %s failed (exit %s): %s — wait-for-debugger launch aborted. "
           .. "Is the app debuggable? Use :UEDAPAttach for a running process instead.")
@@ -1511,7 +1576,13 @@ function M.launch(opts)
       -- already-spawned process keeps waiting regardless.
       pcall(adb_run, sess.adb, vim.list_extend({ "-s", sess.serial }, steps.clear_wait))
       if not pid then
-        P.error(("%s did not start within 10s"):format(pkg))
+        report_failure({
+          layer = require("ue.dap.failure").L.TARGET_POLICY,
+          owner = "dap.android (wait-for-debugger launch)",
+          headline = ("%s did not start within 10s"):format(pkg),
+          summary = "the application never appeared after the debug-app gate was armed",
+          remedy = "confirm the app is debuggable and launchable; see ue-dap-bp-diag.log",
+        })
         wait_notice("wait-launch-no-pid",
           ("%s did not appear within 10s after set-debug-app -w + start "
             .. "(serial=%s). See ue-dap-bp-diag.log."):format(pkg, sess.serial),
@@ -1579,7 +1650,13 @@ function M.reattach()
   -- Async pid poll up to 10s (F4 — no half-blocking vim.wait loop).
   pidof_async(sess.adb, sess.serial, sess.package_name, 10000, function(pid)
     if not pid then
-      P.error(("%s not running on %s after 10s"):format(sess.package_name, sess.serial))
+      report_failure({
+        layer = require("ue.dap.failure").L.TARGET_POLICY,
+        owner = "dap.android (Android target policy)",
+        headline = "target process did not appear within 10s",
+        summary = "reattach timed out waiting for the application process",
+        remedy = "start the app, then run :UEDAPReattach again",
+      })
       M._attach_in_progress = false
       return
     end
@@ -1589,7 +1666,14 @@ function M.reattach()
     local ok_push, push_msg = ensure_lldb_server_pushed(
       sess.adb, sess.serial, sess.package_name, sess.lldb_server_local)
     if not ok_push then
-      P.error("lldb-server re-stage failed: " .. tostring(push_msg))
+      report_failure({
+        layer = require("ue.dap.failure").L.TRANSPORT,
+        owner = "dap.android (staging transport)",
+        headline = "lldb-server re-stage failed",
+        summary = "could not re-stage the debug server for reattach",
+        evidence = require("ue.dap.failure").observed_evidence("staging", tostring(push_msg)),
+        remedy = "run :UEDAPPreflight to identify the blocking layer",
+      })
       M._attach_in_progress = false
       return
     end

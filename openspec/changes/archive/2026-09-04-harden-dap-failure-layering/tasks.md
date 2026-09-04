@@ -25,9 +25,9 @@
       命令 + 输出而非结论文本
 - [x] 2.3 新建 `tests/cases/dap_failure_layer_spec.lua`：构造器缺层报错、UNDETERMINED 必须
       显式、format 顺序（层先于处置）、evidence 形状
-- [ ] 2.4 源码断言用例：扫描 `lua/ue/dap/**` 的 `notify_error|P.error` 调用点，
+- [x] 2.4 源码断言用例：扫描 `lua/ue/dap/**` 的 `notify_error|P.error` 调用点，
       新增/迁移过的入口必须经 `failure.*`（允许显式白名单尚未迁移的旧点，白名单只能缩小）
-- [ ] 2.5 把 attach 主路径的失败发出点迁到 `failure.*`（bootstrap / staging / server 启动 /
+- [x] 2.5 把 attach 主路径的失败发出点迁到 `failure.*`（bootstrap / staging / server 启动 /
       connect / attach 五处），旧点白名单相应缩小
 - [x] 2.6 跑 `dap` `dap_failure_layer` `ue_platform_boundary` 全绿
 
@@ -54,7 +54,7 @@
       其后各层标 `undetermined`；全程异步（P6）
 - [x] 4.2 L0 判定：`lldb-dap` 可解析 + 版本 ≥ 22.1.6（C1 forward-only）+ python 包存在性
       （K57：区分「liblldb 链了 python311.dll」与「`lldb` 包存在」）
-- [ ] 4.3 L4 判定：符号包与设备 versionCode 一致性（本月未闭环的 follow-up）+ slide 可解析性
+- [x] 4.3 L4 判定：符号包与设备 versionCode 一致性（本月未闭环的 follow-up）+ slide 可解析性
 - [x] 4.4 在 `lua/ue.lua` 注册 `:UEDAPPreflight`（**仅注册，实现在 dap/**，保持 10562 行 ratchet）
 - [x] 4.5 输出渲染：逐层 ✓/✗/? + evidence 命令 + 阻塞层的 remedy；可在无活会话时运行
 - [x] 4.6 `commands_spec.lua` 冻结清单 82 → 83 并加注册断言
@@ -66,7 +66,7 @@
       红灯即以 `failure.new{layer=TARGET_POLICY}` 终止
 - [x] 5.2 实现逃生开关 `UE_DAP_SKIP_PREFLIGHT=1`，跳过即在后续失败反馈中留痕（D4）
 - [x] 5.3 探针超时按 P6 放行并标 `undetermined`，MUST NOT 阻塞主循环
-- [ ] 5.4 回归：L2 红灯时断言「未发起 connect」；逃生开关时断言留痕文本存在
+- [x] 5.4 回归：L2 红灯时断言「未发起 connect」；逃生开关时断言留痕文本存在
 - [x] 5.5 跑 `dap` `platform` `ue_platform_boundary` 全绿
 
 ## 6. `:UEDAPSmoke`（真机端到端 + 脱敏证据）

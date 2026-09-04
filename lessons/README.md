@@ -20,7 +20,11 @@
 表现为「探针永不完成」）→ 根治是在边界一次性 `vim.schedule`，不是逐个换纯 Lua 等价物；
 ② 「同一个 rc 代表两种状态」会让门禁静默失效（`test -x` 下「未 stage」与「不可执行」同为
 rc=1，导致 K58 真红灯永远判不出来）→ 用不同退出码分开。同步 fixture 永远碰不到这两条。
-→ `../docs/CONSTRAINTS.md §三 C10`、`§二 K62`；`../openspec/specs/dap-failure-layering/spec.md`（正文）
+**探针实现的三条纪律（K63）**：① 判定必须 **rc 与输出一致**——rc=0 却无输出说明命令没真跑，
+判 undetermined 而非 FAIL（否则误拦一次本可成功的 attach）；② `pgrep -f <pat>` 会匹配**自己的
+命令行**，对不存在的模式也返回 pid，不能作存在性判据；③ 报告措辞不得与判定自相矛盾
+（L4 错配曾标 BLOCKING 而 blocks_attach=false）。
+→ `../docs/CONSTRAINTS.md §三 C10`、`§二 K62`、`§二 K63`；`../openspec/specs/dap-failure-layering/spec.md`（正文）
 
 custom-request 被拒（历史）、手动 `target modules load --slide` rebase、强制 `process handle SIG*`、
 LuaJIT hex 截断、Android terminate-vs-disconnect、dap-repl F-key 多模式、Neovide F11 冲突、

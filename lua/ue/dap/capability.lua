@@ -222,8 +222,16 @@ function M.format_report(report)
   for _, layer in ipairs(failure.LAYER_ORDER) do
     local entry = report.layers[layer]
     if entry then
+      -- 只有 L2 会真的拦下 attach（preflight.blocks_attach）。其他层的 FAIL 仍然
+      -- 终止后续探测，但**不阻断会话**——比如 L4 的符号错配只影响断点解析
+      -- 到哪个修订，不影响能不能 attach。标 BLOCKING 会与 blocks_attach=false
+      -- 自相矛盾（真机实测到这个措辞缺陷），所以分两种标记。
       local suffix = ""
-      if report.blocking_layer == layer then suffix = "   <== BLOCKING" end
+      if report.blocking_layer == layer then
+        suffix = (layer == failure.L.TARGET_POLICY)
+          and "   <== BLOCKS ATTACH"
+          or "   <== FIRST FAILING (does not block attach)"
+      end
       lines[#lines + 1] = ("%s %s %s%s"):format(
         mark[entry.verdict] or "?   ", layer, failure.layer_label(layer) or "?", suffix)
       for _, r in ipairs(entry.results) do

@@ -272,7 +272,7 @@ t.describe("ue.dap.preflight: L2 门禁（K56/K58 语义 fixture 化）", functi
       ["test %-x"] = { rc = 126, out = "denied" },
     }))
     local text = preflight.format(report)
-    t.assert_contains(text, "BLOCKING")
+    t.assert_contains(text, "BLOCKS ATTACH")
     for _, layer in ipairs({ "L0", "L1", "L2", "L3", "L4" }) do
       t.assert_contains(text, layer)
     end
@@ -641,5 +641,354 @@ t.describe("ue.dap.android: 拆分后的归属与委派", function()
     -- 活着的 server 占住端口（K56 记录该残留会静默把 shell-uid SEGV 路径带回来）。
     local owner = read("lua/ue/dap/android.lua")
     t.assert_contains(owner, "transport.lldb_server_jobid = nil")
+  end)
+end)
+
+-- ════════════════════════════════════════════════════════════════════════
+-- 任务 5.4：L2 门禁的**行为**断言（此前只有真机手工验证覆盖）。
+--
+-- 门禁的全部意义是「在发起引擎连接之前拦下」。所以要断言的不是「报了错」，
+-- 而是**连接从未被发起**——这正是 K56/K58 那两条坑的教训：一旦走到 L3，
+-- 同一个策略拒绝就只会表现成 `lost connection` / `The parameter is incorrect`。
+--
+-- 用注入执行器驱动探针，因此无需设备。
+-- ════════════════════════════════════════════════════════════════════════
+t.describe("ue.dap.android: L2 门禁必须先于引擎连接", function()
+  local android = require("ue.dap.android")
+
+  local function fixture(map)
+    return function(argv, done)
+      local key = table.concat(argv, " ")
+      for pattern, res in pairs(map) do
+        if key:find(pattern) then return done(res.rc, res.out, nil) end
+      end
+      done(0, "")
+    end
+  end
+
+  local function run_gate(map)
+    local sess = {
+      adb = "adb", serial = "SERIAL-TEST",
+      package_name = "test.pkg.name", pid = 4242,
+    }
+    local continued, refused = false, nil
+    -- stop_android_debugger 会碰设备与 nvim-dap；门禁测试只关心「是否推进」。
+    local saved_stop = android.stop_android_debugger
+    android.stop_android_debugger = function() return {} end
+    android._gate_then_start(sess, function() continued = true end, {
+      executor = fixture(map),
+      on_refused = function(_, text) refused = text end,
+    })
+    android.stop_android_debugger = saved_stop
+    return { continued = continued, refused = refused, sess = sess }
+  end
+
+  t.it("L2 明确 FAIL → 不调用 continue（引擎连接从未发起）", function()
+    -- rc=11 = staged 但不可执行，K58 的真形状。
+    local r = run_gate({ ["test %-x"] = { rc = 11, out = "" } })
+    t.assert_false(r.continued,
+      "L2 红灯时 MUST NOT 推进到 start_lldb_server_platform / platform connect")
+    t.assert_true(r.refused ~= nil, "必须产出带层归属的拒绝")
+    t.assert_contains(r.refused, "L2")
+  end)
+
+  t.it("拒绝文本含确切命令与 rc，且处置在证据之后", function()
+    local r = run_gate({ ["test %-x"] = { rc = 11, out = "" } })
+    t.assert_contains(r.refused, "rc=11")
+    t.assert_contains(r.refused, "run-as test.pkg.name")
+    local ev = r.refused:find("evidence:", 1, true)
+    local nx = r.refused:find("next:", 1, true)
+    t.assert_true(ev and nx and ev < nx, "evidence 必须先于 remedy")
+  end)
+
+  t.it("L2 全通过 → 正常推进", function()
+    local r = run_gate({})
+    t.assert_true(r.continued, "无阻塞层时必须继续 attach")
+    t.assert_nil(r.refused)
+  end)
+
+  t.it("L2 未判定（设备掉线）→ 仍推进，不误拦", function()
+    local r = run_gate({
+      ["test %-x"] = { rc = nil, out = nil },
+      ["cat /proc/"] = { rc = nil, out = nil },
+    })
+    t.assert_true(r.continued, "未判定不得阻断：宁可漏拦不可误拦")
+  end)
+
+  t.it("逃生开关：跳过门禁并在 session 上留痕", function()
+    local saved = vim.env.UE_DAP_SKIP_PREFLIGHT
+    vim.env.UE_DAP_SKIP_PREFLIGHT = "1"
+    local r = run_gate({ ["test %-x"] = { rc = 11, out = "" } })
+    vim.env.UE_DAP_SKIP_PREFLIGHT = saved
+    t.assert_true(r.continued, "显式跳过时必须放行")
+    t.assert_true(r.sess._preflight_skipped,
+      "跳过必须留痕，否则后续失败取证会被误导成「门禁已放行」")
+  end)
+
+  t.it("门禁只跑 L2 探针（不在 attach 前跑 L0/L1/L3/L4）", function()
+    local seen = {}
+    local sess = { adb = "adb", serial = "S", package_name = "p.k.g", pid = 1 }
+    local saved_stop = android.stop_android_debugger
+    android.stop_android_debugger = function() return {} end
+    android._gate_then_start(sess, function() end, {
+      executor = function(argv, done)
+        seen[#seen + 1] = table.concat(argv, " ")
+        done(0, "")
+      end,
+    })
+    android.stop_android_debugger = saved_stop
+    -- L0 是宿主 adapter 版本探测；它不该出现在 attach 前的 L2 子集里。
+    for _, cmd in ipairs(seen) do
+      t.assert_true(cmd:find("--version", 1, true) == nil,
+        "attach 门禁不得跑 L0 adapter 探针: " .. cmd)
+    end
+    t.assert_true(#seen > 0, "L2 子集不应为空")
+  end)
+end)
+
+-- ════════════════════════════════════════════════════════════════════════
+-- 探针必须 rc 与输出一致才下结论（2026-09-04 由 5.4 的行为测发现）。
+--
+-- 原实现只看「输出里有没有数字」：rc=0 且输出为空时被判 FAIL，于是一次本该
+-- 通过的门禁把 attach 拦掉了。rc 与输出**不一致**说明命令没真正执行（或输出被
+-- 包装层吃掉），那是「未判定」而不是「应用没跑」——判 FAIL 会误拦。
+--
+-- 真机语义（同机实测）：进程存在 → rc=0 + pid；不存在 → rc=1 + 空。
+-- 顺带排除了一个假信号：`pgrep -f <pat>` 会匹配到**自己的命令行**，对不存在的
+-- 模式也返回 pid，因此不能用它替代 pidof。
+-- ════════════════════════════════════════════════════════════════════════
+t.describe("ue.dap.android: 探针需 rc 与输出一致（不一致即未判定）", function()
+  local android = require("ue.dap.android")
+  local capability = require("ue.dap.capability")
+
+  local function probe_by_id(id)
+    for _, d in ipairs(android.capability_probes()) do
+      if d.id == id then return d end
+    end
+  end
+
+  t.it("rc=0 + pid → PASS", function()
+    local r = capability.evaluate(probe_by_id("target-process-running"), 0, "32129\n", nil)
+    t.assert_eq(r.verdict, capability.VERDICT.PASS)
+    t.assert_contains(r.detail, "32129")
+  end)
+
+  t.it("rc≠0 + 空输出 → FAIL（应用确实没跑）", function()
+    local r = capability.evaluate(probe_by_id("target-process-running"), 1, "", nil)
+    t.assert_eq(r.verdict, capability.VERDICT.FAIL)
+    t.assert_contains(r.detail, "not running")
+  end)
+
+  t.it("rc=0 但无输出 → undetermined，MUST NOT 误判为「没跑」", function()
+    local r = capability.evaluate(probe_by_id("target-process-running"), 0, "", nil)
+    t.assert_eq(r.verdict, capability.VERDICT.UNDETERMINED,
+      "rc 与输出不一致时判 FAIL 会误拦一次本可成功的 attach")
+    t.assert_contains(r.detail, "inconsistent")
+  end)
+
+  t.it("rc≠0 但有 pid → undetermined（同样不一致）", function()
+    local r = capability.evaluate(probe_by_id("target-process-running"), 1, "999\n", nil)
+    t.assert_eq(r.verdict, capability.VERDICT.UNDETERMINED)
+  end)
+
+  t.it("其余 L2 探针都以 rc 为主判据（源断言，防同类回归）", function()
+    local source = table.concat(
+      vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue/dap/_android_policy.lua"), "\n")
+    -- 不得再出现「只看输出有没有数字就判 FAIL」的形状。
+    t.assert_true(
+      source:find('if tostring(out or ""):match("%d+") then return { verdict = V.PASS', 1, true) == nil,
+      "探针不得只凭输出含数字下结论，必须与 rc 一致")
+  end)
+end)
+
+-- ════════════════════════════════════════════════════════════════════════
+-- 任务 2.4：源码级守护——DAP owner 不得新增「无层归属」的用户可见失败。
+--
+-- 四元组构造器已在**运行期**强制 layer（缺 layer 直接 error），但那只覆盖
+-- 已经走 failure.* 的路径。新增一个裸 `P.error("...")` / `notify_error("...")`
+-- 会绕过它，且 Lua 不会报错——所以需要源码扫描把「发出点」也守住。
+--
+-- 白名单只能缩小，不能扩大：每一项都要写明为何它不是无层失败。
+-- ════════════════════════════════════════════════════════════════════════
+t.describe("ue.dap: 失败发出点必须带层归属（源码守护）", function()
+  local function read(rel)
+    return table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/" .. rel), "\n")
+  end
+
+  -- 允许的裸发出点，每条附理由。缩小即可，扩大需在此写清为何无需层归属。
+  local ALLOWED = {
+    -- report_failure 自己就是层归属的实现者：它先构造四元组再渲染。
+    ["P.error(spec.headline or spec.summary or \"attach failed\")"] =
+      "report_failure 内部：层归属由 failure.new 强制",
+    -- 门禁自身的 headline；紧随其后就 notify 出完整四元组文本。
+    ["P.error(\"attach refused at L2 (target OS policy)\")"] =
+      "L2 门禁：层已在 headline 与随后的 failure.format 文本中",
+  }
+
+  t.it("android owner 的裸 P.error 均在白名单内", function()
+    local source = read("lua/ue/dap/android.lua")
+    local unlisted = {}
+    for line in source:gmatch("[^\n]+") do
+      local trimmed = line:gsub("^%s+", "")
+      -- 只看代码行，注释里引用历史写法是允许的。
+      if trimmed:sub(1, 2) ~= "--" and trimmed:find("P.error(", 1, true) then
+        if not ALLOWED[trimmed] then unlisted[#unlisted + 1] = trimmed end
+      end
+    end
+    t.assert_eq(#unlisted, 0,
+      "新增的裸失败发出点必须改用 report_failure/failure.new（C10：失败先报层）：\n"
+      .. table.concat(unlisted, "\n"))
+  end)
+
+  t.it("attach 主路径的失败点已迁到带层归属的上报", function()
+    local source = read("lua/ue/dap/android.lua")
+    t.assert_contains(source, "local function report_failure(spec)")
+    -- 迁移过的关键点：每个都必须声明层。
+    for _, marker in ipairs({
+      "headline = \"no device selected\"",
+      "headline = \"lldb-server bootstrap failed\"",
+      "headline = \"target process is not running\"",
+      "headline = \"lldb-server platform failed\"",
+      "headline = \"am set-debug-app failed\"",
+      "headline = \"lldb-server re-stage failed\"",
+    }) do
+      t.assert_contains(source, marker)
+    end
+  end)
+
+  t.it("report_failure 必经 failure.new（构造期强制 layer）", function()
+    local source = read("lua/ue/dap/android.lua")
+    local body = source:match("local function report_failure%(spec%)(.-)\nend")
+    t.assert_true(body ~= nil, "report_failure 应存在")
+    t.assert_contains(body, "F.new(spec)")
+    t.assert_contains(body, "F.format(fail)")
+  end)
+
+  t.it("每个迁移点都声明了 layer（无层的 spec 会在运行期 error）", function()
+    local source = read("lua/ue/dap/android.lua")
+    -- 数一下 report_failure 调用次数与其中 layer= 的出现次数是否匹配。
+    local calls = select(2, source:gsub("report_failure%(%{", ""))
+    local layers = select(2, source:gsub("layer = require%(\"ue%.dap%.failure\"%)%.L%.", ""))
+    t.assert_true(calls > 0, "应存在 report_failure 调用")
+    t.assert_eq(layers, calls,
+      ("每个 report_failure 都必须声明 layer（calls=%d, layer=%d）"):format(calls, layers))
+  end)
+end)
+
+-- ════════════════════════════════════════════════════════════════════════
+-- 任务 4.3：L4 符号一致性判定接通（此前只忠实上报设备值，不做比对）。
+--
+-- 这正是 2026-09-03 记录、当时未闭环的 follow-up：设备 versionCode=178739401
+-- 与本地两个符号包（v178130152 / v178228633）都不匹配，而当时没有任何机制会
+-- 提示这件事——断点会静默解析到错误的源码修订（K35/K37 语义）。
+--
+-- 归 L4 而非 L2 的理由：版本错配**不阻止 attach**，所以它不该拦下会话。
+-- ════════════════════════════════════════════════════════════════════════
+t.describe("ue.dap.android: L4 符号包与设备 versionCode 一致性", function()
+  local policy = require("ue.dap._android_policy")
+  local capability = require("ue.dap.capability")
+
+  t.it("从符号包路径抽 versionCode（纯函数）", function()
+    t.assert_eq(policy.symbol_version_code("C:/x/Client_Symbols_v178130152/libUE4.so"),
+      "178130152")
+    t.assert_eq(policy.symbol_version_code("/a/Game_Symbols_v42/lib/libUE4.so"), "42")
+  end)
+
+  t.it("抽不到就返回 nil（不猜一个版本号出来）", function()
+    t.assert_nil(policy.symbol_version_code("C:/x/libUE4.so"))
+    t.assert_nil(policy.symbol_version_code(""))
+    t.assert_nil(policy.symbol_version_code(nil))
+  end)
+
+  t.it("比对三态：match / mismatch / unknown", function()
+    t.assert_eq(policy.version_code_verdict("111", "111"), "match")
+    t.assert_eq(policy.version_code_verdict("111", "222"), "mismatch")
+    t.assert_eq(policy.version_code_verdict("111", nil), "unknown")
+    t.assert_eq(policy.version_code_verdict(nil, "111"), "unknown")
+  end)
+
+  local function symbol_probe()
+    for _, d in ipairs(policy.capability_probes()) do
+      if d.id == "symbol-build-matches-device" then return d end
+    end
+  end
+
+  t.it("真实错配形状（本月 follow-up）被判 FAIL 并归 L4", function()
+    local d = symbol_probe()
+    t.assert_eq(d.layer, require("ue.dap.failure").L.SYMBOL,
+      "错配不阻止 attach，所以必须是 L4 而不是 L2")
+    d.build_argv({ adb = "adb", serial = "S", package_name = "p",
+      symbol_lib = "/x/Client_Symbols_v178130152/libUE4.so" })
+    local r = capability.evaluate(d, 0, "    versionCode=178739401 minSdk=29", nil)
+    t.assert_eq(r.verdict, capability.VERDICT.FAIL)
+    t.assert_contains(r.detail, "178739401")
+    t.assert_contains(r.detail, "178130152")
+  end)
+
+  t.it("一致时 PASS", function()
+    local d = symbol_probe()
+    d.build_argv({ adb = "adb", serial = "S", package_name = "p",
+      symbol_lib = "/x/Client_Symbols_v111/libUE4.so" })
+    t.assert_eq(capability.evaluate(d, 0, "    versionCode=111", nil).verdict,
+      capability.VERDICT.PASS)
+  end)
+
+  t.it("未选符号包 → undetermined（不编造比对结果）", function()
+    local d = symbol_probe()
+    d.build_argv({ adb = "adb", serial = "S", package_name = "p" })
+    local r = capability.evaluate(d, 0, "    versionCode=178739401", nil)
+    t.assert_eq(r.verdict, capability.VERDICT.UNDETERMINED)
+    t.assert_contains(r.detail, "no symbol package versionCode")
+  end)
+
+  t.it("probe_context 会带上 symbol_lib（否则比对永远 unknown）", function()
+    local android = require("ue.dap.android")
+    android._session.symbol_lib = "/tmp/Client_Symbols_v777/libUE4.so"
+    local ctx = android.probe_context({})
+    android._session.symbol_lib = nil
+    t.assert_eq(policy.symbol_version_code(ctx.symbol_lib), "777")
+  end)
+end)
+
+-- ════════════════════════════════════════════════════════════════════════
+-- 报告措辞不得自相矛盾（2026-09-04 真机发现）。
+--
+-- L4 符号错配曾被标 `<== BLOCKING`，而同一份输出里 `blocks_attach` 是 false ——
+-- 因为只有 L2 真的拦 attach。两个说法互相打脸，读者无法判断会不会被拦。
+-- 现在分两种标记：L2 → BLOCKS ATTACH；其他层 → FIRST FAILING (does not block)。
+-- ════════════════════════════════════════════════════════════════════════
+t.describe("ue.dap.capability: 阻塞标记必须与 blocks_attach 一致", function()
+  local cap = require("ue.dap.capability")
+  local pre = require("ue.dap.preflight")
+
+  local function report_with_fail(layer)
+    local report = { blocking_layer = layer, layers = {} }
+    for _, l in ipairs(failure.LAYER_ORDER) do
+      report.layers[l] = { verdict = (l == layer) and cap.VERDICT.FAIL or cap.VERDICT.PASS,
+        results = {} }
+    end
+    return report
+  end
+
+  t.it("L2 失败 → 标 BLOCKS ATTACH，且 blocks_attach 为真", function()
+    local r = report_with_fail(failure.L.TARGET_POLICY)
+    t.assert_contains(cap.format_report(r), "BLOCKS ATTACH")
+    t.assert_true(pre.blocks_attach(r))
+  end)
+
+  t.it("L4 失败 → 明说不阻断，且 blocks_attach 为假（不得自相矛盾）", function()
+    local r = report_with_fail(failure.L.SYMBOL)
+    local text = cap.format_report(r)
+    t.assert_contains(text, "does not block attach")
+    t.assert_false(pre.blocks_attach(r),
+      "只有 L2 拦 attach；符号错配只影响断点解析到哪个修订")
+  end)
+
+  t.it("L0/L1/L3 失败同样不标成阻断 attach", function()
+    for _, l in ipairs({ failure.L.HOST_TOOLCHAIN, failure.L.TRANSPORT, failure.L.DEBUG_ENGINE }) do
+      local r = report_with_fail(l)
+      t.assert_contains(cap.format_report(r), "does not block attach")
+      t.assert_false(pre.blocks_attach(r))
+    end
   end)
 end)

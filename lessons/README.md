@@ -24,7 +24,11 @@ rc=1，导致 K58 真红灯永远判不出来）→ 用不同退出码分开。�
 判 undetermined 而非 FAIL（否则误拦一次本可成功的 attach）；② `pgrep -f <pat>` 会匹配**自己的
 命令行**，对不存在的模式也返回 pid，不能作存在性判据；③ 报告措辞不得与判定自相矛盾
 （L4 错配曾标 BLOCKING 而 blocks_attach=false）。
-→ `../docs/CONSTRAINTS.md §三 C10`、`§二 K62`、`§二 K63`；`../openspec/specs/dap-failure-layering/spec.md`（正文）
+**符号一致性必须比 build-id（K64）**：同一个 `versionCode` 下实测存在 **5 个不同 build-id**
+（versionCode 来自打包配置，build-id 来自链接产物）。只比 versionCode 会给出「match」假信号，
+断点仍解析到错误二进制——与 K55（iOS 必须比 UUID）同构。判据：两边 build-id 都有才算权威
+`match`/`mismatch`；只有 versionCode 时最强结论是 `weak-match`，不得宣称已验证。
+→ `../docs/CONSTRAINTS.md §三 C10`、`§二 K62`、`§二 K63`、`§二 K64`；`../openspec/specs/dap-failure-layering/spec.md`（正文）
 
 custom-request 被拒（历史）、手动 `target modules load --slide` rebase、强制 `process handle SIG*`、
 LuaJIT hex 截断、Android terminate-vs-disconnect、dap-repl F-key 多模式、Neovide F11 冲突、

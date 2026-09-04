@@ -878,8 +878,8 @@ end)
 -- ════════════════════════════════════════════════════════════════════════
 -- 任务 4.3：L4 符号一致性判定接通（此前只忠实上报设备值，不做比对）。
 --
--- 这正是 2026-09-03 记录、当时未闭环的 follow-up：设备 versionCode=178739401
--- 与本地两个符号包（v178130152 / v178228633）都不匹配，而当时没有任何机制会
+-- 这正是 2026-09-03 记录、当时未闭环的 follow-up：设备 versionCode=900000001
+-- 与本地两个符号包（v900000002 / v900000003）都不匹配，而当时没有任何机制会
 -- 提示这件事——断点会静默解析到错误的源码修订（K35/K37 语义）。
 --
 -- 归 L4 而非 L2 的理由：版本错配**不阻止 attach**，所以它不该拦下会话。
@@ -889,8 +889,8 @@ t.describe("ue.dap.android: L4 符号包与设备 versionCode 一致性", functi
   local capability = require("ue.dap.capability")
 
   t.it("从符号包路径抽 versionCode（纯函数）", function()
-    t.assert_eq(policy.symbol_version_code("C:/x/Client_Symbols_v178130152/libUE4.so"),
-      "178130152")
+    t.assert_eq(policy.symbol_version_code("C:/x/Client_Symbols_v900000002/libUE4.so"),
+      "900000002")
     t.assert_eq(policy.symbol_version_code("/a/Game_Symbols_v42/lib/libUE4.so"), "42")
   end)
 
@@ -918,11 +918,11 @@ t.describe("ue.dap.android: L4 符号包与设备 versionCode 一致性", functi
     t.assert_eq(d.layer, require("ue.dap.failure").L.SYMBOL,
       "错配不阻止 attach，所以必须是 L4 而不是 L2")
     d.build_argv({ adb = "adb", serial = "S", package_name = "p",
-      symbol_lib = "/x/Client_Symbols_v178130152/libUE4.so" })
-    local r = capability.evaluate(d, 0, "    versionCode=178739401 minSdk=29", nil)
+      symbol_lib = "/x/Client_Symbols_v900000002/libUE4.so" })
+    local r = capability.evaluate(d, 0, "    versionCode=900000001 minSdk=29", nil)
     t.assert_eq(r.verdict, capability.VERDICT.FAIL)
-    t.assert_contains(r.detail, "178739401")
-    t.assert_contains(r.detail, "178130152")
+    t.assert_contains(r.detail, "900000001")
+    t.assert_contains(r.detail, "900000002")
   end)
 
   t.it("一致时 PASS", function()
@@ -936,7 +936,7 @@ t.describe("ue.dap.android: L4 符号包与设备 versionCode 一致性", functi
   t.it("未选符号包 → undetermined（不编造比对结果）", function()
     local d = symbol_probe()
     d.build_argv({ adb = "adb", serial = "S", package_name = "p" })
-    local r = capability.evaluate(d, 0, "    versionCode=178739401", nil)
+    local r = capability.evaluate(d, 0, "    versionCode=900000001", nil)
     t.assert_eq(r.verdict, capability.VERDICT.UNDETERMINED)
     t.assert_contains(r.detail, "no symbol package versionCode")
   end)
@@ -990,5 +990,132 @@ t.describe("ue.dap.capability: 阻塞标记必须与 blocks_attach 一致", func
       t.assert_contains(cap.format_report(r), "does not block attach")
       t.assert_false(pre.blocks_attach(r))
     end
+  end)
+end)
+
+-- ════════════════════════════════════════════════════════════════════════
+-- K64：versionCode 相同 ≠ 符号匹配（2026-09-04 实测，第二台设备 the second vendor's device + 3.6 工程）。
+--
+-- 决定性证据：同一个 `versionCode=900000001` 下存在 **5 个不同 build-id**——
+--   Shipping so / 符号包    0517eb878b62477f03ac3087fb0e4c2871289ea1
+--   Test so / Test apk      4dbe840664612c4744b59645718d6e7092a8a355
+--   Testarm64 apk           3f8a49acc4eefd5e6105aa392607de95053fc6a3
+--   gpudiag apk             a8b76e22d1c15e363fb9dc4a734839cd050c36f3
+--   裸 <Target>-arm64.so      df611845a088420a1f81d4f86ecf3b9ae87f4567
+-- 因为 versionCode 来自打包配置，build-id 来自链接产物。只比 versionCode 会给出
+-- 「match」的**假信号**，断点仍解析到错误二进制——与 K55 在 iOS 侧同构
+-- （UUID 相等才是判据）。
+-- ════════════════════════════════════════════════════════════════════════
+t.describe("ue.dap.android: K64 build-id 优先于 versionCode", function()
+  local policy = require("ue.dap._android_policy")
+
+  -- 真机实测值（脱敏：build-id 是构建产物指纹，不含设备/账户身份）
+  local SHIPPING = "0517eb878b62477f03ac3087fb0e4c2871289ea1"
+  local TEST     = "4dbe840664612c4744b59645718d6e7092a8a355"
+
+  t.it("两边 build-id 都有时，它是权威判据", function()
+    t.assert_eq(policy.symbol_match_verdict({
+      device_build_id = SHIPPING, symbol_build_id = SHIPPING }), "match")
+    t.assert_eq(policy.symbol_match_verdict({
+      device_build_id = TEST, symbol_build_id = SHIPPING }), "mismatch")
+  end)
+
+  t.it("build-id 冲突时，versionCode 相同也判 mismatch（不得被版本号救回）", function()
+    t.assert_eq(policy.symbol_match_verdict({
+      device_build_id = TEST, symbol_build_id = SHIPPING,
+      device_version_code = "900000001", symbol_version_code = "900000001" }),
+      "mismatch", "同一 versionCode 下实测有 5 个不同 build-id，版本号不能证明同构建")
+  end)
+
+  t.it("只有 versionCode 时最强结论是 weak-match（不宣称已验证）", function()
+    t.assert_eq(policy.symbol_match_verdict({
+      device_version_code = "900000001", symbol_version_code = "900000001" }),
+      "weak-match")
+  end)
+
+  t.it("versionCode 不同 → mismatch；两者皆缺 → unknown", function()
+    t.assert_eq(policy.symbol_match_verdict({
+      device_version_code = "900000001", symbol_version_code = "900000002" }), "mismatch")
+    t.assert_eq(policy.symbol_match_verdict({}), "unknown")
+  end)
+
+  t.it("read_build_id 解析 ELF note（合成 fixture，含正确的 descsz 偏移）", function()
+    -- 手工构造最小 ELF note：namesz=4 descsz=20 type=3 "GNU\0" + 20 字节
+    local function u32(n)
+      return string.char(n % 256, math.floor(n / 256) % 256,
+        math.floor(n / 65536) % 256, math.floor(n / 16777216) % 256)
+    end
+    local raw = ""
+    for i = 1, 20 do raw = raw .. string.char(i) end
+    local note = ("\127ELF") .. ("\0"):rep(60)
+      .. u32(4) .. u32(20) .. u32(3) .. "GNU" .. string.char(0) .. raw
+    local path = (vim.fn.tempname():gsub("\\", "/"))
+    local fh = assert(io.open(path, "wb")); fh:write(note); fh:close()
+    t.assert_eq(policy.read_build_id(path), "0102030405060708090a0b0c0d0e0f1011121314")
+    pcall(vim.fn.delete, path)
+  end)
+
+  t.it("非 ELF / 不存在的文件 → nil（不猜）", function()
+    t.assert_nil(policy.read_build_id("C:/definitely/not/here.so"))
+    t.assert_nil(policy.read_build_id(""))
+    t.assert_nil(policy.read_build_id(nil))
+    local path = (vim.fn.tempname():gsub("\\", "/"))
+    local fh = assert(io.open(path, "wb")); fh:write("plain text, no note"); fh:close()
+    t.assert_nil(policy.read_build_id(path))
+    pcall(vim.fn.delete, path)
+  end)
+
+  t.it("L4 通过时的 detail 必须点明「版本号一致不等于同构建」", function()
+    local cap = require("ue.dap.capability")
+    local d
+    for _, x in ipairs(policy.capability_probes()) do
+      if x.id == "symbol-build-matches-device" then d = x end
+    end
+    d.build_argv({ adb = "adb", serial = "S", package_name = "p",
+      symbol_lib = "/x/Sample_Symbols_v900000001/libUE4.so" })
+    local r = cap.evaluate(d, 0, "    versionCode=900000001", nil)
+    t.assert_eq(r.verdict, cap.VERDICT.PASS)
+    t.assert_contains(r.detail, "does not prove same-build")
+  end)
+end)
+
+-- ════════════════════════════════════════════════════════════════════════
+-- 「未安装」与「已安装但不可调试」必须分开报（2026-09-04 真机，第二台设备 the second vendor's device）。
+--
+-- 换设备/换工程时最常见的情形就是「这台机上没装这个包」。设备对此的回答是
+-- `run-as: unknown package: <pkg>`，与「已安装但 run-as 被拒」是完全不同的两件事，
+-- 处置也不同（去装 vs 去换可调试构建）。把前者报成「可能不是 debuggable」会把人
+-- 往错方向引——这与 C10 的「先报层再给处置」同一要求：处置必须对得上根因。
+-- ════════════════════════════════════════════════════════════════════════
+t.describe("ue.dap.android: 未安装 vs 不可调试要分开报", function()
+  local policy = require("ue.dap._android_policy")
+  local capability = require("ue.dap.capability")
+
+  local function run_as_probe()
+    for _, d in ipairs(policy.capability_probes()) do
+      if d.id == "run-as-available" then return d end
+    end
+  end
+
+  t.it("`unknown package` → 报「未安装」并让用户去装", function()
+    local r = capability.evaluate(run_as_probe(), 1,
+      "run-as: unknown package: com.example.app", nil)
+    t.assert_eq(r.verdict, capability.VERDICT.FAIL)
+    t.assert_contains(r.detail, "not installed")
+    t.assert_contains(r.remedy, "install the build")
+  end)
+
+  t.it("其他非零 rc → 仍按「已安装但 run-as 被拒」处置", function()
+    local r = capability.evaluate(run_as_probe(), 1, "run-as: Package ... is not debuggable", nil)
+    t.assert_eq(r.verdict, capability.VERDICT.FAIL)
+    t.assert_true(r.detail == nil or r.detail:find("not installed", 1, true) == nil,
+      "不得把「不可调试」也说成「未安装」")
+  end)
+
+  t.it("rc=0 → PASS；rc 取不到 → undetermined", function()
+    t.assert_eq(capability.evaluate(run_as_probe(), 0, "10316", nil).verdict,
+      capability.VERDICT.PASS)
+    t.assert_eq(capability.evaluate(run_as_probe(), nil, nil, nil).verdict,
+      capability.VERDICT.UNDETERMINED)
   end)
 end)

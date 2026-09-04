@@ -124,10 +124,32 @@ every month」，并要求 ① 探索稳定实现 ② 调试必须分清是平�
 - 端到端行为验证（注入 fixture 执行器，无需手机）：**K58 语义**（rc=126 +
   `can't execute: Permission denied`）→ L2 阻塞、L3/L4 skipped、输出含确切命令与处置；
   **全通过** → 不拦；**设备掉线**（rc=nil）→ undetermined 且不拦。三者均已固化为回归。
+- `nvim --headless -l tests/run.lua dap_failure_layer` 真机修复后 → **50/50**；`dap` → **174/174**
 - `openspec validate --specs --strict` → **40/40**（归档后主 spec 生成，引用不再悬空）
-- 全量 `nvim --headless -l tests/run.lua` → **1412/1412 passed, 0 failed**
+- 全量 `nvim --headless -l tests/run.lua` → **1417/1417 passed, 0 failed**（含真机修复后的新用例）
 - spec 一致性处置：**立 change 承载**（`openspec/changes/harden-dap-failure-layering`，
   新 capability `dap-failure-layering` + 5 份 delta），随后归档并入主 spec。
+
+**真机验证（2026-09-04，小米 fuxi / MIUI，`user` build、`ro.debuggable=0`、Enforcing）**
+
+首次真机跑立刻抓出**两个 fixture 永远发现不了的缺陷**（记为 K62）：
+
+1. **异步回调在 fast event context**：`vim.system` 完成回调里读 `vim.env` 抛
+   `E5560 ... must not be called in a fast event context`，**回调链直接断在那里**，
+   外部表现是「探针永不完成」。改掉后 `vim.fn.sha256` 又在同一位置死一次。
+   **根治：在边界一次性 `vim.schedule` 回主循环**，而不是逐个换纯 Lua 等价物。
+2. **门禁曾是死的**：单条 `test -x` 下「还没 stage」与「stage 过但不可执行」**同为 rc=1**，
+   而早期实现把 rc=1 一律判 `undetermined`（为不误拦首跑），于是 **K58 那个真红灯永远
+   判不出来**。改为三态退出码：`0` 可执行 / `11` 存在但不可执行（FAIL）/ `10` 未 stage。
+
+修复后真机实测三态：未 stage → rc=10 不拦；`chmod 400` → **rc=11 拦下、L3/L4 skipped、
+输出确切命令**；`chmod 700` → rc=0 全绿。`:UEDAPSmoke` 产出证据经 leak check：
+**不含真实 serial / 包名 / pid**，只有 digest 与逐层判定。
+
+**K58 在第二台设备（不同 OEM）上完整复现**：同一文件权限 `-rwxrwxrwx`、标签
+`shell_data_file`，shell uid `test -x` **rc=0**（说"能执行"），app uid `test -x` **rc=1**、
+实际 exec **rc=126**；`cat` 进沙箱后标签变 `app_data_file`、rc=0。⇒ 纯 SELinux 域限制，
+与 POSIX 权限位无关，**P20 得到第二台设备背书**。
 
 **Follow-ups**
 
@@ -138,7 +160,8 @@ every month」，并要求 ① 探索稳定实现 ② 调试必须分清是平�
   （现只忠实上报设备值，缺本地值时判 undetermined）。
 - iOS 侧 L2 探针未枚举（Apple 的 L2 是设备信任/开发者模式/签名，不是 uid/SELinux）。
   spec 的层定义 target-agnostic，补 iOS 探针不需改 spec。
-- 真机复验 `:UEDAPPreflight` / `:UEDAPSmoke`：本轮全部以 fixture 验证，**尚未在真机跑过**。
+- ~~真机复验 `:UEDAPPreflight` / `:UEDAPSmoke`~~ **已完成**（见上方真机验证段，抓出 K62 两条）。
+- 真机 attach 端到端（走完 L3/L4 到 threads + bp resolved）**尚未跑**：本轮只验到门禁层。
 
 ### 2026-09-03 — 包名设置不得说谎：写入失败不得报成功（K59 / K61）
 

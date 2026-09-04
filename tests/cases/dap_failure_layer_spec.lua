@@ -341,14 +341,49 @@ t.describe("ue.dap.android: 能力探针注册", function()
     end
   end)
 
-  t.it("首次 attach 前沙箱副本不存在 → undetermined 而非 FAIL（不误拦首跑）", function()
+  -- ════════════════════════════════════════════════════════════════════
+  -- 2026-09-04 真机（小米 fuxi / MIUI，user build、Enforcing）发现的设计缺陷：
+  -- 「还没 stage」与「stage 过但不可执行」在单独的 `test -x` 下**同为 rc=1**。
+  -- 早期实现把 rc=1 一律判 undetermined，于是「可读不可执行」这个真红灯
+  -- **永远判不出来**，L2 门禁实际是死的——而那正是 K58 要拦的情形。
+  -- 现在用不同退出码分开：0=可执行 / 11=存在但不可执行 / 10=未 stage。
+  --
+  -- 真机实测三态（同一台设备、同一文件，只改状态）：
+  --   未 stage        → rc=10 → undetermined → blocks_attach=false
+  --   chmod 400 后    → rc=11 → FAIL         → blocks_attach=true，L3/L4 skipped
+  --   chmod 700 后    → rc=0  → PASS
+  -- ════════════════════════════════════════════════════════════════════
+  local function exec_probe()
     for _, d in ipairs(android.capability_probes()) do
-      if d.id == "app-uid-can-exec-server" then
-        local r = capability.evaluate(d, 1, "", nil)
-        t.assert_eq(r.verdict, capability.VERDICT.UNDETERMINED,
-          "尚未 stage 不是策略拒绝")
-      end
+      if d.id == "app-uid-can-exec-server" then return d end
     end
+  end
+
+  t.it("未 stage（rc=10）→ undetermined，不误拦首跑", function()
+    local r = capability.evaluate(exec_probe(), 10, "", nil)
+    t.assert_eq(r.verdict, capability.VERDICT.UNDETERMINED, "尚未 stage 不是策略拒绝")
+  end)
+
+  t.it("已 stage 但不可执行（rc=11）→ FAIL：K58 的真红灯必须能判出来", function()
+    local r = capability.evaluate(exec_probe(), 11, "", nil)
+    t.assert_eq(r.verdict, capability.VERDICT.FAIL,
+      "存在却不可执行是真正的策略拒绝，必须拦（否则 L2 门禁是死的）")
+    t.assert_contains(r.detail, "K58")
+  end)
+
+  t.it("可执行（rc=0）→ PASS", function()
+    t.assert_eq(capability.evaluate(exec_probe(), 0, "", nil).verdict,
+      capability.VERDICT.PASS)
+  end)
+
+  t.it("探针命令用不同退出码区分存在性与可执行性（源断言）", function()
+    local argv = exec_probe().build_argv({
+      adb = "adb", serial = "ID", package_name = "p.k.g" })
+    local cmd = table.concat(argv, " ")
+    t.assert_contains(cmd, "test -x")
+    t.assert_contains(cmd, "test -e")
+    t.assert_contains(cmd, "exit 11")
+    t.assert_contains(cmd, "exit 10")
   end)
 end)
 
@@ -501,5 +536,35 @@ t.describe("ue.dap.smoke: 脱敏契约（K55）", function()
     t.assert_true(decoded.attach.stop_observed)
     t.assert_eq(decoded.attach.breakpoints_resolved, 1)
     pcall(vim.fn.delete, dir, "rf")
+  end)
+end)
+
+-- ════════════════════════════════════════════════════════════════════════
+-- 2026-09-04 真机发现：探针完成回调运行在 **fast event context**，在那里读
+-- `vim.env` 会抛
+--   E5560: Vimscript function "getenv" must not be called in a fast event context
+-- 同步 fixture 执行器永远走不到该路径，所以只有真机能暴露它。逃生开关必须用
+-- 纯 Lua 的 `os.getenv`。
+-- ════════════════════════════════════════════════════════════════════════
+t.describe("ue.dap.preflight: 异步回调不得使用 fast-event 禁用的 API", function()
+  local source = table.concat(
+    vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue/dap/preflight.lua"), "\n")
+
+  t.it("执行器在边界回到主循环（vim.schedule），使下游可用 Vimscript API", function()
+    -- 根治办法：在边界一次性 vim.schedule，而不是逐个把下游 API 换成纯 Lua 等价物
+    -- （后者只会下次再死一次——真机上先死 getenv，再死 sha256）。
+    t.assert_contains(source, "vim.schedule(function() done(rc, out, err) end)")
+  end)
+
+  t.it("逃生开关用 os.getenv 而非 vim.env（fast event context 安全）", function()
+    t.assert_contains(source, 'os.getenv("UE_DAP_SKIP_PREFLIGHT")')
+    -- 只查代码行：注释里解释「为何不能用 vim.env」是允许且有价值的。
+    for _, line in ipairs(vim.split(source, "\n", { plain = true })) do
+      local code = line:gsub("^%s+", "")
+      if code:sub(1, 2) ~= "--" then
+        t.assert_true(code:find("vim.env", 1, true) == nil,
+          "preflight 在 fast event context 里运行，代码不得读 vim.env: " .. code)
+      end
+    end
   end)
 end)

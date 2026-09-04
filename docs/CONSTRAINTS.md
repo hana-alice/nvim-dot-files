@@ -659,6 +659,30 @@
     「state-setting 命令 SHALL 以回读为凭报告成败」;
     行为测 `tests/cases/multi_instance_state_spec.lua` + `tests/cases/ue_context_spec.lua`
 
+- **K62 — 异步 spawn 回调运行在 fast event context：那里禁用一切 Vimscript 函数；
+  且「同一个 rc 代表两种状态」会让门禁静默失效（2026-09-04 真机，小米 fuxi/MIUI）**
+  层归属: **L2（探针实现）/ 编辑器管道**。两条都只有真机能暴露，同步 fixture 永远碰不到。
+  症状 A: `vim.system` 的完成回调里读 `vim.env` 或调 `vim.fn.sha256` 直接抛
+  `E5560: Vimscript function "getenv"/"sha256" must not be called in a fast event context`，
+  **回调链就断在那里**，外部表现是「探针永不完成 / 超时」，看不出是 API 误用。
+  解决: **在边界一次性 `vim.schedule` 回到主循环**（`preflight.system_executor` 的
+  `finish`），而不是逐个把下游 API 换成纯 Lua 等价物——后者只会下次再死一次
+  （实测先死 `getenv`，改掉后又死 `sha256`）。代价是一个事件循环 tick，与设备往返耗时相比可忽略。
+  症状 B: 用单条 `test -x <path>` 判「app uid 能否执行 staged server」时，
+  **「还没 stage」与「stage 过但不可执行」同为 rc=1**。早期实现把 rc=1 一律判
+  `undetermined`（为了不误拦首跑），于是 K58 那个**真红灯永远判不出来，L2 门禁实际是死的**。
+  解决: 先问存在性再问可执行性，用不同退出码分开 —— `0`=可执行 / `11`=存在但不可执行（FAIL）
+  / `10`=未 stage（undetermined）。真机三态实测：未 stage → rc=10 不拦；`chmod 400` →
+  rc=11 拦下且 L3/L4 skipped；`chmod 700` → rc=0 通过。
+  **K58 在第二台设备上完整复现**（与原设备不同 OEM）：同一文件 `/data/local/tmp/lldb-server`
+  权限 `-rwxrwxrwx`、标签 `shell_data_file`，shell uid `test -x` **rc=0**（说"能执行"），
+  app uid `test -x` **rc=1**、实际 exec **rc=126** `can't execute: Permission denied`；
+  `cat` 进沙箱后标签变 `app_data_file`、rc=0。⇒ 纯 SELinux 域限制，与 POSIX 权限位无关，
+  P20「不用 shell uid 的 test -x 判断 app uid 能否执行」得到第二台设备背书。
+  → `lua/ue/dap/preflight.lua`（`system_executor` 的 schedule 边界、`skipped` 用 `os.getenv`）;
+    `lua/ue/dap/android.lua`（`app-uid-can-exec-server` 三态退出码）;
+    `openspec/specs/dap-failure-layering/spec.md`; 行为测 `tests/cases/dap_failure_layer_spec.lua`
+
 ### 工具链 / LLVM
 
 - **K57 — 22.1.6 pin 上裸 `script` 命令直接把 lldb-dap 打崩；`import lldb` 仍然不可用

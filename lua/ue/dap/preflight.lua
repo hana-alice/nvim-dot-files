@@ -29,21 +29,37 @@ local M = {}
 M.PROBE_TIMEOUT_MS = 4000
 
 --- 逃生开关是否开启。
+---
+--- 用 `os.getenv` 而不是 `vim.env`：本函数会在探针完成回调里被调到，而那是
+--- **fast event context**——`vim.env` 在那里读会报
+--- `E5560: Vimscript function "getenv" must not be called in a fast event context`
+--- （2026-09-04 真机实测；同步 fixture 执行器永远碰不到这条路径，所以只有真机
+--- 能暴露它）。`os.getenv` 是纯 Lua，不进 Vimscript，在任何 context 都安全。
 function M.skipped()
-  return (vim.env.UE_DAP_SKIP_PREFLIGHT or "") ~= ""
+  return (os.getenv("UE_DAP_SKIP_PREFLIGHT") or "") ~= ""
 end
 
 --- 生产执行器：异步子进程。
 ---
 --- 注意这是 preflight **唯一**的 spawn 点，且刻意集中在本模块而不是散进 target owner，
 --- 使 host_resource_discipline 的 spawn anchor 计数有一个稳定归属。
+---
+--- 【真机实测约束（2026-09-04）】`vim.system` 的完成回调运行在 **fast event
+--- context**，那里禁用一切 Vimscript 函数（`vim.fn.*`、`vim.env`）——实测报
+---   E5560: Vimscript function "getenv"/"sha256" must not be called in a fast event context
+--- 且回调链直接断在那里（表现为探针永不完成）。同步 fixture 执行器永远碰不到
+--- 这条路径，所以只有真机能暂露它。
+--- 根治办法是**在边界上一次性回到主循环**（`vim.schedule`），而不是逐个把
+--- 下游的 API 换成纯 Lua 等价物——后者只会下次再死一次。代价是一个事件循环
+--- tick，与设备往返的耗时相比可忽略。
 function M.system_executor()
   return function(argv, done)
     local finished = false
     local function finish(rc, out, err)
       if finished then return end
       finished = true
-      done(rc, out, err)
+      -- 离开 fast event context：decide / 报告 / 证据生成都可能用 Vimscript API。
+      vim.schedule(function() done(rc, out, err) end)
     end
     local ok = pcall(function()
       vim.system(argv, { text = true, timeout = M.PROBE_TIMEOUT_MS }, function(res)

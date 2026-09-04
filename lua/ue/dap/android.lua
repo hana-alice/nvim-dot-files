@@ -1820,22 +1820,37 @@ function M.capability_probes()
       summary = "the app identity can execute the staged debug server",
       remedy = "re-stage the server into the app sandbox path (the public transport copy is "
         .. "labelled shell_data_file and is readable-but-not-executable by the app domain)",
+      -- 两个问题必须分开问（2026-09-04 真机实测发现的设计缺陷）：
+        --   「还没 stage」与「stage 过但不可执行」在单独的 `test -x` 下**同为 rc=1**。
+        -- 早期实现把 rc=1 一律当成「还没 stage」判 undetermined，于是「可读不可执行」
+        -- 这个**真红灯永远判不出来**，L2 门禁实际上是死的——而那正是 K58 要拦的情形。
+        -- 改法：先问存在性再问可执行性，用不同退出码把两者分开。
+        --   rc=0  → 存在且可执行              → pass
+        --   rc=10 → 不存在（尚未 stage）        → undetermined（不误拦首跑）
+        --   rc=11 → 存在但不可执行            → FAIL（真红灯，K58 形状）
       build_argv = function(ctx)
         local sandbox = sandbox_lldb_server_path(ctx.package_name)
         if not sandbox then return nil end
-        return probe_run_as(ctx, "test -x " .. sandbox)
+        return probe_run_as(ctx, ("test -x %s && exit 0; test -e %s && exit 11; exit 10")
+          :format(sandbox, sandbox))
       end,
       decide = function(rc, out)
-        local v = verdict_from_rc(rc, out)
-        -- 首次 attach 时沙箱副本还不存在，这不是策略拒绝，是「还没 stage」。
-        -- 判 undetermined 而非 fail，否则会误拦一次本来能成的首次 attach。
-        if v.verdict == V.FAIL then
-          return { verdict = V.UNDETERMINED,
-            detail = "not executable yet (staging happens later in bootstrap); "
-              .. "a FAIL here after staging means the SELinux label is wrong",
-            remedy = "run :UEDAPPreflight again after an attach attempt has staged the server" }
+        if rc == nil then
+          return { verdict = V.UNDETERMINED, detail = "no exit code (device unreachable?)" }
         end
-        return v
+        if rc == 0 then return { verdict = V.PASS } end
+        if rc == 11 then
+          -- 存在却不可执行 = 真正的策略拒绝（K58 的形状）。必须拦。
+          return { verdict = V.FAIL,
+            detail = "staged copy exists but is NOT executable by the app identity "
+              .. "(SELinux label or mode); this is the K58 shape" }
+        end
+        if rc == 10 then
+          return { verdict = V.UNDETERMINED,
+            detail = "not staged yet (staging happens later in bootstrap)",
+            remedy = "no action needed before a first attach; re-run after one attach attempt" }
+        end
+        return { verdict = V.UNDETERMINED, detail = out }
       end,
     },
     {

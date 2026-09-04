@@ -263,20 +263,29 @@ csearch trigram 索引 SHALL 全平台共用一份，路径为 `csearch/csearch.
 - **THEN** csearch 搜索 SHALL 继续使用同一份 `csearch/csearch.idx`，MUST NOT 因切平台而被判为缺失或需重建
 - **AND** 切平台 SHALL NOT 删除任何既有 csearch 索引
 
-### Requirement: `<leader>/` 结果呈现 SHALL 提供分组、计数与后端状态
+### Requirement: `<leader>/` 结果呈现 SHALL 默认使用扁平 grep 行并显示后端状态
 
-`<leader>/` 的结果面板 SHALL 按文件分组，每文件 SHALL 显示命中计数，并 SHALL 以 Project / Engine / Workspace scope 与对应根目录相对路径分类。分组中的每一行 MUST 是带真实 file/line/column 的可跳转命中；系统 MUST NOT 插入可被选中但没有真实命中位置的 synthetic header。picker 标题 SHALL 标识当前后端（`[csearch]`）与当前 scope。
+`<leader>/` 的默认结果面板 SHALL 每条命中显示一条独立的 grep 行，包含 file/line/column 与命中文本；默认界面 MUST NOT 插入按文件聚合的 header、命中计数或 `▼` / `├` / `└` 分组标记。每一行 MUST 是可跳转、可预览的真实命中。`:UEGrepGroupingToggle` MAY 作为显式诊断 A/B 开关恢复旧分组 formatter，但分组 MUST 默认关闭。picker 标题 SHALL 标识当前后端（`[csearch]`）与当前 scope。
 
-#### Scenario: 多文件多命中
-- **WHEN** 一次 `<leader>/` 搜索在多个文件命中
-- **THEN** 结果 SHALL 按文件分组
-- **AND** 每个文件分组 SHALL 显示该文件内的命中数
-- **AND** 首行 SHALL 显示 scope、相对路径与计数，后续行 SHALL 显示该文件内的真实命中
+#### Scenario: 默认搜索在多个文件命中
+- **WHEN** 用户触发 `<leader>/`，且未显式启用诊断分组
+- **THEN** 每条命中 SHALL 独立显示 file/line/column 与命中文本
+- **AND** 结果 MUST NOT 显示文件组 header、每文件计数或 continuation / end marker
 
-#### Scenario: 选择任意分组行
-- **WHEN** 用户选中首条或后续任意一条结果
+#### Scenario: 新会话或未配置分组状态
+- **WHEN** `ue_grep_grouping_enabled` 未设置或不是 `true`
+- **THEN** `<leader>/` SHALL 使用标准扁平 grep formatter
+- **AND** picker MUST NOT 为文件分组启用 matcher 保序覆盖
+
+#### Scenario: 显式启用诊断分组
+- **WHEN** 用户调用 `:UEGrepGroupingToggle` 将分组显式设为启用
+- **THEN** picker MAY 使用旧的文件分组 formatter 与分组保序配置
+- **AND** 该诊断状态不得改变默认配置
+
+#### Scenario: 选择任意结果行
+- **WHEN** 用户选中任意一条结果
 - **THEN** 该 item SHALL 始终包含真实 file/line/column，并预览对应命中上下文
-- **AND** 首条结果 MUST NOT 因 synthetic file header 而预览文件第一行或空占位内容
+- **AND** 结果 MUST NOT 因 synthetic file header 而预览文件第一行或空占位内容
 
 #### Scenario: 标题反映后端与 scope
 - **WHEN** `<leader>/` 面板打开并完成一次搜索

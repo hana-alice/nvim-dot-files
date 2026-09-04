@@ -77,6 +77,12 @@ Do not ask for confirmation during normal local development unless:
    **按改动范围读，不遍历 `openspec/specs/`**；本地规则或 CONSTRAINTS 与 spec 冲突时以 spec 为准
    （若冲突源于 spec 陈旧，先更正 spec）。机制见
    [`openspec/specs/spec-authority-loop/spec.md`](openspec/specs/spec-authority-loop/spec.md)。
+5. **归属分层契约（如该子系统有）** —— 改动带 failure layering 的子系统前，先读其层契约：
+   失败必须**先指认层与 owner，再给处置**，且能力靠**探测**而非沿用单台设备结论。
+   DAP（`lua/ue/dap/`）的五层契约 L0–L4 权威在
+   [`openspec/specs/dap-failure-layering/spec.md`](openspec/specs/dap-failure-layering/spec.md)，
+   摘要见 [`docs/CONSTRAINTS.md`](docs/CONSTRAINTS.md) §三 C10。
+   （本条只给指针：正文不在根文件复制，避免第四份可漂移副本。）
 
 **回归红灯优先**：若全量回归存在任何 FAIL，**处置它（修复 / 立 change / 记录不处理理由）
 先于推进无关新工作**——与上面第 0 步的探针 report-first 同一哲学。宿主（host）相关失败按

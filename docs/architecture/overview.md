@@ -138,7 +138,9 @@
   DeviceSupport sysroot。两条 route 都冻结 backend，失败不互相 fallback；`UEDAPStop` 先
   `disconnect{terminateDebuggee=false}`，debug-launch 再终止并复查 owned PID，ordinary attach 只复验既有
   PID 仍存活。Android 走 platform
-  模式 + serial connect URL；K30 URL 与本次 session 捕获的 ADB serial 必须一致，切换当前进程的
+  模式 + serial connect URL；device 端 platform server 必须以 **app uid**（`run-as <pkg>`）从 app
+  sandbox 副本运行，`/data/local/tmp` 仅作 `adb push` 中转（K56：shell uid 在 `ro.debuggable=0` 的
+  user build 上无权 ptrace app，LLDB 只把该拒绝暴露成 `lost connection`）；K30 URL 与本次 session 捕获的 ADB serial 必须一致，切换当前进程的
   选择值不改变活跃 session 的 poll/cleanup。
   `tools/ios_dap_protocol_probe.py` 保留为脱敏 CoreDevice/legacy preflight 与协议诊断入口。legacy 真机
   已验证 attach-at-launch、ordinary attach、resolved source breakpoint、source frame、LLDB expression

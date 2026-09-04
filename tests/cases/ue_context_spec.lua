@@ -275,4 +275,18 @@ t.describe("target_platform 无持久状态时的默认值", function()
     t.assert_contains(source, "engine_target_default(engine_root)")
     t.assert_contains(source, "(last used on this engine)")
   end)
+
+  -- K61：`:UESetAndroidPackage` 不得丢弃写入结果。它曾在本进程无选中项目
+  -- （`M.update` 返回 `false, "no project selected …"`）时仍打印「UE Android
+  -- package set: …」，于是用户看到成功而 `<Space>da` 继续解析旧包名。
+  t.it("UESetAndroidPackage 必须走回读校验的 commit，失败时不得报成功（源断言）", function()
+    local source = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
+    t.assert_contains(source,
+      'CORE_RT.project_state.commit(engine_root, "android_package", input)')
+    t.assert_contains(source, "UE Android package NOT set: ")
+    -- 丢弃返回值的旧形式不得回归。
+    t.assert_true(
+      source:find('update_state_field(engine_root, "android_package", input)', 1, true) == nil,
+      "unchecked android_package write must not return")
+  end)
 end)

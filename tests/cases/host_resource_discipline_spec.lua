@@ -27,11 +27,17 @@ local SPAWN_AUDIT = {
   { p="lua/ue/cdb/pipeline.lua", api="jobstart", a="_rt.jobstart(step.command", class="deferrable", reason="admitted CDB chain", guard="host_admission" },
   { p="lua/ue/cdb/pipeline.lua", api="fn-system", a="vim.fn.system(cmd)", class="subprocess-only", reason="slim runs inside admitted ccjson or explicit sync path" },
   { p="lua/ue/clangd_commands.lua", api="vim.system", a="vim.system(cmd, { text = true }", class="interactive", reason="bounded compile-command query for active LSP request" },
-  { p="lua/ue/dap/android.lua", api="vim.system", a="local ok_spawn = pcall(vim.system", n=2, class="dap", reason="DAP protocol/process lifecycle exemption" },
-  { p="lua/ue/dap/android.lua", api="jobstart", a="vim.fn.jobstart({ adb, \"-s\", serial, \"shell\", cmd }", class="dap", reason="DAP device process bridge" },
+  { p="lua/ue/dap/android.lua", api="vim.system", a="local ok_spawn = pcall(vim.system", n=3, class="dap", reason="DAP protocol/process lifecycle exemption (liveness pidof probe, gate release, session-exit post-mortem)" },
+  -- L1 传输层拆分后（design D7），platform server 的 spawn 随代码搬到 _android_transport。
+  { p="lua/ue/dap/_android_transport.lua", api="jobstart", a="vim.fn.jobstart({ adb, \"-s\", serial, \"shell\", cmd }", class="dap", reason="DAP device platform-server bridge (L1 transport owner)" },
   { p="lua/ue/dap/android.lua", api="jobstart", a="vim.fn.jobstart(jdb_connect_argv", class="dap", reason="DAP JDWP bridge" },
   { p="lua/ue/dap/android.lua", api="vim.system", a="vim.system(", class="dap", reason="DAP bounded host operation" },
   { p="lua/ue/dap/android.lua", api="fn-system", a="vim.fn.system(cmd)", n=2, class="dap", reason="DAP preflight fallback" },
+  -- C10 L2 gate: the layered capability preflight owns exactly ONE spawn point,
+  -- deliberately centralized here instead of spread across target owners so this
+  -- ratchet has a stable owner. Bounded by preflight.PROBE_TIMEOUT_MS; async only
+  -- (P6/K53: a synchronous probe would cost 87ms of main loop per call on Windows).
+  { p="lua/ue/dap/preflight.lua", api="vim.system", a="vim.system(argv, { text = true, timeout = M.PROBE_TIMEOUT_MS }", class="dap", reason="layered L0-L4 capability probe, bounded + async (C10 attach gate)" },
   { p="lua/ue/dap/ios.lua", api="vim.system", a="pcall(vim.system, argv", class="dap", reason="DAP adapter lifecycle" },
   { p="lua/ue/dap/ios.lua", api="jobstart", a="bridge.job_id = vim.fn.jobstart", class="dap", reason="DAP bridge lifecycle" },
   { p="lua/ue/dap.lua", api="jobstart", a="logcat_job = vim.fn.jobstart", class="dap", reason="DAP log stream" },

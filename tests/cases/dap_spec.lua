@@ -1191,12 +1191,14 @@ t.describe("ue.dap.android: attach_commands（K30/K34/K37 顺序与 slide 开关
       "信号处置必须在 process attach 之后")
   end)
 
-  t.it("K37: 默认下发显式 ASLR slide（_module_rebase_cmd 在末尾）", function()
+  t.it("K37: 默认下发显式 ASLR slide，且排在信号处置之后", function()
     local cmds = android._attach_commands_for_test(base_session())
-    local slide = cmds[#cmds]
-    t.assert_true(slide:find("target modules load", 1, true) ~= nil
-      and slide:find("--slide 0x", 1, true) ~= nil,
-      "默认应包含显式 slide（K37 load-bearing）")
+    local slide_i = index_of(cmds, function(c)
+      return c:find("target modules load", 1, true) and c:find("--slide 0x", 1, true)
+    end)
+    t.assert_true(slide_i ~= nil, "默认应包含显式 slide（K37 load-bearing）")
+    local pipe_i = index_of(cmds, function(c) return c:find("SIGPIPE", 1, true) end)
+    t.assert_true(pipe_i and slide_i > pipe_i, "slide 必须在信号处置之后")
   end)
 
   t.it("K37: UE_DAP_NO_SLIDE=1 时跳过显式 slide（reverify 开关）", function()
@@ -1206,6 +1208,56 @@ t.describe("ue.dap.android: attach_commands（K30/K34/K37 顺序与 slide 开关
     local has_slide = index_of(cmds, function(c) return c:find("--slide 0x", 1, true) end)
     t.assert_nil(has_slide, "UE_DAP_NO_SLIDE=1 应跳过显式 slide 命令")
     vim.env.UE_DAP_NO_SLIDE = saved or ""
+  end)
+
+  -- ── K60：致命信号可捕获性 ────────────────────────────────────────────
+  -- K3 把 SIGSEGV/SIGBUS 钉成 --stop false（ART 的 libsigchain 良性陷阱），
+  -- 代价是真实 UE 崩溃也被隐藏 → 用户看到「调试器直接退出」。信号号无法区分，
+  -- 符号可以：NDK 27 llvm-nm 实测 shipped symbol libUE4.so 存在
+  -- FFatalSignalHandler::OnTargetSignal（在故障线程上运行）。
+  t.it("K60: 默认在 FFatalSignalHandler::OnTargetSignal 下符号断点", function()
+    local cmds = android._attach_commands_for_test(base_session())
+    local bp_i = index_of(cmds, function(c)
+      return c:find("FFatalSignalHandler::OnTargetSignal", 1, true)
+    end)
+    t.assert_true(bp_i ~= nil, "默认应下发致命信号符号断点")
+    local bp = cmds[bp_i]
+    t.assert_true(bp:sub(1, 1) == "?",
+      "必须用 `?` 前缀标记为非致命命令：符号缺失不得整体中断 attach")
+    t.assert_true(bp:find("--shlib libUE4.so", 1, true) ~= nil,
+      "必须限定 libUE4.so，避免在其它模块上误命中")
+    local attach_i = index_of(cmds, function(c) return c:find("process attach", 1, true) end)
+    t.assert_true(attach_i and bp_i > attach_i, "断点必须在 process attach 之后")
+  end)
+
+  t.it("K60: 符号断点排在 ASLR slide 之后（模块重定位后再解析）", function()
+    local cmds = android._attach_commands_for_test(base_session())
+    local slide_i = index_of(cmds, function(c) return c:find("--slide 0x", 1, true) end)
+    local bp_i = index_of(cmds, function(c)
+      return c:find("FFatalSignalHandler::OnTargetSignal", 1, true)
+    end)
+    t.assert_true(slide_i and bp_i and bp_i > slide_i,
+      "符号断点必须在 target modules load --slide 之后")
+  end)
+
+  t.it("K60: UE_DAP_NO_FATAL_BP=1 时跳过符号断点（逃生开关）", function()
+    local saved = vim.env.UE_DAP_NO_FATAL_BP
+    vim.env.UE_DAP_NO_FATAL_BP = "1"
+    local cmds = android._attach_commands_for_test(base_session())
+    local bp_i = index_of(cmds, function(c)
+      return c:find("FFatalSignalHandler", 1, true)
+    end)
+    t.assert_nil(bp_i, "UE_DAP_NO_FATAL_BP=1 应跳过符号断点")
+    vim.env.UE_DAP_NO_FATAL_BP = saved or ""
+  end)
+
+  t.it("K3 不回退：SIGSEGV/SIGBUS 仍是 --pass true --stop false", function()
+    local cmds = android._attach_commands_for_test(base_session())
+    local seg = cmds[index_of(cmds, function(c) return c:find("SIGSEGV", 1, true) end)]
+    t.assert_true(seg:find("--pass true", 1, true) ~= nil,
+      "K3：--pass false 会让故障线程在 continue 后死转")
+    t.assert_true(seg:find("--stop false", 1, true) ~= nil,
+      "K3：ART 良性陷阱必须对 DAP 客户端不可见")
   end)
 end)
 
@@ -1228,6 +1280,135 @@ t.describe("ue.dap.android: lldb_server_stage_plan（chmod EPERM 残留）", fun
   t.it("尺寸不匹配 → repush（rm -f 残留后 push + chmod）", function()
     t.assert_eq(android._lldb_server_stage_plan_for_test(false, false), "repush")
     t.assert_eq(android._lldb_server_stage_plan_for_test(false, true), "repush")
+  end)
+end)
+
+-- ════════════════════════════════════════════════════════════════════════
+-- K58 run-path（sandbox 副本）复用判定。2026-09-03 真机实测：transport 副本
+-- /data/local/tmp/lldb-server 的 SELinux 标签是 u:object_r:shell_data_file:s0，
+-- app 域可读不可执行；app uid 上 `test -x` 该公共路径 rc=1、直接 exec 得
+-- `sh: …: can't execute: Permission denied` rc=126。而 sandbox 副本
+-- /data/data/<pkg>/lldb-server 标签为 app_data_file，app uid `test -x` rc=0。
+-- 因此 transport 跳的 "reuse"（shell uid `test -x` 通过）绝不能被当成
+-- 「server 可运行」而把公共路径作为 run path 返回 —— 那正是 <Space>da
+-- 「Connection shut down … initial handshake packet」的直接成因。
+-- 纯决策函数，不碰设备。
+-- ════════════════════════════════════════════════════════════════════════
+t.describe("ue.dap.android: K58 sandbox_stage_plan（run path 复用判定）", function()
+  local android = require("ue.dap.android")
+
+  t.it("sandbox 尺寸一致 + app uid 可执行 → reuse", function()
+    t.assert_eq(android._sandbox_stage_plan_for_test(true, true), "reuse")
+  end)
+
+  t.it("尺寸一致但 app uid 不可执行 → restage（不得当成 ready）", function()
+    t.assert_eq(android._sandbox_stage_plan_for_test(true, false), "restage")
+  end)
+
+  t.it("尺寸不一致 → restage（无论 test -x 结果）", function()
+    t.assert_eq(android._sandbox_stage_plan_for_test(false, true), "restage")
+    t.assert_eq(android._sandbox_stage_plan_for_test(false, false), "restage")
+  end)
+
+  t.it("transport 跳的 reuse 与 run path 判定是两个独立决策", function()
+    -- transport reuse（shell uid 视角）不蕴含 run path ready（app uid 视角）。
+    t.assert_eq(android._lldb_server_stage_plan_for_test(true, true), "reuse")
+    t.assert_eq(android._sandbox_stage_plan_for_test(true, false), "restage")
+  end)
+end)
+
+-- ════════════════════════════════════════════════════════════════════════
+-- K59 package 解析不得被 _last_session 污染（2026-09-03 实测）：
+-- 一次失败的 attach（「process <pkg> not running」）也会走
+-- stop_android_debugger() → snapshot_last_session()，把打错的包名写进进程内
+-- 存档；bootstrap_session 旧代码把该存档当成 ctx.android_package，短路掉
+-- pick_package() 的持久化 state 分支，于是 `:UESetAndroidPackage <正确包名>`
+-- 在本次 Neovim 会话内永远不生效，<Space>da 继续报旧包名 not running。
+-- ════════════════════════════════════════════════════════════════════════
+t.describe("ue.dap.android: K59 package 解析与 last-session 存档", function()
+  local android = require("ue.dap.android")
+
+  t.it("显式 ctx / opts 包名优先", function()
+    t.assert_eq(android._resolve_session_package_for_test({ android_package = "a.b.c" }, {}), "a.b.c")
+    t.assert_eq(android._resolve_session_package_for_test({}, { package_name = "d.e.f" }), "d.e.f")
+    t.assert_eq(android._resolve_session_package_for_test({}, { package = "g.h.i" }), "g.h.i")
+  end)
+
+  t.it("无显式来源 → nil（交给 pick_package 读持久化 state）", function()
+    android._last_session = { package_name = "com.stale.pkg" }
+    t.assert_eq(android._resolve_session_package_for_test({}, {}), nil)
+    t.assert_eq(android._resolve_session_package_for_test(nil, nil), nil)
+    android._last_session = nil
+  end)
+
+  t.it("失败的 attach（无 pid）不得写入 _last_session", function()
+    android._last_session = nil
+    local sess = android._session
+    sess.package_name = "com.typo.pkg"
+    sess.serial = "SERIALX"
+    sess.symbol_lib = "C:/tmp/libUE4.so"
+    sess.pid = nil
+    android._snapshot_last_session_for_test()
+    t.assert_eq(android._last_session, nil)
+  end)
+
+  t.it("成功的 attach（有 pid）才写入 _last_session", function()
+    android._last_session = nil
+    local sess = android._session
+    sess.package_name = "com.real.pkg"
+    sess.serial = "SERIALX"
+    sess.symbol_lib = "C:/tmp/libUE4.so"
+    sess.pid = 4321
+    android._snapshot_last_session_for_test()
+    t.assert_eq(android._last_session and android._last_session.package_name, "com.real.pkg")
+    android._last_session = nil
+    sess.pid = nil
+    sess.package_name = nil
+    sess.serial = nil
+    sess.symbol_lib = nil
+  end)
+end)
+
+-- ════════════════════════════════════════════════════════════════════════
+-- K56 app-uid platform server（2026-09-03 真机 A/B：同一个健康目标、同一
+-- host、同一 NDK 27 LLDB 18 device server，只换 server 运行 uid ——
+-- shell-uid 3/3 全部 `attach failed: lost connection`（forked gdbserver 在
+-- vAttach 里 SIGSEGV），app-uid 3/3 全部完整 155-thread stop + clean detach。
+-- 因此 platform server 必须经 `run-as <pkg>` 从 app sandbox 副本启动。
+-- 纯字符串构造函数，不碰设备。
+-- ════════════════════════════════════════════════════════════════════════
+t.describe("ue.dap.android: K56 app-uid platform server 命令构造", function()
+  local android = require("ue.dap.android")
+
+  t.it("sandbox 路径落在 /data/data/<pkg>/lldb-server", function()
+    t.assert_eq(android._sandbox_lldb_server_path_for_test("com.example.game"),
+      "/data/data/com.example.game/lldb-server")
+  end)
+
+  t.it("包名为空时不猜路径", function()
+    t.assert_nil(android._sandbox_lldb_server_path_for_test(""))
+    t.assert_nil(android._sandbox_lldb_server_path_for_test(nil))
+  end)
+
+  t.it("staging 用 cat 重定向 + chmod 700（不用 cp，跨 sandbox 边界会 EACCES）", function()
+    local s = android._sandbox_stage_script_for_test(
+      "/data/local/tmp/lldb-server", "/data/data/com.example.game/lldb-server")
+    t.assert_contains(s, "cat /data/local/tmp/lldb-server > /data/data/com.example.game/lldb-server")
+    t.assert_contains(s, "chmod 700 /data/data/com.example.game/lldb-server")
+  end)
+
+  t.it("platform server 从 sandbox 副本启动且 listen 通配符被双引号保护", function()
+    local s = android._platform_server_script_for_test(
+      "/data/data/com.example.game/lldb-server", 5039)
+    t.assert_contains(s, "/data/data/com.example.game/lldb-server platform --server")
+    t.assert_contains(s, '--listen "*:5039"')
+  end)
+
+  t.it("MUST NOT 回退到已证伪的 shell-uid /data/local/tmp 启动形式", function()
+    local s = android._platform_server_script_for_test(
+      "/data/data/com.example.game/lldb-server", 5039)
+    t.assert_nil(s:find("cd /data/local/tmp", 1, true),
+      "shell-uid /data/local/tmp 启动形式已被 K56 证伪（vAttach SIGSEGV）")
   end)
 end)
 
@@ -1360,5 +1541,156 @@ t.describe("ue.dap._persist_bp: F9 持久化往返（K10）", function()
     t.assert_eq(back.breakpoints["D:/proj/Source/Unopened.cpp"][1].line, 99)
     bp._reset_state_for_test()
     pcall(vim.fn.delete, vim.fn.fnamemodify(path, ":h"), "rf")
+  end)
+end)
+
+-- ════════════════════════════════════════════════════════════════════════
+-- K60 · 真实退出原因上报（ue.dap.exit_reason）
+--
+-- 事实基础（2026-09-03 实测，非推测）：
+--   * lldb-dap 只给出裸状态：
+--       {"body":{"category":"console",
+--         "output":"Process <pid> exited with status = 9 (0x00000009) \n"}}
+--       {"body":{"exitCode":9},"event":"exited"}
+--     且 liblldb.dll 里只有 " Process %llu exited with status = %i (0x%8.8x) %s"
+--     一条相关格式串，没有任何 "Terminated due to signal" 文本（grep -c == 0）。
+--     → "SIGKILL / 外部杀死" 这类人话必须由本层合成。
+--   * 同一次会话 lldb 统计里 signals 只有 {SIGCHLD:2}{SIGSTOP:173}，
+--     零 SIGSEGV/SIGBUS → 调试器没有「漏掉崩溃」，进程是被外部 SIGKILL。
+--   * Android 侧唯一能指出「谁杀的」的权威是 dumpsys activity exit-info <pkg>，
+--     实测记录形如 reason=10 (USER REQUESTED) subreason=21 (FORCE STOP)
+--     description=stop <pkg> due to from pid 1976 (system)。
+-- ════════════════════════════════════════════════════════════════════════
+t.describe("ue.dap.exit_reason: 退出状态解读", function()
+  local er = require("ue.dap.exit_reason")
+
+  t.it("解析 lldb console 行拿到 status", function()
+    t.assert_eq(er.parse_console_exit(
+      "Process 18690 exited with status = 9 (0x00000009) \n"), 9)
+    t.assert_eq(er.parse_console_exit(
+      "Process 1 exited with status = 11 (0x0000000b) \n"), 11)
+  end)
+
+  t.it("非退出行不误报", function()
+    t.assert_nil(er.parse_console_exit("Process 18690 stopped"))
+    t.assert_nil(er.parse_console_exit(nil))
+    t.assert_nil(er.parse_console_exit("breakpoint list"))
+  end)
+
+  t.it("status=9 必须明说 SIGKILL 且不可被调试器捕获", function()
+    local d = er.describe_status(9)
+    t.assert_true(d:find("SIGKILL", 1, true) ~= nil)
+    t.assert_true(d:find("NOT be caught", 1, true) ~= nil,
+      "必须直说 SIGKILL 无法被任何调试器捕获，避免用户以为调试器失灵")
+  end)
+
+  t.it("UE TargetSignals 里的信号标注为自身崩溃路径", function()
+    local d = er.describe_status(11)
+    t.assert_true(d:find("SIGSEGV", 1, true) ~= nil)
+    t.assert_true(d:find("own crash path", 1, true) ~= nil)
+  end)
+
+  t.it("讲事实：措辞是 matches 而非断言 killed by", function()
+    -- lldb 对 exit(N) 与 死于信号 N 打印同一字段，故不得断言死因。
+    for _, code in ipairs({ 9, 11, 6 }) do
+      local d = er.describe_status(code)
+      t.assert_true(d:find("matches", 1, true) ~= nil,
+        "必须用 matches 表述（lldb 无法区分 exit(N) 与 signal N）")
+      t.assert_true(d:find("was killed by", 1, true) == nil,
+        "禁止把推断包装成事实")
+    end
+  end)
+
+  t.it("note/take 单次消费", function()
+    er.reset()
+    er.note({ status = 9, source = "exited" })
+    local got = er.take()
+    t.assert_eq(got and got.status, 9)
+    t.assert_nil(er.take(), "take 应是单次消费，避免污染下一次会话")
+    er.reset()
+  end)
+
+  t.it("note 忽略非法输入", function()
+    er.reset()
+    er.note(nil); er.note({}); er.note({ status = "x" })
+    t.assert_nil(er.take())
+  end)
+end)
+
+t.describe("ue.dap.exit_reason: dumpsys activity exit-info 解析", function()
+  local er = require("ue.dap.exit_reason")
+
+  -- 实测输出结构的脱敏复刻（K55：不落真实序列号/包名/pid/个人路径）。
+  local SAMPLE = table.concat({
+    "ACTIVITY MANAGER PROCESS EXIT INFO (dumpsys activity exit-info)",
+    "  package: com.example.sample",
+    "    Historical Process Exit for uid=10542",
+    "        ApplicationExitInfo #0:",
+    "          timestamp=2026-09-03 18:09:26.867 pid=1001 realUid=10542 user=0",
+    "          process=com.example.sample reason=10 (USER REQUESTED) subreason=21 (FORCE STOP) status=0",
+    "          importance=400 pss=0.00 rss=415MB state=empty trace=null",
+    "          description=stop com.example.sample due to from pid 1976 (system)",
+    "          anrInfo=null",
+    "        ApplicationExitInfo #1:",
+    "          timestamp=2026-09-03 17:58:28.525 pid=1002 realUid=10542 user=0",
+    "          process=com.example.sample reason=1 (EXIT_SELF) subreason=0 (UNKNOWN) status=1",
+    "          importance=100 pss=0.00 rss=2.1GB state=empty trace=null",
+    "          description=null",
+    "          anrInfo=null",
+  }, "\n")
+
+  t.it("按 pid 命中外部 force-stop 记录", function()
+    local rec = er.find_exit_info(SAMPLE, 1001)
+    t.assert_true(rec ~= nil)
+    t.assert_eq(rec.reason_code, 10)
+    t.assert_eq(rec.reason, "USER REQUESTED")
+    t.assert_eq(rec.subreason, "FORCE STOP")
+    t.assert_true(rec.description:find("pid 1976", 1, true) ~= nil,
+      "description 是唯一指认杀手的字段，必须保留")
+  end)
+
+  t.it("按 pid 命中自身崩溃记录（EXIT_SELF status=1）", function()
+    local rec = er.find_exit_info(SAMPLE, 1002)
+    t.assert_eq(rec and rec.reason_code, 1)
+    t.assert_eq(rec and rec.status, 1)
+    t.assert_nil(rec and rec.description, "description=null 不应变成字符串 'null'")
+  end)
+
+  t.it("pid 不在记录里 → nil（不得张冠李戴）", function()
+    t.assert_nil(er.find_exit_info(SAMPLE, 9999))
+    t.assert_nil(er.find_exit_info(nil, 1001))
+    t.assert_nil(er.find_exit_info(SAMPLE, nil))
+  end)
+
+  t.it("compose：SIGKILL + force-stop 明确告知不是漏掉崩溃", function()
+    local msg = er.compose({
+      status = 9,
+      record = er.find_exit_info(SAMPLE, 1001),
+    })
+    t.assert_true(msg:find("SIGKILL", 1, true) ~= nil)
+    t.assert_true(msg:find("USER REQUESTED", 1, true) ~= nil)
+    t.assert_true(msg:find("cannot be trapped", 1, true) ~= nil,
+      "必须显式否掉『调试器漏了崩溃』这个错误印象")
+  end)
+
+  t.it("compose：无设备记录时给出可执行的下一步", function()
+    -- 目标专属命令字面量由平台 owner 传入（ue_platform_boundary 契约：
+    -- 通用模块不得内嵌 adb/dumpsys 之类 target policy literal）。
+    local msg = er.compose({
+      status = 9, record = nil,
+      no_record_hint = "No device exit record found for this pid. Check: <owner-supplied>",
+    })
+    t.assert_true(msg:find("No device exit record", 1, true) ~= nil,
+      "拿不到记录时必须告知用户如何自行取证")
+    local bare = er.compose({ status = 9, record = nil })
+    t.assert_true(bare:find("No device exit record", 1, true) == nil,
+      "owner 未提供提示时不得编造取证命令")
+  end)
+
+  t.it("compose：EXIT_SELF 不宣称不可捕获", function()
+    local msg = er.compose({ status = 1, record = er.find_exit_info(SAMPLE, 1002) })
+    t.assert_true(msg:find("terminated itself", 1, true) ~= nil)
+    t.assert_true(msg:find("cannot be trapped", 1, true) == nil,
+      "自身崩溃是可捕获的，不能误导用户放弃")
   end)
 end)

@@ -6,17 +6,78 @@ UE Android DAP attach、断点与设备路由的目标行为契约。当前以 h
 LLVM 22.1.6+ `lldb-dap`、device `lldb-server platform`、K30 serial-form URL 为准；
 交互式流程消费当前 Neovim 进程内选择的 Android serial，程序化显式 serial 保持最高优先级。
 ## Requirements
-### Requirement: device 端用 lldb-server platform 模式
+### Requirement: device 端用 lldb-server platform 模式，不用 gdbserver --attach
 
-系统 SHALL 用 `lldb-server platform --server --listen 127.0.0.1:<pport>` 启动设备端
-platform server（替代已证伪的 `gdbserver --attach`，后者从不绑定监听端口），并
-`adb forward` 该端口。
+系统 SHALL 用 `lldb-server platform --server` 启动设备端 platform server，并 `adb forward`
+该端口。MUST NOT 使用 `gdbserver --attach <pid>`（该形态在真机从不绑定监听端口）。
+server 的运行 uid、路径与 listen 参数由下一条 Requirement 规定。
 
 #### Scenario: platform server 正常监听
 
 - **WHEN** `<space>da` 触发 Android attach
 - **THEN** 设备端以 `platform --server --listen` 启动并进入 LISTEN 状态
 - **AND** 不再使用 `gdbserver --attach <pid>`
+
+### Requirement: platform server 以 app uid 从 app sandbox 运行
+
+系统 SHALL 以 app uid（经 `run-as <package>`）从 app sandbox 内的副本
+`/data/data/<package>/lldb-server` 启动 device 端 platform server，MUST NOT 以 shell uid
+从 `/data/local/tmp` 启动它。
+
+该形态是当前已验证设备上的**唯一可行运行形态**，但其可行性 SHALL 由针对当前设备的能力
+探测确认（见「设备能力 SHALL 探测得出而非沿用既有设备结论」），MUST NOT 作为对所有设备
+无条件成立的前提；探测失败时 SHALL 以 L2 归属报告，MUST NOT 静默回退到 shell uid 形态。
+
+理由（K56，2026-09-03 真机）：在 `ro.debuggable=0` 的 `user` build 上 shell uid 无法 ptrace
+app 进程，NDK 27 LLDB 18 的 lldb-server 不把该拒绝报成错误——其 fork 的 per-target
+gdbserver 子进程在 `vAttach` 里 SIGSEGV，host 仅看到 `error: attach failed: lost connection`。
+同一健康目标上 A/B：shell uid 3/3 失败，app uid 3/3 成功。device server 版本不是变量
+（LLDB 9/14/18 在 shell uid 下全部同样失败），MUST NOT 通过降级 device server 版本来「修」它。
+
+`/data/local/tmp/lldb-server` 保留为 `adb push` 的中转路径，不是 server 的运行路径。
+
+#### Scenario: 两跳 staging 到 app sandbox
+
+- **WHEN** attach bootstrap 推送 lldb-server
+- **THEN** 系统 SHALL 先 `adb push` 到 `/data/local/tmp/lldb-server` 作为中转
+- **AND** SHALL 经 `run-as <package>` 用 `cat <公共路径> > /data/data/<package>/lldb-server`
+  复制进 sandbox 并 `chmod 700`（用 `cat` 重定向而非 `cp`，跨 sandbox 边界 `cp` 会 EACCES）
+- **AND** SHALL 校验 sandbox 副本可执行后才继续，否则以明确错误中止
+
+#### Scenario: 复用快路径只以 app uid 探测 sandbox 副本
+
+- **WHEN** staging 判断能否跳过某一跳
+- **THEN** transport 跳的「同尺寸 + 可执行」判定 SHALL 只用于跳过 `adb push`，
+  MUST NOT 被当作「server 已可运行」而把 `/data/local/tmp/lldb-server` 作为运行路径返回
+- **AND** run path 的复用判定 SHALL 以 `run-as <package>` 在 app uid 下同时校验
+  sandbox 副本的尺寸与 `test -x`，两者都成立才跳过重新 staging
+- **AND** shell uid 对公共中转路径的 `test -x` MUST NOT 参与 run path 判定
+
+理由（K58，2026-09-03 真机实测）：公共中转副本的 SELinux 标签是
+`u:object_r:shell_data_file:s0`（owner `shell`），app 域可读但不可执行；sandbox 副本标签为
+`u:object_r:app_data_file:s0:…`（owner app uid）。`getenforce` = `Enforcing`。同一台设备上
+app uid `test -x /data/local/tmp/lldb-server` rc=1、直接 exec 得
+`sh: …: can't execute: Permission denied`（rc=126）；对 sandbox 副本 rc=0。
+早期实现在 transport 判定为 `reuse` 时提前返回公共路径作为运行路径，导致启动命令变成
+`run-as <pkg> sh -c '/data/local/tmp/lldb-server platform --server …'` → 126 退出、设备端
+无监听，host 侧表现为 `platform connect` 的
+`Connection shut down by remote side while waiting for reply to initial handshake packet`
+与随后的 `process attach` 失败。
+
+#### Scenario: 以 app uid 启动 platform server
+
+- **WHEN** 系统启动 device 端 platform server
+- **THEN** 启动命令 SHALL 经 `run-as <package>` 执行
+- **AND** 可执行文件路径 SHALL 是 `/data/data/<package>/lldb-server`
+- **AND** listen 参数 SHALL 双引号保护为 `--listen "*:<port>"`，使 device shell 不会把 `*`
+  glob 成 sandbox 内的文件名
+- **AND** 启动命令 MUST NOT 采用 `cd /data/local/tmp && ./lldb-server …` 的 shell-uid 形式
+
+#### Scenario: 收尾清理两个 uid 的残留 server
+
+- **WHEN** session 结束触发 device 端清理
+- **THEN** 系统 SHALL 同时 kill shell uid 与 app uid（`run-as <package>`）下的 lldb-server
+- **AND** 理由 SHALL 是：残留的 shell-uid server 会占住端口并静默把 SEGV 路径带回来
 
 ### Requirement: platform 连接使用 K30 serial-form 路线
 
@@ -127,3 +188,112 @@ forward-only。每次 session 选定 serial 后，全部设备命令与收尾清
 - **THEN** host adapter SHALL 维持 LLVM 22.1.6+
 - **AND** 实现 SHALL 不改 host adapter / device binary
 - **AND** 全部设备命令与收尾清理 device lldb-server + forward SHALL 指定 `-s SERIAL-002`
+
+### Requirement: 会话结束原因必须讲事实
+
+会话中的 app 死亡时，系统 SHALL 报告**可核验的死亡原因**，MUST NOT 只给出无信息量的
+"App … exited. Detaching."——那会让「进程被外部 SIGKILL（不可捕获）」与「调试器漏掉了
+崩溃」在用户侧无法区分。
+
+事实基础（2026-09-03 实测）：lldb-dap 只提供裸状态
+（`{"body":{"exitCode":9},"event":"exited"}` 与 console 行
+`Process <pid> exited with status = N (0x…)`），且 `liblldb` 中不存在任何
+"Terminated due to signal" 文本，因此信号语义必须由本仓 Lua 层合成；设备侧唯一能指认
+「谁杀的」的权威是 `dumpsys activity exit-info <package>` 的 `ApplicationExitInfo`
+记录（`reason` / `subreason` / `status` / `description`）。
+
+#### Scenario: 外部 force-stop（不可捕获）
+
+- **WHEN** 会话中 app 死亡，DAP 报 exit status 9，且设备记录为
+  `reason=10 (USER REQUESTED) subreason=21 (FORCE STOP)`
+- **THEN** 反馈 SHALL 指明该状态对应 SIGKILL 且**无法被任何调试器捕获**
+- **AND** 反馈 SHALL 包含设备侧 `reason`/`subreason` 与 `description`（指认发起方）
+- **AND** 反馈 SHALL 显式否掉「调试器漏掉了崩溃」这一错误印象
+
+#### Scenario: app 自身崩溃路径
+
+- **WHEN** 设备记录为 `reason=1 (EXIT_SELF)`，或 exit status 落在 UE 的
+  `TargetSignals`（SIGQUIT/SIGILL/SIGFPE/SIGBUS/SIGSEGV/SIGSYS/SIGABRT/SIGTRAP）
+- **THEN** 反馈 SHALL 表述为 app 走了自身崩溃路径
+- **AND** 反馈 MUST NOT 宣称该死亡不可捕获
+
+#### Scenario: 取不到设备记录时不编造
+
+- **WHEN** 设备不可达（wifi ADB 掉线正是本场景）或该 pid 无 `ApplicationExitInfo` 记录
+- **THEN** 系统 SHALL 仍报告 lldb 侧状态
+- **AND** SHALL 告知用户自行取证的命令，而 MUST NOT 把推断当作事实
+- **AND** 措辞 SHALL 为「匹配某信号」而非断言「被某信号杀死」（lldb 对 `exit(N)` 与
+  死于信号 N 打印同一字段，无法区分）
+- **AND** 探针 SHALL 落一条 `android-session-exit` 记录以便事后复查
+
+### Requirement: 真实致命信号必须可停
+
+系统 SHALL 让 UE 的真实致命信号在调试器中产生**真实 stop**，同时保持 K3 对 ART 良性
+陷阱的 `--stop false` 处置不回退。
+
+事实基础：ART 通过 `libsigchain.so` 把 SIGSEGV/SIGBUS 用作 JIT read barrier /
+压缩 GC card-table / heap poisoning 的常规机制，故按**信号号**无法区分良性与致命；但按
+**符号**可以——NDK 27 `llvm-nm` 实测出货 symbol `libUE4.so` 中存在
+`FFatalSignalHandler::OnTargetSignal(int, siginfo*, void*)`，它在故障线程上运行。
+
+#### Scenario: 符号断点在 attach 命令序列中的位置
+
+- **WHEN** 构造 Android attach 命令序列
+- **THEN** 序列 SHALL 在 `process attach` 与 ASLR `target modules load --slide` 之后
+  下发一条限定 `libUE4.so` 的 `FFatalSignalHandler::OnTargetSignal` 符号断点
+- **AND** 该命令 SHALL 以 `?` 前缀标记为非致命：符号不匹配的构建 MUST NOT 中断整个 attach
+- **AND** SIGSEGV/SIGBUS 处置 SHALL 仍为 `--pass true --stop false`（K3 不回退）
+- **AND** 系统 SHALL 提供 `UE_DAP_NO_FATAL_BP=1` 逃生开关以还原旧行为
+
+### Requirement: attach SHALL 先过 L2 能力门禁再连接调试引擎
+
+Android attach SHALL 在发起 `platform connect` **之前**判定目标 OS 策略层（L2）是否具备
+必要能力：staged 二进制能否被将要运行它的身份执行、该身份能否 ptrace 目标进程、沙箱
+运行路径是否就绪。任一项失败时 attach SHALL 以 L2 归属的错误终止，并给出确切的拒绝
+命令与其输出。
+
+MUST NOT 把 L2 失败推迟到 L3 表现为 `platform connect` handshake 失败、
+`attach failed: lost connection` 或 `attach failed: The parameter is incorrect`——这三种
+症状均**不指向**根因，是历史上反复消耗数小时取证的直接原因（K56 / K58）。
+
+#### Scenario: 执行权限缺失在连接前被拦下
+
+- **WHEN** 将要运行 platform server 的身份对 staged 二进制没有执行权限
+- **THEN** attach SHALL 在启动 device server 与 `platform connect` 之前终止
+- **AND** 错误 SHALL 归入 L2 并附带该身份下的探测命令与其退出码
+- **AND** MUST NOT 出现 handshake 或 `attach failed` 类下游症状
+
+#### Scenario: ptrace 能力缺失在连接前被拦下
+
+- **WHEN** platform server 的运行身份无法 ptrace 目标进程
+- **THEN** attach SHALL 以 L2 归属终止并说明该身份不具备 ptrace 能力
+- **AND** 反馈 MUST NOT 把 device server 版本表述为首要变量
+
+#### Scenario: 门禁通过后才进入 L3
+
+- **WHEN** L2 全部判定通过
+- **THEN** 系统 SHALL 继续启动 device server 并 `platform connect`
+- **AND** 此后的失败 SHALL 归入 L3 并给出协议级事实
+
+### Requirement: 设备能力 SHALL 探测得出而非沿用既有设备结论
+
+Android attach 依赖的设备能力 SHALL 针对当前设备探测：受限身份的执行权限、ptrace 可行性、
+沙箱路径可用性、强制访问控制模式、`run-as` 可用性。系统 MUST NOT 把某一台已验证设备的
+答案当作其他设备的既定前提。
+
+判定「某身份能否执行某动作」时 SHALL 以**该身份**探测；更高权限身份的同名探测结果
+MUST NOT 代替该判定（K58：shell uid 的 `test -x` 对 app uid 的执行权限零信息量）。
+
+#### Scenario: 未验证设备上给出正确层归属
+
+- **WHEN** 在一台此前未验证过的 Android 设备上发起 attach
+- **THEN** 系统 SHALL 探测其实际能力并据此判定与分层
+- **AND** MUST NOT 因设备与既有验证设备不同而给出误导性归属或静默失败
+
+#### Scenario: 沙箱路径不可用时诚实归层
+
+- **WHEN** 当前设备不提供预期的 app 沙箱运行路径或 `run-as` 不可用
+- **THEN** 系统 SHALL 以 L2 归属报告该能力缺失
+- **AND** SHALL 给出探测命令作为 evidence
+- **AND** MUST NOT 回退到已被证伪的受限身份运行形态
+

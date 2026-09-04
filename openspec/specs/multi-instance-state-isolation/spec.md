@@ -68,6 +68,31 @@ target platform/configuration SHALL 作为一个原子 pair 写入，MUST NOT �
 - **THEN** 磁盘最终值 SHALL 完整来自某一个 writer
 - **AND** MUST NOT 组合一个 writer 的 platform 与另一个 writer 的 configuration
 
+### Requirement: state-setting 命令 SHALL 以回读为凭报告成败
+
+改写持久 project state 的用户命令 SHALL 先校验写入结果，并 SHALL 从读取方使用的同一
+project bucket 回读该字段后才能宣布成功。写入失败或回读不一致时，反馈 SHALL 是错误并包含原因，
+MUST NOT 打印成功文案。
+
+事实基础（K61，2026-09-03 实测）：`project_state.update` 在本进程未选中项目时返回
+`false, "no project selected in this Neovim session"`。`:UESetAndroidPackage` 丢弃了该返回值，
+于是在什么都没落盘的情况下仍打印「UE Android package set: …」，而 `<Space>da` 继续以旧
+包名 attach 并报「process <pkg> not running」——用户感知为「命令不刷新缓存」。单纯检查返回值
+不够：它无法表达 writer 与 reader 落在不同 bucket 的情形，所以必须回读。
+
+#### Scenario: 本进程未选中项目
+
+- **WHEN** 本进程未选中任何 project 时执行一个 state-setting 命令
+- **THEN** 命令 SHALL 报错并告知未选中项目
+- **AND** MUST NOT 报告成功
+- **AND** MUST NOT 写入任何字段
+
+#### Scenario: 写入成功后立刻可被读取方看到
+
+- **WHEN** 用户纠正一个写错的字段值
+- **THEN** 写入 SHALL 在同一 bucket 回读到新值后才报告成功
+- **AND** 后续读取方（包括 DAP attach 的包名解析）SHALL 看到新值，而不是旧值
+
 ### Requirement: engine-level target preference SHALL suggest, never inherit
 
 engine 级 target preference（`.cache/nvim-ue/target-default.json`）SHALL 在每次显式

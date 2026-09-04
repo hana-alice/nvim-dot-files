@@ -33,7 +33,7 @@
 | P5 | **不做周期性 ticker 通知** | 至多 start + 一次中段更新，成功后自然消退；禁止轮询式 toast 刷 `:messages`。 | `README.md` §Conventions |
 | P6 | **不阻塞主线程，且不得占满宿主**（首要原则） | 两个层面缺一不可：① 进程内——多秒等待可接受但必须 async（`nio` / 子进程），UI 卡顿 = bug；② **宿主级**——本配置启动的工作不得把机器资源占满到编辑器不可用。主循环空转再顺，若 24 核被我们自己 spawn 的子进程占满，编辑器一样卡。**资源让路优先于功能尽快完成。**只约束自己启动的进程，不得操作 rustc 等外部进程，也不得声称能保证宿主 CPU 上限。 | §三 C4 第 2 条; `openspec/specs/editor-behavior-regression/spec.md`（主循环余量）; 坑 K52/K54 |
 | P7 | **不用 `string.format("%x", addr)` 处理 64 位值** | LuaJIT 下会截断到 32 位；模块 slide 的 hex 字符串必须用拼接构造。 | `docs/TOOLING.md` §Pitfalls #4 |
-| P8 | **codelldb 不用 `request="custom"`** | codelldb 1.12.2 会回 `Malformed message`；改用 `request="launch"` + `targetCreateCommands` + `processCreateCommands`。 | `docs/TOOLING.md` §Pitfalls #1 |
+| P8 | **codelldb 不用 `request="custom"`**（历史，codelldb 已退役） | codelldb 1.12.2 会回 `Malformed message`；当时改用 `request="launch"` + `targetCreateCommands` + `processCreateCommands`。当前 lldb-dap 路线用 `request="attach"` + `attachCommands`。 | `docs/TOOLING.md` §Pitfalls #1；坑 K1 |
 | P9 | **不用 which-key 自动 cheatsheet** | 会泄漏我们从未绑定的 plugin 键位；自渲染 `:UECheatsheet`。 | `docs/architecture-vs-lazyvim.md` §"What we deliberately *don't* do" |
 | P10 | **不在配置内集成 copilot/codeium** | 推理交给外部 CLI（Claude Code / Codex），编辑器保持是编辑器。 | `docs/architecture-vs-lazyvim.md` §"What we deliberately *don't* do" |
 | P11 | **C++ goto-def 不让 Tree-sitter 决定或否决目标** | TS 没有 build TU 的类型、宏与 name lookup；C++ `gd` 必须由 compiler identity 决定。TS 可服务非 C++ 兼容路径，但不得给 C++ 语义答案或以语法规则制造失败。 | `docs/architecture-symbol-resolution.md` §1、§2 |
@@ -44,6 +44,8 @@
 | P16 | **Android DAP 不用 `lldb-server gdbserver --attach`** | 该形态在真机从不绑定监听端口，attach 必失败；用 platform 模式（见坑 K30/K31）。 | 坑 K30/K31 |
 | P17 | **Android `platform connect` URL 不用 `localhost`/`127.0.0.1` 形式** | 经 lldb-dap getopt 会被吞成空 URL；必须用 `connect://[<serial>]:<port>` serial 形式（见坑 K30/K32）。 | 坑 K30/K32 |
 | P18 | **公开镜像不得绕过本地隐私门禁** | 隐私扫描不是测试；禁止 `git push --no-verify/--all/--mirror`。plumbing 提交必须经过 `reference-transaction`，恢复引用只能放在 `refs/private-backup/`，真实 denylist 只能在 worktree 外。 | `openspec/specs/public-mirror-privacy/spec.md` |
+| P19 | **Windows lldb-dap pin 上不发裸 `script` 命令** | 22.1.6 `lldb-dap.exe` 遇到任意 `script …` 直接 `0xC0000409` 崩溃且 `launch` 无 response，会话静默死；要跑 python 只能用 `command script import <path>`（见坑 K57）。 | 坑 K57 |
+| P20 | **不用 shell uid 的 `test -x` 判断 app uid 能否执行** | `/data/local/tmp` 副本是 `shell_data_file`，enforcing SELinux 下 app 域可读不可执行；shell 侧 `test -x` 通过而 app uid exec 得 126。凡是判定 run path 就绪都必须经 `run-as <pkg>` 探测（见坑 K58）。 | 坑 K58 |
 
 ---
 
@@ -51,17 +53,21 @@
 
 已付出过真实调试成本的陷阱。格式: **症状 → 解决约束 → 出处**。
 
-### DAP / codelldb（codelldb 路线，hard-won #1–#10）
+### DAP（hard-won #1–#10；仅 K1 属已退役 codelldb 路线）
 
-- **K1 — custom-request 被拒**
+- **K1 — custom-request 被拒**（历史，codelldb 路线已退役）
   症状: codelldb 1.12.2 收到 `request="custom"` 回 `Malformed message`。
   解决: 用 `request="launch"` + `targetCreateCommands` + `processCreateCommands` 数组。
-  → `docs/TOOLING.md` §Pitfalls #1; `lua/ue/dap/android.lua` `bootstrap_session`
+  现状: codelldb 已从代码中完全移除，当前 lldb-dap 路线用 `request="attach"` +
+  `stopOnEntry=true` + `initCommands`/`attachCommands`/`postRunCommands`
+  （`lua/ue/dap/android.lua` `lldb_dap_attach_config`）。本条仅存档。
+  → `docs/TOOLING.md` §Pitfalls #1
 
-- **K2 — gdb-remote 不自动 rebase 模块**
+- **K2 — 远程 attach 不自动 rebase 模块**
   症状: attach 后 `.so` 符号全部解析到错地址。
   解决: 对每个要解析的 `.so` 显式 `target modules load --file <so> --slide 0x<base>`，
-  `<base>` 取自设备上 `cat /proc/<pid>/maps`。
+  `<base>` 取自设备上 `/proc/<pid>/maps`。当前 lldb-dap 路线在 `attachCommands` 内下发
+  （见 K11/K37 的时序要求）；`processCreateCommands` 是已退役 codelldb 路线的字段名。
   → `docs/TOOLING.md` §Pitfalls #2
 
 - **K3 — 信号处置必须设置**
@@ -111,15 +117,16 @@
 
 ### Android ASLR（来自 MEMORY，需对当前代码复核）
 
-- **K11 — ASLR slide 必须在 `processCreateCommands` 里下发**
+- **K11 — ASLR slide 必须在 attach 命令序列内、先于 `setBreakpoints` 下发**
   症状: Android 断点 "unresolved" 或永不命中；libUE4.so 的 ASLR slide 检测错误，
   所有断点解析到错地址。
-  解决: ASLR 修正作为 inline LLDB（Python）命令，在 `process attach` 之后、
-  `configurationDone` 返回**之前**运行——因为 nvim-dap 在 `configurationDone`
-  紧后就发 `setBreakpoints`。基于事件（`event_stopped`/`event_initialized`）的
-  做法**太晚**，断点早已按错地址解析。
-  → MEMORY `project_android_dap_aslr_fix.md` / `feedback_android_dap_aslr_debugging.md`
-  （注: 笔记为时点观察，断言前请对照当前 `lua/ue/dap/android.lua` 复核）
+  解决: slide 修正必须在 `process attach` 之后、`configurationDone` 返回**之前**运行——
+  因为 nvim-dap 在 `configurationDone` 紧后就发 `setBreakpoints`。基于事件
+  （`event_stopped`/`event_initialized`）的做法**太晚**，断点早已按错地址解析。
+  当前实现: `lua/ue/dap/android.lua` 在 `attachCommands` 内、signal disposition 之后
+  下发 `target modules load --file libUE4.so --slide 0x<base>`，预置断点命令插在其后。
+  （历史笔记写的 `processCreateCommands` 是已退役 codelldb 路线的字段名，时序要求不变。）
+  → K37（slide 为 load-bearing 的实证）；MEMORY `project_android_dap_aslr_fix.md`
 
 - **K12 — `/proc/maps` 权限模型**
   症状: `adb shell cat /proc/PID/maps` 在 Android 10+ 静默返回空（hidepid）。
@@ -138,8 +145,13 @@
   跑通过；6/02 把路线改成 `gdbserver --attach` 后再也连不上，连环误判多轮。
   **唯一验证可用的 attach 配方**（2026-06-03 真机 protocol log 背书，到 `Connected: yes`
   + `process attach` + `threads ok`）:
-  - device 端: `cd /data/local/tmp && ./lldb-server platform --server --listen \*:<port>`
-    （**public 路径**非 app sandbox；`--listen *:N` 通配，NDK27 LLDB18 server 即可）。
+  - device 端: platform server 必须**以 app uid 经 `run-as <pkg>` 从 app sandbox 副本**
+    启动（`/data/data/<pkg>/lldb-server platform --server --listen "*:<port>"`）。
+    **⚠️ 本行 2026-09-03 被 K56 更正**：原文写的 `cd /data/local/tmp && ./lldb-server …`
+    （shell uid + public 路径）在该设备**已证伪** —— shell uid 无法 ptrace app，
+    forked gdbserver 在 `vAttach` 里 SIGSEGV，host 只看到
+    `error: attach failed: lost connection`。`/data/local/tmp` 仍是 push 的**中转**路径，
+    但不是 server 的运行路径。详见 K56。
   - host attachCommands 顺序: `platform select remote-android` →
     **`platform connect connect://[<serial>]:<port>`** → `process attach --pid <pid>` →
     `process handle SIG*`。
@@ -479,7 +491,299 @@
   → `lua/ue/dap/_ios_coredevice.lua`; `tools/evidence/ios-dap/coredevice-*.current.result.json`;
     `openspec/specs/ios-device-debug-workflow/spec.md`
 
+- **K56 — Android platform server 必须以 app uid 运行；shell uid 会让 forked gdbserver 在
+  `vAttach` 里 SIGSEGV（2026-09-03 真机，更正 K30 的 device 端命令行）**
+  症状: `<Space>da` 走完整 K30 配方（platform 模式 + serial-form connect URL），
+  `platform connect` 成功报 `Connected: yes`、`qHostInfo`/`qfThreadInfo` 全部正常，
+  但 `process attach --pid <pid>` 在 **约 1 秒**内失败，host 只看到
+  `error: attach failed: lost connection`；device 上留下一个 zombie `[lldb-server]`。
+  host packet log 停在 `$vAttach;<hexpid>#xx` 之后，无任何回包。
+  根因: 该机是 `user` build（`ro.debuggable=0`、无 `su`、无 Yama `ptrace_scope` 文件），
+  **shell uid（2000）无法 ptrace app 进程**——即使 app 是 `pkgFlags=[DEBUGGABLE]`。
+  NDK 27 LLDB 18 的 lldb-server **不把这个拒绝报成错误**，它 fork 出来的 per-target
+  gdbserver 子进程直接 SIGSEGV。实测真值表（139=SIGSEGV，124=`timeout` 到点即 server
+  仍活着在服务=成功）：
+  | server uid | target | rc |
+  |---|---|---|
+  | shell | shell 自己的 `sleep` | 124 ok |
+  | shell | root 的 init (pid 1) | **139 SEGV** |
+  | shell | app 的游戏进程 | **139 SEGV** |
+  | app (`run-as`) | app 的游戏进程 | 124 ok |
+  对**不存在**的 pid（999999）做对照返回干净的 rc=1 `No such process`，证明 SEGV
+  专属于「权限被拒的 ptrace」而非坏输入。同一个健康目标（156 threads）上端到端 A/B、
+  同 host、同 NDK 27 LLDB 18 device server、只换 server 运行 uid：
+  **shell uid 3/3 全 `lost connection`（~1s）；app uid 3/3 全成功**
+  （完整 155-thread stop + clean detach，6–7s）。
+  **device server 版本不是变量**：LLDB 9 / 14 / 18 在 shell uid 下全部同样失败。
+  ⚠️ 不要用「降级 device server 版本」来修 `lost connection`——C1 把 device server
+  钉在 NDK 27 LLDB 18.x，`docs/release_1.1.0.md` 2026-06-02 那条把锅推给 NDK r27
+  的记录**已被本条证伪**。
+  解决: 两跳 staging + app uid 启动。
+  1. `adb push` → `/data/local/tmp/lldb-server`（**仅中转**，shell uid 可写）
+  2. `run-as <pkg> sh -c 'cat /data/local/tmp/lldb-server > /data/data/<pkg>/lldb-server
+     && chmod 700 …'`（用 `cat` 重定向而非 `cp`，跨 sandbox 边界 `cp` 会 EACCES）
+  3. `run-as <pkg> sh -c '/data/data/<pkg>/lldb-server platform --server --listen "*:<port>"'`
+     —— listen 通配符**必须双引号**，否则 device shell 会把 `*` glob 成 sandbox 里的
+     第一个文件名。
+  收尾必须**同时** kill 两个 uid 的 lldb-server：残留的 shell-uid server 会占住端口
+  并静默把 SEGV 路径带回来。
+  → `lua/ue/dap/android.lua`（`ensure_lldb_server_pushed` / `start_lldb_server_platform`
+    及其上方的证据表注释）; `openspec/specs/android-dap-attach/spec.md`
+    「device 端 platform server 以 app uid 运行」; 行为测 `tests/cases/dap_spec.lua`
+    「K56 app-uid platform server 命令构造」
+
+- **K58 — 「transport 副本已可执行」不等于「run path 就绪」；shell uid 的 `test -x`
+  对 app uid 毫无意义（2026-09-03 真机，K56 落地实现里的漏洞）**
+  症状: `<Space>da` 走完 K56 的两跳 staging 逻辑后**仍然**失败。host 端顺序是
+  `platform connect connect://[<serial>]:<port>` →
+  `error: Connection shut down by remote side while waiting for reply to initial
+  handshake packet`，接着 `process attach --pid <pid>` →
+  `error: attach failed: The parameter is incorrect.`，UI 上是
+  `Error on attach: process exited during launch or attach` +
+  `command lldb-dap.exe … exited with 1`。
+  根因（trace 到生产代码真正发出的 adb 命令才看见）: `ensure_lldb_server_pushed()`
+  在 transport 跳判定为 `reuse`（远端尺寸一致 + shell 侧 `test -x` 通过）时**提前
+  return 了公共中转路径**，于是跳过了 Hop 2，`sess.remote_lldb_server` 是
+  `/data/local/tmp/lldb-server`，`start_lldb_server_platform` 发出
+  `run-as <pkg> sh -c '/data/local/tmp/lldb-server platform --server --listen "*:N"'`
+  → `sh: /data/local/tmp/lldb-server: can't execute: Permission denied`，
+  **exit 126**，设备端根本没有 listener。
+  证据（同机实测，`getenforce` = `Enforcing`）:
+  | 路径 | label / owner / mode | app uid `test -x` | app uid exec |
+  |---|---|---|---|
+  | `/data/local/tmp/lldb-server` | `u:object_r:shell_data_file:s0` / `shell shell` / `-rwxr-xr-x` | **rc=1** | **rc=126** `can't execute: Permission denied` |
+  | `/data/data/<pkg>/lldb-server` | `u:object_r:app_data_file:s0:c…` / app uid / `-rwx------` | rc=0 | rc=0，报 `lldb version 18.0.1` |
+  app 域**可读**公共副本（`head -c 4` 得到 `.ELF`），所以 `cat >` staging 仍然可行——
+  缺的只有 execute。
+  教训: 判定「能不能跳过 push」和判定「run path 是否就绪」是**两个独立决策**，探测
+  必须用与运行时相同的 uid。`adb shell test -x <public>` 跑在 shell uid 上，对 app uid
+  的执行权限**零信息量**。
+  解决: transport 的 `reuse` 只置一个 `skip_transport` 标志（跳过 push/chmod/ls），
+  之后一律落到 Hop 2；run path 的复用判定改用 `sandbox_stage_plan()`，其两个输入都由
+  `run-as <pkg>` 在 app uid 下测得（sandbox 副本尺寸 + `test -x`）。
+  验证: 删掉 sandbox 副本后重跑真机 attach ——
+  `run-as … 'stat -c %s /data/data/<pkg>/lldb-server'` rc=1 → `cat >` + `chmod 700` →
+  `run-as … test -x` rc=0 → 启动命令变成 sandbox 路径 → `platform connect` 报
+  `Connected: yes` / `Triple: aarch64-unknown-linux-android` → `process attach` 得
+  `Process <pid> stopped` → `Attached to process <pid>` → **23 threads**、
+  `threads err=nil`、`session.initialized=true`。
+  → `lua/ue/dap/android.lua`（`sandbox_stage_plan` / `sandbox_probe` /
+    `ensure_lldb_server_pushed`）; `openspec/specs/android-dap-attach/spec.md`
+    「复用快路径只以 app uid 探测 sandbox 副本」; 行为测 `tests/cases/dap_spec.lua`
+    「K58 sandbox_stage_plan（run path 复用判定）」
+
+- **K59 — 失败的 attach 也会写 `_last_session`，污染下一次包名解析（2026-09-03 实测）**
+  症状: 用户把包名敲错一次后，即使后续用 `:UESetAndroidPackage` 改对，本次 Neovim
+  会话内 `<Space>da` 仍报旧包名 `not running`。
+  根因: `snapshot_last_session()` 在**每次** teardown 都写 `M._last_session`，而一次失败的
+  attach（pkg/serial/symbol_lib 已选定、pid 探测未命中）也会走 `stop_android_debugger()`；
+  `bootstrap_session` 旧代码把该存档当成 `ctx.android_package`，直接短路掉
+  `pick_package()` 的持久 state 分支。
+  解决: ① `snapshot_last_session()` 增加 `s.pid` 守卫（pid 只由 `_finalize_session` 写入，
+  即只有真正接上设备才存档）；② 新增 `resolve_session_package(ctx, opts)`，只取显式
+  ctx/opts，**MUST NOT** 回落 `M._last_session.package_name`，让持久 state 赢。
+  边界: 该修复对**已在跑的**进程无效（旧代码仍在内存）——用户当时看到的症状并未
+  因此消失，真正的第二重缺陷见 **K61**。
+  → `lua/ue/dap/android.lua`（`snapshot_last_session` / `resolve_session_package`）;
+    行为测 `tests/cases/dap_spec.lua`「K59 package 解析与 last-session 存档」
+
+- **K60 — `exited with status = 9` 是 SIGKILL（不可捕获），不是「调试器漏了崩溃」；
+  ART 的良性 SIGSEGV 只能按符号而非按信号号区分（2026-09-03 实测）**
+  症状: wifi 远程 attach 后 app 死掉，用户看到的只有
+  `App <pkg> exited on <serial>. Detaching.`，感知为「调试器没抓住崩溃就自己退了」。
+  实测证据（lldb-dap protocol log + `$__lldb_statistics`）: attach 全程成功
+  （`platform connect` / `process attach` / `target create` / `target modules load`
+  / 173 个 SIGSTOP 入口停顿都 OK），`signals` 只有 `{SIGCHLD:2}{SIGSTOP:173}`——
+  **零 SIGSEGV/零 SIGBUS**，全程只发过一次 `continue`，最后
+  `{"body":{"category":"console","output":"Process <pid> exited with status = 9
+  (0x00000009) 
+"}}` + `{"body":{"exitCode":9},"event":"exited"}`。
+  ⇒ 进程是被**外部 SIGKILL**，SIGKILL 无法被任何调试器捕获；lldb 如实上报了，
+  缺陷在**我们的措辞**。
+  工具事实: `liblldb.dll` 里只有 `" Process %llu exited with status = %i
+  (0x%8.8x) %s"` 一条相关格式串，**没有** "Terminated due to signal"
+  （`grep -c` = 0）→ 信号语义必须由本仓 Lua 层合成，别指望 lldb 给人话。
+  另一条事实: lldb 对 `exit(N)` 与死于信号 N 打印**同一字段**，所以措辞只能是
+  「matches SIGKILL」，**不得**断言「被 SIGKILL 杀死」。
+  设备侧唯一能指认「谁杀的」的权威是 `adb shell dumpsys activity exit-info <pkg>`
+  的 `ApplicationExitInfo`（`reason=10 (USER REQUESTED)/subreason=21 (FORCE STOP)`
+  + `description=stop <pkg> due to from pid <killer>` = 外部杀；
+  `reason=1 (EXIT_SELF) status=1` = app 自身崩溃路径）。它**不接受 pid 过滤**
+  （`dumpsys activity -h` 只写 `exit-info [PACKAGE_NAME]`），pid 匹配放 Lua。
+  第二半（可捕获性）: K3 把 SIGSEGV/SIGBUS 钉成 `--stop false`，因为 ART 用
+  `libsigchain.so` 把它们当 JIT read barrier / 压缩 GC card-table / heap poisoning
+  的常规机制——按**信号号**永远分不出良性与致命。按**符号**可以：NDK 27 `llvm-nm`
+  实测出货 symbol `libUE4.so`（1,178,567 defined symbols）里
+  `FFatalSignalHandler::OnTargetSignal(int, siginfo*, void*)` 存在，且它由
+  `sigaction(SA_SIGINFO|SA_ONSTACK)` 装在**故障线程**上，ART 的良性陷阱永远走不到。
+  故 attach 序列在 ASLR slide 之后追加
+  `?breakpoint set --shlib libUE4.so --name "FFatalSignalHandler::OnTargetSignal"`
+  （`?` = 非致命，符号不匹配的构建不得中断整个 attach），K3 的
+  `--pass true --stop false` 一并保持不回退。
+  待验证: ① 本次「谁杀的」无法闭环——被调试的 wifi 设备已离网（`adb connect` 拒连
+  10061），拿不到它自己的 `am_kill`/`exit-info` 记录；同僚设备上虽有形状吻合的
+  `USER REQUESTED/FORCE STOP`（description 指向 `pid 1976 (system)`），**不得据此
+  断言**本次是 ActivityManager/watchdog 所杀。② UE 的转发信号线程会轮询
+  `WaitForSignalHandlerToFinishOrExit()`，`GAndroidSignalTimeOut` 到点 `exit(0)`，
+  长时间停在该符号断点上仍可能让 app 自退。
+  逃生开关: `UE_DAP_NO_FATAL_BP=1`。
+  → `lua/ue/dap/exit_reason.lua`（状态解读 + `exit-info` 解析）;
+    `lua/ue/dap.lua`（`event_exited` 抢在 dapui 钩子前留住 `exitCode`）;
+    `lua/ue/dap/android.lua`（`_report_exit_reason` + 符号断点）;
+    `openspec/specs/android-dap-attach/spec.md`「会话结束原因必须讲事实」/
+    「真实致命信号必须可停」; 行为测 `tests/cases/dap_spec.lua`
+
+- **K61 — 「命令不刷新缓存」的真因是写入失败被丢弃后仍报成功（lying success）
+  （2026-09-03 实测）**
+  症状: 用户 `:UESetAndroidPackage com.正确包名` 后看到「UE Android package set: …」，
+  但 `<Space>da` 仍报 `process com.旧包名 not running`，用户描述为「UESetAndroidPackage
+  failed to refresh the cache」。
+  被证伪的假设（必须显式记录）: ① 「`read_state` 前面有进程内值缓存」——不存在，
+  `lua/ue.lua` 的 `read_state`/`update_state_field` 是纯 delegate，`android_package`
+  也不在 `SESSION_LOCAL_FIELDS` 里；② 「`invalidate_status_cache` 与包名解析有关」——无关；
+  ③ 「K59 的 `snapshot_last_session` 守卫修好了用户看到的症状」——机制正确但
+  **对已在跑的 Neovim 无效**（被污染的 `M._last_session` 就在那个进程内存里，
+  新代码只在下一个进程生效）。
+  定性证据: `project_state.update` 在本进程未选中项目时返回
+  `false, "no project selected in this Neovim session"`（headless 对照实验 CASE B），
+  而 `set_android_package` **丢弃了这个返回值**并照样弹成功 toast。
+  另一侧磁盘证据: 用户的纠正值确实在 `state-fields/android_package.json` 里
+  （`updated_at` 比投诉时间早 ~1 分钟），而旧包名 **在任何持久文件里都不存在**
+  → 旧值只活在进程内存，与 K59 机制一致。
+  解决: 新增 `project_state.commit(engine_root, key, value)` 作为唯一写入入口——
+  写入 + **从读取方同一 bucket 回读校验**（单纯检查返回值不够：它无法表达
+  writer/reader bucket 分裂）；`set_android_package` 失败时改报 ERROR
+  「UE Android package NOT set: <err>」。
+  → `lua/ue/project_state.lua`（`M.commit`）; `lua/ue.lua`（`set_android_package`）;
+    `openspec/specs/multi-instance-state-isolation/spec.md`
+    「state-setting 命令 SHALL 以回读为凭报告成败」;
+    行为测 `tests/cases/multi_instance_state_spec.lua` + `tests/cases/ue_context_spec.lua`
+
+- **K62 — 异步 spawn 回调运行在 fast event context：那里禁用一切 Vimscript 函数；
+  且「同一个 rc 代表两种状态」会让门禁静默失效（2026-09-04 真机，小米 fuxi/MIUI）**
+  层归属: **L2（探针实现）/ 编辑器管道**。两条都只有真机能暴露，同步 fixture 永远碰不到。
+  症状 A: `vim.system` 的完成回调里读 `vim.env` 或调 `vim.fn.sha256` 直接抛
+  `E5560: Vimscript function "getenv"/"sha256" must not be called in a fast event context`，
+  **回调链就断在那里**，外部表现是「探针永不完成 / 超时」，看不出是 API 误用。
+  解决: **在边界一次性 `vim.schedule` 回到主循环**（`preflight.system_executor` 的
+  `finish`），而不是逐个把下游 API 换成纯 Lua 等价物——后者只会下次再死一次
+  （实测先死 `getenv`，改掉后又死 `sha256`）。代价是一个事件循环 tick，与设备往返耗时相比可忽略。
+  症状 B: 用单条 `test -x <path>` 判「app uid 能否执行 staged server」时，
+  **「还没 stage」与「stage 过但不可执行」同为 rc=1**。早期实现把 rc=1 一律判
+  `undetermined`（为了不误拦首跑），于是 K58 那个**真红灯永远判不出来，L2 门禁实际是死的**。
+  解决: 先问存在性再问可执行性，用不同退出码分开 —— `0`=可执行 / `11`=存在但不可执行（FAIL）
+  / `10`=未 stage（undetermined）。真机三态实测：未 stage → rc=10 不拦；`chmod 400` →
+  rc=11 拦下且 L3/L4 skipped；`chmod 700` → rc=0 通过。
+  **K58 在第二台设备上完整复现**（与原设备不同 OEM）：同一文件 `/data/local/tmp/lldb-server`
+  权限 `-rwxrwxrwx`、标签 `shell_data_file`，shell uid `test -x` **rc=0**（说"能执行"），
+  app uid `test -x` **rc=1**、实际 exec **rc=126** `can't execute: Permission denied`；
+  `cat` 进沙箱后标签变 `app_data_file`、rc=0。⇒ 纯 SELinux 域限制，与 POSIX 权限位无关，
+  P20「不用 shell uid 的 test -x 判断 app uid 能否执行」得到第二台设备背书。
+  → `lua/ue/dap/preflight.lua`（`system_executor` 的 schedule 边界、`skipped` 用 `os.getenv`）;
+    `lua/ue/dap/android.lua`（`app-uid-can-exec-server` 三态退出码）;
+    `openspec/specs/dap-failure-layering/spec.md`; 行为测 `tests/cases/dap_failure_layer_spec.lua`
+
+- **K63 — 探针判定必须 rc 与输出一致；`pgrep -f` 会自匹配；报告措辞不得与判定
+  自相矛盾（2026-09-04 真机）**
+  层归属: **L2/L4（探针实现）**。三条都由「把手工验证变成自动化用例」这一步暴露。
+  症状 A: `target-process-running` 探针原本只看「输出里有没有数字」，于是
+  **rc=0 且输出为空**被判 FAIL，把一次本该通过的 L2 门禁拦掉（行为测立刻抓到）。
+  解决: rc 与输出**一致**才下结论 —— 进程存在 = rc=0 + pid；不存在 = rc≠0 + 空；
+  两者不一致（命令未真正执行 / 输出被包装层吃掉）判 **undetermined**，不判 FAIL。
+  症状 B（排查过程中的假信号，必须记下来）: 用 `pgrep -f <pattern>` 替代 `pidof` 时，
+  它会匹配到**自己的命令行**——对 `zzz_nonexistent_zzz` 也返回 pid。实测同一时刻
+  `pgrep -f <app-substring>` 给 28109 / 28143（每次不同），而 `ps -A | grep -c` 为 0。
+  ⇒ **`pgrep -f` 不能用作进程存在性判据**；`pidof` 在该设备工作正常（对 init 返回
+  `1 238`），当时 rc=1 是**正确**答案（应用确实没跑）。
+  症状 C: L4 符号错配曾被标 `<== BLOCKING`，而同一份输出里 `blocks_attach=false`
+  （只有 L2 真拦 attach）——两个说法互相打脸。解决: L2 标 `BLOCKS ATTACH`，其他层标
+  `FIRST FAILING (does not block attach)`。
+  → `lua/ue/dap/_android_policy.lua`（rc/输出一致性判定）;
+    `lua/ue/dap/capability.lua`（format_report 的两种标记）;
+    行为测 `tests/cases/dap_failure_layer_spec.lua`
+
+- **K64 — versionCode 相同 ≠ 符号匹配：必须比 build-id（2026-09-04 实测）**
+  层归属: **L4 符号语义**。
+  症状: 3.6 工程的 `packageInfo.txt` 与符号包目录名都是 `<code-A>`，看起来完美匹配，
+  但它们**不是同一次构建**的产物。
+  决定性证据（同一 `versionCode=<code-A>` 下存在 **5 个不同 build-id**）:
+  | 产物 | build-id |
+  |---|---|
+  | Shipping so / 符号包 `<Target>_Symbols_v<code>` | `0517eb87…289ea1` |
+  | Test so / Test apk | `4dbe8406…a8a355` |
+  | Testarm64 apk | `3f8a49ac…3fc6a3` |
+  | gpudiag apk | `a8b76e22…050c36f3` |
+  | 裸 `<Target>-arm64.so` | `df611845…e87f4567` |
+  根因: **versionCode 来自打包配置，build-id 来自链接产物**。同一个版本号下可以反复
+  重链出任意多个不同二进制。只比 versionCode 会给出「match」的**假信号**，
+  而断点仍会解析到错误二进制 —— 与 **K55**（iOS: Mach-O/dSYM UUID 相等才是判据）同构。
+  解决约束: 符号一致性判据**以 build-id 为权威**，versionCode 只是必要条件：
+  两边 build-id 都拿到 ⇒ `match`/`mismatch`；只有 versionCode ⇒ 最强结论只能是
+  **`weak-match`**，MUST NOT 宣称已验证（反映到用户可见文本：
+  `versionCode equality alone does not prove same-build`）。
+  build-id 用**纯 Lua** 读 ELF note（不引入新依赖、不调外部工具）。
+  实现坑（实测踩过）: ELF note 布局是 `namesz(4) descsz(4) type(4) name desc`，
+  相对 name 起点 `at`，**descsz 在 `at-8`**（`at-12` 是 namesz）。把偏移写成 `at-12`
+  会读到 4，长度校验不过于是函数**静默返回 nil**——看起来像「该文件没有 build-id」。
+  另一条同时修正的措辞问题: `run-as: unknown package: <pkg>` 意为**根本没安装**（换设备/
+  换工程的常见情形），与「已安装但 run-as 被拒」是两件事，处置也不同
+  （去装 vs 去换可调试构建）；把前者报成「可能不是 debuggable」会把人往错方向引。
+  → `lua/ue/dap/_android_policy.lua`（`read_build_id` / `symbol_match_verdict` /
+    `run-as-available` 的 unknown-package 分支）; 行为测 `tests/cases/dap_failure_layer_spec.lua`
+
+- **K65 — 符号库选择必须消费引擎 cache 里的构建配置，不得只按 versionCode猜
+  （2026-09-04 用户指出）**
+  层归属: **L4 符号语义**。
+  症状: 在一个 `target_configuration = Test` 的工程上，符号库自动选择**静默选中了
+  Shipping 的符号包**，于是断点会解析到用户**从未构建也从未要求**的配置上。
+  证据链（均为本机实测）:
+  | 来源 | 值 |
+  |---|---|
+  | 引擎 cache `target-default.json` / 项目 bucket `target-selection.json` | `Android` / **`Test`** |
+  | Test 产物 so build-id | `4dbe8406…a8a355`（**应当匹配的目标**） |
+  | Shipping 产物 so build-id | `0517eb87…289ea1` |
+  | 现存符号包 build-id | `0517eb87…289ea1` ⇒ 属于 Shipping |
+  根因: `pick_symbol_lib` 只按 `packageInfo.txt` 的 versionCode 匹配，**从不读
+  `target_configuration`**（实测：整个 `lua/ue/dap/android.lua` 对 `configuration` 零引用）；
+  而旧注释还写着 versionCode 匹配“guarantees the symbols correspond to the installed
+  APK”——该说法已被 **K64** 证伪。对比：`lua/ue/targets/android.lua` **早己**用
+  `configuration` 构造产物名并校验 receipt 的 `Configuration`，DAP 层绕过了这套契约。
+  解决约束: 关联链必须是
+  **引擎 cache 的 `target_configuration` → 该配置的产物 so → 其 build-id → build-id 相同的符号包**。
+  versionCode 仅用于先收窄候选集（必要不充分）。产物命名**复用 target 层已确立的规则**
+  （`<Target>-Android-<Cfg>-arm64.so`；`Development` 不带配置后缀），不另造一套。
+  **关键判断**: 有期望 build-id 却无候选命中（或多个命中）时 **拒绕而非降级猜**——
+  错的符号比没有符号更危险（断点看似生效却指向另一个构建）；只有在拿不到期望
+  build-id（该配置的产物 so 不在本地）时，才退回 versionCode 弱匹配且仅接受唯一候选。
+  → `lua/ue/dap/_android_symbols.lua`（`artifact_so_name` / `expected_build_id` /
+    `select_by_build_id`）; `lua/ue/dap/android.lua`（`pick_symbol_lib` 消费
+    `ctx.state.target_configuration`）; 行为测 `tests/cases/dap_failure_layer_spec.lua`
+
 ### 工具链 / LLVM
+
+- **K57 — 22.1.6 pin 上裸 `script` 命令直接把 lldb-dap 打崩；`import lldb` 仍然不可用
+  （2026-09-03 实测）**
+  症状: 在 `initCommands` / `attachCommands` 里放任意裸 `script …`（`script 1` /
+  `script print(1)` / `script import lldb`），`C:/tools/lldb-22/install/bin/lldb-dap.exe`
+  以 `0xC0000409`（STATUS_STACK_BUFFER_OVERRUN / fail-fast）退出，`launch` 请求**永远
+  拿不到 response**，会话静默死掉——从 UI 看就是「按了 `<Space>da` 什么都没发生」。
+  对照组（同一 build 全部存活）：`version`、`expression 1+1`、
+  `settings show target.language`、`command script import <path>`（路径存在与不存在都行）。
+  ⇒ 崩溃专属于 `script` 命令进 embedded interpreter 的入口，不是「用了 python」本身。
+  同时实测: 对一个内含 `import lldb` 的 .py 执行 `command script import` 报
+  `error: module importing failed: … ModuleNotFoundError: No module named 'lldb'`
+  （**非致命**，attach 继续）。即 21.1.8 的 no-python 限制在 22.1.6 pin 上**仍然成立**，
+  `UE4DataFormatters_2ByteChars.py` 依旧加载不了，`lua/ue/dap/android.lua` 里的
+  native `type summary` 兜底仍是承重结构。
+  细节（别混淆两件事）: 这个 build **不是** nopython liblldb —— `liblldb.dll` 确实
+  import `python311.dll` 且该 DLL 在 PATH 上可解析；缺的是 `lldb` **python 包**：
+  install 树只有 `bin/`，没有 `lib/site-packages/lldb`，而那正是
+  `lldb_python_relative_paths()` 探的目录。所以「python-linked」≠「`import lldb` 能用」，
+  现有 `has_python` 门禁探包而不探 DLL，是对的。
+  约束: Android 路线只发 `command script import`，不受影响；`lua/ue/dap/ios.lua` 确实发
+  裸 `script`，但它跑在 macOS lldb 上而非本 Windows pin——**该路线未测，待验证**。
+  → `docs/TOOLING.md` §"Known limitation: no Python bindings"；
+    `lua/ue/dap/android.lua`（`has_python` 探针与 native `type summary` 兜底）
 
 - **K41 — 依赖路径向上发现的 `.clangd` / monolithic External index → 覆盖漂移与资源失控**
   症状: UEPrepare 重生成 CDB 后 clangd `-j=24` 高 CPU/内存常驻（历史同类症状 17GB/32min）；
@@ -699,7 +1003,7 @@
 | clangd / clang | **LLVM 22.1.x**（22.1.5 verified） | **不要降级到 21.x** —— exact-command transport、controlled BackgroundIndex、libclang cursor ABI 与 C shim 都按 22.x 验证 | `docs/TOOLING.md` §clangd |
 | DAP 适配器（Android） | **LLVM 22.1.6+ `lldb-dap.exe`**（forward-only，当前） | Android platform-mode attach 以 `lua/utils/platform/windows.lua` `default_lldb_dap_paths()` 为准；首选 `C:/tools/lldb-22/install/bin/lldb-dap.exe`。不得静默降级到 LLVM 21 或历史 codelldb 路线。 | `docs/TOOLING.md` §"Current Android DAP status" |
 | DAP 适配器（iOS） | **selected Xcode Apple `lldb-dap`** | iOS 17+ 使用 CoreDevice device/PID attach；pre-iOS17 使用 validated MobileDevice bridge。session 冻结 backend/adapter，禁止 Homebrew、Mac 或跨 backend fallback。 | `docs/TOOLING.md` §"macOS host and iOS application workflow" |
-| lldb-server（Android） | **NDK 27 LLDB 18.x**（aarch64-android，platform server） | 当前 K30 路线使用 `/data/local/tmp/lldb-server platform --server --listen`，由 host serial-form `platform connect` 拉起目标 gdbserver；`gdbserver --attach` 路线已证伪。`default_lldb_server_paths()` 以 NDK27 platform server 为首选。 | `docs/TOOLING.md` §"Current Android DAP status" |
+| lldb-server（Android） | **NDK 27 LLDB 18.x**（aarch64-android，platform server） | 当前 K30/K56 路线：`run-as <pkg> /data/data/<pkg>/lldb-server platform --server --listen "*:<port>"`（**app uid**，sandbox 副本；`/data/local/tmp` 仅作 push 中转），由 host serial-form `platform connect` 拉起目标 gdbserver；`gdbserver --attach` 路线已证伪。`default_lldb_server_paths()` 以 NDK27 platform server 为首选；**不得**因 `lost connection` 降级 device server 版本（K56）。 | `docs/TOOLING.md` §"Current Android DAP status" |
 | adb | Platform-Tools 35.x+ | | `docs/TOOLING.md` §adb |
 | Neovim | **0.10+** | 用到 `vim.uv` / `vim.system` / `vim.api.nvim__redraw` | `docs/TOOLING.md` §Neovim |
 | Go（构建 cindex-uefilter） | ≥ 1.22 | 仅构建 csearch 索引工具时需要 | `README.md` §8 |
@@ -819,6 +1123,30 @@ spec 引用完整性用例守护）。强制力入口在根 `AGENTS.md` 的 Defi
 → 根 `AGENTS.md` (Definition of Done); `openspec/specs/spec-authority-loop/spec.md`;
   `memory/project_overview.md` (治理 spec 列); `tests/cases/structure_spec.lua`
 
+### C10 — DAP 归属分层契约（失败先报层，再给处置）
+
+**为何分层**：34 条 DAP 坑（K1–K61）按契约归属方统计，**只有 8 条是本仓自己的 bug**；
+9 条是目标 OS 策略、10 条是调试引擎、6 条是编辑器管道——即**多数不是我们能修的，
+而是我们没建模的外部契约**。分层的作用是一步区分这两类，而不必每次现场取证。
+
+| 层 | 内容 | owner | 典型坑 |
+|---|---|---|---|
+| **L0** 宙主工具链 | adapter 可解析、版本、python 包 | `lua/utils/platform/*` | K14 K57 |
+| **L1** 传输 | adb/设备可达、serial 捕获、forward | `lua/utils/android_device.lua` | K36 |
+| **L2** 目标 OS 策略 | 执行权限、ptrace、SELinux、sandbox、签名 | 各 target owner（`dap/android.lua` 等） | **K56 K58** K12 K38 K3 K55 |
+| **L3** 调试引擎 | platform connect / attach / 命令序列 | `dap/_common.lua` + lldb | K31 K32 K37 K2 |
+| **L4** 符号语义 | slide 解析、bp resolved、dSYM/versionCode | `dap/android.lua`、`dap/ios.lua` | K35 K37 K55 |
+
+**纪律**：任何用户可见的 DAP 失败 MUST 携带 `{layer, owner, evidence, remedy}`，且
+**先呈现层与 owner，再呈现处置**；MUST NOT 发出不带层归属的失败；层不可判定时
+**显式标注未判定**并给出判定手段，**MUST NOT 猜一个层**。evidence MUST 是命令 + 输出，
+不是结论文本。设备能力 MUST 由**探测**得出（以将要执行动作的**那个身份**探测），
+MUST NOT 沿用单台设备的结论。attach MUST 先过 L2 门禁再连接调试引擎（L2 是唯一
+「红灯却表现为 L3 症状」的层）。
+**新增一条 DAP 坑时 MUST 标注其归属层**（见 §六 第 2 条）。
+→ `openspec/specs/dap-failure-layering/spec.md`（正文权威）; `lua/ue/dap/AGENTS.md`（就地可发现）;
+  `docs/TOOLING.md`（排查入口）; `tests/cases/dap_failure_layer_spec.lua`
+
 ---
 
 ## 五、持久化知识库与本地规则（AI 可发现性）
@@ -857,7 +1185,8 @@ spec 引用完整性用例守护）。强制力入口在根 `AGENTS.md` 的 Defi
 1. **新增一个 workaround** → 在 [§二 snacks/clangd/lazy](#snacks--clangd--lazy活跃-workaround共-9-个文件) 加一行
    （症状 + 文件出处）；文件本身的 frontmatter 仍是权威出处。
 2. **踩到一个新坑** → 在 §二 对应分类加条目，必须含 **症状 + 解决约束 + 出处指针**；
-   并在 `lessons/README.md` 对应领域补一句主题导航。
+   并在 `lessons/README.md` 对应领域补一句主题导航。**DAP 类坑还 MUST 标注其归属层**
+   （L0–L4，见 §三 C10），使读者能判断该坑是**外部契约**还是**本仓缺陷**。
 3. **改动版本钉死项 / 约定 / 启动顺序** → 同步更新 §三，并保持指向 `docs/TOOLING.md`
    / `README.md` / `init.lua` 的出处链接。
 4. **新增子系统目录 / 迁移知识** → 为新目录补一份本地 `AGENTS.md`（内容源，声明继承父级）

@@ -5148,7 +5148,7 @@ function CORE_RT.grep_format_grouped(item)
     chunks[#chunks + 1] = { group.path, "SnacksPickerFile" }
     chunks[#chunks + 1] = { (" (%d)  "):format(group.count), "SnacksPickerComment" }
   else
-    chunks[#chunks + 1] = { "  ├ ", "SnacksPickerDir" }
+    chunks[#chunks + 1] = { group.index == group.count and "  └ " or "  ├ ", "SnacksPickerDir" }
   end
 
   chunks[#chunks + 1] = { tostring(pos[1] or 1), "SnacksPickerRow" }
@@ -5425,16 +5425,12 @@ function M.cached_grep(opts)
   local short_live_max_count = opts.short_live_max_count or 1200
 
   -- ─ Helpers shared by both csearch and rg paths ──────────────────────
-  -- Dev toggle: lets us A/B compare against vanilla snacks behavior. The
-  -- structured path/count formatter and preview throttle are disabled when
-  -- false, while every picker item remains a real match in either mode.
-  -- Toggle at runtime with :UEGrepGroupingToggle.
-  local grouping_enabled = (vim.g.ue_grep_grouping_enabled ~= false)
-
-  -- csearch emits hits grouped by file. Buffer only the current file so its
-  -- count is known, then annotate and emit the original match rows. Unlike
-  -- the old synthetic header design, this never creates a selectable item
-  -- without a source location, so every cursor position has a code preview.
+  -- Dev toggle for A/B against vanilla snacks: structured path/count formatter and
+  -- preview throttle are off when false. Runtime: :UEGrepGroupingToggle.
+  local grouping_enabled = (vim.g.ue_grep_grouping_enabled == true)
+  -- csearch emits hits grouped by file. Buffer only the current file so its count is
+  -- known, then annotate and emit the original match rows. Unlike the old synthetic
+  -- header design, this never creates a selectable item without a source location.
   local function make_file_grouping_cb(cb)
     local current_file = nil
     local current_items = {}
@@ -5555,6 +5551,7 @@ function M.cached_grep(opts)
       need_search = true,
       limit = live_max_count,
       limit_live = live_max_count,
+      matcher = grouping_enabled and { sort = false } or nil, -- preserve csearch file groups
       layout = { preset = "telescope" },
       -- Search mode toggles. snacks auto-merges these with built-in toggles
       -- (regex, follow, hidden, ignored, modified — see snacks/picker/config/
@@ -5637,7 +5634,7 @@ function M.cached_grep(opts)
           picker.list:set_target(); picker:find()
         end,
       },
-      format = grouping_enabled and CORE_RT.grep_format_grouped or nil,
+      format = grouping_enabled and CORE_RT.grep_format_grouped or "file",
       on_show = grouping_enabled and on_show_picker or nil,
       finder = function(_picker_opts, finder_ctx)
         local pattern = finder_ctx.filter.search
@@ -6750,17 +6747,17 @@ local function set_android_package(input)
 
   input = trim(input)
   if input == "" then
-    local state = read_state(engine_root)
-    input = vim.fn.input("Android package name: ", state.android_package or "")
+    input = vim.fn.input("Android package name: ", read_state(engine_root).android_package or "")
   end
-  if input == "" then
-    return
-  end
-
-  update_state_field(engine_root, "android_package", input)
+  if input == "" then return end
+  -- K61: commit() re-reads the field from the readers' bucket, so a failed or
+  -- misrouted write can never print a success toast (see project_state.commit).
+  local ok, err = CORE_RT.project_state.commit(engine_root, "android_package", input)
   invalidate_status_cache()
   refresh_statusline()
-  vim.notify("UE Android package set:\nEngine: " .. engine_root .. "\nPackage: " .. input)
+  local msg = ok and ("UE Android package set:\nEngine: " .. engine_root .. "\nPackage: " .. input)
+    or ("UE Android package NOT set: " .. tostring(err))
+  vim.notify(msg, ok and vim.log.levels.INFO or vim.log.levels.ERROR)
 end
 
 -- Tell ue.lua how to find the .uproject when only a workspace root is given
@@ -9347,18 +9344,14 @@ M._dap_run_state = dap_mod._dap_run_state
 M._continue_debounce_until_ms = dap_mod._continue_debounce_until_ms
 M._dap_source_file_cache = dap_mod._dap_source_file_cache
 
--- Delegate DAP public API.  We're back on codelldb (1.12.2) for the
--- Android route as of 2026-05; the lldb-dap experiment is retired.
--- The historical M.codelldb_paths / ASLR listeners / hand-written
--- breakpoint helpers stay deleted — codelldb handles all of that
--- natively, and persistence is owned by ue.dap._persist_bp instead.
+-- Delegate DAP public API.  Host adapter = LLVM 22.1.6+ `lldb-dap.exe` (forward-only,
+-- C1); codelldb removed 2026-05-21.  `--slide` rides in `attachCommands` (K11/K37).
 M.lldb_dap_path = dap_mod.lldb_dap_path
 M.android_dap_attach = dap_mod.android_dap_attach
 
 -- Expose state helpers so peripheral modules (ue/dap/android.lua's pick_package,
--- external probes, future plugins) can read/write the selected project's
--- persisted state without re-implementing canonical bucket resolution. These are forward-
--- declared locals upthread; they exist by the time setup_dap / require returns.
+-- external probes, future plugins) can read/write the selected project's persisted
+-- state without re-implementing canonical buckets. Forward-declared locals upthread.
 M.read_state = read_state
 M.update_state_field = update_state_field
 M.resolve_context = resolve_context
@@ -9404,6 +9397,9 @@ M.dap_toggle_ui = dap_mod.dap_toggle_ui
 M.dap_reset_layout = dap_mod.dap_reset_layout
 M.dap_toggle_repl = dap_mod.dap_toggle_repl
 M.dap_diagnose = dap_mod.dap_diagnose
+-- Layered preflight (C10): unlike :UEDAPDiag it needs NO live session.
+M.dap_preflight = dap_mod.dap_preflight
+M.dap_smoke = dap_mod.dap_smoke
 M.stop_android_debugger = dap_mod.stop_android_debugger
 M.android_dap_reattach  = dap_mod.android_dap_reattach
 M.android_dap_status    = dap_mod.android_dap_status
@@ -9490,7 +9486,7 @@ function M.setup()
   vim.api.nvim_create_user_command("UEGrepGroupingToggle", function()
     -- Default is true; flip the global. Affects subsequent grep picker
     -- invocations (already-open pickers stay as they were).
-    vim.g.ue_grep_grouping_enabled = not (vim.g.ue_grep_grouping_enabled ~= false)
+    vim.g.ue_grep_grouping_enabled = not (vim.g.ue_grep_grouping_enabled == true)
     local now = vim.g.ue_grep_grouping_enabled
     vim.notify(
       string.format("UE grep structured groups/preview throttle/Tab tweaks: %s",
@@ -10065,6 +10061,10 @@ function M.setup()
   vim.api.nvim_create_user_command("UEDAPDiag", function()
     M.dap_diagnose()
   end, {})
+  vim.api.nvim_create_user_command("UEDAPPreflight", function() M.dap_preflight() end,
+    { desc = "Layered L0-L4 DAP capability preflight (no live session needed)" })
+  vim.api.nvim_create_user_command("UEDAPSmoke", function() M.dap_smoke() end,
+    { desc = "On-demand real-device DAP verification with redacted evidence" })
   vim.api.nvim_create_user_command("UEResetLayout", function()
     M.dap_reset_layout()
   end, {})

@@ -1119,3 +1119,132 @@ t.describe("ue.dap.android: 未安装 vs 不可调试要分开报", function()
       capability.VERDICT.UNDETERMINED)
   end)
 end)
+
+-- ════════════════════════════════════════════════════════════════════════
+-- K65：符号库选择必须消费**引擎 cache 里的构建配置**，并以 build-id 定案。
+--
+-- 用户指出的缺陷（2026-09-04）：「where does the shipping config come from, i never
+-- ask you to build shipping, build config should be provided in the cache in engine」。
+--
+-- 实测证据链：
+--   引擎 cache `target_configuration` = Test
+--   Test 产物 so     build-id = 4dbe8406…（这才是应当匹配的目标）
+--   Shipping 产物 so build-id = 0517eb87…
+--   现存符号包       build-id = 0517eb87…  ⇒ 属于 Shipping
+-- 旧实现只按 versionCode 匹配（且注释声称这"guarantees"对应已装 APK），于是在
+-- 一个 Test 工程上**静默选中 Shipping 的符号包**——断点会解析到用户从未构建的配置。
+--
+-- 关键设计判断：错的符号比没有符号更危险（断点看似生效却指向别的构建），
+-- 所以有期望 build-id 而无候选命中时 **拒绝**，不退回猜测。
+-- ════════════════════════════════════════════════════════════════════════
+t.describe("ue.dap.android: K65 符号选择由引擎 cache 的配置驱动", function()
+  local policy = require("ue.dap._android_policy")
+  local symbols = require("ue.dap._android_symbols").bind({
+    read_build_id = policy.read_build_id,
+    is_file = require("ue.core.fs").is_file,
+    is_dir = require("ue.core.fs").is_dir,
+  })
+
+  t.it("产物名沿用 target 层命名规则（不另造一套）", function()
+    t.assert_eq(symbols.artifact_so_name("Sample", "Test"), "Sample-Android-Test-arm64.so")
+    t.assert_eq(symbols.artifact_so_name("Sample", "Shipping"), "Sample-Android-Shipping-arm64.so")
+    -- Development 的 UBT 产物不带配置后缀。
+    t.assert_eq(symbols.artifact_so_name("Sample", "Development"), "Sample-arm64.so")
+    t.assert_eq(symbols.artifact_receipt_name("Sample", "Test"), "Sample-Android-Test.target")
+  end)
+
+  t.it("缺 target 或 configuration 时不猜文件名", function()
+    t.assert_nil(symbols.artifact_so_name("Sample", nil))
+    t.assert_nil(symbols.artifact_so_name("Sample", ""))
+    t.assert_nil(symbols.artifact_so_name("", "Test"))
+    t.assert_nil(symbols.artifact_so_name(nil, "Test"))
+  end)
+
+  -- 用两个合成 ELF（不同 build-id）复现「同 versionCode、不同配置」的真实形状。
+  local function write_elf(path, tail_byte)
+    local function u32(n)
+      return string.char(n % 256, math.floor(n / 256) % 256,
+        math.floor(n / 65536) % 256, math.floor(n / 16777216) % 256)
+    end
+    local raw = ("\1"):rep(19) .. string.char(tail_byte)
+    local note = "\127ELF" .. ("\0"):rep(60)
+      .. u32(4) .. u32(20) .. u32(3) .. "GNU" .. string.char(0) .. raw
+    vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
+    local fh = assert(io.open(path, "wb")); fh:write(note); fh:close()
+  end
+
+  t.it("按配置取到期望 build-id，并只选命中的那个符号包", function()
+    local root = (vim.fn.tempname():gsub("\\", "/"))
+    -- 两个配置的产物 so，build-id 不同
+    write_elf(root .. "/Sample-Android-Test-arm64.so", 0xAA)
+    write_elf(root .. "/Sample-Android-Shipping-arm64.so", 0xBB)
+    -- 两个符号包，分别对应上面两个 build-id
+    local sym_test = root .. "/Sample_Symbols_v900000001/Sample-arm64/libUE4.so"
+    local sym_ship = root .. "/Sample_Symbols_v900000002/Sample-arm64/libUE4.so"
+    write_elf(sym_test, 0xAA)
+    write_elf(sym_ship, 0xBB)
+
+    local exp_test = symbols.expected_build_id(root, "Sample", "Test")
+    local exp_ship = symbols.expected_build_id(root, "Sample", "Shipping")
+    t.assert_true(exp_test ~= nil and exp_ship ~= nil, "两个配置都应取到 build-id")
+    t.assert_true(exp_test ~= exp_ship, "不同配置的 build-id 必须不同")
+
+    local candidates = { sym_test, sym_ship }
+    local got_test, v_test = symbols.select_by_build_id(candidates, exp_test)
+    t.assert_eq(v_test, "build-id")
+    t.assert_eq(got_test, sym_test, "Test 配置必须选 Test 的符号包")
+
+    local got_ship, v_ship = symbols.select_by_build_id(candidates, exp_ship)
+    t.assert_eq(v_ship, "build-id")
+    t.assert_eq(got_ship, sym_ship, "Shipping 配置必须选 Shipping 的符号包")
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("有期望值但无候选命中 → 拒绝（错符号比没符号更危险）", function()
+    local root = (vim.fn.tempname():gsub("\\", "/"))
+    write_elf(root .. "/Sample-Android-Test-arm64.so", 0xAA)
+    local other = root .. "/Sample_Symbols_v900000002/Sample-arm64/libUE4.so"
+    write_elf(other, 0xBB)
+    local exp = symbols.expected_build_id(root, "Sample", "Test")
+    local got, verdict = symbols.select_by_build_id({ other }, exp)
+    t.assert_nil(got, "不得回退到一个 build-id 不符的符号包")
+    t.assert_eq(verdict, "no-match")
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("多个候选同时命中 → ambiguous，不擅自挑一个", function()
+    local root = (vim.fn.tempname():gsub("\\", "/"))
+    write_elf(root .. "/Sample-Android-Test-arm64.so", 0xAA)
+    local a = root .. "/Sample_Symbols_v900000001/Sample-arm64/libUE4.so"
+    local b = root .. "/Sample_Symbols_v900000003/Sample-arm64/libUE4.so"
+    write_elf(a, 0xAA); write_elf(b, 0xAA)
+    local exp = symbols.expected_build_id(root, "Sample", "Test")
+    local got, verdict = symbols.select_by_build_id({ a, b }, exp)
+    t.assert_nil(got)
+    t.assert_eq(verdict, "ambiguous")
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("拿不到期望 build-id → unknown（上层才可退回 versionCode 弱匹配）", function()
+    local root = (vim.fn.tempname():gsub("\\", "/"))
+    -- 该配置的产物 so 不存在
+    local exp, probed = symbols.expected_build_id(root, "Sample", "Test")
+    t.assert_nil(exp)
+    t.assert_contains(probed, "Sample-Android-Test-arm64.so")
+    local got, verdict = symbols.select_by_build_id({ "/x/libUE4.so" }, nil)
+    t.assert_nil(got)
+    t.assert_eq(verdict, "unknown")
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("pick_symbol_lib 读 ctx.state.target_configuration（源断言）", function()
+    local source = table.concat(
+      vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue/dap/android.lua"), "\n")
+    t.assert_contains(source, "ctx.state.target_configuration")
+    t.assert_contains(source, "symbols.expected_build_id(android_dir, target_name, configuration)")
+    -- 被证伪的旧说法不得留在代码里误导后人。
+    t.assert_true(
+      source:find("guarantees the\n    --    symbols correspond", 1, true) == nil,
+      "versionCode 匹配并不能 guarantee 对应已装 APK（K64）")
+  end)
+end)

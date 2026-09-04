@@ -47,6 +47,66 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-04 — 符号选择消费引擎 cache 的构建配置（K65）
+
+**Task**
+
+用户指出上一轮的错误：「where does the shipping config come from, i never ask you to
+build shipping, build config should be provided in the cache in engine」。
+
+**用户是对的。** 上一轮我发现符号包的 build-id 等于 Shipping 产物，就建议去装
+Shipping 包迴就它——而**构建配置本来就在引擎 cache 里**，根本不需要猜。
+
+**Implemented**
+
+- 查证引擎 cache（只读）：`target-default.json` 与项目 bucket 的
+  `state-fields/target-selection.json` **两边一致写着** `Android` / **`Test`**；
+  `project_state.read()` 也正确读出 `target_configuration = Test`。
+- 定位根因：`lua/ue/dap/android.lua` 对 `configuration` **零引用**——符号选择只按
+  versionCode 匹配，对构建配置一无所知。而 `lua/ue/targets/android.lua` **早己**用
+  `configuration` 构造产物名并校验 receipt 的 `Configuration`；DAP 层绕过了这套契约。
+- 新增 `lua/ue/dap/_android_symbols.lua`：关联链改为
+  **引擎 cache 的 `target_configuration` → 该配置的产物 so → 其 build-id →
+  build-id 相同的符号包**。产物命名直接复用 target 层规则
+  （`<Target>-Android-<Cfg>-arm64.so`；`Development` 不带后缀），不另造一套。
+- `pick_symbol_lib` 消费 `ctx.state.target_configuration`；versionCode 降为先收窄候选集。
+  **有期望 build-id 却无命中（或多个命中）→ 拒绕**并说明原因；只有拿不到期望值时
+  才退回弱匹配。删除被证伪的旧注释（versionCode 匹配“guarantees”对应已装 APK）。
+- `docs/CONSTRAINTS.md` 新增坑 **K65**；新增 7 例回归（`dap_failure_layer` 90 → 97）。
+
+**Pitfalls / Gotchas**
+
+- **我把巧合当成了依据**：上一轮看到符号包 build-id == Shipping 产物，就往
+  「那就装 Shipping」推，而没去问「用户选的配置是什么」——那个答案一直就在
+  引擎 cache 里，一次 `cat` 就能看到。**有权威数据源时，不得从产物反推意图。**
+- 旧注释的危害：它声称 versionCode 匹配“guarantees”对应已装 APK，于是看代码的人
+  （包括我）会以为这一步已经尽职。**被证伪的注释必须删，不只是补一个分支。**
+- 符号包目录名**只带 versionCode、不带配置**，所以无法从目录名判断归属；
+  build-id 是唯一可靠关联键。这也解释了为何单靠 versionCode 必然会选错。
+- 依赖方向：`symbols` 的 bind 必须放在文件**顶部**（而非跟 policy/transport 一起放下方），
+  因为 `pick_symbol_lib` 在上方使用它；Lua 的 upvalue 必须先定义。
+
+**Validation**
+
+- **本机真实工程对照**（只读，未构建、未安装）：
+  配置 `Test` → 期望 build-id `4dbe8406…` → 现存符号包 **no-match → 拒绕**（并给出原因）；
+  配置 `Shipping` → 期望 `0517eb87…` → **build-id 命中**。
+  即旧代码会选中的那个包，在真实配置下现在被正确拒绕。
+- `dap_failure_layer` → **97/97**；`dap` → **214/214**；`ue_platform_boundary` → 17/17；
+  `stability` → 10/10；`structure` → 75/75
+- 全量 `nvim --headless -l tests/run.lua` → **1472/1472 passed, 0 failed**
+- spec 一致性处置：**判定无 spec 影响**——`dap-failure-layering` 已声明「能力靠探测而非假设」
+  与「推断必须标注为推断」；本轮是把符号层的数据源从「猜」改成「权威 cache」，未新增行为契约。
+
+**Follow-ups**
+
+- 端到端 attach 仍未跑，且**现在知道不应该靠装 Shipping 来绕过**：若要在 `Test`
+  配置下验证断点，需要 **Test 对应的符号包**（当前本地没有）；或显式把配置改成已有
+  符号包对应的配置。工具现在会直接告知这个事实，而不是静默选错。
+- receipt（`<Target>-Android-<Cfg>.target`）的 `Configuration` 字段尚未参与交叉校验；
+  `artifact_receipt_name()` 已就位，接上可多一道独立证据。
+- 设备侧 build-id 提取仍未实现（见 K64），所以「已装 APK 到底是哪个构建」仍靠推定。
+
 ### 2026-09-04 — L4 符号判据改以 build-id 为权威（K64）
 
 **Task**

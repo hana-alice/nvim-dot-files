@@ -731,6 +731,34 @@
   → `lua/ue/dap/_android_policy.lua`（`read_build_id` / `symbol_match_verdict` /
     `run-as-available` 的 unknown-package 分支）; 行为测 `tests/cases/dap_failure_layer_spec.lua`
 
+- **K65 — 符号库选择必须消费引擎 cache 里的构建配置，不得只按 versionCode猜
+  （2026-09-04 用户指出）**
+  层归属: **L4 符号语义**。
+  症状: 在一个 `target_configuration = Test` 的工程上，符号库自动选择**静默选中了
+  Shipping 的符号包**，于是断点会解析到用户**从未构建也从未要求**的配置上。
+  证据链（均为本机实测）:
+  | 来源 | 值 |
+  |---|---|
+  | 引擎 cache `target-default.json` / 项目 bucket `target-selection.json` | `Android` / **`Test`** |
+  | Test 产物 so build-id | `4dbe8406…a8a355`（**应当匹配的目标**） |
+  | Shipping 产物 so build-id | `0517eb87…289ea1` |
+  | 现存符号包 build-id | `0517eb87…289ea1` ⇒ 属于 Shipping |
+  根因: `pick_symbol_lib` 只按 `packageInfo.txt` 的 versionCode 匹配，**从不读
+  `target_configuration`**（实测：整个 `lua/ue/dap/android.lua` 对 `configuration` 零引用）；
+  而旧注释还写着 versionCode 匹配“guarantees the symbols correspond to the installed
+  APK”——该说法已被 **K64** 证伪。对比：`lua/ue/targets/android.lua` **早己**用
+  `configuration` 构造产物名并校验 receipt 的 `Configuration`，DAP 层绕过了这套契约。
+  解决约束: 关联链必须是
+  **引擎 cache 的 `target_configuration` → 该配置的产物 so → 其 build-id → build-id 相同的符号包**。
+  versionCode 仅用于先收窄候选集（必要不充分）。产物命名**复用 target 层已确立的规则**
+  （`<Target>-Android-<Cfg>-arm64.so`；`Development` 不带配置后缀），不另造一套。
+  **关键判断**: 有期望 build-id 却无候选命中（或多个命中）时 **拒绕而非降级猜**——
+  错的符号比没有符号更危险（断点看似生效却指向另一个构建）；只有在拿不到期望
+  build-id（该配置的产物 so 不在本地）时，才退回 versionCode 弱匹配且仅接受唯一候选。
+  → `lua/ue/dap/_android_symbols.lua`（`artifact_so_name` / `expected_build_id` /
+    `select_by_build_id`）; `lua/ue/dap/android.lua`（`pick_symbol_lib` 消费
+    `ctx.state.target_configuration`）; 行为测 `tests/cases/dap_failure_layer_spec.lua`
+
 ### 工具链 / LLVM
 
 - **K57 — 22.1.6 pin 上裸 `script` 命令直接把 lldb-dap 打崩；`import lldb` 仍然不可用

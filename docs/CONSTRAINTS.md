@@ -683,6 +683,25 @@
     `lua/ue/dap/android.lua`（`app-uid-can-exec-server` 三态退出码）;
     `openspec/specs/dap-failure-layering/spec.md`; 行为测 `tests/cases/dap_failure_layer_spec.lua`
 
+- **K63 — 探针判定必须 rc 与输出一致；`pgrep -f` 会自匹配；报告措辞不得与判定
+  自相矛盾（2026-09-04 真机）**
+  层归属: **L2/L4（探针实现）**。三条都由「把手工验证变成自动化用例」这一步暴露。
+  症状 A: `target-process-running` 探针原本只看「输出里有没有数字」，于是
+  **rc=0 且输出为空**被判 FAIL，把一次本该通过的 L2 门禁拦掉（行为测立刻抓到）。
+  解决: rc 与输出**一致**才下结论 —— 进程存在 = rc=0 + pid；不存在 = rc≠0 + 空；
+  两者不一致（命令未真正执行 / 输出被包装层吃掉）判 **undetermined**，不判 FAIL。
+  症状 B（排查过程中的假信号，必须记下来）: 用 `pgrep -f <pattern>` 替代 `pidof` 时，
+  它会匹配到**自己的命令行**——对 `zzz_nonexistent_zzz` 也返回 pid。实测同一时刻
+  `pgrep -f mingchao` 给 28109 / 28143（每次不同），而 `ps -A | grep -c` 为 0。
+  ⇒ **`pgrep -f` 不能用作进程存在性判据**；`pidof` 在该设备工作正常（对 init 返回
+  `1 238`），当时 rc=1 是**正确**答案（应用确实没跑）。
+  症状 C: L4 符号错配曾被标 `<== BLOCKING`，而同一份输出里 `blocks_attach=false`
+  （只有 L2 真拦 attach）——两个说法互相打脸。解决: L2 标 `BLOCKS ATTACH`，其他层标
+  `FIRST FAILING (does not block attach)`。
+  → `lua/ue/dap/_android_policy.lua`（rc/输出一致性判定）;
+    `lua/ue/dap/capability.lua`（format_report 的两种标记）;
+    行为测 `tests/cases/dap_failure_layer_spec.lua`
+
 ### 工具链 / LLVM
 
 - **K57 — 22.1.6 pin 上裸 `script` 命令直接把 lldb-dap 打崩；`import lldb` 仍然不可用

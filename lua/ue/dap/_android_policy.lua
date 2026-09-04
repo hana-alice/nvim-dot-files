@@ -70,7 +70,30 @@ local function verdict_from_rc(rc, out, fail_remedy)
   return { verdict = V.FAIL, detail = out, remedy = fail_remedy }
 end
 
+--- 纯函数（可单测）：从符号库路径抽出它所属的 versionCode。
+---
+--- UE 的 Android 符号包目录形如 `<Target>_Symbols_v<code>/`（见 packageInfo.txt
+--- 第 2 行的约定）。这里只做字符串抽取——**不猜**：抽不到就返回 nil，让上层判
+--- 「未判定」而不是编一个版本号出来。
+function M.symbol_version_code(symbol_lib)
+  if type(symbol_lib) ~= "string" or symbol_lib == "" then return nil end
+  return symbol_lib:match("_Symbols_v(%d+)")
+end
+
+--- 纯函数（可单测）：比对设备与符号包的 versionCode。
+--- 返回 "match" / "mismatch" / "unknown"。
+---
+--- 为何 mismatch 属 L4 而不是 L2：版本错配**不阻止 attach**，它只让断点解析到
+--- 错误的源码修订（K35/K37 语义）。把它判成阻塞层会误拦一次本可调试的会话。
+function M.version_code_verdict(device_code, symbol_code)
+  if not device_code or not symbol_code then return "unknown" end
+  return tostring(device_code) == tostring(symbol_code) and "match" or "mismatch"
+end
+
 --- 本 target 的能力探针集合。ctx 需含 adb / serial / package_name / remote_lldb_server。
+-- 同一次探测内从 build_argv 传给 decide 的本地期望值（见 L4 探针注释）。
+local last_symbol_code = nil
+
 function M.capability_probes()
   local cap = require("ue.dap.capability")
   local F = require("ue.dap.failure")
@@ -191,8 +214,19 @@ function M.capability_probes()
         if rc == nil then
           return { verdict = V.UNDETERMINED, detail = "no exit code (device unreachable?)" }
         end
-        if tostring(out or ""):match("%d+") then return { verdict = V.PASS, detail = out } end
-        return { verdict = V.FAIL, detail = "no pid for the package" }
+        -- 不得只看输出里有没有数字：必须 **rc 与输出一致** 才下结论。
+        -- 实测（2026-09-04）`pidof -s <pkg>` 在该设备上：进程存在 → rc=0 + pid；
+        -- 不存在 → rc=1 + 空。两者不一致（如 rc=0 却无输出）意味着命令本身未真正
+        -- 执行或被包装层吃掉了输出，那是「未判定」而不是「应用没跑」——
+        -- 把它当 FAIL 会误拦一次本来能成的 attach。
+        local pid = tostring(out or ""):match("(%d+)")
+        if rc == 0 and pid then return { verdict = V.PASS, detail = "pid=" .. pid } end
+        if rc ~= 0 and not pid then
+          return { verdict = V.FAIL, detail = "no pid for the package (not running)" }
+        end
+        return { verdict = V.UNDETERMINED,
+          detail = ("inconsistent probe result (rc=%s, output=%q)")
+            :format(tostring(rc), tostring(out or "")) }
       end,
     },
     -- ── L4 符号语义 ─────────────────────────────────────────────────────
@@ -204,10 +238,14 @@ function M.capability_probes()
       summary = "the selected symbol library matches the installed build",
       remedy = "pick the symbol package whose versionCode equals the installed one; "
         .. "a mismatch resolves breakpoints against the wrong source revision",
-      build_argv = function(ctx) return probe_shell(ctx, "dumpsys package " .. tostring(ctx.package_name or "")
-          .. " | grep -m1 versionCode") end,
-      -- decide 只能看到 rc/out（纯函数契约），拿不到 ctx。本地符号包的
-      -- versionCode 因此由 preflight 在报告层比对；这里只忻实报设备值。
+      -- build_argv 把本次选中的符号包 versionCode 记到闭包外的 last_symbol_code，
+      -- 因为 decide 的纯函数契约只收 (rc, out, err)。这是有意的取舍：探针命令与
+      -- 判定都保持可单测，而「本地期望值」这个 ctx 派生量只在同一次探测内传递。
+      build_argv = function(ctx)
+        last_symbol_code = M.symbol_version_code(ctx.symbol_lib)
+        return probe_shell(ctx, "dumpsys package " .. tostring(ctx.package_name or "")
+          .. " | grep -m1 versionCode")
+      end,
       decide = function(rc, out)
         if rc ~= 0 or not tostring(out or ""):match("versionCode") then
           return { verdict = V.UNDETERMINED, detail = "could not read the installed versionCode" }
@@ -216,7 +254,22 @@ function M.capability_probes()
         if not device_code then
           return { verdict = V.UNDETERMINED, detail = out }
         end
-        return { verdict = V.PASS, detail = "device versionCode=" .. device_code }
+        local verdict = M.version_code_verdict(device_code, last_symbol_code)
+        if verdict == "unknown" then
+          return { verdict = V.UNDETERMINED,
+            detail = ("device versionCode=%s; no symbol package versionCode to compare")
+              :format(device_code),
+            remedy = "select a symbol package so the comparison becomes possible" }
+        end
+        if verdict == "mismatch" then
+          -- L4, not L2: a mismatch does not stop the attach, it resolves
+          -- breakpoints against the wrong source revision.
+          return { verdict = V.FAIL,
+            detail = ("device versionCode=%s but symbols are v%s")
+              :format(device_code, tostring(last_symbol_code)) }
+        end
+        return { verdict = V.PASS,
+          detail = ("versionCode=%s matches the selected symbols"):format(device_code) }
       end,
     },
   }
@@ -247,6 +300,12 @@ function M.probe_context(ctx)
     out.package_name = deps.session().package_name or (last and last.package_name)
   end
   out.pid = out.pid or deps.session().pid
+  -- L4 需要本地符号包路径才能把「设备 versionCode」与「符号 versionCode」对上。
+  -- 缺它不是错误，只是让该层判「未判定」（本月 follow-up 记录的错配问题正需要它）。
+  if not out.symbol_lib or out.symbol_lib == "" then
+    local last = deps.last_session()
+    out.symbol_lib = deps.session().symbol_lib or (last and last.symbol_lib)
+  end
   return out
 end
 

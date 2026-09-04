@@ -47,6 +47,69 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-04 — 补完 DAP 分层的 4 项 follow-up（2.4 / 2.5 / 4.3 / 5.4）
+
+**Task**
+
+把上两条 change 刻意押后的 4 项 follow-up 全部做完：门禁行为断言（5.4）、
+失败发出点迁移 + 源码守护（2.4/2.5）、L4 符号一致性判定接通（4.3）。
+
+**Implemented**
+
+- **5.4 门禁行为断言**：`_gate_then_start` 增加**仅测试用**的 `opts.executor` /
+  `opts.on_refused` 注入点，因此可在无设备下断言门禁的核心语义——**「连接从未被发起」**
+  而不只是「报了错」。新增 6 例：L2 FAIL 不推进 / 拒绝文本含确切命令与 rc 且证据先于处置 /
+  全通过推进 / 未判定推进（不误拦）/ 逃生开关留痕 / 门禁只跑 L2 子集（不跑 L0 adapter 探针）。
+- **2.5 失败发出点迁移**：`android.lua` 新增 `report_failure(spec)`，attach 主路径的 **7 处**
+  裸失败（未选设备 / staging 失败 / 进程未运行 / platform server 失败 / set-debug-app 失败 /
+  reattach 超时 / re-stage 失败）全部改为带 `{layer, owner, evidence, remedy}` 的上报。
+- **2.4 源码守护**：新增 4 例扫描 owner 的裸 `P.error` 发出点，白名单只有 2 项且各写明理由
+  （`report_failure` 自身、L2 门禁 headline），并断言「每个 `report_failure` 调用都声明 layer」
+  （调用数 == `layer =` 出现数）。
+- **4.3 L4 符号一致性接通**：`_android_policy.lua` 新增两个纯函数
+  `symbol_version_code()` / `version_code_verdict()`；`probe_context` 带上 `symbol_lib`；
+  L4 探针从「只忠实上报设备值」升级为**三态比对**（match / mismatch / unknown）。
+  归 L4 而非 L2 的理由：错配**不阻止 attach**，只让断点解析到错误的源码修订。
+- `capability.format_report`：阻塞标记分两种，L2 → `BLOCKS ATTACH`，其他层 →
+  `FIRST FAILING (does not block attach)`。
+- 新增 25 例回归（`dap_failure_layer` 55 → 80）。
+
+**Pitfalls / Gotchas**
+
+- **行为测立刻抓出一个真 bug（K63-A）**：`target-process-running` 探针原本只看
+  「输出里有没有数字」，于是 **rc=0 且输出为空**被判 FAIL —— 一次本该通过的 L2 门禁被拦掉。
+  这正是「把手工验证变成自动化」的价值：真机手工跑时应用在跑，永远碰不到这个组合。
+  修法：**rc 与输出一致才下结论**，不一致判 `undetermined`。
+- **排查中踩到一个假信号（K63-B）**：怀疑 `pidof` 在该设备失效，改用 `pgrep -f` 验证 ——
+  它对 `zzz_nonexistent_zzz` **也返回 pid**，因为匹配到了自己的命令行；同一时刻
+  `pgrep -f mingchao` 每次给不同 pid（28109/28143）而 `ps -A | grep -c` 为 0。
+  ⇒ `pgrep -f` 不能作存在性判据；`pidof` 其实正常（对 init 返回 `1 238`），
+  当时 rc=1 是**正确**答案（应用确实没跑）。**先证伪自己的怀疑，再改代码。**
+- **报告措辞自相矛盾（K63-C）**：L4 错配被标 `<== BLOCKING` 而 `blocks_attach=false`，
+  两个说法互相打脸。真机跑出来才看见——单测只查子串，不会察觉语义冲突。
+- 迁移失败发出点时保留了 `wait_notice` 的原有去重通知：`report_failure` 负责层归属，
+  `wait_notice` 负责每会话去重，两者职责不同，不合并。
+
+**Validation**
+
+- `dap_failure_layer` → **80/80**（新增 25 例）；`dap` → **190/190**
+- 全量 `nvim --headless -l tests/run.lua` → **1455/1455 passed, 0 failed**
+- **真机复验**（同一台小米 fuxi）：
+  ① 应用未运行 → L2 正确判 FAIL 并拦下（rc=1 + 空输出 = 一致）；
+  ② 启动应用（pid 28354）后 → L2 通过；
+  ③ 传入错配符号包 → **L4 检出 `device versionCode=178739401 but symbols are v178130152`**
+  —— 与 2026-09-03 记录的未闭环 follow-up 数字完全一致，且 `blocks_attach=false` 正确。
+- spec 一致性处置：**判定无 spec 影响**——本轮全部是既有 requirement 的实现补齐
+  （`dap-failure-layering` 已声明「失败先报层」「attach 先过门禁」「能力靠探测」）。
+
+**Follow-ups**
+
+- `openspec/changes/archive/2026-09-04-harden-dap-failure-layering/tasks.md` 的
+  **全部 8 组任务已勾完**（0 项未完成）。
+- 真机 attach 端到端（走完 L3/L4 到 threads + bp resolved）**仍未跑**：那需要真启一次
+  调试会话，且当前设备的符号包与 `versionCode=178739401` 不匹配（L4 已能自动指出这一点）。
+- iOS 侧 L2 探针未枚举（Apple 的 L2 是设备信任 / 开发者模式 / 签名）。
+
 ### 2026-09-04 — Android DAP owner 按层拆分（design D7 阶段 1–3）
 
 **Task**

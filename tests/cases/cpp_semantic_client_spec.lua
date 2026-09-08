@@ -12,6 +12,69 @@ local function write_file(path, content)
 end
 
 t.describe("cpp semantic client: request snapshot", function()
+  t.it("direct header definitions reject an index generation changed during resolution", function()
+    local old_discover, old_resolve = client.discover_toolchain, client.resolve_header
+    local old_index, old_notify = client.index_snapshot_is_current, vim.notify
+    local ok, err = xpcall(function()
+      client._reset_for_test()
+      vim.api.nvim_buf_set_lines(0, 0, -1, false, { "header" })
+      vim.api.nvim_win_set_cursor(0, { 1, 0 })
+      local pending, generation_current = nil, true
+      client.discover_toolchain = function()
+        return { build_fingerprint = "build", index = { generation_id = "old" } }
+      end
+      client.index_snapshot_is_current = function() return generation_current, "index-generation-changed" end
+      client.resolve_header = function(_, callback) pending = callback end
+      vim.notify = function() end
+      local owner, jumps = {}, 0
+      local navigation = require("utils.ue_goto.semantic_navigation").install(owner, {
+        dtrace = function() end, format_jump_msg = function() return "jump" end,
+        jump_to_location = function() jumps = jumps + 1; return true end,
+      })
+      navigation.cpp_definition("header", vim.api.nvim_get_current_buf(), "D:/fixture/header.h", "h")
+      generation_current = false
+      pending({ state = "resolved", definition = { path = "D:/fixture/body.cpp", line = 4, column = 1 } })
+      t.assert_eq(jumps, 0)
+      t.assert_eq(owner._last_cpp_transaction.result.stage, "stale")
+    end, debug.traceback)
+    client.discover_toolchain, client.resolve_header = old_discover, old_resolve
+    client.index_snapshot_is_current, vim.notify = old_index, old_notify
+    client._reset_for_test()
+    vim.bo.modified = false
+    if not ok then error(err) end
+  end)
+
+  t.it("stale header completion cannot replace newer window lineage", function()
+    client._reset_for_test()
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, { "header" })
+    vim.api.nvim_win_set_cursor(0, { 1, 0 })
+    local snapshot = client.begin_action(0)
+    local old_request = client.request
+    local ok, err = xpcall(function()
+      local pending
+      client.request = function(_, _, callback) pending = callback end
+      client.note_origin(snapshot.winid, {
+        origin_tu = "D:/fixture/old.cpp", subject_membership = { "D:/fixture/header.h" },
+      }, "build")
+      local stale_reason
+      client.resolve_header({
+        snapshot = snapshot, path = "D:/fixture/header.h", line = 1, column = 1,
+        environment = { build_fingerprint = "build", evidence_roots = {} },
+      }, function(_, reason) stale_reason = reason end)
+      client.cancel_action()
+      client.note_origin(snapshot.winid, {
+        origin_tu = "D:/fixture/new.cpp", subject_membership = { "D:/fixture/header.h" },
+      }, "build")
+      pending({ state = "resolved", document_version = snapshot.document_version })
+      t.assert_eq(stale_reason, "superseded")
+      t.assert_eq(client.window_origin(snapshot.winid, "build").origin_tu, "D:/fixture/new.cpp")
+    end, debug.traceback)
+    client.request = old_request
+    client._reset_for_test()
+    vim.bo.modified = false
+    if not ok then error(err) end
+  end)
+
   t.it("changedtick 变化后旧响应不能产生 UI side effect", function()
     client._reset_for_test()
     vim.api.nvim_buf_set_lines(0, 0, -1, false, { "call(value);" })

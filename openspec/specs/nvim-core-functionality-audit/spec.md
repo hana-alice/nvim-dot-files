@@ -35,6 +35,11 @@ MUST：系统必须以真实配置启动隔离 Neovim 进程，并在临时目�
 - **AND** 必须捕获 Lua error、命令冲突和启动退出码
 - **AND** 不得自动安装或更新 plugin
 
+#### Scenario: 只读启动缺少 lazy.nvim
+- **WHEN** health startup 的既有数据目录没有 lazy.nvim
+- **THEN** SHALL 明确报告缺失依赖并退出该启动检查
+- **AND** MUST NOT 执行 git clone、等待交互输入或安装插件
+
 #### Scenario: 最小文件编辑
 
 - **WHEN** runner 在已验证的临时目录创建测试文件

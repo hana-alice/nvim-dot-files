@@ -45,6 +45,19 @@ capability 的产出物要求 SHALL 表述为：诊断结论与判据必须在 `
 - **WHEN** 对比"握手零响应"与上一轮"tracer 稳定"
 - **THEN** 诊断说明 tracer 附上不等于 attach 成功，并指出上一轮是否漏测握手层
 
+#### Scenario: app uid listener 与 shell control 的同 binary A/B
+
+- **WHEN** app-uid `lldb-server platform` 进程存活且端口 LISTEN，但正确 checksum 的
+  forwarded GDB packet 超时
+- **THEN** 诊断 SHALL 在同一捕获 serial、同一 device binary 上以 shell uid server 仅作
+  handshake control（不得拿它执行 app attach）
+- **AND** 若 shell control 立即 ACK、app uid server 仍超时，结论 SHALL 限定为该设备
+  `runas_app` 身份/策略差异证据，MUST NOT 泛化为所有设备
+- **AND** MUST NOT 把 shell handshake 成功当作可回退 attach 路线（K56 已证明 shell uid
+  可能无权 ptrace app）
+- **AND** 若 control 也失败，层 SHALL 保持未判定并继续检查 binary/packet/forward，MUST NOT
+  仅凭通用 handshake timeout 猜目标 OS 层
+
 ### Requirement: 定位 source-file 断点崩溃层面
 
 诊断 SHALL 在握手通后用受控单条命令复现并定位 `3221226505` 的崩溃层面。

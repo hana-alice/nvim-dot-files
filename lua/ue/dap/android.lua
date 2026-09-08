@@ -2,7 +2,7 @@
 --
 -- Adapter: LLVM lldb-dap (resolved by ue.dap._common.find_lldb_dap, host 22.1.6).
 -- Wire:    nvim-dap → lldb-dap (host) → adb forward → lldb-server platform
---          (device, /data/local/tmp, --listen *:<port>). The host attach runs:
+--          (device app uid, sandbox copy, --listen *:<port>). The host attach runs:
 --            platform select remote-android
 --            platform connect connect://[<serial>]:<port>   (serial form ONLY)
 --            process attach --pid <pid>
@@ -27,21 +27,20 @@
 --     adapter, one liblldb, one set of expectations.
 --
 -- Requirements on the device (auto-bootstrapped):
---   * lldb-server pushed to PUBLIC /data/local/tmp/lldb-server (platform mode
---     does NOT need a sandbox copy — it ptraces via the debug user).
+--   * lldb-server pushed through /data/local/tmp, then copied into the app
+--     sandbox and run as the app uid (K56/K58; the public path is transport only).
 --   * Process matching session.package_name running.
---   * App is debuggable (android:debuggable=true) OR adb root works.
+--   * App is debuggable and supports run-as so the app-uid server can ptrace it.
 --
 -- Requirements on the host (one-time):
 --   * LLVM 22.1.6+ with lldb-dap.exe on PATH or under
 --     C:/tools/lldb-22/install/bin/, or pointed to by
 --     ue.config.dap.lldb_dap_path.
---   * A symbol-rich libUE4.so (DWARF) available locally — either the
---     Binaries/Android/<Target>_Symbols_v* tree or the Intermediate jni
---     output. Pointed to by ue.config dap.android_symbol_lib OR auto-
---     detected from the project root. Strictly optional but strongly
---     recommended: without it lldb-dap will pull stripped libUE4.so from
---     the device into ~/.lldb/module_cache (no source lines).
+--   * A symbol-rich Android module (DWARF) available locally — preferably the
+--     current Target/Configuration's unstripped Binaries/Android artifact,
+--     otherwise a build-id-matching *_Symbols_v* package. It may also be set via
+--     ue.config dap.android_symbol_lib. Without it lldb-dap only sees the stripped
+--     device module and source breakpoints cannot resolve.
 --   * Optional: source-map entries (DAP "sourceMap") so DWARF build-machine
 --     paths (e.g. D:\UE\EngineWorktree\Engine\) resolve to the local checkout.
 
@@ -57,13 +56,20 @@ local symbols = require("ue.dap._android_symbols").bind({
   read_build_id = function(path, n)
     return require("ue.dap._android_policy").read_build_id(path, n)
   end,
-  is_file = fs.is_file,
-  is_dir = fs.is_dir,
+  resolve_artifact = function(android_dir, target, configuration)
+    local project_dir = fs.norm(vim.fn.fnamemodify(android_dir, ":h:h"))
+    return require("ue.targets.android").find_symbol_artifact({
+      project_dir = project_dir,
+      target = target,
+      configuration = configuration,
+    })
+  end,
 })
 
 local M = {}
 
 local UE_MODULE_BASENAME = "libUE4.so"
+local ATTACH_RESULT_LISTENER_KEY = "ue-android-attach-result"
 
 -- ── shared session state ──────────────────────────────────────────────────
 M._session = {
@@ -74,8 +80,11 @@ M._session = {
   adb               = "adb",
   lldb_server_local = nil,  -- host path to NDK lldb-server
   remote_lldb_server = nil, -- device path to app-executable lldb-server
-  lldb_server_mode  = nil,  -- "gdbserver" (production) or legacy "platform"
-  symbol_lib        = nil,  -- host path to libUE4.so (with DWARF)
+  lldb_server_mode  = nil,  -- current route is app-uid "platform" only
+  symbol_lib        = nil,  -- host path to the symbol-rich module
+  runtime_module_basename = nil, -- verified DT_SONAME / maps identity (may differ from host file)
+  symbol_version_code = nil, -- packageInfo evidence for direct artifacts outside *_Symbols_v*
+  attach_succeeded  = nil, -- true only after the DAP attach response succeeds
   source_map        = nil,  -- list of { from, to } pairs
   engine_root       = nil,  -- host engine root, used to wire LLDB UE data formatters
   wait_mode         = nil,  -- true when launched via wait-for-debugger (set-debug-app -w)
@@ -95,16 +104,19 @@ M._last_session = nil
 
 local function snapshot_last_session()
   local s = M._session
-  -- K59: `pid` is set only by _finalize_session, i.e. only after an attach
-  -- actually reached the device. Without this guard a FAILED attach (pkg/serial/
-  -- symbol_lib already picked, pid probe missed) still ran through
-  -- stop_android_debugger() → snapshot, poisoning _last_session with a package
-  -- that does not exist on the device and making :UEDAPReattach replay it.
-  if not (s.package_name and s.serial and s.symbol_lib and s.pid) then return end
+  -- K59/K69: package/serial/symbol/pid are all known before the asynchronous
+  -- L2 gate and DAP attach response. None proves an attached debugger; even a
+  -- failed adapter may emit `initialized` first. Only the successful `attach`
+  -- response listener sets attach_succeeded, so half-sessions never poison
+  -- :UEDAPReattach.
+  if not (s.package_name and s.serial and s.symbol_lib and s.pid
+      and s.attach_succeeded == true) then return end
   M._last_session = {
     package_name      = s.package_name,
     serial            = s.serial,
     symbol_lib        = s.symbol_lib,
+    runtime_module_basename = s.runtime_module_basename,
+    symbol_version_code = s.symbol_version_code,
     lldb_server_local = s.lldb_server_local,
     remote_lldb_server = s.remote_lldb_server,
     lldb_server_mode  = s.lldb_server_mode,
@@ -337,139 +349,146 @@ local function pick_package(ctx)
 end
 
 local function pick_symbol_lib(ctx)
+  local function selected(path, required_runtime_identity)
+    local soname = symbols.read_soname(path)
+    local runtime_basename = soname or vim.fs.basename(path)
+    if required_runtime_identity
+      and soname ~= UE_MODULE_BASENAME and soname ~= "libUnreal.so" then
+      return nil
+    end
+    return path, runtime_basename
+  end
+
   -- 0. Explicit attach/context/default override. This path is used by
   -- agent-driven and reattach flows; do not prompt for a symbol path that is
   -- already known for the current UE Android workspace.
   local ctx_sym = ctx and (ctx.android_symbol_lib or ctx.symbol_lib)
   if type(ctx_sym) == "string" and ctx_sym ~= "" and fs.is_file(ctx_sym) then
-    return ctx_sym
+    return selected(ctx_sym, false)
   end
   -- 1. Config override.
   local cfg_sym = ue_cfg_get("dap.android_symbol_lib")
   if type(cfg_sym) == "string" and cfg_sym ~= "" and fs.is_file(cfg_sym) then
-    return cfg_sym
+    return selected(cfg_sym, false)
   end
-  local proot = effective_project_root(ctx)
-  if proot then
-    local android_dir = android_marker_path(proot, ctx and ctx.uproject or nil)
-    -- 2. versionCode 先收窄候选，再用 **build-id** 定案（K64/K65）。
-    --
-    -- 旧注释曾写「versionCode 匹配 guarantees the symbols correspond to the
-    -- installed APK」——**该说法已被证伪**：同一 versionCode 下存在多个不同
-    -- build-id（versionCode 来自打包配置，build-id 来自链接产物）。更重要的是
-    -- **构建配置本来就在引擎 cache 里**（`target_configuration`），而此前它从未
-    -- 参与选择，导致在 Test 工程上静默选中 Shipping 的符号包。
-    local info = read_package_info(proot, ctx and ctx.uproject or nil)
-    if android_dir and info and info.version_code ~= "" then
-      local suffix = "_Symbols_v" .. info.version_code
-      local exact = {}
-      for name, kind in vim.fs.dir(android_dir) do
-        if kind == "directory" and #name >= #suffix
-            and name:sub(-#suffix) == suffix then
-          local package_dir = android_dir .. "/" .. name
-          for arch_name, arch_kind in vim.fs.dir(package_dir) do
-            if arch_kind == "directory" and arch_name:lower():match("%-arm64$") then
-              local arch_dir = package_dir .. "/" .. arch_name
-              local preferred = arch_dir .. "/libUE4.so"
-              local fallback = arch_dir .. "/libUnreal.so"
-              if fs.is_file(preferred) then
-                exact[#exact + 1] = preferred
-              elseif fs.is_file(fallback) then
-                exact[#exact + 1] = fallback
-              end
+
+  local function discover_symbol_packages(android_dir, required_suffix)
+    local found = {}
+    if not android_dir or not fs.is_dir(android_dir) then return found end
+    for name, kind in vim.fs.dir(android_dir) do
+      local suffix_matches = not required_suffix
+        or (#name >= #required_suffix and name:sub(-#required_suffix) == required_suffix)
+      if kind == "directory" and name:find("Symbols", 1, true) and suffix_matches then
+        local package_dir = android_dir .. "/" .. name
+        for arch_name, arch_kind in vim.fs.dir(package_dir) do
+          if arch_kind == "directory" and arch_name:lower():match("%-arm64$") then
+            local arch_dir = package_dir .. "/" .. arch_name
+            local preferred = arch_dir .. "/libUE4.so"
+            local fallback = arch_dir .. "/libUnreal.so"
+            if fs.is_file(preferred) then
+              found[#found + 1] = preferred
+            elseif fs.is_file(fallback) then
+              found[#found + 1] = fallback
             end
           end
         end
       end
-      table.sort(exact)
-      -- 配置来自引擎 cache（ctx.state）——**不猜、不硬编码某个配置**。
-      local configuration = ctx and ctx.state and ctx.state.target_configuration or nil
-      local target_name = info.target or (ctx and ctx.state and ctx.state.target_name) or nil
-      if not target_name and ctx and ctx.uproject then
-        target_name = vim.fn.fnamemodify(ctx.uproject, ":t:r")
+    end
+    table.sort(found)
+    return found
+  end
+
+  local proot = effective_project_root(ctx)
+  if proot then
+    local android_dir = android_marker_path(proot, ctx and ctx.uproject or nil)
+    local info = read_package_info(proot, ctx and ctx.uproject or nil)
+    -- 配置来自引擎 cache（ctx.state）——**不猜、不硬编码某个配置**。
+    local configuration = ctx and (ctx.configuration
+      or (ctx.state and ctx.state.target_configuration)) or nil
+    local target_name = ctx and (ctx.target or ctx.target_name) or nil
+    -- Project name and Target name are independent (K45). Normal DAP entrypoints
+    -- inject the build planner's Target.cs-derived identity; a lower-level caller
+    -- that omits it may use weak package matching, but MUST NOT guess from .uproject.
+
+    local expected, artifact_so = nil, nil
+    if android_dir and configuration and target_name then
+      expected, artifact_so = symbols.expected_build_id(android_dir, target_name, configuration)
+    end
+
+    -- 2. K66：该配置的**未 strip 产物 so 自己就是符号源**（实测含 1.2GB
+    -- `.debug_info` + `.symtab`，且 build-id 与同配置 APK 内 lib 逐字相同）。
+    -- 它比从 `*_Symbols_v*` 反推配置更直接；该判定不依赖 packageInfo/versionCode，
+    -- 因为那些是打包元数据，而这里消费的是当前配置自己的链接产物。
+    if artifact_so and symbols.has_debug_symbols(artifact_so) then
+      local selected_path, runtime_basename = selected(artifact_so, true)
+      if selected_path then
+        return selected_path, runtime_basename, info and info.version_code or nil
       end
-      local expected = nil
-      if configuration and target_name then
-        expected = symbols.expected_build_id(android_dir, target_name, configuration)
-      end
+    end
+
+    -- 3. 有 packageInfo 时，versionCode 先收窄符号包，再用 build-id 定案（K64/K65）。
+    -- versionCode 相等只是一条弱证据；已知 build-id 时不允许退回 mtime 猜测。
+    if android_dir and info and info.version_code ~= "" then
+      local exact = discover_symbol_packages(android_dir, "_Symbols_v" .. info.version_code)
       local chosen, verdict = symbols.select_by_build_id(exact, expected)
-      if chosen then return chosen end
+      if chosen then return selected(chosen, false) end
       if verdict == "no-match" or verdict == "ambiguous" then
-        -- 有期望 build-id 却无候选命中（或多个命中）：**拒绕比选错安全**。
-        -- 错的符号会把断点解析到另一个构建，比「没有符号」更危险（K64）。
         log.notify("dap.android",
-          ("symbol package does not match the %s build (%s); "
-            .. "pick the symbol package built from the same link, or set "
+          ("no symbols match the %s build (%s); build that configuration, or set "
             .. "ue.config dap.android_symbol_lib explicitly")
             :format(tostring(configuration), verdict),
           vim.log.levels.WARN)
         return nil
       end
-      -- verdict == "unknown"：拿不到期望 build-id（该配置的产物 so 不在本地等）。
-      -- 此时才退回 versionCode 弱匹配，且只在唯一候选时接受。
-      if #exact == 1 then return exact[1] end
+      -- 拿不到期望 build-id 时，versionCode 最强只能算弱匹配，并且必须唯一。
+      if #exact == 1 then return selected(exact[1], false) end
+      log.notify("dap.android",
+        ("no unique symbol source for versionCode %s; build the selected configuration, "
+          .. "or set ue.config dap.android_symbol_lib explicitly")
+          :format(info.version_code),
+        vim.log.levels.WARN)
+      return nil
     end
-    -- 3. Scan all symbol packages, pick the newest by mtime (best guess
-    --    when no packageInfo or no exact match). Use fs.dir for the immediate
-    --    package directories: vim.fn.glob wildcard expansion is unreliable
-    --    for Windows short (8.3) temp paths, including headless tests.
-    local discovered = {}
-    if android_dir and fs.is_dir(android_dir) then
-      for name, kind in vim.fs.dir(android_dir) do
-        if kind == "directory" and name:find("Symbols", 1, true) then
-          local package_dir = android_dir .. "/" .. name
-          for arch_name, arch_kind in vim.fs.dir(package_dir) do
-            if arch_kind == "directory" and arch_name:lower():match("%-arm64$") then
-              local arch_dir = package_dir .. "/" .. arch_name
-              local preferred = arch_dir .. "/libUE4.so"
-              local fallback = arch_dir .. "/libUnreal.so"
-              if fs.is_file(preferred) then
-                discovered[#discovered + 1] = preferred
-              elseif fs.is_file(fallback) then
-                discovered[#discovered + 1] = fallback
-              end
-            end
-          end
-        end
-      end
-    end
+
+    -- 4. 没有 packageInfo 时扫描全部符号包/Intermediate。若当前配置产物提供了
+    -- expected build-id，仍只接受 build-id 命中；只有 expected 也拿不到时才按 mtime
+    -- 做历史兼容的 best guess。
+    local discovered = discover_symbol_packages(android_dir)
     local project_dir = android_dir and fs.norm(vim.fn.fnamemodify(android_dir, ":h:h")) or proot
-    local glob_patterns = {
+    local intermediate = {
       project_dir .. "/Intermediate/Android/arm64/jni/arm64-v8a/libUE4.so",
       project_dir .. "/Intermediate/Android/arm64/jni/arm64-v8a/libUnreal.so",
     }
+    for _, path in ipairs(intermediate) do
+      if fs.is_file(path) then discovered[#discovered + 1] = path end
+    end
+    if expected then
+      local chosen, verdict = symbols.select_by_build_id(discovered, expected)
+      if chosen then return selected(chosen, false) end
+      log.notify("dap.android",
+        ("no symbols match the %s build (%s); build that configuration, or set "
+          .. "ue.config dap.android_symbol_lib explicitly")
+          :format(tostring(configuration), verdict),
+        vim.log.levels.WARN)
+      return nil
+    end
+
     local best_path, best_mtime = nil, -1
     for _, path in ipairs(discovered) do
-      if fs.is_file(path) then
-        local st = vim.uv and vim.uv.fs_stat(path)
-        local mt = (st and st.mtime and st.mtime.sec) or 0
-        if mt > best_mtime then best_path, best_mtime = path, mt end
-      end
+      local st = vim.uv and vim.uv.fs_stat(path)
+      local mt = (st and st.mtime and st.mtime.sec) or 0
+      if mt > best_mtime then best_path, best_mtime = path, mt end
     end
-    for _, pat in ipairs(glob_patterns) do
-      local hit = vim.fn.glob(pat)
-      if hit and hit ~= "" then
-        for line in (hit .. "\n"):gmatch("([^\n]+)\n") do
-          if fs.is_file(line) then
-            local st = vim.uv and vim.uv.fs_stat(line)
-            local mt = (st and st.mtime and st.mtime.sec) or 0
-            if mt > best_mtime then
-              best_path, best_mtime = line, mt
-            end
-          end
-        end
-      end
-    end
-    if best_path then return best_path end
+    if best_path then return selected(best_path, false) end
   end
-  -- 4. Last resort: prompt.
+  -- 5. Last resort: prompt.
   local typed = vim.fn.input("Path to host libUE4.so (with DWARF): ", "", "file")
   if typed == "" then return nil end
   if not fs.is_file(typed) then
     vim.notify("Not a readable file: " .. typed, vim.log.levels.WARN)
     return nil
   end
-  return typed
+  return selected(typed, false)
 end
 
 local function alloc_free_port()
@@ -695,25 +714,53 @@ local function parse_maps_base_hex(maps, so_basename)
   return nil
 end
 
-local function read_so_base_hex(adb, serial, pkg, pid, so_basename)
-  if not (adb and serial and pkg and pid and so_basename) then return nil end
+local function runtime_module_candidates(symbol_lib, runtime_basename)
+  local candidates = {}
+  local verified = type(runtime_basename) == "string" and runtime_basename ~= ""
+    and runtime_basename or nil
+  local fallback = symbol_lib and vim.fs.basename(symbol_lib) or UE_MODULE_BASENAME
+  -- K66 keeps these identities separate. For a differently named UBT artifact,
+  -- runtime_basename comes from its verified ELF DT_SONAME; otherwise preserve
+  -- the historical same-basename behavior rather than guessing a device name.
+  candidates[1] = verified or fallback
+  return candidates
+end
+
+local function parse_runtime_module_base(maps, symbol_lib, runtime_basename)
+  for _, basename in ipairs(runtime_module_candidates(symbol_lib, runtime_basename)) do
+    local base_hex = parse_maps_base_hex(maps, basename)
+    if base_hex then return base_hex, basename end
+  end
+  return nil
+end
+
+local function read_so_base_hex(adb, serial, pkg, pid, symbol_lib, runtime_basename)
+  if not (adb and serial and pkg and pid and symbol_lib) then return nil end
   local maps = adb_run(adb, {
     "-s", serial, "shell", "run-as", pkg, "cat", "/proc/" .. tostring(pid) .. "/maps",
   })
-  return parse_maps_base_hex(maps, so_basename)
+  return parse_runtime_module_base(maps, symbol_lib, runtime_basename)
 end
 
--- Build the LLDB command that relocates the symbol-rich host libUE4.so to the
--- device ASLR base. Returns nil when base resolution failed (caller skips the
--- rebase but does NOT abort the attach).
-local function module_rebase_command(adb, serial, pkg, pid, symbol_lib)
-  if not symbol_lib or symbol_lib == "" then return nil end
-  local so_basename = vim.fs.basename(symbol_lib)
-  if not so_basename or so_basename == "" then return nil end
-  local base_hex = read_so_base_hex(adb, serial, pkg, pid, so_basename)
-  if not base_hex then return nil end
+-- Build the LLDB command that relocates the symbol-rich host module to the
+-- device ASLR base. The command names the HOST module created by `target create`,
+-- while the base lookup accepts the distinct APK runtime basename (K66).
+-- Returns nil when base resolution failed (caller skips the rebase but does NOT
+-- abort the attach).
+local function build_module_rebase_command(symbol_lib, base_hex)
+  if not symbol_lib or symbol_lib == "" or not base_hex or base_hex == "" then return nil end
+  local symbol_basename = vim.fs.basename(symbol_lib)
+  if not symbol_basename or symbol_basename == "" then return nil end
   -- Concatenation only — never string.format("%x", ...) for 64-bit addresses.
-  return string.format('target modules load --file "%s" --slide 0x%s', so_basename, base_hex), base_hex
+  return 'target modules load --file "' .. symbol_basename .. '" --slide 0x' .. base_hex
+end
+
+local function module_rebase_command(adb, serial, pkg, pid, symbol_lib, runtime_basename)
+  if not symbol_lib or symbol_lib == "" then return nil end
+  local base_hex, mapped_basename = read_so_base_hex(
+    adb, serial, pkg, pid, symbol_lib, runtime_basename)
+  if not base_hex then return nil end
+  return build_module_rebase_command(symbol_lib, base_hex), base_hex, mapped_basename
 end
 
 -- ── L1 传输 + 两跳 staging + platform server → ue.dap._android_transport ──
@@ -876,7 +923,8 @@ end
 function M._start_late_rebase_poller(sess)
   M._stop_late_rebase_poller()
   if not (sess and sess.wait_mode and sess.pid and sess.serial and sess.package_name) then return end
-  local so = sess.symbol_lib and vim.fs.basename(sess.symbol_lib) or UE_MODULE_BASENAME
+  local symbol_so = sess.symbol_lib and vim.fs.basename(sess.symbol_lib) or UE_MODULE_BASENAME
+  local runtime_names = runtime_module_candidates(sess.symbol_lib, sess.runtime_module_basename)
   local pid, serial, pkg, adb = sess.pid, sess.serial, sess.package_name, sess.adb
   local attempts, in_flight = 0, false
   local max_attempts = 90 -- × 700ms ≈ 63s of app init budget
@@ -884,13 +932,19 @@ function M._start_late_rebase_poller(sess)
   if not timer then return end
   M._late_rebase_timer = timer
 
-  local function finish_with_base(base_hex)
+  local function finish_with_base(base_hex, runtime_so)
     local ok_dap, dap = pcall(require, "dap")
     local session = ok_dap and dap and dap.session and dap.session() or nil
     if not session then return end
+    sess._runtime_module_basename = runtime_so
     -- Concatenation only — never string.format("%x") on 64-bit values (P7/K4).
-    local cmd = 'target modules load --file "' .. so .. '" --slide 0x' .. base_hex
-    append_bp_diag({ "== late ASLR rebase (wait-mode) ==", cmd })
+    -- Rebase the host symbol module at the base found under the APK runtime name.
+    local cmd = 'target modules load --file "' .. symbol_so .. '" --slide 0x' .. base_hex
+    append_bp_diag({
+      "== late ASLR rebase (wait-mode) ==",
+      "runtime_module=" .. tostring(runtime_so),
+      cmd,
+    })
     session:request("evaluate", { expression = "`" .. cmd, context = "repl" },
       function(err, res)
         append_bp_diag({
@@ -916,7 +970,8 @@ function M._start_late_rebase_poller(sess)
     if attempts > max_attempts then
       M._stop_late_rebase_poller()
       wait_notice("late-rebase-timeout",
-        (so .. " never appeared in /proc/%d/maps within ~60s of launch — "
+        (("none of [%s] appeared in /proc/%%d/maps within ~60s of launch — ")
+          :format(table.concat(runtime_names, ", "))
           .. "explicit ASLR slide NOT issued (K37); breakpoints may not resolve. "
           .. "Context: serial=%s pkg=%s. See ue-dap-bp-diag.log."):format(pid, serial, pkg))
       return
@@ -935,11 +990,14 @@ function M._start_late_rebase_poller(sess)
         vim.schedule(function()
           in_flight = false
           if not M._late_rebase_timer then return end
-          local base = res and res.code == 0
-            and parse_maps_base_hex(res.stdout or "", so) or nil
+          local base, runtime_so
+          if res and res.code == 0 then
+            base, runtime_so = parse_runtime_module_base(
+              res.stdout or "", sess.symbol_lib, sess.runtime_module_basename)
+          end
           if base then
             M._stop_late_rebase_poller()
-            finish_with_base(base)
+            finish_with_base(base, runtime_so)
           end
         end)
       end)
@@ -1015,6 +1073,12 @@ function M.stop_android_debugger(opts)
 
   -- Stop the liveness poller FIRST so it can't race with reset_session.
   if M._stop_liveness_poller then pcall(M._stop_liveness_poller) end
+  pcall(function()
+    local dap = require("dap")
+    if dap.listeners and dap.listeners.after and dap.listeners.after.attach then
+      dap.listeners.after.attach[ATTACH_RESULT_LISTENER_KEY] = nil
+    end
+  end)
   -- Remember session for :UEDAPReattach BEFORE reset_session wipes it.
   snapshot_last_session()
 
@@ -1220,12 +1284,12 @@ local function bootstrap_session(opts, on_ready)
   -- verbatim, skipping the packageInfo.txt versionCode exact-match step), so a
   -- stale build-id lib would attach and resolve breakpoints to the WRONG source
   -- revision (the 3.4 `ad3d4e7c…` false-lead in docs/CONSTRAINTS.md / handoff).
-  -- Leave it nil when no explicit/last-session source is known so pick_symbol_lib
-  -- falls through to: ue.config.dap.android_symbol_lib → packageInfo versionCode
-  -- exact match → newest-by-mtime glob → prompt. Mirrors the pick_package nil
-  -- fallthrough (commit 361b9e7).
+  -- Leave it nil when no explicit source is known so pick_symbol_lib consumes
+  -- the current target/configuration and artifact identity. Normal attach MUST
+  -- NOT replay `_last_session.symbol_lib`; only reattach freezes and reuses the
+  -- previous session explicitly.
   ctx.android_symbol_lib = ctx.android_symbol_lib or ctx.symbol_lib or opts.symbol_lib
-    or opts.android_symbol_lib or (M._last_session and M._last_session.symbol_lib)
+    or opts.android_symbol_lib
   local P = require("ue.dap._progress")
 
   local sess = M._session
@@ -1262,9 +1326,11 @@ local function bootstrap_session(opts, on_ready)
     sess.lldb_server_local = server_src
 
     P.step("4/6  picking symbol lib …")
-    local sym = pick_symbol_lib(ctx)
+    local sym, runtime_basename, symbol_version_code = pick_symbol_lib(ctx)
     if not sym then P.hide(); on_ready(false); return end
     sess.symbol_lib = sym
+    sess.runtime_module_basename = runtime_basename
+    sess.symbol_version_code = symbol_version_code
 
     sess.source_map = pick_source_map(ctx)
 
@@ -1395,12 +1461,14 @@ function M._finalize_session_after_gate(sess, pid, cfg_name, run_label)
   -- --slide` runs inside attachCommands, right after signal disposition.
   sess._module_rebase_cmd = nil
   if sess.symbol_lib and sess.symbol_lib ~= "" then
-    local rebase_cmd, base_hex = module_rebase_command(
-      sess.adb, sess.serial, sess.package_name, pid, sess.symbol_lib)
+    local rebase_cmd, base_hex, runtime_so = module_rebase_command(
+      sess.adb, sess.serial, sess.package_name, pid, sess.symbol_lib,
+      sess.runtime_module_basename)
     if rebase_cmd then
       sess._module_rebase_cmd = rebase_cmd
-      P.step(("module base resolved: %s @ 0x%s"):format(
-        vim.fs.basename(sess.symbol_lib), base_hex))
+      sess._runtime_module_basename = runtime_so
+      P.step(("module base resolved: %s -> %s @ 0x%s"):format(
+        vim.fs.basename(sess.symbol_lib), tostring(runtime_so), base_hex))
     elseif sess.wait_mode then
       -- EXPECTED in wait-for-debugger launch: the app is frozen at the JDWP
       -- gate before libUE4.so is loaded, so there is no maps entry yet. The
@@ -1412,8 +1480,10 @@ function M._finalize_session_after_gate(sess, pid, cfg_name, run_label)
       })
     else
       log.notify("dap.android",
-        "ASLR base unresolved for " .. vim.fs.basename(sess.symbol_lib)
-        .. "; breakpoints may not resolve (continuing attach)",
+        "ASLR base unresolved for runtime candidates ["
+        .. table.concat(runtime_module_candidates(
+          sess.symbol_lib, sess.runtime_module_basename), ", ")
+        .. "]; breakpoints may not resolve (continuing attach)",
         vim.log.levels.WARN)
     end
   end
@@ -1463,6 +1533,21 @@ function M._finalize_session_after_gate(sess, pid, cfg_name, run_label)
     end
     append_bp_diag(lines)
   end
+  sess.attach_succeeded = false
+  pcall(function()
+    local dap = require("dap")
+    dap.listeners.after.attach[ATTACH_RESULT_LISTENER_KEY] = function(session, err)
+      local config = session and session.config or nil
+      if not config or config._ue_session_owner ~= "android"
+        or tonumber(config._ue_process_id) ~= tonumber(pid) then
+        return
+      end
+      dap.listeners.after.attach[ATTACH_RESULT_LISTENER_KEY] = nil
+      if err then return end
+      sess.attach_succeeded = true
+      snapshot_last_session()
+    end
+  end)
   C.run(cfg, run_label)
   -- Progress popup finalized by ue.dap.lua's event_initialized listener
   -- (P.done) or by stop_android_debugger / on_session_end (P.hide).
@@ -1678,6 +1763,8 @@ function M.reattach()
   sess.serial            = android_device.get() or last.serial
   sess.package_name      = last.package_name
   sess.symbol_lib        = last.symbol_lib
+  sess.runtime_module_basename = last.runtime_module_basename
+  sess.symbol_version_code = last.symbol_version_code
   sess.lldb_server_local = last.lldb_server_local
   sess.remote_lldb_server = last.remote_lldb_server
   sess.lldb_server_mode  = last.lldb_server_mode
@@ -1969,6 +2056,18 @@ end
 
 function M._parse_maps_base_hex_for_test(maps, so_basename)
   return parse_maps_base_hex(maps, so_basename)
+end
+
+function M._runtime_module_candidates_for_test(symbol_lib, runtime_basename)
+  return runtime_module_candidates(symbol_lib, runtime_basename)
+end
+
+function M._parse_runtime_module_base_for_test(maps, symbol_lib, runtime_basename)
+  return parse_runtime_module_base(maps, symbol_lib, runtime_basename)
+end
+
+function M._build_module_rebase_command_for_test(symbol_lib, base_hex)
+  return build_module_rebase_command(symbol_lib, base_hex)
 end
 
 function M._wait_launch_device_steps_for_test(pkg)

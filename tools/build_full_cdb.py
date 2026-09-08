@@ -21,8 +21,9 @@ ARCHITECTURE (v3 — exact commands plus controlled background CDB):
 PIPELINE:
   raw UBT compile_commands.json (per-file)
     │
-    ├── replace_i_with_rsp.py        — fix -I list from .Shared.rsp
-    ├── inject_definitions_to_cdb.py — inject Definitions.h #defines as -D
+    ├── replace_i_with_rsp.py        — expand explicit active @response references
+    ├── inject_definitions_to_cdb.py — validate exact inputs for BackgroundIndex
+    │                                 (legacy indexer: inject explicit Definitions)
     │      ↓
     │   (per-file CDB, post-fix) → write to <out_active>     [LSP artefact]
     │      ↓
@@ -176,7 +177,7 @@ def main():
     ap.add_argument('input_cdb', help='Raw per-file UBT compile_commands.json')
     ap.add_argument('output_cdb', help='Output ACTIVE per-file CDB (for LSP)')
     ap.add_argument('--no-rsp', action='store_true',
-                    help='Skip replace_i_with_rsp step (faster, less accurate -I)')
+                    help='Skip expansion of explicit active @response references')
     ap.add_argument('--no-inject', action='store_true',
                     help='Skip inject_definitions step (only for debugging)')
     ap.add_argument('--no-super', action='store_true',
@@ -222,7 +223,7 @@ def main():
     print(f'[normalize] structured entries: {len(structured)}; command converted: {converted}',
           flush=True)
 
-    # ---- Step 1: replace -I with rsp truth (per-file CDB; in-place)
+    # ---- Step 1: expand only response references in active compiler arguments.
     if not args.no_rsp:
         rsp = os.path.join(tools, 'replace_i_with_rsp.py')
         if os.path.isfile(rsp):
@@ -240,10 +241,17 @@ def main():
         inj = os.path.join(tools, 'inject_definitions_to_cdb.py')
         if os.path.isfile(inj):
             print('\n[2/4] inject_definitions_to_cdb')
-            rc = run([py, '-I', inj, work])
+            inject_cmd = [py, '-I', inj, work]
+            if args.background_output:
+                inject_cmd.append('--preserve-exact')
+            rc = run(inject_cmd)
             if rc != 0:
-                print(f'  WARN: inject_definitions_to_cdb returned {rc} (continuing)')
+                print(f'ERROR: inject_definitions_to_cdb returned {rc}', file=sys.stderr)
+                return rc
         else:
+            if args.background_output:
+                print(f'ERROR: required exact-input validator missing: {inj}', file=sys.stderr)
+                return 1
             print(f'\n[2/4] inject_definitions_to_cdb SKIPPED ({inj} not found)')
     else:
         print('\n[2/4] inject_definitions_to_cdb SKIPPED (--no-inject)')

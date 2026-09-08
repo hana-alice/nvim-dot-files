@@ -27,7 +27,10 @@ pwsh -File scripts/run_regression.ps1       # 本机一键（转发 + 退出码�
 
 | 改动位置 | 最小必跑 filter |
 |---|---|
-| `lua/config/keymaps.lua` / 命令定义 | `keymaps` `commands` |
+| `lua/config/keymaps.lua` / 命令定义 | `keymaps` `commands` `review_editor` |
+| picker 交互 / Git sidebar / 插件工具链策略 | `review_editor` `smoke` |
+| CI bootstrap / workflow / legacy smoke | `review_ci` + 全量 + legacy smoke |
+| `lua/utils/ue_watch.lua` / `dirty_save.lua` | `ue_watch_csearch` `multi_instance_state` `stability` |
 | `lua/utils/window_title.lua` | `window_title` `keymaps` `commands` `cheatsheet` |
 | `lua/utils/android_device.lua` / Android ADB device 路由 | `android_device` `dap` `ue_context` |
 | `lua/ue/config.lua`（schema） | `ue_config` `smoke` |

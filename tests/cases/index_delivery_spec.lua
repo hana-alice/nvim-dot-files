@@ -790,12 +790,62 @@ t.describe("头文件多候选 TU：先收敛，唯一定义直接跳转（不�
       "收敛结果应写入 window origin，避免重复付出 catalog 代价")
   end)
 
-  t.it("收敛回调必须做 stale 校验（异步期间光标/buffer 可能已变）", function()
-    local c = read(CLI)
-    local body = c:match("query_contexts%(spec, contexts, function%(response%)(.-)\n          end%)")
-    t.assert_match(body, "client%.snapshot_is_current%(snapshot%)",
-      "异步返回必须校验 snapshot 仍有效")
-  end)
+  for _, change in ipairs({ "none", "action", "generation" }) do
+    t.it("收敛回调检查 snapshot 与 generation 后才交付或写 lineage: " .. change, function()
+      local state = {
+        window_contexts = {}, action_autocmds = {}, next_action_token = 0, active_action_token = 0,
+      }
+      local current_generation = "before"
+      local pending, response, reason
+      local contexts = { { id = "a", origin_tu = "fixture_a.cpp" }, { id = "b", origin_tu = "fixture_b.cpp" } }
+      local client = {
+        request = function(op, fields, callback)
+          if op == "catalog" then
+            callback({ state = "resolved", contexts = contexts })
+          else
+            t.assert_eq(op, "query")
+            t.assert_eq(#fields.contexts, 2, "必须执行多 context 收敛路径")
+            pending = callback
+          end
+        end,
+        index_snapshot_is_current = function(expected)
+          return expected.generation_id == current_generation, "index-generation-changed"
+        end,
+      }
+      local actions = require("utils.ue_goto.semantic_client_actions").install(client, {
+        state = state, hash_text = vim.fn.sha256, emit_trace = function() end,
+        close_timer = function(timer)
+          if timer and not timer:is_closing() then timer:stop(); timer:close() end
+        end,
+        PROGRESS_DELAY_MS = 60000,
+      })
+      local ok, err = xpcall(function()
+        local snapshot = client.begin_action(0)
+        client.resolve_header({
+          snapshot = snapshot, path = "fixture.h", line = 1, column = 1,
+          environment = {
+            build_fingerprint = "build", evidence_roots = { "fixture" },
+            index = { generation_id = "before" },
+          },
+        }, function(value, why) response, reason = value, why end)
+        t.assert_type(pending, "function")
+        if change == "action" then client.cancel_action() end
+        if change == "generation" then current_generation = "after" end
+        pending({ state = "resolved", contexts = contexts, document_version = snapshot.document_version })
+        if change == "none" then
+          t.assert_eq(response.state, "resolved")
+          t.assert_type(state.window_contexts[snapshot.winid], "table")
+        else
+          t.assert_nil(response, "过期收敛结果不得交付")
+          t.assert_eq(reason, change == "action" and "superseded" or "index-generation-changed")
+          t.assert_nil(state.window_contexts[snapshot.winid], "过期收敛结果不得写入 origin lineage")
+        end
+      end, debug.traceback)
+      client.cancel_action()
+      actions.reset()
+      if not ok then error(err) end
+    end)
+  end
 end)
 
 t.describe("prepare 完成汇报不得为了打印计数而冻结 UI", function()

@@ -24,13 +24,13 @@ local M = {}
 local C = require("ue.dap._common")
 
 local deps = {
-  log = nil,                       -- utils.log 兼容对象
-  find_engine_root_from_cwd = nil, -- fun(): string|nil
+  log = false,                       -- utils.log 兼容对象
+  find_engine_root_from_cwd = false, -- fun(): string|nil
 }
 
 function M.bind(overrides)
   for key, value in pairs(overrides or {}) do
-    assert(deps[key] ~= nil or key ~= nil, "unknown engine dependency: " .. tostring(key))
+    assert(deps[key] ~= nil, "unknown engine dependency: " .. tostring(key))
     deps[key] = value
   end
   return M
@@ -118,7 +118,7 @@ function M.init_commands(session)
         vim.notify(
           "[ue.dap] LLDB formatter not found: " .. formatter ..
           "\n(set ue.config.dap.lldb_formatter_path to override)",
-          vim.deps.log.levels.WARN)
+          vim.log.levels.WARN)
       end)
     end
   elseif formatter and formatter ~= "" and not has_python then
@@ -184,7 +184,7 @@ function M.init_commands(session)
         "[ue.dap] lldb-dap has no Python module — using native UE summary fallback.\n" ..
         "Covered: FString, FVector*, FRotator, FQuat, FColor*, FBox, TArray, TWeakObjectPtr, TSharedPtr/Ref.\n" ..
         "FName / UObject->GetName() still require Python bindings or :UEDAPWatchFName command.",
-        vim.deps.log.levels.INFO)
+        vim.log.levels.INFO)
     end)
   end
   return cmds
@@ -316,7 +316,10 @@ function M.attach_commands(session)
   -- GAndroidSignalTimeOut elapses, so sitting at this breakpoint for a long
   -- time may still let the app self-exit.
   if (vim.env.UE_DAP_NO_FATAL_BP or "") == "" then
-    cmds[#cmds + 1] = '?breakpoint set --shlib libUE4.so --name "FFatalSignalHandler::OnTargetSignal"'
+    local symbol_module = session and session.symbol_lib
+      and vim.fs.basename(session.symbol_lib) or "libUE4.so"
+    cmds[#cmds + 1] = ('?breakpoint set --shlib %s --name '
+      .. '"FFatalSignalHandler::OnTargetSignal"'):format(symbol_module)
   end
   return cmds
 end
@@ -353,7 +356,12 @@ function M.post_run_commands(session)
   -- breakpoints resolve without planting an extra diagnostic breakpoint.
   local probe_file = session and session._bp_probe_file or nil
   local probe_line = session and session._bp_probe_line or nil
-  cmds[#cmds + 1] = "image list libUE4.so"
+  local runtime_module = session and session.runtime_module_basename or "libUE4.so"
+  local symbol_module = session and session.symbol_lib and vim.fs.basename(session.symbol_lib) or nil
+  cmds[#cmds + 1] = "image list " .. runtime_module
+  if symbol_module and symbol_module ~= runtime_module then
+    cmds[#cmds + 1] = "image list " .. symbol_module
+  end
   cmds[#cmds + 1] = "image lookup --name FEngineLoop::Tick"  -- cheap symbol/DWARF presence probe
   if probe_file and probe_line then
     cmds[#cmds + 1] = string.format('image lookup --file "%s" --line %d', probe_file, probe_line)

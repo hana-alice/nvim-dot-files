@@ -127,6 +127,131 @@ local function make_manifest(ctx, state, phase, content, keys, completed_at)
 end
 
 t.describe("ue.index generation manifests", function()
+  t.it("full generator preserves Android includes when Win64 Editor intermediates coexist", function()
+    local root = canonical_temp_root("_full_active_rsp")
+    local source = root .. "/Engine/Source/Runtime/Sample/Private/A.cpp"
+    local editor = root .. "/Engine/Intermediate/Build/Win64/x64/UnrealEditor/Development/Sample"
+    write_file(source, "// active Android source\n")
+    write_file(editor .. "/Sample.Shared.rsp", '-I"' .. root .. '/EditorOnly"')
+    write_file(editor .. "/Definitions.Sample.h", "#define PLATFORM_WINDOWS 1\n#define WRONG_EDITOR_BUILD 1\n")
+    write_file(root .. "/Engine/Intermediate/Build/Win64/UnrealEditor/Inc/Sample/UHT/Sample.generated.h", "// stale editor\n")
+    local entry = {
+      directory = root .. "/Engine/Source", file = source,
+      arguments = { "clang++", "--target=aarch64-linux-android", "-I" .. root .. "/AndroidOnly", "-c", source },
+    }
+    local input, active, background = root .. "/input.json", root .. "/out/active.json", root .. "/out/background.json"
+    write_file(input, vim.json.encode({ entry }))
+    local result = vim.system(python_command(
+      vim.fn.stdpath("config") .. "/tools/build_full_cdb.py", input, active,
+      "--background-output", background
+    ), { text = true }):wait()
+    t.assert_eq(result.code, 0, result.stderr or result.stdout)
+    t.assert_true(vim.deep_equal(read_json(active)[1].arguments, entry.arguments), "active flags must not use another build's rsp")
+    t.assert_true(vim.deep_equal(read_json(background)[1].arguments, entry.arguments), "fallback must retain exact active flags")
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("controlled generators keep explicit Definitions and PCH exact and reject missing build inputs", function()
+    local root = canonical_temp_root("_exact_build_inputs")
+    local source = root .. "/Engine/Source/Runtime/Sample/Private/A.cpp"
+    local defs = root .. "/Intermediate/Build/Android/Target/Test/Sample/Definitions.Sample.h"
+    local pch = root .. "/Intermediate/Build/Android/Target/Test/Sample/SharedPCH.Sample.pch"
+    write_file(source, "// active\n")
+    write_file(defs, "#if SELECTED\n#define BUILD_VALUE 1\n#else\n#define BUILD_VALUE 2\n#endif\n")
+    write_file(pch, "fixture: generator checks existence, never invokes compiler\n")
+    local entry = { directory = root, file = source, arguments = {
+      "clang++", "--target=aarch64-linux-android", "-DSELECTED=1", "-include", defs,
+      "-include-pch", pch, "-c", source,
+    } }
+    for _, phase in ipairs({ "full", "current" }) do
+      for _, missing in ipairs({ "ready", "pch", "defs" }) do
+        local folder = root .. "/" .. phase .. "_" .. missing
+        local input, active = folder .. "/input.json", folder .. "/active.json"
+        local background, marker = folder .. "/background.json", folder .. "/marker.json"
+        local variant = vim.deepcopy(entry)
+        if missing == "pch" then variant.arguments[7] = pch .. ".missing" end
+        if missing == "defs" then variant.arguments[5] = defs:gsub("%.h$", ".missing.h") end
+        write_file(input, vim.json.encode({ variant }))
+        local cmd
+        if phase == "full" then
+          cmd = python_command(vim.fn.stdpath("config") .. "/tools/build_full_cdb.py", input, active,
+            "--background-output", background, "--idx-output", marker)
+        else
+          cmd = python_command(vim.fn.stdpath("config") .. "/tools/build_clangd_index.py", input,
+            "--background-output", background, "--output", marker)
+        end
+        local result = vim.system(cmd, { text = true }):wait()
+        if missing ~= "ready" then
+          t.assert_true(result.code ~= 0, "missing explicit build input must fail generation")
+          t.assert_eq(vim.fn.filereadable(marker), 0, "failed validation must not publish a ready marker")
+        else
+          t.assert_eq(result.code, 0, result.stderr or result.stdout)
+          t.assert_true(vim.deep_equal(read_json(background)[1].arguments, variant.arguments), "controlled flags must remain exact")
+        end
+      end
+    end
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("response expansion preserves active order and falls back intact on incomplete evidence", function()
+    local root = canonical_temp_root("_explicit_rsp")
+    write_file(root .. "/flags.Shared.rsp", '-I"include with spaces" -DCHOICE=2 @nested.rsp')
+    write_file(root .. "/nested.rsp", '-Isecond -UOLD')
+    write_file(root .. "/cycle.rsp", '@cycle.rsp')
+    local entries = {
+      { directory = root, file = "A.cpp", arguments = { "clang++", "-Ibefore", "@flags.Shared.rsp", "-DCHOICE=3", "A.cpp" } },
+      { directory = root, file = "B.cpp", arguments = { "clang++", "@flags.Shared.rsp", "@missing.rsp", "B.cpp" } },
+      { directory = root, file = "C.cpp", arguments = { "clang++", "@cycle.rsp", "C.cpp" } },
+    }
+    local input = root .. "/input.json"
+    write_file(input, vim.json.encode(entries))
+    local result = vim.system(python_command(
+      vim.fn.stdpath("config") .. "/tools/replace_i_with_rsp.py", input
+    ), { text = true }):wait()
+    t.assert_eq(result.code, 0, result.stderr or result.stdout)
+    local output = read_json(input)
+    t.assert_true(vim.deep_equal(output[1].arguments, { "clang++", "-Ibefore", "-Iinclude with spaces", "-DCHOICE=2", "-Isecond", "-UOLD", "-DCHOICE=3", "A.cpp" }))
+    t.assert_true(vim.deep_equal(output[2].arguments, entries[2].arguments), "missing nested evidence must not partially change argv")
+    t.assert_true(vim.deep_equal(output[3].arguments, entries[3].arguments), "cyclic response must preserve exact original argv")
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("rejects unity response semantic differences and retains every exact command", function()
+    local root = canonical_temp_root("_rsp_context_mismatch")
+    local unity_root = root .. "/Intermediate/Build/Android/Target/Development"
+    local entries = {}
+    local mismatches = { "-DCHOICE=0", "-Iwrong", "--target=x86_64-linux-android", "-include-pch wrong.pch" }
+    for i, mismatch in ipairs(mismatches) do
+      local source = root .. "/Engine/Source/Runtime/Sample" .. i .. "/Private/A.cpp"
+      local unity = unity_root .. "/Sample" .. i .. "/Module.Sample" .. i .. ".cpp"
+      local common = { "--target=aarch64-linux-android", "-std=c++20", "-DCHOICE=1", "-I" .. unity_root .. "/Includes", "-c" }
+      write_file(source, "// active\n")
+      write_file(unity, '#include "' .. source .. '"\n')
+      local response = {}
+      for _, arg in ipairs(common) do response[#response + 1] = '"' .. arg .. '"' end
+      response[#response + 1] = mismatch
+      response[#response + 1] = '"' .. unity .. '"'
+      write_file(unity .. ".o.rsp", table.concat(response, " "))
+      local argv = { "clang++" }
+      vim.list_extend(argv, common)
+      argv[#argv + 1] = source
+      entries[#entries + 1] = { directory = root, file = source, arguments = argv }
+    end
+    local input, output = root .. "/input.json", root .. "/out.json"
+    write_file(input, vim.json.encode(entries))
+    local result = vim.system(python_command(
+      vim.fn.stdpath("config") .. "/tools/build_hot_super_unity_cdb.py", input, output
+    ), { text = true }):wait()
+    t.assert_eq(result.code, 0, result.stderr or result.stdout)
+    local actual = read_json(output)
+    t.assert_eq(#actual, #entries)
+    for i, entry in ipairs(entries) do
+      t.assert_eq(actual[i].file, entry.file, "mismatched response must not become a proven wrapper")
+      t.assert_true(vim.deep_equal(actual[i].arguments, entry.arguments))
+    end
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
   t.it("hashes generation maps with canonical key ordering", function()
     local first = index._stable_hash_for_test({
       toolchain_identity = "toolchain",
@@ -172,7 +297,8 @@ t.describe("ue.index generation manifests", function()
     write_file(unity_file .. "x.o.rsp", table.concat({
       "--target=x86_64-pc-windows-msvc",
       "-std=c++20",
-      '-include "' .. unity_root .. '/Sample/Definitions.Sample.h"',
+      '-include "' .. unity_root .. '/Engine/SharedPCH.Engine.h"',
+      '-include-pch "' .. unity_root .. '/Engine/SharedPCH.Engine.pch"',
       "-c",
       '"' .. unity_file .. '"',
       '-o "' .. unity_file .. 'x.o"',
@@ -187,7 +313,8 @@ t.describe("ue.index generation manifests", function()
         file = source,
         arguments = {
           "clang++", "--target=x86_64-pc-windows-msvc", "-std=c++20", "-include",
-          unity_root .. "/Engine/SharedPCH.Engine.h", "-c", source,
+          unity_root .. "/Engine/SharedPCH.Engine.h", "-include-pch",
+          unity_root .. "/Engine/SharedPCH.Engine.pch", "-c", source,
         },
       }
     end
@@ -224,6 +351,8 @@ t.describe("ue.index generation manifests", function()
     t.assert_true(fallback ~= nil, "fallback entry missing")
 
     t.assert_eq(#wrapper.nvim_ue_members, 2)
+    t.assert_contains(wrapper.arguments, "-include-pch")
+    t.assert_contains(wrapper.arguments, unity_root .. "/Engine/SharedPCH.Engine.pch")
     t.assert_eq(wrapper.nvim_ue_members[1], "Source/Runtime/Sample/Private/A.cpp")
     t.assert_eq(wrapper.nvim_ue_members[2], "Source/Runtime/Sample/Private/B.cpp")
     t.assert_eq(wrapper.nvim_ue_module_root, "Source/Runtime/Sample")
@@ -657,7 +786,7 @@ t.describe("ue.index generation manifests", function()
     write_file(unity_file .. "x.o.rsp", table.concat({
       "--target=x86_64-pc-windows-msvc",
       "-std=c++20",
-      '-include "' .. unity_root .. '/Sample/Definitions.Sample.h"',
+      '-include "' .. unity_root .. '/Engine/SharedPCH.Engine.h"',
       "-c",
       '"' .. unity_file .. '"',
       '-o "' .. unity_file .. 'x.o"',

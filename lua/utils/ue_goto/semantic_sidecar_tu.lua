@@ -301,7 +301,7 @@ function M.install(Sidecar)
       }
       self.tus[cache_key] = entry
       query_kind = "cold"
-    elseif entry.overlay_hash ~= overlay_hash then
+    elseif entry.overlay_hash ~= overlay_hash or not libclang.file_signatures_current(entry.file_signatures) then
       local started = libclang.uv.hrtime()
       local code = self.toolchain.lib.clang_reparseTranslationUnit(entry.tu, #overlays, unsaved_files, 0)
       reparse_ms = libclang.duration_ms(started)
@@ -318,6 +318,11 @@ function M.install(Sidecar)
       entry.keepalive = keepalive
       entry.diagnostics = nil
       query_kind = "reparse"
+    end
+
+    if query_kind ~= "warm" then
+      entry.file_signatures = libclang.tu_file_signatures(
+        self.toolchain.lib, entry.tu, compile.origin_tu)
     end
 
     entry.last_used_ms = libclang.now_ms()

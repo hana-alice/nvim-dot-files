@@ -755,9 +755,77 @@
   **关键判断**: 有期望 build-id 却无候选命中（或多个命中）时 **拒绕而非降级猜**——
   错的符号比没有符号更危险（断点看似生效却指向另一个构建）；只有在拿不到期望
   build-id（该配置的产物 so 不在本地）时，才退回 versionCode 弱匹配且仅接受唯一候选。
-  → `lua/ue/dap/_android_symbols.lua`（`artifact_so_name` / `expected_build_id` /
-    `select_by_build_id`）; `lua/ue/dap/android.lua`（`pick_symbol_lib` 消费
-    `ctx.state.target_configuration`）; 行为测 `tests/cases/dap_failure_layer_spec.lua`
+  → `lua/ue/dap/_android_symbols.lua`（`expected_build_id` / `select_by_build_id`）;
+    `lua/ue/targets/android.lua`（配置限定产物解析）; `lua/ue/dap/android.lua`
+    （`pick_symbol_lib` 消费当前 Target/Configuration）; 行为测
+    `tests/cases/dap_failure_layer_spec.lua`
+
+- **K66 — 当前配置的未 strip UBT 产物本身就是符号源，但 host 文件名不等于 runtime module 名
+  （2026-09-04 真机前置链实测）**
+  层归属: **L4 符号语义**。
+  症状: Test 配置明明已有 `<Target>-Android-Test-arm64.so`，工具却只在 `*_Symbols_v*`
+  目录找符号并报告「需要另一个符号包」；直接返回该产物的早期修复又拿 host basename 去查
+  `/proc/<pid>/maps`，而设备实际映射的是 `libUE4.so`，使 K37 的显式 slide 静默缺席。
+  证据: 真实 Test 产物含非空 `.debug_info`（约 1.2 GB）、`.debug_line`（约 186 MB）与
+  `.symtab`（约 52 MB），其 build-id 与同配置 APK native lib 一致；`llvm-readelf -d`
+  显示 `DT_SONAME=libUE4.so`。host 文件名与 runtime identity 是两个字段，不能互相代替。
+  解决约束: 符号选择先消费 build 共用 resolver 解析出的 Target + effective Configuration
+  （`UE_TARGET_CONFIGURATION` 与 build 一样优先于 cache/default），并复用 target owner 的产物规则
+  （含 Development `<Target>-arm64.so`，但 mismatched receipt 时不猜 generic short name）。只有
+  ELF64 little-endian section table **真实引用**非空
+  `.debug_info`/`.zdebug_info` 且 `DT_SONAME` 可解析时才直接使用；不能只在字符串表搜字面量
+  （section table 在文件尾部，搜头部也会假阴性）。`target create`/`target modules load --file`
+  使用 host basename，maps/late-rebase 使用 `DT_SONAME`。普通 attach 切配置后必须重选，
+  不得让 `_last_session.symbol_lib` 冒充显式 override；有 packageInfo 但无唯一同版本候选时
+  不得回退 mtime 猜另一个版本。
+  → `lua/ue/target_identity.lua`; `lua/ue/dap/_android_symbols.lua`;
+    `lua/ue/dap/android.lua`; `lua/ue/dap/_android_engine.lua`; `lua/ue/targets/android.lua`;
+    `openspec/specs/android-dap-attach/spec.md`; 行为测
+    `tests/cases/dap_failure_layer_spec.lua` / `tests/cases/dap_spec.lua`
+
+- **K67 — 拆 owner 后的未限定依赖在 `pcall` 里会静默跳过承重清理
+  （2026-09-04 真机 attach 暴露）**
+  层归属: **L1 传输 / L3 编辑器引擎接线**（两个同源的 namespace 缺陷，分别按所在层修复）。
+  症状: `_android_transport.lua` 已把依赖注入到 `deps.adb_run*`、helper 导出到 `M.*`，内部却仍调
+  裸 `adb_run`/`adb_run_raw`/`sandbox_stage_script`/`platform_server_script`。裸调用会报 nil；
+  包在 `pcall` 里的 kill/rm 则更危险——错误被吞掉，root-owned residue 与两 uid stale server
+  根本没清，却看起来流程继续。另一个同源 typo 是 `_android_engine.lua` 的 scheduled notify
+  调 `vim.deps.log.levels`，真机首次走 native formatter fallback 才抛错。
+  解决约束: 拆分模块内部一律经 `deps.*` / `M.*` 调注入依赖与导出 helper；`bind()` 的 known-key
+  sentinel 必须真实存在，禁止 `deps[key] ~= nil or key ~= nil` 这种恒真 guard。承重 `pcall` 路径
+  必须有行为测证明副作用确实发生，不能只测 pure helper。Neovim 日志级别只用 `vim.log.levels`。
+  → `lua/ue/dap/_android_transport.lua`; `lua/ue/dap/_android_engine.lua`;
+    行为测 `tests/cases/dap_spec.lua`「repush 确实先 kill + rm 再 push」
+
+- **K68 — 某一当前设备的 `runas_app` 域允许 server bind/listen，却不让 forwarded GDB handshake 前进
+  （2026-09-04 当前设备 A/B）**
+  层归属: **L2 目标 OS 策略（当前证据）**；生产门禁尚未自动化时不得把泛化结论写成所有设备事实。
+  症状: app-uid `lldb-server platform` 进程存在、`ss` 显示 `0.0.0.0:<port>` LISTEN、sandbox
+  副本可执行，但 host `platform connect` 60 秒后报 handshake timeout；同一 NDK 27 binary、
+  同一设备、同一 adb forward，仅改为 shell uid 启动时，对 `qHostInfo` 立即回 `+` ACK。
+  `ps -AZ` 显示失败进程位于 `u:r:runas_app:...`，因此现有「可执行 + ptrace」L2 探针全绿仍
+  不足以证明 platform transport 在该域可服务。K56 又已证明 shell uid 即使能握手也不能 ptrace
+  app，所以**不得**回退 shell server 假装修好。
+  处置: 本轮真机 attach 记录为 external target-policy blocker；若要在运行时门禁自动化，须先立
+  change 修改当前 diagnostic-only 契约，再在启动 lldb-dap 前增加 app-uid forwarded handshake
+  A/B capability probe并以命令/ACK/timeout 为 evidence。在该探针落地前，handshake timeout 的
+  层归属只能基于现场 A/B，不能仅凭通用错误文本猜。
+  → `openspec/specs/dap-failure-layering/spec.md`; `lua/ue/dap/_android_transport.lua`;
+    本轮 `docs/changelog.md` K66 Validation/Follow-ups
+
+- **K69 — 捕获到目标 PID 不等于 DAP attach 成功；失败会话不得污染 reattach 快照
+  （2026-09-04 review 抓到）**
+  层归属: **L3 调试引擎接线 / 编辑器管道**。
+  症状: `_finalize_session` 在 L2 gate 与异步 DAP attach 之前就写 `sess.pid`，而 liveness poller
+  启动时立即 `snapshot_last_session()`；只用「有 pid」作成功守卫，会把 L2 拒绝、handshake
+  timeout 或 attach response 失败的半会话记成成功。下一次 `:UEDAPReattach` 随后重放一份从未
+  接通过的 symbol/server identity。
+  解决约束: reattach 快照必须额外要求 DAP `attach` response **明确成功**；`initialized` event
+  也不够（失败的 K68 protocol trace 同样先发 initialized，再回 attach failure）。normal attach
+  response listener 成功时置位并快照；失败、L2 拒绝、仅有 PID 或 poller 启动都不得写。
+  → `lua/ue/dap/android.lua`（`attach_succeeded` / attach response listener /
+    `snapshot_last_session`）; `openspec/specs/android-dap-attach/spec.md`;
+    行为测 `tests/cases/dap_spec.lua`「只有 pid 但 response 失败不得写」
 
 ### 工具链 / LLVM
 
@@ -1045,8 +1113,8 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 
 ### C5 — 符号解析分层契约
 
-- **C++ source TU**：active CDB 证明 → proven TU 中的 libclang exact-cursor canonical USR；
-  不以 clangd 单次 definition 或 source 文件名代替 identity proof。
+- **C++ source TU**：active CDB exact command 传给同一 clangd client 后，在不可变位置 snapshot
+  上请求 canonical USR 与 definition；不以单次 definition 或 source 文件名代替 identity proof。
 - **C++ header**：必须继承或选择 compiler-emitted dependency evidence 证明的 origin TU，
   由异步 libclang sidecar 在真实 argv / cwd 中解析 canonical USR；standalone header 不是 build truth。
 - **跨 TU destination**：先在 subject 所属 controlled module 的 compiler-authored UBT unity /

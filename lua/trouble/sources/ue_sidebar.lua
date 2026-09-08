@@ -65,17 +65,17 @@ local function git_state_for(root)
   return git_state.by_root[root]
 end
 
-local function parse_git_status_items(root, lines)
+local function parse_git_status_items(root, stdout)
   local items = {} ---@type trouble.Item[]
-
-  for _, line in ipairs(lines) do
+  local records = vim.split(stdout or "", "\0", { plain = true, trimempty = true })
+  local index = 1
+  while index <= #records do
+    local line = records[index]
     local status = line:sub(1, 2)
-    local raw = vim.trim(line:sub(4))
-    local target = raw
-    if raw:find(" -> ", 1, true) then
-      local parts = vim.split(raw, " -> ", { plain = true })
-      target = parts[#parts]
-    end
+    -- Porcelain -z emits the literal destination path, then a separate
+    -- original-path record for renames/copies. Never trim or unquote paths.
+    local target = line:sub(4)
+    index = index + (status:find("[RC]") and 2 or 1)
     local filename = vim.fs.joinpath(root, target)
     local bufnr = vim.fn.bufadd(filename)
     items[#items + 1] = Item.new({
@@ -131,42 +131,21 @@ local function start_git_refresh(root, force)
   cache.error = nil
   cache.force_refresh = false
 
-  local cmd = { "git", "-C", root, "status", "--porcelain=v1", "--untracked-files=no" }
-  if vim.system then
-    vim.system(cmd, { text = true }, function(result)
-      vim.schedule(function()
-        local lines = result.code == 0 and vim.split(result.stdout or "", "\n", { trimempty = true }) or {}
-        if result.code ~= 0 and #lines == 0 and (result.stdout or "") ~= "" then
-          lines = vim.split(result.stdout or "", "\n", { trimempty = true })
-        end
-        cache.items = parse_git_status_items(root, lines)
-        cache.loading = false
-        cache.loaded = true
-        cache.updated_at = vim.uv.now()
-        local err = vim.trim(result.stderr or ""):gsub("%s+", " ")
-        if #cache.items > 0 or result.code == 0 then
-          cache.error = nil
-        else
-          cache.error = err ~= "" and err or "git status failed"
-        end
-        refresh_git_sidebar()
-      end)
+  local cmd = { "git", "-C", root, "status", "--porcelain=v1", "-z", "--untracked-files=no" }
+  vim.system(cmd, { text = false }, function(result)
+    vim.schedule(function()
+      cache.items = result.code == 0 and parse_git_status_items(root, result.stdout) or {}
+      cache.loading = false
+      cache.loaded = true
+      cache.updated_at = vim.uv.now()
+      local err = vim.trim(result.stderr or ""):gsub("%s+", " ")
+      if #cache.items > 0 or result.code == 0 then
+        cache.error = nil
+      else
+        cache.error = err ~= "" and err or "git status failed"
+      end
+      refresh_git_sidebar()
     end)
-    return
-  end
-
-  vim.schedule(function()
-    local lines = vim.fn.systemlist(cmd)
-    cache.items = vim.v.shell_error == 0 and parse_git_status_items(root, lines) or {}
-    cache.loading = false
-    cache.loaded = true
-    cache.updated_at = vim.uv.now()
-    if #cache.items > 0 or vim.v.shell_error == 0 then
-      cache.error = nil
-    else
-      cache.error = "git status failed"
-    end
-    refresh_git_sidebar()
   end)
 end
 

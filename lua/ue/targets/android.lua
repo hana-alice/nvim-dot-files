@@ -110,11 +110,7 @@ local function so_from_receipt(context)
   return #candidates == 1 and candidates[1] or nil, true
 end
 
-local function find_target_so(context)
-  local receipt_so, receipt_present = so_from_receipt(context)
-  if receipt_present then
-    return receipt_so
-  end
+local function qualified_target_so(context)
   local exact = C.join_path(
     context.project_dir,
     "Binaries",
@@ -122,6 +118,42 @@ local function find_target_so(context)
     ("%s-%s-%s-arm64.so"):format(C.context_target(context), M.id, C.context_configuration(context))
   )
   return is_file(exact) and exact or nil
+end
+
+local function fallback_target_so(context)
+  local qualified = qualified_target_so(context)
+  if C.context_configuration(context) ~= "Development" then return qualified end
+  local short = C.join_path(
+    context.project_dir, "Binaries", M.id, C.context_target(context) .. "-arm64.so")
+  short = is_file(short) and short or nil
+  -- With no receipt, two plausible artifacts are ambiguous rather than mtime-ranked.
+  if short and qualified and short ~= qualified then return nil end
+  return short or qualified
+end
+
+function M.find_target_so(context)
+  context = context or {}
+  local receipt_so, receipt_present = so_from_receipt(context)
+  if receipt_present then
+    return receipt_so
+  end
+  return fallback_target_so(context)
+end
+
+-- DAP may need symbols for the configuration selected in the engine cache even
+-- when `<Target>.target` currently describes a later build of another config.
+-- A config-qualified filename is unambiguous, so symbol lookup may consume it;
+-- deployment remains stricter and still refuses a receipt mismatch above.
+function M.find_symbol_artifact(context)
+  context = context or {}
+  local receipt_so, receipt_present = so_from_receipt(context)
+  if receipt_so then return receipt_so end
+  if receipt_present and C.context_configuration(context) == "Development" then
+    -- A mismatched current receipt means the generic `<Target>-arm64.so` may
+    -- belong to that other configuration. Only a config-qualified file is safe.
+    return qualified_target_so(context)
+  end
+  return fallback_target_so(context)
 end
 
 function M.capabilities()
@@ -184,7 +216,7 @@ function M.so_deploy_plan(context, host_driver)
     return C.unavailable(M.id, "so-deploy", "Android package is not configured; run :UESetAndroidPackage")
   end
 
-  local source_so = find_target_so(context)
+  local source_so = M.find_target_so(context)
   if not source_so then
     return C.unavailable(M.id, "so-deploy", "Android SO not found; run :UEBuildAndroidSO first")
   end

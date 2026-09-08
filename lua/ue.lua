@@ -19,6 +19,7 @@ local CORE_RT = {
   context_cache = {}, -- key -> { ctx, ts }
   target_launch_running = {}, -- target id -> true while one launch owns the route
   project_state = require("ue.project_state"),
+  target_identity = require("ue.target_identity"),
   file_lock = require("ue.file_lock"),
   prepare_lease = nil,
 }
@@ -853,7 +854,6 @@ local UE_CONST = {
     "Development Editor", "Development", "DebugGame Editor", "DebugGame",
     "Debug", "Shipping", "Test",
   },
-  TARGET_KIND_SUFFIXES = { "Editor", "Client", "Server" },
 }
 
 local function copy_list(items)
@@ -1001,16 +1001,7 @@ local function available_configuration_choices(project_root, uproject, platform)
   return copy_list(UE_CONST.DEFAULT_CONFIGURATION_CHOICES)
 end
 
-local function split_target_configuration_name(configuration)
-  configuration = trim(configuration)
-  for _, suffix in ipairs(UE_CONST.TARGET_KIND_SUFFIXES) do
-    local base = trim(configuration:match("^(.-)%s+" .. suffix .. "$") or "")
-    if base ~= "" then
-      return base, suffix
-    end
-  end
-  return configuration ~= "" and configuration or "Development", "Game"
-end
+local split_target_configuration_name = CORE_RT.target_identity.split_configuration
 
 local function default_target_configuration(project_root, uproject, platform)
   local choices = available_configuration_choices(project_root, uproject, platform)
@@ -3116,78 +3107,9 @@ end
 -- BUILD TARGETS + PLATFORM DETECTION
 -- ==========================================================================
 
-local function detect_target_names(project_root, uproject)
-  -- Two layouts to support:
-  --   1. Standard:  <project_root>/<Project>.uproject + <project_root>/Source/*.Target.cs
-  --   2. Nested: <project_root>/Source/<Project>/<Project>.uproject
-  --              + <project_root>/Source/<Project>/Source/*.Target.cs
-  --
-  -- Prefer the directory next to the .uproject (matches what UBT itself
-  -- does), fall back to <project_root>/Source for the standard layout.
-  local search_dirs = {}
-  if uproject and uproject ~= "" then
-    table.insert(search_dirs, join(_ufs.dirname(uproject), "Source"))
-  end
-  table.insert(search_dirs, join(project_root, "Source"))
-
-  local seen, targets = {}, {}
-  for _, dir in ipairs(search_dirs) do
-    if seen[dir] == nil then
-      seen[dir] = true
-      local found = vim.fn.globpath(dir, "*.Target.cs", false, true)
-      if type(found) == "table" then
-        for _, t in ipairs(found) do table.insert(targets, t) end
-      end
-    end
-  end
-
-  local detected = {
-    Editor = nil,
-    Client = nil,
-    Server = nil,
-    Game = nil,
-  }
-
-  for _, target in ipairs(targets) do
-    local name = vim.fs.basename(target):gsub("%.Target%.cs$", "")
-    local matched = false
-    for _, kind in ipairs(UE_CONST.TARGET_KIND_SUFFIXES) do
-      if name:match(kind .. "$") then
-        detected[kind] = detected[kind] or name
-        matched = true
-        break
-      end
-    end
-    if not matched then
-      detected.Game = detected.Game or name
-    end
-  end
-
-  local fallback = vim.fs.basename(uproject):gsub("%.uproject$", "")
-  detected.Game = detected.Game or fallback
-  return detected
-end
-
-local function detect_target_name(project_root, uproject, kind)
-  local detected = detect_target_names(project_root, uproject)
-  local fallback = vim.fs.basename(uproject):gsub("%.uproject$", "")
-  kind = trim(kind or "")
-
-  if kind == "Editor" then
-    return detected.Editor or detected.Game or detected.Client or detected.Server or fallback
-  end
-  if kind == "Client" then
-    return detected.Client or detected.Game or detected.Editor or detected.Server or fallback
-  end
-  if kind == "Server" then
-    return detected.Server or detected.Game or detected.Editor or detected.Client or fallback
-  end
-  if kind == "Game" then
-    return detected.Game or detected.Editor or detected.Client or detected.Server or fallback
-  end
-
-  return detected.Editor or detected.Game or detected.Client or detected.Server or fallback
-end
+-- Shared with DAP so build and debugger consume the same Target.cs identity.
+local detect_target_names = CORE_RT.target_identity.detect_target_names
+local detect_target_name = CORE_RT.target_identity.detect_target_name
 
 local function target_platform(engine_root, cmd)
   local override = trim(vim.env.UE_TARGET_PLATFORM)
@@ -3246,13 +3168,7 @@ local function target_kind(engine_root, project_root, uproject, platform)
   return kind
 end
 
-local function build_target_name(project_root, uproject, kind)
-  local override = trim(vim.env.UE_BUILD_TARGET)
-  if override ~= "" then
-    return override
-  end
-  return detect_target_name(project_root, uproject, kind)
-end
+local build_target_name = CORE_RT.target_identity.build_target_name
 
 -- ==========================================================================
 -- BUILD COMMANDS — Windows wrappers, UBT, Build.bat
@@ -4693,8 +4609,8 @@ do
     return command, nil, plan, driver, target_ctx
   end
 
-  function CORE_RT.update_target_runtime(engine_root, platform, values)
-    local state = read_state(engine_root)
+  function CORE_RT.update_target_runtime(engine_root, platform, values, captured)
+    local state = CORE_RT.project_state.read(engine_root, captured)
     local all = type(state.target_runtime) == "table" and vim.deepcopy(state.target_runtime) or {}
     local current = type(all[platform]) == "table" and vim.deepcopy(all[platform]) or {}
     for key, value in pairs(values or {}) do
@@ -4702,7 +4618,7 @@ do
     end
     current.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
     all[platform] = current
-    local updated, update_err = update_state_field(engine_root, "target_runtime", all)
+    local updated, update_err = CORE_RT.project_state.update(engine_root, "target_runtime", all, captured)
     if not updated then return nil, update_err end
     CORE_RT.context_cache = {}
     return current
@@ -6534,8 +6450,8 @@ function M._target_platform_for_test(engine_root)
   return target_platform(engine_root, nil)
 end
 
-function M._update_target_runtime_for_test(engine_root, platform, values)
-  return CORE_RT.update_target_runtime(engine_root, platform, values)
+function M._update_target_runtime_for_test(engine_root, platform, values, captured)
+  return CORE_RT.update_target_runtime(engine_root, platform, values, captured)
 end
 
 function M._available_platform_choices_for_test(host_driver, project_root, uproject)
@@ -9328,6 +9244,12 @@ dap_mod.setup_core({
   glob_paths = glob_paths,
   is_native_windows = is_native_windows,
   resolve_context = resolve_context,
+  resolve_target_identity = function(ctx, platform)
+    local resolved = vim.tbl_extend("force", {}, ctx or {})
+    resolved.configuration = selected_target_configuration(
+      resolved.engine_root, resolved.project_root, resolved.uproject, platform)
+    return CORE_RT.target_identity.resolve(resolved)
+  end,
   invalidate_status_cache = invalidate_status_cache,
   refresh_statusline = refresh_statusline,
   first_executable = _uproc.first_executable,

@@ -254,7 +254,8 @@ matrix 声明与回归，不能在 generic orchestration 中添加 shell/path �
   nvim-dap 的固定 `dap*.log` 名改为 `dap*.<pid>.log`。
 - **LSP 行为改动**只走 `lua/utils/lsp_fallback.lua` 或 `lua/workarounds/clangd/*`（禁全局 handler 覆盖）。
 - **上游 bug 补丁**只进 `lua/workarounds/<scope>/<name>.lua`（禁 inline monkey-patch）。
-- **C++ goto 精度**只信 proven libclang canonical USR + module AST 唯一 body；TS 不给答案，
+- **C++ goto 精度**：source 由 exact-command clangd client 证明 canonical USR + definition；header
+  由 proven libclang canonical USR + module AST 唯一 body 证明；TS 不给答案，
   csearch/GTAGS 不参与 C++ destination。非 C++ 保留既有 LSP/csearch/GTAGS 兼容链。
 - **启动顺序**固定，见 `docs/CONSTRAINTS.md §三 C3` 与 `init.lua`。
 

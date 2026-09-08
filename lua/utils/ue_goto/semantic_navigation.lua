@@ -22,6 +22,7 @@ local function semantic_location(value)
   if not path or not line then return nil end
   return {
     uri = vim.uri_from_fname(path),
+    _position_encoding = "utf-8",
     range = {
       start = { line = math.max(0, line - 1), character = math.max(0, column - 1) },
       ["end"] = { line = math.max(0, line - 1), character = math.max(0, column - 1) },
@@ -512,6 +513,8 @@ function M.install(owner, deps)
           if stale_reason then finish_stale(stale_reason) end
           return
         end
+        local current, reason = request_is_current(response)
+        if not current then finish_stale(reason); return end
         if response.state ~= "resolved" then
           finish(semantic_failure(response, "context"))
           return

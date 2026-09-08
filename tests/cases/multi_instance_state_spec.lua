@@ -330,6 +330,90 @@ t.describe("multi-instance project state", function()
     pcall(vim.fn.delete, root, "rf")
   end)
 
+  t.it("a delayed stale reclaimer cannot delete a newly acquired lease", function()
+    local root = tmpdir()
+    local path = root .. "/race.lock"
+    local lock = require("ue.file_lock")
+    vim.fn.mkdir(path, "p")
+    vim.fn.writefile({ vim.json.encode({ pid = 2147483647, token = "stale" }) }, path .. "/owner.json")
+    local original_kill = vim.uv.kill
+    local competing, entered
+    vim.uv.kill = function(pid, signal)
+      if pid == 2147483647 and not entered then
+        entered = true
+        competing = assert(lock.acquire(path))
+        return nil, "ESRCH"
+      end
+      return original_kill(pid, signal)
+    end
+    local ok, acquired = pcall(lock.acquire, path)
+    vim.uv.kill = original_kill
+    local owner = lock.owner(path)
+    if acquired then lock.release(acquired) end
+    if competing then lock.release(competing) end
+    pcall(vim.fn.delete, root, "rf")
+    t.assert_true(ok)
+    t.assert_nil(acquired, "the second stale reclaimer must lose to the new live owner")
+    t.assert_eq(owner and owner.token, competing and competing.token)
+  end)
+
+  t.it("a crashed owner and an interrupted empty-directory reap remain recoverable", function()
+    local root = tmpdir()
+    local path = root .. "/crash.lock"
+    local result = child_lua(string.format("assert(require('ue.file_lock').acquire(%q))", path))
+    t.assert_eq(result.code, 0, result.stderr)
+    local lock = require("ue.file_lock")
+    local recovered = assert(lock.acquire(path))
+    t.assert_true(lock.release(recovered))
+    vim.fn.mkdir(path, "p")
+    vim.uv.fs_utime(path, os.time() - 10, os.time() - 10)
+    local empty_recovered = assert(lock.acquire(path))
+    t.assert_true(lock.release(empty_recovered))
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("a failed process permission probe does not authorize lease reclamation", function()
+    local root = tmpdir()
+    local path = root .. "/permission.lock"
+    vim.fn.mkdir(path, "p")
+    vim.fn.writefile({ vim.json.encode({ pid = 2147483646, token = "protected" }) }, path .. "/owner.json")
+    local lock, original_kill = require("ue.file_lock"), vim.uv.kill
+    vim.uv.kill = function() return nil, "EPERM: operation not permitted" end
+    local ok, acquired = pcall(lock.acquire, path)
+    vim.uv.kill = original_kill
+    local owner = lock.owner(path)
+    if acquired then lock.release(acquired) end
+    pcall(vim.fn.delete, root, "rf")
+    t.assert_true(ok)
+    t.assert_nil(acquired)
+    t.assert_eq(owner and owner.token, "protected")
+  end)
+
+  t.it("unknown nonempty leases stay intact with actionable owner diagnostics", function()
+    local root = tmpdir()
+    local lock = require("ue.file_lock")
+    for index, fixture in ipairs({
+      { content = "{", reason = "corrupt owner record" },
+      { content = "{}", reason = "invalid owner record" },
+      { reason = "unreadable owner record" },
+    }) do
+      local path = root .. "/unknown" .. index .. ".lock"
+      vim.fn.mkdir(path, "p")
+      vim.fn.writefile({ "preserve" }, path .. "/evidence.txt")
+      if fixture.content then vim.fn.writefile({ fixture.content }, path .. "/owner.json") end
+      vim.uv.fs_utime(path, os.time() - 10, os.time() - 10)
+      local acquired, err = lock.acquire(path)
+      if acquired then lock.release(acquired) end
+      t.assert_nil(acquired)
+      t.assert_contains(err, fixture.reason)
+      t.assert_contains(err, "inspect the holding process")
+      t.assert_contains(err, path .. "/owner.json")
+      t.assert_eq(vim.fn.readfile(path .. "/evidence.txt")[1], "preserve")
+      if fixture.content then t.assert_eq(vim.fn.readfile(path .. "/owner.json")[1], fixture.content) end
+    end
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
   t.it("global probe counts merge instead of losing concurrent events", function()
     local root = tmpdir()
     local path = root .. "/probes.json"

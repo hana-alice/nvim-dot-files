@@ -190,6 +190,217 @@ t3.describe("ue_watch: persistent_dirty cap 打满可见（F2）", function()
 end)
 
 -- ── Windows metadata-event flood guard ─────────────────────────────────────
+t3.describe("ue_watch project ownership", function()
+  t3.it("an already queued old watcher event cannot target the new project", function()
+    local root = vim.fn.tempname():gsub("\\", "/")
+    local a, b = root .. "/A", root .. "/B"
+    vim.fn.mkdir(a, "p")
+    vim.fn.mkdir(b, "p")
+    local original_wrap, queued = vim.schedule_wrap, nil
+    local ok, err = pcall(function()
+      vim.schedule_wrap = function(callback)
+        queued = callback
+        return original_wrap(callback)
+      end
+      assert(watch.start({ root = a, dirty_json_path = a .. "/dirty.json" }))
+      vim.schedule_wrap = original_wrap
+      assert(watch.start({ root = b, dirty_json_path = b .. "/dirty.json" }))
+      queued(nil, "old.cpp", { rename = true })
+      t3.assert_eq(watch.status().pending_adds, 0)
+      t3.assert_eq(watch.status().pending_dels, 0)
+    end)
+    vim.schedule_wrap = original_wrap
+    watch.stop()
+    watch._set_opts_for_test(nil)
+    pcall(vim.fn.delete, root, "rf")
+    if not ok then error(err) end
+  end)
+
+  t3.it("a contended outgoing save retries its captured bucket after switching", function()
+    local root = vim.fn.tempname():gsub("\\", "/")
+    local a, b = root .. "/A", root .. "/B"
+    vim.fn.mkdir(a, "p")
+    vim.fn.mkdir(b, "p")
+    local lock = require("ue.file_lock")
+    local lease = assert(lock.acquire(a .. "/dirty.json.lock"))
+    local original_defer, retry = vim.defer_fn, nil
+    local ok, err = pcall(function()
+      assert(watch.start({ root = a, dirty_json_path = a .. "/dirty.json" }))
+      watch._seed_persistent_dirty_for_test({ a .. "/pending.cpp" })
+      vim.defer_fn = function(callback) retry = callback; return {} end
+      watch._save_persistent_dirty_for_test()
+      vim.defer_fn = original_defer
+      t3.assert_type(retry, "function")
+      watch.stop()
+      assert(watch.start({ root = b, dirty_json_path = b .. "/dirty.json" }))
+      lock.release(lease)
+      retry()
+      t3.assert_true(vim.deep_equal(watch.snapshot_persistent_dirty(), {}))
+      t3.assert_true(vim.deep_equal(vim.json.decode(table.concat(vim.fn.readfile(a .. "/dirty.json"))),
+        { a .. "/pending.cpp" }))
+      t3.assert_eq(vim.fn.filereadable(b .. "/dirty.json"), 0)
+    end)
+    vim.defer_fn = original_defer
+    lock.release(lease)
+    watch.stop()
+    watch._set_opts_for_test(nil)
+    pcall(vim.fn.delete, root, "rf")
+    if not ok then error(err) end
+  end)
+
+  t3.it("save retries back off, stop at a bound, and recover on a later successful save", function()
+    local root = vim.fn.tempname():gsub("\\", "/")
+    vim.fn.mkdir(root, "p")
+    local lock = require("ue.file_lock")
+    local lease = assert(lock.acquire(root .. "/dirty.json.lock"))
+    local original_defer, retries, delays = vim.defer_fn, {}, {}
+    local ok, err = pcall(function()
+      vim.defer_fn = function(callback, delay)
+        retries[#retries + 1], delays[#delays + 1] = callback, delay
+        return { stop = function() end, close = function() end }
+      end
+      assert(watch.start({ root = root, dirty_json_path = root .. "/dirty.json" }))
+      watch._seed_persistent_dirty_for_test({ root .. "/pending.cpp" })
+      watch._save_persistent_dirty_for_test()
+      local cursor = 1
+      while retries[cursor] and cursor <= 20 do retries[cursor](); cursor = cursor + 1 end
+      t3.assert_true(#retries > 1 and #retries <= 10, "retry sequence must be bounded")
+      t3.assert_true(delays[2] > delays[1], "persistent contention must back off")
+      lock.release(lease)
+      watch._save_persistent_dirty_for_test()
+      t3.assert_true(vim.deep_equal(vim.json.decode(table.concat(vim.fn.readfile(root .. "/dirty.json"))),
+        { root .. "/pending.cpp" }))
+    end)
+    vim.defer_fn = original_defer
+    lock.release(lease)
+    watch.stop()
+    watch._set_opts_for_test(nil)
+    pcall(vim.fn.delete, root, "rf")
+    if not ok then error(err) end
+  end)
+
+  t3.it("successful save cancels an outstanding retry and suppresses its queued callback", function()
+    local root = vim.fn.tempname():gsub("\\", "/")
+    vim.fn.mkdir(root, "p")
+    local lock = require("ue.file_lock")
+    local lease = assert(lock.acquire(root .. "/dirty.json.lock"))
+    local original_defer, original_open = vim.defer_fn, io.open
+    local queued, cancelled, writes = nil, 0, 0
+    local ok, err = pcall(function()
+      vim.defer_fn = function(callback)
+        queued = callback
+        return { stop = function() cancelled = cancelled + 1 end, close = function() end }
+      end
+      assert(watch.start({ root = root, dirty_json_path = root .. "/dirty.json" }))
+      watch._seed_persistent_dirty_for_test({ root .. "/pending.cpp" })
+      watch._save_persistent_dirty_for_test()
+      lock.release(lease)
+      watch._save_persistent_dirty_for_test()
+      t3.assert_eq(cancelled, 1)
+      io.open = function(path, mode)
+        if mode == "w" then writes = writes + 1 end
+        return original_open(path, mode)
+      end
+      queued()
+      t3.assert_eq(writes, 0, "an invalidated retry must not start another write")
+    end)
+    vim.defer_fn, io.open = original_defer, original_open
+    lock.release(lease)
+    watch.stop()
+    watch._set_opts_for_test(nil)
+    pcall(vim.fn.delete, root, "rf")
+    if not ok then error(err) end
+  end)
+
+  for _, failure in ipairs({ "open", "write", "close", "rename" }) do
+    t3.it("outgoing bucket survives transient " .. failure .. " failure after lock retry", function()
+      local root = vim.fn.tempname():gsub("\\", "/")
+      local a, b = root .. "/A", root .. "/B"
+      vim.fn.mkdir(a, "p")
+      vim.fn.mkdir(b, "p")
+      local lock = require("ue.file_lock")
+      local lease = assert(lock.acquire(a .. "/dirty.json.lock"))
+      local original_defer, original_open, original_rename = vim.defer_fn, io.open, vim.uv.fs_rename
+      local retries, injected = {}, false
+      local ok, err = pcall(function()
+        vim.defer_fn = function(callback)
+          retries[#retries + 1] = callback
+          return { stop = function() end, close = function() end }
+        end
+        assert(watch.start({ root = a, dirty_json_path = a .. "/dirty.json" }))
+        watch._seed_persistent_dirty_for_test({ a .. "/pending.cpp" })
+        watch._save_persistent_dirty_for_test()
+        assert(watch.start({ root = b, dirty_json_path = b .. "/dirty.json" }))
+        lock.release(lease)
+        io.open = function(path, mode)
+          if not injected and mode == "w" and path:find(a .. "/dirty.json.tmp.", 1, true) then
+            if failure == "open" then injected = true; return nil, "temporary open failure" end
+            if failure == "write" or failure == "close" then
+              injected = true
+              local fd = assert(original_open(path, mode))
+              return {
+                write = function(_, data)
+                  if failure == "write" then return nil, "temporary write failure" end
+                  return fd:write(data)
+                end,
+                close = function()
+                  local closed = fd:close()
+                  if failure == "close" then return nil, "temporary close failure" end
+                  return closed
+                end,
+              }
+            end
+          end
+          return original_open(path, mode)
+        end
+        vim.uv.fs_rename = function(from, to)
+          if failure == "rename" and not injected and to == a .. "/dirty.json" then
+            injected = true; return nil, "temporary rename failure"
+          end
+          return original_rename(from, to)
+        end
+        t3.assert_eq(#retries, 1)
+        retries[1]()
+        t3.assert_true(injected)
+        t3.assert_eq(#retries, 2, "transient I/O failure must queue another captured-owner save")
+        retries[2]()
+        t3.assert_eq(#retries, 2, "successful save must stop retrying")
+        t3.assert_true(vim.deep_equal(vim.json.decode(table.concat(vim.fn.readfile(a .. "/dirty.json"))),
+          { a .. "/pending.cpp" }))
+        t3.assert_eq(vim.fn.filereadable(b .. "/dirty.json"), 0)
+      end)
+      vim.defer_fn, io.open, vim.uv.fs_rename = original_defer, original_open, original_rename
+      lock.release(lease)
+      watch.stop()
+      watch._set_opts_for_test(nil)
+      pcall(vim.fn.delete, root, "rf")
+      if not ok then error(err) end
+    end)
+  end
+
+  t3.it("switching watchers never merges the previous project's dirty set", function()
+    local root = vim.fn.tempname():gsub("\\", "/")
+    local a, b = root .. "/A", root .. "/B"
+    vim.fn.mkdir(a, "p")
+    vim.fn.mkdir(b, "p")
+    vim.fn.writefile({ vim.json.encode({ a .. "/A.cpp" }) }, a .. "/dirty.json")
+    vim.fn.writefile({ vim.json.encode({ b .. "/B.cpp" }) }, b .. "/dirty.json")
+    local ok, err = pcall(function()
+      assert(watch.start({ root = a, dirty_json_path = a .. "/dirty.json" }))
+      t3.assert_true(vim.deep_equal(watch.snapshot_persistent_dirty(), { a .. "/A.cpp" }))
+      watch.stop()
+      assert(watch.start({ root = b, dirty_json_path = b .. "/dirty.json" }))
+      t3.assert_true(vim.deep_equal(watch.snapshot_persistent_dirty(), { b .. "/B.cpp" }), "B inherited A's dirty files")
+      watch._save_persistent_dirty_for_test()
+      t3.assert_true(vim.deep_equal(vim.json.decode(table.concat(vim.fn.readfile(b .. "/dirty.json"))), { b .. "/B.cpp" }))
+    end)
+    watch.stop()
+    watch._set_opts_for_test(nil)
+    pcall(vim.fn.delete, root, "rf")
+    if not ok then error(err) end
+  end)
+end)
+
 -- libuv's Windows backend subscribes LAST_ACCESS / ATTRIBUTES / SECURITY and
 -- folds all of them into UV_CHANGE. Files whose content mtime predates the
 -- current csearch index are therefore metadata noise, not post-index edits.

@@ -1,22 +1,33 @@
 -- Cross-process filesystem lease for UE cache writers.
--- Directory creation is atomic on every supported host. The owner record lets
--- a later process reclaim a lease after the owning Neovim has exited.
+-- Publish an already nonempty directory atomically. Reclaim only the observed
+-- token's file, then rmdir (never recursive delete): a delayed reclaimer cannot
+-- remove a replacement owner's differently named file or nonempty directory.
 
 local fs = require("ue.core.fs")
 
 local M = {}
 
-local function owner_path(path)
-  return fs.join(path, "owner.json")
-end
-
 local function read_owner(path)
-  local file = io.open(owner_path(path), "rb")
-  if not file then return nil end
+  local name = "owner.json" -- Read old leases, but never publish this fixed name.
+  local scan = vim.uv.fs_scandir(path)
+  if scan then
+    while true do
+      local entry = vim.uv.fs_scandir_next(scan)
+      if not entry then break end
+      if entry:match("^owner%..+%.json$") then name = entry; break end
+    end
+  end
+  local file = io.open(fs.join(path, name), "rb")
+  if not file then return nil, name, "unreadable owner record" end
   local raw = file:read("*a")
   file:close()
   local ok, value = pcall(vim.json.decode, raw or "")
-  return ok and type(value) == "table" and value or nil
+  if not ok then return nil, name, "corrupt owner record" end
+  if type(value) ~= "table" or not tonumber(value.pid) or tonumber(value.pid) <= 0
+      or type(value.token) ~= "string" or value.token == "" then
+    return nil, name, "invalid owner record (expected positive PID and token)"
+  end
+  return value, name
 end
 
 local function process_alive(pid)
@@ -24,8 +35,10 @@ local function process_alive(pid)
   if not pid or pid <= 0 then return false end
   if pid == vim.fn.getpid() then return true end
   if not vim.uv or type(vim.uv.kill) ~= "function" then return true end
-  local ok, result = pcall(vim.uv.kill, pid, 0)
-  return ok and result ~= nil and result ~= false
+  local ok, result, err = pcall(vim.uv.kill, pid, 0)
+  if ok and result ~= nil and result ~= false then return true end
+  -- Permission failures and unavailable probes do not prove process death.
+  return not (ok and tostring(err):find("ESRCH", 1, true))
 end
 
 local function recent_unknown_owner(path)
@@ -35,12 +48,12 @@ local function recent_unknown_owner(path)
   return seconds and (os.time() - seconds) < 5
 end
 
-local function write_owner(path, owner)
-  local file = io.open(owner_path(path), "wb")
+local function write_owner(path, owner, name)
+  local file = io.open(fs.join(path, name), "wb")
   if not file then return false end
-  file:write(vim.json.encode(owner))
-  file:close()
-  return true
+  local wrote = file:write(vim.json.encode(owner))
+  local closed = file:close()
+  return wrote ~= nil and closed ~= nil
 end
 
 ---Acquire an exclusive cross-process lease without waiting.
@@ -51,35 +64,53 @@ function M.acquire(path)
   if path == "" then return nil, "lock path is empty" end
   fs.ensure_dir(fs.dirname(path))
 
-  for _ = 1, 2 do
-    local ok, err = vim.uv.fs_mkdir(path, 448)
-    if ok then
-      local token = table.concat({ vim.fn.getpid(), vim.uv.hrtime(), math.random(1, 2147483646) }, "-")
-      local owner = { pid = vim.fn.getpid(), token = token, acquired_at = os.time() }
-      if not write_owner(path, owner) then
-        pcall(vim.fn.delete, path, "rf")
-        return nil, "cannot write lock owner: " .. path
-      end
-      return { path = path, token = token }
-    end
+  local token = table.concat({ vim.fn.getpid(), vim.uv.hrtime(), math.random(1, 2147483646) }, "-")
+  local name = "owner." .. token .. ".json"
+  local staged = path .. ".pending." .. token
+  local created, create_err = vim.uv.fs_mkdir(staged, 448)
+  if not created then return nil, create_err end
+  local function discard_staged()
+    vim.uv.fs_unlink(fs.join(staged, name))
+    vim.uv.fs_rmdir(staged)
+  end
+  if not write_owner(staged, { pid = vim.fn.getpid(), token = token, acquired_at = os.time() }, name) then
+    discard_staged()
+    return nil, "cannot write lock owner: " .. path
+  end
 
-    local owner = read_owner(path)
+  local owner_diagnostic
+  for _ = 1, 2 do
+    local ok = vim.uv.fs_rename(staged, path)
+    if ok then return { path = path, token = token } end
+    local owner, observed_name, owner_err = read_owner(path)
+    if owner_err then
+      owner_diagnostic = owner_err .. ": " .. fs.join(path, observed_name)
+    end
     if (owner and process_alive(owner.pid)) or (not owner and recent_unknown_owner(path)) then
+      discard_staged()
       return nil, "owned by live process " .. tostring(owner and owner.pid or "initializing")
     end
-    pcall(vim.fn.delete, path, "rf")
-    if err and not fs.is_dir(path) then
-      -- Retry once after reclaiming a stale directory.
-    end
+    if owner then vim.uv.fs_unlink(fs.join(path, observed_name)) end
+    -- A new owner published since read_owner makes rmdir fail with ENOTEMPTY.
+    -- Crashes between unlink/rmdir leave an empty, safely replaceable directory.
+    vim.uv.fs_rmdir(path)
+  end
+  discard_staged()
+  if owner_diagnostic then
+    return nil, "lock preserved: " .. owner_diagnostic
+      .. "; inspect the holding process and owner record before manual recovery"
   end
   return nil, "cannot acquire lock: " .. path
 end
 
 function M.release(handle)
   if type(handle) ~= "table" or not handle.path or not handle.token then return false end
-  local owner = read_owner(handle.path)
+  local owner, name = read_owner(handle.path)
   if not owner or owner.token ~= handle.token then return false end
-  return pcall(vim.fn.delete, handle.path, "rf")
+  local removed = vim.uv.fs_unlink(fs.join(handle.path, name))
+  if not removed then return false end
+  vim.uv.fs_rmdir(handle.path)
+  return true
 end
 
 function M.owner(path)

@@ -993,7 +993,7 @@ t.describe("ue.dap.android: pick_symbol_lib（K35 + 3.4 假线索防护）", fun
     pcall(vim.fn.delete, vim.fn.fnamemodify(proot, ":h:h:h"), "rf")
   end)
 
-  t.it("无精确匹配时按 mtime 取最新符号包（best-guess 回落）", function()
+  t.it("已有 packageInfo 但无精确版本时拒绝 mtime 猜测", function()
     cfg.reset_for_test()
     local proot = tmpdir() .. "/Project/Source/SampleGame"
     local android_dir = proot .. "/Binaries/Android"
@@ -1008,8 +1008,7 @@ t.describe("ue.dap.android: pick_symbol_lib（K35 + 3.4 假线索防护）", fun
     pcall(ok_uv.fs_utime, newer, os.time() + 100, os.time() + 100)
 
     local picked = android._pick_symbol_lib_for_test({ project_root = proot })
-    t.assert_true(picked ~= nil, "应回落到 glob best-guess")
-    t.assert_eq(picked and picked:gsub("\\", "/"), newer, "无精确匹配应取 mtime 最新")
+    t.assert_nil(picked, "versionCode 已知时不得选另一个版本的 mtime winner")
     cfg.reset_for_test()
     pcall(vim.fn.delete, vim.fn.fnamemodify(proot, ":h:h:h"), "rf")
   end)
@@ -1161,6 +1160,20 @@ t.describe("ue.dap.android: attach_commands（K30/K34/K37 顺序与 slide 开关
     t.assert_true(cmds[1]:find('target create', 1, true) ~= nil,
       "首条必须 target create symbol-rich libUE4.so（DWARF 来源）")
     t.assert_true(cmds[1]:find("libUE4.so", 1, true) ~= nil)
+  end)
+
+  t.it("K66: host 产物名与 runtime SONAME 不同时，符号命令仍指向 host module", function()
+    local session = base_session()
+    session.symbol_lib = "D:/symbols/Client-Android-Test-arm64.so"
+    session.runtime_module_basename = "libUE4.so"
+    session._module_rebase_cmd =
+      'target modules load --file "Client-Android-Test-arm64.so" --slide 0x6c9fe21000'
+    local cmds = android._attach_commands_for_test(session)
+    t.assert_contains(cmds[1], "Client-Android-Test-arm64.so")
+    local joined = table.concat(cmds, "\n")
+    t.assert_contains(joined,
+      'target modules load --file "Client-Android-Test-arm64.so" --slide 0x6c9fe21000')
+    t.assert_contains(joined, "--shlib Client-Android-Test-arm64.so")
   end)
 
   t.it("K34: target create 早于 platform connect / process attach", function()
@@ -1352,17 +1365,40 @@ t.describe("ue.dap.android: K59 package 解析与 last-session 存档", function
     t.assert_eq(android._last_session, nil)
   end)
 
-  t.it("成功的 attach（有 pid）才写入 _last_session", function()
+  t.it("普通 attach 不回放 last-session symbol（切配置后必须重新选择）", function()
+    local source = table.concat(vim.fn.readfile(
+      vim.fn.stdpath("config") .. "/lua/ue/dap/android.lua"), "\n")
+    t.assert_nil(source:find(
+      "opts.android_symbol_lib or (M._last_session and M._last_session.symbol_lib)",
+      1, true))
+  end)
+
+  t.it("只有 pid 但 DAP attach response 失败时不得写入 _last_session", function()
+    android._last_session = nil
+    local sess = android._session
+    sess.package_name = "com.failed.pkg"
+    sess.serial = "SERIALX"
+    sess.symbol_lib = "C:/tmp/libUE4.so"
+    sess.pid = 4321
+    sess.attach_succeeded = false
+    android._snapshot_last_session_for_test()
+    t.assert_nil(android._last_session,
+      "pid 在 L2 gate/DAP response 前就已捕获，不能充当 attach 成功证据")
+  end)
+
+  t.it("DAP attach response 成功后才写入 _last_session", function()
     android._last_session = nil
     local sess = android._session
     sess.package_name = "com.real.pkg"
     sess.serial = "SERIALX"
     sess.symbol_lib = "C:/tmp/libUE4.so"
     sess.pid = 4321
+    sess.attach_succeeded = true
     android._snapshot_last_session_for_test()
     t.assert_eq(android._last_session and android._last_session.package_name, "com.real.pkg")
     android._last_session = nil
     sess.pid = nil
+    sess.attach_succeeded = nil
     sess.package_name = nil
     sess.serial = nil
     sess.symbol_lib = nil
@@ -1410,6 +1446,50 @@ t.describe("ue.dap.android: K56 app-uid platform server 命令构造", function(
     t.assert_nil(s:find("cd /data/local/tmp", 1, true),
       "shell-uid /data/local/tmp 启动形式已被 K56 证伪（vAttach SIGSEGV）")
   end)
+
+  t.it("staging 编排经 deps/M 调用，repush 确实先 kill + rm 再 push", function()
+    local module_path = vim.fn.stdpath("config") .. "/lua/ue/dap/_android_transport.lua"
+    local isolated = assert(loadfile(module_path))()
+    local local_server = tmpdir() .. "/lldb-server"
+    touch(local_server, "ELF!")
+    local calls, sandbox_tests = {}, 0
+    isolated.bind({
+      adb_run = function(_, args)
+        calls[#calls + 1] = table.concat(args, " ")
+        local line = calls[#calls]
+        if line:find("stat -c %s /data/local/tmp/lldb-server", 1, true) then return "0" end
+        if line:find("run-as com.example.game", 1, true)
+          and line:find("stat -c %s", 1, true) then return "0" end
+        if line:find("ls /data/local/tmp/lldb-server", 1, true) then
+          return "/data/local/tmp/lldb-server"
+        end
+        return ""
+      end,
+      adb_run_raw = function(_, args)
+        local line = table.concat(args, " ")
+        calls[#calls + 1] = line
+        if line:find("run-as com.example.game", 1, true)
+          and line:find("test -x", 1, true) then
+          sandbox_tests = sandbox_tests + 1
+          return "", sandbox_tests == 1 and 1 or 0
+        end
+        return "", 0
+      end,
+      shell_quote = function(value) return "'" .. value .. "'" end,
+      log = { warn = function() end },
+    })
+
+    local ok, sandbox = isolated.ensure_lldb_server_pushed(
+      "adb", "SERIAL", "com.example.game", local_server)
+    t.assert_true(ok)
+    t.assert_eq(sandbox, "/data/data/com.example.game/lldb-server")
+    local joined = table.concat(calls, "\n")
+    t.assert_contains(joined, "killall lldb-server")
+    t.assert_contains(joined, "rm -f /data/local/tmp/lldb-server")
+    t.assert_contains(joined,
+      "cat /data/local/tmp/lldb-server > /data/data/com.example.game/lldb-server")
+    pcall(vim.fn.delete, vim.fn.fnamemodify(local_server, ":h"), "rf")
+  end)
 end)
 
 -- ════════════════════════════════════════════════════════════════════════
@@ -1437,6 +1517,19 @@ t.describe("ue.dap.android: parse_maps_base_hex（K2/K11/K4）", function()
   t.it("basename 里的 '.' 不当作通配符（libUE4Xso 不得匹配）", function()
     local trap = "6c9fe21000-6ca1e21000 r--p 00000000 fe:21 456 /data/app/x/libUE4Xso"
     t.assert_nil(android._parse_maps_base_hex_for_test(trap, "libUE4.so"))
+  end)
+
+  t.it("K66: host 产物名与 runtime SONAME 分离，maps 查 runtime、rebase 指向 host", function()
+    local host = "D:/symbols/Client-Android-Test-arm64.so"
+    local base, runtime = android._parse_runtime_module_base_for_test(maps, host, "libUE4.so")
+    t.assert_eq(base, "6c9fe21000")
+    t.assert_eq(runtime, "libUE4.so")
+    local command = android._build_module_rebase_command_for_test(host, base)
+    t.assert_eq(command,
+      'target modules load --file "Client-Android-Test-arm64.so" --slide 0x6c9fe21000')
+    local candidates = android._runtime_module_candidates_for_test(host, "libUE4.so")
+    t.assert_eq(#candidates, 1)
+    t.assert_eq(candidates[1], "libUE4.so")
   end)
 end)
 

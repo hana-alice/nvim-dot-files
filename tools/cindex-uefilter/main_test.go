@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"flag"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 const rawIndexTrailerMagic = "\ncsearch trailr\n"
@@ -233,6 +235,77 @@ func TestFilesFromResetBuildsExactIndex(t *testing.T) {
 	}
 	if got, want := trigramNames(ix, "fre"), []string{freshFile}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("fresh trigram names = %v, want %v", got, want)
+	}
+}
+
+func TestFailedResetPreservesPublishedIndex(t *testing.T) {
+	tempDir := t.TempDir()
+	indexPath := filepath.Join(tempDir, "published.idx")
+	source := filepath.Join(tempDir, "keep.cpp")
+	list := filepath.Join(tempDir, "files.list")
+	writeFile(t, source, "keep-marker\n")
+	writeListFile(t, list, source)
+	runTool(t, indexPath, "-reset", "-files-from", list)
+	before, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess", "--", "-reset", "-files-from", filepath.Join(tempDir, "missing.list"))
+	cmd.Env = append(os.Environ(), "GO_WANT_CINDEX_UEFILTER_HELPER=1", "CSEARCHINDEX="+indexPath)
+	if err := cmd.Run(); err == nil {
+		t.Fatal("missing list must fail")
+	}
+	after, err := os.ReadFile(indexPath)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("failed reset changed published index: %v", err)
+	}
+}
+
+func TestResetKeepsPublishedIndexWhileReadingInput(t *testing.T) {
+	tempDir := t.TempDir()
+	indexPath := filepath.Join(tempDir, "published.idx")
+	source := filepath.Join(tempDir, "keep.cpp")
+	list := filepath.Join(tempDir, "files.list")
+	writeFile(t, source, "keep-marker\n")
+	writeListFile(t, list, source)
+	runTool(t, indexPath, "-reset", "-files-from", list)
+	before, _ := os.ReadFile(indexPath)
+	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess", "--", "-reset", "-files-from", "-")
+	cmd.Env = append(os.Environ(), "GO_WANT_CINDEX_UEFILTER_HELPER=1", "CSEARCHINDEX="+indexPath)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdin.Close()
+	var output bytes.Buffer
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		current, err := os.ReadFile(indexPath)
+		if err != nil || !bytes.Equal(before, current) {
+			t.Fatalf("reader observed unpublished reset bytes: %v", err)
+		}
+		if _, err := os.Stat(indexPath + "~"); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("writer did not create staging file")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := fmt.Fprintln(stdin, source); err != nil {
+		t.Fatal(err)
+	}
+	_ = stdin.Close()
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("reset failed: %v: %s", err, output.String())
+	}
+	if _, err := openRawIndex(indexPath); err != nil {
+		t.Fatal(err)
 	}
 }
 

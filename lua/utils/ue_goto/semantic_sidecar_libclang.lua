@@ -104,6 +104,9 @@ void clang_getExpansionLocation(
   unsigned *column,
   unsigned *offset
 );
+typedef void (*CXInclusionVisitor)(CXFile included_file, CXSourceLocation *inclusion_stack,
+  unsigned include_len, CXClientData client_data);
+void clang_getInclusions(CXTranslationUnit tu, CXInclusionVisitor visitor, CXClientData client_data);
 CXCursor clang_getCursor(CXTranslationUnit, CXSourceLocation);
 unsigned clang_Cursor_isNull(CXCursor cursor);
 unsigned clang_isInvalid(unsigned kind);
@@ -222,6 +225,30 @@ function M.file_signature(path)
     tostring(stat.mtime and stat.mtime.sec or 0),
     tostring(stat.mtime and stat.mtime.nsec or 0),
   }))
+end
+
+-- Compiler-authored dependency paths, including the main file. Kept only in
+-- the sidecar: warm validation must not scan the project or block the editor.
+function M.tu_file_signatures(lib, tu, origin)
+  local signatures = { [M.normalize(origin)] = M.file_signature(origin) or false }
+  local visitor = ffi.cast("CXInclusionVisitor", function(file)
+    local path = M.normalize(M.cxstring_to_string(lib, lib.clang_getFileName(file)))
+    if path ~= "" then signatures[path] = M.file_signature(path) or false end
+  end)
+  local ok, err = pcall(lib.clang_getInclusions, tu, visitor, nil)
+  visitor:free()
+  if not ok then error(err) end
+  return signatures
+end
+-- libclang calls back into Lua; this FFI call must remain outside JIT traces.
+jit.off(M.tu_file_signatures, true)
+
+function M.file_signatures_current(signatures)
+  if not signatures then return false end
+  for path, signature in pairs(signatures) do
+    if (M.file_signature(path) or false) ~= signature then return false end
+  end
+  return true
 end
 
 local function mtime_before(left, right)

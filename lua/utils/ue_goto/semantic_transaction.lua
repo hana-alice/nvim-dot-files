@@ -76,8 +76,11 @@ local function owned_copy(value)
 end
 
 local function make_subject(bufnr, snapshot)
-  local subject = snapshot_subject(snapshot, bufnr)
+  local subject = owned_copy(snapshot_subject(snapshot, bufnr))
   subject.bufnr = bufnr
+  if subject.line_text == nil then
+    subject.line_text = vim.api.nvim_buf_get_lines(bufnr, subject.line0, subject.line0 + 1, false)[1]
+  end
   return subject
 end
 
@@ -106,7 +109,8 @@ function M.make_position_params(tx, _bufnr, position_encoding)
     textDocument = { uri = subject.uri },
     position = {
       line = subject.line0,
-      character = subject.column0,
+      character = subject.line_text and vim.str_utfindex(
+        subject.line_text, position_encoding or "utf-16", subject.column0, false) or subject.column0,
     },
     _position_encoding = position_encoding,
   }
@@ -114,8 +118,18 @@ end
 
 function M.same_subject_location(tx, value)
   if not tx or not value then return false end
-  return location.normalize_path(location.location_path(value)):lower() == tx.subject.path:lower()
-    and location.location_line(value) == tx.subject.line
+  if location.normalize_path(location.location_path(value)):lower() ~= tx.subject.path:lower() then
+    return false
+  end
+  local range = value.targetSelectionRange or value.targetRange or value.range
+  if not range or not range.start then return false end
+  local position = M.make_position_params(tx, tx.subject.bufnr, value._position_encoding).position
+  local first, last = range.start, range["end"]
+  local column = tonumber(first.character) or 0
+  if first.line == position.line and column == position.character then return true end
+  if not last then return false end
+  return (position.line > first.line or (position.line == first.line and position.character >= column))
+    and (position.line < last.line or (position.line == last.line and position.character < (last.character or 0)))
 end
 
 function M.subject_role(tx, declaration, definition)
@@ -129,17 +143,11 @@ function M.subject_role(tx, declaration, definition)
 end
 
 function M.filter_definition_locations(tx, locations, declaration)
-  local declaration_path = declaration and location.location_path(declaration) or nil
-  local declaration_line = declaration and location.location_line(declaration) or nil
+  local declaration_key = declaration and location.location_key(declaration):lower() or nil
   local filtered = {}
   for _, item in ipairs(locations or {}) do
-    local item_path = location.location_path(item)
-    local item_line = location.location_line(item)
-    local is_subject = item_path:lower() == tx.subject.path:lower()
-      and item_line == tx.subject.line
-    local is_declaration = declaration_path
-      and item_path:lower() == declaration_path:lower()
-      and item_line == declaration_line
+    local is_subject = M.same_subject_location(tx, item)
+    local is_declaration = declaration_key and location.location_key(item):lower() == declaration_key
     if not is_subject and not is_declaration then
       filtered[#filtered + 1] = item
     end

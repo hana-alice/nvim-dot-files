@@ -556,6 +556,10 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
 
     local clangd_usr = "usr:SubmitActiveCmdBuffer(two-args)"
     local snapshot_line = 1
+    local declaration = {
+      uri = vim.uri_from_fname(header),
+      range = { start = { line = 0, character = 5 }, ["end"] = { line = 0, character = 26 } },
+    }
     local definition_locations = { loc(vim.uri_from_fname(source), 422) }
     local symbol_info_requests = 0
     local definition_requests = 0
@@ -636,7 +640,7 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
           state = "resolved",
           usr = "usr:SubmitActiveCmdBuffer(two-args)",
           definition = nil,
-          declaration = loc(vim.uri_from_fname(header), 0),
+          declaration = declaration,
         })
       end,
       snapshot_is_current = function() return true end,
@@ -674,7 +678,7 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
       t.assert_eq(require("utils.ue_goto.location").location_path(jumps[2]), source)
       t.assert_eq(require("utils.ue_goto.location").location_line(jumps[2]), 423)
 
-      definition_locations = { loc(vim.uri_from_fname(header), 0) }
+      definition_locations = { declaration }
       gd.definition()
       t.assert_eq(definition_requests, 2)
       t.assert_eq(#jumps, 2,

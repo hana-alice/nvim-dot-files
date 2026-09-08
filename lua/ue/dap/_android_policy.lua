@@ -18,16 +18,16 @@
 local M = {}
 
 local deps = {
-  shell_quote = nil,               -- fun(string): string
-  sandbox_lldb_server_path = nil,  -- fun(pkg): string|nil
-  session = nil,                   -- fun(): table
-  last_session = nil,              -- fun(): table|nil
+  shell_quote = false,               -- fun(string): string
+  sandbox_lldb_server_path = false,  -- fun(pkg): string|nil
+  session = false,                   -- fun(): table
+  last_session = false,              -- fun(): table|nil
 }
 
 --- 由 owner 注入依赖。未知键被拒绝（拼错键名不得静默失效）。
 function M.bind(overrides)
   for key, value in pairs(overrides or {}) do
-    assert(deps[key] ~= nil or key ~= nil, "unknown policy dependency: " .. tostring(key))
+    assert(deps[key] ~= nil, "unknown policy dependency: " .. tostring(key))
     assert(type(value) == "function", "policy dependency must be a function: " .. tostring(key))
     deps[key] = value
   end
@@ -318,7 +318,9 @@ function M.capability_probes()
       -- 因为 decide 的纯函数契约只收 (rc, out, err)。这是有意的取舍：探针命令与
       -- 判定都保持可单测，而「本地期望值」这个 ctx 派生量只在同一次探测内传递。
       build_argv = function(ctx)
-        last_symbol_code = M.symbol_version_code(ctx.symbol_lib)
+        -- Direct K66 artifacts are not under a `_Symbols_v<code>` directory;
+        -- the owner carries packageInfo's versionCode explicitly for that case.
+        last_symbol_code = M.symbol_version_code(ctx.symbol_lib) or ctx.symbol_version_code
         last_symbol_build_id = M.read_build_id(ctx.symbol_lib)
         return probe_shell(ctx, "dumpsys package " .. tostring(ctx.package_name or "")
           .. " | grep -m1 versionCode")
@@ -393,6 +395,11 @@ function M.probe_context(ctx)
   if not out.symbol_lib or out.symbol_lib == "" then
     local last = deps.last_session()
     out.symbol_lib = deps.session().symbol_lib or (last and last.symbol_lib)
+  end
+  if not out.symbol_version_code or out.symbol_version_code == "" then
+    local last = deps.last_session()
+    out.symbol_version_code = deps.session().symbol_version_code
+      or (last and last.symbol_version_code)
   end
   return out
 end

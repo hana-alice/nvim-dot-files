@@ -112,7 +112,7 @@ t.describe("csearch 增量遇不可用 idx 被拒（D9 韧性）", function()
     restore()
   end)
 
-  t.it("_usable_index_for_test 正确区分 0 字节 / 有效 / 缺失", function()
+  t.it("_usable_index_for_test 拒绝缺失、空文件和足够大的非索引数据", function()
     local dir = vim.fn.tempname():gsub("\\", "/")
     vim.fn.mkdir(dir, "p")
     local empty = dir .. "/empty.idx"
@@ -122,7 +122,7 @@ t.describe("csearch 增量遇不可用 idx 被拒（D9 韧性）", function()
 
     t.assert_false(cs._usable_index_for_test(empty), "0 字节 idx 不可用")
     t.assert_false(cs._usable_index_for_test(dir .. "/missing.idx"), "缺失 idx 不可用")
-    t.assert_true(cs._usable_index_for_test(good), "足够大的 idx 可用")
+    t.assert_false(cs._usable_index_for_test(good), "体积不能证明索引已完整发布")
     pcall(vim.fn.delete, dir, "rf")
   end)
 end)

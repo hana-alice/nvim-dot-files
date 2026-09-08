@@ -85,9 +85,7 @@ local SPAWN_AUDIT = {
   { p="lua/utils/ue_launch.lua", api="jobstart", a="pcall(vim.fn.jobstart, cmd", class="detached", reason="explicit detached target launch" },
   { p="lua/utils/ue_logs.lua", api="jobstart", a="active_jobid = vim.fn.jobstart", class="interactive", reason="explicit low-CPU log stream" },
   { p="lua/utils/yazi.lua", api="termopen", a="vim.fn.termopen(cmd", class="interactive", reason="explicit interactive terminal UI" },
-  { p="lua/trouble/sources/ue_sidebar.lua", api="vim.system", a="if vim.system then", class="helper", reason="sidebar async capability branch" },
   { p="lua/trouble/sources/ue_sidebar.lua", api="vim.system", a="vim.system(cmd", class="interactive", reason="bounded sidebar query" },
-  { p="lua/trouble/sources/ue_sidebar.lua", api="fn-system", a="vim.fn.systemlist(cmd)", class="interactive", reason="legacy sidebar fallback" },
 }
 
 t.describe("host discipline: spawn audit", function()

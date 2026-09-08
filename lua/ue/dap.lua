@@ -1359,6 +1359,27 @@ function D.stop_android_debugger(opts)
   return result
 end
 
+local function resolve_android_dap_context(base_ctx)
+  local ctx = base_ctx
+  if type(ctx) ~= "table" and type(core.resolve_context) == "function" then
+    local ok_ctx, resolved = pcall(core.resolve_context)
+    if ok_ctx then ctx = resolved end
+  end
+  if type(ctx) ~= "table" then return ctx end
+
+  -- K65/K66: build and DAP share one Target.cs/cache identity resolver. Do not
+  -- infer target from the .uproject basename (K45: these names are independent).
+  local out = vim.tbl_extend("force", {}, ctx)
+  local resolver = type(core.resolve_target_identity) == "function"
+    and core.resolve_target_identity or require("ue.target_identity").resolve
+  local ok_identity, identity = pcall(resolver, ctx, "Android")
+  if ok_identity and type(identity) == "table" then
+    out.target = identity.target
+    out.configuration = identity.configuration
+  end
+  return out
+end
+
 -- Convenience pass-throughs so ue.lua's existing UEDAPAttach/UEDAPLaunch
 -- command bodies can keep calling M.android_dap_attach() / M.android_dap_launch().
 function D.android_dap_attach(_opts)
@@ -1367,12 +1388,7 @@ function D.android_dap_attach(_opts)
     require("utils.log").notify_error("dap", "ue.dap.android not loadable")
     return
   end
-  local ctx
-  if type(core.resolve_context) == "function" then
-    local ok_ctx, c = pcall(core.resolve_context)
-    if ok_ctx then ctx = c end
-  end
-  android.attach({ context = ctx })
+  android.attach({ context = resolve_android_dap_context() })
 end
 
 function D.android_dap_launch(_opts)
@@ -1381,12 +1397,11 @@ function D.android_dap_launch(_opts)
     require("utils.log").notify_error("dap", "ue.dap.android not loadable")
     return
   end
-  local ctx
-  if type(core.resolve_context) == "function" then
-    local ok_ctx, c = pcall(core.resolve_context)
-    if ok_ctx then ctx = c end
-  end
-  android.launch({ context = ctx })
+  android.launch({ context = resolve_android_dap_context() })
+end
+
+function D._resolve_android_dap_context_for_test(ctx)
+  return resolve_android_dap_context(ctx)
 end
 
 --- Reattach to the last-known Android session (same pkg/serial/symbol_lib,
@@ -1509,7 +1524,7 @@ function D.setup_dap(dap, dapui)
           -- Hand off to the real attach pipeline; nvim-dap will see
           -- this returns nil/false and abort its own session start.
           vim.schedule(function()
-            require("ue.dap.android").attach({})
+            D.android_dap_attach()
           end)
           return nil
         end,

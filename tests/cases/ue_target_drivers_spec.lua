@@ -489,6 +489,11 @@ t.describe("ue.targets build planners", function()
     vim.fn.writefile({ "so" }, source_so)
 
     local android = targets.must_get("Android")
+    local artifact = android.find_target_so({
+      project_dir = root,
+      target = "SampleGame",
+      configuration = "Test",
+    })
     local plan = android.so_deploy_plan({
       project_dir = root,
       config_root = vim.fn.stdpath("config"),
@@ -506,14 +511,53 @@ t.describe("ue.targets build planners", function()
       device_id = "DEVICE-1",
       package_name = "com.example.samplegame",
     }, require("utils.platform.macos"))
+    vim.fn.writefile({ vim.json.encode({
+      TargetName = "SampleGame",
+      Platform = "Android",
+      Configuration = "Shipping",
+      BuildProducts = {},
+    }) }, binaries .. "/SampleGame.target")
+    local deploy_with_mismatched_receipt = android.find_target_so({
+      project_dir = root, target = "SampleGame", configuration = "Test",
+    })
+    local symbols_with_mismatched_receipt = android.find_symbol_artifact({
+      project_dir = root, target = "SampleGame", configuration = "Test",
+    })
     vim.fn.delete(root, "rf")
 
+    t.assert_eq(artifact and artifact:gsub("\\", "/"), source_so:gsub("\\", "/"))
+    t.assert_nil(deploy_with_mismatched_receipt,
+      "部署继续以 matching receipt fail closed")
+    t.assert_eq(symbols_with_mismatched_receipt and symbols_with_mismatched_receipt:gsub("\\", "/"),
+      source_so:gsub("\\", "/"),
+      "符号解析可消费配置限定产物，不被另一配置的当前 receipt 遮蔽")
     t.assert_eq(plan.executable, "powershell.exe")
     t.assert_contains(table.concat(plan.args, " "), "ue_android_so_deploy.ps1")
     t.assert_contains(table.concat(plan.args, " "), "SampleGame-Android-Test-arm64.so")
     t.assert_eq(unsupported.status, "unavailable")
     t.assert_eq(unsupported.host_id, "macos")
     t.assert_contains(unsupported.reason, "host adapter")
+  end)
+
+  t.it("resolves Development short-name artifacts without crossing a mismatched receipt", function()
+    local root = vim.fn.tempname()
+    local binaries = root .. "/Binaries/Android"
+    local short_so = binaries .. "/SampleGame-arm64.so"
+    vim.fn.mkdir(binaries, "p")
+    vim.fn.writefile({ "so" }, short_so)
+    local android = targets.must_get("Android")
+    local context = { project_dir = root, target = "SampleGame", configuration = "Development" }
+    t.assert_eq(android.find_target_so(context):gsub("\\", "/"), short_so:gsub("\\", "/"))
+    t.assert_eq(android.find_symbol_artifact(context):gsub("\\", "/"), short_so:gsub("\\", "/"))
+
+    vim.fn.writefile({ vim.json.encode({
+      TargetName = "SampleGame", Platform = "Android", Configuration = "Shipping",
+      BuildProducts = {},
+    }) }, binaries .. "/SampleGame.target")
+    t.assert_nil(android.find_target_so(context))
+    t.assert_nil(android.find_symbol_artifact(context),
+      "另一配置的 receipt 存在时，generic short name 不再能证明属于 Development")
+    vim.fn.delete(root, "rf")
   end)
 
   t.it("keeps PowerShell symbols out of macOS and generic Android drivers", function()

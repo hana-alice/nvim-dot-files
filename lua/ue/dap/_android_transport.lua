@@ -15,16 +15,16 @@
 local M = {}
 
 local deps = {
-  adb_run = nil,      -- fun(adb, args): string           （失败返回空串）
-  adb_run_raw = nil,  -- fun(adb, args): string, integer  （返回输出与退出码）
-  shell_quote = nil,  -- fun(string): string
-  log = nil,          -- utils.log 兼容对象（需 .warn）
+  adb_run = false,      -- fun(adb, args): string           （失败返回空串）
+  adb_run_raw = false,  -- fun(adb, args): string, integer  （返回输出与退出码）
+  shell_quote = false,  -- fun(string): string
+  log = false,          -- utils.log 兼容对象（需 .warn）
 }
 
 --- 由 owner 注入依赖。值必须可调用/为表，拼错键即 assert（不得静默失效）。
 function M.bind(overrides)
   for key, value in pairs(overrides or {}) do
-    assert(deps[key] ~= nil or key ~= nil, "unknown transport dependency: " .. tostring(key))
+    assert(deps[key] ~= nil, "unknown transport dependency: " .. tostring(key))
     deps[key] = value
   end
   return M
@@ -160,11 +160,11 @@ function M.ensure_lldb_server_pushed(adb, serial, pkg, src)
   local skip_transport = (plan == "reuse")
 
   if plan == "repush" then
-    pcall(adb_run, adb, { "-s", serial, "shell", "killall lldb-server 2>/dev/null; true" })
+    pcall(deps.adb_run, adb, { "-s", serial, "shell", "killall lldb-server 2>/dev/null; true" })
     -- Remove any residue first: `adb push` onto an existing root-owned file
     -- fails with EACCES, but unlinking works because the parent directory is
     -- shell-owned. Harmless when the file does not exist.
-    pcall(adb_run_raw, adb, { "-s", serial, "shell", "rm", "-f", remote })
+    pcall(deps.adb_run_raw, adb, { "-s", serial, "shell", "rm", "-f", remote })
     local push_out, push_code = deps.adb_run_raw(adb, { "-s", serial, "push", src, remote })
     if push_code ~= 0 then
       return false, ("adb push failed on %s (exit %s): %s")
@@ -219,7 +219,7 @@ function M.ensure_lldb_server_pushed(adb, serial, pkg, src)
   end
 
   local stage_out, stage_code = deps.adb_run_raw(adb, { "-s", serial, "shell",
-    "run-as " .. pkg .. " sh -c " .. deps.shell_quote(sandbox_stage_script(remote, sandbox)) })
+    "run-as " .. pkg .. " sh -c " .. deps.shell_quote(M.sandbox_stage_script(remote, sandbox)) })
   if stage_code ~= 0 then
     return false, ("staging lldb-server into %s sandbox failed (exit %s): %s")
       :format(pkg, tostring(stage_code), tostring(stage_out))
@@ -259,9 +259,9 @@ end
 -- even with nohup on Android 14+, so vim.fn.system would block forever
 -- (e51cbe6 note).
 function M.start_lldb_server_platform(adb, serial, port, pkg, sandbox_path)
-  pcall(adb_run, adb, { "-s", serial, "shell", "killall lldb-server 2>/dev/null; true" })
+  pcall(deps.adb_run, adb, { "-s", serial, "shell", "killall lldb-server 2>/dev/null; true" })
   if pkg then
-    pcall(adb_run, adb, { "-s", serial, "shell",
+    pcall(deps.adb_run, adb, { "-s", serial, "shell",
       "run-as " .. pkg .. " sh -c " .. deps.shell_quote("killall lldb-server 2>/dev/null || true") })
   end
   vim.wait(150)
@@ -276,7 +276,7 @@ function M.start_lldb_server_platform(adb, serial, port, pkg, sandbox_path)
     return false, "no sandbox lldb-server path for app-uid platform server"
   end
   local cmd = "run-as " .. pkg .. " sh -c "
-    .. deps.shell_quote(platform_server_script(sandbox, port))
+    .. deps.shell_quote(M.platform_server_script(sandbox, port))
   local jobid = vim.fn.jobstart({ adb, "-s", serial, "shell", cmd }, { detach = false })
   if not jobid or jobid <= 0 then
     return false, "failed to spawn lldb-server platform (jobstart=" .. tostring(jobid) .. ")"

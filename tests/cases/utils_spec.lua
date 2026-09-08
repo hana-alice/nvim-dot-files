@@ -102,7 +102,7 @@ t.describe("utils.code_search", function()
     t.assert_eq(escape("a\\b"), "a\\\\b")
   end)
 
-  t.it("staged csearch.idx~~ 有效而 csearch.idx 为空时自动恢复", function()
+  t.it("索引读取不提升仍由写者持有的 staged 文件", function()
     local dir = vim.fn.tempname():gsub("\\", "/")
     vim.fn.mkdir(dir, "p")
     local idx = dir .. "/csearch.idx"
@@ -113,10 +113,21 @@ t.describe("utils.code_search", function()
     local f = io.open(staged, "wb")
     if f then f:write(string.rep("x", 2048)); f:close() end
 
-    t.assert_true(cs._recover_staged_index_for_test(idx), "应提升有效 staged index")
+    local locks = require("ue.file_lock")
+    local lease = assert(locks.acquire(idx .. ".writer.lock"))
+    local platform = require("utils.platform")
+    local resolve = platform.resolve_tool
+    platform.resolve_tool = function() return { ok = true, path = vim.v.progpath } end
+    cs._reset_probe_cache()
+    local ok, ready = pcall(cs.is_indexed, { csearch_idx = idx })
+    platform.resolve_tool = resolve
+    cs._reset_probe_cache()
+    locks.release(lease)
+    t.assert_true(ok)
+    t.assert_false(ready, "读取不得把暂存文件判为已发布")
     local stat = vim.loop.fs_stat(idx)
-    t.assert_true(stat ~= nil and stat.size == 2048, "最终 index 应变为 staged 内容")
-    t.assert_true(vim.loop.fs_stat(staged) == nil, "staged 文件应被 rename 掉")
+    t.assert_true(stat ~= nil and stat.size == 0, "读取不得改写正式索引")
+    t.assert_true(vim.loop.fs_stat(staged) ~= nil, "读取不得抢走写者暂存文件")
 
     pcall(vim.fn.delete, dir, "rf")
   end)

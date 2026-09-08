@@ -24,11 +24,17 @@ rc=1，导致 K58 真红灯永远判不出来）→ 用不同退出码分开。�
 判 undetermined 而非 FAIL（否则误拦一次本可成功的 attach）；② `pgrep -f <pat>` 会匹配**自己的
 命令行**，对不存在的模式也返回 pid，不能作存在性判据；③ 报告措辞不得与判定自相矛盾
 （L4 错配曾标 BLOCKING 而 blocks_attach=false）。
-**符号一致性必须比 build-id（K64）**：同一个 `versionCode` 下实测存在 **5 个不同 build-id**
+**符号一致性必须比 build-id（K64/K65）**：同一个 `versionCode` 下实测存在 **5 个不同 build-id**
 （versionCode 来自打包配置，build-id 来自链接产物）。只比 versionCode 会给出「match」假信号，
 断点仍解析到错误二进制——与 K55（iOS 必须比 UUID）同构。判据：两边 build-id 都有才算权威
-`match`/`mismatch`；只有 versionCode 时最强结论是 `weak-match`，不得宣称已验证。
-→ `../docs/CONSTRAINTS.md §三 C10`、`§二 K62`、`§二 K63`、`§二 K64`；`../openspec/specs/dap-failure-layering/spec.md`（正文）
+`match`/`mismatch`；只有 versionCode 时最强结论是 `weak-match`，不得宣称已验证。构建意图必须
+来自 engine cache 的 Configuration + build planner 的 Target，不能从现存符号包倒推用户想要的配置。
+**当前配置未 strip 产物可直接作符号源（K66）**，但 host 文件名与 APK runtime module 名可能不同：
+`.debug_info` 必须由真实 section header 证明，runtime identity 必须读 `DT_SONAME`；target/create/load
+用 host basename，maps/late-rebase 用 SONAME，不能混成一个字段。
+**有 PID 不等于 attach 成功（K69）**：失败协议也可能先发 `initialized`；只有 DAP attach response
+明确成功才可写 reattach 快照，L2 拒绝/handshake timeout/poller 启动均不算。
+→ `../docs/CONSTRAINTS.md §三 C10`、`§二 K62–K69`；`../openspec/specs/dap-failure-layering/spec.md`（正文）
 
 custom-request 被拒（历史）、手动 `target modules load --slide` rebase、强制 `process handle SIG*`、
 LuaJIT hex 截断、Android terminate-vs-disconnect、dap-repl F-key 多模式、Neovide F11 冲突、
@@ -65,6 +71,10 @@ SELinux 下 app 域可读不可执行，shell uid 的 `test -x` 通过而 app ui
 最早期 crash 只有 wait-for-debugger launch（`set-debug-app -w` + JDWP 闸门 + jdb 释放）
 能抓到（K39）；liveness poller 在 timer 回调里同步 `vim.fn.system(adb)` 造成全天
 ~50 stalls/min 的主循环卡顿 train → 周期探测必须 async `vim.system` + in_flight（K40）。
+**拆 owner 后必须经 `deps.*`/`M.*` 调依赖（K67）**：裸名字包在 `pcall` 里会把 kill/rm 缺席
+静默吞掉。**app uid 可执行并能 listen 仍不保证能握手（K68）**：某 `runas_app` 域下 app server
+LISTEN 但 forwarded GDB packet 超时，同 binary 的 shell server 立即 ACK；shell 又因 K56 无权 ptrace，
+所以不能回退，必须把 handshake capability 纳入逐设备证据。
 → `../docs/CONSTRAINTS.md §二 Android DAP attach`；归档 change `2026-06-03-android-dap-*` /
   `2026-06-15-android-dap-live-breakpoints`；ADR `../docs/plans/2026-06-15-android-dap-live-breakpoints.md`；
   证据 `../tools/evidence/android-f9/livebp-*.json`

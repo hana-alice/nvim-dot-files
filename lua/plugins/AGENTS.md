@@ -23,4 +23,4 @@
 
 `../../docs/architecture-vs-lazyvim.md`（相对 LazyVim 的增量与「刻意不做」清单）。
 
-**治理 spec**：无对应 capability（本目录行为不由某个 `openspec/specs/` capability 治理）。
+**治理 spec**：`../../openspec/specs/editor-behavior-regression/spec.md`（picker 输入与工具链显式安装）；其他插件专属行为按其直接对应的 capability 验证。

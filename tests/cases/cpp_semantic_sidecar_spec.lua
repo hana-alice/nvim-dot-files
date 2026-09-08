@@ -270,6 +270,45 @@ t.describe("semantic sidecar integration", function()
     return
   end
 
+  for _, changed_file in ipairs({ "source", "include" }) do
+    t.it("warm TU observes saved " .. changed_file .. " changes without a CDB or overlay change", function()
+      with_temp_fixture(function(root)
+        local source, header = root .. "/saved.cpp", root .. "/saved.hpp"
+        local lines = {
+          '#include "saved.hpp"',
+          "void selected(int) {} void selected(double) {}",
+          "void caller() { Value value = 0; selected(value); } // QUERY:saved",
+        }
+        assert(vim.fn.writefile({ "using Value = int;" }, header) == 0)
+        assert(vim.fn.writefile(lines, source) == 0)
+        local sidecar = semantic_sidecar.new()
+        local ok, err = xpcall(function()
+          local request = {
+            v = protocol.VERSION, id = "saved-query", op = "query",
+            query = find_marker_position(source, "QUERY:saved", "selected"),
+            contexts = { {
+              id = "saved", origin_tu = source, cdb_dir = root,
+              compile = { directory = root, file = source, argv = { "clang++", "-std=c++20", "-c", source } },
+            } },
+          }
+          local first = sidecar:handle_request(request)
+          t.assert_eq(first.state, "resolved")
+          if changed_file == "include" then
+            assert(vim.fn.writefile({ "using Value = double;" }, header) == 0)
+          else
+            lines[3] = lines[3]:gsub("selected%(value%)", "selected(0.5)")
+            assert(vim.fn.writefile(lines, source) == 0)
+          end
+          local second = sidecar:handle_request(request)
+          t.assert_eq(second.state, "resolved")
+          t.assert_true(second.usr ~= first.usr, "saved file must change the selected overload")
+        end, debug.traceback)
+        sidecar:shutdown()
+        if not ok then error(err) end
+      end)
+    end)
+  end
+
   t.it("proves active membership while using the post-processed merged command", function()
     with_temp_fixture(function(root)
       local merged_path = vim.fs.normalize(root .. "/compile_commands.json")
@@ -705,6 +744,19 @@ t.describe("semantic sidecar integration", function()
         v = protocol.VERSION, id = "lookup-stats-second", op = "stats",
       })
       t.assert_eq(stats_after_second.metrics.tu_count, tu_count_after_first)
+
+      local source_path = root .. "/direct.cpp"
+      local contents = read_all(source_path)
+      local fd = assert(io.open(source_path, "wb"))
+      fd:write("// saved source changed\n" .. contents)
+      fd:close()
+      local after_save = sidecar:handle_request({
+        v = protocol.VERSION, id = "lookup-saved", op = "lookup-definition",
+        usr = query.usr, subject = root .. "/caller.cpp", cdb_paths = { controlled },
+      })
+      t.assert_eq(after_save.state, "resolved")
+      t.assert_false(after_save.metrics.cache_hit)
+      t.assert_eq(after_save.definition.line, first.definition.line + 1)
 
       local evicted = sidecar:handle_request({
         v = protocol.VERSION, id = "lookup-evict", op = "evict", all = true,

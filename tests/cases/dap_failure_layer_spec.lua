@@ -636,6 +636,17 @@ t.describe("ue.dap.android: 拆分后的归属与委派", function()
     end
   end)
 
+  t.it("bind 拒绝拼错的依赖名（K67：不得静默注入无效键）", function()
+    local files = vim.list_extend(vim.deepcopy(SPLIT_FILES), {
+      "lua/ue/dap/_android_symbols.lua",
+    })
+    for _, rel in ipairs(files) do
+      local mod = assert(loadfile(vim.fn.stdpath("config") .. "/" .. rel))()
+      local ok = pcall(mod.bind, { definitely_misspelled = function() end })
+      t.assert_false(ok, rel .. " bind() 必须拒绝未知键")
+    end
+  end)
+
   t.it("platform server 的 jobid 由 transport 拥有，清理必须清它", function()
     -- 拆分把 spawn 搬进 transport，若清理仍只清 owner 的镜像字段，设备上会留下
     -- 活着的 server 占住端口（K56 记录该残留会静默把 shell-uid SEGV 路径带回来）。
@@ -1141,23 +1152,20 @@ t.describe("ue.dap.android: K65 符号选择由引擎 cache 的配置驱动", fu
   local policy = require("ue.dap._android_policy")
   local symbols = require("ue.dap._android_symbols").bind({
     read_build_id = policy.read_build_id,
-    is_file = require("ue.core.fs").is_file,
-    is_dir = require("ue.core.fs").is_dir,
+    resolve_artifact = function(android_dir, target, configuration)
+      return require("ue.targets.android").find_symbol_artifact({
+        project_dir = vim.fn.fnamemodify(android_dir, ":h:h"),
+        target = target,
+        configuration = configuration,
+      })
+    end,
   })
 
-  t.it("产物名沿用 target 层命名规则（不另造一套）", function()
-    t.assert_eq(symbols.artifact_so_name("Sample", "Test"), "Sample-Android-Test-arm64.so")
-    t.assert_eq(symbols.artifact_so_name("Sample", "Shipping"), "Sample-Android-Shipping-arm64.so")
-    -- Development 的 UBT 产物不带配置后缀。
-    t.assert_eq(symbols.artifact_so_name("Sample", "Development"), "Sample-arm64.so")
-    t.assert_eq(symbols.artifact_receipt_name("Sample", "Test"), "Sample-Android-Test.target")
-  end)
-
-  t.it("缺 target 或 configuration 时不猜文件名", function()
-    t.assert_nil(symbols.artifact_so_name("Sample", nil))
-    t.assert_nil(symbols.artifact_so_name("Sample", ""))
-    t.assert_nil(symbols.artifact_so_name("", "Test"))
-    t.assert_nil(symbols.artifact_so_name(nil, "Test"))
+  t.it("缺 target 或 configuration 时不猜产物", function()
+    t.assert_nil(symbols.expected_build_id("C:/tmp", "Sample", nil))
+    t.assert_nil(symbols.expected_build_id("C:/tmp", "Sample", ""))
+    t.assert_nil(symbols.expected_build_id("C:/tmp", "", "Test"))
+    t.assert_nil(symbols.expected_build_id("C:/tmp", nil, "Test"))
   end)
 
   -- 用两个合成 ELF（不同 build-id）复现「同 versionCode、不同配置」的真实形状。
@@ -1174,7 +1182,7 @@ t.describe("ue.dap.android: K65 符号选择由引擎 cache 的配置驱动", fu
   end
 
   t.it("按配置取到期望 build-id，并只选命中的那个符号包", function()
-    local root = (vim.fn.tempname():gsub("\\", "/"))
+    local root = (vim.fn.tempname():gsub("\\", "/")) .. "/Project/Binaries/Android"
     -- 两个配置的产物 so，build-id 不同
     write_elf(root .. "/Sample-Android-Test-arm64.so", 0xAA)
     write_elf(root .. "/Sample-Android-Shipping-arm64.so", 0xBB)
@@ -1197,11 +1205,11 @@ t.describe("ue.dap.android: K65 符号选择由引擎 cache 的配置驱动", fu
     local got_ship, v_ship = symbols.select_by_build_id(candidates, exp_ship)
     t.assert_eq(v_ship, "build-id")
     t.assert_eq(got_ship, sym_ship, "Shipping 配置必须选 Shipping 的符号包")
-    pcall(vim.fn.delete, root, "rf")
+    pcall(vim.fn.delete, vim.fn.fnamemodify(root, ":h:h:h"), "rf")
   end)
 
   t.it("有期望值但无候选命中 → 拒绝（错符号比没符号更危险）", function()
-    local root = (vim.fn.tempname():gsub("\\", "/"))
+    local root = (vim.fn.tempname():gsub("\\", "/")) .. "/Project/Binaries/Android"
     write_elf(root .. "/Sample-Android-Test-arm64.so", 0xAA)
     local other = root .. "/Sample_Symbols_v900000002/Sample-arm64/libUE4.so"
     write_elf(other, 0xBB)
@@ -1209,11 +1217,11 @@ t.describe("ue.dap.android: K65 符号选择由引擎 cache 的配置驱动", fu
     local got, verdict = symbols.select_by_build_id({ other }, exp)
     t.assert_nil(got, "不得回退到一个 build-id 不符的符号包")
     t.assert_eq(verdict, "no-match")
-    pcall(vim.fn.delete, root, "rf")
+    pcall(vim.fn.delete, vim.fn.fnamemodify(root, ":h:h:h"), "rf")
   end)
 
   t.it("多个候选同时命中 → ambiguous，不擅自挑一个", function()
-    local root = (vim.fn.tempname():gsub("\\", "/"))
+    local root = (vim.fn.tempname():gsub("\\", "/")) .. "/Project/Binaries/Android"
     write_elf(root .. "/Sample-Android-Test-arm64.so", 0xAA)
     local a = root .. "/Sample_Symbols_v900000001/Sample-arm64/libUE4.so"
     local b = root .. "/Sample_Symbols_v900000003/Sample-arm64/libUE4.so"
@@ -1222,19 +1230,19 @@ t.describe("ue.dap.android: K65 符号选择由引擎 cache 的配置驱动", fu
     local got, verdict = symbols.select_by_build_id({ a, b }, exp)
     t.assert_nil(got)
     t.assert_eq(verdict, "ambiguous")
-    pcall(vim.fn.delete, root, "rf")
+    pcall(vim.fn.delete, vim.fn.fnamemodify(root, ":h:h:h"), "rf")
   end)
 
   t.it("拿不到期望 build-id → unknown（上层才可退回 versionCode 弱匹配）", function()
-    local root = (vim.fn.tempname():gsub("\\", "/"))
-    -- 该配置的产物 so 不存在
+    local root = (vim.fn.tempname():gsub("\\", "/")) .. "/Project/Binaries/Android"
+    -- 该配置的产物 so 不存在；target owner fail closed，不合成猜测路径。
     local exp, probed = symbols.expected_build_id(root, "Sample", "Test")
     t.assert_nil(exp)
-    t.assert_contains(probed, "Sample-Android-Test-arm64.so")
+    t.assert_nil(probed)
     local got, verdict = symbols.select_by_build_id({ "/x/libUE4.so" }, nil)
     t.assert_nil(got)
     t.assert_eq(verdict, "unknown")
-    pcall(vim.fn.delete, root, "rf")
+    pcall(vim.fn.delete, vim.fn.fnamemodify(root, ":h:h:h"), "rf")
   end)
 
   t.it("pick_symbol_lib 读 ctx.state.target_configuration（源断言）", function()
@@ -1242,9 +1250,179 @@ t.describe("ue.dap.android: K65 符号选择由引擎 cache 的配置驱动", fu
       vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue/dap/android.lua"), "\n")
     t.assert_contains(source, "ctx.state.target_configuration")
     t.assert_contains(source, "symbols.expected_build_id(android_dir, target_name, configuration)")
+    t.assert_contains(source, "ctx.target or ctx.target_name")
+    t.assert_true(source:find('fnamemodify(ctx.uproject, ":t:r")', 1, true) == nil,
+      "项目名与 Target 名独立，不得从 .uproject basename 猜 Target")
     -- 被证伪的旧说法不得留在代码里误导后人。
     t.assert_true(
       source:find("guarantees the\n    --    symbols correspond", 1, true) == nil,
       "versionCode 匹配并不能 guarantee 对应已装 APK（K64）")
+  end)
+end)
+
+-- K66：当前配置的 UBT 未 strip 产物本身含 DWARF；选择它时必须同时从
+-- DT_SONAME 取得 APK runtime module identity，不能拿 host 文件名去查 maps。
+t.describe("ue.dap.android: K66 当前配置产物直接作为符号源", function()
+  local symbols = require("ue.dap._android_symbols")
+  local android = require("ue.dap.android")
+
+  local function le16(n)
+    return string.char(n % 256, math.floor(n / 256) % 256)
+  end
+  local function le32(n)
+    return string.char(n % 256, math.floor(n / 256) % 256,
+      math.floor(n / 65536) % 256, math.floor(n / 16777216) % 256)
+  end
+  local function le64(n)
+    local low = n % 4294967296
+    local high = math.floor(n / 4294967296)
+    return le32(low) .. le32(high)
+  end
+  local function section(name_offset, section_type, offset, size, link, entry_size)
+    return le32(name_offset) .. le32(section_type)
+      .. le64(0) .. le64(0) .. le64(offset) .. le64(size)
+      .. le32(link or 0) .. le32(0) .. le64(1) .. le64(entry_size or 0)
+  end
+  local function write_debug_elf(path, opts)
+    opts = opts or {}
+    local names = "\0.shstrtab\0.debug_info\0.decoy\0.dynstr\0.dynamic\0"
+    local function name_offset(name)
+      return assert(names:find(name, 1, true)) - 1
+    end
+    local dynstr = "\0" .. (opts.soname or "libUE4.so") .. "\0"
+    local dynamic = le64(14) .. le64(1) .. le64(0) .. le64(0)
+    local debug = "DWARF"
+    local shnum, shoff, shentsize = 5, 64, 64
+    local table_end = shoff + shnum * shentsize
+    local names_off = table_end
+    local debug_off = names_off + #names
+    local dynstr_off = debug_off + #debug
+    local dynamic_off = dynstr_off + #dynstr
+    local ident = "\127ELF" .. string.char(opts.elf_class or 2, opts.elf_data or 1, 1)
+      .. ("\0"):rep(9)
+    local header = ident .. le16(3) .. le16(183) .. le32(1)
+      .. le64(0) .. le64(0) .. le64(shoff) .. le32(0)
+      .. le16(64) .. le16(0) .. le16(0) .. le16(shentsize)
+      .. le16(shnum) .. le16(1)
+    local debug_name = opts.debug == false and ".decoy" or ".debug_info"
+    local sections = ("\0"):rep(64)
+      .. section(name_offset(".shstrtab"), 3, names_off, #names)
+      .. section(name_offset(debug_name), 1, debug_off, #debug)
+      .. section(name_offset(".dynstr"), 3, dynstr_off, #dynstr)
+      .. section(name_offset(".dynamic"), 6, dynamic_off, #dynamic, 3, 16)
+    vim.fn.mkdir(vim.fn.fnamemodify(path, ":h"), "p")
+    local fh = assert(io.open(path, "wb"))
+    fh:write(header, sections, names, debug, dynstr, dynamic)
+    fh:close()
+  end
+
+  t.it("只接受真实 section 引用的 .debug_info，并解析 DT_SONAME", function()
+    local root = vim.fn.tempname():gsub("\\", "/")
+    local good = root .. "/good.so"
+    local unused_name = root .. "/unused-name.so"
+    local wrong_class = root .. "/elf32.so"
+    local wrong_endian = root .. "/big-endian.so"
+    local truncated = root .. "/truncated.so"
+    write_debug_elf(good)
+    write_debug_elf(unused_name, { debug = false })
+    write_debug_elf(wrong_class, { elf_class = 1 })
+    write_debug_elf(wrong_endian, { elf_data = 2 })
+    vim.fn.writefile({ "ELF" }, truncated)
+
+    t.assert_true(symbols.has_debug_symbols(good))
+    t.assert_eq(symbols.read_soname(good), "libUE4.so")
+    t.assert_false(symbols.has_debug_symbols(unused_name),
+      "字符串表里未被 section 引用的 .debug_info 不得造成假阳性")
+    t.assert_false(symbols.has_debug_symbols(wrong_class))
+    t.assert_false(symbols.has_debug_symbols(wrong_endian))
+    t.assert_false(symbols.has_debug_symbols(truncated))
+    t.assert_nil(symbols.read_soname(wrong_class))
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("build 与 DAP 共用 Target.cs + cache identity，不从项目名反推 Target", function()
+    -- globpath wildcard expansion is unreliable through Windows 8.3 temp paths;
+    -- use the long config path and remove the fixture immediately.
+    local root = (vim.fn.stdpath("config") .. "/.tmp-dap-target-fixture-" .. vim.fn.getpid())
+      :gsub("\\", "/")
+    local uproject = root .. "/Sample.uproject"
+    vim.fn.mkdir(root .. "/Source", "p")
+    vim.fn.writefile({ "{}" }, uproject)
+    vim.fn.writefile({ "// fixture" }, root .. "/Source/SampleClient.Target.cs")
+    vim.fn.writefile({ "// fixture" }, root .. "/Source/SampleServer.Target.cs")
+    local saved_target = vim.env.UE_BUILD_TARGET
+    local saved_configuration = vim.env.UE_TARGET_CONFIGURATION
+    vim.env.UE_BUILD_TARGET = ""
+    vim.env.UE_TARGET_CONFIGURATION = ""
+    local resolver = require("ue.target_identity")
+    local identity = resolver.resolve({
+      project_root = root,
+      uproject = uproject,
+      state = { target_configuration = "Test Client" },
+    })
+    t.assert_eq(identity.target, "SampleClient")
+    t.assert_eq(identity.configuration, "Test")
+
+    vim.env.UE_TARGET_CONFIGURATION = "Shipping Server"
+    local overridden = resolver.resolve({
+      project_root = root,
+      uproject = uproject,
+      state = { target_configuration = "Test Client" },
+    })
+    vim.env.UE_BUILD_TARGET = saved_target or ""
+    vim.env.UE_TARGET_CONFIGURATION = saved_configuration or ""
+    t.assert_eq(overridden.target, "SampleServer")
+    t.assert_eq(overridden.configuration, "Shipping",
+      "DAP 必须与 build 一样让 UE_TARGET_CONFIGURATION 赢过持久 cache")
+
+    local config = vim.fn.stdpath("config")
+    local dap_source = table.concat(vim.fn.readfile(config .. "/lua/ue/dap.lua"), "\n")
+    local ue_source = table.concat(vim.fn.readfile(config .. "/lua/ue.lua"), "\n")
+    t.assert_contains(dap_source, 'require("ue.target_identity").resolve')
+    t.assert_contains(dap_source, "D.android_dap_attach()")
+    t.assert_true(dap_source:find('require("ue.dap.android").attach({})', 1, true) == nil,
+      "registered nvim-dap entry must not bypass target/configuration enrichment")
+    t.assert_contains(ue_source, 'target_identity = require("ue.target_identity")')
+    t.assert_contains(ue_source, "resolved.configuration = selected_target_configuration(")
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("项目名与 Target 不同时，优先返回当前 Target/配置产物及其 runtime SONAME", function()
+    local root = vim.fn.tempname():gsub("\\", "/") .. "/Project"
+    local android_dir = root .. "/Binaries/Android"
+    local uproject = root .. "/Sample.uproject"
+    vim.fn.mkdir(android_dir, "p")
+    vim.fn.writefile({ "{}" }, uproject)
+    vim.fn.writefile({ "com.example.game", "123", "1.0" }, android_dir .. "/packageInfo.txt")
+    local artifact = android_dir .. "/Client-Android-Test-arm64.so"
+    local decoy = android_dir .. "/Client_Symbols_v123/Client-arm64/libUE4.so"
+    write_debug_elf(artifact)
+    write_debug_elf(decoy, { soname = "libUE4.so" })
+
+    local picked, runtime, symbol_version_code = android._pick_symbol_lib_for_test({
+      project_root = root,
+      uproject = uproject,
+      target = "Client",
+      configuration = "Test",
+      state = { target_configuration = "Test" },
+    })
+    t.assert_eq(picked and picked:gsub("\\", "/"), artifact)
+    t.assert_eq(runtime, "libUE4.so")
+    t.assert_eq(symbol_version_code, "123")
+
+    local policy = require("ue.dap._android_policy")
+    local capability = require("ue.dap.capability")
+    local match_probe
+    for _, probe in ipairs(policy.capability_probes()) do
+      if probe.id == "symbol-build-matches-device" then match_probe = probe end
+    end
+    match_probe.build_argv({
+      adb = "adb", serial = "SERIAL", package_name = "com.example.game",
+      symbol_lib = artifact, symbol_version_code = "123",
+    })
+    local verdict = capability.evaluate(match_probe, 0, "versionCode=123", nil)
+    t.assert_eq(verdict.verdict, capability.VERDICT.PASS,
+      "direct artifact 应携带 packageInfo versionCode，而不是因路径无 _Symbols_v 变 unknown")
+    pcall(vim.fn.delete, vim.fn.fnamemodify(root, ":h"), "rf")
   end)
 end)

@@ -269,8 +269,8 @@ function M.install(Sidecar, deps)
 
     local cache_key = self:_lookup_definition_cache_key(request)
     local cached = self.lookup_cache[cache_key]
-    if cached then
-      local frame = vim.deepcopy(cached)
+    if cached and libclang.file_signatures_current(cached.file_signatures) then
+      local frame = vim.deepcopy(cached.frame)
       frame.id = request.id
       frame.subject = subject_path
       frame.document_version = tonumber(request.document_version or 0) or 0
@@ -338,13 +338,14 @@ function M.install(Sidecar, deps)
 
     self:_prune_idle(libclang.now_ms())
 
-    local all_definitions, query_kinds = {}, {}
+    local all_definitions, query_kinds, file_signatures = {}, {}, {}
     local contexts_summary = {}
     local aggregate_cold_parse_ms, aggregate_reparse_ms = 0, 0
     local shim_overflow = false
     for _, ctx in ipairs(contexts) do
       local entry, meta, compile_err = self:_ensure_tu(ctx, request.overlays or {})
       if entry then
+        for path, signature in pairs(entry.file_signatures or {}) do file_signatures[path] = signature end
         aggregate_cold_parse_ms = aggregate_cold_parse_ms + (meta.cold_parse_ms or 0)
         aggregate_reparse_ms = aggregate_reparse_ms + (meta.reparse_ms or 0)
         query_kinds[#query_kinds + 1] = {
@@ -415,7 +416,7 @@ function M.install(Sidecar, deps)
     end
 
     if frame.state == "resolved" then
-      self.lookup_cache[cache_key] = vim.deepcopy(frame)
+      self.lookup_cache[cache_key] = { frame = vim.deepcopy(frame), file_signatures = file_signatures }
     end
     frame.id = request.id
     frame.metrics = self:_lookup_definition_metrics(started, {

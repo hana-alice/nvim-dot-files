@@ -169,9 +169,9 @@ function M.install(client, deps)
     return origin
   end
 
-  local function finish_progress(timer)
+  local function finish_progress(timer, token)
     close_timer(timer)
-    if state.active_notice then
+    if token == state.active_action_token and state.active_notice then
       pcall(state.active_notice.clear)
       state.active_notice = nil
     end
@@ -290,8 +290,14 @@ function M.install(client, deps)
   function client.resolve_header(spec, callback)
     spec.path = spec.path or spec.header
     local snapshot, environment = spec.snapshot, spec.environment
+    local function snapshot_current(response)
+      local current, reason = client.snapshot_is_current(snapshot, response)
+      if not current then return false, reason end
+      if environment.index then return client.index_snapshot_is_current(environment.index, snapshot.bufnr) end
+      return true
+    end
     local timer = vim.defer_fn(function()
-      if not client.snapshot_is_current(snapshot) then return end
+      if not snapshot_current() then return end
       local ok, ui = pcall(require, "utils.ue_goto.ui")
       if ok then
         state.active_notice = ui.progress_notice("⏳ resolving C++ header in translation-unit context ...")
@@ -299,8 +305,8 @@ function M.install(client, deps)
     end, PROGRESS_DELAY_MS)
 
     local function finish(response)
-      finish_progress(timer)
-      local current, stale_reason = client.snapshot_is_current(snapshot, response)
+      finish_progress(timer, snapshot.token)
+      local current, stale_reason = snapshot_current(response)
       if not current then
         emit_trace("stale", {
           request_id = response and response.id,
@@ -330,9 +336,9 @@ function M.install(client, deps)
         active_build = environment.active_build,
         evidence_roots = environment.evidence_roots,
       }, function(catalog)
-        local current, stale_reason = client.snapshot_is_current(snapshot)
+        local current, stale_reason = snapshot_current()
         if not current then
-          finish_progress(timer)
+          finish_progress(timer, snapshot.token)
           emit_trace("stale", {
             request_id = catalog.id,
             provider = "sidecar",
@@ -362,9 +368,9 @@ function M.install(client, deps)
           -- straight there. It only returns `ambiguous-context` when the results
           -- really differ, which is the sole case worth asking about.
           query_contexts(spec, contexts, function(response)
-            local still_current, why = client.snapshot_is_current(snapshot)
+            local still_current, why = snapshot_current(response)
             if not still_current then
-              finish_progress(timer)
+              finish_progress(timer, snapshot.token)
               callback(nil, why)
               return
             end
@@ -391,7 +397,7 @@ function M.install(client, deps)
             -- situation where the user has something real to decide.
             if response and response.state == "ambiguous-context"
                 and type(response.contexts) == "table" and #response.contexts > 1 then
-              finish_progress(timer)
+              finish_progress(timer, snapshot.token)
               vim.ui.select(response.contexts, {
                 prompt = "Multiple proven contexts resolve differently",
                 format_item = function(item)
@@ -408,6 +414,7 @@ function M.install(client, deps)
                   return tu
                 end,
               }, function(choice)
+                if not snapshot_current() then finish(response); return end
                 if not choice then
                   notify_terminal(response)
                   callback(response)
@@ -428,6 +435,10 @@ function M.install(client, deps)
 
     dispatch = function(context, allow_recatalog)
       query(spec, context, function(response)
+        if not snapshot_current(response) then
+          finish(response)
+          return
+        end
         if response and response.reason == "invalid-query-file-not-in-tu" and allow_recatalog then
           state.window_contexts[snapshot.winid] = nil
           catalog_contexts(true)

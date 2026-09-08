@@ -52,13 +52,14 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 | 核心健康审计 | `lua/utils/core_health*.lua` + `scripts/nvim_core_health.lua` | `lua/utils/AGENTS.md` + `scripts/AGENTS.md` | `nvim-core-functionality-audit`、`codebase-health-audit` | `core_health` | 隔离、只读、可机器判定的启动/编辑/AST/搜索/clangd/CDB/target plan 证据 |
 | 平台驱动 | `lua/utils/platform/` | `lua/utils/platform/AGENTS.md` | `host-platform-driver`、`platform-tool-resolution`、`shell-command-planning` | `platform` `ue_platform_boundary` | 唯一允许做 OS 分支的地方；host 选 shell executable，shell helper 只组 argv/quote |
 | 探针反馈 | `lua/utils/probe.lua` | `lua/utils/AGENTS.md` | `probe-feedback-loop` | `probe` | 主动埋证据；会话开头先读 `:UEProbeReport` |
+| watcher dirty 持久化 | `lua/utils/ue_watch.lua` + `dirty_save.lua` | `lua/utils/AGENTS.md` | `ue-code-search`、`multi-instance-state-isolation` | `ue_watch_csearch` `multi_instance_state` `stability` | 事件 generation 隔离，原 owner 保存与有界 I/O 重试 |
 | 宿主资源感知/动态纪律 | `lua/utils/cpu_load.lua` + `host_admission.lua` + `clangd_resource_controller.lua` + `lua/ue/index/_admission.lua` | `lua/utils/AGENTS.md` + `lua/ue/index/AGENTS.md` | `editor-behavior-regression`、`cpp-semantic-index-coverage` | `cpu_admission` `host_resource_discipline` `clangd_resource` `index_delivery` `ue_config` `stability` | host 1Hz / Neovim 4Hz 常驻感知；batch 推迟、前台优先、owned clangd 可逆降优先级 |
 | 任务管理 | `lua/utils/task_registry.lua` | `lua/utils/AGENTS.md` | `task-management` | `task_registry` `commands` | `Tasks`/`TaskStop`/`TaskStopAll` 通用后台任务 |
 | 通知历史 | `lua/utils/` 通知层 | `lua/utils/AGENTS.md` | `notification-history` | `utils` | 不做周期 ticker（P5） |
 | workaround 注册表 | `lua/workarounds/` | `lua/workarounds/AGENTS.md` | 无对应 capability | `workarounds` `smoke` | 上游 bug 补丁，带 frontmatter |
-| 配置层 | `lua/config/` | `lua/config/AGENTS.md` | `keymap-command-regression`、`editor-behavior-regression` | `keymaps` `commands` `options` `autocmds` | keymaps / options / autocmds / lazy |
+| 配置层 | `lua/config/` | `lua/config/AGENTS.md` | `keymap-command-regression`、`editor-behavior-regression` | `keymaps` `commands` `review_editor` `options` `autocmds` | keymaps / options / autocmds / lazy |
 | 主题 | `lua/theme.lua` + `colors/` | `lua/AGENTS.md` | `curated-theme-entrypoints` | `theme` `smoke` | 策展式主题入口 |
-| 插件层 | `lua/plugins/` | `lua/plugins/AGENTS.md` | 无对应 capability | `smoke` | per-plugin setup（snacks-only） |
+| 插件层 | `lua/plugins/` | `lua/plugins/AGENTS.md` | `editor-behavior-regression` | `smoke` `review_editor` | per-plugin setup（snacks-only） |
 | vendored 依赖 | `lua/nio/`、`lua/trouble/` | 各自 `AGENTS.md` | 无对应 capability | `smoke` | 第三方内联副本，不自行重构 |
 | 回归测试 | `tests/` | `tests/AGENTS.md` | `headless-test-harness`、`config-regression-suite`、`test-regression-policy`、`structure-discoverability-regression` | 改动对应域 + `structure` | headless 套件 + 分范围回归映射 |
 | 规则/知识库 | `AGENTS.md`、`docs/`、`memory/`、`decisions/`、`lessons/` | `docs/AGENTS.md` | `project-constraints-doc`、`ai-knowledge-base`、`local-subsystem-rules`、`spec-authority-loop` | `structure` | 单一内容源 + 四区知识库 + spec 权威 |

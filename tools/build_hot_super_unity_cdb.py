@@ -129,14 +129,11 @@ WRITE_ONLY_PREFIXES = (
 )
 
 
-def strip_write_only_flags(args, strip_pch=False):
+def strip_write_only_flags(args):
     stripped = []
     index = 0
     while index < len(args):
         arg = str(args[index])
-        if strip_pch and arg == '-include-pch':
-            index += 2 if index + 1 < len(args) else 1
-            continue
         if arg in WRITE_ONLY_FLAGS_WITH_VALUE:
             index += 2 if index + 1 < len(args) else 1
             continue
@@ -290,6 +287,16 @@ def unity_response_args(unity_path, template):
             for arg in rsp_args
         ):
             continue
+        response_entry = {
+            'directory': template.get('directory', ''),
+            'file': unity_path,
+            'arguments': [template_args[0]] + rsp_args,
+        }
+        # Member agreement and matching target/std do not prove that this
+        # response belongs to their context. Compare all semantic flags in
+        # order, including defines, includes and PCH inputs.
+        if compile_context_key(response_entry) != compile_context_key(template):
+            continue
         return rsp_args
     return None
 
@@ -366,7 +373,7 @@ def rewritten_arguments(entry, new_source):
 
 
 def rewritten_response_arguments(template, unity_path, rsp_args, new_source):
-    """Build a clangd command from UBT's response file without output/PCH IO."""
+    """Build a clangd command from proven response flags without write outputs."""
     driver = template.get('arguments', [None])[0]
     if not driver:
         return None
@@ -374,7 +381,7 @@ def rewritten_response_arguments(template, unity_path, rsp_args, new_source):
     args = [driver]
     replaced = False
     index = 0
-    filtered_rsp_args = strip_write_only_flags(rsp_args, strip_pch=True)
+    filtered_rsp_args = strip_write_only_flags(rsp_args)
     while index < len(filtered_rsp_args):
         arg = filtered_rsp_args[index]
         if os.path.normcase(str(arg).replace('\\', '/')) == unity_normalized:

@@ -182,14 +182,21 @@ def main():
     inject_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inject_definitions_to_cdb.py")
     if os.path.isfile(inject_script):
         print("\n[inject] Injecting Definitions.h #defines into CDB...")
-        rc = subprocess.call([sys.executable, "-I", inject_script, cdb_path])
+        inject_cmd = [sys.executable, "-I", inject_script, cdb_path]
+        if args.background_output:
+            inject_cmd.append("--preserve-exact")
+        rc = subprocess.call(inject_cmd)
         if rc != 0:
-            print(f"  WARN: inject_definitions_to_cdb returned {rc}")
+            print(f"ERROR: inject_definitions_to_cdb returned {rc}", file=sys.stderr)
+            return rc
         # Re-read CDB after injection (size may have grown)
         with open(cdb_path, "r", encoding="utf-8") as f:
             cdb = json.load(f)
         print(f"  CDB size after inject: {len(cdb)} entries, {os.path.getsize(cdb_path)/1024/1024:.1f} MB")
     else:
+        if args.background_output:
+            print(f"ERROR: required exact-input validator missing: {inject_script}", file=sys.stderr)
+            return 1
         print(f"  WARN: {inject_script} not found, skipping injection")
         print(f"  (Indexer will likely fail on ~97% of UE TUs without it.)")
 

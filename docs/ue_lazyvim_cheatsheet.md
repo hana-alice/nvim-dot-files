@@ -823,8 +823,9 @@ have no key bound by default:
 
 | Command                | Action                                  |
 |------------------------|-----------------------------------------|
-| `:UEPrepareReindex`    | Reindex without re-export ccjson        |
-| `:UEPrepareIncremental`| Prepare only dirty files (fast refresh) |
+| `:UEBuildCsearch`      | Rescan and fully rebuild only csearch; no UBT/CDB/GTAGS |
+| `:UEPrepareReindex`    | Normal prepare + forced csearch rebuild |
+| `:UEPrepareIncremental`| Append watcher dirty files to csearch only |
 | `:UEPrepareSync`       | Synchronous prepare (debug)             |
 | `:UEGenerateFromRSP`   | Re-export ccjson from cached `.rsp`     |
 | `:UEBuildAndroid`      | Force Android build target              |

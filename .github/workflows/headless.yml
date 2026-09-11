@@ -22,13 +22,16 @@ jobs:
       XDG_STATE_HOME: ${{ github.workspace }}/.state
       XDG_CACHE_HOME: ${{ github.workspace }}/.cache
       LOCALAPPDATA: ${{ github.workspace }}
+      # Linux is the mandatory LLVM acceptance lane. Other real hosts report
+      # explicit skips when the matching native tools are unavailable.
+      NVIM_TEST_REQUIRE_NATIVE: ${{ matrix.os == 'ubuntu-24.04' && '1' || '0' }}
     defaults:
       run:
         working-directory: nvim
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-24.04, macos-latest, windows-latest]
         nvim: [stable]
     steps:
       - name: Checkout
@@ -64,6 +67,20 @@ jobs:
       - name: Existing ripgrep prerequisite (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get install -y ripgrep
+
+      - name: Existing LLVM 22 toolchain for required native acceptance
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # Official versioned repository: https://apt.llvm.org/ (Noble, 22).
+          curl --fail --silent --show-error https://apt.llvm.org/llvm-snapshot.gpg.key -o "$RUNNER_TEMP/llvm.asc"
+          sudo install -m 0644 "$RUNNER_TEMP/llvm.asc" /usr/share/keyrings/llvm.asc
+          echo 'deb [signed-by=/usr/share/keyrings/llvm.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main' | sudo tee /etc/apt/sources.list.d/llvm22.list
+          sudo apt-get update
+          sudo apt-get install -y clang-22 clangd-22 libclang-22-dev
+          /usr/lib/llvm-22/bin/clangd --version
+          test -f /usr/lib/llvm-22/lib/libclang.so
+          echo 'UE_CLANGD=/usr/lib/llvm-22/bin/clangd' >> "$GITHUB_ENV"
 
       - name: Existing ripgrep prerequisite (macOS)
         if: runner.os == 'macOS'

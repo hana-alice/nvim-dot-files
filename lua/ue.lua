@@ -1053,21 +1053,26 @@ local read_state
 local update_state_field
 
 local function resolve_project_input(path, engine_root)
-  path = norm(trim(path))
+  path = trim(path)
   if path == "" then
     return nil, nil, "Project path not provided"
   end
 
-  -- Reject Windows drive-relative paths like "E:Projects/..." (missing slash
-  -- after the drive letter). vim.fn.isdirectory() may still resolve them
-  -- via the per-drive cwd quirk, but they break downstream UBT/clangd
-  -- invocations and confuse is_windows_path(). Force the caller to supply
-  -- an absolute path.
-  if path:match("^[A-Za-z]:[^\\/]") then
-    return nil, nil,
-      "Drive-relative path not allowed: " .. path ..
-      " (missing slash after drive letter, e.g. use 'E:/Projects/...' not 'E:Projects/...')"
+  -- Native file completion can return drive-relative paths. Resolve the
+  -- existing object using the OS's per-drive cwd before persisting it; adding
+  -- a slash would change its meaning. fnamemodify(:p) is not reliable for
+  -- bare drive/prefix inputs, whereas fs_realpath resolves the existing path.
+  if path:match("^[A-Za-z]:[^\\/]") or path:match("^[A-Za-z]:$") then
+    local absolute, path_err = vim.uv.fs_realpath(path)
+    if not absolute or not absolute:match("^[A-Za-z]:[/\\]") then
+      return nil, nil, "Cannot resolve project path: " .. path .. " (" .. tostring(path_err or "not an absolute drive path") .. ")"
+    end
+    path = absolute
   end
+  path = norm(path)
+  -- norm strips trailing separators; an absolute drive root must not become
+  -- drive-relative again during project discovery.
+  if path:match("^[A-Za-z]:$") then path = path .. "/" end
 
   if path:match("%.uproject$") then
     if not _ufs.is_file(path) then
@@ -6579,6 +6584,14 @@ end
 -- LuaJIT main-chunk local slot — see skill luajit-200-local-cap-with-loader-cache-mask.
 -- We expose set_project through CORE_RT instead.)
 do
+local function record_project_selection(outcome)
+  pcall(function()
+    local probe = require("utils.probe")
+    probe.observe("project-selection", "completion-path-2026-09-11")
+    probe.record("project-selection", outcome, { state = outcome == "selected" and "resolved" or "unavailable" })
+  end)
+end
+
 local function invalidate_project_scoped_cache(_, reason)
   -- Force prepare_freshness to re-read from disk on next call.
   CORE_RT.freshness_notified = {}
@@ -6613,8 +6626,17 @@ local function set_project(input)
   end
 
   local project_root, uproject, err = resolve_project_input(input, engine_root)
+  -- Shared state/path consumers currently strip a drive root's separator.
+  -- Do not publish C: as a project root and let consumers reinterpret it as cwd.
+  if project_root and project_root:match("^[A-Za-z]:/*$") then
+    project_root = nil
+    err = "Projects directly at a drive root are not supported; select a project in a subdirectory"
+  end
   if not project_root then
-    vim.notify(err, vim.log.levels.WARN)
+    record_project_selection("invalid-input")
+    local active = CORE_RT.project_state.current(engine_root)
+    vim.notify("UE project NOT changed:\n" .. tostring(err)
+      .. "\nStill selected: " .. (active and active.project_root or "<unset>"), vim.log.levels.ERROR)
     return
   end
 
@@ -6631,7 +6653,10 @@ local function set_project(input)
   end
   local persisted, persist_err = persist_project(engine_root, project_root, uproject)
   if not persisted then
-    vim.notify("Failed to set UE project: " .. tostring(persist_err), vim.log.levels.ERROR)
+    record_project_selection("persist-failed")
+    local active = CORE_RT.project_state.current(engine_root)
+    vim.notify("UE project NOT changed:\n" .. tostring(persist_err)
+      .. "\nStill selected: " .. (active and active.project_root or "<unset>"), vim.log.levels.ERROR)
     return
   end
 
@@ -6642,6 +6667,7 @@ local function set_project(input)
   invalidate_status_cache()
   refresh_statusline()
 
+  record_project_selection("selected")
   local msg = "UE project set for this Neovim session:\nEngine: " .. engine_root .. "\nProject: " .. project_root
   if switched then
     msg = msg .. ("\n\nProject CHANGED (was: %s)\n  → previous project caches preserved\n  → active cache bucket: %s"):format(
@@ -9089,6 +9115,32 @@ end
 export_compile_commands = prepare_async
 CORE_RT.prepare_async = prepare_async
 
+-- Reuse existing search policy and writer ownership without entering Prepare.
+function M.build_csearch_async(opts)
+  return require("ue.csearch_build").start(opts, {
+    resolve_context = resolve_context,
+    is_running = function() return M._prepare_running or CORE_RT.csearch_build_running end,
+    build_begin = CORE_RT.csearch_build_begin,
+    build_snapshot = function()
+      return CORE_RT.csearch_build_dirty_snapshot or {}, CORE_RT.csearch_build_started_at
+    end,
+    build_done = function()
+      CORE_RT.csearch_build_dirty_snapshot = nil
+      CORE_RT.csearch_build_started_at = nil
+      CORE_RT.csearch_build_done()
+    end,
+    clear_dirty = CORE_RT.clear_persistent_dirty_safe,
+    scan = scan_relative_files_async,
+    workspace_root = workspace_root,
+    project_dirs = CORE_RT.project_index_dirs,
+    engine_dirs = UE_CONST.ENGINE_INDEX_DIRS,
+    filter_paths = function(paths) return filter_gtags_paths(filter_extensions(paths, M.FT_ALL)) end,
+    write_lines = write_lines,
+    fingerprint = CORE_RT.list_fingerprint,
+    smart_build = CORE_RT.csearch_smart_build,
+  })
+end
+
 function M.prepare_headless()
   local ok, err = xpcall(prepare, debug.traceback)
   if not ok then
@@ -9631,6 +9683,9 @@ function M.setup()
       end,
     })
   end, { bang = true, desc = "UE prepare (bang = force full clean rebuild)" })
+  vim.api.nvim_create_user_command("UEBuildCsearch", function()
+    M.build_csearch_async()
+  end, { desc = "Rescan and fully rebuild csearch only (no UBT, CDB or GTAGS)" })
   vim.api.nvim_create_user_command("UEPrepareIncremental", function()
     -- Apply the watcher's accumulated dirty file set as a cindex INCREMENTAL
     -- add (no -reset). Fast (proportional to dirty count, not workspace size)

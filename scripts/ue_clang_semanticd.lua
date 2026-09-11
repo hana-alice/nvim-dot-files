@@ -21,6 +21,7 @@ end
 
 local decoder = protocol.new_decoder({
   on_frame = function(frame)
+    if not running then return end
     local ok, response = pcall(function()
       return sidecar:handle_request(frame)
     end)
@@ -42,11 +43,31 @@ local decoder = protocol.new_decoder({
   end,
 })
 
-while running do
-  local line = io.read("*l")
-  if line == nil then break end
-  decoder:push(line .. "\n")
+-- Read a bounded libuv chunk, stop reading while it is decoded/processed, then
+-- resume. Standard io.read(n) can wait for n bytes and deadlock an interactive
+-- client; read('*l') can allocate an unbounded line before the decoder sees it.
+local input = assert(vim.uv.new_pipe(false))
+assert(input:open(0))
+local on_read
+on_read = function(err, chunk)
+  input:read_stop()
+  vim.schedule(function()
+    if not running then return end
+    if err then
+      emit(protocol.protocol_error(nil, "stdin-read-error", tostring(err)))
+      running = false
+    elseif chunk then
+      decoder:push(chunk)
+    else
+      decoder:finish()
+      running = false
+    end
+    if running then input:read_start(on_read) end
+  end)
 end
+input:read_start(on_read)
+while running do vim.wait(1000, function() return not running end, 10) end
 
-decoder:finish()
+input:read_stop()
+input:close()
 sidecar:shutdown()

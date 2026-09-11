@@ -6,6 +6,15 @@
 
 ## Requirements
 
+### Requirement: 独立 csearch 命令可发现
+
+`ue.setup()` SHALL 注册 `UEBuildCsearch`，并由命令冻结清单守护；帮助文档 SHALL 区分它与
+`UEPrepareReindex` 的完整 prepare 流程和 `UEPrepareIncremental` 的 dirty 增量更新。
+
+#### Scenario: 注册独立构建命令
+- **WHEN** 用户启动已加载 UE 配置的 Neovim
+- **THEN** `:UEBuildCsearch` SHALL 可直接执行且可通过命令补全发现
+
 ### Requirement: Visual 替换必须消费当前选择并正确定位替换文本
 
 Visual 替换 SHALL 从当前 Visual anchor、cursor 与 selection type 捕获文本和行范围，不能依赖上一次完成选择的 marks。进入替换命令后插入点 SHALL 位于 replacement 字段。

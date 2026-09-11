@@ -92,7 +92,7 @@ t.describe("降级为 unavailable 后不得携带候选（候选=可选定位目
 
   t.it("readiness 类失败必须给出可执行的补救提示", function()
     -- 光说 "unavailable" 会让用户无从下手 —— 这正是本次故障的用户体验。
-    local path = vim.fn.stdpath("config") .. "/lua/utils/ue_goto/semantic_navigation.lua"
+    local path = vim.fn.stdpath("config") .. "/lua/utils/ue_goto/semantic_report.lua"
     local src = table.concat(vim.fn.readfile(path), "\n")
     t.assert_match(src, "local remedy", "缺少 remedy 提示表")
     for _, reason in ipairs({ "index%-provider%-not%-ready", "index%-stale%-for%-module" }) do
@@ -718,6 +718,61 @@ t.describe("头文件多候选 TU：先收敛，唯一定义直接跳转（不�
   local CLI = "lua/utils/ue_goto/semantic_client_actions.lua"
   local SIDE = "lua/utils/ue_goto/semantic_sidecar.lua"
 
+  local function with_convergence(outcome, verify)
+    local state = { window_contexts = {}, action_autocmds = {}, next_action_token = 0, active_action_token = 0 }
+    local contexts = {
+      { id = "a", context_id = "a", origin_tu = "fixture_a.cpp",
+        definition = { path = "target_a.cpp", line = 11, column = 1 } },
+      { id = "b", context_id = "b", origin_tu = "fixture_b.cpp",
+        definition = { path = "target_b.cpp", line = 22, column = 1 } },
+    }
+    local trace = { catalogs = 0, choices = 0, query_sizes = {} }
+    local snapshot
+    local client = {
+      request = function(op, fields, callback)
+        if op == "catalog" then
+          trace.catalogs = trace.catalogs + 1
+          callback({ state = "resolved", contexts = contexts })
+          return
+        end
+        t.assert_eq(op, "query")
+        trace.query_sizes[#trace.query_sizes + 1] = #fields.contexts
+        if #fields.contexts == 2 and outcome ~= "resolved" then
+          callback({ state = outcome, reason = "index-not-ready", contexts = contexts })
+        else
+          if #fields.contexts == 1 then t.assert_eq(fields.contexts[1].id, "b") end
+          callback({ state = "resolved", usr = "usr-b", context_id = "b", contexts = contexts,
+            definition = contexts[2].definition, document_version = snapshot.document_version })
+        end
+      end,
+    }
+    local actions = require("utils.ue_goto.semantic_client_actions").install(client, {
+      state = state, hash_text = vim.fn.sha256, emit_trace = function() end,
+    })
+    local old_select = vim.ui.select
+    local ok, err = xpcall(function()
+      vim.ui.select = function(items, options, callback)
+        trace.choices = trace.choices + 1
+        trace.prompt = options.prompt
+        trace.labels = { options.format_item(items[1]), options.format_item(items[2]) }
+        callback(items[2])
+      end
+      snapshot = client.begin_action(0)
+      local spec = {
+        snapshot = snapshot, path = "fixture.h", line = 1, column = 1,
+        environment = { build_fingerprint = "build", evidence_roots = { "fixture" } },
+        choose_context = require("utils.ue_goto.ui").choose_context,
+      }
+      local response
+      client.resolve_header(spec, function(value) response = value end)
+      verify(client, response, trace, snapshot, state, spec)
+    end, debug.traceback)
+    vim.ui.select = old_select
+    client.cancel_action()
+    actions.reset()
+    if not ok then error(err) end
+  end
+
   t.it("sidecar 具备收敛能力（多 context + identity 分组 + 唯一 definition 判定）", function()
     local s = read(SIDE)
     t.assert_match(s, "request%.contexts", "handle_query 必须接受复数 contexts")
@@ -742,17 +797,13 @@ t.describe("头文件多候选 TU：先收敛，唯一定义直接跳转（不�
       "单 context 查询应委派给同一实现，避免两套逻辑漂移")
   end)
 
-  t.it("求值得到 resolved → 直接跳转，不呈现任何选择", function()
-    local c = read(CLI)
-    local body = c:match("query_contexts%(spec, contexts, function%(response%)(.-)\n          end%)")
-    t.assert_type(body, "string", "未找到收敛回调体")
-    local resolved_at = body:find('response%.state == "resolved"')
-    local select_at = body:find("vim%.ui%.select")
-    t.assert_type(resolved_at, "number", "必须处理 resolved")
-    if select_at then
-      t.assert_true(resolved_at < select_at,
-        "resolved 必须在任何选择框之前返回（唯一定义不得再问用户）")
-    end
+  t.it("求值得到 resolved → 交付唯一定义，不呈现任何选择", function()
+    with_convergence("resolved", function(_, response, trace)
+      t.assert_eq(response.state, "resolved")
+      t.assert_eq(response.definition.path, "target_b.cpp")
+      t.assert_eq(trace.query_sizes[1], 2)
+      t.assert_eq(trace.choices, 0)
+    end)
   end)
 
   t.it("旧的无条件 TU 选择框已移除", function()
@@ -761,19 +812,26 @@ t.describe("头文件多候选 TU：先收敛，唯一定义直接跳转（不�
   end)
 
   t.it("仅在求值后确有分歧时才提示，且展示目标而非仅 TU 名", function()
-    local c = read(CLI)
-    t.assert_match(c, "Multiple proven contexts resolve differently",
-      "提示语必须表达'真的解析不同'")
-    t.assert_match(c, "#response%.contexts > 1",
-      "必须以求值后的 context 数量为门槛")
-    t.assert_match(c, "def%.line", "选项必须展示目标位置，TU 名对用户不可判断")
+    with_convergence("ambiguous-context", function(_, response, trace)
+      t.assert_eq(trace.choices, 1)
+      t.assert_eq(trace.prompt, "Multiple proven contexts resolve differently")
+      t.assert_match(trace.labels[1], "target_a%.cpp:11")
+      t.assert_match(trace.labels[2], "target_b%.cpp:22")
+      t.assert_eq(trace.query_sizes[1], 2)
+      t.assert_eq(trace.query_sizes[2], 1)
+      t.assert_eq(response.definition.path, "target_b.cpp")
+      t.assert_eq(response.origin_context.origin_tu, "fixture_b.cpp")
+    end)
   end)
 
   t.it("无法收敛且未证明分歧 → 诚实失败，不给候选列表（P12）", function()
-    local c = read(CLI)
-    local body = c:match("query_contexts%(spec, contexts, function%(response%)(.-)\n          end%)")
-    t.assert_match(body, "finish%(response or catalog%)",
-      "既不能收敛也无真分歧时必须返回终态，而非 TU 列表")
+    with_convergence("unavailable", function(_, response, trace)
+      t.assert_eq(response.state, "unavailable")
+      t.assert_eq(response.reason, "index-not-ready")
+      t.assert_eq(trace.choices, 0)
+      t.assert_eq(#trace.query_sizes, 1)
+      t.assert_nil(response.origin_context)
+    end)
   end)
 
   t.it("收敛 MUST NOT 依据文件名/路径/顺序启发式（P11/P12）", function()
@@ -783,11 +841,19 @@ t.describe("头文件多候选 TU：先收敛，唯一定义直接跳转（不�
     end
   end)
 
-  t.it("收敛成功后记住 origin，后续导航跳过 catalog", function()
-    local c = read(CLI)
-    local body = c:match("query_contexts%(spec, contexts, function%(response%)(.-)\n          end%)")
-    t.assert_match(body, "client%.note_origin",
-      "收敛结果应写入 window origin，避免重复付出 catalog 代价")
+  t.it("收敛返回 origin 证据，提交后后续导航才跳过 catalog", function()
+    with_convergence("resolved", function(client, response, trace, snapshot, state, spec)
+      t.assert_eq(response.origin_context.origin_tu, "fixture_b.cpp")
+      t.assert_eq(response.origin_context.source_action_token, snapshot.token)
+      t.assert_eq(response.origin_context.build_fingerprint, "build")
+      t.assert_nil(state.window_contexts[snapshot.winid], "解析阶段不得提前提交 lineage")
+      client.note_origin(snapshot.winid, response.origin_context, "build")
+      local following
+      client.resolve_header(spec, function(value) following = value end)
+      t.assert_eq(trace.catalogs, 1, "只有显式提交后的 lineage 才可复用")
+      t.assert_eq(trace.query_sizes[2], 1)
+      t.assert_eq(following.definition.path, "target_b.cpp")
+    end)
   end)
 
   for _, change in ipairs({ "none", "action", "generation" }) do
@@ -831,10 +897,12 @@ t.describe("头文件多候选 TU：先收敛，唯一定义直接跳转（不�
         t.assert_type(pending, "function")
         if change == "action" then client.cancel_action() end
         if change == "generation" then current_generation = "after" end
-        pending({ state = "resolved", contexts = contexts, document_version = snapshot.document_version })
+        pending({ state = "resolved", usr = "fixture-usr", context_id = "b", contexts = contexts,
+          definition = { path = "body.cpp", line = 4, column = 1 }, document_version = snapshot.document_version })
         if change == "none" then
           t.assert_eq(response.state, "resolved")
-          t.assert_type(state.window_contexts[snapshot.winid], "table")
+          t.assert_eq(response.origin_context.origin_tu, "fixture_b.cpp")
+          t.assert_nil(state.window_contexts[snapshot.winid], "收敛交付前不得写入 lineage")
         else
           t.assert_nil(response, "过期收敛结果不得交付")
           t.assert_eq(reason, change == "action" and "superseded" or "index-generation-changed")

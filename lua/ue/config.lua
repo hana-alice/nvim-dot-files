@@ -47,6 +47,11 @@ local function defaults()
     context = {
       ttl_s = 30,
     },
+    android = {
+      -- Project-specific SDK names/flags belong to machine-local policy, never
+      -- to this public configuration. Missing policy leaves Target defaults.
+      sdk_policy_file = function() return vim.fn.stdpath("state") .. "/ue-android-sdk-policy.json" end,
+    },
     paths = {
       -- Lazy-evaluated so callers always see the current `stdpath` result
       -- (XDG vars / nvim startup quirks make eager eval unsafe).

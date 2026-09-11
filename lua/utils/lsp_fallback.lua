@@ -11,17 +11,10 @@ local M = {}
 
 local symbol_mod   = require("utils.ue_goto.symbol")
 local location_mod = require("utils.ue_goto.location")
-local provider     = require("utils.ue_goto.provider")
 local ui           = require("utils.ue_goto.ui")
 local jumper       = require("utils.ue_goto.jumper")
-local cache        = require("utils.ue_goto.cache")
-local csearch_fb   = require("utils.ue_goto.csearch_fallback")
 local semantic     = require("utils.ue_goto.semantic_client")
 local semantic_nav = require("utils.ue_goto.semantic_navigation")
-
-local LSP_PROGRESS_NOTICE_MS = 600
-local OVERALL_TIMEOUT_MS     = 30000
-local CSEARCH_TIMEOUT_MS     = 4000
 
 local MODULE_REVISION = "contextual-clang-v2"
 local TRACE_MAX = 200
@@ -97,6 +90,8 @@ function M.self_test()
 end
 
 local function reload_ue_def()
+  if semantic.dispose then semantic.dispose() end
+  if M._dispose_compat then M._dispose_compat() end
   local dropped = {}
   for k in pairs(package.loaded) do
     if k:match("^utils%.ue_goto") or k == "utils.lsp_fallback" then
@@ -138,7 +133,7 @@ vim.api.nvim_create_user_command("UEDefDiag", function()
     tostring(at_def), tostring(dk), tostring(dn)))
   print(string.format("dependent: %s (root=%s chain=%s)",
     tostring(dep), tostring(droot), tostring(dchain)))
-  local ok, st = pcall(cache.stats, 0)
+  local ok, st = pcall(require("utils.ue_goto.cache").stats, 0)
   if ok and st then
     print(string.format("cache:  entries=%d project=%s",
       st.entries or 0, tostring(st.project)))
@@ -155,6 +150,7 @@ vim.api.nvim_create_user_command("UEDefDiag", function()
 end, { desc = "Diagnose stuck gd: cursor context + last 40 trace lines" })
 
 vim.api.nvim_create_user_command("UEDefCacheClear", function()
+  local cache = require("utils.ue_goto.cache")
   if cache.clear then
     local ok, msg = pcall(cache.clear, 0)
     if ok then
@@ -224,207 +220,38 @@ local navigation = semantic_nav.install(M, {
 
 vim.api.nvim_create_user_command("UEDefExplain", function() M.explain() end, {})
 
-local request_token = 0
+local compat
+function M._dispose_compat() if compat then compat.dispose() end end
+local function compatibility()
+  if not compat then
+    compat = require("utils.ue_goto.compat_navigation").install({
+      dtrace = dtrace, jump_to_location = jump_to_location, format_jump_msg = format_jump_msg,
+    })
+  end
+  return compat
+end
 
 function M.definition()
-  local sym      = symbol_mod.current_symbol()
-  local receiver = symbol_mod.current_receiver()
-  local bufnr    = vim.api.nvim_get_current_buf()
-  local ref_file = location_mod.normalize_path(vim.api.nvim_buf_get_name(bufnr))
-  local ref_line = vim.api.nvim_win_get_cursor(0)[1]
-  dtrace("M.definition() sym=%q recv=%q file=%s:%d",
-    sym or "", receiver or "",
-    vim.fn.fnamemodify(ref_file, ":t"), ref_line)
-
+  local bufnr = vim.api.nvim_get_current_buf()
+  local sym = symbol_mod.current_symbol()
+  local path = location_mod.normalize_path(vim.api.nvim_buf_get_name(bufnr))
   local ext = ui.buf_extension(bufnr)
+  dtrace("M.definition() sym=%q file=%s:%d", sym or "", vim.fn.fnamemodify(path, ":t"),
+    vim.api.nvim_win_get_cursor(0)[1])
   if navigation.CPP_SOURCE_EXTS[ext] or navigation.CPP_HEADER_EXTS[ext] then
-    navigation.cpp_definition(sym, bufnr, ref_file, ext)
+    if compat then compat.dispose() end
+    navigation.cpp_definition(sym, bufnr, path, ext)
     return
   end
-
-  local at_def, def_kind, def_name = symbol_mod.is_at_definition_at_cursor()
-  if at_def then
-    vim.notify(string.format("● already at %s definition of `%s`",
-      def_kind or "?", def_name or sym or "?"),
-      vim.log.levels.INFO, { title = "LSP definition", timeout = 3000 })
-    return
-  end
-
-  local dep, dep_root, dep_chain = symbol_mod.is_dependent_at_cursor()
-  if dep then
-    vim.notify(string.format(
-      "⊘ %s — dependent name (rooted at template param `%s`); not resolvable without instantiation.",
-      dep_chain or sym or "?", dep_root or "?"),
-      vim.log.levels.INFO, { title = "LSP definition", timeout = 4000 })
-    return
-  end
-
-  local in_dead, dead_kind = symbol_mod.is_in_unresolvable_context_at_cursor()
-  if in_dead then
-    dtrace("dead-zone bail: kind=%s", tostring(dead_kind))
-    vim.notify(string.format("⊘ cursor is inside %s — no definition lookup",
-      dead_kind or "literal"),
-      vim.log.levels.INFO, { title = "LSP definition", timeout = 2000 })
-    return
-  end
-
-  if not sym or sym == "" then
-    vim.notify("No symbol under cursor", vim.log.levels.WARN)
-    return
-  end
-
-  if M._active_notice then pcall(M._active_notice.clear); M._active_notice = nil end
-
-  request_token = request_token + 1
-  local my_token = request_token
-  local function still_current() return my_token == request_token end
-
-  local jumped = false
-  local resolved = false
-  local notice = nil
-
-  local function clear_notice()
-    if notice then pcall(notice.clear); notice = nil end
-    if M._active_notice then M._active_notice = nil end
-  end
-
-  local function done(success_msg, lifetime_ms)
-    resolved = true
-    clear_notice()
-    if success_msg then
-      pcall(vim.notify, success_msg, vim.log.levels.INFO,
-        { title = "LSP definition", timeout = lifetime_ms or 3000 })
-    end
-  end
-
-  local ch_locs, ch_key, ch_source = cache.get(sym, receiver, bufnr)
-  if ch_locs and #ch_locs > 0 then
-    dtrace("cache HIT key=%q source=%s n=%d",
-      tostring(ch_key), tostring(ch_source), #ch_locs)
-    ch_locs[1]._origin_cword = sym
-    ch_locs[1]._sym_name     = sym
-    if jump_to_location(ch_locs[1]) then
-      jumped = true
-      done(format_jump_msg(sym, ch_locs[1],
-        string.format("cache·%s", ch_source or "?"), #ch_locs), 2000)
-      return
-    end
-    dtrace("cache: jump failed; proceeding to live resolve")
-  end
-
-  if ui.NON_CLANGD_EXTS[ext] then
-    dtrace("non-clangd ext=%s -> GTAGS direct", tostring(ext))
-    provider.gtags_fallback_async(sym, function(ok)
-      if not still_current() then return end
-      done()
-      if not ok then
-        vim.notify("No definition (GTAGS empty): " .. (sym or "?"), vim.log.levels.INFO)
-      end
-    end)
-    return
-  end
-
-  local has_def_client = #vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/definition" }) > 0
-
-  vim.defer_fn(function()
-    if not still_current() or resolved or jumped then return end
-    notice = ui.progress_notice(string.format("⏳ resolving %s ...", sym or "?"))
-    M._active_notice = notice
-  end, LSP_PROGRESS_NOTICE_MS)
-
-  vim.defer_fn(function()
-    if not still_current() or resolved then return end
-    done()
-    if not jumped then
-      vim.notify(string.format("Definition lookup timed out after %ds (%s)",
-        math.floor(OVERALL_TIMEOUT_MS / 1000), sym or "?"), vim.log.levels.WARN)
-    end
-  end, OVERALL_TIMEOUT_MS)
-
-  local function csearch_then_gtags()
-    if jumped or resolved then return end
-    dtrace("path-B: csearch dispatch sym=%q recv=%q", sym, tostring(receiver))
-    csearch_fb.find(sym, {
-      bufnr = bufnr,
-      receiver = receiver,
-      timeout_ms = CSEARCH_TIMEOUT_MS,
-    }, function(locs, info)
-      if not still_current() or resolved then clear_notice(); return end
-      dtrace("path-B: csearch back n=%d took=%dms reason=%s indexed=%s",
-        info.count or 0, info.took_ms or -1,
-        tostring(info.reason), tostring(info.indexed))
-
-      if locs and #locs > 0 then
-        locs[1]._origin_cword = sym
-        locs[1]._sym_name     = sym
-        if jump_to_location(locs[1]) then
-          jumped = true
-          cache.put(sym, receiver, locs, "csearch", bufnr)
-          done(format_jump_msg(sym, locs[1], "csearch", #locs), 3000)
-          return
-        end
-        dtrace("path-B: csearch jump failed; falling through to GTAGS")
-      end
-
-      provider.gtags_fallback_async(sym, function(g_jumped)
-        if not still_current() or resolved then clear_notice(); return end
-        if g_jumped then
-          jumped = true
-          done(string.format("✓ %s (GTAGS fallback)", sym or "?"), 3000)
-        else
-          done()
-          vim.notify(string.format(
-            "No definition (clangd/csearch/GTAGS all empty): %s", sym or "?"),
-            vim.log.levels.INFO)
-        end
-      end)
-    end)
-  end
-
-  if not has_def_client then
-    dtrace("no LSP def-client -> path-B directly")
-    csearch_then_gtags()
-    return
-  end
-
-  dtrace("path-A: dispatching textDocument/definition")
-  provider.async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_current, function(locs)
-    if not still_current() then clear_notice(); return end
-    dtrace("path-A: back n=%d", locs and #locs or 0)
-
-    if not locs or #locs == 0 then
-      csearch_then_gtags()
-      return
-    end
-
-    if #locs == 1 then
-      locs[1]._origin_cword = sym
-      locs[1]._sym_name     = sym
-      if jump_to_location(locs[1]) then
-        jumped = true
-        cache.put(sym, receiver, locs, "lsp", bufnr)
-        done(format_jump_msg(sym, locs[1], "precise"), 3000)
-        return
-      end
-      csearch_then_gtags()
-      return
-    end
-
-    local outcome = ui.try_jump(locs, "LSP definitions")
-    if outcome == true or outcome == "open_failed" then
-      jumped = true
-      done(format_jump_msg(sym, locs[1], "precise·picker", #locs), 3000)
-    else
-      done()
-    end
-  end)
+  semantic.cancel_action()
+  compatibility().definition(sym, symbol_mod.current_receiver(), bufnr, path, vim.api.nvim_win_get_cursor(0)[1], ext)
 end
 
 function M.status()
   local bufnr = vim.api.nvim_get_current_buf()
   local lines = {
     string.format("buffer: %d  name: %s", bufnr, vim.api.nvim_buf_get_name(bufnr)),
-    string.format("request_token: %d", request_token),
+    string.format("request_token: %d", compat and compat.request_token() or 0),
     string.format("module_rev: %s", MODULE_REVISION),
     "",
     "LSP clients (definition method):",
@@ -438,7 +265,7 @@ function M.status()
         c.name, c.id, c.offset_encoding or "?"))
     end
   end
-  local ok, st = pcall(cache.stats, bufnr)
+  local ok, st = pcall(require("utils.ue_goto.cache").stats, bufnr)
   if ok and st then
     table.insert(lines, "")
     table.insert(lines, string.format(
@@ -455,48 +282,8 @@ function M.status()
   vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO, { title = "LSP fallback status" })
 end
 
--- References: fully async.
---
--- WHY (measured 2026-08-25): the previous implementation blocked the main loop
--- twice on a single `gr`:
---   1. provider.sync_locations -> client:request_sync(..., 5000) — up to FIVE
---      SECONDS of frozen editor while clangd answers (or doesn't).
---   2. ue.gtags_references -> vim.system(...):wait() — the bare spawn floor on
---      this Windows host is 87ms p50, with `global -r` at 82ms p50 / 293ms max.
--- Both violate P6 (never block the UI) and C4-2 (async over blocking). Async
--- twins already existed for the heavy lifting; references was the last everyday
--- keystroke still on the blocking path.
---
--- Behaviour is preserved: same quickfix titles, same GTAGS fallback ordering,
--- same "nothing found" message. Only the waiting is no longer synchronous.
 function M.references()
-  local sym = symbol_mod.current_symbol()
-  if not sym then
-    vim.notify("No symbol under cursor", vim.log.levels.WARN)
-    return
-  end
-
-  local function gtags_fallback()
-    local ok, ue = pcall(require, "ue")
-    if ok and ue.gtags_references_async then
-      ue.gtags_references_async(sym, function(jumped)
-        if not jumped then
-          vim.notify("No references (LSP/GTAGS)", vim.log.levels.INFO)
-        end
-      end)
-      return
-    end
-    vim.notify("No references (LSP/GTAGS)", vim.log.levels.INFO)
-  end
-
-  local bufnr = vim.api.nvim_get_current_buf()
-  provider.async_lsp_request(bufnr, "textDocument/references", function(locations)
-    if locations and #locations > 0
-      and location_mod.populate_quickfix("LSP references: " .. sym, locations) then
-      return
-    end
-    gtags_fallback()
-  end)
+  return compatibility().references()
 end
 
 return M

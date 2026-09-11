@@ -120,6 +120,7 @@ unsigned clang_visitChildren(CXCursor parent, void *visitor, void *client_data);
 
 unsigned clang_getNumDiagnostics(CXTranslationUnit Unit);
 CXDiagnostic clang_getDiagnostic(CXTranslationUnit Unit, unsigned Index);
+unsigned clang_getDiagnosticSeverity(CXDiagnostic Diagnostic);
 void clang_disposeDiagnostic(CXDiagnostic Diagnostic);
 
 typedef struct {
@@ -172,6 +173,12 @@ int ue_clang_cursor_shim_lookup_definitions(
 
 function M.normalize(path)
   return vim.fs.normalize(tostring(path or ""))
+end
+
+function M.absolute_path(path, cwd)
+  path = M.normalize(path)
+  if path == "" or path:match("^/") or path:match("^%a:/") then return path end
+  return M.normalize(vim.fs.joinpath(cwd or uv.cwd(), path))
 end
 
 function M.now_ms()
@@ -229,10 +236,11 @@ end
 
 -- Compiler-authored dependency paths, including the main file. Kept only in
 -- the sidecar: warm validation must not scan the project or block the editor.
-function M.tu_file_signatures(lib, tu, origin)
-  local signatures = { [M.normalize(origin)] = M.file_signature(origin) or false }
+function M.tu_file_signatures(lib, tu, origin, cwd)
+  origin = M.absolute_path(origin, cwd)
+  local signatures = { [origin] = M.file_signature(origin) or false }
   local visitor = ffi.cast("CXInclusionVisitor", function(file)
-    local path = M.normalize(M.cxstring_to_string(lib, lib.clang_getFileName(file)))
+    local path = M.absolute_path(M.cxstring_to_string(lib, lib.clang_getFileName(file)), cwd)
     if path ~= "" then signatures[path] = M.file_signature(path) or false end
   end)
   local ok, err = pcall(lib.clang_getInclusions, tu, visitor, nil)
@@ -468,7 +476,7 @@ function M.map_parse_error(code)
   return names[tonumber(code)] or ("parse-error-" .. tostring(code))
 end
 
-function M.location_from_cursor(lib, cursor)
+function M.location_from_cursor(lib, cursor, cwd)
   local loc = lib.clang_getCursorLocation(cursor)
   local file_ptr = ffi.new("CXFile[1]")
   local line_ptr = ffi.new("unsigned[1]")
@@ -481,7 +489,7 @@ function M.location_from_cursor(lib, cursor)
   local path = M.cxstring_to_string(lib, lib.clang_getFileName(file_ptr[0]))
   if path == "" then return nil end
   return {
-    path = M.normalize(path),
+    path = M.absolute_path(path, cwd),
     line = tonumber(line_ptr[0]),
     column = tonumber(column_ptr[0]),
     offset = tonumber(offset_ptr[0]),
@@ -498,6 +506,17 @@ function M.collect_diagnostics(lib, tu)
     lib.clang_disposeDiagnostic(diag)
   end
   return out
+end
+
+function M.has_error_diagnostics(lib, tu)
+  local n = tonumber(lib.clang_getNumDiagnostics(tu))
+  for i = 0, n - 1 do
+    local diag = lib.clang_getDiagnostic(tu, i)
+    local severity = tonumber(lib.clang_getDiagnosticSeverity(diag))
+    lib.clang_disposeDiagnostic(diag)
+    if severity >= 3 then return true end
+  end
+  return false
 end
 
 local cursor_shim_cache = {}

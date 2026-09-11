@@ -3,7 +3,7 @@
 ## Purpose
 
 定义 UE 工作区代码搜索的完整性、性能与缓存一致性合同：`<leader>/` 使用 csearch
-索引，watcher 仅维护有界 dirty overlay，prepare 家族独占索引写入，并通过内容指纹、
+索引，watcher 仅维护有界 dirty overlay，显式构建命令独占索引写入，并通过内容指纹、
 增量快照和事件降噪确保平台切换、批量文件变化及 Windows 元数据通知不会产生静默漏搜、
 并发损坏或持续卡顿。
 
@@ -114,12 +114,32 @@ to the newly selected bucket; it MUST NOT delete another project's reusable on-d
 - **THEN** 迁移 SHALL NOT 用平台子目录的旧索引覆盖它
 - **AND** 操作 SHALL 可重复安全运行
 
+### Requirement: 独立全量构建 csearch
+
+`:UEBuildCsearch` SHALL 异步重新枚举当前工作区的搜索文件清单，并强制以 reset 模式构建
+csearch 索引。它 MUST NOT 调用 prepare 流程、UBT、CDB 生成、GTAGS 构建或 clangd 重启。
+它 SHALL 复用既有 csearch writer lease、原子发布及成功后的快照与 dirty 处置机制。
+
+#### Scenario: 同步后新增或删除文件
+- **WHEN** 用户执行 `:UEBuildCsearch`，已有文件清单与索引均存在
+- **THEN** 系统 SHALL 重新扫描，而非沿用旧清单或因缓存命中跳过构建
+- **AND** reset 输入 SHALL 包含当前扫描范围内的新增文件，并排除已删除文件
+
+#### Scenario: 其他准备工具链不可用
+- **WHEN** 工作区可解析且扫描和 cindex 工具可用，但 UBT、CDB 或 GTAGS 不可用
+- **THEN** 独立 csearch 构建 SHALL 不依赖这些准备阶段
+
+#### Scenario: 独立构建失败或重复启动
+- **WHEN** 扫描或构建失败，或已有 csearch writer 占用索引
+- **THEN** 命令 SHALL 给出可见失败或忙碌提示，保留既有正式索引与未覆盖的 dirty 记录
+- **AND** 本次取得的构建锁 SHALL 在结束时释放，重复启动 SHALL 不排队
+
 ### Requirement: csearch.idx 同时只有一个写者
 
 系统 SHALL 保证 `csearch.idx` 在任意时刻只有一个写者。watcher（`lua/utils/ue_watch.lua`）
 在 csearch 维度 SHALL 只更新 `persistent_dirty` 记账，MUST NOT 写 csearch 索引。csearch
-索引的写入 SHALL 只由用户显式触发的 prepare 家族命令（`:UEPrepare` / `:UEPrepareReindex` /
-`:UEPrepareIncremental`）执行。
+索引的写入 SHALL 只由用户显式触发的构建命令（`:UEPrepare` / `:UEPrepareReindex` /
+`:UEPrepareIncremental` / `:UEBuildCsearch`）执行。
 
 理由：cindex 的原子写协议把 staged 文件硬编码为 `<idx>~`，两个并发构建会抢同一个 `idx~`，
 在 merge/rename 阶段相互破坏，导致 `corrupt index: remove` 与 0 字节索引死循环。

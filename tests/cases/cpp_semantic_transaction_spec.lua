@@ -128,7 +128,11 @@ t.describe("cpp semantic transaction", function()
       transaction.terminal("unavailable", "provider", "identity-missing"),
       function(result) delivered[#delivered + 1] = result end)
     local second = transaction.finish_once(tx,
-      transaction.terminal("resolved", "jump", "unknown"),
+      transaction.terminal("resolved", "jump", "definition-resolved", {
+        identity = "usr:fixture", provider = "clangd", destination_role = "definition",
+        location = { uri = "file:///fixture.cpp", range = { start = { line = 0, character = 0 } } },
+        metrics = { source = "clangd" },
+      }),
       function(result) delivered[#delivered + 1] = result end)
 
     t.assert_true(first)

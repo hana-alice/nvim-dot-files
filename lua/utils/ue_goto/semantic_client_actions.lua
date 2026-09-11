@@ -11,10 +11,8 @@ local TERMINAL = {
 function M.install(client, deps)
   local state = deps.state
   local hash_text = deps.hash_text
-  local close_timer = deps.close_timer
   local emit_trace = deps.emit_trace
   local unavailable = deps.unavailable
-  local PROGRESS_DELAY_MS = deps.PROGRESS_DELAY_MS
 
   function client.clear_contexts(build_fingerprint)
     for winid, context in pairs(state.window_contexts) do
@@ -65,10 +63,24 @@ function M.install(client, deps)
     state.action_autocmds = {}
     state.next_action_token = state.next_action_token + 1
     state.active_action_token = state.next_action_token
-    if state.active_notice then
-      pcall(state.active_notice.clear)
-      state.active_notice = nil
+    if type(client.cancel_queued_actions) == "function" then client.cancel_queued_actions() end
+    local cleanups = state.action_cleanups or {}
+    state.action_cleanups = {}
+    for _, cleanup in pairs(cleanups) do pcall(cleanup) end
+  end
+
+  function client.add_action_cleanup(snapshot, cleanup)
+    if snapshot and snapshot.token == state.active_action_token then
+      state.action_cleanups = state.action_cleanups or {}
+      local registration = {}
+      state.action_cleanups[registration] = cleanup
+      return function() state.action_cleanups[registration] = nil end
     end
+    return nil
+  end
+
+  function client.set_action_cleanup(snapshot, cleanup)
+    return client.add_action_cleanup(snapshot, cleanup) ~= nil
   end
 
   function client.snapshot_is_current(snapshot, response)
@@ -86,6 +98,17 @@ function M.install(client, deps)
     if response and response.document_version ~= nil
         and response.document_version ~= snapshot.document_version then
       return false, "response-version-mismatch"
+    end
+    if snapshot.overlay_environment and not vim.deep_equal(snapshot.overlay_versions,
+        client.overlay_versions(snapshot.overlay_environment)) then
+      return false, "overlays-changed"
+    end
+    for _, version in ipairs(snapshot.dependency_versions or {}) do
+      if not vim.api.nvim_buf_is_valid(version.bufnr)
+          or vim.api.nvim_buf_get_changedtick(version.bufnr) ~= version.version
+          or vim.fs.normalize(vim.api.nvim_buf_get_name(version.bufnr)) ~= version.path then
+        return false, "overlays-changed"
+      end
     end
     return true
   end
@@ -107,24 +130,50 @@ function M.install(client, deps)
     return path == root or path:sub(1, #root + 1) == root .. "/"
   end
 
-  function client.collect_unsaved_overlays(environment)
-    local overlays = {}
+  function client.overlay_versions(environment, include_unmodified)
+    local versions = {}
     for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
       if vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_is_loaded(bufnr)
-          and vim.bo[bufnr].modified and is_cpp_buffer(bufnr) then
+          and (include_unmodified or vim.bo[bufnr].modified) and is_cpp_buffer(bufnr) then
         local path = vim.api.nvim_buf_get_name(bufnr)
         if path ~= "" and (under(path, environment.engine_root)
             or under(path, environment.project_root)) then
-          overlays[#overlays + 1] = {
+          versions[#versions + 1] = {
+            bufnr = bufnr,
             path = vim.fs.normalize(path),
-            contents = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n") .. "\n",
             version = vim.api.nvim_buf_get_changedtick(bufnr),
           }
         end
       end
     end
-    table.sort(overlays, function(a, b) return a.path:lower() < b.path:lower() end)
+    table.sort(versions, function(a, b) return a.path:lower() < b.path:lower() end)
+    return versions
+  end
+
+  function client.collect_unsaved_overlays(environment)
+    local overlays = {}
+    for _, version in ipairs(client.overlay_versions(environment)) do
+      overlays[#overlays + 1] = {
+        path = version.path,
+        version = version.version,
+        contents = table.concat(vim.api.nvim_buf_get_lines(version.bufnr, 0, -1, false), "\n") .. "\n",
+      }
+    end
     return overlays
+  end
+
+  function client.capture_overlays(snapshot, environment)
+    if not snapshot then return client.collect_unsaved_overlays(environment) end
+    if not snapshot.overlays then
+      snapshot.overlay_environment = {
+        engine_root = environment.engine_root,
+        project_root = environment.project_root,
+      }
+      snapshot.overlay_versions = client.overlay_versions(snapshot.overlay_environment)
+      snapshot.dependency_versions = client.overlay_versions(snapshot.overlay_environment, true)
+      snapshot.overlays = client.collect_unsaved_overlays(snapshot.overlay_environment)
+    end
+    return snapshot.overlays
   end
 
   function client.note_origin(winid, origin_tu, build_fingerprint, context_id)
@@ -166,45 +215,7 @@ function M.install(client, deps)
         return nil
       end
     end
-    return origin
-  end
-
-  local function finish_progress(timer, token)
-    close_timer(timer)
-    if token == state.active_action_token and state.active_notice then
-      pcall(state.active_notice.clear)
-      state.active_notice = nil
-    end
-  end
-
-  local function diagnostic_summary(response)
-    local diagnostics = response and response.diagnostics
-    if type(diagnostics) ~= "table" and response and type(response.contexts) == "table"
-        and response.contexts[1] then
-      diagnostics = response.contexts[1].diagnostics
-    end
-    if type(diagnostics) ~= "table" or #diagnostics == 0 then return "" end
-    local first = tostring(diagnostics[1]):gsub("[\r\n]+", " ")
-    if #first > 240 then first = first:sub(1, 237) .. "..." end
-    return string.format("; %d diagnostic(s): %s", #diagnostics, first)
-  end
-
-  local function terminal_message(response)
-    local state_name = response and response.state or "unavailable"
-    if state_name == "ambiguous-context" then
-      return "C++ definition needs an explicit translation-unit context"
-    elseif state_name == "invalid-semantic-context" then
-      return "C++ semantic context is invalid" .. diagnostic_summary(response)
-    end
-    return "C++ semantic definition unavailable: "
-      .. tostring(response and response.reason or "unknown reason")
-  end
-
-  local function notify_terminal(response)
-    if response and response.state == "resolved" then return end
-    vim.notify(terminal_message(response),
-      response and response.state == "unavailable" and vim.log.levels.WARN or vim.log.levels.INFO,
-      { title = "C++ definition", timeout = 6000 })
+    return origin and vim.deepcopy(origin) or nil
   end
 
   local function wire_context(context, environment)
@@ -254,8 +265,8 @@ function M.install(client, deps)
         document_version = snapshot and snapshot.document_version or nil,
       },
       contexts = wire,
-      overlays = client.collect_unsaved_overlays(environment),
-    }, callback, environment)
+      overlays = client.capture_overlays(snapshot, environment),
+    }, callback, environment, snapshot)
   end
 
   local function query(spec, context, callback)
@@ -282,197 +293,101 @@ function M.install(client, deps)
       usr = spec.usr,
       subject = spec.path,
       cdb_paths = cdb_paths,
-      overlays = client.collect_unsaved_overlays(environment),
+      overlays = client.capture_overlays(spec.snapshot, environment),
       document_version = spec.snapshot and spec.snapshot.document_version or nil,
-    }, callback, environment)
+    }, callback, environment, spec.snapshot)
   end
 
   function client.resolve_header(spec, callback)
-    spec.path = spec.path or spec.header
+    spec = vim.tbl_extend("force", spec, { path = spec.path or spec.header })
     local snapshot, environment = spec.snapshot, spec.environment
+    client.capture_overlays(snapshot, environment)
     local function snapshot_current(response)
       local current, reason = client.snapshot_is_current(snapshot, response)
       if not current then return false, reason end
       if environment.index then return client.index_snapshot_is_current(environment.index, snapshot.bufnr) end
       return true
     end
-    local timer = vim.defer_fn(function()
-      if not snapshot_current() then return end
-      local ok, ui = pcall(require, "utils.ue_goto.ui")
-      if ok then
-        state.active_notice = ui.progress_notice("⏳ resolving C++ header in translation-unit context ...")
-      end
-    end, PROGRESS_DELAY_MS)
 
-    local function finish(response)
-      finish_progress(timer, snapshot.token)
-      local current, stale_reason = snapshot_current(response)
+    local function finish(response, context)
+      local current, reason = snapshot_current(response)
       if not current then
-        emit_trace("stale", {
-          request_id = response and response.id,
-          context_id = response and response.context_id,
-          provider = "libclang",
-          terminal_state = response and response.state,
-          stale_reason = stale_reason,
-        })
-        callback(nil, stale_reason)
+        emit_trace("stale", { request_id = response and response.id, provider = "libclang", stale_reason = reason })
+        callback(nil, reason)
         return
       end
-      notify_terminal(response)
+      if response and response.state == "resolved" and context then
+        local lineage = vim.deepcopy(context)
+        lineage.build_fingerprint = environment.build_fingerprint
+        lineage.source_action_token = snapshot.token
+        lineage.subject_membership = semantic_context.context_subject_membership(context)
+        if #lineage.subject_membership == 0 then lineage.subject_membership = { spec.path } end
+        response = vim.tbl_extend("force", response, { origin_context = lineage })
+      end
       callback(response)
     end
 
-    local dispatch
-
-    local function catalog_contexts(allow_select)
+    local dispatch, catalog_contexts
+    catalog_contexts = function()
       client.request("catalog", {
-        header = spec.path,
-        cdb_dir = environment.cdb_dir,
-        active_cdb_path = environment.active_cdb_path,
-        active_manifest_path = environment.active_manifest_path,
-        project_root = environment.project_root,
-        engine_root = environment.engine_root,
-        active_build_key = environment.active_build_key,
-        active_build = environment.active_build,
+        header = spec.path, cdb_dir = environment.cdb_dir,
+        active_cdb_path = environment.active_cdb_path, active_manifest_path = environment.active_manifest_path,
+        project_root = environment.project_root, engine_root = environment.engine_root,
+        active_build_key = environment.active_build_key, active_build = environment.active_build,
         evidence_roots = environment.evidence_roots,
       }, function(catalog)
-        local current, stale_reason = snapshot_current()
-        if not current then
-          finish_progress(timer, snapshot.token)
-          emit_trace("stale", {
-            request_id = catalog.id,
-            provider = "sidecar",
-            terminal_state = catalog.state,
-            stale_reason = stale_reason,
-          })
-          callback(nil, stale_reason)
-          return
+        if not snapshot_current() then finish(catalog); return end
+        local contexts = catalog and catalog.contexts or {}
+        if not catalog or catalog.state == "unavailable" or #contexts == 0 then finish(catalog); return end
+        if #contexts == 1 then dispatch(contexts[1], false); return end
+        local function original_context(result)
+          for _, context in ipairs(contexts) do
+            if (context.id or context.context_id) == result.context_id
+                or context.origin_tu == result.origin_tu then return context end
+          end
         end
-        local contexts = catalog.contexts or {}
-        if catalog.state == "unavailable" or #contexts == 0 then
-          finish(catalog)
-        elseif #contexts == 1 or allow_select == false then
-          dispatch(contexts[1], false)
-        else
-          -- CONVERGE FIRST, ASK ONLY IF THE COMPILER GENUINELY DISAGREES.
-          --
-          -- Several candidate origin TUs is the NORMAL state for a header that is
-          -- included widely; it means "we have not decided which TU to evaluate
-          -- in", not "this position denotes different entities". Prompting here
-          -- outsourced our job to the user, and gave them TU file names as the
-          -- only basis for a choice they cannot make.
-          --
-          -- So evaluate all candidates in one round trip and let the sidecar's
-          -- existing identity grouping decide: if every context agrees on one
-          -- canonical entity and one definition, it answers `resolved` and we jump
-          -- straight there. It only returns `ambiguous-context` when the results
-          -- really differ, which is the sole case worth asking about.
-          query_contexts(spec, contexts, function(response)
-            local still_current, why = snapshot_current(response)
-            if not still_current then
-              finish_progress(timer, snapshot.token)
-              callback(nil, why)
-              return
-            end
-
-            if response and response.state == "resolved" then
-              -- Remember the proven TU so later navigations in this window skip
-              -- the catalog entirely.
-              local chosen = response.contexts and response.contexts[1] or nil
-              if chosen then
-                local lineage = vim.deepcopy(chosen)
-                lineage.build_fingerprint = environment.build_fingerprint
-                lineage.source_action_token = snapshot.token
-                lineage.subject_membership = semantic_context.context_subject_membership(chosen)
-                if #lineage.subject_membership == 0 then
-                  lineage.subject_membership = { spec.path }
-                end
-                client.note_origin(snapshot.winid, lineage, environment.build_fingerprint)
-              end
-              finish(response)
-              return
-            end
-
-            -- Genuine disagreement between proven contexts: this is the only
-            -- situation where the user has something real to decide.
-            if response and response.state == "ambiguous-context"
-                and type(response.contexts) == "table" and #response.contexts > 1 then
-              finish_progress(timer, snapshot.token)
-              vim.ui.select(response.contexts, {
-                prompt = "Multiple proven contexts resolve differently",
-                format_item = function(item)
-                  -- Show WHAT differs (the target), not just which TU: the TU name
-                  -- alone is not actionable information for the user.
-                  local tu = tostring(item.label or vim.fn.fnamemodify(item.origin_tu or "", ":t"))
-                  local def = item.definition
-                  if type(def) == "table" and def.path then
-                    return ("%s  →  %s:%s"):format(
-                      tu,
-                      vim.fn.fnamemodify(tostring(def.path), ":t"),
-                      tostring(def.line or "?"))
-                  end
-                  return tu
-                end,
-              }, function(choice)
-                if not snapshot_current() then finish(response); return end
-                if not choice then
-                  notify_terminal(response)
-                  callback(response)
-                  return
-                end
-                dispatch(choice, false)
-              end)
-              return
-            end
-
-            -- Could not converge and disagreement was not proven: fail honestly
-            -- rather than handing back a list of TUs as if it were an answer (P12).
+        query_contexts(spec, contexts, function(response)
+          if not snapshot_current(response) then finish(response); return end
+          if response and response.state == "resolved" then
+            finish(response, original_context(response))
+          elseif response and response.state == "ambiguous-context"
+              and type(response.contexts) == "table" and #response.contexts > 1
+              and type(spec.choose_context) == "function" then
+            spec.choose_context(response.contexts, function(choice)
+              if not snapshot_current() or not choice then finish(response); return end
+              dispatch(original_context(choice) or choice, false)
+            end)
+          else
             finish(response or catalog)
-          end)
-        end
-      end, environment)
+          end
+        end)
+      end, environment, snapshot)
     end
 
     dispatch = function(context, allow_recatalog)
       query(spec, context, function(response)
-        if not snapshot_current(response) then
-          finish(response)
-          return
-        end
+        if not snapshot_current(response) then finish(response); return end
         if response and response.reason == "invalid-query-file-not-in-tu" and allow_recatalog then
           state.window_contexts[snapshot.winid] = nil
-          catalog_contexts(true)
+          catalog_contexts()
           return
         end
-        if response and response.state == "resolved" then
-          local lineage = vim.deepcopy(context)
-          lineage.build_fingerprint = environment.build_fingerprint
-          lineage.source_action_token = snapshot.token
-          lineage.subject_membership = semantic_context.context_subject_membership(context)
-          if #lineage.subject_membership == 0 then
-            lineage.subject_membership = { spec.path }
-          end
-          client.note_origin(snapshot.winid, lineage, environment.build_fingerprint)
-        end
-        finish(response)
+        finish(response, context)
       end)
     end
 
     local inherited = client.window_origin(snapshot.winid, environment.build_fingerprint, spec.path)
-    if inherited and inherited.origin_tu then
-      dispatch(inherited, true)
-      return
-    end
-
+    if inherited and inherited.origin_tu then dispatch(inherited, true); return end
     if #environment.evidence_roots == 0 then
       finish(unavailable("no active build dependency roots", "catalog"))
       return
     end
-    catalog_contexts(true)
+    catalog_contexts()
   end
 
   function client.prove_source(spec, callback)
     local env = spec.environment
+    client.capture_overlays(spec.snapshot, env)
     local context_id = hash_text(vim.json.encode({ env.build_fingerprint, spec.source }))
     client.request("prove", {
       source = spec.source,
@@ -510,13 +425,15 @@ function M.install(client, deps)
         entity.origin_context = origin_context
         callback(entity)
       end)
-    end, env)
+    end, env, spec.snapshot)
   end
 
   local function reset()
     for _, id in ipairs(state.action_autocmds) do pcall(vim.api.nvim_del_autocmd, id) end
     state.window_contexts = {}
-    state.active_notice = nil
+    state.action_cleanups = {}
+    state.next_action_token = 0
+    state.active_action_token = 0
     state.action_autocmds = {}
   end
 

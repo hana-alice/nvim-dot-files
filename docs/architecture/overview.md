@@ -34,6 +34,9 @@
 
 ## 2. 数据流（data flow）
 
+- **独立搜索构建**：`:UEBuildCsearch` → `ue/csearch_build.lua` → 新文件清单 → csearch reset。
+  facade 提供现有扫描/过滤与 writer 接口；独立 owner 持有异步生命周期、输入快照与失败清理，
+  不进入 UBT、CDB、GTAGS 或 clangd 准备阶段。
 - **索引/CDB**：`:UEPrepare` → UBT `-SkipBuild` 取编译参数 → `ue/cdb/*` 生成/裁剪/inject
   compile_commands.json → cindex 建 csearch 索引 → clangd reload。UE root 的 clangd LSP 使用持久化 artifact
   gate：当前 project/target/platform/configuration 的 selection、manifest、controlled CDB 与源 CDB 签名
@@ -61,8 +64,14 @@
   精确光标取得 canonical USR，并只向同 identity client 查询唯一 definition；不再为每次 source `gd`
   让 sidecar 重读全量 CDB。header 仍在 proven origin TU 中取得 libclang exact-cursor canonical USR，
   再在同 generation controlled module AST 中查唯一 body。非 C++ 兼容路径保留
-  cache/LSP/csearch/GTAGS；详见
+  cache/LSP/csearch/GTAGS。coordinator 独占最终跳转与成功后的 lineage；报告、通用 LSP transport、
+  clangd adapter 与 compatibility policy 分离。semantic client 分离只读环境、action state、transport
+  state 与 compiler session；sidecar 由独立 TU store、catalog、definition resolver 组成。详见
   `docs/architecture-symbol-resolution.md`。
+- **探针反馈**：`utils.probe` 管观察 revision、期限、已读/处置与固定大小统计，`utils.probe_store` 管锁内
+  增量合并及原子发布。退出遇锁竞争时写本进程 recovery journal，主文件记录 replay ID 后再删 journal，
+  防止恢复重复计数。新 revision 开启有限观察窗口；同 revision 休眠后不因重启自动续期。
+  `UEProbeReport` 只标已读，`UEProbeResolve`/`UEProbeDefer` 记录带理由的处置；真实新失败会重新进入待办。
 - **Android device**：`<Space>uA` / 首次 Android 操作 → `utils.android_device` 异步执行
   `adb devices -l` → picker 展示名称 + serial → 当前进程的 `vim.g.ue_android_device_serial`；install / launch /
   logcat / 新 DAP session 捕获该值并统一形成 `adb -s <serial> ...`。

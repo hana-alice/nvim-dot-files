@@ -359,7 +359,9 @@ local function validate_and_filter(store, key, symbol)
   if not entry or not entry.locations then return nil end
   local kept = {}
   for _, loc in ipairs(entry.locations) do
-    if validate_one(loc, symbol) then
+    -- Older records discarded encoding; re-query rather than guessing whether
+    -- their columns came from byte-oriented search or a UTF-16/32 LSP client.
+    if loc._position_encoding and validate_one(loc, symbol) then
       table.insert(kept, loc)
     end
   end
@@ -434,6 +436,7 @@ function M.put(symbol, receiver, locations, source, bufnr)
     table.insert(clean, {
       uri = loc.uri or loc.targetUri,
       range = loc.range or loc.targetSelectionRange or loc.targetRange,
+      _position_encoding = loc._position_encoding or (source == "csearch" and "utf-8" or "utf-16"),
     })
   end
   -- NOTE: cannot use ipairs({primary, secondary}) — when primary is nil,

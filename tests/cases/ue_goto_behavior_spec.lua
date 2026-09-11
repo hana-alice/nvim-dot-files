@@ -5,7 +5,7 @@ local t = require("tests.harness")
 t.bootstrap()
 
 local function loc(uri, line)
-  return { uri = uri, range = { start = { line = line or 0 } } }
+  return { uri = uri, range = { start = { line = line or 0, character = 0 } } }
 end
 
 t.describe("location: dedup_locations 去重", function()
@@ -232,6 +232,7 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
       normalize_path = function(path) return path end,
       location_path = function(location) return vim.uri_to_fname(location.uri) end,
       location_line = function(location) return location.range.start.line + 1 end,
+      location_key = function(location) return location.uri .. ":" .. location.range.start.line end,
       normalize_locations = function(value) return value end,
       dedup_locations = function(value) return value end,
       filter_self_locations = function(value) return value end,
@@ -251,6 +252,7 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
               usr = usr,
               client_ids = { 17 },
               reason = "ok",
+              definitions = { loc("file:///fixture/Overloads.h", calls == 0 and 420 or 422) },
               exact_command = {
                 workingDirectory = "/fixture",
                 compilationCommand = { "clang++", "-c", "/fixture/Overloads.cpp" },
@@ -329,6 +331,7 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
       end,
       snapshot_is_current = function() return true end,
       note_origin = function(_, context)
+        t.assert_eq(#jumps, origin_notes + 1, "origin must be committed only after a successful jump")
         origin_notes = origin_notes + 1
         noted_memberships[#noted_memberships + 1] = context and context.subject_membership or nil
       end,
@@ -565,6 +568,7 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
     local definition_requests = 0
     local module_lookup_requests = 0
     local module_definition
+    local module_failure = "no-proven-module-contexts"
     local jumps = {}
     package.loaded["utils.ue_goto.symbol"] = {
       current_symbol = function() return "SubmitActiveCmdBuffer" end,
@@ -632,7 +636,7 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
           metrics = { cache_hit = false },
         } or {
           state = "unavailable",
-          reason = "definition-not-found-in-proven-module-context",
+          reason = module_failure,
         })
       end,
       resolve_header = function(_, callback)
@@ -669,6 +673,15 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
       t.assert_eq(require("utils.ue_goto.location").location_line(jumps[1]), 423)
 
       module_definition = nil
+      for _, reason in ipairs({ "lookup-definition-overflow", "lookup-context-limit-exceeded",
+        "cursor-shim-unavailable", "tu-parse-failed", "definition-not-found" }) do
+        module_failure = reason
+        gd.definition()
+        t.assert_eq(symbol_info_requests, 0, reason .. " must not fall through to clangd")
+        t.assert_eq(#jumps, 1, reason .. " must not produce a jump")
+        t.assert_eq(gd._last_cpp_transaction.result.detail, reason)
+      end
+      module_failure = "no-proven-module-contexts"
       gd.definition()
       t.assert_eq(symbol_info_requests, 1,
         "libclang 只见声明时必须向 clangd 校验当前位置的 compiler USR")

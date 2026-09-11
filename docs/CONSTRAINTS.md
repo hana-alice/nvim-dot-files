@@ -1060,6 +1060,24 @@
 
 ---
 
+### Project selection completion
+
+- **K70 — Native Tab completion can produce drive-relative paths that project validation rejects**
+  症状：Tab 补出的现存目录被 `UESetProject` 拒绝，旧项目继续用于构建。
+  约束：用宿主文件系统解析该对象的绝对路径，不盲插盘符后的斜杠；失败反馈必须明确旧项目未切换。
+  排查必须验证输入生成、校验、状态与消费者完整链路，不能仅凭最终字符串归因。
+  → `docs/project-selection-completion-postmortem.md`；
+    `openspec/specs/multi-instance-state-isolation/spec.md`；`tests/cases/ue_project_context_spec.lua`
+
+- **K71 — Runtime SDK settings do not disable compiler SDK modules without a Target argument**
+  症状：运行时配置禁用 SDK，但 Target 在无参数时默认启用 SDK；准备脚本写入的文件并非 Target 消费者。
+  约束：核对实际 Target parser 与最终 UBT argv；普通/SO 构建均将当前项目的禁用意图传为
+  外部策略指定的单个编译参数，不得只以环境设置成功作为编译产物证据。
+  公开镜像使用外部 JSON 策略承载项目私有映射；禁止在代码、测试或文档中编码、拼装或改写
+  私有标识以绕过扫描。迁移后的行为与隐私门禁必须重新验收，不能沿用迁移前的绿灯。
+  → `docs/release_1.11.2.md`；`openspec/specs/ue-target-driver-boundary/spec.md`；
+    `openspec/specs/android-so-quick-deploy/spec.md`
+
 ## 三、约束（Constraints）
 
 承重项。所有贡献都必须遵守。

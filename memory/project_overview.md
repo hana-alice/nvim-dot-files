@@ -47,11 +47,11 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 | Android SO 快速迭代 | `lua/ue/targets/android.lua` + `android_windows.lua` + `scripts/ue_android_so_*.ps1` | `lua/ue/targets/AGENTS.md` + `scripts/AGENTS.md` | `android-so-quick-deploy` | `ue_target_drivers` `ue_target_integration` | Windows-only PowerShell compatibility path；root 或已验证的 debuggable app-private transport；不支持 macOS→Android |
 | UE target drivers | `lua/ue/targets/` | `lua/ue/targets/AGENTS.md` | `ue-target-driver-boundary`、`ios-build-run-workflow`、`ios-device-debug-workflow` | `ue_target_drivers` `ue_target_integration` `ue_target_tasks` | Android/IOS/Mac/Win64/Linux 目标策略彼此隔离；`host_operations` matrix + runtime strategy 是组合真相 |
 | UE workflows | `lua/ue/workflows/` | `lua/ue/workflows/AGENTS.md` | `ue-target-workflow-boundary` | `ue_workflows` `ue_target_tasks` | target-specific 异步/UI/设备状态机的 owner |
-| goto 解析栈 | `lua/utils/ue_goto/` | `lua/utils/ue_goto/AGENTS.md` | `cpp-contextual-definition-navigation`、`cpp-semantic-highlighting` | `cpp_semantic_context` `cpp_semantic_client` `ue_goto_behavior` | proven-TU canonical USR + module AST 唯一 body；非 C++ compatibility fallback |
-| 代码搜索 | `lua/utils/code_search/` | `lua/utils/code_search/AGENTS.md` | `ue-code-search`、`project-scan-root-discovery` | `ue_goto_behavior` `ue_paths` `utils` | csearch 亚秒级 grep（兜底，非主路） |
+| goto 解析栈 | `lua/utils/ue_goto/` | `lua/utils/ue_goto/AGENTS.md` | `cpp-contextual-definition-navigation`、`cpp-semantic-highlighting` | `cpp_semantic_context` `cpp_semantic_client` `ue_goto_behavior` | coordinator/report、LSP/clangd/compat 分层；独立 client action/transport 与 native TU/catalog/definition owners，详见 `docs/architecture-symbol-resolution.md` |
+| 代码搜索 | `lua/utils/code_search/` + `lua/ue/csearch_build.lua` | `lua/utils/code_search/AGENTS.md`、`lua/ue/AGENTS.md` | `ue-code-search`、`project-scan-root-discovery` | `csearch_build_guard` `ue_goto_behavior` `ue_paths` `utils` | 显式搜索与独立 csearch 构建 |
 | 核心健康审计 | `lua/utils/core_health*.lua` + `scripts/nvim_core_health.lua` | `lua/utils/AGENTS.md` + `scripts/AGENTS.md` | `nvim-core-functionality-audit`、`codebase-health-audit` | `core_health` | 隔离、只读、可机器判定的启动/编辑/AST/搜索/clangd/CDB/target plan 证据 |
 | 平台驱动 | `lua/utils/platform/` | `lua/utils/platform/AGENTS.md` | `host-platform-driver`、`platform-tool-resolution`、`shell-command-planning` | `platform` `ue_platform_boundary` | 唯一允许做 OS 分支的地方；host 选 shell executable，shell helper 只组 argv/quote |
-| 探针反馈 | `lua/utils/probe.lua` | `lua/utils/AGENTS.md` | `probe-feedback-loop` | `probe` | 主动埋证据；会话开头先读 `:UEProbeReport` |
+| 探针反馈 | `lua/utils/probe.lua` + `probe_store.lua` | `lua/utils/AGENTS.md` | `probe-feedback-loop` | `probe` | revision 观察、已读/处置/复发、固定统计；锁内增量合并与退出 journal；会话先读 `:UEProbeReport` |
 | watcher dirty 持久化 | `lua/utils/ue_watch.lua` + `dirty_save.lua` | `lua/utils/AGENTS.md` | `ue-code-search`、`multi-instance-state-isolation` | `ue_watch_csearch` `multi_instance_state` `stability` | 事件 generation 隔离，原 owner 保存与有界 I/O 重试 |
 | 宿主资源感知/动态纪律 | `lua/utils/cpu_load.lua` + `host_admission.lua` + `clangd_resource_controller.lua` + `lua/ue/index/_admission.lua` | `lua/utils/AGENTS.md` + `lua/ue/index/AGENTS.md` | `editor-behavior-regression`、`cpp-semantic-index-coverage` | `cpu_admission` `host_resource_discipline` `clangd_resource` `index_delivery` `ue_config` `stability` | host 1Hz / Neovim 4Hz 常驻感知；batch 推迟、前台优先、owned clangd 可逆降优先级 |
 | 任务管理 | `lua/utils/task_registry.lua` | `lua/utils/AGENTS.md` | `task-management` | `task_registry` `commands` | `Tasks`/`TaskStop`/`TaskStopAll` 通用后台任务 |
@@ -75,6 +75,9 @@ Win64/Android，Linux 只执行 Linux；Mac 与 IOS target 独立，Android Powe
 pre-iOS17 使用 legacy MobileDevice/debugserver bridge，失败不跨 backend，也不 fallback 到 Mac process attach。
 
 ## 知识库各区
+
+独立搜索构建：`:UEBuildCsearch` 由 `lua/ue/csearch_build.lua` 持有流程，`ue.lua` 只转发现有扫描和
+writer 接口；治理 spec 为 `ue-code-search`，回归 `csearch_build_guard` + `commands` + `ue_api`。
 
 | 区 | 入口 | 放什么 |
 |---|---|---|

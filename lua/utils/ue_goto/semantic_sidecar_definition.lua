@@ -70,10 +70,29 @@ local function make_cursor_shim_fn_table(lib)
   return table_ptr
 end
 
-function M.install(Sidecar, deps)
-  local location_key = deps.location_key
+local DefinitionResolver = {}
+DefinitionResolver.__index = DefinitionResolver
 
-  function Sidecar:_read_controlled_cdb(cdb_path)
+do
+
+  function DefinitionResolver:_touch_lookup_cache(entry)
+    self.lookup_cache_clock = self.lookup_cache_clock + 1
+    entry.last_used = self.lookup_cache_clock
+  end
+
+  function DefinitionResolver:_prune_lookup_cache()
+    while vim.tbl_count(self.lookup_cache) > self.max_lookup_entries do
+      local oldest_key, oldest
+      for key, entry in pairs(self.lookup_cache) do
+        if not oldest or entry.last_used < oldest then
+          oldest_key, oldest = key, entry.last_used
+        end
+      end
+      self.lookup_cache[oldest_key] = nil
+    end
+  end
+
+  function DefinitionResolver:_read_controlled_cdb(cdb_path)
     cdb_path = libclang.normalize(cdb_path)
     local signature = libclang.file_signature(cdb_path)
     if not signature then
@@ -89,9 +108,14 @@ function M.install(Sidecar, deps)
       return nil, { reason = "lookup-cdb-invalid-json", cdb_path = cdb_path }
     end
 
+    local database, database_err = semantic_context.load_compilation_database(decoded)
+    if not database then
+      return nil, { reason = "lookup-cdb-invalid", detail = database_err }
+    end
+    local coverage = { complete = database.complete, total = #decoded, rejected = vim.deepcopy(database.rejected) }
     local contexts = {}
-    for _, entry in ipairs(decoded) do
-      local compile = semantic_context.parse_compilation_entry(entry)
+    for index, entry in ipairs(decoded) do
+      local compile = database.by_index[index]
       if compile then
         local module_root = libclang.normalize(
           entry.nvim_ue_module_root or entry.module_root or ""
@@ -118,6 +142,9 @@ function M.install(Sidecar, deps)
               compile.argv,
             })),
           }
+        else
+          coverage.complete = false
+          coverage.rejected[#coverage.rejected + 1] = { index = index, reason = "missing-module-metadata" }
         end
       end
     end
@@ -126,16 +153,21 @@ function M.install(Sidecar, deps)
       path = cdb_path,
       signature = signature,
       contexts = contexts,
+      coverage = coverage,
     }
+    coverage.accepted = #contexts
     self.controlled_cdb_cache[cdb_path] = record
     return record
   end
 
-  function Sidecar:_select_controlled_cdb(cdb_paths, subject_path)
+  function DefinitionResolver:_select_controlled_cdb(cdb_paths, subject_path)
     local subject = libclang.normalize(subject_path)
     for _, path in ipairs(cdb_paths or {}) do
       local record, err = self:_read_controlled_cdb(path)
       if record then
+        if not record.coverage.complete then
+          return nil, nil, { reason = "lookup-cdb-incomplete", coverage = record.coverage }
+        end
         local matched = {}
         for _, context in ipairs(record.contexts) do
           if path_matches_controlled_subject(subject, context.module_root, context.members) then
@@ -155,7 +187,7 @@ function M.install(Sidecar, deps)
     return nil, {}, nil
   end
 
-  function Sidecar:_collect_usr_definition(entry, usr, shim)
+  function DefinitionResolver:_collect_usr_definition(entry, usr, shim)
     if not self.cursor_shim_fns then
       self.cursor_shim_fns = make_cursor_shim_fn_table(self.toolchain.lib)
     end
@@ -174,12 +206,12 @@ function M.install(Sidecar, deps)
     for i = 0, tonumber(frame.count or 0) - 1 do
       local item = frame.definitions[i]
       local definition = {
-        path = libclang.normalize(libclang.ffi.string(item.path)),
+        path = libclang.absolute_path(libclang.ffi.string(item.path), entry.compile.cwd),
         line = tonumber(item.line),
         column = tonumber(item.column),
         offset = tonumber(item.offset),
       }
-      local key = location_key(definition)
+      local key = self.location_key(definition)
       if key then
         definitions[key] = definition
       end
@@ -193,7 +225,7 @@ function M.install(Sidecar, deps)
     }
   end
 
-  function Sidecar:_lookup_definition_cache_key(request)
+  function DefinitionResolver:_lookup_definition_cache_key(request)
     local signatures = {}
     for _, path in ipairs(request.cdb_paths or {}) do
       local signature = libclang.file_signature(path)
@@ -204,19 +236,20 @@ function M.install(Sidecar, deps)
     end
     return libclang.sha256(vim.json.encode({
       request.usr,
+      libclang.normalize(request.subject),
       signatures,
       libclang.overlays_key(request.overlays or {}),
       self.toolchain.toolchain_identity,
     }))
   end
 
-  function Sidecar:_lookup_definition_metrics(started, extra)
+  function DefinitionResolver:_lookup_definition_metrics(started, extra)
     extra = extra or {}
     extra.total_ms = libclang.duration_ms(started)
-    return self:_metrics(extra)
+    return self.metrics(extra)
   end
 
-  function Sidecar:handle_lookup_definition(request)
+  function DefinitionResolver:handle_lookup_definition(request)
     local started = libclang.uv.hrtime()
     if not self.toolchain.ok then
       return {
@@ -270,6 +303,7 @@ function M.install(Sidecar, deps)
     local cache_key = self:_lookup_definition_cache_key(request)
     local cached = self.lookup_cache[cache_key]
     if cached and libclang.file_signatures_current(cached.file_signatures) then
+      self:_touch_lookup_cache(cached)
       local frame = vim.deepcopy(cached.frame)
       frame.id = request.id
       frame.subject = subject_path
@@ -281,6 +315,7 @@ function M.install(Sidecar, deps)
       })
       return frame
     end
+    self.lookup_cache[cache_key] = nil
 
     local record, contexts, cdb_err = self:_select_controlled_cdb(request.cdb_paths, subject_path)
     if cdb_err then
@@ -291,6 +326,7 @@ function M.install(Sidecar, deps)
         ok = true,
         state = "unavailable",
         reason = cdb_err.reason,
+        coverage = cdb_err.coverage,
         metrics = self:_lookup_definition_metrics(started, { cache_hit = false }),
       }
     end
@@ -336,15 +372,16 @@ function M.install(Sidecar, deps)
     end
     self.cursor_shim_abi_version = shim.abi_version
 
-    self:_prune_idle(libclang.now_ms())
+    self.prune_tus(libclang.now_ms())
 
     local all_definitions, query_kinds, file_signatures = {}, {}, {}
     local contexts_summary = {}
     local aggregate_cold_parse_ms, aggregate_reparse_ms = 0, 0
     local shim_overflow = false
+    local incomplete_contexts = false
     for _, ctx in ipairs(contexts) do
-      local entry, meta, compile_err = self:_ensure_tu(ctx, request.overlays or {})
-      if entry then
+      local entry, meta, compile_err = self.acquire_tu(ctx, request.overlays or {})
+      if entry and not entry.semantic_errors then
         for path, signature in pairs(entry.file_signatures or {}) do file_signatures[path] = signature end
         aggregate_cold_parse_ms = aggregate_cold_parse_ms + (meta.cold_parse_ms or 0)
         aggregate_reparse_ms = aggregate_reparse_ms + (meta.reparse_ms or 0)
@@ -359,6 +396,7 @@ function M.install(Sidecar, deps)
           all_definitions[key] = all_definitions[key] or definition
         end
         shim_overflow = shim_overflow or shim_meta.overflow
+        incomplete_contexts = incomplete_contexts or shim_meta.error_code ~= 0
         contexts_summary[#contexts_summary + 1] = {
           context_id = ctx.id,
           origin_tu = ctx.origin_tu,
@@ -369,11 +407,14 @@ function M.install(Sidecar, deps)
           compile_command_fingerprint = meta.compile_command_fingerprint,
         }
       else
+        incomplete_contexts = true
         contexts_summary[#contexts_summary + 1] = {
           context_id = ctx.id,
           origin_tu = ctx.origin_tu,
           state = "unavailable",
-          reason = compile_err and compile_err.reason or "compile-command-missing",
+          reason = entry and "invalid-tu-diagnostics"
+            or compile_err and compile_err.reason or "compile-command-missing",
+          diagnostics = entry and self.diagnostics(entry) or nil,
         }
       end
     end
@@ -397,6 +438,11 @@ function M.install(Sidecar, deps)
         state = "unavailable",
         reason = "lookup-definition-overflow",
       })
+    elseif incomplete_contexts then
+      frame = vim.tbl_extend("force", base_frame, {
+        state = "unavailable",
+        reason = "lookup-incomplete-contexts",
+      })
     elseif #definition_keys == 1 then
       frame = vim.tbl_extend("force", base_frame, {
         state = "resolved",
@@ -416,7 +462,10 @@ function M.install(Sidecar, deps)
     end
 
     if frame.state == "resolved" then
-      self.lookup_cache[cache_key] = { frame = vim.deepcopy(frame), file_signatures = file_signatures }
+      local entry = { frame = vim.deepcopy(frame), file_signatures = file_signatures }
+      self:_touch_lookup_cache(entry)
+      self.lookup_cache[cache_key] = entry
+      self:_prune_lookup_cache()
     end
     frame.id = request.id
     frame.metrics = self:_lookup_definition_metrics(started, {
@@ -429,6 +478,22 @@ function M.install(Sidecar, deps)
     })
     return frame
   end
+end
+
+function DefinitionResolver:evict()
+  self.lookup_cache = {}
+  self.controlled_cdb_cache = {}
+  self.lookup_cache_clock = 0
+end
+
+function M.new(deps)
+  return setmetatable({
+    toolchain = deps.toolchain, protocol = deps.protocol,
+    location_key = assert(deps.location_key), metrics = assert(deps.metrics),
+    acquire_tu = assert(deps.acquire_tu), diagnostics = assert(deps.diagnostics),
+    prune_tus = assert(deps.prune_tus), max_lookup_entries = deps.max_lookup_entries,
+    lookup_cache = {}, controlled_cdb_cache = {}, lookup_cache_clock = 0,
+  }, DefinitionResolver)
 end
 
 return M

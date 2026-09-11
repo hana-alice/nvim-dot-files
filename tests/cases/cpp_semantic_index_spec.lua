@@ -144,10 +144,7 @@ t.describe("real clangd controlled background index", function()
   ))
 
   if not clangd then
-    t.it("SKIP when clangd is unavailable", function()
-      io.write("SKIP cpp_semantic_index: clangd unavailable\n")
-      t.assert_true(true)
-    end)
+    t.skip("real clangd controlled background index", "clangd unavailable", { native = true })
     return
   end
 

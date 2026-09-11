@@ -8,6 +8,39 @@ merge 或 single-writer 合同，不因 basename 碰撞或共享 JSON read-modif
 
 ## Requirements
 
+### Requirement: project input completion and selection SHALL agree
+
+`:UESetProject` SHALL accept existing Windows drive-relative paths returned by its native
+file-completion input. Before project discovery and persistence, it SHALL resolve the existing
+object through the host filesystem to an absolute path. It MUST NOT insert a separator after
+the drive letter or send a drive-relative path to build/context consumers.
+Existing top-level and unique `Source/<project>/*.uproject` discovery SHALL remain available.
+An absolute drive root such as `C:/` MUST NOT be reinterpreted as the drive's current directory.
+Projects located directly at a drive root are unsupported by the shared path/state consumers;
+the command SHALL reject such a selection explicitly and retain the previous project.
+
+#### Scenario: Tab completes a drive-relative project file or workspace
+
+- **WHEN** native file completion returns an existing drive-relative project file or workspace,
+  including a path with spaces or a non-root per-drive working directory
+- **THEN** selection SHALL persist the absolute path of the object actually completed
+- **AND** the next context and build plan SHALL use that selected project rather than the previous one
+- **AND** selecting a supported nested workspace SHALL preserve that workspace as project_root
+
+#### Scenario: selected path is missing or contains no discoverable project
+
+- **WHEN** a nonempty project selection cannot resolve a valid project or cannot be persisted
+- **THEN** the command SHALL report ERROR with the cause, `UE project NOT changed`, and the
+  retained active project (or `<unset>`)
+- **AND** it MUST NOT report success or replace the previous project with an invalid path
+
+#### Scenario: project selection repair is observed in subsequent sessions
+
+- **WHEN** project selection succeeds or fails validation/persistence
+- **THEN** a bounded `project-selection` observation SHALL record success or failure without
+  storing private paths; probe failure MUST NOT interrupt project selection
+- **AND** test evidence SHALL remain separate from real-session observations
+
 ### Requirement: owner 交接与过期锁回收不得破坏新 owner
 
 锁发布 SHALL 以已写完整且带唯一 token 的非空 owner 目录为单位；过期回收者 SHALL 只删除它观察到的 owner 文件，MUST NOT 递归删除可能已被新 owner 替换的目录。探测权限不足、损坏或不可读的 owner 记录 SHALL fail closed 并给出诊断，不能当作进程已死亡。

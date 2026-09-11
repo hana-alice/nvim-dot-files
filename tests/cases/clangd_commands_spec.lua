@@ -44,6 +44,79 @@ local function cleanup(root, bufnr)
 end
 
 t.describe("clangd exact compile-command transport", function()
+  for _, termination in ipairs({ "cancel", "timeout" }) do
+    t.it("does not deliver late preparation after transport " .. termination, function()
+      local root, semantic, source, bufnr = fixture(function(path, cwd)
+        return { { directory = cwd, file = path, arguments = { "clang++", "-c", path } } }
+      end)
+      local old_system, old_clients, old_defer = vim.system, vim.lsp.get_clients, vim.defer_fn
+      local complete, timeout, result
+      local notifications, requests = 0, 0
+      vim.system = function(_, _, callback) complete = callback; return {} end
+      vim.defer_fn = function(callback)
+        timeout = callback
+        return { is_closing = function() return false end, stop = function() end, close = function() end }
+      end
+      vim.lsp.get_clients = function() return { {
+        id = 193, name = "clangd", config = { cmd = { "clangd", "--compile-commands-dir=" .. semantic } },
+        notify = function() notifications = notifications + 1; return true end,
+        request = function() requests = requests + 1; return true, 123 end,
+      } } end
+      local ok, err = xpcall(function()
+        local handle = require("utils.ue_goto.clangd_adapter").async_lsp_request(bufnr, "textDocument/definition",
+          function(value) result = value end, { structured = true, is_current = function() return true end })
+        t.assert_type(complete, "function")
+        if termination == "cancel" then handle.cancel() else timeout() end
+        complete({ stdout = vim.json.encode({ state = "resolved", command = {
+          workingDirectory = root, compilationCommand = { "clang++", "-c", source },
+        } }) })
+        t.assert_true(vim.wait(1000, function() return result ~= nil end))
+        vim.wait(20, function() return false end)
+        t.assert_eq(notifications, 0)
+        t.assert_eq(requests, 0)
+        t.assert_eq(result.reason, termination == "cancel" and "provider-cancelled" or "provider-timeout")
+      end, debug.traceback)
+      vim.system, vim.lsp.get_clients, vim.defer_fn = old_system, old_clients, old_defer
+      cleanup(root, bufnr)
+      if not ok then error(err) end
+    end)
+  end
+
+  t.it("a cancelled waiter cannot deliver a shared prepared command for a newer waiter", function()
+    local root, semantic, source, bufnr = fixture(function(path, cwd)
+      return { { directory = cwd, file = path, arguments = { "clang++", "-c", path } } }
+    end)
+    local old_system = vim.system
+    local complete, lookups = nil, 0
+    local sent = { 0, 0 }
+    vim.system = function(_, _, callback) lookups = lookups + 1; complete = callback; return {} end
+    local function make_client(index)
+      return { id = 100 + index, config = { cmd = { "clangd", "--compile-commands-dir=" .. semantic } },
+        notify = function() sent[index] = sent[index] + 1; return true end }
+    end
+    local current, first, second = true, nil, nil
+    local ok, err = xpcall(function()
+      commands.ensure(make_client(1), bufnr, function(value, why) first = { value, why } end,
+        { is_current = function() return current end })
+      commands.ensure(make_client(2), bufnr, function(value) second = value end,
+        { is_current = function() return true end })
+      current = false
+      complete({ stdout = vim.json.encode({ state = "resolved", command = {
+        workingDirectory = root, compilationCommand = { "clang++", "-c", source },
+      } }) })
+      t.assert_true(vim.wait(1000, function() return first ~= nil and second ~= nil end))
+      t.assert_eq(lookups, 1)
+      t.assert_false(first[1])
+      t.assert_eq(first[2], "stale-request")
+      t.assert_true(second)
+      t.assert_eq(sent[1], 0)
+      t.assert_true(sent[2] > 0)
+    end, debug.traceback)
+    vim.system = old_system
+    cleanup(root, bufnr)
+    if not ok then error(err) end
+  end)
+
   t.it("sends one exact command over compilationDatabaseChanges and caches the lookup", function()
     local root, semantic, source, bufnr = fixture(function(path, cwd)
       return {

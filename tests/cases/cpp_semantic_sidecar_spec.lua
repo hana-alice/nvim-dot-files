@@ -196,6 +196,7 @@ t.describe("semantic_protocol", function()
       op = "lookup-definition",
       ok = true,
       state = "resolved",
+      usr = "c:@F@target#",
       declaration = { path = "D:/fixture/header.hpp", line = 8, column = 3 },
       definition = { path = "D:/fixture/source.cpp", line = 42, column = 1 },
       metrics = {},
@@ -246,9 +247,70 @@ t.describe("semantic_protocol", function()
     t.assert_eq(#frames, 1)
     t.assert_eq(frames[1].op, "handshake")
   end)
+
+  t.it("enforces the same frame bound for complete and split lines and recovers at the next newline", function()
+    local oversized = protocol.encode({ v = 1, id = "too-large", op = "stats",
+      padding = string.rep("x", protocol.MAX_LINE_BYTES) })
+    local valid = protocol.encode({ v = 1, id = "after-large", op = "stats" })
+    for _, chunks in ipairs({ { oversized .. valid }, { oversized:sub(1, -2), "\n" .. valid } }) do
+      local frames, errors = {}, {}
+      local decoder = protocol.new_decoder({
+        on_frame = function(frame) frames[#frames + 1] = frame end,
+        on_error = function(frame) errors[#errors + 1] = frame end,
+      })
+      for _, chunk in ipairs(chunks) do decoder:push(chunk) end
+      decoder:finish()
+      t.assert_eq(#errors, 1)
+      t.assert_eq(errors[1].error.code, "line-too-long")
+      t.assert_eq(#frames, 1)
+      t.assert_eq(frames[1].id, "after-large")
+    end
+  end)
 end)
 
 t.describe("semantic_sidecar discovery", function()
+  t.it("resource owners can dispose independently", function()
+    local sidecar = semantic_sidecar.new({ toolchain = { clangd_candidates = { "missing-review-toolchain" } } })
+    t.assert_type(sidecar.tu_store, "table")
+    t.assert_type(sidecar.definitions, "table")
+    sidecar.definitions.lookup_cache.example = { last_used = 1 }
+    sidecar.tu_store:shutdown()
+    t.assert_true(sidecar.definitions.lookup_cache.example ~= nil)
+    sidecar.definitions:evict()
+    t.assert_eq(vim.tbl_count(sidecar.definitions.lookup_cache), 0)
+    sidecar:shutdown()
+  end)
+
+  t.it("definition evidence cannot be satisfied by a declaration-only frame", function()
+    local ok, reason = protocol.validate_response({
+      v = protocol.VERSION, id = "declaration-only", op = "lookup-definition",
+      ok = true, state = "resolved", declaration = { path = "/fixture/a.h", line = 1, column = 1 }, metrics = {},
+    })
+    t.assert_false(ok)
+    t.assert_contains(reason, "requires definition")
+  end)
+
+  t.it("identity and definition evidence require explicit canonical identity", function()
+    local frame = {
+      v = protocol.VERSION, id = "identity", op = "query", ok = true, state = "resolved",
+      declaration = { path = "/fixture/a.h", line = 1, column = 1 }, metrics = {},
+    }
+    t.assert_false(protocol.validate_response(frame))
+    frame.usr = "c:@F@f#"
+    t.assert_true(protocol.validate_response(frame))
+    frame.declaration.path = ""
+    t.assert_false(protocol.validate_response(frame))
+    frame.declaration.path = "/fixture/a.h"
+    local declaration = frame.declaration
+    frame.declaration = nil
+    t.assert_false(protocol.validate_response(frame))
+    frame.declaration = declaration
+    frame.op, frame.definition, frame.usr = "lookup-definition", frame.declaration, nil
+    t.assert_false(protocol.validate_response(frame))
+    frame.usr = "c:@F@f#"
+    t.assert_true(protocol.validate_response(frame))
+  end)
+
   t.it("reports unavailable with structured probes when libclang cannot be found", function()
     local toolchain = semantic_sidecar._discover_toolchain_for_test({
       clangd_candidates = { "definitely-missing-clangd" },
@@ -263,12 +325,124 @@ end)
 t.describe("semantic sidecar integration", function()
   local discovery = semantic_sidecar._discover_toolchain_for_test()
   if not discovery.ok then
-    t.it("SKIP real libclang fixture unavailable", function()
-      io.write("SKIP cpp_semantic_sidecar: " .. tostring(discovery.reason) .. "\n")
-      t.assert_true(true)
-    end)
+    t.skip("real libclang fixtures", discovery.reason, { native = true })
     return
   end
+
+  t.it("reloads native CDB commands on file changes and clears handles on full eviction", function()
+    with_temp_fixture(function(root)
+      local source = root .. "/command-change.cpp"
+      vim.fn.writefile({ "#ifdef NEW", "using Arg=int;", "#else", "using Arg=long;", "#endif",
+        "int choose(int) { return 1; }", "int choose(long) { return 2; }",
+        "int caller() { return choose(Arg{}); } // QUERY:command-change" }, source)
+      local function write_command(extra)
+        local arguments = { "clang++", "-std=c++20", source }
+        if extra then table.insert(arguments, 2, extra) end
+        vim.fn.writefile({ vim.json.encode({ { directory = root, file = source, arguments = arguments } }) },
+          root .. "/compile_commands.json")
+      end
+      write_command()
+      local sidecar = semantic_sidecar.new()
+      local request = { id = "command-change", query = find_marker_position(source, "QUERY:command-change", "choose"),
+        contexts = { { id = "cdb-only", origin_tu = source, cdb_dir = root } } }
+      local first = sidecar:handle_query(request)
+      t.assert_eq(first.usr, "c:@F@choose#L#")
+      write_command("-DNEW")
+      local second = sidecar:handle_query(request)
+      t.assert_eq(second.usr, "c:@F@choose#I#")
+      sidecar:handle_evict({ id = "all", all = true })
+      t.assert_eq(vim.tbl_count(sidecar.tu_store.cdbs), 0)
+      write_command()
+      t.assert_eq(sidecar:handle_query(request).usr, "c:@F@choose#L#")
+      sidecar:shutdown()
+    end)
+  end)
+
+  t.it("keeps malformed controlled records as incomplete coverage before definition lookup", function()
+    with_temp_fixture(function(root)
+      local entries = {}
+      for _, name in ipairs({ "one", "two" }) do
+        local source = root .. "/" .. name .. ".cpp"
+        vim.fn.writefile({ "int duplicate() { return 1; }" }, source)
+        entries[#entries + 1] = { directory = root, file = source,
+          arguments = name == "one" and { "clang++", source } or nil,
+          nvim_ue_module_root = vim.fs.basename(root), nvim_ue_members = { source } }
+      end
+      local path = root .. "/controlled-rejected.json"
+      vim.fn.writefile({ vim.json.encode(entries) }, path)
+      local sidecar = semantic_sidecar.new()
+      local request = { id = "rejected", usr = "c:@F@duplicate#", subject = entries[1].file, cdb_paths = { path } }
+      local response = sidecar:handle_lookup_definition(request)
+      t.assert_eq(response.state, "unavailable")
+      t.assert_eq(response.reason, "lookup-cdb-incomplete")
+      t.assert_false(response.coverage.complete)
+      t.assert_eq(response.coverage.rejected[1].index, 2)
+      t.assert_eq(response.coverage.rejected[1].reason, "missing-command")
+      t.assert_eq(vim.tbl_count(sidecar.definitions.lookup_cache), 0)
+      entries[2].arguments = { "clang++", entries[2].file }
+      vim.fn.writefile({ vim.json.encode(entries) }, path)
+      response = sidecar:handle_lookup_definition(request)
+      t.assert_eq(response.reason, "multiple-definitions")
+      t.assert_eq(#response.contexts, 2)
+      sidecar:shutdown()
+    end)
+  end)
+
+  t.it("rejects incomplete merged CDB evidence in catalog and source proof", function()
+    with_temp_fixture(function(root)
+      vim.fn.writefile({ vim.json.encode({
+        { directory = root, file = root .. "/direct.cpp", arguments = { "clang++", root .. "/direct.cpp" } },
+        { directory = root, file = root .. "/rejected.cpp" },
+      }) }, root .. "/compile_commands.json")
+      local sidecar = semantic_sidecar.new()
+      local responses = {
+        sidecar:handle_prove({ id = "prove-incomplete", source = root .. "/direct.cpp", cdb_dir = root }),
+        sidecar:handle_catalog({ id = "catalog-incomplete", header = root .. "/direct.hpp",
+          cdb_dir = root, evidence_roots = { root }, active_build = {} }),
+      }
+      for _, response in ipairs(responses) do
+        t.assert_eq(response.state, "unavailable")
+        t.assert_eq(response.reason, "merged-cdb-incomplete")
+        t.assert_eq(response.coverage.rejected[1].index, 2)
+        t.assert_eq(response.coverage.rejected[1].reason, "missing-command")
+      end
+      t.assert_eq(#responses[2].contexts, 0)
+      sidecar:shutdown()
+    end)
+  end)
+
+  t.it("bounds real stdin frames without waiting for EOF and serves subsequent requests", function()
+    local frames, tail, exited = {}, "", false
+    local job = vim.fn.jobstart(sidecar_cmd(), {
+      stdin = "pipe", stdout_buffered = false,
+      on_stdout = function(_, data)
+        tail = tail .. table.concat(data, "\n")
+        while true do
+          local newline = tail:find("\n", 1, true)
+          if not newline then break end
+          local line = tail:sub(1, newline - 1)
+          tail = tail:sub(newline + 1)
+          if line ~= "" then frames[#frames + 1] = vim.json.decode(line) end
+        end
+      end,
+      on_exit = function() exited = true end,
+    })
+    local ok, err = xpcall(function()
+      t.assert_true(job > 0)
+      vim.fn.chansend(job, protocol.encode({ v = 1, id = "interactive", op = "stats" }))
+      t.assert_true(vim.wait(3000, function() return #frames == 1 end, 5), "response must arrive while stdin stays open")
+      local oversized = protocol.encode({ v = 1, id = "oversized", op = "stats",
+        padding = string.rep("x", protocol.MAX_LINE_BYTES) })
+      vim.fn.chansend(job, oversized .. protocol.encode({ v = 1, id = "after-limit", op = "stats" }))
+      t.assert_true(vim.wait(3000, function() return #frames >= 3 end, 5))
+      t.assert_eq(frames[2].error.code, "line-too-long")
+      t.assert_eq(frames[3].id, "after-limit")
+      vim.fn.chansend(job, protocol.encode({ v = 1, id = "done", op = "shutdown" }))
+      t.assert_true(vim.wait(2000, function() return exited end, 5))
+    end, debug.traceback)
+    if not exited then pcall(vim.fn.jobstop, job) end
+    if not ok then error(err) end
+  end)
 
   for _, changed_file in ipairs({ "source", "include" }) do
     t.it("warm TU observes saved " .. changed_file .. " changes without a CDB or overlay change", function()
@@ -662,6 +836,142 @@ t.describe("semantic sidecar integration", function()
     end)
   end)
 
+  t.it("rejects recovery AST identities and reparses after a missing include is supplied", function()
+    with_temp_fixture(function(root)
+      local source = root .. "/recovery.cpp"
+      vim.fn.writefile({ '#include "missing.hpp"', 'int pick(long) { return 0; }',
+        'int test() { return pick(1); }' }, source)
+      local sidecar = semantic_sidecar.new()
+      local ctx = { id = "recovery", origin_tu = source, cdb_dir = root,
+        compile = { file = source, directory = root, argv = { "clang++", "-std=c++20", source } } }
+      local query = { path = source, line = 3, column = 21 }
+      local before = sidecar.tu_store:_resolve_context(ctx, query, {})
+      t.assert_eq(before.state, "invalid-semantic-context")
+      t.assert_eq(before.reason, "invalid-tu-diagnostics")
+      t.assert_true(#before.diagnostics > 0)
+      vim.fn.writefile({ "inline int pick(int) { return 1; }" }, root .. "/missing.hpp")
+      local after, meta = sidecar.tu_store:_resolve_context(ctx, query, {})
+      t.assert_eq(after.state, "resolved")
+      t.assert_eq(after.usr, "c:@F@pick#I#")
+      t.assert_eq(meta.query_kind, "reparse")
+      sidecar:shutdown()
+    end)
+  end)
+
+  t.it("resolves relative compiler paths against the TU working directory and tracks includes", function()
+    with_temp_fixture(function(root)
+      vim.fn.mkdir(root .. "/inc", "p")
+      local header = root .. "/inc/cfg.hpp"
+      vim.fn.writefile({ "inline int relative(int) { return 0; }" }, header)
+      local source = root .. "/relative.cpp"
+      vim.fn.writefile({ "#include <cfg.hpp>", "int caller() { return relative(1); }" }, source)
+      local sidecar = semantic_sidecar.new()
+      local ctx = { id = "relative", origin_tu = source, cdb_dir = root,
+        compile = { file = source, directory = root,
+          argv = { "clang++", "-std=c++20", "-Iinc", "relative.cpp" } } }
+      local query = { path = source, line = 2, column = 23 }
+      local cold = sidecar.tu_store:_resolve_context(ctx, query, {})
+      t.assert_eq(cold.definition.path, vim.fs.normalize(header))
+      local entry = sidecar.tu_store:_ensure_tu(ctx, {})
+      t.assert_true(type(entry.file_signatures[vim.fs.normalize(header)]) == "string")
+      vim.fn.writefile({ "", "inline int relative(int) { return 0; }" }, header)
+      local changed, meta = sidecar.tu_store:_resolve_context(ctx, query, {})
+      t.assert_eq(changed.definition.path, vim.fs.normalize(header))
+      t.assert_eq(changed.definition.line, 2)
+      t.assert_eq(meta.query_kind, "reparse")
+      sidecar:shutdown()
+    end)
+  end)
+
+  t.it("bounds definition cache independently of TU count and evicts the least recently used entry", function()
+    with_temp_fixture(function(root)
+      local source = root .. "/bounded.cpp"
+      vim.fn.writefile({ "int first() { return 1; }", "int second() { return 2; }",
+        "int third() { return 3; }" }, source)
+      local cdb = write_controlled_cdb(root, "bounded.json", { "bounded.cpp" }, { { name = "bounded.cpp" } })
+      local sidecar = semantic_sidecar.new({ max_tus = 1, max_lookup_entries = 2 })
+      local function lookup(name)
+        local response = sidecar:handle_lookup_definition({ id = name, usr = "c:@F@" .. name .. "#",
+          subject = source, cdb_paths = { cdb } })
+        t.assert_eq(response.state, "resolved")
+        t.assert_true(response.metrics.lookup_cache_entries <= 2)
+        return response
+      end
+      lookup("first")
+      lookup("second")
+      t.assert_true(lookup("first").metrics.cache_hit)
+      lookup("third")
+      t.assert_true(lookup("first").metrics.cache_hit)
+      t.assert_false(lookup("second").metrics.cache_hit)
+      sidecar:shutdown()
+    end)
+  end)
+
+  t.it("isolates definition cache entries by subject module context", function()
+    with_temp_fixture(function(root)
+      local entries = {}
+      for _, name in ipairs({ "a", "b" }) do
+        local source = root .. "/" .. name .. ".cpp"
+        vim.fn.writefile({ "int same() { return 1; }" }, source)
+        entries[#entries + 1] = { directory = root, file = source,
+          arguments = { "clang++", "-std=c++20", source },
+          nvim_ue_module_root = "module-" .. name,
+          nvim_ue_members = { root .. "/" .. name .. ".hpp" } }
+      end
+      local cdb = root .. "/cache-modules.json"
+      vim.fn.writefile({ vim.json.encode(entries) }, cdb)
+      local sidecar = semantic_sidecar.new()
+      local request = { id = "module-a", usr = "c:@F@same#", subject = root .. "/a.hpp", cdb_paths = { cdb } }
+      local first = sidecar:handle_lookup_definition(request)
+      t.assert_eq(first.state, "resolved")
+      request.subject = root .. "/b.hpp"
+      local second = sidecar:handle_lookup_definition(request)
+      t.assert_eq(second.state, "resolved")
+      t.assert_eq(second.definition.path, root .. "/b.cpp")
+      t.assert_false(second.metrics.cache_hit)
+      t.assert_true(sidecar:handle_lookup_definition(request).metrics.cache_hit)
+      sidecar:shutdown()
+    end)
+  end)
+
+  t.it("does not prove a unique definition from a partial module scan", function()
+    with_temp_fixture(function(root)
+      vim.fn.writefile({ "int partial() { return 1; }" }, root .. "/partial.cpp")
+      local cdb = write_controlled_cdb(root, "partial.json", { "partial.cpp" }, {
+        { name = "partial.cpp" }, { name = "absent.cpp" },
+      })
+      local sidecar = semantic_sidecar.new()
+      local request = { id = "partial", usr = "c:@F@partial#", subject = root .. "/partial.cpp", cdb_paths = { cdb } }
+      local response = sidecar:handle_lookup_definition(request)
+      t.assert_eq(response.state, "unavailable")
+      t.assert_eq(response.reason, "lookup-incomplete-contexts")
+      t.assert_eq(vim.tbl_count(sidecar.definitions.lookup_cache), 0)
+      vim.fn.writefile({ '#include "missing-lookup.hpp"', "int unrelated() { return 0; }" }, root .. "/absent.cpp")
+      response = sidecar:handle_lookup_definition(request)
+      t.assert_eq(response.reason, "lookup-incomplete-contexts")
+      t.assert_eq(vim.tbl_count(sidecar.definitions.lookup_cache), 0)
+      local has_diagnostics = false
+      for _, context in ipairs(response.contexts) do
+        has_diagnostics = has_diagnostics or #(context.diagnostics or {}) > 0
+      end
+      t.assert_true(has_diagnostics)
+      vim.fn.writefile({ "// include repaired" }, root .. "/missing-lookup.hpp")
+      response = sidecar:handle_lookup_definition(request)
+      t.assert_eq(response.state, "resolved")
+      sidecar.definitions.lookup_cache = {}
+      local collect = sidecar.definitions._collect_usr_definition
+      sidecar.definitions._collect_usr_definition = function(self, ...)
+        local definitions, meta = collect(self, ...)
+        meta.error_code = 1
+        return definitions, meta
+      end
+      response = sidecar:handle_lookup_definition(request)
+      t.assert_eq(response.reason, "lookup-incomplete-contexts")
+      t.assert_eq(vim.tbl_count(sidecar.definitions.lookup_cache), 0)
+      sidecar:shutdown()
+    end)
+  end)
+
   t.it("lookup-definition resolves declaration to the unique body and warm hits cache without rereading CDB/TUs", function()
     with_temp_fixture(function(root)
       local sidecar = semantic_sidecar.new()
@@ -709,13 +1019,13 @@ t.describe("semantic sidecar integration", function()
       })
       local tu_count_after_first = stats_after_first.metrics.tu_count
 
-      local original_read_controlled = sidecar._read_controlled_cdb
-      local original_ensure_tu = sidecar._ensure_tu
+      local original_read_controlled = sidecar.definitions._read_controlled_cdb
+      local original_ensure_tu = sidecar.tu_store._ensure_tu
       local original_ensure_shim = sidecar_libclang.ensure_cursor_shim
-      sidecar._read_controlled_cdb = function()
+      sidecar.definitions._read_controlled_cdb = function()
         error("warm cache must not reread controlled cdb")
       end
-      sidecar._ensure_tu = function()
+      sidecar.tu_store._ensure_tu = function()
         error("warm cache must not rebuild translation units")
       end
       sidecar_libclang.ensure_cursor_shim = function()
@@ -726,18 +1036,18 @@ t.describe("semantic sidecar integration", function()
         id = "lookup-second",
         op = "lookup-definition",
         usr = query.usr,
-        subject = vim.fs.normalize(root .. "/direct.hpp"),
+        subject = vim.fs.normalize(root .. "/caller.cpp"),
         cdb_paths = { controlled },
         document_version = 9,
       })
-      sidecar._read_controlled_cdb = original_read_controlled
-      sidecar._ensure_tu = original_ensure_tu
+      sidecar.definitions._read_controlled_cdb = original_read_controlled
+      sidecar.tu_store._ensure_tu = original_ensure_tu
       sidecar_libclang.ensure_cursor_shim = original_ensure_shim
 
       t.assert_eq(second.state, "resolved")
       t.assert_true(second.metrics.cache_hit)
       t.assert_eq(second.metrics.query_kinds[1].kind, "warm-cache")
-      t.assert_eq(second.subject, vim.fs.normalize(root .. "/direct.hpp"))
+      t.assert_eq(second.subject, vim.fs.normalize(root .. "/caller.cpp"))
       t.assert_eq(second.document_version, 9)
       t.assert_eq(vim.fs.normalize(second.definition.path), vim.fs.normalize(first.definition.path))
       local stats_after_second = sidecar:handle_request({
@@ -861,6 +1171,36 @@ t.describe("semantic sidecar integration", function()
       })
       t.assert_eq(stats.metrics.lookup_cache_entries, 0,
         "ambiguous module evidence must not be cached across subjects")
+      sidecar:shutdown()
+    end)
+  end)
+
+  t.it("requires every proven context to resolve before asserting a shared identity", function()
+    with_temp_fixture(function(root)
+      local source = root .. "/mixed-context.cpp"
+      vim.fn.writefile({ '#ifdef BROKEN', '#include "missing-context.hpp"', '#endif',
+        'int selected() { return 1; }', 'int caller() { return selected(); }' }, source)
+      local sidecar = semantic_sidecar.new()
+      local healthy = { id = "healthy", origin_tu = source, cdb_dir = root,
+        compile = { file = source, directory = root, argv = { "clang++", source } } }
+      local broken = vim.deepcopy(healthy)
+      broken.id = "broken"
+      table.insert(broken.compile.argv, 2, "-DBROKEN")
+      local request = { v = protocol.VERSION, id = "mixed-context", op = "query",
+        query = { path = source, line = 5, column = 23 }, contexts = { healthy, broken } }
+      local response = sidecar:handle_request(request)
+      t.assert_eq(response.state, "invalid-semantic-context")
+      t.assert_eq(response.reason, "invalid-tu-diagnostics")
+      t.assert_eq(#response.contexts, 2)
+      t.assert_eq(response.contexts[1].state, "resolved")
+      t.assert_true(#response.diagnostics > 0)
+      t.assert_true(response.definition == nil)
+      broken.compile.directory = root .. "/absent-working-directory"
+      response = sidecar:handle_request(request)
+      t.assert_eq(response.state, "unavailable")
+      t.assert_eq(response.reason, "compile-working-directory-unavailable")
+      t.assert_eq(#response.contexts, 2)
+      t.assert_true(response.definition == nil)
       sidecar:shutdown()
     end)
   end)

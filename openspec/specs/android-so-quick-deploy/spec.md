@@ -10,6 +10,16 @@
 
 系统 SHALL 为当前 Android Target 和 Configuration 提供独立的 SO-only 构建入口，只执行 UBT 需要更新的编译与链接 actions，不执行 Gradle APK 组装。
 
+#### Scenario: SO-only build disables SDK consistently with normal build
+
+- **WHEN** the external SDK policy identifies a field whose value is `0` in the selected project's INI
+- **THEN** the Windows SO runner SHALL receive `-SdkArgument` followed by the policy's actual
+  `disable_argument` and forward that single argument to the UBT action-export invocation that evaluates Target rules
+- **AND** action execution SHALL consume the exported graph without reintroducing SDK or entering APK packaging
+- **AND** both the runner parameter and UBT argument SHALL be absent when the SDK policy leaves the Target default unchanged
+- **AND** the runner SHALL remain generic; actual project-specific mappings SHALL be supplied by the external
+  policy defined in `ue-target-driver-boundary`, not embedded or encoded in the script
+
 #### Scenario: 增量构建成功
 
 - **WHEN** 用户在已配置 Android Target 和 Configuration 的项目中执行 `:UEBuildAndroidSO`

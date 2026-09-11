@@ -167,6 +167,21 @@ function M.terminal(state, stage, reason, extra)
   if state == "resolved" and stage ~= "jump" then
     error("resolved terminal state must complete at jump stage")
   end
+  if state == "resolved" then
+    local evidence = extra or {}
+    local target = evidence.location or {}
+    local range = target.targetSelectionRange or target.targetRange or target.range or {}
+    local position = range.start or {}
+    assert(type(evidence.identity) == "string" and evidence.identity ~= "", "resolved identity evidence is required")
+    assert(type(evidence.provider) == "string" and evidence.provider ~= "", "resolved provider evidence is required")
+    assert(type(target.uri or target.targetUri) == "string" and (target.uri or target.targetUri) ~= ""
+      and type(position.line) == "number" and position.line >= 0
+      and type(position.character) == "number" and position.character >= 0, "resolved destination evidence is required")
+    assert(evidence.destination_role == "definition" or evidence.destination_role == "declaration", "resolved role is required")
+    assert(evidence.destination_role ~= "declaration" or reason ~= "definition-resolved", "a declaration is not a definition")
+    assert(type(evidence.metrics) == "table" and type(evidence.metrics.source) == "string"
+      and evidence.metrics.source ~= "", "resolved metric provenance is required")
+  end
   local result = vim.tbl_extend("force", owned_copy(extra or {}), {
     state = state,
     stage = stage,

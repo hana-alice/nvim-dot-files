@@ -433,6 +433,12 @@ t.describe("multi-instance project state", function()
       local result = job:wait()
       t.assert_eq(result.code, 0, result.stderr)
     end
+    -- An exiting writer may have journaled its last delta under lock contention.
+    -- Recover through the production reader, then verify the published total too.
+    local store = require("utils.probe_store")
+    local recovered = assert(store.read(path))
+    t.assert_eq(recovered.topics["multi-instance"].records["same-key"].count, 8)
+    t.assert_true(store.save(path, { data = recovered, base = recovered }))
     local decoded = vim.json.decode(table.concat(vim.fn.readfile(path), "\n"))
     t.assert_eq(decoded.topics["multi-instance"].records["same-key"].count, 8)
     pcall(vim.fn.delete, root, "rf")

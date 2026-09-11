@@ -11,6 +11,7 @@
 --   断言：t.assert_eq / assert_true / assert_false / assert_nil /
 --         assert_type / assert_error / assert_match
 --   t.run()  → 打印汇总并以 quit / cquit 1 设置退出码
+--   t.skip(name, reason, {native=true}) → 单列 SKIP；required native 模式转 FAIL
 --
 -- 隔离保证：单个 it 抛错只标记该用例 FAIL，不中断后续用例。
 -- 自举保证：bootstrap() 把配置根目录前置到 rtp/package.path，
@@ -204,6 +205,16 @@ function M.it(name, fn)
   record(full, ok, ok and nil or err)
 end
 
+-- Native acceptance must never turn missing compiler coverage into a PASS.
+function M.skip(name, reason, opts)
+  local full = current_describe and (current_describe .. " > " .. name) or name
+  if opts and opts.native and vim.env.NVIM_TEST_REQUIRE_NATIVE == "1" then
+    record(full, false, "required native coverage unavailable: " .. tostring(reason))
+  else
+    results[#results + 1] = { name = full, skipped = true, reason = tostring(reason or "unavailable") }
+  end
+end
+
 -- ── 运行与报告 ────────────────────────────────────────────────────────────
 
 local function printf(fmt, ...)
@@ -230,11 +241,14 @@ end
 -- opts.exit = false 时只打印不退出（便于测试框架自身）。
 function M.run(opts)
   opts = opts or {}
-  local fails = 0
+  local fails, skips = 0, 0
 
   -- 失败优先打印，便于在长输出末尾快速定位。
   for _, r in ipairs(results) do
-    if not r.ok then
+    if r.skipped then
+      skips = skips + 1
+      printf("SKIP  %s (%s)", r.name, r.reason)
+    elseif not r.ok then
       fails = fails + 1
       eprintf("FAIL  %s\n        └─ %s", r.name, tostring(r.err))
     end
@@ -244,7 +258,7 @@ function M.run(opts)
   end
 
   printf("")
-  printf("=== %d/%d passed, %d failed ===", #results - fails, #results, fails)
+  printf("=== %d/%d passed, %d failed, %d skipped ===", #results - fails - skips, #results - skips, fails, skips)
 
   if opts.exit == false then
     return fails

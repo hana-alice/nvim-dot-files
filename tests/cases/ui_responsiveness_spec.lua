@@ -111,32 +111,67 @@ t.describe("交互路径禁止同步阻塞（`gr` references）", function()
       "`gr` 的 GTAGS 回退必须有异步版")
   end)
 
-  t.it("lsp_fallback.references 不再使用 request_sync / 同步 GTAGS", function()
-    -- 读源文件断言：这条锁的是「不得在主循环上等子进程/LSP」的结构性事实。
-    -- 实测（2026-08-25）：request_sync 最多堵 5000ms；vim.system():wait() 在本
-    -- 宿主光 spawn 就 87ms p50。两者都在 `gr` 这条日常按键上。
-    local path = vim.fn.stdpath("config") .. "/lua/utils/lsp_fallback.lua"
-    local src = table.concat(vim.fn.readfile(path), "\n")
-    local body = src:match("function M%.references%(%)(.-)\nend")
-    t.assert_type(body, "string", "未找到 M.references 函数体")
-    t.assert_false(body:find("sync_locations", 1, true) ~= nil,
-      "references 不得使用 sync_locations（request_sync 阻塞主循环最多 5s）")
-    t.assert_false(body:match("ue%.gtags_references%s*%(") ~= nil,
-      "references 不得调同步 ue.gtags_references（内部 vim.system():wait()）")
-    t.assert_true(body:find("async_lsp_request", 1, true) ~= nil,
-      "references 应走异步 LSP 请求")
-    t.assert_true(body:find("gtags_references_async", 1, true) ~= nil,
-      "references 的 GTAGS 回退应走异步版")
+  t.it("references returns before LSP and GTAGS complete, with no synchronous fallback", function()
+    local saved_provider = package.loaded["utils.ue_goto.provider"]
+    local saved_symbol = package.loaded["utils.ue_goto.symbol"]
+    local saved_async, saved_sync = ue.gtags_references_async, ue.gtags_references
+    local lsp_callback, gtags_callback
+    local gtags_calls = 0
+    package.loaded["utils.ue_goto.provider"] = {
+      async_lsp_request = function(_, method, callback)
+        t.assert_eq(method, "textDocument/references")
+        lsp_callback = callback
+      end,
+      sync_locations = function() error("references attempted synchronous LSP") end,
+    }
+    package.loaded["utils.ue_goto.symbol"] = { current_symbol = function() return "Sample" end }
+    ue.gtags_references = function() error("references attempted synchronous GTAGS") end
+    ue.gtags_references_async = function(symbol, callback)
+      t.assert_eq(symbol, "Sample")
+      gtags_calls = gtags_calls + 1
+      gtags_callback = callback
+    end
+    local ok, err = xpcall(function()
+      local compat = require("utils.ue_goto.compat_navigation").install({})
+      compat.references()
+      t.assert_type(lsp_callback, "function", "references must return with an outstanding LSP request")
+      t.assert_eq(gtags_calls, 0, "GTAGS waits for the asynchronous empty LSP result")
+      lsp_callback(nil)
+      t.assert_eq(gtags_calls, 1)
+      t.assert_type(gtags_callback, "function", "GTAGS fallback also returns before completion")
+      gtags_callback(true)
+    end, debug.traceback)
+    package.loaded["utils.ue_goto.provider"] = saved_provider
+    package.loaded["utils.ue_goto.symbol"] = saved_symbol
+    ue.gtags_references_async, ue.gtags_references = saved_async, saved_sync
+    if not ok then error(err) end
   end)
 
-  t.it("异步 references 请求仍携带 includeDeclaration（行为不变）", function()
-    -- 旧的 sync_locations 总是设 includeDeclaration=true；换到异步通道不得静默
-    -- 改变返回集。
-    local path = vim.fn.stdpath("config") .. "/lua/utils/ue_goto/provider.lua"
-    local src = table.concat(vim.fn.readfile(path), "\n")
-    t.assert_match(src, "textDocument/references",
-      "async_lsp_request 必须为 references 补 ReferenceContext")
-    t.assert_match(src, "includeDeclaration")
+  t.it("asynchronous references transport sends includeDeclaration to the client", function()
+    local old_clients = vim.lsp.get_clients
+    local params, respond, completed
+    vim.lsp.get_clients = function() return { {
+      id = 93, name = "references-fixture", offset_encoding = "utf-16",
+      request_sync = function() error("references transport attempted request_sync") end,
+      request = function(_, method, request_params, callback)
+        t.assert_eq(method, "textDocument/references")
+        params, respond = request_params, callback
+        return true
+      end,
+    } } end
+    local ok, err = xpcall(function()
+      require("utils.ue_goto.lsp_transport").async_lsp_request(0, "textDocument/references", function(result)
+        completed = result
+      end, { structured = true })
+      t.assert_type(respond, "function")
+      t.assert_eq(completed, nil, "transport returns while the client response is outstanding")
+      t.assert_true(params.context.includeDeclaration)
+      respond(nil, {})
+      t.assert_true(vim.wait(1000, function() return completed ~= nil end, 10))
+      t.assert_eq(#completed.locations, 0)
+    end, debug.traceback)
+    vim.lsp.get_clients = old_clients
+    if not ok then error(err) end
   end)
 end)
 

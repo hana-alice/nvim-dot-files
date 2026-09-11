@@ -5,6 +5,51 @@
 
 ## Requirements
 
+### Requirement: Android SDK policy SHALL reach the compiler arguments
+
+For Android build and SO-only build, the driver SHALL load an external JSON SDK policy afresh
+when forming each plan. `ue.config`'s `android.sdk_policy_file` SHALL select the policy file;
+its default location SHALL be `stdpath('state')/ue-android-sdk-policy.json`. The policy SHALL
+contain `config_file` (a project-relative INI path), `key` (the SDK field name), and
+`disable_argument` (one UBT argument). Actual project-specific mappings SHALL remain outside
+the public worktree; repository code, tests and documentation MUST NOT encode, assemble or
+rename private identifiers merely to bypass a privacy scanner.
+
+The public example mapping is `Config/SDK/Runtime.ini`, `UseSDK`, and `-skip-project-sdk`.
+These are illustrative values, not evidence of a real checkout's configuration or Target parser.
+The driver SHALL resolve `config_file` relative to the selected `.uproject` directory and read
+that file afresh. An explicit value `0` SHALL append the policy's actual `disable_argument` to
+the normal UBT plan. Runtime configuration alone MUST NOT be treated as proof that the Target
+excluded SDK modules. The driver MUST NOT infer policy from another checkout, cached selection,
+or a preparation script's unrelated output.
+
+The project configuration is a bounded UTF-8/ASCII key/value file (up to 64 KiB); UTF-8 BOM,
+whitespace and `;`/`#` comments SHALL be accepted. A missing policy, missing project file/key,
+or value `1` SHALL preserve the Target's existing default without injecting a disable argument.
+Malformed policy, invalid/conflicting values, unsupported encoding, oversize or read failures
+other than file absence SHALL return an unavailable plan with a reason. Unrelated configuration
+contents MUST NOT be logged or persisted; metadata SHALL expose only the effective `sdk_disabled`
+boolean, not the external mapping or INI contents.
+
+#### Scenario: Runtime configuration disables SDK
+
+- **WHEN** the external policy identifies a field whose value is `0` in the selected project's configuration
+- **THEN** the normal build plan SHALL include the policy's actual `disable_argument` as one argument
+- **AND** the SO-only plan SHALL forward the same compiler decision into its UBT action-export phase
+- **AND** plan metadata SHALL expose the effective `sdk_disabled` decision
+
+#### Scenario: Configuration or project changes
+
+- **WHEN** the user changes the external policy, its selected SDK field, or the checkout before creating a new build plan
+- **THEN** the new plan SHALL reflect the current policy and that project's current file contents without an editor restart
+- **AND** an already captured plan SHALL remain unchanged
+
+#### Scenario: Project has no SDK-specific configuration
+
+- **WHEN** no external policy exists or the selected project has no configured INI file or key
+- **THEN** Android build arguments SHALL retain the existing Target default
+- **AND** no SDK-specific settings SHALL be written to the project
+
 ### Requirement: host/target 兼容性必须只看 `host_operations` matrix
 
 系统 SHALL 以 target driver 声明的 `host_operations` matrix 作为 host/target 兼容性的唯一判据；`ue.lua`、通用 runner、当前平台 UI 状态或任何兄弟 target 的默认值 MUST NOT 参与兼容性推断。若某个 host/target pair 未在 matrix 中声明，系统 MUST 明确报告该 pair 不兼容，而不是隐式选择别的 target 或别的 backend。

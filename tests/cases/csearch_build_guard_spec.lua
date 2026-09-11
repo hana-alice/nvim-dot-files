@@ -16,6 +16,140 @@ t.bootstrap()
 local ue = require("ue")
 local cs = require("utils.code_search")
 
+t.describe("UEBuildCsearch standalone writer", function()
+  local function fixture(body)
+    local dir = vim.fn.tempname():gsub("\\", "/")
+    vim.fn.mkdir(dir .. "/Source", "p")
+    local project_state = require("ue.project_state")
+    local selection = assert(project_state.select(dir, dir .. "/Project", dir .. "/Project/Test.uproject",
+      { persist_default = false }))
+    local ctx = { engine_root = dir, project_root = dir .. "/Project", paths = {
+      cache = dir .. "/cache", runtime_dir = dir .. "/cache/runtime",
+      csearch_idx = dir .. "/cache/csearch/index.idx", workspace_all_list = dir .. "/cache/gtags/workspace_all.files",
+    } }
+    local old = { build = cs.build_index, probe = cs.cindex_uefilter_exe, system = vim.system,
+      remove = require("utils.ue_watch").remove_persistent_dirty,
+      dirty_status = require("utils.ue_watch").persistent_dirty_status }
+    local calls, removed = {}, 0
+    cs.cindex_uefilter_exe = function() return "cindex-test" end
+    vim.system = function() error("standalone command must not spawn UBT/CDB/GTAGS") end
+    require("utils.ue_watch").remove_persistent_dirty = function() removed = removed + 1; return true end
+    cs.build_index = function(_, list, cb, opts)
+      calls[#calls + 1] = { list = vim.fn.readfile(list), path = list, cb = cb, mode = opts.mode }
+    end
+    local function scan(root, _, cb)
+      cb(root == ctx.project_root and { "Source/New.cpp", "Source/Config.ini", "Source/Skip.png" }
+        or { "Engine/Source/Engine.cpp" })
+    end
+    local ok, err = xpcall(function()
+      body(ctx, scan, calls, selection, function() return removed end)
+    end, debug.traceback)
+    if ue._csearch_build_running_for_test() then ue._csearch_build_done_for_test() end
+    cs.build_index, cs.cindex_uefilter_exe, vim.system = old.build, old.probe, old.system
+    require("utils.ue_watch").remove_persistent_dirty = old.remove
+    require("utils.ue_watch").persistent_dirty_status = old.dirty_status
+    vim.fn.delete(dir, "rf")
+    if not ok then error(err) end
+  end
+
+  t.it("fresh scan forces reset, retires successful dirty snapshot and records input", function()
+    fixture(function(ctx, scan, calls, selection, removed)
+      ue.build_csearch_async({ context = ctx, scan = scan })
+      t.assert_eq(#calls, 1)
+      t.assert_eq(calls[1].mode, "reset")
+      t.assert_eq(#calls[1].list, 3, "all supported file types, no asset")
+      t.assert_true(vim.tbl_contains(calls[1].list, ctx.project_root .. "/Source/New.cpp"))
+      local first = calls[1].list
+      calls[1].cb(true, nil, { ms = 1 })
+      t.assert_eq(removed(), 1)
+      t.assert_false(ue._csearch_build_running_for_test())
+      t.assert_nil(vim.uv.fs_stat(calls[1].path), "temporary input removed")
+      t.assert_eq(require("ue.project_state").read(ctx.engine_root, selection).csearch_input_hash,
+        ue._list_fingerprint_for_test(ctx.paths.workspace_all_list))
+      ue.build_csearch_async({ context = ctx, scan = scan })
+      t.assert_eq(#calls, 2, "unchanged file set must still reset")
+      t.assert_eq(calls[2].mode, "reset")
+      t.assert_true(vim.deep_equal(calls[2].list, first))
+      calls[2].cb(true, nil, {})
+      ue.build_csearch_async({ context = ctx, scan = function(_, _, cb) cb({ "Source/Replaced.cpp" }) end })
+      t.assert_eq(#calls, 3)
+      t.assert_false(vim.tbl_contains(calls[3].list, ctx.project_root .. "/Source/New.cpp"), "deleted path removed")
+      t.assert_true(vim.tbl_contains(calls[3].list, ctx.project_root .. "/Source/Replaced.cpp"), "new path included")
+      calls[3].cb(true, nil, {})
+    end)
+  end)
+
+  t.it("concurrent call rejected; failed build preserves metadata and releases both leases", function()
+    fixture(function(ctx, scan, calls, selection, removed)
+      ue.build_csearch_async({ context = ctx, scan = scan })
+      ue.build_csearch_async({ context = ctx, scan = function() error("must not scan twice") end })
+      t.assert_eq(#calls, 1)
+      calls[1].cb(false, "index failed", {})
+      t.assert_eq(removed(), 0)
+      t.assert_nil(require("ue.project_state").read(ctx.engine_root, selection).csearch_input_hash)
+      t.assert_false(ue._csearch_build_running_for_test())
+      ue.build_csearch_async({ context = ctx, scan = scan })
+      t.assert_eq(#calls, 2)
+      calls[2].cb(true, nil, {})
+    end)
+  end)
+
+  t.it("scan failure and spawn exception release writer state for retry", function()
+    fixture(function(ctx, scan, calls)
+      ue.build_csearch_async({ context = ctx, scan = function(_, _, cb) cb(nil, "scan failed") end })
+      t.assert_false(ue._csearch_build_running_for_test())
+      t.assert_eq(#calls, 0)
+      local saved = cs.build_index
+      cs.build_index = function() error("spawn failed") end
+      ue.build_csearch_async({ context = ctx, scan = scan })
+      t.assert_false(ue._csearch_build_running_for_test())
+      cs.build_index = saved
+      ue.build_csearch_async({ context = ctx, scan = scan })
+      t.assert_eq(#calls, 1)
+      calls[1].cb(true, nil, {})
+    end)
+  end)
+
+  t.it("missing tool refuses before acquiring leases or scanning", function()
+    fixture(function(ctx, scan, calls)
+      cs.cindex_uefilter_exe = function() return nil end
+      ue.build_csearch_async({ context = ctx, scan = function() error("must not scan without cindex") end })
+      t.assert_false(ue._csearch_build_running_for_test())
+      t.assert_eq(#calls, 0)
+      t.assert_nil(vim.uv.fs_stat(ctx.paths.runtime_dir .. "/prepare.lock"))
+      cs.cindex_uefilter_exe = function() return "cindex-test" end
+      ue.build_csearch_async({ context = ctx, scan = scan })
+      calls[1].cb(true, nil, {})
+    end)
+  end)
+
+  t.it("project switch preserves new project's dirty state and fingerprints captured input", function()
+    fixture(function(ctx, scan, calls, selection, removed)
+      ue.build_csearch_async({ context = ctx, scan = scan })
+      local hash = ue._list_fingerprint_for_test(ctx.paths.workspace_all_list)
+      local project_state = require("ue.project_state")
+      local other = assert(project_state.select(ctx.engine_root, ctx.engine_root .. "/Other",
+        ctx.engine_root .. "/Other/Other.uproject", { persist_default = false }))
+      vim.fn.writefile({ "different input" }, ctx.paths.workspace_all_list)
+      calls[1].cb(true, nil, {})
+      t.assert_eq(removed(), 0)
+      t.assert_eq(project_state.read(ctx.engine_root, selection).csearch_input_hash, hash)
+      t.assert_nil(project_state.read(ctx.engine_root, other).csearch_input_hash)
+    end)
+  end)
+
+  t.it("watcher owner change preserves other engine's dirty state", function()
+    fixture(function(ctx, scan, calls, _, removed)
+      local owner = "original dirty.json"
+      require("utils.ue_watch").persistent_dirty_status = function() return { path = owner } end
+      ue.build_csearch_async({ context = ctx, scan = scan })
+      owner = "other engine dirty.json"
+      calls[1].cb(true, nil, {})
+      t.assert_eq(removed(), 0)
+    end)
+  end)
+end)
+
 -- ── Policy A：构建串行（拒绝并发，标志无条件清）──────────────────────────
 t.describe("csearch 构建串行（D9 Policy A）", function()
   local function reset()

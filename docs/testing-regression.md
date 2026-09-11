@@ -31,7 +31,7 @@ fail-closed 语义），禁止注入假可执行文件/假宿主让断言「碰�
 | `lua/ue/index/**` / `lua/ue/clangd_commands.lua` / controlled CDB generators | `index_generation` `cpp_semantic_index` `clangd_commands` `ue_api` `ue_platform_boundary` |
 | `lua/ue/targets/**` / `lua/ue/workflows/**` / `lua/ue/target_tasks.lua` | `ue_target_drivers` `ue_target_integration` `ue_target_tasks` `ue_workflows` `ue_platform_boundary` `platform` `commands` `stability` |
 | `lua/utils/ue_goto/**` / C++ `gd` / semantic sidecar | `cpp_semantic_context` `cpp_semantic_client` `cpp_semantic_sidecar` `ue_goto_behavior` `utils` `ue_platform_boundary` |
-| `lua/utils/code_search/**` / `ue_paths.lua` | `ue_goto_behavior` `ue_paths` `utils` `ue_platform_boundary` |
+| `lua/utils/code_search/**` / `lua/ue/csearch_build.lua` / `ue_paths.lua` | `csearch_build_guard` `ue_goto_behavior` `ue_paths` `utils` `ue_platform_boundary` |
 | `lua/config/options.lua` / `autocmds.lua` | `options` `autocmds` |
 | `lua/theme.lua` / `lua/highlights.lua` / `colors/**` | `theme` `smoke` |
 | `lua/utils/stall_probe.lua` | `stall_probe` |
@@ -56,6 +56,9 @@ fail-closed 语义），禁止注入假可执行文件/假宿主让断言「碰�
 - **changelog 联动**：改动完成后在 `docs/changelog.md` 追加记录，其 Validation 字段写明
   **所跑回归范围（filter 或全量）与结果**，以及本次 **spec 一致性处置**
   （同步 spec / 立 change / 判定无 spec 影响）。
+- **反馈验收**：涉及已有探针的行为修复必须声明新的观察 revision，核实对应 topic 的 revision/armed 状态，
+  并在 Validation 中区分 fixture 已验证、观察已开启和现场已验证。不得以“没有新记录”替代覆盖检查，
+  不得把开启观察窗口写成现场修复已经确认。
 - **spec 一致性联动**：改动改变了 `openspec/specs/<capability>/spec.md` 已声明的可观察行为时，
   MUST 同步该 spec 或立一个承载该变更的 change；发现 spec 落后于已验证正确的实现时**反向更正 spec**。
   权威：`openspec/specs/spec-authority-loop/spec.md`、根 `AGENTS.md` 的 Definition of Done 第 2 条。
@@ -65,6 +68,22 @@ fail-closed 语义），禁止注入假可执行文件/假宿主让断言「碰�
 ```
 nvim --headless -l tests/run.lua
 ```
+
+语义导航、编译器或协议边界的最终验收必须启用真实工具门禁：
+
+```powershell
+$env:NVIM_TEST_REQUIRE_NATIVE = '1'
+nvim --headless -l tests/run.lua
+# 或：pwsh -File scripts/run_regression.ps1 -RequireNative
+```
+
+`UE_CLANGD` 可显式选择本机已有的兼容工具链。缺少 native 能力时，该模式失败；普通模式单独报告
+SKIP，跳过不计入通过数。汇总格式为 `N/M passed, K failed, S skipped`，M 不含跳过项。
+Linux CI 默认强制 native，并安装项目已有的 LLVM 22 工具链；其他宿主的缺失能力仍须显式显示。
+本地 runner 在加载模块前隔离 probe、state 与日志路径，避免回归写入或清理用户诊断日志。
+
+`cpp_semantic_pipeline` 使用临时项目输入，贯通真实 environment、native session/协议、catalog/query、
+实际跳转与正常退出反馈落盘；它不替代 source/clangd 的角色矩阵，也不代表大型 UE 项目的现场延迟验收。
 
 ## 本机真实能力健康检查
 

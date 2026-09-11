@@ -12,6 +12,19 @@
 
 ## 按领域导航（权威在 CONSTRAINTS §二）
 
+### Windows project selection (K70)
+
+Tab 可补出真实存在的盘符相对路径；必须按 OS cwd 语义解析后保存，不能因缺斜杠就归因于用户输入。
+→ [复现、修复与 assistant 复盘](../docs/project-selection-completion-postmortem.md)；
+`../docs/CONSTRAINTS.md §二 K70`。
+
+### Android SDK build selection (K71)
+
+运行时禁用 SDK 不等于 Target 已排除 SDK；必须核对实际禁用参数的消费者和普通/SO 两条构建链。
+私有配置路径、字段及参数的映射放在 worktree 外的 SDK 策略文件；公开例子只用通用值，
+不能编码、拼装私有标识规避隐私扫描。迁移须重验实际参数传递与公开镜像门禁。
+→ [SDK 参数修复与复盘](../docs/release_1.11.2.md)；`../docs/CONSTRAINTS.md §二 K71`。
+
 ### DAP（K1–K10；K1 属已退役 codelldb 路线）
 **先看归属分层**：34 条 DAP 坑里只有 8 条是本仓自己的 bug，9 条目标 OS 策略（L2）、10 条
 调试引擎（L3）、6 条编辑器管道。失败先指认层再给处置，能力靠探测而非假设。

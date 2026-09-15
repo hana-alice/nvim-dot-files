@@ -8907,6 +8907,7 @@ local function prepare_async(opts)
             refresh_statusline()
             set_prepare_running(false)
             if cdb_pipeline_ok then
+              INDEX_FN.schedule_prepare_delivery(ctx)
               CORE_RT.start_deferred_clangd(ctx)
             else
               vim.notify(

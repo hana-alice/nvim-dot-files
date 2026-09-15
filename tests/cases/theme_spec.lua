@@ -188,15 +188,17 @@ t.describe("theme: six-entry public surface", function()
         { "enum_member", "type" },
         { "macro", "namespace" },
       }) do
-        t.assert_true(colors[pair[1]] ~= colors[pair[2]],
-          name .. " must distinguish " .. pair[1] .. " from " .. pair[2])
+        if not (name == "sonokai-espresso" and pair[1] == "field" and pair[2] == "variable") then
+          t.assert_true(colors[pair[1]] ~= colors[pair[2]],
+            name .. " must distinguish " .. pair[1] .. " from " .. pair[2])
+        end
       end
 
       t.assert_eq(colors.namespace, colors.type, name .. " namespace should join the type family")
-      if name ~= "catppuccin" then
+      if name ~= "catppuccin" and name ~= "sonokai-espresso" then
         t.assert_eq(colors.enum_member, colors.field, name .. " enum member should join the data family")
       end
-      if name ~= "ubuntu-terminal" and name ~= "catppuccin" then
+      if name ~= "ubuntu-terminal" and name ~= "catppuccin" and name ~= "sonokai-espresso" then
         t.assert_eq(colors.parameter, colors.variable, name .. " parameter should stay in the low-weight local family")
       end
 
@@ -231,6 +233,40 @@ t.describe("theme: six-entry public surface", function()
 
     t.assert_true(theme.apply("monokai_ristretto", { persist = false, silent = true }))
     highlights.apply()
+  end)
+
+  t.it("Espresso matches VS Code token colors and composite backgrounds after ColorScheme", function()
+    highlights.setup()
+    t.assert_true(theme.apply("sonokai-espresso", { persist = false, silent = true }))
+    local function get(name) return vim.api.nvim_get_hl(0, { name = name, link = false }) end
+    for name, expected in pairs({
+      Normal = 0xE4E3E1, Comment = 0x90817B, Keyword = 0xF86882,
+      ["@lsp.type.property.cpp"] = 0xE4E3E1, ["@lsp.type.variable.cpp"] = 0xE4E3E1,
+      ["@lsp.type.parameter.cpp"] = 0xF08D71, ["@lsp.type.class.cpp"] = 0x81D0C9,
+      ["@lsp.type.function.cpp"] = 0xA6CD77, ["@lsp.type.enumMember.cpp"] = 0x9FA0E1,
+      ["@lsp.type.macro.cpp"] = 0x9FA0E1,
+    }) do
+      t.assert_eq(get(name).fg, expected, name .. " VS Code foreground")
+      t.assert_nil(get(name).bold, name .. " no forced bold")
+      t.assert_nil(get(name).italic, name .. " no forced italic")
+    end
+    for name, expected in pairs({
+      Normal = 0x312C2B, CursorLine = 0x352F2D, Visual = 0x483F3B,
+      Search = 0x4D4959, CurSearch = 0x633B41,
+      NormalFloat = 0x352F2D, Pmenu = 0x393230, PmenuSel = 0x49403C,
+      MiniStatuslineFilename = 0x282523, MiniStatuslineModeNormal = 0x282523,
+      SnacksPickerList = 0x282523, BufferLineBufferSelected = 0x312C2B,
+    }) do
+      t.assert_eq(get(name).bg, expected, name .. " VS Code background")
+    end
+    t.assert_true(get("@type.builtin.cpp").italic)
+    t.assert_eq(get("@type.builtin.cpp").fg, 0x81D0C9)
+    t.assert_nil(get("@type.cpp").italic, "named types remain upright")
+    t.assert_true(get("@keyword.modifier.cpp").italic)
+    t.assert_eq(get("@keyword.modifier.cpp").fg, 0xF86882)
+    for _, group in ipairs({ "@lsp.type.property", "@variable.member" }) do
+      t.assert_eq(get(group).fg, 0xE4E3E1, "generic member color")
+    end
   end)
 
   t.it("ColorScheme replays the active profile without leaking the previous theme", function()

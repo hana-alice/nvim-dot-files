@@ -61,7 +61,7 @@ t.describe("provider: compiler identity 必须绑定响应客户端", function()
     t.assert_eq(usr, "usr:cold-preamble")
   end)
 
-  t.it("structured provider 保留 unsupported 而不是折叠成 nil", function()
+  t.it("structured provider 保留 absence 而不是误报 unsupported", function()
     local provider = require("utils.ue_goto.provider")
     local old_get_clients = vim.lsp.get_clients
     vim.lsp.get_clients = function() return {} end
@@ -77,8 +77,8 @@ t.describe("provider: compiler identity 必须绑定响应客户端", function()
     vim.lsp.get_clients = old_get_clients
 
     t.assert_true(waited)
-    t.assert_eq(symbol_info.reason, "provider-method-unsupported")
-    t.assert_eq(definition.reason, "provider-method-unsupported")
+    t.assert_eq(symbol_info.reason, "provider-unavailable")
+    t.assert_eq(definition.reason, "provider-unavailable")
     t.assert_eq(#definition.locations, 0)
   end)
 

@@ -89,11 +89,11 @@ local THEME_PROFILES = {
   ["sonokai-espresso"] = {
     namespace = "Type",
     type = "Type",
-    field = "Identifier",
-    parameter = "Normal",
+    field = "Normal",
+    parameter = "Identifier",
     variable = "Normal",
     ["function"] = "Function",
-    enum_member = "Identifier",
+    enum_member = "Constant",
     macro = "Macro",
   },
 }
@@ -310,6 +310,18 @@ local function apply_semantic_modifiers()
 end
 
 function M.apply()
+  if vim.g.colors_name == "sonokai" and vim.g.sonokai_style == "espresso" then
+    require("sonokai_vscode").apply()
+    apply_semantic_roles()
+    apply_semantic_modifiers()
+    -- VS Code distinguishes built-in type/storage syntax from named types;
+    -- ordinary semantic identifiers retain the shared low-weight role style.
+    set_from(cpp_targets("@type.builtin"), "SonokaiVSCodeBuiltin")
+    set_from(cpp_targets("@keyword.modifier", "@type.qualifier", "@keyword.storage"), "StorageClass")
+    set_from(cpp_targets("@lsp.type.keyword"), "Keyword")
+    return
+  end
+
   set_from({
     "@keyword",
     "@keyword.function",

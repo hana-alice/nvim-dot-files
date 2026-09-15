@@ -431,19 +431,61 @@ t.describe("prepare 的索引调度不得被普通编辑饿死（真正的根因
     end
   end)
 
-  t.it("prepare 完成路径全部改用 schedule_prepare_delivery（不得再落回 120s）", function()
+  t.it("cold prepare waits for CDB completion and schedules delivery before waking clangd", function()
     local src = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
-    -- 三条 prepare 完成路径：fast-path / cold / pipeline。
-    local n = select(2, src:gsub("INDEX_FN%.schedule_prepare_delivery", ""))
-    t.assert_true(n >= 3,
-      ("prepare 的三条完成路径都应使用交付调度，实际 %d 处"):format(n))
-    -- 且这些路径不得再用带 full=true 的 refresh（那会落回 idle_cold_ms）。
-    for line in src:gmatch("[^\n]*schedule_index_refresh[^\n]*") do
-      if line:find("clear_index_dirty") then
-        t.assert_nil(line:match("full%s*=%s*true"),
-          "prepare 路径不得用 full=true 的 refresh：" .. line:sub(1, 80))
+    local parser = vim.treesitter.get_string_parser(src, "lua")
+    local query = vim.treesitter.query.parse("lua", [[
+      (assignment_statement
+        (variable_list (identifier) @name)
+        (expression_list (function_definition) @callback))
+    ]])
+    local callback_source
+    for _, match in query:iter_matches(parser:parse()[1]:root(), src, 0, -1) do
+      local name, callback
+      for id, nodes in pairs(match) do
+        local node = type(nodes) == "table" and nodes[1] or nodes
+        local text = vim.treesitter.get_node_text(node, src)
+        if query.captures[id] == "name" then name = text else callback = text end
       end
+      if name == "finalize_after_csearch" then callback_source = callback end
     end
+    t.assert_type(callback_source, "string", "extract the actual cold finalization callback")
+    local events, ctx = {}, { engine_root = "/fixture", paths = {} }
+    local function noop() end
+    local env = setmetatable({
+      ctx = ctx, cdb_pipeline_done = false, cdb_pipeline_ok = true,
+      end_phase = noop, clear_index_dirty = noop, invalidate_status_cache = noop,
+      refresh_statusline = noop, set_prepare_running = noop, update = noop,
+      update_state_field = noop, elapsed_s = function() return 1 end,
+      prepare_summary = function() return "prepared" end, timings = {},
+      project_code = {}, engine_code = {}, workspace_code = {}, workspace_all = {},
+      vim = { log = vim.log, notify = noop },
+      require = function(name)
+        if name == "utils.code_search" then return { _reset_probe_cache = noop } end
+        error("no watcher in isolated completion test")
+      end,
+      INDEX_FN = { schedule_prepare_delivery = function(actual)
+        t.assert_true(actual == ctx)
+        events[#events + 1] = "delivery"
+      end },
+      CORE_RT = { start_deferred_clangd = function(actual)
+        t.assert_true(actual == ctx)
+        events[#events + 1] = "clangd"
+      end },
+    }, { __index = _G })
+    local compile = assert(loadstring("return " .. callback_source, "@cold-prepare-finalize"))
+    setfenv(compile, env)
+    local finalize = compile()
+    finalize()
+    t.assert_true(env.finalize_waiting, "csearch completion must wait for pending CDB pipeline")
+    t.assert_eq(#events, 0)
+    env.cdb_pipeline_done, env.cdb_pipeline_ok = true, false
+    finalize()
+    t.assert_eq(#events, 0, "failed CDB must neither deliver nor wake clangd")
+    env.cdb_pipeline_ok = true
+    finalize()
+    t.assert_eq(table.concat(events, ","), "delivery,clangd",
+      "cold success must schedule semantic delivery before testing clangd readiness")
   end)
 
   t.it("交付调度为 full 传 protect（否则仍会被饿死）", function()

@@ -20,6 +20,11 @@ full/current/hot 生成器 SHALL 只消费当前 active argv 明确引用且可�
 - **THEN** controlled Full/current pipeline SHALL 验证该显式文件存在，并保留原 argv 的条件宏与 PCH 语义
 - **AND** 文件缺失 SHALL 返回失败且不发布 ready marker；不能用邻近 Editor 文件补齐
 
+#### Scenario: PCH recipe has been generated but no binary was built
+- **WHEN** `tools/prebuild_pch_v2.py` 只生成 response/batch 配方，未执行并验证 PCH 编译
+- **THEN** 它 MUST NOT 将预期的 binary PCH 路径写入 active CDB；原文本 include 或原生编译参数 SHALL 保留
+- **AND** 修复历史污染时，只允许移除本生成器路径、已存在的匹配 recipe 与相邻原文本 include 共同证明的缺失 binary 引用；外部或 binary-only PCH MUST 保持严格校验
+
 #### Scenario: unity response 与 active command 矛盾
 - **WHEN** response 的宏、include、target、语言或 PCH 与 active command 不同
 - **THEN** unity 证明 SHALL 被拒绝，并使用 exact-command fallback
@@ -241,6 +246,11 @@ MUST NOT 让用户以为语义能力已可用。
 - **THEN** controlled index SHALL 被构建并交付（manifest + selection + 提升后的 semantic CDB）
 - **AND** 随后对已证明唯一定义的 C++ 符号执行 `gd` SHALL 到达该定义
 - **AND** 流程 MUST NOT 要求用户执行 `UEIndexFull` 或其他索引命令
+
+#### Scenario: Cold asynchronous prepare finishes before semantic delivery
+- **WHEN** 首次异步 prepare 的 csearch 与 CDB pipeline 均已完成，且 CDB pipeline 成功
+- **THEN** 完成分支 SHALL 调用受保护的 `schedule_prepare_delivery` 后再尝试唤醒 clangd
+- **AND** CDB 尚未完成时 SHALL 等待，CDB 失败时 MUST NOT 调度交付或唤醒 clangd
 
 #### Scenario: Prepare completes while index build is still running
 - **WHEN** prepare 的 CDB 阶段完成但 controlled index 仍在构建

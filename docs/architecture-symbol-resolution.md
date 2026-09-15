@@ -1,6 +1,6 @@
 # Symbol Resolution Architecture — C++ 语义权威与非 C++ 兼容链
 
-> 最后更新：2026-09-09
+> 最后更新：2026-09-15
 > 权威代码：`lua/utils/lsp_fallback.lua`、`lua/utils/ue_goto/semantic_*.lua`、
 > `lua/ue/index/`、`lua/ue/clangd_commands.lua`、`scripts/ue_clang_semanticd.lua`、
 > `scripts/ue_clang_cursor_shim.c`
@@ -33,8 +33,16 @@ missing/stale 或 tuple 变化时才 defer。同进程内也逐次验证，避�
 
 1. 只向已接收 exact command 的 clangd client 请求 `textDocument/symbolInfo`，聚合响应中全部 canonical USR，不选数组首项；
 2. definition 请求只允许同一 USR 的 client 参与；
-3. 去除当前位置后必须只剩一个 destination，且与该 identity 的 definition evidence 相符；声明不可冒充 definition，否则返回结构化 role/empty/multiple reason；
+3. 去除当前位置后必须只剩一个 destination，且与该 identity 的 definition evidence 相符；source `symbolInfo` 不查询跨 TU index，目标不在其 definitionRange 时由 `clangd_destination.lua` 在目标 source TU 的 exact command 下再次验证同一 client/USR 与目标 definitionRange。声明不可冒充 definition，过期/目标编辑不跳转，临时 buffer 在未使用且未修改时清理；
 4. 目标为 header 时，把 exact command 记录为该窗口后续 header-in-context 查询的 origin TU evidence。
+
+实体角色不能一律用 `symbolInfo.definitionRange` 判定。`clangd_referent.lua` 按 clangd 的规则优先保留唯一
+macro USR（它可能与展开后类型一起返回，且本来不带两个 range）；同一 client 的唯一 macro definition
+可直接证明目标。alias/namespace 则用原 snapshot 的零长度 `textDocument/ast` range 检查
+`Typedef/type`、`Namespace/specifier`，再将唯一 destination 与唯一 USR 的 declarationRange 关联；
+保留 `declaration-resolved` 角色，不把函数声明、extern 或前置类冒充 body。未知 kind/真实身份分歧仍失败。
+已在 compiler definitionRange 内时直接报告 `already-at-definition`，避免 clangd 的 declaration/definition
+切换行为被误报为索引缺失。内建宏没有磁盘定义时报告 `macro-no-source-definition`。
 
 若 clangd restart 后已先用 synthetic CDB 的邻近 TU 推断命令打开 source，首次 exact transport 会对
 同一 client/command 只执行一次有序 `didClose → didChangeConfiguration → didOpen`，用当前 buffer 全文
@@ -97,6 +105,7 @@ source 与 header 共用同一 identity/destination authority。声明处不是�
 | `semantic_report.lua` | 纯报告数据：Explain、通知文本、脱敏和 probe payload；不执行请求或修改编辑器 |
 | `lsp_transport.lua` | 通用 LSP 请求、能力与超时；不发现 UE 构建，不调用 legacy search |
 | `clangd_adapter.lua` | clangd exact-command transport、canonical USR 与 identity 限定的 destination 请求 |
+| `clangd_referent.lua` | source macro/alias/namespace 的 compiler referent 关联与角色保留 |
 | `compat_navigation.lua` | 非 C++ definition 的重试/fallback 与 references 兼容策略 |
 | `semantic_environment.lua` | 只读环境快照与 transition 判定；不 evict、不清 lineage、不启动进程 |
 | `semantic_client.lua` | composition root：分开的 transport/action state，环境变化处置与 dispose |

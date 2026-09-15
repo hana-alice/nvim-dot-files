@@ -1,36 +1,4 @@
-# cpp-semantic-highlighting Specification
-
-## Purpose
-
-统一六个公开主题中的 C/C++ 核心语义角色，使 struct/class、field/property、parameter、variable、function、enum member、macro 与 namespace 在 Treesitter、clangd semantic token 和补全 surface 上保持可辨且一致，并确保主题切换后可重放。
-## Requirements
-### Requirement: 语义颜色必须跨解析 surface 一致
-
-系统 SHALL 对同一 C/C++ 角色统一设置 Treesitter capture、clangd LSP semantic token，并在 LSP CompletionItemKind 有对应项时统一 Blink/nvim-cmp completion kind。clangd token 到达前后，同一 token 的语义 foreground 与基础字形 MUST NOT 因 Treesitter/LSP source 切换而改变；completion 中的 Struct/Class/Field/Property/Function/Method/EnumMember/Constant/Module/Variable SHALL 与编辑区对应角色使用同一 foreground。LSP 标准没有 Parameter 与 Macro completion kind，系统 MUST NOT 伪造这两个 kind。
-
-#### Scenario: clangd semantic token 到达
-
-- **WHEN** C/C++ buffer 先由 Treesitter 着色，随后 clangd 发布 semantic tokens
-- **THEN** type、field、parameter、function 等角色保持同一 foreground 和克制的基础字形，仅允许 modifier 叠加状态字形
-
-#### Scenario: 打开代码补全
-
-- **WHEN** completion 菜单展示 Struct、Field、Method、EnumMember、Module 或其他受管 kind
-- **THEN** kind highlight 与编辑区对应语义角色使用同一 foreground，且不额外继承角色粗斜体
-
-### Requirement: 主题切换后必须重建语义对比
-
-系统 SHALL 在每次 `ColorScheme` 后按当前主题 profile 重建语义角色，不得把上一个主题的 RGB 泄漏到新主题。六个白名单主题 MUST 全部满足核心对比矩阵；主题白名单和默认主题 MUST 保持不变。
-
-#### Scenario: 连续预览多个主题
-
-- **WHEN** 用户在 ThemePicker 中连续预览不同公开主题
-- **THEN** 每次预览都使用当前主题 palette 派生角色色，且关键角色对比仍成立
-
-#### Scenario: 恢复默认主题
-
-- **WHEN** 用户切回 `monokai_ristretto`
-- **THEN** 语义角色恢复为 Monokai Ristretto profile，默认主题和持久化语义不变
+## MODIFIED Requirements
 
 ### Requirement: C/C++ 核心语义角色必须形成克制的视觉层级
 

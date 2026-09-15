@@ -23,6 +23,13 @@
 
 - **WHEN** 用户执行 `:Theme sonokai-espresso` 或从 picker 选择 Sonokai Espresso
 - **THEN** 系统在执行 `:colorscheme sonokai` 前强制 `g:sonokai_style = "espresso"`，并持久化 `sonokai-espresso`
+- **AND** 使用 VS Code Sonokai Espresso 0.2.9 的编辑区、选区、搜索、浮窗、侧栏、标签与状态栏配色；沿用现有 Sonokai 插件，不新增主题入口或依赖。RGBA 背景按 editor.background 合成为 Neovim RGB。
+
+#### Scenario: Espresso 切换与启动重放
+
+- **WHEN** 启动恢复、ThemePicker 预览或 `ColorScheme` 重新应用 Sonokai Espresso
+- **THEN** VS Code 适配在主题加载后重放，普通注释与关键字不额外强制粗斜体；仅内建类型与 storage modifier 保留原主题斜体语法
+- **AND** 切换至其他主题后不残留 Espresso 配色覆盖
 
 #### Scenario: 设置未注册入口
 

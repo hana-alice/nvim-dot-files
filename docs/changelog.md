@@ -54,6 +54,8 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 - `v1.11.1` → `docs/release_1.11.1.md` (tag pending explicit confirmation)
 - `v1.11.2` → `docs/release_1.11.2.md` (tag pending explicit confirmation)
 
+- `v1.11.3` → `docs/release_1.11.3.md` (tag pending explicit confirmation)
+
 ## Unreleased
 
 ### 2026-09-11 — Keep project SDK mappings outside the public mirror

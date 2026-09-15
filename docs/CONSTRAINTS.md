@@ -1078,6 +1078,24 @@
   → `docs/release_1.11.2.md`；`openspec/specs/ue-target-driver-boundary/spec.md`；
     `openspec/specs/android-so-quick-deploy/spec.md`
 
+- **K72 — Prepare delivery, PCH recipes and cross-TU definition proof are separate gates**
+  症状：`AllocUniformBuffer` 报 method unsupported，但现场客户端数为零；冷 prepare 生成 CDB 后漏调
+  semantic delivery。补调后又发现 recipe 生成器发布不存在的 PCH，且 source symbolInfo 不含跨 TU body。
+  约束：成功 cold finalize 必须调度交付；配方不是 binary artifact，缺失 `-include-pch` 不会自动回退文本；
+  source symbolInfo 未见 body 时，应在目标 exact-command TU 用相同 client/USR/definitionRange 核验。
+  不得把零客户端报成不支持方法，也不得把普通 definition response 当作 body 身份闭环。
+  → `docs/release_1.11.3.md` navigation repair；`openspec/specs/cpp-semantic-index-coverage/spec.md`；
+    `openspec/specs/cpp-contextual-definition-navigation/spec.md`。
+
+- **K73 — definitionRange is not a universal entity-role discriminator**
+  症状：真实 clangd 已返回 Vulkan extension macro 的定义，但本仓以缺失 symbolInfo range 拒绝；
+  alias/namespace 与宏展开又分别触发 declaration-only 和多 USR 误判。上一轮函数实测不能证明所有实体可用。
+  约束：按 compiler macro referent / exact-position AST + 唯一 identity-location 关联判断角色；
+  alias/namespace 保留 declaration，不放行函数纯声明、extern 或前置类。自定义 gd 验收必须覆盖实体种类矩阵，
+  并主动审计真实文件中的 compiler token 位置，不能仅重试用户给的一个符号。
+  → `docs/cpp-navigation-kind-audit.md`；`lua/utils/ue_goto/clangd_referent.lua`；
+    `tests/cases/ue_goto_behavior_referent_spec.lua`。
+
 ## 三、约束（Constraints）
 
 承重项。所有贡献都必须遵守。

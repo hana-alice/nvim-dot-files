@@ -87,6 +87,43 @@ t.describe("multi-instance project state", function()
     pcall(vim.fn.delete, root, "rf")
   end)
 
+  -- K61 (2026-09-03 实测)：`M.update` 在本进程没有选中项目时返回
+  -- `false, "no project selected in this Neovim session"`。丢弃该返回值的写入方会
+  -- 报告成功而实际什么都没落盘，读取方继续解析旧值——这正是
+  -- `:UESetAndroidPackage` 报「已设置」而 `<Space>da` 仍 attach 旧包名的机制。
+  -- `commit()` 是「写入 + 从读取方同一 bucket 回读验证」的唯一入口。
+  t.it("commit 在未选中项目时失败，且不得声称写入成功", function()
+    local root = tmpdir()
+    local engine = root .. "/engine"
+    local state = require("ue.project_state")
+    state._reset_for_test()
+
+    t.assert_nil(state.current(engine), "precondition: no selection in this process")
+    local ok, err = state.commit(engine, "android_package", "com.example.never")
+    t.assert_false(ok, "commit must fail without a selected project")
+    t.assert_match(tostring(err), "no project selected")
+    t.assert_nil(state.read(engine).android_package, "nothing may be persisted")
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("commit 成功时值可从读取方 bucket 立刻回读", function()
+    local root = tmpdir()
+    local engine = root .. "/engine"
+    local project = root .. "/Project"
+    local uproject = project .. "/Game.uproject"
+    write(uproject)
+    local state = require("ue.project_state")
+    state._reset_for_test()
+    assert(state.select(engine, project, uproject, { persist_default = false }))
+
+    t.assert_true(state.commit(engine, "android_package", "com.example.stale"))
+    t.assert_eq(state.read(engine).android_package, "com.example.stale")
+    -- 纠正一次错误输入后，读取方必须立刻看到新值（无进程内缓存可挡）。
+    t.assert_true(state.commit(engine, "android_package", "com.example.fresh"))
+    t.assert_eq(state.read(engine).android_package, "com.example.fresh")
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
   t.it("ue context paths follow the process-local project bucket", function()
     local root = tmpdir()
     local engine = root .. "/engine"
@@ -293,6 +330,90 @@ t.describe("multi-instance project state", function()
     pcall(vim.fn.delete, root, "rf")
   end)
 
+  t.it("a delayed stale reclaimer cannot delete a newly acquired lease", function()
+    local root = tmpdir()
+    local path = root .. "/race.lock"
+    local lock = require("ue.file_lock")
+    vim.fn.mkdir(path, "p")
+    vim.fn.writefile({ vim.json.encode({ pid = 2147483647, token = "stale" }) }, path .. "/owner.json")
+    local original_kill = vim.uv.kill
+    local competing, entered
+    vim.uv.kill = function(pid, signal)
+      if pid == 2147483647 and not entered then
+        entered = true
+        competing = assert(lock.acquire(path))
+        return nil, "ESRCH"
+      end
+      return original_kill(pid, signal)
+    end
+    local ok, acquired = pcall(lock.acquire, path)
+    vim.uv.kill = original_kill
+    local owner = lock.owner(path)
+    if acquired then lock.release(acquired) end
+    if competing then lock.release(competing) end
+    pcall(vim.fn.delete, root, "rf")
+    t.assert_true(ok)
+    t.assert_nil(acquired, "the second stale reclaimer must lose to the new live owner")
+    t.assert_eq(owner and owner.token, competing and competing.token)
+  end)
+
+  t.it("a crashed owner and an interrupted empty-directory reap remain recoverable", function()
+    local root = tmpdir()
+    local path = root .. "/crash.lock"
+    local result = child_lua(string.format("assert(require('ue.file_lock').acquire(%q))", path))
+    t.assert_eq(result.code, 0, result.stderr)
+    local lock = require("ue.file_lock")
+    local recovered = assert(lock.acquire(path))
+    t.assert_true(lock.release(recovered))
+    vim.fn.mkdir(path, "p")
+    vim.uv.fs_utime(path, os.time() - 10, os.time() - 10)
+    local empty_recovered = assert(lock.acquire(path))
+    t.assert_true(lock.release(empty_recovered))
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("a failed process permission probe does not authorize lease reclamation", function()
+    local root = tmpdir()
+    local path = root .. "/permission.lock"
+    vim.fn.mkdir(path, "p")
+    vim.fn.writefile({ vim.json.encode({ pid = 2147483646, token = "protected" }) }, path .. "/owner.json")
+    local lock, original_kill = require("ue.file_lock"), vim.uv.kill
+    vim.uv.kill = function() return nil, "EPERM: operation not permitted" end
+    local ok, acquired = pcall(lock.acquire, path)
+    vim.uv.kill = original_kill
+    local owner = lock.owner(path)
+    if acquired then lock.release(acquired) end
+    pcall(vim.fn.delete, root, "rf")
+    t.assert_true(ok)
+    t.assert_nil(acquired)
+    t.assert_eq(owner and owner.token, "protected")
+  end)
+
+  t.it("unknown nonempty leases stay intact with actionable owner diagnostics", function()
+    local root = tmpdir()
+    local lock = require("ue.file_lock")
+    for index, fixture in ipairs({
+      { content = "{", reason = "corrupt owner record" },
+      { content = "{}", reason = "invalid owner record" },
+      { reason = "unreadable owner record" },
+    }) do
+      local path = root .. "/unknown" .. index .. ".lock"
+      vim.fn.mkdir(path, "p")
+      vim.fn.writefile({ "preserve" }, path .. "/evidence.txt")
+      if fixture.content then vim.fn.writefile({ fixture.content }, path .. "/owner.json") end
+      vim.uv.fs_utime(path, os.time() - 10, os.time() - 10)
+      local acquired, err = lock.acquire(path)
+      if acquired then lock.release(acquired) end
+      t.assert_nil(acquired)
+      t.assert_contains(err, fixture.reason)
+      t.assert_contains(err, "inspect the holding process")
+      t.assert_contains(err, path .. "/owner.json")
+      t.assert_eq(vim.fn.readfile(path .. "/evidence.txt")[1], "preserve")
+      if fixture.content then t.assert_eq(vim.fn.readfile(path .. "/owner.json")[1], fixture.content) end
+    end
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
   t.it("global probe counts merge instead of losing concurrent events", function()
     local root = tmpdir()
     local path = root .. "/probes.json"
@@ -312,6 +433,12 @@ t.describe("multi-instance project state", function()
       local result = job:wait()
       t.assert_eq(result.code, 0, result.stderr)
     end
+    -- An exiting writer may have journaled its last delta under lock contention.
+    -- Recover through the production reader, then verify the published total too.
+    local store = require("utils.probe_store")
+    local recovered = assert(store.read(path))
+    t.assert_eq(recovered.topics["multi-instance"].records["same-key"].count, 8)
+    t.assert_true(store.save(path, { data = recovered, base = recovered }))
     local decoded = vim.json.decode(table.concat(vim.fn.readfile(path), "\n"))
     t.assert_eq(decoded.topics["multi-instance"].records["same-key"].count, 8)
     pcall(vim.fn.delete, root, "rf")

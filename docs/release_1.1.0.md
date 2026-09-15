@@ -1203,6 +1203,19 @@ Three pieces:
 
 ### 2026-06-02 — fix(dap/android): honor lldb-server priority order for <space>da
 
+> **⚠️ SUPERSEDED / FALSIFIED (2026-09-03, docs/CONSTRAINTS.md K56).** The
+> root-cause attribution below — "NDK r27's LLDB 18 lldb-server … reproduced the
+> known Android platform handoff failure: outer `platform connect` works, inner
+> `process attach` drops with `lost connection`" — is **wrong**. Device-server
+> version is not the variable: LLDB 9 / 14 / 18 all fail identically when the
+> platform server runs as the **shell uid**, and LLDB 18 succeeds 3/3 when it
+> runs as the **app uid** via `run-as <pkg>`. The real cause is that shell uid
+> cannot ptrace the app on this `user` build, and NDK 27 LLDB 18's lldb-server
+> crashes (SIGSEGV in the forked gdbserver's `vAttach`) instead of returning that
+> denial as an error. The "NDK r21 first" ordering this entry introduced was
+> later reverted by K30; the current pin is NDK 27 LLDB 18.x (C1). Kept for the
+> audit trail — **do not use it to justify downgrading the device server.**
+
 **Issue**
 
 After the Source/SampleGame project-root fix, live `<space>da` still failed. Fresh logs at 11:19 showed `platform connect` succeeded, but `process attach --pid 20595` returned `error: attach failed: lost connection`; the adapter then emitted `process exited during launch or attach`, `failed to retrieve threads from process`, and dap-ui's threads panel crashed on the failed response.
@@ -1321,6 +1334,16 @@ Follow-up:
 
 ## 2026-06-02 — Android DAP gdbserver attach on ANDROID-SERIAL-A
 
+> **⚠️ SUPERSEDED / FALSIFIED (2026-09-03, docs/CONSTRAINTS.md K31/P16/K56).** The
+> route adopted here — pre-spawned `lldb-server gdbserver --attach <pid>` +
+> `gdb-remote 127.0.0.1:<port>` — is **retired**: on this device class the
+> `gdbserver --attach` form never binds its listen port (K31/P16). The
+> `platform connect` + `process attach --pid` failure this entry blames is
+> explained by K56 (the platform server was running as the **shell uid**, which
+> cannot ptrace the app on a `ro.debuggable=0` build), **not** by platform mode
+> being broken. Current route: `docs/TOOLING.md` §"Current Android DAP status".
+> Kept for the audit trail only.
+
 - Task: continue the UE Android nvim-dap/lldb-dap attach fix, with validation limited to adb serial `ANDROID-SERIAL-A`.
 - Completed:
   - Replaced the Android attach command path from `platform select/connect` + `process attach --pid` with a pre-spawned `lldb-server gdbserver --attach <pid>` and lldb-dap `gdb-remote 127.0.0.1:<port>` attach command.
@@ -1375,6 +1398,13 @@ Follow-up:
   - Running Neovide is still embedded, so restart Neovide to load this patch before retesting `<space>da`.
 
 ## 2026-06-02 - Android DAP lldb-server latest-version probe
+
+> **⚠️ SUPERSEDED / FALSIFIED (2026-09-03, docs/CONSTRAINTS.md K56).** This probe
+> treated the **device-server version** as the variable. It is not: LLDB 9 / 14 /
+> 18 all fail identically under the shell uid and all work under the app uid. The
+> `windows.lua` priority override described here was reverted; the current pin is
+> NDK 27 LLDB 18.x (C1) and `default_lldb_server_paths()` lists NDK 27 first.
+> **Do not use this entry to justify swapping device-server versions.**
 
 Task: temporarily test the Android DAP path on adb serial `ANDROID-SERIAL-A` with the newest available device-side `lldb-server` instead of the UE/NDK21-pinned binary.
 

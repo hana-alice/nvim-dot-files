@@ -52,7 +52,8 @@ local platform = require("utils.platform")
 -- re-probe after the toolchain may have become available.
 local _csearch_path = nil
 local _cindex_path = nil
-local MIN_INDEX_SIZE = 1024
+local INDEX_MAGIC = "csearch index 1\n"
+local INDEX_TRAILER = "\ncsearch trailr\n"
 
 function M._reset_probe_cache()
   _csearch_path = nil
@@ -127,28 +128,31 @@ end
 
 local function usable_index_stat(path)
   local stat = path and vim.loop.fs_stat(path) or nil
-  return stat and stat.size and stat.size > MIN_INDEX_SIZE and stat or nil
-end
-
-local function recover_staged_index(idx)
-  if usable_index_stat(idx) then
-    return true
+  local trailer_size = 20 + #INDEX_TRAILER
+  if not stat or stat.type ~= "file" or stat.size < #INDEX_MAGIC + trailer_size then return nil end
+  -- Read bounded framing/offset metadata, never a whole multi-GB index.
+  -- Size alone accepts both truncated writers and arbitrary unrelated files.
+  local file = io.open(path, "rb")
+  if not file then return nil end
+  local magic = file:read(#INDEX_MAGIC)
+  local trailer_at = file:seek("end", -trailer_size)
+  local trailer = trailer_at and file:read(trailer_size)
+  file:close()
+  if magic ~= INDEX_MAGIC or not trailer or #trailer ~= trailer_size
+      or trailer:sub(21) ~= INDEX_TRAILER then return nil end
+  local offsets = {}
+  local previous = #INDEX_MAGIC
+  for at = 1, 20, 4 do
+    local a, b, c, d = trailer:byte(at, at + 3)
+    local offset = ((a * 256 + b) * 256 + c) * 256 + d
+    if offset < previous or offset > trailer_at then return nil end
+    offsets[#offsets + 1] = offset
+    previous = offset
   end
-
-  for _, staged in ipairs({ idx .. "~~", idx .. "~" }) do
-    if usable_index_stat(staged) then
-      local cur = vim.loop.fs_stat(idx)
-      if cur then
-        pcall(vim.loop.fs_unlink, idx)
-      end
-      local ok = pcall(vim.loop.fs_rename, staged, idx)
-      if ok and usable_index_stat(idx) then
-        return true
-      end
-    end
-  end
-
-  return false
+  if offsets[1] ~= #INDEX_MAGIC or offsets[5] - offsets[4] < 4
+      or (offsets[5] - offsets[4]) % 4 ~= 0
+      or (trailer_at - offsets[5]) % 11 ~= 0 then return nil end
+  return stat
 end
 
 -- Check that a usable csearch index file exists for this workspace.
@@ -156,12 +160,12 @@ function M.is_indexed(ctx)
   if not csearch_exe() then return false end
   local idx = M.index_path(ctx)
   if not idx then return false end
-  return recover_staged_index(idx)
+  -- Availability is read-only. Only a successful writer may publish staging;
+  -- abandoned temporary files are never treated as committed search data.
+  return usable_index_stat(idx) ~= nil
 end
 
-M._recover_staged_index_for_test = recover_staged_index
-
--- Test seam: "is this index path usable?" (exists + above min size). Backs the
+-- Test seam: "is this published index framed completely?" Backs the
 -- D9 resilience guard that refuses incremental builds onto a corrupt/0-byte idx.
 function M._usable_index_for_test(path)
   return usable_index_stat(path) ~= nil
@@ -757,7 +761,6 @@ function M.build_index(ctx, abs_list_path, cb, opts)
         cb(false, "cindex-uefilter exit=" .. code .. ": " .. table.concat(stderr_buf, ""), { ms = ms })
         return
       end
-      recover_staged_index(idx)
       local stat = usable_index_stat(idx)
       if not stat then
         cb(false, "cindex-uefilter completed but produced no usable csearch index at " .. idx, { ms = ms, index_size = 0 })

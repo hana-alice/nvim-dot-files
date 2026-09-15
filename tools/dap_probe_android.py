@@ -6,6 +6,15 @@
 # gdb-remote handshake + breakpoint command sequence outside nvim so the
 # adapter <-> lldb-server boundary can be isolated.
 #
+# ⚠️ FALSIFIED ROUTE (docs/CONSTRAINTS.md K31/P16/K56). This probe drives the
+# `lldb-server gdbserver --attach <pid>` form, which is NOT the production
+# route: on this device class it never reliably binds its listen port, and the
+# `lost connection` class of failure it was written to chase is actually a
+# server-uid problem (K56 — the platform server must run as the app uid via
+# `run-as <pkg>`). The production probe is tools/dap_platform_probe.py
+# (serial-form `platform connect` + `process attach --pid`). Kept only as a
+# differential/archaeological instrument.
+#
 # Usage:
 #   python tools/dap_probe_android.py <serial> <pid> <MODE> [base_hex]
 #   MODE = handshake | none | imagelookup | sourcebp | addrbp

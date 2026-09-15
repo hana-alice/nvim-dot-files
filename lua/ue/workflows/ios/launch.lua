@@ -117,7 +117,7 @@ function M.launch(platform, opts, deps)
             bundle_id = bundle_id,
             artifacts = artifacts,
             process_id = parsed.process_id,
-          })
+          }, ctx)
           if not runtime then
             launch_error(update_err)
             return

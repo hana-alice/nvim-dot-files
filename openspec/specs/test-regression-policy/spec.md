@@ -92,6 +92,8 @@ Done。根 `CLAUDE.md` MUST 保持为 `@AGENTS.md` 导入 stub，不承载独立
 - **WHEN** 准备 commit 或 PR（跨子系统改动、重构、或无法判定影响面时）
 - **THEN** 政策要求运行不带 filter 的全量 `nvim --headless -l tests/run.lua` 并全绿（退出码 0）
 - **AND** 跨多个子系统的改动不得仅凭单一 filter 范围即视为验证通过
+- **AND** 语义导航/编译器契约的最终验收 SHALL 使用 `NVIM_TEST_REQUIRE_NATIVE=1`，缺少真实工具不得以跳过代替通过
+- **AND** CI SHALL 至少在一个默认验收 lane 强制执行 native 组，其余宿主的能力跳过 SHALL 独立可见
 
 #### Scenario: 拿不准影响面就升级范围
 

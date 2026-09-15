@@ -6,6 +6,21 @@ t.bootstrap()
 
 local ue = require("ue")
 
+t.describe("UESetProject completion and failure feedback", function()
+  for _, mode in ipairs({ "tab-file", "tab-workspace", "drive-root", "absolute", "missing", "empty-directory", "persist-failed", "probe-failed" }) do
+    if (mode:match("^tab") or mode == "drive-root") and vim.fn.has("win32") ~= 1 then
+      t.skip(mode, "requires native Windows drive-relative completion")
+    else
+      t.it(mode, function()
+        local cfg = vim.fn.stdpath("config")
+        local result = vim.system({ vim.v.progpath, "--clean", "--headless", "-l",
+          cfg .. "/tests/fixtures/project_selection.lua", cfg, mode }, { text = true, timeout = 15000 }):wait()
+        t.assert_eq(result.code, 0, (result.stdout or "") .. (result.stderr or ""))
+      end)
+    end
+  end
+end)
+
 local function tmpdir()
   local dir = vim.fn.tempname():gsub("\\", "/")
   vim.fn.mkdir(dir, "p")

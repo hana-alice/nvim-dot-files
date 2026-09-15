@@ -11,6 +11,41 @@ local function loc(path, line)
 end
 
 t.describe("cpp semantic transaction", function()
+  t.it("encodes immutable snapshot byte positions for each provider", function()
+    local line = "/*中😀*/ target();"
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, { line })
+    local column = assert(line:find("target", 1, true)) - 1
+    vim.api.nvim_win_set_cursor(0, { 1, column })
+    local expected = {}
+    for _, encoding in ipairs({ "utf-8", "utf-16", "utf-32" }) do
+      expected[encoding] = vim.lsp.util.make_position_params(0, encoding).position.character
+    end
+    local tx = transaction.create({ snapshot = { cursor = { 1, column } } })
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, { "another line" })
+    for encoding, character in pairs(expected) do
+      t.assert_eq(transaction.make_position_params(tx, 0, encoding).position.character, character)
+    end
+    vim.bo.modified = false
+  end)
+
+  t.it("preserves distinct targets on the same line and recognizes the subject token range", function()
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, { "void foo() {} void bar(){foo();}" })
+    local tx = transaction.create({ snapshot = { cursor = { 1, 25 } } })
+    local path = vim.api.nvim_buf_get_name(0)
+    local definition = loc(path, 1)
+    definition.range.start.character = 5
+    definition.range["end"] = { line = 0, character = 8 }
+    local subject = loc(path, 1)
+    subject.range.start.character = 24
+    subject.range["end"] = { line = 0, character = 27 }
+    t.assert_false(transaction.same_subject_location(tx, definition))
+    t.assert_true(transaction.same_subject_location(tx, subject))
+    local filtered = transaction.filter_definition_locations(tx, { definition, subject }, subject)
+    t.assert_eq(#filtered, 1)
+    t.assert_eq(filtered[1].range.start.character, 5)
+    vim.bo.modified = false
+  end)
+
   t.it("owns copied snapshot/build/context/entity/index tables", function()
     local snapshot = { bufnr = 0, cursor = { 3, 4 }, document_version = 9, changedtick = 9 }
     local build = { build_fingerprint = "before" }
@@ -49,6 +84,7 @@ t.describe("cpp semantic transaction", function()
     })
     local current_path = vim.api.nvim_buf_get_name(0)
     local declaration = loc(current_path, 3)
+    declaration.range.start.character = 4
     local definition = loc(current_path, 8)
 
     t.assert_eq(transaction.subject_role(tx, declaration, definition), "declaration")
@@ -92,7 +128,11 @@ t.describe("cpp semantic transaction", function()
       transaction.terminal("unavailable", "provider", "identity-missing"),
       function(result) delivered[#delivered + 1] = result end)
     local second = transaction.finish_once(tx,
-      transaction.terminal("resolved", "jump", "unknown"),
+      transaction.terminal("resolved", "jump", "definition-resolved", {
+        identity = "usr:fixture", provider = "clangd", destination_role = "definition",
+        location = { uri = "file:///fixture.cpp", range = { start = { line = 0, character = 0 } } },
+        metrics = { source = "clangd" },
+      }),
       function(result) delivered[#delivered + 1] = result end)
 
     t.assert_true(first)

@@ -95,8 +95,11 @@ local function collect_evidence_files(roots, active, subject)
   return cpp_json, depfiles, "filesystem-scan"
 end
 
-function M.install(Sidecar)
-  function Sidecar:handle_catalog(request)
+local Catalog = {}
+Catalog.__index = Catalog
+
+do
+  function Catalog:handle_catalog(request)
     local started = libclang.uv.hrtime()
     local cdb_path = libclang.join(request.cdb_dir, "compile_commands.json")
     local active_cdb_path = request.active_cdb_path or cdb_path
@@ -111,7 +114,7 @@ function M.install(Sidecar)
         state = "unavailable",
         reason = freshness_reason,
         contexts = {},
-        metrics = self:_metrics({ total_ms = libclang.duration_ms(started) }),
+        metrics = self.metrics({ total_ms = libclang.duration_ms(started) }),
       }
     end
     local entries = libclang.read_json(cdb_path)
@@ -124,7 +127,7 @@ function M.install(Sidecar)
         state = "unavailable",
         reason = "merged-compilation-database-unreadable",
         contexts = {},
-        metrics = self:_metrics({ total_ms = libclang.duration_ms(started) }),
+        metrics = self.metrics({ total_ms = libclang.duration_ms(started) }),
       }
     end
     local active_entries = libclang.read_json(active_cdb_path)
@@ -137,12 +140,23 @@ function M.install(Sidecar)
         state = "unavailable",
         reason = "active-compilation-database-unreadable",
         contexts = {},
-        metrics = self:_metrics({ total_ms = libclang.duration_ms(started) }),
+        metrics = self.metrics({ total_ms = libclang.duration_ms(started) }),
       }
     end
 
-    local compile_db = semantic_context.load_compilation_database(entries)
-    local membership_db = semantic_context.load_compilation_database(active_entries)
+    local compile_db, compile_error = semantic_context.load_compilation_database(entries)
+    local membership_db, membership_error = semantic_context.load_compilation_database(active_entries)
+    if not compile_db or not compile_db.complete or not membership_db or not membership_db.complete then
+      local failed, detail = membership_db, membership_error
+      if not compile_db or not compile_db.complete then failed, detail = compile_db, compile_error end
+      return {
+        v = self.protocol.VERSION, id = request.id, op = "catalog", ok = true, state = "unavailable",
+        reason = (not compile_db or not compile_db.complete) and "merged-cdb-incomplete" or "active-cdb-incomplete",
+        contexts = {}, coverage = { complete = false,
+          rejected = failed and failed.rejected or { { reason = detail or "cdb-unreadable" } } },
+        metrics = self.metrics({ total_ms = libclang.duration_ms(started) }),
+      }
+    end
     local cpp_paths, dep_paths, discovery = collect_evidence_files(
       request.evidence_roots,
       request.active_build,
@@ -289,7 +303,7 @@ function M.install(Sidecar)
       state = state,
       reason = #wire == 0 and "no-proven-context" or nil,
       contexts = wire,
-      metrics = self:_metrics({
+      metrics = self.metrics({
         total_ms = libclang.duration_ms(started),
         cpp_json_scanned = #cpp_paths,
         depfiles_scanned = #dep_paths,
@@ -297,6 +311,12 @@ function M.install(Sidecar)
       }),
     }
   end
+end
+
+function M.new(deps)
+  return setmetatable({
+    toolchain = deps.toolchain, protocol = deps.protocol, metrics = assert(deps.metrics),
+  }, Catalog)
 end
 
 return M

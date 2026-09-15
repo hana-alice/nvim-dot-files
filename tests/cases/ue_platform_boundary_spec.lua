@@ -80,6 +80,51 @@ t.describe("ue platform boundary: per-rule fixtures", function()
   end
 end)
 
+-- ════════════════════════════════════════════════════════════════════════
+-- 拆分 owner 的归属识别（2026-09-04）。
+--
+-- `lua/ue/dap/` 用平铺的 `_<target>_<concern>.lua` 约定拆分 target owner
+-- （既有 `_ios_*.lua`，新增 `_android_policy.lua`）。owner 识别必须认这个约定，
+-- 否则拆出来的 owner 会被判成 generic，它**自己的** target 命令字面量会被报成
+-- 违例——从而把贡献者推向「加 allowlist」而不是正确归属。
+--
+-- 同时必须保持精确：通用模块里的 target 字面量**仍然要被拦**。
+-- ════════════════════════════════════════════════════════════════════════
+t.describe("ue platform boundary: 拆分 owner 归属识别", function()
+  local TARGET_LITERAL = 'local cmd = { "adb", "-s", serial }\n'
+
+  local SPLIT_OWNERS = { "lua/ue/dap/android.lua", "lua/ue/dap/_android_policy.lua" }
+  local GENERIC_MODULES = {
+    "lua/ue/dap/failure.lua", "lua/ue/dap/capability.lua",
+    "lua/ue/dap/preflight.lua", "lua/ue/dap/smoke.lua", "lua/ue.lua",
+  }
+
+  for _, path in ipairs(SPLIT_OWNERS) do
+    t.it(path .. " 作为 target owner 允许自己的 target 字面量", function()
+      local violations = boundary.analyze_source(TARGET_LITERAL, path)
+      t.assert_false(has_rule(violations, boundary.RULES.target_policy_literal),
+        path .. " 是 Android owner，不应因自己的命令字面量被判违例")
+    end)
+  end
+
+  for _, path in ipairs(GENERIC_MODULES) do
+    t.it(path .. " 仍不得含 target 字面量（识别放宽不得过度）", function()
+      local violations = boundary.analyze_source(TARGET_LITERAL, path)
+      t.assert_true(has_rule(violations, boundary.RULES.target_policy_literal),
+        path .. " 是 target-generic，必须继续拦下 target 命令字面量")
+    end)
+  end
+
+  t.it("下划线前缀不得让任意文件变成 owner", function()
+    -- `_progress` / `_common` 没有 target 段，必须仍是 generic。
+    for _, path in ipairs({ "lua/ue/dap/_common.lua", "lua/ue/dap/_progress.lua" }) do
+      local violations = boundary.analyze_source(TARGET_LITERAL, path)
+      t.assert_true(has_rule(violations, boundary.RULES.target_policy_literal),
+        path .. " 不含 target 段，不得被识别为 owner")
+    end
+  end)
+end)
+
 t.describe("ue platform boundary: allowlist precision", function()
   t.it("ui-text allowlist does not excuse executable construction in allowlisted files", function()
     local violations =

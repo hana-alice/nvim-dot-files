@@ -358,6 +358,15 @@ local function owner_kind(path)
     return "dap_registry"
   end
   local dap_target = path:match("^lua/ue/dap/([%w_]+)%.lua$")
+  -- Split target owners follow this directory's flat `_<target>_<concern>.lua`
+  -- convention (see `_ios_*.lua`, `_android_policy.lua`), so strip a leading
+  -- underscore and keep only the target segment before classifying. Without this
+  -- a split owner would be judged "generic" and its own target command literals
+  -- would be reported as boundary violations — pushing contributors toward an
+  -- allowlist instead of the correct ownership.
+  if dap_target then
+    dap_target = dap_target:gsub("^_", ""):match("^([%a%d]+)") or dap_target
+  end
   if dap_target and ({ android = true, ios = true, mac = true, win64 = true, linux = true })[dap_target] then
     return "dap_target_owner"
   end
@@ -381,6 +390,9 @@ local function owner_target(path)
     return nil
   end
   part = part:lower()
+  -- Accept the flat split-owner convention (`_ios_session`, `_android_policy`):
+  -- the target name follows an optional leading underscore.
+  part = part:gsub("^_", "")
   if part:find("android", 1, true) == 1 then
     return "android"
   end

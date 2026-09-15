@@ -279,21 +279,37 @@ load_values = function(engine_root, selection)
   return value
 end
 
-function M.read(engine_root)
-  local selection = M.current(engine_root)
+-- Async owners can address their captured project without changing the live
+-- selector. Session-local target choices are overlaid only for live reads.
+function M.read(engine_root, captured)
+  local selection
+  if captured then
+    selection = normalize_selection(engine_root, captured.project_root, captured.uproject)
+  else
+    selection = M.current(engine_root)
+  end
   if not selection then return {} end
   local value = load_values(engine_root, selection)
   local key = engine_key(engine_root)
-  for field in pairs(SESSION_LOCAL_FIELDS) do
-    value[field] = session_values[key] and session_values[key][field] or nil
+  if not captured then
+    for field in pairs(SESSION_LOCAL_FIELDS) do
+      value[field] = session_values[key] and session_values[key][field] or nil
+    end
   end
   return value
 end
 
-function M.update(engine_root, key, value)
-  local selection = M.current(engine_root)
+-- A captured project is a persistence address, never a request to select it.
+function M.update(engine_root, key, value, captured)
+  local selection
+  if captured then
+    selection = normalize_selection(engine_root, captured.project_root, captured.uproject)
+  else
+    selection = M.current(engine_root)
+  end
   if not selection then return false, "no project selected in this Neovim session" end
   if SESSION_LOCAL_FIELDS[key] then
+    if captured then return false, "captured workflows cannot change live target selection" end
     local current = M.read(engine_root)
     return M.update_target(
       engine_root,
@@ -316,6 +332,35 @@ function M.update(engine_root, key, value)
     nonce = table.concat({ vim.fn.getpid(), vim.uv.hrtime() }, "-"),
     updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
   })
+end
+
+--- Write one state field and PROVE the value reads back from the same bucket
+--- the readers use. Returns (true) or (false, err).
+---
+--- K61: `M.update` returns `false, "no project selected in this Neovim session"`
+--- whenever this process holds no selection. A caller that discards that return
+--- reports success while nothing is persisted, and every reader keeps resolving
+--- the PREVIOUS value — measured 2026-09-03 as `:UESetAndroidPackage` printing
+--- "UE Android package set: …" while `<Space>da` kept attaching the old package.
+--- The readback also catches a writer/reader bucket split, which no return code
+--- from a single write can express.
+function M.commit(engine_root, key, value)
+  local ok, err = M.update(engine_root, key, value)
+  if not ok then return false, err or "state update failed" end
+  -- Tables cannot be compared by identity across a JSON round-trip; for them a
+  -- successful atomic write plus a present key is all this layer can assert.
+  local seen = M.read(engine_root)[key]
+  if type(value) == "table" then
+    if type(seen) ~= "table" then
+      return false, ("read-back missing for %s"):format(tostring(key))
+    end
+    return true
+  end
+  if seen ~= value then
+    return false, ("read-back mismatch for %s (wrote %s, reads %s)")
+      :format(tostring(key), tostring(value), tostring(seen))
+  end
+  return true
 end
 
 function M.update_target(engine_root, platform, configuration)

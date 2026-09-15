@@ -1,9 +1,6 @@
 name: headless
 
-# Phase G: gate every push and PR on the same two scripts the maintainer
-# runs locally before commit. Three platforms in parallel proves the
-# Phase A driver split + the platform-neutral bits actually work outside
-# the maintainer's Windows host.
+# Run the same unfiltered regression entrypoint used locally on each real host.
 
 on:
   push:
@@ -16,20 +13,85 @@ jobs:
   smoke:
     name: ${{ matrix.os }} / nvim ${{ matrix.nvim }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      # stdpath(config) must point at this checkout on both Windows and POSIX.
+      # Keep installation and startup-probe writes inside the disposable job.
+      XDG_CONFIG_HOME: ${{ github.workspace }}
+      XDG_DATA_HOME: ${{ github.workspace }}/.data
+      XDG_STATE_HOME: ${{ github.workspace }}/.state
+      XDG_CACHE_HOME: ${{ github.workspace }}/.cache
+      LOCALAPPDATA: ${{ github.workspace }}
+      # Linux is the mandatory LLVM acceptance lane. Other real hosts report
+      # explicit skips when the matching native tools are unavailable.
+      NVIM_TEST_REQUIRE_NATIVE: ${{ matrix.os == 'ubuntu-24.04' && '1' || '0' }}
+    defaults:
+      run:
+        working-directory: nvim
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-24.04, macos-latest, windows-latest]
         nvim: [stable]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          path: nvim
 
       - name: Install Neovim
         uses: rhysd/action-setup-vim@v1
         with:
           neovim: true
           version: ${{ matrix.nvim }}
+
+      - name: Python for generator regression fixtures
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Go for the existing cindex tool
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: nvim/tools/cindex-uefilter/go.mod
+          cache-dependency-path: nvim/tools/cindex-uefilter/go.sum
+
+      - name: Windows parser compiler environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Existing Tree-sitter CLI prerequisite
+        shell: bash
+        run: npm install --global tree-sitter-cli@0.26.1
+
+      - name: Existing ripgrep prerequisite (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y ripgrep
+
+      - name: Existing LLVM 22 toolchain for required native acceptance
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # Official versioned repository: https://apt.llvm.org/ (Noble, 22).
+          curl --fail --silent --show-error https://apt.llvm.org/llvm-snapshot.gpg.key -o "$RUNNER_TEMP/llvm.asc"
+          sudo install -m 0644 "$RUNNER_TEMP/llvm.asc" /usr/share/keyrings/llvm.asc
+          echo 'deb [signed-by=/usr/share/keyrings/llvm.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main' | sudo tee /etc/apt/sources.list.d/llvm22.list
+          sudo apt-get update
+          sudo apt-get install -y clang-22 clangd-22 libclang-22-dev
+          /usr/lib/llvm-22/bin/clangd --version
+          test -f /usr/lib/llvm-22/lib/libclang.so
+          echo 'UE_CLANGD=/usr/lib/llvm-22/bin/clangd' >> "$GITHUB_ENV"
+
+      - name: Existing ripgrep prerequisite (macOS)
+        if: runner.os == 'macOS'
+        run: command -v rg || brew install ripgrep
+
+      - name: Existing ripgrep prerequisite (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ripgrep -y --no-progress
+
+      - name: Bootstrap locked plugins and syntax parsers
+        run: nvim --headless -l scripts/bootstrap_headless_ci.lua
 
       - name: Print versions
         shell: bash
@@ -44,3 +106,10 @@ jobs:
       - name: Headless smoke
         shell: bash
         run: nvim -l scripts/headless_smoke.lua
+
+      - name: Full headless regression
+        run: nvim --headless -l tests/run.lua
+
+      - name: cindex regression
+        working-directory: nvim/tools/cindex-uefilter
+        run: go test -p 1 ./...

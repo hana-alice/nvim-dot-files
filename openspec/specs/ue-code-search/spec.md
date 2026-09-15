@@ -3,11 +3,31 @@
 ## Purpose
 
 定义 UE 工作区代码搜索的完整性、性能与缓存一致性合同：`<leader>/` 使用 csearch
-索引，watcher 仅维护有界 dirty overlay，prepare 家族独占索引写入，并通过内容指纹、
+索引，watcher 仅维护有界 dirty overlay，显式构建命令独占索引写入，并通过内容指纹、
 增量快照和事件降噪确保平台切换、批量文件变化及 Windows 元数据通知不会产生静默漏搜、
 并发损坏或持续卡顿。
 
 ## Requirements
+
+### Requirement: 索引读取只读且发布保留上一份完整索引
+
+索引可用性检查 SHALL 仅检查正式发布路径，并验证有界的格式头、尾与区段 offset；MUST NOT 基于文件大小把暂存文件提升为正式索引。reset 和 add SHALL 先完成暂存产物，再原子替换正式路径；写入、merge 或发布失败 MUST NOT 提前删除或截断原有正式索引。
+
+#### Scenario: 读取遇到仍在构建的暂存索引
+- **WHEN** writer 持有 lease 且存在暂存文件，正式索引缺失或不可用
+- **THEN** 读取 SHALL 返回不可用，并保留正式及暂存文件原状
+- **AND** MUST NOT 偷走 writer 暂存路径或把其视为已提交数据
+
+#### Scenario: reset 失败或尚未读完文件清单
+- **WHEN** 正式索引原本完整，而新 reset 尚未完成或输入清单读取失败
+- **THEN** 旧索引 SHALL 仍可按原字节读取
+- **AND** 只有新产物完整完成后才允许替换
+
+#### Scenario: 体积足够但不是索引
+- **WHEN** 正式路径含大于 1 KiB 的随机、截断或无完整格式头尾数据
+- **THEN** 可用性检查 SHALL 拒绝，不以体积作为完整性证明
+
+
 ### Requirement: `<leader>/` SHALL prefer complete indexed search
 
 UE 全代码搜索（`<leader>/`）SHALL **只**使用 csearch 索引后端，**任何情况下都不得在此入口使用 rg 或目录遍历**——无论是静默降级、cached-file-list + rg 批量搜索、还是 snacks 默认目录遍历兜底，一律 MUST NOT 出现在 `<leader>/` 路径。当 csearch 索引可用时使用 csearch；当 csearch 索引不可用时，`<leader>/` SHALL 给出可见错误并引导用户运行 `:UEPrepare`，而不是回落到任何 rg / 遍历路径。
@@ -94,12 +114,32 @@ to the newly selected bucket; it MUST NOT delete another project's reusable on-d
 - **THEN** 迁移 SHALL NOT 用平台子目录的旧索引覆盖它
 - **AND** 操作 SHALL 可重复安全运行
 
+### Requirement: 独立全量构建 csearch
+
+`:UEBuildCsearch` SHALL 异步重新枚举当前工作区的搜索文件清单，并强制以 reset 模式构建
+csearch 索引。它 MUST NOT 调用 prepare 流程、UBT、CDB 生成、GTAGS 构建或 clangd 重启。
+它 SHALL 复用既有 csearch writer lease、原子发布及成功后的快照与 dirty 处置机制。
+
+#### Scenario: 同步后新增或删除文件
+- **WHEN** 用户执行 `:UEBuildCsearch`，已有文件清单与索引均存在
+- **THEN** 系统 SHALL 重新扫描，而非沿用旧清单或因缓存命中跳过构建
+- **AND** reset 输入 SHALL 包含当前扫描范围内的新增文件，并排除已删除文件
+
+#### Scenario: 其他准备工具链不可用
+- **WHEN** 工作区可解析且扫描和 cindex 工具可用，但 UBT、CDB 或 GTAGS 不可用
+- **THEN** 独立 csearch 构建 SHALL 不依赖这些准备阶段
+
+#### Scenario: 独立构建失败或重复启动
+- **WHEN** 扫描或构建失败，或已有 csearch writer 占用索引
+- **THEN** 命令 SHALL 给出可见失败或忙碌提示，保留既有正式索引与未覆盖的 dirty 记录
+- **AND** 本次取得的构建锁 SHALL 在结束时释放，重复启动 SHALL 不排队
+
 ### Requirement: csearch.idx 同时只有一个写者
 
 系统 SHALL 保证 `csearch.idx` 在任意时刻只有一个写者。watcher（`lua/utils/ue_watch.lua`）
 在 csearch 维度 SHALL 只更新 `persistent_dirty` 记账，MUST NOT 写 csearch 索引。csearch
-索引的写入 SHALL 只由用户显式触发的 prepare 家族命令（`:UEPrepare` / `:UEPrepareReindex` /
-`:UEPrepareIncremental`）执行。
+索引的写入 SHALL 只由用户显式触发的构建命令（`:UEPrepare` / `:UEPrepareReindex` /
+`:UEPrepareIncremental` / `:UEBuildCsearch`）执行。
 
 理由：cindex 的原子写协议把 staged 文件硬编码为 `<idx>~`，两个并发构建会抢同一个 `idx~`，
 在 merge/rename 阶段相互破坏，导致 `corrupt index: remove` 与 0 字节索引死循环。
@@ -263,20 +303,29 @@ csearch trigram 索引 SHALL 全平台共用一份，路径为 `csearch/csearch.
 - **THEN** csearch 搜索 SHALL 继续使用同一份 `csearch/csearch.idx`，MUST NOT 因切平台而被判为缺失或需重建
 - **AND** 切平台 SHALL NOT 删除任何既有 csearch 索引
 
-### Requirement: `<leader>/` 结果呈现 SHALL 提供分组、计数与后端状态
+### Requirement: `<leader>/` 结果呈现 SHALL 默认使用扁平 grep 行并显示后端状态
 
-`<leader>/` 的结果面板 SHALL 按文件分组，每文件 SHALL 显示命中计数，并 SHALL 以 Project / Engine / Workspace scope 与对应根目录相对路径分类。分组中的每一行 MUST 是带真实 file/line/column 的可跳转命中；系统 MUST NOT 插入可被选中但没有真实命中位置的 synthetic header。picker 标题 SHALL 标识当前后端（`[csearch]`）与当前 scope。
+`<leader>/` 的默认结果面板 SHALL 每条命中显示一条独立的 grep 行，包含 file/line/column 与命中文本；默认界面 MUST NOT 插入按文件聚合的 header、命中计数或 `▼` / `├` / `└` 分组标记。每一行 MUST 是可跳转、可预览的真实命中。`:UEGrepGroupingToggle` MAY 作为显式诊断 A/B 开关恢复旧分组 formatter，但分组 MUST 默认关闭。picker 标题 SHALL 标识当前后端（`[csearch]`）与当前 scope。
 
-#### Scenario: 多文件多命中
-- **WHEN** 一次 `<leader>/` 搜索在多个文件命中
-- **THEN** 结果 SHALL 按文件分组
-- **AND** 每个文件分组 SHALL 显示该文件内的命中数
-- **AND** 首行 SHALL 显示 scope、相对路径与计数，后续行 SHALL 显示该文件内的真实命中
+#### Scenario: 默认搜索在多个文件命中
+- **WHEN** 用户触发 `<leader>/`，且未显式启用诊断分组
+- **THEN** 每条命中 SHALL 独立显示 file/line/column 与命中文本
+- **AND** 结果 MUST NOT 显示文件组 header、每文件计数或 continuation / end marker
 
-#### Scenario: 选择任意分组行
-- **WHEN** 用户选中首条或后续任意一条结果
+#### Scenario: 新会话或未配置分组状态
+- **WHEN** `ue_grep_grouping_enabled` 未设置或不是 `true`
+- **THEN** `<leader>/` SHALL 使用标准扁平 grep formatter
+- **AND** picker MUST NOT 为文件分组启用 matcher 保序覆盖
+
+#### Scenario: 显式启用诊断分组
+- **WHEN** 用户调用 `:UEGrepGroupingToggle` 将分组显式设为启用
+- **THEN** picker MAY 使用旧的文件分组 formatter 与分组保序配置
+- **AND** 该诊断状态不得改变默认配置
+
+#### Scenario: 选择任意结果行
+- **WHEN** 用户选中任意一条结果
 - **THEN** 该 item SHALL 始终包含真实 file/line/column，并预览对应命中上下文
-- **AND** 首条结果 MUST NOT 因 synthetic file header 而预览文件第一行或空占位内容
+- **AND** 结果 MUST NOT 因 synthetic file header 而预览文件第一行或空占位内容
 
 #### Scenario: 标题反映后端与 scope
 - **WHEN** `<leader>/` 面板打开并完成一次搜索

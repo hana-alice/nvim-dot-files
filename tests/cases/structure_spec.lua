@@ -195,6 +195,32 @@ t.describe("structure: 强制入口与政策可发现", function()
     t.assert_contains(constraints, "C9")
     t.assert_contains(constraints, "spec-authority-loop")
   end)
+  -- 归属分层契约（dap-failure-layering）：必须对三端 agent 第一手可见。
+  -- 一份正文（spec）+ 三处指针（根 AGENTS / CONSTRAINTS C10 / dap 本地规则）。
+  -- 删掉任一处即 FAIL，防止规则退化回「只存在于源码注释/会话记录」。
+  t.it("根 AGENTS.md 的 SESSION START 含归属分层契约指针", function()
+    local ss = agents:match("SESSION START.-\n## ") or agents:match("SESSION START.*$") or ""
+    t.assert_contains(ss, "dap-failure-layering")
+    t.assert_contains(ss, "C10")
+  end)
+  t.it("CONSTRAINTS 含 DAP 归属分层契约 C10（五层 + 失败先报层）", function()
+    t.assert_contains(constraints, "C10")
+    t.assert_contains(constraints, "dap-failure-layering")
+    for _, layer in ipairs({ "L0", "L1", "L2", "L3", "L4" }) do
+      t.assert_contains(constraints, "**" .. layer .. "**")
+    end
+  end)
+  t.it("lua/ue/dap/AGENTS.md 就地声明层表与 owner", function()
+    local dap_rules = read("lua/ue/dap/AGENTS.md") or ""
+    t.assert_contains(dap_rules, "dap-failure-layering")
+    for _, layer in ipairs({ "L0", "L1", "L2", "L3", "L4" }) do
+      t.assert_contains(dap_rules, "**" .. layer .. "**")
+    end
+    t.assert_contains(dap_rules, "owner")
+  end)
+  t.it("CONSTRAINTS 维护契约要求新 DAP 坑标注归属层", function()
+    t.assert_contains(constraints, "MUST 标注其归属层")
+  end)
 end)
 
 -- ── ⑤ spec 引用完整性 ──────────────────────────────────────

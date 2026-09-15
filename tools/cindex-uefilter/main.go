@@ -143,6 +143,7 @@ func runIncrementalInChild() error {
 	}
 	cmd := exec.Command(exe, args...)
 	cmd.Env = append(os.Environ(), windowsIncrementalWorkerEnv+"=1")
+	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -152,24 +153,10 @@ func runIncrementalInChild() error {
 }
 
 func exactReplaceFile(dst, src string) error {
-	backup := dst + ".bak"
-	_ = os.Remove(backup)
-	hadDst := false
-	if err := os.Rename(dst, backup); err == nil {
-		hadDst = true
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("backup %s: %w", dst, err)
-	}
+	// Go uses MoveFileEx(REPLACE_EXISTING) on Windows. Never move the
+	// published index aside: a failed replacement must leave it readable.
 	if err := os.Rename(src, dst); err != nil {
-		if hadDst {
-			_ = os.Rename(backup, dst)
-		}
 		return fmt.Errorf("publish %s: %w", dst, err)
-	}
-	if hadDst {
-		if err := os.Remove(backup); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("cleanup backup %s: %w", backup, err)
-		}
 	}
 	return nil
 }
@@ -208,26 +195,29 @@ func main() {
 	if !masterExists {
 		*resetFlag = true
 	}
-	if runtime.GOOS == "windows" && masterExists && !*resetFlag && !runIncrementalWorker() {
+	// The dependency keeps writer/mmap handles open until process exit.
+	// Let the child finish before publishing on Windows, for reset as well
+	// as merge; otherwise Windows can reject the rename of the staged file.
+	if runtime.GOOS == "windows" && !runIncrementalWorker() {
 		if err := runIncrementalInChild(); err != nil {
 			log.Fatal(err)
 		}
 		file := master + "~"
-		merged := file + "~"
-		if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
-			log.Fatal(err)
+		published := file
+		if !*resetFlag {
+			published = file + "~"
+			if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
+				log.Fatal(err)
+			}
 		}
-		if err := exactReplaceFile(master, merged); err != nil {
+		if err := exactReplaceFile(master, published); err != nil {
 			log.Fatal(err)
 		}
 		log.Printf("done")
 		return
 	}
 
-	file := master
-	if !*resetFlag {
-		file += "~"
-	}
+	file := master + "~"
 
 	ix := index.Create(file)
 	ix.Verbose = *verboseFlag
@@ -309,7 +299,13 @@ func main() {
 		} else {
 			index.Merge(merged, master, file)
 			os.Remove(file)
-			os.Rename(merged, master)
+			if err := exactReplaceFile(master, merged); err != nil {
+				log.Fatal(err)
+			}
+		}
+	} else if runtime.GOOS != "windows" {
+		if err := exactReplaceFile(master, file); err != nil {
+			log.Fatal(err)
 		}
 	}
 	log.Printf("done")

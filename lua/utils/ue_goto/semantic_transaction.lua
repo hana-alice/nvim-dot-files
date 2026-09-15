@@ -30,6 +30,8 @@ local REASONS = {
   ["context-resolution-failed"] = true,
   ["definition-not-found"] = true,
   ["definition-resolved"] = true,
+  ["declaration-resolved"] = true,
+  ["macro-no-source-definition"] = true,
   ["definition-absent-in-complete-index"] = true,
   ["identity-conflict"] = true,
   ["identity-missing"] = true,
@@ -41,6 +43,7 @@ local REASONS = {
   ["provider-error"] = true,
   ["provider-method-unsupported"] = true,
   ["provider-timeout"] = true,
+  ["provider-unavailable"] = true,
   ["query-file-not-in-tu"] = true,
   ["semantic-cursor-invalid"] = true,
   ["semantic-sidecar-unavailable"] = true,
@@ -76,8 +79,11 @@ local function owned_copy(value)
 end
 
 local function make_subject(bufnr, snapshot)
-  local subject = snapshot_subject(snapshot, bufnr)
+  local subject = owned_copy(snapshot_subject(snapshot, bufnr))
   subject.bufnr = bufnr
+  if subject.line_text == nil then
+    subject.line_text = vim.api.nvim_buf_get_lines(bufnr, subject.line0, subject.line0 + 1, false)[1]
+  end
   return subject
 end
 
@@ -106,7 +112,8 @@ function M.make_position_params(tx, _bufnr, position_encoding)
     textDocument = { uri = subject.uri },
     position = {
       line = subject.line0,
-      character = subject.column0,
+      character = subject.line_text and vim.str_utfindex(
+        subject.line_text, position_encoding or "utf-16", subject.column0, false) or subject.column0,
     },
     _position_encoding = position_encoding,
   }
@@ -114,8 +121,18 @@ end
 
 function M.same_subject_location(tx, value)
   if not tx or not value then return false end
-  return location.normalize_path(location.location_path(value)):lower() == tx.subject.path:lower()
-    and location.location_line(value) == tx.subject.line
+  if location.normalize_path(location.location_path(value)):lower() ~= tx.subject.path:lower() then
+    return false
+  end
+  local range = value.targetSelectionRange or value.targetRange or value.range
+  if not range or not range.start then return false end
+  local position = M.make_position_params(tx, tx.subject.bufnr, value._position_encoding).position
+  local first, last = range.start, range["end"]
+  local column = tonumber(first.character) or 0
+  if first.line == position.line and column == position.character then return true end
+  if not last then return false end
+  return (position.line > first.line or (position.line == first.line and position.character >= column))
+    and (position.line < last.line or (position.line == last.line and position.character < (last.character or 0)))
 end
 
 function M.subject_role(tx, declaration, definition)
@@ -129,17 +146,11 @@ function M.subject_role(tx, declaration, definition)
 end
 
 function M.filter_definition_locations(tx, locations, declaration)
-  local declaration_path = declaration and location.location_path(declaration) or nil
-  local declaration_line = declaration and location.location_line(declaration) or nil
+  local declaration_key = declaration and location.location_key(declaration):lower() or nil
   local filtered = {}
   for _, item in ipairs(locations or {}) do
-    local item_path = location.location_path(item)
-    local item_line = location.location_line(item)
-    local is_subject = item_path:lower() == tx.subject.path:lower()
-      and item_line == tx.subject.line
-    local is_declaration = declaration_path
-      and item_path:lower() == declaration_path:lower()
-      and item_line == declaration_line
+    local is_subject = M.same_subject_location(tx, item)
+    local is_declaration = declaration_key and location.location_key(item):lower() == declaration_key
     if not is_subject and not is_declaration then
       filtered[#filtered + 1] = item
     end
@@ -158,6 +169,21 @@ function M.terminal(state, stage, reason, extra)
   end
   if state == "resolved" and stage ~= "jump" then
     error("resolved terminal state must complete at jump stage")
+  end
+  if state == "resolved" then
+    local evidence = extra or {}
+    local target = evidence.location or {}
+    local range = target.targetSelectionRange or target.targetRange or target.range or {}
+    local position = range.start or {}
+    assert(type(evidence.identity) == "string" and evidence.identity ~= "", "resolved identity evidence is required")
+    assert(type(evidence.provider) == "string" and evidence.provider ~= "", "resolved provider evidence is required")
+    assert(type(target.uri or target.targetUri) == "string" and (target.uri or target.targetUri) ~= ""
+      and type(position.line) == "number" and position.line >= 0
+      and type(position.character) == "number" and position.character >= 0, "resolved destination evidence is required")
+    assert(evidence.destination_role == "definition" or evidence.destination_role == "declaration", "resolved role is required")
+    assert(evidence.destination_role ~= "declaration" or reason ~= "definition-resolved", "a declaration is not a definition")
+    assert(type(evidence.metrics) == "table" and type(evidence.metrics.source) == "string"
+      and evidence.metrics.source ~= "", "resolved metric provenance is required")
   end
   local result = vim.tbl_extend("force", owned_copy(extra or {}), {
     state = state,

@@ -60,12 +60,15 @@ vim.api.nvim_create_autocmd("UIEnter", {
     -- session's first act is READING feedback, not waiting for it.
     pcall(function()
       local probe = require("utils.probe").setup()
+      for topic, revision in pairs(require("utils.ue_goto.semantic_report").OBSERVATIONS) do
+        probe.observe(topic, revision)
+      end
       local s = probe.pending_summary()
-      if s.records > 0 then
+      if s.unread > 0 or s.dormant > 0 then
         vim.defer_fn(function()
           vim.notify(
-            ("[probe] %d topic(s) / %d record(s) of evidence pending — :UEProbeReport")
-              :format(s.topics, s.records),
+            ("[probe] %d unread / %d unresolved / %d dormant observation(s) — :UEProbeReport")
+              :format(s.unread, s.unresolved, s.dormant),
             vim.log.levels.INFO, { title = "UE", timeout = 6000 })
         end, 1500)
       end

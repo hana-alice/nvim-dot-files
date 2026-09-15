@@ -1,9 +1,7 @@
 -- ue.dap._common — shared helpers for the per-platform DAP modules.
 --
--- Migrated from codelldb (VS Code extension) to lldb-dap (the DAP
--- executable that ships with LLVM 18+). lldb-dap natively understands
--- DAP `setBreakpoints` requests, so all the hand-written breakpoint
--- and ASLR hacks that codelldb required are gone.
+-- Shared adapter wiring and desktop prompts. Android still requires its
+-- target-owned ASLR slide and live-breakpoint sequencing; see dap/AGENTS.md.
 --
 -- Resolution priority for the adapter executable:
 --   1. ue.config.get("dap.lldb_dap_path")
@@ -11,6 +9,7 @@
 --   3. PATH lookup for "lldb-dap" / "lldb-dap.exe"
 
 local M = {}
+local fs = require("ue.core.fs")
 
 --- Resolve an lldb-dap executable.
 --- Returns the first readable file path, or nil.
@@ -85,12 +84,9 @@ end
 --- the upstream-blessed path. lldb-dap reads DAP requests from stdin
 --- and writes responses to stdout; nvim-dap pipes them.
 ---
---- History: we briefly used `type = 'server'` + `--connection listen://`
---- to dodge llvm/llvm-project#178155 (LLVM 22.x lldb-dap.exe crashes
---- 0xC0000409 in NativeFile ctor on Windows). That bug only triggers
---- on 22.x; 21.1.8 stdio is stable. We now side-load 21.1.8's lldb-dap
---- (see utils/platform/windows.lua default_lldb_dap_paths) and use the
---- straightforward stdio adapter on all platforms.
+--- Adapter selection follows the host driver and current toolchain contract.
+--- Android uses LLVM 22.1.6+; historical 21.x/codelldb routes are not fallback
+--- choices. iOS owns its separate selected-Xcode adapter.
 ---@param dap table the nvim-dap module
 ---@param adapter string absolute path to lldb-dap
 function M.ensure_adapter(dap, adapter)

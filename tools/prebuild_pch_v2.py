@@ -5,7 +5,7 @@ prebuild_pch_v2.py - 为 clangd 预编译 SharedPCH/PCH 头文件
 完整流程:
   1. 分析 compile_commands.json 中的 PCH 分组
   2. 为每个 PCH 生成 .rsp (response file) + 编译 .bat 脚本
-  3. 修改 compile_commands.json: -include X.h -> -include-pch X.pch
+  3. 保留原编译输入；不把尚未编译/验证的 PCH recipe 发布成二进制参数
   4. 路径全部用正斜杠（避免 clangd/clang driver 转义问题）
 
 用法:
@@ -256,6 +256,41 @@ def _flatten_split_path_flags(flags):
     return out
 
 
+def remove_missing_generated_pch(entries, pch_dir):
+    """Repair only our old adjacent text+binary pairs with a retained recipe.
+
+    Clang rejects missing -include-pch; it does not fall back to -include.
+    External binary-only inputs and existing binaries are left untouched.
+    """
+    modified = 0
+    for entry in entries:
+        args = entry.get('arguments', [])
+        clean = []
+        i = 0
+        while i < len(args):
+            if (i >= 2 and args[i] == '-include-pch' and i + 1 < len(args)
+                    and args[i - 2] == '-include'):
+                header = _resolve_pch_header(args[i - 1], entry.get('directory', ''))
+                name = PurePosixPath(header).stem
+                expected = to_forward_slash(wsl_to_win(os.path.join(pch_dir, name + '.pch')))
+                binary = to_forward_slash(args[i + 1])
+                recipe = os.path.join(pch_dir, name + '.rsp')
+                if (name.startswith(('SharedPCH.', 'PCH.')) and binary == expected
+                        and os.path.isfile(header) and not os.path.exists(binary)
+                        and os.path.isfile(recipe)):
+                    with open(recipe, encoding='utf-8') as f:
+                        recipe_text = f.read().replace('\\', '/')
+                    if header in recipe_text and expected in recipe_text:
+                        i += 2
+                        modified += 1
+                        continue
+            clean.append(args[i])
+            i += 1
+        if clean != args:
+            entry['arguments'] = clean
+    return modified
+
+
 def main():
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} <compile_commands.json>")
@@ -265,6 +300,19 @@ def main():
     with open(cc_path) as f:
         data = json.load(f)
 
+    cc_dir = os.path.dirname(cc_path)
+    pch_dir = os.path.join(cc_dir, ".cache", "nvim-ue", "clangd", "pch")
+    # Check pre-existing recipes before writing new ones: new output is not
+    # evidence that an arbitrary binary argument was originally ours.
+    repaired = remove_missing_generated_pch(data, pch_dir)
+    if repaired:
+        bak = cc_path + ".pre-pch.bak"
+        if not os.path.exists(bak):
+            shutil.copy2(cc_path, bak)
+        tmp = cc_path + f'.tmp.{os.getpid()}'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, cc_path)
     groups = extract_pch_groups(data)
     print(f"条目: {len(data)}, PCH 种类: {len(groups)}")
     if not groups:
@@ -276,10 +324,8 @@ def main():
     first_idx = first_group["indices"][0]
     default_directory = to_forward_slash(data[first_idx].get("directory", ""))
 
-    cc_dir = os.path.dirname(cc_path)
     # Cache layout v3: PCH lives under <project>/.cache/nvim-ue/clangd/pch
     # (was: <project>/.clangd-pch). Single-root cache.
-    pch_dir = os.path.join(cc_dir, ".cache", "nvim-ue", "clangd", "pch")
     os.makedirs(pch_dir, exist_ok=True)
 
     # Windows 路径 (正斜杠)
@@ -297,8 +343,6 @@ def main():
         'set "CLANG_CL=C:\\Program Files\\LLVM\\bin\\clang-cl.exe"',
         "",
     ]
-
-    pch_map = {}
 
     for basename, info in sorted(groups.items(), key=lambda x: -len(x[1]["indices"])):
         pch_output = f"{pch_dir_win}/{basename}.pch"
@@ -352,8 +396,6 @@ def main():
         bat_lines.append(f'if %ERRORLEVEL% EQU 0 (echo   OK) else (echo   FAILED)')
         bat_lines.append("")
 
-        pch_map[basename] = pch_output
-
     bat_lines.append("echo Done.")
 
     # 写 bat 脚本
@@ -362,118 +404,7 @@ def main():
         f.write("\n".join(bat_lines))
     print(f"\nBAT 脚本: {bat_path}")
 
-    # 修改 compile_commands: 把 PCH 引用改为 -include-pch X.pch (正斜杠)
-    # 三种形式都要处理：clang -include / cl-yu (joined) / cl-yu-split
-    modified = 0
-    for basename, info in groups.items():
-        pch_path = pch_map.get(basename)
-        if not pch_path:
-            continue
-        original_header = info["original_header"]
-        form = info.get("form", "clang")
-        for idx in info["indices"]:
-            args = data[idx]["arguments"]
-
-            # ── Idempotency check ────────────────────────────────────────
-            # After A-fix (2026-05-18), each PCH-bearing entry should carry
-            # BOTH:
-            #   -include <SharedPCH.X.ShadowErrors.h>   ← text fallback (always
-            #                                              works, drives clangd
-            #                                              correctness)
-            #   -include-pch <SharedPCH.X.ShadowErrors.pch>  ← perf optimization
-            #                                              (silently no-ops if
-            #                                              .pch missing)
-            # If we already see -include-pch pointing at our pch_path AND a
-            # neighbouring -include pointing at our original_header, this entry
-            # was already processed: skip it (re-running this script on a
-            # already-fixed cdb must be a no-op).
-            already_done = False
-            for j, a in enumerate(args):
-                if a == "-include-pch" and j + 1 < len(args) and args[j + 1] == pch_path:
-                    # look ±2 for -include <original_header>
-                    for k in range(max(0, j - 2), min(len(args), j + 3)):
-                        if args[k] == "-include" and k + 1 < len(args) and args[k + 1] == original_header:
-                            already_done = True
-                            break
-                if already_done:
-                    break
-            if already_done:
-                continue
-
-            new_args = []
-            skip_next = False
-            replaced_this_entry = False
-            for i, a in enumerate(args):
-                if skip_next:
-                    skip_next = False
-                    continue
-                # clang form: -include X.h  →  -include X.h  +  -include-pch X.pch
-                # (KEEP the original -include as text-include fallback; only
-                # APPEND -include-pch for perf. clangd: when .pch exists +
-                # preamble hash matches, it mmap-loads the binary and the
-                # text -include is a no-op. When .pch missing, clangd falls
-                # back to the text -include — full correctness preserved.)
-                if (form == 'clang' and a == "-include" and i + 1 < len(args)
-                        and args[i + 1] == original_header
-                        and not replaced_this_entry):
-                    new_args.append("-include")
-                    new_args.append(args[i + 1])  # keep original text header
-                    new_args.append("-include-pch")
-                    new_args.append(pch_path)
-                    skip_next = True
-                    modified += 1
-                    replaced_this_entry = True
-                    continue
-                # cl-yu joined: /Yu<path>  →  -include <X.h>  +  -include-pch X.pch
-                # NB: /Yu form has no native -include. Synthesize one from
-                # original_header so the text-fallback path also works here.
-                # (clang-cl accepts both -include and /Yu; we drop /Yu since
-                # clangd never reads a real .pch via /Yu without a matching
-                # /Fp binary anyway.)
-                if (form == 'cl-yu' and a.startswith('/Yu') and a != '/Yu'
-                        and not replaced_this_entry):
-                    raw = a[3:].strip().strip('"')
-                    if raw == original_header:
-                        new_args.append("-include")
-                        new_args.append(original_header)
-                        new_args.append("-include-pch")
-                        new_args.append(pch_path)
-                        modified += 1
-                        replaced_this_entry = True
-                        continue
-                # cl-yu split: /Yu <path>  →  -include <X.h>  +  -include-pch X.pch
-                if (form == 'cl-yu-split' and a == '/Yu' and i + 1 < len(args)
-                        and args[i + 1] == original_header
-                        and not replaced_this_entry):
-                    new_args.append("-include")
-                    new_args.append(original_header)
-                    new_args.append("-include-pch")
-                    new_args.append(pch_path)
-                    skip_next = True
-                    modified += 1
-                    replaced_this_entry = True
-                    continue
-                new_args.append(a)
-            data[idx]["arguments"] = new_args
-
-    if modified == 0:
-        print("\nNo changes needed — PCH already applied")
-    else:
-        # 备份
-        bak = cc_path + ".pre-pch.bak"
-        if not os.path.exists(bak):
-            shutil.copy2(cc_path, bak)
-
-        with open(cc_path, "w") as f:
-            json.dump(data, f, ensure_ascii=False)
-
-        # 同步到 Engine 子目录
-        engine_cc = os.path.join(cc_dir, "Engine", "compile_commands.json")
-        if os.path.isdir(os.path.dirname(engine_cc)):
-            shutil.copy2(cc_path, engine_cc)
-            print(f"同步: {engine_cc}")
-
-    print(f"\n替换了 {modified} 个条目 (-include -> -include-pch)")
+    print(f"\nRecipes generated; compiler inputs preserved ({repaired} missing generated PCH references repaired)")
     print(f"\n下一步:")
     bat_win = to_forward_slash(wsl_to_win(bat_path)).replace("/", "\\")
     print(f"  在 cmd.exe 中执行: {bat_win}")

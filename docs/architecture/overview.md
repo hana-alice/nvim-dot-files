@@ -34,6 +34,9 @@
 
 ## 2. 数据流（data flow）
 
+- **独立搜索构建**：`:UEBuildCsearch` → `ue/csearch_build.lua` → 新文件清单 → csearch reset。
+  facade 提供现有扫描/过滤与 writer 接口；独立 owner 持有异步生命周期、输入快照与失败清理，
+  不进入 UBT、CDB、GTAGS 或 clangd 准备阶段。
 - **索引/CDB**：`:UEPrepare` → UBT `-SkipBuild` 取编译参数 → `ue/cdb/*` 生成/裁剪/inject
   compile_commands.json → cindex 建 csearch 索引 → clangd reload。UE root 的 clangd LSP 使用持久化 artifact
   gate：当前 project/target/platform/configuration 的 selection、manifest、controlled CDB 与源 CDB 签名
@@ -61,8 +64,14 @@
   精确光标取得 canonical USR，并只向同 identity client 查询唯一 definition；不再为每次 source `gd`
   让 sidecar 重读全量 CDB。header 仍在 proven origin TU 中取得 libclang exact-cursor canonical USR，
   再在同 generation controlled module AST 中查唯一 body。非 C++ 兼容路径保留
-  cache/LSP/csearch/GTAGS；详见
+  cache/LSP/csearch/GTAGS。coordinator 独占最终跳转与成功后的 lineage；报告、通用 LSP transport、
+  clangd adapter 与 compatibility policy 分离。semantic client 分离只读环境、action state、transport
+  state 与 compiler session；sidecar 由独立 TU store、catalog、definition resolver 组成。详见
   `docs/architecture-symbol-resolution.md`。
+- **探针反馈**：`utils.probe` 管观察 revision、期限、已读/处置与固定大小统计，`utils.probe_store` 管锁内
+  增量合并及原子发布。退出遇锁竞争时写本进程 recovery journal，主文件记录 replay ID 后再删 journal，
+  防止恢复重复计数。新 revision 开启有限观察窗口；同 revision 休眠后不因重启自动续期。
+  `UEProbeReport` 只标已读，`UEProbeResolve`/`UEProbeDefer` 记录带理由的处置；真实新失败会重新进入待办。
 - **Android device**：`<Space>uA` / 首次 Android 操作 → `utils.android_device` 异步执行
   `adb devices -l` → picker 展示名称 + serial → 当前进程的 `vim.g.ue_android_device_serial`；install / launch /
   logcat / 新 DAP session 捕获该值并统一形成 `adb -s <serial> ...`。
@@ -138,7 +147,9 @@
   DeviceSupport sysroot。两条 route 都冻结 backend，失败不互相 fallback；`UEDAPStop` 先
   `disconnect{terminateDebuggee=false}`，debug-launch 再终止并复查 owned PID，ordinary attach 只复验既有
   PID 仍存活。Android 走 platform
-  模式 + serial connect URL；K30 URL 与本次 session 捕获的 ADB serial 必须一致，切换当前进程的
+  模式 + serial connect URL；device 端 platform server 必须以 **app uid**（`run-as <pkg>`）从 app
+  sandbox 副本运行，`/data/local/tmp` 仅作 `adb push` 中转（K56：shell uid 在 `ro.debuggable=0` 的
+  user build 上无权 ptrace app，LLDB 只把该拒绝暴露成 `lost connection`）；K30 URL 与本次 session 捕获的 ADB serial 必须一致，切换当前进程的
   选择值不改变活跃 session 的 poll/cleanup。
   `tools/ios_dap_protocol_probe.py` 保留为脱敏 CoreDevice/legacy preflight 与协议诊断入口。legacy 真机
   已验证 attach-at-launch、ordinary attach、resolved source breakpoint、source frame、LLDB expression
@@ -252,7 +263,8 @@ matrix 声明与回归，不能在 generic orchestration 中添加 shell/path �
   nvim-dap 的固定 `dap*.log` 名改为 `dap*.<pid>.log`。
 - **LSP 行为改动**只走 `lua/utils/lsp_fallback.lua` 或 `lua/workarounds/clangd/*`（禁全局 handler 覆盖）。
 - **上游 bug 补丁**只进 `lua/workarounds/<scope>/<name>.lua`（禁 inline monkey-patch）。
-- **C++ goto 精度**只信 proven libclang canonical USR + module AST 唯一 body；TS 不给答案，
+- **C++ goto 精度**：source 由 exact-command clangd client 证明 canonical USR + definition；header
+  由 proven libclang canonical USR + module AST 唯一 body 证明；TS 不给答案，
   csearch/GTAGS 不参与 C++ destination。非 C++ 保留既有 LSP/csearch/GTAGS 兼容链。
 - **启动顺序**固定，见 `docs/CONSTRAINTS.md §三 C3` 与 `init.lua`。
 

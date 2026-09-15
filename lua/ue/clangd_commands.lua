@@ -203,6 +203,10 @@ local function deliver(client, bufnr, source, command, callback, opts)
 end
 
 local function consume_command(waiter, command)
+  if waiter.opts.is_current and not waiter.opts.is_current() then
+    waiter.callback(false, "stale-request")
+    return
+  end
   if waiter.opts.syntax_only then
     apply_compiler_syntax(waiter.bufnr, command)
     waiter.callback(true, nil, command)

@@ -19,6 +19,7 @@ local CORE_RT = {
   context_cache = {}, -- key -> { ctx, ts }
   target_launch_running = {}, -- target id -> true while one launch owns the route
   project_state = require("ue.project_state"),
+  target_identity = require("ue.target_identity"),
   file_lock = require("ue.file_lock"),
   prepare_lease = nil,
 }
@@ -853,7 +854,6 @@ local UE_CONST = {
     "Development Editor", "Development", "DebugGame Editor", "DebugGame",
     "Debug", "Shipping", "Test",
   },
-  TARGET_KIND_SUFFIXES = { "Editor", "Client", "Server" },
 }
 
 local function copy_list(items)
@@ -1001,16 +1001,7 @@ local function available_configuration_choices(project_root, uproject, platform)
   return copy_list(UE_CONST.DEFAULT_CONFIGURATION_CHOICES)
 end
 
-local function split_target_configuration_name(configuration)
-  configuration = trim(configuration)
-  for _, suffix in ipairs(UE_CONST.TARGET_KIND_SUFFIXES) do
-    local base = trim(configuration:match("^(.-)%s+" .. suffix .. "$") or "")
-    if base ~= "" then
-      return base, suffix
-    end
-  end
-  return configuration ~= "" and configuration or "Development", "Game"
-end
+local split_target_configuration_name = CORE_RT.target_identity.split_configuration
 
 local function default_target_configuration(project_root, uproject, platform)
   local choices = available_configuration_choices(project_root, uproject, platform)
@@ -1062,21 +1053,26 @@ local read_state
 local update_state_field
 
 local function resolve_project_input(path, engine_root)
-  path = norm(trim(path))
+  path = trim(path)
   if path == "" then
     return nil, nil, "Project path not provided"
   end
 
-  -- Reject Windows drive-relative paths like "E:Projects/..." (missing slash
-  -- after the drive letter). vim.fn.isdirectory() may still resolve them
-  -- via the per-drive cwd quirk, but they break downstream UBT/clangd
-  -- invocations and confuse is_windows_path(). Force the caller to supply
-  -- an absolute path.
-  if path:match("^[A-Za-z]:[^\\/]") then
-    return nil, nil,
-      "Drive-relative path not allowed: " .. path ..
-      " (missing slash after drive letter, e.g. use 'E:/Projects/...' not 'E:Projects/...')"
+  -- Native file completion can return drive-relative paths. Resolve the
+  -- existing object using the OS's per-drive cwd before persisting it; adding
+  -- a slash would change its meaning. fnamemodify(:p) is not reliable for
+  -- bare drive/prefix inputs, whereas fs_realpath resolves the existing path.
+  if path:match("^[A-Za-z]:[^\\/]") or path:match("^[A-Za-z]:$") then
+    local absolute, path_err = vim.uv.fs_realpath(path)
+    if not absolute or not absolute:match("^[A-Za-z]:[/\\]") then
+      return nil, nil, "Cannot resolve project path: " .. path .. " (" .. tostring(path_err or "not an absolute drive path") .. ")"
+    end
+    path = absolute
   end
+  path = norm(path)
+  -- norm strips trailing separators; an absolute drive root must not become
+  -- drive-relative again during project discovery.
+  if path:match("^[A-Za-z]:$") then path = path .. "/" end
 
   if path:match("%.uproject$") then
     if not _ufs.is_file(path) then
@@ -3116,78 +3112,9 @@ end
 -- BUILD TARGETS + PLATFORM DETECTION
 -- ==========================================================================
 
-local function detect_target_names(project_root, uproject)
-  -- Two layouts to support:
-  --   1. Standard:  <project_root>/<Project>.uproject + <project_root>/Source/*.Target.cs
-  --   2. Nested: <project_root>/Source/<Project>/<Project>.uproject
-  --              + <project_root>/Source/<Project>/Source/*.Target.cs
-  --
-  -- Prefer the directory next to the .uproject (matches what UBT itself
-  -- does), fall back to <project_root>/Source for the standard layout.
-  local search_dirs = {}
-  if uproject and uproject ~= "" then
-    table.insert(search_dirs, join(_ufs.dirname(uproject), "Source"))
-  end
-  table.insert(search_dirs, join(project_root, "Source"))
-
-  local seen, targets = {}, {}
-  for _, dir in ipairs(search_dirs) do
-    if seen[dir] == nil then
-      seen[dir] = true
-      local found = vim.fn.globpath(dir, "*.Target.cs", false, true)
-      if type(found) == "table" then
-        for _, t in ipairs(found) do table.insert(targets, t) end
-      end
-    end
-  end
-
-  local detected = {
-    Editor = nil,
-    Client = nil,
-    Server = nil,
-    Game = nil,
-  }
-
-  for _, target in ipairs(targets) do
-    local name = vim.fs.basename(target):gsub("%.Target%.cs$", "")
-    local matched = false
-    for _, kind in ipairs(UE_CONST.TARGET_KIND_SUFFIXES) do
-      if name:match(kind .. "$") then
-        detected[kind] = detected[kind] or name
-        matched = true
-        break
-      end
-    end
-    if not matched then
-      detected.Game = detected.Game or name
-    end
-  end
-
-  local fallback = vim.fs.basename(uproject):gsub("%.uproject$", "")
-  detected.Game = detected.Game or fallback
-  return detected
-end
-
-local function detect_target_name(project_root, uproject, kind)
-  local detected = detect_target_names(project_root, uproject)
-  local fallback = vim.fs.basename(uproject):gsub("%.uproject$", "")
-  kind = trim(kind or "")
-
-  if kind == "Editor" then
-    return detected.Editor or detected.Game or detected.Client or detected.Server or fallback
-  end
-  if kind == "Client" then
-    return detected.Client or detected.Game or detected.Editor or detected.Server or fallback
-  end
-  if kind == "Server" then
-    return detected.Server or detected.Game or detected.Editor or detected.Client or fallback
-  end
-  if kind == "Game" then
-    return detected.Game or detected.Editor or detected.Client or detected.Server or fallback
-  end
-
-  return detected.Editor or detected.Game or detected.Client or detected.Server or fallback
-end
+-- Shared with DAP so build and debugger consume the same Target.cs identity.
+local detect_target_names = CORE_RT.target_identity.detect_target_names
+local detect_target_name = CORE_RT.target_identity.detect_target_name
 
 local function target_platform(engine_root, cmd)
   local override = trim(vim.env.UE_TARGET_PLATFORM)
@@ -3246,13 +3173,7 @@ local function target_kind(engine_root, project_root, uproject, platform)
   return kind
 end
 
-local function build_target_name(project_root, uproject, kind)
-  local override = trim(vim.env.UE_BUILD_TARGET)
-  if override ~= "" then
-    return override
-  end
-  return detect_target_name(project_root, uproject, kind)
-end
+local build_target_name = CORE_RT.target_identity.build_target_name
 
 -- ==========================================================================
 -- BUILD COMMANDS — Windows wrappers, UBT, Build.bat
@@ -4693,8 +4614,8 @@ do
     return command, nil, plan, driver, target_ctx
   end
 
-  function CORE_RT.update_target_runtime(engine_root, platform, values)
-    local state = read_state(engine_root)
+  function CORE_RT.update_target_runtime(engine_root, platform, values, captured)
+    local state = CORE_RT.project_state.read(engine_root, captured)
     local all = type(state.target_runtime) == "table" and vim.deepcopy(state.target_runtime) or {}
     local current = type(all[platform]) == "table" and vim.deepcopy(all[platform]) or {}
     for key, value in pairs(values or {}) do
@@ -4702,7 +4623,7 @@ do
     end
     current.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
     all[platform] = current
-    local updated, update_err = update_state_field(engine_root, "target_runtime", all)
+    local updated, update_err = CORE_RT.project_state.update(engine_root, "target_runtime", all, captured)
     if not updated then return nil, update_err end
     CORE_RT.context_cache = {}
     return current
@@ -5148,7 +5069,7 @@ function CORE_RT.grep_format_grouped(item)
     chunks[#chunks + 1] = { group.path, "SnacksPickerFile" }
     chunks[#chunks + 1] = { (" (%d)  "):format(group.count), "SnacksPickerComment" }
   else
-    chunks[#chunks + 1] = { "  ├ ", "SnacksPickerDir" }
+    chunks[#chunks + 1] = { group.index == group.count and "  └ " or "  ├ ", "SnacksPickerDir" }
   end
 
   chunks[#chunks + 1] = { tostring(pos[1] or 1), "SnacksPickerRow" }
@@ -5425,16 +5346,12 @@ function M.cached_grep(opts)
   local short_live_max_count = opts.short_live_max_count or 1200
 
   -- ─ Helpers shared by both csearch and rg paths ──────────────────────
-  -- Dev toggle: lets us A/B compare against vanilla snacks behavior. The
-  -- structured path/count formatter and preview throttle are disabled when
-  -- false, while every picker item remains a real match in either mode.
-  -- Toggle at runtime with :UEGrepGroupingToggle.
-  local grouping_enabled = (vim.g.ue_grep_grouping_enabled ~= false)
-
-  -- csearch emits hits grouped by file. Buffer only the current file so its
-  -- count is known, then annotate and emit the original match rows. Unlike
-  -- the old synthetic header design, this never creates a selectable item
-  -- without a source location, so every cursor position has a code preview.
+  -- Dev toggle for A/B against vanilla snacks: structured path/count formatter and
+  -- preview throttle are off when false. Runtime: :UEGrepGroupingToggle.
+  local grouping_enabled = (vim.g.ue_grep_grouping_enabled == true)
+  -- csearch emits hits grouped by file. Buffer only the current file so its count is
+  -- known, then annotate and emit the original match rows. Unlike the old synthetic
+  -- header design, this never creates a selectable item without a source location.
   local function make_file_grouping_cb(cb)
     local current_file = nil
     local current_items = {}
@@ -5555,6 +5472,7 @@ function M.cached_grep(opts)
       need_search = true,
       limit = live_max_count,
       limit_live = live_max_count,
+      matcher = grouping_enabled and { sort = false } or nil, -- preserve csearch file groups
       layout = { preset = "telescope" },
       -- Search mode toggles. snacks auto-merges these with built-in toggles
       -- (regex, follow, hidden, ignored, modified — see snacks/picker/config/
@@ -5637,7 +5555,7 @@ function M.cached_grep(opts)
           picker.list:set_target(); picker:find()
         end,
       },
-      format = grouping_enabled and CORE_RT.grep_format_grouped or nil,
+      format = grouping_enabled and CORE_RT.grep_format_grouped or "file",
       on_show = grouping_enabled and on_show_picker or nil,
       finder = function(_picker_opts, finder_ctx)
         local pattern = finder_ctx.filter.search
@@ -6537,8 +6455,8 @@ function M._target_platform_for_test(engine_root)
   return target_platform(engine_root, nil)
 end
 
-function M._update_target_runtime_for_test(engine_root, platform, values)
-  return CORE_RT.update_target_runtime(engine_root, platform, values)
+function M._update_target_runtime_for_test(engine_root, platform, values, captured)
+  return CORE_RT.update_target_runtime(engine_root, platform, values, captured)
 end
 
 function M._available_platform_choices_for_test(host_driver, project_root, uproject)
@@ -6666,6 +6584,14 @@ end
 -- LuaJIT main-chunk local slot — see skill luajit-200-local-cap-with-loader-cache-mask.
 -- We expose set_project through CORE_RT instead.)
 do
+local function record_project_selection(outcome)
+  pcall(function()
+    local probe = require("utils.probe")
+    probe.observe("project-selection", "completion-path-2026-09-11")
+    probe.record("project-selection", outcome, { state = outcome == "selected" and "resolved" or "unavailable" })
+  end)
+end
+
 local function invalidate_project_scoped_cache(_, reason)
   -- Force prepare_freshness to re-read from disk on next call.
   CORE_RT.freshness_notified = {}
@@ -6700,8 +6626,17 @@ local function set_project(input)
   end
 
   local project_root, uproject, err = resolve_project_input(input, engine_root)
+  -- Shared state/path consumers currently strip a drive root's separator.
+  -- Do not publish C: as a project root and let consumers reinterpret it as cwd.
+  if project_root and project_root:match("^[A-Za-z]:/*$") then
+    project_root = nil
+    err = "Projects directly at a drive root are not supported; select a project in a subdirectory"
+  end
   if not project_root then
-    vim.notify(err, vim.log.levels.WARN)
+    record_project_selection("invalid-input")
+    local active = CORE_RT.project_state.current(engine_root)
+    vim.notify("UE project NOT changed:\n" .. tostring(err)
+      .. "\nStill selected: " .. (active and active.project_root or "<unset>"), vim.log.levels.ERROR)
     return
   end
 
@@ -6718,7 +6653,10 @@ local function set_project(input)
   end
   local persisted, persist_err = persist_project(engine_root, project_root, uproject)
   if not persisted then
-    vim.notify("Failed to set UE project: " .. tostring(persist_err), vim.log.levels.ERROR)
+    record_project_selection("persist-failed")
+    local active = CORE_RT.project_state.current(engine_root)
+    vim.notify("UE project NOT changed:\n" .. tostring(persist_err)
+      .. "\nStill selected: " .. (active and active.project_root or "<unset>"), vim.log.levels.ERROR)
     return
   end
 
@@ -6729,6 +6667,7 @@ local function set_project(input)
   invalidate_status_cache()
   refresh_statusline()
 
+  record_project_selection("selected")
   local msg = "UE project set for this Neovim session:\nEngine: " .. engine_root .. "\nProject: " .. project_root
   if switched then
     msg = msg .. ("\n\nProject CHANGED (was: %s)\n  → previous project caches preserved\n  → active cache bucket: %s"):format(
@@ -6750,17 +6689,17 @@ local function set_android_package(input)
 
   input = trim(input)
   if input == "" then
-    local state = read_state(engine_root)
-    input = vim.fn.input("Android package name: ", state.android_package or "")
+    input = vim.fn.input("Android package name: ", read_state(engine_root).android_package or "")
   end
-  if input == "" then
-    return
-  end
-
-  update_state_field(engine_root, "android_package", input)
+  if input == "" then return end
+  -- K61: commit() re-reads the field from the readers' bucket, so a failed or
+  -- misrouted write can never print a success toast (see project_state.commit).
+  local ok, err = CORE_RT.project_state.commit(engine_root, "android_package", input)
   invalidate_status_cache()
   refresh_statusline()
-  vim.notify("UE Android package set:\nEngine: " .. engine_root .. "\nPackage: " .. input)
+  local msg = ok and ("UE Android package set:\nEngine: " .. engine_root .. "\nPackage: " .. input)
+    or ("UE Android package NOT set: " .. tostring(err))
+  vim.notify(msg, ok and vim.log.levels.INFO or vim.log.levels.ERROR)
 end
 
 -- Tell ue.lua how to find the .uproject when only a workspace root is given
@@ -8968,6 +8907,7 @@ local function prepare_async(opts)
             refresh_statusline()
             set_prepare_running(false)
             if cdb_pipeline_ok then
+              INDEX_FN.schedule_prepare_delivery(ctx)
               CORE_RT.start_deferred_clangd(ctx)
             else
               vim.notify(
@@ -9176,6 +9116,32 @@ end
 export_compile_commands = prepare_async
 CORE_RT.prepare_async = prepare_async
 
+-- Reuse existing search policy and writer ownership without entering Prepare.
+function M.build_csearch_async(opts)
+  return require("ue.csearch_build").start(opts, {
+    resolve_context = resolve_context,
+    is_running = function() return M._prepare_running or CORE_RT.csearch_build_running end,
+    build_begin = CORE_RT.csearch_build_begin,
+    build_snapshot = function()
+      return CORE_RT.csearch_build_dirty_snapshot or {}, CORE_RT.csearch_build_started_at
+    end,
+    build_done = function()
+      CORE_RT.csearch_build_dirty_snapshot = nil
+      CORE_RT.csearch_build_started_at = nil
+      CORE_RT.csearch_build_done()
+    end,
+    clear_dirty = CORE_RT.clear_persistent_dirty_safe,
+    scan = scan_relative_files_async,
+    workspace_root = workspace_root,
+    project_dirs = CORE_RT.project_index_dirs,
+    engine_dirs = UE_CONST.ENGINE_INDEX_DIRS,
+    filter_paths = function(paths) return filter_gtags_paths(filter_extensions(paths, M.FT_ALL)) end,
+    write_lines = write_lines,
+    fingerprint = CORE_RT.list_fingerprint,
+    smart_build = CORE_RT.csearch_smart_build,
+  })
+end
+
 function M.prepare_headless()
   local ok, err = xpcall(prepare, debug.traceback)
   if not ok then
@@ -9331,6 +9297,12 @@ dap_mod.setup_core({
   glob_paths = glob_paths,
   is_native_windows = is_native_windows,
   resolve_context = resolve_context,
+  resolve_target_identity = function(ctx, platform)
+    local resolved = vim.tbl_extend("force", {}, ctx or {})
+    resolved.configuration = selected_target_configuration(
+      resolved.engine_root, resolved.project_root, resolved.uproject, platform)
+    return CORE_RT.target_identity.resolve(resolved)
+  end,
   invalidate_status_cache = invalidate_status_cache,
   refresh_statusline = refresh_statusline,
   first_executable = _uproc.first_executable,
@@ -9347,18 +9319,14 @@ M._dap_run_state = dap_mod._dap_run_state
 M._continue_debounce_until_ms = dap_mod._continue_debounce_until_ms
 M._dap_source_file_cache = dap_mod._dap_source_file_cache
 
--- Delegate DAP public API.  We're back on codelldb (1.12.2) for the
--- Android route as of 2026-05; the lldb-dap experiment is retired.
--- The historical M.codelldb_paths / ASLR listeners / hand-written
--- breakpoint helpers stay deleted — codelldb handles all of that
--- natively, and persistence is owned by ue.dap._persist_bp instead.
+-- Delegate DAP public API.  Host adapter = LLVM 22.1.6+ `lldb-dap.exe` (forward-only,
+-- C1); codelldb removed 2026-05-21.  `--slide` rides in `attachCommands` (K11/K37).
 M.lldb_dap_path = dap_mod.lldb_dap_path
 M.android_dap_attach = dap_mod.android_dap_attach
 
 -- Expose state helpers so peripheral modules (ue/dap/android.lua's pick_package,
--- external probes, future plugins) can read/write the selected project's
--- persisted state without re-implementing canonical bucket resolution. These are forward-
--- declared locals upthread; they exist by the time setup_dap / require returns.
+-- external probes, future plugins) can read/write the selected project's persisted
+-- state without re-implementing canonical buckets. Forward-declared locals upthread.
 M.read_state = read_state
 M.update_state_field = update_state_field
 M.resolve_context = resolve_context
@@ -9404,6 +9372,9 @@ M.dap_toggle_ui = dap_mod.dap_toggle_ui
 M.dap_reset_layout = dap_mod.dap_reset_layout
 M.dap_toggle_repl = dap_mod.dap_toggle_repl
 M.dap_diagnose = dap_mod.dap_diagnose
+-- Layered preflight (C10): unlike :UEDAPDiag it needs NO live session.
+M.dap_preflight = dap_mod.dap_preflight
+M.dap_smoke = dap_mod.dap_smoke
 M.stop_android_debugger = dap_mod.stop_android_debugger
 M.android_dap_reattach  = dap_mod.android_dap_reattach
 M.android_dap_status    = dap_mod.android_dap_status
@@ -9490,7 +9461,7 @@ function M.setup()
   vim.api.nvim_create_user_command("UEGrepGroupingToggle", function()
     -- Default is true; flip the global. Affects subsequent grep picker
     -- invocations (already-open pickers stay as they were).
-    vim.g.ue_grep_grouping_enabled = not (vim.g.ue_grep_grouping_enabled ~= false)
+    vim.g.ue_grep_grouping_enabled = not (vim.g.ue_grep_grouping_enabled == true)
     local now = vim.g.ue_grep_grouping_enabled
     vim.notify(
       string.format("UE grep structured groups/preview throttle/Tab tweaks: %s",
@@ -9713,6 +9684,9 @@ function M.setup()
       end,
     })
   end, { bang = true, desc = "UE prepare (bang = force full clean rebuild)" })
+  vim.api.nvim_create_user_command("UEBuildCsearch", function()
+    M.build_csearch_async()
+  end, { desc = "Rescan and fully rebuild csearch only (no UBT, CDB or GTAGS)" })
   vim.api.nvim_create_user_command("UEPrepareIncremental", function()
     -- Apply the watcher's accumulated dirty file set as a cindex INCREMENTAL
     -- add (no -reset). Fast (proportional to dirty count, not workspace size)
@@ -10065,6 +10039,10 @@ function M.setup()
   vim.api.nvim_create_user_command("UEDAPDiag", function()
     M.dap_diagnose()
   end, {})
+  vim.api.nvim_create_user_command("UEDAPPreflight", function() M.dap_preflight() end,
+    { desc = "Layered L0-L4 DAP capability preflight (no live session needed)" })
+  vim.api.nvim_create_user_command("UEDAPSmoke", function() M.dap_smoke() end,
+    { desc = "On-demand real-device DAP verification with redacted evidence" })
   vim.api.nvim_create_user_command("UEResetLayout", function()
     M.dap_reset_layout()
   end, {})

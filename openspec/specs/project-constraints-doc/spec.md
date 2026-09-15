@@ -3,9 +3,7 @@
 ## Purpose
 
 在 `docs/CONSTRAINTS.md` 提供一份权威的、统一归纳项目禁止项、踩过的坑与约束的参考文档，并使其可被发现、可溯源、可维护。该文档以索引/链接指向仓库既有出处，而非整段复制原文。
-
 ## Requirements
-
 ### Requirement: Consolidated constraints reference document
 
 仓库 SHALL 在 `docs/CONSTRAINTS.md` 提供一份权威文档，统一归纳项目的禁止项、
@@ -55,8 +53,9 @@
   auto-install（钉死工具链）；不做全局 `vim.lsp.handlers` 覆盖（走
   `lsp_fallback`/`workarounds`）；不写 inline workaround（必须用 registry）；
   不做周期性 ticker 通知；不阻塞主线程；不对 64 位值用
-  `string.format("%x", addr)`（LuaJIT 会截断到 32 位）；codelldb 不用
-  `request="custom"`；不用 which-key 自动 cheatsheet；不在配置内集成
+  `string.format("%x", addr)`（LuaJIT 会截断到 32 位）；DAP 不用
+  `request="custom"`；Windows lldb-dap pin 上不发裸 `script` 命令（只用
+  `command script import`）；不用 which-key 自动 cheatsheet；不在配置内集成
   copilot/codeium
 - **AND** 每条都包含简短理由和指向出处的链接
 
@@ -68,7 +67,7 @@
 #### Scenario: DAP, toolchain, and platform pitfalls are recorded
 
 - **WHEN** 读者查阅「踩过的坑」小节
-- **THEN** 它包含 codelldb 路线的坑（custom-request 被拒；手动
+- **THEN** 它包含 DAP 路线的坑（custom-request 被拒〔历史 codelldb 路线，须标注已退役〕；手动
   `target modules load --slide` rebase；强制
   `process handle SIGSEGV/SIGBUS -p true -s false`；LuaJIT hex 截断；
   Android 的 terminate-vs-disconnect；dap-repl F-key 多模式绑定；
@@ -77,6 +76,10 @@
 - **AND** 它包含 LLVM `STATUS_STACK_BUFFER_OVERRUN` 历史、Android ASLR
   `--slide` 须先于断点 的教训、snacks picker first-open 卡死、clangd 非
   `file://` URI 报错刷屏，以及 lldb-dap ⇄ codelldb 适配器迁移弧线
+- **AND** 它区分「历史 22.0–22.1.5 启动崩」与「当前 22.1.6 pin 上裸 `script` 命令崩
+  （`0xC0000409`，`launch` 无 response）」这两个不同的失败，并记录 `import lldb` 在当前 pin
+  上**仍然不可用**（缺 `lldb` python 包，而非 nopython liblldb），以免有人据「已修」删掉
+  native `type summary` 兜底
 
 #### Scenario: Each pitfall is traceable to a source
 
@@ -92,8 +95,8 @@
 #### Scenario: Version pins, conventions, and boot order are listed
 
 - **WHEN** 读者查阅「约束」小节
-- **THEN** 它列出工具链钉死项（clangd/LLVM 22.x —— 不要降级；codelldb
-  1.12.2；NDK 27 lldb-server；Neovim 0.10+）和六条约定（AST/treesitter 优先于
+- **THEN** 它列出工具链钉死项（clangd/LLVM 22.x —— 不要降级；host DAP 适配器
+  = LLVM 22.1.6+ `lldb-dap`，forward-only；NDK 27 lldb-server；Neovim 0.10+）和六条约定（AST/treesitter 优先于
   regex；async 优先于阻塞；workaround 隔离；可自验证的 `M.*` 模块；不做周期性
   ticker 通知；未变更时跳过写入）
 - **AND** 它引用 `lua/workarounds/README.md` 的 workaround frontmatter 契约
@@ -122,3 +125,27 @@
 - **WHEN** 某份 spec 或规则文档引用的仓内文件被删除、重命名或归档
 - **THEN** 维护契约要求同步更正该引用（或更正 spec 的产出物要求）
 - **AND** spec 引用完整性回归守护「引用不悬空」这一不变量
+
+### Requirement: 约束文档 SHALL 记录 DAP 归属分层契约与「失败先报层」纪律
+
+`docs/CONSTRAINTS.md` SHALL 在约束小节记录 DAP 五层归属契约（宿主工具链 / 传输 /
+目标 OS 策略 / 调试引擎 / 符号语义），每层给出 owner 与判定手段指针，并 SHALL 记录
+「任何 DAP 失败必须先指认层再给处置」这条纪律。
+
+该小节 SHALL 说明分层的目的：34 条 DAP 坑中仅少数属本仓代码，多数是外部契约
+（目标 OS 策略与调试引擎），分层的作用是让读者一步区分「不是我们能修的」与
+「我们的 bug」，而不必每次现场取证。
+
+#### Scenario: 读者查阅约束小节取得分层
+
+- **WHEN** 读者查阅约束小节
+- **THEN** 它列出 DAP 五层归属契约与每层 owner
+- **AND** 它声明失败先报层的纪律
+- **AND** 它指向治理该契约的 capability spec 作为权威出处
+
+#### Scenario: 踩坑条目可按层归类
+
+- **WHEN** 新增一条 DAP 坑
+- **THEN** 维护契约 SHALL 要求该条目标注其归属层
+- **AND** 标注 SHALL 使读者能判断该坑是外部契约还是本仓缺陷
+

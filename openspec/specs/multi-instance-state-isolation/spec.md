@@ -8,6 +8,74 @@ merge 或 single-writer 合同，不因 basename 碰撞或共享 JSON read-modif
 
 ## Requirements
 
+### Requirement: project input completion and selection SHALL agree
+
+`:UESetProject` SHALL accept existing Windows drive-relative paths returned by its native
+file-completion input. Before project discovery and persistence, it SHALL resolve the existing
+object through the host filesystem to an absolute path. It MUST NOT insert a separator after
+the drive letter or send a drive-relative path to build/context consumers.
+Existing top-level and unique `Source/<project>/*.uproject` discovery SHALL remain available.
+An absolute drive root such as `C:/` MUST NOT be reinterpreted as the drive's current directory.
+Projects located directly at a drive root are unsupported by the shared path/state consumers;
+the command SHALL reject such a selection explicitly and retain the previous project.
+
+#### Scenario: Tab completes a drive-relative project file or workspace
+
+- **WHEN** native file completion returns an existing drive-relative project file or workspace,
+  including a path with spaces or a non-root per-drive working directory
+- **THEN** selection SHALL persist the absolute path of the object actually completed
+- **AND** the next context and build plan SHALL use that selected project rather than the previous one
+- **AND** selecting a supported nested workspace SHALL preserve that workspace as project_root
+
+#### Scenario: selected path is missing or contains no discoverable project
+
+- **WHEN** a nonempty project selection cannot resolve a valid project or cannot be persisted
+- **THEN** the command SHALL report ERROR with the cause, `UE project NOT changed`, and the
+  retained active project (or `<unset>`)
+- **AND** it MUST NOT report success or replace the previous project with an invalid path
+
+#### Scenario: project selection repair is observed in subsequent sessions
+
+- **WHEN** project selection succeeds or fails validation/persistence
+- **THEN** a bounded `project-selection` observation SHALL record success or failure without
+  storing private paths; probe failure MUST NOT interrupt project selection
+- **AND** test evidence SHALL remain separate from real-session observations
+
+### Requirement: owner 交接与过期锁回收不得破坏新 owner
+
+锁发布 SHALL 以已写完整且带唯一 token 的非空 owner 目录为单位；过期回收者 SHALL 只删除它观察到的 owner 文件，MUST NOT 递归删除可能已被新 owner 替换的目录。探测权限不足、损坏或不可读的 owner 记录 SHALL fail closed 并给出诊断，不能当作进程已死亡。
+
+#### Scenario: 两个回收者交错执行
+- **WHEN** A 已观察旧 owner，而 B 先回收并发布新 owner
+- **THEN** A MUST NOT 删除 B 的 owner 或同时获得有效 lease
+- **AND** owner 异常退出后仍可通过可验证的死亡证据恢复锁
+
+#### Scenario: watcher 切换项目且旧保存尚未完成
+- **WHEN** watcher 从 A 切到 B，A 尚有排队事件、锁忙或瞬时 I/O 失败后的保存重试
+- **THEN** 旧事件 SHALL 失效，保存重试 SHALL 继续只写 A
+- **AND** B 的内存与磁盘 dirty 集合 MUST NOT 包含 A 的路径
+
+#### Scenario: 持久化持续失败
+- **WHEN** 原 owner 的保存持续遇到锁竞争或 I/O 失败
+- **THEN** 重试 SHALL 有界退避，耗尽后只给出一次含路径与原因的告警
+- **AND** MUST NOT 忙轮询或宣称已落盘；主动成功保存 SHALL 使旧重试失效
+
+#### Scenario: 断点在两个项目之间往返
+- **WHEN** 没有活跃 DAP 会话时从 A 切到 B 再切回 A
+- **THEN** 旧 bucket 的断点 SHALL 先保存并从其管理的 live store 移除，再恢复新 bucket
+- **AND** 共用 engine 源文件的断点 SHALL 仍按项目隔离
+
+#### Scenario: 活跃调试会话期间切换项目
+- **WHEN** DAP 会话仍属于 A 而用户选择 B
+- **THEN** 断点 bucket 交接 SHALL 延迟至会话结束，不清除或重绑 A 的会话断点
+
+#### Scenario: iOS 安装或启动完成时已选择其他项目
+- **WHEN** A 的 iOS 操作开始后用户选择同 engine 下的 B，随后 A 完成
+- **THEN** bundle、PID、安装及运行状态 SHALL 写回捕获的 A bucket
+- **AND** 当前 live selection SHALL 保持 B
+
+
+
 ### Requirement: live selections SHALL be process-local
 
 当前 project、target platform/configuration 与 Android device serial SHALL 在 Neovim 进程内
@@ -67,6 +135,31 @@ target platform/configuration SHALL 作为一个原子 pair 写入，MUST NOT �
 - **WHEN** 多个进程同时写入不同的 `(platform, configuration)` pair
 - **THEN** 磁盘最终值 SHALL 完整来自某一个 writer
 - **AND** MUST NOT 组合一个 writer 的 platform 与另一个 writer 的 configuration
+
+### Requirement: state-setting 命令 SHALL 以回读为凭报告成败
+
+改写持久 project state 的用户命令 SHALL 先校验写入结果，并 SHALL 从读取方使用的同一
+project bucket 回读该字段后才能宣布成功。写入失败或回读不一致时，反馈 SHALL 是错误并包含原因，
+MUST NOT 打印成功文案。
+
+事实基础（K61，2026-09-03 实测）：`project_state.update` 在本进程未选中项目时返回
+`false, "no project selected in this Neovim session"`。`:UESetAndroidPackage` 丢弃了该返回值，
+于是在什么都没落盘的情况下仍打印「UE Android package set: …」，而 `<Space>da` 继续以旧
+包名 attach 并报「process <pkg> not running」——用户感知为「命令不刷新缓存」。单纯检查返回值
+不够：它无法表达 writer 与 reader 落在不同 bucket 的情形，所以必须回读。
+
+#### Scenario: 本进程未选中项目
+
+- **WHEN** 本进程未选中任何 project 时执行一个 state-setting 命令
+- **THEN** 命令 SHALL 报错并告知未选中项目
+- **AND** MUST NOT 报告成功
+- **AND** MUST NOT 写入任何字段
+
+#### Scenario: 写入成功后立刻可被读取方看到
+
+- **WHEN** 用户纠正一个写错的字段值
+- **THEN** 写入 SHALL 在同一 bucket 回读到新值后才报告成功
+- **AND** 后续读取方（包括 DAP attach 的包名解析）SHALL 看到新值，而不是旧值
 
 ### Requirement: engine-level target preference SHALL suggest, never inherit
 

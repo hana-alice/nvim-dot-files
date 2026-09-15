@@ -47,6 +47,7 @@ local function make_location(file, lnum, col)
   local col0  = math.max(0, (col  or 1) - 1)
   return {
     uri = uri,
+    _position_encoding = "utf-8", -- rg/csearch columns are byte offsets.
     range = {
       start  = { line = line0, character = col0 },
       ["end"] = { line = line0, character = col0 + 1 },

@@ -11,7 +11,7 @@
 #   1  hit -- abort the git op
 #   2  internal error (no input, missing tools)
 #
-# Bypass with `git commit --no-verify` / `git push --no-verify`.
+# Privacy failures must be fixed before commit/push. Never bypass the hooks.
 #
 # This script reads stdin (the diff/text to scan).  It assumes the
 # caller has already filtered to "added lines only" if that's desired
@@ -64,9 +64,7 @@ if [ "$hits" -gt 0 ]; then
 [check_secrets] BLOCKED -- $hits sensitive pattern(s) hit:
 $hit_report
 
-Either:
-  - remove the offending content, OR
-  - bypass with --no-verify (DANGER: only if you're 100% sure this remote is private)
+Remove the offending content and rerun the operation with privacy hooks enabled.
 
 EOF
   exit 1

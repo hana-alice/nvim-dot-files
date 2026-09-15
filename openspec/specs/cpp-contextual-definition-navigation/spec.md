@@ -6,6 +6,76 @@
 
 ## Requirements
 
+### Requirement: 精确位置与异步副作用必须绑定不可变请求
+
+LSP 请求 SHALL 按所选 client 的 position encoding 将捕获行文本的字节光标转换为协议位置。self/declaration 过滤 SHALL 比较精确位置或语义范围，MUST NOT 仅以同文件同行否决不同实体。所有结果跳转及 lineage 更新 SHALL 在副作用发生前通过请求和 generation 新鲜度门禁。
+
+请求 SHALL 冻结同一 action 使用的全部 unsaved overlays；新鲜度门禁 SHALL 验证其路径、版本与集合，并记录 active roots 内已加载 C++ buffer 的版本以检测编辑后保存，不能只验证发起 buffer。目标列 SHALL 按 location 的 encoding 转换为 Neovim 字节列。
+
+#### Scenario: 光标前存在非 ASCII 文本
+- **WHEN** 调用位置前有中文或其他多字节字符
+- **THEN** UTF-8、UTF-16 或 UTF-32 client SHALL 收到各自编码下的正确位置
+
+#### Scenario: 目标前存在中文或 emoji
+- **WHEN** provider 返回 UTF-8、UTF-16 或 UTF-32 编码的目标列
+- **THEN** 跳转 SHALL 落在同一个目标 token 的字节位置，保持既有 jumplist 行为
+
+#### Scenario: 在途请求的依赖 overlay 改变
+- **WHEN** 自动格式化或 workspace edit 修改另一 buffer，或其保存使 overlay 集合改变
+- **THEN** 旧响应 SHALL 被拒绝，不跳转或更新 lineage
+- **AND** 同一 action 的后续阶段 MUST NOT 重新采样 overlays 并与旧 identity 混用
+
+#### Scenario: 同一行存在不同 definition
+- **WHEN** declaration/reference 与目标 definition 位于同一行的不同位置
+- **THEN** 系统 MUST NOT 仅因行号相同把目标当作 self jump 移除
+
+#### Scenario: Provider destination no longer exists
+- **WHEN** 目标是目录等非普通文件，或不在已加载 buffer 中且磁盘文件不存在或不可读，或目标参数无效
+- **THEN** jumper SHALL 返回失败，在修改源窗口、光标和 jumplist 之前拒绝该目标
+- **AND** 已加载但尚未保存到磁盘的新文件 buffer SHALL 仍可作为合法目标
+
+#### Scenario: 取消后的头文件查询晚到
+- **WHEN** 旧 header 响应晚于取消、新 lineage 或 generation 切换
+- **THEN** 旧响应 SHALL 被拒绝
+- **AND** MUST NOT 跳转、清除或覆盖新窗口的 origin lineage
+
+### Requirement: warm sidecar 缓存必须验证已解析文件的新鲜度
+
+warm TU 与 destination cache SHALL 绑定 compiler-authored inclusion 集合及主文件的磁盘签名，除 overlay 和编译命令外也验证已保存内容的新鲜度。签名变化 SHALL 触发 reparse/重新 lookup，不能复用旧 USR 或行号。依赖枚举与检查 SHALL 在 sidecar 执行，不扫描整个项目或阻塞编辑器主线程。
+
+#### Scenario: 保存 source 或已包含的 header
+- **WHEN** 两次查询之间 source/header 保存发生变化，而 CDB 与 overlay 集合未变
+- **THEN** 下次查询 SHALL 基于重新解析的 TU 返回新实体及位置
+- **AND** 缓存 destination MUST NOT 保留旧源码行号
+
+#### Scenario: 缺失 include 补齐后恢复
+- **WHEN** TU 因缺失 include 存在编译错误，随后该依赖被补齐
+- **THEN** 错误 TU MUST NOT 提供 resolved identity/destination 或可复用的成功缓存
+- **AND** 下次查询 SHALL 重新解析并解析到补齐依赖后的正确重载
+
+#### Scenario: 同一 USR 在不同模块上下文查询
+- **WHEN** 两个 subject 选择不同模块上下文，但 USR 和 CDB 文件签名相同
+- **THEN** 成功缓存 SHALL 区分 subject 或所选上下文集合，不复用前一个模块的目标
+
+### Requirement: Sidecar 相对路径 SHALL 以真实编译目录解析
+
+compiler 返回的相对 destination 和 dependency 路径 SHALL 以该 TU 的 compile directory 转为绝对路径，不能依赖 sidecar 或编辑器当前目录。
+
+#### Scenario: Relative include path in an exact compile command
+- **WHEN** exact command 使用相对 source 与 `-Iinc`，且 compile directory 不同于编辑器目录
+- **THEN** cold query 与 reparse SHALL 返回相同的绝对目标路径
+- **AND** dependency freshness SHALL 检查该编译目录下的真实文件
+
+### Requirement: 不完整 module lookup MUST NOT 被辅助 provider 覆盖成成功
+
+parse/diagnostic 错误、shim 错误、遍历 overflow、context limit 或已完成 lookup 的零/多 body 结果 MUST NOT 转成 clangd 辅助成功。只有明确缺少 module contexts 时才允许既有 identity-verified clangd 协助。
+
+#### Scenario: Module traversal cannot prove uniqueness
+- **WHEN** module lookup 返回 overflow、context limit 或 native parse/shim failure
+- **THEN** coordinator SHALL 终止并保留失败证据，不调用 clangd 回退或执行跳转
+
+
+
 ### Requirement: C++ definition navigation SHALL accept only semantic targets
 
 C++ `gd` SHALL 只接受当前 active build generation 下由 compiler-owned identity 关联的 declaration / definition destination。Tree-sitter、符号文本、receiver 文本、参数个数、workspace symbol、csearch、GTAGS、文件距离、返回顺序或候选排序 MUST NOT 选择、替换或否决 C++ 语义目标。`resolved` SHALL 表示目标身份与目标位置均已证明，而不能只表示“找到一个同身份 declaration”。
@@ -15,11 +85,45 @@ C++ `gd` SHALL 只接受当前 active build generation 下由 compiler-owned ide
 - **THEN** 系统 SHALL 跳转到该 definition
 - **AND** 跳转结果 SHALL NOT 被任何文本候选覆盖
 
+#### Scenario: Source provider can prove only a declaration
+- **WHEN** source 查询的函数、变量或前置类型 compiler identity 只有 declaration evidence，且 provider 的 definition 响应落在该声明
+- **THEN** 系统 MUST NOT 把声明标为 `definition-resolved` 或 `destination_role=definition`
+- **AND** SHALL 保留声明角色与缺少 definition 的证据
+
+#### Scenario: One provider returns multiple canonical identities
+- **WHEN** 同一 symbolInfo 响应包含多个不同 USR，例如模板 dependent call 或 overload using declaration
+- **THEN** provider SHALL 聚合去重所有 USR，不能选择数组第一项作为唯一身份
+- **AND** 不同身份尚未消歧时 MUST NOT 按首项继续 definition 查询
+
+#### Scenario: Compiler macro identity has no symbolInfo ranges
+- **WHEN** 同一 exact-command client 在原 snapshot 上证明唯一 macro USR，而 symbolInfo 不提供 declarationRange 或 definitionRange
+- **THEN** source navigation SHALL 按 clangd 的 macro referent 语义接受该 client 唯一的 definition destination
+- **AND** macro expansion 的 underlying type USR MUST NOT 被误当作该宏的歧义；不同 macro USR 或不同 client 的冲突仍 SHALL 拒绝
+- **AND** 内建宏无可导航源位置时 SHALL 返回 `macro-no-source-definition`，不得误报 index coverage 缺失
+
+#### Scenario: Alias and namespace destinations have declaration roles
+- **WHEN** 同一 client 的 exact-position AST 证明 `Typedef/type` 或 `Namespace/specifier`，且 definition 唯一位置与唯一 canonical USR 的 declarationRange 一致
+- **THEN** source navigation SHALL 跳转到该 alias/namespace 声明，报告 `declaration-resolved` 与 `destination_role=declaration`
+- **AND** 多 identity 时 SHALL 通过 compiler destination 与 declarationRange 的唯一关联消歧，不按名称、USR 顺序或 underlying 类型猜选
+- **AND** 普通函数声明、extern 变量、前置类、未消歧 overload 和未知 AST kind MUST NOT 复用该放行规则
+- **AND** AST 请求 SHALL 使用原 snapshot 的编码位置、有界 deadline、相同 client、exact command 与 freshness/cancellation 门禁，不拉取全文件 AST
+
+#### Scenario: Cursor is already on its proven definition
+- **WHEN** source symbolInfo 的 definitionRange 包含当前 snapshot 位置，即使 clangd definition 请求会切换到该实体的声明
+- **THEN** 系统 SHALL 保持光标与 jumplist 不变并报告 `already-at-definition`
+- **AND** MUST NOT 将 self-filter 后的空列表误报为 index-incomplete 或缺少 definition
+
 #### Scenario: Source TU uses the transported exact command
 - **WHEN** 当前 source TU 已由 controlled active CDB 提供 exact compile command 并传给 clangd
 - **THEN** `gd` SHALL 在不可变光标 snapshot 上向同一 clangd client 请求 canonical USR 与 definition
 - **AND** MUST NOT 为每次 source `gd` 在 sidecar 中重新读取或解析全量 CDB
 - **AND** 进入 header 时 SHALL 把该 exact command 记录为后续 header-in-context 的 origin TU evidence
+
+#### Scenario: Source symbolInfo cannot see a definition in another TU
+- **WHEN** source exact-cursor USR 已证明，且同一 client 返回唯一 source-TU definition，但 source AST 的 symbolInfo.definitionRange 为空
+- **THEN** 系统 SHALL 在目标 TU 的 exact compile command 下异步核验目标位置，要求同一 client、同一 USR 且 definitionRange 覆盖目标
+- **AND** 目标只为 declaration、不同 USR、目标编辑或原请求过期时 MUST NOT 跳转；MUST NOT 仅凭 definition 请求的位置当作已验证 body
+- **AND** 校验 SHALL 保持当前窗口不变，清理未使用的临时目标 buffer，保留任何用户编辑；不得按独立 header 猜 compile context
 
 #### Scenario: First gd follows a cold clangd restart
 - **WHEN** source 不属于 synthetic background CDB，clangd 已先用邻近 TU 推断命令打开该 buffer
@@ -218,6 +322,17 @@ MUST NOT 归类为 `ambiguous-context`。
 - **THEN** 系统 SHALL 返回 `unavailable` 及 provider/capability reason
 - **AND** MUST NOT 把它归类为当前 C++ 位置语义无效
 
+#### Scenario: No eligible clangd client is attached
+- **WHEN** 当前 buffer 没有符合 identity/provider 约束的 attached clangd client
+- **THEN** transport SHALL 返回 `provider-unavailable`，MUST NOT 把空 client 集合当作 method unsupported 的证据
+- **AND** 当前 index 为 missing/stale 时，导航终态 SHALL 说明 index readiness 与 `UEPrepare` 补救动作；index ready 时 SHALL 保留 provider absence 并指向 `LspInfo` / `UEDefExplain`
+- **AND** 原始 provider absence SHALL 保留在结构化 explain record 中
+
+#### Scenario: An attached provider explicitly lacks the requested capability
+- **WHEN** 符合 identity/provider 约束的 attached client 明确不支持请求 method
+- **THEN** transport SHALL 返回 `provider-method-unsupported` 并保留 client 与 capability 证据
+- **AND** index 缺失 SHALL NOT 将已证明的 capability failure 改写为 provider absence
+
 #### Scenario: Request becomes stale before completion
 - **WHEN** 用户移动光标、切换 buffer、再次触发 `gd`、document version 或 generation 变化后旧请求才
   返回
@@ -246,6 +361,11 @@ Clang 解析、TU 创建、reparse 与索引构建 SHALL 在 Neovim UI 主循环
 - **WHEN** 用户依次查询超过配置上限的不同 TU/context
 - **THEN** 系统 SHALL 按可观察的 LRU/idle 策略释放旧 TU
 - **AND** 进程 RSS、TU count 与 eviction reason SHALL 被探针记录且不得无界增长
+
+#### Scenario: Continuous distinct destination lookups
+- **WHEN** 持续查询不同 USR/subject/overlay 组合而不触发 idle eviction
+- **THEN** destination cache SHALL 受独立于 TU 数量的容量上限和 LRU 淘汰约束
+- **AND** 访问命中的条目 SHALL 更新使用顺序，超过上限时淘汰最久未使用的结果
 
 ### Requirement: Contextual semantic navigation SHALL NOT modify engine or project sources
 
@@ -294,6 +414,11 @@ Clang 解析、TU 创建、reparse 与索引构建 SHALL 在 Neovim UI 主循环
 - **THEN** explain record SHALL 区分 identity failure、provider failure、partial index miss、complete index miss 与 multiple destinations
 - **AND** 用户无需重新开启 debug logging 即可查看最近一次证据链
 
+#### Scenario: Detailed failure is available but summarized by the coordinator
+- **WHEN** coordinator 把原始 provider/context/native 失败映射为通用终态
+- **THEN** `UEDefExplain` SHALL 展示有界且脱敏的原始 reason、diagnostics、context evidence 和可用阶段耗时
+- **AND** 原始绝对路径、用户名与源码内容 MUST NOT 因展示深层诊断泄露
+
 #### Scenario: Repeated identical failure occurs
 - **WHEN** 同一 stage/reason/generation 的失败重复发生
 - **THEN** 探针 SHALL 以稳定 key 聚合 count/first/last 而非逐次追加
@@ -335,6 +460,17 @@ Clang 解析、TU 创建、reparse 与索引构建 SHALL 在 Neovim UI 主循环
 进程；不得让无响应进程继续占用 CPU 或永久阻塞后续导航。下一次请求 SHALL 能按现有 process
 manager 冷启动新 sidecar。
 
+client SHALL 按 sidecar 串行执行能力调度单个 in-flight 请求，只有实际发送时才启动其执行 deadline。
+排队的过期 action SHALL 在发送前清除并完成回调；取消不得移除正在执行请求的硬超时保护。
+
+#### Scenario: Two individually healthy requests are queued together
+- **WHEN** 两个请求各自执行时间低于 deadline，但总时间超过一个 deadline
+- **THEN** 后一个请求 SHALL 在自身实际发送后获得完整执行期限，不因前一个请求的排队耗时被误杀
+
+#### Scenario: A queued navigation action becomes stale
+- **WHEN** 用户取消或开始新的 action，旧请求尚在等待发送
+- **THEN** 旧请求 SHALL 不再发送给 sidecar，并以结构化失败完成回调
+
 #### Scenario: libclang parse 超过请求期限
 - **WHEN** sidecar 在 native parse 中超过配置的 request timeout 且无法处理协议 cancel
 - **THEN** client SHALL 终止该 sidecar，并以 timeout/provider-unavailable 完成请求
@@ -344,3 +480,78 @@ manager 冷启动新 sidecar。
 - **WHEN** 前一 sidecar 已因超时被回收，用户再次触发语义导航
 - **THEN** process manager SHALL 启动新的 sidecar 并接受请求
 - **AND** 系统 MUST NOT 因旧进程或旧 pending entry 永久保持 unavailable
+
+### Requirement: Semantic components SHALL own independent lifecycles
+
+环境读取 SHALL 返回当前构建和工具链的快照，不得因读取本身清除 context、发送 evict 或停止进程。
+client composition root SHALL 决定环境变化的处置：同工具链构建变化清除 context 与缓存；工具链变化重启 sidecar。
+transport SHALL 独立管理进程、协议、队列和 deadline；action SHALL 独立管理编辑器快照、取消与窗口 context。
+native TU store、catalog 与 definition resolver SHALL 通过显式依赖协作，各自清理所拥有的资源。
+
+#### Scenario: Environment is inspected without executing a navigation action
+- **WHEN** 调用环境快照读取 API
+- **THEN** 当前窗口 lineage、运行进程和 native 缓存 SHALL 保持不变
+
+#### Scenario: Semantic modules are reloaded during an active request
+- **WHEN** `UEDefReload` 清除旧模块加载缓存
+- **THEN** 系统 SHALL 先取消旧 action、清除其 UI、释放旧 client 的进程与 context
+- **AND** 旧回调 MUST NOT 跳转、恢复旧进程或覆盖新 action 的 Explain
+
+#### Scenario: Native toolchain disagrees with the requested compiler
+- **WHEN** sidecar handshake 返回的实际工具链与启动请求不匹配，或缺少实际 compiler identity
+- **THEN** transport SHALL 拒绝将该进程标记 ready，并完成排队请求的结构化失败
+
+### Requirement: Identity evidence SHALL remain distinct from a completed navigation
+
+`query` 的 resolved 响应 SHALL 提供非空 canonical USR 与有效 declaration 或 definition；
+`lookup-definition` 的 resolved 响应 SHALL 提供非空 canonical USR 与有效 definition，声明不能替代定义。
+只有导航 coordinator SHALL 提交跳转、来源 lineage、进度提示与终态通知；下层 resolver 返回证据。
+
+#### Scenario: Protocol claims a definition with declaration-only evidence
+- **WHEN** `lookup-definition` 响应为 resolved，但缺少 definition 或 canonical USR
+- **THEN** client SHALL 拒绝该协议响应，不产生跳转
+
+#### Scenario: Compiler evidence is valid but the destination cannot be opened
+- **WHEN** 已取得实体证据，但实际 jump 失败
+- **THEN** 系统 SHALL 报告跳转失败，并保留原窗口 lineage
+
+#### Scenario: A superseded action completes after the next action
+- **WHEN** 旧 action 的异步结果晚于新 action 到达
+- **THEN** 旧 action SHALL 只清理自己拥有的进度 UI，不清除其他 action 的提示或覆盖最新 Explain
+
+### Requirement: Evidence completeness SHALL survive decoding and resource boundaries
+
+CDB 解码 SHALL 保留拒绝记录及完整性状态；catalog/prove/lookup MUST NOT 把成功解析的子集当作完整构建证据。
+native CDB 缓存 SHALL 绑定数据库文件签名，全量 evict SHALL 覆盖其数据库句柄。
+NDJSON 大小上限 SHALL 对完整帧及任意分块方式一致，并在真实 stdin 入口限制读取缓冲。
+
+#### Scenario: A malformed CDB entry hides a competing definition
+- **WHEN** 同模块的另一条编译记录缺失或无法解析 command/arguments
+- **THEN** lookup SHALL 返回不完整证据的结构化失败，不声明剩余定义唯一
+
+#### Scenario: Compilation flags change on a context without embedded compile arguments
+- **WHEN** 数据库文件签名变化或执行全量 evict 后再次解析
+- **THEN** sidecar SHALL 从当前数据库取得新命令，不能沿用旧 CXCompilationDatabase
+
+#### Scenario: Oversized input is split differently
+- **WHEN** 同一超限 NDJSON 帧以整行或多个 chunk 输入
+- **THEN** decoder SHALL 一致拒绝，并在行边界恢复处理下一条合法请求
+
+### Requirement: Navigation ownership SHALL be enforced by interfaces
+
+navigation install SHALL 返回独立实例；公开 lineage getter SHALL 返回副本。
+source route SHALL 仅要求自身使用的 clangd/build 能力，libclang sidecar 能力 SHALL 在 header route 中要求。
+取消与 freshness SHALL 传播到 LSP preparation/dispatch；已发出的 LSP 请求 SHALL 保留 request ID 以便定向取消。
+成功终态 SHALL 保留 canonical identity、实际目标、provider 与有来源标记的 metrics，不能只靠 resolved 枚举声明成功。
+
+#### Scenario: Preparation completes after action cancellation
+- **WHEN** 用户已取消 action，异步 compile preparation 才完成
+- **THEN** 旧 action SHALL 不再投递编译命令或发送新的 LSP 请求
+
+#### Scenario: A caller mutates a returned lineage value
+- **WHEN** 调用者修改 `window_origin` 的返回值
+- **THEN** 内部存储 SHALL 保持不变，除非通过明确的来源提交 API 修改
+
+#### Scenario: Two navigation owners are installed
+- **WHEN** 分别构造两个 navigation 实例并调用第一个
+- **THEN** 其报告与依赖 SHALL 仍属于第一个 owner，不被第二次 install 接管

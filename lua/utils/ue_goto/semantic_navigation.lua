@@ -227,6 +227,16 @@ function M.install(owner, deps)
 
     local function provider_failure(result)
       local reason = result and result.reason
+      if reason == "provider-unavailable" then
+        local readiness_reason = definition_miss_reason()
+        local index_unavailable = readiness_reason == "index-provider-not-ready"
+          or readiness_reason == "index-stale-for-module"
+        return transaction.terminal("unavailable", index_unavailable and "index" or "provider",
+          index_unavailable and readiness_reason or reason, {
+            provider = "clangd",
+            provider_result = result,
+          })
+      end
       if reason == "provider-method-unsupported" or reason == "provider-timeout"
           or reason == "provider-error" then
         return transaction.terminal("unavailable", "provider", reason, {
@@ -542,12 +552,6 @@ function M.install(owner, deps)
       return
     end
 
-    local clients = vim.lsp.get_clients({ bufnr = bufnr, method = "textDocument/definition" })
-    if not clients or vim.tbl_isempty(clients) then
-      finish(transaction.terminal("unavailable", "provider", "provider-method-unsupported"))
-      return
-    end
-
     -- Source TUs already have an exact command transported to clangd from the
     -- controlled active CDB. Query clangd at the immutable cursor snapshot;
     -- do not make every gd parse the 200MB+ CDB again in the libclang sidecar.
@@ -571,7 +575,19 @@ function M.install(owner, deps)
         return
       end
 
-      provider.async_lsp_request(bufnr, "textDocument/definition", function(definition_result)
+      -- clangd toggles from a function definition to its declaration. Detect
+      -- the proven source role before that response can be mistaken for a miss.
+      for _, definition in ipairs(symbol_info.definitions or {}) do
+        if transaction.same_subject_location(tx, definition) then
+          finish(transaction.terminal("unavailable", "destination", "already-at-definition", {
+            provider = "clangd", identity = usr, destination_role = "definition",
+            identity_result = symbol_info,
+          }))
+          return
+        end
+      end
+
+      local function receive_definition(definition_result)
         local still_current, reason = request_is_current(definition_result)
         if not still_current then
           finish_stale(reason)
@@ -579,10 +595,10 @@ function M.install(owner, deps)
         end
         local definition_failure = provider_failure(definition_result)
         if definition_failure then finish(definition_failure); return end
-        local locs = transaction.filter_definition_locations(
-          tx, definition_result.locations or {}, nil)
+        local locs = definition_result.locations or {}
         if #locs == 0 then
-          finish(transaction.terminal("unavailable", "index", definition_miss_reason(), {
+          finish(transaction.terminal("unavailable", symbol_info.entity_kind == "macro" and "destination" or "index",
+            symbol_info.entity_kind == "macro" and "macro-no-source-definition" or definition_miss_reason(), {
             provider = "clangd",
             identity = usr,
             provider_result = definition_result,
@@ -605,55 +621,85 @@ function M.install(owner, deps)
           end
           return false
         end
-        -- clangd's definition method may return a declaration when no body is
-        -- known. Only its same-USR definitionRange proves this is a definition.
-        if not contains_target(symbol_info.definitions) then
+        local function reject_destination(reason, target_evidence)
           finish(transaction.terminal("unavailable", "destination", "definition-not-found", {
             provider = "clangd", identity = usr,
             destination_role = contains_target(symbol_info.declarations) and "declaration" or "unknown",
             provider_result = definition_result,
             identity_result = symbol_info,
+            detail = reason, target_identity_result = target_evidence,
           }))
-          return
         end
-        local target_path = location_mod.location_path(locs[1]):lower()
-        if M.CPP_HEADER_EXTS[target_path:match("%.([^./\\]+)$") or ""]
-            and type(symbol_info.exact_command) == "table" then
-          local exact = symbol_info.exact_command
-          local compile = {
-            directory = exact.workingDirectory,
-            file = ref_file,
-            argv = vim.deepcopy(exact.compilationCommand or {}),
-          }
-          local compile_fingerprint = vim.fn.sha256(vim.json.encode(compile))
-          local lineage = {
-            context_id = compile_fingerprint,
-            origin_tu = ref_file,
-            cdb_dir = environment.cdb_dir,
-            compile = compile,
-            compile_command_fingerprint = compile_fingerprint,
-            subject_membership = { [target_path] = true },
-          }
-          origin_context = lineage
+        local function accept_destination(target_evidence, destination_role)
+          local target_path = location_mod.location_path(locs[1]):lower()
+          if M.CPP_HEADER_EXTS[target_path:match("%.([^./\\]+)$") or ""]
+              and type(symbol_info.exact_command) == "table" then
+            local exact = symbol_info.exact_command
+            local compile = {
+              directory = exact.workingDirectory,
+              file = ref_file,
+              argv = vim.deepcopy(exact.compilationCommand or {}),
+            }
+            local compile_fingerprint = vim.fn.sha256(vim.json.encode(compile))
+            local lineage = {
+              context_id = compile_fingerprint,
+              origin_tu = ref_file,
+              cdb_dir = environment.cdb_dir,
+              compile = compile,
+              compile_command_fingerprint = compile_fingerprint,
+              subject_membership = { [target_path] = true },
+            }
+            origin_context = lineage
+          end
+          dtrace("semantic provider=clangd context=source-exact-command usr=%s state=resolved",
+            tostring(usr))
+          jump_resolved(locs[1], "clangd·semantic", {
+            provider = "clangd",
+            destination_role = destination_role or "definition",
+            terminal_reason = destination_role == "declaration" and "declaration-resolved" or nil,
+            subject_role = "reference",
+            identity = usr,
+            identity_result = symbol_info,
+            target_identity_result = target_evidence,
+            provider_result = definition_result,
+            metrics = { source = "clangd", identity_ms = symbol_info.elapsed_ms,
+              destination_ms = definition_result.elapsed_ms },
+          })
         end
-        dtrace("semantic provider=clangd context=source-exact-command usr=%s state=resolved",
-          tostring(usr))
-        jump_resolved(locs[1], "clangd·semantic", {
-          provider = "clangd",
-          destination_role = "definition",
-          subject_role = "reference",
-          identity = usr,
-          identity_result = symbol_info,
-          provider_result = definition_result,
-          metrics = { source = "clangd", identity_ms = symbol_info.elapsed_ms,
-            destination_ms = definition_result.elapsed_ms },
-        })
-      end, provider_options({
-        client_ids = clangd_client_ids,
-        compile_command_source = ref_file,
-      }))
+        if symbol_info.entity_kind == "macro" or contains_target(symbol_info.definitions) then
+          accept_destination()
+        elseif contains_target(symbol_info.declarations) then
+          if symbol_info.entity_kind == "type-alias" or symbol_info.entity_kind == "namespace" then
+            accept_destination(nil, "declaration")
+          else
+            reject_destination("target-is-declaration")
+          end
+        else
+          -- symbolInfo does not consult the index. A definition in another TU
+          -- must be checked at that destination using the same client and USR.
+          require("utils.ue_goto.clangd_destination").verify(locs[1], usr, clangd_client_ids,
+            function(target_evidence)
+              if not request_is_current() or target_evidence.reason == "provider-cancelled" then
+                finish_stale("destination-changed")
+              elseif target_evidence.reason == "ok" then
+                accept_destination(target_evidence)
+              else
+                reject_destination(target_evidence.reason, target_evidence)
+              end
+            end, provider_options({}))
+        end
+      end
+      if symbol_info.referent_definition then
+        receive_definition(symbol_info.referent_definition)
+      else
+        provider.async_lsp_request(bufnr, "textDocument/definition", receive_definition, provider_options({
+          client_ids = clangd_client_ids,
+          compile_command_source = ref_file,
+        }))
+      end
     end, provider_options({
       compile_command_source = ref_file,
+      resolve_referent = true,
     }))
   end
 

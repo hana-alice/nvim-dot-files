@@ -12,6 +12,18 @@
 
 ## 按领域导航（权威在 CONSTRAINTS §二）
 
+### C++ entity-kind verification (K73)
+
+函数跳转成功不能代替宏/alias/namespace 验收。compiler role evidence 随实体种类不同，
+必须用真实 clangd 矩阵与文件位置审计验证；纯声明和真实歧义仍保留失败。
+→ [实体种类审计](../docs/cpp-navigation-kind-audit.md)；`../docs/CONSTRAINTS.md §二 K73`。
+
+### C++ provider and prepared artifacts (K72)
+
+零客户端不是 method unsupported；PCH recipe 不等于已编译 binary；source symbolInfo 未见跨 TU body
+也不等于目标不存在。分别验证交付调度、实际输入文件和目标 TU 的同一 USR/definitionRange。
+→ `../docs/CONSTRAINTS.md §二 K72`；`../docs/release_1.11.3.md` navigation repair。
+
 ### Windows project selection (K70)
 
 Tab 可补出真实存在的盘符相对路径；必须按 OS cwd 语义解析后保存，不能因缺斜杠就归因于用户输入。

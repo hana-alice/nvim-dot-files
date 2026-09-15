@@ -75,7 +75,9 @@ function M.async_clangd_symbol_info(bufnr, callback, opts)
       result.definitions = location.dedup_locations(result.definitions)
     elseif #usrs > 1 then result.reason = "identity-conflict"
     elseif result.reason == "empty" then result.reason = "identity-missing" end
-    if opts and opts.structured then callback(result) else callback(result.usr, result.client_ids) end
+    if opts and opts.resolve_referent then
+      require("utils.ue_goto.clangd_referent").resolve(bufnr, result, callback, request_opts)
+    elseif opts and opts.structured then callback(result) else callback(result.usr, result.client_ids) end
   end, request_opts)
 end
 

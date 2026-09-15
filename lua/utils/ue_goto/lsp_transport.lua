@@ -4,6 +4,7 @@ local location = require("utils.ue_goto.location")
 local transaction = require("utils.ue_goto.semantic_transaction")
 
 local function reason(records)
+  if #records == 0 then return "provider-unavailable" end
   local supported = false
   for _, record in ipairs(records) do
     if record.status == "timeout" then return "provider-timeout" end
@@ -16,7 +17,9 @@ end
 
 function M.request(bufnr, method, callback, opts)
   opts = opts or {}
-  local clients = vim.lsp.get_clients({ bufnr = bufnr, method = method }) or {}
+  -- Keep attached clients before testing capabilities: filtering by method here
+  -- would make an absent provider indistinguishable from an unsupported method.
+  local clients = vim.lsp.get_clients({ bufnr = bufnr }) or {}
   local allowed
   if opts.client_ids then
     allowed = {}
@@ -75,7 +78,7 @@ function M.request(bufnr, method, callback, opts)
       if pending == 0 then finish() end
     end
     if type(client.supports_method) == "function" then
-      local ok, supports = pcall(client.supports_method, client, method)
+      local ok, supports = pcall(client.supports_method, client, method, bufnr)
       if ok then record.supported = supports end
     end
     if not record.supported then
@@ -89,6 +92,10 @@ function M.request(bufnr, method, callback, opts)
         complete("error", "make-params-failed")
       else
         if method == "textDocument/references" then params.context = { includeDeclaration = true } end
+        if method == "textDocument/ast" then
+          params.range = { start = params.position, ["end"] = vim.deepcopy(params.position) }
+          params.position = nil
+        end
         local function send(prepared, prepare_reason, context)
           if done or record.status then return end
           if opts.is_current and not opts.is_current() then handle.cancel(); return end

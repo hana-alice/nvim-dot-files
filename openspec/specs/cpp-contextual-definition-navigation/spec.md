@@ -86,7 +86,7 @@ C++ `gd` SHALL 只接受当前 active build generation 下由 compiler-owned ide
 - **AND** 跳转结果 SHALL NOT 被任何文本候选覆盖
 
 #### Scenario: Source provider can prove only a declaration
-- **WHEN** source 查询的 compiler identity 只有 declaration evidence，且 provider 的 definition 响应落在该声明
+- **WHEN** source 查询的函数、变量或前置类型 compiler identity 只有 declaration evidence，且 provider 的 definition 响应落在该声明
 - **THEN** 系统 MUST NOT 把声明标为 `definition-resolved` 或 `destination_role=definition`
 - **AND** SHALL 保留声明角色与缺少 definition 的证据
 
@@ -95,11 +95,35 @@ C++ `gd` SHALL 只接受当前 active build generation 下由 compiler-owned ide
 - **THEN** provider SHALL 聚合去重所有 USR，不能选择数组第一项作为唯一身份
 - **AND** 不同身份尚未消歧时 MUST NOT 按首项继续 definition 查询
 
+#### Scenario: Compiler macro identity has no symbolInfo ranges
+- **WHEN** 同一 exact-command client 在原 snapshot 上证明唯一 macro USR，而 symbolInfo 不提供 declarationRange 或 definitionRange
+- **THEN** source navigation SHALL 按 clangd 的 macro referent 语义接受该 client 唯一的 definition destination
+- **AND** macro expansion 的 underlying type USR MUST NOT 被误当作该宏的歧义；不同 macro USR 或不同 client 的冲突仍 SHALL 拒绝
+- **AND** 内建宏无可导航源位置时 SHALL 返回 `macro-no-source-definition`，不得误报 index coverage 缺失
+
+#### Scenario: Alias and namespace destinations have declaration roles
+- **WHEN** 同一 client 的 exact-position AST 证明 `Typedef/type` 或 `Namespace/specifier`，且 definition 唯一位置与唯一 canonical USR 的 declarationRange 一致
+- **THEN** source navigation SHALL 跳转到该 alias/namespace 声明，报告 `declaration-resolved` 与 `destination_role=declaration`
+- **AND** 多 identity 时 SHALL 通过 compiler destination 与 declarationRange 的唯一关联消歧，不按名称、USR 顺序或 underlying 类型猜选
+- **AND** 普通函数声明、extern 变量、前置类、未消歧 overload 和未知 AST kind MUST NOT 复用该放行规则
+- **AND** AST 请求 SHALL 使用原 snapshot 的编码位置、有界 deadline、相同 client、exact command 与 freshness/cancellation 门禁，不拉取全文件 AST
+
+#### Scenario: Cursor is already on its proven definition
+- **WHEN** source symbolInfo 的 definitionRange 包含当前 snapshot 位置，即使 clangd definition 请求会切换到该实体的声明
+- **THEN** 系统 SHALL 保持光标与 jumplist 不变并报告 `already-at-definition`
+- **AND** MUST NOT 将 self-filter 后的空列表误报为 index-incomplete 或缺少 definition
+
 #### Scenario: Source TU uses the transported exact command
 - **WHEN** 当前 source TU 已由 controlled active CDB 提供 exact compile command 并传给 clangd
 - **THEN** `gd` SHALL 在不可变光标 snapshot 上向同一 clangd client 请求 canonical USR 与 definition
 - **AND** MUST NOT 为每次 source `gd` 在 sidecar 中重新读取或解析全量 CDB
 - **AND** 进入 header 时 SHALL 把该 exact command 记录为后续 header-in-context 的 origin TU evidence
+
+#### Scenario: Source symbolInfo cannot see a definition in another TU
+- **WHEN** source exact-cursor USR 已证明，且同一 client 返回唯一 source-TU definition，但 source AST 的 symbolInfo.definitionRange 为空
+- **THEN** 系统 SHALL 在目标 TU 的 exact compile command 下异步核验目标位置，要求同一 client、同一 USR 且 definitionRange 覆盖目标
+- **AND** 目标只为 declaration、不同 USR、目标编辑或原请求过期时 MUST NOT 跳转；MUST NOT 仅凭 definition 请求的位置当作已验证 body
+- **AND** 校验 SHALL 保持当前窗口不变，清理未使用的临时目标 buffer，保留任何用户编辑；不得按独立 header 猜 compile context
 
 #### Scenario: First gd follows a cold clangd restart
 - **WHEN** source 不属于 synthetic background CDB，clangd 已先用邻近 TU 推断命令打开该 buffer
@@ -297,6 +321,17 @@ MUST NOT 归类为 `ambiguous-context`。
 - **WHEN** semantic provider 不支持 identity 请求、超时或返回协议错误
 - **THEN** 系统 SHALL 返回 `unavailable` 及 provider/capability reason
 - **AND** MUST NOT 把它归类为当前 C++ 位置语义无效
+
+#### Scenario: No eligible clangd client is attached
+- **WHEN** 当前 buffer 没有符合 identity/provider 约束的 attached clangd client
+- **THEN** transport SHALL 返回 `provider-unavailable`，MUST NOT 把空 client 集合当作 method unsupported 的证据
+- **AND** 当前 index 为 missing/stale 时，导航终态 SHALL 说明 index readiness 与 `UEPrepare` 补救动作；index ready 时 SHALL 保留 provider absence 并指向 `LspInfo` / `UEDefExplain`
+- **AND** 原始 provider absence SHALL 保留在结构化 explain record 中
+
+#### Scenario: An attached provider explicitly lacks the requested capability
+- **WHEN** 符合 identity/provider 约束的 attached client 明确不支持请求 method
+- **THEN** transport SHALL 返回 `provider-method-unsupported` 并保留 client 与 capability 证据
+- **AND** index 缺失 SHALL NOT 将已证明的 capability failure 改写为 provider absence
 
 #### Scenario: Request becomes stale before completion
 - **WHEN** 用户移动光标、切换 buffer、再次触发 `gd`、document version 或 generation 变化后旧请求才

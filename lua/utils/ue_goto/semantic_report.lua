@@ -1,8 +1,8 @@
 -- Presentation data only: no compiler requests, editor mutation, or lineage writes.
 local M = {}
 M.OBSERVATIONS = {
-  ["cpp-semantic-navigation"] = "semantic-contracts-2026-09-09",
-  ["cpp-semantic-performance"] = "semantic-contracts-2026-09-09",
+  ["cpp-semantic-navigation"] = "compiler-referent-kinds-2026-09-15",
+  ["cpp-semantic-performance"] = "compiler-referent-kinds-2026-09-15",
 }
 local location_mod = require("utils.ue_goto.location")
 local transaction = require("utils.ue_goto.semantic_transaction")
@@ -14,6 +14,7 @@ function M.terminal_notice(sym, result)
   local label = ({
     ["already-at-definition"] = "already at definition",
     ["definition-not-found"] = "semantic definition unavailable",
+    ["macro-no-source-definition"] = "macro has no navigable source definition",
     ["definition-absent-in-complete-index"] = "complete index contains no definition",
     ["identity-conflict"] = "semantic identity conflicted",
     ["identity-missing"] = "semantic identity missing",
@@ -25,6 +26,7 @@ function M.terminal_notice(sym, result)
     ["provider-error"] = "provider request failed",
     ["provider-method-unsupported"] = "provider method unsupported",
     ["provider-timeout"] = "provider timed out",
+    ["provider-unavailable"] = "clangd is not attached to this buffer",
     ["semantic-cursor-invalid"] = "compiler could not resolve the exact cursor entity",
     ["semantic-sidecar-unavailable"] = "compiler semantic tooling unavailable",
     ["semantic-tu-unavailable"] = "translation-unit semantic context unavailable",
@@ -46,6 +48,8 @@ function M.terminal_notice(sym, result)
       "index coverage has not reached this definition yet -- wait for the running index build to finish",
     ["active-compile-command-missing"] =
       "no compile command for this file in the active database -- re-run :UEPrepare for the current platform/configuration",
+    ["provider-unavailable"] =
+      "check :LspInfo for client startup and :UEDefExplain for the captured provider evidence",
   })[reason]
 
   return string.format("C++ definition %s%s%s%s",
@@ -155,6 +159,8 @@ function M.explain_lines(tx)
     string.format("reason: %s", tostring(result.reason or "?")),
     string.format("destination_role: %s", tostring(result.destination_role or "?")),
     string.format("provider: %s", tostring(result.provider or "?")),
+    string.format("provider_method: %s", tostring(provider_result.method or "-")),
+    string.format("provider_reason: %s", tostring(provider_result.reason or "-")),
     string.format("identity_hash: %s", short_hash(result.identity)),
     string.format("provider_clients: %d", #(provider_result.client_results or {})),
     string.format("provider_locations: %d", #(provider_result.locations or {})),
@@ -198,6 +204,14 @@ function M.explain_lines(tx)
   if identity_result.declarations or identity_result.definitions then
     lines[#lines + 1] = string.format("compiler roles: declarations=%d definitions=%d",
       #(identity_result.declarations or {}), #(identity_result.definitions or {}))
+  end
+  if identity_result.entity_kind then
+    lines[#lines + 1] = "compiler referent: " .. safe_text(identity_result.entity_kind)
+  end
+  local target_identity = result.target_identity_result
+  if target_identity then
+    lines[#lines + 1] = string.format("destination proof: reason=%s identity_hash=%s definitions=%d",
+      safe_text(target_identity.reason), short_hash(target_identity.usr), #(target_identity.definitions or {}))
   end
   return lines
 end

@@ -46,6 +46,9 @@ end
 
 require("ue.index._state")(M, core)
 require("ue.index._generation")(M, core)
+-- Publication uses _generation signatures; build-owned path helpers are
+-- resolved when publication is called, after every loader has run.
+require("ue.index._publish")(M, core)
 -- After _generation: recovery consumes its manifest/generation/file_signature
 -- helpers to rebuild readiness from persisted artifacts.
 require("ue.index._recover")(M, core)
@@ -53,6 +56,7 @@ require("ue.index._recover")(M, core)
 -- M.index_status_summary defined there.
 require("ue.index._delivery")(M, core)
 require("ue.index._clangd")(M, core)
+require("ue.index._source")(M, core)
 require("ue.index._build")(M, core)
 -- After _build: admission policy gates build_phase_async starts.
 require("ue.index._admission")(M, core)

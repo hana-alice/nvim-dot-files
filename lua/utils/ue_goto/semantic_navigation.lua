@@ -227,6 +227,12 @@ function M.install(owner, deps)
 
     local function provider_failure(result)
       local reason = result and result.reason
+      if reason == "compile-command-missing" then
+        return transaction.terminal("unavailable", "context", "active-compile-command-missing", {
+          provider = "clangd",
+          provider_result = result,
+        })
+      end
       if reason == "provider-unavailable" then
         local readiness_reason = definition_miss_reason()
         local index_unavailable = readiness_reason == "index-provider-not-ready"

@@ -58,6 +58,10 @@ import shlex
 import sys
 from collections import defaultdict
 
+# Also importable when the CLI is started with Python's isolated (-I) mode.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cdb_unity_receipt import load_verified_groups
+
 
 # ---- path helpers ----------------------------------------------------------
 
@@ -167,6 +171,69 @@ def compile_context_key(entry):
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]
 
 
+def secondary_unity_chunks(entries, max_sources=80, max_unities=8):
+    """Plan same-context SuperUnity chunks without modifying original commands.
+
+    The source budget counts every member, including generated sources. Original
+    UBT groups remain indivisible, and unrelated/exact entries remain available
+    to the caller. These are candidates; the native admission step still decides
+    whether a chunk can replace its originals.
+    """
+    if max_sources < 1 or max_unities < 1:
+        raise ValueError('SuperUnity chunk budgets must be positive')
+    buckets = defaultdict(list)
+    for index, entry in enumerate(entries):
+        members = entry.get('nvim_ue_members')
+        module = entry.get('nvim_ue_module_root')
+        name = entry.get('file', '').replace('\\', '/').rsplit('/', 1)[-1]
+        if name.startswith('SuperUnity.UBT.') and members and module:
+            buckets[(module, compile_context_key(entry))].append(index)
+
+    chunks = []
+    for indexes in buckets.values():
+        chunk, count = [], 0
+        for index in indexes:
+            size = len(entries[index]['nvim_ue_members'])
+            if chunk and (count + size > max_sources or len(chunk) >= max_unities):
+                if len(chunk) > 1:
+                    chunks.append(chunk)
+                chunk, count = [], 0
+            if size > max_sources:
+                # An oversized original is retained, not split or omitted.
+                continue
+            chunk.append(index)
+            count += size
+        if len(chunk) > 1:
+            chunks.append(chunk)
+    return sorted(chunks, key=lambda chunk: chunk[0])
+
+
+def compiler_authored_module_roots(cdb, groups):
+    """Keep generated and ordinary sources under their actual UBT module.
+
+    An Inc/Module path is a build output, not a separate module. Only groups
+    from the same compiler-owned module directory and exact context may share
+    a source root; ambiguous or generated-only owners keep their existing root.
+    """
+    owners, source_roots = {}, defaultdict(set)
+    for unity, members, _kind, _args in groups:
+        key = (os.path.normcase(os.path.normpath(os.path.dirname(unity))),
+               compile_context_key(cdb[members[0]]))
+        owners[unity] = key
+        for member in members:
+            path = cdb[member]['file']
+            parts = _portable_parts(path)
+            if ('intermediate' not in [part.casefold() for part in parts]
+                    and any(part in _MODULE_MARKER_DIRS for part in parts)):
+                source_roots[key].add(portable_module_root(path))
+    roots = {}
+    for unity, members, _kind, _args in groups:
+        candidates = source_roots[owners[unity]]
+        roots[unity] = (next(iter(candidates)) if len(candidates) == 1
+                        else portable_module_root(cdb[members[0]]['file']))
+    return roots
+
+
 # ---- compiler-authored unity discovery ------------------------------------
 
 UNITY_ROOT_RE = re.compile(
@@ -222,11 +289,13 @@ def split_response_file(text):
     split = ctypes.windll.shell32.CommandLineToArgvW
     split.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
     split.restype = ctypes.POINTER(ctypes.c_wchar_p)
-    argv = split(text, ctypes.byref(argc))
+    # RSPs contain arguments, not argv[0]. A dummy driver avoids Windows'
+    # special first-token parsing (including its leading-whitespace empty arg).
+    argv = split('clang ' + text.replace('\r', ' ').replace('\n', ' '), ctypes.byref(argc))
     if not argv:
         raise OSError('CommandLineToArgvW failed')
     try:
-        return [argv[index] for index in range(argc.value)]
+        return [argv[index] for index in range(1, argc.value)]
     finally:
         ctypes.windll.kernel32.LocalFree(ctypes.cast(argv, ctypes.c_void_p))
 
@@ -261,15 +330,20 @@ def looks_like_apple_platform(args):
 
 
 def unity_response_args(unity_path, template):
-    """Return compiler-authored response args compatible with active CDB."""
+    """Return compatible response args and whether responses are proven absent."""
     template_args = template.get('arguments', [])
     template_target = option_value(template_args, '--target')
     template_std = next((arg for arg in template_args if arg.startswith('-std=')), None)
     unity_normalized = os.path.normcase(unity_path.replace('\\', '/'))
-    candidates = sorted(
-        glob.glob(unity_path + '*.o.rsp'),
-        key=lambda path: (-os.path.getmtime(path), path.casefold()),
-    )
+    try:
+        unity_name = os.path.normcase(os.path.basename(unity_path))
+        with os.scandir(os.path.dirname(unity_path)) as entries:
+            candidates = [entry.path for entry in entries
+                          if os.path.normcase(entry.name).startswith(unity_name)
+                          and os.path.normcase(entry.name).endswith('.o.rsp')]
+        candidates.sort(key=lambda path: (-os.path.getmtime(path), path.casefold()))
+    except OSError:
+        return None, False
     for rsp_path in candidates:
         try:
             with open(rsp_path, encoding='utf-8', errors='replace') as stream:
@@ -297,20 +371,21 @@ def unity_response_args(unity_path, template):
         # order, including defines, includes and PCH inputs.
         if compile_context_key(response_entry) != compile_context_key(template):
             continue
-        return rsp_args
-    return None
+        return rsp_args, False
+    return None, not candidates
 
 
-def compiler_authored_unity_groups(cdb, root):
+def compiler_authored_unity_groups(cdb, root, receipts=None):
     """Map active UBT unity manifests to exact CDB entries.
 
     A group is accepted only when every include maps uniquely into the active
     CDB and every member has the same exact compile-context fingerprint.
     Anything not proven this way remains an original per-file entry.
     """
-    if not root:
+    receipts = receipts or {}
+    if not root and not receipts:
         return []
-    root_local = winpath_local(root)
+    root_local = winpath_local(root) if root else ''
     lookup = source_suffix_lookup(cdb)
     groups = []
     claimed = set()
@@ -318,9 +393,10 @@ def compiler_authored_unity_groups(cdb, root):
         os.path.join(root_local, '*', 'Module.*.cpp'),
         os.path.join(root_local, '*', '*', 'Module.*.cpp'),
     )
-    unity_files = []
-    for pattern in patterns:
-        unity_files.extend(glob.glob(pattern))
+    unity_files = [group['unity'] for group in receipts.values()]
+    if root:
+        for pattern in patterns:
+            unity_files.extend(glob.glob(pattern))
     for unity_path in sorted(set(unity_files), key=str.casefold):
         try:
             with open(unity_path, encoding='utf-8', errors='replace') as stream:
@@ -344,12 +420,23 @@ def compiler_authored_unity_groups(cdb, root):
         if len(contexts) != 1:
             continue
         template = cdb[members[0]]
-        rsp_args = unity_response_args(unity_path, template)
+        receipt = receipts.get(os.path.normcase(os.path.normpath(unity_path)))
+        if receipt and [os.path.normcase(os.path.normpath(cdb[i]['file'])) for i in members] == [
+            os.path.normcase(os.path.normpath(path)) for path in receipt['members']
+        ]:
+            # The actual prepare pipeline attested the complete transformation
+            # from this compiler RSP to these exact active commands. Both ends
+            # and every input are revalidated; no flags are ignored here.
+            groups.append((unity_path, members, 'exact', list(template['arguments'])))
+            claimed.update(members)
+            continue
+        rsp_args, no_rsp = unity_response_args(unity_path, template)
         if rsp_args:
             groups.append((unity_path, members, 'rsp', rsp_args))
             claimed.update(members)
             continue
-        if not looks_like_apple_platform(template.get('arguments', [])):
+        # A present but unusable response cannot prove Apple's no-RSP case.
+        if not no_rsp or not looks_like_apple_platform(template.get('arguments', [])):
             continue
         exact_args = rewritten_arguments(template, unity_path)
         if not exact_args:
@@ -395,6 +482,82 @@ def rewritten_response_arguments(template, unity_path, rsp_args, new_source):
 
 # ---- main ------------------------------------------------------------------
 
+def write_if_changed(path, content):
+    """Keep existing output timestamps; publish changed bytes atomically."""
+    data = content.encode('utf-8')
+    try:
+        with open(path, 'rb') as stream:
+            if stream.read() == data:
+                return False
+    except FileNotFoundError:
+        pass
+    temporary = f'{path}.{os.getpid()}.tmp'
+    try:
+        with open(temporary, 'wb') as stream:
+            stream.write(data)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+    return True
+
+
+def write_outputs_if_changed(outputs):
+    """Stage a CDB/marker pair before publishing; restore it on local I/O errors.
+
+    This is not crash-atomic across files. Persisted manifest hashes still
+    reject an interrupted process before a mixed pair can become authoritative.
+    """
+    import shutil
+
+    prepared = []
+    seen = set()
+    try:
+        for path, content in outputs:
+            key = os.path.normcase(os.path.abspath(path))
+            if key in seen:
+                raise ValueError('duplicate transaction output')
+            seen.add(key)
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            existed = os.path.exists(path)
+            if existed:
+                with open(path, 'rb') as stream:
+                    if stream.read() == content.encode('utf-8'):
+                        continue
+            item = {'path': path, 'pending': f'{path}.{os.getpid()}.pending',
+                    'backup': f'{path}.{os.getpid()}.rollback',
+                    'existed': existed, 'replaced': False}
+            prepared.append(item)
+            write_if_changed(item['pending'], content)
+            if existed:
+                shutil.copy2(path, item['backup'])
+        for item in prepared:
+            os.replace(item['pending'], item['path'])
+            item['replaced'] = True
+    except OSError:
+        for item in reversed(prepared):
+            if item['replaced']:
+                if item['existed']:
+                    os.replace(item['backup'], item['path'])
+                else:
+                    os.remove(item['path'])
+        raise
+    finally:
+        for item in prepared:
+            for key in ('pending', 'backup'):
+                # Leave recovery evidence if restoring an already-published
+                # output itself failed; do not delete its last saved baseline.
+                if key == 'backup' and item['replaced'] and os.path.exists(item[key]):
+                    continue
+                if os.path.exists(item[key]):
+                    os.remove(item[key])
+    # Successful commits no longer need the previous generation's backup.
+    for item in prepared:
+        if os.path.exists(item['backup']):
+            os.remove(item['backup'])
+    return bool(prepared)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('src', help='per-file CDB (hot.json)')
@@ -403,6 +566,7 @@ def main():
                     help='max member .cpps per wrapper TU (default 80)')
     ap.add_argument('--super-dir', default=None,
                     help='where to write SuperUnity.*.cpp (default: <out_dir>/super_unity_cpps)')
+    ap.add_argument('--unity-receipt', help='verified prepare pipeline provenance sidecar')
     args = ap.parse_args()
 
     src_local = winpath_local(args.src)
@@ -426,16 +590,13 @@ def main():
     super_dir = args.super_dir or os.path.join(out_dir, 'super_unity_cpps')
     super_dir_local = winpath_local(super_dir)
     os.makedirs(super_dir_local, exist_ok=True)
-    # Clear previous super .cpps so stale files don't confuse the indexer
-    for fn in os.listdir(super_dir_local):
-        if fn.endswith('.cpp'):
-            try:
-                os.remove(os.path.join(super_dir_local, fn))
-            except OSError:
-                pass
+    # Existing wrappers may still be consumed by a published CDB. Their
+    # content-addressed names let generations coexist until cache cleanup.
 
     active_root, root_evidence = discover_active_unity_root(cdb)
-    groups = compiler_authored_unity_groups(cdb, active_root)
+    receipts = load_verified_groups(args.unity_receipt, cdb) if args.unity_receipt else {}
+    groups = compiler_authored_unity_groups(cdb, active_root, receipts)
+    module_roots = compiler_authored_module_roots(cdb, groups)
     claimed = {member for _unity, members, _kind, _args in groups for member in members}
     new_cdb = []
 
@@ -456,10 +617,9 @@ def main():
             wrapper = wrapper.replace('/', '\\')
         else:
             wrapper = wrapper.replace('\\', '/')
-        with open(wrapper_local, 'w', encoding='utf-8', newline='\n') as stream:
-            stream.write('// Compiler-authored UBT unity membership; copied into nvim cache.\n')
-            for member_path in member_paths:
-                stream.write(f'#include "{member_path}"\n')
+        write_if_changed(wrapper_local,
+            '// Compiler-authored UBT unity membership; copied into nvim cache.\n'
+            + ''.join(f'#include "{member_path}"\n' for member_path in member_paths))
         if group_kind == 'rsp':
             command = rewritten_response_arguments(template, unity_path, group_args, wrapper)
         else:
@@ -472,7 +632,7 @@ def main():
             'arguments': command,
             'file': wrapper,
             'nvim_ue_members': [portable_member_path(member_path) for member_path in member_paths],
-            'nvim_ue_module_root': portable_module_root(member_paths[0]),
+            'nvim_ue_module_root': module_roots[unity_path],
         })
 
     # A source without current-build UBT unity evidence stays an exact original
@@ -503,9 +663,8 @@ def main():
     print(f'[hot-super] background TUs: {len(new_cdb)} '
           f'(compression {len(cdb)/max(len(new_cdb),1):.1f}x)', file=sys.stderr)
 
-    with open(out_local, 'w', encoding='utf-8') as f:
-        json.dump(new_cdb, f)
-    print(f'[hot-super] wrote: {out_local}', file=sys.stderr)
+    changed = write_if_changed(out_local, json.dumps(new_cdb))
+    print(f'[hot-super] {"wrote" if changed else "unchanged"}: {out_local}', file=sys.stderr)
     return 0
 
 

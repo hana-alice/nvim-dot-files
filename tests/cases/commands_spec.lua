@@ -5,9 +5,9 @@
 local t = require("tests.harness")
 local cfg = t.bootstrap()
 
--- 85 个 UE* 命令冻结清单（来自 lua/ue.lua + lua/ue/*.lua）。
+-- 87 个 UE* 命令冻结清单（来自 lua/ue.lua + lua/ue/*.lua）。
 local UE_COMMANDS = {
-  "UEBuild", "UEBuildAndroid", "UEBuildAndroidSO", "UEBuildCsearch", "UEBuildIOS", "UEBuildPCH", "UECachePaths", "UECDBPartition",
+  "UEBuild", "UEBuildDistributed", "UEBuildDistributedPlan", "UEBuildAndroid", "UEBuildAndroidSO", "UEBuildCsearch", "UEBuildIOS", "UEBuildPCH", "UECachePaths", "UECDBPartition",
   "UECDBStatus", "UECDBSwitch", "UECheatsheet", "UECheatsheetEdit", "UEClearCache",
   "UECompileForNvim",
   "UEDAPAttach", "UEDAPClearBreakpoints", "UEDAPCondBreakpoint", "UEDAPContinue",
@@ -28,8 +28,8 @@ local UE_COMMANDS = {
 
 t.describe("commands: UE* 全量注册", function()
   require("ue").setup()
-  t.it("冻结清单含 85 个命令", function()
-    t.assert_eq(#UE_COMMANDS, 85)
+  t.it("冻结清单含 87 个命令", function()
+    t.assert_eq(#UE_COMMANDS, 87)
   end)
   for _, c in ipairs(UE_COMMANDS) do
     t.it(":" .. c .. " 已注册", function()

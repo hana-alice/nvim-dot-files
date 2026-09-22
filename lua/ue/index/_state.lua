@@ -204,9 +204,16 @@ local function unity_locate_module_root(engine_root, project_root, name)
   return hit
 end
 
-local function unity_scope_for_path(ctx, path)
+local function unity_scope_for_path(ctx, path, selected_unity_names)
   local name = unity_tu_module_name(path)
   if not name then
+    return nil
+  end
+  -- Every literal-name lookup returns a root ending in that name. A subset
+  -- without that basename cannot select it. Keep unusual/glob names on the
+  -- original path, and never use this hint to choose between same-name roots.
+  if selected_unity_names and name:match("^[A-Za-z_][A-Za-z0-9_]*$")
+    and not selected_unity_names[name:lower()] then
     return nil
   end
   local root = unity_locate_module_root(ctx.engine_root, ctx.project_root, name)
@@ -226,7 +233,7 @@ local function unity_scope_for_path(ctx, path)
   }
 end
 
-local function module_scope_for_path(ctx, path)
+local function module_scope_for_path(ctx, path, selected_unity_names)
   if not ctx then
     return nil
   end
@@ -238,7 +245,7 @@ local function module_scope_for_path(ctx, path)
     or core.deps.project_module_scope(ctx.project_root, path)
     or core.deps.plugin_scope_from_root(fs.join(ctx.engine_root, "Engine"), path)
     or core.deps.engine_module_scope(ctx.engine_root, path)
-    or unity_scope_for_path(ctx, path)
+    or unity_scope_for_path(ctx, path, selected_unity_names)
 end
 
 local function module_key(scope)
@@ -410,8 +417,8 @@ local function module_record_from_path(ctx, path)
   return rec, state
 end
 
-local function module_key_from_path(ctx, path)
-  local scope = module_scope_for_path(ctx, path)
+local function module_key_from_path(ctx, path, selected_unity_names)
+  local scope = module_scope_for_path(ctx, path, selected_unity_names)
   return module_key(scope), scope
 end
 

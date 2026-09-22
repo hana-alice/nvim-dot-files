@@ -6,7 +6,9 @@ return function(M, core)
   M.maybe_restart_clangd_for_index = function(dependencies)
     dependencies = dependencies or {}
     local now = (dependencies.now or unix_now)()
-    if (now - RT.last_restart_at) < RT.restart_debounce_s then return end
+    if dependencies.invalidated_frozen_batch ~= true and (now - RT.last_restart_at) < RT.restart_debounce_s then
+      return false, math.max(1, math.ceil((RT.restart_debounce_s - (now - RT.last_restart_at)) * 1000))
+    end
     RT.last_restart_at = now
 
     local get_clients = dependencies.get_clients or vim.lsp.get_clients
@@ -49,5 +51,60 @@ return function(M, core)
         end
       end
     end, 500)
+    return true
+  end
+
+  -- A new attached client proves that the old in-memory BackgroundIndex was
+  -- retired. Its normal startup revalidates persisted dependency digests.
+  M.restart_source_clangd = function(ctx, callback, dependencies)
+    dependencies = dependencies or {}
+    local fs = require("ue.core.fs")
+    local path_key = require("utils.platform").driver().path_key
+    local function key(path) return path_key(fs.norm(path)):gsub("/+$", "") end
+    local directory = key(vim.fs.dirname(ctx.paths.semantic_cdb))
+    local function owns(client)
+      local config = client and client.config or {}
+      local cmd = config._ue_resolved_cmd or config.cmd
+      if type(cmd) ~= "table" then return false end
+      for index = #cmd, 1, -1 do
+        local arg = cmd[index]
+        local value = type(arg) == "string" and arg:match("^%-%-?compile%-commands%-dir=(.+)$")
+        if arg == "--compile-commands-dir" or arg == "-compile-commands-dir" then value = cmd[index + 1] end
+        if value then return key(value) == directory end
+      end
+      return false
+    end
+    local clients, old = {}, {}
+    for _, client in ipairs((dependencies.get_clients or vim.lsp.get_clients)({ name = "clangd" })) do
+      if owns(client) then clients[#clients + 1] = client; old[client.id] = true end
+    end
+    local create = dependencies.create_autocmd or vim.api.nvim_create_autocmd
+    local delete = dependencies.delete_autocmd or vim.api.nvim_del_autocmd
+    local get_client = dependencies.get_client_by_id or vim.lsp.get_client_by_id
+    local done, autocmd = false, nil
+    local function finish(ok)
+      if done then return end
+      done = true
+      if autocmd then pcall(delete, autocmd) end
+      callback(ok)
+    end
+    autocmd = create("LspAttach", { callback = function(event)
+      local id = event.data and event.data.client_id
+      if id and not old[id] and owns(get_client(id)) then finish(true) end
+    end })
+    -- No current reader: keep the request until the next natural attachment,
+    -- rather than spawning an indexer or repeatedly rebuilding an unused CDB.
+    if #clients == 0 then return true end
+    local options = vim.tbl_extend("force", dependencies, {
+      get_clients = function() return clients end, list_bufs = function() return {} end,
+    })
+    local ok, started, delay = pcall(M.maybe_restart_clangd_for_index, options)
+    if not ok or not started then
+      done = true
+      pcall(delete, autocmd)
+      return false, delay or 5000
+    end
+    (dependencies.defer_fn or vim.defer_fn)(function() finish(false) end, 15000)
+    return true
   end
 end

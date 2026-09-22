@@ -35,6 +35,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -43,6 +44,7 @@ if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
 from cdb_argv import normalize_cdb
+from build_hot_super_unity_cdb import write_outputs_if_changed
 
 
 def find_clangd_indexer():
@@ -83,6 +85,45 @@ def detect_project_root(cdb_path):
     return cdb_dir
 
 
+def generate_subset(request_path, nvim, output):
+    """Run the original Lua selector outside the UI before opening its output."""
+    request = json.loads(Path(request_path).read_text(encoding="utf-8"))
+    active = Path(request["ctx"]["paths"]["active_cdb"])
+    destination = Path(output)
+    if active.resolve() == destination.resolve():
+        raise ValueError("active CDB must not be the subset output")
+    def snapshot():
+        stat = active.stat()
+        return stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+    before = snapshot()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(prefix=destination.name + ".subset.", suffix=".tmp",
+                                     dir=destination.parent, delete=False) as staging:
+        temporary = staging.name
+    process = None
+    try:
+        command = [nvim, "--headless", "-u", "NONE", "-i", "NONE", "-n", "-l",
+                   str(Path(TOOLS_DIR) / "build_index_subset.lua"), str(Path(request_path).resolve()),
+                   str(destination), str(os.getpid()), temporary]
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, encoding="utf-8",
+            creationflags=(subprocess.CREATE_NO_WINDOW | subprocess.IDLE_PRIORITY_CLASS) if os.name == "nt" else 0)
+        stdout, stderr = process.communicate(timeout=120)
+        if process.returncode != 0:
+            raise ValueError(f"subset helper exited {process.returncode}: {stderr.strip()}")
+        result = json.loads(stdout)
+        if not isinstance(result, dict) or result.get("ok") is not True or Path(result.get("output", "")).resolve() != destination.resolve():
+            raise ValueError("subset helper returned an unexpected output")
+        if snapshot() != before:
+            raise ValueError("active CDB changed during subset generation")
+        print(f"Subset generated: {result['phase']} ({len(result['selected_keys'])} selected modules)")
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        Path(temporary).unlink(missing_ok=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build clangd offline index")
     parser.add_argument("compile_commands", help="Path to compile_commands.json")
@@ -103,9 +144,39 @@ def main():
                         help="Disable compiler-authored unity wrapping and keep "
                              "the subset in exact per-file form. Only use for "
                              "debugging controlled BackgroundIndex behavior.")
+    parser.add_argument("--unity-receipt", help="verified prepare pipeline provenance sidecar")
+    parser.add_argument("--super-dir", default=None,
+                        help="shared directory for stable compiler-authored unity wrappers")
+    parser.add_argument("--verified-batches", action="store_true",
+                        help="prove secondary same-context batches with private clangd indexes")
+    parser.add_argument("--reuse-verified-only", action="store_true",
+                        help="reuse valid receipts without starting cold compiler proofs")
+    parser.add_argument("--clangd", default=None, help="existing clangd used for batch proof")
+    parser.add_argument("--server-profile", type=json.loads, default=None,
+                        help="explicit supported clangd query profile JSON; never inferred from a receipt")
+    parser.add_argument("--batch-size", type=int, default=8,
+                        help="maximum original UBT groups in one verified batch")
+    parser.add_argument("--subset-request", help="small ordered current/hot subset request JSON")
+    parser.add_argument("--nvim", help="absolute Neovim executable for the isolated subset worker")
     args = parser.parse_args()
+    if args.verified_batches and (not args.background_output or not args.clangd):
+        parser.error("--verified-batches requires --background-output and --clangd")
+    if args.reuse_verified_only and not args.verified_batches:
+        parser.error("--reuse-verified-only requires --verified-batches")
+    if args.server_profile is not None and (not args.verified_batches or not isinstance(args.server_profile, dict)):
+        parser.error("--server-profile requires --verified-batches and a JSON object")
+    if bool(args.subset_request) != bool(args.nvim):
+        parser.error("--subset-request and --nvim are required together")
+    if args.subset_request and (not args.background_output or not Path(args.nvim).is_absolute()):
+        parser.error("--subset-request requires --background-output and an absolute --nvim")
 
     cdb_path = os.path.abspath(args.compile_commands)
+    if args.subset_request:
+        try:
+            generate_subset(args.subset_request, args.nvim, cdb_path)
+        except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired, KeyboardInterrupt) as error:
+            print(f"ERROR: cannot generate subset CDB: {error}", file=sys.stderr)
+            return 1
     if not os.path.isfile(cdb_path):
         print(f"ERROR: {cdb_path} not found", file=sys.stderr)
         return 1
@@ -231,7 +302,8 @@ def main():
             rc = subprocess.call([
                 sys.executable, "-I", super_script,
                 staged_cdb, super_cdb,
-                "--super-dir", os.path.join(stage_dir, "super_unity_cpps"),
+                "--super-dir", args.super_dir or os.path.join(stage_dir, "super_unity_cpps"),
+                *(["--unity-receipt", args.unity_receipt] if args.unity_receipt else []),
             ])
             if rc == 0 and os.path.isfile(super_cdb):
                 # Swap the staged CDB for the controlled BackgroundIndex one.
@@ -272,27 +344,46 @@ def main():
         ):
             print("ERROR: refusing malformed controlled background CDB", file=sys.stderr)
             return 1
-        background_tmp = background_path + f".tmp.{os.getpid()}"
-        with open(background_tmp, "w", encoding="utf-8", newline="\n") as target:
-            json.dump(background_cdb, target, ensure_ascii=False, separators=(",", ":"))
-        os.replace(background_tmp, background_path)
-
+        semantic_cdb = background_cdb
+        from cdb_unity_receipt import entry_hash, load_verified_synthetic_shaders
+        shader_donors = load_verified_synthetic_shaders(args.unity_receipt, cdb)
+        for entry in semantic_cdb:
+            if entry_hash(entry) in shader_donors:
+                entry['nvim_ue_background_route'] = 'shader-compatibility'
+        batch_metrics = None
+        if args.verified_batches:
+            from cdb_verified_batch import accelerate
+            stable_super_dir = args.super_dir or os.path.join(stage_dir, "super_unity_cpps")
+            background_cdb, batch_metrics = accelerate(
+                semantic_cdb, os.path.join(os.path.dirname(stable_super_dir), "verified_batches"),
+                args.clangd, max_group=args.batch_size, verify_missing=not args.reuse_verified_only,
+                server_profile=args.server_profile)
         marker = {
             "schema": 1,
             "index_kind": "controlled-background",
             "cdb_name": os.path.basename(background_path),
             "entry_count": len(background_cdb),
+            "shader_compatibility_count": sum(entry.get("nvim_ue_background_route") == "shader-compatibility"
+                                              for entry in background_cdb),
+            "native_background_entry_count": sum(entry.get("nvim_ue_background_route") != "shader-compatibility"
+                                                  for entry in background_cdb),
             "unity_entry_count": sum(
                 "super_unity_cpps" in str(entry.get("file", "")).replace("\\", "/")
-                for entry in background_cdb
+                for entry in semantic_cdb
             ),
         }
-        marker_tmp = idx_path + f".tmp.{os.getpid()}"
-        with open(marker_tmp, "w", encoding="utf-8", newline="\n") as target:
-            json.dump(marker, target, ensure_ascii=False, separators=(",", ":"))
-        os.replace(marker_tmp, idx_path)
+        if batch_metrics is not None:
+            marker["verified_batches"] = {key: batch_metrics[key] for key in (
+                "original_ubt_count", "batch_count", "accepted_ubt_count", "retained_ubt_count",
+                "exact_count", "shader_count", "other_count", "output_entries") if key in batch_metrics}
+        write_outputs_if_changed([
+            (background_path, json.dumps(background_cdb, ensure_ascii=False, separators=(",", ":"))),
+            (background_path + ".semantic.json", json.dumps(semantic_cdb, ensure_ascii=False, separators=(",", ":"))),
+            (idx_path, json.dumps(marker, ensure_ascii=False, separators=(",", ":"))),
+        ])
         print(f"\nControlled BackgroundIndex CDB: {background_path}")
-        print(f"  Controlled entries: {len(background_cdb)}")
+        print(f"  Native background tasks: {marker['native_background_entry_count']}; "
+              f"shader compatibility: {marker['shader_compatibility_count']}; covered records: {len(background_cdb)}")
         return 0
 
     cmd = [indexer, "--executor=all-TUs"]

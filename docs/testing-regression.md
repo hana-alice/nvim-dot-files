@@ -28,7 +28,11 @@ fail-closed 语义），禁止注入假可执行文件/假宿主让断言「碰�
 | `lua/ue/project_state.lua` / `lua/ue/file_lock.lua` / 共享持久状态 | `multi_instance_state` |
 | `lua/ue/cdb/**` | `ue_cdb` |
 | `lua/ue/dap/**` / `lua/utils/platform/**` | `dap` `platform` `dap_failure_layer` `ue_platform_boundary` |
-| `lua/ue/index/**` / `lua/ue/clangd_commands.lua` / controlled CDB generators | `index_generation` `cpp_semantic_index` `clangd_commands` `ue_api` `ue_platform_boundary` |
+| `lua/ue/index/**` / `lua/ue/clangd_commands.lua` / controlled CDB generators | `index_generation` `index_subset_async` `cpp_semantic_index` `clangd_commands` `ue_api` `ue_platform_boundary` |
+| 二次批次 / RIFF 图 / 冻结输入验证与运行时保护 | `index_graph` `index_batch` `index_verified_batch` `index_inventory` `index_query_profile` `index_vfs_aliases` `index_generation` `cpp_semantic_client` `host_resource_discipline` |
+| 离线 generated-only 二次候选 | `index_generated_super_unity` `structure` |
+| Shader donor 来源 / C++ 后台路由 | `ue_cdb` `ue_unity_origin` `index_unity_receipt` `index_shader_routing` `index_generation` |
+| 源码内容变化 / 相同 CDB 的后台刷新 | `index_source_refresh` `index_delivery` `ue_watch_csearch` `stability` |
 | `lua/ue/targets/**` / `lua/ue/workflows/**` / `lua/ue/target_tasks.lua` | `ue_target_drivers` `ue_target_integration` `ue_target_tasks` `ue_workflows` `ue_platform_boundary` `platform` `commands` `stability` |
 | `lua/utils/ue_goto/**` / C++ `gd` / semantic sidecar | `cpp_semantic_context` `cpp_semantic_client` `cpp_semantic_sidecar` `ue_goto_behavior` `utils` `ue_platform_boundary` |
 | `lua/utils/code_search/**` / `lua/ue/csearch_build.lua` / `ue_paths.lua` | `csearch_build_guard` `ue_goto_behavior` `ue_paths` `utils` `ue_platform_boundary` |

@@ -123,7 +123,24 @@ target platform/configuration SHALL 作为一个原子 pair 写入，MUST NOT �
 
 - **WHEN** 多个 Neovim 进程同时写同一 project 的不同 state fields 或 definition keys
 - **THEN** 所有不同字段/key SHALL 保留
-- **AND** 读取方 MUST NOT 观察到截断或非法 JSON
+
+#### Scenario: Independent field writers invalidate cached contexts without a shared nonce
+- **WHEN** different processes publish independent fields in the same project bucket
+- **THEN** each successful update SHALL depend on its own atomic publication, without a second shared revision-file write
+- **AND** context invalidation SHALL derive a stable signature from the exact authoritative bytes used to read state, including field additions, removals and the target pair
+- **AND** equal size or mtime MUST NOT hide changed bytes; unchanged input SHALL produce the same signature
+- **AND** legacy revision paths MAY remain for compatibility but MUST NOT remain the cache invalidation authority
+
+#### Scenario: Another writer publishes while context state is sampled
+- **WHEN** a field changes after its old bytes were read and before the context is cached
+- **THEN** the cached revision SHALL describe those same sampled old bytes, so the next lookup detects the later update
+- **AND** the state and revision MUST NOT be sampled independently and paired as though they were one observation
+- **AND** this per-field sampling does not imply an atomic transaction across independent fields
+
+#### Scenario: Authoritative field replacement fails
+- **WHEN** atomic replacement returns a permission or other filesystem error
+- **THEN** the update SHALL report failure and preserve the previous published field
+- **AND** it SHALL clean its temporary file without truncating the destination, busy retrying or reporting success
 
 #### Scenario: 并发写共享集合
 

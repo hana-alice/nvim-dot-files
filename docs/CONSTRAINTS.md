@@ -300,7 +300,10 @@
   根因: libuv Windows backend 的 `ReadDirectoryChangesW` 同时订阅 `LAST_ACCESS`、
   `ATTRIBUTES`、`SECURITY`、`LAST_WRITE`，却统一映射成 `UV_CHANGE`；原 watcher 对所有
   `change` 只做“文件存在”判断，元数据扫描也被当作内容变化。
-  解决约束: rename/create/delete 始终保守记录；已有文件的纯 `change` 只有 LAST_WRITE
+  解决约束: Windows 优先经 host driver 使用 `ReadDirectoryChangesW` 原生 watcher，订阅只含
+  文件名/目录名/size/LAST_WRITE；原生写事件绕过 csearch 时间戳过滤，避免真实写入保留旧 mtime
+  时被吞掉。原生能力不可用时才回退 libuv，并显式暴露 `unknown_coverage`、原因且通知 source
+  owner。libuv 路径上 rename/create/delete 始终保守记录；已有文件的纯 `change` 只有 LAST_WRITE
   晚于当前 `csearch.idx` 才进入 `persistent_dirty`。无可用索引或无 mtime 证据时保持记录，
   不得为降噪漏掉首次构建前/新建文件。
   → `lua/utils/ue_watch.lua`; `openspec/specs/ue-code-search/spec.md`
@@ -861,7 +864,9 @@
   经 LSP 一定返回 body，不能把 binary index 当跨 TU definition authority。
   解决: clangd 固定 `--enable-config=false`，不再写 `.clangd`、不传 `--index-file`；current/hot/full
   发布带 generation/coverage manifest 的 controlled BackgroundIndex CDB，只接受
-  compiler-authored UBT unity membership 或 exact per-file fallback，并通过官方
+  compiler-authored UBT unity membership 或 exact per-file fallback；二次批次另按
+  `cpp-semantic-index-coverage` 的独立原 TU 图、receipt 与失效保护证明，原语义 CDB 保留独立。
+  并通过官方
   `compilationDatabaseChanges` 注入打开文件 exact command。phase artifact 可携带 portable
   unity provenance，但发布给 clangd 的 JSON CDB 必须剥离非标准字段；generation hash 的 map
   key 必须 canonical 排序，不能受 Lua 进程 hash randomization 影响。source 不在 synthetic CDB 时，
@@ -869,6 +874,10 @@
   clangd 的 prepare gate 必须消费持久化 tuple artifact readiness：selection/manifest/controlled CDB 与
   源 CDB 签名仍匹配时，Nvim 重启后直接复用；不得把“当前 Lua 进程执行过 UEPrepare”当作资格。
   同进程内工件发生变化也必须重新验证，缺失/stale 才 defer。
+  prepare 不得自动追加 `-D__INTELLISENSE__`：真实 ControlRig TU 因 `UCLASS` 不展开 PROLOG
+  出现17个缺失 event-parameter 类型错误，单变量去掉自动宏后归零。RSP 显式定义仍须保留。
+  raw → pipeline → partition 必须暂存后在同一 writer lease 内发布；仅比较最终摘要后禁止重启
+  仍不足以阻止中途写入触发监听。相同 origin/receipt/shard/partition metadata 也必须保持稳定。
   exact argv 证明 `.cpp/.h` 实际为 Objective-C++ 时，必须保留 C++ Tree-sitter 并叠加内置 `objcpp`
   syntax；禁止把 mixed source 整体交给仅继承 C 的 `objc` Tree-sitter grammar，普通平台不得受影响。
   definition 的最终权威是
@@ -894,7 +903,7 @@
   git log（`b9cce1d` merge `feat/lldb-dap-migration`、
   `7c70462`、release_1.0.3）
 
-### snacks / clangd / lazy（活跃 workaround，共 8 个文件）
+### snacks / clangd / lazy（活跃 workaround，共 9 个文件）
 
 - **K16 — snacks picker 冷启动首开卡死**
   症状: Neovide 冷启后第一次开 picker 卡约 1s。
@@ -916,6 +925,39 @@
   症状: 在 C++ 文件上开 diffview/Neogit/fugitive/gitsigns blame 后，右下角反复刷
   `clangd: -32602: ... clangd only supports file:// URIs`；Neovide 上每次 notify 强制重绘更糟。
   → `lua/workarounds/clangd/non_file_uri_detach.lua`（已在 `init.lua` eager apply）
+
+- **clangd 22.1.5 friend-template 索引身份随缓存变化**
+  同一双 TU 数据库中，仅修改源文件注释即可让 `InternalConstructor` 引用从主模板变为
+  具体实例，实际主模板 references 查询漏项。已验证的修正是早于所有原 forced inputs 的
+  等价 namespace 声明；只在 Unity 正文添加声明不能修复热重索引。严格限制已测工具版本、
+  引擎头字节身份与文本输入；未知情形不得猜测应用，也不得将它当作二次合并准入证明。
+  → `lua/workarounds/clangd/friend_template_canonical.lua`；
+    `openspec/specs/macos-ios-cdb-semantic-prepare/spec.md` friend-template requirement；
+    `docs/cpp-index-restart-investigation.md`。
+
+- **clangd 22.1.5 Windows 头文件名大小写导致空索引**
+  原生实验证实：错误大小写 include 可使 SymbolCollector 与 IncludeGraph 使用不同 URI，
+  实际头文件 shard 的 symbols/refs 为空，随后同 digest 被视为已索引。逐文件原位 VFS
+  使用真实外部文件名能恢复记录；不得修改源码、折叠不同物理文件或放开任意 VFS 输入。
+  二次合并仍须独立语义与性能验收，不能把小夹具成功冒充完整工程恢复。
+  → `lua/workarounds/clangd/header_path_case.lua`；
+    `openspec/specs/macos-ios-cdb-semantic-prepare/spec.md` Windows filename requirement。
+
+- **旧 NDK 与新 clangd 的 Wall 诊断差异必须逐组兼容**
+  Android Clang 9.0.9 成功构建不代表 clangd 23.1.1 的交互诊断级别相同；CDB driver
+  应从真实 RSP 工具链布局恢复，`--query-driver` 不会替换 clangd 内嵌 parser。
+  只在已证明的 Android C++17 + 有效全局 Werror 命令中添加 VLA、unused-but-set-variable
+  两个具体组的 `-Wno-error=`；其他错误和警告保留，不添加全局 `-Wno-error`。
+  `unused-variable` 是并列组，不能误作 `unused-but-set-variable` 的父组。
+  → `lua/workarounds/clangd/legacy_android_warnings.lua`；
+    `docs/cpp-index-restart-investigation.md` 2026-09-22 A/B 候选与最小诊断兼容。
+
+- **相同完整 CDB 命令的跨文件重排不能触发重索引**
+  current/hot改变优先顺序可能只重排已有full的命令。真实1206条命令完全相等、增删0，
+  却因135处顺序变化重写并重启；唯一文件身份的重排应保留旧bytes/mtime。
+  同文件多command的先后关系仍有语义，不能统一按set比较。
+  → `lua/ue/index/_publish.lua`；`openspec/specs/cpp-semantic-index-coverage/spec.md`；
+    `docs/cpp-index-restart-investigation.md`。
 
 - **K21 — Lazy float 在 VimResized 时 invalid buffer（已退役 2026-07-26）**
   症状: 刚关掉 Lazy float 后窗口 resize（Neovide 启动 / zen-mode / split），报
@@ -968,6 +1010,12 @@
   带 PID。旧顶层 state 只读迁移，禁止继续作为写入真相。
   → `lua/ue/project_state.lua`; `lua/ue/file_lock.lua`;
     `openspec/specs/multi-instance-state-isolation/spec.md`
+
+  2026-09-22 补充：字段各自发布后再争写同一 revision nonce，仍会重新引入 Windows
+  替换冲突；无 reader 的独立实验也可复现，8 次即时重试又被组合回归证伪。缓存签名
+  现从读取状态的同一次权威 JSON 字节采样派生，不再发布共享 nonce；不得把旧 state
+  配上后读的新 token，也不得用 size/mtime 代替内容。字段本身替换失败仍如实传播。
+  → `docs/cpp-index-restart-investigation.md` §共享状态 revision 的并发写入。
 
 - **K50 — nvim-dap 固定 `dap*.log` 且以 `w+` 打开 → 两实例互相截断调试证据**
   症状: 自定义 UE 日志已按 PID 分路，但 nvim-dap 上游 `dap.log.create_logger()` 仍在
@@ -1096,6 +1144,14 @@
   → `docs/cpp-navigation-kind-audit.md`；`lua/utils/ue_goto/clangd_referent.lua`；
     `tests/cases/ue_goto_behavior_referent_spec.lua`。
 
+- **K74 — Clang DefaultError is not caused by global -Werror**
+  症状：旧模板调用写法在 LLVM 22.1 的索引中失败，但普通 `-Wno-error` 不会清除该项默认错误。
+  约束：先核对诊断定义与真实 TU；兼容处理仅在已声明的工具/target/语言范围内改变该组级别，
+  保留警告、其他错误、原始构建证据与完整索引记录。缺失源码是独立输入问题，不能靠诊断策略掩盖。
+  参数插入不得把末尾同名路径猜成 source operand：它可能属于 `-include`，必须保留所有原选项/操作数邻接。
+  → `docs/cpp-index-restart-investigation.md`；`tools/clangd_diagnostic_compat.py`；
+    `openspec/specs/macos-ios-cdb-semantic-prepare/spec.md`；`tests/cases/ue_cdb_diagnostic_compat_spec.lua`。
+
 ## 三、约束（Constraints）
 
 承重项。所有贡献都必须遵守。
@@ -1104,7 +1160,7 @@
 
 | 组件 | 版本 | 备注 | 出处 |
 |------|------|------|------|
-| clangd / clang | **LLVM 22.1.x**（22.1.5 verified） | **不要降级到 21.x** —— exact-command transport、controlled BackgroundIndex、libclang cursor ABI 与 C shim 都按 22.x 验证 | `docs/TOOLING.md` §clangd |
+| clangd / clang / libclang | **A/B 验证合格的候选中优先较新版**；当前生产 **22.1.5**，预检22.1.x | 不要求追随latest；先比较正确性、性能及兼容成本。23.1.1候选尚有proof接口缺口。clangd/libclang/shim身份一致，各workaround单独限制实测版本，不自动安装 | `docs/TOOLING.md` §clangd |
 | DAP 适配器（Android） | **LLVM 22.1.6+ `lldb-dap.exe`**（forward-only，当前） | Android platform-mode attach 以 `lua/utils/platform/windows.lua` `default_lldb_dap_paths()` 为准；首选 `C:/tools/lldb-22/install/bin/lldb-dap.exe`。不得静默降级到 LLVM 21 或历史 codelldb 路线。 | `docs/TOOLING.md` §"Current Android DAP status" |
 | DAP 适配器（iOS） | **selected Xcode Apple `lldb-dap`** | iOS 17+ 使用 CoreDevice device/PID attach；pre-iOS17 使用 validated MobileDevice bridge。session 冻结 backend/adapter，禁止 Homebrew、Mac 或跨 backend fallback。 | `docs/TOOLING.md` §"macOS host and iOS application workflow" |
 | lldb-server（Android） | **NDK 27 LLDB 18.x**（aarch64-android，platform server） | 当前 K30/K56 路线：`run-as <pkg> /data/data/<pkg>/lldb-server platform --server --listen "*:<port>"`（**app uid**，sandbox 副本；`/data/local/tmp` 仅作 push 中转），由 host serial-form `platform connect` 拉起目标 gdbserver；`gdbserver --attach` 路线已证伪。`default_lldb_server_paths()` 以 NDK27 platform server 为首选；**不得**因 `lost connection` 降级 device server 版本（K56）。 | `docs/TOOLING.md` §"Current Android DAP status" |
@@ -1250,6 +1306,18 @@ MUST NOT 沿用单台设备的结论。attach MUST 先过 L2 门禁再连接调�
 **新增一条 DAP 坑时 MUST 标注其归属层**（见 §六 第 2 条）。
 → `openspec/specs/dap-failure-layering/spec.md`（正文权威）; `lua/ue/dap/AGENTS.md`（就地可发现）;
   `docs/TOOLING.md`（排查入口）; `tests/cases/dap_failure_layer_spec.lua`
+
+---
+
+### C11 — SuperUnity 性能保全
+
+**不得静默撤掉二次合并或退回大规模逐文件索引后宣称完成。**正确性、真实覆盖与索引性能
+必须同时验收；基线必须包含最近正常实现，不能只报相对已退化状态的降幅。
+正文直接放在所有 agent 共用的
+[根 AGENTS.md 强制约束](../AGENTS.md#super-unity-performance-contract)，不要求先读 spec。
+CDB / index / tools 的本地入口与 memory 都链接同一正文；`structure` 回归守护可发现性。
+历史故障与实测边界见 `docs/cpp-index-restart-investigation.md`；行为契约见
+`openspec/specs/cpp-semantic-index-coverage/spec.md`。
 
 ---
 

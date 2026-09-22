@@ -150,11 +150,24 @@ csearch 索引。它 MUST NOT 调用 prepare 流程、UBT、CDB 生成、GTAGS �
 - **AND** watcher MUST NOT 调用 csearch 索引构建（不写 `csearch.idx` / `csearch.idx~`）
 - **AND** 这些新文件的可见性 SHALL 由 rg-on-dirty overlay 在下次手动 `:UEPrepare*` 前提供
 
-#### Scenario: Windows metadata-only change 早于当前索引
-- **WHEN** Windows/libuv 报告已有文件 `change`，但该文件的内容 mtime 早于或等于当前
-  `csearch.idx` mtime
-- **THEN** watcher SHALL 把它判为 last-access / attribute / security 类元数据噪声
-- **AND** watcher SHALL NOT 把该路径写入 `persistent_dirty`，避免 dirty overlay 洪水
+#### Scenario: Windows metadata-only notifications do not enter the source observer
+- **WHEN** only a file's last-access time, attributes or security changes on the Windows host
+- **THEN** the source watcher SHALL exclude those native notification classes at subscription, before dirty tracking or source observation
+- **AND** it SHALL continue subscribing to file/directory names, size and last-write changes recursively
+- **AND** unavailable native watching SHALL be reported explicitly rather than silently presented as an equivalent content-only watcher
+
+#### Scenario: A real native write preserves the previous mtime
+- **WHEN** the Windows content-event backend reports a write or atomic replacement whose final mtime is older than the csearch index
+- **THEN** that event SHALL still reach dirty tracking and source content comparison
+- **AND** the csearch timestamp MUST NOT suppress a native write notification
+- **AND** an explicit last-write API call with unchanged bytes MAY cause a conservative first content observation; known equal bytes SHALL remain deduplicated
+
+#### Scenario: Native watcher loses notification coverage
+- **WHEN** the event buffer overflows, its protocol is invalid, or the owned helper exits unexpectedly
+- **THEN** watcher status SHALL expose unknown coverage and the cause, and notify its captured source owner
+- **AND** repeated reports of the same unresolved gap SHALL be coalesced; a new gap after observation resumes SHALL be reportable
+- **AND** events from a stopped or replaced watcher MUST NOT affect the new owner
+- **AND** helper shutdown or editor parent exit SHALL release the watcher without leaving an orphan process
 
 #### Scenario: 新建/重命名文件保留旧 mtime
 - **WHEN** fs_event 包含 rename/create 语义，或当前没有可用的 csearch 索引时间锚

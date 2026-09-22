@@ -13,6 +13,9 @@ local t = require("tests.harness")
 t.bootstrap()
 
 local watch = require("utils.ue_watch")
+-- These tests exercise the libuv fallback and bookkeeping in isolation. The
+-- native transport has its own integration coverage in ue_watch_native_spec.
+watch._set_content_watcher_for_test(false)
 
 -- ── 静态护栏（防止 csearch 写者复活）──────────────────────────────────────
 t.describe("ue_watch csearch provider 静态护栏（D9 单写者）", function()

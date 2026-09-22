@@ -497,9 +497,61 @@ t.describe("cpp semantic client: runtime controlled manifests", function()
       t.assert_eq(#manifests, 2)
       t.assert_eq(manifests[1].phase, "current")
       t.assert_eq(manifests[1].background_cdb_path, vim.fs.normalize(root .. "/current.cdb.json"))
+      t.assert_eq(manifests[1].semantic_cdb_path, manifests[1].background_cdb_path)
+      t.assert_true(vim.deep_equal(manifests[1].semantic_identity, manifests[1].background_identity))
       t.assert_eq(manifests[2].phase, "full")
       t.assert_eq(manifests[2].background_cdb_path, vim.fs.normalize(root .. "/full.cdb.json"))
     end, debug.traceback)
+    pcall(vim.fn.delete, root, "rf")
+    if not ok then error(err) end
+  end)
+
+  t.it("rejects a missing or modified split semantic CDB without falling back to background", function()
+    local root = vim.fn.tempname():gsub("\\", "/") .. "_semantic_runtime_split"
+    local original_open = io.open
+    local ok, err = xpcall(function()
+      local ctx = { paths = { current_index = root .. "/current.idx" } }
+      local background = root .. "/background.json"
+      local semantic = root .. "/native.json"
+      local original = '[{"file":"Module.A.cpp"}]'
+      local manifest = {
+        generation_id = "gen-a", index_kind = "controlled-background",
+        phase = "current", coverage_level = "current", index_path = ctx.paths.current_index,
+        background_cdb_path = background, semantic_cdb_path = semantic,
+        semantic_cdb_hash = vim.fn.sha256(original),
+      }
+      write_file(ctx.paths.current_index, "current")
+      write_file(background, "[]")
+      write_file(semantic, original)
+      write_file(ctx.paths.current_index .. ".manifest.json", vim.json.encode(manifest))
+      local semantic_reads = 0
+      io.open = function(path, mode)
+        if vim.fs.normalize(path) == vim.fs.normalize(semantic) then semantic_reads = semantic_reads + 1 end
+        return original_open(path, mode)
+      end
+      local discover = client._discover_controlled_phase_manifests_for_test
+      local candidates = discover(ctx, "gen-a")
+      t.assert_eq(#candidates, 1)
+      t.assert_eq(candidates[1].background_cdb_path, vim.fs.normalize(background))
+      t.assert_eq(candidates[1].semantic_cdb_path, vim.fs.normalize(semantic))
+      t.assert_eq(candidates[1].semantic_identity.hash, manifest.semantic_cdb_hash)
+      t.assert_eq(#discover(ctx, "gen-a"), 1)
+      t.assert_eq(semantic_reads, 1, "unchanged phase must reuse only the validated signature, not reread the CDB")
+
+      local stat = vim.uv.fs_stat(semantic)
+      write_file(semantic, '[{"file":"Module.B.cpp"}]')
+      assert(vim.uv.fs_utime(semantic, stat.atime.sec, stat.mtime.sec))
+      t.assert_eq(#discover(ctx, "gen-a"), 0, "same-size semantic byte tampering must reject the phase")
+      write_file(semantic, original)
+      manifest.semantic_cdb_hash = nil
+      write_file(ctx.paths.current_index .. ".manifest.json", vim.json.encode(manifest))
+      t.assert_eq(#discover(ctx, "gen-a"), 0, "declared semantic path requires a matching hash")
+      manifest.semantic_cdb_hash = vim.fn.sha256(original)
+      write_file(ctx.paths.current_index .. ".manifest.json", vim.json.encode(manifest))
+      assert(vim.uv.fs_unlink(semantic))
+      t.assert_eq(#discover(ctx, "gen-a"), 0, "missing native CDB must not use the merged background CDB")
+    end, debug.traceback)
+    io.open = original_open
     pcall(vim.fn.delete, root, "rf")
     if not ok then error(err) end
   end)
@@ -604,6 +656,34 @@ t.describe("cpp semantic client: runtime controlled manifests", function()
       local third = assert(client.discover_toolchain(0))
       t.assert_true(second.build_fingerprint ~= third.build_fingerprint,
         "controlled manifest path/mtime/size must affect build fingerprint")
+
+      local semantic_path = root .. "/indices/current.native.json"
+      local semantic_content = '[{"file":"Module.A.cpp"}]'
+      local split_manifest = {
+        generation_id = "gen-a", index_kind = "controlled-background",
+        phase = "current", coverage_level = "current", index_path = current_index,
+        background_cdb_path = current_background, semantic_cdb_path = semantic_path,
+        semantic_cdb_hash = vim.fn.sha256(semantic_content),
+      }
+      write_file(semantic_path, semantic_content)
+      write_file(current_index .. ".manifest.json", vim.json.encode(split_manifest))
+      local split = assert(require("utils.ue_goto.semantic_environment").read(0))
+      t.assert_eq(split.controlled_cdb_path, vim.fs.normalize(semantic_path))
+      t.assert_eq(#split.semantic_cdb_paths, 1)
+      t.assert_eq(split.semantic_cdb_paths[1], vim.fs.normalize(semantic_path))
+      t.assert_eq(split.controlled_candidates[1].background_cdb_path, vim.fs.normalize(current_background))
+
+      local native_stat = vim.uv.fs_stat(semantic_path)
+      local manifest_stat = vim.uv.fs_stat(current_index .. ".manifest.json")
+      semantic_content = '[{"file":"Module.B.cpp"}]'
+      write_file(semantic_path, semantic_content)
+      split_manifest.semantic_cdb_hash = vim.fn.sha256(semantic_content)
+      write_file(current_index .. ".manifest.json", vim.json.encode(split_manifest))
+      assert(vim.uv.fs_utime(semantic_path, native_stat.atime.sec, native_stat.mtime.sec))
+      assert(vim.uv.fs_utime(current_index .. ".manifest.json", manifest_stat.atime.sec, manifest_stat.mtime.sec))
+      local changed_split = assert(require("utils.ue_goto.semantic_environment").read(0))
+      t.assert_true(split.build_fingerprint ~= changed_split.build_fingerprint,
+        "native semantic identity must invalidate caches even with unchanged file sizes and mtime seconds")
     end, debug.traceback)
     package.loaded["ue"] = saved.ue
     package.loaded["ue.cdb.paths"] = saved.cdb_paths

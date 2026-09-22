@@ -1,5 +1,5 @@
 -- ue.cdb.pipeline — orchestrates the slim → expand → pch → resolve →
--- unify → prune sequence on a compile_commands.json file.
+-- unify sequence on a compile_commands.json file; pruning is explicit opt-in.
 --
 -- Phase E.3: lift the pipeline driver out of `ue.lua`. Unlike the pure
 -- helpers in `ue.cdb.json` and `ue.cdb.shaders`, this module DOES need
@@ -20,6 +20,18 @@
 local fs = require("ue.core.fs")
 local file_lock = require("ue.file_lock")
 local platform = require("utils.platform")
+local friend_template = require("workarounds.clangd.friend_template_canonical")
+friend_template.apply()
+local header_path_case = require("workarounds.clangd.header_path_case")
+header_path_case.apply()
+local legacy_android_warnings = require("workarounds.clangd.legacy_android_warnings")
+local workaround_registry = require("workarounds")
+local warning_policy_status = workaround_registry.status("clangd.legacy_android_warnings")
+if not warning_policy_status then
+  legacy_android_warnings.apply()
+elseif warning_policy_status.enabled ~= false then
+  workaround_registry.apply("clangd.legacy_android_warnings")
+end
 
 local M = {}
 local running = false
@@ -38,16 +50,18 @@ local _rt = {
     pcall(function() require("utils.log").notify_error(scope, msg) end)
   end,
   restart_clangd = nil,
+  clangd_path = nil,
 }
 
 --- Configure the runtime. ue.lua should call this once during setup;
 --- tests can call it with stub functions.
----@param opts { jobstart: fun(cmd:any, tag:string, opts:table):integer, notify: fun(msg:string, level:integer?), log_error: fun(scope:string, msg:string)?, restart_clangd: fun()? }
+---@param opts { jobstart: fun(cmd:any, tag:string, opts:table):integer, notify: fun(msg:string, level:integer?), log_error: fun(scope:string, msg:string)?, restart_clangd: fun()?, clangd_path: fun():string? }
 function M.set_runtime(opts)
   if opts.jobstart  then _rt.jobstart  = opts.jobstart  end
   if opts.notify    then _rt.notify    = opts.notify    end
   if opts.log_error then _rt.log_error = opts.log_error end
   if opts.restart_clangd then _rt.restart_clangd = opts.restart_clangd end
+  if opts.clangd_path then _rt.clangd_path = opts.clangd_path end
 end
 
 --- Whether a compile_commands writer pipeline currently owns the mutation slot.
@@ -172,23 +186,31 @@ end
 local function restart_clangd()
   local clients = vim.lsp.get_clients({ name = "clangd" })
   for _, client in ipairs(clients) do
-    local bufs = vim.lsp.get_buffers_by_client_id(client.id)
-    client:stop()
-    vim.defer_fn(function()
-      for _, buf in ipairs(bufs) do
-        if vim.api.nvim_buf_is_valid(buf) then
-          vim.api.nvim_buf_call(buf, function()
-            vim.cmd("LspStart clangd")
-          end)
-          break
+    -- The frozen client's epoch guard owns its scoped fallback restart when
+    -- the committed source changes. Do not restart the same client twice.
+    if not (client.config and client.config._ue_batch_scope) then
+      local bufs = vim.lsp.get_buffers_by_client_id(client.id)
+      client:stop()
+      vim.defer_fn(function()
+        for _, buf in ipairs(bufs) do
+          if vim.api.nvim_buf_is_valid(buf) then
+            vim.api.nvim_buf_call(buf, function()
+              vim.cmd("LspStart clangd")
+            end)
+            break
+          end
         end
-      end
-    end, 500)
+      end, 500)
+    end
   end
 end
 
 local function restart_active_clangd()
   return (_rt.restart_clangd or restart_clangd)()
+end
+
+function M.committed(result)
+  if result.changed then restart_active_clangd() end
 end
 
 local function mtime_key(path)
@@ -197,7 +219,7 @@ local function mtime_key(path)
   return tostring(mtime.sec or 0) .. ":" .. tostring(mtime.nsec or 0)
 end
 
---- Background pipeline: expand → pch → resolve → unify → prune. Each step
+--- Background pipeline: expand → pch → resolve → unify. Each step
 --- is skipped if its python script is absent. After success, syncs `path`
 --- to every other entry in `targets` and restarts clangd. Returns the
 --- jobid from `_rt.jobstart`, 0 when no scripts exist, or nil + error when
@@ -263,10 +285,35 @@ function M.run(path, targets, on_done, opts)
   end
 
   local python = python_exe()
+  local selected_clangd, selection_resolved
+  local function selected_compiler()
+    if selection_resolved then return selected_clangd end
+    selection_resolved = true
+    local selected = _rt.clangd_path and _rt.clangd_path()
+    if type(selected) == "string" and selected ~= "" then
+      local resolved = platform.resolve_tool({ name = "clangd", config_candidates = { selected } })
+      selected_clangd = resolved.ok and resolved.path or selected
+    end
+    return selected_clangd
+  end
 
   local CANONICAL_ARGS = {
     ["expand_response_cdb.py"] = function(p) return { p } end,
-    ["prebuild_pch_v2.py"] = function(p) return { p } end,
+    ["clangd_diagnostic_compat.py"] = function(p)
+      local args = { p }
+      local selected = selected_compiler()
+      if selected then
+        -- Resolve this selection only; an unavailable choice must not fall back.
+        vim.list_extend(args, { "--clangd", selected })
+      end
+      return args
+    end,
+    ["prebuild_pch_v2.py"] = function(p)
+      local args = { p }
+      if opts.logical_cdb then vim.list_extend(args, { "--logical-cdb", opts.logical_cdb }) end
+      if opts.recipes_dir then vim.list_extend(args, { "--recipes-dir", opts.recipes_dir }) end
+      return args
+    end,
     ["resolve_cdb_paths.py"] = function(p) return { p } end,
     ["unify_include_dirs.py"] = function(p) return { p, "--max-overhead=200" } end,
     -- --sample 4: the script's own default is 2 ("per-module groups have
@@ -287,15 +334,15 @@ function M.run(path, targets, on_done, opts)
     local ok, cfg = pcall(require, "ue.config")
     script_names = (ok and cfg and cfg.get and cfg.get("cdb.steps")) or {
       "expand_response_cdb.py",
+      "clangd_diagnostic_compat.py",
       "prebuild_pch_v2.py",
       "resolve_cdb_paths.py",
       "unify_include_dirs.py",
-      "prune_include_dirs.py",
     }
   end
 
   -- Engine-only CDB → unify needs --include-engine
-  local path_lower = path:gsub("\\", "/"):lower()
+  local path_lower = (opts.logical_cdb or path):gsub("\\", "/"):lower()
   local engine_only = path_lower:find("/engine/") ~= nil
 
   local host_driver = require("utils.platform").driver()
@@ -333,8 +380,14 @@ function M.run(path, targets, on_done, opts)
     end
   end
 
+  friend_template.configure_steps(steps, python, path,
+    opts.engine_root and selected_compiler() or nil, opts.engine_root)
+  header_path_case.configure_steps(steps, python, path, selected_compiler(), opts.logical_cdb,
+    opts.engine_root, opts.project_root)
+  legacy_android_warnings.configure_steps(steps, python, path, selected_compiler())
+
   if #steps == 0 then
-    if opts.force_restart then
+    if opts.force_restart and not opts.defer_restart then
       restart_active_clangd()
     end
     if on_done then on_done(true) end
@@ -347,6 +400,30 @@ function M.run(path, targets, on_done, opts)
     _rt.notify(msg, vim.log.levels.WARN)
     if on_done then on_done(false, msg) end
     return nil, msg
+  end
+
+  -- Bind unity membership to this successful transformation, outside the
+  -- standard CDB schema. A unique pending file cannot attest a later run.
+  local receipt_tool = tool_path("cdb_unity_receipt.py")
+  local receipt_pending
+  if fs.is_file(receipt_tool) and (fs.is_file(path .. ".unity-origin.json")
+      or fs.is_file(path .. ".unity-receipt.json")) then
+    receipt_pending = path .. (".unity-pending.%d.%s.json"):format(
+      vim.fn.getpid(), tostring(vim.uv.hrtime()))
+    table.insert(steps, 1, {
+      name = "unity-origin",
+      command = { python, "-u", "-I", receipt_tool, "begin", path, receipt_pending },
+    })
+    steps[#steps + 1] = {
+      name = "unity-receipt",
+      command = { python, "-u", "-I", receipt_tool, "seal", path, receipt_pending },
+    }
+  end
+  if fs.is_file(receipt_tool) then
+    steps[#steps + 1] = {
+      name = "complete",
+      command = { python, "-u", "-I", receipt_tool, "complete", path },
+    }
   end
 
   local phase_names = {}
@@ -362,6 +439,7 @@ function M.run(path, targets, on_done, opts)
   local finished = false
   local finish_ok
   local finish_err
+  local completed_result
   local function finish(ok, err)
     if finished then return end
     finished = true
@@ -369,6 +447,7 @@ function M.run(path, targets, on_done, opts)
     finish_err = err
     running = false
     current_jobid = nil
+    if receipt_pending then pcall(vim.uv.fs_unlink, receipt_pending) end
     file_lock.release(lease)
     if on_done then on_done(ok, err) end
   end
@@ -406,8 +485,10 @@ function M.run(path, targets, on_done, opts)
     -- Cleanup belongs to the success path: a failed run must keep its backups
     -- so the failure remains diagnosable.
     cleanup_intermediate_backups()
+    if opts.defer_restart then finish(true); return end
     local mtime_after = mtime_key(path)
-    if not opts.force_restart and mtime_after == mtime_before then
+    if (completed_result and completed_result.changed == false)
+        or (not completed_result and not opts.force_restart and mtime_after == mtime_before) then
       _rt.notify("compile_commands pipeline: no changes, skipping clangd restart", vim.log.levels.INFO)
       finish(true)
       return
@@ -442,7 +523,28 @@ function M.run(path, targets, on_done, opts)
     local tag = "ue-pipeline-" .. step.name
     local jobid = _rt.jobstart(step.command, tag, {
       cdb = path,
-      on_exit = function()
+      on_exit = function(_, log_lines)
+        if step.name == "complete" and type(log_lines) == "table" then
+          -- Only this invocation's actual CLI output can authorize reuse. A
+          -- stale changed=false file or a legacy runner stub is not evidence.
+          for _, line in ipairs(log_lines) do
+            local payload = type(line) == "string" and line:match("^pipeline complete: (.+)$")
+            if payload then
+              local ok_result, result = pcall(vim.json.decode, payload)
+              if ok_result and type(result) == "table" and result.schema == 1
+                  and type(result.digest) == "string" and #result.digest == 64
+                  and result.digest:match("^%x+$") and type(result.changed) == "boolean" then
+                local file = io.open(path .. ".pipeline-result.json", "rb")
+                if file then
+                  local bytes = file:read("*a")
+                  file:close()
+                  local ok_file, saved = pcall(vim.json.decode, bytes or "")
+                  if ok_file and vim.deep_equal(saved, result) then completed_result = result end
+                end
+              end
+            end
+          end
+        end
         if index == #steps then
           finish_success()
           return

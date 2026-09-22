@@ -47,7 +47,7 @@ function M.terminal_notice(sym, result)
     ["index-incomplete"] =
       "index coverage has not reached this definition yet -- wait for the running index build to finish",
     ["active-compile-command-missing"] =
-      "no compile command for this file in the active database -- re-run :UEPrepare for the current platform/configuration",
+      "no compile command for this file in the active database -- verify the selected platform/target and that its module or plugin participates in that build, then run :UEPrepare for that build",
     ["provider-unavailable"] =
       "check :LspInfo for client startup and :UEDefExplain for the captured provider evidence",
   })[reason]

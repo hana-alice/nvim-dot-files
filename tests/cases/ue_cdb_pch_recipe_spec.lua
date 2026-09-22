@@ -23,6 +23,19 @@ with tempfile.TemporaryDirectory() as folder:
     assert cdb.read_bytes()==original, 'recipe generation changed compiler inputs'
     pchdir=root/'.cache/nvim-ue/clangd/pch'; binary=pchdir/'SharedPCH.Sample.pch'
     assert not binary.exists() and (pchdir/'SharedPCH.Sample.rsp').exists()
+    # Relocation must preserve every compiler path while all recipe writes go
+    # to the transaction's physical workspace outside the live watch roots.
+    with tempfile.TemporaryDirectory() as stage_folder:
+        stage=pathlib.Path(stage_folder); physical=stage/'compile_commands.json'
+        physical.write_bytes(original)
+        destination=stage/'recipes'
+        old={p.name:(p.read_bytes(),p.stat().st_mtime_ns) for p in pchdir.iterdir()}
+        subprocess.run([sys.executable,str(pathlib.Path(m.__file__)),str(physical),
+                        '--logical-cdb',str(cdb),'--recipes-dir',str(destination)],check=True,capture_output=True)
+        assert physical.read_bytes()==original
+        assert {p.name:(p.read_bytes(),p.stat().st_mtime_ns) for p in pchdir.iterdir()}==old
+        assert {p.name:p.read_bytes() for p in destination.iterdir()}=={name:value[0] for name,value in old.items()}
+        assert not (stage/'.cache').exists(), 'physical stage must not become PCH compiler identity'
     polluted=[dict(entry,arguments=args[:3]+['-include-pch',binary.as_posix()]+args[3:])]
     assert m.remove_missing_generated_pch(polluted,str(pchdir))==1
     assert polluted[0]['arguments']==args

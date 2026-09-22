@@ -12,6 +12,7 @@ prebuild_pch_v2.py - 为 clangd 预编译 SharedPCH/PCH 头文件
   python prebuild_pch_v2.py <PROJ_DRIVE>/UEProj/compile_commands.json
   然后在 Windows cmd 执行生成的 build_pch.bat
 """
+import argparse
 import json
 import os
 import re
@@ -292,16 +293,18 @@ def remove_missing_generated_pch(entries, pch_dir):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <compile_commands.json>")
-        sys.exit(1)
-
-    cc_path = os.path.abspath(sys.argv[1])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('cdb')
+    parser.add_argument('--logical-cdb', help='published CDB identity for PCH paths and existing recipes')
+    parser.add_argument('--recipes-dir', help='physical recipe output directory during a prepare transaction')
+    options = parser.parse_args()
+    cc_path = os.path.abspath(options.cdb)
     with open(cc_path) as f:
         data = json.load(f)
 
-    cc_dir = os.path.dirname(cc_path)
+    cc_dir = os.path.dirname(os.path.abspath(options.logical_cdb or cc_path))
     pch_dir = os.path.join(cc_dir, ".cache", "nvim-ue", "clangd", "pch")
+    recipes_dir = os.path.abspath(options.recipes_dir) if options.recipes_dir else pch_dir
     # Check pre-existing recipes before writing new ones: new output is not
     # evidence that an arbitrary binary argument was originally ours.
     repaired = remove_missing_generated_pch(data, pch_dir)
@@ -326,7 +329,7 @@ def main():
 
     # Cache layout v3: PCH lives under <project>/.cache/nvim-ue/clangd/pch
     # (was: <project>/.clangd-pch). Single-root cache.
-    os.makedirs(pch_dir, exist_ok=True)
+    os.makedirs(recipes_dir, exist_ok=True)
 
     # Windows 路径 (正斜杠)
     pch_dir_win = to_forward_slash(wsl_to_win(pch_dir))
@@ -361,7 +364,7 @@ def main():
         flags = _flatten_split_path_flags(flags)
 
         # 写 response file (每行一个参数, 路径用正斜杠)
-        with open(rsp_path, "w", newline="\n") as f:
+        with open(os.path.join(recipes_dir, f"{basename}.rsp"), "w", newline="\n") as f:
             for flag in flags:
                 if " " in flag:
                     f.write(f'"{flag}"\n')
@@ -378,7 +381,7 @@ def main():
                 # MSVC /Yc requires a source file that #include's the PCH
                 # header. We synthesize a one-liner stub.cpp per PCH.
                 stub_path = os.path.join(pch_dir, f"{basename}.stub.cpp")
-                with open(stub_path, "w", newline="\n") as sf:
+                with open(os.path.join(recipes_dir, f"{basename}.stub.cpp"), "w", newline="\n") as sf:
                     sf.write(f'#include "{abs_header}"\n')
                 f.write("/Wv:0\n")  # silence ALL warnings (cl form)
                 f.write(f"/Yc{abs_header}\n")
@@ -400,7 +403,7 @@ def main():
 
     # 写 bat 脚本
     bat_path = os.path.join(pch_dir, "build_pch.bat")
-    with open(bat_path, "w", newline="\r\n") as f:
+    with open(os.path.join(recipes_dir, "build_pch.bat"), "w", newline="\r\n") as f:
         f.write("\n".join(bat_lines))
     print(f"\nBAT 脚本: {bat_path}")
 

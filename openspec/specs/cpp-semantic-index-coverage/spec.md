@@ -6,9 +6,201 @@
 
 ## Requirements
 
+### Requirement: SuperUnity acceleration SHALL not silently regress
+
+索引改动 SHALL 同时保留编译语义、真实覆盖与 SuperUnity 的实际加速能力；替换二次合并策略
+SHALL 用相同真实 build 的实测证明等效性能。全量 exact fallback MAY 临时保住正确性，
+但性能退化未处置时 MUST NOT 报告修复完成。所有 agent 的直接执行约束见根 `AGENTS.md`
+的 SuperUnity 性能硬约束；发现它 MUST NOT 依赖阅读本 spec。
+
+#### Scenario: A stricter correctness gate rejects previous grouping
+- **WHEN** 参数校验、平台兼容或 prepare 变换使原分组失效
+- **THEN** 系统/验收 SHALL 明示分组退化，并修复可证明兼容的分组或提供经真实工程验收的等效加速
+- **AND** MUST NOT 通过忽略语义冲突强行合并，或仅凭功能回归全绿宣称性能已恢复
+
+#### Scenario: Reporting a performance repair
+- **WHEN** 报告索引性能修复完成
+- **THEN** SHALL 对照最近可验证的正常实现，报告当前 build 的源覆盖、UBT/二次合并/exact/shader 分类与实际完成耗时、CPU/内存影响
+- **AND** SHALL 区分冷/热缓存与首次/重复 prepare，MUST NOT 把 CDB 记录数或进度分母当作完成耗时
+- **AND** 输入未变时 SHALL 保持产物与 clangd 生命周期稳定，不能用丢覆盖或清缓存制造好数字
+
+#### Scenario: A current or hot phase only reorders already published unique files
+- **WHEN** same-generation phase publication proposes exactly the same complete commands for uniquely identified files, changing only their cross-file order
+- **THEN** publication SHALL preserve the existing database bytes, mtime and running clangd client; it SHALL report unchanged
+- **AND** this rule SHALL also preserve unchanged frozen batch databases and activation metadata after their existing proof checks
+- **AND** initial publication and actual added/removed/changed commands SHALL still use the new current/hot priority order
+- **AND** multiple commands for the same normalized file SHALL retain order-sensitive comparison; a global command multiset MUST NOT erase build-context selection order
+
+### Requirement: Secondary batches SHALL preserve independently proven compiler semantics
+
+系统 MAY 将同模块、完整编译上下文相同的 compiler-authored UBT 组再次合并；MUST NOT 合并宏、
+include、target 或 PCH 参数以制造兼容性。每个候选 SHALL 与各原 UBT **独立缓存**产生的完整
+BackgroundIndex 图比较，保留真实文件、定义、符号身份、关系和引用。共享缓存的缺失记录、
+`--check` 零诊断、CDB 条目数或进度结束都 MUST NOT 代替此证明。
+
+#### Scenario: A candidate changes a binding without a compiler error
+- **WHEN** 合并能编译但改变重载目标、删除引用、改变符号身份或产生编译错误
+- **THEN** 候选 SHALL 被拒绝，并完整保留其原 UBT 命令
+- **AND** MAY 调整候选顺序后重新证明，MUST NOT 为通过门禁任意重映射 SymbolID
+
+#### Scenario: Original commands use an owned Windows filename identity overlay
+- **WHEN** secondary qualification consumes a prepared command with the validated filename-canonicalization overlay
+- **THEN** original native runs SHALL retain that option and qualification SHALL bind its exact bytes and lookup inventory
+- **AND** a frozen candidate SHALL preserve the canonical original file URIs while reading only its closed, verified snapshot; a live-file fallback MUST NOT escape the snapshot
+- **AND** foreign or altered VFS inputs SHALL remain unsupported, and this compatibility support MUST NOT waive the full semantic comparison
+
+#### Scenario: Equal header bytes belong to different compiler files
+- **WHEN** different source headers have equal bytes but distinct file identities under the active compiler filesystem
+- **THEN** freezing SHALL retain distinct snapshot identities so `#pragma once` cannot suppress a header that the real compiler would read
+- **AND** actual aliases SHALL preserve the active compiler's alias behavior; equal bytes or a cross-platform inode assumption MUST NOT substitute for that behavior
+- **AND** a changed source identity SHALL invalidate cached evidence even when its bytes remain equal
+
+#### Scenario: Compiler metadata differs after declarations merge
+- **WHEN** 同一符号的前置声明与定义记录在 language 或 include provider 上不同
+- **THEN** 比较 SHALL 遵循已验证的 clangd 定义优先规则
+- **AND** 新 include provider SHALL 来自原输入头文件，在单一原 TU 的依赖闭包中到达已有声明；原 provider 提供定义时新 provider 也 SHALL 到达该定义
+- **AND** 未解析的 literal include、新输入头、失去全部建议或指令模式变化 SHALL 被拒绝
+
+#### Scenario: A batch exposes an additional reference
+- **WHEN** 候选产生原独立图中没有的引用
+- **THEN** SHALL 在所有原本包含该文件的原 UBT AST 中证明 target、role、container 与位置
+- **AND** 缺失 native 能力、任一上下文不同或只在合并 TU 中查询 SHALL 拒绝候选
+
+#### Scenario: Printed template arguments differ while typed compiler arguments agree
+- **WHEN** class-template partial specialization records differ only in their printed `template_specialization_args`
+- **THEN** the system MAY accept that field difference only after native compiler proof of the complete ordered argument kinds, parameter identities, types and values in every original TU containing the declaration and in the candidate
+- **AND** proof SHALL use each main shard's effective command and bind the exact original/candidate records, declaration identities and locations, input/tool/profile identities and all required contexts; raw argv or a matching SymbolID alone MUST NOT substitute for proof
+- **AND** the supported proof SHALL check integral parameter type and width before reading its value, preserve integer precision, and prove type-parameter bindings by declaration identity; dependent expressions, unsupported kinds/widths, ambiguous or missing declarations and compiler errors SHALL fail closed
+- **AND** raw graphs SHALL remain unchanged; missing references, relation/source/definition/completion changes or other identity differences SHALL still reject before expensive template proof runs
+- **AND** request/result assets SHALL be hashed into the receipt; changed evidence or policy SHALL invalidate cache-only reuse, which MUST NOT rerun the native proof
+- **AND** accepted semantic equivalence SHALL NOT be reported as identical printed metadata or restored indexing performance
+
+#### Scenario: The same inputs are prepared again
+- **WHEN** 已有成功或语义拒绝的证明，输入未变化
+- **THEN** MAY 复用 receipt，但 SHALL 重新验证完整命令、工具/策略身份、输入/冻结产物字节与 include 目录名称清单
+- **AND** 输入同 mtime 换字节、新增条件头文件、产物损坏或工具变化 SHALL 使旧证明失效
+- **AND** 首次证明成本与重复验证耗时 SHALL 分开报告，MUST NOT 把首次成本藏入缓存
+
+#### Scenario: A proof helper imports its filename identity policy for the first time
+- **WHEN** qualification or offline generated-batch tooling loads the owned filename identity policy from a writable source directory
+- **THEN** the caller SHALL disable Python bytecode writes before importing that policy or its project dependencies, so first import does not itself alter a monitored lookup inventory
+- **AND** the rule SHALL hold without requiring the launcher to supply `-B`; actual source changes and existing inventory mismatches SHALL still invalidate receipts
+- **AND** this prevention MUST NOT delete existing bytecode, rewrite old receipts, or establish semantic or performance acceptance for any batch
+
+#### Scenario: Automatic delivery has no reusable proof
+- **WHEN** automatic current/hot/full delivery encounters a missing, stale or policy-incompatible receipt
+- **THEN** it SHALL retain the original UBT commands, report deferred verification, and MUST NOT start cold compiler proofs or graph replay in the delivery path
+- **AND** a separate explicitly invoked proof run MAY produce receipts; its first-run cost SHALL remain visible in performance acceptance
+
+#### Scenario: Compatible Unity groups are packed into a larger SuperUnity
+- **WHEN** compiler-authored UBT groups belong to the same module and complete compile context
+- **THEN** candidate planning SHALL preserve their original order and indivisible membership, bounded by both original-TU count and total member-source count
+- **AND** generated sources SHALL count toward the same source budget; oversized originals and exact commands SHALL remain available without being dropped
+- **AND** an explicit qualification run MAY subdivide a semantically rejected candidate and reuse valid independent original-TU evidence; automatic cache-only delivery MUST NOT start these cold qualifications
+
+#### Scenario: A different candidate reuses an independently indexed original TU
+- **WHEN** an original TU already has complete independent graph evidence
+- **THEN** qualification MAY reuse it only after checking its original entry, native effective command, compiler/profile/environment, complete dependencies, lookup inventories and stored assets
+- **AND** persisted evidence SHALL bind the native source digests to the actual source bytes; a successful frozen candidate with matching source digests and unchanged SHA-bound snapshots MAY establish that association even when later semantic admission rejects the candidate
+- **AND** an unlinked source digest or failed candidate compilation MUST NOT certify a newly collected original graph for persistent reuse
+- **AND** historical collection cost SHALL remain recorded separately from the new candidate's actual compilation cost
+
+#### Scenario: A proven group is noncontiguous in the full input
+- **WHEN** a previously accepted ordered group is present among other compatible original UBT entries
+- **THEN** cache-only discovery MAY use bounded compact selection hints without scanning all proof graphs or rejected records
+- **AND** a hint SHALL remain untrusted: exact current entries, module/context, the existing proof cache key, compiler/policy identities, receipt originals and all existing input/asset validations SHALL still match
+- **AND** the configured maximum group size SHALL remain a hard limit; selected groups SHALL not overlap, and every unselected original entry SHALL remain present
+- **AND** planning additional candidates SHALL first exclude already selected originals, then pack the remaining compatible entries; overlap with an accepted hint MUST NOT hide otherwise eligible unclaimed groups
+- **AND** invalid, stale, oversized or absent hints SHALL NOT authorize a batch or start a cold proof during automatic delivery
+
+#### Scenario: Experimental ordered candidates are not admitted batches
+- **WHEN** an offline candidate producer explores secondary groups with explicit module Definitions headers
+- **THEN** it SHALL preserve the original ordered PCH/compiler prefix and replay Definitions after that prefix, isolate touched macros, and keep differing feature macro states in separate groups
+- **AND** candidates SHALL classify actual member files and keep generated-only and implementation-only originals in separate groups; originals containing both classes SHALL remain unchanged
+- **AND** candidates SHALL preserve original ordering within each class and each Unity's internal order, retaining complete original ownership and coverage; moving generated specializations ahead of implementation calls MUST NOT manufacture compatibility
+- **AND** unsupported headers, ambiguous membership and oversized originals SHALL remain unchanged; unchanged inputs SHALL NOT rewrite candidate artifacts
+- **AND** candidate generation and syntax-only success SHALL NOT authorize production publication, stand in for independent semantic proof, or be reported as restored full-index performance
+
+#### Scenario: Generated-only grouping passes source-local checks but loses header targets
+- **WHEN** an offline generated-only candidate preserves source-local reference records and definitions of symbols declared in source shards
+- **THEN** qualification SHALL also check the global availability and definitions of every referenced target ID, including targets declared only in headers
+- **AND** a missing header target SHALL reject publication; unchanged reference tuples, zero reference counts, symbol flags or speed improvements MUST NOT waive the loss
+- **AND** `build_super_unity_cdb.build_generated_batches` SHALL remain an offline candidate API until full semantic and performance acceptance succeeds; it MUST NOT be enabled automatically merely because generation fixtures pass
+
+### Requirement: Synthetic shader donors SHALL use their existing compatibility navigation
+
+Shader augmentation MAY retain editor donor commands in the active and phase semantic CDBs. Only records
+proven to have been actually added by that producer, and sealed against the exact final cwd/source/argv,
+MAY be routed away from C++ BackgroundIndex. The source coverage evidence and existing shader GTAGS
+definition/reference paths SHALL remain intact; this does not claim HLSL compiler semantics.
+
+#### Scenario: A native shader command already exists
+- **WHEN** a shader path already has a compiler-authored command, including a relative path resolved against its cwd
+- **THEN** augmentation MUST NOT mark it as a synthetic donor, and publication SHALL retain it
+- **AND** suffix, a command resembling the donor template, or an old receipt MUST NOT override fresh native provenance
+
+#### Scenario: A sealed synthetic command changes
+- **WHEN** donor provenance is absent, ambiguous, malformed, or does not match the complete final command
+- **THEN** the background view SHALL retain that command; shader suffix alone MUST NOT authorize exclusion
+
+#### Scenario: Publishing a proven compatibility donor
+- **WHEN** producer provenance and the final command match
+- **THEN** original and frozen background views SHALL apply the same route and report native tasks separately from shader compatibility records
+- **AND** active/phase semantic commands and GTAGS input SHALL retain the shader; partial C++ error-recovery workspace symbols are not a supported shader semantic index
+
+### Requirement: Frozen batch activation SHALL be guarded and preserve the original semantic authority
+
+默认发布路径 SHALL 始终保留原 UBT/exact CDB。冻结批次 SHALL 使用独立 CDB 和独立 shard 缓存，
+phase manifest SHALL 绑定独立原始 semantic CDB 的路径与内容。native definition 查询 MUST NOT
+把二次合并 AST 当作原始编译上下文。
+
+#### Scenario: An editor starts with persisted frozen batches
+- **WHEN** 新进程发现批次产物
+- **THEN** SHALL 先建立经过宿主能力验证的输入监听，再异步验证 receipts 和发布内容，成功后才选择冻结 CDB
+- **AND** 主循环 MUST NOT 扫描依赖或同步计算大型 CDB/hash；能力缺失或验证失败 SHALL 使用原 UBT CDB
+
+#### Scenario: The server uses a query-driver profile not covered by the proof
+- **WHEN** effective server arguments contain a nonempty query-driver allowlist and receipts do not certify that driver-query profile
+- **THEN** automatic build/activation SHALL retain original UBT commands and preserve the user's server arguments and environment
+- **AND** prepare SHALL reject the profile before expensive validation; a ready metadata cache or a directly supplied verified path MUST NOT bypass this check
+- **AND** the system MUST NOT delete query-driver options merely to make frozen batches eligible
+
+#### Scenario: Inputs change while references or rename is in flight
+- **WHEN** 受监视的源码、头文件、工具、lookup 目录或冻结产物发生变化
+- **THEN** SHALL 立即撤销该客户端的批次 epoch，拒绝新的 references/rename/prepareRename 与迟到的旧结果
+- **AND** SHALL 退回独立原 UBT 路径，并只重启受影响的本进程客户端；不得清理其他进程的缓存
+
+#### Scenario: Certifying a supported driver-query profile
+- **WHEN** a secondary proof explicitly supports a nonempty query-driver profile
+- **THEN** all original and candidate compiler runs SHALL use the same supported server profile, actual launch cwd and compiler environment
+- **AND** native discovery SHALL identify the driver actually executed and bind its bytes, ordered system paths, target and builtin-header handling; PATH guessing or a recorded allowlist alone MUST NOT certify the profile
+- **AND** binding and VFS-alias proofs SHALL consume the original TU's structured main-shard effective command, retaining driver identity and semantic argument order; raw commands MUST NOT substitute for absent evidence
+- **AND** the profile SHALL bind cache/frozen/receipt identities, effective lookup roots SHALL be monitored, and activation SHALL asynchronously repeat native driver discovery after installing watches
+
+#### Scenario: Driver lookup depends on directories outside source trees
+- **WHEN** native driver discovery can search executable candidates outside recursively monitored compiler inputs
+- **THEN** activation SHALL monitor those candidate names and their lexical ancestors, including the nearest existing ancestor of missing directories
+- **AND** direct directory watches SHALL be explicitly nonrecursive; their separate budget MUST NOT weaken the source-tree recursive-watch budget
+- **AND** installation SHALL yield between bounded batches and cancel on epoch invalidation; native validation MUST NOT start until all required watches are installed
+- **AND** a missing event filename, changed lookup candidate, renamed ancestor or unavailable required watch SHALL revoke the frozen selection
+- **AND** validation SHALL confirm the installed watch topology still matches its newly discovered requirements; a directory appearing between describe and watch installation MUST NOT leave an unmonitored lookup root eligible for activation
+
+#### Scenario: The effective compiler environment changes during activation
+- **WHEN** launch cwd, query profile or effective compiler environment differs from the snapshot being validated
+- **THEN** the pending frozen activation SHALL be rejected and the original UBT process configuration SHALL remain available
+- **AND** helper processes SHALL receive the exact merged environment, including variable removal, without accidentally inheriting removed variables
+- **AND** Windows process overrides SHALL preserve case-insensitive environment semantics; an unsupported RPC removal or cwd alias SHALL reject frozen activation rather than silently change user configuration
+- **AND** ambiguous duplicate environment keys SHALL reject certification; a certified process SHALL execute the absolute clangd path whose identity was validated, while fallback retains the original user command
+- **AND** command selection and process startup SHALL reject changed cwd, environment, query results or unsupported server flags while preserving user arguments and the original UBT fallback
+
 ### Requirement: derived CDB 必须保留 active command 的编译语义
 
 full/current/hot 生成器 SHALL 只消费当前 active argv 明确引用且可验证的编译输入，MUST NOT 从源码路径猜测其他 target/platform/configuration 的 response、Definitions 或 UHT include。不能证明兼容时 SHALL 保留 exact command 或明确失败，不得把混合上下文作为 ready 产物发布。
+
+#### Scenario: Generated and ordinary sources belong to the same UBT module
+- **WHEN** UBT groups share the same compiler-owned module directory and complete compile context, and their members identify one unambiguous source module root
+- **THEN** generated `Inc/Module` members SHALL use that same portable module root rather than creating a separate synthetic module
+- **AND** source membership and commands SHALL remain unchanged; different compiler owners or ambiguous roots MUST NOT be combined by directory-name guesses
 
 #### Scenario: Android 与 Win64 Editor 中间产物共存
 - **WHEN** active CDB 属于 Android，而磁盘还存在 Win64 Editor 的 response/Definitions/UHT
@@ -31,6 +223,24 @@ full/current/hot 生成器 SHALL 只消费当前 active argv 明确引用且可�
 - **AND** 比较 MAY 忽略仅影响输出位置的参数和规范化后的 source 占位
 - **AND** 已验证匹配的语义输入 MUST NOT 在最终 argv 中再次被删除
 
+#### Scenario: prepare transforms a compiler-authored unity command
+- **WHEN** the actual prepare pipeline changes compiler RSP arguments for editor use
+- **THEN** grouping MAY reuse exact final active argv only with an external receipt captured by that producer and sealed after the whole pipeline succeeds under its writer lease
+- **AND** the receipt SHALL bind the complete ordered unity membership, raw unity/RSP/nested-RSP content digests, and every member's initial and final exact cwd/source/argv hash
+- **AND** begin SHALL admit only matching captured or previously sealed commands; missing, conflicting or modified evidence SHALL retain exact per-file fallback, without re-signing arbitrary active edits
+- **AND** consumption SHALL revalidate dependency bytes, every member command and equal member contexts; no macro/include/PCH difference may be ignored to obtain a group
+- **AND** provenance SHALL remain outside native compilation databases, whose schema cannot contain private metadata
+
+#### Scenario: Sampled include pruning cannot prove preprocessing equivalence
+- **WHEN** only a sample of a module's sources has been scanned for textual includes
+- **THEN** default prepare SHALL retain the compiler's include search paths; sampled absence MUST NOT justify removing paths from every member's command
+- **AND** RSP traversal and active-bucket selection SHALL be deterministic for identical build inputs, respecting explicit target and valid persisted selection before a stable size/key fallback
+
+#### Scenario: Editor-only macros alter generated engine declarations
+- **WHEN** compiler-authored RSP parameters do not define `__INTELLISENSE__`
+- **THEN** prepare MUST NOT inject that macro: UE `UCLASS`/PROLOG expansion and generated event-parameter types SHALL retain the compiler's context
+- **AND** an explicit user/compiler definition SHALL remain intact; resulting real compiler errors MUST NOT be waived to admit a batch
+
 #### Scenario: 显式响应文件无法完整展开
 - **WHEN** active argv 的 response 文件缺失或循环引用
 - **THEN** 展开阶段 SHALL 保留整个原始 command，而不能发布部分展开的混合 argv
@@ -50,6 +260,46 @@ full/current/hot 生成器 SHALL 只消费当前 active argv 明确引用且可�
 - **WHEN** hot、current、full 产物因异步执行或重试以任意顺序完成
 - **THEN** active coverage SHALL 按已证明的覆盖集合单调前进
 - **AND** 最后完成但覆盖更窄的产物 MUST NOT 成为唯一 active index
+- **AND** an equal proven module set MAY advance to a higher completed coverage level; a completed full phase MUST NOT remain labelled partial solely because the tracked module set did not change
+
+#### Scenario: Unchanged controlled input is prepared again
+- **WHEN** generated wrapper contents, standard published CDB entries and source inputs have not changed
+- **THEN** their paths, bytes and modification times SHALL remain stable; current/hot/full SHALL share wrapper paths for the same proven group
+- **AND** publication SHALL ignore JSON object key order and private metadata changes and MUST NOT request a compiler restart for unchanged published commands
+- **AND** rebuilding SHALL retain previously published wrappers and artifacts until replacement succeeds; it MUST NOT clear the live wrapper directory
+- **AND** prepare SHALL compare the successful final command digest across runs, rather than raw-to-processed modification times, before requesting restart; an unchanged verified digest supersedes a CDB-rewrite restart hint, not an actual source-content change
+- **AND** a phase CDB whose bytes no longer match its successful manifest MUST NOT replace the last published database, including when marker writing failed
+- **AND** raw generation, transformations and partition SHALL run in a staging transaction under the live writer lease; intermediate raw bytes MUST NOT reach the watched live CDB
+- **AND** identical final CDB, origin, receipt, partition and shard metadata SHALL retain their bytes and mtimes, including across processes with different map iteration order
+- **AND** manual partition/switch SHALL acquire the same writer lease; publication failure SHALL restore prior artifacts, retaining and reporting recovery backups if rollback itself fails
+- **AND** temporary generation and recipe writes SHALL stay outside monitored live roots; a missing event filename or watcher overflow MUST NOT be ignored to manufacture an unchanged result
+
+#### Scenario: Source dependencies change without changing compiler commands
+- **WHEN** an observed source/header changes bytes while its wrapper and CDB remain identical
+- **THEN** source refresh SHALL remain pending independently of command publication, including after a successful generator run
+- **AND** the affected project's clangd SHALL refresh its background dependencies; a watched-file notification or repeated identical compile-command notification alone MUST NOT be treated as proof of refresh
+- **AND** pending source revisions SHALL be acknowledged only after a new matching client attaches; failed/debounced restarts and changes arriving during restart SHALL remain pending for delivery
+- **AND** unrelated clients SHALL remain running, existing shard caches SHALL remain intact, and repeated equal source bytes or prepare bookkeeping alone MUST NOT trigger a restart
+
+#### Scenario: Source observation loses the changed filename
+- **WHEN** the captured project watcher reports overflow or another notification gap without a trustworthy filename
+- **THEN** the semantic owner SHALL keep an independent pending source revision and schedule a protected full delivery
+- **AND** it MUST NOT invent a source path/digest, erase caches, or acknowledge the gap merely because the CDB is unchanged
+- **AND** a newer gap during client restart SHALL remain pending after the older attachment completes
+
+#### Scenario: A source save schedules current and hot subsets from a large active CDB
+- **WHEN** current/hot delivery selects a small set of modules from a large active compilation database
+- **THEN** reading, JSON decoding, classifying and encoding that database SHALL execute outside the editor main thread, using the existing module classification and ordered selection semantics
+- **AND** the editor SHALL hand off only a small selection/context request; normalization and injection SHALL modify the isolated subset, never the active input
+- **AND** subset generation failure, parent loss or an input identity change detected before subset publication SHALL preserve the previous subset; a later build failure or input change SHALL prevent semantic publication and report failed delivery
+- **AND** the existing build lease and serialized phase ownership SHALL remain effective
+- **AND** unchanged subset bytes SHALL preserve output modification time; background execution alone MUST NOT be reported as measured GUI responsiveness
+
+#### Scenario: An unselected Unity module is absent from the filesystem
+- **WHEN** a current/hot subset encounters an ordinary identifier Unity name that cannot match the basename of any selected module root
+- **THEN** classification MAY skip recursive Unity fallback discovery after applying the existing direct scope rules
+- **AND** selected entries, their order and complete commands SHALL remain identical to unfiltered classification; the hint MUST NOT choose between same-name roots or change their lookup priority
+- **AND** unknown selected-key shapes, irregular root basenames or nonordinary Unity names SHALL retain the original discovery behavior; full classification SHALL remain unchanged
 
 #### Scenario: Only a partial baseline exists
 - **WHEN** 新 generation 尚无 full synthetic TU baseline，而 current 或 hot partial coverage 已可用
@@ -176,6 +426,8 @@ current/hot/full phase artifact MAY 携带 `nvim_ue_members`、`nvim_ue_module_r
 - **WHEN** SuperUnity phase artifact 包含 member/module-root metadata 并被合并到 clangd background CDB
 - **THEN** phase artifact SHALL 保留这些字段供 semantic sidecar 使用
 - **AND** clangd 发布视图 SHALL 剥离所有非标准字段，同时保持 exact argv、cwd、file 与 output 不变
+- **AND** exact argv 指同一 prepare 事务已经封存的最终语义命令；诊断兼容转换须遵守
+  `macos-ios-cdb-semantic-prepare` 的受控转换契约并保留原始构建 provenance，发布层不得另行添加选项
 
 ### Requirement: Live file freshness SHALL overlay rather than replace broad coverage
 
@@ -197,6 +449,8 @@ current/hot/full phase artifact MAY 携带 `nvim_ue_members`、`nvim_ue_module_r
 BackgroundIndex baseline、exact-command source、warm cache freshness、64-context cap 命中与最后构建
 结果，并以自动化测试证明 coverage 不降级。状态输出 MUST NOT 包含用户项目绝对路径、设备标识或
 其他不必要的本机信息。
+
+Progress SHALL distinguish input source entries from actual controlled translation units and report the generated Unity/exact-fallback counts. Zero accepted groups MUST NOT be described as compressed Unity indexing. A prepared controlled database is not proof that clangd has finished indexing it.
 
 controlled index 的构建 SHALL 是**可观测的前台阶段**，而不是完成后静默的 fire-and-forget 后台
 任务。构建期间 SHALL 提供进度指示（阶段名 + 进展），并遵守 P5：至多 start + 中段更新，成功后自然

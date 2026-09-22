@@ -4,6 +4,21 @@
 
 在 `docs/CONSTRAINTS.md` 提供一份权威的、统一归纳项目禁止项、踩过的坑与约束的参考文档，并使其可被发现、可溯源、可维护。该文档以索引/链接指向仓库既有出处，而非整段复制原文。
 ## Requirements
+
+### Requirement: SuperUnity 性能硬约束 SHALL 不依赖 spec 即可发现
+
+根 `AGENTS.md` SHALL 在 SESSION START 之前直接写出 SuperUnity 性能保全的完整执行约束，
+适用于所有 agent/模式/子任务；根 `CLAUDE.md` SHALL 继续仅导入该共用内容源。
+`docs/CONSTRAINTS.md` C11、`memory/project_overview.md` 以及 CDB/index/tools 本地规则
+SHALL 链接根正文，MUST NOT 新增 agent 专属平行规则源。
+
+#### Scenario: Agent 没有使用 OpenSpec 工作流
+- **WHEN** agent 只读取根或相关目录的本地规则
+- **THEN** 它 SHALL 发现不得静默移除/绕过 SuperUnity 二次合并或用大规模逐文件 fallback 宣称完成的约束
+- **AND** 该约束 SHALL 要求真实工程覆盖、编译语义与性能同时验收，不以功能回归或故障基线降幅替代
+- **AND** 下级规则、spec、技能或测试通过 MUST NOT 被当作豁免；改变验收底线 SHALL 以用户明确调整该约束为前提
+- **AND** `tests/cases/structure_spec.lua` SHALL 守护根正文与各入口指针
+
 ### Requirement: Consolidated constraints reference document
 
 仓库 SHALL 在 `docs/CONSTRAINTS.md` 提供一份权威文档，统一归纳项目的禁止项、
@@ -148,4 +163,3 @@
 - **WHEN** 新增一条 DAP 坑
 - **THEN** 维护契约 SHALL 要求该条目标注其归属层
 - **AND** 标注 SHALL 使读者能判断该坑是外部契约还是本仓缺陷
-

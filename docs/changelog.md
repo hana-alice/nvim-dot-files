@@ -58,6 +58,34 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-22 — Certify the pinned Android NDK query-driver profile
+
+**Task**
+- Remove the strict-query dead end for the actual Android CDB compiler without weakening
+  driver identity or receipt validation.
+
+**Implemented**
+- Added an exact Android NDK r20b clang 9.0.9 profile to the LLVM 22.1.5 query extractor.
+- Bound the profile name into query evidence and validation; unrelated Android/NDK builds remain
+  unsupported.
+- Added a native parser regression for the pinned and rejected version strings.
+
+**Pitfalls / Gotchas**
+- This profile only clears query observation. It does not accept a SuperUnity candidate or
+  claim indexing performance; the current eight-wrapper qualification still needs a bounded
+  semantic proof.
+
+**Validation**
+- Native query-profile regression: **7/7 passed** with the installed clangd 22.1.5.
+- Spec consistency: synchronized `cpp-semantic-index-coverage` with the explicit pinned profile.
+- Required-native full regression: **2090/2090 passed, 0 failed, 0 skipped**.
+- Current-input two-wrapper strict qualification: **accepted 2-to-1**; original 69.9802 s +
+  70.3348 s, candidate 62.5914 s; receipt revalidation `verified-receipts-current`.
+
+**Follow-ups**
+- Keep the accepted pair private until a separately bounded expansion proves the remaining
+  wrappers; do not claim whole-engine performance restoration from this result.
+
 ### 2026-09-22 — Lock the Windows native filter with an OS-level regression
 
 **Task**

@@ -138,6 +138,11 @@ with PrivateDirectory(prefix='query_profile_') as temporary:
             assert not changed['ok'] and changed['reason'] == 'query-profile-changed', changed
             observed = [profile._key(path) for path in changed['evidence']['ordered_includes']]
             assert profile._key(generic) in observed and profile._key(target) in observed
+        elif mode == 'version':
+            ndk = profile.ANDROID_NDK_9_VERSION + '\nTarget: x86_64-w64-windows-gnu'
+            assert profile._driver_profile(ndk) == 'android-ndk-r20b-clang-9.0.9'
+            assert profile._driver_profile('clang version 22.1.5 5ea218a153f4d2f815b8244eab3e4b4ba5e00e6c') == 'llvm-22.1.5'
+            assert profile._driver_profile('Android clang version 9.0.8') is None
         else:
             raise AssertionError(mode)
 print('ok')
@@ -158,6 +163,7 @@ t.describe("native query driver profile", function()
     { "logs", "rejects truncated ambiguous and fallback native logs" },
     { "header", "real query additions change header selection while preserving original flags" },
     { "implicit", "real Android driver discovers newly created unlogged installation headers" },
+    { "version", "accepts only the pinned LLVM and Android NDK driver profiles" },
   }
   for _, case in ipairs(cases) do
     t.it(case[2], function()

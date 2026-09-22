@@ -17,8 +17,12 @@ import threading
 import time
 
 
-PARSER_ID = 'windows-llvm-22.1.5-query-driver-v2'
+PARSER_ID = 'windows-llvm-22.1.5-query-driver-v3'
 LLVM_COMMIT = '5ea218a153f4d2f815b8244eab3e4b4ba5e00e6c'
+ANDROID_NDK_9_VERSION = (
+    'Android (7019983 based on r365631c3) clang version 9.0.9 '
+    '(https://android.googlesource.com/toolchain/llvm-project '
+    'a2a1e703c0edb03ba29944e529ccbf457742737b) (based on LLVM 9.0.9svn)')
 # Same compiler environment boundary as cdb_verified_batch. Never persist the
 # full environment, which contains unrelated variables and potentially secrets.
 COMPILER_ENV = ('CPATH', 'CPLUS_INCLUDE_PATH', 'C_INCLUDE_PATH', 'OBJC_INCLUDE_PATH',
@@ -44,6 +48,15 @@ def _file_hash(path):
         for chunk in iter(lambda: file.read(1024 * 1024), b''):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _driver_profile(version_text):
+    """Return the exact compiler profile certified by this parser revision."""
+    if version_text.startswith('clang version 22.1.5 ') and LLVM_COMMIT in version_text:
+        return 'llvm-22.1.5'
+    if version_text.startswith(ANDROID_NDK_9_VERSION):
+        return 'android-ndk-r20b-clang-9.0.9'
+    return None
 
 
 def _key(path):
@@ -355,7 +368,8 @@ def observe(entry, clangd_path, query_driver, output_dir, timeout=10, *, launch_
         driver_hash = _file_hash(driver)
         driver_version, _ = _run([str(driver), '--version'], cwd, env, remaining(), output / 'driver-version')
         driver_version_text = driver_version.stdout.decode('utf-8').strip()
-        if not driver_version_text.startswith('clang version 22.1.5 ') or LLVM_COMMIT not in driver_version_text:
+        driver_profile = _driver_profile(driver_version_text)
+        if driver_profile is None:
             raise ValueError('unsupported-driver-version')
         argv = [str(driver), '-E', '-v', '-x', tuple_['Lang']]
         if not tuple_['StandardIncludes']:
@@ -387,7 +401,8 @@ def observe(entry, clangd_path, query_driver, output_dir, timeout=10, *, launch_
             'implicit_search_roots': implicit_roots,
             'tuple': tuple_, 'clangd': {'path': str(tool), 'sha256': tool_hash, 'version': version_text},
             'driver': {'path': str(driver), 'realpath': str(driver.resolve(strict=True)), 'sha256': driver_hash,
-                       'version': driver_version_text}, 'query': query_record, 'builtin_query': builtin_record,
+                       'version': driver_version_text}, 'driver_profile': driver_profile,
+            'query': query_record, 'builtin_query': builtin_record,
             'raw_includes': raw_includes, 'ordered_includes': filtered, 'target': target, 'builtin_path': builtin_path,
             'observed_includes': observed['includes'], 'observed_target': observed['target'], 'clangd_run': run}
         return {'ok': True, 'reason': 'native-query-profile-observed', 'evidence': evidence}
@@ -405,7 +420,7 @@ def validate(evidence, entry, clangd_path, query_driver, output_dir, timeout=10,
         return result
     keys = ('schema', 'parser_id', 'helper_sha256', 'entry', 'entry_sha256', 'source_sha256',
             'profile', 'compiler_environment', 'environment_sha256', 'driver_search_roots', 'driver_candidates',
-            'implicit_search_roots',
+            'implicit_search_roots', 'driver_profile',
             'tuple', 'clangd', 'driver', 'raw_includes', 'ordered_includes', 'target',
             'builtin_path', 'observed_includes', 'observed_target', 'query', 'builtin_query')
     if any(evidence.get(key) != result['evidence'][key] for key in keys):

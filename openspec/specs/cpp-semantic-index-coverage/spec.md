@@ -177,6 +177,16 @@ phase manifest SHALL 绑定独立原始 semantic CDB 的路径与内容。native
 - **AND** binding and VFS-alias proofs SHALL consume the original TU's structured main-shard effective command, retaining driver identity and semantic argument order; raw commands MUST NOT substitute for absent evidence
 - **AND** the profile SHALL bind cache/frozen/receipt identities, effective lookup roots SHALL be monitored, and activation SHALL asynchronously repeat native driver discovery after installing watches
 
+#### Scenario: Certifying the pinned Android NDK driver profile
+- **WHEN** the active Android CDB resolves the compiler to the pinned NDK r20b clang 9.0.9 build
+  (`7019983` / `r365631c3`, LLVM commit `a2a1e703c0edb03ba29944e529ccbf457742737b`)
+- **THEN** the LLVM 22.1.5 clangd query extractor MAY certify that driver as the explicit
+  `android-ndk-r20b-clang-9.0.9` profile
+- **AND** the exact driver version string, bytes, target, ordered system includes, builtin-header
+  handling, compiler environment and lookup roots SHALL remain bound in the evidence
+- **AND** any other Android/NDK version or build identity SHALL remain unsupported and retain the
+  original UBT commands until a separately reviewed profile is added
+
 #### Scenario: Driver lookup depends on directories outside source trees
 - **WHEN** native driver discovery can search executable candidates outside recursively monitored compiler inputs
 - **THEN** activation SHALL monitor those candidate names and their lexical ancestors, including the nearest existing ancestor of missing directories

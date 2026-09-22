@@ -715,7 +715,7 @@ function M.clangd_cmd(root_dir)
     end
   end
 
-  return cmd
+  return require("ue.index.batch_runtime").command(cmd)
 end
 
 -- ==========================================================================
@@ -1569,8 +1569,8 @@ local function resolve_context(opts)
     -- ctx was built, drop the cache entry. Without this guard external
     -- writers (other nvim processes, build scripts) would be invisible
     -- for up to _CONTEXT_TTL seconds.
-    if cached.ctx and cached.state_revision_path then
-      local revision = read_all(cached.state_revision_path) or ""
+    if cached.ctx and cached.state_revision then
+      local revision = CORE_RT.project_state.revision(cached.ctx.engine_root)
       if revision == (cached.state_revision or "") then
         return cached.ctx, cached.err
       end
@@ -1587,7 +1587,7 @@ local function resolve_context(opts)
   end
 
   local selection = CORE_RT.project_state.current(engine_root)
-  local state = read_state(engine_root)
+  local state, state_revision = read_state(engine_root)
   local project_root, uproject
 
   -- Project selection is manual-only. Current cwd/buffers may belong to a
@@ -1613,7 +1613,6 @@ local function resolve_context(opts)
     pcall(CORE_RT.migrate_legacy_csearch_if_needed, engine_root, platform_key)
   end
   local paths = cache_paths(engine_root, platform_key, selection)
-  local state_revision = read_all(paths.state_revision) or ""
 
   local ctx = {
     engine_root = engine_root,
@@ -1626,7 +1625,6 @@ local function resolve_context(opts)
     ctx = ctx,
     err = nil,
     ts = now,
-    state_revision_path = paths.state_revision,
     state_revision = state_revision,
   }
   return ctx
@@ -2492,6 +2490,8 @@ end
 -- that yields torn CDBs and wastes CPU the build needs. Parked on CORE_RT
 -- (LuaJIT 200-local cap, see CONSTRAINTS).
 function CORE_RT.ue_build_running()
+  local distributed = package.loaded["ue.workflows.android.distributed"]
+  if distributed and distributed.is_running() then return true end
   if not CORE_RT.build_term_jobid then
     return false
   end
@@ -3492,7 +3492,7 @@ local function augment_compile_commands_table_with_shaders(ctx, entries, progres
   end)
   CORE_RT.trace_mark(string.format("shader.count=%d", #shader_files))
   if #shader_files == 0 then
-    return entries
+    return entries, {}
   end
   progress("shader_augment", 80, string.format("augmenting cdb with %d shaders...", #shader_files))
   local include_roots = CORE_RT.trace_seg("shader.include_roots", function()
@@ -3558,9 +3558,12 @@ end
 --- Also expands @"file" nested rsp references recursively.
 --- base_dir is the directory for resolving relative @ references
 --- (typically Engine/Source, since UBT runs from there).
-local function tokenize_rsp_content(content, base_dir, depth)
+local function tokenize_rsp_content(content, base_dir, depth, dependencies)
   depth = depth or 0
-  if depth > 5 then return {} end -- prevent infinite recursion
+  if depth > 5 then
+    if dependencies then dependencies.invalid = true end
+    return {} -- prevent infinite recursion
+  end
   local tokens = {}
   -- Split on \r\n or \n
   for line in content:gmatch("[^\r\n]+") do
@@ -3580,11 +3583,14 @@ local function tokenize_rsp_content(content, base_dir, depth)
           ref_path = norm(ref_path)
           local nested = read_all(ref_path)
           if nested then
+            if dependencies then require("ue.cdb.unity_origin").add_dependency(dependencies, ref_path, nested) end
             -- Keep the same base_dir for nested refs (all relative to UBT CWD)
-            local nested_tokens = tokenize_rsp_content(nested, base_dir, depth + 1)
+            local nested_tokens = tokenize_rsp_content(nested, base_dir, depth + 1, dependencies)
             for _, nt in ipairs(nested_tokens) do
               tokens[#tokens + 1] = nt
             end
+          elseif dependencies then
+            dependencies.invalid = true
           end
         else
           tokens[#tokens + 1] = tok
@@ -3697,6 +3703,7 @@ end
 local function parse_rsp_tokens(tokens)
   local args = {}
   local input_file = nil
+  local outputs = {}
   local i = 1
   while i <= #tokens do
     local tok = tokens[i]
@@ -3704,6 +3711,7 @@ local function parse_rsp_tokens(tokens)
 
     -- Clang-style skips
     if tok == "-o" then
+      if next_tok then outputs[#outputs + 1] = next_tok end
       i = i + 2
       goto continue
     elseif tok == "-MD" then
@@ -3751,33 +3759,11 @@ local function parse_rsp_tokens(tokens)
     end
   end
 
-  return args, input_file
+  return args, input_file, outputs
 end
 
 local function extract_unity_includes(unity_file, engine_source_dir)
-  local content = read_all(unity_file)
-  if not content then
-    return nil
-  end
-  local includes = {}
-  for inc_path in content:gmatch('#include%s+"([^"]+%.cpp)"') do
-    local abs
-    if inc_path:match("^[A-Za-z]:") or inc_path:match("^/") then
-      abs = norm(inc_path)
-    else
-      abs = norm(join(engine_source_dir, inc_path))
-      if not _ufs.is_file(abs) then
-        abs = norm(join(_ufs.dirname(unity_file), inc_path))
-      end
-    end
-    if _ufs.is_file(abs) then
-      includes[#includes + 1] = abs
-    end
-  end
-  if #includes > 0 then
-    return includes
-  end
-  return nil
+  return require("ue.cdb.unity_origin").extract_members(unity_file, engine_source_dir, read_all, _ufs.is_file)
 end
 
 local function collect_rsp_files(ctx)
@@ -4005,11 +3991,14 @@ local function collect_rsp_files(ctx)
 
   -- Suppress unused-var warning for the diagnostic-only flag.
   local _ = kept_by_target
+  table.sort(rsp_files)
   return rsp_files, nil
 end
 
 generate_compile_commands_from_rsp = function(ctx, progress)
   progress = progress or function() end
+  local unity_origin = require("ue.cdb.unity_origin")
+  local origin_groups = {}
   progress("collect_rsp", 30, "collecting .rsp files...")
   local rsp_files, err = CORE_RT.trace_seg("ccjson.collect_rsp", function()
     return collect_rsp_files(ctx)
@@ -4024,6 +4013,10 @@ generate_compile_commands_from_rsp = function(ctx, progress)
   -- UBT runs with Engine/Source as CWD, so all relative paths in rsp files
   -- (../Intermediate/Build/..., Runtime/Core/Public, etc.) are relative to it.
   local compile_dir = engine_source_dir
+  local link_inputs = require("ue.cdb.link_inputs")
+  local link_plan = link_inputs.plan(ctx, rsp_files, {
+    read = read_all, tokenize = tokenize_rsp_content, parse = parse_rsp_tokens,
+  })
 
   -- Per-shard bucketing: classify every rsp by (platform, target, config)
   -- and stuff its entries into a per-bucket array. This replaces the old
@@ -4060,6 +4053,7 @@ generate_compile_commands_from_rsp = function(ctx, progress)
   local _ccjson_unity_ms = 0
   local _ccjson_unity_calls = 0
   local total_entries = 0
+  local compiler_selections = {}
 
   CORE_RT.trace_seg("ccjson.parse_loop", function()
   for _, rsp_path in ipairs(rsp_files) do
@@ -4067,12 +4061,14 @@ generate_compile_commands_from_rsp = function(ctx, progress)
     local content = read_all(rsp_path)
     _ccjson_read_ms = _ccjson_read_ms + (vim.loop.hrtime() - _t0) / 1e6
     if content then
+      local dependencies = {}
+      unity_origin.add_dependency(dependencies, rsp_path, content)
       content = trim(content)
       if content ~= "" then
-        local tokens = tokenize_rsp_content(content, engine_source_dir)
-        local args, input_file = parse_rsp_tokens(tokens)
+        local tokens = tokenize_rsp_content(content, engine_source_dir, nil, dependencies)
+        local args, input_file, outputs = parse_rsp_tokens(tokens)
 
-        if input_file and input_file ~= "" then
+        if input_file and input_file ~= "" and link_inputs.keep(link_plan, rsp_path, args, outputs, dependencies) then
           -- Resolve relative paths against Engine/Source (UBT's working dir)
           if not input_file:match("^[A-Za-z]:") and not input_file:match("^/") then
             input_file = norm(join(engine_source_dir, input_file))
@@ -4080,35 +4076,43 @@ generate_compile_commands_from_rsp = function(ctx, progress)
             input_file = norm(input_file)
           end
 
-          table.insert(args, 1, "clang++")
-          table.insert(args, "-D__INTELLISENSE__")
+          local compiler, selection = require("ue.cdb.compiler").resolve(args, compile_dir)
+          local selection_key = selection.source .. ":" .. selection.reason .. ":" .. compiler
+          compiler_selections[selection_key] = (compiler_selections[selection_key] or 0) + 1
+          table.insert(args, 1, compiler)
 
           local bucket = get_bucket(rsp_path)
           bucket.roots[_ufs.dirname(rsp_path)] = true
 
           local _u0 = vim.loop.hrtime()
-          local unity_includes = extract_unity_includes(input_file, engine_source_dir)
+          local unity_includes, unity_content, unity_complete = extract_unity_includes(input_file, engine_source_dir)
           _ccjson_unity_ms = _ccjson_unity_ms + (vim.loop.hrtime() - _u0) / 1e6
           _ccjson_unity_calls = _ccjson_unity_calls + 1
           if unity_includes then
+            unity_origin.add_dependency(dependencies, input_file, unity_content)
+            local group = { unity = input_file, members = unity_includes, dependencies = dependencies,
+              entries = {}, invalid = not unity_complete }
             for _, real_file in ipairs(unity_includes) do
               local key = real_file:lower()
-              if not bucket.seen_files[key] then
-                bucket.seen_files[key] = true
-                local entry_args = vim.list_extend({}, args)
-                entry_args[#entry_args + 1] = real_file
-                bucket.entries[#bucket.entries + 1] = {
-                  directory = compile_dir,
-                  file = real_file,
-                  arguments = entry_args,
-                }
+              local entry_args = vim.list_extend({}, args)
+              entry_args[#entry_args + 1] = real_file
+              local entry = { directory = compile_dir, file = real_file, arguments = entry_args }
+              local existing = bucket.seen_files[key]
+              if not existing then
+                bucket.entries[#bucket.entries + 1] = entry
+                bucket.seen_files[key] = entry
                 total_entries = total_entries + 1
+              elseif not vim.deep_equal(existing, entry) then
+                group.invalid = true
               end
+              -- Share the selected entry so later header/PCH injection is
+              -- covered by finalize's exact final-command hash check.
+              group.entries[#group.entries + 1] = existing or entry
             end
+            origin_groups[#origin_groups + 1] = group
           else
             local key = input_file:lower()
             if not bucket.seen_files[key] then
-              bucket.seen_files[key] = true
               local entry_args = vim.list_extend({}, args)
               entry_args[#entry_args + 1] = input_file
               bucket.entries[#bucket.entries + 1] = {
@@ -4116,6 +4120,7 @@ generate_compile_commands_from_rsp = function(ctx, progress)
                 file = input_file,
                 arguments = entry_args,
               }
+              bucket.seen_files[key] = bucket.entries[#bucket.entries]
               total_entries = total_entries + 1
             end
           end
@@ -4124,6 +4129,13 @@ generate_compile_commands_from_rsp = function(ctx, progress)
     end
   end
   end)
+
+  CORE_RT.trace_mark("ccjson.compiler_selections=" .. vim.json.encode(compiler_selections))
+  CORE_RT.trace_mark("ccjson.link_inputs=" .. vim.json.encode({ enabled = link_plan.enabled,
+    reason = link_plan.reason, response = link_plan.response, excluded = link_plan.excluded,
+    dependencies = link_plan.dependencies, gaps = link_plan.gaps, retained_reasons = link_plan.retained_reasons }))
+  progress("link_inputs", 65, string.format("link input selection: %d obsolete compile responses excluded, %d input gaps%s",
+    #link_plan.excluded, #link_plan.gaps, link_plan.reason and ("; retained: " .. link_plan.reason) or ""))
 
   -- Bucket summary for tracing.
   do
@@ -4142,34 +4154,13 @@ generate_compile_commands_from_rsp = function(ctx, progress)
     return nil, "No compile entries generated from .rsp files"
   end
 
-  -- Pick the *active* bucket: the one matching state.target_platform +
-  -- state.target_configuration. Shader CDB augmentation is only attached
-  -- to the active bucket (shader entries are platform-agnostic; merging
-  -- them onto every shard would just duplicate work).
-  local state = ctx.state or {}
-  local want_plat = trim(state.target_platform or "")
-  local want_conf = trim(state.target_configuration or "")
-  local want_conf_stripped = want_conf:gsub(" Editor$", "")
-  local active_bucket = nil
-  for _, b in pairs(buckets) do
-    if (want_plat == "" or b.platform == want_plat) and
-       (want_conf == "" or b.config == want_conf_stripped) then
-      active_bucket = b
-      break
-    end
-  end
-  if not active_bucket then
-    -- Fall back to whichever bucket has the most entries.
-    local best_count = -1
-    for _, b in pairs(buckets) do
-      if #b.entries > best_count then
-        active_bucket, best_count = b, #b.entries
-      end
-    end
-  end
+  -- Select before augmentation changes bucket sizes or shader donors.
+  local active_bucket = shards_mod.select_generated_bucket(
+    buckets, ctx.state, shards_mod.read_manifest(ctx).active)
 
   progress("shaders", 80, "augmenting active shard with shader entries...")
-  active_bucket.entries = augment_compile_commands_table_with_shaders(
+  local synthetic_shaders
+  active_bucket.entries, synthetic_shaders = augment_compile_commands_table_with_shaders(
     ctx, active_bucket.entries, progress)
 
   -- Per-bucket structural fixups for clangd LSP:
@@ -4215,6 +4206,7 @@ generate_compile_commands_from_rsp = function(ctx, progress)
     for _, b in pairs(buckets) do
       local roots = {}
       for r, _ in pairs(b.roots) do roots[#roots + 1] = r end
+      table.sort(roots)
       local k = shards_mod.write_shard(ctx, b.platform, b.target, b.config, b.entries, roots)
       if b == active_bucket then active_key = k end
     end
@@ -4249,6 +4241,13 @@ generate_compile_commands_from_rsp = function(ctx, progress)
       write_all(target, json_content)
     end
   end)
+  local origin = unity_origin.finalize(origin_groups, merged, synthetic_shaders)
+  for _, target in ipairs(targets) do
+    local ok_origin, origin_err = unity_origin.write(target, origin)
+    if not ok_origin then
+      CORE_RT.trace_mark("ccjson.unity_origin unavailable: " .. tostring(origin_err))
+    end
+  end
   progress("done", 95, string.format("cdb written: %d entries (active=%s)", #merged, active_key or "?"))
 
   return #merged, preferred
@@ -4399,6 +4398,7 @@ local function run_compile_commands_pipeline(path, targets, on_done, opts)
   local pipeline = require("ue.cdb.pipeline")
   pipeline.set_runtime({
     jobstart  = M._logged_jobstart,
+    clangd_path = function() return M.clangd_cmd()[1] end,
     notify    = function(msg, level) vim.notify(msg, level) end,
     log_error = function(scope, msg) require("utils.log").notify_error(scope, msg) end,
   })
@@ -4436,6 +4436,11 @@ local function write_compile_commands_targets(ctx, content)
   for _, target in ipairs(compile_commands_targets(ctx)) do
     write_all(target, content)
     slim_compile_commands_file(target)
+    -- Imported non-RSP commands carry no proof of this augmentation. A stage
+    -- may contain an older donor receipt; explicitly revoke that authority.
+    local ok_origin, origin_err = require("ue.cdb.unity_origin").write(target,
+      { schema = 1, groups = {}, synthetic_shaders = {} })
+    if not ok_origin then return false, tostring(origin_err) end
   end
 
   return true, preferred
@@ -4470,53 +4475,16 @@ local function generate_compile_commands(ctx, progress, on_pipeline_done)
   if pipeline.is_running() then
     return false, "compile_commands pipeline is already running"
   end
-
-  local targets = compile_commands_targets(ctx)
-  on_pipeline_done = on_pipeline_done or function(ok_pipeline)
-    if ok_pipeline then CORE_RT.start_deferred_clangd(ctx) end
-  end
-
-  local function start_pipeline(path)
-    local jobid, pipeline_err = run_compile_commands_pipeline(path, targets, on_pipeline_done, {
-      force_restart = ctx._force_cdb_restart == true,
-    })
-    if jobid == nil then
-      return false, pipeline_err or "compile_commands pipeline failed to start"
-    end
-    return true
-  end
-
-  -- PRIMARY: generate from .rsp files. UBT writes one Module.<Mod>.{cpp.obj,cppa8.o}.rsp
-  -- per unity TU at compile time, containing the exact clang/MSVC command line
-  -- (sysroot, -I, -D, PCH, -c <unity.cpp>). This is the most complete and
-  -- accurate source of truth — covers Engine + game modules uniformly across
-  -- Win64 / Android / IOS / Linux.
-  --
-  -- Why rsp instead of `Build.bat -Mode=GenerateClangDatabase`:
-  --   1. GenerateClangDatabase only emits modules the active *target* links;
-  --      Engine modules used by the runtime are often missing.
-  --   2. Re-running Build.bat costs 30-60s; reading rsp files costs <2s.
-  --   3. The unity-rsp pipeline produces identical args to what the build
-  --      actually used, so PCH/macro mismatches are eliminated by construction.
-  local rsp_count, rsp_path = generate_compile_commands_from_rsp(ctx, progress)
-  if rsp_count and rsp_count > 0 then
-    local ok_pipeline, pipeline_err = start_pipeline(targets[1])
-    if not ok_pipeline then return false, pipeline_err end
-    return true, rsp_path .. " (" .. rsp_count .. " entries from .rsp files)"
-  end
-
-  -- FALLBACK: reuse only a provenance-checked CDB from a controlled location.
-  -- Apple semantic compilation stores its tuple-specific UBT database under
-  -- .cache/nvim-ue/cdb/sources; arbitrary recursive fixtures are never eligible.
-  local ok_existing, existing_path = export_compile_commands_to_engine_root(ctx)
-  if ok_existing then
-    local ok_pipeline, pipeline_err = start_pipeline(targets[1])
-    if not ok_pipeline then return false, pipeline_err end
-    return true, existing_path .. " (UBT)"
-  end
-
-  return false,
-    "No engine compile_commands source found. Run :UECompileForNvim to build the active target and prepare its RSP-backed database, or place a compile_commands.json at the engine root."
+  -- Explicit Sync/headless entrypoints wait for the same transaction as the
+  -- normal asynchronous UI path; they must never expose intermediate bytes.
+  local done, success, message = false, false, nil
+  M.async_generate_compile_commands(ctx, progress, function(ok, detail)
+    success, message, done = ok, detail, true
+    if on_pipeline_done then on_pipeline_done(ok, detail)
+    elseif ok then CORE_RT.start_deferred_clangd(ctx) end
+  end)
+  while not done do vim.wait(1000, function() return done end, 20) end
+  return success, message
 end
 
 -- ==========================================================================
@@ -5240,6 +5208,8 @@ function M.cached_files(opts)
           shader_filelist = info.ctx.paths.workspace_list,
           gtags_db = info.ctx.paths.workspace_db,
           dirty_json_path = info.ctx.paths.dirty_json,
+          on_source_changed = function(path) INDEX_FN.check_source(info.ctx, path) end,
+          on_source_unknown = function(reason) INDEX_FN.source_observation_unknown(info.ctx, reason) end,
           debounce_ms = 1500,
         })
       end
@@ -7100,6 +7070,10 @@ local export_compile_commands
 
 local function build_target(opts)
   opts = opts or {}
+  if CORE_RT.ue_build_running() then
+    vim.notify("A UE build is already running in this editor", vim.log.levels.WARN)
+    return
+  end
   local ctx, err = resolve_context()
   if not ctx then
     vim.notify(err, vim.log.levels.WARN)
@@ -8565,46 +8539,15 @@ local function prepare_async(opts)
           return
         end
         update("indexing...", 95)
-        -- Subprocess wrote compile_commands.json but did NOT run the
-        -- expand+pch+resolve+unify+prune pipeline (those rely on jobstart
-        -- whose lifetime is tied to the main nvim, not the subprocess).
-        -- Start it here in the main nvim.
-        local targets_main = compile_commands_targets(ctx)
-        -- Partition MUST run AFTER the async pipeline completes — both rewrite
-        -- the same base compile_commands.json, and running them concurrently
-        -- tears the file mid-write (pipeline's resolve stage then hits a
-        -- JSONDecodeError). Proven via timestamped race probe 2026-06-25:
-        -- partition START fell inside [pipeline START, pipeline EXIT].
-        -- Fix: hand partition to the pipeline's on_done so it is strictly
-        -- serialized after expand→pch→resolve→unify→prune finishes.
-        run_compile_commands_pipeline(targets_main[1], targets_main, function(ok_pipeline, pipeline_err)
-          if not ok_pipeline then
-            invalidate_status_cache()
-            refresh_statusline()
-            set_prepare_running(false)
-            if handle then handle.message = "FAILED"; handle:finish() end
-            vim.notify("UEPrepare compile_commands pipeline failed: " .. tostring(pipeline_err),
-              vim.log.levels.ERROR, { title = "UE" })
-            return
-          end
-          -- Partition base CDB by (plat, cfg) so clangd's gd on macros like
-          -- UE_BUILD_DEVELOPMENT does not jump into stale Dev generated headers
-          -- when the current build is Test. See INDEX_FN.partition_base_cdb.
-          INDEX_FN.partition_base_cdb_async(ctx, {}, function(ok_p, msg_p)
-          if not ok_p then
-            vim.notify("UEPrepare: cdb_partition failed -- " .. tostring(msg_p),
-              vim.log.levels.WARN, { title = "ue.cdb" })
-          end
-          clear_index_dirty(ctx)
-          INDEX_FN.schedule_prepare_delivery(ctx)
-          invalidate_status_cache()
-          refresh_statusline()
-          set_prepare_running(false)
-          CORE_RT.start_deferred_clangd(ctx)
-          if handle then handle.message = "done"; handle.percentage = 100; handle:finish() end
-          vim.notify(prepare_summary(ctx, compile_path, { reused_cache = true }))
-          end)
-        end, { force_restart = ctx._force_cdb_restart })
+        -- Generation, pipeline and partition have committed together.
+        clear_index_dirty(ctx)
+        INDEX_FN.schedule_prepare_delivery(ctx)
+        invalidate_status_cache()
+        refresh_statusline()
+        set_prepare_running(false)
+        CORE_RT.start_deferred_clangd(ctx)
+        if handle then handle.message = "done"; handle.percentage = 100; handle:finish() end
+        vim.notify(prepare_summary(ctx, compile_path, { reused_cache = true }))
 
         -- csearch index rebuild (same logic as before, just moved here).
         local code_search_fp = require("utils.code_search")
@@ -8797,9 +8740,7 @@ local function prepare_async(opts)
           vim.notify("UEPrepare: compile_commands failed (non-fatal): " .. (path or "unknown"), vim.log.levels.WARN)
           return
         end
-        local targets = compile_commands_targets(ctx)
-        run_compile_commands_pipeline(targets[1], targets, on_compile_pipeline_done,
-          { force_restart = ctx._force_cdb_restart == true })
+        on_compile_pipeline_done(true)
       end)
 
     -- ── Phase 3b: build GTAGS (async, slow) ───────────────────────────
@@ -8965,6 +8906,8 @@ local function prepare_async(opts)
                 shader_filelist = ctx.paths and ctx.paths.workspace_list or nil,
                 gtags_db = ctx.paths and ctx.paths.workspace_db or nil,
                 dirty_json_path = ctx.paths and ctx.paths.dirty_json or nil,
+                on_source_changed = function(path) INDEX_FN.check_source(ctx, path) end,
+                on_source_unknown = function(reason) INDEX_FN.source_observation_unknown(ctx, reason) end,
                 debounce_ms = 1500,
               })
               -- NOTE: dirty set is cleared in the csearch build SUCCESS callback
@@ -9330,6 +9273,11 @@ M.android_dap_attach = dap_mod.android_dap_attach
 M.read_state = read_state
 M.update_state_field = update_state_field
 M.resolve_context = resolve_context
+M.build_running = CORE_RT.ue_build_running
+-- Read-only build context for external executors; uses this instance's selection.
+function M.build_snapshot(opts)
+  return require("ue.build_snapshot").capture(opts, resolve_context, CORE_RT.target_plan)
+end
 -- Test seams for grep-cache invalidation (grep_cache_spec.lua). cache_paths
 -- is a forward-declared local; CORE_RT helpers are parked off the local cap.
 M.cache_paths = cache_paths
@@ -9583,6 +9531,7 @@ function M.setup()
   end, { desc = "Bundle UE grep trace + errors + messages into one diag file" })
   vim.api.nvim_create_user_command("UEGenerateFromRSP", prepare_async, {})
   vim.api.nvim_create_user_command("UEBuild", build_target, {})
+  require("ue.workflows.bootstrap").setup_commands()
   vim.api.nvim_create_user_command("UEBuildAndroid", build_target, {})
   vim.api.nvim_create_user_command("UEBuildIOS", function()
     build_target({ platform = "IOS", title = "UEBuildIOS" })
@@ -10323,6 +10272,7 @@ function M.setup()
       -- foreign root so the user knows to :UESetProject (or that they opened
       -- the wrong checkout).
       CORE_RT.notify_foreign_buffer(ctx, path)
+      INDEX_FN.check_source(ctx, path, true)
       if INDEX_FN.set_active_module(ctx, path) then
         invalidate_status_cache()
         refresh_statusline()
@@ -10342,9 +10292,7 @@ function M.setup()
         return
       end
       INDEX_FN.set_active_module(ctx, path)
-      if INDEX_FN.mark_module_dirty(ctx, path, "buffer-write") then
-        INDEX_FN.schedule_index_refresh(ctx, { current = true, hot = true, current_delay_ms = 150, hot_delay_ms = 2500 })
-      end
+      INDEX_FN.check_source(ctx, path)
       invalidate_status_cache()
       refresh_statusline()
     end,
@@ -10430,6 +10378,16 @@ function M.async_generate_compile_commands(ctx, on_progress, on_done, opts)
     })
     if started then return child, start_err end
     return control
+  end
+
+  if opts._raw_only ~= true then
+    return require("ue.cdb.transaction").run(ctx, on_progress, on_done, {
+      _host_admitted = true,
+      generate = function(working, progress, done)
+        return M.async_generate_compile_commands(working, progress, done, { _host_admitted = true, _raw_only = true })
+      end,
+      pipeline = run_compile_commands_pipeline,
+    })
   end
 
   -- 1. Dump ctx to a temp JSON file (argv has size limits on Windows).

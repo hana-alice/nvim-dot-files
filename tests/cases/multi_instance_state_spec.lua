@@ -175,6 +175,211 @@ t.describe("multi-instance project state", function()
     pcall(vim.fn.delete, root, "rf")
   end)
 
+  for _, scenario in ipairs({
+    { name = "propagates EPERM without claiming an unpublished field was committed", code = "EPERM" },
+    { name = "propagates EACCES without replacing the previous field", code = "EACCES" },
+    { name = "propagates unrelated field replacement errors", code = "ENOENT" },
+  }) do
+    t.it(scenario.name, function()
+      local root = tmpdir()
+      local engine, project = root .. "/engine", root .. "/Project"
+      local state = require("ue.project_state")
+      state._reset_for_test()
+      assert(state.select(engine, project, project .. "/Game.uproject", { persist_default = false }))
+      assert(state.update(engine, "atomic_field", "before"))
+      local path = state.project_cache_root(engine) .. "/state-fields/atomic_field.json"
+      local before = table.concat(vim.fn.readfile(path), "\n")
+      local original_rename = vim.uv.fs_rename
+      local attempts, staged = 0, nil
+      local ok, err = pcall(function()
+        vim.uv.fs_rename = function(from, to, ...)
+          if to ~= path then return original_rename(from, to, ...) end
+          attempts = attempts + 1
+          staged = staged or from
+          t.assert_eq(vim.json.decode(table.concat(vim.fn.readfile(from), "\n")).value, "after")
+          t.assert_eq(table.concat(vim.fn.readfile(path), "\n"), before, "old JSON must stay intact until replacement")
+          return nil, scenario.code .. ": injected replacement failure", scenario.code
+        end
+        local updated, update_err = state.update(engine, "atomic_field", "after")
+        t.assert_false(updated)
+        t.assert_eq(attempts, 1)
+        t.assert_contains(update_err, scenario.code)
+      end)
+      vim.uv.fs_rename = original_rename
+      if ok then
+        t.assert_eq(state.read(engine).atomic_field, "before")
+        t.assert_nil(vim.uv.fs_stat(staged), "success or failure must not leak staged JSON")
+      end
+      pcall(vim.fn.delete, root, "rf")
+      if not ok then error(err) end
+    end)
+  end
+
+  t.it("commits independent fields without a shared revision writer", function()
+    local root = tmpdir()
+    local engine, project = root .. "/engine", root .. "/Project"
+    local state = require("ue.project_state")
+    state._reset_for_test()
+    assert(state.select(engine, project, project .. "/Game.uproject", { persist_default = false }))
+    write(state.revision_path(engine), '{"legacy":"unchanged"}')
+    local before = state.revision(engine)
+    local jobs = {}
+    for index = 1, 4 do
+      local code = string.format(
+        "local s=require(%q); assert(s.select(%q,%q,%q,{persist_default=false})); "
+          .. "vim.fn.writefile({'ready'},%q); assert(vim.wait(10000,function() return vim.fn.filereadable(%q)==1 end,5)); "
+          .. "local errors={}; for n=1,400 do local ok,err=s.update(%q,%q,n); if not ok then errors[#errors+1]=err end end; "
+          .. "vim.fn.writefile({vim.json.encode({errors=errors})},%q)",
+        "ue.project_state", engine, project, project .. "/Game.uproject", root .. "/ready-" .. index,
+        root .. "/start", engine, "writer_" .. index, root .. "/result-" .. index .. ".json"
+      )
+      jobs[index] = vim.system({ vim.v.progpath, "--headless", "-u", "NONE", "-i", "NONE",
+        "--cmd", "set rtp+=" .. vim.fn.stdpath("config"), "-c", "lua " .. code, "-c", "qa!" }, { text = true })
+    end
+    local ready = vim.wait(10000, function()
+      for index = 1, 4 do if vim.fn.filereadable(root .. "/ready-" .. index) ~= 1 then return false end end
+      return true
+    end, 5)
+    write(root .. "/start")
+    local results = {}
+    for index, job in ipairs(jobs) do results[index] = job:wait(30000) end
+    local ok, err = pcall(function()
+      t.assert_true(ready, "all four native writers must reach the shared start barrier")
+      for index, result in ipairs(results) do
+        t.assert_eq(result.code, 0, result.stderr)
+        t.assert_eq(vim.trim(result.stderr or ""), "", result.stderr)
+        local report = vim.json.decode(table.concat(vim.fn.readfile(root .. "/result-" .. index .. ".json"), "\n"))
+        t.assert_eq(#report.errors, 0, report.errors[1])
+      end
+      local persisted = state.read(engine)
+      for index = 1, 4 do t.assert_eq(persisted["writer_" .. index], 400) end
+      t.assert_true(state.revision(engine) ~= before)
+      t.assert_eq(table.concat(vim.fn.readfile(state.revision_path(engine)), "\n"), '{"legacy":"unchanged"}')
+    end)
+    pcall(vim.fn.delete, root, "rf")
+    if not ok then error(err) end
+  end)
+
+  t.it("returns a revision from the exact bytes used by the sampled state", function()
+    local root = tmpdir()
+    local engine, project = root .. "/engine", root .. "/Project"
+    local state = require("ue.project_state")
+    state._reset_for_test()
+    assert(state.select(engine, project, project .. "/Game.uproject", { persist_default = false }))
+    assert(state.update(engine, "sample", "before"))
+    local before = state.revision(engine)
+    local path = state.project_cache_root(engine) .. "/state-fields/sample.json"
+    local original_open = io.open
+    local changed = false
+    local ok, err = pcall(function()
+      io.open = function(name, mode)
+        local handle, open_err = original_open(name, mode)
+        if not handle or name ~= path or mode ~= "rb" or changed then return handle, open_err end
+        return {
+          read = function(_, ...) return handle:read(...) end,
+          close = function()
+            local closed = handle:close()
+            changed = true
+            assert(state.update(engine, "sample", "after"))
+            return closed
+          end,
+        }
+      end
+      local sampled, revision = state.read(engine)
+      t.assert_eq(sampled.sample, "before")
+      t.assert_eq(revision, before, "an update after reading must not attach its newer revision to old state")
+    end)
+    io.open = original_open
+    if ok then
+      t.assert_true(changed)
+      local current, revision = state.read(engine)
+      t.assert_eq(current.sample, "after")
+      t.assert_true(revision ~= before)
+      t.assert_eq(state.revision(engine), revision)
+    end
+    pcall(vim.fn.delete, root, "rf")
+    if not ok then error(err) end
+  end)
+
+  t.it("tracks exact field bytes, removals and target pairs without relying on mtimes", function()
+    local root = tmpdir()
+    local engine, project = root .. "/engine", root .. "/Project"
+    local state = require("ue.project_state")
+    state._reset_for_test()
+    assert(state.select(engine, project, project .. "/Game.uproject", { persist_default = false }))
+    assert(state.update(engine, "sample", "alpha"))
+    local path = state.project_cache_root(engine) .. "/state-fields/sample.json"
+    local raw = table.concat(vim.fn.readfile(path), "\n")
+    local changed = raw:gsub('"alpha"', '"bravo"')
+    t.assert_eq(#changed, #raw)
+    assert(vim.uv.fs_utime(path, 1000000000, 1000000000))
+    local before = state.revision(engine)
+    local file = assert(io.open(path, "wb"))
+    assert(file:write(changed))
+    assert(file:close())
+    assert(vim.uv.fs_utime(path, 1000000000, 1000000000))
+    t.assert_eq(vim.uv.fs_stat(path).size, #raw)
+    local after = state.revision(engine)
+    t.assert_true(after ~= before, "same size and timestamp must not hide changed JSON bytes")
+    t.assert_eq(state.read(engine).sample, "bravo")
+    t.assert_eq(state.revision(engine), after, "unchanged reads must have stable signatures")
+    assert(state.update(engine, "sample", nil))
+    local removed = state.revision(engine)
+    t.assert_true(removed ~= after)
+    t.assert_nil(state.read(engine).sample)
+    assert(state.update_target(engine, "Android", "Test"))
+    local paired = state.revision(engine)
+    t.assert_true(paired ~= removed)
+    local value = state.read(engine)
+    t.assert_eq(value.target_platform, "Android")
+    t.assert_eq(value.target_configuration, "Test")
+    t.assert_nil(vim.uv.fs_stat(state.revision_path(engine)), "no shared nonce file is published")
+    pcall(vim.fn.delete, root, "rf")
+  end)
+
+  t.it("invalidates the live context cache for external fields and an update during capture", function()
+    local root = tmpdir()
+    local engine, project = root .. "/engine", root .. "/Project"
+    for _, rel in ipairs({ "Binaries", "Build", "Config", "Plugins", "Shaders", "Source" }) do
+      vim.fn.mkdir(engine .. "/Engine/" .. rel, "p")
+    end
+    write(project .. "/Game.uproject")
+    local result = child_lua(string.format([=[
+      local engine,project=%q,%q
+      vim.cmd('cd '..vim.fn.fnameescape(engine))
+      local s=require('ue.project_state')
+      assert(s.select(engine,project,project..'/Game.uproject',{persist_default=false}))
+      assert(s.update(engine,'cache_sample','initial'))
+      local ue=require('ue')
+      local first=assert(ue.resolve_context())
+      assert(first.state.cache_sample=='initial')
+      local command=string.format('local s=require(%%q); assert(s.select(%%q,%%q,%%q,{persist_default=false})); assert(s.update(%%q,%%q,%%q))',
+        'ue.project_state',engine,project,project..'/Game.uproject',engine,'cache_sample','external')
+      local child=vim.system({vim.v.progpath,'--headless','-u','NONE','-i','NONE','--cmd','set rtp+='..vim.fn.stdpath('config'),
+        '-c','lua '..command,'-c','qa!'},{text=true}):wait()
+      assert(child.code==0 and vim.trim(child.stderr or '')=='',child.stderr)
+      assert(ue.resolve_context().state.cache_sample=='external')
+      assert(s.update(engine,'cache_sample','captured'))
+      local original_read=s.read
+      local injected,reads=false,0
+      s.read=function(...)
+        local value,revision=original_read(...)
+        reads=reads+1
+        if reads==2 then injected=true; assert(s.update(engine,'cache_sample','newer')) end
+        return value,revision
+      end
+      -- Publish after the state-capture read, before resolve_context stores it.
+      local captured=assert(ue.resolve_context())
+      s.read=original_read
+      assert(injected)
+      assert(captured.state.cache_sample=='captured')
+      assert(ue.resolve_context().state.cache_sample=='newer')
+    ]=], engine, project))
+    pcall(vim.fn.delete, root, "rf")
+    t.assert_eq(result.code, 0, result.stderr)
+    t.assert_eq(vim.trim(result.stderr or ""), "", result.stderr)
+  end)
+
   t.it("target platform changes do not redirect another live process", function()
     local root = tmpdir()
     local engine = root .. "/engine"

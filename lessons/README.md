@@ -1,7 +1,7 @@
 # Lessons · 平台怪癖与调试硬知识
 
 > **lessons/** 区：付出过真实调试成本的陷阱与硬知识。
-> 出处优先：权威踩坑清单在 `docs/CONSTRAINTS.md §二（踩过的坑 K1–K51）`，
+> 出处优先：权威踩坑清单在 `docs/CONSTRAINTS.md §二（踩过的坑）`，
 > 本文件是**主题导航**，按领域聚合指回出处，不复制原文。
 
 ## 什么属于这里 / 不属于这里
@@ -11,6 +11,26 @@
   禁止项/版本钉死（→ `../docs/CONSTRAINTS.md §一/§三`）。
 
 ## 按领域导航（权威在 CONSTRAINTS §二）
+
+### C++ diagnostic compatibility (K74)
+
+DefaultError 不能直接归因于全局 `-Werror`。用真实 TU 和完整索引记录验证有界兼容策略，
+并将缺失源码单独处置；命令中的同名路径也可能是选项操作数。
+→ [完整索引与诊断证据](../docs/cpp-index-restart-investigation.md)；`../docs/CONSTRAINTS.md §二 K74`。
+
+版本选择以 A/B 正确性、性能与兼容成本为依据，合格候选中优先较新者，不强求 latest。
+NDK 成功构建与 clangd 新增 Wall 诊断可以并存；按实际 driver/version/target 处理具体组，
+保留全局 Werror。`unused-variable` 不是 `unused-but-set-variable` 的父组，必须核对
+官方组定义并做原生对照。旧实验不替代当前判断。
+→ [23.1.1 与旧 NDK 验证](../docs/cpp-index-restart-investigation.md)；
+`../lua/workarounds/clangd/legacy_android_warnings.lua`。
+
+### Prepared database and live runtime agreement
+
+磁盘正常实现通过测试，不能证明活实例已摆脱旧实验参数；需记录实际spawn argv。
+相同完整CDB的跨文件重排也不能重启索引，同文件多command的顺序则必须保留。
+→ [实际argv与重排修复证据](../docs/cpp-index-restart-investigation.md)；
+`../lua/ue/index/_publish.lua`。
 
 ### C++ entity-kind verification (K73)
 
@@ -171,6 +191,11 @@ state 分支（K59；pid 守卫 + 不从 last-session 回落包名）——但�
 「`invalidate_status_cache` 有关」/「K59 已修好用户看到的症状」三条假设均被实测证伪。
 → `../docs/CONSTRAINTS.md §二 K59 / K61`；
   `../openspec/specs/multi-instance-state-isolation/spec.md`「state-setting 命令 SHALL 以回读为凭报告成败」
+
+独立字段写入后再争写共享 revision nonce，仍会发生 Windows 原子替换竞争；无 reader
+也能复现，固定即时重试未解决。缓存签名须与 state 来自同一次权威字节采样，避免
+“旧 state 配新 token”漏掉并发更新。参见 K43 补充和
+[共享状态调查](../docs/cpp-index-restart-investigation.md)。
 
 ## 新增一条教训
 

@@ -29,13 +29,27 @@
 
 ### Requirement: 基础能力固定，扩展能力显式且可缺失
 
-每个宿主驱动 SHALL 提供稳定的基础能力集合：`shell`、`shell_entry`、`path_sep`、`list_sep`、`exe_suffix`、`open_path`、`reveal_file`、`default_clangd_candidates`、`python_candidates`、`default_lldb_dap_paths`、`default_lldb_server_paths`、`cmd_quote`、`host_path`、`default_target`、`launch_process_plan`、`follow_file_plan`、`ue_build_entry` 与 `ue_uat_entry`。宿主专属能力 MAY 以可选方法形式存在；当能力不存在时，系统 SHALL fail closed，并 MUST NOT 伪造一个看似可用但语义不同的替代实现。
+每个宿主驱动 SHALL 提供稳定的基础能力集合：`shell`、`shell_entry`、`path_sep`、`list_sep`、`exe_suffix`、`open_path`、`reveal_file`、`default_clangd_candidates`、`python_candidates`、`default_lldb_dap_paths`、`default_lldb_server_paths`、`cmd_quote`、`host_path`、`environment_key`、`directory_symlink_options`、`default_target`、`launch_process_plan`、`follow_file_plan`、`ue_build_entry` 与 `ue_uat_entry`。宿主专属能力 MAY 以可选方法形式存在；当能力不存在时，系统 SHALL fail closed，并 MUST NOT 伪造一个看似可用但语义不同的替代实现。
+
+#### Scenario: Compiler environment and directory-link behavior follow the host driver
+
+- **WHEN** a caller compares process environment names or probes a directory link
+- **THEN** it SHALL obtain name normalization and native symlink options from the host driver
+- **AND** Windows environment keys SHALL compare case-insensitively, while POSIX keys retain case
+- **AND** directory symlink options SHALL select Windows junction behavior only on the Windows driver; macOS, Linux and stub SHALL retain ordinary directory-link options
+- **AND** generic callers MUST NOT implement these differences with independent OS probes or compatibility-boolean branches
 
 #### Scenario: macOS 暴露宿主专属能力，Linux 不暴露
 
 - **WHEN** 调用方查询 `xcrun_entry`、`security_entry` 或 `plutil_entry`
 - **THEN** macOS 驱动 SHALL 提供这些能力
 - **AND** Linux 与 Windows 驱动 MUST NOT 伪装同名能力来冒充可用
+
+#### Scenario: Windows exposes native content-event watching
+- **WHEN** UE source watching selects the Windows driver
+- **THEN** it SHALL obtain the optional content-event watcher through that driver, with native filename/directory/size/last-write notification filtering
+- **AND** the helper SHALL reuse the existing Python runtime, wait for native events without main-thread polling, and terminate when its captured editor process exits
+- **AND** other hosts SHALL retain their existing libuv watcher; generic source logic MUST NOT perform a new OS probe
 
 #### Scenario: 缺失能力直接失败，不静默降级
 

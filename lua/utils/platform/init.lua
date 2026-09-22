@@ -52,6 +52,8 @@ M.is_linux   = M.id == "linux"
 ---@field allows_osc52 fun(): boolean
 ---@field code_search_install_hint fun(config_root: string): string
 ---@field path_key fun(path: string): string
+---@field environment_key fun(name: string): string
+---@field directory_symlink_options fun(): table
 ---@field query_driver_globs fun(): string[]
 ---@field cdb_compiler_candidates fun(): string[]
 ---@field lldb_python_relative_paths fun(): string[]
@@ -67,6 +69,7 @@ M.is_linux   = M.id == "linux"
 ---@field plutil_entry? fun(): string|table|nil, string|nil macOS-only capability
 ---@field folder_picker_plan? fun(prompt?: string): table macOS-only native folder chooser
 ---@field build_process_snapshot_plan? fun(root_pid?: integer): table macOS-only process-tree heartbeat snapshot
+---@field content_event_watcher? fun(): table|nil, string|nil Windows-only native source watcher
 ---@field powershell_entry? fun(): string|table|nil, string|nil legacy Windows-only compatibility alias
 ---@field mixed_eol_guard? fun(): boolean Windows-only fileformat capability
 ---@field treesitter_compiler_bin? fun(): string Windows-only parser compiler path

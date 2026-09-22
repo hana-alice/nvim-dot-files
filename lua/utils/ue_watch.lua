@@ -52,13 +52,14 @@
 --                              shader_filelist, debounce_ms }
 --   M.stop()
 --   M.status()      - returns { running, pending_adds, pending_dels,
---                               last_event_at, watch_root }
+--                               last_event_at, watch_root, watch_mode }
 -- ----------------------------------------------------------------------------
 
 local uv = vim.uv or vim.loop
 local M = {}
 local file_lock = require("ue.file_lock")
 local dirty_save = require("utils.dirty_save")
+local native_watch = require("utils.ue_watch_native")
 
 -- Defined later via assignment so earlier closures bind this local rather than a
 -- shadowing declaration (an undeclared name would instead resolve as a global).
@@ -171,6 +172,7 @@ end
 -- LAST_WRITE is older/equal, the reported event did not introduce content
 -- after that index. Missing evidence stays conservative and records the file.
 local function should_track_existing_event(file_stat, events, index_mtime)
+  if events and events.native then return true end
   if not events or events.rename or not events.change then return true end
   if not index_mtime then return true end
   local after = mtime_is_after(file_stat, index_mtime)
@@ -344,6 +346,11 @@ local function flush()
 
   log_info(("flush: +%d -%d"):format(#adds, #dels))
 
+  local on_source_changed = state.opts and state.opts.on_source_changed
+  if type(on_source_changed) == "function" then
+    for _, paths in ipairs({ adds, dels }) do for _, path in ipairs(paths) do
+      if classify(path) == "code" then on_source_changed(path) end end end
+  end
   -- Fan out. Order: CDB first (so clangd has the file before csearch hits
   -- might race-trigger a goto), then csearch (record-only no-op — see D9),
   -- then gtags shaders.
@@ -431,14 +438,15 @@ function M.start(opts)
 
   state.opts = vim.tbl_extend("force", { debounce_ms = 1500 }, opts)
   state.ignored_preindex_changes = 0
-  refresh_csearch_index_mtime()
-  state.handle = uv.new_fs_event()
+  native_watch.reset(); refresh_csearch_index_mtime(); state.timer = uv.new_timer()
+  local native = native_watch.start(opts.root, opts, vim.schedule_wrap(owned_callback(on_event))); if native then
+    state.handle = native; log_info("watching " .. opts.root .. " (native content events)"); return true end
+  state.handle = uv.new_fs_event(); native_watch.set_fallback()
   if not state.handle then
     log_warn("start: uv.new_fs_event() returned nil")
+    M.stop()
     return false
   end
-  state.timer = uv.new_timer()
-
   -- recursive=true is a no-op on Linux but mandatory on Windows (UE tree
   -- has thousands of subdirs; one watch per subdir would exhaust handles).
   local ok, start_err = pcall(state.handle.start, state.handle, opts.root, {
@@ -451,7 +459,7 @@ function M.start(opts)
     M.stop()
     return false
   end
-  log_info("watching " .. opts.root)
+  log_info("watching " .. opts.root .. " (libuv)")
   return true
 end
 
@@ -463,10 +471,10 @@ function M.stop()
     state.timer = nil
   end
   if state.handle then
-    state.handle:stop()
-    state.handle:close()
+    pcall(state.handle.stop, state.handle); pcall(state.handle.close, state.handle)
     state.handle = nil
   end
+  native_watch.stop()
   -- Preserve unflushed edits in the outgoing bucket without invoking providers
   -- that resolve the now-current UE selection. Retry closures retain this owner.
   local adds = {}
@@ -483,14 +491,16 @@ function M.status()
     for _ in pairs(t) do n = n + 1 end
     return n
   end
-  return {
-    running = state.handle ~= nil,
+  local status = {
+    running = state.handle ~= nil and (state.handle.phase == nil or state.handle.phase == "starting"
+      or state.handle.phase == "running"),
     pending_adds = count(state.pending_add),
     pending_dels = count(state.pending_del),
     last_event_at = state.last_event_at,
     watch_root = state.opts and state.opts.root or nil,
     ignored_preindex_changes = state.ignored_preindex_changes,
   }
+  return vim.tbl_extend("force", status, native_watch.status())
 end
 
 function M.flush_now()
@@ -771,6 +781,7 @@ end
 M._provider_csearch_add_for_test = provider_csearch_add
 M._set_opts_for_test = function(opts) state.opts = opts end
 
+M._set_content_watcher_for_test = native_watch.set_for_test
 -- Test seam: seed the in-memory persistent dirty set without a real fs_event,
 -- so D-3b tests can verify clear_persistent_dirty zeroes it. Marks it loaded so
 -- a later count read doesn't lazy-load over the top.
@@ -779,7 +790,6 @@ M._seed_persistent_dirty_for_test = function(paths)
   state.persistent_dirty = {}
   for _, p in ipairs(paths or {}) do state.persistent_dirty[tostring(p):lower()] = p end
 end
-
 -- Test seam (F2): run the save path (cap trim + capped flag) on the current
 -- in-memory set without needing a real dirty_json_path write target.
 M._save_persistent_dirty_for_test = function()

@@ -1040,26 +1040,309 @@ t.describe("启动提示不得触发 hit-enter（每次启动都要按 Enter）"
   end)
 end)
 
-t.describe("索引进度不得误报 per-file 数量为待索引单元", function()
-  -- 用户看到右下角 "16178"，据此认为 super-unity 没生效。实际上：
-  --   [input] 16178 per-file entries        ← 给 LSP 的 CDB（每文件一条编译命令）
-  --   Super-unity TUs created: 9 (vs 429)   ← 真正交给 clangd-indexer 的工作量（47.7x 压缩）
-  -- 这两个是不同产物；把前者原样转发到进度条会让人以为要索引 16k 个单元。
-  t.it("per-file 计数被改写为不会误读的措辞", function()
-    local src = table.concat(vim.fn.readfile(
-      vim.fn.stdpath("config") .. "/lua/ue/index/_build.lua"), "\n")
-    t.assert_match(src, "LSP compile entries",
-      "per-file 计数必须标注用途，不能裸报数字")
-    t.assert_match(src, "super%-unity", "应说明索引走 super-unity TU")
+t.describe("索引进度区分输入与生成器实测工作量", function()
+  local index = require("ue.index")
+
+  t.it("读入 per-file CDB 时不预先声称 Unity 已生效", function()
+    t.assert_eq(index.build_progress_line("[input] 16541 per-file entries"),
+      "input: 16541 source entries")
+    t.assert_eq(index.build_progress_line("[hot-super] input: 2622 per-file TUs"),
+      "input: 2622 source entries")
   end)
 
-  t.it("只转发真正表示进度的行（不再逐行 forward 子进程输出）", function()
-    local src = table.concat(vim.fn.readfile(
-      vim.fn.stdpath("config") .. "/lua/ue/index/_build.lua"), "\n")
-    local body = src:match("local function progress_line%(line%)(.-)\n  end")
-    t.assert_type(body, "string", "未找到 progress_line 过滤器")
-    -- 源码里的模式本身是转义过的（"^%[indexer%]"），断言需匹配这个字面形式。
-    t.assert_true(body:find("indexer", 1, true) ~= nil, "indexer 进度应转发")
-    t.assert_match(body, "return nil", "其余输出应留在日志而非进度条")
+  t.it("零 Unity 时如实显示全部 exact TU", function()
+    t.assert_eq(index.build_progress_line(
+      "[hot-super] active unity root evidence: 28548; proven groups: 0; grouped sources: 0; exact per-file fallback: 16541"),
+      "controlled: 16541 TUs (0 Unity, 16541 exact); 16541 source entries")
+  end)
+
+  t.it("混合 workload 由 proven groups 与 exact fallback 实测计算", function()
+    t.assert_eq(index.build_progress_line(
+      "[hot-super] active unity root evidence: 23; proven groups: 2; grouped sources: 20; exact per-file fallback: 3"),
+      "controlled: 5 TUs (2 Unity, 3 exact); 23 source entries")
+  end)
+
+  t.it("保留阶段进展且不把路径和内部计数转发到进度", function()
+    t.assert_eq(index.build_progress_line("[3/3] build controlled BackgroundIndex CDB from active commands"),
+      "[3/3] build controlled BackgroundIndex CDB from active commands")
+    t.assert_eq(index.build_progress_line("[indexer] processed 9 TUs"), "[indexer] processed 9 TUs")
+    t.assert_nil(index.build_progress_line("[hot-super] wrote: C:/fixture/compile_commands.json"))
+    t.assert_nil(index.build_progress_line("[hot-super] background TUs: 5 (compression 4.6x)"),
+      "the following total-only line must not overwrite the Unity/exact breakdown")
+  end)
+end)
+
+t.describe("受控 CDB 相同标准字段不触碰发布文件", function()
+  require("ue") -- Supplies the index module's ordinary read/write dependencies.
+  local index = require("ue.index")
+
+  local function write(path, content)
+    local handle = assert(io.open(path, "wb"))
+    handle:write(content)
+    handle:close()
+  end
+
+  local function read(path)
+    local handle = assert(io.open(path, "rb"))
+    local content = handle:read("*a")
+    handle:close()
+    return content
+  end
+
+  local function with_fixture(run)
+    local root = vim.fs.normalize(vim.fn.tempname()) .. "_publish_cdb"
+    vim.fn.mkdir(root, "p")
+    local ctx = {
+      engine_root = root,
+      paths = { active_cdb = root .. "/active.json", semantic_cdb = root .. "/published.json" },
+    }
+    local phase = root .. "/phase.json"
+    local entry = {
+      directory = "C:/fixture", file = "A.cpp", output = "A.o",
+      arguments = { "clang++", "-DFIRST=1", "-DSECOND=2", "A.cpp" },
+      nvim_ue_members = { "A.cpp" }, nvim_ue_module_root = "Source/A",
+    }
+    write(ctx.paths.active_cdb, vim.json.encode({ entry }))
+    write(phase, vim.json.encode({ entry }))
+    local state = { index_artifacts = { current = { generation_id = "test-generation", background_cdb_path = phase } } }
+    local generation = { generation_id = "test-generation" }
+    local ok, err = pcall(run, ctx, state, generation, phase, entry)
+    vim.fn.delete(root, "rf")
+    if not ok then error(err) end
+  end
+
+  local function pin_old_mtime(path)
+    assert(vim.uv.fs_utime(path, 1000000000, 1000000000))
+    return assert(vim.uv.fs_stat(path)).mtime
+  end
+
+  t.it("unchanged publication skips JSON reads while disk/generation/context changes revalidate", function()
+    with_fixture(function(ctx, state, generation, phase, entry)
+      local reads = 0
+      local isolated = {
+        base_compile_commands_path = index.base_compile_commands_path,
+        normalize_cdb_file = index.normalize_cdb_file,
+      }
+      local runtime = {}
+      require("ue.index._publish")(isolated, {
+        RT = runtime,
+        h = { file_signature = function(path)
+          local stat = path and vim.uv.fs_stat(path)
+          if not stat then return "missing" end
+          return ("%s:%s:%s"):format(stat.size, stat.mtime.sec, stat.mtime.nsec)
+        end },
+        deps = {
+          read_all = function(path) reads = reads + 1; return read(path) end,
+          write_all = function(path, content) write(path, content); return true end,
+        },
+      })
+      local artifact = state.index_artifacts.current
+      artifact.background_cdb_hash = vim.fn.sha256(read(phase))
+      t.assert_true(isolated.publish_semantic_cdb(ctx, state, generation))
+      t.assert_true(reads > 0, "the initial publication must load and verify phase bytes")
+      reads = 0
+      local ok, reused = isolated.publish_semantic_cdb(ctx, state, generation)
+      t.assert_true(ok)
+      t.assert_false(reused.changed)
+      t.assert_eq(reused.entry_count, 1)
+      t.assert_eq(reads, 0, "a repeated successful key must not reread either phase or published JSON")
+      t.assert_true(#vim.json.encode(runtime.publication_cache) < 2000,
+        "the runtime cache must retain only signatures/counts, not compile commands")
+
+      artifact.background_cdb_hash = string.rep("0", 64)
+      t.assert_false(isolated.publish_semantic_cdb(ctx, state, generation),
+        "changed manifest evidence must be revalidated even when files are unchanged")
+      t.assert_true(reads > 0)
+      artifact.background_cdb_hash = vim.fn.sha256(read(phase))
+
+      entry.arguments[2] = "-DNEW_PHASE=1"
+      write(phase, vim.json.encode({ entry }))
+      reads = 0
+      t.assert_false(isolated.publish_semantic_cdb(ctx, state, generation),
+        "changed phase bytes cannot bypass their successful manifest hash")
+      t.assert_true(reads > 0)
+      artifact.background_cdb_hash = vim.fn.sha256(read(phase))
+      t.assert_true(isolated.publish_semantic_cdb(ctx, state, generation))
+
+      write(ctx.paths.semantic_cdb, "[]")
+      reads = 0
+      local repaired, changed = isolated.publish_semantic_cdb(ctx, state, generation)
+      t.assert_true(repaired)
+      t.assert_true(changed.changed, "a modified published view must be repaired")
+      t.assert_true(reads > 0)
+
+      generation.generation_id = "next-generation"
+      artifact.generation_id = generation.generation_id
+      reads = 0
+      t.assert_true(isolated.publish_semantic_cdb(ctx, state, generation))
+      t.assert_true(reads > 0, "another generation must take the verified content path")
+      ctx.project_root = ctx.engine_root .. "/another-project"
+      reads = 0
+      t.assert_true(isolated.publish_semantic_cdb(ctx, state, generation))
+      t.assert_true(reads > 0, "different context must not inherit a cached validation")
+      local next_ctx = vim.deepcopy(ctx)
+      next_ctx.paths.semantic_cdb = ctx.engine_root .. "/other-published.json"
+      reads = 0
+      t.assert_true(isolated.publish_semantic_cdb(next_ctx, state, generation))
+      t.assert_true(reads > 0, "a different published path must be validated and written")
+      assert(os.remove(ctx.paths.active_cdb))
+      t.assert_false(isolated.publish_semantic_cdb(next_ctx, state, generation),
+        "an existing cache cannot hide a missing active database")
+    end)
+  end)
+
+  t.it("failed phase replacement cannot publish new bytes under an old successful manifest", function()
+    with_fixture(function(ctx, state, generation, phase, entry)
+      state.index_artifacts.current.background_cdb_hash = vim.fn.sha256(read(phase))
+      t.assert_true(index.publish_semantic_cdb(ctx, state, generation))
+      local original, before = read(ctx.paths.semantic_cdb), pin_old_mtime(ctx.paths.semantic_cdb)
+      entry.arguments[2] = "-DBROKEN_PHASE=1"
+      write(phase, vim.json.encode({ entry }))
+      local ok, err = index.publish_semantic_cdb(ctx, state, generation)
+      t.assert_false(ok)
+      t.assert_contains(err, "successful manifest")
+      t.assert_eq(read(ctx.paths.semantic_cdb), original)
+      t.assert_true(vim.deep_equal(vim.uv.fs_stat(ctx.paths.semantic_cdb).mtime, before))
+    end)
+  end)
+
+  t.it("同值 JSON 即使 key 顺序和空白不同也保留原 bytes/mtime", function()
+    with_fixture(function(ctx, state, generation)
+      local original = '[\n {"output":"A.o","file":"A.cpp","arguments":["clang++","-DFIRST=1","-DSECOND=2","A.cpp"],"directory":"C:/fixture"}\n]\n'
+      write(ctx.paths.semantic_cdb, original)
+      local before = pin_old_mtime(ctx.paths.semantic_cdb)
+      for _ = 1, 2 do
+        local ok, result = index.publish_semantic_cdb(ctx, state, generation)
+        t.assert_true(ok)
+        t.assert_false(result.changed)
+        t.assert_eq(result.entry_count, 1)
+        t.assert_eq(read(ctx.paths.semantic_cdb), original)
+        t.assert_true(vim.deep_equal(vim.uv.fs_stat(ctx.paths.semantic_cdb).mtime, before))
+      end
+    end)
+  end)
+
+  t.it("exact argv 顺序变更会发布；随后相同输入再次复用", function()
+    with_fixture(function(ctx, state, generation, phase, entry)
+      local ok, initial = index.publish_semantic_cdb(ctx, state, generation)
+      t.assert_true(ok)
+      t.assert_true(initial.changed)
+      local before = pin_old_mtime(ctx.paths.semantic_cdb)
+      entry.arguments[2], entry.arguments[3] = entry.arguments[3], entry.arguments[2]
+      write(phase, vim.json.encode({ entry }))
+      local updated, result = index.publish_semantic_cdb(ctx, state, generation)
+      t.assert_true(updated)
+      t.assert_true(result.changed, "semantic argument order is part of the command")
+      t.assert_false(vim.deep_equal(vim.uv.fs_stat(ctx.paths.semantic_cdb).mtime, before))
+      t.assert_eq(vim.json.decode(read(ctx.paths.semantic_cdb))[1].arguments[2], "-DSECOND=2")
+      local stable_bytes = read(ctx.paths.semantic_cdb)
+      local stable_mtime = pin_old_mtime(ctx.paths.semantic_cdb)
+      local reused, unchanged = index.publish_semantic_cdb(ctx, state, generation)
+      t.assert_true(reused)
+      t.assert_false(unchanged.changed)
+      t.assert_eq(read(ctx.paths.semantic_cdb), stable_bytes)
+      t.assert_true(vim.deep_equal(vim.uv.fs_stat(ctx.paths.semantic_cdb).mtime, stable_mtime))
+    end)
+  end)
+
+  t.it("仅内部 metadata 变化不重写；已有非法字段仍必须清除", function()
+    with_fixture(function(ctx, state, generation, phase, entry)
+      t.assert_true(index.publish_semantic_cdb(ctx, state, generation))
+      local before = pin_old_mtime(ctx.paths.semantic_cdb)
+      entry.nvim_ue_members = { "A.cpp", "B.cpp" }
+      write(phase, vim.json.encode({ entry }))
+      local ok, result = index.publish_semantic_cdb(ctx, state, generation)
+      t.assert_true(ok)
+      t.assert_false(result.changed)
+      t.assert_true(vim.deep_equal(vim.uv.fs_stat(ctx.paths.semantic_cdb).mtime, before))
+      write(ctx.paths.semantic_cdb, vim.json.encode({ entry }))
+      local repaired, changed = index.publish_semantic_cdb(ctx, state, generation)
+      t.assert_true(repaired)
+      t.assert_true(changed.changed)
+      t.assert_nil(vim.json.decode(read(ctx.paths.semantic_cdb))[1].nvim_ue_members)
+    end)
+  end)
+
+  t.it("phase fingerprint 晋升但发布内容相同不重启，真实变更仍请求重启", function()
+    with_fixture(function(ctx, _, _, phase_path, entry)
+      ctx.project_root = ctx.engine_root
+      for _, name in ipairs({ "index_dir", "index_cdb_dir", "active_index_dir" }) do
+        ctx.paths[name] = ctx.engine_root
+      end
+      ctx.paths.platform_key = "test"
+      ctx.paths.index_state = ctx.engine_root .. "/state.json"
+      ctx.paths.index_queue = ctx.engine_root .. "/queue.json"
+      ctx.paths.index_full_cdb = ctx.engine_root .. "/full-input.json"
+      ctx.paths.full_index = ctx.engine_root .. "/full.idx"
+      ctx.paths.current_index = ctx.engine_root .. "/current.idx"
+      ctx.paths.semantic_full_cdb = ctx.engine_root .. "/full.json"
+      local saved = {
+        system = vim.system, restart = index.maybe_restart_clangd_for_index,
+        queued = index.try_start_queued_build, publish = index.publish_semantic_cdb,
+        toolchain = index._rt.toolchain_identity_override, job = index._rt.job,
+      }
+      local root_key = ctx.engine_root .. "\31" .. ctx.project_root .. "\31test"
+      local ok, err = pcall(function()
+        index._rt.toolchain_identity_override = "fixture-compiler"
+        index._rt.job = nil
+        local state = index.ensure_index_state(ctx)
+        state.modules = {
+          A = { key = "A", name = "A", tier = "core" },
+          B = { key = "B", name = "B", tier = "core" },
+        }
+        write(ctx.paths.current_index, "current-marker")
+        local current = index.make_index_manifest(ctx, state, "current", ctx.paths.current_index, { "A" }, {
+          base_cdb_path = ctx.paths.active_cdb, background_cdb_path = phase_path,
+        })
+        state.index_artifacts = { current = current }
+        local generation = index.generation_for_context(ctx)
+        index.update_index_selection(state, current, generation, "fresh")
+        t.assert_true(index.publish_semantic_cdb(ctx, state, generation))
+        local initial_bytes = read(ctx.paths.semantic_cdb)
+        local restarts, marker, pending = 0, "full-marker", nil
+        index.maybe_restart_clangd_for_index = function() restarts = restarts + 1 end
+        index.try_start_queued_build = function() end
+        vim.system = function(command, _, callback)
+          t.assert_contains(command[2], "build_full_cdb.py")
+          write(ctx.paths.full_index, marker)
+          write(ctx.paths.semantic_full_cdb, vim.json.encode({ entry }))
+          pending = callback
+          return {}
+        end
+        local function build()
+          t.assert_true(index.build_phase_async(ctx, "full"))
+          t.assert_type(pending, "function")
+          pending({ code = 0, stdout = "", stderr = "" })
+          t.assert_true(vim.wait(1000, function() return index._rt.job == nil end, 10))
+          t.assert_eq(state.build.status, "ready")
+        end
+
+        build()
+        t.assert_eq(state.index_selection.phase, "full")
+        t.assert_true(state.index_selection.artifact_fingerprint ~= current.artifact_fingerprint)
+        t.assert_eq(read(ctx.paths.semantic_cdb), initial_bytes)
+        t.assert_eq(restarts, 0, "phase promotion alone must not interrupt the same published workload")
+
+        state.index_artifacts.current = nil
+        entry.arguments[2] = "-DCHANGED=1"
+        build()
+        t.assert_eq(restarts, 1, "a changed selected workload must retain the restart path")
+
+        index.publish_semantic_cdb = function() return true end
+        marker = "another-full-marker"
+        build()
+        t.assert_eq(restarts, 2, "legacy publisher stubs without changed retain the previous behavior")
+        build()
+        t.assert_eq(restarts, 2, "unchanged selection must not request a restart")
+      end)
+      vim.system = saved.system
+      index.maybe_restart_clangd_for_index = saved.restart
+      index.try_start_queued_build = saved.queued
+      index.publish_semantic_cdb = saved.publish
+      index._rt.toolchain_identity_override = saved.toolchain
+      index._rt.job = saved.job
+      index._rt.module_state[root_key], index._rt.contexts[root_key] = nil, nil
+      if not ok then error(err) end
+    end)
   end)
 end)

@@ -101,7 +101,14 @@ load-bearing on this device (K37); `UE_DAP_NO_SLIDE=1` skips it for re-verificat
 
 ## clangd / clang / libclang (C++ LSP + semantic sidecar)
 
-- **Required**: LLVM **22.1.x** (22.1.5 verified)
+- **Selection rule**: prefer the newer candidate among versions that pass A/B
+  correctness, performance and compatibility checks; following upstream latest
+  is not required. **23.1.1** is an isolated candidate tested on Windows on
+  2026-09-22, not an automatic upgrade directive. Current production remains
+  **22.1.5**: the 23.1.1 full A/B run found unported template-proof and query-driver
+  verification interfaces. Preflight accepts 22.1.x; individual workarounds retain
+  their own tested-version guards. This is a repository integration gap, not proof
+  that the newer compiler is incorrect.
 - **Source** (Windows): `winget install LLVM.LLVM`
 - **Source** (macOS): `brew install llvm@22`; if the Homebrew bottle registry is
   unavailable, install the official macOS ARM64 release under
@@ -110,16 +117,27 @@ load-bearing on this device (K37); `UE_DAP_NO_SLIDE=1` skips it for re-verificat
 - Used by: clangd controlled BackgroundIndex, exact-command transport, libclang
   canonical-USR sidecar, and the on-demand cursor-walk C ABI shim.
 
-Do **not** downgrade clang/clangd/libclang to 21.x — controlled BackgroundIndex,
-the official `compilationDatabaseChanges` transport, and the libclang/shim ABI
-are verified as one LLVM 22.x toolchain identity.
+Select a side-by-side installation through `UE_CLANGD` (highest priority), then
+`ue.config.clangd.candidates_extra`, then host defaults. Keep clangd, sibling
+libclang and the cursor shim on the same toolchain; do not downgrade to 21.x.
+Changing `UE_CLANGD` does not change the separately selected DAP adapter.
+Official release authority: [LLVM releases](https://github.com/llvm/llvm-project/releases/latest).
+The standalone clangd release repository may publish later than LLVM.
 
-On macOS, the Xcode-provided Apple clangd is not a substitute for the pinned
+The NDK build compiler remains the compiler named by the successful build.
+clangd embeds its own parser; `--query-driver` obtains target/include configuration,
+not the NDK parser. New diagnostics use only documented group-specific compatibility
+flags in the prepare transaction, retaining warnings and global `-Werror`.
+See [the upgrade evidence](cpp-index-restart-investigation.md) and
+`lua/workarounds/clangd/legacy_android_warnings.lua` before changing this policy.
+
+On macOS, the Xcode-provided Apple clangd is not a substitute for the selected
 LLVM build. The IOS-target `:UEPrepare` branch on macOS checks `clangd --version`
 before generating Apple semantic evidence and accepts only 22.1.x; Tree-sitter
 highlighting remains available when that compiler-semantic gate is not met.
 Nvim checks the user-local versioned
 install first, then the Apple Silicon and Intel Homebrew `llvm@22` kegs.
+The 23.1.1 field checks described here were on Windows, not macOS/iOS.
 
 ## macOS host and iOS application workflow
 

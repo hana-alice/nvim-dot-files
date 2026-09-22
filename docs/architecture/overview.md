@@ -8,7 +8,8 @@
 ## 0. 一句话
 
 把一个万级 cpp 文件的 UE5 工程，塞进一个 24 小时跑、无人值守也不静默挂的 Neovim 开发环境：
-3 分钟全量索引、亚 100ms goto-definition、一键 Android headless DAP、错误全落盘。
+以快速完整索引、低延迟 goto-definition、一键 Android headless DAP、错误全落盘为目标。
+索引耗时必须按真实 build、覆盖与缓存状态实测，不能沿用历史小队列的时间承诺。
 
 ## 1. 主要子系统（major subsystems）
 
@@ -37,11 +38,26 @@
 - **独立搜索构建**：`:UEBuildCsearch` → `ue/csearch_build.lua` → 新文件清单 → csearch reset。
   facade 提供现有扫描/过滤与 writer 接口；独立 owner 持有异步生命周期、输入快照与失败清理，
   不进入 UBT、CDB、GTAGS 或 clangd 准备阶段。
-- **索引/CDB**：`:UEPrepare` → UBT `-SkipBuild` 取编译参数 → `ue/cdb/*` 生成/裁剪/inject
-  compile_commands.json → cindex 建 csearch 索引 → clangd reload。UE root 的 clangd LSP 使用持久化 artifact
+- **索引/CDB**：`:UEPrepare` → 读取现有 RSP（Apple capability 生成 tuple-scoped semantic source）→
+  `ue/cdb/transaction` 暂存生成、pipeline、partition，最终有变化才发布 compile_commands.json →
+  cindex 建 csearch 索引 → 按变化刷新 clangd。UE root 的 clangd LSP 使用持久化 artifact
   gate：当前 project/target/platform/configuration 的 selection、manifest、controlled CDB 与源 CDB 签名
   仍有效时，新 Neovim 直接复用并启动；仅工件缺失、stale 或 tuple 变化时等待下一次 `:UEPrepare`。
   非 UE C++ root 不经过该 gate。全程 async + 进度 UI。
+  二次批次由独立原 TU 完整图证明，冻结输入与 receipt 绑定；原 semantic CDB 继续负责 native
+  definition，冻结 BackgroundIndex 使用独立目录与缓存。先监听再异步验证才可启用；输入变化
+  立即撤销 references/rename epoch，并退回原 UBT 路径。详细契约见 `cpp-semantic-index-coverage`。
+  已接受的非连续分组可用有界提示定位，但仍经过完整证书验证与分组大小上限。current/hot 的
+  大 CDB 筛选由现有 Python 构建进程调用隔离 Neovim worker，复用原 Lua 模块分类；主线程只
+  交付小型选择请求。worker 校验 active 输入、编辑器/Python 存活及 build lease，原子发布子集；
+  规范化与注入仍只操作子集，不修改 active CDB。direct scope 优先；对不可能匹配所选模块根末段的
+  普通 Unity 名称，跳过递归 fallback 查找。不规则名称/未知 key 保留原发现，同名根优先级不变。
+  自动交付只复用有效证明，不启动冷证明；未认证的 query-driver profile 保持原 UBT 路径。
+  认证使用实际 server profile、进程 cwd/environment 和原 TU 主 shard 的有效命令；驱动由原生
+  查询发现。源码/include 保持递归监听，驱动搜索候选及祖先用独立非递归监听，分轮安装后再重验。
+  profile 或环境变化撤销待启用批次；未知参数和不支持的宿主能力保持原 UBT 配置。
+  由 augmentation 实际新增并封存完整命令身份的 shader donor 保留在 active/semantic CDB，
+  使用既有 GTAGS 导航；两个后台视图都按来源证明排除它们，不按扩展名猜测删除。
 - **宿主资源**：`UIEnter` 启动唯一 CPU sampler（host 1Hz、Neovim process 4Hz）→
   `utils.host_admission` 用一份 85/70 双水位与 foreground registry 决定是否启动新 batch。
   workspace scan、ccjson、CDB pipeline/partition、GTAGS、csearch 与 controlled index 均在 process creation
@@ -222,12 +238,20 @@ matrix 声明与回归，不能在 generic orchestration 中添加 shell/path �
 
 - 外部工具链版本钉死见 `docs/CONSTRAINTS.md §三 C1`（clangd/LLVM 22.1.x、`lldb-dap`、
   NDK lldb-server、Neovim 0.10+）。
-- CDB 生成器（`tools/*.py` + `lua/ue/cdb/*`）：super-unity / prune / inject，写前比对跳过。
-- CDB mutation 由 `lua/ue/cdb/pipeline.lua` 进程内 slot + filesystem lease 双层串行化；
+- CDB 生成器（`tools/*.py` + `lua/ue/cdb/*`）：保留 compiler include/宏语义，默认不抽样裁剪、不自动注入 IntelliSense 宏。
+- `lua/ue/cdb/transaction.lua` 持 live writer lease；raw/pipeline/partition 只写工作副本，
+  `tools/cdb_transaction.py` 在子进程比对后发布差异，保留相同 provenance 与 manifests 的 bytes/mtime。
+  发布失败恢复旧产物；恢复失败保留并报告备份。手动 partition/switch 使用同一 writer lease。
+  工作副本放在监听根外，PCH recipe 使用原 logical CDB 路径且按内容提交，避免 Windows
+  文件通知缓冲被大文件暂存写入淹没。
+  `lua/ue/cdb/pipeline.lua` 仍以进程内 slot + filesystem lease 双层串行化工作副本；
   writer lease/第一步与后续 partition 均先经过通用 host admission，每个 Python phase 使用 argv 顺序启动，
   任一步失败即停止。UEPrepare 持有 project-scoped prepare
   lease 到 pipeline/partition 完成，controlled index phase 另持 project+platform build lease，
   禁止不同 Neovim 并发撕裂 JSON/csearch/index artifact。
+- `lua/ue/index/_source.lua` 对已观察的源码/头文件单独记录内容 revision；CDB 相同不等于
+  后台依赖未变。交付保留 shard 缓存，只刷新匹配 CDB 的客户端，新客户端实际附加后才确认
+  revision；节流/失败及重启期间的新修改继续排队。prepare bookkeeping 与相同源字节不触发重启。
 - csearch 索引：`tools/cindex-uefilter`（Go fork）`-files-from` 干净建索引。
 - Android SO-only（Windows host compatibility path）：`android_windows.lua` 通过 Windows-only
   `powershell_entry` 调用 `scripts/ue_android_so_build.ps1`，两阶段执行 UBT action graph；部署脚本先以

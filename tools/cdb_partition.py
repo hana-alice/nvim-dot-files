@@ -56,6 +56,8 @@ import sys
 import time
 from typing import Any
 
+from cdb_argv import split_command_line
+
 PLATFORMS = {
     "Win64", "Win32", "Linux", "LinuxAArch64", "Mac",
     "Android", "IOS", "TVOS", "HoloLens",
@@ -64,6 +66,48 @@ PLATFORMS = {
 KNOWN_CFG = {"Development", "Test", "Shipping", "DebugGame", "Debug"}
 
 PLAT_RE = re.compile(r"[Ii]ntermediate/[Bb]uild/([^/]+)/([^/]+)(?:/([^/]+))?")
+
+
+def _macro_configuration(args: list[str]) -> str | None:
+    """Read final direct -D/-U values, without evaluating macro expressions."""
+    names = {"UE_BUILD_" + cfg.upper() for cfg in KNOWN_CFG}
+    values: dict[str, str] = {}
+    index = 1  # argv[0] is the compiler, not an option.
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if arg == "--":
+            break
+        if arg.startswith(("@", "-Wp,")) or arg == "-Xclang":
+            return None  # An unexpanded/forwarded option may change these macros.
+        if not arg.startswith(("-D", "-U")):
+            continue
+        action, operand = arg[:2], arg[2:]
+        if not operand:
+            if index == len(args) or args[index].startswith("-"):
+                return None
+            operand = args[index]
+            index += 1
+        name, separator, value = operand.partition("=")
+        if name not in names:
+            if name.partition("(")[0] in names:
+                return None  # A function-like build macro is not a boolean flag.
+            continue
+        if action == "-U":
+            if separator:
+                return None
+            values.pop(name, None)
+        else:
+            values[name] = value if separator else "1"
+    if any(value not in {"0", "1"} for value in values.values()):
+        return None
+    enabled = [name for name, value in values.items() if value == "1"]
+    if len(enabled) != 1:
+        return None
+    # UBT uses UE_BUILD_DEVELOPMENT for both Development and DebugGame.
+    # UE_BUILD_DEBUGGAME is not a producer-backed unique configuration signal.
+    return {"UE_BUILD_DEBUG": "Debug", "UE_BUILD_SHIPPING": "Shipping",
+            "UE_BUILD_TEST": "Test"}.get(enabled[0])
 
 
 def _platform_canonical(name: str) -> str | None:
@@ -85,7 +129,9 @@ def classify(entry: dict[str, Any]) -> tuple[str | None, str | None, str | None]
     proj_votes: collections.Counter = collections.Counter()
     cfg_votes: collections.Counter = collections.Counter()
 
-    args = entry.get("arguments") or []
+    args = entry.get("arguments")
+    if not isinstance(args, list):
+        args = split_command_line(entry.get("command") or "", entry)
     for a in args:
         if "ntermediate" not in a:  # cheap pre-filter (case-insensitive 'I')
             continue
@@ -115,7 +161,7 @@ def classify(entry: dict[str, Any]) -> tuple[str | None, str | None, str | None]
 
     plat = plat_votes.most_common(1)[0][0] if plat_votes else None
     proj = proj_votes.most_common(1)[0][0] if proj_votes else None
-    cfg = cfg_votes.most_common(1)[0][0] if cfg_votes else None
+    cfg = cfg_votes.most_common(1)[0][0] if cfg_votes else _macro_configuration(args)
     return (plat, proj, cfg)
 
 

@@ -97,14 +97,14 @@ local function defaults()
       -- can override stdpath via XDG_CONFIG_HOME and still get the right
       -- path on the first read.
       tools_dir = function() return vim.fn.stdpath("config") .. "/tools" end,
-      -- Ordered pipeline. Removing or renaming a step lets the user skip
-      -- slow ones (e.g. drop `prune_include_dirs.py` on a small project).
+      -- Keep compiler include search paths. Sampled textual include pruning
+      -- cannot prove preprocessing equivalence for every TU in a module.
       steps = {
         "expand_response_cdb.py",
+        "clangd_diagnostic_compat.py",
         "prebuild_pch_v2.py",
         "resolve_cdb_paths.py",
         "unify_include_dirs.py",
-        "prune_include_dirs.py",
       },
     },
   }

@@ -17,6 +17,32 @@ Default to doing the work yourself with minimal interruption. Do not offload
 routine execution back to the user. Do not stop after editing code if the next
 natural step is to run, verify, or inspect the result.
 
+<a id="super-unity-performance-contract"></a>
+## 强制约束：SuperUnity 性能不得静默退化（所有 agent 必读，无需先读 spec）
+
+**SuperUnity 的实际压缩与快速索引是承重能力。不得静默删除、绕过、关闭或退化为普通
+UBT Unity / 逐文件全量索引，再以正确性修复、重构、跨平台支持或功能回归全绿宣称完成。**
+这条约束对所有 agent、所有执行模式和子任务都有效；本节是共用正文，不依赖 OpenSpec 工作流。
+下级规则、spec、技能或测试通过都不得视为豁免；只有用户明确调整此约束，才能改变这项验收底线。
+
+- **保住能力，不是名字**：旧能力包含将多个 Unity 进一步二次合并；脚本仍叫 `SuperUnity`、
+  只包装 UBT Unity、保留一个不再生效的参数，都不算保留了能力。替换机制必须证明等效性能。
+- **正确性与性能必须同时验收**：参数/宏/PCH 冲突不得靠强行合并隐藏；也不得把全量 exact
+  fallback 当作性能修复终点。必须修复兼容分组或实现经过真实工程验证的等效加速。
+  安全 fallback 可以暂时保住语义，但发生性能退化时任务仍是**未完成**，必须明确报告并继续处置。
+- **基线不可偷换**：必须对照最近可验证的正常实现；不得只拿已退化的万级逐文件状态作基线，
+  把部分恢复报成新优化或全部恢复。历史 13/23/42 等数字属于各自输入与路线，不可冒充当前保证。
+- **必须看实际产物与真实工程**：涉及 CDB、prepare、Unity 分组、索引发布/重启的改动，记录
+  相同 build 的源文件数、UBT Unity 数、二次合并数、exact fallback 数、shader 记录数、覆盖/缺失，
+  以及实际索引完成耗时与 CPU/内存影响；区分冷/热缓存、首次/重复 prepare。
+  CDB 条目数、clangd 队列分母、编译成功数与完成耗时不得混为一谈。
+- **完成门禁**：功能回归和少数跳转样例不能代替索引性能验收。输入不变不得无故重写产物、
+  重启 clangd 或反复全量索引；不得靠清缓存、漏源文件、缩小平台/模块覆盖或占满宿主制造好数字。
+  无法取得必要实测时，写明缺口，禁止宣称性能已恢复。
+
+历史教训与核对证据：[索引退化调查](docs/cpp-index-restart-investigation.md)。
+约束索引：[`docs/CONSTRAINTS.md` C11](docs/CONSTRAINTS.md#c11--superunity-性能保全)。
+
 ## Primary Behavior
 
 Prefer autonomous execution within the agent's permission model. Proceed directly

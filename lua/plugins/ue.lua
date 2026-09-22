@@ -28,11 +28,14 @@ return {
         -- nvim-lspconfig's legacy on_new_config hook is not available on this
         -- path, so build the project-scoped CDB argv from the resolved config.
         cmd = function(dispatchers, config)
-          local resolved_cmd = require("ue").clangd_cmd(config.root_dir)
+          config.cmd_cwd = config.cmd_cwd or (vim.uv or vim.loop).cwd()
+          config._ue_spawn_cwd = config.cmd_cwd
+          local resolved_cmd = require("ue.index.batch_runtime").configure_process(
+            require("ue").clangd_cmd(config.root_dir), config)
           config._ue_resolved_cmd = resolved_cmd
           local rpc = vim.lsp.rpc.start(resolved_cmd, dispatchers, {
             cwd = config.cmd_cwd,
-            env = config.cmd_env,
+            env = config._ue_batch_spawn_env or config.cmd_env,
             detached = config.detached,
           })
           -- Public RPC hides vim.SystemObj.pid. Bounded async discovery proves
@@ -44,13 +47,21 @@ return {
         end,
         root_dir = function(bufnr, on_dir)
           local root = require("ue").clangd_start_root(bufnr)
-          if root then on_dir(root) end
+          if root then
+            require("ue.index.batch_runtime").prepare(bufnr, root, on_dir, {
+              get_config = function()
+                local registered = type(vim.lsp.config) == "table" and vim.lsp.config.clangd
+                return type(registered) == "table" and registered or clangd
+              end,
+            })
+          end
         end,
         on_attach = function(client, bufnr)
           if type(inherited_on_attach) == "function" then
             inherited_on_attach(client, bufnr)
           end
           require("ue.clangd_commands").ensure(client, bufnr)
+          require("ue.index.batch_runtime").attach(client, bufnr)
         end,
         keys = {
           {

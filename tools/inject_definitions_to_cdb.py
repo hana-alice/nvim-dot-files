@@ -67,11 +67,11 @@ def parse_definitions_h(path, _seen=None):
                 if m:
                     name, val = m.group(1), m.group(2)
                     if val is None or val.strip() == '':
-                        args.append(f'-D{name}')
+                        args.append(f'-D{name}=')
                     else:
                         val = re.sub(r'/\*.*?\*/', '', val).strip()
                         val = re.sub(r'//.*$', '', val).strip()
-                        args.append(f'-D{name}={val}' if val else f'-D{name}')
+                        args.append(f'-D{name}={val}')
                     continue
                 m = RE_UNDEF.match(line)
                 if m:

@@ -8,11 +8,21 @@
 `json`（条目模板/program 提取）、`paths`（targets/candidates）、`shaders`（.usf/.ush 增广）、
 `pipeline`（slim/裁剪）、`header_inject` / `pch_fi_inject`（.h 反查 + force-include）、`shards`。
 
+`unity_origin` 将真实 RSP/nested RSP/unity membership 与初始命令绑定到外置 origin；pipeline 成功后
+由 Python receipt 工具封存最终命令。默认不做基于抽样的 include 裁剪，避免改变未采样 TU 的语义。
+`transaction` 在 live writer lease 内暂存 raw → pipeline → partition，最终内容变化才发布；
+同步 prepare 与手动 partition/switch 也必须遵守这一写入边界。
+
 ## 专属约定
+
+- **SuperUnity 性能保全**：修改 prepare/编译参数必须遵守
+  [根硬约束](../../../AGENTS.md#super-unity-performance-contract)（CONSTRAINTS C11）；
+  不得因参数变换使分组静默退回逐文件索引，仅凭功能回归通过就收尾。
 
 - **纯函数优先**：`template_entry` / `program` / `targets` / `augment` / `make_entry` 等是纯函数，
   有行为回归（`tests/cases/ue_cdb_spec.lua`）——改契约前先看断言。
 - **skip-if-unchanged 是硬约定**：任何生成/裁剪写盘前比对，未变更不写（保护 PCH / clangd cache）。→ C4.6
+- **不得自动注入 `__INTELLISENSE__`**：它会使 UE `UCLASS` 不展开 PROLOG，破坏生成的 event-parameter 类型；保留 RSP 中显式给出的宏，不得全局追加 `-U` 掩盖错误。
 - `.h` CDB inject 的双 donor 路径与 8 个坑见 `../../../docs/plans/2026-05-08-h-inject-cdb.md`（权威）。
 - 子进程调用走 `ue/core/proc` 与 platform 驱动，不直接拼 OS 专属命令。
 

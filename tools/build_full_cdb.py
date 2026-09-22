@@ -34,7 +34,7 @@ PIPELINE:
         (controlled background CDB) → clangd BackgroundIndex input
 
 USAGE:
-  python build_full_cdb.py <raw_perfile_cdb> <out_active> [--no-rsp] [--max-mods=50]
+  python build_full_cdb.py <raw_perfile_cdb> <out_active> [--no-rsp] [--max-mods=80]
                           [--idx-output <path>] [--indexer <path>] [--jobs N]
 
   When --idx-output is passed, after producing the sidecar this also runs
@@ -73,6 +73,7 @@ if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
 from cdb_argv import normalize_cdb
+from build_hot_super_unity_cdb import write_outputs_if_changed
 
 
 def run(cmd, **kw):
@@ -97,8 +98,17 @@ def atomic_write(dst, data, label=''):
     dst_dir = os.path.dirname(dst)
     if dst_dir:
         os.makedirs(dst_dir, exist_ok=True)
+    encoded = json.dumps(data).encode('utf-8')
+    try:
+        with open(dst, 'rb') as stream:
+            if stream.read() == encoded:
+                print(f'[done] unchanged {dst}')
+                return
+    except FileNotFoundError:
+        pass
     tmp = dst + '.tmp'
-    write_cdb(tmp, data)
+    with open(tmp, 'wb') as stream:
+        stream.write(encoded)
     if os.path.exists(dst):
         bak = dst + '.bak.' + str(int(time.time()))
         try:
@@ -182,8 +192,8 @@ def main():
                     help='Skip inject_definitions step (only for debugging)')
     ap.add_argument('--no-super', action='store_true',
                     help='Skip controlled BackgroundIndex sidecar; only produce per-file active CDB')
-    ap.add_argument('--max-mods', type=int, default=50,
-                    help='Max member sources per compiler-authored unity wrapper TU (default 50)')
+    ap.add_argument('--max-mods', type=int, default=80,
+                    help='Maximum member sources per secondary SuperUnity candidate (default 80)')
     ap.add_argument('--keep-staging', action='store_true',
                     help='Keep intermediate staging dir for inspection')
     ap.add_argument('--idx-output', default=None,
@@ -192,11 +202,29 @@ def main():
     ap.add_argument('--background-output', default=None,
                     help='Write the controlled coverage-complete CDB here and a marker to '
                          '--idx-output; do not run clangd-indexer')
+    ap.add_argument('--unity-receipt', help='verified prepare pipeline provenance sidecar')
+    ap.add_argument('--super-dir', default=None,
+                    help='shared directory for stable compiler-authored unity wrappers')
+    ap.add_argument('--verified-batches', action='store_true',
+                    help='prove secondary same-context batches with private clangd indexes')
+    ap.add_argument('--reuse-verified-only', action='store_true',
+                    help='reuse valid receipts without starting cold compiler proofs')
+    ap.add_argument('--clangd', default=None, help='existing clangd used for batch proof')
+    ap.add_argument('--server-profile', type=json.loads, default=None,
+                    help='explicit supported clangd query profile JSON; never inferred from a receipt')
+    ap.add_argument('--batch-size', type=int, default=8,
+                    help='maximum original UBT groups in one verified batch')
     ap.add_argument('--indexer', default=None,
                     help='clangd-indexer executable path (auto-probed if omitted)')
     ap.add_argument('--jobs', '-j', type=int, default=0,
                     help='clangd-indexer concurrency (default: clamp(8, cpu, 24))')
     args = ap.parse_args()
+    if args.verified_batches and (not args.background_output or not args.clangd):
+        ap.error('--verified-batches requires --background-output and --clangd')
+    if args.reuse_verified_only and not args.verified_batches:
+        ap.error('--reuse-verified-only requires --verified-batches')
+    if args.server_profile is not None and (not args.verified_batches or not isinstance(args.server_profile, dict)):
+        ap.error('--server-profile requires --verified-batches and a JSON object')
 
     src = os.path.abspath(args.input_cdb)
     dst_active = os.path.abspath(args.output_cdb)
@@ -276,6 +304,7 @@ def main():
     # from existing UE unity products is forbidden here: those products may
     # belong to another platform/configuration and are not coverage evidence.
     super_cdb = os.path.join(stage, 'compile_commands.super.json')
+    stable_super_dir = args.super_dir or os.path.join(os.path.dirname(dst_active), 'super_unity_cpps')
     bs = os.path.join(tools, 'build_hot_super_unity_cdb.py')
     if not os.path.isfile(bs):
         print(f'\nERROR: build_hot_super_unity_cdb.py missing', file=sys.stderr)
@@ -284,12 +313,19 @@ def main():
     rc = run([
         py, '-I', bs, work, super_cdb,
         '--max-mods', str(args.max_mods),
-        '--super-dir', os.path.join(stage, 'super_unity_cpps'),
+        '--super-dir', stable_super_dir,
+        *(['--unity-receipt', args.unity_receipt] if args.unity_receipt else []),
     ])
     if rc != 0 or not os.path.isfile(super_cdb):
         print(f'ERROR: build_hot_super_unity_cdb failed (rc={rc})', file=sys.stderr)
         return 1
     super_entries = load_cdb(super_cdb)
+    if args.background_output:
+        from cdb_unity_receipt import entry_hash, load_verified_synthetic_shaders
+        shader_donors = load_verified_synthetic_shaders(args.unity_receipt, perfile)
+        for entry in super_entries:
+            if entry_hash(entry) in shader_donors:
+                entry['nvim_ue_background_route'] = 'shader-compatibility'
     print(f'[background-cdb] {len(super_entries)} controlled entries')
     if args.background_output and (not super_entries or any(
             not entry.get('file') or not isinstance(entry.get('arguments'), list)
@@ -298,50 +334,11 @@ def main():
         return 1
 
     # ---- ARTEFACT 2: write controlled BackgroundIndex/indexer CDB ----
-    # Compiler-authored wrapper entries reference .cpp files in
-    # <stage>/super_unity_cpps/.
-    # Move that dir to a stable location next to the active CDB BEFORE we
-    # rewrite paths, so the indexer can find the actual .cpp files later.
-    dst_dir = os.path.dirname(dst_active)
-    stable_super_dir = os.path.join(dst_dir, 'super_unity_cpps')
-    src_super_dir = os.path.join(stage, 'super_unity_cpps')
-    if os.path.isdir(src_super_dir):
-        if os.path.isdir(stable_super_dir):
-            shutil.rmtree(stable_super_dir, ignore_errors=True)
-        shutil.copytree(src_super_dir, stable_super_dir)
-        print(f'[super_cpps] {stable_super_dir}')
+    # The generator writes content-addressed wrappers directly to their stable
+    # directory, preserving files that a previously published CDB may still use.
+    print(f'[super_cpps] {stable_super_dir}')
 
-        # Patch wrapper-TU paths from staging to stable.  The source CDB may
-        # use either native POSIX paths or Windows paths, depending on which
-        # host produced it, so cover both spellings without changing the
-        # spelling already present in each entry.
-        path_pairs = [
-            (src_super_dir.replace('\\', '/'), stable_super_dir.replace('\\', '/')),
-            (src_super_dir.replace('/', '\\'), stable_super_dir.replace('/', '\\')),
-        ]
-        path_pairs = list(dict.fromkeys(path_pairs))
-        patched = 0
-        for e in super_entries:
-            file_path = e.get('file', '')
-            for from_dir, to_dir in path_pairs:
-                if from_dir in file_path:
-                    file_path = file_path.replace(from_dir, to_dir)
-                    patched += 1
-                    break
-            e['file'] = file_path
-            new_args = []
-            for a in e.get('arguments', []):
-                if isinstance(a, str):
-                    for from_dir, to_dir in path_pairs:
-                        if from_dir in a:
-                            a = a.replace(from_dir, to_dir)
-                            break
-                new_args.append(a)
-            e['arguments'] = new_args
-        if patched:
-            print(f'[patched] {patched} wrapper-TU file paths to stable dir')
-
-    print('\n[indexer] writing super-only CDB for clangd-indexer')
+    print('\n[background-cdb] publishing controlled CDB')
     atomic_write(dst_indexer, super_entries, label='indexer CDB')
 
     if not args.keep_staging:
@@ -355,20 +352,40 @@ def main():
 
     if args.background_output:
         background_out = os.path.abspath(args.background_output)
-        atomic_write(background_out, super_entries, label='controlled background CDB')
+        background_entries = super_entries
+        batch_metrics = None
+        if args.verified_batches:
+            from cdb_verified_batch import accelerate
+            background_entries, batch_metrics = accelerate(
+                super_entries, os.path.join(os.path.dirname(stable_super_dir), 'verified_batches'),
+                args.clangd, max_group=args.batch_size, verify_missing=not args.reuse_verified_only,
+                server_profile=args.server_profile, max_sources=args.max_mods)
+        outputs = [(background_out, json.dumps(background_entries)),
+                   (background_out + '.semantic.json', json.dumps(super_entries))]
         if args.idx_output:
             marker = {
                 'schema': 1,
                 'index_kind': 'controlled-background',
                 'cdb_name': os.path.basename(background_out),
-                'entry_count': len(super_entries),
+                'entry_count': len(background_entries),
+                'shader_compatibility_count': sum(entry.get('nvim_ue_background_route') == 'shader-compatibility'
+                                                  for entry in background_entries),
+                'native_background_entry_count': sum(entry.get('nvim_ue_background_route') != 'shader-compatibility'
+                                                      for entry in background_entries),
                 'unity_entry_count': sum(
-                    'super_unity_cpps' in str(entry.get('file', '')).replace('\\', '/')
+                    os.path.basename(str(entry.get('file', '')).replace('\\', '/')).startswith('SuperUnity.UBT.')
                     for entry in super_entries
                 ),
             }
-            atomic_write(os.path.abspath(args.idx_output), marker, label='index marker')
-        print(f'  background (clangd): {background_out}    {len(super_entries)} entries')
+            if batch_metrics is not None:
+                marker['verified_batches'] = {key: batch_metrics[key] for key in (
+                    'original_ubt_count', 'batch_count', 'accepted_ubt_count', 'retained_ubt_count',
+                    'exact_count', 'shader_count', 'other_count', 'output_entries') if key in batch_metrics}
+            outputs.append((os.path.abspath(args.idx_output), json.dumps(marker)))
+        write_outputs_if_changed(outputs)
+        routed = sum(entry.get('nvim_ue_background_route') == 'shader-compatibility' for entry in background_entries)
+        print(f'  background (clangd): {background_out}    {len(background_entries) - routed} native tasks; '
+              f'{routed} proven shader donors use compatibility navigation; {len(background_entries)} covered records')
         return 0
 
     # ---- OPTIONAL Step 5: run clangd-indexer on the sidecar ----

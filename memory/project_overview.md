@@ -7,13 +7,18 @@
 ## 这是什么
 
 hana-alice 的 Neovim 配置（公开镜像 `hana-alice/nvim`），定位为
-**专为 Unreal Engine 5 大型 C++ 工程优化的开发环境**：3 分钟全量索引、
+**专为 Unreal Engine 5 大型 C++ 工程优化的开发环境**，目标体验包括 3 分钟全量索引、
 亚 100ms goto-definition、一键 Android headless DAP attach、错误全落盘。
+**当前 SuperUnity 完整索引性能仍未通过恢复验收**；上述定位不是现状实测承诺，
+验收证据与缺口见 [索引退化调查](../docs/cpp-index-restart-investigation.md)。
 
 LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨模块）+
 `lua/ue/`、`lua/utils/`、`lua/workarounds/`。
 
 ## 先读什么（SESSION START 顺序）
+
+**不依赖 spec 的承重约束**：[SuperUnity 性能保全](../AGENTS.md#super-unity-performance-contract)。
+不得静默取消二次合并；功能回归全绿不等于真实工程索引性能恢复，详见根入口正文与 C11。
 
 新 context 进来、动代码前**按序读**：
 
@@ -40,8 +45,12 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 | 扫描根推导 | `lua/ue/core/scan_roots.lua` | `lua/ue/core/AGENTS.md` | `project-scan-root-discovery` | `ue_api` `fs_proc` | 从 Build.cs/uplugin/uproject 推导应扫目录；只扩不缩 |
 | UE 引擎中枢 | `lua/ue.lua` + `lua/ue/` | `lua/ue/AGENTS.md` | `ue-target-workflow-boundary` | `ue_platform_boundary` `ue_api` `smoke` | 索引 / CDB / DAP / 命令注册的中枢 |
 | 多实例状态 | `lua/ue/project_state.lua` + `file_lock.lua` | `lua/ue/AGENTS.md` | `multi-instance-state-isolation` | `multi_instance_state` | 进程内选择 + canonical project bucket + 跨进程 writer lease |
-| clangd 语义覆盖 | `lua/ue/index/` | `lua/ue/index/AGENTS.md` | `cpp-semantic-index-coverage` | `index_generation` `cpp_semantic_index` | current/hot/full controlled BackgroundIndex + generation 单调选择 |
-| CDB 流水线 | `lua/ue/cdb/` | `lua/ue/cdb/AGENTS.md` | `macos-ios-cdb-semantic-prepare` | `ue_cdb` | compile_commands.json 生成/裁剪/注入 |
+| clangd 语义覆盖 | `lua/ue/index/` | `lua/ue/index/AGENTS.md` | `cpp-semantic-index-coverage` | `index_generation` `index_subset_async` `cpp_semantic_index` | current/hot/full controlled BackgroundIndex + generation 单调选择；大 CDB 筛选在后台执行 |
+| 已验证二次批次 | `tools/clangd_*` + `tools/cdb_verified_batch.py` + `lua/ue/index/batch_*.lua` | `tools/AGENTS.md` + `lua/ue/index/AGENTS.md` | `cpp-semantic-index-coverage` | `index_graph` `index_batch` `index_verified_batch` `index_inventory` `index_query_profile` `index_vfs_aliases` | 原 TU 图证明、冻结输入、独立语义 CDB 与运行时失效保护 |
+| 离线生成代码二次候选 | `tools/build_super_unity_cdb.py` | `tools/AGENTS.md` | `cpp-semantic-index-coverage` | `index_generated_super_unity` `structure` | 同模块完整 argv 相同的 generated-only UBT 候选；全局 header 引用目标验收未过，不得自动发布 |
+| 离线有序二次候选 | `tools/cdb_ordered_unity.py` | `tools/AGENTS.md` | `cpp-semantic-index-coverage` | `index_ordered_unity` `structure` | 保留 PCH/模块宏顺序与覆盖；候选不是已准入的生产批次 |
+| 源码刷新交付 | `lua/ue/index/_source.lua` + `_clangd.lua` + `lua/utils/ue_watch.lua` | `lua/ue/index/AGENTS.md` + `lua/utils/AGENTS.md` | `cpp-semantic-index-coverage` | `index_source_refresh` `index_delivery` `ue_watch_csearch` | 源码字节 revision 独立于 CDB；新客户端附加后才确认交付 |
+| CDB 流水线 | `lua/ue/cdb/` | `lua/ue/cdb/AGENTS.md` | `macos-ios-cdb-semantic-prepare` | `ue_cdb` | 保留真实编译参数；暂存生成/变换/分区，变化后才发布 |
 | DAP 调试 | `lua/ue/dap/` | `lua/ue/dap/AGENTS.md` | `dap-failure-layering`（**归属分层 L0–L4、失败先报层**）、`dap-platform-dispatch`、`android-dap-attach`、`android-dap-live-breakpoints`、`ios-device-debug-workflow` | `dap` `platform` `dap_failure_layer` | Android platform 模式 + iOS CoreDevice/legacy 独立 route；失败按 L0–L4 归属 |
 | Android device | `lua/utils/android_device.lua` | `lua/utils/AGENTS.md` | `global-android-device-selection` | `android_device` `dap` `ue_context` | 名称+serial picker；当前 Neovim 进程 serial；统一 `adb -s` |
 | Android SO 快速迭代 | `lua/ue/targets/android.lua` + `android_windows.lua` + `scripts/ue_android_so_*.ps1` | `lua/ue/targets/AGENTS.md` + `scripts/AGENTS.md` | `android-so-quick-deploy` | `ue_target_drivers` `ue_target_integration` | Windows-only PowerShell compatibility path；root 或已验证的 debuggable app-private transport；不支持 macOS→Android |

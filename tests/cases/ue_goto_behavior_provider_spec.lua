@@ -54,12 +54,19 @@ t.describe("provider absence and capability evidence", function()
       reason = "provider-unavailable", stage = "provider" },
     { name = "unsupported capability with missing index", index = {}, unsupported = true,
       reason = "provider-method-unsupported", stage = "provider" },
+    { name = "missing exact command before symbol query", index = { readiness = "ready", complete = true },
+      preparation_reason = "compile-command-missing", reason = "active-compile-command-missing", stage = "context" },
+    { name = "empty compiler identity after successful preparation", index = { readiness = "ready", complete = true },
+      empty_identity = true, state = "invalid-semantic-context", reason = "identity-missing", stage = "entity" },
   }) do
     t.it("source navigation distinguishes " .. case.name, function()
       local old_semantic, old_probe = package.loaded["utils.ue_goto.semantic_client"], package.loaded["utils.probe"]
+      local old_commands = package.loaded["ue.clangd_commands"]
       local old_clients, old_notify = vim.lsp.get_clients, vim.notify
       local bufnr = vim.api.nvim_get_current_buf()
+      local cursor = vim.api.nvim_win_get_cursor(0)
       local notices, jumps = {}, 0
+      local preparations, requests = 0, 0
       package.loaded["utils.ue_goto.semantic_client"] = {
         set_trace = function() end,
         begin_action = function() return { bufnr = bufnr, cursor = vim.api.nvim_win_get_cursor(0), winid = 0 } end,
@@ -67,7 +74,21 @@ t.describe("provider absence and capability evidence", function()
         snapshot_is_current = function() return true end,
       }
       package.loaded["utils.probe"] = { record = function() end, observe = function() end }
+      package.loaded["ue.clangd_commands"] = { ensure = function(_, _, callback, opts)
+        preparations = preparations + 1
+        t.assert_eq(opts.compile_command_source, "/fixture/source.cpp", "source lookup must not guess a donor command")
+        callback(case.preparation_reason == nil, case.preparation_reason)
+      end }
       vim.lsp.get_clients = function(opts)
+        if not opts.method and (case.preparation_reason or case.empty_identity) then
+          return { { id = 71, name = "clangd", offset_encoding = "utf-8",
+            request = function(_, method, _, callback)
+              requests = requests + 1
+              t.assert_eq(method, "textDocument/symbolInfo")
+              callback(nil, {})
+              return true, 1
+            end } }
+        end
         if not case.unsupported or opts.method then return {} end
         return { { id = 71, name = "clangd", supports_method = function() return false end } }
       end
@@ -81,11 +102,20 @@ t.describe("provider absence and capability evidence", function()
         nav.cpp_definition("AllocUniformBuffer", bufnr, "/fixture/source.cpp", "cpp")
         t.assert_true(vim.wait(1000, function() return owner._last_cpp_transaction.result ~= nil end))
         local result = owner._last_cpp_transaction.result
-        t.assert_eq(result.state, "unavailable")
+        t.assert_eq(result.state, case.state or "unavailable")
         t.assert_eq(result.stage, case.stage)
         t.assert_eq(result.reason, case.reason)
         t.assert_eq(result.provider_result.reason,
-          case.unsupported and "provider-method-unsupported" or "provider-unavailable")
+          case.preparation_reason or (case.empty_identity and "identity-missing")
+            or (case.unsupported and "provider-method-unsupported" or "provider-unavailable"))
+        if case.preparation_reason or case.empty_identity then
+          t.assert_eq(preparations, 1)
+          t.assert_eq(requests, case.preparation_reason and 0 or 1)
+          local record = result.provider_result.client_results[1]
+          t.assert_eq(record.status, case.preparation_reason and "preparation-error" or "ok")
+          t.assert_eq(record.error, case.preparation_reason)
+          t.assert_true(vim.deep_equal(vim.api.nvim_win_get_cursor(0), cursor))
+        end
         local explanation = table.concat(owner.explain_lines(), "\n")
         t.assert_contains(explanation, "provider_method: textDocument/symbolInfo")
         t.assert_contains(explanation, "provider_reason: " .. result.provider_result.reason)
@@ -94,11 +124,16 @@ t.describe("provider absence and capability evidence", function()
         if case.reason == "provider-unavailable" then
           t.assert_contains(notices[1], "clangd is not attached")
           t.assert_contains(notices[1], ":UEDefExplain")
+        elseif case.reason == "active-compile-command-missing" then
+          t.assert_contains(notices[1], "verify the selected platform/target")
+          t.assert_contains(notices[1], "module or plugin participates in that build")
+          t.assert_contains(notices[1], "then run :UEPrepare for that build")
         elseif case.stage == "index" then
           t.assert_contains(notices[1], ":UEPrepare")
         end
       end, debug.traceback)
       package.loaded["utils.ue_goto.semantic_client"], package.loaded["utils.probe"] = old_semantic, old_probe
+      package.loaded["ue.clangd_commands"] = old_commands
       vim.lsp.get_clients, vim.notify = old_clients, old_notify
       if not ok then error(err) end
     end)

@@ -17,6 +17,11 @@ local json = require("ue.cdb.json")
 
 local M = {}
 
+local function source_key(file, directory)
+  local path = fs.is_absolute_path(file) and file or fs.join(directory or "", file)
+  return vim.fs.normalize(path):lower()
+end
+
 --- Build one CDB entry for a shader file. Mirrors the original
 --- `make_shader_compile_command_entry` byte-for-byte.
 function M.make_entry(shader_file, template, include_roots)
@@ -43,27 +48,33 @@ end
 --- In-place augment over a CDB entries TABLE (no JSON round-trip).
 --- Use this when the caller already has the entries in memory — saves
 --- a decode + encode of the full CDB (can be hundreds of MB).
---- Returns the same table (mutated). Always safe to call.
+--- Returns the same table (mutated), and immutable identities of actual inserts.
 function M.augment_table(entries, shader_files, include_roots)
-  if not shader_files or #shader_files == 0 then return entries end
-  if type(entries) ~= "table" then return entries end
+  local added = {}
+  if not shader_files or #shader_files == 0 then return entries, added end
+  if type(entries) ~= "table" then return entries, added end
 
   local template = json.template_entry(entries)
   local existing = {}
   for _, entry in ipairs(entries) do
     if type(entry) == "table" and entry.file then
-      existing[fs.norm(entry.file):lower()] = true
+      existing[source_key(entry.file, entry.directory)] = true
     end
   end
 
   for _, shader_file in ipairs(shader_files) do
-    local key = shader_file:lower()
+    local key = source_key(shader_file)
     if not existing[key] then
-      table.insert(entries, M.make_entry(shader_file, template, include_roots or {}))
+      local entry = M.make_entry(shader_file, template, include_roots or {})
+      table.insert(entries, entry)
+      local hash = require("ue.cdb.unity_origin").entry_hash(entry)
+      if hash and fs.is_absolute_path(entry.file) and fs.is_absolute_path(entry.directory) then
+        added[#added + 1] = { file = entry.file, directory = entry.directory, command_hash = hash }
+      end
       existing[key] = true
     end
   end
-  return entries
+  return entries, added
 end
 
 --- Take a JSON `content` blob (string), append synthetic entries for any
@@ -90,13 +101,13 @@ function M.augment(content, shader_files, include_roots)
   local existing = {}
   for _, entry in ipairs(decoded) do
     if type(entry) == "table" and entry.file then
-      existing[fs.norm(entry.file):lower()] = true
+      existing[source_key(entry.file, entry.directory)] = true
     end
   end
 
   local added = false
   for _, shader_file in ipairs(shader_files) do
-    local key = shader_file:lower()
+    local key = source_key(shader_file)
     if not existing[key] then
       table.insert(decoded, M.make_entry(shader_file, template, include_roots or {}))
       existing[key] = true

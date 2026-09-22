@@ -14,6 +14,16 @@ local M = {
 
 local shell = require("utils.platform.shell")
 
+function M.environment_key(name) return name:upper() end
+function M.directory_symlink_options() return { dir = true, junction = true } end
+
+function M.content_event_watcher()
+  local python = require("utils.platform").resolve_tool({ name = "python", env = { "UE_PYTHON" },
+    driver_candidates = function(driver) return driver.python_candidates() end })
+  if not python.ok then return nil, "Python unavailable for Windows content watcher" end
+  return require("workarounds.libuv.content_events").new(python.path)
+end
+
 function M.shell_entry(kind)
   kind = kind or "default"
   if kind == "cmd" then
@@ -393,11 +403,13 @@ function M.close_process(process)
 end
 
 function M.default_clangd_candidates()
-  -- Hot lookup; let upstream `ue.clangd_cmd` keep its own richer search,
-  -- this is the platform-default fallback.
+  -- Preserve PATH priority, then support LLVM installations whose installer
+  -- did not add its bin directory to the launching process's PATH.
   return {
     "clangd.exe",
     "clangd",
+    (vim.env.ProgramFiles or "C:/Program Files") .. "/LLVM/bin/clangd.exe",
+    (vim.env["ProgramFiles(x86)"] or "C:/Program Files (x86)") .. "/LLVM/bin/clangd.exe",
   }
 end
 

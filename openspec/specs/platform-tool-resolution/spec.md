@@ -38,6 +38,12 @@
 - **THEN** 候选 SHALL 保持 Linux 的宿主路径表示
 - **AND** 调用方 MUST NOT 因平台名称而自行改写路径
 
+#### Scenario: Windows LLVM was installed without updating PATH
+
+- **WHEN** PATH has no clangd but LLVM exists under a Windows Program Files directory
+- **THEN** the Windows driver SHALL offer that installation after its PATH candidates
+- **AND** explicit environment/configuration overrides SHALL retain higher priority
+
 ### Requirement: 调用方不得自行分支 Python、Go 构建产物或其他工具家族
 
 Python、Go 构建产物（例如 `csearch`、`cindex-uefilter`）、clangd、lldb-dap、lldb-server 以及类似工具的候选列表、命名差异与可用性判断 SHALL 由平台工具解析层统一处理；调用方 MUST 只消费解析结果。调用方 MUST NOT 通过 `if windows then python.exe else python3` 这类分支自行拼装候选，也 MUST NOT 在发现某个工具缺失后擅自换另一种工具家族来掩盖缺失。

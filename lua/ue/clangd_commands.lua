@@ -69,14 +69,22 @@ local function controlled_cdb_dir(client)
   local config = client and client.config or {}
   local cmd = type(config._ue_resolved_cmd) == "table" and config._ue_resolved_cmd
     or (type(config.cmd) == "table" and config.cmd or {})
-  for _, arg in ipairs(cmd) do
+  for position = #cmd, 1, -1 do
+    local arg = cmd[position]
     local value = tostring(arg):match("^%-%-compile%-commands%-dir=(.+)$")
     if value then
       value = norm(value)
+      local original = require("ue.index.batch_runtime").original_cdb_dir(value, client)
+      if original then return original end
+      if config._ue_batch_scope or (vim.fs.basename(value) == "verified"
+          and vim.fs.basename(vim.fs.dirname(value)) == "background-cdb") then
+        return nil, "frozen-cdb-unverified"
+      end
       if vim.fs.basename(value) == "background-cdb"
           and (vim.uv or vim.loop).fs_stat(value .. "/compile_commands.json") then
         return value
       end
+      return nil
     end
   end
   return nil
@@ -218,9 +226,9 @@ end
 function M.ensure(client, bufnr, callback, opts)
   callback = callback or function() end
   opts = opts or {}
-  local semantic_dir = controlled_cdb_dir(client)
+  local semantic_dir, authority_error = controlled_cdb_dir(client)
   if not semantic_dir then
-    callback(true)
+    callback(authority_error == nil, authority_error)
     return
   end
   bufnr = bufnr == 0 and vim.api.nvim_get_current_buf() or bufnr

@@ -89,6 +89,9 @@ return function(M, core)
       return "queued", ("Semantic index: QUEUED (%s) — building shortly")
         :format(table.concat(summary.queued or {}, ","))
     end
+    if summary.source_refresh_pending then
+      return "pending", "Semantic index: source changes awaiting clangd refresh"
+    end
     -- Only a selected artifact of the CURRENT generation counts as delivered.
     -- A stale or missing selection MUST NOT be reported as ready: the clangd gate
     -- consumes persisted readiness, so claiming "ready" here while the gate defers

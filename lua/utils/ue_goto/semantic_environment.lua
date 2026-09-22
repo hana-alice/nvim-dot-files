@@ -1,6 +1,7 @@
 local M = {}
 local uv = vim.uv or vim.loop
 local session = require("utils.ue_goto.semantic_session")
+local semantic_cdb_validation_cache = {}
 
 local function hash_text(value)
   return vim.fn.sha256(tostring(value or "")):sub(1, 24)
@@ -63,12 +64,44 @@ local function file_identity(path)
   }
 end
 
+local function semantic_cdb_identity(manifest, background_cdb_path, verified)
+  if manifest.semantic_cdb_path == nil then
+    return file_identity(background_cdb_path)
+  end
+  -- A declared split CDB is the native authority. Invalid evidence must reject
+  -- this phase, never substitute the background batching view.
+  if type(manifest.semantic_cdb_path) ~= "string" or manifest.semantic_cdb_path == ""
+      or type(manifest.semantic_cdb_hash) ~= "string" or manifest.semantic_cdb_hash == "" then
+    return nil
+  end
+  local path = vim.fs.normalize(manifest.semantic_cdb_path)
+  local stat = uv.fs_stat(path)
+  if not stat or stat.type ~= "file" then return nil end
+  local signature = vim.json.encode({
+    path, manifest.semantic_cdb_hash, stat.size,
+    stat.mtime and stat.mtime.sec or 0, stat.mtime and stat.mtime.nsec or 0,
+    stat.ctime and stat.ctime.sec or 0, stat.ctime and stat.ctime.nsec or 0,
+  })
+  if semantic_cdb_validation_cache[path] ~= signature then
+    local fd = io.open(path, "rb")
+    if not fd then return nil end
+    local content = fd:read("*a")
+    fd:close()
+    if not content or vim.fn.sha256(content) ~= manifest.semantic_cdb_hash then return nil end
+  end
+  verified[path] = signature
+  local identity = file_identity(path)
+  identity.hash = manifest.semantic_cdb_hash
+  return identity
+end
+
 local function controlled_phase_manifests(ctx, generation_id)
   if type(ctx) ~= "table" or type(ctx.paths) ~= "table"
       or type(generation_id) ~= "string" or generation_id == "" then
     return {}
   end
   local matches = {}
+  local verified = {}
   for _, phase in ipairs({ "current", "hot", "full" }) do
     local index_path = ctx.paths[phase .. "_index"]
     if type(index_path) == "string" and index_path ~= "" then
@@ -84,19 +117,26 @@ local function controlled_phase_manifests(ctx, generation_id)
       then
         local background_cdb_path = vim.fs.normalize(tostring(manifest.background_cdb_path or ""))
         local background_stat = uv.fs_stat(background_cdb_path)
-        if background_cdb_path ~= "" and background_stat and background_stat.type == "file" then
+        local semantic_identity = background_stat and background_stat.type == "file"
+          and semantic_cdb_identity(manifest, background_cdb_path, verified) or nil
+        if background_cdb_path ~= "" and semantic_identity then
           matches[#matches + 1] = {
             phase = phase,
             manifest = manifest,
             manifest_path = manifest_path,
             background_cdb_path = background_cdb_path,
+            semantic_cdb_path = semantic_identity.path,
             manifest_identity = file_identity(manifest_path),
             background_identity = file_identity(background_cdb_path),
+            semantic_identity = semantic_identity,
           }
         end
       end
     end
   end
+  -- Retain only this context's (at most three) verified phase signatures, never
+  -- the potentially large CDB bytes. Changed file metadata forces revalidation.
+  semantic_cdb_validation_cache = verified
   return matches
 end
 
@@ -189,6 +229,7 @@ function M.read(bufnr, opts)
       phase = candidate.phase,
       manifest = candidate.manifest_identity,
       background = candidate.background_identity,
+      semantic = candidate.manifest.semantic_cdb_path ~= nil and candidate.semantic_identity or nil,
     }
   end
   local requested = session.requested({ clangd_path = clangd, libclang_path = libclang })
@@ -212,7 +253,7 @@ function M.read(bufnr, opts)
 
   local semantic_cdb_paths = {}
   for _, candidate in ipairs(controlled_candidates or {}) do
-    semantic_cdb_paths[#semantic_cdb_paths + 1] = candidate.background_cdb_path
+    semantic_cdb_paths[#semantic_cdb_paths + 1] = candidate.semantic_cdb_path
   end
 
   return {
@@ -237,7 +278,7 @@ function M.read(bufnr, opts)
       partial = true,
       complete = false,
     },
-    controlled_cdb_path = controlled_candidates[1] and controlled_candidates[1].background_cdb_path or nil,
+    controlled_cdb_path = controlled_candidates[1] and controlled_candidates[1].semantic_cdb_path or nil,
     controlled_manifest_path = controlled_candidates[1] and controlled_candidates[1].manifest_path or nil,
     controlled_candidates = controlled_candidates,
     semantic_cdb_paths = semantic_cdb_paths,

@@ -13,6 +13,9 @@ local M = {
 
 local shell = require("utils.platform.shell")
 
+function M.environment_key(name) return name end
+function M.directory_symlink_options() return { dir = true } end
+
 local function join_engine_path(engine_root, suffix)
   local root = tostring(engine_root or "")
   if root:sub(-1) == "/" then

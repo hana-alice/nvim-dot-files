@@ -81,6 +81,66 @@ t.describe("native watcher transport", function()
   end)
 end)
 
+t.describe("native Windows filter", function()
+  t.it("drops access-only SetFileTime but keeps a write with preserved mtime", function()
+    if vim.fn.has("win32") ~= 1 and vim.fn.has("win64") ~= 1 then
+      t.skip("Windows-only native filter", "current host is not Windows")
+      return
+    end
+    local python = vim.fn.exepath("python")
+    if python == "" then
+      t.skip("Windows-only native filter", "python unavailable")
+      return
+    end
+    local root = vim.fn.tempname():gsub("\\", "/")
+    vim.fn.mkdir(root, "p")
+    local source = root .. "/sample.cpp"
+    vim.fn.writefile({ "int value = 1;" }, source)
+    local handle = assert(require("utils.platform.windows").content_event_watcher())
+    local events, ready = {}, false
+    local ok, err = pcall(function()
+      t.assert_true(handle:start(root, {}, function(event_err, path, event)
+        t.assert_nil(event_err)
+        if event.ready then ready = true; return end
+        events[#events + 1] = { path = path, event = event }
+      end) ~= nil)
+      t.assert_true(vim.wait(5000, function() return ready end, 20), "native helper not ready")
+      local set_atime = table.concat({
+        "import ctypes, sys, time",
+        "from ctypes import wintypes",
+        "k=ctypes.WinDLL('kernel32',use_last_error=True)",
+        "h=k.CreateFileW(sys.argv[1],0x0100,7,None,3,0,None)",
+        "if h in (0,ctypes.c_void_p(-1).value): raise ctypes.WinError(ctypes.get_last_error())",
+        "class FT(ctypes.Structure): _fields_=[('low',wintypes.DWORD),('high',wintypes.DWORD)]",
+        "n=int(time.time()*10000000+116444736000000000); ft=FT(n&0xffffffff,n>>32)",
+        "k.SetFileTime.argtypes=[wintypes.HANDLE,ctypes.c_void_p,ctypes.POINTER(FT),ctypes.c_void_p]",
+        "k.SetFileTime.restype=wintypes.BOOL",
+        "if not k.SetFileTime(h,None,ctypes.byref(ft),None): raise ctypes.WinError(ctypes.get_last_error())",
+        "k.CloseHandle(h)",
+      }, "\n")
+      local done, failure = false, nil
+      vim.system({ python, "-c", set_atime, source }, { text = true }, function(result)
+        failure = result.code ~= 0 and (result.stderr or result.stdout or "SetFileTime failed") or nil
+        done = true
+      end)
+      t.assert_true(vim.wait(3000, function() return done end, 20), "SetFileTime timed out")
+      t.assert_nil(failure)
+      vim.wait(500, function() return false end, 10)
+      t.assert_eq(#events, 0, "access-only update must be filtered at subscription")
+
+      local before = assert(vim.uv.fs_stat(source))
+      vim.fn.writefile({ "int value = 2;" }, source)
+      vim.uv.fs_utime(source, before.mtime.sec, before.mtime.sec)
+      t.assert_true(vim.wait(3000, function() return #events > 0 end, 20),
+        "real write with preserved mtime was lost")
+    end)
+    pcall(handle.stop, handle); pcall(handle.close, handle)
+    pcall(vim.fn.delete, root, "rf")
+    if not ok then error(err) end
+    t.assert_eq(events[1].path, "sample.cpp")
+  end)
+end)
+
 t.describe("native watcher host ownership", function()
   t.it("only Windows exposes the optional watcher factory", function()
     t.assert_type(require("utils.platform.windows").content_event_watcher, "function")

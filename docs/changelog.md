@@ -58,6 +58,23 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-22 — Lock the Windows native filter with an OS-level regression
+
+**Task**
+- Keep the watcher fix protected against regressions in the actual Windows notification mask.
+
+**Implemented**
+- Added a native acceptance case that performs true access-only `SetFileTime` and a real write with the old mtime through the production helper path.
+
+**Validation**
+- Native watcher regression: **14/14 passed**.
+- Required-native full regression: **2089/2089 passed, 0 failed, 0 skipped**.
+- Stage evidence: access-only produced zero source events; preserved-mtime write produced one.
+- Spec consistency: existing `host-platform-driver` and `ue-code-search` contracts remain satisfied; no new behavior drift.
+
+**Follow-ups**
+- The explicit unchanged-LAST_WRITE first observation remains conservative by design.
+
 ### 2026-09-22 — Wire Windows native source events into UE watcher
 
 **Task**

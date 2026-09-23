@@ -23,19 +23,21 @@ def _existing(path):
 
 
 def _lookup_watches(search_roots, files, recursive_roots):
-    """Keep lexical ancestors so junction retargets cannot hide behind resolve()."""
+    """Watch lexical ancestor entries as well as every protected subtree."""
     def lexical(value):
         path = Path(value)
         if not path.is_absolute():
             raise ValueError('invalid-driver-lookup-path')
         return Path(os.path.abspath(path))
     watched = {lexical(path) for path in files}
-    requested = {lexical(path) for path in search_roots} | {path.parent for path in watched}
+    requested = ({lexical(path) for path in search_roots}
+                 | {lexical(path) for path in recursive_roots}
+                 | {path.parent for path in watched})
     direct = set()
     for root in requested:
         watched.add(root)
         watched.update(root.parents)
-        # Existing parents observe root deletion/rename/retarget; the nearest
+        # Existing parents observe root deletion/rename/replacement; the nearest
         # existing ancestor observes creation of the first missing component.
         for parent in (root, *root.parents):
             if parent.is_dir() and not any(_covers(base, parent) for base in recursive_roots):
@@ -196,6 +198,7 @@ def activate(info_path, clangd_path, validate=False, server_profile=None):
                 watched.add(parent)
         result.update(watch_roots=list(map(str, minimal)), watched_files=sorted(map(str, watched)),
                       lookup_roots=list(map(str, lookup_roots)),
+                      directory_write_policy='stable-directory-write-v1',
                       verified_cdb=str(frozen), original_cdb=str(original),
                       receipts=list(map(str, receipt_paths)), info_sha256=hashlib.sha256(info_bytes).hexdigest(),
                       generation_id=info['generation_id'])

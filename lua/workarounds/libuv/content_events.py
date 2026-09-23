@@ -10,12 +10,14 @@ import ctypes
 from ctypes import wintypes
 import json
 import os
+import stat
 import struct
 import sys
 import threading
 
 FILTER = 0x1B  # FILE_NAME | DIR_NAME | SIZE | LAST_WRITE
 INPUT_FILTER = 0x15F  # All libuv input categories except LAST_ACCESS (0x20).
+INPUT_STREAMS = {'metadata': 0x147, 'write': 0x18}
 CAPACITY = 64 * 1024  # DWORD aligned; also within the documented SMB limit.
 
 
@@ -142,6 +144,30 @@ def watch(root, parent_pid, *, capacity=CAPACITY, output=emit, recursive=True, n
                 native.CloseHandle(handle)
 
 
+def ordinary_directory_identity(path):
+    """No following links/reparse points, and no timestamp-based identity."""
+    try:
+        info = os.lstat(path)
+        attributes = info.st_file_attributes
+        if (not stat.S_ISDIR(info.st_mode) or attributes & 0x400
+                or not info.st_dev or not info.st_ino):
+            return None
+        return info.st_dev, info.st_ino, attributes
+    except (OSError, AttributeError):
+        return None
+
+
+def input_event(root, stream, event, directories):
+    """Annotate only; consumers must independently decide what can be ignored."""
+    event = dict(event)
+    if stream == 'write' and event.get('action') == 3 and event.get('directory') is True:
+        path = os.path.normcase(os.path.abspath(os.path.join(root, event['path'])))
+        baseline = directories.get(path)
+        if baseline is not None and ordinary_directory_identity(path) == baseline:
+            event['stable_directory_write'] = True
+    return event
+
+
 def watch_group(parent_pid):
     """One bounded input group; each thread owns its overlapped I/O buffers."""
     raw = sys.stdin.buffer.readline(1024 * 1024 + 1)
@@ -166,20 +192,33 @@ def watch_group(parent_pid):
         direct_count += not root['recursive']
     if recursive_count > 32 or direct_count > 256:
         raise ValueError('group root budget exceeded')
+    # Only the bounded configured roots can receive the annotation. No tree
+    # scanning, following junctions or inferring stability from timestamps.
+    directories = {os.path.normcase(os.path.abspath(root['path'])):
+                   ordinary_directory_identity(root['path']) for root in roots}
     output_lock = threading.Lock()
+    armed = {root['id']: set() for root in roots}
 
-    def output(root_id, record):
+    def output(root, stream, record):
         with output_lock:
-            emit(dict(record, root_id=root_id))
+            if record['kind'] == 'ready':
+                armed[root['id']].add(stream)
+                if len(armed[root['id']]) == len(INPUT_STREAMS):
+                    emit({'kind': 'ready', 'root_id': root['id'], 'streams': list(INPUT_STREAMS)})
+                return
+            if record['kind'] == 'events':
+                record = dict(record, events=[input_event(root['path'], stream, event, directories)
+                                              for event in record['events']])
+            emit(dict(record, root_id=root['id'], stream=stream))
 
-    def run(root):
+    def run(root, stream, mask):
         try:
-            watch(root['path'], parent_pid, recursive=root['recursive'], notification_filter=INPUT_FILTER,
-                  output=lambda record: output(root['id'], record))
+            watch(root['path'], parent_pid, recursive=root['recursive'], notification_filter=mask,
+                  output=lambda record: output(root, stream, record))
             raise RuntimeError('input watch unexpectedly returned')
         except BaseException as error:
             try:
-                output(root['id'], {'kind': 'error', 'error': str(error)})
+                output(root, stream, {'kind': 'error', 'error': str(error)})
             finally:
                 os._exit(2)
 
@@ -191,7 +230,8 @@ def watch_group(parent_pid):
 
     threading.Thread(target=input_closed, daemon=True).start()
     for root in roots:
-        threading.Thread(target=run, args=(root,), daemon=True).start()
+        for stream, mask in INPUT_STREAMS.items():
+            threading.Thread(target=run, args=(root, stream, mask), daemon=True).start()
     threading.Event().wait()
 
 
@@ -214,6 +254,11 @@ def main():
         try:
             emit({'kind': 'error', 'error': str(error), 'winerror': getattr(error, 'winerror', None)})
         except (BrokenPipeError, OSError):
+            os._exit(2)
+        if args.group is not None:
+            # A thread-start/configuration failure may occur after other
+            # subscriptions were armed. Do not tear down Python buffers while
+            # the kernel still owns pending requests; terminate the group.
             os._exit(2)
         return 2
     return 0

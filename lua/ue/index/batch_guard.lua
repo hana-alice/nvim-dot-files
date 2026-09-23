@@ -68,9 +68,10 @@ local function event_evidence(root, filename, events, err)
     if type(action) == "number" and action >= 1 and action <= 5 and action % 1 == 0 then
       result.action = action
     end
-    for _, name in ipairs({ "directory", "change", "rename" }) do
+    for _, name in ipairs({ "directory", "change", "rename", "stable_directory_write" }) do
       if type(events[name]) == "boolean" then result[name] = events[name] end
     end
+    if events.stream == "write" or events.stream == "metadata" then result.stream = events.stream end
   end
   return result
 end

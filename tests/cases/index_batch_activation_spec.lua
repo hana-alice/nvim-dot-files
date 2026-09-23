@@ -46,6 +46,15 @@ with tempfile.TemporaryDirectory(prefix='batch_activation_') as temporary:
     described = activate(info, str(clangd))
     assert described['ok'] and described['watch_roots'], described
     assert described['tool_path'] == str(clangd.resolve()), described
+    assert described['directory_write_policy'] == 'stable-directory-write-v1'
+    # Every recursive root needs real parent subscriptions, including without
+    # driver-query lookup paths. Watching a directory cannot watch its own name.
+    recursive = list(map(pathlib.Path, described['watch_roots']))
+    direct = set(map(pathlib.Path, described['lookup_roots']))
+    for protected_root in recursive:
+        for parent in protected_root.parents:
+            if not any(parent == base or base in parent.parents for base in recursive):
+                assert parent in direct, ('unwatched-ancestor', protected_root, parent)
     assert str(receipt) in described['watched_files'] and str(info) in described['watched_files']
     assert str(frozen.parent / '.cache') in described['exclude_roots']
     stored = json.loads(receipt.read_text())
@@ -54,6 +63,7 @@ with tempfile.TemporaryDirectory(prefix='batch_activation_') as temporary:
     valid = activate(info, str(clangd), validate=True)
     assert valid['ok'], valid
     assert valid['tool_path'] == described['tool_path'], valid
+    assert valid['directory_write_policy'] == described['directory_write_policy']
     old = frozen.read_bytes()
     frozen.write_text('[]')
     assert activate(info, str(clangd), validate=True)['reason'] == 'published-batch-cdb-changed'

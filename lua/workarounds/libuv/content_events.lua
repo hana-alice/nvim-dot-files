@@ -199,7 +199,13 @@ function M.new_group(python, roots, deps)
     local id = ok and type(value) == "table" and value.root_id or nil
     local entry = type(id) == "number" and id % 1 == 0 and entries[id] or nil
     if not entry or value.v ~= 1 then fail("invalid input watcher frame"); return end
+    if value.stream ~= nil and value.stream ~= "metadata" and value.stream ~= "write" then
+      fail("invalid input watcher stream"); return
+    end
     if value.kind == "ready" and not entry.armed then
+      if not vim.deep_equal(value.streams, { "metadata", "write" }) then
+        fail("input watcher streams not ready"); return
+      end
       entry.armed = true
       local all = true
       for _, item in ipairs(entries) do if not item.armed then all = false; break end end
@@ -219,8 +225,16 @@ function M.new_group(python, roots, deps)
         if not path or type(action) ~= "number" or action % 1 ~= 0 or action < 1 or action > 5 then
           fail("invalid input watcher event"); return
         end
+        if event.stable_directory_write ~= nil and type(event.stable_directory_write) ~= "boolean" then
+          fail("invalid directory write classification"); return
+        end
+        if event.stable_directory_write == true
+            and (value.stream ~= "write" or action ~= 3 or event.directory ~= true) then
+          fail("invalid directory write classification"); return
+        end
         batch[#batch + 1] = { path, { change = action == 3, rename = action ~= 3,
-          action = action, directory = event.directory == true } }
+          action = action, directory = event.directory == true, stream = value.stream,
+          stable_directory_write = event.stable_directory_write == true } }
       end
       for _, event in ipairs(batch) do
         if not alive() then return end

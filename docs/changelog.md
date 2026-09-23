@@ -61,8 +61,10 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 - `v1.12.2` → [docs/release_1.12.2.md](release_1.12.2.md) (diagnostic stage; tag pending)
 - `v1.12.3` → [docs/release_1.12.3.md](release_1.12.3.md) (demand-driven recovery; tag pending)
 - `v1.12.4` → [docs/release_1.12.4.md](release_1.12.4.md) (native junction verification; later ancestor-event fallback recorded; tag pending)
+- `v1.12.5` → [docs/release_1.12.5.md](release_1.12.5.md) (stable directory writes and complete ancestor watches; tag pending)
 
 ## Unreleased
 
-No unreleased entries. Native cache-junction verification is archived in
-[v1.12.4](release_1.12.4.md); runtime behavior is unchanged and full-engine acceptance remains unfinished.
+No unreleased entries. The directory-notification repair and verification are archived
+in [v1.12.5](release_1.12.5.md). Live code is updated; an existing modified document
+currently requires original fallback, and whole-engine acceptance remains unfinished.

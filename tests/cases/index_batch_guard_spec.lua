@@ -119,6 +119,63 @@ t.describe("frozen batch live validity guard", function()
     t.assert_true(h.client:request("textDocument/definition", {}, function() end))
   end)
 
+  t.it("retains the first filesystem event independently of callback and status mutations", function()
+    local h = harness()
+    h.callbacks.verify({ ok = true }); h.flush()
+    t.assert_nil(h.guard:status().event)
+    local native = { action = 3, directory = false, change = true, rename = false }
+    h.watches[1].callback(nil, "Nested/input.h", native)
+    local expected = { root = h.watches[1].root, filename = "Nested/input.h",
+      action = 3, directory = false, change = true, rename = false }
+    t.assert_true(vim.deep_equal(h.guard:status().event, expected), "first event identity must survive invalidation")
+    native.action, native.change = 5, false
+    local copy = h.guard:status().event
+    copy.root, copy.filename, copy.action, copy.error = "/other", "changed.h", 1, "caller mutation"
+    h.watches[2].callback("late error", "another.h", { action = 5, rename = true })
+    h.flush()
+    t.assert_eq(h.callbacks.reason, "input-changed")
+    t.assert_eq(h.callbacks.invalidated, 1)
+    t.assert_true(vim.deep_equal(h.guard:status().event, expected), "late callbacks and caller edits must not replace evidence")
+    h.guard:stop(); h.watches[1].callback(nil, "after-stop.h", {}); h.flush()
+    t.assert_true(vim.deep_equal(h.guard:status().event, expected), "stopping must preserve the first event")
+  end)
+
+  t.it("bounds filesystem evidence without inventing absent paths, flags or nonfilesystem events", function()
+    local missing = harness()
+    missing.watches[1].callback(string.rep("e", 2049), nil,
+      { action = "3", directory = "true", change = 1, rename = false })
+    local event = missing.guard:status().event
+    t.assert_type(event, "table")
+    t.assert_eq(event.root, missing.watches[1].root)
+    t.assert_nil(event.filename)
+    t.assert_eq(event.error, string.rep("e", 2048))
+    t.assert_true(event.truncated)
+    t.assert_nil(event.action); t.assert_nil(event.directory); t.assert_nil(event.change)
+    t.assert_eq(event.rename, false)
+    missing.flush(); t.assert_eq(missing.callbacks.reason, "watch-error")
+
+    local root, filename = "/" .. string.rep("r", 32768), string.rep("f", 32769)
+    local oversized = harness({ roots = { root } })
+    oversized.watches[1].callback(nil, filename, { action = 5, directory = true, change = false, rename = true })
+    event = oversized.guard:status().event
+    t.assert_eq(event.root, root:sub(1, 32768)); t.assert_eq(event.filename, filename:sub(1, 32768))
+    t.assert_nil(event.error); t.assert_true(event.truncated)
+    t.assert_eq(event.action, 5); t.assert_eq(event.directory, true)
+    t.assert_eq(event.change, false); t.assert_eq(event.rename, true)
+    oversized.flush()
+    for _, action in ipairs({ 0, 6, 1.5 }) do
+      local invalid = harness()
+      invalid.watches[1].callback(nil, "input.h", { action = action })
+      t.assert_nil(invalid.guard:status().event.action, "only integer native actions 1..5 may be retained")
+      invalid.flush()
+    end
+    local other = harness()
+    other.guard:invalidate("activation-metadata-changed")
+    other.watches[1].callback(nil, "late.h", { action = 1, rename = true }); other.flush()
+    t.assert_nil(other.guard:status().event, "nonfilesystem invalidation must not acquire a fabricated late path")
+    t.assert_eq(other.callbacks.reason, "activation-metadata-changed")
+  end)
+
   t.it("discards a synchronous response when an input event arrives during the wait", function()
     local h = harness()
     h.client.request_sync = function()

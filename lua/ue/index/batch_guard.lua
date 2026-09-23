@@ -53,6 +53,28 @@ local function release(handle)
   if type(handle.close) == "function" then pcall(handle.close, handle) end
 end
 
+local function event_evidence(root, filename, events, err)
+  local result = {}
+  local function bounded(value, limit)
+    if type(value) ~= "string" then return nil end
+    if #value > limit then result.truncated = true; return value:sub(1, limit) end
+    return value
+  end
+  result.root = bounded(root, 32768)
+  result.filename = bounded(filename, 32768)
+  result.error = err ~= nil and bounded(tostring(err), 2048) or nil
+  if type(events) == "table" then
+    local action = events.action
+    if type(action) == "number" and action >= 1 and action <= 5 and action % 1 == 0 then
+      result.action = action
+    end
+    for _, name in ipairs({ "directory", "change", "rename" }) do
+      if type(events[name]) == "boolean" then result[name] = events[name] end
+    end
+  end
+  return result
+end
+
 --- Start with the original semantic CDB still published. The caller may publish
 --- the batch only in on_ready, and must restore the original view on_invalidated.
 --- String roots are recursive; {path=...,recursive=false} roots watch only
@@ -74,6 +96,7 @@ function M.start(ctx, client, opts)
   local cancel_verification
   local close_watches = opts.close_watches
   local invalidation_delivered = false
+  local invalidation_event
   local guard = {}
 
   local function stale_error()
@@ -112,7 +135,8 @@ function M.start(ctx, client, opts)
   end
 
   function guard:status()
-    return { state = state, epoch = epoch, reason = reason, watch_count = #watches }
+    return { state = state, epoch = epoch, reason = reason, watch_count = #watches,
+      event = invalidation_event and vim.deepcopy(invalidation_event) or nil }
   end
 
   function guard:invalidate(why)
@@ -247,7 +271,9 @@ function M.start(ctx, client, opts)
         if ok ~= true then guard:invalidate("watch-ready-failed"); return end
         if installed then schedule(maybe_verify) end
       end
-      local ok, handle, capability = pcall(watch_factory, root.path, function(err)
+      local ok, handle, capability = pcall(watch_factory, root.path, function(err, filename, events)
+        if state == "invalidated" or state == "stopped" then return end
+        invalidation_event = event_evidence(root.path, filename, events, err)
         guard:invalidate(err and "watch-error" or "input-changed")
       end, { recursive = root.recursive, on_ready = ready })
       local valid_handle = (type(handle) == "table" or type(handle) == "userdata")

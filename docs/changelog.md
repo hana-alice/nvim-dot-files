@@ -59,8 +59,9 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 - `v1.12.0` → [docs/release_1.12.0.md](release_1.12.0.md) (incremental scope; tag pending)
 - `v1.12.1` → [docs/release_1.12.1.md](release_1.12.1.md) (tag pending)
 - `v1.12.2` → [docs/release_1.12.2.md](release_1.12.2.md) (diagnostic stage; tag pending)
+- `v1.12.3` → [docs/release_1.12.3.md](release_1.12.3.md) (demand-driven recovery; tag pending)
 
 ## Unreleased
 
-No unreleased entries. The bounded first-event evidence change is archived in
-[v1.12.2](release_1.12.2.md); safe recovery and sustained frozen activation remain unfinished.
+No unreleased entries. Demand-driven frozen recovery is archived in
+[v1.12.3](release_1.12.3.md); sustained sessions and full-engine performance remain unfinished.

@@ -8,7 +8,7 @@ local function fixture(body)
   vim.fn.mkdir(root, "p")
   root = vim.fs.normalize(assert(vim.uv.fs_realpath(root)))
   vim.fn.mkdir(root .. "/background/verified", "p")
-  local h = { queue = {}, calls = {}, watches = {}, restarts = {}, roots = {}, config = {}, stamp = "metadata-v1", generation = "gen-a" }
+  local h = { queue = {}, calls = {}, watches = {}, restarts = {}, roots = {}, config = {}, stamp = "metadata-v1", generation = "gen-a", now = 0 }
   h.ctx = { paths = { clangd_dir = root, semantic_cdb = root .. "/background/compile_commands.json" } }
   h.command = { "clangd", "--background-index", "--compile-commands-dir=" .. root .. "/background" }
   h.descriptor = { ok = true, info_sha256 = "sha-v1", generation_id = "gen-a", compiler_environment = {}, tool_path = root .. "/clangd.exe",
@@ -24,6 +24,7 @@ local function fixture(body)
     get_config = function() return h.config end,
     fingerprint = function() return h.stamp end,
     get_generation = function() return h.generation end,
+    now_ms = function() return h.now end,
     schedule = function(callback) h.queue[#h.queue + 1] = callback end,
     probe_recursive = function(callback) callback(h.capable ~= false) end,
     run_async = function(_, _, mode, callback, request)
@@ -208,6 +209,157 @@ t.describe("frozen batch startup runtime", function()
       t.assert_eq(config.cmd_env.EXISTING, "retained")
       h.prepare()
       t.assert_eq(#h.calls, 2, "failed frozen input stays original for the same metadata")
+    end)
+  end)
+
+  t.it("retries an input change only on demand after thirty seconds and shares the pending attempt", function()
+    fixture(function(h)
+      h.prepare(); h.describe(); h.validate()
+      local old_watch = h.watches[1]
+      old_watch.callback(nil, "input.h", { action = 3, change = true }); h.flush()
+      for _, now in ipairs({ 0, 29999 }) do
+        h.now = now; h.prepare()
+        t.assert_eq(#h.calls, 2, "early demand must retain original commands without helpers")
+        t.assert_true(vim.deep_equal(runtime.command(h.command), h.command))
+      end
+      h.now = 30000; h.flush()
+      t.assert_eq(#h.calls, 2, "elapsed time alone must not start recovery")
+      local delivered = #h.roots
+      h.prepare(); h.prepare()
+      t.assert_eq(#h.calls, 3, "simultaneous demand must share one fresh descriptor")
+      t.assert_eq(h.calls[3].mode, "describe")
+      t.assert_eq(#h.roots, delivered, "retry waiters must not be released before fresh validation")
+      t.assert_true(vim.deep_equal(runtime.command(h.command), h.command))
+      h.describe()
+      t.assert_eq(#h.calls, 4); t.assert_eq(h.calls[4].mode, "validate")
+      old_watch.callback(nil, "late-old-event.h", {}); h.flush()
+      t.assert_true(vim.deep_equal(runtime.command(h.command), h.command), "descriptor alone grants no authority")
+      h.validate()
+      t.assert_eq(#h.roots, delivered + 2)
+      t.assert_contains(runtime.command(h.command)[3], "/verified")
+      h.now = 90000; h.prepare()
+      t.assert_eq(#h.calls, 4, "ready reuse must not start another recovery")
+      t.assert_eq(#h.restarts, 1, "demand-driven recovery must not itself restart a client")
+    end)
+  end)
+
+  t.it("rejects late retry validation when another input event restarts the failure cooldown", function()
+    fixture(function(h)
+      h.prepare(); h.describe(); h.validate()
+      h.watches[1].callback(nil, "first.h", {}); h.flush()
+      local old_count = #h.watches
+      h.now = 30000; h.prepare()
+      t.assert_eq(#h.calls, 3)
+      h.describe()
+      t.assert_eq(#h.calls, 4)
+      h.now = 30010
+      h.watches[old_count + 1].callback(nil, "changed-during-retry.h", {})
+      h.calls[4].callback(h.result()); h.flush()
+      t.assert_true(vim.deep_equal(runtime.command(h.command), h.command), "stale retry validation cannot reactivate")
+      h.now = 60009; h.prepare()
+      t.assert_eq(#h.calls, 4, "retry cooldown must start at the latest failure")
+      h.now = 60010; h.prepare()
+      t.assert_eq(#h.calls, 5); t.assert_eq(h.calls[5].mode, "describe")
+    end)
+  end)
+
+  t.it("waits for cancelled helper exit and never lets duplicate old completion settle newer work", function()
+    fixture(function(h)
+      h.prepare(); h.describe()
+      local old_validate = h.calls[2].callback
+      h.watches[1].callback(nil, "changed-during-validation.h", {}); h.flush()
+      h.now = 30000; h.prepare()
+      t.assert_eq(#h.calls, 2, "cancellation is not evidence that the old validation helper exited")
+      t.assert_true(vim.deep_equal(runtime.command(h.command), h.command))
+      old_validate(h.result()); h.flush()
+      t.assert_true(vim.deep_equal(runtime.command(h.command), h.command), "old success cannot reactivate failed authority")
+      local previous_watches = #h.watches
+      h.prepare(); t.assert_eq(#h.calls, 3)
+      h.describe(); t.assert_eq(#h.calls, 4)
+      local retry_validate = h.calls[4].callback
+      old_validate(h.result()); h.flush()
+      h.watches[previous_watches + 1].callback(nil, "changed-during-retry.h", {}); h.flush()
+      h.now = 60000; h.prepare()
+      t.assert_eq(#h.calls, 4, "duplicate old completion must not decrement the newer pending helper")
+      retry_validate(h.result()); h.flush()
+      t.assert_true(vim.deep_equal(runtime.command(h.command), h.command))
+      h.prepare(); t.assert_eq(#h.calls, 5)
+      h.describe(); h.validate()
+      t.assert_eq(#h.calls, 6)
+      t.assert_contains(runtime.command(h.command)[3], "/verified")
+      old_validate(h.result()); retry_validate(h.result()); h.flush()
+      h.prepare()
+      t.assert_eq(#h.calls, 6, "late duplicate completions must not create work or alter ready reuse")
+      t.assert_contains(runtime.command(h.command)[3], "/verified")
+    end)
+  end)
+
+  t.it("keeps watch errors and rejected retry proofs sticky after further demand", function()
+    for _, failure in ipairs({ "watch-error", "validation" }) do
+      fixture(function(h)
+        h.prepare(); h.describe(); h.validate()
+        h.watches[1].callback(failure == "watch-error" and "lost notifications" or nil, "input.h", {})
+        h.flush()
+        local expected = 2
+        if failure == "validation" then
+          h.now = 30000; h.prepare(); t.assert_eq(#h.calls, 3)
+          h.describe(); t.assert_eq(#h.calls, 4)
+          h.calls[4].callback(h.result({ ok = false, reason = "dependency-bytes-changed" })); h.flush()
+          expected = 4
+        end
+        h.now = 90000; h.prepare(); h.prepare()
+        t.assert_eq(#h.calls, expected, "non-input failures must not become an automatic retry policy")
+        t.assert_true(vim.deep_equal(runtime.command(h.command), h.command))
+      end)
+    end
+  end)
+
+  t.it("refuses same-metadata recovery across generation, query profile or compiler environment changes", function()
+    for _, changed in ipairs({ "generation", "profile", "environment" }) do
+      fixture(function(h, root)
+        h.config = { cmd_cwd = root, cmd_env = { CPATH = "certified-include" } }
+        vim.list_extend(h.command, { "--enable-config=false", "--query-driver=clang*" })
+        h.descriptor.server_profile = runtime.server_profile(h.command, h.config)
+        h.descriptor.compiler_environment = { CPATH = "certified-include" }
+        h.prepare(); h.describe(); h.validate()
+        h.watches[1].callback(nil, "input.h", {}); h.flush()
+        if changed == "generation" then h.generation = "gen-b"
+        elseif changed == "profile" then h.command[#h.command] = "--query-driver=other*"
+        else h.config.cmd_env.CPATH = "different-include" end
+        h.now = 30000; h.prepare()
+        h.now = 90000; h.prepare()
+        t.assert_eq(#h.calls, 2, "recovery must retain its original certificate boundary: " .. changed)
+        t.assert_true(vim.deep_equal(runtime.command(h.command, h.config), h.command))
+      end)
+    end
+  end)
+
+  t.it("does not attach a late frozen client from an earlier attempt to the fresh guard", function()
+    fixture(function(h)
+      h.prepare(); h.describe(); h.validate()
+      local old_config = {}
+      runtime.configure_process(runtime.command(h.command), old_config)
+      t.assert_true(old_config._ue_batch_attempt ~= nil, "frozen process configuration must bind its activation attempt")
+      h.watches[1].callback(nil, "input.h", {}); h.flush()
+      h.now = 30000; h.prepare(); t.assert_eq(#h.calls, 3)
+      h.describe(); h.validate()
+      local fresh_config = {}
+      runtime.configure_process(runtime.command(h.command), fresh_config)
+      t.assert_true(fresh_config._ue_batch_attempt ~= nil and fresh_config._ue_batch_attempt ~= old_config._ue_batch_attempt)
+      local function client(id, config)
+        return { id = id, config = config, attached_buffers = {}, request = function() return true, 1 end,
+          cancel_request = function() end, stop = function() end }
+      end
+      local fresh = client(702, fresh_config)
+      runtime.attach(fresh, 0)
+      t.assert_eq(fresh._ue_batch_guard.guard:status().state, "ready")
+      local late = client(701, old_config)
+      runtime.attach(late, 0); h.flush()
+      t.assert_true(not late._ue_batch_guard or late._ue_batch_guard.guard ~= fresh._ue_batch_guard.guard,
+        "same publication stamp must not let a previous attempt join the new guard")
+      if late._ue_batch_guard then t.assert_false(late._ue_batch_guard.guard:status().state == "ready") end
+      t.assert_eq(fresh._ue_batch_guard.guard:status().state, "ready", "late stale clients must not revoke fresh clients")
+      t.assert_contains(runtime.command(h.command)[3], "/verified")
     end)
   end)
 

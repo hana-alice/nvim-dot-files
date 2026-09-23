@@ -1097,3 +1097,21 @@ production validation，9.847 秒、exit0、`publication-and-receipts-current`�
 已交付首次事件留证，下一阶段实现安全复验恢复并验证持续冻结使用。保持真实输入
 变化立即撤权，不能直接放宽 watch mask 或按 basename 排除。全引擎压缩、冷/热索引
 耗时与资源验收及历史导航问题仍未完成，详见 [v1.12.2](release_1.12.2.md)。
+
+## 2026-09-23：同一份证明的按需恢复
+
+后续正常启动原先直接命中同 metadata 的 failed 记录，无法重新验证仍有效的证明。
+现仅为 `input-changed` 开放按需重试：30 秒单调冷却后，且旧 activation helper 已完成，
+重新执行 describe、监听 readiness 与完整验证。取消不等于退出；并发请求共享新 attempt，
+配置绑定独立 attempt 身份，旧客户端与旧回调不能重新获取新 guard。其他失败仍保持
+original；没有定时轮询或主动重启当前 original 客户端的循环。
+
+用新私有副本保留真实完整 publication，仅修改私有 original CDB 的 mtime、保持 bytes
+不变，真实原生事件导致撤权。30.106 秒冷却期间无新 helper；后续正常 prepare 用
+13.697 秒完成复验并恢复冻结选择，重复 prepare 1.488 ms、零 helper。历史 donor 与
+生产输入未改，Job 清理后无残留。这验证恢复机制，不是历史 Timestamp 写入者归因。
+
+全量 required-native 2126/2126、零失败/跳过；当前编辑器交付后 client24 使用 frozen CDB，
+11:03:10Z 复查仍 ready，26 watches。实际重复 prepare 15.088 ms、不重启，七份产物
+bytes/mtime 保持不变。当前只保留单组八合一，主索引进程仍有较高 CPU/内存占用，
+全工程完成耗时和资源验收未完成。测量、范围及剩余项见 [v1.12.3](release_1.12.3.md)。

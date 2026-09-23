@@ -1,8 +1,9 @@
-"""Windows content/name notifications; companion to libuv.content_events.lua.
+"""Windows source/input notifications; companion to libuv.content_events.lua.
 
-One parent-bound process, no source reads or tree scans. ReadDirectoryChangesW
-excludes libuv's last-access/attribute/security subscriptions. See Microsoft's
-ReadDirectoryChangesW, GetOverlappedResult and CancelIoEx contracts.
+Parent-bound native waits, no source reads or tree scans. The single source
+watch excludes access/attribute/security/creation subscriptions; grouped frozen
+inputs exclude only last access. See Microsoft's ReadDirectoryChangesW,
+GetOverlappedResult and CancelIoEx contracts.
 """
 import argparse
 import ctypes
@@ -11,8 +12,10 @@ import json
 import os
 import struct
 import sys
+import threading
 
 FILTER = 0x1B  # FILE_NAME | DIR_NAME | SIZE | LAST_WRITE
+INPUT_FILTER = 0x15F  # All libuv input categories except LAST_ACCESS (0x20).
 CAPACITY = 64 * 1024  # DWORD aligned; also within the documented SMB limit.
 
 
@@ -70,7 +73,7 @@ def emit(record):
     print(json.dumps(dict(v=1, **record), ensure_ascii=True, separators=(',', ':')), flush=True)
 
 
-def watch(root, parent_pid, *, capacity=CAPACITY, output=emit):
+def watch(root, parent_pid, *, capacity=CAPACITY, output=emit, recursive=True, notification_filter=FILTER):
     native = Native()
     root = os.path.abspath(root)
     if not os.path.isdir(root):
@@ -89,7 +92,7 @@ def watch(root, parent_pid, *, capacity=CAPACITY, output=emit):
         native.checked(native.ResetEvent(signal))
         ctypes.memset(ctypes.byref(overlapped), 0, ctypes.sizeof(overlapped))
         overlapped.hEvent = signal
-        native.checked(native.ReadDirectoryChangesW(directory, buffer, capacity, True, FILTER,
+        native.checked(native.ReadDirectoryChangesW(directory, buffer, capacity, recursive, notification_filter,
                                                     None, ctypes.byref(overlapped), None))
         pending = True
 
@@ -139,13 +142,74 @@ def watch(root, parent_pid, *, capacity=CAPACITY, output=emit):
                 native.CloseHandle(handle)
 
 
+def watch_group(parent_pid):
+    """One bounded input group; each thread owns its overlapped I/O buffers."""
+    raw = sys.stdin.buffer.readline(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024 or not raw.endswith(b'\n'):
+        raise ValueError('invalid group configuration frame')
+    config = json.loads(raw)
+    roots = config.get('roots') if isinstance(config, dict) and config.get('v') == 1 else None
+    if not isinstance(roots, list) or not 1 <= len(roots) <= 288:
+        raise ValueError('invalid group roots')
+    recursive_count = direct_count = 0
+    seen = set()
+    for position, root in enumerate(roots, 1):
+        if (not isinstance(root, dict) or root.get('id') != position
+                or not isinstance(root.get('path'), str) or not os.path.isabs(root['path'])
+                or any(c in root['path'] for c in '\0\r\n') or type(root.get('recursive')) is not bool):
+            raise ValueError('invalid group root')
+        key = (os.path.normcase(os.path.abspath(root['path'])), root['recursive'])
+        if key in seen:
+            raise ValueError('duplicate group root')
+        seen.add(key)
+        recursive_count += root['recursive']
+        direct_count += not root['recursive']
+    if recursive_count > 32 or direct_count > 256:
+        raise ValueError('group root budget exceeded')
+    output_lock = threading.Lock()
+
+    def output(root_id, record):
+        with output_lock:
+            emit(dict(record, root_id=root_id))
+
+    def run(root):
+        try:
+            watch(root['path'], parent_pid, recursive=root['recursive'], notification_filter=INPUT_FILTER,
+                  output=lambda record: output(root['id'], record))
+            raise RuntimeError('input watch unexpectedly returned')
+        except BaseException as error:
+            try:
+                output(root['id'], {'kind': 'error', 'error': str(error)})
+            finally:
+                os._exit(2)
+
+    def input_closed():
+        # No second command is supported. EOF or unexpected input ends the
+        # process, letting the OS cancel all outstanding requests atomically.
+        sys.stdin.buffer.read(1)
+        os._exit(2)
+
+    threading.Thread(target=input_closed, daemon=True).start()
+    for root in roots:
+        threading.Thread(target=run, args=(root,), daemon=True).start()
+    threading.Event().wait()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('root')
-    parser.add_argument('parent_pid', type=int)
+    parser.add_argument('root', nargs='?')
+    parser.add_argument('parent_pid', type=int, nargs='?')
+    parser.add_argument('--group', type=int, metavar='PARENT_PID')
     args = parser.parse_args()
     try:
-        watch(args.root, args.parent_pid)
+        if args.group is not None:
+            if args.root is not None or args.parent_pid is not None:
+                raise ValueError('group mode does not accept positional roots')
+            watch_group(args.group)
+        else:
+            if args.root is None or args.parent_pid is None:
+                raise ValueError('root and parent_pid required')
+            watch(args.root, args.parent_pid)
     except Exception as error:
         try:
             emit({'kind': 'error', 'error': str(error), 'winerror': getattr(error, 'winerror', None)})

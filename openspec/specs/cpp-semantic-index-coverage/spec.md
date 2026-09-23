@@ -159,6 +159,15 @@ phase manifest SHALL 绑定独立原始 semantic CDB 的路径与内容。native
 - **THEN** SHALL 先建立经过宿主能力验证的输入监听，再异步验证 receipts 和发布内容，成功后才选择冻结 CDB
 - **AND** 主循环 MUST NOT 扫描依赖或同步计算大型 CDB/hash；能力缺失或验证失败 SHALL 使用原 UBT CDB
 
+#### Scenario: Windows validation reads its own watched input directories
+- **WHEN** reading inputs updates only their last-access timestamps
+- **THEN** the Windows frozen-input watcher SHALL exclude LAST_ACCESS at the native subscription, without revoking otherwise current batch authority
+- **AND** it SHALL retain filename, directory-name, attributes, size, last-write, creation and security notifications; source-only notification filtering MUST NOT substitute for this input guard
+- **AND** recursive and direct capability probes SHALL exercise the selected backend and notification profile on owned temporary inputs
+- **AND** asynchronous watch registration SHALL remain unavailable for batch authority until every required root acknowledges that its native subscription is armed
+- **AND** early input events, unavailable roots, overflow, helper exit, malformed notifications and readiness failure SHALL revoke authority, including during partial installation
+- **AND** grouped native watches SHALL share one parent-bound helper per activation, respect the existing root budgets and release the whole group on invalidation or cancellation; pending, duplicate or late readiness MUST NOT start validation
+
 #### Scenario: The server uses a query-driver profile not covered by the proof
 - **WHEN** effective server arguments contain a nonempty query-driver allowlist and receipts do not certify that driver-query profile
 - **THEN** automatic build/activation SHALL retain original UBT commands and preserve the user's server arguments and environment

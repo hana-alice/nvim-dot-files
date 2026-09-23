@@ -6,6 +6,7 @@ local fs = require("ue.core.fs")
 local records, verified_dirs = {}, {}
 local recursive_capability, probe_waiters
 local direct_capability, direct_waiters
+local recursive_backend, direct_backend
 
 local function key(path)
   return platform.driver().path_key(vim.fs.normalize(path))
@@ -203,21 +204,44 @@ local function run_cli(info, clangd, mode, callback, request)
   return function() pcall(handle.kill, handle, 15) end
 end
 
+local function native_watch(root, callback, options)
+  local handle = uv.new_fs_event()
+  if not handle then return nil end
+  local ok, started = pcall(handle.start, handle, root, { recursive = options.recursive }, callback)
+  if not ok or not started then handle:close(); return nil end
+  return handle, { recursive = options.recursive == true, direct = options.recursive == false }
+end
+
+local function watch_backend(roots)
+  local factory = platform.driver().input_event_watcher
+  if not factory then return native_watch end
+  local session, reason = factory(roots)
+  if not session then return nil, nil, reason end
+  return function(root, callback, options) return session:watch(root, callback, options) end,
+    function() session:close() end
+end
+
 -- libuv can accept recursive=true on hosts that do not implement recursion.
 -- Prove an actual nested event once, using only a small owned temporary tree.
 local function probe_recursive(callback)
+  local backend = platform.driver().input_event_watcher or native_watch
+  if recursive_backend ~= backend then
+    if probe_waiters then callback(false); return end
+    recursive_backend, recursive_capability = backend, nil
+  end
   if recursive_capability ~= nil then callback(recursive_capability); return end
   if probe_waiters then probe_waiters[#probe_waiters + 1] = callback; return end
   probe_waiters = { callback }
   local root = vim.fn.tempname() .. "_frozen_watch_probe"
   local nested, file = root .. "/nested", root .. "/nested/probe"
-  local watch, timer
+  local watch, timer, close_watches
   local finished = false
   local function finish(capable)
     if finished then return end
     finished = true
     vim.schedule(function()
       if watch then pcall(watch.stop, watch); pcall(watch.close, watch) end
+      if close_watches then pcall(close_watches) end
       if timer then pcall(timer.stop, timer); pcall(timer.close, timer) end
       pcall(uv.fs_unlink, file)
       pcall(uv.fs_rmdir, nested)
@@ -230,39 +254,44 @@ local function probe_recursive(callback)
   end
   local ok = pcall(function()
     vim.fn.mkdir(nested, "p")
-    watch = assert(uv.new_fs_event())
-    local started = watch:start(root, { recursive = true }, function(err, filename)
+    local factory
+    factory, close_watches = watch_backend({ { path = root, recursive = true } })
+    assert(factory)
+    timer = assert(uv.new_timer())
+    timer:start(10000, 0, function() finish(false) end)
+    local function ready(capable)
+      if not capable then finish(false); return end
+      vim.schedule(function() if not finished then vim.fn.writefile({ "probe" }, file) end end)
+    end
+    local capability
+    watch, capability = factory(root, function(err, filename)
       if err then finish(false)
       elseif filename and filename:gsub("\\", "/") == "nested/probe" then finish(true) end
-    end)
-    if not started then finish(false); return end
-    timer = assert(uv.new_timer())
-    timer:start(1000, 0, function() finish(false) end)
-    vim.fn.writefile({ "probe" }, file)
+    end, { recursive = true, on_ready = ready })
+    if not watch or not capability or not capability.recursive then finish(false); return end
+    if capability.pending ~= true then ready(true) end
   end)
   if not ok then finish(false) end
 end
 
-local function native_watch(root, callback, options)
-  local handle = uv.new_fs_event()
-  if not handle then return nil end
-  local ok, started = pcall(handle.start, handle, root, options, callback)
-  if not ok or not started then handle:close(); return nil end
-  return handle, { recursive = options.recursive == true, direct = options.recursive == false }
-end
-
 local function probe_direct(callback)
+  local backend = platform.driver().input_event_watcher or native_watch
+  if direct_backend ~= backend then
+    if direct_waiters then callback(false); return end
+    direct_backend, direct_capability = backend, nil
+  end
   if direct_capability ~= nil then callback(direct_capability); return end
   if direct_waiters then direct_waiters[#direct_waiters + 1] = callback; return end
   direct_waiters = { callback }
   local root = vim.fn.tempname() .. "_frozen_direct_probe"
-  local watch, timer, expected, advance
+  local watch, timer, expected, advance, close_watches
   local finished, step = false, 0
   local function finish(capable)
     if finished then return end
     finished = true
     vim.schedule(function()
       if watch then pcall(watch.stop, watch); pcall(watch.close, watch) end
+      if close_watches then pcall(close_watches) end
       if timer then pcall(timer.stop, timer); pcall(timer.close, timer) end
       pcall(uv.fs_unlink, root .. "/link")
       pcall(uv.fs_unlink, root .. "/candidate")
@@ -295,14 +324,22 @@ local function probe_direct(callback)
   local ok = pcall(function()
     for _, name in ipairs({ "lookup", "target-a", "target-b" }) do vim.fn.mkdir(root .. "/" .. name, "p") end
     assert(uv.fs_symlink(root .. "/target-a", root .. "/link", platform.driver().directory_symlink_options()))
-    watch = assert(uv.new_fs_event())
-    assert(watch:start(root, { recursive = false }, function(err, filename)
+    local factory
+    factory, close_watches = watch_backend({ { path = root, recursive = false } })
+    assert(factory)
+    timer = assert(uv.new_timer())
+    timer:start(10000, 0, function() finish(false) end)
+    local function ready(capable)
+      if not capable then finish(false); return end
+      vim.schedule(advance)
+    end
+    local capability
+    watch, capability = factory(root, function(err, filename)
       if err then finish(false)
       elseif expected and filename == expected then expected = nil; vim.schedule(advance) end
-    end))
-    timer = assert(uv.new_timer())
-    timer:start(1500, 0, function() finish(false) end)
-    advance()
+    end, { recursive = false, on_ready = ready })
+    if not watch or not capability or not capability.direct then finish(false); return end
+    if capability.pending ~= true then ready(true) end
   end)
   if not ok then finish(false) end
 end
@@ -324,12 +361,12 @@ local function fallback(record, reason)
   record.clients = {}
 end
 
-local function filtered_watch(record, descriptor)
+local function filtered_watch(record, descriptor, backend)
   local watched, excludes, inputs = {}, {}, {}
   for _, path in ipairs(descriptor.watched_files or {}) do watched[key(path)] = true end
   for _, path in ipairs(descriptor.exclude_roots or {}) do excludes[#excludes + 1] = key(path) end
   for _, path in ipairs(descriptor.input_roots or {}) do inputs[#inputs + 1] = key(path) end
-  local factory = record.opts.watch_factory or native_watch
+  local factory = backend or record.opts.watch_factory or native_watch
   return function(root, callback, options)
     return factory(root, function(err, filename, events)
       if err or not filename then callback(err or "watch-event-without-path"); return end
@@ -468,7 +505,12 @@ function M.prepare(bufnr, root, on_dir, opts)
       for _, path in ipairs(descriptor.lookup_roots or {}) do roots[#roots + 1] = { path = path, recursive = false } end
       record.guard = require("ue.index.batch_guard").start(ctx, nil, {
         receipts = descriptor.receipts or { info }, roots = roots,
-        schedule = opts.schedule, watch_factory = filtered_watch(record, descriptor),
+        schedule = opts.schedule,
+        watch_factory = opts.watch_factory and filtered_watch(record, descriptor) or nil,
+        watch_backend = not opts.watch_factory and function(required)
+          local factory, close = watch_backend(required)
+          return factory and filtered_watch(record, descriptor, factory) or nil, close
+        end or nil,
         verify_async = function(_, callback)
           return run(info, clangd, "validate", function(result)
             if not current() or type(result) ~= "table" or result.info_sha256 ~= record.info_sha256

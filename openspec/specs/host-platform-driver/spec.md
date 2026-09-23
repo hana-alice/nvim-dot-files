@@ -51,6 +51,13 @@
 - **AND** the helper SHALL reuse the existing Python runtime, wait for native events without main-thread polling, and terminate when its captured editor process exits
 - **AND** other hosts SHALL retain their existing libuv watcher; generic source logic MUST NOT perform a new OS probe
 
+#### Scenario: Windows exposes grouped frozen-input watching
+- **WHEN** frozen batch activation selects the Windows driver
+- **THEN** it SHALL obtain the optional input-event watcher through that driver and the existing Python resolver
+- **AND** one parent-bound helper SHALL provide bounded recursive and direct subscriptions, acknowledging each root only after native arming
+- **AND** this profile SHALL omit only access-time notifications while retaining input namespace, content, attributes, creation and security changes
+- **AND** a declared but unavailable input backend SHALL reject activation; other hosts SHALL retain their host-probed libuv backend without declaring a fake Windows capability
+
 #### Scenario: 缺失能力直接失败，不静默降级
 
 - **WHEN** 调用方需要一个当前宿主没有声明的可选能力

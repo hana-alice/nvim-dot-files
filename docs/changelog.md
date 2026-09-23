@@ -60,8 +60,9 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 - `v1.12.1` → [docs/release_1.12.1.md](release_1.12.1.md) (tag pending)
 - `v1.12.2` → [docs/release_1.12.2.md](release_1.12.2.md) (diagnostic stage; tag pending)
 - `v1.12.3` → [docs/release_1.12.3.md](release_1.12.3.md) (demand-driven recovery; tag pending)
+- `v1.12.4` → [docs/release_1.12.4.md](release_1.12.4.md) (native junction verification; tag pending)
 
 ## Unreleased
 
-No unreleased entries. Demand-driven frozen recovery is archived in
-[v1.12.3](release_1.12.3.md); sustained sessions and full-engine performance remain unfinished.
+No unreleased entries. Native cache-junction verification is archived in
+[v1.12.4](release_1.12.4.md); runtime behavior is unchanged and full-engine acceptance remains unfinished.

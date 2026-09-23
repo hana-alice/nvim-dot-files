@@ -56,6 +56,7 @@ local function fixture(body)
   local ok, err = xpcall(function() body(h, root) end, debug.traceback)
   runtime._reset_for_test()
   h.flush()
+  if h.unlink_junction then h.unlink_junction() end -- A failed unlink must prevent recursive fixture cleanup.
   vim.fn.delete(root, "rf")
   if not ok then error(err) end
 end
@@ -847,6 +848,50 @@ t.describe("frozen batch startup runtime", function()
       end)
     end
   end)
+
+  for _, component in ipairs({ "verified", "verified/.cache", "verified/.cache/clangd", "verified/.cache/clangd/index" }) do
+    t.it("rejects a real Windows junction at the owned cache component " .. component, function()
+      local driver = require("utils.platform").driver()
+      if driver.id ~= "windows" then t.skip("Windows cache junction guard", "Windows host required"); return end
+      fixture(function(h, root)
+        local uv, fs = vim.uv, require("ue.core.fs")
+        local target, link = root .. "/redirect-target", root .. "/background/" .. component
+        vim.fn.mkdir(target, "p")
+        vim.fn.mkdir(vim.fs.dirname(link), "p")
+        local owned = vim.fs.normalize(assert(uv.fs_realpath(root)))
+        t.assert_true(fs.is_absolute_path(link) and fs.path_has_prefix(link, owned)
+          and fs.path_has_prefix(vim.fs.normalize(assert(uv.fs_realpath(target))), owned),
+          "junction and target must remain inside the canonical fixture root")
+        if uv.fs_lstat(link) then assert(uv.fs_rmdir(link)) end -- Only the fixture's empty verified directory exists.
+        local sentinel = target .. "/sentinel.txt"
+        vim.fn.writefile({ "preserve target bytes" }, sentinel)
+        local before = { bytes = vim.fn.readfile(sentinel, "b"), mtime = assert(uv.fs_stat(sentinel)).mtime,
+          names = vim.fn.readdir(target), directory_mtime = assert(uv.fs_stat(target)).mtime }
+        table.sort(before.names)
+        local created, reason = uv.fs_symlink(target, link, driver.directory_symlink_options())
+        if not created then t.skip("native Windows cache junction", reason, { native = true }); return end
+        h.unlink_junction = function()
+          assert(uv.fs_unlink(link), "remove junction before recursive fixture cleanup")
+          t.assert_nil(uv.fs_lstat(link), "junction must be gone before recursive fixture cleanup")
+          t.assert_true(vim.deep_equal(vim.fn.readfile(sentinel, "b"), before.bytes), "unlink must preserve target bytes")
+        end
+        t.assert_eq(vim.fs.normalize(assert(uv.fs_realpath(link))), vim.fs.normalize(target), "exercise a real redirected directory")
+        h.prepare(); h.describe()
+        t.assert_eq(#h.calls, 1, "redirected cache must reject before the validation helper")
+        t.assert_eq(#h.watches, 0, "redirected cache must reject before guard watch installation")
+        t.assert_eq(#h.roots, 1, "original startup must be released on rejection")
+        t.assert_true(vim.deep_equal(runtime.command(h.command), h.command))
+        local config = {}
+        t.assert_true(vim.deep_equal(runtime.configure_process(h.command, config), h.command))
+        t.assert_nil(config._ue_batch_scope, "rejected cache must not bind a frozen process")
+        local names = vim.fn.readdir(target); table.sort(names)
+        t.assert_true(vim.deep_equal(names, before.names), "cache preparation must not create entries through the junction")
+        t.assert_true(vim.deep_equal(vim.fn.readfile(sentinel, "b"), before.bytes))
+        t.assert_true(vim.deep_equal(assert(uv.fs_stat(sentinel)).mtime, before.mtime), "target sentinel mtime changed")
+        t.assert_true(vim.deep_equal(assert(uv.fs_stat(target)).mtime, before.directory_mtime), "target directory mtime changed")
+      end)
+    end)
+  end
 
   t.it("revokes immediately when a watched ancestor of an input root is renamed", function()
     fixture(function(h, root)

@@ -1115,3 +1115,14 @@ original；没有定时轮询或主动重启当前 original 客户端的循环�
 11:03:10Z 复查仍 ready，26 watches。实际重复 prepare 15.088 ms、不重启，七份产物
 bytes/mtime 保持不变。当前只保留单组八合一，主索引进程仍有较高 CPU/内存占用，
 全工程完成耗时和资源验收未完成。测量、范围及剩余项见 [v1.12.3](release_1.12.3.md)。
+
+随后补齐四级 owned cache 目录的真实 Windows junction 回归：原实现均在验证器和
+watch 安装前拒绝重定向，目标内容、目录项与 mtime 不变；清理先解除 junction，失败
+则不递归删除。专项 required-native 54/54，全量 2130/2130，零失败/跳过，未改运行时。
+该项历史测试缺口已关闭，见 [v1.12.4](release_1.12.4.md)。
+
+持续观察另记录了 11:13:16Z、11:14:08Z 两次渲染源码文件修改事件；11:15:29Z 已是
+冻结 client27、attempt3、ready26。日志缺少旧 client/attempt 身份和事前文件字节，
+不能强行归因写入者或逐项绑定旧客户端。没有找到 client24 的留存 BackgroundIndex
+完成时间；LSP 日志关闭，UI 历史仅保留无关旧进度。缺少记录不证明完成或未完成，
+后续性能实测须显式保留按客户端区分的开始/结束证据，不能用 guard ready 或计数替代。

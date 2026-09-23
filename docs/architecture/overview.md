@@ -47,6 +47,8 @@
   二次批次由独立原 TU 完整图证明，冻结输入与 receipt 绑定；原 semantic CDB 继续负责 native
   definition，冻结 BackgroundIndex 使用独立目录与缓存。先监听再异步验证才可启用；输入变化
   立即撤销 references/rename epoch，并退回原 UBT 路径。详细契约见 `cpp-semantic-index-coverage`。
+  `batch_documents.lua` 仅筛选相关的已加载未保存文档；`batch_runtime.lua` 保留 CDB 归属、
+  撤权和重验职责。脏文档阻止启动；清洁后的新请求仍需经过冷却、helper 退出及完整验证。
   已接受的非连续分组可用有界提示定位，但仍经过完整证书验证与分组大小上限。current/hot 的
   大 CDB 筛选由现有 Python 构建进程调用隔离 Neovim worker，复用原 Lua 模块分类；主线程只
   交付小型选择请求。worker 校验 active 输入、编辑器/Python 存活及 build lease，原子发布子集；

@@ -1,5 +1,21 @@
 # C++ indexing 再次出现万级任务 — 2026-09-16
 
+## 冷缓存启动修复 — 2026-09-23（v1.12.1）
+
+真实工程发布副本的受控 A/B 捕获到：旧实现创建缓存并写临时文件后仍 ready，随后 rename
+触发 `verified` 父目录的 action=3/directory=true 通知，guard 立即失效。新实现在监听安装前
+准备 canonical 自有缓存目录，相同操作保持 ready；没有忽略父目录事件或削弱真实变更保护。
+两轮输入和证明资产保持不变，原始/冻结 CDB 字节一致，全部实验子进程退出。
+
+LLVM 22.1.5 的磁盘索引存储会创建本地缓存目录并写 `.gitignore`，shard 也通过
+`writeToOutput` 发布，源码见 [BackgroundIndexStorage.cpp](https://github.com/llvm/llvm-project/blob/llvmorg-22.1.5/clang-tools-extra/clangd/index/BackgroundIndexStorage.cpp#L36)。
+该源码与受控实验说明了机制；不能补造历史 client14 缺失的逐事件记录。
+
+现场已载入修复并正常启动冻结客户端，检查时 guard ready；重复 prepare 19.04 ms、同客户端、
+产物不变。全量原生回归 2117/2117 通过。长会话编辑/失效恢复和整工程性能仍需后续验收，
+本次索引进程观测到峰值工作集 15.47 GB，不能把启动修复等同于资源优化完成。
+完整阶段记录见 [v1.12.1](release_1.12.1.md)。
+
 ## 阶段性交付 — 2026-09-23
 
 用户明确允许先交付一版，再持续优化。阶段版本必须保留真实二次合并、全部覆盖与失效回退；

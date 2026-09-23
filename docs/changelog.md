@@ -56,8 +56,9 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v1.11.3` → `docs/release_1.11.3.md` (tag pending explicit confirmation)
 
-- `v1.12.0` → [docs/release_1.12.0.md](release_1.12.0.md) (final validation and tag pending)
+- `v1.12.0` → [docs/release_1.12.0.md](release_1.12.0.md) (incremental scope; tag pending)
+- `v1.12.1` → [docs/release_1.12.1.md](release_1.12.1.md) (tag pending)
 
 ## Unreleased
 
-暂无新增记录；本轮工作已归档至 [v1.12.0](release_1.12.0.md)，最终验证状态见发布文档。
+暂无新增记录；冷缓存启动修复及验收边界见 [v1.12.1](release_1.12.1.md)。

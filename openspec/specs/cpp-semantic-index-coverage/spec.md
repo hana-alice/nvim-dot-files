@@ -177,6 +177,12 @@ phase manifest SHALL 绑定独立原始 semantic CDB 的路径与内容。native
 - **AND** early input events, unavailable roots, overflow, helper exit, malformed notifications and readiness failure SHALL revoke authority, including during partial installation
 - **AND** grouped native watches SHALL share one parent-bound helper per activation, respect the existing root budgets and release the whole group on invalidation or cancellation; pending, duplicate or late readiness MUST NOT start validation
 
+#### Scenario: A frozen database has no local shard-cache directory yet
+- **WHEN** startup is preparing a frozen database whose owned local cache tree does not yet exist
+- **THEN** runtime SHALL create the canonical `verified/.cache/clangd/index` directory tree before installing input watches, deriving its location from the original semantic CDB rather than an arbitrary descriptor path
+- **AND** existing directories and shard contents SHALL remain untouched; conflicting files, redirected components, an unexpected frozen CDB path or creation failure SHALL retain the original CDB
+- **AND** this preparation SHALL NOT bypass receipt validation or ignore ancestor, content, namespace or metadata notifications; first cache writes within the existing excluded tree SHALL not revoke otherwise current authority
+
 #### Scenario: The server uses a query-driver profile not covered by the proof
 - **WHEN** effective server arguments contain a nonempty query-driver allowlist and receipts do not certify that driver-query profile
 - **THEN** automatic build/activation SHALL retain original UBT commands and preserve the user's server arguments and environment

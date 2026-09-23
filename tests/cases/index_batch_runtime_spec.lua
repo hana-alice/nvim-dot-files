@@ -7,6 +7,7 @@ local function fixture(body)
   local root = vim.fn.tempname():gsub("\\", "/") .. "_batch_runtime"
   vim.fn.mkdir(root, "p")
   root = vim.fs.normalize(assert(vim.uv.fs_realpath(root)))
+  vim.fn.mkdir(root .. "/background/verified", "p")
   local h = { queue = {}, calls = {}, watches = {}, restarts = {}, roots = {}, config = {}, stamp = "metadata-v1", generation = "gen-a" }
   h.ctx = { paths = { clangd_dir = root, semantic_cdb = root .. "/background/compile_commands.json" } }
   h.command = { "clangd", "--background-index", "--compile-commands-dir=" .. root .. "/background" }
@@ -614,6 +615,56 @@ t.describe("frozen batch startup runtime", function()
       t.assert_true(vim.wait(1000, function() return #h.restarts > 0 end, 10))
       t.assert_true(vim.deep_equal(runtime.command(h.command), h.command))
     end)
+  end)
+
+  t.it("keeps first frozen cache writes from revoking their watched database parent", function()
+    fixture(function(h, root)
+      local frozen_dir = root .. "/background/verified"
+      local cache = frozen_dir .. "/.cache/clangd/index"
+      vim.fn.mkdir(frozen_dir, "p")
+      vim.fn.mkdir(root .. "/input", "p")
+      vim.fn.writefile({ "[]" }, h.descriptor.verified_cdb)
+      h.descriptor.watch_roots = { root }
+      h.descriptor.watched_files = { h.descriptor.verified_cdb, frozen_dir }
+      h.descriptor.exclude_roots = { frozen_dir .. "/.cache", root .. "/frozen-cache" }
+      h.opts.probe_recursive, h.opts.watch_factory, h.opts.schedule = nil, nil, nil
+      h.prepare(); h.describe()
+      t.assert_true(vim.wait(2500, function() return #h.calls == 2 or #h.roots == 1 end, 10))
+      if #h.calls == 1 then t.skip("cold frozen cache notifications", "host capability unavailable"); return end
+      h.calls[2].callback(h.result())
+      t.assert_true(vim.wait(1000, function() return #h.roots == 1 end, 10))
+      local cmd = runtime.configure_process(runtime.command(h.command), {})
+      t.assert_contains(cmd[3], "/verified")
+      -- Exercise the first local-cache creation and shard write that startup
+      -- performs. Real parent notifications must not revoke a fresh activation.
+      vim.fn.mkdir(cache, "p")
+      vim.fn.writefile({ "first shard" }, cache .. "/first.idx")
+      vim.wait(150, function() return false end, 10)
+      t.assert_contains(runtime.command(h.command)[3], "/verified", "own first cache write revoked activation")
+      vim.fn.writefile({ "[{}]" }, h.descriptor.verified_cdb)
+      t.assert_true(vim.wait(1000, function() return #h.restarts > 0 end, 10))
+      t.assert_true(vim.deep_equal(runtime.command(h.command), h.command), "database writes must still invalidate")
+    end)
+  end)
+
+  t.it("retains original commands when the owned cache path is blocked or the descriptor points elsewhere", function()
+    for _, scenario in ipairs({ "blocked", "foreign" }) do
+      fixture(function(h, root)
+        local foreign = root .. "/foreign"
+        if scenario == "blocked" then
+          vim.fn.writefile({ "keep" }, root .. "/background/verified/.cache")
+        else
+          h.descriptor.verified_cdb = foreign .. "/compile_commands.json"
+        end
+        h.prepare(); h.describe()
+        t.assert_eq(#h.calls, 1, "unavailable cache must fall back before input validation")
+        t.assert_true(vim.deep_equal(runtime.command(h.command), h.command))
+        t.assert_nil(vim.uv.fs_stat(foreign), "descriptor must not choose a filesystem write target")
+        if scenario == "blocked" then
+          t.assert_eq(vim.fn.readfile(root .. "/background/verified/.cache")[1], "keep")
+        end
+      end)
+    end
   end)
 
   t.it("revokes immediately when a watched ancestor of an input root is renamed", function()

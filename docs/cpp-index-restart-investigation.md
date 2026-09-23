@@ -1126,3 +1126,8 @@ watch 安装前拒绝重定向，目标内容、目录项与 mtime 不变；清�
 不能强行归因写入者或逐项绑定旧客户端。没有找到 client24 的留存 BackgroundIndex
 完成时间；LSP 日志关闭，UI 历史仅保留无关旧进度。缺少记录不证明完成或未完成，
 后续性能实测须显式保留按客户端区分的开始/结束证据，不能用 guard ready 或计数替代。
+
+最终复查更正：11:18:32Z 的配置目录祖先事件（`filename=nvim`、action3、directory=true）
+又触发 input-changed；11:26:13Z 的 guard 已 invalidated/0 watches，当前为 original
+client28。事件来源和具体后代仍未知，不能将目录事件全部忽略，也不能把时间更晚的
+本轮提交/推送认作原因。junction 54/54 与全量 2130/2130 仍有效，持续冻结使用仍未完成。

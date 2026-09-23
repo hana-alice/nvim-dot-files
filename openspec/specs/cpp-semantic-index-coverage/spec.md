@@ -92,6 +92,15 @@ BackgroundIndex 图比较，保留真实文件、定义、符号身份、关系�
 - **THEN** it SHALL retain the original UBT commands, report deferred verification, and MUST NOT start cold compiler proofs or graph replay in the delivery path
 - **AND** a separate explicitly invoked proof run MAY produce receipts; its first-run cost SHALL remain visible in performance acceptance
 
+#### Scenario: A project delivers a qualified subset before broader optimization
+- **WHEN** a project/target selects an existing proof directory in `batch-store.json` adjacent to its semantic CDB (`schema: 1`, absolute `path`)
+- **THEN** automatic current/hot/full generation SHALL pass that directory to the existing cache-only verification path and SHALL retain every unselected original and shader record
+- **AND** both generators MAY accept `--verified-batch-store` only together with `--verified-batches` and `--reuse-verified-only`; the default store and original-wrapper directory SHALL remain unchanged when no selection exists
+- **AND** the selection SHALL grant no semantic authority: current exact commands, compiler/profile/environment, dependencies, lookup inventories and frozen assets SHALL still pass the existing receipt checks
+- **AND** missing or stale receipts SHALL retain their original commands without cold qualification; malformed, relative or oversized selection metadata SHALL fail before generation while preserving published artifacts
+- **AND** the selected proof directory SHALL remain available for the lifetime of its published receipts; receipts and bound assets MUST NOT be rewritten merely to relocate proof ownership
+- **AND** a verified incremental version MAY be delivered with explicit measured scope and remaining optimization work, without claiming whole-engine performance restoration or waiving coverage, fallback and unchanged-prepare checks
+
 #### Scenario: Compatible Unity groups are packed into a larger SuperUnity
 - **WHEN** compiler-authored UBT groups belong to the same module and complete compile context
 - **THEN** candidate planning SHALL preserve their original order and indivisible membership, bounded by both original-TU count and total member-source count

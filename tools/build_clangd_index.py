@@ -151,6 +151,8 @@ def main():
                         help="prove secondary same-context batches with private clangd indexes")
     parser.add_argument("--reuse-verified-only", action="store_true",
                         help="reuse valid receipts without starting cold compiler proofs")
+    parser.add_argument("--verified-batch-store", default=None,
+                        help="absolute existing proof-store location for reuse only; caller retains its assets")
     parser.add_argument("--clangd", default=None, help="existing clangd used for batch proof")
     parser.add_argument("--server-profile", type=json.loads, default=None,
                         help="explicit supported clangd query profile JSON; never inferred from a receipt")
@@ -159,6 +161,11 @@ def main():
     parser.add_argument("--subset-request", help="small ordered current/hot subset request JSON")
     parser.add_argument("--nvim", help="absolute Neovim executable for the isolated subset worker")
     args = parser.parse_args()
+    if args.verified_batch_store is not None:
+        if not args.verified_batches or not args.reuse_verified_only:
+            parser.error("--verified-batch-store requires --verified-batches and --reuse-verified-only")
+        if not args.verified_batch_store.strip() or not Path(args.verified_batch_store).is_absolute():
+            parser.error("--verified-batch-store must be a nonempty absolute path")
     if args.verified_batches and (not args.background_output or not args.clangd):
         parser.error("--verified-batches requires --background-output and --clangd")
     if args.reuse_verified_only and not args.verified_batches:
@@ -355,7 +362,7 @@ def main():
             from cdb_verified_batch import accelerate
             stable_super_dir = args.super_dir or os.path.join(stage_dir, "super_unity_cpps")
             background_cdb, batch_metrics = accelerate(
-                semantic_cdb, os.path.join(os.path.dirname(stable_super_dir), "verified_batches"),
+                semantic_cdb, args.verified_batch_store or os.path.join(os.path.dirname(stable_super_dir), "verified_batches"),
                 args.clangd, max_group=args.batch_size, verify_missing=not args.reuse_verified_only,
                 server_profile=args.server_profile)
         marker = {

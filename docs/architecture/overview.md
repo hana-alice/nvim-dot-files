@@ -53,6 +53,9 @@
   规范化与注入仍只操作子集，不修改 active CDB。direct scope 优先；对不可能匹配所选模块根末段的
   普通 Unity 名称，跳过递归 fallback 查找。不规则名称/未知 key 保留原发现，同名根优先级不变。
   自动交付只复用有效证明，不启动冷证明；未认证的 query-driver profile 保持原 UBT 路径。
+  semantic CDB 同目录的 `batch-store.json`（`schema: 1`、绝对 `path`）可按项目/target 选择外部证明目录；
+  current/hot/full 通过 `--verified-batch-store` 接入现有 cache-only 验证，选择文件本身不授予语义权限。
+  没有选择文件时仍用原默认目录；已有 receipt/snapshot 不因接入而迁移或改写，失效组保留原命令。
   认证使用实际 server profile、进程 cwd/environment 和原 TU 主 shard 的有效命令；驱动由原生
   查询发现。源码/include 保持递归监听，驱动搜索候选及祖先用独立非递归监听，分轮安装后再重验。
   profile 或环境变化撤销待启用批次；未知参数和不支持的宿主能力保持原 UBT 配置。

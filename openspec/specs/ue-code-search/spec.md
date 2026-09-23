@@ -156,6 +156,12 @@ csearch 索引。它 MUST NOT 调用 prepare 流程、UBT、CDB 生成、GTAGS �
 - **AND** it SHALL continue subscribing to file/directory names, size and last-write changes recursively
 - **AND** unavailable native watching SHALL be reported explicitly rather than silently presented as an equivalent content-only watcher
 
+#### Scenario: Workspace experiment copies are not source-change notifications
+- **WHEN** a watcher event names a file below an `.omx` directory component, including experimental `.cpp` or `.h` copies
+- **THEN** the shared workspace path filter SHALL reject it before pending events, dirty tracking or source-owner callbacks
+- **AND** the rule SHALL use the existing normalized, case-insensitive directory-component matching, without rejecting ordinary source directories such as `omx` or `.omx-compatible`
+- **AND** real source writes outside excluded workspace metadata SHALL continue through the normal content/revision/refresh path; this filter MUST NOT clear historical dirty records or alter compiler-authored CDB coverage
+
 #### Scenario: A real native write preserves the previous mtime
 - **WHEN** the Windows content-event backend reports a write or atomic replacement whose final mtime is older than the csearch index
 - **THEN** that event SHALL still reach dirty tracking and source content comparison

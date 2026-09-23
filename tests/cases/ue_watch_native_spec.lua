@@ -171,6 +171,82 @@ t.describe("ue_watch native integration", function()
     pcall(vim.fn.delete, root, "rf")
   end
 
+  t.it("ignores OMX artifact events without suppressing real source refresh", function()
+    local root = vim.fn.tempname():gsub("\\", "/")
+    vim.fn.mkdir(root .. "/.omx/artifacts", "p")
+    vim.fn.mkdir(root .. "/Source", "p")
+    for _, path in ipairs({ "/.omx/artifacts/copy.cpp", "/.omx/artifacts/shim.h", "/Source/real.cpp" }) do
+      vim.fn.writefile({ "int source_value;" }, root .. path)
+    end
+    local capture, delivered, injected = {}, {}, {}
+    local owner, state, scheduled, restarts = {}, {}, 0, 0
+    local ctx = { engine_root = root, paths = {} }
+    local core = { RT = {}, deps = { status_root_key = function() return root end }, h = {
+      ensure_index_state = function() return state end, save_index_state = function() end,
+    } }
+    owner.mark_module_dirty = function() end
+    owner.clear_module_dirty_flags = function() end
+    owner.schedule_index_refresh = function() scheduled = scheduled + 1 end
+    owner.schedule_index_phase = function() scheduled = scheduled + 1 end
+    require("ue.index._source")(owner, core)
+    local function deliver()
+      return owner.deliver_source_refresh(ctx, {}, { restart = function(_, complete)
+        restarts = restarts + 1; complete(true); return true
+      end })
+    end
+    local function drain()
+      local done = false
+      vim.schedule(function() done = true end)
+      t.assert_true(vim.wait(500, function() return done end, 10), "scheduled events did not drain")
+    end
+    local previous_ue = package.loaded.ue
+    package.loaded.ue = { cdb_inject_paths = function(paths)
+      vim.list_extend(injected, paths); return true
+    end }
+    watch._set_content_watcher_for_test(function() return fake_handle(capture) end)
+    local ok, err = pcall(function()
+      t.assert_true(watch.start({ root = root, debounce_ms = 60000,
+        dirty_json_path = root .. "/dirty.json", on_source_changed = function(path)
+          delivered[#delivered + 1] = path
+          owner.check_source(ctx, path)
+        end,
+      }))
+      capture.callback(nil, nil, { ready = true })
+      local before = watch.status().last_event_at
+      capture.callback(nil, ".omx/artifacts/copy.cpp", { change = true })
+      capture.callback(nil, ".omx/artifacts/shim.h", { rename = true })
+      capture.callback(nil, ".omx/artifacts/deleted.cpp", { rename = true })
+      drain()
+      t.assert_eq(watch.status().pending_adds, 0)
+      t.assert_eq(watch.status().pending_dels, 0)
+      t.assert_eq(watch.status().last_event_at, before, "artifact events must not arm the flush timer")
+      watch.flush_now(); drain()
+      t.assert_eq(#delivered, 0)
+      t.assert_eq(#injected, 0)
+      t.assert_eq(#watch.snapshot_persistent_dirty(), 0)
+      t.assert_eq(state.source_revision or 0, 0)
+      t.assert_eq(scheduled, 0)
+      t.assert_false(deliver())
+      t.assert_eq(restarts, 0)
+
+      capture.callback(nil, "Source/real.cpp", { change = true })
+      drain()
+      t.assert_eq(watch.status().pending_adds, 1)
+      watch.flush_now()
+      t.assert_true(vim.wait(500, function() return state.source_revision == 1 end, 10))
+      t.assert_true(vim.deep_equal(delivered, { root .. "/Source/real.cpp" }))
+      t.assert_true(vim.deep_equal(injected, delivered))
+      t.assert_true(vim.deep_equal(watch.snapshot_persistent_dirty(), delivered))
+      t.assert_eq(scheduled, 1)
+      t.assert_true(deliver())
+      t.assert_eq(restarts, 1)
+      t.assert_eq(state.source_delivered, 1)
+    end)
+    cleanup(root)
+    package.loaded.ue = previous_ue
+    if not ok then error(err) end
+  end)
+
   t.it("selects the driver watcher and preserves native writes with old mtimes", function()
     local root = vim.fn.tempname():gsub("\\", "/")
     vim.fn.mkdir(root, "p")

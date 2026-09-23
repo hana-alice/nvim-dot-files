@@ -58,6 +58,28 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-23 — Keep OMX experiment copies out of source refresh events
+
+**Task**
+- Prevent workspace experiment `.cpp`/`.h` copies from entering the source refresh and dirty queues.
+
+**Implemented**
+- `lua/utils/ue_paths.lua`: add the exact `/.omx/` directory component to the existing shared blocklist consumed by watcher and dirty-overlay classification.
+- `tests/cases/ue_paths_spec.lua` and `ue_watch_native_spec.lua`: cover normalized directory boundaries and the real source-owner path behind the native event adapter; artifact-only events must not queue, mark dirty, increment source revisions or become restart-deliverable, while normal source writes still do.
+
+**Pitfalls / Gotchas**
+- Read-only live evidence found nine experiment files in source hashes while native watching was ready. A real source file also changed bytes; the evidence does not attribute every observed restart to artifacts.
+- This does not remove compiler-authored CDB entries, clear historical dirty records, change scan-root discovery, or suppress legitimate source changes. Full SuperUnity performance recovery remains open.
+
+**Validation**
+- Before fix: path regression 9/10 and native watcher 14/15, each failing the newly added artifact case. After fix: path regression 10/10 and required-native watcher 15/15, zero failures/skips; includes the existing real Windows native notification check.
+- Full required-native regression with the installed Android driver: 2096/2096 passed, zero failures/skips. Changed-file Lua AST lint, whitespace checks, strict `ue-code-search` validation and independent review passed.
+- Live delivery synchronized only this new entry into the public shared path-policy table after verifying exact old/new policy compatibility. Existing watcher aliases, native readiness, initialized clangd client, loaded buffers/cursors/ticks, pending events and historical dirty state remained unchanged; artifact predicates now reject and ordinary source predicates still allow. No module/watcher reload or editor restart was needed.
+- Spec consistency: synchronized `ue-code-search` with the artifact-event exclusion and preserved real-source delivery contract.
+
+**Follow-ups**
+- Keep historical source-baseline and performance gaps explicit; prior restarts have no complete chronological event trace.
+
 ### 2026-09-23 — Bound root-selection cost without reducing proof coverage
 
 **Task**

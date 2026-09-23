@@ -232,6 +232,8 @@ Do not stop after step 2 if steps 3 to 5 are available.
 
 ## Reporting
 
+每次阶段收尾必须分别列出已完成事项和仍未完成的任务；验证缺口与后续优化不得省略。
+
 Do not narrate every tiny step. Work through a meaningful batch, then report:
 1. what you investigated
 2. what you changed

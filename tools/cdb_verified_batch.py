@@ -254,6 +254,16 @@ def _inventory(path, excluded):
     return {'exists': True, 'sha256': _sha(_json(sorted(records)).encode())}
 
 
+def _minimal_roots(paths):
+    """Keep lexical coverage and ordering without comparing every sibling pair."""
+    result, selected = [], set()
+    for path in sorted(map(Path, paths), key=lambda p: (len(p.parts), str(p))):
+        if path not in selected and not any(parent in selected for parent in path.parents):
+            result.append(path)
+            selected.add(path)
+    return result
+
+
 def _include_roots(group, dependencies, effective_entries=(), extra_roots=()):
     roots = {str(_uri_path(item['uri']).parent.resolve()) for item in dependencies}
     roots.update(str(Path(path).resolve()) for path in extra_roots)
@@ -282,11 +292,7 @@ def _include_roots(group, dependencies, effective_entries=(), extra_roots=()):
                 path = Path(value.strip('"'))
                 roots.add(str((path if path.is_absolute() else Path(entry['directory']) / path).resolve()))
             previous = argument
-    selected = []
-    for path in sorted(map(Path, roots), key=lambda p: (len(p.parts), str(p))):
-        if not any(parent == path or parent in path.parents for parent in selected):
-            selected.append(path)
-    return list(map(str, selected))
+    return list(map(str, _minimal_roots(roots)))
 
 
 def _inventories(paths, output, memo):
@@ -451,10 +457,7 @@ def describe_receipts(receipt_paths, server_profile=None):
                 roots.add(str(Path(record['identities']['binding_path']).parent))
         roots.add(str(Path(__file__).resolve().parent))
         roots.add(str(_HEADER_CASE_PATH.resolve().parent))
-        minimal = []
-        for path in sorted(map(Path, roots), key=lambda value: (len(value.parts), str(value))):
-            if not any(parent == path or parent in path.parents for parent in minimal):
-                minimal.append(path)
+        minimal = _minimal_roots(roots)
         return {'ok': True, 'watch_roots': sorted(map(str, minimal)),
                 'compiler_environment': environment,
                 'server_profile': profile,

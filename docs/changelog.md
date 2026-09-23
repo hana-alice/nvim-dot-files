@@ -58,6 +58,30 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-23 — Bound root-selection cost without reducing proof coverage
+
+**Task**
+- Reduce measured Python overhead in SuperUnity qualification and receipt activation while preserving all semantic and freshness gates.
+
+**Implemented**
+- `tools/cdb_verified_batch.py`: share `_minimal_roots` between `_include_roots` and `describe_receipts`; check each lexical ancestor against a set instead of comparing every selected sibling. Preserve the original depth/string order and native `Path` equality.
+- `tests/cases/index_inventory_spec.lua`: compare against the previous algorithm across permutations, duplicate/missing/relative/Unicode paths and real symbolic links; bound ancestor enumeration for 512 sibling roots without a timing threshold.
+
+**Pitfalls / Gotchas**
+- The historical cache-only reuse time is not attributable to `describe_receipts`, which runs in activation validation. A fresh editor PATH differs from the historical proof environment; old receipts remain ineligible and are not rewritten.
+- This is a root-selection optimization, not a whole-engine indexing or SuperUnity performance recovery claim. Byte, file-identity, inventory, tool, environment and native query checks remain unchanged.
+
+**Validation**
+- Required-native `index_inventory`: 18/18 passed, zero failures/skips; the new test failed before the helper existed.
+- Full required-native regression with the installed Android driver: 2094/2094 passed, zero failures/skips. Python AST, Lua AST lint, whitespace checks and strict governing-spec validation passed; independent lexical review matched 6,000 Windows/POSIX path sets.
+- Same real receipt/commands: complete `describe_receipts` output unchanged, 11.9852 s to 0.0351 s; complete `_include_roots` output unchanged, 23.7081 s to 1.3117 s. CPU times likewise decreased from 11.875/23.6719 s to 0.0469/1.2969 s; these are single local measurements, not end-to-end index timings.
+- Fresh current-editor pair: strict 2-to-1 semantic admission passed in 107.455 s, receipt validation in 7.188 s, compiler-free cache reuse in 8.278 s. The resource guard confirmed unchanged bound inputs/assets and no remaining children. Old and new first-proof times are not a controlled performance comparison.
+- Matched `j1` fresh private shard-cache runs: original 28.0138 s / CPU 25.4531 s / peak RSS 1,150,406,656 bytes; candidate 18.4023 s / CPU 16.1562 s / peak RSS 1,024,053,248 bytes. Both compiled without errors or missing main shards. The 9.6115 s saving remains below combined reuse/activation validation cost, so no production publication; OS cache/load were uncontrolled.
+- Spec consistency: no declared behavior change; existing `cpp-semantic-index-coverage` requirements for complete input validation and monitored coverage remain authoritative.
+
+**Follow-ups**
+- Larger-group net-performance acceptance remains separate; full SuperUnity recovery remains open.
+
 ### 2026-09-23 — Correct Android query identity before reusing batch proofs
 
 **Task**

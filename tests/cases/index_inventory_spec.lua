@@ -2,13 +2,22 @@ local t = require("tests.harness")
 t.bootstrap()
 
 local fixture = [=[
-import json, os, pathlib, stat, sys, tempfile
+import itertools, json, os, pathlib, stat, sys, tempfile
 from unittest.mock import patch
 sys.path.insert(0, str(pathlib.Path(sys.argv[1]).parent))
 from cdb_verified_batch import _inventory as actual, _json, _sha
+import cdb_verified_batch as module
 Path = pathlib.Path
 
 # Preserve the pre-optimization behavior as the comparison oracle.
+def reference_roots(paths):
+    selected = []
+    for path in sorted(map(Path, paths), key=lambda value: (len(value.parts), str(value))):
+        if not any(parent == path or parent in path.parents for parent in selected):
+            selected.append(path)
+    return selected
+
+
 def reference(path, excluded):
     path = Path(path)
     if not path.is_dir():
@@ -56,7 +65,38 @@ with tempfile.TemporaryDirectory(prefix='index_inventory_') as temporary:
         results.append({'name': name, 'equal': True})
         return observed
 
+    def compare_roots(name, paths):
+        expected = reference_roots(paths)
+        # Root reduction is lexical: nonexistent paths and symlink spellings
+        # must not acquire different identities through filesystem resolution.
+        with patch.object(Path, 'resolve', side_effect=AssertionError('root selection must stay lexical')):
+            observed = module._minimal_roots(paths)
+        assert all(isinstance(path, Path) for path in observed), observed
+        assert list(map(str, observed)) == list(map(str, expected)), (name, expected, observed)
+
     try:
+        roots = [tree / 'MixedDir/child', base / 'unrelated', tree / 'MixedDir',
+                 tree / 'MixedDir', base / 'missing/deep']
+        for permutation in itertools.permutations(roots):
+            compare_roots('root permutation', permutation)
+        compare_roots('empty roots', [])
+        compare_roots('mixed lexical roots', [str(path) for path in roots] + [tree,
+            Path('relative/child'), Path('relative'), Path('relative/../other'),
+            base / 'CASE/child', base / 'case', base / '\u0130/child', base / 'i\u0307',
+            base / 'Stra\u00dfe/child', base / 'STRASSE'])
+        compare_roots('relative root itself', [Path('.'), Path('child/grandchild'), Path('..')])
+        results.append({'name': 'preserves lexical root selection for permutations, duplicates, missing, relative and Unicode paths',
+                        'equal': True})
+        siblings = [base / ('sibling-' + str(index)) for index in range(512)]
+        parent_getter, enumerations = pathlib.PurePath.parents.fget, [0]
+        def counted_parents(path):
+            enumerations[0] += 1
+            assert enumerations[0] <= len(siblings), 'ancestor enumeration repeated for sibling comparisons'
+            return parent_getter(path)
+        with patch.object(pathlib.PurePath, 'parents', property(counted_parents)):
+            selected = module._minimal_roots(reversed(siblings))
+        assert selected == sorted(siblings, key=lambda value: (len(value.parts), str(value)))
+        results.append({'name': 'enumerates ancestors at most once per root across a large sibling set', 'equal': True})
         initial = compare('preserves ordinary records and excluded subtrees')
         (tree / 'new.h').write_text('new')
         assert compare('detects new directory entries') != initial
@@ -82,6 +122,9 @@ with tempfile.TemporaryDirectory(prefix='index_inventory_') as temporary:
         except OSError as error:
             results.append({'name': 'native symbolic-link inventory', 'skip': str(error), 'native': True})
         else:
+            compare_roots('symbolic link names remain lexical', [tree / 'directory-link',
+                tree / 'directory-link/child', tree / 'MixedDir', tree / 'MixedDir/child', tree / 'broken-link'])
+            results.append({'name': 'preserves distinct lexical symbolic-link roots without resolving targets', 'equal': True})
             compare('preserves real file, directory, broken, cyclic and excluded symlinks')
             compare('preserves a symbolic-link root', tree / 'directory-link')
         if os.name == 'nt':

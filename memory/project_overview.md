@@ -11,6 +11,9 @@ hana-alice 的 Neovim 配置（公开镜像 `hana-alice/nvim`），定位为
 亚 100ms goto-definition、一键 Android headless DAP attach、错误全落盘。
 **当前 SuperUnity 完整索引性能仍未通过恢复验收**；上述定位不是现状实测承诺，
 验收证据与缺口见 [索引退化调查](../docs/cpp-index-restart-investigation.md)。
+按用户确认的阶段交付方式，已验证范围可先交付，再继续扩大压缩规模；完整恢复仍单独验收。
+项目/target 的 `batch-store.json` 可让正常 current/hot/full 复用指定证明目录，失效时保留原命令；
+契约见 `cpp-semantic-index-coverage`，被引用的回执及冻结资产须持续保留。
 
 LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨模块）+
 `lua/ue/`、`lua/utils/`、`lua/workarounds/`。

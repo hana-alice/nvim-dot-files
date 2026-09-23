@@ -212,8 +212,12 @@ t.describe("index subset runs outside the editor thread", function()
     if not ok then error(failure) end
   end)
 
-  t.it("current/hot hand off small requests without reading or decoding the active CDB", function()
+  t.it("all phases select a proof store without reading the active CDB on the editor thread", function()
     local ctx, _, keys = fixture()
+    ctx.paths.index_full_cdb, ctx.paths.full_index = ctx.engine_root .. "/index/full.json", ctx.engine_root .. "/index/full.idx"
+    ctx.paths.semantic_full_cdb = ctx.engine_root .. "/background/full/compile_commands.json"
+    local store = ctx.engine_root .. "/qualified proof store"
+    write(vim.fs.dirname(ctx.paths.semantic_cdb) .. "/batch-store.json", vim.json.encode({ schema = 1, path = store }))
     local saved = { open = io.open, system = vim.system, select = index.select_phase_module_keys,
       subset = index.write_subset_compile_commands, queued = index.try_start_queued_build,
       notify = vim.notify, job = index._rt.job }
@@ -233,27 +237,51 @@ t.describe("index subset runs outside the editor thread", function()
         command, pending = cmd, callback
         return {}
       end
-      for _, phase in ipairs({ "current", "hot" }) do
+      for _, phase in ipairs({ "current", "hot", "full" }) do
         t.assert_true(index.build_phase_async(ctx, phase))
-        t.assert_contains(command[2], "build_clangd_index.py")
+        t.assert_contains(command[2], phase == "full" and "build_full_cdb.py" or "build_clangd_index.py")
         local function argument(flag)
           for position, value in ipairs(command) do
             if value == flag then return command[position + 1] end
           end
         end
-        t.assert_true(argument("--nvim") ~= nil)
-        local file = assert(saved.open(assert(argument("--subset-request")), "rb"))
-        local raw = file:read("*a")
-        file:close()
-        t.assert_true(#raw < 16384, "only a small selection request crosses the editor boundary")
-        local request = vim.json.decode(raw)
-        t.assert_eq(request.phase, phase)
-        t.assert_true(vim.deep_equal(request.selected_keys, keys))
-        t.assert_eq(request.ctx.paths.active_cdb, ctx.paths.active_cdb)
+        if vim.tbl_contains(command, "--verified-batches") then
+          t.assert_eq(argument("--verified-batch-store"), store)
+          t.assert_true(vim.tbl_contains(command, "--reuse-verified-only"), "automatic external-store use must never qualify")
+        end
+        if phase ~= "full" then
+          t.assert_true(argument("--nvim") ~= nil)
+          local file = assert(saved.open(assert(argument("--subset-request")), "rb"))
+          local raw = file:read("*a")
+          file:close()
+          t.assert_true(#raw < 16384, "only a small selection request crosses the editor boundary")
+          local request = vim.json.decode(raw)
+          t.assert_eq(request.phase, phase)
+          t.assert_true(vim.deep_equal(request.selected_keys, keys))
+          t.assert_eq(request.ctx.paths.active_cdb, ctx.paths.active_cdb)
+        else
+          t.assert_nil(argument("--subset-request"))
+          t.assert_eq(command[3], ctx.paths.active_cdb)
+        end
         pending({ code = 1, stdout = "", stderr = "subset helper failed" })
         t.assert_true(vim.wait(1000, function() return index._rt.job == nil end, 10))
         t.assert_eq(index.ensure_index_state(ctx).build.status, "error")
         t.assert_nil(vim.uv.fs_stat(ctx.paths.semantic_cdb), "failed subset must not publish")
+      end
+      if vim.tbl_contains(command, "--verified-batches") then
+        write(ctx.paths.semantic_cdb, "previous-publication")
+        for _, invalid in ipairs({ "{broken", vim.json.encode({ schema = 2, path = store }),
+          vim.json.encode({ schema = 1, path = "relative/store" }), string.rep(" ", 65537) }) do
+          write(vim.fs.dirname(ctx.paths.semantic_cdb) .. "/batch-store.json", invalid)
+          command = nil
+          local started, reason = index.build_phase_async(ctx, "full")
+          t.assert_false(started)
+          t.assert_contains(reason, "invalid batch-store.json")
+          t.assert_nil(command, "invalid selection must fail before generator dispatch")
+          t.assert_nil(index._rt.job)
+          t.assert_nil(file_lock.owner(ctx.paths.index_state .. ".build.lock"), "failed selection must release the lease")
+          t.assert_eq(read(ctx.paths.semantic_cdb), "previous-publication")
+        end
       end
     end)
     io.open, vim.system, vim.notify = saved.open, saved.system, saved.notify

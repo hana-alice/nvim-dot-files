@@ -461,6 +461,21 @@ M.build_phase_async = function(ctx, phase)
   if clangd.ok and not profile_error then
     vim.list_extend(cmd, { "--verified-batches", "--reuse-verified-only",
       "--clangd", clangd.path, "--batch-size", "8" })
+    -- A project/target-scoped selection points at immutable qualified assets.
+    -- It selects where to look; only the existing receipt checks grant reuse.
+    local store_path = fs.join(vim.fs.dirname(ctx.paths.semantic_cdb), "batch-store.json")
+    local store_stat = vim.uv.fs_stat(store_path)
+    if store_stat then
+      if store_stat.type ~= "file" or store_stat.size > 65536 then
+        return fail_before_spawn("invalid batch-store.json: expected a small selection file")
+      end
+      local store = core.h.read_json_file(store_path)
+      if type(store) ~= "table" or store.schema ~= 1 or type(store.path) ~= "string"
+          or not fs.is_absolute_path(store.path) or store.path:find("[%z\r\n]") then
+        return fail_before_spawn("invalid batch-store.json: expected schema=1 and an absolute proof-store path")
+      end
+      vim.list_extend(cmd, { "--verified-batch-store", store.path })
+    end
     if server_profile then vim.list_extend(cmd, { "--server-profile", vim.json.encode(server_profile) }) end
   end
 

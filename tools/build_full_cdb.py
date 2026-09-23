@@ -209,6 +209,8 @@ def main():
                     help='prove secondary same-context batches with private clangd indexes')
     ap.add_argument('--reuse-verified-only', action='store_true',
                     help='reuse valid receipts without starting cold compiler proofs')
+    ap.add_argument('--verified-batch-store', default=None,
+                    help='absolute existing proof-store location for reuse only; caller retains its assets')
     ap.add_argument('--clangd', default=None, help='existing clangd used for batch proof')
     ap.add_argument('--server-profile', type=json.loads, default=None,
                     help='explicit supported clangd query profile JSON; never inferred from a receipt')
@@ -219,6 +221,11 @@ def main():
     ap.add_argument('--jobs', '-j', type=int, default=0,
                     help='clangd-indexer concurrency (default: clamp(8, cpu, 24))')
     args = ap.parse_args()
+    if args.verified_batch_store is not None:
+        if not args.verified_batches or not args.reuse_verified_only:
+            ap.error('--verified-batch-store requires --verified-batches and --reuse-verified-only')
+        if not args.verified_batch_store.strip() or not Path(args.verified_batch_store).is_absolute():
+            ap.error('--verified-batch-store must be a nonempty absolute path')
     if args.verified_batches and (not args.background_output or not args.clangd):
         ap.error('--verified-batches requires --background-output and --clangd')
     if args.reuse_verified_only and not args.verified_batches:
@@ -357,7 +364,7 @@ def main():
         if args.verified_batches:
             from cdb_verified_batch import accelerate
             background_entries, batch_metrics = accelerate(
-                super_entries, os.path.join(os.path.dirname(stable_super_dir), 'verified_batches'),
+                super_entries, args.verified_batch_store or os.path.join(os.path.dirname(stable_super_dir), 'verified_batches'),
                 args.clangd, max_group=args.batch_size, verify_missing=not args.reuse_verified_only,
                 server_profile=args.server_profile, max_sources=args.max_mods)
         outputs = [(background_out, json.dumps(background_entries)),

@@ -29,6 +29,13 @@ local function assert_plan_entry(driver, fn_name, expected_executable, expected_
 end
 
 t.describe("platform: 驱动接口契约", function()
+  t.it("frozen input-event groups belong only to the Windows driver", function()
+    t.assert_type(require("utils.platform.windows").input_event_watcher, "function")
+    for _, name in ipairs({ "macos", "linux", "stub" }) do
+      t.assert_nil(require("utils.platform." .. name).input_event_watcher)
+    end
+  end)
+
   for _, id in ipairs({ "windows", "macos", "linux", "stub" }) do
     t.it("driver " .. id .. " 实现完整接口", function()
       local m = require("utils.platform." .. id)

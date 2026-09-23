@@ -24,6 +24,13 @@ function M.content_event_watcher()
   return require("workarounds.libuv.content_events").new(python.path)
 end
 
+function M.input_event_watcher(roots)
+  local python = require("utils.platform").resolve_tool({ name = "python", env = { "UE_PYTHON" },
+    driver_candidates = function(driver) return driver.python_candidates() end })
+  if not python.ok then return nil, "Python unavailable for Windows input watcher" end
+  return require("workarounds.libuv.content_events").new_group(python.path, roots)
+end
+
 function M.shell_entry(kind)
   kind = kind or "default"
   if kind == "cmd" then

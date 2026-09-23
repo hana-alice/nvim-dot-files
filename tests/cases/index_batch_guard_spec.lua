@@ -205,6 +205,77 @@ t.describe("frozen batch live validity guard", function()
     for _, watch in ipairs(h.watches) do t.assert_eq(watch.closed, 1) end
   end)
 
+  t.it("waits for every native ready acknowledgement including synchronous and out-of-order callbacks", function()
+    local callbacks, closed = {}, 0
+    local h = harness({
+      roots = { "/a", "/b", "/c" },
+      watch_factory = function(root, _, options)
+        callbacks[root] = options.on_ready
+        if root == "/a" then options.on_ready(true) end
+        return { close = function() closed = closed + 1 end }, { recursive = true, pending = true }
+      end,
+    })
+    h.flush()
+    t.assert_nil(h.callbacks.verify)
+    callbacks["/c"](true); callbacks["/c"](true); h.flush()
+    t.assert_nil(h.callbacks.verify, "duplicate ready cannot settle another root")
+    callbacks["/b"](true); h.flush()
+    t.assert_type(h.callbacks.verify, "function")
+    h.callbacks.verify({ ok = true }); h.flush()
+    t.assert_eq(h.callbacks.ready, 1)
+    h.guard:stop(); h.flush()
+    t.assert_eq(closed, 3)
+  end)
+
+  t.it("creates shared backends only for the minimized set and closes them on setup rejection", function()
+    local captured, closes = nil, 0
+    local h = harness({ watch_backend = function(roots)
+      captured = roots
+      return nil, function() closes = closes + 1 end
+    end })
+    h.flush()
+    t.assert_eq(#captured, 2, "covered descendants must never become unregistered backend watches")
+    t.assert_eq(h.callbacks.reason, "input-watch-unavailable")
+    t.assert_nil(h.callbacks.verify)
+    t.assert_eq(closes, 1)
+  end)
+
+  t.it("closes shared resources on partial setup failure and ignores late readiness", function()
+    local ready, events, closed, shared_closed = {}, {}, 0, 0
+    local h = harness({
+      watch_factory = function(root, callback, options)
+        ready[#ready + 1], events[#events + 1] = options.on_ready, callback
+        return { close = function() closed = closed + 1 end }, { recursive = true, pending = true }
+      end,
+      close_watches = function() shared_closed = shared_closed + 1 end,
+    })
+    ready[1](false)
+    for _, notify in ipairs(ready) do notify(true) end
+    h.flush()
+    t.assert_eq(h.callbacks.reason, "watch-ready-failed")
+    t.assert_nil(h.callbacks.verify)
+    t.assert_eq(closed, #ready)
+    t.assert_eq(shared_closed, 1)
+    h.guard:stop(); h.flush()
+    t.assert_eq(shared_closed, 1)
+
+    local bad = harness({ roots = { "relative" }, close_watches = function() shared_closed = shared_closed + 1 end })
+    bad.flush()
+    t.assert_eq(shared_closed, 2, "shared owner closes even when no handle was registered")
+  end)
+
+  t.it("revokes pending native watches on real events and never validates a late ready", function()
+    local notify, event
+    local h = harness({ roots = { "/input" }, watch_factory = function(_, callback, options)
+      notify, event = options.on_ready, callback
+      return { close = function() end }, { recursive = true, pending = true }
+    end })
+    event(nil, "changed.h", { change = true })
+    notify(true); h.flush()
+    t.assert_eq(h.callbacks.reason, "input-changed")
+    t.assert_nil(h.callbacks.verify)
+  end)
+
   t.it("stop and replacement keep old clients and callbacks gated without blocking the new owner", function()
     local old = harness(nil, true)
     old.guard:stop()

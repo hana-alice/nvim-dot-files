@@ -59,6 +59,11 @@ end
 --- driver lookup entries. The factory must attest recursive or direct capability
 --- respectively, based on its actual host probe. Direct ancestors never cover
 --- descendant watches unless the ancestor is recursive.
+--- An asynchronous factory returns pending=true and calls options.on_ready(ok).
+--- Verification waits for every installed watch to acknowledge native readiness.
+--- close_watches optionally owns shared backend resources, including partial setup.
+--- watch_backend(roots) may create a shared factory and close callback after root
+--- minimization; it receives exactly the subscriptions that will be registered.
 --- verify_async(receipts, callback) returns an optional cancellation function;
 --- callback receives {ok=boolean, reason=string?, evidence=any?}.
 function M.start(ctx, client, opts)
@@ -67,6 +72,7 @@ function M.start(ctx, client, opts)
   local state, epoch, reason = "validating", 1, "verification-pending"
   local watches, pending = {}, {}
   local cancel_verification
+  local close_watches = opts.close_watches
   local invalidation_delivered = false
   local guard = {}
 
@@ -85,6 +91,11 @@ function M.start(ctx, client, opts)
   local function cleanup()
     for _, handle in ipairs(watches) do release(handle) end
     watches = {}
+    if close_watches then
+      local close = close_watches
+      close_watches = nil
+      pcall(close)
+    end
     if cancel_verification then
       local cancel = cancel_verification
       cancel_verification = nil
@@ -172,7 +183,8 @@ function M.start(ctx, client, opts)
     guard:attach(client)
     if state ~= "validating" then return guard end
   end
-  if type(opts.verify_async) ~= "function" or type(opts.watch_factory) ~= "function"
+  if type(opts.verify_async) ~= "function"
+      or (type(opts.watch_factory) ~= "function" and type(opts.watch_backend) ~= "function")
       or type(opts.receipts) ~= "table" or next(opts.receipts) == nil then
     guard:invalidate("missing-verification-capability")
     return guard
@@ -181,6 +193,13 @@ function M.start(ctx, client, opts)
   local lookup_maximum = math.max(1, math.min(256, tonumber(opts.max_lookup_roots) or 256))
   local roots, roots_error = minimal_roots(opts.roots, maximum, lookup_maximum)
   if not roots then guard:invalidate(roots_error); return guard end
+  local watch_factory = opts.watch_factory
+  if opts.watch_backend then
+    local ok, factory, close = pcall(opts.watch_backend, roots)
+    if type(close) == "function" then close_watches = close end
+    if not ok or type(factory) ~= "function" then guard:invalidate("input-watch-unavailable"); return guard end
+    watch_factory = factory
+  end
   local verification_epoch = epoch
   local function verify()
     local ok, cancel = pcall(opts.verify_async, opts.receipts, function(result)
@@ -201,18 +220,36 @@ function M.start(ctx, client, opts)
     if not ok then guard:invalidate("verification-start-failed")
     elseif type(cancel) == "function" then cancel_verification = cancel end
   end
-  local next_root = 1
+  local next_root, waiting = 1, 0
+  local installed, verifying = false, false
+  local function maybe_verify()
+    if installed and waiting == 0 and not verifying and state == "validating" and epoch == verification_epoch then
+      verifying = true
+      verify()
+    end
+  end
   local function install()
     if state ~= "validating" or epoch ~= verification_epoch then return end
     -- The measured 197 direct watches took 106 ms to install synchronously.
     -- Yield between small batches while authority remains unavailable.
     for _ = 1, 16 do
       local root = roots[next_root]
-      if not root then verify(); return end
+      if not root then installed = true; maybe_verify(); return end
       next_root = next_root + 1
-      local ok, handle, capability = pcall(opts.watch_factory, root.path, function(err)
+      -- Register the token before the factory: an in-process backend can
+      -- acknowledge readiness synchronously, before returning its handle.
+      waiting = waiting + 1
+      local settled = false
+      local function ready(ok)
+        if settled or state ~= "validating" or epoch ~= verification_epoch then return end
+        settled = true
+        waiting = waiting - 1
+        if ok ~= true then guard:invalidate("watch-ready-failed"); return end
+        if installed then schedule(maybe_verify) end
+      end
+      local ok, handle, capability = pcall(watch_factory, root.path, function(err)
         guard:invalidate(err and "watch-error" or "input-changed")
-      end, { recursive = root.recursive })
+      end, { recursive = root.recursive, on_ready = ready })
       local valid_handle = (type(handle) == "table" or type(handle) == "userdata")
         and type(handle.close) == "function"
       if state ~= "validating" then if valid_handle then release(handle) end; return end
@@ -223,8 +260,9 @@ function M.start(ctx, client, opts)
         guard:invalidate(root.recursive and "recursive-watch-unavailable" or "direct-watch-unavailable")
         return
       end
+      if capability.pending ~= true then ready(true) end
     end
-    if next_root > #roots then verify() else schedule(install) end
+    if next_root > #roots then installed = true; maybe_verify() else schedule(install) end
   end
   install()
   return guard

@@ -58,6 +58,30 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-23 — Keep input validation from revoking its own frozen batch
+
+**Task**
+- Prevent read-induced Windows last-access notifications from aborting frozen-batch activation while retaining genuine input-change protection.
+
+**Implemented**
+- Reuse the native watcher workaround with a grouped input profile: one parent-bound helper, bounded direct/recursive subscriptions, and only LAST_ACCESS removed from the notification mask. The existing source watcher keeps its separate filter.
+- Route the backend through the Windows driver and exercise it in the actual recursive/direct probes. The guard creates only minimized subscriptions, waits for every native-ready acknowledgement, and releases the shared helper even on partial installation failure.
+- Cover readiness ordering, late callbacks, early events, protocol failures, real preserved-mtime writes, attributes, namespaces and direct/recursive isolation.
+
+**Pitfalls / Gotchas**
+- Independent native subscriptions classified the exact activation-revoking directory event as LAST_ACCESS, within 0.73 ms of libuv's notification; the observation window recorded 832 access events and zero other-category events. Earlier unclassified directory events are not retrospectively assigned that cause.
+- The broader frozen-input profile must retain attributes, security and creation notifications; the source-only filter is insufficient. A fixture's parent-directory last-write event correctly remained observable and was not filtered to manufacture a pass.
+
+**Validation**
+- Targeted guard 16/16, startup runtime 41/41 and new native input watcher 12/12 passed. Existing native source watcher 15/15, workarounds 19/19 and smoke 19/19 passed.
+- Isolated real full-CDB activation passed with 28 actual watches, installed in 0.100 s; full activation took 11.957 s. Repeated unchanged prepare took 1.44 ms with zero new validation helpers. Bound input/proof bytes remained unchanged and all owned children exited. No live batch publication or main-index performance claim follows.
+- Maximum-root native check: 288 owned local roots ready in 0.188 s using one helper (71.24 MB peak RSS, 63.98 MB private bytes, 295 threads); observed idle CPU increment was zero over 2.96 s. Heartbeat maximum gap was 23.21 ms; explicit close was measured separately at 51.13 ms. Actual 28-root activation peaked at 34.03 MB RSS. Missing-root, parent-death and stdin-EOF cases all terminated before supervisor cleanup, with no remaining children. Event floods and network directories were not measured.
+- Full required-native regression with the installed Android query driver: 2113/2113 passed, zero failures/skips. Changed-file Lua AST lint, Python syntax, whitespace checks, strict validation of both synchronized specs and independent backend review passed.
+- Spec consistency: synchronized `cpp-semantic-index-coverage` and `host-platform-driver`; source-watch behavior is unchanged.
+
+**Follow-ups**
+- Whole-engine SuperUnity performance remains unverified. The four-to-one cold indexing saving does not yet cover measured cache-only reuse plus full first activation, before publication and full-view cache costs.
+
 ### 2026-09-23 — Keep OMX experiment copies out of source refresh events
 
 **Task**

@@ -196,6 +196,13 @@ phase manifest SHALL 绑定独立原始 semantic CDB 的路径与内容。native
 - **AND** an invalidation triggered by a watch callback SHALL retain the first triggering watch root, filename or error, and available event flags in bounded guard status and the normal warning log; later callbacks MUST NOT overwrite that evidence
 - **AND** returned evidence SHALL be an independent copy, oversized fields SHALL be explicitly marked truncated, and logging failure MUST NOT delay revocation or suppress fallback; ordinary accepted/ignored events SHALL NOT accumulate a trace
 
+#### Scenario: A later startup retries an input-event invalidation
+- **WHEN** a normal startup requests the same publication and generation after an `input-changed` fallback
+- **THEN** it MAY retry only after a 30-second monotonic cooldown and confirmed completion of the previous activation helpers; cancellation alone MUST NOT establish completion
+- **AND** retry SHALL repeat description, watch readiness and full receipt validation before granting authority; concurrent requests SHALL share the attempt and later input events SHALL still revoke it
+- **AND** each configured frozen client SHALL bind to its activation attempt; a late client from an older attempt MUST NOT acquire the fresh guard merely because the publication stamp matches
+- **AND** elapsed time alone SHALL NOT launch helpers or restart clients; unchanged ready activations SHALL remain reusable without revalidation, and other failure reasons SHALL remain sticky for that publication
+
 #### Scenario: Certifying a supported driver-query profile
 - **WHEN** a secondary proof explicitly supports a nonempty query-driver profile
 - **THEN** all original and candidate compiler runs SHALL use the same supported server profile, actual launch cwd and compiler environment

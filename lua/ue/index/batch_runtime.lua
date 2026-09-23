@@ -4,6 +4,7 @@ local uv = vim.uv or vim.loop
 local platform = require("utils.platform")
 local fs = require("ue.core.fs")
 local records, verified_dirs = {}, {}
+local next_attempt = 0
 local recursive_capability, probe_waiters
 local direct_capability, direct_waiters
 local recursive_backend, direct_backend
@@ -350,7 +351,14 @@ local function flush(record)
   for _, waiter in ipairs(waiters) do pcall(waiter) end
 end
 
+local function now_ms(opts)
+  return opts.now_ms and opts.now_ms() or uv.hrtime() / 1000000
+end
+
 local function fallback(record, reason)
+  if not record.failed and reason == "input-changed" then
+    record.retry_after = now_ms(record.opts) + 30000
+  end
   record.failed, record.reason = true, reason
   for _, id in ipairs(record.autocmds or {}) do pcall(vim.api.nvim_del_autocmd, id) end
   record.autocmds = {}
@@ -429,8 +437,8 @@ local function watch_sets(descriptor)
 end
 
 --- Resolve metadata asynchronously before root_dir starts any new clangd.
---- All large reads/hashes remain in the child. Failure is sticky for the small
---- metadata signature, until new publication metadata or a new editor session.
+--- All large reads/hashes remain in the child. Input-change failures may retry on
+--- a later demand after cooldown and helper exit; other failures stay sticky.
 function M.prepare(bufnr, root, on_dir, opts)
   opts = opts or {}
   local get_command = opts.get_command or function(directory) return require("ue").clangd_cmd(directory) end
@@ -464,20 +472,45 @@ function M.prepare(bufnr, root, on_dir, opts)
     end
     local reason = request_reason(previous, command, config)
     if reason then on_dir(root); return nil, reason end
-    if previous.failed or ready(previous) then on_dir(root)
-    else previous.waiters[#previous.waiters + 1] = function() on_dir(root) end end
-    return
+    local retry = previous.failed and previous.reason == "input-changed"
+      and previous.retry_after and now_ms(opts) >= previous.retry_after
+      and previous.pending_helpers == 0
+    if not retry then
+      if previous.failed or ready(previous) then on_dir(root)
+      else previous.waiters[#previous.waiters + 1] = function() on_dir(root) end end
+      return
+    end
   end
   if previous and previous.guard then previous.guard:invalidate("activation-metadata-changed") end
   if previous and previous.cancel_describe then pcall(previous.cancel_describe) end
   if not stamp then records[scope] = nil; on_dir(root); return end
+  next_attempt = next_attempt + 1
   local record = { ctx = ctx, opts = opts, stamp = stamp, scope = scope, info = info,
+    attempt = next_attempt, pending_helpers = 0,
     original = original, clients = {}, autocmds = {}, phase = "describing", generation = generation,
     server_profile = vim.deepcopy(profile), launch_cwd = cwd, environment = environment,
     command_executable = command[1], get_config = get_config,
     waiters = { function() on_dir(root) end } }
   records[scope] = record
-  local run = opts.run_async or run_cli
+  local execute = opts.run_async or run_cli
+  local function run(path, executable, mode, callback, request)
+    record.pending_helpers = record.pending_helpers + 1
+    local finished = false
+    local function completed(result)
+      if finished then return end
+      finished = true
+      record.pending_helpers = record.pending_helpers - 1
+      callback(result)
+    end
+    local ok, cancel = pcall(execute, path, executable, mode, completed, request)
+    if not ok then
+      if not finished then record.pending_helpers = record.pending_helpers - 1 end
+      finished = true
+      error(cancel)
+    end
+    -- Cancellation requests termination; only completion proves helper exit.
+    return cancel
+  end
   local clangd = opts.clangd or command[1]
   local request = { server_profile = vim.deepcopy(profile), launch_cwd = cwd, environment = vim.deepcopy(environment) }
   local function current()
@@ -628,6 +661,7 @@ function M.configure_process(cmd, config)
     end
     config.cmd_env = next(restored) ~= nil and restored or (before.value ~= nil and {} or nil)
     config._ue_batch_env_before, config._ue_batch_scope, config._ue_batch_stamp = nil, nil, nil
+    config._ue_batch_attempt = nil
     config._ue_batch_server_profile, config._ue_batch_launch_cwd = nil, nil
   end
   local profile, profile_reason = M.server_profile(cmd, config)
@@ -659,6 +693,7 @@ function M.configure_process(cmd, config)
   config._ue_batch_env_before = { value = vim.deepcopy(config.cmd_env), installed = installed }
   config.cmd_env = vim.tbl_extend("force", config.cmd_env or {}, installed)
   config._ue_batch_scope, config._ue_batch_stamp = record.scope, record.stamp
+  config._ue_batch_attempt = record.attempt
   config._ue_batch_server_profile = vim.deepcopy(profile)
   config._ue_batch_launch_cwd = record.launch_cwd
   config._ue_batch_spawn_env = spawn_overrides(config)
@@ -672,7 +707,8 @@ function M.attach(client, bufnr)
   local config = client.config or {}
   if not config._ue_batch_scope then return end
   local record = records[config._ue_batch_scope]
-  if not record or record.stamp ~= config._ue_batch_stamp or not record.guard then
+  if not record or record.stamp ~= config._ue_batch_stamp
+      or record.attempt ~= config._ue_batch_attempt or not record.guard then
     require("ue.index.batch_guard").start({}, client, { on_invalidated = function() scoped_restart({ client }) end })
     return
   end

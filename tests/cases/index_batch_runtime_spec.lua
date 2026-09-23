@@ -364,6 +364,67 @@ t.describe("frozen batch startup runtime", function()
     end)
   end)
 
+  t.it("ignores only certified stable writes to a subscribed ordinary directory", function()
+    fixture(function(h, root)
+      h.descriptor.directory_write_policy = "stable-directory-write-v1"
+      h.descriptor.lookup_roots = { root }
+      h.descriptor.watched_files[#h.descriptor.watched_files + 1] = root .. "/input"
+      h.opts.probe_direct = function(callback) callback(true) end
+      h.prepare(); h.describe(); h.validate()
+      local parent
+      for _, watch in ipairs(h.watches) do if watch.root == root then parent = watch end end
+      t.assert_true(parent ~= nil)
+      parent.callback(nil, "input", { action = 3, directory = true,
+        stream = "write", stable_directory_write = true })
+      h.flush()
+      t.assert_contains(runtime.command(h.command)[3], "/verified")
+      t.assert_eq(#h.restarts, 0)
+      t.assert_eq(#h.calls, 2, "a stable directory write must not trigger another validator")
+      parent.callback(nil, "input/changed.h", { action = 3, directory = false, stream = "write" })
+      t.assert_true(vim.deep_equal(runtime.command(h.command), h.command), "real file writes still revoke immediately")
+    end)
+  end)
+
+  for _, case in ipairs({ "legacy-policy", "metadata", "unknown-stream", "changed-identity", "unsubscribed-directory", "file", "namespace" }) do
+    t.it("retains invalidation for directory classification boundary " .. case, function()
+      fixture(function(h, root)
+        h.descriptor.directory_write_policy = case ~= "legacy-policy" and "stable-directory-write-v1" or nil
+        h.descriptor.lookup_roots = { root }
+        h.opts.probe_direct = function(callback) callback(true) end
+        h.prepare(); h.describe(); h.validate()
+        local parent
+        for _, watch in ipairs(h.watches) do if watch.root == root then parent = watch end end
+        local event = { action = 3, directory = true, stream = "write", stable_directory_write = true }
+        local path = "input"
+        if case == "metadata" then event.stream = "metadata"
+        elseif case == "unknown-stream" then event.stream = nil
+        elseif case == "changed-identity" then event.stable_directory_write = false
+        elseif case == "unsubscribed-directory" then path = "input/unsubscribed"
+        elseif case == "file" then event.directory = false
+        elseif case == "namespace" then event.action = 5 end
+        parent.callback(nil, path, event)
+        t.assert_true(vim.deep_equal(runtime.command(h.command), h.command))
+        h.flush(); t.assert_eq(#h.restarts, 1)
+      end)
+    end)
+  end
+
+  t.it("rejects an unknown or changed directory write policy", function()
+    fixture(function(h)
+      h.descriptor.directory_write_policy = "unreviewed-policy"
+      h.prepare(); h.describe()
+      t.assert_eq(#h.calls, 1); t.assert_eq(#h.watches, 0)
+      t.assert_true(vim.deep_equal(runtime.command(h.command), h.command))
+    end)
+    fixture(function(h)
+      h.descriptor.directory_write_policy = "stable-directory-write-v1"
+      h.prepare(); h.describe()
+      local result = h.result(); result.directory_write_policy = nil
+      h.calls[2].callback(result); h.flush()
+      t.assert_true(vim.deep_equal(runtime.command(h.command), h.command))
+    end)
+  end)
+
   t.it("logs the first native invalidation once and still falls back if logging fails", function()
     local log = require("utils.log")
     local original = log.warn_ctx

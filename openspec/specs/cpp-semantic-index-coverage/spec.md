@@ -177,11 +177,20 @@ phase manifest SHALL 绑定独立原始 semantic CDB 的路径与内容。native
 - **AND** early input events, unavailable roots, overflow, helper exit, malformed notifications and readiness failure SHALL revoke authority, including during partial installation
 - **AND** grouped native watches SHALL share one parent-bound helper per activation, respect the existing root budgets and release the whole group on invalidation or cancellation; pending, duplicate or late readiness MUST NOT start validation
 
+#### Scenario: A subscribed ordinary directory receives only a write notification
+- **WHEN** the Windows grouped backend separates namespace/attributes/creation/security (`0x147`) from size/last-write (`0x18`) notifications
+- **THEN** each root SHALL acknowledge readiness only after both subscriptions are armed; either stream's errors or overflow SHALL revoke authority
+- **AND** activation SHALL install actual parent-entry watches for ancestors of every protected recursive root, as well as lexical driver lookup ancestors, within the existing recursive/direct root budgets
+- **AND** runtime MAY ignore a write-stream action 3 only for an exact subscribed directory whose nonzero device/inode and ordinary, non-reparse attributes still match the backend's initial `lstat` identity, under the explicit `stable-directory-write-v1` descriptor policy
+- **AND** validation SHALL bind that policy and the full installed topology; unknown policy, legacy/unclassified notifications, files, unsubscribed directories, changed identities, metadata and namespace notifications SHALL retain conservative invalidation
+- **AND** ignored directory writes SHALL NOT trigger revalidation, CDB rewriting or a clangd restart; source-only subscriptions SHALL remain unchanged
+- **AND** notification coverage MUST NOT be reported as complete reparse protection: an in-place reparse-target change that the host does not notify remains an explicitly recorded capability gap, not evidence of unchanged identity
+
 #### Scenario: A frozen database has no local shard-cache directory yet
 - **WHEN** startup is preparing a frozen database whose owned local cache tree does not yet exist
 - **THEN** runtime SHALL create the canonical `verified/.cache/clangd/index` directory tree before installing input watches, deriving its location from the original semantic CDB rather than an arbitrary descriptor path
 - **AND** existing directories and shard contents SHALL remain untouched; conflicting files, redirected components, an unexpected frozen CDB path or creation failure SHALL retain the original CDB
-- **AND** this preparation SHALL NOT bypass receipt validation or ignore ancestor, content, namespace or metadata notifications; first cache writes within the existing excluded tree SHALL not revoke otherwise current authority
+- **AND** this preparation SHALL NOT bypass receipt validation or ignore content, namespace, metadata or unclassified ancestor notifications; only the separately specified stable-directory write policy MAY suppress classified ancestor writes, and first cache writes within the existing excluded tree SHALL not revoke otherwise current authority
 
 #### Scenario: The server uses a query-driver profile not covered by the proof
 - **WHEN** effective server arguments contain a nonempty query-driver allowlist and receipts do not certify that driver-query profile

@@ -14,8 +14,9 @@ local function transport()
     stop = function(job) stopped[#stopped + 1] = job end,
     schedule = function(fn) fn() end,
     defer = function(fn) timers[#timers + 1] = fn end, register = function() end }))
-  local function frame(id, kind, events)
-    callbacks.on_stdout(82, { vim.json.encode({ v = 1, root_id = id, kind = kind, events = events }), "" })
+  local function frame(id, kind, events, stream)
+    callbacks.on_stdout(82, { vim.json.encode({ v = 1, root_id = id, kind = kind, events = events,
+      stream = stream, streams = kind == "ready" and { "metadata", "write" } or nil }), "" })
   end
   return group, callbacks, timers, stopped, sent, frame
 end
@@ -58,6 +59,62 @@ t.describe("grouped native input transport", function()
     group:close()
   end)
 
+  t.it("forwards stream classification without dropping metadata or legacy events", function()
+    local group, _, _, _, _, frame = transport()
+    local events = {}
+    group:watch("C:/fixture/source", function(err, path, event)
+      t.assert_nil(err); events[#events + 1] = { path = path, event = event }
+    end, { recursive = true, on_ready = function(ok) t.assert_true(ok) end })
+    frame(1, "ready")
+    frame(1, "events", { { path = "stable", action = 3, directory = true, stable_directory_write = true } }, "write")
+    frame(1, "events", { { path = "stable", action = 3, directory = true } }, "metadata")
+    frame(1, "events", { { path = "stable", action = 3, directory = true } })
+    t.assert_eq(#events, 3)
+    t.assert_true(events[1].event.stable_directory_write)
+    t.assert_eq(events[1].event.stream, "write")
+    t.assert_eq(events[2].event.stream, "metadata")
+    t.assert_false(events[2].event.stable_directory_write)
+    t.assert_nil(events[3].event.stream)
+    t.assert_false(events[3].event.stable_directory_write)
+    group:close()
+  end)
+
+  for index, sample in ipairs({
+    { stream = "other", directory = true, action = 3 },
+    { stream = "metadata", directory = true, action = 3, stable_directory_write = true },
+    { directory = true, action = 3, stable_directory_write = true },
+    { stream = "write", directory = false, action = 3, stable_directory_write = true },
+    { stream = "write", directory = true, action = 4, stable_directory_write = true },
+    { stream = "write", directory = true, action = 3, stable_directory_write = "true" },
+  }) do
+    t.it("rejects malformed directory classification " .. index, function()
+      local group, _, _, _, _, frame = transport()
+      local failure
+      group:watch("C:/fixture/source", function(err) failure = err end,
+        { recursive = true, on_ready = function() end })
+      frame(1, "ready")
+      frame(1, "events", { { path = "root", directory = sample.directory,
+        action = sample.action, stable_directory_write = sample.stable_directory_write } }, sample.stream)
+      t.assert_eq(group.phase, "error")
+      t.assert_true(failure ~= nil)
+      group:close()
+    end)
+  end
+
+  for _, readiness in ipairs({ '{"v":1,"root_id":1,"kind":"ready","streams":["metadata"]}',
+    '{"v":1,"root_id":1,"kind":"ready"}' }) do
+    t.it("refuses unproven stream readiness: " .. readiness, function()
+      local group, callbacks = transport()
+      local failed
+      group:watch("C:/fixture/source", function(err) failed = err end,
+        { recursive = true, on_ready = function(ok) t.assert_false(ok) end })
+      callbacks.on_stdout(82, { readiness, "" })
+      t.assert_eq(group.phase, "error")
+      t.assert_true(failed ~= nil)
+      group:close()
+    end)
+  end
+
   for _, failure in ipairs({ "overflow", "error", "bad-id", "bad-path", "timeout", "exit", "duplicate-ready", "oversized" }) do
     t.it("fails closed across roots on " .. failure, function()
       local group, callbacks, timers, stopped, _, frame = transport()
@@ -90,6 +147,40 @@ t.describe("grouped native input transport", function()
     group:close(); frame(1, "ready"); callbacks.on_exit(82, 1); timers[1]()
     t.assert_eq(called, 0)
     t.assert_eq(#stopped, 1)
+  end)
+end)
+
+t.describe("input directory annotation boundaries", function()
+  t.it("requires an exact configured ordinary directory with unchanged identity", function()
+    local python = vim.fn.exepath("python")
+    if python == "" then t.skip("directory annotation helper", "python unavailable"); return end
+    local code = table.concat({
+      "import importlib.util,os,stat,sys,types",
+      "sys.dont_write_bytecode=True",
+      "spec=importlib.util.spec_from_file_location('input_watch',sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)",
+      "root=os.path.abspath('fixture-parent'); child=os.path.join(root,'child'); key=os.path.normcase(child)",
+      "current=types.SimpleNamespace(st_mode=stat.S_IFDIR,st_file_attributes=16,st_dev=9,st_ino=12)",
+      "m.os.lstat=lambda path: current",
+      "baseline={key:m.ordinary_directory_identity(child)}",
+      "event={'path':'child','directory':True,'action':3}",
+      "assert m.input_event(root,'write',event,baseline)['stable_directory_write'] is True",
+      "assert 'stable_directory_write' not in m.input_event(root,'metadata',event,baseline)",
+      "assert 'stable_directory_write' not in m.input_event(root,'write',dict(event,path='child/descendant'),baseline)",
+      "assert 'stable_directory_write' not in m.input_event(root,'write',dict(event,action=1),baseline)",
+      "assert 'stable_directory_write' not in m.input_event(root,'write',dict(event,directory=False),baseline)",
+      "current.st_ino=13; assert 'stable_directory_write' not in m.input_event(root,'write',event,baseline)",
+      "current.st_ino=12; current.st_file_attributes=16|1024; assert m.ordinary_directory_identity(child) is None",
+      "current.st_file_attributes=16; current.st_ino=0; assert m.ordinary_directory_identity(child) is None",
+      "current.st_ino=12; current.st_dev=0; assert m.ordinary_directory_identity(child) is None",
+      "current.st_dev=9; current.st_mode=stat.S_IFREG; assert m.ordinary_directory_identity(child) is None",
+      "def missing(path): raise OSError('unavailable')",
+      "m.os.lstat=missing; assert m.ordinary_directory_identity(child) is None",
+      "assert m.FILTER==0x1b and m.INPUT_STREAMS=={'metadata':0x147,'write':0x18}",
+      "print('directory annotation boundaries passed')",
+    }, "\n")
+    local result = vim.system({ python, "-B", "-c", code,
+      vim.fn.getcwd() .. "/lua/workarounds/libuv/content_events.py" }, { text = true }):wait(5000)
+    t.assert_eq(result.code, 0, result.stderr)
   end)
 end)
 

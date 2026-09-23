@@ -370,15 +370,23 @@ local function fallback(record, reason)
 end
 
 local function filtered_watch(record, descriptor, backend)
-  local watched, excludes, inputs = {}, {}, {}
+  local watched, excludes, inputs, directories = {}, {}, {}, {}
   for _, path in ipairs(descriptor.watched_files or {}) do watched[key(path)] = true end
   for _, path in ipairs(descriptor.exclude_roots or {}) do excludes[#excludes + 1] = key(path) end
   for _, path in ipairs(descriptor.input_roots or {}) do inputs[#inputs + 1] = key(path) end
+  for _, field in ipairs({ "watch_roots", "lookup_roots" }) do
+    for _, path in ipairs(descriptor[field] or {}) do directories[key(path)] = true end
+  end
   local factory = backend or record.opts.watch_factory or native_watch
   return function(root, callback, options)
     return factory(root, function(err, filename, events)
       if err or not filename then callback(err or "watch-event-without-path"); return end
       local path = key(fs.is_absolute_path(filename) and filename or vim.fs.joinpath(root, filename))
+      -- Only the classified native backend can attest an unchanged ordinary
+      -- directory. Namespace/security subscriptions remain active independently.
+      if descriptor.directory_write_policy == "stable-directory-write-v1" and directories[path]
+          and type(events) == "table" and events.stream == "write" and events.action == 3
+          and events.directory == true and events.stable_directory_write == true then return end
       if watched[path] then callback(nil, filename, events); return end
       for _, excluded in ipairs(excludes) do
         if fs.path_has_prefix(path, excluded) then return end
@@ -426,6 +434,10 @@ end
 
 local function watch_sets(descriptor)
   local result = {}
+  if descriptor.directory_write_policy ~= nil and descriptor.directory_write_policy ~= "stable-directory-write-v1" then
+    return nil
+  end
+  result.directory_write_policy = descriptor.directory_write_policy
   for _, field in ipairs({ "watch_roots", "lookup_roots", "watched_files", "input_roots", "exclude_roots" }) do
     if not path_list(descriptor[field], field == "watch_roots" or field == "watched_files" or field == "input_roots") then
       return nil
@@ -553,6 +565,7 @@ function M.prepare(bufnr, root, on_dir, opts)
     record.compiler_environment = descriptor.compiler_environment
     record.tool_path = descriptor.tool_path
     local installed_sets = watch_sets(descriptor)
+    if not installed_sets then reject("invalid-activation-descriptor"); return end
     local function begin_watching()
       if record.phase ~= "probing" then return end
       record.phase = "validating"

@@ -123,10 +123,12 @@ t.describe("frozen batch live validity guard", function()
     local h = harness()
     h.callbacks.verify({ ok = true }); h.flush()
     t.assert_nil(h.guard:status().event)
-    local native = { action = 3, directory = false, change = true, rename = false }
+    local native = { action = 3, directory = false, change = true, rename = false,
+      stream = "write", stable_directory_write = false }
     h.watches[1].callback(nil, "Nested/input.h", native)
     local expected = { root = h.watches[1].root, filename = "Nested/input.h",
-      action = 3, directory = false, change = true, rename = false }
+      action = 3, directory = false, change = true, rename = false,
+      stream = "write", stable_directory_write = false }
     t.assert_true(vim.deep_equal(h.guard:status().event, expected), "first event identity must survive invalidation")
     native.action, native.change = 5, false
     local copy = h.guard:status().event
@@ -143,7 +145,7 @@ t.describe("frozen batch live validity guard", function()
   t.it("bounds filesystem evidence without inventing absent paths, flags or nonfilesystem events", function()
     local missing = harness()
     missing.watches[1].callback(string.rep("e", 2049), nil,
-      { action = "3", directory = "true", change = 1, rename = false })
+      { action = "3", directory = "true", change = 1, rename = false, stream = "unknown", stable_directory_write = "true" })
     local event = missing.guard:status().event
     t.assert_type(event, "table")
     t.assert_eq(event.root, missing.watches[1].root)
@@ -151,6 +153,7 @@ t.describe("frozen batch live validity guard", function()
     t.assert_eq(event.error, string.rep("e", 2048))
     t.assert_true(event.truncated)
     t.assert_nil(event.action); t.assert_nil(event.directory); t.assert_nil(event.change)
+    t.assert_nil(event.stream); t.assert_nil(event.stable_directory_write)
     t.assert_eq(event.rename, false)
     missing.flush(); t.assert_eq(missing.callbacks.reason, "watch-error")
 

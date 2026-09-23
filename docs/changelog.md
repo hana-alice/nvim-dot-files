@@ -62,9 +62,10 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 - `v1.12.3` → [docs/release_1.12.3.md](release_1.12.3.md) (demand-driven recovery; tag pending)
 - `v1.12.4` → [docs/release_1.12.4.md](release_1.12.4.md) (native junction verification; later ancestor-event fallback recorded; tag pending)
 - `v1.12.5` → [docs/release_1.12.5.md](release_1.12.5.md) (stable directory writes and complete ancestor watches; tag pending)
+- `v1.12.6` → [docs/release_1.12.6.md](release_1.12.6.md) (modified-document preflight and clean demand recovery; tag pending)
 
 ## Unreleased
 
-No unreleased entries. The directory-notification repair and verification are archived
-in [v1.12.5](release_1.12.5.md). Live code is updated; an existing modified document
-currently requires original fallback, and whole-engine acceptance remains unfinished.
+No unreleased entries. Modified-document activation and recovery are archived in
+[v1.12.6](release_1.12.6.md). Live preflight preserves the existing unsaved document
+and original client without helpers or restart; full-engine acceptance remains open.

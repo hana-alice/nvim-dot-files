@@ -206,11 +206,21 @@ phase manifest SHALL 绑定独立原始 semantic CDB 的路径与内容。native
 - **AND** returned evidence SHALL be an independent copy, oversized fields SHALL be explicitly marked truncated, and logging failure MUST NOT delay revocation or suppress fallback; ordinary accepted/ignored events SHALL NOT accumulate a trace
 
 #### Scenario: A later startup retries an input-event invalidation
-- **WHEN** a normal startup requests the same publication and generation after an `input-changed` fallback
+- **WHEN** a normal startup requests the same publication and generation after an `input-changed`, `live-document-modified` or `live-document-changed` fallback
 - **THEN** it MAY retry only after a 30-second monotonic cooldown and confirmed completion of the previous activation helpers; cancellation alone MUST NOT establish completion
+- **AND** relevant loaded documents SHALL be clean before retry; a clean buffer SHALL NOT substitute for fresh validation of the on-disk inputs
 - **AND** retry SHALL repeat description, watch readiness and full receipt validation before granting authority; concurrent requests SHALL share the attempt and later input events SHALL still revoke it
 - **AND** each configured frozen client SHALL bind to its activation attempt; a late client from an older attempt MUST NOT acquire the fresh guard merely because the publication stamp matches
 - **AND** elapsed time alone SHALL NOT launch helpers or restart clients; unchanged ready activations SHALL remain reusable without revalidation, and other failure reasons SHALL remain sticky for that publication
+
+#### Scenario: A loaded document already contains unsaved changes
+- **WHEN** a named, normal, loaded document is modified and is the requested buffer, already attached to a clangd client for the selected CDB, or admitted by the configured filetypes inside the selected engine/project roots
+- **THEN** startup SHALL retain original commands before metadata/generation work, validation helpers or watch installation; an initial blocked request SHALL NOT create a sticky failed activation
+- **AND** unrelated foreign, scratch and unsupported-filetype buffers SHALL NOT block merely because project selection is pinned; existing same-CDB attachments and explicit requests SHALL remain protected when their filetype changes
+- **AND** an already pending or ready activation SHALL revoke immediately when the document check detects an edit; description, watch installation after capability probing, validation, readiness, command-selection, process-configuration and attachment boundaries SHALL recheck documents so asynchronous edits cannot acquire frozen authority
+- **AND** late callbacks from cancelled description/probe work SHALL NOT replace the first document failure with a nonretryable failure; repeated dirty requests SHALL NOT extend the original cooldown or treat cancellation as helper completion
+- **AND** clearing a document SHALL NOT automatically launch work, save/discard any user text, or reuse invalid authority; later clean demand SHALL run the normal complete activation and preserve generation, profile, environment and attempt checks
+- **AND** document checks SHALL inspect loaded buffer metadata and existing ownership only, without reading source contents, scanning dependency trees or resolving a project separately for every buffer
 
 #### Scenario: Certifying a supported driver-query profile
 - **WHEN** a secondary proof explicitly supports a nonempty query-driver profile

@@ -9,6 +9,8 @@ local function fixture(body)
   root = vim.fs.normalize(assert(vim.uv.fs_realpath(root)))
   vim.fn.mkdir(root .. "/background/verified", "p")
   local h = { queue = {}, calls = {}, watches = {}, restarts = {}, roots = {}, config = {}, stamp = "metadata-v1", generation = "gen-a", now = 0 }
+  local owned_buffers = {}
+  local get_clients = vim.lsp.get_clients
   h.ctx = { paths = { clangd_dir = root, semantic_cdb = root .. "/background/compile_commands.json" } }
   h.command = { "clangd", "--background-index", "--compile-commands-dir=" .. root .. "/background" }
   h.descriptor = { ok = true, info_sha256 = "sha-v1", generation_id = "gen-a", compiler_environment = {}, tool_path = root .. "/clangd.exe",
@@ -53,15 +55,193 @@ local function fixture(body)
     h.calls[#h.calls].callback(h.result())
     h.flush()
   end
+  function h.document(path, filetype)
+    h.opts.no_buffer_watch = false
+    h.ctx.engine_root = root .. "/engine"
+    h.ctx.project_root = root .. "/project"
+    h.config.filetypes = { "cpp" }
+    path = path or h.ctx.engine_root .. "/source.cpp"
+    vim.fn.mkdir(vim.fs.dirname(path), "p")
+    vim.fn.writefile({ "int original;" }, path)
+    local buffer = vim.fn.bufadd(path)
+    owned_buffers[#owned_buffers + 1] = buffer
+    vim.fn.bufload(buffer)
+    vim.bo[buffer].filetype = filetype or "cpp"
+    return buffer
+  end
+  function h.edit(buffer) vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { "int unsaved;" }) end
+  function h.clean(buffer) vim.api.nvim_buf_call(buffer, function() vim.cmd("silent edit!") end) end
   local ok, err = xpcall(function() body(h, root) end, debug.traceback)
   runtime._reset_for_test()
   h.flush()
+  vim.lsp.get_clients = get_clients
+  for _, buffer in ipairs(owned_buffers) do if vim.api.nvim_buf_is_valid(buffer) then vim.api.nvim_buf_delete(buffer, { force = true }) end end
   if h.unlink_junction then h.unlink_junction() end -- A failed unlink must prevent recursive fixture cleanup.
   vim.fn.delete(root, "rf")
   if not ok then error(err) end
 end
 
 t.describe("frozen batch startup runtime", function()
+  t.it("document preflight retains original before metadata work and revalidates after clean demand", function()
+    fixture(function(h)
+      local buffer = h.document(); h.edit(buffer)
+      local tick = vim.api.nvim_buf_get_changedtick(buffer)
+      local fingerprint = h.opts.fingerprint
+      h.opts.fingerprint = function() error("dirty preflight must precede metadata") end
+      h.prepare(); h.prepare()
+      t.assert_eq(#h.calls, 0); t.assert_eq(#h.watches, 0); t.assert_eq(#h.restarts, 0)
+      t.assert_eq(#h.roots, 2)
+      t.assert_true(vim.bo[buffer].modified); t.assert_eq(vim.api.nvim_buf_get_changedtick(buffer), tick)
+      h.opts.fingerprint = fingerprint
+      h.clean(buffer); h.prepare(); h.describe(); h.validate()
+      t.assert_eq(#h.calls, 2)
+      t.assert_contains(runtime.command(h.command)[3], "/verified")
+    end)
+  end)
+
+  t.it("document preflight ignores foreign, scratch and unsupported buffers despite a pinned context", function()
+    fixture(function(h, root)
+      local foreign = h.document(root .. "/foreign/source.cpp")
+      local unrelated = h.document(root .. "/engine/notes.txt", "text")
+      local scratch = h.document(root .. "/engine/scratch.cpp")
+      vim.bo[scratch].buftype = "nofile"
+      for _, buffer in ipairs({ foreign, unrelated, scratch }) do h.edit(buffer) end
+      -- The injected resolver, like a manually pinned project, returns the same
+      -- CDB for every name. That alone must not make foreign files blockers.
+      h.prepare(); h.describe(); h.validate()
+      t.assert_contains(runtime.command(h.command)[3], "/verified")
+    end)
+  end)
+
+  t.it("document preflight includes explicit requests and same-CDB attachments with changed filetype", function()
+    for _, ownership in ipairs({ "request", "attached" }) do
+      fixture(function(h, root)
+        local buffer = h.document(root .. "/foreign/source.cpp", "text"); h.edit(buffer)
+        if ownership == "request" then
+          runtime.prepare(buffer, root, function() h.roots[#h.roots + 1] = root end, h.opts)
+        else
+          vim.lsp.get_clients = function(options)
+            return options.bufnr == buffer and { { config = { _ue_resolved_cmd = h.command } } } or {}
+          end
+          h.prepare()
+        end
+        t.assert_eq(#h.calls, 0); t.assert_eq(#h.roots, 1)
+      end)
+    end
+  end)
+
+  for _, stage in ipairs({ "describe", "validate", "ready", "command", "spawn", "attach" }) do
+    t.it("document preflight rejects edits at the " .. stage .. " boundary", function()
+      fixture(function(h)
+        local buffer = h.document()
+        h.prepare()
+        if stage == "describe" then h.edit(buffer); h.describe(); h.flush()
+        else
+          h.describe()
+          if stage == "validate" then h.edit(buffer); h.validate()
+          elseif stage == "ready" then
+            h.calls[2].callback(h.result()); h.edit(buffer); h.flush()
+          else
+            h.validate()
+            local command, config = runtime.command(h.command), {}
+            if stage == "attach" then
+              runtime.configure_process(command, config)
+              local other = h.document(h.ctx.engine_root .. "/other.cpp"); h.edit(other)
+              runtime.attach({ id = 808, config = config, attached_buffers = {},
+                request = function() return true, 1 end, cancel_request = function() end, stop = function() end }, buffer)
+            else
+              h.edit(buffer)
+              if stage == "command" then runtime.command(h.command)
+              else
+                local selected = runtime.configure_process(command, config)
+                t.assert_true(vim.deep_equal(selected, h.command)); t.assert_nil(config._ue_batch_scope)
+              end
+            end
+            h.flush()
+          end
+        end
+        t.assert_true(vim.deep_equal(runtime.command(h.command), h.command))
+        t.assert_eq(#h.calls, stage == "describe" and 1 or 2)
+        h.clean(buffer)
+        -- No clean callback or elapsed timer should schedule recovery itself.
+        h.now = 29999; h.prepare()
+        t.assert_eq(#h.calls, stage == "describe" and 1 or 2)
+      end)
+    end)
+  end
+
+  t.it("document preflight waits for helper exit and clean demand before a complete fresh attempt", function()
+    fixture(function(h)
+      local buffer = h.document()
+      h.prepare(); h.describe()
+      local old_validate = h.calls[2].callback
+      h.edit(buffer); h.prepare(); h.flush()
+      h.now = 30000; h.prepare(); t.assert_eq(#h.calls, 2, "dirty demand cannot start helpers")
+      h.clean(buffer); h.prepare(); t.assert_eq(#h.calls, 2, "cancel is not helper completion")
+      old_validate(h.result()); h.flush()
+      t.assert_true(vim.deep_equal(runtime.command(h.command), h.command))
+      h.prepare(); h.prepare(); t.assert_eq(#h.calls, 3)
+      h.describe(); h.validate(); t.assert_eq(#h.calls, 4)
+      t.assert_contains(runtime.command(h.command)[3], "/verified")
+      old_validate(h.result()); h.flush(); h.prepare(); t.assert_eq(#h.calls, 4)
+    end)
+  end)
+
+  t.it("document preflight retires a late same-attempt client while buffers remain modified", function()
+    fixture(function(h)
+      local buffer = h.document()
+      h.prepare(); h.describe(); h.validate()
+      local config = {}; runtime.configure_process(runtime.command(h.command), config)
+      h.edit(buffer); runtime.command(h.command); h.flush()
+      local client = { id = 810, config = config, attached_buffers = {}, request = function() return true, 1 end,
+        cancel_request = function() end, stop = function() end }
+      runtime.attach(client, buffer); h.flush()
+      t.assert_eq(h.restarts[#h.restarts][1], client, "late frozen reader must still be retired")
+      t.assert_false(client._ue_batch_guard.guard:status().state == "ready")
+    end)
+  end)
+
+  for _, stage in ipairs({ "describe", "probe" }) do
+    t.it("document preflight preserves retry after a late cancelled " .. stage .. " callback", function()
+      fixture(function(h)
+        local buffer = h.document()
+        local probe
+        if stage == "probe" then h.opts.probe_recursive = function(callback) probe = callback end end
+        h.prepare()
+        local late = h.calls[1].callback
+        if stage == "probe" then h.describe(); late = probe end
+        h.edit(buffer); h.prepare(); h.flush()
+        h.clean(buffer)
+        late(stage == "probe" and true or h.result()); h.flush()
+        h.now = 30000; h.prepare()
+        t.assert_eq(#h.calls, 2, "late cancelled callbacks must not replace the retryable document reason")
+        h.describe()
+        if stage == "probe" then probe(true) end
+        h.validate()
+        t.assert_eq(#h.calls, 3)
+        t.assert_contains(runtime.command(h.command)[3], "/verified")
+      end)
+    end)
+  end
+
+  t.it("document preflight recovers a real edit-and-reload invalidation only after full validation", function()
+    fixture(function(h)
+      local buffer = h.document()
+      h.prepare(); h.describe(); h.validate()
+      local config = {}; runtime.configure_process(runtime.command(h.command), config)
+      runtime.attach({ id = 809, config = config, attached_buffers = {}, request = function() return true, 1 end,
+        cancel_request = function() end, stop = function() end }, buffer)
+      h.edit(buffer)
+      vim.api.nvim_exec_autocmds("TextChanged", { buffer = buffer })
+      h.flush(); h.clean(buffer)
+      h.now = 29999; h.prepare(); t.assert_eq(#h.calls, 2)
+      h.now = 30000; h.prepare(); t.assert_eq(#h.calls, 3)
+      h.describe(); h.calls[4].callback(h.result({ ok = false, reason = "dependency-bytes-changed" })); h.flush()
+      t.assert_true(vim.deep_equal(runtime.command(h.command), h.command))
+      h.now = 90000; h.prepare(); t.assert_eq(#h.calls, 4, "failed proof remains sticky even though buffer is clean")
+    end)
+  end)
+
   local query_driver_forms = {
     { "--query-driver=C:/toolchain/*clang++.exe" },
     { "-query-driver=C:/toolchain/*clang++.exe" },

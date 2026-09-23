@@ -3,6 +3,7 @@ local M = {}
 local uv = vim.uv or vim.loop
 local platform = require("utils.platform")
 local fs = require("ue.core.fs")
+local documents = require("ue.index.batch_documents")
 local records, verified_dirs = {}, {}
 local next_attempt = 0
 local recursive_capability, probe_waiters
@@ -355,8 +356,10 @@ local function now_ms(opts)
   return opts.now_ms and opts.now_ms() or uv.hrtime() / 1000000
 end
 
+local retryable = { ["input-changed"] = true, ["live-document-modified"] = true, ["live-document-changed"] = true }
+
 local function fallback(record, reason)
-  if not record.failed and reason == "input-changed" then
+  if not record.failed and retryable[reason] then
     record.retry_after = now_ms(record.opts) + 30000
   end
   record.failed, record.reason = true, reason
@@ -367,6 +370,31 @@ local function fallback(record, reason)
   for _, client in pairs(record.clients) do clients[#clients + 1] = client end
   (record.opts.restart or scoped_restart)(clients, record.ctx)
   record.clients = {}
+end
+
+local function modified_document(bufnr, ctx, scope, config, opts)
+  if opts.no_buffer_watch then return false end
+  return documents.modified(bufnr, ctx, config.filetypes, function(client)
+    local owned = client.config or {}
+    local command = owned._ue_resolved_cmd or owned.cmd
+    local _, directory
+    if type(command) == "table" then _, directory = cdb_argument(command) end
+    return owned._ue_batch_scope == scope or (directory and
+      (key(vim.fs.joinpath(directory, "compile_commands.json")) == scope
+        or (verified_dirs[directory] and verified_dirs[directory].scope == scope)))
+  end)
+end
+
+local function document_blocked(record, bufnr)
+  if not modified_document(bufnr or record.bufnr, record.ctx, record.scope, record.get_config(), record.opts) then return false end
+  if not record.failed then
+    if record.guard then record.guard:invalidate("live-document-modified")
+    else
+      fallback(record, "live-document-modified")
+      if record.cancel_describe then pcall(record.cancel_describe) end
+    end
+  end
+  return true
 end
 
 local function filtered_watch(record, descriptor, backend)
@@ -450,7 +478,7 @@ end
 
 --- Resolve metadata asynchronously before root_dir starts any new clangd.
 --- All large reads/hashes remain in the child. Input-change failures may retry on
---- a later demand after cooldown and helper exit; other failures stay sticky.
+--- a later clean demand after cooldown and helper exit; other failures stay sticky.
 function M.prepare(bufnr, root, on_dir, opts)
   opts = opts or {}
   local get_command = opts.get_command or function(directory) return require("ue").clangd_cmd(directory) end
@@ -467,10 +495,14 @@ function M.prepare(bufnr, root, on_dir, opts)
   local ctx = resolve(bufnr)
   local original = ctx and ctx.paths and ctx.paths.semantic_cdb
   if not original then on_dir(root); return end
-  local info = vim.fs.joinpath(vim.fs.dirname(original), "batches.json")
-  local stamp = (opts.fingerprint or fingerprint)(info)
   local scope = key(original)
   local previous = records[scope]
+  if (previous and document_blocked(previous, bufnr))
+      or (not previous and modified_document(bufnr, ctx, scope, config, opts)) then
+    on_dir(root); return nil, "live-document-modified"
+  end
+  local info = vim.fs.joinpath(vim.fs.dirname(original), "batches.json")
+  local stamp = (opts.fingerprint or fingerprint)(info)
   local get_generation = opts.get_generation or function(context)
     return require("ue.index").generation_for_context(context).generation_id
   end
@@ -484,7 +516,7 @@ function M.prepare(bufnr, root, on_dir, opts)
     end
     local reason = request_reason(previous, command, config)
     if reason then on_dir(root); return nil, reason end
-    local retry = previous.failed and previous.reason == "input-changed"
+    local retry = previous.failed and retryable[previous.reason]
       and previous.retry_after and now_ms(opts) >= previous.retry_after
       and previous.pending_helpers == 0
     if not retry then
@@ -497,7 +529,7 @@ function M.prepare(bufnr, root, on_dir, opts)
   if previous and previous.cancel_describe then pcall(previous.cancel_describe) end
   if not stamp then records[scope] = nil; on_dir(root); return end
   next_attempt = next_attempt + 1
-  local record = { ctx = ctx, opts = opts, stamp = stamp, scope = scope, info = info,
+  local record = { ctx = ctx, opts = opts, stamp = stamp, scope = scope, info = info, bufnr = bufnr,
     attempt = next_attempt, pending_helpers = 0,
     original = original, clients = {}, autocmds = {}, phase = "describing", generation = generation,
     server_profile = vim.deepcopy(profile), launch_cwd = cwd, environment = environment,
@@ -535,7 +567,8 @@ function M.prepare(bufnr, root, on_dir, opts)
     fallback(record, reason or "activation-unavailable")
   end
   local function described(descriptor)
-    if record.phase ~= "describing" then return end
+    if record.failed or record.phase ~= "describing" then return end
+    if document_blocked(record) then return end
     record.phase = "probing"
     if not current() then reject("activation-metadata-changed"); return end
     if type(descriptor) ~= "table" or descriptor.ok ~= true
@@ -567,7 +600,8 @@ function M.prepare(bufnr, root, on_dir, opts)
     local installed_sets = watch_sets(descriptor)
     if not installed_sets then reject("invalid-activation-descriptor"); return end
     local function begin_watching()
-      if record.phase ~= "probing" then return end
+      if record.failed or record.phase ~= "probing" then return end
+      if document_blocked(record) then return end
       record.phase = "validating"
       if not current() then reject("activation-metadata-changed"); return end
       local roots = vim.deepcopy(descriptor.watch_roots)
@@ -581,8 +615,11 @@ function M.prepare(bufnr, root, on_dir, opts)
           return factory and filtered_watch(record, descriptor, factory) or nil, close
         end or nil,
         verify_async = function(_, callback)
+          if document_blocked(record) then callback({ ok = false, reason = "live-document-modified" }); return end
           return run(info, clangd, "validate", function(result)
-            if not current() or type(result) ~= "table" or result.info_sha256 ~= record.info_sha256
+            if document_blocked(record) then
+              callback({ ok = false, reason = "live-document-modified" })
+            elseif not current() or type(result) ~= "table" or result.info_sha256 ~= record.info_sha256
                 or result.generation_id ~= generation then
               callback({ ok = false, reason = "activation-metadata-changed" })
             elseif result.tool_path ~= record.tool_path then
@@ -597,6 +634,7 @@ function M.prepare(bufnr, root, on_dir, opts)
           end, request)
         end,
         on_ready = function()
+          if document_blocked(record) then return end
           if not current() then record.guard:invalidate("activation-metadata-changed"); return end
           record.phase = "ready"
           verified_dirs[key(vim.fs.dirname(record.verified))] = record
@@ -617,11 +655,11 @@ function M.prepare(bufnr, root, on_dir, opts)
     end
     local probe = opts.probe_recursive or probe_recursive
     probe(function(capable)
-      if record.phase ~= "probing" then return end
+      if record.failed or record.phase ~= "probing" then return end
       if not current() or not capable then reject("recursive-watch-unavailable"); return end
       if #(descriptor.lookup_roots or {}) == 0 then begin_watching(); return end
       (opts.probe_direct or probe_direct)(function(direct)
-        if record.phase ~= "probing" then return end
+        if record.failed or record.phase ~= "probing" then return end
         if not direct then reject("direct-watch-unavailable"); return end
         begin_watching()
       end)
@@ -641,6 +679,7 @@ function M.command(cmd, config)
   if not position then return cmd end
   local record = records[key(vim.fs.joinpath(directory, "compile_commands.json"))]
   if not ready(record) then return cmd end
+  if document_blocked(record) then return cmd end
   if request_reason(record, cmd, config or record.get_config()) then return cmd end
   local result = vim.deepcopy(cmd)
   result[position] = "--compile-commands-dir=" .. vim.fs.dirname(record.verified)
@@ -692,7 +731,7 @@ function M.configure_process(cmd, config)
     if reason == "compiler-environment-changed" and record.guard then record.guard:invalidate(reason) end
     return original
   end
-  if not ready(record) then
+  if not ready(record) or document_blocked(record) then
     local original = vim.deepcopy(cmd)
     original[position] = "--compile-commands-dir=" .. vim.fs.dirname(record.original)
     return original
@@ -733,6 +772,7 @@ function M.attach(client, bufnr)
   record.clients[client.id] = client
   record.guard:attach(client)
   if not ready(record) then (record.opts.restart or scoped_restart)({ client }, record.ctx); return end
+  if document_blocked(record, bufnr) then return end
   if not record.opts.no_buffer_watch and vim.api.nvim_buf_is_valid(bufnr) then
     if vim.bo[bufnr].modified then record.guard:invalidate("live-document-modified"); return end
     client._ue_batch_buffers = client._ue_batch_buffers or {}

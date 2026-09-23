@@ -8,6 +8,8 @@ sys.path.insert(0, sys.argv[1])
 import clangd_query_profile as profile
 clangd, mode = pathlib.Path(sys.argv[2]).resolve(), sys.argv[3]
 driver = clangd.with_name('clang++.exe')
+if mode == 'ndk':
+    driver = pathlib.Path(sys.argv[4]).resolve()
 assert driver.is_file(), 'real installed Clang C++ driver required'
 class PrivateDirectory(tempfile.TemporaryDirectory):
     def cleanup(self):
@@ -30,6 +32,9 @@ with PrivateDirectory(prefix='query_profile_') as temporary:
     (include / 'stddef.h').write_text('#define QUERY_PROFILE_HEADER 739\n')
     source = root / 'main.cpp'
     source.write_text('#include <stddef.h>\nint query_profile;\n')
+    if mode == 'ndk':
+        sysroot = driver.parent.parent / 'sysroot'
+        assert sysroot.is_dir(), 'real NDK sysroot required'
     entry = {'directory': str(root), 'file': str(source), 'arguments': [str(driver),
         '--target=aarch64-none-linux-android23', '--sysroot=' + str(sysroot),
         '-x', 'c++', '-std=c++17', '-DKEEP_ORIGINAL=1', '-c', str(source)]}
@@ -139,10 +144,29 @@ with PrivateDirectory(prefix='query_profile_') as temporary:
             observed = [profile._key(path) for path in changed['evidence']['ordered_includes']]
             assert profile._key(generic) in observed and profile._key(target) in observed
         elif mode == 'version':
-            ndk = profile.ANDROID_NDK_9_VERSION + '\nTarget: x86_64-w64-windows-gnu'
-            assert profile._driver_profile(ndk) == 'android-ndk-r20b-clang-9.0.9'
+            ndk_line = ('Android (7019983 based on r365631c3) clang version 9.0.9 '
+                '(https://android.googlesource.com/toolchain/llvm-project '
+                'a2a1e703c0edb03ba29944e529ccbf457742737b) (based on LLVM 9.0.9svn)')
+            ndk = ndk_line + '\nTarget: x86_64-w64-windows-gnu'
+            assert profile._driver_profile(ndk) == 'android-clang-9.0.9-build-7019983'
+            for wrong in (ndk_line + '-custom', ndk_line.replace('7019983', '7019984'),
+                          ndk_line.replace('9.0.9 ', '9.0.90 '),
+                          ndk_line.replace('a2a1e703', 'b2a1e703'), ''):
+                assert profile._driver_profile(wrong) is None, wrong
             assert profile._driver_profile('clang version 22.1.5 5ea218a153f4d2f815b8244eab3e4b4ba5e00e6c') == 'llvm-22.1.5'
             assert profile._driver_profile('Android clang version 9.0.8') is None
+        elif mode == 'ndk':
+            assert evidence['driver_profile'] == 'android-clang-9.0.9-build-7019983'
+            assert profile._key(evidence['driver']['path']) == profile._key(driver)
+            assert evidence['ordered_includes'], 'native NDK query must discover headers'
+            verified = profile.validate(evidence, entry, str(clangd), allow,
+                root / 'validation', launch_cwd=str(root))
+            assert verified['ok'], verified
+            forged = copy.deepcopy(evidence)
+            forged['driver_profile'] = 'android-ndk-r20b-clang-9.0.9'
+            rejected = profile.validate(forged, entry, str(clangd), allow,
+                root / 'forged-profile', launch_cwd=str(root))
+            assert not rejected['ok'] and rejected['reason'] == 'query-profile-changed', rejected
         else:
             raise AssertionError(mode)
 print('ok')
@@ -165,12 +189,17 @@ t.describe("native query driver profile", function()
     { "implicit", "real Android driver discovers newly created unlogged installation headers" },
     { "version", "accepts only the pinned LLVM and Android NDK driver profiles" },
   }
+  -- Optional real toolchain lane. CI without an NDK still runs the version
+  -- rejection cases; acceptance on an NDK host explicitly supplies its driver.
+  if vim.env.UE_QUERY_DRIVER and vim.env.UE_QUERY_DRIVER ~= "" then
+    cases[#cases + 1] = { "ndk", "rediscovers the real Android driver and rejects a forged profile" }
+  end
   for _, case in ipairs(cases) do
     t.it(case[2], function()
       local script = vim.fn.tempname() .. "_query_profile.py"
       local file = assert(io.open(script, "wb")); file:write(fixture); file:close()
       local result = vim.system({ python, "-B", "-I", script,
-        vim.fn.stdpath("config") .. "/tools", clangd, case[1] }, { text = true }):wait(45000)
+        vim.fn.stdpath("config") .. "/tools", clangd, case[1], vim.env.UE_QUERY_DRIVER or "" }, { text = true }):wait(45000)
       vim.fn.delete(script)
       t.assert_eq(result.code, 0, (result.stderr or "") .. (result.stdout or ""))
       t.assert_eq(vim.trim(result.stdout), "ok")

@@ -3,6 +3,7 @@
 > 日期：2026-09-23
 > 类型：Patch；阶段范围为已复现的冷缓存启动自失效。
 > Git tag：未创建，未获 tag 授权。
+> 收尾复查：后续再次发生 `input-changed`，当前已回退原始客户端；持续冻结启用尚未完成。
 
 ### 2026-09-23 — Prepare owned frozen-cache directories before input watches
 
@@ -26,9 +27,10 @@
 - Reusing the real activation options for unchanged prepare returned synchronously in **19.04 ms**, kept the same client and guard epoch, and all seven production artifact bytes/mtimes remained unchanged. Coverage remains 14,312 native sources and 2,094 shader records, with one accepted 8-to-1 batch.
 - The temporary observer ran for 114 seconds and saw 53,893 callbacks. Ordinary event storage was capped at 1,000; the separately reserved first-state-change slot remained empty, with zero observer errors. The original factory was restored. This is bounded observation, not a complete retained event history or a long-session guarantee.
 - Spec consistency: synchronized the owned-cache startup ordering contract in `cpp-semantic-index-coverage`. The runtime change does not modify collector/policy identities; the existing eight-to-one receipt still passed actual validation.
+- **Later final check, 07:51:30Z:** the same guard was invalidated again with `input-changed` and zero watches; original client21 was initialized and frozen client20 had left the client list. This occurred after temporary observation stopped, so the event path and cause are unknown. The earlier 162-second ready observation remains valid but does not establish sustained activation; neither the cache fix nor the commit is assumed to explain this later event.
 
 **Follow-ups**
-- Validate longer editing sessions and legitimate-input invalidation/recovery; historical client14's exact event remains unavailable.
+- Capture the next invalidation's exact event with bounded evidence retained until invalidation, then distinguish legitimate input changes from another self-generated notification. Sustained frozen use and longer editing/recovery validation remain incomplete; historical client14's exact event remains unavailable.
 - Expand proven secondary compression beyond the single accepted group.
 - Measure and optimize full-engine cold/warm completion, cache-transition cost and resource usage. The live existing `-j=12` run reached a sampled peak working set of **15.47 GB**; one host sample was **65.9% CPU** with roughly **36.9 GiB physical memory free**. These are observations, not a resource-cap or performance-restoration claim.
 - Close the historical navigation/dirty probe items separately. Direct junction regression for the newly prepared cache components remains a test-coverage gap; path rejection has code review plus foreign/file-conflict tests.

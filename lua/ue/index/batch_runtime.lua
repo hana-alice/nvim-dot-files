@@ -556,7 +556,17 @@ function M.prepare(bufnr, root, on_dir, opts)
           verified_dirs[key(vim.fs.dirname(record.verified))] = record
           flush(record)
         end,
-        on_invalidated = function(reason) fallback(record, reason) end,
+        on_invalidated = function(reason, guard)
+          local event = guard:status().event
+          if event then
+            pcall(function()
+              require("utils.log").warn_ctx("ue.index", "frozen batch invalidated", {
+                reason = reason, generation_id = record.generation, watch_event = event,
+              })
+            end)
+          end
+          fallback(record, reason)
+        end,
       })
     end
     local probe = opts.probe_recursive or probe_recursive

@@ -193,6 +193,8 @@ phase manifest SHALL 绑定独立原始 semantic CDB 的路径与内容。native
 - **WHEN** 受监视的源码、头文件、工具、lookup 目录或冻结产物发生变化
 - **THEN** SHALL 立即撤销该客户端的批次 epoch，拒绝新的 references/rename/prepareRename 与迟到的旧结果
 - **AND** SHALL 退回独立原 UBT 路径，并只重启受影响的本进程客户端；不得清理其他进程的缓存
+- **AND** an invalidation triggered by a watch callback SHALL retain the first triggering watch root, filename or error, and available event flags in bounded guard status and the normal warning log; later callbacks MUST NOT overwrite that evidence
+- **AND** returned evidence SHALL be an independent copy, oversized fields SHALL be explicitly marked truncated, and logging failure MUST NOT delay revocation or suppress fallback; ordinary accepted/ignored events SHALL NOT accumulate a trace
 
 #### Scenario: Certifying a supported driver-query profile
 - **WHEN** a secondary proof explicitly supports a nonempty query-driver profile

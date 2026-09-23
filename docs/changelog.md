@@ -58,7 +58,9 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v1.12.0` → [docs/release_1.12.0.md](release_1.12.0.md) (incremental scope; tag pending)
 - `v1.12.1` → [docs/release_1.12.1.md](release_1.12.1.md) (tag pending)
+- `v1.12.2` → [docs/release_1.12.2.md](release_1.12.2.md) (diagnostic stage; tag pending)
 
 ## Unreleased
 
-暂无新增记录；冷缓存启动修复及验收边界见 [v1.12.1](release_1.12.1.md)。
+No unreleased entries. The bounded first-event evidence change is archived in
+[v1.12.2](release_1.12.2.md); safe recovery and sustained frozen activation remain unfinished.

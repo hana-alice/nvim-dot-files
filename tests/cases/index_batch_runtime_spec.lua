@@ -211,6 +211,35 @@ t.describe("frozen batch startup runtime", function()
     end)
   end)
 
+  t.it("logs the first native invalidation once and still falls back if logging fails", function()
+    local log = require("utils.log")
+    local original = log.warn_ctx
+    local ok, err = xpcall(function()
+      for _, broken in ipairs({ false, true }) do
+        fixture(function(h, root)
+          local captured = {}
+          log.warn_ctx = function(scope, message, context)
+            captured[#captured + 1] = { scope = scope, message = message, context = context }
+            if broken then error("logging unavailable") end
+          end
+          h.prepare(); h.describe(); h.validate()
+          h.watches[1].callback(nil, "first.h", { action = 3, change = true, directory = false })
+          h.watches[1].callback(nil, "later.h", { rename = true })
+          h.flush()
+          t.assert_eq(#captured, 1)
+          t.assert_eq(captured[1].scope, "ue.index")
+          t.assert_eq(captured[1].context.watch_event.root, root .. "/input")
+          t.assert_eq(captured[1].context.watch_event.filename, "first.h")
+          t.assert_eq(captured[1].context.watch_event.action, 3)
+          t.assert_eq(#h.restarts, 1, "logging failure must not suppress protective fallback")
+          t.assert_true(vim.deep_equal(runtime.command(h.command), h.command))
+        end)
+      end
+    end, debug.traceback)
+    log.warn_ctx = original
+    if not ok then error(err) end
+  end)
+
   t.it("rejects validation that finishes after an event or changed publication metadata", function()
     fixture(function(h)
       h.prepare(); h.describe()

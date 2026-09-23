@@ -1067,3 +1067,33 @@ mtime 锚。当前 source observer 尚未改变，完整 SuperUnity 恢复也尚
 删除；state/cache 所有权修复在新进程完成验证，未热替换已有会话 owner。最后一轮后台
 索引结束通知属于复用缓存的重启轮次，不能据此给出完整冷索引时间。source 首次事件
 基线与 SuperUnity 完整语义、性能恢复仍未完成，不能用本次全绿回归替代它们。
+
+## 2026-09-23：捕获生成目录 Timestamp 导致的冻结失效
+
+此前冷缓存创建问题已独立复现并修复，见 [v1.12.1](release_1.12.1.md)，但后续仍发生
+未记录路径的失效。本轮把诊断改为 guard 保留唯一的首次失效事件，并写入既有 warning
+日志；不累积普通事件，不受临时 observer 停止时间影响。返回值独立复制，字段有界，
+日志异常不能阻止回退。读取能力启动失败而没有 callback 时不伪造文件事件。
+
+本地 18:20:26 的真实事件已在 guard status 与日志双重捕获：生成目录
+`Inc/CoreUObject/Timestamp`，`action=3`、`directory=false`、`change=true`、`rename=false`。
+文件 mtime 与事件时间一致。它在 activation validation 阶段令 guard 失效，随后
+original client22 初始化；不能把这轮报告为已成功持续启用 frozen CDB。
+
+引擎源码 `ExternalExecution.cs` 的 `UpdateTimestamps`（802–826）写入 UObject 头文件
+绝对路径清单；689–760 使用清单、mtime 和头文件状态判断生成代码是否过期。外部与
+内部 UHT 路径在 1122–1131、1330–1339 调用更新，即使此前报告 generated code up to
+date 也会执行。`UEBuildBinary.cs` 471–472 还因它总会更新而排除其 precompiled product。
+这是标记语义的源码证据，不足以指认这次实际写入进程，也不说明 UHT 必然执行或 C++
+生成文件必然改变。没有事件前 marker 的内容快照，不能声称它只修改了 mtime。
+
+实际 receipt 的 dependencies/assets 不含该 marker；包含它的目录 name/type/link
+inventory 与记录一致。随后对实际发布的 batches 描述及当前 client profile 执行一次
+production validation，9.847 秒、exit0、`publication-and-receipts-current`。20 条绑定
+输入与 3,318 条唯一 proof 文件身份在执行前后及 Job 清理后相等；无重新准入、发布、
+重启或遗留子进程。该次校验确认证明在事件后仍有效，不能推广为所有 Timestamp 或
+目录修改均可忽略。完整 required-native 回归 2120/2120、零失败/跳过。
+
+已交付首次事件留证，下一阶段实现安全复验恢复并验证持续冻结使用。保持真实输入
+变化立即撤权，不能直接放宽 watch mask 或按 basename 排除。全引擎压缩、冷/热索引
+耗时与资源验收及历史导航问题仍未完成，详见 [v1.12.2](release_1.12.2.md)。

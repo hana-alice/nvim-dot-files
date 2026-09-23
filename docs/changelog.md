@@ -58,6 +58,28 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-23 — Correct Android query identity before reusing batch proofs
+
+**Task**
+- Correct the previous profile's unsupported NDK release claim and overly broad version prefix match.
+
+**Implemented**
+- Name the profile by observed compiler build (`android-clang-9.0.9-build-7019983`) and require an exact version first line.
+- Advance the parser identity so older receipts cannot silently acquire the corrected policy.
+- Add changed-build/commit/suffix rejection cases and an optional `UE_QUERY_DRIVER` lane exercising a real installed NDK driver, rediscovery and forged-profile rejection.
+
+**Pitfalls / Gotchas**
+- Correction: the observed SDK package reports `Pkg.Revision = 21.4.7075529`; the previous `r20b` label was not supported by evidence. Historical pair admission remains historical and requires requalification under the changed helper.
+
+**Validation**
+- Before fix: query-profile regression 6/7; a direct probe also demonstrated acceptance of an added `-custom` suffix.
+- After fix: required-native query-profile regression 8/8, including the real Android driver.
+- Required-native full regression: **2091/2091 passed, 0 failed, 0 skipped**, with the real NDK lane enabled.
+- Spec consistency: synchronized `cpp-semantic-index-coverage`; strict OpenSpec validation, Python AST parsing and diff whitespace checks passed.
+
+**Follow-ups**
+- SuperUnity global semantic/performance restoration remains open. Independent-original timing sums are not a shared-cache performance baseline.
+
 ### 2026-09-22 — Certify the pinned Android NDK query-driver profile
 
 **Task**
@@ -65,7 +87,7 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
   driver identity or receipt validation.
 
 **Implemented**
-- Added an exact Android NDK r20b clang 9.0.9 profile to the LLVM 22.1.5 query extractor.
+- Added an Android clang 9.0.9 profile to the LLVM 22.1.5 query extractor (release label and version boundary corrected in the 2026-09-23 entry).
 - Bound the profile name into query evidence and validation; unrelated Android/NDK builds remain
   unsupported.
 - Added a native parser regression for the pinned and rejected version strings.

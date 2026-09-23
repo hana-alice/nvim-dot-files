@@ -17,7 +17,7 @@ import threading
 import time
 
 
-PARSER_ID = 'windows-llvm-22.1.5-query-driver-v3'
+PARSER_ID = 'windows-llvm-22.1.5-query-driver-v4'
 LLVM_COMMIT = '5ea218a153f4d2f815b8244eab3e4b4ba5e00e6c'
 ANDROID_NDK_9_VERSION = (
     'Android (7019983 based on r365631c3) clang version 9.0.9 '
@@ -54,8 +54,8 @@ def _driver_profile(version_text):
     """Return the exact compiler profile certified by this parser revision."""
     if version_text.startswith('clang version 22.1.5 ') and LLVM_COMMIT in version_text:
         return 'llvm-22.1.5'
-    if version_text.startswith(ANDROID_NDK_9_VERSION):
-        return 'android-ndk-r20b-clang-9.0.9'
+    if version_text.splitlines()[:1] == [ANDROID_NDK_9_VERSION]:
+        return 'android-clang-9.0.9-build-7019983'
     return None
 
 

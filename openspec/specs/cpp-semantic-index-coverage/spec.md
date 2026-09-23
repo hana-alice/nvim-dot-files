@@ -178,14 +178,16 @@ phase manifest SHALL 绑定独立原始 semantic CDB 的路径与内容。native
 - **AND** the profile SHALL bind cache/frozen/receipt identities, effective lookup roots SHALL be monitored, and activation SHALL asynchronously repeat native driver discovery after installing watches
 
 #### Scenario: Certifying the pinned Android NDK driver profile
-- **WHEN** the active Android CDB resolves the compiler to the pinned NDK r20b clang 9.0.9 build
+- **WHEN** the active Android CDB resolves the compiler to the pinned Android clang 9.0.9 build
   (`7019983` / `r365631c3`, LLVM commit `a2a1e703c0edb03ba29944e529ccbf457742737b`)
 - **THEN** the LLVM 22.1.5 clangd query extractor MAY certify that driver as the explicit
-  `android-ndk-r20b-clang-9.0.9` profile
+  `android-clang-9.0.9-build-7019983` profile
 - **AND** the exact driver version string, bytes, target, ordered system includes, builtin-header
   handling, compiler environment and lookup roots SHALL remain bound in the evidence
 - **AND** any other Android/NDK version or build identity SHALL remain unsupported and retain the
   original UBT commands until a separately reviewed profile is added
+- **AND** the version first line SHALL match the full reviewed build banner exactly; custom suffixes, changed build numbers or commits SHALL reject certification
+- **AND** compiler build identity MUST NOT be reported as an inferred NDK package release; a changed parser/profile identity SHALL invalidate older receipts
 
 #### Scenario: Driver lookup depends on directories outside source trees
 - **WHEN** native driver discovery can search executable candidates outside recursively monitored compiler inputs

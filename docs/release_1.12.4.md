@@ -3,6 +3,7 @@
 > 日期：2026-09-23
 > 类型：Patch；补齐原生回归证据，运行时行为未改变。
 > Git tag：未创建，未获 tag 授权。
+> 收尾复查：目录祖先事件再次触发回退；11:26:13Z 为 original client28，持续冻结运行未完成。
 
 ### 2026-09-23 — Verify redirected frozen-cache components on the real host
 
@@ -27,3 +28,19 @@
 **Follow-ups**
 - Direct Windows cache-junction coverage is now closed on this host. Long-session editing/recovery, proactive promotion, broader secondary compression and historical navigation/dirty/csearch dispositions remain open.
 - Capture explicit per-client indexing start/end evidence with cache and input identities before reporting whole-engine timings. Whole-engine CPU/memory and cold/warm performance acceptance remain unfinished.
+
+### 2026-09-23 — Retain the later ancestor-event fallback in acceptance
+
+**Task**
+- Correct final live-state reporting after the successful junction verification and push.
+
+**Observed**
+- The runtime warning log records an `input-changed` event at **11:18:32Z** for the configuration directory reported through its parent watch: `filename=nvim`, `action=3`, `directory=true`, `change=true`, `rename=false`.
+- At **11:26:13Z**, guard status retains this exact event, is invalidated with zero watches, and initialized **original client28** serves the CDB. The earlier frozen client27-ready snapshot remains valid for its recorded instant; it is not the final state.
+- The event's underlying writer and affected descendant are unknown. It predates the junction-stage commit/push and must not be attributed to those actions from timing alone. No directory-event exclusion or forced recovery was added.
+
+**Validation**
+- Documentation-only correction; production code and the passed **2130/2130** native result are unchanged. Structure **78/78** and whitespace checks passed for this correction. No spec behavior change.
+
+**Follow-ups**
+- Investigate this directory-ancestor notification and safe recovery before claiming sustained frozen activation. Preserve genuine namespace/security/identity protection; do not simply ignore directory changes.

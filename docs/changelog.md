@@ -60,7 +60,7 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 - `v1.12.1` → [docs/release_1.12.1.md](release_1.12.1.md) (tag pending)
 - `v1.12.2` → [docs/release_1.12.2.md](release_1.12.2.md) (diagnostic stage; tag pending)
 - `v1.12.3` → [docs/release_1.12.3.md](release_1.12.3.md) (demand-driven recovery; tag pending)
-- `v1.12.4` → [docs/release_1.12.4.md](release_1.12.4.md) (native junction verification; tag pending)
+- `v1.12.4` → [docs/release_1.12.4.md](release_1.12.4.md) (native junction verification; later ancestor-event fallback recorded; tag pending)
 
 ## Unreleased
 

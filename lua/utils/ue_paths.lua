@@ -33,6 +33,7 @@ M.BLOCKLIST_FRAGMENTS = {
   -- both under .cache/nvim-ue/clangd/, so the .cache/ entry above
   -- already covers them. Do NOT re-add them.
   "/.claude/",
+  "/.omx/",
 }
 
 -- Suffix patterns (lua patterns) that mark generated source. UHT emits

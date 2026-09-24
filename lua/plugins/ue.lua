@@ -48,7 +48,7 @@ return {
         root_dir = function(bufnr, on_dir)
           local root = require("ue").clangd_start_root(bufnr)
           if root then
-            require("ue.index.batch_runtime").prepare(bufnr, root, on_dir, {
+            require("ue.index.batch_recovery").prepare(bufnr, root, on_dir, {
               get_config = function()
                 local registered = type(vim.lsp.config) == "table" and vim.lsp.config.clangd
                 return type(registered) == "table" and registered or clangd
@@ -61,7 +61,7 @@ return {
             inherited_on_attach(client, bufnr)
           end
           require("ue.clangd_commands").ensure(client, bufnr)
-          require("ue.index.batch_runtime").attach(client, bufnr)
+          require("ue.index.batch_recovery").attach(client, bufnr)
         end,
         keys = {
           {

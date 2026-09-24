@@ -727,32 +727,60 @@ t.describe("multi-instance project state", function()
   t.it("persistent dirty overlay unions concurrent watcher updates", function()
     local root = tmpdir()
     local path = root .. "/dirty.json"
-    local jobs = {}
-    for index = 1, 8 do
-      local dirty = root .. "/Source/File" .. index .. ".cpp"
-      local code = string.format(
-        "local w=require(%q); w._set_opts_for_test({dirty_json_path=%q}); "
-          .. "w._seed_persistent_dirty_for_test({%q}); w._save_persistent_dirty_for_test(); vim.wait(300)",
-        "utils.ue_watch", path, dirty
-      )
-      jobs[index] = vim.system({
-        vim.v.progpath, "--headless", "-u", "NONE", "-i", "NONE",
-        "--cmd", "set rtp+=" .. vim.fn.stdpath("config"),
-        "-c", "lua " .. code, "-c", "qa!",
-      }, { text = true })
-    end
-    for _, job in ipairs(jobs) do
-      local result = job:wait()
-      t.assert_eq(result.code, 0, result.stderr)
-    end
-    local seen = {}
-    for _, dirty in ipairs(vim.json.decode(table.concat(vim.fn.readfile(path), "\n"))) do
-      seen[fs.norm(dirty):lower()] = true
-    end
-    for index = 1, 8 do
-      local dirty = fs.norm(root .. "/Source/File" .. index .. ".cpp"):lower()
-      t.assert_true(seen[dirty] == true, "lost dirty watcher path " .. index)
-    end
+    local lock = require("ue.file_lock")
+    local lease = assert(lock.acquire(path .. ".lock"))
+    local jobs, results, released = {}, {}, false
+    local ok, err = xpcall(function()
+      for index = 1, 8 do
+        local dirty = root .. "/Source/File" .. index .. ".cpp"
+        -- Production retries take up to 3575ms plus I/O/dispatch time. Wait for
+        -- this writer's actual published path, never its in-memory seeded set.
+        local code = string.format(
+          "local p,own=%q,%q; local w=require(%q); w._set_opts_for_test({dirty_json_path=p}); "
+            .. "w._seed_persistent_dirty_for_test({own}); w._save_persistent_dirty_for_test(); "
+            .. "vim.fn.writefile({'attempted'},%q); "
+            .. "assert(vim.wait(8000,function() local f=io.open(p,'rb'); if not f then return false end; "
+            .. "local raw=f:read('*a'); f:close(); local decoded,arr=pcall(vim.json.decode,raw); "
+            .. "if not decoded or type(arr)~='table' then return false end; "
+            .. "for _,value in ipairs(arr) do if vim.fs.normalize(value):lower()==vim.fs.normalize(own):lower() then return true end end; "
+            .. "return false end,10),'dirty path was not published before the persistence deadline')",
+          path, dirty, "utils.ue_watch", root .. "/attempted-" .. index
+        )
+        jobs[index] = vim.system({
+          vim.v.progpath, "--headless", "-u", "NONE", "-i", "NONE",
+          "--cmd", "set rtp+=" .. vim.fn.stdpath("config"),
+          "-c", "lua " .. code, "-c", "qa!",
+        }, { text = true })
+      end
+      -- Every writer encounters a real live lease for longer than the old
+      -- unconditional 300ms child lifetime before competing to publish its union.
+      local attempted = vim.wait(5000, function()
+        for index = 1, 8 do if vim.fn.filereadable(root .. "/attempted-" .. index) ~= 1 then return false end end
+        return true
+      end, 10)
+      if attempted then vim.wait(400, function() return false end, 10) end
+      released = lock.release(lease)
+      t.assert_true(attempted, "not all dirty writers attempted their first save")
+      t.assert_true(released, "parent must release its exact dirty writer lease")
+      for index, job in ipairs(jobs) do results[index] = job:wait(10000) end
+      for _, result in ipairs(results) do
+        t.assert_eq(result.code, 0, result.stderr)
+        t.assert_eq(vim.trim(result.stderr or ""), "", result.stderr)
+      end
+      local seen = {}
+      for _, dirty in ipairs(vim.json.decode(table.concat(vim.fn.readfile(path), "\n"))) do
+        seen[fs.norm(dirty):lower()] = true
+      end
+      for index = 1, 8 do
+        local dirty = fs.norm(root .. "/Source/File" .. index .. ".cpp"):lower()
+        t.assert_true(seen[dirty] == true, "lost dirty watcher path " .. index)
+      end
+    end, debug.traceback)
+    -- Release before joining on every failure path; wait() bounds and reaps
+    -- each owned child even when a spawn or an earlier assertion failed.
+    if not released then lock.release(lease) end
+    for index, job in ipairs(jobs) do if not results[index] then job:wait(10000) end end
+    if not ok then error(err) end
     pcall(vim.fn.delete, root, "rf")
   end)
 end)

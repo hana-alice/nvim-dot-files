@@ -64,9 +64,10 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 - `v1.12.5` → [docs/release_1.12.5.md](release_1.12.5.md) (stable directory writes and complete ancestor watches; tag pending)
 - `v1.12.6` → [docs/release_1.12.6.md](release_1.12.6.md) (modified-document preflight and clean demand recovery; tag pending)
 - `v1.12.7` → [docs/release_1.12.7.md](release_1.12.7.md) (automatic clean-document recovery; tag pending)
+- `v1.12.8` → [docs/release_1.12.8.md](release_1.12.8.md) (padded search query cancellation; tag pending)
 
 ## Unreleased
 
-No unreleased entries. Automatic clean-document recovery is archived in
-[v1.12.7](release_1.12.7.md), verified and installed while preserving the original
-client and unsaved document. Whole-engine performance acceptance remains open.
+No unreleased entries. Padded search query cancellation is archived in
+[v1.12.8](release_1.12.8.md), verified in the current editor and the full regression.
+Whole-engine performance acceptance remains open.

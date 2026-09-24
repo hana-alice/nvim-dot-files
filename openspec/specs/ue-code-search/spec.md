@@ -69,6 +69,21 @@ UE 全代码搜索（`<leader>/`）SHALL **只**使用 csearch 索引后端，**
 - **THEN** backend SHALL stop delivering future `on_line` callbacks
 - **AND** backend SHALL NOT call `on_done` for that stopped search after stop has taken effect
 
+### Requirement: Picker cancellation SHALL use the same effective query as its finder
+
+The live csearch picker SHALL compare the current input with the finder's query
+using the same leading/trailing whitespace normalization as Snacks. Its watchdog,
+drain loop and final delivery check SHALL agree on that query identity.
+
+#### Scenario: A pasted query contains surrounding whitespace
+- **WHEN** a query contains leading or trailing whitespace that Snacks trims before starting its finder
+- **THEN** the search SHALL remain active and deliver the normalized query's matches
+- **AND** subsequently removing only that whitespace SHALL NOT leave an empty, cancelled search that requires a forced refresh
+
+#### Scenario: The effective query changes while a search is running
+- **WHEN** editing input changes the query after the same normalization, including changes to interior whitespace
+- **THEN** the previous search SHALL still be cancelled and late results SHALL NOT enter the new query's list
+
 ### Requirement: csearch tool probing SHALL NOT cache failures
 
 csearch 与 cindex-uefilter 的 executable probing SHALL cache only successful executable paths. A failed probe MUST NOT prevent later probes in the same Neovim session.

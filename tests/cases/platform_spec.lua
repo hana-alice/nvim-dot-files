@@ -12,6 +12,7 @@ local IFACE = {
   "shared_library_extension", "allows_osc52", "code_search_install_hint",
   "path_key", "query_driver_globs", "restart_fallback_candidates", "restart_shutdown_delay_ms",
   "cdb_compiler_candidates", "lldb_python_relative_paths",
+  "environment_key", "directory_symlink_options",
 }
 
 local function assert_entry(driver, fn_name, expected_path, expected_reason)
@@ -28,6 +29,13 @@ local function assert_plan_entry(driver, fn_name, expected_executable, expected_
 end
 
 t.describe("platform: 驱动接口契约", function()
+  t.it("frozen input-event groups belong only to the Windows driver", function()
+    t.assert_type(require("utils.platform.windows").input_event_watcher, "function")
+    for _, name in ipairs({ "macos", "linux", "stub" }) do
+      t.assert_nil(require("utils.platform." .. name).input_event_watcher)
+    end
+  end)
+
   for _, id in ipairs({ "windows", "macos", "linux", "stub" }) do
     t.it("driver " .. id .. " 实现完整接口", function()
       local m = require("utils.platform." .. id)
@@ -40,6 +48,18 @@ t.describe("platform: 驱动接口契约", function()
 end)
 
 t.describe("platform: host tool 解析", function()
+  t.it("environment spelling and directory links belong to host capabilities", function()
+    local windows = require("utils.platform.windows")
+    t.assert_eq(windows.environment_key("Path"), "PATH")
+    t.assert_eq(windows.environment_key("cpath"), "CPATH")
+    t.assert_true(vim.deep_equal(windows.directory_symlink_options(), { dir = true, junction = true }))
+    for _, id in ipairs({ "macos", "linux", "stub" }) do
+      local driver = require("utils.platform." .. id)
+      t.assert_eq(driver.environment_key("Path"), "Path")
+      t.assert_eq(driver.environment_key("cpath"), "cpath")
+      t.assert_true(vim.deep_equal(driver.directory_symlink_options(), { dir = true }))
+    end
+  end)
   t.it("Windows 只暴露 bat 与 PowerShell 宿主能力", function()
     local m = require("utils.platform.windows")
     assert_plan_entry(m, "ue_build_entry", "cmd.exe", "Build.bat")
@@ -83,6 +103,14 @@ t.describe("platform: host tool 解析", function()
     t.assert_eq(powershell, nil)
     t.assert_contains(powershell_err, "unsupported shell")
     t.assert_eq(#m.default_lldb_server_paths(), 0)
+  end)
+
+  t.it("Windows clangd 保留 PATH 优先并发现未加入 PATH 的 LLVM 安装", function()
+    local candidates = require("utils.platform.windows").default_clangd_candidates()
+    t.assert_eq(candidates[1], "clangd.exe")
+    t.assert_eq(candidates[2], "clangd")
+    t.assert_contains(candidates, (vim.env.ProgramFiles or "C:/Program Files") .. "/LLVM/bin/clangd.exe")
+    t.assert_contains(candidates, (vim.env["ProgramFiles(x86)"] or "C:/Program Files (x86)") .. "/LLVM/bin/clangd.exe")
   end)
 
   t.it("macOS 优先使用用户级或 Homebrew 的版本化 LLVM 22 clangd", function()

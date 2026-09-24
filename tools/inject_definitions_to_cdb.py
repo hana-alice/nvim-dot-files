@@ -14,6 +14,11 @@ clangd-indexer 在 disableUnsupportedOptions() 中清掉 -include-pch，
 
 用法:
   python inject_definitions_to_cdb.py path/to/compile_commands.json [--dry-run]
+
+Controlled BackgroundIndex passes --preserve-exact: validate explicit
+Definitions/PCH files and preserve their original compiler semantics. The
+legacy injection mode only reads explicitly included Definitions headers;
+source location never authorizes guessing another build's flags or includes.
 """
 import sys
 import os
@@ -21,7 +26,6 @@ import json
 import argparse
 import re
 import shlex
-from pathlib import Path
 
 MARKER = '-DUE_DEFS_INJECTED=1'
 
@@ -63,11 +67,11 @@ def parse_definitions_h(path, _seen=None):
                 if m:
                     name, val = m.group(1), m.group(2)
                     if val is None or val.strip() == '':
-                        args.append(f'-D{name}')
+                        args.append(f'-D{name}=')
                     else:
                         val = re.sub(r'/\*.*?\*/', '', val).strip()
                         val = re.sub(r'//.*$', '', val).strip()
-                        args.append(f'-D{name}={val}' if val else f'-D{name}')
+                        args.append(f'-D{name}={val}')
                     continue
                 m = RE_UNDEF.match(line)
                 if m:
@@ -125,115 +129,6 @@ def find_force_include_definitions(tokens):
     return paths
 
 
-# Match SharedPCH.<Module>.Cpp20.pch  or  PCH.<Module>.pch  or  ExpandedPCH.<Module>.pch
-RE_PCH_MODULE = re.compile(r'(?:^|[/\\])(?:Shared|Expanded)?PCH\.([A-Za-z0-9_]+?)(?:\.RTTI)?(?:\.Cpp\d+)?\.pch$', re.IGNORECASE)
-
-
-def find_pch_module_name(tokens):
-    """From -include-pch X.pch, extract module name (e.g. SharedPCH.Engine.Cpp20.pch -> Engine)."""
-    i, n = 0, len(tokens)
-    while i < n:
-        t = tokens[i]
-        if t == '-include-pch' and i + 1 < n:
-            m = RE_PCH_MODULE.search(tokens[i + 1].strip('"'))
-            if m:
-                return m.group(1)
-            i += 2
-            continue
-        if t.startswith('-include-pch='):
-            m = RE_PCH_MODULE.search(t[len('-include-pch='):].strip('"'))
-            if m:
-                return m.group(1)
-        i += 1
-    return None
-
-
-def find_pch_definitions_h(subset_def_path, pch_module):
-    """Given a subset Definitions.<X>.h path AND the PCH module name, locate the
-    corresponding 'full' Definitions.h that the PCH would have included.
-
-    UE layout: <Intermediate>/<Target>/Development/<PchModule>/Definitions.h
-    We derive that root from the subset's path."""
-    if not pch_module:
-        return None
-    # subset is like .../Development/<SomeModule>/Definitions.<X>.h
-    # full   is at .../Development/<PchModule>/Definitions.h
-    parts = subset_def_path.replace('\\', '/').split('/')
-    try:
-        idx = len(parts) - 1 - parts[::-1].index('Development')
-    except ValueError:
-        return None
-    full_path = '/'.join(parts[:idx + 1] + [pch_module, 'Definitions.h'])
-    return full_path
-
-
-def find_uht_include_dirs(any_def_path):
-    """UE puts generated reflection headers at <Intermediate>/Build/<Plat>/<Target>/Inc/<Module>/UHT/.
-    Indexer cannot find them because CDB only has -I.../Inc (one level too high).
-    Walk the Inc tree once and return [-Idir, ...] for every UHT directory.
-
-    `any_def_path` is one Definitions.h path used to locate the project root."""
-    parts = any_def_path.replace('\\', '/').split('/')
-    try:
-        idx = parts.index('Intermediate')
-    except ValueError:
-        return []
-    # .../Engine/Intermediate/Build/Win64/x64/UnrealEditor/Development/Mod/Definitions.h
-    # we want    .../Engine/Intermediate/Build/Win64/UnrealEditor/Inc/<Mod>/UHT
-    base = '/'.join(parts[:idx + 1])  # .../Engine/Intermediate
-    # Most layouts: Build/<Plat>/<Target>/Inc/<Module>/UHT
-    # Build/<Plat> + UnrealEditor (Target) + Inc + */UHT
-    candidates = []
-    inc_root_local = winpath_to_local(base + '/Build/Win64/UnrealEditor/Inc')
-    if not os.path.isdir(inc_root_local):
-        return []
-    inc_root_win = base + '/Build/Win64/UnrealEditor/Inc'
-    for entry in os.listdir(inc_root_local):
-        uht = os.path.join(inc_root_local, entry, 'UHT')
-        if os.path.isdir(uht):
-            # Use Win-style for CDB consistency
-            candidates.append(f'-I{inc_root_win}/{entry}/UHT')
-    return candidates
-
-
-def find_module_publics(any_cpp_path):
-    """Walk Source/{Runtime,Editor,Developer}/<Module>/{Public,Internal,Classes}
-    and return [-Idir,...] for every such module dir found.
-
-    UE compiles using PCH which inlines these paths; clangd-indexer has no PCH
-    so it needs them as explicit -I. Without these, transitive #include chains
-    like `UnrealClient.h -> Elements/Framework/TypedElementListFwd.h` fail."""
-    parts = any_cpp_path.replace('\\', '/').split('/')
-    try:
-        idx = parts.index('Source')
-    except ValueError:
-        return []
-    src_root = '/'.join(parts[:idx + 1])
-    src_local = winpath_to_local(src_root)
-    if not os.path.isdir(src_local):
-        return []
-    dirs = []
-    for sub in ('Runtime', 'Editor', 'Developer'):
-        sub_dir = f'{src_local}/{sub}'
-        if not os.path.isdir(sub_dir):
-            continue
-        try:
-            for mod in os.listdir(sub_dir):
-                mod_dir = f'{sub_dir}/{mod}'
-                if not os.path.isdir(mod_dir):
-                    continue
-                for kind in ('Public', 'Internal', 'Classes'):
-                    kdir = f'{mod_dir}/{kind}'
-                    if os.path.isdir(kdir):
-                        # Emit Windows-style path matching CDB convention
-                        win_path = f'{src_root}/{sub}/{mod}/{kind}'
-                        dirs.append(f'-I{win_path}')
-        except (OSError, PermissionError):
-            continue
-    return dirs
-
-
-
 def quote_for_command(token):
     """Return token quoted for inclusion in a 'command' string. Preserves =val."""
     if any(c in token for c in (' ', '\t', '"')):
@@ -241,166 +136,48 @@ def quote_for_command(token):
     return token
 
 
-def get_module_from_filepath(file_path):
-    """Extract UE module name from a cpp file path.
-    Two layouts:
-    1. .../Source/.../<Module>/Public|Private|Classes|Internal/...cpp
-    2. .../Intermediate/Build/.../Development/<Module>/Module.<Module>[.N].cpp (UBT unity)"""
-    parts = file_path.replace('\\', '/').split('/')
-    # Layout 2: UBT unity in Intermediate/.../Development/<Module>/Module.<Module>.cpp
-    base = parts[-1] if parts else ''
-    if base.startswith('Module.') and base.endswith('.cpp'):
-        # Module.<Mod>.cpp or Module.<Mod>.<N>.cpp
-        # Parent dir name is the module
-        if len(parts) >= 2:
-            return parts[-2]
-    # Layout 1: Source-tree
-    for i, p in enumerate(parts):
-        if p in ('Private', 'Public', 'Classes', 'Internal') and i > 0:
-            return parts[i - 1]
-    return None
+def validate_exact_inputs(cdb):
+    """Controlled BackgroundIndex consumes the original preprocessor inputs.
 
-
-# Cache the project's Intermediate/Build/.../Development root once
-_dev_root_cache = [None]
-_shared_pch_cache = {}  # mod -> [SharedPCH paths]
-def find_dev_root(any_cpp_path):
-    """Locate <Intermediate>/Build/<Plat>/<Target>/Development by scanning sibling dirs."""
-    if _dev_root_cache[0] is not None:
-        return _dev_root_cache[0]
-    parts = any_cpp_path.replace('\\', '/').split('/')
-    # Layout 2: file IS already in Development/<Mod>/Module.X.cpp
-    if 'Development' in parts:
-        try:
-            idx = parts.index('Development')
-            dev_root = '/'.join(parts[:idx + 1])
-            if os.path.isdir(winpath_to_local(dev_root)):
-                _dev_root_cache[0] = dev_root
-                return dev_root
-        except ValueError:
-            pass
-    # Layout 1: derive from Source-tree path
-    for i, p in enumerate(parts):
-        if p == 'Source':
-            engine_root = '/'.join(parts[:i])  # .../Engine
-            candidates = [
-                f'{engine_root}/Intermediate/Build/Win64/x64/UnrealEditor/Development',
-                f'{engine_root}/Intermediate/Build/Win64/UnrealEditor/Development',
-            ]
-            for c in candidates:
-                if os.path.isdir(winpath_to_local(c)):
-                    _dev_root_cache[0] = c
-                    return c
-            break
-    _dev_root_cache[0] = ''
-    return ''
-
-
-def find_shared_pch_for_module(dev_root, mod):
-    """Read <dev_root>/<mod>/Module.<mod>*.obj.rsp and extract /FI SharedPCH.X.h.
-    Returns absolute paths to all SharedPCH headers force-included for this module
-    (usually 0 or 1)."""
-    if not dev_root or not mod:
-        return []
-    cache_key = (dev_root, mod)
-    if cache_key in _shared_pch_cache:
-        return _shared_pch_cache[cache_key]
-    mod_dir = f'{dev_root}/{mod}'
-    mod_dir_local = winpath_to_local(mod_dir)
-    if not os.path.isdir(mod_dir_local):
-        _shared_pch_cache[cache_key] = []
-        return []
-    rsps = []
-    try:
-        for fn in os.listdir(mod_dir_local):
-            if fn.startswith(f'Module.{mod}') and fn.endswith('.obj.rsp'):
-                rsps.append(f'{mod_dir_local}/{fn}')
-    except OSError:
-        return []
-    if not rsps:
-        return []
-    found = []
-    seen = set()
-    # /FI"path"   or   /FI path   or   -include path / -include="path"
-    re_fi_q = re.compile(r'/FI"([^"]+)"')
-    re_fi_b = re.compile(r'/FI\s+(\S+)')
-    re_inc = re.compile(r'(?:^|\s)-include[= ]"?([^\s"]+)"?')
-    # only one rsp per module is needed — they share preprocessor flags
-    rsp = rsps[0]
-    try:
-        with open(rsp, encoding='utf-8', errors='replace') as f:
-            content = f.read()
-    except OSError:
-        return []
-    for m in list(re_fi_q.finditer(content)) + list(re_fi_b.finditer(content)) + list(re_inc.finditer(content)):
-        p = m.group(1).strip().strip('"')
-        if 'SharedPCH' not in p:
-            continue
-        # rsp paths are relative to Engine/Source (UBT cwd), not module dir.
-        # Try a few base dirs, accept the first that exists.
-        candidates = []
-        if os.path.isabs(p) or (len(p) >= 2 and p[1] == ':'):
-            candidates.append(p)
-        else:
-            # Engine/Source is two levels above dev_root (.../Engine/Intermediate/Build/Win64/.../Development -> ../../../../Source)
-            # Easier: dev_root contains 'Intermediate', strip it back to Engine/.
-            mod_local = mod_dir_local.replace('\\', '/')
-            engine_dir = mod_local
-            while engine_dir and not engine_dir.endswith('/Engine') and '/' in engine_dir:
-                engine_dir = engine_dir.rsplit('/', 1)[0]
-            if engine_dir:
-                candidates.append(os.path.normpath(f'{engine_dir}/Source/{p}'))
-                candidates.append(os.path.normpath(f'{engine_dir}/{p.lstrip("./")}'))
-            candidates.append(os.path.normpath(os.path.join(mod_dir_local, p)))
-        resolved = None
-        for c in candidates:
-            cn = c.replace('\\', '/')
-            if os.path.isfile(winpath_to_local(cn)):
-                resolved = cn
-                break
-        if not resolved:
-            continue
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        found.append(resolved)
-    _shared_pch_cache[cache_key] = found
-    return found
-
-
-def infer_definitions_paths_from_module(file_path, dev_root):
-    """When CDB lacks -include Definitions.X.h, try to locate the Definitions.h
-    files based on file path -> module name -> Intermediate layout.
-
-    Order matters: SharedPCH (broad, generic) goes FIRST, so per-module
-    Definitions.<Mod>.h (which has the correct DLLEXPORT for *this* module)
-    gets injected LATER and overrides.  The 'last wins' loop in main() will
-    then correctly let module-local wins."""
-    if not dev_root:
-        return []
-    mod = get_module_from_filepath(file_path)
-    if not mod:
-        return []
-    paths = []
-    # 1. SharedPCH.<X>.<Y>.h FIRST (broad set, may have <MOD>_API=DLLIMPORT)
-    for sp in find_shared_pch_for_module(dev_root, mod):
-        if sp not in paths:
-            paths.append(sp)
-    # 2. Definitions.<Module>.h (per-module slim defines, has correct DLLEXPORT for this mod)
-    subset = f'{dev_root}/{mod}/Definitions.{mod}.h'
-    if os.path.isfile(winpath_to_local(subset)):
-        paths.append(subset)
-    # 3. Plain Definitions.h (full set, for PCH-source modules)
-    full = f'{dev_root}/{mod}/Definitions.h'
-    if os.path.isfile(winpath_to_local(full)):
-        paths.append(full)
-    return paths
+    Flattening headers can change conditional definitions and removing PCH can
+    remove unrelated compiler state. Validate explicit build products without
+    inventing replacements from another target's intermediate directories.
+    """
+    for entry in cdb:
+        tokens = entry.get('arguments')
+        if not isinstance(tokens, list):
+            print('ERROR: exact input validation requires structured arguments', file=sys.stderr)
+            return 1
+        paths = find_force_include_definitions(tokens)
+        for index, token in enumerate(tokens):
+            if token == '-include-pch':
+                if index + 1 == len(tokens):
+                    print('ERROR: missing -include-pch value', file=sys.stderr)
+                    return 1
+                paths.append(tokens[index + 1])
+            elif token.startswith('-include-pch='):
+                paths.append(token[len('-include-pch='):])
+        for path in paths:
+            local = winpath_to_local(path.strip('"'))
+            if not os.path.isabs(local):
+                directory = winpath_to_local(entry.get('directory', ''))
+                if not os.path.isabs(directory):
+                    print('ERROR: explicit build input requires absolute command directory', file=sys.stderr)
+                    return 1
+                local = os.path.join(directory, local)
+            if not os.path.isfile(local):
+                print(f'ERROR: missing explicit build input for {entry.get("file")}: {path}', file=sys.stderr)
+                return 1
+    print(f'Validated exact Definitions/PCH inputs for {len(cdb)} entries; no flags changed', file=sys.stderr)
+    return 0
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('cdb', help='compile_commands.json (Windows or WSL path)')
     ap.add_argument('--dry-run', action='store_true', help='Show what would change without writing')
+    ap.add_argument('--preserve-exact', action='store_true',
+                    help='Validate explicit Definitions/PCH inputs and retain exact arguments for controlled BackgroundIndex')
     ap.add_argument('--keep-include', action='store_true',
                     help='Keep original -include Definitions.h alongside expanded -D (default: drop them — indexer ignores -include anyway since the bytes are already exploded into -D)')
     args = ap.parse_args()
@@ -411,6 +188,9 @@ def main():
         return 1
     with open(cdb_local, encoding='utf-8') as f:
         cdb = json.load(f)
+
+    if args.preserve_exact:
+        return validate_exact_inputs(cdb)
 
     # Quick idempotency check: any entry already has marker?
     sample = cdb[0] if cdb else {}
@@ -426,47 +206,12 @@ def main():
             defs_cache[p] = parse_definitions_h(winpath_to_local(p))
         return defs_cache[p]
 
-    # Compute UHT -I dirs ONCE per CDB (not per entry; they're project-wide).
-    # Try first from CDB's -include Definitions; fall back to inferring dev_root
-    # from any cpp file path (CDBs from new UBT may not embed -include).
-    uht_dirs = []
-    for e in cdb:
-        tokens = list(e['arguments']) if 'arguments' in e else shlex.split(e.get('command', ''), posix=False)
-        defs = find_force_include_definitions(tokens)
-        if defs:
-            uht_dirs = find_uht_include_dirs(defs[0])
-            break
-    if not uht_dirs and cdb:
-        # Fallback: derive from any cpp's path -> Engine root -> Intermediate
-        any_cpp = cdb[0].get('file', '')
-        dev_root = find_dev_root(any_cpp)
-        if dev_root:
-            # find_uht_include_dirs expects a Definitions.h path inside Intermediate;
-            # fake one by appending /<anything>/Definitions.h to dev_root
-            fake_def = f'{dev_root}/Core/Definitions.h'
-            uht_dirs = find_uht_include_dirs(fake_def)
-    print(f'UHT include dirs to inject: {len(uht_dirs)}', file=sys.stderr)
-    if uht_dirs:
-        print(f'  sample: {uht_dirs[0]}', file=sys.stderr)
-
-    # Module Public/Internal/Classes -I (safety net for transitive #include chains
-    # that UE compiles via PCH; clangd-indexer has no PCH).
-    module_dirs = []
-    if cdb:
-        module_dirs = find_module_publics(cdb[0].get('file', ''))
-    print(f'Module Public/Internal/Classes -I: {len(module_dirs)}', file=sys.stderr)
-    if module_dirs:
-        print(f'  sample: {module_dirs[0]}', file=sys.stderr)
-
+    # Legacy indexer injection is limited to explicitly force-included
+    # Definitions headers. Never infer other build products or include roots.
     n_entries = len(cdb)
     n_modified = 0
     n_no_def = 0
     n_def_total = 0
-
-    # Cache the dev_root for module-based Definitions.h fallback
-    dev_root_for_fallback = ''
-    if cdb:
-        dev_root_for_fallback = find_dev_root(cdb[0].get('file', ''))
 
     for e in cdb:
         # Get tokens
@@ -495,18 +240,6 @@ def main():
                     pn = os.path.normpath(os.path.join(entry_cwd, pn)).replace('\\', '/')
                 resolved.append(pn)
             def_paths = resolved
-        # FALLBACK: if CDB doesn't carry -include Definitions (newer UBT
-        # GenerateClangDatabase omits these), infer them from the cpp file path.
-        if not def_paths and dev_root_for_fallback:
-            def_paths = infer_definitions_paths_from_module(e.get('file', ''), dev_root_for_fallback)
-        # Also locate the PCH-module's full Definitions.h (contains UE_BUILD_*,
-        # WITH_EDITOR, UBT_COMPILED_PLATFORM, etc that the subset .h omits).
-        pch_module = find_pch_module_name(tokens)
-        if pch_module and def_paths:
-            full_def = find_pch_definitions_h(def_paths[0], pch_module)
-            if full_def and os.path.isfile(winpath_to_local(full_def)) and full_def not in def_paths:
-                def_paths.insert(0, full_def)  # full first → subset overrides
-
         if not def_paths:
             n_no_def += 1
             continue
@@ -575,17 +308,6 @@ def main():
                 ordered.append(tok)
 
         new_tokens.append(MARKER)
-        # Inject UHT include dirs so .generated.h headers resolve
-        existing_dirs = {t for t in new_tokens if t.startswith('-I')}
-        for d in uht_dirs:
-            if d not in existing_dirs:
-                new_tokens.append(d)
-                existing_dirs.add(d)
-        # Inject module Public/Internal/Classes -I as safety net
-        for d in module_dirs:
-            if d not in existing_dirs:
-                new_tokens.append(d)
-                existing_dirs.add(d)
         new_tokens.extend(ordered)
 
         # Write back

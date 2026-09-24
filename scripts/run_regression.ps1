@@ -5,13 +5,15 @@
 # 用法 (pwsh 7):
 #   pwsh -File scripts/run_regression.ps1
 #   pwsh -File scripts/run_regression.ps1 -Filter dap     # 只跑匹配的用例
+#   pwsh -File scripts/run_regression.ps1 -RequireNative  # LLVM groups must run
 #
 # 退出码透传自 nvim -l tests/run.lua（0 全绿 / 1 有失败）。
 # 权威回归方式见 docs/testing-regression.md。
 # ----------------------------------------------------------------------------
 
 param(
-  [string]$Filter = ""
+  [string]$Filter = "",
+  [switch]$RequireNative
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,12 +43,18 @@ if ($Filter) { Write-Host "filter   : $Filter" }
 Write-Host ""
 
 # 透传 filter：tests/run.lua 读取 _G.arg[1]。
-if ($Filter) {
-  & $nvim --headless -l $runner $Filter
-} else {
-  & $nvim --headless -l $runner
+$previousRequiredNative = $env:NVIM_TEST_REQUIRE_NATIVE
+try {
+  if ($RequireNative) { $env:NVIM_TEST_REQUIRE_NATIVE = "1" }
+  if ($Filter) {
+    & $nvim --headless -l $runner $Filter
+  } else {
+    & $nvim --headless -l $runner
+  }
+  $code = $LASTEXITCODE
+} finally {
+  $env:NVIM_TEST_REQUIRE_NATIVE = $previousRequiredNative
 }
-$code = $LASTEXITCODE
 
 Write-Host ""
 if ($code -eq 0) {

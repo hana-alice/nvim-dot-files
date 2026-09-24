@@ -122,7 +122,7 @@ function M.run(plan, opts)
   local function stream(chunks, callback)
     return function(_, data)
       if type(data) ~= "string" or data == "" then return end
-      chunks[#chunks + 1] = data
+      if opts.capture_output ~= false then chunks[#chunks + 1] = data end
       vim.schedule(function()
         callback(data)
       end)
@@ -132,6 +132,7 @@ function M.run(plan, opts)
     cwd = plan.cwd,
     text = true,
     env = opts.env,
+    stdin = opts.stdin,
   }
   if type(opts.on_stdout) == "function" then
     system_opts.stdout = stream(stdout_chunks, opts.on_stdout)

@@ -5,6 +5,50 @@
 
 ## Requirements
 
+### Requirement: External distributed build SHALL capture the current instance
+
+The opt-in `UEBuildDistributed [Android] [Development]` command SHALL capture the
+current instance's engine, project workspace, uproject, target and configuration through
+the existing build planner. Omitted arguments SHALL use the current selection. Overrides
+SHALL apply only to this invocation. The external script SHALL be configured using
+`vim.g.ue_builddispatch_script`, `NVIM_UE_BUILDDISPATCH`, or the machine-local JSON
+file `stdpath('data')/ue-builddispatch.json`; private paths and worker
+addresses MUST NOT be embedded in the public configuration.
+
+The local JSON SHALL be read at invocation time and support `script`, `worker_config`,
+and `python` string fields. Each nonempty editor global SHALL take precedence over its
+environment variable, then the local JSON value. Missing local files SHALL be normal;
+malformed or nonobject configuration needed for fallback SHALL fail with a clear path-bearing
+error. New editor instances MUST NOT depend exclusively on inherited environment variables.
+
+#### Scenario: A new editor inherits stale environment variables
+
+- **WHEN** the editor has no configured script global or environment variable
+- **AND** its machine-local JSON contains the script location
+- **THEN** invocation SHALL resolve the persisted script without changing the public repository
+
+The Android workflow owner SHALL send an immutable JSON snapshot through stdin to
+the external Python runner, use shared asynchronous task management and retain output
+in a log buffer. Environment capture SHALL be limited to Android toolchain roots and
+non-secret P4 client/config identifiers; tickets and passwords MUST NOT be exported.
+The original local build commands SHALL retain their behavior.
+
+Streamed output SHALL follow the latest line only in log windows whose cursor was
+already on the final line before the append. Reading older output SHALL NOT be interrupted
+by forced tail jumps. Tail following SHALL remain valid when bounded history is trimmed.
+
+#### Scenario: Inspect a plan without changing build products
+
+- **WHEN** the user invokes `UEBuildDistributedPlan`
+- **THEN** the workflow SHALL use the same captured context with `--dry-run`
+- **AND** SHALL NOT run build preflight, export UBT actions, synchronize files or compile
+
+#### Scenario: Changing selection after dispatch
+
+- **WHEN** the user changes project or configuration after dispatch
+- **THEN** the submitted stdin snapshot SHALL remain unchanged
+- **AND** the next invocation SHALL capture the new selection
+
 ### Requirement: target-specific 异步与 UI 必须有 workflow owner
 
 系统 SHALL 为任何 target-specific 的异步任务建立明确的 workflow owner；只要操作需要设备 serial、PID、签名身份、bundle、adapter、进度文本、错误清理或完成后的状态收束，就 MUST 由该 owner 负责。`ue.lua`、target driver 或 generic runner MUST NOT 直接承担这些 target-specific 状态机职责。

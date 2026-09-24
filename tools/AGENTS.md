@@ -38,6 +38,10 @@ nvim --headless --server //./pipe/nvim.<PID>.0 --remote-expr \
 
 ## 专属约定
 
+- **SuperUnity 性能保全**：生成器必须遵守
+  [根硬约束](../AGENTS.md#super-unity-performance-contract)（CONSTRAINTS C11）；
+  不能保留名称却删掉实际二次合并能力，也不能以降低语义正确性或覆盖率换数字。
+
 - **不动第三方 / 生成物**：`cindex-uefilter/`（Go 源）、`__pycache__/` 不随意重排或重写。
 - 工具幂等 + skip-if-unchanged：生成器写前比对，避免使下游 cache 失效。→ C4.6
 - DAP 探针是历史调试资产，与 `lua/ue/dap/` 配方对照看；权威坑在 `../docs/CONSTRAINTS.md §二`。
@@ -47,6 +51,17 @@ nvim --headless --server //./pipe/nvim.<PID>.0 --remote-expr \
 
 controlled BackgroundIndex 生成器由 `index_generation` / `cpp_semantic_index` 覆盖；其他工具
 改动后手动跑对应工具验证，并在 `../docs/changelog.md` 记录（含验证方式）。
+
+离线生成代码候选 `build_super_unity_cdb.build_generated_batches` 另跑
+`index_generated_super_unity` 和 `structure`；它没有生产准入资格，不得自动发布。
+真实验收必须检查源文件引用指向的全局 header 符号，不能只比较源文件自身声明的符号。
+
+二次批次 / RIFF 图 / 原 TU binding / 冻结 VFS 工具另跑 `index_graph`、`index_batch`、
+`index_verified_batch`、`index_vfs_aliases`；最终使用 `NVIM_TEST_REQUIRE_NATIVE=1`，
+不得把 native 跳过视为通过。实际性能验收仍须真实工程，不由 fixture 代替。
+
+离线有序候选 `cdb_ordered_unity.py` 另跑 `index_ordered_unity`（required-native）和 `structure`；
+它仅生成候选，不得把语法检查通过当作生产准入或完整索引性能验收。
 
 ## 先读
 

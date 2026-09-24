@@ -307,7 +307,14 @@ return function(M, core)
     local background_cdb_hash = background_content and sha256_text(background_content) or ""
     local names = module_names_for_keys(state, module_keys)
     local module_set_hash = stable_hash(module_keys or {}) or ""
-    return {
+    local artifact_identity = {
+      generation_id = generation.generation_id,
+      phase = phase,
+      idx_hash = idx_hash,
+      background_cdb_hash = background_cdb_hash,
+      module_set_hash = module_set_hash,
+    }
+    local manifest = {
       schema = 2,
       index_kind = opts.index_kind or "controlled-background",
       phase = phase,
@@ -329,14 +336,16 @@ return function(M, core)
       module_count = #module_keys,
       module_set_hash = module_set_hash,
       completed_at = tonumber(opts.completed_at) or core.h.unix_now(),
-      artifact_fingerprint = stable_hash({
-        generation_id = generation.generation_id,
-        phase = phase,
-        idx_hash = idx_hash,
-        background_cdb_hash = background_cdb_hash,
-        module_set_hash = module_set_hash,
-      }) or "",
     }
+    if opts.semantic_cdb_path and opts.semantic_cdb_path ~= "" then
+      manifest.semantic_cdb_path = fs.norm(opts.semantic_cdb_path)
+      local semantic_content = read_text_file(manifest.semantic_cdb_path)
+      manifest.semantic_cdb_hash = semantic_content and sha256_text(semantic_content) or ""
+      artifact_identity.semantic_cdb_path = manifest.semantic_cdb_path
+      artifact_identity.semantic_cdb_hash = manifest.semantic_cdb_hash
+    end
+    manifest.artifact_fingerprint = stable_hash(artifact_identity) or ""
+    return manifest
   end
 
   local function index_state_selection_default()
@@ -375,13 +384,8 @@ return function(M, core)
 
   --- Reset a build state orphaned by a dead process.
   ---
-  --- WHY: the completion path (manifest write, stats, promotion) lives entirely
-  --- inside the child's callback, and `full` takes minutes over ~16k TUs. If
-  --- Neovim exits mid-build, `status="running"` / `finished_at=0` is persisted
-  --- forever, and `build_phase_async` then reports "busy" or the UI claims a
-  --- build is in flight that no process owns. Observed on a real bucket:
-  --- status stuck at "running" with stats all zero, i.e. never a single success.
-  ---
+  --- A Neovim exit can strand persisted running/finished_at=0 state before the
+  --- completion callback writes its manifest. Reclaim only proven dead owners.
   --- Only reclaim when the owner is provably gone: a second live Neovim may
   --- legitimately own the build (multi-instance isolation, K43).
   --- Pure enough to test: pass `alive_fn` to inject liveness.
@@ -509,7 +513,8 @@ return function(M, core)
       for _, candidate in ipairs(candidates) do
         if candidate.artifact_fingerprint ~= selected.artifact_fingerprint
           and coverage_superset(candidate, selected)
-          and not coverage_superset(selected, candidate)
+          and (not coverage_superset(selected, candidate)
+            or coverage_rank(candidate.coverage_level) > coverage_rank(selected.coverage_level))
         then
           supersets[#supersets + 1] = candidate
         end
@@ -634,11 +639,7 @@ return function(M, core)
       readiness = "building"
     end
 
-    -- A `ready` verdict MUST name the artifact backing it and that artifact MUST
-    -- exist. Without this, a selection whose fields are blank still yields
-    -- `ready` (observed 2026-08-26: ready with index_path="" while the only .idx
-    -- on disk was a month old and 0 bytes). Such a claim is unfalsifiable and
-    -- misleads every downstream consumer, including the clangd gate.
+    -- The delivery gate requires a named, existing artifact as readiness proof.
     if readiness == "ready" and M.selection_is_self_evidencing then
       local self_ok, self_reason = M.selection_is_self_evidencing(selected)
       if not self_ok then
@@ -723,8 +724,7 @@ return function(M, core)
         queued[#queued + 1] = index_phase_label(phase_name)
       end
     end
-    local phase = state.build and state.build.phase or "idle"
-    local freshness = "missing"
+    local phase, freshness = state.build and state.build.phase or "idle", "missing"
     if selection then
       freshness = ((state.root_dirty or false) or dirty > 0) and "overlay" or "fresh"
     elseif fs.trim(generation.generation_id) ~= "" then
@@ -742,6 +742,7 @@ return function(M, core)
       cold = tier_counts.cold,
       queued = queued,
       queue_count = #queued,
+      source_refresh_pending = (tonumber(state.source_revision) or 0) > (tonumber(state.source_delivered) or 0),
       root_dirty = (state.root_dirty or false)
         or (core.deps.core_rt.dirty_index_roots[core.deps.status_root_key(ctx)] and true or false),
       phase = phase,

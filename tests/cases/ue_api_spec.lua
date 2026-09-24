@@ -12,12 +12,12 @@ local PUBLIC_TABLES = {
 
 local PUBLIC_FUNCTIONS = {
   "clangd_cmd", "clangd_root", "clangd_start_root", "current_platform", "platform_path_priorities",
-  "android_build_command", "picker_options", "picker_project_options",
+  "build_snapshot", "android_build_command", "picker_options", "picker_project_options",
   "current_scope_picker_options", "cached_grep_file_list", "cached_code_file_list",
   "cached_files", "cached_grep", "statusline_status", "index_status", "semantic_index_snapshot", "index_now",
   "index_hot", "index_full", "ue_roots", "gtags_rebuild_shaders",
   "gtags_references", "gtags_definition", "launch_app", "toggle_log",
-  "toggle_debug_log", "prepare_headless", "ai_context",
+  "toggle_debug_log", "prepare_headless", "build_csearch_async", "ai_context",
 }
 
 t.describe("ue: 公共表冻结", function()

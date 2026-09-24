@@ -49,6 +49,7 @@
 -- dropped unless raised via :NvimLogLevel debug or log.set_level("info").
 --
 -- File location: <stdpath('log')>/nvim/nvim-debug.<pid>.log
+-- NVIM_UE_LOG_DIR overrides the directory for isolated regression processes.
 -- Per-process names prevent two Neovim instances from racing rotation and
 -- writing through stale handles. :NvimLog always opens the current process.
 
@@ -149,9 +150,12 @@ end
 -- schedule context only).
 local function resolve_path_main()
   if resolved_path then return resolved_path end
-  local dir
+  local dir = vim.env.NVIM_UE_LOG_DIR
   local ok, p = pcall(vim.fn.stdpath, "log")
-  if ok and p and p ~= "" then
+  if dir and dir ~= "" then
+    -- Explicit process-owned log root (regression children inherit this).
+    dir = vim.fs.normalize(dir)
+  elseif ok and p and p ~= "" then
     dir = join(p, "nvim")
   else
     local ok2, c = pcall(vim.fn.stdpath, "cache")

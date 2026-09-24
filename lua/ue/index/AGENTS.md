@@ -8,11 +8,15 @@
 
 current / hot / full 三相受控 BackgroundIndex：模块记录/持久化（`_state`），generation
 manifest 与 coverage selector（`_generation`），交付就绪判定与 prepare 汇报口径（`_delivery`），
-compiler-authored UBT unity / exact fallback CDB 生成（`_build`），
+compiler-authored UBT unity / exact fallback CDB 生成（`_build`），标准 clangd CDB 验证与幂等发布（`_publish`），
 phase 调度与交付 deadline（`_schedule`），通用宿主策略薄委派（`_admission` → `utils.host_admission`），
-readiness 磁盘自愈（`_recover`），以及只跟随 chosen manifest fingerprint 的 clangd 重启（`_clangd`）。
+readiness 磁盘自愈（`_recover`），以及结合实际发布变化和 reader/recovery 状态的 clangd 重启（`_clangd`）。
 
 ## 结构契约
+
+- **SuperUnity 性能保全**：分组、发布与重启必须遵守
+  [根硬约束](../../../AGENTS.md#super-unity-performance-contract)（CONSTRAINTS C11）；
+  普通 UBT Unity 不能冒充二次合并，必须核验真实工作量、完成耗时与宿主余量。
 
 - `init.lua` 是唯一 require 入口；子模块是 loader 风格
   `return function(M, core)`——共享 `core.h`（helpers）/ `core.RT`（运行时）/
@@ -23,7 +27,7 @@ readiness 磁盘自愈（`_recover`），以及只跟随 chosen manifest fingerp
   不得反向 `require("ue")`（会循环）。
 - `M._rt` 与 ue.lua 的 `INDEX_RT` 是**同一张表**（活引用）；:UESetProject
   清理、status cache 直接改它。别做防御性拷贝。
-- 加载顺序 `_state → _generation → _recover → _delivery → _clangd → _build → _admission → _schedule`：基础 helper 在 `_state` 定义，
+- 加载顺序 `_state → _generation → _publish → _recover → _delivery → _clangd → _build → _admission → _schedule`：基础 helper 在 `_state` 定义，
   generation/selector helper 在 `_generation` 定义，`_delivery` 消费 `_generation` 的
   `index_status_summary`，`_schedule` 消费 `_build` 的 `build_phase_async`；兄弟模块顶部 alias；
   不得反向依赖后加载模块。

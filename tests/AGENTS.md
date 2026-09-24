@@ -18,6 +18,9 @@ pwsh -File scripts/run_regression.ps1       # 本机一键（转发 + 退出码�
 
 退出码：0 全绿 / 1 任意失败。带 filter 时不触发 legacy 旁路。
 
+语义/编译器契约的最终验收设置 `NVIM_TEST_REQUIRE_NATIVE=1`，或使用 PowerShell wrapper 的
+`-RequireNative`。缺失 native 能力此时必须失败。普通能力跳过使用 `t.skip` 独立计数，不得用空 `t.it` 冒充通过。
+
 ## 改动 → 必跑 spec 范围（CHANGE-TO-FILTER MAP）
 
 > 这是「分范围回归」的速查表。最小必跑范围如下；与 `../docs/testing-regression.md` 同步。
@@ -27,18 +30,26 @@ pwsh -File scripts/run_regression.ps1       # 本机一键（转发 + 退出码�
 
 | 改动位置 | 最小必跑 filter |
 |---|---|
-| `lua/config/keymaps.lua` / 命令定义 | `keymaps` `commands` |
+| `lua/config/keymaps.lua` / 命令定义 | `keymaps` `commands` `review_editor` |
+| picker 交互 / Git sidebar / 插件工具链策略 | `review_editor` `smoke` |
+| CI bootstrap / workflow / legacy smoke | `review_ci` + 全量 + legacy smoke |
+| `lua/utils/ue_watch.lua` / `dirty_save.lua` | `ue_watch_csearch` `multi_instance_state` `stability` |
 | `lua/utils/window_title.lua` | `window_title` `keymaps` `commands` `cheatsheet` |
 | `lua/utils/android_device.lua` / Android ADB device 路由 | `android_device` `dap` `ue_context` |
 | `lua/ue/config.lua`（schema） | `ue_config` `smoke` |
 | `lua/ue.lua` 项目选择 / context 解析 / workflow dispatch | `ue_project_context` `ue_api` `smoke` `ue_platform_boundary` |
 | `lua/ue/project_state.lua` / `lua/ue/file_lock.lua` / 共享持久状态 | `multi_instance_state` |
 | `lua/ue/cdb/**` | `ue_cdb` |
-| `lua/ue/dap/**` / `lua/utils/platform/**` | `dap` `platform` `ue_platform_boundary` |
-| `lua/ue/index/**` / `lua/ue/clangd_commands.lua` / controlled CDB generators | `index_generation` `cpp_semantic_index` `clangd_commands` `ue_api` `ue_platform_boundary` |
+| `lua/ue/dap/**` / `lua/utils/platform/**` | `dap` `platform` `dap_failure_layer` `ue_platform_boundary` |
+| `lua/ue/index/**` / `lua/ue/clangd_commands.lua` / controlled CDB generators | `index_generation` `index_subset_async` `cpp_semantic_index` `clangd_commands` `ue_api` `ue_platform_boundary` |
+| 二次批次 / RIFF 图 / 冻结输入验证与运行时保护 | `index_graph` `index_batch` `index_input_directory` `index_verified_batch` `index_inventory` `index_query_profile` `index_vfs_aliases` `index_generation` `cpp_semantic_client` `host_resource_discipline` |
+| 离线有序二次候选 `tools/cdb_ordered_unity.py` | `index_ordered_unity` `structure` |
+| 离线 generated-only 二次候选 | `index_generated_super_unity` `structure` |
+| Shader donor 来源 / C++ 后台路由 | `ue_cdb` `ue_unity_origin` `index_unity_receipt` `index_shader_routing` `index_generation` |
+| 源码内容变化 / 相同 CDB 的后台刷新 | `index_source_refresh` `index_delivery` `ue_watch_csearch` `stability` |
 | `lua/ue/targets/**` / `lua/ue/workflows/**` / `lua/ue/target_tasks.lua` | `ue_target_drivers` `ue_target_integration` `ue_target_tasks` `ue_workflows` `ue_platform_boundary` `platform` `commands` `stability` |
 | `lua/utils/ue_goto/**` / C++ `gd` / semantic sidecar | `cpp_semantic_context` `cpp_semantic_client` `cpp_semantic_sidecar` `ue_goto_behavior` `utils` `ue_platform_boundary` |
-| `lua/utils/code_search/**` / `ue_paths.lua` | `ue_goto_behavior` `ue_paths` `utils` `ue_platform_boundary` |
+| `lua/utils/code_search/**` / `lua/ue/csearch_build.lua` / `ue_paths.lua` | `csearch_build_guard` `ue_goto_behavior` `ue_paths` `utils` `ue_platform_boundary` |
 | `lua/config/options.lua` / `autocmds.lua` | `options` `autocmds` |
 | `lua/theme.lua` / `lua/highlights.lua` / `colors/**` | `theme` `smoke` |
 | `lua/utils/cheatsheet.lua` / `docs/ue_lazyvim_cheatsheet.md` | `cheatsheet` |

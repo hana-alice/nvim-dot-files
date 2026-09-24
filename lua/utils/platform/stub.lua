@@ -9,6 +9,9 @@ local M = {
   exe_suffix  = "",
 }
 
+function M.environment_key(name) return name end
+function M.directory_symlink_options() return { dir = true } end
+
 function M.shell()
   return vim.o.shell ~= "" and vim.o.shell or "sh"
 end

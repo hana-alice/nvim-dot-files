@@ -390,6 +390,175 @@ t.describe("ue.cdb.pipeline lifecycle", function()
     pcall(os.remove, path)
   end)
 
+  t.it("unity provenance brackets successful pipeline steps and never seals a failed run", function()
+    local path = temp_cdb()
+    local f = assert(io.open(path .. ".unity-origin.json", "wb"))
+    f:write('{"schema":1,"groups":[]}')
+    f:close()
+    local calls, completed = {}, nil
+    pipeline.set_runtime({
+      jobstart = function(command, _, opts)
+        calls[#calls + 1] = { command = command, opts = opts }
+        return 37
+      end,
+      notify = function() end, log_error = function() end,
+      restart_clangd = function() end,
+    })
+    pipeline.run(path, { path }, function(ok) completed = ok end)
+    t.assert_eq(calls[1].command[5], "begin")
+    local pending = calls[1].command[7]
+    t.assert_true(vim.uv.fs_stat(path .. ".writer.lock") ~= nil)
+    calls[1].opts.on_exit()
+    calls[2].opts.on_fail(1, {}, "failure.log")
+    t.assert_false(completed)
+    for _, call in ipairs(calls) do t.assert_false(call.command[5] == "seal" or call.command[5] == "complete") end
+    calls = {}
+    pipeline.run(path, { path }, function(ok) completed = ok end)
+    t.assert_false(calls[1].command[7] == pending, "a retry must not reuse the prior pending receipt")
+    local i = 1
+    while pipeline.is_running() do
+      calls[i].opts.on_exit()
+      i = i + 1
+    end
+    t.assert_true(completed)
+    t.assert_eq(calls[#calls - 1].command[5], "seal")
+    t.assert_eq(calls[#calls - 1].command[7], calls[1].command[7])
+    t.assert_eq(calls[#calls].command[5], "complete")
+    t.assert_nil(vim.uv.fs_stat(path .. ".writer.lock"))
+    pcall(os.remove, path .. ".unity-origin.json")
+    pcall(os.remove, path)
+  end)
+
+  t.it("相同最终 argv 即使每轮 raw/processed 都重写也不重复重启，真正变化才重启", function()
+    local path = temp_cdb()
+    local function write(value)
+      local file = assert(io.open(path, "wb"))
+      file:write(vim.json.encode(value))
+      file:close()
+    end
+    local entries = {
+      { directory = "C:/fixture", file = "A.cpp", arguments = { "clang++", "-DVALUE=1", "A.cpp" } },
+      { directory = "C:/fixture", file = "B.cpp", arguments = { "clang++", "-DVALUE=1", "B.cpp" } },
+    }
+    local calls, restarts, completed, failure = {}, 0, nil, false
+    pipeline.set_runtime({
+      jobstart = function(command, _, opts)
+        calls[#calls + 1] = { command = command, opts = opts }
+        return 37 + #calls
+      end,
+      notify = function() end, log_error = function() end,
+      restart_clangd = function() restarts = restarts + 1 end,
+    })
+    local function run(final_entries, force)
+      calls, completed = {}, nil
+      write({ { directory = "C:/fixture", file = "A.cpp", arguments = { "clang++", "-DRAW=1", "A.cpp" } } })
+      assert(vim.uv.fs_utime(path, 1000000000, 1000000000))
+      pipeline.run(path, { path }, function(ok) completed = ok end, { force_restart = force })
+      local i = 1
+      while pipeline.is_running() do
+        local call = assert(calls[i])
+        if call.command[5] == "complete" then
+          local result = vim.system(call.command, { text = true }):wait()
+          if result.code == 0 then
+            call.opts.on_exit(0, vim.split(result.stdout or "", "\n"), "complete.log")
+          else
+            call.opts.on_fail(result.code, vim.split(result.stderr or "", "\n"), "complete.log")
+          end
+        else
+          write(failure and { { file = "bad.cpp", arguments = false } } or final_entries)
+          call.opts.on_exit()
+        end
+        i = i + 1
+      end
+      return calls[#calls].command[5]
+    end
+    local ok, err = pcall(function()
+      t.assert_eq(run(entries), "complete", "completion digest also applies without Unity evidence")
+      t.assert_true(completed)
+      t.assert_eq(restarts, 1, "first verified final command set requires delivery")
+      local reordered = { vim.deepcopy(entries[2]), vim.deepcopy(entries[1]) }
+      reordered[1].output = "new-output.o"
+      t.assert_eq(run(reordered, true), "complete")
+      t.assert_true(completed)
+      t.assert_eq(restarts, 1, "row order/output metadata and force flag do not change final semantic commands")
+      entries[1].arguments[2] = "-DVALUE=2"
+      run(entries)
+      t.assert_true(completed)
+      t.assert_eq(restarts, 2)
+      local successful = table.concat(vim.fn.readfile(path .. ".pipeline-result.json", "b"), "\n")
+      failure = true
+      run(entries)
+      t.assert_false(completed, "invalid final commands must fail complete")
+      t.assert_eq(restarts, 2, "failed completion must not restart")
+      t.assert_eq(table.concat(vim.fn.readfile(path .. ".pipeline-result.json", "b"), "\n"), successful,
+        "failed completion must retain the previous successful digest")
+    end)
+    pcall(os.remove, path)
+    pcall(os.remove, path .. ".pipeline-result.json")
+    if not ok then error(err) end
+  end)
+
+  t.it("未执行 complete 的旧 stub 不得采信残留 changed=false", function()
+    local path = temp_cdb()
+    local result_path = path .. ".pipeline-result.json"
+    vim.fn.writefile({ vim.json.encode({ schema = 1, digest = string.rep("a", 64), changed = false }) }, result_path)
+    local calls, restarts = {}, 0
+    pipeline.set_runtime({
+      jobstart = function(command, _, opts)
+        calls[#calls + 1] = { command = command, opts = opts }
+        return 37
+      end,
+      notify = function() end, log_error = function() end,
+      restart_clangd = function() restarts = restarts + 1 end,
+    })
+    pipeline.run(path, { path }, function() end, { force_restart = true })
+    local i = 1
+    while pipeline.is_running() do calls[i].opts.on_exit(); i = i + 1 end
+    t.assert_eq(restarts, 1, "a stale completion file cannot prove that this run was unchanged")
+    pcall(os.remove, path)
+    pcall(os.remove, result_path)
+  end)
+
+  t.it("complete 在内存规范化 command-only 并保留输入与跨表示 digest", function()
+    local path = temp_cdb()
+    local command_entry = {
+      directory = "C:/fixture", file = "source with spaces.cpp",
+      command = "clang++ -DVALUE=1 'source with spaces.cpp'",
+    }
+    local platform = require("utils.platform")
+    local python = platform.resolve_tool({ name = "python",
+      driver_candidates = function(driver) return driver.python_candidates() end })
+    t.assert_true(python.ok)
+    local function complete(value)
+      local content = vim.json.encode({ value })
+      local file = assert(io.open(path, "wb")); file:write(content); file:close()
+      local result = vim.system({ python.path, "-I", vim.fn.stdpath("config") .. "/tools/cdb_unity_receipt.py",
+        "complete", path }, { text = true }):wait()
+      t.assert_eq(result.code, 0, result.stderr)
+      t.assert_eq(table.concat(vim.fn.readfile(path, "b"), "\n"), content,
+        "normalization for the digest must not rewrite the source CDB")
+      return vim.json.decode(table.concat(vim.fn.readfile(path .. ".pipeline-result.json", "b"), "\n"))
+    end
+    local ok, err = pcall(function()
+      local first = complete(command_entry)
+      t.assert_true(first.changed)
+      local second = complete(command_entry)
+      t.assert_false(second.changed)
+      t.assert_eq(second.digest, first.digest)
+      assert(vim.uv.fs_utime(path .. ".pipeline-result.json", 1000000000, 1000000000))
+      local before = assert(vim.uv.fs_stat(path .. ".pipeline-result.json")).mtime
+      local equivalent = complete({ directory = command_entry.directory, file = command_entry.file,
+        arguments = { "clang++", "-DVALUE=1", "source with spaces.cpp" } })
+      t.assert_false(equivalent.changed)
+      t.assert_eq(equivalent.digest, first.digest)
+      t.assert_true(vim.deep_equal(assert(vim.uv.fs_stat(path .. ".pipeline-result.json")).mtime, before),
+        "an identical completion result should preserve its mtime")
+    end)
+    pcall(os.remove, path)
+    pcall(os.remove, path .. ".pipeline-result.json")
+    if not ok then error(err) end
+  end)
+
   t.it("jobstart 启动失败返回错误且释放 writer", function()
     local path = temp_cdb()
     local result
@@ -430,8 +599,8 @@ t.describe("ue.cdb.pipeline lifecycle", function()
   t.it("同步入口检查 writer slot 并传播 pipeline 启动结果", function()
     local source = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
     t.assert_contains(source, 'if pipeline.is_running() then\n    return false, "compile_commands pipeline is already running"')
-    t.assert_contains(source, 'local jobid, pipeline_err = run_compile_commands_pipeline(path, targets, on_pipeline_done, {')
-    t.assert_contains(source, 'force_restart = ctx._force_cdb_restart == true')
+    t.assert_contains(source, 'M.async_generate_compile_commands(ctx, progress, function(ok, detail)')
+    t.assert_contains(source, 'return require("ue.cdb.transaction").run(ctx, on_progress, on_done, {')
     t.assert_contains(source, 'local pipeline_jobid, pipeline_err = run_compile_commands_pipeline(targets[1], targets, function()')
     t.assert_contains(source, 'return false, nil, pipeline_err or "compile_commands pipeline failed to start"')
   end)

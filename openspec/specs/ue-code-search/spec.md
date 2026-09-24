@@ -3,11 +3,31 @@
 ## Purpose
 
 定义 UE 工作区代码搜索的完整性、性能与缓存一致性合同：`<leader>/` 使用 csearch
-索引，watcher 仅维护有界 dirty overlay，prepare 家族独占索引写入，并通过内容指纹、
+索引，watcher 仅维护有界 dirty overlay，显式构建命令独占索引写入，并通过内容指纹、
 增量快照和事件降噪确保平台切换、批量文件变化及 Windows 元数据通知不会产生静默漏搜、
 并发损坏或持续卡顿。
 
 ## Requirements
+
+### Requirement: 索引读取只读且发布保留上一份完整索引
+
+索引可用性检查 SHALL 仅检查正式发布路径，并验证有界的格式头、尾与区段 offset；MUST NOT 基于文件大小把暂存文件提升为正式索引。reset 和 add SHALL 先完成暂存产物，再原子替换正式路径；写入、merge 或发布失败 MUST NOT 提前删除或截断原有正式索引。
+
+#### Scenario: 读取遇到仍在构建的暂存索引
+- **WHEN** writer 持有 lease 且存在暂存文件，正式索引缺失或不可用
+- **THEN** 读取 SHALL 返回不可用，并保留正式及暂存文件原状
+- **AND** MUST NOT 偷走 writer 暂存路径或把其视为已提交数据
+
+#### Scenario: reset 失败或尚未读完文件清单
+- **WHEN** 正式索引原本完整，而新 reset 尚未完成或输入清单读取失败
+- **THEN** 旧索引 SHALL 仍可按原字节读取
+- **AND** 只有新产物完整完成后才允许替换
+
+#### Scenario: 体积足够但不是索引
+- **WHEN** 正式路径含大于 1 KiB 的随机、截断或无完整格式头尾数据
+- **THEN** 可用性检查 SHALL 拒绝，不以体积作为完整性证明
+
+
 ### Requirement: `<leader>/` SHALL prefer complete indexed search
 
 UE 全代码搜索（`<leader>/`）SHALL **只**使用 csearch 索引后端，**任何情况下都不得在此入口使用 rg 或目录遍历**——无论是静默降级、cached-file-list + rg 批量搜索、还是 snacks 默认目录遍历兜底，一律 MUST NOT 出现在 `<leader>/` 路径。当 csearch 索引可用时使用 csearch；当 csearch 索引不可用时，`<leader>/` SHALL 给出可见错误并引导用户运行 `:UEPrepare`，而不是回落到任何 rg / 遍历路径。
@@ -48,6 +68,21 @@ UE 全代码搜索（`<leader>/`）SHALL **只**使用 csearch 索引后端，**
 - **WHEN** caller 调用 backend 返回的 stop 函数
 - **THEN** backend SHALL stop delivering future `on_line` callbacks
 - **AND** backend SHALL NOT call `on_done` for that stopped search after stop has taken effect
+
+### Requirement: Picker cancellation SHALL use the same effective query as its finder
+
+The live csearch picker SHALL compare the current input with the finder's query
+using the same leading/trailing whitespace normalization as Snacks. Its watchdog,
+drain loop and final delivery check SHALL agree on that query identity.
+
+#### Scenario: A pasted query contains surrounding whitespace
+- **WHEN** a query contains leading or trailing whitespace that Snacks trims before starting its finder
+- **THEN** the search SHALL remain active and deliver the normalized query's matches
+- **AND** subsequently removing only that whitespace SHALL NOT leave an empty, cancelled search that requires a forced refresh
+
+#### Scenario: The effective query changes while a search is running
+- **WHEN** editing input changes the query after the same normalization, including changes to interior whitespace
+- **THEN** the previous search SHALL still be cancelled and late results SHALL NOT enter the new query's list
 
 ### Requirement: csearch tool probing SHALL NOT cache failures
 
@@ -94,12 +129,32 @@ to the newly selected bucket; it MUST NOT delete another project's reusable on-d
 - **THEN** 迁移 SHALL NOT 用平台子目录的旧索引覆盖它
 - **AND** 操作 SHALL 可重复安全运行
 
+### Requirement: 独立全量构建 csearch
+
+`:UEBuildCsearch` SHALL 异步重新枚举当前工作区的搜索文件清单，并强制以 reset 模式构建
+csearch 索引。它 MUST NOT 调用 prepare 流程、UBT、CDB 生成、GTAGS 构建或 clangd 重启。
+它 SHALL 复用既有 csearch writer lease、原子发布及成功后的快照与 dirty 处置机制。
+
+#### Scenario: 同步后新增或删除文件
+- **WHEN** 用户执行 `:UEBuildCsearch`，已有文件清单与索引均存在
+- **THEN** 系统 SHALL 重新扫描，而非沿用旧清单或因缓存命中跳过构建
+- **AND** reset 输入 SHALL 包含当前扫描范围内的新增文件，并排除已删除文件
+
+#### Scenario: 其他准备工具链不可用
+- **WHEN** 工作区可解析且扫描和 cindex 工具可用，但 UBT、CDB 或 GTAGS 不可用
+- **THEN** 独立 csearch 构建 SHALL 不依赖这些准备阶段
+
+#### Scenario: 独立构建失败或重复启动
+- **WHEN** 扫描或构建失败，或已有 csearch writer 占用索引
+- **THEN** 命令 SHALL 给出可见失败或忙碌提示，保留既有正式索引与未覆盖的 dirty 记录
+- **AND** 本次取得的构建锁 SHALL 在结束时释放，重复启动 SHALL 不排队
+
 ### Requirement: csearch.idx 同时只有一个写者
 
 系统 SHALL 保证 `csearch.idx` 在任意时刻只有一个写者。watcher（`lua/utils/ue_watch.lua`）
 在 csearch 维度 SHALL 只更新 `persistent_dirty` 记账，MUST NOT 写 csearch 索引。csearch
-索引的写入 SHALL 只由用户显式触发的 prepare 家族命令（`:UEPrepare` / `:UEPrepareReindex` /
-`:UEPrepareIncremental`）执行。
+索引的写入 SHALL 只由用户显式触发的构建命令（`:UEPrepare` / `:UEPrepareReindex` /
+`:UEPrepareIncremental` / `:UEBuildCsearch`）执行。
 
 理由：cindex 的原子写协议把 staged 文件硬编码为 `<idx>~`，两个并发构建会抢同一个 `idx~`，
 在 merge/rename 阶段相互破坏，导致 `corrupt index: remove` 与 0 字节索引死循环。
@@ -110,11 +165,30 @@ to the newly selected bucket; it MUST NOT delete another project's reusable on-d
 - **AND** watcher MUST NOT 调用 csearch 索引构建（不写 `csearch.idx` / `csearch.idx~`）
 - **AND** 这些新文件的可见性 SHALL 由 rg-on-dirty overlay 在下次手动 `:UEPrepare*` 前提供
 
-#### Scenario: Windows metadata-only change 早于当前索引
-- **WHEN** Windows/libuv 报告已有文件 `change`，但该文件的内容 mtime 早于或等于当前
-  `csearch.idx` mtime
-- **THEN** watcher SHALL 把它判为 last-access / attribute / security 类元数据噪声
-- **AND** watcher SHALL NOT 把该路径写入 `persistent_dirty`，避免 dirty overlay 洪水
+#### Scenario: Windows metadata-only notifications do not enter the source observer
+- **WHEN** only a file's last-access time, attributes or security changes on the Windows host
+- **THEN** the source watcher SHALL exclude those native notification classes at subscription, before dirty tracking or source observation
+- **AND** it SHALL continue subscribing to file/directory names, size and last-write changes recursively
+- **AND** unavailable native watching SHALL be reported explicitly rather than silently presented as an equivalent content-only watcher
+
+#### Scenario: Workspace experiment copies are not source-change notifications
+- **WHEN** a watcher event names a file below an `.omx` directory component, including experimental `.cpp` or `.h` copies
+- **THEN** the shared workspace path filter SHALL reject it before pending events, dirty tracking or source-owner callbacks
+- **AND** the rule SHALL use the existing normalized, case-insensitive directory-component matching, without rejecting ordinary source directories such as `omx` or `.omx-compatible`
+- **AND** real source writes outside excluded workspace metadata SHALL continue through the normal content/revision/refresh path; this filter MUST NOT clear historical dirty records or alter compiler-authored CDB coverage
+
+#### Scenario: A real native write preserves the previous mtime
+- **WHEN** the Windows content-event backend reports a write or atomic replacement whose final mtime is older than the csearch index
+- **THEN** that event SHALL still reach dirty tracking and source content comparison
+- **AND** the csearch timestamp MUST NOT suppress a native write notification
+- **AND** an explicit last-write API call with unchanged bytes MAY cause a conservative first content observation; known equal bytes SHALL remain deduplicated
+
+#### Scenario: Native watcher loses notification coverage
+- **WHEN** the event buffer overflows, its protocol is invalid, or the owned helper exits unexpectedly
+- **THEN** watcher status SHALL expose unknown coverage and the cause, and notify its captured source owner
+- **AND** repeated reports of the same unresolved gap SHALL be coalesced; a new gap after observation resumes SHALL be reportable
+- **AND** events from a stopped or replaced watcher MUST NOT affect the new owner
+- **AND** helper shutdown or editor parent exit SHALL release the watcher without leaving an orphan process
 
 #### Scenario: 新建/重命名文件保留旧 mtime
 - **WHEN** fs_event 包含 rename/create 语义，或当前没有可用的 csearch 索引时间锚
@@ -164,30 +238,56 @@ MUST NOT 排队、MUST NOT 写锁文件。构建状态标志 SHALL 在构建完�
 - **WHEN** 触发全量（reset）csearch 构建且既有索引不可用
 - **THEN** 全量构建 SHALL 正常执行并重建一个可用索引
 
-### Requirement: 全量构建成功后持久化 dirty 集合归零
+### Requirement: 成功构建 SHALL 只移除已覆盖的持久化 dirty 记录
 
-系统在任一**全量** csearch 构建成功后 SHALL 清空 watcher 的 persistent dirty 集合
-（`clear_persistent_dirty`）。这适用于全量构建的所有成功路径（cache fast-path / cold full /
-sync），不只其中一条。
-
-理由：watcher 退回记账员后（单写者 β），「构建成功 ⇒ dirty 归零」的清理责任完全转移到 prepare
-家族。若任一全量路径漏清，残留的 dirty 集合会（1）让 `prepare_freshness` 的 dirty 闸门恒判
-`stale`——即便刚 prepare 完也弹「stale」提示；（2）让 rg-on-dirty overlay 每次 `<leader>/` /
-`<space><space>` 背着一个巨大的脏集合重复 grep，导致 picker 变卡。全量构建已索引整份文件清单
-（含所有脏文件），故脏集合在成功后逻辑上必须为空。
+所有 csearch 构建成功路径 SHALL 在共享 dirty writer lease 下重读并移除本次构建开始时
+捕获且已覆盖的路径。构建期间新增或再次修改的路径 MUST NOT 被清空；没有并发变化且全部
+已覆盖时，集合 SHALL 归零。失败构建 MUST NOT 确认 dirty 记录已覆盖。
 
 #### Scenario: 全量构建经缓存快速路径成功
 - **WHEN** `:UEPrepare` 走缓存快速路径并成功重建 csearch 索引
-- **THEN** 系统 SHALL 调用 `clear_persistent_dirty`
-- **AND** 此后 `prepare_freshness` 的 dirty 闸门 SHALL NOT 因残留 dirty 判 `stale`
+- **THEN** 系统 SHALL 移除已覆盖的构建前快照
+- **AND** 没有并发变化或未处置 overflow 时，freshness SHALL NOT 因已覆盖记录判 `stale`
 
 #### Scenario: 全量构建经冷路径 / 同步路径成功
 - **WHEN** `:UEPrepare` 走冷全量路径或同步路径并成功重建索引
-- **THEN** 系统 SHALL 同样调用 `clear_persistent_dirty`（清理责任在所有全量成功路径一致）
+- **THEN** 系统 SHALL 同样仅移除已覆盖快照，保留并发新增及构建开始后再次修改的路径
 
 #### Scenario: 全量构建失败
 - **WHEN** 全量 csearch 构建失败
-- **THEN** 系统 SHALL NOT 清空 dirty 集合（脏文件仍需在下次成功构建前由 overlay 兜底可见）
+- **THEN** 系统 SHALL NOT 清空 dirty 集合或确认其 overflow 已修复
+
+### Requirement: Dirty truncation SHALL remain visible until covered by a full reset
+
+Watcher dirty tracking SHALL retain its bounded path array. When truncation loses paths, it
+SHALL atomically publish a project-scoped `dirty.json.overflow` marker under the same dirty
+lease BEFORE publishing the truncated array. The marker SHALL retain the latest overflow
+time across writers. Marker publication failure SHALL preserve the previous array and use
+the existing bounded persistence retry. The path array SHALL remain readable by older clients.
+The marker SHALL survive normal saves, incremental removal, project switches and restarts.
+
+#### Scenario: Retained paths have all been incrementally indexed
+- **WHEN** retained dirty paths are empty but overflow remains
+- **THEN** dirty status SHALL remain capped and freshness SHALL remain stale
+- **AND** smart build SHALL choose reset, never add or skip
+- **AND** `UEPrepareIncremental` SHALL visibly route to the existing search-only full rebuild, without CDB generation or clangd restart
+
+#### Scenario: Another owner overflows during a full reset
+- **WHEN** full reset succeeds and covered-path removal is successfully published
+- **THEN** it MAY clear only overflow strictly older than the captured build-start time
+- **AND** same-second or newer overflow and concurrent unacknowledged paths SHALL remain
+- **AND** empty retained snapshots SHALL NOT prevent acknowledging a covered older overflow
+
+#### Scenario: Marker cannot be interpreted or cleared
+- **WHEN** a present marker is unreadable/malformed, or marker deletion fails
+- **THEN** status SHALL retain incomplete coverage rather than report fresh
+- **AND** automatic timestamp-based acknowledgement MUST NOT clear an unknown timestamp
+- **AND** the existing explicit manual dirty-clear operation MAY clear the marker under the same lease
+
+#### Scenario: Overflow repair is observed in later sessions
+- **WHEN** overflow or smart-build mode decisions are recorded
+- **THEN** the owner SHALL open a bounded observation for the durable-overflow repair revision
+- **AND** historical cap events SHALL NOT be declared recovered solely because the repair was installed
 
 ### Requirement: csearch freshness 用文件清单内容指纹判定（非 mtime 代理）
 
@@ -263,20 +363,29 @@ csearch trigram 索引 SHALL 全平台共用一份，路径为 `csearch/csearch.
 - **THEN** csearch 搜索 SHALL 继续使用同一份 `csearch/csearch.idx`，MUST NOT 因切平台而被判为缺失或需重建
 - **AND** 切平台 SHALL NOT 删除任何既有 csearch 索引
 
-### Requirement: `<leader>/` 结果呈现 SHALL 提供分组、计数与后端状态
+### Requirement: `<leader>/` 结果呈现 SHALL 默认使用扁平 grep 行并显示后端状态
 
-`<leader>/` 的结果面板 SHALL 按文件分组，每文件 SHALL 显示命中计数，并 SHALL 以 Project / Engine / Workspace scope 与对应根目录相对路径分类。分组中的每一行 MUST 是带真实 file/line/column 的可跳转命中；系统 MUST NOT 插入可被选中但没有真实命中位置的 synthetic header。picker 标题 SHALL 标识当前后端（`[csearch]`）与当前 scope。
+`<leader>/` 的默认结果面板 SHALL 每条命中显示一条独立的 grep 行，包含 file/line/column 与命中文本；默认界面 MUST NOT 插入按文件聚合的 header、命中计数或 `▼` / `├` / `└` 分组标记。每一行 MUST 是可跳转、可预览的真实命中。`:UEGrepGroupingToggle` MAY 作为显式诊断 A/B 开关恢复旧分组 formatter，但分组 MUST 默认关闭。picker 标题 SHALL 标识当前后端（`[csearch]`）与当前 scope。
 
-#### Scenario: 多文件多命中
-- **WHEN** 一次 `<leader>/` 搜索在多个文件命中
-- **THEN** 结果 SHALL 按文件分组
-- **AND** 每个文件分组 SHALL 显示该文件内的命中数
-- **AND** 首行 SHALL 显示 scope、相对路径与计数，后续行 SHALL 显示该文件内的真实命中
+#### Scenario: 默认搜索在多个文件命中
+- **WHEN** 用户触发 `<leader>/`，且未显式启用诊断分组
+- **THEN** 每条命中 SHALL 独立显示 file/line/column 与命中文本
+- **AND** 结果 MUST NOT 显示文件组 header、每文件计数或 continuation / end marker
 
-#### Scenario: 选择任意分组行
-- **WHEN** 用户选中首条或后续任意一条结果
+#### Scenario: 新会话或未配置分组状态
+- **WHEN** `ue_grep_grouping_enabled` 未设置或不是 `true`
+- **THEN** `<leader>/` SHALL 使用标准扁平 grep formatter
+- **AND** picker MUST NOT 为文件分组启用 matcher 保序覆盖
+
+#### Scenario: 显式启用诊断分组
+- **WHEN** 用户调用 `:UEGrepGroupingToggle` 将分组显式设为启用
+- **THEN** picker MAY 使用旧的文件分组 formatter 与分组保序配置
+- **AND** 该诊断状态不得改变默认配置
+
+#### Scenario: 选择任意结果行
+- **WHEN** 用户选中任意一条结果
 - **THEN** 该 item SHALL 始终包含真实 file/line/column，并预览对应命中上下文
-- **AND** 首条结果 MUST NOT 因 synthetic file header 而预览文件第一行或空占位内容
+- **AND** 结果 MUST NOT 因 synthetic file header 而预览文件第一行或空占位内容
 
 #### Scenario: 标题反映后端与 scope
 - **WHEN** `<leader>/` 面板打开并完成一次搜索

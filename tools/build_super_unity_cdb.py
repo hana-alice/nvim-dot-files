@@ -14,6 +14,15 @@ clangd-indexer 没有 preamble share → 重复 parse 7 大 PCH 821 次。
 import json, os, sys, re
 from collections import defaultdict
 
+# Establish this before imports: their bytecode writes precede module guards
+# and would change the directory inventory used by semantic proof receipts.
+sys.dont_write_bytecode = True
+# Keep this module importable through the existing isolated Python launchers.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from build_hot_super_unity_cdb import (
+    portable_member_path, rewritten_arguments, secondary_unity_chunks, write_if_changed,
+)
+
 RE_FI_PCH = re.compile(r'/FI"([^"]*(?:SharedPCH|PCH)\.[^"]*)"')
 
 # Match #define X DLLEXPORT  or  #define X_NON_ATTRIBUTED_API DLLEXPORT  in Definitions.<Mod>.h
@@ -75,6 +84,196 @@ def find_shared_pch_for_module(dev_root_local, mod):
         return ('NONE',)
     pchs = sorted(set(os.path.basename(m.group(1)) for m in RE_FI_PCH.finditer(content)))
     return tuple(pchs) if pchs else ('NONE',)
+
+
+def build_generated_batches(entries, output_dir, max_originals=50, max_sources=2000):
+    """Generate same-context, generated-only secondary UBT wrappers.
+
+    This does not compile, index, publish or create a frozen/schema-2 receipt.
+    Original entries are retained verbatim when membership cannot be verified;
+    merged entries carry their complete originals for interactive CDB routing.
+    The caller remains responsible for qualification and activation.
+    """
+    import copy
+    import hashlib
+    from collections import Counter
+    from pathlib import Path
+
+    if (type(max_originals) is not int or max_originals < 1
+            or type(max_sources) is not int or max_sources < 1):
+        raise ValueError('generated batch budgets must be positive integers')
+
+    def key(path):
+        return os.path.normcase(os.path.realpath(winpath_local(path)))
+
+    overlay_cache = {}
+    entry_overlays = {}
+
+    def overlay_digest(path):
+        with path.open('rb') as stream:
+            return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+    def owned_overlay(path):
+        identity = key(path)
+        if identity not in overlay_cache:
+            physical = Path(winpath_local(path))
+            digest, valid = None, False
+            try:
+                digest = overlay_digest(physical)
+                workaround_dir = Path(__file__).resolve().parents[1] / 'lua/workarounds/clangd'
+                if str(workaround_dir) not in sys.path:
+                    sys.path.insert(0, str(workaround_dir))
+                from header_path_case import validate_owned_overlay
+                validate_owned_overlay(physical)
+                valid = overlay_digest(physical) == digest
+            except (OSError, ValueError):
+                pass
+            overlay_cache[identity] = (physical, digest, valid)
+        if not overlay_cache[identity][2]:
+            raise ValueError('unsupported or changed VFS overlay')
+        return identity
+
+    marker = '// Compiler-authored UBT unity membership; copied into nvim cache.'
+    literal_include = re.compile(r'#include "([^"\r\n\0]+)"')
+    source_counts = Counter(key(os.path.join(
+                                winpath_local(e['directory']) if isinstance(e.get('directory'), str) else '',
+                                winpath_local(e['file'])))
+                            for e in entries
+                            if isinstance(e.get('file'), str) and e['file'])
+    claims = Counter(source_counts)
+    # Unverified metadata cannot admit a wrapper, but an ownership claim still
+    # prevents batching the same portable member through another entry.
+    metadata_claims = Counter(member for entry in entries
+                              if isinstance(entry.get('nvim_ue_members'), list)
+                              for member in entry['nvim_ue_members'] if isinstance(member, str))
+    verified, contexts = {}, {}
+    rejected = set()
+    for index, entry in enumerate(entries):
+        filename = entry.get('file', '')
+        if not isinstance(filename, str):
+            continue
+        name = filename.replace('\\', '/').rsplit('/', 1)[-1]
+        if not (name.startswith('SuperUnity.UBT.') and name.endswith('.cpp')):
+            continue
+        try:
+            raw = Path(winpath_local(filename)).read_text(encoding='utf-8-sig')
+            lines = raw.splitlines()
+            # Count actual literal ownership even when metadata or other lines
+            # invalidate a wrapper, so another batch cannot steal its members.
+            includes = [match.group(1) for line in lines
+                        if (match := literal_include.fullmatch(line))]
+            claims.update(key(path) for path in includes if os.path.isabs(winpath_local(path)))
+            if (not os.path.isabs(winpath_local(filename)) or not lines or lines[0] != marker
+                    or not includes or len(includes) != len(lines) - 1
+                    or any(not os.path.isabs(winpath_local(p)) or not os.path.isfile(winpath_local(p))
+                           for p in includes)):
+                raise ValueError('unsupported or unavailable wrapper membership')
+            members = entry.get('nvim_ue_members')
+            module = entry.get('nvim_ue_module_root')
+            if (not isinstance(members, list)
+                    or members != [portable_member_path(p) for p in includes]
+                    or len(set(members)) != len(members)
+                    or not isinstance(module, str) or not module
+                    or entry.get('nvim_ue_generated_originals') is not None):
+                raise ValueError('missing or inconsistent original metadata')
+            if not all(path.lower().endswith('.gen.cpp') for path in includes):
+                continue
+            directory, args = entry.get('directory'), entry.get('arguments')
+            if (not isinstance(directory, str) or not os.path.isabs(winpath_local(directory))
+                    or not os.path.isdir(winpath_local(directory)) or not isinstance(args, list)
+                    or len(args) < 2 or any(not isinstance(arg, str) or not arg for arg in args)):
+                raise ValueError('unsupported compiler command')
+            if any(arg.startswith('@') or arg == '--config'
+                   or arg.startswith('--config=') for arg in args):
+                raise ValueError('indirect compiler input')
+            if any(arg.startswith(('-vfsoverlay', '--vfsoverlay', '/vfsoverlay',
+                                   '-Xclang=-ivfsoverlay', '-Xclang=-vfsoverlay',
+                                   '/clang:-ivfsoverlay', '/clang:-vfsoverlay')) for arg in args):
+                raise ValueError('unsupported VFS overlay option')
+            overlays = [i for i, arg in enumerate(args) if arg.startswith('-ivfsoverlay')]
+            if overlays:
+                position = overlays[0]
+                if (len(overlays) != 1 or args[position] != '-ivfsoverlay'
+                        or position == 0 or position + 1 >= len(args)
+                        or args[position - 1] == '-Xclang'
+                        or ('--' in args and position > args.index('--'))
+                        or not os.path.isabs(winpath_local(args[position + 1]))):
+                    raise ValueError('unsupported VFS overlay option')
+                entry_overlays[index] = owned_overlay(args[position + 1])
+            rewritten = rewritten_arguments(entry, '<SOURCE>')
+            if rewritten is None or rewritten.count('<SOURCE>') != 1:
+                raise ValueError('expected exactly one source operand')
+            source_index = rewritten.index('<SOURCE>')
+            if source_index == 0 or rewritten[source_index - 1] in (
+                    '-include', '-include-pch', '-imacros', '-I', '-isystem', '-iquote',
+                    '-idirafter', '-F', '-iframework', '-x', '-target', '--target', '-ivfsoverlay'):
+                raise ValueError('source occurs as an option operand')
+            # Preserve the full literal cwd and ordered semantic argv. The
+            # helper's compact context hash is only a planner optimization.
+            contexts[index] = (directory, tuple(rewritten))
+            verified[index] = includes
+        except (OSError, UnicodeError, ValueError, TypeError):
+            rejected.add(index)
+
+    # Reuse one validation per file's bytes, then bind every candidate to those
+    # same bytes after collecting its originals. Never cache only by mtime.
+    changed_overlays = set()
+    for identity, (path, digest, valid) in overlay_cache.items():
+        try:
+            if not valid or overlay_digest(path) != digest:
+                changed_overlays.add(identity)
+        except OSError:
+            changed_overlays.add(identity)
+
+    eligible = []
+    indexes = []
+    for index, includes in verified.items():
+        if (entry_overlays.get(index) in changed_overlays
+                or source_counts[key(entries[index]['file'])] != 1
+                or any(claims[key(p)] != 1 for p in includes)
+                or any(metadata_claims[p] != 1 for p in entries[index]['nvim_ue_members'])):
+            rejected.add(index)
+            continue
+        indexes.append(index)
+        eligible.append(entries[index])
+
+    replacements, consumed = {}, set()
+    generated_sources = 0
+    for planned in secondary_unity_chunks(eligible, max_sources=max_sources, max_unities=max_originals):
+        chunk = [indexes[index] for index in planned]
+        if any(contexts[index] != contexts[chunk[0]] for index in chunk[1:]):
+            rejected.update(chunk)
+            continue
+        originals = [entries[index] for index in chunk]
+        body = '// Generated-only secondary UBT unity; qualification is separate.\n' + ''.join(
+            '#include "' + original['file'].replace('\\', '/') + '"\n' for original in originals)
+        if any(char in original['file'] for original in originals for char in ('"', '\r', '\n', '\0')):
+            rejected.update(chunk)
+            continue
+        identity = hashlib.sha256(json.dumps([body, contexts[chunk[0]]],
+            ensure_ascii=False, separators=(',', ':')).encode('utf-8')).hexdigest()
+        directory = Path(winpath_local(str(output_dir))).resolve()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / ('SuperUnity.Generated.' + identity + '.cpp')
+        write_if_changed(str(path), body)
+        source = winpath_from_local(str(path))
+        members = [member for original in originals for member in original['nvim_ue_members']]
+        replacements[chunk[0]] = {
+            'directory': originals[0]['directory'], 'file': source,
+            'arguments': rewritten_arguments(originals[0], source),
+            'nvim_ue_members': members, 'nvim_ue_module_root': originals[0]['nvim_ue_module_root'],
+            'nvim_ue_generated_originals': copy.deepcopy(originals),
+        }
+        consumed.update(chunk)
+        generated_sources += len(members)
+    result = [replacements[index] if index in replacements else entry
+              for index, entry in enumerate(entries) if index in replacements or index not in consumed]
+    return result, {
+        'input_entries': len(entries), 'output_entries': len(result),
+        'secondary_groups': len(replacements), 'merged_originals': len(consumed),
+        'generated_sources': generated_sources, 'retained_entries': len(entries) - len(consumed),
+        'rejected_entries': len(rejected),
+    }
 
 
 def main():

@@ -7,13 +7,26 @@
 ## 这是什么
 
 hana-alice 的 Neovim 配置（公开镜像 `hana-alice/nvim`），定位为
-**专为 Unreal Engine 5 大型 C++ 工程优化的开发环境**：3 分钟全量索引、
+**专为 Unreal Engine 5 大型 C++ 工程优化的开发环境**，目标体验包括 3 分钟全量索引、
 亚 100ms goto-definition、一键 Android headless DAP attach、错误全落盘。
+**当前 SuperUnity 完整索引性能仍未通过恢复验收**；上述定位不是现状实测承诺，
+验收证据与缺口见 [索引退化调查](../docs/cpp-index-restart-investigation.md)。
+按用户确认的阶段交付方式，已验证范围可先交付，再继续扩大压缩规模；完整恢复仍单独验收。
+项目/target 的 `batch-store.json` 可让正常 current/hot/full 复用指定证明目录，失效时保留原命令；
+契约见 `cpp-semantic-index-coverage`，被引用的回执及冻结资产须持续保留。
+冻结激活的文档预检由 `lua/ue/index/batch_documents.lua` 读取缓冲区元数据，CDB 归属与
+证明权限和重验仍由 `batch_runtime.lua` 管理；`batch_recovery.lua` 监听文档清洁与客户端事件，
+经过冷却和完整验证后定向切换，验证期间保留原客户端；不会为了激活而保存或丢弃用户修改。
+发布结果区分原始命令变化与冻结产物变化；原始命令未变、相关文档仍脏且既有恢复协调器
+已等待时，交付保留唯一原始 reader，不消耗重启防抖。其余更新沿用既有校验/交付路径。
 
 LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨模块）+
 `lua/ue/`、`lua/utils/`、`lua/workarounds/`。
 
 ## 先读什么（SESSION START 顺序）
+
+**不依赖 spec 的承重约束**：[SuperUnity 性能保全](../AGENTS.md#super-unity-performance-contract)。
+不得静默取消二次合并；功能回归全绿不等于真实工程索引性能恢复，详见根入口正文与 C11。
 
 新 context 进来、动代码前**按序读**：
 
@@ -40,25 +53,30 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 | 扫描根推导 | `lua/ue/core/scan_roots.lua` | `lua/ue/core/AGENTS.md` | `project-scan-root-discovery` | `ue_api` `fs_proc` | 从 Build.cs/uplugin/uproject 推导应扫目录；只扩不缩 |
 | UE 引擎中枢 | `lua/ue.lua` + `lua/ue/` | `lua/ue/AGENTS.md` | `ue-target-workflow-boundary` | `ue_platform_boundary` `ue_api` `smoke` | 索引 / CDB / DAP / 命令注册的中枢 |
 | 多实例状态 | `lua/ue/project_state.lua` + `file_lock.lua` | `lua/ue/AGENTS.md` | `multi-instance-state-isolation` | `multi_instance_state` | 进程内选择 + canonical project bucket + 跨进程 writer lease |
-| clangd 语义覆盖 | `lua/ue/index/` | `lua/ue/index/AGENTS.md` | `cpp-semantic-index-coverage` | `index_generation` `cpp_semantic_index` | current/hot/full controlled BackgroundIndex + generation 单调选择 |
-| CDB 流水线 | `lua/ue/cdb/` | `lua/ue/cdb/AGENTS.md` | `macos-ios-cdb-semantic-prepare` | `ue_cdb` | compile_commands.json 生成/裁剪/注入 |
-| DAP 调试 | `lua/ue/dap/` | `lua/ue/dap/AGENTS.md` | `dap-platform-dispatch`、`android-dap-attach`、`android-dap-live-breakpoints`、`ios-device-debug-workflow` | `dap` `platform` | Android platform 模式 + iOS CoreDevice/legacy 独立 route |
+| clangd 语义覆盖 | `lua/ue/index/` | `lua/ue/index/AGENTS.md` | `cpp-semantic-index-coverage` | `index_generation` `index_subset_async` `cpp_semantic_index` | current/hot/full controlled BackgroundIndex + generation 单调选择；大 CDB 筛选在后台执行 |
+| 已验证二次批次 | `tools/clangd_*` + `tools/cdb_verified_batch.py` + `lua/ue/index/batch_*.lua` | `tools/AGENTS.md` + `lua/ue/index/AGENTS.md` | `cpp-semantic-index-coverage` | `index_graph` `index_batch` `index_input_directory` `index_verified_batch` `index_inventory` `index_query_profile` `index_vfs_aliases` | 原 TU 图证明、冻结输入、独立语义 CDB 与运行时失效保护 |
+| 离线生成代码二次候选 | `tools/build_super_unity_cdb.py` | `tools/AGENTS.md` | `cpp-semantic-index-coverage` | `index_generated_super_unity` `structure` | 同模块完整 argv 相同的 generated-only UBT 候选；全局 header 引用目标验收未过，不得自动发布 |
+| 离线有序二次候选 | `tools/cdb_ordered_unity.py` | `tools/AGENTS.md` | `cpp-semantic-index-coverage` | `index_ordered_unity` `structure` | 保留 PCH/模块宏顺序与覆盖；候选不是已准入的生产批次 |
+| 源码刷新交付 | `lua/ue/index/_source.lua` + `_clangd.lua` + `lua/utils/ue_watch.lua` | `lua/ue/index/AGENTS.md` + `lua/utils/AGENTS.md` | `cpp-semantic-index-coverage` | `index_source_refresh` `index_delivery` `ue_watch_csearch` | 源码字节 revision 独立于 CDB；新客户端附加后才确认交付 |
+| CDB 流水线 | `lua/ue/cdb/` | `lua/ue/cdb/AGENTS.md` | `macos-ios-cdb-semantic-prepare` | `ue_cdb` | 保留真实编译参数；暂存生成/变换/分区，变化后才发布 |
+| DAP 调试 | `lua/ue/dap/` | `lua/ue/dap/AGENTS.md` | `dap-failure-layering`（**归属分层 L0–L4、失败先报层**）、`dap-platform-dispatch`、`android-dap-attach`、`android-dap-live-breakpoints`、`ios-device-debug-workflow` | `dap` `platform` `dap_failure_layer` | Android platform 模式 + iOS CoreDevice/legacy 独立 route；失败按 L0–L4 归属 |
 | Android device | `lua/utils/android_device.lua` | `lua/utils/AGENTS.md` | `global-android-device-selection` | `android_device` `dap` `ue_context` | 名称+serial picker；当前 Neovim 进程 serial；统一 `adb -s` |
 | Android SO 快速迭代 | `lua/ue/targets/android.lua` + `android_windows.lua` + `scripts/ue_android_so_*.ps1` | `lua/ue/targets/AGENTS.md` + `scripts/AGENTS.md` | `android-so-quick-deploy` | `ue_target_drivers` `ue_target_integration` | Windows-only PowerShell compatibility path；root 或已验证的 debuggable app-private transport；不支持 macOS→Android |
 | UE target drivers | `lua/ue/targets/` | `lua/ue/targets/AGENTS.md` | `ue-target-driver-boundary`、`ios-build-run-workflow`、`ios-device-debug-workflow` | `ue_target_drivers` `ue_target_integration` `ue_target_tasks` | Android/IOS/Mac/Win64/Linux 目标策略彼此隔离；`host_operations` matrix + runtime strategy 是组合真相 |
 | UE workflows | `lua/ue/workflows/` | `lua/ue/workflows/AGENTS.md` | `ue-target-workflow-boundary` | `ue_workflows` `ue_target_tasks` | target-specific 异步/UI/设备状态机的 owner |
-| goto 解析栈 | `lua/utils/ue_goto/` | `lua/utils/ue_goto/AGENTS.md` | `cpp-contextual-definition-navigation`、`cpp-semantic-highlighting` | `cpp_semantic_context` `cpp_semantic_client` `ue_goto_behavior` | proven-TU canonical USR + module AST 唯一 body；非 C++ compatibility fallback |
-| 代码搜索 | `lua/utils/code_search/` | `lua/utils/code_search/AGENTS.md` | `ue-code-search`、`project-scan-root-discovery` | `ue_goto_behavior` `ue_paths` `utils` | csearch 亚秒级 grep（兜底，非主路） |
+| goto 解析栈 | `lua/utils/ue_goto/` | `lua/utils/ue_goto/AGENTS.md` | `cpp-contextual-definition-navigation`、`cpp-semantic-highlighting` | `cpp_semantic_context` `cpp_semantic_client` `ue_goto_behavior` | coordinator/report、LSP/clangd/compat 分层；独立 client action/transport 与 native TU/catalog/definition owners，详见 `docs/architecture-symbol-resolution.md` |
+| 代码搜索 | `lua/utils/code_search/` + `lua/ue/csearch_build.lua` | `lua/utils/code_search/AGENTS.md`、`lua/ue/AGENTS.md` | `ue-code-search`、`project-scan-root-discovery` | `csearch_build_guard` `ue_goto_behavior` `ue_paths` `utils` | 显式搜索与独立 csearch 构建 |
 | 核心健康审计 | `lua/utils/core_health*.lua` + `scripts/nvim_core_health.lua` | `lua/utils/AGENTS.md` + `scripts/AGENTS.md` | `nvim-core-functionality-audit`、`codebase-health-audit` | `core_health` | 隔离、只读、可机器判定的启动/编辑/AST/搜索/clangd/CDB/target plan 证据 |
 | 平台驱动 | `lua/utils/platform/` | `lua/utils/platform/AGENTS.md` | `host-platform-driver`、`platform-tool-resolution`、`shell-command-planning` | `platform` `ue_platform_boundary` | 唯一允许做 OS 分支的地方；host 选 shell executable，shell helper 只组 argv/quote |
-| 探针反馈 | `lua/utils/probe.lua` | `lua/utils/AGENTS.md` | `probe-feedback-loop` | `probe` | 主动埋证据；会话开头先读 `:UEProbeReport` |
+| 探针反馈 | `lua/utils/probe.lua` + `probe_store.lua` | `lua/utils/AGENTS.md` | `probe-feedback-loop` | `probe` | revision 观察、已读/处置/复发、固定统计；锁内增量合并与退出 journal；会话先读 `:UEProbeReport` |
+| watcher dirty 持久化 | `lua/utils/ue_watch.lua` + `dirty_save.lua` | `lua/utils/AGENTS.md` | `ue-code-search`、`multi-instance-state-isolation` | `ue_watch_csearch` `multi_instance_state` `stability` | 事件 generation 隔离，原 owner 保存与有界 I/O 重试 |
 | 宿主资源感知/动态纪律 | `lua/utils/cpu_load.lua` + `host_admission.lua` + `clangd_resource_controller.lua` + `lua/ue/index/_admission.lua` | `lua/utils/AGENTS.md` + `lua/ue/index/AGENTS.md` | `editor-behavior-regression`、`cpp-semantic-index-coverage` | `cpu_admission` `host_resource_discipline` `clangd_resource` `index_delivery` `ue_config` `stability` | host 1Hz / Neovim 4Hz 常驻感知；batch 推迟、前台优先、owned clangd 可逆降优先级 |
 | 任务管理 | `lua/utils/task_registry.lua` | `lua/utils/AGENTS.md` | `task-management` | `task_registry` `commands` | `Tasks`/`TaskStop`/`TaskStopAll` 通用后台任务 |
 | 通知历史 | `lua/utils/` 通知层 | `lua/utils/AGENTS.md` | `notification-history` | `utils` | 不做周期 ticker（P5） |
 | workaround 注册表 | `lua/workarounds/` | `lua/workarounds/AGENTS.md` | 无对应 capability | `workarounds` `smoke` | 上游 bug 补丁，带 frontmatter |
-| 配置层 | `lua/config/` | `lua/config/AGENTS.md` | `keymap-command-regression`、`editor-behavior-regression` | `keymaps` `commands` `options` `autocmds` | keymaps / options / autocmds / lazy |
+| 配置层 | `lua/config/` | `lua/config/AGENTS.md` | `keymap-command-regression`、`editor-behavior-regression` | `keymaps` `commands` `review_editor` `options` `autocmds` | keymaps / options / autocmds / lazy |
 | 主题 | `lua/theme.lua` + `colors/` | `lua/AGENTS.md` | `curated-theme-entrypoints` | `theme` `smoke` | 策展式主题入口 |
-| 插件层 | `lua/plugins/` | `lua/plugins/AGENTS.md` | 无对应 capability | `smoke` | per-plugin setup（snacks-only） |
+| 插件层 | `lua/plugins/` | `lua/plugins/AGENTS.md` | `editor-behavior-regression` | `smoke` `review_editor` | per-plugin setup（snacks-only） |
 | vendored 依赖 | `lua/nio/`、`lua/trouble/` | 各自 `AGENTS.md` | 无对应 capability | `smoke` | 第三方内联副本，不自行重构 |
 | 回归测试 | `tests/` | `tests/AGENTS.md` | `headless-test-harness`、`config-regression-suite`、`test-regression-policy`、`structure-discoverability-regression` | 改动对应域 + `structure` | headless 套件 + 分范围回归映射 |
 | 规则/知识库 | `AGENTS.md`、`docs/`、`memory/`、`decisions/`、`lessons/` | `docs/AGENTS.md` | `project-constraints-doc`、`ai-knowledge-base`、`local-subsystem-rules`、`spec-authority-loop` | `structure` | 单一内容源 + 四区知识库 + spec 权威 |
@@ -74,6 +92,11 @@ Win64/Android，Linux 只执行 Linux；Mac 与 IOS target 独立，Android Powe
 pre-iOS17 使用 legacy MobileDevice/debugserver bridge，失败不跨 backend，也不 fallback 到 Mac process attach。
 
 ## 知识库各区
+
+独立搜索构建：`:UEBuildCsearch` 由 `lua/ue/csearch_build.lua` 持有流程，`ue.lua` 只转发现有扫描和
+writer 接口；治理 spec 为 `ue-code-search`，回归 `csearch_build_guard` + `commands` + `ue_api`。
+Dirty 上限截断由 `utils/dirty_save.lua` 的同锁 `dirty.json.overflow` 标记跨实例保留；
+截断后的空集合仍 stale，增量命令转独立完整搜索重建，回归另含 `dirty_overflow`。
 
 | 区 | 入口 | 放什么 |
 |---|---|---|

@@ -26,12 +26,19 @@ local SPAWN_AUDIT = {
   { p="lua/ue/build_monitor.lua", api="vim.system", a="opts.run or vim.system", class="foreground-inherited", reason="bounded status probe while terminal build token is active" },
   { p="lua/ue/cdb/pipeline.lua", api="jobstart", a="_rt.jobstart(step.command", class="deferrable", reason="admitted CDB chain", guard="host_admission" },
   { p="lua/ue/cdb/pipeline.lua", api="fn-system", a="vim.fn.system(cmd)", class="subprocess-only", reason="slim runs inside admitted ccjson or explicit sync path" },
+  { p="lua/ue/cdb/transaction.lua", api="vim.system", a="local ok_spawn, handle = pcall(vim.system", class="deferrable", reason="admitted sequential prepare staging/commit child; large copies and hashing stay outside UI", guard="host_admission" },
   { p="lua/ue/clangd_commands.lua", api="vim.system", a="vim.system(cmd, { text = true }", class="interactive", reason="bounded compile-command query for active LSP request" },
-  { p="lua/ue/dap/android.lua", api="vim.system", a="local ok_spawn = pcall(vim.system", n=2, class="dap", reason="DAP protocol/process lifecycle exemption" },
-  { p="lua/ue/dap/android.lua", api="jobstart", a="vim.fn.jobstart({ adb, \"-s\", serial, \"shell\", cmd }", class="dap", reason="DAP device process bridge" },
+  { p="lua/ue/dap/android.lua", api="vim.system", a="local ok_spawn = pcall(vim.system", n=3, class="dap", reason="DAP protocol/process lifecycle exemption (liveness pidof probe, gate release, session-exit post-mortem)" },
+  -- L1 传输层拆分后（design D7），platform server 的 spawn 随代码搬到 _android_transport。
+  { p="lua/ue/dap/_android_transport.lua", api="jobstart", a="vim.fn.jobstart({ adb, \"-s\", serial, \"shell\", cmd }", class="dap", reason="DAP device platform-server bridge (L1 transport owner)" },
   { p="lua/ue/dap/android.lua", api="jobstart", a="vim.fn.jobstart(jdb_connect_argv", class="dap", reason="DAP JDWP bridge" },
   { p="lua/ue/dap/android.lua", api="vim.system", a="vim.system(", class="dap", reason="DAP bounded host operation" },
   { p="lua/ue/dap/android.lua", api="fn-system", a="vim.fn.system(cmd)", n=2, class="dap", reason="DAP preflight fallback" },
+  -- C10 L2 gate: the layered capability preflight owns exactly ONE spawn point,
+  -- deliberately centralized here instead of spread across target owners so this
+  -- ratchet has a stable owner. Bounded by preflight.PROBE_TIMEOUT_MS; async only
+  -- (P6/K53: a synchronous probe would cost 87ms of main loop per call on Windows).
+  { p="lua/ue/dap/preflight.lua", api="vim.system", a="vim.system(argv, { text = true, timeout = M.PROBE_TIMEOUT_MS }", class="dap", reason="layered L0-L4 capability probe, bounded + async (C10 attach gate)" },
   { p="lua/ue/dap/ios.lua", api="vim.system", a="pcall(vim.system, argv", class="dap", reason="DAP adapter lifecycle" },
   { p="lua/ue/dap/ios.lua", api="jobstart", a="bridge.job_id = vim.fn.jobstart", class="dap", reason="DAP bridge lifecycle" },
   { p="lua/ue/dap.lua", api="jobstart", a="logcat_job = vim.fn.jobstart", class="dap", reason="DAP log stream" },
@@ -40,9 +47,10 @@ local SPAWN_AUDIT = {
   { p="lua/ue/gtags.lua", api="vim.system", a="vim.system(command", class="sync-debug", reason="explicit UEPrepareSync twin only" },
   { p="lua/ue/gtags.lua", api="vim.system", a="spec.system or vim.system", class="deferrable", reason="watcher GTAGS async rebuild", guard="admission.run_when_allowed" },
   { p="lua/ue/index/_build.lua", api="vim.system", a="partition_result(vim.system", class="sync-debug", reason="explicit synchronous twin; UI callers use async" },
-  { p="lua/ue/index/_build.lua", api="vim.system", a="local handle = vim.system(plan.command", class="deferrable", reason="admitted async CDB partition", guard="admission.run_when_allowed" },
+  { p="lua/ue/index/_build.lua", api="vim.system", a="local ok_spawn, handle = pcall(vim.system, plan.command", class="deferrable", reason="admitted async CDB partition under actual base writer lease", guard="admission.run_when_allowed" },
   { p="lua/ue/index/_build.lua", api="vim.system", a="vim.system(cmd, {", class="deferrable", reason="controlled index child admitted by scheduler", guard="admit_background_phase", gp="lua/ue/index/_schedule.lua" },
   { p="lua/ue/index/_generation.lua", api="vim.system", a="vim.system({ path,", class="short", reason="cached bounded toolchain identity probe" },
+  { p="lua/ue/index/batch_runtime.lua", api="vim.system", a="local handle = vim.system(command", class="interactive", reason="bounded asynchronous clangd startup receipt verification", guard="task_registry" },
   { p="lua/ue/target_tasks.lua", api="vim.system", a="pcall(vim.system, command", class="foreground", reason="operation metadata classifies explicit task", guard="is_foreground_operation" },
   { p="lua/ue/workflows/android/install.lua", api="jobstart", a="pcall(d.jobstart, install_cmd", class="foreground", reason="explicit APK install", guard="foreground_begin" },
   { p="lua/ue/workflows/android/launch.lua", api="jobstart", a="pcall(deps.jobstart, prepared.command", class="interactive", reason="short explicit app launch" },
@@ -71,6 +79,7 @@ local SPAWN_AUDIT = {
   { p="lua/utils/platform/macos.lua", api="jobstart", a="vim.fn.jobstart({ \"open\", path }", class="detached", reason="OS opener" },
   { p="lua/utils/platform/macos.lua", api="jobstart", a="vim.fn.jobstart({ \"open\", \"-R\", path }", class="detached", reason="OS revealer" },
   { p="lua/utils/platform/windows.lua", api="jobstart", a="vim.fn.jobstart(command, { detach = true }", class="detached", reason="Explorer opener/revealer" },
+  { p="lua/workarounds/libuv/content_events.lua", api="jobstart", a="vim.fn.jobstart(command, options)", class="long-lived", reason="parent-bound native content watcher owned until editor exit", guard="task_registry" },
   { p="lua/utils/restart.lua", api="spawn", a="uv.spawn(exe", class="interactive", reason="explicit editor restart handoff" },
   { p="lua/utils/ue_goto/semantic_client_runtime.lua", api="jobstart", a="vim.fn.jobstart({", class="interactive", reason="compiler-semantic sidecar for active gd" },
   { p="lua/utils/ue_goto/semantic_sidecar_catalog.lua", api="vim.system", a="vim.system(args", class="subprocess-only", reason="bounded compiler probe inside headless sidecar" },
@@ -79,9 +88,7 @@ local SPAWN_AUDIT = {
   { p="lua/utils/ue_launch.lua", api="jobstart", a="pcall(vim.fn.jobstart, cmd", class="detached", reason="explicit detached target launch" },
   { p="lua/utils/ue_logs.lua", api="jobstart", a="active_jobid = vim.fn.jobstart", class="interactive", reason="explicit low-CPU log stream" },
   { p="lua/utils/yazi.lua", api="termopen", a="vim.fn.termopen(cmd", class="interactive", reason="explicit interactive terminal UI" },
-  { p="lua/trouble/sources/ue_sidebar.lua", api="vim.system", a="if vim.system then", class="helper", reason="sidebar async capability branch" },
   { p="lua/trouble/sources/ue_sidebar.lua", api="vim.system", a="vim.system(cmd", class="interactive", reason="bounded sidebar query" },
-  { p="lua/trouble/sources/ue_sidebar.lua", api="fn-system", a="vim.fn.systemlist(cmd)", class="interactive", reason="legacy sidebar fallback" },
 }
 
 t.describe("host discipline: spawn audit", function()

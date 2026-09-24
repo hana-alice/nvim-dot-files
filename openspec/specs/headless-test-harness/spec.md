@@ -8,14 +8,26 @@
 
 ### Requirement: 统一 headless 运行入口
 
-测试套件 SHALL 提供单一运行入口，使用 `nvim --headless` 在无 UI 环境下顺序执行全部注册的测试用例，并在结束时输出 PASS/FAIL 汇总。
+测试套件 SHALL 提供单一运行入口，使用 `nvim --headless` 在无 UI 环境下顺序执行全部注册的测试用例，并在结束时输出 PASS/FAIL/SKIP 汇总。
 
 #### Scenario: 一条命令跑全量回归
 
 - **WHEN** 开发者执行统一运行入口（例如 `nvim -l tests/run.lua`）
 - **THEN** 入口加载并执行 `tests/` 下所有注册测试用例
 - **AND** 终端输出每个用例的 PASS/FAIL 状态与失败原因
-- **AND** 末尾打印 `=== N/M passed, K failed ===` 形式的汇总行
+- **AND** 末尾打印 `=== N/M passed, K failed, S skipped ===` 形式的汇总行，M 不含跳过项
+
+#### Scenario: Native prerequisites are unavailable
+
+- **WHEN** 真实编译器测试缺少所需工具或动态库
+- **THEN** 框架 SHALL 将该组报告为带原因的 SKIP，MUST NOT 用空成功用例冒充执行
+- **AND** `NVIM_TEST_REQUIRE_NATIVE=1` 时此类跳过 SHALL 转为失败并返回非零退出码
+
+#### Scenario: Local tests emit diagnostic logs
+
+- **WHEN** 本地统一入口执行可能记录日志或 probe 的测试
+- **THEN** 入口 SHALL 在加载被测模块前配置隔离的测试日志和状态路径
+- **AND** 测试记录或日志清理 MUST NOT 写入或清理用户的真实日志目录
 
 #### Scenario: 全部通过时返回零退出码
 

@@ -161,6 +161,25 @@ t.describe("structure: 强制入口与政策可发现", function()
     t.assert_contains(agents, "SESSION START")
     t.assert_contains(agents, "Definition of Done")
   end)
+  t.it("SuperUnity 性能硬约束在根入口直接可读，不依赖 spec", function()
+    local contract = agents:match('<a id="super%-unity%-performance%-contract"></a>\n## [^\n]+\n(.-)\n## ')
+    t.assert_true(contract ~= nil, "根入口缺少 SuperUnity 性能硬约束正文")
+    for _, obligation in ipairs({ "不得静默", "二次合并", "正确性", "已退化", "shader", "真实工程", "功能回归", "未完成", "不得视为豁免", "用户明确调整" }) do
+      t.assert_contains(contract or "", obligation)
+    end
+    t.assert_true(agents:find('id="super-unity-performance-contract"', 1, true)
+      < agents:find("## SESSION START", 1, true), "性能硬约束必须在会话前置步骤之前直接可见")
+  end)
+  t.it("SuperUnity 性能约束可从约束索引和知识库直接发现", function()
+    t.assert_contains(constraints, "C11")
+    t.assert_contains(constraints, "AGENTS.md#super-unity-performance-contract")
+    t.assert_contains(read("memory/project_overview.md") or "", "AGENTS.md#super-unity-performance-contract")
+  end)
+  t.it("CDB、索引和生成器本地入口链接同一 SuperUnity 约束", function()
+    for _, path in ipairs({ "lua/ue/cdb/AGENTS.md", "lua/ue/index/AGENTS.md", "tools/AGENTS.md" }) do
+      t.assert_contains(read(path) or "", "AGENTS.md#super-unity-performance-contract", path)
+    end
+  end)
   t.it("tests/AGENTS.md 含 change→filter 映射表", function()
     t.assert_contains(tests_rules, "CHANGE-TO-FILTER MAP")
   end)
@@ -194,6 +213,32 @@ t.describe("structure: 强制入口与政策可发现", function()
   t.it("CONSTRAINTS 含 spec 一致性约束 C9", function()
     t.assert_contains(constraints, "C9")
     t.assert_contains(constraints, "spec-authority-loop")
+  end)
+  -- 归属分层契约（dap-failure-layering）：必须对三端 agent 第一手可见。
+  -- 一份正文（spec）+ 三处指针（根 AGENTS / CONSTRAINTS C10 / dap 本地规则）。
+  -- 删掉任一处即 FAIL，防止规则退化回「只存在于源码注释/会话记录」。
+  t.it("根 AGENTS.md 的 SESSION START 含归属分层契约指针", function()
+    local ss = agents:match("SESSION START.-\n## ") or agents:match("SESSION START.*$") or ""
+    t.assert_contains(ss, "dap-failure-layering")
+    t.assert_contains(ss, "C10")
+  end)
+  t.it("CONSTRAINTS 含 DAP 归属分层契约 C10（五层 + 失败先报层）", function()
+    t.assert_contains(constraints, "C10")
+    t.assert_contains(constraints, "dap-failure-layering")
+    for _, layer in ipairs({ "L0", "L1", "L2", "L3", "L4" }) do
+      t.assert_contains(constraints, "**" .. layer .. "**")
+    end
+  end)
+  t.it("lua/ue/dap/AGENTS.md 就地声明层表与 owner", function()
+    local dap_rules = read("lua/ue/dap/AGENTS.md") or ""
+    t.assert_contains(dap_rules, "dap-failure-layering")
+    for _, layer in ipairs({ "L0", "L1", "L2", "L3", "L4" }) do
+      t.assert_contains(dap_rules, "**" .. layer .. "**")
+    end
+    t.assert_contains(dap_rules, "owner")
+  end)
+  t.it("CONSTRAINTS 维护契约要求新 DAP 坑标注归属层", function()
+    t.assert_contains(constraints, "MUST 标注其归属层")
   end)
 end)
 

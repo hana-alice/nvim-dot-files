@@ -2,9 +2,7 @@
 
 ## Purpose
 这个 capability 把 DAP 的平台注册与会话分发收束成单一契约：adapter 的注册必须由可验证的 matrix 过滤，真正执行 attach、launch、stop、status、reattach 的 handler 必须按“会话创建时冻结的 owner”路由，而不是读取后来切换的 current platform 来猜。这样可以避免一个会话在生命周期中途被错误地切到另一个平台实现，也避免 attach 成功后、stop/status 却被当前平台带偏。DAP 的 dispatch seam 因此必须兼顾注册时的兼容性过滤和运行时的会话归属冻结，两者缺一不可。
-
 ## Requirements
-
 ### Requirement: DAP adapter 注册必须按 matrix 过滤
 
 系统 SHALL 仅为在 matrix 中声明为兼容的 host/target pair 注册 DAP adapter；未声明的组合 MUST NOT 出现在可选注册表中。注册阶段不得依赖当前 UI 选择或运行时猜测，而必须依据已定义的兼容矩阵决定是否暴露该 adapter。
@@ -68,3 +66,24 @@
 - **WHEN** session owner 与当前注册的 matrix 结果不一致
 - **THEN** 系统 SHALL 报告一致性错误
 - **AND** MUST NOT 静默切换到一个新的 adapter 继续执行
+
+### Requirement: dispatch 层失败 SHALL 携带层归属与 owner
+
+DAP dispatch seam（注册过滤、会话归属校验、attach/launch/stop/status/reattach 路由）产生的
+用户可见失败 SHALL 携带层归属与 owner，使「宿主/目标组合不兼容」「会话归属缺失」这类
+**dispatch 自身的**失败不会被读成设备侧或调试引擎侧问题。
+
+MUST NOT 发出不带层归属的 dispatch 失败。
+
+#### Scenario: 不兼容组合报为 dispatch 归属
+
+- **WHEN** 用户在 matrix 未声明兼容的 host/target 组合上触发 attach 或 launch
+- **THEN** 失败 SHALL 标明其归属为 dispatch 兼容性判定，而非设备或调试引擎
+- **AND** SHALL 给出 host id、target id 与不兼容原因
+
+#### Scenario: 会话归属缺失报为 dispatch 归属
+
+- **WHEN** session owner 缺失或与 matrix 不一致
+- **THEN** 失败 SHALL 标明其归属为 dispatch 会话归属校验
+- **AND** MUST NOT 表述为设备或调试引擎故障
+

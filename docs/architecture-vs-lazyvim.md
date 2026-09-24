@@ -291,7 +291,7 @@ left to the user.
 
 ---
 
-## 6. DAP stack — codelldb / lldb-dap on Android + Win64
+## 6. DAP stack — lldb-dap on Android + Win64
 
 ### LazyVim default
 DAP is opt-in via `lazyvim.plugins.extras.dap.core`. Wires `nvim-dap`

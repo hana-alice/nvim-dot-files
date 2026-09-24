@@ -3,8 +3,71 @@ return function(M, core)
   local RT = core.RT
   local unix_now = core.h.unix_now
 
+  local function retain_original_reader(dependencies)
+    local ctx = dependencies.context
+    if dependencies.original_changed ~= false or dependencies.invalidated_frozen_batch == true
+        or not ctx or not ctx.paths or not ctx.paths.semantic_cdb then return false end
+    local fs = require("ue.core.fs")
+    if not fs.is_absolute_path(vim.fs.normalize(ctx.paths.semantic_cdb)) then return false end
+    local path_key = require("utils.platform").driver().path_key
+    local function key(path) return path_key(vim.fs.normalize(path)) end
+    local scope = key(ctx.paths.semantic_cdb)
+    local waiting = false
+    for _, status in ipairs(require("ue.index.batch_recovery").status()) do
+      if status.scope == scope and status.waiting == true and status.phase == "waiting" and status.busy == false then
+        waiting = true; break
+      end
+    end
+    if not waiting then return false end
+    local original_dir = key(vim.fs.dirname(ctx.paths.semantic_cdb))
+    local frozen_dir = key(vim.fs.joinpath(original_dir, "verified"))
+    local function directory(client)
+      local config = client.config or {}
+      local cmd = config._ue_resolved_cmd or config.cmd
+      if type(cmd) ~= "table" or not vim.islist(cmd) then return end
+      -- Match the recovery owner's reader contract: only its canonical option
+      -- form can later be rediscovered and promoted when documents become clean.
+      local selected
+      for _, arg in ipairs(cmd) do
+        if type(arg) ~= "string" then return end
+        if arg == "--compile-commands-dir" or arg == "-compile-commands-dir"
+            or arg:match("^%-%-?compile%-commands%-dir=") then
+          local path = arg:match("^%-%-compile%-commands%-dir=(.+)$")
+          -- Duplicate or mixed spellings have unproven effective precedence.
+          if not path or selected or not fs.is_absolute_path(vim.fs.normalize(path)) then return end
+          selected = key(path)
+        end
+      end
+      return selected
+    end
+    local function owns(client)
+      return directory(client) == original_dir and not (client.config or {})._ue_batch_scope
+    end
+    local reader
+    for _, client in ipairs((dependencies.get_clients or vim.lsp.get_clients)({ name = "clangd" })) do
+      local client_dir = directory(client)
+      if not client_dir then return false end
+      local batch_scope = (client.config or {})._ue_batch_scope
+      if (type(batch_scope) == "string" and key(batch_scope) == scope) or client_dir == frozen_dir then
+        return false
+      end
+      if owns(client) and client.initialized and not (client.is_stopped and client:is_stopped()) then
+        for buffer in pairs(client.attached_buffers or {}) do
+          if (dependencies.buffer_loaded or vim.api.nvim_buf_is_loaded)(buffer) then
+            if reader then return false end
+            reader = client; break
+          end
+        end
+      end
+    end
+    return reader ~= nil and require("ue.index.batch_documents").modified(nil, ctx, reader.config.filetypes, owns)
+  end
+
   M.maybe_restart_clangd_for_index = function(dependencies)
     dependencies = dependencies or {}
+    -- The original reader already has the unchanged commands. Recovery owns
+    -- the eventual fully validated frozen promotion; do not consume debounce.
+    if retain_original_reader(dependencies) then return false end
     local now = (dependencies.now or unix_now)()
     if dependencies.invalidated_frozen_batch ~= true and (now - RT.last_restart_at) < RT.restart_debounce_s then
       return false, math.max(1, math.ceil((RT.restart_debounce_s - (now - RT.last_restart_at)) * 1000))

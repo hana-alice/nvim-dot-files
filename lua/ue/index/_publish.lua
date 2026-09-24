@@ -123,7 +123,7 @@ return function(M, core)
     if cached and vim.deep_equal(cached.key, key) then
       return true, { entry_count = cached.entry_count,
         controlled_entry_count = cached.controlled_entry_count,
-        shader_compatibility_count = cached.shader_compatibility_count, changed = false }
+        shader_compatibility_count = cached.shader_compatibility_count, changed = false, original_changed = false }
     end
     RT.publication_cache = nil
 
@@ -245,7 +245,8 @@ return function(M, core)
 
     -- Reordering unique unchanged files only reprioritizes an existing queue.
     -- Keep its bytes/mtime; same-file variants retain order-sensitive comparison.
-    local changed = not same_publication(read_cdb(ctx.paths.semantic_cdb), merged)
+    local original_changed = not same_publication(read_cdb(ctx.paths.semantic_cdb), merged)
+    local changed = original_changed
     if changed then
       local ok, err = atomic_write_json(ctx.paths.semantic_cdb, merged)
       if not ok then return false, err end
@@ -301,6 +302,7 @@ return function(M, core)
       controlled_entry_count = controlled_count,
       shader_compatibility_count = shader_count,
       changed = changed,
+      original_changed = original_changed,
     }
   end
 end

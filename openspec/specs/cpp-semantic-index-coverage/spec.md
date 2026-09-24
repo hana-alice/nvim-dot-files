@@ -232,6 +232,13 @@ phase manifest SHALL 绑定独立原始 semantic CDB 的路径与内容。native
 - **AND** cancellation SHALL apply only to the matching unattached activation attempt; runtime state notifications and detached scalar snapshots SHALL convey no proof authority
 - **AND** recovery SHALL NOT poll, rewrite CDBs, save/discard documents, clear caches, force a full index or restart unrelated clients
 
+#### Scenario: Frozen publication changes while a document-blocked original reader is unchanged
+- **WHEN** a successful phase publication changes frozen products or their metadata but explicitly confirms that original commands are unchanged
+- **THEN** index delivery SHALL retain the sole initialized, attached original reader for that CDB when relevant documents are modified and an existing idle document-recovery registration is waiting for that same scope
+- **AND** retention SHALL inspect actual client commands and loaded document metadata, start no helper or restart timer, and leave restart debounce untouched; a corresponding frozen reader or ambiguous reader ownership SHALL prevent this optimization
+- **AND** clean documents, missing recovery ownership, unknown command-change status, changed original commands, pending source refresh and frozen-authority invalidation SHALL retain their existing delivery behavior
+- **AND** later document-clean events SHALL still invoke normal complete validation and scoped promotion; retaining an original reader SHALL grant no frozen authority or permission to alter unsaved text
+
 #### Scenario: Certifying a supported driver-query profile
 - **WHEN** a secondary proof explicitly supports a nonempty query-driver profile
 - **THEN** all original and candidate compiler runs SHALL use the same supported server profile, actual launch cwd and compiler environment

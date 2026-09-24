@@ -10,7 +10,7 @@ current / hot / full 三相受控 BackgroundIndex：模块记录/持久化（`_s
 manifest 与 coverage selector（`_generation`），交付就绪判定与 prepare 汇报口径（`_delivery`），
 compiler-authored UBT unity / exact fallback CDB 生成（`_build`），标准 clangd CDB 验证与幂等发布（`_publish`），
 phase 调度与交付 deadline（`_schedule`），通用宿主策略薄委派（`_admission` → `utils.host_admission`），
-readiness 磁盘自愈（`_recover`），以及只跟随 chosen manifest fingerprint 的 clangd 重启（`_clangd`）。
+readiness 磁盘自愈（`_recover`），以及结合实际发布变化和 reader/recovery 状态的 clangd 重启（`_clangd`）。
 
 ## 结构契约
 

@@ -17,6 +17,8 @@ hana-alice 的 Neovim 配置（公开镜像 `hana-alice/nvim`），定位为
 冻结激活的文档预检由 `lua/ue/index/batch_documents.lua` 读取缓冲区元数据，CDB 归属与
 证明权限和重验仍由 `batch_runtime.lua` 管理；`batch_recovery.lua` 监听文档清洁与客户端事件，
 经过冷却和完整验证后定向切换，验证期间保留原客户端；不会为了激活而保存或丢弃用户修改。
+发布结果区分原始命令变化与冻结产物变化；原始命令未变、相关文档仍脏且既有恢复协调器
+已等待时，交付保留唯一原始 reader，不消耗重启防抖。其余更新沿用既有校验/交付路径。
 
 LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨模块）+
 `lua/ue/`、`lua/utils/`、`lua/workarounds/`。

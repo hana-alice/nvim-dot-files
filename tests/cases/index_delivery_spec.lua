@@ -1279,6 +1279,7 @@ t.describe("受控 CDB 相同标准字段不触碰发布文件", function()
       local saved = {
         system = vim.system, restart = index.maybe_restart_clangd_for_index,
         queued = index.try_start_queued_build, publish = index.publish_semantic_cdb,
+        source_pending = index.source_refresh_pending, source_delivery = index.deliver_source_refresh,
         toolchain = index._rt.toolchain_identity_override, job = index._rt.job,
       }
       local root_key = ctx.engine_root .. "\31" .. ctx.project_root .. "\31test"
@@ -1299,8 +1300,11 @@ t.describe("受控 CDB 相同标准字段不触碰发布文件", function()
         index.update_index_selection(state, current, generation, "fresh")
         t.assert_true(index.publish_semantic_cdb(ctx, state, generation))
         local initial_bytes = read(ctx.paths.semantic_cdb)
-        local restarts, marker, pending = 0, "full-marker", nil
-        index.maybe_restart_clangd_for_index = function() restarts = restarts + 1 end
+        local restarts, marker, pending, restart_options = 0, "full-marker", nil, nil
+        index.maybe_restart_clangd_for_index = function(options)
+          restart_options = options
+          restarts = restarts + 1
+        end
         index.try_start_queued_build = function() end
         vim.system = function(command, _, callback)
           t.assert_contains(command[2], "build_full_cdb.py")
@@ -1327,18 +1331,40 @@ t.describe("受控 CDB 相同标准字段不触碰发布文件", function()
         entry.arguments[2] = "-DCHANGED=1"
         build()
         t.assert_eq(restarts, 1, "a changed selected workload must retain the restart path")
+        t.assert_eq(restart_options.context, ctx)
+        t.assert_true(restart_options.original_changed)
+
+        index.publish_semantic_cdb = function() return true, { changed = true, original_changed = false } end
+        marker = "frozen-only-marker"
+        build()
+        t.assert_eq(restarts, 2)
+        t.assert_eq(restart_options.context, ctx)
+        t.assert_false(restart_options.original_changed, "frozen-only changes reach the reader guard explicitly")
+
+        local source_deliveries = 0
+        index.source_refresh_pending = function() return true end
+        index.deliver_source_refresh = function(context)
+          t.assert_eq(context, ctx); source_deliveries = source_deliveries + 1
+        end
+        marker = "source-refresh-marker"
+        build()
+        t.assert_eq(source_deliveries, 1, "source refresh takes priority over retaining unchanged original commands")
+        t.assert_eq(restarts, 2)
+        index.source_refresh_pending = saved.source_pending
 
         index.publish_semantic_cdb = function() return true end
         marker = "another-full-marker"
         build()
-        t.assert_eq(restarts, 2, "legacy publisher stubs without changed retain the previous behavior")
+        t.assert_eq(restarts, 3, "legacy publisher stubs without changed retain the previous behavior")
+        t.assert_nil(restart_options.original_changed)
         build()
-        t.assert_eq(restarts, 2, "unchanged selection must not request a restart")
+        t.assert_eq(restarts, 3, "unchanged selection must not request a restart")
       end)
       vim.system = saved.system
       index.maybe_restart_clangd_for_index = saved.restart
       index.try_start_queued_build = saved.queued
       index.publish_semantic_cdb = saved.publish
+      index.source_refresh_pending, index.deliver_source_refresh = saved.source_pending, saved.source_delivery
       index._rt.toolchain_identity_override = saved.toolchain
       index._rt.job = saved.job
       index._rt.module_state[root_key], index._rt.contexts[root_key] = nil, nil

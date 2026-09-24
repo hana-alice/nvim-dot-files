@@ -67,9 +67,10 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 - `v1.12.8` → [docs/release_1.12.8.md](release_1.12.8.md) (padded search query cancellation; tag pending)
 - `v1.12.9` → [docs/release_1.12.9.md](release_1.12.9.md) (durable search overflow recovery; tag pending)
 - `v1.12.10` → [docs/release_1.12.10.md](release_1.12.10.md) (second qualified SuperUnity batch; tag pending)
+- `v1.12.11` → [docs/release_1.12.11.md](release_1.12.11.md) (retain document-blocked original readers; tag pending)
 
 ## Unreleased
 
-No unreleased entries. The second qualified SuperUnity batch and its measured
-acceptance limits are archived in [v1.12.10](release_1.12.10.md). Broader compression,
-whole-engine semantic index performance and search responsiveness remain open.
+No unreleased entries. Original-reader retention and its acceptance limits are
+archived in [v1.12.11](release_1.12.11.md). Broader compression, whole-engine index
+performance and search responsiveness remain open.

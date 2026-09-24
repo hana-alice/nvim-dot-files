@@ -526,27 +526,7 @@ local function load_persistent_dirty(owner)
   if state.persistent_dirty_loaded then return end
   state.persistent_dirty_loaded = true
   local p = persistent_dirty_path(state)
-  if not p then return end
-  local fd, _ = io.open(p, "r")
-  if not fd then return end
-  local content = fd:read("*a")
-  fd:close()
-  if not content or content == "" then return end
-  -- Two formats accepted:
-  --   1) JSON array of paths (preferred for atomic write/read)
-  --   2) Newline-separated paths (back-compat / hand-edit friendly)
-  local ok, decoded = pcall(vim.json.decode, content)
-  if ok and type(decoded) == "table" then
-    for _, abs in ipairs(decoded) do
-      if type(abs) == "string" and abs ~= "" then
-        state.persistent_dirty[abs:lower()] = abs
-      end
-    end
-  else
-    for line in content:gmatch("[^\r\n]+") do
-      state.persistent_dirty[line:lower()] = line
-    end
-  end
+  if p then dirty_save.merge_from_disk(state, p) end
 end
 
 local function collect_persistent_dirty(state, p)
@@ -579,16 +559,19 @@ local function collect_persistent_dirty(state, p)
     state.persistent_dirty = {}
     for _, abs in ipairs(arr) do state.persistent_dirty[abs:lower()] = abs end
     state._dirty_capped = true
+    state._dirty_overflow_at = math.max(state._dirty_overflow_at or 0, os.time())
     if not state._warned_dirty_capped then
       state._warned_dirty_capped = true
       -- Probe: cap-hit is the F2 signal the next session reads first.
       pcall(function()
-        require("utils.probe").record("dirty-set-flood", "cap-hit",
+        local probe = require("utils.probe")
+        probe.observe("dirty-set-flood", "durable-overflow-2026-09-24")
+        probe.record("dirty-set-flood", "cap-hit",
           { dropped = dropped, cap = PERSISTENT_DIRTY_CAP })
       end)
       vim.schedule(function()
-        log_warn(("dirty set hit cap=%d — %d oldest entries DROPPED; grep overlay is now lossy. "
-          .. "Run :UEPrepare (or :UEPrepareIncremental) to reindex and reset.")
+        log_warn(("dirty set hit cap=%d — %d entries DROPPED; search coverage is incomplete. "
+          .. "Run :UEBuildCsearch to rebuild the full search index.")
           :format(PERSISTENT_DIRTY_CAP, dropped))
       end)
     end
@@ -660,7 +643,7 @@ function M.remove_persistent_dirty(paths, reason, covered_before, remove_missing
     end
     if covered then remove[normalized:lower()] = true end
   end
-  if not next(remove) then return true end
+  if not next(remove) and not remove_missing then return true end
   local p = persistent_dirty_path()
   if not p then
     for key in pairs(remove) do state.persistent_dirty[key] = nil end
@@ -684,12 +667,20 @@ function M.remove_persistent_dirty(paths, reason, covered_before, remove_missing
     file_lock.release(lease)
     return false
   end
-  fd:write(vim.json.encode(arr))
-  fd:close()
+  local wrote_ok, wrote = pcall(fd.write, fd, vim.json.encode(arr))
+  local closed_ok, closed = pcall(fd.close, fd)
+  if not wrote_ok or not wrote or not closed_ok or not closed then
+    pcall(vim.fn.delete, tmp); file_lock.release(lease)
+    return false
+  end
   local replaced = vim.uv.fs_rename(tmp, p)
   if not replaced then pcall(vim.fn.delete, tmp) end
+  local cleared = true
+  if replaced and remove_missing and covered_before then
+    cleared = dirty_save.clear_overflow(state, p, covered_before)
+  end
   file_lock.release(lease)
-  if not replaced then return false end
+  if not replaced or not cleared then return false end
   state.persistent_dirty_loaded = true
   log_info(("persistent_dirty removed covered paths (reason=%s, remaining=%d)"):format(
     reason or "?", #arr))
@@ -714,10 +705,16 @@ function M.clear_persistent_dirty(reason)
         log_warn("cannot create dirty.json reset file: " .. tmp)
         return false
       end
-      fd:write("[]")
-      fd:close()
+      local wrote_ok, wrote = pcall(fd.write, fd, "[]")
+      local closed_ok, closed = pcall(fd.close, fd)
+      if not wrote_ok or not wrote or not closed_ok or not closed then
+        pcall(vim.fn.delete, tmp); file_lock.release(lease)
+        log_warn("cannot write dirty.json reset file")
+        return false
+      end
       local replaced, replace_err = vim.uv.fs_rename(tmp, p)
       if not replaced then pcall(vim.fn.delete, tmp) end
+      if replaced then replaced, replace_err = dirty_save.clear_overflow(state, p) end
       file_lock.release(lease)
       if not replaced then
         log_warn("cannot reset dirty.json: " .. tostring(replace_err))
@@ -733,6 +730,7 @@ function M.clear_persistent_dirty(reason)
   state._warned_dirty_high = false
   state._warned_dirty_capped = false
   state._dirty_capped = false
+  state._dirty_overflow_at = nil
   -- A successful prepare calls this after the new index is installed. Advance
   -- the change-event anchor so queued/pre-index metadata notifications cannot
   -- immediately repopulate the set that was just cleared.
@@ -744,6 +742,8 @@ end
 -- Public API: stats for :UEDirtyStatus.
 function M.persistent_dirty_status()
   load_persistent_dirty()
+  local p = persistent_dirty_path()
+  if p then dirty_save.merge_from_disk(state, p) end
   local n = 0
   for _ in pairs(state.persistent_dirty) do n = n + 1 end
   return {

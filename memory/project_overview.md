@@ -93,6 +93,8 @@ pre-iOS17 使用 legacy MobileDevice/debugserver bridge，失败不跨 backend�
 
 独立搜索构建：`:UEBuildCsearch` 由 `lua/ue/csearch_build.lua` 持有流程，`ue.lua` 只转发现有扫描和
 writer 接口；治理 spec 为 `ue-code-search`，回归 `csearch_build_guard` + `commands` + `ue_api`。
+Dirty 上限截断由 `utils/dirty_save.lua` 的同锁 `dirty.json.overflow` 标记跨实例保留；
+截断后的空集合仍 stale，增量命令转独立完整搜索重建，回归另含 `dirty_overflow`。
 
 | 区 | 入口 | 放什么 |
 |---|---|---|

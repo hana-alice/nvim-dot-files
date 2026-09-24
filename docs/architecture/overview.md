@@ -191,6 +191,10 @@
 | Neovim 内建 | shada、persistent undo、swap | 保持 Neovim 原生语义，不用 UE project selector 重定向 |
 | 纯诊断 | custom debug/grep/DAP trace、`nvim-dap` main/stdout/stderr logs | 全部按 PID 分文件；任一实例不会 truncate/rotate 另一实例 |
 
+Dirty 截断证据由 `utils/dirty_save.lua` 在同一 writer lease 下先写 `dirty.json.overflow`，
+再发布有界路径数组。状态与构建决策保留该证据，直到完整搜索 reset 覆盖其时间截止点；
+增量完成不得把截断后的空集合视为 fresh。原路径数组格式不变，旧 writer 不会擦掉旁路标记。
+
 ## 3. 平台与工作流分层（platform and workflow layers）
 
 平台相关功能按以下五层单向组合：

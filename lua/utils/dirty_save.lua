@@ -4,7 +4,59 @@ local file_lock = require("ue.file_lock")
 local M = {}
 local MAX_RETRIES = 8
 
+-- Keep the path array compatible with older readers. This loss marker shares
+-- its lease and is published BEFORE any truncated array can replace dirty.json.
+function M.merge_overflow(owner, path)
+  local marker = path .. ".overflow"
+  local fd = io.open(marker, "rb")
+  local stamp
+  if fd then
+    local content = fd:read(4096); fd:close()
+    local ok, data = pcall(vim.json.decode, content or "")
+    stamp = ok and type(data) == "table" and data.version == 1 and tonumber(data.overflow_at) or nil
+    if not stamp or stamp < 0 or stamp >= math.huge then stamp = math.huge end
+  else
+    local stat, err, code = vim.uv.fs_stat(marker)
+    if code == "ENOENT" then return end
+    if err or stat then stamp = math.huge else return end
+  end
+  owner._dirty_capped = true
+  owner._dirty_overflow_at = math.max(owner._dirty_overflow_at or 0, stamp)
+  return stamp
+end
+
+function M.persist_overflow(owner, path)
+  local recorded = M.merge_overflow(owner, path)
+  if not owner._dirty_capped then return true end
+  local stamp = owner._dirty_overflow_at or os.time()
+  owner._dirty_overflow_at = stamp
+  if recorded and recorded >= stamp then return true end
+  local marker = path .. ".overflow"
+  local tmp = marker .. (".tmp.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
+  local fd, err = io.open(tmp, "wb")
+  if not fd then return false, err end
+  local data = { version = 1, overflow_at = stamp < math.huge and stamp or nil }
+  local ok, wrote = pcall(fd.write, fd, vim.json.encode(data))
+  local closed_ok, closed = pcall(fd.close, fd)
+  local renamed, rename_err
+  if ok and wrote and closed_ok and closed then renamed, rename_err = vim.uv.fs_rename(tmp, marker) end
+  if not renamed then pcall(vim.fn.delete, tmp); return false, rename_err or "overflow marker write failed" end
+  return true
+end
+
+-- Caller holds the dirty lease and has already published covered-path removal.
+-- nil cutoff is the existing explicit manual-clear operation.
+function M.clear_overflow(owner, path, covered_before)
+  M.merge_overflow(owner, path)
+  if covered_before and (owner._dirty_overflow_at or math.huge) >= covered_before then return true end
+  local ok, err, code = vim.uv.fs_unlink(path .. ".overflow")
+  if not ok and code ~= "ENOENT" then return false, err end
+  owner._dirty_capped, owner._dirty_overflow_at, owner._warned_dirty_capped = false, nil, false
+  return true
+end
+
 function M.merge_from_disk(owner, path)
+  M.merge_overflow(owner, path)
   local fd = io.open(path, "rb")
   if not fd then return end
   local content = fd:read("*a")
@@ -16,6 +68,9 @@ function M.merge_from_disk(owner, path)
         owner.persistent_dirty[abs:lower()] = abs
       end
     end
+  else
+    -- Preserve the watcher's legacy newline-separated format on every merge.
+    for line in (content or ""):gmatch("[^\r\n]+") do owner.persistent_dirty[line:lower()] = line end
   end
 end
 
@@ -57,6 +112,12 @@ function M.save(owner, path, collect, on_saved, warn)
     return
   end
   local arr = collect()
+  local marked, marker_err = M.persist_overflow(owner, path)
+  if not marked then
+    file_lock.release(lease)
+    retry(owner, path, collect, on_saved, warn, "overflow marker: " .. tostring(marker_err))
+    return
+  end
   -- Atomic write: tmp + rename. Acquiring the lock created the parent directory.
   local tmp = path .. (".tmp.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
   local fd, err = io.open(tmp, "w")

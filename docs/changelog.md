@@ -65,9 +65,11 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 - `v1.12.6` → [docs/release_1.12.6.md](release_1.12.6.md) (modified-document preflight and clean demand recovery; tag pending)
 - `v1.12.7` → [docs/release_1.12.7.md](release_1.12.7.md) (automatic clean-document recovery; tag pending)
 - `v1.12.8` → [docs/release_1.12.8.md](release_1.12.8.md) (padded search query cancellation; tag pending)
+- `v1.12.9` → [docs/release_1.12.9.md](release_1.12.9.md) (durable search overflow recovery; tag pending)
 
 ## Unreleased
 
-No unreleased entries. Padded search query cancellation is archived in
-[v1.12.8](release_1.12.8.md), verified in the current editor and the full regression.
-Whole-engine performance acceptance remains open.
+No unreleased entries. Durable search overflow recovery is archived in
+[v1.12.9](release_1.12.9.md), verified by 2218/2218 regression tests and a completed
+current-engine search rebuild. Search responsiveness and whole-engine semantic
+index performance acceptance remain open.

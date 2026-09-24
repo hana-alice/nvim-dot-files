@@ -2312,7 +2312,7 @@ do
     local ok_watch, watch = pcall(require, "utils.ue_watch")
     if ok_watch and type(watch.persistent_dirty_status) == "function" then
       local st = watch.persistent_dirty_status() or {}
-      if (st.count or 0) > 0 then
+      if st.capped or (st.count or 0) > 0 then
         return "stale"
       end
     end
@@ -2563,16 +2563,8 @@ function CORE_RT.csearch_build_done()
   end
 end
 
--- Clear the watcher's persistent dirty set after a SUCCESSFUL full csearch
--- build (D9 / D-3b). Soft-requires ue_watch so this is safe to call from any
--- prepare path. Since β made the watcher a bookkeeper (not a writer), clearing
--- the dirty set on build success is now the prepare family's sole job — and it
--- MUST happen on EVERY full-build success path (cache fast-path / cold full /
--- sync), not just one. A residual dirty set otherwise (1) makes
--- prepare_freshness' dirty gate return "stale" right after a successful prepare,
--- and (2) makes the rg-on-dirty overlay re-grep a huge stale set on every
--- <leader>/ / <space><space> (picker lag). Only call on SUCCESS — a failed
--- build leaves the dirty set so the overlay keeps those files visible.
+-- Successful writers subtract only covered paths; explicit manual clear retains
+-- its separate API. Overflow acknowledgement additionally requires a full reset.
 function CORE_RT.clear_persistent_dirty_safe(reason, covered_paths, covered_before, remove_missing)
   local ok_watch, watch = pcall(require, "utils.ue_watch")
   if not ok_watch then return false end
@@ -2618,13 +2610,8 @@ function M._csearch_build_done_for_test() return CORE_RT.csearch_build_done() en
 function M._csearch_build_running_for_test() return CORE_RT.csearch_build_running end
 
 -- ── csearch smart incremental build (D11) ───────────────────────────────────
--- Every stale verdict used to trigger a FULL `-reset` rebuild (minutes on a UE
--- tree) even when the actual change was "3 files added". cindex natively
--- supports incremental `add` (re-index given paths, merge into the existing
--- idx) — what was missing is the DIFF: which files are new since the index was
--- last built. We record the exact absolute-path list fed to cindex on every
--- full-build success (snapshot at `<csearch_idx>.files`, per-platform since it
--- lives next to the idx — C5b) and diff against it on the next build.
+-- Diff the last published path snapshot against the current workspace list.
+-- Truncated dirty coverage requires reset even when the retained delta is empty.
 --
 -- Decision rules (pure, unit-tested via _csearch_build_mode_for_test):
 --   * forced / no snapshot        → reset  (no basis for a diff)
@@ -2654,6 +2641,7 @@ end
 function CORE_RT.csearch_build_mode(stats)
   stats = stats or {}
   if stats.forced then return "reset", "forced" end
+  if stats.dirty_capped then return "reset", "dirty coverage was truncated" end
   if not stats.has_snapshot then return "reset", "no snapshot of last indexed set" end
   if (stats.removed_n or 0) > 0 then
     return "reset", ("%d removals (cindex cannot delete)"):format(stats.removed_n)
@@ -2754,9 +2742,10 @@ function CORE_RT.csearch_smart_build(ctx, cs_ctx, abs_list, cb)
   end
   -- Watcher dirty files still present in the new set (modified existing files;
   -- drop entries that vanished — they show up as removals instead).
-  local dirty_in_set, dirty_seen = {}, {}
+  local dirty_in_set, dirty_seen, dirty_capped = {}, {}, false
   do
     local ok_watch, watch = pcall(require, "utils.ue_watch")
+    dirty_capped = ok_watch and watch.persistent_dirty_status and watch.persistent_dirty_status().capped or false
     if ok_watch and type(watch.snapshot_persistent_dirty) == "function" then
       for _, p in ipairs(watch.snapshot_persistent_dirty() or {}) do
         if new_list.set[p] and not dirty_seen[p] then
@@ -2781,6 +2770,7 @@ function CORE_RT.csearch_smart_build(ctx, cs_ctx, abs_list, cb)
     added_n      = #added,
     removed_n    = removed_n,
     dirty_n      = #dirty_in_set,
+    dirty_capped = dirty_capped,
     total_n      = new_list.n,
   })
 
@@ -2788,7 +2778,8 @@ function CORE_RT.csearch_smart_build(ctx, cs_ctx, abs_list, cb)
   -- session can verify the incremental path actually fires in daily use
   -- (report-first workflow — probe-feedback-loop spec #1).
   pcall(function()
-    require("utils.probe").record("csearch-smart-build", mode, why)
+    local probe = require("utils.probe")
+    probe.observe("csearch-smart-build", "durable-overflow-2026-09-24"); probe.record("csearch-smart-build", mode, why)
   end)
 
   if mode == "skip" then
@@ -9650,6 +9641,10 @@ function M.setup()
     if not ctx then vim.notify(err or "no ctx", vim.log.levels.WARN); return end
     local ok_watch, watch = pcall(require, "utils.ue_watch")
     if not ok_watch then vim.notify("ue_watch module missing", vim.log.levels.WARN); return end
+    if watch.persistent_dirty_status().capped then
+      vim.notify("Dirty coverage was truncated; rebuilding the full csearch index", vim.log.levels.INFO)
+      return M.build_csearch_async({ context = ctx })
+    end
     local dirty = (type(watch.snapshot_persistent_dirty) == "function")
       and watch.snapshot_persistent_dirty() or {}
     if #dirty == 0 then
@@ -9807,7 +9802,7 @@ function M.setup()
     local st = (watch.persistent_dirty_status and watch.persistent_dirty_status()) or { count = 0 }
     local lines = {
       ("UEDirty: %d files in cumulative dirty set"):format(st.count or 0),
-      ("  cap=%d  warn_at=%d"):format(st.cap or 0, st.warn_at or 0),
+      ("  cap=%d  warn_at=%d  incomplete=%s"):format(st.cap or 0, st.warn_at or 0, tostring(st.capped or false)),
       ("  path=%s"):format(st.path or "(unconfigured)"),
     }
     -- Also show the dirty_files.collect breakdown so the user can see what

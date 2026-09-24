@@ -238,30 +238,56 @@ MUST NOT 排队、MUST NOT 写锁文件。构建状态标志 SHALL 在构建完�
 - **WHEN** 触发全量（reset）csearch 构建且既有索引不可用
 - **THEN** 全量构建 SHALL 正常执行并重建一个可用索引
 
-### Requirement: 全量构建成功后持久化 dirty 集合归零
+### Requirement: 成功构建 SHALL 只移除已覆盖的持久化 dirty 记录
 
-系统在任一**全量** csearch 构建成功后 SHALL 清空 watcher 的 persistent dirty 集合
-（`clear_persistent_dirty`）。这适用于全量构建的所有成功路径（cache fast-path / cold full /
-sync），不只其中一条。
-
-理由：watcher 退回记账员后（单写者 β），「构建成功 ⇒ dirty 归零」的清理责任完全转移到 prepare
-家族。若任一全量路径漏清，残留的 dirty 集合会（1）让 `prepare_freshness` 的 dirty 闸门恒判
-`stale`——即便刚 prepare 完也弹「stale」提示；（2）让 rg-on-dirty overlay 每次 `<leader>/` /
-`<space><space>` 背着一个巨大的脏集合重复 grep，导致 picker 变卡。全量构建已索引整份文件清单
-（含所有脏文件），故脏集合在成功后逻辑上必须为空。
+所有 csearch 构建成功路径 SHALL 在共享 dirty writer lease 下重读并移除本次构建开始时
+捕获且已覆盖的路径。构建期间新增或再次修改的路径 MUST NOT 被清空；没有并发变化且全部
+已覆盖时，集合 SHALL 归零。失败构建 MUST NOT 确认 dirty 记录已覆盖。
 
 #### Scenario: 全量构建经缓存快速路径成功
 - **WHEN** `:UEPrepare` 走缓存快速路径并成功重建 csearch 索引
-- **THEN** 系统 SHALL 调用 `clear_persistent_dirty`
-- **AND** 此后 `prepare_freshness` 的 dirty 闸门 SHALL NOT 因残留 dirty 判 `stale`
+- **THEN** 系统 SHALL 移除已覆盖的构建前快照
+- **AND** 没有并发变化或未处置 overflow 时，freshness SHALL NOT 因已覆盖记录判 `stale`
 
 #### Scenario: 全量构建经冷路径 / 同步路径成功
 - **WHEN** `:UEPrepare` 走冷全量路径或同步路径并成功重建索引
-- **THEN** 系统 SHALL 同样调用 `clear_persistent_dirty`（清理责任在所有全量成功路径一致）
+- **THEN** 系统 SHALL 同样仅移除已覆盖快照，保留并发新增及构建开始后再次修改的路径
 
 #### Scenario: 全量构建失败
 - **WHEN** 全量 csearch 构建失败
-- **THEN** 系统 SHALL NOT 清空 dirty 集合（脏文件仍需在下次成功构建前由 overlay 兜底可见）
+- **THEN** 系统 SHALL NOT 清空 dirty 集合或确认其 overflow 已修复
+
+### Requirement: Dirty truncation SHALL remain visible until covered by a full reset
+
+Watcher dirty tracking SHALL retain its bounded path array. When truncation loses paths, it
+SHALL atomically publish a project-scoped `dirty.json.overflow` marker under the same dirty
+lease BEFORE publishing the truncated array. The marker SHALL retain the latest overflow
+time across writers. Marker publication failure SHALL preserve the previous array and use
+the existing bounded persistence retry. The path array SHALL remain readable by older clients.
+The marker SHALL survive normal saves, incremental removal, project switches and restarts.
+
+#### Scenario: Retained paths have all been incrementally indexed
+- **WHEN** retained dirty paths are empty but overflow remains
+- **THEN** dirty status SHALL remain capped and freshness SHALL remain stale
+- **AND** smart build SHALL choose reset, never add or skip
+- **AND** `UEPrepareIncremental` SHALL visibly route to the existing search-only full rebuild, without CDB generation or clangd restart
+
+#### Scenario: Another owner overflows during a full reset
+- **WHEN** full reset succeeds and covered-path removal is successfully published
+- **THEN** it MAY clear only overflow strictly older than the captured build-start time
+- **AND** same-second or newer overflow and concurrent unacknowledged paths SHALL remain
+- **AND** empty retained snapshots SHALL NOT prevent acknowledging a covered older overflow
+
+#### Scenario: Marker cannot be interpreted or cleared
+- **WHEN** a present marker is unreadable/malformed, or marker deletion fails
+- **THEN** status SHALL retain incomplete coverage rather than report fresh
+- **AND** automatic timestamp-based acknowledgement MUST NOT clear an unknown timestamp
+- **AND** the existing explicit manual dirty-clear operation MAY clear the marker under the same lease
+
+#### Scenario: Overflow repair is observed in later sessions
+- **WHEN** overflow or smart-build mode decisions are recorded
+- **THEN** the owner SHALL open a bounded observation for the durable-overflow repair revision
+- **AND** historical cap events SHALL NOT be declared recovered solely because the repair was installed
 
 ### Requirement: csearch freshness 用文件清单内容指纹判定（非 mtime 代理）
 

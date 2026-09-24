@@ -206,12 +206,12 @@ phase manifest SHALL 绑定独立原始 semantic CDB 的路径与内容。native
 - **AND** returned evidence SHALL be an independent copy, oversized fields SHALL be explicitly marked truncated, and logging failure MUST NOT delay revocation or suppress fallback; ordinary accepted/ignored events SHALL NOT accumulate a trace
 
 #### Scenario: A later startup retries an input-event invalidation
-- **WHEN** a normal startup requests the same publication and generation after an `input-changed`, `live-document-modified` or `live-document-changed` fallback
+- **WHEN** a normal startup requests the same publication and generation after an `input-changed`, `live-document-modified`, `live-document-changed` or unattached `activation-abandoned` fallback
 - **THEN** it MAY retry only after a 30-second monotonic cooldown and confirmed completion of the previous activation helpers; cancellation alone MUST NOT establish completion
 - **AND** relevant loaded documents SHALL be clean before retry; a clean buffer SHALL NOT substitute for fresh validation of the on-disk inputs
 - **AND** retry SHALL repeat description, watch readiness and full receipt validation before granting authority; concurrent requests SHALL share the attempt and later input events SHALL still revoke it
 - **AND** each configured frozen client SHALL bind to its activation attempt; a late client from an older attempt MUST NOT acquire the fresh guard merely because the publication stamp matches
-- **AND** elapsed time alone SHALL NOT launch helpers or restart clients; unchanged ready activations SHALL remain reusable without revalidation, and other failure reasons SHALL remain sticky for that publication
+- **AND** elapsed time without pending document recovery or a new startup request SHALL NOT launch helpers or restart clients; unchanged ready activations SHALL remain reusable without revalidation, and other failure reasons SHALL remain sticky for that publication
 
 #### Scenario: A loaded document already contains unsaved changes
 - **WHEN** a named, normal, loaded document is modified and is the requested buffer, already attached to a clangd client for the selected CDB, or admitted by the configured filetypes inside the selected engine/project roots
@@ -219,8 +219,18 @@ phase manifest SHALL 绑定独立原始 semantic CDB 的路径与内容。native
 - **AND** unrelated foreign, scratch and unsupported-filetype buffers SHALL NOT block merely because project selection is pinned; existing same-CDB attachments and explicit requests SHALL remain protected when their filetype changes
 - **AND** an already pending or ready activation SHALL revoke immediately when the document check detects an edit; description, watch installation after capability probing, validation, readiness, command-selection, process-configuration and attachment boundaries SHALL recheck documents so asynchronous edits cannot acquire frozen authority
 - **AND** late callbacks from cancelled description/probe work SHALL NOT replace the first document failure with a nonretryable failure; repeated dirty requests SHALL NOT extend the original cooldown or treat cancellation as helper completion
-- **AND** clearing a document SHALL NOT automatically launch work, save/discard any user text, or reuse invalid authority; later clean demand SHALL run the normal complete activation and preserve generation, profile, environment and attempt checks
+- **AND** clearing a document SHALL NOT save/discard any user text or reuse invalid authority; clean demand and the bounded document-recovery coordinator SHALL run the normal complete activation and preserve generation, profile, environment and attempt checks
 - **AND** document checks SHALL inspect loaded buffer metadata and existing ownership only, without reading source contents, scanning dependency trees or resolving a project separately for every buffer
+
+#### Scenario: Previously modified documents become clean while an original reader remains active
+- **WHEN** a registered document-blocked CDB scope receives a buffer or client lifecycle event and its relevant documents are clean
+- **THEN** an event-driven coordinator MAY revalidate after a 200ms settling delay, the existing retry cooldown and actual helper completion; an original reader attaching after the clean event SHALL also wake recovery
+- **AND** the coordinator SHALL retain at most eight canonical CDB scopes, one cancelable timer per scope and one automatic validation at a time; failed callbacks SHALL NOT release that serial slot before helpers exit, and cancelled timer callbacks SHALL NOT consume a newer timer
+- **AND** the original reader SHALL remain running throughout full validation; before one scoped restart the coordinator SHALL recheck the exact reader object, attachment, command/configuration, context, generation, publication, effective environment and clean documents
+- **AND** promotion SHALL respect ordinary restart debounce, reuse successful validation while waiting, and require a matching frozen client attachment within 15 seconds; an external matching attachment SHALL also cancel the pending restart
+- **AND** redirty, lost context or changed identity SHALL abandon the candidate; non-document failures SHALL disarm automatic recovery, and late callbacks SHALL NOT promote abandoned attempts
+- **AND** cancellation SHALL apply only to the matching unattached activation attempt; runtime state notifications and detached scalar snapshots SHALL convey no proof authority
+- **AND** recovery SHALL NOT poll, rewrite CDBs, save/discard documents, clear caches, force a full index or restart unrelated clients
 
 #### Scenario: Certifying a supported driver-query profile
 - **WHEN** a secondary proof explicitly supports a nonempty query-driver profile

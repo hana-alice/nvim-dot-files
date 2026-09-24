@@ -15,7 +15,8 @@ hana-alice 的 Neovim 配置（公开镜像 `hana-alice/nvim`），定位为
 项目/target 的 `batch-store.json` 可让正常 current/hot/full 复用指定证明目录，失效时保留原命令；
 契约见 `cpp-semantic-index-coverage`，被引用的回执及冻结资产须持续保留。
 冻结激活的文档预检由 `lua/ue/index/batch_documents.lua` 读取缓冲区元数据，CDB 归属与
-清洁后按需重验仍由 `batch_runtime.lua` 管理；不会为了激活而保存或丢弃用户修改。
+证明权限和重验仍由 `batch_runtime.lua` 管理；`batch_recovery.lua` 监听文档清洁与客户端事件，
+经过冷却和完整验证后定向切换，验证期间保留原客户端；不会为了激活而保存或丢弃用户修改。
 
 LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨模块）+
 `lua/ue/`、`lua/utils/`、`lua/workarounds/`。

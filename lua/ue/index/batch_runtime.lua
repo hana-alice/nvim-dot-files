@@ -4,6 +4,9 @@ local uv = vim.uv or vim.loop
 local platform = require("utils.platform")
 local fs = require("ue.core.fs")
 local documents = require("ue.index.batch_documents")
+local descriptor_helpers = require("ue.index.batch_descriptor")
+local path_list, prepare_local_cache, watch_sets = descriptor_helpers.path_list,
+  descriptor_helpers.prepare_local_cache, descriptor_helpers.watch_sets
 local records, verified_dirs = {}, {}
 local next_attempt = 0
 local recursive_capability, probe_waiters
@@ -356,7 +359,27 @@ local function now_ms(opts)
   return opts.now_ms and opts.now_ms() or uv.hrtime() / 1000000
 end
 
-local retryable = { ["input-changed"] = true, ["live-document-modified"] = true, ["live-document-changed"] = true }
+local function activation_snapshot(record)
+  if not record then return nil end
+  local result = { failed = record.failed == true, ready = record.phase == "ready" and ready(record) == true }
+  for _, field in ipairs({ "scope", "attempt", "stamp", "generation", "phase", "reason",
+    "pending_helpers", "retry_after", "verified" }) do
+    local value = record[field]
+    if type(value) == "string" or type(value) == "number" or type(value) == "boolean" then result[field] = value end
+  end
+  return result
+end
+
+local function notify_state(record)
+  if type(record.opts.on_state) == "function" then pcall(record.opts.on_state, activation_snapshot(record)) end
+end
+
+function M.activation(original)
+  return activation_snapshot(type(original) == "string" and original ~= "" and records[key(original)] or nil)
+end
+
+local retryable = { ["input-changed"] = true, ["live-document-modified"] = true,
+  ["live-document-changed"] = true, ["activation-abandoned"] = true }
 
 local function fallback(record, reason)
   if not record.failed and retryable[reason] then
@@ -370,6 +393,18 @@ local function fallback(record, reason)
   for _, client in pairs(record.clients) do clients[#clients + 1] = client end
   (record.opts.restart or scoped_restart)(clients, record.ctx)
   record.clients = {}
+  notify_state(record)
+end
+
+function M.cancel_activation(original, attempt)
+  local record = type(original) == "string" and original ~= "" and records[key(original)] or nil
+  if not record or record.attempt ~= attempt or record.failed or next(record.clients) ~= nil then return false end
+  if record.guard then record.guard:invalidate("activation-abandoned")
+  else
+    fallback(record, "activation-abandoned")
+    if record.cancel_describe then pcall(record.cancel_describe) end
+  end
+  return true
 end
 
 local function modified_document(bufnr, ctx, scope, config, opts)
@@ -429,51 +464,6 @@ local function filtered_watch(record, descriptor, backend)
       end
     end, options)
   end
-end
-
-local function path_list(value, required)
-  if value == nil then return not required end
-  if type(value) ~= "table" or not vim.islist(value) or (required and #value == 0) then return false end
-  for _, path in ipairs(value) do
-    if type(path) ~= "string" or not (path:match("^%a:[/\\]$") or fs.is_absolute_path(path)) then return false end
-  end
-  return true
-end
-
--- The first shard creates a local .cache tree beside the frozen database.
--- Prepare that owned tree before watching its parent; weakening ancestor
--- invalidation would also hide real directory replacement or metadata changes.
-local function prepare_local_cache(original, verified)
-  local parent = vim.fs.dirname(original)
-  local resolved = uv.fs_realpath(parent)
-  if not resolved or key(parent) ~= key(resolved) then return false end
-  local directory = vim.fs.joinpath(parent, "verified")
-  if key(verified) ~= key(vim.fs.joinpath(directory, "compile_commands.json")) then return false end
-  for _, part in ipairs({ "", ".cache", "clangd", "index" }) do
-    if part ~= "" then directory = vim.fs.joinpath(directory, part) end
-    local stat = uv.fs_lstat(directory)
-    if stat and stat.type ~= "directory" then return false end
-    if not stat and not uv.fs_mkdir(directory, 448) then return false end
-    local actual = uv.fs_realpath(directory)
-    if not actual or key(actual) ~= key(directory) then return false end
-  end
-  return true
-end
-
-local function watch_sets(descriptor)
-  local result = {}
-  if descriptor.directory_write_policy ~= nil and descriptor.directory_write_policy ~= "stable-directory-write-v1" then
-    return nil
-  end
-  result.directory_write_policy = descriptor.directory_write_policy
-  for _, field in ipairs({ "watch_roots", "lookup_roots", "watched_files", "input_roots", "exclude_roots" }) do
-    if not path_list(descriptor[field], field == "watch_roots" or field == "watched_files" or field == "input_roots") then
-      return nil
-    end
-    result[field] = {}
-    for _, path in ipairs(descriptor[field] or {}) do result[field][key(path)] = true end
-  end
-  return result
 end
 
 --- Resolve metadata asynchronously before root_dir starts any new clangd.
@@ -545,6 +535,7 @@ function M.prepare(bufnr, root, on_dir, opts)
       finished = true
       record.pending_helpers = record.pending_helpers - 1
       callback(result)
+      notify_state(record)
     end
     local ok, cancel = pcall(execute, path, executable, mode, completed, request)
     if not ok then
@@ -638,6 +629,7 @@ function M.prepare(bufnr, root, on_dir, opts)
           if not current() then record.guard:invalidate("activation-metadata-changed"); return end
           record.phase = "ready"
           verified_dirs[key(vim.fs.dirname(record.verified))] = record
+          notify_state(record)
           flush(record)
         end,
         on_invalidated = function(reason, guard)
@@ -784,6 +776,7 @@ function M.attach(client, bufnr)
       record.autocmds[#record.autocmds + 1] = id
     end
   end
+  return true
 end
 
 function M._reset_for_test()

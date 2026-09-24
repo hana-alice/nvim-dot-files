@@ -17,6 +17,13 @@ local function write(path, content)
   vim.fn.writefile({ content or "{}" }, path)
 end
 
+local function assert_no_target_temps(path)
+  local prefix = vim.fs.basename(path) .. ".tmp."
+  for name in vim.fs.dir(vim.fs.dirname(path)) do
+    t.assert_false(name:sub(1, #prefix) == prefix, "temporary target publication remains: " .. name)
+  end
+end
+
 local function child_lua(code)
   return vim.system({
     vim.v.progpath,
@@ -485,37 +492,148 @@ t.describe("multi-instance project state", function()
     pcall(vim.fn.delete, root, "rf")
   end)
 
-  t.it("persisted target platform and configuration never tear across writers", function()
+  t.it("concurrent target writers preserve atomic pairs and report each native publication outcome", function()
     local root = tmpdir()
     local engine = root .. "/engine"
     local project = root .. "/Project"
     local uproject = project .. "/Game.uproject"
     write(uproject)
+    local state = require("ue.project_state")
+    state._reset_for_test()
+    assert(state.select(engine, project, uproject, { persist_default = false }))
+    assert(state.update_target(engine, "PriorPlatform", "PriorConfig"))
+    local target = state.project_cache_root(engine) .. "/state-fields/target-selection.json"
     local jobs = {}
     for index = 1, 8 do
-      local code = string.format(
-        "local s=require(%q); assert(s.select(%q,%q,%q,{persist_default=false})); assert(s.update_target(%q,%q,%q))",
-        "ue.project_state", engine, project, uproject, engine, "Platform" .. index, "Config" .. index
-      )
+      local code = string.format([=[
+        local s=require('ue.project_state')
+        local engine,project,uproject,root,target,index=%q,%q,%q,%q,%q,%d
+        assert(s.select(engine,project,uproject,{persist_default=false}))
+        vim.fn.writefile({'ready'},root..'/ready-'..index)
+        assert(vim.wait(10000,function() return vim.fn.filereadable(root..'/start')==1 end,5))
+        local rename,native=vim.uv.fs_rename,{}
+        vim.uv.fs_rename=function(from,to,...)
+          local ok,err,code=rename(from,to,...)
+          if to==target then native[#native+1]={ok=ok==true,error=err or vim.NIL,code=code or vim.NIL} end
+          return ok,err,code
+        end
+        local ok,err=s.update_target(engine,'Platform'..index,'Config'..index)
+        vim.uv.fs_rename=rename
+        vim.fn.writefile({'done'},root..'/done-'..index)
+        assert(vim.wait(10000,function() return vim.fn.filereadable(root..'/read')==1 end,5))
+        local current=s.read(engine)
+        vim.fn.writefile({vim.json.encode({index=index,pid=vim.fn.getpid(),ok=ok,error=err or vim.NIL,
+          native=native,platform=current.target_platform,configuration=current.target_configuration})},
+          root..'/result-'..index..'.json')
+      ]=], engine, project, uproject, root, target, index)
       jobs[index] = vim.system({
         vim.v.progpath, "--headless", "-u", "NONE", "-i", "NONE",
         "--cmd", "set rtp+=" .. vim.fn.stdpath("config"),
         "-c", "lua " .. code, "-c", "qa!",
       }, { text = true })
     end
-    for _, job in ipairs(jobs) do
-      local result = job:wait()
-      t.assert_eq(result.code, 0, result.stderr)
-      t.assert_eq(vim.trim(result.stderr or ""), "", result.stderr)
-    end
+    -- Native replacement can fail under contention. Observe its actual return
+    -- without substituting filesystem results or serializing the eight writers.
+    local ready = vim.wait(10000, function()
+      for index = 1, 8 do if vim.fn.filereadable(root .. "/ready-" .. index) ~= 1 then return false end end
+      return true
+    end, 5)
+    write(root .. "/start")
+    local finished = vim.wait(10000, function()
+      for index = 1, 8 do if vim.fn.filereadable(root .. "/done-" .. index) ~= 1 then return false end end
+      return true
+    end, 5)
+    write(root .. "/read")
+    local results = {}
+    for index, job in ipairs(jobs) do results[index] = job:wait(15000) end
+    local ok, err = pcall(function()
+      t.assert_true(ready, "all eight native writers must finish selection before their shared start")
+      t.assert_true(finished, "all eight publication attempts must finish before local-state reads")
+      local successes = {}
+      for index, result in ipairs(results) do
+        t.assert_eq(result.code, 0, result.stderr)
+        t.assert_eq(vim.trim(result.stderr or ""), "", result.stderr)
+        local report = vim.json.decode(table.concat(vim.fn.readfile(root .. "/result-" .. index .. ".json"), "\n"))
+        t.assert_eq(report.index, index)
+        t.assert_eq(#report.native, 1, "exactly one authoritative replacement attempt per writer")
+        local native = report.native[1]
+        t.assert_eq(report.ok, native.ok, "API success must match the actual authoritative rename")
+        if native.ok then
+          t.assert_eq(report.error, vim.NIL)
+          t.assert_eq(report.platform, "Platform" .. index)
+          t.assert_eq(report.configuration, "Config" .. index)
+          successes[report.pid] = report
+        else
+          t.assert_true(native.code == "EPERM" or native.code == "EACCES",
+            "unexpected native publication failure: " .. tostring(native.error))
+          t.assert_eq(report.error, native.error, "the actual permission error must propagate unchanged")
+          t.assert_eq(report.platform, "PriorPlatform", "failed publication must preserve process-local selection")
+          t.assert_eq(report.configuration, "PriorConfig")
+        end
+      end
+      t.assert_true(next(successes) ~= nil, "at least one native writer must publish successfully")
+      local persisted = vim.json.decode(table.concat(vim.fn.readfile(target), "\n"))
+      local winner = successes[persisted.writer_pid]
+      t.assert_type(winner, "table", "final publication must identify a successful writer")
+      t.assert_eq(persisted.target_platform, winner.platform)
+      t.assert_eq(persisted.target_configuration, winner.configuration, "target pair must belong to that same writer")
+      assert_no_target_temps(target)
+    end)
+    pcall(vim.fn.delete, root, "rf")
+    if not ok then error(err) end
+  end)
+
+  t.it("a native held target reader preserves atomic publication or reports sharing failure without changing local state", function()
+    local root = tmpdir()
+    local engine, project = root .. "/engine", root .. "/Project"
     local state = require("ue.project_state")
     state._reset_for_test()
-    assert(state.select(engine, project, uproject, { persist_default = false }))
-    local persisted = state.read(engine)
-    local p_index = persisted.target_platform:match("(%d+)$")
-    local c_index = persisted.target_configuration:match("(%d+)$")
-    t.assert_eq(p_index, c_index, "target pair was torn across processes")
+    local handle, path
+    local ok, err = pcall(function()
+      assert(state.select(engine, project, project .. "/Game.uproject", { persist_default = false }))
+      assert(state.update_target(engine, "BeforePlatform", "BeforeConfig"))
+      path = state.project_cache_root(engine) .. "/state-fields/target-selection.json"
+      handle = assert(io.open(path, "rb"))
+      local before = handle:read("*a")
+      assert(handle:seek("set", 0))
+      local updated, update_err = state.update_target(engine, "DuringPlatform", "DuringConfig")
+      local published = vim.json.decode(table.concat(vim.fn.readfile(path), "\n"))
+      local local_state = state.read(engine)
+      t.assert_eq(handle:read("*a"), before, "held reader must retain its complete original version")
+      if updated then
+        t.assert_eq(published.target_platform, "DuringPlatform")
+        t.assert_eq(published.target_configuration, "DuringConfig")
+        t.assert_eq(local_state.target_platform, "DuringPlatform")
+        t.assert_eq(local_state.target_configuration, "DuringConfig")
+      else
+        t.assert_true(type(update_err) == "string"
+          and (update_err:match("^EPERM:") ~= nil or update_err:match("^EACCES:") ~= nil),
+          "only a native permission/sharing failure is permitted: " .. tostring(update_err))
+        t.assert_eq(table.concat(vim.fn.readfile(path), "\n"), before)
+        t.assert_eq(published.target_platform, "BeforePlatform")
+        t.assert_eq(published.target_configuration, "BeforeConfig")
+        t.assert_eq(local_state.target_platform, "BeforePlatform")
+        t.assert_eq(local_state.target_configuration, "BeforeConfig")
+      end
+      assert_no_target_temps(path)
+    end)
+    if handle then
+      local closed, close_err = handle:close()
+      if ok and not closed then ok, err = false, close_err end
+    end
+    if ok then
+      ok, err = pcall(function()
+        assert(state.update_target(engine, "AfterPlatform", "AfterConfig"))
+        local published = vim.json.decode(table.concat(vim.fn.readfile(path), "\n"))
+        t.assert_eq(published.target_platform, "AfterPlatform")
+        t.assert_eq(published.target_configuration, "AfterConfig")
+        t.assert_eq(state.read(engine).target_platform, "AfterPlatform")
+        t.assert_eq(state.read(engine).target_configuration, "AfterConfig")
+        assert_no_target_temps(path)
+      end)
+    end
     pcall(vim.fn.delete, root, "rf")
+    if not ok then error(err) end
   end)
 
   t.it("cross-process lease rejects a second live writer and recovers after release", function()

@@ -1,0 +1,35 @@
+# hana-alice/nvim 1.12.11 — Keep unchanged original readers during blocked frozen delivery
+
+> 日期：2026-09-24
+> 类型：Patch；减少冻结发布触发的无效原始 reader 重启。
+> Git tag：未创建，未获 tag 授权。
+
+### 2026-09-24 — Preserve a document-blocked original reader after frozen-only publication
+
+**Task**
+- The second qualified batch changed frozen products while original commands stayed identical. Delivery restarted the original reader, then dirty-document preflight selected original commands again. The observed original-reader memory footprint in [1.12.10](release_1.12.10.md) remains a separate resource issue.
+
+**Implemented**
+- Publisher reports `original_changed` independently of total product changes, including explicit false on unchanged cached publication. Build completion forwards that fact and its context to the existing restart coordinator; source refresh retains priority.
+- Retain only the sole initialized, attached original reader for an absolute, unambiguous canonical CDB directory when relevant documents are modified and an existing idle recovery registration is waiting for that scope. Duplicate/mixed/relative command-directory options or indeterminate client scope disable this optimization.
+- Retention precedes restart debounce and adds no timer/helper. Changed or unknown original commands, clean documents, missing recovery, ambiguous/frozen readers and explicit frozen invalidation retain their previous delivery paths. The original recovery owner still performs full validation and scoped promotion after documents become clean.
+- Reuse document predicates and recovery status; no new dependency or owner was introduced. Synchronize `cpp-semantic-index-coverage`, subsystem guidance, architecture and knowledge-base pointers. Proof policy and the two qualified secondary groups remain unchanged.
+
+**Validation**
+- Original code reproduced retention failures **22/24**, publication **19/20**, and build-delivery **95/96**. Final focused scopes: retention **34/34**, publication **20/20**, delivery **96/96**, recovery **20/20** — **170/170**.
+- A real recovery-owner fixture retains its dirty original reader, receives a changed publication stamp, then waits for clean documents, description and full validation before one scoped promotion. Source-refresh priority, true command changes, frozen invalidation, legacy publisher behavior and conservative ownership fallbacks are covered.
+- Eight changed Lua files passed AST lint. Spec consistency: synchronized the frozen-only publication scenario; strict governing-spec validation passed. Project-state runtime behavior is unchanged and its existing atomic-publication/failure contract remains authoritative.
+- Initial required-native full regression: **2253/2254**. The sole failure repeated the earlier concurrent target-state `EPERM`; all new retention cases passed. A separate native experiment in `io/uv/uv/io` order showed held readers rejecting atomic replacement **4/4**, with old bytes intact; fresh replacements after handle closure succeeded **4/4**. Switching the reader API alone is therefore not a demonstrated fix, and the exact historical blocking handle remains unknown.
+- Correction: separating initialization reads with a start barrier still failed **26/27**, so reader overlap does not sufficiently explain the concurrent failure. A native-only experiment at the matching Temp/nested destination produced **13 successful replacements and 11 EPERM failures out of 24**, with complete final pairs in all three rounds, without `project_state` or target readers during writes. The historical blocking actor remains unknown; no antivirus attribution is established.
+- The concurrent target-pair test now checks all eight process completions and records each unmodified native rename result. Each API outcome must match its one actual publication attempt; only real permission failures are permitted. Successful writers retain their own session pair, failed writers retain their prior pair, and the final disk pair/PID must belong to a successful writer with no temporary residue. A separate real held-reader case checks both host outcomes and a fresh operation after closure. This replaces an unsupported all-writers-must-succeed assumption, without skipping atomicity coverage, injecting filesystem success, adding retries or changing project-state runtime.
+- Final state-scope regression passed **27/27** in three sequential runs. Exact-directory iteration checks temporary-file cleanup, avoiding the known Windows short-path glob blind spot.
+- Final required-native full regression: **2255/2255**, zero failures/skips. This includes the actual native outcome checks; it does not mean the host's permission failures disappeared.
+- Before installation, the live client independently changed **33 → 34**, while all seven products and the modified document remained unchanged; current/hot phases also completed during that interval. The restart's caller was not captured, so it is not attributed to this patch or a particular actor.
+- Installed the three loaders with their reviewed byte hashes using the existing index core/RT/dependencies. Runtime/recovery owner identities, client configuration/attachments, buffer/window metadata and product stat snapshots remained equal across installation. External hashes confirmed all seven products and the unsaved document's exact hash/tick remained unchanged.
+- Three instrumented calls exercised the real retention guard against live client **34** configuration/attachments, actual documents and recovery status, with stop/start/timer effects intercepted. Each returned no restart and no delay in **0.2175 / 0.2645 / 0.1838ms**; all effect counters were zero and debounce was unchanged. This is live guard coverage, not a naturally changed-publication end-to-end observation.
+- Normal live full generation/publication completed **50.69s**, ready, with the full-run counter **6 → 7**, no remaining job/timer, client **34** unchanged, and identical bytes/mtimes for all seven products. The unsaved document and runtime owners remained unchanged. Coverage remains **14312 source members / 2094 shader records**, original **1206 native commands**, frozen **1197 = 984 UBT + 2 secondary + 211 exact**. This is repeat generation/publication time, not index completion time or proof of whole-engine performance restoration.
+- Final archived-document structure **78/78** and `git diff --check` passed.
+
+**Follow-ups**
+- Broader qualified compression, a healthy historical whole-engine baseline, cold/warm completion, CPU/peak memory, first/repeat prepare and sustained editing acceptance remain open. Retaining a reader does not reduce its existing memory footprint or authorize frozen input while documents remain modified.
+- A later naturally changed frozen publication still needs long-session observation. Historical navigation/reparse issues, search latency and the previously observed target-state `EPERM` remain separate unresolved work; this patch does not modify their mechanisms or claim them resolved.

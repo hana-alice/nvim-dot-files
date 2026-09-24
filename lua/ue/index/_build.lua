@@ -683,7 +683,9 @@ M.build_phase_async = function(ctx, phase)
         if selection and promoted and source_pending then
           M.deliver_source_refresh(ctx, selected_keys)
         elseif selection_changed and promoted and publication_changed then
-          M.maybe_restart_clangd_for_index()
+          local restart_options = { context = ctx }
+          if type(publication) == "table" then restart_options.original_changed = publication.original_changed end
+          M.maybe_restart_clangd_for_index(restart_options)
         end
         if not (selection and promoted) then
           -- Artifacts were produced but delivery did not complete

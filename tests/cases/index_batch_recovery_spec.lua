@@ -166,6 +166,42 @@ local function fixture(body)
 end
 
 t.describe("document-driven frozen batch recovery", function()
+  t.it("retains a dirty original across publication then fully validates the new frozen view before promotion", function()
+    fixture(function(h)
+      h.edit(); h.prepare()
+      local recovery = require("ue.index.batch_recovery")
+      local saved_status = recovery.status
+      recovery.status = function() return h.owner:status() end
+      local state = { last_restart_at = 99, restart_debounce_s = 10 }
+      local index = {}
+      require("ue.index._clangd")(index, { RT = state, h = { unix_now = function() return 100 end } })
+      local ok, err = pcall(function()
+        local restarted, delay = index.maybe_restart_clangd_for_index({
+          context = h.ctx, original_changed = false,
+          defer_fn = function() error("retaining the reader must not schedule a restart") end,
+        })
+        t.assert_false(restarted); t.assert_nil(delay)
+        t.assert_eq(state.last_restart_at, 99)
+        t.assert_eq(#h.calls, 0); t.assert_eq(#h.restarts, 0)
+        t.assert_false(h.original.stopped); t.assert_true(vim.bo[h.buffer].modified)
+      end)
+      recovery.status = saved_status
+      if not ok then error(err) end
+      h.stamp = "publication-b"
+      h.descriptor.info_sha256 = "info-b"
+      h.clean(); h.advance(200)
+      t.assert_eq(#h.calls, 1); t.assert_eq(h.calls[1].mode, "describe")
+      t.assert_false(h.original.stopped)
+      h.calls[1].callback(vim.deepcopy(h.descriptor)); h.flush()
+      t.assert_eq(#h.calls, 2); t.assert_eq(h.calls[2].mode, "validate")
+      t.assert_eq(#h.restarts, 0)
+      h.validate(); h.advance(200)
+      t.assert_eq(#h.restarts, 1); t.assert_eq(#h.restarts[1], 1)
+      t.assert_eq(h.restarts[1][1], h.original)
+      t.assert_true(runtime.activation(h.ctx.paths.semantic_cdb).ready)
+    end)
+  end)
+
   t.it("keeps the original reader alive through clean validation then restarts only that reader", function()
     fixture(function(h)
       local other = { id = 102, name = "clangd", initialized = true, attached_buffers = { [h.buffer] = true },

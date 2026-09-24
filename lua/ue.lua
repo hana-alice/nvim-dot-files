@@ -5649,13 +5649,13 @@ function M.cached_grep(opts)
                 -- IMPORTANT: do NOT compare against finder_ctx.filter —
                 -- snacks captures the filter REFERENCE at finder start
                 -- and never updates it for this finder. Compare against
-                -- the LIVE picker input value instead.
+                -- the LIVE input with Snacks' same trim normalization instead.
                 local cur = nil
                 local p = finder_ctx and finder_ctx.picker
                 if p and p.input and p.input.filter then
                   cur = p.input.filter.search
                 end
-                if cur ~= nil and cur ~= pattern then
+                if cur ~= nil and trim(cur) ~= pattern then
                   watchdog_killed = true
                   trace("WATCHDOG kill pat=%q new=%q recv=%d",
                     pattern, tostring(cur), items_received)
@@ -5716,7 +5716,7 @@ function M.cached_grep(opts)
                 cur_search = p.input.filter.search
               end
             end
-            if cur_search ~= nil and cur_search ~= pattern then
+            if cur_search ~= nil and trim(cur_search) ~= pattern then
               trace("ABORT pat=%q new=%q tick=%d elapsed=%dms recv=%d emit=%d pending=%d",
                 pattern, tostring(cur_search), tick_count, elapsed,
                 items_received, items_emitted, pending_len - read_idx + 1)
@@ -5766,7 +5766,7 @@ function M.cached_grep(opts)
               final_cur = p.input.filter.search
             end
           end
-          local aborted = (final_cur ~= nil and final_cur ~= pattern)
+          local aborted = (final_cur ~= nil and trim(final_cur) ~= pattern)
 
           if not aborted then
             flush_file_group()

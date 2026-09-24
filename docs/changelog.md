@@ -66,10 +66,10 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 - `v1.12.7` → [docs/release_1.12.7.md](release_1.12.7.md) (automatic clean-document recovery; tag pending)
 - `v1.12.8` → [docs/release_1.12.8.md](release_1.12.8.md) (padded search query cancellation; tag pending)
 - `v1.12.9` → [docs/release_1.12.9.md](release_1.12.9.md) (durable search overflow recovery; tag pending)
+- `v1.12.10` → [docs/release_1.12.10.md](release_1.12.10.md) (second qualified SuperUnity batch; tag pending)
 
 ## Unreleased
 
-No unreleased entries. Durable search overflow recovery is archived in
-[v1.12.9](release_1.12.9.md), verified by 2218/2218 regression tests and a completed
-current-engine search rebuild. Search responsiveness and whole-engine semantic
-index performance acceptance remain open.
+No unreleased entries. The second qualified SuperUnity batch and its measured
+acceptance limits are archived in [v1.12.10](release_1.12.10.md). Broader compression,
+whole-engine semantic index performance and search responsiveness remain open.

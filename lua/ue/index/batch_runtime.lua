@@ -5,6 +5,7 @@ local platform = require("utils.platform")
 local fs = require("ue.core.fs")
 local documents = require("ue.index.batch_documents")
 local descriptor_helpers = require("ue.index.batch_descriptor")
+local shard_seed = require("ue.index.batch_shard_seed")
 local path_list, prepare_local_cache, watch_sets = descriptor_helpers.path_list,
   descriptor_helpers.prepare_local_cache, descriptor_helpers.watch_sets
 local records, verified_dirs = {}, {}
@@ -645,17 +646,22 @@ function M.prepare(bufnr, root, on_dir, opts)
         end,
       })
     end
-    local probe = opts.probe_recursive or probe_recursive
-    probe(function(capable)
+    local function start_probe()
       if record.failed or record.phase ~= "probing" then return end
-      if not current() or not capable then reject("recursive-watch-unavailable"); return end
-      if #(descriptor.lookup_roots or {}) == 0 then begin_watching(); return end
-      (opts.probe_direct or probe_direct)(function(direct)
+      local probe = opts.probe_recursive or probe_recursive
+      probe(function(capable)
         if record.failed or record.phase ~= "probing" then return end
-        if not direct then reject("direct-watch-unavailable"); return end
-        begin_watching()
+        if not current() or not capable then reject("recursive-watch-unavailable"); return end
+        if #(descriptor.lookup_roots or {}) == 0 then begin_watching(); return end
+        (opts.probe_direct or probe_direct)(function(direct)
+          if record.failed or record.phase ~= "probing" then return end
+          if not direct then reject("direct-watch-unavailable"); return end
+          begin_watching()
+        end)
       end)
-    end)
+    end
+    -- Add-only seeding precedes watches and never grants authority.
+    shard_seed.before(record, original, descriptor.verified_cdb, opts.seed_async, start_probe)
   end
   local ok, cancel = pcall(run, info, clangd, "describe", described, request)
   if not ok then reject("activation-helper-unavailable") end

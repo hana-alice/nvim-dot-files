@@ -53,6 +53,7 @@ local SPAWN_AUDIT = {
   { p="lua/ue/index/_build.lua", api="vim.system", a="vim.system(cmd, {", class="deferrable", reason="controlled index child admitted by scheduler", guard="admit_background_phase", gp="lua/ue/index/_schedule.lua" },
   { p="lua/ue/index/_generation.lua", api="vim.system", a="vim.system({ path,", class="short", reason="cached bounded toolchain identity probe" },
   { p="lua/ue/index/batch_runtime.lua", api="vim.system", a="local handle = vim.system(command", class="interactive", reason="bounded asynchronous clangd startup receipt verification", guard="task_registry" },
+  { p="lua/ue/index/batch_shard_seed.lua", api="vim.system", a="local handle = vim.system(command", class="interactive", reason="bounded one-time add-only frozen shard-cache seed before startup watches", guard="task_registry" },
   { p="lua/ue/target_tasks.lua", api="vim.system", a="pcall(vim.system, command", class="foreground", reason="operation metadata classifies explicit task", guard="is_foreground_operation" },
   { p="lua/ue/workflows/android/install.lua", api="jobstart", a="pcall(d.jobstart, install_cmd", class="foreground", reason="explicit APK install", guard="foreground_begin" },
   { p="lua/ue/workflows/android/launch.lua", api="jobstart", a="pcall(deps.jobstart, prepared.command", class="interactive", reason="short explicit app launch" },

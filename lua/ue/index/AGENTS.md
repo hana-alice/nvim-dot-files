@@ -46,6 +46,11 @@ readiness 磁盘自愈（`_recover`），以及结合实际发布变化和 reade
   `owner_pid` 使其跨进程可 falsify；prepare 的完成汇报 MUST 经 `_delivery` 陈述 index 真实状态，
   MUST NOT 在构建中/失败时暗示语义层已就绪（用户不应被要求记住平台专属索引命令）。
 
+- **冻结 shard 缓存播种只增不改**：`batch_shard_seed.lua` 仅在冻结缓存无 `*.idx` 时，
+  于 watch probe 前把原缓存缺失 shard 硬链接/独占复制进去；MUST NOT 改写/删除任一侧已有 shard，
+  结果 MUST NOT 影响冻结权威。前提是 clangd 按源路径寻址 shard、只按内容 digest 判过期、
+  temp+rename 写回——升级 clangd 时须重新核对这三点。
+
 ## 宪法级坑（权威在 ../../../docs/CONSTRAINTS.md）
 
 - clangd 固定 `--enable-config=false`；不得恢复 `.clangd` `External.File`、`--index-file`

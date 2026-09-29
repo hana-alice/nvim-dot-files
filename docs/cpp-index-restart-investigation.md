@@ -1166,3 +1166,64 @@ client30、0 guard watches；用户修改未保存也未丢弃。这不是目录
 端到端恢复。首次正常发布触发 client **32 → 33**，未保存文档使它继续使用 original
 reader；重复生成保持七份产物字节/mtime 与 client **33** 不变。完整成本、CPU/内存、
 失败证据、回归门禁及剩余项见 [v1.12.10](release_1.12.10.md)。全工程性能仍未验收。
+
+## 2026-09-29：冻结 shard 缓存从原缓存播种（首次冻结激活冷索引的根因与修复）
+
+**现象**：9/23 首次冻结激活把约 33k 个保留 TU 冷重建进独立的 `verified/.cache/clangd/index`，
+尽管原 background-cdb 缓存（37,375 shard）已经是热的。这是"prepare 之后 indexing 很久"的主要来源。
+
+**机制（源码闭环）**：clangd 22.1.5 release/22.x `Background.cpp` / `BackgroundIndexLoader.cpp` /
+`BackgroundIndexStorage.cpp`：
+- shard 路径 = `<cdbdir>/.cache/clangd/index/<basename>.<hex(digest(FilePath))>.idx`，按**源路径**寻址；
+- `shardIsStale` 只比较文件内容 digest，**不比较编译命令**；`loadProject` 装载全部 shard，只调度有过期依赖的 TU；
+- `storeShard` 走 `llvm::writeToOutput`（`.temp-stream-%%%%%%` 临时文件 + rename），所以硬链接播种的 shard 不会被原地改写。
+- `tools/clangd_batch_activation.py::_coverage` 已证明每条非 batch 冻结条目的 `_command_key` 等于某条原条目，故原 shard 对保留 TU 语义有效；batch TU 路径全新，无 shard，正常索引。
+
+**实测（Client Android-Test，C: 盘副本）**：
+
+| 场景 | wall | CPU | 峰值内存 | 备注 |
+|---|---|---|---|---|
+| 冷冻结激活 | 1713.6 s | 12,937 CPU s | 11.9 GB | |
+| 原 CDB 热重启 | 35.8 s | 34 s | 4.55 GB | |
+| 播种后冻结激活 | 42.3 s | 47.9 s | 5.34 GB | 仅重索引 4 个 TU（2 个 SuperUnity.Batch + trigger + 1） |
+
+播种本身：37,342 shard，`os.link` 9.48 s，`copyfile` 45.87 s。
+
+**等价性核对**：播种缓存 vs 冷建缓存——26,543 个 shard 字节相同；6,472 个仅在 header shard 的
+refs/rela/symb/stri 上不同，归因于 header shard"最后写入者"非确定性（两边并集字符串约 955 vs 999）。
+这一归因为**推测，未完全闭环**；源 shard 的 `cmdl`（108 参数）与当前原 CDB（97 参数）不同也说明原缓存本身就由旧命令构建，clangd 对此不敏感。
+
+**修复**：`tools/clangd_shard_seed.py` + `lua/ue/index/batch_shard_seed.lua`，在 `batch_runtime` 的
+`prepare_local_cache` 之后、watch probe 之前，仅当冻结缓存无 `*.idx` 且原缓存有 shard 时执行一次 add-only 播种；
+结果不授予也不撤销冻结权威。spec：`cpp-semantic-index-coverage` 场景 "A new frozen shard cache is seeded from the original cache"。
+
+**更正（留底）**：此前提出的 priority A/B（EcoQoS 降优先级导致慢）假设经对照实测**被证伪**，不是提速杠杆。
+
+**仍未解决 / 后续杠杆**：
+- wrapper 名为 `SuperUnity.UBT.<sha(members,context,kind,args)>.cpp`，命令/flag 变化产生新 TU 路径 → 相应 TU 全量重索引（9/22 重写 31,475 shard 属正当原因）；
+- 冻结失效来源包括仓库内 `.omx` receipts、工具脚本与 Intermediate 时间戳；失效回落原 CDB 是热的（≈34 s）；
+- 当前 live `verified` 缓存已在 9/23 冷建完成，本次播种只惠及今后新建的 verified 目录/新 generation；
+- 更多真实 L1 二次合并仍属 C11 后续迭代。
+
+### Headless 端到端实测（真实 `batch_runtime.prepare`，隔离副本）
+
+环境：把 live `background-cdb` 的 `compile_commands.json`、`verified/compile_commands.json`、`.cache` 复制到
+工作区外临时目录（`batches.json` 的 original/verified 指向副本，receipts 仍指向仓库
+`.omx` proof assets），`verified/.cache` 清空；`nvim --headless -u NONE -l activate.lua` 调用真实
+`runtime.prepare`，clangd 22.1.5，`-j=12`，`config.cmd_env` 取 receipt 认证的 `PATH/PATHEXT`。
+
+| 阶段 | 结果 |
+|---|---|
+| 首次运行（未设 cmd_env） | `compiler-environment-changed`，播种未执行——headless 进程 PATH 缺 mason/bin 前缀；真实 nvim 会带，属测试环境差异 |
+| 播种（设 cmd_env 后） | `linked=37,339 copied=0`，11.8 s（hardlink，同卷 C:），activation 总耗时 29.0 s |
+| 冻结校验 | `receipt-input-or-asset-changed` → 不激活，`runtime.command` 保持原 CDB（安全回落） |
+| clangd 在播种后的 verified 目录上索引（warm.py） | 54.2 s wall / 56.4 CPU s / 峰值 5.35 GB，仅 4 个 TU 进度（batch/trigger），0 编译失败，37,342 shard |
+
+对照：同一 verified 冷建 1713.6 s / 12,937 CPU s / 11.9 GB → 播种后 54.2 s / 56.4 CPU s（约 31× wall、229× CPU）。
+
+**校验失败根因（已闭环）**：逐项复核 receipt 两份，dependencies/assets 的 sha 与 file_identity 全部一致，唯一不一致为
+inventory 根（某项目插件的 `Intermediate/Build/Win64/UE4Editor/Development/<Plugin>` 目录）的目录名单哈希
+（`3bdcec79…` → `d454ae03…`）；该目录 2026-09-28 13:49–14:02 有 Win64 Editor 构建写入（`*.suppressed.exp/.lib`、`LiveCodingInfo.json` 等）。
+inventory 只哈希文件名/类型/链接，所以新增文件即失效。由于 live 使用同一组 receipt 文件，**推测** live 的冻结激活当前同样失效并回落原 CDB，
+直到下次 prepare 重建 proof；未在 live nvim 上验证（按约束不触碰 live clangd）。这说明：Intermediate 中与 Android 目标无关的 Win64 产物也会使冻结失效，
+是"冻结失效来源"杠杆的实例证据。

@@ -48,6 +48,27 @@ t.describe("platform: 驱动接口契约", function()
 end)
 
 t.describe("platform: host tool 解析", function()
+  t.it("direct Git launcher candidates belong only to the Windows driver", function()
+    local windows = require("utils.platform.windows")
+    t.assert_type(windows.git_binary_candidates, "function")
+    for _, id in ipairs({ "macos", "linux", "stub" }) do
+      t.assert_nil(require("utils.platform." .. id).git_binary_candidates)
+    end
+    local candidates = windows.git_binary_candidates()
+    local found = vim.fn.exepath("git")
+    if found == "" then
+      t.assert_eq(candidates[1], "git")
+    else
+      found = vim.uv.fs_realpath(found) or found
+      local root = vim.fs.dirname(vim.fs.dirname(found))
+      t.assert_eq(candidates[1], root .. "/mingw64/bin/git.exe")
+      t.assert_eq(candidates[2], root .. "/mingw32/bin/git.exe")
+      t.assert_eq(candidates[3], found)
+      local resolved = require("utils.platform").resolve_tool({ name = "git", driver = windows, driver_candidates = candidates })
+      t.assert_true(resolved.ok)
+      t.assert_eq(vim.fn.executable(resolved.path), 1)
+    end
+  end)
   t.it("environment spelling and directory links belong to host capabilities", function()
     local windows = require("utils.platform.windows")
     t.assert_eq(windows.environment_key("Path"), "PATH")

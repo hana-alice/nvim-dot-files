@@ -4,12 +4,6 @@ local Item = require("trouble.item")
 ---@type trouble.Source
 local M = {}
 
-local git_state = {
-  by_root = {},
-}
-
-local GIT_REFRESH_INTERVAL_MS = 1000
-
 local function git_root()
   if _G.LazyVim and LazyVim.root then
     local ok_git, root = pcall(LazyVim.root.git)
@@ -39,121 +33,6 @@ local function relpath(path, root)
     end
   end
   return rel ~= "" and rel or vim.fn.fnamemodify(path, ":t")
-end
-
-local function git_info_item(root, text, kind)
-  return Item.new({
-    source = "ue_sidebar",
-    filename = root,
-    pos = { 1, 0 },
-    text = text,
-    item = {
-      kind = kind or "info",
-    },
-  })
-end
-
-local function git_state_for(root)
-  git_state.by_root[root] = git_state.by_root[root] or {
-    items = {},
-    loaded = false,
-    loading = false,
-    updated_at = 0,
-    error = nil,
-    force_refresh = false,
-  }
-  return git_state.by_root[root]
-end
-
-local function parse_git_status_items(root, stdout)
-  local items = {} ---@type trouble.Item[]
-  local records = vim.split(stdout or "", "\0", { plain = true, trimempty = true })
-  local index = 1
-  while index <= #records do
-    local line = records[index]
-    local status = line:sub(1, 2)
-    -- Porcelain -z emits the literal destination path, then a separate
-    -- original-path record for renames/copies. Never trim or unquote paths.
-    local target = line:sub(4)
-    index = index + (status:find("[RC]") and 2 or 1)
-    local filename = vim.fs.joinpath(root, target)
-    local bufnr = vim.fn.bufadd(filename)
-    items[#items + 1] = Item.new({
-      source = "ue_sidebar",
-      buf = bufnr,
-      filename = filename,
-      pos = { 1, 0 },
-      text = string.format("[%s] %s", status, relpath(filename, root)),
-      item = {
-        kind = "git_status",
-        status = status,
-      },
-    })
-  end
-
-  Item.add_id(items, { "text" })
-  return items
-end
-
-local function git_display_items(root)
-  local cache = git_state_for(root)
-  local items = {} ---@type trouble.Item[]
-
-  if cache.loading then
-    items[#items + 1] = git_info_item(root, "Updating git status...", "git_loading")
-  elseif cache.error then
-    items[#items + 1] = git_info_item(root, "Git status failed: " .. cache.error, "git_error")
-  end
-
-  vim.list_extend(items, cache.items)
-  Item.add_id(items, { "text" })
-  return items
-end
-
-local function refresh_git_sidebar()
-  local ok, trouble = pcall(require, "trouble")
-  if ok and trouble.is_open("ue_sidebar_git_status") then
-    trouble.refresh("ue_sidebar_git_status")
-  end
-end
-
-local function start_git_refresh(root, force)
-  local cache = git_state_for(root)
-  local now = vim.uv.now()
-  if cache.loading then
-    return
-  end
-  if not force and cache.loaded and (now - (cache.updated_at or 0) < GIT_REFRESH_INTERVAL_MS) then
-    return
-  end
-
-  cache.loading = true
-  cache.error = nil
-  cache.force_refresh = false
-
-  local cmd = { "git", "-C", root, "status", "--porcelain=v1", "-z", "--untracked-files=no" }
-  vim.system(cmd, { text = false }, function(result)
-    vim.schedule(function()
-      cache.items = result.code == 0 and parse_git_status_items(root, result.stdout) or {}
-      cache.loading = false
-      cache.loaded = true
-      cache.updated_at = vim.uv.now()
-      local err = vim.trim(result.stderr or ""):gsub("%s+", " ")
-      if #cache.items > 0 or result.code == 0 then
-        cache.error = nil
-      else
-        cache.error = err ~= "" and err or "git status failed"
-      end
-      refresh_git_sidebar()
-    end)
-  end)
-end
-
-function M.request_refresh(kind)
-  if kind ~= "git_status" then
-    return
-  end
-  git_state_for(git_root()).force_refresh = true
 end
 
 local function buffer_items()
@@ -247,12 +126,6 @@ local function todo_items(cb)
 end
 
 M.get = {
-  git_status = function(cb)
-    local root = git_root()
-    local cache = git_state_for(root)
-    start_git_refresh(root, cache.force_refresh or not cache.loaded)
-    cb(git_display_items(root))
-  end,
   buffers = function(cb)
     cb(buffer_items())
   end,

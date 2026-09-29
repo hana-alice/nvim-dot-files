@@ -69,8 +69,30 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 - `v1.12.10` → [docs/release_1.12.10.md](release_1.12.10.md) (second qualified SuperUnity batch; tag pending)
 - `v1.12.11` → [docs/release_1.12.11.md](release_1.12.11.md) (retain document-blocked original readers; tag pending)
 
+- `v2.0.0` → [docs/release_2.0.0.md](release_2.0.0.md) (CodeDiff default review; Diffview retained; tag pending)
+
 ## Unreleased
 
-No unreleased entries. Original-reader retention and its acceptance limits are
+### 2026-09-29 — 归档统一 Git 审阅 change
+
+**Task**
+- 按用户指令完成 CodeDiff 工作的 spec 同步核对、归档与提交推送流程。
+
+**Implemented**
+- 将完整 change 移至 `openspec/changes/archive/2026-09-29-unify-git-review-with-codediff/`，保留 21 项任务及交付证据。
+- 更新 `docs/release_2.0.0.md` 的归档路径和授权状态。
+
+**Pitfalls / Gotchas**
+- 其他 SuperUnity change 保留原状；tag 未包含在本次授权中。
+
+**Validation**
+- Spec 一致性：三个主规格与 delta 的 10 个 requirement 块逐段一致；change 与三个主规格严格校验通过。
+- 归档后提交前 required-native 全量复验 **2338/2338**，0 failed、0 skipped；命令为 `NVIM_TEST_REQUIRE_NATIVE=1 nvim --headless -l tests/run.lua`。
+- 21 个相关 Lua 文件通过 AST lint；暂存差异通过 `git diff --cached --check`。
+
+**Follow-ups**
+- 跨平台和 GUI 验证边界沿用 [v2.0.0 交付记录](release_2.0.0.md)。
+
+Original-reader retention and its acceptance limits are
 archived in [v1.12.11](release_1.12.11.md). Broader compression, whole-engine index
 performance and search responsiveness remain open.

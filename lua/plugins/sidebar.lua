@@ -12,11 +12,6 @@ return {
       end
 
       opts.modes = vim.tbl_deep_extend("force", opts.modes or {}, {
-        ue_sidebar_git_status = sidebar_mode({
-          desc = "Sidebar git status",
-          source = "ue_sidebar.git_status",
-          format = "{text}",
-        }),
         ue_sidebar_buffers = sidebar_mode({
           desc = "Sidebar buffers",
           source = "ue_sidebar.buffers",

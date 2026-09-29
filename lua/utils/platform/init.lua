@@ -74,6 +74,7 @@ M.is_linux   = M.id == "linux"
 ---@field mixed_eol_guard? fun(): boolean Windows-only fileformat capability
 ---@field treesitter_compiler_bin? fun(): string Windows-only parser compiler path
 ---@field windows_ui_config? fun(): boolean Windows-only UI configuration capability
+---@field git_binary_candidates? fun(): string[] Windows-only direct Git candidates before the command launcher
 ---@field restart_fallback_candidates? fun(cwd: string, env: table): table[]
 ---@field restart_requires_spawn_reprobe? fun(): boolean
 ---@field restart_shutdown_delay_ms? fun(): integer

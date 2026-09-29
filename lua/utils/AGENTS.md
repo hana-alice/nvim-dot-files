@@ -37,6 +37,8 @@
 - 改 `code_search/**` / `ue_paths.lua` → `ue_goto_behavior` `ue_paths` `utils`
 - 改 `platform/**` → `platform`（另见子目录 `AGENTS.md`）
 - 改被广泛复用的 helper（如 `log`、`ue_paths`）→ 提交前全量
+- 改 `git_review.lua` Git 路由/搜索/会话交接 → `git_review` `review_editor` `keymaps`
+  `cheatsheet` `workarounds` `smoke`；`git_review` 前缀覆盖各能力切片。
 
 ## 先读
 
@@ -47,3 +49,5 @@
 `../../openspec/specs/task-management/spec.md`、
 `../../openspec/specs/global-android-device-selection/spec.md`、
 `../../openspec/specs/notification-history/spec.md`。
+Git 路由/查询/会话交接另遵循 `../../openspec/specs/git-review-workspace/spec.md`；
+不能以调度回调或夹具通过代替真实大仓性能证据。

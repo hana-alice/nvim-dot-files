@@ -18,7 +18,8 @@ fail-closed 语义），禁止注入假可执行文件/假宿主让断言「碰�
 | 改动位置 | 最小必跑 filter |
 |---|---|
 | `lua/config/keymaps.lua` / 命令定义 | `keymaps` `commands` `review_editor` |
-| picker 交互 / Git sidebar / 插件工具链策略 | `review_editor` `smoke` |
+| picker 交互 / sidebar / 插件工具链策略 | `review_editor` `smoke` |
+| Git 审阅路由 / Git 插件接线 / `lua/workarounds/codediff/**` | `git_review` `review_editor` `keymaps` `cheatsheet` `workarounds` `smoke` |
 | CI bootstrap / workflow / legacy smoke | `review_ci` + 全量 + legacy smoke |
 | `lua/utils/ue_watch.lua` / `dirty_save.lua` | `ue_watch_csearch` `multi_instance_state` `stability` |
 | `lua/utils/window_title.lua` | `window_title` `keymaps` `commands` `cheatsheet` |
@@ -189,6 +190,7 @@ tests/
 | **options** | options_spec | 关键 option 取值 |
 | **autocmd/filetype** | autocmds_spec | usf→hlsl、cindent、commentstring |
 | **workarounds** | workarounds_spec | 注册表完整性 + frontmatter |
+| **Git 审阅** | git_review*_spec | 完整文件/路径覆盖、`-G` 搜索、ref/历史、Neogit 交接、hunk/index 数据保护、大树节点与格式一致；安装插件夹具与纯接线测试分别报告，不能代替真实大仓性能实测 |
 | **utils 纯函数** | fs_proc/ue_paths/ue_goto_behavior | 输入→输出行为断言 |
 | **稳定性** | stability_spec | 幂等 + 状态隔离 |
 

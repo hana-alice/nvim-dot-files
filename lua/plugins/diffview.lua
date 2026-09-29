@@ -4,16 +4,8 @@
 -- diff / 3-way merge is painful inline. Diffview opens a dedicated tab with
 -- a file panel + side-by-side editors, like the GitHub PR view.
 --
--- Keymap policy (user rule): all git keys live under <leader>g, single-level only.
--- LazyVim already occupies: gb gB gc gd gD ge gf gg gG gh* gi gI gl gL go gp gP
---                           gr gs gS gY
--- Free letters used here:   gv gV gm gM gn
---
--- Companion plugins:
---   * fugitive.lua          — :Gedit :0, :Git blame, :Gclog (commit→qf)
---   * advanced_git_search   — content/branch/commit pickers (telescope)
---   * gitsigns              — inline hunks + GitLens-style blame virt text
---   * neogit                — full status panel (<leader>gn)
+-- Optional specialist: gv/gV and visual gv stay here. Default review,
+-- history/ref pickers and Neogit use CodeDiff via utils.git_review.
 return {
   {
     "sindrets/diffview.nvim",
@@ -26,9 +18,7 @@ return {
       "DiffviewRefresh",
     },
     keys = {
-      -- All git keymaps go through utils.git_async.launch so the UI
-      -- never blocks while diffview spins up + git log/diff runs.
-      -- See lua/utils/git_async.lua for the contract.
+      -- Keep the existing launch/notification wrapper for optional Diffview.
       {
         "<leader>gv",
         function()
@@ -41,61 +31,24 @@ return {
       },
       { "<leader>gV", "<cmd>DiffviewClose<cr>", desc = "Diffview: close" },
       {
-        "<leader>gm",
-        function()
-          require("utils.git_async").launch({
-            name = "Diffview: this file history",
-            run  = function() vim.cmd("DiffviewFileHistory %") end,
-          })
-        end,
-        desc = "Diffview: this file history",
-      },
-      {
-        "<leader>gM",
-        function()
-          require("utils.git_async").launch({
-            name = "Diffview: branch history",
-            run  = function() vim.cmd("DiffviewFileHistory") end,
-          })
-        end,
-        desc = "Diffview: branch history",
-      },
-      {
         "<leader>gv",
         function()
+          -- Visual marks describe the previous completed selection until Esc.
+          local anchor, cursor = vim.fn.line("v"), vim.fn.line(".")
+          local first, last = math.min(anchor, cursor), math.max(anchor, cursor)
+          local win, buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
+          vim.cmd.normal({ args = { vim.api.nvim_replace_termcodes("<Esc>", true, false, true) }, bang = true })
           require("utils.git_async").launch({
             name = "Diffview: selection history",
-            run  = function() vim.cmd("'<,'>DiffviewFileHistory") end,
+            run  = function()
+              -- The deferred launcher must not interpret this range in another file.
+              if vim.api.nvim_get_current_win() ~= win or vim.api.nvim_get_current_buf() ~= buf then return end
+              vim.cmd(first .. "," .. last .. "DiffviewFileHistory")
+            end,
           })
         end,
         desc = "Diffview: selection history",
         mode = "v",
-      },
-      -- Range / arbitrary refs. Prompt is synchronous (user input);
-      -- the actual diff dispatch goes through git_async.
-      {
-        "<leader>gr",
-        function()
-          require("utils.git_async").prompt_cmd(
-            "Diffview range",
-            "Diffview range (e.g. main..HEAD or HEAD~3..HEAD): ",
-            "HEAD~1..HEAD",
-            function(input) return "DiffviewOpen " .. input end
-          )()
-        end,
-        desc = "Diffview: arbitrary range",
-      },
-      {
-        "<leader>gk",
-        function()
-          require("utils.git_async").prompt_cmd(
-            "Diffview commit",
-            "Diffview single commit (rev): ",
-            "HEAD",
-            function(input) return "DiffviewOpen " .. input .. "^!" end
-          )()
-        end,
-        desc = "Diffview: single commit",
       },
     },
     opts = function()
@@ -179,7 +132,7 @@ return {
             { "n", "k", actions.prev_entry, { desc = "Prev file (no open)" } },
             -- Stash / refresh
             { "n", "R", actions.refresh_files, { desc = "Refresh files" } },
-            -- Toggle stage hunk on selected file (replicates Neogit's `s`).
+            -- Toggle staging for the selected whole file.
             { "n", "s", actions.toggle_stage_entry, { desc = "Stage / unstage file" } },
           },
           file_history_panel = {

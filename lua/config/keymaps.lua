@@ -284,7 +284,7 @@ map("n", "<leader>uW", "<cmd>WindowTitle<cr>", { desc = "UI: Name window title" 
 map("n", "<leader>va", sidebar_pick, { desc = "Sidebar: Choose view" })
 map("n", "<leader>vv", sidebar_toggle(), { desc = "Sidebar: Toggle last view" })
 map("n", "<leader>vb", sidebar_toggle("buffers"), { desc = "Sidebar: Buffers" })
-map("n", "<leader>vg", sidebar_toggle("git_status"), { desc = "Sidebar: Git modified files" })
+map("n", "<leader>vg", sidebar_toggle("git_status"), { desc = "CodeDiff: review changes" })
 map("n", "<leader>vs", sidebar_toggle("symbols"), { desc = "Sidebar: File symbols" })
 map("n", "<leader>vd", sidebar_toggle("diagnostics"), { desc = "Sidebar: Diagnostics" })
 map("n", "<leader>vq", sidebar_toggle("qflist"), { desc = "Sidebar: Pinned results" })
@@ -426,3 +426,4 @@ map("n", "<leader>ui", "<cmd>UEInstall<cr>", { desc = "UE: Install for active ta
 -- this file before VimEnter, and waiting for another VeryLazy would leave the
 -- prefix-sensitive mappings absent for the rest of that session.
 apply_ue_runtime_overrides()
+require("utils.git_review").setup_keymaps()

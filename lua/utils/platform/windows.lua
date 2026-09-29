@@ -70,6 +70,16 @@ function M.path_key(path)
   return tostring(path or ""):lower()
 end
 
+-- cmd/git.exe is a launcher; direct Git lets the owner cancel the process it
+-- spawned. The shared resolver still probes every candidate before using it.
+function M.git_binary_candidates()
+  local found = vim.fn.exepath("git")
+  if found == "" then return { "git" } end
+  found = vim.uv.fs_realpath(found) or found
+  local root = vim.fs.dirname(vim.fs.dirname(found))
+  return { root .. "/mingw64/bin/git.exe", root .. "/mingw32/bin/git.exe", found }
+end
+
 function M.query_driver_globs()
   return { "**/clang*.exe", "**/clang*", "**/gcc", "**/g++", "**/cc", "**/c++", "**/cl.exe" }
 end

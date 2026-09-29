@@ -61,68 +61,157 @@ t.describe("review_editor: interaction regressions", function()
     ]])
   end)
 
-  t.it("git sidebar preserves literal paths and consumes rename source records", function()
+  t.it("Git aliases delegate without opening or refreshing a Trouble Git view", function()
     child([[
-      package.loaded['trouble.item'] = { new = function(x) return x end, add_id = function() end }
-      package.loaded['trouble'] = { is_open = function() return false end }
-      local names = {'foo bar.cpp', 'new -> name.cpp', 'unicode-中文.cpp'}
-      local command
-      vim.system = function(cmd, opts, cb)
-        command = cmd
-        cb({code = 0, stdout = ' M ' .. names[1] .. '\0R  ' .. names[2]
-          .. '\0old name.cpp\0 M ' .. names[3] .. '\0', stderr = ''})
+      local opened = 0
+      package.loaded['utils.git_review'] = {open = function() opened = opened + 1 end}
+      package.loaded.trouble = {
+        is_open = function() return false end,
+        close = function() error('Git action must not close other sidebar views') end,
+        open = function() error('Git action must not open a Trouble view') end,
+        refresh = function() error('Git action must not refresh a Trouble view') end,
+      }
+      local sidebar = require('utils.sidebar')
+      for _, alias in ipairs({'git_status', 'git', 'modified'}) do
+        sidebar.open(alias)
+        sidebar.toggle(alias)
       end
+      vim.wait(30)
+      assert(opened == 6, tostring(opened))
+      assert(not sidebar.is_open('git_status') and not sidebar.is_any_open())
+      local opts = dofile(vim.fn.getcwd() .. '/lua/plugins/sidebar.lua')[1].opts(nil, {})
+      assert(opts.modes.ue_sidebar_git_status == nil)
+      package.loaded['trouble.item'] = {new = function(item) return item end, add_id = function() end}
       local source = require('trouble.sources.ue_sidebar')
-      source.get.git_status(function() end)
-      vim.wait(20)
-      assert(vim.tbl_contains(command, '-z'), 'porcelain must use NUL paths')
-      source.get.git_status(function(items)
-        assert(#items == #names, vim.inspect(items))
-        for i, name in ipairs(names) do
-          assert(items[i].filename == vim.fs.joinpath(vim.uv.cwd(), name), vim.inspect(items[i]))
-        end
-      end)
+      assert(source.get.git_status == nil and source.request_refresh == nil)
       print('EDITOR_REVIEW_OK')
     ]])
   end)
 
-  t.it("git sidebar reads real porcelain output for spaced and Unicode filenames", function()
+  t.it("Git menu action closes its picker and preserves the last non-Git sidebar", function()
     child([[
-      local root = vim.fs.normalize(vim.fn.tempname() .. '-review-editor')
-      vim.fn.mkdir(root, 'p')
-      local owned_root = vim.uv.fs_realpath(root)
-      local ok, err = pcall(function()
-        local function git(args)
-          local cmd = {'git', '-C', root}
-          vim.list_extend(cmd, args)
-          local result = vim.system(cmd, {text = true}):wait(5000)
-          assert(result.code == 0, result.stderr)
-        end
-        git({'init', '-q'})
-        local names = {'foo bar.cpp', 'new name.cpp', 'unicode-中文.cpp'}
-        for _, name in ipairs(names) do
-          vim.fn.writefile({'int value;'}, root .. '/' .. name)
-          git({'add', '--', name})
-        end
-        package.loaded['trouble.item'] = {new = function(x) return x end, add_id = function() end}
-        package.loaded['trouble'] = {is_open = function() return false end}
-        _G.LazyVim = {root = {git = function() return root end}}
-        local source = require('trouble.sources.ue_sidebar')
-        local items
-        source.get.git_status(function() end)
-        assert(vim.wait(5000, function()
-          source.get.git_status(function(value) items = value end)
-          return items and #items == 3 and items[1].item.kind == 'git_status'
-        end, 20), vim.inspect(items))
-        local found = {}
-        for _, item in ipairs(items) do found[item.filename] = true end
-        for _, name in ipairs(names) do
-          assert(found[vim.fs.joinpath(root, name)], vim.inspect(items))
-        end
+      local active, opened
+      package.loaded.trouble = {
+        is_open = function(mode) return active == mode end,
+        close = function() active = nil end,
+        open = function(mode) active = mode end,
+      }
+      package.loaded['utils.git_review'] = {open = function()
+        opened = true
+        assert(vim.bo.filetype ~= 'ue-sidebar-picker', 'review must use original buffer context')
+      end}
+      local sidebar = require('utils.sidebar')
+      sidebar.open('todo')
+      assert(vim.wait(1000, function() return sidebar.is_open('todo') end, 10))
+      sidebar.pick()
+      local menu = vim.api.nvim_get_current_buf()
+      assert(table.concat(vim.api.nvim_buf_get_lines(menu, 0, -1, false), '\n'):find('Git Review', 1, true))
+      vim.fn.maparg('1', 'n', false, true).callback()
+      assert(opened and not vim.api.nvim_buf_is_valid(menu))
+      assert(sidebar.is_open('todo'), 'Git action must preserve unrelated sidebar')
+      sidebar.close()
+      sidebar.toggle()
+      assert(vim.wait(1000, function() return sidebar.is_open('todo') end, 10))
+      sidebar.close()
+      sidebar.open('buffers')
+      sidebar.open('git')
+      vim.wait(30)
+      assert(not sidebar.is_any_open(), 'Git action must cancel a queued sidebar transition')
+      print('EDITOR_REVIEW_OK')
+    ]])
+  end)
+end)
+
+t.describe("review_editor: non-Git sidebar preservation", function()
+  t.it("all six sidebar modes preserve configuration, switching and toggle", function()
+    child([[
+      local kinds = {'buffers', 'symbols', 'diagnostics', 'qflist', 'loclist', 'todo'}
+      local active, opened = {}, {}
+      package.loaded.trouble = {
+        is_open = function(mode) return active[mode] == true end,
+        close = function(mode) active[mode] = nil end,
+        open = function(mode) active[mode] = true; opened[#opened + 1] = mode end,
+      }
+      local opts = dofile(vim.fn.getcwd() .. '/lua/plugins/sidebar.lua')[1].opts(nil, {})
+      local sidebar = require('utils.sidebar')
+      for _, kind in ipairs(kinds) do
+        local mode = 'ue_sidebar_' .. kind
+        local config = assert(opts.modes[mode], kind)
+        assert(config.focus and config.open_no_results and config.warn_no_results == false)
+        assert(config.win.position == 'left' and config.win.size == 40)
+        assert(config.source == 'ue_sidebar.' .. kind or config.mode == kind)
+        sidebar.open(kind)
+        assert(vim.wait(1000, function() return sidebar.is_open(kind) end, 10), kind)
+        assert(vim.tbl_count(active) == 1, vim.inspect(active))
+        sidebar.toggle()
+        assert(not sidebar.is_any_open())
+        sidebar.toggle()
+        assert(vim.wait(1000, function() return sidebar.is_open(kind) end, 10), kind)
+      end
+      sidebar.close()
+      sidebar.open('quickfix')
+      assert(vim.wait(1000, function() return sidebar.is_open('qflist') end, 10))
+      sidebar.close()
+      sidebar.open('buffers')
+      sidebar.close()
+      vim.wait(30)
+      assert(not sidebar.is_any_open(), 'closing must cancel a pending open')
+      assert(opts.modes.ue_qflist_bottom.win.position == 'bottom')
+      print('EDITOR_REVIEW_OK')
+    ]])
+  end)
+
+  t.it("menu keeps each non-Git sidebar action available", function()
+    child([[
+      local kinds = {'buffers', 'symbols', 'diagnostics', 'qflist', 'loclist', 'todo'}
+      local active
+      package.loaded.trouble = {
+        is_open = function(mode) return active == mode end,
+        close = function() active = nil end,
+        open = function(mode) active = mode end,
+      }
+      local sidebar = require('utils.sidebar')
+      for i, kind in ipairs(kinds) do
+        sidebar.pick()
+        local menu = vim.api.nvim_get_current_buf()
+        assert(vim.bo[menu].filetype == 'ue-sidebar-picker')
+        local choice = vim.fn.maparg(tostring(i + 1), 'n', false, true)
+        assert(type(choice.callback) == 'function')
+        choice.callback()
+        assert(not vim.api.nvim_buf_is_valid(menu), 'menu must close after choosing')
+        assert(vim.wait(1000, function() return sidebar.is_open(kind) end, 10), kind)
+      end
+      sidebar.close()
+      print('EDITOR_REVIEW_OK')
+    ]])
+  end)
+
+  t.it("shared source retains current/modified buffers and TODO positions", function()
+    child([[
+      package.loaded['trouble.item'] = {new = function(item) return item end, add_id = function() end}
+      package.loaded.lazy = {load = function() end}
+      package.loaded['todo-comments.config'] = {loaded = true}
+      local filename = vim.fs.joinpath(vim.uv.cwd(), 'unicode-中文 test.cpp')
+      vim.api.nvim_buf_set_name(0, filename)
+      vim.api.nvim_buf_set_lines(0, 0, -1, false, {'// TODO: keep source'})
+      package.loaded['todo-comments.search'] = {search = function(cb)
+        cb({{filename = filename, lnum = 7, col = 3, tag = 'TODO', text = 'keep source'}})
+      end}
+      local source = require('trouble.sources.ue_sidebar')
+      source.get.buffers(function(items)
+        local current = assert(items[1])
+        assert(current.buf == vim.api.nvim_get_current_buf())
+        assert(current.item.kind == 'buffer' and current.item.changed == 1)
+        assert(current.text:find('中文 test.cpp', 1, true))
       end)
-      assert(owned_root and owned_root == vim.uv.fs_realpath(root), 'temporary root changed')
-      vim.fn.delete(owned_root, 'rf')
-      assert(ok, err)
+      local called = false
+      source.get.todo(function(items)
+        called = true
+        assert(#items == 1 and items[1].filename == vim.fs.normalize(filename))
+        assert(items[1].pos[1] == 7 and items[1].pos[2] == 2)
+        assert(items[1].item.kind == 'todo' and items[1].item.tag == 'TODO')
+      end)
+      assert(called)
       print('EDITOR_REVIEW_OK')
     ]])
   end)

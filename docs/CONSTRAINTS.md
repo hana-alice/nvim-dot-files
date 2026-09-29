@@ -903,7 +903,8 @@
   git log（`b9cce1d` merge `feat/lldb-dap-migration`、
   `7c70462`、release_1.0.3）
 
-### snacks / clangd / lazy（活跃 workaround，共 9 个文件）
+<a id="active-workarounds"></a>
+### 活跃 workaround 索引
 
 - **K16 — snacks picker 冷启动首开卡死**
   症状: Neovide 冷启后第一次开 picker 卡约 1s。
@@ -977,6 +978,44 @@
 
 - **K24 — blink.cmp 自动换行破坏 undo/preview**
   → `lua/workarounds/blink_cmp/auto_wrap_undo_preview.lua`
+
+- **CodeDiff 写操作必须保护脏 buffer 和失效快照**
+  v4.0.6 的 discard 可保存不相关脏行，零上下文 hunk 可写入已被外部修改的 index。
+  写前核验比较来源及 index/磁盘状态；保留行尾，不支持的边界明确拒绝。
+  → `lua/workarounds/codediff/safe_mutations.lua`；`tests/cases/git_review_safety_spec.lua`。
+
+- **CodeDiff 空闲刷新不得轮询全仓状态**
+  v4.0.6 缺可选 watcher 时以 500ms 周期刷新，隐藏的 history 会话也可能继续扫描。
+  `event_refresh` 停止 polling 并保留事件驱动刷新；打开/返回/关闭的接线由 Git 审阅层负责。
+  → `lua/workarounds/codediff/event_refresh.lua`；`tests/cases/git_review_spec.lua`。
+
+- **CodeDiff 大文件树须保留完整节点且限制同步装饰工作**
+  v4.0.6 对屏外行也同步格式化和高亮；补丁保留所有展开行供搜索和导航，
+  仅按 viewport 装饰，并分批准备树。完整覆盖与格式一致由夹具验证，不代表真实大仓性能已通过。
+  关闭时取消该会话的构建、释放待交付树，并清理上游残留的专属窗口回调与 scratch 面板；不得误清其他会话。
+  → `lua/workarounds/codediff/large_tree.lua`；`tests/cases/git_review_tree_spec.lua`。
+
+- **CodeDiff 历史路径须按 NUL 记录解析并区分 rename 两侧**
+  display-form numstat 路径会误读 Unicode 或合并后的 rename 路径，导致历史正文为空。
+  使用结构化路径记录并保留 old_path；历史/ref/staged 比较不得丢失任一侧路径。
+  → `lua/workarounds/codediff/history_paths.lua`；`tests/cases/git_review_history_spec.lua`。
+
+- **CodeDiff Git 进程创建也须离开编辑器主循环**
+  Windows 上即使使用异步进程 API，进程创建本身仍可能同步阻塞主循环。
+  仅将 CodeDiff runner 和 Git apply 的创建移至 worker，限制并发并登记任务、超时及取消；
+  不覆盖全局进程 API，不承诺清理 Git hook/filter 的后代进程。
+  → `lua/workarounds/codediff/threaded_git.lua`；`tests/cases/git_review_transport_spec.lua`。
+
+- **CodeDiff 二进制文件不得伪装成文本 diff**
+  v4.0.6 可将二进制改动送入文本 buffer 而未说明不支持 hunk。
+  保留文件列表条目，依据 Git 二进制元数据或有界 NUL 探测展示只读提示，并拒绝 hunk 写操作；
+  整文件操作仍须经过写入保护。NUL 探测不等于任意格式识别。
+  → `lua/workarounds/codediff/binary_files.lua`；`tests/cases/git_review_binary_spec.lua`。
+
+- **Neogit 的 CodeDiff 集成必须匹配 v4 会话与根提交语义**
+  Neogit `792c139` 使用旧 SessionConfig，并为根提交拼接不存在的父版本。
+  适配层保留选中项、仓库和刷新语义，转交共享审阅路由创建 v4 会话和处理根提交。
+  → `lua/workarounds/neogit/codediff_v4.lua`；`tests/cases/git_review_neogit_spec.lua`。
 
 ### goto-def / cursor
 
@@ -1354,7 +1393,7 @@ CDB / index / tools 的本地入口与 memory 都链接同一正文；`structure
 
 本文档是**索引**，靠下面的规矩防腐烂:
 
-1. **新增一个 workaround** → 在 [§二 snacks/clangd/lazy](#snacks--clangd--lazy活跃-workaround共-9-个文件) 加一行
+1. **新增一个 workaround** → 在 [§二 活跃 workaround 索引](#active-workarounds) 加一行
    （症状 + 文件出处）；文件本身的 frontmatter 仍是权威出处。
 2. **踩到一个新坑** → 在 §二 对应分类加条目，必须含 **症状 + 解决约束 + 出处指针**；
    并在 `lessons/README.md` 对应领域补一句主题导航。**DAP 类坑还 MUST 标注其归属层**

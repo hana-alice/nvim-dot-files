@@ -20,6 +20,7 @@
 | CDB 流水线 | `lua/ue/cdb/` | compile_commands.json 生成/裁剪/shader/inject | 纯函数 + 子进程；写前 skip-if-unchanged |
 | 配置 schema | `lua/ue/config.lua` | `index/resources/context/clangd/dap/cdb` 默认值 + override | `get/setup/options/reset_for_test` |
 | 核心工具 | `lua/ue/core/` | fs / proc 纯函数 | 无副作用，可 headless 断言 |
+| Git 审阅 | `lua/plugins/` Git 配置 + `lua/utils/git_review.lua` | CodeDiff 默认完整文件审阅；Snacks 内容搜索/ref 选择；Neogit 提交与仓库操作 | Diffview 保留 `gv/gV` 和 Visual `gv` 按需入口；Fugitive 保留原文/blame/quickfix；Gitsigns 管普通编辑态，CodeDiff 管审阅内 hunk，不使用 Trouble Git mode |
 | DAP 调试 | `lua/ue/dap/` | session-owner dispatch + 各平台 attach/launch | `platforms` 注册表是唯一 dispatch seam |
 | Android device | `lua/utils/android_device.lua` | `adb devices -l` 枚举、当前进程 serial 选择、`adb -s` argv | `vim.g.ue_android_device_serial` 是本 Neovim 进程的交互真相；活跃任务捕获 serial |
 | Android SO 迭代 | `lua/ue/targets/android.lua` + `android_windows.lua` + `scripts/ue_android_so_*.ps1` + `scripts/ue_android_so_agent.c` | Windows host 上的 SO-only UBT action 执行；root 原子替换或 debuggable app-private ClassLoader 重定向 | Windows-only compatibility adapter；不增加 macOS→Android；正常 APK 流程保持独立 |

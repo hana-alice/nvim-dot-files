@@ -77,6 +77,7 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 | 配置层 | `lua/config/` | `lua/config/AGENTS.md` | `keymap-command-regression`、`editor-behavior-regression` | `keymaps` `commands` `review_editor` `options` `autocmds` | keymaps / options / autocmds / lazy |
 | 主题 | `lua/theme.lua` + `colors/` | `lua/AGENTS.md` | `curated-theme-entrypoints` | `theme` `smoke` | 策展式主题入口 |
 | 插件层 | `lua/plugins/` | `lua/plugins/AGENTS.md` | `editor-behavior-regression` | `smoke` `review_editor` | per-plugin setup（snacks-only） |
+| Git 审阅工作区 | `lua/utils/git_review.lua` + `lua/plugins/codediff.lua` + Git 插件配置 + `lua/workarounds/codediff/` | `lua/utils/AGENTS.md` + `lua/plugins/AGENTS.md` + `lua/workarounds/AGENTS.md` | `git-review-workspace` | `git_review` `review_editor` `keymaps` `cheatsheet` `workarounds` `smoke` | CodeDiff 默认完整文件审阅；Diffview 按需；Snacks `-G` 查询；Neogit 操作与 Fugitive 专项能力保留 |
 | vendored 依赖 | `lua/nio/`、`lua/trouble/` | 各自 `AGENTS.md` | 无对应 capability | `smoke` | 第三方内联副本，不自行重构 |
 | 回归测试 | `tests/` | `tests/AGENTS.md` | `headless-test-harness`、`config-regression-suite`、`test-regression-policy`、`structure-discoverability-regression` | 改动对应域 + `structure` | headless 套件 + 分范围回归映射 |
 | 规则/知识库 | `AGENTS.md`、`docs/`、`memory/`、`decisions/`、`lessons/` | `docs/AGENTS.md` | `project-constraints-doc`、`ai-knowledge-base`、`local-subsystem-rules`、`spec-authority-loop` | `structure` | 单一内容源 + 四区知识库 + spec 权威 |

@@ -1242,4 +1242,81 @@ t.describe("frozen batch startup runtime", function()
     index._rt.last_restart_at = saved
     if not ok then error(err) end
   end)
+
+  t.it("seeds an empty frozen shard cache from original shards before watching", function()
+    fixture(function(h, root)
+      local source = root .. "/background/.cache/clangd/index"
+      vim.fn.mkdir(source, "p")
+      vim.fn.writefile({ "shard" }, source .. "/a.cpp.0123.idx")
+      local seeds, probes = {}, 0
+      h.opts.seed_async = function(from, to, _, callback) seeds[#seeds + 1] = { from = from, to = to, callback = callback } end
+      local probe = h.opts.probe_recursive
+      h.opts.probe_recursive = function(callback) probes = probes + 1; probe(callback) end
+      h.prepare(); h.describe(); h.flush()
+      t.assert_eq(#seeds, 1)
+      t.assert_eq(seeds[1].from, source)
+      t.assert_eq(seeds[1].to, root .. "/background/verified/.cache/clangd/index")
+      t.assert_eq(vim.fn.isdirectory(seeds[1].to), 1, "seeding follows local cache creation")
+      t.assert_eq(probes, 0, "watches must wait for seeding"); t.assert_eq(#h.watches, 0); t.assert_eq(#h.calls, 1)
+      seeds[1].callback({ ok = false, reason = "seed-io-error" })
+      h.flush()
+      t.assert_eq(probes, 1, "a failed seed still proceeds with a cold cache")
+      h.validate()
+      t.assert_contains(runtime.command(h.command)[3], "/verified")
+    end)
+  end)
+
+  t.it("does not seed a frozen cache that already holds shards or a source without shards", function()
+    for _, scenario in ipairs({ "frozen-has-shards", "source-empty", "helper-throws" }) do
+      fixture(function(h, root)
+        local source = root .. "/background/.cache/clangd/index"
+        local target = root .. "/background/verified/.cache/clangd/index"
+        vim.fn.mkdir(source, "p"); vim.fn.mkdir(target, "p")
+        if scenario ~= "source-empty" then vim.fn.writefile({ "shard" }, source .. "/a.cpp.0123.idx") end
+        if scenario == "frozen-has-shards" then vim.fn.writefile({ "own" }, target .. "/b.cpp.4567.idx") end
+        local seeds = 0
+        h.opts.seed_async = function()
+          seeds = seeds + 1
+          if scenario == "helper-throws" then error("spawn failed") end
+        end
+        h.prepare(); h.describe(); h.flush(); h.validate()
+        t.assert_eq(seeds, scenario == "helper-throws" and 1 or 0, scenario)
+        t.assert_contains(runtime.command(h.command)[3], "/verified", scenario)
+      end)
+    end
+  end)
+
+  t.it("shard seed helper only adds absent shards and never writes the source", function()
+    local python = vim.fn.exepath("python")
+    if python == "" then python = vim.fn.exepath("python3") end
+    if python == "" then t.skip("shard seed helper", "Python unavailable", { native = true }); return end
+    local root = vim.fn.tempname():gsub("\\", "/") .. "_shard_seed"
+    local source, target = root .. "/src", root .. "/dst"
+    vim.fn.mkdir(source, "p"); vim.fn.mkdir(target, "p")
+    vim.fn.writefile({ "one" }, source .. "/a.cpp.01.idx")
+    vim.fn.writefile({ "two" }, source .. "/b.h.02.idx")
+    vim.fn.writefile({ "tmp" }, source .. "/c.cpp.03.idx.temp-stream-ab12")
+    vim.fn.writefile({ "mine" }, target .. "/b.h.02.idx")
+    local tool = vim.fn.stdpath("config") .. "/tools/clangd_shard_seed.py"
+    local ok, err = xpcall(function()
+      local result = vim.system({ python, "-B", "-I", tool, "--source", source, "--target", target }, { text = true }):wait()
+      t.assert_eq(result.code, 0, (result.stderr or "") .. (result.stdout or ""))
+      local decoded = vim.json.decode(result.stdout)
+      t.assert_eq(decoded.linked + decoded.copied, 1); t.assert_eq(decoded.existing, 1)
+      t.assert_eq(vim.fn.readfile(target .. "/a.cpp.01.idx")[1], "one")
+      t.assert_eq(vim.fn.readfile(target .. "/b.h.02.idx")[1], "mine", "existing shards are untouched")
+      t.assert_eq(vim.fn.filereadable(target .. "/c.cpp.03.idx.temp-stream-ab12"), 0)
+      -- clangd replaces shards by temp+rename; model that and check the source survives.
+      vim.fn.writefile({ "rewritten" }, target .. "/a.tmp"); vim.fn.delete(target .. "/a.cpp.01.idx")
+      assert(vim.uv.fs_rename(target .. "/a.tmp", target .. "/a.cpp.01.idx"))
+      t.assert_eq(vim.fn.readfile(source .. "/a.cpp.01.idx")[1], "one")
+      t.assert_eq(vim.fn.readfile(source .. "/b.h.02.idx")[1], "two")
+      local same = vim.system({ python, "-B", "-I", tool, "--source", source, "--target", source }, { text = true }):wait()
+      t.assert_eq(same.code, 1); t.assert_eq(vim.json.decode(same.stdout).reason, "target-is-source")
+      local missing = vim.system({ python, "-B", "-I", tool, "--source", source, "--target", root .. "/none" }, { text = true }):wait()
+      t.assert_eq(missing.code, 1); t.assert_eq(vim.json.decode(missing.stdout).reason, "target-cache-unavailable")
+    end, debug.traceback)
+    vim.fn.delete(root, "rf")
+    if not ok then error(err) end
+  end)
 end)

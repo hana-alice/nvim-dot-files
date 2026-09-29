@@ -50,6 +50,8 @@
   立即撤销 references/rename epoch，并退回原 UBT 路径。详细契约见 `cpp-semantic-index-coverage`。
   `batch_documents.lua` 仅筛选相关的已加载未保存文档；`batch_runtime.lua` 保留 CDB 归属、
   撤权和重验职责，`batch_descriptor.lua` 仅承载已有描述路径、缓存和监听集合校验。
+  `batch_shard_seed.lua`（经 `tools/clangd_shard_seed.py`）在监听前把原缓存 shard add-only
+  硬链接进空的冻结缓存，使保留 TU 不被冷重建；结果不授予也不撤销证明权限。
   `batch_recovery.lua` 接收文档/客户端事件，按 CDB 合并恢复请求并串行验证；清洁后仍需经过
   防抖、冷却、helper 退出及完整验证，期间保留原客户端，身份复核后才执行一次定向重启。
   新冻结客户端的实际接入确认恢复；计时器或取消请求均不构成证明权限或 helper 退出证据。

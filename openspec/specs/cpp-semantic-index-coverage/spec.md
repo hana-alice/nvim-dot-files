@@ -3,9 +3,7 @@
 ## Purpose
 
 定义 C++ 语义导航所消费的 clangd 索引覆盖合同，使快速增量索引能够提升新鲜度而不会缩窄已知定义集合，并让每次跳转都能证明其 active build、CDB、toolchain 与索引 generation 来源。
-
 ## Requirements
-
 ### Requirement: SuperUnity acceleration SHALL not silently regress
 
 索引改动 SHALL 同时保留编译语义、真实覆盖与 SuperUnity 的实际加速能力；替换二次合并策略
@@ -192,6 +190,13 @@ phase manifest SHALL 绑定独立原始 semantic CDB 的路径与内容。native
 - **AND** existing directories and shard contents SHALL remain untouched; conflicting files, redirected components, an unexpected frozen CDB path or creation failure SHALL retain the original CDB
 - **AND** this preparation SHALL NOT bypass receipt validation or ignore content, namespace, metadata or unclassified ancestor notifications; only the separately specified stable-directory write policy MAY suppress classified ancestor writes, and first cache writes within the existing excluded tree SHALL not revoke otherwise current authority
 
+#### Scenario: A new frozen shard cache is seeded from the original cache
+- **WHEN** the owned frozen `verified/.cache/clangd/index` directory exists and holds no `*.idx` shard while the original semantic CDB's `.cache/clangd/index` holds shards
+- **THEN** runtime SHALL, before any input watch or frozen client starts, add only shard names absent from the frozen cache by hard link (or exclusive-create copy across volumes), skipping temporary `.temp-stream-` files
+- **AND** it MUST NOT modify, delete or rename any original shard or any shard already present in the frozen cache, and SHALL leave no truncated copy on failure; clangd rewrites shards by temporary file plus rename, so a later frozen rewrite replaces only the frozen directory entry
+- **AND** the seed outcome SHALL NOT grant or revoke frozen authority: seeding failure, a missing helper or a timeout SHALL continue startup with the unseeded cache, and receipt validation and watches SHALL proceed unchanged
+- **RATIONALE** retained frozen commands equal original commands byte-for-byte (activation coverage), clangd 22 keys shards by source path and judges staleness by content digest only, so original shards are valid for retained TUs; batch TUs have new paths and are indexed normally. Measured on the live Client Android cache: cold first frozen activation ≈1714 s wall / 12.9k CPU s; seeded ≈42 s wall reindexing only batch TUs
+
 #### Scenario: The server uses a query-driver profile not covered by the proof
 - **WHEN** effective server arguments contain a nonempty query-driver allowlist and receipts do not certify that driver-query profile
 - **THEN** automatic build/activation SHALL retain original UBT commands and preserve the user's server arguments and environment
@@ -325,8 +330,6 @@ full/current/hot 生成器 SHALL 只消费当前 active argv 明确引用且可�
 #### Scenario: 显式响应文件无法完整展开
 - **WHEN** active argv 的 response 文件缺失或循环引用
 - **THEN** 展开阶段 SHALL 保留整个原始 command，而不能发布部分展开的混合 argv
-
-
 
 ### Requirement: Active semantic index coverage SHALL be monotonic within one build generation
 
@@ -719,3 +722,4 @@ Windows 上 owned clangd 的发现 SHALL 同时匹配当前 Neovim parent PID �
 - **WHEN** 评估 clangd 的资源防线
 - **THEN** `--background-index-priority` SHALL 被视为效果未在本平台验证
 - **AND** OS 级约束 SHALL 独立于该旗标成立
+

@@ -101,6 +101,38 @@ function M.parse_shard_key(key)
   return plat, target, conf
 end
 
+--- Select only from this generation's buckets before shader/header augmentation.
+--- Prefer an explicit target, then a compatible persisted selection; otherwise
+--- use the largest matching bucket, with key order resolving equal counts.
+function M.select_generated_bucket(buckets, state, preferred_key)
+  state = state or {}
+  local platform = vim.trim(state.target_platform or "")
+  local config = vim.trim(state.target_configuration or ""):gsub(" Editor$", "")
+  local target = vim.trim(state.target or "")
+  if target == "" then target = vim.trim(state.target_name or "") end
+  local function matches(bucket)
+    return bucket and (platform == "" or bucket.platform == platform)
+      and (config == "" or bucket.config == config)
+  end
+  local keys = vim.tbl_keys(buckets)
+  table.sort(keys, function(a, b)
+    local a_count, b_count = #buckets[a].entries, #buckets[b].entries
+    if a_count ~= b_count then return a_count > b_count end
+    return a < b
+  end)
+  local matching
+  for _, key in ipairs(keys) do
+    local bucket = buckets[key]
+    if matches(bucket) then
+      matching = matching or bucket
+      if target ~= "" and bucket.target == target then return bucket end
+    end
+  end
+  local preferred = buckets[preferred_key]
+  if matches(preferred) and (target == "" or preferred.target == target) then return preferred end
+  return matching or buckets[keys[1]]
+end
+
 -- ==========================================================================
 -- DEDUP PRIORITY
 -- ==========================================================================

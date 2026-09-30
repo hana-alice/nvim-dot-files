@@ -4,6 +4,126 @@ t.bootstrap()
 local targets = require("ue.targets")
 local contract = require("ue.targets.contract")
 
+local function with_android_sdk_config(content, fn)
+  local root = vim.fn.tempname():gsub("\\", "/")
+  local project_dir = root .. "/Source/Sample"
+  vim.fn.mkdir(project_dir .. "/Config/SDK", "p")
+  local config = project_dir .. "/Config/SDK/Runtime.ini"
+  local settings = require("ue.config")
+  local previous = vim.deepcopy(settings.options())
+  local policy_path = root .. "/sdk-policy.json"
+  local policy = { config_file = "Config/SDK/Runtime.ini", key = "UseSDK", disable_argument = "-skip-project-sdk" }
+  vim.fn.writefile({ vim.json.encode(policy) }, policy_path)
+  settings.setup(vim.tbl_deep_extend("force", previous, { android = { sdk_policy_file = policy_path } }))
+  if content then
+    local file = assert(io.open(config, "wb"))
+    file:write(content)
+    file:close()
+  end
+  local context = {
+    engine_root = root .. "/engine", uproject = project_dir .. "/Sample.uproject",
+    project_root = root, project_dir = root .. "/stale-project",
+    target = "Sample", configuration = "Development", config_root = vim.fn.stdpath("config"),
+  }
+  local host = {
+    id = "windows",
+    ue_build_entry = function() return { executable = "cmd.exe", args = { "/d", "/c", "Build.bat" } } end,
+    powershell_entry = function() return { executable = "powershell.exe", args = {} } end,
+  }
+  local ok, err = pcall(fn, context, host, config, policy_path, policy)
+  settings.setup(previous)
+  vim.fn.delete(root, "rf")
+  if not ok then error(err) end
+end
+
+t.describe("Android SDK configuration reaches build arguments", function()
+  t.it("UseSDK=0 disables SDK in both build routes using the selected uproject directory", function()
+    with_android_sdk_config("UseSDK=0", function(ctx, host)
+      local driver = targets.must_get("Android")
+      local normal = driver.build_plan(ctx, host)
+      local so = driver.so_build_plan(ctx, host)
+      t.assert_contains(normal.args, "-skip-project-sdk")
+      t.assert_contains(so.args, "-SdkArgument")
+      t.assert_contains(so.args, "-skip-project-sdk")
+      t.assert_nil(ctx.sdk_argument, "planning must not mutate caller context")
+    end)
+  end)
+  t.it("enabled or absent project SDK configuration preserves the target default", function()
+    for _, content in ipairs({ "UseSDK=1", "OtherKey=0", "" }) do
+      with_android_sdk_config(content ~= "" and content or nil, function(ctx, host)
+        local driver = targets.must_get("Android")
+        t.assert_false(vim.tbl_contains(driver.build_plan(ctx, host).args, "-skip-project-sdk"))
+        t.assert_false(vim.tbl_contains(driver.so_build_plan(ctx, host).args, "-SdkArgument"))
+      end)
+    end
+  end)
+  t.it("reads changed config on each plan and accepts BOM whitespace and comments", function()
+    with_android_sdk_config("\239\187\191; UseSDK=1\n UseSDK = 0 ; local build\n", function(ctx, host, config)
+      local driver = targets.must_get("Android")
+      t.assert_contains(driver.build_plan(ctx, host).args, "-skip-project-sdk")
+      vim.fn.writefile({ "UseSDK=1" }, config)
+      t.assert_false(vim.tbl_contains(driver.build_plan(ctx, host).args, "-skip-project-sdk"))
+      t.assert_false(vim.tbl_contains(driver.so_build_plan(ctx, host).args, "-SdkArgument"))
+    end)
+  end)
+  t.it("malformed or conflicting SDK settings cannot silently compile the default SDK", function()
+    for _, content in ipairs({ "UseSDK=2", "UseSDK=", "UseSDK=0\nUseSDK=1" }) do
+      with_android_sdk_config(content, function(ctx, host)
+        for _, operation in ipairs({ "build_plan", "so_build_plan" }) do
+          local plan = targets.must_get("Android")[operation](ctx, host)
+          t.assert_eq(plan.status, "unavailable")
+          t.assert_nil(plan.executable)
+          t.assert_contains(plan.reason, "SDK")
+        end
+      end)
+    end
+  end)
+  t.it("oversized or unsupported-encoding config fails instead of ignoring SDK policy", function()
+    for _, content in ipairs({ string.rep(";", 65537), "U\0s\0e\0S\0D\0K\0=\00\0" }) do
+      with_android_sdk_config(content, function(ctx, host)
+        for _, operation in ipairs({ "build_plan", "so_build_plan" }) do
+          local plan = targets.must_get("Android")[operation](ctx, host)
+          t.assert_eq(plan.status, "unavailable")
+          t.assert_nil(plan.executable)
+        end
+      end)
+    end
+  end)
+  t.it("unreadable configuration cannot be treated as absent", function()
+    with_android_sdk_config(nil, function(ctx, host, config)
+      vim.fn.mkdir(config, "p")
+      for _, operation in ipairs({ "build_plan", "so_build_plan" }) do
+        local plan = targets.must_get("Android")[operation](ctx, host)
+        t.assert_eq(plan.status, "unavailable")
+        t.assert_nil(plan.executable)
+      end
+    end)
+  end)
+  t.it("missing local policy leaves Target defaults and changed policy is read afresh", function()
+    with_android_sdk_config("UseSDK=0", function(ctx, host, _, policy_path, policy)
+      local driver = targets.must_get("Android")
+      policy.disable_argument = "-another-sdk-option"
+      vim.fn.writefile({ vim.json.encode(policy) }, policy_path)
+      t.assert_contains(driver.build_plan(ctx, host).args, "-another-sdk-option")
+      t.assert_contains(driver.so_build_plan(ctx, host).args, "-another-sdk-option")
+      vim.fn.delete(policy_path)
+      t.assert_false(driver.build_plan(ctx, host).metadata.sdk_disabled)
+      t.assert_false(driver.so_build_plan(ctx, host).metadata.sdk_disabled)
+    end)
+  end)
+  t.it("malformed or unsafe local policy cannot inject shell arguments or escape the project", function()
+    with_android_sdk_config("UseSDK=0", function(ctx, host, _, policy_path, policy)
+      local invalid = { "{}", "not json", vim.json.encode(vim.tbl_extend("force", policy, { disable_argument = "-sdk & echo bad" })),
+        vim.json.encode(vim.tbl_extend("force", policy, { config_file = "../other/Runtime.ini" })) }
+      for _, raw in ipairs(invalid) do
+        vim.fn.writefile({ raw }, policy_path)
+        t.assert_eq(targets.must_get("Android").build_plan(ctx, host).status, "unavailable")
+        t.assert_eq(targets.must_get("Android").so_build_plan(ctx, host).status, "unavailable")
+      end
+    end)
+  end)
+end)
+
 local SIGNING_IDENTITY = {
   fingerprint = "0123456789ABCDEF0123456789ABCDEF01234567",
   name = "Apple Development: Example User (TEAM123456)",
@@ -489,6 +609,11 @@ t.describe("ue.targets build planners", function()
     vim.fn.writefile({ "so" }, source_so)
 
     local android = targets.must_get("Android")
+    local artifact = android.find_target_so({
+      project_dir = root,
+      target = "SampleGame",
+      configuration = "Test",
+    })
     local plan = android.so_deploy_plan({
       project_dir = root,
       config_root = vim.fn.stdpath("config"),
@@ -506,14 +631,53 @@ t.describe("ue.targets build planners", function()
       device_id = "DEVICE-1",
       package_name = "com.example.samplegame",
     }, require("utils.platform.macos"))
+    vim.fn.writefile({ vim.json.encode({
+      TargetName = "SampleGame",
+      Platform = "Android",
+      Configuration = "Shipping",
+      BuildProducts = {},
+    }) }, binaries .. "/SampleGame.target")
+    local deploy_with_mismatched_receipt = android.find_target_so({
+      project_dir = root, target = "SampleGame", configuration = "Test",
+    })
+    local symbols_with_mismatched_receipt = android.find_symbol_artifact({
+      project_dir = root, target = "SampleGame", configuration = "Test",
+    })
     vim.fn.delete(root, "rf")
 
+    t.assert_eq(artifact and artifact:gsub("\\", "/"), source_so:gsub("\\", "/"))
+    t.assert_nil(deploy_with_mismatched_receipt,
+      "部署继续以 matching receipt fail closed")
+    t.assert_eq(symbols_with_mismatched_receipt and symbols_with_mismatched_receipt:gsub("\\", "/"),
+      source_so:gsub("\\", "/"),
+      "符号解析可消费配置限定产物，不被另一配置的当前 receipt 遮蔽")
     t.assert_eq(plan.executable, "powershell.exe")
     t.assert_contains(table.concat(plan.args, " "), "ue_android_so_deploy.ps1")
     t.assert_contains(table.concat(plan.args, " "), "SampleGame-Android-Test-arm64.so")
     t.assert_eq(unsupported.status, "unavailable")
     t.assert_eq(unsupported.host_id, "macos")
     t.assert_contains(unsupported.reason, "host adapter")
+  end)
+
+  t.it("resolves Development short-name artifacts without crossing a mismatched receipt", function()
+    local root = vim.fn.tempname()
+    local binaries = root .. "/Binaries/Android"
+    local short_so = binaries .. "/SampleGame-arm64.so"
+    vim.fn.mkdir(binaries, "p")
+    vim.fn.writefile({ "so" }, short_so)
+    local android = targets.must_get("Android")
+    local context = { project_dir = root, target = "SampleGame", configuration = "Development" }
+    t.assert_eq(android.find_target_so(context):gsub("\\", "/"), short_so:gsub("\\", "/"))
+    t.assert_eq(android.find_symbol_artifact(context):gsub("\\", "/"), short_so:gsub("\\", "/"))
+
+    vim.fn.writefile({ vim.json.encode({
+      TargetName = "SampleGame", Platform = "Android", Configuration = "Shipping",
+      BuildProducts = {},
+    }) }, binaries .. "/SampleGame.target")
+    t.assert_nil(android.find_target_so(context))
+    t.assert_nil(android.find_symbol_artifact(context),
+      "另一配置的 receipt 存在时，generic short name 不再能证明属于 Development")
+    vim.fn.delete(root, "rf")
   end)
 
   t.it("keeps PowerShell symbols out of macOS and generic Android drivers", function()

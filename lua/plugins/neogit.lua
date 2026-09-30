@@ -12,26 +12,25 @@ return {
     cmd = { "Neogit" },
     dependencies = {
       "nvim-lua/plenary.nvim",
-      "sindrets/diffview.nvim", -- already installed; reused for diff rendering
-      "nvim-telescope/telescope.nvim", -- optional; falls back to vim.ui.select if absent
+      "esmuellert/codediff.nvim",
+      "folke/snacks.nvim",
     },
     keys = {
       {
         "<leader>gn",
         function()
-          require("utils.git_async").launch({
-            name = "Neogit (status)",
-            run  = function() require("neogit").open() end,
-          })
+          require("utils.git_review").neogit()
         end,
         desc = "Neogit (status)",
       },
     },
     opts = {
-      -- Use diffview for the diff surface (1 hunk -> opens diffview tab).
+      diff_viewer = "codediff",
       integrations = {
-        diffview = true,
-        telescope = true,
+        codediff = true,
+        snacks = true,
+        diffview = false,
+        telescope = false,
       },
       disable_signs = false,
       disable_hint = false,
@@ -69,6 +68,7 @@ return {
     },
     config = function(_, opts)
       require("neogit").setup(opts)
+      require("workarounds.neogit.codediff_v4").apply()
     end,
   },
 }

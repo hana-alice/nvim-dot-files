@@ -462,7 +462,7 @@ Source: `lua/config/keymaps.lua` (`<leader>v*`).
 |------------------|-----------------------------------------|
 | `<leader>va`     | Sidebar view picker (1-7 / j-k + Enter) |
 | `<leader>vv`     | Toggle last sidebar view                |
-| `<leader>vg`     | Git modified files / status             |
+| `<leader>vg`     | Open / focus CodeDiff review workspace  |
 | `<leader>vb`     | Open buffers                            |
 | `<leader>vs`     | File symbols                            |
 | `<leader>vd`     | Diagnostics                             |
@@ -470,7 +470,8 @@ Source: `lua/config/keymaps.lua` (`<leader>v*`).
 | `<leader>vl`     | Location list                           |
 | `<leader>vt`     | TODO / FIXME                            |
 
-Views share the same left panel. Switching `v?` replaces content.
+The six sidebar views share the same left panel. The Git menu item and
+`<leader>vg` open CodeDiff separately; Git is no longer a Trouble sidebar mode.
 
 ## Buffers / Windows / Tabs
 
@@ -515,23 +516,31 @@ fast scratch shell.
 
 ## 🌳 Git
 
-Source: `lua/plugins/diffview.lua`, `lua/plugins/neogit.lua`,
-`lua/plugins/fugitive.lua`, `lua/plugins/gitsigns.lua`,
-`lua/plugins/snacks.lua`. There is **no lazygit** — full git UI is
-**Neogit**, diffs are **diffview**, blame and history quickfix are
-**fugitive**, advanced search is **advanced_git_search**.
+Source: `lua/utils/git_review.lua`, `lua/plugins/codediff.lua`,
+`lua/plugins/diffview.lua`, `lua/plugins/neogit.lua`,
+`lua/plugins/fugitive.lua`, `lua/plugins/gitsigns.lua`.
 
-### Cheat-by-scenario (the four scenarios this stack solves)
+**CodeDiff** is the default full-file review workspace: two panes, the complete
+file context, and separate Changes / Staged / Conflicts groups. **Diffview**
+remains available on demand. **Neogit** handles commit, push/pull, branch, stash,
+rebase and reflog; its diff actions use CodeDiff and its pickers use Snacks.
+**Fugitive** keeps revision buffers, full-file blame and quickfix history.
+**Gitsigns** owns normal editing buffers; CodeDiff owns review-buffer hunk actions.
+The default Git keys do not launch Lazygit. The host CLI remains available.
+
+### Cheat-by-scenario
 
 | 你想做什么 | 怎么做 |
 |---|---|
-| **看某个 commit 改了哪些文件 + diff** | `<leader>gM`（branch history picker）→ `<cr>` 选 commit → diffview tab 列文件树 + 双栏 diff |
-| **同上但只想看一个具体 hash** | `<leader>gk` → 输入 hash（默认 `HEAD`） → diffview 直接打开 `<rev>^!` |
-| **单文件随时间的变化轨迹** | `<leader>gm`（this file history）→ 上下选 commit 看每个 commit 对此文件的 diff |
-| **任意两个 ref / 分支间 diff** | `<leader>gr` → 输入 `main..feature` 或 `HEAD~3..HEAD` → diffview 完整 PR 视图 |
-| **Blame 当前行（GitLens 风格）** | 默认开启：行尾虚拟文本显示 `author · time · summary`（200ms 延迟），`<leader>uG` toggle |
+| **审阅当前仓库改动** | `<leader>gg`（当前文件所属仓库，回落 cwd）或 `<leader>gG`（cwd 仓库）；`<leader>vg` 是默认审阅别名 |
+| **看某个 commit 改了哪些文件 + diff** | `<leader>gc` 选择提交 → CodeDiff；`<leader>gM` 浏览仓库历史 |
+| **只看一个具体 hash** | `<leader>gk` → 输入 hash（默认 `HEAD`）；merge commit 明确选择父版本 |
+| **单文件随时间的变化轨迹** | `<leader>gm` → CodeDiff 文件历史 |
+| **任意两个 ref / 分支间 diff** | `<leader>gr` → `main..feature` 两版本比较，或 `main...feature` merge-base 比较 |
+| **沿用熟悉的 Diffview** | `<leader>gv` 打开，`<leader>gV` 关闭；Visual `<leader>gv` 保留选中行历史 |
+| **Blame 当前行（GitLens 风格）** | 行尾虚拟文本显示 `author · time · summary`（500ms 延迟）；`:Gitsigns toggle_current_line_blame` 切换 |
 | **Blame 整个文件（可滚动）** | `<leader>gB`（fugitive `:Git blame`）→ 在 blame 窗口里 `o` 预览 commit、`<cr>` 打开 |
-| **找哪个 commit 引入了某行代码** | `<leader>gh`（按内容搜 commit） / `<leader>gH`（限定当前文件）|
+| **找哪些 commit 修改了某段代码** | `<leader>gh` / `<leader>gH` 搜修改内容（`git log -G` 正则，仓库 / 当前文件）；确认结果进入 CodeDiff |
 | **看当前文件历史 → 选 commit 比 diff** | `<leader>gX`（当前文件 vs 选中的 commit） |
 | **完整状态面板 / 提交 / push** | `<leader>gn`（Neogit） |
 
@@ -539,38 +548,72 @@ Source: `lua/plugins/diffview.lua`, `lua/plugins/neogit.lua`,
 
 | Key                | Action                                           | Source |
 |--------------------|--------------------------------------------------|--------|
-| `]h` / `[h`        | Next / previous hunk                             | gitsigns |
-| `]H` / `[H`        | Last / first hunk                                | LazyVim |
-| `<leader>gb`       | Blame current line (popup)                       | LazyVim |
+| `]h` / `[h`        | Next / previous hunk in normal editing buffers   | gitsigns |
+| `<leader>gb`       | Line history picker; confirm → CodeDiff          | Snacks |
+| `<leader>hb`       | Blame current line (popup)                       | gitsigns |
+| `<leader>hB`       | Full-file blame                                 | gitsigns |
+| `<leader>hp`       | Preview hunk while editing                      | gitsigns |
 | `<leader>gB`       | **Full-file blame view (scrollable)**            | fugitive |
-| `<leader>gd`       | Preview diff hunk                                | LazyVim |
+| `<leader>gg`       | Review current file repository (fallback: cwd)  | CodeDiff |
+| `<leader>gG`       | Review cwd repository                           | CodeDiff |
+| `<leader>vg`       | Open / focus review workspace                   | CodeDiff |
 | `<leader>gv`       | Diffview: working tree                           | diffview |
 | `<leader>gV`       | Diffview: close                                  | diffview |
-| `<leader>gm`       | Diffview: this file history                      | diffview |
-| `<leader>gM`       | Diffview: branch history (commit picker)         | diffview |
+| `<leader>gm`       | This file history                               | CodeDiff |
+| `<leader>gM`       | Repository history                              | CodeDiff |
 | `<leader>gv` (v)   | Diffview: selection history                      | diffview |
-| `<leader>gr`       | **Diffview: arbitrary range** (prompts ref)      | diffview |
-| `<leader>gk`       | **Diffview: single commit** (prompts hash)       | diffview |
+| `<leader>gr`       | Arbitrary refs / range (prompt)                  | CodeDiff |
+| `<leader>gk`       | Single commit (prompt)                           | CodeDiff |
 | `<leader>gn`       | **Neogit** status panel (one-stop)               | neogit |
-| `<leader>gs`       | Git status picker (snacks)                       | LazyVim |
-| `<leader>gc`       | Commits picker (snacks)                          | LazyVim |
-| `<leader>gh`       | **Git: search commits by content**               | adv-git-search |
-| `<leader>gH`       | **Git: search commits by content (this file)**   | adv-git-search |
-| `<leader>gx`       | **Git: diff this file against a branch**         | adv-git-search |
-| `<leader>gX`       | **Git: diff this file against a commit**         | adv-git-search |
-| `<leader>gC`       | **Git: checkout from reflog**                    | adv-git-search |
-| `<leader>gA`       | **Git: advanced search palette (all actions)**   | adv-git-search |
+| `<leader>gs`       | Status picker; confirm → CodeDiff               | Snacks |
+| `<leader>gc`       | Commits picker; confirm → CodeDiff              | Snacks |
+| `<leader>gh`       | Search changed content (`-G` regex)             | Snacks → CodeDiff |
+| `<leader>gH`       | Search changed content (`-G`, current file)     | Snacks → CodeDiff |
+| `<leader>gx`       | Current file vs selected branch                 | Snacks → CodeDiff |
+| `<leader>gX`       | Current file vs selected commit                 | Snacks → CodeDiff |
+| `<leader>gC`       | Reflog; opening the list does not checkout      | Neogit |
+| `<leader>gA`       | Git actions                                     | Git review router |
 | `<leader>g0`       | **Open `:0` (staged) version of current file**   | fugitive |
 | `<leader>gl`       | Commits touching this file → quickfix            | fugitive |
 | `<leader>gL`       | All commits → quickfix                           | fugitive |
 
+Content search preserves `-G <pattern> --pickaxe-all`; it is not commit-message
+`--grep` or occurrence-count `-S` search. File-scoped search follows renames.
+
+### Hunk actions: normal editing and CodeDiff
+
+| Key | Normal editing buffer | CodeDiff review |
+|---|---|---|
+| `<leader>hs` | Stage current hunk | Stage current hunk in Changes |
+| `<leader>hu` | Open staged review to choose what to unstage | Unstage current hunk in Staged |
+| `<leader>hr` | Discard current hunk with confirmation | Discard Changes hunk with confirmation |
+| `<leader>hS` | Stage current file | Stage / unstage current file |
+
+`hu` means **unstage**, not “undo the last stage action”. Ref/history review is
+read-only; actions that do not apply to that comparison are unavailable. These
+bindings replace the inherited `<leader>gh*` hunk prefix, leaving `gh/gH` for
+content search. A stage action must not implicitly save a dirty buffer.
+
+### Inside CodeDiff
+
+| Key | Action |
+|---|---|
+| `]c` / `[c` | Next / previous hunk, continuing across files |
+| `<Tab>` / `<S-Tab>` | Next / previous file |
+| `gS` | Switch staged / unstaged view |
+| `<localleader>c` | Open Neogit commit flow, then return to review |
+| `q` | Close CodeDiff |
+
+Full-file context is shown by default (`side-by-side`, `compact=false`).
+For explicit line history, select lines and run `:'<,'>CodeDiff history`.
+
 ### Inside Neogit status (`<leader>gn`)
 
 每个动作都是单字母：`s`/`u`/`x` stage/unstage/discard、`c` commit、
-`P` push、`p` pull、`b` branch、`Z` stash、`l` log、`<tab>` 折叠 section、
+`P` push、`p` pull、`b` branch、`Z` stash、`r` rebase、`l` log、`<tab>` 折叠 section、
 `?` help、`q`/`<Esc>` 关闭。
 
-### Inside diffview
+### Inside Diffview (on demand)
 
 | Key                  | Action                                  |
 |----------------------|-----------------------------------------|
@@ -585,63 +628,28 @@ Source: `lua/plugins/diffview.lua`, `lua/plugins/neogit.lua`,
 | `y` (history panel)  | Yank commit hash to system clipboard    |
 | `q`                  | Close diffview                          |
 
-Branch diff or any ad-hoc ref pair: `:DiffviewOpen main..feature` (or
-use `<leader>gr` for prompt).
-
-This config uses `[h` / `]h` for hunk nav, **not** `[c` / `]c` —
-`[c` is treesitter context jump.
+For an explicit Diffview ref comparison use `:DiffviewOpen main..feature`;
+`<leader>gr` opens the default CodeDiff workflow. Closing either tool does not
+close the other tool's independently opened workspace.
 
 ### Inline blame (GitLens-style)
 
-Gitsigns shows `<author>, <time> · <summary>` at end of line with 200ms
-delay. Toggle: `<leader>uG`. Disable globally: in
+Gitsigns shows `<author>, <time> · <summary>` at end of line with 500ms
+delay. Toggle: `:Gitsigns toggle_current_line_blame`; `<leader>uG` toggles signs.
+Disable blame globally: in
 `lua/plugins/gitsigns.lua` set `current_line_blame = false`.
 
-### Why every `<leader>g*` shows a placeholder window first
+### Progress and responsiveness
 
-All git **and UE prepare/index** keys go through
-`lua/utils/async_launcher.lua` (formerly `git_async`, kept as a
-forwarder). The contract:
+Some existing commands, including the retained Diffview and Fugitive entries,
+use `lua/utils/async_launcher.lua` through the `git_async` forwarder. Its popup
+and progress indicator report startup; pressing `q` hides the indicator without
+cancelling the underlying work. Default Git routing lives in `utils.git_review`;
+not every Git key uses this launcher.
 
-1. **Placeholder window appears immediately** (centered float with
-   action name + spinner) — the editor is never frozen waiting for
-   git or UBT.
-2. **Right-bottom progress** via fidget (same corner as LSP progress)
-   so it's familiar across subsystems.
-3. **Real command runs in `vim.schedule` + `vim.defer_fn(0)`**, after
-   the placeholder has composited — the heavy work (lazy-loading
-   diffview, spawning `git log` / `UnrealBuildTool` / `cindex`)
-   cannot block the UI thread.
-4. **`run` gets a `report(msg)` callback.** Phase progress (e.g.
-   "S2: UHT done, starting cindex") flows to **both** the placeholder
-   sub-line and the fidget message — no extra `vim.notify` floats.
-5. **Press `q`** in the placeholder to dismiss the indicator early
-   (the underlying job keeps running — this just hides the popup).
-6. **Auto-cleanup** when the picker / diffview tab opens, with a
-   minimum visible time of 250 ms so you can read the title even on
-   instant returns.
-
-Affected commands today:
-
-| Command                | Why it needs the launcher |
-|------------------------|---------------------------|
-| All `<leader>g*` (diffview / fugitive / neogit / advanced_git_search) | First-press lazy load + git spawn |
-| `:UEPrepare`           | ueprepare init + first UBT/cindex spawn |
-| `:UEPrepareReindex`    | Same + forced csearch full rebuild |
-| `:UEIndexHot`          | Schedule hot+full GTAGS passes |
-| `:UEIndexFull`         | Schedule full GTAGS pass |
-
-**Not** wrapped (intentionally):
-
-| Command            | Why no placeholder |
-|--------------------|--------------------|
-| `:UEIndexNow`      | Single buffer; usually <100ms — placeholder would just flash |
-| `<leader>gV`       | Closing diffview is instant |
-| `:UEPrepareSync`   | Synchronous escape hatch by design (debug only); emits a WARN before blocking |
-
-If you want to disable the placeholder for a specific key, replace
-the `function() require("utils.async_launcher").launch{...} end`
-wrapper with the plain `<cmd>...<cr>` form.
+Scheduling a callback is not proof that the callback or plugin is nonblocking.
+Startup, file switching and hunk navigation performance must be measured for the
+installed versions and repository; this key reference makes no speed guarantee.
 
 ## 🎨 UI / Toggles
 
@@ -823,8 +831,9 @@ have no key bound by default:
 
 | Command                | Action                                  |
 |------------------------|-----------------------------------------|
-| `:UEPrepareReindex`    | Reindex without re-export ccjson        |
-| `:UEPrepareIncremental`| Prepare only dirty files (fast refresh) |
+| `:UEBuildCsearch`      | Rescan and fully rebuild only csearch; no UBT/CDB/GTAGS |
+| `:UEPrepareReindex`    | Normal prepare + forced csearch rebuild |
+| `:UEPrepareIncremental`| Append watcher dirty files to csearch only |
 | `:UEPrepareSync`       | Synchronous prepare (debug)             |
 | `:UEGenerateFromRSP`   | Re-export ccjson from cached `.rsp`     |
 | `:UEBuildAndroid`      | Force Android build target              |

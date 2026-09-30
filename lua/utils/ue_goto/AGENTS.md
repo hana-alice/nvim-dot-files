@@ -15,13 +15,14 @@
 
 ## 专属约定 / 分层契约（权威 CONSTRAINTS C5）
 
-- **C++ source/header identity**：active CDB / compiler-emitted origin evidence 证明后，只接受
-  libclang exact-cursor canonical USR；virtual call 保留静态语义选中的 derived override USR。
-- **C++ destination**：先用该 USR 查 subject 所属 controlled module AST 的唯一 body；module
-  contexts 暂不可用时才允许 identity-verified clangd 协助，零个/多个 body 均 fail closed。
+- **C++ source identity/destination**：active CDB exact command 传给同一 clangd client 后，
+  在不可变位置 snapshot 上请求 canonical USR 与 definition，不为每次 source gd 重读全量 CDB。
+- **C++ header identity/destination**：compiler-emitted origin evidence 证明后由 libclang
+  exact-cursor USR 查 controlled module AST 的唯一 body；module contexts 暂不可用时才允许
+  identity-verified clangd 协助。virtual call 保留静态语义选中的 derived override USR。
 - **诚实失败**：C++ 只有 `resolved / ambiguous-context / invalid-semantic-context / unavailable`；
   非 resolved 不跳转，也不进入 cache、arity、workspace symbol、csearch 或 GTAGS。
-- **缓存边界**：缓存 live TU，以及绑定 canonical USR + CDB signatures + overlays + toolchain 的
+- **缓存边界**：缓存 live TU，以及绑定 canonical USR + CDB signatures + overlays + toolchain + compiler inclusion 文件签名的
   唯一 resolved destination；negative/ambiguous 结果和 symbol/receiver/arity location 禁止缓存。
 - **永不前台阻塞**：parse/reparse 只在 sidecar，spinner 600ms 后显示，request 有 stale 门禁。
 - **jumper 后置条件**：一个 `<C-O>` 回源、恰好一条 jumplist、无 `(target_buf,1,0)` 幽灵。→ K25
@@ -36,6 +37,6 @@ legacy 旁路只剩 `scripts/test_jumper_headless.lua`。
 
 `../../../docs/architecture-symbol-resolution.md`（当前权威架构，必读）。
 
-**治理 spec**（可观察行为的权威；与本文冲突时以 spec 为准）：
+**治理 spec**（大方向与选型/踩坑；实现细节以代码与回归为准）：
 `../../../openspec/specs/cpp-contextual-definition-navigation/spec.md`、
 `../../../openspec/specs/cpp-semantic-highlighting/spec.md`。

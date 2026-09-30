@@ -1,78 +1,90 @@
-# android-dap-handshake-diagnostics
+# android-dap-handshake-diagnostics Specification
 
 ## Purpose
 
-诊断契约：UE Android DAP "gdb 握手零响应" 与 "source-file 断点 3221226505" 两个 root
-cause 的分层定位、判定标准，以及区分"语义正解"与"workaround"的判据。
+诊断契约：UE Android DAP "gdb 握手零响应" 与 "source-file 断点 3221226505" 两个
+root cause 的分层定位、判定标准，以及区分"语义正解"与"workaround"的判据。边界：
+纯诊断，不改运行时；产出物是结论本身（保留在本 spec 与 `docs/CONSTRAINTS.md`），
+不要求某个已从工作树移除的报告文件继续存在。
 
 ## Requirements
 
-### Requirement: 诊断报告与可复现 probe
+### Requirement: 诊断结论必须以可发现的形式存在，且只引用真实存在的文件
 
-诊断结论 SHALL 以可发现的形式存在于仓库，把 gdb 握手零响应与 source-file 断点
-`3221226505` 两个 root cause 查实。原始诊断报告已随公开镜像的历史脱敏被移除，因此本
-capability 的产出物要求 SHALL 表述为：诊断结论与判据必须在 `docs/CONSTRAINTS.md` 的
-踩坑条目与本 spec 中保留，而 MUST NOT 继续要求一个已不存在于工作树的报告文件。任何
-声称已产出的诊断文件 MUST 真实存在于仓库，否则该引用 MUST 被移除或改指现存出处。
+诊断结论 SHALL 以可发现的形式存在于仓库；原始诊断报告已随公开镜像的历史脱敏被
+移除，因此结论与判据 SHALL 保留在 `docs/CONSTRAINTS.md` 的踩坑条目与本 spec 中，
+MUST NOT 继续要求一个已不存在于工作树的报告文件。任何声称已产出的诊断文件 MUST
+真实存在于仓库，否则该引用 MUST 被移除或改指现存出处。每次新的握手层诊断仅新增
+诊断记录与 `tools/` 下的 probe 脚本，不修改任何 `lua/ue/dap/*.lua` 运行时文件。
 
 #### Scenario: 结论出处真实存在
 
 - **WHEN** AI agent 或贡献者查阅 Android DAP 握手 root cause 结论
-- **THEN** 结论可从本 spec 的 requirement 与 `docs/CONSTRAINTS.md` 的踩坑条目读到
+- **THEN** 结论可从本 spec 的 requirement 与 `docs/CONSTRAINTS.md` 的踩坑条目
+  读到
 - **AND** 本 spec 不引用任何已从工作树移除的报告文件路径
 
-#### Scenario: 纯诊断、不改运行时
+### Requirement: 必须分层定位 gdb 握手零响应的真因
 
-- **WHEN** 一次新的握手层诊断被执行
-- **THEN** 它仅新增诊断记录与 `tools/` 下的 probe 脚本
-- **AND** 不修改任何 `lua/ue/dap/*.lua` 运行时文件
+诊断 SHALL 分层复现并定位"gdbserver 存活但 gdb 初始握手零响应 / Connection shut
+down"的真因，覆盖端口监听、adb forward 链路、gdb 协议、server↔目标兼容、目标
+ptrace 状态。
 
-### Requirement: 定位 gdb 握手零响应 root cause
+#### Scenario: app uid listener 与 shell control 的同 binary A/B 判据
 
-诊断 SHALL 分层复现并定位 "gdbserver 存活但 gdb 初始握手零响应 / Connection shut down"
-的真因，覆盖端口监听、adb forward 链路、gdb 协议、server↔目标兼容、目标 ptrace 状态。
+- **WHEN** app-uid `lldb-server platform` 进程存活且端口 LISTEN，但正确 checksum
+  的 forwarded GDB packet 超时
+- **THEN** 诊断 SHALL 在同一捕获 serial、同一 device binary 上以 shell uid
+  server 仅作 handshake control（不得拿它执行 app attach）
+- **AND** 若 shell control 立即 ACK、app uid server 仍超时，结论 SHALL 限定为
+  该设备 `runas_app` 身份/策略差异证据，MUST NOT 泛化为所有设备
+- **AND** MUST NOT 把 shell handshake 成功当作可回退 attach 路线（K56 已证明
+  shell uid 可能无权 ptrace app）
 
-#### Scenario: 每层有判定
+### Requirement: 必须分层定位 source-file 断点崩溃层面
 
-- **WHEN** 逐层排查握手零响应
-- **THEN** 确认 gdbserver 是否在端口 listen（设备本地 `/proc/net/tcp` 或等价）
-- **AND** 确认 adb forward 能建连（connect 成功但零响应 → 排除链路，指向协议/server）
-- **AND** 用正确 checksum + ack 的 `$qSupported#<ck>` 区分"server 不说话"与"握手包格式错"
-- **AND** 必要时换 server 二进制对照握手层，判断是否 server↔UE 目标不兼容
-
-#### Scenario: 解释上一轮误判
-
-- **WHEN** 对比"握手零响应"与上一轮"tracer 稳定"
-- **THEN** 诊断说明 tracer 附上不等于 attach 成功，并指出上一轮是否漏测握手层
-
-### Requirement: 定位 source-file 断点崩溃层面
-
-诊断 SHALL 在握手通后用受控单条命令复现并定位 `3221226505` 的崩溃层面。
+诊断 SHALL 在握手通后用受控单条命令复现并定位 `3221226505` 的崩溃层面：分别
+单条执行 `image lookup --file <f> --line <N>`、`breakpoint set --address
+0x<addr>`、`breakpoint set -f <f> -l <N>`，记录哪一条导致 adapter 退出
+`3221226505`，定位崩溃层（DWARF / source 映射 / 通用 breakpoint set）。
 
 #### Scenario: 单条命令区分崩溃点
 
 - **WHEN** 握手与 attach 已稳定
 - **THEN** 分别单条执行 `image lookup --file <f> --line <N>`、
   `breakpoint set --address 0x<addr>`、`breakpoint set -f <f> -l <N>`
-- **AND** 记录哪一条导致 adapter 退出 `3221226505`，定位崩溃层（DWARF / source 映射 / 通用 breakpoint set）
+- **AND** 记录哪一条导致 adapter 退出 `3221226505`，定位崩溃层
 
-### Requirement: 区分正解与 workaround 的判据
+### Requirement: 区分正解与 workaround 必须有明确判据
 
-诊断 SHALL 给出明确判据，用于判断后续修复机制是语义正解还是 workaround。
+诊断 SHALL 给出明确判据：仅当某修复机制走与崩溃路径不同的 lldb 原生代码路径、
+且语义等价（同一 PC/同一断点行为）、并能解释为何不触发 root cause 时，才标记为
+"正解"；若只是"碰巧不崩"而无法解释，标记为 workaround 并不采纳。
 
 #### Scenario: 正解判定
 
 - **WHEN** 评估某修复机制（如 address 断点 / 换 server / 换命令序）
-- **THEN** 仅当它走与崩溃路径不同的 lldb 原生代码路径、且语义等价（同一 PC/同一断点行为）、并能解释为何不触发 root cause 时，才标记为"正解"
+- **THEN** 仅当它走与崩溃路径不同的 lldb 原生代码路径、且语义等价、并能解释
+  为何不触发 root cause 时，才标记为"正解"
 - **AND** 若只是"碰巧不崩"而无法解释，标记为 workaround 并不采纳
 
-### Requirement: 设备验证范围限定
+### Requirement: 每次诊断必须显式限定验证范围到单一捕获 serial
 
-每次诊断 SHALL 显式接收并捕获一个 probe serial，并在报告中记录该 serial 的取证范围；所有设备命令、forward 与收尾清理 MUST 使用同一个捕获值。规范与脚本 MUST NOT 固定某台历史设备，也不得在 probe 运行中重读 live selection 后改投其他设备。
+每次诊断 SHALL 显式接收并捕获一个 probe serial，并在报告中记录该 serial 的取证
+范围；所有设备命令、forward 与收尾清理 MUST 使用同一个捕获值。规范与脚本 MUST
+NOT 固定某台历史设备，也不得在 probe 运行中重读 live selection 后改投其他设备。
 
-#### Scenario: 单机取证
+#### Scenario: 单机取证收尾清理
 
-- **WHEN** 以 `SERIAL-PROBE` 执行任何设备侧 probe
-- **THEN** 所有设备命令 SHALL 指定 `-s SERIAL-PROBE`
-- **AND** 报告 SHALL 标明结论仅覆盖 `SERIAL-PROBE`，其他设备需各自取证
-- **AND** 收尾清理 SHALL 对同一 `SERIAL-PROBE` 执行 lldb-server 清理、移除本次 adb forward，并确认目标 `TracerPid=0`
+- **WHEN** 以某个 probe serial 执行任何设备侧 probe
+- **THEN** 所有设备命令 SHALL 指定该 serial，报告 SHALL 标明结论仅覆盖该设备
+- **AND** 收尾清理 SHALL 对同一 serial 执行 lldb-server 清理、移除本次 adb
+  forward，并确认目标 `TracerPid=0`
+
+## 选型与踩坑
+
+- **踩坑**：曾把"tracer 附上"误判为"attach 成功"，漏测了握手层——tracer 稳定
+  不等于 gdb 协议握手真正完成。处置：诊断必须显式区分 tracer 附上与握手完成
+  两个独立判据。
+- **重要事项**：判定"server 不说话"与"握手包格式错"需要用正确 checksum + ack
+  的 `$qSupported#<ck>` 区分，不能只看超时与否就归因。

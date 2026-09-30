@@ -12,7 +12,6 @@ local state = {
 }
 
 local trouble_modes = {
-  git_status = "ue_sidebar_git_status",
   buffers = "ue_sidebar_buffers",
   symbols = "ue_sidebar_symbols",
   diagnostics = "ue_sidebar_diagnostics",
@@ -22,7 +21,7 @@ local trouble_modes = {
 }
 
 local mode_labels = {
-  git_status = "Git Modified Files",
+  git_status = "Git Review (CodeDiff)",
   buffers = "Open Buffers",
   symbols = "File Symbols",
   diagnostics = "Diagnostics",
@@ -281,6 +280,12 @@ function M.open(kind)
     return
   end
 
+  if kind == "git_status" then
+    next_transition_id()
+    close_menu()
+    return require("utils.git_review").open()
+  end
+
   if M.is_open(kind) then
     open_trouble(kind)
     return
@@ -288,12 +293,6 @@ function M.open(kind)
 
   close_menu()
   state.last = kind
-
-  if kind == "git_status" then
-    pcall(function()
-      require("trouble.sources.ue_sidebar").request_refresh("git_status")
-    end)
-  end
 
   local had_sidebar = M.is_any_open()
   close_trouble_sidebars()

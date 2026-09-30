@@ -248,7 +248,7 @@ local function normalize_subject_membership(value)
 end
 
 local function find_compile_entry(index, path)
-  if not index or type(index) ~= "table" then
+  if not index or type(index) ~= "table" or index.complete == false then
     return nil
   end
   local by_file = index.by_file or index
@@ -323,20 +323,22 @@ function M.load_compilation_database(entries)
   if type(entries) ~= "table" then
     return nil, "entries-not-table"
   end
+  if not is_list(entries) then return nil, "entries-not-array" end
 
-  local out = {
-    entries = {},
-    by_file = {},
-  }
+  local out = { entries = {}, by_file = {}, by_index = {}, rejected = {} }
 
-  for _, entry in ipairs(entries) do
-    local parsed = M.parse_compilation_entry(entry)
+  for index, entry in ipairs(entries) do
+    local parsed, reason = M.parse_compilation_entry(entry)
     if parsed then
       out.entries[#out.entries + 1] = parsed
       out.by_file[match_key(parsed.file)] = parsed
+      out.by_index[index] = parsed
+    else
+      out.rejected[#out.rejected + 1] = { index = index, reason = reason }
     end
   end
 
+  out.complete = #out.rejected == 0
   return out
 end
 

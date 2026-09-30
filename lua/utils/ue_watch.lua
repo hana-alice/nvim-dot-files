@@ -52,12 +52,14 @@
 --                              shader_filelist, debounce_ms }
 --   M.stop()
 --   M.status()      - returns { running, pending_adds, pending_dels,
---                               last_event_at, watch_root }
+--                               last_event_at, watch_root, watch_mode }
 -- ----------------------------------------------------------------------------
 
 local uv = vim.uv or vim.loop
 local M = {}
 local file_lock = require("ue.file_lock")
+local dirty_save = require("utils.dirty_save")
+local native_watch = require("utils.ue_watch_native")
 
 -- Defined later via assignment so earlier closures bind this local rather than a
 -- shadowing declaration (an undeclared name would instead resolve as a global).
@@ -67,7 +69,8 @@ local add_to_persistent_dirty
 -- State
 -- ---------------------------------------------------------------------------
 
-local state = {
+local function new_state()
+  return {
   handle = nil,
   opts = nil,
   pending_add = {},  -- normalized abs path -> true
@@ -92,7 +95,17 @@ local state = {
   csearch_index_checked_at = 0,
   ignored_preindex_changes = 0,
   dirty_save_retry = nil,
+  generation = 0,
 }
+end
+local state = new_state()
+
+local function owned_callback(callback)
+  local owner, generation = state, state.generation
+  return function(...)
+    if state == owner and owner.generation == generation then return callback(...) end
+  end
+end
 
 -- Files we care about. Anything else is dropped at the watcher boundary so
 -- that a giant `git switch` over a content-heavy branch (.uasset / .umap
@@ -159,6 +172,7 @@ end
 -- LAST_WRITE is older/equal, the reported event did not introduce content
 -- after that index. Missing evidence stays conservative and records the file.
 local function should_track_existing_event(file_stat, events, index_mtime)
+  if events and events.native then return true end
   if not events or events.rename or not events.change then return true end
   if not index_mtime then return true end
   local after = mtime_is_after(file_stat, index_mtime)
@@ -308,7 +322,7 @@ local function flush()
   if state.flush_running then
     -- Re-arm so we don't lose work that arrived during the previous flush.
     if state.timer then
-      state.timer:start(state.opts.debounce_ms or 1500, 0, vim.schedule_wrap(flush))
+      state.timer:start(state.opts.debounce_ms or 1500, 0, vim.schedule_wrap(owned_callback(flush)))
     end
     return
   end
@@ -332,6 +346,11 @@ local function flush()
 
   log_info(("flush: +%d -%d"):format(#adds, #dels))
 
+  local on_source_changed = state.opts and state.opts.on_source_changed
+  if type(on_source_changed) == "function" then
+    for _, paths in ipairs({ adds, dels }) do for _, path in ipairs(paths) do
+      if classify(path) == "code" then on_source_changed(path) end end end
+  end
   -- Fan out. Order: CDB first (so clangd has the file before csearch hits
   -- might race-trigger a goto), then csearch (record-only no-op — see D9),
   -- then gtags shaders.
@@ -359,7 +378,7 @@ local function schedule_flush()
   state.last_event_at = uv.now()
   if state.timer then
     state.timer:stop()
-    state.timer:start(state.opts.debounce_ms or 1500, 0, vim.schedule_wrap(flush))
+    state.timer:start(state.opts.debounce_ms or 1500, 0, vim.schedule_wrap(owned_callback(flush)))
   end
 end
 
@@ -411,45 +430,56 @@ function M.start(opts)
     log_warn("start: missing opts.root")
     return false
   end
-  if state.handle then M.stop() end
+  M.stop()
+  if not state.opts or state.opts.root ~= opts.root
+      or state.opts.dirty_json_path ~= opts.dirty_json_path then
+    state = new_state()
+  end
 
   state.opts = vim.tbl_extend("force", { debounce_ms = 1500 }, opts)
   state.ignored_preindex_changes = 0
-  refresh_csearch_index_mtime()
-  state.handle = uv.new_fs_event()
+  native_watch.reset(); refresh_csearch_index_mtime(); state.timer = uv.new_timer()
+  local native = native_watch.start(opts.root, opts, vim.schedule_wrap(owned_callback(on_event))); if native then
+    state.handle = native; log_info("watching " .. opts.root .. " (native content events)"); return true end
+  state.handle = uv.new_fs_event(); native_watch.set_fallback()
   if not state.handle then
     log_warn("start: uv.new_fs_event() returned nil")
+    M.stop()
     return false
   end
-  state.timer = uv.new_timer()
-
   -- recursive=true is a no-op on Linux but mandatory on Windows (UE tree
   -- has thousands of subdirs; one watch per subdir would exhaust handles).
   local ok, start_err = pcall(state.handle.start, state.handle, opts.root, {
     watch_entry = false,
     stat = false,
     recursive = true,
-  }, vim.schedule_wrap(on_event))
-  if not ok then
+  }, vim.schedule_wrap(owned_callback(on_event)))
+  if not ok or start_err == nil then
     log_warn("start: " .. tostring(start_err))
     M.stop()
     return false
   end
-  log_info("watching " .. opts.root)
+  log_info("watching " .. opts.root .. " (libuv)")
   return true
 end
 
 function M.stop()
+  state.generation = state.generation + 1
   if state.timer then
     state.timer:stop()
     state.timer:close()
     state.timer = nil
   end
   if state.handle then
-    state.handle:stop()
-    state.handle:close()
+    pcall(state.handle.stop, state.handle); pcall(state.handle.close, state.handle)
     state.handle = nil
   end
+  native_watch.stop()
+  -- Preserve unflushed edits in the outgoing bucket without invoking providers
+  -- that resolve the now-current UE selection. Retry closures retain this owner.
+  local adds = {}
+  for path in pairs(state.pending_add) do adds[#adds + 1] = path end
+  add_to_persistent_dirty(adds, state)
   state.pending_add = {}
   state.pending_del = {}
   state.flush_running = false
@@ -461,20 +491,22 @@ function M.status()
     for _ in pairs(t) do n = n + 1 end
     return n
   end
-  return {
-    running = state.handle ~= nil,
+  local status = {
+    running = state.handle ~= nil and (state.handle.phase == nil or state.handle.phase == "starting"
+      or state.handle.phase == "running"),
     pending_adds = count(state.pending_add),
     pending_dels = count(state.pending_del),
     last_event_at = state.last_event_at,
     watch_root = state.opts and state.opts.root or nil,
     ignored_preindex_changes = state.ignored_preindex_changes,
   }
+  return vim.tbl_extend("force", status, native_watch.status())
 end
 
 function M.flush_now()
   -- Test/debug helper: bypass the debounce timer.
   if state.timer then state.timer:stop() end
-  vim.schedule(flush)
+  vim.schedule(owned_callback(flush))
 end
 
 -- ---------------------------------------------------------------------------
@@ -484,68 +516,23 @@ end
 local PERSISTENT_DIRTY_CAP = 1000  -- LRU-ish hard cap; see save_persistent_dirty
 local PERSISTENT_DIRTY_WARN = 500  -- nag threshold
 
-local function persistent_dirty_path()
-  return state.opts and state.opts.dirty_json_path or nil
+local function persistent_dirty_path(owner)
+  owner = owner or state
+  return owner.opts and owner.opts.dirty_json_path or nil
 end
 
-local function load_persistent_dirty()
+local function load_persistent_dirty(owner)
+  local state = owner or state
   if state.persistent_dirty_loaded then return end
   state.persistent_dirty_loaded = true
-  local p = persistent_dirty_path()
-  if not p then return end
-  local fd, _ = io.open(p, "r")
-  if not fd then return end
-  local content = fd:read("*a")
-  fd:close()
-  if not content or content == "" then return end
-  -- Two formats accepted:
-  --   1) JSON array of paths (preferred for atomic write/read)
-  --   2) Newline-separated paths (back-compat / hand-edit friendly)
-  local ok, decoded = pcall(vim.json.decode, content)
-  if ok and type(decoded) == "table" then
-    for _, abs in ipairs(decoded) do
-      if type(abs) == "string" and abs ~= "" then
-        state.persistent_dirty[abs:lower()] = abs
-      end
-    end
-  else
-    for line in content:gmatch("[^\r\n]+") do
-      state.persistent_dirty[line:lower()] = line
-    end
-  end
+  local p = persistent_dirty_path(state)
+  if p then dirty_save.merge_from_disk(state, p) end
 end
 
-local function merge_persistent_dirty_from_disk(p)
-  local fd = io.open(p, "rb")
-  if not fd then return end
-  local content = fd:read("*a")
-  fd:close()
-  local ok, decoded = pcall(vim.json.decode, content or "")
-  if ok and type(decoded) == "table" then
-    for _, abs in ipairs(decoded) do
-      if type(abs) == "string" and abs ~= "" then
-        state.persistent_dirty[abs:lower()] = abs
-      end
-    end
-  end
-end
-
-local function save_persistent_dirty()
-  local p = persistent_dirty_path()
-  if not p then return end
-  local lease = file_lock.acquire(p .. ".lock")
-  if not lease then
-    if not state.dirty_save_retry then
-      state.dirty_save_retry = vim.defer_fn(function()
-        state.dirty_save_retry = nil
-        save_persistent_dirty()
-      end, 25)
-    end
-    return
-  end
+local function collect_persistent_dirty(state, p)
   -- The in-memory set may have been loaded before another Neovim wrote its
   -- changes. Re-read under the lease and union before publishing.
-  merge_persistent_dirty_from_disk(p)
+  dirty_save.merge_from_disk(state, p)
   -- Build sorted array (deterministic ordering -> no spurious git diffs if
   -- somebody ever puts this file under VCS for debugging).
   local arr = {}
@@ -572,51 +559,48 @@ local function save_persistent_dirty()
     state.persistent_dirty = {}
     for _, abs in ipairs(arr) do state.persistent_dirty[abs:lower()] = abs end
     state._dirty_capped = true
+    state._dirty_overflow_at = math.max(state._dirty_overflow_at or 0, os.time())
     if not state._warned_dirty_capped then
       state._warned_dirty_capped = true
       -- Probe: cap-hit is the F2 signal the next session reads first.
       pcall(function()
-        require("utils.probe").record("dirty-set-flood", "cap-hit",
+        local probe = require("utils.probe")
+        probe.observe("dirty-set-flood", "durable-overflow-2026-09-24")
+        probe.record("dirty-set-flood", "cap-hit",
           { dropped = dropped, cap = PERSISTENT_DIRTY_CAP })
       end)
       vim.schedule(function()
-        log_warn(("dirty set hit cap=%d — %d oldest entries DROPPED; grep overlay is now lossy. "
-          .. "Run :UEPrepare (or :UEPrepareIncremental) to reindex and reset.")
+        log_warn(("dirty set hit cap=%d — %d entries DROPPED; search coverage is incomplete. "
+          .. "Run :UEBuildCsearch to rebuild the full search index.")
           :format(PERSISTENT_DIRTY_CAP, dropped))
       end)
     end
   end
-  -- Atomic write: tmp + rename.
-  local dir = vim.fn.fnamemodify(p, ":h")
-  if vim.fn.isdirectory(dir) == 0 then vim.fn.mkdir(dir, "p") end
-  local tmp = p .. (".tmp.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
-  local fd, err = io.open(tmp, "w")
-  if not fd then
-    file_lock.release(lease)
-    log_debug("save dirty.json open failed: " .. tostring(err))
-    return
-  end
-  fd:write(vim.json.encode(arr))
-  fd:close()
-  local ok, rename_err = vim.uv.fs_rename(tmp, p)
-  if not ok then
-    pcall(vim.fn.delete, tmp)
-    log_debug("save dirty.json rename failed: " .. tostring(rename_err))
-  end
-  file_lock.release(lease)
-  -- Nag once per crossing — caller can debounce externally if needed.
-  if #arr >= PERSISTENT_DIRTY_WARN and not state._warned_dirty_high then
-    state._warned_dirty_high = true
-    vim.schedule(function()
-      vim.notify(("[ue.watch] %d files dirty since last :UEPrepare. Consider :UEPrepareReindex."):format(#arr),
-        vim.log.levels.INFO)
-    end)
-  end
+  return arr
 end
 
-add_to_persistent_dirty = function(paths)
+local function save_persistent_dirty(owner)
+  local state = owner or state
+  local p = persistent_dirty_path(state)
+  if not p then return end
+  dirty_save.save(state, p, function()
+    return collect_persistent_dirty(state, p)
+  end, function(arr)
+    -- Nag once per crossing — caller can debounce externally if needed.
+    if #arr >= PERSISTENT_DIRTY_WARN and not state._warned_dirty_high then
+      state._warned_dirty_high = true
+      vim.schedule(function()
+        vim.notify(("[ue.watch] %d files dirty since last :UEPrepare. Consider :UEPrepareReindex."):format(#arr),
+          vim.log.levels.INFO)
+      end)
+    end
+  end, log_warn)
+end
+
+add_to_persistent_dirty = function(paths, owner)
+  local state = owner or state
   if #paths == 0 then return end
-  load_persistent_dirty()
+  load_persistent_dirty(state)
   local changed = false
   for _, abs in ipairs(paths) do
     local k = abs:lower()
@@ -625,7 +609,7 @@ add_to_persistent_dirty = function(paths)
       changed = true
     end
   end
-  if changed then save_persistent_dirty() end
+  if changed then save_persistent_dirty(state) end
 end
 
 -- Public API: snapshot the cumulative dirty set.
@@ -634,7 +618,7 @@ end
 function M.snapshot_persistent_dirty()
   load_persistent_dirty()
   local p = persistent_dirty_path()
-  if p then merge_persistent_dirty_from_disk(p) end
+  if p then dirty_save.merge_from_disk(state, p) end
   local arr = {}
   for _, abs in pairs(state.persistent_dirty) do arr[#arr + 1] = abs end
   return arr
@@ -659,7 +643,7 @@ function M.remove_persistent_dirty(paths, reason, covered_before, remove_missing
     end
     if covered then remove[normalized:lower()] = true end
   end
-  if not next(remove) then return true end
+  if not next(remove) and not remove_missing then return true end
   local p = persistent_dirty_path()
   if not p then
     for key in pairs(remove) do state.persistent_dirty[key] = nil end
@@ -671,7 +655,7 @@ function M.remove_persistent_dirty(paths, reason, covered_before, remove_missing
     log_warn("dirty.json remains conservative; another Neovim owns it: " .. tostring(lock_err))
     return false
   end
-  merge_persistent_dirty_from_disk(p)
+  dirty_save.merge_from_disk(state, p)
   for key in pairs(remove) do state.persistent_dirty[key] = nil end
   local arr = {}
   for _, abs in pairs(state.persistent_dirty) do arr[#arr + 1] = abs end
@@ -683,12 +667,20 @@ function M.remove_persistent_dirty(paths, reason, covered_before, remove_missing
     file_lock.release(lease)
     return false
   end
-  fd:write(vim.json.encode(arr))
-  fd:close()
+  local wrote_ok, wrote = pcall(fd.write, fd, vim.json.encode(arr))
+  local closed_ok, closed = pcall(fd.close, fd)
+  if not wrote_ok or not wrote or not closed_ok or not closed then
+    pcall(vim.fn.delete, tmp); file_lock.release(lease)
+    return false
+  end
   local replaced = vim.uv.fs_rename(tmp, p)
   if not replaced then pcall(vim.fn.delete, tmp) end
+  local cleared = true
+  if replaced and remove_missing and covered_before then
+    cleared = dirty_save.clear_overflow(state, p, covered_before)
+  end
   file_lock.release(lease)
-  if not replaced then return false end
+  if not replaced or not cleared then return false end
   state.persistent_dirty_loaded = true
   log_info(("persistent_dirty removed covered paths (reason=%s, remaining=%d)"):format(
     reason or "?", #arr))
@@ -713,10 +705,16 @@ function M.clear_persistent_dirty(reason)
         log_warn("cannot create dirty.json reset file: " .. tmp)
         return false
       end
-      fd:write("[]")
-      fd:close()
+      local wrote_ok, wrote = pcall(fd.write, fd, "[]")
+      local closed_ok, closed = pcall(fd.close, fd)
+      if not wrote_ok or not wrote or not closed_ok or not closed then
+        pcall(vim.fn.delete, tmp); file_lock.release(lease)
+        log_warn("cannot write dirty.json reset file")
+        return false
+      end
       local replaced, replace_err = vim.uv.fs_rename(tmp, p)
       if not replaced then pcall(vim.fn.delete, tmp) end
+      if replaced then replaced, replace_err = dirty_save.clear_overflow(state, p) end
       file_lock.release(lease)
       if not replaced then
         log_warn("cannot reset dirty.json: " .. tostring(replace_err))
@@ -732,6 +730,7 @@ function M.clear_persistent_dirty(reason)
   state._warned_dirty_high = false
   state._warned_dirty_capped = false
   state._dirty_capped = false
+  state._dirty_overflow_at = nil
   -- A successful prepare calls this after the new index is installed. Advance
   -- the change-event anchor so queued/pre-index metadata notifications cannot
   -- immediately repopulate the set that was just cleared.
@@ -743,6 +742,8 @@ end
 -- Public API: stats for :UEDirtyStatus.
 function M.persistent_dirty_status()
   load_persistent_dirty()
+  local p = persistent_dirty_path()
+  if p then dirty_save.merge_from_disk(state, p) end
   local n = 0
   for _ in pairs(state.persistent_dirty) do n = n + 1 end
   return {
@@ -780,6 +781,7 @@ end
 M._provider_csearch_add_for_test = provider_csearch_add
 M._set_opts_for_test = function(opts) state.opts = opts end
 
+M._set_content_watcher_for_test = native_watch.set_for_test
 -- Test seam: seed the in-memory persistent dirty set without a real fs_event,
 -- so D-3b tests can verify clear_persistent_dirty zeroes it. Marks it loaded so
 -- a later count read doesn't lazy-load over the top.
@@ -788,7 +790,6 @@ M._seed_persistent_dirty_for_test = function(paths)
   state.persistent_dirty = {}
   for _, p in ipairs(paths or {}) do state.persistent_dirty[tostring(p):lower()] = p end
 end
-
 -- Test seam (F2): run the save path (cap trim + capped flag) on the current
 -- in-memory set without needing a real dirty_json_path write target.
 M._save_persistent_dirty_for_test = function()

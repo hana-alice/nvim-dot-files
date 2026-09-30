@@ -246,6 +246,20 @@ function M.validate_query_response(frame)
   if type(frame.metrics) ~= "table" then
     return false, "response.metrics is required"
   end
+  for _, field in ipairs({ "declaration", "definition" }) do
+    if frame[field] ~= nil then
+      local ok, err = validate_location(frame[field])
+      if not ok then return false, "query " .. field .. ": " .. err end
+    end
+  end
+  if frame.state == "resolved" then
+    if type(frame.usr) ~= "string" or frame.usr == "" then
+      return false, "resolved query requires canonical usr"
+    end
+    if frame.declaration == nil and frame.definition == nil then
+      return false, "resolved query requires declaration or definition"
+    end
+  end
   return true
 end
 
@@ -274,8 +288,11 @@ local function validate_lookup_response(frame)
     if not ok then return false, "lookup-definition definition: " .. err end
   end
   if frame.state == "resolved" then
-    if frame.declaration == nil and frame.definition == nil then
-      return false, "resolved lookup-definition requires declaration or definition"
+    if frame.definition == nil then
+      return false, "resolved lookup-definition requires definition"
+    end
+    if type(frame.usr) ~= "string" or frame.usr == "" then
+      return false, "resolved lookup-definition requires canonical usr"
     end
   end
   return true
@@ -408,6 +425,7 @@ function M.new_decoder(opts)
   opts = opts or {}
   local state = {
     buffer = "",
+    discarding = false,
     on_frame = assert(opts.on_frame, "on_frame is required"),
     on_error = assert(opts.on_error, "on_error is required"),
   }
@@ -438,27 +456,32 @@ function M.new_decoder(opts)
 
   function decoder:push(chunk)
     if type(chunk) ~= "string" or chunk == "" then return end
-    state.buffer = state.buffer .. chunk
-    if #state.buffer > M.MAX_LINE_BYTES and not state.buffer:find("\n", 1, true) then
-      emit_error(nil, "line-too-long", "protocol line exceeded max size", {
-        max_bytes = M.MAX_LINE_BYTES,
-      })
-      state.buffer = ""
-      return
-    end
-    while true do
-      local newline = state.buffer:find("\n", 1, true)
-      if not newline then break end
-      local line = state.buffer:sub(1, newline - 1)
-      if line:sub(-1) == "\r" then
-        line = line:sub(1, -2)
+    local offset = 1
+    while offset <= #chunk do
+      local newline = chunk:find("\n", offset, true)
+      local last = newline and newline - 1 or #chunk
+      if state.discarding then
+        if newline then state.discarding = false end
+      elseif #state.buffer + last - offset + 1 > M.MAX_LINE_BYTES then
+        state.buffer = ""
+        state.discarding = not newline
+        emit_error(nil, "line-too-long", "protocol line exceeded max size", { max_bytes = M.MAX_LINE_BYTES })
+      else
+        state.buffer = state.buffer .. chunk:sub(offset, last)
+        if newline then
+          local line = state.buffer
+          state.buffer = ""
+          if line:sub(-1) == "\r" then line = line:sub(1, -2) end
+          consume_line(line)
+        end
       end
-      state.buffer = state.buffer:sub(newline + 1)
-      consume_line(line)
+      if not newline then break end
+      offset = newline + 1
     end
   end
 
   function decoder:finish()
+    if state.discarding then state.discarding = false; state.buffer = ""; return end
     if state.buffer == "" then return end
     local tail = state.buffer
     state.buffer = ""

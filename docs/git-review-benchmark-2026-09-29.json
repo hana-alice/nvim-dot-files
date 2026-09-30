@@ -1,0 +1,305 @@
+{
+  "schema_version": 1,
+  "method": [
+    "Windows isolated clean headless; actual repository plugin configuration and real mini.icons provider; CodeDiff default git_review.open route.",
+    "No filesystem or plugin cache clearing; no forced garbage collection or JIT flushing.",
+    "First process open is called cold; operating-system and Git filesystem caches are not cold-controlled.",
+    "Open/select readiness includes 5ms polling and a 30ms stable completion window. Hunk timing includes actual cursor movement and headless redraw.",
+    "CPU/RSS describe the isolated Neovim process including its libuv workers, exclude Git subprocess CPU and total host usage.",
+    "No Neovide/GPU visual rendering claim; scheduled-callback timing adds observer overhead and does not clamp behavior."
+  ],
+  "baseline": {
+    "engine": "diffview",
+    "plugin_commit": "4516612fe98ff56ae0415a259ff6361a89419b0a",
+    "tracked": 262001,
+    "dirty": 4,
+    "untracked_before": 10552,
+    "untracked_after": 10553,
+    "observed_files": 10556,
+    "input_stable": false,
+    "index_stable": true,
+    "target_bytes_stable": null,
+    "cold_open_ms": 8593.963699996471,
+    "warm_open": {
+      "count": 20,
+      "p95_ms": 9202.781200006604,
+      "max_ms": 9442.859500005841,
+      "p50_ms": 8167.281199991703
+    },
+    "switch_file": {
+      "count": 20,
+      "p95_ms": 124.3898999989033,
+      "max_ms": 538.3874000012875,
+      "p50_ms": 109.0719999969006
+    },
+    "jump_hunk": {
+      "count": 20,
+      "p95_ms": 0.7973999977111816,
+      "max_ms": 2.054800003767014,
+      "p50_ms": 0.4071999937295914
+    },
+    "hunk_action": null,
+    "hunk_redraw": null,
+    "max_heartbeat_extra_ms": 4758.226000010967,
+    "max_phase_heartbeat_p95_ms": 86.1845999956131,
+    "measured_subprocesses": 299.0,
+    "measured_cpu_seconds": 83.79700000000001,
+    "max_sampled_rss_mib": 3956.05078125,
+    "closed_rss_mib": 3946.55078125,
+    "idle_duration_ms": 61027.22760000825,
+    "idle_subprocesses": 0,
+    "idle_cpu_seconds": 0.1559999999999917,
+    "closed_subprocesses": 0,
+    "closed_cpu_seconds": 0,
+    "closed_tree": null,
+    "closed_worker_active": 0,
+    "closed_worker_queued": 0,
+    "handles_after_close": {
+      "timer": 1
+    }
+  },
+  "candidate": {
+    "engine": "codediff",
+    "plugin_commit": "09d9ebef2cc5a5c04db7a349cd6c61bdf84ecc8e",
+    "tracked": 262001,
+    "dirty": 4,
+    "untracked_before": 10567,
+    "untracked_after": 10567,
+    "observed_files": 10571,
+    "input_stable": true,
+    "index_stable": true,
+    "target_bytes_stable": true,
+    "cold_open_ms": 3840.650200009346,
+    "warm_open": {
+      "max_ms": 4013.469999998808,
+      "p95_ms": 4000.469400003552,
+      "p50_ms": 3579.159700006247,
+      "count": 20
+    },
+    "switch_file": {
+      "max_ms": 147.8840000033379,
+      "p95_ms": 123.5569000095129,
+      "p50_ms": 107.6662999987602,
+      "count": 20
+    },
+    "jump_hunk": {
+      "max_ms": 14.77069999277592,
+      "p95_ms": 1.339100003242493,
+      "p50_ms": 0.8620000034570694,
+      "count": 20
+    },
+    "hunk_action": {
+      "max_ms": 0.2782000005245209,
+      "p95_ms": 0.1909999996423721,
+      "p50_ms": 0.1311000138521194,
+      "count": 20
+    },
+    "hunk_redraw": {
+      "max_ms": 14.66499999165535,
+      "p95_ms": 1.206200003623962,
+      "p50_ms": 0.7751000076532364,
+      "count": 20
+    },
+    "max_heartbeat_extra_ms": 63.14350000023842,
+    "max_phase_heartbeat_p95_ms": 26.77120000123978,
+    "measured_subprocesses": 106.0,
+    "measured_cpu_seconds": 21.250000000000004,
+    "max_sampled_rss_mib": 605.33984375,
+    "closed_rss_mib": 560.59375,
+    "idle_duration_ms": 62042.62819999456,
+    "idle_subprocesses": 0,
+    "idle_cpu_seconds": 0.2669999999999995,
+    "closed_subprocesses": 0,
+    "closed_cpu_seconds": 0,
+    "closed_tree": {
+      "applied": true,
+      "buffers": 0,
+      "pending": 0,
+      "prepared": 0,
+      "builds": 0
+    },
+    "closed_worker_active": 0,
+    "closed_worker_queued": 0,
+    "handles_after_close": {
+      "timer": 1
+    }
+  },
+  "paired_actions": {
+    "diffview": {
+      "engine": "diffview",
+      "plugin_commit": "4516612fe98ff56ae0415a259ff6361a89419b0a",
+      "tracked": 262001,
+      "dirty": 4,
+      "untracked_before": 10567,
+      "untracked_after": 10567,
+      "observed_files": 10571,
+      "input_stable": true,
+      "index_stable": true,
+      "target_bytes_stable": true,
+      "cold_open_ms": 8833.159899994731,
+      "warm_open": {
+        "count": 0,
+        "max_ms": 0,
+        "p95_ms": 0,
+        "p50_ms": 0
+      },
+      "switch_file": {
+        "count": 20,
+        "max_ms": 553.3172000050545,
+        "p95_ms": 202.660300001502,
+        "p50_ms": 123.2785999923944
+      },
+      "jump_hunk": {
+        "count": 20,
+        "max_ms": 1.970599994063377,
+        "p95_ms": 0.615200012922287,
+        "p50_ms": 0.3471000045537949
+      },
+      "hunk_action": {
+        "count": 20,
+        "max_ms": 0.0812000036239624,
+        "p95_ms": 0.06230001151561737,
+        "p50_ms": 0.03929999470710754
+      },
+      "hunk_redraw": {
+        "count": 20,
+        "max_ms": 1.93129999935627,
+        "p95_ms": 0.5529000014066696,
+        "p50_ms": 0.3011000007390976
+      },
+      "max_heartbeat_extra_ms": 3304.817699998617,
+      "max_phase_heartbeat_p95_ms": 109.0328000038862,
+      "measured_subprocesses": 19.0,
+      "measured_cpu_seconds": 6.141000000000001,
+      "max_sampled_rss_mib": 344.3671875,
+      "closed_rss_mib": 335.03125,
+      "idle_duration_ms": 0.009700000286102295,
+      "idle_subprocesses": 0,
+      "idle_cpu_seconds": 0,
+      "closed_subprocesses": 0,
+      "closed_cpu_seconds": 0.03200000000000003,
+      "closed_tree": null,
+      "closed_worker_active": 0,
+      "closed_worker_queued": 0,
+      "handles_after_close": {
+        "timer": 1
+      }
+    },
+    "codediff": {
+      "engine": "codediff",
+      "plugin_commit": "09d9ebef2cc5a5c04db7a349cd6c61bdf84ecc8e",
+      "tracked": 262001,
+      "dirty": 4,
+      "untracked_before": 10567,
+      "untracked_after": 10567,
+      "observed_files": 10571,
+      "input_stable": true,
+      "index_stable": true,
+      "target_bytes_stable": true,
+      "cold_open_ms": 3731.135900005698,
+      "warm_open": {
+        "max_ms": 0,
+        "p95_ms": 0,
+        "p50_ms": 0,
+        "count": 0
+      },
+      "switch_file": {
+        "max_ms": 203.7978999912739,
+        "p95_ms": 200.4518999904394,
+        "p50_ms": 108.8368999958038,
+        "count": 20
+      },
+      "jump_hunk": {
+        "max_ms": 14.28869999945164,
+        "p95_ms": 1.44149999320507,
+        "p50_ms": 1.047399997711182,
+        "count": 20
+      },
+      "hunk_action": {
+        "max_ms": 0.3050999939441681,
+        "p95_ms": 0.2826999872922897,
+        "p50_ms": 0.1542999893426895,
+        "count": 20
+      },
+      "hunk_redraw": {
+        "max_ms": 14.183399990201,
+        "p95_ms": 1.300599992275238,
+        "p50_ms": 0.7820999920368195,
+        "count": 20
+      },
+      "max_heartbeat_extra_ms": 45.24710001051426,
+      "max_phase_heartbeat_p95_ms": 26.54370000958443,
+      "measured_subprocesses": 26.0,
+      "measured_cpu_seconds": 7.953999999999998,
+      "max_sampled_rss_mib": 160.47265625,
+      "closed_rss_mib": 112.37109375,
+      "idle_duration_ms": 0.05539999902248383,
+      "idle_subprocesses": 0,
+      "idle_cpu_seconds": 0,
+      "closed_subprocesses": 0,
+      "closed_cpu_seconds": 0.01600000000000001,
+      "closed_tree": {
+        "builds": 0,
+        "buffers": 0,
+        "pending": 0,
+        "prepared": 0,
+        "applied": true
+      },
+      "closed_worker_active": 0,
+      "closed_worker_queued": 0,
+      "handles_after_close": {
+        "timer": 1
+      }
+    },
+    "identical_initial_status": true,
+    "identical_coverage": true,
+    "both_input_stable": true,
+    "both_index_stable": true,
+    "both_target_bytes_stable": true
+  },
+  "candidate_audit": {
+    "opens": 21,
+    "unique_counts": [
+      10571
+    ],
+    "unique_path_hashes": 1,
+    "actual_explorer_options": {
+      "untracked": "all",
+      "width": 38,
+      "view_mode": "tree",
+      "line_stats": {
+        "enabled": true,
+        "count_untracked": false
+      },
+      "auto_refresh": false
+    },
+    "integration_hashes": {
+      "lua/workarounds/codediff/safe_mutations.lua": "0a1ce3579945f153d99538085ff85130794a55fc1e339575b8f46f36d3134b6f",
+      "lua/workarounds/codediff/event_refresh.lua": "3d0fc091ca2b518b2503ad5077ee51c9cc78ea84ade4b12feb8c630788587486",
+      "lua/workarounds/codediff/binary_files.lua": "1a092353abf4ea872637ae63b76819c295db4e7b1042c1daa25de70e61122bd1",
+      "lua/workarounds/codediff/history_paths.lua": "907770e5e21804e3ed6e79025f45b56a0265a1992c82187e5a6f6b18901f547d",
+      "lua/workarounds/codediff/large_tree.lua": "a05cd5e86a6f81b7838d772b88abafe9bbf149680185437b782aac6cdb27e497",
+      "lua/workarounds/codediff/threaded_git.lua": "441746e2aee4835f53ce77895026f2904b32428a568698c76b7847a5489087e9",
+      "lua/plugins/codediff.lua": "bf59b425dd1ce06b5d6fde6a5831f600858bad9e0f9fda9a0dce1cbf0031d986",
+      "lua/utils/git_review.lua": "331e06794d1c042725ac5811cb3b2ce2afa2edca42f9fac47b4744df2353b70f"
+    },
+    "fingerprint_encoding": "SHA256(base64(raw bytes)); permits binary index/NUL-delimited Git output"
+  },
+  "gate": {
+    "warm_ratio": 0.43470221806432613,
+    "switch_ratio_against_earlier_baseline": 0.9933033149042024,
+    "paired_switch_ratio": 0.9891029470939979,
+    "hunk_budget_ms": 2.0,
+    "old_hunk_ratio_gate_passed": false,
+    "revised_hunk_budget_passed": true,
+    "own_slow_callbacks_over_100": 0
+  },
+  "limitations": [
+    "Earlier warm-open baseline finished with one additional externally-created untracked file; do not describe all old warm samples as identical input.",
+    "Independent work added untracked diagnostic files between earlier and final runs. Later private manifests prove additions without removed paths; no files were hidden to improve timing.",
+    "Final candidate 21 opens had identical complete coverage and stable before/after status, index and target bytes; the paired actions also used identical stable status and coverage.",
+    "Original hunk-only proportional gate remains recorded as failed. Only that gate was explicitly revised to max(1.2 times baseline, 2ms); all other limits remain unchanged.",
+    "Prior candidates had proven 107-111ms own callbacks and uncleared explorer states; the formatter allocation and cleanup fixes precede this verified candidate.",
+    "Raw reports and path manifests remain private in the system temporary directory; this aggregate excludes private benchmark-repository paths, source filenames and Git configuration contents."
+  ]
+}

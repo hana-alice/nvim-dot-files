@@ -573,10 +573,19 @@ t.describe("core_health: real deterministic audit", function()
 
     t.assert_eq(first.schema_version, 1)
     t.assert_eq(first.mode, "deterministic")
-    t.assert_eq(second.overall, first.overall)
+    local function non_pass(report)
+      local out = {}
+      for _, item in ipairs(report.checks or {}) do
+        if item.status ~= "PASS" then out[#out + 1] = item.id .. "=" .. item.status .. " (" .. tostring(item.summary)
+          .. (type(item.next_step) == "string" and ("; " .. item.next_step) or "") .. ")" end
+      end
+      return table.concat(out, "; ")
+    end
+    t.assert_eq(second.overall, first.overall,
+      "first: " .. non_pass(first) .. " | second: " .. non_pass(second))
     t.assert_true(
       first.overall == "PASS" or first.overall == "DEGRADED",
-      "external tools may pass or block, but deterministic essentials must not fail"
+      "external tools may pass or block, but deterministic essentials must not fail: " .. non_pass(first)
     )
     t.assert_eq(status_shape(second), status_shape(first))
     t.assert_eq(status_by_id(first, "startup.config"), "PASS")
@@ -618,7 +627,7 @@ t.describe("core_health: CLI", function()
 
   t.it("parses --json --live --filter and emits only the selected capability", function()
     local completed = run_cli({ "--json", "--live", "--filter", "startup" })
-    t.assert_eq(completed.code, 0, completed.stderr)
+    t.assert_eq(completed.code, 0, tostring(completed.stderr) .. " | stdout: " .. tostring(completed.stdout))
     local ok, report = pcall(vim.json.decode, completed.stdout or "")
     t.assert_true(ok, "CLI stdout must be one JSON report: " .. tostring(completed.stdout))
     t.assert_eq(report.mode, "live")

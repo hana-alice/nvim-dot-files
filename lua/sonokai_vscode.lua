@@ -1,0 +1,166 @@
+-- Sonokai Espresso for VS Code 0.2.9 (sainnhe.sonokai), adapted to Neovim.
+-- Source: themes/sonokai-espresso.json in the installed VS Code extension.
+-- Reuse the existing Sonokai plugin; only its Espresso presentation is adjusted.
+local M = {}
+
+function M.apply()
+  local c = {
+    bg = "#312c2b",
+    fg = "#e4e3e1",
+    grey = "#90817b",
+    sidebar = "#282523",
+    panel = "#352f2d",
+    menu = "#393230",
+    border = "#4e433f",
+    selected = "#49403c",
+    red = "#f86882",
+    orange = "#f08d71",
+    yellow = "#f0c66f",
+    green = "#a6cd77",
+    blue = "#81d0c9",
+    purple = "#9fa0e1",
+  }
+  -- VS Code accepts RGBA; Neovim backgrounds need the composited RGB.
+  local function overlay(hex)
+    local alpha = tonumber(hex:sub(8, 9), 16) / 255
+    local rgb = "#"
+    for i = 2, 6, 2 do
+      local front = tonumber(hex:sub(i, i + 1), 16)
+      local back = tonumber(c.bg:sub(i, i + 1), 16)
+      rgb = rgb .. string.format("%02x", math.floor(front * alpha + back * (1 - alpha) + 0.5))
+    end
+    return rgb
+  end
+  local groups = {
+    Normal = { fg = c.fg, bg = c.bg },
+    NormalNC = { fg = c.fg, bg = c.bg },
+    NormalFloat = { fg = c.fg, bg = c.panel },
+    FloatBorder = { fg = c.border, bg = c.panel },
+    FloatTitle = { fg = c.fg, bg = c.panel },
+    Cursor = { fg = c.bg, bg = c.fg },
+    CursorLine = { bg = overlay("#352f2de0") },
+    CursorLineNr = { fg = c.fg },
+    LineNr = { fg = c.grey },
+    SignColumn = { bg = c.bg },
+    FoldColumn = { fg = c.grey, bg = c.bg },
+    WinSeparator = { fg = "#1f1e1c", bg = c.bg },
+    Visual = { bg = overlay("#49403cf0") },
+    Search = { bg = overlay("#9fa0e140") },
+    CurSearch = { bg = overlay("#f8688240") },
+    IncSearch = { bg = overlay("#f8688240") },
+    MatchParen = { bg = c.border },
+    LspReferenceText = { bg = overlay("#413937c0") },
+    LspReferenceRead = { bg = overlay("#413937c0") },
+    LspReferenceWrite = { bg = overlay("#413937c0") },
+    Pmenu = { fg = c.fg, bg = c.menu },
+    PmenuSel = { fg = c.fg, bg = c.selected },
+    PmenuMatch = { fg = c.green, bg = c.menu },
+    PmenuMatchSel = { fg = c.green, bg = c.selected },
+    StatusLine = { fg = c.fg, bg = c.sidebar },
+    StatusLineNC = { fg = c.grey, bg = c.sidebar },
+    TabLine = { fg = c.grey, bg = c.bg },
+    TabLineFill = { bg = c.bg },
+    TabLineSel = { fg = c.fg, bg = c.bg },
+    Comment = { fg = c.grey },
+    Keyword = { fg = c.red },
+    Statement = { fg = c.red },
+    Operator = { fg = c.red },
+    Type = { fg = c.blue },
+    StorageClass = { fg = c.red, italic = true },
+    Identifier = { fg = c.orange },
+    Function = { fg = c.green },
+    Constant = { fg = c.purple },
+    Number = { fg = c.purple },
+    Boolean = { fg = c.purple },
+    PreProc = { fg = c.purple },
+    Macro = { fg = c.purple },
+    String = { fg = c.yellow },
+    Delimiter = { fg = c.grey },
+    SonokaiVSCodeBuiltin = { fg = c.blue, italic = true },
+    SonokaiVSCodeSidebar = { fg = c.grey, bg = c.sidebar },
+    SnacksPickerMatch = { fg = c.green },
+    SnacksPickerDirectory = { fg = c.grey },
+    SnacksPickerDir = { fg = c.grey },
+    SnacksPickerFile = { fg = c.fg },
+    SnacksPickerListCursorLine = { bg = c.selected },
+    BufferLineIndicatorSelected = { fg = c.blue, bg = c.bg },
+    BufferLineSeparator = { fg = c.bg, bg = c.bg },
+    BufferLineSeparatorVisible = { fg = c.bg, bg = c.bg },
+    BufferLineSeparatorSelected = { fg = c.bg, bg = c.bg },
+  }
+  for name, spec in pairs(groups) do
+    vim.api.nvim_set_hl(0, name, spec)
+  end
+  local links = {
+    SpecialComment = "Comment",
+    ["@comment"] = "Comment",
+    ["@comment.documentation"] = "Comment",
+    ["@keyword"] = "Keyword",
+    ["@keyword.modifier"] = "StorageClass",
+    ["@type.qualifier"] = "StorageClass",
+    ["@keyword.storage"] = "StorageClass",
+    ["@keyword.directive"] = "PreProc",
+    ["@preproc"] = "PreProc",
+    ["@type"] = "Type",
+    ["@type.builtin"] = "SonokaiVSCodeBuiltin",
+    ["@type.definition"] = "Type",
+    ["@variable"] = "Normal",
+    ["@variable.member"] = "Normal",
+    ["@property"] = "Normal",
+    ["@field"] = "Normal",
+    ["@variable.parameter"] = "Identifier",
+    ["@parameter"] = "Identifier",
+    ["@function"] = "Function",
+    ["@function.call"] = "Function",
+    ["@function.method"] = "Function",
+    ["@constant"] = "Constant",
+    ["@constant.builtin"] = "Constant",
+    ["@constant.macro"] = "Macro",
+    ["@function.macro"] = "Macro",
+    ["@punctuation"] = "Delimiter",
+    ["@lsp.type.comment"] = "Comment",
+    ["@lsp.type.keyword"] = "Keyword",
+    ["@lsp.type.property"] = "Normal",
+    ["@lsp.type.parameter"] = "Identifier",
+    ["@lsp.type.variable"] = "Normal",
+    ["@lsp.type.enumMember"] = "Constant",
+    MiniStatuslineModeNormal = "StatusLine",
+    MiniStatuslineModeInsert = "StatusLine",
+    MiniStatuslineModeVisual = "StatusLine",
+    MiniStatuslineModeReplace = "StatusLine",
+    MiniStatuslineModeCommand = "StatusLine",
+    MiniStatuslineModeOther = "StatusLine",
+    MiniStatuslineDevinfo = "StatusLine",
+    MiniStatuslineFileinfo = "StatusLine",
+    MiniStatuslineFilename = "StatusLine",
+    MiniStatuslineInactive = "StatusLineNC",
+    BufferLineFill = "TabLineFill",
+    BufferLineBackground = "TabLine",
+    BufferLineBuffer = "TabLine",
+    BufferLineBufferVisible = "TabLine",
+    BufferLineBufferSelected = "TabLineSel",
+    BufferLineTab = "TabLine",
+    BufferLineTabSelected = "TabLineSel",
+    BufferLineCloseButton = "TabLine",
+    BufferLineCloseButtonVisible = "TabLine",
+    BufferLineCloseButtonSelected = "TabLineSel",
+    SnacksPicker = "NormalFloat",
+    SnacksPickerBorder = "FloatBorder",
+    SnacksPickerTitle = "FloatTitle",
+    SnacksPickerBox = "SonokaiVSCodeSidebar",
+    SnacksPickerBoxBorder = "SonokaiVSCodeSidebar",
+    SnacksPickerInput = "NormalFloat",
+    SnacksPickerList = "SonokaiVSCodeSidebar",
+    SnacksPickerPreview = "Normal",
+    BlinkCmpMenu = "Pmenu",
+    BlinkCmpMenuSelection = "PmenuSel",
+    BlinkCmpLabelMatch = "PmenuMatch",
+    BlinkCmpDoc = "NormalFloat",
+    BlinkCmpDocBorder = "FloatBorder",
+  }
+  for name, target in pairs(links) do
+    vim.api.nvim_set_hl(0, name, { link = target })
+  end
+end
+
+return M

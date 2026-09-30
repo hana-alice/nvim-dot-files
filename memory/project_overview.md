@@ -43,7 +43,7 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 
 - SESSION START 前置在**每个新 context 只执行一次**；同一 context 内已经读过且未变化的规则或文档，不因每个小任务重复读取。
 - 本地规则只读**实际将修改目录**所适用的最近 `AGENTS.md`；不得遍历、批量读取无关子系统的 AGENTS/spec 文档。
-- OpenSpec 只读取并验证当前 change 及其直接影响的主规格；仅在用户要求全局审计或影响面确实无法界定时使用 `openspec validate --all`。
+- OpenSpec 主规格只记大方向与选型/踩坑；只读取改动直接影响的主规格，change 流程可选。仅在用户要求全局审计时使用 `openspec validate --all`。
 - 全量回归是提交/合并前的**执行门禁**，不等于需要预先阅读全部测试、spec 或 agent 规则；先按实际影响面读取，再按门禁运行测试。
 - 只有目标文件、约束或依赖关系发生变化，或出现需要消歧的新证据时，才扩大读取范围。
 
@@ -81,7 +81,7 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 | Git 审阅工作区 | `lua/utils/git_review.lua` + `lua/plugins/codediff.lua` + Git 插件配置 + `lua/workarounds/codediff/` | `lua/utils/AGENTS.md` + `lua/plugins/AGENTS.md` + `lua/workarounds/AGENTS.md` | `git-review-workspace` | `git_review` `review_editor` `keymaps` `cheatsheet` `workarounds` `smoke` | CodeDiff 默认完整文件审阅；Diffview 按需；Snacks `-G` 查询；Neogit 操作与 Fugitive 专项能力保留 |
 | vendored 依赖 | `lua/nio/`、`lua/trouble/` | 各自 `AGENTS.md` | 无对应 capability | `smoke` | 第三方内联副本，不自行重构 |
 | 回归测试 | `tests/` | `tests/AGENTS.md` | `headless-test-harness`、`config-regression-suite`、`test-regression-policy`、`structure-discoverability-regression` | 改动对应域 + `structure` | headless 套件 + 分范围回归映射 |
-| 规则/知识库 | `AGENTS.md`、`docs/`、`memory/`、`decisions/`、`lessons/` | `docs/AGENTS.md` | `project-constraints-doc`、`ai-knowledge-base`、`local-subsystem-rules`、`spec-authority-loop` | `structure` | 单一内容源 + 四区知识库 + spec 权威 |
+| 规则/知识库 | `AGENTS.md`、`docs/`、`memory/`、`decisions/`、`lessons/` | `docs/AGENTS.md` | `project-constraints-doc`、`ai-knowledge-base`、`local-subsystem-rules`、`spec-authority-loop` | `structure` | 单一内容源 + 四区知识库 + 方向级 spec |
 | 公开镜像隐私 | 本地 git hooks（worktree 外） | 根 `AGENTS.md` | `public-mirror-privacy` | 不适用（本地门禁） | denylist 只在本机；fail closed |
 
 > 每个主要目录同时有一份 `CLAUDE.md`（内容为 `@AGENTS.md` 导入 stub），供 Claude 读取。

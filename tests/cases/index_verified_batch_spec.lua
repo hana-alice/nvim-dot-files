@@ -909,14 +909,14 @@ local function run_fixture(operation, clangd)
 end
 
 t.describe("verified compiler-context UBT batching", function()
+  t.it("interns exact read-only file records without losing same-URI bindings or changing graph JSON", function()
+    run_fixture("intern_records", "")
+  end)
   local discovered = require("utils.ue_goto.semantic_sidecar_libclang").discover_toolchain()
   if not discovered.ok then
     t.skip("native verified batching", discovered.reason, { native = true })
     return
   end
-  t.it("interns exact read-only file records without losing same-URI bindings or changing graph JSON", function()
-    run_fixture("intern_records", discovered.clangd_path)
-  end)
   t.it("shares identical independent native header records while preserving graph output and cached loads", function()
     run_fixture("intern_native", discovered.clangd_path)
   end)
@@ -955,6 +955,12 @@ t.describe("verified compiler-context UBT batching", function()
     run_fixture("original_unlinked", discovered.clangd_path)
   end)
   t.it("proves template values with effective commands and seals proof assets for compiler-free reuse", function()
+    if not (discovered.clang_version or ""):match("clang version 22%.1%.5%s")
+        and not (discovered.clang_version or ""):match("clang version 22%.1%.5$") then
+      t.skip("native template batch proof", "requires libclang 22.1.5; found "
+        .. tostring(discovered.clang_version), { native = true })
+      return
+    end
     run_fixture("template_arguments", discovered.clangd_path)
   end)
   t.it("reuses noncontiguous accepted groups within the hard size limit without reading rejected records", function()
@@ -1007,6 +1013,6 @@ t.describe("verified compiler-context UBT batching", function()
       run_fixture("write_race", discovered.clangd_path)
     end)
   else
-    t.skip("Windows snapshot publication sharing race", "Windows file sharing semantics unavailable", { native = true })
+    t.skip("Windows snapshot publication sharing race", "Windows file sharing semantics do not apply to this host")
   end
 end)

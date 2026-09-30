@@ -67,7 +67,7 @@ controlled BackgroundIndex 生成器由 `index_generation` / `cpp_semantic_index
 
 `../docs/skills/ue-ide-bootstrap.md`（端到端搭建用到这些工具）、`../docs/TOOLING.md`。
 
-**治理 spec**（可观察行为的权威；与本文冲突时以 spec 为准）：
+**治理 spec**（大方向与选型/踩坑；实现细节以代码与回归为准）：
 `../openspec/specs/nvim-core-functionality-audit/spec.md`、
 `../openspec/specs/codebase-health-audit/spec.md`、
 `../openspec/specs/editor-behavior-regression/spec.md`（主循环余量 / stall 诊断纪律）。

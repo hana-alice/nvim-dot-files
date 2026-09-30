@@ -14,6 +14,7 @@
 nvim --headless -l tests/run.lua            # 全量
 nvim --headless -l tests/run.lua <filter>   # 只跑文件名含 <filter> 的 *_spec.lua
 pwsh -File scripts/run_regression.ps1       # 本机一键（转发 + 退出码）
+nvim --headless -l tests/run_parallel.lua   # 本地并行全量（每文件独立进程，JOBS=N 覆盖并发）
 ```
 
 退出码：0 全绿 / 1 任意失败。带 filter 时不触发 legacy 旁路。

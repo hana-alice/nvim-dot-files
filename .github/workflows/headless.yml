@@ -22,9 +22,9 @@ jobs:
       XDG_STATE_HOME: ${{ github.workspace }}/.state
       XDG_CACHE_HOME: ${{ github.workspace }}/.cache
       LOCALAPPDATA: ${{ github.workspace }}
-      # Linux is the mandatory LLVM acceptance lane. Other real hosts report
+      # Windows is the mandatory LLVM acceptance lane. Other real hosts report
       # explicit skips when the matching native tools are unavailable.
-      NVIM_TEST_REQUIRE_NATIVE: ${{ matrix.os == 'ubuntu-24.04' && '1' || '0' }}
+      NVIM_TEST_REQUIRE_NATIVE: ${{ matrix.os == 'windows-latest' && '1' || '0' }}
     defaults:
       run:
         working-directory: nvim
@@ -64,23 +64,32 @@ jobs:
         shell: bash
         run: npm install --global tree-sitter-cli@0.26.3
 
-      - name: Existing ripgrep prerequisite (Linux)
+      - name: Existing search prerequisites (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get install -y ripgrep
-
-      - name: Existing LLVM 22 toolchain for required native acceptance
-        if: runner.os == 'Linux'
-        shell: bash
         run: |
-          # Official versioned repository: https://apt.llvm.org/ (Noble, 22).
-          curl --fail --silent --show-error https://apt.llvm.org/llvm-snapshot.gpg.key -o "$RUNNER_TEMP/llvm.asc"
-          sudo install -m 0644 "$RUNNER_TEMP/llvm.asc" /usr/share/keyrings/llvm.asc
-          echo 'deb [signed-by=/usr/share/keyrings/llvm.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-22 main' | sudo tee /etc/apt/sources.list.d/llvm22.list
           sudo apt-get update
-          sudo apt-get install -y clang-22 clangd-22 libclang-22-dev
-          /usr/lib/llvm-22/bin/clangd --version
-          test -f /usr/lib/llvm-22/lib/libclang.so
-          echo 'UE_CLANGD=/usr/lib/llvm-22/bin/clangd' >> "$GITHUB_ENV"
+          sudo apt-get install -y ripgrep fd-find
+
+      - name: Existing LLVM 22.1.5 toolchain (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'LLVM-22.1.5-win64.exe'
+          $llvmRoot = Join-Path $env:RUNNER_TEMP 'llvm-22.1.5'
+          Invoke-WebRequest 'https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.5/LLVM-22.1.5-win64.exe' -OutFile $installer
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne 'faf0e0795ea91913d29856b3efcb178f2349e5137ae06eec4c96af8eda4565d8') {
+            throw 'LLVM installer checksum mismatch'
+          }
+          $install = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$llvmRoot") -WindowStyle Hidden -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "LLVM installer failed: $($install.ExitCode)" }
+          Remove-Item -LiteralPath $installer
+          & "$llvmRoot/bin/clangd.exe" --version
+          & "$llvmRoot/bin/clang.exe" --version
+          if (!(Test-Path "$llvmRoot/bin/libclang.dll") -or !(Test-Path "$llvmRoot/lib/clang/22/include")) {
+            throw 'LLVM native prerequisites missing'
+          }
+          "UE_CLANGD=$llvmRoot/bin/clangd.exe" >> $env:GITHUB_ENV
+          "$llvmRoot/bin" >> $env:GITHUB_PATH
 
       - name: Existing ripgrep prerequisite (macOS)
         if: runner.os == 'macOS'

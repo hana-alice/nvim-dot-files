@@ -102,12 +102,11 @@ Do not ask for confirmation during normal local development unless:
    `CLAUDE.md`（内容为 `@AGENTS.md` 导入 stub）。Codex 与 pi 读 `AGENTS.md`；Claude 读
    `CLAUDE.md` 并由其 stub 展开同一内容。该目录**无**本地规则时，适用**最近祖先目录**
    的规则（回落语义）。子级规则只写相对父级的增量。
-4. **改动范围对应的 spec** — `openspec/specs/<capability>/spec.md` 是**可观察行为的权威
-   契约**（不是「写完躺着的文档」）。从「我要改哪个目录」一步定位治理它的 spec：查
-   [`memory/project_overview.md`](memory/project_overview.md) 子系统速查表的
-   **「治理 spec」列**（与 [`tests/AGENTS.md`](tests/AGENTS.md) 的 CHANGE-TO-FILTER MAP 同源）。
-   **按改动范围读，不遍历 `openspec/specs/`**；本地规则或 CONSTRAINTS 与 spec 冲突时以 spec 为准
-   （若冲突源于 spec 陈旧，先更正 spec）。机制见
+4. **改动范围对应的 spec（轻量）** — `openspec/specs/<capability>/spec.md` **只规定大方向**，
+   并记录**选型、踩坑与重要事项**；它不是逐行为/逐字段的实现契约，细节以代码与回归为准。
+   从「我要改哪个目录」一步定位：查 [`memory/project_overview.md`](memory/project_overview.md)
+   子系统速查表的 **「治理 spec」列**。**按改动范围读，不遍历 `openspec/specs/`**；
+   改动与 spec 大方向冲突时先停下来确认方向，而不是绕过。机制见
    [`openspec/specs/spec-authority-loop/spec.md`](openspec/specs/spec-authority-loop/spec.md)。
 5. **归属分层契约（如该子系统有）** —— 改动带 failure layering 的子系统前，先读其层契约：
    失败必须**先指认层与 owner，再给处置**，且能力靠**探测**而非沿用单台设备结论。
@@ -218,14 +217,13 @@ Do not stop after step 2 if steps 3 to 5 are available.
 1. **跑回归并全绿** — 按改动范围跑对应 filter（映射见 [`tests/AGENTS.md`](tests/AGENTS.md)
    的 CHANGE-TO-FILTER MAP）；**提交/合并前必跑全量** `nvim --headless -l tests/run.lua`；
    **影响面不确定就升级到全量，不猜窄 filter**。权威：[`docs/testing-regression.md`](docs/testing-regression.md)。
-2. **spec 与实现一致** — 改动改变了 spec 已声明的可观察行为时，**同步更新对应
-   `openspec/specs/<capability>/spec.md` 或立一个承载该 spec 变更的 change**；若发现 spec
-   落后于已验证正确的实现，则**反向更正 spec**。只改实现而不动 spec 的收尾**不算完成**。
-   判定为「无 spec 影响」时也要显式声明。权威：
-   [`openspec/specs/spec-authority-loop/spec.md`](openspec/specs/spec-authority-loop/spec.md)。
+2. **spec 与实现一致（仅方向级）** — 只有当改动**改变了大方向**，或产生了**值得留底的选型/
+   踩坑/重要事项**时，才更新对应 `openspec/specs/<capability>/spec.md`（直接改 spec 即可，
+   不强制立 openspec change）。日常修复、实现细节、测试调整**不需要**动 spec。
+   权威：[`openspec/specs/spec-authority-loop/spec.md`](openspec/specs/spec-authority-loop/spec.md)。
 3. **记 changelog** — 在 [`docs/changelog.md`](docs/changelog.md) Unreleased 追加一条（用既有模板），
-   其 **Validation 字段写明所跑回归范围与结果**，并写明本次 **spec 一致性处置**
-   （同步 spec / 立 change / 判定无 spec 影响）。
+   其 **Validation 字段写明所跑回归范围与结果**；仅当动了 spec 时注明（无需为每次改动声明
+   「无 spec 影响」）。
 4. **收尾版本走 milestone** — 满足 semver 触发时执行 milestone 政策（release 文档 + changelog 归档 +
    全量回归门禁 + spec 无未同步漂移 + git tag〔须用户确认〕 + 架构变更同步知识库）。
    权威：`docs/CONSTRAINTS.md §三 C8`。

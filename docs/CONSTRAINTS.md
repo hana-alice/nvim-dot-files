@@ -1292,9 +1292,8 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 
 每次落地的改动（即便一行补丁）**MUST 在 `docs/changelog.md` Unreleased 追加一条**，用既有模板
 （`### YYYY-MM-DD — 标题` + Task / Implemented / Pitfalls / Validation / Follow-ups）。Implemented 含具体
-文件路径与函数名；**Validation 写明所跑回归范围与结果**（与 C6 联动）**以及本次 spec 一致性处置**
-（同步 spec / 立 change / 判定无 spec 影响，与 C9 联动）。攒够 8–12 条或一项连贯工作收尾
-即切片归档（见 C8）。
+文件路径与函数名；**Validation 写明所跑回归范围与结果**（与 C6 联动）；动了 spec 时注明（与 C9 联动）。
+攒够 8–12 条或一项连贯工作收尾即切片归档（见 C8）。
 → 根 `AGENTS.md` (Definition of Done); `docs/changelog.md` (Entry template / How to use)
 
 ### C8 — milestone（版本里程碑）政策
@@ -1302,23 +1301,25 @@ lazy.setup 前、autocmds+keymaps 在 VeryLazy），**不要**在 `init.lua` 再
 **触发**：按 semver——含 BREAKING → major、引入新能力 → minor、仅修复/小改 → patch；版本号续
 `v1.0.3` 不跳号。**产出物四件套（缺一不算 milestone）**：① 生成 `docs/release_vX.Y.Z.md`（沿用
 `docs/release_1.0.0.md` 格式）+ changelog Unreleased 切片归档 + Released 加交叉链接 + 清空 Unreleased；
-② milestone 前跑**全量回归门禁** `nvim --headless -l tests/run.lua` 全绿，且确认所有已落地行为变更
-均已反映到 `openspec/specs/`（无未同步的 spec 漂移）；③ 打 git tag `vX.Y.Z`
+② milestone 前跑**全量回归门禁** `nvim --headless -l tests/run.lua` 全绿，且确认大方向变化与重要选型/踩坑
+已记入 `openspec/specs/`；③ 打 git tag `vX.Y.Z`
 （**tag/commit 须用户确认**，遵守本仓 git 政策，不自动执行）；④ 若动了架构/子系统边界，同步
 `memory/` 与 `docs/architecture/overview.md`。
 → 根 `AGENTS.md` (Definition of Done); `docs/changelog.md` (Released); `docs/release_1.0.0.md` (格式范例)
 
-### C9 — spec 一致性属于完成定义（spec 是行为权威）
+### C9 — spec 轻量化：只规定大方向，记录选型与踩坑（用户 2026-09-30 调整）
 
-`openspec/specs/<capability>/spec.md` 是**可观察行为的权威契约**。**SESSION START MUST 包含
-「读改动范围对应的 spec」一步**（按范围读，不遍历全部 spec；从 `memory/project_overview.md`
-子系统速查表的「治理 spec」列一步定位）。**改动落地前 MUST 满足 spec 与实现一致**：行为变更
-同步对应 spec 或立 change；**spec 落后于已验证正确的实现时反向更正 spec**；只改实现不动 spec
-的收尾不算完成。本文档与各目录本地规则**不得与 spec 冲突**（冲突以 spec 为准；冲突源于 spec
-陈旧则先更正 spec）。spec 与规则文档中的**仓内路径引用 MUST 真实存在**（`structure` filter 的
-spec 引用完整性用例守护）。强制力入口在根 `AGENTS.md` 的 Definition of Done 第 2 条。
+`openspec/specs/<capability>/spec.md` **只规定大方向与不可退让的底线**（安全/隐私、正确性、
+SuperUnity 等不得静默退化），并在「选型与踩坑」段记录选型理由、被否决方案、踩坑根因与重要事项。
+它**不是**逐行为/逐字段/逐超时的实现契约——实现细节以代码与回归为准，日常修复与测试调整**不需要**
+动 spec，也**不强制**走 openspec change 流程（可直接改 spec；大改动可自愿用 change）。
+仅当改动改变大方向或产生值得留底的选型/踩坑时才更新 spec。SESSION START 仍按改动范围读对应 spec
+（从 `memory/project_overview.md`「治理 spec」列定位，不遍历全部）。spec 与规则文档中的
+**仓内路径引用 MUST 真实存在**（`structure` filter 守护）。
 **禁止为让某一个 agent 生效而新增第四份并行入口文件**（Claude/Codex/pi 三端只从 `AGENTS.md`
 层级读取；各目录 `CLAUDE.md` 只能是 `@AGENTS.md` stub）。
+历史：此前 C9 要求「spec 是可观察行为权威、只改实现不动 spec 不算完成」，规格膨胀到 41 份/近万行，
+严重拖慢开发，已由用户叫停并瘦身。
 → 根 `AGENTS.md` (Definition of Done); `openspec/specs/spec-authority-loop/spec.md`;
   `memory/project_overview.md` (治理 spec 列); `tests/cases/structure_spec.lua`
 
@@ -1378,9 +1379,8 @@ CDB / index / tools 的本地入口与 memory 都链接同一正文；`structure
   - `decisions/README.md` — 架构决策(ADR)导航（权威正文在 `docs/plans/`）。
   - `lessons/README.md` — 平台怪癖/调试硬知识导航（权威在本文件 §二）。
   - `docs/architecture/overview.md` — 架构总览（子系统/数据流/平台层/构建流水线/归属边界）。
-- **行为契约权威（spec）**：`openspec/specs/<capability>/spec.md` 是**可观察行为的权威**；
-  本文档与各目录本地规则**不得与之冲突**（冲突时以 spec 为准；若冲突源于 spec 陈旧，
-  先更正 spec 再对齐规则）。从「改动哪个目录」一步定位治理它的 spec：见
+- **方向与选型（spec）**：`openspec/specs/<capability>/spec.md` 只规定**大方向与底线**，并记录
+  选型、踩坑与重要事项（见 C9）；本文档与各目录本地规则不得与其大方向冲突。从「改动哪个目录」一步定位治理它的 spec：见
   `memory/project_overview.md` 子系统速查表的**「治理 spec」列**（与 `tests/AGENTS.md` 的
   CHANGE-TO-FILTER MAP 同源对齐）。权威机制见 `openspec/specs/spec-authority-loop/spec.md`。
 - **可发现性回归**：`tests/cases/structure_spec.lua` 守护「目录规则存在（AGENTS.md 源 +

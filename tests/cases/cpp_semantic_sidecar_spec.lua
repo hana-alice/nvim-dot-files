@@ -863,6 +863,9 @@ t.describe("semantic sidecar integration", function()
       vim.fn.mkdir(root .. "/inc", "p")
       local header = root .. "/inc/cfg.hpp"
       vim.fn.writefile({ "inline int relative(int) { return 0; }" }, header)
+      -- Compare filesystem identity across macOS /var aliases and Windows
+      -- short names; compiler path spelling need not match the fixture's.
+      local canonical_header = vim.fs.normalize(assert(vim.uv.fs_realpath(header)))
       local source = root .. "/relative.cpp"
       vim.fn.writefile({ "#include <cfg.hpp>", "int caller() { return relative(1); }" }, source)
       local sidecar = semantic_sidecar.new()
@@ -871,12 +874,12 @@ t.describe("semantic sidecar integration", function()
           argv = { "clang++", "-std=c++20", "-Iinc", "relative.cpp" } } }
       local query = { path = source, line = 2, column = 23 }
       local cold = sidecar.tu_store:_resolve_context(ctx, query, {})
-      t.assert_eq(cold.definition.path, vim.fs.normalize(header))
+      t.assert_eq(vim.fs.normalize(assert(vim.uv.fs_realpath(cold.definition.path))), canonical_header)
       local entry = sidecar.tu_store:_ensure_tu(ctx, {})
-      t.assert_true(type(entry.file_signatures[vim.fs.normalize(header)]) == "string")
+      t.assert_true(type(entry.file_signatures[cold.definition.path]) == "string")
       vim.fn.writefile({ "", "inline int relative(int) { return 0; }" }, header)
       local changed, meta = sidecar.tu_store:_resolve_context(ctx, query, {})
-      t.assert_eq(changed.definition.path, vim.fs.normalize(header))
+      t.assert_eq(vim.fs.normalize(assert(vim.uv.fs_realpath(changed.definition.path))), canonical_header)
       t.assert_eq(changed.definition.line, 2)
       t.assert_eq(meta.query_kind, "reparse")
       sidecar:shutdown()

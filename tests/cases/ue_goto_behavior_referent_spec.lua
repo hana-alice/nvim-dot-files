@@ -15,6 +15,9 @@ t.describe("real clangd source referent matrix", function()
     t.skip("compiler-owned entity roles", tool.reason, { native = true })
     return
   end
+  local version = vim.system({ tool.path, "--version" }, { text = true }):wait(10000)
+  local certified_alias_ast = version.code == 0
+    and (version.stdout or ""):match("clangd version 22%.1%.5[%s%)]") ~= nil
 
   local header_lines = {
     "#pragma once",
@@ -179,24 +182,31 @@ t.describe("real clangd source referent matrix", function()
       { "ordinary function call", 13, "ordinary", 2, target_source = true },
       { "parameter reference", 2, "parameter", 2, target_source = true, occurrence = 2 },
     }) do
-      t.it(case[1], function()
-        local result = navigate(case[2], case[3], case.occurrence)
-        local details = vim.inspect(result)
-        t.assert_eq(result.state, "resolved", details)
-        local role = case[5] or "definition"
-        t.assert_eq(result.destination_role, role, details)
-        t.assert_eq(result.reason, role .. "-resolved", details)
-        t.assert_eq(#jumps, 1, "exactly one proven destination")
-        local expected_path = case.target_source and source or header
-        local expected_lines = case.target_source and source_lines or header_lines
-        local target = jumps[1]
-        t.assert_eq(vim.uri_to_fname(target.uri):gsub("\\", "/"), expected_path, details)
-        t.assert_eq(target.range.start.line, case[4] - 1, details)
-        t.assert_eq(target.range.start.character, column(expected_lines, case[4], case[3]), details)
-        t.assert_true(type(result.identity) == "string" and result.identity ~= "", "canonical identity required")
-        t.assert_eq(result.provider, "clangd")
-        t.assert_eq(vim.api.nvim_get_current_buf(), bufnr, "only the final jump hook may change the view")
-      end)
+      -- The namespace-alias AST join is certified against upstream 22.1.5.
+      -- Other toolchains are not certified for this evidence shape; keep the
+      -- remaining real-tool cases running instead of skipping the entire suite.
+      if case[1] == "namespace alias qualifier" and not certified_alias_ast then
+        t.skip(case[1], "namespace-alias AST proof requires clangd 22.1.5", { native = true })
+      else
+        t.it(case[1], function()
+          local result = navigate(case[2], case[3], case.occurrence)
+          local details = vim.inspect(result)
+          t.assert_eq(result.state, "resolved", details)
+          local role = case[5] or "definition"
+          t.assert_eq(result.destination_role, role, details)
+          t.assert_eq(result.reason, role .. "-resolved", details)
+          t.assert_eq(#jumps, 1, "exactly one proven destination")
+          local expected_path = case.target_source and source or header
+          local expected_lines = case.target_source and source_lines or header_lines
+          local target = jumps[1]
+          t.assert_eq(vim.uri_to_fname(target.uri):gsub("\\", "/"), expected_path, details)
+          t.assert_eq(target.range.start.line, case[4] - 1, details)
+          t.assert_eq(target.range.start.character, column(expected_lines, case[4], case[3]), details)
+          t.assert_true(type(result.identity) == "string" and result.identity ~= "", "canonical identity required")
+          t.assert_eq(result.provider, "clangd")
+          t.assert_eq(vim.api.nvim_get_current_buf(), bufnr, "only the final jump hook may change the view")
+        end)
+      end
     end
 
     t.it("definition under the cursor does not self-jump", function()

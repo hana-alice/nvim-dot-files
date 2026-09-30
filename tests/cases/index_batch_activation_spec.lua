@@ -138,7 +138,7 @@ t.describe("verified batch activation", function()
     run_fixture("legacy")
   end)
   t.it("requires an explicit matching native query profile and separates direct lookup ancestors from inputs", function()
-    if vim.fn.has("win32") ~= 1 then t.skip("native Windows query activation", "Windows query profile required", { native = true }); return end
+    if vim.fn.has("win32") ~= 1 then t.skip("native Windows query activation", "query profile is supported only on Windows"); return end
     run_fixture("query")
   end)
 end)

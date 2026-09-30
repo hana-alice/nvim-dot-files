@@ -7,6 +7,16 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, sys.argv[1])
 import clangd_query_profile as profile
 clangd, mode = pathlib.Path(sys.argv[2]).resolve(), sys.argv[3]
+if mode == 'host':
+    assert os.name != 'nt', 'host rejection must exercise the actual unsupported host'
+    with tempfile.TemporaryDirectory(prefix='query_profile_host_') as temporary:
+        root = pathlib.Path(temporary).resolve()
+        output = root / 'proof'
+        rejected = profile.observe({}, str(clangd), '**/clang*', output, launch_cwd=str(root))
+        assert not rejected['ok'] and rejected['reason'] == 'unsupported-query-profile-host', rejected
+        assert not output.exists(), 'unsupported host must reject before writing proof or spawning compilers'
+    print('ok')
+    raise SystemExit(0)
 driver = clangd.with_name('clang++.exe')
 if mode == 'ndk':
     driver = pathlib.Path(sys.argv[4]).resolve()
@@ -176,8 +186,9 @@ t.describe("native query driver profile", function()
   local clangd = vim.env.UE_CLANGD or vim.fn.exepath("clangd")
   local python = vim.fn.exepath("python")
   if python == "" then python = vim.fn.exepath("python3") end
-  if clangd == "" or python == "" or not require("utils.platform").is_windows then
-    t.skip("Windows native query profile", "Windows, real clangd and Python required", { native = true })
+  local windows = require("utils.platform").is_windows
+  if python == "" or (windows and clangd == "") then
+    t.skip("native query profile prerequisites", "real clangd and Python required on the supported host", { native = true })
     return
   end
   local cases = {
@@ -189,9 +200,13 @@ t.describe("native query driver profile", function()
     { "implicit", "real Android driver discovers newly created unlogged installation headers" },
     { "version", "accepts only the pinned LLVM and Android NDK driver profiles" },
   }
-  -- Optional real toolchain lane. CI without an NDK still runs the version
-  -- rejection cases; acceptance on an NDK host explicitly supplies its driver.
-  if vim.env.UE_QUERY_DRIVER and vim.env.UE_QUERY_DRIVER ~= "" then
+  if not windows then
+    t.skip("Windows native query profile", "native extractor profile is supported only on Windows")
+    cases = { { "host", "rejects the actual unsupported host without publishing proof" } }
+  end
+  -- Optional real toolchain lane. Supported hosts without an NDK still run the
+  -- version rejection cases; NDK acceptance explicitly supplies its driver.
+  if windows and vim.env.UE_QUERY_DRIVER and vim.env.UE_QUERY_DRIVER ~= "" then
     cases[#cases + 1] = { "ndk", "rediscovers the real Android driver and rejects a forged profile" }
   end
   for _, case in ipairs(cases) do

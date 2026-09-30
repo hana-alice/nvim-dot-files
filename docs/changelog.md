@@ -73,6 +73,21 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-30 — git_review_runtime 的 Diffview 关闭竞态；macOS FSEvents 假设实验
+
+**Task**
+- `ae75b2f` 后 `git_review_runtime` 不再空转（证实上条根因），但 Linux/macOS 暴露下一处失败。
+
+**Implemented**
+- `tests/cases/git_review_runtime_spec.lua`：可视模式 Diffview 文件历史等到 `panel.cur_item` 已选中、主窗口已打开文件再按 `gV` 关闭。CI 证据：只等 `#entries > 0` 就关闭，锁定版本 Diffview 的 `update_entries` 回调在关闭后执行 `cur_file()`，`file_history_panel.lua:380 attempt to index field 'cur_item' (a nil value)`。属测试时序，Diffview 版本与生产映射未改。
+- `tests/cases/index_batch_runtime_spec.lua`（仅 macOS）：在安装监听前等 1 s，检验「FSEvents 延迟投递监听开始前刚写入的 `compile_commands.json`（报为 `rename`）」这一**假设**。若 CI 仍失败则假设不成立，需另查。
+
+**Validation**
+- 本机 `git_review_runtime` 连续 2 次 1/1；`index_batch_runtime` 80/80。
+
+**Follow-ups**
+- CI 子进程的 `Plugin <name> is not installed` 为 WARN 级（lazy 对未进 lockfile 安装范围的插件的提示），不再造成空转；是否影响用例待本轮结果。
+
 ### 2026-09-30 — 定位并修复 git_review_runtime 在 CI 上的 CPU 空转
 
 **Task**

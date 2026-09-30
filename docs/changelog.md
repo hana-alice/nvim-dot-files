@@ -73,6 +73,17 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-30 — 最近项目列表并发写入在 Windows 上丢记录
+
+**Task**
+- `5db84e9` 后 Ubuntu/macOS 全绿，Windows 仅剩 `multi_instance_state`「recent-project MRU keeps concurrent distinct roots」（8 个并发实例丢 1 条）。
+
+**Implemented**
+- `lua/utils/recent_projects.lua`：拿到锁后若读取/原子 rename 失败（Windows 上别的实例正打开该文件读取时 rename 会失败），改为走与抢锁失败相同的异步重试，而不是静默丢弃这次写入；重试上限 20 → 60（约 1.5 s）。这是生产代码的真实缺陷：多个 Neovim 同时启动时最近项目可能丢失。
+
+**Validation**
+- `multi_instance_state` 本机连续 5 次 27/27。
+
 ### 2026-09-30 — CI 引导只装了一半插件（git_review_runtime 三平台失败的根因）
 
 **Root cause（CI 日志 + 本机全新数据目录复现）**

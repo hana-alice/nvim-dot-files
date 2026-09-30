@@ -775,8 +775,13 @@ t.describe("multi-instance project state", function()
       local project = root .. "/project-" .. index
       vim.fn.mkdir(project .. "/.git", "p")
       local code = string.format(
-        "vim.env.NVIM_RECENT_PROJECTS_PATH=%q; require(%q).record(%q); vim.wait(300)",
-        path, "utils.recent_projects", project
+        -- record() retries lock contention asynchronously; stay alive until this
+        -- root is visible instead of exiting after a fixed 300 ms (slow CI hosts).
+        "vim.env.NVIM_RECENT_PROJECTS_PATH=%q; require(%q).record(%q); "
+          -- pcall: a concurrent atomic rename can briefly hide the file on Windows.
+          .. "vim.wait(5000, function() local ok, lines = pcall(vim.fn.readfile, %q) "
+          .. "return ok and table.concat(lines, ' '):find(%q, 1, true) ~= nil end, 20)",
+        path, "utils.recent_projects", project, path, "project-" .. index
       )
       jobs[index] = vim.system({
         vim.v.progpath, "--headless", "-u", "NONE", "-i", "NONE",

@@ -50,7 +50,12 @@ local ok, err = xpcall(function()
   end
   local function wait(predicate, label)
     checkpoint("wait: " .. label)
-    assert(vim.wait(12000, predicate, 20), label .. ": " .. table.concat(errors, "\n"))
+    if not vim.wait(12000, predicate, 20) then
+      local messages = vim.api.nvim_exec2("messages", { output = true }).output
+      error(label .. ": " .. table.concat(errors, "\n") .. "\nbuf=" .. vim.api.nvim_buf_get_name(0)
+        .. " gitsigns=" .. vim.inspect(vim.b.gitsigns_status_dict) .. " hs=" .. vim.inspect(vim.fn.maparg(" hs", "n", false, true).desc)
+        .. " git=" .. vim.fn.system({ "git", "--version" }) .. "\nmessages:\n" .. messages)
+    end
     checkpoint("ready: " .. label)
   end
   local function mapping(key, mode)

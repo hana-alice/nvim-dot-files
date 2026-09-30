@@ -129,7 +129,7 @@ t.describe("compiler unity origin capture", function()
 import importlib.util,json,pathlib,sys
 spec=importlib.util.spec_from_file_location('receipt',pathlib.Path.cwd()/'tools/cdb_unity_receipt.py')
 receipt=importlib.util.module_from_spec(spec);spec.loader.exec_module(receipt)
-e=json.loads(sys.stdin.read())
+e=json.loads(sys.stdin.buffer.read().decode("utf-8"))
 print(receipt.entry_hash(e))
 ]=],
       }, { text = true, stdin = vim.json.encode(entry), cwd = vim.fn.stdpath("config") })

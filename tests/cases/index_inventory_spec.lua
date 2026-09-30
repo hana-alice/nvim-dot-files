@@ -107,7 +107,15 @@ with tempfile.TemporaryDirectory(prefix='index_inventory_') as temporary:
         compare('preserves missing roots', base / 'missing')
         compare('preserves non-directory roots', tree / 'file.h')
         compare('preserves exclusion of the root itself', excluded)
-        compare('preserves relative-root behavior', Path(os.path.relpath(tree, Path.cwd())))
+        if tree.drive.lower() == Path.cwd().drive.lower():
+            compare('preserves relative-root behavior', Path(os.path.relpath(tree, Path.cwd())))
+        else:
+            # A relative path cannot span Windows drives (CI temp is C:, checkout D:).
+            previous = Path.cwd(); os.chdir(tree.parent)
+            try:
+                compare('preserves relative-root behavior', Path(tree.name))
+            finally:
+                os.chdir(previous)
         unicode_first, unicode_second = tree / '\u0130', tree / 'i\u0307'
         unicode_first.mkdir()
         # Probe this filesystem's Unicode identity: APFS may alias these

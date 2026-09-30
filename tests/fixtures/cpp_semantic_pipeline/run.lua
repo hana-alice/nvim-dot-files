@@ -54,7 +54,8 @@ assert(vim.wait(20000, function()
 end, 10), "production navigation did not finish")
 local result = owner._last_cpp_transaction.result
 assert(result.state == "resolved", vim.inspect(result))
-assert(vim.fs.normalize(vim.api.nvim_buf_get_name(0)) == target, "wrong actual destination buffer")
+assert(vim.fs.normalize(vim.api.nvim_buf_get_name(0)) == target, "wrong actual destination buffer: "
+  .. vim.api.nvim_buf_get_name(0) .. " vs " .. target)
 assert(vim.api.nvim_win_get_cursor(0)[1] == 1, "wrong actual destination line")
 assert(environment_reads > 0, "environment discovery was not exercised")
 assert(result.identity == "c:@F@selected#", "canonical compiler identity absent: " .. vim.inspect(result))

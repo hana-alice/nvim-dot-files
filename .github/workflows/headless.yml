@@ -95,9 +95,9 @@ jobs:
         if: runner.os == 'macOS'
         run: command -v rg || brew install ripgrep
 
-      - name: Existing ripgrep prerequisite (Windows)
+      - name: Existing search prerequisites (Windows)
         if: runner.os == 'Windows'
-        run: choco install ripgrep -y --no-progress
+        run: choco install ripgrep fd -y --no-progress
 
       - name: Bootstrap locked plugins and syntax parsers
         run: nvim --headless -l scripts/bootstrap_headless_ci.lua

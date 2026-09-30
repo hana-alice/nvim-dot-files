@@ -669,4 +669,7 @@ def main():
 
 
 if __name__ == '__main__':
+    # Emit UTF-8 regardless of the host ANSI code page (cp1252 on CI runners).
+    for _stream in (sys.stdout, sys.stderr):
+        _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     sys.exit(main())

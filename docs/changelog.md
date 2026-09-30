@@ -73,6 +73,28 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-30 — 修复 PR #13 三平台 CI 暴露的 Windows 编码/前置与测试时序问题
+
+**Task**
+- `779c2b2` 的 CI：Windows 32 失败、macOS 5、Ubuntu 2。按根因分组处置。
+
+**Implemented**
+- 17 个会打印非 ASCII（`←`/`→`/中文）的 `tools/*.py` 在 `__main__` 入口把 stdout/stderr 重设为 UTF-8（`errors="backslashreplace"`）。根因：CI runner ANSI 代码页 cp1252，`print('← exit')` 抛 `UnicodeEncodeError`，连带 23 个 index/CDB 用例失败；本机 cp65001 不复现。
+- `.github/workflows/headless.yml`：Windows 通过 choco 安装既有 `fd` 前置（4 个 required-native 用例报 `fd unavailable`）。
+- `tests/cases/ue_unity_origin_spec.lua`：Python 端以 UTF-8 解码 stdin（原按 cp1252 解码中文路径，哈希不一致）。
+- `tests/cases/index_inventory_spec.lua`：临时目录与 checkout 不在同一盘符时改为在父目录内用相对名验证（`relpath` 不能跨盘）。
+- `tests/cases/multi_instance_state_spec.lua`：MRU 并发子进程等到自己的记录可见再退出（原固定 300 ms，在慢宿主上 `record()` 的异步锁重试尚未完成进程已退出）。
+- 诊断增强（根因未定，不改断言）：`core_health` 两次审计不一致时列出非 PASS 项；CLI 失败打印 stdout；`git_review_runtime` 的 Gitsigns 等待超时打印 buffer/gitsigns 状态/`:messages`；`cpp_semantic_pipeline` 打印实际与期望目标路径。
+
+**Pitfalls / Gotchas**
+- 本机 Windows 为 UTF-8 代码页，CI 为 cp1252——Python 工具的 print 编码问题只在 CI 暴露。
+
+**Validation**
+- 并行全量 required-native：125/125 文件通过（135.4 s）；`multi_instance_state` 连续 3 次 27/27。
+
+**Follow-ups**
+- 仍未定位：三平台 `git_review_runtime` Gitsigns 未挂载（此前 CI 已存在）；Linux/macOS `core_health` 审计不稳定；macOS `cpp_semantic_pipeline` 目标 buffer、`index_batch_runtime` 首次缓存写入被 FSEvents 报为 `compile_commands.json` rename 而撤销激活（此前 CI 已存在）。待本次诊断输出后处置。
+
 ### 2026-09-30 — SDD 轻量化：spec 只规定大方向并记录选型与踩坑
 
 **Task**

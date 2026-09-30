@@ -37,7 +37,7 @@ nvim --headless -l tests/run_parallel.lua   # 本地并行全量（每文件独�
 | CI bootstrap / workflow / legacy smoke | `review_ci` + 全量 + legacy smoke |
 | `lua/utils/ue_watch.lua` / `dirty_save.lua` | `ue_watch_csearch` `multi_instance_state` `stability` |
 | `lua/utils/window_title.lua` | `window_title` `keymaps` `commands` `cheatsheet` |
-| `lua/utils/android_device.lua` / `android_package.lua` / Android ADB device 路由 / `dap/_android_crash.lua` | `android_device` `android_ide` `dap` `ue_context` |
+| `lua/utils/android_device.lua` / `android_package.lua` / `android_logcat.lua` / `ue_hub.lua` / Android ADB device 路由 / `dap/_android_crash.lua` | `android_device` `android_ide` `dap` `ue_context` |
 | `lua/ue/config.lua`（schema） | `ue_config` `smoke` |
 | `lua/ue.lua` 项目选择 / context 解析 / workflow dispatch | `ue_project_context` `ue_api` `smoke` `ue_platform_boundary` |
 | `lua/ue/project_state.lua` / `lua/ue/file_lock.lua` / 共享持久状态 | `multi_instance_state` |

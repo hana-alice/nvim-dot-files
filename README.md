@@ -294,6 +294,7 @@ tests/                    headless regression suite
 
 | Topic | Location |
 | --- | --- |
+| **User guide (daily workflow, keys, troubleshooting)** | [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) |
 | Architecture overview | [`docs/architecture/overview.md`](docs/architecture/overview.md) |
 | Additions over LazyVim | [`docs/architecture-vs-lazyvim.md`](docs/architecture-vs-lazyvim.md) |
 | Symbol resolution internals | [`docs/architecture-symbol-resolution.md`](docs/architecture-symbol-resolution.md) |

@@ -1271,6 +1271,12 @@ local function report_failure(spec)
   local fail = F.new(spec)
   local text = F.format(fail)
   P.error(spec.headline or spec.summary or "attach failed")
+  -- A failure with a concrete command fix is offered as one keypress
+  -- (<leader>uk) instead of only text the user has to retype.
+  if spec.fix then
+    require("utils.ue_hub").offer_fix(spec.fix, spec.headline)
+    text = text .. "\n→ <leader>uk runs :" .. spec.fix
+  end
   log.notify_error("dap.android", text)
   -- Field evidence for the report-first loop: which layer blocks real attaches.
   pcall(function()
@@ -1361,6 +1367,7 @@ local function bootstrap_session(opts, on_ready)
         headline = "no device selected",
         summary = "no Android device was selected for this session",
         remedy = "run :UESetAndroidDevice and pick a ready device",
+        fix = "UESetAndroidDevice",
       })
       on_ready(false); return
     end
@@ -1404,6 +1411,7 @@ local function bootstrap_session(opts, on_ready)
         summary = "could not stage the debug server onto the device",
         evidence = require("ue.dap.failure").observed_evidence("staging", tostring(push_msg)),
         remedy = "run :UEDAPPreflight to see which layer blocks, then re-try the attach",
+        fix = "UEDAPPreflight",
       })
       on_ready(false); return
     end
@@ -1508,6 +1516,7 @@ function M._finalize_session_after_gate(sess, pid, cfg_name, run_label)
       summary = "the device-side platform server did not start",
       evidence = require("ue.dap.failure").observed_evidence("server start", tostring(srv_err)),
       remedy = "run :UEDAPPreflight; a target-policy denial at L2 is the usual cause",
+      fix = "UEDAPPreflight",
     })
     M.stop_android_debugger()
     return
@@ -1697,6 +1706,7 @@ function M.attach(opts)
         evidence = require("ue.dap.failure").command_evidence(
           { "<adb>", "shell", "pidof", "-s", "<package>" }, nil, "no pid returned"),
         remedy = "start the app first, or use :UEDAPLaunch for wait-for-debugger launch",
+        fix = "UEDAPLaunch",
       })
       M._attach_in_progress = false
       M.stop_android_debugger()

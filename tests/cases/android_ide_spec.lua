@@ -118,3 +118,120 @@ t.describe("android target status token", function()
     if saved then device.set(saved) end
   end)
 end)
+
+t.describe("ue hub: keyboard-first command surface", function()
+  local hub = require("utils.ue_hub")
+
+  t.it("generic actions are runnable and target-owned actions join for that target only", function()
+    for _, action in ipairs(hub.actions) do
+      t.assert_type(action.run, "function")
+      t.assert_true(action.group ~= nil and action.label ~= nil)
+    end
+    local android = hub.visible_actions({ platform = "Android", state = {} })
+    local win = hub.visible_actions({ platform = "Win64", state = {} })
+    t.assert_eq(#win, #hub.actions, "a target without hub data adds nothing")
+    t.assert_true(#android > #win, "the Android target contributes its own actions")
+    local groups, last = {}, nil
+    for _, action in ipairs(android) do
+      if action.group ~= last then
+        t.assert_nil(groups[action.group], "groups stay contiguous: " .. action.group)
+        groups[action.group], last = true, action.group
+      end
+    end
+    t.assert_contains(hub.format_action(android[1]), "<F5>")
+  end)
+
+  t.it("hub commands reference registered user commands", function()
+    require("ue").setup()
+    local registered = vim.api.nvim_get_commands({})
+    local checked = 0
+    local function check(name)
+      name = name:match("^(%S+)")
+      -- ue.setup() owns UE*/Task* commands; others (NotificationHistory,
+      -- NvimCoreHealth) are registered by their own modules at real startup.
+      if name:match("^UE") or name:match("^Task") then
+        checked = checked + 1
+        t.assert_true(registered[name] ~= nil, "hub references unregistered command: " .. name)
+      end
+    end
+    local src = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/utils/ue_hub.lua"), "\n")
+    for name in src:gmatch('cmd%("(%u[%w ]+)"') do check(name) end
+    local contribution = require("ue.targets.android").hub({})
+    check(contribution.loop_command)
+    for _, action in ipairs(contribution.actions) do check(action.command) end
+    for _, field in ipairs(contribution.fields) do if field.command then check(field.command) end end
+    t.assert_true(checked >= 20, "expected the hub to reference the UE command set")
+  end)
+
+  t.it("target rows and summary come from the target owner's fields", function()
+    local device = require("utils.android_device")
+    local saved = vim.g[device.global_key]
+    device.set("SERIAL1", { serial = "SERIAL1", model = "Pixel_8" })
+    local target = { project = "Game", platform = "Android", configuration = "Development",
+      state = { android_package = "com.x.game" } }
+    t.assert_eq(hub.target_summary(target), "Game · Android Development · Pixel 8 · com.x.game")
+    t.assert_eq(#hub.target_rows(target), 4)
+    device.clear()
+    t.assert_contains(hub.target_summary(target), "no device")
+    t.assert_eq(#hub.target_rows({ project = "Game", platform = "Win64", configuration = "", state = {} }), 2)
+    if saved then device.set(saved) end
+  end)
+
+  t.it("a failure's fix runs once from one key and is then consumed", function()
+    local ran = {}
+    vim.api.nvim_create_user_command("UEHubFixProbe", function() ran[#ran + 1] = true end, {})
+    hub.offer_fix("UEHubFixProbe", "probe")
+    t.assert_eq(hub.run_fix(), "UEHubFixProbe")
+    t.assert_eq(#ran, 1)
+    t.assert_nil(hub.run_fix())
+    vim.api.nvim_del_user_command("UEHubFixProbe")
+  end)
+
+  t.it("doctor marks missing target parts with the command that fixes them", function()
+    local device = require("utils.android_device")
+    local saved = vim.g[device.global_key]
+    device.clear()
+    local rows = hub.doctor_rows({ project = nil, platform = "Android", state = {} })
+    if saved then device.set(saved) end
+    local by = {}
+    for _, row in ipairs(rows) do by[row.name] = row end
+    t.assert_eq(by.project.ok, false)
+    t.assert_eq(by.device.fix, "UESetAndroidDevice")
+    t.assert_eq(by.package.fix, "UESetAndroidPackage")
+    t.assert_eq(hub.debug_indicator(), "", "no indicator without a debug session")
+  end)
+end)
+
+t.describe("android logcat helpers", function()
+  local logcat = require("utils.android_logcat")
+
+  t.it("cycles levels and builds the adb filterspec", function()
+    t.assert_eq(logcat.next_level("V"), "D")
+    t.assert_eq(logcat.next_level("E"), "V")
+    t.assert_eq(#logcat.filter_args("V"), 0)
+    t.assert_eq(logcat.filter_args("W")[1], "*:W")
+  end)
+
+  t.it("reads severity and source locations from log lines", function()
+    t.assert_eq(logcat.line_level("01-01 00:00:00.000  1000  1001 E UE4     : boom"), "E")
+    local file, lnum = logcat.parse_location("E UE4 : Assertion failed [File:D:/Game/Source/A.cpp] [Line: 42]")
+    t.assert_eq(file, "D:/Game/Source/A.cpp")
+    t.assert_eq(lnum, 42)
+    file, lnum = logcat.parse_location("W UE4 : Runtime/Core/Private/Foo.cpp:17 something")
+    t.assert_eq(file, "Runtime/Core/Private/Foo.cpp")
+    t.assert_eq(lnum, 17)
+    t.assert_nil(logcat.parse_location("I UE4 : nothing to see"))
+  end)
+
+  t.it("attaches buffer-local keys without touching other buffers", function()
+    local buf, other = vim.api.nvim_create_buf(false, true), vim.api.nvim_create_buf(false, true)
+    local cycled
+    logcat.attach(buf, { level = "I", on_cycle = function(level) cycled = level end })
+    local keys = {}
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do keys[m.lhs] = m end
+    t.assert_true(keys["gl"] ~= nil and keys["<CR>"] ~= nil and keys["gx"] ~= nil)
+    t.assert_eq(#vim.api.nvim_buf_get_keymap(other, "n"), 0)
+    keys["gl"].callback()
+    t.assert_eq(cycled, "W")
+  end)
+end)

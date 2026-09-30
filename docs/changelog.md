@@ -73,6 +73,26 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-30 — 键盘优先的 UE 工作流入口：命令中枢、目标切换、F5、状态栏、一键修复
+
+**Task**
+- 用户：使用体验距 IDE 差距大，按产品路线图全部推进；并纠正方向——尽量不用鼠标、不必对标 IDE UI，用快捷键呼出面板与状态栏提示。
+
+**Implemented**
+- `lua/utils/ue_hub.lua`（新）：`command_hub`（`<leader>P` / `:UEHub`，按组列出当前 target 的全部动作并显示快捷键）、`target_switcher`（`<leader>uu` / `:UETarget`）、`run_or_debug`（`<F5>`）、`offer_fix`/`run_fix`（`<leader>uk`）、`doctor`（`:UEDoctor`，✗ 行 `<CR>` 执行修复）、`debug_indicator`。
+- target 专属数据归 owner：`ue.targets.android.hub(state)` 声明 Android 的动作、字段与循环命令；通用 hub 无 target 字面量。
+- `lua/config/keymaps.lua`：`<F5>` 无会话时运行 target 循环、会话中 continue；新增 `<S-F5>` 停止（四模式）。
+- `lua/plugins/statusline.lua`：mini.statusline 现在真正显示 `g:ueindex_status`（此前该状态只接在已禁用的 lualine 与启动前的原生 statusline 上，mini 接管后不可见）以及调试会话指示 `⏸/▶ DBG`。只读缓存值，无新定时器。
+- `lua/utils/android_logcat.lua`（新）并接入 DAP logcat 面板：`<CR>` 跳到行内源码位置、`gl` 循环最低级别（由 adb 过滤）、`gx` 符号化最近崩溃、E/W 行高亮（buffer-local syntax）。
+- 新增面向使用者的长期文档 `docs/USER_GUIDE.md`（日常流程、按键、状态栏读法、排障），README 中英文与 `docs/AGENTS.md` 已登记并写明维护约定。
+- 失败带修复：Android DAP 的 `report_failure` 支持 `fix`，设备未选/进程未运行/lldb-server 失败会登记修复命令。
+- `:UESetAndroidPackage` 无参数时打开设备包名选择器；`UEAndroidIterate` 把结果与耗时写入状态栏（`LOOP✓ 42s` / `LOOP✗`）。
+
+**Validation**
+- `android_ide` 16/16（hub 动作/分组/命令存在性、目标行、修复一次性消费、doctor、logcat 解析与 buffer-local 键）；`keymaps` 59/59、`commands` 121/121、`cheatsheet` 148/148、`ue_platform_boundary` 17/17。
+- 真实配置启动冒烟：`<leader>P`/`uu`/`uk`/`<F5>`/`<S-F5>` 均已绑定，三个命令已注册，状态栏渲染含 UE 段，doctor 面板正常打开。
+- 未做：真机上的 F5 循环与 logcat 交互未实测；布局预设、面包屑评估、Java/Kotlin LSP、性能分析入口未实现。
+
 ### 2026-09-30 — Android IDE 体验：异步调试路径、设备/包可见、崩溃符号化、一键迭代
 
 **Task**

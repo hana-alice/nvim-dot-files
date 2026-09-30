@@ -1906,10 +1906,21 @@ function D.setup_dap(dap, dapui)
     vim.bo[logcat_buf].bufhidden = "wipe"
     vim.bo[logcat_buf].filetype = "log"
     vim.api.nvim_buf_set_name(logcat_buf, "logcat:" .. pid)
-    local cmd = require("utils.android_device").adb_args(
-      adb, serial, { "logcat", "--pid=" .. pid })
+    local logcat = require("utils.android_logcat")
+    local args = { "logcat", "--pid=" .. pid }
+    vim.list_extend(args, logcat.filter_args(D._logcat_level))
+    local cmd = require("utils.android_device").adb_args(adb, serial, args)
     if not cmd then return end
     local buf = logcat_buf
+    -- Keyboard affordances: <CR> jump to source, gl cycle level, gx crash.
+    logcat.attach(buf, {
+      level = D._logcat_level or "V",
+      on_cycle = function(level)
+        D._logcat_level = level
+        start_logcat()
+        D.dap_bottom_tab("logcat", { quiet = true })
+      end,
+    })
     logcat_job = vim.fn.jobstart(cmd, {
       on_stdout = function(_, data)
         if not vim.api.nvim_buf_is_valid(buf) then return end

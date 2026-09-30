@@ -55,6 +55,24 @@ lock_manager._loaded = true
 lock_manager.update = function() end
 loader.startup = function() end
 local configured, configure_error = pcall(require, "config.lazy")
+-- `import = "lazyvim.plugins"` is resolved before LazyVim itself is cloned, so
+-- the first pass reports "No specs found for module lazyvim.plugins" and only
+-- installs the project's own specs (27 of 44 locally reproduced). The real
+-- startup later sees the full graph and reports e.g. "Plugin flash.nvim is not
+-- installed". Re-resolve the spec until every locked dependency is present.
+if configured then
+  local Config, Plugin, Cache = require("lazy.core.config"), require("lazy.core.plugin"), require("lazy.core.cache")
+  for _ = 1, 5 do
+    Cache.reset()
+    Plugin.load()
+    local missing = {}
+    for _, plugin in pairs(Config.plugins) do
+      if plugin.url and not plugin._.is_local and not plugin._.installed then missing[#missing + 1] = plugin end
+    end
+    if #missing == 0 then break end
+    require("lazy.manage").install({ wait = true, lockfile = true, clear = false, plugins = missing })
+  end
+end
 loader.startup = startup
 lock_manager.update = update_lock
 lazy.setup = setup

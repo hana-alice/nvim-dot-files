@@ -576,7 +576,8 @@ t.describe("core_health: real deterministic audit", function()
     local function non_pass(report)
       local out = {}
       for _, item in ipairs(report.checks or {}) do
-        if item.status ~= "PASS" then out[#out + 1] = item.id .. "=" .. item.status .. " (" .. tostring(item.summary) .. ")" end
+        if item.status ~= "PASS" then out[#out + 1] = item.id .. "=" .. item.status .. " (" .. tostring(item.summary)
+          .. (type(item.next_step) == "string" and ("; " .. item.next_step) or "") .. ")" end
       end
       return table.concat(out, "; ")
     end

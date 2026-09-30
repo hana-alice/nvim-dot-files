@@ -23,6 +23,15 @@ local function checkpoint(label)
   io.stderr:write("GIT_REVIEW_RUNTIME_STAGE: " .. label .. "\n")
   io.stderr:flush()
 end
+-- CI on Linux/macOS exits 124 (outer timeout) inside a 12 s vim.wait, so the
+-- event loop itself is blocked. A fast-context timer still fires during input
+-- waits; report the editor mode to tell a pending prompt from a busy loop.
+local watchdog = vim.uv.new_timer()
+watchdog:start(15000, 15000, function()
+  local mode = vim.api.nvim_get_mode()
+  io.stderr:write("GIT_REVIEW_RUNTIME_WATCHDOG: mode=" .. mode.mode .. " blocking=" .. tostring(mode.blocking) .. "\n")
+  io.stderr:flush()
+end)
 local ok, err = xpcall(function()
   checkpoint("startup loaded")
   assert(package.loaded["lazy"] and package.loaded["lazyvim.config"], "real LazyVim startup did not load")

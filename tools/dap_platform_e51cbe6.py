@@ -14,6 +14,11 @@
 #   run-as <pkg> sh -c '/data/data/<pkg>/lldb-server platform --server --listen "*:<pport>"'
 # The host-side command sequence below is unchanged and still correct (K30).
 import socket, subprocess, json, threading, time, sys, contextlib
+# Emit UTF-8 regardless of the host ANSI code page (cp1252 on CI runners).
+# At import time so callers that import this module and call main() are covered.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
 DAP = r"C:/tools/lldb-22/install/bin/lldb-dap.exe"
 SYMSO = r"E:/Projects/SampleGame-3.4/Source/SampleGame/Binaries/Android/SampleGame_Symbols_v100000001/SampleGame-arm64/libUE4.so"
 
@@ -84,7 +89,4 @@ def main():
         with contextlib.suppress(Exception): p.kill()
 
 if __name__ == "__main__":
-    # Emit UTF-8 regardless of the host ANSI code page (cp1252 on CI runners).
-    for _stream in (sys.stdout, sys.stderr):
-        _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     main()

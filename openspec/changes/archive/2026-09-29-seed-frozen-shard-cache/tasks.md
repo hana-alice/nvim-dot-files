@@ -8,7 +8,7 @@
 
 - [x] 2.1 `index_batch_runtime` 新增 3 个用例（播种、跳过条件与 helper 异常、工具只增不改）。
 - [x] 2.2 映射 filter 全绿；全量 `nvim --headless -l tests/run.lua` 2341/2341。
-- [x] 2.3 离线副本实测 1713.6 s → 42.3 s；headless 真实 prepare 端到端播种 37,339 shard / 11.8 s，随后索引 54.2 s。
+- [x] 2.3 离线副本索引实测 1713.6 s → 42.3 s；headless 真实 prepare 播种 37,339 shard / 11.8 s 后因 receipt 失效回落；随后独立启动 clangd 索引测得 54.2 s，不作为完整激活验收。
 - [ ] 2.4 receipt 有效状态下的激活→切换→索引完整链路实测（本次副本 receipt inventory 已失效，回落原 CDB），留作后续。
 
 ## 3. 收尾

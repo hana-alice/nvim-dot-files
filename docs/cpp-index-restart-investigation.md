@@ -1183,9 +1183,9 @@ reader；重复生成保持七份产物字节/mtime 与 client **33** 不变。�
 
 | 场景 | wall | CPU | 峰值内存 | 备注 |
 |---|---|---|---|---|
-| 冷冻结激活 | 1713.6 s | 12,937 CPU s | 11.9 GB | |
+| 冻结 CDB 冷索引 | 1713.6 s | 12,937 CPU s | 11.9 GB | |
 | 原 CDB 热重启 | 35.8 s | 34 s | 4.55 GB | |
-| 播种后冻结激活 | 42.3 s | 47.9 s | 5.34 GB | 仅重索引 4 个 TU（2 个 SuperUnity.Batch + trigger + 1） |
+| 播种后冻结 CDB 索引 | 42.3 s | 47.9 s | 5.34 GB | 仅重索引 4 个 TU（2 个 SuperUnity.Batch + trigger + 1） |
 
 播种本身：37,342 shard，`os.link` 9.48 s，`copyfile` 45.87 s。
 
@@ -1205,7 +1205,7 @@ refs/rela/symb/stri 上不同，归因于 header shard"最后写入者"非确定
 - 当前 live `verified` 缓存已在 9/23 冷建完成，本次播种只惠及今后新建的 verified 目录/新 generation；
 - 更多真实 L1 二次合并仍属 C11 后续迭代。
 
-### Headless 端到端实测（真实 `batch_runtime.prepare`，隔离副本）
+### Headless prepare 与独立索引实测（隔离副本）
 
 环境：把 live `background-cdb` 的 `compile_commands.json`、`verified/compile_commands.json`、`.cache` 复制到
 工作区外临时目录（`batches.json` 的 original/verified 指向副本，receipts 仍指向仓库
@@ -1220,6 +1220,11 @@ refs/rela/symb/stri 上不同，归因于 header shard"最后写入者"非确定
 | clangd 在播种后的 verified 目录上索引（warm.py） | 54.2 s wall / 56.4 CPU s / 峰值 5.35 GB，仅 4 个 TU 进度（batch/trigger），0 编译失败，37,342 shard |
 
 对照：同一 verified 冷建 1713.6 s / 12,937 CPU s / 11.9 GB → 播种后 54.2 s / 56.4 CPU s（约 31× wall、229× CPU）。
+
+**2026-09-30 更正**：前次提交及部分摘要将 54.2 s 称为 prepare 端到端结果，主 spec 还将 42.3 s
+描述为 live activation；这两种表述均不准确。42.3 s 来自隔离副本，54.2 s 来自 prepare 校验失败后
+独立启动的 clangd 索引。它们证明播种后的副本索引收益，不证明有效 receipt 下的激活→切换→索引完整链路；
+归档任务 2.4 继续保持未完成，既有 header shard 等价性归因仍待闭环。
 
 **校验失败根因（已闭环）**：逐项复核 receipt 两份，dependencies/assets 的 sha 与 file_identity 全部一致，唯一不一致为
 inventory 根（某项目插件的 `Intermediate/Build/Win64/UE4Editor/Development/<Plugin>` 目录）的目录名单哈希

@@ -13,5 +13,5 @@ prepare 后首次冻结激活把约 33k 个保留 TU 冷重建进独立 `verifie
 
 ## Impact
 
-- 首次冻结索引：1713.6 s → 42.3 s（离线副本）/ 54.2 s（headless 真实 prepare 端到端），只重索引 batch TU。
+- 隔离副本冻结 CDB 索引：冷缓存 1713.6 s → 播种后 42.3 s；另一轮 headless prepare 播种后因 receipt 失效回落，随后独立启动 clangd 测得 54.2 s。两者均不是有效 receipt 下的完整激活→切换→索引验收，剩余项见 tasks 2.4。
 - 不改变原缓存、原 CDB 权威、receipt 校验与回落路径。

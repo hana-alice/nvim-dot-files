@@ -73,6 +73,29 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-30 — 更正 shard 播种验收范围并复核发布脱敏
+
+**Task**
+- 接力已提交并推送的 shard 播种改动，复核 spec 同步、归档与公开内容。
+
+**Implemented**
+- 在 `docs/cpp-index-restart-investigation.md` 更正 42.3 s / 54.2 s 的实测范围，并同步主 spec、归档 delta、proposal 与 tasks。
+- 保留归档任务 2.4 未完成；副本索引不再表述为成功的线上激活或完整端到端验收。
+
+**Pitfalls / Gotchas**
+- 前次提交的 Tested 摘要过宽；详细证据是 prepare 校验失败后另行启动 clangd 索引。本次追加更正，不改写已发布历史。
+
+**Validation**
+- 前次提交的元数据、路径和全部新增内容通过专属 denylist 与通用敏感信息扫描。
+- Spec 一致性：主 spec 与已归档 delta 同步更正，15 个 scenario 保持一致；主 spec 严格校验与暂存差异检查通过，未改变运行时行为。
+- 首次 required-native 全量为 2338/2341，失败涉及多实例缓存刷新、探针重试与 native watcher 就绪。独立复测分别通过 27/27、10/10、15/15；watcher 的原始断言和生产时限未改动。
+- 同一原生 helper 的一次配对测量：默认 Python 3.12 启动到 ready 为 9044 ms，已安装 Python 3.14 为 125 ms；后续 Python 3.14 运行也曾超时，因此不能将波动全部归因于版本。测试进程使用现有 `UE_PYTHON` 显式选择真实 Python 3.14，未伪造工具或改变用户会话配置。
+- 最终完整回归 **2341/2341 passed，0 failed、0 skipped**：设置进程内 `NVIM_TEST_REQUIRE_NATIVE=1` 与 `UE_PYTHON` 指向已安装的 Python 3.14 后运行 `nvim --headless -l tests/run.lua`。复测通过不代表上述时限波动已修复。
+
+**Follow-ups**
+- 有效 receipt 下的完整激活链路、header shard 差异归因及更大范围 SuperUnity 验收仍未完成。
+- 本轮异步测试与 helper 就绪时限波动的根因尚未闭环；保留为既存验证稳定性问题，不宣称由文档更正修复。
+
 ### 2026-09-29 — 冻结 shard 缓存从原缓存 add-only 播种
 
 **Task**
@@ -89,8 +112,8 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 - header shard 在播种/冷建间存在 refs/relations 差异，归因于写入者非确定性，为推测、待闭环。
 
 **Validation**
-- 实测（Client Android-Test 副本）：冷冻结激活 1713.6 s / 12,937 CPU s → 播种后 42.3 s / 47.9 CPU s（仅重索引 batch TU）。
-- Headless 端到端（真实 `batch_runtime.prepare`，隔离副本）：播种 linked 37,339、11.8 s；随后 clangd 在该 verified 目录索引 54.2 s / 56.4 CPU s / 5.35 GB、4 TU、0 失败。冻结校验因 receipt inventory（某插件 Win64 Editor Intermediate 目录 9/28 新增文件）返回 `receipt-input-or-asset-changed`，正确回落原 CDB；未验证 live 是否同样失效（推测是）。
+- 实测（Android target 隔离副本）：冻结 CDB 冷索引 1713.6 s / 12,937 CPU s → 播种后索引 42.3 s / 47.9 CPU s（重索引 4 个 TU，其中 2 个为 batch TU）。
+- Headless prepare（真实 `batch_runtime.prepare`，隔离副本）：播种 linked 37,339、11.8 s；冻结校验因 receipt inventory（某插件 Win64 Editor Intermediate 目录 9/28 新增文件）返回 `receipt-input-or-asset-changed`，正确回落原 CDB。随后独立启动 clangd，在播种后的 verified 目录索引 54.2 s / 56.4 CPU s / 5.35 GB、4 TU、0 失败；该数字不是成功激活的端到端耗时。未验证 live 是否同样失效（推测是）。
 - `NVIM_TEST_REQUIRE_NATIVE=1` filters：index_batch_runtime 80/80、index_batch 201/201、index_generation 35/35、cpp_semantic_index 1/1、clangd_commands 10/10、ue_api 65/65、index_graph 12/12、index_verified_batch 27/27、index_vfs_aliases 5/5、index_input_directory 4/4、index_inventory 18/18、cpp_semantic_client 33/33、host_resource_discipline 13/13、stability 26/26。
 - 单独跑 `index_query_profile` filter 时报 native coverage unavailable（skip 条件 clangd/python 未解析被触发），全量套件中同一用例通过；推测全量里其他用例设置了 `UE_CLANGD`，未验证；本改动未触及该路径。
 - 全量 `NVIM_TEST_REQUIRE_NATIVE=1 nvim --headless -l tests/run.lua`：2341/2341 passed。

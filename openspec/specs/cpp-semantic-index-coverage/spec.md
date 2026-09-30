@@ -195,7 +195,7 @@ phase manifest SHALL 绑定独立原始 semantic CDB 的路径与内容。native
 - **THEN** runtime SHALL, before any input watch or frozen client starts, add only shard names absent from the frozen cache by hard link (or exclusive-create copy across volumes), skipping temporary `.temp-stream-` files
 - **AND** it MUST NOT modify, delete or rename any original shard or any shard already present in the frozen cache, and SHALL leave no truncated copy on failure; clangd rewrites shards by temporary file plus rename, so a later frozen rewrite replaces only the frozen directory entry
 - **AND** the seed outcome SHALL NOT grant or revoke frozen authority: seeding failure, a missing helper or a timeout SHALL continue startup with the unseeded cache, and receipt validation and watches SHALL proceed unchanged
-- **RATIONALE** retained frozen commands equal original commands byte-for-byte (activation coverage), clangd 22 keys shards by source path and judges staleness by content digest only, so original shards are valid for retained TUs; batch TUs have new paths and are indexed normally. Measured on the live Client Android cache: cold first frozen activation ≈1714 s wall / 12.9k CPU s; seeded ≈42 s wall reindexing only batch TUs
+- **RATIONALE** retained frozen commands equal original commands byte-for-byte (activation coverage), clangd 22 keys shards by source path and judges staleness by content digest only, so original shards are valid for retained TUs; batch TUs have new paths and are indexed normally. On an isolated copy of an Android target cache, cold indexing of the frozen CDB took ≈1714 s wall / 12.9k CPU s, versus ≈42 s wall after seeding. These are isolated indexing measurements; successful guarded activation, client switching and indexing with valid receipts remain unverified.
 
 #### Scenario: The server uses a query-driver profile not covered by the proof
 - **WHEN** effective server arguments contain a nonempty query-driver allowlist and receipts do not certify that driver-query profile
@@ -722,4 +722,3 @@ Windows 上 owned clangd 的发现 SHALL 同时匹配当前 Neovim parent PID �
 - **WHEN** 评估 clangd 的资源防线
 - **THEN** `--background-index-priority` SHALL 被视为效果未在本平台验证
 - **AND** OS 级约束 SHALL 独立于该旗标成立
-

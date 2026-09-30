@@ -102,6 +102,9 @@ t.describe("shader augmentation provenance", function()
       -- long spelling of the same file, so compare file identity.
       local function real(path) return vim.fs.normalize(vim.uv.fs_realpath(path) or path) end
       t.assert_eq(real(document.synthetic_shaders[1].file), real(shader))
+      -- Use the producer's spelling for the entry lookups below: on Windows CI
+      -- the fixture root is an 8.3 short name while the CDB holds long names.
+      shader = document.synthetic_shaders[1].file
       local probe = root .. "/probe.py"
       write(probe, [=[
 import json, sys

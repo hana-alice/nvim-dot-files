@@ -73,6 +73,18 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-30 — CI 引导只装了一半插件（git_review_runtime 三平台失败的根因）
+
+**Root cause（CI 日志 + 本机全新数据目录复现）**
+- `scripts/bootstrap_headless_ci.lua` 在 LazyVim 克隆前就解析 `import = "lazyvim.plugins"`，日志报 `No specs found for module "lazyvim.plugins"`，只安装了项目自身的 27 个插件（lockfile 共 44 个）。真实启动随后看到完整依赖图，报 `Plugin flash.nvim / nvim-ts-autotag … is not installed`（ERROR），`git_review_runtime` 因此失败。本机全新目录复现同样只得到 28 个目录（含 lazy.nvim）。
+
+**Implemented**
+- 引导脚本在首次解析后重新加载 spec，把缺失插件按冻结 lockfile 装齐（最多 5 轮）；原有「每个插件必须在锁定提交」断言现在覆盖完整依赖图，CI 自身即为验证。
+- `tests/cases/ue_cdb_shader_receipt_spec.lua`：后续按条目查找改用产物中的路径拼写（Windows CI 8.3 短名）。
+
+**Validation**
+- `review_ci` 3/3、`ue_cdb_shader_receipt` 3/3 本机通过；引导修复待本轮 CI 验证。
+
 ### 2026-09-30 — git_review_runtime 的 Diffview 关闭竞态；macOS FSEvents 假设实验
 
 **Task**

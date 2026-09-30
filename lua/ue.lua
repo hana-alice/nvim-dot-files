@@ -2477,6 +2477,11 @@ refresh_statusline = function()
   pcall(vim.cmd, "redrawstatus")
 end
 
+function M._refresh_statusline()
+  invalidate_status_cache()
+  refresh_statusline()
+end
+
 local function set_build_status(value)
   vim.g.ue_build_status = trim(value)
   invalidate_status_cache()
@@ -5853,6 +5858,14 @@ function M.statusline_status(opts)
     parts[#parts + 1] = build
   end
 
+  -- Target-owned status token (e.g. Android device/package the next install,
+  -- deploy or attach will use). The target driver decides; no literal here.
+  local target_driver = require("ue.targets").driver(trim((ctx.state or {}).target_platform or ""))
+  if target_driver and type(target_driver.status_token) == "function" then
+    local ok_token, token = pcall(target_driver.status_token, ctx.state or {})
+    if ok_token and type(token) == "string" and token ~= "" then parts[#parts + 1] = token end
+  end
+
   -- Generic background-task count segment (⏵N). Shown only when N>0; absent
   -- (no placeholder) when zero. Count is derived live from the task registry
   -- at this existing statusline eval — no new timer (config rule P5).
@@ -7989,11 +8002,13 @@ function M.toggle_debug_log()
   return require("utils.ue_logs").toggle_debug_log(ue_runtime_env())
 end
 
-local function deploy_android_so()
+local function deploy_android_so(opts)
+  opts = type(opts) == "table" and opts.on_exit and opts or {}
   local host_driver = require("utils.platform").driver()
   local dispatched, dispatch_err = dispatch_registered_workflow("Android", "so_deploy", {
     host_driver = host_driver,
     context = {
+      on_exit = opts.on_exit,
       resolve_context = resolve_context,
       read_state = read_state,
       target_context = function(ctx, platform)
@@ -8001,7 +8016,7 @@ local function deploy_android_so()
       end,
       open_terminal_command = open_terminal_command,
       workspace_root = workspace_root,
-      reinvoke = deploy_android_so,
+      reinvoke = function() deploy_android_so(opts) end,
     },
   })
   if dispatched ~= nil then
@@ -9557,7 +9572,37 @@ function M.setup()
   vim.api.nvim_create_user_command("UEInstallIOS", function()
     CORE_RT.install_target("IOS")
   end, { desc = "Install the current tuple's staged IOS app through its target driver" })
-  vim.api.nvim_create_user_command("UEDeployAndroidSO", deploy_android_so, {})
+  vim.api.nvim_create_user_command("UEDeployAndroidSO", function() deploy_android_so() end, {})
+  -- One-key Android inner loop: build SO → hot-deploy → attach. The steps stay
+  -- separate owners (K46); this only chains them and stops at the first failure.
+  vim.api.nvim_create_user_command("UEAndroidCrash", function()
+    require("ue.dap._android_crash").run()
+  end, { desc = "Android: symbolicate the latest native crash from the device into quickfix" })
+  vim.api.nvim_create_user_command("UEAndroidIterate", function(cmd)
+    local notify = function(msg, level) vim.notify("[UEAndroidIterate] " .. msg, level or vim.log.levels.INFO) end
+    local function start()
+      -- The deploy leaves the app stopped (K46). Start it under the debugger
+      -- (wait-for-debugger launch, K39) or plainly with `nodebug`.
+      if cmd.args == "nodebug" then
+        notify("deploy ok → launching app")
+        return M.launch_app()
+      end
+      notify("deploy ok → launching under the debugger")
+      vim.cmd("UEDAPLaunch Android")
+    end
+    local function deploy()
+      notify("SO build ok → deploying")
+      deploy_android_so({ on_exit = function(code)
+        if code ~= 0 then return notify("stopped: deploy exited " .. code, vim.log.levels.ERROR) end
+        start()
+      end })
+    end
+    build_target({ operation = "so_build", on_exit = function(code)
+      if code ~= 0 then return notify("stopped: SO build exited " .. code, vim.log.levels.ERROR) end
+      deploy()
+    end })
+  end, { nargs = "?", complete = function() return { "nodebug" } end,
+    desc = "Android loop: build SO, hot-deploy it, launch under the debugger (nodebug: plain launch)" })
   vim.api.nvim_create_user_command("UELaunch", function()
     M.launch_app()
   end, {})

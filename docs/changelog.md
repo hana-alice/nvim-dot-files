@@ -73,6 +73,26 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-30 — Android IDE 体验：异步调试路径、设备/包可见、崩溃符号化、一键迭代
+
+**Task**
+- 用户：以 Android 为主打造自己的 nvim IDE，按扫描出的改进计划全部推进。
+
+**Implemented**
+- 不卡界面：`lua/ue/dap/android.lua` 新增 `adb_async`/`adb_sequence`；attach 查 pid（`pidof_async`）、ASLR maps 读取（`read_so_base_hex_async`，attach 配置构建拆为 `M._finalize_attach_config`）、wait-for-debugger 的 force-stop/set-debug-app/start/clear、JDWP forward 全部改为异步。
+- 设备/包可见：`utils.android_device.set(serial, device)` 记录机型标签并刷新状态栏；`ue.targets.android.status_token` 由 target owner 输出 `A:<机型>/<包短名>`，`ue.lua` 状态栏经 target driver 调用（无 target 字面量）。
+- 包名选择：新增 `lua/utils/android_package.lua`（设备 `pm list packages -3` + 项目候选 + 手输兜底）；launch、logcat、DAP 在没有已知包名时用它代替空白 `vim.fn.input`，选择结果持久化到 `android_package`。
+- 崩溃符号化：新增 `lua/ue/dap/_android_crash.lua` 与 `:UEAndroidCrash`（`<leader>uX`）：读 `logcat -b crash -d`，取最近一次崩溃，UE 模块帧用 `llvm-symbolizer`（经平台 `resolve_tool`，与 clangd 同目录）按 DAP 同一符号库选择链符号化，其余帧原样保留，进 quickfix。`ue.dap.resolve_android_dap_context`、`ue.dap.android.symbol_lib` 转为公开 API。
+- 一键迭代：`:UEAndroidIterate`（`<leader>ux`）串联 SO 构建 → 快速部署 → wait-for-debugger 启动（`nodebug` 参数改为普通启动），任一步失败立即停止；步骤仍是各自 owner（K46）。部署工作流新增 `on_exit` 透传。
+- 探针：`android-attach` 主题记录 attach 成功（是否有符号/rebase）与按层失败。
+- 致命信号断点的「待验证」注释按引擎源码 `AndroidSignals.h` 核对后更正（见 spec 踩坑）。
+
+**Validation**
+- 新增 `tests/cases/android_ide_spec.lua` 8/8（崩溃帧解析用真机 `logcat -b crash` 格式、包选择、状态栏标签、target token）；`dap_spec` 新增异步 adb 用例 115/115。
+- 真实工具验证：真机（ANDROID-SERIAL-B）崩溃缓冲解析出 7 帧；用 clang 生成的 aarch64 DWARF ELF 端到端跑 `llvm-symbolizer`，quickfix 得到 `sym.c:1 crash_here`。
+- `commands` 118/118、`keymaps` 58/58、`cheatsheet` 145/145、`host_resource_discipline` 13/13、`ue_platform_boundary` 17/17、`structure` 78/78；并行全量 required-native 126/126 文件通过（152.3 s）。
+- 未做：attach/launch/`UEAndroidIterate` 的真机端到端调试会话（本轮未连接调试会话验证）。
+
 ### 2026-09-30 — 最近项目列表并发写入在 Windows 上丢记录
 
 **Task**

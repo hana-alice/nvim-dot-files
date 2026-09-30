@@ -1400,6 +1400,10 @@ function D.android_dap_launch(_opts)
   android.launch({ context = resolve_android_dap_context() })
 end
 
+function D.resolve_android_dap_context(ctx)
+  return resolve_android_dap_context(ctx)
+end
+
 function D._resolve_android_dap_context_for_test(ctx)
   return resolve_android_dap_context(ctx)
 end

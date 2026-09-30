@@ -25,6 +25,7 @@ local function deps(request)
     end,
     logger = logger,
     reinvoke = context.reinvoke,
+    on_exit = context.on_exit,
   }
 end
 
@@ -105,6 +106,8 @@ function M.run(request)
     quickfix_title = "UEDeployAndroidSO",
     quickfix_root = d.workspace_root(ctx),
     tail_limit = 20,
+    finish_label = "UEDeployAndroidSO",
+    on_exit = d.on_exit,
   })
   return command, nil, snapshot
 end

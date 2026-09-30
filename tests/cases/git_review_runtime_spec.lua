@@ -155,16 +155,35 @@ end, debug.traceback)
 if not ok then io.stderr:write(tostring(err) .. "\n"); vim.cmd("cquit 1") else vim.cmd("qa!") end
 ]], f.root)
       vim.fn.writefile(vim.split(code, "\n", { plain = true }), script)
-      local result = vim.system({ vim.v.progpath, "--headless", "-u", cfg .. "/init.lua", "-i", "NONE", "-n",
+      local handle = vim.system({ vim.v.progpath, "--headless", "-u", cfg .. "/init.lua", "-i", "NONE", "-n",
         "-c", "lua dofile(" .. string.format("%q", script) .. ")" }, {
         text = true, cwd = f.root, timeout = 60000,
         env = vim.tbl_extend("force", vim.fn.environ(), {
           NVIM_CORE_HEALTH_NO_MUTATE = "1", XDG_STATE_HOME = scratch .. "/state", XDG_CACHE_HOME = scratch .. "/cache",
           NVIM_UE_LOG_DIR = scratch .. "/logs", NVIM_UE_PROBE_PATH = scratch .. "/probes.json",
         }),
-      }):wait()
+      })
+      -- CI (Linux/macOS) showed the child's own event loop stops: neither its
+      -- 12 s vim.wait nor a libuv watchdog timer fire. Snapshot its process
+      -- tree from outside before the 60 s kill to see what it blocks on.
+      local snapshot
+      if not require("utils.platform").is_windows then
+        vim.wait(40000, function() return handle:is_closing() end, 100)
+        if not handle:is_closing() then
+          local tree = vim.system({ "ps", "-ax", "-o", "pid,ppid,stat,etime,command" }, { text = true }):wait(5000)
+          local keep = {}
+          for line in vim.gsplit(tree.stdout or "", "\n", { plain = true }) do
+            if line:find("nvim", 1, true) or line:find("git", 1, true) or line:find("PID", 1, true) then
+              keep[#keep + 1] = line:sub(1, 240)
+            end
+          end
+          snapshot = "\nprocess snapshot at 40s (child pid " .. tostring(handle.pid) .. "):\n"
+            .. table.concat(keep, "\n")
+        end
+      end
+      local result = handle:wait()
       vim.fn.delete(scratch, "rf")
-      t.assert_eq(result.code, 0, result.stderr)
+      t.assert_eq(result.code, 0, tostring(result.stderr) .. (snapshot or ""))
       t.assert_contains((result.stdout or "") .. (result.stderr or ""), "GIT_REVIEW_RUNTIME_OK")
       t.assert_eq(f.read(), "one changed\ntwo\nthree\n")
       t.assert_eq(f.git({ "show", ":review.txt" }), "one\ntwo\nthree\n")

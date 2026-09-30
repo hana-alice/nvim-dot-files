@@ -73,6 +73,25 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-30 — 修复 CI Tree-sitter CLI 安装版本
+
+**Task**
+- 修复 PR #13 三个平台在依赖安装阶段共同失败的问题。
+
+**Implemented**
+- `.github/workflows/headless.yml` 将 npm 安装版本从未发布的 `tree-sitter-cli@0.26.1` 改为已发布的固定版本 `0.26.3`。
+
+**Pitfalls / Gotchas**
+- GitHub release 存在不代表对应 npm 版本存在；原版本在 runner 报 `ETARGET`，本地 npm registry 查询同样报版本不存在。
+
+**Validation**
+- Spec 一致性：无行为契约变更，恢复 `config-regression-suite` 已要求的隔离依赖安装和全量回归入口。
+- 临时目录实际 npm 安装成功，CLI 返回 `tree-sitter 0.26.3`；225 个 Lua 文件通过 AST lint。
+- 本地 required-native 全量 **2341/2341**，0 failed、0 skipped（测试进程使用已安装的 Python 3.14）；差异检查通过。
+
+**Follow-ups**
+- 跨平台验收以 PR #13 对应提交的 Linux、macOS、Windows 完整 CI 记录为准；依赖安装成功不能替代整个工作流通过。
+
 ### 2026-09-30 — 更正 shard 播种验收范围并复核发布脱敏
 
 **Task**

@@ -54,10 +54,10 @@ with tempfile.TemporaryDirectory(prefix='index_inventory_') as temporary:
     assert base.parent == Path(tempfile.gettempdir()).resolve()
     tree, excluded = base / 'MixedRoot', base / 'MixedRoot/Excluded'
     (tree / 'MixedDir').mkdir(parents=True)
-    (tree / 'MixedDir/Value.H').write_text('content')
+    (tree / 'MixedDir/Value.H').write_text('content', encoding='utf-8')
     excluded.mkdir()
-    (excluded / 'omitted.h').write_text('omitted')
-    (tree / 'file.h').write_text('file')
+    (excluded / 'omitted.h').write_text('omitted', encoding='utf-8')
+    (tree / 'file.h').write_text('file', encoding='utf-8')
 
     def compare(name, root=tree, omitted=excluded):
         expected, observed = outcome(reference, root, omitted), outcome(actual, root, omitted)
@@ -98,7 +98,7 @@ with tempfile.TemporaryDirectory(prefix='index_inventory_') as temporary:
         assert selected == sorted(siblings, key=lambda value: (len(value.parts), str(value)))
         results.append({'name': 'enumerates ancestors at most once per root across a large sibling set', 'equal': True})
         initial = compare('preserves ordinary records and excluded subtrees')
-        (tree / 'new.h').write_text('new')
+        (tree / 'new.h').write_text('new', encoding='utf-8')
         assert compare('detects new directory entries') != initial
         (tree / 'new.h').unlink()
         assert compare('restores the digest after directory entry removal') == initial
@@ -126,7 +126,7 @@ with tempfile.TemporaryDirectory(prefix='index_inventory_') as temporary:
             unicode_second.mkdir()
             assert not unicode_first.samefile(unicode_second)
         for number, directory in enumerate((unicode_first, unicode_second)):
-            (directory / ('child-' + str(number) + '.h')).write_text(directory.name)
+            (directory / ('child-' + str(number) + '.h')).write_text(directory.name, encoding='utf-8')
         compare('uses Path-compatible Unicode case identity')
         try:
             for name, target, directory in [('file-link.h', tree / 'file.h', False),

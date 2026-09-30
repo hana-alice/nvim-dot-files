@@ -13,6 +13,11 @@ clangd-indexer 没有 preamble share → 重复 parse 7 大 PCH 821 次。
 """
 import json, os, sys, re
 from collections import defaultdict
+# Emit UTF-8 regardless of the host ANSI code page (cp1252 on CI runners).
+# At import time so callers that import this module and call main() are covered.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
 
 # Establish this before imports: their bytecode writes precede module guards
 # and would change the directory inventory used by semantic proof receipts.
@@ -442,7 +447,4 @@ def main():
 
 
 if __name__ == '__main__':
-    # Emit UTF-8 regardless of the host ANSI code page (cp1252 on CI runners).
-    for _stream in (sys.stdout, sys.stderr):
-        _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     sys.exit(main())

@@ -38,6 +38,11 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+# Emit UTF-8 regardless of the host ANSI code page (cp1252 on CI runners).
+# At import time so callers that import this module and call main() are covered.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
 
 TOOLS_DIR = str(Path(__file__).resolve().parent)
 if TOOLS_DIR not in sys.path:
@@ -470,7 +475,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # Emit UTF-8 regardless of the host ANSI code page (cp1252 on CI runners).
-    for _stream in (sys.stdout, sys.stderr):
-        _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     sys.exit(main())

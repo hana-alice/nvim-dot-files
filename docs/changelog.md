@@ -73,6 +73,24 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-30 — Windows CI：导入期 UTF-8 输出、fixture 文本编码与 8.3 短路径
+
+**Task**
+- `9f08099` 的 Windows CI 仍有 10 项失败；逐项读日志处置。
+
+**Implemented**
+- 17 个 `tools/*.py` 的 UTF-8 stdout/stderr 重设从 `__main__` 挪到导入期。根因：`index_output_stability` 的驱动脚本 `import` 工具后直接调 `main()`，不经过 `__main__`，6 项仍报 `UnicodeEncodeError`（`←`）。
+- `tests/cases/index_inventory_spec.lua`：fixture 的 `write_text` 显式 `encoding='utf-8'`（写入 `İ` 等目录名时按 cp1252 编码失败）。
+- `tests/cases/ue_cdb_shader_receipt_spec.lua`：shader 路径按 realpath 比较（CI 临时目录期望值是 8.3 短名 `RUNNER~1`，产物是长名 `runneradmin`，同一文件）。
+
+**Validation**
+- 本机模拟 CI 编码（`PYTHONIOENCODING=cp1252`）并行全量 required-native：125/125 文件通过（127.1 s）。
+
+**Follow-ups（根因未定）**
+- `git_review_runtime`：Linux/macOS 子进程 CPU 空转（`ps` 为 `R`，git 子进程成僵尸未回收）；Windows 在 4 次运行中有 3 次报 `Plugin mini.ai/... is not installed`（VeryLazy 触发时 lazy 认为插件未安装），另 1 次未出现。两者是否同源待查。
+- Windows `ordered Unity` 真实 clangd 索引在 4 次中失败 1 次（`indexing_complete` 为假、编译失败数 0），疑似偶发，待观察。
+- macOS `index_batch_runtime` FSEvents 延迟 rename 事件（见前条）。
+
 ### 2026-09-30 — 按 CI 诊断修复 core_health 清理与 macOS 路径别名
 
 **Task**

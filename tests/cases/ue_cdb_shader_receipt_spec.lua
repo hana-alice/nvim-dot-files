@@ -98,7 +98,10 @@ t.describe("shader augmentation provenance", function()
       local document = vim.json.decode(read(cdb .. ".unity-origin.json"))
       t.assert_type(document.synthetic_shaders, "table")
       t.assert_eq(#document.synthetic_shaders, 1)
-      t.assert_eq(document.synthetic_shaders[1].file, shader)
+      -- Windows CI temp is an 8.3 short name (RUNNER~1); the producer may emit the
+      -- long spelling of the same file, so compare file identity.
+      local function real(path) return vim.fs.normalize(vim.uv.fs_realpath(path) or path) end
+      t.assert_eq(real(document.synthetic_shaders[1].file), real(shader))
       local probe = root .. "/probe.py"
       write(probe, [=[
 import json, sys

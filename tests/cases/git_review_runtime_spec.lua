@@ -54,10 +54,15 @@ local ok, err = xpcall(function()
     assert(type(sources[source].confirm) == "function", "missing review confirmation: " .. source)
   end
   local errors = {}
-  local notify = vim.notify
-  vim.notify = function(message, level, opts)
+  -- Do not forward to the captured vim.notify: during startup LazyVim installs
+  -- a temporary queueing notify (lazy_notify) and later replays its queue with
+  -- `for _, n in ipairs(notifs) do vim.notify(...) end`. Forwarding to that
+  -- temp from here appends to the list being iterated, so the replay never
+  -- ends and the child spins fully busy (seen on CI whenever a startup
+  -- notification such as a deprecation warning is queued).
+  vim.notify = function(message, level)
     if level and level >= vim.log.levels.ERROR then errors[#errors + 1] = tostring(message) end
-    return notify(message, level, opts)
+    io.stderr:write("GIT_REVIEW_RUNTIME_NOTIFY[" .. tostring(level) .. "]: " .. tostring(message) .. "\n")
   end
   local function wait(predicate, label)
     checkpoint("wait: " .. label)

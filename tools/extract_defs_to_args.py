@@ -18,6 +18,11 @@ import json
 import argparse
 import os
 from pathlib import Path
+# Emit UTF-8 regardless of the host ANSI code page (cp1252 on CI runners).
+# At import time so callers that import this module and call main() are covered.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
 
 # Match #define NAME [VALUE]    or    #undef NAME
 RE_DEF = re.compile(r'^\s*#\s*define\s+(\w+)(?:\s+(.+?))?\s*$')

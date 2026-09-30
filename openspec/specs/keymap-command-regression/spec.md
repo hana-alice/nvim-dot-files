@@ -2,99 +2,69 @@
 
 ## Purpose
 
-定义针对本 Neovim 配置中快捷键绑定与用户命令注册的回归测试覆盖范围：验证关键 keymap 在加载后于对应模式存在且指向预期命令或行为，并验证配置定义的用户命令在相应 setup 调用后均已注册，确保「开发完跑一遍」即可发现键位与命令层面的回归。
+定义针对本 Neovim 配置中快捷键绑定与用户命令注册的回归测试覆盖范围：验证关键 keymap 在
+加载后于对应模式存在且指向预期命令或行为，并验证配置定义的用户命令在相应 setup 调用后均已
+注册，确保「开发完跑一遍」即可发现键位与命令层面的回归。不管具体键位分配是否合理，只管
+「声明的绑定确实生效」。
 
 ## Requirements
 
-### Requirement: 快捷键绑定回归
+### Requirement: 快捷键绑定回归必须覆盖真实加载后的状态
 
-回归套件 SHALL 验证关键 keymap 在加载 `lua/config/keymaps.lua` 后，于对应模式下存在且映射到预期命令或行为。校验前 SHALL 设置 `vim.g.mapleader = " "`、`vim.g.maplocalleader = " "` 并调用 `require("ue").setup()`，使 `<leader>` 前缀与依赖命令就绪。
+回归套件 SHALL 验证关键 keymap 在加载 `lua/config/keymaps.lua` 后，于对应模式下存在且映射
+到预期命令或行为；校验前 SHALL 设置 leader 并调用 `require("ue").setup()`，使依赖命令就绪。
+涉及插件延迟加载或 buffer 附加才生效的键位（如 Git 相关入口）SHALL 在对应加载/附加完成后
+另行验证最终行为，防止继承入口覆盖迁移结果被误判为通过。
 
-#### Scenario: DAP 功能键多模式绑定
+#### Scenario: 覆盖多模式与依赖 setup 的键位
+- **WHEN** keymap 用例加载完成，且相关插件延迟加载、buffer 已附加
+- **THEN** 关键 keymap（如 DAP 功能键、leader 系列、核心编辑/导航键）在其声明的模式下均有
+  映射，并指向预期命令
+- **AND** 依赖延迟加载才生效的入口（如 Git 键位）SHALL 反映加载完成后的最终路由，而非
+  初始的临时/继承状态
 
-- **WHEN** keymap 用例加载完成
-- **THEN** `<F5>`/`<F6>`/`<F9>`/`<F10>`/`<F11>`/`<S-F11>` 在 `n`、`i`、`t`、`v` 四种模式下均有映射
-- **AND** `<F5>` 映射到 `UEDAPContinue`、`<F9>` 映射到 `UEDAPToggleBreakpoint`、`<F10>` 映射到 `UEDAPStepOver`
+### Requirement: Visual 替换必须消费当前选择而非旧 marks
 
-#### Scenario: leader 系列绑定存在且指向预期命令
+Visual 替换 SHALL 从当前 Visual anchor、cursor 与 selection type 捕获文本和行范围，不能依赖
+上一次完成选择的 marks；进入替换命令后插入点 SHALL 位于 replacement 字段。
 
-- **WHEN** keymap 用例查询 normal 模式映射
-- **THEN** `<leader>?` → `UECheatsheet`、`<leader>uW` → `WindowTitle`、`<leader>db` → `UEDAPToggleBreakpoint`、`<leader>dc` → `UEDAPContinue`、`<leader>da` 含 `UEDAPAttach`
-- **AND** `<leader>vv`/`<leader>vb`/`<leader>vg` 等 sidebar 键均有映射
-- **AND** `<leader>ub` → `UEBuild`、`<leader>ul` → `UELaunch`（由 VeryLazy 覆盖应用后）
-
-#### Scenario: 核心编辑/导航键绑定
-
-- **WHEN** keymap 用例查询映射
-- **THEN** `gd`、`gr`、`gc`（normal/visual）、`gcc` 均有映射
-- **AND** Windows 平台下 cmdline 模式 `<C-v>` 映射为 `<C-r>+`、insert 模式 `<C-v>` 映射为 `<C-r><C-o>+`
-
-#### Scenario: keymap 查询辅助可用
-
-- **WHEN** 用例通过 harness 的 keymap 查询辅助按 `(mode, lhs)` 检索
-- **THEN** 返回该映射的 rhs/callback 信息或 nil
-- **AND** 查询不存在的映射返回 nil 而非报错
-
-### Requirement: 快捷键帮助可搜索且保留分类
-
-浮动 cheatsheet SHALL 提供 `/` 实时搜索入口；搜索 SHALL 同时覆盖快捷键、描述和原始分类，并在结果界面保留 `Tab › Section` 两级分类。用于展示成对大小写命令的空格分隔符 SHALL 不妨碍直接组合查询。
-
-#### Scenario: mixed-case 成对快捷键可直接发现
-
-- **WHEN** 用户在 `<leader>?` 浮窗按 `/` 并输入 `wW`
-- **THEN** 结果直接包含 `w / W`
-- **AND** 该结果显示为 `Basics › Motions`
-- **WHEN** 用户输入 `aA`
-- **THEN** 结果直接包含 `a / A`
-- **AND** 该结果显示为 `Basics › Modes`
-
-#### Scenario: 搜索交互与分类回归
-
-- **WHEN** 回归套件真实喂入 `/wW<CR>`
-- **THEN** cheatsheet 进入 `wW` 搜索状态
-- **AND** 实际浮窗 extmark 内容包含 `Basics › Motions` 与 `w / W`
-- **AND** 搜索大小写不敏感，每条命中均携带非空 tab 与 section 分类
+#### Scenario: 首次与后续不同选区
+- **WHEN** 用户首次选择文本或改变选区后执行 Visual replace
+- **THEN** SHALL 使用本次选区，不抛无效行号错误、不使用旧选区，替换后不修改搜索 pattern
 
 ### Requirement: 用户命令注册回归
 
-回归套件 SHALL 验证配置定义的用户命令在相应 setup 调用后均已注册（`vim.fn.exists(":Cmd") == 2`）。
+回归套件 SHALL 验证配置定义的用户命令在相应 setup 调用后均已注册
+（`vim.fn.exists(":Cmd") == 2`），任一命令缺失时用例 SHALL FAIL 并打印缺失命令名。
 
 #### Scenario: UE 命令全量注册
-
 - **WHEN** 用例调用 `require("ue").setup()` 后查询
-- **THEN** 全部 `UE*` 命令（含 `UEBuild`、`UEPrepare`、`UEIndexNow`、`UEDAPAttach`、`UEDAPLaunch`、`UEDAPTab`、`UEExportCompileCommands`、`UEPaths` 等）均 `exists == 2`
-- **AND** 任一命令缺失时用例 FAIL 并打印缺失命令名
+- **THEN** 全部 `UE*` 命令均 `exists == 2`；任一缺失即 FAIL 并报告命令名
 
-#### Scenario: 辅助命令注册
+### Requirement: 快捷键帮助必须可搜索且保留分类
 
-- **WHEN** 用例加载 `lua/config/keymaps.lua` 后查询
-- **THEN** `Restart`、`RestartDetect`、`UEDefStatus`、`WindowTitle`、`WindowTitleReset` 均 `exists == 2`
+浮动 cheatsheet SHALL 提供实时搜索入口，搜索 SHALL 同时覆盖快捷键、描述和原始分类，并在
+结果界面保留两级分类；用于展示成对大小写命令的分隔符 SHALL 不妨碍直接组合查询。
 
-### Requirement: 系统窗口标题命名
+#### Scenario: mixed-case 成对快捷键可直接发现
+- **WHEN** 用户在 cheatsheet 浮窗搜索输入框中输入成对键位的组合（如 `wW`）
+- **THEN** 结果直接包含该成对键位，并显示其分类路径
 
-配置 SHALL 允许为当前 Neovim/Neovide 系统窗口设置会话级名称，并 SHALL 提供恢复 Neovim 自动标题的明确路径。自定义名称进入 `'titlestring'` 时 SHALL 按字面显示，不得把用户输入当作 statusline 表达式执行；终端控制字符 SHALL 被移除。
+### Requirement: 系统窗口标题命名必须安全且可恢复
 
-#### Scenario: 快捷键输入名称
-
-- **WHEN** 用户按 `<leader>uW` 并确认一个非空名称
-- **THEN** 当前系统窗口标题立即显示该名称
-- **AND** 名称仅作用于当前 Neovim 会话
-
-#### Scenario: 命令直接设置与恢复自动标题
-
-- **WHEN** 用户执行 `:WindowTitle Build Window`
-- **THEN** 系统窗口标题按字面显示 `Build Window`
-- **WHEN** 用户执行 `:WindowTitle!`、`:WindowTitleReset`，或在输入框确认空值
-- **THEN** 自定义名称被清除并恢复 Neovim 自动标题
-- **AND** 取消输入框不改变现有标题
+配置 SHALL 允许为当前 Neovim/Neovide 系统窗口设置会话级名称，并 SHALL 提供恢复 Neovim 自动
+标题的明确路径。自定义名称进入 `'titlestring'` 时 SHALL 按字面显示，不得把用户输入当作
+statusline 表达式执行；终端控制字符 SHALL 被移除，长度 SHALL 有界且不切坏 UTF-8。
 
 #### Scenario: 标题输入安全且有界
-
 - **WHEN** 名称含 `%{...}`、换行或终端控制字符
-- **THEN** 百分号按字面显示，控制字符被折叠为空格
-- **AND** 标题最多保留 80 个 Unicode 字符且不会切坏 UTF-8
+- **THEN** 百分号按字面显示，控制字符被折叠为空格，标题长度有界且不切坏 UTF-8
 
-#### Scenario: workarounds 命令在 setup 后注册
+## 选型与踩坑
 
-- **WHEN** 用例调用 `require("workarounds").setup({ auto_apply = false })`
-- **THEN** `WorkaroundList`、`WorkaroundStatus`、`WorkaroundEnable`、`WorkaroundDisable` 均 `exists == 2`
+- **踩坑**：Git 相关键位如果只在 `keymaps.lua` 加载后立即校验，会因为 LazyVim 的延迟映射
+  和 buffer-local Git 映射尚未生效而得到误判「通过」的假阳性——根因是继承入口（终端默认
+  Git 键位）在延迟加载完成前仍然生效，掩盖了迁移结果；处置为要求回归套件在插件延迟加载和
+  buffer 附加完成后另行验证最终路由。
+- **重要事项**：具体键位到命令的映射表（如哪个 leader 前缀对应哪个命令）属于实现细节，不
+  在本 spec 固化；spec 只约束「声明了的映射必须真实生效、且在依赖就绪后才可信」这条底线。

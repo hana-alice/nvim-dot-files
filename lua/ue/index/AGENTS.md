@@ -8,11 +8,15 @@
 
 current / hot / full 三相受控 BackgroundIndex：模块记录/持久化（`_state`），generation
 manifest 与 coverage selector（`_generation`），交付就绪判定与 prepare 汇报口径（`_delivery`），
-compiler-authored UBT unity / exact fallback CDB 生成（`_build`），
+compiler-authored UBT unity / exact fallback CDB 生成（`_build`），标准 clangd CDB 验证与幂等发布（`_publish`），
 phase 调度与交付 deadline（`_schedule`），通用宿主策略薄委派（`_admission` → `utils.host_admission`），
-readiness 磁盘自愈（`_recover`），以及只跟随 chosen manifest fingerprint 的 clangd 重启（`_clangd`）。
+readiness 磁盘自愈（`_recover`），以及结合实际发布变化和 reader/recovery 状态的 clangd 重启（`_clangd`）。
 
 ## 结构契约
+
+- **SuperUnity 性能保全**：分组、发布与重启必须遵守
+  [根硬约束](../../../AGENTS.md#super-unity-performance-contract)（CONSTRAINTS C11）；
+  普通 UBT Unity 不能冒充二次合并，必须核验真实工作量、完成耗时与宿主余量。
 
 - `init.lua` 是唯一 require 入口；子模块是 loader 风格
   `return function(M, core)`——共享 `core.h`（helpers）/ `core.RT`（运行时）/
@@ -23,7 +27,7 @@ readiness 磁盘自愈（`_recover`），以及只跟随 chosen manifest fingerp
   不得反向 `require("ue")`（会循环）。
 - `M._rt` 与 ue.lua 的 `INDEX_RT` 是**同一张表**（活引用）；:UESetProject
   清理、status cache 直接改它。别做防御性拷贝。
-- 加载顺序 `_state → _generation → _recover → _delivery → _clangd → _build → _admission → _schedule`：基础 helper 在 `_state` 定义，
+- 加载顺序 `_state → _generation → _publish → _recover → _delivery → _clangd → _build → _admission → _schedule`：基础 helper 在 `_state` 定义，
   generation/selector helper 在 `_generation` 定义，`_delivery` 消费 `_generation` 的
   `index_status_summary`，`_schedule` 消费 `_build` 的 `build_phase_async`；兄弟模块顶部 alias；
   不得反向依赖后加载模块。
@@ -41,6 +45,11 @@ readiness 磁盘自愈（`_recover`），以及只跟随 chosen manifest fingerp
 - **交付可观测是硬约束**：index 构建失败/中断 MUST notify + 落 `utils.log`；`running` 必须携带
   `owner_pid` 使其跨进程可 falsify；prepare 的完成汇报 MUST 经 `_delivery` 陈述 index 真实状态，
   MUST NOT 在构建中/失败时暗示语义层已就绪（用户不应被要求记住平台专属索引命令）。
+
+- **冻结 shard 缓存播种只增不改**：`batch_shard_seed.lua` 仅在冻结缓存无 `*.idx` 时，
+  于 watch probe 前把原缓存缺失 shard 硬链接/独占复制进去；MUST NOT 改写/删除任一侧已有 shard，
+  结果 MUST NOT 影响冻结权威。前提是 clangd 按源路径寻址 shard、只按内容 digest 判过期、
+  temp+rename 写回——升级 clangd 时须重新核对这三点。
 
 ## 宪法级坑（权威在 ../../../docs/CONSTRAINTS.md）
 
@@ -61,5 +70,5 @@ readiness 磁盘自愈（`_recover`），以及只跟随 chosen manifest fingerp
 `../../../docs/health-check-2026-07.md`（F1 切分大纲）、
 `../../../docs/architecture/overview.md`。
 
-**治理 spec**（可观察行为的权威；与本文冲突时以 spec 为准）：
+**治理 spec**（大方向与选型/踩坑；实现细节以代码与回归为准）：
 `../../../openspec/specs/cpp-semantic-index-coverage/spec.md`。

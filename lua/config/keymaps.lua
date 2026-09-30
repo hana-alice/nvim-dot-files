@@ -33,7 +33,7 @@ end
 
 local function open_substitute(range, pattern)
   local command = string.format(":%ss/\\V%s//gc", range, pattern)
-  vim.fn.feedkeys(termcodes(command .. "<Left><Left><Left><Left>"), "n")
+  vim.fn.feedkeys(termcodes(command .. "<Left><Left><Left>"), "n")
 end
 
 local function open_word_substitute()
@@ -47,22 +47,29 @@ local function open_word_substitute()
 end
 
 local function visual_selection_text()
-  local lines = vim.fn.getregion(vim.fn.getpos("'<"), vim.fn.getpos("'>"), { type = vim.fn.mode() })
+  -- '< and '> describe the last completed selection. A Lua visual mapping
+  -- still has an active selection: v is its anchor and . is its current end.
+  local first, last = vim.fn.getpos("v"), vim.fn.getpos(".")
+  local lines = vim.fn.getregion(first, last, {
+    type = vim.fn.mode(),
+    exclusive = vim.o.selection == "exclusive",
+  })
   if type(lines) ~= "table" or vim.tbl_isempty(lines) then
     return ""
   end
-  return table.concat(lines, "\n")
+  return table.concat(lines, "\n"), math.min(first[2], last[2]), math.max(first[2], last[2])
 end
 
 local function open_visual_substitute()
-  local selection = visual_selection_text()
+  local selection, first, last = visual_selection_text()
   if selection == "" then
     vim.notify("No selection to replace", vim.log.levels.WARN)
     return
   end
 
+  vim.cmd.normal({ args = { termcodes("<Esc>") }, bang = true })
   vim.schedule(function()
-    open_substitute("'<,'>", escape_substitute_pattern(selection))
+    open_substitute(first .. "," .. last, escape_substitute_pattern(selection))
   end)
 end
 
@@ -277,7 +284,7 @@ map("n", "<leader>uW", "<cmd>WindowTitle<cr>", { desc = "UI: Name window title" 
 map("n", "<leader>va", sidebar_pick, { desc = "Sidebar: Choose view" })
 map("n", "<leader>vv", sidebar_toggle(), { desc = "Sidebar: Toggle last view" })
 map("n", "<leader>vb", sidebar_toggle("buffers"), { desc = "Sidebar: Buffers" })
-map("n", "<leader>vg", sidebar_toggle("git_status"), { desc = "Sidebar: Git modified files" })
+map("n", "<leader>vg", sidebar_toggle("git_status"), { desc = "CodeDiff: review changes" })
 map("n", "<leader>vs", sidebar_toggle("symbols"), { desc = "Sidebar: File symbols" })
 map("n", "<leader>vd", sidebar_toggle("diagnostics"), { desc = "Sidebar: Diagnostics" })
 map("n", "<leader>vq", sidebar_toggle("qflist"), { desc = "Sidebar: Pinned results" })
@@ -419,3 +426,4 @@ map("n", "<leader>ui", "<cmd>UEInstall<cr>", { desc = "UE: Install for active ta
 -- this file before VimEnter, and waiting for another VeryLazy would leave the
 -- prefix-sensitive mappings absent for the rest of that session.
 apply_ue_runtime_overrides()
+require("utils.git_review").setup_keymaps()

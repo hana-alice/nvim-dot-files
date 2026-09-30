@@ -1,6 +1,9 @@
 local lazypath = vim.fn.stdpath("data") .. "/lazy/lazy.nvim"
 local health_no_mutate = vim.env.NVIM_CORE_HEALTH_NO_MUTATE == "1"
 if not (vim.uv or vim.loop).fs_stat(lazypath) then
+  if health_no_mutate then
+    error("Read-only health probe requires an existing lazy.nvim installation: " .. lazypath)
+  end
   local lazyrepo = "https://github.com/folke/lazy.nvim.git"
   local out = vim.fn.system({ "git", "clone", "--filter=blob:none", "--branch=stable", lazyrepo, lazypath })
   if vim.v.shell_error ~= 0 then

@@ -21,7 +21,9 @@ param(
   [string]$Configuration,
 
   [switch]$WaitMutex,
-  [switch]$FromMsBuild
+  [switch]$FromMsBuild,
+  [ValidatePattern('\A(?:|-[A-Za-z0-9][A-Za-z0-9_.=-]*)\z')]
+  [string]$SdkArgument = ""
 )
 
 Set-StrictMode -Version Latest
@@ -64,6 +66,7 @@ try {
   )
   if ($WaitMutex) { $exportArgs += "-WaitMutex" }
   if ($FromMsBuild) { $exportArgs += "-FromMsBuild" }
+  if ($SdkArgument) { $exportArgs += $SdkArgument }
 
   Write-Host "[UE SO] phase 1/2: exporting compile/link actions (deploy is not executed)"
   Invoke-Ubt -Arguments $exportArgs -Phase "action export"

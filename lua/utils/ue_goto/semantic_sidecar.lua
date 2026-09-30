@@ -76,8 +76,30 @@ local function select_identity_winner(results)
   return results[1]
 end
 
-require("utils.ue_goto.semantic_sidecar_tu").install(Sidecar)
-require("utils.ue_goto.semantic_sidecar_catalog").install(Sidecar)
+local tu_store = require("utils.ue_goto.semantic_sidecar_tu")
+local catalog = require("utils.ue_goto.semantic_sidecar_catalog")
+local definition_resolver = require("utils.ue_goto.semantic_sidecar_definition")
+
+function Sidecar:_metrics(extra)
+  local metrics = self.tu_store:_metrics(extra)
+  metrics.lookup_cache_entries = vim.tbl_count(self.definitions.lookup_cache)
+  metrics.max_lookup_entries = self.definitions.max_lookup_entries
+  metrics.controlled_cdb_entries = vim.tbl_count(self.definitions.controlled_cdb_cache)
+  return metrics
+end
+
+function Sidecar:handle_catalog(request)
+  return self.catalog:handle_catalog(request)
+end
+
+function Sidecar:handle_lookup_definition(request)
+  return self.definitions:handle_lookup_definition(request)
+end
+
+function Sidecar:shutdown()
+  self.definitions:evict()
+  self.tu_store:shutdown()
+end
 
 function Sidecar:_log_metrics(kind, metrics)
   logger.info_ctx(kind, "metrics", metrics)
@@ -138,11 +160,22 @@ function Sidecar:handle_prove(request)
   end
   local function compile_entry(path)
     local entries = libclang.read_json(path)
-    local db = entries and semantic_context.load_compilation_database(entries) or nil
+    local db, detail = semantic_context.load_compilation_database(entries)
+    if not db or not db.complete then
+      return nil, { complete = false, rejected = db and db.rejected or { { reason = detail or "cdb-unreadable" } } }
+    end
     return db and db.by_file[semantic_context.match_key(request.source)] or nil
   end
-  local merged = compile_entry(cdb_path)
-  local active = compile_entry(active_cdb_path)
+  local merged, merged_coverage = compile_entry(cdb_path)
+  local active, active_coverage = compile_entry(active_cdb_path)
+  if merged_coverage or active_coverage then
+    return {
+      v = protocol.VERSION, id = request.id, op = "prove", ok = true, state = "unavailable",
+      reason = merged_coverage and "merged-cdb-incomplete" or "active-cdb-incomplete",
+      coverage = merged_coverage or active_coverage,
+      metrics = self:_metrics({ total_ms = libclang.duration_ms(started) }),
+    }
+  end
   if not active then
     return {
       v = protocol.VERSION,
@@ -201,7 +234,7 @@ function Sidecar:handle_query(request)
     }
   end
 
-  self:_prune_idle(libclang.now_ms())
+  self.tu_store:_prune_idle(libclang.now_ms())
 
   local contexts = {}
   local aggregate = {
@@ -214,7 +247,7 @@ function Sidecar:handle_query(request)
   }
 
   for _, ctx in ipairs(request.contexts or {}) do
-    local result, meta = self:_resolve_context(ctx, request.query, request.overlays or {})
+    local result, meta = self.tu_store:_resolve_context(ctx, request.query, request.overlays or {})
     contexts[#contexts + 1] = result
     if meta then
       aggregate.cold_parse_ms = aggregate.cold_parse_ms + (meta.cold_parse_ms or 0)
@@ -258,7 +291,21 @@ function Sidecar:handle_query(request)
 
   local identities = vim.tbl_keys(by_identity)
   local frame
-  if #resolved == 1 or #identities == 1 then
+  if #unresolved > 0 then
+    local state, reason = summarize_unresolved(unresolved)
+    frame = {
+      v = protocol.VERSION,
+      id = request.id,
+      op = "query",
+      ok = true,
+      state = state,
+      contexts = contexts,
+      reason = reason,
+      probes = state == "unavailable" and self.toolchain.probes or nil,
+      diagnostics = aggregate_diagnostics(contexts),
+      metrics = metrics,
+    }
+  elseif #resolved == 1 or #identities == 1 then
     local bucket = #identities == 1 and by_identity[identities[1]] or resolved
     local winner = select_identity_winner(bucket)
     local definition_keys = {}
@@ -311,20 +358,6 @@ function Sidecar:handle_query(request)
       diagnostics = aggregate_diagnostics(resolved),
       metrics = metrics,
     }
-  elseif #unresolved > 0 then
-    local state, reason = summarize_unresolved(unresolved)
-    frame = {
-      v = protocol.VERSION,
-      id = request.id,
-      op = "query",
-      ok = true,
-      state = state,
-      contexts = unresolved,
-      reason = reason,
-      probes = state == "unavailable" and self.toolchain.probes or nil,
-      diagnostics = aggregate_diagnostics(unresolved),
-      metrics = metrics,
-    }
   else
     frame = {
       v = protocol.VERSION,
@@ -343,7 +376,7 @@ end
 
 function Sidecar:handle_stats(request)
   local entries = {}
-  for key, entry in pairs(self.tus) do
+  for key, entry in pairs(self.tu_store.tus) do
     entries[#entries + 1] = {
       key = key,
       context_id = entry.context_id,
@@ -366,30 +399,8 @@ function Sidecar:handle_stats(request)
 end
 
 function Sidecar:handle_evict(request)
-  self.lookup_cache = {}
-  self.controlled_cdb_cache = {}
-  local evicted = 0
-  if request.all then
-    for key, entry in pairs(self.tus) do
-      self:_dispose_tu(entry)
-      self.tus[key] = nil
-      evicted = evicted + 1
-    end
-  elseif request.context_ids and #request.context_ids > 0 then
-    local wanted = {}
-    for _, id in ipairs(request.context_ids) do
-      wanted[id] = true
-    end
-    for key, entry in pairs(self.tus) do
-      if wanted[entry.context_id] then
-        self:_dispose_tu(entry)
-        self.tus[key] = nil
-        evicted = evicted + 1
-      end
-    end
-  else
-    self:_prune_idle(libclang.now_ms())
-  end
+  self.definitions:evict()
+  local evicted = self.tu_store:evict(request)
 
   return {
     v = protocol.VERSION,
@@ -448,25 +459,29 @@ function M.new(opts)
   opts = opts or {}
   local toolchain = libclang.discover_toolchain(opts.toolchain)
   local max_tus = tonumber(opts.max_tus or vim.env.UE_SEMANTICD_MAX_TUS or 1) or 1
+  local max_lookup_entries = tonumber(
+    opts.max_lookup_entries or vim.env.UE_SEMANTICD_MAX_LOOKUP_ENTRIES or 128
+  ) or 128
   local idle_evict_ms = tonumber(
     opts.idle_evict_ms or vim.env.UE_SEMANTICD_IDLE_EVICT_MS or 30000
   ) or 30000
-  local instance = setmetatable({
-    toolchain = toolchain,
-    protocol = protocol,
-    tus = {},
-    lookup_cache = {},
-    controlled_cdb_cache = {},
-    cdbs = {},
+  local instance = setmetatable({ toolchain = toolchain, protocol = protocol }, Sidecar)
+  instance.tu_store = tu_store.new(toolchain, {
     max_tus = math.max(1, math.floor(max_tus)),
     idle_evict_ms = math.max(1000, math.floor(idle_evict_ms)),
-  }, Sidecar)
-
-  if toolchain.ok then
-    instance.index = toolchain.lib.clang_createIndex(0, 0)
-  else
-    instance.index = nil
-  end
+  })
+  instance.definitions = definition_resolver.new({
+    toolchain = toolchain, protocol = protocol, location_key = location_key,
+    max_lookup_entries = math.max(1, math.floor(max_lookup_entries)),
+    metrics = function(extra) return instance:_metrics(extra) end,
+    acquire_tu = function(ctx, overlays) return instance.tu_store:_ensure_tu(ctx, overlays) end,
+    diagnostics = function(entry) return instance.tu_store:_diagnostics(entry) end,
+    prune_tus = function(now) return instance.tu_store:_prune_idle(now) end,
+  })
+  instance.catalog = catalog.new({
+    toolchain = toolchain, protocol = protocol,
+    metrics = function(extra) return instance:_metrics(extra) end,
+  })
   return instance
 end
 

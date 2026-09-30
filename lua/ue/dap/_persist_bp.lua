@@ -51,6 +51,7 @@ local state = {
   pending_paths = {},     -- file -> bp[]  waiting for BufReadPost
   save_timer = nil,
   clear_all_pending = false,
+  owned_paths = {},       -- paths managed by the loaded project bucket
 }
 
 local function norm(p)
@@ -121,12 +122,32 @@ function M.load()
   local cache, project_name = resolve_cache_path()
   if not cache then return end
   if state.loaded and state.cache_path == cache then return end
+  if state.cache_path and state.cache_path ~= cache then
+    -- A running adapter owns the current store even after the UI selection
+    -- changes. Defer the handoff until it ends; never send B's restore to A.
+    local dap = package.loaded["dap"]
+    if dap and ((type(dap.session) == "function" and dap.session())
+        or (type(dap.sessions) == "function" and next(dap.sessions()))) then
+      return
+    end
+    if not M.save({ captured = true, owned_only = true }) then return end
+    local dapbp = package.loaded["dap.breakpoints"]
+    if dapbp then
+      for bufnr, bps in pairs(dapbp.get()) do
+        local key = norm(vim.api.nvim_buf_get_name(bufnr))
+        if state.owned_paths[key] then
+          for _, bp in ipairs(vim.deepcopy(bps)) do dapbp.remove(bufnr, bp.line) end
+        end
+      end
+    end
+  end
   if state.save_timer then pcall(function() state.save_timer:stop() end) end
   state.save_timer = nil
   state.loaded = true
   state.cache_path = cache
   state.pending_paths = {}
   state.clear_all_pending = false
+  state.owned_paths = {}
   local data = read_json_file(cache) or {
     version = 1, project = project_name, breakpoints = {},
   }
@@ -135,6 +156,7 @@ function M.load()
   -- Stage every entry for lazy restore on BufReadPost.
   for path, bps in pairs(data.breakpoints) do
     state.pending_paths[norm(path)] = bps
+    state.owned_paths[norm(path)] = true
   end
   -- Also try restoring into already-open buffers (e.g. user did
   -- :luafile after editing files).  Important for our hot-reload flow.
@@ -155,6 +177,7 @@ function M.restore_for_buf(bufnr)
   if not bps or #bps == 0 then return end
   local ok_dapbp, dapbp = pcall(require, "dap.breakpoints")
   if not ok_dapbp then return end
+  state.owned_paths[key] = true
   for _, bp in ipairs(bps) do
     pcall(dapbp.set, {
       condition    = bp.condition,
@@ -180,9 +203,12 @@ function M.restore_for_buf(bufnr)
 end
 
 -- ── snapshot current bps and persist ─────────────────────────────────────
-function M.save()
-  local live_cache = resolve_cache_path()
-  if live_cache and live_cache ~= state.cache_path then M.load() end
+function M.save(opts)
+  opts = opts or {}
+  if not opts.captured then
+    local live_cache = resolve_cache_path()
+    if live_cache and live_cache ~= state.cache_path then M.load() end
+  end
   if not state.cache_path then
     -- First save in this session may run before load() (e.g. user toggles
     -- in a pristine nvim).  Resolve lazily.
@@ -206,8 +232,9 @@ function M.save()
   local seen_buffers = {}
   for bufnr, bps in pairs(raw) do
     local name = vim.api.nvim_buf_get_name(bufnr)
-    if name and name ~= "" then
+    if name and name ~= "" and (not opts.owned_only or state.owned_paths[norm(name)]) then
       local key = norm(name)
+      state.owned_paths[key] = true
       seen_buffers[key] = true
       local list = {}
       for _, bp in ipairs(bps) do
@@ -227,7 +254,7 @@ function M.save()
     if vim.api.nvim_buf_is_loaded(bufnr) then
       local name = vim.api.nvim_buf_get_name(bufnr)
       local key = name ~= "" and norm(name) or nil
-      if key then
+      if key and (not opts.owned_only or state.owned_paths[key]) then
         if not seen_buffers[key] then out[key] = nil end
         seen_buffers[key] = true
       end
@@ -244,9 +271,12 @@ function M.save()
       if not seen_buffers[key] then state.pending_paths[key] = vim.deepcopy(bps) end
     end
   end
+  return ok_write
 end
 
 function M.save_debounced()
+  local name = vim.api.nvim_buf_get_name(0)
+  if name ~= "" then state.owned_paths[norm(name)] = true end
   if state.save_timer then state.save_timer:stop() end
   state.save_timer = vim.defer_fn(function()
     state.save_timer = nil
@@ -405,6 +435,7 @@ function M._reset_state_for_test()
   state.data = nil
   state.pending_paths = {}
   state.clear_all_pending = false
+  state.owned_paths = {}
   if state.save_timer then pcall(function() state.save_timer:stop() end) end
   state.save_timer = nil
 end

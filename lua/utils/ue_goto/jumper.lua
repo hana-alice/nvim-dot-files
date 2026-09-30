@@ -9,7 +9,8 @@
 -- Input:
 --   location.uri                          required (string)
 --   location.range.start.line             required (0-indexed)
---   location.range.start.character        required (0-indexed UTF-16 col)
+--   location.range.start.character        required (0-indexed protocol col)
+--   location._position_encoding           optional (defaults to UTF-16)
 --
 -- Caller responsibility (NOT this module's):
 --   The location must already be PRECISE. drift / ws-symbol staleness /
@@ -54,18 +55,34 @@ end
 --- @return boolean ok
 function M.jump(location)
   -- ---- validate input ----------------------------------------------------
+  if type(location) ~= "table" then return false end
   local uri = location and (location.uri or location.targetUri)
   local range = location and (location.range
     or location.targetSelectionRange
     or location.targetRange)
-  if not uri or not range or not range.start then
+  if type(uri) ~= "string" or type(range) ~= "table" or type(range.start) ~= "table" then
     return false
   end
 
-  local target_path = vim.uri_to_fname(uri)
+  local path_ok, target_path = pcall(vim.uri_to_fname, uri)
+  if not path_ok or not target_path or target_path == "" then return false end
   local target_line_0b = range.start.line or 0
   local target_col_0b  = range.start.character or 0
+  for _, value in ipairs({ target_line_0b, target_col_0b }) do
+    if type(value) ~= "number" or value < 0 or value % 1 ~= 0 then return false end
+  end
+  local encoding = location._position_encoding or "utf-16"
+  if encoding ~= "utf-8" and encoding ~= "utf-16" and encoding ~= "utf-32" then return false end
   local target_line_1b = target_line_0b + 1
+  local bufnr = vim.fn.bufnr(target_path)
+  local target_stat = vim.uv.fs_stat(target_path)
+  if target_stat and target_stat.type ~= "file" then return false end
+  -- Existing loaded buffers may legitimately contain an unsaved new file.
+  -- Otherwise reject missing/unreadable files before recording a source jump.
+  if (bufnr == -1 or not vim.api.nvim_buf_is_loaded(bufnr))
+      and vim.fn.filereadable(target_path) ~= 1 then
+    return false
+  end
 
   -- ---- step 1: push SOURCE onto jumplist BEFORE any buffer mutation -------
   -- This must be the very first vim.cmd we run. If we let `:edit` run first,
@@ -74,7 +91,6 @@ function M.jump(location)
   vim.cmd("normal! m'")
 
   -- ---- step 2: ensure target buffer exists & is loaded --------------------
-  local bufnr = vim.fn.bufnr(target_path)
   if bufnr == -1 or not vim.api.nvim_buf_is_loaded(bufnr) then
     -- `keepjumps`: do NOT let :edit append its own (target, 1, 0) jumplist
     -- entry. We've already controlled the jumplist via `m'` above.
@@ -94,6 +110,8 @@ function M.jump(location)
 
   -- ---- step 4: set cursor to clamped target position ----------------------
   local ln, cc = clamp_pos(bufnr, target_line_1b, target_col_0b)
+  local line = vim.api.nvim_buf_get_lines(bufnr, ln - 1, ln, false)[1] or ""
+  cc = vim.str_byteindex(line, encoding, cc, false)
   local ok_cur = pcall(vim.api.nvim_win_set_cursor, 0, { ln, cc })
   if not ok_cur then return false end
 

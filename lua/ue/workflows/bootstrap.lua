@@ -1,6 +1,10 @@
 local M = {}
 local defaults_registered = false
 
+function M.setup_commands()
+  require("ue.workflows.android.distributed").setup()
+end
+
 function M.ensure_registered()
   if defaults_registered then
     return

@@ -2,7 +2,10 @@ local libclang = require("utils.ue_goto.semantic_sidecar_libclang")
 
 local M = {}
 
-function M.install(Sidecar)
+local TUStore = {}
+TUStore.__index = TUStore
+
+do
   local function location_key(loc)
     if type(loc) ~= "table" then return nil end
     return table.concat({
@@ -32,7 +35,7 @@ function M.install(Sidecar)
     return "reference"
   end
 
-  function Sidecar:_tu_count()
+  function TUStore:_tu_count()
     local count = 0
     for _ in pairs(self.tus) do
       count = count + 1
@@ -40,7 +43,7 @@ function M.install(Sidecar)
     return count
   end
 
-  function Sidecar:_rss_bytes()
+  function TUStore:_rss_bytes()
     if libclang.uv.resident_set_memory then
       local ok, rss = pcall(libclang.uv.resident_set_memory)
       if ok and type(rss) == "number" then
@@ -50,45 +53,41 @@ function M.install(Sidecar)
     return 0
   end
 
-  function Sidecar:_metrics(extra)
+  function TUStore:_metrics(extra)
     extra = extra or {}
     extra.tu_count = self:_tu_count()
     extra.process_rss_bytes = self:_rss_bytes()
     extra.max_tus = self.max_tus
     extra.idle_evict_ms = self.idle_evict_ms
-    extra.lookup_cache_entries = vim.tbl_count(self.lookup_cache or {})
-    extra.controlled_cdb_entries = vim.tbl_count(self.controlled_cdb_cache or {})
     return extra
   end
 
-  function Sidecar:_diagnostics(entry)
+  function TUStore:_diagnostics(entry)
     if entry.diagnostics == nil then
       entry.diagnostics = libclang.collect_diagnostics(self.toolchain.lib, entry.tu)
     end
     return entry.diagnostics
   end
 
-  function Sidecar:_dispose_tu(entry)
+  function TUStore:_dispose_tu(entry)
     if entry and entry.tu ~= nil then
       self.toolchain.lib.clang_disposeTranslationUnit(entry.tu)
       entry.tu = nil
     end
   end
 
-  function Sidecar:_dispose_cdb(cdb)
+  function TUStore:_dispose_cdb(cdb)
     if cdb and cdb.db ~= nil then
       self.toolchain.lib.clang_CompilationDatabase_dispose(cdb.db)
       cdb.db = nil
     end
   end
 
-  function Sidecar:shutdown()
+  function TUStore:shutdown()
     for _, entry in pairs(self.tus) do
       self:_dispose_tu(entry)
     end
     self.tus = {}
-    self.lookup_cache = {}
-    self.controlled_cdb_cache = {}
     for _, cdb in pairs(self.cdbs) do
       self:_dispose_cdb(cdb)
     end
@@ -99,7 +98,7 @@ function M.install(Sidecar)
     end
   end
 
-  function Sidecar:_prune_idle(now)
+  function TUStore:_prune_idle(now)
     now = now or libclang.now_ms()
     for key, entry in pairs(self.tus) do
       if now - entry.last_used_ms >= self.idle_evict_ms then
@@ -109,7 +108,7 @@ function M.install(Sidecar)
     end
   end
 
-  function Sidecar:_prune_lru()
+  function TUStore:_prune_lru()
     local count = self:_tu_count()
     if count <= self.max_tus then return end
     local entries = {}
@@ -124,12 +123,14 @@ function M.install(Sidecar)
     end
   end
 
-  function Sidecar:_get_cdb(cdb_dir)
+  function TUStore:_get_cdb(cdb_dir)
     cdb_dir = libclang.normalize(cdb_dir)
+    local signature = libclang.file_signature(libclang.join(cdb_dir, "compile_commands.json"))
     local cached = self.cdbs[cdb_dir]
-    if cached and cached.db ~= nil then
+    if cached and cached.db ~= nil and signature and cached.signature == signature then
       return cached
     end
+    if cached then self:_dispose_cdb(cached); self.cdbs[cdb_dir] = nil end
     local error_code = libclang.ffi.new("CXCompilationDatabase_Error[1]")
     local db = self.toolchain.lib.clang_CompilationDatabase_fromDirectory(cdb_dir, error_code)
     if db == nil then
@@ -139,12 +140,12 @@ function M.install(Sidecar)
         code = libclang.map_cdb_error(error_code[0]),
       }
     end
-    local record = { dir = cdb_dir, db = db }
+    local record = { dir = cdb_dir, db = db, signature = signature }
     self.cdbs[cdb_dir] = record
     return record
   end
 
-  function Sidecar:_read_compile_command(ctx)
+  function TUStore:_read_compile_command(ctx)
     if type(ctx.compile) == "table" and type(ctx.compile.argv) == "table"
         and #ctx.compile.argv > 0 and type(ctx.compile.directory) == "string"
         and ctx.compile.directory ~= "" then
@@ -225,7 +226,7 @@ function M.install(Sidecar)
     return compile
   end
 
-  function Sidecar:_ensure_tu(ctx, overlays)
+  function TUStore:_ensure_tu(ctx, overlays)
     overlays = overlays or {}
     local compile, compile_err = self:_read_compile_command(ctx)
     if not compile then
@@ -301,11 +302,14 @@ function M.install(Sidecar)
       }
       self.tus[cache_key] = entry
       query_kind = "cold"
-    elseif entry.overlay_hash ~= overlay_hash then
+    elseif entry.semantic_errors or entry.overlay_hash ~= overlay_hash
+        or not libclang.file_signatures_current(entry.file_signatures) then
       local started = libclang.uv.hrtime()
       local code = self.toolchain.lib.clang_reparseTranslationUnit(entry.tu, #overlays, unsaved_files, 0)
       reparse_ms = libclang.duration_ms(started)
       if tonumber(code) ~= 0 then
+        self:_dispose_tu(entry)
+        self.tus[cache_key] = nil
         return nil, nil, {
           reason = "reparse-failed",
           code = libclang.map_parse_error(code),
@@ -320,6 +324,12 @@ function M.install(Sidecar)
       query_kind = "reparse"
     end
 
+    if query_kind ~= "warm" then
+      entry.semantic_errors = libclang.has_error_diagnostics(self.toolchain.lib, entry.tu)
+      entry.file_signatures = libclang.tu_file_signatures(
+        self.toolchain.lib, entry.tu, compile.origin_tu, compile.cwd)
+    end
+
     entry.last_used_ms = libclang.now_ms()
     entry.context_id = ctx.id
     self:_prune_lru()
@@ -332,7 +342,7 @@ function M.install(Sidecar)
     }, nil
   end
 
-  function Sidecar:_resolve_context(ctx, query, overlays)
+  function TUStore:_resolve_context(ctx, query, overlays)
     local entry, compile_meta, compile_err = self:_ensure_tu(ctx, overlays)
     if not entry then
       return {
@@ -402,10 +412,10 @@ function M.install(Sidecar)
     end
     local definition = nil
     if self.toolchain.lib.clang_Cursor_isNull(definition_cursor) == 0 then
-      definition = libclang.location_from_cursor(self.toolchain.lib, definition_cursor)
+      definition = libclang.location_from_cursor(self.toolchain.lib, definition_cursor, entry.compile.cwd)
     end
     local usr = libclang.cxstring_to_string(self.toolchain.lib, self.toolchain.lib.clang_getCursorUSR(canonical))
-    local declaration = libclang.location_from_cursor(self.toolchain.lib, canonical)
+    local declaration = libclang.location_from_cursor(self.toolchain.lib, canonical, entry.compile.cwd)
 
     -- libclang intentionally exposes no USR for preprocessing entities.
     -- MacroExpansion still carries a compiler-owned referenced/definition
@@ -421,7 +431,7 @@ function M.install(Sidecar)
           self.toolchain.lib.clang_getCursorKindSpelling(semantic_cursor.kind)
         )
       end
-      local semantic_location = libclang.location_from_cursor(self.toolchain.lib, semantic_cursor)
+      local semantic_location = libclang.location_from_cursor(self.toolchain.lib, semantic_cursor, entry.compile.cwd)
       local spelling = libclang.cxstring_to_string(
         self.toolchain.lib,
         self.toolchain.lib.clang_getCursorSpelling(semantic_cursor)
@@ -466,6 +476,17 @@ function M.install(Sidecar)
       }, vim.tbl_extend("force", compile_meta, { query_ms = libclang.duration_ms(started) })
     end
 
+    if entry.semantic_errors then
+      return {
+        context_id = ctx.id,
+        state = "invalid-semantic-context",
+        reason = "invalid-tu-diagnostics",
+        cursor_kind = kind_spelling,
+        diagnostics = self:_diagnostics(entry),
+        compile_command_fingerprint = compile_meta.compile_command_fingerprint,
+      }, vim.tbl_extend("force", compile_meta, { query_ms = libclang.duration_ms(started) })
+    end
+
     local cursor_role = classify_cursor_role(query, declaration, definition)
 
     local query_ms = libclang.duration_ms(started)
@@ -490,9 +511,37 @@ function M.install(Sidecar)
     }, vim.tbl_extend("force", compile_meta, { query_ms = query_ms })
   end
 
-  require("utils.ue_goto.semantic_sidecar_definition").install(Sidecar, {
-    location_key = location_key,
-  })
+end
+
+function TUStore:evict(request)
+  local evicted = 0
+  if request.all then
+    for _, cdb in pairs(self.cdbs) do self:_dispose_cdb(cdb) end
+    self.cdbs = {}
+  end
+  if request.all or (request.context_ids and #request.context_ids > 0) then
+    local wanted = {}
+    for _, id in ipairs(request.context_ids or {}) do wanted[id] = true end
+    for key, entry in pairs(self.tus) do
+      if request.all or wanted[entry.context_id] then
+        self:_dispose_tu(entry)
+        self.tus[key] = nil
+        evicted = evicted + 1
+      end
+    end
+  else
+    self:_prune_idle(libclang.now_ms())
+  end
+  return evicted
+end
+
+function M.new(toolchain, opts)
+  local store = setmetatable({
+    toolchain = toolchain, tus = {}, cdbs = {},
+    max_tus = opts.max_tus, idle_evict_ms = opts.idle_evict_ms,
+  }, TUStore)
+  if toolchain.ok then store.index = toolchain.lib.clang_createIndex(0, 0) end
+  return store
 end
 
 return M

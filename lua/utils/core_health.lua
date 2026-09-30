@@ -409,10 +409,27 @@ function M.run_checks(definitions, opts)
     pcall(cancel)
   end
   local cleanup_ok = not ctx.temp_created or ctx.deps.delete(ctx.temp_root)
+  -- A just-cancelled child can still flush a file into the tree while the
+  -- recursive delete runs ("directory not empty"). Retry briefly; a root that
+  -- still exists afterwards remains a FAIL.
+  for _ = 1, 5 do
+    if cleanup_ok then break end
+    vim.wait(100, function() return false end, 20)
+    cleanup_ok = ctx.deps.delete(ctx.temp_root)
+  end
+  local leftovers
+  if not cleanup_ok and ctx.deps.stat(ctx.temp_root) then
+    leftovers = {}
+    for name in vim.fs.dir(ctx.temp_root, { depth = 3 }) do
+      leftovers[#leftovers + 1] = name
+      if #leftovers >= 10 then break end
+    end
+  end
   if opts.include_cleanup then
     local cleanup_next_step
     if not cleanup_ok then
       cleanup_next_step = "Remove the redacted health temporary directory manually."
+        .. (leftovers and (" Remaining: " .. table.concat(leftovers, ", ")) or "")
     end
     checks[#checks + 1] = normalize_check({ id = "cleanup.temp", stage = "cleanup" }, {
       status = cleanup_ok and M.STATUS.PASS or M.STATUS.FAIL,

@@ -37,19 +37,28 @@
 --   M.setup()                     -- install :UEProbe* commands
 
 local M = {}
-local file_lock = require("ue.file_lock")
+local store = require("utils.probe_store")
 
 local DEFAULT_ARM_DAYS = 14
 local DEFAULT_MAX_RECORDS = 200
 local RECORD_TTL_DAYS = 30
 local SAVE_DEBOUNCE_MS = 2000
+local MAX_SAVE_DELAY_MS = 10000
 
 local state = {
   loaded = false,
   data = nil,      -- { version=1, topics={ [t]={armed_until,max_records,records={ [k]={count,first,last,data} }} } }
   base = nil,      -- disk snapshot used to turn local counts into deltas
   topic_updates = {},
+  record_updates = {},
+  first_dirty_ms = nil,
+  dirty = false,
+  exiting = false,
+  retry_ms = nil,
+  load_error = nil,
+  save_error = nil,
   save_timer = nil,
+  exit_autocmd = nil,
   path_override = nil, -- test seam
 }
 
@@ -82,10 +91,14 @@ local function compact_store(store)
     for k in pairs(recs) do keys[#keys + 1] = k end
     if #keys > cap then
       table.sort(keys, function(a, b)
+        local revision = t.observation and t.observation.revision
+        local a_current = not revision or recs[a].revision == revision
+        local b_current = not revision or recs[b].revision == revision
+        if a_current ~= b_current then return not a_current end
         -- `_overflow` is the only durable evidence that a topic self-slept;
         -- never let same-second timestamp ties prune it immediately.
-        if a == "_overflow" then return false end
-        if b == "_overflow" then return true end
+        if a == "_overflow" and a_current then return false end
+        if b == "_overflow" and b_current then return true end
         local a_last, b_last = recs[a].last or 0, recs[b].last or 0
         if a_last == b_last then return a < b end
         return a_last < b_last
@@ -97,7 +110,7 @@ local function compact_store(store)
       t.armed_until = nil
     end
     -- Drop empty dormant topics entirely
-    if next(recs) == nil and not t.armed_until then
+    if next(recs) == nil and not t.armed_until and not t.observation then
       store.topics[topic] = nil
     else
       t.records = recs
@@ -106,94 +119,52 @@ local function compact_store(store)
   return store
 end
 
+local schedule_save
 local function load()
   if state.loaded then return end
   state.loaded = true
-  state.data = empty_store()
-  local f = io.open(probe_path(), "r")
-  if not f then return end
-  local content = f:read("*a")
-  f:close()
-  local ok, decoded = pcall(vim.json.decode, content or "")
-  if ok and type(decoded) == "table" and type(decoded.topics) == "table" then
-    state.data = compact_store(decoded)
-  end
+  local snapshot, err = store.read(probe_path())
+  state.load_error = err
+  state.data = snapshot and compact_store(snapshot) or empty_store()
   state.base = vim.deepcopy(state.data)
+  if snapshot and next(snapshot.applied_journals or {}) then schedule_save() end
 end
 
-local schedule_save
+local function failure_count(record)
+  if record.failure_count ~= nil then return record.failure_count end
+  local outcome = type(record.data) == "table" and record.data.state
+  if outcome == "resolved" or outcome == "ok" or outcome == "cancelled" then return 0 end
+  return record.count or 0
+end
+
 local function save_now()
-  if not state.data then return end
+  if not state.data or not state.dirty then return true end
   compact_store(state.data)
-  local p = probe_path()
-  local dir = vim.fn.fnamemodify(p, ":h")
-  if vim.fn.isdirectory(dir) == 0 then vim.fn.mkdir(dir, "p") end
-  local lease = file_lock.acquire(p .. ".lock")
-  if not lease then schedule_save(25); return end
-
-  local latest = empty_store()
-  local source = io.open(p, "rb")
-  if source then
-    local ok, decoded = pcall(vim.json.decode, source:read("*a") or "")
-    source:close()
-    if ok and type(decoded) == "table" and type(decoded.topics) == "table" then latest = decoded end
-  end
-  local base = state.base or empty_store()
-  for topic, local_topic in pairs(state.data.topics or {}) do
-    local disk_topic = latest.topics[topic]
-    if not disk_topic then
-      disk_topic = { records = {} }
-      latest.topics[topic] = disk_topic
-    end
-    disk_topic.records = disk_topic.records or {}
-    local base_topic = (base.topics or {})[topic] or { records = {} }
-    for key, local_record in pairs(local_topic.records or {}) do
-      local base_record = (base_topic.records or {})[key] or {}
-      local delta = math.max(0, (local_record.count or 0) - (base_record.count or 0))
-      if delta > 0 then
-        local disk_record = disk_topic.records[key] or {
-          count = 0, first = local_record.first, last = 0,
-        }
-        disk_record.count = (disk_record.count or 0) + delta
-        disk_record.first = math.min(disk_record.first or local_record.first, local_record.first or now())
-        if (local_record.last or 0) >= (disk_record.last or 0) then
-          disk_record.last = local_record.last
-          disk_record.data = local_record.data
-        end
-        disk_topic.records[key] = disk_record
-      end
-    end
-    if not latest.topics[topic].max_records then
-      latest.topics[topic].max_records = local_topic.max_records
-    end
-    if not latest.topics[topic].armed_until then
-      latest.topics[topic].armed_until = local_topic.armed_until
-    end
-  end
-  for topic in pairs(state.topic_updates) do
-    local local_topic = state.data.topics[topic]
-    if local_topic then
-      latest.topics[topic] = latest.topics[topic] or { records = {} }
-      latest.topics[topic].armed_until = local_topic.armed_until
-      latest.topics[topic].max_records = local_topic.max_records
-    end
-  end
-  compact_store(latest)
-
-  local tmp = p .. (".tmp.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
-  local f = io.open(tmp, "wb")
-  if not f then file_lock.release(lease); return end
-  f:write(vim.json.encode(latest))
-  f:flush()
-  f:close()
-  local replaced = vim.uv.fs_rename(tmp, p)
-  if not replaced then pcall(os.remove, tmp) end
-  file_lock.release(lease)
-  if replaced then
-    state.data = latest
-    state.base = vim.deepcopy(latest)
+  local ok, latest, durable = store.save(probe_path(), {
+    data = state.data, base = state.base or empty_store(),
+    topic_updates = state.topic_updates, record_updates = state.record_updates,
+  }, { compact = compact_store, exiting = state.exiting })
+  if ok or durable then
+    if ok then state.data = latest end
+    -- A durable recovery journal owns these deltas even if the primary write failed.
+    state.base = vim.deepcopy(state.data)
     state.topic_updates = {}
+    state.record_updates = {}
+    state.first_dirty_ms = nil
+    state.dirty = false
+    state.retry_ms = nil
   end
+  if ok then
+    state.load_error = nil
+    state.save_error = nil
+  else
+    state.save_error = latest
+    if not durable and not state.exiting then
+      state.retry_ms = math.min((state.retry_ms or 125) * 2, 5000)
+      schedule_save(state.retry_ms, true)
+    end
+  end
+  return ok, state.save_error, durable
 end
 
 local function cancel_save_timer()
@@ -203,13 +174,34 @@ local function cancel_save_timer()
   state.save_timer = nil
 end
 
-schedule_save = function(delay_ms)
+local function ensure_persistence()
+  if state.exit_autocmd then return end
+  local group = vim.api.nvim_create_augroup("UEProbePersistence", { clear = false })
+  state.exit_autocmd = vim.api.nvim_create_autocmd("VimLeavePre", { group = group, callback = function()
+    state.exiting = true
+    cancel_save_timer()
+    save_now()
+  end })
+end
+
+schedule_save = function(delay_ms, retry)
+  state.dirty = true
+  if state.exiting then return end
+  ensure_persistence()
   -- One-shot debounce; always stop+close the previous timer (F5 lesson).
   cancel_save_timer()
   local timer = vim.uv.new_timer()
-  if not timer then save_now(); return end
+  if not timer then
+    state.save_error = "probe save timer unavailable"
+    return
+  end
   state.save_timer = timer
-  timer:start(delay_ms or SAVE_DEBOUNCE_MS, 0, vim.schedule_wrap(function()
+  local current_ms = vim.uv.hrtime() / 1e6
+  if retry then state.first_dirty_ms = nil end
+  state.first_dirty_ms = state.first_dirty_ms or current_ms
+  local delay = math.min(delay_ms or SAVE_DEBOUNCE_MS, math.max(1, MAX_SAVE_DELAY_MS - (current_ms - state.first_dirty_ms)))
+  if state.retry_ms then delay = math.max(delay, state.retry_ms) end
+  timer:start(math.floor(delay), 0, vim.schedule_wrap(function()
     if state.save_timer == timer then
       pcall(function() timer:stop() end)
       pcall(function() timer:close() end)
@@ -236,7 +228,7 @@ function M.arm(topic, opts)
   local t = topic_of(state.data, topic, true)
   t.armed_until = now() + (opts.days or DEFAULT_ARM_DAYS) * 86400
   if opts.max_records then t.max_records = opts.max_records end
-  state.topic_updates[topic] = true
+  state.topic_updates[topic] = "arm"
   schedule_save()
 end
 
@@ -245,7 +237,7 @@ function M.sleep(topic)
   local t = state.data.topics[topic]
   if t then
     t.armed_until = nil
-    state.topic_updates[topic] = true
+    state.topic_updates[topic] = "sleep"
     schedule_save()
   end
 end
@@ -254,6 +246,96 @@ function M.is_armed(topic)
   load()
   local t = state.data.topics[topic]
   return (t and t.armed_until and t.armed_until >= now()) and true or false
+end
+
+-- A repair opens one bounded observation window; repeated use does not renew it.
+function M.observe(topic, revision, opts)
+  assert(type(revision) == "string" and revision ~= "", "observation revision is required")
+  opts = opts or {}
+  load()
+  local t = topic_of(state.data, topic, true)
+  if t.observation and t.observation.revision == revision then return M.is_armed(topic) end
+  t.observation = { revision = revision, started = now() }
+  t.armed_until = now() + (opts.days or DEFAULT_ARM_DAYS) * 86400
+  compact_store(state.data)
+  state.topic_updates[topic] = "observe"
+  schedule_save()
+  return true
+end
+
+function M.status(topic)
+  load()
+  local t = state.data.topics[topic]
+  local storage_error = state.save_error or state.load_error
+  if not t then return { armed = false, records = 0, storage_error = storage_error } end
+  return { armed = M.is_armed(topic), armed_until = t.armed_until,
+    records = vim.tbl_count(t.records or {}), observation = vim.deepcopy(t.observation),
+    storage_error = storage_error }
+end
+
+local function update_record(topic, key, status, note)
+  load()
+  local t = state.data.topics[topic]
+  local record = t and t.records[key]
+  if not record then return false end
+  record.seen_count = record.count or 0
+  local update = { seen_count = record.seen_count }
+  if status then
+    record.disposition = { status = status, count = record.count, failures = failure_count(record), at = now(),
+      note = tostring(note or ""):sub(1, 512), revision = t.observation and t.observation.revision }
+    update.disposition = vim.deepcopy(record.disposition)
+  end
+  state.record_updates[topic] = state.record_updates[topic] or {}
+  local existing = state.record_updates[topic][key]
+  if existing and not update.disposition then update.disposition = existing.disposition end
+  state.record_updates[topic][key] = update
+  schedule_save()
+  return true
+end
+
+function M.acknowledge(topic, key)
+  load()
+  if topic and key then return update_record(topic, key) end
+  for name, entry in pairs(state.data.topics) do
+    if not topic or name == topic then
+      for record_key in pairs(entry.records or {}) do update_record(name, record_key) end
+    end
+  end
+  return true
+end
+
+function M.resolve(topic, key, note)
+  assert(type(note) == "string" and note ~= "", "resolution evidence is required")
+  return update_record(topic, key, "resolved", note)
+end
+
+function M.defer(topic, key, note)
+  assert(type(note) == "string" and note ~= "", "deferral reason is required")
+  return update_record(topic, key, "deferred", note)
+end
+
+local OUTCOMES = { resolved = true, unavailable = true, cancelled = true,
+  ["invalid-semantic-context"] = true, ["ambiguous-context"] = true }
+
+local function sample_stats(record, data)
+  if type(data) ~= "table" then return end
+  local elapsed = tonumber(data.elapsed_ms)
+  if not data.state and not elapsed then return end
+  local stats = record.stats or { samples = 0, total_ms = 0, buckets = {}, outcomes = {} }
+  record.stats = stats
+  if data.state then
+    local outcome = OUTCOMES[data.state] and data.state or "unknown"
+    stats.outcomes[outcome] = (stats.outcomes[outcome] or 0) + 1
+  end
+  if elapsed and elapsed >= 0 and elapsed < math.huge then
+    stats.samples = stats.samples + 1
+    stats.total_ms = stats.total_ms + elapsed
+    stats.min_ms = math.min(stats.min_ms or elapsed, elapsed)
+    stats.max_ms = math.max(stats.max_ms or elapsed, elapsed)
+    local bucket = elapsed < 10 and "lt_10" or elapsed < 100 and "lt_100"
+      or elapsed < 1000 and "lt_1000" or elapsed < 10000 and "lt_10000" or "ge_10000"
+    stats.buckets[bucket] = (stats.buckets[bucket] or 0) + 1
+  end
 end
 
 -- ── recording (dedup-compressed) ───────────────────────────────────────────
@@ -271,6 +353,7 @@ function M.record(topic, key, data)
   key = tostring(key or "?")
   local r = t.records[key]
   if r then
+    r.failure_count = failure_count(r)
     r.count = (r.count or 0) + 1
     r.last = now()
     if data ~= nil then r.data = data end
@@ -278,7 +361,9 @@ function M.record(topic, key, data)
     -- Distinct-key budget: hitting max_records puts the topic to sleep
     -- (flood guard — same philosophy as ue_watch F2, but self-sleeping).
     local n = 0
-    for _ in pairs(t.records) do n = n + 1 end
+    for _, existing in pairs(t.records) do
+      if not t.observation or existing.revision == t.observation.revision then n = n + 1 end
+    end
     if n >= (t.max_records or DEFAULT_MAX_RECORDS) then
       t.armed_until = nil
       state.topic_updates[topic] = true
@@ -286,11 +371,21 @@ function M.record(topic, key, data)
         or { count = 0, first = now(), last = now(), data = "max_records hit; topic slept" }
       t.records["_overflow"].count = t.records["_overflow"].count + 1
       t.records["_overflow"].last = now()
+      t.records["_overflow"].revision = t.observation and t.observation.revision
       schedule_save()
       return false
     end
-    t.records[key] = { count = 1, first = now(), last = now(), data = data }
+    t.records[key] = { count = 1, failure_count = 0, first = now(), last = now(), data = data }
   end
+  r = t.records[key]
+  local outcome = type(data) == "table" and data.state
+  if outcome ~= "resolved" and outcome ~= "ok" and outcome ~= "cancelled" then
+    r.failure_count = r.failure_count + 1
+  end
+  local revision = t.observation and t.observation.revision
+  if r.revision ~= revision then r.stats = nil end
+  r.revision = revision
+  sample_stats(r, data)
   schedule_save()
   return true
 end
@@ -300,11 +395,14 @@ function M.report()
   load()
   compact_store(state.data)
   local lines = {}
+  local storage_error = state.save_error or state.load_error
+  if storage_error then lines[#lines + 1] = "Probe storage error: " .. tostring(storage_error) end
   local topics = {}
   for name in pairs(state.data.topics) do topics[#topics + 1] = name end
   table.sort(topics)
   if #topics == 0 then
-    return { "(no probe evidence recorded)" }
+    lines[#lines + 1] = "(no probe evidence recorded)"
+    return lines
   end
   for _, name in ipairs(topics) do
     local t = state.data.topics[name]
@@ -312,6 +410,7 @@ function M.report()
     lines[#lines + 1] = ("## %s  [%s%s]"):format(
       name, armed and "armed" or "dormant",
       armed and (" until " .. os.date("%m-%d", t.armed_until)) or "")
+    if t.observation then lines[#lines + 1] = "  observation: " .. t.observation.revision end
     local keys = {}
     for k in pairs(t.records or {}) do keys[#keys + 1] = k end
     table.sort(keys, function(a, b)
@@ -325,6 +424,14 @@ function M.report()
       lines[#lines + 1] = ("  %4dx  %-40s  %s%s"):format(
         r.count or 0, k:sub(1, 40), span,
         r.data ~= nil and ("  | " .. tostring(vim.inspect(r.data)):gsub("%s+", " "):sub(1, 80)) or "")
+      local disposition = r.disposition
+      if disposition and (disposition.failures or disposition.count or 0) >= failure_count(r) then
+        lines[#lines + 1] = "      " .. disposition.status .. ": " .. tostring(disposition.note)
+      end
+      if r.stats and r.stats.samples > 0 then
+        lines[#lines + 1] = ("      latency: n=%d mean=%.1fms max=%.1fms"):format(
+          r.stats.samples, r.stats.total_ms / r.stats.samples, r.stats.max_ms)
+      end
     end
     lines[#lines + 1] = ""
   end
@@ -334,27 +441,39 @@ end
 function M.compact()
   load()
   compact_store(state.data)
-  save_now()
+  state.dirty = true
+  cancel_save_timer()
+  return save_now()
 end
 
--- Count of records whose topic is armed — the "unread feedback" signal
--- surfaced at session start (spec requirement #1).
+-- Retained evidence, unread samples, unresolved failures and dormant coverage
+-- remain separate; reading is not proof of a repair.
 function M.pending_summary()
   load()
-  local topics, records = 0, 0
+  local topics, records, unread, unresolved, dormant = 0, 0, 0, 0, 0
   for _, t in pairs(state.data.topics) do
     local n = 0
-    for _ in pairs(t.records or {}) do n = n + 1 end
+    for _, record in pairs(t.records or {}) do
+      n = n + 1
+      if (record.count or 0) > (record.seen_count or 0) then unread = unread + 1 end
+      local disposition = record.disposition
+      if failure_count(record) > 0 and (not disposition or disposition.status ~= "resolved"
+          or (disposition.failures or disposition.count or 0) < failure_count(record)) then
+        unresolved = unresolved + 1
+      end
+    end
+    if t.observation and (not t.armed_until or t.armed_until < now()) then dormant = dormant + 1 end
     if n > 0 then
       topics = topics + 1
       records = records + n
     end
   end
-  return { topics = topics, records = records }
+  return { topics = topics, records = records, unread = unread, unresolved = unresolved, dormant = dormant }
 end
 
 -- ── commands ───────────────────────────────────────────────────────────────
 function M.setup()
+  ensure_persistence()
   vim.api.nvim_create_user_command("UEProbeReport", function()
     local lines = M.report()
     local buf = vim.api.nvim_create_buf(false, true)
@@ -367,6 +486,7 @@ function M.setup()
     vim.api.nvim_win_set_buf(win, buf)
     vim.api.nvim_win_set_height(win, math.min(#lines + 1, 20))
     vim.keymap.set("n", "q", "<cmd>close<cr>", { buffer = buf, nowait = true })
+    M.acknowledge()
   end, { desc = "Probe: show evidence report (read this FIRST, fix findings)" })
 
   vim.api.nvim_create_user_command("UEProbeArm", function(a)
@@ -383,9 +503,22 @@ function M.setup()
   end, { nargs = "?", desc = "Probe: put a topic to sleep" })
 
   vim.api.nvim_create_user_command("UEProbeCompact", function()
-    M.compact()
-    vim.notify("probe log compacted", vim.log.levels.INFO)
+    local ok, err = M.compact()
+    vim.notify(ok and "probe log compacted" or ("probe compaction pending: " .. tostring(err)),
+      ok and vim.log.levels.INFO or vim.log.levels.WARN)
   end, { desc = "Probe: prune TTL-expired / over-cap records now" })
+
+  for command, handler in pairs({ UEProbeResolve = M.resolve, UEProbeDefer = M.defer }) do
+    vim.api.nvim_create_user_command(command, function(a)
+      if #a.fargs < 3 then
+        vim.notify("usage: " .. command .. " <topic> <key> <evidence-or-reason>", vim.log.levels.WARN)
+        return
+      end
+      if not handler(a.fargs[1], a.fargs[2], table.concat(a.fargs, " ", 3)) then
+        vim.notify("probe record not found", vim.log.levels.WARN)
+      end
+    end, { nargs = "+", desc = "Probe: record evidence disposition without deleting history" })
+  end
 
   return M
 end
@@ -395,11 +528,20 @@ function M._set_path_for_test(p)
   -- Never let a delayed save outlive its test path and spill into the next
   -- path (especially the real stdpath('state') store).
   cancel_save_timer()
+  if state.exit_autocmd then pcall(vim.api.nvim_del_autocmd, state.exit_autocmd) end
+  state.exit_autocmd = nil
   state.path_override = p
   state.loaded = false
   state.data = nil
   state.base = nil
   state.topic_updates = {}
+  state.record_updates = {}
+  state.first_dirty_ms = nil
+  state.dirty = false
+  state.exiting = false
+  state.retry_ms = nil
+  state.load_error = nil
+  state.save_error = nil
 end
 function M._flush_for_test()
   cancel_save_timer()

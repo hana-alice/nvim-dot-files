@@ -152,6 +152,17 @@ function M.session_owner(session)
   return nil
 end
 
+--- Read-only: the owner id of the most recently completed session, or nil.
+---
+--- Exposed so diagnostics and the layered preflight can pick an owner WITHOUT
+--- naming a concrete target (ue_platform_boundary) and without reaching into
+--- this module's internals. This is a hint for a probe run, never an authority
+--- for lifecycle dispatch — dispatch still requires frozen owner metadata.
+function M.last_owner()
+  local record = _active_owner or _last_owner or _pending_owner
+  return record and record.owner or nil
+end
+
 function M.end_session(session)
   local record = M.session_owner(session)
   if record then _last_owner = completed_owner(record) end

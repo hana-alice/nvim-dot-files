@@ -27,6 +27,19 @@ local function compile_db()
 end
 
 t.describe("semantic_context: compilation db + fingerprint", function()
+  t.it("reports rejected records instead of treating the parsed subset as complete", function()
+    local db = assert(sc.load_compilation_database({
+      { directory = "C:/Fixture", file = "good.cpp", arguments = { "clang++", "good.cpp" } },
+      { directory = "C:/Fixture", file = "bad.cpp" },
+    }))
+    t.assert_false(db.complete)
+    t.assert_eq(#db.entries, 1)
+    t.assert_eq(#db.rejected, 1)
+    t.assert_eq(db.rejected[1].index, 2)
+    t.assert_eq(db.rejected[1].reason, "missing-command")
+    t.assert_true(compile_db().complete)
+  end)
+
   t.it("parses arguments and command entries conservatively", function()
     local db = compile_db()
     t.assert_eq(#db.entries, 4)
@@ -81,6 +94,19 @@ t.describe("semantic_context: compilation db + fingerprint", function()
 end)
 
 t.describe("semantic_context: cpp.json provenance", function()
+  t.it("does not prove origins from an incomplete compilation dataset", function()
+    local entries = read_json("compile_commands.json")
+    entries[#entries + 1] = { directory = "C:/Fixture", file = "bad.cpp" }
+    local db = assert(sc.load_compilation_database(entries))
+    t.assert_false(db.complete)
+    local contexts = sc.proven_contexts_from_cpp_json({
+      project_root = "C:/Fixture", active_build_key = "Win64-Development-Editor", toolchain_identity = "clang-18",
+      compile_db = db, header = "C:/Fixture/include/NonSelfContained.h",
+      records = { { record = read_json("same_arity_value.cpp.json") } },
+    })
+    t.assert_eq(#contexts, 0)
+  end)
+
   t.it("supports nested Data and flat forms", function()
     local nested = assert(sc.parse_cpp_json_record(read_json("same_arity_value.cpp.json")))
     local flat = assert(sc.parse_cpp_json_record(read_json("same_arity_pointer.cpp.json")))

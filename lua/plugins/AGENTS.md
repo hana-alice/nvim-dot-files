@@ -18,9 +18,13 @@
 ## 改动 → 必跑回归
 
 `smoke`（加载冒烟）；若动到命令/键位接线 → 另跑 `commands` `keymaps`。
+Git 审阅插件接线 → `git_review` `review_editor` `keymaps` `cheatsheet` `workarounds` `smoke`；
+`git_review` 前缀包含各能力切片，性能结论另需真实仓库对照证据。
 
 ## 先读
 
 `../../docs/architecture-vs-lazyvim.md`（相对 LazyVim 的增量与「刻意不做」清单）。
 
-**治理 spec**：无对应 capability（本目录行为不由某个 `openspec/specs/` capability 治理）。
+**治理 spec**：`../../openspec/specs/editor-behavior-regression/spec.md`（picker 输入与工具链显式安装）；其他插件专属行为按其直接对应的 capability 验证。
+Git 默认审阅、按需 Diffview、Neogit/Snacks/Fugitive/Gitsigns 分工遵循
+`../../openspec/specs/git-review-workspace/spec.md`。

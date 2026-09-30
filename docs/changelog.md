@@ -44,167 +44,281 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 - `v1.6.0` → `docs/release_1.6.0.md` (tag pending explicit confirmation)
 - `v1.7.0` → `docs/release_1.7.0.md` (tag pending explicit confirmation)
 - `v1.8.0` → `docs/release_1.8.0.md` (tag pending explicit confirmation)
+- `v1.9.0` → `docs/release_1.9.0.md` (tag pending explicit confirmation)
+
+- `v1.9.1` → `docs/release_1.9.1.md` (tag pending explicit confirmation)
+- `v1.9.2` → `docs/release_1.9.2.md` (tag pending explicit confirmation)
+- `v1.9.3` → `docs/release_1.9.3.md` (tag pending explicit confirmation)
+- `v1.10.0` → `docs/release_1.10.0.md` (tag pending explicit confirmation)
+- `v1.11.0` → `docs/release_1.11.0.md` (tag pending explicit confirmation)
+- `v1.11.1` → `docs/release_1.11.1.md` (tag pending explicit confirmation)
+- `v1.11.2` → `docs/release_1.11.2.md` (tag pending explicit confirmation)
+
+- `v1.11.3` → `docs/release_1.11.3.md` (tag pending explicit confirmation)
+
+- `v1.12.0` → [docs/release_1.12.0.md](release_1.12.0.md) (incremental scope; tag pending)
+- `v1.12.1` → [docs/release_1.12.1.md](release_1.12.1.md) (tag pending)
+- `v1.12.2` → [docs/release_1.12.2.md](release_1.12.2.md) (diagnostic stage; tag pending)
+- `v1.12.3` → [docs/release_1.12.3.md](release_1.12.3.md) (demand-driven recovery; tag pending)
+- `v1.12.4` → [docs/release_1.12.4.md](release_1.12.4.md) (native junction verification; later ancestor-event fallback recorded; tag pending)
+- `v1.12.5` → [docs/release_1.12.5.md](release_1.12.5.md) (stable directory writes and complete ancestor watches; tag pending)
+- `v1.12.6` → [docs/release_1.12.6.md](release_1.12.6.md) (modified-document preflight and clean demand recovery; tag pending)
+- `v1.12.7` → [docs/release_1.12.7.md](release_1.12.7.md) (automatic clean-document recovery; tag pending)
+- `v1.12.8` → [docs/release_1.12.8.md](release_1.12.8.md) (padded search query cancellation; tag pending)
+- `v1.12.9` → [docs/release_1.12.9.md](release_1.12.9.md) (durable search overflow recovery; tag pending)
+- `v1.12.10` → [docs/release_1.12.10.md](release_1.12.10.md) (second qualified SuperUnity batch; tag pending)
+- `v1.12.11` → [docs/release_1.12.11.md](release_1.12.11.md) (retain document-blocked original readers; tag pending)
+
+- `v2.0.0` → [docs/release_2.0.0.md](release_2.0.0.md) (CodeDiff default review; Diffview retained; tag pending)
 
 ## Unreleased
 
-### 2026-08-31 — Sync and archive all active OpenSpec changes
+### 2026-09-30 — 最近项目列表并发写入在 Windows 上丢记录
 
 **Task**
-
-将四个活动 OpenSpec change 的 delta 同步到主规格并归档，同时在公开分支提交前检查商业敏感词。
+- `5db84e9` 后 Ubuntu/macOS 全绿，Windows 仅剩 `multi_instance_state`「recent-project MRU keeps concurrent distinct roots」（8 个并发实例丢 1 条）。
 
 **Implemented**
-
-- 将后台索引 CPU 准入、磁盘工件自证 readiness、跨 checkout 候选标记、header TU 自动收敛四组契约
-  同步到 `cpp-semantic-index-coverage`、`ue-code-search` 与
-  `cpp-contextual-definition-navigation` 主规格；同时消除旧的“多个 TU 即提示选择”条款冲突。
-- 将四个 change 移入 `openspec/changes/archive/2026-08-31-*`，保留原始 task 勾选状态，不把未完成项
-  改写为已完成。
-- 收窄 iOS DAP smoke 脱敏回归中的短 PID 断言：直接检查结构化 `pid` 字段与错误消息，避免随机路径
-  摘要恰好含同一四位数字时误报；设备、bundle 与本地路径的完整序列化结果检查保持不变。
-
-**Pitfalls / Gotchas**
-
-- 四个归档 change 分别仍有 1、4、12、4 个未勾选任务；归档是用户明确要求的管理动作，不构成这些
-  实现/验收项已完成的证据，尤其 foreign checkout picker change 仍为 0/12。
-- 12 位十六进制摘要可能偶然包含任意四位数字；独立 SHA-256 实验在第 5019 个输入复现了 `4242`
-  出现在已脱敏摘要中的情况，因此不能把整段 JSON 的短数字子串搜索当作泄漏证明。
+- `lua/utils/recent_projects.lua`：拿到锁后若读取/原子 rename 失败（Windows 上别的实例正打开该文件读取时 rename 会失败），改为走与抢锁失败相同的异步重试，而不是静默丢弃这次写入；重试上限 20 → 60（约 1.5 s）。这是生产代码的真实缺陷：多个 Neovim 同时启动时最近项目可能丢失。
 
 **Validation**
+- `multi_instance_state` 本机连续 5 次 27/27。
 
-- `openspec validate --all`（归档后）：39/39；`nvim --headless -l tests/run.lua structure`：71/71；
-  `nvim --headless -l tests/run.lua ios_dap_probe`：6/6；全量回归：1325/1325。
-- 暂存新增内容通过本地 pre-commit 隐私门；完整暂存树按私有 denylist 扫描为 0 命中。
-- spec 一致性：四份 delta 已同步到上述三份主规格并完成归档；未勾选的实现/验收义务原样保留为风险。
+### 2026-09-30 — CI 引导只装了一半插件（git_review_runtime 三平台失败的根因）
 
-**Follow-ups**
+**Root cause（CI 日志 + 本机全新数据目录复现）**
+- `scripts/bootstrap_headless_ci.lua` 在 LazyVim 克隆前就解析 `import = "lazyvim.plugins"`，日志报 `No specs found for module "lazyvim.plugins"`，只安装了项目自身的 27 个插件（lockfile 共 44 个）。真实启动随后看到完整依赖图，报 `Plugin flash.nvim / nvim-ts-autotag … is not installed`（ERROR），`git_review_runtime` 因此失败。本机全新目录复现同样只得到 28 个目录（含 lazy.nvim）。
 
-- 若继续实现归档中的剩余义务，应从对应 archive 恢复或新建后继 change，不能把本次归档视为验收通过。
+**Implemented**
+- 引导脚本在首次解析后重新加载 spec，把缺失插件按冻结 lockfile 装齐（最多 5 轮）；原有「每个插件必须在锁定提交」断言现在覆盖完整依赖图，CI 自身即为验证。
+- `tests/cases/ue_cdb_shader_receipt_spec.lua`：后续按条目查找改用产物中的路径拼写（Windows CI 8.3 短名）。
 
-### 2026-08-31 — Surface csearch queries in grep history
+**Validation**
+- `review_ci` 3/3、`ue_cdb_shader_receipt` 3/3 本机通过；引导修复待本轮 CI 验证。
+
+### 2026-09-30 — git_review_runtime 的 Diffview 关闭竞态；macOS FSEvents 假设实验
 
 **Task**
-
-修复 `<leader>/` 的 csearch 查询已由 Snacks 持久化、但 `<leader>sH` 历史面板完全看不到的问题。
+- `ae75b2f` 后 `git_review_runtime` 不再空转（证实上条根因），但 Linux/macOS 暴露下一处失败。
 
 **Implemented**
-
-- `lua/plugins/snacks.lua` 统一读取 csearch、常规 grep 与旧 rg picker 的 history source，按查询文本去重；
-  picker history 清理动作同步清空这些 grep source，不再留下隐形 csearch 记录。
-- `tests/cases/grep_cache_spec.lua` 用隔离的 Snacks history 替身锁住 csearch/rg 合并展示与清理行为；
-  用例在修复前分别以“只显示 1/2 条”和“未清理 csearch store”稳定失败。
-- `tests/cases/ios_dap_coredevice_spec.lua` 处置全量回归暴露的既有 Windows 红灯：只有真实 `xcrun`
-  可用时验证成功冻结路径，否则断言 CoreDevice resolver fail closed；不再用其他 executable 冒充 `xcrun`。
-- `openspec/specs/ue-code-search/spec.md` 同步 csearch 查询进入统一 grep history、去重与共同清理的可观察契约。
-
-**Pitfalls / Gotchas**
-
-- Snacks 按 picker `source` 分文件保存 history；csearch 使用 `ue_grep_csearch`，原历史面板却只读取 `grep`，
-  所以磁盘记录一直存在，缺失发生在读取路由而非写入。
-- 宿主相关回归不能靠注入无关 executable 让断言通过；Windows 没有真实 `xcrun` 时应验证 fail-closed。
+- `tests/cases/git_review_runtime_spec.lua`：可视模式 Diffview 文件历史等到 `panel.cur_item` 已选中、主窗口已打开文件再按 `gV` 关闭。CI 证据：只等 `#entries > 0` 就关闭，锁定版本 Diffview 的 `update_entries` 回调在关闭后执行 `cur_file()`，`file_history_panel.lua:380 attempt to index field 'cur_item' (a nil value)`。属测试时序，Diffview 版本与生产映射未改。
+- `tests/cases/index_batch_runtime_spec.lua`（仅 macOS）：在安装监听前等 1 s，检验「FSEvents 延迟投递监听开始前刚写入的 `compile_commands.json`（报为 `rename`）」这一**假设**。若 CI 仍失败则假设不成立，需另查。
 
 **Validation**
-
-- 修复前：`grep_cache` 基线 29/29；新增回归后 29/31（2 个预期失败）。修复后：`grep_cache` 31/31、
-  `smoke` 19/19、`keymaps` 58/58、`structure` 71/71、`ios_dap_coredevice` 10/10、`dap` 94/94。
-- 全量首次运行 1324/1325，唯一失败为 Windows 缺少 `xcrun` 时旧用例注入 `true` 失败；按宿主能力守卫
-  修正后全量 `nvim --headless -l tests/run.lua`：1325/1325。
-- `stylua --check` 未运行：本机未安装 `stylua`；相关 Lua 文件均已被上述 headless 用例实际加载。
-- spec 一致性：已同步 `ue-code-search` 主规格，无独立 delta change。
+- 本机 `git_review_runtime` 连续 2 次 1/1；`index_batch_runtime` 80/80。
 
 **Follow-ups**
+- CI 子进程的 `Plugin <name> is not installed` 为 WARN 级（lazy 对未进 lockfile 安装范围的插件的提示），不再造成空转；是否影响用例待本轮结果。
 
-- 无。
-
-### 2026-08-27 — Keep clangd discovery retries callable after history reconciliation
+### 2026-09-30 — 定位并修复 git_review_runtime 在 CI 上的 CPU 空转
 
 **Task**
+- 三平台 CI 上 `git_review_runtime` 子进程在「等 Gitsigns 挂载」处卡死直至外层 60 s 超时。
 
-消除合入重写后的 origin 时由全量回归暴露的 `vim.defer_fn` 异步回调错误。
+**Root cause（CI 证据 + 本机独立复现）**
+- `f60ce15` 的计数钩子调用栈：`runtime.lua:40 notify` ← `lazyvim/util/init.lua:165`（`lazy_notify` 的 replay 循环）← 测试的 `vim.wait`。
+- LazyVim 启动时把 `vim.notify` 换成把消息追加到 `notifs` 队列的临时函数；测试随后捕获的正是这个临时函数，并让自己的包装函数转发给它。replay 时 `vim.notify` 已不等于临时函数，所以保留测试的包装函数，并对**正在遍历的** `notifs` 逐条调用 `vim.notify` → 包装函数转发回临时函数 → 又追加一条，`ipairs` 永远到不了末尾。只要启动期有一条排队通知（CI 上有 `vim.lsp.set_log_level() is deprecated` 警告），子进程就 100% CPU 空转；git 子进程也因此得不到回收（`ps` 中为僵尸）。
+- 独立复现脚本按同样形状运行：500 ms 内调用 1001 次、队列长到 1001 条，确认不收敛。
 
 **Implemented**
-
-- `clangd_resource_controller.discover_with_retry` 按 Neovim API 的 `(fn, timeout)` 顺序安排有界重试。
-- 回归注入使用同一真实签名，避免测试 mock 反向固化实现错误。
-- 既有 host-resource-discipline 可观察契约不变；这是实现对现有 spec 的一致性修复，无 delta spec。
-
-**Pitfalls / Gotchas**
-
-- 原全量统计仍显示全绿，但 `vim.wait` 期间的 scheduled callback 已打印 `fn: expected callable, got number`；
-  只看最终 pass 计数会漏掉异步错误。
+- `tests/cases/git_review_runtime_spec.lua`：测试的 `vim.notify` 替换不再转发给捕获的函数，只记录 ERROR 并写 stderr。仅为测试侧缺陷，生产代码未改。
 
 **Validation**
+- 本机 `git_review_runtime` 1/1。
 
-- 定向 `nvim --headless -l tests/run.lua clangd_resource`：10/10；全量回归：1324/1324，且不再出现
-  scheduled callback 异常。
-- 现有 host resource OpenSpec 契约未变化；本次只修正实现与测试替身的 Neovim API 调用顺序。
-
-**Follow-ups**
-
-- 无。
-
-### 2026-08-26 — Add the iOS CoreDevice production DAP route
+### 2026-09-30 — Windows CI：导入期 UTF-8 输出、fixture 文本编码与 8.3 短路径
 
 **Task**
-
-让 macOS 上的 Neovim headless/production iOS DAP 支持已选 `coredevice` 真机，同时保留 pre-iOS17
-`legacy-mobiledevice` 行为，并用真机 source breakpoint/cleanup gate 决定是否可报告成功。
+- `9f08099` 的 Windows CI 仍有 10 项失败；逐项读日志处置。
 
 **Implemented**
-
-- iOS DAP 在 session 开始时冻结 backend、selected Xcode adapter、project/source roots、device、bundle、
-  local Mach-O/dSYM 与 PID；CoreDevice 和 legacy 走独立 strategy，失败不互相 fallback，也不借用 Mac handler。
-- iOS DAP 的产物布局与 backend 工具集合由 `ue.targets.ios` owner 规划，runtime 只冻结解析结果，保持
-  host/target 架构边界与 capability matrix 一致。
-- CoreDevice 只消费 `devicectl --json-output`：精确解析 installed app/canonical device、start-stopped launch、
-  running process 与 PID reuse；Apple LLDB config 固定为 `target create` → `device select` →
-  `device process attach -p` → `target symbols add`，再通过 `postRunCommands` 输出唯一 loaded-image UUID marker；
-  Neovim listener 只有收到成功 marker 才允许 source breakpoint proof 继续，并以有界 grace 兼容 marker/
-  `initialized` 事件顺序差异；adapter 不回 disconnect 事件时也有 owner cleanup timeout fallback。
-- adapter 前置门禁异步比较 Mach-O/dSYM UUID，并要求 dSYM 通过 `dwarfdump --verify --quiet`；owner cleanup
-  先 non-terminating disconnect：普通 attach 复验冻结 app/PID 仍存在，只有 debug-launch owner 才终止该 PID 并
-  复验 absence；重复触发复用同一 cleanup 结果。
-- headless smoke 改为显式 project/device/backend/bundle/binary/dSYM/source/line 输入，要求 verified breakpoint、
-  breakpoint stop、精确 source:line、expression 与 cleanup 全部成立才写 `passed`；raw/production evidence
-  只持久化 basename/digest/boolean，不落真实 device、bundle、PID 或个人路径。
-- 将 DAP event proof 从已超过仓库行数门禁的 iOS transport 文件拆到单一 session listener owner；没有改变
-  CoreDevice/legacy transport 行为，也没有引入依赖。
-- 将 CoreDevice route、debug-launch identity、UUID/source gate 与 production headless contract 同步到 canonical
-  OpenSpec、architecture、tooling、constraints（K55）与 lessons。
-
-**Pitfalls / Gotchas**
-
-- 原 monolithic dSYM 虽与 Mach-O UUID 相等，但 DWARF verification 报 invalid abbreviation offset；UUID 相等
-  不能代替内容校验。最终使用与设备安装的 branch_3.6 Development executable 精确匹配、且 verification
-  通过的窄 dSYM 完成 source breakpoint 证明；该 dSYM 只覆盖本次所需编译单元，不冒充项目完整符号包。
-- attach command 中的同步 LLDB `assert` 会早于异步 CoreDevice process load 执行，而且 lldb-dap 会继续初始化；
-  因此真实 fail gate 必须是 `process status` 后的 marker，并由 DAP listener 在首次 continue 前消费。
-- QA 包体属于 branch_3.6；把 branch_3.7 本地 executable 与它的 cooked shader 混用会连续触发 missing global
-  shader。安装必须使用包体 `prepared-signing/current.json` 指向的匹配 App，或使用同一 branch_3.6 checkout
-  编译的本地 executable；不得复用已被其他构建覆盖的通用 `signed-app` 路径。
-- Personal Team profile 不提供 V8 所需的 Apple 私有内存 entitlement，原 QA executable 会因 pointer-compression
-  cage 预留失败退出。匹配 branch_3.6 的本地 Development executable 必须以
-  `-disablev8pointercompression` 构建；本次真机日志确认 `V8 PointerCompressionIsEnabled: 0`。
+- 17 个 `tools/*.py` 的 UTF-8 stdout/stderr 重设从 `__main__` 挪到导入期。根因：`index_output_stability` 的驱动脚本 `import` 工具后直接调 `main()`，不经过 `__main__`，6 项仍报 `UnicodeEncodeError`（`←`）。
+- `tests/cases/index_inventory_spec.lua`：fixture 的 `write_text` 显式 `encoding='utf-8'`（写入 `İ` 等目录名时按 cp1252 编码失败）。
+- `tests/cases/ue_cdb_shader_receipt_spec.lua`：shader 路径按 realpath 比较（CI 临时目录期望值是 8.3 短名 `RUNNER~1`，产物是长名 `runneradmin`，同一文件）。
 
 **Validation**
+- 本机模拟 CI 编码（`PYTHONIOENCODING=cp1252`）并行全量 required-native：125/125 文件通过（127.1 s）。
 
-- 定向：`dap` 94/94、`platform` 39/39、`ue_platform_boundary` 9/9、`ios_dap_probe` 6/6、
-  `ue_target_drivers` 47/47、`ue_target_tasks` 9/9、`ue_workflows` 26/26；5 个 iOS production Lua、
-  新增 CoreDevice spec 与 production smoke 的 `stylua --check` 通过，production Lua bare-global AST lint 通过。
-- `python3 tools/ios_dap_protocol_probe.py self-test`：passed；production headless attach/launch 与 strict raw-DAP
-  均生成脱敏 `status=passed` evidence，并同时证明 loaded-image UUID、verified breakpoint、breakpoint stop、
-  精确 source frame、expression 与 disconnect acknowledgement。
-- 真机 cleanup：production attach 在 detach 后复验原 app/PID 仍存在；production launch 只终止本次 owner PID
-  并复验 absence；最终设备无残留测试进程。
-- 匹配 branch_3.6 的 Personal Team App 完成 container-preserving 安装，既有外置资源未重传；普通启动进入
-  `FEngineLoop::Init`、LaunchScene 并持续运行。raw DAP 以及 production nvim attach/launch 均使用同一
-  local Mach-O/dSYM/source identity，未混用 branch_3.7 artifact。
-- 全量 `nvim --headless -l tests/run.lua`：1324/1324；
-  `openspec validate add-ios-coredevice-headless-dap --strict` 与 `git diff --check` 通过。
-- `python3 tools/ios_dap_protocol_probe.py self-test`、`git diff --check`、通用 secrets 扫描，以及旧历史到脱敏
-  snapshot 的删除内容回归扫描均通过；未重新引入被清理的 identity、设备标识或个人路径。
+**Follow-ups（根因未定）**
+- `git_review_runtime`：Linux/macOS 子进程 CPU 空转（`ps` 为 `R`，git 子进程成僵尸未回收）；Windows 在 4 次运行中有 3 次报 `Plugin mini.ai/... is not installed`（VeryLazy 触发时 lazy 认为插件未安装），另 1 次未出现。两者是否同源待查。
+- Windows `ordered Unity` 真实 clangd 索引在 4 次中失败 1 次（`indexing_complete` 为假、编译失败数 0），疑似偶发，待观察。
+- macOS `index_batch_runtime` FSEvents 延迟 rename 事件（见前条）。
+
+### 2026-09-30 — 按 CI 诊断修复 core_health 清理与 macOS 路径别名
+
+**Task**
+- `6656be3` 的诊断输出定位了两类 Linux/macOS 失败。
+
+**Implemented**
+- `lua/utils/core_health.lua`：临时审计目录递归删除失败时有界重试 5×100 ms（刚取消的子进程可能仍在写入），仍失败则保持 FAIL 并在 `next_step` 列出残留文件名。CI 证据：两次审计唯一差异是 `cleanup.temp=FAIL (temporary audit resources could not be removed)`，Ubuntu 与 macOS 都出现。
+- `tests/fixtures/cpp_semantic_pipeline/run.lua`：目标 buffer 按 realpath 比较。CI 证据：macOS 上实际为 `/private/var/.../defs.hpp`，期望为 `/var/.../defs.hpp`（`/var` 是 `/private/var` 的符号链接）。
+- `tests/cases/git_review_runtime_spec.lua`：加 15 s 周期 watchdog 输出编辑器 mode/blocking，用于区分挂起的输入提示与阻塞的事件循环。
+
+**Validation**
+- `core_health` 连续 2 次 28/28；`cpp_semantic_pipeline` 1/1；`git_review_runtime` 1/1（本机 Windows）。
 
 **Follow-ups**
+- `git_review_runtime`：Linux/macOS 在「等 Gitsigns 挂载」处被外层 60 s 超时杀掉（exit 124），12 s 的 `vim.wait` 未能返回，说明事件循环被同步阻塞；根因待 watchdog 输出确认。
+- macOS `index_batch_runtime`「首次缓存写入」：FSEvents 报告 `compile_commands.json` rename 导致撤销激活；推测为 fixture 在监听启动前刚写入该文件、FSEvents 延迟投递的历史事件，**待验证**，未改代码。
 
-- 当前窄 dSYM 已完成 Launch 编译单元的真机证明；调试其他编译单元前仍需为同一 executable 生成对应的
-  verified dSYM。Personal Team profile 到期时只刷新签名缓存，不得改变 binary/dSYM UUID 配对。
+### 2026-09-30 — 修复 PR #13 三平台 CI 暴露的 Windows 编码/前置与测试时序问题
+
+**Task**
+- `779c2b2` 的 CI：Windows 32 失败、macOS 5、Ubuntu 2。按根因分组处置。
+
+**Implemented**
+- 17 个会打印非 ASCII（`←`/`→`/中文）的 `tools/*.py` 在 `__main__` 入口把 stdout/stderr 重设为 UTF-8（`errors="backslashreplace"`）。根因：CI runner ANSI 代码页 cp1252，`print('← exit')` 抛 `UnicodeEncodeError`，连带 23 个 index/CDB 用例失败；本机 cp65001 不复现。
+- `.github/workflows/headless.yml`：Windows 通过 choco 安装既有 `fd` 前置（4 个 required-native 用例报 `fd unavailable`）。
+- `tests/cases/ue_unity_origin_spec.lua`：Python 端以 UTF-8 解码 stdin（原按 cp1252 解码中文路径，哈希不一致）。
+- `tests/cases/index_inventory_spec.lua`：临时目录与 checkout 不在同一盘符时改为在父目录内用相对名验证（`relpath` 不能跨盘）。
+- `tests/cases/multi_instance_state_spec.lua`：MRU 并发子进程等到自己的记录可见再退出（原固定 300 ms，在慢宿主上 `record()` 的异步锁重试尚未完成进程已退出）。
+- 诊断增强（根因未定，不改断言）：`core_health` 两次审计不一致时列出非 PASS 项；CLI 失败打印 stdout；`git_review_runtime` 的 Gitsigns 等待超时打印 buffer/gitsigns 状态/`:messages`；`cpp_semantic_pipeline` 打印实际与期望目标路径。
+
+**Pitfalls / Gotchas**
+- 本机 Windows 为 UTF-8 代码页，CI 为 cp1252——Python 工具的 print 编码问题只在 CI 暴露。
+
+**Validation**
+- 并行全量 required-native：125/125 文件通过（135.4 s）；`multi_instance_state` 连续 3 次 27/27。
+
+**Follow-ups**
+- 仍未定位：三平台 `git_review_runtime` Gitsigns 未挂载（此前 CI 已存在）；Linux/macOS `core_health` 审计不稳定；macOS `cpp_semantic_pipeline` 目标 buffer、`index_batch_runtime` 首次缓存写入被 FSEvents 报为 `compile_commands.json` rename 而撤销激活（此前 CI 已存在）。待本次诊断输出后处置。
+
+### 2026-09-30 — SDD 轻量化：spec 只规定大方向并记录选型与踩坑
+
+**Task**
+- 用户判定 SDD 过重、阻碍开发：41 份主 spec 近万行、逐字段/逐超时契约与实现同频漂移。要求整理为只规定大方向、记录选型踩坑等重要事项。
+
+**Implemented**
+- `openspec/specs/*/spec.md` 全部 41 份重写为统一结构：Purpose（边界与方向）+ 2–6 条方向性 Requirement（保留安全/隐私、SuperUnity 不静默退化、DAP 五层分层等底线）+「## 选型与踩坑」段。
+- 政策降级：根 `AGENTS.md` SESSION START 第 4 步与 DoD 第 2/3 条、`docs/CONSTRAINTS.md` C7/C8/C9、`docs/testing-regression.md`、`memory/project_overview.md`、各目录 `AGENTS.md` 的「治理 spec」措辞——日常修复不需改 spec、不强制立 change，changelog 不再逐条声明 spec 一致性处置。
+- `openspec/config.yaml` 增加轻量化说明；未实现的 `2026-09-28-restructure-super-unity-compression` 以 `--skip-specs` 归档（0/22 任务，已标注未实现），其调查结论与已选方向浓缩进 `cpp-semantic-index-coverage` 的「选型与踩坑」。
+
+**Pitfalls / Gotchas**
+- 瘦身只浓缩不编造；完整旧条款仍可在 git 历史与 `openspec/changes/archive/` 查到。
+- SuperUnity 方向（Tier 1 发射序列分组）**尚未实现、无实测收益**，不得引用为已交付。
+
+- 新增 `tests/run_parallel.lua`：每个 spec 文件独立 `nvim --headless -l tests/run.lua <file>` 子进程（run.lua 已隔离 state/log/probe），默认 min(8, CPU/2) 并发，实时逐文件进度，按上次耗时优先调度慢文件。串行 `tests/run.lua` 仍是 CI/提交门禁入口。
+- `tests/cases/index_batch_runtime_spec.lua`：盘符根监听用例等待由 3 s 改为 12 s（与同文件 `await_watch_probe` 及生产 10 s 探测预算一致）；同文件其余 7 处等待真实 fs 事件到达的正向 `vim.wait(1000)` 统一放宽到 5 s（并行负载下父目录 rename 失效用例曾超时）。均为「等到条件成立即返回」的正向等待，未改生产时限或断言语义。
+
+**Validation**
+- 41/41 `openspec validate <cap> --type spec --strict` 通过；`structure` 78/78。
+- `index_batch_runtime` 修复前单独串行 3 次中 1 次失败（盘符根 3 s 等待），修复后连续 4 次 80/80。
+- 并行全量（`NVIM_TEST_REQUIRE_NATIVE=1`，Python 3.14，jobs=8）：首轮 124/125 文件（父目录 rename 用例 1 s 等待超时），放宽等待后 **125/125 文件、2344 用例全绿，140.6 s**（串行约 10+ 分钟）。
+
+### 2026-09-30 — 修复跨平台原生回归前置与诊断
+
+**Task**
+- Tree-sitter 安装恢复后，继续处理 PR #13 全量回归实际暴露的跨平台失败。
+
+**Implemented**
+- `.github/workflows/headless.yml` 为 Linux 安装既有 `fd-find` 前置；用官方 LLVM 22.1.5 完整归档和固定 SHA256 配置编译器、clangd、libclang 与 builtin headers，避免 apt 的 22.1.8 漂移绕开或触发既有精确版本门禁。
+- `tools/clangd_batch_bindings.py` 保留选定 libclang 的安装路径，再查真实链接目标，支持 Debian multiarch 布局；显式资源目录和版本约束保持。
+- `grep_cache_spec` 在剪贴板输入边界提供 fixture，保留真实 picker 编辑行为；compiler fixture 保留 `clang++` 符号链接的调用名。
+- 原生测试区分 Windows 专属场景和缺失工具；watcher 用真实探针验证能力及原命令回退，测试等待覆盖既有生产探针时限。
+- `tests/run.lua` 与 harness 在 CI 立即刷新 spec/case 标记，避免提前退出后只能看到延迟通知、无法定位退出点。
+
+**Pitfalls / Gotchas**
+- 必需的原生证明仍保持启用，未放宽 LLVM 22.1.5 证明限制、伪造宿主能力或改变 SuperUnity 压缩/准入机制。
+- Windows CI 使用 Neovim 0.12.5，本地原版本为 0.11.5；已在临时目录校验并运行官方同版程序，未替换用户安装。
+
+**Validation**
+- 剪贴板回归 36/36；libclang 布局新增用例先复现原错误，修复后 required-native bindings 11/11。
+- Windows required-native runtime 80/80、activation 9/9、query 7/7、verified batch 27/27；真实 Linux Python 验证不支持的 query profile 拒绝路径。
+- 同版 Neovim 0.12.5 的 Git review 73/73、transport 9/9；整合全量见上条（125/125 文件），远端三平台复验待 PR #13 CI。
+- Spec 一致性：同步 `headless-test-harness` 的真实宿主适用性与 CI 进度证据契约、`config-regression-suite` 的一致工具链前置；资源查找与 fixture 修复恢复既有行为契约。
+
+**Follow-ups**
+- 以对应提交的三平台完整 CI 结果验收；Windows 提前退出的具体位置仍需带进度标记的运行记录确认。
+
+### 2026-09-30 — 修复 CI Tree-sitter CLI 安装版本
+
+**Task**
+- 修复 PR #13 三个平台在依赖安装阶段共同失败的问题。
+
+**Implemented**
+- `.github/workflows/headless.yml` 将 npm 安装版本从未发布的 `tree-sitter-cli@0.26.1` 改为已发布的固定版本 `0.26.3`。
+
+**Pitfalls / Gotchas**
+- GitHub release 存在不代表对应 npm 版本存在；原版本在 runner 报 `ETARGET`，本地 npm registry 查询同样报版本不存在。
+
+**Validation**
+- Spec 一致性：无行为契约变更，恢复 `config-regression-suite` 已要求的隔离依赖安装和全量回归入口。
+- 临时目录实际 npm 安装成功，CLI 返回 `tree-sitter 0.26.3`；225 个 Lua 文件通过 AST lint。
+- 本地 required-native 全量 **2341/2341**，0 failed、0 skipped（测试进程使用已安装的 Python 3.14）；差异检查通过。
+
+**Follow-ups**
+- 跨平台验收以 PR #13 对应提交的 Linux、macOS、Windows 完整 CI 记录为准；依赖安装成功不能替代整个工作流通过。
+
+### 2026-09-30 — 更正 shard 播种验收范围并复核发布脱敏
+
+**Task**
+- 接力已提交并推送的 shard 播种改动，复核 spec 同步、归档与公开内容。
+
+**Implemented**
+- 在 `docs/cpp-index-restart-investigation.md` 更正 42.3 s / 54.2 s 的实测范围，并同步主 spec、归档 delta、proposal 与 tasks。
+- 保留归档任务 2.4 未完成；副本索引不再表述为成功的线上激活或完整端到端验收。
+
+**Pitfalls / Gotchas**
+- 前次提交的 Tested 摘要过宽；详细证据是 prepare 校验失败后另行启动 clangd 索引。本次追加更正，不改写已发布历史。
+
+**Validation**
+- 前次提交的元数据、路径和全部新增内容通过专属 denylist 与通用敏感信息扫描。
+- Spec 一致性：主 spec 与已归档 delta 同步更正，15 个 scenario 保持一致；主 spec 严格校验与暂存差异检查通过，未改变运行时行为。
+- 首次 required-native 全量为 2338/2341，失败涉及多实例缓存刷新、探针重试与 native watcher 就绪。独立复测分别通过 27/27、10/10、15/15；watcher 的原始断言和生产时限未改动。
+- 同一原生 helper 的一次配对测量：默认 Python 3.12 启动到 ready 为 9044 ms，已安装 Python 3.14 为 125 ms；后续 Python 3.14 运行也曾超时，因此不能将波动全部归因于版本。测试进程使用现有 `UE_PYTHON` 显式选择真实 Python 3.14，未伪造工具或改变用户会话配置。
+- 最终完整回归 **2341/2341 passed，0 failed、0 skipped**：设置进程内 `NVIM_TEST_REQUIRE_NATIVE=1` 与 `UE_PYTHON` 指向已安装的 Python 3.14 后运行 `nvim --headless -l tests/run.lua`。复测通过不代表上述时限波动已修复。
+
+**Follow-ups**
+- 有效 receipt 下的完整激活链路、header shard 差异归因及更大范围 SuperUnity 验收仍未完成。
+- 本轮异步测试与 helper 就绪时限波动的根因尚未闭环；保留为既存验证稳定性问题，不宣称由文档更正修复。
+
+### 2026-09-29 — 冻结 shard 缓存从原缓存 add-only 播种
+
+**Task**
+- 让 prepare 后首次冻结激活不再把约 33k 个保留 TU 冷重建进独立 shard 缓存。
+
+**Implemented**
+- 新增 `tools/clangd_shard_seed.py`：仅添加目标缺失的 `*.idx`（硬链接，跨卷回落 exclusive-create 复制；跳过 `.temp-stream-`；失败删除半截副本；拒绝同目录/缺失目标）。
+- 新增 `lua/ue/index/batch_shard_seed.lua`，并在 `batch_runtime` 的本地缓存创建之后、watch probe 之前异步播种；结果不影响冻结权威，失败按冷缓存继续。
+- spec `cpp-semantic-index-coverage` 新增场景 "A new frozen shard cache is seeded from the original cache"。
+- 调查记录见 `docs/cpp-index-restart-investigation.md` 2026-09-29 节（含 priority A/B 假设被证伪的更正）。
+
+**Pitfalls / Gotchas**
+- clangd 22 shard 按源路径寻址、只按内容 digest 判过期、以 temp+rename 写回——这三点是播种安全且有效的前提（源码已核对）。
+- header shard 在播种/冷建间存在 refs/relations 差异，归因于写入者非确定性，为推测、待闭环。
+
+**Validation**
+- 实测（Android target 隔离副本）：冻结 CDB 冷索引 1713.6 s / 12,937 CPU s → 播种后索引 42.3 s / 47.9 CPU s（重索引 4 个 TU，其中 2 个为 batch TU）。
+- Headless prepare（真实 `batch_runtime.prepare`，隔离副本）：播种 linked 37,339、11.8 s；冻结校验因 receipt inventory（某插件 Win64 Editor Intermediate 目录 9/28 新增文件）返回 `receipt-input-or-asset-changed`，正确回落原 CDB。随后独立启动 clangd，在播种后的 verified 目录索引 54.2 s / 56.4 CPU s / 5.35 GB、4 TU、0 失败；该数字不是成功激活的端到端耗时。未验证 live 是否同样失效（推测是）。
+- `NVIM_TEST_REQUIRE_NATIVE=1` filters：index_batch_runtime 80/80、index_batch 201/201、index_generation 35/35、cpp_semantic_index 1/1、clangd_commands 10/10、ue_api 65/65、index_graph 12/12、index_verified_batch 27/27、index_vfs_aliases 5/5、index_input_directory 4/4、index_inventory 18/18、cpp_semantic_client 33/33、host_resource_discipline 13/13、stability 26/26。
+- 单独跑 `index_query_profile` filter 时报 native coverage unavailable（skip 条件 clangd/python 未解析被触发），全量套件中同一用例通过；推测全量里其他用例设置了 `UE_CLANGD`，未验证；本改动未触及该路径。
+- 全量 `NVIM_TEST_REQUIRE_NATIVE=1 nvim --headless -l tests/run.lua`：2341/2341 passed。
+- spec 一致性：以 change `2026-09-29-seed-frozen-shard-cache` 承载并已归档，同步 `openspec/specs/cpp-semantic-index-coverage/spec.md`；知识库同步 architecture overview / project_overview / `lua/ue/index/AGENTS.md` / tests 映射（新增 `index_batch_runtime`）。
+
+**Follow-ups**
+- wrapper 命令变更导致新 TU 路径全量重索引；冻结失效源（仓库 `.omx` receipts）迁出；更多真实 L1 二次合并。
+
+### 2026-09-29 — 归档统一 Git 审阅 change
+
+**Task**
+- 按用户指令完成 CodeDiff 工作的 spec 同步核对、归档与提交推送流程。
+
+**Implemented**
+- 将完整 change 移至 `openspec/changes/archive/2026-09-29-unify-git-review-with-codediff/`，保留 21 项任务及交付证据。
+- 更新 `docs/release_2.0.0.md` 的归档路径和授权状态。
+
+**Pitfalls / Gotchas**
+- 其他 SuperUnity change 保留原状；tag 未包含在本次授权中。
+
+**Validation**
+- Spec 一致性：三个主规格与 delta 的 10 个 requirement 块逐段一致；change 与三个主规格严格校验通过。
+- 归档后提交前 required-native 全量复验 **2338/2338**，0 failed、0 skipped；命令为 `NVIM_TEST_REQUIRE_NATIVE=1 nvim --headless -l tests/run.lua`。
+- 21 个相关 Lua 文件通过 AST lint；暂存差异通过 `git diff --cached --check`。
+
+**Follow-ups**
+- 跨平台和 GUI 验证边界沿用 [v2.0.0 交付记录](release_2.0.0.md)。
+
+Original-reader retention and its acceptance limits are
+archived in [v1.12.11](release_1.12.11.md). Broader compression, whole-engine index
+performance and search responsiveness remain open.

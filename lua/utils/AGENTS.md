@@ -37,13 +37,17 @@
 - 改 `code_search/**` / `ue_paths.lua` → `ue_goto_behavior` `ue_paths` `utils`
 - 改 `platform/**` → `platform`（另见子目录 `AGENTS.md`）
 - 改被广泛复用的 helper（如 `log`、`ue_paths`）→ 提交前全量
+- 改 `git_review.lua` Git 路由/搜索/会话交接 → `git_review` `review_editor` `keymaps`
+  `cheatsheet` `workarounds` `smoke`；`git_review` 前缀覆盖各能力切片。
 
 ## 先读
 
 `../../docs/architecture-symbol-resolution.md`、`../../docs/architecture/overview.md` §5。
 
-**治理 spec**（可观察行为的权威；与本文冲突时以 spec 为准）：
+**治理 spec**（大方向与选型/踩坑；实现细节以代码与回归为准）：
 `../../openspec/specs/probe-feedback-loop/spec.md`、
 `../../openspec/specs/task-management/spec.md`、
 `../../openspec/specs/global-android-device-selection/spec.md`、
 `../../openspec/specs/notification-history/spec.md`。
+Git 路由/查询/会话交接另遵循 `../../openspec/specs/git-review-workspace/spec.md`；
+不能以调度回调或夹具通过代替真实大仓性能证据。

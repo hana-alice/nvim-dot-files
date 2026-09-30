@@ -57,7 +57,7 @@ local function read_json(path)
   local raw = file:read("*a")
   file:close()
   local ok, value = pcall(vim.json.decode, raw or "")
-  return ok and type(value) == "table" and value or nil
+  return ok and type(value) == "table" and value or nil, raw
 end
 
 local function atomic_write(path, value)
@@ -243,7 +243,15 @@ function M.revision_path(engine_root, selection)
 end
 
 load_values = function(engine_root, selection)
-  local value = read_json(M.state_path(engine_root, selection)) or {}
+  -- Capture the exact bytes used for this state value. A separately read token
+  -- could pair an old value with a newer revision and hide a concurrent update.
+  local snapshot = {}
+  local function observed_json(path)
+    local value, raw = read_json(path)
+    snapshot[#snapshot + 1] = { path, raw or false }
+    return value
+  end
+  local value = observed_json(M.state_path(engine_root, selection)) or {}
   local dir = fields_dir(engine_root, selection)
   if dir and fs.is_dir(dir) then
     -- vim.fn.globpath() can miss files below Neovim's own temporary root on
@@ -251,7 +259,7 @@ load_values = function(engine_root, selection)
     -- directory iterator operates on the exact path and is also cheaper here.
     for name, kind in vim.fs.dir(dir) do
       if kind == "file" and name:match("%.json$") and name ~= "target-selection.json" then
-        local field = read_json(fs.join(dir, name))
+        local field = observed_json(fs.join(dir, name))
         local key = name:gsub("%.json$", "")
         if type(field) == "table" and tostring(field.updated_at or "") > tostring(value.updated_at or "") then
           value.updated_at = field.updated_at
@@ -263,7 +271,7 @@ load_values = function(engine_root, selection)
         end
       end
     end
-    local target = read_json(target_path(engine_root, selection))
+    local target = observed_json(target_path(engine_root, selection))
     if type(target) == "table" then
       value.target_platform = target.target_platform
       value.target_configuration = target.target_configuration
@@ -276,24 +284,48 @@ load_values = function(engine_root, selection)
   value.project_root = selection.project_root
   value.uproject = selection.uproject
   value.project_key = selection.project_key
-  return value
+  table.sort(snapshot, function(a, b) return a[1] < b[1] end)
+  return value, vim.fn.sha256(vim.json.encode(snapshot))
 end
 
-function M.read(engine_root)
-  local selection = M.current(engine_root)
-  if not selection then return {} end
-  local value = load_values(engine_root, selection)
-  local key = engine_key(engine_root)
-  for field in pairs(SESSION_LOCAL_FIELDS) do
-    value[field] = session_values[key] and session_values[key][field] or nil
+-- Async owners can address their captured project without changing the live
+-- selector. Session-local target choices are overlaid only for live reads.
+function M.read(engine_root, captured)
+  local selection
+  if captured then
+    selection = normalize_selection(engine_root, captured.project_root, captured.uproject)
+  else
+    selection = M.current(engine_root)
   end
-  return value
+  if not selection then return {} end
+  local value, revision = load_values(engine_root, selection)
+  local key = engine_key(engine_root)
+  if not captured then
+    for field in pairs(SESSION_LOCAL_FIELDS) do
+      value[field] = session_values[key] and session_values[key][field] or nil
+    end
+  end
+  return value, revision
 end
 
-function M.update(engine_root, key, value)
-  local selection = M.current(engine_root)
+-- Derive invalidation from the authoritative field files. Distinct-field
+-- writers no longer race to replace a shared revision marker after committing.
+function M.revision(engine_root, captured)
+  local _, revision = M.read(engine_root, captured)
+  return revision
+end
+
+-- A captured project is a persistence address, never a request to select it.
+function M.update(engine_root, key, value, captured)
+  local selection
+  if captured then
+    selection = normalize_selection(engine_root, captured.project_root, captured.uproject)
+  else
+    selection = M.current(engine_root)
+  end
   if not selection then return false, "no project selected in this Neovim session" end
   if SESSION_LOCAL_FIELDS[key] then
+    if captured then return false, "captured workflows cannot change live target selection" end
     local current = M.read(engine_root)
     return M.update_target(
       engine_root,
@@ -312,10 +344,36 @@ function M.update(engine_root, key, value)
     writer_pid = vim.fn.getpid(),
   })
   if not ok then return false, err end
-  return atomic_write(M.revision_path(engine_root, selection), {
-    nonce = table.concat({ vim.fn.getpid(), vim.uv.hrtime() }, "-"),
-    updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-  })
+  return true
+end
+
+--- Write one state field and PROVE the value reads back from the same bucket
+--- the readers use. Returns (true) or (false, err).
+---
+--- K61: `M.update` returns `false, "no project selected in this Neovim session"`
+--- whenever this process holds no selection. A caller that discards that return
+--- reports success while nothing is persisted, and every reader keeps resolving
+--- the PREVIOUS value — measured 2026-09-03 as `:UESetAndroidPackage` printing
+--- "UE Android package set: …" while `<Space>da` kept attaching the old package.
+--- The readback also catches a writer/reader bucket split, which no return code
+--- from a single write can express.
+function M.commit(engine_root, key, value)
+  local ok, err = M.update(engine_root, key, value)
+  if not ok then return false, err or "state update failed" end
+  -- Tables cannot be compared by identity across a JSON round-trip; for them a
+  -- successful atomic write plus a present key is all this layer can assert.
+  local seen = M.read(engine_root)[key]
+  if type(value) == "table" then
+    if type(seen) ~= "table" then
+      return false, ("read-back missing for %s"):format(tostring(key))
+    end
+    return true
+  end
+  if seen ~= value then
+    return false, ("read-back mismatch for %s (wrote %s, reads %s)")
+      :format(tostring(key), tostring(value), tostring(seen))
+  end
+  return true
 end
 
 function M.update_target(engine_root, platform, configuration)
@@ -342,10 +400,7 @@ function M.update_target(engine_root, platform, configuration)
   session_values[session_key] = session_values[session_key] or {}
   session_values[session_key].target_platform = platform
   session_values[session_key].target_configuration = configuration
-  return atomic_write(M.revision_path(engine_root, selection), {
-    nonce = table.concat({ vim.fn.getpid(), vim.uv.hrtime() }, "-"),
-    updated_at = updated_at,
-  })
+  return true
 end
 
 --- Capture an explicit :UESetPlatform intent independently from project

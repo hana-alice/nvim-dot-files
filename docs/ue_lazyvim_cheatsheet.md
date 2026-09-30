@@ -762,6 +762,12 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `:UEInstallIOS`           | CoreDevice: install current packaged `.app`; pre-iOS17: stream signing/upload/Upgrade progress through prepared `InstallIOSClient.sh`; never uninstall or launch |
 | `<leader>us`              | `:UEBuildAndroidSO` — export + execute UBT compile/link actions (no Deploy/Gradle/APK) |
 | `<leader>uq`              | `:UEDeployAndroidSO` — strip, push, atomically replace and verify `libUE4.so`; leaves the app stopped |
+| `<leader>P`               | `:UEHub` — searchable list of every UE action for the active target, with its key shown |
+| `<leader>uu`              | `:UETarget` — show and switch project / platform / device / package in one place |
+| `<leader>uk`              | Run the command that fixes the last reported failure (e.g. select a device) |
+| `<F5>` / `<S-F5>`         | No session: run the target loop (Android: build SO → deploy → debug-launch). In a session: continue. `<S-F5>` stops |
+| `:UEDoctor`               | Check tools, target, device, package; `<CR>` on a ✗ row runs its fix |
+| logcat buffer             | `<CR>` jump to the source location on the line · `gl` cycle minimum level · `gx` symbolicate latest crash |
 | `<leader>ux`              | `:UEAndroidIterate` — build SO → quick deploy → wait-for-debugger launch; stops at the first failing step (`nodebug` arg: plain launch) |
 | `<leader>uX`              | `:UEAndroidCrash` — pull the device crash buffer, symbolicate the UE module with the build-id-matched symbols, open quickfix |
 | `<leader>uB`              | `:UEPrepare`; IOS on macOS also generates its semantic CDB and auto-runs first-use setup |

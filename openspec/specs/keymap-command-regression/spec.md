@@ -68,3 +68,10 @@ statusline 表达式执行；终端控制字符 SHALL 被移除，长度 SHALL �
   buffer 附加完成后另行验证最终路由。
 - **重要事项**：具体键位到命令的映射表（如哪个 leader 前缀对应哪个命令）属于实现细节，不
   在本 spec 固化；spec 只约束「声明了的映射必须真实生效、且在依赖就绪后才可信」这条底线。
+- **选型（2026-09-30，用户明确）**：体验提升以**键盘为中心**，不对标 IDE 的鼠标 UI。
+  做法是「一个可搜索入口 + 状态栏常驻提示」：`<leader>P`（`:UEHub`）列出当前 target 的全部动作
+  并显示其快捷键，`<leader>uu`（`:UETarget`）集中查看/切换项目·平台·设备·包名，`<leader>uk`
+  执行上一次失败给出的修复命令；不做可点击工具栏/按钮。
+- **选型**：`<F5>` 在无调试会话时运行当前 target 的循环（Android：编 SO → 部署 → 调试启动），
+  会话中仍是 continue；`<S-F5>` 停止。target 专属动作与字段由 target driver 的声明式 `hub(state)`
+  提供，通用 hub 不含 target 字面量（守护：`ue_platform_boundary`）。

@@ -17,6 +17,7 @@
 | 架构总览 | `architecture/overview.md` | 全景 + 归属边界 |
 | 子系统深度 | `architecture-*.md` | 单主题深挖 |
 | 架构决策(ADR) | `plans/*.md` | 为什么这样设计（`decisions/` 索引指回这里） |
+| 使用手册（给人读） | `USER_GUIDE.md` | 按「想做的事 → 按什么」组织；不写实现。改用户可感知的按键/命令/状态栏时同步 |
 | 端到端配方 | `skills/*.md` | 可执行 + 可校验数字 |
 | 回归政策 | `testing-regression.md` | 分范围映射 + 操作细则 |
 | 变更记录 | `changelog.md` → `release_*.md` | 每次改动追加，攒够切片归档 |

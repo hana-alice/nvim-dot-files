@@ -6662,8 +6662,16 @@ local function set_android_package(input)
   end
 
   input = trim(input)
-  if input == "" then
-    input = vim.fn.input("Android package name: ", read_state(engine_root).android_package or "")
+  if input == "" and vim.g.ue_prepare_headless ~= 1 then
+    -- No argument: pick from the device's installed packages (current value
+    -- first) instead of retyping the name; the pick re-enters with the name.
+    local device = require("utils.android_device")
+    local serial = device.get()
+    local current = trim(read_state(engine_root).android_package or "")
+    return require("utils.android_package").pick({
+      adb = serial and device.adb_executable() or nil, serial = serial,
+      known = current ~= "" and { current } or nil,
+    }, function(name) if name then CORE_RT.set_android_package(name) end end)
   end
   if input == "" then return end
   -- K61: commit() re-reads the field from the readers' bucket, so a failed or
@@ -6675,6 +6683,8 @@ local function set_android_package(input)
     or ("UE Android package NOT set: " .. tostring(err))
   vim.notify(msg, ok and vim.log.levels.INFO or vim.log.levels.ERROR)
 end
+
+CORE_RT.set_android_package = set_android_package
 
 -- Tell ue.lua how to find the .uproject when only a workspace root is given
 -- to :UESetProject. Stored in the selected project's state bucket so it never
@@ -9575,19 +9585,33 @@ function M.setup()
   vim.api.nvim_create_user_command("UEDeployAndroidSO", function() deploy_android_so() end, {})
   -- One-key Android inner loop: build SO → hot-deploy → attach. The steps stay
   -- separate owners (K46); this only chains them and stops at the first failure.
+  vim.api.nvim_create_user_command("UEHub", function() require("utils.ue_hub").command_hub() end,
+    { desc = "Searchable hub of every UE action for the active target" })
+  vim.api.nvim_create_user_command("UETarget", function() require("utils.ue_hub").target_switcher() end,
+    { desc = "Show and switch the active project / platform / device / package" })
+  vim.api.nvim_create_user_command("UEDoctor", function() require("utils.ue_hub").doctor() end,
+    { desc = "Check tools, target, device and package; <CR> on a failed row runs its fix" })
   vim.api.nvim_create_user_command("UEAndroidCrash", function()
     require("ue.dap._android_crash").run()
   end, { desc = "Android: symbolicate the latest native crash from the device into quickfix" })
   vim.api.nvim_create_user_command("UEAndroidIterate", function(cmd)
-    local notify = function(msg, level) vim.notify("[UEAndroidIterate] " .. msg, level or vim.log.levels.INFO) end
+    local started = vim.uv.hrtime()
+    local notify = function(msg, level)
+      vim.notify("[UEAndroidIterate] " .. msg, level or vim.log.levels.INFO)
+      -- A failed step is a long-task outcome the user may have walked away
+      -- from: keep it in the statusline until the next run.
+      if level == vim.log.levels.ERROR then set_build_status("LOOP✗") end
+    end
+    local function elapsed() return ("%.0fs"):format((vim.uv.hrtime() - started) / 1e9) end
     local function start()
       -- The deploy leaves the app stopped (K46). Start it under the debugger
       -- (wait-for-debugger launch, K39) or plainly with `nodebug`.
+      set_build_status("LOOP✓ " .. elapsed())
       if cmd.args == "nodebug" then
-        notify("deploy ok → launching app")
+        notify("deploy ok in " .. elapsed() .. " → launching app")
         return M.launch_app()
       end
-      notify("deploy ok → launching under the debugger")
+      notify("deploy ok in " .. elapsed() .. " → launching under the debugger")
       vim.cmd("UEDAPLaunch Android")
     end
     local function deploy()

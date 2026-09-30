@@ -166,6 +166,30 @@ function M.status_token(state)
     .. (package ~= "" and ("/" .. (package:match("([^.]+)$") or package)) or "")
 end
 
+--- Declarative hub contribution (data only; the generic hub renders and runs
+--- it). Keeps target-specific actions and fields with the target owner.
+function M.hub(state)
+  local ok_dev, device = pcall(require, "utils.android_device")
+  local adb = ok_dev and device.adb_executable() or "adb"
+  local package = C.trim(state and state.android_package)
+  return {
+    loop_command = "UEAndroidIterate",
+    actions = {
+      { group = "Run",    label = "Android loop: build SO → deploy → debug-launch", key = "<leader>ux", command = "UEAndroidIterate" },
+      { group = "Run",    label = "Android loop without debugger", command = "UEAndroidIterate nodebug" },
+      { group = "Build",  label = "Build Android SO only", key = "<leader>us", command = "UEBuildAndroidSO" },
+      { group = "Build",  label = "Quick deploy Android SO", key = "<leader>uq", command = "UEDeployAndroidSO" },
+      { group = "Debug",  label = "Symbolicate latest Android crash", key = "<leader>uX", command = "UEAndroidCrash" },
+      { group = "Target", label = "Select Android device", key = "<leader>uA", command = "UESetAndroidDevice" },
+    },
+    fields = {
+      { name = "adb", label = "adb", value = vim.fn.executable(adb) == 1 and adb or nil, doctor_only = true },
+      { name = "device", label = "Device", value = ok_dev and device.status_label() or nil, command = "UESetAndroidDevice" },
+      { name = "package", label = "Package", value = package ~= "" and package or nil, command = "UESetAndroidPackage" },
+    },
+  }
+end
+
 function M.capabilities()
   return C.default_capabilities(M.id, {
     build = true,

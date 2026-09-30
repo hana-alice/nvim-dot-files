@@ -108,9 +108,17 @@ with tempfile.TemporaryDirectory(prefix='index_inventory_') as temporary:
         compare('preserves non-directory roots', tree / 'file.h')
         compare('preserves exclusion of the root itself', excluded)
         compare('preserves relative-root behavior', Path(os.path.relpath(tree, Path.cwd())))
-        for name in ('\u0130', 'i\u0307'):
-            (tree / name).mkdir()
-            (tree / name / (name + '.h')).write_text(name)
+        unicode_first, unicode_second = tree / '\u0130', tree / 'i\u0307'
+        unicode_first.mkdir()
+        # Probe this filesystem's Unicode identity: APFS may alias these
+        # spellings, while other filesystems keep two distinct directories.
+        if unicode_second.exists():
+            assert unicode_first.samefile(unicode_second)
+        else:
+            unicode_second.mkdir()
+            assert not unicode_first.samefile(unicode_second)
+        for number, directory in enumerate((unicode_first, unicode_second)):
+            (directory / ('child-' + str(number) + '.h')).write_text(directory.name)
         compare('uses Path-compatible Unicode case identity')
         try:
             for name, target, directory in [('file-link.h', tree / 'file.h', False),

@@ -43,6 +43,54 @@ t.describe("cross-TU destination proof", function()
     end)
   end
 
+  t.it("proves real symlink aliases without accepting another file or in-flight edits", function()
+    local root = vim.fn.tempname():gsub("\\", "/")
+    vim.fn.mkdir(root .. "/actual", "p")
+    root = assert(vim.uv.fs_realpath(root)):gsub("\\", "/")
+    local actual, alias = root .. "/actual/body.cpp", root .. "/alias/body.cpp"
+    vim.fn.writefile({ "int body(){return 1;}" }, actual)
+    vim.fn.writefile({ "int body(){return 1;}" }, root .. "/other.cpp")
+    local linked, link_error = vim.uv.fs_symlink(root .. "/actual", root .. "/alias", { dir = true })
+    if not linked then
+      vim.fn.delete(root, "rf")
+      t.skip("real destination symlink", link_error, { native = true })
+      return
+    end
+    local target = { uri = vim.uri_from_fname(alias), _position_encoding = "utf-8",
+      range = { start = { line = 0, character = 4 }, ["end"] = { line = 0, character = 8 } } }
+    local existing = vim.fn.bufadd(actual)
+    vim.fn.bufload(existing)
+    local previous = package.loaded["utils.ue_goto.clangd_adapter"]
+    local ok, err = xpcall(function()
+      for _, case in ipairs({
+        { reason = "ok", path = alias },
+        { reason = "definition-not-found", path = root .. "/other.cpp" },
+        { reason = "provider-cancelled", path = alias, edit = true },
+      }) do
+        package.loaded["utils.ue_goto.clangd_adapter"] = {
+          async_clangd_symbol_info = function(bufnr, callback)
+            t.assert_eq(bufnr, existing, "reuse the existing target buffer through its real alias")
+            if case.edit then vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "int changed;" }) end
+            local definition = vim.deepcopy(target)
+            definition.uri = vim.uri_from_fname(case.path)
+            callback({ reason = "ok", usr = "usr:expected", definitions = { definition } })
+          end,
+        }
+        local result
+        require("utils.ue_goto.clangd_destination").verify(target, "usr:expected", {}, function(value)
+          result = value
+        end)
+        t.assert_eq(result.reason, case.reason)
+        t.assert_eq(target.uri, vim.uri_from_fname(alias), "provider URI must remain unchanged")
+      end
+    end, debug.traceback)
+    package.loaded["utils.ue_goto.clangd_adapter"] = previous
+    vim.api.nvim_buf_delete(existing, { force = true })
+    assert(vim.uv.fs_unlink(root .. "/alias"))
+    vim.fn.delete(root, "rf")
+    if not ok then error(err) end
+  end)
+
   local platform = require("utils.platform")
   local tool = platform.resolve_tool({ name = "clangd", env = { "UE_CLANGD" },
     driver_candidates = function(driver) return driver.default_clangd_candidates() end })

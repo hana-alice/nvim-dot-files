@@ -2,6 +2,22 @@ local t = require("tests.harness")
 t.bootstrap()
 local runtime = require("ue.index.batch_runtime")
 
+local function await_watch_probe(h, reason)
+  -- The real probe allows ten seconds for the selected backend to deliver an
+  -- event. An unsupported backend must finish and prove original-view fallback,
+  -- rather than failing the test's shorter deadline before that decision exists.
+  t.assert_true(vim.wait(12000, function() return #h.calls == 2 or #h.roots == 1 end, 10),
+    "native watch capability probe did not settle")
+  if #h.calls == 2 then return true end
+  local activation = runtime.activation(h.ctx.paths.semantic_cdb)
+  t.assert_true(activation and activation.failed, "unavailable watch must fail closed")
+  t.assert_eq(activation.reason, reason)
+  t.assert_eq(#h.calls, 1, "unproven watch must not start validation")
+  t.assert_eq(#h.roots, 1, "original startup must be released exactly once")
+  t.assert_true(vim.deep_equal(runtime.command(h.command), h.command))
+  return false
+end
+
 local function fixture(body)
   runtime._reset_for_test()
   local root = vim.fn.tempname():gsub("\\", "/") .. "_batch_runtime"
@@ -933,10 +949,11 @@ t.describe("frozen batch startup runtime", function()
         return handle, { recursive = options.recursive, direct = not options.recursive }
       end
       h.prepare(); h.describe()
-      t.assert_true(vim.wait(3000, function() return #h.calls == 2 or #h.roots == 1 end, 10))
+      -- Same budget as await_watch_probe: the real probe may take up to ten seconds.
+      t.assert_true(vim.wait(12000, function() return #h.calls == 2 or #h.roots == 1 end, 10))
       t.assert_eq(#h.calls, 2, "drive root descriptor must reach validation after real host probes")
       h.validate()
-      t.assert_true(vim.wait(1000, function() return #h.roots == 1 end, 10))
+      t.assert_true(vim.wait(5000, function() return #h.roots == 1 end, 10))
       t.assert_contains(runtime.command(h.command)[3], "/verified")
       local found = false
       for _, watch in ipairs(observed) do
@@ -1008,8 +1025,9 @@ t.describe("frozen batch startup runtime", function()
       h.descriptor.lookup_roots = { root .. "/lookup" }
       h.opts.probe_direct = nil
       h.prepare(); h.describe()
-      t.assert_true(vim.wait(2500, function() return #h.calls == 2 or #h.roots == 1 end, 10))
-      if #h.calls ~= 2 then t.skip("direct watch capability", "host probe did not prove all event types"); return end
+      if not await_watch_probe(h, "direct-watch-unavailable") then
+        t.skip("direct watch capability", "actual host probe rejected the backend; original-view fallback verified"); return
+      end
       h.validate()
       t.assert_contains(runtime.command(h.command)[3], "/verified")
     end)
@@ -1026,16 +1044,17 @@ t.describe("frozen batch startup runtime", function()
       h.descriptor.exclude_roots = { root .. "/cache" }
       h.opts.probe_recursive, h.opts.watch_factory, h.opts.schedule = nil, nil, nil
       h.prepare(); h.describe()
-      t.assert_true(vim.wait(2000, function() return #h.calls == 2 or #h.roots == 1 end, 10))
-      if #h.calls == 1 then t.skip("recursive runtime event filtering", "host capability unavailable"); return end
+      if not await_watch_probe(h, "recursive-watch-unavailable") then
+        t.skip("recursive runtime event filtering", "actual host probe rejected the backend; original-view fallback verified"); return
+      end
       h.calls[2].callback(h.result())
-      t.assert_true(vim.wait(1000, function() return #h.roots == 1 end, 10))
+      t.assert_true(vim.wait(5000, function() return #h.roots == 1 end, 10))
       vim.fn.writefile({ "index shard" }, root .. "/cache/new.idx")
       vim.fn.writefile({ "unrelated phase progress" }, root .. "/artifacts/progress.log")
       vim.wait(100, function() return false end, 10)
       t.assert_contains(runtime.command(h.command)[3], "/verified")
       vim.fn.writefile({ "changed" }, source)
-      t.assert_true(vim.wait(1000, function() return #h.restarts > 0 end, 10))
+      t.assert_true(vim.wait(5000, function() return #h.restarts > 0 end, 10))
       t.assert_true(vim.deep_equal(runtime.command(h.command), h.command))
     end)
   end)
@@ -1052,20 +1071,51 @@ t.describe("frozen batch startup runtime", function()
       h.descriptor.exclude_roots = { frozen_dir .. "/.cache", root .. "/frozen-cache" }
       h.opts.probe_recursive, h.opts.watch_factory, h.opts.schedule = nil, nil, nil
       h.prepare(); h.describe()
-      t.assert_true(vim.wait(2500, function() return #h.calls == 2 or #h.roots == 1 end, 10))
-      if #h.calls == 1 then t.skip("cold frozen cache notifications", "host capability unavailable"); return end
+      if not await_watch_probe(h, "recursive-watch-unavailable") then
+        t.skip("cold frozen cache notifications", "actual host probe rejected the backend; original-view fallback verified"); return
+      end
       h.calls[2].callback(h.result())
-      t.assert_true(vim.wait(1000, function() return #h.roots == 1 end, 10))
-      local cmd = runtime.configure_process(runtime.command(h.command), {})
+      t.assert_true(vim.wait(5000, function() return #h.roots == 1 end, 10))
+      local config = {}
+      local cmd = runtime.configure_process(runtime.command(h.command), config)
       t.assert_contains(cmd[3], "/verified")
+      local client = { id = 811, config = config, request = function() return true, 1 end }
+      runtime.attach(client, 0)
+      local guard = assert(client._ue_batch_guard).guard
+      t.assert_eq(guard:status().state, "ready")
       -- Exercise the first local-cache creation and shard write that startup
       -- performs. Real parent notifications must not revoke a fresh activation.
       vim.fn.mkdir(cache, "p")
       vim.fn.writefile({ "first shard" }, cache .. "/first.idx")
       vim.wait(150, function() return false end, 10)
-      t.assert_contains(runtime.command(h.command)[3], "/verified", "own first cache write revoked activation")
+      local selected = runtime.command(h.command)
+      local evidence = ""
+      if not selected[3]:find("/verified", 1, true) then
+        local state = guard:status()
+        local event = state.event or {}
+        local fs = require("ue.core.fs")
+        local function relative(path)
+          if type(path) ~= "string" then return path end
+          path = vim.fs.normalize(path)
+          if path == root then return "." end
+          if fs.path_has_prefix(path, root) then return path:sub(#root + 2) end
+          return fs.is_absolute_path(path) and "<outside-fixture>" or path
+        end
+        local target = event.filename and (fs.is_absolute_path(event.filename) and event.filename
+          or vim.fs.joinpath(event.root or root, event.filename))
+        local resolved = target and vim.uv.fs_realpath(target)
+        event.root, event.filename = relative(event.root), relative(event.filename)
+        evidence = ": " .. vim.json.encode({ reason = state.reason, state = state.state, event = event,
+          resolved_filename = relative(resolved),
+          root_is_canonical = vim.fs.normalize(assert(vim.uv.fs_realpath(root))) == root,
+          cache_is_canonical = vim.fs.normalize(assert(vim.uv.fs_realpath(cache))) == cache,
+          cache_is_excluded = fs.path_has_prefix(cache, h.descriptor.exclude_roots[1]),
+          validation_calls = #h.calls })
+      end
+      t.assert_contains(selected[3], "/verified", "own first cache write revoked activation" .. evidence)
       vim.fn.writefile({ "[{}]" }, h.descriptor.verified_cdb)
-      t.assert_true(vim.wait(1000, function() return #h.restarts > 0 end, 10))
+      -- Real fs events are delivered asynchronously; allow for host load.
+      t.assert_true(vim.wait(5000, function() return #h.restarts > 0 end, 10))
       t.assert_true(vim.deep_equal(runtime.command(h.command), h.command), "database writes must still invalidate")
     end)
   end)
@@ -1156,10 +1206,11 @@ t.describe("frozen batch startup runtime", function()
       h.descriptor.input_roots = { root .. "/include/subdir" }
       h.opts.probe_recursive, h.opts.watch_factory, h.opts.schedule = nil, nil, nil
       h.prepare(); h.describe()
-      t.assert_true(vim.wait(2000, function() return #h.calls == 2 or #h.roots == 1 end, 10))
-      if #h.calls == 1 then t.skip("recursive ancestor rename", "host capability unavailable"); return end
+      if not await_watch_probe(h, "recursive-watch-unavailable") then
+        t.skip("recursive ancestor rename", "actual host probe rejected the backend; original-view fallback verified"); return
+      end
       h.calls[2].callback(h.result())
-      t.assert_true(vim.wait(1000, function() return #h.roots == 1 end, 10))
+      t.assert_true(vim.wait(5000, function() return #h.roots == 1 end, 10))
       t.assert_contains(runtime.command(h.command)[3], "/verified")
       local fs = require("ue.core.fs")
       local owned = vim.fs.normalize(assert(vim.uv.fs_realpath(root)))
@@ -1168,7 +1219,7 @@ t.describe("frozen batch startup runtime", function()
       t.assert_true(fs.path_has_prefix(source, owned) and fs.path_has_prefix(target, owned),
         "directory rename must stay within this fixture's resolved owned root")
       assert(vim.uv.fs_rename(source, target))
-      t.assert_true(vim.wait(1000, function() return #h.restarts > 0 end, 10))
+      t.assert_true(vim.wait(5000, function() return #h.restarts > 0 end, 10))
       t.assert_true(vim.deep_equal(runtime.command(h.command), h.command))
     end)
   end)
@@ -1189,18 +1240,14 @@ t.describe("frozen batch startup runtime", function()
     end)
   end)
 
-  t.it("the default recursive capability probe observes a real nested event before validation", function()
+  t.it("the default recursive capability probe proves a nested event or retains original commands", function()
     fixture(function(h)
       h.opts.probe_recursive = nil
       h.opts.schedule = nil
       h.prepare(); h.describe()
-      t.assert_true(vim.wait(2000, function() return #h.calls == 2 or #h.roots == 1 end, 10))
-      if #h.calls == 1 then
-        t.skip("native recursive watcher", "runtime probe proved recursion unavailable")
-        return
-      end
+      if not await_watch_probe(h, "recursive-watch-unavailable") then return end
       h.calls[2].callback(h.result())
-      t.assert_true(vim.wait(1000, function() return #h.roots == 1 end, 10))
+      t.assert_true(vim.wait(5000, function() return #h.roots == 1 end, 10))
       t.assert_contains(runtime.command(h.command)[3], "/verified")
     end)
   end)

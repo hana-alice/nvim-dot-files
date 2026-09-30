@@ -70,5 +70,5 @@ readiness 磁盘自愈（`_recover`），以及结合实际发布变化和 reade
 `../../../docs/health-check-2026-07.md`（F1 切分大纲）、
 `../../../docs/architecture/overview.md`。
 
-**治理 spec**（可观察行为的权威；与本文冲突时以 spec 为准）：
+**治理 spec**（大方向与选型/踩坑；实现细节以代码与回归为准）：
 `../../../openspec/specs/cpp-semantic-index-coverage/spec.md`。

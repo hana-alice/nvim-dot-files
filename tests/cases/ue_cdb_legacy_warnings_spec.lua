@@ -15,6 +15,10 @@ local function python_test(body, extra)
   vim.list_extend(argv, extra or {})
   local result = vim.system(argv, { text = true }):wait(30000)
   os.remove(script)
+  if result.code == 77 then
+    t.skip("native warning contrast", result.stdout, { native = true })
+    return
+  end
   t.assert_eq(result.code, 0, result.stderr or result.stdout)
 end
 
@@ -232,7 +236,10 @@ t.describe("legacy Android warning native evidence", function()
 import subprocess, tempfile
 compiler, clangd = sys.argv[2:4]
 version = subprocess.run([clangd, '--version'], capture_output=True, text=True, timeout=5)
-assert version.returncode == 0 and policy.supported_version(version.stdout), version.stdout
+assert version.returncode == 0, version.stdout + version.stderr
+if not policy.supported_version(version.stdout):
+    print('native warning contrast requires the reviewed clangd 22.1 profile; selected tool: ' + version.stdout.strip())
+    raise SystemExit(77)
 with tempfile.TemporaryDirectory(prefix='legacy-warning-native-') as folder:
     source = Path(folder) / 'Warnings.cpp'
     source.write_text('int legacy(int n) { int assigned = 0; assigned = n; int values[n]; values[0] = n; return values[0]; }\n')
@@ -303,7 +310,7 @@ with tempfile.TemporaryDirectory(prefix='legacy-warning-native-') as folder:
     python_test(fixture .. [=[
 import json, tempfile
 from unittest.mock import patch
-compiler = Path(sys.argv[2]).resolve()
+compiler = Path(sys.argv[2]).absolute()
 root = compiler.parent.parent
 with tempfile.TemporaryDirectory(prefix='legacy-warning-driver-') as folder:
     path = Path(folder) / 'compile_commands.json'
@@ -319,7 +326,7 @@ with tempfile.TemporaryDirectory(prefix='legacy-warning-driver-') as folder:
     with patch.object(policy.subprocess, 'run', wraps=actual_run) as probe:
         result = policy.apply_policy(path, CLANGD)
         assert probe.call_count == 1, (probe.call_count, result, entries)
-        assert probe.call_args.args[0] == [str(compiler), '--version']
+        assert probe.call_args.args[0] == [str(compiler.resolve()), '--version']
     assert not result['changed'] and result['added'] == 0
     assert result['outcomes']['unsupported-build-compiler'] == 2
     assert path.read_bytes() == before and path.stat().st_mtime_ns == stamp

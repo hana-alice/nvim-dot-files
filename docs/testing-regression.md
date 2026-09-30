@@ -59,13 +59,12 @@ fail-closed 语义），禁止注入假可执行文件/假宿主让断言「碰�
 - **冻结清单同步**：`commands_spec.lua` 的 `UE_COMMANDS`、`structure_spec.lua` 的目录清单等，
   在相关项变化时必须同步，否则回归会 FAIL（这是有意的防误删契约）。
 - **changelog 联动**：改动完成后在 `docs/changelog.md` 追加记录，其 Validation 字段写明
-  **所跑回归范围（filter 或全量）与结果**，以及本次 **spec 一致性处置**
-  （同步 spec / 立 change / 判定无 spec 影响）。
+  **所跑回归范围（filter 或全量）与结果**；动了 spec 时注明。
 - **反馈验收**：涉及已有探针的行为修复必须声明新的观察 revision，核实对应 topic 的 revision/armed 状态，
   并在 Validation 中区分 fixture 已验证、观察已开启和现场已验证。不得以“没有新记录”替代覆盖检查，
   不得把开启观察窗口写成现场修复已经确认。
-- **spec 一致性联动**：改动改变了 `openspec/specs/<capability>/spec.md` 已声明的可观察行为时，
-  MUST 同步该 spec 或立一个承载该变更的 change；发现 spec 落后于已验证正确的实现时**反向更正 spec**。
+- **spec 轻量联动**：spec 只规定大方向并记录选型/踩坑/重要事项；仅当改动改变大方向或产生值得留底的
+  选型/踩坑时更新对应 `openspec/specs/<capability>/spec.md`（直接改，不强制立 change）。
   权威：`openspec/specs/spec-authority-loop/spec.md`、根 `AGENTS.md` 的 Definition of Done 第 2 条。
 
 ## 一键全量回归

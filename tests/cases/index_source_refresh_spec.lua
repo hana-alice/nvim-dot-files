@@ -182,6 +182,7 @@ t.describe("native unchanged-CDB source refresh", function()
     require("ue.index._clangd")(m, core)
     local root = vim.fn.tempname():gsub("\\", "/") .. "_source_refresh"
     vim.fn.mkdir(root .. "/environment", "p")
+    root = assert(vim.uv.fs_realpath(root)):gsub("\\", "/")
     local consumer, impl, wrapper = root .. "/consumer.cpp", root .. "/impl.cpp", root .. "/Module.cpp"
     ctx.project_root, ctx.paths.semantic_cdb = root, root .. "/compile_commands.json"
     vim.fn.writefile({ "int target();", "int consume(){return target();}" }, consumer)

@@ -1,39 +1,34 @@
-# C++ Semantic Index Coverage Specification
+# cpp-semantic-index-coverage Specification
 
 ## Purpose
 
-定义 C++ 语义导航所消费的 clangd 索引覆盖合同，使快速增量索引能够提升新鲜度而不会缩窄已知定义集合，并让每次跳转都能证明其 active build、CDB、toolchain 与索引 generation 来源。
+定义 C++ 语义导航所消费的 clangd 索引覆盖合同：快速增量索引必须能够提升新鲜度而不缩窄已知
+定义集合，每次跳转都必须能证明其 active build、CDB、toolchain 与索引 generation 来源。本
+capability 管辖 SuperUnity 二次合并、build generation 的覆盖单调性、readiness 的可证伪性、
+冻结批次激活的失效保护，以及 prepare 交付语义；不管具体加速比数字，只管「不得静默退化」与
+「结论必须可验证」两条底线。
+
 ## Requirements
+
 ### Requirement: SuperUnity acceleration SHALL not silently regress
 
 索引改动 SHALL 同时保留编译语义、真实覆盖与 SuperUnity 的实际加速能力；替换二次合并策略
-SHALL 用相同真实 build 的实测证明等效性能。全量 exact fallback MAY 临时保住正确性，
-但性能退化未处置时 MUST NOT 报告修复完成。所有 agent 的直接执行约束见根 `AGENTS.md`
-的 SuperUnity 性能硬约束；发现它 MUST NOT 依赖阅读本 spec。
-
-#### Scenario: A stricter correctness gate rejects previous grouping
-- **WHEN** 参数校验、平台兼容或 prepare 变换使原分组失效
-- **THEN** 系统/验收 SHALL 明示分组退化，并修复可证明兼容的分组或提供经真实工程验收的等效加速
-- **AND** MUST NOT 通过忽略语义冲突强行合并，或仅凭功能回归全绿宣称性能已恢复
+SHALL 用相同真实 build 的实测证明等效性能。全量 exact fallback MAY 临时保住正确性，但性能
+退化未处置时 MUST NOT 报告修复完成。所有 agent 的直接执行约束见根 `AGENTS.md` 的 SuperUnity
+性能硬约束；发现它 MUST NOT 依赖阅读本 spec。
 
 #### Scenario: Reporting a performance repair
 - **WHEN** 报告索引性能修复完成
-- **THEN** SHALL 对照最近可验证的正常实现，报告当前 build 的源覆盖、UBT/二次合并/exact/shader 分类与实际完成耗时、CPU/内存影响
-- **AND** SHALL 区分冷/热缓存与首次/重复 prepare，MUST NOT 把 CDB 记录数或进度分母当作完成耗时
-- **AND** 输入未变时 SHALL 保持产物与 clangd 生命周期稳定，不能用丢覆盖或清缓存制造好数字
-
-#### Scenario: A current or hot phase only reorders already published unique files
-- **WHEN** same-generation phase publication proposes exactly the same complete commands for uniquely identified files, changing only their cross-file order
-- **THEN** publication SHALL preserve the existing database bytes, mtime and running clangd client; it SHALL report unchanged
-- **AND** this rule SHALL also preserve unchanged frozen batch databases and activation metadata after their existing proof checks
-- **AND** initial publication and actual added/removed/changed commands SHALL still use the new current/hot priority order
-- **AND** multiple commands for the same normalized file SHALL retain order-sensitive comparison; a global command multiset MUST NOT erase build-context selection order
+- **THEN** SHALL 对照最近可验证的正常实现，报告当前 build 的源覆盖、UBT/二次合并/exact/
+  shader 分类与实际完成耗时、CPU/内存影响
+- **AND** SHALL 区分冷/热缓存与首次/重复 prepare，MUST NOT 把 CDB 记录数或进度分母当作完成
+  耗时或加速证据
 
 ### Requirement: Secondary batches SHALL preserve independently proven compiler semantics
 
 系统 MAY 将同模块、完整编译上下文相同的 compiler-authored UBT 组再次合并；MUST NOT 合并宏、
-include、target 或 PCH 参数以制造兼容性。每个候选 SHALL 与各原 UBT **独立缓存**产生的完整
-BackgroundIndex 图比较，保留真实文件、定义、符号身份、关系和引用。共享缓存的缺失记录、
+include、target 或 PCH 参数以制造兼容性。每个候选 SHALL 与各原 UBT 独立缓存产生的完整
+BackgroundIndex 图比较，保留真实文件、定义、符号身份、关系和引用；共享缓存的缺失记录、
 `--check` 零诊断、CDB 条目数或进度结束都 MUST NOT 代替此证明。
 
 #### Scenario: A candidate changes a binding without a compiler error
@@ -41,684 +36,100 @@ BackgroundIndex 图比较，保留真实文件、定义、符号身份、关系�
 - **THEN** 候选 SHALL 被拒绝，并完整保留其原 UBT 命令
 - **AND** MAY 调整候选顺序后重新证明，MUST NOT 为通过门禁任意重映射 SymbolID
 
-#### Scenario: Original commands use an owned Windows filename identity overlay
-- **WHEN** secondary qualification consumes a prepared command with the validated filename-canonicalization overlay
-- **THEN** original native runs SHALL retain that option and qualification SHALL bind its exact bytes and lookup inventory
-- **AND** a frozen candidate SHALL preserve the canonical original file URIs while reading only its closed, verified snapshot; a live-file fallback MUST NOT escape the snapshot
-- **AND** foreign or altered VFS inputs SHALL remain unsupported, and this compatibility support MUST NOT waive the full semantic comparison
+### Requirement: Active semantic index coverage SHALL be monotonic within an immutable build generation
 
-#### Scenario: Equal header bytes belong to different compiler files
-- **WHEN** different source headers have equal bytes but distinct file identities under the active compiler filesystem
-- **THEN** freezing SHALL retain distinct snapshot identities so `#pragma once` cannot suppress a header that the real compiler would read
-- **AND** actual aliases SHALL preserve the active compiler's alias behavior; equal bytes or a cross-platform inode assumption MUST NOT substitute for that behavior
-- **AND** a changed source identity SHALL invalidate cached evidence even when its bytes remain equal
-
-#### Scenario: Compiler metadata differs after declarations merge
-- **WHEN** 同一符号的前置声明与定义记录在 language 或 include provider 上不同
-- **THEN** 比较 SHALL 遵循已验证的 clangd 定义优先规则
-- **AND** 新 include provider SHALL 来自原输入头文件，在单一原 TU 的依赖闭包中到达已有声明；原 provider 提供定义时新 provider 也 SHALL 到达该定义
-- **AND** 未解析的 literal include、新输入头、失去全部建议或指令模式变化 SHALL 被拒绝
-
-#### Scenario: A batch exposes an additional reference
-- **WHEN** 候选产生原独立图中没有的引用
-- **THEN** SHALL 在所有原本包含该文件的原 UBT AST 中证明 target、role、container 与位置
-- **AND** 缺失 native 能力、任一上下文不同或只在合并 TU 中查询 SHALL 拒绝候选
-
-#### Scenario: Printed template arguments differ while typed compiler arguments agree
-- **WHEN** class-template partial specialization records differ only in their printed `template_specialization_args`
-- **THEN** the system MAY accept that field difference only after native compiler proof of the complete ordered argument kinds, parameter identities, types and values in every original TU containing the declaration and in the candidate
-- **AND** proof SHALL use each main shard's effective command and bind the exact original/candidate records, declaration identities and locations, input/tool/profile identities and all required contexts; raw argv or a matching SymbolID alone MUST NOT substitute for proof
-- **AND** the supported proof SHALL check integral parameter type and width before reading its value, preserve integer precision, and prove type-parameter bindings by declaration identity; dependent expressions, unsupported kinds/widths, ambiguous or missing declarations and compiler errors SHALL fail closed
-- **AND** raw graphs SHALL remain unchanged; missing references, relation/source/definition/completion changes or other identity differences SHALL still reject before expensive template proof runs
-- **AND** request/result assets SHALL be hashed into the receipt; changed evidence or policy SHALL invalidate cache-only reuse, which MUST NOT rerun the native proof
-- **AND** accepted semantic equivalence SHALL NOT be reported as identical printed metadata or restored indexing performance
-
-#### Scenario: The same inputs are prepared again
-- **WHEN** 已有成功或语义拒绝的证明，输入未变化
-- **THEN** MAY 复用 receipt，但 SHALL 重新验证完整命令、工具/策略身份、输入/冻结产物字节与 include 目录名称清单
-- **AND** 输入同 mtime 换字节、新增条件头文件、产物损坏或工具变化 SHALL 使旧证明失效
-- **AND** 首次证明成本与重复验证耗时 SHALL 分开报告，MUST NOT 把首次成本藏入缓存
-
-#### Scenario: A proof helper imports its filename identity policy for the first time
-- **WHEN** qualification or offline generated-batch tooling loads the owned filename identity policy from a writable source directory
-- **THEN** the caller SHALL disable Python bytecode writes before importing that policy or its project dependencies, so first import does not itself alter a monitored lookup inventory
-- **AND** the rule SHALL hold without requiring the launcher to supply `-B`; actual source changes and existing inventory mismatches SHALL still invalidate receipts
-- **AND** this prevention MUST NOT delete existing bytecode, rewrite old receipts, or establish semantic or performance acceptance for any batch
-
-#### Scenario: Automatic delivery has no reusable proof
-- **WHEN** automatic current/hot/full delivery encounters a missing, stale or policy-incompatible receipt
-- **THEN** it SHALL retain the original UBT commands, report deferred verification, and MUST NOT start cold compiler proofs or graph replay in the delivery path
-- **AND** a separate explicitly invoked proof run MAY produce receipts; its first-run cost SHALL remain visible in performance acceptance
-
-#### Scenario: A project delivers a qualified subset before broader optimization
-- **WHEN** a project/target selects an existing proof directory in `batch-store.json` adjacent to its semantic CDB (`schema: 1`, absolute `path`)
-- **THEN** automatic current/hot/full generation SHALL pass that directory to the existing cache-only verification path and SHALL retain every unselected original and shader record
-- **AND** both generators MAY accept `--verified-batch-store` only together with `--verified-batches` and `--reuse-verified-only`; the default store and original-wrapper directory SHALL remain unchanged when no selection exists
-- **AND** the selection SHALL grant no semantic authority: current exact commands, compiler/profile/environment, dependencies, lookup inventories and frozen assets SHALL still pass the existing receipt checks
-- **AND** missing or stale receipts SHALL retain their original commands without cold qualification; malformed, relative or oversized selection metadata SHALL fail before generation while preserving published artifacts
-- **AND** the selected proof directory SHALL remain available for the lifetime of its published receipts; receipts and bound assets MUST NOT be rewritten merely to relocate proof ownership
-- **AND** a verified incremental version MAY be delivered with explicit measured scope and remaining optimization work, without claiming whole-engine performance restoration or waiving coverage, fallback and unchanged-prepare checks
-
-#### Scenario: Compatible Unity groups are packed into a larger SuperUnity
-- **WHEN** compiler-authored UBT groups belong to the same module and complete compile context
-- **THEN** candidate planning SHALL preserve their original order and indivisible membership, bounded by both original-TU count and total member-source count
-- **AND** generated sources SHALL count toward the same source budget; oversized originals and exact commands SHALL remain available without being dropped
-- **AND** an explicit qualification run MAY subdivide a semantically rejected candidate and reuse valid independent original-TU evidence; automatic cache-only delivery MUST NOT start these cold qualifications
-
-#### Scenario: A different candidate reuses an independently indexed original TU
-- **WHEN** an original TU already has complete independent graph evidence
-- **THEN** qualification MAY reuse it only after checking its original entry, native effective command, compiler/profile/environment, complete dependencies, lookup inventories and stored assets
-- **AND** persisted evidence SHALL bind the native source digests to the actual source bytes; a successful frozen candidate with matching source digests and unchanged SHA-bound snapshots MAY establish that association even when later semantic admission rejects the candidate
-- **AND** an unlinked source digest or failed candidate compilation MUST NOT certify a newly collected original graph for persistent reuse
-- **AND** historical collection cost SHALL remain recorded separately from the new candidate's actual compilation cost
-
-#### Scenario: A proven group is noncontiguous in the full input
-- **WHEN** a previously accepted ordered group is present among other compatible original UBT entries
-- **THEN** cache-only discovery MAY use bounded compact selection hints without scanning all proof graphs or rejected records
-- **AND** a hint SHALL remain untrusted: exact current entries, module/context, the existing proof cache key, compiler/policy identities, receipt originals and all existing input/asset validations SHALL still match
-- **AND** the configured maximum group size SHALL remain a hard limit; selected groups SHALL not overlap, and every unselected original entry SHALL remain present
-- **AND** planning additional candidates SHALL first exclude already selected originals, then pack the remaining compatible entries; overlap with an accepted hint MUST NOT hide otherwise eligible unclaimed groups
-- **AND** invalid, stale, oversized or absent hints SHALL NOT authorize a batch or start a cold proof during automatic delivery
-
-#### Scenario: Experimental ordered candidates are not admitted batches
-- **WHEN** an offline candidate producer explores secondary groups with explicit module Definitions headers
-- **THEN** it SHALL preserve the original ordered PCH/compiler prefix and replay Definitions after that prefix, isolate touched macros, and keep differing feature macro states in separate groups
-- **AND** candidates SHALL classify actual member files and keep generated-only and implementation-only originals in separate groups; originals containing both classes SHALL remain unchanged
-- **AND** candidates SHALL preserve original ordering within each class and each Unity's internal order, retaining complete original ownership and coverage; moving generated specializations ahead of implementation calls MUST NOT manufacture compatibility
-- **AND** unsupported headers, ambiguous membership and oversized originals SHALL remain unchanged; unchanged inputs SHALL NOT rewrite candidate artifacts
-- **AND** candidate generation and syntax-only success SHALL NOT authorize production publication, stand in for independent semantic proof, or be reported as restored full-index performance
-
-#### Scenario: Generated-only grouping passes source-local checks but loses header targets
-- **WHEN** an offline generated-only candidate preserves source-local reference records and definitions of symbols declared in source shards
-- **THEN** qualification SHALL also check the global availability and definitions of every referenced target ID, including targets declared only in headers
-- **AND** a missing header target SHALL reject publication; unchanged reference tuples, zero reference counts, symbol flags or speed improvements MUST NOT waive the loss
-- **AND** `build_super_unity_cdb.build_generated_batches` SHALL remain an offline candidate API until full semantic and performance acceptance succeeds; it MUST NOT be enabled automatically merely because generation fixtures pass
-
-### Requirement: Synthetic shader donors SHALL use their existing compatibility navigation
-
-Shader augmentation MAY retain editor donor commands in the active and phase semantic CDBs. Only records
-proven to have been actually added by that producer, and sealed against the exact final cwd/source/argv,
-MAY be routed away from C++ BackgroundIndex. The source coverage evidence and existing shader GTAGS
-definition/reference paths SHALL remain intact; this does not claim HLSL compiler semantics.
-
-#### Scenario: A native shader command already exists
-- **WHEN** a shader path already has a compiler-authored command, including a relative path resolved against its cwd
-- **THEN** augmentation MUST NOT mark it as a synthetic donor, and publication SHALL retain it
-- **AND** suffix, a command resembling the donor template, or an old receipt MUST NOT override fresh native provenance
-
-#### Scenario: A sealed synthetic command changes
-- **WHEN** donor provenance is absent, ambiguous, malformed, or does not match the complete final command
-- **THEN** the background view SHALL retain that command; shader suffix alone MUST NOT authorize exclusion
-
-#### Scenario: Publishing a proven compatibility donor
-- **WHEN** producer provenance and the final command match
-- **THEN** original and frozen background views SHALL apply the same route and report native tasks separately from shader compatibility records
-- **AND** active/phase semantic commands and GTAGS input SHALL retain the shader; partial C++ error-recovery workspace symbols are not a supported shader semantic index
-
-### Requirement: Frozen batch activation SHALL be guarded and preserve the original semantic authority
-
-默认发布路径 SHALL 始终保留原 UBT/exact CDB。冻结批次 SHALL 使用独立 CDB 和独立 shard 缓存，
-phase manifest SHALL 绑定独立原始 semantic CDB 的路径与内容。native definition 查询 MUST NOT
-把二次合并 AST 当作原始编译上下文。
-
-#### Scenario: An editor starts with persisted frozen batches
-- **WHEN** 新进程发现批次产物
-- **THEN** SHALL 先建立经过宿主能力验证的输入监听，再异步验证 receipts 和发布内容，成功后才选择冻结 CDB
-- **AND** 主循环 MUST NOT 扫描依赖或同步计算大型 CDB/hash；能力缺失或验证失败 SHALL 使用原 UBT CDB
-
-#### Scenario: Windows validation reads its own watched input directories
-- **WHEN** reading inputs updates only their last-access timestamps
-- **THEN** the Windows frozen-input watcher SHALL exclude LAST_ACCESS at the native subscription, without revoking otherwise current batch authority
-- **AND** it SHALL retain filename, directory-name, attributes, size, last-write, creation and security notifications; source-only notification filtering MUST NOT substitute for this input guard
-- **AND** recursive and direct capability probes SHALL exercise the selected backend and notification profile on owned temporary inputs
-- **AND** asynchronous watch registration SHALL remain unavailable for batch authority until every required root acknowledges that its native subscription is armed
-- **AND** early input events, unavailable roots, overflow, helper exit, malformed notifications and readiness failure SHALL revoke authority, including during partial installation
-- **AND** grouped native watches SHALL share one parent-bound helper per activation, respect the existing root budgets and release the whole group on invalidation or cancellation; pending, duplicate or late readiness MUST NOT start validation
-
-#### Scenario: A subscribed ordinary directory receives only a write notification
-- **WHEN** the Windows grouped backend separates namespace/attributes/creation/security (`0x147`) from size/last-write (`0x18`) notifications
-- **THEN** each root SHALL acknowledge readiness only after both subscriptions are armed; either stream's errors or overflow SHALL revoke authority
-- **AND** activation SHALL install actual parent-entry watches for ancestors of every protected recursive root, as well as lexical driver lookup ancestors, within the existing recursive/direct root budgets
-- **AND** runtime MAY ignore a write-stream action 3 only for an exact subscribed directory whose nonzero device/inode and ordinary, non-reparse attributes still match the backend's initial `lstat` identity, under the explicit `stable-directory-write-v1` descriptor policy
-- **AND** validation SHALL bind that policy and the full installed topology; unknown policy, legacy/unclassified notifications, files, unsubscribed directories, changed identities, metadata and namespace notifications SHALL retain conservative invalidation
-- **AND** ignored directory writes SHALL NOT trigger revalidation, CDB rewriting or a clangd restart; source-only subscriptions SHALL remain unchanged
-- **AND** notification coverage MUST NOT be reported as complete reparse protection: an in-place reparse-target change that the host does not notify remains an explicitly recorded capability gap, not evidence of unchanged identity
-
-#### Scenario: A frozen database has no local shard-cache directory yet
-- **WHEN** startup is preparing a frozen database whose owned local cache tree does not yet exist
-- **THEN** runtime SHALL create the canonical `verified/.cache/clangd/index` directory tree before installing input watches, deriving its location from the original semantic CDB rather than an arbitrary descriptor path
-- **AND** existing directories and shard contents SHALL remain untouched; conflicting files, redirected components, an unexpected frozen CDB path or creation failure SHALL retain the original CDB
-- **AND** this preparation SHALL NOT bypass receipt validation or ignore content, namespace, metadata or unclassified ancestor notifications; only the separately specified stable-directory write policy MAY suppress classified ancestor writes, and first cache writes within the existing excluded tree SHALL not revoke otherwise current authority
-
-#### Scenario: A new frozen shard cache is seeded from the original cache
-- **WHEN** the owned frozen `verified/.cache/clangd/index` directory exists and holds no `*.idx` shard while the original semantic CDB's `.cache/clangd/index` holds shards
-- **THEN** runtime SHALL, before any input watch or frozen client starts, add only shard names absent from the frozen cache by hard link (or exclusive-create copy across volumes), skipping temporary `.temp-stream-` files
-- **AND** it MUST NOT modify, delete or rename any original shard or any shard already present in the frozen cache, and SHALL leave no truncated copy on failure; clangd rewrites shards by temporary file plus rename, so a later frozen rewrite replaces only the frozen directory entry
-- **AND** the seed outcome SHALL NOT grant or revoke frozen authority: seeding failure, a missing helper or a timeout SHALL continue startup with the unseeded cache, and receipt validation and watches SHALL proceed unchanged
-- **RATIONALE** retained frozen commands equal original commands byte-for-byte (activation coverage), clangd 22 keys shards by source path and judges staleness by content digest only, so original shards are valid for retained TUs; batch TUs have new paths and are indexed normally. On an isolated copy of an Android target cache, cold indexing of the frozen CDB took ≈1714 s wall / 12.9k CPU s, versus ≈42 s wall after seeding. These are isolated indexing measurements; successful guarded activation, client switching and indexing with valid receipts remain unverified.
-
-#### Scenario: The server uses a query-driver profile not covered by the proof
-- **WHEN** effective server arguments contain a nonempty query-driver allowlist and receipts do not certify that driver-query profile
-- **THEN** automatic build/activation SHALL retain original UBT commands and preserve the user's server arguments and environment
-- **AND** prepare SHALL reject the profile before expensive validation; a ready metadata cache or a directly supplied verified path MUST NOT bypass this check
-- **AND** the system MUST NOT delete query-driver options merely to make frozen batches eligible
-
-#### Scenario: Inputs change while references or rename is in flight
-- **WHEN** 受监视的源码、头文件、工具、lookup 目录或冻结产物发生变化
-- **THEN** SHALL 立即撤销该客户端的批次 epoch，拒绝新的 references/rename/prepareRename 与迟到的旧结果
-- **AND** SHALL 退回独立原 UBT 路径，并只重启受影响的本进程客户端；不得清理其他进程的缓存
-- **AND** an invalidation triggered by a watch callback SHALL retain the first triggering watch root, filename or error, and available event flags in bounded guard status and the normal warning log; later callbacks MUST NOT overwrite that evidence
-- **AND** returned evidence SHALL be an independent copy, oversized fields SHALL be explicitly marked truncated, and logging failure MUST NOT delay revocation or suppress fallback; ordinary accepted/ignored events SHALL NOT accumulate a trace
-
-#### Scenario: A later startup retries an input-event invalidation
-- **WHEN** a normal startup requests the same publication and generation after an `input-changed`, `live-document-modified`, `live-document-changed` or unattached `activation-abandoned` fallback
-- **THEN** it MAY retry only after a 30-second monotonic cooldown and confirmed completion of the previous activation helpers; cancellation alone MUST NOT establish completion
-- **AND** relevant loaded documents SHALL be clean before retry; a clean buffer SHALL NOT substitute for fresh validation of the on-disk inputs
-- **AND** retry SHALL repeat description, watch readiness and full receipt validation before granting authority; concurrent requests SHALL share the attempt and later input events SHALL still revoke it
-- **AND** each configured frozen client SHALL bind to its activation attempt; a late client from an older attempt MUST NOT acquire the fresh guard merely because the publication stamp matches
-- **AND** elapsed time without pending document recovery or a new startup request SHALL NOT launch helpers or restart clients; unchanged ready activations SHALL remain reusable without revalidation, and other failure reasons SHALL remain sticky for that publication
-
-#### Scenario: A loaded document already contains unsaved changes
-- **WHEN** a named, normal, loaded document is modified and is the requested buffer, already attached to a clangd client for the selected CDB, or admitted by the configured filetypes inside the selected engine/project roots
-- **THEN** startup SHALL retain original commands before metadata/generation work, validation helpers or watch installation; an initial blocked request SHALL NOT create a sticky failed activation
-- **AND** unrelated foreign, scratch and unsupported-filetype buffers SHALL NOT block merely because project selection is pinned; existing same-CDB attachments and explicit requests SHALL remain protected when their filetype changes
-- **AND** an already pending or ready activation SHALL revoke immediately when the document check detects an edit; description, watch installation after capability probing, validation, readiness, command-selection, process-configuration and attachment boundaries SHALL recheck documents so asynchronous edits cannot acquire frozen authority
-- **AND** late callbacks from cancelled description/probe work SHALL NOT replace the first document failure with a nonretryable failure; repeated dirty requests SHALL NOT extend the original cooldown or treat cancellation as helper completion
-- **AND** clearing a document SHALL NOT save/discard any user text or reuse invalid authority; clean demand and the bounded document-recovery coordinator SHALL run the normal complete activation and preserve generation, profile, environment and attempt checks
-- **AND** document checks SHALL inspect loaded buffer metadata and existing ownership only, without reading source contents, scanning dependency trees or resolving a project separately for every buffer
-
-#### Scenario: Previously modified documents become clean while an original reader remains active
-- **WHEN** a registered document-blocked CDB scope receives a buffer or client lifecycle event and its relevant documents are clean
-- **THEN** an event-driven coordinator MAY revalidate after a 200ms settling delay, the existing retry cooldown and actual helper completion; an original reader attaching after the clean event SHALL also wake recovery
-- **AND** the coordinator SHALL retain at most eight canonical CDB scopes, one cancelable timer per scope and one automatic validation at a time; failed callbacks SHALL NOT release that serial slot before helpers exit, and cancelled timer callbacks SHALL NOT consume a newer timer
-- **AND** the original reader SHALL remain running throughout full validation; before one scoped restart the coordinator SHALL recheck the exact reader object, attachment, command/configuration, context, generation, publication, effective environment and clean documents
-- **AND** promotion SHALL respect ordinary restart debounce, reuse successful validation while waiting, and require a matching frozen client attachment within 15 seconds; an external matching attachment SHALL also cancel the pending restart
-- **AND** redirty, lost context or changed identity SHALL abandon the candidate; non-document failures SHALL disarm automatic recovery, and late callbacks SHALL NOT promote abandoned attempts
-- **AND** cancellation SHALL apply only to the matching unattached activation attempt; runtime state notifications and detached scalar snapshots SHALL convey no proof authority
-- **AND** recovery SHALL NOT poll, rewrite CDBs, save/discard documents, clear caches, force a full index or restart unrelated clients
-
-#### Scenario: Frozen publication changes while a document-blocked original reader is unchanged
-- **WHEN** a successful phase publication changes frozen products or their metadata but explicitly confirms that original commands are unchanged
-- **THEN** index delivery SHALL retain the sole initialized, attached original reader for that CDB when relevant documents are modified and an existing idle document-recovery registration is waiting for that same scope
-- **AND** retention SHALL inspect actual client commands and loaded document metadata, start no helper or restart timer, and leave restart debounce untouched; a corresponding frozen reader or ambiguous reader ownership SHALL prevent this optimization
-- **AND** clean documents, missing recovery ownership, unknown command-change status, changed original commands, pending source refresh and frozen-authority invalidation SHALL retain their existing delivery behavior
-- **AND** later document-clean events SHALL still invoke normal complete validation and scoped promotion; retaining an original reader SHALL grant no frozen authority or permission to alter unsaved text
-
-#### Scenario: Certifying a supported driver-query profile
-- **WHEN** a secondary proof explicitly supports a nonempty query-driver profile
-- **THEN** all original and candidate compiler runs SHALL use the same supported server profile, actual launch cwd and compiler environment
-- **AND** native discovery SHALL identify the driver actually executed and bind its bytes, ordered system paths, target and builtin-header handling; PATH guessing or a recorded allowlist alone MUST NOT certify the profile
-- **AND** binding and VFS-alias proofs SHALL consume the original TU's structured main-shard effective command, retaining driver identity and semantic argument order; raw commands MUST NOT substitute for absent evidence
-- **AND** the profile SHALL bind cache/frozen/receipt identities, effective lookup roots SHALL be monitored, and activation SHALL asynchronously repeat native driver discovery after installing watches
-
-#### Scenario: Certifying the pinned Android NDK driver profile
-- **WHEN** the active Android CDB resolves the compiler to the pinned Android clang 9.0.9 build
-  (`7019983` / `r365631c3`, LLVM commit `a2a1e703c0edb03ba29944e529ccbf457742737b`)
-- **THEN** the LLVM 22.1.5 clangd query extractor MAY certify that driver as the explicit
-  `android-clang-9.0.9-build-7019983` profile
-- **AND** the exact driver version string, bytes, target, ordered system includes, builtin-header
-  handling, compiler environment and lookup roots SHALL remain bound in the evidence
-- **AND** any other Android/NDK version or build identity SHALL remain unsupported and retain the
-  original UBT commands until a separately reviewed profile is added
-- **AND** the version first line SHALL match the full reviewed build banner exactly; custom suffixes, changed build numbers or commits SHALL reject certification
-- **AND** compiler build identity MUST NOT be reported as an inferred NDK package release; a changed parser/profile identity SHALL invalidate older receipts
-
-#### Scenario: Driver lookup depends on directories outside source trees
-- **WHEN** native driver discovery can search executable candidates outside recursively monitored compiler inputs
-- **THEN** activation SHALL monitor those candidate names and their lexical ancestors, including the nearest existing ancestor of missing directories
-- **AND** direct directory watches SHALL be explicitly nonrecursive; their separate budget MUST NOT weaken the source-tree recursive-watch budget
-- **AND** installation SHALL yield between bounded batches and cancel on epoch invalidation; native validation MUST NOT start until all required watches are installed
-- **AND** a missing event filename, changed lookup candidate, renamed ancestor or unavailable required watch SHALL revoke the frozen selection
-- **AND** validation SHALL confirm the installed watch topology still matches its newly discovered requirements; a directory appearing between describe and watch installation MUST NOT leave an unmonitored lookup root eligible for activation
-
-#### Scenario: The effective compiler environment changes during activation
-- **WHEN** launch cwd, query profile or effective compiler environment differs from the snapshot being validated
-- **THEN** the pending frozen activation SHALL be rejected and the original UBT process configuration SHALL remain available
-- **AND** helper processes SHALL receive the exact merged environment, including variable removal, without accidentally inheriting removed variables
-- **AND** Windows process overrides SHALL preserve case-insensitive environment semantics; an unsupported RPC removal or cwd alias SHALL reject frozen activation rather than silently change user configuration
-- **AND** ambiguous duplicate environment keys SHALL reject certification; a certified process SHALL execute the absolute clangd path whose identity was validated, while fallback retains the original user command
-- **AND** command selection and process startup SHALL reject changed cwd, environment, query results or unsupported server flags while preserving user arguments and the original UBT fallback
-
-### Requirement: derived CDB 必须保留 active command 的编译语义
-
-full/current/hot 生成器 SHALL 只消费当前 active argv 明确引用且可验证的编译输入，MUST NOT 从源码路径猜测其他 target/platform/configuration 的 response、Definitions 或 UHT include。不能证明兼容时 SHALL 保留 exact command 或明确失败，不得把混合上下文作为 ready 产物发布。
-
-#### Scenario: Generated and ordinary sources belong to the same UBT module
-- **WHEN** UBT groups share the same compiler-owned module directory and complete compile context, and their members identify one unambiguous source module root
-- **THEN** generated `Inc/Module` members SHALL use that same portable module root rather than creating a separate synthetic module
-- **AND** source membership and commands SHALL remain unchanged; different compiler owners or ambiguous roots MUST NOT be combined by directory-name guesses
-
-#### Scenario: Android 与 Win64 Editor 中间产物共存
-- **WHEN** active CDB 属于 Android，而磁盘还存在 Win64 Editor 的 response/Definitions/UHT
-- **THEN** production default full pipeline SHALL 保留 Android 的语义 argv
-- **AND** MUST NOT 注入 Editor 宏或 include 路径
-
-#### Scenario: controlled CDB 显式依赖 Definitions 或 PCH
-- **WHEN** active argv 明确引用 Definitions header 或 PCH
-- **THEN** controlled Full/current pipeline SHALL 验证该显式文件存在，并保留原 argv 的条件宏与 PCH 语义
-- **AND** 文件缺失 SHALL 返回失败且不发布 ready marker；不能用邻近 Editor 文件补齐
-
-#### Scenario: PCH recipe has been generated but no binary was built
-- **WHEN** `tools/prebuild_pch_v2.py` 只生成 response/batch 配方，未执行并验证 PCH 编译
-- **THEN** 它 MUST NOT 将预期的 binary PCH 路径写入 active CDB；原文本 include 或原生编译参数 SHALL 保留
-- **AND** 修复历史污染时，只允许移除本生成器路径、已存在的匹配 recipe 与相邻原文本 include 共同证明的缺失 binary 引用；外部或 binary-only PCH MUST 保持严格校验
-
-#### Scenario: unity response 与 active command 矛盾
-- **WHEN** response 的宏、include、target、语言或 PCH 与 active command 不同
-- **THEN** unity 证明 SHALL 被拒绝，并使用 exact-command fallback
-- **AND** 比较 MAY 忽略仅影响输出位置的参数和规范化后的 source 占位
-- **AND** 已验证匹配的语义输入 MUST NOT 在最终 argv 中再次被删除
-
-#### Scenario: prepare transforms a compiler-authored unity command
-- **WHEN** the actual prepare pipeline changes compiler RSP arguments for editor use
-- **THEN** grouping MAY reuse exact final active argv only with an external receipt captured by that producer and sealed after the whole pipeline succeeds under its writer lease
-- **AND** the receipt SHALL bind the complete ordered unity membership, raw unity/RSP/nested-RSP content digests, and every member's initial and final exact cwd/source/argv hash
-- **AND** begin SHALL admit only matching captured or previously sealed commands; missing, conflicting or modified evidence SHALL retain exact per-file fallback, without re-signing arbitrary active edits
-- **AND** consumption SHALL revalidate dependency bytes, every member command and equal member contexts; no macro/include/PCH difference may be ignored to obtain a group
-- **AND** provenance SHALL remain outside native compilation databases, whose schema cannot contain private metadata
-
-#### Scenario: Sampled include pruning cannot prove preprocessing equivalence
-- **WHEN** only a sample of a module's sources has been scanned for textual includes
-- **THEN** default prepare SHALL retain the compiler's include search paths; sampled absence MUST NOT justify removing paths from every member's command
-- **AND** RSP traversal and active-bucket selection SHALL be deterministic for identical build inputs, respecting explicit target and valid persisted selection before a stable size/key fallback
-
-#### Scenario: Editor-only macros alter generated engine declarations
-- **WHEN** compiler-authored RSP parameters do not define `__INTELLISENSE__`
-- **THEN** prepare MUST NOT inject that macro: UE `UCLASS`/PROLOG expansion and generated event-parameter types SHALL retain the compiler's context
-- **AND** an explicit user/compiler definition SHALL remain intact; resulting real compiler errors MUST NOT be waived to admit a batch
-
-#### Scenario: 显式响应文件无法完整展开
-- **WHEN** active argv 的 response 文件缺失或循环引用
-- **THEN** 展开阶段 SHALL 保留整个原始 command，而不能发布部分展开的混合 argv
-
-### Requirement: Active semantic index coverage SHALL be monotonic within one build generation
-
-系统 SHALL 为每个 active build generation 记录可验证的 coverage 集合与等级。较窄的 current/hot 产物完成后 MUST NOT 替换、隐藏或降级同一 generation 中已经可用的较宽基线；只有覆盖集合为超集，或明确进入新的 build generation，才允许改变 active semantic coverage 的可见基线。full/current/hot 由 compiler-authored UBT unity wrapper / exact fallback CDB 提供，clangd 以 `--enable-config=false` 启动，并通过官方 `compilationDatabaseChanges` 接收当前文件的 exact commands。
-
-#### Scenario: Current refresh completes after a full baseline
-- **WHEN** 同一 build generation 已有 full controlled BackgroundIndex baseline，随后只覆盖当前模块的 current coverage 完成
-- **THEN** full 基线中的其他模块 body SHALL 继续可被 `gd` 查询
-- **AND** current 结果 SHALL 只作为更新层或新鲜度证据参与解析，不得把 active coverage 降为 current
+系统 SHALL 为每个 active build generation 记录可验证的 coverage 集合与等级，并至少绑定 active
+target/platform/configuration、CDB 内容 fingerprint、toolchain identity、manifest gate 与
+exact-command map 摘要。较窄的 current/hot 产物完成后 MUST NOT 替换、隐藏或降级同一 generation
+中已可用的较宽基线；只有覆盖集合为超集，或明确进入新的 build generation，才允许改变可见基线。
+导航请求开始后发生的 generation 切换 MUST 使旧响应 stale。
 
 #### Scenario: Hot and full phases finish out of scheduling order
 - **WHEN** hot、current、full 产物因异步执行或重试以任意顺序完成
-- **THEN** active coverage SHALL 按已证明的覆盖集合单调前进
-- **AND** 最后完成但覆盖更窄的产物 MUST NOT 成为唯一 active index
-- **AND** an equal proven module set MAY advance to a higher completed coverage level; a completed full phase MUST NOT remain labelled partial solely because the tracked module set did not change
+- **THEN** active coverage SHALL 按已证明的覆盖集合单调前进，最后完成但覆盖更窄的产物
+  MUST NOT 成为唯一 active index
 
-#### Scenario: Unchanged controlled input is prepared again
-- **WHEN** generated wrapper contents, standard published CDB entries and source inputs have not changed
-- **THEN** their paths, bytes and modification times SHALL remain stable; current/hot/full SHALL share wrapper paths for the same proven group
-- **AND** publication SHALL ignore JSON object key order and private metadata changes and MUST NOT request a compiler restart for unchanged published commands
-- **AND** rebuilding SHALL retain previously published wrappers and artifacts until replacement succeeds; it MUST NOT clear the live wrapper directory
-- **AND** prepare SHALL compare the successful final command digest across runs, rather than raw-to-processed modification times, before requesting restart; an unchanged verified digest supersedes a CDB-rewrite restart hint, not an actual source-content change
-- **AND** a phase CDB whose bytes no longer match its successful manifest MUST NOT replace the last published database, including when marker writing failed
-- **AND** raw generation, transformations and partition SHALL run in a staging transaction under the live writer lease; intermediate raw bytes MUST NOT reach the watched live CDB
-- **AND** identical final CDB, origin, receipt, partition and shard metadata SHALL retain their bytes and mtimes, including across processes with different map iteration order
-- **AND** manual partition/switch SHALL acquire the same writer lease; publication failure SHALL restore prior artifacts, retaining and reporting recovery backups if rollback itself fails
-- **AND** temporary generation and recipe writes SHALL stay outside monitored live roots; a missing event filename or watcher overflow MUST NOT be ignored to manufacture an unchanged result
+### Requirement: Readiness SHALL be provable from persisted artifacts and self-evidencing
 
-#### Scenario: Source dependencies change without changing compiler commands
-- **WHEN** an observed source/header changes bytes while its wrapper and CDB remain identical
-- **THEN** source refresh SHALL remain pending independently of command publication, including after a successful generator run
-- **AND** the affected project's clangd SHALL refresh its background dependencies; a watched-file notification or repeated identical compile-command notification alone MUST NOT be treated as proof of refresh
-- **AND** pending source revisions SHALL be acknowledged only after a new matching client attaches; failed/debounced restarts and changes arriving during restart SHALL remain pending for delivery
-- **AND** unrelated clients SHALL remain running, existing shard caches SHALL remain intact, and repeated equal source bytes or prepare bookkeeping alone MUST NOT trigger a restart
-
-#### Scenario: Source observation loses the changed filename
-- **WHEN** the captured project watcher reports overflow or another notification gap without a trustworthy filename
-- **THEN** the semantic owner SHALL keep an independent pending source revision and schedule a protected full delivery
-- **AND** it MUST NOT invent a source path/digest, erase caches, or acknowledge the gap merely because the CDB is unchanged
-- **AND** a newer gap during client restart SHALL remain pending after the older attachment completes
-
-#### Scenario: A source save schedules current and hot subsets from a large active CDB
-- **WHEN** current/hot delivery selects a small set of modules from a large active compilation database
-- **THEN** reading, JSON decoding, classifying and encoding that database SHALL execute outside the editor main thread, using the existing module classification and ordered selection semantics
-- **AND** the editor SHALL hand off only a small selection/context request; normalization and injection SHALL modify the isolated subset, never the active input
-- **AND** subset generation failure, parent loss or an input identity change detected before subset publication SHALL preserve the previous subset; a later build failure or input change SHALL prevent semantic publication and report failed delivery
-- **AND** the existing build lease and serialized phase ownership SHALL remain effective
-- **AND** unchanged subset bytes SHALL preserve output modification time; background execution alone MUST NOT be reported as measured GUI responsiveness
-
-#### Scenario: An unselected Unity module is absent from the filesystem
-- **WHEN** a current/hot subset encounters an ordinary identifier Unity name that cannot match the basename of any selected module root
-- **THEN** classification MAY skip recursive Unity fallback discovery after applying the existing direct scope rules
-- **AND** selected entries, their order and complete commands SHALL remain identical to unfiltered classification; the hint MUST NOT choose between same-name roots or change their lookup priority
-- **AND** unknown selected-key shapes, irregular root basenames or nonordinary Unity names SHALL retain the original discovery behavior; full classification SHALL remain unchanged
-
-#### Scenario: Only a partial baseline exists
-- **WHEN** 新 generation 尚无 full synthetic TU baseline，而 current 或 hot partial coverage 已可用
-- **THEN** 系统 MAY 使用该局部 coverage 与 exact commands 提供其范围内的语义结果
-- **AND** 系统 SHALL 把 active coverage 标记为 partial，不能宣称全 build body 覆盖已完成
-
-### Requirement: Index results SHALL be bound to an immutable build generation
-
-每个供导航消费的 generation SHALL 至少绑定 active target/platform/configuration、CDB 内容 fingerprint、toolchain identity、manifest gate、exact-command map 摘要与覆盖集合。导航请求开始后发生的 generation 切换 MUST 使旧响应 stale；旧 generation 的定义位置不得在新 generation 中自动生效。
-
-每个阶段产物 SHALL 在其 controlled CDB 与 index 产物确实生成后**立即**写出绑定
-`generation_id` / `build_key` / `cdb_source_signature` 的持久化 manifest。manifest 是“该产物属于
-哪一次 build”的自证，其写出 MUST NOT 依赖后续步骤（selection 提升、clangd 重启、其他阶段）是否
-成功——否则产物留在磁盘上却无法自证归属，readiness 只能依赖易失的进程内账本。
-
-#### Scenario: Generation identity survives a Nvim restart
-- **WHEN** active target、CDB 内容与 toolchain 均未变化，但 Lua table 的迭代顺序因新进程而改变
-- **THEN** generation fingerprint SHALL 保持完全相同
-- **AND** 系统 SHALL 使用 canonical key ordering 序列化 hash payload，不得把运行时 hash 顺序当作 build evidence
-
-#### Scenario: Prepared tuple artifacts survive a Nvim restart
-- **WHEN** 当前 project/target/platform/configuration 的 selection、manifest、controlled CDB、semantic CDB
-  与源 CDB 签名仍可证明为 ready，随后 Neovim 重启
-- **THEN** clangd SHALL 直接消费这些持久化工件并为 UE C/C++ buffer 启动
-- **AND** 系统 MUST NOT 因新的 Lua 进程尚未执行 `UEPrepare` 而要求重复 prepare
-- **AND** 工件缺失、stale 或 tuple/build evidence 变化时 SHALL 继续 defer；同一进程内也必须重新验证
-
-#### Scenario: A phase produces artifacts but later delivery steps fail
-- **WHEN** 某阶段的 controlled CDB 与 index 产物已生成，但 selection 提升、clangd 重启或其他阶段
-  随后失败
-- **THEN** 该阶段的 manifest SHALL 已经落盘并可证明其 generation 归属
-- **AND** 后续进程 SHALL 能据此判定该产物可用或 stale，而不是把它视为不存在
-
-#### Scenario: Compile database changes during navigation
-- **WHEN** `gd` 发出后 active CDB fingerprint 发生变化，旧索引响应随后返回
-- **THEN** 旧响应 SHALL 被标记为 stale 且 MUST NOT 跳转
-- **AND** 下一次导航 SHALL 使用新 generation 的 context 与索引证据
-
-#### Scenario: Platform or configuration changes
-- **WHEN** active platform、configuration 或 target 改变，即使文件路径和 symbol name 相同
-- **THEN** 系统 SHALL 创建新的 build generation
-- **AND** 旧 generation 的 coverage、USR/opaque identity 与 destination MUST NOT 被复用为新 generation 的证明
-
-#### Scenario: Module baseline freshness cannot be proven
-- **WHEN** controlled BackgroundIndex baseline、module AST 或 exact-command map 无法证明由当前 CDB/toolchain generation 产生
-- **THEN** 系统 SHALL 拒绝把该 baseline 作为语义 destination authority
-- **AND** 失败信息 SHALL 指明 generation/freshness 缺口，不得静默使用陈旧位置
-
-### Requirement: Readiness SHALL be provable from persisted artifacts, not only from in-process state
-
-索引就绪判定 MUST NOT 只依赖进程内/单文件的 `state` 账本。该账本会因进程中途退出、并发写入或
-状态文件损坏而丢失，而 controlled CDB、index 产物与 manifest 仍完好存在于磁盘。
-
-当 `state` 的 selection 或 artifact 记录缺失、类型错误或与磁盘不一致时，系统 SHALL 扫描当前 tuple
-的持久化 manifest，并在 `generation_id`、`build_key` 与 `cdb_source_signature` 均校验通过后重建
-selection。系统 MUST NOT 因账本丢失而要求用户重跑 `UEPrepare`。
-
-重建 MUST fail closed：manifest 缺失、无法解析、generation/build_key 不匹配，或其引用的产物文件
-不存在时，SHALL 继续判为非就绪并 defer，MUST NOT 猜测或降级校验。
+索引就绪判定 MUST NOT 只依赖易失的进程内/单文件 `state` 账本；账本丢失、损坏或类型错误时，
+系统 SHALL 扫描当前 tuple 的持久化 manifest，在 `generation_id`/`build_key`/
+`cdb_source_signature` 均校验通过后重建 selection，MUST NOT 因账本丢失而要求用户重跑
+`UEPrepare`。重建 MUST fail closed。`ready` 判定本身 MUST 可证伪：报告 `ready` 时 active
+selection MUST 同时携带非空 `index_path`、`artifact_fingerprint`、`coverage_level`，且
+`index_path` 指向的文件 MUST 存在；内部矛盾的 `ready` SHALL 被降级为非就绪并可观测地记录。
+索引查询无定义结果时 SHALL 区分 `index-incomplete`（partial coverage 下的 miss）与
+`definition-absent-in-complete-index`（complete coverage 下确实无定义），两者 MUST NOT 被
+归类为 overload ambiguity 或 invalid AST。
 
 #### Scenario: State ledger is lost but artifacts remain on disk
-- **WHEN** `state.index_artifacts` 为空或类型错误，但该 tuple 的 manifest、controlled CDB 与
-  semantic CDB 仍存在且签名匹配当前 build
-- **THEN** 系统 SHALL 依据磁盘 manifest 重建 selection 并判定为 ready
-- **AND** 系统 MUST NOT 提示用户重跑 `UEPrepare`
+- **WHEN** `state.index_artifacts` 为空或类型错误，但该 tuple 的 manifest、controlled CDB
+  与 semantic CDB 仍存在且签名匹配当前 build
+- **THEN** 系统 SHALL 依据磁盘 manifest 重建 selection 并判定为 ready，MUST NOT 提示用户
+  重跑 `UEPrepare`
 
-#### Scenario: Disk manifest does not match the active build
-- **WHEN** manifest 存在但其 `generation_id` / `build_key` / `cdb_source_signature` 与当前 tuple
-  或源 CDB 不匹配
-- **THEN** 系统 SHALL 判为 stale 并继续 defer
-- **AND** MUST NOT 用不匹配的 manifest 重建 selection
+### Requirement: Frozen batch activation SHALL be guarded and preserve the original semantic authority
 
-#### Scenario: Manifest references a missing artifact
-- **WHEN** manifest 校验通过，但其引用的 index 产物或 background CDB 文件不存在
-- **THEN** 系统 SHALL 判为非就绪
-- **AND** MUST NOT 仅因 manifest 存在就宣称 ready
+默认发布路径 SHALL 始终保留原 UBT/exact CDB；冻结批次 SHALL 使用独立 CDB 与独立 shard 缓存。
+新进程发现批次产物时 SHALL 先建立经过宿主能力验证的输入监听，再异步验证 receipts 和发布内容，
+成功后才选择冻结 CDB；主循环 MUST NOT 扫描依赖或同步计算大型 CDB/hash。受监视的源码、头文件、
+工具、lookup 目录或冻结产物发生变化时，SHALL 立即撤销该客户端的批次 epoch 并退回独立原 UBT
+路径，只重启受影响的本进程客户端。
 
-### Requirement: A `ready` verdict SHALL be self-evidencing
+#### Scenario: Inputs change while references or rename is in flight
+- **WHEN** 受监视的源码、头文件、工具、lookup 目录或冻结产物发生变化
+- **THEN** SHALL 立即撤销该客户端的批次 epoch，拒绝新的 references/rename/prepareRename
+  与迟到的旧结果
+- **AND** SHALL 退回独立原 UBT 路径，不得清理其他进程的缓存
 
-`ready` MUST 是可证伪的。系统报告 readiness 为 `ready` 时，active selection MUST 同时携带非空
-`index_path`、`artifact_fingerprint` 与 `coverage_level`，且 `index_path` 指向的文件 MUST 存在。
+### Requirement: Prepare SHALL deliver a usable, self-healing index without extra user commands or stale accumulation
 
-任何内部矛盾的就绪状态（例如报 `ready` 却没有指向产物的证据）SHALL 被降级为非就绪并以可观测方式
-记录，MUST NOT 静默通过——假 `ready` 会让“已交付”不可证伪，并使下游误判索引可用。
-
-#### Scenario: Selection claims readiness without artifact evidence
-- **WHEN** readiness 计算得到 `ready`，但 selection 的 `index_path`、`artifact_fingerprint` 或
-  `coverage_level` 为空
-- **THEN** 系统 SHALL 将其降级为非就绪并附带可解释的 reason
-- **AND** SHALL 记录该矛盾以便诊断，MUST NOT 报告 `ready`
-
-#### Scenario: Selection references an artifact that no longer exists
-- **WHEN** selection 携带完整字段，但 `index_path` 指向的文件已被删除
-- **THEN** 系统 SHALL 判为非就绪
-- **AND** MUST NOT 依据陈旧 selection 宣称 ready
-
-### Requirement: Definition misses SHALL distinguish incomplete coverage from semantic absence
-
-索引查询没有返回 definition 时，系统 SHALL 根据 generation coverage 输出结构化结论。partial coverage 下的 miss 必须表示为 `index-incomplete`；只有完成声明所覆盖 active build 范围的索引后，才可表示 `definition-absent-in-complete-index`。两者都 MUST NOT 被归类为 overload ambiguity 或 invalid AST。
-
-#### Scenario: Definition TU is outside current coverage
-- **WHEN** canonical entity 的 declaration 已被证明，但其 definition TU 不在 active partial coverage 中
-- **THEN** 导航 SHALL 返回 `unavailable` / `index-incomplete`
-- **AND** 结果 SHALL 包含 coverage level、generation 与缺失 destination stage，并触发或保持已配置的完整索引收敛流程
-
-#### Scenario: Complete index contains no definition
-- **WHEN** 当前 generation 的 complete coverage 已就绪，且同一 canonical entity 没有 definition location
-- **THEN** 导航 SHALL 返回 `unavailable` / `definition-absent-in-complete-index`
-- **AND** 系统 MUST NOT 用同名、同 arity、邻近文件或历史缓存制造 definition
-
-#### Scenario: Provider or module baseline is not ready
-- **WHEN** clangd 尚未完成 controlled BackgroundIndex baseline、exact-command transport 尚未生效、正在重启或无法回答查询
-- **THEN** 导航 SHALL 返回 provider/index readiness reason
-- **AND** MUST NOT 把暂时性 provider 状态包装成实体不存在
-
-### Requirement: Published clangd CDB SHALL use the standard JSON compilation database schema
-
-current/hot/full phase artifact MAY 携带 `nvim_ue_members`、`nvim_ue_module_root` 等内部 provenance，
-但发布给 clangd 的 `compile_commands.json` SHALL 只包含标准的 `directory`、`file`、
-`arguments`/`command` 与可选 `output` 字段。内部 provenance MUST 在发布边界剥离；否则 clangd
-拒绝整份数据库时不得回退到 active per-file CDB。
-
-#### Scenario: Controlled phase entries contain portable provenance
-- **WHEN** SuperUnity phase artifact 包含 member/module-root metadata 并被合并到 clangd background CDB
-- **THEN** phase artifact SHALL 保留这些字段供 semantic sidecar 使用
-- **AND** clangd 发布视图 SHALL 剥离所有非标准字段，同时保持 exact argv、cwd、file 与 output 不变
-- **AND** exact argv 指同一 prepare 事务已经封存的最终语义命令；诊断兼容转换须遵守
-  `macos-ios-cdb-semantic-prepare` 的受控转换契约并保留原始构建 provenance，发布层不得另行添加选项
-
-### Requirement: Live file freshness SHALL overlay rather than replace broad coverage
-
-已打开或有 unsaved overlay 的 C++ 文件 SHALL 使用与其 document version 一致的 live semantic data 覆盖较旧静态记录；该覆盖 MUST NOT 删除静态基线中不相关文件的定义。文件、CDB 或 generation 失效时，live overlay SHALL 被丢弃或重建。
-
-#### Scenario: Unsaved source changes a definition
-- **WHEN** 用户修改已打开 source buffer 中的 declaration/definition 且尚未保存
-- **THEN** 该 buffer 的导航 SHALL 使用当前 document version 的 live semantic data
-- **AND** 其他模块仍 SHALL 保留 broad baseline 的定义覆盖
-
-#### Scenario: Live overlay becomes stale
-- **WHEN** buffer changedtick、compile command 或 build generation 改变
-- **THEN** 旧 live overlay MUST NOT 继续贡献 destination
-- **AND** 后续请求 SHALL 等待或建立与新快照一致的 semantic data
-
-### Requirement: Index coverage SHALL be observable and regression-tested
-
-系统 SHALL 暴露脱敏后的 active generation、coverage level、覆盖模块/TU 摘要、controlled
-BackgroundIndex baseline、exact-command source、warm cache freshness、64-context cap 命中与最后构建
-结果，并以自动化测试证明 coverage 不降级。状态输出 MUST NOT 包含用户项目绝对路径、设备标识或
-其他不必要的本机信息。
-
-Progress SHALL distinguish input source entries from actual controlled translation units and report the generated Unity/exact-fallback counts. Zero accepted groups MUST NOT be described as compressed Unity indexing. A prepared controlled database is not proof that clangd has finished indexing it.
-
-controlled index 的构建 SHALL 是**可观测的前台阶段**，而不是完成后静默的 fire-and-forget 后台
-任务。构建期间 SHALL 提供进度指示（阶段名 + 进展），并遵守 P5：至多 start + 中段更新，成功后自然
-消退，MUST NOT 周期性刷屏。
-
-构建失败或中断 MUST NOT 静默。失败 SHALL 同时（a）以 notify 告知用户，（b）写入
-`utils.log`（含 phase、exit code、stderr 尾部），使跨会话事后诊断不依赖控制台输出。
-
-#### Scenario: User explains an index-backed miss
-- **WHEN** 用户查看最近一次 C++ `gd` explain/diagnostic
-- **THEN** 输出 SHALL 指明该请求使用的 generation、coverage level、index readiness 与 miss reason
-- **AND** 路径 SHALL 以 workspace-relative 或脱敏形式展示
-
-#### Scenario: Controlled index build reports progress
-- **WHEN** `current` / `hot` / `full` 任一阶段开始构建
-- **THEN** 系统 SHALL 显示该阶段的进度指示，含 phase 名称与可辨识的进展信息
-- **AND** 成功后指示 SHALL 自然消退，MUST NOT 留下常驻或周期刷新的通知
-
-#### Scenario: Controlled index build fails
-- **WHEN** index 构建子进程非零退出、产物缺失，或交付步骤（manifest/selection/promotion）未完成
-- **THEN** 系统 SHALL notify 用户并写入结构化日志（phase、exit code、stderr 尾部）
-- **AND** `state.build.status` SHALL 记为 `error` 且 `finished_at` SHALL 写入真实时间
-- **AND** 系统 MUST NOT 把该次构建计入成功统计
-
-#### Scenario: Regression simulates full synthetic baseline, partial miss, and restart recovery
-- **WHEN** 测试以 `--enable-config=false` 启动 clangd，磁盘 CDB full 只含 compiler-authored
-  synthetic/full TU，并通过官方 `compilationDatabaseChanges` 注入打开文件 exact commands；随后切到
-  partial-only generation，再切回 full generation
-- **THEN** full baseline 下 call/declaration SHALL 到达 `.cpp` body，partial generation 下 SHALL 停在
-  declaration，返回 full generation 后 SHALL 再次到达 `.cpp` body
-- **AND** 测试 SHALL 在旧的 declaration-self-terminating 行为或陈旧 generation 复用下失败
-
-### Requirement: Prepare SHALL deliver a usable semantic index without extra user commands
-
-`UEPrepare` 的完成语义 SHALL 覆盖 controlled index 的就绪状态。用户完成
-`set platform → set project → build → UEPrepare` 后，SHALL NOT 需要额外记忆或执行任何平台专属
-索引命令（如 `UEIndexFull`）才能获得可用的 C++ 定义跳转。
-
-`UEIndexNow` / `UEIndexHot` / `UEIndexFull` SHALL 仅作为显式重建入口保留，MUST NOT 成为日常
-流程的必要步骤。
-
-当 prepare 完成而 index 尚未就绪时，系统 SHALL 明确告知当前处于 index 构建中或构建失败，
-MUST NOT 让用户以为语义能力已可用。
-
-#### Scenario: Habitual prepare flow yields working definition navigation
-- **WHEN** 用户依次执行设置 platform、设置 project、构建、`UEPrepare`，且各步成功
-- **THEN** controlled index SHALL 被构建并交付（manifest + selection + 提升后的 semantic CDB）
-- **AND** 随后对已证明唯一定义的 C++ 符号执行 `gd` SHALL 到达该定义
-- **AND** 流程 MUST NOT 要求用户执行 `UEIndexFull` 或其他索引命令
-
-#### Scenario: Cold asynchronous prepare finishes before semantic delivery
-- **WHEN** 首次异步 prepare 的 csearch 与 CDB pipeline 均已完成，且 CDB pipeline 成功
-- **THEN** 完成分支 SHALL 调用受保护的 `schedule_prepare_delivery` 后再尝试唤醒 clangd
-- **AND** CDB 尚未完成时 SHALL 等待，CDB 失败时 MUST NOT 调度交付或唤醒 clangd
-
-#### Scenario: Prepare completes while index build is still running
-- **WHEN** prepare 的 CDB 阶段完成但 controlled index 仍在构建
-- **THEN** 系统 SHALL 通过进度指示表明 index 构建进行中
-- **AND** 状态查询 SHALL 报告 index 尚未就绪，而不是报告 prepare 已整体完成
-
-### Requirement: Interrupted index builds SHALL be self-healing
-
-index 构建状态 MUST NOT 因进程退出而永久卡死。当持久化的 `state.build.status` 为 `running` 而其
-owner 进程已不存在时，系统 SHALL 判定该状态为孤儿并复位，随后重新调度或明确告知用户，
-MUST NOT 依赖用户手动删除状态文件或锁目录。
-
-跨进程构建 lease 的孤儿目录 SHALL 可被回收（owner 进程已死时），且回收 MUST NOT 破坏另一个存活
-Neovim 正在进行的构建。
+`UEPrepare` 的完成语义 SHALL 覆盖 controlled index 的就绪状态；用户完成
+`set platform → set project → build → UEPrepare` 后 SHALL NOT 需要额外执行任何平台专属索引
+命令（如 `UEIndexFull`）才能获得可用的 C++ 定义跳转，这些命令 SHALL 仅作为显式重建入口保留。
+index 构建状态 MUST NOT 因进程退出而永久卡死：持久化 `state.build.status` 为 `running` 而其
+owner 进程已不存在时，系统 SHALL 判定为孤儿并复位，MUST NOT 依赖用户手动删除状态文件。prepare
+家族 SHALL 在成功后清理自身中间备份（如 `.pre-*.bak`），不同 generation 的陈旧 controlled CDB
+SHALL 被失效或清除，MUST NOT 以「存在即可用」误导 readiness 判定。
 
 #### Scenario: Neovim exits mid-build and is restarted
-- **WHEN** controlled index 构建期间 Neovim 退出，持久化状态留下 `status="running"`、
-  `finished_at=0`，其 owner PID 已不存在
+- **WHEN** controlled index 构建期间 Neovim 退出，持久化状态留下 `status="running"`，其 owner
+  PID 已不存在
 - **THEN** 下一次索引操作 SHALL 将该孤儿状态复位，而不是判定"构建中"并拒绝新构建
-- **AND** 系统 SHALL 重新调度构建或明确告知上次构建被中断
 
-#### Scenario: A second live Neovim owns the build
-- **WHEN** 孤儿检测发现 `running` 状态但 owner 进程仍存活
-- **THEN** 系统 SHALL 保留该状态并拒绝抢占
-- **AND** MUST NOT 回收属于存活进程的 lease
+### Requirement: Background index work and the clangd process SHALL yield to host CPU pressure without over-claiming guarantees
 
-### Requirement: Prepare SHALL not accumulate stale or intermediate artifacts
-
-prepare 家族 SHALL 在成功后清理自身产生的中间备份（如 `.pre-pch.bak`、`.pre-unify.bak`）。
-不同 build generation 的陈旧 controlled CDB SHALL 被失效或清除，MUST NOT 以"存在即可用"的形式
-留在磁盘上误导 readiness 判定。
-
-清理 MUST NOT 删除当前 generation 仍需的产物，也 MUST NOT 删除属于其他 project bucket 或其他
-platform 分片的有效产物（与 K27/C5b 的失效矩阵一致）。
-
-#### Scenario: Prepare succeeds with intermediate backups present
-- **WHEN** prepare 的 CDB 阶段成功完成，且过程中产生了 `.pre-*.bak` 中间备份
-- **THEN** 这些中间备份 SHALL 被清理
-- **AND** 当前 generation 的 active CDB 与 controlled CDB SHALL 保留
-
-#### Scenario: Stale controlled CDB from an older generation exists
-- **WHEN** controlled CDB 存在但其 generation 与当前源 CDB 签名不匹配，且无有效 manifest
-- **THEN** 该产物 SHALL 被视为失效，MUST NOT 被计入 coverage 或 readiness
-- **AND** 系统 SHALL 以可观测方式表明该产物已失效（而非静默忽略）
-
-### Requirement: Background index work SHALL yield to host CPU pressure
-
-后台受控索引构建 SHALL 在**启动前**评估宿主整体 CPU 负载，并在负载超过高水位时推迟启动，
-而不是无条件加压。静态并发预算（`-j` / 保留核数）只能防止“我们自己占满”，无法防止“在别人
-（外部编译器、其他工具链）已占满时我们继续加压”——共享机器上必须有动态准入。
-
-负载采样 MUST NOT 通过 spawn 子进程实现（周期性同步子进程往返会阻塞主循环，见 K40）。
-采样 SHALL 使用进程内可用的宿主统计信息，其开销 SHALL 可忽略。
-
-系统 MUST NOT 声称能保证宿主总体 CPU 低于任何阈值，也 MUST NOT 尝试挂起、降级或终止外部进程；
-契约仅限于**我们自己不在高负载期间主动启动新的重活**。
+后台受控索引构建 SHALL 在启动前评估宿主整体 CPU 负载，负载超过高水位时推迟启动而非无条件
+加压；负载采样 MUST NOT 通过 spawn 子进程实现（同步子进程往返阻塞主循环）。判定 SHALL 使用
+高/低双水位滞回，MUST NOT 单阈值抖动式反复启停，且推迟 SHALL 有上限。宿主负载高于高水位时，
+clangd 进程 SHALL 被施加 OS 级资源约束（降低优先级等可逆手段），MUST NOT 被终止或暂停——
+clangd 是长驻交互式服务，终止会丢弃已构建的 preamble。系统 MUST NOT 声称能保证宿主 CPU 低于
+任何阈值，也 MUST NOT 约束或挂起非自身启动的外部进程。
 
 #### Scenario: Host is under heavy external load when a phase becomes due
 - **WHEN** 某索引阶段的 deadline 到达，而宿主 CPU 使用率高于高水位
-- **THEN** 系统 SHALL 推迟该阶段启动，MUST NOT 启动新的构建子进程
-- **AND** 推迟原因 SHALL 可观测（进度/日志），MUST NOT 静默无响应
+- **THEN** 系统 SHALL 推迟该阶段启动，MUST NOT 启动新的构建子进程，推迟原因 SHALL 可观测
 
-#### Scenario: Load falls back after a deferral
-- **WHEN** 先前因高负载被推迟的阶段，其后宿主 CPU 回落到低水位以下
-- **THEN** 系统 SHALL 恢复该阶段的启动
-- **AND** 判定 SHALL 使用高/低双水位（滞回），MUST NOT 在单一阈值附近抖动式反复启停
+## 选型与踩坑
 
-#### Scenario: A build is already running when load spikes
-- **WHEN** 构建已在进行中，随后宿主负载超过高水位
-- **THEN** 系统 SHALL 允许该构建继续完成，MUST NOT 杀掉它以致已完成的工作被浪费
-- **AND** 系统 SHALL NOT 在此期间启动额外阶段
-
-#### Scenario: Host stays busy for a long time
-- **WHEN** 宿主 CPU 长期高于高水位
-- **THEN** 推迟 SHALL 有上限，超过上限后 SHALL 允许交付推进
-- **AND** 系统 MUST NOT 因外部负载而无限期饿死索引交付
-
-#### Scenario: Load sampling is unavailable
-- **WHEN** 宿主 CPU 统计不可读（平台不支持或采样失败）
-- **THEN** 系统 SHALL 视为无压力并按既有 deadline 正常启动
-- **AND** MUST NOT 因无法测量而永久阻塞交付
-
-#### Scenario: Throttling is disabled by configuration
-- **WHEN** 用户在配置中关闭 CPU 准入控制
-- **THEN** 系统 SHALL 完全按既有 deadline 行为启动，不做负载判定
-- **AND** 阈值与开关 SHALL 可通过既有配置机制调整
-
-### Requirement: The clangd process SHALL be constrained under host CPU pressure
-
-clangd 的资源占用 MUST NOT 仅由启动参数决定。`-j`、`--pch-storage` 与
-`--background-index-priority` 都是进程启动时固定的静态预算，无法反映宿主上其他工具链
-（外部编译器、其他编辑器、构建系统）的实时负载；`--background-index-priority` 的效果按 clangd
-自身文档为 OS-specific，SHALL NOT 被当作已验证的防线。
-
-当宿主整体 CPU 高于高水位时，系统 SHALL 对 clangd 进程施加 OS 级资源约束（降低进程优先级或
-等价手段），使交互式 UI 与前台工具链优先获得调度。负载回落到低水位以下时 SHALL 恢复正常优先级。
-判定 SHALL 复用系统既有的宿主负载采样与双水位滞回判据，MUST NOT 另行实现一套可能漂移的阈值。
-
-系统 MUST NOT 终止或暂停 clangd 以降低负载：clangd 是长驻交互式服务，终止会丢弃已构建的
-preamble，使下一次导航重新付出分钟级代价。约束 SHALL 限于优先级/亲和性等可逆的降级手段。
-
-无法获取 clangd 进程句柄时，系统 SHALL 跳过约束并记录，MUST NOT 因此报错或阻塞 clangd 启动。
-
-系统 MUST NOT 声称能保证宿主 CPU 低于任何阈值，也 MUST NOT 约束非自身启动的外部进程；
-Windows 上 owned clangd 的发现 SHALL 同时匹配当前 Neovim parent PID 与 executable name，MUST NOT
-仅按进程名枚举全机。发现后 SHALL 持有绑定原 process object 的原生 HANDLE；每次调整前只在该 HANDLE
-仍为 `STILL_ACTIVE` 时写入。MUST NOT 仅凭数字 PID 重开进程，避免 PID reuse 误伤。
-契约仅限于降低 owned clangd 抢占 UI 调度的能力。
-
-#### Scenario: Host CPU exceeds the high watermark while clangd is indexing
-- **WHEN** 宿主整体 CPU 高于高水位，且 clangd 正在后台索引
-- **THEN** 系统 SHALL 降低 clangd 进程优先级
-- **AND** 系统 MUST NOT 终止或暂停 clangd
-
-#### Scenario: Host load falls back
-- **WHEN** 宿主 CPU 回落到低水位以下
-- **THEN** 系统 SHALL 恢复 clangd 的正常优先级
-- **AND** 判定 SHALL 使用双水位滞回，MUST NOT 在单一阈值附近反复升降
-
-#### Scenario: clangd process handle is unavailable
-- **WHEN** 系统无法获得 clangd 的进程句柄或平台不支持优先级调整
-- **THEN** 系统 SHALL 跳过约束并记录该事实
-- **AND** clangd 启动与后续导航 MUST NOT 因此失败
-
-#### Scenario: A stale PID has been reused
-- **WHEN** 已登记 clangd 的原生 process HANDLE 不再为 `STILL_ACTIVE`
-- **THEN** 系统 SHALL 关闭 HANDLE 并从控制集合移除该 PID
-- **AND** MUST NOT 按数字 PID 重新打开并写入复用该 PID 的进程
-
-#### Scenario: Static flags are not treated as sufficient
-- **WHEN** 评估 clangd 的资源防线
-- **THEN** `--background-index-priority` SHALL 被视为效果未在本平台验证
-- **AND** OS 级约束 SHALL 独立于该旗标成立
+- **踩坑**：`openspec/changes/archive/2026-09-28-restructure-super-unity-compression/` 的
+  调查发现，「Secondary batches」二次合并的**实际交付量为零**——活跃索引缓存 33,014 个
+  shard 中 995 个 `SuperUnity.UBT`、仅 **1 个** `SuperUnity.Batch`。根因不是合并质量差，而是
+  门禁本身要求了一个任何单个 TU 都达不到的目标：`compare_graphs` 把引用基线构造成**所有原始
+  图的 UNION**，在模板主模板/偏特化、宏生成重载集这类 context-dependent SymbolID 面前**结构
+  性不可满足**——585 条被拒绝的 removed-ref 中 **0 条**落在该组自己拥有的成员源文件里
+  （全部是共享头），其中 583 条所在位置在原始图之间本来就存在多个 symbol id，且没有任何单个
+  TU（候选或原始）能同时携带 union 要求的全部 id。
+- **已选方向（尚未实现）**：该调查按用户决策选定的方向是——Tier 1 只合并属于**同一次 UBT
+  unity 发射序列**（`(module_root, compile_context_key, member_class)` 三元组相同）的组，
+  按 UBT 自身 `NumIncludedBytesPerUnityCPP` 的整数倍字节预算打包，理由是这是编译器自己会
+  发射的分组、不是语义改动，因此 Tier 1 SHALL NOT 要求逐组 `compare_graphs`，改用编译成功 +
+  索引完成（`missing_main_shards == 0`）+ 成员源集合与被替换原始逐字节一致三项硬门禁替代。
+  Tier 2（跨 gen/src 类、跨模块的合并）仍需证明，但其基线必须先改为可满足的形式，本方向
+  未给出 Tier 2 新基线设计。
+- **明确标注（防止冒充收益）**：该 change 的 22 个任务**全部未勾选**，Tier 1 无任何实测
+  收益数字；本仓唯一受控冷启动 A/B 实测是 **1115.23 s → 1028.51 s（7.78%）**
+  （`docs/cpp-index-restart-investigation.md`），这是另一次改动的结果，MUST NOT 被冒充为
+  Tier 1 的收益，也 MUST NOT 用 CDB 条目数下降（纸面 1197 → 777，−35%）替代实测速度提升。
+- **重要事项**：截至本次瘦身，`cpp-semantic-index-coverage` 的现行实现仍是本 spec
+  Requirements 描述的状态（union 基线、逐组 compare_graphs、0 条 Tier 1 结构化豁免）；上述
+  「已选方向」只是记录调查结论与选型意向，不代表 Requirements 已经改变。

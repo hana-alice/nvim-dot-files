@@ -19,6 +19,61 @@ local discovery = require("utils.ue_goto.semantic_sidecar")._discover_toolchain_
 local python = vim.fn.exepath("python")
 if python == "" then python = vim.fn.exepath("python3") end
 
+t.describe("libclang resource directory lookup", function()
+  if python == "" then
+    t.skip("library installation layouts", "python-not-found", { native = true })
+    return
+  end
+  t.it("keeps the selected installation prefix when its library is a multiarch symlink", function()
+    local code = [=[
+import pathlib, sys, tempfile
+sys.path.insert(0, sys.argv[1])
+from clangd_batch_bindings import _resource_directory
+with tempfile.TemporaryDirectory(prefix='clang_resource_') as temporary:
+    root = pathlib.Path(temporary)
+    version = 'Debian clang version 22.1.5'
+    prefix = root / 'usr/lib/llvm-22'
+    resource = prefix / 'lib/clang/22'
+    (resource / 'include').mkdir(parents=True)
+    target = root / 'usr/lib/multiarch/libclang-22.so.22'
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b'layout fixture; never loaded')
+    selected = prefix / 'lib/libclang.so'
+    selected.symlink_to(target)
+    assert selected.resolve() == target.resolve()
+    assert _resource_directory(selected, version, None) == resource.resolve()
+    # Explicit selection remains exclusive: an invalid override must not fall
+    # back to the valid adjacent installation, nor accept another major.
+    for wrong in (root / 'absent/22', prefix / 'lib/clang/21'):
+        if wrong.name == '21':
+            (wrong / 'include').mkdir(parents=True)
+        try:
+            _resource_directory(selected, version, str(wrong))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('invalid resource override accepted')
+    assert _resource_directory(selected, version, str(resource)) == resource.resolve()
+    # A library selected via an unrelated alias still finds its real prefix.
+    installed = prefix / 'lib/libclang-real.so'
+    installed.write_bytes(b'layout fixture; never loaded')
+    alias = root / 'alias/libclang.so'
+    alias.parent.mkdir()
+    alias.symlink_to(installed)
+    assert _resource_directory(alias, version, None) == resource.resolve()
+    # Both bin-based and lib-based native package layouts remain supported.
+    dll = prefix / 'bin/libclang.dll'
+    dll.parent.mkdir()
+    dll.write_bytes(b'layout fixture; never loaded')
+    assert _resource_directory(dll, version, None) == resource.resolve()
+print('resource layouts verified')
+]=]
+    local result = vim.system({ python, "-I", "-B", "-c", code,
+      vim.fn.stdpath("config") .. "/tools" }, { text = true }):wait(10000)
+    t.assert_eq(result.code, 0, result.stderr or result.stdout)
+  end)
+end)
+
 t.describe("original TU batch binding proof", function()
   if not discovery.ok or python == "" then
     t.skip("real libclang and Python binding fixtures", discovery.reason or "python-not-found", { native = true })
@@ -385,6 +440,15 @@ struct Pointer { BASE(int) template<class Dummy> struct Link<__COUNTER__ - Count
 t.describe("compiler proof for printed template arguments", function()
   if not discovery.ok or python == "" then
     t.skip("real libclang template argument fixtures", discovery.reason or "python-not-found", { native = true })
+    return
+  end
+  -- Discovery reads clang_getClangVersion from the selected, loaded library.
+  -- Only this proof protocol is pinned; ordinary binding/layout tests above
+  -- continue to exercise other installed native toolchains.
+  if not (discovery.clang_version or ""):match("clang version 22%.1%.5%s")
+      and not (discovery.clang_version or ""):match("clang version 22%.1%.5$") then
+    t.skip("real libclang template argument fixtures", "requires libclang 22.1.5; found "
+      .. tostring(discovery.clang_version), { native = true })
     return
   end
   for _, case in ipairs({

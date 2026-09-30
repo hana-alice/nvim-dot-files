@@ -19,14 +19,21 @@ t.describe("git review actual LazyVim runtime", function()
       local script = scratch .. "/runtime.lua"
       local code = string.format([[
 local root = %q
+local function checkpoint(label)
+  io.stderr:write("GIT_REVIEW_RUNTIME_STAGE: " .. label .. "\n")
+  io.stderr:flush()
+end
 local ok, err = xpcall(function()
+  checkpoint("startup loaded")
   assert(package.loaded["lazy"] and package.loaded["lazyvim.config"], "real LazyVim startup did not load")
   assert(require("lazy.core.config").options.install.missing == false)
   assert(require("lazy.core.config").options.checker.enabled == false)
   -- Headless has no UIEnter, which is Lazy's normal VeryLazy trigger.
   vim.api.nvim_exec_autocmds("User", { pattern = "VeryLazy", modeline = false })
+  checkpoint("VeryLazy loaded")
   assert(package.loaded["config.keymaps"], "VeryLazy did not load the real project keymaps")
   require("lazy").load({ plugins = { "codediff.nvim", "diffview.nvim", "gitsigns.nvim" } })
+  checkpoint("review plugins loaded")
   local review = require("utils.git_review")
   local plugins = require("lazy.core.config").plugins
   assert(not plugins["advanced-git-search.nvim"] and not plugins["telescope.nvim"], "removed dependencies remain active")
@@ -42,7 +49,9 @@ local ok, err = xpcall(function()
     return notify(message, level, opts)
   end
   local function wait(predicate, label)
+    checkpoint("wait: " .. label)
     assert(vim.wait(12000, predicate, 20), label .. ": " .. table.concat(errors, "\n"))
+    checkpoint("ready: " .. label)
   end
   local function mapping(key, mode)
     local value = vim.fn.maparg(" " .. key, mode or "n", false, true)
@@ -50,10 +59,12 @@ local ok, err = xpcall(function()
     return value
   end
   local function invoke(key)
+    checkpoint("invoke: " .. key)
     local value = mapping(key)
     if value.callback then value.callback() else vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(value.rhs, true, false, true), "nx", false) end
   end
   vim.cmd.edit(vim.fn.fnameescape(root .. "/review.txt"))
+  checkpoint("editing fixture")
   local editing_buf, editing_win, editing_tab = vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win(), vim.api.nvim_get_current_tabpage()
   wait(function() return vim.fn.maparg(" hs", "n", false, true).desc == "Git: stage current unstaged hunk" end, "Gitsigns did not attach")
   local ordinary = mapping("hs").callback

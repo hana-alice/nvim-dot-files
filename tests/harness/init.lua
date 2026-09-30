@@ -201,6 +201,10 @@ end
 
 function M.it(name, fn)
   local full = current_describe and (current_describe .. " > " .. name) or name
+  if vim.env.CI == "true" then
+    io.stderr:write("[test] " .. full .. "\n")
+    io.stderr:flush()
+  end
   local ok, err = pcall(fn)
   record(full, ok, ok and nil or err)
 end

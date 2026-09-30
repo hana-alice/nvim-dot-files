@@ -2,146 +2,69 @@
 
 ## Purpose
 
-定义针对本 Neovim 配置的回归测试套件覆盖范围：配置加载冒烟、平台驱动契约、`ue` 模块公共 API 冻结、DAP 平台注册、工具函数加载，以及失败可定位性，确保「开发完跑一遍」即可快速发现回归。
+定义本 Neovim 配置的回归测试套件覆盖的大方向：配置加载冒烟、平台驱动契约、`ue` 模块公共
+API 冻结、DAP 平台注册、工具函数加载与关键纯函数行为、以及失败可定位性。目标是「开发完跑一遍」
+即可快速发现回归；本 spec 不逐字段列出所有断言细节，具体断言由 `tests/cases/*_spec.lua` 承载。
 
 ## Requirements
 
-### Requirement: 配置加载冒烟覆盖
+### Requirement: 冒烟与公共 API 冻结覆盖回归
 
-回归套件 SHALL 包含冒烟测试，验证 headless 启动时关键模块可被加载且不抛错。
+回归套件 SHALL 覆盖 headless 启动冒烟（关键模块可 `require`、`ue.setup()` 不报错）、平台驱动
+（windows/macos/linux/stub）接口形状一致、以及 `ue` 模块与子模块的公共表/函数持续存在，防止
+重构误删。
 
-#### Scenario: 核心模块可 require
+#### Scenario: 核心模块与命令可用
 
-- **WHEN** 冒烟用例运行
-- **THEN** `require("ue")`、`require("ue.config")`、`require("utils.platform")`、`require("utils.log")` 均成功返回 table
+- **WHEN** 冒烟用例运行并调用 `require("ue").setup()`
+- **THEN** 关键模块成功 `require`、关键用户命令（`UEDAP*` 等）已注册
 - **AND** 任一模块加载报错时该用例标记为 FAIL 并打印模块名与错误
 
-#### Scenario: ue.setup 注册命令不报错
+### Requirement: DAP 平台注册与工具函数行为覆盖
 
-- **WHEN** 冒烟用例调用 `require("ue").setup()`
-- **THEN** 调用无异常返回
-- **AND** `UEDAP*` 等关键用户命令通过 `vim.fn.exists(":Cmd")` 验证为已注册
+回归套件 SHALL 验证 DAP 平台注册表（`register_attach`/`attach_handler`/`_reset_for_test`）与
+各平台模块（win64/mac/linux/ios/android）的 `attach`/`launch` 导出符合 host/target matrix；
+并对 `utils`、`ue.core` 下的纯函数（路径处理、`ue_paths` 过滤、`ue_goto` 的 semantic context/
+location）做输入→输出断言，而不仅是「模块能加载」。
 
-### Requirement: 平台驱动契约覆盖
+#### Scenario: 平台注册与纯函数行为符合契约
 
-回归套件 SHALL 验证 `utils.platform` 的四个驱动（windows/macos/linux/stub）实现一致的接口形状。
-
-#### Scenario: 每个驱动实现完整接口
-
-- **WHEN** 平台契约用例遍历四个驱动模块
-- **THEN** 每个驱动的 `id` 与模块名一致
-- **AND** `shell`、`open_path`、`reveal_file`、`cmd_quote`、`default_clangd_candidates`、`default_lldb_dap_paths`、`default_lldb_server_paths` 均为 function
-
-#### Scenario: 向后兼容布尔标志存在
-
-- **WHEN** 用例读取 `utils.platform`
-- **THEN** `is_windows`、`is_mac`、`is_linux` 均为 boolean
-- **AND** `platform.id` 为非空 string
-
-### Requirement: ue 模块公共 API 冻结覆盖
-
-回归套件 SHALL 验证 `ue` 模块及子模块的公共 API（表与函数）持续存在，防止重构误删。
-
-#### Scenario: 公共表与函数存在
-
-- **WHEN** API 冻结用例运行
-- **THEN** `ue` 暴露的公共表（如 `FT_CPP`、`GLOBS_ALL`）为非空 table
-- **AND** 公共函数（如 `clangd_cmd`、`launch_app`、`index_now`、`prepare_headless`）均为 function
-
-#### Scenario: ue.config schema 默认值正确
-
-- **WHEN** 用例读取 `ue.config` 默认值
-- **THEN** `index.idle_cold_ms`、`context.ttl_s`、`cdb.steps`、`dap` 等关键键返回预期默认值
-- **AND** 用户 `setup()` 覆盖后再 `reset_for_test()` 能恢复默认值
-
-#### Scenario: ue.cdb 子模块行为稳定
-
-- **WHEN** 用例调用 `ue.cdb.json`、`ue.cdb.paths`、`ue.cdb.shaders`
-- **THEN** `template_entry`、`program`、`targets`、`augment`、`make_entry` 返回符合既有契约的结构
-
-### Requirement: DAP 平台注册覆盖
-
-回归套件 SHALL 验证 DAP 平台注册表与各平台模块的 `attach`/`launch` 导出。
-
-#### Scenario: 平台注册与查找
-
-- **WHEN** 用例对 `ue.dap.platforms` 注册测试处理器并查找
-- **THEN** `register_attach` 后 `attach_handler` 返回可调用 function
-- **AND** 未注册的 `launch_handler` 返回 nil
-- **AND** `_reset_for_test` 可清空注册状态
-
-#### Scenario: 各平台模块导出 attach/launch
-
-- **WHEN** 用例遍历 `win64`、`mac`、`linux`、`ios`、`android`
-- **THEN** 每个平台模块的 `attach` 与 `launch` 均为 function
-- **AND** `ue.setup()` 后只有真实 host/target matrix 支持的平台操作会注册；不兼容的 attach/launch handler SHALL 为 nil
+- **WHEN** 用例遍历平台模块并调用纯函数（如 `ue.core.fs.norm`、`utils.ue_paths.is_blocked`）
+- **THEN** 只有真实 host/target matrix 支持的平台操作会注册，不兼容的 handler 为 nil
+- **AND** 纯函数按既定输入返回既定输出，覆盖不仅是加载成功
 
 ### Requirement: CI 与本地维护同一回归入口
 
-CI SHALL 在隔离配置目录恢复仓库 lock 中的既有依赖及必需 parser，并执行 `tests/run.lua` 全量回归；旧 smoke 与 lint MAY 同时保留，但不能替代全量行为门禁。
+CI SHALL 在隔离配置目录执行 `tests/run.lua` 全量回归，且 Windows 原生编译器验收车道使用同一
+受支持版本的 LLVM 工具链（clangd/clang/libclang/内建头文件不漂移到不同大版本渠道）；Linux/macOS
+车道不强制要求 LLVM，编译相关用例在工具不满足要求时报告明确的 capability skip 而非静默跳过。
+DAP/host capability smoke SHALL 使用真实 host matrix，不注入假宿主让不兼容操作看似受支持。
 
-#### Scenario: 全新 CI checkout
-- **WHEN** runner 没有已有 Neovim 用户配置或插件缓存
-- **THEN** checkout、stdpath(config) 与依赖初始化 SHALL 指向同一隔离目录
-- **AND** 全量回归 SHALL 检验该 checkout，不读取其他用户配置
+#### Scenario: 全新 CI checkout 且工具链一致
 
-#### Scenario: DAP 环境与 host capability smoke
-- **WHEN** smoke 检查 adapter 注册与 spawn 环境
-- **THEN** SHALL 使用真实 host matrix，并按 libuv 的 KEY=VALUE 数组检查环境值
-- **AND** 不注入假宿主让不兼容操作看似受支持
-
-### Requirement: 工具函数加载覆盖
-
-回归套件 SHALL 验证 `utils` 下关键工具模块可被 require 且核心导出存在，并在可能时对纯函数追加行为断言（见「utils 纯函数行为覆盖」）。
-
-#### Scenario: 工具模块可加载
-
-- **WHEN** 用例 require `utils.code_search`、`utils.ue_goto`（其子模块）、`utils.log`、`utils.ue_paths`
-- **THEN** 各模块成功返回 table
-- **AND** C++ 语义导航的 `semantic_context`、`semantic_protocol`、`semantic_client` 与 `semantic_sidecar` 关键导出为 function
-
-#### Scenario: 纯函数模块同时校验行为
-
-- **WHEN** 被加载的模块属于纯函数类（`ue.core.fs`/`ue.core.proc`/`utils.ue_paths`/`utils.ue_goto.location`/`semantic_context`/`semantic_protocol`）
-- **THEN** 除加载断言外，还按既定输入断言其输出符合契约
-
-### Requirement: utils 纯函数行为覆盖
-
-回归套件 SHALL 对 `utils` 与 `ue.core` 下的纯函数进行输入→输出断言（而不仅是「模块能加载」），守护其行为契约。
-
-#### Scenario: ue.core.fs 路径函数行为
-
-- **WHEN** 用例调用 `ue.core.fs`
-- **THEN** `norm("a\\b\\")` == `"a/b"`、`join("a","b")` == `"a/b"`
-- **AND** `is_absolute_path("/a")` 与 `is_absolute_path("C:/a")` 均为 true、`is_absolute_path("a/b")` 为 false
-- **AND** `relative_to("/a", "/a/b")` == `"b"`、`common_ancestor({"/a/b","/a/c"})` == `"/a"`
-
-#### Scenario: ue.core.proc.first_executable 行为
-
-- **WHEN** 用例调用 `ue.core.proc.first_executable({})`
-- **THEN** 返回 nil
-- **AND** 传入全不可执行的候选列表时返回 nil
-
-#### Scenario: utils.ue_paths 过滤行为
-
-- **WHEN** 用例调用 `utils.ue_paths`
-- **THEN** `is_blocked` 对含 `/intermediate/`、`/binaries/`、`/.git/` 的路径返回 true，对普通源码路径返回 false
-- **AND** `is_searchable("foo.cpp")` 为 true、`is_searchable("foo.txt")` 为 false
-- **AND** `filter({...})` 返回的新列表只保留可搜索路径且保持顺序
-
-#### Scenario: utils.ue_goto semantic context 与 location 行为
-
-- **WHEN** 用例解析 compilation database、compiler-emitted dependency evidence 与多个 proven context
-- **THEN** context fingerprint 绑定 active build、origin TU、exact argv/cwd、toolchain 与 evidence
-- **AND** 零/一/多个 proven context 分别产生 `unavailable` / `resolved` / `ambiguous-context`，不得按 basename、目录距离或最近使用猜选
-- **AND** `utils.ue_goto.location.dedup_locations` 能去除重复 location
+- **WHEN** runner 没有已有用户配置或插件缓存，且 Windows 车道拉起 LLVM
+- **THEN** checkout、依赖初始化与全量回归均指向同一隔离目录
+- **AND** Windows 上 clangd/clang/libclang 来自同一受支持工具链版本；缺失的必需工具直接失败
+  而非静默跳过原生验收
+- **AND** Linux/macOS 无强制 LLVM 要求，能力不满足时用例报告显式 capability skip
 
 ### Requirement: 套件失败可定位
 
-回归套件 SHALL 在任意用例失败时输出足够定位的上下文，便于「开发完跑一遍」时快速排错。
+回归套件 SHALL 在任意用例失败时输出 `describe > it` 归属、断言期望与实际值或错误堆栈摘要，
+并以非零退出码结束，便于「开发完跑一遍」时快速排错。
 
 #### Scenario: 失败输出包含归属与原因
 
 - **WHEN** 任意领域用例失败
-- **THEN** 输出包含 `describe > it` 归属、断言期望与实际值或错误堆栈摘要
+- **THEN** 输出包含用例归属与失败原因
 - **AND** 整体退出码非零
+
+## 选型与踩坑
+
+- **选型**：用 `describe/it` 风格分组 + 纯函数输入→输出断言，而非只验证「模块能加载」——
+  仅验证加载对重构中悄悄改变的行为契约（如 `ue_goto` 的 semantic context 判定规则）无防护力。
+- **踩坑**：CI 原生编译器验收若跨大版本包渠道拉取 LLVM 组件（clangd 与 clang/libclang 版本不
+  一致），会导致编译期证明测试基于不一致的工具链，结论不可信；处置为固定同一受支持版本渠道
+  （见 headless-test-harness 的 required-native 语义）。
+- **重要事项**：Linux/macOS 车道不作为 LLVM 强制验收通道是当前既定范围，非疏漏；覆盖缺口
+  由 capability skip 显式暴露。

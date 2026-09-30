@@ -126,8 +126,10 @@ t.describe("Snacks picker clipboard paste keeps live search separate", function(
     return opts.picker.actions.paste_clipboard
   end
 
-  local function paste_into(live)
-    local old_clipboard = vim.fn.getreg("+")
+  local function paste_into(live, registers)
+    local old_getreg = vim.fn.getreg
+    registers = registers or { ["+"] = "pasted-query" }
+    local reads = {}
     local win = vim.api.nvim_get_current_win()
     local buf = vim.api.nvim_win_get_buf(win)
     local previous = vim.api.nvim_buf_get_lines(buf, 0, 1, false)
@@ -138,9 +140,15 @@ t.describe("Snacks picker clipboard paste keeps live search separate", function(
 
     vim.api.nvim_buf_set_lines(buf, 0, 1, false, { "" })
     vim.api.nvim_win_set_cursor(win, { 1, 0 })
-    vim.fn.setreg("+", "pasted-query")
 
     local ok, err = xpcall(function()
+      -- Test the picker consumer independently of the host clipboard provider.
+      -- Do not read or overwrite the user's real system clipboard in headless tests.
+      vim.fn.getreg = function(reg)
+        reads[#reads + 1] = reg
+        t.assert_true(reg == "+" or reg == "*", "paste must use a clipboard register")
+        return registers[reg] or ""
+      end
       paste_action()({
         opts = { live = live },
         input = {
@@ -156,19 +164,20 @@ t.describe("Snacks picker clipboard paste keeps live search separate", function(
       })
     end, debug.traceback)
 
-    vim.fn.setreg("+", old_clipboard)
+    vim.fn.getreg = old_getreg
     vim.api.nvim_buf_set_lines(buf, 0, 1, false, previous)
     vim.api.nvim_win_set_cursor(win, previous_cursor)
     vim.bo[buf].modified = previous_modified
     if not ok then error(err) end
-    return captured, finds
+    return captured, finds, reads
   end
 
   t.it("live picker paste updates search without creating a duplicate pattern tag", function()
-    local captured, finds = paste_into(true)
+    local captured, finds, reads = paste_into(true)
     t.assert_eq(captured.pattern, nil)
     t.assert_eq(captured.search, "pasted-query")
     t.assert_eq(finds, 1)
+    t.assert_eq(table.concat(reads, ","), "+", "non-empty clipboard takes precedence over primary selection")
   end)
 
   t.it("non-live picker paste continues to update the matcher pattern", function()
@@ -176,6 +185,21 @@ t.describe("Snacks picker clipboard paste keeps live search separate", function(
     t.assert_eq(captured.pattern, "pasted-query")
     t.assert_eq(captured.search, nil)
     t.assert_eq(finds, 1)
+  end)
+
+  t.it("empty clipboard falls back to primary selection", function()
+    local captured, finds, reads = paste_into(true, { ["*"] = "primary-query" })
+    t.assert_eq(captured.search, "primary-query")
+    t.assert_eq(captured.pattern, nil)
+    t.assert_eq(finds, 1)
+    t.assert_eq(table.concat(reads, ","), "+,*")
+  end)
+
+  t.it("empty clipboard registers leave the picker unchanged", function()
+    local captured, finds, reads = paste_into(true, {})
+    t.assert_eq(next(captured), nil)
+    t.assert_eq(finds, 0)
+    t.assert_eq(table.concat(reads, ","), "+,*")
   end)
 end)
 

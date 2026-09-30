@@ -73,6 +73,53 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-30 — SDD 轻量化：spec 只规定大方向并记录选型与踩坑
+
+**Task**
+- 用户判定 SDD 过重、阻碍开发：41 份主 spec 近万行、逐字段/逐超时契约与实现同频漂移。要求整理为只规定大方向、记录选型踩坑等重要事项。
+
+**Implemented**
+- `openspec/specs/*/spec.md` 全部 41 份重写为统一结构：Purpose（边界与方向）+ 2–6 条方向性 Requirement（保留安全/隐私、SuperUnity 不静默退化、DAP 五层分层等底线）+「## 选型与踩坑」段。
+- 政策降级：根 `AGENTS.md` SESSION START 第 4 步与 DoD 第 2/3 条、`docs/CONSTRAINTS.md` C7/C8/C9、`docs/testing-regression.md`、`memory/project_overview.md`、各目录 `AGENTS.md` 的「治理 spec」措辞——日常修复不需改 spec、不强制立 change，changelog 不再逐条声明 spec 一致性处置。
+- `openspec/config.yaml` 增加轻量化说明；未实现的 `2026-09-28-restructure-super-unity-compression` 以 `--skip-specs` 归档（0/22 任务，已标注未实现），其调查结论与已选方向浓缩进 `cpp-semantic-index-coverage` 的「选型与踩坑」。
+
+**Pitfalls / Gotchas**
+- 瘦身只浓缩不编造；完整旧条款仍可在 git 历史与 `openspec/changes/archive/` 查到。
+- SuperUnity 方向（Tier 1 发射序列分组）**尚未实现、无实测收益**，不得引用为已交付。
+
+- 新增 `tests/run_parallel.lua`：每个 spec 文件独立 `nvim --headless -l tests/run.lua <file>` 子进程（run.lua 已隔离 state/log/probe），默认 min(8, CPU/2) 并发，实时逐文件进度，按上次耗时优先调度慢文件。串行 `tests/run.lua` 仍是 CI/提交门禁入口。
+- `tests/cases/index_batch_runtime_spec.lua`：盘符根监听用例等待由 3 s 改为 12 s（与同文件 `await_watch_probe` 及生产 10 s 探测预算一致）；同文件其余 7 处等待真实 fs 事件到达的正向 `vim.wait(1000)` 统一放宽到 5 s（并行负载下父目录 rename 失效用例曾超时）。均为「等到条件成立即返回」的正向等待，未改生产时限或断言语义。
+
+**Validation**
+- 41/41 `openspec validate <cap> --type spec --strict` 通过；`structure` 78/78。
+- `index_batch_runtime` 修复前单独串行 3 次中 1 次失败（盘符根 3 s 等待），修复后连续 4 次 80/80。
+- 并行全量（`NVIM_TEST_REQUIRE_NATIVE=1`，Python 3.14，jobs=8）：首轮 124/125 文件（父目录 rename 用例 1 s 等待超时），放宽等待后 **125/125 文件、2344 用例全绿，140.6 s**（串行约 10+ 分钟）。
+
+### 2026-09-30 — 修复跨平台原生回归前置与诊断
+
+**Task**
+- Tree-sitter 安装恢复后，继续处理 PR #13 全量回归实际暴露的跨平台失败。
+
+**Implemented**
+- `.github/workflows/headless.yml` 为 Linux 安装既有 `fd-find` 前置；用官方 LLVM 22.1.5 完整归档和固定 SHA256 配置编译器、clangd、libclang 与 builtin headers，避免 apt 的 22.1.8 漂移绕开或触发既有精确版本门禁。
+- `tools/clangd_batch_bindings.py` 保留选定 libclang 的安装路径，再查真实链接目标，支持 Debian multiarch 布局；显式资源目录和版本约束保持。
+- `grep_cache_spec` 在剪贴板输入边界提供 fixture，保留真实 picker 编辑行为；compiler fixture 保留 `clang++` 符号链接的调用名。
+- 原生测试区分 Windows 专属场景和缺失工具；watcher 用真实探针验证能力及原命令回退，测试等待覆盖既有生产探针时限。
+- `tests/run.lua` 与 harness 在 CI 立即刷新 spec/case 标记，避免提前退出后只能看到延迟通知、无法定位退出点。
+
+**Pitfalls / Gotchas**
+- 必需的原生证明仍保持启用，未放宽 LLVM 22.1.5 证明限制、伪造宿主能力或改变 SuperUnity 压缩/准入机制。
+- Windows CI 使用 Neovim 0.12.5，本地原版本为 0.11.5；已在临时目录校验并运行官方同版程序，未替换用户安装。
+
+**Validation**
+- 剪贴板回归 36/36；libclang 布局新增用例先复现原错误，修复后 required-native bindings 11/11。
+- Windows required-native runtime 80/80、activation 9/9、query 7/7、verified batch 27/27；真实 Linux Python 验证不支持的 query profile 拒绝路径。
+- 同版 Neovim 0.12.5 的 Git review 73/73、transport 9/9；整合全量见上条（125/125 文件），远端三平台复验待 PR #13 CI。
+- Spec 一致性：同步 `headless-test-harness` 的真实宿主适用性与 CI 进度证据契约、`config-regression-suite` 的一致工具链前置；资源查找与 fixture 修复恢复既有行为契约。
+
+**Follow-ups**
+- 以对应提交的三平台完整 CI 结果验收；Windows 提前退出的具体位置仍需带进度标记的运行记录确认。
+
 ### 2026-09-30 — 修复 CI Tree-sitter CLI 安装版本
 
 **Task**

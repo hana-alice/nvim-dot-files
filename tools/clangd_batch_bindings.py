@@ -147,9 +147,14 @@ def _resource_directory(libclang_path, version, requested):
     if requested:
         candidates = [Path(requested)]
     else:
-        library_dir = Path(libclang_path).resolve().parent
-        candidates = [library_dir.parent / 'lib' / 'clang' / major,
-                      library_dir / 'clang' / major]
+        library = Path(libclang_path).absolute()
+        # Debian's selected LLVM-prefix library is a symlink into a multiarch
+        # directory. Keep that installation prefix before trying the real
+        # library's siblings; resolving first loses its resource directory.
+        candidates = []
+        for library_dir in dict.fromkeys((library.parent, library.resolve().parent)):
+            candidates.extend((library_dir.parent / 'lib' / 'clang' / major,
+                               library_dir / 'clang' / major))
     for candidate in candidates:
         if candidate.name.split('.')[0] == major and (candidate / 'include').is_dir():
             return candidate.resolve()

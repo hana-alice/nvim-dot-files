@@ -52,7 +52,7 @@ function M.verify(target, usr, client_ids, callback, opts)
       and (not opts.is_current or opts.is_current())
       and vim.api.nvim_buf_is_valid(bufnr)
       and vim.api.nvim_buf_get_changedtick(bufnr) == tick
-      and location.normalize_path(vim.api.nvim_buf_get_name(bufnr)):lower() == location.normalize_path(path):lower()
+      and transaction.same_file_path(vim.api.nvim_buf_get_name(bufnr), path)
   end
   local position = (target.targetSelectionRange or target.targetRange or target.range).start
   local line = vim.api.nvim_buf_get_lines(bufnr, position.line, position.line + 1, false)[1]

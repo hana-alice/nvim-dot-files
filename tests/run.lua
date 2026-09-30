@@ -86,6 +86,10 @@ io.write(string.format("Running %d spec file(s)%s\n\n",
   #files, filter and (" [filter=" .. filter .. "]") or ""))
 
 for _, file in ipairs(files) do
+  if vim.env.CI == "true" then
+    io.stderr:write("[spec] " .. vim.fn.fnamemodify(file, ":t") .. "\n")
+    io.stderr:flush()
+  end
   local chunk, load_err = loadfile(file)
   if not chunk then
     -- 文件无法加载：记为一个失败用例，继续其余文件。

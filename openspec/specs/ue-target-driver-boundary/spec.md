@@ -1,64 +1,21 @@
 # ue-target-driver-boundary Specification
 
 ## Purpose
-这个 capability 把 host/target 的正交关系固定成可执行契约：host driver 只回答“当前宿主是什么、有哪些主机级能力可用”，target driver 只回答“在这个宿主上，某个目标是否可行、应该走哪份计划”。`host_operations` matrix 由此成为兼容性的唯一真相，任何 host/target 可执行性判断都必须从这里出发，而不能再回读 `ue.lua`、当前平台选择、或别的 target 的默认值来猜测。这样一来，Android、iOS、Mac、Win64、Linux 的 target 规则可以独立演进，同时避免通用层把跨平台 fallback 当成“更聪明”的行为。
+
+把 host/target 的正交关系固定成可执行契约：host driver 只回答“当前宿主是什么、有哪些主机级
+能力可用”，target driver 只回答“在这个宿主上，某个目标是否可行、应该走哪份计划”。
+`host_operations` matrix 是兼容性的唯一真相，任何 host/target 可执行性判断都必须从这里出发，
+不能回读 `ue.lua`、当前平台选择或别的 target 的默认值来猜测。这样 Android/iOS/Mac/Win64/Linux
+的 target 规则可以独立演进，同时避免通用层把跨平台 fallback 当成“更聪明”的行为。
 
 ## Requirements
 
-### Requirement: Android SDK policy SHALL reach the compiler arguments
-
-For Android build and SO-only build, the driver SHALL load an external JSON SDK policy afresh
-when forming each plan. `ue.config`'s `android.sdk_policy_file` SHALL select the policy file;
-its default location SHALL be `stdpath('state')/ue-android-sdk-policy.json`. The policy SHALL
-contain `config_file` (a project-relative INI path), `key` (the SDK field name), and
-`disable_argument` (one UBT argument). Actual project-specific mappings SHALL remain outside
-the public worktree; repository code, tests and documentation MUST NOT encode, assemble or
-rename private identifiers merely to bypass a privacy scanner.
-
-The public example mapping is `Config/SDK/Runtime.ini`, `UseSDK`, and `-skip-project-sdk`.
-These are illustrative values, not evidence of a real checkout's configuration or Target parser.
-The driver SHALL resolve `config_file` relative to the selected `.uproject` directory and read
-that file afresh. An explicit value `0` SHALL append the policy's actual `disable_argument` to
-the normal UBT plan. Runtime configuration alone MUST NOT be treated as proof that the Target
-excluded SDK modules. The driver MUST NOT infer policy from another checkout, cached selection,
-or a preparation script's unrelated output.
-
-The project configuration is a bounded UTF-8/ASCII key/value file (up to 64 KiB); UTF-8 BOM,
-whitespace and `;`/`#` comments SHALL be accepted. A missing policy, missing project file/key,
-or value `1` SHALL preserve the Target's existing default without injecting a disable argument.
-Malformed policy, invalid/conflicting values, unsupported encoding, oversize or read failures
-other than file absence SHALL return an unavailable plan with a reason. Unrelated configuration
-contents MUST NOT be logged or persisted; metadata SHALL expose only the effective `sdk_disabled`
-boolean, not the external mapping or INI contents.
-
-#### Scenario: Runtime configuration disables SDK
-
-- **WHEN** the external policy identifies a field whose value is `0` in the selected project's configuration
-- **THEN** the normal build plan SHALL include the policy's actual `disable_argument` as one argument
-- **AND** the SO-only plan SHALL forward the same compiler decision into its UBT action-export phase
-- **AND** plan metadata SHALL expose the effective `sdk_disabled` decision
-
-#### Scenario: Configuration or project changes
-
-- **WHEN** the user changes the external policy, its selected SDK field, or the checkout before creating a new build plan
-- **THEN** the new plan SHALL reflect the current policy and that project's current file contents without an editor restart
-- **AND** an already captured plan SHALL remain unchanged
-
-#### Scenario: Project has no SDK-specific configuration
-
-- **WHEN** no external policy exists or the selected project has no configured INI file or key
-- **THEN** Android build arguments SHALL retain the existing Target default
-- **AND** no SDK-specific settings SHALL be written to the project
-
 ### Requirement: host/target 兼容性必须只看 `host_operations` matrix
 
-系统 SHALL 以 target driver 声明的 `host_operations` matrix 作为 host/target 兼容性的唯一判据；`ue.lua`、通用 runner、当前平台 UI 状态或任何兄弟 target 的默认值 MUST NOT 参与兼容性推断。若某个 host/target pair 未在 matrix 中声明，系统 MUST 明确报告该 pair 不兼容，而不是隐式选择别的 target 或别的 backend。
-
-#### Scenario: 已声明的 host/target pair 可以进入规划
-
-- **WHEN** 当前宿主与请求的 target pair 出现在该 target driver 的 `host_operations` matrix 中
-- **THEN** 系统 SHALL 允许继续进入该 target driver 的规划阶段
-- **AND** 所得结果 SHALL 仅反映该 matrix 允许的 operation 集合
+SHALL：系统以 target driver 声明的 `host_operations` matrix 作为 host/target 兼容性的唯一判据；
+`ue.lua`、通用 runner、当前平台 UI 状态或任何兄弟 target 的默认值 MUST NOT 参与兼容性推断。若
+某个 host/target pair 未在 matrix 中声明，系统 MUST 明确报告该 pair 不兼容，不得隐式选择别的
+target 或别的 backend。
 
 #### Scenario: 未声明的 host/target pair 必须显式拒绝
 
@@ -66,9 +23,14 @@ boolean, not the external mapping or INI contents.
 - **THEN** 系统 SHALL 立即拒绝该请求并返回不兼容原因
 - **AND** MUST NOT 通过 sibling target、历史默认值或当前平台选择完成“自动修复”
 
-### Requirement: target driver 只能产出纯 policy/plan
+### Requirement: target driver 只能产出纯 policy/plan，严禁跨 target fallback
 
-系统 SHALL 让 target driver 只负责纯 policy/plan：它可以描述 build、prepare、package、install、launch、debug 或 probe 所需的结构化步骤与约束，但 MUST NOT 直接执行异步任务、打开 UI、探测设备、挑选进程、写进度条、触发 cleanup 或 mutate session state。任何可观察副作用都必须由下游 workflow owner 或 runner 执行。
+SHALL：target driver 只负责纯 policy/plan——描述 build/prepare/package/install/launch/debug/
+probe 所需的结构化步骤与约束，但 MUST NOT 直接执行异步任务、打开 UI、探测设备、挑选进程、写
+进度条、触发 cleanup 或 mutate session state；任何可观察副作用必须由下游 workflow owner 或
+runner 执行。系统 SHALL 保证 target driver 的规划结果不会因为“本 target 不可用”而自动跳到另一
+个 target；一旦当前 target 的规划或能力缺失，系统 MUST 失败或返回显式不可用状态，任何跨 target
+的恢复或降级都必须由上层明确选择，不能由 driver 自行兜底。
 
 #### Scenario: driver 只返回结构化计划
 
@@ -76,24 +38,44 @@ boolean, not the external mapping or INI contents.
 - **THEN** driver SHALL 只返回结构化 plan、约束与所需能力
 - **AND** SHALL NOT 直接执行安装、启动、连接或设备枚举
 
-#### Scenario: driver 不能借通用层偷偷做副作用
-
-- **WHEN** target driver 的实现需要读取文件、路径或候选工具信息
-- **THEN** 这些读取 SHALL 只用于生成 plan 或 capability 结果
-- **AND** driver MUST NOT 通过通用层启动异步 job、更新状态栏或修改当前会话
-
-### Requirement: target driver 严禁跨 target fallback
-
-系统 SHALL 保证 target driver 的规划结果不会因为“本 target 不可用”而自动跳到另一个 target；一旦当前 target 的规划或能力缺失，系统 MUST 失败或返回显式不可用状态。任何跨 target 的恢复、降级或兼容实现都必须由上层明确选择，不能由 driver 自行兜底。
-
 #### Scenario: Android driver 缺失时不能改用 iOS driver
 
 - **WHEN** 当前请求的 target 是 Android，但 Android driver 未声明该 host 的可用操作
 - **THEN** 系统 SHALL 失败并报告 Android 不可用
 - **AND** MUST NOT 复用 iOS driver、Mac driver 或其他 target 的 plan
 
-#### Scenario: 同一请求不能因为平台切换而换 driver
+### Requirement: Android SDK policy 必须经外部配置文件到达编译参数
 
-- **WHEN** 一个请求已经绑定到某个 target driver
-- **THEN** 该请求后续步骤 SHALL 继续使用同一个 driver 的规划结果
-- **AND** MUST NOT 因当前平台选择变化而切换到另一个 driver
+SHALL：Android build 与 SO-only build 时，driver 在形成每份 plan 时都要重新加载外部 JSON SDK
+policy（`ue.config` 的 `android.sdk_policy_file` 选择该文件，默认
+`stdpath('state')/ue-android-sdk-policy.json`），其中包含项目相对 INI 路径、字段名与一个 UBT
+disable argument。实际项目专属映射必须留在公开 worktree 之外；仓库代码、测试与文档 MUST NOT
+编码、拼装或改写私有标识以绕过隐私扫描。显式值 `0` 时才追加该 disable argument；运行时配置本身
+不能证明 Target 已排除 SDK 模块。缺失 policy/字段或值为 `1` 时必须保留 Target 既有默认值；
+malformed policy 或读取失败（非文件缺失）必须返回不可用 plan 并附原因；元数据只暴露最终
+`sdk_disabled` 布尔值，不暴露外部映射或 INI 内容。
+
+#### Scenario: 运行时配置禁用 SDK
+
+- **WHEN** 外部 policy 指出某字段在当前项目配置中的值为 `0`
+- **THEN** 普通 build plan 必须包含该 policy 的实际 disable argument 作为一个参数
+- **AND** SO-only plan 必须把同一编译决策转发进它的 UBT action-export 阶段
+
+#### Scenario: Project 没有 SDK 专属配置
+
+- **WHEN** 不存在外部 policy，或所选项目没有配置对应 INI 文件或字段
+- **THEN** Android build 参数必须保留 Target 既有默认值，不写入任何 SDK 专属设置到项目
+
+## 选型与踩坑
+
+- **选型**：兼容性判据唯一来源是 `host_operations` matrix，不是 `ue.lua` 的隐式判断——这是把
+  12,002 行单体中散落的平台分支收口的核心手段
+  （出处：`openspec/changes/archive/2026-08-24-establish-ue-platform-workflow-boundaries/proposal.md`）。
+- **选型**：Android SDK 私有映射放在公开镜像之外的机器本地 JSON（`android.sdk_policy_file`），
+  仓库内只保留占位示例（`Config/SDK/Runtime.ini`、`UseSDK`、`-skip-project-sdk`），避免公开镜像
+  泄漏真实工程私有标识。
+- **踩坑**：K71（2026 迁移）— 运行时 SDK 设置本身不会让编译器禁用 SDK 模块，Target 在无参数时
+  默认启用 SDK；准备脚本写入的文件并非 Target 真正消费者。必须核对实际 Target parser 与最终 UBT
+  argv，普通/SO 构建都要把当前项目的禁用意图转成外部策略指定的单个编译参数，不能只以“环境设置
+  成功”作为编译产物证据；迁移后的行为与隐私门禁必须重新验收，不能沿用迁移前的绿灯
+  （出处：`docs/CONSTRAINTS.md` K71；`docs/release_1.11.2.md`）。

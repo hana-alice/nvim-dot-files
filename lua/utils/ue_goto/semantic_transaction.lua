@@ -119,9 +119,22 @@ function M.make_position_params(tx, _bufnr, position_encoding)
   }
 end
 
+function M.same_file_path(left, right)
+  left, right = location.normalize_path(left), location.normalize_path(right)
+  if left == right then return true end
+  -- Existing targets may use symlink or short-name spellings while Neovim
+  -- reuses a buffer under its canonical name. Do not rewrite the provider URI.
+  local real_left, real_right = vim.uv.fs_realpath(left), vim.uv.fs_realpath(right)
+  if real_left and real_right then
+    return location.normalize_path(real_left) == location.normalize_path(real_right)
+  end
+  -- Unsaved/nonexistent subjects retain the existing lexical comparison.
+  return left:lower() == right:lower()
+end
+
 function M.same_subject_location(tx, value)
   if not tx or not value then return false end
-  if location.normalize_path(location.location_path(value)):lower() ~= tx.subject.path:lower() then
+  if not M.same_file_path(location.location_path(value), tx.subject.path) then
     return false
   end
   local range = value.targetSelectionRange or value.targetRange or value.range

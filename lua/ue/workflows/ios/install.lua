@@ -107,7 +107,7 @@ function M.install(platform, deps)
               device_id = target_ctx.device_id,
               device_backend = target_ctx.device_backend,
               bundle_id = bundle_id,
-            })
+            }, ctx)
             if not runtime then
               install_error(update_err)
               return
@@ -134,7 +134,7 @@ function M.install(platform, deps)
             device_id = target_ctx.device_id,
             bundle_id = bundle_id,
             artifacts = artifacts,
-          })
+          }, ctx)
           if not runtime then
             install_error(update_err)
             return

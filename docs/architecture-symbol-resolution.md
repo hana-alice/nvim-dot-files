@@ -1,6 +1,6 @@
 # Symbol Resolution Architecture — C++ 语义权威与非 C++ 兼容链
 
-> 最后更新：2026-08-08
+> 最后更新：2026-09-15
 > 权威代码：`lua/utils/lsp_fallback.lua`、`lua/utils/ue_goto/semantic_*.lua`、
 > `lua/ue/index/`、`lua/ue/clangd_commands.lua`、`scripts/ue_clang_semanticd.lua`、
 > `scripts/ue_clang_cursor_shim.c`
@@ -15,6 +15,9 @@ canonical USR（或等价的 compiler-owned identity）；函数名、receiver �
 csearch 或 GTAGS 自动猜目标，也不让 Tree-sitter 决定或否决语义结果。显式搜索、
 references 和非 C++ 文件仍可使用 csearch / GTAGS；这是另一条能力边界。
 
+环境要求按 route 区分：source 需要 clangd 与当前 build/CDB；header 才额外要求匹配 libclang。
+缺少 header 的 native tooling 不再提前阻断独立的 source clangd 路径。
+
 ## 2. 两条 C++ 路径
 
 ### 2.1 Active CDB 覆盖的 source TU
@@ -28,10 +31,18 @@ clangd 启动资格来自同一组持久化证据，而不是进程内“执行�
 selection/artifact、controlled/semantic CDB 与源 CDB 签名仍为 ready 时，Nvim 重启后直接复用；证据
 missing/stale 或 tuple 变化时才 defer。同进程内也逐次验证，避免更新 CDB 后沿用旧的 positive cache。
 
-1. 只向已接收 exact command 的 clangd client 请求 `textDocument/symbolInfo` canonical USR；
+1. 只向已接收 exact command 的 clangd client 请求 `textDocument/symbolInfo`，聚合响应中全部 canonical USR，不选数组首项；
 2. definition 请求只允许同一 USR 的 client 参与；
-3. 去除当前位置后必须只剩一个 destination，否则返回结构化 empty/multiple reason；
+3. 去除当前位置后必须只剩一个 destination，且与该 identity 的 definition evidence 相符；source `symbolInfo` 不查询跨 TU index，目标不在其 definitionRange 时由 `clangd_destination.lua` 在目标 source TU 的 exact command 下再次验证同一 client/USR 与目标 definitionRange。声明不可冒充 definition，过期/目标编辑不跳转，临时 buffer 在未使用且未修改时清理；
 4. 目标为 header 时，把 exact command 记录为该窗口后续 header-in-context 查询的 origin TU evidence。
+
+实体角色不能一律用 `symbolInfo.definitionRange` 判定。`clangd_referent.lua` 按 clangd 的规则优先保留唯一
+macro USR（它可能与展开后类型一起返回，且本来不带两个 range）；同一 client 的唯一 macro definition
+可直接证明目标。alias/namespace 则用原 snapshot 的零长度 `textDocument/ast` range 检查
+`Typedef/type`、`Namespace/specifier`，再将唯一 destination 与唯一 USR 的 declarationRange 关联；
+保留 `declaration-resolved` 角色，不把函数声明、extern 或前置类冒充 body。未知 kind/真实身份分歧仍失败。
+已在 compiler definitionRange 内时直接报告 `already-at-definition`，避免 clangd 的 declaration/definition
+切换行为被误报为索引缺失。内建宏没有磁盘定义时报告 `macro-no-source-definition`。
 
 若 clangd restart 后已先用 synthetic CDB 的邻近 TU 推断命令打开 source，首次 exact transport 会对
 同一 client/command 只执行一次有序 `didClose → didChangeConfiguration → didOpen`，用当前 buffer 全文
@@ -85,6 +96,33 @@ source 与 header 共用同一 identity/destination authority。声明处不是�
 
 ## 3. Semantic sidecar
 
+### 3.1 模块归属
+
+| 模块 | 所有权与依赖边界 |
+|---|---|
+| `lsp_fallback.lua` / `provider.lua` | 稳定公共入口、命令和路由；provider 转发到具体能力 |
+| `semantic_navigation.lua` | action coordinator：最终 freshness、jump、成功后的 lineage、进度与终态通知 |
+| `semantic_report.lua` | 纯报告数据：Explain、通知文本、脱敏和 probe payload；不执行请求或修改编辑器 |
+| `lsp_transport.lua` | 通用 LSP 请求、能力与超时；不发现 UE 构建，不调用 legacy search |
+| `clangd_adapter.lua` | clangd exact-command transport、canonical USR 与 identity 限定的 destination 请求 |
+| `clangd_referent.lua` | source macro/alias/namespace 的 compiler referent 关联与角色保留 |
+| `compat_navigation.lua` | 非 C++ definition 的重试/fallback 与 references 兼容策略 |
+| `semantic_environment.lua` | 只读环境快照与 transition 判定；不 evict、不清 lineage、不启动进程 |
+| `semantic_client.lua` | composition root：分开的 transport/action state，环境变化处置与 dispose |
+| `semantic_client_runtime.lua` / `semantic_session.lua` | 队列、进程、deadline 与实际 compiler handshake session；通过请求级 validity callback 判断排队请求是否过期 |
+| `semantic_client_actions.lua` | 编辑器快照、overlay、取消与窗口 context；返回 origin evidence，由 coordinator 在 jump 成功后提交 |
+| `semantic_sidecar.lua` | native composition root、协议路由与聚合 metrics |
+| `semantic_sidecar_tu.lua` | TU store：CXIndex、TU 与 compilation database handles 的创建和释放 |
+| `semantic_sidecar_catalog.lua` | compiler evidence catalog，经显式依赖访问工具链和 metrics |
+| `semantic_sidecar_definition.lua` | definition resolver：自己的 LRU 与 controlled CDB cache，通过注入接口借用 TU |
+
+sidecar 三个组件各自实例化；TU shutdown 不再顺手删除 definition cache。根对象统一 evict/shutdown 时
+显式调用相关 owner。client transport 与 action 不共享可变 state，transport 不依赖 action installer
+稍后补上的方法。source 与 header 保留各自的证明流程，只在 coordinator 汇合跳转副作用。
+navigation install 返回独立实例；公开 lineage getter 返回副本，外部修改返回值不会越过提交入口改写内部状态。
+
+### 3.2 Native 语义执行
+
 主 Neovim 只负责异步进程 I/O、请求快照、context 选择和跳转副作用。独立 headless
 Neovim 通过 LuaJIT FFI 加载与 clangd 同目录的 `libclang.dll`，通过 versioned NDJSON
 协议处理 `handshake/catalog/prove/query/lookup-definition/stats/evict/shutdown`。
@@ -103,6 +141,10 @@ file + line + column
 空 USR、null / invalid cursor、`OverloadedDeclRef`、recovery AST 或不同 context 的
 不同 USR 都不能降级成“第一候选”。本地缺少匹配 semantic tooling 时返回
 `unavailable`，不会写引擎或项目源码，也不会生成 forced-include 补丁。
+error/fatal diagnostics 会阻止该 TU 提供语义答案；失败 TU 下次查询重新解析，允许补齐依赖后恢复。
+多 context 查询和 module lookup 的部分解析/遍历失败不能构成唯一目标证明。
+CDB 解码同时保留被拒绝的编译记录和完整性状态；catalog、prove、lookup 不能把成功解析的子集冒充完整输入。
+compiler 返回的相对目标与依赖路径统一按该 TU 的编译目录解析。
 
 `clang_getCursorDefinition` 的可见域是当前 origin TU 的 AST。若头文件 declaration
 对应的 out-of-line body 位于另一 source TU，identity query 仍返回 canonical USR，但
@@ -125,14 +167,29 @@ clangd；其 `symbolInfo` USR 必须与 sidecar USR 完全相同。
 
 | 状态 | 含义 | 是否跳转 |
 |---|---|---|
-| `resolved` | 唯一 canonical identity 与合法 declaration/definition | 是 |
+| `resolved` | 导航 coordinator 已完成合法目标跳转 | 已跳转 |
 | `ambiguous-context` | 多个 proven context 产生不同真实结果 | 否；先选 context |
 | `invalid-semantic-context` | TU 可建，但当前位置是 invalid/recovery/dependent 结果 | 否 |
 | `unavailable` | 工具、CDB、proven context 或协议不可用 | 否 |
 
 每次 `gd` 带 monotonic action token、window/buffer/cursor/changedtick 和 document
 version 快照。响应到达时任一项变化即 stale；stale 响应不得改窗口、jumplist 或光标。
+同一 action 冻结全部 unsaved overlays，并验证 active roots 内已加载 C++ buffer 的版本，
+防止另一依赖 buffer 在等待期间编辑或编辑后保存造成旧语义结果被接受。目标协议列按编码转换为字节列。
 `:UEDefCancel` 只取消 UI side effect，不强杀仍可能留下 warm TU 的冷解析。
+尚未执行的旧 action 请求会从 client 队列移除并完成回调；sidecar 同时只接收一个执行中请求，
+执行 deadline 从实际发送时计算，不扣除等待前序请求的时间。已有 native 请求仍受硬超时回收保护。
+`UEDefExplain` 输出有界、脱敏的原始失败原因、诊断、上下文和阶段耗时。
+LSP preparation 和真正发送前都检查同一 action 的有效性；已发送请求保留 request ID，取消/超时只取消
+对应请求。action cleanup 支持多项注册与注销，进度清理和请求取消不会互相覆盖。
+成功终态在 jump 前验证 identity、location、provider、destination role 与 metrics 来源，所有成功路径
+均保留 USR；header 还携带实际 compiler session。没有测得的阶段耗时不伪造为测量值。
+
+协议 evidence 与 action outcome 不同：`query/resolved` 表示 canonical USR 加 declaration/definition
+证据；`lookup-definition/resolved` 必须是 canonical USR 加 definition。单独的 identity 响应不表示
+编辑器已跳转。新 lineage 在 jump 成功后才提交；失败保留原 context。每个进度句柄拥有独立的
+原生非聚焦 float、buffer 和 8 秒到期计时器，clear/finish 只清理这些资源，不扫描其他窗口。
+终态继续使用 `vim.notify`。过期 action 不覆盖最新 Explain；resolver 不再重复显示终态或持有进度 UI。
 
 ## 5. Reuse 与失效边界
 
@@ -145,12 +202,25 @@ origin_tu + active_build_key + exact compile fingerprint + toolchain identity
 
 unsaved overlay 按 `path + contents` 判断是否需要 reparse；document version 只参与
 stale 门禁，内容相同不会浪费一次 reparse。project/platform/configuration/target、CDB
-或 toolchain fingerprint 变化会清理窗口 context 并 evict sidecar TU。
+或构建 fingerprint 变化会清理窗口 context 并 evict sidecar TU。工具链变化则重启进程，
+不能仅清 TU 后继续使用已经加载的旧 libclang。`UEDefReload` 在清除模块缓存前先 dispose 旧 client，
+取消旧 action、清理进度和 context 并停止旧 sidecar；旧实例的延迟启动回调受 lifecycle generation 守卫。
 
-resolved destination cache 绑定 canonical USR、所有候选 controlled CDB 的文件签名、
+EnvironmentSnapshot 中 `compiler_files` 保存 clangd/libclang 的 realpath、size、mtime（秒和纳秒），
+只用于宿主判断是否重新启动，不能冒充语义身份。CompilerSession 绑定进程代际、请求 descriptor 与
+handshake 返回的实际工具路径、Clang version、toolchain identity；路径不匹配或启动期间文件签名变化
+会拒绝 ready。普通响应附带处理它的 compiler session。文件签名不读取整个二进制内容，故无法检测
+刻意保留同 size/mtime 的原地替换。
+native compilation database 句柄也绑定数据库文件签名，并在全量 evict 时释放，覆盖协议允许的未嵌入
+compile descriptor 路径。NDJSON 对完整帧和分块帧统一执行 1 MiB 限制；真实 stdin 分块读取并背压，
+超限后丢弃到下一行边界再恢复。host 超大出站请求直接返回 `request-too-large`，不占满执行 deadline。
+
+resolved destination cache 绑定 canonical USR、决定模块选择的 subject、所有候选 controlled CDB 的文件签名、
 overlay 内容 hash 与 toolchain identity，所以同一实体从 call 跳到 declaration 后可直接复用。
 `definition-not-found` 与 `multiple-definitions` 不缓存，避免一个 module 的负证据压住另一个
 subject 的真实定义；裸 symbol、receiver、arity 与格式化 signature 永远不是 cache key。
+destination cache 有独立 LRU，默认上限 128 项（`UE_SEMANTICD_MAX_LOOKUP_ENTRIES` 可配置），
+命中更新顺序、无效签名条目清除；TU 数量上限不能替代该缓存上限。
 
 sidecar 记录 cold parse、reparse、warm cursor query、TU 数量和进程 RSS。实机表明单个
 UE Android TU 可达到数 GB working set，因此默认 LRU 容量为 1（可显式配置），并在 30 秒
@@ -167,6 +237,14 @@ C++ `gd` authority invariant 影响。
 恰好一条源位置记录、无幽灵位置。
 
 ## 7. 验证入口
+
+最终验收设置 `NVIM_TEST_REQUIRE_NATIVE=1`，缺失真实工具时不能以 SKIP 代替通过。
+`cpp_semantic_pipeline` 补充 header 的完整真实链路与持久反馈验证。
+
+反馈由 `semantic_report.OBSERVATIONS` 声明稳定修复 revision，在启动和记录路径开启有期限的观察。
+同 revision 休眠后不自动续期；读取报告、处置失败与确认复发分开记录。成功/失败计数与固定耗时桶
+支持观察质量变化，但不能把“已开启观察”表述为现场验证完成。持久化 owner 与生命周期 owner 分离，
+详见 `probe-feedback-loop` spec。
 
 - `nvim --headless -l tests/run.lua cpp_semantic_context`
 - `nvim --headless -l tests/run.lua cpp_semantic_client`

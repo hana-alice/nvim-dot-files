@@ -3,6 +3,20 @@ t.bootstrap()
 
 local ue = require("ue")
 
+t.describe("Android SO runner SDK argument forwarding", function()
+  if vim.fn.has("win32") ~= 1 or vim.fn.executable("pwsh") ~= 1 then
+    t.skip("native PowerShell runner", "requires Windows and PowerShell 7")
+  else
+    t.it("forwards the local SDK argument only to Target-evaluating action export", function()
+      local result = vim.system({ vim.fn.exepath("pwsh"), "-NoProfile", "-File",
+        vim.fn.stdpath("config") .. "/tests/fixtures/android_so_sdk_args.ps1",
+      }, { text = true, timeout = 30000 }):wait()
+      t.assert_eq(result.code, 0, (result.stdout or "") .. (result.stderr or ""))
+      t.assert_contains(result.stdout, "PASS")
+    end)
+  end
+end)
+
 local function with_target_env(platform, configuration, target, fn)
   local old_platform = vim.env.UE_TARGET_PLATFORM
   local old_configuration = vim.env.UE_TARGET_CONFIGURATION

@@ -55,7 +55,7 @@ function M.so_build_plan(context)
 
   local target_name = C.context_target(context)
   local configuration = C.context_configuration(context)
-  return powershell_plan(context, "so-build", script, {
+  local args = {
     "-EngineRoot",
     C.host_path(context.host_driver, context.engine_root),
     "-Project",
@@ -68,12 +68,17 @@ function M.so_build_plan(context)
     configuration,
     "-WaitMutex",
     "-FromMsBuild",
-  }, {
+  }
+  if C.trim(context.sdk_argument) ~= "" then
+    vim.list_extend(args, { "-SdkArgument", context.sdk_argument })
+  end
+  return powershell_plan(context, "so-build", script, args, {
     target = target_name,
     platform = "Android",
     configuration = configuration,
     workflow = "android-so-only",
     host_adapter = M.id,
+    sdk_disabled = C.trim(context.sdk_argument) ~= "",
   })
 end
 

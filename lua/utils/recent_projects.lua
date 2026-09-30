@@ -13,7 +13,7 @@ local M = {}
 local file_lock = require("ue.file_lock")
 
 local MAX_ENTRIES = 50
-local MAX_UPDATE_ATTEMPTS = 20
+local MAX_UPDATE_ATTEMPTS = 60 -- ~1.5 s of async retries under concurrent startups
 local MARKERS = { ".git", ".uproject", ".uplugin", "package.json", "Cargo.toml", "go.mod" }
 
 local function state_path()
@@ -40,8 +40,7 @@ end
 
 local function update_file(transform, attempt)
   local path = state_path()
-  local lease = file_lock.acquire(path .. ".lock")
-  if not lease then
+  local function retry()
     attempt = (attempt or 0) + 1
     if attempt <= MAX_UPDATE_ATTEMPTS then
       -- Keep this asynchronous: several Neovim instances can discover a
@@ -52,9 +51,14 @@ local function update_file(transform, attempt)
     end
     return false
   end
+  local lease = file_lock.acquire(path .. ".lock")
+  if not lease then return retry() end
   local ok, result = pcall(transform, read_lines(path))
   if ok and type(result) == "table" then ok = write_lines(path, result) end
   file_lock.release(lease)
+  -- On Windows the atomic rename fails while another instance still has the
+  -- list open for reading; that write must be retried, not silently dropped.
+  if not ok then return retry() end
   return ok
 end
 

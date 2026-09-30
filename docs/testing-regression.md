@@ -17,18 +17,26 @@ fail-closed 语义），禁止注入假可执行文件/假宿主让断言「碰�
 
 | 改动位置 | 最小必跑 filter |
 |---|---|
-| `lua/config/keymaps.lua` / 命令定义 | `keymaps` `commands` |
+| `lua/config/keymaps.lua` / 命令定义 | `keymaps` `commands` `review_editor` |
+| picker 交互 / sidebar / 插件工具链策略 | `review_editor` `smoke` |
+| Git 审阅路由 / Git 插件接线 / `lua/workarounds/codediff/**` | `git_review` `review_editor` `keymaps` `cheatsheet` `workarounds` `smoke` |
+| CI bootstrap / workflow / legacy smoke | `review_ci` + 全量 + legacy smoke |
+| `lua/utils/ue_watch.lua` / `dirty_save.lua` | `ue_watch_csearch` `multi_instance_state` `stability` |
 | `lua/utils/window_title.lua` | `window_title` `keymaps` `commands` `cheatsheet` |
 | `lua/utils/android_device.lua` / Android ADB device 路由 | `android_device` `dap` `ue_context` |
 | `lua/ue/config.lua`（schema） | `ue_config` `smoke` |
 | `lua/ue.lua` 项目选择 / context 解析 / workflow dispatch | `ue_project_context` `ue_api` `smoke` `ue_platform_boundary` |
 | `lua/ue/project_state.lua` / `lua/ue/file_lock.lua` / 共享持久状态 | `multi_instance_state` |
 | `lua/ue/cdb/**` | `ue_cdb` |
-| `lua/ue/dap/**` / `lua/utils/platform/**` | `dap` `platform` `ue_platform_boundary` |
-| `lua/ue/index/**` / `lua/ue/clangd_commands.lua` / controlled CDB generators | `index_generation` `cpp_semantic_index` `clangd_commands` `ue_api` `ue_platform_boundary` |
+| `lua/ue/dap/**` / `lua/utils/platform/**` | `dap` `platform` `dap_failure_layer` `ue_platform_boundary` |
+| `lua/ue/index/**` / `lua/ue/clangd_commands.lua` / controlled CDB generators | `index_generation` `index_subset_async` `cpp_semantic_index` `clangd_commands` `ue_api` `ue_platform_boundary` |
+| 二次批次 / RIFF 图 / 冻结输入验证与运行时保护 | `index_graph` `index_batch` `index_input_directory` `index_verified_batch` `index_inventory` `index_query_profile` `index_vfs_aliases` `index_generation` `cpp_semantic_client` `host_resource_discipline` |
+| 离线 generated-only 二次候选 | `index_generated_super_unity` `structure` |
+| Shader donor 来源 / C++ 后台路由 | `ue_cdb` `ue_unity_origin` `index_unity_receipt` `index_shader_routing` `index_generation` |
+| 源码内容变化 / 相同 CDB 的后台刷新 | `index_source_refresh` `index_delivery` `ue_watch_csearch` `stability` |
 | `lua/ue/targets/**` / `lua/ue/workflows/**` / `lua/ue/target_tasks.lua` | `ue_target_drivers` `ue_target_integration` `ue_target_tasks` `ue_workflows` `ue_platform_boundary` `platform` `commands` `stability` |
 | `lua/utils/ue_goto/**` / C++ `gd` / semantic sidecar | `cpp_semantic_context` `cpp_semantic_client` `cpp_semantic_sidecar` `ue_goto_behavior` `utils` `ue_platform_boundary` |
-| `lua/utils/code_search/**` / `ue_paths.lua` | `ue_goto_behavior` `ue_paths` `utils` `ue_platform_boundary` |
+| `lua/utils/code_search/**` / `lua/ue/csearch_build.lua` / `ue_paths.lua` | `csearch_build_guard` `ue_goto_behavior` `ue_paths` `utils` `ue_platform_boundary` |
 | `lua/config/options.lua` / `autocmds.lua` | `options` `autocmds` |
 | `lua/theme.lua` / `lua/highlights.lua` / `colors/**` | `theme` `smoke` |
 | `lua/utils/stall_probe.lua` | `stall_probe` |
@@ -51,10 +59,12 @@ fail-closed 语义），禁止注入假可执行文件/假宿主让断言「碰�
 - **冻结清单同步**：`commands_spec.lua` 的 `UE_COMMANDS`、`structure_spec.lua` 的目录清单等，
   在相关项变化时必须同步，否则回归会 FAIL（这是有意的防误删契约）。
 - **changelog 联动**：改动完成后在 `docs/changelog.md` 追加记录，其 Validation 字段写明
-  **所跑回归范围（filter 或全量）与结果**，以及本次 **spec 一致性处置**
-  （同步 spec / 立 change / 判定无 spec 影响）。
-- **spec 一致性联动**：改动改变了 `openspec/specs/<capability>/spec.md` 已声明的可观察行为时，
-  MUST 同步该 spec 或立一个承载该变更的 change；发现 spec 落后于已验证正确的实现时**反向更正 spec**。
+  **所跑回归范围（filter 或全量）与结果**；动了 spec 时注明。
+- **反馈验收**：涉及已有探针的行为修复必须声明新的观察 revision，核实对应 topic 的 revision/armed 状态，
+  并在 Validation 中区分 fixture 已验证、观察已开启和现场已验证。不得以“没有新记录”替代覆盖检查，
+  不得把开启观察窗口写成现场修复已经确认。
+- **spec 轻量联动**：spec 只规定大方向并记录选型/踩坑/重要事项；仅当改动改变大方向或产生值得留底的
+  选型/踩坑时更新对应 `openspec/specs/<capability>/spec.md`（直接改，不强制立 change）。
   权威：`openspec/specs/spec-authority-loop/spec.md`、根 `AGENTS.md` 的 Definition of Done 第 2 条。
 
 ## 一键全量回归
@@ -62,6 +72,22 @@ fail-closed 语义），禁止注入假可执行文件/假宿主让断言「碰�
 ```
 nvim --headless -l tests/run.lua
 ```
+
+语义导航、编译器或协议边界的最终验收必须启用真实工具门禁：
+
+```powershell
+$env:NVIM_TEST_REQUIRE_NATIVE = '1'
+nvim --headless -l tests/run.lua
+# 或：pwsh -File scripts/run_regression.ps1 -RequireNative
+```
+
+`UE_CLANGD` 可显式选择本机已有的兼容工具链。缺少 native 能力时，该模式失败；普通模式单独报告
+SKIP，跳过不计入通过数。汇总格式为 `N/M passed, K failed, S skipped`，M 不含跳过项。
+Linux CI 默认强制 native，并安装项目已有的 LLVM 22 工具链；其他宿主的缺失能力仍须显式显示。
+本地 runner 在加载模块前隔离 probe、state 与日志路径，避免回归写入或清理用户诊断日志。
+
+`cpp_semantic_pipeline` 使用临时项目输入，贯通真实 environment、native session/协议、catalog/query、
+实际跳转与正常退出反馈落盘；它不替代 source/clangd 的角色矩阵，也不代表大型 UE 项目的现场延迟验收。
 
 ## 本机真实能力健康检查
 
@@ -163,6 +189,7 @@ tests/
 | **options** | options_spec | 关键 option 取值 |
 | **autocmd/filetype** | autocmds_spec | usf→hlsl、cindent、commentstring |
 | **workarounds** | workarounds_spec | 注册表完整性 + frontmatter |
+| **Git 审阅** | git_review*_spec | 完整文件/路径覆盖、`-G` 搜索、ref/历史、Neogit 交接、hunk/index 数据保护、大树节点与格式一致；安装插件夹具与纯接线测试分别报告，不能代替真实大仓性能实测 |
 | **utils 纯函数** | fs_proc/ue_paths/ue_goto_behavior | 输入→输出行为断言 |
 | **稳定性** | stability_spec | 幂等 + 状态隔离 |
 

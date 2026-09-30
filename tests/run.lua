@@ -6,6 +6,7 @@
 --   nvim -l tests/run.lua
 --   nvim -l tests/run.lua <filter>     # 只跑文件名匹配 <filter> 的用例
 --   FILTER=<pat> nvim -l tests/run.lua # 同上，环境变量形式
+--   NVIM_TEST_REQUIRE_NATIVE=1        # missing native groups fail acceptance
 --
 -- 退出码：
 --   0  全部用例通过
@@ -23,6 +24,11 @@ vim.g.started_with_stdin = true
 -- 尚未触发的防抖 timer，避免旧测试 payload 延迟写到新路径。
 local probe_test_dir = vim.fn.tempname():gsub("\\", "/")
 vim.fn.mkdir(probe_test_dir, "p")
+-- Keep installed plugins/config readable, but never write local user evidence.
+-- Children inherit these process-local overrides; the launching shell is unchanged.
+vim.env.NVIM_TEST_RUN_ROOT = probe_test_dir
+vim.env.XDG_STATE_HOME = probe_test_dir .. "/state"
+vim.env.NVIM_UE_LOG_DIR = probe_test_dir .. "/logs"
 vim.env.NVIM_UE_PROBE_PATH = probe_test_dir .. "/ue_probes.json"
 
 -- 自举：require("tests.harness") 之前必须先把配置根目录挂上 rtp/package.path，
@@ -80,6 +86,10 @@ io.write(string.format("Running %d spec file(s)%s\n\n",
   #files, filter and (" [filter=" .. filter .. "]") or ""))
 
 for _, file in ipairs(files) do
+  if vim.env.CI == "true" then
+    io.stderr:write("[spec] " .. vim.fn.fnamemodify(file, ":t") .. "\n")
+    io.stderr:flush()
+  end
   local chunk, load_err = loadfile(file)
   if not chunk then
     -- 文件无法加载：记为一个失败用例，继续其余文件。

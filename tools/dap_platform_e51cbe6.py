@@ -1,12 +1,24 @@
 #!/usr/bin/env python
 # DIAGNOSTIC: reproduce the 5/21 e51cbe6 WORKING platform-mode attach exactly.
-# device: lldb-server platform --server --listen *:<pport>  (from /data/local/tmp)
+# device: lldb-server platform --server --listen "*:<pport>"
 # host attachCommands:
 #   platform select remote-android
 #   platform connect connect://[<serial>]:<pport>
 #   process attach --pid <pid>
 #   process handle SIG* ...
+#
+# ⚠️ The historical `/data/local/tmp` server location this probe was written
+# against is FALSIFIED for attach (docs/CONSTRAINTS.md K56): a shell-uid server
+# cannot ptrace the app on a `user` build and dies as
+# `attach failed: lost connection`. Start the server as the app uid:
+#   run-as <pkg> sh -c '/data/data/<pkg>/lldb-server platform --server --listen "*:<pport>"'
+# The host-side command sequence below is unchanged and still correct (K30).
 import socket, subprocess, json, threading, time, sys, contextlib
+# Emit UTF-8 regardless of the host ANSI code page (cp1252 on CI runners).
+# At import time so callers that import this module and call main() are covered.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
 DAP = r"C:/tools/lldb-22/install/bin/lldb-dap.exe"
 SYMSO = r"E:/Projects/SampleGame-3.4/Source/SampleGame/Binaries/Android/SampleGame_Symbols_v100000001/SampleGame-arm64/libUE4.so"
 

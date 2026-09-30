@@ -62,7 +62,7 @@ jobs:
 
       - name: Existing Tree-sitter CLI prerequisite
         shell: bash
-        run: npm install --global tree-sitter-cli@0.26.1
+        run: npm install --global tree-sitter-cli@0.26.3
 
       - name: Existing ripgrep prerequisite (Linux)
         if: runner.os == 'Linux'

@@ -551,6 +551,8 @@ local tabs = {
           { ":UEPackageIOS", "Stage/package IOS (no build/cook/run)" },
           { "<leader>us",    "Build Android SO only (skip APK)" },
           { "<leader>uq",    "Deploy Android SO; keep app stopped" },
+          { "<leader>ux",    "Android loop: build SO → deploy → debug-launch" },
+          { "<leader>uX",    "Symbolicate latest Android crash → quickfix" },
           { "<leader>uB",    "UEPrepare (IOS setup/semantic + CDB/index, then clangd)" },
           { ":UEPrepareIncremental", "Prepare dirty files only" },
           { "<leader>uc",    "Export compile_commands" },

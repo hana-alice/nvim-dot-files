@@ -78,22 +78,41 @@ function M.format_item(device)
   return ("%s  [%s]"):format(M.device_name(device), tostring(device and device.serial or "?"))
 end
 
+M.label_key = "ue_android_device_label"
+
 function M.get()
   local serial = trim(vim.g[M.global_key])
   return serial ~= "" and not serial:find("%s") and serial or nil
 end
 
-function M.set(serial)
+local function refresh_statusline()
+  pcall(function() require("ue")._refresh_statusline() end)
+end
+
+---@param device? table parsed `adb devices -l` row; its model becomes the statusline label
+function M.set(serial, device)
   serial = trim(serial)
   if serial == "" or serial:find("%s") then
     return nil, "Android device serial must be a non-empty value without whitespace"
   end
   vim.g[M.global_key] = serial
+  vim.g[M.label_key] = device and M.device_name(device) or nil
+  refresh_statusline()
   return serial
 end
 
 function M.clear()
   vim.g[M.global_key] = nil
+  vim.g[M.label_key] = nil
+  refresh_statusline()
+end
+
+---Short statusline token for the process-local selection: model name or serial.
+function M.status_label()
+  local serial = M.get()
+  if not serial then return nil end
+  local label = trim(vim.g[M.label_key])
+  return label ~= "" and label or serial
 end
 
 ---Build an argv for an operation directed at exactly one Android device.
@@ -143,7 +162,7 @@ local function choose_rows(opts, devices, done)
       done(nil, nil, "cancelled")
       return
     end
-    local serial, err = M.set(choice.serial)
+    local serial, err = M.set(choice.serial, choice)
     if not serial then
       notify(err, vim.log.levels.ERROR)
       done(nil, nil, err)

@@ -156,6 +156,16 @@ function M.find_symbol_artifact(context)
   return fallback_target_so(context)
 end
 
+--- Statusline token: selected device (process-local) and persisted package.
+--- Several devices are often attached; this shows where the next action goes.
+function M.status_token(state)
+  local ok_dev, device = pcall(require, "utils.android_device")
+  local label = ok_dev and device.status_label() or nil
+  local package = C.trim(state and state.android_package)
+  return "A:" .. (label or "no-device")
+    .. (package ~= "" and ("/" .. (package:match("([^.]+)$") or package)) or "")
+end
+
 function M.capabilities()
   return C.default_capabilities(M.id, {
     build = true,

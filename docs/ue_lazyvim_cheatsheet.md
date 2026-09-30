@@ -762,6 +762,8 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `:UEInstallIOS`           | CoreDevice: install current packaged `.app`; pre-iOS17: stream signing/upload/Upgrade progress through prepared `InstallIOSClient.sh`; never uninstall or launch |
 | `<leader>us`              | `:UEBuildAndroidSO` — export + execute UBT compile/link actions (no Deploy/Gradle/APK) |
 | `<leader>uq`              | `:UEDeployAndroidSO` — strip, push, atomically replace and verify `libUE4.so`; leaves the app stopped |
+| `<leader>ux`              | `:UEAndroidIterate` — build SO → quick deploy → wait-for-debugger launch; stops at the first failing step (`nodebug` arg: plain launch) |
+| `<leader>uX`              | `:UEAndroidCrash` — pull the device crash buffer, symbolicate the UE module with the build-id-matched symbols, open quickfix |
 | `<leader>uB`              | `:UEPrepare`; IOS on macOS also generates its semantic CDB and auto-runs first-use setup |
 | `<leader>uc`              | `:UEExportCompileCommands`          |
 | `<leader>ul`              | `:UELaunch` (no debugger)           |

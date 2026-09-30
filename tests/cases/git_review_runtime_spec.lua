@@ -152,7 +152,11 @@ local ok, err = xpcall(function()
   mapping("gv", "x").callback()
   wait(function()
     local view = lib.get_current_view()
+    -- Wait for the first file to be selected, not merely for entries: closing
+    -- while update_entries' callback is still pending makes pinned Diffview
+    -- index panel.cur_item == nil (file_history_panel.lua:380), seen on CI.
     return view and view.panel and view.panel.entries and #view.panel.entries > 0
+      and view.panel.cur_item ~= nil and view.cur_layout and view.cur_layout:get_main_win():is_file_open()
   end, "visual Diffview file history did not open")
   invoke("gV")
   back_to_editing()

@@ -1066,6 +1066,13 @@ t.describe("frozen batch startup runtime", function()
       vim.fn.mkdir(frozen_dir, "p")
       vim.fn.mkdir(root .. "/input", "p")
       vim.fn.writefile({ "[]" }, h.descriptor.verified_cdb)
+      -- macOS CI reports a `rename` event for this pre-existing CDB after the
+      -- watch starts, although nothing touches it again (evidence in the
+      -- failure message). Hypothesis under test: FSEvents coalesces and
+      -- delivers the creation that happened just before the stream began.
+      -- Let the fixture's own writes age out before the watch is installed;
+      -- the case under test is the first cache write, not this setup write.
+      if vim.uv.os_uname().sysname == "Darwin" then vim.wait(1000, function() return false end, 50) end
       h.descriptor.watch_roots = { root }
       h.descriptor.watched_files = { h.descriptor.verified_cdb, frozen_dir }
       h.descriptor.exclude_roots = { frozen_dir .. "/.cache", root .. "/frozen-cache" }

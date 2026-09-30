@@ -73,6 +73,23 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-30 — 按 CI 诊断修复 core_health 清理与 macOS 路径别名
+
+**Task**
+- `6656be3` 的诊断输出定位了两类 Linux/macOS 失败。
+
+**Implemented**
+- `lua/utils/core_health.lua`：临时审计目录递归删除失败时有界重试 5×100 ms（刚取消的子进程可能仍在写入），仍失败则保持 FAIL 并在 `next_step` 列出残留文件名。CI 证据：两次审计唯一差异是 `cleanup.temp=FAIL (temporary audit resources could not be removed)`，Ubuntu 与 macOS 都出现。
+- `tests/fixtures/cpp_semantic_pipeline/run.lua`：目标 buffer 按 realpath 比较。CI 证据：macOS 上实际为 `/private/var/.../defs.hpp`，期望为 `/var/.../defs.hpp`（`/var` 是 `/private/var` 的符号链接）。
+- `tests/cases/git_review_runtime_spec.lua`：加 15 s 周期 watchdog 输出编辑器 mode/blocking，用于区分挂起的输入提示与阻塞的事件循环。
+
+**Validation**
+- `core_health` 连续 2 次 28/28；`cpp_semantic_pipeline` 1/1；`git_review_runtime` 1/1（本机 Windows）。
+
+**Follow-ups**
+- `git_review_runtime`：Linux/macOS 在「等 Gitsigns 挂载」处被外层 60 s 超时杀掉（exit 124），12 s 的 `vim.wait` 未能返回，说明事件循环被同步阻塞；根因待 watchdog 输出确认。
+- macOS `index_batch_runtime`「首次缓存写入」：FSEvents 报告 `compile_commands.json` rename 导致撤销激活；推测为 fixture 在监听启动前刚写入该文件、FSEvents 延迟投递的历史事件，**待验证**，未改代码。
+
 ### 2026-09-30 — 修复 PR #13 三平台 CI 暴露的 Windows 编码/前置与测试时序问题
 
 **Task**

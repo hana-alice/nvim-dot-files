@@ -54,7 +54,10 @@ assert(vim.wait(20000, function()
 end, 10), "production navigation did not finish")
 local result = owner._last_cpp_transaction.result
 assert(result.state == "resolved", vim.inspect(result))
-assert(vim.fs.normalize(vim.api.nvim_buf_get_name(0)) == target, "wrong actual destination buffer: "
+-- macOS temp lives under /var -> /private/var; Neovim may name the reused
+-- buffer by its real path, so compare file identity rather than spelling.
+local function real(path) return vim.fs.normalize(vim.uv.fs_realpath(path) or path) end
+assert(real(vim.api.nvim_buf_get_name(0)) == real(target), "wrong actual destination buffer: "
   .. vim.api.nvim_buf_get_name(0) .. " vs " .. target)
 assert(vim.api.nvim_win_get_cursor(0)[1] == 1, "wrong actual destination line")
 assert(environment_reads > 0, "environment discovery was not exercised")

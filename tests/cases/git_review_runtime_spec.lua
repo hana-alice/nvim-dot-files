@@ -23,15 +23,17 @@ local function checkpoint(label)
   io.stderr:write("GIT_REVIEW_RUNTIME_STAGE: " .. label .. "\n")
   io.stderr:flush()
 end
--- CI on Linux/macOS exits 124 (outer timeout) inside a 12 s vim.wait, so the
--- event loop itself is blocked. A fast-context timer still fires during input
--- waits; report the editor mode to tell a pending prompt from a busy loop.
-local watchdog = vim.uv.new_timer()
-watchdog:start(15000, 15000, function()
-  local mode = vim.api.nvim_get_mode()
-  io.stderr:write("GIT_REVIEW_RUNTIME_WATCHDOG: mode=" .. mode.mode .. " blocking=" .. tostring(mode.blocking) .. "\n")
-  io.stderr:flush()
-end)
+-- CI snapshot: the child is in state R (CPU-busy) with an unreaped git zombie,
+-- i.e. a Lua loop spins without returning to the event loop. A count hook
+-- runs inside that loop; dump its traceback once after 20 s.
+local hook_started, hook_dumped = vim.uv.hrtime(), false
+debug.sethook(function()
+  if not hook_dumped and vim.uv.hrtime() - hook_started > 20e9 then
+    hook_dumped = true
+    io.stderr:write("GIT_REVIEW_RUNTIME_BUSY_TRACE:\n" .. debug.traceback("", 2) .. "\n")
+    io.stderr:flush()
+  end
+end, "", 1000000)
 local ok, err = xpcall(function()
   checkpoint("startup loaded")
   assert(package.loaded["lazy"] and package.loaded["lazyvim.config"], "real LazyVim startup did not load")

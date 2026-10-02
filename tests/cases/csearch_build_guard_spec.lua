@@ -367,8 +367,15 @@ t.describe("csearch 智能增量决策（D11 csearch_build_mode）", function()
     t.assert_eq(mode({ has_snapshot = false, added_n = 0, total_n = 100 }), "reset")
   end)
 
-  t.it("有删除 → reset（cindex 不能删；ghost 命中是正确性问题）", function()
+  t.it("少量删除 → add（-delete-from 在同一次 merge 里移除，不再全量）", function()
     t.assert_eq(mode({ has_snapshot = true, added_n = 1, removed_n = 1, total_n = 1000 }),
+      "add")
+    t.assert_eq(mode({ has_snapshot = true, added_n = 0, removed_n = 3, total_n = 1000 }),
+      "add", "只有删除也不能判 skip")
+  end)
+
+  t.it("删除计入 30% 阈值（大规模删除仍 reset）", function()
+    t.assert_eq(mode({ has_snapshot = true, added_n = 0, removed_n = 4000, total_n = 10000 }),
       "reset")
   end)
 
@@ -417,6 +424,7 @@ t.describe("csearch smart_build 端到端（D11，mock build_index）", function
       calls[#calls + 1] = {
         mode = (opts and opts.mode) or "reset",
         lines = read_lines(list_path),
+        deletes = opts and opts.delete_list and read_lines(opts.delete_list) or nil,
       }
       vim.schedule(function() cb(true, nil, { ms = 1, index_size = 4096 }) end)
     end
@@ -555,18 +563,24 @@ t.describe("csearch smart_build 端到端（D11，mock build_index）", function
     restore_mock()
   end)
 
-  t.it("有删除 → reset（不留 ghost）", function()
+  t.it("有删除 → add 并把被删路径交给 -delete-from（不全量、不留 ghost）", function()
     install_mock()
     local dir = setup_dir()
     local ctx = { paths = { csearch_idx = dir .. "/csearch.idx" } }
     local abs_list = dir .. "/list.txt"
-    write_lines(ue._csearch_snapshot_path_for_test(ctx), { "D:/w/A.cpp", "D:/w/B.cpp", "D:/w/C.cpp" })
-    write_lines(abs_list, { "D:/w/A.cpp", "D:/w/B.cpp" })  -- C 被删
+    local old = {}
+    for i = 1, 10 do old[i] = ("D:/w/d%02d.cpp"):format(i) end
+    write_lines(ue._csearch_snapshot_path_for_test(ctx), old)
+    write_lines(abs_list, vim.list_slice(old, 1, 9))  -- d10 被删
 
     local res = run_smart(ctx, abs_list)
     t.assert_true(res.ok)
-    t.assert_eq(res.stats.mode, "reset", "有删除必须全量（cindex 无删除能力）")
-    t.assert_eq(calls[1].mode, "reset")
+    t.assert_eq(res.stats.mode, "add")
+    t.assert_eq(#calls, 1)
+    t.assert_eq(calls[1].mode, "add")
+    t.assert_eq(#calls[1].lines, 0, "未改动文件不重喂")
+    t.assert_eq(table.concat(calls[1].deletes or {}, ","), "D:/w/d10.cpp")
+    t.assert_eq(#read_lines(ue._csearch_snapshot_path_for_test(ctx)), 9, "快照应去掉被删文件")
 
     pcall(vim.fn.delete, dir, "rf")
     restore_mock()

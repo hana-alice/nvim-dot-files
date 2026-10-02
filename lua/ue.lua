@@ -2382,6 +2382,7 @@ end
 
 local function prepare_summary(ctx, compile_path, opts)
   opts = opts or {}
+  pcall(function() require("utils.probe").record("prepare-path", opts.reused_cache and "fast" or "cold", { state = "ok" }) end)
   local project_count = opts.project_count or count_cached_entries(ctx.paths.project_list)
   local engine_count = opts.engine_count or count_cached_entries(ctx.paths.engine_list)
   local workspace_count = opts.workspace_count or count_cached_entries(ctx.paths.workspace_list)
@@ -2620,14 +2621,15 @@ function M._csearch_build_running_for_test() return CORE_RT.csearch_build_runnin
 --
 -- Decision rules (pure, unit-tested via _csearch_build_mode_for_test):
 --   * forced / no snapshot        → reset  (no basis for a diff)
---   * removed > 0                 → reset  (cindex CANNOT delete from an index;
---                                           ghost entries would serve hits for
---                                           dead files — correctness over speed)
---   * added + dirty == 0          → skip   (set unchanged; just refresh
+--   * added + dirty + removed == 0 → skip  (set unchanged; just refresh
 --                                           bookkeeping)
---   * added + dirty > 30% of set  → reset  (merge cost approaches full build;
+--   * that work > 30% of set      → reset  (merge cost approaches full build;
 --                                           usually a branch switch)
---   * else                        → add    (feed ONLY the delta to cindex)
+--   * else                        → add    (feed ONLY the delta to cindex;
+--                                           removals go to -delete-from)
+-- Removals no longer force reset (2026-10-02, codesearch v1.2.0 verified):
+-- -delete-from drops them in the same merge; an older binary rejects the flag
+-- and the add→reset fallback runs.
 --
 -- `dirty` = watcher's persistent set (modified existing files + new files).
 -- Re-adding a modified file refreshes its trigrams, so content edits get folded
@@ -2648,17 +2650,15 @@ function CORE_RT.csearch_build_mode(stats)
   if stats.forced then return "reset", "forced" end
   if stats.dirty_capped then return "reset", "dirty coverage was truncated" end
   if not stats.has_snapshot then return "reset", "no snapshot of last indexed set" end
-  if (stats.removed_n or 0) > 0 then
-    return "reset", ("%d removals (cindex cannot delete)"):format(stats.removed_n)
-  end
-  local work = (stats.added_n or 0) + (stats.dirty_n or 0)
+  local work = (stats.added_n or 0) + (stats.dirty_n or 0) + (stats.removed_n or 0)
   if work == 0 then return "skip", "indexed set unchanged" end
   local total = math.max(tonumber(stats.total_n) or 0, 1)
   if work > total * CORE_RT.CSEARCH_ADD_RATIO_MAX then
     return "reset", ("delta %d > %d%% of %d files"):format(
       work, math.floor(CORE_RT.CSEARCH_ADD_RATIO_MAX * 100), total)
   end
-  return "add", ("+%d added, %d dirty"):format(stats.added_n or 0, stats.dirty_n or 0)
+  return "add", ("+%d added, %d dirty, -%d removed"):format(
+    stats.added_n or 0, stats.dirty_n or 0, stats.removed_n or 0)
 end
 
 -- Read a list file into { set = {path=true}, list = {...}, n = count }.
@@ -2736,13 +2736,13 @@ function CORE_RT.csearch_smart_build(ctx, cs_ctx, abs_list, cb)
       old_list = new_list
     end
   end
-  local added, removed_n = {}, 0
+  local added, removed = {}, {}
   if old_list then
     for _, p in ipairs(new_list.list) do
       if not old_list.set[p] then added[#added + 1] = p end
     end
     for _, p in ipairs(old_list.list) do
-      if not new_list.set[p] then removed_n = removed_n + 1 end
+      if not new_list.set[p] then removed[#removed + 1] = p end
     end
   end
   -- Watcher dirty files still present in the new set (modified existing files;
@@ -2773,7 +2773,7 @@ function CORE_RT.csearch_smart_build(ctx, cs_ctx, abs_list, cb)
     forced       = ctx and ctx._force_csearch or false,
     has_snapshot = old_list ~= nil,
     added_n      = #added,
-    removed_n    = removed_n,
+    removed_n    = #removed,
     dirty_n      = #dirty_in_set,
     dirty_capped = dirty_capped,
     total_n      = new_list.n,
@@ -2784,7 +2784,9 @@ function CORE_RT.csearch_smart_build(ctx, cs_ctx, abs_list, cb)
   -- (report-first workflow — probe-feedback-loop spec #1).
   pcall(function()
     local probe = require("utils.probe")
-    probe.observe("csearch-smart-build", "durable-overflow-2026-09-24"); probe.record("csearch-smart-build", mode, why)
+    -- Routine decisions are evidence, not failures (state=ok).
+    probe.observe("csearch-smart-build", "delete-from-2026-10-02")
+    probe.record("csearch-smart-build", mode, { state = "ok", why = why, removed = #removed })
   end)
 
   if mode == "skip" then
@@ -2809,8 +2811,21 @@ function CORE_RT.csearch_smart_build(ctx, cs_ctx, abs_list, cb)
   end
   for _, p in ipairs(add_input) do fout:write(p, "\n") end
   fout:close()
+  local delete_list_path
+  if #removed > 0 then
+    delete_list_path = add_list_path .. ".delete"
+    local dout = io.open(delete_list_path, "w")
+    if not dout then
+      pcall(os.remove, add_list_path)
+      run_reset("cannot write delete-list")
+      return
+    end
+    for _, p in ipairs(removed) do dout:write(p, "\n") end
+    dout:close()
+  end
   code_search.build_index(cs_ctx, add_list_path, function(ok, err, stats)
     pcall(os.remove, add_list_path)
+    if delete_list_path then pcall(os.remove, delete_list_path) end
     if ok then
       stats = stats or {}
       stats.mode = "add"
@@ -2826,7 +2841,7 @@ function CORE_RT.csearch_smart_build(ctx, cs_ctx, abs_list, cb)
         tostring(err or "?"):sub(1, 120))
     end)
     run_reset("fallback after add failure", err or "?")
-  end, { mode = "add" })
+  end, { mode = "add", delete_list = delete_list_path })
 end
 
 -- Test seams (D11).

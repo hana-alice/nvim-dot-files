@@ -376,6 +376,29 @@ t.describe("ue.android_build_command（SO-only）", function()
       "不得假设设备安装目录固定属于 system:system")
   end)
 
+  t.it("SO 未变在 force-stop 前跳过，探测失败继续部署且可强制", function()
+    local config = vim.fn.stdpath("config")
+    local script = table.concat(vim.fn.readfile(config .. "/scripts/ue_android_so_deploy.ps1"), "\n")
+    local skip = assert(script:find("if (-not $Force -and (Test-DeployedSoUnchanged", 1, true))
+    local stop = assert(script:find('"shell", "am", "force-stop"', 1, true))
+    t.assert_true(skip < stop, "跳过判定必须先于停止应用")
+    t.assert_contains(script, "catch { return $false }")
+    t.assert_contains(script, "[switch]$Force")
+    t.assert_contains(script, "unchanged (sha256=$localHash) $([char]0x2014) skipped")
+    t.assert_contains(script, "if ($deploymentStarted)")
+    if vim.fn.executable("powershell.exe") ~= 1 then
+      t.skip("PowerShell unavailable")
+      return
+    end
+    local result = vim.system({
+      "powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass",
+      "-File", config .. "/tests/fixtures/android_so_deploy/unchanged_spec.ps1",
+      "-DeployScript", config .. "/scripts/ue_android_so_deploy.ps1",
+    }, { text = true }):wait()
+    t.assert_eq(result.code, 0, result.stderr or result.stdout)
+    t.assert_contains(result.stdout or "", "PASS unchanged SO root + manifest + fail-open")
+  end)
+
   t.it("SO deploy 替换前等待旧 PID 消失且等待有界", function()
     if vim.fn.executable("powershell.exe") ~= 1 then return end
     local config = vim.fn.stdpath("config")

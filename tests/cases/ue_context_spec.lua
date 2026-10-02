@@ -6,8 +6,16 @@ local function write_file(path, content)
   vim.fn.writefile(vim.split(content or "", "\n", { plain = true }), path)
 end
 
+-- Use a writable real host directory. Windows short temp aliases can make
+-- vim.fn.glob miss an existing APK; realpath retains the actual fixture.
+local function temporary_root()
+  local path = vim.fn.tempname()
+  vim.fn.mkdir(path, "p")
+  return assert(vim.uv.fs_realpath(path)):gsub("\\", "/")
+end
+
 local function fixture()
-  local root = ("C:/tmp/nvim-ue-context-%d-%d"):format(vim.fn.getpid(), vim.uv.hrtime())
+  local root = temporary_root()
   local engine = root .. "/UE"
   local project = root .. "/Project"
   local uproject = project .. "/Source/SampleGame/SampleGame.uproject"
@@ -239,7 +247,7 @@ t.describe("target_platform 无持久状态时的默认值", function()
 
   t.it("Windows host / 盘符 engine root 默认 Win64（不再回落 Linux）", function()
     -- Fresh checkout: engine root exists but has no persisted state at all.
-    local root = ("C:/tmp/nvim-ue-plat-%d-%d"):format(vim.fn.getpid(), vim.uv.hrtime())
+    local root = temporary_root()
     vim.fn.mkdir(root, "p")
     local saved = vim.env.UE_TARGET_PLATFORM
     local platform = require("utils.platform")

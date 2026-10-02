@@ -73,6 +73,86 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-10-03 — Git 完整改动集恢复 csearch dirty 溢出
+
+**Task**
+- dirty 超过有界集合上限后，Git 工作区使用完整证据恢复增量，避免必然全量重建；非 Git、缺记录、查询失败或 HEAD 不可达保留 reset。
+
+**Implemented**
+- 将智能构建从 ue.lua 提取到 csearch_smart，并由 csearch_git 在 writer 生命周期内异步采集各 root HEAD、工作区状态及 tracked 集合。成功才发布项目 bucket 内的基线；observed HEAD 与 coverage HEAD 分开，普通局部 add 不提前提升覆盖基线。
+- 溢出恢复合并基线脏路径、Git diff/status 与 tracked 补集；ignored、未跟踪、assume-unchanged/skip-worktree、gitlink 内源文件保守重加。完整证据走 add，删除沿既有 delete-from；普通 unchanged skip 不额外查询 Git。
+- HEAD race、坏记录、查询/发布失败不授权清 overflow；确认与删除 dirty 分开，保留同锁、同秒及构建期间新增溢出保护。缓存 prepare 中已删源异步确认后送 delete-from，并成功同步 workspace 清单、快照及清单指纹。
+- Git 命令用 vim.system 回调，大清单解析采用定时分批让出主循环；同步修订 ue-code-search 溢出方向级 requirement。
+
+**Pitfalls / Gotchas**
+- 普通 Git diff/status 不能单独证明 ignored、子模块或索引标记隐藏文件未变；tracked 补集避免静默漏索引。
+- 已不存在的文件送 add 会被 cindex 过滤，不会移除旧命中；缓存清单未刷新时必须显式 delete-from。
+- 恢复中 stat 失败回落 reset 时也必须先过滤已确认删除的临时输入；否则 canonical 与 snapshot 会漂移，下一轮发生额外 merge。
+- vim.schedule 自续分批仍可能连续耗尽事件队列：真实清单 timer 最大间隔曾为 2712 ms；改定时分批后本次为 167 ms，不能声称没有任何调度延迟。
+
+**Validation**
+- Git 恢复 19/19（真实临时 Git、160000 gitlink、native cindex 新内容/旧内容/删除命中闭环）、csearch_build_guard 29/29、dirty_overflow 21/21、ue_watch_csearch 22/22、multi_instance_state 27/27、stability 26/26、host_resource_discipline 13/13，全绿且无跳过。
+- 裸全局 lint：233 个 Lua 文件通过；git diff --check 通过。ue.lua 10369 行，低于 10562 上限；新增 Lua 模块均小于 800 行。
+- 真实引擎只读查询：workspace 快照 182403 文件，其中引擎 136793，tracked 262003，保守补集 1。status 0.144–0.179 s、tracked 0.174–0.218 s；diff 首次 8.458 s，重复 4.569–5.984 s，未复现旧 0.23 s 基线。
+- 隔离基线上的真实引擎 Lua 恢复查询含解析约 10.302 s，恢复 5 路径，10 ms timer 最大间隔 167 ms；未写真实 csearch 索引，此数据不是完整 prepare/add 耗时。
+- 首轮全量 2407/2412，5 失败、0 跳过；最终 stat 修正后未隔离日志的全量 2408/2413，仍 5 失败。不能把分域全绿当作全量验收。
+- Git 审阅的独立 HEAD 对照复现同一失败：fixture 内额外的 Neovim 日志改变默认选中文件。仅隔离进程 NVIM_LOG_FILE 后，HEAD 与当前代码各 1/1；没有修改插件或跳过测试。
+- 其余四个失败是 ue_context fixture 硬编码临时目录被权限拒绝。两处改用真实宿主临时目录 realpath，保留所有断言；独立 glob 实验确认短路径未找到的同一个 APK，在 realpath 下能找到。ue_context 14/14 全绿。
+- 两次隔离日志的完整全量均 2412/2413，剩 Git tree 调度 fixture 的时间依赖。独立真实 tree 同进程热跑第 5 轮复现 icons=6000/builds=0，钩子仍有效；没有测量该轮构建耗时或 resume 次数，不能据此断言总耗时小于 8 ms。
+- 仅该 fixture 第一次真实图标读取模拟 20 ms 慢 provider，保证测试观察真实 production yield，再保留取消、late callback 与重开断言。git_review_tree 修正后 9/9，同进程连续八轮热运行 72/72，均 0 失败、0 跳过；未改 Git 审阅业务代码或跳过测试。
+- 最终运行完整 `nvim --headless -l tests/run.lua`：2413/2413，全绿，0 失败、0 跳过，退出码 0。仅为该进程设置 NVIM_LOG_FILE 至 ignored 实验日志目录，避免 fixture 内新日志污染 Git 默认选中项；未排除用例、修改插件或假造宿主能力。
+
+**Follow-ups**
+- 当前真实项目 root 经 Git 确认不是仓库；按本项约束整体仍走 reset，不能宣称这个现场已消除全量重建。p4 不处理。
+- 未验证双 Git 真实工程完整 prepare/add、活跃 GUI 会话及最终 CPU/内存收益；大型清单解析和 Git diff 耗时仍可继续优化。
+
+
+### 2026-10-03 — CDB 输入指纹原型未通过性能门禁，保留原生成路径
+
+**Task**
+- 在 ccjson 子进程启动前识别相同输入，避免重复生成；同时保持 SuperUnity、完整覆盖和无 UI 阻塞。
+
+**Implemented**
+- 完成隔离原型与回归，复用生产 RSP selector、nested response parser、shader/project discovery，并检查 pipeline 脚本内容、配置、clangd 身份和发布 sidecar。
+- 真实性能验收未达标，撤回全部生产接线及新增原型文件；当前仍按原事务生成，不宣称本项已完成。隔离源码及无私有路径测量报告保存在本地 ignored 实验目录。
+
+**Pitfalls / Gotchas**
+- 不能仅对上一轮的 RSP 文件 stat；新文件、目录发现、header/PCH、Unity member 和 pipeline 的实际读取都会影响生成。
+- Windows 每目录缓存的 DirEntry metadata 曾漏掉目录新变化，回归发现后已修正，未用于交付。
+- 把完整 descriptor 放在前置检查会使输入变化时额外执行约 35–46 秒扫描，不能将此成本误记为仅首次扫描。
+
+**Validation**
+- 原型 `ue_cdb` 126/126、`host_resource_discipline` 13/13、`index_delivery` 97/97、`platform` 51/51、`dap_failure_layer` 100/100，均无失败或跳过；这些结果证明原型行为，不代表生产优化已交付。
+- 真实 Android/Test selector 选择 1233 个 RSP；完整指纹约 7 万个唯一依赖。重复检查含 worker 启动耗时 9.409–10.590 秒，高于用户提供的约 8.4 秒生成基线。
+- 原生属性读取原型逐项核对约 7 万输入耗时 6.522 秒，未获得稳定端到端收益，因此撤回。
+- 撤回后重新运行 ue_cdb：117/117 全绿，0 失败、0 跳过；最终完整回归 2413/2413，全绿，0 失败、0 跳过，退出码 0。全量通过不代表本项优化已交付。
+
+**Follow-ups**
+- 本项未完成：需在实际读取者处采集可重放的依赖，并减少输入变化后的重复扫描，再做相同输入/变化输入及完整 prepare 的真实性能验收。
+- 本次只读测量未启动真实 CDB 生成或 clangd 全量索引，未验证全工程二次合并、索引耗时、CPU/内存或性能恢复。
+
+
+### 2026-10-02 — SO 相同则保留运行状态并跳过部署
+
+**Task**
+- 避免相同 stripped SO 重复停止应用、上传和替换。
+
+**Implemented**
+- `scripts/ue_android_so_deploy.ps1` 在操作锁内、force-stop 前读取 root SO SHA-256 或 current generation manifest。
+- run-as 同时比对 SO/agent hash、generation 与 APK 基线；证据缺失、畸形或命令异常按变更继续原部署流程。`-Force` 绕过跳过。
+- no-op 只清理主机临时文件并释放操作锁；替换后的校验和回滚沿用原流程。
+- `tests/fixtures/android_so_deploy/unchanged_spec.ps1` 与 `tests/cases/ue_api_spec.lua` 覆盖 hash/manifest 命中、失效、读取异常与停止前守护。
+
+**Pitfalls / Gotchas**
+- 不能只看 SO：agent 或已安装 APK 已变化时旧 manifest 不足以证明可复用。
+
+**Validation**
+- `ue_api` 66/66、`ue_target_drivers` 56/56、`ue_target_integration` 27/27、`structure` 78/78 全通过，0 failed / 0 skipped。
+- 同步 `android-so-quick-deploy` spec 的未变化部署方向；最终完整回归 2413/2413，全绿，0 失败、0 跳过，退出码 0。
+
+**Follow-ups**
+- 未进行真机 root/run-as 重复部署、设备传输与回滚实测。
+
 ### 2026-10-02 — 删文件不再整体重建 csearch；修复增量 add 静默丢同名前缀文件
 
 **Task**

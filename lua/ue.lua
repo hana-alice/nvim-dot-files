@@ -2570,13 +2570,13 @@ function CORE_RT.csearch_build_done()
 end
 
 -- Successful writers subtract only covered paths; explicit manual clear retains
--- its separate API. Overflow acknowledgement additionally requires a full reset.
-function CORE_RT.clear_persistent_dirty_safe(reason, covered_paths, covered_before, remove_missing)
+-- its separate API. Overflow acknowledgement needs reset or complete Git evidence.
+function CORE_RT.clear_persistent_dirty_safe(reason, covered_paths, covered_before, remove_missing, acknowledge_overflow)
   local ok_watch, watch = pcall(require, "utils.ue_watch")
   if not ok_watch then return false end
   if type(covered_paths) == "table" and type(watch.remove_persistent_dirty) == "function" then
     return watch.remove_persistent_dirty(
-      covered_paths, reason or "prepare", covered_before, remove_missing)
+      covered_paths, reason or "prepare", covered_before, remove_missing, acknowledge_overflow)
   end
   if type(watch.clear_persistent_dirty) == "function" then
     return watch.clear_persistent_dirty(reason or "prepare")
@@ -2599,7 +2599,8 @@ function CORE_RT.on_full_csearch_success(ctx, reason, stats)
     reason,
     CORE_RT.csearch_build_dirty_snapshot or {},
     CORE_RT.csearch_build_started_at,
-    stats and stats.mode == "reset")
+    stats and (stats.mode == "reset" or stats.git_recovered),
+    stats and (stats.mode == "reset" or stats.git_recovered))
   CORE_RT.csearch_build_dirty_snapshot = nil
   CORE_RT.csearch_build_started_at = nil
   local list_path = ctx and ctx.paths and ctx.paths.workspace_all_list
@@ -2617,7 +2618,7 @@ function M._csearch_build_running_for_test() return CORE_RT.csearch_build_runnin
 
 -- ── csearch smart incremental build (D11) ───────────────────────────────────
 -- Diff the last published path snapshot against the current workspace list.
--- Truncated dirty coverage requires reset even when the retained delta is empty.
+-- Truncated dirty coverage uses complete Git evidence, otherwise reset.
 --
 -- Decision rules (pure, unit-tested via _csearch_build_mode_for_test):
 --   * forced / no snapshot        → reset  (no basis for a diff)
@@ -2635,213 +2636,16 @@ function M._csearch_build_running_for_test() return CORE_RT.csearch_build_runnin
 -- Re-adding a modified file refreshes its trigrams, so content edits get folded
 -- in on the cheap path too. An `add` that fails (corrupt/0-byte idx — the
 -- build_index D9 guard refuses it) falls back to one reset automatically.
-CORE_RT.CSEARCH_ADD_RATIO_MAX = 0.30
-
 function CORE_RT.csearch_snapshot_path(ctx)
-  local idx = ctx and ctx.paths and ctx.paths.csearch_idx
-  if not idx or idx == "" then return nil end
-  return idx .. ".files"
+  return require("ue.csearch_smart").csearch_snapshot_path(ctx)
 end
-
--- Pure decision. stats = { forced, has_snapshot, added_n, removed_n, dirty_n,
--- total_n }. Returns mode ("reset"|"add"|"skip") + human reason.
 function CORE_RT.csearch_build_mode(stats)
-  stats = stats or {}
-  if stats.forced then return "reset", "forced" end
-  if stats.dirty_capped then return "reset", "dirty coverage was truncated" end
-  if not stats.has_snapshot then return "reset", "no snapshot of last indexed set" end
-  local work = (stats.added_n or 0) + (stats.dirty_n or 0) + (stats.removed_n or 0)
-  if work == 0 then return "skip", "indexed set unchanged" end
-  local total = math.max(tonumber(stats.total_n) or 0, 1)
-  if work > total * CORE_RT.CSEARCH_ADD_RATIO_MAX then
-    return "reset", ("delta %d > %d%% of %d files"):format(
-      work, math.floor(CORE_RT.CSEARCH_ADD_RATIO_MAX * 100), total)
-  end
-  return "add", ("+%d added, %d dirty, -%d removed"):format(
-    stats.added_n or 0, stats.dirty_n or 0, stats.removed_n or 0)
+  return require("ue.csearch_smart").csearch_build_mode(stats)
 end
-
--- Read a list file into { set = {path=true}, list = {...}, n = count }.
-local function read_list_file(path)
-  local set, list, n = {}, {}, 0
-  local f = path and io.open(path, "r") or nil
-  if not f then return nil end
-  for line in f:lines() do
-    line = line:gsub("\r$", "")
-    if line ~= "" and not set[line] then
-      set[line] = true
-      n = n + 1
-      list[n] = line
-    end
-  end
-  f:close()
-  return { set = set, list = list, n = n }
-end
-
--- Drop-in replacement for the three prepare-path build_index calls.
--- cb(ok, err, stats) — stats gains .mode ("reset"|"add"|"skip") and .delta.
--- Owns: diff, mode decision, add→reset fallback, snapshot refresh on success.
--- Does NOT own: csearch_build_begin/done (call sites keep that), fingerprint /
--- dirty-clear (call sites keep on_full_csearch_success — snapshot refresh here
--- is the only extra obligation, and it is idempotent).
 function CORE_RT.csearch_smart_build(ctx, cs_ctx, abs_list, cb)
-  local code_search = require("utils.code_search")
-  local snap_path = CORE_RT.csearch_snapshot_path(ctx)
-  local new_list = read_list_file(abs_list)
-  if not new_list then
-    vim.schedule(function() cb(false, "cannot read " .. tostring(abs_list), {}) end)
-    return
-  end
-
-  local function snapshot_current()
-    if not snap_path then return end
-    pcall(function()
-      local uvfs = vim.uv or vim.loop
-      uvfs.fs_copyfile(abs_list, snap_path)
-    end)
-  end
-
-  local function run_reset(reason, after_fallback)
-    code_search.build_index(cs_ctx, abs_list, function(ok, err, stats)
-      stats = stats or {}
-      stats.mode = "reset"
-      stats.delta = reason
-      if ok then snapshot_current() end
-      cb(ok, err, stats)
-    end, { mode = "reset" })
-    if after_fallback then
-      vim.schedule(function()
-        vim.notify("[ue] csearch incremental add failed — fell back to full rebuild ("
-          .. tostring(after_fallback) .. ")", vim.log.levels.WARN,
-          { title = "UE", replace = "ue.csearch.build" })
-      end)
-    end
-  end
-
-  -- Gather diff inputs.
-  local old_list = snap_path and read_list_file(snap_path) or nil
-  -- The sidecar predates the primary csearch index and can be absent after an
-  -- upgrade or interrupted cleanup. Rebuild it without a full reset only when
-  -- two independent facts agree: the primary index is usable, and the current
-  -- canonical workspace list has the exact fingerprint recorded after the last
-  -- successful build. The absolute temp list cannot be hashed for this check
-  -- because workspace_all.files is workspace-relative on same-drive entries.
-  if not old_list and snap_path and ctx and ctx.paths and ctx.paths.workspace_all_list then
-    local state = read_state(ctx.engine_root)
-    local recorded = state and state.csearch_input_hash or nil
-    local current = CORE_RT.list_fingerprint(ctx.paths.workspace_all_list)
-    local ok_indexed, indexed = pcall(code_search.is_indexed, cs_ctx)
-    if ok_indexed and indexed and type(recorded) == "string" and recorded ~= ""
-        and current == recorded then
-      old_list = new_list
-    end
-  end
-  local added, removed = {}, {}
-  if old_list then
-    for _, p in ipairs(new_list.list) do
-      if not old_list.set[p] then added[#added + 1] = p end
-    end
-    for _, p in ipairs(old_list.list) do
-      if not new_list.set[p] then removed[#removed + 1] = p end
-    end
-  end
-  -- Watcher dirty files still present in the new set (modified existing files;
-  -- drop entries that vanished — they show up as removals instead).
-  local dirty_in_set, dirty_seen, dirty_capped = {}, {}, false
-  do
-    local ok_watch, watch = pcall(require, "utils.ue_watch")
-    dirty_capped = ok_watch and watch.persistent_dirty_status and watch.persistent_dirty_status().capped or false
-    if ok_watch and type(watch.snapshot_persistent_dirty) == "function" then
-      for _, p in ipairs(watch.snapshot_persistent_dirty() or {}) do
-        if new_list.set[p] and not dirty_seen[p] then
-          dirty_seen[p] = true
-          dirty_in_set[#dirty_in_set + 1] = p
-        end
-      end
-    end
-  end
-  -- added ∪ dirty without double-counting.
-  local add_input, add_seen = {}, {}
-  for _, p in ipairs(added) do
-    if not add_seen[p] then add_seen[p] = true; add_input[#add_input + 1] = p end
-  end
-  for _, p in ipairs(dirty_in_set) do
-    if not add_seen[p] then add_seen[p] = true; add_input[#add_input + 1] = p end
-  end
-
-  local mode, why = CORE_RT.csearch_build_mode({
-    forced       = ctx and ctx._force_csearch or false,
-    has_snapshot = old_list ~= nil,
-    added_n      = #added,
-    removed_n    = #removed,
-    dirty_n      = #dirty_in_set,
-    dirty_capped = dirty_capped,
-    total_n      = new_list.n,
+  return require("ue.csearch_smart").csearch_smart_build(ctx, cs_ctx, abs_list, cb, {
+    read_state = read_state, list_fingerprint = CORE_RT.list_fingerprint,
   })
-
-  -- Probe (D11 soak): record which mode each prepare takes, so the next
-  -- session can verify the incremental path actually fires in daily use
-  -- (report-first workflow — probe-feedback-loop spec #1).
-  pcall(function()
-    local probe = require("utils.probe")
-    -- Routine decisions are evidence, not failures (state=ok).
-    probe.observe("csearch-smart-build", "delete-from-2026-10-02")
-    probe.record("csearch-smart-build", mode, { state = "ok", why = why, removed = #removed })
-  end)
-
-  if mode == "skip" then
-    snapshot_current()  -- ordering may differ; keep snapshot in lockstep with list
-    vim.schedule(function()
-      cb(true, nil, { mode = "skip", delta = why, ms = 0, index_size = 0, skipped = true })
-    end)
-    return
-  end
-
-  if mode == "reset" then
-    run_reset(why)
-    return
-  end
-
-  -- mode == "add": feed ONLY the delta.
-  local add_list_path = abs_list .. (".add.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
-  local fout = io.open(add_list_path, "w")
-  if not fout then
-    run_reset("cannot write add-list")
-    return
-  end
-  for _, p in ipairs(add_input) do fout:write(p, "\n") end
-  fout:close()
-  local delete_list_path
-  if #removed > 0 then
-    delete_list_path = add_list_path .. ".delete"
-    local dout = io.open(delete_list_path, "w")
-    if not dout then
-      pcall(os.remove, add_list_path)
-      run_reset("cannot write delete-list")
-      return
-    end
-    for _, p in ipairs(removed) do dout:write(p, "\n") end
-    dout:close()
-  end
-  code_search.build_index(cs_ctx, add_list_path, function(ok, err, stats)
-    pcall(os.remove, add_list_path)
-    if delete_list_path then pcall(os.remove, delete_list_path) end
-    if ok then
-      stats = stats or {}
-      stats.mode = "add"
-      stats.delta = why
-      snapshot_current()
-      cb(true, nil, stats)
-      return
-    end
-    -- Incremental refused/failed (typically D9 unusable-idx guard). One
-    -- automatic reset — always safe — instead of surfacing a dead end.
-    pcall(function()
-      require("utils.probe").record("csearch-smart-build", "add-fallback-reset",
-        tostring(err or "?"):sub(1, 120))
-    end)
-    run_reset("fallback after add failure", err or "?")
-  end, { mode = "add", delete_list = delete_list_path })
 end
 
 -- Test seams (D11).
@@ -9708,8 +9512,8 @@ function M.setup()
     local ok_watch, watch = pcall(require, "utils.ue_watch")
     if not ok_watch then vim.notify("ue_watch module missing", vim.log.levels.WARN); return end
     if watch.persistent_dirty_status().capped then
-      vim.notify("Dirty coverage was truncated; rebuilding the full csearch index", vim.log.levels.INFO)
-      return M.build_csearch_async({ context = ctx })
+      vim.notify("Dirty coverage was truncated; recovering complete changes for csearch", vim.log.levels.INFO)
+      return M.build_csearch_async({ context = ctx, recover_overflow = true })
     end
     local dirty = (type(watch.snapshot_persistent_dirty) == "function")
       and watch.snapshot_persistent_dirty() or {}
@@ -9739,23 +9543,29 @@ function M.setup()
     vim.notify(("UEPrepareIncremental: adding %d dirty files to csearch index ..."):format(#dirty),
       vim.log.levels.INFO, { title = "UE", timeout = 3000, replace = "ue.csearch.build" })
     local cs_ctx = { workspace_root = workspace_root(ctx), csearch_idx = ctx.paths.csearch_idx }
-    code_search.build_index(cs_ctx, abs_list, function(ok_cs, err_cs, stats)
-      CORE_RT.csearch_build_done()
-      pcall(os.remove, abs_list)
-      if ok_cs then
-        if type(watch.remove_persistent_dirty) == "function" then
-          watch.remove_persistent_dirty(dirty, "UEPrepareIncremental", CORE_RT.csearch_build_started_at)
+    local git_evidence = require("ue.csearch_git")
+    git_evidence.capture(ctx, function(before)
+      code_search.build_index(cs_ctx, abs_list, function(ok_cs, err_cs, stats)
+        local function finish_record()
+          CORE_RT.csearch_build_done()
+          pcall(os.remove, abs_list)
+          if ok_cs then
+            if type(watch.remove_persistent_dirty) == "function" then
+              watch.remove_persistent_dirty(dirty, "UEPrepareIncremental", CORE_RT.csearch_build_started_at)
+            end
+            CORE_RT.csearch_build_started_at = nil
+            local mb = math.floor((stats.index_size or 0) / 1024 / 1024)
+            vim.notify(("✓ csearch +%d files (%.1fs, idx now %d MB)"):format(
+              #dirty, (stats.ms or 0) / 1000, mb),
+              vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
+          else
+            vim.notify("UEPrepareIncremental failed: " .. (err_cs or "?"),
+              vim.log.levels.WARN, { title = "UE" })
+          end
         end
-        CORE_RT.csearch_build_started_at = nil
-        local mb = math.floor((stats.index_size or 0) / 1024 / 1024)
-        vim.notify(("✓ csearch +%d files (%.1fs, idx now %d MB)"):format(
-          #dirty, (stats.ms or 0) / 1000, mb),
-          vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
-      else
-        vim.notify("UEPrepareIncremental failed: " .. (err_cs or "?"),
-          vim.log.levels.WARN, { title = "UE" })
-      end
-    end, { mode = "add" })
+        if ok_cs then git_evidence.save(ctx, before, false, dirty, finish_record) else finish_record() end
+      end, { mode = "add" })
+    end)
   end, { desc = "Append watcher's dirty files to csearch index (no full rebuild)" })
   vim.api.nvim_create_user_command("UEPrepareReindex", function()
     -- Force csearch rebuild even when the cache fast-path would skip it.

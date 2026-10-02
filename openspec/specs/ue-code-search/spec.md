@@ -55,13 +55,35 @@ SHALL 失败并回退 reset，MUST NOT 留下已删除文件的命中。
 所有构建成功路径 SHALL 只移除本次构建开始时捕获且已覆盖的 dirty 路径；构建
 期间新增或再次修改的路径 MUST NOT 被清空，失败构建 MUST NOT 确认覆盖。
 Watcher dirty 数组是有界集合，截断丢失路径时 SHALL 原子发布
-`dirty.json.overflow` 标记；标记 SHALL 保持可见直到被覆盖它的全量 reset
-清除，期间 freshness SHALL 保持 stale 且 smart build SHALL 选择 reset 而非
-add 或 skip。
+`dirty.json.overflow` 标记。溢出恢复 SHALL 在 Git root 有成功索引的可验证基线时，
+异步查询该基线到当前工作区的完整改动集，并与当前索引清单相交后走增量 add，
+删除沿既有 `-delete-from`。完整证据 SHALL 包括已提交变化、未提交及未跟踪变化、
+上次索引时的脏路径，并保守覆盖 Git 普通 diff/status 不报告的索引文件
+（例如 ignored、assume-unchanged、skip-worktree 和子模块内文件）。
+所有必要 root 的身份和基线均可验证时才允许使用该路径；非 Git、无有效记录、
+命令失败或基线 HEAD 不可达 SHALL 保持 reset。p4 工作区不在此恢复范围。
 
-#### Scenario: 全量构建失败
-- **WHEN** 全量 csearch 构建失败
+每次 reset/add 成功 SHALL 记录各 root 当时观察到的 Git HEAD；局部增量未覆盖
+旧基线以来的全部变化时 MUST NOT 把该 HEAD 冒充完整覆盖基线。Git 基线仅用于
+恢复改动集，MUST NOT 替代 workspace 清单内容指纹的 freshness 判据。
+
+标记 SHALL 保持可见直到成功 reset 或已证明覆盖完整改动集的 Git add 确认。
+成功确认 SHALL 只清除构建开始前的旧标记；构建期间的新溢出及同秒不确定事件
+MUST NOT 被清除。无法证明完整覆盖时 freshness SHALL 保持 stale，
+smart build MUST NOT 把有界 dirty 集合当作完整 delta。
+
+#### Scenario: 全量或 Git 恢复构建失败
+- **WHEN** reset 或 Git 恢复 add 失败
 - **THEN** 系统 SHALL NOT 清空 dirty 集合或确认其 overflow 已修复
+
+#### Scenario: 溢出但 Git 基线完整可验证
+- **WHEN** dirty 被截断，所有 root 的成功覆盖基线可达，异步 Git 查询成功
+- **THEN** 系统 SHALL 对完整改动集执行增量 add 和既有删除处理
+- **AND** 原普通 delta 比例阈值 MUST NOT 再强迫该恢复走 reset
+
+#### Scenario: 溢出且缺少可靠 Git 证据
+- **WHEN** 任一 root 非 Git、无记录、Git 查询失败或记录 HEAD 不可达
+- **THEN** 系统 SHALL 选择 reset，保留既有失败与溢出保护
 
 ### Requirement: freshness 以文件清单内容指纹判定，不用 mtime 代理
 

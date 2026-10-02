@@ -33,11 +33,17 @@ function M.run(steps, opts)
     local debug_launch = opts.debug_launch or function() vim.cmd("UEDAPLaunch Android") end
     debug_launch()
   end
+  -- Owners report -1 when a step never started (build already running,
+  -- no project, device picker cancelled, planning failed).
+  local function stopped(step, code)
+    return code == -1 and ("stopped: " .. step .. " did not start (see the previous message)")
+      or ("stopped: " .. step .. " exited " .. code)
+  end
   steps.build_so(function(code)
-    if code ~= 0 then return fail("stopped: SO build exited " .. code) end
+    if code ~= 0 then return fail(stopped("SO build", code)) end
     notify("SO build ok → deploying")
     steps.deploy_so(function(deploy_code)
-      if deploy_code ~= 0 then return fail("stopped: deploy exited " .. deploy_code) end
+      if deploy_code ~= 0 then return fail(stopped("deploy", deploy_code)) end
       start()
     end)
   end)

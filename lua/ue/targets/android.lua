@@ -184,7 +184,9 @@ function M.hub(state)
     },
     fields = {
       { name = "adb", label = "adb", value = vim.fn.executable(adb) == 1 and adb or nil, doctor_only = true },
-      { name = "device", label = "Device", value = ok_dev and device.status_label() or nil, command = "UESetAndroidDevice" },
+      { name = "device", label = "Device", value = ok_dev and device.status_label() or nil, command = "UESetAndroidDevice",
+        -- Doctor-only async liveness: a selected serial may have been unplugged.
+        check = ok_dev and device.get() and function(done) device.check_async(device.get(), done) end or nil },
       { name = "package", label = "Package", value = package ~= "" and package or nil, command = "UESetAndroidPackage" },
     },
   }

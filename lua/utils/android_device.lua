@@ -70,7 +70,7 @@ function M.device_name(device)
   local name = device and (device.model or device.device or device.product) or nil
   name = trim(name)
   if name == "" then name = "Android device" end
-  return name:gsub("_", " ")
+  return (name:gsub("_", " "))
 end
 
 ---Picker label: readable device name and serial are both mandatory.
@@ -113,6 +113,46 @@ function M.status_label()
   if not serial then return nil end
   local label = trim(vim.g[M.label_key])
   return label ~= "" and label or serial
+end
+
+-- adb's wording when `-s <serial>` names a device that is not attached
+-- (checked against adb 1.0.41: "device 'X' not found") or no longer usable.
+local GONE_PATTERNS = { "device '[^']*' not found", "device offline", "no devices/emulators found",
+  "device unauthorized" }
+
+---True when adb output says the targeted device is unplugged/offline.
+function M.is_gone_output(text)
+  text = tostring(text or "")
+  for _, pattern in ipairs(GONE_PATTERNS) do
+    if text:find(pattern) then return true end
+  end
+  return false
+end
+
+---The selected device stays the target (no silent re-routing, see the
+---global-android-device-selection spec); offer re-selection as the one-key fix.
+---@return boolean reported whether the output identified a missing device
+function M.report_if_gone(text, serial)
+  if not M.is_gone_output(text) then return false end
+  local headline = ("Android device %s is not connected"):format(tostring(serial or M.get() or "?"))
+  pcall(function() require("utils.ue_hub").offer_fix("UESetAndroidDevice", headline) end)
+  vim.notify(headline .. " — <leader>uk to pick another device", vim.log.levels.WARN, { title = "UE" })
+  return true
+end
+
+---Asynchronous liveness check (`adb -s <serial> get-state`), for UI that must
+---not block. `done(ok, state_or_error)` runs on the main loop.
+function M.check_async(serial, done, opts)
+  opts = opts or {}
+  local argv = M.adb_args(adb_executable(opts.adb), serial, { "get-state" })
+  if not argv then return done(false, "no device selected") end
+  local ok_spawn = pcall(opts.system or vim.system, argv, { text = true, timeout = 5000 }, function(result)
+    vim.schedule(function()
+      local out = trim((result.stdout or "") .. " " .. (result.stderr or ""))
+      done(result.code == 0 and out == "device", out ~= "" and out or ("exit " .. tostring(result.code)))
+    end)
+  end)
+  if not ok_spawn then done(false, "failed to start adb") end
 end
 
 ---Build an argv for an operation directed at exactly one Android device.

@@ -212,9 +212,32 @@ function M.doctor_rows(target)
     fix = "UESetPlatform" }
   for _, field in ipairs(target_hub(target).fields or {}) do
     rows[#rows + 1] = { name = field.name, ok = field.value ~= nil,
-      detail = field.value or (field.command and "not set" or "not found"), fix = field.command }
+      detail = field.value or (field.command and "not set" or "not found"), fix = field.command,
+      check = field.value ~= nil and field.check or nil }
   end
   return rows
+end
+
+function M.format_doctor_row(row)
+  return ("%s %-9s %s%s"):format(row.ok and "✓" or "✗", row.name, row.detail,
+    (not row.ok and row.fix) and ("   → :" .. row.fix) or "")
+end
+
+-- Rows with an async `check` (e.g. a selected device that may be unplugged)
+-- render first, then their line is rewritten in place when the check returns.
+local function run_doctor_checks(buf, rows, first_line)
+  for i, row in ipairs(rows) do
+    if row.check then
+      row.check(function(ok, detail)
+        if not vim.api.nvim_buf_is_valid(buf) then return end
+        local updated = vim.tbl_extend("force", row, { ok = ok,
+          detail = ok and row.detail or (row.detail .. " — " .. tostring(detail)) })
+        vim.bo[buf].modifiable = true
+        vim.api.nvim_buf_set_lines(buf, first_line + i - 1, first_line + i, false, { M.format_doctor_row(updated) })
+        vim.bo[buf].modifiable = false
+      end)
+    end
+  end
 end
 
 function M.doctor()
@@ -222,13 +245,12 @@ function M.doctor()
   local rows = M.doctor_rows(target)
   local lines, fixes = { "UE doctor — " .. M.target_summary(target), "" }, {}
   for _, row in ipairs(rows) do
-    lines[#lines + 1] = ("%s %-9s %s%s"):format(row.ok and "✓" or "✗", row.name, row.detail,
-      (not row.ok and row.fix) and ("   → :" .. row.fix) or "")
+    lines[#lines + 1] = M.format_doctor_row(row)
     if not row.ok and row.fix then fixes[#fixes + 1] = row end
   end
   lines[#lines + 1] = ""
   lines[#lines + 1] = "Debugger layers: :UEDAPPreflight   ·   editor audit: :NvimCoreHealth"
-  if #fixes > 0 then lines[#lines + 1] = "<CR> on a ✗ row runs its fix" end
+  lines[#lines + 1] = "<CR> on a ✗ row runs its fix"
   local buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
@@ -242,6 +264,7 @@ function M.doctor()
     local fix = line:match("→ :(%S+)")
     if fix then vim.cmd("close"); vim.cmd(fix) end
   end, { buffer = buf, nowait = true })
+  run_doctor_checks(buf, rows, 2)
 end
 
 --- Register the keyboard-first entry commands (kept out of ue.lua, whose

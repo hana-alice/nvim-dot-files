@@ -7093,21 +7093,26 @@ local export_compile_commands
 
 local function build_target(opts)
   opts = opts or {}
+  -- Callers chaining on on_exit (UEAndroidIterate) must hear about a build
+  -- that never started, or they wait forever with no status.
+  local function abort()
+    if type(opts.on_exit) == "function" then opts.on_exit(-1) end
+  end
   if CORE_RT.ue_build_running() then
     vim.notify("A UE build is already running in this editor", vim.log.levels.WARN)
-    return
+    return abort()
   end
   local ctx, err = resolve_context()
   if not ctx then
     vim.notify(err, vim.log.levels.WARN)
-    return
+    return abort()
   end
   if not ctx.project_root then
     vim.notify("No project configured for engine root. Run :UESetProject [path]", vim.log.levels.WARN)
     if vim.g.ue_prepare_headless == 1 then
       error("No project configured for engine root. Run :UESetProject [path]")
     end
-    return
+    return abort()
   end
 
   -- Fresh-bucket gate: never build on a silently-guessed platform. A project
@@ -7126,9 +7131,8 @@ local function build_target(opts)
       vim.log.levels.WARN, { title = "UE" })
     set_platform(nil, {
       on_done = function(ok)
-        if ok then
-          build_target(vim.tbl_extend("force", opts, { _platform_prompted = true }))
-        end
+        if not ok then return abort() end
+        build_target(vim.tbl_extend("force", opts, { _platform_prompted = true }))
       end,
     })
     return
@@ -7160,7 +7164,7 @@ local function build_target(opts)
   if not cmd then
     set_build_status("BERR")
     require("utils.log").notify_error("ue.build", title .. " failed: " .. build_err)
-    return
+    return abort()
   end
 
   local _, workflow_err = dispatch_registered_workflow(driver.id, operation, {
@@ -7178,7 +7182,7 @@ local function build_target(opts)
   if workflow_err then
     set_build_status("BERR")
     require("utils.log").notify_error("ue.build", title .. " failed: " .. tostring(workflow_err.reason or workflow_err))
-    return
+    return abort()
   end
   local function start_build()
     local function on_exit(code, output)
@@ -7199,13 +7203,15 @@ local function build_target(opts)
       end
       if type(opts.on_exit) == "function" then opts.on_exit(code, output) end
     end
-    return open_terminal_command(cmd, {
+    local job = open_terminal_command(cmd, {
       cwd = plan.cwd or ctx.engine_root,
       quickfix_title = title,
       quickfix_root = workspace_root(ctx),
       tail_limit = 16,
       on_exit = on_exit,
     })
+    if not job then abort() end
+    return job
   end
 
   if type(driver.preflight_plans) == "function" and type(CORE_RT.run_target_preflight) == "function" then
@@ -7213,7 +7219,7 @@ local function build_target(opts)
       if not ok then
         set_build_status("BERR")
         require("utils.log").notify_error("ue.build", title .. " failed: " .. tostring(preflight_err))
-        return
+        return abort()
       end
       start_build()
     end)

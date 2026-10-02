@@ -315,9 +315,40 @@ t.describe("android iterate loop", function()
     t.assert_eq(log.status, "LOOP✗")
   end)
 
+  t.it("a step that could not start (exit -1) still ends the loop visibly", function()
+    local log, notes = {}, {}
+    iterate.run(steps(-1, 0, log), { notify = function(m) notes[#notes + 1] = m end })
+    t.assert_eq(table.concat(log, ","), "build")
+    t.assert_eq(log.status, "LOOP✗")
+    t.assert_contains(notes[#notes], "did not start")
+  end)
+
   t.it("nodebug launches without the debugger", function()
     local log = {}
     iterate.run(steps(0, 0, log), { notify = quiet, nodebug = true, debug_launch = function() log[#log + 1] = "debug" end })
     t.assert_eq(table.concat(log, ","), "build,deploy,launch")
+  end)
+end)
+
+t.describe("doctor async row checks", function()
+  t.it("a selected-but-unplugged device row is rewritten to ✗ with the fix", function()
+    local hub = require("utils.ue_hub")
+    local row = { name = "device", ok = true, detail = "Pixel", fix = "UESetAndroidDevice" }
+    t.assert_contains(hub.format_doctor_row(row), "✓ device")
+    local failed = vim.tbl_extend("force", row, { ok = false, detail = "Pixel — not found" })
+    local line = hub.format_doctor_row(failed)
+    t.assert_contains(line, "✗ device")
+    t.assert_contains(line, "→ :UESetAndroidDevice")
+  end)
+
+  t.it("android hub exposes a liveness check only when a device is selected", function()
+    local devices = require("utils.android_device")
+    local android = require("ue.targets.android")
+    devices.clear()
+    local function field() for _, f in ipairs(android.hub({}).fields) do if f.name == "device" then return f end end end
+    t.assert_nil(field().check)
+    devices.set("SERIAL-X")
+    t.assert_eq(type(field().check), "function")
+    devices.clear()
   end)
 end)

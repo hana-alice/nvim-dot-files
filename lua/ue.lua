@@ -5432,6 +5432,15 @@ function M.cached_grep(opts)
   if has_index then
     snacks.picker.pick({
       source = "ue_grep_csearch",
+      -- Record the query only when a result is actually opened, so search
+      -- history keeps useful searches instead of every typing pause.
+      confirm = function(picker, item, action)
+        pcall(function()
+          local query = picker.input and picker.input.filter and picker.input.filter.search or ""
+          if item and query ~= "" then require("utils.history_hub").record(query, "grep") end
+        end)
+        return require("snacks.picker.actions").jump(picker, item, action)
+      end,
       title = grep_picker_title(false),
       search = opts.search or "",
       live = true,
@@ -9585,48 +9594,15 @@ function M.setup()
   vim.api.nvim_create_user_command("UEDeployAndroidSO", function() deploy_android_so() end, {})
   -- One-key Android inner loop: build SO → hot-deploy → attach. The steps stay
   -- separate owners (K46); this only chains them and stops at the first failure.
-  vim.api.nvim_create_user_command("UEHub", function() require("utils.ue_hub").command_hub() end,
-    { desc = "Searchable hub of every UE action for the active target" })
-  vim.api.nvim_create_user_command("UETarget", function() require("utils.ue_hub").target_switcher() end,
-    { desc = "Show and switch the active project / platform / device / package" })
-  vim.api.nvim_create_user_command("UEDoctor", function() require("utils.ue_hub").doctor() end,
-    { desc = "Check tools, target, device and package; <CR> on a failed row runs its fix" })
-  vim.api.nvim_create_user_command("UEAndroidCrash", function()
-    require("ue.dap._android_crash").run()
-  end, { desc = "Android: symbolicate the latest native crash from the device into quickfix" })
-  vim.api.nvim_create_user_command("UEAndroidIterate", function(cmd)
-    local started = vim.uv.hrtime()
-    local notify = function(msg, level)
-      vim.notify("[UEAndroidIterate] " .. msg, level or vim.log.levels.INFO)
-      -- A failed step is a long-task outcome the user may have walked away
-      -- from: keep it in the statusline until the next run.
-      if level == vim.log.levels.ERROR then set_build_status("LOOP✗") end
-    end
-    local function elapsed() return ("%.0fs"):format((vim.uv.hrtime() - started) / 1e9) end
-    local function start()
-      -- The deploy leaves the app stopped (K46). Start it under the debugger
-      -- (wait-for-debugger launch, K39) or plainly with `nodebug`.
-      set_build_status("LOOP✓ " .. elapsed())
-      if cmd.args == "nodebug" then
-        notify("deploy ok in " .. elapsed() .. " → launching app")
-        return M.launch_app()
-      end
-      notify("deploy ok in " .. elapsed() .. " → launching under the debugger")
-      vim.cmd("UEDAPLaunch Android")
-    end
-    local function deploy()
-      notify("SO build ok → deploying")
-      deploy_android_so({ on_exit = function(code)
-        if code ~= 0 then return notify("stopped: deploy exited " .. code, vim.log.levels.ERROR) end
-        start()
-      end })
-    end
-    build_target({ operation = "so_build", on_exit = function(code)
-      if code ~= 0 then return notify("stopped: SO build exited " .. code, vim.log.levels.ERROR) end
-      deploy()
-    end })
-  end, { nargs = "?", complete = function() return { "nodebug" } end,
-    desc = "Android loop: build SO, hot-deploy it, launch under the debugger (nodebug: plain launch)" })
+  require("utils.ue_hub").setup_commands()
+  -- Target inner loops (Android: build SO → deploy → debug-launch) live with
+  -- their workflows; ue.lua only hands over the steps it owns.
+  require("ue.workflows.bootstrap").setup_loop_commands({
+    build_so = function(on_exit) build_target({ operation = "so_build", on_exit = on_exit }) end,
+    deploy_so = function(on_exit) deploy_android_so({ on_exit = on_exit }) end,
+    launch = function() M.launch_app() end,
+    set_status = set_build_status,
+  })
   vim.api.nvim_create_user_command("UELaunch", function()
     M.launch_app()
   end, {})

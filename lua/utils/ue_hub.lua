@@ -244,4 +244,23 @@ function M.doctor()
   end, { buffer = buf, nowait = true })
 end
 
+--- Register the keyboard-first entry commands (kept out of ue.lua, whose
+--- size is ratcheted down).
+function M.setup_commands()
+  local create = vim.api.nvim_create_user_command
+  create("UEHub", function() M.command_hub() end,
+    { desc = "Searchable hub of every UE action for the active target" })
+  create("UETarget", function() M.target_switcher() end,
+    { desc = "Show and switch the active project / platform / device / package" })
+  create("UEDoctor", function() M.doctor() end,
+    { desc = "Check tools, target, device and package; <CR> on a failed row runs its fix" })
+  create("UESearchHistory", function()
+    require("utils.history_hub").searches({
+      rerun = function(query) require("ue").cached_grep({ search = query }) end,
+    })
+  end, { desc = "Search history for this project (used searches first)" })
+  create("UEAndroidCrash", function() require("ue.dap._android_crash").run() end,
+    { desc = "Android: symbolicate the latest native crash from the device into quickfix" })
+end
+
 return M

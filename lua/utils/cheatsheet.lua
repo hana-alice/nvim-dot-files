@@ -552,6 +552,7 @@ local tabs = {
           { "<leader>us",    "Build Android SO only (skip APK)" },
           { "<leader>uq",    "Deploy Android SO; keep app stopped" },
           { "<leader>P",     "UE command hub: every action, searchable" },
+          { "<leader>fh",    "History hub: searches, files, jumps, commands, quickfix" },
           { "<leader>uu",    "Switch target: project/platform/device/package" },
           { "<leader>uk",    "Run the fix for the last failure" },
           { "<F5>",          "Run/debug target (continue inside a session)" },

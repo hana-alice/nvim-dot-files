@@ -73,6 +73,24 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-09-30 — 找回历史记录：按「用过」排序的搜索历史 + 统一历史入口
+
+**Task**
+- 用户：搜索历史很难找，要求举一反三。
+
+**Evidence（本机实测）**
+- 主搜索（csearch）picker 历史 249 条中 44 条是另一条的前缀（打字停顿被记下）；文件 picker 349 条中 179 条是前缀。历史没有「是否用过」「多久以前」「属于哪个项目」，各类历史分散在不同按键后面。
+
+**Implemented**
+- `lua/utils/history_hub.lua`（新）：只在**打开了结果**时记录查询（次数、最近时间、按项目分文件存于 `stdpath('state')/ue_search_history/`，上限 300，写入时才落盘，无定时器）；旧历史展示时去掉前缀与大小写重复。
+- `lua/ue.lua` 主搜索 picker 的 confirm 先记录再跳转；`:UESearchHistory` 与 hub 类命令改由 `utils.ue_hub.setup_commands` 注册，`UEAndroidIterate` 移到 `lua/ue/workflows/android/iterate.lua`（经 `ue.workflows.bootstrap` 接入），使 `ue.lua` 回到行数 ratchet 之下（10538 ≤ 10562）。
+- `lua/plugins/snacks.lua`：`<leader>sH` 改为「用过的在前（带 `3h ×2`）+ 清理后的旧记录」；新增 `<leader>fh` 历史中枢（搜索、上次结果、任意 picker、最近文件、跳转、命令行、通知、撤销树、旧 quickfix 列表、本文件 git 提交）。
+- `docs/USER_GUIDE.md` 增加「找回以前做过的事」一节。
+
+**Validation**
+- 全量回归 2383/2383 通过。
+- `android_ide` 21/21（前缀清理、计数与大小写合并、合并排序、按项目持久化、历史入口完整）；真实历史上清理 249 → 161 条；真实配置中 `<leader>sH`、`<leader>fh`、`:UESearchHistory` 已生效。
+
 ### 2026-09-30 — 键盘优先的 UE 工作流入口：命令中枢、目标切换、F5、状态栏、一键修复
 
 **Task**

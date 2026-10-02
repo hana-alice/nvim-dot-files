@@ -235,3 +235,89 @@ t.describe("android logcat helpers", function()
     t.assert_eq(cycled, "W")
   end)
 end)
+
+t.describe("history hub: searches worth finding again", function()
+  local history = require("utils.history_hub")
+
+  t.it("drops typing-pause prefixes and case duplicates, keeps order", function()
+    local cleaned = history.clean_queries({ "rasterbin", "shadebin", "shadeb", "RasterBin", "persistentthread", "shade" })
+    t.assert_eq(table.concat(cleaned, ","), "rasterbin,shadebin,persistentthread")
+  end)
+
+  t.it("records used queries newest-first with counts, bounded and case-insensitive", function()
+    local entries = history.record_into({}, "FooBar", "grep", 100)
+    entries = history.record_into(entries, "baz", "grep", 200)
+    entries = history.record_into(entries, "foobar", "grep", 300)
+    t.assert_eq(entries[1].query, "foobar")
+    t.assert_eq(entries[1].count, 2)
+    t.assert_eq(entries[2].query, "baz")
+    t.assert_eq(#entries, 2)
+    t.assert_eq(#history.record_into(entries, "  ", "grep", 400), 2, "blank queries are not recorded")
+  end)
+
+  t.it("puts used searches first, then cleaned older history without duplicates", function()
+    local merged = history.merge({ { query = "shadebin", kind = "grep", count = 3, last = 0 } },
+      { "SHADEBIN", "shadeb", "raster" })
+    t.assert_eq(#merged, 2)
+    t.assert_eq(merged[1].query, "shadebin")
+    t.assert_eq(merged[2].query, "raster")
+    t.assert_eq(merged[2].count, 0)
+    t.assert_contains(history.format_entry(merged[1], 3 * 3600), "3h ×3")
+    t.assert_contains(history.format_entry(merged[2], 0), "older")
+  end)
+
+  t.it("persists per project in a state file", function()
+    local key = "test-" .. tostring(vim.uv.hrtime())
+    history.record("VulkanRHI", "grep", key)
+    history.record("vulkanrhi", "grep", key)
+    local loaded = history.load(key)
+    t.assert_eq(#loaded, 1)
+    t.assert_eq(loaded[1].count, 2)
+    os.remove(vim.fs.joinpath(vim.fn.stdpath("state"), "ue_search_history", key .. ".json"))
+  end)
+
+  t.it("every history surface has a runnable entry and a key", function()
+    for _, surface in ipairs(history.surfaces) do
+      t.assert_type(surface.run, "function")
+      t.assert_true(type(surface.key) == "string" and surface.key ~= "")
+    end
+  end)
+end)
+
+t.describe("android iterate loop", function()
+  local iterate = require("ue.workflows.android.iterate")
+  local function steps(build_code, deploy_code, log)
+    return {
+      build_so = function(done) log[#log + 1] = "build"; done(build_code) end,
+      deploy_so = function(done) log[#log + 1] = "deploy"; done(deploy_code) end,
+      launch = function() log[#log + 1] = "launch" end,
+      set_status = function(value) log.status = value end,
+    }
+  end
+  local quiet = function() end
+
+  t.it("runs build → deploy → debug-launch and records success with duration", function()
+    local log, clock = {}, 0
+    iterate.run(steps(0, 0, log), { notify = quiet, now = function() clock = clock + 21; return clock end,
+      debug_launch = function() log[#log + 1] = "debug" end })
+    t.assert_eq(table.concat(log, ","), "build,deploy,debug")
+    t.assert_contains(log.status, "LOOP✓")
+  end)
+
+  t.it("stops at the first failing step and marks the statusline", function()
+    local log = {}
+    iterate.run(steps(2, 0, log), { notify = quiet })
+    t.assert_eq(table.concat(log, ","), "build")
+    t.assert_eq(log.status, "LOOP✗")
+    log = {}
+    iterate.run(steps(0, 5, log), { notify = quiet })
+    t.assert_eq(table.concat(log, ","), "build,deploy")
+    t.assert_eq(log.status, "LOOP✗")
+  end)
+
+  t.it("nodebug launches without the debugger", function()
+    local log = {}
+    iterate.run(steps(0, 0, log), { notify = quiet, nodebug = true, debug_launch = function() log[#log + 1] = "debug" end })
+    t.assert_eq(table.concat(log, ","), "build,deploy,launch")
+  end)
+end)

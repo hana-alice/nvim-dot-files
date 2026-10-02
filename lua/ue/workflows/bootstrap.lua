@@ -5,6 +5,11 @@ function M.setup_commands()
   require("ue.workflows.android.distributed").setup()
 end
 
+--- Inner-loop commands whose steps are provided by the ue.lua facade.
+function M.setup_loop_commands(steps)
+  require("ue.workflows.android.iterate").setup(steps)
+end
+
 function M.ensure_registered()
   if defaults_registered then
     return

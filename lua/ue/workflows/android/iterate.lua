@@ -17,14 +17,20 @@ function M.run(steps, opts)
   local notify = opts.notify or function(msg, level)
     vim.notify("[UEAndroidIterate] " .. msg, level or vim.log.levels.INFO)
   end
+  -- Field evidence: does the loop finish, and where does it stop?
+  local function probe(key, data)
+    pcall(function() require("utils.probe").record("android-iterate", key, data) end)
+  end
   local function fail(msg)
     steps.set_status("LOOP✗")
     notify(msg, vim.log.levels.ERROR)
+    probe("stopped", { reason = msg:sub(1, 120), elapsed = elapsed() })
   end
   local function start()
     -- The deploy leaves the app stopped (K46); start it under the debugger
     -- (wait-for-debugger launch, K39) unless `nodebug` was requested.
     steps.set_status("LOOP✓ " .. elapsed())
+    probe(opts.nodebug and "ok:nodebug" or "ok:debug", { state = "ok", elapsed = elapsed() })
     if opts.nodebug then
       notify("deploy ok in " .. elapsed() .. " → launching app")
       return steps.launch()

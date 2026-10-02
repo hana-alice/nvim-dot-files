@@ -135,6 +135,8 @@ end
 function M.report_if_gone(text, serial)
   if not M.is_gone_output(text) then return false end
   local headline = ("Android device %s is not connected"):format(tostring(serial or M.get() or "?"))
+  -- Evidence that real failures reach this path (and with which adb wording).
+  pcall(function() require("utils.probe").record("android-device-gone", "detected", tostring(text):sub(1, 120)) end)
   pcall(function() require("utils.ue_hub").offer_fix("UESetAndroidDevice", headline) end)
   vim.notify(headline .. " — <leader>uk to pick another device", vim.log.levels.WARN, { title = "UE" })
   return true

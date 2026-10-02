@@ -73,6 +73,29 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-10-02 — 删文件不再整体重建 csearch；修复增量 add 静默丢同名前缀文件
+
+**Task**
+- 用户：切引擎分支 / p4 sync 触发 prepare 没关系，但要复用、避免无效操作；另扫探针查漏补缺。
+
+**Evidence（本机实测）**
+- 最近一次 prepare 记录：总 88 s，其中 csearch 71.9 s（state-fields `prepare_timings`）。
+- 探针 `csearch-smart-build`：reset 8 次 / add 2 次——任何删除都强制 reset。
+- 「cindex 无删除能力」被证伪：codesearch v1.2.0 `Merge` 以 delta root 前缀区间遮蔽旧名字。
+- 同一机制的既有缺陷：旧二进制增量 add 在真实 18.2 万文件清单上，对 37 个被前缀遮蔽的未改动文件丢了 36 个（`Foo.h` 改动 → `Foo.hpp` 消失）。
+- 真实清单基准：300 删除 + 237 改动（含 37 个遮蔽样例）增量 2.4 s；全量 reset 87.4 s。增量结果与对剩余集合的全量 reset 名字表（181615）与全部 502253 个 trigram 倒排逐项相等。
+
+**Implemented**
+- `tools/cindex-uefilter`：`-delete-from FILE`（同一次 merge 删除）；增量时对遮蔽区间做闭包，重新入索引未改动兄弟文件；`rawindex.go` 从测试移出供运行时读名字数。新增 Go 用例：前缀兄弟不丢、只删列出文件。已 `go install`，旧二进制备份为 `cindex-uefilter.exe.bak-20261002`。
+- `lua/ue.lua` `csearch_build_mode`：删除不再强制 reset，计入 30% 阈值；`csearch_smart_build` 把删除清单交给 `build_index`（`delete_list`）。旧二进制不认参数 → add 失败 → 既有回退 reset。
+- 探针：`csearch-smart-build` 决策改记 `state=ok`（非失败），新 revision `delete-from-2026-10-02`；新增 `prepare-path`（fast/cold）、`android-iterate`（完成/停在哪）、`android-device-gone`（真实掉线是否走到该路径）。
+- 处置既有探针：`csearch-smart-build` reset/add 记 resolved；`dirty-set-flood` cap-hit 记 deferred（下一项改动）。
+- spec `ue-code-search`、`docs/architecture/grep-cache-invalidation.md` D11 修订旧结论。
+
+**Validation**
+- `go test ./...` 通过；全量回归 2391/2391 通过；`csearch_build_guard` 29/29（删除 → add + `-delete-from`、删除计入阈值）、`dirty_overflow`、`grep_cache`、`stability`（ue.lua 10559 ≤ 10562）。
+- 未做：在 nvim 内对真实工程跑一次带删除的 `:UEPrepare` 端到端（本次在同一真实清单上直接驱动二进制验证）。
+
 ### 2026-10-02 — 设备被拔掉后只会报错了事，没有一键重选
 
 **Task**

@@ -37,7 +37,10 @@ MUST NOT 提前删除或截断原有正式索引。
 （append）前 SHALL 校验目标索引可用，不可用时拒绝并提示全量 `:UEPrepare`；
 全量构建（reset）永远安全，不受此约束。`-files-from` 增量 merge 只替换清单
 中列出的 exact file path 的 trigram，MUST NOT 把宽泛 CLI root 当作 delta
-replacement prefix；删除事件升级为 reset，不得伪装成 add。
+replacement prefix；被前缀遮蔽的未改动同名前缀文件（如 `Foo.h` 遮蔽 `Foo.hpp`）
+SHALL 重新入索引，不得被增量静默丢弃。删除 SHALL 经 `-delete-from` 在同一次
+merge 中移除，结果 MUST 与对剩余集合的全量 reset 等价；工具不支持该参数时
+SHALL 失败并回退 reset，MUST NOT 留下已删除文件的命中。
 
 理由：cindex 原子写协议把 staged 文件硬编码为 `<idx>~`，并发构建抢同一
 `idx~` 会在 merge/rename 阶段相互破坏，导致 `corrupt index: remove` 与 0
@@ -153,6 +156,13 @@ Project-scoped grep 缓存 SHALL 按 canonical project identity 分桶于 engine
 - **踩坑**：`corrupt index: remove` 与 0 字节索引死循环——根因是并发构建争抢
   同一 `<idx>~` 临时文件；处置是单写者串行化（拒绝并发，不排队）+ 增量构建
   前校验索引可用性。
+- **踩坑（2026-10-02 实测）**：「cindex 无删除能力，删除必须 reset」是错误前提。
+  codesearch v1.2.0 的 `Merge` 把 delta 的每个 root `P` 视为拥有旧索引中
+  `[P, P 末字节+1)` 的全部名字：root 指向已删文件且不索引内容即可删除该文件。
+  同一机制也让 `Foo.h` 遮蔽未改动的 `Foo.hpp`——旧版增量 add 在真实 18.2 万文件
+  清单上对 37 个此类文件丢了 36 个。处置：`cindex-uefilter -delete-from` + 遮蔽
+  闭包重入索引；真实清单上 300 删除 + 237 改动 2.4 s（reset 87 s），与对剩余集合
+  全量 reset 的名字表与全部 trigram 倒排逐项相等。
 - **踩坑**：watcher 曾经/可能被误接回 csearch 写入路径——回归测试专门断言
   watcher provider 不触发 `build_index`，这是防回归红线。
 - **重要事项**：Windows 原生文件通知包含大量与内容无关的元数据事件，必须在

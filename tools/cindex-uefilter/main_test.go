@@ -15,79 +15,6 @@ import (
 	"time"
 )
 
-const rawIndexTrailerMagic = "\ncsearch trailr\n"
-const rawPostEntrySize = 3 + 4 + 4
-
-type rawIndex struct {
-	data      []byte
-	pathData  uint32
-	nameData  uint32
-	postData  uint32
-	nameIndex uint32
-	postIndex uint32
-	numName   int
-	numPost   int
-}
-
-func openRawIndex(file string) (*rawIndex, error) {
-	data, err := os.ReadFile(file)
-	if err != nil {
-		return nil, err
-	}
-	if len(data) < 4*4+len(rawIndexTrailerMagic) || string(data[len(data)-len(rawIndexTrailerMagic):]) != rawIndexTrailerMagic {
-		return nil, os.ErrInvalid
-	}
-	n := uint32(len(data) - len(rawIndexTrailerMagic) - 5*4)
-	ix := &rawIndex{data: data}
-	ix.pathData = ix.uint32(n)
-	ix.nameData = ix.uint32(n + 4)
-	ix.postData = ix.uint32(n + 8)
-	ix.nameIndex = ix.uint32(n + 12)
-	ix.postIndex = ix.uint32(n + 16)
-	ix.numName = int((ix.postIndex-ix.nameIndex)/4) - 1
-	ix.numPost = int((n - ix.postIndex) / rawPostEntrySize)
-	return ix, nil
-}
-
-func (ix *rawIndex) slice(off uint32, n int) []byte {
-	o := int(off)
-	if n < 0 {
-		return ix.data[o:]
-	}
-	return ix.data[o : o+n]
-}
-
-func (ix *rawIndex) uint32(off uint32) uint32 {
-	return binary.BigEndian.Uint32(ix.slice(off, 4))
-}
-
-func (ix *rawIndex) str(off uint32) []byte {
-	data := ix.slice(off, -1)
-	end := bytes.IndexByte(data, 0)
-	if end < 0 {
-		return nil
-	}
-	return data[:end]
-}
-
-func (ix *rawIndex) Paths() []string {
-	off := ix.pathData
-	var out []string
-	for {
-		s := ix.str(off)
-		if len(s) == 0 {
-			return out
-		}
-		out = append(out, string(s))
-		off += uint32(len(s) + 1)
-	}
-}
-
-func (ix *rawIndex) Name(fileid uint32) string {
-	off := ix.uint32(ix.nameIndex + 4*fileid)
-	return string(ix.str(ix.nameData + off))
-}
-
 func (ix *rawIndex) PostingList(trigram uint32) []uint32 {
 	data := ix.slice(ix.postIndex, rawPostEntrySize*ix.numPost)
 	i := sort.Search(ix.numPost, func(i int) bool {
@@ -126,6 +53,7 @@ func resetFlagsForTest() {
 	verboseFlag = flag.CommandLine.Bool("verbose", false, "print extra information")
 	cpuProfile = flag.CommandLine.String("cpuprofile", "", "write cpu profile to this file")
 	filesFromFlag = flag.CommandLine.String("files-from", "", "read paths from FILE (or stdin if -)")
+	deleteFromFlag = flag.CommandLine.String("delete-from", "", "incremental only: remove the paths listed in FILE from the index")
 }
 
 func TestHelperProcess(t *testing.T) {
@@ -351,5 +279,76 @@ func TestFilesFromIncrementalAddReplacesAndAddsWithoutPanic(t *testing.T) {
 		if _, err := os.Stat(leftover); !os.IsNotExist(err) {
 			t.Fatalf("unexpected publish leftover %s", leftover)
 		}
+	}
+}
+
+// Merge treats each staged path P as owning every old name in [P, P+1): a
+// delta that re-adds "Foo.h" therefore also shadows "Foo.hpp". The tool must
+// re-stage such untouched siblings or an incremental add silently drops them.
+func TestIncrementalAddKeepsSiblingsSharingAPathPrefix(t *testing.T) {
+	tempDir := t.TempDir()
+	indexPath := filepath.Join(tempDir, "prefix.idx")
+	header := filepath.Join(tempDir, "Foo.h")
+	sibling := filepath.Join(tempDir, "Foo.hpp")
+	initialList := filepath.Join(tempDir, "initial.list")
+	updateList := filepath.Join(tempDir, "update.list")
+
+	writeFile(t, header, "header-token-hhh\n")
+	writeFile(t, sibling, "sibling-token-sss\n")
+	writeListFile(t, initialList, header, sibling)
+	runTool(t, indexPath, "-reset", "-files-from", initialList, tempDir)
+
+	writeFile(t, header, "edited-token-eee\n")
+	writeListFile(t, updateList, header)
+	runTool(t, indexPath, "-files-from", updateList)
+
+	ix, err := openRawIndex(indexPath)
+	if err != nil {
+		t.Fatalf("openRawIndex(%s): %v", indexPath, err)
+	}
+	if got, want := trigramNames(ix, "sib"), []string{sibling}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("sibling dropped by prefix shadow: names = %v, want %v", got, want)
+	}
+	if got, want := trigramNames(ix, "edi"), []string{header}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("edited header names = %v, want %v", got, want)
+	}
+}
+
+// -delete-from removes vanished files from the index without a full reset.
+func TestDeleteFromRemovesOnlyListedFiles(t *testing.T) {
+	tempDir := t.TempDir()
+	indexPath := filepath.Join(tempDir, "delete.idx")
+	keep := filepath.Join(tempDir, "keep.cpp")
+	gone := filepath.Join(tempDir, "gone.cpp")
+	goneSibling := filepath.Join(tempDir, "gone.cpp.inl")
+	initialList := filepath.Join(tempDir, "initial.list")
+	emptyList := filepath.Join(tempDir, "empty.list")
+	deleteList := filepath.Join(tempDir, "delete.list")
+
+	writeFile(t, keep, "keep-token-kkk\n")
+	writeFile(t, gone, "gone-token-ggg\n")
+	writeFile(t, goneSibling, "inline-token-iii\n")
+	writeListFile(t, initialList, keep, gone, goneSibling)
+	runTool(t, indexPath, "-reset", "-files-from", initialList, tempDir)
+
+	if err := os.Remove(gone); err != nil {
+		t.Fatal(err)
+	}
+	writeListFile(t, emptyList)
+	writeListFile(t, deleteList, gone)
+	runTool(t, indexPath, "-files-from", emptyList, "-delete-from", deleteList)
+
+	ix, err := openRawIndex(indexPath)
+	if err != nil {
+		t.Fatalf("openRawIndex(%s): %v", indexPath, err)
+	}
+	if got := trigramNames(ix, "gon"); len(got) != 0 {
+		t.Fatalf("deleted file still indexed: %v", got)
+	}
+	if got, want := trigramNames(ix, "kee"), []string{keep}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("untouched file names = %v, want %v", got, want)
+	}
+	if got, want := trigramNames(ix, "inl"), []string{goneSibling}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("prefix sibling of deleted file = %v, want %v", got, want)
 	}
 }

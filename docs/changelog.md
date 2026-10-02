@@ -73,6 +73,39 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-10-02 — 设备被拔掉后只会报错了事，没有一键重选
+
+**Task**
+- 用户：从实用角度继续找可改善点（承接上一条 iterate 挂起修复）。
+
+**Evidence**
+- 按 `global-android-device-selection` spec 的刻意设计，已选 serial 掉线时不自动改投；但四下都只留 adb 原文：install 的 `failure_hint` 只认 `device offline/no devices`（真机 1.0.41 的原文是 `adb.exe: device 'X' not found`，匹配不上）、launch/deploy/DAP staging 同样只发裸文本，用户还得自己想起 `<leader>uA`。
+
+**Implemented**
+- `lua/utils/android_device.lua`：`is_gone_output`（纯函数，四种 adb 原文）、`report_if_gone`（提示 + 登记 `:UESetAndroidDevice` 为一次性修复，仍不改写 serial）、`check_async`（异步 `get-state`，仅给 UI 用）。
+- install / launch / deploy / DAP attach staging 失败路径接入 `report_if_gone`；DAP 侧按 C10 拆成独立上报点（owner 由 `dap.android (staging transport)` 改为 `utils.android_device`，headline/remedy/fix 一并改），仍在 `report_failure` 内。
+- `:UEDoctor` 新增异步设备存活行：target 字段可用 `check` 提供异步判定，通用 hub 渲染后原地重写该行（无 check 的行行为不变）。
+- `docs/USER_GUIDE.md` 排障表补一行；spec 增加「已选设备不可用时必须提示重选」requirement 与场景。
+
+**Validation**
+- 全量回归 2390/2390 通过；`android_device` 17/17、`android_ide` 27/27、`ue_workflows` 25/25、`dap` 237/237、`host_resource_discipline` 13/13（新 spawn 站点已登记）、`structure` 78/78。
+
+### 2026-10-02 — `UEAndroidIterate` 在步骤未启动时静默挂起
+
+**Task**
+- 用户：从实用角度继续找可改善点。
+
+**Evidence**
+- 复现：构建已在运行、未配置项目、平台选择取消、计划失败、终端未启动、设备选择取消、deploy 计划失败等路径都 `return` 而不调用 `on_exit`；循环既不报错也不更新状态栏（headless 复现：build 早退后 `ue_build_status` 仍为 nil）。
+
+**Implemented**
+- `lua/ue.lua` `build_target`：所有未启动路径调用 `on_exit(-1)`（仅链式调用方传 `on_exit`，直接命令行为不变）。
+- `lua/ue/workflows/android/deploy.lua`：同样在未启动/设备选择取消/终端未启动时回报 `-1`。
+- `lua/ue/workflows/android/iterate.lua`：`-1` 显示为「did not start」并标 `LOOP✗`。
+
+**Validation**
+- 全量回归 2385/2385 通过；`android_ide`、`ue_workflows`（新增取消选择与计划失败回报用例）、`stability`（ue.lua 10544 ≤ 10562）、`ue_api`、`ue_target_integration` 全绿。
+
 ### 2026-09-30 — 找回历史记录：按「用过」排序的搜索历史 + 统一历史入口
 
 **Task**

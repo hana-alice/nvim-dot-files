@@ -1404,6 +1404,21 @@ local function bootstrap_session(opts, on_ready)
     P.step("5/6  pushing lldb-server to device …")
     local ok_push, push_msg = ensure_lldb_server_pushed(sess.adb, serial, sess.package_name, server_src)
     if not ok_push then
+      -- The selected device was unplugged: re-selecting is the fix, not preflight.
+      if android_device.is_gone_output(push_msg) then
+        -- The selected device is unplugged, not a staging defect: the layer
+        -- owner changes and re-selecting (not preflight) is the fix.
+        report_failure({
+          layer = require("ue.dap.failure").L.TRANSPORT,
+          owner = "utils.android_device",
+          headline = "device " .. tostring(serial) .. " is not connected",
+          summary = "the selected device was gone before the debug server could be staged",
+          evidence = require("ue.dap.failure").observed_evidence("staging", tostring(push_msg)),
+          remedy = "reconnect it or run :UESetAndroidDevice to pick another device",
+          fix = "UESetAndroidDevice",
+        })
+        on_ready(false); return
+      end
       report_failure({
         layer = require("ue.dap.failure").L.TRANSPORT,
         owner = "dap.android (staging transport)",

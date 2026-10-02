@@ -198,6 +198,9 @@ function M.run(request)
           return
         end
         local detail = #output > 0 and ("\n" .. table.concat(output, "\n")) or ""
+        if deps.android_device.report_if_gone and deps.android_device.report_if_gone(detail, snapshot.device.serial) then
+          return
+        end
         deps.notify_error("ue_launch", ("Android launch failed (exit %d)%s"):format(code, detail))
       end)
     end,

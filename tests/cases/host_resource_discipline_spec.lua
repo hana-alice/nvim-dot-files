@@ -75,6 +75,7 @@ local SPAWN_AUDIT = {
   { p="lua/ue.lua", api="vim.system", a="local handle = vim.system(cmd, {", class="deferrable", reason="admitted ccjson subprocess", guard="admission.run_when_allowed" },
   { p="lua/ue.lua", api="fn-system", a="vim.fn.systemlist(joined)", class="helper", reason="legacy fallback for shared sync helper" },
   { p="lua/utils/android_device.lua", api="vim.system", a="pcall(vim.system", class="interactive", reason="bounded device discovery requested by user" },
+  { p="lua/utils/android_device.lua", api="vim.system", a="pcall(opts.system or vim.system", class="interactive", reason="one bounded `adb -s <serial> get-state` liveness check (doctor row)" },
   { p="lua/utils/android_package.lua", api="vim.system", a="opts.system or vim.system", class="interactive", reason="one `pm list packages` for a user-driven package picker" },
   { p="lua/utils/code_search/init.lua", api="spawn", a="vim.loop.spawn(cs", class="interactive", reason="cancellable indexed query" },
   { p="lua/utils/code_search/init.lua", api="spawn", a="vim.loop.spawn(rg", class="interactive", reason="cancellable grep fallback" },

@@ -52,6 +52,21 @@ pidof/cleanup。`adb devices -l` 作为发现命令是不加 `-s` 的例外。
 - **THEN** 安装命令 SHALL 仍包含 `-s SERIAL-OLD`，MUST NOT 静默对 `SERIAL-NEW`
   安装
 
+### Requirement: 已选设备不可用时必须提示重选，仍不得自动改投
+
+设备定向操作失败且 adb 输出表明该 serial 已断开（`device 'X' not found` /
+`device offline` / `no devices/emulators found` / `device unauthorized`）时，系统
+SHALL 明确说明「所选设备未连接」，并 SHALL 把 `:UESetAndroidDevice` 登记为
+一键修复（`<leader>uk`）；MUST NOT 因此清空或改写全局 serial，MUST NOT 自动
+切到列表中的其他 ready device。判定只依赖该次操作的 adb 输出（纯函数），
+不得为此在失败路径上新增阻塞探测。
+
+#### Scenario: 设备拔掉后安装失败
+
+- **WHEN** 全局 serial 为 `SERIAL-OLD`（已拔出），执行 Android install/launch/deploy/DAP attach
+- **THEN** 失败信息 SHALL 指向设备未连接，并登记 `:UESetAndroidDevice` 作为修复
+- **AND** 全局 serial SHALL 仍为 `SERIAL-OLD`
+
 ### Requirement: 运行中流程必须捕获 serial 并保持设备一致，跨会话不漂移
 
 每个 Android 长流程 SHALL 在启动时捕获目标 serial，后续异步 callback、poller

@@ -758,6 +758,7 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `:UESetPlatform`          | Interactive platform+config select  |
 | `:UESetPlatform Win64 Development Editor` | Direct set         |
 | `<leader>ub`              | `:UEBuild` (platform from `:UESetPlatform`); on macOS, silent stages show a process-tree heartbeat in the same terminal |
+| `<leader>u?`              | `:UEGuide`: open the user guide (daily workflow, keys, troubleshooting) read-only |
 | `<leader>uE`              | `:UEBuildFirstError`: jump directly to the first source error of the latest build |
 | `<leader>uJ`              | `:UEPanelNext`: cycle build / quickfix / logcat / tasks in one bottom window (normal/terminal) |
 | `:UEPanel build` / `quickfix` / `logcat` / `tasks` | Select a bottom panel directly; tasks: `<CR>` / `dd` stop, `r` refresh |

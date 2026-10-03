@@ -68,6 +68,7 @@ M.actions = {
   { group = "Help",   label = "Cheatsheet", key = "<leader>?", run = cmd("UECheatsheet") },
   { group = "Help",   label = "Environment doctor (tools, target, device, package)", run = cmd("UEDoctor") },
   { group = "Help",   label = "Editor health audit", run = cmd("NvimCoreHealth") },
+  { group = "Help",   label = "User guide / 使用手册（日常流程、按键、排障）", key = "<leader>u?", run = function() M.open_guide() end },
 }
 
 local function target_hub(target)
@@ -302,8 +303,26 @@ end
 
 --- Register the keyboard-first entry commands (kept out of ue.lua, whose
 --- size is ratcheted down).
+--- Open the long-lived user guide (docs/USER_GUIDE.md) read-only in a tab.
+function M.guide_path()
+  return vim.fs.joinpath(vim.fn.stdpath("config"), "docs", "USER_GUIDE.md")
+end
+
+function M.open_guide()
+  local path = M.guide_path()
+  if vim.fn.filereadable(path) ~= 1 then
+    vim.notify("使用手册不存在: " .. path, vim.log.levels.ERROR)
+    return nil
+  end
+  vim.cmd("tabedit " .. vim.fn.fnameescape(path))
+  vim.bo.readonly = true
+  return path
+end
+
 function M.setup_commands()
   local create = vim.api.nvim_create_user_command
+  create("UEGuide", function() M.open_guide() end,
+    { desc = "Open the user guide: daily workflow, keys, troubleshooting" })
   create("UEHub", function() M.command_hub() end,
     { desc = "Searchable hub of every UE action for the active target" })
   create("UETarget", function() M.target_switcher() end,

@@ -565,6 +565,7 @@ local tabs = {
           { "<leader>ux",    "Android loop: build SO → deploy → debug-launch" },
           { "<leader>uX",    "Symbolicate latest Android crash → quickfix" },
           { "<leader>uB",    "UEPrepare (IOS setup/semantic + CDB/index, then clangd)" },
+          { "<leader>u?",    "User guide / 使用手册 (:UEGuide)" },
           { "<leader>uE",    "Jump to first build error (:UEBuildFirstError)" },
           { "<leader>uJ",    "Cycle bottom: build / problems / logcat / tasks" },
           { ":UEPrepareIncremental", "Prepare dirty files only" },

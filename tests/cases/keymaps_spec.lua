@@ -87,6 +87,10 @@ t.describe("keymaps: leader 代表键", function()
       t.assert_contains(t.get_keymap(mode, "<leader>uJ").rhs, "UEPanelNext")
     end
   end)
+  t.it("<leader>u? → user guide", function()
+    t.assert_contains(t.get_keymap("n", "<leader>u?").rhs, "UEGuide")
+  end)
+
   t.it("<leader>uE → first build error", function()
     t.assert_contains(t.get_keymap("n", "<leader>uE").rhs, "UEBuildFirstError")
   end)

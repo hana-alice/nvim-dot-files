@@ -211,6 +211,7 @@ end
 local function apply_ue_runtime_overrides()
   local opts = { nowait = true }
 
+  map("n", "<leader>u?", "<cmd>UEGuide<cr>", vim.tbl_extend("force", opts, { desc = "UE: User guide (使用手册)" }))
   map("n", "<leader>uA", "<cmd>UESetAndroidDevice<cr>", vim.tbl_extend("force", opts, { desc = "UE: Select Android device (this Nvim)" }))
   map("n", "<leader>ub", "<cmd>UEBuild<cr>", vim.tbl_extend("force", opts, { desc = "UE: Build (platform from UESetPlatform)" }))
   map("n", "<leader>uE", "<cmd>UEBuildFirstError<cr>", vim.tbl_extend("force", opts, { desc = "UE: Jump to first build error" }))

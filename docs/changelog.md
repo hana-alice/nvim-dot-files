@@ -73,6 +73,21 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-10-03 — 编辑器内一键打开使用手册
+
+**Task**
+- 用户：至少要让人知道有个地方可以查看使用手册。
+
+**Evidence**
+- `docs/USER_GUIDE.md` 只在 README 表格里出现，编辑器内没有任何命令、按键或命令中枢条目指向它。
+
+**Implemented**
+- `:UEGuide` / `<leader>u?`：只读标签页打开使用手册；`<leader>P` 命令中枢「Help」组可搜到「使用手册」。
+- 手册第 1 节、cheatsheet 同步登记入口。
+
+**Validation**
+- 全量回归 2488/2488 通过；`keymaps` 64/64、`cheatsheet` 164/164、`commands` 126/126（冻结命令数 96→97）、`android_ide` 45/45；headless `:UEGuide` 打开 `USER_GUIDE.md` 且只读。
+
 ### 2026-10-03 — 一个底部窗口容纳构建、问题、日志与任务
 
 **Task**

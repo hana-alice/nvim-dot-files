@@ -285,6 +285,12 @@ Source: `lua/plugins/ue.lua` (`gd`, `<leader>ch`),
 | `<C-k>` (insert) | Signature help in insert mode (LazyVim) |
 | `<C-LeftMouse>`  | Smart jump: `gf` if file ref, else `gd` |
 | `<leader>ch`     | Switch source / header (clangd, UE)     |
+| `<leader>cI`     | Incoming calls / 谁调用了它 (clangd)    |
+| `<leader>cO`     | Outgoing calls / 它调用了谁 (clangd)    |
+| `<leader>cB`     | Type hierarchy: base types (clangd)     |
+| `<leader>cD`     | Type hierarchy: derived types (clangd)  |
+| `<leader>ss`     | Current file symbol outline (clangd)   |
+| `<leader>sS`     | Live workspace class/function search (clangd) |
 | `<leader>ca`     | Code action (LazyVim)                   |
 | `<leader>cr`     | Rename symbol (LazyVim)                 |
 | `<leader>cf`     | Format buffer or selection (LazyVim)    |
@@ -752,6 +758,9 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `:UESetPlatform`          | Interactive platform+config select  |
 | `:UESetPlatform Win64 Development Editor` | Direct set         |
 | `<leader>ub`              | `:UEBuild` (platform from `:UESetPlatform`); on macOS, silent stages show a process-tree heartbeat in the same terminal |
+| `<leader>uE`              | `:UEBuildFirstError`: jump directly to the first source error of the latest build |
+| `<leader>uJ`              | `:UEPanelNext`: cycle build / quickfix / logcat / tasks in one bottom window (normal/terminal) |
+| `:UEPanel build` / `quickfix` / `logcat` / `tasks` | Select a bottom panel directly; tasks: `<CR>` / `dd` stop, `r` refresh |
 | `:UECompileForNvim`       | Compatibility entry: build current target, then delegate to the normal `UEPrepare` path |
 | `:UEBuildIOS`             | Build IOS C++ through native macOS UBT; safely reuse unchanged AOT outputs and defer dSYM |
 | `:UEIOSSetup`             | Optional explicit rerun of IOS prepared identity/private-key/device setup |

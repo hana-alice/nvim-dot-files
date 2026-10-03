@@ -73,6 +73,7 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 | watcher dirty 持久化 | `lua/utils/ue_watch.lua` + `dirty_save.lua` | `lua/utils/AGENTS.md` | `ue-code-search`、`multi-instance-state-isolation` | `ue_watch_csearch` `multi_instance_state` `stability` | 事件 generation 隔离，原 owner 保存与有界 I/O 重试 |
 | 宿主资源感知/动态纪律 | `lua/utils/cpu_load.lua` + `host_admission.lua` + `clangd_resource_controller.lua` + `lua/ue/index/_admission.lua` | `lua/utils/AGENTS.md` + `lua/ue/index/AGENTS.md` | `editor-behavior-regression`、`cpp-semantic-index-coverage` | `cpu_admission` `host_resource_discipline` `clangd_resource` `index_delivery` `ue_config` `stability` | host 1Hz / Neovim 4Hz 常驻感知；batch 推迟、前台优先、owned clangd 可逆降优先级 |
 | 任务管理 | `lua/utils/task_registry.lua` | `lua/utils/AGENTS.md` | `task-management` | `task_registry` `commands` | `Tasks`/`TaskStop`/`TaskStopAll` 通用后台任务 |
+| 底部面板 | `lua/utils/bottom_panel.lua` | `lua/utils/AGENTS.md` | `task-management`、`editor-behavior-regression` | `android_ide` `task_registry` `commands` `stability` | 每 tab 一个 host，保留原生 quickfix 与 build/logcat reader 生命周期；显式切换/刷新才查询任务 |
 | 通知历史 | `lua/utils/` 通知层 | `lua/utils/AGENTS.md` | `notification-history` | `utils` | 不做周期 ticker（P5） |
 | workaround 注册表 | `lua/workarounds/` | `lua/workarounds/AGENTS.md` | 无对应 capability | `workarounds` `smoke` | 上游 bug 补丁，带 frontmatter |
 | 配置层 | `lua/config/` | `lua/config/AGENTS.md` | `keymap-command-regression`、`editor-behavior-regression` | `keymaps` `commands` `review_editor` `options` `autocmds` | keymaps / options / autocmds / lazy |

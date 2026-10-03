@@ -64,6 +64,20 @@ return {
           require("ue.index.batch_recovery").attach(client, bufnr)
         end,
         keys = {
+          { "<leader>cI", function() require("snacks").picker.lsp_incoming_calls() end,
+            desc = "Incoming calls (谁调用了它)", has = "prepareCallHierarchy" },
+          { "<leader>cO", function() require("snacks").picker.lsp_outgoing_calls() end,
+            desc = "Outgoing calls (它调用了谁)", has = "prepareCallHierarchy" },
+          { "<leader>ss", function() require("snacks").picker.lsp_symbols({ tree = true }) end,
+            desc = "Document symbols (当前文件大纲)", has = "documentSymbol" },
+          { "<leader>sS", function() require("snacks").picker.lsp_workspace_symbols({ live = true }) end,
+            desc = "Workspace symbols (类 / 函数)", has = "workspace/symbol" },
+          { "<leader>cB", function() require("utils.ue_goto.type_hierarchy").open("supertypes") end,
+            desc = "Type hierarchy: base types (基类)", has = "prepareTypeHierarchy" },
+          { "<leader>cD", function() require("utils.ue_goto.type_hierarchy").open("subtypes") end,
+            desc = "Type hierarchy: derived types (派生类)", has = "prepareTypeHierarchy" },
+          { "<leader>cr", vim.lsp.buf.rename, desc = "Rename symbol", has = "rename" },
+          { "<leader>ca", vim.lsp.buf.code_action, desc = "Code action", mode = { "n", "x" }, has = "codeAction" },
           {
             "gd",
             definition_fallback,

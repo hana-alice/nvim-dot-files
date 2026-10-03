@@ -16,6 +16,7 @@
 | 子系统 | 代码 | 职责 | 归属边界 |
 |---|---|---|---|
 | UE 引擎中枢 | `lua/ue.lua` + `lua/ue/` | 索引 / CDB / DAP / 命令注册总入口 | 公共 API 挂 `M.*`；命令在 `ue.setup()` 注册 |
+| 底部面板 | `lua/utils/bottom_panel.lua` | 构建输出 / 原生 quickfix / logcat / 后台任务共用每 tab 的窗口 | 只换 buffer；隐藏不取消进程，任务状态仍由 registry 派生；DAP 借用 host 后只收自己的可见内容 |
 | Project/session state | `lua/ue/project_state.lua` + `file_lock.lua` | 当前进程选择、canonical project bucket、跨进程 writer lease | live selection 不重读其他实例的默认值；共享写入必须 atomic/merge/lease |
 | CDB 流水线 | `lua/ue/cdb/` | compile_commands.json 生成/裁剪/shader/inject | 纯函数 + 子进程；写前 skip-if-unchanged |
 | 配置 schema | `lua/ue/config.lua` | `index/resources/context/clangd/dap/cdb` 默认值 + override | `get/setup/options/reset_for_test` |

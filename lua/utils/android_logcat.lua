@@ -69,6 +69,7 @@ end
 --- opts.on_cycle(next_level): restart the reader with the new level.
 function M.attach(buf, opts)
   opts = opts or {}
+  require("utils.bottom_panel").register("logcat", buf)
   local map = function(lhs, rhs, desc)
     vim.keymap.set("n", lhs, rhs, { buffer = buf, nowait = true, silent = true, desc = desc })
   end

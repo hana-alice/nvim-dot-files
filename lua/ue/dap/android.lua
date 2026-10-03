@@ -342,10 +342,8 @@ local function pick_package(ctx)
     end
     return info.package
   end
-  -- 4. Last resort: prompt.
-  local typed = vim.fn.input("Android package name: ", "")
-  if typed == "" then return nil end
-  return typed
+  -- 4. Nothing known: the caller offers a device package picker (async).
+  return nil
 end
 
 local function pick_symbol_lib(ctx)
@@ -575,6 +573,37 @@ local function adb_run_raw(adb, args)
   return (out or ""):gsub("[\r\n]+$", ""), vim.v.shell_error
 end
 
+-- Asynchronous adb round-trip for interactive attach/launch paths (K53: a
+-- synchronous spawn on Windows costs >= 87 ms before adb even connects).
+-- done(out, code) runs on the main loop; a spawn failure reports code -1.
+local function adb_async(adb, args, done)
+  local cmd = { adb }
+  vim.list_extend(cmd, args)
+  local ok, err = pcall(vim.system, cmd, { text = true }, function(res)
+    vim.schedule(function()
+      local out = ((res and res.stdout) or "") .. ((res and res.code ~= 0 and res.stderr) or "")
+      done(out:gsub("[\r\n]+$", ""), res and res.code or -1)
+    end)
+  end)
+  if not ok then vim.schedule(function() done(tostring(err), -1) end) end
+end
+
+-- Run adb steps in order without blocking; stops at the first nonzero exit
+-- unless the step is marked optional. done(ok, out, code, failed_index).
+local function adb_sequence(adb, steps, done)
+  local index = 0
+  local function nxt()
+    index = index + 1
+    local step = steps[index]
+    if not step then return done(true) end
+    adb_async(adb, step.args, function(out, code)
+      if code ~= 0 and not step.optional then return done(false, out, code, index) end
+      nxt()
+    end)
+  end
+  nxt()
+end
+
 local function shell_quote(s)
   return "'" .. tostring(s or ""):gsub("'", "'\\''") .. "'"
 end
@@ -742,6 +771,17 @@ local function read_so_base_hex(adb, serial, pkg, pid, symbol_lib, runtime_basen
   return parse_runtime_module_base(maps, symbol_lib, runtime_basename)
 end
 
+-- Non-blocking variant used by attach: done(base_hex|nil, runtime_basename|nil).
+local function read_so_base_hex_async(adb, serial, pkg, pid, symbol_lib, runtime_basename, done)
+  if not (adb and serial and pkg and pid and symbol_lib) then return done(nil) end
+  adb_async(adb, {
+    "-s", serial, "shell", "run-as", pkg, "cat", "/proc/" .. tostring(pid) .. "/maps",
+  }, function(maps, code)
+    if code ~= 0 then return done(nil) end
+    done(parse_runtime_module_base(maps, symbol_lib, runtime_basename))
+  end)
+end
+
 -- Build the LLDB command that relocates the symbol-rich host module to the
 -- device ASLR base. The command names the HOST module created by `target create`,
 -- while the base lookup accepts the distinct APK runtime basename (K66).
@@ -877,8 +917,8 @@ local function start_jdwp_release(sess)
     return
   end
   local port = alloc_free_port() or 8700
-  local fwd_out, fwd_code = adb_run_raw(sess.adb,
-    { "-s", sess.serial, "forward", "tcp:" .. port, "jdwp:" .. sess.pid })
+  adb_async(sess.adb, { "-s", sess.serial, "forward", "tcp:" .. port, "jdwp:" .. sess.pid },
+    function(fwd_out, fwd_code)
   if fwd_code ~= 0 then
     wait_notice("jdwp-forward",
       ("jdwp forward failed (exit %s): %s — waiting-gate NOT released; "
@@ -902,6 +942,7 @@ local function start_jdwp_release(sess)
     "== jdwp release armed ==",
     ("jdb=%s port=%d pid=%d"):format(jdb, port, sess.pid),
   })
+  end)
 end
 
 -- Late ASLR rebase poller (wait-mode only). Watches /proc/<pid>/maps
@@ -1230,7 +1271,19 @@ local function report_failure(spec)
   local fail = F.new(spec)
   local text = F.format(fail)
   P.error(spec.headline or spec.summary or "attach failed")
+  -- A failure with a concrete command fix is offered as one keypress
+  -- (<leader>uk) instead of only text the user has to retype.
+  if spec.fix then
+    require("utils.ue_hub").offer_fix(spec.fix, spec.headline)
+    text = text .. "\n→ <leader>uk runs :" .. spec.fix
+  end
   log.notify_error("dap.android", text)
+  -- Field evidence for the report-first loop: which layer blocks real attaches.
+  pcall(function()
+    require("utils.probe").record("android-attach",
+      ("fail:%s:%s"):format(tostring(fail.layer or spec.layer), tostring(spec.headline or "?")),
+      { owner = spec.owner, serial = M._session and M._session.serial })
+  end)
   return fail
 end
 
@@ -1299,7 +1352,6 @@ local function bootstrap_session(opts, on_ready)
 
   P.step("1/6  picking package …")
   local pkg = pick_package(ctx)
-  if not pkg then P.hide(); on_ready(false); return end
   sess.package_name = pkg
 
   P.step("2/6  picking device …")
@@ -1315,10 +1367,25 @@ local function bootstrap_session(opts, on_ready)
         headline = "no device selected",
         summary = "no Android device was selected for this session",
         remedy = "run :UESetAndroidDevice and pick a ready device",
+        fix = "UESetAndroidDevice",
       })
       on_ready(false); return
     end
     sess.serial = serial
+    if not sess.package_name then
+      -- No persisted/config/cook package: pick from the device's installed
+      -- packages instead of a blank prompt, then remember it for this project.
+      return require("utils.android_package").pick({ adb = sess.adb, serial = serial,
+        prompt = "Android package to debug:" }, function(picked)
+        if not picked then P.hide(); return on_ready(false) end
+        sess.package_name = picked
+        local engine_root = ctx and ctx.engine_root
+        if engine_root then
+          pcall(function() require("ue").update_state_field(engine_root, "android_package", picked) end)
+        end
+        after_serial(serial)
+      end)
+    end
 
     P.step("3/6  locating lldb-server …")
     local server_src = pick_lldb_server()
@@ -1337,6 +1404,21 @@ local function bootstrap_session(opts, on_ready)
     P.step("5/6  pushing lldb-server to device …")
     local ok_push, push_msg = ensure_lldb_server_pushed(sess.adb, serial, sess.package_name, server_src)
     if not ok_push then
+      -- The selected device was unplugged: re-selecting is the fix, not preflight.
+      if android_device.is_gone_output(push_msg) then
+        -- The selected device is unplugged, not a staging defect: the layer
+        -- owner changes and re-selecting (not preflight) is the fix.
+        report_failure({
+          layer = require("ue.dap.failure").L.TRANSPORT,
+          owner = "utils.android_device",
+          headline = "device " .. tostring(serial) .. " is not connected",
+          summary = "the selected device was gone before the debug server could be staged",
+          evidence = require("ue.dap.failure").observed_evidence("staging", tostring(push_msg)),
+          remedy = "reconnect it or run :UESetAndroidDevice to pick another device",
+          fix = "UESetAndroidDevice",
+        })
+        on_ready(false); return
+      end
       report_failure({
         layer = require("ue.dap.failure").L.TRANSPORT,
         owner = "dap.android (staging transport)",
@@ -1344,6 +1426,7 @@ local function bootstrap_session(opts, on_ready)
         summary = "could not stage the debug server onto the device",
         evidence = require("ue.dap.failure").observed_evidence("staging", tostring(push_msg)),
         remedy = "run :UEDAPPreflight to see which layer blocks, then re-try the attach",
+        fix = "UEDAPPreflight",
       })
       on_ready(false); return
     end
@@ -1448,6 +1531,7 @@ function M._finalize_session_after_gate(sess, pid, cfg_name, run_label)
       summary = "the device-side platform server did not start",
       evidence = require("ue.dap.failure").observed_evidence("server start", tostring(srv_err)),
       remedy = "run :UEDAPPreflight; a target-policy denial at L2 is the usual cause",
+      fix = "UEDAPPreflight",
     })
     M.stop_android_debugger()
     return
@@ -1460,10 +1544,14 @@ function M._finalize_session_after_gate(sess, pid, cfg_name, run_label)
   -- maps-read hiccup never blocks attach. The actual `target modules load
   -- --slide` runs inside attachCommands, right after signal disposition.
   sess._module_rebase_cmd = nil
-  if sess.symbol_lib and sess.symbol_lib ~= "" then
-    local rebase_cmd, base_hex, runtime_so = module_rebase_command(
-      sess.adb, sess.serial, sess.package_name, pid, sess.symbol_lib,
-      sess.runtime_module_basename)
+  if not (sess.symbol_lib and sess.symbol_lib ~= "") then
+    return M._finalize_attach_config(sess, pid, cfg_name, run_label)
+  end
+  -- Read /proc/<pid>/maps asynchronously so the editor stays responsive while
+  -- the adb round-trip runs; the attach config is built once it returns.
+  read_so_base_hex_async(sess.adb, sess.serial, sess.package_name, pid, sess.symbol_lib,
+    sess.runtime_module_basename, function(base_hex, runtime_so)
+    local rebase_cmd = build_module_rebase_command(sess.symbol_lib, base_hex)
     if rebase_cmd then
       sess._module_rebase_cmd = rebase_cmd
       sess._runtime_module_basename = runtime_so
@@ -1486,8 +1574,11 @@ function M._finalize_session_after_gate(sess, pid, cfg_name, run_label)
         .. "]; breakpoints may not resolve (continuing attach)",
         vim.log.levels.WARN)
     end
-  end
+    M._finalize_attach_config(sess, pid, cfg_name, run_label)
+  end)
+end
 
+function M._finalize_attach_config(sess, pid, cfg_name, run_label)
   local cfg = lldb_dap_attach_config(sess, sess.source_map)
   cfg.name = cfg_name
   cfg._ue_session_owner = "android"
@@ -1546,6 +1637,11 @@ function M._finalize_session_after_gate(sess, pid, cfg_name, run_label)
       if err then return end
       sess.attach_succeeded = true
       snapshot_last_session()
+      pcall(function()
+        require("utils.probe").record("android-attach", "ok:" .. tostring(cfg._ue_session_operation),
+          { state = "ok", serial = sess.serial, symbols = sess.symbol_lib and "yes" or "no",
+            rebase = sess._module_rebase_cmd and "yes" or (sess.wait_mode and "late" or "no") })
+      end)
     end
   end)
   C.run(cfg, run_label)
@@ -1614,7 +1710,8 @@ function M.attach(opts)
     local sess = M._session
     local P = require("ue.dap._progress")
     P.step("6/6  finding pid for " .. (sess.package_name or "?") .. " …")
-    local pid = pidof(sess.adb, sess.serial, sess.package_name)
+    -- Single async probe window: the app must already run for a plain attach.
+    pidof_async(sess.adb, sess.serial, sess.package_name, 2500, function(pid)
     if not pid then
       report_failure({
         layer = require("ue.dap.failure").L.TARGET_POLICY,
@@ -1624,6 +1721,7 @@ function M.attach(opts)
         evidence = require("ue.dap.failure").command_evidence(
           { "<adb>", "shell", "pidof", "-s", "<package>" }, nil, "no pid returned"),
         remedy = "start the app first, or use :UEDAPLaunch for wait-for-debugger launch",
+        fix = "UEDAPLaunch",
       })
       M._attach_in_progress = false
       M.stop_android_debugger()
@@ -1632,6 +1730,7 @@ function M.attach(opts)
     _finalize_session(sess, pid, "UE Android Attach (lldb-dap)", "UEDAP android attach")
     M._attach_in_progress = false
     M._start_liveness_poller()
+    end)
   end)
 end
 
@@ -1664,10 +1763,12 @@ function M.launch(opts)
     -- the user's first continue. Catches earliest-init crashes that the
     -- old "start, then attach when pid appears" flow always missed.
     P.step("6/6  set-debug-app -w " .. pkg .. " …")
-    pcall(adb_run, sess.adb, vim.list_extend({ "-s", sess.serial }, steps.force_stop))
-    local sd_out, sd_code = adb_run_raw(sess.adb,
-      vim.list_extend({ "-s", sess.serial }, steps.set_wait))
-    if sd_code ~= 0 then
+    local on_serial = function(args) return vim.list_extend({ "-s", sess.serial }, args) end
+    adb_sequence(sess.adb, {
+      { args = on_serial(steps.force_stop), optional = true },
+      { args = on_serial(steps.set_wait) },
+    }, function(armed, sd_out, sd_code)
+    if not armed then
       -- User policy: fail with a recorded reason, do NOT silently fall back.
       -- L2: the debug-app gate is an Android policy mechanism; a non-debuggable
       -- build is a policy denial, not a debugger defect.
@@ -1693,14 +1794,14 @@ function M.launch(opts)
     end
 
     P.step("starting activity (waiting at debugger gate) …")
-    pcall(adb_run, sess.adb, vim.list_extend({ "-s", sess.serial }, steps.start))
+    adb_async(sess.adb, on_serial(steps.start), function()
 
     -- Async pid poll (F4): does not freeze user input while the process spawns.
     pidof_async(sess.adb, sess.serial, sess.package_name, 10000, function(pid)
       -- One-shot: clear the debug-app flag as soon as the process exists (or
       -- we give up), so a later manual launch of the app is NOT gated. The
       -- already-spawned process keeps waiting regardless.
-      pcall(adb_run, sess.adb, vim.list_extend({ "-s", sess.serial }, steps.clear_wait))
+      adb_async(sess.adb, on_serial(steps.clear_wait), function() end)
       if not pid then
         report_failure({
           layer = require("ue.dap.failure").L.TARGET_POLICY,
@@ -1728,6 +1829,8 @@ function M.launch(opts)
         .. "Set breakpoints, then F5: the JDWP gate is released automatically and\n"
         .. "the earliest engine init runs under the debugger.",
         vim.log.levels.INFO)
+    end)
+    end)
     end)
   end)
 end
@@ -2010,6 +2113,12 @@ function M._pick_package_for_test(ctx)
   return pick_package(ctx)
 end
 
+--- Symbol library for the current build (build-id authority, K64/K65/K66).
+--- Returns (path, runtime_basename, version_code) or nil.
+function M.symbol_lib(ctx)
+  return pick_symbol_lib(ctx)
+end
+
 function M._pick_symbol_lib_for_test(ctx)
   return pick_symbol_lib(ctx)
 end
@@ -2064,6 +2173,14 @@ end
 
 function M._parse_runtime_module_base_for_test(maps, symbol_lib, runtime_basename)
   return parse_runtime_module_base(maps, symbol_lib, runtime_basename)
+end
+
+function M._adb_sequence_for_test(adb, steps, done)
+  return adb_sequence(adb, steps, done)
+end
+
+function M._read_so_base_hex_async_for_test(...)
+  return read_so_base_hex_async(...)
 end
 
 function M._build_module_rebase_command_for_test(symbol_lib, base_hex)

@@ -362,28 +362,14 @@ local function ue_scope_grep()
   vim.notify(err or "No UE module or plugin scope found", vim.log.levels.WARN)
 end
 
+-- Searches that led to an opened result come first (count + age, per
+-- project); older picker history follows with typing-pause prefixes removed.
 local function ue_grep_history()
-  local snacks = require("snacks")
-  local items = grep_history_items()
-  if vim.tbl_isempty(items) then
-    vim.notify("No grep history found", vim.log.levels.WARN)
-    return
-  end
-
-  return snacks.picker.pick({
-    title = "Grep History",
-    items = items,
-    format = "text",
-    preview = "none",
-    layout = { preset = "vscode" },
-    confirm = function(picker, item)
-      picker:close()
-      if item and item.query then
-        vim.schedule(function()
-          ue_project_grep(item.query)
-        end)
-      end
-    end,
+  local legacy = {}
+  for _, item in ipairs(grep_history_items()) do legacy[#legacy + 1] = item.query end
+  return require("utils.history_hub").searches({
+    legacy = legacy,
+    rerun = function(query) ue_project_grep(query) end,
   })
 end
 
@@ -434,7 +420,8 @@ return {
       { "<leader>/", ue_project_grep, desc = "Grep All Code (Engine+Project)" },
       { "<leader>sg", ue_grep, desc = "Grep Workspace Code (C++/Shader)" },
       { "<leader>sG", ue_grep_all, desc = "Grep Workspace All Files" },
-      { "<leader>sH", ue_grep_history, desc = "Search: Grep History" },
+      { "<leader>sH", ue_grep_history, desc = "Search: history (used searches first)" },
+      { "<leader>fh", function() require("utils.history_hub").hub() end, desc = "History hub: searches, files, jumps, commands, …" },
       -- Resume the last grep picker, even if it was closed via <C-q> pin.
       -- snacks.picker.resume keys state by source name. Our pickers use
       -- "ue_grep_csearch" / "ue_grep_rg" sources; we try csearch first

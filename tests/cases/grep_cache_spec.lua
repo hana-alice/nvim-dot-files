@@ -259,6 +259,11 @@ t.describe("UE grep history routes csearch records", function()
   end
 
   t.it("<leader>sH merges csearch and regular grep history", function()
+    -- Isolate from real per-project "used search" records.
+    local history_hub = require("utils.history_hub")
+    local old_load = history_hub.load
+    history_hub.load = function() return {} end
+    local restore = function() history_hub.load = old_load end
     with_history_mock({
       picker_ue_grep_csearch = {
         { search = "from-csearch", pattern = "", live = true },
@@ -275,6 +280,7 @@ t.describe("UE grep history routes csearch records", function()
       t.assert_eq(picker.items[1].query, "from-csearch")
       t.assert_eq(picker.items[2].query, "from-rg")
     end)
+    restore()
   end)
 
   t.it("clear picker history also clears csearch history", function()

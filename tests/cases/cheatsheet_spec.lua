@@ -223,6 +223,9 @@ t.describe("cheatsheet: 双 surface 不漂移", function()
   local md = read("docs/ue_lazyvim_cheatsheet.md") or ""
 
   local ANCHORS = {
+    "<leader>uJ",
+    "<leader>uE",
+    "<leader>cI", "<leader>cO", "<leader>cB", "<leader>cD", "<leader>ss", "<leader>sS", "<leader>ca", "<leader>cr",
     "<leader>da", "<leader>db", "<leader>dB", "<leader>dL", "<leader>dC",
     "<leader>dW", "<leader>dt", "<leader>dR", "<leader>d1", "<leader>d4",
     "<leader>uA", "<leader>uB", "<leader>ub", "<leader>us", "<leader>uq", "<leader>uP", "<leader>uC",

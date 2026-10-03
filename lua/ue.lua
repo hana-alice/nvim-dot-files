@@ -346,6 +346,7 @@ local function parse_output_entry(line, opts)
       lnum = 1,
       col = 1,
       text = trim(line),
+      _source_location = false, -- Context path only; no source line was parsed.
     }
   end
 end
@@ -2382,6 +2383,7 @@ end
 
 local function prepare_summary(ctx, compile_path, opts)
   opts = opts or {}
+  pcall(function() require("utils.probe").record("prepare-path", opts.reused_cache and "fast" or "cold", { state = "ok" }) end)
   local project_count = opts.project_count or count_cached_entries(ctx.paths.project_list)
   local engine_count = opts.engine_count or count_cached_entries(ctx.paths.engine_list)
   local workspace_count = opts.workspace_count or count_cached_entries(ctx.paths.workspace_list)
@@ -2477,6 +2479,11 @@ refresh_statusline = function()
   pcall(vim.cmd, "redrawstatus")
 end
 
+function M._refresh_statusline()
+  invalidate_status_cache()
+  refresh_statusline()
+end
+
 local function set_build_status(value)
   vim.g.ue_build_status = trim(value)
   invalidate_status_cache()
@@ -2564,13 +2571,13 @@ function CORE_RT.csearch_build_done()
 end
 
 -- Successful writers subtract only covered paths; explicit manual clear retains
--- its separate API. Overflow acknowledgement additionally requires a full reset.
-function CORE_RT.clear_persistent_dirty_safe(reason, covered_paths, covered_before, remove_missing)
+-- its separate API. Overflow acknowledgement needs reset or complete Git evidence.
+function CORE_RT.clear_persistent_dirty_safe(reason, covered_paths, covered_before, remove_missing, acknowledge_overflow)
   local ok_watch, watch = pcall(require, "utils.ue_watch")
   if not ok_watch then return false end
   if type(covered_paths) == "table" and type(watch.remove_persistent_dirty) == "function" then
     return watch.remove_persistent_dirty(
-      covered_paths, reason or "prepare", covered_before, remove_missing)
+      covered_paths, reason or "prepare", covered_before, remove_missing, acknowledge_overflow)
   end
   if type(watch.clear_persistent_dirty) == "function" then
     return watch.clear_persistent_dirty(reason or "prepare")
@@ -2593,7 +2600,8 @@ function CORE_RT.on_full_csearch_success(ctx, reason, stats)
     reason,
     CORE_RT.csearch_build_dirty_snapshot or {},
     CORE_RT.csearch_build_started_at,
-    stats and stats.mode == "reset")
+    stats and (stats.mode == "reset" or stats.git_recovered),
+    stats and (stats.mode == "reset" or stats.git_recovered))
   CORE_RT.csearch_build_dirty_snapshot = nil
   CORE_RT.csearch_build_started_at = nil
   local list_path = ctx and ctx.paths and ctx.paths.workspace_all_list
@@ -2611,217 +2619,34 @@ function M._csearch_build_running_for_test() return CORE_RT.csearch_build_runnin
 
 -- ── csearch smart incremental build (D11) ───────────────────────────────────
 -- Diff the last published path snapshot against the current workspace list.
--- Truncated dirty coverage requires reset even when the retained delta is empty.
+-- Truncated dirty coverage uses complete Git evidence, otherwise reset.
 --
 -- Decision rules (pure, unit-tested via _csearch_build_mode_for_test):
 --   * forced / no snapshot        → reset  (no basis for a diff)
---   * removed > 0                 → reset  (cindex CANNOT delete from an index;
---                                           ghost entries would serve hits for
---                                           dead files — correctness over speed)
---   * added + dirty == 0          → skip   (set unchanged; just refresh
+--   * added + dirty + removed == 0 → skip  (set unchanged; just refresh
 --                                           bookkeeping)
---   * added + dirty > 30% of set  → reset  (merge cost approaches full build;
+--   * that work > 30% of set      → reset  (merge cost approaches full build;
 --                                           usually a branch switch)
---   * else                        → add    (feed ONLY the delta to cindex)
+--   * else                        → add    (feed ONLY the delta to cindex;
+--                                           removals go to -delete-from)
+-- Removals no longer force reset (2026-10-02, codesearch v1.2.0 verified):
+-- -delete-from drops them in the same merge; an older binary rejects the flag
+-- and the add→reset fallback runs.
 --
 -- `dirty` = watcher's persistent set (modified existing files + new files).
 -- Re-adding a modified file refreshes its trigrams, so content edits get folded
 -- in on the cheap path too. An `add` that fails (corrupt/0-byte idx — the
 -- build_index D9 guard refuses it) falls back to one reset automatically.
-CORE_RT.CSEARCH_ADD_RATIO_MAX = 0.30
-
 function CORE_RT.csearch_snapshot_path(ctx)
-  local idx = ctx and ctx.paths and ctx.paths.csearch_idx
-  if not idx or idx == "" then return nil end
-  return idx .. ".files"
+  return require("ue.csearch_smart").csearch_snapshot_path(ctx)
 end
-
--- Pure decision. stats = { forced, has_snapshot, added_n, removed_n, dirty_n,
--- total_n }. Returns mode ("reset"|"add"|"skip") + human reason.
 function CORE_RT.csearch_build_mode(stats)
-  stats = stats or {}
-  if stats.forced then return "reset", "forced" end
-  if stats.dirty_capped then return "reset", "dirty coverage was truncated" end
-  if not stats.has_snapshot then return "reset", "no snapshot of last indexed set" end
-  if (stats.removed_n or 0) > 0 then
-    return "reset", ("%d removals (cindex cannot delete)"):format(stats.removed_n)
-  end
-  local work = (stats.added_n or 0) + (stats.dirty_n or 0)
-  if work == 0 then return "skip", "indexed set unchanged" end
-  local total = math.max(tonumber(stats.total_n) or 0, 1)
-  if work > total * CORE_RT.CSEARCH_ADD_RATIO_MAX then
-    return "reset", ("delta %d > %d%% of %d files"):format(
-      work, math.floor(CORE_RT.CSEARCH_ADD_RATIO_MAX * 100), total)
-  end
-  return "add", ("+%d added, %d dirty"):format(stats.added_n or 0, stats.dirty_n or 0)
+  return require("ue.csearch_smart").csearch_build_mode(stats)
 end
-
--- Read a list file into { set = {path=true}, list = {...}, n = count }.
-local function read_list_file(path)
-  local set, list, n = {}, {}, 0
-  local f = path and io.open(path, "r") or nil
-  if not f then return nil end
-  for line in f:lines() do
-    line = line:gsub("\r$", "")
-    if line ~= "" and not set[line] then
-      set[line] = true
-      n = n + 1
-      list[n] = line
-    end
-  end
-  f:close()
-  return { set = set, list = list, n = n }
-end
-
--- Drop-in replacement for the three prepare-path build_index calls.
--- cb(ok, err, stats) — stats gains .mode ("reset"|"add"|"skip") and .delta.
--- Owns: diff, mode decision, add→reset fallback, snapshot refresh on success.
--- Does NOT own: csearch_build_begin/done (call sites keep that), fingerprint /
--- dirty-clear (call sites keep on_full_csearch_success — snapshot refresh here
--- is the only extra obligation, and it is idempotent).
 function CORE_RT.csearch_smart_build(ctx, cs_ctx, abs_list, cb)
-  local code_search = require("utils.code_search")
-  local snap_path = CORE_RT.csearch_snapshot_path(ctx)
-  local new_list = read_list_file(abs_list)
-  if not new_list then
-    vim.schedule(function() cb(false, "cannot read " .. tostring(abs_list), {}) end)
-    return
-  end
-
-  local function snapshot_current()
-    if not snap_path then return end
-    pcall(function()
-      local uvfs = vim.uv or vim.loop
-      uvfs.fs_copyfile(abs_list, snap_path)
-    end)
-  end
-
-  local function run_reset(reason, after_fallback)
-    code_search.build_index(cs_ctx, abs_list, function(ok, err, stats)
-      stats = stats or {}
-      stats.mode = "reset"
-      stats.delta = reason
-      if ok then snapshot_current() end
-      cb(ok, err, stats)
-    end, { mode = "reset" })
-    if after_fallback then
-      vim.schedule(function()
-        vim.notify("[ue] csearch incremental add failed — fell back to full rebuild ("
-          .. tostring(after_fallback) .. ")", vim.log.levels.WARN,
-          { title = "UE", replace = "ue.csearch.build" })
-      end)
-    end
-  end
-
-  -- Gather diff inputs.
-  local old_list = snap_path and read_list_file(snap_path) or nil
-  -- The sidecar predates the primary csearch index and can be absent after an
-  -- upgrade or interrupted cleanup. Rebuild it without a full reset only when
-  -- two independent facts agree: the primary index is usable, and the current
-  -- canonical workspace list has the exact fingerprint recorded after the last
-  -- successful build. The absolute temp list cannot be hashed for this check
-  -- because workspace_all.files is workspace-relative on same-drive entries.
-  if not old_list and snap_path and ctx and ctx.paths and ctx.paths.workspace_all_list then
-    local state = read_state(ctx.engine_root)
-    local recorded = state and state.csearch_input_hash or nil
-    local current = CORE_RT.list_fingerprint(ctx.paths.workspace_all_list)
-    local ok_indexed, indexed = pcall(code_search.is_indexed, cs_ctx)
-    if ok_indexed and indexed and type(recorded) == "string" and recorded ~= ""
-        and current == recorded then
-      old_list = new_list
-    end
-  end
-  local added, removed_n = {}, 0
-  if old_list then
-    for _, p in ipairs(new_list.list) do
-      if not old_list.set[p] then added[#added + 1] = p end
-    end
-    for _, p in ipairs(old_list.list) do
-      if not new_list.set[p] then removed_n = removed_n + 1 end
-    end
-  end
-  -- Watcher dirty files still present in the new set (modified existing files;
-  -- drop entries that vanished — they show up as removals instead).
-  local dirty_in_set, dirty_seen, dirty_capped = {}, {}, false
-  do
-    local ok_watch, watch = pcall(require, "utils.ue_watch")
-    dirty_capped = ok_watch and watch.persistent_dirty_status and watch.persistent_dirty_status().capped or false
-    if ok_watch and type(watch.snapshot_persistent_dirty) == "function" then
-      for _, p in ipairs(watch.snapshot_persistent_dirty() or {}) do
-        if new_list.set[p] and not dirty_seen[p] then
-          dirty_seen[p] = true
-          dirty_in_set[#dirty_in_set + 1] = p
-        end
-      end
-    end
-  end
-  -- added ∪ dirty without double-counting.
-  local add_input, add_seen = {}, {}
-  for _, p in ipairs(added) do
-    if not add_seen[p] then add_seen[p] = true; add_input[#add_input + 1] = p end
-  end
-  for _, p in ipairs(dirty_in_set) do
-    if not add_seen[p] then add_seen[p] = true; add_input[#add_input + 1] = p end
-  end
-
-  local mode, why = CORE_RT.csearch_build_mode({
-    forced       = ctx and ctx._force_csearch or false,
-    has_snapshot = old_list ~= nil,
-    added_n      = #added,
-    removed_n    = removed_n,
-    dirty_n      = #dirty_in_set,
-    dirty_capped = dirty_capped,
-    total_n      = new_list.n,
+  return require("ue.csearch_smart").csearch_smart_build(ctx, cs_ctx, abs_list, cb, {
+    read_state = read_state, list_fingerprint = CORE_RT.list_fingerprint,
   })
-
-  -- Probe (D11 soak): record which mode each prepare takes, so the next
-  -- session can verify the incremental path actually fires in daily use
-  -- (report-first workflow — probe-feedback-loop spec #1).
-  pcall(function()
-    local probe = require("utils.probe")
-    probe.observe("csearch-smart-build", "durable-overflow-2026-09-24"); probe.record("csearch-smart-build", mode, why)
-  end)
-
-  if mode == "skip" then
-    snapshot_current()  -- ordering may differ; keep snapshot in lockstep with list
-    vim.schedule(function()
-      cb(true, nil, { mode = "skip", delta = why, ms = 0, index_size = 0, skipped = true })
-    end)
-    return
-  end
-
-  if mode == "reset" then
-    run_reset(why)
-    return
-  end
-
-  -- mode == "add": feed ONLY the delta.
-  local add_list_path = abs_list .. (".add.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
-  local fout = io.open(add_list_path, "w")
-  if not fout then
-    run_reset("cannot write add-list")
-    return
-  end
-  for _, p in ipairs(add_input) do fout:write(p, "\n") end
-  fout:close()
-  code_search.build_index(cs_ctx, add_list_path, function(ok, err, stats)
-    pcall(os.remove, add_list_path)
-    if ok then
-      stats = stats or {}
-      stats.mode = "add"
-      stats.delta = why
-      snapshot_current()
-      cb(true, nil, stats)
-      return
-    end
-    -- Incremental refused/failed (typically D9 unusable-idx guard). One
-    -- automatic reset — always safe — instead of surfacing a dead end.
-    pcall(function()
-      require("utils.probe").record("csearch-smart-build", "add-fallback-reset",
-        tostring(err or "?"):sub(1, 120))
-    end)
-    run_reset("fallback after add failure", err or "?")
-  end, { mode = "add" })
 end
 
 -- Test seams (D11).
@@ -4615,22 +4440,14 @@ end
 -- ==========================================================================
 
 local function append_job_output(lines, pending, chunks)
-  pending = pending or ""
-  for _, chunk in ipairs(chunks or {}) do
-    if chunk and chunk ~= "" then
-      pending = pending .. chunk
-      while true do
-        local newline = pending:find("\n", 1, true)
-        if not newline then
-          break
-        end
-        local line = trim(strip_ansi(pending:sub(1, newline - 1)))
-        if line ~= "" then
-          table.insert(lines, line)
-        end
-        pending = pending:sub(newline + 1)
-      end
-    end
+  -- Channel arrays split on newline; only the endpoints are fragments.
+  pending = (pending or "") .. table.concat(chunks or {}, "\n")
+  while true do
+    local newline = pending:find("\n", 1, true)
+    if not newline then break end
+    local line = trim(strip_ansi(pending:sub(1, newline - 1)))
+    if line ~= "" then table.insert(lines, line) end
+    pending = pending:sub(newline + 1)
   end
   return pending
 end
@@ -4661,6 +4478,7 @@ local function open_terminal_command(cmd, opts)
   local function track_state(buf, win)
     CORE_RT.build_term_buf = buf
     CORE_RT.build_term_win = win
+    require("utils.bottom_panel").register("build", buf)
 
     vim.api.nvim_create_autocmd("BufWipeout", {
       buffer = buf,
@@ -4693,14 +4511,8 @@ local function open_terminal_command(cmd, opts)
 
   local function ensure_window()
     prune_state()
-
-    if CORE_RT.build_term_win and focus_window(CORE_RT.build_term_win) then
-      return CORE_RT.build_term_win
-    end
-
     local height = opts.height or math.max(8, math.floor(vim.o.lines * 0.25))
-    vim.cmd(("botright %dnew"):format(height))
-    CORE_RT.build_term_win = vim.api.nvim_get_current_win()
+    CORE_RT.build_term_win = require("utils.bottom_panel").show("build", CORE_RT.build_term_buf, { height = height })
     return CORE_RT.build_term_win
   end
 
@@ -4722,8 +4534,8 @@ local function open_terminal_command(cmd, opts)
   -- Closing the terminal window is a presentation action, not task
   -- cancellation. `bufhidden=wipe` terminates a live terminal job (reported
   -- by Neovim as exit 143), so keep the buffer hidden while the build runs.
-  -- The exit callback restores the old cleanup behavior once no process can
-  -- be killed by wiping the buffer.
+  -- Keep completed output too: the bottom panel can revisit it until the next
+  -- build explicitly replaces and deletes this buffer.
   vim.bo[buf].bufhidden = "hide"
   vim.bo[buf].buflisted = false
   vim.bo[buf].swapfile = false
@@ -4733,6 +4545,7 @@ local function open_terminal_command(cmd, opts)
   end
 
   if opts.quickfix_title then
+    require("ue.build_diagnostics").clear()
     set_build_status("B...")
   end
 
@@ -4755,7 +4568,7 @@ local function open_terminal_command(cmd, opts)
           build_monitor = nil
         end
         if vim.api.nvim_buf_is_valid(buf) then
-          vim.bo[buf].bufhidden = "wipe"
+          vim.bo[buf].bufhidden = "hide"
         end
         stdout_pending = flush_job_output(output_lines, stdout_pending)
         stderr_pending = flush_job_output(output_lines, stderr_pending)
@@ -4764,10 +4577,10 @@ local function open_terminal_command(cmd, opts)
         end
         if foreground_token then require("utils.host_admission").foreground_done(foreground_token); foreground_token = nil end
         if code ~= 0 and opts.quickfix_title then
-          populate_quickfix_from_output(opts.quickfix_title, output_lines, {
+          require("ue.build_diagnostics").publish(opts.quickfix_title, diagnostic_entries_from_output(output_lines, {
             root = opts.quickfix_root,
             tail_limit = opts.tail_limit,
-          })
+          }))
         end
         if opts.quickfix_title then
           set_build_status(code == 0 and "BOK" or ("B" .. tostring(code)))
@@ -4776,6 +4589,9 @@ local function open_terminal_command(cmd, opts)
         local msg = ("%s finished with exit code %d"):format(
           opts.finish_label or "UE build", code
         )
+        if code ~= 0 and opts.quickfix_title then
+          msg = msg .. " — " .. require("ue.build_diagnostics").summary()
+        end
         vim.notify(msg, level)
         if code ~= 0 then require("utils.log").error("ue.build", msg) end
         if type(opts.on_exit) == "function" then
@@ -5427,6 +5243,15 @@ function M.cached_grep(opts)
   if has_index then
     snacks.picker.pick({
       source = "ue_grep_csearch",
+      -- Record the query only when a result is actually opened, so search
+      -- history keeps useful searches instead of every typing pause.
+      confirm = function(picker, item, action)
+        pcall(function()
+          local query = picker.input and picker.input.filter and picker.input.filter.search or ""
+          if item and query ~= "" then require("utils.history_hub").record(query, "grep") end
+        end)
+        return require("snacks.picker.actions").jump(picker, item, action)
+      end,
       title = grep_picker_title(false),
       search = opts.search or "",
       live = true,
@@ -5851,6 +5676,14 @@ function M.statusline_status(opts)
   local build = trim(vim.g.ue_build_status or "")
   if build ~= "" then
     parts[#parts + 1] = build
+  end
+
+  -- Target-owned status token (e.g. Android device/package the next install,
+  -- deploy or attach will use). The target driver decides; no literal here.
+  local target_driver = require("ue.targets").driver(trim((ctx.state or {}).target_platform or ""))
+  if target_driver and type(target_driver.status_token) == "function" then
+    local ok_token, token = pcall(target_driver.status_token, ctx.state or {})
+    if ok_token and type(token) == "string" and token ~= "" then parts[#parts + 1] = token end
   end
 
   -- Generic background-task count segment (⏵N). Shown only when N>0; absent
@@ -6649,8 +6482,16 @@ local function set_android_package(input)
   end
 
   input = trim(input)
-  if input == "" then
-    input = vim.fn.input("Android package name: ", read_state(engine_root).android_package or "")
+  if input == "" and vim.g.ue_prepare_headless ~= 1 then
+    -- No argument: pick from the device's installed packages (current value
+    -- first) instead of retyping the name; the pick re-enters with the name.
+    local device = require("utils.android_device")
+    local serial = device.get()
+    local current = trim(read_state(engine_root).android_package or "")
+    return require("utils.android_package").pick({
+      adb = serial and device.adb_executable() or nil, serial = serial,
+      known = current ~= "" and { current } or nil,
+    }, function(name) if name then CORE_RT.set_android_package(name) end end)
   end
   if input == "" then return end
   -- K61: commit() re-reads the field from the readers' bucket, so a failed or
@@ -6662,6 +6503,8 @@ local function set_android_package(input)
     or ("UE Android package NOT set: " .. tostring(err))
   vim.notify(msg, ok and vim.log.levels.INFO or vim.log.levels.ERROR)
 end
+
+CORE_RT.set_android_package = set_android_package
 
 -- Tell ue.lua how to find the .uproject when only a workspace root is given
 -- to :UESetProject. Stored in the selected project's state bucket so it never
@@ -7061,21 +6904,26 @@ local export_compile_commands
 
 local function build_target(opts)
   opts = opts or {}
+  -- Callers chaining on on_exit (UEAndroidIterate) must hear about a build
+  -- that never started, or they wait forever with no status.
+  local function abort()
+    if type(opts.on_exit) == "function" then opts.on_exit(-1) end
+  end
   if CORE_RT.ue_build_running() then
     vim.notify("A UE build is already running in this editor", vim.log.levels.WARN)
-    return
+    return abort()
   end
   local ctx, err = resolve_context()
   if not ctx then
     vim.notify(err, vim.log.levels.WARN)
-    return
+    return abort()
   end
   if not ctx.project_root then
     vim.notify("No project configured for engine root. Run :UESetProject [path]", vim.log.levels.WARN)
     if vim.g.ue_prepare_headless == 1 then
       error("No project configured for engine root. Run :UESetProject [path]")
     end
-    return
+    return abort()
   end
 
   -- Fresh-bucket gate: never build on a silently-guessed platform. A project
@@ -7094,9 +6942,8 @@ local function build_target(opts)
       vim.log.levels.WARN, { title = "UE" })
     set_platform(nil, {
       on_done = function(ok)
-        if ok then
-          build_target(vim.tbl_extend("force", opts, { _platform_prompted = true }))
-        end
+        if not ok then return abort() end
+        build_target(vim.tbl_extend("force", opts, { _platform_prompted = true }))
       end,
     })
     return
@@ -7128,7 +6975,7 @@ local function build_target(opts)
   if not cmd then
     set_build_status("BERR")
     require("utils.log").notify_error("ue.build", title .. " failed: " .. build_err)
-    return
+    return abort()
   end
 
   local _, workflow_err = dispatch_registered_workflow(driver.id, operation, {
@@ -7146,7 +6993,7 @@ local function build_target(opts)
   if workflow_err then
     set_build_status("BERR")
     require("utils.log").notify_error("ue.build", title .. " failed: " .. tostring(workflow_err.reason or workflow_err))
-    return
+    return abort()
   end
   local function start_build()
     local function on_exit(code, output)
@@ -7167,13 +7014,15 @@ local function build_target(opts)
       end
       if type(opts.on_exit) == "function" then opts.on_exit(code, output) end
     end
-    return open_terminal_command(cmd, {
+    local job = open_terminal_command(cmd, {
       cwd = plan.cwd or ctx.engine_root,
       quickfix_title = title,
       quickfix_root = workspace_root(ctx),
       tail_limit = 16,
       on_exit = on_exit,
     })
+    if not job then abort() end
+    return job
   end
 
   if type(driver.preflight_plans) == "function" and type(CORE_RT.run_target_preflight) == "function" then
@@ -7181,7 +7030,7 @@ local function build_target(opts)
       if not ok then
         set_build_status("BERR")
         require("utils.log").notify_error("ue.build", title .. " failed: " .. tostring(preflight_err))
-        return
+        return abort()
       end
       start_build()
     end)
@@ -7989,11 +7838,13 @@ function M.toggle_debug_log()
   return require("utils.ue_logs").toggle_debug_log(ue_runtime_env())
 end
 
-local function deploy_android_so()
+local function deploy_android_so(opts)
+  opts = type(opts) == "table" and opts.on_exit and opts or {}
   local host_driver = require("utils.platform").driver()
   local dispatched, dispatch_err = dispatch_registered_workflow("Android", "so_deploy", {
     host_driver = host_driver,
     context = {
+      on_exit = opts.on_exit,
       resolve_context = resolve_context,
       read_state = read_state,
       target_context = function(ctx, platform)
@@ -8001,7 +7852,7 @@ local function deploy_android_so()
       end,
       open_terminal_command = open_terminal_command,
       workspace_root = workspace_root,
-      reinvoke = deploy_android_so,
+      reinvoke = function() deploy_android_so(opts) end,
     },
   })
   if dispatched ~= nil then
@@ -9355,6 +9206,9 @@ function M.setup()
   end
   CORE_RT.setup_done = true
 
+  require("utils.cpp_format").setup()
+  require("utils.unsaved").setup()
+
   vim.g.ueindex_status = vim.g.ueindex_status or ""
   vim.g.ue_build_status = vim.g.ue_build_status or ""
 
@@ -9557,7 +9411,20 @@ function M.setup()
   vim.api.nvim_create_user_command("UEInstallIOS", function()
     CORE_RT.install_target("IOS")
   end, { desc = "Install the current tuple's staged IOS app through its target driver" })
-  vim.api.nvim_create_user_command("UEDeployAndroidSO", deploy_android_so, {})
+  vim.api.nvim_create_user_command("UEDeployAndroidSO", function() deploy_android_so() end, {})
+  -- One-key Android inner loop: build SO → hot-deploy → attach. The steps stay
+  -- separate owners (K46); this only chains them and stops at the first failure.
+  require("utils.ue_hub").setup_commands()
+  require("ue.build_diagnostics").setup()
+  require("utils.bottom_panel").setup_commands()
+  -- Target inner loops (Android: build SO → deploy → debug-launch) live with
+  -- their workflows; ue.lua only hands over the steps it owns.
+  require("ue.workflows.bootstrap").setup_loop_commands({
+    build_so = function(on_exit) build_target({ operation = "so_build", on_exit = on_exit }) end,
+    deploy_so = function(on_exit) deploy_android_so({ on_exit = on_exit }) end,
+    launch = function() M.launch_app() end,
+    set_status = set_build_status,
+  })
   vim.api.nvim_create_user_command("UELaunch", function()
     M.launch_app()
   end, {})
@@ -9642,8 +9509,8 @@ function M.setup()
     local ok_watch, watch = pcall(require, "utils.ue_watch")
     if not ok_watch then vim.notify("ue_watch module missing", vim.log.levels.WARN); return end
     if watch.persistent_dirty_status().capped then
-      vim.notify("Dirty coverage was truncated; rebuilding the full csearch index", vim.log.levels.INFO)
-      return M.build_csearch_async({ context = ctx })
+      vim.notify("Dirty coverage was truncated; recovering complete changes for csearch", vim.log.levels.INFO)
+      return M.build_csearch_async({ context = ctx, recover_overflow = true })
     end
     local dirty = (type(watch.snapshot_persistent_dirty) == "function")
       and watch.snapshot_persistent_dirty() or {}
@@ -9673,23 +9540,29 @@ function M.setup()
     vim.notify(("UEPrepareIncremental: adding %d dirty files to csearch index ..."):format(#dirty),
       vim.log.levels.INFO, { title = "UE", timeout = 3000, replace = "ue.csearch.build" })
     local cs_ctx = { workspace_root = workspace_root(ctx), csearch_idx = ctx.paths.csearch_idx }
-    code_search.build_index(cs_ctx, abs_list, function(ok_cs, err_cs, stats)
-      CORE_RT.csearch_build_done()
-      pcall(os.remove, abs_list)
-      if ok_cs then
-        if type(watch.remove_persistent_dirty) == "function" then
-          watch.remove_persistent_dirty(dirty, "UEPrepareIncremental", CORE_RT.csearch_build_started_at)
+    local git_evidence = require("ue.csearch_git")
+    git_evidence.capture(ctx, function(before)
+      code_search.build_index(cs_ctx, abs_list, function(ok_cs, err_cs, stats)
+        local function finish_record()
+          CORE_RT.csearch_build_done()
+          pcall(os.remove, abs_list)
+          if ok_cs then
+            if type(watch.remove_persistent_dirty) == "function" then
+              watch.remove_persistent_dirty(dirty, "UEPrepareIncremental", CORE_RT.csearch_build_started_at)
+            end
+            CORE_RT.csearch_build_started_at = nil
+            local mb = math.floor((stats.index_size or 0) / 1024 / 1024)
+            vim.notify(("✓ csearch +%d files (%.1fs, idx now %d MB)"):format(
+              #dirty, (stats.ms or 0) / 1000, mb),
+              vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
+          else
+            vim.notify("UEPrepareIncremental failed: " .. (err_cs or "?"),
+              vim.log.levels.WARN, { title = "UE" })
+          end
         end
-        CORE_RT.csearch_build_started_at = nil
-        local mb = math.floor((stats.index_size or 0) / 1024 / 1024)
-        vim.notify(("✓ csearch +%d files (%.1fs, idx now %d MB)"):format(
-          #dirty, (stats.ms or 0) / 1000, mb),
-          vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
-      else
-        vim.notify("UEPrepareIncremental failed: " .. (err_cs or "?"),
-          vim.log.levels.WARN, { title = "UE" })
-      end
-    end, { mode = "add" })
+        if ok_cs then git_evidence.save(ctx, before, false, dirty, finish_record) else finish_record() end
+      end, { mode = "add" })
+    end)
   end, { desc = "Append watcher's dirty files to csearch index (no full rebuild)" })
   vim.api.nvim_create_user_command("UEPrepareReindex", function()
     -- Force csearch rebuild even when the cache fast-path would skip it.
@@ -10154,27 +10027,7 @@ function M.setup()
     end
 
     vim.api.nvim_create_user_command("Tasks", function()
-      local tr = require("utils.task_registry")
-      local rows = tr.list()
-      if #rows == 0 then
-        vim.notify("无后台任务", vim.log.levels.INFO, { title = "Tasks" })
-        return
-      end
-      vim.ui.select(rows, {
-        prompt = "Tasks (select to stop):",
-        format_item = task_label,
-      }, function(choice)
-        if not choice then return end
-        if choice.status ~= "running" then
-          vim.notify(("%s 已结束（%s）"):format(choice.name, choice.status), vim.log.levels.INFO, { title = "Tasks" })
-          return
-        end
-        if tr.cancel(choice.id) then
-          vim.notify(("已停止 %s"):format(choice.name), vim.log.levels.INFO, { title = "Tasks" })
-        else
-          vim.notify(("%s 已结束"):format(choice.name), vim.log.levels.INFO, { title = "Tasks" })
-        end
-      end)
+      require("utils.bottom_panel").show("tasks")
     end, { desc = "List background tasks; select to stop" })
 
     vim.api.nvim_create_user_command("TaskStop", function(opts)

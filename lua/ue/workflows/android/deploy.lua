@@ -25,6 +25,7 @@ local function deps(request)
     end,
     logger = logger,
     reinvoke = context.reinvoke,
+    on_exit = context.on_exit,
   }
 end
 
@@ -67,10 +68,16 @@ end
 
 function M.run(request)
   local d = deps(request)
+  -- A chained caller (UEAndroidIterate) waits on on_exit; every path that
+  -- never starts the deploy must still report, or the loop hangs silently.
+  local function abort(reason)
+    if type(d.on_exit) == "function" then d.on_exit(-1) end
+    return nil, reason
+  end
   local ctx, err = d.resolve_context()
   if not ctx then
     vim.notify(err, vim.log.levels.WARN)
-    return nil, err
+    return abort(err)
   end
 
   local serial = d.android_device.get()
@@ -78,6 +85,8 @@ function M.run(request)
     d.android_device.ensure({ prompt = "Select Android device for SO deploy:" }, function(selected)
       if selected and type(d.reinvoke) == "function" then
         d.reinvoke()
+      elseif not selected then
+        abort("device-selection-cancelled")
       end
     end)
     return nil, "device-selection-pending"
@@ -87,7 +96,7 @@ function M.run(request)
   local target_ctx, context_err = d.target_context(ctx, "Android")
   if not target_ctx then
     d.notify_error("ue.android", context_err)
-    return nil, context_err
+    return abort(context_err)
   end
   local snapshot = request.snapshot or build_snapshot(ctx, d.host_driver, serial, state.android_package, target_ctx)
   target_ctx.device_id = snapshot.device.serial
@@ -96,16 +105,24 @@ function M.run(request)
   local command, command_err = d.target_tasks.command(plan)
   if not command then
     d.notify_error("ue.android", command_err)
-    return nil, command_err
+    return abort(command_err)
   end
 
   d.stop_android_debugger({ kill_orphans = true })
-  d.open_terminal_command(command, {
+  local job = d.open_terminal_command(command, {
     cwd = plan.cwd or ctx.engine_root,
     quickfix_title = "UEDeployAndroidSO",
     quickfix_root = d.workspace_root(ctx),
     tail_limit = 20,
+    finish_label = "UEDeployAndroidSO",
+    on_exit = function(code, output)
+      if code ~= 0 and d.android_device.report_if_gone then
+        d.android_device.report_if_gone(table.concat(output or {}, "\n"), snapshot.device.serial)
+      end
+      if type(d.on_exit) == "function" then d.on_exit(code, output) end
+    end,
   })
+  if job == nil then return abort("terminal-not-started") end
   return command, nil, snapshot
 end
 

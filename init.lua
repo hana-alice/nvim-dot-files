@@ -63,15 +63,7 @@ vim.api.nvim_create_autocmd("UIEnter", {
       for topic, revision in pairs(require("utils.ue_goto.semantic_report").OBSERVATIONS) do
         probe.observe(topic, revision)
       end
-      local s = probe.pending_summary()
-      if s.unread > 0 or s.dormant > 0 then
-        vim.defer_fn(function()
-          vim.notify(
-            ("[probe] %d unread / %d unresolved / %d dormant observation(s) — :UEProbeReport")
-              :format(s.unread, s.unresolved, s.dormant),
-            vim.log.levels.INFO, { title = "UE", timeout = 6000 })
-        end, 1500)
-      end
+      vim.defer_fn(function() pcall(probe.startup_notice) end, 1500)
     end)
   end,
 })

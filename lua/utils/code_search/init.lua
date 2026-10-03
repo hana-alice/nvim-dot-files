@@ -745,6 +745,8 @@ function M.build_index(ctx, abs_list_path, cb, opts)
   end
   table.insert(args, "-files-from")
   table.insert(args, abs_list_path)
+  -- Incremental only: vanished files leave the index in the same merge.
+  if mode == "add" and opts.delete_list then vim.list_extend(args, { "-delete-from", opts.delete_list }) end
 
   handle = vim.loop.spawn(cindex, {
     args = args,

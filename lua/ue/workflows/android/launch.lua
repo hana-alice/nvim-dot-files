@@ -38,9 +38,27 @@ local function dependencies(request)
   }
 end
 
-local function read_package(ctx, deps)
+local function persist_package(ctx, deps, package_name)
+  if type(deps.update_state_field) ~= "function" then return true end
+  local ok, err = deps.update_state_field(ctx.engine_root, "android_package", package_name)
+  if ok == false or ok == nil then
+    return nil, err or "failed to persist Android package name"
+  end
+  return true
+end
+
+local function read_package(ctx, deps, serial, adb)
   local state = type(deps.read_state) == "function" and deps.read_state(ctx.engine_root) or ctx.state or {}
   local package_name = trim(state and state.android_package)
+  if package_name == "" and deps.input == vim.fn.input and type(deps.reinvoke) == "function" then
+    -- Offer device/project candidates instead of a blank prompt; the chosen
+    -- package is persisted and the workflow reruns with it.
+    require("utils.android_package").pick({ adb = adb, serial = serial,
+      prompt = "Android package for UE launch:" }, function(picked)
+      if picked and persist_package(ctx, deps, picked) then deps.reinvoke() end
+    end)
+    return nil, "package-selection-pending"
+  end
   if package_name == "" then
     package_name = trim(deps.input("Android package name: ", ""))
   end
@@ -112,13 +130,13 @@ function M.prepare(request, opts)
     return nil, "device-selection-pending"
   end
 
-  local package_name, package_err = read_package(ctx, deps)
-  if not package_name then
-    return nil, package_err
-  end
   local adb, adb_err = resolve_adb(deps)
   if not adb then
     return nil, adb_err
+  end
+  local package_name, package_err = read_package(ctx, deps, serial, adb)
+  if not package_name then
+    return nil, package_err
   end
   local snapshot = make_snapshot(request, ctx, serial, package_name, adb, deps.host_driver)
   local plan = deps.targets.plan(request.target_id or "Android", "launch", {
@@ -143,7 +161,7 @@ end
 function M.run(request)
   local prepared, prepare_err = M.prepare(request)
   if not prepared then
-    if prepare_err ~= "device-selection-pending" then
+    if prepare_err ~= "device-selection-pending" and prepare_err ~= "package-selection-pending" then
       dependencies(request).notify_error("ue_launch", prepare_err)
     end
     return nil, prepare_err
@@ -180,6 +198,9 @@ function M.run(request)
           return
         end
         local detail = #output > 0 and ("\n" .. table.concat(output, "\n")) or ""
+        if deps.android_device.report_if_gone and deps.android_device.report_if_gone(detail, snapshot.device.serial) then
+          return
+        end
         deps.notify_error("ue_launch", ("Android launch failed (exit %d)%s"):format(code, detail))
       end)
     end,

@@ -1400,6 +1400,10 @@ function D.android_dap_launch(_opts)
   android.launch({ context = resolve_android_dap_context() })
 end
 
+function D.resolve_android_dap_context(ctx)
+  return resolve_android_dap_context(ctx)
+end
+
 function D._resolve_android_dap_context_for_test(ctx)
   return resolve_android_dap_context(ctx)
 end
@@ -1726,10 +1730,13 @@ function D.setup_dap(dap, dapui)
   end
 
   local function find_bottom_tab_window()
-    if D._dap_bottom_tab_win and vim.api.nvim_win_is_valid(D._dap_bottom_tab_win) then
+    if D._dap_bottom_tab_win and vim.api.nvim_win_is_valid(D._dap_bottom_tab_win)
+      and vim.api.nvim_win_get_tabpage(D._dap_bottom_tab_win) == vim.api.nvim_get_current_tabpage() then
       return D._dap_bottom_tab_win
     end
-    for _, win in ipairs(vim.api.nvim_list_wins()) do
+    local shared = require("utils.bottom_panel").window()
+    if shared then return shared end
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
       if is_bottom_tab_win(win) then
         D._dap_bottom_tab_win = win
         return win
@@ -1799,8 +1806,7 @@ function D.setup_dap(dap, dapui)
 
     local cur = vim.api.nvim_get_current_win()
     pcall(vim.api.nvim_set_current_win, code_win)
-    vim.cmd("belowright split")
-    local win = vim.api.nvim_get_current_win()
+    local win = require("utils.bottom_panel").show("debug", nil, { height = 12, focus = false })
     D._dap_bottom_tab_win = win
     pcall(vim.api.nvim_win_set_height, win, 12)
     apply_bottom_tab_window(win, active_bottom_tab)
@@ -1813,9 +1819,8 @@ function D.setup_dap(dap, dapui)
 
   local function open_debug_layout(opts)
     opts = opts or {}
-    -- dap-ui owns only the left debug rail. The bottom tab host is our own
-    -- split under the saved code window, so it aligns with code instead of
-    -- spanning under the left rail.
+    -- dap-ui owns only the left debug rail. Debug tabs borrow the common
+    -- bottom host alongside build output, problems, logs and tasks.
     dapui.open({ layout = 1, reset = opts.reset })
     D._dap_bottom_tab_win = open_bottom_tab_window()
     D.dap_bottom_tab(active_bottom_tab or "repl", { quiet = true })
@@ -1823,7 +1828,11 @@ function D.setup_dap(dap, dapui)
 
   local function close_debug_layout()
     if D._dap_bottom_tab_win and vim.api.nvim_win_is_valid(D._dap_bottom_tab_win) then
-      pcall(vim.api.nvim_win_close, D._dap_bottom_tab_win, true)
+      -- A borrowed host may now display build/problems/tasks; closing debug UI
+      -- must only close its own currently visible content.
+      if is_bottom_tab_win(D._dap_bottom_tab_win) then
+        pcall(vim.api.nvim_win_close, D._dap_bottom_tab_win, true)
+      end
     end
     dapui.close({ layout = 1 })
     D._dap_bottom_tab_win = nil
@@ -1834,7 +1843,8 @@ function D.setup_dap(dap, dapui)
   end
 
   function D._dap_toggle_debug_layout()
-    if find_bottom_tab_window() then
+    local bottom = find_bottom_tab_window()
+    if bottom and is_bottom_tab_win(bottom) then
       close_debug_layout()
     else
       open_debug_layout({ reset = false })
@@ -1861,7 +1871,7 @@ function D.setup_dap(dap, dapui)
       win = open_bottom_tab_window()
     end
     if not win then return end
-    vim.api.nvim_win_set_buf(win, buf)
+    win = require("utils.bottom_panel").show(name == "logcat" and "logcat" or "debug", buf, { focus = false })
     D._dap_bottom_tab_win = win
     apply_bottom_tab_window(win, name)
   end
@@ -1880,6 +1890,7 @@ function D.setup_dap(dap, dapui)
   local function stop_logcat()
     if logcat_job then pcall(vim.fn.jobstop, logcat_job); logcat_job = nil end
     if logcat_buf and vim.api.nvim_buf_is_valid(logcat_buf) then
+      require("utils.bottom_panel").remove("logcat", logcat_buf)
       for _, win in ipairs(vim.api.nvim_list_wins()) do
         if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == logcat_buf then
           pcall(vim.api.nvim_win_close, win, true)
@@ -1902,10 +1913,21 @@ function D.setup_dap(dap, dapui)
     vim.bo[logcat_buf].bufhidden = "wipe"
     vim.bo[logcat_buf].filetype = "log"
     vim.api.nvim_buf_set_name(logcat_buf, "logcat:" .. pid)
-    local cmd = require("utils.android_device").adb_args(
-      adb, serial, { "logcat", "--pid=" .. pid })
+    local logcat = require("utils.android_logcat")
+    local args = { "logcat", "--pid=" .. pid }
+    vim.list_extend(args, logcat.filter_args(D._logcat_level))
+    local cmd = require("utils.android_device").adb_args(adb, serial, args)
     if not cmd then return end
     local buf = logcat_buf
+    -- Keyboard affordances: <CR> jump to source, gl cycle level, gx crash.
+    logcat.attach(buf, {
+      level = D._logcat_level or "V",
+      on_cycle = function(level)
+        D._logcat_level = level
+        start_logcat()
+        D.dap_bottom_tab("logcat", { quiet = true })
+      end,
+    })
     logcat_job = vim.fn.jobstart(cmd, {
       on_stdout = function(_, data)
         if not vim.api.nvim_buf_is_valid(buf) then return end

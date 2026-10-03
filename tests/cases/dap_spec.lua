@@ -1533,6 +1533,57 @@ t.describe("ue.dap.android: parse_maps_base_hex（K2/K11/K4）", function()
   end)
 end)
 
+-- Interactive attach/launch adb round-trips must not block the editor (K53).
+t.describe("dap.android: asynchronous adb round-trips", function()
+  local android = require("ue.dap.android")
+  local function with_system(results, fn)
+    local original, calls = vim.system, {}
+    vim.system = function(cmd, _, on_exit)
+      calls[#calls + 1] = cmd
+      local res = table.remove(results, 1) or { code = 0, stdout = "" }
+      on_exit(res)
+      return {}
+    end
+    local ok, err = pcall(fn, calls)
+    vim.system = original
+    assert(ok, err)
+  end
+
+  t.it("reads the ASLR base without a synchronous spawn", function()
+    local blocked = vim.fn.system
+    vim.fn.system = function() error("synchronous adb spawn on the attach path") end
+    local base, runtime
+    with_system({ { code = 0, stdout = "6c9fe21000-6ca0000000 r-xp 0 fd:00 1 /data/app/x/lib/arm64/libUE4.so\n" } },
+      function(calls)
+        android._read_so_base_hex_async_for_test("adb", "SERIAL", "com.x", 42, "/host/libUE4.so", "libUE4.so",
+          function(b, r) base, runtime = b, r end)
+        t.assert_true(vim.wait(1000, function() return base ~= nil end, 10))
+        t.assert_eq(calls[1][#calls[1]], "/proc/42/maps")
+      end)
+    vim.fn.system = blocked
+    t.assert_eq(base, "6c9fe21000")
+    t.assert_eq(runtime, "libUE4.so")
+  end)
+
+  t.it("runs launch steps in order and stops at the first required failure", function()
+    local finished
+    with_system({ { code = 1, stdout = "" }, { code = 7, stdout = "", stderr = "denied" }, { code = 0 } },
+      function(calls)
+        android._adb_sequence_for_test("adb", {
+          { args = { "force-stop" }, optional = true },
+          { args = { "set-debug-app" } },
+          { args = { "never-runs" } },
+        }, function(ok, out, code, index) finished = { ok = ok, out = out, code = code, index = index } end)
+        t.assert_true(vim.wait(1000, function() return finished ~= nil end, 10))
+        t.assert_eq(#calls, 2, "a failed required step must stop the sequence")
+      end)
+    t.assert_eq(finished.ok, false)
+    t.assert_eq(finished.code, 7)
+    t.assert_eq(finished.index, 2)
+    t.assert_contains(finished.out, "denied")
+  end)
+end)
+
 -- ════════════════════════════════════════════════════════════════════════
 -- wait-for-debugger launch（Android Studio debug 按钮语义）：
 -- set-debug-app -w → start → clear-debug-app 的命令形状 + jdb 释放 JDWP 闸门。

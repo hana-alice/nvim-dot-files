@@ -154,3 +154,15 @@ SHALL 显式使用该 serial，不得固定某一台设备或在运行中重读 
 - **重要事项**：符号发现要求当前配置产物"真实声明非空 `.debug_info`"，字符串表
   中未被 section 引用的残留名字不算 DWARF 证据（避免 strip 后残留符号名误判为
   可用调试信息）。
+- **选型（2026-09-30）**：attach/launch 路径上的 adb 往返（查 pid、读
+  `/proc/<pid>/maps` 求 slide、`set-debug-app`/启动、JDWP forward）一律异步，
+  不再用 `vim.fn.system`。K53 实测 Windows 同步 spawn 仅启动即 ≥87 ms，加上
+  adb 往返会在每次 attach/rebase 时冻结界面。
+- **重要事项（2026-09-30，引擎源码核对，未真机复验）**：致命信号断点停在
+  `FFatalSignalHandler::OnTargetSignal` 时不会触发 UE 的 `exit(0)` 自杀超时——
+  该超时只在 `ForwardSignal` 之后的轮询里按 10 ms 迭代累计（非墙钟），且 LLDB
+  all-stop 会冻结全部线程；只有 `continue` 之后的运行时间才计入
+  `android.SignalTimeout`（默认 20 s）。
+- **重要事项**：包名缺省时不再弹空白输入框，改为从设备
+  `pm list packages -3` 与项目 cook 产物中选择并持久化；崩溃符号化
+  （`:UEAndroidCrash`）复用同一 build-id 权威的符号库选择链（K64/K65/K66）。

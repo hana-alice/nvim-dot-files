@@ -285,9 +285,18 @@ Source: `lua/plugins/ue.lua` (`gd`, `<leader>ch`),
 | `<C-k>` (insert) | Signature help in insert mode (LazyVim) |
 | `<C-LeftMouse>`  | Smart jump: `gf` if file ref, else `gd` |
 | `<leader>ch`     | Switch source / header (clangd, UE)     |
+| `<leader>cI`     | Incoming calls / 谁调用了它 (clangd)    |
+| `<leader>cO`     | Outgoing calls / 它调用了谁 (clangd)    |
+| `<leader>cB`     | Type hierarchy: base types (clangd)     |
+| `<leader>cD`     | Type hierarchy: derived types (clangd)  |
+| `<leader>ss`     | Current file symbol outline (clangd)   |
+| `<leader>sS`     | Live workspace class/function search (clangd) |
 | `<leader>ca`     | Code action (LazyVim)                   |
 | `<leader>cr`     | Rename symbol (LazyVim)                 |
-| `<leader>cf`     | Format buffer or selection (LazyVim)    |
+| `<leader>cf`     | Safe format buffer / selection; C++ needs project style |
+| `:UEFormat epic` | Explicitly use the built-in UE style template |
+| `:UEUnsaved`     | List unsaved buffers and choose one to review |
+| `<leader>qq` / `:UEQuit` | Quit with save-all / review / discard choices |
 | `<leader>cd`     | Line diagnostics (LazyVim)              |
 | `<leader>cl`     | LSP info (LazyVim)                      |
 | `<leader>ss`     | Document symbols (LSP/treesitter)       |
@@ -752,6 +761,10 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `:UESetPlatform`          | Interactive platform+config select  |
 | `:UESetPlatform Win64 Development Editor` | Direct set         |
 | `<leader>ub`              | `:UEBuild` (platform from `:UESetPlatform`); on macOS, silent stages show a process-tree heartbeat in the same terminal |
+| `<leader>u?`              | `:UEGuide`: open the user guide (daily workflow, keys, troubleshooting) read-only |
+| `<leader>uE`              | `:UEBuildFirstError`: jump directly to the first source error of the latest build |
+| `<leader>uJ`              | `:UEPanelNext`: cycle build / quickfix / logcat / tasks in one bottom window (normal/terminal) |
+| `:UEPanel build` / `quickfix` / `logcat` / `tasks` | Select a bottom panel directly; tasks: `<CR>` / `dd` stop, `r` refresh |
 | `:UECompileForNvim`       | Compatibility entry: build current target, then delegate to the normal `UEPrepare` path |
 | `:UEBuildIOS`             | Build IOS C++ through native macOS UBT; safely reuse unchanged AOT outputs and defer dSYM |
 | `:UEIOSSetup`             | Optional explicit rerun of IOS prepared identity/private-key/device setup |
@@ -762,6 +775,14 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `:UEInstallIOS`           | CoreDevice: install current packaged `.app`; pre-iOS17: stream signing/upload/Upgrade progress through prepared `InstallIOSClient.sh`; never uninstall or launch |
 | `<leader>us`              | `:UEBuildAndroidSO` — export + execute UBT compile/link actions (no Deploy/Gradle/APK) |
 | `<leader>uq`              | `:UEDeployAndroidSO` — strip, push, atomically replace and verify `libUE4.so`; leaves the app stopped |
+| `<leader>P`               | `:UEHub` — searchable list of every UE action for the active target, with its key shown |
+| `<leader>uu`              | `:UETarget` — show and switch project / platform / device / package in one place |
+| `<leader>uk`              | Run the command that fixes the last reported failure (e.g. select a device) |
+| `<F5>` / `<S-F5>`         | No session: run the target loop (Android: build SO → deploy → debug-launch). In a session: continue. `<S-F5>` stops |
+| `:UEDoctor`               | Check tools, target, device, package; `<CR>` on a ✗ row runs its fix |
+| logcat buffer             | `<CR>` jump to the source location on the line · `gl` cycle minimum level · `gx` symbolicate latest crash |
+| `<leader>ux`              | `:UEAndroidIterate` — build SO → quick deploy → wait-for-debugger launch; stops at the first failing step (`nodebug` arg: plain launch) |
+| `<leader>uX`              | `:UEAndroidCrash` — pull the device crash buffer, symbolicate the UE module with the build-id-matched symbols, open quickfix |
 | `<leader>uB`              | `:UEPrepare`; IOS on macOS also generates its semantic CDB and auto-runs first-use setup |
 | `<leader>uc`              | `:UEExportCompileCommands`          |
 | `<leader>ul`              | `:UELaunch` (no debugger)           |

@@ -20,6 +20,7 @@ end
 -- explicit resource classification and rationale here. Broad file/API
 -- exemptions are deliberately impossible.
 local SPAWN_AUDIT = {
+  { p="lua/ue/csearch_git.lua", api="vim.system", a="pcall(vim.system, command", class="short", reason="serialized read-only Git evidence for explicit csearch writer; 15s timeout and cancellable task" },
   { p="lua/workarounds/codediff/threaded_git.lua", api="spawn", a="process, pid = uv.spawn", class="interactive", reason="two-worker bound; foreground Git spawn occurs inside libuv worker with owned cancellation and timeout", guard="task_registry" },
   { p="lua/workarounds/codediff/threaded_git.lua", api="fn-system", a="local result = vim.fn.systemlist", class="sync-debug", reason="upstream explicit synchronous runner compatibility; UI async callers use worker transport" },
   { p="lua/config/lazy.lua", api="fn-system", a="vim.fn.system({ \"git\", \"clone\"", class="bootstrap", reason="one-time lazy.nvim bootstrap before UI exists" },
@@ -36,6 +37,9 @@ local SPAWN_AUDIT = {
   { p="lua/ue/dap/android.lua", api="jobstart", a="vim.fn.jobstart(jdb_connect_argv", class="dap", reason="DAP JDWP bridge" },
   { p="lua/ue/dap/android.lua", api="vim.system", a="vim.system(", class="dap", reason="DAP bounded host operation" },
   { p="lua/ue/dap/android.lua", api="fn-system", a="vim.fn.system(cmd)", n=2, class="dap", reason="DAP preflight fallback" },
+  { p="lua/ue/dap/android.lua", api="vim.system", a="local ok, err = pcall(vim.system, cmd", class="dap", reason="async adb round-trip for interactive attach/launch steps (K53)" },
+  { p="lua/ue/dap/_android_crash.lua", api="vim.system", a="opts.system or vim.system", class="interactive", reason="one llvm-symbolizer run for a user-requested crash report" },
+  { p="lua/ue/dap/_android_crash.lua", api="vim.system", a="vim.system({ adb, \"-s\", serial, \"logcat\", \"-b\", \"crash\"", class="interactive", reason="one bounded crash-buffer dump requested by user" },
   -- C10 L2 gate: the layered capability preflight owns exactly ONE spawn point,
   -- deliberately centralized here instead of spread across target owners so this
   -- ratchet has a stable owner. Bounded by preflight.PROBE_TIMEOUT_MS; async only
@@ -72,6 +76,8 @@ local SPAWN_AUDIT = {
   { p="lua/ue.lua", api="vim.system", a="local handle = vim.system(cmd, {", class="deferrable", reason="admitted ccjson subprocess", guard="admission.run_when_allowed" },
   { p="lua/ue.lua", api="fn-system", a="vim.fn.systemlist(joined)", class="helper", reason="legacy fallback for shared sync helper" },
   { p="lua/utils/android_device.lua", api="vim.system", a="pcall(vim.system", class="interactive", reason="bounded device discovery requested by user" },
+  { p="lua/utils/android_device.lua", api="vim.system", a="pcall(opts.system or vim.system", class="interactive", reason="one bounded `adb -s <serial> get-state` liveness check (doctor row)" },
+  { p="lua/utils/android_package.lua", api="vim.system", a="opts.system or vim.system", class="interactive", reason="one `pm list packages` for a user-driven package picker" },
   { p="lua/utils/code_search/init.lua", api="spawn", a="vim.loop.spawn(cs", class="interactive", reason="cancellable indexed query" },
   { p="lua/utils/code_search/init.lua", api="spawn", a="vim.loop.spawn(rg", class="interactive", reason="cancellable grep fallback" },
   { p="lua/utils/code_search/init.lua", api="spawn", a="vim.loop.spawn(cindex", class="deferrable", reason="admitted csearch rebuild", guard="admission.run_when_allowed" },

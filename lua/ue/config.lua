@@ -47,6 +47,10 @@ local function defaults()
     context = {
       ttl_s = 30,
     },
+    probe = {
+      -- report-first requires a visible unread summary; neither mode is silent.
+      startup_notice = "statusline", -- "statusline" or "notify" (INFO)
+    },
     android = {
       -- Project-specific SDK names/flags belong to machine-local policy, never
       -- to this public configuration. Missing policy leaves Target defaults.

@@ -311,10 +311,14 @@ function M.attach_commands(session)
   -- symbols differ must not abort the whole attach.
   --
   -- Escape hatch: UE_DAP_NO_FATAL_BP=1 restores the pre-K60 behaviour.
-  -- Caveat (待验证): the forwarded handler thread polls
-  -- WaitForSignalHandlerToFinishOrExit() and calls exit(0) once
-  -- GAndroidSignalTimeOut elapses, so sitting at this breakpoint for a long
-  -- time may still let the app self-exit.
+  -- Self-exit timeout (resolved by engine source reading, 2026-09-30; not yet
+  -- re-run on a device): OnTargetSignal stops here BEFORE it calls
+  -- ForwardSignal, and only ForwardSignal enters
+  -- WaitForSignalHandlerToFinishOrExit(). That loop counts 10 ms poll
+  -- iterations (not wall-clock) against android.SignalTimeout (default 20 s),
+  -- and LLDB all-stop halts every thread while we sit at this breakpoint. So
+  -- inspecting the stop does not trigger exit(0); only time spent running
+  -- after `continue` counts toward it.
   if (vim.env.UE_DAP_NO_FATAL_BP or "") == "" then
     local symbol_module = session and session.symbol_lib
       and vim.fs.basename(session.symbol_lib) or "libUE4.so"

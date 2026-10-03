@@ -2,6 +2,16 @@ local map = vim.keymap.set
 local window_title = require("utils.window_title")
 window_title.setup()
 
+map({ "n", "x" }, "<leader>cf", function()
+  local format = require("utils.cpp_format")
+  if not format.is_cpp(0) then return LazyVim.format({ force = true }) end
+  local mode = vim.fn.mode()
+  local range = format.selection()
+  if mode == "\22" then return end
+  if range then vim.cmd.normal({ args = { "\27" }, bang = true }) end
+  format.format({ range = range })
+end, { desc = "Format safely (工程风格 / 选区)" })
+
 local function live_grep_with(opts)
   return function()
     LazyVim.pick.open("live_grep", vim.deepcopy(opts or {}))
@@ -211,10 +221,19 @@ end
 local function apply_ue_runtime_overrides()
   local opts = { nowait = true }
 
+  map("n", "<leader>u?", "<cmd>UEGuide<cr>", vim.tbl_extend("force", opts, { desc = "UE: User guide (使用手册)" }))
   map("n", "<leader>uA", "<cmd>UESetAndroidDevice<cr>", vim.tbl_extend("force", opts, { desc = "UE: Select Android device (this Nvim)" }))
   map("n", "<leader>ub", "<cmd>UEBuild<cr>", vim.tbl_extend("force", opts, { desc = "UE: Build (platform from UESetPlatform)" }))
+  map("n", "<leader>uE", "<cmd>UEBuildFirstError<cr>", vim.tbl_extend("force", opts, { desc = "UE: Jump to first build error" }))
+  map("n", "<leader>uJ", "<cmd>UEPanelNext<cr>", vim.tbl_extend("force", opts, { desc = "UE: Cycle bottom panel" }))
+  map("t", "<leader>uJ", [[<C-\><C-n><cmd>UEPanelNext<cr>]], vim.tbl_extend("force", opts, { desc = "UE: Cycle bottom panel" }))
   map("n", "<leader>us", "<cmd>UEBuildAndroidSO<cr>", vim.tbl_extend("force", opts, { desc = "UE: Build Android SO only (skip APK)" }))
   map("n", "<leader>uq", "<cmd>UEDeployAndroidSO<cr>", vim.tbl_extend("force", opts, { desc = "UE: Quick deploy Android SO" }))
+  map("n", "<leader>ux", "<cmd>UEAndroidIterate<cr>", vim.tbl_extend("force", opts, { desc = "UE: Android loop (build SO, deploy, debug-launch)" }))
+  map("n", "<leader>uX", "<cmd>UEAndroidCrash<cr>", vim.tbl_extend("force", opts, { desc = "UE: Symbolicate latest Android crash" }))
+  map("n", "<leader>uu", function() require("utils.ue_hub").target_switcher() end, vim.tbl_extend("force", opts, { desc = "UE: Switch target (project/platform/device/package)" }))
+  map("n", "<leader>uk", function() require("utils.ue_hub").run_fix() end, vim.tbl_extend("force", opts, { desc = "UE: Run the fix for the last failure" }))
+  map("n", "<leader>P", function() require("utils.ue_hub").command_hub() end, vim.tbl_extend("force", opts, { desc = "UE: Command hub (all actions, searchable)" }))
   map("n", "<leader>ug", "<cmd>UELogToggle<cr>", vim.tbl_extend("force", opts, { desc = "UE: Toggle app log" }))
   map("n", "<leader>ui", "<cmd>UEInstall<cr>", vim.tbl_extend("force", opts, { desc = "UE: Install for active target" }))
   map("n", "<leader>ul", "<cmd>UELaunch<cr>", vim.tbl_extend("force", opts, { desc = "UE: Launch app (no debugger)" }))
@@ -319,6 +338,7 @@ vim.api.nvim_create_user_command("RestartDetect", function()
 end, { desc = "Print restart plan without acting (debug)" })
 
 map("n", "<leader>qr", "<cmd>Restart<cr>", { desc = "Quit: Restart Neovim in cwd" })
+map("n", "<leader>qq", "<cmd>UEQuit<cr>", { desc = "退出（查看未保存文件）" })
 
 -- Windows-style paste in cmdline (`:` / `/` / `?`) and insert mode.
 -- Default Ctrl+V in cmdline is "literal-insert next key" (rarely useful);
@@ -349,7 +369,10 @@ map("n", "<leader>dx", "<cmd>UEResetLayout<cr>", { desc = "Reset Layout (DAP or 
 -- and regular code buffers alike. Without this, pressing F5 inside the REPL
 -- inserts a literal "<F5>" instead of stepping.
 local dap_fkeys = {
-  ["<F5>"]   = { cmd = "UEDAPContinue",        desc = "DAP: Continue" },
+  -- F5: continue inside a debug session; with no session it runs the active
+  -- target's loop (Android: build SO → deploy → debug-launch). S-F5 stops.
+  ["<F5>"]   = { cmd = "lua require('utils.ue_hub').run_or_debug()", desc = "Run/debug target, or DAP continue" },
+  ["<S-F5>"] = { cmd = "UEDAPStop",            desc = "DAP: Stop session" },
   ["<F6>"]   = { cmd = "UEDAPPause",           desc = "DAP: Pause" },
   ["<F9>"]   = { cmd = "UEDAPToggleBreakpoint",desc = "DAP: Toggle Breakpoint" },
   ["<F10>"]  = { cmd = "UEDAPStepOver",        desc = "DAP: Step Over" },

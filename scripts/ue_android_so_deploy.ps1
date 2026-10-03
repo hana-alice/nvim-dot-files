@@ -18,7 +18,9 @@ param(
 
   [switch]$PreflightOnly,
 
-  [switch]$PreferRunAs
+  [switch]$PreferRunAs,
+
+  [switch]$Force
 )
 
 Set-StrictMode -Version Latest
@@ -489,6 +491,46 @@ function Wait-PackageStopped {
   throw "Package processes did not stop within ${TimeoutSeconds}s"
 }
 
+function Test-DeployedSoUnchanged {
+  param($Transport, [string]$TargetSo, [string]$LocalHash, [string]$HostAgent,
+    [string]$Current, [string]$VersionCode, [string]$ApkFingerprint)
+
+  # Missing, malformed or unreadable evidence is a cache miss, never a deploy error.
+  try {
+    if ($Transport.Kind -eq "root") {
+      $remote = Invoke-AdbRoot -Arguments @("sha256sum", $TargetSo) -AllowFailure
+      if ($remote.Code -ne 0) { return $false }
+      $match = [regex]::Match($remote.Text.Trim(), "^([0-9a-fA-F]{64})\s+\S+$")
+      return ($match.Success -and $match.Groups[1].Value.ToLowerInvariant() -eq $LocalHash)
+    }
+    if ($Transport.Kind -ne "run-as-agent") { return $false }
+    $pointer = Invoke-AdbRunAs -Arguments @("cat", $Current) -AllowFailure
+    if ($pointer.Code -ne 0) { return $false }
+    $generation = $pointer.Text.Trim()
+    if ($generation -cnotmatch "^g-[0-9a-f]{32}$") { return $false }
+    $manifestPath = "code_cache/nvim-ue-so/$generation/manifest"
+    $remote = Invoke-AdbRunAs -Arguments @("cat", $manifestPath) -AllowFailure
+    if ($remote.Code -ne 0) { return $false }
+    $fields = @{}
+    foreach ($line in ($remote.Text.Trim() -split "`n")) {
+      $match = [regex]::Match($line.TrimEnd("`r"), "^([a-z_][a-z0-9_]*)=(.+)$")
+      if (-not $match.Success -or $fields.ContainsKey($match.Groups[1].Value)) { return $false }
+      $fields[$match.Groups[1].Value] = $match.Groups[2].Value
+    }
+    foreach ($key in @("generation", "so_sha256", "agent_sha256", "installed_version_code", "installed_apk_fingerprint")) {
+      if (-not $fields.ContainsKey($key)) { return $false }
+    }
+    if ($fields.so_sha256 -cnotmatch "^[0-9a-f]{64}$" -or
+        $fields.agent_sha256 -cnotmatch "^[0-9a-f]{64}$") { return $false }
+    return ($fields.generation -ceq $generation -and
+      $fields.so_sha256 -ceq $LocalHash -and
+      $fields.agent_sha256 -ceq (Get-Sha256Hex -Path $HostAgent) -and
+      $fields.installed_version_code -ceq $VersionCode -and
+      $fields.installed_apk_fingerprint -ceq $ApkFingerprint)
+  }
+  catch { return $false }
+}
+
 function Get-SourcePackageIdentity {
   $packageInfoPath = Join-Path (Split-Path -Parent $script:SourceSo) "packageInfo.txt"
   if (-not (Test-Path -LiteralPath $packageInfoPath -PathType Leaf)) {
@@ -643,6 +685,7 @@ $generationComplete = $false
 $generationPublished = $false
 $replaced = $false
 $operationSucceeded = $false
+$deploymentStarted = $false
 $operationMutex = Enter-OperationMutex
 
 try {
@@ -656,6 +699,13 @@ try {
   $localSize = (Get-Item -LiteralPath $hostTempSo).Length
   Write-Host "[UE SO deploy] stripped size=$localSize sha256=$localHash"
 
+  if (-not $Force -and (Test-DeployedSoUnchanged -Transport $transport -TargetSo $targetSo `
+      -LocalHash $localHash -HostAgent $hostAgent -Current $runAsCurrent `
+      -VersionCode $installedVersionCode -ApkFingerprint $installedApkFingerprint)) {
+    Write-Host "[UE SO deploy] unchanged (sha256=$localHash) $([char]0x2014) skipped"
+    return
+  }
+  $deploymentStarted = $true
   Invoke-Adb -Arguments @("shell", "am", "force-stop", $Package) | Out-Null
   Wait-PackageStopped
   Write-Host "[UE SO deploy] pushing to $Serial"
@@ -799,46 +849,48 @@ catch {
 finally {
   Remove-Item -LiteralPath $hostTempSo -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $hostTempManifest -Force -ErrorAction SilentlyContinue
-  Invoke-Adb -Arguments @(
-    "shell", "rm", "-f", $deviceStage, $deviceAgentStage, $deviceManifestStage
-  ) -AllowFailure | Out-Null
-  if ($transport.Kind -eq "root") {
-    Invoke-AdbRoot -Arguments @("rm", "-f", $targetNew) -AllowFailure | Out-Null
-  }
-  else {
-    $currentPointsToGeneration = $false
-    if ($generationComplete) {
-      $currentProbe = Invoke-AdbRunAs -Arguments @(
-        "cat", $runAsCurrent
-      ) -AllowFailure
-      $currentPointsToGeneration = (
-        $currentProbe.Code -eq 0 -and
-        $currentProbe.Text.Trim() -eq $generationName
-      )
-      if ($currentPointsToGeneration) {
-        $generationPublished = $true
+  if ($deploymentStarted) {
+    Invoke-Adb -Arguments @(
+      "shell", "rm", "-f", $deviceStage, $deviceAgentStage, $deviceManifestStage
+    ) -AllowFailure | Out-Null
+    if ($transport.Kind -eq "root") {
+      Invoke-AdbRoot -Arguments @("rm", "-f", $targetNew) -AllowFailure | Out-Null
+    }
+    else {
+      $currentPointsToGeneration = $false
+      if ($generationComplete) {
+        $currentProbe = Invoke-AdbRunAs -Arguments @(
+          "cat", $runAsCurrent
+        ) -AllowFailure
+        $currentPointsToGeneration = (
+          $currentProbe.Code -eq 0 -and
+          $currentProbe.Text.Trim() -eq $generationName
+        )
+        if ($currentPointsToGeneration) {
+          $generationPublished = $true
+        }
       }
-    }
-    Invoke-AdbRunAs -Arguments @(
-      "rm", "-rf", $runAsGenerationNew
-    ) -AllowFailure | Out-Null
-    Invoke-AdbRunAs -Arguments @(
-      "rm", "-f", $runAsCurrentNew
-    ) -AllowFailure | Out-Null
-    if ($generationComplete -and -not $generationPublished) {
       Invoke-AdbRunAs -Arguments @(
-        "rm", "-rf", $runAsGeneration
+        "rm", "-rf", $runAsGenerationNew
       ) -AllowFailure | Out-Null
-    }
-    if ($operationSucceeded -and $generationPublished -and
-        -not [string]::IsNullOrWhiteSpace($previousGeneration) -and
-        $previousGeneration -ne $generationName) {
-      $oldGeneration = "$runAsDir/$previousGeneration"
-      $cleanupOld = Invoke-AdbRunAs -Arguments @(
-        "rm", "-rf", $oldGeneration
-      ) -AllowFailure
-      if ($cleanupOld.Code -ne 0) {
-        Write-Warning "Published the new generation but could not remove stale generation: $oldGeneration"
+      Invoke-AdbRunAs -Arguments @(
+        "rm", "-f", $runAsCurrentNew
+      ) -AllowFailure | Out-Null
+      if ($generationComplete -and -not $generationPublished) {
+        Invoke-AdbRunAs -Arguments @(
+          "rm", "-rf", $runAsGeneration
+        ) -AllowFailure | Out-Null
+      }
+      if ($operationSucceeded -and $generationPublished -and
+          -not [string]::IsNullOrWhiteSpace($previousGeneration) -and
+          $previousGeneration -ne $generationName) {
+        $oldGeneration = "$runAsDir/$previousGeneration"
+        $cleanupOld = Invoke-AdbRunAs -Arguments @(
+          "rm", "-rf", $oldGeneration
+        ) -AllowFailure
+        if ($cleanupOld.Code -ne 0) {
+          Write-Warning "Published the new generation but could not remove stale generation: $oldGeneration"
+        }
       }
     }
   }

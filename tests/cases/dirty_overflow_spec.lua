@@ -258,6 +258,29 @@ t.describe("dirty overflow survives owner lifetime", function()
     end)
   end)
 
+  t.it("explicit Git coverage acknowledges empty overflow without conflating delete removal", function()
+    with_watchers(function(open)
+      local watch, _, dir = open()
+      flood(watch, dir)
+      local path = watch.persistent_dirty_status().path
+      watch.remove_persistent_dirty(watch.snapshot_persistent_dirty(), "subtract-only")
+      watch.remove_persistent_dirty({}, "git-complete", os.time() + 2, false, true)
+      t.assert_false(watch.persistent_dirty_status().capped)
+      t.assert_false(vim.uv.fs_stat(path .. ".overflow") ~= nil)
+    end)
+  end)
+
+  t.it("Git acknowledgement keeps a same-second marker and failed publication", function()
+    with_watchers(function(open)
+      local watch, _, dir = open()
+      flood(watch, dir)
+      watch.remove_persistent_dirty({}, "git-complete", os.time(), false, true)
+      t.assert_true(watch.persistent_dirty_status().capped)
+      watch.remove_persistent_dirty({}, "incomplete-git", os.time() + 2, true, false)
+      t.assert_true(watch.persistent_dirty_status().capped)
+    end)
+  end)
+
   t.it("smart build requires a reset even when retained overflow paths are empty", function()
     local ue = require("ue")
     local mode = ue._csearch_build_mode_for_test({
@@ -328,7 +351,7 @@ t.describe("dirty overflow survives owner lifetime", function()
       assert(callback, "incremental command callback unavailable")
       local context, routed = { paths = {}, engine_root = dir }, nil
       local command = assert(loadstring("local M, resolve_context = ...; return " .. callback))(
-        { build_csearch_async = function(opts) routed = opts.context end },
+        { build_csearch_async = function(opts) routed = opts.context; t.assert_true(opts.recover_overflow) end },
         function() return context end)
       command()
       t.assert_true(routed == context, "full search-only owner must receive the original context")

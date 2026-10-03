@@ -346,6 +346,7 @@ local function parse_output_entry(line, opts)
       lnum = 1,
       col = 1,
       text = trim(line),
+      _source_location = false, -- Context path only; no source line was parsed.
     }
   end
 end
@@ -4439,22 +4440,14 @@ end
 -- ==========================================================================
 
 local function append_job_output(lines, pending, chunks)
-  pending = pending or ""
-  for _, chunk in ipairs(chunks or {}) do
-    if chunk and chunk ~= "" then
-      pending = pending .. chunk
-      while true do
-        local newline = pending:find("\n", 1, true)
-        if not newline then
-          break
-        end
-        local line = trim(strip_ansi(pending:sub(1, newline - 1)))
-        if line ~= "" then
-          table.insert(lines, line)
-        end
-        pending = pending:sub(newline + 1)
-      end
-    end
+  -- Channel arrays split on newline; only the endpoints are fragments.
+  pending = (pending or "") .. table.concat(chunks or {}, "\n")
+  while true do
+    local newline = pending:find("\n", 1, true)
+    if not newline then break end
+    local line = trim(strip_ansi(pending:sub(1, newline - 1)))
+    if line ~= "" then table.insert(lines, line) end
+    pending = pending:sub(newline + 1)
   end
   return pending
 end
@@ -4485,6 +4478,7 @@ local function open_terminal_command(cmd, opts)
   local function track_state(buf, win)
     CORE_RT.build_term_buf = buf
     CORE_RT.build_term_win = win
+    require("utils.bottom_panel").register("build", buf)
 
     vim.api.nvim_create_autocmd("BufWipeout", {
       buffer = buf,
@@ -4517,14 +4511,8 @@ local function open_terminal_command(cmd, opts)
 
   local function ensure_window()
     prune_state()
-
-    if CORE_RT.build_term_win and focus_window(CORE_RT.build_term_win) then
-      return CORE_RT.build_term_win
-    end
-
     local height = opts.height or math.max(8, math.floor(vim.o.lines * 0.25))
-    vim.cmd(("botright %dnew"):format(height))
-    CORE_RT.build_term_win = vim.api.nvim_get_current_win()
+    CORE_RT.build_term_win = require("utils.bottom_panel").show("build", CORE_RT.build_term_buf, { height = height })
     return CORE_RT.build_term_win
   end
 
@@ -4546,8 +4534,8 @@ local function open_terminal_command(cmd, opts)
   -- Closing the terminal window is a presentation action, not task
   -- cancellation. `bufhidden=wipe` terminates a live terminal job (reported
   -- by Neovim as exit 143), so keep the buffer hidden while the build runs.
-  -- The exit callback restores the old cleanup behavior once no process can
-  -- be killed by wiping the buffer.
+  -- Keep completed output too: the bottom panel can revisit it until the next
+  -- build explicitly replaces and deletes this buffer.
   vim.bo[buf].bufhidden = "hide"
   vim.bo[buf].buflisted = false
   vim.bo[buf].swapfile = false
@@ -4557,6 +4545,7 @@ local function open_terminal_command(cmd, opts)
   end
 
   if opts.quickfix_title then
+    require("ue.build_diagnostics").clear()
     set_build_status("B...")
   end
 
@@ -4579,7 +4568,7 @@ local function open_terminal_command(cmd, opts)
           build_monitor = nil
         end
         if vim.api.nvim_buf_is_valid(buf) then
-          vim.bo[buf].bufhidden = "wipe"
+          vim.bo[buf].bufhidden = "hide"
         end
         stdout_pending = flush_job_output(output_lines, stdout_pending)
         stderr_pending = flush_job_output(output_lines, stderr_pending)
@@ -4588,10 +4577,10 @@ local function open_terminal_command(cmd, opts)
         end
         if foreground_token then require("utils.host_admission").foreground_done(foreground_token); foreground_token = nil end
         if code ~= 0 and opts.quickfix_title then
-          populate_quickfix_from_output(opts.quickfix_title, output_lines, {
+          require("ue.build_diagnostics").publish(opts.quickfix_title, diagnostic_entries_from_output(output_lines, {
             root = opts.quickfix_root,
             tail_limit = opts.tail_limit,
-          })
+          }))
         end
         if opts.quickfix_title then
           set_build_status(code == 0 and "BOK" or ("B" .. tostring(code)))
@@ -4600,6 +4589,9 @@ local function open_terminal_command(cmd, opts)
         local msg = ("%s finished with exit code %d"):format(
           opts.finish_label or "UE build", code
         )
+        if code ~= 0 and opts.quickfix_title then
+          msg = msg .. " — " .. require("ue.build_diagnostics").summary()
+        end
         vim.notify(msg, level)
         if code ~= 0 then require("utils.log").error("ue.build", msg) end
         if type(opts.on_exit) == "function" then
@@ -9420,6 +9412,8 @@ function M.setup()
   -- One-key Android inner loop: build SO → hot-deploy → attach. The steps stay
   -- separate owners (K46); this only chains them and stops at the first failure.
   require("utils.ue_hub").setup_commands()
+  require("ue.build_diagnostics").setup()
+  require("utils.bottom_panel").setup_commands()
   -- Target inner loops (Android: build SO → deploy → debug-launch) live with
   -- their workflows; ue.lua only hands over the steps it owns.
   require("ue.workflows.bootstrap").setup_loop_commands({
@@ -10030,27 +10024,7 @@ function M.setup()
     end
 
     vim.api.nvim_create_user_command("Tasks", function()
-      local tr = require("utils.task_registry")
-      local rows = tr.list()
-      if #rows == 0 then
-        vim.notify("无后台任务", vim.log.levels.INFO, { title = "Tasks" })
-        return
-      end
-      vim.ui.select(rows, {
-        prompt = "Tasks (select to stop):",
-        format_item = task_label,
-      }, function(choice)
-        if not choice then return end
-        if choice.status ~= "running" then
-          vim.notify(("%s 已结束（%s）"):format(choice.name, choice.status), vim.log.levels.INFO, { title = "Tasks" })
-          return
-        end
-        if tr.cancel(choice.id) then
-          vim.notify(("已停止 %s"):format(choice.name), vim.log.levels.INFO, { title = "Tasks" })
-        else
-          vim.notify(("%s 已结束"):format(choice.name), vim.log.levels.INFO, { title = "Tasks" })
-        end
-      end)
+      require("utils.bottom_panel").show("tasks")
     end, { desc = "List background tasks; select to stop" })
 
     vim.api.nvim_create_user_command("TaskStop", function(opts)

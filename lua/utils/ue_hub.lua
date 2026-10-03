@@ -13,12 +13,35 @@ end
 
 local function cmd(name) return function() vim.cmd(name) end end
 
+-- Reuse the attached buffer's actual key callback, including capability guards.
+-- A hub picker may change the current buffer; capture its source window first.
+local function code_key(key)
+  return function()
+    if #vim.lsp.get_clients({ bufnr = 0, name = "clangd" }) == 0 then
+      vim.notify("C++ 导航需要当前文件已附加 clangd", vim.log.levels.WARN)
+      return
+    end
+    local mapping = vim.fn.maparg(key, "n", false, true)
+    if type(mapping.callback) == "function" then return mapping.callback() end
+    vim.notify("当前 clangd 未提供此动作: " .. key, vim.log.levels.WARN)
+  end
+end
+
 --- Generic actions: { group, label, key?, run }. Target-specific actions and
 --- fields come from the active target driver's declarative `hub(state)`.
 M.actions = {
   { group = "Run",    label = "Run / debug current target (F5 when idle)", key = "<F5>", run = function() M.run_or_debug() end },
   { group = "Run",    label = "Launch app (no debugger)", key = "<leader>ul", run = cmd("UELaunch") },
+  { group = "Code", label = "Incoming calls / 谁调用了它", key = "<leader>cI", run = code_key("<leader>cI") },
+  { group = "Code", label = "Outgoing calls / 它调用了谁", key = "<leader>cO", run = code_key("<leader>cO") },
+  { group = "Code", label = "Workspace symbols / 类名、函数名", key = "<leader>sS", run = code_key("<leader>sS") },
+  { group = "Code", label = "Document symbols / 当前文件大纲", key = "<leader>ss", run = code_key("<leader>ss") },
+  { group = "Code", label = "Base types / 基类", key = "<leader>cB", run = code_key("<leader>cB") },
+  { group = "Code", label = "Derived types / 派生类", key = "<leader>cD", run = code_key("<leader>cD") },
+  { group = "Code", label = "Rename symbol / 重命名", key = "<leader>cr", run = code_key("<leader>cr") },
+  { group = "Code", label = "Code action / 代码操作", key = "<leader>ca", run = code_key("<leader>ca") },
   { group = "Build",  label = "Build active target", key = "<leader>ub", run = cmd("UEBuild") },
+  { group = "Build",  label = "First build error / 首个构建错误", key = "<leader>uE", run = cmd("UEBuildFirstError") },
   { group = "Build",  label = "Install app on device", key = "<leader>ui", run = cmd("UEInstall") },
   { group = "Debug",  label = "Attach debugger", key = "<leader>da", run = cmd("UEDAPAttach") },
   { group = "Debug",  label = "Launch under debugger (wait-for-debugger)", key = "<leader>dl", run = cmd("UEDAPLaunch") },
@@ -35,6 +58,11 @@ M.actions = {
   { group = "Index",  label = "Index status", run = cmd("UEIndexStatus") },
   { group = "Index",  label = "Rebuild code search index", run = cmd("UEBuildCsearch") },
   { group = "Tasks",  label = "Background tasks (list / stop)", key = "<leader>X", run = cmd("Tasks") },
+  { group = "Panels", label = "Cycle bottom panel / 底部面板", key = "<leader>uJ", run = cmd("UEPanelNext") },
+  { group = "Panels", label = "Build output / 构建输出", run = cmd("UEPanel build") },
+  { group = "Panels", label = "Problems / 问题列表", run = cmd("UEPanel quickfix") },
+  { group = "Panels", label = "Logcat / 日志", run = cmd("UEPanel logcat") },
+  { group = "Panels", label = "Background tasks / 后台任务", run = cmd("UEPanel tasks") },
   { group = "Tasks",  label = "Stop all background tasks", key = "<leader>XA", run = cmd("TaskStopAll") },
   { group = "Help",   label = "Run the fix for the last failure", key = "<leader>uk", run = function() M.run_fix() end },
   { group = "Help",   label = "Cheatsheet", key = "<leader>?", run = cmd("UECheatsheet") },
@@ -115,8 +143,13 @@ end
 --- Searchable hub: grouped actions with their keys shown for learning.
 function M.command_hub()
   local target = M.target()
+  local source_win = vim.api.nvim_get_current_win()
   pick(M.visible_actions(target), "UE  " .. M.target_summary(target), M.format_action,
-    function(action) action.run() end)
+    function(action)
+      if not vim.api.nvim_win_is_valid(source_win) then return end
+      vim.api.nvim_set_current_win(source_win)
+      action.run()
+    end)
 end
 
 function M.target_summary(target)

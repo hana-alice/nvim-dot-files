@@ -119,7 +119,7 @@ t.describe("ue.android_build_command（SO-only）", function()
     t.assert_false(script:find('"-SkipDeploy"', 1, true) ~= nil)
   end)
 
-  t.it("运行中的 build terminal 可隐藏，任务退出后才恢复 wipe", function()
+  t.it("运行中与已结束的 build terminal 都可隐藏回看", function()
     local source = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
     local section = source:match(
       "local function open_terminal_command%b().-\nend\n\n%-%- =========================================================================="
@@ -130,8 +130,8 @@ t.describe("ue.android_build_command（SO-only）", function()
     local wipe_at = section:find('vim.bo[buf].bufhidden = "wipe"', 1, true)
     t.assert_true(hide_at ~= nil and termopen_at ~= nil and hide_at < termopen_at,
       "任务启动前 terminal 必须使用 bufhidden=hide，关窗不得终止 build")
-    t.assert_true(wipe_at ~= nil and wipe_at > termopen_at,
-      "任务退出后 terminal 必须恢复 bufhidden=wipe")
+    t.assert_nil(wipe_at, "完成后不可 wipe，面板须能回看构建输出")
+    t.assert_contains(section, 'require("utils.bottom_panel").register("build", buf)')
   end)
 
   t.it("项目和 SO 发现不固定 Client 项目路径", function()

@@ -7,6 +7,8 @@ local cfg = t.bootstrap()
 
 -- 87 个 UE* 命令冻结清单（来自 lua/ue.lua + lua/ue/*.lua）。
 local UE_COMMANDS = {
+  "UEBuildFirstError",
+  "UEPanel", "UEPanelNext",
   "UEAndroidCrash", "UEAndroidIterate", "UEBuild", "UEBuildDistributed", "UEBuildDistributedPlan", "UEBuildAndroid", "UEBuildAndroidSO", "UEBuildCsearch", "UEBuildIOS", "UEBuildPCH", "UECachePaths", "UECDBPartition",
   "UECDBStatus", "UECDBSwitch", "UECheatsheet", "UECheatsheetEdit", "UEClearCache",
   "UECompileForNvim",
@@ -28,8 +30,8 @@ local UE_COMMANDS = {
 
 t.describe("commands: UE* 全量注册", function()
   require("ue").setup()
-  t.it("冻结清单含 93 个命令", function()
-    t.assert_eq(#UE_COMMANDS, 93)
+  t.it("冻结清单含 96 个命令", function()
+    t.assert_eq(#UE_COMMANDS, 96)
   end)
   for _, c in ipairs(UE_COMMANDS) do
     t.it(":" .. c .. " 已注册", function()

@@ -73,6 +73,79 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-10-03 — 一个底部窗口容纳构建、问题、日志与任务
+
+**Task**
+- 键盘循环切换四种底部内容，复用窗口、不叠窗口。
+
+**Implemented**
+- `lua/utils/bottom_panel.lua` 提供每 tab 的共享 host、原生 quickfix、buffer/view 保留、任务派生状态与 `<CR>` / `dd` 取消、`r` 刷新；`UEPanel` / `UEPanelNext` / `<leader>uJ`（普通与终端模式）接入 hub 和帮助。
+- 默认构建终端、`ue.build_diagnostics`、`utils.ue_logs`、`utils.android_logcat`、DAP 底部 tab 与 `:Tasks` 复用此 host；退出构建保留输出，隐藏日志不停止 reader；DAP 关闭只作用于自己当前可见的内容。
+- `docs/USER_GUIDE.md` 将底部面板从计划中移入正文；同步 `task-management` 方向级 spec 与架构/知识库入口。
+
+**Pitfalls / Gotchas**
+- 不可沿用 bufhidden=wipe，否则换面板会终止 reader 或丢失完成输出；停止仍由原 owner 执行。窗口局部选项每次切换重设，避免 DAP tab 标题/折行污染其它面板。
+- Windows headless 的子 Neovim stdout 未进入 PTY，不能拿它作终端文本实测；回归分别验证真实进程生命周期与输出 buffer 保留。
+- 组合回归曾在强制 jobstop 清理后挂起/异常退出；改为真实 child 读取 stop marker 后自然退出，连续两次 android_ide 44/44 且真实 exit=0，主 agent 再复验 exit=0。ConPTY 内部机制未证明；没有吞退出码或放宽断言。
+- `tests/run.lua` 将 Neovim 自身日志也置于原有临时隔离目录，防 native 子进程日志污染工程输入。
+
+**Validation**
+- 新面板 14/14、真实 terminal/DAP UI owner 生命周期 3/3，android_ide 合并 44/44，task_registry 15/15，全绿、0 跳过。
+- 最终源码核查补齐共享 build/tasks/quickfix host 下打开调试 UI 的 toggle 门禁；新增生产闭包回归后生命周期 4/4、android_ide 合并 45/45，全绿、真实退出码 0。
+- 首轮全量 2473/2483，10 失败、0 跳过；隔离真实键位验证进程并完成源码核查修正后，键位 + 真实主题 + 完成回调 + 面板组合 43/43、退出码 0。最终全量结果在下方验收补充记录。
+- 最终冻结代码全量 `NVIM_TEST_REQUIRE_NATIVE=1 nvim --headless -l tests/run.lua`：2484/2484 全绿，0 失败、0 跳过，真实退出码 0；全部测试子进程退出。裸全局 lint 与 `git diff --check` 通过；ue.lua 10343 行，新文件均小于 800 行。
+- keymaps 63/63、cheatsheet 162/162、commands 125/125、stability 26/26；dap 237/237、platform 51/51、ue_api 66/66、ue_platform_boundary 17/17、ue_context 14/14、ue_target_integration 27/27、review_editor 9/9、smoke 19/19、structure 78/78，全绿、0 跳过。
+
+**Follow-ups**
+- 未做真实 UE/ADB/DAP 会话的 GUI 交互验收；可选首次打开项目的一次性提示本次未实施，保留现有 UEDoctor 与第一次使用步骤。
+
+### 2026-10-03 — 构建失败后直接定位首个错误
+
+**Task**
+- 默认构建与 SO 构建失败后，在结束通知给出第一个源码错误并一键跳转；问题列表保留 warning。
+
+**Implemented**
+- `lua/ue/build_diagnostics.lua` 在构建完成时稳定分组 error/warning/上下文，保存首个有效 error 位置；`UEBuildFirstError` / `<leader>uE` 从面板直接跳到源码，不依赖当前 quickfix 尚是构建列表。
+- `lua/ue.lua` 只在终端完成回调发布诊断与附加首错通知；开始新构建清旧位置。同步 hub、两份 cheatsheet、命令清单与用户指南。
+
+**Pitfalls / Gotchas**
+- 完成链 fixture 证实原 append_job_output 丢失 channel 数组元素之间的换行，黏连 warning/error；已按原生数组语义拼接，保留两端碎片与退出时尾行 flush。
+- 真实主题后冷 quickfix fixture 约 413.8 ms，vim.wait(200) 返回超时但条件已满足；完成链等待改为 2 秒，完整交付/诊断断言保留。此 fixture 不证明真实 GUI 无卡顿。
+- 无源码位置的失败明确提示，不能把上一轮位置当作当前错误；普通搜索排序与后台非构建任务保持自己的 quickfix 行为。不新增 timer。
+
+**Validation**
+- ue_build 16/16（含真正终端 parser/完成回调 5/5、诊断模块 4/4），全绿、0 跳过。
+- 最终源码核查补齐引号 artifact 路径不得冒充源码位置：完成回调追加两例后 7/7 全绿，quoted 上下文仍完整保留。
+- 最终冻结代码全量（native 必需门禁）2484/2484 全绿，0 失败、0 跳过，退出码 0。
+- keymaps 62/62、cheatsheet 159/159、commands 123/123、android_ide 27/27、stability 26/26；ue_api 66/66、ue_platform_boundary 17/17、ue_target_integration 27/27、smoke 19/19、structure 78/78、review_editor 9/9，全绿、0 跳过。
+
+**Follow-ups**
+- 未触发真实 UBT 故意失败或人工验收 GUI 通知；外部可选分布式执行器不在默认终端完成链验收范围。
+
+### 2026-10-03 — clangd 键盘导航入口补齐
+
+**Task**
+- 补调用层级、符号搜索、大纲与类型层级，并让命令中枢可搜索这些操作。
+
+**Implemented**
+- `lua/plugins/ue.lua` 的 clangd keys 声明 cI/cO、ss/sS、cB/cD、ca/cr；code action 同时支持可视模式，均使用 LSP capability 的缓冲区局部映射。
+- `lua/utils/ue_goto/type_hierarchy.lua` 异步 prepareTypeHierarchy 后查询 supertypes/subtypes，保留同 client 的 opaque data，多客户端/类型显式选择，过期请求不交付。`lua/utils/ue_hub.lua` 从原窗口执行真实局部键位。
+- 同步浮动/Markdown cheatsheet 与 `docs/USER_GUIDE.md` 的读代码入口。
+
+**Pitfalls / Gotchas**
+- gco/gcO 属注释键；调用层级使用 cI/cO。Neovim 0.11.5 内建 typehierarchy 只走默认 quickfix，已安装 Snacks 无类型源，因此增加小型 picker 模块，不覆盖全局 LSP handlers。
+- 工作区/类型搜索是显式导航，不参与 gd 的 compiler identity fallback；没有修改 SuperUnity、CDB、prepare 或索引交付。
+- 真实 LazyVim/Snacks 接线验证须放独立子 Neovim：共享 runner 半加载 lazy.nvim 会污染后续主题加载；保留真实局部映射断言，不修改主题实现。
+
+**Validation**
+- keymaps 61/61（含真实 LazyVim/Snacks 附加与全局映射不变），cheatsheet 156/156，commands 122/122，android_ide 27/27，stability 26/26，全绿、0 跳过。
+- review_editor 9/9、smoke 19/19、ue_context 14/14、android_device 17/17、ue_platform_boundary 17/17；cpp_semantic_context 13/13、client 33/33、sidecar 31/31、ue_goto_behavior 90/90、utils 49/49，全绿、0 跳过。
+- 类型层级 21/21，全绿、0 跳过，包含本机真实 clangd 临时 C++ fixture：Derived 的基类 Base 与派生类 Leaf 均由标准请求返回；Unicode selectionRange 经安装的 Snacks 转为字节列，确认时切离源窗口不会跳转。
+- 最终冻结代码全量（native 必需门禁）2484/2484 全绿，0 失败、0 跳过，退出码 0。
+
+**Follow-ups**
+- 未在真实大型 UE 工程人工验收调用层级、重命名/code action、picker 展示与索引覆盖；既有探针失败与完整 SuperUnity 性能缺口保留，未冒充已解决。
+
 ### 2026-10-03 — Git 完整改动集恢复 csearch dirty 溢出
 
 **Task**

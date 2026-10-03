@@ -52,8 +52,8 @@
 
 ### Requirement: `:Tasks` / `:TaskStop` / `:TaskStopAll` 提供统一操作面
 
-`:Tasks`（snacks.picker 双列列表，`status` 列实时求值，`dd` 停止不二次
-确认、空表给可见提示而非空 picker）、`:TaskStop [id]`（无参且唯一运行中
+`:Tasks`（共享底部任务列表，打开/刷新时从句柄求状态，`<CR>` / `dd` 停止不二次
+确认、`r` 刷新，空表给可见提示）、`:TaskStop [id]`（无参且唯一运行中
 任务直接停、多个走选择器）与 `:TaskStopAll`（执行前 MUST 一次性确认，
 确认后取消所有运行中任务并报告数量）SHALL 提供统一的任务操作面。
 
@@ -85,6 +85,10 @@ SHALL 不登记 DAP 适配器会话为可 kill 任务；停止 DAP SHALL 仍走
   真机被调试进程
 
 ## 选型与踩坑
+
+- **选型（2026-10-03）**：任务列表与构建输出、原生 quickfix、logcat 共享每 tab 的底部窗口，
+  只换 buffer，不叠窗口。显式切换/刷新才读取任务状态；不新增轮询，隐藏面板不取消进程。
+  构建退出后保留输出，日志停止仍由原 owner 执行；调试 UI 只能关闭自己当前可见的内容。
 
 - **选型**：状态设计为派生量而非存储副本，是本 capability 的核心架构
   决策：唯一常规写 `tasks` 的入口是 `M.register`（只在创建 job 时调用），

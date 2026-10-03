@@ -82,6 +82,14 @@ t.describe("keymaps: DAP 功能键多模式", function()
 end)
 
 t.describe("keymaps: leader 代表键", function()
+  t.it("<leader>uJ cycles panels from normal and terminal modes", function()
+    for _, mode in ipairs({ "n", "t" }) do
+      t.assert_contains(t.get_keymap(mode, "<leader>uJ").rhs, "UEPanelNext")
+    end
+  end)
+  t.it("<leader>uE → first build error", function()
+    t.assert_contains(t.get_keymap("n", "<leader>uE").rhs, "UEBuildFirstError")
+  end)
   local function rhs_of(mode, lhs)
     local m = t.get_keymap(mode, lhs)
     return m and (m.rhs or "") or nil

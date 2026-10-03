@@ -30,10 +30,14 @@ return {
             -- and cached in g:ueindex_status; this only reads it (no timers).
             local ue_status     = MiniStatusline.is_truncated(90) and "" or (vim.g.ueindex_status or "")
             local debug_state   = require("utils.ue_hub").debug_indicator()
+            local probe_status  = vim.g.ue_probe_status or ""
+            local unsaved       = vim.g.ue_unsaved_status or ""
 
             return MiniStatusline.combine_groups({
               { hl = mode_hl,                  strings = { mode } },
               { hl = "DiagnosticError",        strings = { debug_state } },
+              { hl = "DiagnosticWarn",         strings = { unsaved } },
+              { hl = "MiniStatuslineDevinfo",  strings = { probe_status } },
               { hl = "MiniStatuslineDevinfo",  strings = { git, diff, diagnostics, lsp } },
               "%<", -- truncate from here
               { hl = "MiniStatuslineFilename", strings = { filename } },

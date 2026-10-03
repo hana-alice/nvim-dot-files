@@ -40,6 +40,14 @@ M.actions = {
   { group = "Code", label = "Derived types / 派生类", key = "<leader>cD", run = code_key("<leader>cD") },
   { group = "Code", label = "Rename symbol / 重命名", key = "<leader>cr", run = code_key("<leader>cr") },
   { group = "Code", label = "Code action / 代码操作", key = "<leader>ca", run = code_key("<leader>ca") },
+  { group = "Code", label = "Format safely / 安全格式化", key = "<leader>cf", run = cmd("UEFormat") },
+  { group = "Code", label = "Format with UE style / 用 UE 风格格式化", run = cmd("UEFormat epic") },
+  { group = "Code", label = "Inlay hints / 内联提示开关", key = "<leader>uh", run = function()
+    local mapping = vim.fn.maparg("<leader>uh", "n", false, true)
+    if type(mapping.callback) == "function" then mapping.callback() end
+  end },
+  { group = "Files", label = "Unsaved files / 未保存文件", run = cmd("UEUnsaved") },
+  { group = "Files", label = "Quit with unsaved list / 退出前查看未保存文件", key = "<leader>qq", run = cmd("UEQuit") },
   { group = "Build",  label = "Build active target", key = "<leader>ub", run = cmd("UEBuild") },
   { group = "Build",  label = "First build error / 首个构建错误", key = "<leader>uE", run = cmd("UEBuildFirstError") },
   { group = "Build",  label = "Install app on device", key = "<leader>ui", run = cmd("UEInstall") },

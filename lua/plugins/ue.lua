@@ -3,11 +3,32 @@ return {
     "stevearc/conform.nvim",
     opts = {
       formatters_by_ft = {
-        c = { "clang_format" },
-        cpp = { "clang_format" },
-        objc = { "clang_format" },
-        objcpp = { "clang_format" },
+        c = { "clang_format", lsp_format = "never" },
+        cpp = { "clang_format", lsp_format = "never" },
+        objc = { "clang_format", lsp_format = "never" },
+        objcpp = { "clang_format", lsp_format = "never" },
         hlsl = { "clang_format" },
+      },
+      formatters = {
+        clang_format = {
+          command = function() return require("utils.cpp_format").command() end,
+          prepend_args = function(_, ctx)
+            return require("utils.cpp_format").is_cpp(ctx.buf)
+              and { "--style=file", "--fallback-style=none" } or {}
+          end,
+          condition = function(_, ctx)
+            return not require("utils.cpp_format").is_cpp(ctx.buf)
+              or require("utils.cpp_format").find_config(ctx.buf) ~= nil
+          end,
+        },
+        ue_epic = {
+          inherit = "clang_format",
+          command = function() return require("utils.cpp_format").command() end,
+          condition = function() return true end,
+          prepend_args = function()
+            return { "--style=file:" .. require("utils.cpp_format").template, "--fallback-style=none" }
+          end,
+        },
       },
     },
   },
@@ -16,6 +37,9 @@ return {
     "neovim/nvim-lspconfig",
     opts = function(_, opts)
       opts.servers = opts.servers or {}
+      -- Measured on a 6007-line fixture with a real clangd and external UI.
+      -- Keep LazyVim's buffer-local <leader>uh toggle and bigfile guard.
+      opts.inlay_hints = vim.tbl_deep_extend("force", opts.inlay_hints or {}, { enabled = true })
 
       local clangd = opts.servers.clangd == true and {} or opts.servers.clangd or {}
       local inherited_on_attach = clangd.on_attach

@@ -293,7 +293,10 @@ Source: `lua/plugins/ue.lua` (`gd`, `<leader>ch`),
 | `<leader>sS`     | Live workspace class/function search (clangd) |
 | `<leader>ca`     | Code action (LazyVim)                   |
 | `<leader>cr`     | Rename symbol (LazyVim)                 |
-| `<leader>cf`     | Format buffer or selection (LazyVim)    |
+| `<leader>cf`     | Safe format buffer / selection; C++ needs project style |
+| `:UEFormat epic` | Explicitly use the built-in UE style template |
+| `:UEUnsaved`     | List unsaved buffers and choose one to review |
+| `<leader>qq` / `:UEQuit` | Quit with save-all / review / discard choices |
 | `<leader>cd`     | Line diagnostics (LazyVim)              |
 | `<leader>cl`     | LSP info (LazyVim)                      |
 | `<leader>ss`     | Document symbols (LSP/treesitter)       |

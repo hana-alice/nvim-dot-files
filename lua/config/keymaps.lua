@@ -2,6 +2,16 @@ local map = vim.keymap.set
 local window_title = require("utils.window_title")
 window_title.setup()
 
+map({ "n", "x" }, "<leader>cf", function()
+  local format = require("utils.cpp_format")
+  if not format.is_cpp(0) then return LazyVim.format({ force = true }) end
+  local mode = vim.fn.mode()
+  local range = format.selection()
+  if mode == "\22" then return end
+  if range then vim.cmd.normal({ args = { "\27" }, bang = true }) end
+  format.format({ range = range })
+end, { desc = "Format safely (工程风格 / 选区)" })
+
 local function live_grep_with(opts)
   return function()
     LazyVim.pick.open("live_grep", vim.deepcopy(opts or {}))
@@ -328,6 +338,7 @@ vim.api.nvim_create_user_command("RestartDetect", function()
 end, { desc = "Print restart plan without acting (debug)" })
 
 map("n", "<leader>qr", "<cmd>Restart<cr>", { desc = "Quit: Restart Neovim in cwd" })
+map("n", "<leader>qq", "<cmd>UEQuit<cr>", { desc = "退出（查看未保存文件）" })
 
 -- Windows-style paste in cmdline (`:` / `/` / `?`) and insert mode.
 -- Default Ctrl+V in cmdline is "literal-insert next key" (rarely useful);

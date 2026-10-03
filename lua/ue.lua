@@ -9206,6 +9206,9 @@ function M.setup()
   end
   CORE_RT.setup_done = true
 
+  require("utils.cpp_format").setup()
+  require("utils.unsaved").setup()
+
   vim.g.ueindex_status = vim.g.ueindex_status or ""
   vim.g.ue_build_status = vim.g.ue_build_status or ""
 

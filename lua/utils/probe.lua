@@ -471,6 +471,21 @@ function M.pending_summary()
   return { topics = topics, records = records, unread = unread, unresolved = unresolved, dormant = dormant }
 end
 
+-- Presentation only: never acknowledge or resolve evidence by displaying it.
+function M.startup_notice()
+  local s = M.pending_summary()
+  vim.g.ue_probe_status = ""
+  if s.unread == 0 and s.dormant == 0 then return end
+  local message = ("维护者诊断记录：%d 未读 / %d 待处置 / %d 观察已结束；可忽略。:UEProbeReport")
+    :format(s.unread, s.unresolved, s.dormant)
+  if require("ue.config").get("probe.startup_notice") == "statusline" then
+    vim.g.ue_probe_status = ("维护诊断:%d未读（可忽略）"):format(s.unread)
+    vim.cmd("redrawstatus")
+  else
+    vim.notify(message, vim.log.levels.INFO, { title = "维护者诊断（可忽略）", timeout = 3000 })
+  end
+end
+
 -- ── commands ───────────────────────────────────────────────────────────────
 function M.setup()
   ensure_persistence()
@@ -487,6 +502,7 @@ function M.setup()
     vim.api.nvim_win_set_height(win, math.min(#lines + 1, 20))
     vim.keymap.set("n", "q", "<cmd>close<cr>", { buffer = buf, nowait = true })
     M.acknowledge()
+    vim.g.ue_probe_status = ""
   end, { desc = "Probe: show evidence report (read this FIRST, fix findings)" })
 
   vim.api.nvim_create_user_command("UEProbeArm", function(a)

@@ -493,6 +493,7 @@ return {
         enabled = false,
         replace_netrw = false,
       })
+      require("workarounds.snacks.safe_buffer_delete").apply()
       -- Disable snacks.scroll smooth-scroll animation.
       -- Reason: when ue_goto/jumper.lua does a cross-buffer jump and lands at
       -- a target line far from the buffer's last cursor position (e.g. gd from
@@ -534,6 +535,7 @@ return {
         opts.picker.sources[source] = require("utils.file_query").options(opts.picker.sources[source])
         opts.picker.sources[source].format = require("utils.search_ui").format
       end
+      require("workarounds.snacks.safe_file_actions").apply(opts)
 
       -- Workaround: snacks projects picker freezes for ~30s on UE workspaces
       -- (oldfiles walk + per-entry git spawn on main loop). See

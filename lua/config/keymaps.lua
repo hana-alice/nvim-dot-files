@@ -116,7 +116,7 @@ local function open_symbol_picker(opts)
     local buf = vim.api.nvim_get_current_buf()
     local has_lsp = #vim.lsp.get_clients({ bufnr = buf, method = "textDocument/documentSymbol" }) > 0
     if has_lsp then
-      return snacks.picker.lsp_symbols(picker_opts)
+      return require("utils.document_symbols").open(picker_opts)
     end
 
     -- No LSP client supports documentSymbol yet — use treesitter

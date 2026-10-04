@@ -658,7 +658,11 @@ local function direct_os_probe(parsed, node)
       "direct OS probing belongs to host platform drivers only"
     )
   end
-  if node:type() == "dot_index_expression" and dot_text(node, parsed.buf) == "jit.os" then
+  if node:type() == "dot_index_expression" then
+    local name = dot_text(node, parsed.buf)
+    if name ~= "jit.os" and name ~= "ffi.os" then
+      return nil
+    end
     return make_violation(
       RULES.direct_os_probe,
       parsed,
@@ -744,6 +748,22 @@ local function target_literal_condition(parsed, node)
   local value = binary_uses_target_literal(node, parsed.buf)
   if not value then
     return nil
+  end
+  -- LuaJIT's host name Linux also names a UE target. Only a qualified OS
+  -- probe in a host owner is host selection; ordinary target tests stay banned.
+  if parsed.owner_kind == "host_owner" and node:type() == "binary_expression" then
+    local left, right = node:named_child(0), node:named_child(1)
+    local function host_linux(probe, literal)
+      if not probe or not literal or probe:type() ~= "dot_index_expression" or literal:type() ~= "string" then
+        return false
+      end
+      local name = dot_text(probe, parsed.buf)
+      return (name == "ffi.os" or name == "jit.os")
+        and string_value(vim.treesitter.get_node_text(literal, parsed.buf)) == "Linux"
+    end
+    if host_linux(left, right) or host_linux(right, left) then
+      return nil
+    end
   end
   return make_violation(
     RULES.target_literal_condition,

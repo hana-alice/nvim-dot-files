@@ -92,7 +92,7 @@ return {
             desc = "Incoming calls (谁调用了它)", has = "prepareCallHierarchy" },
           { "<leader>cO", function() require("utils.ue_goto.reading").calls("outgoing") end,
             desc = "Outgoing calls (它调用了谁)", has = "prepareCallHierarchy" },
-          { "<leader>ss", function() require("snacks").picker.lsp_symbols({ tree = true }) end,
+          { "<leader>ss", function() require("utils.document_symbols").open({ tree = true }) end,
             desc = "Document symbols (当前文件大纲)", has = "documentSymbol" },
           { "<leader>sS", function() require("snacks").picker.lsp_workspace_symbols({ live = true }) end,
             desc = "Workspace symbols (类 / 函数)", has = "workspace/symbol" },

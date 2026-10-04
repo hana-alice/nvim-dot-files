@@ -22,6 +22,8 @@ fail-closed 语义），禁止注入假可执行文件/假宿主让断言「碰�
 | IDE 运行配置、Editor 测试与模块类生成 | `ide_workflow` `ide_run_profiles` `ide_ue_tools` `ide_hub` `platform` `commands` |
 | picker 交互 / sidebar / 插件工具链策略 | `review_editor` `smoke` |
 | 窗口关闭后的恢复 / 被动保存 quickfix | `ide_workspace` `task_registry` `keymaps` `commands` `android_ide` |
+| 文件树改名/移动/删除 / 受保护的缓冲区关闭 | `ide_file_mutations` `ide_buffer_close` `unsaved` `ide_workspace` `task_registry` `keymaps` `workarounds` `smoke` |
+| 代码片段字段 / 当前文件大纲 | `ide_editing_feedback` `daily_edit` `ue_goto_reading` `review_editor` `keymaps` `workarounds` `smoke` |
 | 搜索状态 / 路径坐标 / 完整搜索条件 / 独立文件清单 | `search_` `file_inventory` `grep_cache` `multi_instance_state` `ue_platform_boundary` |
 | 引用 / header / 显式 Peek / 按需关系树 | `ue_goto_reading` `ue_goto_relations` `ue_goto_behavior` `cpp_semantic_context` `cpp_semantic_client` `cpp_semantic_sidecar` `utils` |
 | Git 审阅路由 / Git 插件接线 / `lua/workarounds/codediff/**` | `git_review` `review_editor` `keymaps` `cheatsheet` `workarounds` `smoke` |

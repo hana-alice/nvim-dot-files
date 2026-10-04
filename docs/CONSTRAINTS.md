@@ -1017,6 +1017,15 @@
   适配层保留选中项、仓库和刷新语义，转交共享审阅路由创建 v4 会话和处理根提交。
   → `lua/workarounds/neogit/codediff_v4.lua`；`tests/cases/git_review_neogit_spec.lua`。
 
+### 文件操作与大纲
+
+- **Snacks 关闭确认与卸载回调会继续处理新编辑**：放弃仅授权原版本；确认和窗口交接后复验，
+  原生卸载阶段新增文本须保留为可检查的缓冲区。→ `lua/workarounds/snacks/safe_buffer_delete.lua`。
+- **Snacks 文件树改名/删除会强制卸载文本，普通 rename 可覆盖目标**：保护脏文件及已加载子文件，
+  使用宿主独占移动和隔离后回收，保持文本归属。→ `lua/workarounds/snacks/safe_file_actions.lua`。
+- **Snacks 文件大纲接受旧坐标，键控请求表不能用数组方式取消**：绑定来源版本、实际 request ID
+  和确认过程，保留原生层级。→ `lua/workarounds/snacks/document_symbols_owner.lua`。
+
 ### goto-def / cursor
 
 - **K25 — 跨 buffer 跳转 cursor 漂移**

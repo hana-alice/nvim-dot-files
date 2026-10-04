@@ -196,6 +196,15 @@
 
 ### 2.1 状态归属清单
 
+日常文件修改由 `utils/file_mutations*.lua` 统一拥有，Snacks 文件树只通过隔离补丁接线。
+宿主驱动提供工作池中的独占移动；删除先隔离对象，再回收该路径，已打开的文本保留。
+`safe_buffer_close.lua` 保护确认、保存和窗口交接；原生卸载回调产生的新文本恢复为未命名脏缓冲区。
+这些操作不接管任务停止或全局窗口恢复。
+
+当前文件大纲由 `document_symbols.lua` 绑定阅读 owner，并沿用 Snacks 原生符号树；
+迟到坐标在发布和确认前复验，关闭取消实际在途请求。Blink 活跃片段先跳字段，
+Noice 继续拥有自动参数签名。命令中枢复用真实映射回调，并保护来源窗口、文本与目标身份。
+
 | 作用域 | 当前状态 | 多实例语义 |
 |---|---|---|
 | 当前 Neovim 进程 | project/target live selection、Android serial (`vim.g`)、活跃 DAP/build/task、statusline、window title、notification history | 不读取其他实例的 live 值；长任务在启动时捕获设备/项目 |

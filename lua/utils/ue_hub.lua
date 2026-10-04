@@ -11,27 +11,46 @@ local function trim(value)
   return (tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
-local function cmd(name) return function() vim.cmd(name) end end
+local command_names = setmetatable({}, { __mode = "k" })
+local function cmd(name)
+  local run = function()
+    vim.cmd(name)
+  end
+  command_names[run] = name
+  return run
+end
+
+local function mapped_key(key)
+  return function()
+    local mapping = vim.fn.maparg(key, "n", false, true)
+    if type(mapping.callback) == "function" then
+      return mapping.callback()
+    end
+    vim.notify("当前入口未就绪: " .. key, vim.log.levels.WARN)
+  end
+end
 
 -- Reuse the attached buffer's actual key callback, including capability guards.
 -- A hub picker may change the current buffer; capture its source window first.
 local function code_key(key)
+  local run = mapped_key(key)
   return function()
     if #vim.lsp.get_clients({ bufnr = 0, name = "clangd" }) == 0 then
       vim.notify("C++ 导航需要当前文件已附加 clangd", vim.log.levels.WARN)
       return
     end
-    local mapping = vim.fn.maparg(key, "n", false, true)
-    if type(mapping.callback) == "function" then return mapping.callback() end
-    vim.notify("当前 clangd 未提供此动作: " .. key, vim.log.levels.WARN)
+    return run()
   end
 end
 
---- Generic actions: { group, label, key?, run }. Target-specific actions and
+--- Generic actions: { group, label, key?, command?, method?, clangd_only?, run }. Target-specific actions and
 --- fields come from the active target driver's declarative `hub(state)`.
 M.actions = {
   { group = "Run",    label = "Run / debug current target (F5 when idle)", key = "<F5>", target_fields = true, run = function() M.run_or_debug() end },
   { group = "Run",    label = "Launch app (no debugger)", key = "<leader>ul", target_fields = true, run = cmd("UELaunch") },
+  { group = "Code", label = "Go to definition / 跳到定义", key = "gd", run = mapped_key("gd") },
+  { group = "Code", label = "References / 查看引用", key = "gr", run = mapped_key("gr") },
+  { group = "Code", label = "Switch source / header / 切换头文件源文件", key = "<leader>ch", run = code_key("<leader>ch") },
   { group = "Code", label = "Incoming calls / 谁调用了它", key = "<leader>cI", run = code_key("<leader>cI") },
   { group = "Code", label = "Outgoing calls / 它调用了谁", key = "<leader>cO", run = code_key("<leader>cO") },
   { group = "Code", label = "Workspace symbols / 类名、函数名", key = "<leader>sS", run = code_key("<leader>sS") },
@@ -41,10 +60,10 @@ M.actions = {
   { group = "Read", label = "Peek definition / 预览定义并保留上下文", run = cmd("UEPeek") },
   { group = "Read", label = "Return to investigation origin / 返回调查起点", run = cmd("UEReadReturn") },
   { group = "Read", label = "Cancel reading request / 取消待返回的阅读请求", run = cmd("UEReadCancel") },
-  { group = "Read", label = "Browse incoming calls / 连续浏览调用者", run = cmd("UERelations incoming") },
-  { group = "Read", label = "Browse outgoing calls / 连续浏览调用目标", run = cmd("UERelations outgoing") },
-  { group = "Read", label = "Browse base types / 连续浏览基类", run = cmd("UERelations base") },
-  { group = "Read", label = "Browse derived types / 连续浏览派生类", run = cmd("UERelations derived") },
+  { group = "Read", label = "Browse incoming calls / 连续浏览调用者", method = "textDocument/prepareCallHierarchy", clangd_only = true, run = cmd("UERelations incoming") },
+  { group = "Read", label = "Browse outgoing calls / 连续浏览调用目标", method = "textDocument/prepareCallHierarchy", clangd_only = true, run = cmd("UERelations outgoing") },
+  { group = "Read", label = "Browse base types / 连续浏览基类", method = "textDocument/prepareTypeHierarchy", clangd_only = true, run = cmd("UERelations base") },
+  { group = "Read", label = "Browse derived types / 连续浏览派生类", method = "textDocument/prepareTypeHierarchy", clangd_only = true, run = cmd("UERelations derived") },
   { group = "Read", label = "Resume relationship browser / 找回上次关系浏览", run = cmd("UERelations resume") },
   { group = "Code", label = "Rename symbol / 重命名", key = "<leader>cr", run = code_key("<leader>cr") },
   { group = "Code", label = "Code action / 代码操作", key = "<leader>ca", run = code_key("<leader>ca") },
@@ -62,17 +81,13 @@ M.actions = {
   { group = "Files", label = "Recover unsaved text / 恢复异常退出的未保存文本", run = cmd("UERecovery") },
   { group = "Files", label = "Quit with unsaved list / 退出前查看未保存文件", key = "<leader>qq", run = cmd("UEQuit") },
   { group = "Search", label = "Indexed code search / 快速索引搜索", key = "<leader>/", run = function() require("ue").cached_grep() end },
-  { group = "Search", label = "Explicit rg code search / 独立代码搜索", key = "<leader>sg", run = function()
-    local mapping = vim.fn.maparg("<leader>sg", "n", false, true)
-    if type(mapping.callback) == "function" then return mapping.callback() end
-    vim.notify("搜索入口未就绪: <leader>sg", vim.log.levels.WARN)
-  end },
-  { group = "Search", label = "Project files / 查找项目文件", key = "<leader>ff", requires = { "project" }, run = function()
-    local options = require("ue").picker_project_options()
-    if not options then vim.notify("项目文件搜索上下文未就绪", vim.log.levels.WARN); return end
-    require("snacks").picker.files(options)
-  end },
+  { group = "Search", label = "Explicit rg code search / 独立代码搜索", key = "<leader>sg", run = mapped_key("<leader>sg") },
+  { group = "Search", label = "Explicit rg text search / 搜索未索引的全部文本", key = "<leader>sG", run = mapped_key("<leader>sG") },
+  { group = "Search", label = "Workspace all files / 查找工程和引擎全部文件", key = "<leader><space>", run = mapped_key("<leader><space>") },
+  { group = "Search", label = "Project files / 查找项目文件", key = "<leader>ff", requires = { "project" }, run = mapped_key("<leader>ff") },
   { group = "Search", label = "Search history / 按原条件重新搜索", key = "<leader>sH", run = cmd("UESearchHistory") },
+  { group = "Search", label = "Resume last search / 恢复最近搜索", key = "<leader>s/", run = mapped_key("<leader>s/") },
+  { group = "Search", label = "History hub / 搜索文件跳转与结果历史", key = "<leader>fh", run = mapped_key("<leader>fh") },
   { group = "Windows", label = "Find or recover a window / 找回关闭的窗口", key = "<leader>wM", run = cmd("UEWorkspace") },
   { group = "Windows", label = "Visible windows across tabs / 跨标签窗口", run = cmd("UEWorkspace windows") },
   { group = "Windows", label = "Hidden buffers / 窗口关闭后保留的文件", run = cmd("UEWorkspace buffers") },
@@ -116,6 +131,10 @@ M.actions = {
   { group = "Help",   label = "User guide / 使用手册（日常流程、按键、排障）", key = "<leader>u?", run = function() M.open_guide() end },
 }
 
+for _, action in ipairs(M.actions) do
+  action.command = command_names[action.run]
+end
+
 local function target_hub(target)
   local driver = require("ue.targets").driver(target.platform)
   if driver and type(driver.hub) == "function" then
@@ -134,6 +153,7 @@ local CODE_METHODS = {
   ["<leader>cD"] = "textDocument/prepareTypeHierarchy",
   ["<leader>cr"] = "textDocument/rename",
   ["<leader>ca"] = "textDocument/codeAction",
+  ["<leader>ch"] = "textDocument/switchSourceHeader",
 }
 
 -- Selection readiness is not proof of device, symbol or full-index health.
@@ -141,11 +161,16 @@ local CODE_METHODS = {
 function M.action_state(action, target, opts)
   opts = opts or {}
   local dap = package.loaded["dap"]
-  if action.key == "<F5>" and dap and dap.session and dap.session() then return { ready = true } end
-  if action.always then return { ready = true } end
-  local requirements = action.requires or
-    ((action.group == "Build" or action.group == "Run" or action.group == "Debug")
-      and { "project", "platform" } or {})
+  if action.key == "<F5>" and dap and dap.session and dap.session() then
+    return { ready = true }
+  end
+  if action.always then
+    return { ready = true }
+  end
+  local requirements = action.requires
+    or (
+      (action.group == "Build" or action.group == "Run" or action.group == "Debug") and { "project", "platform" } or {}
+    )
   for _, requirement in ipairs(requirements) do
     if requirement == "project" and not target.project then
       return { ready = false, reason = "缺工程", fix = "UESetProject" }
@@ -155,7 +180,9 @@ function M.action_state(action, target, opts)
   end
   if action.target_fields then
     local contribution = opts.contribution or target_hub(target)
-    for _, name in ipairs(action.target_fields == true and (contribution.runtime_requires or {}) or action.target_fields) do
+    for _, name in
+      ipairs(action.target_fields == true and (contribution.runtime_requires or {}) or action.target_fields)
+    do
       for _, field in ipairs(contribution.fields or {}) do
         if field.name == name and not field.value then
           return { ready = false, reason = "缺 " .. (field.label or name), fix = field.command or "UEDoctor" }
@@ -163,17 +190,28 @@ function M.action_state(action, target, opts)
       end
     end
   end
-  local method = CODE_METHODS[action.key]
+  local method = action.method or CODE_METHODS[action.key]
   if method then
-    local clients = opts.clients or vim.lsp.get_clients({ bufnr = opts.buf or 0, name = "clangd" })
+    local clients = opts.clients
+      or vim.lsp.get_clients({ bufnr = opts.buf or 0, name = not action.method and "clangd" or nil })
     for _, client in ipairs(clients) do
-      if client:supports_method(method, opts.buf or 0) then return { ready = true } end
+      -- Match reading.choose_client(..., true), which UERelations uses.
+      if
+        (not action.clangd_only or tostring(client.name):lower():find("clangd", 1, true))
+        and client:supports_method(method, opts.buf or 0)
+      then
+        return { ready = true }
+      end
     end
-    return { ready = false, reason = #clients == 0 and "当前文件 clangd 未就绪" or "clangd 不支持此操作", fix = "UEDoctor" }
+    return {
+      ready = false,
+      reason = action.method and "当前位置没有支持此操作的提供者"
+        or (#clients == 0 and "当前文件 clangd 未就绪" or "clangd 不支持此操作"),
+      fix = "UEDoctor",
+    }
   end
   return { ready = true }
 end
-
 --- Current target snapshot from persisted state.
 function M.target(opts)
   opts = opts or {}
@@ -197,27 +235,33 @@ end
 
 --- Actions visible for a target: target-owned actions join their groups
 --- after the generic ones.
-function M.visible_actions(target)
+function M.visible_actions(target, opts)
+  opts = opts or {}
   local out = {}
   local contribution = target_hub(target)
-  for _, action in ipairs(M.actions) do out[#out + 1] = vim.tbl_extend("force", {}, action) end
+  for _, action in ipairs(M.actions) do
+    out[#out + 1] = vim.tbl_extend("force", {}, action)
+  end
   for _, action in ipairs(contribution.actions or {}) do
     out[#out + 1] = vim.tbl_extend("force", {}, action, { run = cmd(action.command) })
   end
   for _, action in ipairs(out) do
-    action.readiness = M.action_state(action, target, { contribution = contribution })
+    action.readiness = M.action_state(action, target, { contribution = contribution, buf = opts.buf })
   end
   local first, rank = {}, {}
   for index, action in ipairs(out) do
     first[action.group] = first[action.group] or index
     rank[action] = first[action.group] * 1000 + index
   end
-  table.sort(out, function(x, y) return rank[x] < rank[y] end)
+  table.sort(out, function(x, y)
+    return rank[x] < rank[y]
+  end)
   return out
 end
 
 function M.format_action(action)
-  local key = action.key and ("  " .. action.key) or ""
+  local shortcut = action.key or (action.command and (":" .. action.command))
+  local key = shortcut and ("  " .. shortcut) or ""
   local state = action.readiness
   local readiness = state and not state.ready and ("  [" .. state.reason .. "]") or ""
   return ("%-7s %s%s%s"):format(action.group, action.label, key, readiness)
@@ -236,10 +280,13 @@ local function runtime_identity(target)
 end
 
 local function source_valid(pending)
-  return pending.epoch == intent_epoch and vim.api.nvim_win_is_valid(pending.win)
+  return pending.epoch == intent_epoch
+    and vim.api.nvim_win_is_valid(pending.win)
     and vim.api.nvim_win_get_buf(pending.win) == pending.buf
     and vim.api.nvim_buf_get_name(pending.buf) == pending.name
     and vim.api.nvim_buf_get_changedtick(pending.buf) == pending.tick
+    and (not pending.tab or vim.api.nvim_win_get_tabpage(pending.win) == pending.tab)
+    and (not pending.cursor or vim.deep_equal(vim.api.nvim_win_get_cursor(pending.win), pending.cursor))
 end
 
 -- Called after an explicit, successful selection. The user confirms continuing
@@ -276,28 +323,65 @@ function M.invoke_action(action, opts)
   intent_epoch = intent_epoch + 1
   pending_action = nil
   local win = opts.source_win or vim.api.nvim_get_current_win()
-  if not vim.api.nvim_win_is_valid(win) then return end
+  if not vim.api.nvim_win_is_valid(win) then
+    return
+  end
   local buf = vim.api.nvim_win_get_buf(win)
   local epoch, tick, name = intent_epoch, vim.api.nvim_buf_get_changedtick(buf), vim.api.nvim_buf_get_name(buf)
+  local source = {
+    epoch = epoch,
+    win = win,
+    buf = buf,
+    tick = tick,
+    name = name,
+    tab = vim.api.nvim_win_get_tabpage(win),
+    cursor = vim.api.nvim_win_get_cursor(win),
+  }
   local target = opts.target or M.target()
   local state = M.action_state(action, target, { buf = buf })
   if state.ready then
     vim.api.nvim_set_current_win(win)
+    if
+      not source_valid(source)
+      or vim.api.nvim_get_current_win() ~= win
+      or not vim.deep_equal(opts.target or M.target(), target)
+    then
+      return
+    end
     return action.run()
   end
   vim.ui.select({ "配置/检查：" .. state.fix, "取消" }, {
     prompt = state.reason .. " — " .. action.label,
   }, function(choice)
-    if not choice or choice == "取消" or epoch ~= intent_epoch
-        or not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= buf
-        or vim.api.nvim_buf_get_name(buf) ~= name
-        or vim.api.nvim_buf_get_changedtick(buf) ~= tick then return end
-    local pending = { action = action, win = win, buf = buf, name = name,
-      epoch = epoch, tick = tick, project = target.project,
-      project_root = target.project_root, engine_root = target.engine_root }
+    if
+      not choice
+      or choice == "取消"
+      or epoch ~= intent_epoch
+      or not vim.api.nvim_win_is_valid(win)
+      or vim.api.nvim_win_get_buf(win) ~= buf
+      or vim.api.nvim_buf_get_name(buf) ~= name
+      or vim.api.nvim_buf_get_changedtick(buf) ~= tick
+    then
+      return
+    end
+    local pending = {
+      action = action,
+      win = win,
+      buf = buf,
+      name = name,
+      epoch = epoch,
+      tick = tick,
+      project = target.project,
+      project_root = target.project_root,
+      engine_root = target.engine_root,
+    }
     pending_action = pending
     -- A single bounded expiry, not polling. It never invokes the action.
-    vim.defer_fn(function() if pending_action == pending then pending_action = nil end end, 60000)
+    vim.defer_fn(function()
+      if pending_action == pending then
+        pending_action = nil
+      end
+    end, 60000)
     vim.api.nvim_set_current_win(win)
     vim.cmd(state.fix)
   end)
@@ -308,30 +392,72 @@ local function pick(items, prompt, format, on_choice)
   if ok and snacks.picker then
     return snacks.picker.pick({
       title = prompt,
-      items = vim.tbl_map(function(item) return { text = format(item), data = item } end, items),
+      items = vim.tbl_map(function(item)
+        return { text = format(item), data = item }
+      end, items),
       format = "text",
       preview = "none",
       layout = { preset = "vscode" },
       confirm = function(picker, choice)
-        picker:close()
-        if choice then vim.schedule(function() on_choice(choice.data) end) end
+        if picker.closed then
+          return
+        end
+        local closed, err = pcall(picker.close, picker)
+        if not closed then
+          vim.notify("未能关闭动作列表，操作已取消: " .. tostring(err), vim.log.levels.WARN)
+          return
+        end
+        if choice then
+          vim.schedule(function()
+            on_choice(choice.data)
+          end)
+        end
       end,
     })
   end
   vim.ui.select(items, { prompt = prompt, format_item = format }, function(choice)
-    if choice then on_choice(choice) end
+    if choice then
+      on_choice(choice)
+    end
   end)
 end
 
 --- Searchable hub: grouped actions with their keys shown for learning.
 function M.command_hub()
+  intent_epoch = intent_epoch + 1
+  pending_action = nil
   local target = M.target()
   local source_win = vim.api.nvim_get_current_win()
-  pick(M.visible_actions(target), "UE  " .. M.target_summary(target), M.format_action,
+  local source_buf = vim.api.nvim_win_get_buf(source_win)
+  local source = {
+    epoch = intent_epoch,
+    win = source_win,
+    buf = source_buf,
+    name = vim.api.nvim_buf_get_name(source_buf),
+    tick = vim.api.nvim_buf_get_changedtick(source_buf),
+    tab = vim.api.nvim_get_current_tabpage(),
+    cursor = vim.api.nvim_win_get_cursor(source_win),
+  }
+  local runtime = runtime_identity(target)
+  return pick(
+    M.visible_actions(target, { buf = source_buf }),
+    "UE  " .. M.target_summary(target),
+    M.format_action,
     function(action)
-      if not vim.api.nvim_win_is_valid(source_win) then return end
+      if
+        not source_valid(source)
+        or vim.api.nvim_get_current_win() ~= source_win
+        or vim.api.nvim_get_current_tabpage() ~= source.tab
+      then
+        return
+      end
+      local current = M.target()
+      if not vim.deep_equal(current, target) or not vim.deep_equal(runtime_identity(current), runtime) then
+        return
+      end
       M.invoke_action(action, { source_win = source_win })
-    end)
+    end
+  )
 end
 
 function M.target_summary(target)

@@ -580,4 +580,65 @@ function M.ue_editor_test_plan(spec)
   return { argv = argv, cwd = vim.fs.dirname(project), report_dir = spec.report_dir, log_path = spec.log_path }
 end
 
+-- No upvalues/editor APIs: luv executes this in an independent Lua state.
+local function exclusive_move_worker(from, to)
+  local invoked, ok, err = pcall(function()
+    local ffi = require("ffi")
+    if ffi.os ~= "Windows" then
+      return false, "Windows native no-replace move is unavailable on this host"
+    end
+    from, to = from:gsub("/", "\\"), to:gsub("/", "\\")
+    local function absolute(path)
+      return path:match("^%a:\\") or path:match("^\\\\[^\\]+\\[^\\]+")
+    end
+    if not absolute(from) or not absolute(to) then
+      return false, "Native no-replace move requires absolute paths"
+    end
+    ffi.cdef([[
+      int __stdcall MultiByteToWideChar(unsigned int, unsigned long,
+        const char *, int, uint16_t *, int);
+      int __stdcall MoveFileExW(const uint16_t *, const uint16_t *, unsigned long);
+      unsigned long __stdcall GetLastError(void);
+    ]])
+    local kernel = ffi.load("kernel32")
+    local function wide(path)
+      local length = kernel.MultiByteToWideChar(65001, 8, path, #path, nil, 0)
+      if length == 0 then
+        return nil, "UTF-8 path conversion failed (Win32 error " .. tonumber(kernel.GetLastError()) .. ")"
+      end
+      if length > 32766 then
+        return nil, "UTF-8 path exceeds the native Windows length limit"
+      end
+      local buffer = ffi.new("uint16_t[?]", length + 1)
+      if kernel.MultiByteToWideChar(65001, 8, path, #path, buffer, length) ~= length then
+        return nil, "UTF-8 path conversion failed (Win32 error " .. tonumber(kernel.GetLastError()) .. ")"
+      end
+      return buffer
+    end
+    local source, source_err = wide(from)
+    if not source then
+      return false, source_err
+    end
+    local target, target_err = wide(to)
+    if not target then
+      return false, target_err
+    end
+    -- Flags zero disables both replacement and cross-volume copy/delete.
+    -- MoveFileW alone permits cross-volume file moves.
+    if kernel.MoveFileExW(source, target, 0) ~= 0 then
+      return true
+    end
+    return false, "MoveFileExW failed (Win32 error " .. tonumber(kernel.GetLastError()) .. ")"
+  end)
+  if not invoked then
+    return false, "Native no-replace move unavailable: " .. tostring(ok)
+  end
+  return ok, err
+end
+
+-- Atomic destination refusal; source identity is the caller's responsibility.
+function M.rename_no_replace(from, to, callback)
+  return require("utils.platform.exclusive_move").rename(exclusive_move_worker, from, to, callback)
+end
+
 return M

@@ -21,6 +21,7 @@ end
 -- exemptions are deliberately impossible.
 local SPAWN_AUDIT = {
   { p="lua/utils/search_process.lua", api="spawn", a="local handle, spawn_err = uv.spawn", class="foreground", reason="single explicit grep query with bounded reader, owned abort and stderr status", guard="foreground_begin" },
+  { p="lua/utils/document_find_process.lua", api="vim.system", a="local system = vim.system", class="foreground", reason="single document snapshot query with bounded stdin, streamed output, owned cancellation and explicit partial status", guard="foreground_begin" },
   { p="lua/utils/file_inventory.lua", api="vim.system", a="pcall(vim.system, plan.command", class="foreground", reason="explicit single-thread fd inventory with owned cancellation and bounded cache; no background polling", guard="foreground_begin" },
   { p="lua/utils/file_mutations_trash.lua", api="vim.system", a="local ok, handle = pcall(vim.system, argv", class="foreground", reason="one explicit trash child for an already quarantined object; bounded timeout, handle-derived task state and once-only foreground release", guard="foreground_begin" },
   { p="lua/ue/editor_tests.lua", api="vim.system", a="pcall(opts.system or vim.system", class="foreground", reason="one explicit Editor automation worker; frozen project, bounded list/run timeout and owned cancellation", guard="foreground_begin" },

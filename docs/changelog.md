@@ -80,6 +80,8 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v2.3.2` → [docs/release_2.3.2.md](release_2.3.2.md) (navigation and editing entry fixes; tag pending)
 
+- `v2.4.0` → [docs/release_2.4.0.md](release_2.4.0.md) (memory document find and editor reuse; tag pending)
+
 ## Unreleased
 
-本轮已归档到 [2.3.2](release_2.3.2.md)。
+本轮已归档到 [2.4.0](release_2.4.0.md)。

@@ -1,6 +1,8 @@
 return {
   {
     "folke/trouble.nvim",
+    -- Keep config.keymaps' native quickfix route after the first lazy load.
+    keys = { { "[q", false }, { "]q", false } },
     opts = function(_, opts)
       opts = opts or {}
       local function sidebar_mode(mode)

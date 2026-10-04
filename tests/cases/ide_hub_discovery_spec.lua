@@ -78,7 +78,12 @@ local function picker_fixture(check)
       return ran_buf
     end
     source.finish = function(close, choice)
-      local picker = { close = close or function() end }
+      local picker = {
+        close = close or function() end,
+        norm = function(_, callback)
+          callback()
+        end,
+      }
       picker_options.confirm(picker, choice ~= false and { data = action } or nil)
       local drained = false
       vim.schedule(function()
@@ -425,6 +430,33 @@ t.describe("ide_hub discovery: native window ownership during picker close", fun
     end
   end)
 
+  t.it("closing the picker during normal-mode handoff cancels the pending action", function()
+    picker_fixture(function(f)
+      local handoff, closes = nil, 0
+      local picker = {
+        norm = function(_, callback)
+          handoff = callback
+        end,
+        close = function()
+          closes = closes + 1
+        end,
+      }
+      f.options().confirm(picker, { data = f.action })
+      t.assert_type(handoff, "function")
+      picker.closed = true
+      assert(handoff)()
+      local drained = false
+      vim.schedule(function()
+        drained = true
+      end)
+      t.assert_true(vim.wait(1000, function()
+        return drained
+      end, 5))
+      t.assert_eq(closes, 0)
+      t.assert_eq(f.runs(), 0)
+    end)
+  end)
+
   t.it("rejects close callbacks and queued edits that change the source", function()
     for _, timing in ipairs({ "close", "queued" }) do
       picker_fixture(function(f)
@@ -477,7 +509,12 @@ t.describe("ide_hub discovery: native window ownership during picker close", fun
     picker_fixture(function(f)
       local old = f.options()
       f.open()
-      old.confirm({ close = function() end }, { data = f.action })
+      old.confirm({
+        close = function() end,
+        norm = function(_, callback)
+          callback()
+        end,
+      }, { data = f.action })
       local drained = false
       vim.schedule(function()
         drained = true

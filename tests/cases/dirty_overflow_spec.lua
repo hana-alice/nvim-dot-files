@@ -17,18 +17,24 @@ local function with_watchers(fn)
     instances[#instances + 1] = watch
     return watch, dir .. "/dirty.json", dir
   end
-  local ok, err = xpcall(function() fn(open) end, debug.traceback)
+  local ok, err = xpcall(function()
+    fn(open)
+  end, debug.traceback)
   for _, watch in ipairs(instances) do
     watch._set_opts_for_test(nil)
   end
   package.loaded["utils.ue_watch"] = original
   vim.fn.delete(root, "rf")
-  if not ok then error(err) end
+  if not ok then
+    error(err)
+  end
 end
 
 local function flood(watch, dir)
   local files = {}
-  for i = 1, 1100 do files[i] = ("%s/Source/f%04d.cpp"):format(dir, i) end
+  for i = 1, 1100 do
+    files[i] = ("%s/Source/f%04d.cpp"):format(dir, i)
+  end
   watch._seed_persistent_dirty_for_test(files)
   watch._save_persistent_dirty_for_test()
 end
@@ -137,10 +143,14 @@ t.describe("dirty overflow survives owner lifetime", function()
       local before = table.concat(vim.fn.readfile(path), "\n")
       local rename, defer = vim.uv.fs_rename, vim.defer_fn
       vim.uv.fs_rename = function(source, destination)
-        if destination == path .. ".overflow" then return nil, "injected marker publication failure" end
+        if destination == path .. ".overflow" then
+          return nil, "injected marker publication failure"
+        end
         return rename(source, destination)
       end
-      vim.defer_fn = function() return { stop = function() end, close = function() end } end
+      vim.defer_fn = function()
+        return { stop = function() end, close = function() end }
+      end
       local ok, err = xpcall(function()
         flood(watch, dir)
         t.assert_eq(table.concat(vim.fn.readfile(path), "\n"), before)
@@ -148,7 +158,9 @@ t.describe("dirty overflow survives owner lifetime", function()
       vim.uv.fs_rename, vim.defer_fn = rename, defer
       -- Complete the owner-bound retry synchronously after restoring I/O.
       watch._save_persistent_dirty_for_test()
-      if not ok then error(err) end
+      if not ok then
+        error(err)
+      end
     end)
   end)
 
@@ -158,15 +170,18 @@ t.describe("dirty overflow survives owner lifetime", function()
       flood(watch, dir)
       local rename = vim.uv.fs_rename
       vim.uv.fs_rename = function(source, destination)
-        if destination == path then return nil, "injected reset publication failure" end
+        if destination == path then
+          return nil, "injected reset publication failure"
+        end
         return rename(source, destination)
       end
       local ok, err = xpcall(function()
-        t.assert_false(watch.remove_persistent_dirty(
-          watch.snapshot_persistent_dirty(), "reset", os.time() + 10, true))
+        t.assert_false(watch.remove_persistent_dirty(watch.snapshot_persistent_dirty(), "reset", os.time() + 10, true))
       end, debug.traceback)
       vim.uv.fs_rename = rename
-      if not ok then error(err) end
+      if not ok then
+        error(err)
+      end
       local reopened = open()
       t.assert_true(reopened.persistent_dirty_status().capped)
     end)
@@ -178,24 +193,29 @@ t.describe("dirty overflow survives owner lifetime", function()
       flood(watch, dir)
       local unlink = vim.uv.fs_unlink
       vim.uv.fs_unlink = function(target)
-        if target == path .. ".overflow" then return nil, "injected unlink failure", "EPERM" end
+        if target == path .. ".overflow" then
+          return nil, "injected unlink failure", "EPERM"
+        end
         return unlink(target)
       end
       local ok, err = xpcall(function()
-        t.assert_false(watch.remove_persistent_dirty(
-          watch.snapshot_persistent_dirty(), "reset", os.time() + 10, true))
+        t.assert_false(watch.remove_persistent_dirty(watch.snapshot_persistent_dirty(), "reset", os.time() + 10, true))
         t.assert_true(watch.persistent_dirty_status().capped)
       end, debug.traceback)
       vim.uv.fs_unlink = unlink
-      if not ok then error(err) end
+      if not ok then
+        error(err)
+      end
       local reopened = open()
       t.assert_true(reopened.persistent_dirty_status().capped)
     end)
   end)
 
   for _, case in ipairs({
-    { "covered-reset", "write" }, { "covered-reset", "close" },
-    { "manual-clear", "write" }, { "manual-clear", "close" },
+    { "covered-reset", "write" },
+    { "covered-reset", "close" },
+    { "manual-clear", "write" },
+    { "manual-clear", "close" },
   }) do
     local operation, failure = case[1], case[2]
     t.it("failed path " .. failure .. " cannot retire overflow: " .. operation, function()
@@ -209,12 +229,16 @@ t.describe("dirty overflow survives owner lifetime", function()
           if fd and mode == "w" and target:sub(1, #path + 5) == path .. ".tmp." then
             return {
               write = function(_, data)
-                if failure == "write" then return nil, "injected short write" end
+                if failure == "write" then
+                  return nil, "injected short write"
+                end
                 return fd:write(data)
               end,
               close = function()
                 local closed = fd:close()
-                if failure == "close" then return nil, "injected close failure" end
+                if failure == "close" then
+                  return nil, "injected close failure"
+                end
                 return closed
               end,
             }
@@ -223,14 +247,18 @@ t.describe("dirty overflow survives owner lifetime", function()
         end
         local ok, err = xpcall(function()
           local result
-          if operation == "manual-clear" then result = watch.clear_persistent_dirty("manual")
-          else result = watch.remove_persistent_dirty(
-            watch.snapshot_persistent_dirty(), "reset", os.time() + 10, true) end
+          if operation == "manual-clear" then
+            result = watch.clear_persistent_dirty("manual")
+          else
+            result = watch.remove_persistent_dirty(watch.snapshot_persistent_dirty(), "reset", os.time() + 10, true)
+          end
           t.assert_false(result)
           t.assert_eq(table.concat(vim.fn.readfile(path), "\n"), before)
         end, debug.traceback)
         io.open = io_open
-        if not ok then error(err) end
+        if not ok then
+          error(err)
+        end
         local reopened = open()
         t.assert_true(reopened.persistent_dirty_status().capped)
       end)
@@ -243,13 +271,19 @@ t.describe("dirty overflow survives owner lifetime", function()
       local now = os.time
       local first = now()
       local ok, err = xpcall(function()
-        os.time = function() return first end
+        os.time = function()
+          return first
+        end
         flood(watch, dir)
-        os.time = function() return first + 2 end
+        os.time = function()
+          return first + 2
+        end
         flood(watch, dir)
       end, debug.traceback)
       os.time = now
-      if not ok then error(err) end
+      if not ok then
+        error(err)
+      end
       local marker = vim.json.decode(table.concat(vim.fn.readfile(path .. ".overflow"), "\n"))
       t.assert_eq(marker.overflow_at, first + 2)
       watch.remove_persistent_dirty(watch.snapshot_persistent_dirty(), "older-reset", first + 1, true)
@@ -274,9 +308,15 @@ t.describe("dirty overflow survives owner lifetime", function()
     with_watchers(function(open)
       local watch, _, dir = open()
       flood(watch, dir)
-      watch.remove_persistent_dirty({}, "git-complete", os.time(), false, true)
+      -- The saved marker is the boundary under test. Wall-clock time sampled
+      -- after publication may already be a later second on a loaded host.
+      local marker_path = watch.persistent_dirty_status().path .. ".overflow"
+      local marker = vim.json.decode(table.concat(vim.fn.readfile(marker_path), "\n"))
+      local cutoff = marker.overflow_at
+      t.assert_type(cutoff, "number")
+      watch.remove_persistent_dirty({}, "git-complete", cutoff, false, true)
       t.assert_true(watch.persistent_dirty_status().capped)
-      watch.remove_persistent_dirty({}, "incomplete-git", os.time() + 2, true, false)
+      watch.remove_persistent_dirty({}, "incomplete-git", cutoff + 2, true, false)
       t.assert_true(watch.persistent_dirty_status().capped)
     end)
   end)
@@ -284,8 +324,12 @@ t.describe("dirty overflow survives owner lifetime", function()
   t.it("smart build requires a reset even when retained overflow paths are empty", function()
     local ue = require("ue")
     local mode = ue._csearch_build_mode_for_test({
-      has_snapshot = true, added_n = 0, removed_n = 0, dirty_n = 0,
-      total_n = 10000, dirty_capped = true,
+      has_snapshot = true,
+      added_n = 0,
+      removed_n = 0,
+      dirty_n = 0,
+      total_n = 10000,
+      dirty_capped = true,
     })
     t.assert_eq(mode, "reset")
   end)
@@ -298,30 +342,39 @@ t.describe("dirty overflow survives owner lifetime", function()
       local ue, runtime = require("ue"), nil
       for i = 1, 30 do
         local name, value = debug.getupvalue(ue.cached_grep, i)
-        if name == "CORE_RT" then runtime = value; break end
+        if name == "CORE_RT" then
+          runtime = value
+          break
+        end
       end
       assert(runtime, "cached grep must retain its prepare runtime")
       local read_index, old_read
       for i = 1, 20 do
         local name, value = debug.getupvalue(runtime.prepare_freshness, i)
-        if name == "read_state" then read_index, old_read = i, value; break end
+        if name == "read_state" then
+          read_index, old_read = i, value
+          break
+        end
       end
       assert(read_index, "freshness must read published input fingerprints")
       local old_fingerprint, old_job = runtime.list_fingerprint, runtime.prepare_jobid
       local list = dir .. "/workspace.files"
       vim.fn.writefile({ "Source/sample.cpp" }, list)
-      runtime.list_fingerprint = function() return "matching-fingerprint" end
+      runtime.list_fingerprint = function()
+        return "matching-fingerprint"
+      end
       runtime.prepare_jobid = nil
       debug.setupvalue(runtime.prepare_freshness, read_index, function()
         return { csearch_input_hash = "matching-fingerprint" }
       end)
       local ok, err = xpcall(function()
-        t.assert_eq(runtime.prepare_freshness({ engine_root = dir,
-          paths = { workspace_all_list = list } }), "stale")
+        t.assert_eq(runtime.prepare_freshness({ engine_root = dir, paths = { workspace_all_list = list } }), "stale")
       end, debug.traceback)
       debug.setupvalue(runtime.prepare_freshness, read_index, old_read)
       runtime.list_fingerprint, runtime.prepare_jobid = old_fingerprint, old_job
-      if not ok then error(err) end
+      if not ok then
+        error(err)
+      end
     end)
   end)
 
@@ -334,7 +387,9 @@ t.describe("dirty overflow survives owner lifetime", function()
       local tree = vim.treesitter.get_string_parser(source, "lua"):parse()[1]
       local callback
       local function visit(node)
-        if callback then return end
+        if callback then
+          return
+        end
         if node:type() == "function_call" then
           local arguments = node:field("arguments")[1]
           if arguments then
@@ -345,14 +400,21 @@ t.describe("dirty overflow survives owner lifetime", function()
             end
           end
         end
-        for child in node:iter_children() do visit(child) end
+        for child in node:iter_children() do
+          visit(child)
+        end
       end
       visit(tree:root())
       assert(callback, "incremental command callback unavailable")
       local context, routed = { paths = {}, engine_root = dir }, nil
-      local command = assert(loadstring("local M, resolve_context = ...; return " .. callback))(
-        { build_csearch_async = function(opts) routed = opts.context; t.assert_true(opts.recover_overflow) end },
-        function() return context end)
+      local command = assert(loadstring("local M, resolve_context = ...; return " .. callback))({
+        build_csearch_async = function(opts)
+          routed = opts.context
+          t.assert_true(opts.recover_overflow)
+        end,
+      }, function()
+        return context
+      end)
       command()
       t.assert_true(routed == context, "full search-only owner must receive the original context")
     end)

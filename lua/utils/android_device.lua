@@ -87,6 +87,8 @@ end
 
 local function refresh_statusline()
   pcall(function() require("ue")._refresh_statusline() end)
+  local hub = package.loaded["utils.ue_hub"]
+  if hub and hub.selection_changed then hub.selection_changed() end
 end
 
 ---@param device? table parsed `adb devices -l` row; its model becomes the statusline label

@@ -30,8 +30,8 @@ end
 --- Generic actions: { group, label, key?, run }. Target-specific actions and
 --- fields come from the active target driver's declarative `hub(state)`.
 M.actions = {
-  { group = "Run",    label = "Run / debug current target (F5 when idle)", key = "<F5>", run = function() M.run_or_debug() end },
-  { group = "Run",    label = "Launch app (no debugger)", key = "<leader>ul", run = cmd("UELaunch") },
+  { group = "Run",    label = "Run / debug current target (F5 when idle)", key = "<F5>", target_fields = true, run = function() M.run_or_debug() end },
+  { group = "Run",    label = "Launch app (no debugger)", key = "<leader>ul", target_fields = true, run = cmd("UELaunch") },
   { group = "Code", label = "Incoming calls / 谁调用了它", key = "<leader>cI", run = code_key("<leader>cI") },
   { group = "Code", label = "Outgoing calls / 它调用了谁", key = "<leader>cO", run = code_key("<leader>cO") },
   { group = "Code", label = "Workspace symbols / 类名、函数名", key = "<leader>sS", run = code_key("<leader>sS") },
@@ -40,6 +40,9 @@ M.actions = {
   { group = "Code", label = "Derived types / 派生类", key = "<leader>cD", run = code_key("<leader>cD") },
   { group = "Code", label = "Rename symbol / 重命名", key = "<leader>cr", run = code_key("<leader>cr") },
   { group = "Code", label = "Code action / 代码操作", key = "<leader>ca", run = code_key("<leader>ca") },
+  { group = "Code", label = "Undo refactor batch / 撤销上次整批修改", run = cmd("UERefactorUndo") },
+  { group = "Code", label = "Refactor recovery / 查看修改恢复记录", run = cmd("UERefactorRecovery") },
+  { group = "Code", label = "Create UE class / 预览并创建类", requires = { "project" }, run = cmd("UENewClass") },
   { group = "Code", label = "Format safely / 安全格式化", key = "<leader>cf", run = cmd("UEFormat") },
   { group = "Code", label = "Format with UE style / 用 UE 风格格式化", run = cmd("UEFormat epic") },
   { group = "Code", label = "Inlay hints / 内联提示开关", key = "<leader>uh", run = function()
@@ -47,19 +50,27 @@ M.actions = {
     if type(mapping.callback) == "function" then mapping.callback() end
   end },
   { group = "Files", label = "Unsaved files / 未保存文件", run = cmd("UEUnsaved") },
+  { group = "Files", label = "Restore project session / 按需恢复会话", run = cmd("UESessionRestore") },
+  { group = "Files", label = "Recover unsaved text / 恢复异常退出的未保存文本", run = cmd("UERecovery") },
   { group = "Files", label = "Quit with unsaved list / 退出前查看未保存文件", key = "<leader>qq", run = cmd("UEQuit") },
   { group = "Build",  label = "Build active target", key = "<leader>ub", run = cmd("UEBuild") },
-  { group = "Build",  label = "First build error / 首个构建错误", key = "<leader>uE", run = cmd("UEBuildFirstError") },
-  { group = "Build",  label = "Install app on device", key = "<leader>ui", run = cmd("UEInstall") },
-  { group = "Debug",  label = "Attach debugger", key = "<leader>da", run = cmd("UEDAPAttach") },
-  { group = "Debug",  label = "Launch under debugger (wait-for-debugger)", key = "<leader>dl", run = cmd("UEDAPLaunch") },
-  { group = "Debug",  label = "Reattach to restarted app", run = cmd("UEDAPReattach") },
-  { group = "Debug",  label = "Stop debug session", key = "<S-F5>", run = cmd("UEDAPStop") },
-  { group = "Debug",  label = "Debugger preflight (why would attach fail?)", run = cmd("UEDAPPreflight") },
-  { group = "Logs",   label = "Toggle app log", key = "<leader>ug", run = cmd("UELogToggle") },
+  { group = "Build",  label = "First build error / 首个构建错误", key = "<leader>uE", always = true, run = cmd("UEBuildFirstError") },
+  { group = "Tests", label = "UE Editor tests / 发现与运行测试", requires = { "project" }, run = cmd("UETests") },
+  { group = "Tests", label = "Last test results / 上次测试结果", requires = { "project" }, run = cmd("UETests results") },
+  { group = "Tests", label = "Rerun failed tests / 重跑失败测试", requires = { "project" }, run = cmd("UETests rerun") },
+  { group = "Build",  label = "Install app on device", key = "<leader>ui", target_fields = true, run = cmd("UEInstall") },
+  { group = "Debug",  label = "Attach debugger", key = "<leader>da", target_fields = true, run = cmd("UEDAPAttach") },
+  { group = "Debug",  label = "Launch under debugger (wait-for-debugger)", key = "<leader>dl", target_fields = true, run = cmd("UEDAPLaunch") },
+  { group = "Debug",  label = "Reattach to restarted app", always = true, run = cmd("UEDAPReattach") },
+  { group = "Debug",  label = "Stop debug session", key = "<S-F5>", always = true, run = cmd("UEDAPStop") },
+  { group = "Debug",  label = "Debugger preflight (why would attach fail?)", target_fields = true, run = cmd("UEDAPPreflight") },
+  { group = "Logs",   label = "Toggle app log", key = "<leader>ug", requires = { "project", "platform" }, target_fields = true, run = cmd("UELogToggle") },
   { group = "Logs",   label = "Logcat (debug panel tab)", key = "<leader>d4", run = cmd("UEDAPTab logcat") },
   { group = "Logs",   label = "Notification history", key = "<leader>uN", run = cmd("NotificationHistory") },
   { group = "Target", label = "Switch target (project/platform/device/package)", key = "<leader>uu", run = function() M.target_switcher() end },
+  { group = "Target", label = "Run profiles / 选择运行配置", run = cmd("UERunProfile") },
+  { group = "Target", label = "Save run profile / 保存当前运行配置", run = cmd("UERunProfileSave") },
+  { group = "Target", label = "Delete run profile / 删除运行配置", run = cmd("UERunProfileDelete") },
   { group = "Target", label = "Set platform / configuration", run = cmd("UESetPlatform") },
   { group = "Target", label = "Set project", run = cmd("UESetProject") },
   { group = "Index",  label = "Prepare (compile DB + index)", run = cmd("UEPrepare") },
@@ -88,6 +99,55 @@ local function target_hub(target)
   return { actions = {}, fields = {} }
 end
 
+local CODE_METHODS = {
+  ["<leader>cI"] = "textDocument/prepareCallHierarchy",
+  ["<leader>cO"] = "textDocument/prepareCallHierarchy",
+  ["<leader>sS"] = "workspace/symbol",
+  ["<leader>ss"] = "textDocument/documentSymbol",
+  ["<leader>cB"] = "textDocument/prepareTypeHierarchy",
+  ["<leader>cD"] = "textDocument/prepareTypeHierarchy",
+  ["<leader>cr"] = "textDocument/rename",
+  ["<leader>ca"] = "textDocument/codeAction",
+}
+
+-- Selection readiness is not proof of device, symbol or full-index health.
+-- Only read current state/capabilities; never prepare, scan or probe a device.
+function M.action_state(action, target, opts)
+  opts = opts or {}
+  local dap = package.loaded["dap"]
+  if action.key == "<F5>" and dap and dap.session and dap.session() then return { ready = true } end
+  if action.always then return { ready = true } end
+  local requirements = action.requires or
+    ((action.group == "Build" or action.group == "Run" or action.group == "Debug")
+      and { "project", "platform" } or {})
+  for _, requirement in ipairs(requirements) do
+    if requirement == "project" and not target.project then
+      return { ready = false, reason = "缺工程", fix = "UESetProject" }
+    elseif requirement == "platform" and trim(target.platform) == "" then
+      return { ready = false, reason = "缺平台/配置", fix = "UESetPlatform" }
+    end
+  end
+  if action.target_fields then
+    local contribution = opts.contribution or target_hub(target)
+    for _, name in ipairs(action.target_fields == true and (contribution.runtime_requires or {}) or action.target_fields) do
+      for _, field in ipairs(contribution.fields or {}) do
+        if field.name == name and not field.value then
+          return { ready = false, reason = "缺 " .. (field.label or name), fix = field.command or "UEDoctor" }
+        end
+      end
+    end
+  end
+  local method = CODE_METHODS[action.key]
+  if method then
+    local clients = opts.clients or vim.lsp.get_clients({ bufnr = opts.buf or 0, name = "clangd" })
+    for _, client in ipairs(clients) do
+      if client:supports_method(method, opts.buf or 0) then return { ready = true } end
+    end
+    return { ready = false, reason = #clients == 0 and "当前文件 clangd 未就绪" or "clangd 不支持此操作", fix = "UEDoctor" }
+  end
+  return { ready = true }
+end
+
 --- Current target snapshot from persisted state.
 function M.target(opts)
   opts = opts or {}
@@ -100,6 +160,8 @@ function M.target(opts)
   local state = (ctx and ctx.state) or {}
   return {
     project = ctx and (ctx.uproject and vim.fn.fnamemodify(ctx.uproject, ":t:r") or ctx.project_root) or nil,
+    project_root = ctx and ctx.project_root or nil,
+    uproject = ctx and ctx.uproject or nil,
     engine_root = ctx and ctx.engine_root or nil,
     platform = trim(state.target_platform),
     configuration = trim(state.target_configuration),
@@ -111,9 +173,13 @@ end
 --- after the generic ones.
 function M.visible_actions(target)
   local out = {}
-  for _, action in ipairs(M.actions) do out[#out + 1] = action end
-  for _, action in ipairs(target_hub(target).actions or {}) do
-    out[#out + 1] = { group = action.group, label = action.label, key = action.key, run = cmd(action.command) }
+  local contribution = target_hub(target)
+  for _, action in ipairs(M.actions) do out[#out + 1] = vim.tbl_extend("force", {}, action) end
+  for _, action in ipairs(contribution.actions or {}) do
+    out[#out + 1] = vim.tbl_extend("force", {}, action, { run = cmd(action.command) })
+  end
+  for _, action in ipairs(out) do
+    action.readiness = M.action_state(action, target, { contribution = contribution })
   end
   local first, rank = {}, {}
   for index, action in ipairs(out) do
@@ -126,7 +192,89 @@ end
 
 function M.format_action(action)
   local key = action.key and ("  " .. action.key) or ""
-  return ("%-7s %s%s"):format(action.group, action.label, key)
+  local state = action.readiness
+  local readiness = state and not state.ready and ("  [" .. state.reason .. "]") or ""
+  return ("%-7s %s%s%s"):format(action.group, action.label, key, readiness)
+end
+
+local pending_action
+local intent_epoch = 0
+function M.pending_action() return pending_action end
+
+local function runtime_identity(target)
+  local fields = {}
+  for _, field in ipairs(target_hub(target).fields or {}) do
+    fields[field.name] = field.identity or field.value or false
+  end
+  return fields
+end
+
+local function source_valid(pending)
+  return pending.epoch == intent_epoch and vim.api.nvim_win_is_valid(pending.win)
+    and vim.api.nvim_win_get_buf(pending.win) == pending.buf
+    and vim.api.nvim_buf_get_name(pending.buf) == pending.name
+    and vim.api.nvim_buf_get_changedtick(pending.buf) == pending.tick
+end
+
+-- Called after an explicit, successful selection. The user confirms continuing
+-- the retained intent; cancelling a picker can never start a delayed build.
+function M.selection_changed()
+  local pending = pending_action
+  if not pending or pending.checking then return end
+  pending.checking = true
+  vim.schedule(function()
+    if pending_action ~= pending then return end
+    pending.checking = nil
+    if not source_valid(pending) then pending_action = nil; return end
+    local target = M.target()
+    local runtime = runtime_identity(target)
+    if pending.project and (target.project ~= pending.project
+      or target.project_root ~= pending.project_root or target.engine_root ~= pending.engine_root) then
+      pending_action = nil; return
+    end
+    pending_action = nil
+    vim.ui.select({ "继续 " .. pending.action.label, "取消" }, {
+      prompt = "配置已更新：" .. M.target_summary(target) .. "，继续原操作？",
+    }, function(choice)
+      if choice and choice ~= "取消" and source_valid(pending) then
+        local current = M.target()
+        if not vim.deep_equal(current, target) or not vim.deep_equal(runtime_identity(current), runtime) then return end
+        M.invoke_action(pending.action, { source_win = pending.win })
+      end
+    end)
+  end)
+end
+
+function M.invoke_action(action, opts)
+  opts = opts or {}
+  intent_epoch = intent_epoch + 1
+  pending_action = nil
+  local win = opts.source_win or vim.api.nvim_get_current_win()
+  if not vim.api.nvim_win_is_valid(win) then return end
+  local buf = vim.api.nvim_win_get_buf(win)
+  local epoch, tick, name = intent_epoch, vim.api.nvim_buf_get_changedtick(buf), vim.api.nvim_buf_get_name(buf)
+  local target = opts.target or M.target()
+  local state = M.action_state(action, target, { buf = buf })
+  if state.ready then
+    vim.api.nvim_set_current_win(win)
+    return action.run()
+  end
+  vim.ui.select({ "配置/检查：" .. state.fix, "取消" }, {
+    prompt = state.reason .. " — " .. action.label,
+  }, function(choice)
+    if not choice or choice == "取消" or epoch ~= intent_epoch
+        or not vim.api.nvim_win_is_valid(win) or vim.api.nvim_win_get_buf(win) ~= buf
+        or vim.api.nvim_buf_get_name(buf) ~= name
+        or vim.api.nvim_buf_get_changedtick(buf) ~= tick then return end
+    local pending = { action = action, win = win, buf = buf, name = name,
+      epoch = epoch, tick = tick, project = target.project,
+      project_root = target.project_root, engine_root = target.engine_root }
+    pending_action = pending
+    -- A single bounded expiry, not polling. It never invokes the action.
+    vim.defer_fn(function() if pending_action == pending then pending_action = nil end end, 60000)
+    vim.api.nvim_set_current_win(win)
+    vim.cmd(state.fix)
+  end)
 end
 
 local function pick(items, prompt, format, on_choice)
@@ -156,8 +304,7 @@ function M.command_hub()
   pick(M.visible_actions(target), "UE  " .. M.target_summary(target), M.format_action,
     function(action)
       if not vim.api.nvim_win_is_valid(source_win) then return end
-      vim.api.nvim_set_current_win(source_win)
-      action.run()
+      M.invoke_action(action, { source_win = source_win })
     end)
 end
 
@@ -201,8 +348,12 @@ function M.run_or_debug()
   if ok_dap and dap.session and dap.session() then
     return vim.cmd("UEDAPContinue")
   end
-  local loop = target_hub(M.target()).loop_command
-  return vim.cmd(loop or "UEDAPLaunch")
+  local contribution = target_hub(M.target())
+  local profiles = package.loaded["ue.run_profiles"]
+  if profiles and profiles.mode and profiles.mode() == "run" then
+    return vim.cmd(contribution.run_command or "UELaunch")
+  end
+  return vim.cmd(contribution.loop_command or "UEDAPLaunch")
 end
 
 -- ── one-key fix for the last failure ───────────────────────────────────────
@@ -328,6 +479,11 @@ function M.open_guide()
 end
 
 function M.setup_commands()
+  require("utils.session_restore").setup_commands()
+  require("utils.edit_recovery").setup_commands()
+  require("utils.lsp_fallback").setup_refactor_commands()
+  require("utils.ue_entities").setup_commands()
+  require("ue.editor_tests").setup_commands()
   local create = vim.api.nvim_create_user_command
   create("UEGuide", function() M.open_guide() end,
     { desc = "Open the user guide: daily workflow, keys, troubleshooting" })

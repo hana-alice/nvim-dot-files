@@ -92,9 +92,39 @@ M._session = {
 }
 
 local function reset_session()
-  for k in pairs(M._session) do M._session[k] = nil end
-  M._session.adb  = "adb"
-  M._session.port = 5045
+  -- Retire the object captured by async callbacks. Reusing and clearing the
+  -- same table would let an old callback mutate the next attempt's fields.
+  M._session = { adb = "adb", port = 5045 }
+end
+
+local function current_operation(sess)
+  local operation = sess and sess._operation
+  return not operation or (M._session == sess and operation.current())
+end
+
+local function complete_operation(sess, code, detail)
+  local operation = sess and sess._operation
+  if not operation then return end
+  if code ~= 0 then M._cleanup_in_progress = true end
+  operation.finish(code, detail or (operation.failure and {
+    failure = operation.failure, reason = operation.failure.summary or operation.failure.headline,
+  }))
+end
+
+function M._begin_operation(opts)
+  reset_session()
+  local sess = M._session
+  local operation = require("ue.dap._operation").new(opts, function(value)
+    return M._session == sess and sess._operation == value
+  end, function(value)
+    if M._session._operation == value then M.stop_android_debugger() end
+  end)
+  M._session._operation = operation
+  return operation
+end
+
+function M.initialized_progress()
+  if not M._session.attach_succeeded then return "debugger initialized; waiting for attach response …" end
 end
 
 -- ── reattach memory ───────────────────────────────────────────────────────
@@ -277,6 +307,10 @@ local function discover_project_root(start)
 end
 
 local function effective_project_root(ctx)
+  if ctx and ctx._frozen then
+    return type(ctx.project_root) == "string" and ctx.project_root ~= "" and fs.norm(ctx.project_root)
+      or (ctx.uproject and fs.dirname(ctx.uproject))
+  end
   local roots = {}
   local function add(root)
     if type(root) == "string" and root ~= "" then roots[#roots + 1] = fs.norm(root) end
@@ -576,21 +610,30 @@ end
 -- Asynchronous adb round-trip for interactive attach/launch paths (K53: a
 -- synchronous spawn on Windows costs >= 87 ms before adb even connects).
 -- done(out, code) runs on the main loop; a spawn failure reports code -1.
-local function adb_async(adb, args, done)
+local function adb_async(adb, args, done, operation)
   local cmd = { adb }
   vim.list_extend(cmd, args)
-  local ok, err = pcall(vim.system, cmd, { text = true }, function(res)
+  local release = operation and operation.hold()
+  local ok, err = pcall(vim.system, cmd, { text = true, timeout = 10000 }, function(res)
     vim.schedule(function()
       local out = ((res and res.stdout) or "") .. ((res and res.code ~= 0 and res.stderr) or "")
-      done(out:gsub("[\r\n]+$", ""), res and res.code or -1)
+      if not operation or operation.current() then done(out:gsub("[\r\n]+$", ""), res and res.code or -1) end
+      if release then release() end
     end)
   end)
-  if not ok then vim.schedule(function() done(tostring(err), -1) end) end
+  if not ok then
+    vim.schedule(function()
+      if not operation or operation.current() then done(tostring(err), -1) end
+      if release then release() end
+    end)
+  elseif operation then
+    operation.resource(function() if err and err.kill then err:kill(15) end end)
+  end
 end
 
 -- Run adb steps in order without blocking; stops at the first nonzero exit
 -- unless the step is marked optional. done(ok, out, code, failed_index).
-local function adb_sequence(adb, steps, done)
+local function adb_sequence(adb, steps, done, operation)
   local index = 0
   local function nxt()
     index = index + 1
@@ -599,7 +642,7 @@ local function adb_sequence(adb, steps, done)
     adb_async(adb, step.args, function(out, code)
       if code ~= 0 and not step.optional then return done(false, out, code, index) end
       nxt()
-    end)
+    end, operation)
   end
   nxt()
 end
@@ -664,7 +707,7 @@ end
 -- synchronous adb round-trip stacks on top). Same fix pattern as K40:
 -- uv timer + vim.system, `in_flight` against overlap, done() on main loop.
 -- done(pid|nil) fires exactly once — pid found, or nil after timeout_ms.
-local function pidof_async(adb, serial, pkg, timeout_ms, done)
+local function pidof_async(adb, serial, pkg, timeout_ms, done, operation)
   local timer = vim.uv.new_timer()
   if not timer then
     -- Degenerate fallback: single synchronous probe.
@@ -673,13 +716,16 @@ local function pidof_async(adb, serial, pkg, timeout_ms, done)
   end
   local deadline = vim.uv.now() + (timeout_ms or 10000)
   local in_flight, finished = false, false
+  local release = operation and operation.hold()
   local function finish(pid)
     if finished then return end
     finished = true
     pcall(function() timer:stop() end)
     pcall(function() timer:close() end)
-    done(pid)
+    if not operation or operation.current() then done(pid) end
+    if release then release() end
   end
+  if operation then operation.resource(function() finish(nil) end) end
   timer:start(0, 200, function()
     -- FAST EVENT CONTEXT: spawn only; results handled on the main loop.
     if finished or in_flight then return end
@@ -1110,6 +1156,14 @@ local preseed_breakpoints_into_attach_commands = engine.preseed_breakpoints_into
 
 function M.stop_android_debugger(opts)
   opts = opts or {}
+  local stopped_session = M._session
+  local operation = stopped_session._operation
+  if operation and not operation.cancelled
+      and (not operation.finished or (operation.code ~= 0 and operation.pending > 0)) then
+    if operation.finished then operation.abort("failed attempt stopped") else operation.cancel("debugger stopped") end
+    return { disconnected = false, adapter_killed = false, orphan_killed = 0, cancellation_requested = true }
+  end
+  M._cleanup_in_progress = true
   local result = { disconnected = false, adapter_killed = false, orphan_killed = 0 }
 
   -- Stop the liveness poller FIRST so it can't race with reset_session.
@@ -1147,9 +1201,12 @@ function M.stop_android_debugger(opts)
   local function finalize()
     if cleanup_done then return end
     cleanup_done = true
+    if M._session ~= stopped_session then return end
     M._cleanup_device_side()
     result.adapter_killed = sess_active ~= nil
     reset_session()
+    M._attach_in_progress = false
+    M._cleanup_in_progress = false
   end
 
   if sess_active then
@@ -1248,10 +1305,13 @@ end
 -- disconnect). MUST NOT issue another `disconnect` — see _cleanup_device_side
 -- comment. Only releases device-side resources and clears local state.
 function M.cleanup(_session_state)
+  complete_operation(M._session, 1, { stage = "attach", reason = "debug session ended before attach completed" })
   if M._stop_liveness_poller then pcall(M._stop_liveness_poller) end
   snapshot_last_session()
   M._cleanup_device_side()
   reset_session()
+  M._attach_in_progress = false
+  M._cleanup_in_progress = false
   return { device_cleaned = true }
 end
 
@@ -1269,6 +1329,8 @@ local function report_failure(spec)
   local F = require("ue.dap.failure")
   local P = require("ue.dap._progress")
   local fail = F.new(spec)
+  local operation = M._session._operation
+  if operation then operation.failure = fail end
   local text = F.format(fail)
   P.error(spec.headline or spec.summary or "attach failed")
   -- A failure with a concrete command fix is offered as one keypress
@@ -1312,6 +1374,9 @@ local function bootstrap_session(opts, on_ready)
   -- doing so would pin the first serial in ctx.android_serial and make a later
   -- :UESetAndroidDevice switch lose to that stale "explicit" value.
   local ctx = vim.tbl_extend("force", {}, opts.context or {})
+  ctx._frozen = opts.owner ~= nil
+  ctx.configuration = opts.configuration or ctx.configuration
+  ctx.target = opts.target or ctx.target
   -- Programmatic/headless retries should not block forever on vim.fn.input()
   -- for values that are stable for this workspace and already known.
   -- Priority: explicit context/opts -> session-global selected device. A normal
@@ -1346,9 +1411,12 @@ local function bootstrap_session(opts, on_ready)
   local P = require("ue.dap._progress")
 
   local sess = M._session
+  local operation = sess._operation
   sess.adb  = "adb"
   sess.port = pick_port()
   sess.engine_root = ctx and ctx.engine_root or nil
+  sess.project_root = ctx.project_root
+  sess.target, sess.configuration = ctx.target, ctx.configuration
 
   P.step("1/6  picking package …")
   local pkg = pick_package(ctx)
@@ -1360,6 +1428,7 @@ local function bootstrap_session(opts, on_ready)
   end
 
   local function after_serial(serial)
+    if not current_operation(sess) then return end
     if not serial then
       report_failure({
         layer = require("ue.dap.failure").L.TRANSPORT,
@@ -1369,21 +1438,28 @@ local function bootstrap_session(opts, on_ready)
         remedy = "run :UESetAndroidDevice and pick a ready device",
         fix = "UESetAndroidDevice",
       })
-      on_ready(false); return
+      on_ready(false, -1); return
     end
     sess.serial = serial
     if not sess.package_name then
       -- No persisted/config/cook package: pick from the device's installed
       -- packages instead of a blank prompt, then remember it for this project.
+      local release = operation and operation.hold()
       return require("utils.android_package").pick({ adb = sess.adb, serial = serial,
         prompt = "Android package to debug:" }, function(picked)
-        if not picked then P.hide(); return on_ready(false) end
+        if not current_operation(sess) then if release then release() end; return end
+        if not picked then
+          P.hide()
+          if release then release() end
+          return on_ready(false, -1)
+        end
         sess.package_name = picked
         local engine_root = ctx and ctx.engine_root
         if engine_root then
           pcall(function() require("ue").update_state_field(engine_root, "android_package", picked) end)
         end
         after_serial(serial)
+        if release then release() end
       end)
     end
 
@@ -1439,7 +1515,11 @@ local function bootstrap_session(opts, on_ready)
   if sess.serial then
     after_serial(sess.serial)
   else
-    pick_serial_async(sess.adb, after_serial)
+    local release = operation and operation.hold()
+    pick_serial_async(sess.adb, function(serial)
+      after_serial(serial)
+      if release then release() end
+    end)
   end
 end
 
@@ -1453,9 +1533,11 @@ end
 -- connection` (K56) or `The parameter is incorrect` (K58) — symptoms that point
 -- at nothing and cost hours of forensics each.
 local function _finalize_session(sess, pid, cfg_name, run_label)
+  if not current_operation(sess) then return end
   local P = require("ue.dap._progress")
   sess.pid = pid
   sess.lldb_server_mode = "platform"
+  if sess._operation then sess._operation.stage("attach", { state = "running", pid = pid }) end
 
   -- The gate is async (P6) and deliberately fail-open: only an explicit denial
   -- blocks. See preflight.blocks_attach — undetermined never blocks.
@@ -1472,6 +1554,7 @@ end
 --- was initiated" without a device is to drive the probes from recorded output.
 --- Production callers pass nothing and get the real async executor.
 function M._gate_then_start(sess, continue_fn, opts)
+  if not current_operation(sess) then return end
   local preflight = require("ue.dap.preflight")
   local F = require("ue.dap.failure")
   local P = require("ue.dap._progress")
@@ -1491,6 +1574,7 @@ function M._gate_then_start(sess, continue_fn, opts)
   end
 
   P.step("checking target OS policy (L2) …")
+  local release = sess._operation and sess._operation.hold()
   preflight.run({
     probes = l2,
     executor = opts.executor,
@@ -1499,7 +1583,12 @@ function M._gate_then_start(sess, continue_fn, opts)
       package_name = sess.package_name, pid = sess.pid,
     },
     on_done = function(report)
-      if not preflight.blocks_attach(report) then return continue_fn() end
+      if not current_operation(sess) then if release then release() end; return end
+      if not preflight.blocks_attach(report) then
+        continue_fn()
+        if release then release() end
+        return
+      end
       local fail = preflight.blocking_failure(report)
       local text = F.format(fail)
       sess._gate_refusal = text
@@ -1508,13 +1597,16 @@ function M._gate_then_start(sess, continue_fn, opts)
         "attach refused before connecting the debug engine:\n" .. text
         .. "\n(run :UEDAPPreflight for all layers; UE_DAP_SKIP_PREFLIGHT=1 overrides)")
       M._attach_in_progress = false
+      complete_operation(sess, 1, fail)
       M.stop_android_debugger()
       if opts.on_refused then opts.on_refused(fail, text) end
+      if release then release() end
     end,
   })
 end
 
 function M._finalize_session_after_gate(sess, pid, cfg_name, run_label)
+  if not current_operation(sess) then return end
   local P = require("ue.dap._progress")
 
   P.step(("starting lldb-server platform (port=%d) …"):format(sess.port))
@@ -1533,6 +1625,7 @@ function M._finalize_session_after_gate(sess, pid, cfg_name, run_label)
       remedy = "run :UEDAPPreflight; a target-policy denial at L2 is the usual cause",
       fix = "UEDAPPreflight",
     })
+    complete_operation(sess, 1)
     M.stop_android_debugger()
     return
   end
@@ -1551,6 +1644,7 @@ function M._finalize_session_after_gate(sess, pid, cfg_name, run_label)
   -- the adb round-trip runs; the attach config is built once it returns.
   read_so_base_hex_async(sess.adb, sess.serial, sess.package_name, pid, sess.symbol_lib,
     sess.runtime_module_basename, function(base_hex, runtime_so)
+    if not current_operation(sess) then return end
     local rebase_cmd = build_module_rebase_command(sess.symbol_lib, base_hex)
     if rebase_cmd then
       sess._module_rebase_cmd = rebase_cmd
@@ -1579,12 +1673,14 @@ function M._finalize_session_after_gate(sess, pid, cfg_name, run_label)
 end
 
 function M._finalize_attach_config(sess, pid, cfg_name, run_label)
+  if not current_operation(sess) then return end
   local cfg = lldb_dap_attach_config(sess, sess.source_map)
   cfg.name = cfg_name
   cfg._ue_session_owner = "android"
   cfg._ue_session_operation = cfg_name:find("Launch", 1, true) and "launch" or "attach"
   cfg._ue_device_id = sess.serial
   cfg._ue_process_id = pid
+  cfg._ue_operation_id = sess._operation and sess._operation.id
   -- K33 diagnosis: pick the first current nvim breakpoint as the post-attach
   -- probe so post_run_commands logs `image lookup` + `breakpoint list` to
   -- stdpath('cache')/ue-dap-bp-diag.log. Non-mutating, does not resume.
@@ -1630,13 +1726,22 @@ function M._finalize_attach_config(sess, pid, cfg_name, run_label)
     dap.listeners.after.attach[ATTACH_RESULT_LISTENER_KEY] = function(session, err)
       local config = session and session.config or nil
       if not config or config._ue_session_owner ~= "android"
-        or tonumber(config._ue_process_id) ~= tonumber(pid) then
+        or tonumber(config._ue_process_id) ~= tonumber(pid)
+        or config._ue_operation_id ~= cfg._ue_operation_id or not current_operation(sess) then
         return
       end
       dap.listeners.after.attach[ATTACH_RESULT_LISTENER_KEY] = nil
-      if err then return end
+      M._attach_in_progress = false
+      if err then
+        complete_operation(sess, 1, { stage = "attach", reason = err.message or tostring(err) })
+        M.stop_android_debugger()
+        return
+      end
       sess.attach_succeeded = true
       snapshot_last_session()
+      if sess._operation then sess._operation.stage("attach", { state = "done", pid = pid }) end
+      complete_operation(sess, 0, { stage = "attach", reason = "attach response succeeded", pid = pid })
+      pcall(function() require("ue.dap._progress").done("debugger attached") end)
       pcall(function()
         require("utils.probe").record("android-attach", "ok:" .. tostring(cfg._ue_session_operation),
           { state = "ok", serial = sess.serial, symbols = sess.symbol_lib and "yes" or "no",
@@ -1644,7 +1749,23 @@ function M._finalize_attach_config(sess, pid, cfg_name, run_label)
       end)
     end
   end)
-  C.run(cfg, run_label)
+  local started = C.run(cfg, run_label, nil, nil, {
+    -- nvim-dap's run opts.after is a no-argument close callback, not a
+    -- session-start callback. It also covers adapter death without an event.
+    after = function()
+      vim.schedule(function()
+        if current_operation(sess) and not sess.attach_succeeded then
+          complete_operation(sess, 1, { stage = "attach", reason = "adapter closed before attach response" })
+          M.stop_android_debugger()
+        end
+      end)
+    end,
+  })
+  if not started then
+    complete_operation(sess, 1, { stage = "attach", reason = "DAP adapter could not start" })
+    M.stop_android_debugger()
+    return
+  end
   -- Progress popup finalized by ue.dap.lua's event_initialized listener
   -- (P.done) or by stop_android_debugger / on_session_end (P.hide).
   -- If the adapter exits before nvim-dap installs/keeps a session (observed
@@ -1653,109 +1774,101 @@ function M._finalize_attach_config(sess, pid, cfg_name, run_label)
   -- Release the mutex after a short grace window when there is no live DAP
   -- session, so the next <space>da is a real retry instead of a stale-block.
   vim.defer_fn(function()
+    if not current_operation(sess) then return end
     if not M._attach_in_progress then return end
     local ok_dap, dap = pcall(require, "dap")
     local has_session = ok_dap and dap and dap.session and dap.session() or nil
     if not has_session then
       M._attach_in_progress = false
+      complete_operation(sess, 1, { stage = "attach", reason = "no live DAP session after adapter start" })
+      M.stop_android_debugger()
       pcall(function() require("ue.dap._progress").hide() end)
     end
   end, 10000)
 end
 
+local function reject_operation(opts, reason)
+  vim.notify("[ue.dap.android] " .. reason, vim.log.levels.WARN)
+  if type(opts.on_complete) == "function" then
+    opts.on_complete(-1, { owner = opts.owner, stage = "launch", reason = reason })
+  end
+  return nil, reason
+end
+
+local function can_begin_operation()
+  if M._cleanup_in_progress then return false, "debug cleanup is still in progress" end
+  local operation = M._session._operation
+  if operation and (not operation.finished or operation.pending > 0 or (operation.cancelled and not operation.cleaned)) then
+    return false, "attach already in progress; wait or stop the current attempt"
+  end
+  local ok, dap = pcall(require, "dap")
+  if ok and dap.session and dap.session() then return false, "DAP session already active; :UEDAPStop first" end
+  return true
+end
+
 function M.attach(opts)
-  opts = opts or {}
-  -- A previous attach can fail before nvim-dap creates a session while still
-  -- leaving the bootstrap flag set (for example lldb-dap dies after
-  -- `process attach --pid` reports `lost connection`). In that state a second
-  -- <space>da should be able to retry instead of being blocked forever by our
-  -- own stale mutex. Keep the mutex only while a real dap session exists.
-  if M._attach_in_progress then
-    local ok_dap, dap = pcall(require, "dap")
-    local has_session = ok_dap and dap and dap.session and dap.session() or nil
-    -- Keep the mutex only for a real live DAP session. A stale/failed early
-    -- bootstrap can leave a half-filled M._session (for example only adb/port,
-    -- or a serial but no DAP session); a second <space>da should retry.
-    if has_session then
-      vim.notify("[ue.dap.android] attach already in progress — wait for it to finish or :UEDAPStop",
-        vim.log.levels.WARN)
-      return
-    end
-    M._attach_in_progress = false
-  end
-  local ok_dap, dap = pcall(require, "dap")
-  if ok_dap and dap and dap.session and dap.session() then
-    vim.notify("[ue.dap.android] DAP session already active — :UEDAPStop first, or :UEDAPReattach",
-      vim.log.levels.WARN)
-    return
-  end
-  -- Clear stale notifier popups from a previous session so this attach's
-  -- diagnostics aren't drowned in old warnings that have already been
-  -- fixed. snacks.notifier accumulates active toasts forever by default
-  -- (history is the dict behind get_history); without this the user sees
-  -- the same popup wall on every attach and can't tell whether errors are
-  -- current or historical. We hide each toast by id (the only public API)
-  -- rather than mutating the internal history dict.
-  pcall(function()
-    local snacks = require("snacks")
-    if not (snacks and snacks.notifier and snacks.notifier.get_history) then return end
-    local hist = snacks.notifier.get_history()
-    for _, item in ipairs(hist) do
-      if item.id then pcall(snacks.notifier.hide, item.id) end
-    end
-  end)
+  opts = vim.deepcopy(opts or {})
+  local ready, reason = can_begin_operation()
+  if not ready then return reject_operation(opts, reason) end
   M._attach_in_progress = true
-  bootstrap_session(opts, function(ok)
-    if not ok then M._attach_in_progress = false; return end
-    local sess = M._session
-    local P = require("ue.dap._progress")
-    P.step("6/6  finding pid for " .. (sess.package_name or "?") .. " …")
-    -- Single async probe window: the app must already run for a plain attach.
-    pidof_async(sess.adb, sess.serial, sess.package_name, 2500, function(pid)
-    if not pid then
-      report_failure({
-        layer = require("ue.dap.failure").L.TARGET_POLICY,
-        owner = "dap.android (Android target policy)",
-        headline = "target process is not running",
-        summary = "the application has no live process to attach to",
-        evidence = require("ue.dap.failure").command_evidence(
-          { "<adb>", "shell", "pidof", "-s", "<package>" }, nil, "no pid returned"),
-        remedy = "start the app first, or use :UEDAPLaunch for wait-for-debugger launch",
-        fix = "UEDAPLaunch",
-      })
-      M._attach_in_progress = false
+  local operation = M._begin_operation(opts)
+  local sess = M._session
+  operation.stage("attach", { state = "running" })
+  bootstrap_session(opts, function(ok, code)
+    if not current_operation(sess) then return end
+    if not ok then
+      complete_operation(sess, code or 1, { stage = "attach", reason = "debug attach setup failed", failure = operation.failure })
       M.stop_android_debugger()
       return
     end
-    _finalize_session(sess, pid, "UE Android Attach (lldb-dap)", "UEDAP android attach")
-    M._attach_in_progress = false
-    M._start_liveness_poller()
-    end)
+    local P = require("ue.dap._progress")
+    P.step("6/6  finding pid for " .. (sess.package_name or "?") .. " …")
+    pidof_async(sess.adb, sess.serial, sess.package_name, 2500, function(pid)
+      if not pid then
+        report_failure({
+          layer = require("ue.dap.failure").L.TARGET_POLICY,
+          owner = "dap.android (Android target policy)",
+          headline = "target process is not running",
+          summary = "the application has no live process to attach to",
+          evidence = require("ue.dap.failure").command_evidence(
+            { "<adb>", "shell", "pidof", "-s", "<package>" }, nil, "no pid returned"),
+          remedy = "start the app first, or use :UEDAPLaunch for wait-for-debugger launch",
+          fix = "UEDAPLaunch",
+        })
+        complete_operation(sess, 1)
+        M.stop_android_debugger()
+        return
+      end
+      _finalize_session(sess, pid, "UE Android Attach (lldb-dap)", "UEDAP android attach")
+      M._start_liveness_poller()
+    end, operation)
   end)
+  return operation.handle
 end
 
 function M.launch(opts)
-  opts = opts or {}
-  if M._attach_in_progress then
-    vim.notify("[ue.dap.android] attach already in progress", vim.log.levels.WARN)
-    return
-  end
-  local ok_dap, dap = pcall(require, "dap")
-  if ok_dap and dap and dap.session and dap.session() then
-    vim.notify("[ue.dap.android] DAP session already active — :UEDAPStop first",
-      vim.log.levels.WARN)
-    return
-  end
+  opts = vim.deepcopy(opts or {})
+  local ready, reason = can_begin_operation()
+  if not ready then return reject_operation(opts, reason) end
   M._attach_in_progress = true
+  local operation = M._begin_operation(opts)
+  local sess = M._session
+  operation.stage("launch", { state = "running" })
   -- Fresh session → failures should be reported once again (the dedup is
   -- per-session, not forever).
   M._wait_notice_seen = {}
-  bootstrap_session(opts, function(ok)
-    if not ok then M._attach_in_progress = false; return end
-    local sess = M._session
+  bootstrap_session(opts, function(ok, code)
+    if not current_operation(sess) then return end
+    if not ok then
+      complete_operation(sess, code or 1, { stage = "launch", reason = "debug launch setup failed", failure = operation.failure })
+      M.stop_android_debugger()
+      return
+    end
     local P = require("ue.dap._progress")
     local pkg = sess.package_name or "?"
     local steps = wait_launch_device_steps(sess.package_name)
+    -- Set before sending the command so every cancellation/failure clears it.
+    sess.wait_mode = true
 
     -- Android-Studio-debug-button semantics: freeze the app at the JDWP
     -- "Waiting for debugger" gate from the very first instruction, attach
@@ -1768,6 +1881,7 @@ function M.launch(opts)
       { args = on_serial(steps.force_stop), optional = true },
       { args = on_serial(steps.set_wait) },
     }, function(armed, sd_out, sd_code)
+    if not current_operation(sess) then return end
     if not armed then
       -- User policy: fail with a recorded reason, do NOT silently fall back.
       -- L2: the debug-app gate is an Android policy mechanism; a non-debuggable
@@ -1788,20 +1902,31 @@ function M.launch(opts)
           .. "Is the app debuggable? Use :UEDAPAttach for a running process instead.")
           :format(pkg, tostring(sd_code), tostring(sd_out)),
         vim.log.levels.ERROR)
-      M._attach_in_progress = false
+      complete_operation(sess, 1)
       M.stop_android_debugger()
       return
     end
 
     P.step("starting activity (waiting at debugger gate) …")
-    adb_async(sess.adb, on_serial(steps.start), function()
+    adb_async(sess.adb, on_serial(steps.start), function(start_out, start_code)
+    if start_code ~= 0 then
+      report_failure({
+        layer = require("ue.dap.failure").L.TARGET_POLICY,
+        owner = "dap.android (wait-for-debugger launch)",
+        headline = "application activity did not start",
+        evidence = require("ue.dap.failure").command_evidence(steps.start, start_code, start_out),
+        remedy = "check the installed package and launch activity with :UEDAPPreflight",
+      })
+      complete_operation(sess, 1)
+      M.stop_android_debugger()
+      return
+    end
 
     -- Async pid poll (F4): does not freeze user input while the process spawns.
     pidof_async(sess.adb, sess.serial, sess.package_name, 10000, function(pid)
       -- One-shot: clear the debug-app flag as soon as the process exists (or
       -- we give up), so a later manual launch of the app is NOT gated. The
       -- already-spawned process keeps waiting regardless.
-      adb_async(sess.adb, on_serial(steps.clear_wait), function() end)
       if not pid then
         report_failure({
           layer = require("ue.dap.failure").L.TARGET_POLICY,
@@ -1814,25 +1939,32 @@ function M.launch(opts)
           ("%s did not appear within 10s after set-debug-app -w + start "
             .. "(serial=%s). See ue-dap-bp-diag.log."):format(pkg, sess.serial),
           vim.log.levels.ERROR)
-        M._attach_in_progress = false
+        complete_operation(sess, 1)
         M.stop_android_debugger()
         return
       end
 
-      sess.wait_mode = true
-      _finalize_session(sess, pid, "UE Android Launch (wait-for-debugger)", "UEDAP android launch")
-      arm_wait_mode_followup(sess)
-      M._attach_in_progress = false
-      M._start_liveness_poller()
-      vim.notify(
+      adb_async(sess.adb, on_serial(steps.clear_wait), function(clear_out, clear_code)
+        if clear_code ~= 0 then
+          complete_operation(sess, 1, { stage = "launch", reason = "debug-app gate could not be cleared", evidence = clear_out })
+          M.stop_android_debugger()
+          return
+        end
+        operation.stage("launch", { state = "done", pid = pid })
+        _finalize_session(sess, pid, "UE Android Launch (wait-for-debugger)", "UEDAP android launch")
+        arm_wait_mode_followup(sess)
+        M._start_liveness_poller()
+        vim.notify(
         "[ue.dap.android] launched " .. pkg .. " frozen at the debugger gate.\n"
         .. "Set breakpoints, then F5: the JDWP gate is released automatically and\n"
         .. "the earliest engine init runs under the debugger.",
         vim.log.levels.INFO)
-    end)
-    end)
-    end)
+      end, operation)
+    end, operation)
+    end, operation)
+    end, operation)
   end)
+  return operation.handle
 end
 
 -- ── public: reattach (same pkg/serial/symbol_lib, fresh pid) ──────────────

@@ -544,4 +544,40 @@ function M.powershell_entry()
   return M.shell_entry("powershell")
 end
 
+-- Optional Editor test capability. Resolve the executable from this engine's
+-- structured version, never from another checkout or a guessed target name.
+function M.ue_editor_test_plan(spec)
+  spec = spec or {}
+  if spec.operation ~= "list" and spec.operation ~= "run" then return nil, "unsupported test operation" end
+  local engine = tostring(spec.engine_root or "")
+  local project = tostring(spec.uproject or "")
+  if engine == "" or project == "" or vim.fn.filereadable(project) ~= 1 then
+    return nil, "test runner needs the selected engine and existing .uproject"
+  end
+  local file = io.open(vim.fs.joinpath(engine, "Engine/Build/Build.version"), "rb")
+  if not file then return nil, "cannot read selected Engine/Build/Build.version" end
+  local raw = file:read(8193)
+  file:close()
+  if not raw or #raw > 8192 then return nil, "engine version record is unreadable or exceeds 8 KiB" end
+  local ok, version = pcall(vim.json.decode, raw)
+  local binaries = { [4] = "UE4Editor-Cmd.exe", [5] = "UnrealEditor-Cmd.exe" }
+  local binary = ok and type(version) == "table" and binaries[version.MajorVersion]
+  if not binary then return nil, "unrecognized engine major version for Editor tests" end
+  local editor = vim.fs.joinpath(engine, "Engine/Binaries/Win64", binary)
+  if vim.fn.executable(editor) ~= 1 then return nil, "selected engine Editor command-line executable is unavailable" end
+  local filter = tostring(spec.filter or "")
+  if filter:find("[,;'\"\r\n]") or filter:find("\0", 1, true) then
+    return nil, "test filter contains a console command separator"
+  end
+  if spec.operation == "run" and filter == "" then return nil, "choose a test/filter before running" end
+  local command = spec.operation == "list" and "Automation List;Quit"
+    or ("Automation RunTests " .. filter .. ";Quit")
+  local argv = { editor, project, "-ExecCmds=" .. command,
+    "-NullRHI", "-NoShaderCompile", "-nosound", "-unattended", "-nosplash",
+    "-stdout", "-FullStdOutLogOutput" }
+  if spec.report_dir then argv[#argv + 1] = "-ReportExportPath=" .. spec.report_dir end
+  if spec.log_path then argv[#argv + 1] = "-abslog=" .. spec.log_path end
+  return { argv = argv, cwd = vim.fs.dirname(project), report_dir = spec.report_dir, log_path = spec.log_path }
+end
+
 return M

@@ -120,6 +120,10 @@ selection 变更 MUST NOT 改投、重绑或重新解释已经开始的 workflow
 
 ## 选型与踩坑
 
+- **选型（2026-10-03 IDE）**：命名运行配置普通字段的失败恢复使用同字段 lease 下的 revision receipt
+  compare-and-restore；值相等不能证明 ownership（含同值 ABA），拿不到 receipt 时显式保留待审阅状态。
+  相同平台/配置不调用会触发索引流水线的 setter；目标 pair 无可靠恢复 receipt 时不猜测写回旧值。
+
 - **选型**：project-key 绑定 canonical path digest 而非 basename——同一
   机器常并存多个同构 checkout（相同目录层级、相同项目名），只用 basename
   会让不同路径的项目共享同一份 cache/breakpoint，产生跨项目数据污染。

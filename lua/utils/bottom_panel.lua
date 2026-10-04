@@ -1,6 +1,7 @@
 -- One bottom split per tab. Switching content never starts jobs or log readers.
 local M = {}
 local tabs = {}
+local KEEP_BUILD_LOGS = 16
 local order = { "build", "quickfix", "logcat", "tasks" }
 local labels = { build = "构建输出", quickfix = "问题", logcat = "Logcat", tasks = "后台任务", debug = "调试" }
 local empty = {
@@ -15,14 +16,31 @@ local function valid_buf(buf)
 end
 
 local function state()
-  for tab in pairs(tabs) do
-    if not vim.api.nvim_tabpage_is_valid(tab) then tabs[tab] = nil end
+  for tab, old in pairs(tabs) do
+    if not vim.api.nvim_tabpage_is_valid(tab) then
+      local live
+      for _, row in ipairs(old.build_logs or {}) do
+        if valid_buf(row.buf) then
+          local channel = vim.bo[row.buf].channel
+          if channel > 0 and vim.fn.jobwait({ channel }, 0)[1] == -1 then
+            live = true
+          elseif #vim.fn.win_findbuf(row.buf) == 0 and vim.bo[row.buf].buftype ~= "" then
+            pcall(vim.api.nvim_buf_delete, row.buf, { force = true })
+          end
+        end
+      end
+      if not live then
+        tabs[tab] = nil
+      end
+    end
   end
   local tab = vim.api.nvim_get_current_tabpage()
   tabs[tab] = tabs[tab] or { buffers = {}, placeholders = {}, views = {} }
   local s = tabs[tab]
   for kind, buf in pairs(s.buffers) do
-    if not valid_buf(buf) then s.buffers[kind], s.views[buf] = nil, nil end
+    if not valid_buf(buf) then
+      s.buffers[kind], s.views[buf] = nil, nil
+    end
   end
   return s, tab
 end
@@ -80,13 +98,26 @@ local function tasks_buffer(s, tab)
   local rows = registry.list()
   local lines, ids = { "后台任务  ·  <CR>/dd 停止当前任务  ·  r 刷新", "" }, {}
   for _, row in ipairs(rows) do
-    lines[#lines + 1] = string.format("%d  %-10s  %s", row.id, row.status, tostring(row.name):gsub("[\r\n]", " "))
+    local result = row.result == "unknown" and "done (exit unknown)" or row.result or row.status
+    local code = row.code ~= nil and (" exit=" .. row.code) or ""
+    lines[#lines + 1] = string.format(
+      "%d  %s%s  [%s]  %s",
+      row.id,
+      result,
+      code,
+      tostring(row.group):gsub("[\r\n]", " "),
+      tostring(row.name):gsub("[\r\n]", " ")
+    )
     ids[#lines] = row.id
   end
-  if #rows == 0 then lines[#lines + 1] = "没有后台任务。" end
+  if #rows == 0 then
+    lines[#lines + 1] = "没有后台任务。"
+  end
   set_lines(buf, lines)
   local refresh = function()
-    if valid_buf(buf) then tasks_buffer(s, tab) end
+    if valid_buf(buf) then
+      tasks_buffer(s, tab)
+    end
   end
   local stop = function()
     local id = ids[vim.api.nvim_win_get_cursor(0)[1]]
@@ -120,17 +151,82 @@ end
 
 --- Register content in the current tab; hiding its window must preserve jobs.
 function M.register(kind, buf)
-  if not labels[kind] or not valid_buf(buf) then return false end
+  if not labels[kind] or not valid_buf(buf) then
+    return false
+  end
   local s, tab = state()
   s.buffers[kind] = buf
   vim.bo[buf].bufhidden = "hide"
   vim.b[buf].ue_bottom_panel_kind = kind
+  if kind == "build" then
+    s.build_logs = s.build_logs or {}
+    local found
+    for _, row in ipairs(s.build_logs) do
+      if row.buf == buf then
+        found = true
+        break
+      end
+    end
+    if not found then
+      table.insert(s.build_logs, 1, { buf = buf, title = vim.b[buf].ue_build_title or "构建输出" })
+      M.build_history()
+    end
+    vim.keymap.set("n", "gH", M.show_build_history, { buffer = buf, desc = "选择阶段构建日志" })
+  end
   for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
     if normal_win(win, tab) and vim.api.nvim_win_get_buf(win) == buf then
-      if not s.win or s.win == win then s.win, s.kind = win, kind end
+      if not s.win or s.win == win then
+        s.win, s.kind = win, kind
+      end
     end
   end
   return true
+end
+
+--- Bounded history in this tab. Live terminals and visible logs are protected.
+function M.build_history()
+  local s = state()
+  local rows, retained = {}, 0
+  for _, row in ipairs(s.build_logs or {}) do
+    if valid_buf(row.buf) then
+      local channel = vim.bo[row.buf].channel
+      local live = channel > 0 and vim.fn.jobwait({ channel }, 0)[1] == -1
+      local visible = #vim.fn.win_findbuf(row.buf) > 0
+      if live or visible or retained < KEEP_BUILD_LOGS then
+        rows[#rows + 1] = row
+        if not live then
+          retained = retained + 1
+        end
+      else
+        s.views[row.buf] = nil
+        if vim.bo[row.buf].buftype ~= "" then
+          pcall(vim.api.nvim_buf_delete, row.buf, { force = true })
+        end
+      end
+    end
+  end
+  s.build_logs = rows
+  return vim.deepcopy(rows)
+end
+
+function M.show_build_history()
+  local rows = M.build_history()
+  if #rows == 0 then
+    vim.notify("尚无阶段构建日志", vim.log.levels.INFO)
+    return
+  end
+  local _, tab = state()
+  vim.ui.select(rows, {
+    prompt = "构建 / 部署阶段日志：",
+    format_item = function(row)
+      return row.title
+    end,
+  }, function(row)
+    if row and valid_buf(row.buf) and vim.api.nvim_tabpage_is_valid(tab) then
+      vim.api.nvim_set_current_tabpage(tab)
+      M.show("build", row.buf)
+    end
+  end)
 end
 
 --- Managed bottom window in this tab, or nil after manual close/replacement.
@@ -217,7 +313,8 @@ function M.cycle()
   local s = state()
   local current = 0
   for index, kind in ipairs(order) do
-    if s.kind == kind then current = index; break end
+    if s.kind == kind then current = index
+break end
   end
   return M.show(order[current % #order + 1])
 end
@@ -238,11 +335,12 @@ end
 
 function M.setup_commands()
   vim.api.nvim_create_user_command("UEPanel", function(args)
-    if args.args == "" then M.cycle() else M.show(args.args) end
+    if args.args == "history" then M.show_build_history()
+    elseif args.args == "" then M.cycle() else M.show(args.args) end
   end, {
     nargs = "?",
-    complete = function() return vim.deepcopy(order) end,
-    desc = "切换底部面板：build/quickfix/logcat/tasks",
+    complete = function() return vim.list_extend(vim.deepcopy(order), { "history" }) end,
+    desc = "切换底部面板：build/quickfix/logcat/tasks/history",
     force = true,
   })
   vim.api.nvim_create_user_command("UEPanelNext", M.cycle, { desc = "循环切换底部面板", force = true })

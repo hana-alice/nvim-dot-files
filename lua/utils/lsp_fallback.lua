@@ -286,4 +286,16 @@ function M.references()
   return compatibility().references()
 end
 
+function M.rename(new_name)
+  return require("utils.refactor").rename(new_name)
+end
+
+function M.code_actions(opts)
+  return require("utils.refactor").code_actions(opts)
+end
+
+function M.setup_refactor_commands()
+  return require("utils.refactor").setup_commands()
+end
+
 return M

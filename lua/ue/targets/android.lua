@@ -174,20 +174,23 @@ function M.hub(state)
   local package = C.trim(state and state.android_package)
   return {
     loop_command = "UEAndroidIterate",
+    run_command = "UEAndroidIterate nodebug",
+    runtime_requires = { "adb", "device", "package" },
     actions = {
-      { group = "Run",    label = "Android loop: build SO → deploy → debug-launch", key = "<leader>ux", command = "UEAndroidIterate" },
-      { group = "Run",    label = "Android loop without debugger", command = "UEAndroidIterate nodebug" },
+      { group = "Run",    label = "Android loop: build SO → deploy → debug-launch", key = "<leader>ux", target_fields = true, command = "UEAndroidIterate" },
+      { group = "Run",    label = "Android loop without debugger", target_fields = true, command = "UEAndroidIterate nodebug" },
       { group = "Build",  label = "Build Android SO only", key = "<leader>us", command = "UEBuildAndroidSO" },
-      { group = "Build",  label = "Quick deploy Android SO", key = "<leader>uq", command = "UEDeployAndroidSO" },
-      { group = "Debug",  label = "Symbolicate latest Android crash", key = "<leader>uX", command = "UEAndroidCrash" },
+      { group = "Build",  label = "Quick deploy Android SO", key = "<leader>uq", target_fields = true, command = "UEDeployAndroidSO" },
+      { group = "Debug",  label = "Symbolicate latest Android crash", key = "<leader>uX", target_fields = true, command = "UEAndroidCrash" },
       { group = "Target", label = "Select Android device", key = "<leader>uA", command = "UESetAndroidDevice" },
     },
     fields = {
       { name = "adb", label = "adb", value = vim.fn.executable(adb) == 1 and adb or nil, doctor_only = true },
-      { name = "device", label = "Device", value = ok_dev and device.status_label() or nil, command = "UESetAndroidDevice",
+      { name = "device", label = "Device", value = ok_dev and device.status_label() or nil,
+        identity = ok_dev and device.get() or nil, command = "UESetAndroidDevice",
         -- Doctor-only async liveness: a selected serial may have been unplugged.
         check = ok_dev and device.get() and function(done) device.check_async(device.get(), done) end or nil },
-      { name = "package", label = "Package", value = package ~= "" and package or nil, command = "UESetAndroidPackage" },
+      { name = "package", label = "Package", value = package ~= "" and package or nil, command = "UESetAndroidPackage", state_key = "android_package" },
     },
   }
 end

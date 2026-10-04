@@ -61,10 +61,10 @@ end
 -- copy of DAP wiring after the production UI is moved or restructured.
 local function dap_ui_fixture(code_win)
   local source = table.concat(vim.fn.readfile(cfg .. "/lua/ue/dap.lua"), "\n")
-  local first = assert(source:find("  local logcat_buf, logcat_job\n", 1, true), "DAP UI start missing")
-  local last = assert(source:find("  local function stop_logcat()", first, true), "DAP UI end missing")
+  local first = assert(source:find("  -- UI ownership is scoped to the session and its starting tab.\n", 1, true), "DAP UI start missing")
+  local last = assert(source:find("  local function stop_logcat(", first, true), "DAP UI end missing")
   local factory = assert(loadstring(
-    "return function(D, dapui, saved_win)\n" .. source:sub(first, last - 1)
+      "return function(D, dapui)\n" .. source:sub(first, last - 1)
       .. "\nreturn { close = close_debug_layout, set_logcat = function(buf) logcat_buf = buf end }\nend",
     "@dap-bottom-ui-fixture"
   ))()
@@ -86,7 +86,7 @@ local function dap_ui_fixture(code_win)
   }
   local D = { dap_focus_main_window = function() return code_win end }
   function D.dap_bottom_tab(name, opts) return D._dap_bottom_tab_impl(name, opts) end
-  local fixture = factory(D, dapui, code_win)
+  local fixture = factory(D, dapui)
   fixture.D, fixture.repl = D, repl
   fixture.opens = function() return opens end
   fixture.closes = function() return closes end
@@ -167,7 +167,7 @@ t.describe("android_ide_panel_lifecycle: native terminal and DAP host ownership"
         t.assert_nil(dap.D._dap_bottom_tab_win)
         t.assert_eq(#vim.api.nvim_tabpage_list_wins(tab), 2)
       end
-      t.assert_eq(dap.closes(), 2)
+      t.assert_eq(dap.closes(), 0, "cleanup closes only owned IDs; broad dapui.close is not used")
       t.assert_eq(panel.show("build"), host)
       t.assert_eq(vim.api.nvim_win_get_buf(host), build)
     end)
@@ -192,14 +192,14 @@ t.describe("android_ide_panel_lifecycle: native terminal and DAP host ownership"
         t.assert_eq(#vim.api.nvim_tabpage_list_wins(tab), 1)
         t.assert_eq(vim.api.nvim_get_current_win(), code)
       end
-      t.assert_eq(dap.closes(), 2)
+      t.assert_eq(dap.closes(), 0)
       t.assert_eq(dap.renders(), 1)
       dap.D.dap_bottom_tab("repl")
       t.assert_eq(vim.api.nvim_win_get_buf(panel.window()), dap.repl)
     end)
   end)
 
-  t.it("生产 DAP toggle 从 build/tasks/quickfix 打开调试并复用 host，再按才关闭", function()
+  t.it("生产 DAP toggle 从 build/tasks/quickfix 借用 host，再按恢复原内容", function()
     isolated(function(panel, tab)
       local code = vim.api.nvim_get_current_win()
       local dap = dap_ui_fixture(code)
@@ -207,20 +207,22 @@ t.describe("android_ide_panel_lifecycle: native terminal and DAP host ownership"
       vim.fn.setqflist({}, "r", { items = { { bufnr = source, lnum = 1, text = "test error", type = "E" } } })
       for index, kind in ipairs({ "build", "tasks", "quickfix" }) do
         local host = panel.show(kind, nil, { focus = false })
+        local borrowed = vim.api.nvim_win_get_buf(host)
         t.assert_eq(#vim.api.nvim_tabpage_list_wins(tab), 2)
         dap.D._dap_toggle_debug_layout()
         t.assert_eq(dap.opens(), index, kind .. " host 存在时应打开左侧调试布局")
-        t.assert_eq(dap.closes(), index - 1, "首次 toggle 不得误调用 close")
+        t.assert_eq(dap.closes(), 0, "首次 toggle 不得误调用 broad close")
         t.assert_eq(panel.window(), host, "首次 toggle 应复用 " .. kind .. " host")
         t.assert_eq(vim.api.nvim_win_get_buf(host), dap.repl)
         t.assert_eq(#vim.api.nvim_tabpage_list_wins(tab), 2, "调试内容不得叠底部窗口")
         t.assert_eq(vim.api.nvim_get_current_win(), code)
         dap.D._dap_toggle_debug_layout()
         t.assert_eq(dap.opens(), index)
-        t.assert_eq(dap.closes(), index)
-        t.assert_false(vim.api.nvim_win_is_valid(host))
+        t.assert_eq(dap.closes(), 0)
+        t.assert_true(vim.api.nvim_win_is_valid(host), "借用的 host 必须保留")
+        t.assert_eq(vim.api.nvim_win_get_buf(host), borrowed)
         t.assert_nil(dap.D._dap_bottom_tab_win)
-        t.assert_eq(#vim.api.nvim_tabpage_list_wins(tab), 1)
+        t.assert_eq(#vim.api.nvim_tabpage_list_wins(tab), 2)
       end
     end)
   end)

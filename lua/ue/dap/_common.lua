@@ -172,7 +172,7 @@ end
 --- Run a config via nvim-dap; degrade to a notify when nvim-dap is
 --- unavailable so headless smoke tests don't crash. Platform handlers with a
 --- protocol-proven adapter (notably IOS/Xcode) may freeze its absolute path.
-function M.run(config, fallback_msg, adapter_override, adapter_options)
+function M.run(config, fallback_msg, adapter_override, adapter_options, run_options)
   local dap, err = M.require_dap()
   if not dap then
     vim.notify((fallback_msg or "DAP unavailable") .. ": " .. err, vim.log.levels.WARN)
@@ -189,7 +189,7 @@ function M.run(config, fallback_msg, adapter_override, adapter_options)
       "force", dap.adapters.lldb.options or {}, adapter_options
     )
   end
-  dap.run(config)
+  dap.run(config, run_options)
   return true
 end
 

@@ -1,0 +1,62 @@
+{
+  "UE property": {
+    "prefix": "uproperty",
+    "body": "UPROPERTY(${1:EditAnywhere}, ${2:BlueprintReadWrite}, Category = \"${3:Default}\")\n${4:float} ${5:Value};$0",
+    "description": "UE reflected property; choose type, exposure and category"
+  },
+  "UE function": {
+    "prefix": "ufunction",
+    "body": "UFUNCTION(${1:BlueprintCallable}, Category = \"${2:Default}\")\n${3:void} ${4:FunctionName}(${5});$0",
+    "description": "UE reflected function declaration"
+  },
+  "UE class": {
+    "prefix": "uclass",
+    "body": ["UCLASS(${1})", "class ${2:MODULE}_API ${3:UMyObject} : public ${4:UObject}", "{", "\tGENERATED_BODY()", "", "public:", "\t$0", "};"],
+    "description": "UE class body; set the owning module API and include its generated header last"
+  },
+  "UE struct": {
+    "prefix": "ustruct",
+    "body": ["USTRUCT(${1:BlueprintType})", "struct ${2:MODULE}_API ${3:FMyStruct}", "{", "\tGENERATED_BODY()", "", "\t$0", "};"],
+    "description": "UE reflected struct using GENERATED_BODY"
+  },
+  "UE enum": {
+    "prefix": "uenum",
+    "body": ["UENUM(${1:BlueprintType})", "enum class ${2:EMyEnum} : uint8", "{", "\t${3:Value} UMETA(DisplayName = \"${4:Value}\")$0", "};"],
+    "description": "UE reflected uint8 enum"
+  },
+  "UE log": {
+    "prefix": "ulog",
+    "body": "UE_LOG(${1:LogTemp}, ${2:Log}, TEXT(\"${3:Message}\"));$0",
+    "description": "UE log message; verbosity: Log, Display, Warning, Error, Verbose, VeryVerbose"
+  },
+  "UE log declaration": {
+    "prefix": "ulogdeclare",
+    "body": "DECLARE_LOG_CATEGORY_EXTERN(${1:LogCategory}, ${2:Log}, All);$0",
+    "description": "Declare a UE log category in a header"
+  },
+  "UE log definition": {
+    "prefix": "ulogdefine",
+    "body": "DEFINE_LOG_CATEGORY(${1:LogCategory});$0",
+    "description": "Define a UE log category in one source file"
+  },
+  "UE generated header": {
+    "prefix": "ugenerated",
+    "body": "#include \"${TM_FILENAME_BASE}.generated.h\"$0",
+    "description": "Generated header; must be the last include in the reflected header"
+  },
+  "UE cast": {
+    "prefix": "ucast",
+    "body": "Cast<${1:UMyObject}>(${2:Object})$0",
+    "description": "UE UObject cast"
+  },
+  "UE class reference": {
+    "prefix": "usubclassof",
+    "body": "TSubclassOf<${1:UMyObject}> ${2:Class};$0",
+    "description": "Type-safe UE class reference"
+  },
+  "UE default subobject": {
+    "prefix": "ucreatedefaultsubobject",
+    "body": "${1:Component} = CreateDefaultSubobject<${2:UActorComponent}>(TEXT(\"${1:Component}\"));$0",
+    "description": "Create a default component in the owning actor constructor"
+  }
+}

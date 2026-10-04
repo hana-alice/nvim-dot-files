@@ -35,6 +35,8 @@ local function dependencies(request)
       logger.notify_error(scope, message)
     end,
     reinvoke = deps.reinvoke,
+    on_exit = deps.on_exit,
+    is_current = deps.is_current,
   }
 end
 
@@ -109,15 +111,16 @@ end
 function M.prepare(request, opts)
   opts = opts or {}
   local deps = dependencies(request)
-  if type(deps.resolve_context) ~= "function" then
+  local frozen = request.snapshot and runtime.unwrap(request.snapshot)
+  if not frozen and type(deps.resolve_context) ~= "function" then
     return nil, "Android launch workflow requires resolve_context"
   end
-  local ctx, context_err = deps.resolve_context()
+  local ctx, context_err = frozen and frozen.context or deps.resolve_context()
   if not ctx then
     return nil, context_err
   end
 
-  local serial = deps.android_device.get()
+  local serial = frozen and frozen.device.serial or deps.android_device.get()
   if not serial then
     if opts.prompt_device == false then
       return nil, "Android device is not selected; run :UESetAndroidDevice"
@@ -134,7 +137,12 @@ function M.prepare(request, opts)
   if not adb then
     return nil, adb_err
   end
-  local package_name, package_err = read_package(ctx, deps, serial, adb)
+  local package_name, package_err
+  if frozen then
+    package_name = frozen.runtime.package_name
+  else
+    package_name, package_err = read_package(ctx, deps, serial, adb)
+  end
   if not package_name then
     return nil, package_err
   end
@@ -142,7 +150,7 @@ function M.prepare(request, opts)
   local plan = deps.targets.plan(request.target_id or "Android", "launch", {
     config_root = deps.config_root,
     cwd = deps.cwd,
-    adb = snapshot.runtime.adb,
+    adb = snapshot.runtime.adb or adb,
     device_id = snapshot.device.serial,
     package_name = snapshot.runtime.package_name,
   }, deps.host_driver)
@@ -163,6 +171,10 @@ function M.run(request)
   if not prepared then
     if prepare_err ~= "device-selection-pending" and prepare_err ~= "package-selection-pending" then
       dependencies(request).notify_error("ue_launch", prepare_err)
+    end
+    local callback = dependencies(request).on_exit
+    if type(callback) == "function" then
+      callback(-1, prepare_err)
     end
     return nil, prepare_err
   end
@@ -189,6 +201,13 @@ function M.run(request)
     end,
     on_exit = function(_, code)
       deps.schedule(function()
+        local current = not deps.is_current or deps.is_current()
+        if type(deps.on_exit) == "function" then
+          deps.on_exit(code, vim.deepcopy(output))
+        end
+        if not current then
+          return
+        end
         if code == 0 then
           deps.notify(
             "ue_launch",
@@ -198,7 +217,9 @@ function M.run(request)
           return
         end
         local detail = #output > 0 and ("\n" .. table.concat(output, "\n")) or ""
-        if deps.android_device.report_if_gone and deps.android_device.report_if_gone(detail, snapshot.device.serial) then
+        if
+          deps.android_device.report_if_gone and deps.android_device.report_if_gone(detail, snapshot.device.serial)
+        then
           return
         end
         deps.notify_error("ue_launch", ("Android launch failed (exit %d)%s"):format(code, detail))
@@ -208,6 +229,9 @@ function M.run(request)
   if not ok or not jobid or jobid <= 0 then
     local message = "Failed to start Android launch job"
     deps.notify_error("ue_launch", message)
+    if type(deps.on_exit) == "function" then
+      deps.on_exit(-1, message)
+    end
     return nil, message, snapshot
   end
   if deps.task_registry and type(deps.task_registry.register) == "function" then

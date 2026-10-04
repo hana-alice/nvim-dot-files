@@ -32,6 +32,8 @@ nvim --headless -l tests/run_parallel.lua   # 本地并行全量（每文件独�
 | 改动位置 | 最小必跑 filter |
 |---|---|
 | `lua/config/keymaps.lua` / 命令定义 | `keymaps` `commands` `review_editor` |
+| IDE 修改、文本恢复、会话与重启 | `ide_refactor` `ide_recovery` `ide_continuity` `ide_session` `commands` |
+| IDE 运行配置、Editor 测试与模块类生成 | `ide_workflow` `ide_run_profiles` `ide_ue_tools` `ide_hub` `platform` `commands` |
 | picker 交互 / sidebar / 插件工具链策略 | `review_editor` `smoke` |
 | Git 审阅路由 / Git 插件接线 / `lua/workarounds/codediff/**` | `git_review` `review_editor` `keymaps` `cheatsheet` `workarounds` `smoke` |
 | CI bootstrap / workflow / legacy smoke | `review_ci` + 全量 + legacy smoke |

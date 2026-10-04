@@ -100,8 +100,10 @@ return {
             desc = "Type hierarchy: base types (基类)", has = "prepareTypeHierarchy" },
           { "<leader>cD", function() require("utils.ue_goto.type_hierarchy").open("subtypes") end,
             desc = "Type hierarchy: derived types (派生类)", has = "prepareTypeHierarchy" },
-          { "<leader>cr", vim.lsp.buf.rename, desc = "Rename symbol", has = "rename" },
-          { "<leader>ca", vim.lsp.buf.code_action, desc = "Code action", mode = { "n", "x" }, has = "codeAction" },
+          { "<leader>cr", function() require("utils.lsp_fallback").rename() end,
+            desc = "Rename symbol (preview)", has = "rename" },
+          { "<leader>ca", function() require("utils.lsp_fallback").code_actions() end,
+            desc = "Code action (server / preview)", mode = { "n", "x" }, has = "codeAction" },
           {
             "gd",
             definition_fallback,

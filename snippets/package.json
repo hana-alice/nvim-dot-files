@@ -1,0 +1,6 @@
+{
+  "name": "nvim-ue-audited-snippets",
+  "contributes": {
+    "snippets": [{ "language": "unreal", "path": "./unreal.json" }]
+  }
+}

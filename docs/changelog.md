@@ -78,6 +78,8 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v2.3.1` → [docs/release_2.3.1.md](release_2.3.1.md) (daily file protection and discovery; tag pending)
 
+- `v2.3.2` → [docs/release_2.3.2.md](release_2.3.2.md) (navigation and editing entry fixes; tag pending)
+
 ## Unreleased
 
-本轮已归档到 [2.3.1](release_2.3.1.md)。
+本轮已归档到 [2.3.2](release_2.3.2.md)。

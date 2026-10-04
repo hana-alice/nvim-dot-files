@@ -153,6 +153,7 @@ search `aA` to find that pair directly.
 | `<A-j>` / `<A-k>`| Move line / selection up / down         |
 | `.`              | Repeat last change                      |
 | `u` / `<C-r>`    | Undo / redo                             |
+| `<leader>su`     | Current file undo history (Snacks)       |
 | `<C-s>`          | Save file                               |
 
 ## Vim Fundamentals — Text Objects
@@ -181,6 +182,7 @@ Use with `c`, `d`, `y`, `v`: `{operator}{a/i}{object}`
 | `V`                     | Line-wise visual                   |
 | `<C-v>`                 | Block visual (column select)       |
 | `gv`                    | Reselect last visual               |
+| `<C-Space>` / `<BS>`     | Syntax selection: expand / shrink (requires parser) |
 | `o`                     | Jump to other end of selection     |
 | `>` / `<`               | Indent / unindent selection        |
 | `=`                     | Auto-indent selection              |
@@ -197,8 +199,28 @@ Use with `c`, `d`, `y`, `v`: `{operator}{a/i}{object}`
 | `:s/old/new/g`          | Replace in current line            |
 | `:%s/old/new/gc`        | Replace all in file with confirm   |
 | `:%s/\<Name\>/New/gc`   | Replace exact word                 |
-| `<leader>sr`            | Cross-file find/replace tool       |
+| `<leader>sr`            | Current word in buffer (n) / selected text in selected rows (x); confirm each |
+| `y` / `n` / `a` / `q`   | Substitute: replace / skip / remaining / stop |
 | `:noh`                  | Clear search highlight             |
+
+`<leader>sr` keeps this scope after GrugFar loads. `:GrugFar` is a separate
+multi-file disk tool, outside the protected refactor preview/batch-undo flow.
+For task recipes, see [the user guide](USER_GUIDE.md#替换文本再检查结果).
+
+### Language diagnostics and quickfix results
+
+| Key | Action |
+|---|---|
+| `<leader>xx` / `<leader>xX` | All / current-file language diagnostics (Trouble) |
+| `<leader>sd` / `<leader>sD` | Search all / current-file diagnostics |
+| `<leader>cd` | Diagnostic details |
+| `]d` / `[d`; `]e` / `[e` | Next / previous diagnostic; errors only |
+| `]q` / `[q` | Next / previous current native quickfix result, with count |
+| `gb` / `s` in Trouble | Current-file / severity filter |
+
+An unrelated Trouble sidebar does not reroute `]q` / `[q`. Search, build and
+crash share the native result history; select a retained build list through
+`:UEWorkspace results` before continuing through that build's entries.
 
 ## Vim Fundamentals — Marks & Jumps
 

@@ -59,7 +59,9 @@ try:
       vim.fn.bufload(other);vim.bo[other].buflisted=true
     """,cfg,data,directory.as_posix())
     if entry.startswith('picker'):
-        instance.lua("""picker=Snacks.picker.buffers({pattern='Alpha.cpp'});
+        # Buffer text includes its full path and trailing filetype fields.
+        # Scope to the exact file suffix so temp-directory text cannot match Beta.
+        instance.lua("""picker=Snacks.picker.buffers({pattern='file:Alpha.cpp$'});
           assert(vim.wait(2000,function() return picker.list:count()==1 and picker:current().buf==source_buf end,10))""")
         if entry == 'picker_dd':
             instance.lua('vim.api.nvim_set_current_win(picker.list.win.win);vim.cmd.stopinsert()')

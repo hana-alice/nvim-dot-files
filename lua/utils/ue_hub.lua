@@ -53,8 +53,8 @@ M.actions = {
   { group = "Code", label = "Switch source / header / 切换头文件源文件", key = "<leader>ch", run = code_key("<leader>ch") },
   { group = "Code", label = "Incoming calls / 谁调用了它", key = "<leader>cI", run = code_key("<leader>cI") },
   { group = "Code", label = "Outgoing calls / 它调用了谁", key = "<leader>cO", run = code_key("<leader>cO") },
-  { group = "Code", label = "Workspace symbols / 类名、函数名", key = "<leader>sS", run = code_key("<leader>sS") },
-  { group = "Code", label = "Document symbols / 当前文件大纲", key = "<leader>ss", run = code_key("<leader>ss") },
+  { group = "Code", label = "Workspace symbols / 类名、函数名", key = "<leader>sS", method = "workspace/symbol", run = mapped_key("<leader>sS") },
+  { group = "Code", label = "Document symbols / 当前文件大纲", key = "<leader>ss", always = true, run = mapped_key("<leader>ss") },
   { group = "Code", label = "Base types / 基类", key = "<leader>cB", run = code_key("<leader>cB") },
   { group = "Code", label = "Derived types / 派生类", key = "<leader>cD", run = code_key("<leader>cD") },
   { group = "Read", label = "Peek definition / 预览定义并保留上下文", run = cmd("UEPeek") },
@@ -69,6 +69,10 @@ M.actions = {
   { group = "Code", label = "Code action / 代码操作", key = "<leader>ca", run = code_key("<leader>ca") },
   { group = "Code", label = "Undo refactor batch / 撤销上次整批修改", run = cmd("UERefactorUndo") },
   { group = "Code", label = "Refactor recovery / 查看修改恢复记录", run = cmd("UERefactorRecovery") },
+  { group = "Edit", label = "Replace word in current file / 当前文件替换光标词（逐个确认）", key = "<leader>sr", run = mapped_key("<leader>sr") },
+  { group = "Edit", label = "Undo history / 当前文件撤销历史", key = "<leader>su", run = function() require("snacks").picker.undo() end },
+  { group = "Read", label = "Jump history / 跳转位置历史", key = "<leader>sj", run = function() require("snacks").picker.jumps() end },
+  { group = "Read", label = "Marks / 书签标记", key = "<leader>sm", run = function() require("snacks").picker.marks() end },
   { group = "Code", label = "Create UE class / 预览并创建类", requires = { "project" }, run = cmd("UENewClass") },
   { group = "Code", label = "Format safely / 安全格式化", key = "<leader>cf", run = cmd("UEFormat") },
   { group = "Code", label = "Format with UE style / 用 UE 风格格式化", run = cmd("UEFormat epic") },
@@ -120,7 +124,10 @@ M.actions = {
   { group = "Tasks",  label = "Background tasks (list / stop)", key = "<leader>X", run = cmd("Tasks") },
   { group = "Panels", label = "Cycle bottom panel / 底部面板", key = "<leader>uJ", run = cmd("UEPanelNext") },
   { group = "Panels", label = "Build output / 构建输出", run = cmd("UEPanel build") },
-  { group = "Panels", label = "Problems / 问题列表", run = cmd("UEPanel quickfix") },
+  { group = "Problems", label = "All diagnostics / 全部文件错误与警告", key = "<leader>xx", run = function() require("trouble").toggle("diagnostics") end },
+  { group = "Problems", label = "Current file diagnostics / 当前文件错误与警告", key = "<leader>xX", run = function() require("trouble").toggle({ mode = "diagnostics", filter = { buf = 0 } }) end },
+  { group = "Problems", label = "Search diagnostics / 搜索错误与警告", key = "<leader>sd", run = function() require("snacks").picker.diagnostics() end },
+  { group = "Panels", label = "Quickfix results / 当前结果列表（搜索、构建、崩溃）", run = cmd("UEPanel quickfix") },
   { group = "Panels", label = "Logcat / 日志", run = cmd("UEPanel logcat") },
   { group = "Panels", label = "Background tasks / 后台任务", run = cmd("UEPanel tasks") },
   { group = "Tasks",  label = "Stop all background tasks", key = "<leader>XA", run = cmd("TaskStopAll") },
@@ -399,19 +406,23 @@ local function pick(items, prompt, format, on_choice)
       preview = "none",
       layout = { preset = "vscode" },
       confirm = function(picker, choice)
-        if picker.closed then
-          return
-        end
-        local closed, err = pcall(picker.close, picker)
-        if not closed then
-          vim.notify("未能关闭动作列表，操作已取消: " .. tostring(err), vim.log.levels.WARN)
-          return
-        end
-        if choice then
-          vim.schedule(function()
-            on_choice(choice.data)
-          end)
-        end
+        if picker.closed then return end
+        -- Finish insert mode in the picker before restoring its source window.
+        picker:norm(function()
+          if picker.closed then
+            return
+          end
+          local closed, err = pcall(picker.close, picker)
+          if not closed then
+            vim.notify("未能关闭动作列表，操作已取消: " .. tostring(err), vim.log.levels.WARN)
+            return
+          end
+          if choice then
+            vim.schedule(function()
+              on_choice(choice.data)
+            end)
+          end
+        end)
       end,
     })
   end

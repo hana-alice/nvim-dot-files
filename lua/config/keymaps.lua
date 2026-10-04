@@ -218,6 +218,17 @@ local function sidebar_pick()
   require("utils.sidebar").pick()
 end
 
+local function quickfix_jump(command)
+  return function()
+    local ok, err = pcall(vim.cmd[command], { count = vim.v.count1 })
+    if not ok then vim.notify(tostring(err), vim.log.levels.WARN) end
+  end
+end
+
+-- Result navigation stays on the native list, regardless of open sidebars.
+map("n", "]q", quickfix_jump("cnext"), { desc = "Next quickfix result" })
+map("n", "[q", quickfix_jump("cprev"), { desc = "Previous quickfix result" })
+
 local function apply_ue_runtime_overrides()
   local opts = { nowait = true }
 

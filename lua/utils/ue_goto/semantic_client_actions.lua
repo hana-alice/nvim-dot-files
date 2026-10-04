@@ -22,7 +22,7 @@ function M.install(client, deps)
     end
   end
 
-  function client.begin_action(bufnr)
+  function client.begin_action(bufnr, scope)
     if not bufnr or bufnr == 0 then bufnr = vim.api.nvim_get_current_buf() end
     client.cancel_action()
     state.next_action_token = state.next_action_token + 1
@@ -34,27 +34,34 @@ function M.install(client, deps)
       cursor = vim.api.nvim_win_get_cursor(0),
       changedtick = vim.api.nvim_buf_get_changedtick(bufnr),
       document_version = vim.api.nvim_buf_get_changedtick(bufnr),
+      focus_is_current = scope and scope.is_current,
     }
     local function invalidate()
-      if state.active_action_token == snapshot.token then client.cancel_action() end
+      if state.active_action_token ~= snapshot.token then return end
+      -- An owned picker can emit CursorMoved while returning focus even when
+      -- its source snapshot is unchanged. Keep listening after that event.
+      if snapshot.focus_is_current and client.snapshot_is_current(snapshot) then return end
+      client.cancel_action()
     end
-    local ok_buffer, buffer_id = pcall(vim.api.nvim_create_autocmd, {
-      "CursorMoved", "CursorMovedI", "BufLeave", "TextChanged", "TextChangedI",
-    }, {
+    local events = { "CursorMoved", "CursorMovedI", "TextChanged", "TextChangedI" }
+    if not snapshot.focus_is_current then events[#events + 1] = "BufLeave" end
+    local ok_buffer, buffer_id = pcall(vim.api.nvim_create_autocmd, events, {
       buffer = bufnr,
-      once = true,
+      once = not snapshot.focus_is_current,
       callback = invalidate,
       desc = "Invalidate stale C++ semantic definition action",
     })
     if ok_buffer then state.action_autocmds[#state.action_autocmds + 1] = buffer_id end
-    local ok_window, window_id = pcall(vim.api.nvim_create_autocmd, "WinLeave", {
+    if not snapshot.focus_is_current then
+      local ok_window, window_id = pcall(vim.api.nvim_create_autocmd, "WinLeave", {
       once = true,
       callback = function()
         if vim.api.nvim_get_current_win() == snapshot.winid then invalidate() end
       end,
       desc = "Invalidate C++ semantic action when its window is left",
     })
-    if ok_window then state.action_autocmds[#state.action_autocmds + 1] = window_id end
+      if ok_window then state.action_autocmds[#state.action_autocmds + 1] = window_id end
+    end
     return snapshot
   end
 
@@ -86,7 +93,10 @@ function M.install(client, deps)
   function client.snapshot_is_current(snapshot, response)
     if not snapshot or snapshot.token ~= state.active_action_token then return false, "superseded" end
     if not vim.api.nvim_win_is_valid(snapshot.winid) then return false, "window-invalid" end
-    if vim.api.nvim_get_current_win() ~= snapshot.winid then return false, "window-changed" end
+    if snapshot.focus_is_current then
+      local ok, current = pcall(snapshot.focus_is_current)
+      if not ok or not current then return false, "reading-owner-changed" end
+    elseif vim.api.nvim_get_current_win() ~= snapshot.winid then return false, "window-changed" end
     if vim.api.nvim_win_get_buf(snapshot.winid) ~= snapshot.bufnr then return false, "buffer-changed" end
     if vim.api.nvim_buf_get_changedtick(snapshot.bufnr) ~= snapshot.changedtick then
       return false, "document-changed"

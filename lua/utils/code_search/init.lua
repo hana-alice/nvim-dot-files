@@ -22,14 +22,19 @@
 --   require("utils.code_search").stream(ctx, pattern, opts, callbacks)
 --       Spawn a search; callbacks = { on_line, on_done }.
 --       on_line(file, lnum, col, text)
---       on_done(exit_code, err_msg | nil)
+--       on_line's optional fifth argument proves a byte span or marks line-only;
+--       col is nil when csearch cannot prove a literal span (including regex).
+--       on_done(exit_code, err_msg | nil, terminal_metadata)
 --       Returns a stop() function the caller can invoke to kill the proc.
+--       stop(reason) returns canceled metadata and never calls back afterwards.
 --
 -- opts: { code_only = bool, max_count = int, smart_case = bool,
 --         regex = bool (default true; false = literal/fixed-string),
 --         word  = bool (whole-word match, wraps pattern in \b...\b),
 --         case  = bool (case-sensitive; nil/false = smart-case behavior),
---         ignore_case = bool (force case-insensitive unless case=true) }
+--         ignore_case = bool (force case-insensitive unless case=true),
+--         require_index = bool (never permit rg even if the index disappears),
+--         timeout_ms = int (default 30000) }
 
 local M = {}
 
@@ -239,388 +244,158 @@ end
 M._escape_re2_literal_for_test = escape_re2_literal
 
 local function stream_csearch(ctx, pattern, opts, callbacks)
+  local reader_class = require("utils.code_search.stream_reader")
+  local location = require("utils.code_search.location")
+  local raw_needle = pattern
+  local reader = reader_class.new({
+    backend = "csearch",
+    max_count = opts.max_count,
+    timeout_ms = opts.timeout_ms,
+    parse = function(line)
+      if line == "" then
+        return nil
+      end
+      local search_start = line:sub(2, 2) == ":" and 3 or 1
+      local file_end = line:find(":", search_start, true)
+      if not file_end then
+        return nil
+      end
+      local lnum, text = line:sub(file_end + 1):match("^(%d+):(.*)$")
+      if not lnum then
+        return nil
+      end
+      local col, span = location.literal(text, raw_needle, opts)
+      return { file = line:sub(1, file_end - 1), lnum = tonumber(lnum), col = col, text = text, location = span }
+    end,
+  }, callbacks)
   local cs = csearch_exe()
   if not cs then
-    callbacks.on_done(1, "csearch not found in PATH")
-    return function() end
+    return reader:attach(nil, "csearch not found in PATH")
   end
-
-  -- Keep the user's ORIGINAL untransformed text for column estimation
-  -- below. Pattern rewrites (literal escape, \b wrap, (?i) prefix) only
-  -- affect what we hand to csearch; column-finding still uses the raw
-  -- needle, which is what actually appears in matched text.
-  local raw_needle = pattern
-
   local args = { "-n" }
-  -- csearch supports a SINGLE -f fileregexp; compose code_only + path_filter
-  -- into one RE2 (see M._compose_file_regex). nil → no -f.
   local file_re = M._compose_file_regex(opts)
   if file_re then
-    table.insert(args, "-f")
-    table.insert(args, file_re)
+    vim.list_extend(args, { "-f", file_re })
   end
-
-  -- Pattern rewrite pipeline. ORDER MATTERS: literal-escape first (so
-  -- subsequent \b additions are not themselves escaped), then word-wrap,
-  -- then case-flag injection.
-  --
-  -- regex defaults to TRUE (caller treats pattern as RE2). When false,
-  -- the input is taken literally — every RE2 metachar is escaped. This
-  -- is the fix for "\Pr" / "[1-9]" / "(foo|bar)" etc. silently exploding
-  -- csearch's RE2 parser ("error parsing regexp: invalid character class
-  -- range: `\Pr`"). Anything the user types is matched verbatim.
-  local is_regex = opts.regex ~= false
-  if not is_regex then
+  if opts.regex == false then
     pattern = escape_re2_literal(pattern)
   end
-
   if opts.word then
     pattern = "\\b" .. pattern .. "\\b"
   end
-
-  -- Case sensitivity. opts.case=true → strict case-sensitive (no (?i)).
-  -- opts.ignore_case=true → unconditional (?i), used by UE grep so
-  -- camelCase queries like r.useLandscape still match r.UseLandscape...
-  -- opts.case=nil/false without ignore_case keeps the legacy smart-case
-  -- behavior (lowercase pattern ⇒ (?i)) for non-UE callers.
-  local case_sensitive = opts.case == true
-  if not case_sensitive and opts.ignore_case == true then
+  if location.ignore_case(raw_needle, opts) then
     pattern = "(?i)" .. pattern
-  elseif not case_sensitive and opts.smart_case ~= false then
-    -- Only inject (?i) when there's no uppercase in the ORIGINAL search
-    -- text. After literal-escape "Foo.Bar" becomes "Foo\.Bar" which
-    -- still has uppercase, so this still works correctly.
-    if not pattern:match("%u") then
-      pattern = "(?i)" .. pattern
-    end
   end
-  table.insert(args, pattern)
-
-  local stdout = vim.loop.new_pipe(false)
-  local stderr = vim.loop.new_pipe(false)
-  local stderr_buf = {}
-  local handle
-  local closed = false
-  local leftover = ""
-
-  -- csearch uses CSEARCHINDEX env var. Pass per-workspace index.
+  args[#args + 1] = pattern
   local env = {}
-  for k, v in pairs(vim.fn.environ()) do
-    if k ~= "CSEARCHINDEX" then
-      table.insert(env, k .. "=" .. v)
+  for key, value in pairs(vim.fn.environ()) do
+    if key ~= "CSEARCHINDEX" then
+      env[#env + 1] = key .. "=" .. value
     end
   end
-  table.insert(env, "CSEARCHINDEX=" .. M.index_path(ctx))
-
-  -- Stopped is set the moment the picker tells us to stop. From this
-  -- point on we MUST NOT call any callback — the picker has marked its
-  -- finder done and any further yield trips snacks' "yielded after done"
-  -- bug-trap (which spams the user with red Snacks Picker Finder errors).
-  local stopped = false
-
-  local function safe_close()
-    if closed then return end
-    closed = true
-    if stdout then pcall(stdout.read_stop, stdout) end
-    if stderr then pcall(stderr.read_stop, stderr) end
-    if stdout then pcall(stdout.close, stdout) end
-    if stderr then pcall(stderr.close, stderr) end
-  end
-
-  local function safe_kill()
-    if handle and not closed then
-      pcall(handle.kill, handle, "sigterm")
-    end
-  end
-
-  -- Pre-compile a Lua plain-find pattern for column estimation.
-  -- Uses raw_needle (untransformed user text), not the post-rewrite
-  -- pattern which may be \b-wrapped or backslash-escaped.
-  local needle = raw_needle:lower()
-
-  local emitted = 0
-  local max_count = opts.max_count or 5000
-
-  -- DELIVERY ORDERING (fix 2026-06-12 — "<leader>/ drops trailing hits"):
-  -- We must guarantee on_done() fires STRICTLY AFTER every on_line() for this
-  -- search. The old code did `vim.schedule(on_line)` per line AND
-  -- `vim.schedule(on_done)` from the exit callback. libuv does not order the
-  -- exit event after the final stdout-data event, and even when it does, the
-  -- per-line schedules and the on_done schedule are independent queue entries
-  -- whose relative order is not guaranteed — so on_done could run while the
-  -- last few on_line callbacks were still queued. The ue.lua drain loop keys
-  -- off on_done (done=true) to stop draining, so those late lines were never
-  -- delivered → 2–4 trailing hits silently dropped.
-  --
-  -- Fix: parse lines SYNCHRONOUSLY in the read callback into `parsed` (no
-  -- per-line schedule), and run a SINGLE scheduled flusher that (a) delivers
-  -- all parsed-but-undelivered lines, then (b) calls on_done — but only once
-  -- the process has exited. A flush is requested on every data chunk (to keep
-  -- the picker streaming) and on exit; the flusher always drains the full
-  -- backlog before signalling done, so no line can be stranded behind on_done.
-  local parsed = {}        -- { {file,lnum,col,text}, ... } parsed, not yet delivered
-  local delivered_idx = 0  -- high-water mark of parsed[] handed to on_line
-  local proc_exited = false
-  local exit_code = 0
-  local exit_err = nil
-  local flush_scheduled = false
-  local done_called = false
-
-  local function flush()
-    flush_scheduled = false
-    if stopped then return end
-    -- Deliver every parsed line we haven't delivered yet.
-    while delivered_idx < #parsed do
-      delivered_idx = delivered_idx + 1
-      local it = parsed[delivered_idx]
-      if stopped then return end
-      callbacks.on_line(it.file, it.lnum, it.col, it.text)
-    end
-    -- Only signal done after the process exited AND the full backlog is
-    -- delivered. If more data is still arriving, proc_exited is false and we
-    -- bail; the next flush (or the exit flush) will finish the job.
-    if proc_exited and not done_called then
-      done_called = true
-      callbacks.on_done(exit_code, exit_err)
-    end
-  end
-
-  local function request_flush()
-    if flush_scheduled or stopped then return end
-    flush_scheduled = true
-    vim.schedule(flush)
-  end
-
-  handle = vim.loop.spawn(cs, {
+  env[#env + 1] = "CSEARCHINDEX=" .. M.index_path(ctx)
+  local handle, err = vim.loop.spawn(cs, {
     args = args,
     env = env,
-    stdio = { nil, stdout, stderr },
-  }, function(code)
-    safe_close()
-    if handle then handle:close() end
-    if stopped then return end
-    exit_code = code
-    exit_err = code ~= 0 and table.concat(stderr_buf, "") or nil
-    proc_exited = true
-    -- Force a final flush even if one is already scheduled — the scheduled one
-    -- may have run before proc_exited flipped, leaving done uncalled.
-    flush_scheduled = true
-    vim.schedule(flush)
+    stdio = { nil, reader.stdout, reader.stderr },
+  }, function(code, signal)
+    reader:exit(code, signal)
   end)
-
-  if not handle then
-    safe_close()
-    vim.schedule(function()
-      if stopped then return end
-      callbacks.on_done(1, "failed to spawn csearch")
-    end)
-    return function() stopped = true end
-  end
-
-  stdout:read_start(function(_, data)
-    if stopped then return end
-    if not data then return end
-    leftover = leftover .. data
-    while true do
-      local nl = leftover:find("\n")
-      if not nl then break end
-      local line = leftover:sub(1, nl - 1):gsub("\r$", "")
-      leftover = leftover:sub(nl + 1)
-      if line ~= "" and emitted < max_count and not stopped then
-        -- Format: <file>:<lnum>:<text>
-        -- Files on Windows can start with C:\ — find the FIRST `:` AFTER
-        -- the drive letter pair.
-        local search_start = 1
-        if line:sub(2, 2) == ":" then search_start = 3 end
-        local file_end = line:find(":", search_start, true)
-        if file_end then
-          local file = line:sub(1, file_end - 1)
-          local rest = line:sub(file_end + 1)
-          local lnum_str, text = rest:match("^(%d+):(.*)$")
-          if lnum_str and text then
-            local lnum = tonumber(lnum_str) or 1
-            local col = (text:lower():find(needle, 1, true) or 1)
-            emitted = emitted + 1
-            -- Parse synchronously; deliver via the single flusher. This keeps
-            -- on_line strictly before on_done (see ordering note above).
-            parsed[#parsed + 1] = { file = file, lnum = lnum, col = col, text = text }
-          end
-        end
-      end
-    end
-    request_flush()
-  end)
-  stderr:read_start(function(_, data)
-    if stopped then return end
-    if data then table.insert(stderr_buf, data) end
-  end)
-
-  return function()
-    -- Picker is done with us. Mark stopped FIRST so any in-flight
-    -- vim.schedule callback short-circuits before touching the picker,
-    -- THEN kill+close. Order matters: scheduled callbacks already on the
-    -- main-loop queue would otherwise still call on_line.
-    stopped = true
-    safe_kill()
-    safe_close()
-  end
+  return reader:attach(handle, err)
 end
 
 -- ── rg fallback ──────────────────────────────────────────────────────────
 
 local function stream_rg(ctx, pattern, opts, callbacks)
+  local location = require("utils.code_search.location")
+  local reader = require("utils.code_search.stream_reader").new({
+    backend = "rg",
+    max_count = opts.max_count,
+    timeout_ms = opts.timeout_ms,
+    record_end = function(buffer)
+      local nul = buffer:find("\0", 1, true)
+      local newline = nul and buffer:find("\n", nul + 1, true)
+      return newline, newline
+    end,
+    parse = function(record)
+      local file_end = record:find("\0", 1, true)
+      if not file_end then
+        return nil
+      end
+      local lnum, col, text = record:sub(file_end + 1):match("^(%d+):(%d+):(.*)$")
+      if not lnum then
+        return nil
+      end
+      col = tonumber(col)
+      local _, span = location.literal(text, pattern, opts)
+      if not span or span.precision ~= "exact" or span.byte_start0 ~= col - 1 then
+        span = { precision = "column", byte_start0 = col - 1, reason = "rg-column-without-end-span" }
+      end
+      return { file = record:sub(1, file_end - 1), lnum = tonumber(lnum), col = col, text = text, location = span }
+    end,
+  }, callbacks)
   local rg = vim.fn.exepath("rg")
   if rg == "" then
-    callbacks.on_done(1, "rg not found and no csearch index available")
-    return function() end
+    return reader:attach(nil, "rg not found and no csearch index available")
   end
-
   local args = {
-    "--color=never", "--no-heading", "--with-filename",
-    "--line-number", "--column",
-    "--max-columns=500", "-0",
-    "-j", "32", "--mmap",
+    "--color=never",
+    "--no-heading",
+    "--with-filename",
+    "--line-number",
+    "--column",
+    "--max-columns=500",
+    "-0",
+    "-j",
+    "32",
+    "--mmap",
   }
   if opts.case == true then
-    table.insert(args, "--case-sensitive")
+    args[#args + 1] = "--case-sensitive"
   elseif opts.ignore_case == true then
-    table.insert(args, "--ignore-case")
+    args[#args + 1] = "--ignore-case"
   else
-    table.insert(args, "--smart-case")
+    args[#args + 1] = "--smart-case"
   end
-  for _, ex in ipairs(opts.exclude_dirs or {}) do
-    table.insert(args, "-g"); table.insert(args, "!**/" .. ex .. "/**")
+  if opts.regex == false then
+    args[#args + 1] = "--fixed-strings"
+  end
+  if opts.word then
+    args[#args + 1] = "--word-regexp"
+  end
+  for _, exclude in ipairs(opts.exclude_dirs or {}) do
+    vim.list_extend(args, { "-g", "!**/" .. exclude .. "/**" })
   end
   if opts.code_only then
-    for _, ext in ipairs({ "cpp","c","cc","cxx","h","hpp","hh","hxx","inl",
-                            "cs","usf","ush","hlsl","hlsli" }) do
-      table.insert(args, "-g"); table.insert(args, "*." .. ext)
+    for _, ext in ipairs({
+      "cpp",
+      "c",
+      "cc",
+      "cxx",
+      "h",
+      "hpp",
+      "hh",
+      "hxx",
+      "inl",
+      "cs",
+      "usf",
+      "ush",
+      "hlsl",
+      "hlsli",
+    }) do
+      vim.list_extend(args, { "-g", "*." .. ext })
     end
   end
-  table.insert(args, "--"); table.insert(args, pattern)
-  for _, dir in ipairs(opts.search_dirs or {}) do
-    table.insert(args, dir)
-  end
-
-  local stdout = vim.loop.new_pipe(false)
-  local stderr = vim.loop.new_pipe(false)
-  local stderr_buf = {}
-  local handle
-  local closed = false
-  local leftover = ""
-  local stopped = false
-
-  local function safe_close()
-    if closed then return end
-    closed = true
-    if stdout then pcall(stdout.read_stop, stdout) end
-    if stderr then pcall(stderr.read_stop, stderr) end
-    if stdout then pcall(stdout.close, stdout) end
-    if stderr then pcall(stderr.close, stderr) end
-  end
-
-  local function safe_kill()
-    if handle and not closed then
-      pcall(handle.kill, handle, "sigterm")
-    end
-  end
-
-  local emitted = 0
-  local max_count = opts.max_count or 5000
-
-  -- Same delivery-ordering fix as the csearch path: parse synchronously into
-  -- `parsed`, deliver + signal on_done via a single flusher so on_done always
-  -- runs after every on_line (no dropped trailing hits). All state declared
-  -- BEFORE spawn so the exit callback can close over it.
-  local parsed = {}
-  local delivered_idx = 0
-  local proc_exited = false
-  local exit_code = 0
-  local exit_err = nil
-  local flush_scheduled = false
-  local done_called = false
-
-  local function flush()
-    flush_scheduled = false
-    if stopped then return end
-    while delivered_idx < #parsed do
-      delivered_idx = delivered_idx + 1
-      local it = parsed[delivered_idx]
-      if stopped then return end
-      callbacks.on_line(it.file, it.lnum, it.col, it.text)
-    end
-    if proc_exited and not done_called then
-      done_called = true
-      callbacks.on_done(exit_code, exit_err)
-    end
-  end
-
-  local function request_flush()
-    if flush_scheduled or stopped then return end
-    flush_scheduled = true
-    vim.schedule(flush)
-  end
-
-  handle = vim.loop.spawn(rg, {
+  vim.list_extend(args, { "--", pattern })
+  vim.list_extend(args, opts.search_dirs or {})
+  local handle, err = vim.loop.spawn(rg, {
     args = args,
     cwd = ctx.workspace_root,
-    stdio = { nil, stdout, stderr },
-  }, function(code)
-    safe_close()
-    if handle then handle:close() end
-    if stopped then return end
-    exit_code = code
-    exit_err = code ~= 0 and table.concat(stderr_buf, "") or nil
-    proc_exited = true
-    flush_scheduled = true
-    vim.schedule(flush)
+    stdio = { nil, reader.stdout, reader.stderr },
+  }, function(code, signal)
+    reader:exit(code, signal)
   end)
-
-  if not handle then
-    safe_close()
-    vim.schedule(function()
-      if stopped then return end
-      callbacks.on_done(1, "failed to spawn rg")
-    end)
-    return function() stopped = true end
-  end
-
-  stdout:read_start(function(_, data)
-    if stopped then return end
-    if not data then return end
-    leftover = leftover .. data
-    while true do
-      local nul = leftover:find("\0")
-      if not nul then break end
-      local rec = leftover:sub(1, nul - 1)
-      -- After NUL comes "<lnum>:<col>:<text>\n"
-      leftover = leftover:sub(nul + 1)
-      local nl = leftover:find("\n")
-      if not nl then
-        -- Push the file part back; wait for more data.
-        leftover = rec .. "\0" .. leftover
-        break
-      end
-      local rest = leftover:sub(1, nl - 1):gsub("\r$", "")
-      leftover = leftover:sub(nl + 1)
-      local lnum_s, col_s, text = rest:match("^(%d+):(%d+):(.*)$")
-      if lnum_s and col_s and text and emitted < max_count then
-        emitted = emitted + 1
-        parsed[#parsed + 1] = { file = rec, lnum = tonumber(lnum_s), col = tonumber(col_s), text = text }
-      end
-    end
-    request_flush()
-  end)
-  stderr:read_start(function(_, data)
-    if stopped then return end
-    if data then table.insert(stderr_buf, data) end
-  end)
-
-  return function()
-    stopped = true
-    safe_kill()
-    safe_close()
-  end
+  return reader:attach(handle, err)
 end
 
 -- ── Public dispatcher ────────────────────────────────────────────────────
@@ -628,11 +403,24 @@ end
 function M.stream(ctx, pattern, opts, callbacks)
   opts = opts or {}
   callbacks = callbacks or {}
-  if not callbacks.on_line then callbacks.on_line = function() end end
-  if not callbacks.on_done then callbacks.on_done = function() end end
+  if not callbacks.on_line then
+    callbacks.on_line = function() end
+  end
+  if not callbacks.on_done then
+    callbacks.on_done = function() end
+  end
 
   if M.is_indexed(ctx) then
     return stream_csearch(ctx, pattern, opts, callbacks)
+  end
+  if opts.require_index then
+    local reader = require("utils.code_search.stream_reader").new({
+      backend = "csearch",
+      max_count = opts.max_count,
+      parse = function() end,
+    }, callbacks)
+    reader.failure_state, reader.failure_reason = "index_unavailable", "index-unavailable"
+    return reader:attach(nil, "csearch index unavailable; rebuild the search index")
   end
   return stream_rg(ctx, pattern, opts, callbacks)
 end

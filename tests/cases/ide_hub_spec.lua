@@ -170,4 +170,40 @@ t.describe("ide_hub: context-aware actions", function()
     package.loaded.dap = dap
     t.assert_true(state.ready)
   end)
+
+  t.it("search hub uses the advertised code-search key and reports an unavailable mapping", function()
+    local action
+    for _, entry in ipairs(hub.actions) do
+      if entry.group == "Search" and entry.key == "<leader>sg" then
+        action = entry
+        break
+      end
+    end
+    t.assert_true(action ~= nil)
+    local before = vim.fn.maparg("<leader>sg", "n", false, true)
+    local notify, calls, notices = vim.notify, 0, {}
+    vim.keymap.set("n", "<leader>sg", function()
+      calls = calls + 1
+    end)
+    vim.notify = function(message, level)
+      notices[#notices + 1] = { message, level }
+    end
+    local ok, err = pcall(function()
+      action.run()
+      t.assert_eq(calls, 1, "Hub must preserve the same code masks and fallback as its advertised key")
+      vim.keymap.del("n", "<leader>sg")
+      action.run()
+      t.assert_eq(calls, 1)
+      t.assert_eq(#notices, 1, "missing search action must be visible")
+      t.assert_eq(notices[1][2], vim.log.levels.WARN)
+    end)
+    vim.notify = notify
+    pcall(vim.keymap.del, "n", "<leader>sg")
+    if next(before) then
+      vim.fn.mapset("n", false, before)
+    end
+    if not ok then
+      error(err, 0)
+    end
+  end)
 end)

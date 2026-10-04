@@ -88,9 +88,9 @@ return {
           require("ue.index.batch_recovery").attach(client, bufnr)
         end,
         keys = {
-          { "<leader>cI", function() require("snacks").picker.lsp_incoming_calls() end,
+          { "<leader>cI", function() require("utils.ue_goto.reading").calls("incoming") end,
             desc = "Incoming calls (谁调用了它)", has = "prepareCallHierarchy" },
-          { "<leader>cO", function() require("snacks").picker.lsp_outgoing_calls() end,
+          { "<leader>cO", function() require("utils.ue_goto.reading").calls("outgoing") end,
             desc = "Outgoing calls (它调用了谁)", has = "prepareCallHierarchy" },
           { "<leader>ss", function() require("snacks").picker.lsp_symbols({ tree = true }) end,
             desc = "Document symbols (当前文件大纲)", has = "documentSymbol" },
@@ -120,7 +120,7 @@ return {
           },
           {
             "<leader>ch",
-            "<cmd>LspClangdSwitchSourceHeader<cr>",
+            function() require("utils.ue_goto.reading").source_header() end,
             desc = "Switch Source/Header (UE)",
           },
         },

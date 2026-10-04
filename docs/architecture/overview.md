@@ -17,6 +17,7 @@
 |---|---|---|---|
 | UE 引擎中枢 | `lua/ue.lua` + `lua/ue/` | 索引 / CDB / DAP / 命令注册总入口 | 公共 API 挂 `M.*`；命令在 `ue.setup()` 注册 |
 | 底部面板 | `lua/utils/bottom_panel.lua` | 构建输出 / 原生 quickfix / logcat / 后台任务共用每 tab 的窗口 | 只换 buffer；隐藏不取消进程，任务状态仍由 registry 派生；DAP 借用 host 后只收自己的可见内容 |
+| 窗口与任务找回 | `lua/utils/workspace.lua` | 搜索实际窗口、隐藏 buffer、结果历史和保留日志 | 原生句柄为权威；确认前查身份；保存不打开面板，保护当前 qf ID/view，结果仍为原生有界历史 |
 | 日常编辑 | `lua/utils/cpp_format.lua` + `unsaved.lua` | 工程风格发现、显式 UE 模板、未保存列表与退出选择 | Conform 异步格式化且不回落默认风格；缓冲区事件维护计数，状态栏只读缓存；原生退出保留 |
 | 重构批次 | `lua/utils/refactor.lua` + `workspace_edit.lua` + `rename_preview.lua` | LSP 修改预览、受保护应用、恢复证据及整批撤销 | 编译器是修改来源；请求/预览/确认都核验 owner；取消的 applyTweak 保留拒绝守卫直到迟到请求排空，不覆盖后续输入 |
 | 工作现场 | `lua/utils/edit_recovery.lua` + `session_restore.lua` + `restart.lua` | 异步文本快照、按需会话、重启前检查 | 文本快照按项目/进程/会话独立；仅恢复为新 buffer；会话布局与文本耐久性分开验收 |
@@ -31,7 +32,9 @@
 | Android SO 迭代 | `lua/ue/targets/android.lua` + `android_windows.lua` + `scripts/ue_android_so_*.ps1` + `scripts/ue_android_so_agent.c` | Windows host 上的 SO-only UBT action 执行；root 原子替换或 debuggable app-private ClassLoader 重定向 | Windows-only compatibility adapter；不增加 macOS→Android；正常 APK 流程保持独立 |
 | UE target drivers | `lua/ue/targets/` | Android / IOS / Mac / Win64 / Linux 的 UBT、UAT、产物和设备策略 | 各 target 独立实现；不得跨 driver fallback |
 | 符号解析栈 | `lua/utils/ue_goto/` + `lsp_fallback.lua` | C++ compiler identity；非 C++ compatibility | header 必须有 proven origin TU；非 resolved 不猜测 |
-| 代码搜索 | `lua/utils/code_search/` | csearch 亚秒级 grep | 显式搜索、references 与非 C++ 兼容路径 |
+| 代码搜索 | `lua/utils/code_search/` + `search_picker.lua` + `search_process.lua` | 索引查询、可证明 span、流式状态及后置过滤 | 索引入口不降级；显式 rg 沿用真实 provider argv；line-only/partial 可见，EOF 与 exit 分开 |
+| 搜索意图与文件清单 | `lua/utils/search_recipe.lua` + `search_history_store.lua` + `file_query.lua` + `file_inventory.lua` | 完整条件恢复、路径/位置往返、独立冷热文件范围 | canonical 项目隔离与锁内合并；文件清单只在当前进程缓存，不更改 CDB/csearch 输入 |
+| 连续代码阅读 | `lua/utils/ue_goto/reading*.lua` + `relations.lua` | 引用/header owner、显式 Peek、按需关系与返回 | C++ 定义复用 compiler proof；确认交接复核版本；关系 location 渲染不修改缓存；不接管全局 view |
 | 核心健康审计 | `lua/utils/core_health*.lua` + `scripts/nvim_core_health.lua` | 真实启动、编辑、AST、搜索、clangd/CDB/target plan 的分层证据 | 交互入口只异步启动隔离 headless runner；live workspace 只读 |
 | 宿主资源纪律 | `lua/utils/cpu_load.lua` + `host_admission.lua` + `clangd_resource_controller.lua` | 轻量感知、统一双水位策略、前台 ownership、owned clangd 可逆降级 | batch 只在 start 前推迟；前台不等 CPU；不操作外部进程 |
 | 平台驱动 | `lua/utils/platform/` | OS 分支唯一收口 | 共享基础接口 + host-owned 可选能力；其余代码不做 OS 分支 |

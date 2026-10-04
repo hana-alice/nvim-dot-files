@@ -74,6 +74,8 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v2.2.0` → [docs/release_2.2.0.md](release_2.2.0.md) (IDE experience; local validation complete; tag pending)
 
+- `v2.3.0` → [docs/release_2.3.0.md](release_2.3.0.md) (search, reading and window recovery; tag pending)
+
 ## Unreleased
 
-已归档至 [v2.2.0 发布记录](release_2.2.0.md)，验证边界与未完成工作见该记录。
+已归档至 [v2.3.0 发布记录](release_2.3.0.md)，验证边界与未完成工作见该记录。

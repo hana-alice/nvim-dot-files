@@ -100,6 +100,11 @@ SHALL 有明确 host-side deadline；超时后 client SHALL 完成结构化失�
 
 ## 选型与踩坑
 
+- **选型（2026-10-04）**：显式定义 Peek 复用同一 compiler identity / proven-context 解析；
+  大小写扩展名遵循原路由，失败不改走普通 definition 或文本候选。inspection 与 gd 跳转交付分开，
+  预览不制造 jump、lineage 或 gd 成功证据；确认后的导航仍校验来源/目标和 build。
+  真正需要选择 compiler context 时，其 UI 同样属于阅读 owner，不放宽未登记窗口的 stale guard。
+
 - **选型**：身份主键固定为 Clang canonical USR / compiler-owned identity，
   拒绝一切文本类启发式（符号名、receiver 文本、arity、渲染签名、文件距离、
   候选顺序）——理由见 P11/P12 与 `docs/architecture-symbol-resolution.md`

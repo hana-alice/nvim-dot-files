@@ -120,6 +120,12 @@ selection 变更 MUST NOT 改投、重绑或重新解释已经开始的 workflow
 
 ## 选型与踩坑
 
+- **选型（2026-10-04）**：搜索历史保存版本化、有界、source/scope/mode allowlist 的完整条件，
+  bucket 和执行比较采用 host driver 的 canonical path identity；旧 query-only 记录保留并说明缺项。
+  多写者在 lease 内重读、合并、原子发布，不用最后写入覆盖另一个进程的使用计数。
+  序列化的 rg query 只能是模式文本，原生附加参数需经过 allowlist 并保留 glob 顺序；
+  不把未经验证的 inline 参数、任意 provider、Ex 或可执行程序写进恢复动作。
+
 - **选型（2026-10-03 IDE）**：命名运行配置普通字段的失败恢复使用同字段 lease 下的 revision receipt
   compare-and-restore；值相等不能证明 ownership（含同值 ABA），拿不到 receipt 时显式保留待审阅状态。
   相同平台/配置不调用会触发索引流水线的 setter；目标 pair 无可靠恢复 receipt 时不猜测写回旧值。

@@ -38,6 +38,14 @@ M.actions = {
   { group = "Code", label = "Document symbols / 当前文件大纲", key = "<leader>ss", run = code_key("<leader>ss") },
   { group = "Code", label = "Base types / 基类", key = "<leader>cB", run = code_key("<leader>cB") },
   { group = "Code", label = "Derived types / 派生类", key = "<leader>cD", run = code_key("<leader>cD") },
+  { group = "Read", label = "Peek definition / 预览定义并保留上下文", run = cmd("UEPeek") },
+  { group = "Read", label = "Return to investigation origin / 返回调查起点", run = cmd("UEReadReturn") },
+  { group = "Read", label = "Cancel reading request / 取消待返回的阅读请求", run = cmd("UEReadCancel") },
+  { group = "Read", label = "Browse incoming calls / 连续浏览调用者", run = cmd("UERelations incoming") },
+  { group = "Read", label = "Browse outgoing calls / 连续浏览调用目标", run = cmd("UERelations outgoing") },
+  { group = "Read", label = "Browse base types / 连续浏览基类", run = cmd("UERelations base") },
+  { group = "Read", label = "Browse derived types / 连续浏览派生类", run = cmd("UERelations derived") },
+  { group = "Read", label = "Resume relationship browser / 找回上次关系浏览", run = cmd("UERelations resume") },
   { group = "Code", label = "Rename symbol / 重命名", key = "<leader>cr", run = code_key("<leader>cr") },
   { group = "Code", label = "Code action / 代码操作", key = "<leader>ca", run = code_key("<leader>ca") },
   { group = "Code", label = "Undo refactor batch / 撤销上次整批修改", run = cmd("UERefactorUndo") },
@@ -53,6 +61,24 @@ M.actions = {
   { group = "Files", label = "Restore project session / 按需恢复会话", run = cmd("UESessionRestore") },
   { group = "Files", label = "Recover unsaved text / 恢复异常退出的未保存文本", run = cmd("UERecovery") },
   { group = "Files", label = "Quit with unsaved list / 退出前查看未保存文件", key = "<leader>qq", run = cmd("UEQuit") },
+  { group = "Search", label = "Indexed code search / 快速索引搜索", key = "<leader>/", run = function() require("ue").cached_grep() end },
+  { group = "Search", label = "Explicit rg code search / 独立代码搜索", key = "<leader>sg", run = function()
+    local mapping = vim.fn.maparg("<leader>sg", "n", false, true)
+    if type(mapping.callback) == "function" then return mapping.callback() end
+    vim.notify("搜索入口未就绪: <leader>sg", vim.log.levels.WARN)
+  end },
+  { group = "Search", label = "Project files / 查找项目文件", key = "<leader>ff", requires = { "project" }, run = function()
+    local options = require("ue").picker_project_options()
+    if not options then vim.notify("项目文件搜索上下文未就绪", vim.log.levels.WARN); return end
+    require("snacks").picker.files(options)
+  end },
+  { group = "Search", label = "Search history / 按原条件重新搜索", key = "<leader>sH", run = cmd("UESearchHistory") },
+  { group = "Windows", label = "Find or recover a window / 找回关闭的窗口", key = "<leader>wM", run = cmd("UEWorkspace") },
+  { group = "Windows", label = "Visible windows across tabs / 跨标签窗口", run = cmd("UEWorkspace windows") },
+  { group = "Windows", label = "Hidden buffers / 窗口关闭后保留的文件", run = cmd("UEWorkspace buffers") },
+  { group = "Results", label = "Saved search results / 找回保存的搜索结果", run = cmd("UEWorkspace results") },
+  { group = "Tasks", label = "Find tasks and output / 找回任务及日志", run = cmd("UEWorkspace tasks") },
+  { group = "Logs", label = "Retained terminal and stage logs / 找回关闭的任务输出", run = cmd("UEWorkspace logs") },
   { group = "Build",  label = "Build active target", key = "<leader>ub", run = cmd("UEBuild") },
   { group = "Build",  label = "First build error / 首个构建错误", key = "<leader>uE", always = true, run = cmd("UEBuildFirstError") },
   { group = "Tests", label = "UE Editor tests / 发现与运行测试", requires = { "project" }, run = cmd("UETests") },
@@ -479,6 +505,7 @@ function M.open_guide()
 end
 
 function M.setup_commands()
+  require("utils.workspace").setup_commands()
   require("utils.session_restore").setup_commands()
   require("utils.edit_recovery").setup_commands()
   require("utils.lsp_fallback").setup_refactor_commands()
@@ -494,9 +521,7 @@ function M.setup_commands()
   create("UEDoctor", function() M.doctor() end,
     { desc = "Check tools, target, device and package; <CR> on a failed row runs its fix" })
   create("UESearchHistory", function()
-    require("utils.history_hub").searches({
-      rerun = function(query) require("ue").cached_grep({ search = query }) end,
-    })
+    require("utils.history_hub").searches()
   end, { desc = "Search history for this project (used searches first)" })
   create("UEAndroidCrash", function() require("ue.dap._android_crash").run() end,
     { desc = "Android: symbolicate the latest native crash from the device into quickfix" })

@@ -8,6 +8,7 @@ local function workspace_opts()
   if not ue then return nil end
   local opts = ue.picker_options()
   if type(opts) ~= "table" or #opts.dirs == 0 then return nil end
+  opts.ue_search_context = ue.resolve_context()
   return opts
 end
 
@@ -16,6 +17,7 @@ local function project_opts()
   if not ue then return nil end
   local opts = ue.picker_project_options()
   if type(opts) ~= "table" then return nil end
+  opts.ue_search_context = ue.resolve_context()
   return opts
 end
 
@@ -32,6 +34,7 @@ local function scope_opts()
   if not ue then return nil, nil end
   local opts, scope, err = ue.current_scope_picker_options()
   if type(opts) ~= "table" then return nil, err end
+  opts.ue_search_context = ue.resolve_context()
   return opts, nil
 end
 
@@ -162,26 +165,16 @@ local function paste_picker_clipboard(picker)
 end
 
 local function pin_sidebar_qflist(picker)
-  -- We do NOT call snacks.picker.actions.qflist(): that helper does
-  -- `vim.cmd("botright copen")` itself, which left us with TWO panels
-  -- visible (the native quickfix split AND the trouble float). We want
-  -- only the trouble tree, so we replicate the qflist-population logic
-  -- inline and skip the copen.
-
   local sel = picker:selected()
   local items = (sel and #sel > 0) and sel or picker:items()
-
   local qf = {}
   for _, item in ipairs(items) do
-    local file = (item.file ~= nil and item.file ~= "")
-        and item.file
-        or (Snacks and Snacks.picker and Snacks.picker.util and Snacks.picker.util.path
-            and Snacks.picker.util.path(item) or nil)
+    local file = require("snacks").picker.util.path(item)
     qf[#qf + 1] = {
       filename = file,
       bufnr    = item.buf,
       lnum     = (item.pos and item.pos[1]) or 1,
-      col      = ((item.pos and item.pos[2]) or 0) + 1,
+      col      = item.ue_location and item.ue_location.precision == "line" and 0 or ((item.pos and item.pos[2]) or 0) + 1,
       end_lnum = item.end_pos and item.end_pos[1] or nil,
       end_col  = item.end_pos and (item.end_pos[2] + 1) or nil,
       text     = item.line or item.comment or item.label or item.name or item.detail or item.text or "",
@@ -190,26 +183,19 @@ local function pin_sidebar_qflist(picker)
     }
   end
 
-  -- Set the list BEFORE closing the picker — closing changes focus and
-  -- some snacks bookkeeping; populating first keeps things tidy.
-  vim.fn.setqflist({}, " ", {
-    title = "Pinned: " .. (picker.opts and picker.opts.title or "picker"),
-    items = qf,
+  local state = picker.opts.ue_search_status or {}
+  local id, err = require("utils.workspace").pin(qf, {
+    title = "Pinned: " .. (picker.title or picker.opts.title or "picker"),
+    source = picker.opts.source,
+    recipe = require("utils.search_recipe").from_picker(picker),
+    truncated = state.complete == false and #qf > 0,
   })
+  if not id then return vim.notify(err or "Could not save these results", vim.log.levels.WARN) end
+  local recipe = require("utils.search_recipe").from_picker(picker)
+  if recipe then require("utils.history_hub").record_recipe(recipe) end
+  -- Saving does not open a panel or close unrelated windows. Native picker
+  -- close returns to its source; :UEWorkspace results opens saved lists.
   picker:close()
-
-  -- Close any left sidebar so the bottom trouble panel is the only
-  -- secondary view, then pop trouble.
-  vim.schedule(function()
-    pcall(function() require("utils.sidebar").close() end)
-    local ok_t, trouble = pcall(require, "trouble")
-    if not ok_t then
-      vim.notify("Trouble unavailable; falling back to :copen", vim.log.levels.WARN)
-      vim.cmd("botright copen 14")
-      return
-    end
-    trouble.open("ue_qflist_bottom")
-  end)
 end
 
 local function grep_history_items()
@@ -319,23 +305,22 @@ local function ue_project_grep(query)
 end
 
 local function ue_grep()
-  local snacks = require("snacks")
   local opts = with_glob(workspace_opts(), code_globs())
   if opts then
     opts.title = "Grep Workspace Code"
-    return snacks.picker.grep(opts)
+    return require("utils.search_recipe").open_grep(opts, "workspace")
   end
-  return snacks.picker.grep()
+  return require("utils.search_recipe").open_grep({}, "directory")
 end
 
 local function ue_grep_all()
-  local snacks = require("snacks")
   local opts = workspace_opts()
   if opts then
-    opts.title = "Grep Workspace All"
-    return snacks.picker.grep(opts)
+    opts.title = "Grep Workspace Text (excludes build/assets/ThirdParty)"
+    opts.code_only = false
+    return require("utils.search_recipe").open_grep(opts, "workspace")
   end
-  return snacks.picker.grep()
+  return require("utils.search_recipe").open_grep({ code_only = false }, "directory")
 end
 
 ---------- Scope (current module/plugin) ----------
@@ -352,12 +337,11 @@ local function ue_scope_files()
 end
 
 local function ue_scope_grep()
-  local snacks = require("snacks")
   local opts, err = scope_opts()
   if opts then
     opts.title = "UE Scope Grep"
     with_glob(opts, code_globs())
-    return snacks.picker.grep(opts)
+    return require("utils.search_recipe").open_grep(opts, "module")
   end
   vim.notify(err or "No UE module or plugin scope found", vim.log.levels.WARN)
 end
@@ -369,7 +353,6 @@ local function ue_grep_history()
   for _, item in ipairs(grep_history_items()) do legacy[#legacy + 1] = item.query end
   return require("utils.history_hub").searches({
     legacy = legacy,
-    rerun = function(query) ue_project_grep(query) end,
   })
 end
 
@@ -419,17 +402,11 @@ return {
       -- Grep
       { "<leader>/", ue_project_grep, desc = "Grep All Code (Engine+Project)" },
       { "<leader>sg", ue_grep, desc = "Grep Workspace Code (C++/Shader)" },
-      { "<leader>sG", ue_grep_all, desc = "Grep Workspace All Files" },
+      { "<leader>sG", ue_grep_all, desc = "Grep Workspace Text (explicit rg)" },
       { "<leader>sH", ue_grep_history, desc = "Search: history (used searches first)" },
       { "<leader>fh", function() require("utils.history_hub").hub() end, desc = "History hub: searches, files, jumps, commands, …" },
-      -- Resume the last grep picker, even if it was closed via <C-q> pin.
-      -- snacks.picker.resume keys state by source name. Our pickers use
-      -- "ue_grep_csearch" / "ue_grep_rg" sources; we try csearch first
-      -- then fall back to rg, mirroring the live decision in cached_grep.
       { "<leader>s/", function()
-        local picker = require("snacks").picker
-        local ok = pcall(picker.resume, "ue_grep_csearch")
-        if not ok then pcall(picker.resume, "ue_grep_rg") end
+        return require("utils.history_hub").resume_search()
       end, desc = "Resume Last Grep (incl. after <C-q> pin)" },
       { "<leader>sC", ue_clear_picker_history, desc = "Search: Clear Picker History" },
       -- Find files
@@ -544,7 +521,19 @@ return {
       opts.picker.sources.grep = vim.tbl_deep_extend(
         "force", opts.picker.sources.grep or {}, {
           layout = { preset = "telescope" },
+          finder = require("utils.search_recipe").grep_finder,
+          jump = { match = false },
+          format = require("utils.search_ui").format,
         })
+      local grep_close = opts.picker.sources.grep.on_close
+      opts.picker.sources.grep.on_close = function(picker)
+        require("utils.search_recipe").save_resume_options(picker)
+        if grep_close then grep_close(picker) end
+      end
+      for _, source in ipairs({ "files", "git_files" }) do
+        opts.picker.sources[source] = require("utils.file_query").options(opts.picker.sources[source])
+        opts.picker.sources[source].format = require("utils.search_ui").format
+      end
 
       -- Workaround: snacks projects picker freezes for ~30s on UE workspaces
       -- (oldfiles walk + per-entry git spawn on main loop). See
@@ -602,7 +591,9 @@ return {
       opts.picker.actions = vim.tbl_deep_extend("force", opts.picker.actions or {}, {
         paste_clipboard = paste_picker_clipboard,
         pin_sidebar_qflist = pin_sidebar_qflist,
-
+        copy_position = function(picker, item) return require("utils.file_query").copy(picker, item, "position") end,
+        copy_absolute_path = function(picker, item) return require("utils.file_query").copy(picker, item, "absolute") end,
+        copy_relative_path = function(picker, item) return require("utils.file_query").copy(picker, item, "relative") end,
       })
       opts.picker.win = opts.picker.win or {}
       opts.picker.win.input = opts.picker.win.input or {}
@@ -610,6 +601,10 @@ return {
       opts.picker.win.input.keys = vim.tbl_deep_extend("force", opts.picker.win.input.keys or {}, {
         ["<C-q>"] = { "pin_sidebar_qflist", mode = { "i", "n" } },
         ["<C-v>"] = { "paste_clipboard", mode = { "i", "n" } },
+        ["<M-v>"] = { "edit_vsplit", mode = { "i", "n" } },
+        ["<C-y>"] = { "copy_position", mode = { "i", "n" } },
+        ["<a-y>"] = { "copy_absolute_path", mode = { "i", "n" } },
+        ["<a-Y>"] = { "copy_relative_path", mode = { "i", "n" } },
         ["<Tab>"] = { "list_down", mode = { "i", "n" } },
         ["<S-Tab>"] = { "list_up", mode = { "i", "n" } },
         ["<C-Space>"] = { "select_and_next", mode = { "i", "n" } },
@@ -617,6 +612,10 @@ return {
       opts.picker.win.list.keys = vim.tbl_deep_extend("force", opts.picker.win.list.keys or {}, {
         ["<C-q>"] = { "pin_sidebar_qflist", mode = { "n", "x" } },
         ["<C-v>"] = { "paste_clipboard", mode = { "n", "x" } },
+        ["<M-v>"] = { "edit_vsplit", mode = { "n", "x" } },
+        ["<C-y>"] = { "copy_position", mode = { "n", "x" } },
+        ["<a-y>"] = { "copy_absolute_path", mode = { "n", "x" } },
+        ["<a-Y>"] = { "copy_relative_path", mode = { "n", "x" } },
         ["<Tab>"] = { "list_down", mode = { "n", "x" } },
         ["<S-Tab>"] = { "list_up", mode = { "n", "x" } },
        ["<C-Space>"] = { "select_and_next", mode = { "n", "x" } },

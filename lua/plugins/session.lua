@@ -42,11 +42,13 @@ return {
           if line:match("^badd%s+") then
             buffers = buffers + 1
             if buffers > MAX_AUTO_RESTORE_BUFFERS then
+              vim.g.ue_session_restore_hint = "已保存会话超过 24 个文件，未自动恢复；:UESessionRestore 可按需打开"
               return true
             end
           elseif line:match("^tabnew%s") or line:match("^tabedit%s") then
             tabs = tabs + 1
             if tabs > MAX_AUTO_RESTORE_TABS then
+              vim.g.ue_session_restore_hint = "已保存会话包含多个标签页，未自动恢复；:UESessionRestore 可按需打开"
               return true
             end
           end
@@ -100,6 +102,8 @@ return {
         local target = pick_session_file(current, current_plain)
         if target then
           load_session_file(persistence, target)
+        elseif vim.g.ue_session_restore_hint then
+          vim.notify(vim.g.ue_session_restore_hint, vim.log.levels.INFO)
         end
       end
 

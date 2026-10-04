@@ -40,7 +40,7 @@ function M.publish(title, entries)
       break
     end
   end
-  require("utils.bottom_panel").show("quickfix")
+  require("utils.bottom_panel").show("quickfix", nil, { focus = false })
   return true
 end
 
@@ -64,9 +64,10 @@ function M.jump_first()
       end
     end
   end
-  local file = vim.api.nvim_buf_get_name(first_error.bufnr)
   vim.cmd("normal! m'")
-  local ok, err = pcall(vim.cmd.edit, vim.fn.fnameescape(file))
+  -- Reuse the existing source buffer; :edit would reject or reload dirty
+  -- content even when this error already belongs to the current file.
+  local ok, err = pcall(vim.api.nvim_win_set_buf, 0, first_error.bufnr)
   if not ok then
     vim.notify("无法跳到构建错误: " .. tostring(err), vim.log.levels.WARN)
     return false

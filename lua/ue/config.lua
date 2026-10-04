@@ -51,6 +51,13 @@ local function defaults()
       -- report-first requires a visible unread summary; neither mode is silent.
       startup_notice = "statusline", -- "statusline" or "notify" (INFO)
     },
+    edit_recovery = {
+      enabled = true,
+      delay_ms = 1500,
+      max_bytes = 2 * 1024 * 1024,
+      max_buffers = 64,
+      retention_days = 7,
+    },
     android = {
       -- Project-specific SDK names/flags belong to machine-local policy, never
       -- to this public configuration. Missing policy leaves Target defaults.

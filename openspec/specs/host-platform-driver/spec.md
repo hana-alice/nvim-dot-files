@@ -57,6 +57,11 @@ SHALL：`path_sep`、`list_sep`、`exe_suffix` 以及 `host_path()` 由宿主驱
 
 ## 选型与踩坑
 
+- **选型（2026-10-03 IDE）**：Editor 测试计划是宿主可选能力；当前 Windows 从所选引擎的
+  Build.version 和实际 Editor 二进制解析，原生 argv 保持单个 ExecCmds 参数。其他宿主缺少能力
+  时直接说明不可用，不猜测其他引擎、安装工具或加入假实现。用户显式启动的测试 worker
+  复用前台 ownership 和任务取消，不在打开菜单或状态栏时启动。
+
 - **选型**：宿主专属能力（`xcrun_entry`/`security_entry`/`plutil_entry`、Windows native
   content-event watcher、grouped frozen-input watcher）以可选方法暴露而非全平台统一接口——因为
   这些能力本身在其他宿主上不存在等价物，强行统一接口会诱使调用方伪造假实现

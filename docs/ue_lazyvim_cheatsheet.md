@@ -765,6 +765,13 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `<leader>uE`              | `:UEBuildFirstError`: jump directly to the first source error of the latest build |
 | `<leader>uJ`              | `:UEPanelNext`: cycle build / quickfix / logcat / tasks in one bottom window (normal/terminal) |
 | `:UEPanel build` / `quickfix` / `logcat` / `tasks` | Select a bottom panel directly; tasks: `<CR>` / `dd` stop, `r` refresh |
+| `:UEPanel history` / build `gH` | Select retained recent stage output (up to 16); background completion keeps source focus |
+| `:UERunProfileSave [name]` / `:UERunProfile [name]` / `:UERunProfileDelete [name]` | Save, preview/apply, delete named target/config/package/mode; device serial stays process-local |
+| `:UEAndroidIterateStop` | Cancel the active loop; late callbacks cannot start another stage |
+| `:UERename` / `:UECodeActions` | Actual LSP edits → multi-file preview → confirm; no auto-save |
+| `:UERefactorUndo` / `:UERefactorRecovery` | Undo the last owned batch without overwriting later input / inspect recovery evidence |
+| `:UENewClass` / `:UETests` | Preview a class in an existing project module / explicit Editor test discovery, run, results, failed rerun |
+| `:UESessionRestore [lazy\|full]` / `:UERecovery [all]` | Restore source names on demand / recover abnormal-exit text into new unnamed buffers |
 | `:UECompileForNvim`       | Compatibility entry: build current target, then delegate to the normal `UEPrepare` path |
 | `:UEBuildIOS`             | Build IOS C++ through native macOS UBT; safely reuse unchanged AOT outputs and defer dSYM |
 | `:UEIOSSetup`             | Optional explicit rerun of IOS prepared identity/private-key/device setup |
@@ -780,7 +787,7 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `<leader>uk`              | Run the command that fixes the last reported failure (e.g. select a device) |
 | `<F5>` / `<S-F5>`         | No session: run the target loop (Android: build SO → deploy → debug-launch). In a session: continue. `<S-F5>` stops |
 | `:UEDoctor`               | Check tools, target, device, package; `<CR>` on a ✗ row runs its fix |
-| logcat buffer             | `<CR>` jump to the source location on the line · `gl` cycle minimum level · `gx` symbolicate latest crash |
+| logcat buffer             | `<CR>` source · `gl` level · `g/` content · `gt` tag · `g0` clear filters · `gf` pause/follow · `G` latest + follow · `gx` crash |
 | `<leader>ux`              | `:UEAndroidIterate` — build SO → quick deploy → wait-for-debugger launch; stops at the first failing step (`nodebug` arg: plain launch) |
 | `<leader>uX`              | `:UEAndroidCrash` — pull the device crash buffer, symbolicate the UE module with the build-id-matched symbols, open quickfix |
 | `<leader>uB`              | `:UEPrepare`; IOS on macOS also generates its semantic CDB and auto-runs first-use setup |

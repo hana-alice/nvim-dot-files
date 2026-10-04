@@ -88,9 +88,15 @@ local function default_probe(rec)
     -- vim.system handle exposes is_closing(); a closed/closing handle means
     -- the process has finished. Be defensive across Neovim versions.
     if type(h) == "table" then
-      local ok_c, closing = pcall(function() return h:is_closing() end)
+      local ok_c, closing = pcall(function()
+        return h:is_closing()
+      end)
       if ok_c and closing then
-        return "done", nil
+        -- SystemObj:wait(0) can kill a process whose result has not arrived.
+        -- Read only the completed result already owned by Neovim; absent
+        -- version-specific evidence stays unknown rather than implying success.
+        local result = type(h._state) == "table" and h._state.result or nil
+        return "done", type(result) == "table" and result.code or nil
       end
       -- pid present + not closing ⇒ assume running. If we can't tell, lean
       -- "running" so we never claim a live task is dead.
@@ -234,6 +240,10 @@ function M.list()
       kind = rec.kind,
       status = status_of[id],
       code = code_of[id],
+      result = status_of[id] == "running" and "running"
+        or status_of[id] == "cancelled" and "cancelled"
+        or code_of[id] == 0 and "success"
+        or code_of[id] ~= nil and "failed" or "unknown",
       started_at = rec.started_at,
     }
   end

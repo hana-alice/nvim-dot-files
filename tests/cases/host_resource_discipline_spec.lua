@@ -20,6 +20,7 @@ end
 -- explicit resource classification and rationale here. Broad file/API
 -- exemptions are deliberately impossible.
 local SPAWN_AUDIT = {
+  { p="lua/ue/editor_tests.lua", api="vim.system", a="pcall(opts.system or vim.system", class="foreground", reason="one explicit Editor automation worker; frozen project, bounded list/run timeout and owned cancellation", guard="foreground_begin" },
   { p="lua/ue/csearch_git.lua", api="vim.system", a="pcall(vim.system, command", class="short", reason="serialized read-only Git evidence for explicit csearch writer; 15s timeout and cancellable task" },
   { p="lua/workarounds/codediff/threaded_git.lua", api="spawn", a="process, pid = uv.spawn", class="interactive", reason="two-worker bound; foreground Git spawn occurs inside libuv worker with owned cancellation and timeout", guard="task_registry" },
   { p="lua/workarounds/codediff/threaded_git.lua", api="fn-system", a="local result = vim.fn.systemlist", class="sync-debug", reason="upstream explicit synchronous runner compatibility; UI async callers use worker transport" },

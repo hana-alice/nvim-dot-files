@@ -26,6 +26,8 @@ local function deps(request)
     logger = logger,
     reinvoke = context.reinvoke,
     on_exit = context.on_exit,
+    return_handle = context.return_handle,
+    is_current = context.is_current,
   }
 end
 
@@ -71,16 +73,19 @@ function M.run(request)
   -- A chained caller (UEAndroidIterate) waits on on_exit; every path that
   -- never starts the deploy must still report, or the loop hangs silently.
   local function abort(reason)
-    if type(d.on_exit) == "function" then d.on_exit(-1) end
+    if type(d.on_exit) == "function" then
+      d.on_exit(-1)
+    end
     return nil, reason
   end
-  local ctx, err = d.resolve_context()
+  local frozen = request.snapshot and runtime.unwrap(request.snapshot)
+  local ctx, err = frozen and frozen.context or d.resolve_context()
   if not ctx then
     vim.notify(err, vim.log.levels.WARN)
     return abort(err)
   end
 
-  local serial = d.android_device.get()
+  local serial = frozen and frozen.device.serial or d.android_device.get()
   if not serial then
     d.android_device.ensure({ prompt = "Select Android device for SO deploy:" }, function(selected)
       if selected and type(d.reinvoke) == "function" then
@@ -92,8 +97,13 @@ function M.run(request)
     return nil, "device-selection-pending"
   end
 
-  local state = d.read_state(ctx.engine_root)
-  local target_ctx, context_err = d.target_context(ctx, "Android")
+  local state = frozen and { android_package = frozen.runtime.package_name } or d.read_state(ctx.engine_root)
+  local target_ctx, context_err
+  if frozen then
+    target_ctx = frozen.target_context
+  else
+    target_ctx, context_err = d.target_context(ctx, "Android")
+  end
   if not target_ctx then
     d.notify_error("ue.android", context_err)
     return abort(context_err)
@@ -111,7 +121,7 @@ function M.run(request)
   d.stop_android_debugger({ kill_orphans = true })
   local job = d.open_terminal_command(command, {
     cwd = plan.cwd or ctx.engine_root,
-    quickfix_title = "UEDeployAndroidSO",
+    quickfix_title = ("UEDeployAndroidSO %s %s"):format(target_ctx.target or "", snapshot.configuration),
     quickfix_root = d.workspace_root(ctx),
     tail_limit = 20,
     finish_label = "UEDeployAndroidSO",
@@ -119,10 +129,18 @@ function M.run(request)
       if code ~= 0 and d.android_device.report_if_gone then
         d.android_device.report_if_gone(table.concat(output or {}, "\n"), snapshot.device.serial)
       end
-      if type(d.on_exit) == "function" then d.on_exit(code, output) end
+      if type(d.on_exit) == "function" then
+        d.on_exit(code, output)
+      end
     end,
+    is_current = d.is_current,
   })
-  if job == nil then return abort("terminal-not-started") end
+  if job == nil then
+    return abort("terminal-not-started")
+  end
+  if d.return_handle then
+    return job, nil, snapshot
+  end
   return command, nil, snapshot
 end
 

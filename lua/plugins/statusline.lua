@@ -32,11 +32,14 @@ return {
             local debug_state   = require("utils.ue_hub").debug_indicator()
             local probe_status  = vim.g.ue_probe_status or ""
             local unsaved       = vim.g.ue_unsaved_status or ""
+            local recovery      = vim.g.ue_recovery_available or ""
+            local recovery_status = vim.g.ue_recovery_status or ""
 
             return MiniStatusline.combine_groups({
               { hl = mode_hl,                  strings = { mode } },
               { hl = "DiagnosticError",        strings = { debug_state } },
               { hl = "DiagnosticWarn",         strings = { unsaved } },
+              { hl = "DiagnosticWarn",         strings = { recovery, recovery_status } },
               { hl = "MiniStatuslineDevinfo",  strings = { probe_status } },
               { hl = "MiniStatuslineDevinfo",  strings = { git, diff, diagnostics, lsp } },
               "%<", -- truncate from here

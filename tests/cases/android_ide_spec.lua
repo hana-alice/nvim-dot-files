@@ -288,9 +288,13 @@ t.describe("android iterate loop", function()
   local iterate = require("ue.workflows.android.iterate")
   local function steps(build_code, deploy_code, log)
     return {
+      capture = function(_, done)
+        done(require("ue.workflows._runtime").snapshot({ operation = "iterate", owner = "test",
+          project = "/Test", target = "Android", configuration = "Test" }))
+      end,
       build_so = function(done) log[#log + 1] = "build"; done(build_code) end,
       deploy_so = function(done) log[#log + 1] = "deploy"; done(deploy_code) end,
-      launch = function() log[#log + 1] = "launch" end,
+      launch = function(done) log[#log + 1] = "launch"; done(0) end,
       set_status = function(value) log.status = value end,
     }
   end
@@ -299,7 +303,7 @@ t.describe("android iterate loop", function()
   t.it("runs build → deploy → debug-launch and records success with duration", function()
     local log, clock = {}, 0
     iterate.run(steps(0, 0, log), { notify = quiet, now = function() clock = clock + 21; return clock end,
-      debug_launch = function() log[#log + 1] = "debug" end })
+      debug_launch = function(done) log[#log + 1] = "debug"; done(0) end })
     t.assert_eq(table.concat(log, ","), "build,deploy,debug")
     t.assert_contains(log.status, "LOOP✓")
   end)

@@ -18,9 +18,12 @@
 | UE 引擎中枢 | `lua/ue.lua` + `lua/ue/` | 索引 / CDB / DAP / 命令注册总入口 | 公共 API 挂 `M.*`；命令在 `ue.setup()` 注册 |
 | 底部面板 | `lua/utils/bottom_panel.lua` | 构建输出 / 原生 quickfix / logcat / 后台任务共用每 tab 的窗口 | 只换 buffer；隐藏不取消进程，任务状态仍由 registry 派生；DAP 借用 host 后只收自己的可见内容 |
 | 日常编辑 | `lua/utils/cpp_format.lua` + `unsaved.lua` | 工程风格发现、显式 UE 模板、未保存列表与退出选择 | Conform 异步格式化且不回落默认风格；缓冲区事件维护计数，状态栏只读缓存；原生退出保留 |
+| 重构批次 | `lua/utils/refactor.lua` + `workspace_edit.lua` + `rename_preview.lua` | LSP 修改预览、受保护应用、恢复证据及整批撤销 | 编译器是修改来源；请求/预览/确认都核验 owner；取消的 applyTweak 保留拒绝守卫直到迟到请求排空，不覆盖后续输入 |
+| 工作现场 | `lua/utils/edit_recovery.lua` + `session_restore.lua` + `restart.lua` | 异步文本快照、按需会话、重启前检查 | 文本快照按项目/进程/会话独立；仅恢复为新 buffer；会话布局与文本耐久性分开验收 |
+| 运行配置与 UE 工具 | `lua/ue/run_profiles.lua` + `editor_tests.lua` + `lua/utils/ue_entities.lua` | 命名配置、显式 Editor 测试及模块内类创建 | 复用 live selection 和原子项目字段；host driver 拥有 Editor argv；生成仅限现有项目模块，不自动构建或安装 |
 | Project/session state | `lua/ue/project_state.lua` + `file_lock.lua` | 当前进程选择、canonical project bucket、跨进程 writer lease | live selection 不重读其他实例的默认值；共享写入必须 atomic/merge/lease |
 | CDB 流水线 | `lua/ue/cdb/` | compile_commands.json 生成/裁剪/shader/inject | 纯函数 + 子进程；写前 skip-if-unchanged |
-| 配置 schema | `lua/ue/config.lua` | `index/resources/context/clangd/dap/cdb/probe` 默认值 + override | `get/setup/options/reset_for_test` |
+| 配置 schema | `lua/ue/config.lua` | `index/resources/context/clangd/dap/cdb/probe/edit_recovery` 默认值 + override | `get/setup/options/reset_for_test` |
 | 核心工具 | `lua/ue/core/` | fs / proc 纯函数 | 无副作用，可 headless 断言 |
 | Git 审阅 | `lua/plugins/` Git 配置 + `lua/utils/git_review.lua` | CodeDiff 默认完整文件审阅；Snacks 内容搜索/ref 选择；Neogit 提交与仓库操作 | Diffview 保留 `gv/gV` 和 Visual `gv` 按需入口；Fugitive 保留原文/blame/quickfix；Gitsigns 管普通编辑态，CodeDiff 管审阅内 hunk，不使用 Trouble Git mode |
 | DAP 调试 | `lua/ue/dap/` | session-owner dispatch + 各平台 attach/launch | `platforms` 注册表是唯一 dispatch seam |

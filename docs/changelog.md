@@ -72,6 +72,8 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 - `v2.0.0` → [docs/release_2.0.0.md](release_2.0.0.md) (CodeDiff default review; Diffview retained; tag pending)
 - `v2.1.0` → [docs/release_2.1.0.md](release_2.1.0.md) (daily editing and maintenance diagnostics; tag pending)
 
+- `v2.2.0` → [docs/release_2.2.0.md](release_2.2.0.md) (IDE experience; local validation complete; tag pending)
+
 ## Unreleased
 
-已归档至 [v2.1.0 发布记录](release_2.1.0.md)，包含本次独立收尾审查与修复。
+已归档至 [v2.2.0 发布记录](release_2.2.0.md)，验证边界与未完成工作见该记录。

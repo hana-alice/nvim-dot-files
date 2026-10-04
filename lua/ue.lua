@@ -1432,7 +1432,8 @@ function CORE_RT.migrate_legacy_csearch_if_needed(engine_root, platform_key)
       if not ok then
         local data = nil
         local f = io.open(src, "rb")
-        if f then data = f:read("*a"); f:close() end
+        if f then data = f:read("*a")
+f:close() end
         if data and write_all(dst, data) then
           pcall(os.remove, src)
           ok = true
@@ -3031,13 +3032,16 @@ local function scan_shader_files(root, search_paths)
   if vim.fn.executable("fd") == 1 and vim.system then
     local cmd = { "fd", "--type", "f", "--hidden", "--no-ignore", "--absolute-path" }
     for _, ex in ipairs(UE_CONST.SCAN_EXCLUDES) do
-      table.insert(cmd, "--exclude"); table.insert(cmd, ex)
+      table.insert(cmd, "--exclude")
+table.insert(cmd, ex)
     end
     for _, ext in ipairs(M.FT_SHADER) do
-      table.insert(cmd, "-e"); table.insert(cmd, ext)
+      table.insert(cmd, "-e")
+table.insert(cmd, ext)
     end
     for _, sp in ipairs(existing) do
-      table.insert(cmd, "--search-path"); table.insert(cmd, sp)
+      table.insert(cmd, "--search-path")
+table.insert(cmd, sp)
     end
     local ok, result = pcall(function()
       return vim.system(cmd, { text = true, cwd = root }):wait()
@@ -4149,8 +4153,10 @@ function M._logged_jobstart(cmd, tag, opts)
 
   local function flush_log(code)
     -- Flush any unfinished trailing lines before the footer.
-    emit(pending.stdout); pending.stdout = ""
-    emit(pending.stderr); pending.stderr = ""
+    emit(pending.stdout)
+pending.stdout = ""
+    emit(pending.stderr)
+pending.stderr = ""
     if not log_file then return end
     log_file:write(("\n# exit: %s (%s)\n"):format(tostring(code), os.date("%Y-%m-%d %H:%M:%S")))
     log_file:close()
@@ -4315,6 +4321,12 @@ do
 
   function CORE_RT.target_context(ctx, platform_override, opts)
     opts = opts or {}
+    if opts.snapshot then
+      local frozen = require("ue.workflows._runtime").unwrap(opts.snapshot)
+      if frozen.target_context then
+        return frozen.target_context, nil, require("ue.targets").driver(frozen.target.id)
+      end
+    end
     local uproject = ctx.uproject or find_uproject_in_dir(ctx.project_root)
     if not uproject then
       return nil, "No .uproject found in project root: " .. tostring(ctx.project_root)
@@ -4512,7 +4524,11 @@ local function open_terminal_command(cmd, opts)
   local function ensure_window()
     prune_state()
     local height = opts.height or math.max(8, math.floor(vim.o.lines * 0.25))
-    CORE_RT.build_term_win = require("utils.bottom_panel").show("build", CORE_RT.build_term_buf, { height = height })
+    CORE_RT.build_term_win = require("utils.bottom_panel").show(
+      "build",
+      CORE_RT.build_term_buf,
+      { height = height, focus = opts.focus == true }
+    )
     return CORE_RT.build_term_win
   end
 
@@ -4521,28 +4537,25 @@ local function open_terminal_command(cmd, opts)
     if CORE_RT.build_term_buf and vim.api.nvim_buf_is_valid(CORE_RT.build_term_buf) then
       vim.api.nvim_win_set_buf(running_win, CORE_RT.build_term_buf)
     end
-    startinsert_in_window(running_win)
+    if opts.focus == true then
+      startinsert_in_window(running_win)
+    end
     vim.notify("UE build is already running", vim.log.levels.WARN)
     return
   end
 
   local win = ensure_window()
-  local previous_buf = CORE_RT.build_term_buf
   local buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_win_set_buf(win, buf)
+  vim.b[buf].ue_build_title = opts.quickfix_title or opts.finish_label or "UE build"
   track_state(buf, win)
   -- Closing the terminal window is a presentation action, not task
   -- cancellation. `bufhidden=wipe` terminates a live terminal job (reported
   -- by Neovim as exit 143), so keep the buffer hidden while the build runs.
-  -- Keep completed output too: the bottom panel can revisit it until the next
-  -- build explicitly replaces and deletes this buffer.
+  -- Each stage stays in the bottom panel's bounded history.
   vim.bo[buf].bufhidden = "hide"
   vim.bo[buf].buflisted = false
   vim.bo[buf].swapfile = false
-
-  if previous_buf and previous_buf ~= buf and vim.api.nvim_buf_is_valid(previous_buf) then
-    pcall(vim.api.nvim_buf_delete, previous_buf, { force = true })
-  end
 
   if opts.quickfix_title then
     require("ue.build_diagnostics").clear()
@@ -4552,54 +4565,66 @@ local function open_terminal_command(cmd, opts)
   local build_monitor
   local active_jobid
   local foreground_token
-  active_jobid = vim.fn.termopen(cmd, {
-    cwd = opts.cwd,
-    env = opts.env,
-    on_stdout = function(_, data)
-      stdout_pending = append_job_output(output_lines, stdout_pending, data)
-    end,
-    on_stderr = function(_, data)
-      stderr_pending = append_job_output(output_lines, stderr_pending, data)
-    end,
-    on_exit = function(_, code)
-      vim.schedule(function()
-        if build_monitor then
-          build_monitor:stop()
-          build_monitor = nil
-        end
-        if vim.api.nvim_buf_is_valid(buf) then
-          vim.bo[buf].bufhidden = "hide"
-        end
-        stdout_pending = flush_job_output(output_lines, stdout_pending)
-        stderr_pending = flush_job_output(output_lines, stderr_pending)
-        if CORE_RT.build_term_jobid == active_jobid then
-          CORE_RT.build_term_jobid = nil
-        end
-        if foreground_token then require("utils.host_admission").foreground_done(foreground_token); foreground_token = nil end
-        if code ~= 0 and opts.quickfix_title then
-          require("ue.build_diagnostics").publish(opts.quickfix_title, diagnostic_entries_from_output(output_lines, {
-            root = opts.quickfix_root,
-            tail_limit = opts.tail_limit,
-          }))
-        end
-        if opts.quickfix_title then
-          set_build_status(code == 0 and "BOK" or ("B" .. tostring(code)))
-        end
-        local level = code == 0 and vim.log.levels.INFO or vim.log.levels.ERROR
-        local msg = ("%s finished with exit code %d"):format(
-          opts.finish_label or "UE build", code
-        )
-        if code ~= 0 and opts.quickfix_title then
-          msg = msg .. " — " .. require("ue.build_diagnostics").summary()
-        end
-        vim.notify(msg, level)
-        if code ~= 0 then require("utils.log").error("ue.build", msg) end
-        if type(opts.on_exit) == "function" then
-          opts.on_exit(code, vim.deepcopy(output_lines))
-        end
-      end)
-    end,
-  })
+  active_jobid = vim.api.nvim_win_call(win, function()
+    return vim.fn.termopen(cmd, {
+      cwd = opts.cwd,
+      env = opts.env,
+      on_stdout = function(_, data)
+        stdout_pending = append_job_output(output_lines, stdout_pending, data)
+      end,
+      on_stderr = function(_, data)
+        stderr_pending = append_job_output(output_lines, stderr_pending, data)
+      end,
+      on_exit = function(_, code)
+        vim.schedule(function()
+          if build_monitor then
+            build_monitor:stop()
+            build_monitor = nil
+          end
+          if vim.api.nvim_buf_is_valid(buf) then
+            vim.bo[buf].bufhidden = "hide"
+          end
+          stdout_pending = flush_job_output(output_lines, stdout_pending)
+          stderr_pending = flush_job_output(output_lines, stderr_pending)
+          local owns_terminal = CORE_RT.build_term_jobid == active_jobid
+          if owns_terminal then
+            CORE_RT.build_term_jobid = nil
+          end
+          if foreground_token then
+            require("utils.host_admission").foreground_done(foreground_token)
+            foreground_token = nil
+          end
+          local current = owns_terminal and (not opts.is_current or opts.is_current())
+          if current and code ~= 0 and opts.quickfix_title then
+            require("ue.build_diagnostics").publish(
+              opts.quickfix_title,
+              diagnostic_entries_from_output(output_lines, {
+                root = opts.quickfix_root,
+                tail_limit = opts.tail_limit,
+              })
+            )
+          end
+          if current and opts.quickfix_title then
+            set_build_status(code == 0 and "BOK" or ("B" .. tostring(code)))
+          end
+          local level = code == 0 and vim.log.levels.INFO or vim.log.levels.ERROR
+          local msg = ("%s finished with exit code %d"):format(opts.finish_label or "UE build", code)
+          if current and code ~= 0 and opts.quickfix_title then
+            msg = msg .. " — " .. require("ue.build_diagnostics").summary()
+          end
+          if current then
+            vim.notify(msg, level)
+          end
+          if code ~= 0 then
+            require("utils.log").error("ue.build", msg)
+          end
+          if type(opts.on_exit) == "function" then
+            opts.on_exit(code, vim.deepcopy(output_lines))
+          end
+        end)
+      end,
+    })
+  end)
   if active_jobid <= 0 then
     CORE_RT.build_term_jobid = nil
     if opts.quickfix_title then
@@ -4610,7 +4635,8 @@ local function open_terminal_command(cmd, opts)
   end
 
   CORE_RT.build_term_jobid = active_jobid
-  foreground_token = require("utils.host_admission").foreground_begin(opts.quickfix_title or opts.finish_label or "terminal task")
+  foreground_token =
+    require("utils.host_admission").foreground_begin(opts.quickfix_title or opts.finish_label or "terminal task")
   -- Register after job creation; status remains derived from the channel.
   pcall(function()
     require("utils.task_registry").register({
@@ -4627,7 +4653,9 @@ local function open_terminal_command(cmd, opts)
       bufnr = buf,
     })
   end)
-  startinsert_in_window(win)
+  if opts.focus == true then
+    startinsert_in_window(win)
+  end
   return active_jobid
 end
 
@@ -5197,7 +5225,8 @@ function M.cached_grep(opts)
     local ms = (vim.loop.hrtime() - trace_t0) / 1e6
     local line = string.format("[+%8.1fms] " .. fmt, ms, ...)
     local f = io.open(trace_log_path, "a")
-    if f then f:write(line .. "\n"); f:close() end
+    if f then f:write(line .. "\n")
+f:close() end
   end
   if trace_enabled then
     -- Truncate at session start so each <leader>/ produces a clean timeline.
@@ -5308,20 +5337,23 @@ function M.cached_grep(opts)
           picker.opts.literal = not picker.opts.regex
           require("snacks").notify((picker.opts.regex and "✓ regex ON " or "✗ regex OFF (literal)"),
             { title = "UE grep", level = "info" })
-          picker.list:set_target(); picker:find()
+          picker.list:set_target()
+picker:find()
         end,
         ue_grep_toggle_word = function(picker)
           picker.opts.word = not picker.opts.word
           require("snacks").notify((picker.opts.word and "✓ whole-word ON " or "✗ whole-word OFF"),
             { title = "UE grep", level = "info" })
-          picker.list:set_target(); picker:find()
+          picker.list:set_target()
+picker:find()
         end,
         ue_grep_toggle_case = function(picker)
           picker.opts.case = not picker.opts.case
           require("snacks").notify((picker.opts.case and "✓ case-sensitive ON " or "✗ ignore-case"),
             { title = "UE grep", level = "info" })
           grep_debug("TOGGLE backend=csearch case=%s", tostring(picker.opts.case == true))
-          picker.list:set_target(); picker:find()
+          picker.list:set_target()
+picker:find()
         end,
         ue_grep_toggle_scope = function(picker)
           if not grep_scope then
@@ -5338,7 +5370,8 @@ function M.cached_grep(opts)
               and ("✓ scope: " .. (grep_scope.label or grep_scope.name or "current"))
               or "✗ scope OFF (whole workspace)"),
             { title = "UE grep", level = "info" })
-          picker.list:set_target(); picker:find()
+          picker.list:set_target()
+picker:find()
         end,
       },
       format = grouping_enabled and CORE_RT.grep_format_grouped or "file",
@@ -6913,7 +6946,7 @@ local function build_target(opts)
     vim.notify("A UE build is already running in this editor", vim.log.levels.WARN)
     return abort()
   end
-  local ctx, err = resolve_context()
+  local ctx, err = opts.snapshot and require("ue.workflows._runtime").unwrap(opts.snapshot).context or resolve_context()
   if not ctx then
     vim.notify(err, vim.log.levels.WARN)
     return abort()
@@ -6933,7 +6966,7 @@ local function build_target(opts)
   -- picker once — the engine-level last-used pair is floated to the top so
   -- it's a single <CR> — then resume this exact build. An explicit
   -- opts.platform (caller already chose) bypasses the gate.
-  if not opts._platform_prompted
+  if not opts.snapshot and not opts._platform_prompted
       and trim(opts.platform or "") == ""
       and vim.g.ue_prepare_headless ~= 1
       and CORE_RT.project_state.target_is_set
@@ -6949,9 +6982,10 @@ local function build_target(opts)
     return
   end
 
-  local plat = trim(opts.platform or "")
+  local plat = trim(opts.snapshot and opts.snapshot.target.id or opts.platform or "")
   if plat == "" then plat = target_platform(ctx.engine_root, nil) end
-  local conf = selected_target_configuration(ctx.engine_root, ctx.project_root, ctx.uproject, plat)
+  local conf = opts.snapshot and opts.snapshot.configuration
+    or selected_target_configuration(ctx.engine_root, ctx.project_root, ctx.uproject, plat)
   local operation = opts.operation or (opts.skip_deploy == true and "so_build" or "build")
   opts.operation = operation
   local so_only = operation == "so_build"
@@ -6996,6 +7030,7 @@ local function build_target(opts)
     return abort()
   end
   local function start_build()
+    if opts.is_current and not opts.is_current() then return abort() end
     local function on_exit(code, output)
       if code == 0
           and require("ue.targets").supports(target_ctx.platform, "semantic_cdb", host_driver) then
@@ -7020,6 +7055,7 @@ local function build_target(opts)
       quickfix_root = workspace_root(ctx),
       tail_limit = 16,
       on_exit = on_exit,
+      is_current = opts.is_current,
     })
     if not job then abort() end
     return job
@@ -7839,12 +7875,15 @@ function M.toggle_debug_log()
 end
 
 local function deploy_android_so(opts)
-  opts = type(opts) == "table" and opts.on_exit and opts or {}
+  opts = type(opts) == "table" and opts or {}
   local host_driver = require("utils.platform").driver()
   local dispatched, dispatch_err = dispatch_registered_workflow("Android", "so_deploy", {
     host_driver = host_driver,
+    snapshot = opts.snapshot,
     context = {
       on_exit = opts.on_exit,
+      return_handle = opts.on_exit ~= nil,
+      is_current = opts.is_current,
       resolve_context = resolve_context,
       read_state = read_state,
       target_context = function(ctx, platform)
@@ -8156,7 +8195,8 @@ end
 
 function CORE_RT.prepare_sync()
   local ctx, err = resolve_context()
-  if not ctx then vim.notify(err, vim.log.levels.WARN); return false end
+  if not ctx then vim.notify(err, vim.log.levels.WARN)
+return false end
   local lease, lease_err = CORE_RT.file_lock.acquire(join(ctx.paths.runtime_dir, "prepare.lock"))
   if not lease then
     vim.notify("UEPrepare is running in another Neovim: " .. tostring(lease_err),
@@ -8350,7 +8390,8 @@ local function prepare_async(opts)
       join(ctx.paths.runtime_dir, "prepare.lock"))
   end
   if not prepare_lease then
-    if handle then handle.message = "BUSY"; handle:finish() end
+    if handle then handle.message = "BUSY"
+handle:finish() end
     vim.notify("UEPrepare is running in another Neovim: " .. tostring(prepare_lease_err),
       vim.log.levels.WARN, { title = "UE" })
     return
@@ -8377,7 +8418,8 @@ local function prepare_async(opts)
           set_prepare_running(false)
           populate_quickfix_from_output("UEPrepare compile_commands", compile_path, { root = root })
           vim.notify("UEPrepare compile_commands failed: " .. compile_path, vim.log.levels.WARN)
-          if handle then handle.message = "FAILED"; handle:finish() end
+          if handle then handle.message = "FAILED"
+handle:finish() end
           return
         end
         update("indexing...", 95)
@@ -8388,7 +8430,9 @@ local function prepare_async(opts)
         refresh_statusline()
         set_prepare_running(false)
         CORE_RT.start_deferred_clangd(ctx)
-        if handle then handle.message = "done"; handle.percentage = 100; handle:finish() end
+        if handle then handle.message = "done"
+handle.percentage = 100
+handle:finish() end
         vim.notify(prepare_summary(ctx, compile_path, { reused_cache = true }))
 
         -- csearch index rebuild (same logic as before, just moved here).
@@ -9278,7 +9322,8 @@ function M.setup()
     if on and not CORE_RT.err_sink_timer then
       local err_log = vim.fn.stdpath("state") .. ("/ue_errors.%d.log"):format(vim.fn.getpid())
       local f = io.open(err_log, "w")
-      if f then f:write("=== installed " .. os.date() .. " ===\n"); f:close() end
+      if f then f:write("=== installed " .. os.date() .. " ===\n")
+f:close() end
       local timer = vim.uv.new_timer()
       if timer then
         CORE_RT.err_sink_timer = timer
@@ -9329,8 +9374,10 @@ function M.setup()
     local function read_file(p, max_bytes)
       max_bytes = max_bytes or 50000
       if vim.fn.filereadable(p) == 0 then return "(missing: " .. p .. ")" end
-      local fp = io.open(p, "r"); if not fp then return "(open failed)" end
-      local content = fp:read("*a") or ""; fp:close()
+      local fp = io.open(p, "r")
+if not fp then return "(open failed)" end
+      local content = fp:read("*a") or ""
+fp:close()
       if #content > max_bytes then
         content = "...[truncated, showing last " .. max_bytes .. " bytes]...\n"
                   .. content:sub(-max_bytes)
@@ -9370,7 +9417,8 @@ function M.setup()
 
     local body = table.concat(parts, "\n")
     local fp = io.open(out_path, "w")
-    if fp then fp:write(body); fp:close() end
+    if fp then fp:write(body)
+fp:close() end
     vim.notify("UE grep diag → " .. out_path,
       vim.log.levels.INFO, { title = "UE", timeout = 5000 })
   end, { desc = "Bundle UE grep trace + errors + messages into one diag file" })
@@ -9417,12 +9465,30 @@ function M.setup()
   require("utils.ue_hub").setup_commands()
   require("ue.build_diagnostics").setup()
   require("utils.bottom_panel").setup_commands()
+  require("ue.run_profiles").setup_commands({
+    set_target = function(platform, configuration)
+      return set_platform(platform .. " " .. configuration, { stage_next = false })
+    end,
+  })
   -- Target inner loops (Android: build SO → deploy → debug-launch) live with
   -- their workflows; ue.lua only hands over the steps it owns.
   require("ue.workflows.bootstrap").setup_loop_commands({
-    build_so = function(on_exit) build_target({ operation = "so_build", on_exit = on_exit }) end,
-    deploy_so = function(on_exit) deploy_android_so({ on_exit = on_exit }) end,
-    launch = function() M.launch_app() end,
+    resolve_context = resolve_context,
+    target_context = CORE_RT.target_context,
+    read_state = read_state,
+    update_state_field = update_state_field,
+    build_so = function(on_exit, snapshot, _, _, is_current)
+      return build_target({ operation = "so_build", on_exit = on_exit, snapshot = snapshot, is_current = is_current })
+    end,
+    deploy_so = function(on_exit, snapshot, _, _, is_current)
+      return deploy_android_so({ on_exit = on_exit, snapshot = snapshot, is_current = is_current })
+    end,
+    launch = function(on_exit, snapshot, _, _, is_current)
+      return dispatch_registered_workflow(snapshot.target.id, "launch", {
+        snapshot = snapshot,
+        context = { on_exit = on_exit, resolve_context = resolve_context, is_current = is_current },
+      })
+    end,
     set_status = set_build_status,
   })
   vim.api.nvim_create_user_command("UELaunch", function()
@@ -9505,9 +9571,11 @@ function M.setup()
     -- for a full :UEPrepare. Doesn't refresh gtags or cdb — only csearch.
     -- For gtags/cdb drift, use :UEPrepare (normal) or :UEPrepare! (full).
     local ctx, err = resolve_context()
-    if not ctx then vim.notify(err or "no ctx", vim.log.levels.WARN); return end
+    if not ctx then vim.notify(err or "no ctx", vim.log.levels.WARN)
+return end
     local ok_watch, watch = pcall(require, "utils.ue_watch")
-    if not ok_watch then vim.notify("ue_watch module missing", vim.log.levels.WARN); return end
+    if not ok_watch then vim.notify("ue_watch module missing", vim.log.levels.WARN)
+return end
     if watch.persistent_dirty_status().capped then
       vim.notify("Dirty coverage was truncated; recovering complete changes for csearch", vim.log.levels.INFO)
       return M.build_csearch_async({ context = ctx, recover_overflow = true })
@@ -9590,7 +9658,8 @@ function M.setup()
     local ctx = require_ctx_or_nil()
     if not ctx then
       vim.notify("UECDBPartition: no UE context (run :UESetProject first)",
-        vim.log.levels.WARN, { title = "ue.cdb" }); return
+        vim.log.levels.WARN, { title = "ue.cdb" })
+return
     end
     local opts = {}
     local arg = (cmd.args or ""):gsub("^%s+", ""):gsub("%s+$", "")
@@ -9606,17 +9675,20 @@ function M.setup()
     --   :UECDBSwitch Win64 Development
     local ctx = require_ctx_or_nil()
     if not ctx then
-      vim.notify("UECDBSwitch: no UE context", vim.log.levels.WARN, { title = "ue.cdb" }); return
+      vim.notify("UECDBSwitch: no UE context", vim.log.levels.WARN, { title = "ue.cdb" })
+return
     end
     local args = cmd.fargs or {}
     if #args ~= 2 then
       vim.notify("Usage: :UECDBSwitch <Platform> <Config>  e.g. :UECDBSwitch Android Test",
-        vim.log.levels.WARN, { title = "ue.cdb" }); return
+        vim.log.levels.WARN, { title = "ue.cdb" })
+return
     end
     local spec = args[1] .. "/" .. args[2]
     INDEX_FN.partition_base_cdb_async(ctx, { active = spec }, function(ok, msg)
       if not ok then
-        vim.notify("UECDBSwitch failed: " .. tostring(msg), vim.log.levels.WARN, { title = "ue.cdb" }); return
+        vim.notify("UECDBSwitch failed: " .. tostring(msg), vim.log.levels.WARN, { title = "ue.cdb" })
+return
       end
       INDEX_FN.maybe_restart_clangd_for_index()
       vim.notify("UECDBSwitch: active=" .. spec, vim.log.levels.INFO, { title = "ue.cdb" })
@@ -9625,12 +9697,14 @@ function M.setup()
   vim.api.nvim_create_user_command("UECDBStatus", function()
     local ctx = require_ctx_or_nil()
     if not ctx then
-      vim.notify("UECDBStatus: no UE context", vim.log.levels.WARN, { title = "ue.cdb" }); return
+      vim.notify("UECDBStatus: no UE context", vim.log.levels.WARN, { title = "ue.cdb" })
+return
     end
     local mf, mf_path = INDEX_FN.read_partition_manifest(ctx)
     if not mf then
       vim.notify("UECDBStatus: no partition manifest yet (run :UEPrepare or :UECDBPartition)",
-        vim.log.levels.INFO, { title = "ue.cdb" }); return
+        vim.log.levels.INFO, { title = "ue.cdb" })
+return
     end
     local lines = { "Manifest: " .. mf_path }
     if mf.active then
@@ -9652,7 +9726,8 @@ function M.setup()
   end, { desc = "Show CDB partition status" })
   vim.api.nvim_create_user_command("UEWatchStatus", function()
     local ok, watch = pcall(require, "utils.ue_watch")
-    if not ok then vim.notify("ue_watch module missing", vim.log.levels.WARN); return end
+    if not ok then vim.notify("ue_watch module missing", vim.log.levels.WARN)
+return end
     local s = watch.status()
     vim.notify(("UEWatch: running=%s root=%s pending(+%d/-%d) last=%s"):format(
       tostring(s.running), s.watch_root or "?",
@@ -9661,17 +9736,20 @@ function M.setup()
   end, { desc = "Show ue_watch incremental indexer status" })
   vim.api.nvim_create_user_command("UEWatchStop", function()
     local ok, watch = pcall(require, "utils.ue_watch")
-    if ok then watch.stop(); vim.notify("UEWatch stopped") end
+    if ok then watch.stop()
+vim.notify("UEWatch stopped") end
   end, {})
   vim.api.nvim_create_user_command("UEWatchFlush", function()
     local ok, watch = pcall(require, "utils.ue_watch")
-    if ok and watch.flush_now then watch.flush_now(); vim.notify("UEWatch flush triggered") end
+    if ok and watch.flush_now then watch.flush_now()
+vim.notify("UEWatch flush triggered") end
   end, { desc = "Bypass debounce; immediately apply pending watcher events" })
   vim.api.nvim_create_user_command("UEDirtyStatus", function()
     -- Show the cumulative-since-last-:UEPrepare dirty set (rg-on-dirty
     -- overlay's source of truth until the next csearch publish).
     local ok, watch = pcall(require, "utils.ue_watch")
-    if not ok then vim.notify("ue_watch module missing", vim.log.levels.WARN); return end
+    if not ok then vim.notify("ue_watch module missing", vim.log.levels.WARN)
+return end
     local st = (watch.persistent_dirty_status and watch.persistent_dirty_status()) or { count = 0 }
     local lines = {
       ("UEDirty: %d files in cumulative dirty set"):format(st.count or 0),
@@ -9692,9 +9770,11 @@ function M.setup()
   end, { desc = "Show cumulative dirty set + dirty_files.collect breakdown" })
   vim.api.nvim_create_user_command("UEDirtyClear", function()
     local ok, watch = pcall(require, "utils.ue_watch")
-    if not ok then vim.notify("ue_watch module missing", vim.log.levels.WARN); return end
+    if not ok then vim.notify("ue_watch module missing", vim.log.levels.WARN)
+return end
     if type(watch.clear_persistent_dirty) ~= "function" then
-      vim.notify("clear_persistent_dirty unavailable (old ue_watch?)", vim.log.levels.WARN); return
+      vim.notify("clear_persistent_dirty unavailable (old ue_watch?)", vim.log.levels.WARN)
+return
     end
     watch.clear_persistent_dirty("manual")
     vim.notify("UEDirty cleared")
@@ -9759,7 +9839,8 @@ function M.setup()
   end, {})
   vim.api.nvim_create_user_command("UEIndexTimings", function()
     local ctx, err = resolve_context()
-    if not ctx then vim.notify("UEIndexTimings: " .. (err or "no ctx"), vim.log.levels.WARN); return end
+    if not ctx then vim.notify("UEIndexTimings: " .. (err or "no ctx"), vim.log.levels.WARN)
+return end
     local state = ensure_index_state(ctx)
     local timings = state.index_timings or {}
     local lines = { "UEIndexTimings (last run per phase):" }
@@ -9806,7 +9887,8 @@ function M.setup()
     local bat = nil
     for _, root in ipairs(roots) do
       local candidate = cache_paths(root).pch_build_bat
-      if _ufs.is_file(candidate) then bat = candidate; break end
+      if _ufs.is_file(candidate) then bat = candidate
+break end
     end
     if not bat then
       vim.notify(

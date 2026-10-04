@@ -395,6 +395,7 @@ Source: `lua/plugins/snacks.lua` (`<leader>;` / `fe` / `e` / `/` /
 | `<leader>/`      | Grep all code (engine + project)        |
 | `<leader>sg`     | Grep workspace code (C++/shader)        |
 | `<leader>sG`     | Grep workspace text (explicit rg)       |
+| `<leader>sf/sF`  | Find current document occurrences / prefill word or single-line selection; includes unsaved text |
 | `<leader>sw/sW`  | Search current word/selection (LazyVim) |
 | `<leader>sy/sY`  | Live grep with current word prefilled   |
 | `<leader>sx`     | Grep whole word match                   |
@@ -407,7 +408,25 @@ Source: `lua/plugins/snacks.lua` (`<leader>;` / `fe` / `e` / `/` /
 | `<leader>sh`     | Help tags (LazyVim)                     |
 | `<leader>sm`     | Marks (LazyVim)                         |
 
-### Inside a Snacks Picker
+### Current-document Find
+
+`<leader>sf` searches the current in-memory document, including unnamed and
+unsaved text; `<leader>sF` prefills the current word or active single-line
+selection. Each occurrence has its own row and UTF-8 byte position. Enter
+opens that position in the source editor; Esc cancels. Alt-C toggles case,
+Alt-W whole word, Alt-R literal/regex; title reports conditions and result state.
+Ctrl-V pastes the query. This document list locates in its source editor;
+file/project search pickers provide split/tab opening and saved results.
+Regex uses single-line Rust syntax; expressions producing zero-width matches
+are explicitly unsupported. Invalid patterns and partial output are not empty results.
+F5 refreshes changed document text; reopen after a new cursor/window intent.
+After closing, `<leader>sR` reruns the last query/modes against fresh text in
+the current document. Ctrl-O returns after a cross-line jump; two backticks
+return to the exact previous column after a same-line jump.
+Documents over 2 MiB are refused and bounded result/output counts are marked partial.
+`sb` remains fuzzy line browsing; `sB` reads open files from disk, not unsaved text.
+
+### Inside file and project search pickers
 
 | Key              | Action                                  |
 |------------------|-----------------------------------------|
@@ -621,6 +640,11 @@ reports that instead of rerunning work.
 `:UEWorkspace windows` / `buffers` / `results` / `tasks` / `logs` selects a
 category. Inside this entry, Ctrl-R refreshes native ownership/status, Enter
 opens or focuses, and Ctrl-X stops only the selected registered background job.
+From an ordinary editing window, Ctrl-O opens a still-hidden ordinary Buffers
+entry in that source window without adding a split; its previous dirty text
+remains retained. Existing views use Enter to focus them; hidden files keep
+Enter's new-split behavior. Terminal/log/result/task entries use Enter.
+Reopen the list after changing its source window or text.
 Debug sessions still stop with Shift-F5. A stale window row is rejected rather
 than opening unrelated content; refresh it before trying again.
 

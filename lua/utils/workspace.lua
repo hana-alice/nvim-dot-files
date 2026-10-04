@@ -3,6 +3,7 @@
 local M = {}
 local categories = { "all", "windows", "buffers", "results", "tasks", "logs" }
 local PIN_ROWS, PIN_BYTES = 5000, 8 * 1024 * 1024
+local open_epoch = 0
 
 local function text(value)
   return tostring(value or ""):gsub("[%z\1-\31\127]", " ")
@@ -31,6 +32,54 @@ end
 
 local function buffer_row(buf, kind)
   return { kind = kind, buf = buf, name = vim.api.nvim_buf_get_name(buf), panel = vim.b[buf].ue_bottom_panel_kind }
+end
+
+local function ordinary_buffer(buf)
+  return valid_buf(buf)
+    and vim.api.nvim_buf_is_loaded(buf)
+    and vim.bo[buf].buftype == ""
+    and not picker_buf(buf)
+    and vim.b[buf].ue_bottom_panel_kind == nil
+    and (vim.bo[buf].buflisted or vim.bo[buf].modified)
+end
+
+local function source_context(win)
+  if type(win) ~= "number" or not vim.api.nvim_win_is_valid(win) then
+    return nil
+  end
+  local buf = vim.api.nvim_win_get_buf(win)
+  return {
+    win = win,
+    tab = vim.api.nvim_win_get_tabpage(win),
+    buf = buf,
+    name = vim.api.nvim_buf_get_name(buf),
+    tick = vim.api.nvim_buf_get_changedtick(buf),
+    cursor = vim.api.nvim_win_get_cursor(win),
+    strict = ordinary_buffer(buf),
+  }
+end
+
+local function current_source(source, strict)
+  return source
+    and vim.api.nvim_win_is_valid(source.win)
+    and vim.api.nvim_tabpage_is_valid(source.tab)
+    and vim.api.nvim_get_current_win() == source.win
+    and vim.api.nvim_get_current_tabpage() == source.tab
+    and vim.api.nvim_win_get_tabpage(source.win) == source.tab
+    and vim.api.nvim_win_get_buf(source.win) == source.buf
+    and vim.api.nvim_buf_get_name(source.buf) == source.name
+    and (
+      not strict and source.strict == false
+      or (
+        vim.api.nvim_buf_get_changedtick(source.buf) == source.tick
+        and vim.deep_equal(vim.api.nvim_win_get_cursor(source.win), source.cursor)
+      )
+    )
+end
+
+local function retained_buffer(buf)
+  local policy = vim.bo[buf].bufhidden
+  return policy == "" or policy == "hide"
 end
 
 local function qf_info(id)
@@ -312,12 +361,108 @@ local function reopen(row, opts)
   return vim.api.nvim_open_win(row.buf, true, { split = "right", win = source })
 end
 
+local function reuse_buffer(row, opts)
+  if row.kind ~= "buffer" or row.panel ~= nil then
+    return nil,
+      "Ctrl-O 只在当前编辑区打开隐藏的普通文件；窗口、结果、任务和日志请用回车。"
+  end
+  if not valid_buf(row.buf) or vim.api.nvim_buf_get_name(row.buf) ~= row.name then
+    return nil, "缓冲区已被删除或更名；按 Ctrl-R 刷新列表。"
+  end
+  if not ordinary_buffer(row.buf) then
+    return nil, "所选条目不是普通文件缓冲区；请用回车恢复其视图。"
+  end
+  if #vim.fn.win_findbuf(row.buf) > 0 then
+    return nil, "所选文件已有窗口；请刷新后用回车聚焦已有视图。"
+  end
+  local win = opts.source_win or vim.api.nvim_get_current_win()
+  if win == 0 then
+    win = vim.api.nvim_get_current_win()
+  end
+  local source = opts.source_context or source_context(win)
+  if not source or not current_source(source, true) or source.win ~= win then
+    return nil, "来源窗口或文本位置已变化；请从当前编辑区重新打开 Workspace。"
+  end
+  if not normal_win(win) or not ordinary_buffer(source.buf) then
+    return nil, "请从要使用的普通编辑区打开 Workspace，再按 Ctrl-O。"
+  end
+  if not retained_buffer(source.buf) or not retained_buffer(row.buf) then
+    return nil, "缓冲区配置了隐藏时删除或卸载；本次未替换编辑区。"
+  end
+  if vim.wo[win].winfixbuf then
+    return nil, "当前编辑区固定了缓冲区；本次未替换。"
+  end
+  local setter = vim.api.nvim_win_set_buf
+  local function assign()
+    local result = setter(win, row.buf)
+    return result
+  end
+  local revoked = false
+  local guard = vim.api.nvim_create_autocmd({ "BufLeave", "BufWinLeave" }, {
+    buffer = source.buf,
+    callback = function()
+      -- Only veto this assignment frame. A user's nested native switch must
+      -- finish first; its new view/text then revokes our outer assignment.
+      for level = 2, 30 do
+        local frame = debug.getinfo(level, "fS")
+        if not frame then
+          return
+        end
+        if frame.what == "C" then
+          local caller = debug.getinfo(level + 1, "f")
+          if frame.func ~= setter or not caller or caller.func ~= assign then
+            return
+          end
+          break
+        end
+      end
+      if
+        not current_source(source, true)
+        or not ordinary_buffer(source.buf)
+        or not retained_buffer(source.buf)
+        or not valid_buf(row.buf)
+        or vim.api.nvim_buf_get_name(row.buf) ~= row.name
+        or not ordinary_buffer(row.buf)
+        or not retained_buffer(row.buf)
+        or #vim.fn.win_findbuf(row.buf) > 0
+      then
+        revoked = true
+        error("Workspace source changed during buffer switch", 0)
+      end
+    end,
+  })
+  local ok, err = pcall(assign)
+  pcall(vim.api.nvim_del_autocmd, guard)
+  if revoked then
+    return nil, "切换回调产生了新输入或视图；已保留新状态，本次打开已取消。"
+  end
+  if not ok then
+    return nil, "无法在当前编辑区打开文件: " .. tostring(err)
+  end
+  -- Native switch callbacks may make a new choice. Keep that choice and the
+  -- retained source text; never move focus back or retry in another editor.
+  if
+    not vim.api.nvim_win_is_valid(win)
+    or vim.api.nvim_win_get_buf(win) ~= row.buf
+    or vim.api.nvim_get_current_win() ~= win
+    or vim.api.nvim_win_get_tabpage(win) ~= source.tab
+    or not valid_buf(row.buf)
+    or vim.api.nvim_buf_get_name(row.buf) ~= row.name
+  then
+    return nil, "切换期间窗口或文件有了新选择；已保留当前状态，请重新检查。"
+  end
+  return win
+end
+
 --- Confirm a row's native identity before any window or cancellation effect.
 ---@return integer? win, string? err
 function M.activate(row, opts)
   opts = opts or {}
   if type(row) ~= "table" then
     return nil, "没有选择条目。"
+  end
+  if opts.reuse then
+    return reuse_buffer(row, opts)
   end
   if row.kind == "result" then
     local info, err = select_qf(row.id)
@@ -383,12 +528,46 @@ function M.open(opts)
     vim.notify("Workspace 分类：" .. table.concat(categories, ", "), vim.log.levels.WARN)
     return nil
   end
-  local source_win = vim.api.nvim_get_current_win()
-  local function confirm(row)
-    local win, err = M.activate(row, { source_win = source_win })
+  open_epoch = open_epoch + 1
+  local epoch, source = open_epoch, source_context(vim.api.nvim_get_current_win())
+  local finished, selecting = false, false
+  local function confirm(row, reuse)
+    if finished or epoch ~= open_epoch then
+      return
+    end
+    finished = true
+    if not source or not current_source(source) then
+      vim.notify(
+        "来源窗口或文本位置已变化；请从当前编辑区重新打开 Workspace。",
+        vim.log.levels.WARN
+      )
+      return
+    end
+    local win, err = M.activate(row, { source_win = source.win, source_context = source, reuse = reuse })
     if not win then
       vim.notify(err, vim.log.levels.WARN)
     end
+  end
+  local function choose(picker, item, reuse)
+    local row = item and vim.deepcopy(item.data)
+    picker:norm(function()
+      if picker.closed or finished or epoch ~= open_epoch then
+        return
+      end
+      selecting = true
+      local closed, err = pcall(picker.close, picker)
+      selecting = false
+      if not closed then
+        finished = true
+        vim.notify("未能关闭 Workspace，操作已取消: " .. tostring(err), vim.log.levels.WARN)
+        return
+      end
+      if row then
+        vim.schedule(function()
+          confirm(row, reuse)
+        end)
+      end
+    end)
   end
   local ok, snacks = pcall(require, "snacks")
   if ok and snacks.picker then
@@ -402,6 +581,7 @@ function M.open(opts)
       end,
       format = "text",
       preview = "none",
+      main = { current = true },
       sort = function(a, b)
         return a.idx < b.idx
       end,
@@ -409,7 +589,15 @@ function M.open(opts)
       auto_confirm = false,
       show_empty = true,
       layout = { preset = "vscode" },
+      on_close = function()
+        if not selecting then
+          finished = true
+        end
+      end,
       actions = {
+        workspace_reuse = function(picker)
+          choose(picker, picker:current(), true)
+        end,
         workspace_refresh = function(picker)
           picker:refresh()
         end,
@@ -425,17 +613,20 @@ function M.open(opts)
           keys = {
             ["<C-r>"] = { "workspace_refresh", mode = { "i", "n" }, desc = "Refresh native ownership" },
             ["<C-x>"] = { "workspace_stop", mode = { "i", "n" }, desc = "Stop selected task" },
+            ["<C-o>"] = { "workspace_reuse", mode = { "i", "n" }, desc = "Open hidden file in current editor" },
           },
         },
-        list = { keys = { r = "workspace_refresh", ["<C-r>"] = "workspace_refresh", ["<C-x>"] = "workspace_stop" } },
+        list = {
+          keys = {
+            r = "workspace_refresh",
+            ["<C-r>"] = "workspace_refresh",
+            ["<C-x>"] = "workspace_stop",
+            ["<C-o>"] = "workspace_reuse",
+          },
+        },
       },
       confirm = function(picker, item)
-        picker:close()
-        if item then
-          vim.schedule(function()
-            confirm(item.data)
-          end)
-        end
+        choose(picker, item, false)
       end,
     })
   end
@@ -448,6 +639,8 @@ function M.open(opts)
   }, function(row)
     if row then
       confirm(row)
+    else
+      finished = true
     end
   end)
 end

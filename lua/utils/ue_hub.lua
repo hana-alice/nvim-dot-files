@@ -89,6 +89,8 @@ M.actions = {
   { group = "Search", label = "Explicit rg text search / 搜索未索引的全部文本", key = "<leader>sG", run = mapped_key("<leader>sG") },
   { group = "Search", label = "Workspace all files / 查找工程和引擎全部文件", key = "<leader><space>", run = mapped_key("<leader><space>") },
   { group = "Search", label = "Project files / 查找项目文件", key = "<leader>ff", requires = { "project" }, run = mapped_key("<leader>ff") },
+  { group = "Search", label = "Find in current document / 当前文档查找（含未保存）", key = "<leader>sf", run = mapped_key("<leader>sf") },
+  { group = "Search", label = "Find current word in document / 在当前文档找光标词", key = "<leader>sF", run = mapped_key("<leader>sF") },
   { group = "Search", label = "Search history / 按原条件重新搜索", key = "<leader>sH", run = cmd("UESearchHistory") },
   { group = "Search", label = "Resume last search / 恢复最近搜索", key = "<leader>s/", run = mapped_key("<leader>s/") },
   { group = "Search", label = "History hub / 搜索文件跳转与结果历史", key = "<leader>fh", run = mapped_key("<leader>fh") },

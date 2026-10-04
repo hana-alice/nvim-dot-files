@@ -33,6 +33,7 @@
 | UE target drivers | `lua/ue/targets/` | Android / IOS / Mac / Win64 / Linux 的 UBT、UAT、产物和设备策略 | 各 target 独立实现；不得跨 driver fallback |
 | 符号解析栈 | `lua/utils/ue_goto/` + `lsp_fallback.lua` | C++ compiler identity；非 C++ compatibility | header 必须有 proven origin TU；非 resolved 不猜测 |
 | 代码搜索 | `lua/utils/code_search/` + `search_picker.lua` + `search_process.lua` | 索引查询、可证明 span、流式状态及后置过滤 | 索引入口不降级；显式 rg 沿用真实 provider argv；line-only/partial 可见，EOF 与 exit 分开 |
+| 当前文档查找 | `lua/utils/document_find.lua` + `document_find_process.lua` | 当前内存文本的逐次匹配和条件控制 | 不依赖 UE/CDB；有界单线程 rg stdin、流式解析和取消，来源版本与窗口交接复核 |
 | 搜索意图与文件清单 | `lua/utils/search_recipe.lua` + `search_history_store.lua` + `file_query.lua` + `file_inventory.lua` | 完整条件恢复、路径/位置往返、独立冷热文件范围 | canonical 项目隔离与锁内合并；文件清单只在当前进程缓存，不更改 CDB/csearch 输入 |
 | 连续代码阅读 | `lua/utils/ue_goto/reading*.lua` + `relations.lua` | 引用/header owner、显式 Peek、按需关系与返回 | C++ 定义复用 compiler proof；确认交接复核版本；关系 location 渲染不修改缓存；不接管全局 view |
 | 核心健康审计 | `lua/utils/core_health*.lua` + `scripts/nvim_core_health.lua` | 真实启动、编辑、AST、搜索、clangd/CDB/target plan 的分层证据 | 交互入口只异步启动隔离 headless runner；live workspace 只读 |

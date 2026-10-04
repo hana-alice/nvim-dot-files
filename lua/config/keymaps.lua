@@ -83,6 +83,23 @@ local function open_visual_substitute()
   end)
 end
 
+local function find_document_text()
+  local mode = vim.fn.mode()
+  local visual = mode == "v" or mode == "V" or mode == "\22"
+  local text
+  if visual then
+    text = visual_selection_text()
+    if text:find("\n", 1, true) then
+      vim.notify("当前文档查找使用单行文字；请缩小选区", vim.log.levels.WARN)
+      return
+    end
+    vim.cmd.normal({ args = { termcodes("<Esc>") }, bang = true })
+  else
+    text = vim.fn.expand("<cword>")
+  end
+  require("utils.document_find").open({ text = text })
+end
+
 local function open_symbol_picker(opts)
   opts = opts or {}
   return function()
@@ -300,6 +317,10 @@ map({ "n", "x" }, "<leader>sY", live_grep_word_with({
 }), { desc = "Search: Live grep word/selection (cwd)" })
 map("n", "<leader>sr", open_word_substitute, { desc = "Search: Replace current word in buffer" })
 map("x", "<leader>sr", open_visual_substitute, { desc = "Search: Replace selection in range" })
+map("n", "<leader>sf", function()
+  require("utils.document_find").open()
+end, { desc = "Search: Find in current document (unsaved text)" })
+map({ "n", "x" }, "<leader>sF", find_document_text, { desc = "Search: Find current word / selection in document" })
 map("n", "<leader>ss", open_symbol_picker(), { desc = "Search: Symbols" })
 map("n", "<leader>sS", open_symbol_picker({ workspace = true }), { desc = "Search: Workspace Symbols" })
 map("n", "<leader>bc", close_current_target, { desc = "Buffer/Window: Smart close current target" })
@@ -323,6 +344,13 @@ map("n", "<leader>vq", sidebar_toggle("qflist"), { desc = "Sidebar: Pinned resul
 map("n", "<leader>vl", sidebar_toggle("loclist"), { desc = "Sidebar: Location list" })
 map("n", "<leader>vt", sidebar_toggle("todo"), { desc = "Sidebar: TODO / FIXME" })
 map("n", "<leader>?", "<cmd>UECheatsheet<cr>", { desc = "UE: Cheatsheet" })
+
+map({ "n", "i", "x" }, "<A-j>", function()
+  return require("utils.line_move").keys(1)
+end, { expr = true, silent = true, desc = "Move Down" })
+map({ "n", "i", "x" }, "<A-k>", function()
+  return require("utils.line_move").keys(-1)
+end, { expr = true, silent = true, desc = "Move Up" })
 
 -- Restart Neovim in the current cwd. Detects Neovide / WezTerm / native
 -- terminal and spawns a fresh nvim there before tearing down this one.

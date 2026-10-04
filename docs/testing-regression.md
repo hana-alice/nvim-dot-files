@@ -25,6 +25,7 @@ fail-closed 语义），禁止注入假可执行文件/假宿主让断言「碰�
 | 文件树改名/移动/删除 / 受保护的缓冲区关闭 | `ide_file_mutations` `ide_buffer_close` `unsaved` `ide_workspace` `task_registry` `keymaps` `workarounds` `smoke` |
 | 代码片段字段 / 当前文件大纲 | `ide_editing_feedback` `daily_edit` `ue_goto_reading` `review_editor` `keymaps` `workarounds` `smoke` |
 | 诊断入口 / quickfix 导航 / 当前文件替换接线 | `ide_problem_navigation` `ide_replace_entry` `ide_flow_hub` `ide_hub` `keymaps` `commands` `review_editor` `cheatsheet` `smoke` |
+| 当前文档逐次查找 / 移动行边界 | `ide_document_find` `ide_line_move` `ide_workspace` `host_resource_discipline` `keymaps` `ide_hub` `review_editor` `cheatsheet` `smoke` |
 | 搜索状态 / 路径坐标 / 完整搜索条件 / 独立文件清单 | `search_` `file_inventory` `grep_cache` `multi_instance_state` `ue_platform_boundary` |
 | 引用 / header / 显式 Peek / 按需关系树 | `ue_goto_reading` `ue_goto_relations` `ue_goto_behavior` `cpp_semantic_context` `cpp_semantic_client` `cpp_semantic_sidecar` `utils` |
 | Git 审阅路由 / Git 插件接线 / `lua/workarounds/codediff/**` | `git_review` `review_editor` `keymaps` `cheatsheet` `workarounds` `smoke` |

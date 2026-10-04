@@ -104,9 +104,10 @@ function M.install(owner, deps)
     end)
   end
 
-  function navigation.cpp_definition(sym, bufnr, ref_file, _ext)
+  function navigation.cpp_definition(sym, bufnr, ref_file, _ext, inspection)
     setup_semantic_trace()
-    local snapshot = semantic.begin_action(bufnr)
+    local snapshot = semantic.begin_action(bufnr, inspection and deps.inspection_current
+      and { is_current = deps.inspection_current } or nil)
     local environment, env_err = semantic.discover_toolchain(bufnr, {
       route = M.CPP_HEADER_EXTS[_ext] and "header" or "source",
     })
@@ -118,8 +119,11 @@ function M.install(owner, deps)
       failed.elapsed_ms = 0
       transaction.finish_once(failed_tx, failed)
       owner._last_cpp_transaction = failed_tx
-      record_semantic_probe(failed, failed_tx)
-      semantic_terminal_notice(sym, failed)
+      if inspection then inspection(nil, failed)
+      else
+        record_semantic_probe(failed, failed_tx)
+        semantic_terminal_notice(sym, failed)
+      end
       return
     end
 
@@ -283,6 +287,7 @@ function M.install(owner, deps)
         clear_progress()
         final.elapsed_ms = math.floor((vim.uv.hrtime() - started_at) / 1000000)
         if owner._last_cpp_transaction ~= tx then return end
+        if inspection then inspection(nil, final); return end
         record_semantic_probe(final, tx)
         if final.state ~= "resolved" then
           semantic_terminal_notice(sym, final)
@@ -304,7 +309,7 @@ function M.install(owner, deps)
     local function jump_resolved(location, tag, extra)
       local current, reason = request_is_current()
       if not current then finish_stale(reason); return end
-      if transaction.same_subject_location(tx, location) then
+      if not inspection and transaction.same_subject_location(tx, location) then
         finish(transaction.terminal("unavailable", "destination", "already-at-definition", extra))
         return
       end
@@ -319,6 +324,19 @@ function M.install(owner, deps)
       payload.metrics.source = payload.metrics.source or payload.provider
       local terminal_reason = payload.terminal_reason or "definition-resolved"
       payload.terminal_reason = nil
+      if inspection then
+        -- Inspection publishes compiler proof, not a resolved gd terminal or
+        -- a jump/probe/lineage side effect. The explicit picker owns opening.
+        payload.origin_context = extra and extra.origin_context or origin_context
+        payload.build_fingerprint = environment.build_fingerprint
+        payload.kind = "proven-destination"
+        payload.is_current = request_is_current
+        transaction.finish_once(tx, payload, function(proof)
+          clear_progress()
+          if request_is_current() then inspection(proof) end
+        end)
+        return
+      end
       local resolved = transaction.terminal("resolved", "jump", terminal_reason, payload)
       if jump_to_location(location) then
         local origin = extra and extra.origin_context or origin_context
@@ -419,7 +437,8 @@ function M.install(owner, deps)
         choose_context = function(contexts, callback)
           clear_progress()
           if not request_is_current() then callback(nil); return end
-          require("utils.ue_goto.ui").choose_context(contexts, callback)
+          if inspection and deps.inspection_choose_context then deps.inspection_choose_context(contexts, callback)
+          else require("utils.ue_goto.ui").choose_context(contexts, callback) end
         end,
       }, function(response, stale_reason)
         if not response then
@@ -585,10 +604,17 @@ function M.install(owner, deps)
       -- the proven source role before that response can be mistaken for a miss.
       for _, definition in ipairs(symbol_info.definitions or {}) do
         if transaction.same_subject_location(tx, definition) then
-          finish(transaction.terminal("unavailable", "destination", "already-at-definition", {
-            provider = "clangd", identity = usr, destination_role = "definition",
-            identity_result = symbol_info,
-          }))
+          if inspection then
+            jump_resolved(definition, "clangd·semantic", {
+              provider = "clangd", identity = usr, destination_role = "definition",
+              identity_result = symbol_info, metrics = { source = "clangd", identity_ms = symbol_info.elapsed_ms },
+            })
+          else
+            finish(transaction.terminal("unavailable", "destination", "already-at-definition", {
+              provider = "clangd", identity = usr, destination_role = "definition",
+              identity_result = symbol_info,
+            }))
+          end
           return
         end
       end

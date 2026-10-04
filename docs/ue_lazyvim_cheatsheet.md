@@ -16,7 +16,7 @@ surfaces drift apart.
 
 ## Contents
 
-- [🚦 Start here](#-start-here-the-8-keys-you-must-know)
+- [🚦 Start here](#-start-here-the-9-keys-you-must-know)
 - [📐 Keymap conventions](#-keymap-conventions-this-config)
 - [⌨️ Vim fundamentals](#️-vim-fundamentals--modes)
 - [🧭 LSP navigation](#-lsp-navigation)
@@ -55,7 +55,7 @@ This file is **derived from code**. After editing any keymap or command:
 
 ---
 
-## 🚦 Start Here (the 8 keys you must know)
+## 🚦 Start Here (the 9 keys you must know)
 
 - `Space`                 → `<leader>`
 - `<leader>sk`            → search keymaps (best discovery)
@@ -63,6 +63,7 @@ This file is **derived from code**. After editing any keymap or command:
 - `<leader><space>`       → find files (workspace-aware)
 - `<leader>/`             → grep project (Engine + Project)
 - `gd` / `gr`             → goto definition / references
+- `<leader>wM`            → find windows, hidden buffers, results, tasks and logs
 - `u` / `<C-r>`           → undo / redo
 - `.`                     → repeat last change
 
@@ -276,7 +277,7 @@ Source: `lua/plugins/ue.lua` (`gd`, `<leader>ch`),
 | Key              | Action                                  |
 |------------------|-----------------------------------------|
 | `gd`             | Definition (contextual C++ / non-C++ fallback) |
-| `gr`             | References (LSP → GTAGS fallback)       |
+| `gr`             | Preview references (LSP → GTAGS fallback) |
 | `gD`             | Go to declaration (LazyVim)             |
 | `gI`             | Go to implementation (LazyVim)          |
 | `gy`             | Go to type definition (LazyVim)         |
@@ -315,6 +316,40 @@ retain their existing LSP/csearch/GTAGS behavior.
 Status: `:UEDefStatus`. Trace: `:UEDefTrace`. Cancel the current UI action with
 `:UEDefCancel`; clear inherited header contexts with `:UEDefContextClear`.
 
+### Preview and investigate
+
+| Command | Action |
+|---|---|
+| `:UEPeek` / `:UEPeek definition` | Preview a definition before leaving the source |
+| `:UEPeek declaration` | Preview declarations |
+| `:UEPeek implementation` | Preview implementations |
+| `:UEPeek type_definition` | Preview the type definition |
+| `:UEPeek references` | Preview references, as with `gr` |
+| `:UEReadCancel` | Cancel the current reading request or preview |
+| `:UEReadReturn` | Return to this investigation's source, cursor and reading view |
+| `:UERelations incoming` / `outgoing` | Expand caller / callee relationships on demand |
+| `:UERelations base` / `derived` | Expand base / derived type relationships on demand |
+| `:UERelations resume` | Reopen the root and already loaded branches |
+
+A unique location still stays in preview. Enter opens in the source window;
+Ctrl-S opens a horizontal split, Alt-V a vertical split, and Ctrl-T a new tab.
+Ctrl-Q saves results for `:UEWorkspace results` and keeps the investigation
+picker open. Ctrl-V keeps its paste action.
+These requests become invalid when their source or owner changes; a late result
+does not replace the file in an unrelated window. Source/header switching also
+uses the original reading request and does not guess a filename pair.
+
+In the relationship browser, Right expands and Left collapses; `l` / `h` do
+the same in the list. Input Left/Right are tree actions too. Alt-U selects the
+parent, Enter opens the node, Alt-V opens it beside the source, and Ctrl-Q saves
+the visible tree. Cycles, request failures and budget limits are shown. A title
+with `覆盖未知` means an empty response does not prove that no relationship exists.
+`<leader>cI` / `<leader>cO` remain the one-level call lists.
+
+Ctrl-O / Ctrl-I retain normal jump history. `:UEReadReturn` is an explicit return
+to the investigation's reading view; it refuses to force an old layout after
+an intentional layout or project change.
+
 ## 🔍 Picker / Search (Snacks)
 
 Source: `lua/plugins/snacks.lua` (`<leader>;` / `fe` / `e` / `/` /
@@ -337,7 +372,7 @@ Source: `lua/plugins/snacks.lua` (`<leader>;` / `fe` / `e` / `/` /
 | `<leader>fr/fR`  | Recent files (LazyVim)                  |
 | `<leader>/`      | Grep all code (engine + project)        |
 | `<leader>sg`     | Grep workspace code (C++/shader)        |
-| `<leader>sG`     | Grep workspace all files                |
+| `<leader>sG`     | Grep workspace text (explicit rg)       |
 | `<leader>sw/sW`  | Search current word/selection (LazyVim) |
 | `<leader>sy/sY`  | Live grep with current word prefilled   |
 | `<leader>sx`     | Grep whole word match                   |
@@ -354,25 +389,50 @@ Source: `lua/plugins/snacks.lua` (`<leader>;` / `fe` / `e` / `/` /
 
 | Key              | Action                                  |
 |------------------|-----------------------------------------|
-| `<C-q>`          | Send results to quickfix (auto sidebar) |
-| `<C-Space>`      | Multi-select toggle                     |
+| `<C-q>`          | Save results without auto-opening a result panel |
+| `<C-Space>`      | Select/unselect, then move to next candidate |
 | `<C-j>` / `<C-k>`| Down / up                               |
 | `<C-d>` / `<C-u>`| Half page down / up                     |
 | `<C-f>` / `<C-b>`| Preview scroll down / up                |
-| `<C-p>` / `<C-n>`| Prev / next history                     |
+| `<C-p>` / `<C-n>`| Previous / next candidate               |
+| `<C-Up>` / `<C-Down>` | Previous / next input history        |
 | `<C-/>`          | Toggle help inside picker               |
-| `<Tab>` / `<S-Tab>` | Toggle focus list ↔ input            |
-| `<C-s>`          | Open in split / send selection          |
-| `<C-v>`          | Open in vertical split                  |
+| `<Tab>` / `<S-Tab>` | Next / previous candidate; input keeps focus |
+| `<C-s>`          | Open in horizontal split                |
+| `<C-v>`          | Paste clipboard                         |
+| `<a-v>`          | Open in vertical split                  |
 | `<C-t>`          | Open in new tab                         |
+| `<C-y>`          | Copy path:line:byte-column (line-only when marked) |
+| `<a-y>` / `<a-Y>` | Copy absolute / relative path          |
+| `<F5>` (files)   | Refresh this file-list snapshot          |
 | `<CR>`           | Confirm                                 |
 | `<Esc>` / `q`    | Close picker                            |
 
+### File paths and refreshed lists
+
+File input accepts `/` or `\`, absolute or relative paths, and quoted paths.
+Append `:line` or `:line:column`, for example `Source/Game/Alpha.cpp:42:7` or
+`"Source/Space Name.cpp":42:7`. External lines and UTF-8 byte columns start at 1.
+Copied locations use that same convention; a result marked `行定位` copies only
+`path:line`, without a guessed column.
+
+All-file lists keep the same set on first scan and cached opens, including
+documents, scripts, configuration and `.uproject` files. Code-only entries
+keep their extension filter. The first scan is asynchronous; subsequent opens
+reuse a process-local snapshot with the same roots, exclusions and flags.
+F5 explicitly refreshes additions and deletions. Titles distinguish scanning,
+cached snapshots, complete scans, cancellation and failures.
+
+The snapshot cache keeps at most 200,000 paths, 64 MiB of path bytes and 8 scopes.
+Over-budget scans still show their full results and are marked uncached;
+cancelled or failed scans are not stored as complete. The byte budget is for
+path strings, not a promise about total editor memory or large-engine latency.
+
 ### Refining a grep — whole-word, case, regex, scope (read this)
 
-**`<leader>/` is csearch-only** (sub-second trigram index; never falls back to
+**`<leader>/` is csearch-only** (searches the indexed set; never falls back to
 rg). It does **not** use ` -- ` rg flags — instead it has **visual toggles** you
-press inside the picker (the active ones show as icons in the title):
+press in the picker input (the active ones show as icons in the title):
 
 | Key | Toggle |
 |---|---|
@@ -380,13 +440,24 @@ press inside the picker (the active ones show as icons in the title):
 | `<a-w>` / `<a-x>` | whole-word — shows **W** |
 | `<a-c>` | case-sensitive (default ignore-case) — shows **C** |
 | `<a-s>` | restrict to current module/plugin **scope** — shows **S** |
+| `<a-d>` | choose workspace / project / engine / current directory / file / module scope |
+| `<a-f>` | set include globs, exclude globs and extensions |
+| `<C-g>` | switch between content query and filtering its results; query is retained |
 
 Literal mode is exact: characters such as `.`, `/`, `[`, and `(` are searched
 as themselves. A single punctuation character is allowed; a one-character
 identifier and a one-character regex stay gated to avoid unbounded result sets.
-Results are grouped as `Project` / `Engine` / `Workspace`; the first real hit
-shows the relative path and per-file count, and every row previews and opens its
-actual match location.
+Results are flat by default. `:UEGrepGroupingToggle` enables per-file groups
+labelled `Project` / `Engine` / `Workspace`. Literal matches use the actual
+matching byte position, including case-sensitive and whole-word modes. Regex
+results without a proven span are marked `行定位`; they open the line without
+claiming an exact matching column.
+
+Scope and file masks intersect the indexed set; selecting a directory does not
+add unindexed files. The title displays the active scope/masks and waiting,
+searching, empty, error, partial, timeout or cancelled status. A truncated result
+set is not a complete absence check. To filter a returned set by path, press
+Ctrl-G and type a result filter; Ctrl-G returns to the retained content query.
 
 If there's no csearch index, `<leader>/` shows an error telling you to run
 `:UEPrepare` (it will NOT silently fall back to a slow rg search).
@@ -408,7 +479,7 @@ If there's no csearch index, `<leader>/` shows an error telling you to run
    | `FRDGBuilder -- -w -s` | whole-word **and** case-sensitive |
    | `F.*Builder -- ` | pattern is already regex (rg is regex by default) |
    | `Foo\(` / `a\|b` | escape regex metachars, or use them — rg regex syntax |
-   | `foo -- -g '*.cpp'` | restrict to a glob |
+   | `foo -- -g *.cpp` | restrict to a glob; native arguments, without shell quotes |
    | `foo -- -F` | fixed-string (treat pattern literally, no regex) |
 
 2. **Dedicated launch keys** — start the grep already in that mode:
@@ -430,7 +501,8 @@ case-sensitive. Inline `--` flags belong only to the explicit rg pickers.
 `<leader><leader>` and other pickers share these matcher options
 (set in `lua/plugins/snacks.lua`):
 
-- **smart-case**: lowercase query → ignore case; mixed case → exact
+- **ignore-case**: candidates remain case-insensitive even for mixed-case input;
+  this matcher is separate from csearch's Alt-C and rg's content case modes
 - **fzf-style fuzzy**: subsequence match, gap-penalised, boundary
   bonuses (camelCase, path separators, word starts)
 - **filename bonus**: filename matches outrank path matches —
@@ -438,14 +510,27 @@ case-sensitive. Inline `--` flags belong only to the explicit rg pickers.
 
 ### Grep Tips
 
-- Default is smart-case; type a capital to force case on that token
+- Candidate filtering ignores case. Csearch content defaults to ignore-case;
+  explicit rg content uses smart-case unless you supply a case flag
 - `<leader>sw` searches current word/selection directly
 - `<leader>sy` prefills current word into live grep for further editing
 - `<leader>sx` for whole-word, `<leader>sX` for case-sensitive
 - Inline flags after ` -- `: `Foo -- --word-regexp --case-sensitive`
-- In any Snacks picker: `<C-q>` sends results to quickfix (auto-opens sidebar)
-- `<C-Space>` to multi-select, then `<C-q>` to pin filtered subset
-- After `<C-q>` pin, recover the picker with `<leader>s/`
+- In file/content search, `<C-Space>` selects candidates, then `<C-q>` saves the
+  selected subset; without a selection it saves the current results. A successful
+  save closes that picker and returns to the source without changing the sidebar
+- Reading previews and relationship browsers keep the investigation open after saving
+- Open saved results with `<leader>wM` or `:UEWorkspace results`
+- `<leader>s/` resumes the most recent real csearch or rg search
+- `<leader>sH` remembers the query, source, scope, modes and file/result filters
+  per project. Old query-only entries are labelled as missing modes instead of
+  pretending to preserve a complete search
+
+Saved results use the native ten-list quickfix history, with a per-save limit
+of 5,000 rows / 8 MiB. Saving is refused when a full history would evict the
+currently selected oldest list; explicitly choose another result before saving.
+Closing the result window does not delete its history entry. An evicted list
+must be searched again.
 
 ## 🩺 Trouble / Quickfix / Diagnostics
 
@@ -494,6 +579,7 @@ The six sidebar views share the same left panel. The Git menu item and
 | `<leader>bp`          | Toggle pin buffer (LazyVim)          |
 | `<leader>bD`          | Delete buffer and window (LazyVim)   |
 | `<leader>bc`          | Smart close: window/buffer/float     |
+| `<leader>wM` / `:UEWorkspace` | Find windows, hidden buffers, results, tasks and logs |
 | `<leader>-`           | Horizontal split (LazyVim)           |
 | `<leader>\|`          | Vertical split (LazyVim)             |
 | `<C-h/j/k/l>`         | Move between windows (LazyVim)       |
@@ -503,6 +589,18 @@ The six sidebar views share the same left panel. The Git menu item and
 | `<leader><tab>[/]`    | Previous / next tab (LazyVim)        |
 | `<leader><tab>d`      | Close tab (LazyVim)                  |
 | `<leader><tab>o`      | Close other tabs (LazyVim)           |
+
+After `<C-w>q`, use `<leader>wM` to focus an existing window or reopen a retained
+hidden buffer, result or log. Windows from every tab are included; hidden dirty
+buffers keep their content. Closing a managed output view does not cancel or
+restart its job. If the buffer or result was already deleted/evicted, the entry
+reports that instead of rerunning work.
+
+`:UEWorkspace windows` / `buffers` / `results` / `tasks` / `logs` selects a
+category. Inside this entry, Ctrl-R refreshes native ownership/status, Enter
+opens or focuses, and Ctrl-X stops only the selected registered background job.
+Debug sessions still stop with Shift-F5. A stale window row is rejected rather
+than opening unrelated content; refresh it before trying again.
 
 ## 💻 Terminal / Shell
 
@@ -1108,7 +1206,8 @@ becoming a flat list. Display separators are ignored for exact key lookup, so
   `zM` / `zo` / `zc`)
 - To avoid polluting register: `"_d`
 - After each small edit: `.` to repeat quickly
-- Lost a picker after `<C-q>`? `<leader>s/` brings it back
+- After `<C-q>`, `<leader>s/` resumes the search; `<leader>wM` opens the saved results
+- Lost a window after `<C-w>q`? `<leader>wM` finds retained files, outputs and tasks
 
 ## Essential Builtins to Memorize
 - `u` / `<C-r>` — undo / redo

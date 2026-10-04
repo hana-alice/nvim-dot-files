@@ -35,6 +35,9 @@ nvim --headless -l tests/run_parallel.lua   # 本地并行全量（每文件独�
 | IDE 修改、文本恢复、会话与重启 | `ide_refactor` `ide_recovery` `ide_continuity` `ide_session` `commands` |
 | IDE 运行配置、Editor 测试与模块类生成 | `ide_workflow` `ide_run_profiles` `ide_ue_tools` `ide_hub` `platform` `commands` |
 | picker 交互 / sidebar / 插件工具链策略 | `review_editor` `smoke` |
+| 窗口关闭后的恢复 / 被动保存 quickfix | `ide_workspace` `task_registry` `keymaps` `commands` `android_ide` |
+| 搜索状态 / 路径坐标 / 完整搜索条件 / 独立文件清单 | `search_` `file_inventory` `grep_cache` `multi_instance_state` `ue_platform_boundary` |
+| 引用 / header / 显式 Peek / 按需关系树 | `ue_goto_reading` `ue_goto_relations` `ue_goto_behavior` `cpp_semantic_context` `cpp_semantic_client` `cpp_semantic_sidecar` `utils` |
 | Git 审阅路由 / Git 插件接线 / `lua/workarounds/codediff/**` | `git_review` `review_editor` `keymaps` `cheatsheet` `workarounds` `smoke` |
 | CI bootstrap / workflow / legacy smoke | `review_ci` + 全量 + legacy smoke |
 | `lua/utils/ue_watch.lua` / `dirty_save.lua` | `ue_watch_csearch` `multi_instance_state` `stability` |

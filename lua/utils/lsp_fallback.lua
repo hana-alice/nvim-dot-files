@@ -232,6 +232,8 @@ local function compatibility()
 end
 
 function M.definition()
+  local reading = package.loaded["utils.ue_goto.reading"]
+  if reading then reading.cancel() end
   local bufnr = vim.api.nvim_get_current_buf()
   local sym = symbol_mod.current_symbol()
   local path = location_mod.normalize_path(vim.api.nvim_buf_get_name(bufnr))

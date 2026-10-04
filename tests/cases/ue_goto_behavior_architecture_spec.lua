@@ -141,28 +141,34 @@ t.describe("navigation architecture boundaries", function()
   t.it("disposed references cannot populate quickfix or launch a new GTAGS fallback", function()
     local old_provider, old_symbol = package.loaded["utils.ue_goto.provider"], package.loaded["utils.ue_goto.symbol"]
     local old_ue = package.loaded["ue"]
-    local location = require("utils.ue_goto.location")
-    local old_quickfix = location.populate_quickfix
-    local callbacks, quickfix, gtags = {}, 0, 0
+    local results = require("utils.ue_goto.reading_results")
+    local old_preview = results.open
+    local callbacks, previews, gtags = {}, 0, 0
+    local target = vim.fn.tempname() .. ".cpp"
+    vim.fn.writefile({ "int f();" }, target)
     package.loaded["utils.ue_goto.provider"] = { async_lsp_request = function(_, _, cb) callbacks[#callbacks + 1] = cb end }
     package.loaded["utils.ue_goto.symbol"] = { current_symbol = function() return "f" end }
     package.loaded["ue"] = { gtags_references_async = function() gtags = gtags + 1 end }
-    location.populate_quickfix = function() quickfix = quickfix + 1; return true end
+    results.open = function() previews = previews + 1; return true end
     local ok, err = xpcall(function()
       local compat = require("utils.ue_goto.compat_navigation").install({})
       compat.references()
       compat.references()
       compat.dispose()
-      callbacks[1]({ { uri = "file:///fixture/f.cpp" } })
-      callbacks[2](nil)
-      t.assert_eq(quickfix, 0)
+      local response = { locations = { { uri = vim.uri_from_fname(target),
+        range = { start = { line = 0, character = 4 } } } }, reason = "ok" }
+      callbacks[1](response)
+      callbacks[2]({ locations = {}, reason = "empty" })
+      t.assert_eq(previews, 0)
       t.assert_eq(gtags, 0)
       compat.references()
-      callbacks[3]({ { uri = "file:///fixture/f.cpp" } })
-      t.assert_eq(quickfix, 1, "new references retain the existing result behavior")
+      callbacks[3](response)
+      t.assert_eq(previews, 1, "new references still deliver results as an explicit preview")
+      compat.dispose()
     end, debug.traceback)
     package.loaded["utils.ue_goto.provider"], package.loaded["utils.ue_goto.symbol"] = old_provider, old_symbol
-    package.loaded["ue"], location.populate_quickfix = old_ue, old_quickfix
+    package.loaded["ue"], results.open = old_ue, old_preview
+    vim.fn.delete(target)
     if not ok then error(err) end
   end)
 end)

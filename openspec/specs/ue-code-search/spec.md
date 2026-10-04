@@ -166,6 +166,18 @@ Project-scoped grep 缓存 SHALL 按 canonical project identity 分桶于 engine
 
 ## 选型与踩坑
 
+- **选型（2026-10-04）**：严格字面和全词命中以可证明的 UTF-8 byte span 驱动跳转/预览；
+  csearch 没有提供可证明正则 span 时诚实行定位，不把第 1 列包装成精确匹配。
+  后置 matcher 只筛候选，不重定位 provider 的位置。查询与目录/文件 mask、类型、模式分别保存。
+- **选型（2026-10-04）**：流式状态区分 waiting、empty、error、truncated、timeout 和 cancel；
+  退出不等于 stdout EOF，已解析输出排空后才交付终态；范围或总量未知时不显示完整性结论。
+  面板每次查询都要求索引，不能因打开后索引失效而自动切去 rg。
+- **选型（2026-10-04）**：文件 picker 使用独立的进程内有界目录清单，冷热采用同一范围/排除/
+  类型规则；完整成功扫描才缓存，取消/错误不发布。超缓存预算仍完整显示，显式刷新快照。
+  不借 GTAGS shader 清单冒充 C++ 文件，也不为文件列表改变 csearch/CDB 输入或触发重新索引。
+- **踩坑（2026-10-04）**：上游原生 grep provider 丢弃 stderr，finder 完成不足以证明是空结果。
+  保留其实际 argv 和 transform，复用本仓 reader 取得真实错误/EOF；不另造 shell 字符串解析。
+
 - **选型**：`<leader>/` 与显式 rg 入口（`<leader>sG`）严格分离——索引搜索
   承诺「亚秒 + 完整」，走 rg 会破坏承诺并制造「搜过却没搜到」的体验欺骗；
   `gd`/`gr` 内部的 rg fallback 是另一个调用点，不受本 spec 约束。

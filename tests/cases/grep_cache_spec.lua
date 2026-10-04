@@ -16,6 +16,17 @@ t.bootstrap()
 local ue = require("ue")
 local uv = vim.uv or vim.loop
 
+local function search_source()
+  local root = vim.fn.stdpath("config"):gsub("\\", "/")
+  local content = {}
+  for _, path in ipairs({ "/lua/ue.lua", "/lua/utils/search_picker.lua" }) do
+    local file = assert(io.open(root .. path, "rb"))
+    content[#content + 1] = file:read("*a")
+    file:close()
+  end
+  return table.concat(content, "\n")
+end
+
 -- ── 临时目录辅助 ─────────────────────────────────────────────────────────
 local function tmpdir()
   -- vim.fn.tempname() 给一个唯一路径；建目录用之。
@@ -99,12 +110,7 @@ t.describe("UE grep <leader>/ csearch-only（从不加 rg）", function()
   end)
 
   t.it("cached_grep 无索引时弹可见 ERROR 且不开 rg picker", function()
-    local root = vim.fn.stdpath("config"):gsub("\\", "/")
-    local path = root .. "/lua/ue.lua"
-    local f = io.open(path, "rb")
-    t.assert_true(f ~= nil, "应能读取 ue.lua")
-    local content = f and f:read("*a") or ""
-    if f then f:close() end
+    local content = search_source()
 
     -- 三处 rg 暗门必须已移除
     t.assert_false(content:find('source = "ue_grep_rg"', 1, true) ~= nil,
@@ -311,13 +317,10 @@ end)
 
 t.describe("UE grep 结果信息架构与预览定位", function()
   t.it("默认使用扁平 grep 行，文件分组只允许显式诊断开关启用", function()
-    local root = vim.fn.stdpath("config"):gsub("\\", "/")
-    local file = assert(io.open(root .. "/lua/ue.lua", "rb"))
-    local content = file:read("*a")
-    file:close()
+    local content = search_source()
 
     t.assert_contains(content, "local grouping_enabled = (vim.g.ue_grep_grouping_enabled == true)")
-    t.assert_contains(content, 'format = grouping_enabled and CORE_RT.grep_format_grouped or "file"')
+    t.assert_contains(content, 'format = grouping_enabled and owner.grep_format_grouped or ui.format')
     t.assert_contains(content, "matcher = grouping_enabled and { sort = false } or nil")
     t.assert_contains(content, "vim.g.ue_grep_grouping_enabled = not (vim.g.ue_grep_grouping_enabled == true)")
   end)
@@ -394,12 +397,7 @@ end)
 
 t.describe("UE grep 大小写模式", function()
   t.it("csearch 路径默认 ignore-case，Alt-C 才切 case-sensitive", function()
-    local root = vim.fn.stdpath("config"):gsub("\\", "/")
-    local path = root .. "/lua/ue.lua"
-    local f = io.open(path, "rb")
-    t.assert_true(f ~= nil, "应能读取 ue.lua")
-    local content = f and f:read("*a") or ""
-    if f then f:close() end
+    local content = search_source()
 
     -- csearch 路径的大小写接线（rg 路径已随 <leader>/ 去 rg 移除）
     t.assert_contains(content, "ignore_case = mode_ignore_case")
@@ -409,12 +407,7 @@ end)
 
 t.describe("UE grep csearch drain 队列", function()
   t.it("不用 #pending 统计有洞队列，避免尾部命中丢失", function()
-    local root = vim.fn.stdpath("config"):gsub("\\", "/")
-    local path = root .. "/lua/ue.lua"
-    local f = io.open(path, "rb")
-    t.assert_true(f ~= nil, "应能读取 ue.lua")
-    local content = f and f:read("*a") or ""
-    if f then f:close() end
+    local content = search_source()
 
     t.assert_contains(content, "local pending_len = 0")
     t.assert_contains(content, "local n = pending_len")

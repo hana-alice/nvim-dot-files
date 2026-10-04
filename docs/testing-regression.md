@@ -18,7 +18,12 @@ fail-closed 语义），禁止注入假可执行文件/假宿主让断言「碰�
 | 改动位置 | 最小必跑 filter |
 |---|---|
 | `lua/config/keymaps.lua` / 命令定义 | `keymaps` `commands` `review_editor` |
+| IDE 修改、文本恢复、会话与重启 | `ide_refactor` `ide_recovery` `ide_continuity` `ide_session` `commands` |
+| IDE 运行配置、Editor 测试与模块类生成 | `ide_workflow` `ide_run_profiles` `ide_ue_tools` `ide_hub` `platform` `commands` |
 | picker 交互 / sidebar / 插件工具链策略 | `review_editor` `smoke` |
+| 窗口关闭后的恢复 / 被动保存 quickfix | `ide_workspace` `task_registry` `keymaps` `commands` `android_ide` |
+| 搜索状态 / 路径坐标 / 完整搜索条件 / 独立文件清单 | `search_` `file_inventory` `grep_cache` `multi_instance_state` `ue_platform_boundary` |
+| 引用 / header / 显式 Peek / 按需关系树 | `ue_goto_reading` `ue_goto_relations` `ue_goto_behavior` `cpp_semantic_context` `cpp_semantic_client` `cpp_semantic_sidecar` `utils` |
 | Git 审阅路由 / Git 插件接线 / `lua/workarounds/codediff/**` | `git_review` `review_editor` `keymaps` `cheatsheet` `workarounds` `smoke` |
 | CI bootstrap / workflow / legacy smoke | `review_ci` + 全量 + legacy smoke |
 | `lua/utils/ue_watch.lua` / `dirty_save.lua` | `ue_watch_csearch` `multi_instance_state` `stability` |
@@ -31,7 +36,8 @@ fail-closed 语义），禁止注入假可执行文件/假宿主让断言「碰�
 | `lua/ue/cdb/**` | `ue_cdb` |
 | `lua/ue/dap/**` / `lua/utils/platform/**` | `dap` `platform` `dap_failure_layer` `ue_platform_boundary` |
 | `lua/ue/index/**` / `lua/ue/clangd_commands.lua` / controlled CDB generators | `index_generation` `index_subset_async` `cpp_semantic_index` `clangd_commands` `ue_api` `ue_platform_boundary` |
-| 二次批次 / RIFF 图 / 冻结输入验证与运行时保护 | `index_graph` `index_batch` `index_input_directory` `index_verified_batch` `index_inventory` `index_query_profile` `index_vfs_aliases` `index_generation` `cpp_semantic_client` `host_resource_discipline` |
+| 二次批次 / RIFF 图 / 冻结输入验证与运行时保护（含 `batch_runtime` / `batch_shard_seed`） | `index_batch_runtime` `index_graph` `index_batch` `index_input_directory` `index_verified_batch` `index_inventory` `index_query_profile` `index_vfs_aliases` `index_generation` `cpp_semantic_client` `host_resource_discipline` |
+| 离线有序二次候选 `tools/cdb_ordered_unity.py` | `index_ordered_unity` `structure` |
 | 离线 generated-only 二次候选 | `index_generated_super_unity` `structure` |
 | Shader donor 来源 / C++ 后台路由 | `ue_cdb` `ue_unity_origin` `index_unity_receipt` `index_shader_routing` `index_generation` |
 | 源码内容变化 / 相同 CDB 的后台刷新 | `index_source_refresh` `index_delivery` `ue_watch_csearch` `stability` |
@@ -40,6 +46,7 @@ fail-closed 语义），禁止注入假可执行文件/假宿主让断言「碰�
 | `lua/utils/code_search/**` / `lua/ue/csearch_build.lua` / `ue_paths.lua` | `csearch_build_guard` `ue_goto_behavior` `ue_paths` `utils` `ue_platform_boundary` |
 | `lua/config/options.lua` / `autocmds.lua` | `options` `autocmds` |
 | `lua/theme.lua` / `lua/highlights.lua` / `colors/**` | `theme` `smoke` |
+| `lua/utils/cheatsheet.lua` / `docs/ue_lazyvim_cheatsheet.md` | `cheatsheet` |
 | `lua/utils/stall_probe.lua` | `stall_probe` |
 | `lua/config/ui_responsiveness.lua` / `lua/ue/clangd_jobs.lua` / clangd `-j` / 主循环余量 | `ui_responsiveness` `core_health` `ue_api` `stability` |
 | `lua/utils/cpu_load.lua` / `lua/utils/host_admission.lua` / `lua/utils/clangd_resource_controller.lua` / `lua/ue/index/_admission.lua` / 宿主资源纪律 | `cpu_admission` `host_resource_discipline` `clangd_resource` `index_delivery` `ue_config` `stability` |

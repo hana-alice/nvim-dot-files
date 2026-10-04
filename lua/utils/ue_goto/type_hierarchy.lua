@@ -4,12 +4,15 @@ local M = {}
 local generation = 0
 local active_picker
 local prepare_method = "textDocument/prepareTypeHierarchy"
+local ownership = require("utils.ue_goto.reading_owner")
+local results = require("utils.ue_goto.reading_results")
 
 local function notify(message)
   vim.notify("类型层级：" .. message, vim.log.levels.WARN, { title = "UE C++" })
 end
 
 local function fresh(snapshot, require_focus)
+  if snapshot.reading_owner and not ownership.current(snapshot.reading_owner, true) then return false end
   if snapshot.generation ~= generation
     or not vim.api.nvim_win_is_valid(snapshot.win)
     or not vim.api.nvim_buf_is_valid(snapshot.buf)
@@ -44,6 +47,7 @@ function M.items(items, encoding)
         pos = { range.start.line + 1, range.start.character },
         loc = { uri = item.uri, range = vim.deepcopy(range), encoding = encoding },
         hierarchy_item = item,
+        target_guard = results.items({ { uri = item.uri, range = range, _position_encoding = encoding } })[1],
       }
     end
   end
@@ -56,15 +60,16 @@ local function pick(snapshot, title, rows, choose)
     notify("Snacks picker 不可用")
     return
   end
-  active_picker = Snacks.picker.pick({
+  local accepted = false
+  active_picker = ownership.present(snapshot.reading_owner, function() return Snacks.picker.pick({
     title = title,
     items = rows,
     format = rows[1].file and "file" or "text",
     preview = rows[1].file and "file" or "none",
     -- Root/client selection must request its hierarchy, never jump to it.
     win = choose and {
-      input = { keys = { ["<C-s>"] = false, ["<C-v>"] = false, ["<C-t>"] = false } },
-      list = { keys = { ["<C-s>"] = false, ["<C-v>"] = false, ["<C-t>"] = false } },
+      input = { keys = { ["<C-s>"] = false, ["<C-t>"] = false } },
+      list = { keys = { ["<C-s>"] = false, ["<C-t>"] = false } },
     } or nil,
     confirm = function(picker, row)
       local focused = vim.api.nvim_get_current_win() == snapshot.win
@@ -74,30 +79,46 @@ local function pick(snapshot, title, rows, choose)
         return
       end
       if choose then
-        picker:close()
-        vim.schedule(function()
+        accepted = true
+        ownership.confirm_picker(snapshot.reading_owner, picker, function()
           if fresh(snapshot, true) then choose(row) end
         end)
       else
-        Snacks.picker.actions.jump(picker, row, {})
+        local function jump()
+          if not fresh(snapshot, false) or not ownership.focused(snapshot.reading_owner) then return end
+          if row.target_guard and not results.target_current(row.target_guard) then notify("目标已改变，请重新查询"); return end
+          accepted = true
+          ownership.confirm_picker(snapshot.reading_owner, picker, function()
+            if not fresh(snapshot, true) or (row.target_guard and not results.target_current(row.target_guard)) then return end
+            picker.opts.jump = vim.tbl_extend("force", picker.opts.jump or {}, { close = false, reuse_win = false })
+            snapshot.reading_owner.handoff = true
+            pcall(Snacks.picker.actions.jump, picker, row, {})
+            snapshot.reading_owner.handoff = false
+            if ownership.active() == snapshot.reading_owner then ownership.cancel() end
+          end)
+        end
+        if vim.fn.mode():sub(1, 1) == "i" then vim.cmd.stopinsert(); vim.schedule(jump) else jump() end
       end
     end,
-  })
+    on_close = function(picker)
+      if not accepted then ownership.picker_closed(snapshot.reading_owner, picker) end
+    end,
+  }) end)
 end
 
 local function request(snapshot, method, params, done)
   if not fresh(snapshot, true) then return end
-  local ok, accepted = pcall(snapshot.client.request, snapshot.client, method, params, function(err, result)
-    vim.schedule(function()
+  local sent
+  sent = ownership.request(snapshot.reading_owner, snapshot.client, method, params, function(err, result)
+      if sent == false then return end
       if not fresh(snapshot, true) then return end
       if err then
         notify("请求失败（" .. tostring(err.message or err.code or err) .. "）")
         return
       end
       done(result)
-    end)
-  end, snapshot.buf)
-  if not ok or not accepted then notify("无法发送 " .. method .. " 请求") end
+  end)
+  if sent == false and fresh(snapshot, true) then notify("无法发送 " .. method .. " 请求") end
 end
 
 local function prepare(snapshot, kind)
@@ -133,6 +154,7 @@ function M.open(kind)
     return false
   end
   generation = generation + 1
+  require("utils.ue_goto.reading").cancel()
   if active_picker and not active_picker.closed then active_picker:close() end
   active_picker = nil
   local win = vim.api.nvim_get_current_win()
@@ -153,6 +175,7 @@ function M.open(kind)
     buf = buf,
     tick = vim.api.nvim_buf_get_changedtick(buf),
     cursor = vim.api.nvim_win_get_cursor(win),
+    reading_owner = ownership.begin(),
   }
   if #clients == 1 then
     snapshot.client = clients[1]

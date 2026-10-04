@@ -15,6 +15,8 @@
 -- use only (no timers). Bounded by MAX_ENTRIES.
 
 local M = {}
+local store = require("utils.search_history_store")
+local recipes = require("utils.search_recipe")
 
 local MAX_ENTRIES = 300
 
@@ -94,47 +96,62 @@ end
 function M.format_entry(entry, now)
   local meta = entry.count and entry.count > 0
     and ("%3s ×%d"):format(M.age(entry.last, now), entry.count) or "  older"
-  return ("%-8s %s"):format(meta, entry.query)
+  local intent = entry.unavailable and (" [unavailable: " .. entry.unavailable .. "]")
+    or entry.recipe and (" [" .. recipes.describe(entry.recipe) .. "]")
+    or " [legacy: query only; modes unknown]"
+  return ("%-8s %s%s"):format(meta, entry.query, intent)
 end
 
 -- ── storage ────────────────────────────────────────────────────────────────
 
-local function project_key()
-  local ok, ue = pcall(require, "ue")
-  local ctx
-  if ok and type(ue.resolve_context) == "function" then
-    local ok_ctx, resolved = pcall(ue.resolve_context)
-    if ok_ctx then ctx = resolved end
-  end
-  local root = ctx and (ctx.project_root or ctx.engine_root) or vim.uv.cwd() or ""
-  return vim.fn.sha256(vim.fs.normalize(root)):sub(1, 16)
-end
-
-local function store_path(key)
-  return vim.fs.joinpath(vim.fn.stdpath("state"), "ue_search_history", (key or project_key()) .. ".json")
-end
-
 function M.load(key)
-  local ok, lines = pcall(vim.fn.readfile, store_path(key))
-  if not ok then return {} end
-  local ok_json, data = pcall(vim.json.decode, table.concat(lines, "\n"))
-  return ok_json and type(data) == "table" and data or {}
-end
-
-local function save(entries, key)
-  local path = store_path(key)
-  vim.fn.mkdir(vim.fs.dirname(path), "p")
-  local temp = path .. ".tmp." .. vim.fn.getpid()
-  if pcall(vim.fn.writefile, { vim.json.encode(entries) }, temp) then
-    if not vim.uv.fs_rename(temp, path) then pcall(os.remove, temp) end
-  end
+  return store.load(key)
 end
 
 --- Record that a query produced a result the user opened.
 function M.record(query, kind, key)
-  local entries = M.record_into(M.load(key), query, kind or "grep", os.time())
-  save(entries, key)
-  return entries
+  query = trim(query)
+  if query == "" then return M.load(key) end
+  return store.record({ query = query, kind = kind or "grep", count = 1, last = os.time() }, key)
+end
+
+function M.record_recipe_into(entries, recipe, now)
+  local validated, err = recipes.validate(recipe)
+  if not validated then return nil, err end
+  return store.merge(entries, { query = validated.query, kind = validated.source, recipe = validated, count = 1, last = now or os.time() })
+end
+
+function M.record_recipe(recipe)
+  local validated, err = recipes.validate(recipe)
+  if not validated then return nil, err end
+  return store.record({ query = validated.query, kind = validated.source, recipe = validated, count = 1, last = os.time() })
+end
+
+function M.resume_search()
+  local resume = require("snacks.picker.resume")
+  local sources = { "ue_grep_csearch", "grep", "ue_grep_rg" }
+  local has_state = false
+  for _, source in ipairs(sources) do if resume.state[source] then has_state = true; break end end
+  if not has_state then return vim.notify("No search to resume in this session", vim.log.levels.INFO) end
+  return resume.resume({ include = sources })
+end
+
+function M.rerun(entry)
+  if entry.unavailable then return vim.notify(entry.unavailable, vim.log.levels.WARN) end
+  if entry.recipe then
+    local result, err = recipes.run(entry.recipe)
+    if not result and err then vim.notify(err, vim.log.levels.WARN) end
+    return result
+  end
+  -- Legacy data cannot claim to restore modes it never recorded. Keep it
+  -- reachable as an explicitly described query-only search.
+  return vim.ui.select({ "Search query with indexed literal defaults", "Cancel" }, {
+    prompt = "Legacy history stores only the query; source and modes are unknown",
+  }, function(choice)
+    if choice == "Search query with indexed literal defaults" then
+      require("ue").cached_grep({ search = entry.query, title = "Legacy query (default modes)" })
+    end
+  end)
 end
 
 -- ── pickers ────────────────────────────────────────────────────────────────
@@ -163,24 +180,29 @@ end
 
 --- Searches that led somewhere, newest first; then older cleaned history.
 --- opts.legacy: string[] (newest first) from the picker's own history;
---- opts.rerun(query, kind): run the search again.
+--- opts.rerun_entry(entry): optional complete-entry handler.
 function M.searches(opts)
   opts = opts or {}
-  local items = M.merge(M.load(), opts.legacy or {})
+  local used, load_err = M.load()
+  if load_err then return vim.notify(load_err, vim.log.levels.WARN) end
+  local items = M.merge(used, opts.legacy or {})
   if #items == 0 then
     return vim.notify("No search history yet for this project", vim.log.levels.INFO)
   end
   local now = os.time()
   pick("Search history — this project", items, function(entry) return M.format_entry(entry, now) end,
-    function(entry) if opts.rerun then opts.rerun(entry.query, entry.kind) end end)
+    function(entry)
+      if opts.rerun_entry then opts.rerun_entry(entry)
+      elseif opts.rerun and not entry.recipe then opts.rerun(entry.query, entry.kind, entry)
+      else M.rerun(entry) end
+    end)
 end
 
 --- Every "what did I do before" surface behind one key.
 M.surfaces = {
   { label = "Searches that found something (this project)", key = "<leader>sH", run = function() vim.cmd("UESearchHistory") end },
   { label = "Resume last search with its results", key = "<leader>s/", run = function()
-      local picker = require("snacks").picker
-      if not pcall(picker.resume, "ue_grep_csearch") then pcall(picker.resume, "ue_grep_rg") end
+      return M.resume_search()
     end },
   { label = "Resume last picker of any kind", key = "<leader>sR", run = function() require("snacks").picker.resume() end },
   { label = "Recent files", key = "<leader>fr", run = function() require("snacks").picker.recent() end },

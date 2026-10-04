@@ -79,19 +79,18 @@ function M.install(deps)
   local compat = {}
   local provider = require("utils.ue_goto.provider")
   local symbol_mod = require("utils.ue_goto.symbol")
-  local location_mod = location
   local ui = require("utils.ue_goto.ui")
   local cache = require("utils.ue_goto.cache")
   local csearch_fb = require("utils.ue_goto.csearch_fallback")
   local dtrace, jump_to_location, format_jump_msg = deps.dtrace, deps.jump_to_location, deps.format_jump_msg
   local LSP_PROGRESS_NOTICE_MS, OVERALL_TIMEOUT_MS, CSEARCH_TIMEOUT_MS = 600, 30000, 4000
   local request_token = 0
-  local generation = 0
   function compat.request_token() return request_token end
   function compat.dispose()
     request_token = request_token + 1
-    generation = generation + 1
     if compat._active_notice then pcall(compat._active_notice.clear); compat._active_notice = nil end
+    local reading = package.loaded["utils.ue_goto.reading"]
+    if reading then reading.cancel() end
   end
   function compat.definition(sym, receiver, bufnr, ref_file, ref_line, ext)
     local at_def, def_kind, def_name = symbol_mod.is_at_definition_at_cursor()
@@ -273,37 +272,7 @@ function M.install(deps)
     end)
   end
   function compat.references()
-    local request_generation = generation
-    local sym = symbol_mod.current_symbol()
-    if not sym then
-      vim.notify("No symbol under cursor", vim.log.levels.WARN)
-      return
-    end
-
-    local function gtags_fallback()
-      if request_generation ~= generation then return end
-      local ok, ue = pcall(require, "ue")
-      if ok and ue.gtags_references_async then
-        ue.gtags_references_async(sym, function(jumped)
-          if request_generation ~= generation then return end
-          if not jumped then
-            vim.notify("No references (LSP/GTAGS)", vim.log.levels.INFO)
-          end
-        end)
-        return
-      end
-      vim.notify("No references (LSP/GTAGS)", vim.log.levels.INFO)
-    end
-
-    local bufnr = vim.api.nvim_get_current_buf()
-    provider.async_lsp_request(bufnr, "textDocument/references", function(locations)
-      if request_generation ~= generation then return end
-      if locations and #locations > 0
-        and location_mod.populate_quickfix("LSP references: " .. sym, locations) then
-        return
-      end
-      gtags_fallback()
-    end)
+    return require("utils.ue_goto.reading").references()
   end
   return compat
 end

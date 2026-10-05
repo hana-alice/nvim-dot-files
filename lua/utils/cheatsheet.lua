@@ -114,6 +114,8 @@ local tabs = {
           { "0 / ^ / $",   "Line start / first char / end" },
           { "gg / G",      "File start / end" },
           { "42G",         "Go to line 42" },
+          { "<leader>fl",  "Go to line[:UTF-8 byte column] in current document" },
+          { "<leader>fy / fA / fY", "Copy relative-to-window-cwd / absolute path / file location" },
           { "%",           "Matching bracket" },
           { "f{c} / t{c}", "Find / till char forward" },
           { "F{c} / T{c}", "Find / till char backward" },

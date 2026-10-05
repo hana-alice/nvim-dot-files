@@ -1019,6 +1019,15 @@
 
 ### 文件操作与大纲
 
+- **当前文档位置输入须完成模式交接再关闭**：表达式回车可读取同包按键里的旧文字；
+  立即 stopinsert/关闭可使来源退列，通用输入后端的 parent 回拉还会覆盖关闭回调的新窗口选择。
+  该能力复用 Snacks.win，使用非表达式确认、普通模式后关闭与来源复验，不做全局恢复守卫。
+  → `lua/utils/document_location.lua`；`tests/cases/ide_document_location_ui_spec.lua`。
+- **路径复制须保护命名寄存器；验收剪贴板 provider 必须先于首次使用配置**：
+  unnamed alias 可指向用户命名寄存器，直接写 alias 会改写原文本；使用原生 yank 槽并明确指向。
+  Neovim 可缓存 clipboard provider，启动后才替换验收 fixture 不能证明隔离；必须在启动前设置。
+  → `lua/utils/document_location.lua`；`tests/cases/ide_document_location_spec.lua`、`ide_document_location_ui_spec.lua`。
+
 - **Snacks 关闭确认与卸载回调会继续处理新编辑**：放弃仅授权原版本；确认和窗口交接后复验，
   原生卸载阶段新增文本须保留为可检查的缓冲区。→ `lua/workarounds/snacks/safe_buffer_delete.lua`。
 - **Snacks 文件树改名/删除会强制卸载文本，普通 rename 可覆盖目标**：保护脏文件及已加载子文件，

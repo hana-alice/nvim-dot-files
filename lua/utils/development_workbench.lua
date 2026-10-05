@@ -112,6 +112,45 @@ function M.model(opts)
     add("  活动流程（r 更新）: " .. clean(active.status) .. " · " .. clean(active.stage))
   end
   add("")
+  add("调查现场（文件位置、搜索条件与下一步）")
+  local contexts = require("utils.work_context")
+  local context_state = contexts.status(target)
+  if context_state.state == "unloaded" then
+    add("  尚未读取保存的调查；点继续查看")
+  elseif context_state.state == "loading" then
+    add("  正在读取本工程调查")
+  elseif context_state.state == "error" then
+    add("  读取失败: " .. clean(context_state.error))
+  elseif context_state.state == "cached" then
+    add("  已缓存本次调查；完整列表按继续查看")
+  elseif context_state.count ~= nil then
+    add("  已读取调查: " .. tostring(context_state.count))
+  end
+  local investigation = contexts.active(target)
+  if investigation then
+    add("  当前调查: " .. clean(investigation.name))
+    add("  下一步: " .. clean(investigation.note ~= "" and investigation.note or "未填写"))
+    add("  > 查看调查文件、条件与原结果", function(win)
+      return contexts.details(investigation, { source_win = win })
+    end, { kind = "work_context_details", context_id = investigation.id })
+  else
+    add("  尚未选择具名调查")
+  end
+  add("  > 保存当前调查", function(win)
+    if not editing(win) then
+      return nil, "编辑窗口已关闭。"
+    end
+    contexts.prompt_save({ source_win = win })
+    return true
+  end, { kind = "work_context_save" })
+  add("  > 继续已保存调查", function(win)
+    if not editing(win) then
+      return nil, "编辑窗口已关闭。"
+    end
+    contexts.open({ source_win = win })
+    return true
+  end, { kind = "work_context_resume" })
+  add("")
   add("本工程构建记录（按发起时间）")
   local runs = require("utils.verification_runs")
   local records = target.project_root and runs.list({ project_root = target.project_root }) or {}
@@ -290,6 +329,7 @@ function M.open(opts)
 end
 
 function M.setup()
+  require("utils.work_context").setup()
   vim.api.nvim_create_user_command("UEWorkbench", function()
     M.open()
   end, { desc = "Current target, next actions, build evidence and tasks" })

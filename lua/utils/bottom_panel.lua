@@ -10,6 +10,7 @@ local labels = {
   tasks = "后台任务",
   debug = "调试",
   task = "任务详情",
+  context = "调查现场",
 }
 local empty = {
   build = "尚无构建输出；先运行构建。",
@@ -318,6 +319,7 @@ function M.show(kind, buf, opts)
   if kind == "task" then
     names[#names + 1] = "[任务详情]"
   end
+  if kind == "context" then names[#names + 1] = "[调查现场]" end
   vim.wo[win].statusline = " " .. table.concat(names, " | ")
   -- Restore only on an explicit panel switch, never via BufEnter guards.
   local view = s.views[target]

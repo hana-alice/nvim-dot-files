@@ -37,7 +37,9 @@ end
 t.describe("development workbench product continuity", function()
   t.it("current target and next actions share one read-only view without starting checks or jobs", function()
     local project = target("Readonly")
-    local original_target, original_system, original_jobstart = H.target, vim.system, vim.fn.jobstart
+    local store = require("utils.work_context_store")
+    local original_target, original_system, original_jobstart, original_load =
+      H.target, vim.system, vim.fn.jobstart, store.load
     local source_win, source_buf = api.nvim_get_current_win(), api.nvim_get_current_buf()
     local buf = api.nvim_create_buf(true, false)
     api.nvim_win_set_buf(source_win, buf)
@@ -53,6 +55,9 @@ t.describe("development workbench product continuity", function()
     end
     vim.fn.jobstart = function()
       error("workbench started a job")
+    end
+    store.load = function()
+      error("opening the workbench read the investigation collection")
     end
     local owned_win
     local ok, err = pcall(function()
@@ -73,6 +78,8 @@ t.describe("development workbench product continuity", function()
         "刷新索引",
         "查看未保存文件",
         "找回窗口",
+        "保存当前调查",
+        "继续已保存调查",
       }) do
         t.assert_contains(text, label)
       end
@@ -89,6 +96,7 @@ t.describe("development workbench product continuity", function()
       t.assert_true(W.close(win))
     end)
     H.target, vim.system, vim.fn.jobstart = original_target, original_system, original_jobstart
+    store.load = original_load
     if owned_win and api.nvim_win_is_valid(owned_win) then
       W.close(owned_win)
     end

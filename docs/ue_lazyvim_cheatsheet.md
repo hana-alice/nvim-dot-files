@@ -913,6 +913,8 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `<leader>uJ`              | `:UEPanelNext`: cycle build / quickfix / logcat / tasks in one bottom window (normal/terminal) |
 | `:UEPanel build` / `quickfix` / `logcat` / `tasks` | Select a bottom panel; tasks: Enter inspects, `dd` / Ctrl-X stops, `r` refreshes |
 | `<leader>uH` / `:UEWorkbench` | Current target, next actions, run-owned errors/output and task inspection; `r` refresh, `q` close view |
+| `:UEWorkContext` / `save` | Continue or save a named investigation: file locations, original search intent and next step; metadata survives restart |
+| `:UEWorkContext add` / `note` / `search` | Explicitly associate the current file, edit next-step text or choose a complete search recipe; no automatic replay |
 | `:UEPanel history` / build `gH` | Select retained recent stage output (up to 16); background completion keeps source focus |
 | `:UERunProfileSave [name]` / `:UERunProfile [name]` / `:UERunProfileDelete [name]` | Save, preview/apply, delete named target/config/package/mode; device serial stays process-local |
 | `:UEAndroidIterateStop` | Cancel the active loop; late callbacks cannot start another stage |

@@ -18,6 +18,7 @@
 | UE 引擎中枢 | `lua/ue.lua` + `lua/ue/` | 索引 / CDB / DAP / 命令注册总入口 | 公共 API 挂 `M.*`；命令在 `ue.setup()` 注册 |
 | 底部面板 | `lua/utils/bottom_panel.lua` | 构建输出 / 原生 quickfix / logcat / 后台任务共用每 tab 的窗口 | 只换 buffer；隐藏不取消进程，任务状态仍由 registry 派生；DAP 借用 host 后只收自己的可见内容 |
 | 当前开发工作台 | `lua/utils/development_workbench.lua` + `verification_runs.lua` + `task_inspector.lua` | 目标/下一步、按运行归属的错误与日志、任务检查 | 每 tab 右分屏；业务凭据有界且不写进程状态；查看不启动探测；Enter 检查与停止分开 |
+| 具名调查 | `lua/utils/work_context.lua` + `work_context_ui.lua` + `work_context_store.lua` + `work_context_restore.lua` | 文件位置、完整搜索意图与下一步；本实例原结果另行关联 | 协调器保留工程/卡片/cache，restore 只负责本次原生文件视图；持久元数据按工程 CAS/merge/原子回读，不存文本/原生句柄，不执行 sessionload 或自动重放 |
 | 窗口与任务找回 | `lua/utils/workspace.lua` | 搜索实际窗口、隐藏 buffer、结果历史和保留日志 | 原生句柄为权威；确认前查身份；保存不打开面板，保护当前 qf ID/view，结果仍为原生有界历史 |
 | 日常编辑 | `lua/utils/cpp_format.lua` + `unsaved.lua` | 工程风格发现、显式 UE 模板、未保存列表与退出选择 | Conform 异步格式化且不回落默认风格；缓冲区事件维护计数，状态栏只读缓存；原生退出保留 |
 | 重构批次 | `lua/utils/refactor.lua` + `workspace_edit.lua` + `rename_preview.lua` | LSP 修改预览、受保护应用、恢复证据及整批撤销 | 编译器是修改来源；请求/预览/确认都核验 owner；取消的 applyTweak 保留拒绝守卫直到迟到请求排空，不覆盖后续输入 |

@@ -17,10 +17,26 @@ local function read_owner(path)
       if entry:match("^owner%..+%.json$") then name = entry; break end
     end
   end
-  local file = io.open(fs.join(path, name), "rb")
-  if not file then return nil, name, "unreadable owner record" end
-  local raw = file:read("*a")
-  file:close()
+  -- Libuv readers allow deletion on Windows while stdio readers can block release.
+  local fd = vim.uv.fs_open(fs.join(path, name), "r", 438)
+  if not fd then
+    return nil, name, "unreadable owner record"
+  end
+  local read_ok, raw = pcall(function()
+    local stat = vim.uv.fs_fstat(fd)
+    if not stat then
+      return nil
+    end
+    local bytes = vim.uv.fs_read(fd, stat.size, 0)
+    if not bytes or #bytes ~= stat.size then
+      return nil
+    end
+    return bytes
+  end)
+  local closed = vim.uv.fs_close(fd)
+  if not read_ok or not raw or not closed then
+    return nil, name, "unreadable owner record"
+  end
   local ok, value = pcall(vim.json.decode, raw or "")
   if not ok then return nil, name, "corrupt owner record" end
   if type(value) ~= "table" or not tonumber(value.pid) or tonumber(value.pid) <= 0

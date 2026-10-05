@@ -48,6 +48,8 @@ end
 M.actions = {
   { group = "Run",    label = "Run / debug current target (F5 when idle)", key = "<F5>", target_fields = true, run = function() M.run_or_debug() end },
   { group = "Work", label = "Development workbench / 当前开发工作台", key = "<leader>uH", always = true, run = cmd("UEWorkbench") },
+  { group = "Work", label = "Save investigation / 保存具名调查", always = true, run = cmd("UEWorkContext save") },
+  { group = "Work", label = "Resume investigation / 继续已保存调查", always = true, run = cmd("UEWorkContext") },
   { group = "Run",    label = "Launch app (no debugger)", key = "<leader>ul", target_fields = true, run = cmd("UELaunch") },
   { group = "Code", label = "Go to definition / 跳到定义", key = "gd", run = mapped_key("gd") },
   { group = "Code", label = "References / 查看引用", key = "gr", run = mapped_key("gr") },
@@ -283,7 +285,9 @@ end
 
 local pending_action
 local intent_epoch = 0
+local selection_epoch = 0
 function M.pending_action() return pending_action end
+function M.selection_generation() return selection_epoch end
 
 local function runtime_identity(target)
   local fields = {}
@@ -306,6 +310,7 @@ end
 -- Called after an explicit, successful selection. The user confirms continuing
 -- the retained intent; cancelling a picker can never start a delayed build.
 function M.selection_changed()
+  selection_epoch = selection_epoch + 1
   local pending = pending_action
   if not pending or pending.checking then return end
   pending.checking = true

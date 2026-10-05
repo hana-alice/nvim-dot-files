@@ -643,6 +643,7 @@ local tabs = {
           { "<leader>uE",    "Jump to first build error (:UEBuildFirstError)" },
           { "<leader>uJ",    "Cycle bottom: build / problems / logcat / tasks" },
           { "<leader>uH",    "Development workbench: target, next action, own errors/logs" },
+          { ":UEWorkContext [save]", "Resume/save named investigation: files, query, next step" },
           { ":UEPanel history / gH", "Retained recent stage logs" },
           { ":UETests", "Discover/run Editor tests; results / rerun" },
           { ":UENewClass", "Preview header/source in an existing UE module" },

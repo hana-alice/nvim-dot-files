@@ -86,6 +86,8 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v2.6.0` → [docs/release_2.6.0.md](release_2.6.0.md) (development workbench and run-owned evidence; tag pending)
 
+- `v2.7.0` → [docs/release_2.7.0.md](release_2.7.0.md) (named investigations and interruption continuity; tag pending)
+
 ## Unreleased
 
-本轮已归档到 [2.6.0](release_2.6.0.md)。
+已将具名调查切片归档至 [2.7.0](release_2.7.0.md)。

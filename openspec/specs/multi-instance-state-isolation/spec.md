@@ -120,6 +120,13 @@ selection 变更 MUST NOT 改投、重绑或重新解释已经开始的 workflow
 
 ## 选型与踩坑
 
+- **踩坑（2026-10-05 原生双实例实测）**：Windows 上持有 stdio owner 读取句柄会阻止
+  删除该文件，原生 UV 读取句柄允许删除。搜索历史实测出现 owner 删除 `EBUSY`、
+  release 失败被忽略、随后自身活 PID 的 lease 阻塞，最终 52 个待写项被清空。
+  owner 读取采用原生 UV，并以真实双进程保持读取句柄的释放回归覆盖；不改变 PID/token
+  判定、发布、权限不足保护或过期回收规则。该失败瞬间是否正由对端句柄占用，原记录
+  无法严格证明；锁释放失败到丢记录的链条已由实际调用及 stderr 确认。
+
 - **选型（2026-10-04）**：搜索历史保存版本化、有界、source/scope/mode allowlist 的完整条件，
   bucket 和执行比较采用 host driver 的 canonical path identity；旧 query-only 记录保留并说明缺项。
   多写者在 lease 内重读、合并、原子发布，不用最后写入覆盖另一个进程的使用计数。

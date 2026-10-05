@@ -81,6 +81,10 @@ M.actions = {
     if type(mapping.callback) == "function" then mapping.callback() end
   end },
   { group = "Files", label = "Unsaved files / 未保存文件", run = cmd("UEUnsaved") },
+  { group = "Files", label = "Go to line / column / 当前文档跳到行列", key = "<leader>fl", run = mapped_key("<leader>fl") },
+  { group = "Files", label = "Copy relative path / 复制相对窗口工作目录的路径", key = "<leader>fy", run = mapped_key("<leader>fy") },
+  { group = "Files", label = "Copy absolute path / 复制绝对路径", key = "<leader>fA", run = mapped_key("<leader>fA") },
+  { group = "Files", label = "Copy file location / 复制文件路径和行列位置", key = "<leader>fY", run = mapped_key("<leader>fY") },
   { group = "Files", label = "Restore project session / 按需恢复会话", run = cmd("UESessionRestore") },
   { group = "Files", label = "Recover unsaved text / 恢复异常退出的未保存文本", run = cmd("UERecovery") },
   { group = "Files", label = "Quit with unsaved list / 退出前查看未保存文件", key = "<leader>qq", run = cmd("UEQuit") },

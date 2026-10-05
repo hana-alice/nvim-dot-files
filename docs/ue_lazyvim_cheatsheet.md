@@ -396,6 +396,9 @@ Source: `lua/plugins/snacks.lua` (`<leader>;` / `fe` / `e` / `/` /
 | `<leader>sg`     | Grep workspace code (C++/shader)        |
 | `<leader>sG`     | Grep workspace text (explicit rg)       |
 | `<leader>sf/sF`  | Find current document occurrences / prefill word or single-line selection; includes unsaved text |
+| `<leader>fl`     | Go to line or line:UTF-8-byte-column in the current in-memory document |
+| `<leader>fy`     | Copy file path relative to the current window cwd (absolute when outside it) |
+| `<leader>fA/fY`  | Copy absolute file path / quoted path:line:UTF-8-byte-column |
 | `<leader>sw/sW`  | Search current word/selection (LazyVim) |
 | `<leader>sy/sY`  | Live grep with current word prefilled   |
 | `<leader>sx`     | Grep whole word match                   |

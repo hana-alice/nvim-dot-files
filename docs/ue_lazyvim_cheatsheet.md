@@ -911,7 +911,8 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `<leader>u?`              | `:UEGuide`: open the user guide (daily workflow, keys, troubleshooting) read-only |
 | `<leader>uE`              | `:UEBuildFirstError`: jump directly to the first source error of the latest build |
 | `<leader>uJ`              | `:UEPanelNext`: cycle build / quickfix / logcat / tasks in one bottom window (normal/terminal) |
-| `:UEPanel build` / `quickfix` / `logcat` / `tasks` | Select a bottom panel directly; tasks: `<CR>` / `dd` stop, `r` refresh |
+| `:UEPanel build` / `quickfix` / `logcat` / `tasks` | Select a bottom panel; tasks: Enter inspects, `dd` / Ctrl-X stops, `r` refreshes |
+| `<leader>uH` / `:UEWorkbench` | Current target, next actions, run-owned errors/output and task inspection; `r` refresh, `q` close view |
 | `:UEPanel history` / build `gH` | Select retained recent stage output (up to 16); background completion keeps source focus |
 | `:UERunProfileSave [name]` / `:UERunProfile [name]` / `:UERunProfileDelete [name]` | Save, preview/apply, delete named target/config/package/mode; device serial stays process-local |
 | `:UEAndroidIterateStop` | Cancel the active loop; late callbacks cannot start another stage |
@@ -1069,7 +1070,7 @@ race). Source: `lua/config/keymaps.lua` (`<leader>X*` block), commands in `lua/u
 
 | Key / Command     | Action                                            |
 |-------------------|---------------------------------------------------|
-| `<leader>X`       | `:Tasks` — list tasks; select one to stop         |
+| `<leader>X`       | `:Tasks` — Enter inspects output/details; `dd` / Ctrl-X explicitly stops |
 | `<leader>Xs`      | `:TaskStop` — stop one (auto if single, else pick) |
 | `<leader>XA`      | `:TaskStopAll` — stop all (confirms first)         |
 | `:TaskStop <id>`  | Stop a specific task by id                         |

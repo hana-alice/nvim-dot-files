@@ -29,19 +29,20 @@ end
 function M.clear() first_error = nil end
 
 ---Called only by a completed build; no timers or polling.
-function M.publish(title, entries)
+function M.publish(title, entries, opts)
   M.clear()
   local items = M.ordered(entries)
   if #items == 0 then return false end
-  vim.fn.setqflist({}, " ", { title = title, items = items })
-  for index, item in ipairs(vim.fn.getqflist()) do
+  vim.fn.setqflist({}, " ", { title = title, items = items, context = opts and opts.context })
+  local receipt = vim.fn.getqflist({ id = 0, items = 0, changedtick = 0 })
+  for index, item in ipairs(receipt.items) do
     if items[index]._source_location ~= false and item.type == "E" and item.valid == 1 and item.lnum > 0 then
       first_error = vim.deepcopy(item)
       break
     end
   end
   require("utils.bottom_panel").show("quickfix", nil, { focus = false })
-  return true
+  return true, { qf_id = receipt.id, qf_tick = receipt.changedtick, items = items }
 end
 
 function M.summary()

@@ -343,7 +343,7 @@ local function reopen(row, opts)
       return win
     end
   end
-  if row.panel == "build" or row.panel == "logcat" or row.panel == "debug" then
+  if row.panel == "build" or row.panel == "logcat" or row.panel == "debug" or row.panel == "task" then
     return require("utils.bottom_panel").show(row.panel, row.buf)
   end
   local source = opts.source_win
@@ -494,10 +494,9 @@ function M.activate(row, opts)
     if not task_record(row) then
       return nil, "任务已被淘汰；按 Ctrl-R 刷新列表。"
     end
-    if row.buf then
-      return reopen(row, opts)
-    end
-    return require("utils.bottom_panel").show("tasks")
+    return require("utils.task_inspector").open(row.id, vim.tbl_extend("force", opts, {
+      expected = { kind = row.task_kind, handle = row.handle },
+    }))
   elseif row.kind == "buffer" or row.kind == "log" then
     return reopen(row, opts)
   end

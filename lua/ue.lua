@@ -208,7 +208,7 @@ end
 
 local function strip_ansi(line)
   line = tostring(line or "")
-  line = line:gsub("\27%[[0-9;?]*[%a]", "")
+  line = line:gsub("\27%][^\7\27]*\7", ""):gsub("\27%][^\7\27]*\27\\", ""):gsub("\27%[[0-9;?]*[%a]", "")
   return line:gsub("\r", "")
 end
 
@@ -4564,7 +4564,7 @@ local function open_terminal_command(cmd, opts)
 
   local build_monitor
   local active_jobid
-  local foreground_token
+  local foreground_token, verification_id
   active_jobid = vim.api.nvim_win_call(win, function()
     return vim.fn.termopen(cmd, {
       cwd = opts.cwd,
@@ -4595,15 +4595,12 @@ local function open_terminal_command(cmd, opts)
             foreground_token = nil
           end
           local current = owns_terminal and (not opts.is_current or opts.is_current())
-          if current and code ~= 0 and opts.quickfix_title then
-            require("ue.build_diagnostics").publish(
-              opts.quickfix_title,
-              diagnostic_entries_from_output(output_lines, {
-                root = opts.quickfix_root,
-                tail_limit = opts.tail_limit,
-              })
-            )
-          end
+          require("utils.build_verification").finish(verification_id, {
+            current = current, code = code, title = opts.quickfix_title,
+            entries = code ~= 0 and opts.quickfix_title and (current or verification_id) and diagnostic_entries_from_output(output_lines, {
+              root = opts.quickfix_root, tail_limit = opts.tail_limit,
+            }) or {},
+          })
           if current and opts.quickfix_title then
             set_build_status(code == 0 and "BOK" or ("B" .. tostring(code)))
           end
@@ -4635,6 +4632,7 @@ local function open_terminal_command(cmd, opts)
   end
 
   CORE_RT.build_term_jobid = active_jobid
+  verification_id = require("utils.build_verification").begin(opts.verification_context, buf, active_jobid, opts.quickfix_title)
   foreground_token =
     require("utils.host_admission").foreground_begin(opts.quickfix_title or opts.finish_label or "terminal task")
   -- Register after job creation; status remains derived from the channel.
@@ -6484,6 +6482,7 @@ local function build_target(opts)
       tail_limit = 16,
       on_exit = on_exit,
       is_current = opts.is_current,
+      verification_context = require("utils.build_verification").context(ctx, target_ctx, operation),
     })
     if not job then abort() end
     return job
@@ -8893,6 +8892,7 @@ fp:close() end
   require("utils.ue_hub").setup_commands()
   require("ue.build_diagnostics").setup()
   require("utils.bottom_panel").setup_commands()
+  require("utils.development_workbench").setup()
   require("utils.ue_goto.reading").setup_commands()
   require("ue.run_profiles").setup_commands({
     set_target = function(platform, configuration)
@@ -9539,7 +9539,7 @@ break end
 
     vim.api.nvim_create_user_command("Tasks", function()
       require("utils.bottom_panel").show("tasks")
-    end, { desc = "List background tasks; select to stop" })
+    end, { desc = "Inspect background tasks and output; stop explicitly" })
 
     vim.api.nvim_create_user_command("TaskStop", function(opts)
       local tr = require("utils.task_registry")

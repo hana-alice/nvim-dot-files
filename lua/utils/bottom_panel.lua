@@ -3,7 +3,14 @@ local M = {}
 local tabs = {}
 local KEEP_BUILD_LOGS = 16
 local order = { "build", "quickfix", "logcat", "tasks" }
-local labels = { build = "构建输出", quickfix = "问题", logcat = "Logcat", tasks = "后台任务", debug = "调试" }
+local labels = {
+  build = "构建输出",
+  quickfix = "问题",
+  logcat = "Logcat",
+  tasks = "后台任务",
+  debug = "调试",
+  task = "任务详情",
+}
 local empty = {
   build = "尚无构建输出；先运行构建。",
   quickfix = "当前 quickfix 没有问题。",
@@ -96,7 +103,7 @@ local function tasks_buffer(s, tab)
   local buf = scratch("tasks", s, tab)
   local registry = require("utils.task_registry")
   local rows = registry.list()
-  local lines, ids = { "后台任务  ·  <CR>/dd 停止当前任务  ·  r 刷新", "" }, {}
+  local lines, entries = { "后台任务  ·  Enter查看  ·  dd/C-x停止  ·  r 刷新", "" }, {}
   for _, row in ipairs(rows) do
     local result = row.result == "unknown" and "done (exit unknown)" or row.result or row.status
     local code = row.code ~= nil and (" exit=" .. row.code) or ""
@@ -108,7 +115,10 @@ local function tasks_buffer(s, tab)
       tostring(row.group):gsub("[\r\n]", " "),
       tostring(row.name):gsub("[\r\n]", " ")
     )
-    ids[#lines] = row.id
+    local record = registry.get(row.id)
+    if record then
+      entries[#lines] = { id = row.id, kind = record.kind, handle = record.handle }
+    end
   end
   if #rows == 0 then
     lines[#lines + 1] = "没有后台任务。"
@@ -120,14 +130,28 @@ local function tasks_buffer(s, tab)
     end
   end
   local stop = function()
-    local id = ids[vim.api.nvim_win_get_cursor(0)[1]]
-    if id then
-      local stopped = registry.cancel(id)
-      vim.notify(stopped and ("已停止任务 " .. id) or "该任务已经结束", vim.log.levels.INFO)
+    local entry = entries[vim.api.nvim_win_get_cursor(0)[1]]
+    if entry then
+      local record = registry.get(entry.id)
+      if not record or record.kind ~= entry.kind or record.handle ~= entry.handle then
+        vim.notify("任务已过期；请刷新任务列表。", vim.log.levels.WARN)
+        return
+      end
+      local stopped = registry.cancel(entry.id)
+      vim.notify(stopped and ("已请求停止任务 " .. entry.id) or "该任务已经结束", vim.log.levels.INFO)
       refresh()
     end
   end
-  for _, key in ipairs({ "<CR>", "dd" }) do
+  vim.keymap.set("n", "<CR>", function()
+    local entry = entries[vim.api.nvim_win_get_cursor(0)[1]]
+    if entry then
+      local win, err = require("utils.task_inspector").open(entry.id, { expected = entry })
+      if not win then
+        vim.notify(err or "任务视图无法打开。", vim.log.levels.WARN)
+      end
+    end
+  end, { buffer = buf, silent = true, desc = "查看后台任务详情 / 输出" })
+  for _, key in ipairs({ "dd", "<C-x>" }) do
     vim.keymap.set("n", key, stop, { buffer = buf, silent = true, desc = "停止当前后台任务" })
   end
   vim.keymap.set("n", "r", refresh, { buffer = buf, silent = true, desc = "刷新后台任务" })
@@ -291,6 +315,9 @@ function M.show(kind, buf, opts)
     names[#names + 1] = name == kind and ("[" .. labels[name] .. "]") or labels[name]
   end
   if kind == "debug" then names[#names + 1] = "[调试]" end
+  if kind == "task" then
+    names[#names + 1] = "[任务详情]"
+  end
   vim.wo[win].statusline = " " .. table.concat(names, " | ")
   -- Restore only on an explicit panel switch, never via BufEnter guards.
   local view = s.views[target]
@@ -308,7 +335,7 @@ function M.show(kind, buf, opts)
   return win
 end
 
---- Build → problems → logcat → tasks. Debug is deliberately outside the cycle.
+--- Build → problems → logcat → tasks. Debug and task details stay outside the cycle.
 function M.cycle()
   local s = state()
   local current = 0

@@ -448,7 +448,7 @@ t.describe("ide_workspace: native ownership and recovery", function()
         local count = #registry.list()
         local win = workspace.activate(row)
         return { initial = initial, code = code, done = status == 'done', no_copy = record.state == nil,
-          no_relaunch = #registry.list() == count, panel = win and vim.b[vim.api.nvim_win_get_buf(win)].ue_bottom_panel_kind == 'tasks',
+          no_relaunch = #registry.list() == count, panel = win and vim.b[vim.api.nvim_win_get_buf(win)].ue_bottom_panel_kind == 'task',
           stop = workspace.stop(row), label = row.text }
       ]])
       t.assert_eq(result.initial, "running")

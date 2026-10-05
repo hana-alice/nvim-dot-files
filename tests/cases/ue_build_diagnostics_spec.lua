@@ -85,3 +85,50 @@ t.describe("build diagnostics", function()
     end)
   end)
 end)
+
+local function upvalue(fn, name)
+  for index = 1, 255 do
+    local key, value = debug.getupvalue(fn, index)
+    if not key then
+      break
+    end
+    if key == name then
+      return value
+    end
+  end
+  error("missing build output owner: " .. name)
+end
+
+t.describe("build output terminal controls", function()
+  local build = upvalue(require("ue").setup, "build_target")
+  local terminal = upvalue(build, "open_terminal_command")
+  local parse = upvalue(terminal, "diagnostic_entries_from_output")
+
+  t.it("OSC titles cannot become part of a compiler filename", function()
+    fixture(function(file)
+      for _, ending in ipairs({ "\7", "\27\\" }) do
+        local title = "\27]0;native compiler" .. ending
+        local rows = parse({ title .. file .. title .. ":3:2: error: original message" })
+        t.assert_eq(#rows, 1)
+        t.assert_eq(vim.fs.normalize(rows[1].filename), vim.fs.normalize(file))
+        t.assert_eq(rows[1].lnum, 3)
+        t.assert_eq(rows[1].col, 2)
+        t.assert_eq(rows[1].text, "error: original message")
+      end
+    end)
+  end)
+
+  t.it("OSC links and CSI colour leave the displayed source and diagnostic intact", function()
+    fixture(function(file)
+      local line = "\27]8;;file://metadata\27\\"
+        .. file
+        .. "\27]8;;\27\\"
+        .. ":2:1: \27[31merror: plain diagnostic\27[0m"
+      local rows = parse({ line })
+      t.assert_eq(#rows, 1)
+      t.assert_eq(vim.fs.normalize(rows[1].filename), vim.fs.normalize(file))
+      t.assert_eq(rows[1].lnum, 2)
+      t.assert_eq(rows[1].text, "error: plain diagnostic")
+    end)
+  end)
+end)

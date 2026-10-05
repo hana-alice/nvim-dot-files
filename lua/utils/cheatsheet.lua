@@ -642,6 +642,7 @@ local tabs = {
           { "<leader>u?",    "User guide / 使用手册 (:UEGuide)" },
           { "<leader>uE",    "Jump to first build error (:UEBuildFirstError)" },
           { "<leader>uJ",    "Cycle bottom: build / problems / logcat / tasks" },
+          { "<leader>uH",    "Development workbench: target, next action, own errors/logs" },
           { ":UEPanel history / gH", "Retained recent stage logs" },
           { ":UETests", "Discover/run Editor tests; results / rerun" },
           { ":UENewClass", "Preview header/source in an existing UE module" },
@@ -669,7 +670,7 @@ local tabs = {
       {
         title = "Tasks (background jobs)",
         mappings = {
-          { "<leader>X",     "List tasks; select to stop (:Tasks)" },
+          { "<leader>X",     "Tasks: Enter inspect; dd / Ctrl-X stop (:Tasks)" },
           { "<leader>Xs",    "Stop one (auto if single) (:TaskStop)" },
           { "<leader>XA",    "Stop all (confirms first) (:TaskStopAll)" },
           { ":TaskStop [id]","Stop a specific task by id" },

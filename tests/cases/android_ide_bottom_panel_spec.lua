@@ -272,7 +272,7 @@ t.describe("android_ide_bottom_panel: 真实窗口与内容切换", function()
     end)
   end)
 
-  t.it("任务面板查询派生状态，回车/dd 停止真实 registry 记录且无二次确认", function()
+  t.it("任务面板查询派生状态，dd 停止真实 registry 记录且无二次确认", function()
     isolated(function()
       registry._set_probe_for_test(function(rec) return rec.handle.alive and "running" or "done" end)
       local handle = { alive = true, killed = 0 }

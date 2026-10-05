@@ -14,7 +14,7 @@ local UE_COMMANDS = {
   "UENewClass", "UETests",
   "UEBuildFirstError",
   "UEPanel", "UEPanelNext",
-  "UEWorkspace", "UEPeek", "UEReadCancel", "UEReadReturn", "UERelations",
+  "UEWorkbench", "UEWorkspace", "UEPeek", "UEReadCancel", "UEReadReturn", "UERelations",
   "UEAndroidCrash", "UEAndroidIterate", "UEBuild", "UEBuildDistributed", "UEBuildDistributedPlan", "UEBuildAndroid", "UEBuildAndroidSO", "UEBuildCsearch", "UEBuildIOS", "UEBuildPCH", "UECachePaths", "UECDBPartition",
   "UECDBStatus", "UECDBSwitch", "UECheatsheet", "UECheatsheetEdit", "UEClearCache",
   "UECompileForNvim",
@@ -36,8 +36,8 @@ local UE_COMMANDS = {
 
 t.describe("commands: UE* 全量注册", function()
   require("ue").setup()
-  t.it("冻结清单含 117 个命令", function()
-    t.assert_eq(#UE_COMMANDS, 117)
+  t.it("冻结清单含 118 个命令", function()
+    t.assert_eq(#UE_COMMANDS, 118)
   end)
   for _, c in ipairs(UE_COMMANDS) do
     t.it(":" .. c .. " 已注册", function()

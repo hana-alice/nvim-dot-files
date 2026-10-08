@@ -19,7 +19,7 @@ local action_state = {
 local runtime = runtime_helper.install(transport, {
   protocol = protocol, state = transport_state, uv = vim.uv or vim.loop,
   SIDECAR_NAME = "ue-clang-semanticd", REQUEST_TIMEOUT_MS = REQUEST_TIMEOUT_MS,
-  IDLE_EVICT_MS = 30000,
+  IDLE_EVICT_MS = 300000,
 })
 
 local function compiler_options(options)
@@ -28,16 +28,22 @@ end
 
 function M.request(op, fields, callback, options, snapshot)
   local is_current = snapshot and function() return M.snapshot_is_current(snapshot) end or nil
-  return transport.request(op, fields, callback, compiler_options(options), is_current)
+  return transport.request(op, fields, callback, compiler_options(options), is_current,
+    snapshot and snapshot.prewarm == true)
 end
 
 M.cancel_queued_actions = transport.cancel_queued_actions
+M.set_priority = transport.set_priority
 M.set_trace = transport.set_trace
+M.trace_event = runtime.emit_trace
 M.index_snapshot_is_current = environment.index_snapshot_is_current
 local actions = action_helper.install(M, {
   state = action_state, hash_text = runtime.hash_text,
   emit_trace = runtime.emit_trace, unavailable = runtime.unavailable,
 })
+local prewarm = require("utils.ue_goto.semantic_prewarm").install(M)
+M.cancel_prewarm = prewarm.cancel
+M.prewarm_header = prewarm.start
 
 function M.discover_toolchain(bufnr, opts)
   local current, err = environment.read(bufnr, opts)
@@ -91,4 +97,5 @@ M.PROTOCOL_VERSION = protocol.VERSION
 M.TERMINAL = actions.TERMINAL
 M.IDLE_EVICT_MS = runtime.IDLE_EVICT_MS
 M.REQUEST_TIMEOUT_MS = REQUEST_TIMEOUT_MS
+prewarm.setup()
 return M

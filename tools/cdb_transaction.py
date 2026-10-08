@@ -45,6 +45,14 @@ def payload(value):
     return (json.dumps(value, ensure_ascii=False, sort_keys=True) + '\n').encode('utf-8')
 
 
+def file_hash(path):
+    value = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            value.update(block)
+    return value.hexdigest()
+
+
 def prepare(config):
     stage, active = Path(config['stage']), Path(config['active'])
     # No hardlinks: pipeline tools may mutate their physical input in place.
@@ -99,11 +107,8 @@ def commit(config):
         source = Path(str(stage) + suffix)
         if source.is_file():
             add_file(source, str(active) + suffix)
-    # Do not oscillate a persisted changed flag on identical final commands.
-    result_path = str(active) + SIDECARS[2]
-    add_file(stage, result_path, {'schema': 1, 'digest': final_digest, 'changed': changed}, ('changed',))
-
     stage_shards, shards = Path(config['stage_shards']), Path(config['shards'])
+    provenance = None
     if stage_shards.is_dir():
         for source in sorted(stage_shards.glob('*.json')):
             value = read_json(source)
@@ -124,9 +129,31 @@ def commit(config):
                         for field in ('mtime', 'updated_at'):
                             if field in previous:
                                 metadata[field] = previous[field]
+                selected = value.get('active')
+                if isinstance(selected, str) and selected in value.get('shards', {}):
+                    raw = stage_shards / (selected + '.json')
+                    live_raw = shards / raw.name
+                    if raw.is_file():
+                        # Hash the bytes readers will actually see. Equivalent
+                        # JSON and commands deliberately retain the live files.
+                        selected_bytes = live_raw if equivalent_json(live_raw, read_json(raw)) else raw
+                        provenance = {
+                            'schema': 1, 'active_key': selected,
+                            'active_cdb_sha256': file_hash(selected_bytes),
+                            'merged_cdb_sha256': file_hash(stage if changed else active),
+                        }
                 add_file(source, destination, value)
             else:
                 add_file(source, destination)
+
+    # The transaction binds postprocessed bytes to the selected raw input.
+    # copy2 preserves stage mtime, while selection metadata is written at
+    # commit time; their timestamp ordering is not a freshness proof.
+    result_path = str(active) + SIDECARS[2]
+    result = {'schema': 1, 'digest': final_digest, 'changed': changed}
+    if provenance is not None:
+        result['provenance'] = provenance
+    add_file(stage, result_path, result, ('changed',))
 
     stage_manifest = Path(config['stage_manifest'])
     if stage_manifest.is_file():

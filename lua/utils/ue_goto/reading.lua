@@ -2,6 +2,7 @@
 local M = {}
 local ownership = require("utils.ue_goto.reading_owner")
 local results = require("utils.ue_goto.reading_results")
+local last_references
 local methods = {
   definition = "textDocument/definition",
   declaration = "textDocument/declaration",
@@ -201,12 +202,28 @@ end
 
 function M.references()
   local owner = begin()
+  local started = (vim.uv or vim.loop).hrtime()
   local symbol = current_word()
   if not symbol or symbol == "" then
     notify(owner, "光标处没有符号")
     return false
   end
-  require("utils.ue_goto.provider").async_lsp_request(owner.buf, methods.references, function(response)
+  local header = require("utils.ue_goto.reading_companion").kind(owner.path) == "header" and owner.context ~= nil
+  local function record(proof, state, stage, reason, count)
+    if not ownership.current(owner, true) then return end
+    local context = proof and proof.context or {}
+    last_references = {
+      subject = vim.fs.basename(owner.path), donor = vim.fs.basename(context.compile and context.compile.file or context.origin_tu or ""),
+      evidence_kind = context.evidence_kind or (proof and "compiler-query" or "-"),
+      context_id = context.id or context.context_id,
+      compile_digest = proof and proof.compile_digest,
+      state = state, stage = stage, reason = reason, location_count = count or 0,
+      elapsed_ms = math.floor(((vim.uv or vim.loop).hrtime() - started) / 1000000),
+    }
+  end
+  local function request(proof)
+    if not ownership.current(owner, true) then return end
+    require("utils.ue_goto.provider").async_lsp_request(owner.buf, methods.references, function(response)
     if not ownership.current(owner, true) then
       return
     end
@@ -215,13 +232,19 @@ function M.references()
       locations = {}
     end
     if #locations > 0 then
+      record(proof, "resolved", "references", "provider-locations", #locations)
       present(owner, locations, { title = "引用", source = "LSP" })
+    elseif header then
+      local reason = type(response) == "table" and response.reason or "missing-provider-response"
+      record(proof, "unavailable", "references", reason)
+      notify(owner, "头文件引用不可用（" .. tostring(reason) .. "）；覆盖未知")
     else
       references_gtags(owner, symbol, type(response) == "table" and response.reason or "missing-provider-response")
     end
   end, {
     snapshot = owner,
     structured = true,
+    proven_header = proof,
     is_current = function()
       return ownership.current(owner, true)
     end,
@@ -229,13 +252,62 @@ function M.references()
       return ownership.add_cleanup(owner, cancel)
     end,
   })
+  end
+  if header then
+    record(nil, "preparing", "context", "header-origin-pending")
+    require("utils.ue_goto.reading_context").resolve_header(owner, function(contexts, callback)
+      return M.choose_context(owner, contexts, callback)
+    end, function(proof, failure)
+      if not ownership.current(owner, true) then return end
+      if not proof then
+        local reason = failure and failure.reason or "header-origin-unproven"
+        record(nil, "unavailable", "context", reason)
+        notify(owner, "头文件引用缺少已证明的编译上下文（" .. tostring(reason) .. "）")
+        return
+      end
+      record(proof, "preparing", "command", "compiler-origin-proven")
+      request(proof)
+    end)
+  else
+    request()
+  end
   return true
+end
+
+function M.explain_lines()
+  if not last_references then return {} end
+  local report = last_references
+  local function safe(value)
+    return tostring(value or "-"):gsub("\\", "/"):gsub("[%a]:/[^%c]+", "<path>"):gsub("%c", " "):sub(1, 160)
+  end
+  return {
+    "--- references ---",
+    string.format("references: subject=%s state=%s stage=%s reason=%s", safe(report.subject), safe(report.state), safe(report.stage), safe(report.reason)),
+    string.format("references donor: %s evidence=%s context=%s command=%s", safe(report.donor), safe(report.evidence_kind),
+      safe((report.context_id or ""):sub(1, 12)), safe((report.compile_digest or ""):sub(1, 12))),
+    string.format("references timing: elapsed_ms=%d locations=%d", report.elapsed_ms, report.location_count),
+  }
 end
 
 function M.source_header(opts)
   local owner = begin()
   local method = "textDocument/switchSourceHeader"
-  return M.choose_client(owner, method, function(client)
+  local companion = require("utils.ue_goto.reading_companion")
+  local function deliver(paths, provider)
+    if not ownership.current(owner, true) then return end
+    local locations = vim.tbl_map(function(path)
+      return { uri = vim.uri_from_fname(path), _position_encoding = "utf-8", range = { start = { line = 0, character = 0 } } }
+    end, paths)
+    local rows = results.items(locations)
+    if #rows == 0 then notify(owner, "对应文件不存在或不是可读文件"); return end
+    if (opts and opts.peek) or #rows > 1 then
+      results.open(owner, rows, { title = "对应头源文件", source = provider })
+    else
+      results.jump(owner, rows[1])
+    end
+  end
+  local function provider_fallback()
+    return M.choose_client(owner, method, function(client)
     ownership.request(owner, client, method, { uri = owner.subject.uri }, function(err, uri)
       if err then
         notify(owner, "头源查询失败：" .. tostring(err.message))
@@ -245,20 +317,30 @@ function M.source_header(opts)
         notify(owner, "提供者没有可打开的对应文件；不会猜测配对")
         return
       end
-      local row = results.items({
-        { uri = uri, _position_encoding = "utf-8", range = { start = { line = 0, character = 0 } } },
-      })[1]
-      if not row then
-        notify(owner, "对应文件不存在或不是可读文件")
+      local decoded, path = pcall(vim.uri_to_fname, uri)
+      if decoded then path = vim.fs.normalize(path) end
+      local valid, rule
+      if decoded then valid, rule = companion.valid_pair(owner.path, path) end
+      if not valid then
+        notify(owner, "提供者返回了生成文件或非对应头源文件；不会接受该目标")
         return
       end
-      if opts and opts.peek then
-        results.open(owner, { row }, { title = "对应头源文件", source = client.name })
-      else
-        results.jump(owner, row)
-      end
+      if rule == "same-basename" then deliver({ path }, client.name .. " · 同名文件"); return end
+      local source = companion.kind(owner.path) == "source" and owner.path or path
+      local header = companion.kind(owner.path) == "header" and owner.path or path
+      require("utils.ue_goto.reading_context").prove_companion(owner, source, header, function(proven, reason)
+        if not ownership.current(owner, true) then return end
+        if proven then deliver({ path }, client.name .. " · 编译器 include 证明")
+        else notify(owner, "对应关系未被编译器证明（" .. tostring(reason) .. "）") end
+      end)
     end)
   end, true)
+  end
+  companion.known_sources(owner, function(paths)
+    if not ownership.current(owner, true) then return end
+    if paths then deliver(paths, "active CDB · 同名源文件") else provider_fallback() end
+  end)
+  return true
 end
 
 local function cpp_definition_peek(owner)

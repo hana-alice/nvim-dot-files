@@ -78,7 +78,12 @@ function M.install(owner, deps)
   local format_jump_msg = assert(deps.format_jump_msg, "format_jump_msg is required")
 
   function owner.explain_lines()
-    return report.explain_lines(owner._last_cpp_transaction)
+    local lines = report.explain_lines(owner._last_cpp_transaction)
+    local reading = package.loaded["utils.ue_goto.reading"]
+    if reading and type(reading.explain_lines) == "function" then
+      vim.list_extend(lines, reading.explain_lines())
+    end
+    return lines
   end
 
   owner._test_explain_lines = owner.explain_lines
@@ -664,23 +669,32 @@ function M.install(owner, deps)
         end
         local function accept_destination(target_evidence, destination_role)
           local target_path = location_mod.location_path(locs[1]):lower()
-          if M.CPP_HEADER_EXTS[target_path:match("%.([^./\\]+)$") or ""]
-              and type(symbol_info.exact_command) == "table" then
+          if type(symbol_info.exact_command) == "table" then
             local exact = symbol_info.exact_command
             local compile = {
               directory = exact.workingDirectory,
               file = ref_file,
               argv = vim.deepcopy(exact.compilationCommand or {}),
             }
-            local compile_fingerprint = vim.fn.sha256(vim.json.encode(compile))
+            local compile_fingerprint = require("utils.ue_goto.semantic_context")
+              .compile_descriptor_fingerprint(compile.directory, compile.file, compile.argv)
             local lineage = {
               context_id = compile_fingerprint,
               origin_tu = ref_file,
               cdb_dir = environment.cdb_dir,
               compile = compile,
               compile_command_fingerprint = compile_fingerprint,
-              subject_membership = { [target_path] = true },
+              subject_membership = { [ref_file] = true },
+              -- A validated source command is a candidate for another header,
+              -- not proof that it includes that header. The header route must
+              -- re-prove active CDB identity and native inclusion before use.
+              source_exact_candidate = true,
+              evidence_kind = "clangd-source-exact-command",
+              source_action_token = snapshot.token,
             }
+            if M.CPP_HEADER_EXTS[target_path:match("%.([^./\\]+)$") or ""] then
+              lineage.subject_membership[target_path] = true
+            end
             origin_context = lineage
           end
           dtrace("semantic provider=clangd context=source-exact-command usr=%s state=resolved",

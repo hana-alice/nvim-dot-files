@@ -11,12 +11,13 @@ local function fixture(body)
   local old_clients, old_notify, old_snacks = vim.lsp.get_clients, vim.notify, _G.Snacks
   local old_ue = package.loaded.ue
   local old_commands = package.loaded["ue.clangd_commands"]
+  local old_context = package.loaded["utils.ue_goto.reading_context"]
   local old_hidden = vim.o.hidden
   local old_buffers = {}
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
     old_buffers[buf] = true
   end
-  local f = { source = source, target = target, root = root, requests = {}, picks = {}, messages = {} }
+  local f = { source = source, target = target, root = root, requests = {}, picks = {}, messages = {}, preparations = {} }
   vim.o.hidden = true
   vim.api.nvim_set_current_buf(vim.api.nvim_create_buf(true, false))
   vim.cmd.edit(vim.fn.fnameescape(source))
@@ -61,7 +62,8 @@ local function fixture(body)
     end,
   }
   package.loaded["ue.clangd_commands"] = {
-    ensure = function(_, _, callback)
+    ensure = function(_, _, callback, opts)
+      f.preparations[#f.preparations + 1] = opts
       callback(true, nil, { workingDirectory = root, compilationCommand = { "clang++", "-c", source } })
     end,
   }
@@ -105,6 +107,7 @@ local function fixture(body)
   vim.lsp.get_clients, vim.notify, _G.Snacks = old_clients, old_notify, old_snacks
   package.loaded.ue = old_ue
   package.loaded["ue.clangd_commands"] = old_commands
+  package.loaded["utils.ue_goto.reading_context"] = old_context
   vim.o.hidden = old_hidden
   for _, tab in ipairs(vim.api.nvim_list_tabpages()) do
     if tab ~= f.tab then
@@ -134,6 +137,13 @@ local function fixture(body)
   if not ok then
     error(err)
   end
+end
+
+local function header(f)
+  vim.cmd.edit(vim.fn.fnameescape(f.target))
+  f.buf = vim.api.nvim_get_current_buf()
+  vim.bo.filetype = "cpp"
+  vim.api.nvim_win_set_cursor(f.win, { 1, 4 })
 end
 
 t.describe("ue_goto reading ownership", function()
@@ -314,6 +324,160 @@ t.describe("ue_goto reading ownership", function()
       t.assert_true(vim.deep_equal(vim.api.nvim_win_get_cursor(f.win), cursor))
     end)
   end)
+
+  t.it("header references prepare the compiler-proven donor and expose its provenance", function()
+    fixture(function(f)
+      header(f)
+      local donor = f.root .. "/different-origin.cpp"
+      local proof = { context = { origin_tu = donor, compile = { file = donor }, id = "native-context",
+        evidence_kind = "clang-d-rsp-unity" }, compile_digest = "native-command" }
+      package.loaded["utils.ue_goto.reading_context"] = {
+        resolve_header = function(owner, _, callback)
+          t.assert_eq(owner.path, vim.api.nvim_buf_get_name(f.buf))
+          callback(proof)
+        end,
+      }
+      local reading = require("utils.ue_goto.reading")
+      t.assert_true(reading.references())
+      t.assert_eq(f.preparations[1].proven_header, proof)
+      t.assert_eq(f.requests[1].params.textDocument.uri, vim.uri_from_bufnr(f.buf))
+      f.respond(1, nil, { f.loc() })
+      t.assert_eq(#f.picks, 1)
+      local explanation = table.concat(reading.explain_lines(), "\n")
+      t.assert_contains(explanation, "different-origin.cpp")
+      t.assert_contains(explanation, "clang-d-rsp-unity")
+      t.assert_contains(explanation, "state=resolved")
+      t.assert_false(explanation:find(f.root, 1, true) ~= nil, "Explain must not leak the fixture root")
+    end)
+  end)
+
+  for _, failure in ipairs({ "no-proven-context", "invalid-query-file-not-in-tu", "compile-command-missing", "empty" }) do
+    t.it("header references do not replace " .. failure .. " with text-index success", function()
+      fixture(function(f)
+        header(f)
+        local fallback = 0
+        package.loaded.ue.gtags_references_async = function() fallback = fallback + 1 end
+        package.loaded["utils.ue_goto.reading_context"] = {
+          resolve_header = function(_, _, callback)
+            if failure == "no-proven-context" or failure == "invalid-query-file-not-in-tu" then
+              callback(nil, { state = "unavailable", reason = failure })
+            else
+              callback({ context = { origin_tu = f.source, compile = { file = f.source } } })
+            end
+          end,
+        }
+        if failure == "compile-command-missing" then
+          package.loaded["ue.clangd_commands"].ensure = function(_, _, callback)
+            callback(false, "compile-command-missing")
+          end
+        end
+        local reading = require("utils.ue_goto.reading")
+        reading.references()
+        if failure == "empty" then f.respond(1, nil, {}) end
+        vim.wait(40, function() return #f.messages > 0 end, 5)
+        t.assert_eq(fallback, 0)
+        t.assert_eq(#f.picks, 0)
+        t.assert_eq(#f.messages, 1)
+        t.assert_contains(table.concat(reading.explain_lines(), "\n"), failure)
+      end)
+    end)
+  end
+
+  t.it("late header donor discovery cannot prepare or present references", function()
+    fixture(function(f)
+      header(f)
+      local complete
+      package.loaded["utils.ue_goto.reading_context"] = {
+        resolve_header = function(_, _, callback) complete = callback end,
+      }
+      require("utils.ue_goto.reading").references()
+      vim.api.nvim_buf_set_lines(f.buf, 0, -1, false, { "new header input" })
+      complete({ context = { origin_tu = f.source, compile = { file = f.source } } })
+      t.assert_eq(#f.preparations, 0)
+      t.assert_eq(#f.requests, 0)
+      t.assert_eq(#f.picks, 0)
+      t.assert_eq(#f.messages, 0)
+    end)
+  end)
+
+  for _, target_name in ipairs({ "origin.gen.cpp", "ObjectMacros.h", "Class.h" }) do
+    t.it("header switching rejects raw provider target " .. target_name, function()
+      fixture(function(f)
+        header(f)
+        local destination = f.root .. "/" .. target_name
+        vim.fn.writefile({ "int unrelated;" }, destination)
+        local proofs = 0
+        package.loaded["utils.ue_goto.reading_context"] = {
+          prove_companion = function() proofs = proofs + 1 end,
+        }
+        require("utils.ue_goto.reading").source_header()
+        f.respond(1, nil, vim.uri_from_fname(destination))
+        t.assert_eq(vim.api.nvim_get_current_buf(), f.buf)
+        t.assert_eq(proofs, 0, "same-kind and generated candidates must be rejected before inclusion work")
+        t.assert_eq(#f.messages, 1)
+      end)
+    end)
+  end
+
+  for _, proven in ipairs({ false, true }) do
+    t.it("non-basename companion requires native inclusion proof: " .. tostring(proven), function()
+      fixture(function(f)
+        header(f)
+        local destination = f.root .. "/UnrealMath.cpp"
+        vim.fn.writefile({ "int unrelated;" }, destination)
+        local complete
+        package.loaded["utils.ue_goto.reading_context"] = {
+          prove_companion = function(owner, source, subject, callback)
+            t.assert_eq(owner.buf, f.buf)
+            t.assert_eq(source, destination)
+            t.assert_eq(subject, vim.api.nvim_buf_get_name(f.buf))
+            complete = callback
+          end,
+        }
+        require("utils.ue_goto.reading").source_header()
+        f.respond(1, nil, vim.uri_from_fname(destination))
+        t.assert_eq(vim.api.nvim_get_current_buf(), f.buf)
+        t.assert_type(complete, "function")
+        complete(proven, proven and "compiler-inclusion" or "invalid-query-file-not-in-tu")
+        if proven then
+          t.assert_eq(vim.fs.normalize(vim.api.nvim_buf_get_name(0)), vim.fs.normalize(destination))
+        else
+          t.assert_eq(vim.api.nvim_get_current_buf(), f.buf)
+          t.assert_eq(#f.messages, 1)
+        end
+      end)
+    end)
+  end
+
+  for _, count in ipairs({ 1, 2 }) do
+    t.it("known CDB companion count " .. count .. " overrides clangd without guessing among duplicates", function()
+      fixture(function(f)
+        header(f)
+        vim.fn.writefile({ "[]" }, f.context.paths.active_cdb)
+        local paths = { f.source }
+        if count == 2 then
+          vim.fn.mkdir(f.root .. "/Other", "p")
+          local duplicate = f.root .. "/Other/origin.cpp"
+          vim.fn.writefile({ "int other;" }, duplicate)
+          paths[#paths + 1] = duplicate
+        end
+        package.loaded["ue.clangd_commands"].find_companion = function(_, _, callback, opts)
+          t.assert_true(opts.is_current())
+          callback(paths)
+        end
+        require("utils.ue_goto.reading").source_header()
+        t.assert_eq(#f.requests, 0, "the known source should not depend on raw switchSourceHeader")
+        if count == 1 then
+          t.assert_eq(vim.fs.normalize(vim.api.nvim_buf_get_name(0)), vim.fs.normalize(f.source))
+        else
+          t.assert_eq(vim.api.nvim_get_current_buf(), f.buf)
+          t.assert_eq(#f.picks, 1)
+          t.assert_eq(#f.picks[1].opts.items, 2)
+          t.assert_false(f.picks[1].opts.auto_confirm)
+        end
+      end)
+    end)
+  end
 
   for _, value in ipairs({ "", "https://invalid.example/file", "file:///missing-own-fixture.hpp" }) do
     t.it("header result " .. value .. " fails closed", function()

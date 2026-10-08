@@ -9,6 +9,7 @@ import argparse
 import ctypes
 import json
 import os
+import pathlib
 import shlex
 import sys
 
@@ -40,17 +41,46 @@ def split_command(command):
         ctypes.windll.kernel32.LocalFree(ctypes.cast(argv, ctypes.c_void_p))
 
 
+def companion_sources(database, subject):
+    """File pairing only; basename does not prove a semantic header donor."""
+    stem = pathlib.Path(subject).stem.casefold()
+    candidates = {}
+    for entry in database:
+        path = absolute_file(entry)
+        candidate = pathlib.Path(path)
+        name = candidate.name.casefold()
+        parts = {part.casefold() for part in candidate.parts}
+        if (candidate.suffix.casefold() not in {".c", ".cc", ".cpp", ".cxx", ".m", ".mm"}
+                or candidate.stem.casefold() != stem
+                or ".gen." in name or ".generated." in name
+                or name.startswith(("module.", "superunity."))
+                or parts.intersection({"intermediate", "binaries", "saved"})
+                or not os.path.isfile(path)):
+            continue
+        candidates[path] = path
+    return sorted(candidates.values())
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("compile_commands")
     parser.add_argument("source_file")
     parser.add_argument("--subject", default=None,
                         help="Associate the donor command with this subject path")
+    parser.add_argument("--companion", action="store_true",
+                        help="List non-generated same-basename source files known to this CDB")
     args = parser.parse_args()
 
     wanted = canonical_path(args.source_file)
     with open(args.compile_commands, "r", encoding="utf-8") as handle:
         database = json.load(handle)
+
+    if args.companion:
+        candidates = companion_sources(database, wanted)
+        print(json.dumps({"state": "resolved" if candidates else "unavailable",
+                          "reason": None if candidates else "companion-source-missing",
+                          "candidates": candidates}, separators=(",", ":")))
+        return 0 if candidates else 2
 
     matches = []
     seen = set()

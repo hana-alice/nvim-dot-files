@@ -932,6 +932,49 @@ t.describe("ue.index generation manifests", function()
     cleanup_ctx(ctx)
   end)
 
+  t.it("reuses completed_at only for identical artifact and provenance evidence", function()
+    local ctx = make_ctx("stable_manifest")
+    local ok, err = xpcall(function()
+      local state = seed_state(ctx)
+      local keys = { "module:/B", "module:/A" }
+      local first = make_manifest(ctx, state, "full", "full-index", keys, 42)
+      local semantic_path = ctx.paths.semantic_full_cdb .. ".semantic.json"
+      write_file(semantic_path, '[{"file":"Module.A.cpp"}]')
+      local opts = { base_cdb_path = ctx.engine_root .. "/compile_commands.json",
+        background_cdb_path = first.background_cdb_path, semantic_cdb_path = semantic_path, completed_at = 42 }
+      first = index.make_index_manifest(ctx, state, "full", ctx.paths.full_index, keys, opts)
+      local manifest_path = index.index_manifest_path(ctx.paths.full_index)
+      write_file(manifest_path, vim.json.encode(first))
+      opts.completed_at = 99
+      local repeated = index.make_index_manifest(ctx, state, "full", ctx.paths.full_index,
+        { "module:/A", "module:/B" }, opts)
+      t.assert_true(vim.deep_equal(first, repeated), "queue order and wall clock must not change the manifest")
+      t.assert_eq(keys[1], "module:/B", "canonical coverage must not mutate the scheduling input")
+      for _, field in ipairs({ "background_cdb_hash", "semantic_cdb_hash", "idx_hash", "cdb_source_signature",
+        "toolchain_identity", "module_set_hash", "index_path_hash", "generation_id" }) do
+        local stale = vim.deepcopy(first)
+        stale[field] = "different"
+        write_file(manifest_path, vim.json.encode(stale))
+        repeated = index.make_index_manifest(ctx, state, "full", ctx.paths.full_index, keys, opts)
+        t.assert_eq(repeated.completed_at, 99, field .. " changes must not reuse a previous proof timestamp")
+      end
+      for _, timestamp in ipairs({ -1, "42", vim.NIL }) do
+        local malformed = vim.deepcopy(first)
+        malformed.completed_at = timestamp
+        write_file(manifest_path, vim.json.encode(malformed))
+        repeated = index.make_index_manifest(ctx, state, "full", ctx.paths.full_index, keys, opts)
+        t.assert_eq(repeated.completed_at, 99, "malformed completion time must not be reused")
+      end
+      write_file(manifest_path, vim.json.encode(first))
+      write_file(semantic_path, '[{"file":"Module.B.cpp"}]')
+      repeated = index.make_index_manifest(ctx, state, "full", ctx.paths.full_index, keys, opts)
+      t.assert_eq(repeated.completed_at, 99, "real semantic bytes require a new manifest")
+      t.assert_true(repeated.artifact_fingerprint ~= first.artifact_fingerprint)
+    end, debug.traceback)
+    cleanup_ctx(ctx)
+    if not ok then error(err) end
+  end)
+
   t.it("binds a split semantic CDB's bytes to the artifact within the same generation", function()
     local ctx = make_ctx("semantic_manifest")
     local ok, err = xpcall(function()

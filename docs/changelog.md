@@ -92,6 +92,38 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 已将具名调查切片归档至 [2.7.0](release_2.7.0.md)。
 
+### 2026-10-08 — 头文件语义导航、重复 Prepare no-op 与首个真实二次批次
+
+**Task**
+- 按真实工程基线修 P0：头文件 gd/gr 全失败、头源切换误跳、重复 Prepare 非 no-op、二次合并为 0。
+
+**Implemented**
+- 新鲜度：header gd 改为以 active selection 与 raw/merged 内容 SHA proof 判定，不再比较 manifest mtime（`cdb_transaction` 的 copy2 保留 stage mtime 导致误拒）；切换选择后旧 merged 仍在 prove 阶段被拒。
+- header 编译上下文：gd/gr 从真实 donor TU 取编译命令，并由 libclang native inclusion（`clang_getInclusions` + `clang_File_isEqual`）证明包含当前头文件；VFS 别名须源码字节一致才映回用户位置。无法证明时明确失败，不借 GTAGS 变绿。
+- sidecar 补齐 LLVM 22 builtin resource 目录（原注入 NDK Clang 9 资源头导致 NEON 大量编译错误）；catalog donor 发现改为请求内线性索引。
+- 头源切换拒绝生成文件与未证明的 companion。
+- TU 缓存 1→4（受 RSS/宿主剩余内存约束），空闲回收 30 s→300 s；进入头文件异步低优先级预热已证明 donor，前台请求可取消；CDB 解析缓存绑定内容 digest。
+- 重复 Prepare：`module_keys` 规范排序、全部 provenance 一致才复用 `completed_at`、manifest 深比较相等不写盘；缓存命中不再创建 proof 目录（原触发 watcher 撤权并重启 clangd）。
+- 正常 full prepare 有界证明最多 2 个未缓存候选（原路径恒 `--reuse-verified-only`，永远不生产 proof）。
+- 新模块：`reading_companion/compile/context`、`semantic_prewarm`、`semantic_cdb_cache`、`semantic_context_hash`、`semantic_sidecar_inputs`、`index/_generation_digest`（含为 800 行门禁做的机械拆分）。
+
+**Pitfalls / Gotchas**
+- preserved-size/mtime 的内容 hash 复用曾出现一次 false acceptance，未复现根因；已改为每次实读 hash，并加 metadata 相同、内容替换的拒绝反例。
+- 首次与缓存读回的 batch 字段顺序不同会导致等价 CDB 被重写。
+- 测量驱动：启动期异步切窗会让“头文件 gd”实际落在源文件上，调用前须校验 buffer/path/cursor。
+
+**Validation**
+- 真实 Android/Test 30 样本（同 SHA）：gd 11/30→22/30、gr 11/30→22/30（header 0/19→11/19），头源切换 24/30→30/30（误跳 6→0），cpp 起点 11/11 不变。
+- 重复 Prepare 缓存轮：受控产物 SHA/size/mtime 全同，clangd PID 不变，0 spawn/0 detach。
+- 二次合并 0→1 批（2 个 UBT 输入；997 UBT → 995 + 1 batch，full 条目 3329→3328），exact 215、shader 2117 不变。
+- 合批全量回归（含 800 行门禁拆分）：3283/3283，0 失败、0 跳过，包含 legacy。
+
+**Follow-ups（未达标，不宣称完成）**
+- **延迟未达预算**：header 首次 gd 30–41 s 或超时（P01/E02），同 donor 重复 208 ms 达标。逐请求冷解析 TU（≈8 s/个）是结构性瓶颈；下一步改为先用 clangd 后台索引按 USR 查定义，sidecar 只做歧义/缺失回退。
+- 剩余 8 个 header 中 P09/E09/E15 native 校验已恢复，端到端 gd 与 P10/E10/E11/E12/E14 未实测；E02 触发 64-context 上限。
+- 增量二次合并未实施：`cdb_verified_batch.py` stage-complete 用总 batch_count（含缓存批次），已有 1 批后不再接受新组。
+- 缓存轮 Prepare 仍重做输入验证，墙钟约 164 s；全工程 SuperUnity 性能未恢复。
+
 ### 2026-10-08 — 用工作台贯通开发入口、恢复与首次上手
 
 **Task**

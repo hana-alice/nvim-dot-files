@@ -1,4 +1,5 @@
 local libclang = require("utils.ue_goto.semantic_sidecar_libclang")
+local semantic_context = require("utils.ue_goto.semantic_context")
 
 local M = {}
 
@@ -59,6 +60,7 @@ do
     extra.process_rss_bytes = self:_rss_bytes()
     extra.max_tus = self.max_tus
     extra.idle_evict_ms = self.idle_evict_ms
+    extra.max_rss_bytes = self.max_rss_bytes
     return extra
   end
 
@@ -108,18 +110,28 @@ do
     end
   end
 
-  function TUStore:_prune_lru()
+  function TUStore:_prune_lru(protected_key)
     local count = self:_tu_count()
-    if count <= self.max_tus then return end
+    local function pressured()
+      return self:_rss_bytes() > self.max_rss_bytes
+        or libclang.uv.get_free_memory() < self.free_memory_reserve
+    end
+    if count <= self.max_tus and not pressured() then return end
     local entries = {}
     for key, entry in pairs(self.tus) do
-      entries[#entries + 1] = { key = key, last_used_ms = entry.last_used_ms }
+      if key ~= protected_key then
+        entries[#entries + 1] = { key = key, last_used_ms = entry.last_used_ms }
+      end
     end
     table.sort(entries, function(a, b) return a.last_used_ms < b.last_used_ms end)
-    for i = 1, count - self.max_tus do
+    -- Keep the most recently used TU available to its current foreground query.
+    -- Additional cached TUs yield under either process RSS or host memory pressure.
+    for i = 1, count - 1 do
+      if count <= self.max_tus and not pressured() then break end
       local victim = self.tus[entries[i].key]
       self:_dispose_tu(victim)
       self.tus[entries[i].key] = nil
+      count = count - 1
     end
   end
 
@@ -154,11 +166,7 @@ do
         origin_tu = libclang.normalize(ctx.compile.file or ctx.origin_tu),
         argv = libclang.shallow_copy(ctx.compile.argv),
       }
-      compile.fingerprint = libclang.sha256(vim.json.encode({
-        cwd = compile.cwd,
-        origin_tu = compile.origin_tu,
-        argv = compile.argv,
-      }))
+      compile.fingerprint = semantic_context.compile_descriptor_fingerprint(compile.cwd, compile.origin_tu, compile.argv)
       return compile
     end
     local cdb, cdb_err = self:_get_cdb(ctx.cdb_dir)
@@ -218,11 +226,7 @@ do
       origin_tu = libclang.normalize(origin),
       argv = argv,
     }
-    compile.fingerprint = libclang.sha256(vim.json.encode({
-      cwd = compile.cwd,
-      origin_tu = compile.origin_tu,
-      argv = compile.argv,
-    }))
+    compile.fingerprint = semantic_context.compile_descriptor_fingerprint(compile.cwd, compile.origin_tu, compile.argv)
     return compile
   end
 
@@ -248,8 +252,17 @@ do
     local entry = self.tus[cache_key]
     local unsaved_files, keepalive = libclang.make_unsaved_files(overlays)
 
+    if entry and not libclang.file_signatures_current(entry.vfs_input_signatures) then
+      -- Reparse retains the existing VFS; changed mapping inputs need a fresh
+      -- FileManager. This never promotes mapped-but-unincluded paths.
+      self:_dispose_tu(entry)
+      self.tus[cache_key] = nil
+      entry = nil
+    end
+
     if not entry then
-      local parse_args = libclang.semantic_parse_args(compile.argv)
+      local parse_args, resource_error = libclang.semantic_parse_args(compile.argv, self.toolchain)
+      if not parse_args then return nil, nil, { reason = resource_error } end
       local argv_buf = libclang.ffi.new("const char *[?]", #parse_args)
       for i, value in ipairs(parse_args) do
         argv_buf[i - 1] = value
@@ -328,11 +341,18 @@ do
       entry.semantic_errors = libclang.has_error_diagnostics(self.toolchain.lib, entry.tu)
       entry.file_signatures = libclang.tu_file_signatures(
         self.toolchain.lib, entry.tu, compile.origin_tu, compile.cwd)
+      entry.included_files = {}
+      for path in pairs(entry.file_signatures) do
+        entry.included_files[semantic_context.match_key(path)] = true
+        local real = libclang.uv.fs_realpath(path)
+        if real then entry.included_files[semantic_context.match_key(real)] = true end
+      end
+      entry.vfs_input_signatures = libclang.vfs_input_signatures(compile, entry.file_signatures)
     end
 
     entry.last_used_ms = libclang.now_ms()
     entry.context_id = ctx.id
-    self:_prune_lru()
+    self:_prune_lru(cache_key)
 
     return entry, {
       query_kind = query_kind,
@@ -357,8 +377,15 @@ do
 
     local started = libclang.uv.hrtime()
     local tu = entry.tu
-    local file = self.toolchain.lib.clang_getFile(tu, libclang.normalize(query.path))
-    if file == nil then
+    local query_path = libclang.absolute_path(query.path, entry.compile.cwd)
+    local real_query = libclang.uv.fs_realpath(query_path)
+    local included = entry.included_files[semantic_context.match_key(query_path)]
+      or (real_query and entry.included_files[semantic_context.match_key(real_query)])
+    local file = self.toolchain.lib.clang_getFile(tu, query_path)
+    if not included and file ~= nil then
+      included = libclang.tu_includes_file(self.toolchain.lib, tu, file)
+    end
+    if not included or file == nil then
       return {
         context_id = ctx.id,
         state = "invalid-semantic-context",
@@ -366,6 +393,33 @@ do
         diagnostics = self:_diagnostics(entry),
         compile_command_fingerprint = compile_meta.compile_command_fingerprint,
       }, compile_meta
+    end
+
+    local compiler_path = libclang.absolute_path(libclang.cxstring_to_string(
+      self.toolchain.lib, self.toolchain.lib.clang_getFileName(file)), entry.compile.cwd)
+    local alias = semantic_context.match_key(compiler_path) ~= semantic_context.match_key(query_path)
+    -- use-external-names=false hides the alias in the reported filename, so
+    -- coordinates require content proof even when the names are identical.
+    if not libclang.file_contents_match(self.toolchain.lib, tu, file, query_path, overlays) then
+      return {
+        context_id = ctx.id,
+        state = "invalid-semantic-context",
+        reason = "invalid-query-file-alias-content-mismatch",
+        diagnostics = self:_diagnostics(entry),
+        compile_command_fingerprint = compile_meta.compile_command_fingerprint,
+      }, compile_meta
+    end
+    -- Preserve the user's source spelling for locations in the proven file.
+    -- Other files are never mapped by basename or coincident source text.
+    local function source_location(cursor)
+      local location = libclang.location_from_cursor(self.toolchain.lib, cursor, entry.compile.cwd)
+      if alias and location then
+        local located_file = self.toolchain.lib.clang_getFile(tu, location.path)
+        if located_file ~= nil and tonumber(self.toolchain.lib.clang_File_isEqual(file, located_file)) ~= 0 then
+          location.path = query_path
+        end
+      end
+      return location
     end
 
     local loc = self.toolchain.lib.clang_getLocation(tu, file, query.line, query.column)
@@ -412,10 +466,10 @@ do
     end
     local definition = nil
     if self.toolchain.lib.clang_Cursor_isNull(definition_cursor) == 0 then
-      definition = libclang.location_from_cursor(self.toolchain.lib, definition_cursor, entry.compile.cwd)
+      definition = source_location(definition_cursor)
     end
     local usr = libclang.cxstring_to_string(self.toolchain.lib, self.toolchain.lib.clang_getCursorUSR(canonical))
-    local declaration = libclang.location_from_cursor(self.toolchain.lib, canonical, entry.compile.cwd)
+    local declaration = source_location(canonical)
 
     -- libclang intentionally exposes no USR for preprocessing entities.
     -- MacroExpansion still carries a compiler-owned referenced/definition
@@ -431,7 +485,7 @@ do
           self.toolchain.lib.clang_getCursorKindSpelling(semantic_cursor.kind)
         )
       end
-      local semantic_location = libclang.location_from_cursor(self.toolchain.lib, semantic_cursor, entry.compile.cwd)
+      local semantic_location = source_location(semantic_cursor)
       local spelling = libclang.cxstring_to_string(
         self.toolchain.lib,
         self.toolchain.lib.clang_getCursorSpelling(semantic_cursor)
@@ -539,6 +593,8 @@ function M.new(toolchain, opts)
   local store = setmetatable({
     toolchain = toolchain, tus = {}, cdbs = {},
     max_tus = opts.max_tus, idle_evict_ms = opts.idle_evict_ms,
+    max_rss_bytes = opts.max_rss_bytes or math.huge,
+    free_memory_reserve = opts.free_memory_reserve or 0,
   }, TUStore)
   if toolchain.ok then store.index = toolchain.lib.clang_createIndex(0, 0) end
   return store

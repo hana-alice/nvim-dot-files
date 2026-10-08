@@ -214,6 +214,8 @@ def main():
                     help='prove secondary same-context batches with private clangd indexes')
     ap.add_argument('--reuse-verified-only', action='store_true',
                     help='reuse valid receipts without starting cold compiler proofs')
+    ap.add_argument('--batch-proof-limit', type=int, default=None,
+                    help='maximum candidate groups to prove; remaining groups retain original commands')
     ap.add_argument('--verified-batch-store', default=None,
                     help='absolute existing proof-store location for reuse only; caller retains its assets')
     ap.add_argument('--clangd', default=None, help='existing clangd used for batch proof')
@@ -226,6 +228,13 @@ def main():
     ap.add_argument('--jobs', '-j', type=int, default=0,
                     help='clangd-indexer concurrency (default: clamp(8, cpu, 24))')
     args = ap.parse_args()
+    if args.batch_proof_limit is not None:
+        if args.batch_proof_limit < 0:
+            ap.error('--batch-proof-limit must be nonnegative')
+        if not args.verified_batches:
+            ap.error('--batch-proof-limit requires --verified-batches')
+        if args.reuse_verified_only or args.verified_batch_store is not None:
+            ap.error('--batch-proof-limit cannot be combined with --reuse-verified-only or --verified-batch-store')
     if args.verified_batch_store is not None:
         if not args.verified_batches or not args.reuse_verified_only:
             ap.error('--verified-batch-store requires --verified-batches and --reuse-verified-only')
@@ -371,7 +380,8 @@ def main():
             background_entries, batch_metrics = accelerate(
                 super_entries, args.verified_batch_store or os.path.join(os.path.dirname(stable_super_dir), 'verified_batches'),
                 args.clangd, max_group=args.batch_size, verify_missing=not args.reuse_verified_only,
-                server_profile=args.server_profile, max_sources=args.max_mods)
+                server_profile=args.server_profile, max_sources=args.max_mods,
+                max_new_groups=args.batch_proof_limit)
         outputs = [(background_out, json.dumps(background_entries)),
                    (background_out + '.semantic.json', json.dumps(super_entries))]
         if args.idx_output:

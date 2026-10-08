@@ -495,9 +495,11 @@ def validate_receipts(receipt_paths, clangd_path, server_profile=None):
                     continue
                 from clangd_query_profile import validate
                 profile = identities['server_profile']
-                directory = Path(tempfile.mkdtemp(prefix='query-validation-', dir=output))
-                query = validate(observation, observation['entry'], str(executable), profile['query_driver'], directory,
-                    launch_cwd=profile['launch_cwd'], environment=dict(os.environ))
+                # The proof store and immutable asset ancestors are watched.
+                # Query scratch must not change them while validation runs.
+                with tempfile.TemporaryDirectory(prefix='nvim-ue-batch-query-validation-') as scratch:
+                    query = validate(observation, observation['entry'], str(executable), profile['query_driver'], Path(scratch),
+                        launch_cwd=profile['launch_cwd'], environment=dict(os.environ))
                 if query.get('ok') is not True:
                     raise ValueError('receipt-query-profile-invalid: ' + query.get('reason', 'unknown'))
                 checked_queries.add(key)
@@ -1238,7 +1240,7 @@ def _cached_group_matches(record, group, output):
 
 
 def _batch_groups(entries, groups, output, identities, profile, max_group, claimed, memo, metrics,
-                  max_sources=80, verify_missing=False):
+                  max_sources=80, verify_missing=False, prioritize_small=False):
     hints, metrics['group_hints_status'] = _read_group_hints(output)
     lookup = collections.defaultdict(list)
     for indexes in groups.values():
@@ -1275,9 +1277,15 @@ def _batch_groups(entries, groups, output, identities, profile, max_group, claim
     # Accepted hints may cover only part of an otherwise larger chunk. Repack
     # the unclaimed originals so a cached pair cannot suppress their candidacy.
     available = [index for index in range(len(entries)) if index not in claimed]
-    pending = [[available[index] for index in chunk] for chunk in reversed(
+    chunks = [[available[index] for index in chunk] for chunk in
         secondary_unity_chunks([entries[index] for index in available],
-            max_sources=max_sources, max_unities=max_group))]
+            max_sources=max_sources, max_unities=max_group)]
+    if prioritize_small:
+        # A first bounded prepare should prove a small same-context group, not
+        # retain the largest module's independent graphs for the whole budget.
+        chunks.sort(key=lambda chunk: (sum(len(entries[i]['nvim_ue_members']) for i in chunk),
+                                       len(chunk), chunk[0]))
+    pending = list(reversed(chunks))
     while pending:
         chunk = pending.pop()
         if claimed.intersection(chunk):
@@ -1308,7 +1316,7 @@ def _save_group_hints(output, additions):
 
 
 def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify_missing=True, server_profile=None,
-               max_sources=80):
+               max_sources=80, max_new_groups=None):
     """Return (background_entries, metrics); rejected groups keep exact originals.
 
     output_dir must be a private proof/artifact directory, never a live clangd
@@ -1318,16 +1326,27 @@ def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify
     graph replay; only receipts with the complete current identity are reused.
     Compact accepted hints discover noncontiguous groups; max_group remains a
     hard limit and every discovered group goes through the full cache gate.
+    A bounded prepare qualifies at most max_new_groups cache misses and stops
+    qualifying once it has a usable batch. Later identical prepares validate
+    that batch without starting more compilers or changing its publication.
     """
+    if max_new_groups is not None and (type(max_new_groups) is not int or max_new_groups < 0):
+        raise ValueError('batch-proof-limit-must-be-nonnegative')
+    if max_new_groups is not None and not verify_missing:
+        raise ValueError('batch-proof-limit-requires-qualification')
     started = time.monotonic()
     _OWNED_OVERLAY_MEMO.clear()
     output = Path(output_dir).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    invocation = Path(tempfile.mkdtemp(prefix='proof-', dir=output))
+    # Revalidation must be read-only in a watched proof store. Even creating
+    # an empty observation directory revokes the live frozen reader via the
+    # store's protected ancestor watch. Retain a directory only for real work.
+    invocation = None
     groups = collections.defaultdict(list)
     metrics = {'original_ubt_count': sum(_is_ubt(entry) for entry in entries),
-        'batch_count': 0, 'accepted_ubt_count': 0, 'groups': [], 'proof_directory': str(invocation),
-        'cache_hits': 0, 'deferred_group_count': 0}
+        'batch_count': 0, 'accepted_ubt_count': 0, 'groups': [], 'proof_directory': None,
+        'cache_hits': 0, 'deferred_group_count': 0, 'new_proof_count': 0,
+        'qualification_limit': max_new_groups}
     shader = lambda e: Path(e.get('file', '')).suffix.lower() in (
         '.usf', '.ush', '.hlsl', '.hlsli', '.glsl', '.vert', '.frag', '.geom', '.tesc', '.tese', '.comp', '.metal')
     exact = lambda e: not _is_ubt(e) and Path(e.get('file', '')).suffix.lower() in ('.c', '.cc', '.cpp', '.cxx', '.c++')
@@ -1351,7 +1370,8 @@ def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify
     chunk_size = max(1, int(max_group))
     for chunk, hinted_cache in _batch_groups(entries, groups, output, identities, profile,
                                              chunk_size, claimed, inventory_memo, metrics,
-                                             max_sources=max_sources, verify_missing=verify_missing):
+                                             max_sources=max_sources, verify_missing=verify_missing,
+                                             prioritize_small=max_new_groups is not None):
         group_start = time.monotonic()
         record = {'original_indexes': chunk, 'original_ubt_count': len(chunk), 'accepted': False, 'run_metrics': []}
         print('[verified-batch] start group=' + str(chunk[0]) + ' ubt=' + str(len(chunk)), flush=True)
@@ -1385,6 +1405,13 @@ def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify
                 metrics['deferred_group_count'] += 1
                 record['deferred'] = True
                 raise ValueError('verification-not-cached')
+            if not cached and max_new_groups is not None:
+                reason = ('verification-stage-complete' if metrics['batch_count'] else
+                          'verification-budget-exhausted' if metrics['new_proof_count'] >= max_new_groups else None)
+                if reason:
+                    metrics['deferred_group_count'] += 1
+                    record['deferred'] = True
+                    raise ValueError(reason)
             if cached:
                 metrics['cache_hits'] += 1
                 record.update(cached=True, first_proof_seconds=cached['first_proof_seconds'])
@@ -1393,6 +1420,10 @@ def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify
                 candidate, detail = cached['candidate'], {'receipt': cached['candidate']['nvim_ue_batch_receipt'],
                     'candidate_order': cached.get('candidate_order', list(range(len(group))))}
             else:
+                metrics['new_proof_count'] += 1
+                if invocation is None:
+                    invocation = Path(tempfile.mkdtemp(prefix='proof-', dir=output))
+                    metrics['proof_directory'] = str(invocation)
                 evidence['query_profiles'] = list(reused.get('query_profiles', [])) if reused else []
                 group_root = invocation / ('group-' + str(chunk[0]))
                 _observe_queries(group, str(executable.resolve()), profile,
@@ -1441,6 +1472,10 @@ def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify
                 identities=identities, first_proof_seconds=reused['first_proof_seconds'] if reused else record['proof_seconds'])))
         metrics['groups'].append(record)
         if record['accepted']:
+            # Receipts sort their JSON keys. Match that ordering on the first
+            # publication too, or a cache hit rewrites equal CDB commands solely
+            # because the fresh candidate had a different field insertion order.
+            replacements[min(chunk)] = dict(sorted(candidate.items()))
             new_hints.append(_group_hint(group, cache_key))
         print('[verified-batch] ' + ('admitted' if record['accepted'] else 'retained')
             + ' group=' + str(chunk[0]) + ' ubt=' + str(len(chunk))
@@ -1463,7 +1498,8 @@ def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify
         metrics['group_hints_write_status'] = _save_group_hints(output, new_hints)
     metrics.update(output_entries=len(result), retained_ubt_count=metrics['original_ubt_count'] - metrics['accepted_ubt_count'],
                    proof_seconds=round(time.monotonic() - started, 6), baseline_cache_reused=metrics['cache_hits'] > 0)
-    _write(invocation / 'metrics.json', _json(metrics))
+    if invocation is not None:
+        _write(invocation / 'metrics.json', _json(metrics))
     return result, metrics
 
 

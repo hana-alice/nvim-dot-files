@@ -95,7 +95,7 @@ local SPAWN_AUDIT = {
   { p="lua/utils/platform/windows.lua", api="jobstart", a="vim.fn.jobstart(command, { detach = true }", class="detached", reason="Explorer opener/revealer" },
   { p="lua/workarounds/libuv/content_events.lua", api="jobstart", a="vim.fn.jobstart(command, options)", class="long-lived", reason="parent-bound native content watcher owned until editor exit", guard="task_registry" },
   { p="lua/utils/restart.lua", api="spawn", a="uv.spawn(exe", class="interactive", reason="explicit editor restart handoff" },
-  { p="lua/utils/ue_goto/semantic_client_runtime.lua", api="jobstart", a="vim.fn.jobstart({", class="interactive", reason="compiler-semantic sidecar for active gd" },
+  { p="lua/utils/ue_goto/semantic_client_runtime.lua", api="jobstart", a="vim.fn.jobstart({", class="long-lived", reason="owned compiler-semantic service; background warmup is admitted and lower priority", guard='client.set_priority(pending.background and "low" or "normal")' },
   { p="lua/utils/ue_goto/semantic_sidecar_catalog.lua", api="vim.system", a="vim.system(args", class="subprocess-only", reason="bounded compiler probe inside headless sidecar" },
   { p="lua/utils/ue_goto/semantic_sidecar_libclang.lua", api="vim.system", a="vim.system(cmd", class="subprocess-only", reason="bounded compiler probe inside headless sidecar" },
   { p="lua/utils/ue_launch.lua", api="vim.system", a="vim.system(cmd", class="interactive", reason="explicit target launch waits only for PID handoff" },

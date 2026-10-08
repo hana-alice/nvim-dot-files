@@ -677,7 +677,7 @@ t.describe("manifest 随产物落盘（不再等全链路成功）", function()
     -- manifest 写出必须早于 promotion 的**调用点**。
     -- 注意不能直接 find("publish_semantic_cdb") —— 那会先命中函数**定义**
     -- （M.publish_semantic_cdb = function ...，位置远在前面），使断言失去意义。
-    local write_at = s:find("write_json_file%(index_manifest_path")
+    local write_at = s:find("write_json_file%(manifest_path")
     local promote_at = s:find("M%.publish_semantic_cdb%(ctx")
     t.assert_type(write_at, "number", "未找到 manifest 写出")
     t.assert_type(promote_at, "number", "未找到 promotion 调用点")
@@ -1326,6 +1326,14 @@ t.describe("受控 CDB 相同标准字段不触碰发布文件", function()
         t.assert_true(state.index_selection.artifact_fingerprint ~= current.artifact_fingerprint)
         t.assert_eq(read(ctx.paths.semantic_cdb), initial_bytes)
         t.assert_eq(restarts, 0, "phase promotion alone must not interrupt the same published workload")
+        local manifest_path = index.index_manifest_path(ctx.paths.full_index)
+        local manifest_bytes = read(manifest_path)
+        local manifest_stat = vim.uv.fs_stat(manifest_path)
+        build()
+        t.assert_eq(read(manifest_path), manifest_bytes, "identical build must preserve manifest bytes")
+        t.assert_true(vim.deep_equal(vim.uv.fs_stat(manifest_path).mtime, manifest_stat.mtime),
+          "identical build must not rewrite the manifest")
+        t.assert_eq(restarts, 0, "identical prepare must preserve the current reader")
 
         state.index_artifacts.current = nil
         entry.arguments[2] = "-DCHANGED=1"

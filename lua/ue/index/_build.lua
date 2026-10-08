@@ -459,8 +459,7 @@ M.build_phase_async = function(ctx, phase)
   local server_profile, profile_error = require("ue.index.batch_runtime").server_profile(
     require("ue").clangd_cmd(ctx.engine_root), process_config)
   if clangd.ok and not profile_error then
-    vim.list_extend(cmd, { "--verified-batches", "--reuse-verified-only",
-      "--clangd", clangd.path, "--batch-size", "8" })
+    vim.list_extend(cmd, { "--verified-batches", "--clangd", clangd.path, "--batch-size", "8" })
     -- A project/target-scoped selection points at immutable qualified assets.
     -- It selects where to look; only the existing receipt checks grant reuse.
     local store_path = fs.join(vim.fs.dirname(ctx.paths.semantic_cdb), "batch-store.json")
@@ -475,6 +474,15 @@ M.build_phase_async = function(ctx, phase)
         return fail_before_spawn("invalid batch-store.json: expected schema=1 and an absolute proof-store path")
       end
       vim.list_extend(cmd, { "--verified-batch-store", store.path })
+      vim.list_extend(cmd, { "--reuse-verified-only" })
+    elseif phase == "full" then
+      -- The existing async generator and writer lease own qualification. Keep
+      -- first delivery bounded; current/hot and externally selected immutable
+      -- stores only reuse receipts. An admitted local batch ends this stage so
+      -- an unchanged prepare never expands/reindexes it merely to fill a budget.
+      vim.list_extend(cmd, { "--batch-proof-limit", "2" })
+    else
+      vim.list_extend(cmd, { "--reuse-verified-only" })
     end
     if server_profile then vim.list_extend(cmd, { "--server-profile", vim.json.encode(server_profile) }) end
   end
@@ -634,7 +642,9 @@ M.build_phase_async = function(ctx, phase)
           completed_at = live_state.index_timings[phase].finished_at,
         })
         live_state.index_artifacts[phase] = manifest
-        local ok_write = write_json_file(index_manifest_path(out_idx), manifest)
+        local manifest_path = index_manifest_path(out_idx)
+        local previous = core.h.read_index_manifest(manifest_path)
+        local ok_write = vim.deep_equal(previous, manifest) or write_json_file(manifest_path, manifest)
         if not ok_write then
           -- Without the manifest the artifact is unrecoverable next session, so a
           -- failed write must be visible rather than silently degrading.

@@ -1,6 +1,8 @@
 local semantic_context = require("utils.ue_goto.semantic_context")
 local libclang = require("utils.ue_goto.semantic_sidecar_libclang")
 local cdb_shards = require("ue.cdb.shards")
+local compile_command = require("utils.ue_goto.reading_compile")
+local cdb_cache = require("utils.ue_goto.semantic_cdb_cache")
 
 local M = {}
 
@@ -47,6 +49,8 @@ local function collect_evidence_files(roots, active, subject)
     local json_backslash = backslash:gsub("\\", "\\\\")
     local args = {
       rg,
+      "--threads", "1",
+      "--no-ignore",
       "--files-with-matches",
       "--fixed-strings",
       "--ignore-case",
@@ -95,6 +99,42 @@ local function collect_evidence_files(roots, active, subject)
   return cpp_json, depfiles, "filesystem-scan"
 end
 
+local function processed_compile(commands_by_file, membership_db, compile_file, members, dependencies)
+  local main = semantic_context.match_key(compile_file)
+  if not dependencies[main] then return nil, "dep-context-primary-input-unproven" end
+  local donors = membership_db.by_file[main] and commands_by_file[main] or {}
+  if #donors == 0 then
+    for _, member in ipairs(members) do
+      local key = semantic_context.match_key(member)
+      if dependencies[key] and membership_db.by_file[key] then
+        vim.list_extend(donors, commands_by_file[key] or {})
+      end
+    end
+  end
+  local compile, fingerprint
+  local donor_sources, seen = {}, {}
+  for _, donor in ipairs(donors) do
+    -- Preserve the merged command's PCH, forced includes, VFS and compatibility
+    -- fixes. The raw RSP proves its primary input; it is not the parse argv.
+    local rebound = compile_command.rebind(donor, donor.file, compile_file)
+    if not rebound then return nil, "dep-context-main-file-unproven" end
+    local current = semantic_context.compile_descriptor_fingerprint(
+      rebound.workingDirectory, compile_file, rebound.compilationCommand)
+    if fingerprint and fingerprint ~= current then
+      return nil, "dep-context-donor-environment-conflict"
+    end
+    fingerprint = current
+    compile = { file = compile_file, directory = rebound.workingDirectory, argv = rebound.compilationCommand }
+    local key = semantic_context.match_key(donor.file)
+    if not seen[key] then
+      seen[key] = true
+      donor_sources[#donor_sources + 1] = donor.file
+    end
+  end
+  table.sort(donor_sources)
+  return compile, nil, donor_sources
+end
+
 local Catalog = {}
 Catalog.__index = Catalog
 
@@ -103,7 +143,7 @@ do
     local started = libclang.uv.hrtime()
     local cdb_path = libclang.join(request.cdb_dir, "compile_commands.json")
     local active_cdb_path = request.active_cdb_path or cdb_path
-    local fresh, freshness_reason = libclang.active_cdb_is_fresh(
+    local fresh, freshness_reason, verified = libclang.active_cdb_is_fresh(
       cdb_path, active_cdb_path, request.active_manifest_path)
     if not fresh then
       return {
@@ -117,8 +157,9 @@ do
         metrics = self.metrics({ total_ms = libclang.duration_ms(started) }),
       }
     end
-    local entries = libclang.read_json(cdb_path)
-    if type(entries) ~= "table" then
+    local compile_db, compile_error, merged_readable = self.compilation_databases:load(cdb_path,
+      verified and verified[libclang.normalize(cdb_path)])
+    if not merged_readable then
       return {
         v = self.protocol.VERSION,
         id = request.id,
@@ -130,8 +171,9 @@ do
         metrics = self.metrics({ total_ms = libclang.duration_ms(started) }),
       }
     end
-    local active_entries = libclang.read_json(active_cdb_path)
-    if type(active_entries) ~= "table" then
+    local membership_db, membership_error, active_readable = self.compilation_databases:load(active_cdb_path,
+      verified and verified[libclang.normalize(active_cdb_path)])
+    if not active_readable then
       return {
         v = self.protocol.VERSION,
         id = request.id,
@@ -144,8 +186,6 @@ do
       }
     end
 
-    local compile_db, compile_error = semantic_context.load_compilation_database(entries)
-    local membership_db, membership_error = semantic_context.load_compilation_database(active_entries)
     if not compile_db or not compile_db.complete or not membership_db or not membership_db.complete then
       local failed, detail = membership_db, membership_error
       if not compile_db or not compile_db.complete then failed, detail = compile_db, compile_error end
@@ -156,6 +196,16 @@ do
           rejected = failed and failed.rejected or { { reason = detail or "cdb-unreadable" } } },
         metrics = self.metrics({ total_ms = libclang.duration_ms(started) }),
       }
+    end
+    local after_verified
+    fresh, freshness_reason, after_verified = libclang.active_cdb_is_fresh(cdb_path, active_cdb_path, request.active_manifest_path)
+    if fresh and verified and not vim.deep_equal(verified, after_verified) then
+      fresh, freshness_reason = false, "cdb-changed-during-proof"
+    end
+    if not fresh then
+      return { v = self.protocol.VERSION, id = request.id, op = "catalog", ok = true, state = "unavailable",
+        reason = freshness_reason, contexts = {},
+        metrics = self.metrics({ total_ms = libclang.duration_ms(started) }) }
     end
     local cpp_paths, dep_paths, discovery = collect_evidence_files(
       request.evidence_roots,
@@ -181,8 +231,16 @@ do
     common.records = cpp_records
     local contexts = semantic_context.proven_contexts_from_cpp_json(common)
 
-    local dep_records = {}
     local dep_contexts = {}
+    local dep_context_error
+    local commands_by_file = {}
+    -- Build once per request and retain every command, including conflicting
+    -- duplicates. A common header must not rescan the whole CDB per depfile.
+    for _, entry in ipairs(compile_db.entries) do
+      local key = semantic_context.match_key(entry.file)
+      commands_by_file[key] = commands_by_file[key] or {}
+      commands_by_file[key][#commands_by_file[key] + 1] = entry
+    end
     for _, path in ipairs(dep_paths) do
       local text = libclang.read_all(path)
       local dep = text and semantic_context.parse_depfile(text) or nil
@@ -197,81 +255,55 @@ do
         end
       end
       if dep and subject_in_dep then
-        local compile_file
         local source_dependencies = {}
+        local dependencies = {}
         for _, dependency in ipairs(dep.dependencies or {}) do
+          dependencies[semantic_context.match_key(dependency)] = true
           if source_like(dependency) then
             source_dependencies[#source_dependencies + 1] = dependency
-            if not compile_file then compile_file = dependency end
           end
         end
         local rsp_path = path:gsub("%.d$", ".o.rsp")
         local rsp_text = libclang.read_all(rsp_path)
         local rsp_tokens = rsp_text and semantic_context.parse_rsp_tokens(rsp_text) or nil
-        compile_file = semantic_context.rsp_source_file(rsp_tokens) or compile_file
+        local compile_file = semantic_context.rsp_source_file(rsp_tokens)
+        if not compile_file and #source_dependencies == 1 then compile_file = source_dependencies[1] end
 
         local unity_members = {}
         local unity_text = compile_file and libclang.read_all(compile_file) or nil
         if unity_text then
           unity_members = semantic_context.parse_unity_membership(unity_text, compile_file) or {}
         end
-        local donor = compile_file and compile_db.by_file[semantic_context.match_key(compile_file)] or nil
-        if not donor then
-          for _, dependency in ipairs(source_dependencies) do
-            donor = compile_db.by_file[semantic_context.match_key(dependency)]
-            if donor then break end
-          end
+        local compile, reason, donor_sources
+        if compile_file then
+          compile, reason, donor_sources = processed_compile(
+            commands_by_file, membership_db, compile_file, unity_members, dependencies)
         end
-        if not donor then
-          for _, member in ipairs(unity_members) do
-            donor = compile_db.by_file[semantic_context.match_key(member)]
-            if donor then break end
-          end
-        end
-
-        local proven_members = {}
-        for _, dependency in ipairs(source_dependencies) do
-          if compile_db.by_file[semantic_context.match_key(dependency)] then
-            proven_members[#proven_members + 1] = dependency
-          end
-        end
-        if #proven_members > 0 then unity_members = proven_members end
-
-        if compile_file and rsp_tokens and #rsp_tokens > 0 and donor then
-          local argv = { donor.argv[1] }
-          vim.list_extend(argv, rsp_tokens)
+        if compile then
           local context = semantic_context.make_proven_context({
             project_root = request.project_root or request.engine_root,
             active_build_key = request.active_build_key,
             origin_tu = compile_file,
-            compile = {
-              file = compile_file,
-              directory = donor.directory,
-              argv = argv,
-            },
+            compile = compile,
             toolchain_identity = self.toolchain.toolchain_identity,
             evidence = {
-              kind = "clang-d-rsp-unity",
+              kind = rsp_tokens and "clang-d-rsp-unity" or "clang-d",
               header = libclang.normalize(request.header),
               depfile_path = path,
               rsp_path = rsp_path,
               unity_path = compile_file,
               unity_members = unity_members,
+              donor_sources = donor_sources,
             },
           })
           if context then dep_contexts[#dep_contexts + 1] = context end
-        elseif compile_file then
-          dep_records[#dep_records + 1] = {
-            depfile = dep,
-            depfile_path = path,
-            compile_file = compile_file,
-          }
+        elseif reason == "dep-context-donor-environment-conflict" or reason == "dep-context-main-file-unproven" then
+          dep_context_error = reason
         end
       end
     end
-    common.records = dep_records
-    vim.list_extend(contexts, semantic_context.proven_contexts_from_dep_records(common))
     vim.list_extend(contexts, dep_contexts)
+    if dep_context_error then contexts = {} end
 
     local unique, wire = {}, {}
     for _, context in ipairs(contexts) do
@@ -301,7 +333,7 @@ do
       op = "catalog",
       ok = true,
       state = state,
-      reason = #wire == 0 and "no-proven-context" or nil,
+      reason = dep_context_error or (#wire == 0 and "no-proven-context" or nil),
       contexts = wire,
       metrics = self.metrics({
         total_ms = libclang.duration_ms(started),
@@ -316,6 +348,7 @@ end
 function M.new(deps)
   return setmetatable({
     toolchain = deps.toolchain, protocol = deps.protocol, metrics = assert(deps.metrics),
+    compilation_databases = deps.compilation_databases or cdb_cache.new(),
   }, Catalog)
 end
 

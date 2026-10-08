@@ -156,6 +156,8 @@ def main():
                         help="prove secondary same-context batches with private clangd indexes")
     parser.add_argument("--reuse-verified-only", action="store_true",
                         help="reuse valid receipts without starting cold compiler proofs")
+    parser.add_argument("--batch-proof-limit", type=int, default=None,
+                        help="maximum candidate groups to prove; remaining groups retain original commands")
     parser.add_argument("--verified-batch-store", default=None,
                         help="absolute existing proof-store location for reuse only; caller retains its assets")
     parser.add_argument("--clangd", default=None, help="existing clangd used for batch proof")
@@ -166,6 +168,13 @@ def main():
     parser.add_argument("--subset-request", help="small ordered current/hot subset request JSON")
     parser.add_argument("--nvim", help="absolute Neovim executable for the isolated subset worker")
     args = parser.parse_args()
+    if args.batch_proof_limit is not None:
+        if args.batch_proof_limit < 0:
+            parser.error("--batch-proof-limit must be nonnegative")
+        if not args.verified_batches:
+            parser.error("--batch-proof-limit requires --verified-batches")
+        if args.reuse_verified_only or args.verified_batch_store is not None:
+            parser.error("--batch-proof-limit cannot be combined with --reuse-verified-only or --verified-batch-store")
     if args.verified_batch_store is not None:
         if not args.verified_batches or not args.reuse_verified_only:
             parser.error("--verified-batch-store requires --verified-batches and --reuse-verified-only")
@@ -369,7 +378,7 @@ def main():
             background_cdb, batch_metrics = accelerate(
                 semantic_cdb, args.verified_batch_store or os.path.join(os.path.dirname(stable_super_dir), "verified_batches"),
                 args.clangd, max_group=args.batch_size, verify_missing=not args.reuse_verified_only,
-                server_profile=args.server_profile)
+                server_profile=args.server_profile, max_new_groups=args.batch_proof_limit)
         marker = {
             "schema": 1,
             "index_kind": "controlled-background",

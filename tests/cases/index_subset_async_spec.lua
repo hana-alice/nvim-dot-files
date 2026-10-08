@@ -248,6 +248,7 @@ t.describe("index subset runs outside the editor thread", function()
         if vim.tbl_contains(command, "--verified-batches") then
           t.assert_eq(argument("--verified-batch-store"), store)
           t.assert_true(vim.tbl_contains(command, "--reuse-verified-only"), "automatic external-store use must never qualify")
+          t.assert_nil(argument("--batch-proof-limit"))
         end
         if phase ~= "full" then
           t.assert_true(argument("--nvim") ~= nil)
@@ -280,6 +281,26 @@ t.describe("index subset runs outside the editor thread", function()
           t.assert_nil(command, "invalid selection must fail before generator dispatch")
           t.assert_nil(index._rt.job)
           t.assert_nil(file_lock.owner(ctx.paths.index_state .. ".build.lock"), "failed selection must release the lease")
+          t.assert_eq(read(ctx.paths.semantic_cdb), "previous-publication")
+        end
+        vim.fn.delete(vim.fs.dirname(ctx.paths.semantic_cdb) .. "/batch-store.json")
+        for _, phase in ipairs({ "current", "hot", "full" }) do
+          t.assert_true(index.build_phase_async(ctx, phase))
+          local function argument(flag)
+            for position, value in ipairs(command) do
+              if value == flag then return command[position + 1] end
+            end
+          end
+          t.assert_nil(argument("--verified-batch-store"))
+          if phase == "full" then
+            t.assert_eq(argument("--batch-proof-limit"), "2")
+            t.assert_false(vim.tbl_contains(command, "--reuse-verified-only"))
+          else
+            t.assert_true(vim.tbl_contains(command, "--reuse-verified-only"))
+            t.assert_nil(argument("--batch-proof-limit"))
+          end
+          pending({ code = 1, stdout = "", stderr = "bounded qualification fixture" })
+          t.assert_true(vim.wait(1000, function() return index._rt.job == nil end, 10))
           t.assert_eq(read(ctx.paths.semantic_cdb), "previous-publication")
         end
       end

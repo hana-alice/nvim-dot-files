@@ -79,6 +79,7 @@ end
 local tu_store = require("utils.ue_goto.semantic_sidecar_tu")
 local catalog = require("utils.ue_goto.semantic_sidecar_catalog")
 local definition_resolver = require("utils.ue_goto.semantic_sidecar_definition")
+local cdb_cache = require("utils.ue_goto.semantic_cdb_cache")
 
 function Sidecar:_metrics(extra)
   local metrics = self.tu_store:_metrics(extra)
@@ -97,6 +98,7 @@ function Sidecar:handle_lookup_definition(request)
 end
 
 function Sidecar:shutdown()
+  self.compilation_databases:clear()
   self.definitions:evict()
   self.tu_store:shutdown()
 end
@@ -144,7 +146,7 @@ function Sidecar:handle_prove(request)
   local started = libclang.uv.hrtime()
   local cdb_path = request.cdb_path or libclang.join(request.cdb_dir, "compile_commands.json")
   local active_cdb_path = request.active_cdb_path or cdb_path
-  local fresh, freshness_reason = libclang.active_cdb_is_fresh(
+  local fresh, freshness_reason, verified = libclang.active_cdb_is_fresh(
     cdb_path, active_cdb_path, request.active_manifest_path)
   if not fresh then
     return {
@@ -159,8 +161,7 @@ function Sidecar:handle_prove(request)
     }
   end
   local function compile_entry(path)
-    local entries = libclang.read_json(path)
-    local db, detail = semantic_context.load_compilation_database(entries)
+    local db, detail = self.compilation_databases:load(path, verified and verified[libclang.normalize(path)])
     if not db or not db.complete then
       return nil, { complete = false, rejected = db and db.rejected or { { reason = detail or "cdb-unreadable" } } }
     end
@@ -175,6 +176,16 @@ function Sidecar:handle_prove(request)
       coverage = merged_coverage or active_coverage,
       metrics = self:_metrics({ total_ms = libclang.duration_ms(started) }),
     }
+  end
+  local after_verified
+  fresh, freshness_reason, after_verified = libclang.active_cdb_is_fresh(cdb_path, active_cdb_path, request.active_manifest_path)
+  if fresh and verified and not vim.deep_equal(verified, after_verified) then
+    fresh, freshness_reason = false, "cdb-changed-during-proof"
+  end
+  if not fresh then
+    return { v = protocol.VERSION, id = request.id, op = "prove", ok = true, state = "unavailable",
+      reason = freshness_reason, context_id = request.context_id,
+      metrics = self:_metrics({ total_ms = libclang.duration_ms(started) }) }
   end
   if not active then
     return {
@@ -213,7 +224,7 @@ function Sidecar:handle_prove(request)
     state = "resolved",
     context_id = request.context_id,
     origin_tu = libclang.normalize(request.source),
-    compile = merged,
+    compile = vim.deepcopy(merged),
     compile_command_fingerprint = fingerprint,
     metrics = self:_metrics({ total_ms = libclang.duration_ms(started) }),
   }
@@ -399,6 +410,7 @@ function Sidecar:handle_stats(request)
 end
 
 function Sidecar:handle_evict(request)
+  self.compilation_databases:clear()
   self.definitions:evict()
   local evicted = self.tu_store:evict(request)
 
@@ -458,16 +470,22 @@ end
 function M.new(opts)
   opts = opts or {}
   local toolchain = libclang.discover_toolchain(opts.toolchain)
-  local max_tus = tonumber(opts.max_tus or vim.env.UE_SEMANTICD_MAX_TUS or 1) or 1
+  local max_tus = tonumber(opts.max_tus or vim.env.UE_SEMANTICD_MAX_TUS or 4) or 4
+  local total_memory = libclang.uv.get_total_memory()
+  local max_rss_bytes = tonumber(opts.max_rss_bytes or vim.env.UE_SEMANTICD_MAX_RSS_BYTES)
+    or math.min(12 * 1024 ^ 3, total_memory * 0.2)
   local max_lookup_entries = tonumber(
     opts.max_lookup_entries or vim.env.UE_SEMANTICD_MAX_LOOKUP_ENTRIES or 128
   ) or 128
   local idle_evict_ms = tonumber(
-    opts.idle_evict_ms or vim.env.UE_SEMANTICD_IDLE_EVICT_MS or 30000
-  ) or 30000
+    opts.idle_evict_ms or vim.env.UE_SEMANTICD_IDLE_EVICT_MS or 300000
+  ) or 300000
   local instance = setmetatable({ toolchain = toolchain, protocol = protocol }, Sidecar)
+  instance.compilation_databases = cdb_cache.new()
   instance.tu_store = tu_store.new(toolchain, {
     max_tus = math.max(1, math.floor(max_tus)),
+    max_rss_bytes = math.max(1, math.floor(max_rss_bytes)),
+    free_memory_reserve = math.max(2 * 1024 ^ 3, total_memory * 0.1),
     idle_evict_ms = math.max(1000, math.floor(idle_evict_ms)),
   })
   instance.definitions = definition_resolver.new({
@@ -480,6 +498,7 @@ function M.new(opts)
   })
   instance.catalog = catalog.new({
     toolchain = toolchain, protocol = protocol,
+    compilation_databases = instance.compilation_databases,
     metrics = function(extra) return instance:_metrics(extra) end,
   })
   return instance

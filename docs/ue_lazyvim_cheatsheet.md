@@ -58,14 +58,47 @@ This file is **derived from code**. After editing any keymap or command:
 ## 🚦 Start Here (the 9 keys you must know)
 
 - `Space`                 → `<leader>`
-- `<leader>sk`            → search keymaps (best discovery)
+- `<leader>uH`            → **main entry: development workbench**
+- `<leader>sk`            → search keymaps
 - `<leader>sh`            → search help
 - `<leader><space>`       → find files (workspace-aware)
 - `<leader>/`             → grep project (Engine + Project)
 - `gd` / `gr`             → goto definition / references
-- `<leader>wM`            → find windows, hidden buffers, results, tasks and logs
 - `u` / `<C-r>`           → undo / redo
 - `.`                     → repeat last change
+
+### Workbench first
+
+Open `<leader>uH` / `:UEWorkbench`; `j` / `k` selects, Enter acts, `r` refreshes,
+`q` closes the view. The first screen has five sections:
+
+| Section | Use it for |
+|---|---|
+| 当前目标 — Current target | View and change project, platform/config, device and package |
+| 下一步 — Next step | `g`: first-use guide; select build, run or environment checks |
+| 最近结果 — Recent results | Inspect errors and output belonging to a numbered build |
+| 运行中任务 — Running tasks | Enter inspects output or task details |
+| 恢复 — Recovery | `R`: choose what to recover |
+
+The first-use guide advances through missing project → platform/config →
+target-required device/package → explicitly confirmed `:UEPrepare` → `:UEDoctor`.
+Esc cancels the flow; `q` also cancels selection lists in normal mode, while `q`
+in input mode remains text. Cancellation cannot launch a later task. Prepare requires its own confirmation.
+
+The Recovery picker opens in input mode: Ctrl-N / Ctrl-P or arrow keys select,
+Enter confirms. Its window/file/result item is “找回关掉的窗口、文件或结果”.
+
+| Recovery intent | Existing entry called |
+|---|---|
+| Closed logs / recent build log | `:UEWorkspace logs` / the recent build's retained output |
+| Closed windows, files or results | `:UEWorkspace` |
+| Continue an investigation | `:UEWorkContext` |
+| Previous session | `:UESessionRestore` |
+| Abnormal-exit unsaved text | `:UERecovery` |
+
+Workbench `p` opens the searchable command hub. Existing `<leader>P`,
+`<leader>uu`, `<leader>uk`, and `<leader>wM` remain direct shortcuts.
+See the [task guide](USER_GUIDE.md) and [retention / validation limits](USER_GUIDE_LIMITS.md).
 
 ---
 
@@ -623,7 +656,7 @@ The six sidebar views share the same left panel. The Git menu item and
 | `<leader>bp`          | Toggle pin buffer (LazyVim)          |
 | `<leader>bD`          | Delete buffer and window (LazyVim)   |
 | `<leader>bc`          | Smart close: window/buffer/float     |
-| `<leader>wM` / `:UEWorkspace` | Find windows, hidden buffers, results, tasks and logs |
+| `<leader>wM` / `:UEWorkspace` | Direct shortcut for workbench Recovery: windows, files, results, tasks and logs |
 | `<leader>-`           | Horizontal split (LazyVim)           |
 | `<leader>\|`          | Vertical split (LazyVim)             |
 | `<C-h/j/k/l>`         | Move between windows (LazyVim)       |
@@ -634,7 +667,8 @@ The six sidebar views share the same left panel. The Git menu item and
 | `<leader><tab>d`      | Close tab (LazyVim)                  |
 | `<leader><tab>o`      | Close other tabs (LazyVim)           |
 
-After `<C-w>q`, use `<leader>wM` to focus an existing window or reopen a retained
+After `<C-w>q`, use workbench `<leader>uH` → `R` → closed windows/files/results,
+or the direct shortcut `<leader>wM`, to focus an existing window or reopen a retained
 hidden buffer, result or log. Windows from every tab are included; hidden dirty
 buffers keep their content. Closing a managed output view does not cancel or
 restart its job. If the buffer or result was already deleted/evicted, the entry
@@ -903,6 +937,7 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 
 | Key / Command             | Action                              |
 |---------------------------|-------------------------------------|
+| `<leader>uH` / `:UEWorkbench` | Main entry: current target / next step / recent results / running tasks / Recovery; `g` guide, `R` recovery, `p` searchable actions |
 | `<leader>uP`              | `:UESetProject` — set project root  |
 | `<leader>uA`              | `:UESetAndroidDevice` — select Android device (name + serial) for this Neovim session |
 | `:UESetPlatform`          | Interactive platform+config select  |
@@ -912,8 +947,7 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `<leader>uE`              | `:UEBuildFirstError`: jump directly to the first source error of the latest build |
 | `<leader>uJ`              | `:UEPanelNext`: cycle build / quickfix / logcat / tasks in one bottom window (normal/terminal) |
 | `:UEPanel build` / `quickfix` / `logcat` / `tasks` | Select a bottom panel; tasks: Enter inspects, `dd` / Ctrl-X stops, `r` refreshes |
-| `<leader>uH` / `:UEWorkbench` | Current target, next actions, run-owned errors/output and task inspection; `r` refresh, `q` close view |
-| `:UEWorkContext` / `save` | Continue or save a named investigation: file locations, original search intent and next step; metadata survives restart |
+| `:UEWorkContext` / `save` | Direct save/continue investigation; workbench saves, Recovery continues; locations, search intent and next step |
 | `:UEWorkContext add` / `note` / `search` | Explicitly associate the current file, edit next-step text or choose a complete search recipe; no automatic replay |
 | `:UEPanel history` / build `gH` | Select retained recent stage output (up to 16); background completion keeps source focus |
 | `:UERunProfileSave [name]` / `:UERunProfile [name]` / `:UERunProfileDelete [name]` | Save, preview/apply, delete named target/config/package/mode; device serial stays process-local |
@@ -921,7 +955,7 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `:UERename` / `:UECodeActions` | Actual LSP edits → multi-file preview → confirm; no auto-save |
 | `:UERefactorUndo` / `:UERefactorRecovery` | Undo the last owned batch without overwriting later input / inspect recovery evidence |
 | `:UENewClass` / `:UETests` | Preview a class in an existing project module / explicit Editor test discovery, run, results, failed rerun |
-| `:UESessionRestore [lazy\|full]` / `:UERecovery [all]` | Restore source names on demand / recover abnormal-exit text into new unnamed buffers |
+| `:UESessionRestore [lazy\|full]` / `:UERecovery [all]` | Direct shortcuts for workbench Recovery: previous session / abnormal-exit text |
 | `:UECompileForNvim`       | Compatibility entry: build current target, then delegate to the normal `UEPrepare` path |
 | `:UEBuildIOS`             | Build IOS C++ through native macOS UBT; safely reuse unchanged AOT outputs and defer dSYM |
 | `:UEIOSSetup`             | Optional explicit rerun of IOS prepared identity/private-key/device setup |
@@ -932,7 +966,7 @@ runtime `uA / ub / us / uq / ug / ui / ul / uL / uD / up`), `lua/plugins/snacks.
 | `:UEInstallIOS`           | CoreDevice: install current packaged `.app`; pre-iOS17: stream signing/upload/Upgrade progress through prepared `InstallIOSClient.sh`; never uninstall or launch |
 | `<leader>us`              | `:UEBuildAndroidSO` — export + execute UBT compile/link actions (no Deploy/Gradle/APK) |
 | `<leader>uq`              | `:UEDeployAndroidSO` — strip, push, atomically replace and verify `libUE4.so`; leaves the app stopped |
-| `<leader>P`               | `:UEHub` — searchable list of every UE action for the active target, with its key shown |
+| `<leader>P`               | Direct `:UEHub`; also workbench `p` — grouped searchable actions and existing keys |
 | `<leader>uu`              | `:UETarget` — show and switch project / platform / device / package in one place |
 | `<leader>uk`              | Run the command that fixes the last reported failure (e.g. select a device) |
 | `<F5>` / `<S-F5>`         | No session: run the target loop (Android: build SO → deploy → debug-launch). In a session: continue. `<S-F5>` stops |

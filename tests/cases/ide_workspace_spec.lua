@@ -517,8 +517,19 @@ t.describe("ide_workspace: searchable entry contracts", function()
       end
     end
     t.assert_true(found)
-    for _, group in ipairs({ "Search", "Windows", "Results", "Tasks", "Logs", "Read" }) do
+    for _, group in ipairs({ "Work", "Recovery", "Search", "Tasks", "Logs", "Read" }) do
       t.assert_true(groups[group], group)
+    end
+    local routes = {}
+    for _, action in ipairs(require("utils.ue_hub").visible_actions({ platform = "", state = {} })) do
+      if action.command and action.command:find("UEWorkspace", 1, true) then
+        t.assert_eq(action.group, "Recovery")
+        t.assert_true(action.readiness.ready)
+        routes[action.command] = true
+      end
+    end
+    for _, route in ipairs({ "UEWorkspace", "UEWorkspace windows", "UEWorkspace buffers", "UEWorkspace results", "UEWorkspace tasks", "UEWorkspace logs" }) do
+      t.assert_true(routes[route], route)
     end
   end)
 end)

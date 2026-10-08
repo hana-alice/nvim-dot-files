@@ -138,7 +138,9 @@ t.describe("ue hub: keyboard-first command surface", function()
         groups[action.group], last = true, action.group
       end
     end
-    t.assert_contains(hub.format_action(android[1]), "<F5>")
+    t.assert_contains(hub.format_action(android[1]), "<leader>uH")
+    local f5 = vim.tbl_filter(function(action) return action.key == "<F5>" end, android)
+    t.assert_eq(#f5, 1, "the original F5 route remains available")
   end)
 
   t.it("hub commands reference registered user commands", function()

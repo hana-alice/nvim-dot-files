@@ -18,11 +18,6 @@
 
 local M = {}
 
--- Shared, target-agnostic adapter plumbing (adapter resolution + env sanitation).
--- Required directly rather than injected: it is not target knowledge, and both
--- this module and the owner legitimately depend on it.
-local C = require("ue.dap._common")
-
 local deps = {
   log = false,                       -- utils.log 兼容对象
   find_engine_root_from_cwd = false, -- fun(): string|nil
@@ -56,24 +51,6 @@ function M.init_commands(session)
         'settings set target.exec-search-paths "%s"', dir))
     end
   end
-  -- UE LLDB pretty-printers for FString / FName / TArray / TMap / FVector …
-  -- Shipped by Epic at  <engine>/Engine/Extras/LLDBDataFormatters/.
-  -- _2ByteChars variant matches UE's default 2-byte TCHAR build (Android,
-  -- Win64, Linux). If user is on a 4-byte TCHAR build they can swap the
-  -- filename via ue.config.dap.lldb_formatter_path.
-  --
-  -- IMPORTANT: Epic's formatter is pure-Python (uses lldb.SBValue API).
-  -- LLVM 22.1.6 Windows minimal builds (the one we ship lldb-dap from)
-  -- DO NOT include the `lldb` Python module — only liblldb.dll + the
-  -- DAP front-end. `command script import` against that build emits
-  --   ModuleNotFoundError: No module named 'lldb'
-  -- to the console (non-fatal, attach continues). To still get *some*
-  -- pretty-printing for the single most common type (FString), we fall
-  -- back to a native `type summary --summary-string` rule which lldb's
-  -- C++ summary engine handles without any Python interpreter.
-  -- FName / TArray / TMap / FVector lose their summaries on that build —
-  -- those types require SBValue.ReadMemory / decode logic that can't be
-  -- expressed in the summary-string mini-language.
   local er = session and session.engine_root
   if not er or er == "" then er = deps.find_engine_root_from_cwd() end
   local cfg_path
@@ -81,112 +58,7 @@ function M.init_commands(session)
   if ok_cfg and ue_cfg and ue_cfg.get then
     cfg_path = ue_cfg.get("dap.lldb_formatter_path")
   end
-  local formatter = cfg_path
-  if (not formatter or formatter == "") and er and er ~= "" then
-    formatter = er .. "/Engine/Extras/LLDBDataFormatters/UE4DataFormatters_2ByteChars.py"
-  end
-
-  -- Detect whether the configured lldb-dap.exe ships the `lldb` Python
-  -- module. Standard LLVM Windows installer layout puts it at
-  --   <install_root>/lib/site-packages/lldb/__init__.py
-  -- (or Lib/site-packages/lldb on python.org-style trees). The minimal
-  -- 22.1.6 build we use has none of those — so we treat missing dir as
-  -- "no Python". This file probe is fast and cached per attach.
-  local dap_exe = (C.find_lldb_dap and C.find_lldb_dap()) or nil
-  local has_python = false
-  if dap_exe and dap_exe ~= "" then
-    local install_root = vim.fs.dirname(vim.fs.dirname(dap_exe))  -- strip /bin/lldb-dap.exe
-    if install_root and install_root ~= "" then
-      for _, sub in ipairs(require("utils.platform").driver().lldb_python_relative_paths()) do
-        local probe = install_root .. "/" .. sub
-        local st = vim.uv and vim.uv.fs_stat(probe) or vim.loop.fs_stat(probe)
-        if st and st.type == "directory" then
-          has_python = true
-          break
-        end
-      end
-    end
-  end
-
-  if formatter and formatter ~= "" and has_python then
-    local f = io.open(formatter, "r")
-    if f then
-      f:close()
-      table.insert(cmds, string.format('command script import "%s"', formatter))
-    else
-      vim.schedule(function()
-        vim.notify(
-          "[ue.dap] LLDB formatter not found: " .. formatter ..
-          "\n(set ue.config.dap.lldb_formatter_path to override)",
-          vim.log.levels.WARN)
-      end)
-    end
-  elseif formatter and formatter ~= "" and not has_python then
-    -- No Python in lldb-dap → fall back to native `type summary` rules.
-    -- These can express anything that's a simple `${var.field}` template;
-    -- they CAN'T express the FName index→string lookup or TArray element
-    -- iteration that Epic's Python formatter does, so we cover only the
-    -- types that have purely-data layouts.
-    --
-    -- Layout references (UE5 stock, 2-byte TCHAR builds):
-    --   FString { TArray<TCHAR> Data }                    where TArray = { AllocatorInstance.Data : TCHAR*, ArrayNum, ArrayMax }
-    --   FVector       { float X, Y, Z }                   (float = double in 5.0+, layout still has X/Y/Z)
-    --   FVector2D     { float X, Y }
-    --   FVector4      { float X, Y, Z, W }
-    --   FIntVector    { int32 X, Y, Z }
-    --   FRotator      { float Pitch, Yaw, Roll }
-    --   FQuat         { float X, Y, Z, W }
-    --   FColor        { uint8 B, G, R, A } (BGRA on disk)
-    --   FLinearColor  { float R, G, B, A }
-    --   FBox          { FVector Min, Max; uint8 IsValid }
-    --   TArray<T>     { Data, ArrayNum, ArrayMax }        — we show count only
-    table.insert(cmds,
-      'type summary add -w UEFallback --summary-string "${var.Data.AllocatorInstance.Data%s}" FString')
-    table.insert(cmds,
-      'type summary add -w UEFallback --summary-string "(X=${var.X} Y=${var.Y} Z=${var.Z})" FVector')
-    table.insert(cmds,
-      'type summary add -w UEFallback --summary-string "(X=${var.X} Y=${var.Y})" FVector2D')
-    table.insert(cmds,
-      'type summary add -w UEFallback --summary-string "(X=${var.X} Y=${var.Y} Z=${var.Z} W=${var.W})" FVector4')
-    table.insert(cmds,
-      'type summary add -w UEFallback --summary-string "(X=${var.X} Y=${var.Y} Z=${var.Z})" FIntVector')
-    table.insert(cmds,
-      'type summary add -w UEFallback --summary-string "(Pitch=${var.Pitch} Yaw=${var.Yaw} Roll=${var.Roll})" FRotator')
-    table.insert(cmds,
-      'type summary add -w UEFallback --summary-string "(X=${var.X} Y=${var.Y} Z=${var.Z} W=${var.W})" FQuat')
-    table.insert(cmds,
-      'type summary add -w UEFallback --summary-string "(R=${var.R} G=${var.G} B=${var.B} A=${var.A})" FColor')
-    table.insert(cmds,
-      'type summary add -w UEFallback --summary-string "(R=${var.R} G=${var.G} B=${var.B} A=${var.A})" FLinearColor')
-    table.insert(cmds,
-      'type summary add -w UEFallback --summary-string "Min=(${var.Min.X},${var.Min.Y},${var.Min.Z}) Max=(${var.Max.X},${var.Max.Y},${var.Max.Z}) Valid=${var.IsValid}" FBox')
-    -- TArray<T>: regex match, show element count + capacity. For element
-    -- VALUES the user can expand the Variables panel — lldb already does
-    -- per-element child rendering, so we only need to add a useful summary
-    -- on the parent. -x is regex match, ^TArray<.+>$ catches all instantiations.
-    table.insert(cmds,
-      'type summary add -w UEFallback -x "^TArray<.+>$" --summary-string "size=${var.ArrayNum} cap=${var.ArrayMax}"')
-    -- TWeakObjectPtr<T>: show whether it's pointing at anything (ObjectIndex==-1
-    -- means null). Layout: { ObjectIndex, ObjectSerialNumber }.
-    table.insert(cmds,
-      'type summary add -w UEFallback -x "^TWeakObjectPtr<.+>$" --summary-string "idx=${var.ObjectIndex} serial=${var.ObjectSerialNumber}"')
-    -- TSharedPtr / TSharedRef: show ref count. Layout: { Object, SharedReferenceCount }
-    -- where SharedReferenceCount is { ReferenceController* } pointing at a
-    -- struct with SharedReferenceCount/WeakReferenceCount. We can only
-    -- safely show the inner pointer.
-    table.insert(cmds,
-      'type summary add -w UEFallback -x "^TSharedPtr<.+>$" --summary-string "obj=${var.Object}"')
-    table.insert(cmds,
-      'type summary add -w UEFallback -x "^TSharedRef<.+>$" --summary-string "obj=${var.Object}"')
-    table.insert(cmds, 'type category enable UEFallback')
-    vim.schedule(function()
-      vim.notify(
-        "[ue.dap] lldb-dap has no Python module — using native UE summary fallback.\n" ..
-        "Covered: FString, FVector*, FRotator, FQuat, FColor*, FBox, TArray, TWeakObjectPtr, TSharedPtr/Ref.\n" ..
-        "FName / UObject->GetName() still require Python bindings or :UEDAPWatchFName command.",
-        vim.log.levels.INFO)
-    end)
-  end
+  vim.list_extend(cmds, require("ue.dap._ue_formatters").commands(er, cfg_path))
   return cmds
 end
 

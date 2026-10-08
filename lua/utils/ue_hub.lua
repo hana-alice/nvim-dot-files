@@ -1,8 +1,7 @@
 -- utils.ue_hub — keyboard-first command hub and target switcher.
 --
--- The UE workflow exposes ~90 `:UE*` commands. Instead of memorising them,
--- one key opens a searchable, grouped action list; another opens the current
--- target (project / platform / device / package) for switching. Entries are
+-- The workbench is the main entry. The command list and target switcher keep
+-- existing direct shortcuts and are also reached from that view. Entries are
 -- declarative so the list is testable and stays in sync with real commands.
 
 local M = {}
@@ -49,7 +48,7 @@ M.actions = {
   { group = "Run",    label = "Run / debug current target (F5 when idle)", key = "<F5>", target_fields = true, run = function() M.run_or_debug() end },
   { group = "Work", label = "Development workbench / 当前开发工作台", key = "<leader>uH", always = true, run = cmd("UEWorkbench") },
   { group = "Work", label = "Save investigation / 保存具名调查", always = true, run = cmd("UEWorkContext save") },
-  { group = "Work", label = "Resume investigation / 继续已保存调查", always = true, run = cmd("UEWorkContext") },
+  { group = "Recovery", label = "Resume investigation / 继续已保存调查", always = true, run = cmd("UEWorkContext") },
   { group = "Run",    label = "Launch app (no debugger)", key = "<leader>ul", target_fields = true, run = cmd("UELaunch") },
   { group = "Code", label = "Go to definition / 跳到定义", key = "gd", run = mapped_key("gd") },
   { group = "Code", label = "References / 查看引用", key = "gr", run = mapped_key("gr") },
@@ -88,8 +87,8 @@ M.actions = {
   { group = "Files", label = "Copy relative path / 复制相对窗口工作目录的路径", key = "<leader>fy", run = mapped_key("<leader>fy") },
   { group = "Files", label = "Copy absolute path / 复制绝对路径", key = "<leader>fA", run = mapped_key("<leader>fA") },
   { group = "Files", label = "Copy file location / 复制文件路径和行列位置", key = "<leader>fY", run = mapped_key("<leader>fY") },
-  { group = "Files", label = "Restore project session / 按需恢复会话", run = cmd("UESessionRestore") },
-  { group = "Files", label = "Recover unsaved text / 恢复异常退出的未保存文本", run = cmd("UERecovery") },
+  { group = "Recovery", label = "Restore project session / 恢复上次会话", run = cmd("UESessionRestore") },
+  { group = "Recovery", label = "Recover unsaved text / 找回异常退出的文本", run = cmd("UERecovery") },
   { group = "Files", label = "Quit with unsaved list / 退出前查看未保存文件", key = "<leader>qq", run = cmd("UEQuit") },
   { group = "Search", label = "Indexed code search / 快速索引搜索", key = "<leader>/", run = function() require("ue").cached_grep() end },
   { group = "Search", label = "Explicit rg code search / 独立代码搜索", key = "<leader>sg", run = mapped_key("<leader>sg") },
@@ -101,12 +100,12 @@ M.actions = {
   { group = "Search", label = "Search history / 按原条件重新搜索", key = "<leader>sH", run = cmd("UESearchHistory") },
   { group = "Search", label = "Resume last search / 恢复最近搜索", key = "<leader>s/", run = mapped_key("<leader>s/") },
   { group = "Search", label = "History hub / 搜索文件跳转与结果历史", key = "<leader>fh", run = mapped_key("<leader>fh") },
-  { group = "Windows", label = "Find or recover a window / 找回关闭的窗口", key = "<leader>wM", run = cmd("UEWorkspace") },
-  { group = "Windows", label = "Visible windows across tabs / 跨标签窗口", run = cmd("UEWorkspace windows") },
-  { group = "Windows", label = "Hidden buffers / 窗口关闭后保留的文件", run = cmd("UEWorkspace buffers") },
-  { group = "Results", label = "Saved search results / 找回保存的搜索结果", run = cmd("UEWorkspace results") },
-  { group = "Tasks", label = "Find tasks and output / 找回任务及日志", run = cmd("UEWorkspace tasks") },
-  { group = "Logs", label = "Retained terminal and stage logs / 找回关闭的任务输出", run = cmd("UEWorkspace logs") },
+  { group = "Recovery", label = "Find or recover a window / 找回关掉的窗口", key = "<leader>wM", run = cmd("UEWorkspace") },
+  { group = "Recovery", label = "Visible windows across tabs / 跨标签窗口", run = cmd("UEWorkspace windows") },
+  { group = "Recovery", label = "Hidden buffers / 窗口关闭后保留的文件", run = cmd("UEWorkspace buffers") },
+  { group = "Recovery", label = "Saved search results / 找回保存的搜索结果", run = cmd("UEWorkspace results") },
+  { group = "Recovery", label = "Find tasks and output / 找回任务及日志", run = cmd("UEWorkspace tasks") },
+  { group = "Recovery", label = "Retained terminal and stage logs / 找回关掉的日志", run = cmd("UEWorkspace logs") },
   { group = "Build",  label = "Build active target", key = "<leader>ub", run = cmd("UEBuild") },
   { group = "Build",  label = "First build error / 首个构建错误", key = "<leader>uE", always = true, run = cmd("UEBuildFirstError") },
   { group = "Tests", label = "UE Editor tests / 发现与运行测试", requires = { "project" }, run = cmd("UETests") },
@@ -264,7 +263,7 @@ function M.visible_actions(target, opts)
   for _, action in ipairs(out) do
     action.readiness = M.action_state(action, target, { contribution = contribution, buf = opts.buf })
   end
-  local first, rank = {}, {}
+  local first, rank = { Work = 0 }, {}
   for index, action in ipairs(out) do
     first[action.group] = first[action.group] or index
     rank[action] = first[action.group] * 1000 + index
@@ -288,6 +287,10 @@ local intent_epoch = 0
 local selection_epoch = 0
 function M.pending_action() return pending_action end
 function M.selection_generation() return selection_epoch end
+function M.cancel_pending_action()
+  intent_epoch = intent_epoch + 1
+  pending_action = nil
+end
 
 local function runtime_identity(target)
   local fields = {}
@@ -295,6 +298,13 @@ local function runtime_identity(target)
     fields[field.name] = field.identity or field.value or false
   end
   return fields
+end
+
+function M.runtime_identity(target) return runtime_identity(target) end
+
+function M.selection_options()
+  local onboarding = package.loaded["utils.ue_onboarding"]
+  return onboarding and onboarding.selection_options() or {}
 end
 
 local function source_valid(pending)
@@ -311,6 +321,8 @@ end
 -- the retained intent; cancelling a picker can never start a delayed build.
 function M.selection_changed()
   selection_epoch = selection_epoch + 1
+  local onboarding = package.loaded["utils.ue_onboarding"]
+  if onboarding then onboarding.selection_changed() end
   local pending = pending_action
   if not pending or pending.checking then return end
   pending.checking = true
@@ -339,6 +351,8 @@ end
 
 function M.invoke_action(action, opts)
   opts = opts or {}
+  local onboarding = package.loaded["utils.ue_onboarding"]
+  if onboarding then onboarding.cancel() end
   intent_epoch = intent_epoch + 1
   pending_action = nil
   local win = opts.source_win or vim.api.nvim_get_current_win()
@@ -406,7 +420,7 @@ function M.invoke_action(action, opts)
   end)
 end
 
-local function pick(items, prompt, format, on_choice)
+local function pick(items, prompt, format, on_choice, on_cancel)
   local ok, snacks = pcall(require, "snacks")
   if ok and snacks.picker then
     return snacks.picker.pick({
@@ -417,6 +431,9 @@ local function pick(items, prompt, format, on_choice)
       format = "text",
       preview = "none",
       layout = { preset = "vscode" },
+      on_close = function(picker)
+        if on_cancel and not picker._ue_chosen then on_cancel() end
+      end,
       confirm = function(picker, choice)
         if picker.closed then return end
         -- Finish insert mode in the picker before restoring its source window.
@@ -424,8 +441,10 @@ local function pick(items, prompt, format, on_choice)
           if picker.closed then
             return
           end
+          picker._ue_chosen = choice ~= nil
           local closed, err = pcall(picker.close, picker)
           if not closed then
+            if on_cancel then on_cancel() end
             vim.notify("未能关闭动作列表，操作已取消: " .. tostring(err), vim.log.levels.WARN)
             return
           end
@@ -441,16 +460,23 @@ local function pick(items, prompt, format, on_choice)
   vim.ui.select(items, { prompt = prompt, format_item = format }, function(choice)
     if choice then
       on_choice(choice)
+    elseif on_cancel then
+      on_cancel()
     end
   end)
 end
 
 --- Searchable hub: grouped actions with their keys shown for learning.
-function M.command_hub()
+function M.command_hub(opts)
+  opts = opts or {}
+  local onboarding = package.loaded["utils.ue_onboarding"]
+  if onboarding then onboarding.cancel() end
   intent_epoch = intent_epoch + 1
   pending_action = nil
   local target = M.target()
-  local source_win = vim.api.nvim_get_current_win()
+  local source_win = opts.source_win or vim.api.nvim_get_current_win()
+  if not vim.api.nvim_win_is_valid(source_win) then return end
+  vim.api.nvim_set_current_win(source_win)
   local source_buf = vim.api.nvim_win_get_buf(source_win)
   local source = {
     epoch = intent_epoch,
@@ -463,8 +489,8 @@ function M.command_hub()
   }
   local runtime = runtime_identity(target)
   return pick(
-    M.visible_actions(target, { buf = source_buf }),
-    "UE  " .. M.target_summary(target),
+    opts.actions or M.visible_actions(target, { buf = source_buf }),
+    opts.title or ("UE  " .. M.target_summary(target)),
     M.format_action,
     function(action)
       if
@@ -503,17 +529,27 @@ function M.target_rows(target)
   }
   for _, field in ipairs(target_hub(target).fields or {}) do
     if not field.doctor_only and field.command then
-      rows[#rows + 1] = { label = field.label, value = field.value or "(none)", run = cmd(field.command) }
+      rows[#rows + 1] = { label = field.label, name = field.name, value = field.value or "(none)", run = cmd(field.command) }
     end
   end
   return rows
 end
 
-function M.target_switcher()
+function M.target_switcher(opts)
+  opts = opts or {}
+  local onboarding = package.loaded["utils.ue_onboarding"]
+  if onboarding and not opts.guard then onboarding.cancel() end
   local target = M.target()
-  pick(M.target_rows(target), "UE target", function(row)
+  local rows = M.target_rows(target)
+  if opts.row then
+    rows = vim.tbl_filter(function(row) return row.label == opts.row end, rows)
+  end
+  return pick(rows, opts.title or "UE target", function(row)
     return ("%-9s %s"):format(row.label, row.value)
-  end, function(row) row.run() end)
+  end, function(row)
+    if opts.guard and not opts.guard() then return end
+    if opts.invoke then opts.invoke(row.run) else row.run() end
+  end, opts.on_cancel)
 end
 
 --- F5 when no debug session: run the target's own loop when it declares one,

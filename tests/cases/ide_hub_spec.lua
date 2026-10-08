@@ -40,8 +40,13 @@ t.describe("ide_hub: context-aware actions", function()
   t.it("legacy actions remain immutable when annotated for a target", function()
     local before = vim.deepcopy(hub.actions)
     local actions = hub.visible_actions({ project = nil, platform = "Win64", state = {} })
-    t.assert_false(actions[1].readiness.ready)
-    t.assert_contains(hub.format_action(actions[1]), "工程")
+    t.assert_true(actions[1].readiness.ready)
+    t.assert_eq(actions[1].key, "<leader>uH")
+    local build
+    for _, action in ipairs(actions) do
+      if action.key == "<leader>ub" then build = action end
+    end
+    t.assert_contains(hub.format_action(build), "工程")
     t.assert_eq(hub.actions[1].readiness, nil)
     t.assert_eq(hub.actions[1].label, before[1].label)
   end)

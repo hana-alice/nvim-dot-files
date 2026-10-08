@@ -48,22 +48,72 @@ local outcome = {
   unknown = "结果未知",
 }
 
+function M.recovery_actions(target)
+  target = target or require("utils.ue_hub").target()
+  local actions = {}
+  local function add(label, cmd, run)
+    actions[#actions + 1] = {
+      group = "Recovery", label = label, always = true, command = cmd,
+      run = run or function() vim.cmd(cmd) end,
+    }
+  end
+  add("找回关掉的日志", "UEWorkspace logs")
+  add("找回关掉的窗口、文件或结果", "UEWorkspace")
+  local runs = require("utils.verification_runs")
+  local records = target.project_root and runs.list({ project_root = target.project_root }) or {}
+  local recent = records[1]
+  if recent then
+    add("找回最近构建日志 #" .. recent.id, nil, function()
+      local ok, err = runs.show_log(recent.id)
+      if not ok then vim.notify(clean(err), vim.log.levels.WARN) end
+      return ok
+    end)
+  end
+  add("继续已保存调查", "UEWorkContext")
+  add("恢复上次会话", "UESessionRestore")
+  add("找回异常退出的文本", "UERecovery")
+  return actions
+end
+
+function M.recovery(opts)
+  opts = opts or {}
+  return require("utils.ue_hub").command_hub({
+    source_win = opts.source_win,
+    title = "恢复 — 按想做的事选择",
+    actions = M.recovery_actions(),
+  })
+end
+
 --- Build a headless-testable view; selection readiness is not runtime health.
 function M.model(opts)
   opts = opts or {}
   local hub = require("utils.ue_hub")
   local target = opts.target or hub.target()
-  local lines, actions = {}, {}
+  local lines, actions, sections = {}, {}, {}
+  local width = opts.width or 52
   local function add(label, run, info)
+    -- Keep the five sections visible; full identities stay with their owners.
+    local full_label = label
+    if vim.fn.strdisplaywidth(label) > width then
+      local count = vim.fn.strchars(label)
+      repeat
+        count = count - 1
+        label = vim.fn.strcharpart(full_label, 0, count) .. "…"
+      until vim.fn.strdisplaywidth(label) <= width or count == 0
+    end
     lines[#lines + 1] = label
     if run then
-      actions[#lines] = vim.tbl_extend("force", info or {}, { label = label, run = run })
+      actions[#lines] = vim.tbl_extend("force", info or {}, { label = label, full_label = full_label, run = run })
     end
   end
+  local function section(label)
+    sections[#sections + 1] = { label = label, line = #lines + 1 }
+    add(label)
+  end
   add("当前开发工作台")
-  add("Enter 操作 · r 刷新 · q 关闭视图")
+  add("Enter 操作 · g 向导 · R 恢复 · p 命令 · r 刷新 · q 关闭")
   add("")
-  add("当前目标（Enter 修改选择）")
+  section("当前目标（Enter 修改选择）")
   for _, row in ipairs(hub.target_rows(target)) do
     add("  " .. clean(row.label) .. ": " .. clean(row.value), function(win)
       if not editing(win) then
@@ -74,11 +124,20 @@ function M.model(opts)
       return true
     end, { kind = "selection" })
   end
-  add("  选择信息不代表设备在线或索引完成")
   add("  本实例最近状态: " .. clean(vim.g.ueindex_status or "暂无报告"))
-  add("  当前未保存: " .. tostring(tonumber(vim.g.ue_unsaved_count) or 0))
+  add("  > 查看未保存文件: " .. tostring(tonumber(vim.g.ue_unsaved_count) or 0), command("UEUnsaved"))
   add("")
-  add("下一步（构建读取磁盘，不自动保存）")
+  section("下一步（构建读取磁盘，不自动保存）")
+  local onboarding = require("utils.ue_onboarding")
+  local steps, flow = onboarding.steps(target), onboarding.current()
+  if flow then
+    add("  向导: " .. clean(flow.label or "配置检查") .. " · Esc 取消")
+    add("  > 取消首次上手向导", function() return onboarding.cancel() end, { kind = "onboarding_cancel" })
+  elseif #steps > 0 then
+    add("  > 首次上手向导：补齐 " .. steps[1].label .. "（g）", function(win)
+      return onboarding.start({ source_win = win })
+    end, { kind = "onboarding", missing = steps })
+  end
   for _, spec in ipairs({
     { label = "构建当前目标", group = "Build", cmd = "UEBuild" },
     {
@@ -89,10 +148,8 @@ function M.model(opts)
         return hub.run_or_debug()
       end,
     },
-    { label = "查看未保存文件", always = true, cmd = "UEUnsaved" },
     { label = "检查配置", always = true, cmd = "UEDoctor" },
     { label = "刷新索引", requires = { "project", "platform" }, cmd = "UEPrepare" },
-    { label = "找回窗口和结果", always = true, cmd = "UEWorkspace" },
   }) do
     local action = vim.tbl_extend("force", spec, { run = spec.run or function()
       vim.cmd(spec.cmd)
@@ -106,35 +163,25 @@ function M.model(opts)
       return true
     end, { kind = "action", readiness = ready })
   end
+  if hub._pending_fix then
+    add("  > 修复上次失败", function(win)
+      if not editing(win) then return nil, "编辑窗口已关闭。" end
+      vim.api.nvim_set_current_win(win)
+      hub.run_fix()
+      return true
+    end, { kind = "fix" })
+  end
   local loop = package.loaded["ue.workflows.android.iterate"]
   local active = loop and loop.active and loop.active()
   if active then
     add("  活动流程（r 更新）: " .. clean(active.status) .. " · " .. clean(active.stage))
   end
-  add("")
-  add("调查现场（文件位置、搜索条件与下一步）")
   local contexts = require("utils.work_context")
-  local context_state = contexts.status(target)
-  if context_state.state == "unloaded" then
-    add("  尚未读取保存的调查；点继续查看")
-  elseif context_state.state == "loading" then
-    add("  正在读取本工程调查")
-  elseif context_state.state == "error" then
-    add("  读取失败: " .. clean(context_state.error))
-  elseif context_state.state == "cached" then
-    add("  已缓存本次调查；完整列表按继续查看")
-  elseif context_state.count ~= nil then
-    add("  已读取调查: " .. tostring(context_state.count))
-  end
   local investigation = contexts.active(target)
   if investigation then
-    add("  当前调查: " .. clean(investigation.name))
-    add("  下一步: " .. clean(investigation.note ~= "" and investigation.note or "未填写"))
-    add("  > 查看调查文件、条件与原结果", function(win)
+    add("  > 当前调查: " .. clean(investigation.name) .. "（Enter 详情与下一步）", function(win)
       return contexts.details(investigation, { source_win = win })
     end, { kind = "work_context_details", context_id = investigation.id })
-  else
-    add("  尚未选择具名调查")
   end
   add("  > 保存当前调查", function(win)
     if not editing(win) then
@@ -143,26 +190,31 @@ function M.model(opts)
     contexts.prompt_save({ source_win = win })
     return true
   end, { kind = "work_context_save" })
-  add("  > 继续已保存调查", function(win)
-    if not editing(win) then
-      return nil, "编辑窗口已关闭。"
-    end
-    contexts.open({ source_win = win })
-    return true
-  end, { kind = "work_context_resume" })
   add("")
-  add("本工程构建记录（按发起时间）")
+  section("最近结果（本工程构建，按发起时间）")
   local runs = require("utils.verification_runs")
   local records = target.project_root and runs.list({ project_root = target.project_root }) or {}
   if #records == 0 then
     add(target.project_root and "  尚无本实例构建记录" or "  请先选择工程")
   end
-  for _, run in ipairs(records) do
+  for index, run in ipairs(records) do
+    if index > 1 then
+      add("  > 更多构建记录", function(win)
+        local actions = {}
+        for _, record in ipairs(records) do
+          actions[#actions + 1] = { label = "#" .. record.id .. " 输出", always = true, group = "Results",
+            run = function() return runs.show_log(record.id) end }
+          actions[#actions + 1] = { label = "#" .. record.id .. " 错误", always = true, group = "Results",
+            run = function() return runs.show_problems(record.id) end }
+        end
+        return hub.command_hub({ source_win = win, title = "本工程构建记录", actions = actions })
+      end)
+      break
+    end
     add(("  #%d %s"):format(run.id, outcome[run.result] or "结果未知"))
-    add("    " .. clean(run.target) .. " · " .. clean(run.platform) .. " " .. clean(run.configuration))
     add(
       "    "
-        .. clean(run.operation)
+        .. clean(run.platform) .. " " .. clean(run.configuration)
         .. " · 发起时未保存: "
         .. tostring(run.dirty_count_start or "未知")
         .. (run.code ~= nil and (" · exit=" .. tostring(run.code)) or "")
@@ -176,15 +228,14 @@ function M.model(opts)
   end
   add("  历史退出结果不证明当前代码已验证")
   add("")
-  add("后台任务（Enter 查看；停止是独立操作）")
+  section("运行中任务（Enter 查看；停止是独立操作）")
   local registry = require("utils.task_registry")
-  local tasks = registry.list()
+  local tasks = vim.tbl_filter(function(task) return task.status == "running" end, registry.list())
   if #tasks == 0 then
     add("  没有已登记任务")
   end
   for index, task in ipairs(tasks) do
-    if index > 8 then
-      add("  > 查看全部任务", command("UEPanel tasks"))
+    if index > 2 then
       break
     end
     local record = registry.get(task.id)
@@ -195,7 +246,15 @@ function M.model(opts)
       end, { kind = "task", task_id = task.id })
     end
   end
-  return { target = target, lines = lines, actions = actions }
+  add("  > 查看全部任务", command("UEPanel tasks"))
+  add("")
+  section("恢复（按想做的事选择）")
+  add("  > 找回窗口、日志、调查、会话或异常退出文本（R）", function(win)
+    if not editing(win) then return nil, "编辑窗口已关闭。" end
+    M.recovery({ source_win = win })
+    return true
+  end, { kind = "recovery" })
+  return { target = target, lines = lines, actions = actions, sections = sections }
 end
 
 local function valid(view)
@@ -210,7 +269,7 @@ local function render(view)
     return
   end
   local previous = view.model
-  view.model = M.model()
+  view.model = M.model({ width = vim.api.nvim_win_get_width(view.win) })
   if previous and vim.deep_equal(previous.lines, view.model.lines) then
     return
   end
@@ -319,8 +378,15 @@ function M.open(opts)
     end,
     r = M.refresh,
     q = function()
+      require("utils.ue_onboarding").cancel()
       M.close(view.win)
     end,
+    g = function()
+      local win = source(view)
+      if win then require("utils.ue_onboarding").start({ source_win = win }) end
+    end,
+    R = function() M.recovery({ source_win = source(view) }) end,
+    p = function() require("utils.ue_hub").command_hub({ source_win = source(view) }) end,
   }) do
     vim.keymap.set("n", key, fn, { buffer = view.buf, nowait = true, silent = true })
   end
@@ -329,6 +395,7 @@ function M.open(opts)
 end
 
 function M.setup()
+  require("utils.ue_onboarding").setup()
   require("utils.work_context").setup()
   vim.api.nvim_create_user_command("UEWorkbench", function()
     M.open()

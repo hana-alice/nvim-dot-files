@@ -2519,6 +2519,7 @@ local function set_prepare_running(value)
   end
   invalidate_status_cache()
   refresh_statusline()
+  pcall(vim.api.nvim_exec_autocmds, "User", { pattern = "UEWorkbenchChanged" })
 end
 
 -- csearch build serialization (D9 Policy A). Returns true when the caller is
@@ -5864,7 +5865,8 @@ local function invalidate_project_scoped_cache(_, reason)
   return 0
 end
 
-local function set_project(input)
+local function set_project(input, opts)
+  opts = opts or {}
   local engine_root = current_engine_root()
   if not engine_root then
     vim.notify("No Unreal Engine root found from current buffer or cwd", vim.log.levels.WARN)
@@ -5877,6 +5879,7 @@ local function set_project(input)
     local default_path = state.project_root or cwd()
     input = vim.fn.input("UE project dir or .uproject: ", default_path, "file")
   end
+  if opts.is_current and not opts.is_current() then return end
 
   local project_root, uproject, err = resolve_project_input(input, engine_root)
   -- Shared state/path consumers currently strip a drive root's separator.
@@ -5933,7 +5936,9 @@ end
 CORE_RT.set_project = set_project
 end -- close do-block opened above invalidate_project_scoped_cache
 
-local function set_android_package(input)
+local function set_android_package(input, opts)
+  opts = opts or {}
+  if opts.is_current and not opts.is_current() then return end
   local engine_root = current_engine_root()
   if not engine_root then
     vim.notify("No Unreal Engine root found from current buffer or cwd", vim.log.levels.WARN)
@@ -5947,10 +5952,10 @@ local function set_android_package(input)
     local device = require("utils.android_device")
     local serial = device.get()
     local current = trim(read_state(engine_root).android_package or "")
-    return require("utils.android_package").pick({
+    return require("utils.android_package").pick(vim.tbl_extend("force", opts, {
       adb = serial and device.adb_executable() or nil, serial = serial,
       known = current ~= "" and { current } or nil,
-    }, function(name) if name then CORE_RT.set_android_package(name) end end)
+    }), function(name) if name then CORE_RT.set_android_package(name, opts) end end)
   end
   if input == "" then return end
   -- K61: commit() re-reads the field from the readers' bucket, so a failed or
@@ -6166,6 +6171,9 @@ end
 
 local function set_platform(input, opts)
   opts = opts or {}
+  local function current() return not opts.is_current or opts.is_current() end
+  local select_ui = opts.ui_select or vim.ui.select
+  if not current() then return end
   local engine_root, project_root, uproject, state = platform_selection_context()
   if not engine_root then
     vim.notify("No Unreal Engine root found from current buffer or cwd", vim.log.levels.WARN)
@@ -6203,6 +6211,7 @@ local function set_platform(input, opts)
       engine_root,
       (plat and plat ~= "") and plat or current_plat,
       (conf and conf ~= "") and conf or current_conf)
+    if not current() then return end
     if not ok_update then
       vim.notify("Failed to set target: " .. tostring(update_err), vim.log.levels.ERROR)
       return
@@ -6234,6 +6243,7 @@ local function set_platform(input, opts)
     -- Try the cheap path first: if a shard already exists for the new
     -- (platform,config), flip manifest.active + re-merge in-place (~1s)
     -- instead of forcing a full :UEPrepare (~30-60s).
+    if not current() then return end
     local ok, key, info = CORE_RT.fast_swap_active_platform(engine_root)
     if ok then
       vim.notify(("UE platform: %s %s\nFast-swapped to shard %s (%d entries, %d shards merged)"):format(
@@ -6269,7 +6279,7 @@ local function set_platform(input, opts)
       end
     end
   end
-  vim.ui.select(platform_choices, {
+  select_ui(platform_choices, {
     prompt = "Target Platform (current: " .. (current_plat ~= "" and current_plat or "auto") .. "):",
     format_item = function(item)
       if suggestion and item == suggestion.target_platform then
@@ -6278,7 +6288,7 @@ local function set_platform(input, opts)
       return item
     end,
   }, function(plat)
-    if not plat then
+    if not plat or not current() then
       if opts.on_done then opts.on_done(false) end
       return
     end
@@ -6295,7 +6305,7 @@ local function set_platform(input, opts)
         end
       end
     end
-    vim.ui.select(config_choices, {
+    select_ui(config_choices, {
       prompt = "Target Configuration (current: " .. current_for_platform .. "):",
       format_item = function(item)
         if suggestion and plat == suggestion.target_platform
@@ -6305,7 +6315,7 @@ local function set_platform(input, opts)
         return item
       end,
     }, function(conf)
-      if not conf then
+      if not conf or not current() then
         if opts.on_done then opts.on_done(false) end
         return
       end
@@ -6313,6 +6323,7 @@ local function set_platform(input, opts)
           and CORE_RT.project_state.update_target
         or CORE_RT.project_state.stage_target
       local ok_update, update_err = target_update(engine_root, plat, conf)
+      if not current() then return end
       if not ok_update then
         vim.notify("Failed to set target: " .. tostring(update_err), vim.log.levels.ERROR)
         if opts.on_done then opts.on_done(false) end
@@ -6337,6 +6348,7 @@ local function set_platform(input, opts)
         end
       end
 
+      if not current() then return end
       local ok, key, info = CORE_RT.fast_swap_active_platform(engine_root)
       if ok then
         vim.notify(("UE platform set: %s %s\nFast-swapped to shard %s (%d entries)"):format(
@@ -8693,15 +8705,15 @@ function M.setup()
 
   vim.api.nvim_create_user_command("UEPaths", show_paths, {})
   vim.api.nvim_create_user_command("UESetProject", function(opts)
-    CORE_RT.set_project(opts.args)
+    CORE_RT.set_project(opts.args, require("utils.ue_hub").selection_options())
   end, { nargs = "?" })
   vim.api.nvim_create_user_command("UESetAndroidPackage", function(opts)
-    set_android_package(opts.args)
+    set_android_package(opts.args, require("utils.ue_hub").selection_options())
   end, { nargs = "?" })
   vim.api.nvim_create_user_command("UESetAndroidDevice", function()
-    require("utils.android_device").select({
+    require("utils.android_device").select(vim.tbl_extend("force", require("utils.ue_hub").selection_options(), {
       prompt = "Select Android device for this Neovim:",
-    }, function(serial, device)
+    }), function(serial, device)
       if serial then
         vim.notify(("Android device selected: %s"):format(
           require("utils.android_device").format_item(device)), vim.log.levels.INFO)
@@ -8715,7 +8727,7 @@ function M.setup()
     desc = "Set workspace -> .uproject relative path (used by :UESetProject when given only a workspace root)",
   })
   vim.api.nvim_create_user_command("UESetPlatform", function(opts)
-    set_platform(opts.args)
+    set_platform(opts.args, require("utils.ue_hub").selection_options())
   end, {
     nargs = "?",
     complete = set_platform_completions,
@@ -8935,6 +8947,8 @@ fp:close() end
   vim.api.nvim_create_user_command("UEInstallAndroid", install_android, {})
   vim.api.nvim_create_user_command("UEPrepare", function(cmd)
     local bang = cmd.bang and true or false
+    local onboarding = package.loaded["utils.ue_onboarding"]
+    local guard = onboarding and onboarding.prepare_guard()
     require("utils.async_launcher").launch({
       name  = bang and "UE: Prepare (FORCE full rebuild)" or "UE: Prepare (semantic + ccjson + index)",
       group = "ue",
@@ -8950,20 +8964,9 @@ fp:close() end
         end
       end,
       run   = function(report)
-        -- prepare_async already returns immediately and runs UBT/cindex
-        -- in libuv jobs. The launcher placeholder + fidget handle here
-        -- exist to give a unified visible-progress surface during the
-        -- 100–500ms window where ueprepare itself spins up + first job
-        -- spawn happens on the main thread.
-        --
-        -- :UEPrepare!  → force_csearch=true AND wipe the cache fast-path
-        --                gates so EVERY phase rebuilds from scratch.
-        --                Use after a confused state (project switch with
-        --                stale lists, corrupted .idx, post-:UESetProject
-        --                if the invalidation missed something). Always
-        --                correct, just slow.
-        -- :UEPrepare   → normal flow. Fast-path skips phases whose inputs
-        --                still look fresh against external anchors.
+        if guard and not guard() then return end
+        -- Prepare keeps its existing async jobs, progress and fast paths.
+        -- :UEPrepare! forces every phase; ordinary prepare keeps its fast path.
         if bang then
           if report then report("BANG → forcing full clean rebuild ...") end
           -- Mark the engine_root as dirty so prepare_cache_ready returns

@@ -112,12 +112,20 @@ def save_card():
     workbench('work_context_save',lua('return Source.win'));old=input_ready();keys('<C-u>Investigate token<CR>')
     input_ready(old);keys('<C-u>Check the caller before editing<CR>')
     wait('local rows=C.rows(Project);Card=rows[1];return Card and Card.name=="Investigate token"and Card.note=="Check the caller before editing"and vim.fn.mode()=="n"')
-    wait('if not vim.api.nvim_win_is_valid(Work)then return false end;local text=table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(Work),0,-1,false)," ");return text:find("Investigate token",1,true)and text:find("Check the caller before editing",1,true)')
+    wait('if not vim.api.nvim_win_is_valid(Work)then return false end;local text=table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(Work),0,-1,false)," ");return text:find("当前调查: Investigate token",1,true)')
     assert lua('return #Card.files==2 and Card.files[Card.active].line==1 and Card.files[Card.active].col==14 and Card.search.query=="InvestigateToken"and Card.search.mode.case=="sensitive"and vim.deep_equal(vim.api.nvim_win_get_cursor(Source.win),Source.cursor)and vim.api.nvim_buf_get_changedtick(Source.buf)==Source.tick')
     evidence['existing_workbench_updates_after_save_without_reopen']=True
     evidence['saved']=lua('return {id=Card.id,revision=Card.revision,name=Card.name,note=Card.note,files=Card.files,active=Card.active,search=Card.search,has_result=Card.has_result}')
 def details(source,resume=False):
-    workbench('work_context_resume'if resume else'work_context_details',source)
+    if resume:
+        # Resume moved from the workbench main screen into its Recovery menu.
+        lua('''
+          local source=...;vim.api.nvim_set_current_win(source)
+          for _,action in ipairs(W.recovery_actions())do if action.command=="UEWorkContext"then return action.run()end end
+          error('missing recovery action UEWorkContext')
+        ''',source)
+    else:
+        workbench('work_context_details',source)
     if resume:
         wait('Picker=Snacks.picker.get()[1];return Picker and not Picker.closed and Picker.opts.source=="ue_work_context"and not Picker.finder:running()and not Picker.matcher:running()and #Picker:items()>0 and vim.fn.mode()=="i"')
         keys('Investigate token');wait('return not Picker.matcher:running()and #Picker:items()==1')

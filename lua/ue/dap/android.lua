@@ -1738,6 +1738,7 @@ function M._finalize_attach_config(sess, pid, cfg_name, run_label)
         return
       end
       sess.attach_succeeded = true
+      require("ue.dap._ue_values").install(session)
       snapshot_last_session()
       if sess._operation then sess._operation.stage("attach", { state = "done", pid = pid }) end
       complete_operation(sess, 0, { stage = "attach", reason = "attach response succeeded", pid = pid })

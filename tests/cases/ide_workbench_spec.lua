@@ -79,10 +79,11 @@ t.describe("development workbench product continuity", function()
         "查看未保存文件",
         "找回窗口",
         "保存当前调查",
-        "继续已保存调查",
       }) do
         t.assert_contains(text, label)
       end
+      t.assert_true(vim.tbl_contains(vim.tbl_map(function(action) return action.command end,
+        W.recovery_actions(project)), "UEWorkContext"))
       local win = assert(W.open({ source_win = source_win }))
       owned_win = win
       t.assert_eq(W.open({ source_win = source_win }), win)

@@ -313,19 +313,61 @@ with tempfile.TemporaryDirectory(prefix='batch_prepare_') as temporary:
         before_store = store_state()
         assert (pathlib.Path(metrics['proof_directory']) / 'metrics.json').is_file(), \
             'a real new proof must retain its evidence directory and metrics'
+        limited, zero = generate(0, compiler_free=True)
+        assert limited == current and zero['cache_hits'] == zero['batch_count'] == 1, zero
+        assert zero['new_proof_count'] == 0, zero
+        assert_snapshot(before, 'zero-budget cached prepare rewrote publication')
+        assert store_state() == before_store, 'zero-budget prepare changed proof storage'
+
+        with patch.object(batch, '_prove', wraps=batch._prove) as next_proofs:
+            expanded, second = generate(2)
+        assert second['cache_hits'] == 1 and second['batch_count'] == 2, second
+        assert next_proofs.call_count == second['new_proof_count'] == second['new_batch_count'] == 1, second
+        assert zero['groups'][1]['reason'] == 'verification-budget-exhausted', zero
+        assert second['accepted_ubt_count'] == 4 and second['retained_ubt_count'] == 0, second
+        assert second['deferred_group_count'] == 0 and len(expanded) == 4, second
+        assert sorted(member for entry in expanded for member in entry['nvim_ue_members']) \
+            == sorted(member for entry in originals for member in entry['nvim_ue_members'])
+        assert [entry for entry in expanded if not entry.get('nvim_ue_batch_receipt')] == exact
+        assert json.loads(pathlib.Path(str(output) + '.semantic.json').read_text()) == originals
+        assert_snapshot({path: value for path, value in before.items()
+                         if pathlib.Path(path) in protected and pathlib.Path(path) != hints},
+                        'incremental proof rewrote the previously accepted proof')
+        assert len(json.loads(hints.read_text())['groups']) == 2
+        assert json.loads(marker.read_text())['verified_batches']['batch_count'] == 2
+        for path in (store / 'receipts').glob('*.json'):
+            item = json.loads(path.read_text())
+            protected.update(pathlib.Path(asset['path']) for asset in item['assets'] + item['graph_files'])
+            protected.add(path)
+        current = expanded
+        before = snapshot(protected | set(published))
+        before_store = store_state()
         for _ in range(2):
             again, warm = generate(2, compiler_free=True)
-            assert again == current and warm['cache_hits'] == 1 and warm['new_proof_count'] == 0, warm
-            assert warm['group_hints_status'] == 'loaded' and warm['batch_count'] == 1, warm
+            assert again == current and warm['cache_hits'] == 2 and warm['new_proof_count'] == 0, warm
+            assert warm['group_hints_status'] == 'loaded' and warm['batch_count'] == 2, warm
+            assert warm['new_batch_count'] == 0 and warm['proof_directory'] is None, warm
             assert all(group['run_metrics'] == [] for group in warm['groups']), warm
             assert_snapshot(before, 'unchanged bounded prepare rewrote proof or publication')
             assert store_state() == before_store, 'cached prepare changed watched proof store paths or directory mtimes'
+        changed_commands = [dict(entry, arguments=entry['arguments'] + ['-DBUILD_REVISION=2'])
+                            if batch._is_ubt(entry) else entry for entry in originals]
+        with patch.object(batch, '_prove', side_effect=AssertionError('zero-budget config change must not prove')), \
+             patch.object(batch, 'compare_graphs', side_effect=AssertionError('zero-budget config change must not replay')):
+            configured, obsolete = batch.accelerate(changed_commands, store, clangd, max_group=2,
+                                                    timeout=30, max_new_groups=0)
+        assert configured == changed_commands and obsolete['cache_hits'] == obsolete['batch_count'] == 0, obsolete
+        assert obsolete['deferred_group_count'] == 2 and obsolete['new_proof_count'] == 0, obsolete
+        assert all(group['reason'] == 'verification-budget-exhausted' for group in obsolete['groups']), obsolete
+        assert_snapshot(before, 'changed build configuration rewrote cached proof or publication')
+        assert store_state() == before_store, 'changed configuration touched proof storage'
         # A same-size edit with restored mtime must invalidate the actual byte
         # proof, even though all CDB commands and wrapper membership remain equal.
-        changed = pathlib.Path(batch._validate_ubt(proofs.call_args.args[0][0])[0])
-        raw, stamp = changed.read_bytes(), changed.stat()
-        changed.write_bytes(raw.replace(b'return 1', b'return 7', 1))
-        os.utime(changed, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        for group in (proofs.call_args.args[0], next_proofs.call_args.args[0]):
+            changed = pathlib.Path(batch._validate_ubt(group[0])[0])
+            raw, stamp = changed.read_bytes(), changed.stat()
+            changed.write_bytes(raw.replace(b'return 1', b'return 7', 1))
+            os.utime(changed, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
         assert not batch._cache_valid(record, store, {}), 'true byte change must reject the old certificate'
         validation = batch.validate_receipts([str(receipt)], clangd)
         assert not validation['ok'] and validation['reason'] == 'receipt-input-or-asset-changed', validation
@@ -335,7 +377,7 @@ with tempfile.TemporaryDirectory(prefix='batch_prepare_') as temporary:
         assert all(group['reason'] == 'verification-budget-exhausted' for group in stale['groups']), stale
         assert_snapshot({path: value for path, value in before.items() if pathlib.Path(path) in protected},
                         'stale fallback rewrote protected proof artifacts')
-    print('both bounded generators: real receipts and hints, cheaper group admitted, exact/shader coverage, byte-stable warm reuse, true-stale fallback')
+    print('both bounded generators: batches grow 1 to 2; cached zero-budget run and complete warm reuse stay byte-stable; exact/shader coverage and true-stale fallback preserved')
 ]=]
 
 local function run_fixture(operation, clangd)
@@ -361,7 +403,7 @@ t.describe("bounded verified prepare", function()
     t.skip("bounded prepare native compiler proofs", discovered.reason, { native = true })
     return
   end
-  t.it("produces native proofs and hints through both generators with full coverage and stable warm reuse", function()
+  t.it("grows native batches through both generators while preserving budget gates, full coverage and stable complete-cache reuse", function()
     run_fixture("integration", discovered.clangd_path)
   end)
   t.it("stops at the proof budget after a native collision and preserves incompatible macro commands", function()

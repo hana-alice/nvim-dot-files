@@ -477,9 +477,9 @@ M.build_phase_async = function(ctx, phase)
       vim.list_extend(cmd, { "--reuse-verified-only" })
     elseif phase == "full" then
       -- The existing async generator and writer lease own qualification. Keep
-      -- first delivery bounded; current/hot and externally selected immutable
-      -- stores only reuse receipts. An admitted local batch ends this stage so
-      -- an unchanged prepare never expands/reindexes it merely to fill a budget.
+      -- each delivery bounded; current/hot and externally selected immutable
+      -- stores only reuse receipts. Only a newly admitted batch ends this
+      -- stage; cached batches leave the next group eligible for qualification.
       vim.list_extend(cmd, { "--batch-proof-limit", "2" })
     else
       vim.list_extend(cmd, { "--reuse-verified-only" })

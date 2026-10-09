@@ -16,7 +16,7 @@ local function read(path)
   return bytes
 end
 
-local function fixture()
+local function fixture(large_base)
   local root = vim.fs.normalize(vim.fn.tempname()) .. "_publication"
   vim.fn.mkdir(root, "p")
   root = vim.fs.normalize(vim.uv.fs_realpath(root))
@@ -37,16 +37,16 @@ local function fixture()
   local entries = { { directory = root, file = root .. "/A.cpp", arguments = { "clang++", "-c", root .. "/A.cpp" },
     nvim_ue_module_root = root .. "/Module", nvim_ue_members = { root .. "/A.cpp" } } }
   write(root .. "/A.cpp", "int fixture_value;\n")
-  write(base, vim.json.encode(entries))
+  write(base, vim.json.encode(entries) .. (large_base and string.rep(" ", 1100000) or ""))
   write(source, vim.json.encode(entries)); write(background, vim.json.encode(entries))
   write(marker, vim.json.encode({ schema = 1, index_kind = "controlled-background", entry_count = 1 }))
   local state = index.ensure_index_state(ctx)
   state.modules = { ["module:/A"] = { key = "module:/A", name = "A", tier = "core", kind = "module", dirty = false } }
   state.queue, state.index_artifacts, state.index_selection = {}, {}, nil
-  local generation = index.generation_for_context(ctx, { base_cdb_path = base })
+  local generation = index.generation_for_context(ctx, { base_cdb_path = base, synchronous = large_base })
   state.index_artifacts.full = index.make_index_manifest(ctx, state, "full", marker, { "module:/A" }, {
     base_cdb_path = base, background_cdb_path = background, semantic_cdb_path = source,
-    index_kind = "controlled-background", completed_at = os.time() - 10,
+    index_kind = "controlled-background", completed_at = os.time() - 10, synchronous = large_base,
   })
   index.save_index_state(ctx, state)
   write(marker .. ".manifest.json", vim.json.encode(state.index_artifacts.full))
@@ -75,8 +75,8 @@ local function fixture()
 end
 
 t.describe("真实隔离后台publication worker", function()
-  t.it("真实toolchain generation与parent lease下发布标准original CDB", function()
-    local env = fixture()
+  t.it("真实toolchain generation与parent lease下冷大型base发布标准original CDB", function()
+    local env = fixture(true)
     local ok, failure = xpcall(function()
       local child, result = env:run()
       t.assert_eq(child.code, 0, child.stderr)

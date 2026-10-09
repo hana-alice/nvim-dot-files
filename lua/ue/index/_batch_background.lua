@@ -12,6 +12,20 @@ return function(M, core)
     local base = M.base_compile_commands_path(ctx)
     local base_signature = h.file_signature(base)
     local generation = h.generation_for_context(ctx, { base_cdb_path = base })
+    if generation.failed then
+      require("utils.log").warn_ctx("ue.index", "background batch digest failed", { reason = generation.digest_error })
+      return
+    end
+    if generation.pending then
+      h.generation_for_context_async(ctx, { base_cdb_path = base }, function(value, err)
+        if not value then
+          require("utils.log").warn_ctx("ue.index", "background batch digest failed", { reason = err })
+          return
+        end
+        M.start_background_batches(ctx, request)
+      end)
+      return
+    end
     local control = fs.join(vim.fs.dirname(request.store), "background-control")
     fs.ensure_dir(control)
     local function current()

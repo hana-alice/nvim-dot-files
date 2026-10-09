@@ -248,14 +248,19 @@ with tempfile.TemporaryDirectory(prefix='background_batch_') as temporary:
 spec = importlib.util.spec_from_file_location('background', sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+def publish_ready(value):
+    path = pathlib.Path(sys.argv[2])
+    temporary = path.with_name(path.name + '.tmp')
+    temporary.write_text(value)
+    temporary.replace(path)
 try:
     owned = module._owned_job()
 except OSError as error:
-    pathlib.Path(sys.argv[2]).write_text('blocked:' + str(error))
+    publish_ready('blocked:' + str(error))
     sys.exit(1)
 child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],
     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-pathlib.Path(sys.argv[2]).write_text(str(child.pid))
+publish_ready(str(child.pid))
 time.sleep(60)
 ''', encoding='utf-8')
                 parent = subprocess.Popen([sys.executable, '-I', str(helper), tool, str(ready)],

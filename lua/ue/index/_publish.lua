@@ -14,11 +14,16 @@ return function(M, core)
   end
 
   local function atomic_write_json(path, value)
+    if M._publication_guard then M._publication_guard() end
     _ufs.ensure_dir(vim.fs.dirname(path))
     local tmp = path .. ".tmp." .. tostring(vim.uv.hrtime())
     if not core.deps.write_all(tmp, vim.json.encode(value)) then
       pcall(vim.fn.delete, tmp)
       return false, "temporary write failed"
+    end
+    if M._publication_guard then
+      local current, reason = pcall(M._publication_guard)
+      if not current then pcall(vim.fn.delete, tmp); return false, tostring(reason) end
     end
     local ok, err = (vim.uv or vim.loop).fs_rename(tmp, path)
     if not ok then
@@ -305,4 +310,5 @@ return function(M, core)
       original_changed = original_changed,
     }
   end
+  require("ue.index._publication_async")(M, core)
 end

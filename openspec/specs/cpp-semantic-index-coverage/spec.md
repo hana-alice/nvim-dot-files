@@ -111,6 +111,12 @@ clangd 是长驻交互式服务，终止会丢弃已构建的 preamble。系统 
 
 ## 选型与踩坑
 
+- **选型（2026-10-09）**：冷大型 CDB generation 摘要与普通 phase 的 manifest/语义发布使用独立
+  nvim worker；摘要按 size/mtime/ctime/dev/ino 绑定当前输入，计算期间替换必须丢弃并重算。
+  未就绪与 worker 失败分别处理，旧 selection 只保留为历史，不冒充当前已验证 generation；
+  成功后恢复延迟 reader，发布保持原 writer lease、来源校验和未变更不写入语义。
+  子进程异步计算不等于整个启动/prepare 无卡顿；主循环最大间隔与 GUI 响应仍需分别实测。
+
 - **踩坑（2026-10-08）**：正常 prepare 的 current/hot/full 曾统一只复用 proof；新项目桶没有
   receipts 或 accepted hints 时，所有候选都 deferred=`verification-not-cached`，不会自行生产证明。
   历史上其他项目桶的成功 proof 不能证明当前 build，也不能靠复制或改写其身份来命中。

@@ -3,6 +3,7 @@ local source = debug.getinfo(1, "S").source:sub(2)
 local repo = vim.fs.dirname(vim.fs.dirname(vim.fs.dirname(vim.fs.dirname(vim.fs.normalize(source)))))
 vim.opt.runtimepath:prepend(repo)
 package.path = repo .. "/lua/?.lua;" .. repo .. "/lua/?/init.lua;" .. package.path
+vim.g.ue_index_worker = true -- This isolated publisher owns synchronous CDB work.
 local function read(path)
   local file = assert(io.open(path, "rb"))
   local raw = file:read("*a"); file:close()

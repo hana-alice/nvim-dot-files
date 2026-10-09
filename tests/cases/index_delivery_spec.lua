@@ -1281,6 +1281,7 @@ t.describe("受控 CDB 相同标准字段不触碰发布文件", function()
         system = vim.system, restart = index.maybe_restart_clangd_for_index,
         queued = index.try_start_queued_build, publish = index.publish_semantic_cdb,
         source_pending = index.source_refresh_pending, source_delivery = index.deliver_source_refresh,
+        finish_publication = index.finish_publication_async, notify = vim.notify,
         toolchain = index._rt.toolchain_identity_override, job = index._rt.job,
       }
       local root_key = ctx.engine_root .. "\31" .. ctx.project_root .. "\31test"
@@ -1368,12 +1369,70 @@ t.describe("受控 CDB 相同标准字段不触碰发布文件", function()
         t.assert_nil(restart_options.original_changed)
         build()
         t.assert_eq(restarts, 3, "unchanged selection must not request a restart")
+
+        -- A large base switches only the publication path. Hold the real writer
+        -- lease and RT.job until the mocked publication worker completes.
+        local async_manifest = state.index_artifacts.full
+        local async_generation = index.generation_for_context(ctx)
+        write(ctx.paths.active_cdb, read(ctx.paths.active_cdb) .. string.rep(" ", 1024 * 1024))
+        local worker_callback, worker_options, failures = nil, nil, 0
+        index.source_refresh_pending = function() return false end
+        index.publish_semantic_cdb = function() error("large publication must not run on the editor thread") end
+        vim.notify = function(message, level)
+          if level == vim.log.levels.ERROR and message:find("UE index:", 1, true) then failures = failures + 1 end
+        end
+        index.finish_publication_async = function(context, live, phase, path, keys, options, callback)
+          t.assert_eq(context, ctx); t.assert_eq(live, state); t.assert_eq(phase, "full")
+          t.assert_eq(path, ctx.paths.full_index); t.assert_eq(#keys, 2)
+          t.assert_eq(options.owner_pid, vim.fn.getpid())
+          worker_callback, worker_options = callback, options
+          return true
+        end
+        local function begin_async_build()
+          worker_callback = nil
+          t.assert_true(index.build_phase_async(ctx, "full"))
+          pending({ code = 0, stdout = "", stderr = "" })
+          t.assert_true(vim.wait(1000, function() return worker_callback ~= nil end, 10))
+          t.assert_type(index._rt.job, "table", "worker must retain the single-job exclusion")
+          t.assert_eq(state.build.status, "running")
+          local lock = require("ue.file_lock")
+          t.assert_eq(lock.owner(worker_options.lease.path).token, worker_options.lease.token)
+          local competing = lock.acquire(worker_options.lease.path)
+          t.assert_nil(competing, "publication must retain the cross-process writer lease")
+        end
+        begin_async_build()
+        worker_callback(nil, { manifest = async_manifest, generation = async_generation,
+          selection = async_manifest, promoted = true, publication = { changed = false } })
+        t.assert_nil(index._rt.job)
+        t.assert_nil(vim.uv.fs_stat(worker_options.lease.path))
+        t.assert_eq(state.build.status, "ready")
+        t.assert_eq(restarts, 3, "worker no-op publication must preserve the reader")
+
+        begin_async_build()
+        worker_callback("publication worker failed fixture")
+        t.assert_nil(index._rt.job)
+        t.assert_nil(vim.uv.fs_stat(worker_options.lease.path))
+        t.assert_eq(state.build.status, "error")
+        t.assert_contains(state.build.message, "publication worker failed fixture")
+        t.assert_eq(state.index_timings.full.status, "error")
+        t.assert_eq(failures, 1, "worker failure must remain visible without stale fallback")
+        t.assert_eq(restarts, 3)
+
+        index.finish_publication_async = function() return false, "publication spawn failed fixture" end
+        t.assert_true(index.build_phase_async(ctx, "full"))
+        pending({ code = 0, stdout = "", stderr = "" })
+        t.assert_true(vim.wait(1000, function() return index._rt.job == nil end, 10))
+        t.assert_eq(state.build.status, "error")
+        t.assert_contains(state.build.message, "publication spawn failed fixture")
+        t.assert_nil(vim.uv.fs_stat(ctx.paths.index_state .. ".build.lock"))
+        t.assert_eq(failures, 2, "spawn failure must release ownership and remain visible")
       end)
       vim.system = saved.system
       index.maybe_restart_clangd_for_index = saved.restart
       index.try_start_queued_build = saved.queued
       index.publish_semantic_cdb = saved.publish
       index.source_refresh_pending, index.deliver_source_refresh = saved.source_pending, saved.source_delivery
+      index.finish_publication_async, vim.notify = saved.finish_publication, saved.notify
       index._rt.toolchain_identity_override = saved.toolchain
       index._rt.job = saved.job
       index._rt.module_state[root_key], index._rt.contexts[root_key] = nil, nil

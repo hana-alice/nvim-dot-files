@@ -48,7 +48,8 @@ local function activate_frozen(root, semantic, bufnr, clangd)
   local runtime = require("ue.index.batch_runtime")
   runtime._reset_for_test()
   local descriptor = { ok = true, info_sha256 = "transport-proof", generation_id = "transport-generation",
-    compiler_environment = {}, tool_path = clangd, receipts = { root .. "/receipt.json" }, watch_roots = { root },
+    compiler_environment = {}, compiler_lookup_environment = {}, tool_path = clangd,
+    receipts = { root .. "/receipt.json" }, watch_roots = { root },
     input_roots = { root .. "/Source" },
     watched_files = { semantic .. "/verified/compile_commands.json" }, exclude_roots = {},
     original_cdb = semantic .. "/compile_commands.json", verified_cdb = semantic .. "/verified/compile_commands.json" }

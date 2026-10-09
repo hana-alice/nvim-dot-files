@@ -92,6 +92,32 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 已将具名调查切片归档至 [2.7.0](release_2.7.0.md)。
 
+### 2026-10-09 — 无变化 prepare 0.2 s；后台证明阶段计时与图处理缓存
+
+**Task**
+- 让输入不变的 prepare 在真实工程上真正走快速路径；拆解后台 SuperUnity 证明约 70 s 的未分阶段耗时。
+
+**Implemented**
+- `cdb/prepare_inputs`：支持 `--gcc-toolchain=`、`-gcc-toolchain=`、`--gcc-install-dir=` 及分离式写法，外部工具链目录纳入原生递归监听与根身份核验；重复路径解析进程内去重；owned 的 `engine/.cache/nvim-ue` 从递归订阅拆出，父目录非递归监听新增/替换。
+- `cdb/prepare_cache`：修正 Python cache 过滤漏掉 `__pycache__` 目录本身；真实工具 `.py` 修改仍立即撤权。
+- 后台证明：各阶段计时（失败路径也保留）；单次原 TU 收集内 64 MiB header shard 缓存，SHA 命中后仍比较完整字节，含 main Cmd/MainFile 的 shard 不缓存；最终回执复用已保存图的 SHA，不再重复全图 JSON/hash。
+- 原生 query-profile 回执的环境身份改为编译器真实路径、版本、字节与 query 输出；PATH/PATHEXT 只作启动上下文。
+
+**Pitfalls / Gotchas**
+- 70 s 残差主要是图解码/处理（原 TU 侧约 17 s、候选约 9 s），不是 freeze/hash（freeze 合计 1.2 s）。
+- 新启动 3.77 s 主循环卡顿：冷 `normalized_cdb_digest` 同步读 291 MB CDB 并 hash 260 MB JSON，占 2.27 s CPU。
+- 未分类的 `nvim_ue_members` union（16626）含 shader/别名，不能当 C/C++ 源数。
+
+**Validation**
+- 真实 Android/Test：seed 169 s 后两次无变化 prepare **0.273 s / 0.222 s**，走快速路径，产物 SHA/size/mtime 不变，clangd PID 不变；改源注释后监听 epoch 0→4、进入完整生成（完整生成在限时内未完成）；源文件按字节与 mtime 恢复。
+- 离线真实产物：图处理 13.930 → 9.556 s（−31%），三张规范化图 SHA 全等；锁内整组证明 109 s，尚未测到整体提速（header 缓存在该次实测后加入）。
+- 全量回归 3336/3336，0 失败、0 跳过；前后工作树哈希一致。
+
+**Follow-ups**
+- 冷 generation 摘要与普通发布改为异步，消除 3.77 s 卡顿。
+- header 缓存后的整组证明真实收益与 304 候选吞吐推算；旧 collector/helper 回执安全迁移。
+- 改注释后完整 prepare 的耗时与发布结果未取得。
+
 ### 2026-10-09 — 后台 SuperUnity 证明、prepare 输入缓存骨架与头文件 clangd 目标校验
 
 **Task**

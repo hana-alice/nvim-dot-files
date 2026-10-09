@@ -1327,8 +1327,9 @@ def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify
     Compact accepted hints discover noncontiguous groups; max_group remains a
     hard limit and every discovered group goes through the full cache gate.
     A bounded prepare qualifies at most max_new_groups cache misses and stops
-    qualifying once it has a usable batch. Later identical prepares validate
-    that batch without starting more compilers or changing its publication.
+    qualifying once it accepts a new batch in this invocation. Cached batches
+    do not consume that stage; later prepares can qualify the next group.
+    Fully cached prepares validate without changing their publication.
     """
     if max_new_groups is not None and (type(max_new_groups) is not int or max_new_groups < 0):
         raise ValueError('batch-proof-limit-must-be-nonnegative')
@@ -1345,7 +1346,7 @@ def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify
     groups = collections.defaultdict(list)
     metrics = {'original_ubt_count': sum(_is_ubt(entry) for entry in entries),
         'batch_count': 0, 'accepted_ubt_count': 0, 'groups': [], 'proof_directory': None,
-        'cache_hits': 0, 'deferred_group_count': 0, 'new_proof_count': 0,
+        'cache_hits': 0, 'deferred_group_count': 0, 'new_proof_count': 0, 'new_batch_count': 0,
         'qualification_limit': max_new_groups}
     shader = lambda e: Path(e.get('file', '')).suffix.lower() in (
         '.usf', '.ush', '.hlsl', '.hlsli', '.glsl', '.vert', '.frag', '.geom', '.tesc', '.tese', '.comp', '.metal')
@@ -1406,7 +1407,7 @@ def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify
                 record['deferred'] = True
                 raise ValueError('verification-not-cached')
             if not cached and max_new_groups is not None:
-                reason = ('verification-stage-complete' if metrics['batch_count'] else
+                reason = ('verification-stage-complete' if metrics['new_batch_count'] else
                           'verification-budget-exhausted' if metrics['new_proof_count'] >= max_new_groups else None)
                 if reason:
                     metrics['deferred_group_count'] += 1
@@ -1445,6 +1446,8 @@ def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify
             consumed.update(index for index in chunk if index != anchor)
             claimed.update(chunk)
             metrics['batch_count'] += 1
+            if not cached:
+                metrics['new_batch_count'] += 1
             metrics['accepted_ubt_count'] += len(chunk)
             record.update(accepted=True, reason='verified-original-tu-union', **detail)
         except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
@@ -1491,7 +1494,7 @@ def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify
         'include-inventory-changed-during-run' if inventory_changed else None)
     if invalidated:
         result = list(entries)
-        metrics.update(batch_count=0, accepted_ubt_count=0, invalidated_reason=invalidated)
+        metrics.update(batch_count=0, new_batch_count=0, accepted_ubt_count=0, invalidated_reason=invalidated)
         for record in metrics['groups']:
             record.update(accepted=False, reason=invalidated)
     elif new_hints and verify_missing:

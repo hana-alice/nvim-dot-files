@@ -115,8 +115,9 @@ clangd 是长驻交互式服务，终止会丢弃已构建的 preamble。系统 
   receipts 或 accepted hints 时，所有候选都 deferred=`verification-not-cached`，不会自行生产证明。
   历史上其他项目桶的成功 proof 不能证明当前 build，也不能靠复制或改写其身份来命中。
 - **阶段选型（2026-10-08）**：无外部 proof selector 的 full 在已有异步 worker、writer lease
-  和宿主准入下有界生产独立原 TU 图证明，优先小组；交付一个合格批次后停止自动扩展。
-  重复 prepare 完整重验并复用该批次，失效或预算未覆盖的组保留原 UBT。current/hot 与显式
+  和宿主准入下有界生产独立原 TU 图证明，优先小组；每轮新接受一个合格批次后停止该轮证明。
+  重复 prepare 完整重验并复用已有批次，缓存命中不消耗本轮新接受批次名额，下一组仍可在
+  预算内证明；新增产物按计划发布，纯缓存轮保持 no-op。失效或预算未覆盖的组保留原 UBT。current/hot 与显式
   外部 store 仍仅复用；完整 argv、宏/PCH、图比较、来源及真实过期拒绝门禁保持不变。
   这是生产/命中路径的阶段修复，不能用条目数下降宣称全工程性能恢复。
 - **踩坑（2026-10-08）**：冻结激活安装监听后，query profile 验证若在 proof store 内创建临时

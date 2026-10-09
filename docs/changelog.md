@@ -92,6 +92,28 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 已将具名调查切片归档至 [2.7.0](release_2.7.0.md)。
 
+### 2026-10-09 — 二次合并随 prepare 逐轮增长
+
+**Task**
+- 上一版正常 prepare 交付 1 个二次批次后再也不增长；让 SuperUnity 合并能逐轮扩大。
+
+**Implemented**
+- `tools/cdb_verified_batch.py` 判断本轮验证是否完成时只看本轮新接受的批次（`new_batch_count`），已缓存批次不再阻断下一组候选；整体失效时一并归零。每轮仍最多新证明 2 组、新接受 1 批。
+- 同步 `cpp-semantic-index-coverage` spec 的阶段选型说明。
+
+**Pitfalls / Gotchas**
+- 原判断用总 `batch_count`（含缓存批次），有 1 批后所有新组都被记为 `verification-stage-complete`。
+- 工具源码身份变化会让旧 proof 全部失效重证明，首轮属迁移轮，不能与热缓存轮比较。
+
+**Validation**
+- 原生夹具先红后绿：第二轮 1→2 批；纯缓存轮字节/mtime/proof store 不变；零预算、同大小源码变化、构建参数变化均回退原命令。
+- 真实 Android/Test：连续 prepare 1→2→3 批，改一行注释后再到 4 批；raw/原始语义 CDB SHA 与 14317 个逻辑成员不变；被引用门禁拒绝的组保留原 UBT。新接受组独立冷索引比两个原 TU 快 50–56%（仅该组，不代表全工程）。
+- 全量回归 3283/3283，0 失败、0 跳过。
+
+**Follow-ups**
+- 每轮只增 1 批，铺满 304 个候选不现实，需要后台并发证明。
+- 改注释那轮不能证明完整输入变化检测（每次 prepare 本就全量重验）；无变化 prepare 仍约 150 s。
+
 ### 2026-10-08 — 头文件语义导航、重复 Prepare no-op 与首个真实二次批次
 
 **Task**

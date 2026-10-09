@@ -458,6 +458,7 @@ M.build_phase_async = function(ctx, phase)
   local process_config = vim.lsp.config and vim.lsp.config.clangd or {}
   local server_profile, profile_error = require("ue.index.batch_runtime").server_profile(
     require("ue").clangd_cmd(ctx.engine_root), process_config)
+  local background_request
   if clangd.ok and not profile_error then
     vim.list_extend(cmd, { "--verified-batches", "--clangd", clangd.path, "--batch-size", "8" })
     -- A project/target-scoped selection points at immutable qualified assets.
@@ -476,11 +477,10 @@ M.build_phase_async = function(ctx, phase)
       vim.list_extend(cmd, { "--verified-batch-store", store.path })
       vim.list_extend(cmd, { "--reuse-verified-only" })
     elseif phase == "full" then
-      -- The existing async generator and writer lease own qualification. Keep
-      -- each delivery bounded; current/hot and externally selected immutable
-      -- stores only reuse receipts. Only a newly admitted batch ends this
-      -- stage; cached batches leave the next group eligible for qualification.
-      vim.list_extend(cmd, { "--batch-proof-limit", "2" })
+      vim.list_extend(cmd, { "--reuse-verified-only" })
+      background_request = { enabled = true, python = python, clangd = clangd.path, profile = server_profile,
+        store = fs.join(vim.fs.dirname(ctx.paths.semantic_cdb), "verified_batches"),
+        background = background_cdb, marker = out_idx }
     else
       vim.list_extend(cmd, { "--reuse-verified-only" })
     end
@@ -748,6 +748,7 @@ M.build_phase_async = function(ctx, phase)
       core.deps.invalidate_status_cache()
       core.deps.refresh_statusline()
       file_lock.release(phase_lease)
+      if ok_result and background_request then background_request.env = child_env; M.start_background_batches(ctx, background_request) end
       M.try_start_queued_build()
     end)
   end)

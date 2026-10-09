@@ -375,10 +375,14 @@ def main():
         if args.verified_batches:
             from cdb_verified_batch import accelerate
             stable_super_dir = args.super_dir or os.path.join(stage_dir, "super_unity_cpps")
-            background_cdb, batch_metrics = accelerate(
-                semantic_cdb, args.verified_batch_store or os.path.join(os.path.dirname(stable_super_dir), "verified_batches"),
-                args.clangd, max_group=args.batch_size, verify_missing=not args.reuse_verified_only,
-                server_profile=args.server_profile, max_new_groups=args.batch_proof_limit)
+            store = args.verified_batch_store or os.path.join(os.path.dirname(stable_super_dir), "verified_batches")
+            if args.reuse_verified_only and args.verified_batch_store is None:
+                from cdb_background_batch import reuse_completed
+                background_cdb, batch_metrics = reuse_completed(semantic_cdb, store, args.clangd, args.server_profile)
+            else:
+                background_cdb, batch_metrics = accelerate(
+                    semantic_cdb, store, args.clangd, max_group=args.batch_size, verify_missing=not args.reuse_verified_only,
+                    server_profile=args.server_profile, max_new_groups=args.batch_proof_limit)
         marker = {
             "schema": 1,
             "index_kind": "controlled-background",
@@ -397,10 +401,11 @@ def main():
             marker["verified_batches"] = {key: batch_metrics[key] for key in (
                 "original_ubt_count", "batch_count", "accepted_ubt_count", "retained_ubt_count",
                 "exact_count", "shader_count", "other_count", "output_entries") if key in batch_metrics}
+        from cdb_background_batch import encode_preserving
         write_outputs_if_changed([
-            (background_path, json.dumps(background_cdb, ensure_ascii=False, separators=(",", ":"))),
+            (background_path, encode_preserving(background_path, background_cdb)),
             (background_path + ".semantic.json", json.dumps(semantic_cdb, ensure_ascii=False, separators=(",", ":"))),
-            (idx_path, json.dumps(marker, ensure_ascii=False, separators=(",", ":"))),
+            (idx_path, encode_preserving(idx_path, marker)),
         ])
         print(f"\nControlled BackgroundIndex CDB: {background_path}")
         print(f"  Native background tasks: {marker['native_background_entry_count']}; "

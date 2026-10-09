@@ -292,13 +292,8 @@ t.describe("index subset runs outside the editor thread", function()
             end
           end
           t.assert_nil(argument("--verified-batch-store"))
-          if phase == "full" then
-            t.assert_eq(argument("--batch-proof-limit"), "2")
-            t.assert_false(vim.tbl_contains(command, "--reuse-verified-only"))
-          else
-            t.assert_true(vim.tbl_contains(command, "--reuse-verified-only"))
-            t.assert_nil(argument("--batch-proof-limit"))
-          end
+          t.assert_true(vim.tbl_contains(command, "--reuse-verified-only"), "delivery must not wait for a new proof")
+          t.assert_nil(argument("--batch-proof-limit"))
           pending({ code = 1, stdout = "", stderr = "bounded qualification fixture" })
           t.assert_true(vim.wait(1000, function() return index._rt.job == nil end, 10))
           t.assert_eq(read(ctx.paths.semantic_cdb), "previous-publication")

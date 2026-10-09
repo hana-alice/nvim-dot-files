@@ -35,6 +35,7 @@ local SPAWN_AUDIT = {
   { p="lua/ue/cdb/pipeline.lua", api="jobstart", a="_rt.jobstart(step.command", class="deferrable", reason="admitted CDB chain", guard="host_admission" },
   { p="lua/ue/cdb/pipeline.lua", api="fn-system", a="vim.fn.system(cmd)", class="subprocess-only", reason="slim runs inside admitted ccjson or explicit sync path" },
   { p="lua/ue/cdb/transaction.lua", api="vim.system", a="local ok_spawn, handle = pcall(vim.system", class="deferrable", reason="admitted sequential prepare staging/commit child; large copies and hashing stay outside UI", guard="host_admission" },
+  { p="lua/ue/cdb/prepare_cache.lua", api="vim.system", a="local spawned, handle = pcall(vim.system", class="deferrable", reason="one admitted input/product inventory child on prepare miss or successful seal; reused inputs spawn none", guard="host_admission" },
   { p="lua/ue/clangd_commands.lua", api="vim.system", a="vim.system(cmd, { text = true }", class="interactive", reason="bounded compile-command query for active LSP request" },
   { p="lua/ue/dap/android.lua", api="vim.system", a="local ok_spawn = pcall(vim.system", n=3, class="dap", reason="DAP protocol/process lifecycle exemption (liveness pidof probe, gate release, session-exit post-mortem)" },
   -- L1 传输层拆分后（design D7），platform server 的 spawn 随代码搬到 _android_transport。
@@ -62,6 +63,7 @@ local SPAWN_AUDIT = {
   { p="lua/ue/index/_build.lua", api="vim.system", a="vim.system(cmd, {", class="deferrable", reason="controlled index child admitted by scheduler", guard="admit_background_phase", gp="lua/ue/index/_schedule.lua" },
   { p="lua/ue/index/_generation.lua", api="vim.system", a="vim.system({ path,", class="short", reason="cached bounded toolchain identity probe" },
   { p="lua/ue/index/batch_runtime.lua", api="vim.system", a="local handle = vim.system(command", class="interactive", reason="bounded asynchronous clangd startup receipt verification", guard="task_registry" },
+  { p="lua/ue/index/batch_background.lua", api="vim.system", a="local handle = vim.system(command", class="deferrable", reason="two private proof workers; shared host admission, owned cancellation and coalesced publication", guard="admission.run_when_allowed" },
   { p="lua/ue/index/batch_shard_seed.lua", api="vim.system", a="local handle = vim.system(command", class="interactive", reason="bounded one-time add-only frozen shard-cache seed before startup watches", guard="task_registry" },
   { p="lua/ue/target_tasks.lua", api="vim.system", a="pcall(vim.system, command", class="foreground", reason="operation metadata classifies explicit task", guard="is_foreground_operation" },
   { p="lua/ue/workflows/android/install.lua", api="jobstart", a="pcall(d.jobstart, install_cmd", class="foreground", reason="explicit APK install", guard="foreground_begin" },

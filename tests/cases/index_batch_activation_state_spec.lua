@@ -16,7 +16,7 @@ local function fixture(body)
   h.ctx = { paths = { semantic_cdb = h.original, clangd_dir = root } }
   h.descriptor = { ok = true, original_cdb = h.original,
     verified_cdb = root .. "/background/verified/compile_commands.json",
-    info_sha256 = "publication-a", generation_id = "generation-a", compiler_environment = {},
+    info_sha256 = "publication-a", generation_id = "generation-a", compiler_environment = {}, compiler_lookup_environment = {},
     tool_path = root .. "/clangd.exe", receipts = { root .. "/receipt.json" },
     watch_roots = { root .. "/input" }, input_roots = { root .. "/input" },
     watched_files = { root .. "/input/file.h" }, exclude_roots = {} }

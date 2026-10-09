@@ -60,7 +60,7 @@ local function seal(ctx)
   t.assert_false(begin(ctx))
   cache.complete(ctx)
   t.assert_true(vim.wait(15000, function() return cache.status().ready end, 10),
-    "seal failed: " .. tostring(cache.status().reason))
+    "seal failed: " .. vim.inspect(cache.status()))
   t.assert_true(begin(ctx), "unchanged products must reuse: " .. vim.inspect(cache.status()))
 end
 
@@ -92,6 +92,29 @@ t.describe("prepare cache real input evidence", function()
       t.assert_match(value.reason, "unexpanded response file")
       write(ctx.paths.active_cdb, "{invalid")
       t.assert_false(inputs.collect(request).ok)
+    end)
+  end)
+
+  t.it("collector covers external GCC toolchain paths and refuses unknown path options", function()
+    fixture(function(ctx, request, root)
+      local external = vim.fs.normalize(vim.fn.tempname() .. "-gcc-toolchain")
+      write(external .. "/lib/runtime.h", "// one\n")
+      local ok, err = xpcall(function()
+        for _, args in ipairs({ { "--gcc-toolchain=" .. external }, { "-gcc-toolchain=" .. external },
+          { "--gcc-install-dir=" .. external }, { "--gcc-toolchain", external }, { "-gcc-toolchain", external } }) do
+          write(ctx.paths.active_cdb, { { directory = root, file = root .. "/Source/A.cpp",
+            arguments = vim.list_extend({ vim.v.progpath }, args) } })
+          local value = inputs.collect(request)
+          t.assert_true(value.ok, value.reason)
+          t.assert_true(vim.iter(value.roots):any(function(item) return item.path == external end),
+            "external toolchain needs a recursive observed root")
+        end
+        write(ctx.paths.active_cdb, { { directory = root, file = root .. "/Source/A.cpp",
+          arguments = { vim.v.progpath, "--unknown-toolchain=" .. external } } })
+        t.assert_match(inputs.collect(request).reason, "unrecognized path argument")
+      end, debug.traceback)
+      vim.fn.delete(external, "rf")
+      if not ok then error(err) end
     end)
   end)
 
@@ -147,6 +170,29 @@ t.describe("prepare cache real input evidence", function()
     end)
   end)
 
+  t.it("external toolchain bytes revoke native cache even with size and mtime restored", function()
+    fixture(function(ctx, _, root)
+      local external = vim.fs.normalize(vim.fn.tempname() .. "-gcc-toolchain")
+      local path = external .. "/lib/runtime.h"
+      write(path, "// one\n")
+      local ok, err = xpcall(function()
+        write(ctx.paths.active_cdb, { { directory = root, file = root .. "/Source/A.cpp",
+          arguments = { vim.v.progpath, "--gcc-toolchain=" .. external, "-c", root .. "/Source/A.cpp" } } })
+        seal(ctx)
+        local before = assert(uv.fs_stat(path))
+        write(path, "// two\n")
+        assert(uv.fs_utime(path, before.atime.sec + before.atime.nsec / 1e9,
+          before.mtime.sec + before.mtime.nsec / 1e9))
+        t.assert_eq(uv.fs_stat(path).size, before.size)
+        t.assert_false(begin(ctx), "external toolchain mutation must select the complete path")
+        t.assert_eq(cache.status().last_miss_reason, "input-event")
+      end, debug.traceback)
+      cache.stop()
+      vim.fn.delete(external, "rf")
+      if not ok then error(err) end
+    end)
+  end)
+
   t.it("stopped observation revokes reuse", function()
     fixture(function(ctx)
       seal(ctx)
@@ -183,6 +229,44 @@ t.describe("prepare cache real input evidence", function()
       seal(ctx)
       write(root .. "/tools/fixture.py", "VALUE = 2\n")
       t.assert_false(begin(ctx))
+    end)
+  end)
+
+  t.it("generated Python cache directory events preserve reuse but tool source edits revoke it", function()
+    fixture(function(ctx, _, root)
+      seal(ctx)
+      write(root .. "/tools/__pycache__/fixture.cpython.pyc", "derived cache\n")
+      t.assert_true(begin(ctx), "generated cache directory and children are owned output noise")
+      write(root .. "/tools/fixture.py", "VALUE = 3\n")
+      t.assert_false(begin(ctx), "ignoring generated cache must not hide actual tool source changes")
+    end)
+  end)
+
+  t.it("split native subscriptions retain input additions and artifact identity while excluding owned staging", function()
+    fixture(function(ctx, request, root)
+      write(root .. "/.cache/external-input/header.h", "// one\n")
+      local value = inputs.collect(request)
+      t.assert_true(value.ok, value.reason)
+      t.assert_true(vim.iter(value.roots):any(function(item)
+        return item.path == root and item.recursive == false
+      end), "engine parent must observe new top-level inputs")
+      t.assert_true(vim.iter(value.roots):any(function(item)
+        return item.path == root .. "/.cache/external-input" and item.recursive == true
+      end), "only owned nvim-ue outputs may be excluded")
+      t.assert_false(vim.iter(value.roots):any(function(item)
+        return item.recursive and (item.path == root or item.path == root .. "/.cache/nvim-ue")
+      end), "owned output staging must not fill a recursive ancestor queue")
+      seal(ctx)
+      for i = 1, 300 do write(root .. "/.cache/nvim-ue/staging/" .. i .. ".tmp", "derived\n") end
+      t.assert_true(begin(ctx), "owned staging cannot revoke unchanged inputs")
+      write(root .. "/.cache/external-input/header.h", "// two\n")
+      t.assert_false(begin(ctx), "other cache-tree inputs must still revoke reuse")
+      seal(ctx)
+      write(root .. "/NewInput/Source.h", "// new\n")
+      t.assert_false(begin(ctx), "new top-level input subtrees must revoke reuse")
+      seal(ctx)
+      write(ctx.paths.index_full_cdb, "corrupt published artifact\n")
+      t.assert_false(begin(ctx), "excluded outputs remain identity-bound")
     end)
   end)
 end)

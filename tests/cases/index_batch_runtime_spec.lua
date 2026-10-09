@@ -30,7 +30,7 @@ local function fixture(body)
   h.ctx = { paths = { clangd_dir = root, semantic_cdb = root .. "/background/compile_commands.json" } }
   h.command = { "clangd", "--background-index", "--compile-commands-dir=" .. root .. "/background" }
   h.descriptor = { ok = true, info_sha256 = "sha-v1", generation_id = "gen-a", compiler_environment = {}, tool_path = root .. "/clangd.exe",
-    receipts = { root .. "/receipt.json" },
+    compiler_lookup_environment = {}, receipts = { root .. "/receipt.json" },
     watch_roots = { root .. "/input", root .. "/output" }, exclude_roots = { root .. "/output" },
     input_roots = { root .. "/input" },
     watched_files = { root .. "/output/frozen.cpp", root .. "/output/metadata.json" },
@@ -749,13 +749,14 @@ t.describe("frozen batch startup runtime", function()
     end)
   end)
 
-  for _, mutation in ipairs({ "query", "cwd", "environment", "unknown-option", "enabled-config" }) do
+  for _, mutation in ipairs({ "query", "cwd", "environment", "lookup", "unknown-option", "enabled-config" }) do
     t.it("retains original commands after a certified profile changes " .. mutation, function()
       fixture(function(h, root)
-        h.config = { cmd_cwd = root, cmd_env = { CPATH = "proof-include" } }
+        h.config = { cmd_cwd = root, cmd_env = { CPATH = "proof-include", PATH = "validated-lookup" } }
         vim.list_extend(h.command, { "--enable-config=false", "--query-driver=clang*" })
         h.descriptor.server_profile = runtime.server_profile(h.command, h.config)
         h.descriptor.compiler_environment = { CPATH = "proof-include" }
+        h.descriptor.compiler_lookup_environment = { PATH = "validated-lookup" }
         h.prepare(); h.describe(); h.validate()
         local config, changed = vim.deepcopy(h.config), vim.deepcopy(h.command)
         local frozen = runtime.command(changed, config)
@@ -766,6 +767,7 @@ t.describe("frozen batch startup runtime", function()
           vim.fn.mkdir(root .. "/other", "p")
           config.cmd_cwd = root .. "/other"
         elseif mutation == "environment" then config.cmd_env.CPATH = "different"
+        elseif mutation == "lookup" then config.cmd_env.PATH = "changed-after-validation"
         elseif mutation == "unknown-option" then
           changed[#changed + 1], frozen[#frozen + 1] = "--experimental-semantic-option", "--experimental-semantic-option"
         else
@@ -780,18 +782,20 @@ t.describe("frozen batch startup runtime", function()
     end)
   end
 
-  for _, mutation in ipairs({ "cwd", "environment", "query" }) do
+  for _, mutation in ipairs({ "cwd", "environment", "lookup", "query" }) do
     t.it("rejects asynchronous validation if the requested " .. mutation .. " changes", function()
       fixture(function(h, root)
-        h.config = { cmd_cwd = root, cmd_env = { CPATH = "proof-include" } }
+        h.config = { cmd_cwd = root, cmd_env = { CPATH = "proof-include", PATH = "validated-lookup" } }
         vim.list_extend(h.command, { "--enable-config=false", "--query-driver=clang*" })
         h.descriptor.server_profile = runtime.server_profile(h.command, h.config)
         h.descriptor.compiler_environment = { CPATH = "proof-include" }
+        h.descriptor.compiler_lookup_environment = { PATH = "validated-lookup" }
         h.prepare(); h.describe()
         if mutation == "cwd" then
           vim.fn.mkdir(root .. "/other", "p")
           h.config.cmd_cwd = root .. "/other"
         elseif mutation == "environment" then h.config.cmd_env.CPATH = "changed-after-describe"
+        elseif mutation == "lookup" then h.config.cmd_env.PATH = "changed-after-describe"
         else h.command[#h.command] = "--query-driver=other*" end
         h.validate()
         t.assert_eq(#h.roots, 1)

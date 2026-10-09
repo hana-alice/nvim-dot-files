@@ -25,7 +25,7 @@ end
 
 local function collect(request)
   local ctx, paths = request.ctx or {}, (request.ctx or {}).paths or {}
-  local roots, seen, products, artifacts, compilers = {}, {}, {}, {}, {}
+  local roots, seen, products, artifacts, compilers, resolved_inputs = {}, {}, {}, {}, {}, {}
   local windows = uv.os_uname().sysname:match("Windows") ~= nil
   local function key(path) return windows and path:lower() or path end
   local function covered(path)
@@ -60,6 +60,10 @@ local function collect(request)
     end
   end
   local function input(path, base)
+    -- Many commands repeat the same include/toolchain paths. This inventory
+    -- only grows coverage; resolving each identical operand once preserves it.
+    local operand = tostring(base or "") .. "\0" .. tostring(path)
+    if resolved_inputs[operand] then return resolved_inputs[operand] end
     path = absolute(path, base)
     if not covered(path) then root(path) end
     -- Resolve even paths covered by a lexical root: junctions may point out.
@@ -68,6 +72,7 @@ local function collect(request)
       local physical = uv.fs_realpath(path)
       if physical and not covered(absolute(physical)) then root(physical) end
     end
+    resolved_inputs[operand] = path
     return path
   end
   local function product(path, required)
@@ -150,12 +155,15 @@ local function collect(request)
     ["-I"] = true, ["-isystem"] = true, ["-iquote"] = true, ["-idirafter"] = true,
     ["-include"] = true, ["-include-pch"] = true, ["-imacros"] = true,
     ["-isysroot"] = true, ["--sysroot"] = true, ["-ivfsoverlay"] = true,
+    ["--gcc-toolchain"] = true, ["-gcc-toolchain"] = true,
     ["-resource-dir"] = true, ["-fmodule-map-file"] = true, ["-fmodule-file"] = true,
     ["-o"] = true, ["-MF"] = true, ["/I"] = true, ["/FI"] = true, ["/Fo"] = true,
   }
-  local attached = { "--sysroot=", "-resource-dir=", "-fmodule-map-file=", "-fmodule-file=",
+  local attached = { "--gcc-toolchain=", "-gcc-toolchain=", "--gcc-install-dir=",
+    "--sysroot=", "-resource-dir=", "-fmodule-map-file=", "-fmodule-file=",
     "-ivfsoverlay=", "-isystem", "-iquote", "-idirafter", "-include-pch", "-include", "-imacros",
     "-I", "/external:I", "/FI", "/Fo", "/I" }
+  local attached_prefixes = {}
   for _, entry in ipairs(entries) do
     if type(entry.arguments) ~= "table" or #entry.arguments == 0 then error("command-only CDB unsupported") end
     local cwd = absolute(entry.directory)
@@ -172,13 +180,20 @@ local function collect(request)
         else input(entry.arguments[index], cwd) end
       else
         local parsed = false
-        for _, prefix in ipairs(attached) do
-          if token:sub(1, #prefix) == prefix and #token > #prefix then
-            if prefix == "-ivfsoverlay=" then overlay(token:sub(#prefix + 1), cwd)
-            else input(token:sub(#prefix + 1), cwd) end
-            parsed = true
-            break
+        local prefix = attached_prefixes[token]
+        if prefix == nil then
+          for _, candidate in ipairs(attached) do
+            if token:sub(1, #candidate) == candidate and #token > #candidate then
+              prefix = candidate
+              break
+            end
           end
+          attached_prefixes[token] = prefix or false
+        end
+        if prefix then
+          if prefix == "-ivfsoverlay=" then overlay(token:sub(#prefix + 1), cwd)
+          else input(token:sub(#prefix + 1), cwd) end
+          parsed = true
         end
         if not parsed then
           if token:sub(1, 1) ~= "-" and token:sub(1, 1) ~= "/" then
@@ -311,6 +326,39 @@ local function collect(request)
     if not remaining then break end
     scan(remaining)
   end
+  -- Owned products are stat-bound below, and their events have always been
+  -- excluded from the input epoch. Keep their staging bursts out of the kernel
+  -- queue too: direct parents observe replacement/new siblings; all other
+  -- existing directories retain recursive observation. Root-level additions
+  -- invalidate the capsule before any newly created subtree can be reused.
+  local subscriptions = {}
+  local owned_cache = absolute(ctx.engine_root) .. "/.cache/nvim-ue"
+  local function subscribe(directory)
+    if key(directory) == key(owned_cache) then return end
+    if key(owned_cache):sub(1, #directory + 1) ~= key(directory) .. "/" then
+      subscriptions[#subscriptions + 1] = { path = directory, recursive = true }
+      return
+    end
+    subscriptions[#subscriptions + 1] = { path = directory, recursive = false }
+    local scanner = assert(uv.fs_scandir(directory), "unreadable watch parent: " .. directory)
+    while true do
+      local name, kind = uv.fs_scandir_next(scanner)
+      if not name then break end
+      if name ~= ".git" then
+        local child = directory .. "/" .. name
+        if kind == "link" or kind == "unknown" then
+          local stat = assert(uv.fs_stat(child), "unresolvable watch child: " .. child)
+          kind = stat.type
+        end
+        if kind == "directory" then subscribe(child) end
+      end
+    end
+  end
+  for _, item in ipairs(roots) do
+    if key(item.path) == key(absolute(ctx.engine_root)) then subscribe(item.path)
+    else subscriptions[#subscriptions + 1] = item end
+  end
+  roots = subscriptions
   table.sort(roots, function(a, b) return a.path < b.path end)
   table.sort(artifacts, function(a, b) return a.path < b.path end)
   if #roots > (request.max_roots or 32) then error("watch root budget exceeded") end

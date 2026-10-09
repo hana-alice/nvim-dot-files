@@ -76,7 +76,7 @@ local function output_event(root, name, events)
   if events.stable_directory_write then return true end
   local path = fs.join(root, name):lower()
   return path:find("/.cache/nvim-ue/", 1, true) ~= nil or path:match("/%.cache/nvim%-ue$") ~= nil
-    or path:find("/__pycache__/", 1, true) ~= nil
+    or path:find("/__pycache__/", 1, true) ~= nil or path:match("/__pycache__$") ~= nil
 end
 
 local function collect(ctx, required, done, admitted)
@@ -148,7 +148,7 @@ end
 -- invoke the original complete path; unavailable native coverage never guesses.
 function M.begin(ctx, opts, done)
   opts = opts or {}
-  pcall(function() require("utils.probe").observe("prepare-path", "input-epoch-fast-2026-10-09-P") end)
+  pcall(function() require("utils.probe").observe("prepare-path", "gcc-toolchain-fast-2026-10-09-P2") end)
   if not leave_registered then
     leave_registered = true
     vim.api.nvim_create_autocmd("VimLeavePre", { callback = M.stop })

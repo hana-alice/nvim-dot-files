@@ -367,18 +367,18 @@ function M.install(owner, deps)
         return
       end
       local miss_reason = extra and extra.fallback_reason or definition_miss_reason()
-      if role == "declaration" or (miss_reason ~= "index-incomplete"
-          and miss_reason ~= "index-provider-not-ready" and miss_reason ~= "identity-missing") then
-        local stage = miss_reason == "identity-missing" and "entity" or "index"
-        finish(transaction.terminal("unavailable", stage, miss_reason,
-          vim.tbl_extend("force", { subject_role = role, index = tx.index }, extra or {})))
+      if inspection and role ~= "declaration" and (miss_reason == "index-incomplete"
+          or miss_reason == "index-provider-not-ready" or miss_reason == "identity-missing") then
+        jump_resolved(declaration, "semantic·declaration", vim.tbl_extend("force", {
+          destination_role = "declaration", terminal_reason = miss_reason, index = tx.index,
+        }, extra or {}))
         return
       end
-      jump_resolved(declaration, "semantic·declaration", vim.tbl_extend("force", {
-        destination_role = "declaration",
-        terminal_reason = miss_reason,
-        index = tx.index,
-      }, extra or {}))
+      -- A header's proven declaration is identity evidence, not a substitute
+      -- for an out-of-line body when clangd is empty or only returns declarations.
+      local stage = miss_reason == "identity-missing" and "entity" or "index"
+      finish(transaction.terminal("unavailable", stage, miss_reason,
+        vim.tbl_extend("force", { subject_role = role, index = tx.index }, extra or {})))
     end
 
     local function lookup_module_definition(authoritative_usr, role, on_miss)
@@ -556,16 +556,25 @@ function M.install(owner, deps)
                 }))
                 return
               end
-              jump_resolved(locations[1], "clangd·USR-verified", {
-                provider = "clangd",
-                destination_role = "definition",
-                subject_role = role,
-                identity = authoritative_usr,
-                identity_result = symbol_info,
-                provider_result = definition_result,
-                metrics = { source = "clangd", identity_ms = symbol_info.elapsed_ms,
-                  destination_ms = definition_result.elapsed_ms },
-              })
+              require("utils.ue_goto.clangd_destination").verify(locations[1], authoritative_usr,
+                clangd_client_ids, function(target_evidence)
+                  if not request_is_current() or target_evidence.reason == "provider-cancelled" then
+                    finish_stale("destination-changed")
+                  elseif target_evidence.reason ~= "ok" then
+                    finish(transaction.terminal("unavailable", "destination", "definition-not-found", {
+                      provider = "clangd", identity = authoritative_usr,
+                      detail = target_evidence.reason, target_identity_result = target_evidence,
+                    }))
+                  else
+                    jump_resolved(locations[1], "clangd·USR-verified", {
+                      provider = "clangd", destination_role = "definition", subject_role = role,
+                      identity = authoritative_usr, identity_result = symbol_info,
+                      target_identity_result = target_evidence, provider_result = definition_result,
+                      metrics = { source = "clangd", identity_ms = symbol_info.elapsed_ms,
+                        destination_ms = definition_result.elapsed_ms },
+                    })
+                  end
+                end, provider_options({}))
             end, provider_options({
               client_ids = clangd_client_ids,
               compile_command_source = response.contexts and response.contexts[1]

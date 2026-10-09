@@ -92,6 +92,32 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 已将具名调查切片归档至 [2.7.0](release_2.7.0.md)。
 
+### 2026-10-09 — 后台 SuperUnity 证明、prepare 输入缓存骨架与头文件 clangd 目标校验
+
+**Task**
+- 用户约束：Windows 文件系统是索引瓶颈，任何方案都不得依赖等 clangd 后台索引全部完成。本轮把二次合并证明挪出 prepare，并为无变化 prepare 与头文件跳转打基础。
+
+**Implemented**
+- 后台 SuperUnity 证明：正常 full 只复用缓存回执，交付后启动后台队列；最多 2 个私有 clangd（-j=1、IDLE 优先级、宿主准入），120 s 攒批后排空再增量发布；大 CDB 合并/hash 放到独立 `batch_publish_worker`，编辑器只接小结果并走原冻结激活流程。新增 `index/_batch_background`、`batch_background`、`batch_publish_worker`、`tools/cdb_background_batch.py`。
+- prepare 输入证据缓存：`cdb/prepare_cache` + `prepare_inputs`，在 writer lease 内用 Windows 原生 watcher epoch 与产物身份判断输入未变时跳过 raw/pipeline/partition/commit/current/hot/full；未知参数、未知 VFS、监听溢出/停止、产物缺失或损坏、工具源码变化一律回退完整路径。
+- 头文件 clangd 兜底：跳转前校验目标 exact-command AST 的 canonical USR、definitionRange/body 与 changedtick；删除无定义体时悄悄回跳声明的成功路径。
+
+**Pitfalls / Gotchas**
+- clangd 冷启动读入 33,026 个 shard 约 9.7 s、内存重建约 9 s，约 19.5 s 才能回答头文件定义；不必等 background end，但首次 <3 s 不可达，瓶颈即 shard 数量。
+- 并发 clangd+sidecar 原型被真实反例否决（只校验目标位置不足），已撤回。
+- 旧证明回执因 compiler PATH 不同全部失效，门禁正确拒绝；需环境身份规范化。
+- 跨子进程 JSON 会丢失 Windows 大整数 inode 精度；签名需带类型与长度的稳定编码。
+
+**Validation**
+- 全量回归 3329/3329，0 失败、0 跳过；回归前后工作树哈希一致。
+- 真实 Android/Test 后台证明约 8.7 min：完成 7 组（接受 4、拒绝 3），发布 2 批；prepare 51 ms 返回，full 交付约 40 s；单组约 130 s（原 TU 两次约 40 s、候选约 18 s、约 70 s 未分阶段）。
+- 真实头文件 gd（独立冷进程）：P01 37.9/38.7 s、E02 33.7/32.2 s 超时；P12 重复跳对 `.cpp`；无错误目标。
+
+**Follow-ups（未完成）**
+- prepare 快速路径在真实工程**未启用**：真实 argv 含 `--gcc-toolchain=` 被保守拒绝；无变化 prepare <10 s 未实测。
+- 后台证明铺满 304 候选推算约 6.3 h；PATH 规范化、70 s 残差拆解、headless 心跳最大 3.7 s 卡顿待处理。
+- 头文件首次/重复 gd 延迟未达标；新增 clangd 兜底分支尚无真实工程触发证据。
+
 ### 2026-10-09 — 二次合并随 prepare 逐轮增长
 
 **Task**

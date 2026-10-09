@@ -462,6 +462,7 @@ t.describe("prepare 的索引调度不得被普通编辑饿死（真正的根因
       vim = { log = vim.log, notify = noop },
       require = function(name)
         if name == "utils.code_search" then return { _reset_probe_cache = noop } end
+        if name == "ue.cdb.prepare_cache" then return { complete = noop } end
         error("no watcher in isolated completion test")
       end,
       INDEX_FN = { schedule_prepare_delivery = function(actual)

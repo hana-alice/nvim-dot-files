@@ -377,12 +377,17 @@ def main():
         batch_metrics = None
         if args.verified_batches:
             from cdb_verified_batch import accelerate
-            background_entries, batch_metrics = accelerate(
-                super_entries, args.verified_batch_store or os.path.join(os.path.dirname(stable_super_dir), 'verified_batches'),
-                args.clangd, max_group=args.batch_size, verify_missing=not args.reuse_verified_only,
-                server_profile=args.server_profile, max_sources=args.max_mods,
-                max_new_groups=args.batch_proof_limit)
-        outputs = [(background_out, json.dumps(background_entries)),
+            store = args.verified_batch_store or os.path.join(os.path.dirname(stable_super_dir), 'verified_batches')
+            if args.reuse_verified_only and args.verified_batch_store is None:
+                from cdb_background_batch import reuse_completed
+                background_entries, batch_metrics = reuse_completed(super_entries, store, args.clangd, args.server_profile)
+            else:
+                background_entries, batch_metrics = accelerate(
+                    super_entries, store, args.clangd, max_group=args.batch_size, verify_missing=not args.reuse_verified_only,
+                    server_profile=args.server_profile, max_sources=args.max_mods,
+                    max_new_groups=args.batch_proof_limit)
+        from cdb_background_batch import encode_preserving
+        outputs = [(background_out, encode_preserving(background_out, background_entries)),
                    (background_out + '.semantic.json', json.dumps(super_entries))]
         if args.idx_output:
             marker = {
@@ -403,7 +408,7 @@ def main():
                 marker['verified_batches'] = {key: batch_metrics[key] for key in (
                     'original_ubt_count', 'batch_count', 'accepted_ubt_count', 'retained_ubt_count',
                     'exact_count', 'shader_count', 'other_count', 'output_entries') if key in batch_metrics}
-            outputs.append((os.path.abspath(args.idx_output), json.dumps(marker)))
+            outputs.append((os.path.abspath(args.idx_output), encode_preserving(os.path.abspath(args.idx_output), marker)))
         write_outputs_if_changed(outputs)
         routed = sum(entry.get('nvim_ue_background_route') == 'shader-compatibility' for entry in background_entries)
         print(f'  background (clangd): {background_out}    {len(background_entries) - routed} native tasks; '

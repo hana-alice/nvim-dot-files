@@ -7754,8 +7754,6 @@ local function prepare_async(opts)
 
   _ufs.ensure_dir(ctx.paths.cache)
 
-  -- ── Timing & ETA ─────────────────────────────────────────────────────
-  -- Load previous run timings for ETA estimation
   local prev_timings = ctx.state.prepare_timings or {}
   local phase_start = vim.uv.hrtime()
   local total_start = phase_start
@@ -7795,10 +7793,6 @@ local function prepare_async(opts)
     return ""
   end
 
-  -- ── fidget progress (created BEFORE fast-path so async ccjson can stream
-  --     progress events into it; previously this was only set up on the cold
-  --     path after fast-path returned, so fast-path's 17s ccjson run looked
-  --     like a silent freeze) ─────────────────────────────────────────────
   local ok_fidget, progress = pcall(require, "fidget.progress")
   local handle
   if ok_fidget then
@@ -7819,9 +7813,6 @@ local function prepare_async(opts)
     end
   end
 
-  -- Cover the entire fast path, including async CDB generation and the writer
-  -- pipeline. Previously only the cold GTAGS phase set this flag, so two quick
-  -- :UEPrepare calls could concurrently rewrite compile_commands.json.
   local prepare_lease = opts._prepare_lease
   local prepare_lease_err
   if not prepare_lease then
@@ -7837,15 +7828,25 @@ handle:finish() end
   end
   CORE_RT.prepare_lease = prepare_lease
   set_prepare_running(true)
-
+  local prepare_cache = require("ue.cdb.prepare_cache")
+  local function continue_prepare(reused_inputs)
+  if reused_inputs then
+    CORE_RT.trace_mark("PREPARE_INPUTS_UNCHANGED")
+    invalidate_status_cache()
+    refresh_statusline()
+    CORE_RT.start_deferred_clangd(ctx)
+    prepare_cache.continue_background(ctx)
+    set_prepare_running(false)
+    if handle then handle.message = "done (inputs unchanged)"; handle.percentage = 100; handle:finish() end
+    vim.notify(prepare_summary(ctx, compile_commands_targets(ctx)[1], { reused_cache = true }))
+    return
+  end
   -- ── Cache fast-path ──────────────────────────────────────────────────
   if prepare_cache_ready(ctx) then
     CORE_RT.trace_mark("FAST_PATH_TAKEN")
     local root = workspace_root(ctx)
     update("generating compile_commands (async)...", 25)
 
-    -- Async ccjson — runs in headless nvim subprocess, streams progress
-    -- here, and continues with the rest of fast-path in on_done.
     M.async_generate_compile_commands(ctx,
       function(stage, pct, detail)
         update(detail, pct)
@@ -7865,6 +7866,7 @@ handle:finish() end
         -- Generation, pipeline and partition have committed together.
         clear_index_dirty(ctx)
         INDEX_FN.schedule_prepare_delivery(ctx)
+        require("ue.cdb.prepare_cache").complete(ctx)
         invalidate_status_cache()
         refresh_statusline()
         set_prepare_running(false)
@@ -7874,7 +7876,6 @@ handle.percentage = 100
 handle:finish() end
         vim.notify(prepare_summary(ctx, compile_path, { reused_cache = true }))
 
-        -- csearch index rebuild (same logic as before, just moved here).
         local code_search_fp = require("utils.code_search")
         local cs_ctx_fp = { workspace_root = root, csearch_idx = ctx.paths and ctx.paths.csearch_idx or nil }
         local need_index = true
@@ -7887,11 +7888,6 @@ handle:finish() end
           elseif not idx_stat or (idx_stat.size or 0) <= 1024 then
             stale_reason = "missing"
           else
-            -- Reuse the canonical freshness oracle. It already considers
-            -- worktree-aware git index mtime + dir mtimes
-            -- and the watcher's persistent dirty set — all the things this
-            -- fast-path used to half-implement and get wrong for git
-            -- worktrees / projects without their own .git.
             local fr = prepare_freshness(ctx)
             if fr == "fresh" then
               need_index = false
@@ -7908,8 +7904,6 @@ handle:finish() end
             for line in io.lines(ctx.paths.workspace_all_list) do
               local trimmed = line:gsub("\r$", "")
               if trimmed ~= "" then
-                -- Guard against cross-drive absolute paths in workspace_all_list
-                -- (see lengthy comment near the sync path for the full story).
                 if _ufs.is_absolute_path(trimmed) then
                   fout:write(trimmed, "\n")
                 else
@@ -8068,7 +8062,7 @@ handle:finish() end
         on_compile_pipeline_done(true)
       end)
 
-    -- ── Phase 3b: build GTAGS (async, slow) ───────────────────────────
+    -- Phase 3b: build GTAGS (async, admitted)
     update(("indexing %d files with gtags..."):format(#workspace_code), 35)
     start_phase()
 
@@ -8174,6 +8168,7 @@ handle:finish() end
             set_prepare_running(false)
             if cdb_pipeline_ok then
               INDEX_FN.schedule_prepare_delivery(ctx)
+              require("ue.cdb.prepare_cache").complete(ctx)
               CORE_RT.start_deferred_clangd(ctx)
             else
               vim.notify(
@@ -8378,8 +8373,11 @@ handle:finish() end
   end
 
   start_scan()
+  end
+  prepare_cache.begin(ctx, vim.tbl_extend("force", opts, { cache_ready = function()
+    return prepare_cache_ready(ctx)
+  end }), continue_prepare)
 end
-
 -- export_compile_commands is now an alias for the unified prepare flow
 export_compile_commands = prepare_async
 CORE_RT.prepare_async = prepare_async

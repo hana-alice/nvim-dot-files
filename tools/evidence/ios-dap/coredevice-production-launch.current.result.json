@@ -25,12 +25,7 @@
       "breakpoints": [
         {
           "id_digest": "0c8b5835f10e",
-          "line": 651,
-          "verified": true
-        },
-        {
-          "id_digest": "96e9856f6007",
-          "line": 651,
+          "line": 555,
           "verified": true
         }
       ],
@@ -41,7 +36,7 @@
       "hit_breakpoint_count": 0,
       "name": "stopped",
       "reason": "exception",
-      "thread_digest": "235d3383c945"
+      "thread_digest": "5f8957d64be0"
     },
     {
       "name": "continue"
@@ -51,51 +46,38 @@
       "hit_breakpoint_count": 1,
       "name": "stopped",
       "reason": "breakpoint",
-      "thread_digest": "06da7aa05e2b"
+      "thread_digest": "5f8957d64be0"
     }
   ],
   "exact_source_frame": true,
   "frames": [
     {
-      "id_digest": "d50fd5fe5c4d",
-      "line": 4804,
+      "id_digest": "5c469273c397",
+      "line": 555,
       "source": {
-        "digest": "79318d46cd85",
-        "name": "LaunchEngineLoop.cpp"
+        "digest": "1ce452ffd327"
       }
     },
     {
-      "id_digest": "25bbc38ba81f",
-      "line": 0
-    },
-    {
-      "id_digest": "d6c834d5a653",
-      "line": 0
-    },
-    {
-      "id_digest": "9a6ebf90a8a0",
+      "id_digest": "3b97bb11c22f",
       "line": 0
     }
   ],
   "identity": {
     "binary": {
-      "digest": "44dd5670c677",
-      "name": "Client"
+      "digest": "9aa9e7fe7374"
     },
     "bundle_digest": "c72d992232e1",
     "cwd": {
-      "digest": "1757fc3ef7e1",
-      "name": "Client"
+      "digest": "2c816a596483"
     },
-    "device_digest": "05e77b06c298",
+    "device_digest": "c2c9549df0f1",
     "dsym": {
-      "digest": "fcb1a2f36b83",
-      "name": "Client.dev.branch36.Launch.dSYM"
+      "digest": "2927f41aab04"
     },
     "expression_digest": "89c375db9b45",
     "project": {
-      "digest": "d8f9a92153dc",
-      "name": "Client.uproject"
+      "digest": "abf1f554e3d5"
     }
   },
   "loaded_image_uuid_match": true,
@@ -120,7 +102,7 @@
     },
     {
       "level": 2,
-      "message": "[ue.dap] iOS source breakpoint proven: <redacted>:4804; :UEDAPEval is ready"
+      "message": "[ue.dap] iOS source breakpoint proven: <redacted>:555; :UEDAPEval is ready"
     },
     {
       "level": 2,
@@ -129,19 +111,17 @@
   ],
   "schema": "ue-ios-production-dap-smoke-v1",
   "source_frame": {
-    "line": 4804,
+    "line": 555,
     "source": {
-      "digest": "79318d46cd85",
-      "name": "LaunchEngineLoop.cpp"
+      "digest": "1ce452ffd327"
     }
   },
   "status": "passed",
   "stop_reason": "breakpoint",
   "target": {
-    "line": 4804,
+    "line": 555,
     "source": {
-      "digest": "79318d46cd85",
-      "name": "LaunchEngineLoop.cpp"
+      "digest": "1ce452ffd327"
     }
   },
   "verified_breakpoint": true

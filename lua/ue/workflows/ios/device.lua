@@ -165,7 +165,10 @@ function M.select(platform, opts, deps)
     end
     if preferred_device_id ~= "" then
       for _, device in ipairs(devices) do
-        if device.id == preferred_device_id and device.available ~= false then
+        if
+          (device.id == preferred_device_id or device.mobiledevice_id == preferred_device_id)
+          and device.available ~= false
+        then
           persist_device(device)
           return true
         end
@@ -309,8 +312,15 @@ function M.select(platform, opts, deps)
     workflow_progress:report("Checking USB and Wi-Fi MobileDevice routes", 35)
     local devices = vim.deepcopy(primary_devices or {})
     local positions = {}
-    for index, device in ipairs(devices) do
+    local function index_device(device, index)
       positions[device.id] = index
+      local mobiledevice_id = deps.trim(device.mobiledevice_id or "")
+      if mobiledevice_id ~= "" then
+        positions[mobiledevice_id] = index
+      end
+    end
+    for index, device in ipairs(devices) do
+      index_device(device, index)
     end
     local pending = #plans
     local function present_choices()
@@ -366,9 +376,12 @@ function M.select(platform, opts, deps)
       local position = positions[device.id]
       if not position then
         devices[#devices + 1] = device
-        positions[device.id] = #devices
+        index_device(device, #devices)
+      elseif devices[position].backend == "coredevice" then
+        return
       elseif devices[position].transport == "network" and device.transport == "usb" then
         devices[position] = device
+        index_device(device, position)
       end
     end
     local function complete_one()

@@ -81,6 +81,10 @@ function M.build_config(opts)
     ("device process attach -p %d"):format(pid),
     "target symbols add " .. lldb_quote(dsym),
   }
+  local init_commands = vim.deepcopy(opts.init_commands or {})
+  -- A start-stopped device can take 20s per initial process/image query.
+  -- DAP's request timeout does not cover LLDB's default 5s packet timeout.
+  init_commands[#init_commands + 1] = "settings set plugin.process.gdb-remote.packet-timeout 60"
   return {
     name = mode == "launch" and "UE IOS CoreDevice Debug Launch" or "UE IOS CoreDevice Attach",
     _ue_ios_backend = "coredevice",
@@ -94,7 +98,7 @@ function M.build_config(opts)
     stopOnEntry = true,
     timeout = 240,
     cwd = trim(opts.cwd) ~= "" and opts.cwd or vim.fn.getcwd(),
-    initCommands = vim.deepcopy(opts.init_commands or {}),
+    initCommands = init_commands,
     attachCommands = commands,
     postRunCommands = { "process status", uuid_probe },
   }

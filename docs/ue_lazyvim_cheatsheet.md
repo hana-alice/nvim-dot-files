@@ -933,6 +933,7 @@ literal `<F5>` in insert mode).
 | `<leader>dn` / `F10` | `:UEDAPStepOver` | Step over |
 | `<leader>di` / `F11` | `:UEDAPStepIn` | Step in (Neovide may steal F11 — see note) |
 | `<leader>do` / `S-F11` | `:UEDAPStepOut` | Step out |
+| — | `:UEDAPStop` | Stop through the frozen session owner (iOS launch stops its process; attach preserves it) |
 
 ### Breakpoints
 
@@ -946,8 +947,9 @@ literal `<F5>` in insert mode).
 **Persistent breakpoints**: `F9` / `<leader>db` write to
 `<engine_root>/.cache/nvim-ue/breakpoints/<project>.json`, survive nvim
 restarts, and lazy-restore on `BufReadPost`. Saves are debounced 250ms.
-Module: `lua/ue/dap/_persist_bp.lua`. In-session, breakpoints are planted live
-via the lldb-dap evaluate channel (no reattach needed).
+Module: `lua/ue/dap/_persist_bp.lua`. In-session, iOS uses nvim-dap's source
+breakpoint requests; Android plants live breakpoints via the lldb-dap evaluate
+channel. Neither requires reattach for ordinary breakpoint changes.
 
 ### Inspect / evaluate / navigate
 
@@ -972,17 +974,151 @@ via the lldb-dap evaluate channel (no reattach needed).
 | `<leader>d1` | `:UEDAPTab repl` | Focus REPL tab |
 | `<leader>d2` | `:UEDAPTab console` | Focus Console tab |
 | `<leader>d3` | `:UEDAPTab breakpoints` | Focus Breakpoints tab |
-| `<leader>d4` | `:UEDAPTab logcat` | Focus Logcat tab |
+| `<leader>d4` | `:UEDAPTab log` | Focus target logs: iOS Logs on IOS, Logcat on Android |
 | `<leader>d]` / `<leader>d[` | `:UEDAPNextTab` / `:UEDAPPrevTab` | Cycle DAP tabs |
 
 Other commands (no default key): `:UEDAPStatus`, `:UEDAPDiag`,
 `:UEDAPHover`, `:UEDAPListBreakpoints`, `:UEDAPReattach`, `:UEDAPRestartFrame`.
+`:UEDAPTab logcat` remains a compatibility alias for the fourth, target-specific log tab.
 
 **Note (Neovide 0.16+)**: F11 defaults to fullscreen. If `F11` toggles
 fullscreen instead of stepping in, set `vim.g.neovide_fullscreen = false`.
 
 `:qa` triggers `VimLeavePre`, which flushes any pending breakpoint save and
 auto-cleans the DAP session.
+
+### iOS 真机调试操作手册（macOS 本机）
+
+本流程假定 Neovim、Xcode、本地 UE 工程与物理 iPhone/iPad 在同一台 Mac 上。iOS 17+ 使用
+CoreDevice；pre-iOS17 使用独立的 legacy MobileDevice/debugserver 路线。设备选择决定 backend，
+失败不会自动换设备、换 backend 或改成 Mac 进程 attach。
+
+#### 1. 准备当前构建、符号与已安装应用
+
+1. 用 `:UESetProject <workspace>` 选择工程，`:UESetPlatform IOS` 选择 IOS 配置，
+   `:UESetIOSDevice` 选择实际连接的真机。设备需启用 Developer Mode、完成信任配对，并能被当前
+   Xcode 访问；debug provisioning profile 必须包含该设备且允许 `get-task-allow`。
+2. 若已在 Neovim 中编译当前 target/configuration，可以复用该次构建；否则执行 `:UEBuildIOS`。
+   Build 只 compile/link，日常构建不会自动生成 dSYM。
+3. 执行 `:UEIOSSymbols` 为**刚才的 binary**生成符号，等任务成功后再启动调试。默认工件为
+   `<project_dir>/Binaries/IOS/<target>` 与同路径的 `<target>.dSYM`。
+4. CoreDevice 首次安装或 binary 已更新时，执行 `:UEPackageIOS` → `:UEInstallIOS`。
+   Package 复用已有 cooked data，只 stage/package；Install 原地安装且不启动应用。
+   signing identity 可用 `:UESetIOSSigningCertificate` 从本工程 prepared manifest 导入或显式选择。
+   符号生成不会把新 binary 安装到设备；仅更新 dSYM 也不会更新已安装的 app。
+
+`:UEIOSSymbols` 调用仓内 `scripts/ue_ios_cpp_iteration.zsh`，由 `xcrun` 使用当前 Xcode 的
+`dsymutil --linker parallel --verify-dwarf=output` 生成 `<binary>.dSYM`，随后比较 binary 与 dSYM
+UUID，不生成 ZIP。CoreDevice DAP 默认用 `xcrun --find lldb-dap` 解析 Apple adapter；缺少时会
+明确失败，不会静默改用 Homebrew LLVM。
+
+#### 2. 从启动时调试（Launch）
+
+1. 打开**对应构建的本地源码**，在希望首次执行时停下的位置按 `F9`。例如某次构建曾在
+   `Engine/Source/Runtime/Launch/Private/IOS/LaunchIOS.cpp:555` 的 `main` 命中；这只是操作示例，
+   文件行号与可停位置会随源码、配置和优化改变，应以当前源码及当前 frame 为准。
+2. 执行 `:UEDAPLaunch ios` 或 `<leader>dl`。CoreDevice 路线以 `--start-stopped` 启动当前 bundle，
+   捕获并复验其 PID，再连接 Apple lldb-dap。该命令使用 `--terminate-existing`，会替换该 bundle
+   已有进程；需要保留现有运行状态时使用下一节的 Attach。
+3. 等待 attach、loaded executable UUID 与断点 resolved 的证据。初始暂停允许在首次继续前添加
+   源码断点；`F5` 继续后，应收到真正的 `breakpoint` stop 并跳到预期本地文件/行。
+   只有断点标记、attach response 或 DAP UI 出现，都不足以证明断点已命中。
+4. 暂停后用 `F10` / `F11` / `S-F11` 单步，`<leader>dk` / `<leader>dj` 切换 stack frame。
+   `:UEDAPEval` 可先输入 `1+2` 检查 evaluate 通道；复杂 C++/UE 表达式是否可用取决于当前
+   Apple LLDB、符号和 frame。表达式失败或 adapter 退出时应保留诊断，不要把简单表达式成功
+   当成所有 UE 对象求值已验证。
+
+普通 `:UELaunch` 保持非调试启动语义，不会 start-stopped；它与 `:UEDAPLaunch ios` 分开。
+
+#### 3. 附加已运行应用（Attach）
+
+1. 先以普通 `:UELaunch` 或设备端启动**已安装的当前 bundle**。
+2. 在接下来会执行的源码位置按 `F9`，执行 `:UEDAPAttach ios` 或 `<leader>da`。
+   handler 查询当前设备进程并复验 bundle/PID，不把上次普通 launch 返回的 PID 当成当前真相。
+   应用未运行、PID 消失、同号 PID 已属其他 app 或进程无法唯一确定时会失败。
+3. Attach 完成并通过 UUID gate 后，按 `F5` 继续，让目标走到断点。已经执行过的一次性启动代码
+   不会因 attach 重新执行；此时应选择后续路径，或改用 Debug Launch。
+
+两种入口都冻结当次 project、device/backend、bundle、PID、binary/dSYM 与 adapter。
+会话中切换 `:UESetProject`、`:UESetPlatform` 或 `:UESetIOSDevice` 不会更改该会话的调试与清理归属。
+
+#### 4. iOS Logs、Console 与调试诊断
+
+| 入口 | 内容 |
+|---|---|
+| `<leader>d4` / `:UEDAPTab log` | **iOS Logs**：通过已有 `idevicesyslog` 读取冻结设备上该会话 PID 的设备日志 |
+| `<leader>d1` / `:UEDAPTab repl` | **REPL**：DAP adapter 的 output event、连接/UUID 消息与表达式交互输出 |
+| `<leader>d2` / `:UEDAPTab console` | **Console**：adapter 请求 `runInTerminal` 时使用的集成终端；iOS attach 不保证请求或输出，不等同于设备 syslog |
+| `:UEDAPStatus` | 当前冻结 iOS owner、operation 与会话状态 |
+| `:DapShowLog` | nvim-dap 的 adapter/protocol 诊断日志（插件加载后可用） |
+| `:NvimLog` / `:NvimLogPath` | 本配置的错误记录与当前记录文件路径 |
+
+iOS Logs 会按 session 的 CoreDevice identifier 查询其 hardware UDID，再按冻结 PID 过滤；
+不会选择“第一台设备”，不会混入 Android `adb logcat`。reader 在 DAP initialized 时自动启动，
+切到第四页后保留该 reader 已收到的最近 12,000 行，不需要等第一次打开日志页才开始收集。
+日志读取不会 continue、detach 或重新启动正在暂停的 app。日志页没内容可能是该 PID 此时没有
+新输出；暂停会话不会持续产生游戏日志，也不会把上次运行的历史输出补成当前日志。
+`:Tasks` 可查看该日志 reader，`:TaskStop <id>` 只停止 reader，不结束 debugger 或改变暂停状态。
+
+`idevicesyslog` 是可选的已有宿主工具。缺失或该设备日志连接失败时，日志页明确显示原因，
+不自动安装依赖，DAP 本身仍可调试。旧命令 `:UEDAPTab logcat` 兼容为同一日志页。
+普通 UE app log（`:UELogToggle`）的 IOS 主日志策略目前仍未支持；查看 iOS DAP 日志请使用第四页。
+
+#### 5. UUID、dSYM 与连接失败排错
+
+| 症状 / 归属 | 核对与处置 |
+|---|---|
+| L0：缺少 Apple lldb-dap / Xcode tool | 核对当前选定的 Xcode 能否提供 `xcrun --find lldb-dap`；CoreDevice 不换成其他平台 adapter |
+| L1/L2：设备连接、信任、Developer Mode 或 debug entitlement 拒绝 | 核对冻结设备的连接与实际拒绝证据，再处理配对、Developer Mode 或匹配的 development profile |
+| L4：本地 binary/dSYM UUID 不同 | 重新对当前 binary 执行 `:UEIOSSymbols`；不要使用另一构建的符号 |
+| L4：DWARF verification 失败 | 重新生成通过结构验证的 dSYM；`dwarfdump --uuid` 相同本身不能证明 DWARF 可用 |
+| L4：loaded executable UUID mismatch | 确认设备安装的是本次构建，重新 package/install 后再调试；不要关闭 gate 或改用旧 app |
+| L3：Apple lldb-dap 退出、evaluate 无响应 | 记录 adapter 日志与具体请求；EOF cleanup 会释放本仓会话状态，不代表 LLDB 引擎问题已经修复 |
+
+手动核对符号时，以下路径替换为当前 `<project_dir>/Binaries/IOS/<target>`；它们只读取本地
+工件，不会继续或停止设备进程：
+
+```sh
+xcrun dwarfdump --uuid "/path/to/Binaries/IOS/SampleGame"
+xcrun dwarfdump --uuid "/path/to/Binaries/IOS/SampleGame.dSYM"
+xcrun dwarfdump --verify --quiet "/path/to/Binaries/IOS/SampleGame.dSYM"
+```
+
+**UUID 与 DWARF verification 通过仍不等于 LLDB evaluate 安全。**2026-10-09 的真机排查中，
+默认 Apple parallel `dsymutil` 生成的一个大型 UE dSYM 通过了这两项检查，但 C++ evaluate 仍让
+Apple LLDB stack overflow；使用宿主上**已有的 LLVM 23.1.3 `dsymutil`**，以
+`--linker parallel --verify-dwarf=output` 重新生成后才通过该构建的真机验证。这是当前构建的实证，
+不是所有 Apple 产物或所有新版 LLVM 都有同样结论；默认 `:UEIOSSymbols` helper 仍使用当前
+Xcode 的工具，没有自动切换到 LLVM 23，也不会安装依赖。
+
+若默认 helper 的产物复现该问题，先保存 adapter crash/request 证据并备份原 dSYM，再用已存在且
+经验证的 `dsymutil` 输出到**新的临时 bundle**，例如：
+
+```sh
+"/path/to/existing/dsymutil" --linker parallel --verify-dwarf=output \
+  "/path/to/Binaries/IOS/SampleGame" \
+  -o "/path/to/Binaries/IOS/SampleGame.candidate.dSYM"
+xcrun dwarfdump --uuid "/path/to/Binaries/IOS/SampleGame.candidate.dSYM"
+xcrun dwarfdump --verify --quiet "/path/to/Binaries/IOS/SampleGame.candidate.dSYM"
+```
+
+在结束原调试会话后，以 candidate 作为新会话显式指定的 dSYM（`ue.dap.ios.launch/attach` 的
+`dsym` 选项），复验同一 binary 的 UUID、DWARF、设备 loaded-image UUID、真实源码断点/frame
+以及曾失败的 evaluate；全部证据通过后才替换默认 `<binary>.dSYM`，并保留原备份。
+只换工具版本、生成成功或简单表达式成功，都不能替代这组验收。
+
+CoreDevice 在 attach 前设置 `plugin.process.gdb-remote.packet-timeout 60`，保留传入的其他 init
+commands。实测 start-stopped 初始连接的 `qProcessInfo` 曾需约 20 秒；LLDB 默认 5 秒会先超时，
+断开的通道随后还可能表现为 loaded UUID mismatch。60 秒是远端包等待上限，不会主动 continue，
+不会取消 binary/dSYM/loaded-image UUID 检查，也不会让真实不匹配通过。再次出现 mismatch 时，
+应结合 adapter 日志判断是否先发生传输超时，再处理实际的工件不一致。
+
+#### 6. 停止与清理归属
+
+使用 `:UEDAPStop` 结束会话。**Debug Launch 创建的 PID**由该 owner 停止并复验退出；
+**Attach 接入的已有 PID**只 detach 并复验进程保留。协议退出、adapter EOF、用户 Stop 与 Neovim
+退出沿用同一 owner cleanup；重复事件不会重复执行有副作用的 teardown，旧会话晚到的回调也不会
+清理新会话的 PID。日志 reader 可以单独停止；停止 reader 不等于停止 debugger。
 
 ---
 

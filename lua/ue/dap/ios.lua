@@ -15,6 +15,7 @@ local M = {
   _starting = false,
   _stopping = false,
 }
+local owner_sequence = 0
 local INIT_COMMANDS = {
   "settings set stop-disassembly-display never",
   "settings set target.inline-breakpoint-strategy always",
@@ -445,12 +446,18 @@ local function preserves_attached_process(runtime)
   return runtime and runtime.backend == "coredevice" and runtime._ue_coredevice_owns_process ~= true
 end
 
+local function matches_runtime(session, runtime)
+  local token = runtime and runtime._ue_ios_owner_token
+  return type(token) == "string" and IOSSession.is_owned(session) and session.config._ue_ios_owner_token == token
+end
+
 local function end_unexpected_session(session, on_done)
+  require("ue.dap._ios_log").stop(session)
   if not IOSSession.is_owned(session) or M._stopping then
     return false
   end
   local runtime = M._session or M._cleanup_runtime
-  if not runtime then
+  if not matches_runtime(session, runtime) then
     return false
   end
   M._session = nil
@@ -482,6 +489,7 @@ end
 local install_listeners
 
 local function run_coredevice(runtime, config)
+  config._ue_ios_owner_token = runtime._ue_ios_owner_token
   M._session = runtime
   M._starting = false
   install_listeners()
@@ -539,6 +547,7 @@ local function run_with_metadata(mode, runtime, app, symbols, pid)
       fail_start(config_err)
       return
     end
+    config._ue_ios_owner_token = runtime._ue_ios_owner_token
     M._session = runtime
     M._starting = false
     install_listeners()
@@ -557,6 +566,10 @@ local function run_with_metadata(mode, runtime, app, symbols, pid)
 end
 
 local function prepare(mode, opts)
+  if M._stopping then
+    notify("the previous iOS owner cleanup is still running", vim.log.levels.WARN)
+    return
+  end
   if M._starting then
     notify("an iOS DAP bootstrap is already running", vim.log.levels.WARN)
     return
@@ -577,6 +590,8 @@ local function prepare(mode, opts)
     fail_start(err)
     return
   end
+  owner_sequence = owner_sequence + 1
+  runtime._ue_ios_owner_token = tostring(vim.uv.hrtime()) .. ":" .. owner_sequence
   M._starting = true
   notify(
     (mode == "launch" and "iOS attach-at-launch" or "iOS attach") .. " bootstrap started for " .. runtime.device_id
@@ -656,6 +671,24 @@ function M.stop(opts)
     on_done(true)
     return
   end
+  if opts.session and not matches_runtime(opts.session, runtime) then
+    local err = "iOS DAP stop session does not match the frozen runtime owner"
+    notify(err, vim.log.levels.WARN)
+    on_done(false, err)
+    return
+  end
+  if runtime._ue_ios_stop_callbacks then
+    table.insert(runtime._ue_ios_stop_callbacks, on_done)
+    return
+  end
+  runtime._ue_ios_stop_callbacks = { on_done }
+  local function complete(ok, err)
+    local callbacks = runtime._ue_ios_stop_callbacks
+    runtime._ue_ios_stop_callbacks = nil
+    for _, callback in ipairs(callbacks) do
+      callback(ok, err)
+    end
+  end
   M._stopping = true
   local finalized = false
   local function finalize()
@@ -663,6 +696,10 @@ function M.stop(opts)
       return
     end
     finalized = true
+    if (M._session or M._cleanup_runtime) ~= runtime then
+      complete(false, "iOS DAP cleanup runtime owner was replaced")
+      return
+    end
     M._session = nil
     M._cleanup_runtime = runtime
     local preserve = preserves_attached_process(runtime)
@@ -682,17 +719,17 @@ function M.stop(opts)
           preserve and "iOS debugger detached; existing device process preserved"
             or "iOS debugger detached and device process stopped"
         )
-        on_done(true)
+        complete(true)
       else
         progress("error", err)
         notify(err, vim.log.levels.ERROR)
-        on_done(false, err)
+        complete(false, err)
       end
     end)
   end
   local dap = C.require_dap()
   local active = dap and dap.session and dap.session() or nil
-  if active and IOSSession.is_owned(active) then
+  if matches_runtime(active, runtime) then
     local ok = pcall(dap.disconnect, { terminateDebuggee = false }, function()
       vim.schedule(finalize)
     end)
@@ -706,12 +743,13 @@ end
 
 function M.cleanup(opts)
   local session = type(opts) == "table" and opts.session or nil
+  require("ue.dap._ios_log").stop(session)
   local completed = false
   local function done()
     completed = true
   end
   local started = end_unexpected_session(session, done)
-  if not started and M._cleanup_runtime then
+  if not started and M._cleanup_runtime and (not session or matches_runtime(session, M._cleanup_runtime)) then
     started = true
     stop_runtime(M._cleanup_runtime, done)
   end
@@ -720,6 +758,12 @@ function M.cleanup(opts)
       return completed
     end, 50)
   end
+end
+
+M.log_label = "iOS Logs"
+
+function M.log_buffer(session)
+  return require("ue.dap._ios_log").buffer(session)
 end
 
 function M._build_config_for_test(opts)

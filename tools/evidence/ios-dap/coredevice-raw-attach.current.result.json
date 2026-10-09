@@ -26,24 +26,19 @@
   "errors": [],
   "identity": {
     "adapter": {
-      "digest": "5b3c0fcb8a37",
-      "name": "lldb-dap",
-      "system_path": "/Applications/Xcode.app/Contents/Developer/usr/bin/lldb-dap"
+      "digest": "5b3c0fcb8a37"
     },
     "binary": {
-      "digest": "d002f1b2ac63",
-      "name": "Client"
+      "digest": "1cee9dbe44d7"
     },
     "bundle_digest": "2249f7739c06",
-    "device_digest": "5bb027e5444e",
+    "device_digest": "a827dfb18ca8",
     "dsym": {
-      "digest": "9bda16dae1b6",
-      "name": "Client.dev.branch36.Launch.dSYM"
+      "digest": "835cc19c976e"
     },
-    "pid_digest": "56b8877f3a51",
+    "pid_digest": "c65659064f6d",
     "source": {
-      "line": 4804,
-      "name": "LaunchEngineLoop.cpp"
+      "line": 555
     }
   },
   "mode": "attach",

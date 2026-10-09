@@ -3,6 +3,25 @@ local C = require("ue.targets._common")
 local TARGET = "IOS"
 local M = {}
 
+local function bundle_id_from_launch_arguments(decoded, expected)
+  local info = type(decoded) == "table" and decoded.info or nil
+  local expected_bundle = C.trim(expected and expected.bundle_id)
+  if
+    type(info) ~= "table"
+    or info.commandType ~= "devicectl.device.process.launch"
+    or type(info.arguments) ~= "table"
+    or expected_bundle == ""
+  then
+    return ""
+  end
+  for _, argument in ipairs(info.arguments) do
+    if C.trim(argument) == expected_bundle then
+      return expected_bundle
+    end
+  end
+  return ""
+end
+
 function M.plan(context, host_driver, bundle_id, bundle_err)
   local device_id = C.trim(context and context.device_id)
   if device_id == "" then
@@ -125,6 +144,9 @@ function M.parse_result(payload, expected)
         or process and (process.bundleIdentifier or process.bundleID or process.applicationIdentifier)
       )
   )
+  if bundle_id == "" then
+    bundle_id = bundle_id_from_launch_arguments(decoded, expected)
+  end
   local process_id = result
     and (result.processIdentifier or result.pid or process and (process.processIdentifier or process.pid))
 

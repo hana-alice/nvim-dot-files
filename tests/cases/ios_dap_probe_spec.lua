@@ -10,7 +10,7 @@ local function smoke_fixture()
   local root = vim.fn.tempname() .. "-ios-dap-smoke"
   local project_dir = root .. "/SecretProject"
   local uproject = project_dir .. "/SecretProject.uproject"
-  local source = project_dir .. "/Source/Secret/Hidden.cpp"
+  local source = project_dir .. "/Source/Secret/SensitiveSource.cpp"
   local binary = project_dir .. "/Binaries/IOS/SecretProject"
   local dsym = project_dir .. "/Binaries/IOS/SecretProject.dSYM"
   local cwd = project_dir .. "/Intermediate/Headless"
@@ -32,21 +32,33 @@ local function smoke_fixture()
   }
 end
 
-local function run_smoke(env)
+local function run_smoke(env, notification)
   local output = vim.fn.tempname() .. ".json"
   local merged_env = vim.tbl_extend("force", {
     NVIM_IOS_DAP_SMOKE_RESULT = output,
     NVIM_IOS_DAP_SMOKE_TIMEOUT_MS = "500",
   }, env or {})
+  local argv = {
+    vim.v.progpath,
+    "--headless",
+    "-u",
+    "NONE",
+  }
+  if notification then
+    vim.list_extend(argv, {
+      "--cmd",
+      "lua local hash = vim.fn.sha256; vim.fn.sha256 = function(value) "
+        .. "vim.fn.sha256 = hash; vim.notify("
+        .. string.format("%q", notification)
+        .. ", vim.log.levels.ERROR); return hash(value) end",
+    })
+  end
+  vim.list_extend(argv, {
+    "-l",
+    config .. "/tools/nvim_ios_dap_smoketest.lua",
+  })
   local result = vim
-    .system({
-      vim.v.progpath,
-      "--headless",
-      "-u",
-      "NONE",
-      "-l",
-      config .. "/tools/nvim_ios_dap_smoketest.lua",
-    }, {
+    .system(argv, {
       env = merged_env,
       text = true,
     })
@@ -58,15 +70,19 @@ end
 t.describe("iOS DAP protocol probe", function()
   t.it("passes its parser and redaction self-test", function()
     local python = vim.fn.exepath("python3")
-    if python == "" then return end
+    if python == "" then
+      return
+    end
     local output = vim.fn.tempname()
-    local result = vim.system({
-      python,
-      config .. "/tools/ios_dap_protocol_probe.py",
-      "self-test",
-      "--output",
-      output,
-    }, { text = true }):wait()
+    local result = vim
+      .system({
+        python,
+        config .. "/tools/ios_dap_protocol_probe.py",
+        "self-test",
+        "--output",
+        output,
+      }, { text = true })
+      :wait()
 
     t.assert_eq(result.code, 0, result.stderr)
     local payload = vim.json.decode(result.stdout)
@@ -79,6 +95,12 @@ t.describe("iOS DAP protocol probe", function()
     t.assert_contains(encoded, '"pid_digest"')
     t.assert_false(encoded:find('"pid"', 1, true) ~= nil)
     t.assert_false(encoded:find("4242", 1, true) ~= nil)
+    for _, private_name in ipairs({ "SecretProject", "SensitiveSource", "Headless" }) do
+      t.assert_false(result.stdout:find(private_name, 1, true) ~= nil, private_name)
+      t.assert_false(encoded:find(private_name, 1, true) ~= nil, private_name)
+    end
+    t.assert_true(persisted.attach_identity_example.source.digest ~= nil)
+    t.assert_eq(persisted.attach_identity_example.source.line, 7)
   end)
 
   t.it("keeps identities parameterized and detach non-terminating", function()
@@ -87,8 +109,8 @@ t.describe("iOS DAP protocol probe", function()
     t.assert_contains(source, 'add_argument("--bundle-id", required=True)')
     t.assert_contains(source, '"pid_digest": pid_digest(args.pid)')
     t.assert_contains(source, '"terminateDebuggee": False')
-    t.assert_contains(source, 'settings set target.memory-module-load-level minimal')
-    t.assert_contains(source, 'settings set symbols.enable-external-lookup false')
+    t.assert_contains(source, "settings set target.memory-module-load-level minimal")
+    t.assert_contains(source, "settings set symbols.enable-external-lookup false")
     t.assert_contains(source, 'target symbols add " + lldb_quote(args.dsym)')
     t.assert_contains(source, '"loaded iOS executable UUID does not match the local debug artifact"')
     t.assert_contains(source, "max_bootstrap_stops = 8")
@@ -123,7 +145,7 @@ t.describe("iOS DAP protocol probe", function()
       NVIM_IOS_DAP_SMOKE_PROJECT = fixture.project_dir,
       NVIM_IOS_DAP_SMOKE_CWD = fixture.cwd,
       NVIM_IOS_DAP_SMOKE_EXPR = 'FString(TEXT("secret"))',
-    })
+    }, "SecretProject SensitiveSource.cpp Headless " .. device .. " " .. bundle .. " 4242 " .. fixture.binary)
 
     t.assert_eq(result.code, 0, result.stderr)
     t.assert_eq(payload.status, "error")
@@ -138,6 +160,10 @@ t.describe("iOS DAP protocol probe", function()
     t.assert_false(payload.error.message:find("4242", 1, true) ~= nil)
     t.assert_false(encoded:find(fixture.project_dir, 1, true) ~= nil)
     t.assert_false(encoded:find(fixture.source, 1, true) ~= nil)
+    for _, sensitive in ipairs({ "SecretProject", "SensitiveSource", "Headless", device, bundle, "4242" }) do
+      t.assert_false(encoded:find(sensitive, 1, true) ~= nil, sensitive)
+      t.assert_false((result.stdout .. result.stderr):find(sensitive, 1, true) ~= nil, sensitive)
+    end
   end)
 
   t.it("passes explicit coredevice opts and persists only redacted smoke evidence", function()
@@ -181,15 +207,16 @@ t.describe("iOS DAP protocol probe", function()
 
     t.assert_eq(result.code, 0, result.stderr)
     t.assert_eq(payload.status, "error")
-    t.assert_eq(payload.target.source.name, "Hidden.cpp")
+    t.assert_nil(payload.target.source.name)
+    t.assert_type(payload.target.source.digest, "string")
     t.assert_eq(payload.target.line, 2)
     t.assert_true(payload.identity.device_digest ~= nil)
     t.assert_true(payload.identity.bundle_digest ~= nil)
     t.assert_true(payload.identity.pid_digest ~= nil)
-    t.assert_eq(payload.identity.binary.name, "SecretProject")
-    t.assert_eq(payload.identity.dsym.name, "SecretProject.dSYM")
-    t.assert_eq(payload.identity.project.name, "SecretProject.uproject")
-    t.assert_eq(payload.identity.cwd.name, "Headless")
+    for _, kind in ipairs({ "binary", "dsym", "project", "cwd" }) do
+      t.assert_nil(payload.identity[kind].name, kind)
+      t.assert_type(payload.identity[kind].digest, "string", kind)
+    end
     t.assert_true(payload.identity.expression_digest ~= nil)
     t.assert_false(encoded:find(device, 1, true) ~= nil)
     t.assert_false(encoded:find(bundle, 1, true) ~= nil)
@@ -199,6 +226,10 @@ t.describe("iOS DAP protocol probe", function()
     t.assert_false(encoded:find(fixture.dsym, 1, true) ~= nil)
     t.assert_false(encoded:find(fixture.uproject, 1, true) ~= nil)
     t.assert_false(encoded:find(fixture.cwd, 1, true) ~= nil)
+    for _, sensitive in ipairs({ "SecretProject", "SensitiveSource", "Headless", device, bundle, "4242" }) do
+      t.assert_false(encoded:find(sensitive, 1, true) ~= nil, sensitive)
+      t.assert_false((result.stdout .. result.stderr):find(sensitive, 1, true) ~= nil, sensitive)
+    end
   end)
 
   t.it("keeps persisted CoreDevice evidence free of raw identities and personal paths", function()
@@ -214,6 +245,19 @@ t.describe("iOS DAP protocol probe", function()
       t.assert_false(encoded:find('"pid"', 1, true) ~= nil, name)
       t.assert_false(encoded:find("/Users/", 1, true) ~= nil, name)
       t.assert_false(encoded:find('"com.', 1, true) ~= nil, name)
+      local function assert_safe(value)
+        if type(value) ~= "table" then
+          return
+        end
+        if value.digest or value.line then
+          t.assert_nil(value.name, name)
+          t.assert_nil(value.system_path, name)
+        end
+        for _, child in pairs(value) do
+          assert_safe(child)
+        end
+      end
+      assert_safe(vim.json.decode(encoded))
     end
   end)
 end)

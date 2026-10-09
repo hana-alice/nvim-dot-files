@@ -101,6 +101,36 @@ Vim 退出必须按 session platform/owner 分派一次幂等 cleanup，不得�
 - **WHEN** DAP event、用户 stop 与 Vim 退出先后触发清理
 - **THEN** owner cleanup 必须至多执行一次有副作用的 teardown，后续调用只能读取或确认已清理状态
 
+#### Scenario: adapter 退出但没有协议结束事件
+
+- **WHEN** Apple lldb-dap 崩溃或关闭连接，未发送 terminated/exited 事件或 disconnect response
+- **THEN** 系统必须通过 session close 回调异步派发同一 frozen owner 的幂等 cleanup
+- **AND** attach 保留并复验原进程，debug launch 清理本次创建的进程，不得遗留活跃 owner 状态
+
+#### Scenario: 旧会话回调晚于新会话启动
+
+- **WHEN** 旧 iOS 会话的 UUID failure fallback、退出事件或显式 stop/cleanup 在新会话启动后到达
+- **THEN** 系统必须核对该请求与冻结 runtime 的单次会话归属，只处理匹配的 owner
+- **AND** 不得清空新会话、断开其他活跃 DAP session 或复用另一 owner 的 cleanup runtime
+
+### Requirement: iOS 调试日志必须属于冻结的真机会话
+
+MUST：iOS 调试日志只读取冻结会话的设备和进程，不得因后来切换 target/device 而改投，
+也不得混用 Android 日志状态。日志读取与取消必须独立于 debugger/debuggee，不能恢复、
+断开或终止调试进程。系统必须诚实显示缺工具、连接失败与 reader 退出，限制保留历史，
+并清理结束会话的 reader；晚到回调不得影响其他会话或重新打开的日志。
+
+#### Scenario: iOS 会话切到日志页
+
+- **WHEN** 用户在已暂停的 iOS 会话按 `<leader>d4` 或执行 `:UEDAPTab logcat`
+- **THEN** 同一底部窗口必须显示 `iOS Logs` 与冻结设备/PID 的日志，调试进程仍保持暂停
+- **AND** 切回 REPL 再打开日志必须保留历史；Android 会话仍显示 `Logcat`
+
+#### Scenario: 旧日志查询在会话结束后返回
+
+- **WHEN** 日志 reader 的设备查询、输出或退出回调晚于对应会话清理
+- **THEN** 不得创建新的 reader 或写入后来会话的 buffer，且不得清理新会话的日志
+
 ### Requirement: 外部真机 gate 必须诚实报告，且本能力不得暗含远程主机语义
 
 MUST：签名、Developer Mode、debug entitlement、设备连接或兼容 Xcode 缺失时，真机验证必须报告
@@ -113,8 +143,22 @@ remote-execution capability，不得把远程 Mac 冒充本地 host driver。
 - **WHEN** 所有 headless regressions 通过但不存在满足条件的物理设备
 - **THEN** 可以报告自动测试通过，但必须单独把真机 breakpoint/cleanup gate 标记为 blocked/not-run
 
+#### Scenario: adapter 在断点命中后崩溃
+
+- **WHEN** headless 真机验收已获得 UUID、断点与源码 frame 证据，但 adapter 在求值完成前关闭
+- **THEN** 验收必须保留已获得的脱敏证据、执行 owner cleanup，并及时报告失败
+- **AND** 不得因已有断点证据而将未完成的求值或完整 E2E 判定为 passed
+
 ## 选型与踩坑
 
+- **选型**：第四页统一为 `:UEDAPTab log`，保留 `logcat` 别名；iOS 使用已有
+  `idevicesyslog` 按 PID 过滤。CoreDevice UUID 与 hardware UDID 不同，必须以匹配捕获设备的
+  结构化 details 结果映射，不能把 CoreDevice UUID 直接交给日志 relay。
+- **踩坑**：启动停止点的初始 process/image 查询各曾需约 20 秒；LLDB 默认 5 秒 packet timeout
+  会先断开，空镜像并不证明 device 拒绝读内存。连接前使用有限 packet timeout 解决该构建的
+  真机问题，仍保留首次 continue 前 UUID 与源码断点证明；具体值和顺序由实现与回归维护。
+- **踩坑**：adapter EOF 不保证发出协议结束事件；session close 与 owner token 必须共同约束
+  cleanup，避免旧退出回调清理新的设备进程或日志 reader。
 - **选型**：iOS 必须使用独立 Apple lldb-dap adapter 与独立 adapter id，不复用 Mac/Android
   handler——设备协议、cleanup 顺序与失败语义都不同，混用会掩盖真实的平台差异。
 - **踩坑**：K55（2026-08-26 真机）— CoreDevice start-stopped、PID identity 与 Mach-O/dSYM UUID

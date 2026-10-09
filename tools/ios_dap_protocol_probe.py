@@ -50,18 +50,21 @@ def pid_digest(value: int | str) -> str:
 
 def redact_text(value: str, *sensitive: str) -> str:
     redacted = value
-    for item in sorted((item for item in sensitive if item), key=len, reverse=True):
+    captured = {item for item in sensitive if item}
+    for item in tuple(captured):
+        if "/" in item:
+            captured.update((Path(item).name, Path(item).stem))
+    for item in sorted((item for item in captured if item), key=len, reverse=True):
         redacted = redacted.replace(item, "<redacted>")
-    return APPLE_DEVICE_ID_RE.sub("<redacted-device-id>", redacted)
+    redacted = APPLE_DEVICE_ID_RE.sub("<redacted-device-id>", redacted)
+    redacted = re.sub(r"\b[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\b", "<redacted-uuid>", redacted)
+    return re.sub(r"(?<!\w)/[^\s\"'<>]+", "<redacted-path>", redacted)
 
 
 def path_evidence(value: str) -> dict[str, str]:
     path = Path(value).expanduser()
     resolved = str(path.resolve(strict=False))
-    evidence = {"name": path.name, "digest": digest(resolved)}
-    if resolved.startswith(("/Applications/", "/usr/", "/Library/")):
-        evidence["system_path"] = resolved
-    return evidence
+    return {"digest": digest(resolved)}
 
 
 def attach_identity(args: argparse.Namespace) -> dict[str, Any]:
@@ -71,7 +74,7 @@ def attach_identity(args: argparse.Namespace) -> dict[str, Any]:
         "pid_digest": pid_digest(args.pid),
         "binary": path_evidence(args.binary),
         "dsym": path_evidence(args.dsym),
-        "source": {"name": Path(args.source).name, "line": args.line},
+        "source": {**path_evidence(args.source), "line": args.line},
         "adapter": path_evidence(args.adapter),
     }
 
@@ -160,7 +163,7 @@ def read_json(path: Path) -> Any:
 def first_line(value: str) -> str:
     for line in value.splitlines():
         if line.strip():
-            return line.strip()[:240]
+            return redact_text(line.strip())[:240]
     return ""
 
 
@@ -724,6 +727,7 @@ def cli_attach_probe(args: argparse.Namespace, expected_uuids: set[str], device_
         marked([
             "settings set target.memory-module-load-level minimal",
             "settings set symbols.enable-external-lookup false",
+            "settings set plugin.process.gdb-remote.packet-timeout 60",
             "target create " + lldb_quote(args.binary),
             "device select " + lldb_quote(device_id),
             f"device process attach -p {args.pid}",
@@ -794,6 +798,7 @@ def dap_attach_probe(
             "cwd": str(Path(args.source).resolve().parent),
             "timeout": max(240, int(args.timeout)),
             "initCommands": [
+                "settings set plugin.process.gdb-remote.packet-timeout 60",
                 "settings set stop-disassembly-display never",
                 "settings set target.inline-breakpoint-strategy always",
                 "settings set target.move-to-nearest-code true",
@@ -1001,8 +1006,10 @@ def self_test(args: argparse.Namespace) -> int:
     assert process_identity_matches(process_fixture, 42, "PRIVATE-DEVICE-ID", "file:///private/Game.app")
     assert not process_identity_matches(process_fixture, 43, "PRIVATE-DEVICE-ID", "file:///private/Game.app")
     assert MODULE_UUID_RE.search("[  0] 322CB148-C401-3EA0-A023-4B21A104D42F /tmp/Game")
-    redacted = json.dumps(path_evidence("/private/example/Secret/Binary"))
+    redacted = json.dumps(path_evidence("/private/example/SecretProject/Headless"))
     assert "/private/example" not in redacted
+    assert "SecretProject" not in redacted and "Headless" not in redacted
+    assert set(path_evidence("/Applications/SecretProject/SensitiveSource.cpp")) == {"digest"}
     assert "PRIVATE-DEVICE-ID" not in json.dumps({"device_digest": digest("PRIVATE-DEVICE-ID")})
     private_ids = "legacy 0123456789abcdef0123456789abcdef01234567 modern 12345678-0123456789ABCDEF"
     scrubbed = redact_text(private_ids)
@@ -1031,17 +1038,27 @@ def self_test(args: argparse.Namespace) -> int:
         device="PRIVATE-DEVICE-ID",
         bundle_id="com.example.game",
         pid=4242,
-        binary="/private/example/MyGame",
-        dsym="/private/example/MyGame.dSYM",
-        source="/private/example/Game.cpp",
+        binary="/private/example/SecretProject",
+        dsym="/private/example/SecretProject.dSYM",
+        source="/private/example/SensitiveSource.cpp",
         line=7,
-        adapter="/Applications/Xcode.app/Contents/Developer/usr/bin/lldb-dap",
+        adapter="/Applications/Headless/lldb-dap",
     ))
     encoded_identity = json.dumps(attach_identity_example, sort_keys=True)
     assert '"pid":' not in encoded_identity
     assert '"pid_digest":' in encoded_identity
     assert "4242" not in encoded_identity
     assert attach_identity_example["pid_digest"] == pid_digest(4242)
+    assert attach_identity_example["source"]["digest"] == path_evidence("/private/example/SensitiveSource.cpp")["digest"]
+    assert attach_identity_example["source"]["line"] == 7
+    assert all(name not in encoded_identity for name in ("SecretProject", "SensitiveSource", "Headless"))
+    scrubbed = redact_text(
+        "SecretProject SensitiveSource.cpp Headless 4242 com.example.game PRIVATE-DEVICE-ID "
+        "12345678-1234-1234-1234-123456789abc /private/example/OtherSource.cpp",
+        "/private/example/SecretProject", "/private/example/SensitiveSource.cpp", "/private/example/Headless",
+        "4242", "com.example.game", "PRIVATE-DEVICE-ID",
+    )
+    assert all(name not in scrubbed for name in ("SecretProject", "SensitiveSource", "Headless", "4242", "com.example.game", "PRIVATE-DEVICE-ID", "12345678-1234-1234-1234-123456789abc", "OtherSource.cpp"))
     payload = {
         "schema": SCHEMA,
         "mode": "self-test",

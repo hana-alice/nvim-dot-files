@@ -161,4 +161,33 @@ t.describe("ue.target_tasks", function()
     t.assert_eq(records[2].scope, "ue.install")
     t.assert_eq(records[2].message, "Validating signing and install inputs")
   end)
+
+  t.it("surfaces terminal warnings even when fidget owns progress rendering", function()
+    local saved_fidget = package.loaded["fidget.progress"]
+    local saved_notify = vim.notify
+    local notices = {}
+    package.loaded["fidget.progress"] = {
+      handle = {
+        create = function()
+          return {
+            report = function() end,
+            finish = function() end,
+          }
+        end,
+      },
+    }
+    vim.notify = function(message, level, opts)
+      notices[#notices + 1] = { message = message, level = level, title = opts and opts.title }
+    end
+
+    local progress = tasks.progress({ title = "IOS device discovery", message = "Starting device discovery" })
+    progress:finish("Selected IOS USB device remains offline", 100, vim.log.levels.WARN)
+
+    vim.notify = saved_notify
+    package.loaded["fidget.progress"] = saved_fidget
+    t.assert_eq(#notices, 1)
+    t.assert_eq(notices[1].message, "Selected IOS USB device remains offline")
+    t.assert_eq(notices[1].level, vim.log.levels.WARN)
+    t.assert_eq(notices[1].title, "IOS device discovery")
+  end)
 end)

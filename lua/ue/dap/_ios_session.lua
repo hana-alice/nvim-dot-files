@@ -67,6 +67,22 @@ function M.install(deps)
     return
   end
   local key = "ue_ios_lifecycle"
+  local function watch_close(session)
+    if not M.is_owned(session) or type(session.on_close) ~= "table" then
+      return
+    end
+    -- Adapter exit can close a session without any DAP end event or response.
+    -- nvim-dap may invoke on_close from the luv loop, so owner cleanup is scheduled.
+    session.on_close[key] = function(closed)
+      vim.schedule(function()
+        deps.on_unexpected_end(closed)
+      end)
+    end
+  end
+  dap.listeners.on_session[key] = function(_, session)
+    watch_close(session)
+  end
+  watch_close(dap.session())
   dap.listeners.after.event_output[key] = function(session, body)
     if not M.is_owned(session) or session.config._ue_ios_backend ~= "coredevice" then
       return

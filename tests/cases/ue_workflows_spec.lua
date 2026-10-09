@@ -38,6 +38,119 @@ local function progress_probe(records)
   end
 end
 
+local function run_ios_device_discovery(opts)
+  local saved_target_tasks = package.loaded["ue.target_tasks"]
+  local saved_targets = package.loaded["ue.targets"]
+  local saved_platform = package.loaded["utils.platform"]
+  local saved_notify = vim.notify
+  local saved_select = vim.ui.select
+  local observed = {
+    persisted = {},
+    notifications = {},
+  }
+  local driver = {
+    id = "IOS",
+    device_list_plan = function()
+      return { kind = "coredevice" }
+    end,
+    parse_device_list = function()
+      return { ok = true, devices = vim.deepcopy(opts.core_devices or {}) }
+    end,
+    mobiledevice_device_list_plans = function()
+      local plans = {}
+      for _, transport in ipairs(opts.transports) do
+        plans[#plans + 1] = { kind = "mobiledevice", metadata = { transport = transport } }
+      end
+      return plans
+    end,
+    parse_mobiledevice_device_list = function(_, transport)
+      return { ok = true, devices = vim.deepcopy(opts.devices[transport] or {}) }
+    end,
+  }
+
+  package.loaded["ue.target_tasks"] = {
+    progress = function()
+      return {
+        report = function() end,
+        finish = function() end,
+      }
+    end,
+    run = function(plan, callbacks)
+      callbacks.on_exit({ code = 0, stdout = plan.kind or "" })
+      return {}
+    end,
+    error_message = function(result)
+      return "exit " .. tostring(result.code)
+    end,
+  }
+  package.loaded["ue.targets"] = {
+    resolve = function()
+      return driver
+    end,
+  }
+  package.loaded["utils.platform"] = {
+    driver = function()
+      return { id = "macos" }
+    end,
+  }
+  vim.notify = function(message, level)
+    observed.notifications[#observed.notifications + 1] = { message = message, level = level }
+  end
+  vim.ui.select = function(devices, select_opts)
+    observed.picker = { devices = vim.deepcopy(devices), opts = select_opts }
+  end
+
+  local ok, err = xpcall(function()
+    require("ue.workflows.ios.device").select("IOS", {
+      preferred_device_id = opts.preferred_device_id,
+      on_selected = function(device)
+        observed.selected = vim.deepcopy(device)
+      end,
+    }, {
+      trim = function(value)
+        return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+      end,
+      resolve_context = function()
+        return { engine_root = "/UE", project_root = "/Project" }
+      end,
+      target_context_matches = function()
+        return true
+      end,
+      target_context = function()
+        return {
+          device_id = opts.preferred_device_id,
+          device_name = "Saved USB iPhone",
+          device_backend = "legacy-mobiledevice",
+          device_transport = "usb",
+        },
+          nil,
+          driver
+      end,
+      update_target_runtime = function(_, _, patch)
+        observed.persisted[#observed.persisted + 1] = vim.deepcopy(patch)
+        return {}
+      end,
+      target_error = function(_, message)
+        observed.error = message
+      end,
+      read_result_file = function()
+        return {}
+      end,
+      select_target_device = function()
+        observed.rediscovered = true
+      end,
+    })
+  end, debug.traceback)
+
+  vim.ui.select = saved_select
+  vim.notify = saved_notify
+  package.loaded["utils.platform"] = saved_platform
+  package.loaded["ue.targets"] = saved_targets
+  package.loaded["ue.target_tasks"] = saved_target_tasks
+  t.assert_true(ok, err)
+  return observed
+end
+
 t.describe("ue.workflows snapshot", function()
   t.it("captures immutable operation identity without rereading live selection", function()
     local live = {
@@ -735,6 +848,105 @@ t.describe("ue.workflows android owners", function()
     t.assert_nil(err)
     t.assert_eq(ensured, 1)
     t.assert_eq(reinvoked, 1)
+  end)
+end)
+
+t.describe("ue.workflows IOS device selection", function()
+  t.it("upgrades a saved MobileDevice UDID to the connected CoreDevice route for the same phone", function()
+    local observed = run_ios_device_discovery({
+      preferred_device_id = "MOBILEDEVICE-1",
+      core_devices = {
+        {
+          id = "COREDEVICE-1",
+          mobiledevice_id = "MOBILEDEVICE-1",
+          name = "Connected iPhone",
+          backend = "coredevice",
+          transport = "usb",
+          available = true,
+        },
+      },
+      transports = { "usb" },
+      devices = {
+        usb = {
+          {
+            id = "MOBILEDEVICE-1",
+            name = "Connected iPhone",
+            backend = "legacy-mobiledevice",
+            transport = "usb",
+            available = true,
+          },
+        },
+      },
+    })
+
+    t.assert_eq(observed.selected.id, "COREDEVICE-1")
+    t.assert_eq(observed.selected.backend, "coredevice")
+    t.assert_eq(observed.persisted[1].device_id, "COREDEVICE-1")
+    t.assert_eq(observed.persisted[1].device_backend, "coredevice")
+    t.assert_nil(observed.picker)
+    t.assert_nil(observed.error)
+  end)
+
+  t.it("keeps the USB route when the preferred device is also visible over the network", function()
+    local observed = run_ios_device_discovery({
+      preferred_device_id = "DEVICE-1",
+      transports = { "network", "usb" },
+      devices = {
+        network = {
+          {
+            id = "DEVICE-1",
+            name = "iPhone over Wi-Fi",
+            backend = "legacy-mobiledevice",
+            transport = "network",
+            available = true,
+          },
+        },
+        usb = {
+          {
+            id = "DEVICE-1",
+            name = "iPhone over USB",
+            backend = "legacy-mobiledevice",
+            transport = "usb",
+            available = true,
+          },
+        },
+      },
+    })
+
+    t.assert_eq(observed.selected.id, "DEVICE-1")
+    t.assert_eq(observed.selected.transport, "usb")
+    t.assert_eq(observed.persisted[1].device_transport, "usb")
+    t.assert_nil(observed.picker)
+    t.assert_nil(observed.error)
+  end)
+
+  t.it("does not replace an offline preferred USB device with another live network device", function()
+    local observed = run_ios_device_discovery({
+      preferred_device_id = "SAVED-USB",
+      transports = { "network", "usb" },
+      devices = {
+        network = {
+          {
+            id = "OTHER-DEVICE",
+            name = "Other iPhone",
+            backend = "legacy-mobiledevice",
+            transport = "network",
+            available = true,
+          },
+        },
+        usb = {},
+      },
+    })
+
+    t.assert_nil(observed.selected)
+    t.assert_eq(#observed.persisted, 0)
+    t.assert_eq(#observed.picker.devices, 2)
+    t.assert_eq(observed.picker.devices[1].id, "OTHER-DEVICE")
+    t.assert_eq(observed.picker.devices[1].transport, "network")
+    t.assert_eq(observed.picker.devices[2].id, "SAVED-USB")
+    t.assert_eq(observed.picker.devices[2].transport, "usb")
+    t.assert_false(observed.picker.devices[2].available)
+    t.assert_nil(observed.error)
   end)
 end)
 

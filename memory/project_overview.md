@@ -92,6 +92,9 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 Win64/Android，Linux 只执行 Linux；Mac 与 IOS target 独立，Android PowerShell transport 继续
 保持 Windows-only；iOS DAP 在 macOS 上冻结 selected backend：iOS 17+ 使用结构化 CoreDevice PID attach，
 pre-iOS17 使用 legacy MobileDevice/debugserver bridge，失败不跨 backend，也不 fallback 到 Mac process attach。
+调试第四页按冻结 owner 选择日志：iOS 由 `ue.dap._ios_log` 独立管理 reader 与有界历史，Android
+保留 logcat；日志取消不改变设备进程。iOS 单次 owner token/session close 隔离旧 cleanup，公开
+probe evidence 仅保留身份 digest。详细启动/attach/符号/日志操作见 `docs/ue_lazyvim_cheatsheet.md`。
 
 ## 知识库各区
 

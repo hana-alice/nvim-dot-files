@@ -43,6 +43,8 @@ local SPAWN_AUDIT = {
   { p="lua/ue/dap/preflight.lua", api="vim.system", a="vim.system(argv, { text = true, timeout = M.PROBE_TIMEOUT_MS }", class="dap", reason="layered L0-L4 capability probe, bounded + async (C10 attach gate)" },
   { p="lua/ue/dap/ios.lua", api="vim.system", a="pcall(vim.system, argv", class="dap", reason="DAP adapter lifecycle" },
   { p="lua/ue/dap/ios.lua", api="jobstart", a="bridge.job_id = vim.fn.jobstart", class="dap", reason="DAP bridge lifecycle" },
+  { p="lua/ue/dap/_ios_log.lua", api="jobstart", a="pcall(vim.fn.jobstart, argv, options)", class="interactive", reason="session-owned low-CPU log relay reader; cancellable without debugger/process actions", guard="Tasks.register" },
+  { p="lua/ue/dap/_ios_log.lua", api="vim.system", a="pcall(vim.system, argv", class="interactive", reason="frozen CoreDevice-to-hardware identity lookup; async bounded 20/25-second query", guard="Tasks.register" },
   { p="lua/ue/dap.lua", api="jobstart", a="logcat_job = vim.fn.jobstart", class="dap", reason="DAP log stream" },
   { p="lua/ue/dap.lua", api="fn-system", a="vim.fn.system({ dap_exe", class="dap", reason="DAP version preflight" },
   { p="lua/ue/dap.lua", api="fn-system", a="vim.fn.systemlist(cmd)", class="dap", reason="DAP process snapshot fallback" },

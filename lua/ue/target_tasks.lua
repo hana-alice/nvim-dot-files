@@ -99,6 +99,9 @@ function M.progress(opts)
     record_history(final_message or message, level)
     if fidget_handle then
       pcall(fidget_handle.finish, fidget_handle)
+      if level == vim.log.levels.WARN then
+        vim.notify(final_message or message, level, { title = title })
+      end
     else
       vim.notify(final_message or message, level or vim.log.levels.INFO, {
         title = title,

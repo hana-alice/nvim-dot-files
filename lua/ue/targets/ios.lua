@@ -610,6 +610,14 @@ function M.parse_device_list(payload)
     local connection = item.connectionProperties or {}
     local properties = item.deviceProperties or {}
     local platform = C.trim(item.platform or item.operatingSystem or item.runtimePlatform or hardware.platform or "")
+    local mobiledevice_id = C.trim(hardware.udid)
+    local transport_type = C.trim(connection.transportType):lower()
+    local transport
+    if transport_type == "wired" or transport_type == "usb" then
+      transport = "usb"
+    elseif transport_type == "wireless" or transport_type == "wifi" or transport_type == "network" then
+      transport = "network"
+    end
     local tunnel = C.trim(connection.tunnelState):lower()
     local available_now = item.available == true
       or C.trim(item.availability):lower() == "available"
@@ -625,6 +633,8 @@ function M.parse_device_list(payload)
         platform = platform,
         os_version = properties.osVersionNumber,
         backend = "coredevice",
+        mobiledevice_id = mobiledevice_id ~= "" and mobiledevice_id or nil,
+        transport = transport,
       }
     end
   end

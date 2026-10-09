@@ -648,7 +648,7 @@ local tabs = {
           { "<leader>du",   "Toggle DAP UI" },
           { "<leader>dr",   "Toggle REPL" },
           { "<leader>dx",   "Reset layout" },
-          { "<leader>d1-d4","REPL / console / bp / logcat" },
+          { "<leader>d1-d4","REPL / console / bp / Log（iOS Logs / Android Logcat）" },
           { "<leader>d] d[","Next / prev DAP tab" },
           { ":qa",          "Auto DAP cleanup" },
         },

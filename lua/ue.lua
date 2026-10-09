@@ -10081,7 +10081,7 @@ function M.setup()
   end, {
     nargs = 1,
     complete = function()
-      return { "repl", "console", "breakpoints", "logcat" }
+      return { "repl", "console", "breakpoints", "log", "logcat" }
     end,
     desc = "DAP: switch right-bottom tab",
   })

@@ -86,7 +86,6 @@ local function path_evidence(path)
     return nil
   end
   return {
-    name = vim.fs.basename(normalized),
     digest = short_digest("path:" .. normalized),
   }
 end
@@ -130,14 +129,25 @@ local function redact_text(value)
   local sensitive = {
     device_id,
     bundle_id,
-    target_pid and tostring(target_pid) or nil,
+    expression,
+    result.identity.pid and tostring(result.identity.pid) or "",
+    result.identity.canonical_device_id or "",
+  }
+  local paths = {
     binary_path,
     dsym_path,
     target_source,
     project_info and project_info.project_root or project_input,
-    project_info and project_info.uproject or nil,
-    smoke_cwd or explicit_cwd,
+    project_info and project_info.uproject or "",
+    smoke_cwd or explicit_cwd or "",
   }
+  for _, path in ipairs(paths) do
+    local normalized = trim(path)
+    if normalized ~= "" then
+      local basename = vim.fs.basename(normalized)
+      vim.list_extend(sensitive, { normalized, basename, basename:gsub("%.[^.]+$", "") })
+    end
+  end
   table.sort(sensitive, function(left, right)
     return #tostring(left or "") > #tostring(right or "")
   end)
@@ -153,6 +163,14 @@ local function redact_text(value)
   end
   rendered = rendered:gsub("/[Uu]sers/[^/%s]+/[^%s,;]+", "<redacted-path>")
   rendered = rendered:gsub("[A-Za-z]:/[Uu]sers/[^/%s]+/[^%s,;]+", "<redacted-path>")
+  rendered = rendered:gsub(string.rep("%x", 8) .. "%-" .. string.rep("%x", 16), "<redacted-device-id>")
+  rendered = rendered:gsub(string.rep("%x", 40), "<redacted-device-id>")
+  local uuid = table.concat(
+    { string.rep("%x", 8), string.rep("%x", 4), string.rep("%x", 4), string.rep("%x", 4), string.rep("%x", 12) },
+    "%-"
+  )
+  rendered = rendered:gsub(uuid, "<redacted-uuid>")
+  rendered = rendered:gsub("/[^%s\"'<>]+", "<redacted-path>")
   return rendered
 end
 
@@ -173,7 +191,7 @@ local function error_evidence(message)
     return nil
   end
   return {
-    code = error_code(rendered),
+    code = error_code(redact_text(rendered)),
     message = redact_text(rendered),
   }
 end
@@ -305,7 +323,8 @@ vim.notify = function(message, level, opts)
   if handler_started and level == vim.log.levels.ERROR then
     result.startup_error = tostring(message)
   end
-  return original_notify(message, level, opts)
+  local safe_opts = opts and vim.tbl_extend("force", opts, { title = opts.title and redact_text(opts.title) or nil })
+  return original_notify(redact_text(message), level, safe_opts)
 end
 
 local function write_result()
@@ -485,6 +504,20 @@ local non_breakpoint_stops = 0
 local max_bootstrap_stops = 8
 local saw_verified_breakpoint = false
 local saw_breakpoint_stop = false
+dap.listeners.on_session[listener] = function(_, session)
+  if not session or session.config._ue_session_owner ~= "ios" then
+    return
+  end
+  result.identity.pid = tonumber(session.config._ue_process_id) or target_pid
+  result.identity.canonical_device_id = session.config._ue_device_id
+  session.on_close[listener] = function()
+    vim.schedule(function()
+      if not done and not cleaning then
+        stop_and_finish("error", { error = "iOS debug adapter session closed before proof completed" })
+      end
+    end)
+  end
+end
 local saw_loaded_uuid_match = false
 
 dap.listeners.after.event_initialized[listener] = function(session)
@@ -546,6 +579,13 @@ local function evaluate_at_stop(session, body)
         end
       end
       local frame_id = target_frame and target_frame.id or nil
+      result.verified_breakpoint = saw_verified_breakpoint
+      result.loaded_image_uuid_match = saw_loaded_uuid_match
+      result.breakpoint_stop = saw_breakpoint_stop
+      result.exact_source_frame = exact_source_frame
+      result.stop_reason = body.reason
+      result.source_frame = target_frame and { source = target_frame.source, line = target_frame.line } or nil
+      result.frames = frames
       session:request("evaluate", {
         expression = expression,
         frameId = frame_id,

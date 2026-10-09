@@ -185,6 +185,10 @@
   已验证 attach-at-launch、ordinary attach、resolved source breakpoint、source frame、LLDB expression
   和 cleanup；当前 CoreDevice 真机已用 matching Mach-O/verified dSYM 证明 raw-DAP、production attach 与
   debug-launch 的 loaded UUID、resolved breakpoint、精确 source frame、expression 与 owner cleanup 均通过。
+  iOS 使用单次 owner token 隔离延迟 cleanup，并通过 session close 覆盖 adapter EOF。第四页的日志
+  provider 也按冻结 owner 路由：独立 `ue.dap._ios_log` 拥有 CoreDevice/hardware identity 映射、
+  bounded buffer 和可单独取消的 reader，不改变 debugger/debuggee 生命周期；Android 保持 logcat。
+  公开 probe evidence 只保留身份 digest，不输出私有 artifact/source basename。
 
 ### 2.1 状态归属清单
 

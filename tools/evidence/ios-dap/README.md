@@ -13,8 +13,11 @@ device identifier and exact DeviceSupport `Symbols` directory as private CLI
 inputs; neither value is copied into the artifact. `legacy-transport.current.result.json`
 records the manually observed bridge/launch boundary without raw logs.
 
-The artifact intentionally contains only tool versions, system-owned tool
-paths, counts, booleans, short digests, and blocker codes. It must never store
+New probe output intentionally contains only tool versions, counts, booleans,
+source line numbers, short digests, and redacted diagnostics/blocker codes. Path
+evidence contains only a digest, including artifact, source, project, working
+directory and adapter paths: neither a full path nor its basename is public
+evidence. It must never store
 certificate names/fingerprints, device identifiers/names, bundle identifiers,
 PIDs from a real application, or personal project paths.
 
@@ -33,3 +36,12 @@ The CoreDevice production gate writes three additional redacted artifacts:
 These files must never be edited to `passed`. A passing artifact is written only by rerunning the corresponding
 probe with a `dwarfdump --verify --quiet`-clean dSYM and exact source/line. The current CoreDevice artifacts are
 such probe-generated passing results and include loaded-image UUID, breakpoint/frame, evaluation and cleanup gates.
+
+The current CoreDevice results received a privacy-only conversion that removed
+path basenames and unnecessary system paths from identities and source/frame
+evidence, and redacted those names in text. Their observed statuses, gate
+booleans, source lines, existing digests and events are preserved. This
+conversion is not a rerun and does not manufacture new passing evidence or a
+missing digest; future raw-attach source evidence includes a path digest plus
+its requested line. Both generators also redact captured private basenames
+from diagnostics, and the production smoke probe redacts forwarded notifications.

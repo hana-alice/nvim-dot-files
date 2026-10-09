@@ -368,7 +368,7 @@ map("n", "<leader>dr", "<cmd>UEDAPREPL<cr>", { desc = "DAP: Toggle REPL" })
 map("n", "<leader>d1", "<cmd>UEDAPTab repl<cr>", { desc = "DAP Tab: REPL" })
 map("n", "<leader>d2", "<cmd>UEDAPTab console<cr>", { desc = "DAP Tab: Console" })
 map("n", "<leader>d3", "<cmd>UEDAPTab breakpoints<cr>", { desc = "DAP Tab: Breakpoints" })
-map("n", "<leader>d4", "<cmd>UEDAPTab logcat<cr>", { desc = "DAP Tab: Logcat" })
+map("n", "<leader>d4", "<cmd>UEDAPTab log<cr>", { desc = "DAP Tab: Log" })
 map("n", "<leader>d]", "<cmd>UEDAPNextTab<cr>", { desc = "DAP Tab: Next" })
 map("n", "<leader>d[", "<cmd>UEDAPPrevTab<cr>", { desc = "DAP Tab: Previous" })
 

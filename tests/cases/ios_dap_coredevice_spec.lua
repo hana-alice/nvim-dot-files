@@ -70,7 +70,299 @@ local function bootstrap_system(calls)
   end
 end
 
+local function assert_coredevice_attach_policy(captured, initial_commands)
+  local config = captured.config
+  local runtime = captured.runtime
+  local expected_init = vim.deepcopy(initial_commands)
+  expected_init[#expected_init + 1] = "settings set plugin.process.gdb-remote.packet-timeout 60"
+  t.assert_true(vim.deep_equal(config.initCommands, expected_init), "packet timeout must be set before attach")
+  t.assert_true(config.initCommands ~= initial_commands)
+  t.assert_eq(config.request, "attach")
+  t.assert_true(config.stopOnEntry)
+  t.assert_eq(config._ue_device_id, runtime.coredevice_id)
+  t.assert_eq(config._ue_process_id, runtime.pid)
+  t.assert_true(
+    vim.deep_equal(config.attachCommands, {
+      'target create "' .. runtime.binary .. '"',
+      'device select "' .. runtime.coredevice_id .. '"',
+      "device process attach -p " .. runtime.pid,
+      'target symbols add "' .. runtime.dsym .. '"',
+    }),
+    "attach must keep the frozen target and PID suspended"
+  )
+  t.assert_eq(config.postRunCommands[1], "process status")
+  t.assert_contains(config.postRunCommands[2], runtime.expected_uuids[1])
+  t.assert_contains(config.postRunCommands[2], "__UE_IOS_LOADED_UUID_OK__")
+  t.assert_contains(config.postRunCommands[2], "__UE_IOS_LOADED_UUID_MISMATCH__")
+end
+
+local function with_ios_lifecycle(callback)
+  local C = require("ue.dap._common")
+  local Runtime = require("ue.dap._ios_runtime")
+  local CoreDevice = require("ue.dap._ios_coredevice")
+  local original = {
+    resolve = Runtime.resolve,
+    query_adapter = Runtime.query_adapter,
+    prepare = CoreDevice.prepare,
+    stop = CoreDevice.stop,
+    run = C.run,
+    require_dap = C.require_dap,
+    defer_fn = vim.defer_fn,
+    ios = package.loaded["ue.dap.ios"],
+    session = package.loaded["ue.dap._ios_session"],
+  }
+  local state = { stopped = {}, deferred = {}, disconnects = 0 }
+  local dap = {
+    listeners = {
+      after = { disconnect = {}, event_initialized = {}, event_output = {}, event_stopped = {}, setBreakpoints = {} },
+      before = { event_exited = {}, event_terminated = {} },
+      on_session = {},
+    },
+    session = function()
+      return state.active
+    end,
+    disconnect = function(_, done)
+      state.disconnects = state.disconnects + 1
+      state.disconnect_done = done
+    end,
+  }
+  Runtime.resolve = function()
+    return { backend = "coredevice", device_id = "DEVICE-1" }
+  end
+  Runtime.query_adapter = function(_, _, done)
+    done({})
+  end
+  CoreDevice.prepare = function(mode, runtime, deps)
+    runtime._ue_coredevice_owns_process = mode == "launch"
+    deps.run(runtime, {
+      _ue_session_owner = "ios",
+      _ue_ios_session_owner = "coredevice",
+      _ue_ios_backend = "coredevice",
+      _ue_session_operation = mode,
+    })
+  end
+  CoreDevice.stop = function(runtime, _, done)
+    if runtime._ue_coredevice_cleanup and runtime._ue_coredevice_cleanup.done then
+      done(true)
+      return
+    end
+    state.stopped[#state.stopped + 1] = runtime
+    runtime._ue_coredevice_cleanup = { done = true }
+    done(true)
+  end
+  C.run = function(config)
+    local old_session = state.active
+    state.active = { config = vim.deepcopy(config), on_close = {} }
+    for _, on_session in pairs(dap.listeners.on_session) do
+      on_session(old_session, state.active)
+    end
+    return true
+  end
+  C.require_dap = function()
+    return dap
+  end
+  vim.defer_fn = function(fn)
+    state.deferred[#state.deferred + 1] = fn
+  end
+  package.loaded["ue.dap.ios"] = nil
+  package.loaded["ue.dap._ios_session"] = nil
+  local ok, err = xpcall(function()
+    callback(require("ue.dap.ios"), dap, state)
+  end, debug.traceback)
+  Runtime.resolve = original.resolve
+  Runtime.query_adapter = original.query_adapter
+  CoreDevice.prepare = original.prepare
+  CoreDevice.stop = original.stop
+  C.run = original.run
+  C.require_dap = original.require_dap
+  vim.defer_fn = original.defer_fn
+  package.loaded["ue.dap.ios"] = original.ios
+  package.loaded["ue.dap._ios_session"] = original.session
+  if not ok then
+    error(err)
+  end
+end
+
 t.describe("ue.dap iOS CoreDevice runtime", function()
+  t.it("cleans the owned iOS runtime after adapter EOF without protocol end events", function()
+    with_ios_lifecycle(function(ios, _, state)
+      ios.launch({})
+      local session = state.active
+      local runtime = ios._session
+      session.closed = true
+      for _, on_close in pairs(session.on_close) do
+        on_close(session)
+      end
+      session.on_close = {}
+      t.assert_eq(ios._session, runtime)
+      t.assert_true(vim.wait(100, function()
+        return ios._session == nil
+      end, 2))
+      t.assert_eq(state.stopped[1], runtime)
+      t.assert_eq(#state.stopped, 1)
+      t.assert_eq(state.disconnects, 0)
+    end)
+  end)
+
+  t.it("ignores an old iOS close callback queued before a new session starts", function()
+    with_ios_lifecycle(function(ios, dap, state)
+      ios.launch({})
+      local old_session = state.active
+      t.assert_type(old_session.on_close.ue_ios_lifecycle, "function")
+      old_session.on_close.ue_ios_lifecycle(old_session)
+      dap.listeners.after.disconnect.ue_ios_lifecycle(old_session)
+      ios.launch({})
+      local new_runtime = ios._session
+      vim.wait(10)
+      t.assert_eq(ios._session, new_runtime)
+      t.assert_eq(#state.stopped, 1)
+      t.assert_eq(state.disconnects, 0)
+    end)
+  end)
+
+  t.it("coalesces protocol cleanup and adapter close for the same iOS owner", function()
+    with_ios_lifecycle(function(ios, dap, state)
+      ios.attach({})
+      local session = state.active
+      local on_close = session.on_close.ue_ios_lifecycle
+      t.assert_type(on_close, "function")
+      dap.listeners.on_session.ue_ios_lifecycle(session, session)
+      t.assert_eq(vim.tbl_count(session.on_close), 1)
+      dap.listeners.after.disconnect.ue_ios_lifecycle(session)
+      on_close(session)
+      vim.wait(10)
+      t.assert_nil(ios._session)
+      t.assert_eq(#state.stopped, 1)
+      t.assert_eq(state.disconnects, 0)
+    end)
+  end)
+
+  t.it("leaves another platform's close hooks and active iOS owner untouched", function()
+    with_ios_lifecycle(function(ios, dap, state)
+      ios.attach({})
+      local runtime = ios._session
+      local foreign_close = function() end
+      local foreign_session = { config = { _ue_session_owner = "android" }, on_close = { other = foreign_close } }
+      t.assert_type(dap.listeners.on_session.ue_ios_lifecycle, "function")
+      dap.listeners.on_session.ue_ios_lifecycle(state.active, foreign_session)
+      t.assert_nil(foreign_session.on_close.ue_ios_lifecycle)
+      t.assert_eq(foreign_session.on_close.other, foreign_close)
+      vim.wait(10)
+      t.assert_eq(ios._session, runtime)
+      t.assert_eq(#state.stopped, 0)
+      t.assert_eq(state.disconnects, 0)
+    end)
+  end)
+
+  t.it("ignores an old owner's UUID fallback and exit events after a new debug launch", function()
+    with_ios_lifecycle(function(ios, dap, state)
+      local key = "ue_ios_lifecycle"
+      ios.launch({})
+      local old_session = state.active
+      local old_runtime = ios._session
+      dap.listeners.after.event_output[key](old_session, { output = "__UE_IOS_LOADED_UUID_MISMATCH__" })
+      t.assert_true(vim.wait(100, function()
+        return #state.deferred == 1
+      end, 2))
+      dap.listeners.after.disconnect[key](old_session)
+      t.assert_eq(state.stopped[1], old_runtime)
+      ios.launch({})
+      local new_runtime = ios._session
+      state.deferred[1]()
+      dap.listeners.before.event_exited[key](old_session)
+      dap.listeners.before.event_terminated[key](old_session)
+      ios.cleanup({ session = old_session })
+      t.assert_eq(ios._session, new_runtime)
+      t.assert_eq(#state.stopped, 1)
+      t.assert_eq(state.disconnects, 1)
+      dap.listeners.after.disconnect[key](state.active)
+      t.assert_eq(state.stopped[2], new_runtime)
+    end)
+  end)
+
+  t.it("does not reuse another owner's cached cleanup for a stale session", function()
+    with_ios_lifecycle(function(ios, dap, state)
+      ios.attach({})
+      local old_session = state.active
+      dap.listeners.after.disconnect.ue_ios_lifecycle(old_session)
+      ios.attach({})
+      local new_session = state.active
+      dap.listeners.after.disconnect.ue_ios_lifecycle(new_session)
+      ios.cleanup({ session = old_session })
+      t.assert_eq(#state.stopped, 2)
+    end)
+  end)
+
+  t.it("rejects stale stop requests and never disconnects a different active DAP session", function()
+    with_ios_lifecycle(function(ios, dap, state)
+      ios.launch({})
+      local old_session = state.active
+      dap.listeners.after.disconnect.ue_ios_lifecycle(old_session)
+      ios.launch({})
+      local new_runtime = ios._session
+      local stopped
+      ios.stop({
+        session = old_session,
+        on_done = function(ok)
+          stopped = ok
+        end,
+      })
+      t.assert_false(stopped)
+      t.assert_eq(ios._session, new_runtime)
+      t.assert_eq(#state.stopped, 1)
+      state.active = old_session
+      ios.stop({})
+      t.assert_eq(state.disconnects, 0)
+      t.assert_eq(state.stopped[2], new_runtime)
+    end)
+  end)
+
+  t.it("waits for the matching owner's disconnect cleanup before accepting another launch", function()
+    with_ios_lifecycle(function(ios, _, state)
+      ios.launch({})
+      local runtime = ios._session
+      ios.stop({})
+      t.assert_eq(state.disconnects, 1)
+      t.assert_true(ios._stopping)
+      ios.launch({})
+      t.assert_eq(ios._session, runtime)
+      t.assert_eq(#state.stopped, 0)
+      state.deferred[1]()
+      t.assert_false(ios._stopping)
+      t.assert_eq(state.stopped[1], runtime)
+      ios.launch({})
+      t.assert_true(ios._session ~= runtime)
+    end)
+  end)
+
+  t.it("shares repeated stop requests and ignores their late finalizer after a new launch", function()
+    with_ios_lifecycle(function(ios, _, state)
+      ios.launch({})
+      local completed = 0
+      local opts = {
+        on_done = function(ok)
+          t.assert_true(ok)
+          completed = completed + 1
+        end,
+      }
+      ios.stop(opts)
+      ios.stop(opts)
+      t.assert_eq(state.disconnects, 1)
+      t.assert_eq(#state.deferred, 1)
+      state.deferred[1]()
+      t.assert_eq(completed, 2)
+      t.assert_eq(#state.stopped, 1)
+      ios.launch({})
+      local new_runtime = ios._session
+      state.deferred[1]()
+      state.disconnect_done()
+      vim.wait(10)
+      t.assert_eq(ios._session, new_runtime)
+      t.assert_eq(#state.stopped, 1)
+      t.assert_eq(completed, 2)
+    end)
+  end)
+
   t.it("freezes explicit CoreDevice inputs with real xcrun or fails closed without it", function()
     local root = vim.fn.tempname() .. "-ios-runtime"
     local binary = root .. "/Binaries/IOS/SampleGame"
@@ -117,11 +409,12 @@ t.describe("ue.dap iOS CoreDevice runtime", function()
     local calls = {}
     local captured
     local failure
+    local init_commands = { "settings set stop-disassembly-display never" }
     require("ue.dap._ios_coredevice").prepare("launch", coredevice_runtime(), {
       fail = function(message)
         failure = message
       end,
-      init_commands = { "settings set stop-disassembly-display never" },
+      init_commands = init_commands,
       progress = function() end,
       run = function(runtime, config)
         captured = { runtime = runtime, config = config }
@@ -135,6 +428,8 @@ t.describe("ue.dap iOS CoreDevice runtime", function()
     t.assert_eq(captured.runtime.pid, 991)
     t.assert_true(captured.runtime._ue_coredevice_owns_process)
     t.assert_eq(captured.config._ue_session_operation, "launch")
+    t.assert_true(vim.deep_equal(init_commands, { "settings set stop-disassembly-display never" }))
+    assert_coredevice_attach_policy(captured, init_commands)
     local launch
     for _, argv in ipairs(calls) do
       if vim.list_contains(argv, "launch") then
@@ -151,11 +446,12 @@ t.describe("ue.dap iOS CoreDevice runtime", function()
     local calls = {}
     local captured
     local runtime = coredevice_runtime()
+    local init_commands = { "settings set auto-confirm true" }
     require("ue.dap._ios_coredevice").prepare("attach", runtime, {
       fail = function(message)
         error(message)
       end,
-      init_commands = {},
+      init_commands = init_commands,
       progress = function() end,
       run = function(frozen, config)
         captured = { runtime = frozen, config = config }
@@ -167,6 +463,8 @@ t.describe("ue.dap iOS CoreDevice runtime", function()
     t.assert_eq(captured.runtime.pid, 991)
     t.assert_false(captured.runtime._ue_coredevice_owns_process)
     t.assert_eq(captured.config._ue_session_operation, "attach")
+    t.assert_true(vim.deep_equal(init_commands, { "settings set auto-confirm true" }))
+    assert_coredevice_attach_policy(captured, init_commands)
     for _, argv in ipairs(calls) do
       t.assert_false(vim.list_contains(argv, "launch"))
     end
@@ -394,13 +692,17 @@ t.describe("ue.dap iOS CoreDevice runtime", function()
   t.it("allows a late UUID marker but bounds missing-marker disconnect cleanup", function()
     local C = require("ue.dap._common")
     local original_require_dap = C.require_dap
-    local active
+    local active = {
+      config = { _ue_session_owner = "ios", _ue_ios_session_owner = "coredevice", _ue_ios_backend = "coredevice" },
+      on_close = {},
+    }
     local disconnects = 0
     local cleanups = 0
     local dap = {
       listeners = {
         after = { disconnect = {}, event_initialized = {}, event_output = {}, event_stopped = {}, setBreakpoints = {} },
         before = { event_exited = {}, event_terminated = {} },
+        on_session = {},
       },
       disconnect = function()
         disconnects = disconnects + 1
@@ -426,9 +728,7 @@ t.describe("ue.dap iOS CoreDevice runtime", function()
     local listeners = dap.listeners.after
     local key = "ue_ios_lifecycle"
 
-    active = {
-      config = { _ue_session_owner = "ios", _ue_ios_session_owner = "coredevice", _ue_ios_backend = "coredevice" },
-    }
+    t.assert_type(active.on_close[key], "function")
     listeners.event_initialized[key](active)
     listeners.setBreakpoints[key](active, nil, {
       breakpoints = { { verified = true } },

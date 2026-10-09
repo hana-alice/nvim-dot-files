@@ -79,10 +79,16 @@ picker 而不能自动改选另一台。单次 Install/Launch 任务必须在开
 MUST：`UELaunch` 必须使用捕获设备和已安装 app 的真实 bundle identifier；CoreDevice 与
 pre-iOS17 legacy backend 均不得调用 UE legacy Run 后端或自动进入 DAP。
 
+#### Scenario: 普通启动与真机调试均可用
+
+- **WHEN** 用户执行 `:UELaunch`，且当前宿主同时支持原生 iOS DAP
+- **THEN** 系统必须只报告 run 结果，不得自动 start-stopped 或进入 DAP
+- **AND** 真机调试必须通过独立 `:UEDAPLaunch ios` / `:UEDAPAttach ios` 入口执行
+
 #### Scenario: 只存在 macOS PID attach 能力
 
-- **WHEN** 用户启动 IOS 应用但原生 iOS DAP 尚未实现
-- **THEN** 系统必须只报告 run 结果，不得把 macOS PID attach 伪装成 iOS 真机调试
+- **WHEN** 当前宿主没有满足条件的原生 iOS 真机调试能力
+- **THEN** 普通启动必须只报告 run 结果，不得把 macOS PID attach 伪装成 iOS 真机调试
 
 ### Requirement: 长任务必须异步、可取消、不误报成功，且日志脱敏
 
@@ -106,6 +112,6 @@ MUST：Build/Package/Install/Launch 必须使用非阻塞任务生命周期，�
 - **踩坑**：签名身份校验不能止步于“keychain 里有一张有效证书”，必须用临时 Mach-O 证明私钥可被
   非交互 `codesign` 使用；`errSecInternalComponent` 等错误的根因通常是 keychain 访问权限，不是
   设备或产物问题。
-- **重要事项**：原生 iOS DAP 尚未实现，`UELaunch` 只能报告 run 结果；相关调试能力见
+- **重要事项**：`UELaunch` 保持普通 run 语义；已实现的原生 iOS DAP 使用独立入口，相关调试能力见
   `ios-device-debug-workflow`。真机 E2E 需要有效签名身份和可用设备，CI 无真机时必须报告
   blocked/not-run，不能靠 headless fixture 冒充通过。

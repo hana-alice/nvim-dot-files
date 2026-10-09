@@ -1194,6 +1194,44 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
     t.assert_eq(legacy_launch.process_id, 4242)
   end)
 
+  t.it("parses Xcode 26 launch identity from structured command arguments", function()
+    local expected = {
+      device_id = "COREDEVICE-1",
+      bundle_id = "com.example.samplegame",
+    }
+    local payload = {
+      info = {
+        commandType = "devicectl.device.process.launch",
+        outcome = "success",
+        arguments = {
+          "devicectl",
+          "device",
+          "process",
+          "launch",
+          "--device",
+          "COREDEVICE-1",
+          "com.example.samplegame",
+          "--json-output",
+          "/tmp/launch.json",
+        },
+      },
+      result = {
+        deviceIdentifier = "COREDEVICE-1",
+        process = { processIdentifier = 34330 },
+      },
+    }
+
+    local parsed = ios.parse_launch_result(vim.json.encode(payload), expected)
+    t.assert_true(parsed.ok)
+    t.assert_eq(parsed.bundle_id, "com.example.samplegame")
+    t.assert_eq(parsed.process_id, 34330)
+
+    payload.info.arguments[7] = "com.example.other"
+    local mismatched = ios.parse_launch_result(vim.json.encode(payload), expected)
+    t.assert_eq(mismatched.status, "unavailable")
+    t.assert_contains(mismatched.reason, "missing process identity")
+  end)
+
   t.it("parses the current CoreDevice schema and excludes disconnected hardware", function()
     local devices = ios.parse_device_list(vim.json.encode({
       result = {
@@ -1203,6 +1241,7 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
             connectionProperties = {
               pairingState = "paired",
               tunnelState = "connected",
+              transportType = "wired",
             },
             deviceProperties = {
               name = "Connected iPhone",
@@ -1212,6 +1251,7 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
               platform = "iOS",
               reality = "physical",
               deviceType = "iPhone",
+              udid = "MOBILEDEVICE-1",
             },
           },
           {
@@ -1234,8 +1274,10 @@ t.describe("ue.targets.ios package/device/install/launch planners", function()
     t.assert_true(devices.ok)
     t.assert_eq(#devices.devices, 1)
     t.assert_eq(devices.devices[1].id, "CONNECTED-1")
+    t.assert_eq(devices.devices[1].mobiledevice_id, "MOBILEDEVICE-1")
     t.assert_eq(devices.devices[1].name, "Connected iPhone")
     t.assert_eq(devices.devices[1].os_version, "18.5")
+    t.assert_eq(devices.devices[1].transport, "usb")
   end)
 
   t.it("owns iOS SDK and signing preflight plans and validation", function()

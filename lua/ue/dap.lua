@@ -1476,7 +1476,7 @@ function D.dap_status_session(opts)
 end
 
 -- ─────────────────────────────────────────────────────────────────────
--- setup_dap — wire dap-ui listeners, logcat, source-path rewrite,
+-- setup_dap — wire dap-ui listeners, session logs, source-path rewrite,
 -- scope filter, VimLeavePre cleanup. Called by lua/plugins/dap.lua.
 -- ─────────────────────────────────────────────────────────────────────
 
@@ -1672,15 +1672,15 @@ function D.setup_dap(dap, dapui)
     end
   end
 
-  -- ─── logcat side-panel (Android sessions only) ────────────────────
+  -- ─── session-owned log side-panel ────────────────────────────────
   local logcat_buf, logcat_job
   local start_logcat
-  local bottom_tabs = { "repl", "console", "breakpoints", "logcat" }
+  local bottom_tabs = { "repl", "console", "breakpoints", "log" }
   local bottom_tab_labels = {
     repl = "REPL",
     console = "Console",
     breakpoints = "Breakpoints",
-    logcat = "Logcat",
+    log = "Log",
   }
   local active_bottom_tab = "repl"
 
@@ -1699,6 +1699,10 @@ function D.setup_dap(dap, dapui)
   end
 
   local function bottom_tab_statusline(active)
+    local session = dap.session()
+    local owner = D._dap_log_owner(session)
+    bottom_tab_labels.log = owner and owner.log_label
+      or (is_ue_android_lldb_session(session) and "Logcat" or "Log")
     local parts = {}
     for i, name in ipairs(bottom_tabs) do
       local label = bottom_tab_labels[name] or name
@@ -1723,6 +1727,7 @@ function D.setup_dap(dap, dapui)
       or ft == "dapui_console"
       or ft == "dapui_breakpoints"
       or name:match("logcat:%d+$") ~= nil
+      or vim.b[buf].ue_dap_log == true
   end
 
   local function find_bottom_tab_window()
@@ -1752,7 +1757,11 @@ function D.setup_dap(dap, dapui)
   end
 
   local function bottom_tab_buffer(name)
-    if name == "logcat" then
+    if name == "log" then
+      local session = dap.session()
+      local owner = D._dap_log_owner(session)
+      if owner then return owner.log_buffer(session) end
+      if not is_ue_android_lldb_session(session) then return nil end
       if (not logcat_buf or not vim.api.nvim_buf_is_valid(logcat_buf))
          and type(start_logcat) == "function" then
         local state = current_android_state()
@@ -1844,6 +1853,7 @@ function D.setup_dap(dap, dapui)
   D._dap_bottom_tab_impl = function(name, opts)
     opts = opts or {}
     name = tostring(name or active_bottom_tab or "repl"):lower()
+    if name == "logcat" then name = "log" end
     if not vim.tbl_contains(bottom_tabs, name) then
       vim.notify("[ue.dap] unknown tab: " .. name, vim.log.levels.WARN)
       return
@@ -1891,6 +1901,7 @@ function D.setup_dap(dap, dapui)
   end
 
   start_logcat = function()
+    if not is_ue_android_lldb_session(dap.session()) then return end
     stop_logcat()
     local state = current_android_state()
     local pid = state.pid
@@ -2067,7 +2078,12 @@ function D.setup_dap(dap, dapui)
       pcall(vim.api.nvim_set_current_buf, saved_buf)
     end
     open_debug_layout({ reset = true })
-    start_logcat()
+    local log_owner = D._dap_log_owner(session)
+    if log_owner then
+      log_owner.log_buffer(session)
+    else
+      start_logcat()
+    end
     local config = session and session.config or nil
     if config and config._ue_ios_session_owner == "legacy-mobiledevice" then
       pcall(function()
@@ -2538,6 +2554,20 @@ function D._session_owner_module(owner_id)
   if id == "" then return nil end
   local ok_owner, owner = pcall(require, "ue.dap." .. id:lower())
   return ok_owner and owner or nil
+end
+
+--- Logs belong to the active session, never to a later target selection.
+function D._dap_log_owner(session)
+  local config = session and session.config
+  local id = config and config._ue_session_owner
+  if type(id) ~= "string" or id == "" then
+    return nil
+  end
+  local owner = D._session_owner_module(id)
+  if owner and type(owner.log_buffer) == "function" then
+    return owner
+  end
+  return nil
 end
 
 --- Collect the L0 probes that are host-side and target-agnostic.

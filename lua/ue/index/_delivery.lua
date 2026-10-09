@@ -142,6 +142,9 @@ return function(M, core)
     end
     local state = core.h.ensure_index_state(ctx)
     local generation = core.h.generation_for_context(ctx)
+    -- No generation verdict exists while the current digest is in flight.
+    -- Reporting a mismatch here would label intact artifacts as obsolete.
+    if generation.pending or generation.failed then return rows end
     local paths = {
       current = ctx.paths.index_current_cdb,
       hot = ctx.paths.index_hot_cdb,

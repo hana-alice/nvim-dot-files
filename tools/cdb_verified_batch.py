@@ -30,7 +30,8 @@ from clangd_batch_runner import normalize_server_profile, run
 from clangd_index_graph import _record_key, canonical_file_graph, read_shard
 
 _COLLECTOR_FILES = ('cdb_verified_batch.py', 'build_hot_super_unity_cdb.py', 'clangd_index_graph.py',
-                    'clangd_batch_runner.py', 'clangd_vfs_aliases.py', 'clangd_query_profile.py')
+                    'clangd_batch_runner.py', 'clangd_vfs_aliases.py', 'clangd_query_profile.py',
+                    'clangd_receipt_migration.py')
 _POLICY_FILES = ('clangd_batch_admission.py', 'clangd_batch_bindings.py',
                  '../lua/workarounds/clangd/header_path_case.py')
 _HEADER_CASE_PATH = Path(__file__).resolve().parent / _POLICY_FILES[-1]

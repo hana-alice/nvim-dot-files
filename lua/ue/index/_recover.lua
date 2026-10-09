@@ -139,6 +139,13 @@ return function(M, core)
     if not (manifest_path and read_manifest and phase_paths and generation) then
       return recovered, verdicts
     end
+    if generation.failed then return recovered, { digest = generation.digest_error or "digest-failed" } end
+    if generation.pending then
+      -- A cold digest cannot prove any persisted manifest. Resume only after
+      -- the worker has verified the current source identity.
+      core.h.resume_pending_generation(ctx, state)
+      return recovered, { digest = "digest-pending" }
+    end
 
     local base_cdb = core.h.base_compile_commands_path
       and core.h.base_compile_commands_path(ctx) or nil

@@ -92,6 +92,30 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 已将具名调查切片归档至 [2.7.0](release_2.7.0.md)。
 
+### 2026-10-09 — 大型 CDB 摘要与语义发布移出主循环；旧证明回执安全迁移
+
+**Task**
+- 消除启动/发布时主循环的同步大文件计算；让旧格式的 SuperUnity 证明回执在可重新证明时复用，并验收后台证明真实耗时。
+
+**Implemented**
+- `index/_generation_digest` + 新 `generation_digest_worker`：超过 1 MiB 的冷 CDB 摘要在独立 nvim worker 读取/解码/规范化/hash，父端只收小结果；缓存绑定 size/mtime/ctime/dev/ino，计算期间输入被替换即作废重算，连续变化 3 次明确失败。generation 区分 pending 与 failed，pending 不报 ready、不透传旧 generation。
+- 新 `_publication_async` + `publication_worker`：普通 phase manifest 与语义发布的读写/hash/合并在 worker 执行，主循环持有 job 与 writer lease 至回调完成；worker 失败显式报错，不同步回退。
+- 新 `tools/clangd_receipt_migration.py`：旧回执仅当 collector/helper 源码身份、编译器真实路径/版本/字节/query 输出、输入/依赖/快照/图 SHA 均能重新证明一致时才升级复用，否则保持失效。
+
+**Pitfalls / Gotchas**
+- Windows dev/ino 经 JSON 传输需转字符串，否则丢精度。
+- 覆盖统计必须用生产者的 portable member 函数；按 cwd/engine 拼路径或大小写折叠都会给出错误覆盖数（已作废留底）。
+
+**Validation**
+- 真实 Android/Test：主循环冷摘要 span 2363 ms → 371 ms（CPU 2359 → 31 ms），父端不再读写 291 MB CDB；启动最大 gap 4080 → 2378 ms。14317/14317 C/C++ 源成员覆盖、缺失 0。
+- 旧回执迁移恢复 1 批（另 6 批缺旧 collector 源码档案，保持失效）。
+- 全量回归 3360/3360，0 失败、0 跳过；前后工作树哈希一致。
+
+**Follow-ups（未达标）**
+- 卡顿目标 <200 ms 未达成：prepare 期间 max gap 4310 ms（父端 CPU 约 4.3 s 同步计算，热点未定位）；启动仍有约 1.9 s 未归因。
+- 后台发布反复 `publication generation changed`，队列卡在 collecting；frozen activation `watch-error`（原安全回退仍生效）。
+- 固定组 [29,30] 整组证明 127.5 s，比上轮 109 s 慢 17%（图解码 26.3 → 10.7 s，原 TU 索引 35.7 → 58.1 s；缓存与负载未控制，不是有效 A/B）。
+
 ### 2026-10-09 — 无变化 prepare 0.2 s；后台证明阶段计时与图处理缓存
 
 **Task**

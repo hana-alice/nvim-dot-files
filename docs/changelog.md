@@ -73,4 +73,6 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v2.1.0` → [docs/release_2.1.0.md](release_2.1.0.md) (iOS device debug and session logs; tag pending)
 
+- `v2.1.1` → [docs/release_2.1.1.md](release_2.1.1.md) (public history privacy repair; tag pending)
+
 ## Unreleased

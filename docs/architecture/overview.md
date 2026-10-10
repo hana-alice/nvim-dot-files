@@ -16,9 +16,17 @@
 | 子系统 | 代码 | 职责 | 归属边界 |
 |---|---|---|---|
 | UE 引擎中枢 | `lua/ue.lua` + `lua/ue/` | 索引 / CDB / DAP / 命令注册总入口 | 公共 API 挂 `M.*`；命令在 `ue.setup()` 注册 |
+| 底部面板 | `lua/utils/bottom_panel.lua` | 构建输出 / 原生 quickfix / logcat / 后台任务共用每 tab 的窗口 | 只换 buffer；隐藏不取消进程，任务状态仍由 registry 派生；DAP 借用 host 后只收自己的可见内容 |
+| 当前开发工作台 | `lua/utils/development_workbench.lua` + `verification_runs.lua` + `task_inspector.lua` | 目标/下一步、按运行归属的错误与日志、任务检查 | 每 tab 右分屏；业务凭据有界且不写进程状态；查看不启动探测；Enter 检查与停止分开 |
+| 具名调查 | `lua/utils/work_context.lua` + `work_context_ui.lua` + `work_context_store.lua` + `work_context_restore.lua` | 文件位置、完整搜索意图与下一步；本实例原结果另行关联 | 协调器保留工程/卡片/cache，restore 只负责本次原生文件视图；持久元数据按工程 CAS/merge/原子回读，不存文本/原生句柄，不执行 sessionload 或自动重放 |
+| 窗口与任务找回 | `lua/utils/workspace.lua` | 搜索实际窗口、隐藏 buffer、结果历史和保留日志 | 原生句柄为权威；确认前查身份；保存不打开面板，保护当前 qf ID/view，结果仍为原生有界历史 |
+| 日常编辑 | `lua/utils/cpp_format.lua` + `unsaved.lua` | 工程风格发现、显式 UE 模板、未保存列表与退出选择 | Conform 异步格式化且不回落默认风格；缓冲区事件维护计数，状态栏只读缓存；原生退出保留 |
+| 重构批次 | `lua/utils/refactor.lua` + `workspace_edit.lua` + `rename_preview.lua` | LSP 修改预览、受保护应用、恢复证据及整批撤销 | 编译器是修改来源；请求/预览/确认都核验 owner；取消的 applyTweak 保留拒绝守卫直到迟到请求排空，不覆盖后续输入 |
+| 工作现场 | `lua/utils/edit_recovery.lua` + `session_restore.lua` + `restart.lua` | 异步文本快照、按需会话、重启前检查 | 文本快照按项目/进程/会话独立；仅恢复为新 buffer；会话布局与文本耐久性分开验收 |
+| 运行配置与 UE 工具 | `lua/ue/run_profiles.lua` + `editor_tests.lua` + `lua/utils/ue_entities.lua` | 命名配置、显式 Editor 测试及模块内类创建 | 复用 live selection 和原子项目字段；host driver 拥有 Editor argv；生成仅限现有项目模块，不自动构建或安装 |
 | Project/session state | `lua/ue/project_state.lua` + `file_lock.lua` | 当前进程选择、canonical project bucket、跨进程 writer lease | live selection 不重读其他实例的默认值；共享写入必须 atomic/merge/lease |
 | CDB 流水线 | `lua/ue/cdb/` | compile_commands.json 生成/裁剪/shader/inject | 纯函数 + 子进程；写前 skip-if-unchanged |
-| 配置 schema | `lua/ue/config.lua` | `index/resources/context/clangd/dap/cdb` 默认值 + override | `get/setup/options/reset_for_test` |
+| 配置 schema | `lua/ue/config.lua` | `index/resources/context/clangd/dap/cdb/probe/edit_recovery` 默认值 + override | `get/setup/options/reset_for_test` |
 | 核心工具 | `lua/ue/core/` | fs / proc 纯函数 | 无副作用，可 headless 断言 |
 | Git 审阅 | `lua/plugins/` Git 配置 + `lua/utils/git_review.lua` | CodeDiff 默认完整文件审阅；Snacks 内容搜索/ref 选择；Neogit 提交与仓库操作 | Diffview 保留 `gv/gV` 和 Visual `gv` 按需入口；Fugitive 保留原文/blame/quickfix；Gitsigns 管普通编辑态，CodeDiff 管审阅内 hunk，不使用 Trouble Git mode |
 | DAP 调试 | `lua/ue/dap/` | session-owner dispatch + 各平台 attach/launch | `platforms` 注册表是唯一 dispatch seam |
@@ -26,7 +34,11 @@
 | Android SO 迭代 | `lua/ue/targets/android.lua` + `android_windows.lua` + `scripts/ue_android_so_*.ps1` + `scripts/ue_android_so_agent.c` | Windows host 上的 SO-only UBT action 执行；root 原子替换或 debuggable app-private ClassLoader 重定向 | Windows-only compatibility adapter；不增加 macOS→Android；正常 APK 流程保持独立 |
 | UE target drivers | `lua/ue/targets/` | Android / IOS / Mac / Win64 / Linux 的 UBT、UAT、产物和设备策略 | 各 target 独立实现；不得跨 driver fallback |
 | 符号解析栈 | `lua/utils/ue_goto/` + `lsp_fallback.lua` | C++ compiler identity；非 C++ compatibility | header 必须有 proven origin TU；非 resolved 不猜测 |
-| 代码搜索 | `lua/utils/code_search/` | csearch 亚秒级 grep | 显式搜索、references 与非 C++ 兼容路径 |
+| 代码搜索 | `lua/utils/code_search/` + `search_picker.lua` + `search_process.lua` | 索引查询、可证明 span、流式状态及后置过滤 | 索引入口不降级；显式 rg 沿用真实 provider argv；line-only/partial 可见，EOF 与 exit 分开 |
+| 当前文档查找 | `lua/utils/document_find.lua` + `document_find_process.lua` | 当前内存文本的逐次匹配和条件控制 | 不依赖 UE/CDB；有界单线程 rg stdin、流式解析和取消，来源版本与窗口交接复核 |
+| 当前文档位置 | `lua/utils/document_location.lua` | 编辑区行列直达及文件位置复制 | 同文件列表一基 UTF-8 字节列；严格拒绝无效坐标，输入期间核验来源，相对路径以窗口 cwd 为根 |
+| 搜索意图与文件清单 | `lua/utils/search_recipe.lua` + `search_history_store.lua` + `file_query.lua` + `file_inventory.lua` | 完整条件恢复、路径/位置往返、独立冷热文件范围 | canonical 项目隔离与锁内合并；文件清单只在当前进程缓存，不更改 CDB/csearch 输入 |
+| 连续代码阅读 | `lua/utils/ue_goto/reading*.lua` + `relations.lua` | 引用/header owner、显式 Peek、按需关系与返回 | C++ 定义复用 compiler proof；确认交接复核版本；关系 location 渲染不修改缓存；不接管全局 view |
 | 核心健康审计 | `lua/utils/core_health*.lua` + `scripts/nvim_core_health.lua` | 真实启动、编辑、AST、搜索、clangd/CDB/target plan 的分层证据 | 交互入口只异步启动隔离 headless runner；live workspace 只读 |
 | 宿主资源纪律 | `lua/utils/cpu_load.lua` + `host_admission.lua` + `clangd_resource_controller.lua` | 轻量感知、统一双水位策略、前台 ownership、owned clangd 可逆降级 | batch 只在 start 前推迟；前台不等 CPU；不操作外部进程 |
 | 平台驱动 | `lua/utils/platform/` | OS 分支唯一收口 | 共享基础接口 + host-owned 可选能力；其余代码不做 OS 分支 |
@@ -187,6 +199,15 @@
   debug-launch 的 loaded UUID、resolved breakpoint、精确 source frame、expression 与 owner cleanup 均通过。
 
 ### 2.1 状态归属清单
+
+日常文件修改由 `utils/file_mutations*.lua` 统一拥有，Snacks 文件树只通过隔离补丁接线。
+宿主驱动提供工作池中的独占移动；删除先隔离对象，再回收该路径，已打开的文本保留。
+`safe_buffer_close.lua` 保护确认、保存和窗口交接；原生卸载回调产生的新文本恢复为未命名脏缓冲区。
+这些操作不接管任务停止或全局窗口恢复。
+
+当前文件大纲由 `document_symbols.lua` 绑定阅读 owner，并沿用 Snacks 原生符号树；
+迟到坐标在发布和确认前复验，关闭取消实际在途请求。Blink 活跃片段先跳字段，
+Noice 继续拥有自动参数签名。命令中枢复用真实映射回调，并保护来源窗口、文本与目标身份。
 
 | 作用域 | 当前状态 | 多实例语义 |
 |---|---|---|

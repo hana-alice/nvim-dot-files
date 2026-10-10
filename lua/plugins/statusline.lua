@@ -25,13 +25,27 @@ return {
             local fileinfo      = MiniStatusline.section_fileinfo({ trunc_width = 120 })
             local location      = MiniStatusline.section_location({ trunc_width = 75 })
             local search        = MiniStatusline.section_searchcount({ trunc_width = 75 })
+            -- UE workflow state (index, build result, tasks, target device/
+            -- package) is computed by ue.statusline_status on its own events
+            -- and cached in g:ueindex_status; this only reads it (no timers).
+            local ue_status     = MiniStatusline.is_truncated(90) and "" or (vim.g.ueindex_status or "")
+            local debug_state   = require("utils.ue_hub").debug_indicator()
+            local probe_status  = vim.g.ue_probe_status or ""
+            local unsaved       = vim.g.ue_unsaved_status or ""
+            local recovery      = vim.g.ue_recovery_available or ""
+            local recovery_status = vim.g.ue_recovery_status or ""
 
             return MiniStatusline.combine_groups({
               { hl = mode_hl,                  strings = { mode } },
+              { hl = "DiagnosticError",        strings = { debug_state } },
+              { hl = "DiagnosticWarn",         strings = { unsaved } },
+              { hl = "DiagnosticWarn",         strings = { recovery, recovery_status } },
+              { hl = "MiniStatuslineDevinfo",  strings = { probe_status } },
               { hl = "MiniStatuslineDevinfo",  strings = { git, diff, diagnostics, lsp } },
               "%<", -- truncate from here
               { hl = "MiniStatuslineFilename", strings = { filename } },
               "%=", -- right align
+              { hl = "MiniStatuslineDevinfo",  strings = { ue_status } },
               { hl = "MiniStatuslineFileinfo", strings = { fileinfo } },
               { hl = mode_hl,                  strings = { search, location } },
             })

@@ -14,7 +14,6 @@ return function(M, core)
   }
 
   local TOOLCHAIN_IDENTITY_CACHE = {}
-  local CDB_DIGEST_CACHE = {}
 
   local read_json_file = core.h.read_json_file
   local read_text_file = core.h.read_text_file
@@ -23,140 +22,11 @@ return function(M, core)
   local index_phase_label = core.h.index_phase_label
   local module_tier_label = core.h.module_tier_label
 
-  local function sha256_text(payload)
-    local ok, digest = pcall(vim.fn.sha256, tostring(payload or ""))
-    if ok and type(digest) == "string" and digest ~= "" then
-      return digest
-    end
-    return nil
-  end
-
-  local function canonical_json(value, seen)
-    local kind = type(value)
-    if kind ~= "table" then return vim.json.encode(value) end
-
-    seen = seen or {}
-    if seen[value] then error("cannot hash cyclic table") end
-    seen[value] = true
-
-    local encoded = {}
-    if vim.islist(value) then
-      for _, item in ipairs(value) do
-        encoded[#encoded + 1] = canonical_json(item, seen)
-      end
-      seen[value] = nil
-      return "[" .. table.concat(encoded, ",") .. "]"
-    end
-
-    local keys = {}
-    for key in pairs(value) do
-      if type(key) ~= "string" then error("generation maps require string keys") end
-      keys[#keys + 1] = key
-    end
-    table.sort(keys)
-    for _, key in ipairs(keys) do
-      encoded[#encoded + 1] = vim.json.encode(key) .. ":" .. canonical_json(value[key], seen)
-    end
-    seen[value] = nil
-    return "{" .. table.concat(encoded, ",") .. "}"
-  end
-
-  local function stable_hash(payload)
-    return sha256_text(canonical_json(payload or {}))
-  end
-
-  local function canonical_cdb_path(dir, path)
-    local normalized = fs.norm(path or "")
-    local normalized_dir = fs.norm(dir or "")
-    if normalized ~= "" and not _ufs.is_absolute_path(normalized) and normalized_dir ~= "" then
-      normalized = fs.join(normalized_dir, normalized)
-    end
-    return fs.norm(normalized)
-  end
-
-  local function canonical_cdb_entry(entry)
-    if type(entry) ~= "table" then
-      return nil
-    end
-    local directory = fs.norm(entry.directory or "")
-    local file = canonical_cdb_path(directory, entry.file or "")
-    if file == "" then
-      return nil
-    end
-    local args = {}
-    if type(entry.arguments) == "table" then
-      for _, arg in ipairs(entry.arguments) do
-        args[#args + 1] = tostring(arg)
-      end
-    end
-    return {
-      directory = directory,
-      file = file,
-      output = canonical_cdb_path(directory, entry.output or ""),
-      arguments = args,
-      command = type(entry.command) == "string" and fs.trim(entry.command) or "",
-    }
-  end
-
-  local function normalized_cdb_digest(base_cdb_path)
-    base_cdb_path = fs.norm(base_cdb_path or "")
-    local stat = base_cdb_path ~= "" and (vim.uv or vim.loop).fs_stat(base_cdb_path) or nil
-    local signature = stat and table.concat({
-      tostring(stat.size or 0),
-      tostring(stat.mtime and stat.mtime.sec or 0),
-      tostring(stat.mtime and stat.mtime.nsec or 0),
-    }, ":") or "missing"
-    local cached = CDB_DIGEST_CACHE[base_cdb_path]
-    if cached and cached.signature == signature then
-      return cached.digest
-    end
-    local content = read_text_file(base_cdb_path)
-    if not content then
-      return ""
-    end
-    local ok, decoded = pcall(vim.json.decode, content)
-    if not ok or type(decoded) ~= "table" then
-      return ""
-    end
-    local canonical = {}
-    for _, entry in ipairs(decoded) do
-      local normalized = canonical_cdb_entry(entry)
-      if normalized then
-        canonical[#canonical + 1] = normalized
-      end
-    end
-    table.sort(canonical, function(a, b)
-      if a.file ~= b.file then
-        return a.file < b.file
-      end
-      if a.directory ~= b.directory then
-        return a.directory < b.directory
-      end
-      local a_args = table.concat(a.arguments or {}, "\31")
-      local b_args = table.concat(b.arguments or {}, "\31")
-      if a_args ~= b_args then
-        return a_args < b_args
-      end
-      if a.command ~= b.command then
-        return a.command < b.command
-      end
-      return (a.output or "") < (b.output or "")
-    end)
-    local digest = stable_hash(canonical) or ""
-    CDB_DIGEST_CACHE[base_cdb_path] = { signature = signature, digest = digest }
-    return digest
-  end
-
-  local function file_signature(path)
-    path = fs.norm(path or "")
-    local stat = path ~= "" and (vim.uv or vim.loop).fs_stat(path) or nil
-    if not stat or stat.type ~= "file" then return "missing" end
-    return table.concat({
-      tostring(stat.size or 0),
-      tostring(stat.mtime and stat.mtime.sec or 0),
-      tostring(stat.mtime and stat.mtime.nsec or 0),
-    }, ":")
-  end
+  local digest = require("ue.index._generation_digest")(M, core)
+  local sha256_text = digest.sha256_text
+  local stable_hash = digest.stable_hash
+  local normalized_cdb_digest = digest.normalized_cdb_digest
+  local file_signature = digest.file_signature
 
   local function coverage_rank(level)
     return INDEX_COVERAGE_RANK[fs.trim(level):lower()] or 0
@@ -279,14 +149,26 @@ return function(M, core)
     if not base_cdb_path or base_cdb_path == "" then
       base_cdb_path = core.h.base_compile_commands_path and core.h.base_compile_commands_path(ctx) or nil
     end
-    local cdb_digest = base_cdb_path and base_cdb_digest(base_cdb_path) or ""
+    local cdb_digest, digest_reason
+    if opts.cdb_digest ~= nil then
+      cdb_digest = opts.cdb_digest
+    elseif opts.synchronous then
+      cdb_digest, digest_reason = digest.compute_cdb_digest(base_cdb_path)
+    elseif base_cdb_path then
+      cdb_digest, digest_reason = base_cdb_digest(base_cdb_path)
+    else
+      cdb_digest = ""
+    end
     local key = build_key_from_ctx(ctx)
     local toolchain = opts.toolchain_identity or toolchain_identity()
     return {
       build_key = key,
       cdb_digest = cdb_digest,
       toolchain_identity = toolchain,
-      generation_id = stable_hash({
+      pending = cdb_digest == nil and digest_reason == "digest-pending",
+      failed = cdb_digest == nil and digest_reason ~= "digest-pending",
+      digest_error = digest_reason,
+      generation_id = cdb_digest ~= nil and stable_hash({
         build_key = key,
         cdb_digest = cdb_digest,
         toolchain_identity = toolchain,
@@ -294,12 +176,47 @@ return function(M, core)
     }
   end
 
+  local function generation_for_context_async(ctx, opts, callback)
+    opts = opts or {}
+    local base = opts.base_cdb_path
+      or (core.h.base_compile_commands_path and core.h.base_compile_commands_path(ctx))
+    digest.normalized_cdb_digest_async(base, function(value, err)
+      if not value then callback(nil, err); return end
+      callback(generation_for_context(ctx, vim.tbl_extend("force", opts, { cdb_digest = value })))
+    end, opts)
+  end
+
+  local function resume_pending_generation(ctx, state)
+    RT.pending_generation_consumers = RT.pending_generation_consumers or {}
+    if RT.pending_generation_consumers[ctx] then return end
+    RT.pending_generation_consumers[ctx] = true
+    generation_for_context_async(ctx, {}, function(value, err)
+      RT.pending_generation_consumers[ctx] = nil
+      if not value then
+        require("utils.log").warn_ctx("ue.index", "generation digest failed", { reason = err })
+      else
+        local selection = core.h.select_active_artifact(state, value)
+        core.h.update_index_selection(state, selection, value, selection and "fresh" or "missing")
+        if M.maybe_recover_readiness then M.maybe_recover_readiness(ctx, state) end
+        local wake = core.deps.core_rt and core.deps.core_rt.start_deferred_clangd
+        if wake then wake(ctx) end
+      end
+      if core.deps.invalidate_status_cache then core.deps.invalidate_status_cache() end
+      if core.deps.refresh_statusline then core.deps.refresh_statusline() end
+    end)
+  end
+
   local function make_index_manifest(ctx, state, phase, index_path, module_keys, opts)
     opts = opts or {}
+    -- Coverage is a set; queue priority must not churn its persisted identity.
+    module_keys = vim.deepcopy(module_keys or {})
+    table.sort(module_keys)
     local generation = generation_for_context(ctx, {
       base_cdb_path = opts.base_cdb_path,
       toolchain_identity = opts.toolchain_identity,
+      synchronous = opts.synchronous,
     })
+    if generation.pending or generation.failed then return nil, generation.digest_error end
     local content = read_text_file(index_path)
     local idx_hash = content and sha256_text(content) or ""
     local background_cdb_path = fs.norm(opts.background_cdb_path or "")
@@ -345,6 +262,17 @@ return function(M, core)
       artifact_identity.semantic_cdb_hash = manifest.semantic_cdb_hash
     end
     manifest.artifact_fingerprint = stable_hash(artifact_identity) or ""
+    -- A repeated proof of identical artifacts is not a new publication. Keep
+    -- the original completion time only when every other provenance field,
+    -- including source signature and both CDB hashes, is still identical.
+    local previous = read_index_manifest(index_manifest_path(index_path))
+    if previous and type(previous.completed_at) == "number" and previous.completed_at >= 0 then
+      local comparable = vim.deepcopy(manifest)
+      comparable.completed_at = previous.completed_at
+      if vim.deep_equal(previous, comparable) then
+        manifest.completed_at = previous.completed_at
+      end
+    end
     return manifest
   end
 
@@ -609,6 +537,8 @@ return function(M, core)
     -- Not ledger-only: rebuild from on-disk manifests when the in-process record
     -- was lost (lua/ue/index/_recover.lua).
     if M.maybe_recover_readiness then M.maybe_recover_readiness(ctx, state) end
+    local generation = generation_for_context(ctx)
+    if generation.pending then resume_pending_generation(ctx, state) end
 
     local selected = state.index_selection or index_state_selection_default()
     local artifact = state.index_artifacts and state.index_artifacts[selected.phase] or nil
@@ -619,7 +549,7 @@ return function(M, core)
 
     local readiness = "missing"
     local freshness = "missing"
-    if artifact and artifact.build_key ~= build_key_from_ctx(ctx) then
+    if artifact and (artifact.build_key ~= build_key_from_ctx(ctx) or not same_generation(artifact, generation)) then
       readiness = "stale"
       freshness = "stale"
     elseif artifact and _ufs.is_file(artifact.index_path)
@@ -637,6 +567,11 @@ return function(M, core)
       end
     elseif state.build and state.build.status == "running" then
       readiness = "building"
+    end
+    if generation.pending or generation.failed then
+      readiness = generation.failed and "failed" or "pending"
+      freshness = "missing"
+      selected = index_state_selection_default()
     end
 
     -- The delivery gate requires a named, existing artifact as readiness proof.
@@ -685,6 +620,7 @@ return function(M, core)
       complete = selected.coverage_level == "full",
       module_count = tonumber(selected.module_count) or 0,
       readiness = readiness,
+      digest_error = generation.digest_error,
       freshness = freshness,
       subject_module = subject_module,
       subject_dirty = subject_dirty,
@@ -695,6 +631,7 @@ return function(M, core)
   M.index_status_summary = function(ctx)
     local state = ensure_index_state(ctx)
     local generation = generation_for_context(ctx)
+    if generation.pending then resume_pending_generation(ctx, state) end
     local selection = select_active_artifact(state, generation)
     local dirty = 0
     local total = 0
@@ -730,7 +667,13 @@ return function(M, core)
     elseif fs.trim(generation.generation_id) ~= "" then
       freshness = "stale"
     end
-    local _, snapshot = update_index_selection(state, selection, generation, freshness)
+    local snapshot
+    if generation.pending or generation.failed then
+      snapshot = index_state_selection_default()
+    else
+      local _, selected_snapshot = update_index_selection(state, selection, generation, freshness)
+      snapshot = selected_snapshot
+    end
     return {
       active = active_name,
       active_tier = active_tier,
@@ -747,8 +690,9 @@ return function(M, core)
         or (core.deps.core_rt.dirty_index_roots[core.deps.status_root_key(ctx)] and true or false),
       phase = phase,
       phase_label = index_phase_label(phase),
-      status = state.build and state.build.status or "idle",
-      message = state.build and state.build.message or "",
+      status = generation.failed and "error" or generation.pending and "pending" or state.build and state.build.status or "idle",
+      message = generation.failed and ("CDB digest failed: " .. tostring(generation.digest_error))
+        or generation.pending and "CDB digest pending" or state.build and state.build.message or "",
       active_index = state.build and state.build.active_index or "",
       active_index_name = fs.trim(vim.fs.basename(state.build and state.build.active_index or "")),
       coverage_level = snapshot.coverage_level,
@@ -767,6 +711,7 @@ return function(M, core)
   core.h.build_key_from_ctx = build_key_from_ctx
   core.h.toolchain_identity = toolchain_identity
   core.h.base_cdb_digest = base_cdb_digest
+  core.h.accept_verified_cdb_digest = digest.accept_verified_digest
   core.h.index_manifest_path = index_manifest_path
   core.h.read_index_manifest = read_index_manifest
   -- Exported for _recover: rebuilding readiness from disk must compare the source
@@ -777,6 +722,8 @@ return function(M, core)
   -- tuple, so both selection and observability must use the SAME rule.
   core.h.same_generation = same_generation
   core.h.generation_for_context = generation_for_context
+  core.h.generation_for_context_async = generation_for_context_async
+  core.h.resume_pending_generation = resume_pending_generation
   core.h.make_index_manifest = make_index_manifest
   core.h.select_active_artifact = select_active_artifact
   core.h.update_index_selection = update_index_selection
@@ -789,6 +736,7 @@ return function(M, core)
   M.read_index_manifest = read_index_manifest
   M.index_manifest_path = index_manifest_path
   M.generation_for_context = generation_for_context
+  M.generation_for_context_async = generation_for_context_async
   M._stable_hash_for_test = stable_hash
   M.make_index_manifest = make_index_manifest
   M.select_active_artifact = select_active_artifact

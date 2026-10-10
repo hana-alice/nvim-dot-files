@@ -78,7 +78,12 @@ function M.install(owner, deps)
   local format_jump_msg = assert(deps.format_jump_msg, "format_jump_msg is required")
 
   function owner.explain_lines()
-    return report.explain_lines(owner._last_cpp_transaction)
+    local lines = report.explain_lines(owner._last_cpp_transaction)
+    local reading = package.loaded["utils.ue_goto.reading"]
+    if reading and type(reading.explain_lines) == "function" then
+      vim.list_extend(lines, reading.explain_lines())
+    end
+    return lines
   end
 
   owner._test_explain_lines = owner.explain_lines
@@ -104,9 +109,10 @@ function M.install(owner, deps)
     end)
   end
 
-  function navigation.cpp_definition(sym, bufnr, ref_file, _ext)
+  function navigation.cpp_definition(sym, bufnr, ref_file, _ext, inspection)
     setup_semantic_trace()
-    local snapshot = semantic.begin_action(bufnr)
+    local snapshot = semantic.begin_action(bufnr, inspection and deps.inspection_current
+      and { is_current = deps.inspection_current } or nil)
     local environment, env_err = semantic.discover_toolchain(bufnr, {
       route = M.CPP_HEADER_EXTS[_ext] and "header" or "source",
     })
@@ -118,8 +124,11 @@ function M.install(owner, deps)
       failed.elapsed_ms = 0
       transaction.finish_once(failed_tx, failed)
       owner._last_cpp_transaction = failed_tx
-      record_semantic_probe(failed, failed_tx)
-      semantic_terminal_notice(sym, failed)
+      if inspection then inspection(nil, failed)
+      else
+        record_semantic_probe(failed, failed_tx)
+        semantic_terminal_notice(sym, failed)
+      end
       return
     end
 
@@ -283,6 +292,7 @@ function M.install(owner, deps)
         clear_progress()
         final.elapsed_ms = math.floor((vim.uv.hrtime() - started_at) / 1000000)
         if owner._last_cpp_transaction ~= tx then return end
+        if inspection then inspection(nil, final); return end
         record_semantic_probe(final, tx)
         if final.state ~= "resolved" then
           semantic_terminal_notice(sym, final)
@@ -304,7 +314,7 @@ function M.install(owner, deps)
     local function jump_resolved(location, tag, extra)
       local current, reason = request_is_current()
       if not current then finish_stale(reason); return end
-      if transaction.same_subject_location(tx, location) then
+      if not inspection and transaction.same_subject_location(tx, location) then
         finish(transaction.terminal("unavailable", "destination", "already-at-definition", extra))
         return
       end
@@ -319,6 +329,19 @@ function M.install(owner, deps)
       payload.metrics.source = payload.metrics.source or payload.provider
       local terminal_reason = payload.terminal_reason or "definition-resolved"
       payload.terminal_reason = nil
+      if inspection then
+        -- Inspection publishes compiler proof, not a resolved gd terminal or
+        -- a jump/probe/lineage side effect. The explicit picker owns opening.
+        payload.origin_context = extra and extra.origin_context or origin_context
+        payload.build_fingerprint = environment.build_fingerprint
+        payload.kind = "proven-destination"
+        payload.is_current = request_is_current
+        transaction.finish_once(tx, payload, function(proof)
+          clear_progress()
+          if request_is_current() then inspection(proof) end
+        end)
+        return
+      end
       local resolved = transaction.terminal("resolved", "jump", terminal_reason, payload)
       if jump_to_location(location) then
         local origin = extra and extra.origin_context or origin_context
@@ -344,18 +367,18 @@ function M.install(owner, deps)
         return
       end
       local miss_reason = extra and extra.fallback_reason or definition_miss_reason()
-      if role == "declaration" or (miss_reason ~= "index-incomplete"
-          and miss_reason ~= "index-provider-not-ready" and miss_reason ~= "identity-missing") then
-        local stage = miss_reason == "identity-missing" and "entity" or "index"
-        finish(transaction.terminal("unavailable", stage, miss_reason,
-          vim.tbl_extend("force", { subject_role = role, index = tx.index }, extra or {})))
+      if inspection and role ~= "declaration" and (miss_reason == "index-incomplete"
+          or miss_reason == "index-provider-not-ready" or miss_reason == "identity-missing") then
+        jump_resolved(declaration, "semantic·declaration", vim.tbl_extend("force", {
+          destination_role = "declaration", terminal_reason = miss_reason, index = tx.index,
+        }, extra or {}))
         return
       end
-      jump_resolved(declaration, "semantic·declaration", vim.tbl_extend("force", {
-        destination_role = "declaration",
-        terminal_reason = miss_reason,
-        index = tx.index,
-      }, extra or {}))
+      -- A header's proven declaration is identity evidence, not a substitute
+      -- for an out-of-line body when clangd is empty or only returns declarations.
+      local stage = miss_reason == "identity-missing" and "entity" or "index"
+      finish(transaction.terminal("unavailable", stage, miss_reason,
+        vim.tbl_extend("force", { subject_role = role, index = tx.index }, extra or {})))
     end
 
     local function lookup_module_definition(authoritative_usr, role, on_miss)
@@ -419,7 +442,8 @@ function M.install(owner, deps)
         choose_context = function(contexts, callback)
           clear_progress()
           if not request_is_current() then callback(nil); return end
-          require("utils.ue_goto.ui").choose_context(contexts, callback)
+          if inspection and deps.inspection_choose_context then deps.inspection_choose_context(contexts, callback)
+          else require("utils.ue_goto.ui").choose_context(contexts, callback) end
         end,
       }, function(response, stale_reason)
         if not response then
@@ -532,16 +556,25 @@ function M.install(owner, deps)
                 }))
                 return
               end
-              jump_resolved(locations[1], "clangd·USR-verified", {
-                provider = "clangd",
-                destination_role = "definition",
-                subject_role = role,
-                identity = authoritative_usr,
-                identity_result = symbol_info,
-                provider_result = definition_result,
-                metrics = { source = "clangd", identity_ms = symbol_info.elapsed_ms,
-                  destination_ms = definition_result.elapsed_ms },
-              })
+              require("utils.ue_goto.clangd_destination").verify(locations[1], authoritative_usr,
+                clangd_client_ids, function(target_evidence)
+                  if not request_is_current() or target_evidence.reason == "provider-cancelled" then
+                    finish_stale("destination-changed")
+                  elseif target_evidence.reason ~= "ok" then
+                    finish(transaction.terminal("unavailable", "destination", "definition-not-found", {
+                      provider = "clangd", identity = authoritative_usr,
+                      detail = target_evidence.reason, target_identity_result = target_evidence,
+                    }))
+                  else
+                    jump_resolved(locations[1], "clangd·USR-verified", {
+                      provider = "clangd", destination_role = "definition", subject_role = role,
+                      identity = authoritative_usr, identity_result = symbol_info,
+                      target_identity_result = target_evidence, provider_result = definition_result,
+                      metrics = { source = "clangd", identity_ms = symbol_info.elapsed_ms,
+                        destination_ms = definition_result.elapsed_ms },
+                    })
+                  end
+                end, provider_options({}))
             end, provider_options({
               client_ids = clangd_client_ids,
               compile_command_source = response.contexts and response.contexts[1]
@@ -585,10 +618,17 @@ function M.install(owner, deps)
       -- the proven source role before that response can be mistaken for a miss.
       for _, definition in ipairs(symbol_info.definitions or {}) do
         if transaction.same_subject_location(tx, definition) then
-          finish(transaction.terminal("unavailable", "destination", "already-at-definition", {
-            provider = "clangd", identity = usr, destination_role = "definition",
-            identity_result = symbol_info,
-          }))
+          if inspection then
+            jump_resolved(definition, "clangd·semantic", {
+              provider = "clangd", identity = usr, destination_role = "definition",
+              identity_result = symbol_info, metrics = { source = "clangd", identity_ms = symbol_info.elapsed_ms },
+            })
+          else
+            finish(transaction.terminal("unavailable", "destination", "already-at-definition", {
+              provider = "clangd", identity = usr, destination_role = "definition",
+              identity_result = symbol_info,
+            }))
+          end
           return
         end
       end
@@ -638,23 +678,32 @@ function M.install(owner, deps)
         end
         local function accept_destination(target_evidence, destination_role)
           local target_path = location_mod.location_path(locs[1]):lower()
-          if M.CPP_HEADER_EXTS[target_path:match("%.([^./\\]+)$") or ""]
-              and type(symbol_info.exact_command) == "table" then
+          if type(symbol_info.exact_command) == "table" then
             local exact = symbol_info.exact_command
             local compile = {
               directory = exact.workingDirectory,
               file = ref_file,
               argv = vim.deepcopy(exact.compilationCommand or {}),
             }
-            local compile_fingerprint = vim.fn.sha256(vim.json.encode(compile))
+            local compile_fingerprint = require("utils.ue_goto.semantic_context")
+              .compile_descriptor_fingerprint(compile.directory, compile.file, compile.argv)
             local lineage = {
               context_id = compile_fingerprint,
               origin_tu = ref_file,
               cdb_dir = environment.cdb_dir,
               compile = compile,
               compile_command_fingerprint = compile_fingerprint,
-              subject_membership = { [target_path] = true },
+              subject_membership = { [ref_file] = true },
+              -- A validated source command is a candidate for another header,
+              -- not proof that it includes that header. The header route must
+              -- re-prove active CDB identity and native inclusion before use.
+              source_exact_candidate = true,
+              evidence_kind = "clangd-source-exact-command",
+              source_action_token = snapshot.token,
             }
+            if M.CPP_HEADER_EXTS[target_path:match("%.([^./\\]+)$") or ""] then
+              lineage.subject_membership[target_path] = true
+            end
             origin_context = lineage
           end
           dtrace("semantic provider=clangd context=source-exact-command usr=%s state=resolved",

@@ -1,8 +1,8 @@
 -- Presentation data only: no compiler requests, editor mutation, or lineage writes.
 local M = {}
 M.OBSERVATIONS = {
-  ["cpp-semantic-navigation"] = "compiler-referent-kinds-2026-09-15",
-  ["cpp-semantic-performance"] = "compiler-referent-kinds-2026-09-15",
+  ["cpp-semantic-navigation"] = "header-cross-tu-target-proof-2026-10-09-K",
+  ["cpp-semantic-performance"] = "header-warm-alias-2026-10-08-F",
 }
 local location_mod = require("utils.ue_goto.location")
 local transaction = require("utils.ue_goto.semantic_transaction")

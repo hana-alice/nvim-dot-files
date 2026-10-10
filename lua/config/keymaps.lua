@@ -2,6 +2,16 @@ local map = vim.keymap.set
 local window_title = require("utils.window_title")
 window_title.setup()
 
+map({ "n", "x" }, "<leader>cf", function()
+  local format = require("utils.cpp_format")
+  if not format.is_cpp(0) then return LazyVim.format({ force = true }) end
+  local mode = vim.fn.mode()
+  local range = format.selection()
+  if mode == "\22" then return end
+  if range then vim.cmd.normal({ args = { "\27" }, bang = true }) end
+  format.format({ range = range })
+end, { desc = "Format safely (工程风格 / 选区)" })
+
 local function live_grep_with(opts)
   return function()
     LazyVim.pick.open("live_grep", vim.deepcopy(opts or {}))
@@ -73,6 +83,23 @@ local function open_visual_substitute()
   end)
 end
 
+local function find_document_text()
+  local mode = vim.fn.mode()
+  local visual = mode == "v" or mode == "V" or mode == "\22"
+  local text
+  if visual then
+    text = visual_selection_text()
+    if text:find("\n", 1, true) then
+      vim.notify("当前文档查找使用单行文字；请缩小选区", vim.log.levels.WARN)
+      return
+    end
+    vim.cmd.normal({ args = { termcodes("<Esc>") }, bang = true })
+  else
+    text = vim.fn.expand("<cword>")
+  end
+  require("utils.document_find").open({ text = text })
+end
+
 local function open_symbol_picker(opts)
   opts = opts or {}
   return function()
@@ -106,7 +133,7 @@ local function open_symbol_picker(opts)
     local buf = vim.api.nvim_get_current_buf()
     local has_lsp = #vim.lsp.get_clients({ bufnr = buf, method = "textDocument/documentSymbol" }) > 0
     if has_lsp then
-      return snacks.picker.lsp_symbols(picker_opts)
+      return require("utils.document_symbols").open(picker_opts)
     end
 
     -- No LSP client supports documentSymbol yet — use treesitter
@@ -208,13 +235,37 @@ local function sidebar_pick()
   require("utils.sidebar").pick()
 end
 
+local function quickfix_jump(command)
+  return function()
+    local ok, err = pcall(vim.cmd[command], { count = vim.v.count1 })
+    if not ok then vim.notify(tostring(err), vim.log.levels.WARN) end
+  end
+end
+
+-- Result navigation stays on the native list, regardless of open sidebars.
+map("n", "]q", quickfix_jump("cnext"), { desc = "Next quickfix result" })
+map("n", "[q", quickfix_jump("cprev"), { desc = "Previous quickfix result" })
+
 local function apply_ue_runtime_overrides()
   local opts = { nowait = true }
 
+  map("n", "<leader>u?", "<cmd>UEGuide<cr>", vim.tbl_extend("force", opts, { desc = "UE: User guide (使用手册)" }))
+  map("n", "<leader>uH", "<cmd>UEWorkbench<cr>", vim.tbl_extend("force", opts, { desc = "UE: Current development workbench" }))
+  map("t", "<leader>uH", [[<C-\><C-n><cmd>UEWorkbench<cr>]], vim.tbl_extend("force", opts, { desc = "UE: Current development workbench" }))
   map("n", "<leader>uA", "<cmd>UESetAndroidDevice<cr>", vim.tbl_extend("force", opts, { desc = "UE: Select Android device (this Nvim)" }))
   map("n", "<leader>ub", "<cmd>UEBuild<cr>", vim.tbl_extend("force", opts, { desc = "UE: Build (platform from UESetPlatform)" }))
+  map("n", "<leader>uE", "<cmd>UEBuildFirstError<cr>", vim.tbl_extend("force", opts, { desc = "UE: Jump to first build error" }))
+  map("n", "<leader>uJ", "<cmd>UEPanelNext<cr>", vim.tbl_extend("force", opts, { desc = "UE: Cycle bottom panel" }))
+  map("t", "<leader>uJ", [[<C-\><C-n><cmd>UEPanelNext<cr>]], vim.tbl_extend("force", opts, { desc = "UE: Cycle bottom panel" }))
+  map("n", "<leader>wM", "<cmd>UEWorkspace<cr>", vim.tbl_extend("force", opts, { desc = "Workspace: recover windows, results and task logs" }))
+  map("t", "<leader>wM", [[<C-\><C-n><cmd>UEWorkspace<cr>]], vim.tbl_extend("force", opts, { desc = "Workspace: recover windows, results and task logs" }))
   map("n", "<leader>us", "<cmd>UEBuildAndroidSO<cr>", vim.tbl_extend("force", opts, { desc = "UE: Build Android SO only (skip APK)" }))
   map("n", "<leader>uq", "<cmd>UEDeployAndroidSO<cr>", vim.tbl_extend("force", opts, { desc = "UE: Quick deploy Android SO" }))
+  map("n", "<leader>ux", "<cmd>UEAndroidIterate<cr>", vim.tbl_extend("force", opts, { desc = "UE: Android loop (build SO, deploy, debug-launch)" }))
+  map("n", "<leader>uX", "<cmd>UEAndroidCrash<cr>", vim.tbl_extend("force", opts, { desc = "UE: Symbolicate latest Android crash" }))
+  map("n", "<leader>uu", function() require("utils.ue_hub").target_switcher() end, vim.tbl_extend("force", opts, { desc = "UE: Switch target (project/platform/device/package)" }))
+  map("n", "<leader>uk", function() require("utils.ue_hub").run_fix() end, vim.tbl_extend("force", opts, { desc = "UE: Run the fix for the last failure" }))
+  map("n", "<leader>P", function() require("utils.ue_hub").command_hub() end, vim.tbl_extend("force", opts, { desc = "UE: Command hub (all actions, searchable)" }))
   map("n", "<leader>ug", "<cmd>UELogToggle<cr>", vim.tbl_extend("force", opts, { desc = "UE: Toggle app log" }))
   map("n", "<leader>ui", "<cmd>UEInstall<cr>", vim.tbl_extend("force", opts, { desc = "UE: Install for active target" }))
   map("n", "<leader>ul", "<cmd>UELaunch<cr>", vim.tbl_extend("force", opts, { desc = "UE: Launch app (no debugger)" }))
@@ -268,6 +319,23 @@ map({ "n", "x" }, "<leader>sY", live_grep_word_with({
 }), { desc = "Search: Live grep word/selection (cwd)" })
 map("n", "<leader>sr", open_word_substitute, { desc = "Search: Replace current word in buffer" })
 map("x", "<leader>sr", open_visual_substitute, { desc = "Search: Replace selection in range" })
+map("n", "<leader>sf", function()
+  require("utils.document_find").open()
+end, { desc = "Search: Find in current document (unsaved text)" })
+map({ "n", "x" }, "<leader>sF", find_document_text, { desc = "Search: Find current word / selection in document" })
+
+map("n", "<leader>fl", function()
+  require("utils.document_location").open()
+end, { desc = "File: Go to line / UTF-8 byte column" })
+map("n", "<leader>fy", function()
+  require("utils.document_location").copy("relative")
+end, { desc = "File: Copy path relative to window cwd" })
+map("n", "<leader>fA", function()
+  require("utils.document_location").copy("absolute")
+end, { desc = "File: Copy absolute path" })
+map("n", "<leader>fY", function()
+  require("utils.document_location").copy("position")
+end, { desc = "File: Copy path:line:UTF-8 byte column" })
 map("n", "<leader>ss", open_symbol_picker(), { desc = "Search: Symbols" })
 map("n", "<leader>sS", open_symbol_picker({ workspace = true }), { desc = "Search: Workspace Symbols" })
 map("n", "<leader>bc", close_current_target, { desc = "Buffer/Window: Smart close current target" })
@@ -291,6 +359,13 @@ map("n", "<leader>vq", sidebar_toggle("qflist"), { desc = "Sidebar: Pinned resul
 map("n", "<leader>vl", sidebar_toggle("loclist"), { desc = "Sidebar: Location list" })
 map("n", "<leader>vt", sidebar_toggle("todo"), { desc = "Sidebar: TODO / FIXME" })
 map("n", "<leader>?", "<cmd>UECheatsheet<cr>", { desc = "UE: Cheatsheet" })
+
+map({ "n", "i", "x" }, "<A-j>", function()
+  return require("utils.line_move").keys(1)
+end, { expr = true, silent = true, desc = "Move Down" })
+map({ "n", "i", "x" }, "<A-k>", function()
+  return require("utils.line_move").keys(-1)
+end, { expr = true, silent = true, desc = "Move Up" })
 
 -- Restart Neovim in the current cwd. Detects Neovide / WezTerm / native
 -- terminal and spawns a fresh nvim there before tearing down this one.
@@ -319,6 +394,7 @@ vim.api.nvim_create_user_command("RestartDetect", function()
 end, { desc = "Print restart plan without acting (debug)" })
 
 map("n", "<leader>qr", "<cmd>Restart<cr>", { desc = "Quit: Restart Neovim in cwd" })
+map("n", "<leader>qq", "<cmd>UEQuit<cr>", { desc = "退出（查看未保存文件）" })
 
 -- Windows-style paste in cmdline (`:` / `/` / `?`) and insert mode.
 -- Default Ctrl+V in cmdline is "literal-insert next key" (rarely useful);
@@ -349,7 +425,10 @@ map("n", "<leader>dx", "<cmd>UEResetLayout<cr>", { desc = "Reset Layout (DAP or 
 -- and regular code buffers alike. Without this, pressing F5 inside the REPL
 -- inserts a literal "<F5>" instead of stepping.
 local dap_fkeys = {
-  ["<F5>"]   = { cmd = "UEDAPContinue",        desc = "DAP: Continue" },
+  -- F5: continue inside a debug session; with no session it runs the active
+  -- target's loop (Android: build SO → deploy → debug-launch). S-F5 stops.
+  ["<F5>"]   = { cmd = "lua require('utils.ue_hub').run_or_debug()", desc = "Run/debug target, or DAP continue" },
+  ["<S-F5>"] = { cmd = "UEDAPStop",            desc = "DAP: Stop session" },
   ["<F6>"]   = { cmd = "UEDAPPause",           desc = "DAP: Pause" },
   ["<F9>"]   = { cmd = "UEDAPToggleBreakpoint",desc = "DAP: Toggle Breakpoint" },
   ["<F10>"]  = { cmd = "UEDAPStepOver",        desc = "DAP: Step Over" },

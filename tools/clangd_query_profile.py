@@ -17,7 +17,7 @@ import threading
 import time
 
 
-PARSER_ID = 'windows-llvm-22.1.5-query-driver-v4'
+PARSER_ID = 'windows-llvm-22.1.5-query-driver-v5'
 LLVM_COMMIT = '5ea218a153f4d2f815b8244eab3e4b4ba5e00e6c'
 ANDROID_NDK_9_VERSION = (
     'Android (7019983 based on r365631c3) clang version 9.0.9 '
@@ -29,9 +29,30 @@ COMPILER_ENV = ('CPATH', 'CPLUS_INCLUDE_PATH', 'C_INCLUDE_PATH', 'OBJC_INCLUDE_P
     'OBJCPLUS_INCLUDE_PATH', 'INCLUDE', 'SDKROOT', 'MACOSX_DEPLOYMENT_TARGET',
     'IPHONEOS_DEPLOYMENT_TARGET', 'TVOS_DEPLOYMENT_TARGET', 'WATCHOS_DEPLOYMENT_TARGET',
     'XROS_DEPLOYMENT_TARGET', 'DEVELOPER_DIR', 'TOOLCHAINS', 'GCC_EXEC_PREFIX',
-    'COMPILER_PATH', 'PATH', 'PATHEXT', 'WindowsSdkDir', 'WindowsSDKVersion',
+    'COMPILER_PATH', 'WindowsSdkDir', 'WindowsSDKVersion',
     'VCToolsInstallDir', 'VCINSTALLDIR', 'CL', '_CL_', 'CCC_OVERRIDE_OPTIONS',
     'SOURCE_DATE_EPOCH', 'TZ')
+LOOKUP_ENV = ('PATH', 'PATHEXT')
+
+
+def lookup_environment(environment=None):
+    """Lookup context is observed separately, never a semantic certificate."""
+    env = os.environ if environment is None else environment
+    folded = {key.upper(): value for key, value in env.items()} if os.name == 'nt' else env
+    return {name: folded.get(name) for name in LOOKUP_ENV}
+
+
+def semantic_identity(evidence):
+    """Only actual extraction results grant equivalence after rediscovery.
+
+    Search roots and candidates remain watch inputs. Their spelling/order may
+    change without changing which native driver clangd actually executed.
+    """
+    keys = ('schema', 'parser_id', 'helper_sha256', 'entry', 'entry_sha256', 'source_sha256',
+            'profile', 'compiler_environment', 'environment_sha256', 'implicit_search_roots',
+            'driver_profile', 'tuple', 'clangd', 'driver', 'raw_includes', 'ordered_includes',
+            'target', 'builtin_path', 'observed_includes', 'observed_target', 'query', 'builtin_query')
+    return {key: evidence.get(key) for key in keys}
 
 
 def _json(value):
@@ -397,6 +418,7 @@ def observe(entry, clangd_path, query_driver, output_dir, timeout=10, *, launch_
             'entry': native, 'entry_sha256': _sha(_json(native).encode()), 'source_sha256': source_hash,
             'profile': {'enable_config': False, 'query_driver': query_driver, 'launch_cwd': cwd.as_posix()},
             'compiler_environment': semantic_env, 'environment_sha256': _sha(_json(semantic_env).encode()),
+            'lookup_environment': lookup_environment(env),
             'driver_search_roots': search_roots, 'driver_candidates': candidates,
             'implicit_search_roots': implicit_roots,
             'tuple': tuple_, 'clangd': {'path': str(tool), 'sha256': tool_hash, 'version': version_text},
@@ -418,12 +440,7 @@ def validate(evidence, entry, clangd_path, query_driver, output_dir, timeout=10,
                      launch_cwd=launch_cwd, environment=environment)
     if not result['ok']:
         return result
-    keys = ('schema', 'parser_id', 'helper_sha256', 'entry', 'entry_sha256', 'source_sha256',
-            'profile', 'compiler_environment', 'environment_sha256', 'driver_search_roots', 'driver_candidates',
-            'implicit_search_roots', 'driver_profile',
-            'tuple', 'clangd', 'driver', 'raw_includes', 'ordered_includes', 'target',
-            'builtin_path', 'observed_includes', 'observed_target', 'query', 'builtin_query')
-    if any(evidence.get(key) != result['evidence'][key] for key in keys):
+    if semantic_identity(evidence) != semantic_identity(result['evidence']):
         return {'ok': False, 'reason': 'query-profile-changed', 'evidence': result['evidence']}
     return result
 

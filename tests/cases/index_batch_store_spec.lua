@@ -139,8 +139,9 @@ with tempfile.TemporaryDirectory(prefix='batch_store_') as temporary:
         assert snapshot(protected) == before, 'reuse rewrote receipt, frozen assets, or UBT wrappers'
         # The omitted option still uses the existing default; an absent external store defers too.
         for absent in (None, root / 'not-qualified'):
-            assert generate(name, absent, True)[2] == originals
-            assert last_metrics[-1]['accepted_ubt_count'] == 0 and last_metrics[-1]['deferred_group_count'] > 0
+            missing_output, missing_marker, missing_entries = generate(name, absent, True)
+            assert missing_entries == originals
+            assert json.loads(missing_marker.read_text())['verified_batches']['accepted_ubt_count'] == 0
     # A real dependency edit invalidates the stored proof; no compiler or replay is permitted.
     changed = source / 'Member0.cpp'
     changed.write_text(changed.read_text() + '// newer source revision\n')

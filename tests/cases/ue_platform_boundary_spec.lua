@@ -69,6 +69,37 @@ local function has_rule(violations, rule)
   return false
 end
 
+t.describe("ue platform boundary: qualified native host probes", function()
+  t.it("host driver Linux probes are distinguished from target policy", function()
+    for _, code in ipairs({
+      'if ffi.os ~= "Linux" then return false end',
+      'if "Linux" == jit.os then return true end',
+    }) do
+      local violations = boundary.analyze_source(code, "lua/utils/platform/linux.lua")
+      t.assert_false(has_rule(violations, boundary.RULES.target_literal_condition))
+      t.assert_false(has_rule(violations, boundary.RULES.direct_os_probe))
+    end
+  end)
+  t.it("generic FFI OS probes remain forbidden even without a target literal", function()
+    for _, code in ipairs({
+      'if ffi.os ~= "Linux" then return false end',
+      'if ffi.os == "Windows" then return true end',
+    }) do
+      local violations = boundary.analyze_source(code, "lua/utils/file_mutations.lua")
+      t.assert_true(has_rule(violations, boundary.RULES.direct_os_probe))
+    end
+  end)
+  t.it("host drivers still cannot select concrete UE target policy", function()
+    for _, code in ipairs({
+      'if target == "Linux" then return true end',
+      'if ffi.os == "Android" then return true end',
+    }) do
+      local violations = boundary.analyze_source(code, "lua/utils/platform/linux.lua")
+      t.assert_true(has_rule(violations, boundary.RULES.target_literal_condition))
+    end
+  end)
+end)
+
 t.describe("ue platform boundary: per-rule fixtures", function()
   for _, case in ipairs(CASES) do
     t.it(case.name, function()

@@ -232,6 +232,8 @@ local function compatibility()
 end
 
 function M.definition()
+  local reading = package.loaded["utils.ue_goto.reading"]
+  if reading then reading.cancel() end
   local bufnr = vim.api.nvim_get_current_buf()
   local sym = symbol_mod.current_symbol()
   local path = location_mod.normalize_path(vim.api.nvim_buf_get_name(bufnr))
@@ -284,6 +286,18 @@ end
 
 function M.references()
   return compatibility().references()
+end
+
+function M.rename(new_name)
+  return require("utils.refactor").rename(new_name)
+end
+
+function M.code_actions(opts)
+  return require("utils.refactor").code_actions(opts)
+end
+
+function M.setup_refactor_commands()
+  return require("utils.refactor").setup_commands()
 end
 
 return M

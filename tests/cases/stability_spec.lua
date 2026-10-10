@@ -106,7 +106,7 @@ end)
 -- 超限文件暂时保留精确白名单。ratchet 只能随迁移下调，不能提高。
 t4.describe("stability: ue.lua 单调下降 ratchet 与新增文件 800 行上限", function()
   local cfg_root = vim.fn.stdpath("config")
-  local UE_LUA_LIMIT = 10562
+  local UE_LUA_LIMIT = 9860
   local GRANDFATHERED = {
     ["lua/ue.lua"] = UE_LUA_LIMIT,
     ["lua/ue/dap.lua"] = true,

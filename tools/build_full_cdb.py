@@ -214,6 +214,8 @@ def main():
                     help='prove secondary same-context batches with private clangd indexes')
     ap.add_argument('--reuse-verified-only', action='store_true',
                     help='reuse valid receipts without starting cold compiler proofs')
+    ap.add_argument('--batch-proof-limit', type=int, default=None,
+                    help='maximum candidate groups to prove; remaining groups retain original commands')
     ap.add_argument('--verified-batch-store', default=None,
                     help='absolute existing proof-store location for reuse only; caller retains its assets')
     ap.add_argument('--clangd', default=None, help='existing clangd used for batch proof')
@@ -226,6 +228,13 @@ def main():
     ap.add_argument('--jobs', '-j', type=int, default=0,
                     help='clangd-indexer concurrency (default: clamp(8, cpu, 24))')
     args = ap.parse_args()
+    if args.batch_proof_limit is not None:
+        if args.batch_proof_limit < 0:
+            ap.error('--batch-proof-limit must be nonnegative')
+        if not args.verified_batches:
+            ap.error('--batch-proof-limit requires --verified-batches')
+        if args.reuse_verified_only or args.verified_batch_store is not None:
+            ap.error('--batch-proof-limit cannot be combined with --reuse-verified-only or --verified-batch-store')
     if args.verified_batch_store is not None:
         if not args.verified_batches or not args.reuse_verified_only:
             ap.error('--verified-batch-store requires --verified-batches and --reuse-verified-only')
@@ -368,11 +377,17 @@ def main():
         batch_metrics = None
         if args.verified_batches:
             from cdb_verified_batch import accelerate
-            background_entries, batch_metrics = accelerate(
-                super_entries, args.verified_batch_store or os.path.join(os.path.dirname(stable_super_dir), 'verified_batches'),
-                args.clangd, max_group=args.batch_size, verify_missing=not args.reuse_verified_only,
-                server_profile=args.server_profile, max_sources=args.max_mods)
-        outputs = [(background_out, json.dumps(background_entries)),
+            store = args.verified_batch_store or os.path.join(os.path.dirname(stable_super_dir), 'verified_batches')
+            if args.reuse_verified_only and args.verified_batch_store is None:
+                from cdb_background_batch import reuse_completed
+                background_entries, batch_metrics = reuse_completed(super_entries, store, args.clangd, args.server_profile)
+            else:
+                background_entries, batch_metrics = accelerate(
+                    super_entries, store, args.clangd, max_group=args.batch_size, verify_missing=not args.reuse_verified_only,
+                    server_profile=args.server_profile, max_sources=args.max_mods,
+                    max_new_groups=args.batch_proof_limit)
+        from cdb_background_batch import encode_preserving
+        outputs = [(background_out, encode_preserving(background_out, background_entries)),
                    (background_out + '.semantic.json', json.dumps(super_entries))]
         if args.idx_output:
             marker = {
@@ -393,7 +408,7 @@ def main():
                 marker['verified_batches'] = {key: batch_metrics[key] for key in (
                     'original_ubt_count', 'batch_count', 'accepted_ubt_count', 'retained_ubt_count',
                     'exact_count', 'shader_count', 'other_count', 'output_entries') if key in batch_metrics}
-            outputs.append((os.path.abspath(args.idx_output), json.dumps(marker)))
+            outputs.append((os.path.abspath(args.idx_output), encode_preserving(os.path.abspath(args.idx_output), marker)))
         write_outputs_if_changed(outputs)
         routed = sum(entry.get('nvim_ue_background_route') == 'shader-compatibility' for entry in background_entries)
         print(f'  background (clangd): {background_out}    {len(background_entries) - routed} native tasks; '

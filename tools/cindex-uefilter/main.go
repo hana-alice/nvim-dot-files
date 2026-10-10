@@ -25,12 +25,15 @@ import (
 	"github.com/google/codesearch/index"
 )
 
-var usageMessage = `usage: cindex-uefilter [-list] [-reset] [-files-from FILE] [path...]
+var usageMessage = `usage: cindex-uefilter [-list] [-reset] [-files-from FILE] [-delete-from FILE] [path...]
 
 Like cindex, but with -files-from FILE: read absolute file paths
 (one per line) from FILE — or from stdin if FILE is "-" — and index
 exactly those files. Skips the walk entirely. Other cindex flags work
 identically.
+
+Without -reset, -delete-from FILE removes the listed paths (files that no
+longer exist) in the same merge, so deletions do not need a full rebuild.
 `
 
 const windowsIncrementalWorkerEnv = "CINDEX_UEFILTER_WINDOWS_INCREMENTAL_WORKER"
@@ -41,11 +44,12 @@ func usage() {
 }
 
 var (
-	listFlag      = flag.Bool("list", false, "list indexed paths and exit")
-	resetFlag     = flag.Bool("reset", false, "discard existing index")
-	verboseFlag   = flag.Bool("verbose", false, "print extra information")
-	cpuProfile    = flag.String("cpuprofile", "", "write cpu profile to this file")
-	filesFromFlag = flag.String("files-from", "", "read paths from FILE (or stdin if -)")
+	listFlag       = flag.Bool("list", false, "list indexed paths and exit")
+	resetFlag      = flag.Bool("reset", false, "discard existing index")
+	verboseFlag    = flag.Bool("verbose", false, "print extra information")
+	cpuProfile     = flag.String("cpuprofile", "", "write cpu profile to this file")
+	filesFromFlag  = flag.String("files-from", "", "read paths from FILE (or stdin if -)")
+	deleteFromFlag = flag.String("delete-from", "", "incremental only: remove the paths listed in FILE from the index")
 )
 
 func uniqueSortedStrings(values []string) []string {
@@ -108,6 +112,28 @@ func readFilesFromList(name string) ([]string, int, error) {
 		return nil, skipped, fmt.Errorf("read %s: %w", name, err)
 	}
 	return uniqueSortedStrings(files), skipped, nil
+}
+
+// readPathList reads one absolute path per line without requiring the paths to
+// exist: -delete-from lists files that are already gone.
+func readPathList(name string) ([]string, error) {
+	file, err := os.Open(name)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", name, err)
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	var paths []string
+	for scanner.Scan() {
+		if path := strings.TrimSpace(scanner.Text()); path != "" {
+			paths = append(paths, path)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("read %s: %w", name, err)
+	}
+	return uniqueSortedStrings(paths), nil
 }
 
 func filesFromIndexPaths(args, files []string, reset bool) []string {
@@ -229,7 +255,32 @@ func main() {
 			log.Fatal(err)
 		}
 
-		ix.AddPaths(filesFromIndexPaths(args, files, *resetFlag))
+		if *resetFlag {
+			if *deleteFromFlag != "" {
+				log.Fatal("-delete-from is meaningless with -reset")
+			}
+			ix.AddPaths(filesFromIndexPaths(args, files, true))
+		} else {
+			var deletes []string
+			if *deleteFromFlag != "" {
+				deletes, err = readPathList(*deleteFromFlag)
+				if err != nil {
+					log.Fatal(err)
+				}
+			}
+			roots, toIndex, rootErr := incrementalRoots(master, files, deletes)
+			if rootErr != nil {
+				log.Fatal(rootErr)
+			}
+			if extra := len(toIndex) - len(files); extra > 0 {
+				log.Printf("re-staging %d prefix-shadowed files", extra)
+			}
+			if len(deletes) > 0 {
+				log.Printf("removing %d deleted files", len(deletes))
+			}
+			ix.AddPaths(roots)
+			files = toIndex
+		}
 
 		log.Printf("indexing from %s", *filesFromFlag)
 		count := 0

@@ -70,255 +70,246 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 - `v1.12.11` → [docs/release_1.12.11.md](release_1.12.11.md) (retain document-blocked original readers; tag pending)
 
 - `v2.0.0` → [docs/release_2.0.0.md](release_2.0.0.md) (CodeDiff default review; Diffview retained; tag pending)
+- `v2.1.0` → [docs/release_2.1.0.md](release_2.1.0.md) (daily editing and maintenance diagnostics; tag pending)
+
+- `v2.2.0` → [docs/release_2.2.0.md](release_2.2.0.md) (IDE experience; local validation complete; tag pending)
+
+- `v2.3.0` → [docs/release_2.3.0.md](release_2.3.0.md) (search, reading and window recovery; tag pending)
+
+- `v2.3.1` → [docs/release_2.3.1.md](release_2.3.1.md) (daily file protection and discovery; tag pending)
+
+- `v2.3.2` → [docs/release_2.3.2.md](release_2.3.2.md) (navigation and editing entry fixes; tag pending)
+
+- `v2.4.0` → [docs/release_2.4.0.md](release_2.4.0.md) (memory document find and editor reuse; tag pending)
+
+- `v2.5.0` → [docs/release_2.5.0.md](release_2.5.0.md) (document locations and copy actions; tag pending)
+
+- `v2.6.0` → [docs/release_2.6.0.md](release_2.6.0.md) (development workbench and run-owned evidence; tag pending)
+
+- `v2.7.0` → [docs/release_2.7.0.md](release_2.7.0.md) (named investigations and interruption continuity; tag pending)
 
 ## Unreleased
 
-### 2026-09-30 — 最近项目列表并发写入在 Windows 上丢记录
+已将具名调查切片归档至 [2.7.0](release_2.7.0.md)。
+
+### 2026-10-10 — prepare 主循环热点移入 worker；发布 generation 修复；快速路径有序屏障与只读工具身份复核
 
 **Task**
-- `5db84e9` 后 Ubuntu/macOS 全绿，Windows 仅剩 `multi_instance_state`「recent-project MRU keeps concurrent distinct roots」（8 个并发实例丢 1 条）。
+- 定位并移除 prepare 期间约 4.3 s 父端同步 CPU；修复后台发布反复 `publication generation changed`；修复快速路径“固定等 100 ms”的正确性缺陷，并让默认安装（Program Files 只读工具链）下的快速路径继续可用。
 
 **Implemented**
-- `lua/utils/recent_projects.lua`：拿到锁后若读取/原子 rename 失败（Windows 上别的实例正打开该文件读取时 rename 会失败），改为走与抢锁失败相同的异步重试，而不是静默丢弃这次写入；重试上限 20 → 60（约 1.5 s）。这是生产代码的真实缺陷：多个 Neovim 同时启动时最近项目可能丢失。
-
-**Validation**
-- `multi_instance_state` 本机连续 5 次 27/27。
-
-### 2026-09-30 — CI 引导只装了一半插件（git_review_runtime 三平台失败的根因）
-
-**Root cause（CI 日志 + 本机全新数据目录复现）**
-- `scripts/bootstrap_headless_ci.lua` 在 LazyVim 克隆前就解析 `import = "lazyvim.plugins"`，日志报 `No specs found for module "lazyvim.plugins"`，只安装了项目自身的 27 个插件（lockfile 共 44 个）。真实启动随后看到完整依赖图，报 `Plugin flash.nvim / nvim-ts-autotag … is not installed`（ERROR），`git_review_runtime` 因此失败。本机全新目录复现同样只得到 28 个目录（含 lazy.nvim）。
-
-**Implemented**
-- 引导脚本在首次解析后重新加载 spec，把缺失插件按冻结 lockfile 装齐（最多 5 轮）；原有「每个插件必须在锁定提交」断言现在覆盖完整依赖图，CI 自身即为验证。
-- `tests/cases/ue_cdb_shader_receipt_spec.lua`：后续按条目查找改用产物中的路径拼写（Windows CI 8.3 短名）。
-
-**Validation**
-- `review_ci` 3/3、`ue_cdb_shader_receipt` 3/3 本机通过；引导修复待本轮 CI 验证。
-
-### 2026-09-30 — git_review_runtime 的 Diffview 关闭竞态；macOS FSEvents 假设实验
-
-**Task**
-- `ae75b2f` 后 `git_review_runtime` 不再空转（证实上条根因），但 Linux/macOS 暴露下一处失败。
-
-**Implemented**
-- `tests/cases/git_review_runtime_spec.lua`：可视模式 Diffview 文件历史等到 `panel.cur_item` 已选中、主窗口已打开文件再按 `gV` 关闭。CI 证据：只等 `#entries > 0` 就关闭，锁定版本 Diffview 的 `update_entries` 回调在关闭后执行 `cur_file()`，`file_history_panel.lua:380 attempt to index field 'cur_item' (a nil value)`。属测试时序，Diffview 版本与生产映射未改。
-- `tests/cases/index_batch_runtime_spec.lua`（仅 macOS）：在安装监听前等 1 s，检验「FSEvents 延迟投递监听开始前刚写入的 `compile_commands.json`（报为 `rename`）」这一**假设**。若 CI 仍失败则假设不成立，需另查。
-
-**Validation**
-- 本机 `git_review_runtime` 连续 2 次 1/1；`index_batch_runtime` 80/80。
-
-**Follow-ups**
-- CI 子进程的 `Plugin <name> is not installed` 为 WARN 级（lazy 对未进 lockfile 安装范围的插件的提示），不再造成空转；是否影响用例待本轮结果。
-
-### 2026-09-30 — 定位并修复 git_review_runtime 在 CI 上的 CPU 空转
-
-**Task**
-- 三平台 CI 上 `git_review_runtime` 子进程在「等 Gitsigns 挂载」处卡死直至外层 60 s 超时。
-
-**Root cause（CI 证据 + 本机独立复现）**
-- `f60ce15` 的计数钩子调用栈：`runtime.lua:40 notify` ← `lazyvim/util/init.lua:165`（`lazy_notify` 的 replay 循环）← 测试的 `vim.wait`。
-- LazyVim 启动时把 `vim.notify` 换成把消息追加到 `notifs` 队列的临时函数；测试随后捕获的正是这个临时函数，并让自己的包装函数转发给它。replay 时 `vim.notify` 已不等于临时函数，所以保留测试的包装函数，并对**正在遍历的** `notifs` 逐条调用 `vim.notify` → 包装函数转发回临时函数 → 又追加一条，`ipairs` 永远到不了末尾。只要启动期有一条排队通知（CI 上有 `vim.lsp.set_log_level() is deprecated` 警告），子进程就 100% CPU 空转；git 子进程也因此得不到回收（`ps` 中为僵尸）。
-- 独立复现脚本按同样形状运行：500 ms 内调用 1001 次、队列长到 1001 条，确认不收敛。
-
-**Implemented**
-- `tests/cases/git_review_runtime_spec.lua`：测试的 `vim.notify` 替换不再转发给捕获的函数，只记录 ERROR 并写 stderr。仅为测试侧缺陷，生产代码未改。
-
-**Validation**
-- 本机 `git_review_runtime` 1/1。
-
-### 2026-09-30 — Windows CI：导入期 UTF-8 输出、fixture 文本编码与 8.3 短路径
-
-**Task**
-- `9f08099` 的 Windows CI 仍有 10 项失败；逐项读日志处置。
-
-**Implemented**
-- 17 个 `tools/*.py` 的 UTF-8 stdout/stderr 重设从 `__main__` 挪到导入期。根因：`index_output_stability` 的驱动脚本 `import` 工具后直接调 `main()`，不经过 `__main__`，6 项仍报 `UnicodeEncodeError`（`←`）。
-- `tests/cases/index_inventory_spec.lua`：fixture 的 `write_text` 显式 `encoding='utf-8'`（写入 `İ` 等目录名时按 cp1252 编码失败）。
-- `tests/cases/ue_cdb_shader_receipt_spec.lua`：shader 路径按 realpath 比较（CI 临时目录期望值是 8.3 短名 `RUNNER~1`，产物是长名 `runneradmin`，同一文件）。
-
-**Validation**
-- 本机模拟 CI 编码（`PYTHONIOENCODING=cp1252`）并行全量 required-native：125/125 文件通过（127.1 s）。
-
-**Follow-ups（根因未定）**
-- `git_review_runtime`：Linux/macOS 子进程 CPU 空转（`ps` 为 `R`，git 子进程成僵尸未回收）；Windows 在 4 次运行中有 3 次报 `Plugin mini.ai/... is not installed`（VeryLazy 触发时 lazy 认为插件未安装），另 1 次未出现。两者是否同源待查。
-- Windows `ordered Unity` 真实 clangd 索引在 4 次中失败 1 次（`indexing_complete` 为假、编译失败数 0），疑似偶发，待观察。
-- macOS `index_batch_runtime` FSEvents 延迟 rename 事件（见前条）。
-
-### 2026-09-30 — 按 CI 诊断修复 core_health 清理与 macOS 路径别名
-
-**Task**
-- `6656be3` 的诊断输出定位了两类 Linux/macOS 失败。
-
-**Implemented**
-- `lua/utils/core_health.lua`：临时审计目录递归删除失败时有界重试 5×100 ms（刚取消的子进程可能仍在写入），仍失败则保持 FAIL 并在 `next_step` 列出残留文件名。CI 证据：两次审计唯一差异是 `cleanup.temp=FAIL (temporary audit resources could not be removed)`，Ubuntu 与 macOS 都出现。
-- `tests/fixtures/cpp_semantic_pipeline/run.lua`：目标 buffer 按 realpath 比较。CI 证据：macOS 上实际为 `/private/var/.../defs.hpp`，期望为 `/var/.../defs.hpp`（`/var` 是 `/private/var` 的符号链接）。
-- `tests/cases/git_review_runtime_spec.lua`：加 15 s 周期 watchdog 输出编辑器 mode/blocking，用于区分挂起的输入提示与阻塞的事件循环。
-
-**Validation**
-- `core_health` 连续 2 次 28/28；`cpp_semantic_pipeline` 1/1；`git_review_runtime` 1/1（本机 Windows）。
-
-**Follow-ups**
-- `git_review_runtime`：Linux/macOS 在「等 Gitsigns 挂载」处被外层 60 s 超时杀掉（exit 124），12 s 的 `vim.wait` 未能返回，说明事件循环被同步阻塞；根因待 watchdog 输出确认。
-- macOS `index_batch_runtime`「首次缓存写入」：FSEvents 报告 `compile_commands.json` rename 导致撤销激活；推测为 fixture 在监听启动前刚写入该文件、FSEvents 延迟投递的历史事件，**待验证**，未改代码。
-
-### 2026-09-30 — 修复 PR #13 三平台 CI 暴露的 Windows 编码/前置与测试时序问题
-
-**Task**
-- `779c2b2` 的 CI：Windows 32 失败、macOS 5、Ubuntu 2。按根因分组处置。
-
-**Implemented**
-- 17 个会打印非 ASCII（`←`/`→`/中文）的 `tools/*.py` 在 `__main__` 入口把 stdout/stderr 重设为 UTF-8（`errors="backslashreplace"`）。根因：CI runner ANSI 代码页 cp1252，`print('← exit')` 抛 `UnicodeEncodeError`，连带 23 个 index/CDB 用例失败；本机 cp65001 不复现。
-- `.github/workflows/headless.yml`：Windows 通过 choco 安装既有 `fd` 前置（4 个 required-native 用例报 `fd unavailable`）。
-- `tests/cases/ue_unity_origin_spec.lua`：Python 端以 UTF-8 解码 stdin（原按 cp1252 解码中文路径，哈希不一致）。
-- `tests/cases/index_inventory_spec.lua`：临时目录与 checkout 不在同一盘符时改为在父目录内用相对名验证（`relpath` 不能跨盘）。
-- `tests/cases/multi_instance_state_spec.lua`：MRU 并发子进程等到自己的记录可见再退出（原固定 300 ms，在慢宿主上 `record()` 的异步锁重试尚未完成进程已退出）。
-- 诊断增强（根因未定，不改断言）：`core_health` 两次审计不一致时列出非 PASS 项；CLI 失败打印 stdout；`git_review_runtime` 的 Gitsigns 等待超时打印 buffer/gitsigns 状态/`:messages`；`cpp_semantic_pipeline` 打印实际与期望目标路径。
+- `ue.lua` 的 `project_index_dirs` 目录遍历（采样实测 5.68 s）移入新 `ue/cdb/prepare_scan_roots.lua` worker：同步调用 5680 → 0.03 ms（缓存），worker 3.79 s 但父端 CPU 仅 +78 ms；seed prepare 主循环最大卡顿 5871 → 463 ms。
+- `batch_publish_worker` 显式同步计算 generation，不再在 worker 中走编辑器异步摘要路径拿到 pending 空值；真不一致仍报错。真实队列 319 s 完成 2 组、接受 1 组、发布 1 批。
+- 新 `utils/platform/input_watch_barrier.lua` + `watch_barrier_marker.lua`：可写监听根写隐藏 marker，等待 write/metadata 两路事件都回到才判断复用；超时、错误、marker 删不掉一律走完整路径。修复 libuv 缓存时钟导致定时器提前到期。
+- 只读工具根（原生 CreateFileW access-denied/write-protect 分类）不写 marker，改为复核实际使用的工具身份（路径、类型、大小、mtime、ctime、inode、dev、realpath），libuv 异步、最多 8 并发；只绑定 argv 编译器、clangd/clang/libclang、resource include、gcc-toolchain/sysroot 子树，不遍历整个安装树。argv 编译器的隐式资源目录（`lib/clang`、`lib64/clang`）一并绑定；非标准布局在 inventory 子进程中调用 `-print-resource-dir`（3 s 超时），推导不出则关闭复用。
 
 **Pitfalls / Gotchas**
-- 本机 Windows 为 UTF-8 代码页，CI 为 cp1252——Python 工具的 print 编码问题只在 CI 暴露。
+- 只看子代理报告就推进出过两次漏洞：W 的十连跑用了可写工具链副本，默认安装下 10 条失败；Y 只跑窄 filter，漏掉其缩窄身份集合导致隐式 builtin 头未绑定（3 条红灯）。验收必须在默认安装下由 Claude 自跑 `ue_cdb` 与全量。
+- X 的整树身份复核使命中耗时贴着 1 s 断言（982/985 ms），负载下飘忽失败；不是正确性问题，按提速修复而非放宽断言（断言最终收紧到 300 ms）。
+- 新增的 `-print-resource-dir` spawn 需要在 `host_resource_discipline` spawn 审计中登记（subprocess-only）。
 
 **Validation**
-- 并行全量 required-native：125/125 文件通过（135.4 s）；`multi_instance_state` 连续 3 次 27/27。
+- 默认安装（Clang 22.1.5，未覆盖工具链）`ue_cdb` 由 Claude 连跑 3 次均 165/165；子代理侧 15 次命中 103–156 ms（屏障 6–17 ms），只读复核 325 项身份。
+- 全量回归（spawn 审计登记后复跑）3426/3426，0 失败、0 跳过；首轮 3425/3426 唯一失败为 `-print-resource-dir` spawn 未登记，登记后 `host_resource_discipline` 13/13。
 
-**Follow-ups**
-- 仍未定位：三平台 `git_review_runtime` Gitsigns 未挂载（此前 CI 已存在）；Linux/macOS `core_health` 审计不稳定；macOS `cpp_semantic_pipeline` 目标 buffer、`index_batch_runtime` 首次缓存写入被 FSEvents 报为 `compile_commands.json` rename 而撤销激活（此前 CI 已存在）。待本次诊断输出后处置。
+**Follow-ups（未达标）**
+- 只读工具复核仍是资源 include 整子树（约 301 文件），不是精确依赖闭包；真实大 CDB 冷收集开销未测。
+- 只读工具根有任何事件即撤销复用，无关文件变化也会走完整路径。
+- 多 Neovim 实例的 marker 会互相触发一次完整路径；写句柄未关时的判断不在已证明范围。
+- 真实 Android/Test 工程上未重新测量无变化 prepare 耗时与整工程索引性能；SuperUnity 后台证明吞吐（约 6 h 铺满 304 候选）未改善。
 
-### 2026-09-30 — SDD 轻量化：spec 只规定大方向并记录选型与踩坑
+### 2026-10-09 — 大型 CDB 摘要与语义发布移出主循环；旧证明回执安全迁移
 
 **Task**
-- 用户判定 SDD 过重、阻碍开发：41 份主 spec 近万行、逐字段/逐超时契约与实现同频漂移。要求整理为只规定大方向、记录选型踩坑等重要事项。
+- 消除启动/发布时主循环的同步大文件计算；让旧格式的 SuperUnity 证明回执在可重新证明时复用，并验收后台证明真实耗时。
 
 **Implemented**
-- `openspec/specs/*/spec.md` 全部 41 份重写为统一结构：Purpose（边界与方向）+ 2–6 条方向性 Requirement（保留安全/隐私、SuperUnity 不静默退化、DAP 五层分层等底线）+「## 选型与踩坑」段。
-- 政策降级：根 `AGENTS.md` SESSION START 第 4 步与 DoD 第 2/3 条、`docs/CONSTRAINTS.md` C7/C8/C9、`docs/testing-regression.md`、`memory/project_overview.md`、各目录 `AGENTS.md` 的「治理 spec」措辞——日常修复不需改 spec、不强制立 change，changelog 不再逐条声明 spec 一致性处置。
-- `openspec/config.yaml` 增加轻量化说明；未实现的 `2026-09-28-restructure-super-unity-compression` 以 `--skip-specs` 归档（0/22 任务，已标注未实现），其调查结论与已选方向浓缩进 `cpp-semantic-index-coverage` 的「选型与踩坑」。
+- `index/_generation_digest` + 新 `generation_digest_worker`：超过 1 MiB 的冷 CDB 摘要在独立 nvim worker 读取/解码/规范化/hash，父端只收小结果；缓存绑定 size/mtime/ctime/dev/ino，计算期间输入被替换即作废重算，连续变化 3 次明确失败。generation 区分 pending 与 failed，pending 不报 ready、不透传旧 generation。
+- 新 `_publication_async` + `publication_worker`：普通 phase manifest 与语义发布的读写/hash/合并在 worker 执行，主循环持有 job 与 writer lease 至回调完成；worker 失败显式报错，不同步回退。
+- 新 `tools/clangd_receipt_migration.py`：旧回执仅当 collector/helper 源码身份、编译器真实路径/版本/字节/query 输出、输入/依赖/快照/图 SHA 均能重新证明一致时才升级复用，否则保持失效。
 
 **Pitfalls / Gotchas**
-- 瘦身只浓缩不编造；完整旧条款仍可在 git 历史与 `openspec/changes/archive/` 查到。
-- SuperUnity 方向（Tier 1 发射序列分组）**尚未实现、无实测收益**，不得引用为已交付。
-
-- 新增 `tests/run_parallel.lua`：每个 spec 文件独立 `nvim --headless -l tests/run.lua <file>` 子进程（run.lua 已隔离 state/log/probe），默认 min(8, CPU/2) 并发，实时逐文件进度，按上次耗时优先调度慢文件。串行 `tests/run.lua` 仍是 CI/提交门禁入口。
-- `tests/cases/index_batch_runtime_spec.lua`：盘符根监听用例等待由 3 s 改为 12 s（与同文件 `await_watch_probe` 及生产 10 s 探测预算一致）；同文件其余 7 处等待真实 fs 事件到达的正向 `vim.wait(1000)` 统一放宽到 5 s（并行负载下父目录 rename 失效用例曾超时）。均为「等到条件成立即返回」的正向等待，未改生产时限或断言语义。
+- Windows dev/ino 经 JSON 传输需转字符串，否则丢精度。
+- 覆盖统计必须用生产者的 portable member 函数；按 cwd/engine 拼路径或大小写折叠都会给出错误覆盖数（已作废留底）。
 
 **Validation**
-- 41/41 `openspec validate <cap> --type spec --strict` 通过；`structure` 78/78。
-- `index_batch_runtime` 修复前单独串行 3 次中 1 次失败（盘符根 3 s 等待），修复后连续 4 次 80/80。
-- 并行全量（`NVIM_TEST_REQUIRE_NATIVE=1`，Python 3.14，jobs=8）：首轮 124/125 文件（父目录 rename 用例 1 s 等待超时），放宽等待后 **125/125 文件、2344 用例全绿，140.6 s**（串行约 10+ 分钟）。
+- 真实 Android/Test：主循环冷摘要 span 2363 ms → 371 ms（CPU 2359 → 31 ms），父端不再读写 291 MB CDB；启动最大 gap 4080 → 2378 ms。14317/14317 C/C++ 源成员覆盖、缺失 0。
+- 旧回执迁移恢复 1 批（另 6 批缺旧 collector 源码档案，保持失效）。
+- 全量回归 3360/3360，0 失败、0 跳过；前后工作树哈希一致。
 
-### 2026-09-30 — 修复跨平台原生回归前置与诊断
+**Follow-ups（未达标）**
+- 卡顿目标 <200 ms 未达成：prepare 期间 max gap 4310 ms（父端 CPU 约 4.3 s 同步计算，热点未定位）；启动仍有约 1.9 s 未归因。
+- 后台发布反复 `publication generation changed`，队列卡在 collecting；frozen activation `watch-error`（原安全回退仍生效）。
+- 固定组 [29,30] 整组证明 127.5 s，比上轮 109 s 慢 17%（图解码 26.3 → 10.7 s，原 TU 索引 35.7 → 58.1 s；缓存与负载未控制，不是有效 A/B）。
+
+### 2026-10-09 — 无变化 prepare 0.2 s；后台证明阶段计时与图处理缓存
 
 **Task**
-- Tree-sitter 安装恢复后，继续处理 PR #13 全量回归实际暴露的跨平台失败。
+- 让输入不变的 prepare 在真实工程上真正走快速路径；拆解后台 SuperUnity 证明约 70 s 的未分阶段耗时。
 
 **Implemented**
-- `.github/workflows/headless.yml` 为 Linux 安装既有 `fd-find` 前置；用官方 LLVM 22.1.5 完整归档和固定 SHA256 配置编译器、clangd、libclang 与 builtin headers，避免 apt 的 22.1.8 漂移绕开或触发既有精确版本门禁。
-- `tools/clangd_batch_bindings.py` 保留选定 libclang 的安装路径，再查真实链接目标，支持 Debian multiarch 布局；显式资源目录和版本约束保持。
-- `grep_cache_spec` 在剪贴板输入边界提供 fixture，保留真实 picker 编辑行为；compiler fixture 保留 `clang++` 符号链接的调用名。
-- 原生测试区分 Windows 专属场景和缺失工具；watcher 用真实探针验证能力及原命令回退，测试等待覆盖既有生产探针时限。
-- `tests/run.lua` 与 harness 在 CI 立即刷新 spec/case 标记，避免提前退出后只能看到延迟通知、无法定位退出点。
+- `cdb/prepare_inputs`：支持 `--gcc-toolchain=`、`-gcc-toolchain=`、`--gcc-install-dir=` 及分离式写法，外部工具链目录纳入原生递归监听与根身份核验；重复路径解析进程内去重；owned 的 `engine/.cache/nvim-ue` 从递归订阅拆出，父目录非递归监听新增/替换。
+- `cdb/prepare_cache`：修正 Python cache 过滤漏掉 `__pycache__` 目录本身；真实工具 `.py` 修改仍立即撤权。
+- 后台证明：各阶段计时（失败路径也保留）；单次原 TU 收集内 64 MiB header shard 缓存，SHA 命中后仍比较完整字节，含 main Cmd/MainFile 的 shard 不缓存；最终回执复用已保存图的 SHA，不再重复全图 JSON/hash。
+- 原生 query-profile 回执的环境身份改为编译器真实路径、版本、字节与 query 输出；PATH/PATHEXT 只作启动上下文。
 
 **Pitfalls / Gotchas**
-- 必需的原生证明仍保持启用，未放宽 LLVM 22.1.5 证明限制、伪造宿主能力或改变 SuperUnity 压缩/准入机制。
-- Windows CI 使用 Neovim 0.12.5，本地原版本为 0.11.5；已在临时目录校验并运行官方同版程序，未替换用户安装。
+- 70 s 残差主要是图解码/处理（原 TU 侧约 17 s、候选约 9 s），不是 freeze/hash（freeze 合计 1.2 s）。
+- 新启动 3.77 s 主循环卡顿：冷 `normalized_cdb_digest` 同步读 291 MB CDB 并 hash 260 MB JSON，占 2.27 s CPU。
+- 未分类的 `nvim_ue_members` union（16626）含 shader/别名，不能当 C/C++ 源数。
 
 **Validation**
-- 剪贴板回归 36/36；libclang 布局新增用例先复现原错误，修复后 required-native bindings 11/11。
-- Windows required-native runtime 80/80、activation 9/9、query 7/7、verified batch 27/27；真实 Linux Python 验证不支持的 query profile 拒绝路径。
-- 同版 Neovim 0.12.5 的 Git review 73/73、transport 9/9；整合全量见上条（125/125 文件），远端三平台复验待 PR #13 CI。
-- Spec 一致性：同步 `headless-test-harness` 的真实宿主适用性与 CI 进度证据契约、`config-regression-suite` 的一致工具链前置；资源查找与 fixture 修复恢复既有行为契约。
+- 真实 Android/Test：seed 169 s 后两次无变化 prepare **0.273 s / 0.222 s**，走快速路径，产物 SHA/size/mtime 不变，clangd PID 不变；改源注释后监听 epoch 0→4、进入完整生成（完整生成在限时内未完成）；源文件按字节与 mtime 恢复。
+- 离线真实产物：图处理 13.930 → 9.556 s（−31%），三张规范化图 SHA 全等；锁内整组证明 109 s，尚未测到整体提速（header 缓存在该次实测后加入）。
+- 全量回归 3336/3336，0 失败、0 跳过；前后工作树哈希一致。
 
 **Follow-ups**
-- 以对应提交的三平台完整 CI 结果验收；Windows 提前退出的具体位置仍需带进度标记的运行记录确认。
+- 冷 generation 摘要与普通发布改为异步，消除 3.77 s 卡顿。
+- header 缓存后的整组证明真实收益与 304 候选吞吐推算；旧 collector/helper 回执安全迁移。
+- 改注释后完整 prepare 的耗时与发布结果未取得。
 
-### 2026-09-30 — 修复 CI Tree-sitter CLI 安装版本
+### 2026-10-09 — 后台 SuperUnity 证明、prepare 输入缓存骨架与头文件 clangd 目标校验
 
 **Task**
-- 修复 PR #13 三个平台在依赖安装阶段共同失败的问题。
+- 用户约束：Windows 文件系统是索引瓶颈，任何方案都不得依赖等 clangd 后台索引全部完成。本轮把二次合并证明挪出 prepare，并为无变化 prepare 与头文件跳转打基础。
 
 **Implemented**
-- `.github/workflows/headless.yml` 将 npm 安装版本从未发布的 `tree-sitter-cli@0.26.1` 改为已发布的固定版本 `0.26.3`。
+- 后台 SuperUnity 证明：正常 full 只复用缓存回执，交付后启动后台队列；最多 2 个私有 clangd（-j=1、IDLE 优先级、宿主准入），120 s 攒批后排空再增量发布；大 CDB 合并/hash 放到独立 `batch_publish_worker`，编辑器只接小结果并走原冻结激活流程。新增 `index/_batch_background`、`batch_background`、`batch_publish_worker`、`tools/cdb_background_batch.py`。
+- prepare 输入证据缓存：`cdb/prepare_cache` + `prepare_inputs`，在 writer lease 内用 Windows 原生 watcher epoch 与产物身份判断输入未变时跳过 raw/pipeline/partition/commit/current/hot/full；未知参数、未知 VFS、监听溢出/停止、产物缺失或损坏、工具源码变化一律回退完整路径。
+- 头文件 clangd 兜底：跳转前校验目标 exact-command AST 的 canonical USR、definitionRange/body 与 changedtick；删除无定义体时悄悄回跳声明的成功路径。
 
 **Pitfalls / Gotchas**
-- GitHub release 存在不代表对应 npm 版本存在；原版本在 runner 报 `ETARGET`，本地 npm registry 查询同样报版本不存在。
+- clangd 冷启动读入 33,026 个 shard 约 9.7 s、内存重建约 9 s，约 19.5 s 才能回答头文件定义；不必等 background end，但首次 <3 s 不可达，瓶颈即 shard 数量。
+- 并发 clangd+sidecar 原型被真实反例否决（只校验目标位置不足），已撤回。
+- 旧证明回执因 compiler PATH 不同全部失效，门禁正确拒绝；需环境身份规范化。
+- 跨子进程 JSON 会丢失 Windows 大整数 inode 精度；签名需带类型与长度的稳定编码。
 
 **Validation**
-- Spec 一致性：无行为契约变更，恢复 `config-regression-suite` 已要求的隔离依赖安装和全量回归入口。
-- 临时目录实际 npm 安装成功，CLI 返回 `tree-sitter 0.26.3`；225 个 Lua 文件通过 AST lint。
-- 本地 required-native 全量 **2341/2341**，0 failed、0 skipped（测试进程使用已安装的 Python 3.14）；差异检查通过。
+- 全量回归 3329/3329，0 失败、0 跳过；回归前后工作树哈希一致。
+- 真实 Android/Test 后台证明约 8.7 min：完成 7 组（接受 4、拒绝 3），发布 2 批；prepare 51 ms 返回，full 交付约 40 s；单组约 130 s（原 TU 两次约 40 s、候选约 18 s、约 70 s 未分阶段）。
+- 真实头文件 gd（独立冷进程）：P01 37.9/38.7 s、E02 33.7/32.2 s 超时；P12 重复跳对 `.cpp`；无错误目标。
 
-**Follow-ups**
-- 跨平台验收以 PR #13 对应提交的 Linux、macOS、Windows 完整 CI 记录为准；依赖安装成功不能替代整个工作流通过。
+**Follow-ups（未完成）**
+- prepare 快速路径在真实工程**未启用**：真实 argv 含 `--gcc-toolchain=` 被保守拒绝；无变化 prepare <10 s 未实测。
+- 后台证明铺满 304 候选推算约 6.3 h；PATH 规范化、70 s 残差拆解、headless 心跳最大 3.7 s 卡顿待处理。
+- 头文件首次/重复 gd 延迟未达标；新增 clangd 兜底分支尚无真实工程触发证据。
 
-### 2026-09-30 — 更正 shard 播种验收范围并复核发布脱敏
+### 2026-10-09 — 二次合并随 prepare 逐轮增长
 
 **Task**
-- 接力已提交并推送的 shard 播种改动，复核 spec 同步、归档与公开内容。
+- 上一版正常 prepare 交付 1 个二次批次后再也不增长；让 SuperUnity 合并能逐轮扩大。
 
 **Implemented**
-- 在 `docs/cpp-index-restart-investigation.md` 更正 42.3 s / 54.2 s 的实测范围，并同步主 spec、归档 delta、proposal 与 tasks。
-- 保留归档任务 2.4 未完成；副本索引不再表述为成功的线上激活或完整端到端验收。
+- `tools/cdb_verified_batch.py` 判断本轮验证是否完成时只看本轮新接受的批次（`new_batch_count`），已缓存批次不再阻断下一组候选；整体失效时一并归零。每轮仍最多新证明 2 组、新接受 1 批。
+- 同步 `cpp-semantic-index-coverage` spec 的阶段选型说明。
 
 **Pitfalls / Gotchas**
-- 前次提交的 Tested 摘要过宽；详细证据是 prepare 校验失败后另行启动 clangd 索引。本次追加更正，不改写已发布历史。
+- 原判断用总 `batch_count`（含缓存批次），有 1 批后所有新组都被记为 `verification-stage-complete`。
+- 工具源码身份变化会让旧 proof 全部失效重证明，首轮属迁移轮，不能与热缓存轮比较。
 
 **Validation**
-- 前次提交的元数据、路径和全部新增内容通过专属 denylist 与通用敏感信息扫描。
-- Spec 一致性：主 spec 与已归档 delta 同步更正，15 个 scenario 保持一致；主 spec 严格校验与暂存差异检查通过，未改变运行时行为。
-- 首次 required-native 全量为 2338/2341，失败涉及多实例缓存刷新、探针重试与 native watcher 就绪。独立复测分别通过 27/27、10/10、15/15；watcher 的原始断言和生产时限未改动。
-- 同一原生 helper 的一次配对测量：默认 Python 3.12 启动到 ready 为 9044 ms，已安装 Python 3.14 为 125 ms；后续 Python 3.14 运行也曾超时，因此不能将波动全部归因于版本。测试进程使用现有 `UE_PYTHON` 显式选择真实 Python 3.14，未伪造工具或改变用户会话配置。
-- 最终完整回归 **2341/2341 passed，0 failed、0 skipped**：设置进程内 `NVIM_TEST_REQUIRE_NATIVE=1` 与 `UE_PYTHON` 指向已安装的 Python 3.14 后运行 `nvim --headless -l tests/run.lua`。复测通过不代表上述时限波动已修复。
+- 原生夹具先红后绿：第二轮 1→2 批；纯缓存轮字节/mtime/proof store 不变；零预算、同大小源码变化、构建参数变化均回退原命令。
+- 真实 Android/Test：连续 prepare 1→2→3 批，改一行注释后再到 4 批；raw/原始语义 CDB SHA 与 14317 个逻辑成员不变；被引用门禁拒绝的组保留原 UBT。新接受组独立冷索引比两个原 TU 快 50–56%（仅该组，不代表全工程）。
+- 全量回归 3283/3283，0 失败、0 跳过。
 
 **Follow-ups**
-- 有效 receipt 下的完整激活链路、header shard 差异归因及更大范围 SuperUnity 验收仍未完成。
-- 本轮异步测试与 helper 就绪时限波动的根因尚未闭环；保留为既存验证稳定性问题，不宣称由文档更正修复。
+- 每轮只增 1 批，铺满 304 个候选不现实，需要后台并发证明。
+- 改注释那轮不能证明完整输入变化检测（每次 prepare 本就全量重验）；无变化 prepare 仍约 150 s。
 
-### 2026-09-29 — 冻结 shard 缓存从原缓存 add-only 播种
+### 2026-10-08 — 头文件语义导航、重复 Prepare no-op 与首个真实二次批次
 
 **Task**
-- 让 prepare 后首次冻结激活不再把约 33k 个保留 TU 冷重建进独立 shard 缓存。
+- 按真实工程基线修 P0：头文件 gd/gr 全失败、头源切换误跳、重复 Prepare 非 no-op、二次合并为 0。
 
 **Implemented**
-- 新增 `tools/clangd_shard_seed.py`：仅添加目标缺失的 `*.idx`（硬链接，跨卷回落 exclusive-create 复制；跳过 `.temp-stream-`；失败删除半截副本；拒绝同目录/缺失目标）。
-- 新增 `lua/ue/index/batch_shard_seed.lua`，并在 `batch_runtime` 的本地缓存创建之后、watch probe 之前异步播种；结果不影响冻结权威，失败按冷缓存继续。
-- spec `cpp-semantic-index-coverage` 新增场景 "A new frozen shard cache is seeded from the original cache"。
-- 调查记录见 `docs/cpp-index-restart-investigation.md` 2026-09-29 节（含 priority A/B 假设被证伪的更正）。
+- 新鲜度：header gd 改为以 active selection 与 raw/merged 内容 SHA proof 判定，不再比较 manifest mtime（`cdb_transaction` 的 copy2 保留 stage mtime 导致误拒）；切换选择后旧 merged 仍在 prove 阶段被拒。
+- header 编译上下文：gd/gr 从真实 donor TU 取编译命令，并由 libclang native inclusion（`clang_getInclusions` + `clang_File_isEqual`）证明包含当前头文件；VFS 别名须源码字节一致才映回用户位置。无法证明时明确失败，不借 GTAGS 变绿。
+- sidecar 补齐 LLVM 22 builtin resource 目录（原注入 NDK Clang 9 资源头导致 NEON 大量编译错误）；catalog donor 发现改为请求内线性索引。
+- 头源切换拒绝生成文件与未证明的 companion。
+- TU 缓存 1→4（受 RSS/宿主剩余内存约束），空闲回收 30 s→300 s；进入头文件异步低优先级预热已证明 donor，前台请求可取消；CDB 解析缓存绑定内容 digest。
+- 重复 Prepare：`module_keys` 规范排序、全部 provenance 一致才复用 `completed_at`、manifest 深比较相等不写盘；缓存命中不再创建 proof 目录（原触发 watcher 撤权并重启 clangd）。
+- 正常 full prepare 有界证明最多 2 个未缓存候选（原路径恒 `--reuse-verified-only`，永远不生产 proof）。
+- 新模块：`reading_companion/compile/context`、`semantic_prewarm`、`semantic_cdb_cache`、`semantic_context_hash`、`semantic_sidecar_inputs`、`index/_generation_digest`（含为 800 行门禁做的机械拆分）。
 
 **Pitfalls / Gotchas**
-- clangd 22 shard 按源路径寻址、只按内容 digest 判过期、以 temp+rename 写回——这三点是播种安全且有效的前提（源码已核对）。
-- header shard 在播种/冷建间存在 refs/relations 差异，归因于写入者非确定性，为推测、待闭环。
+- preserved-size/mtime 的内容 hash 复用曾出现一次 false acceptance，未复现根因；已改为每次实读 hash，并加 metadata 相同、内容替换的拒绝反例。
+- 首次与缓存读回的 batch 字段顺序不同会导致等价 CDB 被重写。
+- 测量驱动：启动期异步切窗会让“头文件 gd”实际落在源文件上，调用前须校验 buffer/path/cursor。
 
 **Validation**
-- 实测（Android target 隔离副本）：冻结 CDB 冷索引 1713.6 s / 12,937 CPU s → 播种后索引 42.3 s / 47.9 CPU s（重索引 4 个 TU，其中 2 个为 batch TU）。
-- Headless prepare（真实 `batch_runtime.prepare`，隔离副本）：播种 linked 37,339、11.8 s；冻结校验因 receipt inventory（某插件 Win64 Editor Intermediate 目录 9/28 新增文件）返回 `receipt-input-or-asset-changed`，正确回落原 CDB。随后独立启动 clangd，在播种后的 verified 目录索引 54.2 s / 56.4 CPU s / 5.35 GB、4 TU、0 失败；该数字不是成功激活的端到端耗时。未验证 live 是否同样失效（推测是）。
-- `NVIM_TEST_REQUIRE_NATIVE=1` filters：index_batch_runtime 80/80、index_batch 201/201、index_generation 35/35、cpp_semantic_index 1/1、clangd_commands 10/10、ue_api 65/65、index_graph 12/12、index_verified_batch 27/27、index_vfs_aliases 5/5、index_input_directory 4/4、index_inventory 18/18、cpp_semantic_client 33/33、host_resource_discipline 13/13、stability 26/26。
-- 单独跑 `index_query_profile` filter 时报 native coverage unavailable（skip 条件 clangd/python 未解析被触发），全量套件中同一用例通过；推测全量里其他用例设置了 `UE_CLANGD`，未验证；本改动未触及该路径。
-- 全量 `NVIM_TEST_REQUIRE_NATIVE=1 nvim --headless -l tests/run.lua`：2341/2341 passed。
-- spec 一致性：以 change `2026-09-29-seed-frozen-shard-cache` 承载并已归档，同步 `openspec/specs/cpp-semantic-index-coverage/spec.md`；知识库同步 architecture overview / project_overview / `lua/ue/index/AGENTS.md` / tests 映射（新增 `index_batch_runtime`）。
+- 真实 Android/Test 30 样本（同 SHA）：gd 11/30→22/30、gr 11/30→22/30（header 0/19→11/19），头源切换 24/30→30/30（误跳 6→0），cpp 起点 11/11 不变。
+- 重复 Prepare 缓存轮：受控产物 SHA/size/mtime 全同，clangd PID 不变，0 spawn/0 detach。
+- 二次合并 0→1 批（2 个 UBT 输入；997 UBT → 995 + 1 batch，full 条目 3329→3328），exact 215、shader 2117 不变。
+- 合批全量回归（含 800 行门禁拆分）：3283/3283，0 失败、0 跳过，包含 legacy。
 
-**Follow-ups**
-- wrapper 命令变更导致新 TU 路径全量重索引；冻结失效源（仓库 `.omx` receipts）迁出；更多真实 L1 二次合并。
+**Follow-ups（未达标，不宣称完成）**
+- **延迟未达预算**：header 首次 gd 30–41 s 或超时（P01/E02），同 donor 重复 208 ms 达标。逐请求冷解析 TU（≈8 s/个）是结构性瓶颈；下一步改为先用 clangd 后台索引按 USR 查定义，sidecar 只做歧义/缺失回退。
+- 剩余 8 个 header 中 P09/E09/E15 native 校验已恢复，端到端 gd 与 P10/E10/E11/E12/E14 未实测；E02 触发 64-context 上限。
+- 增量二次合并未实施：`cdb_verified_batch.py` stage-complete 用总 batch_count（含缓存批次），已有 1 批后不再接受新组。
+- 缓存轮 Prepare 仍重做输入验证，墙钟约 164 s；全工程 SuperUnity 性能未恢复。
 
-### 2026-09-29 — 归档统一 Git 审阅 change
+### 2026-10-08 — 用工作台贯通开发入口、恢复与首次上手
 
 **Task**
-- 按用户指令完成 CodeDiff 工作的 spec 同步核对、归档与提交推送流程。
+- 产品复盘后收敛入口：多个顶层入口与六类“恢复”概念让用户先要理解差异；改为以工作台为主线，并缩短首次上手与手册阅读路径。
 
 **Implemented**
-- 将完整 change 移至 `openspec/changes/archive/2026-09-29-unify-git-review-with-codediff/`，保留 21 项任务及交付证据。
-- 更新 `docs/release_2.0.0.md` 的归档路径和授权状态。
+- `development_workbench` 首屏分为当前目标 / 下一步 / 最近结果 / 运行中任务 / 恢复五区；局部键 `g` 向导、`R` 恢复、`p` 命令中枢。恢复按意图组织，直接复用原 Workspace / WorkContext / SessionRestore / Recovery owner，不复制存储或逻辑。
+- 新增 `utils/ue_onboarding`：按缺项依次走工程 → 平台/配置 → 设备/包名 → Prepare（单独确认）→ UEDoctor，取消即失效后续步骤；`ue.lua` 的原选择命令接受可选 flow guard，覆盖内层迟到回调与 Prepare 延迟启动。
+- `USER_GUIDE.md` 只讲“想做什么 → 按什么”（592 → 326 行），边界说明迁到 `USER_GUIDE_LIMITS.md`；同步 Markdown/浮动速查与命令中枢 Recovery 分组；保留全部旧直达键。
 
 **Pitfalls / Gotchas**
-- 其他 SuperUnity change 保留原状；tag 未包含在本次授权中。
+- 外层 picker 取消挡不住平台选择器的内层迟到回调（实验观测到取消后仍 fast swap 1 次），必须在内层与 Prepare launcher 处复核 guard。
+- 包名选择要绑定发起时设备；Snacks 的 Esc 只切模式，不等于关闭向导 UI。
+- 合批全量首轮 3178/3180：`ide_work_context_native` 两条用例仍按旧工作台主屏断言（调查备注行、主屏「继续已保存调查」）。这是入口有意迁移造成的过期断言，不是功能回归；改为断言主屏「当前调查」行，并经恢复菜单的 `UEWorkContext` 动作继续，原有恢复/备注详情断言保留。
 
 **Validation**
-- Spec 一致性：三个主规格与 delta 的 10 个 requirement 块逐段一致；change 与三个主规格严格校验通过。
-- 归档后提交前 required-native 全量复验 **2338/2338**，0 failed、0 skipped；命令为 `NVIM_TEST_REQUIRE_NATIVE=1 nvim --headless -l tests/run.lua`。
-- 21 个相关 Lua 文件通过 AST lint；暂存差异通过 `git diff --cached --check`。
+- 26 个 MAP filter 全绿；cheatsheet/structure 冻结瘦身前 57 个命令、87 个键位、29 个组合键均仍可查。
+- 真实 Neovim + Snacks 按键回放：工作台 → 恢复 → 找回关闭的构建日志 7 键；空配置 → 向导 → 取消 5 键，取消后 1800 ms 无新任务。
+- 合批全量（含 B/C 与本条测试修正）：3180/3180，0 失败、0 跳过，包含 legacy。
 
 **Follow-ups**
-- 跨平台和 GUI 验证边界沿用 [v2.0.0 交付记录](release_2.0.0.md)。
+- 真实 UE 工程完整 fresh 上手（含设备/应用选择）、极窄窗口布局、其它宿主仍未验收。
 
-Original-reader retention and its acceptance limits are
-archived in [v1.12.11](release_1.12.11.md). Broader compression, whole-engine index
-performance and search responsiveness remain open.
+### 2026-10-08 — Android 无 Python 的 UE 调试变量显示
+
+**Task**
+- 让 FString、FName、容器与指针在真实 Android DAP 变量面板中可读。
+
+**Implemented**
+- `_android_engine` 的 formatter 命令委派给新 `_ue_formatters`：对引擎自带 LLDB formatter 做非致命 `command script import`，始终保留原生 fallback，删除按 Python 目录推断能力的旧分支。
+- 新增 `_ue_values` / `_ue_array`：attach 成功后安装会话级显示层，按真实 `readMemory` 解码 FString（UTF-16、空态）、TArray 有界元素、TMap/TSet Num、NULL UObject/SharedPtr，FName 显示 index + Number；continue/step/detach 作废旧观察。
+
+**Pitfalls / Gotchas**
+- 当前 lldb-dap 22.1.6 导入 Python 报 `No module named 'lldb'`（L0 外部工具链），引擎 Python formatter 无法生效。
+- 真机上 typed array cast 让 adapter 以 0xC0000409 退出，该路线已删除；内部崩溃机制待验证。
+- 正的弱指针 index/serial 不等于有效；不执行目标函数，不把源码字符串冒充已解码 FName。
+
+**Validation**
+- dap 252/252、platform 66/66、dap_failure_layer 100/100、ue_platform_boundary 20/20、android_ide 45/45；新增 `dap_ue_values_spec` 15 项。
+- 真机同 BuildId：5 个非空 FString、61 个数组元素、FName 索引、TSet/TMap Num、NULL 指针可读；no-kill detach 后游戏存活、TracerPid=0。
+
+**Follow-ups**
+- Python 成功分支、有效 UObject 名称、FName 名称解析、真实弱指针、复杂元素数组、GUI 展开仍待验证。
+
+### 2026-10-08 — 真实工程体验基线（只测量）
+
+**Task**
+- 在真实 Android/Test 工程上测导航命中率、索引规模与耗时、重复 Prepare 与首次上手，按数据决定下一轮优先级。
+
+**Implemented**
+- 无生产代码改动；原始证据与可复跑驱动保存在被忽略的本地证据目录。
+
+**Pitfalls / Gotchas**
+- 测量驱动反复 `:edit` 同一文件会让 clangd 短暂脱离（1→0→约 500 ms 后 1），该批数据已作废重测。
+- 非当前构建分支（`WITH_EDITOR=0`）与不在 build 内的插件样本不能计为产品缺陷。
+
+**Validation**
+- 30 样本：gd 11/30、LSP 引用 11/30、头源切换 24/30；11 个 cpp 起点全部成功，19 个头文件起点全部失败。
+- 当前 build 16434 输入、1212 条发布 CDB（997 UBT Unity + 215 exact），覆盖 missing/extra 均 0；**真实二次合并 0**（304 组 verification-not-cached），不满足 C11 阶段验收。
+- 后台索引：首次追赶 1612.6 s，热启动 23.4–62.2 s；重复 Prepare 120.7 s，主 CDB 未变、clangd 未重启，current/hot 产物有写入（输入是否不变待验证）。
+
+**Follow-ups**
+- P0：头文件 gd 被 `merged-cdb-predates-active-selection` 时间门禁拒绝；头文件 gr 无编译命令（`compile-command-missing`）。
+- P0：恢复真实二次合并（C11）。
+- P1：头源切换 6/30 跳到 `.gen.cpp` 或无关头文件；新 TU 首次 gd 等待 9–27 s。

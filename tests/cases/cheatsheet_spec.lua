@@ -22,7 +22,7 @@ end
 
 -- UE* 命令权威集合：commands_spec 的 UE_COMMANDS 冻结清单（lua/ue.lua）
 -- ＋ UEDef* 系列（在 lua/utils/lsp_fallback.lua 注册，不在 ue.lua 冻结清单）。
--- 后者通过 keymaps.lua 顶部的 eager require 注册，headless 下 exists 可靠。
+-- 补充入口按真实 owner 注册；headless 下 exists 可靠。
 local UE_COMMANDS = {}
 do
   local ok, src = pcall(read, "tests/cases/commands_spec.lua")
@@ -34,15 +34,17 @@ do
       end
     end
   end
-  -- 合并 lsp_fallback 注册的 UEDef* 命令（真实存在、非死链）。
+  -- 合并 lsp_fallback 与 probe owner 注册的额外命令（真实存在、非死链）。
   vim.g.mapleader = " "
   vim.g.maplocalleader = " "
   pcall(function() require("ue").setup() end)
   pcall(require, "utils.lsp_fallback")
+  pcall(function() require("utils.probe").setup() end)
   pcall(dofile, cfg .. "/lua/config/keymaps.lua")
   for _, c in ipairs({
     "UEDefStatus", "UEDefTrace", "UEDefSelfTest", "UEDefDiag",
     "UEDefReload", "UEDefCacheClear", "UEDefCancel", "UEDefContextClear",
+    "UEProbeReport",
   }) do
     if vim.fn.exists(":" .. c) == 2 then UE_COMMANDS[c] = true end
   end
@@ -92,6 +94,89 @@ t.describe("cheatsheet: float 版 UE 命令不死链", function()
         ":" .. c .. " 在 float cheatsheet 引用但不在 UE_COMMANDS 冻结清单（死链/过期）")
     end)
   end
+end)
+
+-- 2026-10-08 瘦身前 USER_GUIDE 的操作清单；独立于当前文档解析，防止一起删掉后假绿。
+local ORIGINAL_GUIDE_COMMANDS = {
+  ":'<,'>UEFormat epic", ":GrugFar", ":NvimCoreHealth", ":Restart",
+  ":UEAndroidIterate nodebug", ":UEAndroidIterateStop", ":UEBuildCsearch", ":UECodeActions",
+  ":UEDAPPreflight", ":UEDAPReattach", ":UEDoctor", ":UEFormat epic",
+  ":UEGrepGroupingToggle", ":UEGuide", ":UEIndexStatus", ":UENewClass",
+  ":UEPanel build", ":UEPanel history", ":UEPeek", ":UEPrepare", ":UEProbeReport", ":UEQuit",
+  ":UEReadCancel", ":UEReadReturn", ":UERecovery", ":UERecovery all",
+  ":UERefactorRecovery", ":UERefactorUndo", ":UERelations incoming", ":UERelations resume",
+  ":UERename", ":UERunProfile", ":UERunProfileDelete", ":UERunProfileSave",
+  ":UESessionRestore", ":UESessionRestore full", ":UESetProject", ":UETests",
+  ":UETests list", ":UETests rerun", ":UETests results", ":UETests run <筛选>", ":UEUnsaved",
+  ":UEWorkContext", ":UEWorkContext add", ":UEWorkContext note", ":UEWorkContext save",
+  ":UEWorkContext search", ":UEWorkbench", ":UEWorkspace", ":UEWorkspace buffers",
+  ":UEWorkspace results", ":pwd", ":q", ":qa", ":qa!", ":w",
+}
+local ORIGINAL_GUIDE_KEYS = {
+  "<F10>", "<F11>", "<F5>", "<F6>", "<F9>", "<S-F11>", "<S-F5>", "<leader>",
+  "<leader>/", "<leader><leader>", "<leader>?", "<leader>P", "<leader>X", "<leader>XA", "<leader>Xs",
+  "<leader>bc", "<leader>bd", "<leader>cB", "<leader>cD", "<leader>cI", "<leader>cO",
+  "<leader>ca", "<leader>cd", "<leader>cf", "<leader>ch", "<leader>cr", "<leader>d4",
+  "<leader>dB", "<leader>dC", "<leader>dL", "<leader>dW", "<leader>da", "<leader>db",
+  "<leader>de", "<leader>dh", "<leader>dj", "<leader>dk", "<leader>dl", "<leader>dt", "<leader>dw",
+  "<leader>fA", "<leader>fY", "<leader>fe", "<leader>ff", "<leader>fh", "<leader>fl",
+  "<leader>fr", "<leader>fy", "<leader>qq", "<leader>s/", "<leader>sB", "<leader>sF",
+  "<leader>sG", "<leader>sH", "<leader>sR", "<leader>sS", "<leader>sb", "<leader>sd",
+  "<leader>sf", "<leader>sg", "<leader>sj", "<leader>sm", "<leader>sr", "<leader>ss", "<leader>su",
+  "<leader>u?", "<leader>uE", "<leader>uH", "<leader>uJ", "<leader>uN", "<leader>uX",
+  "<leader>ub", "<leader>uf", "<leader>ug", "<leader>uh", "<leader>ui", "<leader>uk",
+  "<leader>ul", "<leader>uo", "<leader>uq", "<leader>us", "<leader>uu", "<leader>ux",
+  "<leader>v", "<leader>wM", "<leader>xX", "<leader>xx",
+}
+local ORIGINAL_GUIDE_LOCAL_KEYS_AND_ARGUMENTS = {
+  "<C-w>q", "<CR>", "2]q", "[c", "[d", "[e", "[q", "]d", "]e", "]q",
+  "a", "d", "dd", "G", "g/", "g0", "gH", "gK", "gb", "gc", "gcc", "gd", "gf", "gl", "gr", "gt", "gx",
+  "h", "j", "k", "l", "m", "n", "q", "r", "s", "u", "v", "V", "y",
+  "declaration", "implementation", "type_definition", "references", "outgoing", "base", "derived",
+  "quickfix", "logcat", "tasks", "logs", "results", "run", "foo -- -g *.cpp",
+  "uproperty", "ufunction", "uclass", "ustruct", "uenum", "ulog",
+}
+local ORIGINAL_GUIDE_CHORDS = {
+  "Alt-C", "Alt-D", "Alt-F", "Alt-J", "Alt-K", "Alt-R", "Alt-Shift-Y", "Alt-U", "Alt-V", "Alt-W", "Alt-Y",
+  "Ctrl-E", "Ctrl-G", "Ctrl-I", "Ctrl-K", "Ctrl-N", "Ctrl-O", "Ctrl-P", "Ctrl-Q", "Ctrl-R",
+  "Ctrl-S", "Ctrl-Space", "Ctrl-T", "Ctrl-V", "Ctrl-W", "Ctrl-X", "Ctrl-Y", "Shift-F5", "Shift-Tab",
+}
+
+t.describe("cheatsheet: 手册瘦身保留原操作清单", function()
+  local guide = read("docs/USER_GUIDE.md") or ""
+  for label, forms in pairs({
+    commands = ORIGINAL_GUIDE_COMMANDS, keys = ORIGINAL_GUIDE_KEYS,
+    local_keys_and_arguments = ORIGINAL_GUIDE_LOCAL_KEYS_AND_ARGUMENTS,
+  }) do
+    t.it(label .. " 保留原始完整形式", function()
+      for _, form in ipairs(forms) do
+        t.assert_contains(guide, "`" .. form .. "`", "手册遗漏原操作: " .. form)
+      end
+    end)
+  end
+  t.it("组合按键仍可从手册查询", function()
+    for _, chord in ipairs(ORIGINAL_GUIDE_CHORDS) do
+      t.assert_contains(guide, chord, "手册遗漏原组合按键: " .. chord)
+    end
+  end)
+  t.it("手册当前引用的 UE 命令仍在注册清单", function()
+    for _, command in ipairs(extract_ue_commands(guide)) do
+      t.assert_true(UE_COMMANDS[command] == true, "手册命令不存在: :" .. command)
+    end
+  end)
+  t.it("速查主线与手册工作台局部入口一致", function()
+    local md = read("docs/ue_lazyvim_cheatsheet.md") or ""
+    for _, entry in ipairs({
+      "<leader>uH", "UEWorkbench", "当前目标", "下一步", "最近结果", "运行中任务", "恢复",
+      "`g`", "`R`", "`p`", "UEWorkspace logs", "UEWorkContext", "UESessionRestore", "UERecovery",
+    }) do
+      t.assert_contains(md, entry, "速查遗漏工作台主线: " .. entry)
+    end
+    t.assert_contains(md, "USER_GUIDE_LIMITS.md")
+    local data = read("lua/utils/cheatsheet.lua") or ""
+    t.assert_contains(data, "Main entry: workbench")
+    t.assert_contains(data, '"g / R / p"')
+  end)
 end)
 
 -- ── 快捷键发现：混合大小写组合必须直接命中并保留分类 ───────────────────────
@@ -223,6 +308,9 @@ t.describe("cheatsheet: 双 surface 不漂移", function()
   local md = read("docs/ue_lazyvim_cheatsheet.md") or ""
 
   local ANCHORS = {
+    "<leader>uJ",
+    "<leader>uE",
+    "<leader>cI", "<leader>cO", "<leader>cB", "<leader>cD", "<leader>ss", "<leader>sS", "<leader>ca", "<leader>cr",
     "<leader>da", "<leader>db", "<leader>dB", "<leader>dL", "<leader>dC",
     "<leader>dW", "<leader>dt", "<leader>dR", "<leader>d1", "<leader>d4",
     "<leader>uA", "<leader>uB", "<leader>ub", "<leader>us", "<leader>uq", "<leader>uP", "<leader>uC",

@@ -534,6 +534,7 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
       "utils.ue_goto.cache",
       "utils.ue_goto.csearch_fallback",
       "utils.ue_goto.semantic_client",
+      "utils.ue_goto.clangd_destination",
       "utils.lsp_fallback",
     }
     for _, name in ipairs(mocked) do saved[name] = package.loaded[name] end
@@ -567,9 +568,20 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
     local symbol_info_requests = 0
     local definition_requests = 0
     local module_lookup_requests = 0
+    local target_verify_requests = 0
     local module_definition
     local module_failure = "no-proven-module-contexts"
     local jumps = {}
+    package.loaded["utils.ue_goto.clangd_destination"] = {
+      verify = function(target, usr, clients, callback, opts)
+        target_verify_requests = target_verify_requests + 1
+        t.assert_eq(usr, "usr:SubmitActiveCmdBuffer(two-args)")
+        t.assert_eq(clients[1], 17, "目标 proof 必须复用源 USR 校验的 client")
+        t.assert_eq(require("utils.ue_goto.location").location_path(target), source)
+        t.assert_true(opts.is_current())
+        callback({ reason = "ok", usr = usr, definitions = { target } })
+      end,
+    }
     package.loaded["utils.ue_goto.symbol"] = {
       current_symbol = function() return "SubmitActiveCmdBuffer" end,
       current_receiver = function() return nil end,
@@ -688,6 +700,7 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
       t.assert_eq(definition_requests, 1,
         "USR 相等后必须请求跨 TU definition")
       t.assert_eq(#jumps, 2)
+      t.assert_eq(target_verify_requests, 1, "跨 TU definition 必须先验证目标 AST 的同 USR body")
       t.assert_eq(require("utils.ue_goto.location").location_path(jumps[2]), source)
       t.assert_eq(require("utils.ue_goto.location").location_line(jumps[2]), 423)
 
@@ -720,10 +733,9 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
       gd.definition()
       t.assert_eq(symbol_info_requests, 5)
       t.assert_eq(definition_requests, 3)
-      t.assert_eq(#jumps, 3,
-        "跨 TU definition 不可证明时，其他调用点仍可退到同一 USR 的声明")
-      t.assert_eq(require("utils.ue_goto.location").location_path(jumps[3]), header)
-      t.assert_eq(require("utils.ue_goto.location").location_line(jumps[3]), 1)
+      t.assert_eq(#jumps, 2,
+        "跨 TU definition 不可证明时，其他调用点也不得把 native 声明当成 body 跳转")
+      t.assert_eq(gd._last_cpp_transaction.result.state, "unavailable")
     end, debug.traceback)
 
     vim.notify = old_notify

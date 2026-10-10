@@ -235,4 +235,32 @@ function M.ideviceinfo_entry()
   return path, nil
 end
 
+-- No upvalues/editor APIs: luv executes this in an independent Lua state.
+local function exclusive_move_worker(from, to)
+  local invoked, ok, err = pcall(function()
+    local ffi = require("ffi")
+    if ffi.os ~= "OSX" then
+      return false, "Darwin native no-replace move is unavailable on this host"
+    end
+    if from:sub(1, 1) ~= "/" or to:sub(1, 1) ~= "/" then
+      return false, "Native no-replace move requires absolute paths"
+    end
+    ffi.cdef("int renamex_np(const char *, const char *, unsigned int);")
+    -- Darwin RENAME_EXCL=4; no ordinary rename fallback on old runtimes/FS.
+    if ffi.C.renamex_np(from, to, 4) == 0 then
+      return true
+    end
+    return false, "renamex_np(RENAME_EXCL) failed (errno " .. ffi.errno() .. ")"
+  end)
+  if not invoked then
+    return false, "Native no-replace move unavailable: " .. tostring(ok)
+  end
+  return ok, err
+end
+
+-- Atomic destination refusal; source identity is the caller's responsibility.
+function M.rename_no_replace(from, to, callback)
+  return require("utils.platform.exclusive_move").rename(exclusive_move_worker, from, to, callback)
+end
+
 return M

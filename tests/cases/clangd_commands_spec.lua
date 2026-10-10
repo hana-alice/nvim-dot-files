@@ -48,7 +48,8 @@ local function activate_frozen(root, semantic, bufnr, clangd)
   local runtime = require("ue.index.batch_runtime")
   runtime._reset_for_test()
   local descriptor = { ok = true, info_sha256 = "transport-proof", generation_id = "transport-generation",
-    compiler_environment = {}, tool_path = clangd, receipts = { root .. "/receipt.json" }, watch_roots = { root },
+    compiler_environment = {}, compiler_lookup_environment = {}, tool_path = clangd,
+    receipts = { root .. "/receipt.json" }, watch_roots = { root },
     input_roots = { root .. "/Source" },
     watched_files = { semantic .. "/verified/compile_commands.json" }, exclude_roots = {},
     original_cdb = semantic .. "/compile_commands.json", verified_cdb = semantic .. "/verified/compile_commands.json" }
@@ -408,6 +409,109 @@ t.describe("clangd exact compile-command transport", function()
     t.assert_true(vim.wait(10000, function() return done end, 10))
     t.assert_false(ok)
     t.assert_eq(reason, "compile-command-ambiguous")
+    cleanup(root, bufnr)
+  end)
+
+  t.it("native compile descriptor identity is independent of object field construction order", function()
+    local model = require("utils.ue_goto.semantic_context")
+    local first = { directory = "D:/fixture/./cwd", file = "D:/fixture/cwd/../subject.cpp",
+      argv = { "clang++", "-DFLAG=1", "-c", "D:/fixture/subject.cpp" } }
+    local second = {}
+    second.argv, second.file, second.directory = vim.deepcopy(first.argv), first.file, first.directory
+    local function fingerprint(value)
+      return model.compile_descriptor_fingerprint(value.directory, value.file, value.argv)
+    end
+    t.assert_eq(fingerprint(first), fingerprint(second))
+    second.argv[2] = "-DFLAG=0"
+    t.assert_false(fingerprint(first) == fingerprint(second))
+  end)
+
+  for _, flag in ipairs({ "-include", "-include-pch", "-imacros", "-o", "-Xclang" }) do
+    t.it("header rebinding preserves " .. flag .. " operands even when they equal the source", function()
+      local helper = require("utils.ue_goto.reading_compile")
+      local source, header = "D:/fixture/source.cpp", "D:/fixture/header.hpp"
+      local command, reason = helper.rebind({ directory = "D:/fixture", file = source,
+        argv = { "clang++", flag, source, "-c", source } }, source, header)
+      t.assert_type(command, "table", reason)
+      t.assert_eq(command.compilationCommand[3], source)
+      t.assert_eq(command.compilationCommand[5], header)
+      local missing, why = helper.rebind({ directory = "D:/fixture", file = source,
+        argv = { "clang++", flag, source } }, source, header)
+      t.assert_nil(missing)
+      t.assert_eq(why, "header-command-main-file-unproven")
+    end)
+  end
+
+  for _, invalid in ipairs({ "receipt-only", "missing-header", "session-change", "descriptor-change", "cdb-change", "stale" }) do
+    t.it("header command rejects " .. invalid .. " before any configuration notification", function()
+      local root, semantic_dir, source, bufnr = fixture(function(path, cwd)
+        return { { directory = cwd, file = path, arguments = { "clang++", "-c", path } } }
+      end)
+      local header = root .. "/subject.hpp"
+      write(header, "int subject();\n")
+      vim.api.nvim_buf_set_name(bufnr, header)
+      local semantic = require("utils.ue_goto.semantic_client")
+      local previous_status = semantic.status
+      local session = { generation = 1, actual = { toolchain_identity = "fixture-toolchain" } }
+      local context = { id = "native-context", origin_tu = source, cdb_dir = root,
+        build_fingerprint = "build", subject_membership = { header },
+        compile = { directory = root, file = source, argv = { "clang++", "-c", source } } }
+      local model = require("utils.ue_goto.semantic_context")
+      local proof = { context = context, compile_digest = vim.fn.sha256(vim.json.encode(context.compile)),
+        environment = { build_fingerprint = "build", cdb_path = root .. "/compile_commands.json" },
+        is_current = function() return invalid ~= "stale" end,
+        response = { op = "query", state = "resolved", usr = "c:@F@subject#", context_id = "native-context",
+          compiler_session = vim.deepcopy(session), contexts = { { state = "resolved", usr = "c:@F@subject#",
+            context_id = "native-context", compile_command_fingerprint = model.compile_descriptor_fingerprint(root, source, context.compile.argv) } } } }
+      semantic.status = function() return { session = session } end
+      local notified, result, failure = 0, nil, nil
+      local ok, err = xpcall(function()
+        if invalid == "receipt-only" then proof = { proven = true, context = context }
+        elseif invalid == "missing-header" then context.subject_membership = {}
+        elseif invalid == "session-change" then session.generation = 2
+        elseif invalid == "descriptor-change" then
+          context.compile.argv = { "clang++", "-DUNPROVEN=1", "-c", source }
+          proof.compile_digest = vim.fn.sha256(vim.json.encode(context.compile))
+        elseif invalid == "cdb-change" then proof.environment.cdb_path = root .. "/other-compile_commands.json" end
+        commands.ensure({ id = -51, config = { cmd = { "clangd", "--compile-commands-dir=" .. semantic_dir } },
+          notify = function() notified = notified + 1; return true end }, bufnr,
+          function(value, why) result, failure = value, why end, { proven_header = proof })
+        t.assert_false(result)
+        t.assert_eq(notified, 0)
+        if invalid == "descriptor-change" then t.assert_eq(failure, "header-command-compiler-descriptor-mismatch")
+        elseif invalid == "session-change" then t.assert_eq(failure, "header-command-compiler-session-stale")
+        elseif invalid == "missing-header" then t.assert_eq(failure, "header-command-subject-unproven")
+        else t.assert_eq(failure, "header-command-provenance-invalid") end
+      end, debug.traceback)
+      semantic.status = previous_status
+      cleanup(root, bufnr)
+      if not ok then error(err) end
+    end)
+  end
+
+  t.it("CDB companion enumeration excludes generated files and retains duplicate real basenames", function()
+    local root, _, source, bufnr = fixture(function(path, cwd)
+      return { { directory = cwd, file = path, arguments = { "clang++", "-c", path } } }
+    end)
+    local duplicate = root .. "/Other/subject.cpp"
+    local generated = root .. "/Intermediate/subject.cpp"
+    write(duplicate, "int duplicate;\n")
+    write(generated, "int generated;\n")
+    write(root .. "/compile_commands.json", {
+      { directory = root, file = source }, { directory = root, file = duplicate },
+      { directory = root, file = generated }, { directory = root, file = source },
+    })
+    local done, paths, reason = false, nil, nil
+    commands.find_companion(root .. "/compile_commands.json", root .. "/subject.hpp",
+      function(value, why) done, paths, reason = true, value, why end)
+    t.assert_true(vim.wait(10000, function() return done end, 10))
+    t.assert_type(paths, "table", reason)
+    t.assert_eq(#paths, 2)
+    local canonical = {}
+    for _, path in ipairs(paths) do canonical[vim.fs.normalize(path):lower()] = true end
+    t.assert_true(canonical[vim.fs.normalize(source):lower()])
+    t.assert_true(canonical[vim.fs.normalize(duplicate):lower()])
+    t.assert_false(canonical[vim.fs.normalize(generated):lower()] == true)
     cleanup(root, bufnr)
   end)
 end)

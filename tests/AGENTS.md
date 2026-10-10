@@ -32,13 +32,26 @@ nvim --headless -l tests/run_parallel.lua   # 本地并行全量（每文件独�
 | 改动位置 | 最小必跑 filter |
 |---|---|
 | `lua/config/keymaps.lua` / 命令定义 | `keymaps` `commands` `review_editor` |
+| IDE 修改、文本恢复、会话与重启 | `ide_refactor` `ide_recovery` `ide_continuity` `ide_session` `commands` |
+| IDE 运行配置、Editor 测试与模块类生成 | `ide_workflow` `ide_run_profiles` `ide_ue_tools` `ide_hub` `platform` `commands` |
 | picker 交互 / sidebar / 插件工具链策略 | `review_editor` `smoke` |
+| 窗口关闭后的恢复 / 被动保存 quickfix | `ide_workspace` `task_registry` `keymaps` `commands` `android_ide` |
+| 开发工作台 / 构建凭据 / 任务检查 | `ide_workbench` `ide_verification_runs` `ide_task_inspection` `ide_workspace` `task_registry` `android_ide` `ue_api` `ue_platform_boundary` `keymaps` `commands` |
+| 具名调查保存与继续 / 工程元数据集合 | `ide_work_context` `ide_workspace` `ide_workbench` `search_` `multi_instance_state` `commands` `ue_platform_boundary` `structure` `stability` |
+| 文件树改名/移动/删除 / 受保护的缓冲区关闭 | `ide_file_mutations` `ide_buffer_close` `unsaved` `ide_workspace` `task_registry` `keymaps` `workarounds` `smoke` |
+| 代码片段字段 / 当前文件大纲 | `ide_editing_feedback` `daily_edit` `ue_goto_reading` `review_editor` `keymaps` `workarounds` `smoke` |
+| 诊断入口 / quickfix 导航 / 当前文件替换接线 | `ide_problem_navigation` `ide_replace_entry` `ide_flow_hub` `ide_hub` `keymaps` `commands` `review_editor` `cheatsheet` `smoke` |
+| 当前文档逐次查找 / 移动行边界 | `ide_document_find` `ide_line_move` `ide_workspace` `host_resource_discipline` `keymaps` `ide_hub` `review_editor` `cheatsheet` `smoke` |
+| 当前文档行列直达 / 编辑态复制文件位置 | `ide_document_location` `keymaps` `ide_hub` `review_editor` `cheatsheet` `smoke` |
+| 搜索状态 / 路径坐标 / 完整搜索条件 / 独立文件清单 | `search_` `file_inventory` `grep_cache` `multi_instance_state` `ue_platform_boundary` |
+| 引用 / header / 显式 Peek / 按需关系树 | `ue_goto_reading` `ue_goto_relations` `ue_goto_behavior` `cpp_semantic_context` `cpp_semantic_client` `cpp_semantic_sidecar` `utils` |
 | Git 审阅路由 / Git 插件接线 / `lua/workarounds/codediff/**` | `git_review` `review_editor` `keymaps` `cheatsheet` `workarounds` `smoke` |
 | CI bootstrap / workflow / legacy smoke | `review_ci` + 全量 + legacy smoke |
 | `lua/utils/ue_watch.lua` / `dirty_save.lua` | `ue_watch_csearch` `multi_instance_state` `stability` |
 | `lua/utils/window_title.lua` | `window_title` `keymaps` `commands` `cheatsheet` |
-| `lua/utils/android_device.lua` / Android ADB device 路由 | `android_device` `dap` `ue_context` |
+| `lua/utils/android_device.lua` / `android_package.lua` / `android_logcat.lua` / `ue_hub.lua` / Android ADB device 路由 / `dap/_android_crash.lua` | `android_device` `android_ide` `dap` `ue_context` |
 | `lua/ue/config.lua`（schema） | `ue_config` `smoke` |
+| `lua/utils/cpp_format.lua` / `unsaved.lua` / 日常编辑状态栏 | `cpp_format` `unsaved` `daily_edit` `review_editor` `keymaps` `commands` `smoke` |
 | `lua/ue.lua` 项目选择 / context 解析 / workflow dispatch | `ue_project_context` `ue_api` `smoke` `ue_platform_boundary` |
 | `lua/ue/project_state.lua` / `lua/ue/file_lock.lua` / 共享持久状态 | `multi_instance_state` |
 | `lua/ue/cdb/**` | `ue_cdb` |

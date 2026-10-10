@@ -119,18 +119,20 @@ function M.try_jump(locations, title)
   return location.populate_quickfix(title, locations) and true or false
 end
 
+function M.context_label(item)
+  local tu = tostring(item.label or vim.fn.fnamemodify(item.origin_tu or "", ":t"))
+  local definition = item.definition
+  if type(definition) == "table" and definition.path then
+    return ("%s  →  %s:%s"):format(tu, vim.fn.fnamemodify(tostring(definition.path), ":t"),
+      tostring(definition.line or "?"))
+  end
+  return tu
+end
+
 function M.choose_context(contexts, callback)
   vim.ui.select(contexts, {
     prompt = "Multiple proven contexts resolve differently",
-    format_item = function(item)
-      local tu = tostring(item.label or vim.fn.fnamemodify(item.origin_tu or "", ":t"))
-      local definition = item.definition
-      if type(definition) == "table" and definition.path then
-        return ("%s  →  %s:%s"):format(tu, vim.fn.fnamemodify(tostring(definition.path), ":t"),
-          tostring(definition.line or "?"))
-      end
-      return tu
-    end,
+    format_item = M.context_label,
   }, callback)
 end
 

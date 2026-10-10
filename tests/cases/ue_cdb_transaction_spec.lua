@@ -117,6 +117,14 @@ t.describe("prepare CDB transaction", function()
       t.assert_true(first.ok, first.message)
       t.assert_true(first.detail.changed)
       t.assert_false(read(ctx.paths.active_cdb) == raw, "real resolver must transform the raw input")
+      local committed = vim.json.decode(read(ctx.paths.active_cdb .. ".pipeline-result.json"))
+      local selected = ctx.paths.cdb_shards_dir .. "/Win64-Fixture-Development.json"
+      t.assert_eq(committed.provenance.active_key, "Win64-Fixture-Development")
+      t.assert_eq(committed.provenance.merged_cdb_sha256, vim.fn.sha256(read(ctx.paths.active_cdb)))
+      t.assert_eq(committed.provenance.active_cdb_sha256, vim.fn.sha256(read(selected)))
+      local fresh, reason = require("utils.ue_goto.semantic_sidecar_libclang").active_cdb_is_fresh(
+        ctx.paths.active_cdb, selected, ctx.paths.cdb_shards_dir .. "/manifest.json")
+      t.assert_true(fresh, reason)
       local receipt = vim.json.decode(read(ctx.paths.active_cdb .. ".unity-receipt.json"))
       t.assert_eq(#receipt.groups, 1, "stage path must retain original Unity compiler evidence")
       t.assert_eq(receipt.groups[1].members[1], ctx.engine_root .. "/A.cpp")
@@ -197,6 +205,25 @@ t.describe("prepare CDB transaction", function()
         t.assert_true(vim.deep_equal(snapshot(ctx.paths.active_cdb .. ".unity-receipt.json"), receipt))
         t.assert_eq(restarts(), 1)
       end
+    end)
+  end)
+
+  t.it("binds freshness to retained live bytes when equivalent staged JSON has different formatting", function()
+    fixture(function(ctx, run)
+      t.assert_true(run(1).ok)
+      local before = snapshot(ctx.paths.active_cdb)
+      local repeated = run(1, { partition = function(working, _, done)
+        write(working.paths.active_cdb, "\n" .. read(working.paths.active_cdb))
+        done(true)
+      end })
+      t.assert_true(repeated.ok, repeated.message)
+      t.assert_false(repeated.detail.changed)
+      t.assert_true(vim.deep_equal(snapshot(ctx.paths.active_cdb), before))
+      local proof = vim.json.decode(read(ctx.paths.active_cdb .. ".pipeline-result.json")).provenance
+      t.assert_eq(proof.merged_cdb_sha256, vim.fn.sha256(before.bytes))
+      t.assert_true(require("utils.ue_goto.semantic_sidecar_libclang").active_cdb_is_fresh(
+        ctx.paths.active_cdb, ctx.paths.cdb_shards_dir .. "/Win64-Fixture-Development.json",
+        ctx.paths.cdb_shards_dir .. "/manifest.json"))
     end)
   end)
 

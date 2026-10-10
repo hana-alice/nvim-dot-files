@@ -496,6 +496,7 @@ t.describe("ue.workflows android owners", function()
           live.serial = "SERIAL-B"
           live.package_name = "com.example.changed"
           opened = table.concat(cmd, " ")
+          return 1
         end,
         workspace_root = function()
           return "/Project"
@@ -517,7 +518,7 @@ t.describe("ue.workflows android owners", function()
 
   t.it("android deploy owner fails before debugger cleanup or device mutation when planning fails", function()
     local deploy = require("ue.workflows.android.deploy")
-    local side_effects = 0
+    local side_effects, exit_code = 0, nil
     local result, err = deploy.run({
       target_id = "Android",
       operation = "so_deploy",
@@ -554,12 +555,34 @@ t.describe("ue.workflows android owners", function()
           side_effects = side_effects + 1
         end,
         notify_error = function() end,
+        on_exit = function(code) exit_code = code end,
       },
     })
 
     t.assert_nil(result)
     t.assert_contains(err, "source SO missing")
     t.assert_eq(side_effects, 0)
+    -- A chained caller (UEAndroidIterate) must not wait forever.
+    t.assert_eq(exit_code, -1)
+  end)
+
+  t.it("android deploy owner reports a cancelled device selection to a chained caller", function()
+    local deploy = require("ue.workflows.android.deploy")
+    local exit_code
+    local _, err = deploy.run({
+      host_driver = { id = "windows" },
+      context = {
+        resolve_context = function() return { engine_root = "/UE", project_root = "/Project" } end,
+        android_device = {
+          get = function() return nil end,
+          ensure = function(_, cb) cb(nil) end,
+        },
+        reinvoke = function() error("must not reinvoke after a cancelled selection") end,
+        on_exit = function(code) exit_code = code end,
+      },
+    })
+    t.assert_eq(err, "device-selection-pending")
+    t.assert_eq(exit_code, -1)
   end)
 
   t.it("android launch owner keeps callbacks pinned to the captured serial and package", function()

@@ -5,9 +5,17 @@
 local t = require("tests.harness")
 local cfg = t.bootstrap()
 
--- 87 个 UE* 命令冻结清单（来自 lua/ue.lua + lua/ue/*.lua）。
+-- UE* 命令冻结清单（来自 façade 与各模块的 setup_commands）。
 local UE_COMMANDS = {
-  "UEBuild", "UEBuildDistributed", "UEBuildDistributedPlan", "UEBuildAndroid", "UEBuildAndroidSO", "UEBuildCsearch", "UEBuildIOS", "UEBuildPCH", "UECachePaths", "UECDBPartition",
+  "UEFormat",
+  "UEQuit", "UEUnsaved", "UERecovery", "UESessionRestore",
+  "UERename", "UECodeActions", "UERefactorUndo", "UERefactorRecovery",
+  "UERunProfile", "UERunProfileSave", "UERunProfileDelete", "UEAndroidIterateStop",
+  "UENewClass", "UETests",
+  "UEBuildFirstError",
+  "UEPanel", "UEPanelNext",
+  "UEWorkContext", "UEWorkbench", "UEWorkspace", "UEPeek", "UEReadCancel", "UEReadReturn", "UERelations",
+  "UEAndroidCrash", "UEAndroidIterate", "UEBuild", "UEBuildDistributed", "UEBuildDistributedPlan", "UEBuildAndroid", "UEBuildAndroidSO", "UEBuildCsearch", "UEBuildIOS", "UEBuildPCH", "UECachePaths", "UECDBPartition",
   "UECDBStatus", "UECDBSwitch", "UECheatsheet", "UECheatsheetEdit", "UEClearCache",
   "UECompileForNvim",
   "UEDAPAttach", "UEDAPClearBreakpoints", "UEDAPCondBreakpoint", "UEDAPContinue",
@@ -16,20 +24,20 @@ local UE_COMMANDS = {
   "UEDAPPause", "UEDAPPreflight", "UEDAPPrevTab", "UEDAPReattach", "UEDAPREPL", "UEDAPRestartFrame",
   "UEDAPRunToCursor", "UEDAPStatus", "UEDAPStepIn", "UEDAPStepOut", "UEDAPStepOver",
   "UEDAPSmoke", "UEDAPStop", "UEDAPTab", "UEDAPToggleBreakpoint", "UEDAPToggleUI", "UEDAPWatchAdd",
-  "UEDAPWatchUE", "UEDebugLogToggle", "UEDirtyClear", "UEDirtyStatus",
+  "UEDAPWatchUE", "UEDebugLogToggle", "UEDirtyClear", "UEDirtyStatus", "UEDoctor", "UEGuide",
   "UEDeployAndroidSO", "UEExportCompileCommands", "UEGenerateFromRSP", "UEGrepDiagDump",
-  "UEGrepGroupingToggle", "UEGrepTraceShow", "UEGrepTraceToggle", "UEIndexFull",
+  "UEGrepGroupingToggle", "UEGrepTraceShow", "UEGrepTraceToggle", "UEHub", "UEIndexFull",
   "UEIndexHot", "UEIndexNow", "UEIndexStatus", "UEIndexTimings", "UEInstall", "UEInstallAndroid", "UEInstallIOS",
   "UEIOSSetup", "UEIOSSymbols", "UELaunch", "UELogToggle", "UEPackageIOS", "UEPaths", "UEPrepare", "UEPrepareIncremental",
-  "UEPrepareReindex", "UEPrepareSync", "UEReloadScanPaths", "UEResetLayout", "UESetAndroidDevice",
-  "UESetAndroidPackage", "UESetIOSDevice", "UESetIOSSigningCertificate", "UESetPlatform", "UESetProject", "UESetUprojectRelativePath", "UEWatchFlush",
+  "UEPrepareReindex", "UEPrepareSync", "UEReloadScanPaths", "UEResetLayout", "UESearchHistory", "UESetAndroidDevice",
+  "UESetAndroidPackage", "UESetIOSDevice", "UESetIOSSigningCertificate", "UESetPlatform", "UESetProject", "UESetUprojectRelativePath", "UETarget", "UEWatchFlush",
   "UEWatchStatus", "UEWatchStop",
 }
 
 t.describe("commands: UE* 全量注册", function()
   require("ue").setup()
-  t.it("冻结清单含 87 个命令", function()
-    t.assert_eq(#UE_COMMANDS, 87)
+  t.it("冻结清单含 119 个命令", function()
+    t.assert_eq(#UE_COMMANDS, 119)
   end)
   for _, c in ipairs(UE_COMMANDS) do
     t.it(":" .. c .. " 已注册", function()

@@ -32,6 +32,22 @@ go install ./...
 # binary lands in $GOBIN (default %USERPROFILE%\go\bin)
 ```
 
+## Incremental merge semantics
+
+Without `-reset` the tool merges into the existing index. codesearch's `Merge`
+gives every staged root `P` ownership of all old names in
+`[P, P-with-last-byte-incremented)`, which has two consequences the tool handles:
+
+- `-delete-from FILE` lists files that are gone; staging them with no content
+  removes them from the merged index, so deletions need no full rebuild.
+- A root such as `Foo.h` also shadows an untouched `Foo.hpp`. Those siblings are
+  detected from the master index and re-indexed from disk, instead of being
+  silently dropped by the merge.
+
+Verified on a real 182k-file Unreal Engine list: 300 deletions plus 237 touched
+files merged in ~2.4s, byte-equivalent (names and every trigram posting list) to
+a full reset of the remaining set, which took ~87s.
+
 ## Use
 
 ```pwsh

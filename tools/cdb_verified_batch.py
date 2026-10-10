@@ -5,6 +5,7 @@ Callers must invalidate a published receipt when its live dependencies change.
 """
 import collections
 import argparse
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
@@ -29,12 +30,16 @@ from clangd_batch_runner import normalize_server_profile, run
 from clangd_index_graph import _record_key, canonical_file_graph, read_shard
 
 _COLLECTOR_FILES = ('cdb_verified_batch.py', 'build_hot_super_unity_cdb.py', 'clangd_index_graph.py',
-                    'clangd_batch_runner.py', 'clangd_vfs_aliases.py', 'clangd_query_profile.py')
+                    'clangd_batch_runner.py', 'clangd_vfs_aliases.py', 'clangd_query_profile.py',
+                    'clangd_receipt_migration.py')
 _POLICY_FILES = ('clangd_batch_admission.py', 'clangd_batch_bindings.py',
                  '../lua/workarounds/clangd/header_path_case.py')
 _HEADER_CASE_PATH = Path(__file__).resolve().parent / _POLICY_FILES[-1]
 _HEADER_CASE_POLICY = None
 _OWNED_OVERLAY_MEMO = {}
+_RUN_METRIC_FIELDS = ('indexing_wall_seconds', 'process_wall_seconds', 'graph_decode_seconds',
+                      'spawn_seconds', 'shutdown_seconds', 'cpu_seconds', 'peak_working_set_bytes')
+_QUERY_RESOLUTION_MEMO = {}
 _INCLUDE_ENV = ('CPATH', 'CPLUS_INCLUDE_PATH', 'C_INCLUDE_PATH', 'OBJC_INCLUDE_PATH',
                 'OBJCPLUS_INCLUDE_PATH', 'INCLUDE')
 # These values are inherited by every private compiler process. Cache/TEMP
@@ -46,8 +51,12 @@ _COMPILER_ENV = _INCLUDE_ENV + ('SDKROOT', 'MACOSX_DEPLOYMENT_TARGET', 'IPHONEOS
     'CL', '_CL_', 'CCC_OVERRIDE_OPTIONS', 'SOURCE_DATE_EPOCH', 'TZ')
 
 
-def _compiler_environment():
-    return {name: os.environ.get(name) for name in _COMPILER_ENV}
+def _compiler_environment(server_profile=None):
+    # Without a native query profile there is no driver-resolution proof, so
+    # preserve the conservative PATH boundary for that older proof route.
+    folded = {name.upper(): value for name, value in os.environ.items()} if os.name == 'nt' else os.environ
+    return {name: folded.get(name.upper() if os.name == 'nt' else name) for name in _COMPILER_ENV
+            if server_profile is None or name not in ('PATH', 'PATHEXT')}
 
 
 def _code_identities():
@@ -64,6 +73,22 @@ def _json(value):
 
 def _sha(data):
     return hashlib.sha256(data).hexdigest()
+
+
+@contextmanager
+def _phase(timings, name):
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        row = timings.setdefault(name, {'seconds': 0.0, 'calls': 0})
+        row['seconds'] += time.monotonic() - started
+        row['calls'] += 1
+
+
+def _timed(phase_rows, name, operation, *args, **kwargs):
+    with _phase(phase_rows, name):
+        return operation(*args, **kwargs)
 
 
 def _write(path, data):
@@ -328,7 +353,7 @@ def _observe_queries(entries, clangd, profile, directory, observations, timeout)
         if result.get('ok') is not True:
             raise ValueError('query-observation-failed: ' + result.get('reason', 'unknown'))
         observation = result['evidence']
-        if observation['profile'] != profile or observation['compiler_environment'] != _compiler_environment():
+        if observation['profile'] != profile or observation['compiler_environment'] != _compiler_environment(profile):
             raise ValueError('query-observation-profile-mismatch')
         observations.append(observation)
         known.add(key)
@@ -392,10 +417,41 @@ def _source_identity(path, info=None):
     return ['inode', str(info.st_dev), str(info.st_ino)]
 
 
-def _cache_valid(record, output, memo):
+def _query_resolution_current(observations, executable, profile, memo=None, *, force=False):
+    """Re-observe changed lookup state; never infer a driver from PATH text."""
+    if profile is None:
+        return not observations
+    if not observations:
+        return False
+    from clangd_query_profile import lookup_environment, semantic_identity, validate
+    current = lookup_environment()
+    for observation in observations:
+        if not force and observation.get('lookup_environment') == current:
+            continue
+        key = ('query-resolution', _json(semantic_identity(observation)), _json(current))
+        if not force and memo is not None and key in memo:
+            if not memo[key]:
+                return False
+            continue
+        with tempfile.TemporaryDirectory(prefix='nvim-ue-batch-lookup-validation-') as scratch:
+            result = validate(observation, observation['entry'], str(executable), profile['query_driver'],
+                Path(scratch), launch_cwd=profile['launch_cwd'], environment=dict(os.environ))
+        valid = result.get('ok') is True and lookup_environment() == current
+        if memo is not None:
+            memo[key] = valid
+        if not valid:
+            return False
+    return True
+
+
+def _cache_valid(record, output, memo, *, validate_resolution=True):
     if not isinstance(record, dict) or record.get('schema') != 1:
         return False
-    if not isinstance(record.get('identities'), dict) or record['identities'].get('compiler_environment') != _compiler_environment():
+    identities = record.get('identities')
+    if not isinstance(identities, dict) or identities.get('compiler_environment') != _compiler_environment(identities.get('server_profile')):
+        return False
+    if validate_resolution and not _query_resolution_current(record.get('query_profiles', []), identities['tool_path'],
+                                                            identities.get('server_profile'), _QUERY_RESOLUTION_MEMO):
         return False
     originals = record.get('original_entries', record.get('effective_entries',
         [record['entry']] if 'entry' in record else []))
@@ -417,7 +473,7 @@ def _identities(executable, tool_hash=None, imported=False, server_profile=None)
     library = _libclang(executable)
     return {'tool_path': str(executable.resolve()), 'tool': tool_hash or _sha(executable.read_bytes()),
         **(_IMPORTED_CODE if imported else _code_identities()),
-        'compiler_environment': _compiler_environment(),
+        'compiler_environment': _compiler_environment(server_profile),
         'server_profile': normalize_server_profile(server_profile),
         'binding_path': str(library.resolve()) if library else None,
         'binding': _sha(library.read_bytes()) if library else None}
@@ -447,6 +503,14 @@ def describe_receipts(receipt_paths, server_profile=None):
         driver_files = {path for item in queries for path in
             [item['driver']['path'], item['driver']['realpath']] + item.get('driver_candidates', [])}
         driver_roots = {path for item in queries for path in item.get('driver_search_roots', [])}
+        if profile is not None:
+            from clangd_query_profile import _driver_candidates, lookup_environment
+            folded = {name.upper(): value for name, value in os.environ.items()}
+            for item in queries:
+                current_roots, current_files = _driver_candidates(item['tuple'], Path(item['clangd']['path']),
+                    Path(profile['launch_cwd']), folded)
+                driver_roots.update(current_roots)
+                driver_files.update(current_files)
         environment = records[0]['identities']['compiler_environment']
         if any(record['identities']['compiler_environment'] != environment for record in records):
             raise ValueError('receipt-compiler-environments-disagree')
@@ -460,6 +524,7 @@ def describe_receipts(receipt_paths, server_profile=None):
         minimal = _minimal_roots(roots)
         return {'ok': True, 'watch_roots': sorted(map(str, minimal)),
                 'compiler_environment': environment,
+                'compiler_lookup_environment': lookup_environment() if profile else {},
                 'server_profile': profile,
                 'query_driver_files': sorted(driver_files), 'query_driver_search_roots': sorted(driver_roots),
                 'query_search_roots': _query_roots(queries), 'query_profiles': queries,
@@ -472,6 +537,7 @@ def validate_receipts(receipt_paths, clangd_path, server_profile=None):
     """Verify live dependencies, immutable assets, inventories and tool policy."""
     started = time.monotonic()
     _OWNED_OVERLAY_MEMO.clear()
+    _QUERY_RESOLUTION_MEMO.clear()
     result = describe_receipts(receipt_paths, server_profile)
     try:
         if not result['ok']:
@@ -486,7 +552,9 @@ def validate_receipts(receipt_paths, clangd_path, server_profile=None):
                 raise ValueError('receipt-tool-or-policy-changed')
             output = Path(record['output_dir']).resolve()
             memo = memos.setdefault(str(output), {})
-            if not _cache_valid(dict(record, schema=1), output, memo):
+            # Every query is rediscovered immediately below; do not repeat it
+            # here merely because a semantically irrelevant PATH was changed.
+            if not _cache_valid(dict(record, schema=1), output, memo, validate_resolution=False):
                 raise ValueError('receipt-input-or-asset-changed')
             for observation in record.get('query_profiles', []):
                 key = _json({name: observation[name] for name in
@@ -495,9 +563,11 @@ def validate_receipts(receipt_paths, clangd_path, server_profile=None):
                     continue
                 from clangd_query_profile import validate
                 profile = identities['server_profile']
-                directory = Path(tempfile.mkdtemp(prefix='query-validation-', dir=output))
-                query = validate(observation, observation['entry'], str(executable), profile['query_driver'], directory,
-                    launch_cwd=profile['launch_cwd'], environment=dict(os.environ))
+                # The proof store and immutable asset ancestors are watched.
+                # Query scratch must not change them while validation runs.
+                with tempfile.TemporaryDirectory(prefix='nvim-ue-batch-query-validation-') as scratch:
+                    query = validate(observation, observation['entry'], str(executable), profile['query_driver'], Path(scratch),
+                        launch_cwd=profile['launch_cwd'], environment=dict(os.environ))
                 if query.get('ok') is not True:
                     raise ValueError('receipt-query-profile-invalid: ' + query.get('reason', 'unknown'))
                 checked_queries.add(key)
@@ -509,7 +579,7 @@ def validate_receipts(receipt_paths, clangd_path, server_profile=None):
     return result
 
 
-def _index(entries, directory, clangd, timeout, server_profile=None, record_pool=None):
+def _index(entries, directory, clangd, timeout, server_profile=None, record_pool=None, run_metrics=None):
     directory.mkdir(parents=True, exist_ok=True)
     trigger = directory / 'trigger.cpp'
     _write(trigger, '// Private BackgroundIndex trigger.\n')
@@ -518,8 +588,14 @@ def _index(entries, directory, clangd, timeout, server_profile=None, record_pool
                      'arguments': ['clang++', '-x', 'c++', '-c', str(trigger)]})
     _write(directory / 'compile_commands.json', _json(commands))
     result = run(directory, directory / 'run', trigger, clangd, timeout=timeout, jobs=1, server_profile=server_profile)
+    if run_metrics is not None:
+        run_metrics.append(result)
     effective = {}
-    graph = _graph_result(result, trigger, effective, record_pool)
+    started = time.monotonic()
+    try:
+        graph = _graph_result(result, trigger, effective, record_pool)
+    finally:
+        result['graph_decode_seconds'] = time.monotonic() - started
     return graph, result, [_effective_entry(entry, effective) for entry in entries]
 
 
@@ -556,8 +632,23 @@ def _graph_result(result, trigger, effective=None, record_pool=None):
     if not result.get('background_compile_success') or result.get('missing_main_shards'):
         category = 'compiler-errors: ' if result.get('indexing_complete') and result.get('compile_failure_count', 0) else ''
         raise ValueError('private-index-failed: ' + category + str(trigger.parent / 'run/run.json'))
+    shard_cache = record_pool.setdefault('header_shards', {'bytes': 0, 'records': {}}) if record_pool is not None else None
     def shards():
         for path in result['shards']:
+            # A cache is local to this original-TU collection, not a production
+            # shard import. Exact RIFF bytes preserve every semantic field and
+            # dependency edge; a hash collision alone never authorizes reuse.
+            raw = Path(path).read_bytes() if shard_cache is not None and Path(path).is_file() else None
+            digest = _sha(raw) if raw is not None else None
+            if digest is not None:
+                for prior, graph in shard_cache['records'].get(digest, []):
+                    if raw == prior and trigger.as_uri() not in graph:
+                        yield None, graph
+                        break
+                else:
+                    graph = None
+                if graph is not None:
+                    continue
             shard = read_shard(path)
             if effective is not None and shard.get('command'):
                 own = [(uri, node) for uri, node in shard['sources'].items()
@@ -568,18 +659,28 @@ def _graph_result(result, trigger, effective=None, record_pool=None):
                 if key in effective and effective[key] != shard['command']:
                     raise ValueError('conflicting-main-shard-commands')
                 effective[key] = shard['command']
-            yield shard
+            yield shard, raw
     if record_pool is None:
-        graph = canonical_file_graph(shards(), ignore_files={trigger.as_uri()})
+        graph = canonical_file_graph((shard for shard, _ in shards()), ignore_files={trigger.as_uri()})
     else:
         graph = {}
         # Release duplicate file records while reading each independent TU,
         # rather than retaining a second complete decoded TU until _index ends.
-        for shard in shards():
-            for uri, record in canonical_file_graph([shard], ignore_files={trigger.as_uri()}).items():
+        for shard, raw in shards():
+            if shard is None:
+                collected = raw
+            else:
+                collected = canonical_file_graph([shard], ignore_files={trigger.as_uri()})
+                if (raw is not None and len(collected) == 1 and not shard.get('command')
+                        and not any(record['source']['flags'] & 1 for record in collected.values())
+                        and shard_cache['bytes'] + len(raw) <= 64 * 1024 * 1024):
+                    shard_cache['records'].setdefault(_sha(raw), []).append((raw, collected))
+                    shard_cache['bytes'] += len(raw)
+            for uri, record in collected.items():
                 if uri in graph and graph[uri] != record:
                     raise ValueError('conflicting clangd file shards for ' + uri)
-                graph[uri] = _intern_file_record(uri, record, record_pool)
+                graph[uri] = record if shard is None else _intern_file_record(uri, record, record_pool)
+                collected[uri] = graph[uri]
         graph = dict(sorted(graph.items()))
     own = set(graph)
     for uri, record in graph.items():
@@ -590,7 +691,8 @@ def _graph_result(result, trigger, effective=None, record_pool=None):
     return graph
 
 
-def _freeze(group, originals, assets, tool_hash, server_profile=None):
+def _freeze(group, originals, assets, tool_hash, server_profile=None, timings=None):
+    timings = timings if timings is not None else {}
     canonical_names = {os.path.normcase(os.path.normpath(path))
                        for entry in group for overlay in _owned_overlays(entry)
                        for path in overlay['mapping']}
@@ -598,19 +700,20 @@ def _freeze(group, originals, assets, tool_hash, server_profile=None):
     files = []
     for uri in dependencies:
         path = _uri_path(uri)
-        with path.open('rb') as stream:
-            physical = os.fstat(stream.fileno())
-            raw = stream.read()
-        file_identity = _source_identity(path, physical)
-        digest = _sha(raw)
+        with _phase(timings, 'freeze_read_hash'):
+            with path.open('rb') as stream:
+                physical = os.fstat(stream.fileno())
+                raw = stream.read()
+            file_identity = _source_identity(path, physical)
+            digest = _sha(raw)
         # Equal bytes do not imply equal #pragma-once file identity. Preserve
         # aliases recognized by Clang even when their suffixes differ.
         copy = assets / 'snapshots' / (_sha(_json([digest, file_identity]).encode()) + '.snapshot')
-        _write(copy, raw)
+        _timed(timings, 'snapshot_write', _write, copy, raw)
         files.append({'uri': uri, 'path': str(path), 'sha256': digest, 'snapshot': str(copy),
                       'file_identity': file_identity})
     identity = _sha(_json({'entries': [_native(entry) for entry in group],
-                          'files': files, 'tool': tool_hash, 'compiler_environment': _compiler_environment(),
+                          'files': files, 'tool': tool_hash, 'compiler_environment': _compiler_environment(server_profile),
                           'server_profile': server_profile}).encode())
     wrapper = assets / ('SuperUnity.Batch.' + identity[:24] + '.cpp')
     body = '// Verified same-context UBT batch.\n' + ''.join(
@@ -834,19 +937,15 @@ def _candidate_index(effective_group, candidate, root, assets, clangd, timeout, 
                     or _command_key(observed['builtin_path']) != _command_key(original['builtin_path'])):
                 raise ValueError('candidate-query-results-differ-from-original')
     try:
-        graph, result, effective = _index([candidate], root, clangd, timeout, server_profile)
-        runs.append(result)
+        graph, result, effective = _index([candidate], root, clangd, timeout, server_profile, run_metrics=runs)
     except ValueError as error:
-        report = root / 'run/run.json'
-        if report.is_file():
-            runs.append(json.loads(report.read_text(encoding='utf-8')))
         if os.name != 'nt' or not str(error).startswith('private-index-failed: compiler-errors:'):
             raise
         alias_started = time.monotonic()
         candidate = _alias_overlay(effective_group, candidate, root, assets, clangd, timeout)
         evidence['alias_probe_seconds'] = round(time.monotonic() - alias_started, 6)
-        graph, result, effective = _index([candidate], root.with_name(root.name + '-aliases'), clangd, timeout, server_profile)
-        runs.append(result)
+        graph, result, effective = _index([candidate], root.with_name(root.name + '-aliases'), clangd,
+            timeout, server_profile, run_metrics=runs)
     _verify_effective_query(candidate, effective[0], observations)
     evidence.update(assets=_candidate_assets(candidate) + _owned_overlay_assets(effective_group),
                     replay_candidate=candidate, effective_candidate=effective[0])
@@ -916,8 +1015,9 @@ def _original_query_identity(observations):
     # Query tuples can be shared by different sources; the current original
     # command and its source bytes are bound separately below. Native query
     # output, lookup candidates, driver bytes and ordered includes still match.
-    return [{key: value for key, value in item.items()
-             if key not in ('entry', 'entry_sha256', 'source_sha256', 'clangd_run')}
+    from clangd_query_profile import semantic_identity
+    return [{key: value for key, value in semantic_identity(item).items()
+             if key not in ('entry', 'entry_sha256', 'source_sha256')}
             for item in observations]
 
 
@@ -1038,6 +1138,7 @@ def _save_originals(group, originals, effective_group, pending, files, frozen_gr
 
 def _prove(group, root, assets, clangd, tool_hash, timeout, evidence, reused=None, server_profile=None,
            original_identities=None, inventory_memo=None):
+    timings = evidence.setdefault('phase_timings', {})
     original_overlay_assets = _owned_overlay_assets(group)
     for entry in group:
         _validate_ubt(entry)
@@ -1045,6 +1146,7 @@ def _prove(group, root, assets, clangd, tool_hash, timeout, evidence, reused=Non
     if len(set(members)) != len(members):
         raise ValueError('overlapping-original-members')
     originals, runs, effective_group, pending_originals = [], [], [], {}
+    evidence['run_metrics'] = runs
     record_pool = {}
     output = assets.parent.resolve()
     memo = inventory_memo if inventory_memo is not None else {}
@@ -1083,16 +1185,17 @@ def _prove(group, root, assets, clangd, tool_hash, timeout, evidence, reused=Non
     else:
         for index, entry in enumerate(group):
             queries = _original_queries(entry, evidence['query_profiles'])
-            cached = _cached_original(entry, identities, output, memo, queries, record_pool)
+            cached = _timed(timings, 'original_cache_validate', _cached_original,
+                            entry, identities, output, memo, queries, record_pool)
             if cached:
                 graph, effective_entry = cached
                 effective = [effective_entry]
                 evidence['original_cache_hits'] += 1
             else:
                 evidence['original_cache_misses'] += 1
-                graph, result, effective = _index([entry], root / ('original-' + str(index)), clangd, timeout,
-                                                  server_profile, record_pool=record_pool)
-                runs.append(result)
+                graph, result, effective = _timed(timings, 'original_index', _index,
+                    [entry], root / ('original-' + str(index)), clangd, timeout,
+                    server_profile, record_pool=record_pool, run_metrics=runs)
                 pending_originals[index] = {
                     'main_shard': _original_main_shard(entry, effective[0], result['shards']),
                     'first_index_metrics': {key: result.get(key) for key in (
@@ -1103,14 +1206,18 @@ def _prove(group, root, assets, clangd, tool_hash, timeout, evidence, reused=Non
             effective_group.extend(effective)
         record_pool.clear()
         evidence['effective_entries'] = effective_group
-        candidate, files, identity = _freeze(group, originals, assets, tool_hash, server_profile)
+        candidate, files, identity = _timed(timings, 'freeze', _freeze,
+            group, originals, assets, tool_hash, server_profile, timings=timings)
         evidence.update(dependencies=files, identity=identity, replay_candidate=candidate)
         evidence['assets'] = _candidate_assets(candidate) + original_overlay_assets
-        candidate, graph = _candidate_index(effective_group, candidate, root / 'candidate', assets, clangd, timeout, runs, evidence, server_profile)
-        _save_originals(group, originals, effective_group, pending_originals, files, graph,
+        candidate, graph = _timed(timings, 'candidate_index', _candidate_index,
+            effective_group, candidate, root / 'candidate', assets, clangd, timeout, runs, evidence, server_profile)
+        _timed(timings, 'original_cache_save', _save_originals,
+                        group, originals, effective_group, pending_originals, files, graph,
                         identities, output, memo, evidence['query_profiles'])
         evidence['original_cache_unlinked'] = len(pending_originals)
-    verdict = _admit(group, candidate, originals, graph, root, clangd, timeout,
+    verdict = _timed(timings, 'graph_compare_and_bindings', _admit,
+                     group, candidate, originals, graph, root, clangd, timeout,
                      effective_group, evidence['effective_candidate'])
     if verdict['reason'] == 'symbol-identities-changed' and verdict.get('missing') and not reused:
         missing = set(verdict['missing'])
@@ -1119,25 +1226,31 @@ def _prove(group, root, assets, clangd, tool_hash, timeout, evidence, reused=Non
         owner = max(range(len(group)), key=lambda index: scores[index])
         if owner and scores[owner]:
             order = [owner] + [index for index in range(len(group)) if index != owner]
-            candidate, files, identity = _freeze([group[index] for index in order], originals, assets, tool_hash, server_profile)
+            candidate, files, identity = _timed(timings, 'freeze', _freeze,
+                [group[index] for index in order], originals, assets, tool_hash, server_profile, timings=timings)
             evidence.update(dependencies=files, identity=identity, replay_candidate=candidate, candidate_order=order)
             evidence['assets'] = _candidate_assets(candidate) + original_overlay_assets
-            candidate, graph = _candidate_index(effective_group, candidate, root / 'candidate-reordered', assets, clangd, timeout, runs, evidence, server_profile)
-            _save_originals(group, originals, effective_group, pending_originals, files, graph,
+            candidate, graph = _timed(timings, 'candidate_index', _candidate_index,
+                effective_group, candidate, root / 'candidate-reordered', assets, clangd, timeout, runs, evidence, server_profile)
+            _timed(timings, 'original_cache_save', _save_originals,
+                            group, originals, effective_group, pending_originals, files, graph,
                             identities, output, memo, evidence['query_profiles'])
             evidence['original_cache_unlinked'] = len(pending_originals)
-            verdict = _admit(group, candidate, originals, graph, root, clangd, timeout,
+            verdict = _timed(timings, 'graph_compare_and_bindings', _admit,
+                             group, candidate, originals, graph, root, clangd, timeout,
                              effective_group, evidence['effective_candidate'])
     evidence['assets'].extend(verdict.get('template_argument_proof_assets', []))
     if not reused:
         evidence['graph_files'] = []
         for index, value in enumerate(originals + [graph]):
-            path, raw = root / ('graph-' + str(index) + '.json'), _json(value)
-            _write(path, raw)
-            evidence['graph_files'].append({'path': str(path), 'sha256': _sha(raw.encode())})
+            with _phase(timings, 'graph_serialize'):
+                path, raw = root / ('graph-' + str(index) + '.json'), _json(value)
+                _write(path, raw)
+                evidence['graph_files'].append({'path': str(path), 'sha256': _sha(raw.encode())})
     if not verdict.get('accepted'):
         raise ValueError('admission-rejected: ' + verdict['reason'])
-    if any(_sha(Path(item['path']).read_bytes()) != item['sha256'] for item in files):
+    if _timed(timings, 'dependencies_revalidate', lambda:
+            any(_sha(Path(item['path']).read_bytes()) != item['sha256'] for item in files)):
         raise ValueError('dependencies-changed-during-proof')
     if any(_sha(Path(item['path']).read_bytes()) != item['sha256'] for item in original_overlay_assets):
         raise ValueError('owned-overlay-changed-during-proof')
@@ -1152,8 +1265,8 @@ def _prove(group, root, assets, clangd, tool_hash, timeout, evidence, reused=Non
         'effective_candidate': _native(evidence['effective_candidate']),
         'original_entries': [_native(entry) for entry in group], 'candidate': _native(candidate),
         'dependencies': files, 'admission_reason': verdict['reason'],
-        'original_graph_sha256': [_sha(_json(original).encode()) for original in originals],
-        'candidate_graph_sha256': _sha(_json(graph).encode()),
+        'original_graph_sha256': [item['sha256'] for item in evidence['graph_files'][:-1]],
+        'candidate_graph_sha256': evidence['graph_files'][-1]['sha256'],
         'proven_added_references': verdict.get('added_refs', []),
         'proven_template_arguments': verdict.get('proven_template_arguments', []),
         'template_argument_proof_assets': verdict.get('template_argument_proof_assets', [])}))
@@ -1165,7 +1278,7 @@ def _prove(group, root, assets, clangd, tool_hash, timeout, evidence, reused=Non
         'original_cache_unlinked': len(pending_originals),
         'candidate_order': evidence.get('candidate_order', list(range(len(group)))),
         'alias_probe_seconds': evidence.get('alias_probe_seconds', 0), 'run_metrics': [
-        {key: run.get(key) for key in ('indexing_wall_seconds', 'cpu_seconds', 'peak_working_set_bytes')}
+        {key: run.get(key) for key in _RUN_METRIC_FIELDS}
         for run in runs]}
 
 
@@ -1238,7 +1351,7 @@ def _cached_group_matches(record, group, output):
 
 
 def _batch_groups(entries, groups, output, identities, profile, max_group, claimed, memo, metrics,
-                  max_sources=80, verify_missing=False):
+                  max_sources=80, verify_missing=False, prioritize_small=False):
     hints, metrics['group_hints_status'] = _read_group_hints(output)
     lookup = collections.defaultdict(list)
     for indexes in groups.values():
@@ -1275,9 +1388,15 @@ def _batch_groups(entries, groups, output, identities, profile, max_group, claim
     # Accepted hints may cover only part of an otherwise larger chunk. Repack
     # the unclaimed originals so a cached pair cannot suppress their candidacy.
     available = [index for index in range(len(entries)) if index not in claimed]
-    pending = [[available[index] for index in chunk] for chunk in reversed(
+    chunks = [[available[index] for index in chunk] for chunk in
         secondary_unity_chunks([entries[index] for index in available],
-            max_sources=max_sources, max_unities=max_group))]
+            max_sources=max_sources, max_unities=max_group)]
+    if prioritize_small:
+        # A first bounded prepare should prove a small same-context group, not
+        # retain the largest module's independent graphs for the whole budget.
+        chunks.sort(key=lambda chunk: (sum(len(entries[i]['nvim_ue_members']) for i in chunk),
+                                       len(chunk), chunk[0]))
+    pending = list(reversed(chunks))
     while pending:
         chunk = pending.pop()
         if claimed.intersection(chunk):
@@ -1308,7 +1427,7 @@ def _save_group_hints(output, additions):
 
 
 def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify_missing=True, server_profile=None,
-               max_sources=80):
+               max_sources=80, max_new_groups=None):
     """Return (background_entries, metrics); rejected groups keep exact originals.
 
     output_dir must be a private proof/artifact directory, never a live clangd
@@ -1318,16 +1437,29 @@ def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify
     graph replay; only receipts with the complete current identity are reused.
     Compact accepted hints discover noncontiguous groups; max_group remains a
     hard limit and every discovered group goes through the full cache gate.
+    A bounded prepare qualifies at most max_new_groups cache misses and stops
+    qualifying once it accepts a new batch in this invocation. Cached batches
+    do not consume that stage; later prepares can qualify the next group.
+    Fully cached prepares validate without changing their publication.
     """
+    if max_new_groups is not None and (type(max_new_groups) is not int or max_new_groups < 0):
+        raise ValueError('batch-proof-limit-must-be-nonnegative')
+    if max_new_groups is not None and not verify_missing:
+        raise ValueError('batch-proof-limit-requires-qualification')
     started = time.monotonic()
     _OWNED_OVERLAY_MEMO.clear()
     output = Path(output_dir).resolve()
+    _QUERY_RESOLUTION_MEMO.clear()
     output.mkdir(parents=True, exist_ok=True)
-    invocation = Path(tempfile.mkdtemp(prefix='proof-', dir=output))
+    # Revalidation must be read-only in a watched proof store. Even creating
+    # an empty observation directory revokes the live frozen reader via the
+    # store's protected ancestor watch. Retain a directory only for real work.
+    invocation = None
     groups = collections.defaultdict(list)
     metrics = {'original_ubt_count': sum(_is_ubt(entry) for entry in entries),
-        'batch_count': 0, 'accepted_ubt_count': 0, 'groups': [], 'proof_directory': str(invocation),
-        'cache_hits': 0, 'deferred_group_count': 0}
+        'batch_count': 0, 'accepted_ubt_count': 0, 'groups': [], 'proof_directory': None,
+        'cache_hits': 0, 'deferred_group_count': 0, 'new_proof_count': 0, 'new_batch_count': 0,
+        'qualification_limit': max_new_groups}
     shader = lambda e: Path(e.get('file', '')).suffix.lower() in (
         '.usf', '.ush', '.hlsl', '.hlsli', '.glsl', '.vert', '.frag', '.geom', '.tesc', '.tese', '.comp', '.metal')
     exact = lambda e: not _is_ubt(e) and Path(e.get('file', '')).suffix.lower() in ('.c', '.cc', '.cpp', '.cxx', '.c++')
@@ -1337,7 +1469,7 @@ def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify
     for index, entry in enumerate(entries):
         if _is_ubt(entry):
             groups[(entry['nvim_ue_module_root'], compile_context_key(entry))].append(index)
-    replacements, consumed, claimed, new_hints = {}, set(), set(), []
+    replacements, consumed, claimed, new_hints, admitted_queries = {}, set(), set(), [], []
     resolved = shutil.which(str(clangd_path)) if clangd_path else None
     executable = Path(resolved or clangd_path or '')
     tool_hash = _sha(executable.read_bytes()) if executable.is_file() else None
@@ -1351,11 +1483,13 @@ def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify
     chunk_size = max(1, int(max_group))
     for chunk, hinted_cache in _batch_groups(entries, groups, output, identities, profile,
                                              chunk_size, claimed, inventory_memo, metrics,
-                                             max_sources=max_sources, verify_missing=verify_missing):
+                                             max_sources=max_sources, verify_missing=verify_missing,
+                                             prioritize_small=max_new_groups is not None):
         group_start = time.monotonic()
         record = {'original_indexes': chunk, 'original_ubt_count': len(chunk), 'accepted': False, 'run_metrics': []}
         print('[verified-batch] start group=' + str(chunk[0]) + ' ubt=' + str(len(chunk)), flush=True)
         group, evidence, candidate, cached, reused = [entries[i] for i in chunk], {}, None, hinted_cache, None
+        timings = evidence.setdefault('phase_timings', {})
         cache_key = _cache_key(group, identities, profile)
         cache_file = output / 'receipts' / (cache_key + '.json')
         try:
@@ -1385,6 +1519,13 @@ def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify
                 metrics['deferred_group_count'] += 1
                 record['deferred'] = True
                 raise ValueError('verification-not-cached')
+            if not cached and max_new_groups is not None:
+                reason = ('verification-stage-complete' if metrics['new_batch_count'] else
+                          'verification-budget-exhausted' if metrics['new_proof_count'] >= max_new_groups else None)
+                if reason:
+                    metrics['deferred_group_count'] += 1
+                    record['deferred'] = True
+                    raise ValueError(reason)
             if cached:
                 metrics['cache_hits'] += 1
                 record.update(cached=True, first_proof_seconds=cached['first_proof_seconds'])
@@ -1393,39 +1534,57 @@ def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify
                 candidate, detail = cached['candidate'], {'receipt': cached['candidate']['nvim_ue_batch_receipt'],
                     'candidate_order': cached.get('candidate_order', list(range(len(group))))}
             else:
+                metrics['new_proof_count'] += 1
+                if invocation is None:
+                    invocation = Path(tempfile.mkdtemp(prefix='proof-', dir=output))
+                    metrics['proof_directory'] = str(invocation)
                 evidence['query_profiles'] = list(reused.get('query_profiles', [])) if reused else []
                 group_root = invocation / ('group-' + str(chunk[0]))
-                _observe_queries(group, str(executable.resolve()), profile,
+                _timed(timings, 'query_observe', _observe_queries,
+                    group, str(executable.resolve()), profile,
                     group_root / 'queries', evidence['query_profiles'], timeout)
-                before = _inventories(_include_roots(group, [], extra_roots=_query_roots(evidence['query_profiles'])),
-                    output, inventory_memo)
+                with _phase(timings, 'inventory_before'):
+                    before = _inventories(_include_roots(group, [], extra_roots=_query_roots(evidence['query_profiles'])),
+                        output, inventory_memo)
                 if reused:
                     metrics['cache_hits'] += 1
                     record.update(first_proof_seconds=reused['first_proof_seconds'], graph_replayed=True)
                 candidate, detail = _prove(group, group_root,
                     output / 'assets', str(executable.resolve()), tool_hash, timeout, evidence, reused=reused, server_profile=profile,
                     original_identities=identities, inventory_memo=inventory_memo)
-                if any(_inventory(path, output) != value for path, value in before.items()):
+                if _timed(timings, 'inventory_after', lambda:
+                        any(_inventory(path, output) != value for path, value in before.items())):
                     raise ValueError('include-inventory-changed-during-proof')
-            if _compiler_environment() != identities['compiler_environment']:
+            if _compiler_environment(profile) != identities['compiler_environment']:
                 raise ValueError('compiler-environment-changed-during-proof')
+            checked_queries = cached.get('query_profiles', []) if cached else evidence.get('query_profiles', [])
+            if not _timed(timings, 'query_resolution_revalidate', _query_resolution_current,
+                    checked_queries, executable, profile, force=not bool(cached)):
+                raise ValueError('compiler-resolution-changed-during-proof')
+            admitted_queries.extend(checked_queries)
             anchor = min(chunk)
             replacements[anchor] = candidate
             consumed.update(index for index in chunk if index != anchor)
             claimed.update(chunk)
             metrics['batch_count'] += 1
+            if not cached:
+                metrics['new_batch_count'] += 1
             metrics['accepted_ubt_count'] += len(chunk)
             record.update(accepted=True, reason='verified-original-tu-union', **detail)
         except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
             record['reason'] = str(error)
         record.update({key: evidence[key] for key in (
             'original_cache_hits', 'original_cache_misses', 'original_cache_unlinked') if key in evidence})
-        record['proof_seconds'] = round(time.monotonic() - group_start, 6)
+        if evidence.get('run_metrics'):
+            record['run_metrics'] = [{key: run.get(key) for key in _RUN_METRIC_FIELDS}
+                                     for run in evidence['run_metrics']]
+        evidence.pop('run_metrics', None)
         compile_rejection = record['reason'].startswith('private-index-failed: compiler-errors:')
         if (not cached and evidence.get('dependencies') and evidence.get('assets')
                 and (record['accepted'] or compile_rejection or record['reason'].startswith('admission-rejected:'))):
-            inventory = _inventories(_include_roots(group, evidence['dependencies'], evidence.get('effective_entries', []),
-                extra_roots=_query_roots(evidence.get('query_profiles', []))), output, inventory_memo)
+            with _phase(timings, 'inventory_receipt'):
+                inventory = _inventories(_include_roots(group, evidence['dependencies'], evidence.get('effective_entries', []),
+                    extra_roots=_query_roots(evidence.get('query_profiles', []))), output, inventory_memo)
             if record['accepted']:
                 receipt_path = Path(candidate['nvim_ue_batch_receipt'])
                 evidence['assets'] = [item for item in evidence['assets'] if Path(item['path']) != receipt_path]
@@ -1435,35 +1594,55 @@ def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify
                 _write(receipt_path, _json(receipt))
                 candidate['nvim_ue_batch_receipt_sha256'] = _sha(receipt_path.read_bytes())
                 evidence['assets'].append({'path': str(receipt_path), 'sha256': candidate['nvim_ue_batch_receipt_sha256']})
-            _write(cache_file, _json(dict(evidence, schema=1, inventories=inventory, accepted=record['accepted'],
-                reason=record['reason'], candidate=candidate if record['accepted'] else None,
-                compile_rejection=compile_rejection,
-                identities=identities, first_proof_seconds=reused['first_proof_seconds'] if reused else record['proof_seconds'])))
+            with _phase(timings, 'receipt_cache_write'):
+                _write(cache_file, _json(dict(evidence, schema=1, inventories=inventory, accepted=record['accepted'],
+                    reason=record['reason'], candidate=candidate if record['accepted'] else None,
+                    compile_rejection=compile_rejection,
+                    identities=identities, first_proof_seconds=reused['first_proof_seconds'] if reused else time.monotonic() - group_start)))
+        record['proof_seconds'] = round(time.monotonic() - group_start, 6)
+        record['phase_timings'] = {key: dict(value, seconds=round(value['seconds'], 6))
+                                 for key, value in timings.items()}
         metrics['groups'].append(record)
         if record['accepted']:
+            # Receipts sort their JSON keys. Match that ordering on the first
+            # publication too, or a cache hit rewrites equal CDB commands solely
+            # because the fresh candidate had a different field insertion order.
+            replacements[min(chunk)] = dict(sorted(candidate.items()))
             new_hints.append(_group_hint(group, cache_key))
         print('[verified-batch] ' + ('admitted' if record['accepted'] else 'retained')
             + ' group=' + str(chunk[0]) + ' ubt=' + str(len(chunk))
             + ' batches=' + str(metrics['batch_count']) + ' proof_seconds=' + str(record['proof_seconds'])
             + ' reason=' + record['reason'], flush=True)
     result = [replacements.get(index, entry) for index, entry in enumerate(entries) if index not in consumed]
+    run_timings = {}
     try:
-        inventory_changed = any(_inventory(path, output) != value for path, value in inventory_memo.items())
+        inventory_changed = _timed(run_timings, 'inventory_final', lambda:
+            any(_inventory(path, output) != value for path, value in inventory_memo.items()))
     except OSError:
         inventory_changed = True
+    try:
+        resolution_changed = bool(admitted_queries) and not _timed(run_timings, 'query_resolution_final', _query_resolution_current,
+            admitted_queries, executable, profile, force=bool(metrics['new_proof_count']))
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        resolution_changed = True
+        metrics['query_resolution_error'] = str(error)
     invalidated = ('compiler-environment-changed-during-run' if tool_hash
-        and _compiler_environment() != identities['compiler_environment'] else
+        and _compiler_environment(profile) != identities['compiler_environment'] else
+        'compiler-resolution-changed-during-run' if resolution_changed else
         'include-inventory-changed-during-run' if inventory_changed else None)
     if invalidated:
         result = list(entries)
-        metrics.update(batch_count=0, accepted_ubt_count=0, invalidated_reason=invalidated)
+        metrics.update(batch_count=0, new_batch_count=0, accepted_ubt_count=0, invalidated_reason=invalidated)
         for record in metrics['groups']:
             record.update(accepted=False, reason=invalidated)
     elif new_hints and verify_missing:
         metrics['group_hints_write_status'] = _save_group_hints(output, new_hints)
     metrics.update(output_entries=len(result), retained_ubt_count=metrics['original_ubt_count'] - metrics['accepted_ubt_count'],
                    proof_seconds=round(time.monotonic() - started, 6), baseline_cache_reused=metrics['cache_hits'] > 0)
-    _write(invocation / 'metrics.json', _json(metrics))
+    metrics['phase_timings'] = {key: dict(value, seconds=round(value['seconds'], 6))
+                              for key, value in run_timings.items()}
+    if invocation is not None:
+        _write(invocation / 'metrics.json', _json(metrics))
     return result, metrics
 
 

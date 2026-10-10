@@ -329,6 +329,85 @@ t.describe("semantic sidecar integration", function()
     return
   end
 
+  t.it("proves VFS external-name inclusion and maps only identical user source coordinates", function()
+    with_temp_fixture(function(root)
+      local original, external = root .. "/Original.hpp", root .. "/External.hpp"
+      local source, absent = root .. "/Included.cpp", root .. "/Absent.cpp"
+      local unused = root .. "/Unused.hpp"
+      assert(vim.fn.writefile({ "int never_included;" }, unused) == 0)
+      local lines = { "#pragma once", "inline int mapped_target(int value) { return value + 1; }",
+        "inline int mapped_query() { return mapped_target(3); } // QUERY:alias" }
+      assert(vim.fn.writefile(lines, original) == 0)
+      assert(vim.fn.writefile(lines, external) == 0)
+      assert(vim.fn.writefile({ '#include "Original.hpp"', "int use() { return mapped_query(); }" }, source) == 0)
+      assert(vim.fn.writefile({ "int unrelated() { return 7; }" }, absent) == 0)
+      local sidecar = semantic_sidecar.new()
+      local function request(name, input, mode)
+        local args = { "clang++", "-std=c++20" }
+        if mode ~= "none" then
+          local overlay = { version = 0, roots = {
+            { type = "file", name = original, ["external-contents"] = external },
+            { type = "file", name = root .. "/UnusedAlias.hpp", ["external-contents"] = unused },
+          } }
+          if mode == "nested" then
+            overlay.roots = { { type = "directory", name = root, contents = {
+              { type = "file", name = "Original.hpp", ["external-contents"] = "External.hpp" },
+            } } }
+            overlay["overlay-relative"] = true
+          end
+          if mode ~= "default" then overlay["use-external-names"] = mode == "true" or mode == "nested" end
+          local path = root .. "/Overlay-" .. mode .. ".json"
+          assert(vim.fn.writefile({ vim.json.encode(overlay) }, path) == 0)
+          vim.list_extend(args, { "-ivfsoverlay", path })
+        end
+        vim.list_extend(args, { "-c", input })
+        return { v = protocol.VERSION, id = name, op = "query",
+          query = find_marker_position(original, "QUERY:alias", "mapped_target"),
+          contexts = { { id = name, origin_tu = input,
+            compile = { file = input, directory = root, argv = args } } } }
+      end
+      for _, mode in ipairs({ "none", "default", "true", "false", "nested" }) do
+        local row = request("included-" .. mode, source, mode)
+        local response = sidecar:handle_request(row)
+        t.assert_eq(response.state, "resolved", mode .. ": " .. tostring(response.reason))
+        t.assert_eq(response.usr, "c:@F@mapped_target#I#")
+        t.assert_eq(response.declaration.path, vim.fs.normalize(original))
+        t.assert_eq(response.definition.path, vim.fs.normalize(original))
+        t.assert_eq(response.definition.line, 2)
+        t.assert_eq(sidecar:handle_request(row).metrics.query_kinds[1].kind, "warm")
+        local rejected = sidecar:handle_request(request("absent-" .. mode, absent, mode))
+        t.assert_eq(rejected.reason, "invalid-query-file-not-in-tu")
+      end
+      -- Equal basename and bytes in a distinct non-included file are no proof.
+      assert(vim.fn.mkdir(root .. "/other", "p") == 1)
+      local other = root .. "/other/Original.hpp"
+      assert(vim.fn.writefile(lines, other) == 0)
+      local other_request = request("other", source, "none")
+      other_request.query.path = other
+      t.assert_eq(sidecar:handle_request(other_request).reason, "invalid-query-file-not-in-tu")
+      -- A VFS remap may be valid for the compiler but invalid for user positions.
+      local mismatch = request("mismatch", source, "true")
+      local changed = vim.deepcopy(lines)
+      changed[2] = "inline int mapped_target(int value) { return value + 100; }"
+      assert(vim.fn.writefile(changed, external) == 0)
+      t.assert_eq(sidecar:handle_request(mismatch).reason, "invalid-query-file-alias-content-mismatch")
+      t.assert_eq(sidecar:handle_request(request("mismatch-hidden-name", source, "false")).reason,
+        "invalid-query-file-alias-content-mismatch")
+      t.assert_eq(sidecar:handle_request(request("mismatch-nested", source, "nested")).reason,
+        "invalid-query-file-alias-content-mismatch")
+      assert(vim.fn.writefile(lines, external) == 0)
+      t.assert_eq(sidecar:handle_request(mismatch).state, "resolved")
+      local entry = assert(sidecar.tu_store:_ensure_tu(mismatch.contexts[1], {}))
+      t.assert_true(entry.vfs_input_signatures[unused] == nil,
+        "VFS entries outside actual compiler inclusions must not cause full overlay stat scans")
+      assert(vim.fn.writefile({ "int still_never_included;" }, unused) == 0)
+      local warm = sidecar:handle_request(mismatch)
+      t.assert_eq(warm.state, "resolved")
+      t.assert_eq(warm.metrics.query_kinds[1].kind, "warm")
+      sidecar:shutdown()
+    end)
+  end)
+
   t.it("reloads native CDB commands on file changes and clears handles on full eviction", function()
     with_temp_fixture(function(root)
       local source = root .. "/command-change.cpp"
@@ -1231,7 +1310,7 @@ t.describe("semantic sidecar integration", function()
         reasons[context.reason] = true
       end
       t.assert_true(reasons["invalid-empty-usr"])
-      t.assert_true(reasons["invalid-cursor"])
+      t.assert_true(reasons["invalid-query-file-not-in-tu"])
       t.assert_true(#(response.diagnostics or {}) >= #(response.contexts[1].diagnostics or {}))
       sidecar:shutdown()
     end)
@@ -1323,44 +1402,74 @@ t.describe("semantic sidecar integration", function()
     end)
   end)
 
-  t.it("reconstructs and queries a compiler-emitted depfile, rsp, and unity context", function()
-    with_temp_fixture(function(root)
-      local evidence_dir = root .. "/Intermediate/Build/Android/FixtureTarget/Development/Module"
-      assert(vim.fn.mkdir(evidence_dir, "p") == 1)
-      local unity = vim.fs.normalize(evidence_dir .. "/Module.Fixture.cpp")
-      local depfile = unity .. "x64.d"
-      local rsp = unity .. "x64.o.rsp"
-      local direct = vim.fs.normalize(root .. "/direct.cpp")
-      local header = vim.fs.normalize(root .. "/direct.hpp")
-      assert(vim.fn.writefile({ '#include "' .. direct:gsub("\\", "/") .. '"' }, unity) == 0)
-      assert(vim.fn.writefile({
-        unity:gsub("\\", "/") .. "x64.o: "
-          .. unity:gsub("\\", "/") .. " "
-          .. direct:gsub("\\", "/") .. " "
-          .. header:gsub("\\", "/"),
-      }, depfile) == 0)
-      assert(vim.fn.writefile({
-        '-std=c++20 -c "' .. unity:gsub("\\", "/") .. '"',
-      }, rsp) == 0)
+  local function write_unity_evidence(root, members, dependencies)
+    local evidence_dir = root .. "/Intermediate/Build/Android/FixtureTarget/Development/Module"
+    assert(vim.fn.mkdir(evidence_dir, "p") == 1)
+    local unity = vim.fs.normalize(evidence_dir .. "/Module.Fixture.cpp")
+    local header = vim.fs.normalize(root .. "/direct.hpp")
+    local lines = {}
+    for _, member in ipairs(members) do
+      lines[#lines + 1] = '#include "' .. member:gsub("\\", "/") .. '"'
+    end
+    assert(vim.fn.writefile(lines, unity) == 0)
+    local deps = { unity }
+    vim.list_extend(deps, dependencies or members)
+    deps[#deps + 1] = header
+    assert(vim.fn.writefile({ unity .. "x64.o: " .. table.concat(deps, " ") }, unity .. "x64.d") == 0)
+    assert(vim.fn.writefile({ '-std=c++20 -c "' .. unity .. '"' }, unity .. "x64.o.rsp") == 0)
+    return unity, {
+      v = protocol.VERSION,
+      id = "android-catalog",
+      op = "catalog",
+      header = header,
+      cdb_dir = vim.fs.normalize(root),
+      project_root = vim.fs.normalize(root),
+      engine_root = vim.fs.normalize(root),
+      active_build_key = "Android-FixtureTarget-Development",
+      active_build = { platform = "Android", target = "FixtureTarget", configuration = "Development" },
+      evidence_roots = { vim.fs.normalize(root .. "/Intermediate") },
+    }
+  end
 
+  t.it("reconstructs and queries processed donor flags in a depfile, rsp, and unity context", function()
+    with_temp_fixture(function(root)
+      local direct = vim.fs.normalize(root .. "/direct.cpp")
+      local unity, request = write_unity_evidence(root, { direct })
+      local header = request.header
+      local forced = vim.fs.normalize(root .. "/processed_forced.hpp")
+      local virtual = vim.fs.normalize(root .. "/processed_virtual.hpp")
+      local backing = vim.fs.normalize(root .. "/processed_backing.hpp")
+      local overlay = vim.fs.normalize(root .. "/processed_overlay.json")
+      assert(vim.fn.writefile({ "#define PROCESSED_DONOR_FORCED 1" }, forced) == 0)
+      assert(vim.fn.writefile({ "#define PROCESSED_DONOR_VFS 1" }, backing) == 0)
+      assert(vim.fn.writefile({ vim.json.encode({ version = 0, roots = {
+        { type = "file", name = virtual, ["external-contents"] = backing },
+      } }) }, overlay) == 0)
+      local header_lines = {
+        '#include "processed_virtual.hpp"',
+        "#if !defined(PROCESSED_DONOR_FORCED) || !defined(PROCESSED_DONOR_VFS)",
+        '#error "postprocessed donor environment missing"',
+        "#endif",
+      }
+      vim.list_extend(header_lines, vim.split(read_all(header), "\n", { plain = true }))
+      assert(vim.fn.writefile(header_lines, header) == 0)
+      local entries = vim.json.decode(read_all(root .. "/compile_commands.json"))
+      entries[1].arguments = { "clang++", "-std=c++20", "-include", forced,
+        "-ivfsoverlay", overlay, "-c", direct }
+      assert(vim.fn.writefile({ vim.json.encode(entries) }, root .. "/compile_commands.json") == 0)
+      assert(vim.fn.writefile({ "Engine\\Binaries\\" }, root .. "/.ignore") == 0)
       local sidecar = semantic_sidecar.new()
-      local catalog = sidecar:handle_request({
-        v = protocol.VERSION,
-        id = "android-catalog",
-        op = "catalog",
-        header = header,
-        cdb_dir = vim.fs.normalize(root),
-        project_root = vim.fs.normalize(root),
-        engine_root = vim.fs.normalize(root),
-        active_build_key = "Android-FixtureTarget-Development",
-        active_build = {},
-        evidence_roots = { vim.fs.normalize(root .. "/Intermediate") },
-      })
+      local catalog = sidecar:handle_request(request)
       t.assert_eq(catalog.state, "resolved")
       t.assert_eq(#catalog.contexts, 1)
       t.assert_eq(catalog.contexts[1].evidence_kind, "clang-d-rsp-unity")
       t.assert_eq(vim.fs.normalize(catalog.contexts[1].origin_tu), unity)
       t.assert_eq(catalog.contexts[1].compile.argv[#catalog.contexts[1].compile.argv], unity)
+      t.assert_true(vim.tbl_contains(catalog.contexts[1].compile.argv, forced))
+      t.assert_true(vim.tbl_contains(catalog.contexts[1].compile.argv, overlay))
+      if vim.fn.exepath("rg") ~= "" then
+        t.assert_eq(catalog.metrics.evidence_discovery, "rg-exact-prefilter")
+      end
 
       local query = find_marker_position(header, "QUERY:header_pick", "pick")
       local response = sidecar:handle_request({
@@ -1370,10 +1479,135 @@ t.describe("semantic sidecar integration", function()
         query = vim.tbl_extend("force", query, { document_version = 1 }),
         contexts = { catalog.contexts[1] },
       })
-      t.assert_eq(response.state, "resolved")
+      t.assert_eq(response.state, "resolved", vim.inspect({ reason = response.reason,
+        diagnostics = response.diagnostics, contexts = response.contexts }))
       t.assert_true(type(response.usr) == "string" and response.usr ~= "")
       t.assert_eq(vim.fs.normalize(response.definition.path), direct)
       sidecar:shutdown()
+    end)
+  end)
+
+  t.it("rejects conflicting processed member environments unless an exact Unity command exists", function()
+    with_temp_fixture(function(root)
+      local direct = vim.fs.normalize(root .. "/direct.cpp")
+      local caller = vim.fs.normalize(root .. "/caller.cpp")
+      local unity, request = write_unity_evidence(root, { direct, caller })
+      local entries = vim.json.decode(read_all(root .. "/compile_commands.json"))
+      local sidecar = semantic_sidecar.new()
+      local equivalent = sidecar:handle_request(request)
+      t.assert_eq(equivalent.state, "resolved")
+      t.assert_eq(#equivalent.contexts, 1)
+      table.insert(entries[2].arguments, 2, "-DCONFLICTING_DONOR=1")
+      assert(vim.fn.writefile({ vim.json.encode(entries) }, root .. "/compile_commands.json") == 0)
+      local conflict = sidecar:handle_request(request)
+      t.assert_eq(conflict.state, "unavailable")
+      t.assert_eq(conflict.reason, "dep-context-donor-environment-conflict")
+      t.assert_eq(#conflict.contexts, 0)
+      entries[1], entries[2] = entries[2], entries[1]
+      assert(vim.fn.writefile({ vim.json.encode(entries) }, root .. "/compile_commands.json") == 0)
+      t.assert_eq(sidecar:handle_request(request).reason, "dep-context-donor-environment-conflict")
+      entries[#entries + 1] = {
+        directory = root, file = unity, arguments = { "clang++", "-std=c++20", "-c", unity },
+      }
+      assert(vim.fn.writefile({ vim.json.encode(entries) }, root .. "/compile_commands.json") == 0)
+      local exact = sidecar:handle_request(request)
+      t.assert_eq(exact.state, "resolved")
+      t.assert_eq(#exact.contexts, 1)
+      t.assert_false(vim.tbl_contains(exact.contexts[1].compile.argv, "-DCONFLICTING_DONOR=1"))
+      local duplicate = vim.deepcopy(entries[#entries])
+      table.insert(duplicate.arguments, 2, "-DCONFLICTING_EXACT=1")
+      entries[#entries + 1] = duplicate
+      assert(vim.fn.writefile({ vim.json.encode(entries) }, root .. "/compile_commands.json") == 0)
+      t.assert_eq(sidecar:handle_request(request).reason, "dep-context-donor-environment-conflict")
+      sidecar:shutdown()
+    end)
+  end)
+
+  t.it("does not promote a depfile source outside actual Unity membership to a donor", function()
+    with_temp_fixture(function(root)
+      local direct = vim.fs.normalize(root .. "/direct.cpp")
+      local overlay = vim.fs.normalize(root .. "/overlay.cpp")
+      local _, request = write_unity_evidence(root, { overlay }, { direct })
+      local sidecar = semantic_sidecar.new()
+      local response = sidecar:handle_request(request)
+      t.assert_eq(response.state, "unavailable")
+      t.assert_eq(#response.contexts, 0)
+      sidecar:shutdown()
+    end)
+  end)
+
+  t.it("rejects a merged donor absent from the active shard even when the depfile includes the header", function()
+    with_temp_fixture(function(root)
+      local direct = vim.fs.normalize(root .. "/direct.cpp")
+      local _, request = write_unity_evidence(root, { direct })
+      local entries = vim.json.decode(read_all(root .. "/compile_commands.json"))
+      local active = root .. "/selected.json"
+      assert(vim.fn.writefile({ vim.json.encode({ entries[2] }) }, active) == 0)
+      assert(vim.fn.writefile({ vim.json.encode(entries) }, root .. "/compile_commands.json") == 0)
+      request.active_cdb_path = active
+      local sidecar = semantic_sidecar.new()
+      local response = sidecar:handle_request(request)
+      t.assert_eq(response.state, "unavailable")
+      t.assert_eq(#response.contexts, 0)
+      sidecar:shutdown()
+    end)
+  end)
+
+  t.it("retains conflicting duplicate commands for the same proven donor", function()
+    with_temp_fixture(function(root)
+      local direct = vim.fs.normalize(root .. "/direct.cpp")
+      local _, request = write_unity_evidence(root, { direct })
+      local entries = vim.json.decode(read_all(root .. "/compile_commands.json"))
+      local duplicate = vim.deepcopy(entries[1])
+      table.insert(duplicate.arguments, 2, "-DCONFLICTING_DUPLICATE=1")
+      entries[#entries + 1] = duplicate
+      assert(vim.fn.writefile({ vim.json.encode(entries) }, root .. "/compile_commands.json") == 0)
+      local sidecar = semantic_sidecar.new()
+      local response = sidecar:handle_request(request)
+      t.assert_eq(response.state, "unavailable")
+      t.assert_eq(response.reason, "dep-context-donor-environment-conflict")
+      t.assert_eq(#response.contexts, 0)
+      entries[1], entries[#entries] = entries[#entries], entries[1]
+      assert(vim.fn.writefile({ vim.json.encode(entries) }, root .. "/compile_commands.json") == 0)
+      t.assert_eq(sidecar:handle_request(request).reason, "dep-context-donor-environment-conflict")
+      sidecar:shutdown()
+    end)
+  end)
+
+  t.it("bounds donor discovery work linearly while retaining every matching depfile context", function()
+    with_temp_fixture(function(root)
+      local direct = vim.fs.normalize(root .. "/direct.cpp")
+      local unity, request = write_unity_evidence(root, { direct })
+      local entries = vim.json.decode(read_all(root .. "/compile_commands.json"))
+      for index = 1, 80 do
+        local source = vim.fs.normalize(root .. "/unrelated_" .. index .. ".cpp")
+        entries[#entries + 1] = {
+          directory = root, file = source, arguments = { "clang++", "-std=c++20", "-c", source },
+        }
+      end
+      assert(vim.fn.writefile({ vim.json.encode(entries) }, root .. "/compile_commands.json") == 0)
+      local dep_count = 12
+      for index = 2, dep_count do
+        local stem = unity .. "repeat" .. index
+        assert(vim.fn.writefile(vim.split(read_all(unity .. "x64.d"), "\n", { plain = true }), stem .. ".d") == 0)
+        assert(vim.fn.writefile(vim.split(read_all(unity .. "x64.o.rsp"), "\n", { plain = true }), stem .. ".o.rsp") == 0)
+      end
+      local model = require("utils.ue_goto.semantic_context")
+      local original, normalizations = model.match_key, 0
+      local sidecar = semantic_sidecar.new()
+      model.match_key = function(path)
+        normalizations = normalizations + 1
+        return original(path)
+      end
+      local ok, response = pcall(sidecar.handle_request, sidecar, request)
+      model.match_key = original
+      sidecar:shutdown()
+      t.assert_true(ok, tostring(response))
+      t.assert_eq(response.state, "ambiguous-context")
+      t.assert_eq(response.metrics.depfiles_scanned, dep_count)
+      t.assert_eq(#response.contexts, dep_count, "work reduction must not truncate proven context coverage")
+      t.assert_true(normalizations <= #entries * 2 + dep_count * 20,
+        "donor lookup must not rescan the whole CDB per depfile; path normalizations=" .. normalizations)
     end)
   end)
 end)

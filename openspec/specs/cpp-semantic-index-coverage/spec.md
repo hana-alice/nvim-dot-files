@@ -111,6 +111,25 @@ clangd 是长驻交互式服务，终止会丢弃已构建的 preamble。系统 
 
 ## 选型与踩坑
 
+- **选型（2026-10-09）**：冷大型 CDB generation 摘要与普通 phase 的 manifest/语义发布使用独立
+  nvim worker；摘要按 size/mtime/ctime/dev/ino 绑定当前输入，计算期间替换必须丢弃并重算。
+  未就绪与 worker 失败分别处理，旧 selection 只保留为历史，不冒充当前已验证 generation；
+  成功后恢复延迟 reader，发布保持原 writer lease、来源校验和未变更不写入语义。
+  子进程异步计算不等于整个启动/prepare 无卡顿；主循环最大间隔与 GUI 响应仍需分别实测。
+
+- **踩坑（2026-10-08）**：正常 prepare 的 current/hot/full 曾统一只复用 proof；新项目桶没有
+  receipts 或 accepted hints 时，所有候选都 deferred=`verification-not-cached`，不会自行生产证明。
+  历史上其他项目桶的成功 proof 不能证明当前 build，也不能靠复制或改写其身份来命中。
+- **阶段选型（2026-10-08）**：无外部 proof selector 的 full 在已有异步 worker、writer lease
+  和宿主准入下有界生产独立原 TU 图证明，优先小组；每轮新接受一个合格批次后停止该轮证明。
+  重复 prepare 完整重验并复用已有批次，缓存命中不消耗本轮新接受批次名额，下一组仍可在
+  预算内证明；新增产物按计划发布，纯缓存轮保持 no-op。失效或预算未覆盖的组保留原 UBT。current/hot 与显式
+  外部 store 仍仅复用；完整 argv、宏/PCH、图比较、来源及真实过期拒绝门禁保持不变。
+  这是生产/命中路径的阶段修复，不能用条目数下降宣称全工程性能恢复。
+- **踩坑（2026-10-08）**：冻结激活安装监听后，query profile 验证若在 proof store 内创建临时
+  目录，会改变受保护的 receipt/asset 祖先目录并触发自撤权。查询 scratch 必须外置且自动收尾；
+  不得提前应用 exclude、忽略目录事件或削弱真实修改与祖先 rename/delete 的保护来规避该故障。
+
 - **踩坑**：`openspec/changes/archive/2026-09-28-restructure-super-unity-compression/` 的
   调查发现，「Secondary batches」二次合并的**实际交付量为零**——活跃索引缓存 33,014 个
   shard 中 995 个 `SuperUnity.UBT`、仅 **1 个** `SuperUnity.Batch`。根因不是合并质量差，而是

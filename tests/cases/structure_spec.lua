@@ -117,6 +117,9 @@ local KEY_DOCS = {
   "docs/CONSTRAINTS.md",
   "memory/project_overview.md",
   "docs/architecture/overview.md",
+  "docs/USER_GUIDE.md",
+  "docs/USER_GUIDE_LIMITS.md",
+  "docs/ue_lazyvim_cheatsheet.md",
 }
 
 t.describe("structure: 关键文档内链不悬空", function()
@@ -138,6 +141,57 @@ t.describe("structure: 关键文档内链不悬空", function()
         doc .. " 悬空链接:\n  " .. table.concat(dangling, "\n  "))
     end)
   end
+end)
+
+-- 手册按任务组织；边界另存但要能从操作处到达，不能靠删说明造瘦身数字。
+t.describe("structure: 工作台手册与边界导航", function()
+  local guide = read("docs/USER_GUIDE.md") or ""
+  local limits = read("docs/USER_GUIDE_LIMITS.md") or ""
+
+  t.it("工作台主线、五分区与向导可发现", function()
+    for _, text in ipairs({
+      "<leader>uH", "当前目标", "下一步", "最近结果", "运行中任务", "恢复", "首次上手向导",
+    }) do
+      t.assert_contains(guide, text)
+    end
+    t.assert_contains(guide, "## 1. 从工作台开始")
+    t.assert_contains(guide, "`g`")
+    t.assert_contains(guide, "`R`")
+    t.assert_contains(guide, "取消后流程结束")
+    t.assert_contains(guide, "必须单独确认")
+  end)
+
+  t.it("瘦身后手册行数至多为原592行的75%", function()
+    local lines = vim.fn.readfile(cfg .. "/docs/USER_GUIDE.md")
+    t.assert_true(#lines <= 444, "手册行数 " .. #lines .. "，应将边界说明移至 LIMITS")
+  end)
+
+  t.it("每个边界链接的主题都存在且边界文档可返回手册", function()
+    local count = 0
+    for anchor in guide:gmatch("USER_GUIDE_LIMITS%.md#([^%)]+)") do
+      count = count + 1
+      local found = false
+      for heading in limits:gmatch("\n## ([^\n]+)") do
+        local slug = heading:lower():gsub("%s+", "-")
+        if slug == anchor then found = true; break end
+      end
+      t.assert_true(found, "手册边界链接悬空: #" .. anchor)
+    end
+    t.assert_true(count >= 10, "边界迁移后操作主题需保留对应链接")
+    t.assert_contains(limits, "[使用手册](USER_GUIDE.md)")
+  end)
+
+  t.it("恢复意图与既有实现均可从手册查询", function()
+    for _, intent in ipairs({ "关掉的", "继续已保存调查", "恢复上次会话", "找回异常退出的文本" }) do
+      t.assert_contains(guide, intent)
+    end
+    for _, command in ipairs({ "UEWorkspace", "UEWorkContext", "UESessionRestore", "UERecovery", "Restart" }) do
+      t.assert_contains(guide, ":" .. command)
+    end
+    for _, boundary in ipairs({ "进程退出 0", "不跨重启", "部分记录", "最后尚未落盘" }) do
+      t.assert_contains(limits, boundary)
+    end
+  end)
 end)
 
 -- ── ④ 强制入口与政策可发现 ────────────────────────────────────────────────

@@ -196,9 +196,27 @@ function M.install(client, deps)
     pending.timeout = vim.defer_fn(function() expire_pending(pending) end, REQUEST_TIMEOUT_MS)
   end
 
+  function client.set_priority(priority)
+    if not state.job or state.job <= 0 then return false end
+    -- jobpid belongs to this transport's job; never discover or adjust other PIDs.
+    local ok_pid, pid = pcall(vim.fn.jobpid, state.job)
+    if ok_pid and tonumber(pid) and pid > 0 then
+      local ok, changed, reason = pcall(function()
+        local driver = require("utils.platform").driver()
+        if type(driver.set_process_priority) == "function" then
+          return driver.set_process_priority(pid, priority)
+        end
+        return false, "process-priority-unsupported"
+      end)
+      return ok and changed == true, ok and reason or changed
+    end
+    return false, "pid-unavailable"
+  end
+
   local function send_pending(pending)
     if not state.job or state.job <= 0 then return false end
     if next(state.pending) ~= nil then return false end
+    client.set_priority(pending.background and "low" or "normal")
     close_timer(state.idle_timer)
     state.idle_timer = nil
     local ok_encode, encoded = pcall(protocol.encode, pending.payload)
@@ -427,7 +445,7 @@ function M.install(client, deps)
     return send_pending(handshake)
   end
 
-  function client.request(op, fields, callback, options, is_current)
+  function client.request(op, fields, callback, options, is_current, background)
     callback = callback or function() end
     state.next_request_id = state.next_request_id + 1
     local payload = vim.tbl_extend("force", fields or {}, {
@@ -442,7 +460,8 @@ function M.install(client, deps)
       return payload.id
     end
     local pending = { payload = payload, callback = callback, restarts = 0,
-      is_current = is_current, options = options and compiler_session.requested(options) }
+      is_current = is_current, background = background == true,
+      options = options and compiler_session.requested(options) }
     state.queued[#state.queued + 1] = pending
     if state.stopping then return payload.id end
     if state.ready then
@@ -461,7 +480,9 @@ function M.install(client, deps)
   function client.status()
     local pending_count = 0
     for _ in pairs(state.pending) do pending_count = pending_count + 1 end
+    local ok_pid, pid = pcall(vim.fn.jobpid, state.job or -1)
     return {
+      pid = ok_pid and pid > 0 and pid or nil,
       running = state.job ~= nil,
       ready = state.ready,
       stopping = state.stopping,

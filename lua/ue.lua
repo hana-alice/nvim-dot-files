@@ -208,7 +208,7 @@ end
 
 local function strip_ansi(line)
   line = tostring(line or "")
-  line = line:gsub("\27%[[0-9;?]*[%a]", "")
+  line = line:gsub("\27%][^\7\27]*\7", ""):gsub("\27%][^\7\27]*\27\\", ""):gsub("\27%[[0-9;?]*[%a]", "")
   return line:gsub("\r", "")
 end
 
@@ -346,6 +346,7 @@ local function parse_output_entry(line, opts)
       lnum = 1,
       col = 1,
       text = trim(line),
+      _source_location = false, -- Context path only; no source line was parsed.
     }
   end
 end
@@ -1431,7 +1432,8 @@ function CORE_RT.migrate_legacy_csearch_if_needed(engine_root, platform_key)
       if not ok then
         local data = nil
         local f = io.open(src, "rb")
-        if f then data = f:read("*a"); f:close() end
+        if f then data = f:read("*a")
+f:close() end
         if data and write_all(dst, data) then
           pcall(os.remove, src)
           ok = true
@@ -2382,6 +2384,7 @@ end
 
 local function prepare_summary(ctx, compile_path, opts)
   opts = opts or {}
+  pcall(function() require("utils.probe").record("prepare-path", opts.reused_cache and "fast" or "cold", { state = "ok" }) end)
   local project_count = opts.project_count or count_cached_entries(ctx.paths.project_list)
   local engine_count = opts.engine_count or count_cached_entries(ctx.paths.engine_list)
   local workspace_count = opts.workspace_count or count_cached_entries(ctx.paths.workspace_list)
@@ -2477,6 +2480,11 @@ refresh_statusline = function()
   pcall(vim.cmd, "redrawstatus")
 end
 
+function M._refresh_statusline()
+  invalidate_status_cache()
+  refresh_statusline()
+end
+
 local function set_build_status(value)
   vim.g.ue_build_status = trim(value)
   invalidate_status_cache()
@@ -2511,6 +2519,7 @@ local function set_prepare_running(value)
   end
   invalidate_status_cache()
   refresh_statusline()
+  pcall(vim.api.nvim_exec_autocmds, "User", { pattern = "UEWorkbenchChanged" })
 end
 
 -- csearch build serialization (D9 Policy A). Returns true when the caller is
@@ -2564,13 +2573,13 @@ function CORE_RT.csearch_build_done()
 end
 
 -- Successful writers subtract only covered paths; explicit manual clear retains
--- its separate API. Overflow acknowledgement additionally requires a full reset.
-function CORE_RT.clear_persistent_dirty_safe(reason, covered_paths, covered_before, remove_missing)
+-- its separate API. Overflow acknowledgement needs reset or complete Git evidence.
+function CORE_RT.clear_persistent_dirty_safe(reason, covered_paths, covered_before, remove_missing, acknowledge_overflow)
   local ok_watch, watch = pcall(require, "utils.ue_watch")
   if not ok_watch then return false end
   if type(covered_paths) == "table" and type(watch.remove_persistent_dirty) == "function" then
     return watch.remove_persistent_dirty(
-      covered_paths, reason or "prepare", covered_before, remove_missing)
+      covered_paths, reason or "prepare", covered_before, remove_missing, acknowledge_overflow)
   end
   if type(watch.clear_persistent_dirty) == "function" then
     return watch.clear_persistent_dirty(reason or "prepare")
@@ -2593,7 +2602,8 @@ function CORE_RT.on_full_csearch_success(ctx, reason, stats)
     reason,
     CORE_RT.csearch_build_dirty_snapshot or {},
     CORE_RT.csearch_build_started_at,
-    stats and stats.mode == "reset")
+    stats and (stats.mode == "reset" or stats.git_recovered),
+    stats and (stats.mode == "reset" or stats.git_recovered))
   CORE_RT.csearch_build_dirty_snapshot = nil
   CORE_RT.csearch_build_started_at = nil
   local list_path = ctx and ctx.paths and ctx.paths.workspace_all_list
@@ -2611,217 +2621,34 @@ function M._csearch_build_running_for_test() return CORE_RT.csearch_build_runnin
 
 -- ── csearch smart incremental build (D11) ───────────────────────────────────
 -- Diff the last published path snapshot against the current workspace list.
--- Truncated dirty coverage requires reset even when the retained delta is empty.
+-- Truncated dirty coverage uses complete Git evidence, otherwise reset.
 --
 -- Decision rules (pure, unit-tested via _csearch_build_mode_for_test):
 --   * forced / no snapshot        → reset  (no basis for a diff)
---   * removed > 0                 → reset  (cindex CANNOT delete from an index;
---                                           ghost entries would serve hits for
---                                           dead files — correctness over speed)
---   * added + dirty == 0          → skip   (set unchanged; just refresh
+--   * added + dirty + removed == 0 → skip  (set unchanged; just refresh
 --                                           bookkeeping)
---   * added + dirty > 30% of set  → reset  (merge cost approaches full build;
+--   * that work > 30% of set      → reset  (merge cost approaches full build;
 --                                           usually a branch switch)
---   * else                        → add    (feed ONLY the delta to cindex)
+--   * else                        → add    (feed ONLY the delta to cindex;
+--                                           removals go to -delete-from)
+-- Removals no longer force reset (2026-10-02, codesearch v1.2.0 verified):
+-- -delete-from drops them in the same merge; an older binary rejects the flag
+-- and the add→reset fallback runs.
 --
 -- `dirty` = watcher's persistent set (modified existing files + new files).
 -- Re-adding a modified file refreshes its trigrams, so content edits get folded
 -- in on the cheap path too. An `add` that fails (corrupt/0-byte idx — the
 -- build_index D9 guard refuses it) falls back to one reset automatically.
-CORE_RT.CSEARCH_ADD_RATIO_MAX = 0.30
-
 function CORE_RT.csearch_snapshot_path(ctx)
-  local idx = ctx and ctx.paths and ctx.paths.csearch_idx
-  if not idx or idx == "" then return nil end
-  return idx .. ".files"
+  return require("ue.csearch_smart").csearch_snapshot_path(ctx)
 end
-
--- Pure decision. stats = { forced, has_snapshot, added_n, removed_n, dirty_n,
--- total_n }. Returns mode ("reset"|"add"|"skip") + human reason.
 function CORE_RT.csearch_build_mode(stats)
-  stats = stats or {}
-  if stats.forced then return "reset", "forced" end
-  if stats.dirty_capped then return "reset", "dirty coverage was truncated" end
-  if not stats.has_snapshot then return "reset", "no snapshot of last indexed set" end
-  if (stats.removed_n or 0) > 0 then
-    return "reset", ("%d removals (cindex cannot delete)"):format(stats.removed_n)
-  end
-  local work = (stats.added_n or 0) + (stats.dirty_n or 0)
-  if work == 0 then return "skip", "indexed set unchanged" end
-  local total = math.max(tonumber(stats.total_n) or 0, 1)
-  if work > total * CORE_RT.CSEARCH_ADD_RATIO_MAX then
-    return "reset", ("delta %d > %d%% of %d files"):format(
-      work, math.floor(CORE_RT.CSEARCH_ADD_RATIO_MAX * 100), total)
-  end
-  return "add", ("+%d added, %d dirty"):format(stats.added_n or 0, stats.dirty_n or 0)
+  return require("ue.csearch_smart").csearch_build_mode(stats)
 end
-
--- Read a list file into { set = {path=true}, list = {...}, n = count }.
-local function read_list_file(path)
-  local set, list, n = {}, {}, 0
-  local f = path and io.open(path, "r") or nil
-  if not f then return nil end
-  for line in f:lines() do
-    line = line:gsub("\r$", "")
-    if line ~= "" and not set[line] then
-      set[line] = true
-      n = n + 1
-      list[n] = line
-    end
-  end
-  f:close()
-  return { set = set, list = list, n = n }
-end
-
--- Drop-in replacement for the three prepare-path build_index calls.
--- cb(ok, err, stats) — stats gains .mode ("reset"|"add"|"skip") and .delta.
--- Owns: diff, mode decision, add→reset fallback, snapshot refresh on success.
--- Does NOT own: csearch_build_begin/done (call sites keep that), fingerprint /
--- dirty-clear (call sites keep on_full_csearch_success — snapshot refresh here
--- is the only extra obligation, and it is idempotent).
 function CORE_RT.csearch_smart_build(ctx, cs_ctx, abs_list, cb)
-  local code_search = require("utils.code_search")
-  local snap_path = CORE_RT.csearch_snapshot_path(ctx)
-  local new_list = read_list_file(abs_list)
-  if not new_list then
-    vim.schedule(function() cb(false, "cannot read " .. tostring(abs_list), {}) end)
-    return
-  end
-
-  local function snapshot_current()
-    if not snap_path then return end
-    pcall(function()
-      local uvfs = vim.uv or vim.loop
-      uvfs.fs_copyfile(abs_list, snap_path)
-    end)
-  end
-
-  local function run_reset(reason, after_fallback)
-    code_search.build_index(cs_ctx, abs_list, function(ok, err, stats)
-      stats = stats or {}
-      stats.mode = "reset"
-      stats.delta = reason
-      if ok then snapshot_current() end
-      cb(ok, err, stats)
-    end, { mode = "reset" })
-    if after_fallback then
-      vim.schedule(function()
-        vim.notify("[ue] csearch incremental add failed — fell back to full rebuild ("
-          .. tostring(after_fallback) .. ")", vim.log.levels.WARN,
-          { title = "UE", replace = "ue.csearch.build" })
-      end)
-    end
-  end
-
-  -- Gather diff inputs.
-  local old_list = snap_path and read_list_file(snap_path) or nil
-  -- The sidecar predates the primary csearch index and can be absent after an
-  -- upgrade or interrupted cleanup. Rebuild it without a full reset only when
-  -- two independent facts agree: the primary index is usable, and the current
-  -- canonical workspace list has the exact fingerprint recorded after the last
-  -- successful build. The absolute temp list cannot be hashed for this check
-  -- because workspace_all.files is workspace-relative on same-drive entries.
-  if not old_list and snap_path and ctx and ctx.paths and ctx.paths.workspace_all_list then
-    local state = read_state(ctx.engine_root)
-    local recorded = state and state.csearch_input_hash or nil
-    local current = CORE_RT.list_fingerprint(ctx.paths.workspace_all_list)
-    local ok_indexed, indexed = pcall(code_search.is_indexed, cs_ctx)
-    if ok_indexed and indexed and type(recorded) == "string" and recorded ~= ""
-        and current == recorded then
-      old_list = new_list
-    end
-  end
-  local added, removed_n = {}, 0
-  if old_list then
-    for _, p in ipairs(new_list.list) do
-      if not old_list.set[p] then added[#added + 1] = p end
-    end
-    for _, p in ipairs(old_list.list) do
-      if not new_list.set[p] then removed_n = removed_n + 1 end
-    end
-  end
-  -- Watcher dirty files still present in the new set (modified existing files;
-  -- drop entries that vanished — they show up as removals instead).
-  local dirty_in_set, dirty_seen, dirty_capped = {}, {}, false
-  do
-    local ok_watch, watch = pcall(require, "utils.ue_watch")
-    dirty_capped = ok_watch and watch.persistent_dirty_status and watch.persistent_dirty_status().capped or false
-    if ok_watch and type(watch.snapshot_persistent_dirty) == "function" then
-      for _, p in ipairs(watch.snapshot_persistent_dirty() or {}) do
-        if new_list.set[p] and not dirty_seen[p] then
-          dirty_seen[p] = true
-          dirty_in_set[#dirty_in_set + 1] = p
-        end
-      end
-    end
-  end
-  -- added ∪ dirty without double-counting.
-  local add_input, add_seen = {}, {}
-  for _, p in ipairs(added) do
-    if not add_seen[p] then add_seen[p] = true; add_input[#add_input + 1] = p end
-  end
-  for _, p in ipairs(dirty_in_set) do
-    if not add_seen[p] then add_seen[p] = true; add_input[#add_input + 1] = p end
-  end
-
-  local mode, why = CORE_RT.csearch_build_mode({
-    forced       = ctx and ctx._force_csearch or false,
-    has_snapshot = old_list ~= nil,
-    added_n      = #added,
-    removed_n    = removed_n,
-    dirty_n      = #dirty_in_set,
-    dirty_capped = dirty_capped,
-    total_n      = new_list.n,
+  return require("ue.csearch_smart").csearch_smart_build(ctx, cs_ctx, abs_list, cb, {
+    read_state = read_state, list_fingerprint = CORE_RT.list_fingerprint,
   })
-
-  -- Probe (D11 soak): record which mode each prepare takes, so the next
-  -- session can verify the incremental path actually fires in daily use
-  -- (report-first workflow — probe-feedback-loop spec #1).
-  pcall(function()
-    local probe = require("utils.probe")
-    probe.observe("csearch-smart-build", "durable-overflow-2026-09-24"); probe.record("csearch-smart-build", mode, why)
-  end)
-
-  if mode == "skip" then
-    snapshot_current()  -- ordering may differ; keep snapshot in lockstep with list
-    vim.schedule(function()
-      cb(true, nil, { mode = "skip", delta = why, ms = 0, index_size = 0, skipped = true })
-    end)
-    return
-  end
-
-  if mode == "reset" then
-    run_reset(why)
-    return
-  end
-
-  -- mode == "add": feed ONLY the delta.
-  local add_list_path = abs_list .. (".add.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
-  local fout = io.open(add_list_path, "w")
-  if not fout then
-    run_reset("cannot write add-list")
-    return
-  end
-  for _, p in ipairs(add_input) do fout:write(p, "\n") end
-  fout:close()
-  code_search.build_index(cs_ctx, add_list_path, function(ok, err, stats)
-    pcall(os.remove, add_list_path)
-    if ok then
-      stats = stats or {}
-      stats.mode = "add"
-      stats.delta = why
-      snapshot_current()
-      cb(true, nil, stats)
-      return
-    end
-    -- Incremental refused/failed (typically D9 unusable-idx guard). One
-    -- automatic reset — always safe — instead of surfacing a dead end.
-    pcall(function()
-      require("utils.probe").record("csearch-smart-build", "add-fallback-reset",
-        tostring(err or "?"):sub(1, 120))
-    end)
-    run_reset("fallback after add failure", err or "?")
-  end, { mode = "add" })
 end
 
 -- Test seams (D11).
@@ -3206,13 +3033,16 @@ local function scan_shader_files(root, search_paths)
   if vim.fn.executable("fd") == 1 and vim.system then
     local cmd = { "fd", "--type", "f", "--hidden", "--no-ignore", "--absolute-path" }
     for _, ex in ipairs(UE_CONST.SCAN_EXCLUDES) do
-      table.insert(cmd, "--exclude"); table.insert(cmd, ex)
+      table.insert(cmd, "--exclude")
+table.insert(cmd, ex)
     end
     for _, ext in ipairs(M.FT_SHADER) do
-      table.insert(cmd, "-e"); table.insert(cmd, ext)
+      table.insert(cmd, "-e")
+table.insert(cmd, ext)
     end
     for _, sp in ipairs(existing) do
-      table.insert(cmd, "--search-path"); table.insert(cmd, sp)
+      table.insert(cmd, "--search-path")
+table.insert(cmd, sp)
     end
     local ok, result = pcall(function()
       return vim.system(cmd, { text = true, cwd = root }):wait()
@@ -4324,8 +4154,10 @@ function M._logged_jobstart(cmd, tag, opts)
 
   local function flush_log(code)
     -- Flush any unfinished trailing lines before the footer.
-    emit(pending.stdout); pending.stdout = ""
-    emit(pending.stderr); pending.stderr = ""
+    emit(pending.stdout)
+pending.stdout = ""
+    emit(pending.stderr)
+pending.stderr = ""
     if not log_file then return end
     log_file:write(("\n# exit: %s (%s)\n"):format(tostring(code), os.date("%Y-%m-%d %H:%M:%S")))
     log_file:close()
@@ -4490,6 +4322,12 @@ do
 
   function CORE_RT.target_context(ctx, platform_override, opts)
     opts = opts or {}
+    if opts.snapshot then
+      local frozen = require("ue.workflows._runtime").unwrap(opts.snapshot)
+      if frozen.target_context then
+        return frozen.target_context, nil, require("ue.targets").driver(frozen.target.id)
+      end
+    end
     local uproject = ctx.uproject or find_uproject_in_dir(ctx.project_root)
     if not uproject then
       return nil, "No .uproject found in project root: " .. tostring(ctx.project_root)
@@ -4615,22 +4453,14 @@ end
 -- ==========================================================================
 
 local function append_job_output(lines, pending, chunks)
-  pending = pending or ""
-  for _, chunk in ipairs(chunks or {}) do
-    if chunk and chunk ~= "" then
-      pending = pending .. chunk
-      while true do
-        local newline = pending:find("\n", 1, true)
-        if not newline then
-          break
-        end
-        local line = trim(strip_ansi(pending:sub(1, newline - 1)))
-        if line ~= "" then
-          table.insert(lines, line)
-        end
-        pending = pending:sub(newline + 1)
-      end
-    end
+  -- Channel arrays split on newline; only the endpoints are fragments.
+  pending = (pending or "") .. table.concat(chunks or {}, "\n")
+  while true do
+    local newline = pending:find("\n", 1, true)
+    if not newline then break end
+    local line = trim(strip_ansi(pending:sub(1, newline - 1)))
+    if line ~= "" then table.insert(lines, line) end
+    pending = pending:sub(newline + 1)
   end
   return pending
 end
@@ -4661,6 +4491,7 @@ local function open_terminal_command(cmd, opts)
   local function track_state(buf, win)
     CORE_RT.build_term_buf = buf
     CORE_RT.build_term_win = win
+    require("utils.bottom_panel").register("build", buf)
 
     vim.api.nvim_create_autocmd("BufWipeout", {
       buffer = buf,
@@ -4693,14 +4524,12 @@ local function open_terminal_command(cmd, opts)
 
   local function ensure_window()
     prune_state()
-
-    if CORE_RT.build_term_win and focus_window(CORE_RT.build_term_win) then
-      return CORE_RT.build_term_win
-    end
-
     local height = opts.height or math.max(8, math.floor(vim.o.lines * 0.25))
-    vim.cmd(("botright %dnew"):format(height))
-    CORE_RT.build_term_win = vim.api.nvim_get_current_win()
+    CORE_RT.build_term_win = require("utils.bottom_panel").show(
+      "build",
+      CORE_RT.build_term_buf,
+      { height = height, focus = opts.focus == true }
+    )
     return CORE_RT.build_term_win
   end
 
@@ -4709,81 +4538,91 @@ local function open_terminal_command(cmd, opts)
     if CORE_RT.build_term_buf and vim.api.nvim_buf_is_valid(CORE_RT.build_term_buf) then
       vim.api.nvim_win_set_buf(running_win, CORE_RT.build_term_buf)
     end
-    startinsert_in_window(running_win)
+    if opts.focus == true then
+      startinsert_in_window(running_win)
+    end
     vim.notify("UE build is already running", vim.log.levels.WARN)
     return
   end
 
   local win = ensure_window()
-  local previous_buf = CORE_RT.build_term_buf
   local buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_win_set_buf(win, buf)
+  vim.b[buf].ue_build_title = opts.quickfix_title or opts.finish_label or "UE build"
   track_state(buf, win)
   -- Closing the terminal window is a presentation action, not task
   -- cancellation. `bufhidden=wipe` terminates a live terminal job (reported
   -- by Neovim as exit 143), so keep the buffer hidden while the build runs.
-  -- The exit callback restores the old cleanup behavior once no process can
-  -- be killed by wiping the buffer.
+  -- Each stage stays in the bottom panel's bounded history.
   vim.bo[buf].bufhidden = "hide"
   vim.bo[buf].buflisted = false
   vim.bo[buf].swapfile = false
 
-  if previous_buf and previous_buf ~= buf and vim.api.nvim_buf_is_valid(previous_buf) then
-    pcall(vim.api.nvim_buf_delete, previous_buf, { force = true })
-  end
-
   if opts.quickfix_title then
+    require("ue.build_diagnostics").clear()
     set_build_status("B...")
   end
 
   local build_monitor
   local active_jobid
-  local foreground_token
-  active_jobid = vim.fn.termopen(cmd, {
-    cwd = opts.cwd,
-    env = opts.env,
-    on_stdout = function(_, data)
-      stdout_pending = append_job_output(output_lines, stdout_pending, data)
-    end,
-    on_stderr = function(_, data)
-      stderr_pending = append_job_output(output_lines, stderr_pending, data)
-    end,
-    on_exit = function(_, code)
-      vim.schedule(function()
-        if build_monitor then
-          build_monitor:stop()
-          build_monitor = nil
-        end
-        if vim.api.nvim_buf_is_valid(buf) then
-          vim.bo[buf].bufhidden = "wipe"
-        end
-        stdout_pending = flush_job_output(output_lines, stdout_pending)
-        stderr_pending = flush_job_output(output_lines, stderr_pending)
-        if CORE_RT.build_term_jobid == active_jobid then
-          CORE_RT.build_term_jobid = nil
-        end
-        if foreground_token then require("utils.host_admission").foreground_done(foreground_token); foreground_token = nil end
-        if code ~= 0 and opts.quickfix_title then
-          populate_quickfix_from_output(opts.quickfix_title, output_lines, {
-            root = opts.quickfix_root,
-            tail_limit = opts.tail_limit,
+  local foreground_token, verification_id
+  active_jobid = vim.api.nvim_win_call(win, function()
+    return vim.fn.termopen(cmd, {
+      cwd = opts.cwd,
+      env = opts.env,
+      on_stdout = function(_, data)
+        stdout_pending = append_job_output(output_lines, stdout_pending, data)
+      end,
+      on_stderr = function(_, data)
+        stderr_pending = append_job_output(output_lines, stderr_pending, data)
+      end,
+      on_exit = function(_, code)
+        vim.schedule(function()
+          if build_monitor then
+            build_monitor:stop()
+            build_monitor = nil
+          end
+          if vim.api.nvim_buf_is_valid(buf) then
+            vim.bo[buf].bufhidden = "hide"
+          end
+          stdout_pending = flush_job_output(output_lines, stdout_pending)
+          stderr_pending = flush_job_output(output_lines, stderr_pending)
+          local owns_terminal = CORE_RT.build_term_jobid == active_jobid
+          if owns_terminal then
+            CORE_RT.build_term_jobid = nil
+          end
+          if foreground_token then
+            require("utils.host_admission").foreground_done(foreground_token)
+            foreground_token = nil
+          end
+          local current = owns_terminal and (not opts.is_current or opts.is_current())
+          require("utils.build_verification").finish(verification_id, {
+            current = current, code = code, title = opts.quickfix_title,
+            entries = code ~= 0 and opts.quickfix_title and (current or verification_id) and diagnostic_entries_from_output(output_lines, {
+              root = opts.quickfix_root, tail_limit = opts.tail_limit,
+            }) or {},
           })
-        end
-        if opts.quickfix_title then
-          set_build_status(code == 0 and "BOK" or ("B" .. tostring(code)))
-        end
-        local level = code == 0 and vim.log.levels.INFO or vim.log.levels.ERROR
-        local msg = ("%s finished with exit code %d"):format(
-          opts.finish_label or "UE build", code
-        )
-        vim.notify(msg, level)
-        if code ~= 0 then require("utils.log").error("ue.build", msg) end
-        if type(opts.on_exit) == "function" then
-          opts.on_exit(code, vim.deepcopy(output_lines))
-        end
-      end)
-    end,
-  })
+          if current and opts.quickfix_title then
+            set_build_status(code == 0 and "BOK" or ("B" .. tostring(code)))
+          end
+          local level = code == 0 and vim.log.levels.INFO or vim.log.levels.ERROR
+          local msg = ("%s finished with exit code %d"):format(opts.finish_label or "UE build", code)
+          if current and code ~= 0 and opts.quickfix_title then
+            msg = msg .. " — " .. require("ue.build_diagnostics").summary()
+          end
+          if current then
+            vim.notify(msg, level)
+          end
+          if code ~= 0 then
+            require("utils.log").error("ue.build", msg)
+          end
+          if type(opts.on_exit) == "function" then
+            opts.on_exit(code, vim.deepcopy(output_lines))
+          end
+        end)
+      end,
+    })
+  end)
   if active_jobid <= 0 then
     CORE_RT.build_term_jobid = nil
     if opts.quickfix_title then
@@ -4794,7 +4633,9 @@ local function open_terminal_command(cmd, opts)
   end
 
   CORE_RT.build_term_jobid = active_jobid
-  foreground_token = require("utils.host_admission").foreground_begin(opts.quickfix_title or opts.finish_label or "terminal task")
+  verification_id = require("utils.build_verification").begin(opts.verification_context, buf, active_jobid, opts.quickfix_title)
+  foreground_token =
+    require("utils.host_admission").foreground_begin(opts.quickfix_title or opts.finish_label or "terminal task")
   -- Register after job creation; status remains derived from the channel.
   pcall(function()
     require("utils.task_registry").register({
@@ -4811,7 +4652,9 @@ local function open_terminal_command(cmd, opts)
       bufnr = buf,
     })
   end)
-  startinsert_in_window(win)
+  if opts.focus == true then
+    startinsert_in_window(win)
+  end
   return active_jobid
 end
 
@@ -5032,22 +4875,30 @@ function CORE_RT.grep_format_grouped(item)
   end
 
   chunks[#chunks + 1] = { tostring(pos[1] or 1), "SnacksPickerRow" }
-  chunks[#chunks + 1] = { ":", "SnacksPickerDelim" }
-  chunks[#chunks + 1] = { tostring((pos[2] or 0) + 1), "SnacksPickerCol" }
+  if item.ue_location and item.ue_location.precision == "line" then
+    chunks[#chunks + 1] = { " [行定位]", "SnacksPickerComment" }
+  else
+    chunks[#chunks + 1] = { ":", "SnacksPickerDelim" }
+    chunks[#chunks + 1] = { tostring((pos[2] or 0) + 1), "SnacksPickerCol" }
+  end
   chunks[#chunks + 1] = { " │ ", "SnacksPickerDelim" }
   chunks[#chunks + 1] = { line }
   return chunks
 end
 
-function CORE_RT.grep_hit_item(file, lnum, col, text, pattern, regex)
-  local start_col = math.max(0, (tonumber(col) or 1) - 1)
+function CORE_RT.grep_hit_item(file, lnum, col, text, pattern, regex, location)
+  local exact = not location or location.precision == "exact"
+  local start_col = exact and math.max(0, (tonumber(col) or 1) - 1) or 0
   local item = {
-    text = file .. ":" .. lnum .. ":" .. col .. ":" .. text,
+    text = file .. ":" .. lnum .. (exact and (":" .. tostring(col)) or " [行定位]") .. ":" .. text,
     line = text,
     pos = { lnum, start_col },
     file = file,
+    ue_location = location,
   }
-  if regex ~= true and tostring(pattern or "") ~= "" then
+  if exact and location and location.byte_end0 then
+    item.end_pos = { lnum, location.byte_end0 }
+  elseif exact and regex ~= true and tostring(pattern or "") ~= "" then
     item.end_pos = { lnum, start_col + #tostring(pattern) }
   end
   return item
@@ -5172,15 +5023,14 @@ function M.cached_code_file_list(opts)
   return { files = files, root = info.root, list_path = info.list_path }
 end
 
--- Files picker using cached file list (avoids fd traversal and streams results into Snacks).
+-- Files picker uses an independent, complete per-process inventory.
 -- list_type: "all" (default) or "code"
 function M.cached_files(opts)
   opts = opts or {}
   local list_type = opts.list_type or "all"
-  local info = cached_file_list_info(opts, list_type == "code" and "code" or "all")
-  if not info then
-    return nil
-  end
+  local ctx = resolve_context(opts)
+  if not ctx then return nil end
+  local info = { ctx = ctx, root = workspace_root(ctx) }
 
   -- Lazy-start ue_watch so subsequent edits/adds get tracked into the
   -- persistent dirty set even if the user never runs :UEPrepare this session.
@@ -5209,47 +5059,14 @@ function M.cached_files(opts)
 
   CORE_RT.notify_freshness(info.ctx, "find files")
 
-  local rg = _uproc.first_executable({ "rg" })
-  if not rg then
-    return nil
-  end
-
-  local snacks = require("snacks")
-  local ok, proc = pcall(require, "snacks.picker.source.proc")
-  if not ok then
-    return nil
-  end
-
-  snacks.picker.pick({
-    title = opts.title or "Find Files (cached)",
-    source = "files",
-    format = "file",
-    layout = opts.layout,
-    finder = function(_, ctx)
-      return proc.proc(
-        ctx:opts({
-          notify = false,
-          cmd = rg,
-          args = { "--no-messages", "--color", "never", "--line-buffered", "--no-filename", "^", info.list_path },
-          transform = function(item)
-            local text = trim(item.text)
-            if text == "" then
-              return false
-            end
-            item.text = text
-            item.file = text
-            if _ufs.is_absolute_path(text) then
-              item.cwd = nil
-            else
-              item.cwd = info.root
-            end
-            return item
-          end,
-        }),
-        ctx
-      )
-    end,
+  local options = vim.tbl_extend("force", vim.deepcopy(opts), {
+    title = opts.title or "Workspace Files",
+    dirs = picker_search_dirs(ctx),
+    exclude = picker_excludes({ include_third_party = list_type ~= "code" }),
+    ft = list_type == "code" and M.FT_CODE or opts.ft,
+    follow = true,
   })
+  require("utils.file_inventory").open(options)
 
   return true
 end
@@ -5264,562 +5081,18 @@ end
 -- for the rg-batched path. See lua/utils/code_search/ for backend details.
 function M.cached_grep(opts)
   opts = opts or {}
-
   local ctx = resolve_context(opts)
-  if not ctx then
-    return nil
-  end
+  if not ctx then return nil end
   CORE_RT.notify_freshness(ctx, "grep")
-
-  local snacks = require("snacks")
-  local code_search = require("utils.code_search")
-  local cs_ctx = { workspace_root = workspace_root(ctx), csearch_idx = ctx.paths and ctx.paths.csearch_idx or nil }
-  local has_index = code_search.is_indexed(cs_ctx)
-  local backend_label = has_index and "csearch" or "rg"
-
-  -- In-panel scope filter (change `refactor-search-system`): capture the
-  -- current buffer's module/plugin scope at open time so <a-s> can restrict
-  -- the search to it without leaving the picker. The scope's root path is
-  -- escaped into an RE2 fragment passed to csearch's -f file-path filter.
-  -- nil when the current file isn't inside any module/plugin (toggle no-ops).
-  local grep_scope = current_scope_info_from_context(ctx)
-  local function scope_path_regex(scope)
-    if not scope or not scope.root then return nil end
-    -- csearch indexes absolute paths with forward slashes (see UEPrepare
-    -- filelist writer). Normalize + escape RE2 metachars in the root so the
-    -- -f regex matches "<root>/..." literally.
-    local root = norm(scope.root)
-    local esc = root:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?%{%}%|%\\/])", "\\%1")
-    return esc
-  end
-
-  local function grep_picker_title(scoped)
-    local base = CORE_RT.grep_backend_title(opts.title or "Grep All Code", backend_label)
-    if scoped and grep_scope then
-      return base .. " [scope: " .. tostring(grep_scope.label or grep_scope.name or "current") .. "]"
-    end
-    return base .. " [scope: all]"
-  end
-
-  local title_default = CORE_RT.grep_backend_title("Grep All Code", backend_label)
-  local live_min_chars = opts.live_min_chars or 2
-  local live_max_count = opts.max_count or 5000
-  local short_live_max_count = opts.short_live_max_count or 1200
-
-  -- ─ Helpers shared by both csearch and rg paths ──────────────────────
-  -- Dev toggle for A/B against vanilla snacks: structured path/count formatter and
-  -- preview throttle are off when false. Runtime: :UEGrepGroupingToggle.
-  local grouping_enabled = (vim.g.ue_grep_grouping_enabled == true)
-  -- csearch emits hits grouped by file. Buffer only the current file so its count is
-  -- known, then annotate and emit the original match rows. Unlike the old synthetic
-  -- header design, this never creates a selectable item without a source location.
-  local function make_file_grouping_cb(cb)
-    local current_file = nil
-    local current_items = {}
-
-    local function flush()
-      if #current_items == 0 then return end
-      for _, item in ipairs(CORE_RT.grep_annotate_file_group(current_items, ctx)) do
-        cb(item)
-      end
-      current_items = {}
-    end
-
-    local function push(item)
-      if item == nil then return end
-      if current_file ~= nil and item.file ~= current_file then
-        flush()
-      end
-      current_file = item.file
-      current_items[#current_items + 1] = item
-    end
-
-    return push, flush
-  end
-
-  -- Per-picker keymap override:
-  -- snacks default <Tab> = select_and_next (multi-select), which on huge
-  -- grep result lists costs a full list redraw + selected-set highlight
-  -- recompute on EVERY press — feels laggy when the user is just scanning
-  -- with key-repeat. Override <Tab> to plain list_down here. Multi-select
-  -- still available via <S-Tab> / <C-Space> (which we leave alone).
-  local fast_tab_keys = {
-    win = {
-      input = { keys = { ["<Tab>"] = { "list_down", mode = { "i", "n" } } } },
-      list  = { keys = { ["<Tab>"] = "list_down" } },
-    },
-  }
-
-  -- Preview throttle: snacks default is 60ms which is faster than typical
-  -- Tab key-repeat (30-50ms), so each Tab still fires a fresh preview build.
-  -- For UE-scale files (.cpp 500KB+, 50-200ms TS highlight), this stacks up
-  -- and feels laggy. Bump to 200ms — preview renders only after the user
-  -- pauses scrolling.
-  local function on_show_picker(picker)
-    pcall(function()
-      local snacks_util = require("snacks.util")
-      local ref = picker:ref()
-      picker._throttled_preview = snacks_util.throttle(function()
-        local this = ref()
-        if this then this:_show_preview() end
-      end, { ms = 200, name = "preview" })
-    end)
-  end
-
-  -- ─ Diagnostic trace (opt-in via vim.g.ue_grep_trace) ────────────────
-  -- When enabled, write per-event lines to a stable log path so we can
-  -- post-mortem WHY the picker felt laggy on a real human typing session.
-  -- Zero overhead when disabled (single boolean check per event).
-  --
-  -- Toggle: :UEGrepTraceToggle  (or set vim.g.ue_grep_trace = true)
-  -- Log:    vim.fn.stdpath("state") .. "/ue_grep_trace.log"
-  local trace_enabled = vim.g.ue_grep_trace == true
-  local trace_log_path = vim.fn.stdpath("state") .. ("/ue_grep_trace.%d.log"):format(vim.fn.getpid())
-  local trace_t0 = vim.loop.hrtime()
-  local function trace(fmt, ...)
-    if not trace_enabled then return end
-    local ms = (vim.loop.hrtime() - trace_t0) / 1e6
-    local line = string.format("[+%8.1fms] " .. fmt, ms, ...)
-    local f = io.open(trace_log_path, "a")
-    if f then f:write(line .. "\n"); f:close() end
-  end
-  if trace_enabled then
-    -- Truncate at session start so each <leader>/ produces a clean timeline.
-    local f = io.open(trace_log_path, "w")
-    if f then
-      f:write(string.format("=== UE grep trace  %s  backend=%s  grouping=%s  has_index=%s ===\n",
-        os.date("%Y-%m-%d %H:%M:%S"), backend_label,
-        tostring(grouping_enabled), tostring(has_index)))
-      f:close()
-    end
-  end
-
-  -- Backend diagnostic — now OPT-IN (was always-on during the "<leader>/
-  -- missing results" investigation; that's confirmed fixed). Gated on the same
-  -- vim.g.ue_grep_trace flag so a normal grep writes nothing to disk (P5: no
-  -- silent per-action side-effects). Enable with :UEGrepTraceToggle when
-  -- debugging backend/mode/result-count.
-  local debug_log_path = vim.fn.stdpath("state") .. ("/ue_grep_backend_debug.%d.log"):format(vim.fn.getpid())
-  local function grep_debug(fmt, ...)
-    if vim.g.ue_grep_trace ~= true then return end
-    local ok, line = pcall(string.format, fmt, ...)
-    if not ok then
-      line = tostring(fmt)
-    end
-    local f = io.open(debug_log_path, "a")
-    if f then
-      f:write(os.date("%Y-%m-%d %H:%M:%S") .. " " .. line .. "\n")
-      f:close()
-    end
-  end
-  do
-    local idx_size = nil
-    if cs_ctx.csearch_idx then
-      local st = vim.loop.fs_stat(cs_ctx.csearch_idx)
-      idx_size = st and st.size or nil
-    end
-    grep_debug("OPEN backend=%s has_index=%s idx=%s idx_size=%s title=%s",
-      tostring(backend_label), tostring(has_index), tostring(cs_ctx.csearch_idx),
-      tostring(idx_size), tostring(CORE_RT.grep_backend_title(opts.title or title_default, backend_label)))
-  end
-
-  -- ── csearch fast path ────────────────────────────────────────────────
-  if has_index then
-    snacks.picker.pick({
-      source = "ue_grep_csearch",
-      title = grep_picker_title(false),
-      search = opts.search or "",
-      live = true,
-      need_search = true,
-      limit = live_max_count,
-      limit_live = live_max_count,
-      matcher = grouping_enabled and { sort = false } or nil, -- preserve csearch file groups
-      layout = { preset = "telescope" },
-      -- Search mode toggles. snacks auto-merges these with built-in toggles
-      -- (regex, follow, hidden, ignored, modified — see snacks/picker/config/
-      -- defaults.lua). For each entry it auto-generates a toggle_<name>
-      -- action that flips picker.opts[name] then calls picker:find().
-      --
-      -- Title icon semantics: snacks renders icon when picker.opts[name] ==
-      -- toggle.value. We want "icon visible = mode ENABLED" so:
-      --   regex: value=true   → R shows when regex mode is ON (literal off)
-      --   word:  value=true   → W shows when whole-word ON
-      --   case:  value=true   → C shows when case-sensitive ON
-      -- Without overriding regex here, snacks' default value=false would
-      -- show R when LITERAL mode is on, which is reverse intuition.
-      regex = false,
-      literal = true,
-      word = false,
-      case = false,
-      scoped = false,
-      toggles = {
-        regex = { icon = "R", value = true },
-        literal = { icon = "L", value = true },
-        word  = { icon = "W", value = true },
-        case  = { icon = "C", value = true },
-        scoped = { icon = "S", value = true },
-      },
-      -- Keymaps: Alt-r/g/x/w/c = mode toggles, shown live as R/W/C icons in
-      -- the picker title. <a-r> is the intuitive "regex" toggle (matches
-      -- snacks' own default); <a-g> = "grep regex" mnemonic alias. Both flip
-      -- the same regex flag. <a-w>/<a-x> = whole-word, <a-c> = case-sensitive.
-      -- <a-s> = restrict to the current module/plugin scope (in-panel scope
-      -- filter; shows an "S" icon when active).
-      -- NOTE: <a-r> previously collided with NVIDIA App's global Performance
-      -- Overlay hotkey; if it ever stops reaching nvim again, use <a-g>.
-      win = vim.tbl_deep_extend("force", grouping_enabled and fast_tab_keys.win or {}, {
-        input = { keys = {
-          ["<a-r>"] = { "ue_grep_toggle_regex", mode = { "i", "n" } },
-          ["<a-g>"] = { "ue_grep_toggle_regex", mode = { "i", "n" } },
-          ["<a-x>"] = { "ue_grep_toggle_word",  mode = { "i", "n" } },
-          ["<a-w>"] = { "ue_grep_toggle_word",  mode = { "i", "n" } },
-          ["<a-c>"] = { "ue_grep_toggle_case",  mode = { "i", "n" } },
-          ["<a-s>"] = { "ue_grep_toggle_scope", mode = { "i", "n" } },
-        } },
-      }),
-      actions = {
-        ue_grep_toggle_regex = function(picker)
-          picker.opts.regex = not picker.opts.regex
-          picker.opts.literal = not picker.opts.regex
-          require("snacks").notify((picker.opts.regex and "✓ regex ON " or "✗ regex OFF (literal)"),
-            { title = "UE grep", level = "info" })
-          picker.list:set_target(); picker:find()
-        end,
-        ue_grep_toggle_word = function(picker)
-          picker.opts.word = not picker.opts.word
-          require("snacks").notify((picker.opts.word and "✓ whole-word ON " or "✗ whole-word OFF"),
-            { title = "UE grep", level = "info" })
-          picker.list:set_target(); picker:find()
-        end,
-        ue_grep_toggle_case = function(picker)
-          picker.opts.case = not picker.opts.case
-          require("snacks").notify((picker.opts.case and "✓ case-sensitive ON " or "✗ ignore-case"),
-            { title = "UE grep", level = "info" })
-          grep_debug("TOGGLE backend=csearch case=%s", tostring(picker.opts.case == true))
-          picker.list:set_target(); picker:find()
-        end,
-        ue_grep_toggle_scope = function(picker)
-          if not grep_scope then
-            require("snacks").notify(
-              "✗ no module/plugin scope (current file isn't inside one)",
-              { title = "UE grep", level = "warn" })
-            return
-          end
-          picker.opts.scoped = not picker.opts.scoped
-          picker.title = grep_picker_title(picker.opts.scoped)
-          picker:update_titles()
-          require("snacks").notify(
-            (picker.opts.scoped
-              and ("✓ scope: " .. (grep_scope.label or grep_scope.name or "current"))
-              or "✗ scope OFF (whole workspace)"),
-            { title = "UE grep", level = "info" })
-          picker.list:set_target(); picker:find()
-        end,
-      },
-      format = grouping_enabled and CORE_RT.grep_format_grouped or "file",
-      on_show = grouping_enabled and on_show_picker or nil,
-      finder = function(_picker_opts, finder_ctx)
-        local pattern = finder_ctx.filter.search
-        local _picker = finder_ctx and finder_ctx.picker
-        local _po = _picker and _picker.opts or {}
-        if not CORE_RT.grep_live_search_ready(pattern, live_min_chars, _po.regex ~= true) then
-          return function() end
-        end
-        trace("finder START pattern=%q", pattern)
-        return function(cb)
-          -- snacks finder protocol: this function MUST block until ALL
-          -- callbacks have been emitted, otherwise snacks marks the finder
-          -- "done" and any later cb call trips its "yielded after done"
-          -- bug-trap. We start csearch in the background, queue items
-          -- through a buffer, and use ctx.async:sleep() to yield to the
-          -- picker until the csearch process reports done OR the picker
-          -- aborts us (sleep returns early on abort).
-          local done = false
-          local pending = {}  -- items waiting to be drained on the main loop
-          local pending_len = 0
-          local items_received = 0
-          local items_emitted = 0
-
-          local function enqueue(item)
-            pending_len = pending_len + 1
-            pending[pending_len] = item
-          end
-          local queue_item = enqueue
-          local flush_file_group = function() end
-          if grouping_enabled then
-            queue_item, flush_file_group = make_file_grouping_cb(enqueue)
-          end
-
-          local t_cs_spawn_0 = vim.loop.hrtime()
-          local cs_first_line_logged = false
-          -- Read mode toggles from picker.opts (Alt-r/Alt-x/Alt-c flip
-          -- these in place via snacks auto-generated toggle_<name> actions,
-          -- then picker:find() restarts this finder so we see the new values).
-          local pattern_len = #trim(tostring(pattern or ""))
-          local mode_case = _po.case == true
-          local mode_ignore_case = not mode_case
-          grep_debug("FINDER backend=csearch pattern=%q regex=%s word=%s case=%s ignore_case=%s max=%d",
-            tostring(pattern), tostring(_po.regex == true), tostring(_po.word == true),
-            tostring(mode_case), tostring(mode_ignore_case),
-            pattern_len <= live_min_chars and short_live_max_count or live_max_count)
-          local scope_re = (_po.scoped and grep_scope) and scope_path_regex(grep_scope) or nil
-          local stop = code_search.stream(cs_ctx, pattern, {
-            code_only   = opts.code_only,
-            smart_case  = true,
-            max_count   = pattern_len <= live_min_chars and short_live_max_count or live_max_count,
-            regex       = _po.regex == true,   -- snacks default false = literal
-            word        = _po.word == true,
-            case        = mode_case,
-            ignore_case = mode_ignore_case,
-            path_filter = scope_re,            -- in-panel scope filter (<a-s>)
-          }, {
-            on_line = function(file, lnum, col, text)
-              if not cs_first_line_logged then
-                cs_first_line_logged = true
-                trace("PHASE csearch_first_line=%.2fms after_spawn",
-                  (vim.loop.hrtime() - t_cs_spawn_0) / 1e6)
-              end
-              -- Buffer only real match items. The literal path carries an
-              -- exact end_pos so Snacks preview never reinterprets raw input
-              -- such as "." as Vim regex syntax.
-              queue_item(CORE_RT.grep_hit_item(
-                file, lnum, col, text, pattern, _po.regex == true))
-              items_received = items_received + 1
-            end,
-            on_done = function(code, err)
-              -- csearch output is file-grouped. Close the final group before
-              -- done=true so the normal budgeted drain sees every annotated
-              -- real hit and never needs a synthetic header row.
-              flush_file_group()
-              done = true
-              trace("csearch DONE pat=%q recv=%d code=%s err=%s elapsed=%.1fms",
-                pattern, items_received, tostring(code),
-                tostring(err and err:sub(1,80)),
-                (vim.loop.hrtime() - t_cs_spawn_0) / 1e6)
-              grep_debug("DONE backend=csearch pattern=%q recv=%d code=%s err=%s elapsed=%.1fms",
-                tostring(pattern), items_received, tostring(code),
-                tostring(err and err:sub(1, 120)),
-                (vim.loop.hrtime() - t_cs_spawn_0) / 1e6)
-              if err and code ~= 0 then
-                vim.schedule(function()
-                  vim.notify("UE grep [csearch]: " .. err, vim.log.levels.WARN, { title = "UE" })
-                end)
-              end
-            end,
-          })
-          trace("PHASE cs_stream_call_returned=%.2fms",
-            (vim.loop.hrtime() - t_cs_spawn_0) / 1e6)
-
-          -- Watchdog timer: snacks aborts our async task by killing the
-          -- coroutine — when that happens our drain loop never executes
-          -- another iteration so its abort-detection branch never fires
-          -- and stop() never runs. Result: csearch processes accumulate.
-          --
-          -- Fix: an independent vim.loop timer outside the coroutine.
-          -- It checks the picker's filter every 30ms and kills csearch
-          -- the moment we detect the user moved on. This survives
-          -- coroutine death.
-          local watchdog_killed = false
-          local watchdog
-          local ok_timer, timer = pcall(vim.loop.new_timer)
-          if ok_timer and timer then
-            watchdog = timer
-            trace("WATCHDOG start pat=%q", pattern)
-            local ok_start = pcall(function()
-              watchdog:start(30, 30, vim.schedule_wrap(function()
-                -- Snapshot reference; timer callback may fire after
-                -- watchdog has been nilled by the outer cleanup path.
-                local t = watchdog
-                if watchdog_killed or done then
-                  if t and not t:is_closing() then
-                    pcall(function() t:stop() end)
-                    pcall(function() t:close() end)
-                  end
-                  return
-                end
-                -- IMPORTANT: do NOT compare against finder_ctx.filter —
-                -- snacks captures the filter REFERENCE at finder start
-                -- and never updates it for this finder. Compare against
-                -- the LIVE input with Snacks' same trim normalization instead.
-                local cur = nil
-                local p = finder_ctx and finder_ctx.picker
-                if p and p.input and p.input.filter then
-                  cur = p.input.filter.search
-                end
-                if cur ~= nil and trim(cur) ~= pattern then
-                  watchdog_killed = true
-                  trace("WATCHDOG kill pat=%q new=%q recv=%d",
-                    pattern, tostring(cur), items_received)
-                  pcall(stop)
-                  if t and not t:is_closing() then
-                    pcall(function() t:stop() end)
-                    pcall(function() t:close() end)
-                  end
-                end
-              end))
-            end)
-            if not ok_start then
-              trace("WATCHDOG start FAILED pat=%q", pattern)
-            end
-          else
-            trace("WATCHDOG new_timer FAILED pat=%q", pattern)
-          end
-          local function kill_watchdog()
-            watchdog_killed = true
-            if watchdog and not watchdog:is_closing() then
-              pcall(function() watchdog:stop() end)
-              pcall(function() watchdog:close() end)
-            end
-          end
-
-          -- Drain loop: sleep in short slices so we can flush pending
-          -- items frequently AND react to picker aborts (filter.search
-          -- changing under us). Small slice (5ms) lets us notice aborts
-          -- fast — when the user is typing, each keystroke aborts the
-          -- prior finder, and a 30ms slice meant 30ms of dead csearch
-          -- output kept landing in the picker. Per-tick cb count is also
-          -- capped so we never hand snacks more than CB_BUDGET items in
-          -- one frame (large bursts → snacks rebuilds list+highlight per
-          -- batch and can stall the main loop for tens of ms).
-          -- Tunables: smaller slice = faster abort response; smaller
-          -- budget = lower per-tick stall on snacks redraw. Sweet spot
-          -- found empirically at 2ms / 80 — abort after typing a key is
-          -- ~imperceptible, and large result bursts (Render*, FName etc.)
-          -- spread across ~10 frames at 16ms each instead of stalling
-          -- one frame for 100ms+.
-          local drain_slice_ms = 2
-          local CB_BUDGET = 80  -- items per drain tick
-          local max_total_ms = 30000  -- absolute upper bound, ~30s
-          local elapsed = 0
-          local read_idx = 1
-          local tick_count = 0
-          local longest_drain_ms = 0
-          while not done and elapsed < max_total_ms do
-            tick_count = tick_count + 1
-            -- Abort detection: compare against LIVE picker input, not the
-            -- finder_ctx.filter snapshot (snacks captures the filter at
-            -- finder start and never updates it for this finder, so
-            -- finder_ctx.filter.search would always equal `pattern`).
-            local cur_search = nil
-            do
-              local p = finder_ctx and finder_ctx.picker
-              if p and p.input and p.input.filter then
-                cur_search = p.input.filter.search
-              end
-            end
-            if cur_search ~= nil and trim(cur_search) ~= pattern then
-              trace("ABORT pat=%q new=%q tick=%d elapsed=%dms recv=%d emit=%d pending=%d",
-                pattern, tostring(cur_search), tick_count, elapsed,
-                items_received, items_emitted, pending_len - read_idx + 1)
-              pcall(stop)
-              break
-            end
-            -- Drain up to CB_BUDGET items accumulated since last slice.
-            -- Use read_idx + pending_len rather than #pending: drained
-            -- entries are set to nil below, and Lua's length operator is
-            -- undefined on tables with holes. Using #pending here used to
-            -- drop tail hits (e.g. backend recv=15 but picker emitted=12).
-            local n = pending_len
-            if read_idx <= n then
-              local stop_at = math.min(n, read_idx + CB_BUDGET - 1)
-              local drain_t0 = vim.loop.hrtime()
-              for i = read_idx, stop_at do
-                local item = pending[i]
-                if item then
-                  cb(item)
-                  items_emitted = items_emitted + 1
-                end
-                pending[i] = nil
-              end
-              local drain_ms = (vim.loop.hrtime() - drain_t0) / 1e6
-              if drain_ms > longest_drain_ms then longest_drain_ms = drain_ms end
-              if drain_ms > 20 then
-                trace("SLOW DRAIN tick=%d elapsed=%dms emitted=%d in %.1fms (budget=%d, queue_len=%d)",
-                  tick_count, elapsed, stop_at - read_idx + 1, drain_ms, CB_BUDGET, n - stop_at)
-              end
-              read_idx = stop_at + 1
-            end
-            finder_ctx.async:sleep(drain_slice_ms)
-            elapsed = elapsed + drain_slice_ms
-          end
-
-          -- Detect WHY we exited the loop. If the user aborted us
-          -- (filter changed), we MUST NOT call cb anymore — snacks has
-          -- marked our finder done and any further cb trips the
-          -- "yielded after done" bug-trap. Just kill the subprocess and
-          -- discard any pending items.
-          -- Detect WHY we exited the loop. Use LIVE picker input (not
-          -- finder_ctx.filter snapshot — same reason as drain abort).
-          local final_cur = nil
-          do
-            local p = finder_ctx and finder_ctx.picker
-            if p and p.input and p.input.filter then
-              final_cur = p.input.filter.search
-            end
-          end
-          local aborted = (final_cur ~= nil and trim(final_cur) ~= pattern)
-
-          if not aborted then
-            flush_file_group()
-            -- Final drain after done (still safe — we haven't returned).
-            -- Resume from read_idx so we don't double-cb earlier items.
-            local final_drain_t0 = vim.loop.hrtime()
-            local final_count = 0
-            for i = read_idx, pending_len do
-              local item = pending[i]
-              if item then
-                cb(item)
-                final_count = final_count + 1
-                items_emitted = items_emitted + 1
-              end
-              pending[i] = nil
-            end
-            local final_drain_ms = (vim.loop.hrtime() - final_drain_t0) / 1e6
-            trace("FINAL DRAIN pat=%q count=%d in %.1fms", pattern, final_count, final_drain_ms)
-            grep_debug("FINAL backend=csearch pattern=%q final_count=%d total_recv=%d emitted_before_final=%d",
-              tostring(pattern), final_count, items_received, items_emitted)
-          end
-
-          -- Stop the subprocess if it's still alive (timeout / abort path).
-          if not done then
-            pcall(stop)
-          end
-
-          -- Watchdog cleanup: normal completion path. Abort path also
-          -- kills it from inside the timer callback once it detects the
-          -- abort; this is the catch-all for the "loop exited because
-          -- done=true" path.
-          kill_watchdog()
-
-          trace("finder END pat=%q aborted=%s ticks=%d elapsed=%dms recv=%d emit=%d longest_drain=%.1fms",
-            pattern, tostring(aborted), tick_count, elapsed,
-            items_received, items_emitted, longest_drain_ms)
-          grep_debug("END backend=csearch pattern=%q aborted=%s recv=%d emitted=%d longest_drain=%.1fms",
-            tostring(pattern), tostring(aborted), items_received, items_emitted, longest_drain_ms)
-        end
-      end,
-    })
-    return true
-  end
-
-  -- ── No csearch index: <leader>/ NEVER falls back to rg ─────────────
-  -- Hard contract (change `refactor-search-system`): this entry is csearch-
-  -- ONLY. We removed all three former rg back-doors (rg-batched fallback,
-  -- return-nil -> snacks dir-walk, and the "ue_grep_rg" fast-path). When no
-  -- csearch index is available we surface a visible error and open NO picker.
-  -- rg lives on elsewhere: <leader>sG (ue_grep_all) is the explicit rg entry,
-  -- and code_search.stream() keeps its rg branch for gd/gr fallback (P12).
-  if not vim.b._ue_grep_no_index_warned then
-    vim.b._ue_grep_no_index_warned = true
-    vim.schedule(function()
-      vim.notify(
-        "UE grep: no csearch index — <leader>/ is csearch-only and will not " ..
-        "fall back to rg. Run :UEPrepare to build the index. " ..
-        "(For an explicit rg search use <leader>sG.)",
-        vim.log.levels.ERROR, { title = "UE" })
-    end)
-  end
-  return nil
+  return require("utils.search_picker").open(opts, ctx, {
+    workspace_root = workspace_root(ctx),
+    scope = current_scope_info_from_context(ctx),
+    grep_live_search_ready = CORE_RT.grep_live_search_ready,
+    grep_backend_title = CORE_RT.grep_backend_title,
+    grep_annotate_file_group = CORE_RT.grep_annotate_file_group,
+    grep_format_grouped = CORE_RT.grep_format_grouped,
+    grep_hit_item = CORE_RT.grep_hit_item,
+  })
 end
 
 -- ==========================================================================
@@ -5851,6 +5124,14 @@ function M.statusline_status(opts)
   local build = trim(vim.g.ue_build_status or "")
   if build ~= "" then
     parts[#parts + 1] = build
+  end
+
+  -- Target-owned status token (e.g. Android device/package the next install,
+  -- deploy or attach will use). The target driver decides; no literal here.
+  local target_driver = require("ue.targets").driver(trim((ctx.state or {}).target_platform or ""))
+  if target_driver and type(target_driver.status_token) == "function" then
+    local ok_token, token = pcall(target_driver.status_token, ctx.state or {})
+    if ok_token and type(token) == "string" and token ~= "" then parts[#parts + 1] = token end
   end
 
   -- Generic background-task count segment (⏵N). Shown only when N>0; absent
@@ -6352,22 +5633,34 @@ do
   -- Async references twin of M.gtags_references. `gr` MUST NOT block: the sync
   -- twin reaches vim.system(...):wait(); bare spawn floor here is 87ms p50 and
   -- `global -r` 82ms p50 / 293ms max (2026-08-25, K52). on_done(true)=populated.
-  function M.gtags_references_async(symbol, on_done)
+  function M.gtags_references_async(symbol, on_done, opts)
     on_done = on_done or function() end
-    local ctx, err = resolve_context()
+    opts = opts or {}
+    local function current()
+      if not opts.is_current then return true end
+      local ok, value = pcall(opts.is_current)
+      return ok and value == true
+    end
+    if not current() then return end
+    local ctx, err = opts.context, nil
+    if not ctx then ctx, err = resolve_context() end
     if not ctx then
-      vim.notify(err, vim.log.levels.WARN)
+      if current() then vim.notify(err, vim.log.levels.WARN) end
       return on_done(false)
     end
     if not ctx.project_root or ctx.project_root == "" or not db_ready(ctx.paths.workspace_db) then
       return on_done(false)
     end
     local root = workspace_root(ctx)
-    global_lines_async(root, ctx.paths.workspace_db,
+    return global_lines_async(root, ctx.paths.workspace_db,
       { "-r", "--literal", "--result=grep", symbol }, function(code, lines)
-        local hit = (code == 0 or code == 1) and lines and #lines > 0
-          and populate_quickfix_from_global("GTAGS references: " .. symbol, root, lines)
-        on_done(hit and true or false)
+        if not current() then return end
+        local entries = (code == 0 or code == 1) and parse_global_entries(root, lines or {}) or {}
+        if opts.collect then
+          return on_done(#entries > 0, entries, { source = "GTAGS", coverage = "unknown" })
+        end
+        local hit = populate_quickfix_from_entries("GTAGS references: " .. symbol, entries)
+        on_done(hit and true or false, entries, { source = "GTAGS", coverage = "unknown" })
       end)
   end
 end
@@ -6572,7 +5865,8 @@ local function invalidate_project_scoped_cache(_, reason)
   return 0
 end
 
-local function set_project(input)
+local function set_project(input, opts)
+  opts = opts or {}
   local engine_root = current_engine_root()
   if not engine_root then
     vim.notify("No Unreal Engine root found from current buffer or cwd", vim.log.levels.WARN)
@@ -6585,6 +5879,7 @@ local function set_project(input)
     local default_path = state.project_root or cwd()
     input = vim.fn.input("UE project dir or .uproject: ", default_path, "file")
   end
+  if opts.is_current and not opts.is_current() then return end
 
   local project_root, uproject, err = resolve_project_input(input, engine_root)
   -- Shared state/path consumers currently strip a drive root's separator.
@@ -6641,7 +5936,9 @@ end
 CORE_RT.set_project = set_project
 end -- close do-block opened above invalidate_project_scoped_cache
 
-local function set_android_package(input)
+local function set_android_package(input, opts)
+  opts = opts or {}
+  if opts.is_current and not opts.is_current() then return end
   local engine_root = current_engine_root()
   if not engine_root then
     vim.notify("No Unreal Engine root found from current buffer or cwd", vim.log.levels.WARN)
@@ -6649,8 +5946,16 @@ local function set_android_package(input)
   end
 
   input = trim(input)
-  if input == "" then
-    input = vim.fn.input("Android package name: ", read_state(engine_root).android_package or "")
+  if input == "" and vim.g.ue_prepare_headless ~= 1 then
+    -- No argument: pick from the device's installed packages (current value
+    -- first) instead of retyping the name; the pick re-enters with the name.
+    local device = require("utils.android_device")
+    local serial = device.get()
+    local current = trim(read_state(engine_root).android_package or "")
+    return require("utils.android_package").pick(vim.tbl_extend("force", opts, {
+      adb = serial and device.adb_executable() or nil, serial = serial,
+      known = current ~= "" and { current } or nil,
+    }), function(name) if name then CORE_RT.set_android_package(name, opts) end end)
   end
   if input == "" then return end
   -- K61: commit() re-reads the field from the readers' bucket, so a failed or
@@ -6662,6 +5967,8 @@ local function set_android_package(input)
     or ("UE Android package NOT set: " .. tostring(err))
   vim.notify(msg, ok and vim.log.levels.INFO or vim.log.levels.ERROR)
 end
+
+CORE_RT.set_android_package = set_android_package
 
 -- Tell ue.lua how to find the .uproject when only a workspace root is given
 -- to :UESetProject. Stored in the selected project's state bucket so it never
@@ -6864,6 +6171,9 @@ end
 
 local function set_platform(input, opts)
   opts = opts or {}
+  local function current() return not opts.is_current or opts.is_current() end
+  local select_ui = opts.ui_select or vim.ui.select
+  if not current() then return end
   local engine_root, project_root, uproject, state = platform_selection_context()
   if not engine_root then
     vim.notify("No Unreal Engine root found from current buffer or cwd", vim.log.levels.WARN)
@@ -6901,6 +6211,7 @@ local function set_platform(input, opts)
       engine_root,
       (plat and plat ~= "") and plat or current_plat,
       (conf and conf ~= "") and conf or current_conf)
+    if not current() then return end
     if not ok_update then
       vim.notify("Failed to set target: " .. tostring(update_err), vim.log.levels.ERROR)
       return
@@ -6932,6 +6243,7 @@ local function set_platform(input, opts)
     -- Try the cheap path first: if a shard already exists for the new
     -- (platform,config), flip manifest.active + re-merge in-place (~1s)
     -- instead of forcing a full :UEPrepare (~30-60s).
+    if not current() then return end
     local ok, key, info = CORE_RT.fast_swap_active_platform(engine_root)
     if ok then
       vim.notify(("UE platform: %s %s\nFast-swapped to shard %s (%d entries, %d shards merged)"):format(
@@ -6967,7 +6279,7 @@ local function set_platform(input, opts)
       end
     end
   end
-  vim.ui.select(platform_choices, {
+  select_ui(platform_choices, {
     prompt = "Target Platform (current: " .. (current_plat ~= "" and current_plat or "auto") .. "):",
     format_item = function(item)
       if suggestion and item == suggestion.target_platform then
@@ -6976,7 +6288,7 @@ local function set_platform(input, opts)
       return item
     end,
   }, function(plat)
-    if not plat then
+    if not plat or not current() then
       if opts.on_done then opts.on_done(false) end
       return
     end
@@ -6993,7 +6305,7 @@ local function set_platform(input, opts)
         end
       end
     end
-    vim.ui.select(config_choices, {
+    select_ui(config_choices, {
       prompt = "Target Configuration (current: " .. current_for_platform .. "):",
       format_item = function(item)
         if suggestion and plat == suggestion.target_platform
@@ -7003,7 +6315,7 @@ local function set_platform(input, opts)
         return item
       end,
     }, function(conf)
-      if not conf then
+      if not conf or not current() then
         if opts.on_done then opts.on_done(false) end
         return
       end
@@ -7011,6 +6323,7 @@ local function set_platform(input, opts)
           and CORE_RT.project_state.update_target
         or CORE_RT.project_state.stage_target
       local ok_update, update_err = target_update(engine_root, plat, conf)
+      if not current() then return end
       if not ok_update then
         vim.notify("Failed to set target: " .. tostring(update_err), vim.log.levels.ERROR)
         if opts.on_done then opts.on_done(false) end
@@ -7035,6 +6348,7 @@ local function set_platform(input, opts)
         end
       end
 
+      if not current() then return end
       local ok, key, info = CORE_RT.fast_swap_active_platform(engine_root)
       if ok then
         vim.notify(("UE platform set: %s %s\nFast-swapped to shard %s (%d entries)"):format(
@@ -7061,21 +6375,26 @@ local export_compile_commands
 
 local function build_target(opts)
   opts = opts or {}
+  -- Callers chaining on on_exit (UEAndroidIterate) must hear about a build
+  -- that never started, or they wait forever with no status.
+  local function abort()
+    if type(opts.on_exit) == "function" then opts.on_exit(-1) end
+  end
   if CORE_RT.ue_build_running() then
     vim.notify("A UE build is already running in this editor", vim.log.levels.WARN)
-    return
+    return abort()
   end
-  local ctx, err = resolve_context()
+  local ctx, err = opts.snapshot and require("ue.workflows._runtime").unwrap(opts.snapshot).context or resolve_context()
   if not ctx then
     vim.notify(err, vim.log.levels.WARN)
-    return
+    return abort()
   end
   if not ctx.project_root then
     vim.notify("No project configured for engine root. Run :UESetProject [path]", vim.log.levels.WARN)
     if vim.g.ue_prepare_headless == 1 then
       error("No project configured for engine root. Run :UESetProject [path]")
     end
-    return
+    return abort()
   end
 
   -- Fresh-bucket gate: never build on a silently-guessed platform. A project
@@ -7085,7 +6404,7 @@ local function build_target(opts)
   -- picker once — the engine-level last-used pair is floated to the top so
   -- it's a single <CR> — then resume this exact build. An explicit
   -- opts.platform (caller already chose) bypasses the gate.
-  if not opts._platform_prompted
+  if not opts.snapshot and not opts._platform_prompted
       and trim(opts.platform or "") == ""
       and vim.g.ue_prepare_headless ~= 1
       and CORE_RT.project_state.target_is_set
@@ -7094,17 +6413,17 @@ local function build_target(opts)
       vim.log.levels.WARN, { title = "UE" })
     set_platform(nil, {
       on_done = function(ok)
-        if ok then
-          build_target(vim.tbl_extend("force", opts, { _platform_prompted = true }))
-        end
+        if not ok then return abort() end
+        build_target(vim.tbl_extend("force", opts, { _platform_prompted = true }))
       end,
     })
     return
   end
 
-  local plat = trim(opts.platform or "")
+  local plat = trim(opts.snapshot and opts.snapshot.target.id or opts.platform or "")
   if plat == "" then plat = target_platform(ctx.engine_root, nil) end
-  local conf = selected_target_configuration(ctx.engine_root, ctx.project_root, ctx.uproject, plat)
+  local conf = opts.snapshot and opts.snapshot.configuration
+    or selected_target_configuration(ctx.engine_root, ctx.project_root, ctx.uproject, plat)
   local operation = opts.operation or (opts.skip_deploy == true and "so_build" or "build")
   opts.operation = operation
   local so_only = operation == "so_build"
@@ -7128,7 +6447,7 @@ local function build_target(opts)
   if not cmd then
     set_build_status("BERR")
     require("utils.log").notify_error("ue.build", title .. " failed: " .. build_err)
-    return
+    return abort()
   end
 
   local _, workflow_err = dispatch_registered_workflow(driver.id, operation, {
@@ -7146,9 +6465,10 @@ local function build_target(opts)
   if workflow_err then
     set_build_status("BERR")
     require("utils.log").notify_error("ue.build", title .. " failed: " .. tostring(workflow_err.reason or workflow_err))
-    return
+    return abort()
   end
   local function start_build()
+    if opts.is_current and not opts.is_current() then return abort() end
     local function on_exit(code, output)
       if code == 0
           and require("ue.targets").supports(target_ctx.platform, "semantic_cdb", host_driver) then
@@ -7167,13 +6487,17 @@ local function build_target(opts)
       end
       if type(opts.on_exit) == "function" then opts.on_exit(code, output) end
     end
-    return open_terminal_command(cmd, {
+    local job = open_terminal_command(cmd, {
       cwd = plan.cwd or ctx.engine_root,
       quickfix_title = title,
       quickfix_root = workspace_root(ctx),
       tail_limit = 16,
       on_exit = on_exit,
+      is_current = opts.is_current,
+      verification_context = require("utils.build_verification").context(ctx, target_ctx, operation),
     })
+    if not job then abort() end
+    return job
   end
 
   if type(driver.preflight_plans) == "function" and type(CORE_RT.run_target_preflight) == "function" then
@@ -7181,7 +6505,7 @@ local function build_target(opts)
       if not ok then
         set_build_status("BERR")
         require("utils.log").notify_error("ue.build", title .. " failed: " .. tostring(preflight_err))
-        return
+        return abort()
       end
       start_build()
     end)
@@ -7989,11 +7313,16 @@ function M.toggle_debug_log()
   return require("utils.ue_logs").toggle_debug_log(ue_runtime_env())
 end
 
-local function deploy_android_so()
+local function deploy_android_so(opts)
+  opts = type(opts) == "table" and opts or {}
   local host_driver = require("utils.platform").driver()
   local dispatched, dispatch_err = dispatch_registered_workflow("Android", "so_deploy", {
     host_driver = host_driver,
+    snapshot = opts.snapshot,
     context = {
+      on_exit = opts.on_exit,
+      return_handle = opts.on_exit ~= nil,
+      is_current = opts.is_current,
       resolve_context = resolve_context,
       read_state = read_state,
       target_context = function(ctx, platform)
@@ -8001,7 +7330,7 @@ local function deploy_android_so()
       end,
       open_terminal_command = open_terminal_command,
       workspace_root = workspace_root,
-      reinvoke = deploy_android_so,
+      reinvoke = function() deploy_android_so(opts) end,
     },
   })
   if dispatched ~= nil then
@@ -8305,7 +7634,8 @@ end
 
 function CORE_RT.prepare_sync()
   local ctx, err = resolve_context()
-  if not ctx then vim.notify(err, vim.log.levels.WARN); return false end
+  if not ctx then vim.notify(err, vim.log.levels.WARN)
+return false end
   local lease, lease_err = CORE_RT.file_lock.acquire(join(ctx.paths.runtime_dir, "prepare.lock"))
   if not lease then
     vim.notify("UEPrepare is running in another Neovim: " .. tostring(lease_err),
@@ -8424,8 +7754,6 @@ local function prepare_async(opts)
 
   _ufs.ensure_dir(ctx.paths.cache)
 
-  -- ── Timing & ETA ─────────────────────────────────────────────────────
-  -- Load previous run timings for ETA estimation
   local prev_timings = ctx.state.prepare_timings or {}
   local phase_start = vim.uv.hrtime()
   local total_start = phase_start
@@ -8465,10 +7793,6 @@ local function prepare_async(opts)
     return ""
   end
 
-  -- ── fidget progress (created BEFORE fast-path so async ccjson can stream
-  --     progress events into it; previously this was only set up on the cold
-  --     path after fast-path returned, so fast-path's 17s ccjson run looked
-  --     like a silent freeze) ─────────────────────────────────────────────
   local ok_fidget, progress = pcall(require, "fidget.progress")
   local handle
   if ok_fidget then
@@ -8489,9 +7813,6 @@ local function prepare_async(opts)
     end
   end
 
-  -- Cover the entire fast path, including async CDB generation and the writer
-  -- pipeline. Previously only the cold GTAGS phase set this flag, so two quick
-  -- :UEPrepare calls could concurrently rewrite compile_commands.json.
   local prepare_lease = opts._prepare_lease
   local prepare_lease_err
   if not prepare_lease then
@@ -8499,22 +7820,33 @@ local function prepare_async(opts)
       join(ctx.paths.runtime_dir, "prepare.lock"))
   end
   if not prepare_lease then
-    if handle then handle.message = "BUSY"; handle:finish() end
+    if handle then handle.message = "BUSY"
+handle:finish() end
     vim.notify("UEPrepare is running in another Neovim: " .. tostring(prepare_lease_err),
       vim.log.levels.WARN, { title = "UE" })
     return
   end
   CORE_RT.prepare_lease = prepare_lease
   set_prepare_running(true)
-
+  local prepare_cache = require("ue.cdb.prepare_cache")
+  local function continue_prepare(reused_inputs)
+  if reused_inputs then
+    CORE_RT.trace_mark("PREPARE_INPUTS_UNCHANGED")
+    invalidate_status_cache()
+    refresh_statusline()
+    CORE_RT.start_deferred_clangd(ctx)
+    prepare_cache.continue_background(ctx)
+    set_prepare_running(false)
+    if handle then handle.message = "done (inputs unchanged)"; handle.percentage = 100; handle:finish() end
+    vim.notify(prepare_summary(ctx, compile_commands_targets(ctx)[1], { reused_cache = true }))
+    return
+  end
   -- ── Cache fast-path ──────────────────────────────────────────────────
   if prepare_cache_ready(ctx) then
     CORE_RT.trace_mark("FAST_PATH_TAKEN")
     local root = workspace_root(ctx)
     update("generating compile_commands (async)...", 25)
 
-    -- Async ccjson — runs in headless nvim subprocess, streams progress
-    -- here, and continues with the rest of fast-path in on_done.
     M.async_generate_compile_commands(ctx,
       function(stage, pct, detail)
         update(detail, pct)
@@ -8526,21 +7858,24 @@ local function prepare_async(opts)
           set_prepare_running(false)
           populate_quickfix_from_output("UEPrepare compile_commands", compile_path, { root = root })
           vim.notify("UEPrepare compile_commands failed: " .. compile_path, vim.log.levels.WARN)
-          if handle then handle.message = "FAILED"; handle:finish() end
+          if handle then handle.message = "FAILED"
+handle:finish() end
           return
         end
         update("indexing...", 95)
         -- Generation, pipeline and partition have committed together.
         clear_index_dirty(ctx)
         INDEX_FN.schedule_prepare_delivery(ctx)
+        require("ue.cdb.prepare_cache").complete(ctx)
         invalidate_status_cache()
         refresh_statusline()
         set_prepare_running(false)
         CORE_RT.start_deferred_clangd(ctx)
-        if handle then handle.message = "done"; handle.percentage = 100; handle:finish() end
+        if handle then handle.message = "done"
+handle.percentage = 100
+handle:finish() end
         vim.notify(prepare_summary(ctx, compile_path, { reused_cache = true }))
 
-        -- csearch index rebuild (same logic as before, just moved here).
         local code_search_fp = require("utils.code_search")
         local cs_ctx_fp = { workspace_root = root, csearch_idx = ctx.paths and ctx.paths.csearch_idx or nil }
         local need_index = true
@@ -8553,11 +7888,6 @@ local function prepare_async(opts)
           elseif not idx_stat or (idx_stat.size or 0) <= 1024 then
             stale_reason = "missing"
           else
-            -- Reuse the canonical freshness oracle. It already considers
-            -- worktree-aware git index mtime + dir mtimes
-            -- and the watcher's persistent dirty set — all the things this
-            -- fast-path used to half-implement and get wrong for git
-            -- worktrees / projects without their own .git.
             local fr = prepare_freshness(ctx)
             if fr == "fresh" then
               need_index = false
@@ -8574,8 +7904,6 @@ local function prepare_async(opts)
             for line in io.lines(ctx.paths.workspace_all_list) do
               local trimmed = line:gsub("\r$", "")
               if trimmed ~= "" then
-                -- Guard against cross-drive absolute paths in workspace_all_list
-                -- (see lengthy comment near the sync path for the full story).
                 if _ufs.is_absolute_path(trimmed) then
                   fout:write(trimmed, "\n")
                 else
@@ -8734,7 +8062,7 @@ local function prepare_async(opts)
         on_compile_pipeline_done(true)
       end)
 
-    -- ── Phase 3b: build GTAGS (async, slow) ───────────────────────────
+    -- Phase 3b: build GTAGS (async, admitted)
     update(("indexing %d files with gtags..."):format(#workspace_code), 35)
     start_phase()
 
@@ -8840,6 +8168,7 @@ local function prepare_async(opts)
             set_prepare_running(false)
             if cdb_pipeline_ok then
               INDEX_FN.schedule_prepare_delivery(ctx)
+              require("ue.cdb.prepare_cache").complete(ctx)
               CORE_RT.start_deferred_clangd(ctx)
             else
               vim.notify(
@@ -9044,8 +8373,13 @@ local function prepare_async(opts)
   end
 
   start_scan()
+  end
+  require("ue.cdb.prepare_scan_roots").begin(ctx, vim.tbl_extend("force", opts, { cache_ready = function() return prepare_cache_ready(ctx) end }),
+    CORE_RT, prepare_lease, continue_prepare, function(scan_err)
+    set_prepare_running(false); if handle then handle.message = "FAILED"; handle:finish() end
+    require("utils.log").notify_error("ue.prepare", "UEPrepare scan roots failed: " .. tostring(scan_err))
+  end)
 end
-
 -- export_compile_commands is now an alias for the unified prepare flow
 export_compile_commands = prepare_async
 CORE_RT.prepare_async = prepare_async
@@ -9355,6 +8689,9 @@ function M.setup()
   end
   CORE_RT.setup_done = true
 
+  require("utils.cpp_format").setup()
+  require("utils.unsaved").setup()
+
   vim.g.ueindex_status = vim.g.ueindex_status or ""
   vim.g.ue_build_status = vim.g.ue_build_status or ""
 
@@ -9368,15 +8705,15 @@ function M.setup()
 
   vim.api.nvim_create_user_command("UEPaths", show_paths, {})
   vim.api.nvim_create_user_command("UESetProject", function(opts)
-    CORE_RT.set_project(opts.args)
+    CORE_RT.set_project(opts.args, require("utils.ue_hub").selection_options())
   end, { nargs = "?" })
   vim.api.nvim_create_user_command("UESetAndroidPackage", function(opts)
-    set_android_package(opts.args)
+    set_android_package(opts.args, require("utils.ue_hub").selection_options())
   end, { nargs = "?" })
   vim.api.nvim_create_user_command("UESetAndroidDevice", function()
-    require("utils.android_device").select({
+    require("utils.android_device").select(vim.tbl_extend("force", require("utils.ue_hub").selection_options(), {
       prompt = "Select Android device for this Neovim:",
-    }, function(serial, device)
+    }), function(serial, device)
       if serial then
         vim.notify(("Android device selected: %s"):format(
           require("utils.android_device").format_item(device)), vim.log.levels.INFO)
@@ -9390,7 +8727,7 @@ function M.setup()
     desc = "Set workspace -> .uproject relative path (used by :UESetProject when given only a workspace root)",
   })
   vim.api.nvim_create_user_command("UESetPlatform", function(opts)
-    set_platform(opts.args)
+    set_platform(opts.args, require("utils.ue_hub").selection_options())
   end, {
     nargs = "?",
     complete = set_platform_completions,
@@ -9424,7 +8761,8 @@ function M.setup()
     if on and not CORE_RT.err_sink_timer then
       local err_log = vim.fn.stdpath("state") .. ("/ue_errors.%d.log"):format(vim.fn.getpid())
       local f = io.open(err_log, "w")
-      if f then f:write("=== installed " .. os.date() .. " ===\n"); f:close() end
+      if f then f:write("=== installed " .. os.date() .. " ===\n")
+f:close() end
       local timer = vim.uv.new_timer()
       if timer then
         CORE_RT.err_sink_timer = timer
@@ -9475,8 +8813,10 @@ function M.setup()
     local function read_file(p, max_bytes)
       max_bytes = max_bytes or 50000
       if vim.fn.filereadable(p) == 0 then return "(missing: " .. p .. ")" end
-      local fp = io.open(p, "r"); if not fp then return "(open failed)" end
-      local content = fp:read("*a") or ""; fp:close()
+      local fp = io.open(p, "r")
+if not fp then return "(open failed)" end
+      local content = fp:read("*a") or ""
+fp:close()
       if #content > max_bytes then
         content = "...[truncated, showing last " .. max_bytes .. " bytes]...\n"
                   .. content:sub(-max_bytes)
@@ -9516,7 +8856,8 @@ function M.setup()
 
     local body = table.concat(parts, "\n")
     local fp = io.open(out_path, "w")
-    if fp then fp:write(body); fp:close() end
+    if fp then fp:write(body)
+fp:close() end
     vim.notify("UE grep diag → " .. out_path,
       vim.log.levels.INFO, { title = "UE", timeout = 5000 })
   end, { desc = "Bundle UE grep trace + errors + messages into one diag file" })
@@ -9557,7 +8898,40 @@ function M.setup()
   vim.api.nvim_create_user_command("UEInstallIOS", function()
     CORE_RT.install_target("IOS")
   end, { desc = "Install the current tuple's staged IOS app through its target driver" })
-  vim.api.nvim_create_user_command("UEDeployAndroidSO", deploy_android_so, {})
+  vim.api.nvim_create_user_command("UEDeployAndroidSO", function() deploy_android_so() end, {})
+  -- One-key Android inner loop: build SO → hot-deploy → attach. The steps stay
+  -- separate owners (K46); this only chains them and stops at the first failure.
+  require("utils.ue_hub").setup_commands()
+  require("ue.build_diagnostics").setup()
+  require("utils.bottom_panel").setup_commands()
+  require("utils.development_workbench").setup()
+  require("utils.ue_goto.reading").setup_commands()
+  require("ue.run_profiles").setup_commands({
+    set_target = function(platform, configuration)
+      return set_platform(platform .. " " .. configuration, { stage_next = false })
+    end,
+  })
+  -- Target inner loops (Android: build SO → deploy → debug-launch) live with
+  -- their workflows; ue.lua only hands over the steps it owns.
+  require("ue.workflows.bootstrap").setup_loop_commands({
+    resolve_context = resolve_context,
+    target_context = CORE_RT.target_context,
+    read_state = read_state,
+    update_state_field = update_state_field,
+    build_so = function(on_exit, snapshot, _, _, is_current)
+      return build_target({ operation = "so_build", on_exit = on_exit, snapshot = snapshot, is_current = is_current })
+    end,
+    deploy_so = function(on_exit, snapshot, _, _, is_current)
+      return deploy_android_so({ on_exit = on_exit, snapshot = snapshot, is_current = is_current })
+    end,
+    launch = function(on_exit, snapshot, _, _, is_current)
+      return dispatch_registered_workflow(snapshot.target.id, "launch", {
+        snapshot = snapshot,
+        context = { on_exit = on_exit, resolve_context = resolve_context, is_current = is_current },
+      })
+    end,
+    set_status = set_build_status,
+  })
   vim.api.nvim_create_user_command("UELaunch", function()
     M.launch_app()
   end, {})
@@ -9573,6 +8947,8 @@ function M.setup()
   vim.api.nvim_create_user_command("UEInstallAndroid", install_android, {})
   vim.api.nvim_create_user_command("UEPrepare", function(cmd)
     local bang = cmd.bang and true or false
+    local onboarding = package.loaded["utils.ue_onboarding"]
+    local guard = onboarding and onboarding.prepare_guard()
     require("utils.async_launcher").launch({
       name  = bang and "UE: Prepare (FORCE full rebuild)" or "UE: Prepare (semantic + ccjson + index)",
       group = "ue",
@@ -9588,20 +8964,9 @@ function M.setup()
         end
       end,
       run   = function(report)
-        -- prepare_async already returns immediately and runs UBT/cindex
-        -- in libuv jobs. The launcher placeholder + fidget handle here
-        -- exist to give a unified visible-progress surface during the
-        -- 100–500ms window where ueprepare itself spins up + first job
-        -- spawn happens on the main thread.
-        --
-        -- :UEPrepare!  → force_csearch=true AND wipe the cache fast-path
-        --                gates so EVERY phase rebuilds from scratch.
-        --                Use after a confused state (project switch with
-        --                stale lists, corrupted .idx, post-:UESetProject
-        --                if the invalidation missed something). Always
-        --                correct, just slow.
-        -- :UEPrepare   → normal flow. Fast-path skips phases whose inputs
-        --                still look fresh against external anchors.
+        if guard and not guard() then return end
+        -- Prepare keeps its existing async jobs, progress and fast paths.
+        -- :UEPrepare! forces every phase; ordinary prepare keeps its fast path.
         if bang then
           if report then report("BANG → forcing full clean rebuild ...") end
           -- Mark the engine_root as dirty so prepare_cache_ready returns
@@ -9638,12 +9003,14 @@ function M.setup()
     -- for a full :UEPrepare. Doesn't refresh gtags or cdb — only csearch.
     -- For gtags/cdb drift, use :UEPrepare (normal) or :UEPrepare! (full).
     local ctx, err = resolve_context()
-    if not ctx then vim.notify(err or "no ctx", vim.log.levels.WARN); return end
+    if not ctx then vim.notify(err or "no ctx", vim.log.levels.WARN)
+return end
     local ok_watch, watch = pcall(require, "utils.ue_watch")
-    if not ok_watch then vim.notify("ue_watch module missing", vim.log.levels.WARN); return end
+    if not ok_watch then vim.notify("ue_watch module missing", vim.log.levels.WARN)
+return end
     if watch.persistent_dirty_status().capped then
-      vim.notify("Dirty coverage was truncated; rebuilding the full csearch index", vim.log.levels.INFO)
-      return M.build_csearch_async({ context = ctx })
+      vim.notify("Dirty coverage was truncated; recovering complete changes for csearch", vim.log.levels.INFO)
+      return M.build_csearch_async({ context = ctx, recover_overflow = true })
     end
     local dirty = (type(watch.snapshot_persistent_dirty) == "function")
       and watch.snapshot_persistent_dirty() or {}
@@ -9673,23 +9040,29 @@ function M.setup()
     vim.notify(("UEPrepareIncremental: adding %d dirty files to csearch index ..."):format(#dirty),
       vim.log.levels.INFO, { title = "UE", timeout = 3000, replace = "ue.csearch.build" })
     local cs_ctx = { workspace_root = workspace_root(ctx), csearch_idx = ctx.paths.csearch_idx }
-    code_search.build_index(cs_ctx, abs_list, function(ok_cs, err_cs, stats)
-      CORE_RT.csearch_build_done()
-      pcall(os.remove, abs_list)
-      if ok_cs then
-        if type(watch.remove_persistent_dirty) == "function" then
-          watch.remove_persistent_dirty(dirty, "UEPrepareIncremental", CORE_RT.csearch_build_started_at)
+    local git_evidence = require("ue.csearch_git")
+    git_evidence.capture(ctx, function(before)
+      code_search.build_index(cs_ctx, abs_list, function(ok_cs, err_cs, stats)
+        local function finish_record()
+          CORE_RT.csearch_build_done()
+          pcall(os.remove, abs_list)
+          if ok_cs then
+            if type(watch.remove_persistent_dirty) == "function" then
+              watch.remove_persistent_dirty(dirty, "UEPrepareIncremental", CORE_RT.csearch_build_started_at)
+            end
+            CORE_RT.csearch_build_started_at = nil
+            local mb = math.floor((stats.index_size or 0) / 1024 / 1024)
+            vim.notify(("✓ csearch +%d files (%.1fs, idx now %d MB)"):format(
+              #dirty, (stats.ms or 0) / 1000, mb),
+              vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
+          else
+            vim.notify("UEPrepareIncremental failed: " .. (err_cs or "?"),
+              vim.log.levels.WARN, { title = "UE" })
+          end
         end
-        CORE_RT.csearch_build_started_at = nil
-        local mb = math.floor((stats.index_size or 0) / 1024 / 1024)
-        vim.notify(("✓ csearch +%d files (%.1fs, idx now %d MB)"):format(
-          #dirty, (stats.ms or 0) / 1000, mb),
-          vim.log.levels.INFO, { title = "UE", timeout = 4000, replace = "ue.csearch.build" })
-      else
-        vim.notify("UEPrepareIncremental failed: " .. (err_cs or "?"),
-          vim.log.levels.WARN, { title = "UE" })
-      end
-    end, { mode = "add" })
+        if ok_cs then git_evidence.save(ctx, before, false, dirty, finish_record) else finish_record() end
+      end, { mode = "add" })
+    end)
   end, { desc = "Append watcher's dirty files to csearch index (no full rebuild)" })
   vim.api.nvim_create_user_command("UEPrepareReindex", function()
     -- Force csearch rebuild even when the cache fast-path would skip it.
@@ -9717,7 +9090,8 @@ function M.setup()
     local ctx = require_ctx_or_nil()
     if not ctx then
       vim.notify("UECDBPartition: no UE context (run :UESetProject first)",
-        vim.log.levels.WARN, { title = "ue.cdb" }); return
+        vim.log.levels.WARN, { title = "ue.cdb" })
+return
     end
     local opts = {}
     local arg = (cmd.args or ""):gsub("^%s+", ""):gsub("%s+$", "")
@@ -9733,17 +9107,20 @@ function M.setup()
     --   :UECDBSwitch Win64 Development
     local ctx = require_ctx_or_nil()
     if not ctx then
-      vim.notify("UECDBSwitch: no UE context", vim.log.levels.WARN, { title = "ue.cdb" }); return
+      vim.notify("UECDBSwitch: no UE context", vim.log.levels.WARN, { title = "ue.cdb" })
+return
     end
     local args = cmd.fargs or {}
     if #args ~= 2 then
       vim.notify("Usage: :UECDBSwitch <Platform> <Config>  e.g. :UECDBSwitch Android Test",
-        vim.log.levels.WARN, { title = "ue.cdb" }); return
+        vim.log.levels.WARN, { title = "ue.cdb" })
+return
     end
     local spec = args[1] .. "/" .. args[2]
     INDEX_FN.partition_base_cdb_async(ctx, { active = spec }, function(ok, msg)
       if not ok then
-        vim.notify("UECDBSwitch failed: " .. tostring(msg), vim.log.levels.WARN, { title = "ue.cdb" }); return
+        vim.notify("UECDBSwitch failed: " .. tostring(msg), vim.log.levels.WARN, { title = "ue.cdb" })
+return
       end
       INDEX_FN.maybe_restart_clangd_for_index()
       vim.notify("UECDBSwitch: active=" .. spec, vim.log.levels.INFO, { title = "ue.cdb" })
@@ -9752,12 +9129,14 @@ function M.setup()
   vim.api.nvim_create_user_command("UECDBStatus", function()
     local ctx = require_ctx_or_nil()
     if not ctx then
-      vim.notify("UECDBStatus: no UE context", vim.log.levels.WARN, { title = "ue.cdb" }); return
+      vim.notify("UECDBStatus: no UE context", vim.log.levels.WARN, { title = "ue.cdb" })
+return
     end
     local mf, mf_path = INDEX_FN.read_partition_manifest(ctx)
     if not mf then
       vim.notify("UECDBStatus: no partition manifest yet (run :UEPrepare or :UECDBPartition)",
-        vim.log.levels.INFO, { title = "ue.cdb" }); return
+        vim.log.levels.INFO, { title = "ue.cdb" })
+return
     end
     local lines = { "Manifest: " .. mf_path }
     if mf.active then
@@ -9779,7 +9158,8 @@ function M.setup()
   end, { desc = "Show CDB partition status" })
   vim.api.nvim_create_user_command("UEWatchStatus", function()
     local ok, watch = pcall(require, "utils.ue_watch")
-    if not ok then vim.notify("ue_watch module missing", vim.log.levels.WARN); return end
+    if not ok then vim.notify("ue_watch module missing", vim.log.levels.WARN)
+return end
     local s = watch.status()
     vim.notify(("UEWatch: running=%s root=%s pending(+%d/-%d) last=%s"):format(
       tostring(s.running), s.watch_root or "?",
@@ -9788,17 +9168,20 @@ function M.setup()
   end, { desc = "Show ue_watch incremental indexer status" })
   vim.api.nvim_create_user_command("UEWatchStop", function()
     local ok, watch = pcall(require, "utils.ue_watch")
-    if ok then watch.stop(); vim.notify("UEWatch stopped") end
+    if ok then watch.stop()
+vim.notify("UEWatch stopped") end
   end, {})
   vim.api.nvim_create_user_command("UEWatchFlush", function()
     local ok, watch = pcall(require, "utils.ue_watch")
-    if ok and watch.flush_now then watch.flush_now(); vim.notify("UEWatch flush triggered") end
+    if ok and watch.flush_now then watch.flush_now()
+vim.notify("UEWatch flush triggered") end
   end, { desc = "Bypass debounce; immediately apply pending watcher events" })
   vim.api.nvim_create_user_command("UEDirtyStatus", function()
     -- Show the cumulative-since-last-:UEPrepare dirty set (rg-on-dirty
     -- overlay's source of truth until the next csearch publish).
     local ok, watch = pcall(require, "utils.ue_watch")
-    if not ok then vim.notify("ue_watch module missing", vim.log.levels.WARN); return end
+    if not ok then vim.notify("ue_watch module missing", vim.log.levels.WARN)
+return end
     local st = (watch.persistent_dirty_status and watch.persistent_dirty_status()) or { count = 0 }
     local lines = {
       ("UEDirty: %d files in cumulative dirty set"):format(st.count or 0),
@@ -9819,9 +9202,11 @@ function M.setup()
   end, { desc = "Show cumulative dirty set + dirty_files.collect breakdown" })
   vim.api.nvim_create_user_command("UEDirtyClear", function()
     local ok, watch = pcall(require, "utils.ue_watch")
-    if not ok then vim.notify("ue_watch module missing", vim.log.levels.WARN); return end
+    if not ok then vim.notify("ue_watch module missing", vim.log.levels.WARN)
+return end
     if type(watch.clear_persistent_dirty) ~= "function" then
-      vim.notify("clear_persistent_dirty unavailable (old ue_watch?)", vim.log.levels.WARN); return
+      vim.notify("clear_persistent_dirty unavailable (old ue_watch?)", vim.log.levels.WARN)
+return
     end
     watch.clear_persistent_dirty("manual")
     vim.notify("UEDirty cleared")
@@ -9886,7 +9271,8 @@ function M.setup()
   end, {})
   vim.api.nvim_create_user_command("UEIndexTimings", function()
     local ctx, err = resolve_context()
-    if not ctx then vim.notify("UEIndexTimings: " .. (err or "no ctx"), vim.log.levels.WARN); return end
+    if not ctx then vim.notify("UEIndexTimings: " .. (err or "no ctx"), vim.log.levels.WARN)
+return end
     local state = ensure_index_state(ctx)
     local timings = state.index_timings or {}
     local lines = { "UEIndexTimings (last run per phase):" }
@@ -9933,7 +9319,8 @@ function M.setup()
     local bat = nil
     for _, root in ipairs(roots) do
       local candidate = cache_paths(root).pch_build_bat
-      if _ufs.is_file(candidate) then bat = candidate; break end
+      if _ufs.is_file(candidate) then bat = candidate
+break end
     end
     if not bat then
       vim.notify(
@@ -10154,28 +9541,8 @@ function M.setup()
     end
 
     vim.api.nvim_create_user_command("Tasks", function()
-      local tr = require("utils.task_registry")
-      local rows = tr.list()
-      if #rows == 0 then
-        vim.notify("无后台任务", vim.log.levels.INFO, { title = "Tasks" })
-        return
-      end
-      vim.ui.select(rows, {
-        prompt = "Tasks (select to stop):",
-        format_item = task_label,
-      }, function(choice)
-        if not choice then return end
-        if choice.status ~= "running" then
-          vim.notify(("%s 已结束（%s）"):format(choice.name, choice.status), vim.log.levels.INFO, { title = "Tasks" })
-          return
-        end
-        if tr.cancel(choice.id) then
-          vim.notify(("已停止 %s"):format(choice.name), vim.log.levels.INFO, { title = "Tasks" })
-        else
-          vim.notify(("%s 已结束"):format(choice.name), vim.log.levels.INFO, { title = "Tasks" })
-        end
-      end)
-    end, { desc = "List background tasks; select to stop" })
+      require("utils.bottom_panel").show("tasks")
+    end, { desc = "Inspect background tasks and output; stop explicitly" })
 
     vim.api.nvim_create_user_command("TaskStop", function(opts)
       local tr = require("utils.task_registry")

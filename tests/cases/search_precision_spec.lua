@@ -1,0 +1,87 @@
+local t = require("tests.harness")
+t.bootstrap()
+local native = require("tests.fixtures.search_native")
+
+local function hit_at(hits, line)
+  for _, hit in ipairs(hits) do
+    if hit.line == line then
+      return hit
+    end
+  end
+  error("native match missing at line " .. line)
+end
+
+t.describe("search_precision: native csearch location", function()
+  t.it("strict literal points to uppercase occurrence and carries exact byte span", function()
+    native.with_index(t, function(fixture)
+      local hits = native.query(t, fixture, "Alpha", { regex = false, case = true })
+      local hit = hit_at(hits, 1)
+      t.assert_eq(hit.column, 15)
+      t.assert_eq(hit.location.precision, "exact")
+      t.assert_eq(hit.location.byte_start0, 14)
+      t.assert_eq(hit.location.byte_end0, 19)
+    end)
+  end)
+
+  t.it("whole word skips an earlier non-word match", function()
+    native.with_index(t, function(fixture)
+      local hits = native.query(t, fixture, "Alpha", { regex = false, case = true, word = true })
+      local hit = hit_at(hits, 2)
+      t.assert_eq(hit.column, 19)
+      t.assert_eq(hit.location.byte_start0, 18)
+    end)
+  end)
+
+  t.it("UTF-8 prefix preserves byte0/column1 boundaries exactly once", function()
+    native.with_index(t, function(fixture)
+      local hits = native.query(t, fixture, "Alpha", { regex = false, case = true })
+      local hit = hit_at(hits, 3)
+      local start = assert(fixture.lines[3]:find("Alpha", 1, true))
+      t.assert_eq(hit.column, start)
+      t.assert_eq(hit.location.byte_start0, start - 1)
+      t.assert_eq(hit.location.byte_end0, start - 1 + #"Alpha")
+    end)
+  end)
+
+  t.it("regex hits are honest line locations without a guessed column", function()
+    native.with_index(t, function(fixture)
+      local hits = native.query(t, fixture, "A.*a", { regex = true, case = true })
+      local hit = hit_at(hits, 4)
+      t.assert_nil(hit.column)
+      t.assert_eq(hit.location.precision, "line")
+      t.assert_nil(hit.location.byte_start0)
+      t.assert_nil(hit.location.byte_end0)
+    end)
+  end)
+
+  t.it("zero-width regex also keeps unknown span honest", function()
+    native.with_index(t, function(fixture)
+      local hits = native.query(t, fixture, "^", { regex = true })
+      t.assert_eq(#hits, #fixture.lines)
+      for _, hit in ipairs(hits) do
+        t.assert_nil(hit.column)
+        t.assert_eq(hit.location.precision, "line")
+      end
+    end)
+  end)
+
+  t.it("native Unicode case folding never creates a false literal column", function()
+    native.with_index(t, function(fixture)
+      local hits = native.query(t, fixture, "Ä", { regex = false, ignore_case = true })
+      local hit = hit_at(hits, 6)
+      t.assert_nil(hit.column)
+      t.assert_eq(hit.location.precision, "line")
+      t.assert_contains(hit.location.reason, "literal-span")
+    end)
+  end)
+
+  t.it("literal punctuation has its exact span", function()
+    native.with_index(t, function(fixture)
+      local hits = native.query(t, fixture, ".", { regex = false, case = true })
+      local hit = hit_at(hits, 5)
+      local start = assert(fixture.lines[5]:find(".", 1, true))
+      t.assert_eq(hit.column, start)
+      t.assert_eq(hit.location.byte_end0 - hit.location.byte_start0, 1)
+    end)
+  end)
+end)

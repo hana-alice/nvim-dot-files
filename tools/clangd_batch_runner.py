@@ -78,6 +78,7 @@ def run(cdb_dir, out_dir, trigger, clangd, timeout=90, jobs=1, server_profile=No
     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, cwd=launch_cwd, env=env,
         creationflags=(subprocess.CREATE_NO_WINDOW | subprocess.IDLE_PRIORITY_CLASS) if os.name == 'nt' else 0)
+    spawn_seconds = time.monotonic() - started
     messages = queue.Queue()
     stdout_log = (out_dir / 'lsp-received.ndjson').open('w', encoding='utf-8')
     sent_log = (out_dir / 'lsp-sent.ndjson').open('w', encoding='utf-8')
@@ -169,6 +170,7 @@ def run(cdb_dir, out_dir, trigger, clangd, timeout=90, jobs=1, server_profile=No
                     complete = True
                     break
         indexed_wall = time.monotonic() - started
+        shutdown_started = time.monotonic()
         before_shutdown = process_metrics(process)
         shutdown_response = False
         if process.poll() is None:
@@ -199,6 +201,7 @@ def run(cdb_dir, out_dir, trigger, clangd, timeout=90, jobs=1, server_profile=No
         stdout_log.close()
         sent_log.close()
         stderr_log.close()
+    shutdown_seconds = time.monotonic() - shutdown_started
     observed_shards = sorted({str(path) for path in list(cdb_dir.rglob('*.idx')) + list(environment.rglob('*.idx'))})
     present = {Path(path).name for path in observed_shards}
     missing = [prefix for prefix in expected_names if not any(name.startswith(prefix) for name in present)]
@@ -207,6 +210,7 @@ def run(cdb_dir, out_dir, trigger, clangd, timeout=90, jobs=1, server_profile=No
         'cdb_sha256': hashlib.sha256((cdb_dir / 'compile_commands.json').read_bytes()).hexdigest(),
         'initialized': initialized, 'indexing_complete': complete, 'shutdown_response': shutdown_response,
         'indexing_wall_seconds': round(indexed_wall, 4), 'process_wall_seconds': round(time.monotonic() - started, 4),
+        'spawn_seconds': round(spawn_seconds, 6), 'shutdown_seconds': round(shutdown_seconds, 6),
         'exit_code': process.returncode, 'progress': progress, 'shard_count': len(observed_shards),
         'shards': observed_shards, 'missing_main_shards': missing, 'before_shutdown_metrics': before_shutdown,
         **metrics, 'indexing_log_lines': [line for line in stderr_lines if 'Indexed ' in line or 'Enqueueing ' in line],

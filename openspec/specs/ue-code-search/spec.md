@@ -37,7 +37,10 @@ MUST NOT 提前删除或截断原有正式索引。
 （append）前 SHALL 校验目标索引可用，不可用时拒绝并提示全量 `:UEPrepare`；
 全量构建（reset）永远安全，不受此约束。`-files-from` 增量 merge 只替换清单
 中列出的 exact file path 的 trigram，MUST NOT 把宽泛 CLI root 当作 delta
-replacement prefix；删除事件升级为 reset，不得伪装成 add。
+replacement prefix；被前缀遮蔽的未改动同名前缀文件（如 `Foo.h` 遮蔽 `Foo.hpp`）
+SHALL 重新入索引，不得被增量静默丢弃。删除 SHALL 经 `-delete-from` 在同一次
+merge 中移除，结果 MUST 与对剩余集合的全量 reset 等价；工具不支持该参数时
+SHALL 失败并回退 reset，MUST NOT 留下已删除文件的命中。
 
 理由：cindex 原子写协议把 staged 文件硬编码为 `<idx>~`，并发构建抢同一
 `idx~` 会在 merge/rename 阶段相互破坏，导致 `corrupt index: remove` 与 0
@@ -52,13 +55,35 @@ replacement prefix；删除事件升级为 reset，不得伪装成 add。
 所有构建成功路径 SHALL 只移除本次构建开始时捕获且已覆盖的 dirty 路径；构建
 期间新增或再次修改的路径 MUST NOT 被清空，失败构建 MUST NOT 确认覆盖。
 Watcher dirty 数组是有界集合，截断丢失路径时 SHALL 原子发布
-`dirty.json.overflow` 标记；标记 SHALL 保持可见直到被覆盖它的全量 reset
-清除，期间 freshness SHALL 保持 stale 且 smart build SHALL 选择 reset 而非
-add 或 skip。
+`dirty.json.overflow` 标记。溢出恢复 SHALL 在 Git root 有成功索引的可验证基线时，
+异步查询该基线到当前工作区的完整改动集，并与当前索引清单相交后走增量 add，
+删除沿既有 `-delete-from`。完整证据 SHALL 包括已提交变化、未提交及未跟踪变化、
+上次索引时的脏路径，并保守覆盖 Git 普通 diff/status 不报告的索引文件
+（例如 ignored、assume-unchanged、skip-worktree 和子模块内文件）。
+所有必要 root 的身份和基线均可验证时才允许使用该路径；非 Git、无有效记录、
+命令失败或基线 HEAD 不可达 SHALL 保持 reset。p4 工作区不在此恢复范围。
 
-#### Scenario: 全量构建失败
-- **WHEN** 全量 csearch 构建失败
+每次 reset/add 成功 SHALL 记录各 root 当时观察到的 Git HEAD；局部增量未覆盖
+旧基线以来的全部变化时 MUST NOT 把该 HEAD 冒充完整覆盖基线。Git 基线仅用于
+恢复改动集，MUST NOT 替代 workspace 清单内容指纹的 freshness 判据。
+
+标记 SHALL 保持可见直到成功 reset 或已证明覆盖完整改动集的 Git add 确认。
+成功确认 SHALL 只清除构建开始前的旧标记；构建期间的新溢出及同秒不确定事件
+MUST NOT 被清除。无法证明完整覆盖时 freshness SHALL 保持 stale，
+smart build MUST NOT 把有界 dirty 集合当作完整 delta。
+
+#### Scenario: 全量或 Git 恢复构建失败
+- **WHEN** reset 或 Git 恢复 add 失败
 - **THEN** 系统 SHALL NOT 清空 dirty 集合或确认其 overflow 已修复
+
+#### Scenario: 溢出但 Git 基线完整可验证
+- **WHEN** dirty 被截断，所有 root 的成功覆盖基线可达，异步 Git 查询成功
+- **THEN** 系统 SHALL 对完整改动集执行增量 add 和既有删除处理
+- **AND** 原普通 delta 比例阈值 MUST NOT 再强迫该恢复走 reset
+
+#### Scenario: 溢出且缺少可靠 Git 证据
+- **WHEN** 任一 root 非 Git、无记录、Git 查询失败或记录 HEAD 不可达
+- **THEN** 系统 SHALL 选择 reset，保留既有失败与溢出保护
 
 ### Requirement: freshness 以文件清单内容指纹判定，不用 mtime 代理
 
@@ -141,6 +166,18 @@ Project-scoped grep 缓存 SHALL 按 canonical project identity 分桶于 engine
 
 ## 选型与踩坑
 
+- **选型（2026-10-04）**：严格字面和全词命中以可证明的 UTF-8 byte span 驱动跳转/预览；
+  csearch 没有提供可证明正则 span 时诚实行定位，不把第 1 列包装成精确匹配。
+  后置 matcher 只筛候选，不重定位 provider 的位置。查询与目录/文件 mask、类型、模式分别保存。
+- **选型（2026-10-04）**：流式状态区分 waiting、empty、error、truncated、timeout 和 cancel；
+  退出不等于 stdout EOF，已解析输出排空后才交付终态；范围或总量未知时不显示完整性结论。
+  面板每次查询都要求索引，不能因打开后索引失效而自动切去 rg。
+- **选型（2026-10-04）**：文件 picker 使用独立的进程内有界目录清单，冷热采用同一范围/排除/
+  类型规则；完整成功扫描才缓存，取消/错误不发布。超缓存预算仍完整显示，显式刷新快照。
+  不借 GTAGS shader 清单冒充 C++ 文件，也不为文件列表改变 csearch/CDB 输入或触发重新索引。
+- **踩坑（2026-10-04）**：上游原生 grep provider 丢弃 stderr，finder 完成不足以证明是空结果。
+  保留其实际 argv 和 transform，复用本仓 reader 取得真实错误/EOF；不另造 shell 字符串解析。
+
 - **选型**：`<leader>/` 与显式 rg 入口（`<leader>sG`）严格分离——索引搜索
   承诺「亚秒 + 完整」，走 rg 会破坏承诺并制造「搜过却没搜到」的体验欺骗；
   `gd`/`gr` 内部的 rg fallback 是另一个调用点，不受本 spec 约束。
@@ -153,6 +190,13 @@ Project-scoped grep 缓存 SHALL 按 canonical project identity 分桶于 engine
 - **踩坑**：`corrupt index: remove` 与 0 字节索引死循环——根因是并发构建争抢
   同一 `<idx>~` 临时文件；处置是单写者串行化（拒绝并发，不排队）+ 增量构建
   前校验索引可用性。
+- **踩坑（2026-10-02 实测）**：「cindex 无删除能力，删除必须 reset」是错误前提。
+  codesearch v1.2.0 的 `Merge` 把 delta 的每个 root `P` 视为拥有旧索引中
+  `[P, P 末字节+1)` 的全部名字：root 指向已删文件且不索引内容即可删除该文件。
+  同一机制也让 `Foo.h` 遮蔽未改动的 `Foo.hpp`——旧版增量 add 在真实 18.2 万文件
+  清单上对 37 个此类文件丢了 36 个。处置：`cindex-uefilter -delete-from` + 遮蔽
+  闭包重入索引；真实清单上 300 删除 + 237 改动 2.4 s（reset 87 s），与对剩余集合
+  全量 reset 的名字表与全部 trigram 倒排逐项相等。
 - **踩坑**：watcher 曾经/可能被误接回 csearch 写入路径——回归测试专门断言
   watcher provider 不触发 `build_index`，这是防回归红线。
 - **重要事项**：Windows 原生文件通知包含大量与内容无关的元数据事件，必须在

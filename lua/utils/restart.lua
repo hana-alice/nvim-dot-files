@@ -227,6 +227,34 @@ end
 ---@param opts table?  { cwd?, dry_run?, force? }
 function M.restart(opts)
   opts = opts or {}
+  if not opts.force and not opts.dry_run then
+    local unsaved = require("utils.unsaved")
+    local dirty = unsaved.list()
+    if #dirty > 0 then
+      local before = {}
+      for _, item in ipairs(dirty) do
+        before[item.buf] = { name = item.name, tick = vim.api.nvim_buf_get_changedtick(item.buf) }
+      end
+      vim.ui.select({ "保存全部并重启", "取消重启" }, {
+        prompt = ("重启前处理 %d 个未保存文件："):format(#dirty),
+      }, function(choice)
+        if choice ~= "保存全部并重启" then return end
+        local current = unsaved.list()
+        local unchanged = #current == #dirty
+        for _, item in ipairs(current) do
+          local previous = before[item.buf]
+          unchanged = unchanged and previous ~= nil and previous.name == item.name
+            and previous.tick == vim.api.nvim_buf_get_changedtick(item.buf)
+        end
+        if not unchanged then
+          vim.notify("未保存文件在确认期间发生变化，已取消重启，请重新检查", vim.log.levels.INFO)
+          return
+        end
+        if unsaved.save_all() then M.restart(opts) end
+      end)
+      return
+    end
+  end
   log().info(string.format("restart requested cwd=%s force=%s dry=%s",
     opts.cwd or vim.fn.getcwd(), tostring(opts.force), tostring(opts.dry_run)))
 

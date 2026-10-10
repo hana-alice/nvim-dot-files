@@ -458,9 +458,9 @@ M.build_phase_async = function(ctx, phase)
   local process_config = vim.lsp.config and vim.lsp.config.clangd or {}
   local server_profile, profile_error = require("ue.index.batch_runtime").server_profile(
     require("ue").clangd_cmd(ctx.engine_root), process_config)
+  local background_request
   if clangd.ok and not profile_error then
-    vim.list_extend(cmd, { "--verified-batches", "--reuse-verified-only",
-      "--clangd", clangd.path, "--batch-size", "8" })
+    vim.list_extend(cmd, { "--verified-batches", "--clangd", clangd.path, "--batch-size", "8" })
     -- A project/target-scoped selection points at immutable qualified assets.
     -- It selects where to look; only the existing receipt checks grant reuse.
     local store_path = fs.join(vim.fs.dirname(ctx.paths.semantic_cdb), "batch-store.json")
@@ -475,6 +475,14 @@ M.build_phase_async = function(ctx, phase)
         return fail_before_spawn("invalid batch-store.json: expected schema=1 and an absolute proof-store path")
       end
       vim.list_extend(cmd, { "--verified-batch-store", store.path })
+      vim.list_extend(cmd, { "--reuse-verified-only" })
+    elseif phase == "full" then
+      vim.list_extend(cmd, { "--reuse-verified-only" })
+      background_request = { enabled = true, python = python, clangd = clangd.path, profile = server_profile,
+        store = fs.join(vim.fs.dirname(ctx.paths.semantic_cdb), "verified_batches"),
+        background = background_cdb, marker = out_idx }
+    else
+      vim.list_extend(cmd, { "--reuse-verified-only" })
     end
     if server_profile then vim.list_extend(cmd, { "--server-profile", vim.json.encode(server_profile) }) end
   end
@@ -498,21 +506,9 @@ M.build_phase_async = function(ctx, phase)
 
   RT.job = { root_key = root_key, phase = phase }
 
-  -- Visible progress for the controlled index build (P5-compliant).
-  --
-  -- WHY: this build is scheduled automatically by every UEPrepare completion
-  -- path, and `full` processes ~16k TUs / writes ~270MB -- minutes of work. It
-  -- previously ran as a completely silent fire-and-forget child: no progress, no
-  -- log, and the failure branch did not even notify. So when it was interrupted
-  -- (window closed) or failed, the user saw prepare finish, reasonably assumed
-  -- the semantic layer was ready, and then got a degraded `gd` with nothing on
-  -- screen explaining why. Delivery must be observable.
-  --
-  -- Uses the same fidget channel as UEPrepare (bottom-right, alongside LSP
-  -- progress) rather than async_launcher's floating window: this task starts on
-  -- its own, so it must inform without stealing screen space. P5 is honored --
-  -- start + coarse updates driven by real child output, no periodic ticker, and
-  -- it disappears on success.
+  -- Automatically scheduled builds must report delivery failures. Use the
+  -- UEPrepare fidget channel without stealing focus; P5 permits start and
+  -- coarse updates driven by child output, never periodic notifications.
   local ok_fidget, fidget_progress = pcall(require, "fidget.progress")
   local progress_handle
   if ok_fidget then
@@ -535,13 +531,8 @@ M.build_phase_async = function(ctx, phase)
     progress_handle = nil
   end
 
-  -- Defensive env scrub: if our parent (hermes/wt/IDE) injected PYTHONHOME
-  -- pointing at a different python minor than `python` on PATH, the child
-  -- explodes with `_sre.MAGIC mismatch` from the stdlib loader. Strip it.
-  -- IMPORTANT: setting key=nil in vim.fn.environ() is NOT enough — vim.system
-  -- on Windows has been observed inheriting the parent env even when the key
-  -- is removed from the table. Force-overwrite to the empty string so the
-  -- child sees an explicit blank, which Python's site.py treats as unset.
+  -- Scrub inherited Python configuration to avoid `_sre.MAGIC mismatch`.
+  -- Windows vim.system may inherit removed keys: explicit blanks are required.
   local child_env = require("ue.index.batch_runtime").process_environment(process_config)
   child_env.PYTHONHOME = ""
   child_env.PYTHONPATH = ""
@@ -588,7 +579,6 @@ M.build_phase_async = function(ctx, phase)
     vim.schedule(function()
       local live_state = ensure_index_state(ctx)
       normalize_index_state(live_state)
-      RT.job = nil
       local stderr = fs.trim((result.stderr or "") .. "\n" .. (result.stdout or ""))
       local ok_result = (result.code == 0)
         and _ufs.is_file(out_idx)
@@ -611,134 +601,152 @@ M.build_phase_async = function(ctx, phase)
         controlled_background = true,
         finished_at = unix_now(),
       }
-      -- MANIFEST LANDS WITH THE ARTIFACT, not after the whole chain succeeds.
-      --
-      -- WHY: the manifest is the ONLY on-disk proof of which build a given index
-      -- artifact belongs to, and it is what lets a later process recover readiness
-      -- without re-running UEPrepare (spec: "Prepared tuple artifacts survive a
-      -- Nvim restart"). Writing it only after selection/promotion/clangd-restart
-      -- all succeed meant a produced artifact could sit on disk with no way to
-      -- prove its provenance -- exactly the state found on this machine: 261MB of
-      -- controlled CDB present, zero manifests anywhere, stats still {0,0,0}.
-      --
-      -- The artifact existing is sufficient evidence to describe it. Downstream
-      -- failures are recorded separately and MUST NOT erase this record.
-      local manifest = nil
-      if ok_result then
-        manifest = make_index_manifest(ctx, live_state, phase, out_idx, selected_keys, {
-          base_cdb_path = M.base_compile_commands_path(ctx),
-          background_cdb_path = background_cdb,
-          semantic_cdb_path = _ufs.is_file(background_cdb .. ".semantic.json")
-            and (background_cdb .. ".semantic.json") or nil,
-          index_kind = "controlled-background",
-          completed_at = live_state.index_timings[phase].finished_at,
-        })
-        live_state.index_artifacts[phase] = manifest
-        local ok_write = write_json_file(index_manifest_path(out_idx), manifest)
-        if not ok_write then
-          -- Without the manifest the artifact is unrecoverable next session, so a
-          -- failed write must be visible rather than silently degrading.
+      local function finalize(publication_error, publication_result)
+        if publication_error then
+          ok_result, stderr = false, tostring(publication_error)
+          live_state.index_timings[phase].status = "error"
+        end
+        -- Persist artifact provenance before selection/promotion: readiness after
+        -- restart depends on this manifest, even when later delivery fails.
+        local manifest = publication_result and publication_result.manifest or nil
+        if manifest then live_state.index_artifacts[phase] = manifest end
+        if ok_result and not publication_result then
+          manifest = make_index_manifest(ctx, live_state, phase, out_idx, selected_keys, {
+            base_cdb_path = M.base_compile_commands_path(ctx),
+            background_cdb_path = background_cdb,
+            semantic_cdb_path = _ufs.is_file(background_cdb .. ".semantic.json")
+              and (background_cdb .. ".semantic.json") or nil,
+            index_kind = "controlled-background",
+            completed_at = live_state.index_timings[phase].finished_at,
+          })
+          live_state.index_artifacts[phase] = manifest
+          local manifest_path = index_manifest_path(out_idx)
+          local previous = core.h.read_index_manifest(manifest_path)
+          local ok_write = vim.deep_equal(previous, manifest) or write_json_file(manifest_path, manifest)
+          if not ok_write then
+            -- Without the manifest the artifact is unrecoverable next session, so a
+            -- failed write must be visible rather than silently degrading.
+            pcall(function()
+              require("utils.log").error_ctx("ue.index", "failed to persist index manifest", {
+                phase = phase,
+                path = index_manifest_path(out_idx),
+              })
+            end)
+          end
+        end
+
+        if ok_result then
+          local prev_fingerprint = live_state.index_selection and live_state.index_selection.artifact_fingerprint or ""
+          local prev_active_index = live_state.build and live_state.build.active_index or ""
+          local generation = publication_result and publication_result.generation
+            or generation_for_context(ctx, { base_cdb_path = M.base_compile_commands_path(ctx) })
+          local selection = publication_result and publication_result.selection
+            or select_active_artifact(live_state, generation)
+          local snapshot = persist_index_selection(live_state, selection, generation)
+          local promoted, publication = false, nil
+          if publication_result then
+            promoted, publication = publication_result.promoted, publication_result.publication
+          elseif selection then
+            promoted, publication = M.publish_semantic_cdb(ctx, live_state, generation)
+          end
+          local selection_changed = selection
+            and snapshot.artifact_fingerprint ~= ""
+            and snapshot.artifact_fingerprint ~= prev_fingerprint
+          local source_pending = M.source_refresh_pending(ctx)
+          if not source_pending then M.clear_module_dirty_flags(ctx, selected_keys) end
+          live_state.stats[phase .. "_runs"] = (tonumber(live_state.stats[phase .. "_runs"]) or 0) + 1
+          live_state.build = {
+            phase = phase,
+            status = (selection and promoted) and "ready" or "error",
+            started_at = live_state.build.started_at or unix_now(),
+            finished_at = unix_now(),
+            message = (selection and promoted) and string.format(
+              "%s ready (%d modules, base=%s, coverage=%s) in %.1fs",
+              phase,
+              #selected_keys,
+              snapshot.phase ~= "" and snapshot.phase or "-",
+              snapshot.coverage_level ~= "" and snapshot.coverage_level or "-",
+              elapsed_s
+            ) or (stderr ~= "" and stderr or "failed to select/promote active semantic index"),
+            active_index = (selection and promoted) and ctx.paths.semantic_cdb or prev_active_index,
+          }
+          save_index_state(ctx, live_state)
+          -- Phase/coverage metadata may change without changing clangd's commands.
+          -- Preserve its in-flight index work when the published CDB is identical.
+          local publication_changed = type(publication) ~= "table" or publication.changed ~= false
+          if selection and promoted and source_pending then
+            M.deliver_source_refresh(ctx, selected_keys)
+          elseif selection_changed and promoted and publication_changed then
+            local restart_options = { context = ctx }
+            if type(publication) == "table" then restart_options.original_changed = publication.original_changed end
+            M.maybe_restart_clangd_for_index(restart_options)
+          end
+          if not (selection and promoted) then
+            -- Produced artifacts without selection/promotion are failed delivery.
+            ok_result = false
+          end
+        else
+          live_state.build = {
+            phase = phase,
+            status = "error",
+            started_at = live_state.build.started_at or unix_now(),
+            finished_at = unix_now(),
+            message = stderr ~= "" and stderr or (phase .. " index build failed"),
+            active_index = live_state.build.active_index or "",
+          }
+          save_index_state(ctx, live_state)
+        end
+
+        -- Failure must be visible in both the log and the user notification.
+        if ok_result then
+          progress_finish()
+        else
+          local detail = fs.trim(live_state.build and live_state.build.message or "")
+          if detail == "" then detail = last_line end
           pcall(function()
-            require("utils.log").error_ctx("ue.index", "failed to persist index manifest", {
+            require("utils.log").error_ctx("ue.index", "controlled index build failed", {
               phase = phase,
-              path = index_manifest_path(out_idx),
+              exit_code = result.code,
+              modules = #selected_keys,
+              elapsed_s = math.floor(elapsed_s * 10 + 0.5) / 10,
+              detail = detail ~= "" and detail:sub(1, 400) or nil,
             })
           end)
-        end
-      end
-
-      if ok_result then
-        local prev_fingerprint = live_state.index_selection and live_state.index_selection.artifact_fingerprint or ""
-        local prev_active_index = live_state.build and live_state.build.active_index or ""
-        local generation = generation_for_context(ctx, { base_cdb_path = M.base_compile_commands_path(ctx) })
-        local selection = select_active_artifact(live_state, generation)
-        local snapshot = persist_index_selection(live_state, selection, generation)
-        local promoted, publication = false, nil
-        if selection then promoted, publication = M.publish_semantic_cdb(ctx, live_state, generation) end
-        local selection_changed = selection
-          and snapshot.artifact_fingerprint ~= ""
-          and snapshot.artifact_fingerprint ~= prev_fingerprint
-        local source_pending = M.source_refresh_pending(ctx)
-        if not source_pending then M.clear_module_dirty_flags(ctx, selected_keys) end
-        live_state.stats[phase .. "_runs"] = (tonumber(live_state.stats[phase .. "_runs"]) or 0) + 1
-        live_state.build = {
-          phase = phase,
-          status = (selection and promoted) and "ready" or "error",
-          started_at = live_state.build.started_at or unix_now(),
-          finished_at = unix_now(),
-          message = (selection and promoted) and string.format(
-            "%s ready (%d modules, base=%s, coverage=%s) in %.1fs",
+          progress_finish(string.format("%s FAILED", phase))
+          vim.notify(string.format(
+            "UE index: %s build failed (exit %s) -- C++ definition navigation stays degraded.\n%s\nSee :NvimLog for details.",
             phase,
-            #selected_keys,
-            snapshot.phase ~= "" and snapshot.phase or "-",
-            snapshot.coverage_level ~= "" and snapshot.coverage_level or "-",
-            elapsed_s
-          ) or (stderr ~= "" and stderr or "failed to select/promote active semantic index"),
-          active_index = (selection and promoted) and ctx.paths.semantic_cdb or prev_active_index,
-        }
-        save_index_state(ctx, live_state)
-        -- Phase/coverage metadata may change without changing clangd's commands.
-        -- Preserve its in-flight index work when the published CDB is identical.
-        local publication_changed = type(publication) ~= "table" or publication.changed ~= false
-        if selection and promoted and source_pending then
-          M.deliver_source_refresh(ctx, selected_keys)
-        elseif selection_changed and promoted and publication_changed then
-          local restart_options = { context = ctx }
-          if type(publication) == "table" then restart_options.original_changed = publication.original_changed end
-          M.maybe_restart_clangd_for_index(restart_options)
+            tostring(result.code),
+            detail ~= "" and detail:sub(1, 200) or "no output captured"),
+            vim.log.levels.ERROR, { title = "UE index" })
         end
-        if not (selection and promoted) then
-          -- Artifacts were produced but delivery did not complete
-          -- (manifest/selection/promotion). This is a FAILURE, not a quiet
-          -- partial success: the gate consumes persisted readiness, so leaving it
-          -- unreported is exactly how a 270MB full.json can sit on disk while
-          -- `gd` keeps degrading with no explanation.
-          ok_result = false
-        end
-      else
-        live_state.build = {
-          phase = phase,
-          status = "error",
-          started_at = live_state.build.started_at or unix_now(),
-          finished_at = unix_now(),
-          message = stderr ~= "" and stderr or (phase .. " index build failed"),
-          active_index = live_state.build.active_index or "",
-        }
-        save_index_state(ctx, live_state)
+
+        core.deps.invalidate_status_cache()
+        core.deps.refresh_statusline()
+        file_lock.release(phase_lease)
+        RT.job = nil
+        if ok_result and background_request then background_request.env = child_env; M.start_background_batches(ctx, background_request) end
+        M.try_start_queued_build()
       end
 
-      -- Failure MUST be visible. Previously both failure branches only wrote
-      -- status="error" into a JSON file: no notify, no log, and no index build
-      -- log has ever existed in this repository. The user therefore had no way
-      -- to learn that the semantic index they were implicitly waiting for had
-      -- failed -- the whole reason this defect stayed hidden.
-      if ok_result then
-        progress_finish()
+      if ok_result and M.publication_needs_worker(ctx, live_state, base, background_cdb, out_idx) then
+        -- Keep both job ownership and the writer lease until publication returns.
+        -- Manifest hashing and semantic CDB I/O belong to the child, not the UI.
+        local invoked, started, start_error = pcall(M.finish_publication_async,
+          ctx, live_state, phase, out_idx, selected_keys, {
+            base_cdb_path = base,
+            background_cdb_path = background_cdb,
+            semantic_cdb_path = _ufs.is_file(background_cdb .. ".semantic.json")
+              and (background_cdb .. ".semantic.json") or nil,
+            index_kind = "controlled-background",
+            completed_at = live_state.index_timings[phase].finished_at,
+            lease = phase_lease,
+            owner_pid = vim.fn.getpid(),
+          }, finalize)
+        if not invoked then finalize(started) elseif started == false then finalize(start_error) end
       else
-        local detail = fs.trim(live_state.build and live_state.build.message or "")
-        if detail == "" then detail = last_line end
-        pcall(function()
-          require("utils.log").error_ctx("ue.index", "controlled index build failed", {
-            phase = phase,
-            exit_code = result.code,
-            modules = #selected_keys,
-            elapsed_s = math.floor(elapsed_s * 10 + 0.5) / 10,
-            detail = detail ~= "" and detail:sub(1, 400) or nil,
-          })
-        end)
-        progress_finish(string.format("%s FAILED", phase))
-        vim.notify(string.format(
-          "UE index: %s build failed (exit %s) -- C++ definition navigation stays degraded.\n%s\nSee :NvimLog for details.",
-          phase,
-          tostring(result.code),
-          detail ~= "" and detail:sub(1, 200) or "no output captured"),
-          vim.log.levels.ERROR, { title = "UE index" })
+        finalize()
       end
-
-      core.deps.invalidate_status_cache()
-      core.deps.refresh_statusline()
-      file_lock.release(phase_lease)
-      M.try_start_queued_build()
     end)
   end)
 

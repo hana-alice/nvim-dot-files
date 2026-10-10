@@ -190,4 +190,32 @@ function M.ue_uat_entry(engine_root)
   return join_engine_path(engine_root, "Engine/Build/BatchFiles/RunUAT.sh"), nil
 end
 
+-- No upvalues/editor APIs: luv executes this in an independent Lua state.
+local function exclusive_move_worker(from, to)
+  local invoked, ok, err = pcall(function()
+    local ffi = require("ffi")
+    if ffi.os ~= "Linux" then
+      return false, "Linux native no-replace move is unavailable on this host"
+    end
+    if from:sub(1, 1) ~= "/" or to:sub(1, 1) ~= "/" then
+      return false, "Native no-replace move requires absolute paths"
+    end
+    ffi.cdef("int renameat2(int, const char *, int, const char *, unsigned int);")
+    -- AT_FDCWD=-100; RENAME_NOREPLACE=1. Missing libc/kernel/FS support fails.
+    if ffi.C.renameat2(-100, from, -100, to, 1) == 0 then
+      return true
+    end
+    return false, "renameat2(RENAME_NOREPLACE) failed (errno " .. ffi.errno() .. ")"
+  end)
+  if not invoked then
+    return false, "Native no-replace move unavailable: " .. tostring(ok)
+  end
+  return ok, err
+end
+
+-- Atomic destination refusal; source identity is the caller's responsibility.
+function M.rename_no_replace(from, to, callback)
+  return require("utils.platform.exclusive_move").rename(exclusive_move_worker, from, to, callback)
+end
+
 return M

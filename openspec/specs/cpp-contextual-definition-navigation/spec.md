@@ -100,6 +100,33 @@ SHALL 有明确 host-side deadline；超时后 client SHALL 完成结构化失�
 
 ## 选型与踩坑
 
+- **踩坑（2026-10-08，头文件别名与预热）**：VFS external names 会使真正被包含的文件
+  以另一条路径出现在 compiler inclusion 中。路径未命中时以同一 TU 的
+  `clang_getInclusions` + `clang_File_isEqual` 证明包含；只有用户源码/overlay 与 TU 解析字节
+  一致才沿用其行列并映回用户路径，真未包含和同名不同文件仍拒绝。
+  VFS 映射文件本身始终属于失效输入；external-contents 只追踪 compiler 实际包含的映射，
+  避免为每次暖查询 stat 整个全局 overlay。映射/实际输入变化需要重建 FileManager，
+  不能依赖 reparse 保留的旧 VFS。编译数据库解析缓存有独立容量和输入身份门禁；
+  catalog/prove 仍逐请求验证 active selection 与内容来源，不缓存失败或上下文选择结论。
+
+- **踩坑（2026-10-08）**：prepare 事务以 `copy2` 保留 processed CDB 的 stage mtime，
+  selection manifest 却在提交时重新写入；mtime 先后不能证明同次产物过期。
+  已提交事务结果绑定选择键、实际保留的 raw shard 字节摘要与 processed CDB 字节摘要；
+  sidecar 校验这组内容身份，选择切换或任一内容不匹配仍拒绝。旧产物缺少绑定证据时仍保留
+  原有保守时间门禁，不能仅凭 controlled index ready 绕过。
+  native 对照另证明：`clang_getFile` 可返回未被 TU 包含的磁盘头文件，include 归属必须使用
+  `clang_getInclusions`；新 libclang 的 builtin resource headers 必须来自加载的 compiler，
+  不能按旧目标 GCC toolchain 推断，否则 NEON builtin 错误会使真实 header context 失效。
+  源文件 `gd` 成功跳到另一源文件时也保留已验证的 exact command，供同一窗口的头文件请求
+  作为候选；候选不等于包含证明。复用前仍校验当前 raw/merged 内容身份与完整命令一致性，
+  并由 native inclusion 和 exact-cursor identity 证明头文件。非成员回到完整 catalog；
+  过期、命令冲突和解析失败不能作为成功，也不能按候选顺序换一个上下文隐藏错误。
+
+- **选型（2026-10-04）**：显式定义 Peek 复用同一 compiler identity / proven-context 解析；
+  大小写扩展名遵循原路由，失败不改走普通 definition 或文本候选。inspection 与 gd 跳转交付分开，
+  预览不制造 jump、lineage 或 gd 成功证据；确认后的导航仍校验来源/目标和 build。
+  真正需要选择 compiler context 时，其 UI 同样属于阅读 owner，不放宽未登记窗口的 stale guard。
+
 - **选型**：身份主键固定为 Clang canonical USR / compiler-owned identity，
   拒绝一切文本类启发式（符号名、receiver 文本、arity、渲染签名、文件距离、
   候选顺序）——理由见 P11/P12 与 `docs/architecture-symbol-resolution.md`
@@ -116,7 +143,11 @@ SHALL 有明确 host-side deadline；超时后 client SHALL 完成结构化失�
   的声明而非 `VulkanCommands.cpp` 的 out-of-line definition——派生 override
   的静态选中必须保持独立身份，不能被 base virtual identity 吸收。
 - **重要事项**：sidecar 对同一 client/USR 共用 30 秒 provider hard ceiling
-  以覆盖冷 UE preamble；TU 默认 LRU 容量为 1（可配置），30 秒无请求后 evict——
+  以覆盖冷 UE preamble；TU 默认 LRU 容量为 4（可配置），5 分钟无请求后 evict；
+  额外 TU 同时受进程 RSS 与宿主剩余内存约束，当前正在使用的 TU 不因容量裁剪被释放。
+  打开头文件的异步低优先级预热复用已有 donor/provenance/inclusion 解析路径，
+  不提交导航结果或 window lineage；切走、编辑、前台请求和宿主压力取消排队工作。
+  预热不能被表述为保证 2 秒内完成冷解析，实际延迟须单独验收。
   实机 UE Android TU 可达数 GB working set。destination cache 独立 LRU，
   默认上限 128 项（`UE_SEMANTICD_MAX_LOOKUP_ENTRIES` 可配置）。NDJSON 帧大小
   上限 1 MiB，对完整帧与任意分块方式一致。

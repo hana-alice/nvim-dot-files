@@ -10,6 +10,7 @@ local function read(path)
   return raw
 end
 local request = vim.json.decode(read(assert(arg[1])))
+local generation
 local ok, result = xpcall(function()
   assert(request.schema == 1, "invalid background publication request")
   require("ue") -- Installs the original index dependencies without editor setup.
@@ -26,14 +27,14 @@ local ok, result = xpcall(function()
   end
   current()
   local ctx = request.ctx
-  local generation = index.generation_for_context(ctx, { base_cdb_path = request.base })
+  generation = index.generation_for_context(ctx, { base_cdb_path = request.base, synchronous = true })
   assert(generation.generation_id == request.generation_id, "publication generation changed")
   local state = index.ensure_index_state(ctx)
   local previous = assert(state.index_artifacts.full, "publication full baseline missing")
   assert(previous.generation_id == generation.generation_id, "publication baseline changed")
   local manifest = index.make_index_manifest(ctx, state, "full", request.marker, previous.module_keys, {
     base_cdb_path = request.base, background_cdb_path = request.background,
-    semantic_cdb_path = request.source, index_kind = "controlled-background", completed_at = os.time(),
+    semantic_cdb_path = request.source, index_kind = "controlled-background", completed_at = os.time(), synchronous = true,
   })
   current()
   if not vim.deep_equal(previous, manifest) then
@@ -51,9 +52,10 @@ local ok, result = xpcall(function()
   assert(promoted, tostring(publication))
   current()
   return { ok = true, manifest = manifest, index_selection = state.index_selection, publication = publication,
-    generation_id = generation.generation_id, scope = fs.norm(ctx.paths.semantic_cdb) }
+    generation_id = generation.generation_id, generation = generation, scope = fs.norm(ctx.paths.semantic_cdb) }
 end, debug.traceback)
-if not ok then result = { ok = false, reason = tostring(result) } end
+if not ok then result = { ok = false, reason = tostring(result), generation = generation,
+  requested_generation = request.generation, requested_generation_id = request.generation_id } end
 local path = assert(request.publication_result)
 local temporary = path .. "." .. vim.fn.getpid() .. ".tmp"
 local file = assert(io.open(temporary, "wb")); assert(file:write(vim.json.encode(result))); assert(file:close())

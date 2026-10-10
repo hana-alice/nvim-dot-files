@@ -7,6 +7,7 @@ local record
 local hits, misses = 0, 0
 local leave_registered = false
 local last_miss_reason
+local last_barrier_ms
 
 local function stable(value)
   if type(value) ~= "table" then return type(value) .. ":" .. tostring(value) end
@@ -79,13 +80,18 @@ local function output_event(root, name, events)
     or path:find("/__pycache__/", 1, true) ~= nil or path:match("/__pycache__$") ~= nil
 end
 
-local function collect(ctx, required, done, admitted)
+local function collect(ctx, required, done, admitted, tools)
   if not admitted then
     return require("utils.host_admission").run_when_allowed({ name = "UE prepare input evidence",
-      start = function() return collect(ctx, required, done, true) end,
+      start = function() return collect(ctx, required, done, true, tools) end,
       on_error = function(reason) done(nil, tostring(reason)) end,
       on_cancel = function() done(nil, "input-evidence-cancelled") end,
     })
+  end
+  if tools then
+    return require("ue.cdb.prepare_inputs").verify_tools_async(tools, function(value)
+      done(value.ok and value or nil, value.reason)
+    end)
   end
   local targets = require("ue.cdb.paths").targets(ctx)
   local platform = require("utils.platform")
@@ -96,6 +102,7 @@ local function collect(ctx, required, done, admitted)
     shards_dir = require("ue.cdb.shards").shards_dir(ctx),
     pch_dir = fs.join(fs.dirname(targets[1]), ".cache", "nvim-ue", "clangd", "pch"),
     tools_dir = require("ue.config").get("cdb.tools_dir"), require_products = required,
+    clangd_path = vim.fn.exepath(clangd) ~= "" and vim.fn.exepath(clangd) or clangd,
     environment = vim.fn.environ(), tools_executables = { vim.v.progpath,
       python.ok and python.path or "", vim.fn.exepath(clangd) ~= "" and vim.fn.exepath(clangd) or clangd } }
   local path = vim.fn.tempname() .. "-prepare-inputs.json"
@@ -127,7 +134,29 @@ function M.status()
     epoch = current and current.epoch, reason = current and current.reason or "no-successful-prepare",
     roots = current and current.roots, last_event = current and current.last_event,
     last_miss_reason = last_miss_reason,
+    last_barrier_ms = last_barrier_ms,
+    readonly_tool_roots = current and current.group and current.group.readonly_tool_roots,
+    tools_verified = current and current.tools_verified,
+    tool_files_verified = current and current.tool_files_verified,
+    tool_directories_verified = current and current.tool_directories_verified,
+    toolchain = current and current.toolchain, executables = current and current.executables,
     background_pending = current and current.background_timer ~= nil or false }
+end
+
+local function readonly_tools(snapshot, readonly)
+  local selected, covered = {}, {}
+  local driver = require("utils.platform").driver()
+  local path_key = driver.path_key or function(path) return path end
+  for _, tool in ipairs(snapshot or {}) do
+    for root in pairs(readonly) do
+      local path, parent = path_key(tool.path), path_key(root)
+      if path == parent or path:sub(1, #parent + 1) == parent .. "/" then
+        selected[#selected + 1], covered[root] = tool, true
+        break
+      end
+    end
+  end
+  return selected, covered
 end
 
 local function reusable(ctx, current)
@@ -148,15 +177,14 @@ end
 -- invoke the original complete path; unavailable native coverage never guesses.
 function M.begin(ctx, opts, done)
   opts = opts or {}
-  pcall(function() require("utils.probe").observe("prepare-path", "gcc-toolchain-fast-2026-10-09-P2") end)
+  pcall(function() require("utils.probe").observe("prepare-path", "argv-resource-identity-2026-10-10-Z") end)
   if not leave_registered then
     leave_registered = true
     vim.api.nvim_create_autocmd("VimLeavePre", { callback = M.stop })
   end
   local current = record
-  -- Yield before testing the epoch so already queued native callbacks can revoke
-  -- it. This is not a native stream barrier; unknown/error remains fail-closed.
-  vim.defer_fn(function()
+  local function decide()
+    if record ~= current and current then misses = misses + 1; done(false); return end
     if not opts.force_csearch and not opts.force_cdb_restart and current and current.ready then
       local locks = require("ue.file_lock")
       local lease = locks.acquire(require("ue.cdb.paths").targets(ctx)[1] .. ".writer.lock")
@@ -174,7 +202,8 @@ function M.begin(ctx, opts, done)
     collect(ctx, false, function(value, err)
       if record ~= current then done(false); return end
       if not value then current.reason = err; done(false); return end
-      current.roots, current.artifacts = value.roots, value.artifacts
+      current.roots, current.artifacts, current.tools = value.roots, value.artifacts, value.tools
+      current.toolchain, current.executables = value.toolchain, value.executables
       local driver = require("utils.platform").driver()
       if type(driver.input_event_watcher) ~= "function" then current.reason = "native-watch-unavailable"; done(false); return end
       local group, watch_err = driver.input_event_watcher(value.roots)
@@ -199,7 +228,8 @@ function M.begin(ctx, opts, done)
           if record ~= current then return end
           if event_err or not name or (events and (events.unknown or events.overflow)) then
             invalidate(current, "watch-unknown:" .. tostring(event_err or "overflow"))
-          elseif not output_event(root.path, name, events or {}) then
+          elseif (group.readonly_tool_roots and group.readonly_tool_roots[root.path])
+            or not output_event(root.path, name, events or {}) then
             current.last_event = fs.join(root.path, name)
             invalidate(current, "input-event")
           end
@@ -211,7 +241,38 @@ function M.begin(ctx, opts, done)
         if not handle then invalidate(current, "watch-install:" .. tostring(reason)); group:close(); finish(); break end
       end
     end)
-  end, 100)
+  end
+  if not opts.force_csearch and not opts.force_cdb_restart and current and current.ready then
+    if not current.group or type(current.group.barrier) ~= "function" then
+      invalidate(current, "native-barrier-unavailable")
+      vim.schedule(decide)
+    else
+      current.group:barrier(function(ok, reason, elapsed_ms)
+        last_barrier_ms = elapsed_ms
+        if record ~= current then misses = misses + 1; done(false); return end
+        if not ok then invalidate(current, reason or "native-barrier-failed") end
+        local readonly = current.group.readonly_tool_roots or {}
+        if ok and current.ready and next(readonly) then
+          local tools, covered = readonly_tools(current.tools, readonly)
+          for root in pairs(readonly) do
+            if not covered[root] then invalidate(current, "tool-identities-unavailable:" .. root); decide(); return end
+          end
+          -- Re-stat tools outside the UI thread. Native events remain active
+          -- throughout this proof; decide() checks readiness/epoch afterwards.
+          collect(ctx, false, function(value, err)
+            if record ~= current then misses = misses + 1; done(false); return end
+            if not value then invalidate(current, err or "tool-verification-failed")
+            else
+              current.tools_verified = value.tools_verified
+              current.tool_files_verified = value.files_verified
+              current.tool_directories_verified = value.directories_verified
+            end
+            decide()
+          end, nil, tools)
+        else decide() end
+      end)
+    end
+  else vim.schedule(decide) end
 end
 
 -- Seal only after the controlled products have finished publishing. This waits
@@ -242,7 +303,16 @@ function M.complete(ctx)
       if current.epoch ~= current.start_epoch then current.reason = "input-event-during-seal"; return end
       if current.signature ~= M.signature(ctx) then current.reason = "configuration-changed-during-seal"; return end
       if not vim.deep_equal(current.roots, value.roots) then current.reason = "input-roots-changed-during-seal"; return end
-      current.artifacts, current.ready, current.reason = value.artifacts, true, "unchanged-inputs"
+      local previous, observed = current.tools, value.tools
+      local readonly = current.group.readonly_tool_roots or {}
+      if next(readonly) then
+        -- Writable roots retain the native event/marker proof. Our own markers
+        -- change their directory timestamps, so only denied tool roots use the
+        -- old snapshot across reseals. Before classification, compare all tools.
+        previous, observed = readonly_tools(previous, readonly), readonly_tools(observed, readonly)
+      end
+      if not vim.deep_equal(previous, observed) then current.reason = "tools-changed-during-prepare"; return end
+      current.artifacts, current.tools, current.ready, current.reason = value.artifacts, value.tools, true, "unchanged-inputs"
     end)
   end
   settle()

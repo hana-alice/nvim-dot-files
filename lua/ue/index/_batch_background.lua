@@ -40,7 +40,7 @@ return function(M, core)
       background = request.background, marker = request.marker,
       publication_request = { schema = 1, ctx = { engine_root = ctx.engine_root, project_root = ctx.project_root,
         paths = ctx.paths, state = ctx.state }, base = base, base_signature = base_signature,
-        generation_id = generation.generation_id, source = source, marker = request.marker,
+        generation_id = generation.generation_id, generation = generation, source = source, marker = request.marker,
         background = request.background, publication_result = fs.join(control, "activation.json") },
       publication_request_path = fs.join(control, "activation-request.json"), nvim = vim.v.progpath,
       publication_worker = fs.join(vim.fn.stdpath("config"), "lua", "ue", "index", "batch_publish_worker.lua"),

@@ -3,6 +3,17 @@ t.bootstrap()
 local uv = vim.uv
 local inputs = require("ue.cdb.prepare_inputs")
 local cache = require("ue.cdb.prepare_cache")
+local libclang = require("utils.ue_goto.semantic_sidecar_libclang")
+local clangd = require("ue").clangd_cmd()[1]
+local compiler
+for _, candidate in ipairs(libclang.sibling_clang_candidates(clangd)) do
+  compiler = libclang.resolve_executable(candidate)
+  if compiler then break end
+end
+if not compiler then
+  t.skip("prepare cache compiler input evidence", "真实 argv Clang 编译器不可用", { native = true })
+  return
+end
 
 local function write(path, value)
   vim.fn.mkdir(vim.fs.dirname(path), "p")
@@ -18,7 +29,7 @@ local function fixture(body)
     target_configuration = "Development" }, paths = { active_cdb = directory .. "/compile_commands.json",
     cdb_shards_dir = directory .. "/shards", index_cdb_dir = directory } }
   local entries = { { directory = root, file = root .. "/Source/A.cpp",
-    arguments = { vim.v.progpath, "-I", root .. "/Source", "-c", root .. "/Source/A.cpp" } } }
+    arguments = { compiler, "-I", root .. "/Source", "-c", root .. "/Source/A.cpp" } } }
   write(root .. "/Source/A.cpp", "// one\n")
   write(root .. "/tools/fixture.py", "VALUE = 1\n")
   write(ctx.paths.active_cdb, entries)
@@ -86,12 +97,73 @@ t.describe("prepare cache real input evidence", function()
   t.it("collector refuses unexpanded response files and malformed CDB", function()
     fixture(function(ctx, request, root)
       write(ctx.paths.active_cdb, { { directory = root, file = root .. "/Source/A.cpp",
-        arguments = { vim.v.progpath, "@build.rsp" } } })
+        arguments = { compiler, "@build.rsp" } } })
       local value = inputs.collect(request)
       t.assert_false(value.ok)
       t.assert_match(value.reason, "unexpanded response file")
       write(ctx.paths.active_cdb, "{invalid")
       t.assert_false(inputs.collect(request).ok)
+    end)
+  end)
+
+  t.it("narrow tool evidence binds used files, directory members and missing identities", function()
+    fixture(function(ctx, request, root)
+      local external = vim.fs.normalize(vim.fn.tempname() .. "-used-tool-inputs")
+      local used = external .. "/include/used.h"
+      write(used, "// one\n")
+      assert(uv.fs_utime(used, 1000000000, 1000000000))
+      write(external .. "/share/unused.bin", "unrelated tool data\n")
+      write(external .. "/resource/include/stddef.h", "// builtin\n")
+      write(external .. "/resource/include/nested/used.h", "// nested\n")
+      write(external .. "/resource/include/nested/unused.h", "// unrelated\n")
+      vim.fn.mkdir(external .. "/sysroot", "p")
+      local ok, err = xpcall(function()
+        write(ctx.paths.active_cdb, {{ directory = root, file = root .. "/Source/A.cpp",
+          arguments = { compiler, "--gcc-toolchain=" .. external, "-I", external .. "/include",
+            "-include", used, "-include", external .. "/resource/include/nested/used.h",
+            "-resource-dir", external .. "/resource", "--sysroot=" .. external .. "/sysroot" } }})
+        local value = inputs.collect(request)
+        t.assert_true(value.ok, value.reason)
+        local bound = {}
+        for _, item in ipairs(value.tools) do bound[item.path] = item end
+        for _, path in ipairs({ used, external, external .. "/include", external .. "/resource",
+          external .. "/resource/include", external .. "/resource/include/stddef.h",
+          external .. "/resource/include/nested", external .. "/resource/include/nested/used.h",
+          external .. "/sysroot" }) do
+          t.assert_true(bound[path] ~= nil, "used tool input missing: " .. path)
+        end
+        t.assert_true(bound[external .. "/resource/include/nested/unused.h"] ~= nil,
+          "unknown implicit header dependency retains conservative protection")
+        t.assert_true(bound[external .. "/share/unused.bin"] ~= nil,
+          "gcc-toolchain input subtree retains unknown dependency protection")
+        local function verify(tools)
+          local result
+          inputs.verify_tools_async(tools, function(observed) result = observed end)
+          t.assert_true(vim.wait(3000, function() return result ~= nil end, 5), "async identity timeout")
+          return result
+        end
+        t.assert_true(verify(value.tools).ok)
+        local before = assert(uv.fs_stat(used))
+        write(used, "// two\n")
+        assert(uv.fs_utime(used, before.atime.sec + before.atime.nsec / 1e9,
+          before.mtime.sec + before.mtime.nsec / 1e9))
+        t.assert_eq(uv.fs_stat(used).size, before.size)
+        t.assert_true(vim.deep_equal(uv.fs_stat(used).mtime, before.mtime), "mtime restored exactly")
+        t.assert_false(vim.deep_equal(uv.fs_stat(used).ctime, before.ctime), "native ctime detects the closed byte write")
+        t.assert_false(verify({bound[used]}).ok, "same-size/restored-mtime used bytes revoke async proof")
+        t.assert_false(inputs.verify_tools({bound[used]}).ok)
+        value = inputs.collect(request)
+        t.assert_true(value.ok, value.reason)
+        write(external .. "/include/new.h", "// new member\n")
+        t.assert_false(verify(value.tools).ok, "used directory membership revokes async proof")
+        t.assert_false(verify({{path = used, identity = {}}}).ok, "missing identity fields fail closed")
+        t.assert_false(verify({{path = used, identity = {ctime = {sec = 0}}}}).ok)
+        t.assert_false(verify({}).ok)
+        os.remove(used)
+        t.assert_false(verify({bound[used]}).ok, "unavailable used file fails closed")
+      end, debug.traceback)
+      vim.fn.delete(external, "rf")
+      if not ok then error(err) end
     end)
   end)
 
@@ -103,14 +175,14 @@ t.describe("prepare cache real input evidence", function()
         for _, args in ipairs({ { "--gcc-toolchain=" .. external }, { "-gcc-toolchain=" .. external },
           { "--gcc-install-dir=" .. external }, { "--gcc-toolchain", external }, { "-gcc-toolchain", external } }) do
           write(ctx.paths.active_cdb, { { directory = root, file = root .. "/Source/A.cpp",
-            arguments = vim.list_extend({ vim.v.progpath }, args) } })
+            arguments = vim.list_extend({ compiler }, args) } })
           local value = inputs.collect(request)
           t.assert_true(value.ok, value.reason)
           t.assert_true(vim.iter(value.roots):any(function(item) return item.path == external end),
             "external toolchain needs a recursive observed root")
         end
         write(ctx.paths.active_cdb, { { directory = root, file = root .. "/Source/A.cpp",
-          arguments = { vim.v.progpath, "--unknown-toolchain=" .. external } } })
+          arguments = { compiler, "--unknown-toolchain=" .. external } } })
         t.assert_match(inputs.collect(request).reason, "unrecognized path argument")
       end, debug.traceback)
       vim.fn.delete(external, "rf")
@@ -126,7 +198,7 @@ t.describe("prepare cache real input evidence", function()
       write(overlay, { roots = { { type = "file", name = "/virtual/External.h",
         ["external-contents"] = external .. "/External.h" } } })
       write(ctx.paths.active_cdb, { { directory = root, file = root .. "/Source/A.cpp",
-        arguments = { vim.v.progpath, "-ivfsoverlay", overlay, "-c", root .. "/Source/A.cpp" } } })
+        arguments = { compiler, "-ivfsoverlay", overlay, "-c", root .. "/Source/A.cpp" } } })
       local value = inputs.collect(request)
       vim.fn.delete(external, "rf")
       t.assert_true(value.ok, value.reason)
@@ -143,7 +215,6 @@ t.describe("prepare cache real input evidence", function()
   local platform = require("utils.platform")
   local python = platform.resolve_tool({ name = "python", env = { "UE_PYTHON" },
     driver_candidates = function(driver) return driver.python_candidates() end })
-  local clangd = require("ue").clangd_cmd()[1]
   if not python.ok or vim.fn.executable(clangd) ~= 1 or type(platform.driver().input_event_watcher) ~= "function" then
     t.skip("native cache invalidation", "真实 Python/clangd/input_event_watcher 能力不可用", { native = true })
     return
@@ -170,6 +241,148 @@ t.describe("prepare cache real input evidence", function()
     end)
   end)
 
+  t.it("reseal after writable tool markers preserves readonly evidence and later reuse", function()
+    fixture(function(ctx)
+      seal(ctx)
+      t.assert_true(next(cache.status().readonly_tool_roots or {}) ~= nil)
+      local original_system, completed, inventories = vim.system, false, 0
+      vim.system = function(command, options, callback)
+        local request_path = command[#command]
+        local collector = type(request_path) == "string" and request_path:match("%-prepare%-inputs%.json$")
+        if collector then
+          local file = assert(io.open(request_path, "rb"))
+          local request = vim.json.decode(file:read("*a")); file:close()
+          if request.require_products then
+            inventories = inventories + 1
+            return original_system(command, options, function(result)
+              callback(result)
+              -- collect() schedules its production handling first. This seam
+              -- then records that the new seal result has actually been handled;
+              -- the ready value retained from seal(ctx) cannot satisfy the wait.
+              vim.schedule(function() completed = true end)
+            end)
+          end
+        end
+        return original_system(command, options, callback)
+      end
+      local ok, err = xpcall(function()
+        cache.complete(ctx)
+        t.assert_true(vim.wait(15000, function() return completed end, 10), "new reseal worker callback missing")
+        t.assert_eq(inventories, 1, "actual required-products inventory ran")
+        t.assert_true(cache.status().ready, vim.inspect(cache.status()))
+        t.assert_eq(cache.status().reason, "unchanged-inputs")
+        t.assert_true(begin(ctx), "resealed capsule must remain reusable: " .. vim.inspect(cache.status()))
+      end, debug.traceback)
+      vim.system = original_system
+      if not ok then error(err) end
+    end)
+  end)
+
+  t.it("closed source write immediately before begin revokes reuse without a settling sleep", function()
+    fixture(function(ctx, _, root)
+      seal(ctx)
+      t.assert_true(next(cache.status().readonly_tool_roots or {}) ~= nil,
+        "default installed tools must exercise readonly identity reuse")
+      t.assert_true((cache.status().tools_verified or 0) > 0, "reuse must carry verified readonly tools")
+      io.write("TOOL_METRIC " .. vim.json.encode({ readonly_roots = cache.status().readonly_tool_roots,
+        roots = cache.status().roots, toolchain = cache.status().toolchain, executables = cache.status().executables,
+        files = cache.status().tool_files_verified, directories = cache.status().tool_directories_verified,
+        identities = cache.status().tools_verified }) .. "\n")
+      for i = 1, 5 do
+        local started = uv.hrtime()
+        t.assert_true(begin(ctx), "unchanged native barrier must reuse")
+        t.assert_true((uv.hrtime() - started) / 1e6 < 300, "unchanged prepare must finish below 300 ms")
+        t.assert_true(cache.status().last_barrier_ms ~= nil, "reuse must carry a native barrier timing")
+        io.write(string.format("BARRIER_METRIC %.3f %.3f\n", cache.status().last_barrier_ms,
+          (uv.hrtime() - started) / 1e6))
+      end
+      -- write() closes the actual source handle. No wait/defer is inserted
+      -- between that close and the reuse decision.
+      write(root .. "/Source/A.cpp", "// two\n")
+      t.assert_false(begin(ctx), "a just-closed input mutation must revoke reuse")
+      t.assert_eq(cache.status().last_miss_reason, "input-event")
+    end)
+  end)
+
+  -- Only the denied marker response and delayed external event delivery are
+  -- injected. Actual installed executables, inventories, grouped watches and
+  -- metadata/write acknowledgements on every writable root remain native.
+  for _, mutation in ipairs({"same-size-restored-mtime", "new-tool-directory-member", "unused-native-event",
+    "implicit-nested-header"}) do
+    t.it("readonly tool identity rejects " .. mutation .. " even before delayed native events", function()
+      fixture(function(ctx, _, root)
+        local external = vim.fs.normalize(vim.fn.tempname() .. "-readonly-tool-evidence")
+        local path = external .. "/lib/runtime.h"
+        write(path, "// one\n")
+        assert(uv.fs_utime(path, 1000000000, 1000000000))
+        local nested = external .. "/resource/include/nested/used.h"
+        write(nested, "// one\n")
+        assert(uv.fs_utime(nested, 1000000000, 1000000000))
+        local driver = platform.driver()
+        local marker = require("utils.platform.watch_barrier_marker")
+        local original_create, original_watcher = marker.create, driver.input_event_watcher
+        local withheld = 0
+        marker.create = function(target, callback)
+          if target:sub(1, #external + 1) == external .. "/" then
+            callback(false, "CreateFileW failed (Win32 error 5)")
+            return false
+          end
+          return original_create(target, callback)
+        end
+        driver.input_event_watcher = function(roots)
+          local group, err = original_watcher(roots)
+          if not group then return nil, err end
+          local original_watch = group.watch
+          function group:watch(directory, callback, options)
+            return original_watch(self, directory, function(event_err, name, events)
+              if mutation ~= "unused-native-event" and directory == external and not event_err and name
+                and not (events and (events.unknown or events.overflow)) then
+                withheld = withheld + 1
+                return
+              end
+              callback(event_err, name, events)
+            end, options)
+          end
+          return group
+        end
+        local ok, err = xpcall(function()
+          write(ctx.paths.active_cdb, {{directory = root, file = root .. "/Source/A.cpp",
+            arguments = {compiler, "--gcc-toolchain=" .. external, "-I", external .. "/lib",
+              "-resource-dir=" .. external .. "/resource",
+              "-include", path, "-c", root .. "/Source/A.cpp"}}})
+          seal(ctx)
+          t.assert_true(cache.status().readonly_tool_roots[external])
+          t.assert_true((cache.status().tools_verified or 0) > 0)
+          if mutation == "same-size-restored-mtime" or mutation == "implicit-nested-header" then
+            if mutation == "implicit-nested-header" then path = nested end
+            local before = assert(uv.fs_stat(path))
+            write(path, "// two\n")
+            assert(uv.fs_utime(path, before.atime.sec + before.atime.nsec / 1e9,
+              before.mtime.sec + before.mtime.nsec / 1e9))
+            t.assert_eq(uv.fs_stat(path).size, before.size)
+            t.assert_true(vim.deep_equal(uv.fs_stat(path).mtime, before.mtime), "mtime restored exactly")
+            t.assert_false(vim.deep_equal(uv.fs_stat(path).ctime, before.ctime), "used file ctime changed")
+          elseif mutation == "new-tool-directory-member" then
+            write(external .. "/lib/new-shadow-header.h", "// new\n")
+          else
+            write(external .. "/unrelated.txt", "// still observed\n")
+          end
+          t.assert_false(begin(ctx), "identity verification must reject before held input events")
+          if mutation == "unused-native-event" then
+            t.assert_eq(cache.status().last_miss_reason, "input-event", "every native readonly event revokes authority")
+          else
+            t.assert_contains(cache.status().last_miss_reason, "tool-changed:")
+            t.assert_true(withheld > 0, "actual native tool event was withheld to model delayed delivery")
+          end
+        end, debug.traceback)
+        cache.stop()
+        marker.create, driver.input_event_watcher = original_create, original_watcher
+        vim.fn.delete(external, "rf")
+        if not ok then error(err) end
+      end)
+    end)
+  end
+
   t.it("external toolchain bytes revoke native cache even with size and mtime restored", function()
     fixture(function(ctx, _, root)
       local external = vim.fs.normalize(vim.fn.tempname() .. "-gcc-toolchain")
@@ -177,7 +390,7 @@ t.describe("prepare cache real input evidence", function()
       write(path, "// one\n")
       local ok, err = xpcall(function()
         write(ctx.paths.active_cdb, { { directory = root, file = root .. "/Source/A.cpp",
-          arguments = { vim.v.progpath, "--gcc-toolchain=" .. external, "-c", root .. "/Source/A.cpp" } } })
+          arguments = { compiler, "--gcc-toolchain=" .. external, "-c", root .. "/Source/A.cpp" } } })
         seal(ctx)
         local before = assert(uv.fs_stat(path))
         write(path, "// two\n")
@@ -258,7 +471,7 @@ t.describe("prepare cache real input evidence", function()
       end), "owned output staging must not fill a recursive ancestor queue")
       seal(ctx)
       for i = 1, 300 do write(root .. "/.cache/nvim-ue/staging/" .. i .. ".tmp", "derived\n") end
-      t.assert_true(begin(ctx), "owned staging cannot revoke unchanged inputs")
+      t.assert_true(begin(ctx), "owned staging cannot revoke unchanged inputs: " .. vim.inspect(cache.status()))
       write(root .. "/.cache/external-input/header.h", "// two\n")
       t.assert_false(begin(ctx), "other cache-tree inputs must still revoke reuse")
       seal(ctx)

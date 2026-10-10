@@ -60,8 +60,9 @@ local function fixture(large_base)
   local env = { ctx = ctx, request = request, lease = lease, entries = entries, path = root .. "/request.json" }
   function env:run()
     write(self.path, vim.json.encode(self.request))
-    local child = vim.system({ vim.v.progpath, "--headless", "-u", "NONE", "-l",
-      vim.fn.getcwd() .. "/lua/ue/index/batch_publish_worker.lua", self.path }, { text = true }):wait(20000)
+    local command = { vim.v.progpath, "--headless", "-u", "NONE", "-l",
+      self.worker or (vim.fn.getcwd() .. "/lua/ue/index/batch_publish_worker.lua"), self.path }
+    local child = vim.system(command, self.process_opts or { text = true }):wait(20000)
     local result = vim.json.decode(read(self.request.publication_result))
     return child, result
   end
@@ -75,6 +76,80 @@ local function fixture(large_base)
 end
 
 t.describe("真实隔离后台publication worker", function()
+  t.it("冷大型CDB发布显式同步即使进程worker标记缺失仍与parent一致", function()
+    local env = fixture(true)
+    local ok, failure = xpcall(function()
+      local raw = read(vim.fn.getcwd() .. "/lua/ue/index/batch_publish_worker.lua")
+      raw = raw:gsub("local repo = [^\r\n]+", function() return "local repo = " .. string.format("%q", vim.fn.getcwd()) end, 1)
+      raw = raw:gsub("vim.g.ue_index_worker = true", "vim.g.ue_index_worker = false", 1)
+      env.worker = env.ctx._root .. "/unmarked-worker.lua"
+      write(env.worker, raw)
+      env.request.generation = index.generation_for_context(env.ctx, { base_cdb_path = env.request.base, synchronous = true })
+      local child, result = env:run()
+      t.assert_eq(child.code, 0, result.reason)
+      t.assert_true(vim.deep_equal(result.generation, env.request.generation))
+      t.assert_eq(result.manifest.generation_id, env.request.generation_id)
+    end, debug.traceback)
+    env:cleanup()
+    if not ok then error(failure) end
+  end)
+  t.it("生产proof环境传递的generation字段一致", function()
+    local env = fixture()
+    local ok, failure = xpcall(function()
+      env.request.generation = index.generation_for_context(env.ctx, { base_cdb_path = env.request.base })
+      env.process_opts = { text = true, env = require("ue.index.batch_runtime").process_environment({}), clear_env = true }
+      local child, result = env:run()
+      t.assert_eq(child.code, 0, vim.inspect(result))
+      t.assert_true(vim.deep_equal(env.request.generation, result.generation))
+    end, debug.traceback)
+    env:cleanup()
+    if not ok then error(failure) end
+  end)
+
+  t.it("真实build identity变化仍拒绝generation且保留发布bytes", function()
+    local env = fixture()
+    local ok, failure = xpcall(function()
+      local child = env:run()
+      t.assert_eq(child.code, 0, child.stderr)
+      local before = { read(env.ctx.paths.semantic_cdb), read(env.request.marker .. ".manifest.json") }
+      env.request.generation = index.generation_for_context(env.ctx, { base_cdb_path = env.request.base })
+      env.request.ctx.state = { target = "DifferentTarget" }
+      local rejected, result = env:run()
+      t.assert_true(rejected.code ~= 0)
+      t.assert_false(result.ok)
+      t.assert_contains(result.reason, "publication generation changed")
+      t.assert_true(result.generation.build_key ~= result.requested_generation.build_key)
+      t.assert_eq(result.generation.cdb_digest, result.requested_generation.cdb_digest)
+      t.assert_eq(result.generation.toolchain_identity, result.requested_generation.toolchain_identity)
+      t.assert_true(vim.deep_equal(before, { read(env.ctx.paths.semantic_cdb), read(env.request.marker .. ".manifest.json") }))
+    end, debug.traceback)
+    env:cleanup()
+    if not ok then error(failure) end
+  end)
+
+  t.it("CDB命令真实变化即使请求stat已更新仍拒绝旧generation", function()
+    local env = fixture()
+    local ok, failure = xpcall(function()
+      local child = env:run()
+      t.assert_eq(child.code, 0, child.stderr)
+      local before = { read(env.ctx.paths.semantic_cdb), read(env.request.marker .. ".manifest.json") }
+      env.request.generation = index.generation_for_context(env.ctx, { base_cdb_path = env.request.base })
+      local changed = vim.deepcopy(env.entries)
+      table.insert(changed[1].arguments, "-DNEW_PUBLICATION_INPUT=1")
+      write(env.request.base, vim.json.encode(changed))
+      local stat = assert(vim.uv.fs_stat(env.request.base))
+      env.request.base_signature = table.concat({ stat.size, stat.mtime.sec, stat.mtime.nsec }, ":")
+      local rejected, result = env:run()
+      t.assert_true(rejected.code ~= 0)
+      t.assert_contains(result.reason, "publication generation changed")
+      t.assert_true(result.generation.cdb_digest ~= result.requested_generation.cdb_digest)
+      t.assert_eq(result.generation.build_key, result.requested_generation.build_key)
+      t.assert_eq(result.generation.toolchain_identity, result.requested_generation.toolchain_identity)
+      t.assert_true(vim.deep_equal(before, { read(env.ctx.paths.semantic_cdb), read(env.request.marker .. ".manifest.json") }))
+    end, debug.traceback)
+    env:cleanup()
+    if not ok then error(failure) end
+  end)
   t.it("真实toolchain generation与parent lease下冷大型base发布标准original CDB", function()
     local env = fixture(true)
     local ok, failure = xpcall(function()
@@ -111,6 +186,28 @@ t.describe("真实隔离后台publication worker", function()
       t.assert_false(result.ok)
       t.assert_true(result.reason:find("publication semantic input changed", 1, true) ~= nil)
       t.assert_true(vim.deep_equal(before, { read(env.ctx.paths.semantic_cdb), read(env.request.marker .. ".manifest.json") }))
+    end, debug.traceback)
+    env:cleanup()
+    if not ok then error(failure) end
+  end)
+
+  t.it("重复发布同generation保持CDB与manifest bytes和mtime", function()
+    local env = fixture(true)
+    local ok, failure = xpcall(function()
+      local child = env:run()
+      t.assert_eq(child.code, 0, child.stderr)
+      local function snapshot()
+        return { cdb = read(env.ctx.paths.semantic_cdb), manifest = read(env.request.marker .. ".manifest.json"),
+          cdb_mtime = vim.uv.fs_stat(env.ctx.paths.semantic_cdb).mtime,
+          manifest_mtime = vim.uv.fs_stat(env.request.marker .. ".manifest.json").mtime }
+      end
+      local before = snapshot()
+      local repeated, result = env:run()
+      t.assert_eq(repeated.code, 0, result.reason)
+      t.assert_false(result.publication.changed)
+      t.assert_false(result.publication.original_changed)
+      t.assert_true(vim.deep_equal(before, snapshot()))
+      t.assert_eq(locks.owner(env.lease.path).token, env.lease.token)
     end, debug.traceback)
     env:cleanup()
     if not ok then error(failure) end

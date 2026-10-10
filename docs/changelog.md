@@ -92,6 +92,32 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 已将具名调查切片归档至 [2.7.0](release_2.7.0.md)。
 
+### 2026-10-10 — prepare 主循环热点移入 worker；发布 generation 修复；快速路径有序屏障与只读工具身份复核
+
+**Task**
+- 定位并移除 prepare 期间约 4.3 s 父端同步 CPU；修复后台发布反复 `publication generation changed`；修复快速路径“固定等 100 ms”的正确性缺陷，并让默认安装（Program Files 只读工具链）下的快速路径继续可用。
+
+**Implemented**
+- `ue.lua` 的 `project_index_dirs` 目录遍历（采样实测 5.68 s）移入新 `ue/cdb/prepare_scan_roots.lua` worker：同步调用 5680 → 0.03 ms（缓存），worker 3.79 s 但父端 CPU 仅 +78 ms；seed prepare 主循环最大卡顿 5871 → 463 ms。
+- `batch_publish_worker` 显式同步计算 generation，不再在 worker 中走编辑器异步摘要路径拿到 pending 空值；真不一致仍报错。真实队列 319 s 完成 2 组、接受 1 组、发布 1 批。
+- 新 `utils/platform/input_watch_barrier.lua` + `watch_barrier_marker.lua`：可写监听根写隐藏 marker，等待 write/metadata 两路事件都回到才判断复用；超时、错误、marker 删不掉一律走完整路径。修复 libuv 缓存时钟导致定时器提前到期。
+- 只读工具根（原生 CreateFileW access-denied/write-protect 分类）不写 marker，改为复核实际使用的工具身份（路径、类型、大小、mtime、ctime、inode、dev、realpath），libuv 异步、最多 8 并发；只绑定 argv 编译器、clangd/clang/libclang、resource include、gcc-toolchain/sysroot 子树，不遍历整个安装树。argv 编译器的隐式资源目录（`lib/clang`、`lib64/clang`）一并绑定；非标准布局在 inventory 子进程中调用 `-print-resource-dir`（3 s 超时），推导不出则关闭复用。
+
+**Pitfalls / Gotchas**
+- 只看子代理报告就推进出过两次漏洞：W 的十连跑用了可写工具链副本，默认安装下 10 条失败；Y 只跑窄 filter，漏掉其缩窄身份集合导致隐式 builtin 头未绑定（3 条红灯）。验收必须在默认安装下由 Claude 自跑 `ue_cdb` 与全量。
+- X 的整树身份复核使命中耗时贴着 1 s 断言（982/985 ms），负载下飘忽失败；不是正确性问题，按提速修复而非放宽断言（断言最终收紧到 300 ms）。
+- 新增的 `-print-resource-dir` spawn 需要在 `host_resource_discipline` spawn 审计中登记（subprocess-only）。
+
+**Validation**
+- 默认安装（Clang 22.1.5，未覆盖工具链）`ue_cdb` 由 Claude 连跑 3 次均 165/165；子代理侧 15 次命中 103–156 ms（屏障 6–17 ms），只读复核 325 项身份。
+- 全量回归（spawn 审计登记后复跑）3426/3426，0 失败、0 跳过；首轮 3425/3426 唯一失败为 `-print-resource-dir` spawn 未登记，登记后 `host_resource_discipline` 13/13。
+
+**Follow-ups（未达标）**
+- 只读工具复核仍是资源 include 整子树（约 301 文件），不是精确依赖闭包；真实大 CDB 冷收集开销未测。
+- 只读工具根有任何事件即撤销复用，无关文件变化也会走完整路径。
+- 多 Neovim 实例的 marker 会互相触发一次完整路径；写句柄未关时的判断不在已证明范围。
+- 真实 Android/Test 工程上未重新测量无变化 prepare 耗时与整工程索引性能；SuperUnity 后台证明吞吐（约 6 h 铺满 304 候选）未改善。
+
 ### 2026-10-09 — 大型 CDB 摘要与语义发布移出主循环；旧证明回执安全迁移
 
 **Task**

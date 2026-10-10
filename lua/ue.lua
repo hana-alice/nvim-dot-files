@@ -8374,9 +8374,11 @@ handle:finish() end
 
   start_scan()
   end
-  prepare_cache.begin(ctx, vim.tbl_extend("force", opts, { cache_ready = function()
-    return prepare_cache_ready(ctx)
-  end }), continue_prepare)
+  require("ue.cdb.prepare_scan_roots").begin(ctx, vim.tbl_extend("force", opts, { cache_ready = function() return prepare_cache_ready(ctx) end }),
+    CORE_RT, prepare_lease, continue_prepare, function(scan_err)
+    set_prepare_running(false); if handle then handle.message = "FAILED"; handle:finish() end
+    require("utils.log").notify_error("ue.prepare", "UEPrepare scan roots failed: " .. tostring(scan_err))
+  end)
 end
 -- export_compile_commands is now an alias for the unified prepare flow
 export_compile_commands = prepare_async

@@ -28,7 +28,9 @@ function M.input_event_watcher(roots)
   local python = require("utils.platform").resolve_tool({ name = "python", env = { "UE_PYTHON" },
     driver_candidates = function(driver) return driver.python_candidates() end })
   if not python.ok then return nil, "Python unavailable for Windows input watcher" end
-  return require("workarounds.libuv.content_events").new_group(python.path, roots)
+  local group, reason = require("workarounds.libuv.content_events").new_group(python.path, roots)
+  if not group then return nil, reason end
+  return require("utils.platform.input_watch_barrier").attach(group, roots)
 end
 
 function M.shell_entry(kind)

@@ -3,6 +3,7 @@
 -- This module owns only the CoreDevice route. The legacy MobileDevice bridge
 -- stays in ue.dap.ios and a frozen session never switches between them.
 local IOSProcess = require("ue.dap._ios_process")
+local Failure = require("ue.dap.failure")
 
 local M = {}
 
@@ -115,6 +116,25 @@ local function read_json_file(path)
   return table.concat(lines, "\n")
 end
 
+local function command_failure(argv, result, read_err)
+  local output = trim((result.stdout or "") .. "\n" .. (result.stderr or ""))
+  local normalized = output:lower()
+  local missing_device = normalized:find("unable to locate a device matching requested device identifier", 1, true)
+    or normalized:find("unable to locate a device matching the requested device identifier", 1, true)
+    or normalized:match("coredeviceerror%s+error%s+1011%f[%D]")
+  return Failure.format(Failure.new({
+    layer = missing_device and Failure.L.TRANSPORT or Failure.L.UNDETERMINED,
+    owner = "dap.ios.coredevice",
+    summary = missing_device and "CoreDevice cannot locate the frozen device"
+      or read_err
+      or "CoreDevice command failed; failure layer is undetermined",
+    evidence = Failure.command_evidence(argv, result.code, output),
+    remedy = missing_device
+        and "Reconnect the device, unlock it and check trust, then reselect it with :UESetIOSDevice and retry. " .. "Use :UEResetLayout if the debug layout needs restoring."
+      or "Inspect the command/output above and verify the selected Xcode and device route to determine the failing layer before retrying.",
+  }))
+end
+
 local function json_command(runtime, args, deps, callback)
   local output = vim.fn.tempname() .. ".json"
   local argv = { runtime.tools.xcrun }
@@ -127,11 +147,11 @@ local function json_command(runtime, args, deps, callback)
     end
     pcall(vim.fn.delete, output)
     if result.code ~= 0 then
-      callback(nil, "devicectl failed: " .. IOSProcess.error_message(result))
+      callback(nil, command_failure(argv, result))
       return
     end
     if not payload then
-      callback(nil, read_err)
+      callback(nil, command_failure(argv, result, read_err))
       return
     end
     callback(payload)

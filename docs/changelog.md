@@ -75,4 +75,6 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v2.1.1` → [docs/release_2.1.1.md](release_2.1.1.md) (public history privacy repair; tag pending)
 
+- `v2.1.2` → [docs/release_2.1.2.md](release_2.1.2.md) (debug layout recovery; tag pending)
+
 ## Unreleased

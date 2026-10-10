@@ -1009,6 +1009,10 @@ function D.dap_reset_layout()
     vim.cmd("wincmd =")
     return
   end
+  if not dap.session() and type(D._dap_restore_edit_layout) == "function" then
+    D._dap_restore_edit_layout()
+    return
+  end
 
   -- Step 1: close any leftover dap-* panels and dap-src:// virtual buffers.
   for _, win in ipairs(vim.api.nvim_list_wins()) do
@@ -1542,28 +1546,24 @@ function D.setup_dap(dap, dapui)
   -- output / floats / extra splits — and we keep it alive even if the
   -- user accidentally <C-w>q's it (we re-create it from saved_buf).
   local saved_win, saved_buf
+  local layout_session, lifecycle_session
+
+  local function is_code_win(w)
+    if not vim.api.nvim_win_is_valid(w) then return false end
+    if vim.api.nvim_win_get_config(w).relative ~= "" then return false end
+    local b = vim.api.nvim_win_get_buf(w)
+    local ft = vim.bo[b].filetype
+    if vim.bo[b].buftype ~= "" then return false end
+    if ft:find("^dap") or ft == "snacks_picker_list" or ft == "snacks_picker_input"
+       or ft == "snacks_dashboard" or ft == "snacks_explorer" then return false end
+    return not vim.api.nvim_buf_get_name(b):match("^dap%-src://")
+  end
 
   --- Pick the "best" window to keep as the main code window:
   -- prefer the current window if it holds a real file; otherwise scan
   -- for any normal-file window; otherwise fall back to current.
   local function pick_main_window()
     local cur = vim.api.nvim_get_current_win()
-    local function is_code_win(w)
-      if not vim.api.nvim_win_is_valid(w) then return false end
-      if vim.api.nvim_win_get_config(w).relative ~= "" then return false end
-      local b = vim.api.nvim_win_get_buf(w)
-      local bt = vim.bo[b].buftype
-      local ft = vim.bo[b].filetype
-      if bt ~= "" then return false end
-      if ft:find("^dap") or ft == "snacks_picker_list" or ft == "snacks_picker_input"
-         or ft == "snacks_dashboard" or ft == "snacks_explorer" then return false end
-      -- Reject dap-src:// virtual source stubs (memory-reference views
-      -- left over from a prior session). They have buftype="" but are
-      -- 1-line placeholders that collapse the editor area.
-      local name = vim.api.nvim_buf_get_name(b)
-      if name:match("^dap%-src://") then return false end
-      return true
-    end
     if is_code_win(cur) then return cur end
     for _, w in ipairs(vim.api.nvim_list_wins()) do
       if is_code_win(w) then return w end
@@ -1643,22 +1643,36 @@ function D.setup_dap(dap, dapui)
   end
 
   local function restore_layout()
-    dapui.close()
-    for _, win in ipairs(vim.api.nvim_list_wins()) do
+    -- dapui.close() may restore a pre-debug buffer over the current source
+    -- frame. Capture the code view first, including manually opened layouts.
+    local main = saved_win and is_code_win(saved_win) and saved_win or pick_main_window()
+    local buf, view
+    if is_code_win(main) then
+      buf = vim.api.nvim_win_get_buf(main)
+      view = vim.api.nvim_win_call(main, vim.fn.winsaveview)
+    else
+      buf = saved_buf
+    end
+    local tab = vim.api.nvim_win_get_tabpage(main)
+    pcall(dapui.close)
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
       if vim.api.nvim_win_is_valid(win) then
-        local buf = vim.api.nvim_win_get_buf(win)
-        local bt = vim.bo[buf].buftype
-        local ft = vim.bo[buf].filetype
-        if bt == "nofile" or ft:find("^dap") then
+        local panel = vim.api.nvim_win_get_buf(win)
+        local ft = vim.bo[panel].filetype
+        if ft:find("^dap") or vim.b[panel].ue_dap_log
+           or vim.api.nvim_buf_get_name(panel):match("logcat:%d+$") then
           pcall(vim.api.nvim_win_close, win, true)
         end
       end
     end
-    if saved_win and vim.api.nvim_win_is_valid(saved_win) then
-      pcall(vim.api.nvim_set_current_win, saved_win)
-    elseif saved_buf and vim.api.nvim_buf_is_valid(saved_buf) then
-      pcall(vim.cmd, "buffer " .. saved_buf)
+    if vim.api.nvim_win_is_valid(main) then
+      pcall(vim.api.nvim_set_current_win, main)
     end
+    if buf and vim.api.nvim_buf_is_valid(buf) then
+      pcall(vim.api.nvim_set_current_buf, buf)
+      if view then pcall(vim.fn.winrestview, view) end
+    end
+    D._dap_bottom_tab_win = nil
     saved_win, saved_buf = nil, nil
     vim.cmd("wincmd =")
   end
@@ -2007,10 +2021,22 @@ function D.setup_dap(dap, dapui)
   end
 
   -- ─── nvim-dap listeners ───────────────────────────────────────────
-  local function on_session_end(session)
+  function D._dap_restore_edit_layout()
     stop_logcat()
     restore_layout()
+    layout_session = nil
     source_path_cache = {}
+  end
+
+  local function finish_ui(session)
+    if layout_session ~= session then return end
+    D._dap_restore_edit_layout()
+  end
+
+  local function on_session_end(session)
+    if not session or lifecycle_session ~= session then return end
+    lifecycle_session = nil
+    finish_ui(session)
     D._ue_android_pending_bps = {}  -- clear pending breakpoints on session end
     local platforms = require("ue.dap.platforms")
     platforms.dispatch_lifecycle("cleanup", {
@@ -2057,7 +2083,27 @@ function D.setup_dap(dap, dapui)
     end
   end
 
+  local function watch_session(session)
+    if not session then return end
+    lifecycle_session = session
+    if session and type(session.on_close) == "table" then
+      session.on_close.ue_dap_layout = function()
+        vim.schedule(function()
+          if lifecycle_session ~= session then return end
+          -- The target owner handles device teardown independently. An EOF
+          -- must restore the editor without waiting for device I/O.
+          finish_ui(session)
+        end)
+      end
+    end
+  end
+  dap.listeners.on_session = dap.listeners.on_session or {}
+  dap.listeners.on_session.ue_dap_layout = function(_, session) watch_session(session) end
+  watch_session(dap.session())
+
   dap.listeners.after.event_initialized["dapui_config"] = function(session)
+    watch_session(session)
+    layout_session = session
     local owner, owner_err = require("ue.dap.platforms").bind_session(session)
     -- Non-UE dap configurations remain unmanaged and retain native nvim-dap
     -- behavior. Only malformed explicit UE owner metadata is actionable.

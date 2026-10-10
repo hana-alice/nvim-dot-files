@@ -1069,6 +1069,7 @@ iOS Logs 会按 session 的 CoreDevice identifier 查询其 hardware UDID，再�
 | 症状 / 归属 | 核对与处置 |
 |---|---|
 | L0：缺少 Apple lldb-dap / Xcode tool | 核对当前选定的 Xcode 能否提供 `xcrun --find lldb-dap`；CoreDevice 不换成其他平台 adapter |
+| L1：CoreDevice 找不到所选设备（error 1011） | 重连并解锁设备，核对信任后执行 `:UESetIOSDevice` 重新选择当前可连接设备，再重试调试；不自动改用另一台设备 |
 | L1/L2：设备连接、信任、Developer Mode 或 debug entitlement 拒绝 | 核对冻结设备的连接与实际拒绝证据，再处理配对、Developer Mode 或匹配的 development profile |
 | L4：本地 binary/dSYM UUID 不同 | 重新对当前 binary 执行 `:UEIOSSymbols`；不要使用另一构建的符号 |
 | L4：DWARF verification 失败 | 重新生成通过结构验证的 dSYM；`dwarfdump --uuid` 相同本身不能证明 DWARF 可用 |
@@ -1119,6 +1120,11 @@ commands。实测 start-stopped 初始连接的 `qProcessInfo` 曾需约 20 秒�
 **Attach 接入的已有 PID**只 detach 并复验进程保留。协议退出、adapter EOF、用户 Stop 与 Neovim
 退出沿用同一 owner cleanup；重复事件不会重复执行有副作用的 teardown，旧会话晚到的回调也不会
 清理新会话的 PID。日志 reader 可以单独停止；停止 reader 不等于停止 debugger。
+
+设备查找或 bootstrap 失败、以及 adapter 无结束事件直接关闭时，调试面板会自动退回普通
+代码布局，并保留当前源码 buffer 与光标。设备端清理失败或仍在等待连接，不会阻止窗口恢复。
+若只想收起遗留的调试面板，在没有活跃会话时执行 `:UEResetLayout`（`<leader>dx`）；
+它只恢复编辑布局，不会恢复、停止或终止设备进程。活跃会话中的同一命令仍会重建调试布局。
 
 ---
 

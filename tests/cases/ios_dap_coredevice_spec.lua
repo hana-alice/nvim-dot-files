@@ -110,8 +110,9 @@ local function with_ios_lifecycle(callback)
     defer_fn = vim.defer_fn,
     ios = package.loaded["ue.dap.ios"],
     session = package.loaded["ue.dap._ios_session"],
+    ui = package.loaded["ue.dap"],
   }
-  local state = { stopped = {}, deferred = {}, disconnects = 0 }
+  local state = { stopped = {}, deferred = {}, disconnects = 0, restores = 0 }
   local dap = {
     listeners = {
       after = { disconnect = {}, event_initialized = {}, event_output = {}, event_stopped = {}, setBreakpoints = {} },
@@ -166,6 +167,11 @@ local function with_ios_lifecycle(callback)
   end
   package.loaded["ue.dap.ios"] = nil
   package.loaded["ue.dap._ios_session"] = nil
+  package.loaded["ue.dap"] = {
+    _dap_restore_edit_layout = function()
+      state.restores = state.restores + 1
+    end,
+  }
   local ok, err = xpcall(function()
     callback(require("ue.dap.ios"), dap, state)
   end, debug.traceback)
@@ -178,12 +184,135 @@ local function with_ios_lifecycle(callback)
   vim.defer_fn = original.defer_fn
   package.loaded["ue.dap.ios"] = original.ios
   package.loaded["ue.dap._ios_session"] = original.session
+  package.loaded["ue.dap"] = original.ui
   if not ok then
     error(err)
   end
 end
 
 t.describe("ue.dap iOS CoreDevice runtime", function()
+  local function failed_prepare(mode, result)
+    local runtime = coredevice_runtime()
+    runtime.device_id = "DEVICE-MISSING"
+    local calls = {}
+    local failure
+    require("ue.dap._ios_coredevice").prepare(mode, runtime, {
+      fail = function(message)
+        failure = message
+      end,
+      progress = function() end,
+      run = function()
+        error("DAP must not start when the frozen device lookup fails")
+      end,
+      system_async = function(argv, _, callback)
+        calls[#calls + 1] = vim.deepcopy(argv)
+        callback(result)
+      end,
+    })
+    t.assert_type(failure, "string")
+    t.assert_eq(#calls, 1)
+    t.assert_contains(calls[1], "apps")
+    t.assert_nil(runtime.pid)
+    t.assert_nil(runtime.app)
+    t.assert_nil(runtime._ue_coredevice_cleanup)
+    return failure, calls[1]
+  end
+
+  t.it(
+    "reports missing CoreDevice transport with command evidence and safe retry guidance before creating a PID",
+    function()
+      for _, mode in ipairs({ "launch", "attach" }) do
+        for _, stderr in ipairs({
+          "Unable to locate a device matching requested device identifier DEVICE-MISSING.",
+          "Unable to locate a device matching the requested device identifier DEVICE-MISSING.",
+          "Failed to locate device. (com.apple.dt.CoreDeviceError error 1011.)",
+        }) do
+          local message, argv =
+            failed_prepare(mode, { code = 1, stdout = "Inventory query attempted", stderr = stderr })
+          t.assert_match(message, "^%[L1 transport%] owner: dap%.ios%.coredevice")
+          t.assert_contains(message, table.concat(argv, " "))
+          t.assert_contains(message, "rc=1")
+          t.assert_contains(message, "Inventory query attempted")
+          t.assert_contains(message, stderr)
+          t.assert_contains(message, "Reconnect")
+          t.assert_contains(message, "unlock")
+          t.assert_contains(message, "trust")
+          t.assert_contains(message, ":UESetIOSDevice")
+          t.assert_contains(message, "retry")
+        end
+      end
+    end
+  )
+
+  t.it("keeps unclassified CoreDevice failures undetermined instead of guessing target policy", function()
+    for _, stderr in ipairs({
+      "A service returned permission denied without target-policy evidence.",
+      "An unrelated failure. (com.apple.dt.CoreDeviceError error 10110.)",
+    }) do
+      local message, argv = failed_prepare("launch", {
+        code = 2,
+        stdout = "CoreDevice request submitted",
+        stderr = stderr,
+      })
+      t.assert_match(message, "^%[L%? UNDETERMINED%] owner: dap%.ios%.coredevice")
+      t.assert_contains(message, table.concat(argv, " "))
+      t.assert_contains(message, "rc=2")
+      t.assert_contains(message, "CoreDevice request submitted")
+      t.assert_contains(message, stderr)
+      t.assert_contains(message, "determine")
+      t.assert_false(message:find("[L2", 1, true) ~= nil)
+    end
+  end)
+
+  t.it(
+    "restores the edit layout once and clears bootstrap state when iOS adapter lookup fails without a DAP session",
+    function()
+      with_ios_lifecycle(function(ios, _, state)
+        require("ue.dap._ios_runtime").query_adapter = function(_, _, done)
+          t.assert_true(ios._starting)
+          done(nil, "The selected Apple adapter is unavailable")
+        end
+        ios.launch({})
+        t.assert_false(ios._starting)
+        t.assert_nil(ios._session)
+        t.assert_nil(state.active)
+        t.assert_eq(state.restores, 1)
+        t.assert_eq(#state.stopped, 0)
+        t.assert_eq(state.disconnects, 0)
+      end)
+    end
+  )
+
+  t.it("preserves another platform's active DAP layout when the iOS device bootstrap fails", function()
+    with_ios_lifecycle(function(ios, _, state)
+      local foreign = { config = { _ue_session_owner = "mac" }, on_close = {} }
+      state.active = foreign
+      require("ue.dap._ios_coredevice").prepare = function(_, _, deps)
+        t.assert_true(ios._starting)
+        deps.fail("The frozen CoreDevice route could not be resolved")
+      end
+      ios.launch({})
+      t.assert_false(ios._starting)
+      t.assert_nil(ios._session)
+      t.assert_eq(state.active, foreign)
+      t.assert_eq(state.restores, 0)
+      t.assert_eq(#state.stopped, 0)
+      t.assert_eq(state.disconnects, 0)
+    end)
+  end)
+
+  t.it(
+    "reports missing CoreDevice JSON as an undetermined result failure with the successful command evidence",
+    function()
+      local message, argv = failed_prepare("attach", { code = 0, stdout = "Query finished without JSON", stderr = "" })
+      t.assert_match(message, "^%[L%? UNDETERMINED%] owner: dap%.ios%.coredevice")
+      t.assert_contains(message, table.concat(argv, " "))
+      t.assert_contains(message, "rc=0")
+      t.assert_contains(message, "Query finished without JSON")
+      t.assert_contains(message, "devicectl did not create its JSON result")
+    end
+  )
+
   t.it("cleans the owned iOS runtime after adapter EOF without protocol end events", function()
     with_ios_lifecycle(function(ios, _, state)
       ios.launch({})

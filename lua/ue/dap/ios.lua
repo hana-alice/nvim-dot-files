@@ -516,6 +516,11 @@ end
 
 local function fail_start(message)
   M._starting = false
+  local ui = package.loaded["ue.dap"]
+  local dap = C.require_dap()
+  if ui and type(ui._dap_restore_edit_layout) == "function" and not (dap and dap.session()) then
+    ui._dap_restore_edit_layout()
+  end
   progress("error", message)
   notify(message, vim.log.levels.ERROR)
 end

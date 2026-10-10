@@ -159,6 +159,9 @@ remote-execution capability，不得把远程 Mac 冒充本地 host driver。
   真机问题，仍保留首次 continue 前 UUID 与源码断点证明；具体值和顺序由实现与回归维护。
 - **踩坑**：adapter EOF 不保证发出协议结束事件；session close 与 owner token 必须共同约束
   cleanup，避免旧退出回调清理新的设备进程或日志 reader。
+- **踩坑**：只有协议结束事件恢复布局会在 adapter EOF 后留下调试面板；UI close 恢复必须
+  按具体会话隔离，并独立于可能失败或耗时的设备 cleanup。关闭 dapui 前保留当前源码视图，
+  不能让其内部布局回放覆盖源码，也不能关闭不属于调试器的 scratch 窗口。
 - **选型**：iOS 必须使用独立 Apple lldb-dap adapter 与独立 adapter id，不复用 Mac/Android
   handler——设备协议、cleanup 顺序与失败语义都不同，混用会掩盖真实的平台差异。
 - **踩坑**：K55（2026-08-26 真机）— CoreDevice start-stopped、PID identity 与 Mach-O/dSYM UUID

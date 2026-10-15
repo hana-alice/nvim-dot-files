@@ -417,9 +417,12 @@ t.describe("csearch smart_build 端到端（D11，mock build_index）", function
   -- mock code_search.build_index：记录调用（mode + 喂入清单），立即成功。
   local calls
   local orig_build
+  local orig_indexed
   local function install_mock()
     calls = {}
     orig_build = cs.build_index
+    orig_indexed = cs.is_indexed
+    cs.is_indexed = function() return true end -- this fixture mocks the published index
     cs.build_index = function(_ctx, list_path, cb, opts)
       calls[#calls + 1] = {
         mode = (opts and opts.mode) or "reset",
@@ -429,7 +432,7 @@ t.describe("csearch smart_build 端到端（D11，mock build_index）", function
       vim.schedule(function() cb(true, nil, { ms = 1, index_size = 4096 }) end)
     end
   end
-  local function restore_mock() cs.build_index = orig_build end
+  local function restore_mock() cs.build_index, cs.is_indexed = orig_build, orig_indexed end
 
   local function run_smart(ctx, abs_list)
     local done, res = false, nil
@@ -589,6 +592,8 @@ t.describe("csearch smart_build 端到端（D11，mock build_index）", function
   t.it("add 失败 → 自动回退 reset（一次，成功收尾）", function()
     calls = {}
     orig_build = cs.build_index
+    orig_indexed = cs.is_indexed
+    cs.is_indexed = function() return true end
     cs.build_index = function(_ctx, list_path, cb, opts)
       local m = (opts and opts.mode) or "reset"
       calls[#calls + 1] = { mode = m, lines = read_lines(list_path) }

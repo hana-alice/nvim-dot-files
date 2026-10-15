@@ -30,10 +30,16 @@ local function log_warn(msg)
   end
 end
 
-local function report_unknown(reason, key, callback)
+local function report_unknown(reason, key, callback, coverage_callback)
   reason, key = tostring(reason), tostring(key or reason)
   native_status.unknown_coverage = true
   native_status.unknown_coverage_reason = reason
+  -- Logging/source refresh is coalesced, but each loss must advance the durable
+  -- csearch marker, including losses arriving during an in-flight rebuild.
+  if type(coverage_callback) == "function" then
+    local ok, err = pcall(coverage_callback, reason)
+    if not ok then log_warn("coverage loss persistence failed: " .. tostring(err)) end
+  end
   if native_status.unknown_coverage_key == key then return end
   native_status.unknown_coverage_key = key
   log_warn(reason)
@@ -74,7 +80,7 @@ function M.start(root, opts, callback)
     if supported and resolve_err then
       native_status.error = tostring(resolve_err)
       report_unknown("native content watcher unavailable: " .. tostring(resolve_err),
-        "native-unavailable", opts.on_source_unknown)
+        "native-unavailable", opts.on_source_unknown, opts.on_coverage_unknown)
     end
     return nil, resolve_err, supported
   end
@@ -93,13 +99,13 @@ function M.start(root, opts, callback)
       reason = reason or "native watcher coverage lost"
       native_status.error = tostring(reason)
       local key = events.overflow and "overflow" or "native-gap"
-      report_unknown(reason, key, opts.on_source_unknown)
+      report_unknown(reason, key, opts.on_source_unknown, opts.on_coverage_unknown)
       return
     end
     if err then
       native_status.ready = false
       native_status.error = tostring(err)
-      report_unknown(err, "native-error", opts.on_source_unknown)
+      report_unknown(err, "native-error", opts.on_source_unknown, opts.on_coverage_unknown)
       return
     end
     native_status.unknown_coverage_key = nil
@@ -113,7 +119,7 @@ function M.start(root, opts, callback)
   local err = start_err or (ok and started) or "native watcher start failed"
   native_status.ready, native_status.error = false, tostring(err)
   report_unknown("native content watcher unavailable: " .. tostring(err),
-    "native-unavailable", opts.on_source_unknown)
+    "native-unavailable", opts.on_source_unknown, opts.on_coverage_unknown)
   pcall(watcher.stop, watcher)
   pcall(watcher.close, watcher)
   return nil, tostring(err), true

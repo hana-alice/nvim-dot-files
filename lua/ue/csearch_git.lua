@@ -49,7 +49,10 @@ local function run(root, args, cb)
   vim.list_extend(command, args)
   local ok, handle = pcall(vim.system, command, {text = false, timeout = 15000}, function(result)
     vim.schedule(function()
-      if result.code ~= 0 then cb(nil, "git query failed") else cb(result.stdout or "") end
+      if result.code ~= 0 then
+        local non_git = result.code == 128 and (result.stderr or ""):find("not a git repository", 1, true)
+        cb(nil, non_git and "not a Git worktree" or "git query failed")
+      else cb(result.stdout or "") end
     end)
   end)
   if not ok then cb(nil, "git spawn failed"); return end
@@ -121,6 +124,32 @@ function M.capture(ctx, cb)
     end)
   end
   next_root()
+end
+-- HEAD observation is only a trigger. Recovery still diffs the last completely
+-- covered HEAD, so a prior partial add cannot hide committed source changes.
+function M.pending(ctx, before, failures)
+  local baseline, changed, bootstrap = read(ctx), {}, false
+  local unavailable
+  for _, root in ipairs(roots(ctx)) do
+    local now = before and before[root]
+    local old = baseline and baseline.roots[root]
+    local failure = failures and failures[root]
+    -- Only an explicit non-worktree response for a previously unknown root is
+    -- optional. Timeout/spawn/status failure cannot prove unchanged coverage.
+    if not now and ((old and old.top) or (failure and failure ~= "not a Git worktree")) then
+      unavailable = tostring(failure or "Git observation missing") .. ": " .. root
+    end
+    if now then
+      if not old or old.top ~= now.top or not old.coverage_head then
+        bootstrap = true
+      elseif old.coverage_head ~= now.head then
+        changed[#changed + 1] = root
+      end
+    end
+  end
+  if #changed == 0 then return nil, bootstrap, unavailable end
+  local scoped = vim.tbl_extend("force", ctx, {engine_root = changed[1], project_root = changed[2] or ""})
+  return scoped, bootstrap, unavailable
 end
 local function union(into, from)
   for path in pairs(from or {}) do into[path] = true end

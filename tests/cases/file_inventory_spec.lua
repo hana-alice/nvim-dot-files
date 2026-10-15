@@ -28,6 +28,14 @@ local names = {
   "scope cache is bounded and evicts its oldest entry",
   "invalidation prevents an active scan republishing stale paths",
   "real files source keeps configured hooks and refresh action",
+  "prepared list source yields exactly its entries without fd",
+  "prepared list abort closes its descriptor exactly once",
+  "prepared list callback errors close its descriptor",
+  "prepared list yield errors close its descriptor",
+  "prepared list read errors preserve partial results without claiming completion",
+  "prepared list keeps CRLF chunk boundaries and final unterminated paths",
+  "empty prepared list completes and closes its descriptor",
+  "prepared list cancellation across a real coroutine suspension closes its descriptor",
 }
 
 local function fixture(root)
@@ -74,14 +82,14 @@ local function native_case(number, root, plugin)
   local Async = require("snacks.picker.util.async")
   local inventory = require("utils.file_inventory")
   local opts = fixture(root)
-  local function collect(options, on_item)
+  local function collect(options, on_item, find)
     local ctx = { filter = { search = "" }, meta = {} }
     local found, finished, failure = {}, false, nil
-    local finder = inventory.find(options, ctx)
+    local finder = (find or inventory.find)(options, ctx)
     local task
     task = Async.new(function()
       finder(function(item)
-        found[#found + 1] = item.file
+        found[#found + 1] = item.cwd and vim.fs.normalize(item.cwd .. "/" .. item.file) or item.file
         if on_item then
           on_item(item, task, #found)
         end
@@ -285,6 +293,137 @@ local function native_case(number, root, plugin)
     picker:close()
     t.assert_true(vim.bo[source].modified)
     t.assert_eq(vim.api.nvim_buf_get_lines(source, 0, -1, false)[1], "original unsaved content")
+  elseif number == 13 then
+    -- Prepared lists mix absolute project paths with workspace-root-relative engine paths.
+    local list = root .. "/workspace_all.files"
+    vim.fn.writefile({ root .. "/Project/Game.uproject", "Engine/Config/Engine.ini", "", "Engine/Docs/Guide.md" }, list)
+    local registry = require("utils.task_registry")
+    local before = #registry.list()
+    local listed = { list_path = list, list_root = root, title = "Workspace Files" }
+    local paths, meta = collect(listed, nil, inventory.find_list)
+    t.assert_eq(#registry.list(), before, "prepared list must not spawn a native scan")
+    t.assert_eq(#paths, 3)
+    t.assert_true(has(paths, "Project/Game.uproject"))
+    t.assert_true(has(paths, "Engine/Config/Engine.ini"))
+    t.assert_true(has(paths, "Engine/Docs/Guide.md"))
+    t.assert_false(has(paths, "Project/README.md"), "unlisted files on disk stay out of the picker")
+    t.assert_eq(meta.state, "prepared")
+    t.assert_eq(meta.count, 3)
+    local missing, missing_meta =
+      collect({ list_path = root .. "/absent.files", list_root = root }, nil, inventory.find_list)
+    t.assert_eq(#missing, 0)
+    t.assert_eq(missing_meta.state, "error")
+  elseif number >= 14 then
+    local uv = vim.uv or vim.loop
+    local raw_open, raw_read, raw_close, raw_yielder = uv.fs_open, uv.fs_read, uv.fs_close, Async.yielder
+    local list = root .. "/prepared.files"
+    vim.fn.writefile({ "Alpha.cpp", "Beta.cpp" }, list)
+    local opened, closed, target_fd, reads = 0, 0, nil, 0
+    local ctx, found, failure, finished, task = { meta = {} }, {}, nil, false, nil
+    uv.fs_open = function(path, ...)
+      local fd, err = raw_open(path, ...)
+      if path == list and fd then
+        opened, target_fd = opened + 1, fd
+      end
+      return fd, err
+    end
+    uv.fs_close = function(fd, ...)
+      if fd == target_fd then
+        closed = closed + 1
+      end
+      return raw_close(fd, ...)
+    end
+    if number >= 17 and number <= 19 then
+      uv.fs_read = function(fd, ...)
+        if fd ~= target_fd then
+          return raw_read(fd, ...)
+        end
+        reads = reads + 1
+        if number == 17 then
+          return reads == 1 and "Alpha.cpp\nUnfinished" or nil, reads > 1 and "EIO: injected read error" or nil
+        elseif number == 18 then
+          return ({ "Alpha.cpp\r", "\n\r\nBeta.cpp", "" })[reads]
+        end
+        return ""
+      end
+    elseif number == 16 then
+      Async.yielder = function()
+        return function()
+          error("injected yield error")
+        end
+      end
+    end
+    local ok, err = xpcall(function()
+      local finder = inventory.find_list({ list_path = list, list_root = root }, ctx)
+      task = Async.new(function()
+        finder(function(item)
+          found[#found + 1] = item
+          if number == 14 then
+            task:abort()
+          elseif number == 20 then
+            vim.schedule(function()
+              task:abort()
+            end)
+            task:suspend()
+          elseif number == 15 then
+            error("injected callback error")
+          end
+        end)
+      end)
+        :on("error", function(value)
+          failure = value
+        end)
+        :on("done", function()
+          finished = true
+        end)
+      t.assert_true(
+        vim.wait(2000, function()
+          return finished
+        end, 5),
+        "prepared list task must finish"
+      )
+      t.assert_eq(opened, 1)
+      t.assert_eq(closed, 1, "normal, error and abort paths must close exactly once")
+      t.assert_nil(uv.fs_fstat(target_fd), "the native file descriptor must be closed")
+      local meta = ctx.meta.file_inventory
+      if number == 14 or number == 20 then
+        t.assert_eq(#found, 1)
+        t.assert_nil(failure, "Snacks abort stays a cancellation, not a finder error")
+        t.assert_eq(meta.state, "cancelled")
+        t.assert_false(meta.complete)
+      elseif number == 15 or number == 16 then
+        local reason = number == 15 and "injected callback error" or "injected yield error"
+        t.assert_contains(tostring(failure), reason, "Snacks still receives callback/yield errors")
+        t.assert_eq(meta.state, "error")
+        t.assert_false(meta.complete)
+        t.assert_contains(meta.error, reason)
+      elseif number == 17 then
+        t.assert_nil(failure)
+        t.assert_eq(#found, 1, "do not publish an unterminated partial path after a read error")
+        t.assert_eq(found[1].file, "Alpha.cpp")
+        t.assert_eq(meta.count, 1)
+        t.assert_eq(meta.state, "error")
+        t.assert_false(meta.complete)
+        t.assert_contains(meta.error, "EIO")
+      else
+        t.assert_nil(failure)
+        t.assert_eq(meta.state, "prepared")
+        t.assert_true(meta.complete)
+        t.assert_eq(#found, number == 18 and 2 or 0)
+        if number == 18 then
+          t.assert_eq(found[1].file, "Alpha.cpp")
+          t.assert_eq(found[2].file, "Beta.cpp")
+          t.assert_eq(found[2].cwd, root)
+        end
+      end
+    end, debug.traceback)
+    uv.fs_open, uv.fs_read, uv.fs_close, Async.yielder = raw_open, raw_read, raw_close, raw_yielder
+    if target_fd and uv.fs_fstat(target_fd) then
+      raw_close(target_fd)
+    end
+    if not ok then
+      error(err)
+    end
   end
 end
 

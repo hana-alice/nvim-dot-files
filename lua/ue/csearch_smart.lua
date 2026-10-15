@@ -13,8 +13,9 @@ end
 -- total_n }. Returns mode ("reset"|"add"|"skip") + human reason.
 function M.csearch_build_mode(stats)
   stats = stats or {}
+  if stats.index_unavailable then return "reset", "primary csearch index unavailable" end
   if stats.forced then return "reset", "forced" end
-  if stats.dirty_capped and not stats.git_recovered then return "reset", "dirty coverage was truncated" end
+  if stats.dirty_capped and not stats.git_recovered then return "reset", "dirty event coverage is unknown" end
   if stats.git_recovered and stats.has_snapshot then return "add", "complete Git overflow recovery" end
   if not stats.has_snapshot then return "reset", "no snapshot of last indexed set" end
   local work = (stats.added_n or 0) + (stats.dirty_n or 0) + (stats.removed_n or 0)
@@ -72,13 +73,13 @@ function M.csearch_smart_build(ctx, cs_ctx, abs_list, cb, deps)
     return
   end
 
-  local function snapshot_current()
+  local function snapshot_current(input)
     if not snap_path then return true end
-    local ok, copied = pcall(vim.uv.fs_copyfile, abs_list, snap_path)
+    local ok, copied = pcall(vim.uv.fs_copyfile, input or abs_list, snap_path)
     return ok and copied == true
   end
 
-  local git_before, recovered, recovery_stats
+  local git_before, recovered, recovery_stats, bootstrap_git, capture_unavailable
   local missing_from_cache = {}
   local function publish_filtered_workspace()
     local path = ctx and ctx.paths and ctx.paths.workspace_all_list
@@ -102,7 +103,14 @@ function M.csearch_smart_build(ctx, cs_ctx, abs_list, cb, deps)
     return ok
   end
   local function published(stats, complete)
-    if not publish_filtered_workspace() or not snapshot_current() then
+    if stats.repair_input then
+      local repaired = read_list_file(stats.repair_input)
+      if not repaired then cb(false, "cannot read repaired csearch snapshot", stats); return end
+      for _, path in ipairs(new_list.list) do
+        if not repaired.set[path] then missing_from_cache[path] = true end
+      end
+    end
+    if not publish_filtered_workspace() or not snapshot_current(stats.repair_input) then
       local path = git.path(ctx); if path then pcall(os.remove, path) end
       cb(false, "cannot publish csearch file snapshot", stats); return
     end
@@ -120,6 +128,7 @@ function M.csearch_smart_build(ctx, cs_ctx, abs_list, cb, deps)
       stats = stats or {}
       stats.mode = "reset"
       stats.delta = reason
+      stats.git_capture_unavailable = capture_unavailable
       if ok then published(stats, true) else cb(ok, err, stats) end
     end), { mode = "reset" })
     if after_fallback then
@@ -183,14 +192,16 @@ function M.csearch_smart_build(ctx, cs_ctx, abs_list, cb, deps)
       if new_list.set[p] and not add_seen[p] then add_seen[p] = true; add_input[#add_input + 1] = p end
     end
 
+    local index_checked, indexed = pcall(code_search.is_indexed, cs_ctx)
     local mode, why = M.csearch_build_mode({
-      forced       = ctx and ctx._force_csearch or false,
+      forced       = (ctx and ctx._force_csearch) or bootstrap_git or false,
       has_snapshot = old_list ~= nil,
       added_n      = #added,
       removed_n    = #removed,
       dirty_n      = #dirty_in_set,
       dirty_capped = dirty_capped,
       git_recovered = recovered,
+      index_unavailable = not (index_checked and indexed == true),
       total_n      = new_list.n,
     })
 
@@ -243,13 +254,14 @@ function M.csearch_smart_build(ctx, cs_ctx, abs_list, cb, deps)
       if delete_list_path then pcall(os.remove, delete_list_path) end
       if ok then
         stats = stats or {}
-        stats.mode = "add"
+        stats.mode = stats.repair_reset and "reset" or "add"
         stats.delta = why
         stats.git_recovered = recovered == true
         stats.covered_paths = add_input
-        published(stats, recovered == true)
+        published(stats, stats.repair_reset == true or recovered == true)
         return
       end
+      if stats and (stats.repair_attempted or stats.verification_unavailable) then cb(false, err, stats); return end
       -- Incremental refused/failed (typically D9 unusable-idx guard). One
       -- automatic reset — always safe — instead of surfacing a dead end.
       pcall(function()
@@ -257,14 +269,25 @@ function M.csearch_smart_build(ctx, cs_ctx, abs_list, cb, deps)
           tostring(err or "?"):sub(1, 120))
       end)
       run_reset("fallback after add failure", err or "?")
-    end), { mode = "add", delete_list = delete_list_path })
+    end), { mode = "add", delete_list = delete_list_path, complete_list_path = abs_list })
   end
-  if not dirty_capped and old_list and not (ctx and ctx._force_csearch)
-      and #added + #removed + #dirty_in_set == 0 then decide(); return end
-  git.capture(ctx, guard(function(before)
+  git.capture(ctx, guard(function(before, failures)
     git_before = before
-    if not dirty_capped or not old_list or (ctx and ctx._force_csearch) then decide(); return end
-    git.recover(ctx, before, new_list.list, old_list.list, guard(function(changes, failure, details)
+    local pending_ctx, pending_bootstrap, unavailable = git.pending(ctx, before, failures)
+    capture_unavailable = unavailable
+    if unavailable then
+      bootstrap_git = true
+      pcall(function() require("utils.probe").record("csearch-smart-build", "git-capture-unavailable",
+        {state = "unavailable", why = unavailable}) end)
+      decide(); return
+    end
+    if not old_list or (ctx and ctx._force_csearch) then decide(); return end
+    local recovery_ctx = ctx
+    if not dirty_capped then
+      recovery_ctx, bootstrap_git = pending_ctx, pending_bootstrap
+      if bootstrap_git or not recovery_ctx then decide(); return end
+    end
+    git.recover(recovery_ctx, before, new_list.list, old_list.list, guard(function(changes, failure, details)
       recovery_stats = details
       recovered = changes ~= nil
       if changes then
@@ -292,7 +315,7 @@ function M.csearch_smart_build(ctx, cs_ctx, abs_list, cb, deps)
             vim.schedule(guard(function()
               if stat_err and not tostring(stat_err):find("ENOENT", 1, true)
                   and not tostring(stat_err):find("ENOTDIR", 1, true) then
-                recovered = false; finish_stat(); return
+                recovered, bootstrap_git = false, true; finish_stat(); return
               end
               if not stat or stat.type ~= "file" then
                 if new_list.set[p] then
@@ -309,6 +332,7 @@ function M.csearch_smart_build(ctx, cs_ctx, abs_list, cb, deps)
         next_stat()
         return
       else
+        bootstrap_git = true
         pcall(function() require("utils.probe").record("csearch-smart-build", "git-recovery-reset",
           {state = "ok", why = failure}) end)
       end

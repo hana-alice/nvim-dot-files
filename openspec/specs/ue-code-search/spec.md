@@ -67,6 +67,12 @@ Watcher dirty 数组是有界集合，截断丢失路径时 SHALL 原子发布
 旧基线以来的全部变化时 MUST NOT 把该 HEAD 冒充完整覆盖基线。Git 基线仅用于
 恢复改动集，MUST NOT 替代 workspace 清单内容指纹的 freshness 判据。
 
+普通构建也 SHALL 在判定 skip 前异步核对成功捕获的 Git root：完整覆盖 HEAD 与
+当前 HEAD 不同，即使未发生 dirty 溢出、文件清单未变，也 SHALL 从完整覆盖基线
+恢复 delta。观察 HEAD 前进不构成覆盖证据。已识别 Git root 缺少有效覆盖基线时
+SHALL 通过一次 reset 建立基线；普通非 Git root 不因无法捕获 Git 身份而反复 reset。
+上述普通构建判据 MUST NOT 放宽溢出恢复要求所有必要 root 证据完整的门禁。
+
 标记 SHALL 保持可见直到成功 reset 或已证明覆盖完整改动集的 Git add 确认。
 成功确认 SHALL 只清除构建开始前的旧标记；构建期间的新溢出及同秒不确定事件
 MUST NOT 被清除。无法证明完整覆盖时 freshness SHALL 保持 stale，
@@ -85,6 +91,32 @@ smart build MUST NOT 把有界 dirty 集合当作完整 delta。
 - **WHEN** 任一 root 非 Git、无记录、Git 查询失败或记录 HEAD 不可达
 - **THEN** 系统 SHALL 选择 reset，保留既有失败与溢出保护
 
+#### Scenario: 普通提交被 watcher 漏记
+- **WHEN** 文件清单未变、dirty 未溢出，但 Git HEAD 与成功覆盖基线不同
+- **THEN** 系统 SHALL 查询完整改动集，MUST NOT 提前 skip 或用观察 HEAD 隐藏漏记
+
+### Requirement: 增量成功必须包含入索引与有界内容证据
+
+原生增量工具 SHALL 拒绝缺失或非普通文件的输入；本轮要求更新的文件若未进入
+暂存名字表，SHALL 在 merge 发布前失败，MUST NOT 以部分成功推进覆盖基线。
+既有 reset 文本过滤、增量删除及前缀遮蔽闭包 SHALL 保留。
+
+增量发布后、调用方确认覆盖前，SHALL 异步抽查本轮变更和随机快照文件，通过
+精确文件 mask 查询文件当前内容中的长标识符。抽查 SHALL 有界：最多 16 个变更
+文件加 4 个随机文件，每个最多读取 64 KiB、最多查询两个标识符，查询串行且有超时。
+达到读取上限、无长标识符或符合已知原生文本排除规则的文件 SHALL 跳过，不能把
+有意未索引的内容误判为陈旧；抽查范围限于可完整读取的小文本文件。
+格式头有效或查询通用词命中 MUST NOT 被当作内容 trigram 正确的证明。
+
+明确内容不命中 SHALL 记录不一致探针，并在原写者租约内按完整输入安排一次后台
+reset，继续使用既有宿主准入。修复失败 SHALL 保留 dirty/基线且 MUST NOT 二次
+自动 reset；查询工具、读取或查询执行错误 SHALL 报错，不冒充内容不一致触发重建。
+抽样成功只代表抽中窗口通过，MUST NOT 表述为全索引内容一致性证明。
+
+#### Scenario: 结构有效但 trigram 陈旧
+- **WHEN** 增量工具返回成功，但精确文件查询不命中文件当前的长标识符
+- **THEN** 系统 SHALL 记录探针并最多执行一次异步 reset，修复成功才确认覆盖
+
 ### Requirement: freshness 以文件清单内容指纹判定，不用 mtime 代理
 
 freshness SHALL 以 `workspace_all.files` 的内容指纹与建索引时记录的指纹
@@ -96,7 +128,8 @@ HEAD/logs 或引擎/项目目录 mtime 等侧信道代理。全量构建成功�
 理由：freshness 要回答的是「被索引的文件**集合**是否变化」，内容指纹是
 直接测量；mtime 代理会被 fsmonitor / TortoiseGit 后台 touch、编译产物落树
 等无关事件污染而产生假 stale。已有文件的**内容编辑**不在此范围，由 clangd
-实时感知。
+实时感知；csearch 内容覆盖另外由 dirty、Git 覆盖恢复与增量有界自检负责，集合
+freshness 为 fresh 不证明内容 trigram 最新。
 
 #### Scenario: 文件集合未变但引擎目录 mtime 被 touch
 - **WHEN** `:UEPrepare` 后用户重新编译，引擎目录 mtime 被 touch，但未增删
@@ -165,6 +198,13 @@ Project-scoped grep 缓存 SHALL 按 canonical project identity 分桶于 engine
   首次 `:UEPrepare` 重建
 
 ## 选型与踩坑
+
+- **踩坑（2026-10-13，W1 fixture）**：未溢出且文件清单不变时，提前 skip 会跳过
+  Git 恢复，watcher 漏记的普通提交可一直保留旧 trigram。Go 工具曾把缺失输入或
+  AddFile 拒绝的增量当成功；现分别在输入和 merge 发布前拒绝。相同 size/mtime
+  内容替换的原生回归通过，未复现旧段覆盖。用户旧索引的历史漏写时刻未被唯一还原。
+- **选型（2026-10-13）**：完整覆盖 HEAD 与观察 HEAD 分开使用；增量内容抽查作为
+  覆盖发布前的有界证据，发现明确漏命中时原租约内一次异步 reset，不循环重建。
 
 - **选型（2026-10-04）**：严格字面和全词命中以可证明的 UTF-8 byte span 驱动跳转/预览；
   csearch 没有提供可证明正则 span 时诚实行定位，不把第 1 列包装成精确匹配。

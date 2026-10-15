@@ -1819,8 +1819,8 @@ M.FT_ALL = vim.list_extend(vim.list_extend({}, M.FT_CODE), M.FT_CONFIG)
 -- Strictly limited to shaders: GNU Global on Windows ships without a
 -- self-contained language parser — its plug-in stub spawns an external
 -- `ctags` for languages the bundled DLL doesn't natively handle. We
--- can route .usf/.ush/.hlsl/.hlsli through the C++ langmap (validated:
--- 100% definition-jump hit rate, zero deps), but .cs/.py would force
+-- route shaders through the C++ langmap with bounded positive witnesses;
+-- shader attributes still have parser limits, while .cs/.py would force
 -- a hard dependency on a separately-installed ctags.exe.
 --
 -- For .cs (Build.cs/Target.cs) and .py the user falls back to csearch
@@ -1909,8 +1909,9 @@ local function picker_search_dirs(ctx)
     add(join(ctx.engine_root, relative))
   end
 
-  if ctx.project_root and ctx.project_root ~= "" then
-    add(ctx.project_root)
+  local project_dirs = ctx.project_root and existing_relative_dirs(ctx.project_root, CORE_RT.project_index_dirs(ctx)) or {}
+  for _, relative in ipairs(_uscan.converge(project_dirs)) do -- nested dirs would make rg report a match twice
+    add(join(ctx.project_root, relative)) -- same scope as :UEPrepare, never the whole project tree
   end
 
   return dirs
@@ -2195,18 +2196,11 @@ local save_index_state = INDEX_FN.save_index_state
 local sorted_module_records = INDEX_FN.sorted_module_records
 local module_tier_label = INDEX_FN.module_tier_label
 
-local function index_output_paths(ctx)
-  local outputs = {}
-  local compile_commands = ctx.paths and ctx.paths.active_cdb or nil
-  if compile_commands and compile_commands ~= "" then
-    table.insert(outputs, compile_commands)
-  end
-  if ctx.paths and ctx.paths.active_index then
-    table.insert(outputs, ctx.paths.active_index)
-  end
-  for _, name in ipairs({ "GTAGS", "GRTAGS", "GPATH" }) do
-    table.insert(outputs, join(ctx.paths.workspace_db, name))
-  end
+local function index_output_paths(ctx, summary)
+  local outputs = { ctx.paths and ctx.paths.active_cdb or "" }
+  -- Check the selected phase artifact, not the retired <project>.idx alias.
+  table.insert(outputs, ctx.paths[(summary.selected_phase or "") .. "_index"] or "")
+  vim.list_extend(outputs, require("ue.gtags").output_paths(ctx.paths.workspace_db))
   return outputs
 end
 
@@ -2257,13 +2251,7 @@ local function count_cached_entries(path)
 end
 
 local function db_ready(db_dir)
-  for _, name in ipairs({ "GTAGS", "GRTAGS", "GPATH" }) do
-    local path = join(db_dir, name)
-    if not _ufs.is_file(path) or vim.fn.getfsize(path) <= 0 then
-      return false
-    end
-  end
-  return true
+  return require("ue.gtags").ready(db_dir, true)
 end
 
 local prepare_freshness  -- forward-decl alias kept for in-module callers
@@ -2360,7 +2348,7 @@ local function prepare_cache_ready(ctx)
       return false
     end
   end
-  if not db_ready(ctx.paths.workspace_db) then
+  if not require("ue.gtags").ready(ctx.paths.workspace_db, false, ctx) then
     return false
   end
   -- Scan roots are part of the cache identity. This invalidates pre-fix lists
@@ -2428,9 +2416,9 @@ local function index_status_token(ctx)
   elseif summary.root_dirty then
     token = summary.dirty > 0 and string.format("IDX!%d", summary.dirty) or "IDX!R"
   else
-    local outputs = index_output_paths(ctx)
+    local outputs = index_output_paths(ctx, summary)
     for _, path in ipairs(outputs) do
-      if _ufs.file_mtime(path) <= 0 then
+      if not _ufs.is_file(path) or _ufs.file_mtime(path) <= 0 then
         token = "IDX?"
         break
       end
@@ -2513,6 +2501,7 @@ local function set_prepare_running(value)
     return
   end
   M._prepare_running = value
+  require("ue.index.prepare_observer").running(value)
   if not value and CORE_RT.prepare_lease then
     CORE_RT.file_lock.release(CORE_RT.prepare_lease)
     CORE_RT.prepare_lease = nil
@@ -2729,7 +2718,7 @@ local function scan_relative_files(root, search_paths)
     return nil, table.concat(lines or {}, "\n")
   end
 
-  return lines, nil
+  return require("utils.file_inventory").supplement_tracked_sync(root, search_paths, lines, { excludes = UE_CONST.SCAN_EXCLUDES })
 end
 
 -- Async version: calls cb(lines, err) on vim.schedule when done.
@@ -2778,17 +2767,12 @@ local function scan_relative_files_async(root, search_paths, cb)
       for line in output:gmatch("[^\r\n]+") do
         lines[#lines + 1] = line
       end
-      cb(lines, nil)
+      require("utils.file_inventory").supplement_tracked(root, search_paths, lines, cb, { excludes = UE_CONST.SCAN_EXCLUDES })
     end)
   end)
     end,
     on_error = function(err) cb(nil, "workspace scan admission failed: " .. tostring(err)) end,
   })
-end
-
-local function clean_db_dir(dir)
-  pcall(vim.fn.delete, dir, "rf")
-  _ufs.ensure_dir(dir)
 end
 
 local function glob_paths(pattern)
@@ -2821,43 +2805,6 @@ local function uproject_dir(ctx)
     if d and d ~= "" then return d end
   end
   return ctx and ctx.project_root or nil
-end
-
-local function build_gtags_db(root, filelist, db_dir, label)
-  return require("ue.gtags").build_sync({
-    root = root,
-    filelist = filelist,
-    db_dir = db_dir,
-    label = label,
-    run_lines = run_lines,
-  })
-end
-
-local function global_lines(root, db_dir, args)
-  local cmd = { "global" }
-  vim.list_extend(cmd, args)
-
-  if vim.system then
-    return run_lines(cmd, {
-      cwd = root,
-      env = {
-        GTAGSROOT = root,
-        GTAGSDBPATH = db_dir,
-      },
-    })
-  end
-
-  local prev_root = vim.env.GTAGSROOT
-  local prev_db = vim.env.GTAGSDBPATH
-  vim.env.GTAGSROOT = root
-  vim.env.GTAGSDBPATH = db_dir
-  local ok, code, lines = pcall(run_lines, cmd, { cwd = root })
-  vim.env.GTAGSROOT = prev_root
-  vim.env.GTAGSDBPATH = prev_db
-  if not ok then
-    error(code)
-  end
-  return code, lines
 end
 
 local function rg_code_definition_search(ctx, symbol)
@@ -3220,6 +3167,9 @@ local function shader_definition_search(ctx, symbol)
   if current == "" or not path_has_extension(current, M.FT_SHADER) then
     return false
   end
+
+  local code, lines = require("ue.gtags").query_sync(ctx, { "-d", "--literal", "--result=grep", symbol }, run_lines)
+  if code == 0 and #lines > 0 then return jump_to_global_result(workspace_root(ctx), lines, symbol) end
 
   local function finalize(entries)
     if #entries == 0 then
@@ -3977,7 +3927,7 @@ generate_compile_commands_from_rsp = function(ctx, progress)
 
   -- Select before augmentation changes bucket sizes or shader donors.
   local active_bucket = shards_mod.select_generated_bucket(
-    buckets, ctx.state, shards_mod.read_manifest(ctx).active)
+    buckets, ctx.state, assert(shards_mod.read_manifest(ctx)).active)
 
   progress("shaders", 80, "augmenting active shard with shader entries...")
   local synthetic_shaders
@@ -4020,7 +3970,6 @@ generate_compile_commands_from_rsp = function(ctx, progress)
     end
   end)
 
-  -- Write every bucket to its shard file + update manifest.
   progress("shards", 85, "writing per-config shards...")
   local active_key = nil
   CORE_RT.trace_seg("ccjson.write_shards", function()
@@ -4028,23 +3977,21 @@ generate_compile_commands_from_rsp = function(ctx, progress)
       local roots = {}
       for r, _ in pairs(b.roots) do roots[#roots + 1] = r end
       table.sort(roots)
-      local k = shards_mod.write_shard(ctx, b.platform, b.target, b.config, b.entries, roots)
+      local k = assert(shards_mod.write_shard(ctx, b.platform, b.target, b.config, b.entries, roots))
       if b == active_bucket then active_key = k end
     end
   end)
-
-  -- Ensure manifest.active reflects the bucket clangd should consume.
   if active_key then
-    local manifest = shards_mod.read_manifest(ctx)
+    local manifest = assert(shards_mod.read_manifest(ctx))
     manifest.active = active_key
-    shards_mod.write_manifest(ctx, manifest)
+    assert(shards_mod.write_manifest(ctx, manifest))
   end
 
-  -- Merge all shards (priority dedup) → final top-level CDB.
   progress("merge", 90, "merging shards into top-level CDB...")
   local merged, stats = CORE_RT.trace_seg("ccjson.merge", function()
     return shards_mod.merge_shards(ctx)
   end)
+  assert(merged, stats and stats.error or "shard merge failed")
   CORE_RT.trace_mark(string.format(
     "ccjson.merge in=%d out=%d dropped=%d shards=%d active=%s",
     stats.total_in, stats.total_out, stats.dropped, stats.shard_count,
@@ -4757,7 +4704,7 @@ CORE_RT.foreign_buffer_notified = CORE_RT.foreign_buffer_notified or {}
 -- key for dedup (the first path segment two levels up, best effort).
 function CORE_RT.foreign_buffer_key(path, project_root, engine_root)
   local p = tostring(path or ""):lower():gsub("\\", "/")
-  if p == "" then return nil end
+  if not require("utils.buffer_uri").is_file_name(p) then return nil end
   local function inside(root)
     root = tostring(root or ""):lower():gsub("\\", "/"):gsub("/+$", "")
     if root == "" then return false end
@@ -5023,7 +4970,7 @@ function M.cached_code_file_list(opts)
   return { files = files, root = info.root, list_path = info.list_path }
 end
 
--- Files picker uses an independent, complete per-process inventory.
+-- Files picker: prepared list first, else a complete per-process fd inventory.
 -- list_type: "all" (default) or "code"
 function M.cached_files(opts)
   opts = opts or {}
@@ -5032,12 +4979,8 @@ function M.cached_files(opts)
   if not ctx then return nil end
   local info = { ctx = ctx, root = workspace_root(ctx) }
 
-  -- Lazy-start ue_watch so subsequent edits/adds get tracked into the
-  -- persistent dirty set even if the user never runs :UEPrepare this session.
-  -- Without this, freshness banners on <space><space> would only become
-  -- truthful AFTER the first explicit :UEPrepare of the session (which is
-  -- exactly the failure mode that landed us here). Idempotent — M.start
-  -- early-returns when a handle is already live.
+  -- Lazy-start ue_watch so edits are tracked into the dirty set (and freshness
+  -- banners stay truthful) even before the first :UEPrepare. Idempotent.
   do
     local ok_watch, watch = pcall(require, "utils.ue_watch")
     if ok_watch and type(watch.start) == "function" then
@@ -5059,7 +5002,10 @@ function M.cached_files(opts)
 
   CORE_RT.notify_freshness(info.ctx, "find files")
 
-  local options = vim.tbl_extend("force", vim.deepcopy(opts), {
+  -- Prefer the prepared list (same scope as :UEPrepare); fd only when no list exists.
+  local list = cached_file_list_info(opts, list_type == "code" and "code" or "all")
+  local options = vim.tbl_extend("force", vim.deepcopy(opts), list and { title = opts.title or "Workspace Files",
+    list_path = list.list_path, list_root = list.root } or {
     title = opts.title or "Workspace Files",
     dirs = picker_search_dirs(ctx),
     exclude = picker_excludes({ include_third_party = list_type ~= "code" }),
@@ -5192,6 +5138,7 @@ function M.index_status(opts)
       )
     end
   end
+  require("ue.index.batch_progress").append(ctx, lines)
   local msg = table.concat(lines, "\n")
   vim.notify(msg, vim.log.levels.INFO)
   return msg
@@ -5368,7 +5315,7 @@ function CORE_RT.start_deferred_clangd(ctx)
     for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
       if vim.api.nvim_buf_is_valid(bufnr)
           and vim.api.nvim_buf_is_loaded(bufnr)
-          and allowed_filetypes[vim.bo[bufnr].filetype] then
+          and allowed_filetypes[vim.bo[bufnr].filetype] and require("utils.buffer_uri").is_file_buffer(bufnr) then
         local path = vim.api.nvim_buf_get_name(bufnr)
         if CORE_RT.foreign_buffer_key(path, ctx.project_root, ctx.engine_root) == nil then
           CORE_RT.wake_deferred_clangd_buffer(bufnr)
@@ -5379,6 +5326,7 @@ function CORE_RT.start_deferred_clangd(ctx)
 end
 
 function M.clangd_start_root(bufnr)
+  if not require("utils.buffer_uri").is_file_buffer(bufnr or 0) then return nil end
   local root = M.clangd_root(bufnr)
   local path = vim.api.nvim_buf_get_name(bufnr or 0)
   local ctx = resolve_context({ bufname = path ~= "" and path or nil })
@@ -5435,12 +5383,7 @@ function M.gtags_rebuild_shaders()
   if not ctx.paths or not ctx.paths.workspace_list or not ctx.paths.workspace_db then
     return false, "ctx.paths missing workspace_list/workspace_db"
   end
-  return require("ue.gtags").rebuild_async({
-    root = workspace_root(ctx),
-    filelist = ctx.paths.workspace_list,
-    db_dir = ctx.paths.workspace_db,
-    label = "UE shader GTAGS rebuild",
-  }, function(ok, message)
+  return require("ue.gtags").rebuild_async(require("ue.gtags").workspace_spec(ctx), function(ok, message)
     if not ok then require("utils.log").warn_ctx(
       "ue.gtags", "shader GTAGS rebuild failed", { reason = message }) end
   end)
@@ -5458,7 +5401,7 @@ function M.gtags_references(symbol)
 
   local root = workspace_root(ctx)
   if db_ready(ctx.paths.workspace_db) then
-    local code, lines = global_lines(root, ctx.paths.workspace_db, { "-r", "--literal", "--result=grep", symbol })
+    local code, lines = require("ue.gtags").query_sync(ctx, { "-r", "--literal", "--result=grep", symbol }, run_lines)
     if (code == 0 or code == 1) and lines and #lines > 0 then
       return populate_quickfix_from_global("GTAGS references: " .. symbol, root, lines)
     end
@@ -5480,12 +5423,12 @@ function M.gtags_definition(symbol)
 
   local root = workspace_root(ctx)
   if db_ready(ctx.paths.workspace_db) then
-    local code, lines = global_lines(root, ctx.paths.workspace_db, { "-d", "--literal", "--result=grep", symbol })
+    local code, lines = require("ue.gtags").query_sync(ctx, { "-d", "--literal", "--result=grep", symbol }, run_lines)
     if (code == 0 or code == 1) and lines and #lines > 0 then
       return jump_to_global_result(root, lines, symbol)
     end
 
-    code, lines = global_lines(root, ctx.paths.workspace_db, { "-g", "--literal", "--result=grep", symbol })
+    code, lines = require("ue.gtags").query_sync(ctx, { "-g", "--literal", "--result=grep", symbol }, run_lines)
     if (code == 0 or code == 1) and lines and #lines > 0 then
       return jump_to_global_grep_candidate(root, symbol, lines)
     end
@@ -5502,28 +5445,17 @@ end
 -- ---------------------------------------------------------------------------
 
 do
-  local function global_lines_async(root, db_dir, args, on_done)
-    local cmd = { "global" }
-    vim.list_extend(cmd, args)
-    return M._async.run_lines(cmd, {
-      cwd = root,
-      env = {
-        GTAGSROOT = root,
-        GTAGSDBPATH = db_dir,
-      },
-    }, on_done)
-  end
-
-  local function rg_code_definition_search_async(ctx, symbol, on_done)
+  local definition_token = 0
+  local function rg_code_definition_search_async(ctx, symbol, on_done, current)
     symbol = trim(symbol)
     if not ctx or symbol == "" then
-      on_done(false)
+      on_done(false, { backend = "rg", reason = "unavailable", coverage = "unavailable" })
       return
     end
 
     local rg = _uproc.first_executable({ "rg" })
     if not rg then
-      on_done(false)
+      on_done(false, { backend = "rg", reason = "unavailable", coverage = "unavailable" })
       return
     end
 
@@ -5547,7 +5479,7 @@ do
     end
 
     if #dirs == 0 then
-      on_done(false)
+      on_done(false, { backend = "rg", reason = "unavailable", coverage = "unavailable" })
       return
     end
 
@@ -5572,12 +5504,56 @@ do
     end
 
     M._async.run_lines(cmd, { cwd = cwd }, function(code, lines)
+      if current and not current() then return end
       if code ~= 0 and code ~= 1 then
-        on_done(false)
+        on_done(false, { backend = "rg", reason = "command-failed", coverage = "partial" })
         return
       end
       local jumped = jump_to_grep_candidate_entries(symbol, parse_rg_entries(lines))
-      on_done(jumped and true or false)
+      on_done(jumped and true or false, { backend = "rg", reason = jumped and "resolved" or "empty", coverage = "partial" })
+    end)
+  end
+
+  local function shader_definition_search_async(ctx, symbol, previous, on_done, subject, current)
+    local file = norm(vim.api.nvim_buf_get_name(subject))
+    local entries, seen = {}, {}
+    collect_shader_definition_entries(entries, seen, file, vim.api.nvim_buf_get_lines(subject, 0, -1, false), symbol)
+    if #entries > 0 then
+      local hit
+      if #entries == 1 then hit = jump_to_entry(entries[1])
+      else hit = populate_quickfix_from_entries("Shader definitions: " .. symbol, entries) end
+      on_done(hit and true or false, { backend = "buffer", reason = hit and "resolved" or "jump-failed", coverage = "partial" })
+      return
+    end
+    local rg = _uproc.first_executable({ "rg" })
+    if not rg then
+      on_done(false, { backend = "rg", reason = "unavailable", coverage = "unavailable", previous = previous })
+      return
+    end
+    local dirs = shader_search_dirs(ctx)
+    if #dirs == 0 then on_done(false, previous); return end
+    local cmd = { rg, "--threads", "1", "--line-number", "--with-filename", "--no-heading", "--color", "never",
+      "--no-ignore", "--max-count", "200" }
+    for _, extension in ipairs(M.FT_SHADER) do vim.list_extend(cmd, { "-g", "*." .. extension }) end
+    cmd[#cmd + 1] = [[\b]] .. symbol .. [[\s*\(]]
+    vim.list_extend(cmd, dirs)
+    M._async.run_lines(cmd, { cwd = ctx.engine_root }, function(code, lines)
+      if not current() then return end
+      if code ~= 0 and code ~= 1 then
+        on_done(false, { backend = "rg", reason = "command-failed", coverage = "partial", previous = previous })
+        return
+      end
+      for _, line in ipairs(lines or {}) do
+        local file, lnum, text = line:match("^(.-):(%d+):(.*)$")
+        if file then
+          local entry = shader_definition_entry(file, tonumber(lnum), text, symbol)
+          if entry then add_quickfix_entry(entries, seen, entry) end
+        end
+      end
+      local hit = #entries == 1 and jump_to_entry(entries[1])
+        or #entries > 1 and populate_quickfix_from_entries("Shader definitions: " .. symbol, entries)
+      on_done(hit and true or false, { backend = "rg", reason = hit and "resolved"
+        or #entries > 0 and "jump-failed" or "empty", coverage = "partial", previous = previous })
     end)
   end
 
@@ -5585,48 +5561,36 @@ do
   -- on_done(true) -> jumped or qf populated; on_done(false) -> nothing found.
   function M.gtags_definition_async(symbol, on_done)
     on_done = on_done or function() end
+    definition_token = definition_token + 1
+    local token = definition_token
+    local win, subject = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
+    local tick, cursor = vim.api.nvim_buf_get_changedtick(subject), vim.api.nvim_win_get_cursor(win)
+    local function current()
+      return token == definition_token and vim.api.nvim_win_is_valid(win) and vim.api.nvim_buf_is_valid(subject)
+        and vim.api.nvim_get_current_win() == win and vim.api.nvim_win_get_buf(win) == subject
+        and vim.api.nvim_buf_get_changedtick(subject) == tick and vim.deep_equal(vim.api.nvim_win_get_cursor(win), cursor)
+    end
     local ctx, err = resolve_context()
     if not ctx then
-      vim.notify(err, vim.log.levels.WARN)
-      on_done(false)
+      on_done(false, { backend = "none", reason = "unavailable", coverage = "unavailable", detail = err })
       return
     end
-
-    if shader_definition_search(ctx, symbol) then
-      on_done(true)
-      return
-    end
-
     local root = workspace_root(ctx)
-    local function rg_step()
-      rg_code_definition_search_async(ctx, symbol, on_done)
-    end
-
-    if not db_ready(ctx.paths.workspace_db) then
-      rg_step()
-      return
-    end
-
-    global_lines_async(root, ctx.paths.workspace_db,
-      { "-d", "--literal", "--result=grep", symbol },
-      function(code, lines)
-        if (code == 0 or code == 1) and lines and #lines > 0 then
-          if jump_to_global_result(root, lines, symbol) then
-            on_done(true)
-            return
-          end
+    require("ue.gtags").query_async(ctx, { "-d", "--literal", "--result=grep", symbol }, M._async.run_lines,
+      function(code, lines, result)
+        if not current() then return end
+        if code == 0 and #lines > 0 then
+          local jumped = jump_to_global_result(root, lines, symbol)
+          result.reason = jumped and "resolved" or "jump-failed"
+          on_done(jumped and true or false, result)
+          return
         end
-        global_lines_async(root, ctx.paths.workspace_db,
-          { "-g", "--literal", "--result=grep", symbol },
-          function(code2, lines2)
-            if (code2 == 0 or code2 == 1) and lines2 and #lines2 > 0 then
-              if jump_to_global_grep_candidate(root, symbol, lines2) then
-                on_done(true)
-                return
-              end
-            end
-            rg_step()
-          end)
+        local subject_file = norm(vim.api.nvim_buf_get_name(subject))
+        if path_has_extension(subject_file, M.FT_SHADER) then
+          shader_definition_search_async(ctx, symbol, result, on_done, subject, current)
+          return
+        end
+        rg_code_definition_search_async(ctx, symbol, on_done, current)
       end)
   end
 
@@ -5652,8 +5616,8 @@ do
       return on_done(false)
     end
     local root = workspace_root(ctx)
-    return global_lines_async(root, ctx.paths.workspace_db,
-      { "-r", "--literal", "--result=grep", symbol }, function(code, lines)
+    return require("ue.gtags").query_async(ctx,
+      { "-r", "--literal", "--result=grep", symbol }, M._async.run_lines, function(code, lines)
         if not current() then return end
         local entries = (code == 0 or code == 1) and parse_global_entries(root, lines or {}) or {}
         if opts.collect then
@@ -6117,9 +6081,9 @@ function CORE_RT.fast_swap_active_platform(engine_root)
   end
 
   local shards = require("ue.cdb.shards")
-  local manifest = shards.read_manifest(ctx)
+  local manifest, manifest_err = shards.read_manifest(ctx)
   if not manifest or not manifest.shards or not next(manifest.shards) then
-    return false, nil, "no shards on disk yet — run :UEPrepare once to seed the per-platform cache"
+    return false, nil, manifest_err or "no shards on disk yet — run :UEPrepare once to seed the per-platform cache"
   end
 
   local new_key = shards.active_key(ctx, manifest)
@@ -6145,6 +6109,10 @@ function CORE_RT.fast_swap_active_platform(engine_root)
   manifest.active = new_key
 
   local merged, stats = shards.merge_shards(ctx, manifest)
+  if not merged then
+    CORE_RT.file_lock.release(swap_lease)
+    return false, nil, stats and stats.error or "shard merge failed"
+  end
   local json = vim.json.encode(merged)
 
   local targets = compile_commands_targets(ctx)
@@ -6162,8 +6130,7 @@ function CORE_RT.fast_swap_active_platform(engine_root)
     return false, nil, pipeline_err or "compile_commands pipeline failed to start"
   end
 
-  -- Tell clangd to reload. LspRestart is async — clangd reads the new cdb on
-  -- attach, so any open buffer will pick up the swap within ~1s.
+  -- Reload clangd after the platform swap.
   pcall(vim.cmd, "LspRestart clangd")
 
   return true, new_key, stats
@@ -7529,7 +7496,7 @@ local function prepare()
   write_lines(ctx.paths.workspace_all_list, workspace_all)
   update_state_field(ctx.engine_root, "project_scan_roots", CORE_RT.project_index_dirs(ctx))
 
-  local ok_workspace, workspace_err = build_gtags_db(root, ctx.paths.workspace_list, ctx.paths.workspace_db, "workspace")
+  local ok_workspace, workspace_err = require("ue.gtags").build_sync(vim.tbl_extend("force", require("ue.gtags").workspace_spec(ctx), { run_lines = run_lines }))
   if not ok_workspace then
     invalidate_status_cache()
     refresh_statusline()
@@ -7663,6 +7630,17 @@ end
 
 local function prepare_async(opts)
   opts = opts or {}
+  if opts._headless_index_fixture then
+    local fixture = opts._headless_index_fixture
+    return require("ue.index.prepare_fixture").start(fixture.ctx, fixture.private_root, fixture.options, {
+      running = function() return M._prepare_running or CORE_RT.prepare_bootstrap_running end,
+      build_running = CORE_RT.ue_build_running,
+      lock = CORE_RT.file_lock,
+      set_lease = function(lease) CORE_RT.prepare_lease = lease end,
+      set_running = set_prepare_running,
+      schedule = INDEX_FN.schedule_prepare_delivery,
+    })
+  end
   local ctx, err = resolve_context()
   if not ctx then
     vim.notify(err, vim.log.levels.WARN)
@@ -7721,6 +7699,7 @@ local function prepare_async(opts)
       CORE_RT.prepare_bootstrap_running = true
       CORE_RT.prepare_apple_semantics(ctx, opts, function(ok, semantic_info, already_reported)
         CORE_RT.prepare_bootstrap_running = false
+        if not ok then require("ue.index.prepare_observer").failed(tostring(semantic_info or "semantic-prepare-failed")) end
         if not ok then
           CORE_RT.file_lock.release(bootstrap_lease)
           if not already_reported then
@@ -7746,6 +7725,7 @@ local function prepare_async(opts)
   -- can honor :UEPrepareReindex (force a csearch rebuild even when the
   -- regular UEPrepare cache is fresh).
   ctx._force_csearch = opts.force_csearch and true or false
+  ctx._bypass_phase_barrier = opts.bypass_phase_barrier == true
   -- The semantic source is published before UEPrepare starts.  Pipeline mtime
   -- comparison alone cannot observe that earlier replacement, so carry the
   -- provenance event across the async subprocess boundary and reload clangd
@@ -8066,80 +8046,9 @@ handle:finish() end
     update(("indexing %d files with gtags..."):format(#workspace_code), 35)
     start_phase()
 
-    local gtags = _uproc.first_executable({ "gtags" })
-    if not gtags then
-      fail("gtags not found in PATH")
-      return
-    end
-
-    local db_dir = ctx.paths.workspace_db
-    local filelist = ctx.paths.workspace_list
-    local function start_gtags_phase()
-      clean_db_dir(db_dir)
-
-    local gtags_cmd = { gtags, "-f", filelist, "--skip-unreadable", "--skip-symlink", db_dir }
-    local gtags_output = {}
-    local indexed_count = 0
-    local gtags_started_at = vim.uv.hrtime()
-    local gtags_timer = vim.uv.new_timer()
-    local gtags_cwd = ctx.engine_root
-
-    gtags_timer:start(2000, 2000, vim.schedule_wrap(function()
-      if CORE_RT.prepare_jobid and CORE_RT.prepare_jobid > 0 then
-        local gtags_elapsed = math.max(1, math.floor((vim.uv.hrtime() - gtags_started_at) / 1e9))
-        local pct = indexed_count > 0
-            and math.min(30 + math.floor(indexed_count / math.max(#workspace_code, 1) * 50), 80)
-          or 35
-        -- ETA based on gtags progress
-        local gtags_eta = ""
-        if indexed_count > 100 then
-          local rate = indexed_count / gtags_elapsed
-          local remaining_files = #workspace_code - indexed_count
-          local remaining_s = math.max(0, math.floor(remaining_files / rate))
-          -- Add estimate for compile_commands phase
-          local cc_est = tonumber(prev_timings.compile_commands) or 10
-          gtags_eta = (" ~%ds left"):format(remaining_s + math.floor(cc_est))
-        end
-        local msg = ("gtags: %d/%d files, %ds elapsed%s"):format(
-          indexed_count, #workspace_code, gtags_elapsed, gtags_eta)
-        if handle then
-          handle.message = msg
-          handle.percentage = pct
-        end
-      end
-    end))
-
-    CORE_RT.prepare_jobid = vim.fn.jobstart(gtags_cmd, {
-      cwd = gtags_cwd,
-      on_stdout = function(_, data)
-        collect_trimmed_lines(gtags_output, data)
-      end,
-      on_stderr = function(_, data)
-        for _, line in ipairs(data or {}) do
-          line = trim(line)
-          if line ~= "" then
-            table.insert(gtags_output, line)
-            if not line:match("^Warning:") then
-              indexed_count = indexed_count + 1
-            end
-          end
-        end
-      end,
-      on_exit = function(_, code)
-        vim.schedule(function()
-          CORE_RT.prepare_jobid = nil
+    local accepted, gtags_err = require("ue.gtags").rebuild_async(require("ue.gtags").workspace_spec(ctx), function(ok, message)
           CORE_RT.clear_freshness(ctx)
-          if gtags_timer then
-            gtags_timer:stop()
-            gtags_timer:close()
-            gtags_timer = nil
-          end
-
-          if code ~= 0 or not db_ready(db_dir) then
-            fail("gtags exited with code " .. code .. "\n" .. table.concat(gtags_output, "\n"))
-            return
-          end
-
+          if not ok then fail("GTAGS validation failed: " .. tostring(message)); return end
           end_phase("gtags")
 
           -- ── Phase 4: csearch index (sub-second grep) ─────────────
@@ -8301,44 +8210,8 @@ handle:finish() end
             end
             finalize_after_csearch()
           end)
-        end)
-      end,
-    })
-
-    if CORE_RT.prepare_jobid <= 0 then
-      CORE_RT.prepare_jobid = nil
-      if gtags_timer then
-        gtags_timer:stop()
-        gtags_timer:close()
-        gtags_timer = nil
-      end
-      fail("failed to start gtags process")
-    else
-      -- Register the gtags phase job for :Tasks list/cancel. Pure side-path:
-      -- register only, after job creation; on_exit above is untouched. Status
-      -- is derived live from the channel.
-      pcall(function()
-        require("utils.task_registry").register({
-          name = "UEPrepare (index)",
-          group = "ue",
-          kind = "job",
-          handle = CORE_RT.prepare_jobid,
-          started_at = os.time(),
-        })
-      end)
-    end
-    return CORE_RT.prepare_jobid
-    end
-
-    local admission = require("utils.host_admission")
-    admission.run_when_allowed({
-      name = "UEPrepare GTAGS",
-      start = start_gtags_phase,
-      on_defer = function() update("waiting for host CPU headroom before GTAGS...", 35) end,
-      on_error = function(err)
-        fail("GTAGS admission failed: " .. tostring(err))
-      end,
-    })
+    end)
+    if not accepted then fail(tostring(gtags_err)) end
   end
 
   -- ── Phase 1: scan files (async) ──────────────────────────────────────
@@ -8383,6 +8256,10 @@ end
 -- export_compile_commands is now an alias for the unified prepare flow
 export_compile_commands = prepare_async
 CORE_RT.prepare_async = prepare_async
+function M._prepare_index_fixture_for_test(ctx, private_root, options)
+  return prepare_async({ _headless_index_fixture = { ctx = ctx, private_root = private_root, options = options } })
+end
+require("ue.index.prepare_observer").configure(prepare_async, function() return M._prepare_running or CORE_RT.prepare_bootstrap_running end)
 
 -- Reuse existing search policy and writer ownership without entering Prepare.
 function M.build_csearch_async(opts)
@@ -8973,6 +8850,7 @@ fp:close() end
           -- false and we take the cold path (which rebuilds every phase).
           local ctx_b = resolve_context()
           if ctx_b then
+            INDEX_FN.bypass_phase_barrier(ctx_b)
             local key = status_root_key(ctx_b)
             if key and key ~= "" then
               CORE_RT.dirty_index_roots[key] = true
@@ -8981,7 +8859,7 @@ fp:close() end
             -- csearch writer captures a snapshot at start and subtracts only
             -- that covered snapshot after successful publication.
           end
-          prepare_async({ force_csearch = true })
+          prepare_async({ force_csearch = true, bypass_phase_barrier = true })
         else
           if report then report("dispatching prepare_async ...") end
           prepare_async()
@@ -9242,13 +9120,9 @@ return
     end
     vim.notify(table.concat(lines, "\n"))
   end, { desc = "Dump cache_paths() result + existence check" })
-  vim.api.nvim_create_user_command("UEIndexStatus", function()
-    M.index_status()
-  end, {})
-  vim.api.nvim_create_user_command("UEIndexNow", function()
-    -- Single-buffer reindex; usually <100ms, no placeholder needed.
-    M.index_now()
-  end, {})
+  require("ue.index.switch_commands").setup({ resolve = resolve_context, scope = status_root_key,
+    prepare = require("ue.index.prepare_observer").prepare, restart = INDEX_FN.restart_source_clangd,
+    index_status = M.index_status, index_now = M.index_now })
   vim.api.nvim_create_user_command("UEIndexHot", function()
     require("utils.async_launcher").launch({
       name  = "UE: GTAGS hot reindex",
@@ -9614,7 +9488,7 @@ break end
       statusline_timer:stop()
       statusline_timer:start(500, 0, vim.schedule_wrap(refresh_statusline))
 
-      local path = norm(vim.api.nvim_buf_get_name(0))
+      local path = norm(require("utils.buffer_uri").is_file_buffer(0) and vim.api.nvim_buf_get_name(0) or "")
       if path == "" then
         return
       end
@@ -9645,7 +9519,7 @@ break end
     group = group,
     pattern = { "*.c", "*.cc", "*.cpp", "*.cxx", "*.h", "*.hh", "*.hpp", "*.hxx", "*.inl", "*.inc", "*.ipp" },
     callback = function()
-      local path = norm(vim.api.nvim_buf_get_name(0))
+      local path = norm(require("utils.buffer_uri").is_file_buffer(0) and vim.api.nvim_buf_get_name(0) or "")
       if path == "" then
         return
       end

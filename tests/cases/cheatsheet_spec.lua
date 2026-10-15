@@ -45,6 +45,7 @@ do
     "UEDefStatus", "UEDefTrace", "UEDefSelfTest", "UEDefDiag",
     "UEDefReload", "UEDefCacheClear", "UEDefCancel", "UEDefContextClear",
     "UEProbeReport",
+    "UELayout", "UELayoutRestore", "UELayoutBack", "UEView",
   }) do
     if vim.fn.exists(":" .. c) == 2 then UE_COMMANDS[c] = true end
   end
@@ -332,5 +333,44 @@ t.describe("cheatsheet: 双 surface 不漂移", function()
   t.it("markdown 不把 :UEAndroidDAP 当活命令引用", function()
     t.assert_true(md:find(":UEAndroidDAP", 1, true) == nil,
       "markdown 仍以命令形式引用已废弃的 :UEAndroidDAP*（应统一到 :UEDAP*）")
+  end)
+end)
+
+t.describe("cheatsheet: 审阅导航与 code 视图提示", function()
+  local sheet = require("utils.cheatsheet")
+  local md = read("docs/ue_lazyvim_cheatsheet.md") or ""
+
+  t.it("gd 与审阅帮助区分跳转历史和跨 tab 返回", function()
+    for _, section in ipairs({ "Search & Navigate", "Inside CodeDiff" }) do
+      local found = false
+      for _, hit in ipairs(sheet.search("gd")) do
+        if hit.key == "gd" and hit.section == section then
+          t.assert_contains(hit.desc, "Ctrl-O 不切回审阅 tab，用 <leader>w[ 返回")
+          found = true
+        end
+      end
+      t.assert_true(found, "缺少 gd 提示: " .. section)
+    end
+    local plain_md = md:gsub("`", "")
+    for _, pattern in ipairs({
+      "C%+%+ gd(.-)### Preview and investigate",
+      "%*%*CodeDiff%*%*(.-)### Cheat%-by%-scenario",
+    }) do
+      local area = plain_md:match(pattern)
+      t.assert_type(area, "string", "缺少对应 markdown 帮助区")
+      t.assert_contains(area, "Ctrl-O 不切回审阅 tab，用 <leader>w[ 返回")
+    end
+  end)
+
+  t.it("wC 仅聚焦当前组已有 code 的限制在两份帮助一致", function()
+    local found = false
+    for _, hit in ipairs(sheet.search("wC")) do
+      if hit.key == "<leader>wC / :UEView code" then
+        t.assert_contains(hit.desc, "仅聚焦当前组已有 code")
+        found = true
+      end
+    end
+    t.assert_true(found, "缺少 wC 提示")
+    t.assert_contains(md, "`:UEView code` 仅聚焦当前组已有 code")
   end)
 end)

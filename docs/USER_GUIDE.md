@@ -266,6 +266,8 @@ Editor 前提与报告完整性：[测试边界](USER_GUIDE_LIMITS.md#editor-测
 | 看到什么 | 怎么做 |
 |---|---|
 | 索引状态、`Q:…`、`PREP*` | 等待准备/索引，或 `:UEIndexStatus` 查看 |
+| 切分支后刷新 C++ 索引 | `:UEIndexSwitchReindex`；没有有效旧基线或变化未覆盖时进入既有 Prepare，显示结果 |
+| 盘点索引 TEMP 证据 | `:UEIndexBatchWorkInventory`；只生成引用/活性/未知项清单，不删除文件 |
 | `BOK` / `B<数字>` / `BERR`、`LOOP✓ 42s` / `LOOP✗` | 工作台看最近构建/运行结果 |
 | `A:Pixel 8/game` / `A:no-device` | 设备与包名选择；缺设备在当前目标里补齐 |
 | `⏵3` | 三个后台任务；工作台查看，或 `<leader>X` |

@@ -32,8 +32,8 @@ end
 
 local report = require("utils.ue_goto.semantic_report")
 
-local function semantic_terminal_notice(sym, result)
-  local message, level, opts = report.terminal_notice(sym, result)
+local function semantic_terminal_notice(sym, result, tx)
+  local message, level, opts = report.terminal_notice(sym, result, tx)
   if message then vim.notify(message, level, opts) end
 end
 
@@ -142,6 +142,9 @@ function M.install(owner, deps)
         build_fingerprint = environment.build_fingerprint,
         project_root = environment.project_root,
         engine_root = environment.engine_root,
+        platform = environment.active_build and environment.active_build.platform,
+        target = environment.active_build and environment.active_build.target,
+        configuration = environment.active_build and environment.active_build.configuration,
       },
       context = { active_build_key = environment.active_build_key },
       index = environment.index,
@@ -236,6 +239,19 @@ function M.install(owner, deps)
 
     local function provider_failure(result)
       local reason = result and result.reason
+      local preparation_reason = result and result.preparation_reason
+      for _, round in ipairs({ result or {}, result and result.referent_ast or {} }) do
+        for _, record in ipairs(round.client_results or {}) do
+          if record.status == "preparation-error" then preparation_reason = record.preparation_reason or record.error or round.reason; break end
+        end
+        if preparation_reason then break end
+      end
+      if preparation_reason then
+        return transaction.terminal("unavailable", "context",
+          preparation_reason == "compile-command-missing" and "active-compile-command-missing" or "context-resolution-failed", {
+            provider = "clangd", provider_result = result, preparation_reason = preparation_reason,
+          })
+      end
       if reason == "compile-command-missing" then
         return transaction.terminal("unavailable", "context", "active-compile-command-missing", {
           provider = "clangd",
@@ -295,7 +311,7 @@ function M.install(owner, deps)
         if inspection then inspection(nil, final); return end
         record_semantic_probe(final, tx)
         if final.state ~= "resolved" then
-          semantic_terminal_notice(sym, final)
+          semantic_terminal_notice(sym, final, tx)
         end
       end)
     end
@@ -351,7 +367,7 @@ function M.install(owner, deps)
           if M.CPP_HEADER_EXTS[path:match("%.([^./\\]+)$") or ""] then
             lineage.subject_membership = vim.tbl_extend("force", lineage.subject_membership or {}, { [path] = true })
           end
-          semantic.note_origin(snapshot.winid, lineage, environment.build_fingerprint)
+          semantic.note_origin(vim.api.nvim_get_current_win(), lineage, environment.build_fingerprint)
         end
         finish(resolved)
         vim.notify(format_jump_msg(sym, location, tag), vim.log.levels.INFO,

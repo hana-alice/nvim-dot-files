@@ -73,7 +73,7 @@ t.describe("navigation architecture boundaries", function()
     package.loaded["utils.probe"] = { record = function() effects = effects + 1 end }
     local ok, err = xpcall(function()
       local result = { state = "unavailable", stage = "entity", reason = "identity-missing" }
-      t.assert_contains(report.terminal_notice("f", result), "semantic identity missing")
+      t.assert_contains(report.terminal_notice("f", result), "编译器在当前构建")
       t.assert_eq(#report.probes(result, { index = {} }), 2)
       t.assert_eq(effects, 0)
     end, debug.traceback)

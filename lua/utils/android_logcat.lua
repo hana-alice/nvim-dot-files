@@ -45,6 +45,11 @@ function M.parse_location(line)
 end
 
 local function jump(buf)
+  if vim.api.nvim_get_current_buf() ~= buf then return end
+  local source, tab = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_tabpage()
+  local layout = require("utils.layout")
+  local handoff = require("utils.layout_handoff")
+  local snapshot = handoff.capture(source)
   local file, lnum = M.parse_location(vim.api.nvim_get_current_line())
   if not file then
     return vim.notify("No source location on this line", vim.log.levels.INFO)
@@ -58,11 +63,29 @@ local function jump(buf)
     end
     path = found
   end
-  -- Leave the log window in place; open the source in the previous window.
-  vim.cmd("wincmd p")
-  if vim.api.nvim_get_current_buf() == buf then vim.cmd("aboveleft split") end
-  vim.cmd("edit " .. vim.fn.fnameescape(path))
-  pcall(vim.api.nvim_win_set_cursor, 0, { lnum or 1, 0 })
+  if layout.routes_to_normal(tab) then
+    local target = vim.fn.bufadd(path)
+    local prior = layout.resolve({ tab = tab, source_win = source, create = false, route_to_normal = true })
+    local prior_snapshot = prior and handoff.capture(prior)
+    if prior_snapshot then prior_snapshot.active, prior_snapshot.code = false, true end
+    if not handoff.load(snapshot, target, prior_snapshot) then return end
+    local win, err = layout.focus({ tab = tab, source_win = source })
+    if not win then return vim.notify(err, vim.log.levels.WARN) end
+    local destination = { win = win, tab = vim.api.nvim_win_get_tabpage(win), buf = target, code = true }
+    if not handoff.revalidate(snapshot, { win = win, tab = destination.tab, buf = vim.api.nvim_win_get_buf(win), code = true }) then return end
+    destination.tick = vim.api.nvim_buf_get_changedtick(target)
+    local ok, _, failure = handoff.handoff(snapshot, destination, function() vim.api.nvim_win_set_buf(win, target) end)
+    if not ok then return vim.notify(tostring(failure), vim.log.levels.WARN) end
+    if handoff.revalidate(snapshot, destination) then
+      vim.api.nvim_win_set_cursor(win, { math.min(lnum or 1, vim.api.nvim_buf_line_count(target)), 0 })
+    end
+  else
+    -- Preserve the ordinary-tab previous-window behavior.
+    vim.cmd("wincmd p")
+    if vim.api.nvim_get_current_buf() == buf then vim.cmd("aboveleft split") end
+    vim.cmd("edit " .. vim.fn.fnameescape(path))
+    pcall(vim.api.nvim_win_set_cursor, 0, { lnum or 1, 0 })
+  end
 end
 
 --- Attach keys and highlights. opts.level: current minimum level;

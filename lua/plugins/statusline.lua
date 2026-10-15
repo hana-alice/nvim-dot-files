@@ -34,6 +34,7 @@ return {
             local unsaved       = vim.g.ue_unsaved_status or ""
             local recovery      = vim.g.ue_recovery_available or ""
             local recovery_status = vim.g.ue_recovery_status or ""
+            local layout_source = MiniStatusline.is_truncated(90) and "" or (vim.t.ue_layout_source or "")
 
             return MiniStatusline.combine_groups({
               { hl = mode_hl,                  strings = { mode } },
@@ -46,6 +47,7 @@ return {
               { hl = "MiniStatuslineFilename", strings = { filename } },
               "%=", -- right align
               { hl = "MiniStatuslineDevinfo",  strings = { ue_status } },
+              { hl = "MiniStatuslineDevinfo",  strings = { layout_source } },
               { hl = "MiniStatuslineFileinfo", strings = { fileinfo } },
               { hl = mode_hl,                  strings = { search, location } },
             })
@@ -56,6 +58,7 @@ return {
     init = function()
       -- Avoid 1-frame empty statusline flash.
       vim.o.laststatus = 2
+      require("utils.layout_notice").setup()
     end,
   },
 }

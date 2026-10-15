@@ -206,6 +206,7 @@ t.describe("IDE debug: native layout ownership", function()
         end
       end
       t.assert_true(owned ~= nil, "native dap-ui rail opened")
+      vim.wo[owned].winfixbuf = false -- a deliberate repurpose first unpins the rail
       c.buffers[#c.buffers + 1] = source(owned, "repurposed")
       local repurposed_buf = vim.api.nvim_win_get_buf(owned)
       vim.api.nvim_set_current_win(c.main)

@@ -78,9 +78,11 @@ local function write_json_file(path, tbl)
   local temp = path .. (".tmp.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
   local fh, err = io.open(temp, "wb")
   if not fh then return false, err end
-  fh:write(raw)
-  fh:flush()
-  fh:close()
+  local written, write_err = fh:write(raw)
+  local flushed, flush_err
+  if written then flushed, flush_err = fh:flush() end
+  local closed, close_err = fh:close()
+  if not written or not flushed or not closed then return false, write_err or flush_err or close_err end
   local ok, rename_err = vim.uv.fs_rename(temp, path)
   if not ok then
     pcall(os.remove, temp)
@@ -178,15 +180,31 @@ function M.restore_for_buf(bufnr)
   local ok_dapbp, dapbp = pcall(require, "dap.breakpoints")
   if not ok_dapbp then return end
   state.owned_paths[key] = true
+  local pending, first_error = {}, nil
+  local present = {}
+  local ok_store, store = pcall(dapbp.get, bufnr)
+  for _, bp in ipairs(ok_store and type(store) == "table" and store[bufnr] or {}) do present[bp.line] = true end
   for _, bp in ipairs(bps) do
-    pcall(dapbp.set, {
+    local ok_set, set_error = true, nil
+    if not present[bp.line] then ok_set, set_error = pcall(dapbp.set, {
       condition    = bp.condition,
       hit_condition = bp.hit_condition,
       log_message  = bp.log_message,
-    }, bufnr, bp.line)
+    }, bufnr, bp.line) end
+    if not ok_set then
+      pending[#pending + 1] = bp
+      first_error = first_error or set_error
+    end
   end
-  -- Once restored, drop from pending so we don't double-set on reload.
-  state.pending_paths[key] = nil
+  -- Retire only successful local-store writes. Failed entries remain retryable
+  -- without setting the already-restored entries again on BufReadPost.
+  state.pending_paths[key] = #pending > 0 and pending or nil
+  if first_error then
+    vim.notify(("[ue.dap.bp] layer=undetermined owner=ue.dap._persist_bp: "
+      .. "dap.breakpoints.set(buf=%d) 失败，%d/%d 条断点保留待重试：%s；"
+      .. "重新打开文件可重试，尚未验证 adapter 下发结果"):format(bufnr, #pending, #bps,
+        tostring(first_error):gsub("[%c]", " "):sub(1, 240)), vim.log.levels.WARN)
+  end
   -- If a session is already running, push the freshly-restored breakpoints to
   -- the adapter so they arm live (no reattach needed). nvim-dap's
   -- session:set_breakpoints reads the current dap.breakpoints store for the
@@ -229,6 +247,7 @@ function M.save(opts)
     version = 1, project = state.data.project, breakpoints = {},
   }
   local out = state.clear_all_pending and {} or (latest.breakpoints or {})
+  local pending = state.pending_paths
   local seen_buffers = {}
   for bufnr, bps in pairs(raw) do
     local name = vim.api.nvim_buf_get_name(bufnr)
@@ -260,15 +279,46 @@ function M.save(opts)
       end
     end
   end
-  state.clear_all_pending = false
+  -- A failed lazy restore is not a user clear. Keep those entries in the disk
+  -- snapshot as well as pending; the live store wins if it has the same line.
+  if not state.clear_all_pending then
+    for key, bps in pairs(pending) do
+      if seen_buffers[key] then
+        local list, lines = out[key] or {}, {}
+        for _, bp in ipairs(list) do lines[bp.line] = true end
+        for _, bp in ipairs(bps) do
+          if bp.line == nil or not lines[bp.line] then
+            list[#list + 1] = vim.deepcopy(bp)
+            if bp.line ~= nil then lines[bp.line] = true end
+          end
+        end
+        out[key] = #list > 0 and list or nil
+      end
+    end
+  end
   state.data.breakpoints = out
   state.data.saved_at = os.date("!%Y-%m-%dT%H:%M:%SZ")
   local ok_write = write_json_file(state.cache_path, state.data)
   file_lock.release(lease)
   if ok_write then
+    -- Failed publication must retain the user's clear-all intent for retry.
+    state.clear_all_pending = false
     state.pending_paths = {}
     for key, bps in pairs(out) do
-      if not seen_buffers[key] then state.pending_paths[key] = vim.deepcopy(bps) end
+      if not seen_buffers[key] then
+        state.pending_paths[key] = vim.deepcopy(bps)
+      elseif pending[key] then
+        local live_lines, still_pending = {}, {}
+        for bufnr, bps in pairs(raw) do
+          if norm(vim.api.nvim_buf_get_name(bufnr)) == key then
+            for _, bp in ipairs(bps) do live_lines[bp.line] = true end
+          end
+        end
+        for _, bp in ipairs(pending[key]) do
+          if not live_lines[bp.line] then still_pending[#still_pending + 1] = vim.deepcopy(bp) end
+        end
+        state.pending_paths[key] = #still_pending > 0 and still_pending or nil
+      end
     end
   end
   return ok_write

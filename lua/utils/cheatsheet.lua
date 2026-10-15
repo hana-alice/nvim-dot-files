@@ -216,7 +216,7 @@ local tabs = {
           { "n / N",           "Next / prev match" },
           { "* / #",           "Search word fwd / back" },
           { ":noh",            "Clear search highlight" },
-          { "gd",              "Definition (contextual C++ / LSP fallback)" },
+          { "gd",              "Definition (contextual C++ / LSP fallback); Ctrl-O 不切回审阅 tab，用 <leader>w[ 返回" },
           { "gr",              "Preview references (LSP→GTAGS)" },
           { "gD",              "Declaration" },
           { "gI",              "Implementation" },
@@ -350,6 +350,19 @@ local tabs = {
   {
     name = "Window",
     sections = {
+      {
+        title = "Layout: switch and restore views",
+        mappings = {
+          { "<leader>wN / wR / wD", "Normal / review / debug views; no launch or attach" },
+          { "<leader>wL / :UELayout", "List groups: type, project, tab and availability" },
+          { "<leader>wB / :UELayoutRestore", "Restore current group; retain new views and dirty buffers" },
+          { "<leader>wV / :UEView", "List role views without replacing buffers" },
+          { "<leader>wC / :UEView code", "仅聚焦当前组已有 code" },
+          { "<leader>wP / :UEView panel", "Choose a panel in the current group" },
+          { "<leader>w[ / :UELayoutBack", "Return to the previous valid group" },
+          { ":UELayout normal|review|debug", "Focus or ask the original owner to restore visible layout" },
+        },
+      },
       {
         title = "Workspace: find a closed view",
         mappings = {
@@ -504,6 +517,7 @@ local tabs = {
       {
         title = "Inside CodeDiff",
         mappings = {
+          { "gd",                "进入编辑 tab；Ctrl-O 不切回审阅 tab，用 <leader>w[ 返回" },
           { "]c / [c",           "Next / prev hunk" },
           { "<tab> / <s-tab>",   "Next / prev file" },
           { "gS",                "Switch staged / unstaged view" },

@@ -57,7 +57,25 @@ function M.jump_first()
     vim.notify("没有可跳转的构建错误", vim.log.levels.INFO)
     return false
   end
-  if vim.bo.buftype ~= "" then
+  local expected, entry = first_error, vim.deepcopy(first_error)
+  local layout = require("utils.layout")
+  local tab, source = vim.api.nvim_get_current_tabpage(), vim.api.nvim_get_current_win()
+  local handoff = require("utils.layout_handoff")
+  local snapshot = handoff.capture(source)
+  local protected = layout.routes_to_normal(tab)
+  if protected then
+    local prior = layout.resolve({ tab = tab, source_win = source, create = false, route_to_normal = true })
+    local prior_snapshot = prior and handoff.capture(prior)
+    if prior_snapshot then prior_snapshot.active, prior_snapshot.code = false, true end
+    if not handoff.load(snapshot, entry.bufnr, prior_snapshot) or first_error ~= expected then return false end
+    local win, err = layout.focus({ tab = tab, source_win = source })
+    if not win then
+      vim.notify(err, vim.log.levels.WARN)
+      return false
+    end
+    if first_error ~= expected or not handoff.revalidate(snapshot,
+      { win = win, tab = vim.api.nvim_win_get_tabpage(win), buf = vim.api.nvim_win_get_buf(win), code = true }) then return false end
+  elseif vim.bo.buftype ~= "" then
     for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
       if vim.bo[vim.api.nvim_win_get_buf(win)].buftype == "" and vim.api.nvim_win_get_config(win).relative == "" then
         vim.api.nvim_set_current_win(win)
@@ -68,14 +86,20 @@ function M.jump_first()
   vim.cmd("normal! m'")
   -- Reuse the existing source buffer; :edit would reject or reload dirty
   -- content even when this error already belongs to the current file.
-  local ok, err = pcall(vim.api.nvim_win_set_buf, 0, first_error.bufnr)
+  local win = vim.api.nvim_get_current_win()
+  local destination = { win = win, tab = vim.api.nvim_win_get_tabpage(win), buf = entry.bufnr, code = protected }
+  if vim.api.nvim_buf_is_loaded(entry.bufnr) then destination.tick = vim.api.nvim_buf_get_changedtick(entry.bufnr) end
+  local ok, _, err = handoff.handoff(snapshot, destination, function()
+    vim.api.nvim_win_set_buf(win, entry.bufnr)
+  end)
   if not ok then
     vim.notify("无法跳到构建错误: " .. tostring(err), vim.log.levels.WARN)
     return false
   end
-  local line = math.min(first_error.lnum, vim.api.nvim_buf_line_count(0))
-  local text = vim.api.nvim_buf_get_lines(0, line - 1, line, false)[1] or ""
-  vim.api.nvim_win_set_cursor(0, { line, math.min(math.max((first_error.col or 1) - 1, 0), #text) })
+  if first_error ~= expected or not handoff.revalidate(snapshot, destination) then return false end
+  local line = math.min(entry.lnum, vim.api.nvim_buf_line_count(entry.bufnr))
+  local text = vim.api.nvim_buf_get_lines(entry.bufnr, line - 1, line, false)[1] or ""
+  vim.api.nvim_win_set_cursor(win, { line, math.min(math.max((entry.col or 1) - 1, 0), #text) })
   return true
 end
 

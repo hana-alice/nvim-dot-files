@@ -177,6 +177,39 @@ end
 end
 
 t.describe("ide_problem_navigation: installed Trouble and native quickfix", function()
+  for _, entry in ipairs({ "quickfix", "location", "trouble" }) do
+    t.it("debug " .. entry .. " switches to normal and preserves the owned source", function()
+      native(string.format([[
+        lifecycle(false)
+        local files,owner,list=fixture()
+        local tab=api.nvim_get_current_tabpage()
+        local original,cursor=api.nvim_win_get_buf(owner),api.nvim_win_get_cursor(owner)
+        local layout=require('utils.layout')
+        local token={}
+        layout.register_group('debug',{tab=tab,token=token,main=owner})
+        layout.register(owner,'code',{owner='debug'})
+        local entry=%q
+        if entry=='quickfix' then
+          keys(']q')
+          assert_list(list,2)
+        elseif entry=='location' then
+          vim.fn.setloclist(owner,{},' ',{items={{bufnr=files.BuildB,lnum=3,col=1}}})
+          local id=vim.fn.getloclist(owner,{id=0}).id
+          vim.cmd.lopen()
+          keys('<CR>')
+          assert(vim.fn.getloclist(owner,{id=0}).id==id)
+        else
+          local view=assert(require('trouble').open('ue_sidebar_qflist'))
+          assert(vim.wait(3000,function() return view.win:valid() end,10))
+          view.opts.keys['<cr>'].action(view,{item={buf=files.BuildB,pos={3,0},filename=api.nvim_buf_get_name(files.BuildB)}})
+        end
+        assert(api.nvim_get_current_tabpage()~=tab)
+        assert_location(files.BuildB,3)
+        assert(api.nvim_win_get_buf(owner)==original and vim.deep_equal(api.nvim_win_get_cursor(owner),cursor))
+        assert(layout.navigation_owner(tab)==token)
+      ]],entry))
+    end)
+  end
   for _, early in ipairs({ false, true }) do
     t.it((early and "early keymap load" or "normal VeryLazy load") .. " survives first Trouble load", function()
       native(("lifecycle(%s)\n"):format(tostring(early)) .. [[
@@ -257,4 +290,402 @@ t.describe("ide_problem_navigation: installed Trouble and native quickfix", func
       assert_location(files.BuildB, 6)
     ]])
   end)
+
+  t.it("review quickfix Enter and counted navigation keep list ID and auxiliary panes", function()
+    native([[
+      lifecycle(false)
+      local files, owner, list = fixture()
+      local original = api.nvim_win_get_buf(owner)
+      vim.cmd('vsplit')
+      local aux = api.nvim_get_current_win()
+      api.nvim_win_set_buf(aux, files.BuildB)
+      local tab = api.nvim_get_current_tabpage()
+      local session={original_win=owner,modified_win=aux}
+      package.loaded['codediff.ui.lifecycle'] = {get_session=function(t)
+        if t == tab then return session end
+      end}
+      api.nvim_set_current_win(owner)
+      vim.o.switchbuf='useopen,usetab,uselast'
+      keys(']q')
+      local code = api.nvim_get_current_win()
+      assert(code ~= owner and code ~= aux)
+      assert(api.nvim_win_get_tabpage(code)~=tab and #api.nvim_tabpage_list_wins(tab)==2)
+      assert_location(files.BuildB,3)
+      assert_list(list,2)
+      assert(api.nvim_win_get_buf(owner)==original and api.nvim_win_get_buf(aux)==files.BuildB)
+      local cursor=api.nvim_win_get_cursor(aux)
+      api.nvim_set_current_win(owner)
+      vim.cmd.copen()
+      local panel=api.nvim_get_current_win()
+      assert(vim.wo[panel].winfixbuf)
+      api.nvim_win_set_cursor(panel,{4,0})
+      keys('<CR>')
+      assert(api.nvim_get_current_win()==code)
+      assert_location(files.BuildA,5)
+      assert_list(list,4)
+      assert(vim.deep_equal(api.nvim_win_get_cursor(aux),cursor))
+      assert(vim.o.switchbuf=='useopen,usetab,uselast')
+      keys('2[q')
+      assert_location(files.BuildB,3)
+      assert_list(list,2)
+      keys('100]q')
+      assert_location(files.BuildB,6)
+      assert_list(list,5)
+      keys('100[q')
+      assert_location(files.BuildA,2)
+      assert_list(list,1)
+    ]])
+  end)
+
+  t.it("review quickfix boundaries do not create a browser or move focus", function()
+    native([[
+      lifecycle(false)
+      local files, owner, list=fixture()
+      vim.cmd('vsplit')
+      local aux=api.nvim_get_current_win()
+      local tab=api.nvim_get_current_tabpage()
+      local session={original_win=owner,modified_win=aux}
+      package.loaded['codediff.ui.lifecycle']={get_session=function(t)
+        if t==tab then return session end
+      end}
+      api.nvim_set_current_win(owner)
+      local n=#api.nvim_tabpage_list_wins(tab)
+      keys('[q')
+      assert(api.nvim_get_current_win()==owner and #api.nvim_tabpage_list_wins(tab)==n)
+      assert_list(list,1)
+      vim.fn.setqflist({},' ',{items={}})
+      keys(']q')
+      assert(api.nvim_get_current_win()==owner and #api.nvim_tabpage_list_wins(tab)==n)
+    ]])
+  end)
+
+  t.it("review loclist Enter keeps owner and ID and supports pattern and virtual columns", function()
+    native([[
+      lifecycle(false)
+      local files, owner=fixture()
+      api.nvim_buf_set_lines(files.BuildA,0,-1,false,{'one','\tvalue','  match here','last'})
+      vim.bo[files.BuildA].modified=false
+      local before=api.nvim_win_get_cursor(owner)
+      vim.cmd('vsplit')
+      local aux=api.nvim_get_current_win()
+      local tab=api.nvim_get_current_tabpage()
+      local session={original_win=owner,modified_win=aux}
+      package.loaded['codediff.ui.lifecycle']={get_session=function(t)
+        if t==tab then return session end
+      end}
+      vim.fn.setloclist(owner,{},' ',{title='Owned locations',items={
+        {bufnr=files.BuildA,lnum=2,col=9,vcol=1,text='tabbed'},
+        {bufnr=files.BuildA,pattern='^  match here$',text='pattern'},
+        {bufnr=files.BuildA,lnum=0,col=0,valid=0,text='invalid but file'},
+      }})
+      local list=vim.fn.getloclist(owner,{id=0,items=0})
+      api.nvim_set_current_win(owner)
+      vim.cmd.lopen()
+      local panel=api.nvim_get_current_win()
+      assert(vim.wo[panel].winfixbuf)
+      api.nvim_win_set_cursor(panel,{1,0})
+      keys('<CR>')
+      local code=api.nvim_get_current_win()
+      assert(code~=owner and code~=aux)
+      assert(api.nvim_win_get_tabpage(code)~=tab)
+      assert_location(files.BuildA,2)
+      assert(api.nvim_win_get_cursor(code)[2]==1)
+      assert(vim.deep_equal(api.nvim_win_get_cursor(owner),before))
+      api.nvim_set_current_win(panel)
+      api.nvim_win_set_cursor(panel,{2,0})
+      keys('<CR>')
+      assert(api.nvim_get_current_win()==code)
+      assert_location(files.BuildA,3)
+      local actual=api.nvim_win_call(panel,function() return vim.fn.getloclist(panel,{id=0,idx=0,items=0,filewinid=0}) end)
+      assert(actual.id==list.id and actual.idx==2 and actual.filewinid==owner)
+      assert(vim.deep_equal(actual.items,list.items))
+      assert(vim.fn.getloclist(code,{id=0}).id~=list.id,'normal window must not share the native owner list ID')
+      assert(vim.deep_equal(api.nvim_win_get_cursor(owner),before))
+      api.nvim_set_current_win(panel)
+      api.nvim_win_set_cursor(panel,{3,0})
+      keys('<CR>')
+      assert_location(files.BuildA,3)
+      assert(api.nvim_win_get_cursor(code)[2]==2,'native invalid-file entry must move to first nonblank')
+      actual=api.nvim_win_call(panel,function() return vim.fn.getloclist(panel,{id=0,idx=0,filewinid=0}) end)
+      assert(actual.idx==3 and actual.id==list.id and actual.filewinid==owner)
+    ]])
+  end)
+
+  t.it("loclist native and protected Enter agree on invalid entries and byte columns", function()
+    native([[
+      lifecycle(false)
+      local files, owner=fixture()
+      local items={
+        {bufnr=files.BuildA,lnum=3,col=4,text='byte'},
+        {bufnr=files.BuildA,lnum=0,col=0,valid=0,text='invalid file'},
+        {valid=0,text='message only'},
+        {bufnr=files.BuildA,pattern='unmatched-location-pattern',text='missing pattern'},
+      }
+      api.nvim_buf_set_lines(files.BuildA,0,-1,false,{'one','two','  three','four'})
+      vim.bo[files.BuildA].modified=false
+      vim.fn.setloclist(owner,{},' ',{items=items})
+      local expected={}
+      for row=1,4 do
+        vim.cmd.ll({count=row})
+        expected[row]=api.nvim_win_get_cursor(owner)
+      end
+      local before=api.nvim_win_get_cursor(owner)
+      vim.cmd('vsplit')
+      local aux=api.nvim_get_current_win()
+      local tab=api.nvim_get_current_tabpage()
+      local session={original_win=owner,modified_win=aux}
+      package.loaded['codediff.ui.lifecycle']={get_session=function(t)
+        if t==tab then return session end
+      end}
+      api.nvim_set_current_win(owner)
+      vim.cmd.lopen()
+      local panel=api.nvim_get_current_win()
+      local id=vim.fn.getloclist(panel,{id=0}).id
+      local code
+      for row=1,4 do
+        api.nvim_set_current_win(panel)
+        api.nvim_win_set_cursor(panel,{row,0})
+        keys('<CR>')
+        if row~=3 then code=api.nvim_get_current_win() end
+        assert(vim.deep_equal(api.nvim_win_get_cursor(code),expected[row]),vim.inspect({row,expected[row],api.nvim_win_get_cursor(code)}))
+        local list=api.nvim_win_call(panel,function() return vim.fn.getloclist(panel,{id=0,idx=0,filewinid=0}) end)
+        assert(list.idx==row and list.id==id and list.filewinid==owner)
+        assert(vim.deep_equal(api.nvim_win_get_cursor(owner),before))
+        if row==3 then assert(api.nvim_get_current_win()==panel,'message-only entry must stay in list') end
+      end
+    ]])
+  end)
+
+  for _, mode in ipairs({'ue_sidebar_buffers','ue_sidebar_qflist','ue_sidebar_loclist',
+    'ue_sidebar_diagnostics','ue_sidebar_symbols','ue_sidebar_todo','ue_qflist_bottom'}) do
+    t.it("review Trouble " .. mode .. " routes existing aux target despite foreign main", function()
+      native(string.format([[
+        lifecycle(false)
+        local files, owner=fixture()
+        vim.cmd('vsplit')
+        local aux=api.nvim_get_current_win()
+        api.nvim_win_set_buf(aux,files.BuildB)
+        local tab=api.nvim_get_current_tabpage()
+        local foreign
+        vim.cmd('tabnew')
+        foreign=api.nvim_get_current_win()
+        require('trouble.view.main').set({win=foreign,buf=api.nvim_get_current_buf(),cursor={1,0},filename=''})
+        api.nvim_set_current_tabpage(tab)
+        local session={original_win=owner,modified_win=aux}
+        package.loaded['codediff.ui.lifecycle']={get_session=function(t)
+          if t==tab then return session end
+        end}
+        local view=assert(require('trouble').open(%q))
+        assert(vim.wait(3000,function() return view.win:valid() end,10))
+        local main=require('trouble.view.main')
+        main.set({win=foreign,buf=api.nvim_win_get_buf(foreign),cursor={1,0},filename=''})
+        local item={buf=files.BuildB,pos={3,0},filename=api.nvim_buf_get_name(files.BuildB)}
+        view.opts.keys['<cr>'].action(view,{item=item})
+        local code=api.nvim_get_current_win()
+        assert(code~=owner and code~=aux and api.nvim_win_get_tabpage(code)~=tab)
+        assert_location(files.BuildB,3)
+        assert(vim.wo[view.win.win].winfixbuf)
+        assert(api.nvim_win_get_buf(owner)==files.BuildA and api.nvim_win_get_buf(aux)==files.BuildB)
+      ]],mode))
+    end)
+  end
+
+  t.it("Trouble custom jump keys preserve close and split with a nowrite browser", function()
+    native([[
+      lifecycle(false)
+      local files,owner=fixture()
+      vim.cmd('vsplit')
+      local aux=api.nvim_get_current_win()
+      local tab=api.nvim_get_current_tabpage()
+      local session={original_win=owner,modified_win=aux}
+      package.loaded['codediff.ui.lifecycle']={get_session=function(t) if t==tab then return session end end}
+      local layout=require('utils.layout')
+      local browser=assert(layout.resolve({tab=tab,source_win=owner}))
+      local revision=api.nvim_create_buf(false,true)
+      vim.bo[revision].buftype='nowrite'
+      api.nvim_win_set_buf(browser,revision)
+      local normal_tab=api.nvim_win_get_tabpage(browser)
+      for _,key in ipairs({'<cr>','<2-leftmouse>','<c-s>','<c-v>','o'}) do
+        api.nvim_set_current_win(owner)
+        local view=assert(require('trouble').open('ue_sidebar_qflist'))
+        assert(vim.wait(3000,function() return view.win:valid() end,10))
+        local before=#api.nvim_tabpage_list_wins(normal_tab)
+        view.opts.keys[key].action(view,{item={buf=files.BuildB,pos={3,0},filename=api.nvim_buf_get_name(files.BuildB)}})
+        assert_location(files.BuildB,3)
+        assert(api.nvim_get_current_win()~=owner and api.nvim_get_current_win()~=aux)
+        if key=='<c-s>' or key=='<c-v>' then
+          assert(#api.nvim_tabpage_list_wins(normal_tab)==before+1,'split key did not preserve native split in normal tab')
+        elseif key=='o' then
+          assert(not view.win:valid(),'jump_close did not close Trouble')
+        end
+        if view.win:valid() then view:close() end
+      end
+      assert(api.nvim_win_get_buf(owner)==files.BuildA and api.nvim_win_get_buf(aux)==files.BuildA)
+    ]])
+  end)
+
+  t.it("quickfix focus callbacks changing list ownership cancel the protected jump", function()
+    native([[
+      lifecycle(false)
+      local files,owner,list=fixture()
+      vim.cmd('vsplit')
+      local aux=api.nvim_get_current_win()
+      local tab=api.nvim_get_current_tabpage()
+      local session={original_win=owner,modified_win=aux}
+      package.loaded['codediff.ui.lifecycle']={get_session=function(t) if t==tab then return session end end}
+      local code=assert(require('utils.layout').resolve({tab=tab,source_win=owner}))
+      local before=api.nvim_win_get_buf(code)
+      api.nvim_set_current_win(owner)
+      local fired=false
+      api.nvim_create_autocmd('WinEnter',{callback=function()
+        if api.nvim_get_current_win()==code and not fired then
+          fired=true
+          vim.fn.setqflist({},' ',{title='New owner during focus',items={{bufnr=files.Other,lnum=6,col=1}}})
+        end
+      end})
+      keys(']q')
+      assert(fired and api.nvim_win_get_buf(code)==before,'new list navigated with stale request')
+      assert(vim.fn.getqflist({id=0}).id~=list.id)
+    ]])
+  end)
+
+  t.it("quickfix navigation keeps native advancement when every entry is invalid", function()
+    native([[
+      lifecycle(false)
+      local files,owner=fixture()
+      vim.fn.setqflist({},' ',{items={
+        {bufnr=files.BuildA,lnum=1,col=1,valid=0},
+        {bufnr=files.BuildB,lnum=3,col=1,valid=0},
+      }})
+      vim.cmd.cc({count=1})
+      vim.cmd.cnext()
+      local expected=vim.fn.getqflist({id=0,idx=0,items=0,title=0})
+      vim.cmd.cc({count=1})
+      vim.cmd('vsplit')
+      local aux=api.nvim_get_current_win()
+      local tab=api.nvim_get_current_tabpage()
+      local session={original_win=owner,modified_win=aux}
+      package.loaded['codediff.ui.lifecycle']={get_session=function(t) if t==tab then return session end end}
+      api.nvim_set_current_win(owner)
+      keys(']q')
+      assert_location(files.BuildB,3)
+      assert_list(expected,expected.idx)
+    ]])
+  end)
+
+  t.it("loclist BufEnter replacement cancels positioning and keeps native owner and list ID", function()
+    native([[
+      lifecycle(false)
+      local files,owner=fixture()
+      vim.cmd('vsplit')
+      local aux=api.nvim_get_current_win()
+      local tab=api.nvim_get_current_tabpage()
+      local session={original_win=owner,modified_win=aux}
+      package.loaded['codediff.ui.lifecycle']={get_session=function(t) if t==tab then return session end end}
+      local code=assert(require('utils.layout').resolve({tab=tab,source_win=owner}))
+      local replacement=api.nvim_create_buf(true,false)
+      api.nvim_buf_set_lines(replacement,0,-1,false,{'new selection','second','third','fourth'})
+      vim.fn.setloclist(owner,{},' ',{items={{bufnr=files.BuildB,lnum=3,col=5}}})
+      local before=vim.fn.getloclist(owner,{id=0,items=0})
+      api.nvim_set_current_win(owner)
+      vim.cmd.lopen()
+      local panel=api.nvim_get_current_win()
+      local fired=false
+      api.nvim_create_autocmd('BufEnter',{buffer=files.BuildB,callback=function()
+        if not fired and api.nvim_get_current_win()==code then
+          fired=true
+          api.nvim_set_current_buf(replacement)
+          api.nvim_win_set_cursor(code,{1,0})
+        end
+      end})
+      assert(require('utils.problem_navigation').enter()==false,'cancelled action must report false')
+      assert(fired and api.nvim_get_current_win()==code and api.nvim_win_get_buf(code)==replacement)
+      assert(vim.deep_equal(api.nvim_win_get_cursor(code),{1,0}),'old loclist cursor overwrote new work')
+      local actual=api.nvim_win_call(panel,function() return vim.fn.getloclist(panel,{id=0,idx=0,items=0,filewinid=0}) end)
+      assert(actual.id==before.id and actual.idx==1 and actual.filewinid==owner)
+      assert(vim.deep_equal(actual.items,before.items),'native list contents changed')
+      assert(api.nvim_win_get_buf(owner)==files.BuildA and api.nvim_win_get_buf(aux)==files.BuildA)
+    ]])
+  end)
+
+  t.it("loclist focus callbacks rewriting the same ID cancel stale destination content", function()
+    native([[
+      lifecycle(false)
+      local files,owner=fixture()
+      vim.cmd('vsplit')
+      local aux=api.nvim_get_current_win()
+      local tab=api.nvim_get_current_tabpage()
+      local session={original_win=owner,modified_win=aux}
+      package.loaded['codediff.ui.lifecycle']={get_session=function(t) if t==tab then return session end end}
+      local code=assert(require('utils.layout').resolve({tab=tab,source_win=owner}))
+      local before=api.nvim_win_get_buf(code)
+      vim.fn.setloclist(owner,{},' ',{items={{bufnr=files.BuildB,lnum=3,col=1}}})
+      local id=vim.fn.getloclist(owner,{id=0}).id
+      api.nvim_set_current_win(owner)
+      vim.cmd.lopen()
+      local panel=api.nvim_get_current_win()
+      local fired=false
+      api.nvim_create_autocmd('WinEnter',{callback=function()
+        if api.nvim_get_current_win()==code and not fired then
+          fired=true
+          vim.fn.setloclist(owner,{},'r',{id=id,items={{bufnr=files.Other,lnum=6,col=1}}})
+        end
+      end})
+      keys('<CR>')
+      assert(fired and api.nvim_win_get_buf(code)==before,'same-ID replacement list navigated')
+      assert(api.nvim_win_call(panel,function() return vim.fn.getloclist(panel,{id=0,filewinid=0}).filewinid end)==owner)
+      assert(api.nvim_win_get_buf(owner)==files.BuildA and api.nvim_win_get_buf(aux)==files.BuildA)
+    ]])
+  end)
+
+  for _, mutation in ipairs({'tab','source','role'}) do
+    t.it("Trouble target BufReadPost " .. mutation .. " changes cancel before native window replacement", function()
+      native(string.format([[
+        lifecycle(false)
+        local files,owner=fixture()
+        vim.cmd('vsplit')
+        local aux=api.nvim_get_current_win()
+        local tab=api.nvim_get_current_tabpage()
+        local session={original_win=owner,modified_win=aux}
+        package.loaded['codediff.ui.lifecycle']={get_session=function(t) if t==tab then return session end end}
+        local layout=require('utils.layout')
+        local code=assert(layout.resolve({tab=tab,source_win=owner}))
+        local before=api.nvim_win_get_buf(code)
+        vim.cmd('tabnew')
+        local foreign=api.nvim_get_current_win()
+        api.nvim_set_current_tabpage(tab)
+        local view=assert(require('trouble').open('ue_sidebar_qflist'))
+        assert(vim.wait(3000,function() return view.win:valid() end,10))
+        local source=view.win.win
+        local path=root..'/TroubleUnread.txt'
+        vim.fn.writefile({'unread target','second line'},path)
+        local mutation=%q
+        local fired=false
+        local replacement=api.nvim_create_buf(false,true)
+        api.nvim_create_autocmd('BufReadPost',{pattern=path,callback=function()
+          fired=true
+          if mutation=='tab' then
+            api.nvim_set_current_win(foreign)
+          elseif mutation=='source' then
+            vim.wo[source].winfixbuf=false
+            api.nvim_win_set_buf(source,replacement)
+            vim.wo[source].winfixbuf=true
+          else
+            layout.register(code,'aux',{owner='new destination owner'})
+          end
+        end})
+        local count=#notices
+        view.opts.keys['<cr>'].action(view,{item={filename=path,pos={2,0}}})
+        assert(fired,'actual installed Trouble did not load target')
+        assert(api.nvim_win_get_buf(code)==before,'stale Trouble target replaced code')
+        assert(api.nvim_win_get_buf(owner)==files.BuildA and api.nvim_win_get_buf(aux)==files.BuildA)
+        assert(#notices==count+1 and notices[#notices].level==vim.log.levels.WARN)
+        if mutation=='tab' then assert(api.nvim_get_current_win()==foreign,'cancellation stole new tab focus') end
+        if mutation=='source' then assert(api.nvim_win_get_buf(source)==replacement,'cancellation revived old source') end
+        for _,autocmd in ipairs(api.nvim_get_autocmds({event={'TabEnter','WinEnter','BufReadPost'}})) do
+          assert(autocmd.desc~='Problem navigation target-load intent','load intent watcher leaked')
+        end
+      ]],mutation))
+    end)
+  end
 end)

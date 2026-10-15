@@ -68,9 +68,10 @@ local function event_evidence(root, filename, events, err)
     if type(action) == "number" and action >= 1 and action <= 5 and action % 1 == 0 then
       result.action = action
     end
-    for _, name in ipairs({ "directory", "change", "rename", "stable_directory_write" }) do
+    for _, name in ipairs({ "directory", "change", "rename", "stable_directory_write", "unknown" }) do
       if type(events[name]) == "boolean" then result[name] = events[name] end
     end
+    if err ~= nil and events.unknown == true then result.root_kind = "observer-subscription" end
     if events.stream == "write" or events.stream == "metadata" then result.stream = events.stream end
   end
   return result
@@ -255,9 +256,11 @@ function M.start(ctx, client, opts)
   end
   local function install()
     if state ~= "validating" or epoch ~= verification_epoch then return end
-    -- The measured 197 direct watches took 106 ms to install synchronously.
-    -- Yield between small batches while authority remains unavailable.
-    for _ = 1, 16 do
+    -- A grouped backend has already armed every native root; its watch calls
+    -- only bind virtual callbacks. Register them in one turn, or real events
+    -- can arrive at roots left without handlers by a yielded installation.
+    -- Standalone watches still yield between bounded native setup batches.
+    for _ = 1, opts.watch_backend and #roots or 16 do
       local root = roots[next_root]
       if not root then installed = true; maybe_verify(); return end
       next_root = next_root + 1

@@ -125,6 +125,92 @@ local function intercepted(env, act)
 end
 
 t.describe("ordinary publication 独立 worker", function()
+  for _, scenario in ipairs({ "complete", "input-changed", "cancelled", "command-changed", "manifest-failure" }) do
+    t.it("真实 worker 追加预检与屏障释放：" .. scenario, function()
+      with_fixture(function(env)
+        local entries = vim.deepcopy(env.entries)
+        local added = vim.deepcopy(entries[1])
+        added.file, added.arguments = env.ctx._root .. "/B.cpp", { "clang++", "-c", env.ctx._root .. "/B.cpp" }
+        entries[#entries + 1] = added
+        -- Keep the active build immutable across both partial publications.
+        write(env.opts.base_cdb_path, vim.json.encode(entries))
+        local reason, first = env:run()
+        t.assert_eq(reason, nil)
+        env.state.index_artifacts.full, env.state.index_selection = first.manifest, first.selection
+        local original, manifest = snapshot(env.ctx.paths.semantic_cdb), snapshot(env.marker .. ".manifest.json")
+        if scenario == "command-changed" or scenario == "manifest-failure" then
+          entries[1].arguments[#entries[1].arguments + 1] = "-DCHANGED=1"
+        end
+        write(env.opts.background_cdb_path, vim.json.encode(entries))
+        if scenario == "manifest-failure" then
+          assert(vim.uv.fs_unlink(env.marker .. ".manifest.json"))
+          vim.fn.mkdir(env.marker .. ".manifest.json", "p")
+        end
+        local pending, wait = index.phase_barrier_pending, index.wait_phase_publication
+        local release, delivered, failure, result
+        index.phase_barrier_pending = function() return true end
+        index.wait_phase_publication = function(_, callback) release = callback end
+        local ok, err = xpcall(function()
+          local started, start_error = index.finish_publication_async(env.ctx, env.state, "full", env.marker,
+            { "module:/A" }, env.opts, function(why, value)
+              delivered, failure, result = true, why, value
+            end)
+          t.assert_true(started, start_error)
+          t.assert_true(vim.wait(20000, function() return release ~= nil or delivered end, 10))
+          if scenario == "manifest-failure" then
+            t.assert_true(delivered)
+            t.assert_eq(release, nil)
+            t.assert_contains(failure, "publication worker failed")
+            t.assert_true(vim.deep_equal(snapshot(env.ctx.paths.semantic_cdb), original),
+              "manifest failure must preserve the original publication order and CDB")
+            return
+          end
+          if scenario == "command-changed" then
+            t.assert_true(delivered, "non-additive commands must bypass the barrier")
+            t.assert_eq(release, nil)
+            t.assert_eq(failure, nil)
+            t.assert_true(result.publication.original_changed)
+            t.assert_false(result.publication.original_append_only)
+            return
+          end
+          t.assert_type(release, "function")
+          t.assert_false(delivered == true)
+          t.assert_true(vim.deep_equal(snapshot(env.ctx.paths.semantic_cdb), original), "waiting must not publish the full CDB")
+          t.assert_true(vim.deep_equal(snapshot(env.marker .. ".manifest.json"), manifest), "waiting must not promote a manifest")
+          t.assert_eq(locks.owner(env.lease.path).token, env.lease.token)
+          if scenario == "input-changed" then
+            write(env.opts.base_cdb_path, "[]")
+          elseif scenario == "cancelled" then
+            index.cancel_publication_workers()
+          end
+          release()
+          if scenario == "cancelled" then
+            local drained = false
+            vim.schedule(function() drained = true end)
+            t.assert_true(vim.wait(1000, function() return drained end, 10))
+            t.assert_false(delivered == true)
+            t.assert_true(vim.deep_equal(snapshot(env.ctx.paths.semantic_cdb), original))
+          else
+            t.assert_true(vim.wait(20000, function() return delivered end, 10))
+            if scenario == "input-changed" then
+              t.assert_contains(failure, "input changed")
+              t.assert_eq(result, nil)
+              t.assert_true(vim.deep_equal(snapshot(env.ctx.paths.semantic_cdb), original))
+            else
+              t.assert_eq(failure, nil)
+              t.assert_true(result.publication.original_append_only)
+              local published = vim.json.decode(read(env.ctx.paths.semantic_cdb))
+              t.assert_eq(#published, 2, "full release must retain both old and new TU")
+              t.assert_true(vim.deep_equal(published[1].arguments, env.entries[1].arguments))
+            end
+          end
+        end, debug.traceback)
+        index.phase_barrier_pending, index.wait_phase_publication = pending, wait
+        if not ok then index.cancel_publication_workers(); error(err) end
+      end)
+    end)
+  end
+
   t.it("真实 nvim worker 持有 parent lease 发布，重复 prepare 保持 bytes 与 mtime", function()
     with_fixture(function(env)
       local reason, result = env:run()

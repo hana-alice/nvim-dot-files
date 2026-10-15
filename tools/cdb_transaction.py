@@ -120,12 +120,20 @@ def commit(config):
                 except (OSError, ValueError):
                     old = {}
                 for name, metadata in value.get('shards', {}).items():
+                    raw = stage_shards / (name + '.json')
+                    entries = read_json(raw)
+                    declared = metadata.get('entry_count')
+                    if (type(declared) is not int or not isinstance(entries, list)
+                            or declared != len(entries)):
+                        actual = len(entries) if isinstance(entries, list) else 'not an array'
+                        raise ValueError(f'shard entry_count mismatch: {raw}: '
+                                         f'declared={declared!r}, actual={actual}')
                     previous = old.get('shards', {}).get(name, {})
                     # Source roots are a set collected from Lua pairs(). Keep
                     # historical ordering when only process hash order changed.
                     if sorted(metadata.get('source_roots', [])) == sorted(previous.get('source_roots', [])):
                         metadata['source_roots'] = previous.get('source_roots', [])
-                    if equivalent_json(shards / (name + '.json'), read_json(stage_shards / (name + '.json'))):
+                    if equivalent_json(shards / (name + '.json'), entries):
                         for field in ('mtime', 'updated_at'):
                             if field in previous:
                                 metadata[field] = previous[field]

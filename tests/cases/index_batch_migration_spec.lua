@@ -127,6 +127,13 @@ with OwnedDirectory(prefix='receipt_migration_') as temporary:
     assert migrated['ok'], migrated
     assert old_path.read_bytes() == old_bytes, 'legacy record was overwritten'
     current = json.loads(pathlib.Path(migrated['cache_path']).read_bytes())
+    invocations = list(proof._proof_work_root(output).glob('migration-proof-*'))
+    assert len(invocations) == 1 and not invocations[0].is_relative_to(output), invocations
+    assert not any(pathlib.Path(asset['path']).is_relative_to(invocations[0]) for asset in current['assets']), current['assets']
+    certificates = [asset for asset in current['assets'] if pathlib.Path(asset['path']).name.startswith('migration-certificate.')]
+    assert len(certificates) == 1 and pathlib.Path(certificates[0]['path']).parent == output / 'assets', certificates
+    (invocations[0] / 'later-query.stdout.log').write_text('mutable migration scratch')
+    assert proof._cache_valid(current, output, {}, validate_resolution=False), 'migration scratch must not revoke sealed receipt'
     assert current['candidate_order'] == [1, 0], current
     assert current['identities'] == proof._identities(pathlib.Path(clangd), server_profile=server)
     assert all(q['parser_id'].endswith('-v5') for q in current['query_profiles'])
@@ -142,6 +149,7 @@ with OwnedDirectory(prefix='receipt_migration_') as temporary:
     repeated = run()
     assert repeated['ok'] and repeated['no_op'], repeated
     assert snapshot() == before, 'repeated migration rewrote or created artifacts'
+    assert list(proof._proof_work_root(output).glob('migration-proof-*')) == invocations
     graph.write_bytes(graph_bytes + b' ')
     assert not proof._cache_valid(current, output, {}, validate_resolution=False)
     assert not proof.validate_receipts([migrated['candidate']['nvim_ue_batch_receipt']], clangd, server)['ok']

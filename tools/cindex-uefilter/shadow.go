@@ -49,6 +49,21 @@ func indexNameCount(file string) (int, error) {
 	return int((postIndex-nameIndex)/4) - 1, nil
 }
 
+func verifyStagedFiles(file string, files []string) error {
+	count, err := indexNameCount(file)
+	if err != nil {
+		return err
+	}
+	ix := index.Open(file)
+	for _, path := range files {
+		i := sort.Search(count, func(i int) bool { return ix.Name(uint32(i)) >= path })
+		if i == count || ix.Name(uint32(i)) != path {
+			return fmt.Errorf("incomplete staged index: %s was not indexed", path)
+		}
+	}
+	return nil
+}
+
 // shadowLimit mirrors index.Merge: the exclusive end of the range a root owns.
 func shadowLimit(root string) string {
 	return root[:len(root)-1] + string(root[len(root)-1]+1)

@@ -2,6 +2,76 @@
 return function(M, core)
   local RT = core.RT
   local unix_now = core.h.unix_now
+  local unretired = setmetatable({}, { __mode = "k" })
+  M.phase_reader_eligible = function(client) return not unretired[client] end
+
+  local function reload_additive_phase(dependencies)
+    local ctx = dependencies.context
+    if dependencies.original_append_only ~= true or dependencies.same_generation ~= true
+        or dependencies.invalidated_frozen_batch == true or not ctx or not ctx.paths then return false end
+    local fs = require("ue.core.fs")
+    local path_key = require("utils.platform").driver().path_key
+    local function key(path) return path_key(vim.fs.normalize(path)) end
+    local directory = vim.fs.dirname(ctx.paths.semantic_cdb or "")
+    if not fs.is_absolute_path(directory) then return false end
+    local readers = {}
+    for _, client in ipairs((dependencies.get_clients or vim.lsp.get_clients)({ name = "clangd" })) do
+      local config = client.config or {}
+      local cmd = config._ue_resolved_cmd or config.cmd
+      local selected
+      if type(cmd) ~= "table" or config._ue_batch_scope or unretired[client] then return false end
+      for _, argument in ipairs(cmd) do
+        if type(argument) ~= "string" then return false end
+        if argument:find("compile-commands-dir", 1, true) then
+          local path = argument:match("^%-%-compile%-commands%-dir=(.+)$")
+          if not path or selected or not fs.is_absolute_path(path) then return false end
+          selected = key(path)
+        end
+      end
+      if selected ~= key(directory) or not client.initialized or not client.notify or not client.request
+          or (client.is_stopped and client:is_stopped()) then return false end
+      readers[#readers + 1] = { client = client, cmd = vim.deepcopy(cmd) }
+    end
+    if #readers == 0 then return false end
+    local signature = core.h.file_signature(ctx.paths.semantic_cdb)
+    local selection = core.h.ensure_index_state(ctx).index_selection
+    if not selection or not selection.generation_id then return false end
+    local generation = selection.generation_id
+    local defer = dependencies.defer_fn or vim.defer_fn
+    for _, reader in ipairs(readers) do
+      local client = reader.client
+      -- DirectoryCDB revalidates after 5s. A real open source may have an exact
+      -- overlay and bypass that lookup entirely. Use a private, memory-only URI;
+      -- no editor buffer or on-disk TU is added to the compilation database.
+      defer(function()
+        local state = core.h.ensure_index_state(ctx)
+        if not state.index_selection or state.index_selection.generation_id ~= generation
+            or unretired[client]
+            or not vim.deep_equal(signature, core.h.file_signature(ctx.paths.semantic_cdb))
+            or (M.source_refresh_pending and M.source_refresh_pending(ctx))
+            or not vim.deep_equal(reader.cmd, (client.config or {})._ue_resolved_cmd or (client.config or {}).cmd)
+            or (client.is_stopped and client:is_stopped()) or (client.config or {})._ue_batch_scope then return end
+        local uri = vim.uri_from_fname(fs.join(directory,
+          ".nvim-ue-phase-" .. vim.fn.getpid() .. "-" .. tostring(vim.uv.hrtime()) .. ".cpp"))
+        if M.phase_reader_loading then M.phase_reader_loading(ctx, client) end
+        local opened = client:notify("textDocument/didOpen", { textDocument = {
+          uri = uri, languageId = "cpp", version = 1, text = "",
+        } })
+        if not opened then return end
+        local closed = false
+        local function close()
+          if closed then return end
+          closed = true
+          client:notify("textDocument/didClose", { textDocument = { uri = uri } })
+        end
+        -- Wait until the scheduled parse has looked up the directory CDB before
+        -- closing. WatchedFiles is a no-op in the supported clangd release.
+        local requested = client:request("textDocument/documentSymbol", { textDocument = { uri = uri } }, close)
+        if not requested then close() else defer(close, 15000) end
+      end, 6000)
+    end
+    return true
+  end
 
   local function retain_original_reader(dependencies)
     local ctx = dependencies.context
@@ -65,16 +135,21 @@ return function(M, core)
 
   M.maybe_restart_clangd_for_index = function(dependencies)
     dependencies = dependencies or {}
+    if reload_additive_phase(dependencies) then return false end
     -- The original reader already has the unchanged commands. Recovery owns
     -- the eventual fully validated frozen promotion; do not consume debounce.
     if retain_original_reader(dependencies) then return false end
+    local get_clients = dependencies.get_clients or vim.lsp.get_clients
+    local clients = get_clients({ name = "clangd" })
+    -- A previous non-additive publication may have hit the restart debounce.
+    -- Its old reader must not be blessed by a subsequent same-generation append.
+    for _, client in ipairs(clients) do unretired[client] = true end
     local now = (dependencies.now or unix_now)()
     if dependencies.invalidated_frozen_batch ~= true and (now - RT.last_restart_at) < RT.restart_debounce_s then
       return false, math.max(1, math.ceil((RT.restart_debounce_s - (now - RT.last_restart_at)) * 1000))
     end
     RT.last_restart_at = now
 
-    local get_clients = dependencies.get_clients or vim.lsp.get_clients
     local list_bufs = dependencies.list_bufs or vim.api.nvim_list_bufs
     local buffer_valid = dependencies.buffer_valid or vim.api.nvim_buf_is_valid
     local buffer_loaded = dependencies.buffer_loaded or vim.api.nvim_buf_is_loaded
@@ -88,7 +163,6 @@ return function(M, core)
       end)
     end
 
-    local clients = get_clients({ name = "clangd" })
     local cpp_bufs = {}
     for _, client in ipairs(clients) do
       for buf in pairs(client.attached_buffers or {}) do

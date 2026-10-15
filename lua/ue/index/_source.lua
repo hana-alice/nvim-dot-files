@@ -6,6 +6,7 @@ return function(M, core)
   RT.source_hashes = RT.source_hashes or {}
   RT.source_reads = RT.source_reads or {}
   RT.source_restarts = RT.source_restarts or {}
+  RT.source_notices = RT.source_notices or {}
 
   M.source_refresh_pending = function(ctx)
     local state = ensure(ctx)
@@ -79,6 +80,8 @@ return function(M, core)
     if RT.source_restarts[scope] then return true end
     dependencies = dependencies or {}
     local revision = ensure(ctx).source_revision
+    local quiet_retry = RT.source_notices[scope] == revision
+    RT.source_notices[scope] = revision
     RT.source_restarts[scope] = revision
     local finished = false
     local function complete(ok)
@@ -94,12 +97,24 @@ return function(M, core)
         M.clear_module_dirty_flags(ctx, module_keys)
       end
     end
-    local ok, started, delay = pcall(dependencies.restart or M.restart_source_clangd, ctx, complete)
-    if not ok then complete(false); return true end
-    if not started and not finished then
-      RT.source_restarts[scope] = nil
-      M.schedule_index_phase(ctx, "current", delay or 5000)
+    local function restart(_, attached)
+      local function acknowledged(ok, reason) complete(ok); attached(ok, reason) end
+      local ok, started, delay = pcall(dependencies.restart or M.restart_source_clangd, ctx, acknowledged)
+      if not ok then acknowledged(false, tostring(started)); return false end
+      if not started and not finished then
+        finished = true -- Preserve the restart owner's specific retry delay.
+        RT.source_restarts[scope] = nil
+        M.schedule_index_phase(ctx, "current", delay or 5000)
+      end
+      return started
     end
+    local started = require("ue.index.switch_commands").run({ resolve = function() return ctx end,
+      scope = function() return scope end, restart = restart, helper = dependencies.switch_reindex,
+      force_reader_refresh = true, -- A source revision still needs its actual reader acknowledgement.
+      notify = quiet_retry and function() end or (dependencies.notify or vim.notify),
+      prepare = dependencies.prepare or require("ue.index.prepare_observer").prepare,
+      completed = function() if not finished then complete(false) end end })
+    if not started then RT.source_restarts[scope] = nil; M.schedule_index_phase(ctx, "current", 5000) end
     return true
   end
 end

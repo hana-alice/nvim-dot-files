@@ -386,6 +386,11 @@ def main():
                     super_entries, store, args.clangd, max_group=args.batch_size, verify_missing=not args.reuse_verified_only,
                     server_profile=args.server_profile, max_sources=args.max_mods,
                     max_new_groups=args.batch_proof_limit)
+            if args.verified_batch_store is not None:
+                print('[verified-batch] external-selector reuse=' + batch_metrics['selector_reuse_status']
+                      + ' accepted=' + str(batch_metrics['batch_count'])
+                      + ' uncached=' + str(batch_metrics['proof_uncached_count'])
+                      + ' policy=reuse-only; originals retained for unmatched groups')
         from cdb_background_batch import encode_preserving
         outputs = [(background_out, encode_preserving(background_out, background_entries)),
                    (background_out + '.semantic.json', json.dumps(super_entries))]

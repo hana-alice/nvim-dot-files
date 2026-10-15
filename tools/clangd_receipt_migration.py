@@ -105,7 +105,8 @@ def _recollect(record, group, output, proof):
     if len(parents) != 1:
         raise ValueError('migration-graph-roots-disagree')
     root = next(iter(parents))
-    if not root.is_relative_to(output):
+    work = proof._proof_work_root(output)
+    if not root.is_relative_to(output) and not root.is_relative_to(work):
         raise ValueError('migration-graph-outside-proof-store')
     pool = {}
     for index, graph_asset in enumerate(graphs):
@@ -133,7 +134,7 @@ def _recollect(record, group, output, proof):
             raise ValueError('migration-native-riff-shards-missing')
         for shard in shards:
             path = Path(shard).resolve()
-            if not path.is_relative_to(output) or not path.is_file():
+            if (not path.is_relative_to(output) and not path.is_relative_to(root)) or not path.is_file():
                 raise ValueError('migration-native-riff-shard-missing')
         effective = {}
         graph = proof._graph_result(report, Path(commands[-1]['file']), effective, pool if original else None)
@@ -234,7 +235,9 @@ def migrate_cache(record_path, group, output, clangd, server_profile, collector_
             raise ValueError('migration-input-or-asset-changed')
         _recollect(record, group, output, proof)
         reused['identity'] = proof._sha(proof._json({'legacy': record['identity'], 'identities': identities}).encode())
-        invocation = Path(tempfile.mkdtemp(prefix='migration-proof-', dir=output))
+        work = proof._proof_work_root(output)
+        work.mkdir(parents=True, exist_ok=True)
+        invocation = Path(tempfile.mkdtemp(prefix='migration-proof-', dir=work))
         evidence = {'query_profiles': upgraded}
         candidate, detail = proof._prove(group, invocation, output / 'assets', str(clangd), identities['tool'],
             90, evidence, reused=reused, server_profile=profile, original_identities=identities)
@@ -253,11 +256,12 @@ def migrate_cache(record_path, group, output, clangd, server_profile, collector_
         for graph_asset in record['graph_files']:
             if graph_asset not in evidence['assets']:
                 evidence['assets'].append(graph_asset)
-        certificate = invocation / 'migration-certificate.json'
-        proof._write(certificate, proof._json({'schema': 1, 'legacy_cache_sha256': _hash(path),
+        certificate_content = proof._json({'schema': 1, 'legacy_cache_sha256': _hash(path),
             'legacy_identities': old_ids, 'current_identities': identities,
             'collector_sources': {name: {'path': str(source), 'sha256': _hash(source)} for name, source in archive_files.items()},
-            'graphs': record['graph_files'], 'query_profiles': upgraded, 'replayed_admission': detail}))
+            'graphs': record['graph_files'], 'query_profiles': upgraded, 'replayed_admission': detail})
+        certificate = output / 'assets' / ('migration-certificate.' + proof._sha(certificate_content.encode()) + '.json')
+        proof._write(certificate, certificate_content)
         evidence['assets'].append({'path': str(certificate), 'sha256': _hash(certificate)})
         receipt = json.loads(receipt_path.read_bytes())
         receipt.update(schema=2, identities=identities, inventories=inventory, assets=evidence['assets'],

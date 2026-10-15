@@ -75,6 +75,12 @@ def _sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def _proof_work_root(output):
+    """Persistent private work, outside published receipt/asset namespaces."""
+    return (Path(tempfile.gettempdir()).resolve() / 'nvim-ue-batch-work'
+            / _sha(str(Path(output).resolve()).encode())[:24])
+
+
 @contextmanager
 def _phase(timings, name):
     started = time.monotonic()
@@ -515,12 +521,8 @@ def describe_receipts(receipt_paths, server_profile=None):
         if any(record['identities']['compiler_environment'] != environment for record in records):
             raise ValueError('receipt-compiler-environments-disagree')
         roots = {path for record in records for path in record['inventories']}
-        for record in records:
-            roots.add(str(Path(record['identities']['tool_path']).parent))
-            if record['identities'].get('binding_path'):
-                roots.add(str(Path(record['identities']['binding_path']).parent))
-        roots.add(str(Path(__file__).resolve().parent))
-        roots.add(str(_HEADER_CASE_PATH.resolve().parent))
+        # Tool/policy files and immutable assets get exact-file and direct
+        # namespace watches in activation. Their parents are not source trees.
         minimal = _minimal_roots(roots)
         return {'ok': True, 'watch_roots': sorted(map(str, minimal)),
                 'compiler_environment': environment,
@@ -528,7 +530,7 @@ def describe_receipts(receipt_paths, server_profile=None):
                 'server_profile': profile,
                 'query_driver_files': sorted(driver_files), 'query_driver_search_roots': sorted(driver_roots),
                 'query_search_roots': _query_roots(queries), 'query_profiles': queries,
-                'exclude_roots': sorted({record['output_dir'] for record in records})}
+                'exclude_roots': []}
     except (OSError, ValueError, KeyError, TypeError) as error:
         return {'ok': False, 'reason': str(error), 'watch_roots': [], 'exclude_roots': []}
 
@@ -996,7 +998,9 @@ def replay_proof(entries, proof_dir, clangd_path, timeout=90):
         else:
             candidate = commands[0]
             effective_candidate = _effective_entry(candidate, effective)
-    evidence = Path(tempfile.mkdtemp(prefix='policy-replay-', dir=root))
+    work = _proof_work_root(root)
+    work.mkdir(parents=True, exist_ok=True)
+    evidence = Path(tempfile.mkdtemp(prefix='policy-replay-', dir=work))
     verdict = _admit(entries, candidate, originals, graph, evidence, clangd_path, timeout,
                      effective_group, effective_candidate)
     return {'ok': verdict['accepted'], 'admission': verdict, 'diagnostic_only': True,
@@ -1239,7 +1243,19 @@ def _prove(group, root, assets, clangd, tool_hash, timeout, evidence, reused=Non
             verdict = _timed(timings, 'graph_compare_and_bindings', _admit,
                              group, candidate, originals, graph, root, clangd, timeout,
                              effective_group, evidence['effective_candidate'])
-    evidence['assets'].extend(verdict.get('template_argument_proof_assets', []))
+    # Compiler proof request/result bytes become immutable receipt assets only
+    # after admission completes; never watch the mutable invocation directory.
+    sealed = []
+    for item in verdict.get('template_argument_proof_assets', []):
+        raw = Path(item['path']).read_bytes()
+        if _sha(raw) != item['sha256']:
+            raise ValueError('template-proof-changed-before-sealing')
+        path = assets / ('template-proof.' + item['sha256'] + '.json')
+        _write(path, raw)
+        sealed.append({'path': str(path), 'sha256': item['sha256']})
+    if sealed:
+        verdict['template_argument_proof_assets'] = sealed
+    evidence['assets'].extend(sealed)
     if not reused:
         evidence['graph_files'] = []
         for index, value in enumerate(originals + [graph]):
@@ -1536,7 +1552,9 @@ def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify
             else:
                 metrics['new_proof_count'] += 1
                 if invocation is None:
-                    invocation = Path(tempfile.mkdtemp(prefix='proof-', dir=output))
+                    work = _proof_work_root(output)
+                    work.mkdir(parents=True, exist_ok=True)
+                    invocation = Path(tempfile.mkdtemp(prefix='proof-', dir=work))
                     metrics['proof_directory'] = str(invocation)
                 evidence['query_profiles'] = list(reused.get('query_profiles', [])) if reused else []
                 group_root = invocation / ('group-' + str(chunk[0]))
@@ -1639,6 +1657,11 @@ def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify
         metrics['group_hints_write_status'] = _save_group_hints(output, new_hints)
     metrics.update(output_entries=len(result), retained_ubt_count=metrics['original_ubt_count'] - metrics['accepted_ubt_count'],
                    proof_seconds=round(time.monotonic() - started, 6), baseline_cache_reused=metrics['cache_hits'] > 0)
+    metrics.update(proof_accepted_count=sum(bool(record.get('accepted')) for record in metrics['groups']),
+        proof_rejected_count=sum(not record.get('accepted') and not record.get('deferred') for record in metrics['groups']),
+        proof_uncached_count=sum(record.get('reason') == 'verification-not-cached' for record in metrics['groups']),
+        selector_reuse_status=('qualification' if verify_missing else
+                               'accepted' if metrics['batch_count'] else 'zero-hit'))
     metrics['phase_timings'] = {key: dict(value, seconds=round(value['seconds'], 6))
                               for key, value in run_timings.items()}
     if invocation is not None:

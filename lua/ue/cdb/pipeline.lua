@@ -220,10 +220,10 @@ local function mtime_key(path)
 end
 
 --- Background pipeline: expand → pch → resolve → unify. Each step
---- is skipped if its python script is absent. After success, syncs `path`
+--- requires its configured script when supported by the host. After success, syncs `path`
 --- to every other entry in `targets` and restarts clangd. Returns the
---- jobid from `_rt.jobstart`, 0 when no scripts exist, or nil + error when
---- the writer slot is occupied or the background job cannot start.
+--- jobid from `_rt.jobstart`, 0 when no supported steps are configured, or nil + error
+--- when a required script is missing, the writer slot is occupied, or a job cannot start.
 ---
 --- Phase I: the script list and per-step args are sourced from
 --- ue.config.cdb.steps (default = the original 5-step recipe). To skip a
@@ -351,7 +351,14 @@ function M.run(path, targets, on_done, opts)
     local script_path = tool_path(name)
     local host_supports_step = name ~= "prebuild_pch_v2.py"
       or type(host_driver.pch_build_plan) == "function"
-    if host_supports_step and fs.is_file(script_path) then
+    if host_supports_step and not fs.is_file(script_path) then
+      local msg = ("ue-pipeline-%s required script not found: %s")
+        :format(name:gsub("%.py$", ""), script_path)
+      _rt.log_error("ue.runner", msg)
+      if on_done then on_done(false, msg) end
+      return nil, msg
+    end
+    if host_supports_step then
       local arg_builder = CANONICAL_ARGS[name]
       local args
       local isolate = false
@@ -394,6 +401,14 @@ function M.run(path, targets, on_done, opts)
     return 0
   end
 
+  local receipt_tool = tool_path("cdb_unity_receipt.py")
+  if not fs.is_file(receipt_tool) then
+    local msg = "ue-pipeline-complete required script not found: " .. receipt_tool
+    _rt.log_error("ue.runner", msg)
+    if on_done then on_done(false, msg) end
+    return nil, msg
+  end
+
   local lease, lease_err = file_lock.acquire(path .. ".writer.lock")
   if not lease then
     local msg = "compile_commands pipeline is owned by another Neovim: " .. tostring(lease_err)
@@ -404,10 +419,8 @@ function M.run(path, targets, on_done, opts)
 
   -- Bind unity membership to this successful transformation, outside the
   -- standard CDB schema. A unique pending file cannot attest a later run.
-  local receipt_tool = tool_path("cdb_unity_receipt.py")
   local receipt_pending
-  if fs.is_file(receipt_tool) and (fs.is_file(path .. ".unity-origin.json")
-      or fs.is_file(path .. ".unity-receipt.json")) then
+  if fs.is_file(path .. ".unity-origin.json") or fs.is_file(path .. ".unity-receipt.json") then
     receipt_pending = path .. (".unity-pending.%d.%s.json"):format(
       vim.fn.getpid(), tostring(vim.uv.hrtime()))
     table.insert(steps, 1, {
@@ -419,12 +432,10 @@ function M.run(path, targets, on_done, opts)
       command = { python, "-u", "-I", receipt_tool, "seal", path, receipt_pending },
     }
   end
-  if fs.is_file(receipt_tool) then
-    steps[#steps + 1] = {
-      name = "complete",
-      command = { python, "-u", "-I", receipt_tool, "complete", path },
-    }
-  end
+  steps[#steps + 1] = {
+    name = "complete",
+    command = { python, "-u", "-I", receipt_tool, "complete", path },
+  }
 
   local phase_names = {}
   for _, step in ipairs(steps) do phase_names[#phase_names + 1] = step.name end
@@ -467,10 +478,14 @@ function M.run(path, targets, on_done, opts)
     for _, bak in ipairs(M.intermediate_backup_paths(path)) do
       local stat = vim.uv.fs_stat(bak)
       if stat and stat.type == "file" then
-        local ok = pcall(vim.uv.fs_unlink, bak)
-        if ok then
+        local ok, unlinked, unlink_err = pcall(vim.uv.fs_unlink, bak)
+        if ok and unlinked then
           removed = removed + 1
           freed = freed + (stat.size or 0)
+        else
+          _rt.notify(("compile_commands pipeline: failed to remove intermediate backup %s: %s")
+            :format(bak, tostring(ok and (unlink_err or "unlink returned no success") or unlinked)),
+            vim.log.levels.WARN)
         end
       end
     end

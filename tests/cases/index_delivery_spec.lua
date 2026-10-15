@@ -1282,12 +1282,16 @@ t.describe("受控 CDB 相同标准字段不触碰发布文件", function()
         queued = index.try_start_queued_build, publish = index.publish_semantic_cdb,
         source_pending = index.source_refresh_pending, source_delivery = index.deliver_source_refresh,
         finish_publication = index.finish_publication_async, notify = vim.notify,
+        phase_pending = index.phase_barrier_pending,
         toolchain = index._rt.toolchain_identity_override, job = index._rt.job,
       }
       local root_key = ctx.engine_root .. "\31" .. ctx.project_root .. "\31test"
       local ok, err = pcall(function()
         index._rt.toolchain_identity_override = "fixture-compiler"
         index._rt.job = nil
+        -- This fixture stubs only the generator. The real publication-worker
+        -- barrier is covered independently in index_publication_async_spec.
+        index.phase_barrier_pending = function() return false end
         local state = index.ensure_index_state(ctx)
         state.modules = {
           A = { key = "A", name = "A", tier = "core" },
@@ -1426,6 +1430,23 @@ t.describe("受控 CDB 相同标准字段不触碰发布文件", function()
         t.assert_contains(state.build.message, "publication spawn failed fixture")
         t.assert_nil(vim.uv.fs_stat(ctx.paths.index_state .. ".build.lock"))
         t.assert_eq(failures, 2, "spawn failure must release ownership and remain visible")
+
+        -- Exercise the actual build-completion seam, not just the reload helper.
+        write(ctx.paths.active_cdb, vim.json.encode(vim.json.decode(read(ctx.paths.active_cdb))))
+        index.finish_publication_async = saved.finish_publication
+        index.publish_semantic_cdb = function()
+          return true, { changed = true, original_changed = true, original_append_only = true }
+        end
+        state.index_selection.generation_id = index.generation_for_context(ctx).generation_id
+        marker = "append-only-marker"
+        build()
+        t.assert_true(restart_options.original_append_only)
+        t.assert_true(restart_options.same_generation, "capture the old generation before persisting selection")
+        state.index_selection.generation_id = "previous-build"
+        marker = "new-generation-marker"
+        build()
+        t.assert_true(restart_options.original_append_only)
+        t.assert_false(restart_options.same_generation, "append-only bytes cannot bless another build generation")
       end)
       vim.system = saved.system
       index.maybe_restart_clangd_for_index = saved.restart
@@ -1433,6 +1454,7 @@ t.describe("受控 CDB 相同标准字段不触碰发布文件", function()
       index.publish_semantic_cdb = saved.publish
       index.source_refresh_pending, index.deliver_source_refresh = saved.source_pending, saved.source_delivery
       index.finish_publication_async, vim.notify = saved.finish_publication, saved.notify
+      index.phase_barrier_pending = saved.phase_pending
       index._rt.toolchain_identity_override = saved.toolchain
       index._rt.job = saved.job
       index._rt.module_state[root_key], index._rt.contexts[root_key] = nil, nil

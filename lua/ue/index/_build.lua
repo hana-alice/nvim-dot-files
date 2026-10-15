@@ -1,5 +1,4 @@
 -- ue.index._build — subset CDB, partition, phase build + scheduling.
--- Extracted verbatim from lua/ue.lua (F1 split phase-1).
 return function(M, core)
   local fs = require("ue.core.fs")
   local file_lock = require("ue.file_lock")
@@ -495,9 +494,7 @@ M.build_phase_async = function(ctx, phase)
     finished_at = 0,
     message = string.format("%s modules=%d", phase, #selected_keys),
     active_index = state.build and state.build.active_index or "",
-    -- Owner identity makes "running" falsifiable across processes: without it a
-    -- build interrupted by a Neovim exit stays "running" forever and nothing can
-    -- tell an in-flight build apart from an orphaned record.
+    -- Owner PID distinguishes a live build from an orphaned running record.
     owner_pid = vim.fn.getpid(),
   }
   save_index_state(ctx, state)
@@ -506,9 +503,7 @@ M.build_phase_async = function(ctx, phase)
 
   RT.job = { root_key = root_key, phase = phase }
 
-  -- Automatically scheduled builds must report delivery failures. Use the
-  -- UEPrepare fidget channel without stealing focus; P5 permits start and
-  -- coarse updates driven by child output, never periodic notifications.
+  -- P5: report start/output/failure through fidget, without periodic notifications.
   local ok_fidget, fidget_progress = pcall(require, "fidget.progress")
   local progress_handle
   if ok_fidget then
@@ -539,9 +534,7 @@ M.build_phase_async = function(ctx, phase)
   child_env.PYTHONSTARTUP = ""
   local t_build_0 = vim.uv.hrtime()
 
-  -- Stream child output into the progress message. jobstart/vim.system deliver
-  -- arbitrary chunks that are NOT line-aligned, so keep a pending buffer and
-  -- only surface complete lines (same lesson as K51's pipeline logging).
+  -- K51: child chunks are not line-aligned; only surface complete buffered lines.
   local pending_out = ""
   local last_line = ""
   -- Input size cannot prove grouping succeeded. Show the generator's measured
@@ -637,6 +630,7 @@ M.build_phase_async = function(ctx, phase)
 
         if ok_result then
           local prev_fingerprint = live_state.index_selection and live_state.index_selection.artifact_fingerprint or ""
+          local prev_generation = live_state.index_selection and live_state.index_selection.generation_id or ""
           local prev_active_index = live_state.build and live_state.build.active_index or ""
           local generation = publication_result and publication_result.generation
             or generation_for_context(ctx, { base_cdb_path = M.base_compile_commands_path(ctx) })
@@ -671,14 +665,21 @@ M.build_phase_async = function(ctx, phase)
             active_index = (selection and promoted) and ctx.paths.semantic_cdb or prev_active_index,
           }
           save_index_state(ctx, live_state)
+          if selection and promoted and M.phase_publication_committed then
+            M.phase_publication_committed(ctx, generation, phase, publication)
+          end
           -- Phase/coverage metadata may change without changing clangd's commands.
           -- Preserve its in-flight index work when the published CDB is identical.
           local publication_changed = type(publication) ~= "table" or publication.changed ~= false
           if selection and promoted and source_pending then
             M.deliver_source_refresh(ctx, selected_keys)
           elseif selection_changed and promoted and publication_changed then
-            local restart_options = { context = ctx }
-            if type(publication) == "table" then restart_options.original_changed = publication.original_changed end
+            local restart_options = { context = ctx,
+              same_generation = prev_generation ~= "" and prev_generation == snapshot.generation_id }
+            if type(publication) == "table" then
+              restart_options.original_changed = publication.original_changed
+              restart_options.original_append_only = publication.original_append_only
+            end
             M.maybe_restart_clangd_for_index(restart_options)
           end
           if not (selection and promoted) then
@@ -725,11 +726,12 @@ M.build_phase_async = function(ctx, phase)
         core.deps.refresh_statusline()
         file_lock.release(phase_lease)
         RT.job = nil
-        if ok_result and background_request then background_request.env = child_env; M.start_background_batches(ctx, background_request) end
+        if ok_result and background_request and not ctx._headless_index_fixture then background_request.env = child_env; M.start_background_batches(ctx, background_request) end
         M.try_start_queued_build()
       end
 
-      if ok_result and M.publication_needs_worker(ctx, live_state, base, background_cdb, out_idx) then
+      if ok_result and ((phase ~= "current" and M.phase_barrier_pending and M.phase_barrier_pending(ctx))
+          or M.publication_needs_worker(ctx, live_state, base, background_cdb, out_idx)) then
         -- Keep both job ownership and the writer lease until publication returns.
         -- Manifest hashing and semantic CDB I/O belong to the child, not the UI.
         local invoked, started, start_error = pcall(M.finish_publication_async,

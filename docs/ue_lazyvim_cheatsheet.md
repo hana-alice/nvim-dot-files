@@ -368,6 +368,8 @@ csearch or GTAGS fallback is allowed to choose a C++ target. A non-resolved sema
 state keeps the cursor in place. Non-C++ files and explicit search/reference commands
 retain their existing LSP/csearch/GTAGS behavior.
 
+从审阅视图执行 `gd` 等外部导航会进入编辑 tab；Ctrl-O 不切回审阅 tab，用 `<leader>w[` 返回。
+
 Status: `:UEDefStatus`. Trace: `:UEDefTrace`. Cancel the current UI action with
 `:UEDefCancel`; clear inherited header contexts with `:UEDefContextClear`.
 
@@ -646,6 +648,21 @@ The six sidebar views share the same left panel. The Git menu item and
 
 ## Buffers / Windows / Tabs
 
+| Layout key | Command / action |
+|------------|------------------|
+| `<leader>wN` / `wR` / `wD` | `:UELayout normal` / `review` / `debug`: focus or restore the owner's visible layout |
+| `<leader>wL` | `:UELayout`: list type, project, tab and current / recoverable / invalid status |
+| `<leader>wB` | `:UELayoutRestore`: restore the current group, retaining new views and dirty buffers |
+| `<leader>wV` | `:UEView`: list role views without replacing their buffers |
+| `<leader>wC` / `wP` | `:UEView code` 仅聚焦当前组已有 code；`:UEView panel` 选择当前组面板 |
+| `<leader>w[` | `:UELayoutBack`: return to the previous still-valid group |
+
+Layout switching changes visible views only. Debug layout opening does not launch
+or attach; hiding or closing it does not stop debugging. Review recovery retains
+the comparison's repository, revisions, pathspec and selected path while its
+original owner is valid. If that owner is gone, reopen the comparison explicitly.
+Existing `<leader>wM`, `<leader>du` and native `<C-w>h/j/k/l` remain available.
+
 | Key                   | Action                               |
 |-----------------------|--------------------------------------|
 | `<S-h>` / `<S-l>`    | Previous / next buffer (LazyVim)     |
@@ -717,6 +734,8 @@ rebase and reflog; its diff actions use CodeDiff and its pickers use Snacks.
 **Fugitive** keeps revision buffers, full-file blame and quickfix history.
 **Gitsigns** owns normal editing buffers; CodeDiff owns review-buffer hunk actions.
 The default Git keys do not launch Lazygit. The host CLI remains available.
+
+审阅中的 `gd` 等外部导航保留原审阅现场，并切到编辑 tab；Ctrl-O 不切回审阅 tab，用 `<leader>w[` 返回。
 
 ### Cheat-by-scenario
 
@@ -1068,6 +1087,8 @@ have no key bound by default:
 | `:UEIndexHot`          | Hot-list reindex                        |
 | `:UEIndexFull`         | Full GTAGS reindex                      |
 | `:UEIndexTimings`      | Last index timings                      |
+| `:UEIndexSwitchReindex` | Refresh changed source shards after switching branches; uncovered inputs delegate to normal prepare |
+| `:UEIndexBatchWorkInventory` | Read-only dry-run of index TEMP work: referenced, active and unreferenced candidates; writes a report and never deletes |
 | `:UECachePaths`        | Show cache directory paths              |
 | `:UEClearCache`        | Clear nvim-ue + clangd caches           |
 | `:UEClearCache!`       | Above + rm `compile_commands.json` + restart clangd |

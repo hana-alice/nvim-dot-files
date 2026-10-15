@@ -55,6 +55,11 @@
 
 ### DAP（hard-won #1–#10；仅 K1 属已退役 codelldb 路线）
 
+- **编辑器窗口归属（不改变 L0–L4 attach 策略）**：dap-ui 已有目标分支绕过
+  `select_window`，首次手动打开也早于 native `_frame_set` 的恢复采样；统一源码窗交接
+  隔离在 `lua/workarounds/dap/source_windows.lua`，归属/恢复仍由 `ue.dap._layout` 管理。
+  → `tests/cases/dap_layout_spec.lua`；`tests/cases/dap_bottom_panel_spec.lua`。
+
 - **K1 — custom-request 被拒**（历史，codelldb 路线已退役）
   症状: codelldb 1.12.2 收到 `request="custom"` 回 `Malformed message`。
   解决: 用 `request="launch"` + `targetCreateCommands` + `processCreateCommands` 数组。

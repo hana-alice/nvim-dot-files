@@ -155,3 +155,8 @@ selection 变更 MUST NOT 改投、重绑或重新解释已经开始的 workflow
 - **重要事项**：诊断日志的 PID 隔离与「进程内 `vim.g` 不是跨 Neovim 全局」
   是同一类问题的两个面——本 capability 反复强调不要把进程内状态误当成
   跨进程权威状态。
+- **重要事项（2026-10-14，GTAGS）**：跨有效源码根的 shader 必须分根构建，
+  查询端组合结果；完整输入快照、配置及有界同源正向 witness 验收通过后，
+  才原子发布该 project/platform bucket 的 roots manifest。exit 0 与三个
+  非空文件不能单独证明就绪；ignored 告警属于覆盖缺失。witness 是有界
+  parser 可用性证据，不保证所有 shader 定义均收录；C++ gd 仍禁止文本 fallback。

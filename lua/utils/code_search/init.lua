@@ -526,6 +526,7 @@ function M.build_index(ctx, abs_list_path, cb, opts)
   local handle
   local started = vim.loop.hrtime()
   local stopped = false
+  local repair_stop
 
   local args = {}
   if mode == "reset" then
@@ -556,10 +557,51 @@ function M.build_index(ctx, abs_list_path, cb, opts)
         cb(false, "cindex-uefilter completed but produced no usable csearch index at " .. idx, { ms = ms, index_size = 0 })
         return
       end
-      cb(true, nil, {
+      local stats = {
         ms = ms,
         index_size = stat.size,
-      })
+      }
+      if mode ~= "add" then cb(true, nil, stats); return end
+      local verify = require("ue.csearch_verify")
+      local full_list = opts.complete_list_path or (idx .. ".files")
+      verify.check_lists(ctx, abs_list_path, full_list, function(valid, check_err, evidence)
+        if stopped then return end
+        stats.consistency = evidence
+        if valid then cb(true, nil, stats); return end
+        if valid == nil then stats.verification_unavailable = true; cb(false, check_err, stats); return end
+        stats.repair_attempted = true
+        pcall(function()
+          local probe = require("utils.probe")
+          probe.observe("csearch-consistency", "content-check-2026-10-13-W1")
+          probe.record("csearch-consistency", "trigram-mismatch", {
+            state = "inconsistent", path = evidence and evidence.path, token = evidence and evidence.token,
+          })
+        end)
+        local repair_list = abs_list_path .. (".repair.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
+        verify.repair_list(abs_list_path, full_list, repair_list, function(input, repair_err)
+          if stopped then return end
+          if not input then cb(false, repair_err, stats); return end
+          -- Keep the original caller's writer lease throughout. The reset uses
+          -- the same asynchronous host-admission seam and cannot retry itself.
+          vim.notify("[ue] csearch content mismatch — rebuilding once in background", vim.log.levels.WARN)
+          repair_stop = M.build_index(ctx, input, function(reset_ok, reset_err, reset_stats)
+            if stopped then return end
+            reset_stats = reset_stats or {}
+            reset_stats.repair_attempted, reset_stats.consistency = true, evidence
+            if not reset_ok then cb(false, reset_err, reset_stats); return end
+            vim.uv.fs_copyfile(input, idx .. ".files", function(copy_err)
+              vim.schedule(function()
+                if stopped then return end
+                if copy_err then cb(false, "cannot publish repaired csearch snapshot: " .. tostring(copy_err), stats); return end
+                reset_stats.repair_reset, reset_stats.consistency = true, evidence
+                reset_stats.repair_input = input
+                reset_stats.ms = math.floor((vim.loop.hrtime() - started) / 1e6)
+                cb(true, nil, reset_stats)
+              end)
+            end)
+          end, { mode = "reset" })
+        end, function() return stopped end)
+      end, function() return stopped end)
     end)
   end)
 
@@ -576,6 +618,7 @@ function M.build_index(ctx, abs_list_path, cb, opts)
   return function()
     if stopped then return end
     stopped = true
+    if repair_stop then pcall(repair_stop) end
     if handle and not handle:is_closing() then
       pcall(handle.kill, handle, "sigterm")
     end

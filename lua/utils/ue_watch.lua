@@ -63,8 +63,7 @@ local native_watch = require("utils.ue_watch_native")
 
 -- Defined later via assignment so earlier closures bind this local rather than a
 -- shadowing declaration (an undeclared name would instead resolve as a global).
-local add_to_persistent_dirty
-
+local add_to_persistent_dirty, save_persistent_dirty
 -- ---------------------------------------------------------------------------
 -- State
 -- ---------------------------------------------------------------------------
@@ -83,7 +82,7 @@ local function new_state()
   -- WHY: the watcher is record-only and never publishes csearch updates.
   -- The rg-on-dirty overlay therefore needs the full post-prepare cumulative
   -- set, not just the in-flight pre-flush queue.
-  -- Keys: lowercased forward-slash abs path. Values: true.
+  -- Keys: lowercased abs path; values preserve the original spelling.
   persistent_dirty = {},
   persistent_dirty_loaded = false,
   -- Content anchor for Windows fs_event noise suppression. libuv subscribes
@@ -439,7 +438,11 @@ function M.start(opts)
   state.opts = vim.tbl_extend("force", { debounce_ms = 1500 }, opts)
   state.ignored_preindex_changes = 0
   native_watch.reset(); refresh_csearch_index_mtime(); state.timer = uv.new_timer()
-  local native = native_watch.start(opts.root, opts, vim.schedule_wrap(owned_callback(on_event))); if native then
+  local native_opts = vim.tbl_extend("force", opts, { on_coverage_unknown = owned_callback(function()
+    state._dirty_capped, state._dirty_overflow_at = true, math.max(state._dirty_overflow_at or 0, os.time())
+    save_persistent_dirty(state)
+  end) })
+  local native = native_watch.start(opts.root, native_opts, vim.schedule_wrap(owned_callback(on_event))); if native then
     state.handle = native; log_info("watching " .. opts.root .. " (native content events)"); return true end
   state.handle = uv.new_fs_event(); native_watch.set_fallback()
   if not state.handle then
@@ -509,10 +512,7 @@ function M.flush_now()
   vim.schedule(owned_callback(flush))
 end
 
--- ---------------------------------------------------------------------------
--- Persistent dirty.json — cumulative add-set since last :UEPrepare.
--- ---------------------------------------------------------------------------
-
+-- Persistent dirty.json and durable coverage-loss marker (shared writer lease).
 local PERSISTENT_DIRTY_CAP = 1000  -- LRU-ish hard cap; see save_persistent_dirty
 local PERSISTENT_DIRTY_WARN = 500  -- nag threshold
 
@@ -579,7 +579,7 @@ local function collect_persistent_dirty(state, p)
   return arr
 end
 
-local function save_persistent_dirty(owner)
+save_persistent_dirty = function(owner)
   local state = owner or state
   local p = persistent_dirty_path(state)
   if not p then return end

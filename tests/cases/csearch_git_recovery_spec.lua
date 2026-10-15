@@ -36,13 +36,27 @@ local function fixture(fn)
   command(repo, "-c", "user.name=Test Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "Fixture baseline")
   local ctx = {engine_root = repo .. "/Engine", project_root = repo .. "/Project",
     paths = {csearch_idx = bucket .. "/csearch.idx"}}
+  local verify = require("ue.csearch_verify")
   local original, old_status, old_snapshot = cs.build_index, watch.persistent_dirty_status, watch.snapshot_persistent_dirty
+  local original_verify, original_indexed = verify.check, cs.is_indexed
   local calls = {}
-  cs.build_index = function(_, list, cb, opts)
+  local mock_build = function(_, list, cb, opts)
     local added = vim.fn.readfile(list)
     local deleted = opts.delete_list and vim.fn.readfile(opts.delete_list) or {}
     calls[#calls + 1] = {mode = opts.mode, added = added, deleted = deleted}
     vim.schedule(function() cb(true, nil, {ms = 1}) end)
+  end
+  cs.build_index = mock_build
+  cs.is_indexed = function(...)
+    if cs.build_index == original then return original_indexed(...) end
+    return #calls > 0 -- mock writer has published its mock primary index
+  end
+  -- These fixtures exercise Git coverage publication, not native trigram
+  -- consistency. The final native-index case retains the real verifier.
+  verify.check = function(...)
+    if cs.build_index == original then return original_verify(...) end
+    local _, _, cb = ...
+    vim.schedule(function() cb(true, nil, {}) end)
   end
   watch.persistent_dirty_status = function() return {capped = false} end
   watch.snapshot_persistent_dirty = function() return {} end
@@ -58,6 +72,8 @@ local function fixture(fn)
   end
   local ok, err = xpcall(function() fn(ctx, repo, paths, calls, build, list) end, debug.traceback)
   cs.build_index, watch.persistent_dirty_status, watch.snapshot_persistent_dirty = original, old_status, old_snapshot
+  verify.check = original_verify
+  cs.is_indexed = original_indexed
   vim.fn.delete(dir, "rf")
   if not ok then error(err) end
 end
@@ -229,13 +245,97 @@ t.describe("csearch Git overflow recovery", function()
       t.assert_nil(before[ctx.engine_root])
     end)
   end)
-  t.it("普通 unchanged skip 不查询 Git，不提升 baseline", function()
+  t.it("普通 unchanged skip 先检查 Git HEAD，不提升 baseline", function()
     fixture(function(ctx, _, _, calls, build)
       t.assert_true(build())
       local prior, original = table.concat(vim.fn.readfile(git.path(ctx)), "\n"), vim.system
-      vim.system = function() error("unchanged skip must not spawn Git") end
+      local queried = false
+      vim.system = function(argv, ...)
+        if argv[1] == "git" then queried = true end
+        return original(argv, ...)
+      end
       local ok, err, stats = build(); vim.system = original
       t.assert_true(ok, err); t.assert_eq(stats.mode, "skip"); t.assert_eq(#calls, 1)
+      t.assert_true(queried)
+      t.assert_eq(table.concat(vim.fn.readfile(git.path(ctx)), "\n"), prior)
+    end)
+  end)
+  t.it("未 capped 且 watcher dirty 为空：同文件集合的新 commit 必须恢复内容", function()
+    fixture(function(ctx, repo, paths, calls, build)
+      t.assert_true(build())
+      vim.fn.writefile({"int NORMAL_COMMIT_FRESH = 1;"}, paths["Keep.cpp"])
+      command(repo, "add", ".")
+      command(repo, "-c", "user.name=Test Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "Fixture normal commit")
+      local ok, err, stats = build()
+      t.assert_true(ok, err); t.assert_eq(stats.mode, "add"); t.assert_true(stats.git_recovered)
+      t.assert_true(set_of(calls[2].added)[paths["Keep.cpp"]])
+      t.assert_false(set_of(calls[2].added)[paths["Modified.cpp"]])
+      t.assert_eq(baseline(ctx).roots[ctx.engine_root].coverage_head, command(repo, "rev-parse", "HEAD"))
+    end)
+  end)
+  t.it("observed HEAD 已前进而 coverage HEAD 旧：正常分支仍从旧 coverage 恢复", function()
+    fixture(function(ctx, repo, paths, calls, build)
+      t.assert_true(build()); local old = baseline(ctx).roots[ctx.engine_root].coverage_head
+      vim.fn.writefile({"int OLD_COVERAGE_FRESH = 1;"}, paths["Keep.cpp"])
+      command(repo, "add", ".")
+      command(repo, "-c", "user.name=Test Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "Fixture advanced observation")
+      local before = await(function(cb) git.capture(ctx, cb) end)
+      t.assert_true(await(function(cb) git.save(ctx, before, false, {}, cb) end))
+      local saved = baseline(ctx).roots[ctx.engine_root]
+      t.assert_eq(saved.coverage_head, old); t.assert_eq(saved.observed_head, command(repo, "rev-parse", "HEAD"))
+      t.assert_true(build()); t.assert_true(set_of(calls[2].added)[paths["Keep.cpp"]])
+    end)
+  end)
+  t.it("无有效 Git 基线 bootstrap reset 一次，下一次正常跳过", function()
+    fixture(function(ctx, _, _, calls, build)
+      t.assert_true(build())
+      vim.fn.writefile({vim.json.encode({schema = 1, roots = {}})}, git.path(ctx))
+      t.assert_true(build()); t.assert_eq(calls[2].mode, "reset")
+      local ok, err, stats = build()
+      t.assert_true(ok, err); t.assert_eq(stats.mode, "skip"); t.assert_eq(#calls, 2)
+    end)
+  end)
+  t.it("Git root top 身份失配要求 bootstrap；正常恢复只选有效变化 root", function()
+    fixture(function(ctx, repo, _, _, build)
+      t.assert_true(build())
+      local before = await(function(cb) git.capture(ctx, cb) end)
+      local saved = baseline(ctx)
+      saved.roots[ctx.engine_root].top = repo .. "/different-worktree"
+      saved.roots[ctx.project_root].coverage_head = string.rep("a", 40)
+      vim.fn.writefile({vim.json.encode(saved)}, git.path(ctx))
+      local scoped, reset = git.pending(ctx, before)
+      t.assert_true(reset)
+      t.assert_eq(scoped.engine_root, ctx.project_root)
+      t.assert_eq(scoped.project_root, "")
+      t.assert_eq(scoped.paths.csearch_idx, ctx.paths.csearch_idx)
+      t.assert_eq(ctx.engine_root, repo .. "/Engine", "pending must not mutate input roots")
+    end)
+  end)
+  t.it("non-Git 附加根不阻断正常 Git commit 恢复，也不反复 bootstrap", function()
+    fixture(function(ctx, repo, paths, calls, build)
+      ctx.project_root = repo .. "/../bucket"
+      t.assert_true(build())
+      local before = await(function(cb) git.capture(ctx, cb) end)
+      local scoped, reset = git.pending(ctx, before)
+      t.assert_nil(scoped); t.assert_false(reset)
+      vim.fn.writefile({"int MIXED_ROOT_FRESH = 1;"}, paths["Keep.cpp"])
+      command(repo, "add", ".")
+      command(repo, "-c", "user.name=Test Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "Fixture mixed roots")
+      local ok, err, stats = build()
+      t.assert_true(ok, err); t.assert_eq(stats.mode, "add")
+      t.assert_true(set_of(calls[2].added)[paths["Keep.cpp"]])
+      t.assert_eq(baseline(ctx).roots[ctx.engine_root].coverage_head, command(repo, "rev-parse", "HEAD"))
+      t.assert_nil(baseline(ctx).roots[ctx.project_root].coverage_head)
+    end)
+  end)
+  t.it("正常 Git 恢复的 add 与 fallback reset 都失败时 coverage 不前进", function()
+    fixture(function(ctx, repo, paths, _, build)
+      t.assert_true(build()); local prior = table.concat(vim.fn.readfile(git.path(ctx)), "\n")
+      vim.fn.writefile({"int FAILED_RECOVERY_FRESH = 1;"}, paths["Keep.cpp"])
+      command(repo, "add", ".")
+      command(repo, "-c", "user.name=Test Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "Fixture failed recovery")
+      cs.build_index = function(_, _, cb) vim.schedule(function() cb(false, "fixture failure", {}) end) end
+      t.assert_false(build())
       t.assert_eq(table.concat(vim.fn.readfile(git.path(ctx)), "\n"), prior)
     end)
   end)
@@ -302,7 +402,7 @@ t.describe("csearch Git overflow recovery", function()
       t.assert_true(set_of(calls[2].added)[actual:upper()])
     end)
   end)
-  t.it("真实 cindex 通过 Git 恢复替换内容并删除旧命中", function()
+  t.it("真实 cindex 未 capped 时通过新 commit 恢复替换内容并删除旧命中", function()
     if not cs.csearch_exe() or not cs.cindex_uefilter_exe() then t.skip("native csearch unavailable"); return end
     local native_build = cs.build_index
     fixture(function(ctx, repo, paths, _, build)
@@ -313,7 +413,9 @@ t.describe("csearch Git overflow recovery", function()
       t.assert_true(build())
       lines[1] = "int GIT_RECOVERY_FRESH = 1;"
       vim.fn.writefile(lines, paths["Keep.cpp"]); vim.fn.delete(paths["Deleted.cpp"])
-      capped(); local ok, err, stats = build()
+      command(repo, "add", ".")
+      command(repo, "-c", "user.name=Test Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "Fixture native normal commit")
+      local ok, err, stats = build()
       t.assert_true(ok, err); t.assert_eq(stats.mode, "add"); t.assert_true(stats.git_recovered)
       local function search(token)
         local hits = {}

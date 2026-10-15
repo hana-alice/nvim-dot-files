@@ -50,8 +50,13 @@ function M.request(bufnr, method, callback, opts)
         if not record.status then record.status = "timeout" end
       end
     end
+    local preparation_reason
+    for _, record in ipairs(records) do
+      if record.status == "preparation-error" then preparation_reason = record.error; break end
+    end
     vim.schedule(function()
       callback({ method = method, client_results = records, reason = terminal_reason or reason(records),
+        preparation_reason = preparation_reason,
         document_version = subject.document_version,
         elapsed_ms = math.floor((vim.uv.hrtime() - started) / 1000000) })
     end)
@@ -99,7 +104,11 @@ function M.request(bufnr, method, callback, opts)
         local function send(prepared, prepare_reason, context)
           if done or record.status then return end
           if opts.is_current and not opts.is_current() then handle.cancel(); return end
-          if not prepared then complete("preparation-error", prepare_reason); return end
+          if not prepared then
+            record.preparation_reason = prepare_reason or "compile-command-preparation-failed"
+            complete("preparation-error", record.preparation_reason)
+            return
+          end
           record.context = context
           local request_started = vim.uv.hrtime()
           local ok, accepted, request_id = pcall(client.request, client, method, params, function(err, result)

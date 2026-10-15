@@ -18,9 +18,12 @@
 --   This module will faithfully execute whatever location it receives.
 --
 -- Post-condition (guaranteed on return true):
---   1. jumplist tail has exactly ONE new entry: the SOURCE position
+--   1. same-window jumplist adds exactly ONE entry: the SOURCE position
 --      (i.e. one Ctrl-O returns to where gd was invoked from).
 --      In particular: NO spurious (target_buf, 1, 0) entry.
+--      Cross-window handoff into a reused normal tab may also retain that
+--      editor's native current position before the exact SOURCE tail entry.
+--      The review/debug source window and its own history remain unchanged.
 --   2. current window's buffer == target buffer.
 --   3. cursor == (range.start.line + 1, clamped col).
 --   4. view centered (zz).
@@ -52,8 +55,10 @@ end
 
 --- Execute a precise jump.
 --- @param location table  { uri, range = { start = { line, character } } }
+--- @param opts? table Source snapshot when an external handoff already selected normal code.
 --- @return boolean ok
-function M.jump(location)
+function M.jump(location, opts)
+  opts = opts or {}
   -- ---- validate input ----------------------------------------------------
   if type(location) ~= "table" then return false end
   local uri = location and (location.uri or location.targetUri)
@@ -84,6 +89,61 @@ function M.jump(location)
     return false
   end
 
+  local source_win = opts.source_win or vim.api.nvim_get_current_win()
+  if not vim.api.nvim_win_is_valid(source_win) then return false end
+  local source_buf = opts.source_buf or vim.api.nvim_win_get_buf(source_win)
+  local source_cursor = opts.source_cursor or vim.api.nvim_win_get_cursor(source_win)
+  if not vim.api.nvim_buf_is_valid(source_buf)
+      or vim.api.nvim_win_get_buf(source_win) ~= source_buf
+      or not vim.deep_equal(vim.api.nvim_win_get_cursor(source_win), source_cursor) then return false end
+  local source_tick = vim.api.nvim_buf_get_changedtick(source_buf)
+  local word_ok, source_word = pcall(vim.api.nvim_win_call, source_win, function() return vim.fn.expand("<cword>") end)
+  source_word = word_ok and source_word or ""
+  local destinations = require("utils.layout")
+  local destination_tab = vim.api.nvim_get_current_tabpage()
+  local source_tab = vim.api.nvim_win_get_tabpage(source_win)
+  local protected = destinations.routes_to_normal(destination_tab)
+    or (opts.source_win ~= nil and destinations.routes_to_normal(source_tab))
+  local handoff = protected and require("utils.layout_handoff")
+  local snapshot = protected and handoff.capture(source_win)
+  local destination_win = vim.api.nvim_get_current_win()
+  if destinations.routes_to_normal(destination_tab) then
+    local win = destinations.focus({ tab = destination_tab, source_win = destination_win })
+    if not win then return false end
+    destination_win = win
+    destination_tab = vim.api.nvim_win_get_tabpage(win)
+  end
+  local cross_window = destination_win ~= source_win
+  local expected_buf = vim.api.nvim_win_get_buf(destination_win)
+  local destination_owner, destination_kind = destinations.navigation_owner(destination_tab)
+  local function destination_identity(buf)
+    return { win = destination_win, tab = destination_tab, buf = buf, code = true,
+      ownership = true, owner = destination_owner, kind = destination_kind }
+  end
+  local function destination_current()
+    return not protected or handoff.revalidate(snapshot, destination_identity(expected_buf))
+  end
+  if not destination_current() then return false end
+  if cross_window then
+    if not vim.api.nvim_win_is_valid(source_win)
+        or vim.api.nvim_win_get_buf(source_win) ~= source_buf
+        or vim.api.nvim_buf_get_changedtick(source_buf) ~= source_tick
+        or not vim.deep_equal(vim.api.nvim_win_get_cursor(source_win), source_cursor) then return false end
+    -- Native jump history belongs to the destination window. Stage the exact
+    -- source there before m' so Ctrl-O returns to the invocation, while the
+    -- source's own buffer, view and histories stay untouched.
+    if protected then
+      if not handoff.handoff(snapshot, destination_identity(source_buf), function()
+        vim.api.nvim_set_current_buf(source_buf)
+      end) then return false end
+    else
+      vim.api.nvim_set_current_buf(source_buf)
+    end
+    expected_buf = source_buf
+    if not destination_current() then return false end
+    vim.api.nvim_win_set_cursor(destination_win, source_cursor)
+  end
+
   -- ---- step 1: push SOURCE onto jumplist BEFORE any buffer mutation -------
   -- This must be the very first vim.cmd we run. If we let `:edit` run first,
   -- the buffer-switch lands cursor at (1, 0) and `m'` would record THAT
@@ -95,9 +155,18 @@ function M.jump(location)
     -- `keepjumps`: do NOT let :edit append its own (target, 1, 0) jumplist
     -- entry. We've already controlled the jumplist via `m'` above.
     -- `silent!`: suppress "X lines, Y bytes" mid-callback chatter.
-    local ok = pcall(vim.cmd, "keepjumps silent! edit "
-      .. vim.fn.fnameescape(target_path))
+    local ok
+    if protected then
+      if bufnr == -1 then bufnr = vim.fn.bufadd(target_path) end
+      ok = handoff.handoff(snapshot, destination_identity(bufnr), function()
+        vim.cmd("keepjumps silent! edit " .. vim.fn.fnameescape(target_path))
+      end)
+      expected_buf = bufnr
+    else
+      ok = pcall(vim.cmd, "keepjumps silent! edit " .. vim.fn.fnameescape(target_path))
+    end
     if not ok then return false end
+    if not destination_current() then return false end
     bufnr = vim.fn.bufnr(target_path)
     if bufnr == -1 then return false end
   end
@@ -105,8 +174,16 @@ function M.jump(location)
   -- ---- step 3: switch current window to target buffer (no jumplist write)--
   -- nvim_set_current_buf is a pure API call; it does NOT push onto jumplist.
   if vim.api.nvim_get_current_buf() ~= bufnr then
-    vim.api.nvim_set_current_buf(bufnr)
+    if protected then
+      if not handoff.handoff(snapshot, destination_identity(bufnr), function()
+        vim.api.nvim_set_current_buf(bufnr)
+      end) then return false end
+    else
+      vim.api.nvim_set_current_buf(bufnr)
+    end
   end
+  expected_buf = bufnr
+  if not destination_current() then return false end
 
   -- ---- step 4: set cursor to clamped target position ----------------------
   local ln, cc = clamp_pos(bufnr, target_line_1b, target_col_0b)
@@ -175,6 +252,14 @@ function M.jump(location)
   -- "I just mutated state, push cursor to the UI NOW, don't wait for the
   -- redraw scheduler." Cheap, idempotent, no-op on UIs that don't care.
   pcall(vim.api.nvim__redraw, { cursor = true, flush = true })
+  if not destination_current() then return false end
+
+  if cross_window then
+    vim.fn.settagstack(destination_win, { items = { {
+      tagname = source_word ~= "" and source_word or target_path,
+      from = { source_buf, source_cursor[1], source_cursor[2] + 1, 0 },
+    } } }, "t")
+  end
 
   return true
 end

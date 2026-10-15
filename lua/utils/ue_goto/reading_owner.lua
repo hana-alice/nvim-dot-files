@@ -240,6 +240,12 @@ function M.present(owner, create)
     error(picker)
   end
   owner.picker = picker
+  -- Snacks' default main may differ from a nowrite revision source. Reading
+  -- actions own their jump, so main is the immutable source/close destination;
+  -- the file destination is resolved only after the source checks pass.
+  if picker then
+    picker.main = owner.win
+  end
   return picker
 end
 

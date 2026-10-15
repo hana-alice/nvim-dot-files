@@ -38,6 +38,8 @@ t.describe("real clangd source referent matrix", function()
     "int ambiguous(long);",
     "namespace macro { extern int value; int declared(); }",
     "namespace record_scope { struct macro { static int value; static int declared(); }; }",
+    "#define DROP_ASSUME(expr)",
+    "#define DROP_CHECK(expr) { DROP_ASSUME(expr); }",
   }
   local source_lines = {
     '#include "referents.h"',
@@ -62,6 +64,11 @@ t.describe("real clangd source referent matrix", function()
     "int record_macro_value() { return record_scope::macro::value; }",
     "int record_macro_call() { return record_scope::macro::declared(); }",
     "int builtin_line = __LINE__;",
+    "void erased_check() { DROP_CHECK(EnumValue::ValueOne == 1); }",
+    "template<class T> int dependent(T &value) { return value.unresolved(); }",
+    "#if !PLATFORM_ANDROID",
+    "int inactive_value = ordinary(3);",
+    "#endif",
   }
 
   local root = vim.fn.tempname():gsub("\\", "/")
@@ -75,7 +82,7 @@ t.describe("real clangd source referent matrix", function()
       {
         file = source,
         directory = root,
-        arguments = { "clang++", "-std=c++17", "-c", source },
+        arguments = { "clang++", "-std=c++17", "-DPLATFORM_ANDROID=1", "-c", source },
       },
     }),
   }, root .. "/compile_commands.json")
@@ -101,7 +108,8 @@ t.describe("real clangd source referent matrix", function()
       }
     end,
     discover_toolchain = function()
-      return { index = { readiness = "ready", complete = true } }
+      return { index = { readiness = "ready", complete = true },
+        active_build = { platform = "Android", target = "NativeFixture", configuration = "Test" } }
     end,
     snapshot_is_current = function(snapshot)
       return snapshot.id == action
@@ -111,7 +119,8 @@ t.describe("real clangd source referent matrix", function()
     note_origin = function() end,
   }
   package.loaded["utils.probe"] = { record = function() end, observe = function() end }
-  vim.notify = function() end
+  local notices = {}
+  vim.notify = function(message) notices[#notices + 1] = message end
 
   local function column(lines, line, token, occurrence)
     local first, last = 0, 0
@@ -155,6 +164,7 @@ t.describe("real clangd source referent matrix", function()
     })
     local function navigate(line, token, occurrence)
       jumps = {}
+      notices = {}
       -- Query inside the token rather than relying on an exact first-byte cursor.
       vim.api.nvim_win_set_cursor(0, { line, column(source_lines, line, token, occurrence) + 1 })
       nav.cpp_definition(token, bufnr, source, "cpp")
@@ -240,6 +250,8 @@ t.describe("real clangd source referent matrix", function()
       },
       { "method of struct named macro is not a macro", 21, "declared", "definition-not-found", macro_fragment = true },
       { "builtin macro without source has no fabricated destination", 22, "__LINE__", "macro-no-source-definition" },
+      { "erased macro argument qualifier has no fabricated identity", 23, "EnumValue", "identity-missing" },
+      { "erased macro argument enum member has no fabricated identity", 23, "ValueOne", "identity-missing" },
     }) do
       t.it(case[1], function()
         local result = navigate(case[2], case[3])
@@ -252,6 +264,24 @@ t.describe("real clangd source referent matrix", function()
         t.assert_eq(#jumps, 0, "a declaration or ambiguous overload must not masquerade as a definition")
       end)
     end
+    t.it("B3 dependent template name reports exact compiler AST evidence without a jump", function()
+      local result = navigate(24, "unresolved")
+      t.assert_eq(result.state, "invalid-semantic-context", vim.inspect(result))
+      t.assert_eq(result.reason, "identity-missing")
+      t.assert_eq(result.provider_result.compiler_evidence.kind, "dependent-name", vim.inspect(result))
+      t.assert_contains(notices[1], "尚未实例化的依赖名")
+      t.assert_contains(notices[1], "platform=Android target=NativeFixture config=Test")
+      t.assert_eq(#jumps, 0)
+    end)
+    t.it("B3 inactive platform branch has neutral entity absence, never a rebuild recommendation", function()
+      local result = navigate(26, "ordinary")
+      t.assert_eq(result.reason, "identity-missing", vim.inspect(result))
+      t.assert_nil(result.provider_result.compiler_evidence)
+      t.assert_contains(notices[1], "可能是未启用分支、宏消去或未实例化的依赖名")
+      t.assert_false(notices[1]:find("UEPrepare", 1, true))
+      t.assert_contains(table.concat(owner.explain_lines(), "\n"), "method=textDocument/ast")
+      t.assert_eq(#jumps, 0)
+    end)
   end, debug.traceback)
 
   action = action + 1

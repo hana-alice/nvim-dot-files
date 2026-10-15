@@ -37,7 +37,48 @@ local function select_identity(result, usr)
   result.reason = "ok"
 end
 
+local function dependent_at_cursor(root, position)
+  local stack, visited = { root }, 0
+  while #stack > 0 and visited < 1024 do
+    local node = table.remove(stack)
+    visited = visited + 1
+    local range = type(node) == "table" and node.range
+    local first, last = range and range.start, range and range["end"]
+    local contains = first and last and position
+      and (position.line > first.line or (position.line == first.line and position.character >= first.character))
+      and (position.line < last.line or (position.line == last.line and position.character < last.character))
+    if type(node) == "table" and (contains or (node == root and not range)) then
+      if node.kind == "CXXDependentScopeMember" or node.kind == "DependentScopeDeclRef" then return true end
+      for _, child in ipairs(node.children or {}) do stack[#stack + 1] = child end
+    end
+  end
+  return false
+end
+
 function M.resolve(bufnr, result, callback, opts)
+  if result.reason == "identity-missing" then
+    local ids = {}
+    for _, record in ipairs(result.client_results or {}) do
+      if record.error or (record.status ~= "ok" and record.status ~= "empty") then callback(result); return end
+      ids[record.client_id] = true
+    end
+    if not next(ids) then callback(result); return end
+    transport.request(bufnr, "textDocument/ast", function(ast)
+      if ast.reason == "provider-cancelled" then callback(ast); return end
+      result.referent_ast = ast
+      local dependent = covers_clients(ast.client_results, ids)
+      for _, record in ipairs(ast.client_results or {}) do
+        local node = record.result or {}
+        local params = opts.snapshot and require("utils.ue_goto.semantic_transaction")
+          .make_position_params(opts.snapshot, bufnr, record.position_encoding)
+        dependent = dependent and not record.error
+          and dependent_at_cursor(node, params and params.position)
+      end
+      if dependent then result.compiler_evidence = { kind = "dependent-name", source = "textDocument/ast" } end
+      callback(result)
+    end, vim.tbl_extend("force", {}, opts, { client_ids = vim.tbl_keys(ids) }))
+    return
+  end
   if result.reason ~= "ok" and result.reason ~= "identity-conflict" then
     callback(result)
     return

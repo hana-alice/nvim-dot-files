@@ -3,6 +3,7 @@ local M = {}
 local ownership = require("utils.ue_goto.reading_owner")
 local results = require("utils.ue_goto.reading_results")
 local last_references
+local references_request = 0
 local methods = {
   definition = "textDocument/definition",
   declaration = "textDocument/declaration",
@@ -152,22 +153,34 @@ local function present(owner, locations, opts)
   return results.open(owner, rows, opts)
 end
 
-local function references_gtags(owner, symbol, reason)
+local function references_gtags(owner, symbol, reason, record, response)
   if not ownership.current(owner, true) then
     return
   end
   local ok, ue = pcall(require, "ue")
   if not ok or type(ue.gtags_references_async) ~= "function" then
+    record(nil, "unavailable", "references", "gtags-unavailable", 0, {
+      backend = "GTAGS", provider_reason = reason, provider_result = response, coverage = "unknown",
+    })
     notify(owner, "引用提供者未返回结果（" .. tostring(reason) .. "）；覆盖未知")
     return
   end
+  record(nil, "preparing", "references", "gtags-pending", 0, {
+    backend = "GTAGS", provider_reason = reason, provider_result = response, coverage = "unknown",
+  })
   local completed = false
-  local handle = ue.gtags_references_async(symbol, function(hit, entries)
+  local accepted, handle = pcall(ue.gtags_references_async, symbol, function(hit, entries, evidence)
     completed = true
     if not ownership.current(owner, true) then
       return
     end
+    local metadata = {
+      backend = "GTAGS", provider_reason = reason, provider_result = response,
+      coverage = type(evidence) == "table" and evidence.coverage or "unknown",
+      error = type(evidence) == "table" and (evidence.error or evidence.reason) or nil,
+    }
     if not hit or type(entries) ~= "table" or #entries == 0 then
+      record(nil, "unavailable", "references", "gtags-no-result", 0, metadata)
       notify(owner, "LSP / GTAGS 未返回引用；覆盖未知，不能据此断言没有引用")
       return
     end
@@ -179,6 +192,7 @@ local function references_gtags(owner, symbol, reason)
         range = { start = { line = entry.lnum - 1, character = math.max(0, (entry.col or 1) - 1) } },
       }
     end
+    record(nil, "resolved", "references", "gtags-locations", #locations, metadata)
     present(owner, locations, { title = "引用 · 文本索引结果", source = "GTAGS" })
   end, {
     context = owner.context,
@@ -187,6 +201,13 @@ local function references_gtags(owner, symbol, reason)
       return ownership.current(owner, true)
     end,
   })
+  if not accepted then
+    record(nil, "unavailable", "references", "gtags-error", 0, {
+      backend = "GTAGS", provider_reason = reason, provider_result = response, error = handle, coverage = "unknown",
+    })
+    notify(owner, "文本引用查询失败；详见 :UEDefExplain，覆盖未知")
+    return
+  end
   if handle and type(handle.kill) == "function" then
     ownership.add_cleanup(owner, function()
       local ok_closing, closing = true, false
@@ -204,12 +225,10 @@ function M.references()
   local owner = begin()
   local started = (vim.uv or vim.loop).hrtime()
   local symbol = current_word()
-  if not symbol or symbol == "" then
-    notify(owner, "光标处没有符号")
-    return false
-  end
+  references_request = references_request + 1
+  local request_id = references_request
   local header = require("utils.ue_goto.reading_companion").kind(owner.path) == "header" and owner.context ~= nil
-  local function record(proof, state, stage, reason, count)
+  local function record(proof, state, stage, reason, count, metadata)
     if not ownership.current(owner, true) then return end
     local context = proof and proof.context or {}
     last_references = {
@@ -217,9 +236,25 @@ function M.references()
       evidence_kind = context.evidence_kind or (proof and "compiler-query" or "-"),
       context_id = context.id or context.context_id,
       compile_digest = proof and proof.compile_digest,
+      request_id = request_id, symbol = symbol, document_version = owner.tick,
+      line = owner.cursor and owner.cursor[1], column0 = owner.cursor and owner.cursor[2],
       state = state, stage = stage, reason = reason, location_count = count or 0,
       elapsed_ms = math.floor(((vim.uv or vim.loop).hrtime() - started) / 1000000),
     }
+    for key, value in pairs(metadata or {}) do last_references[key] = value end
+  end
+  record(nil, "preparing", "references", "request-started")
+  if type(ownership.add_cleanup) == "function" then
+    ownership.add_cleanup(owner, function()
+      if last_references and last_references.request_id == request_id and last_references.state == "preparing" then
+        last_references.state, last_references.stage, last_references.reason = "unavailable", "stale", "stale-request"
+      end
+    end)
+  end
+  if not symbol or symbol == "" then
+    record(nil, "unavailable", "references", "symbol-missing")
+    notify(owner, "光标处没有符号")
+    return false
   end
   local function request(proof)
     if not ownership.current(owner, true) then return end
@@ -232,14 +267,16 @@ function M.references()
       locations = {}
     end
     if #locations > 0 then
-      record(proof, "resolved", "references", "provider-locations", #locations)
+      record(proof, "resolved", "references", "provider-locations", #locations, {
+        backend = "LSP", provider_result = response, coverage = "unknown",
+      })
       present(owner, locations, { title = "引用", source = "LSP" })
     elseif header then
       local reason = type(response) == "table" and response.reason or "missing-provider-response"
-      record(proof, "unavailable", "references", reason)
+      record(proof, "unavailable", "references", reason, 0, { backend = "LSP", provider_result = response, coverage = "unknown" })
       notify(owner, "头文件引用不可用（" .. tostring(reason) .. "）；覆盖未知")
     else
-      references_gtags(owner, symbol, type(response) == "table" and response.reason or "missing-provider-response")
+      references_gtags(owner, symbol, type(response) == "table" and response.reason or "missing-provider-response", record, response)
     end
   end, {
     snapshot = owner,
@@ -278,15 +315,21 @@ function M.explain_lines()
   if not last_references then return {} end
   local report = last_references
   local function safe(value)
-    return tostring(value or "-"):gsub("\\", "/"):gsub("[%a]:/[^%c]+", "<path>"):gsub("%c", " "):sub(1, 160)
+    return require("utils.ue_goto.semantic_report").safe_text(value)
   end
-  return {
+  local lines = {
     "--- references ---",
     string.format("references: subject=%s state=%s stage=%s reason=%s", safe(report.subject), safe(report.state), safe(report.stage), safe(report.reason)),
     string.format("references donor: %s evidence=%s context=%s command=%s", safe(report.donor), safe(report.evidence_kind),
       safe((report.context_id or ""):sub(1, 12)), safe((report.compile_digest or ""):sub(1, 12))),
     string.format("references timing: elapsed_ms=%d locations=%d", report.elapsed_ms, report.location_count),
+    string.format("references request: id=%s symbol=%s version=%s position=%s:%s backend=%s coverage=%s provider_reason=%s",
+      safe(report.request_id), safe(report.symbol), safe(report.document_version), safe(report.line), safe(report.column0),
+      safe(report.backend), safe(report.coverage), safe(report.provider_reason)),
   }
+  if report.error then lines[#lines + 1] = "references error: " .. safe(report.error) end
+  vim.list_extend(lines, require("utils.ue_goto.semantic_report").provider_lines(report.provider_result, "references"))
+  return lines
 end
 
 function M.source_header(opts)

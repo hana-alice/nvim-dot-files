@@ -84,7 +84,7 @@ t.describe("provider absence and capability evidence", function()
           return { { id = 71, name = "clangd", offset_encoding = "utf-8",
             request = function(_, method, _, callback)
               requests = requests + 1
-              t.assert_eq(method, "textDocument/symbolInfo")
+              t.assert_true(method == "textDocument/symbolInfo" or (case.empty_identity and method == "textDocument/ast"))
               callback(nil, {})
               return true, 1
             end } }
@@ -109,8 +109,8 @@ t.describe("provider absence and capability evidence", function()
           case.preparation_reason or (case.empty_identity and "identity-missing")
             or (case.unsupported and "provider-method-unsupported" or "provider-unavailable"))
         if case.preparation_reason or case.empty_identity then
-          t.assert_eq(preparations, 1)
-          t.assert_eq(requests, case.preparation_reason and 0 or 1)
+          t.assert_eq(preparations, case.empty_identity and 2 or 1)
+          t.assert_eq(requests, case.preparation_reason and 0 or 2)
           local record = result.provider_result.client_results[1]
           t.assert_eq(record.status, case.preparation_reason and "preparation-error" or "ok")
           t.assert_eq(record.error, case.preparation_reason)
@@ -122,12 +122,11 @@ t.describe("provider absence and capability evidence", function()
         t.assert_eq(jumps, 0)
         t.assert_eq(#notices, 1)
         if case.reason == "provider-unavailable" then
-          t.assert_contains(notices[1], "clangd is not attached")
+          t.assert_contains(notices[1], "当前 buffer 没有可用 clangd")
           t.assert_contains(notices[1], ":UEDefExplain")
         elseif case.reason == "active-compile-command-missing" then
-          t.assert_contains(notices[1], "verify the selected platform/target")
-          t.assert_contains(notices[1], "module or plugin participates in that build")
-          t.assert_contains(notices[1], "then run :UEPrepare for that build")
+          t.assert_contains(notices[1], "核对所选平台、目标及模块参与")
+          t.assert_contains(notices[1], "对该构建运行 :UEPrepare")
         elseif case.stage == "index" then
           t.assert_contains(notices[1], ":UEPrepare")
         end

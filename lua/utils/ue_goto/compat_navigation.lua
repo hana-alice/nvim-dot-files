@@ -54,13 +54,13 @@ end
 -- ---------------------------------------------------------------------------
 
 function M.gtags_fallback_async(symbol, on_done)
-  if not symbol then
-    on_done(false)
+  if not symbol or symbol == "" then
+    on_done(false, { backend = "none", reason = "unavailable", coverage = "unavailable", detail = "no symbol" })
     return
   end
   local ok, ue = pcall(require, "ue")
   if not ok then
-    on_done(false)
+    on_done(false, { backend = "none", reason = "unavailable", coverage = "unavailable", detail = "UE context unavailable" })
     return
   end
   if ue.gtags_definition_async then
@@ -71,8 +71,24 @@ function M.gtags_fallback_async(symbol, on_done)
   -- the press itself still feels responsive.
   vim.schedule(function()
     local r = ue.gtags_definition and ue.gtags_definition(symbol) or false
-    on_done(r and true or false)
+    local result = { backend = "none", coverage = "unavailable" }
+    if not r then result.reason = "unavailable" end
+    on_done(r and true or false, result)
   end)
+end
+
+function M.definition_failure_message(symbol, result)
+  result = result or {}
+  local backend, reason, coverage = result.backend or "none", result.reason or "unavailable", result.coverage or "unavailable"
+  if backend == "gtags" and reason == "empty" and coverage == "complete" then
+    return "No definition (GTAGS empty; coverage=complete): " .. (symbol or "?")
+  end
+  local reasons = {
+    empty = "no definition returned", unavailable = "query unavailable", ["command-failed"] = "query command failed",
+    ["coverage-missing"] = "index coverage missing", ["jump-failed"] = "definition found, but jump failed",
+  }
+  return string.format("Definition lookup: %s (backend=%s; reason=%s; coverage=%s): %s",
+    reasons[reason] or "query did not resolve", backend, reason, coverage, symbol or "?")
 end
 
 function M.install(deps)
@@ -166,11 +182,11 @@ function M.install(deps)
 
     if ui.NON_CLANGD_EXTS[ext] then
       dtrace("non-clangd ext=%s -> GTAGS direct", tostring(ext))
-      provider.gtags_fallback_async(sym, function(ok)
+      provider.gtags_fallback_async(sym, function(ok, result)
         if not still_current() then return end
         done()
         if not ok then
-          vim.notify("No definition (GTAGS empty): " .. (sym or "?"), vim.log.levels.INFO)
+          vim.notify(M.definition_failure_message(sym, result), vim.log.levels.INFO)
         end
       end)
       return
@@ -218,16 +234,14 @@ function M.install(deps)
           dtrace("path-B: csearch jump failed; falling through to GTAGS")
         end
 
-        provider.gtags_fallback_async(sym, function(g_jumped)
+        provider.gtags_fallback_async(sym, function(g_jumped, result)
           if not still_current() or resolved then clear_notice(); return end
           if g_jumped then
             jumped = true
-            done(string.format("✓ %s (GTAGS fallback)", sym or "?"), 3000)
+            done(string.format("✓ %s (%s fallback)", sym or "?", result and result.backend or "compatibility"), 3000)
           else
             done()
-            vim.notify(string.format(
-              "No definition (clangd/csearch/GTAGS all empty): %s", sym or "?"),
-              vim.log.levels.INFO)
+            vim.notify(M.definition_failure_message(sym, result), vim.log.levels.INFO)
           end
         end)
       end)

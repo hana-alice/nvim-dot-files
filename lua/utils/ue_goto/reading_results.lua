@@ -147,17 +147,39 @@ function M.jump(owner, row, cmd, saved_origin)
   owner.handoff = true
   local succeeded, ok = pcall(function()
     vim.api.nvim_set_current_win(owner.win)
-    if cmd == "vsplit" then
-      vim.cmd.vsplit()
-    elseif cmd == "split" then
-      vim.cmd.split()
-    elseif cmd == "tab" then
-      vim.cmd("tab split")
+    local destinations = require("utils.layout")
+    local session = destinations.sync_review(owner.tab)
+    local navigation_owner = destinations.navigation_owner(owner.tab)
+    local protected = destinations.routes_to_normal(owner.tab)
+    local handoff = require("utils.layout_handoff")
+    local snapshot = handoff.capture(owner.win)
+    if protected then
+      local win = destinations.focus({ tab = owner.tab, source_win = owner.win })
+      if not win then return false end
+      local destination_tab = vim.api.nvim_win_get_tabpage(win)
+      if not ownership.valid(owner) or not M.target_current(row)
+          or vim.api.nvim_get_current_win() ~= win
+          or vim.api.nvim_get_current_tabpage() ~= destination_tab
+          or destinations.sync_review(owner.tab) ~= session
+          or destinations.navigation_owner(owner.tab) ~= navigation_owner
+          or not destinations.is_code(win, destination_tab) then return false end
+    end
+    if cmd == "vsplit" or cmd == "split" or cmd == "tab" then
+      local win = vim.api.nvim_get_current_win()
+      local destination = handoff.capture(win)
+      destination.code = true
+      local created = handoff.split(snapshot, destination, cmd)
+      if not created or destinations.routes_to_normal(vim.api.nvim_win_get_tabpage(created)) then return false end
+      -- This explicit split is ours. Its code role also permits staging the
+      -- nowrite revision source for native history before opening the target.
+      if protected then destinations.register(created, "code", { owner = "browser" }) end
     end
     if not ownership.valid(owner) or not M.target_current(row) then
       return false
     end
-    return require("utils.ue_goto.jumper").jump(row.location)
+    return require("utils.ue_goto.jumper").jump(row.location, protected and {
+      source_win = owner.win, source_buf = owner.buf, source_cursor = owner.cursor,
+    } or nil)
   end)
   owner.handoff = false
   if ownership.active() == owner then

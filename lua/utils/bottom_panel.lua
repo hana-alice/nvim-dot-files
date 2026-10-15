@@ -67,11 +67,36 @@ local function panel_win(win, tab)
   return info and info.quickfix == 1 and info.loclist == 0
 end
 
+local function protect(win, tab)
+  local layout = require("utils.layout")
+  layout.register(win, "panel", { tab = tab, owner = "bottom_panel" })
+  if layout.is_review(tab) then
+    vim.w[win].ue_bottom_panel_pin = vim.w[win].ue_bottom_panel_pin
+      or (vim.wo[win].winfixbuf and "fixed" or "free")
+    vim.wo[win].winfixbuf = true
+  elseif vim.w[win].ue_bottom_panel_pin then
+    vim.wo[win].winfixbuf = vim.w[win].ue_bottom_panel_pin == "fixed"
+    vim.w[win].ue_bottom_panel_pin = nil
+  end
+end
+
 local function save_view(s, win)
   if vim.api.nvim_win_is_valid(win) then
     local buf = vim.api.nvim_win_get_buf(win)
     s.views[buf] = vim.api.nvim_win_call(win, vim.fn.winsaveview)
   end
+end
+
+-- The shared host may be pinned by DAP. Only its owner's synchronous content
+-- handoff releases the pin; user jumps stay protected, even after an error.
+local function with_host_unpinned(win, fn)
+  if not win then return fn() end
+  local pinned = vim.wo[win].winfixbuf
+  if pinned then vim.wo[win].winfixbuf = false end
+  local ok, result = pcall(fn)
+  if vim.api.nvim_win_is_valid(win) then vim.wo[win].winfixbuf = pinned end
+  if not ok then error(result, 0) end
+  return result
 end
 
 local function scratch(kind, s, tab)
@@ -166,7 +191,7 @@ local function quickfix_buffer(s, tab)
   if not valid_buf(buf) or not vim.api.nvim_buf_is_loaded(buf) then
     local previous = vim.api.nvim_get_current_win()
     -- :copen creates the native buffer and its normal <CR> jump behavior.
-    vim.cmd("botright copen")
+    with_host_unpinned(M.window(), function() vim.cmd("botright copen") end)
     buf = vim.api.nvim_get_current_buf()
     if vim.api.nvim_win_is_valid(previous) then vim.api.nvim_set_current_win(previous) end
   end
@@ -200,6 +225,7 @@ function M.register(kind, buf)
   end
   for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
     if normal_win(win, tab) and vim.api.nvim_win_get_buf(win) == buf then
+      protect(win, tab)
       if not s.win or s.win == win then
         s.win, s.kind = win, kind
       end
@@ -257,7 +283,14 @@ end
 --- Managed bottom window in this tab, or nil after manual close/replacement.
 function M.window()
   local s, tab = state()
-  if panel_win(s.win, tab) then return s.win end
+  if panel_win(s.win, tab) then protect(s.win, tab); return s.win end
+  if normal_win(s.win, tab) then
+    require("utils.layout").unregister(s.win)
+    if vim.w[s.win].ue_bottom_panel_pin then
+      vim.wo[s.win].winfixbuf = vim.w[s.win].ue_bottom_panel_pin == "fixed"
+      vim.w[s.win].ue_bottom_panel_pin = nil
+    end
+  end
   s.win = nil
   return nil
 end
@@ -291,7 +324,7 @@ function M.show(kind, buf, opts)
   end
   if win then
     save_view(s, win)
-    vim.api.nvim_win_set_buf(win, target)
+    with_host_unpinned(win, function() vim.api.nvim_win_set_buf(win, target) end)
     -- Adoption moves an existing panel to the full-width bottom without
     -- touching ordinary editing windows, floats, or another tab's panels.
     if adopted then vim.api.nvim_win_call(win, function() vim.cmd("wincmd J") end) end
@@ -299,6 +332,7 @@ function M.show(kind, buf, opts)
     win = vim.api.nvim_open_win(target, false, { split = "below", win = -1, height = opts.height or 12 })
   end
   s.win, s.kind = win, kind
+  protect(win, tab)
   for _, duplicate in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
     if duplicate ~= win and panel_win(duplicate, tab) then
       save_view(s, duplicate)
@@ -357,7 +391,8 @@ function M.remove(kind, buf)
   s.buffers[kind], s.views[registered] = nil, nil
   local win = M.window()
   if win and vim.api.nvim_win_get_buf(win) == registered then
-    vim.api.nvim_win_set_buf(win, placeholder(kind, s, tab))
+    local target = placeholder(kind, s, tab)
+    with_host_unpinned(win, function() vim.api.nvim_win_set_buf(win, target) end)
   end
   return true
 end

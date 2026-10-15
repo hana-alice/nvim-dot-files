@@ -512,6 +512,7 @@ return {
         enabled = false,
       })
       opts.picker = opts.picker or {}
+      opts.picker.confirm = require("utils.layout").confirm
       opts.picker.layout = vim.tbl_deep_extend("force", { preset = "vscode" }, opts.picker.layout or {})
 
       -- Per-source layout overrides:
@@ -591,6 +592,8 @@ return {
       })
 
       opts.picker.actions = vim.tbl_deep_extend("force", opts.picker.actions or {}, {
+        jump = require("utils.layout").confirm,
+        edit = require("utils.layout").confirm,
         paste_clipboard = paste_picker_clipboard,
         pin_sidebar_qflist = pin_sidebar_qflist,
         copy_position = function(picker, item) return require("utils.file_query").copy(picker, item, "position") end,

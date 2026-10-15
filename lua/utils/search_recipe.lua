@@ -429,7 +429,7 @@ function M.confirm(picker, item, action)
       vim.notify("Search history could not retain these options: " .. err, vim.log.levels.WARN)
     end
   end
-  return require("snacks.picker.actions").jump(picker, item, action)
+  return require("utils.layout").confirm(picker, item, action)
 end
 
 function M.save_resume_options(picker)

@@ -5,6 +5,15 @@ return {
     keys = { { "[q", false }, { "]q", false } },
     opts = function(_, opts)
       opts = opts or {}
+      local navigation = require("utils.problem_navigation")
+      opts.keys = opts.keys or {}
+      for key, action in pairs({
+        ["<cr>"] = "jump", ["<2-leftmouse>"] = "jump", o = "jump_close",
+        ["<c-s>"] = "jump_split", ["<c-v>"] = "jump_vsplit",
+      }) do
+        opts.keys[key] = { action = navigation.trouble_action(action), desc = action }
+      end
+      opts.win = vim.tbl_deep_extend("force", opts.win or {}, { wo = { winfixbuf = true } })
       local function sidebar_mode(mode)
         mode.focus = true
         mode.warn_no_results = false

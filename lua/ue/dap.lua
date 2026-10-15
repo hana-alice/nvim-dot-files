@@ -1492,10 +1492,22 @@ function D.setup_dap(dap, dapui)
   local ui_layouts = {}
   local frame_views = {}
   local ui_layout, ui_session
+  local register_debug
+  local function retire_debug(state, reason)
+    local group = state and state.group
+    if not group then return end
+    -- register_group returns the actual owner record. Retire that record in
+    -- place so its ID/history survive without holding the invocation/session.
+    group.token, group.navigation_origin = nil, nil
+    group.views, group.invalid_reason = {}, reason
+    state.group = nil
+  end
   local function save_layout(session)
-    local tab = vim.api.nvim_get_current_tabpage()
+    local tab = session and session.config and session.config._ue_debug_tab or vim.api.nvim_get_current_tabpage()
+    if not vim.api.nvim_tabpage_is_valid(tab) then return end
     ui_layouts[tab] = ui_layouts[tab] or layout.begin(session or ui_session)
     ui_layout = ui_layouts[tab]
+    ui_layout.session = session or ui_layout.session
     ui_session = session or ui_session
   end
 
@@ -1504,11 +1516,17 @@ function D.setup_dap(dap, dapui)
   end
 
   local function restore_layout()
-    for _, owned in pairs(ui_layouts) do layout.close(owned) end
+    local failure
+    for _, owned in pairs(ui_layouts) do
+      local ok, err = pcall(layout.close, owned)
+      retire_debug(owned, "调试会话已结束或更换；原 debug 布局已失效。")
+      if not ok then failure = failure or err end
+    end
     ui_layouts = {}
     frame_views = {}
     ui_layout, ui_session = nil, nil
     D._dap_bottom_tab_win = nil
+    if failure then error(failure, 0) end
   end
 
   -- ─── logcat side-panel (Android sessions only) ────────────────────
@@ -1596,10 +1614,10 @@ function D.setup_dap(dap, dapui)
     return nil
   end
 
-  local function bottom_tab_buffer(name)
+  local function bottom_tab_buffer(name, opts)
     if name == "logcat" then
       if (not logcat_buf or not vim.api.nvim_buf_is_valid(logcat_buf))
-         and type(start_logcat) == "function" then
+         and not (opts and opts.ui_only) and type(start_logcat) == "function" then
         local state = current_android_state()
         if state.pid and state.pid ~= "" then
           start_logcat()
@@ -1661,17 +1679,23 @@ function D.setup_dap(dap, dapui)
     -- bottom host alongside build output, problems, logs and tasks.
     save_layout()
     layout.open(ui_layout, function()
+      if opts.rebuild then dapui.close({ layout = 1 }) end
       dapui.open({ layout = 1, reset = opts.reset })
       D._dap_bottom_tab_win = open_bottom_tab_window()
-      D.dap_bottom_tab(active_bottom_tab or "repl", { quiet = true })
+      D.dap_bottom_tab(active_bottom_tab or "repl", { quiet = true, ui_only = opts.ui_only })
     end)
+    if register_debug then register_debug(ui_layout) end
   end
 
   local function close_debug_layout()
     local tab = vim.api.nvim_get_current_tabpage()
-    layout.close(ui_layouts[tab])
+    local owned = ui_layouts[tab]
+    local ok, err = pcall(layout.close, owned)
+    retire_debug(owned, ok and "调试 UI 已关闭；可用 UELayout debug 为当前会话重新打开 UI。"
+      or "调试 UI 归还失败；原 debug 布局已失效，请检查 :NvimLog。")
     ui_layouts[tab], ui_layout = nil, nil
     D._dap_bottom_tab_win = nil
+    if not ok then error(err, 0) end
   end
 
   D._dap_close_debug_layout = close_debug_layout
@@ -1697,7 +1721,7 @@ function D.setup_dap(dap, dapui)
       return
     end
     active_bottom_tab = name
-    local buf = bottom_tab_buffer(name)
+    local buf = bottom_tab_buffer(name, opts)
     if not buf then
       if not opts.quiet then
         vim.notify("[ue.dap] tab unavailable: " .. name, vim.log.levels.WARN)
@@ -1854,7 +1878,7 @@ return cand end
   local function on_session_end(session)
     if ui_session and session and ui_session ~= session then return end
     stop_logcat()
-    restore_layout()
+    local restored, ui_error = pcall(restore_layout)
     source_path_cache = {}
     D._ue_android_pending_bps = {}  -- clear pending breakpoints on session end
     local platforms = require("ue.dap.platforms")
@@ -1864,7 +1888,94 @@ return cand end
     })
     platforms.end_session(session)
     reset_session_state()
+    if not restored then
+      require("utils.log").notify_error("dap.layout",
+        "[编辑器 UI ownership · ue.dap._layout] 调试 UI 归还失败：" .. tostring(ui_error)
+          .. "；平台 cleanup/end_session/reset 已执行。请检查 :NvimLog 与保留的窗口。")
+    end
   end
+
+  local destinations = require("utils.layout")
+  local function debug_valid(group)
+    local state = group.token
+    if not state then return false, group.invalid_reason or "原 debug 布局已失效。" end
+    if state.session and state.session ~= ui_session then
+      return false, "调试会话已结束或更换；原 debug 布局已失效。"
+    end
+    if ui_layouts[group.tab] ~= state then
+      return false, "调试 UI 已关闭；可用 UELayout debug 为当前会话重新打开 UI。"
+    end
+    return true
+  end
+  local function debug_focus(group)
+    local valid, err = debug_valid(group)
+    if not valid then return nil, err end
+    local state = group.token
+    if layout.code_window(state.main, state.tab) then
+      vim.api.nvim_set_current_win(state.main)
+      return state.main
+    end
+    return layout.focus(state)
+  end
+  local function debug_restore(group)
+    local valid, err = debug_valid(group)
+    if not valid then return nil, err end
+    local rebuild, reason = layout.restore_rebuild(group.token)
+    if rebuild == nil then return nil, reason end
+    open_debug_layout({ reset = false, rebuild = rebuild, ui_only = true })
+    return debug_focus(group)
+  end
+  register_debug = function(state)
+    state.group = destinations.register_group("debug", { tab = state.tab, token = state, owner = "dap",
+      metadata = { source_tab = state.tab },
+      valid = debug_valid, focus = debug_focus, restore = debug_restore })
+    return state.group
+  end
+  destinations.register_owner("debug", {
+    discover = function()
+      for _, state in pairs(ui_layouts) do
+        if state.after and vim.api.nvim_tabpage_is_valid(state.tab) then register_debug(state) end
+      end
+    end,
+    open = function()
+      local session = ui_session or dap.session()
+      if not session then return nil, "无调试会话；布局命令不会 launch / attach。" end
+      local tab = session.config and session.config._ue_debug_tab or vim.api.nvim_get_current_tabpage()
+      if not vim.api.nvim_tabpage_is_valid(tab) then return nil, "调试会话的来源 tab 已关闭；未重建或启动会话。" end
+      local previous = vim.api.nvim_get_current_tabpage()
+      local win = vim.api.nvim_tabpage_get_win(tab)
+      vim.api.nvim_set_current_tabpage(tab)
+      if vim.api.nvim_get_current_tabpage() ~= tab
+        or (previous ~= tab and vim.api.nvim_get_current_win() ~= win) then
+        return nil, "切换回调选择了其它窗口；已保留新选择。"
+      end
+      save_layout(session)
+      open_debug_layout({ reset = false, ui_only = true })
+      return register_debug(ui_layout)
+    end,
+  })
+
+  -- Capture the UI owner before asynchronous adapter startup. The existing
+  -- invocation state holds the snapshot; config carries only its tab ID.
+  dap.listeners.on_config = dap.listeners.on_config or {}
+  dap.listeners.on_config["ue_debug_layout"] = function(config)
+    local tab = vim.api.nvim_get_current_tabpage()
+    config._ue_debug_tab = tab
+    -- An aborted/missing-adapter start emits no session-end event. Refresh a
+    -- pending snapshot on the next attempt; retain an initialized UI owner.
+    if not ui_layouts[tab] or not ui_layouts[tab].session then ui_layouts[tab] = layout.begin() end
+    return config
+  end
+  dap.defaults = dap.defaults or {}
+  dap.defaults.fallback = dap.defaults.fallback or {}
+  dap.defaults.fallback.switchbuf = function(buf, line, column)
+    local session = dap.session()
+    local tab = session and session.config and session.config._ue_debug_tab or vim.api.nvim_get_current_tabpage()
+    return layout.jump(ui_layouts[tab], buf, line, column)
+  end
+  require("workarounds.dap.source_windows").apply(function()
+    return ui_layouts[vim.api.nvim_get_current_tabpage()]
+  end)
 
   -- nvim-dap calls request listeners before → native callback → after on one
   -- scheduled response. Only that explicit frame jump receives restoration
@@ -1884,6 +1995,10 @@ return cand end
     if frame then
       frame_views[session] = frame_views[session] or {}
       frame_views[session][seq or session] = layout.before_frame(ui_layouts)
+      local tab = session.config and session.config._ue_debug_tab or vim.api.nvim_get_current_tabpage()
+      -- Native DAP skips switchbuf when its current buffer/line already match.
+      -- Resolve before that optimization so an existing aux target stays aux.
+      layout.focus(ui_layouts[tab])
     end
   end
   dap.listeners.after.stackTrace["ue_debug_layout"] = function(session, _, _, _, seq)
@@ -1947,20 +2062,25 @@ return cand end
       )
     end
     if ui_session and ui_session ~= session then restore_layout() end
-    save_layout(session)
-    open_debug_layout({ reset = true })
-    start_logcat()
-    local config = session and session.config or nil
-    if config and config._ue_ios_session_owner == "legacy-mobiledevice" then
-      pcall(function()
-        require("ue.dap._progress").step("iOS transport attached; arming source breakpoints …")
-      end)
-    else
-      local owner = config and D._session_owner_module(config._ue_session_owner)
-      local waiting = owner and owner.initialized_progress and owner.initialized_progress(session)
-      pcall(function()
-        local progress = require("ue.dap._progress")
-        if waiting then progress.step(waiting) else progress.done("debugger attached") end
+    local tab = session and session.config and session.config._ue_debug_tab or vim.api.nvim_get_current_tabpage()
+    if vim.api.nvim_tabpage_is_valid(tab) then
+      vim.api.nvim_win_call(vim.api.nvim_tabpage_get_win(tab), function()
+        save_layout(session)
+        open_debug_layout({ reset = true })
+        start_logcat()
+        local config = session and session.config or nil
+        if config and config._ue_ios_session_owner == "legacy-mobiledevice" then
+          pcall(function()
+            require("ue.dap._progress").step("iOS transport attached; arming source breakpoints …")
+          end)
+        else
+          local owner = config and D._session_owner_module(config._ue_session_owner)
+          local waiting = owner and owner.initialized_progress and owner.initialized_progress(session)
+          pcall(function()
+            local progress = require("ue.dap._progress")
+            if waiting then progress.step(waiting) else progress.done("debugger attached") end
+          end)
+        end
       end)
     end
   end
@@ -2032,6 +2152,10 @@ return cand end
         return
       end
       local before = session == ui_session and layout.before_frame(ui_layouts)
+      if before then
+        local tab = session.config and session.config._ue_debug_tab or vim.api.nvim_get_current_tabpage()
+        layout.focus(ui_layouts[tab])
+      end
       local result = orig_frame_set(session, frame)
       if before then
         layout.after_frame(before, session.current_frame or frame)

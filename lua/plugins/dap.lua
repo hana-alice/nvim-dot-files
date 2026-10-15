@@ -14,6 +14,7 @@ return {
       local dapui = require("dapui")
       dapui.setup({
         force_buffers = false,
+        select_window = function() return require("ue.dap._layout").resolve() end,
         -- In stacks panel, <CR> / double-click should jump to frame (open),
         -- not try to expand (which frames don't support).
         element_mappings = {

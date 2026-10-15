@@ -1,6 +1,7 @@
 -- Window ownership for one debug UI invocation. Native splits keep their IDs;
 -- only windows created by this invocation and still showing its content close.
 local M = {}
+local destinations = require("utils.layout")
 
 local options = {
   "statusline",
@@ -15,11 +16,12 @@ local options = {
   "colorcolumn",
   "winfixheight",
   "winfixwidth",
+  "winfixbuf",
   "winhighlight",
 }
 
 local function valid(win, tab)
-  return win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_tabpage(win) == tab
+  return type(win) == "number" and win > 0 and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_tabpage(win) == tab
 end
 
 local function snapshot(win)
@@ -72,6 +74,34 @@ local function code_window(win, tab)
   return vim.bo[buf].buftype == ""
     and not vim.bo[buf].filetype:find("^dap")
     and not vim.api.nvim_buf_get_name(buf):match("^dap%-src://")
+    and destinations.is_code(win, tab)
+end
+
+M.code_window = code_window
+
+local function panel_buffer(buf)
+  return vim.bo[buf].filetype:find("^dap") or vim.b[buf].ue_bottom_panel_kind
+end
+
+-- The existing UI invocation owns role/pin restoration as well as its splits.
+function M.sync(state)
+  if not state or not vim.api.nvim_tabpage_is_valid(state.tab) then return end
+  state.pins = state.pins or {}
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(state.tab)) do
+    local buf = vim.api.nvim_win_get_buf(win)
+    if panel_buffer(buf) and vim.api.nvim_win_get_config(win).relative == "" then
+      destinations.register(win, "panel", { tab = state.tab, owner = "dap" })
+      if state.pins[win] == nil then state.pins[win] = vim.wo[win].winfixbuf end
+      vim.wo[win].winfixbuf = true
+    else
+      if state.pins[win] ~= nil then
+        if vim.wo[win].winfixbuf then vim.wo[win].winfixbuf = state.pins[win] end
+        state.pins[win] = nil
+        destinations.unregister(win)
+      end
+      if code_window(win, state.tab) then destinations.register(win, "code", { tab = state.tab }) end
+    end
+  end
 end
 
 function M.begin(session)
@@ -88,6 +118,7 @@ function M.begin(session)
     borrowed = {},
     changed = false,
     navigation = {},
+    pins = {},
   }
 end
 
@@ -147,25 +178,33 @@ function M.after_frame(before, frame)
 end
 
 --- Explicit focus helper: never resurrect a split deliberately closed by a user.
-function M.focus(state)
-  local tab = vim.api.nvim_get_current_tabpage()
+function M.resolve(state)
+  local tab = state and state.tab or vim.api.nvim_get_current_tabpage()
+  M.sync(state)
   local current = vim.api.nvim_get_current_win()
-  if code_window(current, tab) then
-    return current
+  local source = code_window(current, tab) and current or (state and state.main)
+  local win, err = destinations.resolve({ tab = tab, source_win = source, anchor = source, create = true, route_to_normal = false })
+  if win and state then state.main = win end
+  return win, err
+end
+
+function M.focus(state)
+  local win, err = M.resolve(state)
+  if win then vim.api.nvim_set_current_win(win) end
+  return win, err
+end
+
+function M.jump(state, buf, line, column)
+  local before = state and M.before_frame({ state })
+  local win, err = M.focus(state)
+  if not win then error(err, 0) end
+  vim.api.nvim_win_set_buf(win, buf)
+  vim.api.nvim_win_set_cursor(win, { math.max(1, line or 1), math.max(0, (column or 1) - 1) })
+  destinations.register(win, "code")
+  if before then
+    M.after_frame(before, { source = { path = vim.api.nvim_buf_get_name(buf) }, line = line or 1 })
   end
-  if state and code_window(state.main, tab) then
-    vim.api.nvim_set_current_win(state.main)
-    return state.main
-  end
-  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
-    if code_window(win, tab) then
-      vim.api.nvim_set_current_win(win)
-      return win
-    end
-  end
-  local buf = vim.api.nvim_create_buf(true, false)
-  local win = vim.api.nvim_open_win(buf, true, { split = "above", win = current })
-  return win
+  return true
 end
 
 --- Track one synchronous UI operation, including a borrowed shared bottom host.
@@ -207,6 +246,24 @@ function M.open(state, operation)
     end
   end
   state.after, state.after_tree = windows(state.tab), tree(state.tab)
+  for win in pairs(state.owned) do
+    if not valid(win, state.tab) then state.owned[win] = nil end
+  end
+  M.sync(state)
+end
+
+-- dap-ui considers a partially closed rail open. A reset is needed only when
+-- an owned window is gone; repurposed windows remain the user's content.
+function M.restore_rebuild(state)
+  local missing = false
+  for win, buf in pairs(state.owned) do
+    if not valid(win, state.tab) then
+      missing = true
+    elseif vim.api.nvim_win_get_buf(win) ~= buf then
+      return nil, "调试窗口已有新内容；已保留，请显式重新打开 UI。"
+    end
+  end
+  return missing
 end
 
 local function project(node, removed, values)
@@ -306,6 +363,16 @@ function M.close(state)
   end
   local current = vim.api.nvim_get_current_win()
   local before, removed = windows(state.tab), {}
+  for win, pinned in pairs(state.pins or {}) do
+    if valid(win, state.tab) then
+      if vim.wo[win].winfixbuf then vim.wo[win].winfixbuf = pinned end
+      destinations.unregister(win)
+      local buf = vim.api.nvim_win_get_buf(win)
+      if vim.b[buf].ue_bottom_panel_kind or vim.bo[buf].buftype == "quickfix" then
+        destinations.register(win, "panel", { tab = state.tab, owner = "bottom_panel" })
+      end
+    end
+  end
   local unchanged = state.after
     and not state.changed
     and vim.deep_equal(geometry(before), geometry(state.after))
@@ -327,7 +394,13 @@ function M.close(state)
       and vim.api.nvim_win_get_buf(win) == saved.content
       and vim.api.nvim_buf_is_valid(saved.buf)
     then
-      vim.api.nvim_win_set_buf(win, saved.buf)
+      -- Returning borrowed content is the owner's synchronous handoff, not a
+      -- user jump. Restore its pin even when native buffer events raise.
+      local pinned = vim.wo[win].winfixbuf
+      if pinned then vim.wo[win].winfixbuf = false end
+      local ok, err = pcall(vim.api.nvim_win_set_buf, win, saved.buf)
+      if vim.api.nvim_win_is_valid(win) then vim.wo[win].winfixbuf = pinned end
+      if not ok then error(err, 0) end
       local expected = state.after and state.after[win]
       for name, value in pairs(saved.options) do
         if expected and vim.wo[win][name] == expected.options[name] then

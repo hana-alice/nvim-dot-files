@@ -2,6 +2,18 @@ local map = vim.keymap.set
 local window_title = require("utils.window_title")
 window_title.setup()
 
+-- Layout visibility belongs to its owner; these commands never start/stop work.
+require("utils.layout_commands").setup()
+map("n", "<leader>wN", "<cmd>UELayout normal<cr>", { desc = "Layout: normal editing" })
+map("n", "<leader>wR", "<cmd>UELayout review<cr>", { desc = "Layout: review" })
+map("n", "<leader>wD", "<cmd>UELayout debug<cr>", { desc = "Layout: debug views (no launch/attach)" })
+map("n", "<leader>wL", "<cmd>UELayout<cr>", { desc = "Layout: list groups" })
+map("n", "<leader>wB", "<cmd>UELayoutRestore<cr>", { desc = "Layout: restore current group" })
+map("n", "<leader>wV", "<cmd>UEView<cr>", { desc = "Layout: list role views" })
+map("n", "<leader>wC", "<cmd>UEView code<cr>", { desc = "Layout: focus code view" })
+map("n", "<leader>wP", "<cmd>UEView panel<cr>", { desc = "Layout: focus panel view" })
+map("n", "<leader>w[", "<cmd>UELayoutBack<cr>", { desc = "Layout: previous valid group" })
+
 map({ "n", "x" }, "<leader>cf", function()
   local format = require("utils.cpp_format")
   if not format.is_cpp(0) then return LazyVim.format({ force = true }) end
@@ -214,7 +226,7 @@ local function open_file_reference_under_cursor()
     return false
   end
 
-  return pcall(vim.cmd.normal, { args = { "gf" }, bang = true })
+  return require("utils.file_reference").open()
 end
 
 local function ctrl_leftmouse_jump()
@@ -237,10 +249,11 @@ end
 
 local function quickfix_jump(command)
   return function()
-    local ok, err = pcall(vim.cmd[command], { count = vim.v.count1 })
-    if not ok then vim.notify(tostring(err), vim.log.levels.WARN) end
+    require("utils.problem_navigation").quickfix(command, vim.v.count1)
   end
 end
+
+require("utils.problem_navigation").setup()
 
 -- Result navigation stays on the native list, regardless of open sidebars.
 map("n", "]q", quickfix_jump("cnext"), { desc = "Next quickfix result" })

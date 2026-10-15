@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Expand UE-style compile_commands.json `command` entries that use
+"""Expand UE-style compile_commands.json entries that use
 @response-files into a flat `arguments` array suitable for clangd and
 the rest of the ue-pipeline (prebuild_pch / unify / prune).
 
@@ -13,8 +13,8 @@ Why:
   every TU.
 
 What it does (idempotent):
-  1. For every entry, if `arguments` already populated → skip.
-  2. Tokenize `command` (handles quoted args / @files).
+  1. Skip populated `arguments` only when no @response remains.
+  2. Use `arguments` in order, or tokenize `command` (quoted args / @files).
   3. Recursively expand @response files (resolved relative to entry
      directory).
   4. Convert MSVC-style /I (with or without space) to clang -I so
@@ -91,9 +91,9 @@ def tokenize_response(text):
     return tokens
 
 
-def expand_response_file(path, base_dir, seen):
+def expand_response_file(path, base_dir, seen, failures):
     """Read .response at `path` (resolved against base_dir if relative),
-    return token list with any nested @response files inlined."""
+    return tokens only when every required nested response is readable."""
     full = path
     if not os.path.isabs(full):
         full = os.path.normpath(os.path.join(base_dir, full))
@@ -105,31 +105,38 @@ def expand_response_file(path, base_dir, seen):
         rest = full_read[2:].replace('\\', '/')
         full_read = f'/mnt/{drive}{rest}'
 
-    real = os.path.realpath(full_read)
+    real = os.path.normcase(os.path.realpath(full_read))
     if real in seen:
-        return []
+        failures[('cycle', real)] = 'response-file cycle'
+        return None
+    try:
+        with open(full_read, 'r', encoding='utf-8') as f:
+            text = f.read()
+    except FileNotFoundError as error:
+        failures[('missing', real)] = str(error)
+        return None
+    except (OSError, UnicodeDecodeError) as error:
+        failures[('read_error', real)] = str(error)
+        return None
+
     seen.add(real)
-
-    if not os.path.exists(full_read):
-        return None  # signal: missing (caller decides)
-
-    with open(full_read, 'r', encoding='utf-8', errors='replace') as f:
-        text = f.read()
-
-    tokens = tokenize_response(text)
-    out = []
-    i = 0
-    while i < len(tokens):
-        t = tokens[i]
-        if t.startswith('@'):
-            nested = expand_response_file(t[1:], base_dir, seen)
-            if nested:
-                out.extend(nested)
-            i += 1
-        else:
-            out.append(t)
-            i += 1
-    return out
+    try:
+        out = []
+        complete = True
+        for token in tokenize_response(text):
+            if token.startswith('@'):
+                nested = expand_response_file(token[1:], base_dir, seen, failures)
+                if nested is None:
+                    complete = False
+                else:
+                    out.extend(nested)
+            else:
+                out.append(token)
+        return out if complete else None
+    finally:
+        # This is the recursion stack, not a global visited set: a repeated
+        # response in separate branches is valid and must expand each time.
+        seen.remove(real)
 
 
 def normalize_args(tokens, source_file):
@@ -196,9 +203,10 @@ def normalize_args(tokens, source_file):
 
 
 def needs_expand(entry):
-    """True if entry must be expanded (no arguments, command has @rsp)."""
-    if entry.get('arguments'):
-        return False
+    """True if the selected arguments or command still contains @rsp."""
+    arguments = entry.get('arguments')
+    if arguments:
+        return any(token.startswith('@') for token in arguments[1:])
     cmd = entry.get('command', '')
     return '@' in cmd
 
@@ -225,7 +233,7 @@ def parse_command_for_driver_and_rsp(cmd):
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
-        sys.exit(1)
+        return 1
     cdb_path = sys.argv[1]
     dry_run = '--dry-run' in sys.argv
 
@@ -236,48 +244,51 @@ def main():
     n_total = len(cdb)
     n_already = 0
     n_expanded = 0
-    n_missing_rsp = 0
+    failures = {}
     n_no_rsp = 0
     n_kept_as_is = 0
 
     new_cdb = []
     for entry in cdb:
-        if entry.get('arguments'):
-            n_already += 1
-            new_cdb.append(entry)
-            continue
+        arguments = entry.get('arguments')
+        if arguments:
+            if not needs_expand(entry):
+                n_already += 1
+                new_cdb.append(entry)
+                continue
+            driver, tokens = arguments[0], arguments[1:]
+        else:
+            cmd = entry.get('command', '')
+            if not cmd:
+                n_kept_as_is += 1
+                new_cdb.append(entry)
+                continue
 
-        cmd = entry.get('command', '')
-        if not cmd:
-            n_kept_as_is += 1
-            new_cdb.append(entry)
-            continue
+            parsed = parse_command_for_driver_and_rsp(cmd)
+            if not parsed:
+                n_no_rsp += 1
+                new_cdb.append(entry)
+                continue
+            driver, rsps, extras = parsed
+            tokens = extras + ['@' + rsp for rsp in rsps]
 
-        parsed = parse_command_for_driver_and_rsp(cmd)
-        if not parsed:
-            n_no_rsp += 1
-            new_cdb.append(entry)
-            continue
-
-        driver, rsps, extras = parsed
         base_dir = entry.get('directory', '').replace('\\', '/')
         source_file = entry.get('file', '')
 
-        all_tokens = list(extras)
-        all_missing = True
-        for rsp in rsps:
+        all_tokens = []
+        complete = True
+        for token in tokens:
+            if not token.startswith('@'):
+                all_tokens.append(token)
+                continue
             seen = set()
-            toks = expand_response_file(rsp, base_dir, seen)
+            toks = expand_response_file(token[1:], base_dir, seen, failures)
             if toks is None:
-                continue  # missing file
-            all_missing = False
-            all_tokens.extend(toks)
+                complete = False
+            else:
+                all_tokens.extend(toks)
 
-        if all_missing:
-            # No usable .response — leave entry untouched (clangd will
-            # also fail, but at least pipeline does not silently strip
-            # the original command).
-            n_missing_rsp += 1
+        if not complete:
             new_cdb.append(entry)
             continue
 
@@ -293,9 +304,19 @@ def main():
         n_expanded += 1
 
     dt = time.time() - t0
+    n_missing_rsp = sum(kind == 'missing' for kind, _ in failures)
+    n_read_error_rsp = sum(kind == 'read_error' for kind, _ in failures)
+    n_cycle_rsp = sum(kind == 'cycle' for kind, _ in failures)
     print(f"expand_response_cdb: total={n_total} expanded={n_expanded} "
           f"already_args={n_already} missing_rsp={n_missing_rsp} "
+          f"read_error_rsp={n_read_error_rsp} cycle_rsp={n_cycle_rsp} "
           f"no_rsp_in_cmd={n_no_rsp} no_command={n_kept_as_is} ({dt:.1f}s)")
+
+    if failures:
+        for (kind, path), reason in sorted(failures.items()):
+            print(f"expand_response_cdb: {kind}: {path}: {reason}", file=sys.stderr)
+        print("expand_response_cdb: expansion failed, leaving file untouched", file=sys.stderr)
+        return 1
 
     if n_expanded == 0:
         print("expand_response_cdb: nothing to expand, leaving file untouched")
@@ -311,4 +332,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

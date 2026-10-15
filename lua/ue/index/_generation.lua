@@ -685,6 +685,7 @@ return function(M, core)
       cold = tier_counts.cold,
       queued = queued,
       queue_count = #queued,
+      background_index = M.phase_barrier_status and M.phase_barrier_status(ctx) or nil,
       source_refresh_pending = (tonumber(state.source_revision) or 0) > (tonumber(state.source_delivered) or 0),
       root_dirty = (state.root_dirty or false)
         or (core.deps.core_rt.dirty_index_roots[core.deps.status_root_key(ctx)] and true or false),

@@ -35,8 +35,11 @@ local function fixture(count, settings)
     release = function(lease) env.released[#env.released + 1] = lease.path end,
     run = run,
     read_json = function(path)
-      if path == "plan.json" then return { schema = 1, groups = groups } end
-      if path == "collect.json" then return { ok = not env.bad_collect, changed = true } end
+      if path == "plan.json" then return { schema = 1, groups = groups, proof_accepted_count = 3,
+        proof_rejected_count = 2, proof_uncached_count = 8, selector_reuse_status = "accepted",
+        recovered_completed = settings.recovered, plan_candidate_count = settings.plan_candidate_count } end
+      if path == "collect.json" then return { ok = not env.bad_collect, changed = true, metrics = { collect_accepted_count = 4 },
+        revalidated_completed = settings.validated } end
       return { ok = true, metrics = { new_batch_count = 1, new_proof_count = 1 } }
     end,
     admit = function(spec)
@@ -74,6 +77,47 @@ local function fixture(count, settings)
 end
 
 t.describe("连续后台二次证明队列", function()
+  t.it("restart collects hints under both leases and keeps only revalidated groups", function()
+    local env = fixture(2, { recovered = { { id = "group-1", accepted_hint = 1 } }, validated = { "group-1" }, plan_candidate_count = 1 })
+    env:complete(1)
+    t.assert_eq(env:count("worker"), 0)
+    t.assert_eq(env:count("collect"), 1)
+    t.assert_eq(env.module.summary(env.spec.scope).pending_accepted_count, 1)
+    t.assert_eq(env.module.summary(env.spec.scope).planned_candidates, 1, "recovery hints are not new work candidates")
+    t.assert_eq(#env.acquired, 2)
+    env:complete(2)
+    t.assert_eq(env:count("worker"), 1)
+    t.assert_eq(env.module.summary(env.spec.scope).pending_accepted_count, 0)
+    t.assert_eq(env.module.summary(env.spec.scope).last_collect_success.outcome, "published")
+    t.assert_eq(env.argument(env.jobs[3].command, "--group"), "group-2")
+    env:complete(3); env:complete(4)
+    t.assert_eq(env.record.phase, "finished")
+  end)
+
+  t.it("stale historical ok must be reproved instead of bypassing admission", function()
+    local env = fixture(1, { recovered = { { id = "group-1", accepted_hint = 1 } }, validated = {} })
+    env:complete(1); env:complete(2)
+    t.assert_eq(env:count("worker"), 1)
+    t.assert_eq(env.argument(env.jobs[3].command, "--group"), "group-1")
+    env:complete(3); env:complete(4)
+    t.assert_eq(env.record.phase, "finished")
+  end)
+  t.it("observes plan, cached proofs, new proofs and collected batches independently", function()
+    local env = fixture(1)
+    env:complete(1)
+    local summary = env.module.summary(env.spec.scope)
+    t.assert_eq(summary.planned_candidates, 1); t.assert_eq(summary.cached_accepted, 3)
+    t.assert_eq(summary.cached_rejected, 2); t.assert_eq(summary.cached_uncached, 8)
+    t.assert_eq(summary.proof_accepted, 0); t.assert_eq(summary.collect_accepted, 0)
+    summary.planned_candidates = 99
+    t.assert_eq(env.module.summary(env.spec.scope).planned_candidates, 1)
+    env:complete(2); env:complete(3)
+    summary = env.module.summary(env.spec.scope)
+    t.assert_eq(summary.proof_accepted, 1); t.assert_eq(summary.proof_rejected, 0)
+    t.assert_eq(summary.collect_accepted, 4)
+    t.assert_eq(summary.selector_reuse, "accepted")
+  end)
+
   t.it("最多两个worker，重复start复用队列", function()
     local env = fixture(5)
     t.assert_eq(env:count("worker"), 0)

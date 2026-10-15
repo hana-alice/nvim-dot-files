@@ -98,6 +98,61 @@ local function fixture(body)
 end
 
 t.describe("frozen batch startup runtime", function()
+  t.it("reports published, ready and attached batch TUs as separate stages", function()
+    fixture(function(h)
+      h.descriptor.published_batch_count = 2
+      h.prepare(); h.describe()
+      local snapshot = runtime.activation(h.ctx.paths.semantic_cdb)
+      t.assert_eq(snapshot.published_batch_count, 2); t.assert_false(snapshot.ready)
+      t.assert_eq(snapshot.client_batch_tu_count, 0)
+      h.validate()
+      snapshot = runtime.activation(h.ctx.paths.semantic_cdb)
+      t.assert_true(snapshot.ready); t.assert_eq(snapshot.client_batch_tu_count, 0)
+      local config = {}
+      runtime.configure_process(h.command, config)
+      local stopped = false
+      runtime.attach({ id = 891, config = config, attached_buffers = {},
+        request = function() return true, 1 end, is_stopped = function() return stopped end }, 0)
+      snapshot = runtime.activation(h.ctx.paths.semantic_cdb)
+      t.assert_eq(snapshot.batch_client_count, 1); t.assert_eq(snapshot.client_batch_tu_count, 2)
+      stopped = true
+      t.assert_eq(runtime.activation(h.ctx.paths.semantic_cdb).client_batch_tu_count, 0)
+    end)
+  end)
+
+  t.it("preserves a helper's explicit no-batch reason instead of mislabelling its descriptor", function()
+    fixture(function(h)
+      h.prepare(); h.calls[1].callback({ ok = false, reason = "no-verified-batches" }); h.flush()
+      local snapshot = runtime.activation(h.ctx.paths.semantic_cdb)
+      t.assert_eq(snapshot.reason, "no-verified-batches"); t.assert_false(snapshot.ready)
+      t.assert_eq(snapshot.client_batch_tu_count, 0)
+      t.assert_eq(#h.calls, 1); t.assert_eq(#h.roots, 1)
+    end)
+  end)
+
+  t.it("ignores unrelated direct asset siblings while keeping exact files and ancestor namespace protected", function()
+    fixture(function(h, root)
+      h.descriptor.watch_roots = { root .. "/input" }
+      h.descriptor.lookup_roots = { root .. "/output", root }
+      h.descriptor.exclude_roots = {}
+      h.descriptor.watched_files[#h.descriptor.watched_files + 1] = root .. "/output"
+      h.opts.probe_direct = function(callback) callback(true) end
+      h.prepare(); h.describe(); h.flush(); h.validate()
+      local output, ancestor
+      for _, watch in ipairs(h.watches) do
+        if watch.root == root .. "/output" then output = watch end
+        if watch.root == root then ancestor = watch end
+      end
+      t.assert_true(output ~= nil and ancestor ~= nil)
+      output.callback(nil, ".nvim-ue-watch-barrier-other-process.tmp", { action = 1, stream = "metadata", rename = true })
+      output.callback(nil, "proof-unfinished/pending.cpp", { action = 3, stream = "write" })
+      t.assert_true(runtime.activation(h.ctx.paths.semantic_cdb).ready, "unrelated producers must not revoke exact assets")
+      ancestor.callback(nil, "output", { action = 4, directory = true, stream = "metadata", rename = true })
+      t.assert_false(runtime.activation(h.ctx.paths.semantic_cdb).ready, "asset directory rename must revoke immediately")
+      h.flush()
+    end)
+  end)
+
   t.it("document preflight retains original before metadata work and revalidates after clean demand", function()
     fixture(function(h)
       local buffer = h.document(); h.edit(buffer)

@@ -61,9 +61,41 @@ with tempfile.TemporaryDirectory(prefix='background_batch_') as temporary:
             assert plan_path.stat().st_mtime_ns == stamp
             assert plan['entry_count'] == 6 and plan['counts']['shader_count'] == 1
             assert group['indexes'] == [0, 1, 2, 3] and 'entries' not in group
+            assert plan['plan_candidate_count'] == 1 and plan['proof_accepted_count'] == 0
+            assert plan['selector_reuse_status'] == 'zero-hit'
             assert pathlib.Path(group['store']).parent == store.parent / 'background-proofs'
             assert all(not options['verify_missing'] for _, _, options in calls)
             print('small deterministic plan and read-only discovery verified')
+        elif operation == 'recover_hints':
+            result_path = plan_path.parent / ('result-' + group['id'] + '.json')
+            result_path.write_text(json.dumps({'ok': True, 'group_id': group['id'],
+                'input_sha256': plan['input_sha256'], 'metrics': {'new_batch_count': 1}}), encoding='utf-8')
+            recovered = module.make_plan(source, store, 'clangd', previous_path=plan_path)
+            assert recovered['recovered_completed'] == [{'id': group['id'], 'accepted_hint': 1}]
+            module._write(plan_path, recovered)
+            # Historical ok has no admission power: absent current receipts retain all originals.
+            result = module.collect(plan_path, [group['id']], background, marker, 'clangd')
+            assert result['metrics']['batch_count'] == 0 and result['revalidated_completed'] == []
+            assert json.loads(background.read_text()) == entries
+            accepted_stores.add(group['store'])
+            pathlib.Path(group['store']).mkdir(exist_ok=True)
+            result = module.collect(plan_path, [group['id']], background, marker, 'clangd')
+            assert result['revalidated_completed'] == [group['id']]
+            assert result['metrics']['batch_count'] == 1
+            # Reuse can remove an old accepted group from ordinary candidates;
+            # recovery must still enter collect before any remaining proof work.
+            again = module.make_plan(source, store, 'clangd', previous_path=plan_path)
+            assert again['plan_candidate_count'] == 0
+            assert again['recovered_completed'] == [{'id': group['id'], 'accepted_hint': 1}]
+            assert again['groups'] == [group]
+            module._write(plan_path, again)
+            result = module.collect(plan_path, [group['id']], background, marker, 'clangd')
+            assert result['revalidated_completed'] == [group['id']]
+            assert result['metrics']['batch_count'] == 1
+            result_path.write_text(json.dumps({'ok': True, 'group_id': group['id'],
+                'input_sha256': 'stale', 'metrics': {'new_batch_count': 1}}), encoding='utf-8')
+            assert module.make_plan(source, store, 'clangd', previous_path=plan_path)['recovered_completed'] == []
+            print('historical hints require current input and independent receipt revalidation')
         elif operation == 'input_changed':
             before = (background.read_bytes(), marker.read_bytes())
             source.write_text(json.dumps(entries) + ' ', encoding='utf-8')
@@ -84,6 +116,9 @@ with tempfile.TemporaryDirectory(prefix='background_batch_') as temporary:
             assert options['max_group'] == 8 and options['max_sources'] == 80
             result = module.collect(plan_path, [group['id']], background, marker, 'clangd')
             assert result['metrics']['batch_count'] == 0
+            assert result['metrics']['collect_accepted_count'] == 0
+            assert result['observations']['plan_candidate_count'] == 1
+            assert result['observations']['selector_reuse_status'] == 'zero-hit'
             assert json.loads(background.read_text()) == entries
             assert json.loads(marker.read_text())['kept'] == 'original marker'
             print('binding rejection retains every exact, UBT and shader command')
@@ -92,9 +127,19 @@ with tempfile.TemporaryDirectory(prefix='background_batch_') as temporary:
             accepted_stores.add(group['store'])
             result = module.collect(plan_path, [group['id']], background, marker, 'clangd')
             assert result['metrics']['batch_count'] == 1 and result['metrics']['accepted_ubt_count'] == 4
+            assert result['metrics']['collect_accepted_count'] == 1
+            assert result['observations']['proof_accepted_count'] == 1
             published = json.loads(background.read_text())
             assert published[-2:] == [exact, shader] and len(published) == 3
             stamps = [path.stat().st_mtime_ns for path in (background, marker, module._catalog_path(store))]
+            # The generator persists the established eight count fields. Pure
+            # observations must not oscillate its marker against collect.
+            marker_value = json.loads(marker.read_text())
+            assert set(marker_value['verified_batches']) == {'original_ubt_count', 'exact_count', 'shader_count',
+                'other_count', 'batch_count', 'accepted_ubt_count', 'retained_ubt_count', 'output_entries'}
+            module.write_outputs_if_changed([(str(background), json.dumps(published)),
+                (str(marker), json.dumps(marker_value))])
+            assert stamps == [path.stat().st_mtime_ns for path in (background, marker, module._catalog_path(store))]
             result = module.collect(plan_path, [group['id']], background, marker, 'clangd')
             assert not result['changed']
             assert stamps == [path.stat().st_mtime_ns for path in (background, marker, module._catalog_path(store))]
@@ -164,6 +209,8 @@ with tempfile.TemporaryDirectory(prefix='background_batch_') as temporary:
             output, metrics = module.reuse_completed(entries, missing, 'clangd')
             assert output == entries and metrics['batch_count'] == 0
             assert not missing.exists() and not calls
+            assert metrics['proof_uncached_count'] == 1 and metrics['proof_rejected_count'] == 0
+            assert metrics['selector_reuse_status'] == 'zero-hit'
             print('missing advisory proof store remains read-only')
         elif operation in ('publication_failure', 'publication_shape'):
             request_path, result_path = root / 'publication-request.json', root / 'publication-result.json'
@@ -317,7 +364,7 @@ local function run_fixture(operation)
 end
 
 t.describe("后台独立二次批次工具", function()
-  for _, operation in ipairs({ "plan", "input_changed", "rejected", "reuse_noop", "overlap", "changed_during_collect", "profile", "rejected_generator_noop", "missing_store", "publication_failure", "publication_shape", "rollback", "owned_job" }) do
+  for _, operation in ipairs({ "plan", "recover_hints", "input_changed", "rejected", "reuse_noop", "overlap", "changed_during_collect", "profile", "rejected_generator_noop", "missing_store", "publication_failure", "publication_shape", "rollback", "owned_job" }) do
     t.it(operation, function()
       run_fixture(operation)
     end)

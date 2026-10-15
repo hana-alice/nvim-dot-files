@@ -40,6 +40,20 @@ local ok, result = xpcall(function()
   local manifest = assert(index.make_index_manifest(request.ctx, request.state, request.phase,
     request.marker, request.keys, request.opts))
   current()
+  request.state.index_artifacts[request.phase] = manifest
+  local selection = index.select_active_artifact(request.state, generation)
+  assert(selection, "publication selection failed")
+  local promoted, publication
+  if request.defer_append then
+    index._defer_append = true
+    promoted, publication = index.publish_semantic_cdb(request.ctx, request.state, generation)
+    assert(promoted, tostring(publication))
+    if publication.deferred then
+      return { ok = true, publication = publication, generation = generation }
+    end
+    -- Preflight must not move a frozen/non-additive CDB ahead of its manifest.
+    index._defer_append, promoted = nil, nil
+  end
   local path = request.marker .. ".manifest.json"
   local previous
   if vim.uv.fs_stat(path) then
@@ -47,10 +61,7 @@ local ok, result = xpcall(function()
     if readable then previous = value end
   end
   if not vim.deep_equal(previous, manifest) then write(path, manifest) end
-  request.state.index_artifacts[request.phase] = manifest
-  local selection = index.select_active_artifact(request.state, generation)
-  assert(selection, "publication selection failed")
-  local promoted, publication = index.publish_semantic_cdb(request.ctx, request.state, generation)
+  if not promoted then promoted, publication = index.publish_semantic_cdb(request.ctx, request.state, generation) end
   assert(promoted, tostring(publication))
   current()
   return { ok = true, manifest = manifest, generation = generation, selection = selection,

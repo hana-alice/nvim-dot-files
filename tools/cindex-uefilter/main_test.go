@@ -314,6 +314,87 @@ func TestIncrementalAddKeepsSiblingsSharingAPathPrefix(t *testing.T) {
 	}
 }
 
+func TestIncrementalSameSizeAndMtimeReplacesContent(t *testing.T) {
+	tempDir := t.TempDir()
+	indexPath := filepath.Join(tempDir, "same-stat.idx")
+	source := filepath.Join(tempDir, "same.cpp")
+	list := filepath.Join(tempDir, "files.list")
+	writeFile(t, source, "old-token-aaa\n")
+	writeListFile(t, list, source)
+	runTool(t, indexPath, "-reset", "-files-from", list)
+	before, err := os.Stat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, source, "new-token-bbb\n")
+	if err := os.Chtimes(source, before.ModTime(), before.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	runTool(t, indexPath, "-files-from", list)
+	ix, err := openRawIndex(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := trigramNames(ix, "old"); len(got) != 0 {
+		t.Fatalf("old trigrams retained: %v", got)
+	}
+	if got := trigramNames(ix, "new"); !reflect.DeepEqual(got, []string{source}) {
+		t.Fatalf("new trigrams missing: %v", got)
+	}
+}
+
+func TestIncrementalMissingListedFileFailsWithoutPublishing(t *testing.T) {
+	tempDir := t.TempDir()
+	indexPath := filepath.Join(tempDir, "partial.idx")
+	source := filepath.Join(tempDir, "keep.cpp")
+	list := filepath.Join(tempDir, "files.list")
+	writeFile(t, source, "old-token-aaa\n")
+	writeListFile(t, list, source)
+	runTool(t, indexPath, "-reset", "-files-from", list)
+	before, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, source, "new-token-bbb\n")
+	writeListFile(t, list, source, filepath.Join(tempDir, "missing.cpp"))
+	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess", "--", "-files-from", list)
+	cmd.Env = append(os.Environ(), "GO_WANT_CINDEX_UEFILTER_HELPER=1", "CSEARCHINDEX="+indexPath)
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("partial input published with success:\n%s", output)
+	}
+	after, readErr := os.ReadFile(indexPath)
+	if readErr != nil || !bytes.Equal(before, after) {
+		t.Fatalf("failed incremental changed published index: %v", readErr)
+	}
+}
+
+func TestIncrementalRejectedContentFailsWithoutPublishing(t *testing.T) {
+	tempDir := t.TempDir()
+	indexPath := filepath.Join(tempDir, "rejected.idx")
+	source := filepath.Join(tempDir, "keep.cpp")
+	list := filepath.Join(tempDir, "files.list")
+	writeFile(t, source, "old-token-aaa\n")
+	writeListFile(t, list, source)
+	runTool(t, indexPath, "-reset", "-files-from", list)
+	before, err := os.ReadFile(indexPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// codesearch silently rejects a line longer than 2000 bytes in AddFile.
+	writeFile(t, source, strings.Repeat("x", 2001)+"\n")
+	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess", "--", "-files-from", list)
+	cmd.Env = append(os.Environ(), "GO_WANT_CINDEX_UEFILTER_HELPER=1", "CSEARCHINDEX="+indexPath)
+	output, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "incomplete staged index") {
+		t.Fatalf("rejected content reported success: %v\n%s", err, output)
+	}
+	after, readErr := os.ReadFile(indexPath)
+	if readErr != nil || !bytes.Equal(before, after) {
+		t.Fatalf("failed incremental changed published index: %v", readErr)
+	}
+}
+
 // -delete-from removes vanished files from the index without a full reset.
 func TestDeleteFromRemovesOnlyListedFiles(t *testing.T) {
 	tempDir := t.TempDir()

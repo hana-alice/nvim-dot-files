@@ -103,6 +103,9 @@ with tempfile.TemporaryDirectory(prefix='batch_store_') as temporary:
              patch.object(subprocess, 'Popen', generator_only):
             code = generators[name].main()
         assert code == 0, captured.getvalue()
+        if selected_store is not None:
+            assert 'external-selector reuse=' + last_metrics[-1]['selector_reuse_status'] in captured.getvalue()
+            assert 'policy=reuse-only; originals retained for unmatched groups' in captured.getvalue()
         return output, marker, json.loads(output.read_text())
 
     # Exercise both complete generator pipelines before qualifying their real wrappers.

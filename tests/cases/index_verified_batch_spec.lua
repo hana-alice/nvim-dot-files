@@ -753,6 +753,7 @@ module._write(root / 'snapshot.h', b'certified snapshot bytes')
         assert len(proof_assets) == 2
         record = json.loads(next((root / 'proofs/receipts').glob('*.json')).read_text())
         assert all(asset in record['assets'] for asset in proof_assets)
+        assert all(pathlib.Path(asset['path']).parent == root / 'proofs/assets' for asset in proof_assets)
         proof = json.loads(pathlib.Path(proof_assets[1]['path']).read_text())
         assert proof['ok'] is True
         assert proof['evidence']['entries'] == receipt['effective_entries'] + [receipt['effective_candidate']]
@@ -837,6 +838,10 @@ module._write(root / 'snapshot.h', b'certified snapshot bytes')
         assert deferred['groups'][0]['reason'] == 'verification-not-cached', deferred
     elif operation == 'pass':
         assert len(output) == 3 and metrics['batch_count'] == 1, metrics
+        work = pathlib.Path(metrics['proof_directory'])
+        assert work.parent == module._proof_work_root(root / 'proofs')
+        assert not work.is_relative_to(root / 'proofs'), 'mutable proof must leave frozen asset ancestors'
+        assert metrics['proof_accepted_count'] == 1 and metrics['proof_rejected_count'] == 0
         batch = output[0]
         assert batch['nvim_ue_batch_receipt_sha256'] == module._sha(pathlib.Path(batch['nvim_ue_batch_receipt']).read_bytes())
         assert batch['nvim_ue_batch_ubt_count'] == 2
@@ -849,14 +854,28 @@ module._write(root / 'snapshot.h', b'certified snapshot bytes')
         assert again == output and repeat['batch_count'] == 1, repeat
         assert before == {str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
         assert repeat['baseline_cache_reused'] is True and repeat['cache_hits'] == 1
+        assert repeat['proof_directory'] is None and repeat['new_proof_count'] == 0
         record = json.loads(next((root / 'proofs/receipts').glob('*.json')).read_text())
         excluded = (root / 'proofs').resolve()
         assert module._cache_valid(record, excluded, {})
         receipts = [batch['nvim_ue_batch_receipt']]
         described = module.describe_receipts(receipts)
-        assert described['ok'] and described['watch_roots'] and str(excluded) in described['exclude_roots']
+        assert described['ok'] and described['watch_roots'] and described['exclude_roots'] == []
         validated = module.validate_receipts(receipts, clangd)
         assert validated['ok'] and validated['validation_seconds'] >= 0, validated
+        replay_before = {str(path): (path.read_bytes(), path.stat().st_mtime_ns)
+                         for path in work.rglob('*') if path.is_file()}
+        replay = module.replay_proof(entries[:2], work / 'group-0', clangd, timeout=30)
+        assert replay['diagnostic_only'] and not replay['freshness_proven'], replay
+        assert pathlib.Path(replay['evidence_dir']).parent == module._proof_work_root(work / 'group-0')
+        assert replay_before == {str(path): (path.read_bytes(), path.stat().st_mtime_ns)
+                                  for path in work.rglob('*') if path.is_file()}, 'diagnostic replay mutated historical proof'
+        incomplete = work.parent / 'incomplete-next-proof'
+        incomplete.mkdir()
+        (incomplete / 'query.stdout.log').write_text('mutable next qualification')
+        assert module._cache_valid(record, excluded, {}), 'next proof scratch must not change receipt inputs'
+        assert not any(work == pathlib.Path(path) or pathlib.Path(path) in work.parents
+                       for path in described['watch_roots']), 'source inventory watches must not cover proof scratch'
         request_path, response_path = root / 'proofs/request.json', root / 'proofs/response.json'
         request_path.write_text(json.dumps(receipts), encoding='utf-8')
         for action in ('--describe-receipts', '--validate-receipts'):

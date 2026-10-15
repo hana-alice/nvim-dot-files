@@ -23,11 +23,11 @@ from clangd_batch_bindings import (
 )
 
 
-def _include_alias(including, spelling, included):
+def _include_alias(including, spelling, included, lookup=None):
     """Reproduce VFS's mixed-slash parent lookup, with a compiler-selected target."""
     if ntpath.isabs(spelling) or '..' not in spelling.replace('\\', '/').split('/'):
         return None
-    lookup = ntpath.dirname(including) + '/' + spelling
+    lookup = lookup if lookup is not None else ntpath.dirname(including) + '/' + spelling
     separators = [position for position in (lookup.find('/'), lookup.find('\\')) if position >= 0]
     if not separators or lookup[min(separators)] != '/':
         return None
@@ -124,21 +124,29 @@ def collect_aliases(entries, libclang_path, resource_dir=None):
                         record = {'entry_index': number, 'including': including,
                                   'line': line.value, 'spelling': spelling, 'included': included}
                         evidence['include_records'].append(record)
-                        alias = _include_alias(including, spelling, included)
-                        if alias:
+                        # FileManager can retain a mixed-separator lookup in
+                        # the selected file name (e.g. More\\../../X.h). Its
+                        # POSIX normalization differs from the synthesized
+                        # includer path, especially for multiple parent hops.
+                        for lookup in (None, included):
+                            alias = _include_alias(including, spelling, included, lookup)
+                            if not alias:
+                                continue
                             key = ntpath.normcase(alias['alias'])
                             previous = aliases.get(key)
                             if previous and ntpath.normcase(previous['target']) != ntpath.normcase(alias['target']):
                                 raise ValueError('alias-target-collision: ' + alias['alias'])
                             aliases[key] = alias
                             record['alias'] = alias
-                            # Native directory remapping also handles a '\\..'
-                            # component left unnormalized by POSIX lookup. Its
-                            # external FS must be the closed snapshot layer.
-                            parent_path = Path(including).resolve(strict=True).parent
-                            parent_name = str(parent_path)
-                            directory_aliases[ntpath.normcase(parent_name)] = {
-                                'alias': parent_name, 'target': parent_name}
+                        # The includer directory needs native Windows lookup
+                        # even when dot-normalization produces no file alias.
+                        # A mixed '\\../' lookup can otherwise miss a frozen
+                        # sibling. The caller verifies this parent and routes
+                        # it through the closed snapshot, never the live FS.
+                        parent_path = Path(including).resolve(strict=True).parent
+                        parent_name = str(parent_path)
+                        directory_aliases[ntpath.normcase(parent_name)] = {
+                            'alias': parent_name, 'target': parent_name}
                         return 1
                     except (AttributeError, OSError, ValueError, TypeError) as error:
                         callback_errors.append(str(error))
@@ -158,7 +166,7 @@ def collect_aliases(entries, libclang_path, resource_dir=None):
     finally:
         api.lib.clang_disposeIndex(index)
         os.chdir(previous_cwd)
-    return finish(True, 'collected' if aliases else 'no-aliases')
+    return finish(True, 'collected' if aliases or directory_aliases else 'no-aliases')
 
 
 def main():

@@ -9,7 +9,7 @@ import sys
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cdb_verified_batch import describe_receipts, validate_receipts
+from cdb_verified_batch import describe_receipts, validate_receipts, _COLLECTOR_FILES, _POLICY_FILES
 
 
 def _covers(parent, path):
@@ -171,13 +171,13 @@ def activate(info_path, clangd_path, validate=False, server_profile=None):
         if len(tool_paths) != 1:
             raise ValueError('conflicting-certified-clangd-paths')
         result['tool_path'] = next(iter(tool_paths))
-        watched.update(Path(__file__).resolve().parent / name for name in (
-            'cdb_verified_batch.py', 'clangd_batch_runner.py', 'clangd_index_graph.py',
-            'clangd_batch_admission.py', 'clangd_batch_bindings.py', 'clangd_query_profile.py',
-            'build_hot_super_unity_cdb.py'))
+        watched.update((Path(__file__).resolve().parent / name).resolve()
+                       for name in _COLLECTOR_FILES + _POLICY_FILES)
         roots = {Path(root).resolve() for root in result['watch_roots']}
         roots.update(Path(root).resolve() for root in result.get('query_search_roots', []))
-        roots.update(path.parent for path in watched)
+        # Only include lookup inventories need recursive membership watches.
+        # Certified tools and immutable assets need exact-file content watches
+        # plus direct namespace subscriptions, not their producer's whole tree.
         bases = [Path(path).resolve() for path in info.get('watch_bases', []) if path]
         collapsed = set()
         for root in roots:
@@ -188,7 +188,7 @@ def activate(info_path, clangd_path, validate=False, server_profile=None):
             if not any(_covers(parent, root) for parent in minimal):
                 minimal.append(root)
         lookup_roots, lookup_files = _lookup_watches(result.get('query_driver_search_roots', []),
-            result.get('query_driver_files', []), minimal)
+            list(result.get('query_driver_files', [])) + list(map(str, watched)), minimal)
         watched.update(lookup_files)
         # An ancestor rename/delete must revoke its watched descendants too.
         for path in list(watched):
@@ -202,6 +202,7 @@ def activate(info_path, clangd_path, validate=False, server_profile=None):
                       verified_cdb=str(frozen), original_cdb=str(original),
                       receipts=list(map(str, receipt_paths)), info_sha256=hashlib.sha256(info_bytes).hexdigest(),
                       generation_id=info['generation_id'])
+        result['published_batch_count'] = len(set(receipt_paths))
         result['exclude_roots'] = sorted(set(result['exclude_roots']) | {
             str(frozen.parent / '.cache'), str(original.parent / '.cache'),
             str(frozen.parent.parent.parent / 'frozen-cache')})

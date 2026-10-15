@@ -22,6 +22,23 @@ local function transport()
 end
 
 t.describe("grouped native input transport", function()
+  t.it("fans an overflow out to other subscriptions, so callback root is not its origin", function()
+    local group, _, _, _, _, frame = transport()
+    local roots = {}
+    for _, entry in ipairs({ { "C:/fixture/source", true }, { "C:/fixture/lookup", false } }) do
+      group:watch(entry[1], function(err, _, event)
+        t.assert_contains(err, "overflow")
+        t.assert_true(event.unknown)
+        roots[#roots + 1] = entry[1]
+      end, { recursive = entry[2], on_ready = function() end })
+    end
+    frame(1, "ready"); frame(2, "ready"); frame(2, "overflow")
+    t.assert_eq(group.phase, "error")
+    t.assert_eq(roots[1], "C:/fixture/source", "first callback is different from overflowing root_id=2")
+    t.assert_eq(roots[2], "C:/fixture/lookup")
+    group:close()
+  end)
+
   t.it("sends bounded roots through stdin and retains early readiness", function()
     local group, _, _, stopped, sent, frame = transport()
     local config = vim.json.decode(sent[1][2])

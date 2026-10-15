@@ -82,11 +82,42 @@ function M.run(ctx, progress, on_done, opts)
     local function complete()
       if completed then return end
       completed = true
-      locks.release(lease)
+      local lease_released = locks.release(lease)
       local migrated = result and result.cache_migration and (result.cache_migration.migrated or 0) > 0
-      if ok and result and (result.changed or migrated) then
-        local refresh = migrated and vim.tbl_extend("force", result, { changed = true, cdb_changed = result.changed }) or result
-        pcall(opts.on_committed or require("ue.cdb.pipeline").committed, refresh, ctx)
+      if ok then
+        result = result or {}
+        result.committed, result.delivered = true, nil
+        result.writer_lease_released = lease_released
+        result.delivery_status = "unchanged"
+        if result.changed or migrated then
+          local refresh = migrated and vim.tbl_extend("force", result, { changed = true, cdb_changed = result.changed }) or result
+          local refreshed, accepted, refresh_err = pcall(function()
+            return (opts.on_committed or require("ue.cdb.pipeline").committed)(refresh, ctx)
+          end)
+          result.delivery_status = "refresh-requested"
+          if not refreshed or accepted == false then
+            ok, result.ok, result.delivered = false, false, false
+            result.delivery_status = "refresh-failed"
+            result.delivery_error = tostring(refreshed and (refresh_err or "reader refresh rejected") or accepted)
+            message = "CDB committed; reader refresh failed: " .. result.delivery_error
+            -- Persist the undelivered revision with the existing index owner.
+            -- It retries through normal admission, writer leases and attachment
+            -- acknowledgement; never roll committed bytes back or retry a raw restart.
+            local recovered, recovery_err = pcall(function()
+              assert(lease_released, "CDB writer lease not released: " .. lease.path)
+              local index = require("ue.index")
+              assert(index.source_observation_unknown(ctx, "cdb-reader-refresh-failed"), "recovery owner rejected refresh")
+              -- Do not acknowledge prepare_observer.prepared on this failure.
+              index.schedule_index_phase(ctx, "current", 50)
+            end)
+            result.recovery_scheduled = recovered
+            if not recovered then
+              result.recovery_error = tostring(recovery_err)
+              message = message .. "; recovery scheduling failed: " .. result.recovery_error
+            end
+            pcall(function() require("utils.log").notify_error("ue.cdb.transaction", message) end)
+          end
+        end
       end
       on_done(ok, message or active, result)
     end

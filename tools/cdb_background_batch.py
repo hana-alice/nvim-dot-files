@@ -130,6 +130,10 @@ def _merge_metrics(entries, legacy, replacements, claimed, records):
         deferred_group_count=sum(bool(record.get('deferred')) for record in records),
         new_proof_count=0, new_batch_count=0, proof_directory=None,
         baseline_cache_reused=bool(replacements))
+    result.update(proof_accepted_count=sum(bool(record.get('accepted')) for record in records),
+        proof_rejected_count=sum(not record.get('accepted') and not record.get('deferred') for record in records),
+        proof_uncached_count=sum(record.get('reason') == 'verification-not-cached' for record in records),
+        selector_reuse_status='accepted' if replacements else 'zero-hit')
     return result
 
 
@@ -172,7 +176,58 @@ def reuse_completed(entries, legacy_store, clangd, server_profile=None):
     return output, metrics
 
 
-def make_plan(source, store, clangd, profile=None):
+def _pending_result_hints(previous_path, plan, entries):
+    """Old worker outputs are discovery hints only; collect revalidates receipts."""
+    if previous_path is None:
+        return []
+    previous_path = Path(previous_path)
+    try:
+        previous = json.loads(previous_path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return []
+    if (not isinstance(previous, dict) or not isinstance(previous.get('groups'), list)
+            or previous.get('schema') != 1 or previous.get('input_sha256') != plan['input_sha256']
+            or previous.get('server_profile') != plan['server_profile']):
+        return []
+    current_groups = {group['id']: group for group in plan['groups']}
+    hints = []
+    seen = set()
+    for group in previous['groups']:
+        if not isinstance(group, dict) or not isinstance(group.get('id'), str):
+            continue
+        identity = group['id']
+        if identity in seen or (identity in current_groups and current_groups[identity] != group):
+            continue
+        seen.add(identity)
+        try:
+            # Validate the old group's indexes/store against CURRENT source bytes.
+            # A valid cached group may disappear from the new work plan after reuse.
+            _group(dict(plan, groups=[group]), entries, identity)
+            if type(group.get('ubt_count')) is not int or group['ubt_count'] != len(group['indexes']):
+                continue
+        except (KeyError, TypeError, ValueError):
+            continue
+        path = previous_path.parent / ('result-' + identity + '.json')
+        try:
+            if path.stat().st_size > 4194304:
+                continue
+            result = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(result, dict) or not isinstance(result.get('metrics'), dict):
+            continue
+        count = result['metrics'].get('new_batch_count', 0)
+        if (result.get('ok') is True and result.get('group_id') == identity
+                and result.get('input_sha256') == plan['input_sha256']
+                and type(count) is int and 0 < count <= group['ubt_count']):
+            if identity not in current_groups:
+                plan['groups'].append(group)
+                current_groups[identity] = group
+            hints.append({'id': identity, 'accepted_hint': count})
+    return hints
+
+
+def make_plan(source, store, clangd, profile=None, previous_path=None):
     source, store = Path(source).resolve(), Path(store).resolve()
     entries, digest = _read_source(source)
     output, metrics = reuse_completed(entries, store, clangd, profile)
@@ -190,11 +245,18 @@ def make_plan(source, store, clangd, profile=None):
             'member_count': sum(len(entry['nvim_ue_members']) for entry in selected)})
     groups.sort(key=lambda group: (group['member_count'], group['ubt_count'], group['indexes'][0]))
     _read_source(source, digest)
-    return {'schema': 1, 'input_path': str(source), 'input_sha256': digest,
+    plan = {'schema': 1, 'input_path': str(source), 'input_sha256': digest,
         'legacy_store': str(store), 'server_profile': profile,
         'entry_count': len(entries), 'counts': {key: metrics[key] for key in (
             'original_ubt_count', 'exact_count', 'shader_count', 'other_count')},
-        'legacy_batch_count': metrics['batch_count'], 'groups': groups}
+        'legacy_batch_count': metrics['batch_count'], 'groups': groups,
+        'plan_candidate_count': len(groups),
+        'proof_accepted_count': metrics['proof_accepted_count'],
+        'proof_rejected_count': metrics['proof_rejected_count'],
+        'proof_uncached_count': metrics['proof_uncached_count'],
+        'selector_reuse_status': metrics['selector_reuse_status']}
+    plan['recovered_completed'] = _pending_result_hints(previous_path, plan, entries)
+    return plan
 
 
 def _load_plan(path, profile):
@@ -293,9 +355,12 @@ def collect(plan_path, completed, background, marker_path, clangd, profile=None,
     replacements, consumed, claimed = _replacements(entries, output, legacy)
     records = list(legacy['groups'])
     catalog = {group['id']: group for group in _catalog(plan['legacy_store']) if isinstance(group, dict) and 'id' in group}
+    revalidated = []
     for identity in dict.fromkeys(completed):
         group, selected = _group(plan, entries, identity)
         if claimed.intersection(group['indexes']):
+            if set(group['indexes']).issubset(claimed):
+                revalidated.append(identity)
             continue  # Never overlay a legacy proof or split an admitted group.
         output, metrics = _cache_only(selected, group['store'], clangd, profile)
         local_replacements, local_consumed, local_claimed = _replacements(selected, output, metrics)
@@ -303,6 +368,7 @@ def collect(plan_path, completed, background, marker_path, clangd, profile=None,
         consumed.update(group['indexes'][index] for index in local_consumed)
         claimed.update(group['indexes'][index] for index in local_claimed)
         if local_replacements:
+            revalidated.append(identity)
             catalog[identity] = {'id': identity, 'store': group['store'],
                 'entry_hashes': [_sha(_json(entry).encode('utf-8')) for entry in selected]}
         records.extend(dict(record, original_indexes=[group['indexes'][index]
@@ -311,12 +377,16 @@ def collect(plan_path, completed, background, marker_path, clangd, profile=None,
     metrics = _merge_metrics(entries, legacy, replacements, claimed, records)
     summary = {key: metrics[key] for key in ('original_ubt_count', 'exact_count', 'shader_count',
         'other_count', 'batch_count', 'accepted_ubt_count', 'retained_ubt_count', 'output_entries')}
+    marker_summary = dict(summary)
+    # This is admission by collect, distinct from planned/proven groups and
+    # frozen activation or the translation units a client actually indexes.
+    summary['collect_accepted_count'] = metrics['batch_count']
     marker = json.loads(Path(marker_path).read_text(encoding='utf-8'))
     marker.update(entry_count=len(output),
         native_background_entry_count=sum(entry.get('nvim_ue_background_route') != 'shader-compatibility'
             for entry in output),
         unity_entry_count=sum('super_unity_cpps' in str(entry.get('file', '')).replace('\\', '/')
-            for entry in entries), verified_batches=summary)
+            for entry in entries), verified_batches=marker_summary)
     _read_source(plan['input_path'], plan['input_sha256'])
     catalog_value = {'schema': 1, 'groups': [catalog[key] for key in sorted(catalog)]}
     background_content, background_changed = _publication_content(background, output)
@@ -324,7 +394,12 @@ def collect(plan_path, completed, background, marker_path, clangd, profile=None,
     write_outputs_if_changed([(str(background), background_content), (str(marker_path), marker_content),
         (str(_catalog_path(plan['legacy_store'])), _json(catalog_value))])
     result = {'ok': True, 'changed': background_changed or marker_changed, 'metrics': summary, 'groups': records,
+        'revalidated_completed': revalidated,
         'completed_at': time.time(), 'input_sha256': plan['input_sha256']}
+    result['observations'] = {key: metrics[key] for key in ('proof_accepted_count',
+        'proof_rejected_count', 'proof_uncached_count', 'selector_reuse_status')}
+    result['observations'].update(plan_candidate_count=plan.get('plan_candidate_count', len(plan['groups'])),
+        collect_accepted_count=metrics['batch_count'])
     if publish_request:
         request = json.loads(Path(publish_request).read_text(encoding='utf-8'))
         publication_result = Path(request['publication_result'])
@@ -370,7 +445,7 @@ def main():
         if args.plan:
             if not args.store:
                 raise ValueError('background-proof-store-required')
-            result = make_plan(args.plan, args.store, args.clangd, args.server_profile)
+            result = make_plan(args.plan, args.store, args.clangd, args.server_profile, args.out)
         elif args.worker:
             if not args.group:
                 raise ValueError('background-proof-group-required')

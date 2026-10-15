@@ -383,6 +383,11 @@ def main():
                 background_cdb, batch_metrics = accelerate(
                     semantic_cdb, store, args.clangd, max_group=args.batch_size, verify_missing=not args.reuse_verified_only,
                     server_profile=args.server_profile, max_new_groups=args.batch_proof_limit)
+            if args.verified_batch_store is not None:
+                print('[verified-batch] external-selector reuse=' + batch_metrics['selector_reuse_status']
+                      + ' accepted=' + str(batch_metrics['batch_count'])
+                      + ' uncached=' + str(batch_metrics['proof_uncached_count'])
+                      + ' policy=reuse-only; originals retained for unmatched groups')
         marker = {
             "schema": 1,
             "index_kind": "controlled-background",

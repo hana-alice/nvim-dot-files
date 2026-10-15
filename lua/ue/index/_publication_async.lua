@@ -45,7 +45,8 @@ return function(M, core)
       end
     end
     local request = { schema = 1, ctx = ctx, state = state, phase = phase, marker = marker,
-      keys = keys, opts = opts, signatures = signatures, output = output_path }
+      keys = keys, opts = opts, signatures = signatures, output = output_path,
+      defer_append = phase ~= "current" and M.phase_barrier_pending and M.phase_barrier_pending(ctx) or false }
     local function cleanup()
       active[request_path] = nil
       uv.fs_unlink(request_path)
@@ -63,32 +64,48 @@ return function(M, core)
     end
     local record = { cleanup = cleanup }
     active[request_path] = record
-    local spawned, process = pcall(vim.system,
-      { vim.v.progpath, "--headless", "-u", "NONE", "-i", "NONE", "-l", worker, request_path },
-      { text = true, timeout = 120000, env = { NVIM_INDEX_WORKER = "1" } }, function(result)
-        vim.schedule(function()
-          if active[request_path] ~= record then cleanup(); return end
-          local data = core.h.read_json_file(output_path, nil)
-          if result.code ~= 0 or type(data) ~= "table" or data.ok ~= true then
-            done("publication worker failed: " .. tostring(data and data.reason or result.stderr or result.code)); return
-          end
-          local lease = opts.lease
-          local owner = lease and require("ue.file_lock").owner(lease.path)
-          if not owner or owner.pid ~= opts.owner_pid or owner.token ~= lease.token then
-            done("publication lease changed before delivery"); return
-          end
-          for path, before in pairs(signatures) do
-            if not vim.deep_equal(before, identity(path)) then done("publication input changed: " .. path); return end
-          end
-          if core.h.accept_verified_cdb_digest and data.generation then
-            if not core.h.accept_verified_cdb_digest(opts.base_cdb_path, data.generation.cdb_digest,
-              signatures[opts.base_cdb_path]) then done("publication digest identity changed before delivery"); return end
-          end
-          done(nil, data)
+    local spawn
+    spawn = function()
+      local spawned, process = pcall(vim.system,
+        { vim.v.progpath, "--headless", "-u", "NONE", "-i", "NONE", "-l", worker, request_path },
+        { text = true, timeout = 120000, env = { NVIM_INDEX_WORKER = "1" } }, function(result)
+          vim.schedule(function()
+            if active[request_path] ~= record then cleanup(); return end
+            local data = core.h.read_json_file(output_path, nil)
+            if result.code ~= 0 or type(data) ~= "table" or data.ok ~= true then
+              done("publication worker failed: " .. tostring(data and data.reason or result.stderr or result.code)); return
+            end
+            local lease = opts.lease
+            local owner = lease and require("ue.file_lock").owner(lease.path)
+            if not owner or owner.pid ~= opts.owner_pid or owner.token ~= lease.token then
+              done("publication lease changed before delivery"); return
+            end
+            for path, before in pairs(signatures) do
+              if not vim.deep_equal(before, identity(path)) then done("publication input changed: " .. path); return end
+            end
+            if core.h.accept_verified_cdb_digest and data.generation then
+              if not core.h.accept_verified_cdb_digest(opts.base_cdb_path, data.generation.cdb_digest,
+                signatures[opts.base_cdb_path]) then done("publication digest identity changed before delivery"); return end
+            end
+            if data.publication and data.publication.deferred then
+              record.process = nil
+              M.wait_phase_publication(ctx, function()
+                if active[request_path] ~= record then return end
+                request.defer_append = false
+                local written, failure = core.h.write_json_file(request_path, request)
+                if not written then done("publication retry request failed: " .. tostring(failure)); return end
+                local started, retry_error = spawn()
+                if not started then done(retry_error) end
+              end)
+              return
+            end
+            done(nil, data)
+          end)
         end)
-      end)
-    if not spawned or not process then cleanup(); return false, "publication worker spawn failed: " .. tostring(process) end
-    record.process = process
-    return true
+      if not spawned or not process then cleanup(); return false, "publication worker spawn failed: " .. tostring(process) end
+      record.process = process
+      return true
+    end
+    return spawn()
   end
 end

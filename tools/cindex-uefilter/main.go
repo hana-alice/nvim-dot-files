@@ -98,9 +98,13 @@ func readFilesFromList(name string) ([]string, int, error) {
 			continue
 		}
 		info, statErr := os.Stat(path)
-		if statErr != nil || info.IsDir() {
+		if statErr != nil {
 			skipped++
-			continue
+			return nil, skipped, fmt.Errorf("stat listed file %s: %w", path, statErr)
+		}
+		if !info.Mode().IsRegular() {
+			skipped++
+			return nil, skipped, fmt.Errorf("listed path is not a regular file: %s", path)
 		}
 		if _, ok := seen[path]; ok {
 			continue
@@ -247,6 +251,7 @@ func main() {
 
 	ix := index.Create(file)
 	ix.Verbose = *verboseFlag
+	var requiredFiles []string
 
 	// ─── -files-from mode ───────────────────────────
 	if *filesFromFlag != "" {
@@ -280,6 +285,7 @@ func main() {
 			}
 			ix.AddPaths(roots)
 			files = toIndex
+			requiredFiles = files
 		}
 
 		log.Printf("indexing from %s", *filesFromFlag)
@@ -339,6 +345,14 @@ func main() {
 
 	log.Printf("flush index")
 	ix.Flush()
+	// AddFile reports read/text-policy failures only through logging. A delta
+	// must not publish or authorize a baseline advance after silently omitting
+	// a requested file. Reset keeps the upstream non-text exclusion policy.
+	if len(requiredFiles) > 0 {
+		if err := verifyStagedFiles(file, requiredFiles); err != nil {
+			log.Fatal(err)
+		}
+	}
 
 	if !*resetFlag {
 		merged := file + "~"

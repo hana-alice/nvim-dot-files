@@ -6,7 +6,7 @@ local options, session, records, attached, queued = nil, nil, {}, {}, {}
 local owned_directories = {}
 local generation = 0
 local FILEFORMATS = { unix = true, dos = true, mac = true }
-M.REVISION = "ide-edit-recovery-2026-10-03"
+M.REVISION = "ide-edit-recovery-read-errors-2026-10-14"
 
 local function probe(key, data)
   pcall(function()
@@ -205,7 +205,8 @@ local function read_async(path, done)
             return scheduled(done, nil, tostring(read_err))
           end
           vim.schedule(function()
-            done(decode(raw, path))
+            local record, decode_err = decode(raw, path)
+            done(record, decode_err, decode_err and "invalid" or nil)
           end)
         end)
       end)
@@ -379,10 +380,30 @@ function M.list(done, opts)
   done = done or function() end
   local paths, result = {}, {}
   local selected = project()
-  local metadata = { truncated = false }
+  local scan_root = opts.all and root() or vim.fs.joinpath(root(), vim.fn.sha256(selected):sub(1, 24))
+  local metadata = { truncated = false, errors = {}, error_count = 0, state = "complete" }
+  local first_error
+  local function failed(stage, err, invalid)
+    local reason = tostring(err):gsub("%c", " "):sub(1, 160)
+    metadata.error_count = metadata.error_count + 1
+    if #metadata.errors < 8 then
+      metadata.errors[#metadata.errors + 1] = { stage = stage, reason = reason }
+    end
+    -- Known-invalid snapshots remain excluded, as before. Actual I/O failures
+    -- additionally use the callback error; both remain visible in metadata/UI.
+    if not invalid then
+      first_error = first_error or reason
+    end
+  end
   local function visit(path, depth, finish)
-    uv.fs_scandir(path, function(_, request)
-      if not request then
+    uv.fs_scandir(path, function(err, request)
+      if err or not request then
+        local code = tostring(err):match("^([A-Z][A-Z0-9_]*):") or tostring(err)
+        if path == scan_root and code == "ENOENT" then
+          metadata.empty_store = true
+        else
+          failed("scan", err or "recovery directory cannot be read")
+        end
         return scheduled(finish)
       end
       local entries = {}
@@ -461,7 +482,6 @@ function M.list(done, opts)
       order_entries()
     end)
   end
-  local scan_root = opts.all and root() or vim.fs.joinpath(root(), vim.fn.sha256(selected):sub(1, 24))
   visit(scan_root, opts.all and 0 or 1, function()
     local index = 0
     local function next_record()
@@ -471,9 +491,18 @@ function M.list(done, opts)
         table.sort(result, function(a, b)
           return (a.at or 0) > (b.at or 0)
         end)
-        return done(result, nil, metadata)
+        if metadata.error_count > 0 then
+          metadata.state = #result > 0 and "partial" or "unavailable"
+          probe("read-failed", { state = "failed", reason = metadata.errors[1].reason, count = metadata.error_count })
+        elseif metadata.truncated then
+          metadata.state = "partial"
+        end
+        return scheduled(done, result, first_error, metadata) -- may be reached from a uv callback (fast event)
       end
-      read_async(path, function(record)
+      read_async(path, function(record, read_err, kind)
+        if read_err then
+          failed("read", read_err, kind == "invalid")
+        end
         if record and (opts.all or record.project == selected) then
           uv.fs_stat(vim.fs.joinpath(vim.fs.dirname(path), "closed"), function(_, closed)
             local alive, alive_err = uv.kill(record.pid, 0)
@@ -570,11 +599,21 @@ function M.restore(value)
 end
 
 function M.open(all)
-  M.list(function(items, _, metadata)
+  M.list(function(items, err, metadata)
+    local incomplete = err or (metadata and metadata.error_count > 0)
+    if incomplete then
+      local reason = err or metadata.errors[1].reason
+      local message = #items > 0 and "恢复列表仅显示已读取快照，部分记录读取失败；快照保留："
+        or "恢复快照读取失败，无法确认是否有可恢复文本；快照保留："
+      vim.notify(message .. reason, vim.log.levels.WARN)
+    end
     if metadata and metadata.truncated then
       vim.notify("恢复列表达到扫描上限，部分历史记录未显示；快照保留", vim.log.levels.WARN)
     end
     if #items == 0 then
+      if incomplete then
+        return
+      end
       vim.notify(
         metadata and metadata.truncated and "已扫描范围内没有可恢复快照"
           or "没有可恢复的异常退出快照",
@@ -652,11 +691,15 @@ function M.setup(opts)
   local function startup_summary()
     local owner_generation = generation
     M.prune(function()
-      M.list(function(items, _, metadata)
+      M.list(function(items, err, metadata)
         if owner_generation ~= generation then
           return
         end
         vim.g.ue_recovery_available = #items > 0 and ("可恢复文本:" .. #items) or ""
+        if err or (metadata and metadata.error_count > 0) then
+          vim.g.ue_recovery_available = #items > 0 and (vim.g.ue_recovery_available .. "（部分读取失败）")
+            or "恢复检查失败"
+        end
         if metadata and metadata.truncated then
           vim.g.ue_recovery_available = vim.g.ue_recovery_available .. "（扫描受限）"
         end

@@ -43,6 +43,74 @@ if not ok then io.stderr:write(tostring(err) .. '\n'); vim.cmd('cquit 1') else p
 end
 
 t.describe("git review routing", function()
+  t.it("picker file-only routing protects explorer/history and clears session hints", function()
+    child(cfg, [[
+      vim.opt.rtp:prepend(vim.fn.stdpath('data') .. '/lazy/snacks.nvim')
+      local Main = require('snacks.picker.core.main')
+      local api = vim.api
+      vim.cmd('tabnew')
+      local tab = api.nvim_get_current_tabpage()
+      local original = api.nvim_get_current_win()
+      local original_buf = api.nvim_create_buf(false, true)
+      vim.bo[original_buf].buftype = 'nowrite'
+      api.nvim_win_set_buf(original, original_buf)
+      vim.cmd('rightbelow vsplit')
+      local modified = api.nvim_get_current_win()
+      local modified_buf = api.nvim_create_buf(false, true)
+      vim.bo[modified_buf].buftype = 'nowrite'
+      api.nvim_win_set_buf(modified, modified_buf)
+      vim.cmd('topleft vsplit')
+      local panel_win = api.nvim_get_current_win()
+      local panel_buf = api.nvim_create_buf(false, true)
+      api.nvim_win_set_buf(panel_win, panel_buf)
+      local session = {original_win=original, modified_win=modified,
+        panel={name='explorer', view={winid=panel_win}}}
+      package.loaded['codediff.ui.lifecycle'] = {
+        get_session=function(id) if id==tab then return session end end,
+        set_tab_keymap=function() end,
+      }
+      local function event(pattern)
+        api.nvim_exec_autocmds('User', {pattern=pattern, data={tabpage=tab}})
+      end
+      assert(vim.bo[panel_buf].buftype=='nofile')
+      assert(not vim.wo[panel_win].winfixbuf)
+      assert(not vim.w[modified].snacks_main)
+      event('CodeDiffOpen')
+      assert(vim.wo[panel_win].winfixbuf)
+      assert(vim.w[modified].snacks_main==true)
+      assert(not vim.w[original].snacks_main)
+      assert(Main.new({file=true}):find()==modified)
+      assert(api.nvim_win_get_buf(panel_win)==panel_buf)
+      local replacement = api.nvim_create_buf(false, true)
+      local changed = pcall(api.nvim_win_set_buf, panel_win, replacement)
+      assert(not changed, 'panel must reject unrelated buffer replacement')
+      assert(api.nvim_win_get_buf(panel_win)==panel_buf)
+
+      -- History uses the same lifecycle descriptor; invalid modified falls back.
+      session.panel.name = 'history'
+      session.modified_win = -1
+      vim.wo[panel_win].winfixbuf = false
+      event('CodeDiffFileSelect')
+      assert(vim.wo[panel_win].winfixbuf)
+      assert(vim.w[modified].snacks_main==nil)
+      assert(vim.w[original].snacks_main==true)
+      assert(Main.new({file=true}):find()==original)
+      session.modified_win = nil
+      event('CodeDiffFileSelect')
+      assert(Main.new({file=true}):find()==original)
+
+      -- Close can arrive after the session disappears and from another tab.
+      session = nil
+      vim.cmd('tabnew')
+      local other_win = api.nvim_get_current_win()
+      vim.w[other_win].snacks_main = true
+      event('CodeDiffClose')
+      assert(vim.w[original].snacks_main==nil)
+      assert(vim.w[modified].snacks_main==nil)
+      assert(vim.w[other_win].snacks_main==true)
+    ]])
+  end)
+
   t.it("content search preserves -G rather than -S or message search", function()
     fixture.with_repo(function(f)
       f.baseline("value = needle + 1\n")
@@ -63,6 +131,46 @@ t.describe("git review routing", function()
     end)
   end)
 
+  t.it("native history keeps its panel buffer while changing revision files", function()
+    fixture.with_repo(function(f)
+      f.baseline("before\n")
+      f.write("after\n")
+      f.git({ "add", "--", f.path })
+      local tree = vim.trim(f.git({ "write-tree" }))
+      local hash = vim.trim(f.git({ "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        "commit-tree", tree, "-p", "HEAD", "-m", "second revision" }))
+      f.git({ "update-ref", "HEAD", hash })
+      child(f.root, [[
+        vim.opt.rtp:prepend(vim.fn.stdpath('data') .. '/lazy/snacks.nvim')
+        vim.cmd.edit(vim.fn.fnameescape(root .. '/review.txt'))
+        review.history(true)
+        wait(function()
+          local s=review.session()
+          return s and s.panel and s.panel.name=='history' and s.stored_diff_result
+            and vim.bo[s.original_bufnr].buftype=='nowrite' and vim.bo[s.modified_bufnr].buftype=='nowrite'
+            and vim.api.nvim_buf_get_lines(s.modified_bufnr,0,1,false)[1]=='after'
+        end)
+        local s=review.session()
+        local panel=s.panel.view
+        local panel_buf=vim.api.nvim_win_get_buf(panel.winid)
+        assert(vim.wo[panel.winid].winfixbuf)
+        assert(vim.w[s.modified_win].snacks_main==true, 'history code window must be the picker target')
+        assert(vim.bo[s.original_bufnr].buftype=='nowrite', 'original buftype=' .. vim.bo[s.original_bufnr].buftype)
+        assert(vim.bo[s.modified_bufnr].buftype=='nowrite', 'modified buftype=' .. vim.bo[s.modified_bufnr].buftype)
+        vim.api.nvim_set_current_win(panel.winid)
+        assert(require('snacks.picker.core.main').new({file=true}):find()==s.modified_win)
+        require('codediff.ui.history').navigate_next_commit(panel)
+        wait(function()
+          local current=review.session()
+          return current.stored_diff_result and vim.api.nvim_buf_get_lines(current.modified_bufnr,0,1,false)[1]=='before'
+        end)
+        assert(vim.api.nvim_win_get_buf(panel.winid)==panel_buf)
+        assert(vim.wo[panel.winid].winfixbuf)
+        require('codediff.ui.lifecycle').close()
+      ]])
+    end)
+  end)
+
   t.it("native explorer preserves full files, special paths and untracked coverage", function()
     fixture.with_repo(function(f)
       f.path = "空 格 file.txt"
@@ -76,6 +184,8 @@ t.describe("git review routing", function()
         review.open({root=root, path='空 格 file.txt'})
         wait(function() local s=review.session(); return s and s.modified.relative=='空 格 file.txt' and s.stored_diff_result and #s.stored_diff_result.changes==2 end)
         local s=review.session()
+        assert(vim.wo[s.panel.view.winid].winfixbuf)
+        assert(vim.w[s.modified_win].snacks_main==true)
         assert(vim.api.nvim_buf_line_count(s.original_bufnr)==80)
         assert(vim.api.nvim_buf_line_count(s.modified_bufnr)==80)
         assert(vim.api.nvim_buf_get_lines(s.modified_bufnr,39,40,false)[1]=='unchanged 40')

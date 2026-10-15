@@ -44,8 +44,11 @@ local prelude = [[
     return path
   end
   local function records(opts)
-    local list, err = await(function(done) recovery.list(done, opts or {all=true, include_live=true}) end)
+    local list, err, fast = await(function(done)
+      recovery.list(function(items, list_err) done(items, list_err, vim.in_fast_event()) end, opts or {all=true, include_live=true})
+    end)
     assert(type(list) == 'table' and not err, tostring(err))
+    assert(not fast, 'list callback must not run in a fast event (callers redraw from it)')
     return list
   end
   local function lines(buf)

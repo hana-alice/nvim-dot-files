@@ -3,6 +3,7 @@ return {
     "esmuellert/codediff.nvim",
     commit = "09d9ebef2cc5a5c04db7a349cd6c61bdf84ecc8e", -- v4.0.6
     cmd = "CodeDiff",
+    event = "BufReadCmd codediff:///*", -- Native session restore must load the URI reader before filetype detection.
     dependencies = { "nvim-mini/mini.icons" },
     build = function(plugin)
       -- Lazy's explicit install/build step owns downloads; view opening does not.

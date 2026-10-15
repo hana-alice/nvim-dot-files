@@ -42,7 +42,7 @@ function M.inspect(path)
         end
         if parsed.cmd == "badd" or parsed.cmd == "edit" then
           local raw = parsed.args[1]
-          if raw and raw ~= "" then
+          if raw and raw ~= "" and require("utils.buffer_uri").is_file_name(filename(raw)) then
             local name, cursor = filename(raw)
             if not (name:sub(1, 1) == "/" or name:match("^%a:[/\\]") or name:sub(1, 2) == "\\\\") then
               name = vim.fs.joinpath(base, name)

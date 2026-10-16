@@ -195,17 +195,20 @@ t.describe('GTAGS X1 parser evidence and independent roots', function()
     local base = vim.env.NVIM_X1_NATIVE_ROOT
     local engine_root = vim.env.NVIM_X1_NATIVE_ENGINE_ROOT
     local project_root = vim.env.NVIM_X1_NATIVE_PROJECT_ROOT
-    if (base or '') == '' or (engine_root or '') == '' or (project_root or '') == '' then
-      t.skip('private native proof requires NVIM_X1_NATIVE_ROOT/_ENGINE_ROOT/_PROJECT_ROOT'); return
+    local project_shader = vim.env.NVIM_X1_NATIVE_PROJECT_SHADER
+    local project_symbol = vim.env.NVIM_X1_NATIVE_PROJECT_SYMBOL
+    if (base or '') == '' or (engine_root or '') == '' or (project_root or '') == ''
+        or (project_shader or '') == '' or (project_symbol or '') == '' then
+      t.skip('private native proof requires NVIM_X1_NATIVE_ROOT/_ENGINE_ROOT/_PROJECT_ROOT/_PROJECT_SHADER/_PROJECT_SYMBOL'); return
     end
     vim.fn.mkdir(base, 'p')
     local ctx = { engine_root = engine_root, project_root = project_root,
       paths = { workspace_db = base .. '/db', engine_list = base .. '/engine.files', project_list = base .. '/project.files' } }
     vim.fn.writefile({ 'Engine/Shaders/Private/OctahedralCommon.ush' }, ctx.paths.engine_list)
-    vim.fn.writefile({ 'Source/Client/Plugins/KuroComputeShader/Shaders/KuroCSPBDCommon.ush' }, ctx.paths.project_list)
+    vim.fn.writefile({ project_shader }, ctx.paths.project_list)
     local ok, reason = gtags.build_sync(gtags.workspace_spec(ctx))
     t.assert_true(ok, reason)
-    for _, symbol in ipairs({ 'ComputeSphericalExcess', 'KuroCSUnifiedCollider_genericCloth' }) do
+    for _, symbol in ipairs({ 'ComputeSphericalExcess', project_symbol }) do
       local code, lines = gtags.query_sync(ctx, { '-x', '--literal', symbol }, function(cmd, opts)
         local value = vim.system(cmd, opts):wait()
         return value.code, vim.split(value.stdout or '', '\n', { trimempty = true })

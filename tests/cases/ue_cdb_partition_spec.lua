@@ -34,10 +34,10 @@ end
 
 t.describe("CDB configuration partition", function()
   for _, source in ipairs({
-    "Project/Plugins/KuroNetwork/Private/kcp/ikcp.c",
-    "Project/Plugins/KuroNetwork/Private/kcp/kurocrc32.c",
-    "Project/Plugins/KuroUtility/Private/minizip/ioapi.c",
-    "Project/Plugins/KuroUtility/Private/minizip/zip.c",
+    "Project/Plugins/SampleNetwork/Private/kcp/ikcp.c",
+    "Project/Plugins/SampleNetwork/Private/kcp/Samplecrc32.c",
+    "Project/Plugins/SampleUtility/Private/minizip/ioapi.c",
+    "Project/Plugins/SampleUtility/Private/minizip/zip.c",
     "Engine/Plugins/Runtime/Database/SQLiteCore/Private/SQLiteEmbedded.c",
   }) do
     t.it("keeps Test C source without a configuration path: " .. vim.fs.basename(source), function()
@@ -107,7 +107,7 @@ assert row == before
 with tempfile.TemporaryDirectory(prefix='ue-partition-') as folder:
     root = pathlib.Path(folder)
     selected = [entry(['-D', 'UE_BUILD_TEST=1'], name) for name in
-        ('ikcp.c', 'kurocrc32.c', 'ioapi.c', 'zip.c', 'SQLiteEmbedded.c')]
+        ('ikcp.c', 'Samplecrc32.c', 'ioapi.c', 'zip.c', 'SQLiteEmbedded.c')]
     other = entry(['-DUE_BUILD_SHIPPING=1'], 'Shipping.c')
     unknown = entry(['-DUE_BUILD_DEVELOPMENT=1'], 'Ambiguous.c')
     cdb = root/'compile_commands.json'

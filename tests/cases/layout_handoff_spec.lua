@@ -79,7 +79,7 @@ vim.cmd('qa!')
 local api = vim.api
 local root = vim.fn.getcwd():gsub('\\', '/')
 vim.opt.rtp:prepend(root)
-vim.opt.rtp:prepend('C:/Users/lizeqiang/AppData/Local/nvim-data/lazy/snacks.nvim')
+vim.opt.rtp:prepend(assert(vim.env.SCAN_SNACKS_RTP, 'SCAN_SNACKS_RTP is required'))
 package.path = root .. '/lua/?.lua;' .. root .. '/lua/?/init.lua;' .. package.path
 require('snacks')
 local fixture = (vim.env.NVIM_TEST_RUN_ROOT or root .. '/.tmp/review-gd/scan/lsp-snacks-fixture'):gsub('\\', '/')
@@ -170,6 +170,7 @@ t.describe("layout_handoff scan regressions", function()
           NVIM_UE_LOG_DIR = run .. "/ue-logs",
           NVIM_UE_PROBE_PATH = run .. "/probes.json",
           SCAN_SNACKS_MODE = case.mode or "",
+          SCAN_SNACKS_RTP = vim.fn.stdpath("data") .. "/lazy/snacks.nvim",
         },
       }):wait(10000)
       local output = (result.stdout or "") .. (result.stderr or "")

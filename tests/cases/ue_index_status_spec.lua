@@ -25,10 +25,10 @@ local function fixture(opts)
   local root = run_root:gsub("\\", "/") .. "/ue-index-status-" .. case_id
   local paths = {
     active_cdb = root .. "/compile_commands.json",
-    active_index = root .. "/android_debug_3.7.idx",
-    current_index = root .. "/android_debug_3.7.current.idx",
-    hot_index = root .. "/android_debug_3.7.hot.idx",
-    full_index = root .. "/android_debug_3.7.full.idx",
+    active_index = root .. "/sample_project.idx",
+    current_index = root .. "/sample_project.current.idx",
+    hot_index = root .. "/sample_project.hot.idx",
+    full_index = root .. "/sample_project.full.idx",
     workspace_db = root .. "/workspace-db",
     platform_key = "android_debug",
   }

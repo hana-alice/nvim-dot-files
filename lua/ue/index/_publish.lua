@@ -150,7 +150,9 @@ return function(M, core)
     end
     local key = publication_key(ctx, state, generation, base_path)
     local cached = RT.publication_cache
-    if cached and vim.deep_equal(cached.key, key) then
+    -- Tier 1 receipts refer to live inputs and may be changed independently of
+    -- phase CDB stats. Recheck them before allowing an unchanged publication.
+    if cached and not cached.has_tier1 and vim.deep_equal(cached.key, key) then
       return true, { entry_count = cached.entry_count,
         controlled_entry_count = cached.controlled_entry_count,
         shader_compatibility_count = cached.shader_compatibility_count, changed = false, original_changed = false,
@@ -159,6 +161,91 @@ return function(M, core)
     RT.publication_cache = nil
 
     local merged, seen, frozen, frozen_seen, receipts, batches = {}, {}, {}, {}, {}, {}
+    local tier1_batches, tier1_consumed, tier1_fallbacks, has_tier1 = {}, {}, {}, false
+    -- Reuse byte reads only within this publication. Phase manifests and stat
+    -- identities cannot detect same-size live input edits between publications.
+    local content_hashes = {}
+    local function current_content_hash(path)
+      if type(path) ~= "string" or path == "" or path:find("%z")
+        or not fs.is_absolute_path(path) then return nil end
+      if content_hashes[path] == nil then
+        local content = _ufs.is_file(path) and core.deps.read_all(path) or nil
+        content_hashes[path] = content and vim.fn.sha256(content) or false
+      end
+      return content_hashes[path] or nil
+    end
+    local function is_sha256(value)
+      return type(value) == "string" and #value == 64 and value:match("^[0-9a-f]+$") ~= nil
+    end
+    local function tier1_fallback(phase, entry, reason, source)
+      tier1_fallbacks[#tier1_fallbacks + 1] = { phase = phase, candidate = entry.file, reason = reason,
+        original_source = source }
+    end
+    local function tier1_recover_originals(entry)
+      local path, digest = entry.nvim_ue_tier1_receipt, entry.nvim_ue_tier1_receipt_sha256
+      if type(path) ~= "string" or path == "" or type(digest) ~= "string" or digest == "" then return nil end
+      local receipt, content = read_cdb(path)
+      if not receipt or vim.fn.sha256(content) ~= digest or receipt.schema ~= 1 or receipt.tier ~= 1
+        or type(receipt.original_entries) ~= "table" or not vim.islist(receipt.original_entries)
+        or #receipt.original_entries == 0 then return nil end
+      local keys = {}
+      for _, original in ipairs(receipt.original_entries) do
+        local key = entry_key(original)
+        if not key or keys[key] then return nil end
+        keys[key] = true
+      end
+      -- A sealed receipt can restore its old UBT commands when the phase's
+      -- semantic file is lost. It cannot authorize its live candidate this way.
+      return receipt.original_entries
+    end
+    local function tier1_receipt(entry, originals, phase_candidates)
+      local path, digest = entry.nvim_ue_tier1_receipt, entry.nvim_ue_tier1_receipt_sha256
+      if type(path) ~= "string" or path == "" or type(digest) ~= "string" or digest == "" then
+        return nil, "tier1-receipt-identity-missing"
+      end
+      local candidate_key = entry_key(entry)
+      if not candidate_key then return nil, "tier1-candidate-command-malformed" end
+      if phase_candidates[candidate_key] ~= 1 then return nil, "tier1-candidate-repeated-in-phase" end
+      local receipt, content = read_cdb(path)
+      if not receipt or vim.fn.sha256(content) ~= digest then return nil, "tier1-receipt-sha256-mismatch" end
+      if receipt.schema ~= 1 or receipt.tier ~= 1 or receipt.accepted ~= true or receipt.reusable ~= true
+        or type(receipt.gates) ~= "table" or receipt.gates.compile_success ~= true
+        or receipt.gates.main_shards_complete ~= true or receipt.gates.members_equal ~= true then
+        return nil, "tier1-receipt-not-accepted"
+      end
+      if entry_key(receipt.candidate) ~= candidate_key then return nil, "tier1-candidate-command-mismatch" end
+      if type(receipt.inputs) ~= "table" or not vim.islist(receipt.inputs) or #receipt.inputs == 0 then
+        return nil, "tier1-inputs-missing"
+      end
+      for _, input in ipairs(receipt.inputs) do
+        if type(input) ~= "table" or not is_sha256(input.sha256) then
+          return nil, "tier1-input-identity-malformed"
+        end
+        if current_content_hash(input.path) ~= input.sha256 then return nil, "tier1-input-content-mismatch" end
+      end
+      if not is_sha256(receipt.candidate_sha256) then return nil, "tier1-candidate-content-identity-missing" end
+      if current_content_hash(M.normalize_cdb_file(entry)) ~= receipt.candidate_sha256 then
+        return nil, "tier1-candidate-content-mismatch"
+      end
+      if type(receipt.original_entries) ~= "table" or not vim.islist(receipt.original_entries)
+        or #receipt.original_entries == 0 then return nil, "tier1-original-commands-missing" end
+      if originals[candidate_key] then return nil, "tier1-candidate-aliases-original" end
+      local consumed = {}
+      for _, original in ipairs(receipt.original_entries) do
+        local original_key = entry_key(original)
+        if not original_key or not originals[original_key] then return nil, "tier1-phase-original-absent-or-changed" end
+        if consumed[original_key] then return nil, "tier1-original-repeated-in-receipt" end
+        if tier1_consumed[original_key] and tier1_consumed[original_key] ~= candidate_key then
+          return nil, "tier1-original-covered-more-than-once"
+        end
+        consumed[original_key] = true
+      end
+      local previous = tier1_batches[candidate_key]
+      if previous and (previous.path ~= path or previous.digest ~= digest) then
+        return nil, "tier1-candidate-conflicting-receipts"
+      end
+      return { path = path, digest = digest, entry = entry, originals = consumed, key = candidate_key }
+    end
     local shader_compatibility = {}
     local function add_entries(entries, target, keys)
       target, keys = target or merged, keys or seen
@@ -194,9 +281,50 @@ return function(M, core)
         if artifact.background_cdb_hash and artifact.background_cdb_hash ~= vim.fn.sha256(content) then
           return false, phase .. " controlled background CDB no longer matches its successful manifest"
         end
-        local has_batch = false
+        local has_batch, phase_tier1, phase_candidates = false, false, {}
         for _, entry in ipairs(entries) do
-          if entry.nvim_ue_batch_receipt then
+          if type(entry) == "table" and entry.nvim_ue_tier1_receipt then
+            has_tier1, phase_tier1 = true, true
+            local candidate_key = entry_key(entry)
+            if candidate_key then phase_candidates[candidate_key] = (phase_candidates[candidate_key] or 0) + 1 end
+          end
+        end
+        local originals, semantic_content
+        if phase_tier1 then
+          originals, semantic_content = read_cdb(artifact.semantic_cdb_path)
+          if not originals or not vim.islist(originals) or not artifact.semantic_cdb_hash
+            or vim.fn.sha256(semantic_content) ~= artifact.semantic_cdb_hash then
+            originals = nil
+          end
+        end
+        local original_keys = {}
+        for _, original in ipairs(originals or {}) do
+          local original_key = entry_key(original)
+          if original_key then original_keys[original_key] = true end
+        end
+        local frozen_entries, recovered_entries = {}, {}
+        for _, entry in ipairs(entries) do
+          if entry.nvim_ue_tier1_receipt then
+            local admitted, reason, source
+            if originals then admitted, reason = tier1_receipt(entry, original_keys, phase_candidates)
+              source = "phase-semantic-cdb"
+            else
+              reason, source = "tier1-original-semantic-cdb-unavailable", "tier1-receipt-originals"
+              local recovered = tier1_recover_originals(entry)
+              if not recovered then
+                return false, phase .. " Tier 1 has no verifiable original commands; prior publication retained"
+              end
+              for _, original in ipairs(recovered) do recovered_entries[#recovered_entries + 1] = original end
+            end
+            if admitted then
+              tier1_batches[admitted.key] = admitted
+              for original_key in pairs(admitted.originals) do tier1_consumed[original_key] = admitted.key end
+            else tier1_fallback(phase, entry, reason, source) end
+          else
+            frozen_entries[#frozen_entries + 1] = entry
+            recovered_entries[#recovered_entries + 1] = entry
+          end
+          if entry.nvim_ue_batch_receipt and not entry.nvim_ue_tier1_receipt then
             has_batch = true
             local digest = entry.nvim_ue_batch_receipt_sha256
             if type(entry.nvim_ue_batch_receipt) ~= "string" or entry.nvim_ue_batch_receipt == ""
@@ -220,16 +348,21 @@ return function(M, core)
             receipts[entry.nvim_ue_batch_receipt] = digest
           end
         end
-        if not add_entries(entries, frozen, frozen_seen) then
+        if not add_entries(frozen_entries, frozen, frozen_seen) then
           return false, phase .. " controlled background command is malformed"
         end
         if has_batch then
-          local originals, semantic_content = read_cdb(artifact.semantic_cdb_path)
-          if not originals or not artifact.semantic_cdb_hash
-            or vim.fn.sha256(semantic_content) ~= artifact.semantic_cdb_hash then
+          local strict_originals, strict_content = read_cdb(artifact.semantic_cdb_path)
+          if not strict_originals or not artifact.semantic_cdb_hash
+            or vim.fn.sha256(strict_content) ~= artifact.semantic_cdb_hash then
             return false, phase .. " verified batches require their original semantic CDB"
           end
-          entries = originals
+          entries = strict_originals
+        elseif phase_tier1 then
+          -- Qualification was private; only its exact same-phase originals
+          -- authorize live replacement. An unavailable authority cannot borrow
+          -- commands from another phase or publish an unverified candidate.
+          entries = originals or recovered_entries
         end
         local before = #merged
         if not add_entries(entries) then return false, phase .. " original semantic command is malformed" end
@@ -274,6 +407,26 @@ return function(M, core)
     end
     frozen = selected
 
+    -- Tier 1 uses live wrappers, not the frozen/activation route. Its receipt
+    -- binds wrapper/member source bytes, tool and environment; header changes
+    -- do not invalidate it. This is the explicitly accepted Tier 1 tradeoff.
+    local live, live_seen = {}, {}
+    for _, entry in ipairs(merged) do
+      local original_key = entry_key(entry)
+      local candidate_key = tier1_consumed[original_key]
+      if candidate_key then
+        if not live_seen[candidate_key] then
+          live[#live + 1] = clangd_cdb_entry(tier1_batches[candidate_key].entry)
+          live_seen[candidate_key] = true
+        end
+      elseif not live_seen[original_key] then
+        live[#live + 1] = entry
+        live_seen[original_key] = true
+      end
+    end
+    merged = live
+    controlled_count = #merged
+
     -- Reordering unique unchanged files only reprioritizes an existing queue.
     -- Keep its bytes/mtime; same-file variants retain order-sensitive comparison.
     local previous = read_cdb(ctx.paths.semantic_cdb)
@@ -291,10 +444,9 @@ return function(M, core)
       local ok, err = atomic_write_json(ctx.paths.semantic_cdb, merged)
       if not ok then return false, err end
     end
-    -- The normal path ALWAYS remains the live original-UBT database. Frozen
-    -- batches have their own CDB and shard environment; only the asynchronous
-    -- input/watch guard may select them. A partial publication cannot make an
-    -- unguarded client silently consume snapshots.
+    -- Strict batches retain their separate CDB/shard environment and input
+    -- guard. Tier 1 above is qualified for live source commands and never
+    -- contributes a frozen receipt or preseeded shard.
     local receipt_paths = vim.tbl_keys(receipts)
     table.sort(receipt_paths)
     if #receipt_paths > 0 then
@@ -335,7 +487,8 @@ return function(M, core)
     key.published[2] = file_signature(ctx.paths.semantic_cdb)
     local shader_count = vim.tbl_count(shader_compatibility)
     RT.publication_cache = { key = key, entry_count = #merged,
-      controlled_entry_count = controlled_count, shader_compatibility_count = shader_count, ordinary = ordinary }
+      controlled_entry_count = controlled_count, shader_compatibility_count = shader_count, ordinary = ordinary,
+      has_tier1 = has_tier1 }
     return true, {
       entry_count = #merged,
       controlled_entry_count = controlled_count,
@@ -343,6 +496,7 @@ return function(M, core)
       changed = changed,
       original_changed = original_changed,
       ordinary = ordinary,
+      tier1_fallbacks = tier1_fallbacks,
       -- Frozen activation owns its independent reader/cache and cannot use the
       -- ordinary directory reload path, even if original rows only grew.
       original_append_only = original_append_only and #receipt_paths == 0 and not _ufs.is_file(batch_info_path),

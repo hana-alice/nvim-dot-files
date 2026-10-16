@@ -330,7 +330,7 @@ M.write_subset_compile_commands = function(ctx, phase, selected_keys)
   return out_cdb, selected_keys, nil
 end
 
-M.build_phase_async = function(ctx, phase)
+M.build_phase_async = function(ctx, phase, opts)
   local state = ensure_index_state(ctx)
   local root_key = core.deps.status_root_key(ctx)
   if RT.job then
@@ -341,7 +341,7 @@ M.build_phase_async = function(ctx, phase)
 
   local phase_lease, lease_err = file_lock.acquire(ctx.paths.index_state .. ".build.lock")
   if not phase_lease then
-    return false, "index artifacts are owned by another Neovim: " .. tostring(lease_err)
+    return false, "index artifacts are owned by another Neovim: " .. tostring(lease_err), M.retry_index_writer(ctx, phase, lease_err, opts)
   end
   local function fail_before_spawn(message)
     file_lock.release(phase_lease)
@@ -486,7 +486,7 @@ M.build_phase_async = function(ctx, phase)
     if server_profile then vim.list_extend(cmd, { "--server-profile", vim.json.encode(server_profile) }) end
   end
 
-  state.queue[phase] = nil
+  M.consume_index_phase(ctx, phase, state)
   state.build = {
     phase = phase,
     status = "running",
@@ -786,11 +786,12 @@ M.try_start_queued_build = function()
         and not M.admit_index_phase_start(picked_ctx, picked_phase) then
       break
     end
-    local ok_started = M.build_phase_async(picked_ctx, picked_phase)
+    local ok_started, _, retryable = M.build_phase_async(picked_ctx, picked_phase)
     if ok_started then
       started = true
       break
     end
+    if retryable then break end -- The phase already has a bounded retry timer.
     picked_state.queue[picked_phase] = nil
     save_index_state(picked_ctx, picked_state)
   end

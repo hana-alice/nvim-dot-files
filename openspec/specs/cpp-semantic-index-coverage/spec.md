@@ -31,6 +31,13 @@ include、target 或 PCH 参数以制造兼容性。每个候选 SHALL 与各原
 BackgroundIndex 图比较，保留真实文件、定义、符号身份、关系和引用；共享缓存的缺失记录、
 `--check` 零诊断、CDB 条目数或进度结束都 MUST NOT 代替此证明。
 
+**Tier 1 结构化豁免**：属于同一次 UBT unity 发射序列（`(module_root, compile_context_key,
+member_class)` 相同、按字节预算打包）的合并 SHALL 用三条硬门禁代替图比较：私有候选编译/索引成功；
+每个成员源都有主 shard；候选成员集合与被替换原 UBT 的成员并集完全相等。任一失败，该块 SHALL 保留原
+UBT。门禁 SHALL 在写入 live CDB **之前**于私有目录完成（不乐观发布、不预置 shard）。Tier 1 receipt
+只绑定 wrapper/成员源/工具/环境，头文件变化不会让它失效，这是已接受的取舍。跨 gen/src、跨模块等
+非 Tier 1 合并仍受上面的图比较约束。
+
 #### Scenario: A candidate changes a binding without a compiler error
 - **WHEN** 合并能编译但改变重载目标、删除引用、改变符号身份或产生编译错误
 - **THEN** 候选 SHALL 被拒绝，并完整保留其原 UBT 命令
@@ -181,17 +188,55 @@ clangd 是长驻交互式服务，终止会丢弃已构建的 preamble。系统 
   性不可满足**——585 条被拒绝的 removed-ref 中 **0 条**落在该组自己拥有的成员源文件里
   （全部是共享头），其中 583 条所在位置在原始图之间本来就存在多个 symbol id，且没有任何单个
   TU（候选或原始）能同时携带 union 要求的全部 id。
-- **已选方向（尚未实现）**：该调查按用户决策选定的方向是——Tier 1 只合并属于**同一次 UBT
+- **已选方向（2026-10-16 首版已实现）**：该调查按用户决策选定的方向是——Tier 1 只合并属于**同一次 UBT
   unity 发射序列**（`(module_root, compile_context_key, member_class)` 三元组相同）的组，
   按 UBT 自身 `NumIncludedBytesPerUnityCPP` 的整数倍字节预算打包，理由是这是编译器自己会
   发射的分组、不是语义改动，因此 Tier 1 SHALL NOT 要求逐组 `compare_graphs`，改用编译成功 +
   索引完成（`missing_main_shards == 0`）+ 成员源集合与被替换原始逐字节一致三项硬门禁替代。
   Tier 2（跨 gen/src 类、跨模块的合并）仍需证明，但其基线必须先改为可满足的形式，本方向
   未给出 Tier 2 新基线设计。
-- **明确标注（防止冒充收益）**：该 change 的 22 个任务**全部未勾选**，Tier 1 无任何实测
-  收益数字；本仓唯一受控冷启动 A/B 实测是 **1115.23 s → 1028.51 s（7.78%）**
-  （`docs/cpp-index-restart-investigation.md`），这是另一次改动的结果，MUST NOT 被冒充为
+- **历史边界（防止冒充收益）**：该调查 change 归档时 22 个任务全部未勾选，尚无 Tier 1
+  实测；后续首版阶段数据见下一条。此前的受控冷启动 A/B **1115.23 s → 1028.51 s（7.78%）**
+  （`docs/cpp-index-restart-investigation.md`）是另一次改动的结果，MUST NOT 被冒充为
   Tier 1 的收益，也 MUST NOT 用 CDB 条目数下降（纸面 1197 → 777，−35%）替代实测速度提升。
-- **重要事项**：截至本次瘦身，`cpp-semantic-index-coverage` 的现行实现仍是本 spec
-  Requirements 描述的状态（union 基线、逐组 compare_graphs、0 条 Tier 1 结构化豁免）；上述
-  「已选方向」只是记录调查结论与选型意向，不代表 Requirements 已经改变。
+  2026-10-13 的全工程 j12 空 shard A/B 中，原 UBT 为 1199.6166 / 1255.9569 s，旧 13 Batch
+  为 1437.0561 / 1273.0648 s；均覆盖 14317 个源并保留相同两个 Vulkan 编译失败，OS 缓存未清。
+  这两对未测得全工程提速，不能冒充新 Tier 1 的结果；后续不同 j 或内存上限的未完成实验也不能
+  替代这些约 20–24 分钟的完整测量。
+- **Tier 1 首版实测（2026-10-16，阶段验收，不代表全工程恢复）**：私有 shard，clangd -j1，
+  低优先级，串行，格式为 CPU s / 墙钟 s / 峰值 WS：VulkanRHI 5 UBT/33 源，原 UBT 48.1/50.3/1.43 GB，
+  Tier 1 18.2/19.9/1.36 GB；Renderer 8 UBT/79 源，原 UBT 93.0/96.3/1.65 GB，Tier 1 21.5/23.4/1.68 GB。
+  两组门禁全过；Renderer 的 shard 文件名集合除 wrapper 外一致，符号/引用内容未做比较。
+  真实 full phase 规划：3329 条/997 UBT → 110 块覆盖 540 UBT，纸面 2899 条（不是实测速度）。
+  门禁选型：用户选「前置私有验证」，首次 prepare 额外付出约一次 Tier 1 索引的成本，以换取不存在错误窗口。
+- **实际交付后的阶段验收（2026-10-16）**：当前工程与构建的 full 已补齐并启动生产
+  Tier 1 队列；实际采用的 AugmentedReality 5 UBT/21个生成源，在同生产 query-driver/cwd/config、
+  同 clangd、j4、新私有 shard 的窄 A/B 中，wall74.18→29.51s、CPU211.61→27.31s、峰值WS
+  3.84→1.09GiB，源与头文件 own digest集合一致、成员/TU完整且无错误。资格成本49.17s另计；
+  与候选冷索引分项相加约78.68s，不是端到端测量，未证明完全无资格缓存的首次启动更快。
+  OS 文件缓存未清，正常后台队列仍在运行，非独占宿主基准。收尾生产快照为278 UBT→65批次，
+  其余719 UBT、214 exact与2119 shader记录保留，14319源集合及内容摘要完整；65候选own shard
+  均为TU且无错误。当前全工程j4冷基线在实验的8GiB进程commit上限内OOM，
+  不完整结果不能计算全工程提速；本次属于可用阶段交付，不能表述为全工程性能已恢复。
+  已验证范围与未完成事项归档于 `docs/release_2.9.0.md`。
+- **踩坑**：发布到 clangd 的 CDB 会按设计剥离 `nvim_ue_members`/`nvim_ue_module_root`
+  （clangd 解析器拒绝未知键）。Tier 1 规划必须读 phase 的 `.semantic.json`，不能读已发布 CDB；
+  已发布 CDB 规划出 0 块不代表元数据丢失。
+- **发布重验（2026-10-16）**：producer 的复用检查不能替代稍后发布时的输入检查；成员源
+  已变化时，旧 full phase 仍可能重新引入此前合格的候选。发布 SHALL 重新核对收据声明的
+  wrapper/member/owned-overlay 字节和候选本身的 `candidate_sha256`，失效块保留原 UBT。
+  缺少候选 digest 的旧 Tier 1 收据需重新私有验证，不补造证明；小 CDB 中的批次也走已有发布
+  worker，避免源文件哈希落在编辑器主循环。未声明的头文件依赖仍保持既有 Tier 1 取舍。
+- **负缓存边界（2026-10-16）**：超时、进程异常与不完整索引不是候选无法编译的证明，不能
+  将它们永久缓存为拒绝并从后续计划排除。只有正常完成的确定编译拒绝可复用负收据；旧负
+  收据缺少完成/退出/编译错误证据时重新验证。临时失败仍保留原 UBT，后续计划可以重试。
+- **重复复用成本（2026-10-16）**：真实缓存组约93%的复用时间曾耗在反复验证同一 owned
+  overlay 的物理名称。Tier 1 可在一次外层 collect/reuse 内共享该验证，退出即清空；下一次
+  独立调用必须重新验证物理路径，overlay bytes 及成员源 bytes 仍按原门禁检查。不得把
+  单次调用复用扩大为跨 prepare 的持久缓存，也不得据此弱化 strict 路线。
+  真实60批次时的重复 full 交付84.75s，输入与五类产物 bytes/mtime 不变、reader不重启；
+  此验收只覆盖 full 阶段，不代表完整 UEPrepare 时延或全工程冷索引收益。
+- **混合与监听的验收边界（2026-10-16）**：目前 mixed strict/Tier 1 发布的 strict coverage
+  校验会拒绝激活，不能把该 fail-closed 回归称作两类批次同时被 reader 消费。监听组错误会广播
+  到多个回调；盘根的 direct 祖先订阅出现在日志中，不证明该盘根是原生 overflow 来源，亦不
+  证明递归监听了整个磁盘。不能据此删除祖先保护。

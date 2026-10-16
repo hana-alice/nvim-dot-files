@@ -21,6 +21,26 @@ local function snapshot(path)
 end
 
 t.describe("ordinary publication worker admission", function()
+  t.it("small batch publications verify input bytes outside the editor loop", function()
+    local root = vim.fn.tempname():gsub("\\", "/")
+    local base, background, marker = root .. "/base.json", root .. "/phase.json", root .. "/phase.idx"
+    local previous = root .. "/full.idx"
+    write(base, "[]"); write(background, "[]")
+    local ctx, state = { paths = { semantic_cdb = background } }, { index_artifacts = {} }
+    write(marker, vim.json.encode({ verified_batches = { batch_count = 0 } }))
+    t.assert_false(index.publication_needs_worker(ctx, state, base, background, marker))
+    write(marker, vim.json.encode({ verified_batches = { batch_count = 1 } }))
+    t.assert_true(index.publication_needs_worker(ctx, state, base, background, marker))
+    write(marker, vim.json.encode({ verified_batches = { batch_count = 0 } }))
+    write(previous, vim.json.encode({ verified_batches = { batch_count = 1 } }))
+    state.index_artifacts.full = { index_path = previous }
+    t.assert_true(index.publication_needs_worker(ctx, state, base, background, marker),
+      "an older full batch also needs input revalidation during current publication")
+    write(previous, "[]" .. string.rep(" ", 1100000))
+    t.assert_true(index.publication_needs_worker(ctx, state, base, background, marker))
+    vim.fn.delete(root, "rf")
+  end)
+
   t.it("small base cannot keep large phase or published CDB reads on the editor loop", function()
     local root = vim.fn.tempname():gsub("\\", "/")
     vim.fn.mkdir(root, "p")

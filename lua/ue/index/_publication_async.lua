@@ -28,7 +28,22 @@ return function(M, core)
       if large(path) then return true end
     end
     for _, artifact in pairs(state.index_artifacts or {}) do
-      if large(artifact.background_cdb_path) or large(artifact.semantic_cdb_path) then return true end
+      if large(artifact.background_cdb_path) or large(artifact.semantic_cdb_path)
+        or large(artifact.index_path) then return true end
+    end
+    -- Even a tiny CDB can authorize a batch containing megabytes of source.
+    -- The producer's small marker routes byte revalidation to the existing
+    -- worker; it does not grant receipt authority. Older phases participate in
+    -- every merged publication, so their batches must take this route too.
+    local function has_batches(path)
+      if not path or path == "" then return false end
+      local data = core.h.read_json_file(path, nil)
+      local batches = type(data) == "table" and data.verified_batches or nil
+      return type(batches) == "table" and (tonumber(batches.batch_count) or 0) > 0
+    end
+    if has_batches(marker) then return true end
+    for _, artifact in pairs(state.index_artifacts or {}) do
+      if has_batches(artifact.index_path) then return true end
     end
     return false
   end

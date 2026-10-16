@@ -12,7 +12,10 @@ hana-alice 的 Neovim 配置（公开镜像 `hana-alice/nvim`），定位为
 **当前 SuperUnity 完整索引性能仍未通过恢复验收**；上述定位不是现状实测承诺，
 验收证据与缺口见 [索引退化调查](../docs/cpp-index-restart-investigation.md)。
 按用户确认的阶段交付方式，已验证范围可先交付，再继续扩大压缩规模；完整恢复仍单独验收。
-项目/target 的 `batch-store.json` 可让正常 current/hot/full 复用指定证明目录，失效时保留原命令；
+Tier 1 已按同模块/完整编译上下文/成员类别进行真实二次合并，私有资格验证后通过正常后台队列
+发布到 live CDB；发布重新核验输入，失效块保留原 UBT。阶段交付数据、首次资格成本与全工程
+冷索引缺口见 [2.9.0 归档](../docs/release_2.9.0.md)，不能将窄范围加速比推广到全工程。
+严格图证明路线中，项目/target 的 `batch-store.json` 可让正常 current/hot/full 复用指定证明目录，失效时保留原命令；
 契约见 `cpp-semantic-index-coverage`，被引用的回执及冻结资产须持续保留。
 冻结激活的文档预检由 `lua/ue/index/batch_documents.lua` 读取缓冲区元数据，CDB 归属与
 证明权限和重验仍由 `batch_runtime.lua` 管理（新冻结缓存先由 `batch_shard_seed.lua` 从原缓存
@@ -55,7 +58,7 @@ LazyVim 作为**库**而非成品；真正引擎是 `lua/ue.lua`（单文件巨�
 | UE 引擎中枢 | `lua/ue.lua` + `lua/ue/` | `lua/ue/AGENTS.md` | `ue-target-workflow-boundary` | `ue_platform_boundary` `ue_api` `smoke` | 索引 / CDB / DAP / 命令注册的中枢 |
 | 多实例状态 | `lua/ue/project_state.lua` + `file_lock.lua` | `lua/ue/AGENTS.md` | `multi-instance-state-isolation` | `multi_instance_state` | 进程内选择 + canonical project bucket + 跨进程 writer lease |
 | clangd 语义覆盖 | `lua/ue/index/` | `lua/ue/index/AGENTS.md` | `cpp-semantic-index-coverage` | `index_generation` `index_subset_async` `cpp_semantic_index` | current/hot/full controlled BackgroundIndex + generation 单调选择；大 CDB 筛选在后台执行 |
-| 已验证二次批次 | `tools/clangd_*` + `tools/cdb_verified_batch.py` + `lua/ue/index/batch_*.lua` | `tools/AGENTS.md` + `lua/ue/index/AGENTS.md` | `cpp-semantic-index-coverage` | `index_batch_runtime` `index_graph` `index_batch` `index_input_directory` `index_verified_batch` `index_inventory` `index_query_profile` `index_vfs_aliases` | 原 TU 图证明、冻结输入、独立语义 CDB 与运行时失效保护 |
+| 已验证二次批次 | `tools/clangd_*` + `tools/cdb_verified_batch.py` + `tools/cdb_background_batch.py` + `lua/ue/index/batch_*.lua` | `tools/AGENTS.md` + `lua/ue/index/AGENTS.md` | `cpp-semantic-index-coverage` | `index_batch_runtime` `index_graph` `index_batch` `index_input_directory` `index_verified_batch` `index_inventory` `index_query_profile` `index_vfs_aliases` | Tier 1 资格缓存与普通发布；strict 原 TU 图证明、冻结输入与运行时失效保护 |
 | 离线生成代码二次候选 | `tools/build_super_unity_cdb.py` | `tools/AGENTS.md` | `cpp-semantic-index-coverage` | `index_generated_super_unity` `structure` | 同模块完整 argv 相同的 generated-only UBT 候选；全局 header 引用目标验收未过，不得自动发布 |
 | 离线有序二次候选 | `tools/cdb_ordered_unity.py` | `tools/AGENTS.md` | `cpp-semantic-index-coverage` | `index_ordered_unity` `structure` | 保留 PCH/模块宏顺序与覆盖；候选不是已准入的生产批次 |
 | 源码刷新交付 | `lua/ue/index/_source.lua` + `_clangd.lua` + `lua/utils/ue_watch.lua` | `lua/ue/index/AGENTS.md` + `lua/utils/AGENTS.md` | `cpp-semantic-index-coverage` | `index_source_refresh` `index_delivery` `ue_watch_csearch` | 源码字节 revision 独立于 CDB；新客户端附加后才确认交付 |

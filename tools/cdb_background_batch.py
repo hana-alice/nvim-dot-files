@@ -57,7 +57,31 @@ def _read_source(path, expected=None):
     return entries, digest
 
 
-def _cache_only(entries, store, clangd, profile):
+def _mode():
+    """Tier 1 is the production default; strict preserves the graph-proof path."""
+    mode = os.environ.get('NVIM_UE_BATCH_TIER', '1').strip().lower()
+    if mode not in ('1', 'strict'):
+        raise ValueError('background-proof-unsupported-tier: ' + mode)
+    return mode
+
+
+def _chunks(entries, mode):
+    return secondary_unity_chunks(entries, max_unities=8,
+        **({'max_sources': 80} if mode == 'strict' else {}))
+
+
+def _identity(entries, mode):
+    value = entries if mode == 'strict' else {'tier': 1, 'entries': entries}
+    return _sha(_json(value).encode('utf-8'))
+
+
+def _cache_only(entries, store, clangd, profile, mode=None):
+    mode = mode or _mode()
+    if mode == '1':
+        # The Tier 1 cache binds wrappers, member sources and owned overlays.
+        # Header changes deliberately do not invalidate its receipt.
+        return verified.reuse_tier1(entries, store, clangd, max_group=8,
+            server_profile=profile)
     if not Path(store).is_dir():
         # accelerate creates its artifact root even in cache-only mode. An
         # absent advisory store must not mutate watched lookup inventories.
@@ -75,7 +99,25 @@ def _cache_only(entries, store, clangd, profile):
         verify_missing=False, server_profile=profile)
 
 
-def _replacements(entries, output, metrics):
+def _tier1_receipt(entries, candidate):
+    raw = Path(candidate['nvim_ue_tier1_receipt']).read_bytes()
+    if _sha(raw) != candidate.get('nvim_ue_tier1_receipt_sha256'):
+        raise ValueError('background-proof-tier1-receipt-sha-mismatch')
+    receipt = json.loads(raw.decode('utf-8'))
+    members = [member for entry in entries for member in entry['nvim_ue_members']]
+    if (receipt.get('schema') != 1 or receipt.get('tier') != 1
+            or receipt.get('accepted') is not True or receipt.get('reusable') is not True
+            or receipt.get('original_entries') != [verified._native(entry) for entry in entries]
+            or receipt.get('candidate') != verified._native(candidate)
+            or not all(receipt.get('gates', {}).get(name) is True for name in
+                ('compile_success', 'main_shards_complete', 'members_equal'))
+            or len(members) != len(set(members))
+            or receipt.get('members') != candidate.get('nvim_ue_members')
+            or sorted(receipt.get('members', [])) != sorted(members)):
+        raise ValueError('background-proof-tier1-receipt-mismatch')
+
+
+def _replacements(entries, output, metrics, mode=None):
     """Accept replacements only for groups actually admitted by the proof gate."""
     anchors, consumed, claimed = {}, set(), set()
     for record in metrics['groups']:
@@ -101,22 +143,29 @@ def _replacements(entries, output, metrics):
         value = output[cursor]
         cursor += 1
         if index in anchors:
-            if not value.get('nvim_ue_batch_receipt'):
+            tier = mode or _mode()
+            receipt_key = 'nvim_ue_tier1_receipt' if tier == '1' else 'nvim_ue_batch_receipt'
+            if not value.get(receipt_key):
                 raise ValueError('background-proof-missing-receipt')
+            if tier == '1':
+                _tier1_receipt([entries[position] for position in anchors[index]], value)
             replacements[index] = value
         elif value != entry:
             raise ValueError('background-proof-original-command-changed')
     return replacements, consumed, claimed
 
 
-def _catalog_path(store):
-    return Path(store).resolve().parent / 'background-proofs' / 'catalog.json'
+def _catalog_path(store, mode=None):
+    root = Path(store).resolve().parent / 'background-proofs'
+    return (root / 'tier1' if (mode or _mode()) == '1' else root) / 'catalog.json'
 
 
-def _catalog(store):
+def _catalog(store, mode=None):
+    mode = mode or _mode()
     try:
-        value = json.loads(_catalog_path(store).read_text(encoding='utf-8'))
-        return value['groups'] if value.get('schema') == 1 and isinstance(value.get('groups'), list) else []
+        value = json.loads(_catalog_path(store, mode).read_text(encoding='utf-8'))
+        return value['groups'] if (value.get('schema') == 1 and value.get('mode', 'strict') == mode
+            and isinstance(value.get('groups'), list)) else []
     except (OSError, ValueError, TypeError, KeyError):
         return []
 
@@ -139,14 +188,20 @@ def _merge_metrics(entries, legacy, replacements, claimed, records):
 
 def reuse_completed(entries, legacy_store, clangd, server_profile=None):
     """Read-only reuse for prepare; validate every catalog group through the gate."""
+    with verified.tier1_overlay_scope(_mode() == '1'):
+        return _reuse_completed(entries, legacy_store, clangd, server_profile)
+
+
+def _reuse_completed(entries, legacy_store, clangd, server_profile):
     started = time.monotonic()
-    output, legacy = _cache_only(entries, legacy_store, clangd, server_profile)
-    replacements, consumed, claimed = _replacements(entries, output, legacy)
+    mode = _mode()
+    output, legacy = _cache_only(entries, legacy_store, clangd, server_profile, mode)
+    replacements, consumed, claimed = _replacements(entries, output, legacy, mode)
     records = list(legacy['groups'])
     positions = {}
     for index, entry in enumerate(entries):
         positions.setdefault(_sha(_json(entry).encode('utf-8')), []).append(index)
-    for group in _catalog(legacy_store):
+    for group in _catalog(legacy_store, mode):
         try:
             hashes = group['entry_hashes']
             if not isinstance(hashes, list) or any(len(positions.get(value, [])) != 1 for value in hashes):
@@ -155,14 +210,14 @@ def reuse_completed(entries, legacy_store, clangd, server_profile=None):
             if claimed.intersection(indexes) or len(set(indexes)) != len(indexes):
                 continue
             selected = [entries[index] for index in indexes]
-            identity = _sha(_json(selected).encode('utf-8'))
-            expected_store = _catalog_path(legacy_store).parent / identity
+            identity = _identity(selected, mode)
+            expected_store = _catalog_path(legacy_store, mode).parent / identity
             if (identity != group['id'] or Path(group['store']).resolve() != expected_store
-                    or secondary_unity_chunks(selected, max_sources=80, max_unities=8)
+                    or _chunks(selected, mode)
                     != [list(range(len(selected))) ]):
                 continue
-            output, metrics = _cache_only(selected, expected_store, clangd, server_profile)
-            local_replacements, local_consumed, local_claimed = _replacements(selected, output, metrics)
+            output, metrics = _cache_only(selected, expected_store, clangd, server_profile, mode)
+            local_replacements, local_consumed, local_claimed = _replacements(selected, output, metrics, mode)
             replacements.update({indexes[index]: value for index, value in local_replacements.items()})
             consumed.update(indexes[index] for index in local_consumed)
             claimed.update(indexes[index] for index in local_claimed)
@@ -171,6 +226,9 @@ def reuse_completed(entries, legacy_store, clangd, server_profile=None):
         except (OSError, ValueError, KeyError, TypeError):
             continue  # A corrupt or stale advisory catalog never grants admission.
     output = [replacements.get(index, entry) for index, entry in enumerate(entries) if index not in consumed]
+    if mode == '1':
+        # Prefer a revalidated catalog record over the root store's cache miss.
+        records = list({tuple(record['original_indexes']): record for record in records}.values())
     metrics = _merge_metrics(entries, legacy, replacements, claimed, records)
     metrics['proof_seconds'] = round(time.monotonic() - started, 6)
     return output, metrics
@@ -187,6 +245,7 @@ def _pending_result_hints(previous_path, plan, entries):
         return []
     if (not isinstance(previous, dict) or not isinstance(previous.get('groups'), list)
             or previous.get('schema') != 1 or previous.get('input_sha256') != plan['input_sha256']
+            or previous.get('mode', 'strict') != plan.get('mode', 'strict')
             or previous.get('server_profile') != plan['server_profile']):
         return []
     current_groups = {group['id']: group for group in plan['groups']}
@@ -219,6 +278,7 @@ def _pending_result_hints(previous_path, plan, entries):
         count = result['metrics'].get('new_batch_count', 0)
         if (result.get('ok') is True and result.get('group_id') == identity
                 and result.get('input_sha256') == plan['input_sha256']
+                and result.get('mode', 'strict') == plan.get('mode', 'strict')
                 and type(count) is int and 0 < count <= group['ubt_count']):
             if identity not in current_groups:
                 plan['groups'].append(group)
@@ -230,22 +290,30 @@ def _pending_result_hints(previous_path, plan, entries):
 def make_plan(source, store, clangd, profile=None, previous_path=None):
     source, store = Path(source).resolve(), Path(store).resolve()
     entries, digest = _read_source(source)
+    mode = _mode()
     output, metrics = reuse_completed(entries, store, clangd, profile)
-    _, _, claimed = _replacements(entries, output, metrics)
-    available = [(index, entry) for index, entry in enumerate(entries) if index not in claimed]
-    candidates = secondary_unity_chunks([entry for _, entry in available], max_sources=80, max_unities=8)
+    _, _, claimed = _replacements(entries, output, metrics, mode)
+    # Tier 1 chunks must stay identical to prepare's full-input cache lookup;
+    # removing admitted groups first could regroup the remaining originals.
+    available = [(index, entry) for index, entry in enumerate(entries)
+        if mode == '1' or index not in claimed]
+    candidates = _chunks([entry for _, entry in available], mode)
+    rejected = {tuple(record['original_indexes']) for record in metrics['groups']
+        if record.get('cached') and not record.get('accepted') and not record.get('deferred')}
     groups = []
     for chunk in candidates:
         indexes = [available[index][0] for index in chunk]
+        if mode == '1' and (claimed.intersection(indexes) or tuple(indexes) in rejected):
+            continue
         selected = [entries[index] for index in indexes]
-        identity = _sha(_json(selected).encode('utf-8'))
+        identity = _identity(selected, mode)
         groups.append({'id': identity, 'indexes': indexes,
-            'store': str(store.parent / 'background-proofs' / identity),
+            'store': str(_catalog_path(store, mode).parent / identity),
             'ubt_count': len(indexes),
             'member_count': sum(len(entry['nvim_ue_members']) for entry in selected)})
     groups.sort(key=lambda group: (group['member_count'], group['ubt_count'], group['indexes'][0]))
     _read_source(source, digest)
-    plan = {'schema': 1, 'input_path': str(source), 'input_sha256': digest,
+    plan = {'schema': 1, 'mode': mode, 'input_path': str(source), 'input_sha256': digest,
         'legacy_store': str(store), 'server_profile': profile,
         'entry_count': len(entries), 'counts': {key: metrics[key] for key in (
             'original_ubt_count', 'exact_count', 'shader_count', 'other_count')},
@@ -263,6 +331,8 @@ def _load_plan(path, profile):
     plan = json.loads(Path(path).read_text(encoding='utf-8'))
     if plan.get('schema') != 1 or plan.get('server_profile') != profile:
         raise ValueError('background-proof-plan-profile-mismatch')
+    if plan.get('mode', 'strict') != _mode():
+        raise ValueError('background-proof-plan-tier-mismatch')
     entries, _ = _read_source(plan['input_path'], plan['input_sha256'])
     return plan, entries
 
@@ -277,10 +347,11 @@ def _group(plan, entries, identity):
             or any(type(index) is not int or index < 0 or index >= len(entries) for index in indexes)):
         raise ValueError('background-proof-invalid-indexes')
     selected = [entries[index] for index in indexes]
-    expected_store = Path(plan['legacy_store']).resolve().parent / 'background-proofs' / identity
-    if (_sha(_json(selected).encode('utf-8')) != identity
+    mode = plan.get('mode', 'strict')
+    expected_store = _catalog_path(plan['legacy_store'], mode).parent / identity
+    if (_identity(selected, mode) != identity
             or Path(group['store']).resolve() != expected_store
-            or secondary_unity_chunks(selected, max_sources=80, max_unities=8) != [list(range(len(selected))) ]):
+            or _chunks(selected, mode) != [list(range(len(selected))) ]):
         raise ValueError('background-proof-group-identity-mismatch')
     return group, selected
 
@@ -333,28 +404,42 @@ def work(plan_path, identity, clangd, profile=None):
     plan, entries = _load_plan(plan_path, profile)
     group, selected = _group(plan, entries, identity)
     job_handle = _owned_job()
-    output, metrics = verified.accelerate(selected, group['store'], clangd,
-        max_group=8, max_sources=80, timeout=90, verify_missing=True,
-        max_new_groups=None, server_profile=profile)
-    _replacements(selected, output, metrics)
+    if plan.get('mode', 'strict') == '1':
+        output, metrics = verified.accelerate_tier1(selected, group['store'], clangd,
+            max_group=8, timeout=90, server_profile=profile)
+    else:
+        output, metrics = verified.accelerate(selected, group['store'], clangd,
+            max_group=8, max_sources=80, timeout=90, verify_missing=True,
+            max_new_groups=None, server_profile=profile)
+    _replacements(selected, output, metrics, plan.get('mode', 'strict'))
     _read_source(plan['input_path'], plan['input_sha256'])
-    return {'ok': True, 'group_id': identity, 'input_sha256': plan['input_sha256'],
+    return {'ok': True, 'mode': plan.get('mode', 'strict'),
+        'group_id': identity, 'input_sha256': plan['input_sha256'],
         'completed_at': time.time(), 'metrics': metrics, 'owned_job': job_handle is not None}
 
 
 def collect(plan_path, completed, background, marker_path, clangd, profile=None,
         publish_request=None, nvim=None, publish_worker=None):
+    with verified.tier1_overlay_scope(_mode() == '1'):
+        return _collect(plan_path, completed, background, marker_path, clangd, profile,
+            publish_request, nvim, publish_worker)
+
+
+def _collect(plan_path, completed, background, marker_path, clangd, profile,
+        publish_request, nvim, publish_worker):
     publication_args = (publish_request, nvim, publish_worker)
     if any(publication_args) and not all(publication_args):
         raise ValueError('background-proof-publication-worker-options-required-together')
     plan, entries = _load_plan(plan_path, profile)
+    mode = plan.get('mode', 'strict')
     job_handle = _owned_job() if publish_request else None
     if not isinstance(completed, list) or not all(isinstance(identity, str) for identity in completed):
         raise ValueError('background-proof-completed-list-required')
     output, legacy = reuse_completed(entries, plan['legacy_store'], clangd, profile)
-    replacements, consumed, claimed = _replacements(entries, output, legacy)
+    replacements, consumed, claimed = _replacements(entries, output, legacy, mode)
     records = list(legacy['groups'])
-    catalog = {group['id']: group for group in _catalog(plan['legacy_store']) if isinstance(group, dict) and 'id' in group}
+    catalog = {group['id']: group for group in _catalog(plan['legacy_store'], mode)
+        if isinstance(group, dict) and 'id' in group}
     revalidated = []
     for identity in dict.fromkeys(completed):
         group, selected = _group(plan, entries, identity)
@@ -362,18 +447,21 @@ def collect(plan_path, completed, background, marker_path, clangd, profile=None,
             if set(group['indexes']).issubset(claimed):
                 revalidated.append(identity)
             continue  # Never overlay a legacy proof or split an admitted group.
-        output, metrics = _cache_only(selected, group['store'], clangd, profile)
-        local_replacements, local_consumed, local_claimed = _replacements(selected, output, metrics)
+        output, metrics = _cache_only(selected, group['store'], clangd, profile, mode)
+        local_replacements, local_consumed, local_claimed = _replacements(selected, output, metrics, mode)
         replacements.update({group['indexes'][index]: value for index, value in local_replacements.items()})
         consumed.update(group['indexes'][index] for index in local_consumed)
         claimed.update(group['indexes'][index] for index in local_claimed)
         if local_replacements:
             revalidated.append(identity)
+        if local_replacements or (mode == '1' and any(record.get('cached') for record in metrics['groups'])):
             catalog[identity] = {'id': identity, 'store': group['store'],
                 'entry_hashes': [_sha(_json(entry).encode('utf-8')) for entry in selected]}
         records.extend(dict(record, original_indexes=[group['indexes'][index]
             for index in record['original_indexes']]) for record in metrics['groups'])
     output = [replacements.get(index, entry) for index, entry in enumerate(entries) if index not in consumed]
+    if mode == '1':
+        records = list({tuple(record['original_indexes']): record for record in records}.values())
     metrics = _merge_metrics(entries, legacy, replacements, claimed, records)
     summary = {key: metrics[key] for key in ('original_ubt_count', 'exact_count', 'shader_count',
         'other_count', 'batch_count', 'accepted_ubt_count', 'retained_ubt_count', 'output_entries')}
@@ -388,12 +476,12 @@ def collect(plan_path, completed, background, marker_path, clangd, profile=None,
         unity_entry_count=sum('super_unity_cpps' in str(entry.get('file', '')).replace('\\', '/')
             for entry in entries), verified_batches=marker_summary)
     _read_source(plan['input_path'], plan['input_sha256'])
-    catalog_value = {'schema': 1, 'groups': [catalog[key] for key in sorted(catalog)]}
+    catalog_value = {'schema': 1, 'mode': mode, 'groups': [catalog[key] for key in sorted(catalog)]}
     background_content, background_changed = _publication_content(background, output)
     marker_content, marker_changed = _publication_content(marker_path, marker)
     write_outputs_if_changed([(str(background), background_content), (str(marker_path), marker_content),
-        (str(_catalog_path(plan['legacy_store'])), _json(catalog_value))])
-    result = {'ok': True, 'changed': background_changed or marker_changed, 'metrics': summary, 'groups': records,
+        (str(_catalog_path(plan['legacy_store'], mode)), _json(catalog_value))])
+    result = {'ok': True, 'mode': mode, 'changed': background_changed or marker_changed, 'metrics': summary, 'groups': records,
         'revalidated_completed': revalidated,
         'completed_at': time.time(), 'input_sha256': plan['input_sha256']}
     result['observations'] = {key: metrics[key] for key in ('proof_accepted_count',

@@ -205,6 +205,137 @@ local function run_fixture(operation)
   t.assert_eq(result.code, 0, (result.stderr or "") .. (result.stdout or ""))
 end
 
+local secondary_fixture = [=[
+import copy, importlib.util, json, os, pathlib, subprocess, sys, tempfile
+from unittest.mock import patch
+tool, operation = sys.argv[1:]
+spec = importlib.util.spec_from_file_location('hot_unity', tool)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+with tempfile.TemporaryDirectory(prefix='tier1_chunks_') as temporary:
+    root = pathlib.Path(temporary).resolve()
+    baseline = 393216
+    def unit(name, sizes=(1,), kinds=None, module_name='Sample', options=()):
+        members = []
+        kinds = kinds or ['src'] * len(sizes)
+        for index, (size, kind) in enumerate(zip(sizes, kinds)):
+            suffix = '.gen.cpp' if kind == 'gen' else '.cpp'
+            member = root / 'Source/Runtime' / module_name / 'Private' / (name + str(index) + suffix)
+            member.parent.mkdir(parents=True, exist_ok=True)
+            with member.open('wb') as stream: stream.truncate(size)
+            members.append(member)
+        wrapper = root / ('SuperUnity.UBT.' + name + '.cpp')
+        wrapper.write_text('// Compiler-authored UBT unity membership; copied into nvim cache.\n'
+            + ''.join('#include "' + member.as_posix() + '"\n' for member in members), encoding='utf-8')
+        return {'file': str(wrapper), 'directory': str(root),
+            'arguments': ['clang++', '-std=c++17', *options, '-c', str(wrapper)],
+            'nvim_ue_members': [module.portable_member_path(str(member)) for member in members],
+            'nvim_ue_module_root': 'Source/Runtime/' + module_name}
+    def plan(entries, **kwargs):
+        before = copy.deepcopy(entries)
+        with patch.object(subprocess, 'Popen', side_effect=AssertionError('chunk planning must not run native')):
+            chunks = module.secondary_unity_chunks(entries, **kwargs)
+        assert entries == before, 'planning mutated original commands or membership'
+        assert len([i for chunk in chunks for i in chunk]) == len(set(i for chunk in chunks for i in chunk))
+        return chunks
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop('NVIM_UE_SUPER_UNITY_BUDGET_FACTOR', None)
+        if operation == 'triple_key':
+            entries = [unit('g0', kinds=['gen']), unit('s0'),
+                unit('m0', (1, 1), ['gen', 'src']),
+                unit('ctx0', kinds=['gen'], options=['-DVALUE=1']),
+                unit('other0', kinds=['gen'], module_name='Other'),
+                unit('g1', kinds=['gen']), unit('s1'),
+                unit('m1', (1, 1), ['src', 'gen']),
+                unit('ctx1', kinds=['gen'], options=['-DVALUE=1']),
+                unit('other1', kinds=['gen'], module_name='Other')]
+            assert plan(entries) == [[0, 5], [1, 6], [2, 7], [3, 8], [4, 9]]
+        elif operation == 'byte_budget':
+            entries = [unit(str(i), (size,)) for i, size in enumerate([200000, 190000, 5000, 200000])]
+            assert plan(entries, budget_factor=1) == [[0, 1], [2, 3]]
+            exact = [unit('edge' + str(i), (baseline // 2,)) for i in range(3)]
+            assert plan(exact, budget_factor=1) == [[0, 1]], 'the exact byte limit is inclusive'
+            # The budget is the sum of source bytes, rather than wrapper bytes or member count.
+            multi = [unit('many', (1,) * 81), unit('one')]
+            assert plan(multi, budget_factor=1) == [[0, 1]], 'legacy 80-source default leaked into Tier 1'
+            assert plan([unit('sum0', (100000, 100000)), unit('sum1', (100000, 100000))],
+                budget_factor=1) == [], 'all member bytes must count'
+        elif operation == 'factor_configuration':
+            entries = [unit('a', (baseline,)), unit('b', (baseline,))]
+            assert plan([unit('default0', (4 * baseline,)), unit('default1', (4 * baseline,))]) == [[0, 1]], \
+                'default factor must permit exactly eight UBT byte budgets'
+            assert plan([unit('too0', (5 * baseline,)), unit('too1', (4 * baseline,))]) == [], \
+                'the default factor must not exceed eight'
+            os.environ['NVIM_UE_SUPER_UNITY_BUDGET_FACTOR'] = '1'
+            assert plan(entries) == []
+            assert plan(entries, budget_factor=2) == [[0, 1]], 'explicit factor must override environment'
+            os.environ['NVIM_UE_SUPER_UNITY_BUDGET_FACTOR'] = '2'
+            assert plan(entries) == [[0, 1]]
+        elif operation == 'oversized_single':
+            entries = [unit('oversized', (baseline + 1,)), unit('small0'), unit('small1')]
+            assert plan(entries, budget_factor=1) == [[1, 2]], 'oversized original must stay indivisible'
+            assert plan(entries[:1], budget_factor=1) == []
+            assert plan(entries[1:2], budget_factor=1) == [], 'single UBT blocks must not be emitted'
+            assert plan(entries, budget_factor=1, max_unities=1) == []
+        elif operation == 'stable_order':
+            entries = [unit(str(i), module_name=('Sample' if i % 2 == 0 else 'Other')) for i in range(10)]
+            expected = [[0, 2], [1, 3], [4, 6], [5, 7]]
+            assert plan(entries, max_unities=2) == expected
+            assert plan(entries, max_unities=2) == expected, 'repeated planning changed source order'
+            assert all(chunk == sorted(chunk) for chunk in expected)
+        elif operation == 'unknown_size':
+            unknown, a, b = unit('unknown'), unit('a'), unit('b')
+            missing = next((root / 'Source').rglob('unknown0.cpp'))
+            missing.unlink()
+            diagnostics = []
+            assert plan([unknown, a, b], budget_factor=1, diagnostics=diagnostics) == [[1, 2]]
+            assert len(diagnostics) == 1, diagnostics
+            record = diagnostics[0]
+            assert record['reason'] == 'member-size-unavailable' and record['entry_index'] == 0, record
+            assert record['assumed_bytes'] > baseline and record['member'], record
+            assert record['file'] == unknown['file'], record
+        else: raise AssertionError(operation)
+    print(json.dumps({'operation': operation, 'status': 'passed'}))
+]=]
+
+local function run_secondary_fixture(operation)
+  local python = vim.fn.exepath("python")
+  if python == "" then python = vim.fn.exepath("python3") end
+  if python == "" then
+    t.skip("Tier 1 secondary chunk planner", "Python unavailable")
+    return
+  end
+  local script = vim.fn.tempname() .. "_tier1_chunks.py"
+  local stream = assert(io.open(script, "wb"))
+  stream:write(secondary_fixture)
+  stream:close()
+  local result = vim.system({ python, "-B", "-I", script,
+    vim.fn.stdpath("config") .. "/tools/build_hot_super_unity_cdb.py", operation }, { text = true }):wait()
+  pcall(vim.fn.delete, script)
+  t.assert_eq(result.code, 0, (result.stderr or "") .. (result.stdout or ""))
+end
+
+t.describe("Tier 1 byte-budget secondary UBT planning", function()
+  t.it("isolates generated, source and mixed members by module and full compiler context", function()
+    run_secondary_fixture("triple_key")
+  end)
+  t.it("uses inclusive total member bytes without inheriting the old source-count budget", function()
+    run_secondary_fixture("byte_budget")
+  end)
+  t.it("honors the default, environment and explicit byte-budget factor precedence", function()
+    run_secondary_fixture("factor_configuration")
+  end)
+  t.it("preserves indivisible oversized originals and does not emit single UBT blocks", function()
+    run_secondary_fixture("oversized_single")
+  end)
+  t.it("packs interleaved buckets in stable CDB order with the UBT count limit", function()
+    run_secondary_fixture("stable_order")
+  end)
+  t.it("keeps unreadable members outside batches and reports the conservative byte estimate", function()
+    run_secondary_fixture("unknown_size")
+  end)
+end)
+
 t.describe("generated-only secondary UBT batches", function()
   t.it("merges verified generated wrappers while preserving complete originals and member order", function()
     run_fixture("merge")

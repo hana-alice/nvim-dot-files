@@ -2,6 +2,15 @@ local t = require("tests.harness")
 local cfg = t.bootstrap()
 local api = vim.api
 
+local function position_mouse(win)
+  vim.cmd.redraw()
+  local position = vim.fn.screenpos(win, 1, 1)
+  api.nvim_input_mouse("left", "press", "", 0, position.row - 1, position.col - 1)
+  api.nvim_input_mouse("left", "release", "", 0, position.row - 1, position.col - 1)
+  api.nvim_feedkeys("", "x", false)
+  t.assert_eq(vim.fn.getmousepos().winid, win)
+end
+
 local function fixture(review, fn)
   local original_tabs = {}
   for _, tab in ipairs(api.nvim_list_tabpages()) do original_tabs[tab] = true end
@@ -150,6 +159,7 @@ t.describe("keymaps layout file reference", function()
     fixture(true, function(source, source_buf, target, session)
       api.nvim_buf_set_lines(source_buf, 0, 1, false, { "target.h" })
       local mapping = vim.fn.maparg("<C-LeftMouse>", "n", false, true)
+      position_mouse(source)
       local old = package.loaded["utils.lsp_fallback"]
       local definitions = 0
       package.loaded["utils.lsp_fallback"] = { definition = function() definitions = definitions + 1 end }
@@ -165,9 +175,10 @@ t.describe("keymaps layout file reference", function()
 
   t.it("Ctrl-mouse consumes a stale layout transition without requesting definition on its replacement", function()
     dofile(cfg .. "/lua/config/keymaps.lua")
-    fixture(true, function(_, source_buf)
+    fixture(true, function(source, source_buf)
       api.nvim_buf_set_lines(source_buf, 0, 1, false, { "target.h" })
       local mapping = vim.fn.maparg("<C-LeftMouse>", "n", false, true)
+      position_mouse(source)
       local old = package.loaded["utils.lsp_fallback"]
       local definitions = 0
       package.loaded["utils.lsp_fallback"] = { definition = function() definitions = definitions + 1 end }

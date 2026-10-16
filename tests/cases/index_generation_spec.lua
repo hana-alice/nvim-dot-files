@@ -1379,11 +1379,19 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 def entry(index, count, module_name='Engine', extra=()):
-    path = '/build/SuperUnity.UBT.' + str(index) + '.cpp'
-    return {'file': path, 'directory': '/build',
-        'arguments': ['clang++', '-std=c++17', '-include', '/build/PCH.h', *extra, '-c', path],
+    root = pathlib.Path(__file__).resolve().parent
+    path = root / ('SuperUnity.UBT.' + str(index) + '.cpp')
+    members = [root / 'Source/Runtime' / module_name / 'Private' /
+               (str(index) + '_' + str(i) + '.gen.cpp') for i in range(count)]
+    for member in members:
+        member.parent.mkdir(parents=True, exist_ok=True)
+        member.write_text('// source\n', encoding='utf-8')
+    path.write_text('// Compiler-authored UBT unity membership; copied into nvim cache.\n' +
+        ''.join('#include "' + member.as_posix() + '"\n' for member in members), encoding='utf-8')
+    return {'file': str(path), 'directory': str(root),
+        'arguments': ['clang++', '-std=c++17', '-include', str(root / 'PCH.h'), *extra, '-c', str(path)],
         'nvim_ue_module_root': 'Source/Runtime/' + module_name,
-        'nvim_ue_members': [module_name + '/' + str(index) + '_' + str(i) + '.gen.cpp' for i in range(count)]}
+        'nvim_ue_members': [module.portable_member_path(str(member)) for member in members]}
 
 entries = [entry(0, 30), entry(1, 25), entry(2, 30), entry(3, 20),
            entry(4, 5, extra=('-DFEATURE=1',)), entry(5, 5, 'Other'),

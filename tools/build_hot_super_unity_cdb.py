@@ -176,38 +176,80 @@ def compile_context_key(entry):
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]
 
 
-def secondary_unity_chunks(entries, max_sources=80, max_unities=8):
+def secondary_unity_chunks(entries, max_sources=None, max_unities=8,
+                           budget_factor=None, diagnostics=None):
     """Plan same-context SuperUnity chunks without modifying original commands.
 
-    The source budget counts every member, including generated sources. Original
-    UBT groups remain indivisible, and unrelated/exact entries remain available
-    to the caller. These are candidates; the native admission step still decides
-    whether a chunk can replace its originals.
+    Each chunk is bounded by budget_factor * UBT's 384 KiB member-source budget.
+    max_sources is an optional additional limit for existing strict callers.
+    Original UBT groups remain indivisible; unknown source sizes conservatively
+    exceed the budget. These are candidates, not admission receipts.
     """
-    if max_sources < 1 or max_unities < 1:
+    if budget_factor is None:
+        budget_factor = int(os.environ.get('NVIM_UE_SUPER_UNITY_BUDGET_FACTOR', '8'))
+    if (not isinstance(budget_factor, int) or isinstance(budget_factor, bool)
+            or budget_factor < 1 or not isinstance(max_unities, int)
+            or isinstance(max_unities, bool) or max_unities < 1
+            or (max_sources is not None and (not isinstance(max_sources, int)
+                or isinstance(max_sources, bool) or max_sources < 1))):
         raise ValueError('SuperUnity chunk budgets must be positive')
+    byte_budget = budget_factor * 393216
     buckets = defaultdict(list)
     for index, entry in enumerate(entries):
         members = entry.get('nvim_ue_members')
         module = entry.get('nvim_ue_module_root')
         name = entry.get('file', '').replace('\\', '/').rsplit('/', 1)[-1]
         if name.startswith('SuperUnity.UBT.') and members and module:
-            buckets[(module, compile_context_key(entry))].append(index)
+            generated = [member.lower().endswith('.gen.cpp') for member in members]
+            member_class = 'gen' if all(generated) else 'mixed' if any(generated) else 'src'
+            buckets[(module, compile_context_key(entry), member_class)].append(index)
+
+    def member_bytes(index):
+        entry = entries[index]
+        wrapper = winpath_local(entry['file'])
+        if not os.path.isabs(wrapper):
+            wrapper = os.path.join(winpath_local(entry.get('directory', '')), wrapper)
+        member = None
+        try:
+            with open(wrapper, encoding='utf-8') as source:
+                paths = [match.group(1) for line in source
+                         if (match := UNITY_INCLUDE_RE.match(line))]
+            if [portable_member_path(path) for path in paths] != entry['nvim_ue_members']:
+                raise ValueError('wrapper-membership-mismatch')
+            size = 0
+            for member in paths:
+                path = winpath_local(member)
+                if not os.path.isabs(path):
+                    path = os.path.join(os.path.dirname(wrapper), path)
+                size += os.stat(path).st_size
+            return size
+        except (OSError, UnicodeError, ValueError) as error:
+            detail = {'entry_index': index, 'file': entry['file'], 'member': member,
+                      'reason': 'member-size-unavailable', 'detail': str(error),
+                      'assumed_bytes': byte_budget + 1}
+            if diagnostics is not None:
+                diagnostics.append(detail)
+            else:
+                print('[hot-super] ' + json.dumps(detail, ensure_ascii=True), file=sys.stderr)
+            return byte_budget + 1
 
     chunks = []
     for indexes in buckets.values():
-        chunk, count = [], 0
+        chunk, size, count = [], 0, 0
         for index in indexes:
-            size = len(entries[index]['nvim_ue_members'])
-            if chunk and (count + size > max_sources or len(chunk) >= max_unities):
+            source_bytes = member_bytes(index)
+            sources = len(entries[index]['nvim_ue_members'])
+            if chunk and (size + source_bytes > byte_budget or len(chunk) >= max_unities
+                    or (max_sources is not None and count + sources > max_sources)):
                 if len(chunk) > 1:
                     chunks.append(chunk)
-                chunk, count = [], 0
-            if size > max_sources:
+                chunk, size, count = [], 0, 0
+            if source_bytes > byte_budget or (max_sources is not None and sources > max_sources):
                 # An oversized original is retained, not split or omitted.
                 continue
             chunk.append(index)
-            count += size
+            size += source_bytes
+            count += sources
         if len(chunk) > 1:
             chunks.append(chunk)
     return sorted(chunks, key=lambda chunk: chunk[0])

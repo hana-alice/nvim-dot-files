@@ -1,6 +1,13 @@
 local t = require("tests.harness")
 local cfg = t.bootstrap()
 
+-- Native snippets queue selection keys; finish them while their buffer is
+-- still current so a later input-driven fixture cannot receive those keys.
+local function finish_snippet_input()
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
+  t.assert_eq(vim.fn.getchar(1), 0, "snippet input must be consumed before changing buffers")
+end
+
 t.describe("ide_editing: audited UE snippets", function()
   t.it("registers UE snippets alongside ordinary C++ and excludes unaudited legacy templates", function()
     local lazyvim = _G.LazyVim
@@ -32,10 +39,13 @@ t.describe("ide_editing: audited UE snippets", function()
     -- Close the previous undo block before expanding the user's next action.
     vim.bo[buf].undolevels = vim.bo[buf].undolevels
     vim.snippet.expand(definitions["UE property"].body)
+    vim.api.nvim_feedkeys("", "x", false)
     t.assert_contains(vim.api.nvim_buf_get_lines(buf, 0, -1, false)[1], "UPROPERTY(")
     t.assert_true(vim.snippet.active({ direction = 1 }))
     vim.snippet.jump(1)
+    vim.api.nvim_feedkeys("", "x", false)
     vim.snippet.stop()
+    finish_snippet_input()
     vim.cmd("undo")
     t.assert_eq(table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n"), "")
     vim.api.nvim_buf_delete(buf, { force = true })
@@ -46,8 +56,10 @@ t.describe("ide_editing: audited UE snippets", function()
     local buf = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_set_current_buf(buf)
     vim.snippet.expand(definitions["UE log"].body)
+    vim.api.nvim_feedkeys("", "x", false)
     local text = vim.api.nvim_buf_get_lines(buf, 0, -1, false)[1]
     vim.snippet.stop()
+    finish_snippet_input()
     vim.api.nvim_set_current_buf(original)
     vim.api.nvim_buf_delete(buf, { force = true })
     t.assert_eq(text, 'UE_LOG(LogTemp, Log, TEXT("Message"));')

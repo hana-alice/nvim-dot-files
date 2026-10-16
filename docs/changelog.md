@@ -90,9 +90,15 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v2.8.0` → [docs/release_2.8.0.md](release_2.8.0.md) (staged index delivery, honest failure reporting and layout roles; tag pending)
 
+- `v2.9.0` → [docs/release_2.9.0.md](release_2.9.0.md) (Tier 1 SuperUnity production delivery; full regression 4079/4079, 2 skips; tag pending)
+
 ## Unreleased
 
-已将本轮切片归档至 [2.8.0](release_2.8.0.md)。
+本轮 Tier 1 切片已归档至 [2.9.0](release_2.9.0.md)；提交前串行全量 4079/4079、0 FAIL、2 SKIP。
+
+## 已归档补记（2.8.0）
+
+以下保留 [2.8.0](release_2.8.0.md) 的脱敏收尾记录，不属于 2.9.0 的功能范围。
 
 ### 2026-10-16 — 公开镜像脱敏与 2.8.0 归档
 

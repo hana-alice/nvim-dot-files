@@ -37,6 +37,7 @@ _POLICY_FILES = ('clangd_batch_admission.py', 'clangd_batch_bindings.py',
 _HEADER_CASE_PATH = Path(__file__).resolve().parent / _POLICY_FILES[-1]
 _HEADER_CASE_POLICY = None
 _OWNED_OVERLAY_MEMO = {}
+_TIER1_OVERLAY_SCOPE_DEPTH = 0
 _RUN_METRIC_FIELDS = ('indexing_wall_seconds', 'process_wall_seconds', 'graph_decode_seconds',
                       'spawn_seconds', 'shutdown_seconds', 'cpu_seconds', 'peak_working_set_bytes')
 _QUERY_RESOLUTION_MEMO = {}
@@ -167,6 +168,24 @@ def _owned_overlay_policy():
         _HEADER_CASE_POLICY = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(_HEADER_CASE_POLICY)
     return _HEADER_CASE_POLICY
+
+
+@contextmanager
+def tier1_overlay_scope(enabled=True):
+    """Share physical-name checks only inside one outer Tier 1 operation."""
+    global _TIER1_OVERLAY_SCOPE_DEPTH
+    if not enabled:
+        yield
+        return
+    if _TIER1_OVERLAY_SCOPE_DEPTH == 0:
+        _OWNED_OVERLAY_MEMO.clear()
+    _TIER1_OVERLAY_SCOPE_DEPTH += 1
+    try:
+        yield
+    finally:
+        _TIER1_OVERLAY_SCOPE_DEPTH -= 1
+        if _TIER1_OVERLAY_SCOPE_DEPTH == 0:
+            _OWNED_OVERLAY_MEMO.clear()
 
 
 def _owned_overlays(entry):
@@ -1440,6 +1459,337 @@ def _save_group_hints(output, additions):
         # Losing an advisory lookup is observable, but never drops coverage or
         # invalidates an independently usable receipt.
         return 'group-hints-write-failed'
+
+
+def _tier1_ubt_members(entry):
+    members = _validate_ubt(entry)
+    expected = '// Compiler-authored UBT unity membership; copied into nvim cache.\n' + ''.join(
+        '#include "' + path + '"\n' for path in members)
+    if Path(entry['file']).read_text(encoding='utf-8') != expected:
+        raise ValueError('tier1-noncanonical-original-wrapper')
+    return members
+
+
+def _tier1_candidate_spec(group, assets):
+    """Describe a deterministic live-source candidate without writing assets."""
+    members = [path for entry in group for path in _tier1_ubt_members(entry)]
+    body = '// Tier 1 same-context compiler-authored UBT batch.\n' + ''.join(
+        '#include "' + path.replace('\\', '/') + '"\n' for path in members)
+    identity = _sha(_json({'entries': [_native(entry) for entry in group], 'body': body}).encode())
+    wrapper = Path(assets) / ('SuperUnity.Tier1.Batch.' + identity[:24] + '.cpp')
+    arguments = rewritten_arguments(group[0], str(wrapper))
+    if arguments is None:
+        raise ValueError('tier1-source-rewrite-failed')
+    candidate = dict(group[0], file=str(wrapper), arguments=arguments,
+        nvim_ue_members=[member for entry in group for member in entry['nvim_ue_members']],
+        nvim_ue_tier=1, nvim_ue_tier1_ubt_count=len(group))
+    # Tier 1 qualifies only this explicit candidate run. It must never inherit
+    # a strict frozen reader's certificate or be discovered by its cache.
+    for name in ('nvim_ue_batch_receipt', 'nvim_ue_batch_receipt_sha256', 'nvim_ue_batch_ubt_count'):
+        candidate.pop(name, None)
+    return _windows_paths(candidate), body
+
+
+def _tier1_candidate(group, assets):
+    """Build a content-addressed Tier 1 wrapper without strict-proof metadata."""
+    candidate, body = _tier1_candidate_spec(group, assets)
+    _write(candidate['file'], body)
+    return candidate
+
+
+def _tier1_candidate_index(candidate, directory, clangd, timeout, server_profile=None):
+    """Index just the candidate, then inspect per-file own nodes, not graphs.
+
+    Included .cpp files have a file shard with a nonzero own digest. They need
+    not have the IsTU flag (1), which belongs to the enclosing candidate TU.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    trigger = directory / 'trigger.cpp'
+    _write(trigger, '// Private Tier 1 BackgroundIndex trigger.\n')
+    _write(directory / 'compile_commands.json', _json([_private_command(candidate),
+        {'directory': str(directory), 'file': str(trigger),
+         'arguments': ['clang++', '-x', 'c++', '-c', str(trigger)]}]))
+    result = run(directory, directory / 'run', trigger, clangd, timeout=timeout, jobs=1,
+        server_profile=server_profile)
+    if result.get('background_compile_success') is not True:
+        return dict(result, member_main_shards=[])
+    sources = set()
+    for path in result.get('shards', []):
+        shard = read_shard(path)
+        own = [(uri, node) for uri, node in shard['sources'].items()
+               if node['digest'] != '0000000000000000']
+        if len(own) != 1:
+            raise ValueError('tier1-invalid-own-shard: ' + str(path))
+        uri, node = own[0]
+        if node['flags'] & 2:
+            return dict(result, background_compile_success=False, shard_had_errors=True,
+                member_main_shards=sorted(sources))
+        sources.add(str(_uri_path(uri)))
+    return dict(result, member_main_shards=sorted(sources))
+
+
+def _tier1_members_match(group, candidate):
+    """Compare the wrapper's actual includes independently of its metadata."""
+    expected = [path for entry in group for path in _tier1_ubt_members(entry)]
+    text = Path(candidate['file']).read_text(encoding='utf-8')
+    # This producer owns the whole wrapper. Reject noncanonical lines instead
+    # of overlooking an additional preprocessor spelling such as '# include'.
+    if not re.fullmatch(r'// Tier 1 same-context compiler-authored UBT batch\.\n'
+                        r'(?:#include "[^"\r\n]+"\n)+', text):
+        return False, expected
+    actual = re.findall(r'^#include "([^"]+)"$', text, re.M)
+    original_keys, candidate_keys = ([_command_key(path) for path in paths] for paths in (expected, actual))
+    expected_members = [member for entry in group for member in entry['nvim_ue_members']]
+    actual_members = candidate.get('nvim_ue_members', [])
+    return (len(original_keys) == len(set(original_keys))
+        and len(candidate_keys) == len(set(candidate_keys))
+        and set(original_keys) == set(candidate_keys)
+        and len(expected_members) == len(set(expected_members))
+        and len(actual_members) == len(set(actual_members))
+        and set(expected_members) == set(actual_members)), expected
+
+
+def _tier1_source_coverage(entries):
+    return collections.Counter(member for entry in entries for member in
+        (entry.get('nvim_ue_members') or [entry.get('file', '')]))
+
+
+def _tier1_inputs(group):
+    paths = [entry['file'] for entry in group]
+    paths += [path for entry in group for path in _tier1_ubt_members(entry)]
+    return ([{'path': str(path), 'sha256': _sha(Path(path).read_bytes())}
+             for path in sorted(set(paths))] + _owned_overlay_assets(group))
+
+
+def _tier1_cache_key(group, candidate, tool_hash, profile, environment):
+    return _sha(_json({'original_entries': [_native(entry) for entry in group],
+        'candidate': _native(candidate), 'tool_sha256': tool_hash,
+        'server_profile': profile, 'compiler_environment': environment}).encode())
+
+
+def _tier1_compile_rejection(result):
+    """Only a completed, cleanly exited run can establish a reusable rejection."""
+    return (isinstance(result, dict) and result.get('indexing_complete') is True
+        and type(result.get('exit_code')) is int and result['exit_code'] == 0
+        and ((type(result.get('compile_failure_count')) is int and result['compile_failure_count'] > 0)
+            or result.get('shard_had_errors') is True))
+
+
+def _tier1_cached(group, candidate, body, output, key, inputs, tool_hash, profile, environment):
+    """Validate only wrapper/member/owned-overlay bytes, not header dependencies.
+
+    Header changes intentionally DO NOT invalidate Tier 1 receipts. This is the
+    selected live-CDB tradeoff; these receipts never authorize frozen activation.
+    """
+    try:
+        index = json.loads((output / 'receipts' / (key + '.json')).read_text(encoding='utf-8'))
+        if (index.get('schema') != 1 or index.get('tier') != 1 or index.get('cache_key') != key
+                or type(index.get('accepted')) is not bool):
+            raise ValueError('tier1-cache-index-invalid')
+        path = Path(index['receipt'])
+        if path.resolve().parent != (output / 'receipts').resolve():
+            raise ValueError('tier1-cache-receipt-outside-store')
+        raw = path.read_bytes()
+        digest = _sha(raw)
+        receipt = json.loads(raw)
+        if (digest != index['receipt_sha256'] or receipt.get('schema') != 1
+                or receipt.get('tier') != 1 or receipt.get('reusable') is not True
+                or receipt.get('cache_key') != key or receipt.get('accepted') is not index['accepted']
+                or receipt.get('original_entries') != [_native(entry) for entry in group]
+                or receipt.get('candidate') != _native(candidate)
+                or receipt.get('members') != candidate['nvim_ue_members']
+                or receipt.get('tool_sha256') != tool_hash or receipt.get('server_profile') != profile
+                or receipt.get('compiler_environment') != environment):
+            raise ValueError('tier1-cache-receipt-identity-mismatch')
+        if receipt.get('inputs') != inputs:
+            raise ValueError('tier1-cache-inputs-changed')
+        if not receipt['accepted'] and not _tier1_compile_rejection(receipt.get('compile_result')):
+            raise ValueError('tier1-cache-rejection-inconclusive')
+        if receipt.get('candidate_sha256') != _sha(body.encode('utf-8')):
+            raise ValueError('tier1-cache-candidate-hash-mismatch')
+        if Path(candidate['file']).read_bytes() != body.encode('utf-8'):
+            raise ValueError('tier1-cache-candidate-changed')
+        gates = receipt.get('gates')
+        if (not isinstance(gates, dict) or not isinstance(receipt.get('reason'), str)
+                or not receipt['reason'] or (receipt['accepted'] and not all(
+                    gates.get(name) is True for name in ('compile_success', 'main_shards_complete', 'members_equal')))):
+            raise ValueError('tier1-cache-gates-invalid')
+        return {'receipt': str(path), 'receipt_sha256': digest, 'accepted': receipt['accepted'],
+                'reason': receipt['reason'], 'gates': gates}, None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        return None, str(error)
+
+
+@tier1_overlay_scope()
+def _accelerate_tier1(entries, output_dir, clangd_path, max_group=8, timeout=90,
+                      budget_factor=None, server_profile=None, reuse_only=False):
+    """Qualify live-source chunks, or perform strictly read-only cache reuse.
+
+    Header dependencies are deliberately excluded from the Tier 1 cache boundary.
+    Compiler-success and rejection caches bind wrapper/member/owned-overlay bytes.
+    They are independent of strict frozen-runtime qualification.
+    """
+    started = time.monotonic()
+    output = Path(output_dir).resolve() / 'tier1'
+    diagnostics = []
+    chunks = secondary_unity_chunks(entries, max_unities=max_group,
+        budget_factor=budget_factor, diagnostics=diagnostics)
+    metrics = {'tier': 1, 'original_ubt_count': sum(_is_ubt(entry) for entry in entries),
+        'batch_count': 0, 'accepted_ubt_count': 0, 'groups': [], 'chunk_diagnostics': diagnostics,
+        'cache_hits': 0, 'receipt_reuse': False, 'proof_directory': None}
+    shaders = {'.usf', '.ush', '.hlsl', '.hlsli', '.glsl', '.vert', '.frag', '.geom', '.tesc', '.tese', '.comp', '.metal'}
+    metrics['shader_count'] = sum(Path(entry.get('file', '')).suffix.lower() in shaders for entry in entries)
+    metrics['exact_count'] = sum(not _is_ubt(entry) and Path(entry.get('file', '')).suffix.lower()
+        in ('.c', '.cc', '.cpp', '.cxx', '.c++') for entry in entries)
+    metrics['other_count'] = len(entries) - metrics['original_ubt_count'] - metrics['shader_count'] - metrics['exact_count']
+    resolved = shutil.which(str(clangd_path)) if clangd_path else None
+    executable = Path(resolved or clangd_path or '')
+    try:
+        tool_hash = _sha(executable.read_bytes()) if executable.is_file() else None
+        tool_error = None
+    except OSError as error:
+        tool_hash, tool_error = None, 'clangd-unreadable: ' + str(error)
+    try:
+        profile, profile_error = normalize_server_profile(server_profile), None
+    except ValueError as error:
+        profile, profile_error = None, str(error)
+    environment = _compiler_environment(profile)
+    invocation, replacements, consumed = None, {}, set()
+    for chunk in chunks:
+        group = [entries[index] for index in chunk]
+        gates = {'compile_success': False, 'main_shards_complete': False, 'members_equal': False}
+        record = {'tier': 1, 'original_indexes': chunk, 'original_ubt_count': len(chunk),
+            'accepted': False, 'gates': gates, 'run_metrics': [], 'cached': False, 'deferred': False}
+        inputs, candidate, result, cache_key, cached, body = [], None, None, None, None, None
+        group_started = time.monotonic()
+        try:
+            if profile_error:
+                raise ValueError(profile_error)
+            if not tool_hash:
+                raise ValueError(tool_error or 'clangd-unavailable')
+            inputs = _tier1_inputs(group)
+            candidate, body = _tier1_candidate_spec(group, output / 'assets')
+            cache_key = _tier1_cache_key(group, candidate, tool_hash, profile, environment)
+            cached, record['cache_reason'] = _tier1_cached(group, candidate, body, output,
+                cache_key, inputs, tool_hash, profile, environment)
+            if cached:
+                record.update(accepted=cached['accepted'], reason=cached['reason'], cached=True,
+                    gates=dict(cached['gates']), receipt=cached['receipt'])
+                metrics['cache_hits'] += 1
+            elif reuse_only:
+                record.update(reason='verification-not-cached', deferred=True)
+            else:
+                candidate = _tier1_candidate(group, output / 'assets')
+                gates['members_equal'], expected = _tier1_members_match(group, candidate)
+                if not gates['members_equal']:
+                    raise ValueError('tier1-membership-mismatch')
+                if invocation is None:
+                    work = _proof_work_root(output)
+                    work.mkdir(parents=True, exist_ok=True)
+                    invocation = Path(tempfile.mkdtemp(prefix='tier1-', dir=work))
+                    metrics['proof_directory'] = str(invocation)
+                result = _tier1_candidate_index(candidate, invocation / ('group-' + str(chunk[0])),
+                    str(executable.resolve()), timeout, server_profile=profile)
+                record['run_metrics'] = [{key: result.get(key) for key in _RUN_METRIC_FIELDS}]
+                gates['compile_success'] = result.get('background_compile_success') is True
+                if not gates['compile_success']:
+                    raise ValueError('tier1-candidate-index-failed')
+                observed = {_command_key(path) for path in result.get('member_main_shards', [])}
+                record['missing_member_main_shards'] = [path for path in expected if _command_key(path) not in observed]
+                gates['main_shards_complete'] = (result.get('missing_main_shards') in ([], 0)
+                    and not record['missing_member_main_shards'])
+                if not gates['main_shards_complete']:
+                    raise ValueError('tier1-main-shards-missing')
+                # Recheck actual wrapper and source inputs after the private run.
+                gates['members_equal'], _ = _tier1_members_match(group, candidate)
+                if not gates['members_equal']:
+                    raise ValueError('tier1-membership-mismatch')
+                if any(_sha(Path(item['path']).read_bytes()) != item['sha256'] for item in inputs):
+                    raise ValueError('tier1-inputs-changed-during-index')
+                if _compiler_environment(profile) != environment:
+                    raise ValueError('tier1-compiler-environment-changed')
+                record.update(accepted=True, reason='tier1-compile-shards-members-accepted')
+        except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired) as error:
+            record['reason'] = str(error)
+            record['deferred'] = reuse_only
+        # Runtime/process paths and timings deliberately stay out of receipts.
+        # These diagnostic receipts have no strict-runtime publication fields.
+        try:
+            if cached:
+                receipt_path, receipt_digest = Path(cached['receipt']), cached['receipt_sha256']
+            elif not reuse_only:
+                receipt = {'schema': 1, 'tier': 1,
+                'reusable': record['accepted'] or _tier1_compile_rejection(result), 'cache_key': cache_key,
+                'accepted': record['accepted'],
+                'reason': record['reason'], 'gates': dict(gates), 'inputs': inputs,
+                'compile_result': {name: result.get(name) for name in
+                    ('indexing_complete', 'exit_code', 'compile_failure_count', 'shard_had_errors')}
+                    if result is not None else None,
+                'original_entries': [_native(entry) for entry in group],
+                'candidate': _native(candidate) if candidate else None,
+                'candidate_sha256': _sha(body.encode('utf-8')) if body is not None else None,
+                'members': candidate.get('nvim_ue_members', []) if candidate else [],
+                'tool_sha256': tool_hash, 'server_profile': profile, 'compiler_environment': environment}
+                receipt_raw = _json(receipt)
+                receipt_digest = _sha(receipt_raw.encode())
+                receipt_path = output / 'receipts' / ('receipt.' + receipt_digest[:24] + '.json')
+                _write(receipt_path, receipt_raw)
+                if _sha(receipt_path.read_bytes()) != receipt_digest:
+                    raise ValueError('tier1-receipt-changed-during-publication')
+                record['receipt'] = str(receipt_path)
+                if cache_key:
+                    _write(output / 'receipts' / (cache_key + '.json'), _json({'schema': 1, 'tier': 1,
+                        'cache_key': cache_key, 'accepted': record['accepted'], 'receipt': str(receipt_path),
+                        'receipt_sha256': receipt_digest}))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            record.update(accepted=False, reason='tier1-receipt-unavailable: ' + str(error))
+        if record['accepted']:
+            candidate.update(nvim_ue_tier1_receipt=str(receipt_path),
+                nvim_ue_tier1_receipt_sha256=receipt_digest)
+            replacements[min(chunk)] = dict(sorted(candidate.items()))
+            consumed.update(index for index in chunk if index != min(chunk))
+            metrics['batch_count'] += 1
+            metrics['accepted_ubt_count'] += len(chunk)
+        record['proof_seconds'] = round(time.monotonic() - group_started, 6)
+        metrics['groups'].append(record)
+        print('[tier1-batch] ' + ('admitted' if record['accepted'] else 'retained')
+            + ' group=' + str(chunk[0]) + ' ubt=' + str(len(chunk)) + ' reason=' + record['reason'], flush=True)
+    background = [replacements.get(index, entry) for index, entry in enumerate(entries) if index not in consumed]
+    original_coverage = _tier1_source_coverage(entries)
+    covered = _tier1_source_coverage(background)
+    if original_coverage != covered:
+        background = list(entries)
+        metrics.update(batch_count=0, accepted_ubt_count=0, invalidated_reason='tier1-output-coverage-mismatch')
+        for record in metrics['groups']:
+            record.update(accepted=False, reason='tier1-output-coverage-mismatch')
+    metrics.update(output_entries=len(background), input_member_count=sum(original_coverage.values()),
+        output_member_count=sum(_tier1_source_coverage(background).values()),
+        coverage_complete=original_coverage == _tier1_source_coverage(background),
+        retained_ubt_count=metrics['original_ubt_count'] - metrics['accepted_ubt_count'],
+        new_batch_count=sum(record['accepted'] and not record['cached'] for record in metrics['groups']),
+        new_proof_count=sum(not record['cached'] and not record['deferred'] for record in metrics['groups']),
+        deferred_group_count=sum(record['deferred'] for record in metrics['groups']),
+        proof_accepted_count=sum(record['accepted'] for record in metrics['groups']),
+        proof_rejected_count=sum(not record['accepted'] and not record['deferred'] for record in metrics['groups']),
+        proof_uncached_count=sum(record['deferred'] for record in metrics['groups']),
+        selector_reuse_status='accepted' if replacements else 'zero-hit',
+        receipt_reuse=metrics['cache_hits'] > 0,
+        proof_seconds=round(time.monotonic() - started, 6))
+    return background, metrics
+
+
+def accelerate_tier1(entries, output_dir, clangd_path, max_group=8, timeout=90,
+                     budget_factor=None, server_profile=None):
+    return _accelerate_tier1(entries, output_dir, clangd_path, max_group, timeout,
+        budget_factor, server_profile)
+
+
+def reuse_tier1(entries, output_dir, clangd_path, max_group=8, timeout=90,
+                budget_factor=None, server_profile=None):
+    """Reuse current Tier 1 successes/rejections without any filesystem writes."""
+    return _accelerate_tier1(entries, output_dir, clangd_path, max_group, timeout,
+        budget_factor, server_profile, reuse_only=True)
 
 
 def accelerate(entries, output_dir, clangd_path, max_group=8, timeout=90, verify_missing=True, server_profile=None,

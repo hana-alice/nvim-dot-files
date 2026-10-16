@@ -5,6 +5,8 @@ local fixture = [=[
 import importlib.util, json, os, pathlib, subprocess, sys, tempfile, time
 from unittest.mock import patch
 tool, operation = sys.argv[1:]
+# Existing graph-proof fixtures explicitly exercise the supported strict mode.
+os.environ['NVIM_UE_BATCH_TIER'] = 'strict'
 spec = importlib.util.spec_from_file_location('background', tool)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
@@ -15,10 +17,17 @@ with tempfile.TemporaryDirectory(prefix='background_batch_') as temporary:
     store = root / 'verified_batches'
     store.mkdir()
     background, marker, plan_path = root / 'background.json', root / 'marker.json', root / 'plan.json'
-    entries = [{'directory': str(root), 'file': str(root / ('SuperUnity.UBT.Test.%d.cpp' % index)),
-        'arguments': ['clang++', '-x', 'c++', str(root / ('SuperUnity.UBT.Test.%d.cpp' % index))],
-        'nvim_ue_module_root': str(root / 'Module'), 'nvim_ue_members': [str(root / ('member%d.cpp' % index))]}
-        for index in range(4)]
+    entries = []
+    for index in range(4):
+        member = root / ('member%d.cpp' % index)
+        member.write_text('int member%d() { return 1; }\n' % index, encoding='utf-8')
+        wrapper = root / ('SuperUnity.UBT.Test.%d.cpp' % index)
+        wrapper.write_text('// Compiler-authored UBT unity membership; copied into nvim cache.\n'
+            + '#include "' + member.as_posix() + '"\n', encoding='utf-8')
+        entries.append({'directory': str(root), 'file': str(wrapper),
+            'arguments': ['clang++', '-x', 'c++', str(wrapper)],
+            'nvim_ue_module_root': str(root / 'Module'),
+            'nvim_ue_members': [module.verified.portable_member_path(str(member))]})
     exact = {'directory': str(root), 'file': str(root / 'exact.cpp'), 'arguments': ['clang++', 'exact.cpp']}
     shader = {'directory': str(root), 'file': str(root / 'test.usf'), 'arguments': ['clang++', 'test.usf'],
         'nvim_ue_background_route': 'shader-compatibility'}
@@ -27,6 +36,178 @@ with tempfile.TemporaryDirectory(prefix='background_batch_') as temporary:
     background.write_text('previous background', encoding='utf-8')
     marker.write_text(json.dumps({'schema': 1, 'kept': 'original marker'}), encoding='utf-8')
     accepted_stores, calls = set(), []
+
+    if operation.startswith('tier1_'):
+        os.environ.pop('NVIM_UE_BATCH_TIER', None)
+        assert module._mode() == '1', 'production default must be explicit'
+        indexed = []
+        def candidate_index(candidate, directory, clangd, timeout, server_profile=None):
+            indexed.append(dict(candidate))
+            assert timeout == 90 and server_profile is None
+            if operation == 'tier1_failed_cached':
+                return {'background_compile_success': False, 'missing_main_shards': [],
+                    'member_main_shards': [], 'indexing_complete': True, 'exit_code': 0, 'compile_failure_count': 1}
+            if operation == 'tier1_transient_retry' and len(indexed) == 1:
+                return {'background_compile_success': False, 'missing_main_shards': [],
+                    'member_main_shards': [], 'indexing_complete': False, 'exit_code': 0, 'compile_failure_count': 0}
+            return {'background_compile_success': True, 'missing_main_shards': [],
+                'member_main_shards': [path for entry in entries[:4]
+                    for path in module.verified._tier1_ubt_members(entry)]}
+
+        with patch.object(module.verified, '_tier1_candidate_index', side_effect=candidate_index), \
+             patch.object(module.verified, 'accelerate', side_effect=AssertionError('strict path used')), \
+             patch.object(module, '_owned_job', return_value=None):
+            if operation == 'tier1_overlay_scope':
+                header = root / 'Shared.h'
+                header.write_text('// owned header\n', encoding='utf-8')
+                physical = [header] + [pathlib.Path(entry['file']) for entry in entries[:4]]
+                physical += [pathlib.Path(module.verified._tier1_ubt_members(entry)[0]) for entry in entries[:4]]
+                raw = module.verified._json({'version': 0, 'case-sensitive': False, 'use-external-names': True,
+                    'fallthrough': True, 'roots': [{'type': 'file', 'name': path.as_posix(),
+                        'external-contents': path.as_posix()} for path in physical]}).encode()
+                overlay = root / 'header-path-case' / ('header-path-case.' + module._sha(raw) + '.json')
+                overlay.parent.mkdir()
+                overlay.write_bytes(raw)
+                for index, entry in enumerate(entries[:4]):
+                    entry['nvim_ue_module_root'] = str(root / ('Module%d' % (index // 2)))
+                    entry['arguments'] += ['-ivfsoverlay', str(overlay)]
+                source.write_text(json.dumps(entries), encoding='utf-8')
+                plan = module.make_plan(source, store, sys.executable)
+                module._write(plan_path, plan)
+                assert len(plan['groups']) == 2
+                for group in plan['groups']: module.work(plan_path, group['id'], sys.executable)
+                policy = module.verified._owned_overlay_policy()
+                with patch.object(policy, 'validate_owned_overlay', wraps=policy.validate_owned_overlay) as validate:
+                    collected = module.collect(plan_path, [g['id'] for g in plan['groups']],
+                        background, marker, sys.executable)
+                    assert collected['metrics']['batch_count'] == 2
+                    assert validate.call_count == 1, ('collect repeated physical validation', validate.call_count)
+                    validate.reset_mock()
+                    output, metrics = module.reuse_completed(entries, store, sys.executable)
+                    assert metrics['batch_count'] == 2 and validate.call_count == 1
+                    validate.reset_mock()
+                    for group in plan['groups']:
+                        selected = [entries[i] for i in group['indexes']]
+                        _, reused = module.verified.reuse_tier1(selected, group['store'], sys.executable)
+                        assert reused['batch_count'] == 1
+                    assert validate.call_count == 2, 'independent reuse calls must each revalidate physical names'
+                    validate.reset_mock()
+                    header.unlink()  # Overlay bytes are unchanged; its physical namespace changed.
+                    retained, metrics = module.reuse_completed(entries, store, sys.executable)
+                    assert retained == entries and metrics['batch_count'] == 0 and validate.call_count > 0
+                    header.write_text('// owned header\n', encoding='utf-8')
+                    with module.verified.tier1_overlay_scope():
+                        module.verified._owned_overlays(entries[0])
+                        overlay.write_bytes(raw + b' ')
+                        try:
+                            module.verified._owned_overlays(entries[1])
+                            raise AssertionError('scope reused stale overlay bytes')
+                        except ValueError as error:
+                            assert str(error) == 'header-overlay-content-hash-mismatch'
+                    overlay.write_bytes(raw)
+                    validate.reset_mock()
+                    _, metrics = module.reuse_completed(entries, store, sys.executable)
+                    assert metrics['batch_count'] == 2 and validate.call_count == 1
+                assert len(indexed) == 2, 'cache reuse must never repeat private proof'
+                print('one physical overlay validation per outer call; later namespace and byte changes rechecked')
+                sys.exit(0)
+            if operation == 'tier1_byte_budget':
+                # More than strict's 80-source ceiling still fits the byte budget.
+                expanded = []
+                for index, entry in enumerate(entries[:2]):
+                    members = []
+                    for number in range(41):
+                        path = root / ('small%d_%d.cpp' % (index, number))
+                        path.write_text('int tiny%d_%d;\n' % (index, number), encoding='utf-8')
+                        members.append(path)
+                    pathlib.Path(entry['file']).write_text(
+                        '// Compiler-authored UBT unity membership; copied into nvim cache.\n'
+                        + ''.join('#include "' + path.as_posix() + '"\n' for path in members), encoding='utf-8')
+                    expanded.append(dict(entry, nvim_ue_members=[
+                        module.verified.portable_member_path(str(path)) for path in members]))
+                source.write_text(json.dumps(expanded), encoding='utf-8')
+                plan = module.make_plan(source, store, sys.executable)
+                assert len(plan['groups']) == 1 and plan['groups'][0]['member_count'] == 82
+                assert module._chunks(expanded, 'strict') == []
+                assert not indexed
+                print('default Tier 1 planning uses byte budget, retaining all 82 members')
+                sys.exit(0)
+
+            plan = module.make_plan(source, store, sys.executable)
+            assert plan['mode'] == '1' and len(plan['groups']) == 1 and not indexed
+            module._write(plan_path, plan)
+            group = plan['groups'][0]
+            assert pathlib.Path(group['store']).parent == store.parent / 'background-proofs' / 'tier1'
+            if operation == 'tier1_mode_isolation':
+                with patch.dict(os.environ, {'NVIM_UE_BATCH_TIER': 'strict'}):
+                    try:
+                        module.work(plan_path, group['id'], sys.executable)
+                        raise AssertionError('Tier 1 plan admitted in strict mode')
+                    except ValueError as error:
+                        assert str(error) == 'background-proof-plan-tier-mismatch'
+                    assert module._catalog_path(store) != pathlib.Path(group['store']).parent / 'catalog.json'
+                assert not indexed
+                print('tier mode binds plans, catalogs and worker admission')
+                sys.exit(0)
+
+            worked = module.work(plan_path, group['id'], sys.executable)
+            assert worked['ok'] and worked['mode'] == '1' and len(indexed) == 1
+            result = module.collect(plan_path, [group['id']], background, marker, sys.executable)
+            assert result['ok'] and len(indexed) == 1, 'collect must only reuse the private proof'
+            if operation == 'tier1_transient_retry':
+                assert result['metrics']['batch_count'] == 0 and json.loads(background.read_text()) == entries
+                again = module.make_plan(source, store, sys.executable)
+                assert len(again['groups']) == 1 and again['proof_rejected_count'] == 0, again
+                module._write(plan_path, again)
+                module.work(plan_path, group['id'], sys.executable)
+                recovered = module.collect(plan_path, [group['id']], background, marker, sys.executable)
+                assert len(indexed) == 2 and recovered['metrics']['batch_count'] == 1, recovered
+                print('transient failure remains eligible through collect, catalog and repeated prepare')
+                sys.exit(0)
+            if operation == 'tier1_failed_cached':
+                assert result['metrics']['batch_count'] == 0
+                assert json.loads(background.read_text()) == entries
+                again = module.make_plan(source, store, sys.executable)
+                assert again['groups'] == [] and again['proof_rejected_count'] == 1
+                assert len(indexed) == 1
+                assert any(record.get('cached') and not record.get('accepted')
+                    and record['reason'] == 'tier1-candidate-index-failed' for record in result['groups'])
+                print('failed proof cache retains originals and avoids repeated work scheduling')
+                sys.exit(0)
+
+            published = json.loads(background.read_text())
+            assert len(published) == 3 and published[-2:] == [exact, shader]
+            candidate = published[0]
+            assert candidate.get('nvim_ue_tier1_receipt') and not candidate.get('nvim_ue_batch_receipt')
+            assert result['metrics']['accepted_ubt_count'] == 4
+            if operation == 'tier1_member_changed':
+                pathlib.Path(module.verified._tier1_ubt_members(entries[0])[0]).write_text(
+                    'int changed;\n', encoding='utf-8')
+                reused, metrics = module.reuse_completed(entries, store, sys.executable)
+                assert reused == entries and metrics['batch_count'] == 0 and len(indexed) == 1
+                assert len(module.make_plan(source, store, sys.executable)['groups']) == 1
+                print('member bytes invalidate Tier 1 prepare reuse without starting clangd')
+            elif operation == 'tier1_receipt_tamper':
+                receipt = pathlib.Path(candidate['nvim_ue_tier1_receipt'])
+                receipt.write_bytes(receipt.read_bytes() + b' ')
+                reused, metrics = module.reuse_completed(entries, store, sys.executable)
+                assert reused == entries and metrics['batch_count'] == 0
+                result = module.collect(plan_path, [group['id']], background, marker, sys.executable)
+                assert json.loads(background.read_text()) == entries and len(indexed) == 1
+                print('corrupt content-addressed receipt retains all original commands')
+            else:
+                stamps = [(path.read_bytes(), path.stat().st_mtime_ns) for path in
+                    (background, marker, module._catalog_path(store))]
+                reused, metrics = module.reuse_completed(entries, store, sys.executable)
+                assert reused == published and metrics['batch_count'] == 1
+                assert module.encode_preserving(background, reused).encode('utf-8') == background.read_bytes()
+                repeated = module.collect(plan_path, [group['id']], background, marker, sys.executable)
+                assert not repeated['changed'] and len(indexed) == 1
+                assert stamps == [(path.read_bytes(), path.stat().st_mtime_ns) for path in
+                    (background, marker, module._catalog_path(store))]
+                assert module.make_plan(source, store, sys.executable)['groups'] == []
+                print('plan/work/collect and prepare reuse preserve identical Tier 1 CDB bytes')
+        sys.exit(0)
 
     def gate(selected, output_dir, clangd, **options):
         calls.append((list(selected), str(output_dir), options))
@@ -365,6 +546,11 @@ end
 
 t.describe("后台独立二次批次工具", function()
   for _, operation in ipairs({ "plan", "recover_hints", "input_changed", "rejected", "reuse_noop", "overlap", "changed_during_collect", "profile", "rejected_generator_noop", "missing_store", "publication_failure", "publication_shape", "rollback", "owned_job" }) do
+    t.it(operation, function()
+      run_fixture(operation)
+    end)
+  end
+  for _, operation in ipairs({ "tier1_e2e", "tier1_failed_cached", "tier1_transient_retry", "tier1_overlay_scope", "tier1_byte_budget", "tier1_mode_isolation", "tier1_member_changed", "tier1_receipt_tamper" }) do
     t.it(operation, function()
       run_fixture(operation)
     end)

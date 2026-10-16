@@ -270,6 +270,9 @@ t.describe("CodeDiff large explorer tree", function()
     local original_icon, icons = nodes.get_file_icon, 0
     nodes.get_file_icon = function(...)
       icons = icons + 1
+      -- A warm cache can finish before this wait observes a yielded build.
+      -- Model one slow provider so this close test observes a real yield.
+      if icons == 1 then vim.uv.sleep(20) end
       return original_icon(...)
     end
     local extra_tab

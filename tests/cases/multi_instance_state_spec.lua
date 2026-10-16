@@ -653,6 +653,108 @@ t.describe("multi-instance project state", function()
     pcall(vim.fn.delete, root, "rf")
   end)
 
+  t.it("an actual cross-process owner reader does not block lease release", function()
+    local root = tmpdir()
+    local path = root .. "/reader.lock"
+    local lock = require("ue.file_lock")
+    local lease = assert(lock.acquire(path))
+    local _, owner_name = lock.owner(path)
+    local script = root .. "/reader.lua"
+    vim.fn.writefile(
+      vim.split(
+        [=[
+      local config,path,out=unpack(arg)
+      vim.opt.rtp:prepend(config)
+      local lock=require('ue.file_lock')
+      local _,owner_name=lock.owner(path)
+      local owner_path=vim.fs.normalize(path..'/'..owner_name)
+      local native_io,native_open=io.open,vim.uv.fs_open
+      local held=false
+      local function hold_real_reader(kind)
+        assert(not held,'owner must only be opened once by the observed read')
+        held=true
+        vim.fn.writefile({vim.json.encode({pid=vim.fn.getpid(),transport=kind})},out..'/held.json')
+        assert(vim.wait(5000,function() return vim.fn.filereadable(out..'/continue')==1 end,5),
+          'parent did not finish release while the actual owner descriptor was held')
+      end
+      -- Observe the descriptor opened by M.owner. Both hooks delegate to the
+      -- actual native reader and preserve its returns; neither creates a fake FD.
+      io.open=function(name,mode,...)
+        local file,err=native_io(name,mode,...)
+        if file and vim.fs.normalize(name)==owner_path and mode=='rb' then hold_real_reader('stdio') end
+        return file,err
+      end
+      vim.uv.fs_open=function(name,flags,mode,...)
+        local fd,err,code=native_open(name,flags,mode,...)
+        if fd and vim.fs.normalize(name)==owner_path and flags=='r' then hold_real_reader('uv') end
+        return fd,err,code
+      end
+      local ok,owner,name,err=pcall(lock.owner,path)
+      io.open,vim.uv.fs_open=native_io,native_open
+      assert(ok,owner)
+      assert(held,'M.owner never opened the actual owner descriptor')
+      assert(owner,err)
+      vim.fn.writefile({vim.json.encode({owner=owner,name=name})},out..'/snapshot.json')
+    ]=],
+        "\n",
+        { plain = true }
+      ),
+      script
+    )
+    local job, result, released, continued
+    local ok, err = xpcall(function()
+      job = vim.system({
+        vim.v.progpath,
+        "--headless",
+        "-u",
+        "NONE",
+        "-i",
+        "NONE",
+        "-l",
+        script,
+        vim.fn.stdpath("config"),
+        path,
+        root,
+      }, { text = true })
+      local ready = vim.wait(5000, function()
+        return vim.fn.filereadable(root .. "/held.json") == 1
+      end, 5)
+      if ready then
+        released = lock.release(lease)
+      end
+      write(root .. "/continue")
+      continued = true
+      result = job:wait(6000)
+      t.assert_eq(result.code, 0, result.stderr)
+      t.assert_true(ready, "the real peer owner reader must reach its open-descriptor barrier")
+      t.assert_eq(vim.trim(result.stderr or ""), "", result.stderr)
+      local reader = vim.json.decode(table.concat(vim.fn.readfile(root .. "/held.json"), "\n"))
+      local snapshot = vim.json.decode(table.concat(vim.fn.readfile(root .. "/snapshot.json"), "\n"))
+      t.assert_true(reader.pid ~= vim.fn.getpid(), "reader must be a distinct real Neovim process")
+      t.assert_eq(snapshot.owner.pid, vim.fn.getpid())
+      t.assert_eq(snapshot.owner.token, lease.token)
+      t.assert_eq(snapshot.name, owner_name)
+      t.assert_true(released, "an actual M.owner descriptor in another process must not prevent release")
+      t.assert_eq(reader.transport, "uv")
+      t.assert_nil(vim.uv.fs_stat(path), "release must remove its own lease directory")
+      local next_lease = assert(lock.acquire(path))
+      t.assert_true(lock.release(next_lease))
+    end, debug.traceback)
+    if not continued then
+      write(root .. "/continue")
+    end
+    if job and not result then
+      job:wait(6000)
+    end
+    if not released then
+      lock.release(lease)
+    end
+    pcall(vim.fn.delete, root, "rf")
+    if not ok then
+      error(err)
+    end
+  end)
+
   t.it("a delayed stale reclaimer cannot delete a newly acquired lease", function()
     local root = tmpdir()
     local path = root .. "/race.lock"

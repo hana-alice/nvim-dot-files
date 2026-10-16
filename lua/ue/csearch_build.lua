@@ -16,7 +16,7 @@ function M.start(opts, deps)
     return
   end
   ctx = vim.deepcopy(ctx)
-  ctx._force_csearch = true
+  ctx._force_csearch = not opts.recover_overflow
   local code_search = require("utils.code_search")
   if not code_search.cindex_uefilter_exe() then
     vim.notify("UEBuildCsearch: cindex-uefilter not found — " .. code_search.install_hint(), vim.log.levels.WARN)
@@ -54,9 +54,13 @@ function M.start(opts, deps)
         if selection and current and current.project_key == selection.project_key
             and watch.persistent_dirty_status().path == dirty_owner then
           deps.clear_dirty("UEBuildCsearch", dirty_snapshot,
-            started_at, true)
+            started_at, stats and (stats.mode == "reset" or stats.git_recovered),
+            stats and (stats.mode == "reset" or stats.git_recovered))
         end
         if input_hash then
+          if stats and stats.workspace_list_changed then
+            input_hash = assert(deps.fingerprint(ctx.paths.workspace_all_list), "cannot fingerprint filtered workspace")
+          end
           local saved, save_err = project_state.update(ctx.engine_root, "csearch_input_hash", input_hash, selection)
           if not saved then error(save_err or "cannot save csearch input fingerprint") end
         end

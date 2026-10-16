@@ -3,11 +3,32 @@ return {
     "stevearc/conform.nvim",
     opts = {
       formatters_by_ft = {
-        c = { "clang_format" },
-        cpp = { "clang_format" },
-        objc = { "clang_format" },
-        objcpp = { "clang_format" },
+        c = { "clang_format", lsp_format = "never" },
+        cpp = { "clang_format", lsp_format = "never" },
+        objc = { "clang_format", lsp_format = "never" },
+        objcpp = { "clang_format", lsp_format = "never" },
         hlsl = { "clang_format" },
+      },
+      formatters = {
+        clang_format = {
+          command = function() return require("utils.cpp_format").command() end,
+          prepend_args = function(_, ctx)
+            return require("utils.cpp_format").is_cpp(ctx.buf)
+              and { "--style=file", "--fallback-style=none" } or {}
+          end,
+          condition = function(_, ctx)
+            return not require("utils.cpp_format").is_cpp(ctx.buf)
+              or require("utils.cpp_format").find_config(ctx.buf) ~= nil
+          end,
+        },
+        ue_epic = {
+          inherit = "clang_format",
+          command = function() return require("utils.cpp_format").command() end,
+          condition = function() return true end,
+          prepend_args = function()
+            return { "--style=file:" .. require("utils.cpp_format").template, "--fallback-style=none" }
+          end,
+        },
       },
     },
   },
@@ -16,6 +37,9 @@ return {
     "neovim/nvim-lspconfig",
     opts = function(_, opts)
       opts.servers = opts.servers or {}
+      -- Measured on a 6007-line fixture with a real clangd and external UI.
+      -- Keep LazyVim's buffer-local <leader>uh toggle and bigfile guard.
+      opts.inlay_hints = vim.tbl_deep_extend("force", opts.inlay_hints or {}, { enabled = true })
 
       local clangd = opts.servers.clangd == true and {} or opts.servers.clangd or {}
       local inherited_on_attach = clangd.on_attach
@@ -64,6 +88,22 @@ return {
           require("ue.index.batch_recovery").attach(client, bufnr)
         end,
         keys = {
+          { "<leader>cI", function() require("utils.ue_goto.reading").calls("incoming") end,
+            desc = "Incoming calls (谁调用了它)", has = "prepareCallHierarchy" },
+          { "<leader>cO", function() require("utils.ue_goto.reading").calls("outgoing") end,
+            desc = "Outgoing calls (它调用了谁)", has = "prepareCallHierarchy" },
+          { "<leader>ss", function() require("utils.document_symbols").open({ tree = true }) end,
+            desc = "Document symbols (当前文件大纲)", has = "documentSymbol" },
+          { "<leader>sS", function() require("snacks").picker.lsp_workspace_symbols({ live = true }) end,
+            desc = "Workspace symbols (类 / 函数)", has = "workspace/symbol" },
+          { "<leader>cB", function() require("utils.ue_goto.type_hierarchy").open("supertypes") end,
+            desc = "Type hierarchy: base types (基类)", has = "prepareTypeHierarchy" },
+          { "<leader>cD", function() require("utils.ue_goto.type_hierarchy").open("subtypes") end,
+            desc = "Type hierarchy: derived types (派生类)", has = "prepareTypeHierarchy" },
+          { "<leader>cr", function() require("utils.lsp_fallback").rename() end,
+            desc = "Rename symbol (preview)", has = "rename" },
+          { "<leader>ca", function() require("utils.lsp_fallback").code_actions() end,
+            desc = "Code action (server / preview)", mode = { "n", "x" }, has = "codeAction" },
           {
             "gd",
             definition_fallback,
@@ -80,7 +120,7 @@ return {
           },
           {
             "<leader>ch",
-            "<cmd>LspClangdSwitchSourceHeader<cr>",
+            function() require("utils.ue_goto.reading").source_header() end,
             desc = "Switch Source/Header (UE)",
           },
         },

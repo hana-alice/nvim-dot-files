@@ -218,11 +218,10 @@ idx）；缺的是 **diff 基准**：上次索引到底喂了哪些文件。
   * 下次构建先 diff（新清单 vs 快照）+ 并入 watcher persistent_dirty（改动的既有文件
     re-add 刷新 trigram）
   * 决策（CORE_RT.csearch_build_mode，纯函数）：
-      forced / 无快照            → reset
-      removed > 0               → reset   （cindex 无删除能力；ghost 命中 = 正确性问题）
-      added+dirty == 0          → skip    （集合没变，只刷新记账）
-      added+dirty > 30% 总量     → reset   （merge 成本逼近全量；典型 = 切分支）
-      否则                      → add     （只喂 delta）
+      forced / 无快照                 → reset
+      added+dirty+removed == 0       → skip    （集合没变，只刷新记账）
+      added+dirty+removed > 30% 总量  → reset   （merge 成本逼近全量；典型 = 切分支）
+      否则                           → add     （只喂 delta；删除走 -delete-from）
   * add 失败（D9 guard 拒绝 unusable idx 等）→ 自动回退一次 reset（永远安全）
 ```
 
@@ -231,8 +230,12 @@ idx）；缺的是 **diff 基准**：上次索引到底喂了哪些文件。
   `on_full_csearch_success`（退役 captured dirty + 写指纹）仍归调用点——smart_build 只额外负责快照刷新。
 - **与 D9 的关系**：写者仍只有 prepare 家族（smart_build 是 prepare 的实现细节，不是新写者）；
   watcher 仍是记账员。`UEPrepareIncremental`（手动挡）保留，语义不变。
-- **正确性边界**：删除必须 reset——cindex merge 只能加不能减，留 ghost 会让 `<leader>/`
-  命中已删除文件（比慢更糟）。30% 阈值 `CORE_RT.CSEARCH_ADD_RATIO_MAX` 可调。
+- **正确性边界（2026-10-02 修订）**：旧结论「删除必须 reset，cindex 只能加不能减」被实测证伪。
+  codesearch merge 以 delta root 为前缀区间遮蔽旧名字，root 指向已删文件且不索引内容即删除；
+  `cindex-uefilter -delete-from` 利用这一点，并对遮蔽到的未改动兄弟文件（`Foo.h` → `Foo.hpp`）
+  重新入索引——旧版增量 add 会静默丢掉它们。真实清单验证：结果与全量 reset 逐项等价。
+  旧二进制不认 `-delete-from` → add 失败 → 既有回退 reset，仍不留 ghost。
+  30% 阈值 `CORE_RT.CSEARCH_ADD_RATIO_MAX` 可调，删除数计入。
 
 防回归：`tests/cases/csearch_build_guard_spec.lua`（D11 组：mode 决策矩阵 + smart_build
 skip/add/reset 端到端 with mock build_index + 快照往返）。

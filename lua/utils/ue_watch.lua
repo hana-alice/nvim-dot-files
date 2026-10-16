@@ -63,8 +63,7 @@ local native_watch = require("utils.ue_watch_native")
 
 -- Defined later via assignment so earlier closures bind this local rather than a
 -- shadowing declaration (an undeclared name would instead resolve as a global).
-local add_to_persistent_dirty
-
+local add_to_persistent_dirty, save_persistent_dirty
 -- ---------------------------------------------------------------------------
 -- State
 -- ---------------------------------------------------------------------------
@@ -83,7 +82,7 @@ local function new_state()
   -- WHY: the watcher is record-only and never publishes csearch updates.
   -- The rg-on-dirty overlay therefore needs the full post-prepare cumulative
   -- set, not just the in-flight pre-flush queue.
-  -- Keys: lowercased forward-slash abs path. Values: true.
+  -- Keys: lowercased abs path; values preserve the original spelling.
   persistent_dirty = {},
   persistent_dirty_loaded = false,
   -- Content anchor for Windows fs_event noise suppression. libuv subscribes
@@ -439,7 +438,11 @@ function M.start(opts)
   state.opts = vim.tbl_extend("force", { debounce_ms = 1500 }, opts)
   state.ignored_preindex_changes = 0
   native_watch.reset(); refresh_csearch_index_mtime(); state.timer = uv.new_timer()
-  local native = native_watch.start(opts.root, opts, vim.schedule_wrap(owned_callback(on_event))); if native then
+  local native_opts = vim.tbl_extend("force", opts, { on_coverage_unknown = owned_callback(function()
+    state._dirty_capped, state._dirty_overflow_at = true, math.max(state._dirty_overflow_at or 0, os.time())
+    save_persistent_dirty(state)
+  end) })
+  local native = native_watch.start(opts.root, native_opts, vim.schedule_wrap(owned_callback(on_event))); if native then
     state.handle = native; log_info("watching " .. opts.root .. " (native content events)"); return true end
   state.handle = uv.new_fs_event(); native_watch.set_fallback()
   if not state.handle then
@@ -509,10 +512,7 @@ function M.flush_now()
   vim.schedule(owned_callback(flush))
 end
 
--- ---------------------------------------------------------------------------
--- Persistent dirty.json — cumulative add-set since last :UEPrepare.
--- ---------------------------------------------------------------------------
-
+-- Persistent dirty.json and durable coverage-loss marker (shared writer lease).
 local PERSISTENT_DIRTY_CAP = 1000  -- LRU-ish hard cap; see save_persistent_dirty
 local PERSISTENT_DIRTY_WARN = 500  -- nag threshold
 
@@ -565,7 +565,7 @@ local function collect_persistent_dirty(state, p)
       -- Probe: cap-hit is the F2 signal the next session reads first.
       pcall(function()
         local probe = require("utils.probe")
-        probe.observe("dirty-set-flood", "durable-overflow-2026-09-24")
+        probe.observe("dirty-set-flood", "git-overflow-2026-10-03")
         probe.record("dirty-set-flood", "cap-hit",
           { dropped = dropped, cap = PERSISTENT_DIRTY_CAP })
       end)
@@ -579,7 +579,7 @@ local function collect_persistent_dirty(state, p)
   return arr
 end
 
-local function save_persistent_dirty(owner)
+save_persistent_dirty = function(owner)
   local state = owner or state
   local p = persistent_dirty_path(state)
   if not p then return end
@@ -623,11 +623,11 @@ function M.snapshot_persistent_dirty()
   for _, abs in pairs(state.persistent_dirty) do arr[#arr + 1] = abs end
   return arr
 end
-
 -- Remove only paths proven covered by a completed index operation. Re-read
 -- and subtract under the same lease used by writers so dirty paths added by a
 -- different Neovim while the build was running remain visible.
-function M.remove_persistent_dirty(paths, reason, covered_before, remove_missing)
+function M.remove_persistent_dirty(paths, reason, covered_before, remove_missing, acknowledge_overflow)
+  if acknowledge_overflow == nil then acknowledge_overflow = remove_missing end
   local remove = {}
   for _, path in ipairs(paths or {}) do
     local normalized = tostring(path)
@@ -643,7 +643,7 @@ function M.remove_persistent_dirty(paths, reason, covered_before, remove_missing
     end
     if covered then remove[normalized:lower()] = true end
   end
-  if not next(remove) and not remove_missing then return true end
+  if not next(remove) and not remove_missing and not acknowledge_overflow then return true end
   local p = persistent_dirty_path()
   if not p then
     for key in pairs(remove) do state.persistent_dirty[key] = nil end
@@ -676,7 +676,7 @@ function M.remove_persistent_dirty(paths, reason, covered_before, remove_missing
   local replaced = vim.uv.fs_rename(tmp, p)
   if not replaced then pcall(vim.fn.delete, tmp) end
   local cleared = true
-  if replaced and remove_missing and covered_before then
+  if replaced and acknowledge_overflow and covered_before then
     cleared = dirty_save.clear_overflow(state, p, covered_before)
   end
   file_lock.release(lease)

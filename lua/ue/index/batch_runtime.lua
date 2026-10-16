@@ -6,6 +6,7 @@ local fs = require("ue.core.fs")
 local documents = require("ue.index.batch_documents")
 local descriptor_helpers = require("ue.index.batch_descriptor")
 local shard_seed = require("ue.index.batch_shard_seed")
+local snapshots = require("ue.index.batch_snapshot")
 local path_list, prepare_local_cache, watch_sets = descriptor_helpers.path_list,
   descriptor_helpers.prepare_local_cache, descriptor_helpers.watch_sets
 local records, verified_dirs = {}, {}
@@ -361,14 +362,7 @@ local function now_ms(opts)
 end
 
 local function activation_snapshot(record)
-  if not record then return nil end
-  local result = { failed = record.failed == true, ready = record.phase == "ready" and ready(record) == true }
-  for _, field in ipairs({ "scope", "attempt", "stamp", "generation", "phase", "reason",
-    "pending_helpers", "retry_after", "verified" }) do
-    local value = record[field]
-    if type(value) == "string" or type(value) == "number" or type(value) == "boolean" then result[field] = value end
-  end
-  return result
+  return snapshots.activation(record, ready)
 end
 
 local function notify_state(record)
@@ -563,6 +557,9 @@ function M.prepare(bufnr, root, on_dir, opts)
     if document_blocked(record) then return end
     record.phase = "probing"
     if not current() then reject("activation-metadata-changed"); return end
+    if type(descriptor) == "table" and descriptor.ok == false then
+      reject(descriptor.reason or "activation-describe-failed"); return
+    end
     if type(descriptor) ~= "table" or descriptor.ok ~= true
         or not path_list(descriptor.watch_roots, true) or #descriptor.watch_roots > 32
         or not path_list(descriptor.lookup_roots, false) or (descriptor.lookup_roots and #descriptor.lookup_roots > 256)
@@ -570,7 +567,7 @@ function M.prepare(bufnr, root, on_dir, opts)
         or not path_list(descriptor.input_roots, true)
         or type(descriptor.verified_cdb) ~= "string" or type(descriptor.original_cdb) ~= "string"
         or type(descriptor.info_sha256) ~= "string" or descriptor.info_sha256 == ""
-        or type(descriptor.compiler_environment) ~= "table"
+        or type(descriptor.compiler_environment) ~= "table" or type(descriptor.compiler_lookup_environment) ~= "table"
         or type(descriptor.tool_path) ~= "string" or not fs.is_absolute_path(descriptor.tool_path)
         or descriptor.generation_id ~= generation
         or key(descriptor.original_cdb) ~= scope then
@@ -579,15 +576,18 @@ function M.prepare(bufnr, root, on_dir, opts)
     if not vim.deep_equal(profile_value(descriptor.server_profile), profile) then
       reject("uncertified-clangd-server-profile"); return
     end
-    if not environment_matches(descriptor.compiler_environment, environment) then
+    local spawn_environment = vim.tbl_extend("force", descriptor.compiler_environment, descriptor.compiler_lookup_environment)
+    if not environment_matches(spawn_environment, environment) then
       reject("compiler-environment-changed"); return
     end
     if not prepare_local_cache(original, descriptor.verified_cdb) then
       reject("frozen-cache-unavailable"); return
     end
     record.verified = descriptor.verified_cdb
+    record.published_batch_count = descriptor.published_batch_count or 0
     record.info_sha256 = descriptor.info_sha256
-    record.compiler_environment = descriptor.compiler_environment
+    -- Startup context pins current lookup state; receipt semantic identity omits it.
+    record.compiler_environment = spawn_environment
     record.tool_path = descriptor.tool_path
     local installed_sets = watch_sets(descriptor)
     if not installed_sets then reject("invalid-activation-descriptor"); return end
@@ -616,7 +616,8 @@ function M.prepare(bufnr, root, on_dir, opts)
               callback({ ok = false, reason = "activation-metadata-changed" })
             elseif result.tool_path ~= record.tool_path then
               callback({ ok = false, reason = "clangd-executable-changed" })
-            elseif not vim.deep_equal(result.compiler_environment, record.compiler_environment) then
+            elseif type(result.compiler_lookup_environment) ~= "table" or not vim.deep_equal(
+                vim.tbl_extend("force", result.compiler_environment or {}, result.compiler_lookup_environment), record.compiler_environment) then
               callback({ ok = false, reason = "compiler-environment-changed" })
             elseif not vim.deep_equal(profile_value(result.server_profile), record.server_profile) then
               callback({ ok = false, reason = "uncertified-clangd-server-profile" })

@@ -9,6 +9,7 @@ local platform = require("utils.platform")
 local cache = {}
 local pending = {}
 local delivered = {}
+local companions = {}
 
 local function explicit_language(command)
   local argv = type(command) == "table" and command.compilationCommand or nil
@@ -223,6 +224,94 @@ local function consume_command(waiter, command)
   deliver(waiter.client, waiter.bufnr, waiter.source, command, waiter.callback, waiter.opts)
 end
 
+local function query_command(cdb, source, extra, callback)
+  local python = python_command()
+  local script = norm(vim.fn.stdpath("config") .. "/tools/query_compile_command.py")
+  if not python or not (vim.uv or vim.loop).fs_stat(script) then
+    callback(nil, "compile-command-tool-missing")
+    return
+  end
+  local cmd = { python, script, cdb, source }
+  vim.list_extend(cmd, extra or {})
+  return vim.system(cmd, { text = true }, function(result)
+    vim.schedule(function()
+      local ok, decoded = pcall(vim.json.decode, result.stdout or "")
+      callback(ok and decoded or nil, ok and decoded and decoded.reason or "compile-command-query-failed")
+    end)
+  end)
+end
+
+local function proven_header_command(proof, source, cdb)
+  local context = type(proof) == "table" and proof.context or nil
+  local response = type(proof) == "table" and proof.response or nil
+  local environment = type(proof) == "table" and proof.environment or nil
+  if type(context) ~= "table" or type(response) ~= "table" or type(environment) ~= "table"
+      or type(proof.is_current) ~= "function" or not proof.is_current()
+      or response.op ~= "query" or response.state ~= "resolved"
+      or type(response.usr) ~= "string" or response.usr == ""
+      or response.context_id ~= (context.id or context.context_id)
+      or context.build_fingerprint ~= environment.build_fingerprint
+      or norm(environment.cdb_path):lower() ~= norm(cdb):lower()
+      or norm(context.cdb_dir):lower() ~= norm(vim.fs.dirname(cdb)):lower() then
+    return nil, "header-command-provenance-invalid"
+  end
+  local model = require("utils.ue_goto.semantic_context")
+  if not model.context_supports_subject(context, source) then
+    return nil, "header-command-subject-unproven"
+  end
+  local semantic = require("utils.ue_goto.semantic_client")
+  local session = semantic.status().session
+  if type(response.compiler_session) ~= "table" or not session
+      or not vim.deep_equal(response.compiler_session, session) then
+    return nil, "header-command-compiler-session-stale"
+  end
+  local compiler_evidence
+  for _, record in ipairs(response.contexts or {}) do
+    if record.context_id == response.context_id and record.state == "resolved"
+        and record.usr == response.usr and type(record.compile_command_fingerprint) == "string"
+        and record.compile_command_fingerprint ~= "" then
+      compiler_evidence = record
+    end
+  end
+  local compile = context.compile
+  if not compiler_evidence or type(compile) ~= "table" or type(compile.directory) ~= "string"
+      or compile.directory == "" or type(compile.argv) ~= "table" or #compile.argv < 2
+      or vim.fn.sha256(vim.json.encode(compile)) ~= proof.compile_digest then
+    return nil, "header-command-descriptor-unproven"
+  end
+  local descriptor = require("utils.ue_goto.reading_compile")
+  if not descriptor.matches_native(compile, context.origin_tu, compiler_evidence.compile_command_fingerprint) then
+    return nil, "header-command-compiler-descriptor-mismatch"
+  end
+  return descriptor.rebind(compile, context.origin_tu, source)
+end
+
+-- This is explicit file pairing, not semantic TU selection. The caller's
+-- immutable reading owner guards the CDB signature and any late result.
+function M.find_companion(cdb, source, callback, opts)
+  opts = opts or {}
+  cdb, source = norm(cdb), norm(source)
+  local stat = (vim.uv or vim.loop).fs_stat(cdb)
+  if not stat or stat.type ~= "file" then callback(nil, "companion-cdb-unavailable"); return end
+  local key = table.concat({ cdb, tostring(stat.size), tostring(stat.mtime.sec),
+    tostring(stat.mtime.nsec), vim.fs.basename(source):lower() }, "\0")
+  local function finish(value, reason)
+    if opts.is_current and not opts.is_current() then return end
+    callback(value, reason)
+  end
+  if companions[key] then finish(vim.deepcopy(companions[key])); return end
+  return query_command(cdb, source, { "--companion" }, function(result, reason)
+    local candidates = result and result.candidates
+    if result and result.state == "resolved" and type(candidates) == "table" then
+      if vim.tbl_count(companions) >= 128 then companions = {} end
+      companions[key] = candidates
+      finish(vim.deepcopy(candidates))
+    else
+      finish(nil, reason)
+    end
+  end)
+end
+
 function M.ensure(client, bufnr, callback, opts)
   callback = callback or function() end
   opts = opts or {}
@@ -237,6 +326,13 @@ function M.ensure(client, bufnr, callback, opts)
   local cdb, stat = base_cdb(semantic_dir)
   if source == "" or not cdb then
     callback(false, source == "" and "subject-path-missing" or "base-compile-database-missing")
+    return
+  end
+  if opts.proven_header then
+    local command, reason = proven_header_command(opts.proven_header, source, cdb)
+    if not command then callback(false, reason); return end
+    consume_command({ client = client, bufnr = bufnr, source = source,
+      callback = callback, opts = opts }, command)
     return
   end
   local signature = table.concat({
@@ -265,25 +361,14 @@ function M.ensure(client, bufnr, callback, opts)
   }
   if #pending[key] > 1 then return end
 
-  local python = python_command()
-  local script = norm(vim.fn.stdpath("config") .. "/tools/query_compile_command.py")
-  if not python or not (vim.uv or vim.loop).fs_stat(script) then
-    local waiters = pending[key]
-    pending[key] = nil
-    for _, waiter in ipairs(waiters) do waiter.callback(false, "compile-command-tool-missing") end
-    return
-  end
-  local cmd = { python, script, cdb, command_source }
+  local extra = {}
   if command_source:lower() ~= source:lower() then
-    cmd[#cmd + 1] = "--subject"
-    cmd[#cmd + 1] = source
+    extra = { "--subject", source }
   end
-  vim.system(cmd, { text = true }, function(result)
-    vim.schedule(function()
+  query_command(cdb, command_source, extra, function(decoded, query_reason)
       local waiters = pending[key] or {}
       pending[key] = nil
-      local ok, decoded = pcall(vim.json.decode, result.stdout or "")
-      local command = ok and decoded and decoded.state == "resolved" and decoded.command or nil
+      local command = decoded and decoded.state == "resolved" and decoded.command or nil
       if type(command) == "table"
           and type(command.workingDirectory) == "string"
           and type(command.compilationCommand) == "table" then
@@ -292,10 +377,9 @@ function M.ensure(client, bufnr, callback, opts)
           consume_command(waiter, command)
         end
       else
-        local reason = ok and decoded and decoded.reason or "compile-command-query-failed"
+        local reason = query_reason or "compile-command-query-failed"
         for _, waiter in ipairs(waiters) do waiter.callback(false, reason) end
       end
-    end)
   end)
 end
 
@@ -314,6 +398,7 @@ function M._reset_for_test()
   cache = {}
   pending = {}
   delivered = {}
+  companions = {}
 end
 
 return M

@@ -52,6 +52,20 @@ rebase、reflog、全文 blame、历史版本 buffer 与 quickfix 历史能力 S
 - **THEN** Diffview 对应审阅、关闭、行历史仍可用，且不被自动重定向为默认工具
 - **AND** 组件问题显示可诊断错误与修复入口，不联网安装、不修改工作区
 
+### Requirement: 外部导航切换到普通编辑布局并保留审阅现场
+
+从审阅布局发起的定义、引用、阅读结果、搜索或问题导航 SHALL 切换到可复用的 normal 编辑
+tab；不存在时新建 normal tab。原审阅 tab 的 explorer、两侧比较与光标 SHALL 保留，不在其中
+创建浏览 split。`UELayoutBack` SHALL 返回原审阅侧与位置；normal tab 的原生 jumplist 保留
+文档位置回溯，跨 tab 的布局回溯由 `UELayoutBack` 承担。
+
+#### Scenario: 修订文件的定义跳转与返回
+
+- **WHEN** 用户在历史修订窗对 C++ 符号执行定义跳转
+- **THEN** 在 normal tab 将修订位置映射到真实工作区文件，等待匹配 root 的有效 clangd 后请求定义
+- **AND** 不向修订或未附加 clangd 的 buffer 发语义请求；超时报告耗时和 client 状态
+- **AND** 返回布局时仍是原审阅侧与位置，原比较窗口未被目标文件替换
+
 ### Requirement: 性能切换基于同覆盖实测，不得靠缩小数据集通过验收
 
 切换默认入口前 SHALL 在相同覆盖和可比负载下记录旧界面与候选的延迟及资源证据（冷/暖缓存、
@@ -67,6 +81,9 @@ Git 查询与界面计算区分），不得以隐藏 untracked 或缩小数据�
 
 ## 选型与踩坑
 
+- **选型（2026-10-12）**：外部浏览切到 normal 编辑 tab，替代审阅 tab 内 browser split；
+  同一策略用于 debug 外部浏览，DAP stopped/frame 的内部源码交接显式留在 debug。隐藏真实
+  buffer 再次打开未必触发 FileType，定义跳转必须复用正常 clangd 配置主动启动/附加并校验 root。
 - **选型**：默认审阅收敛为单一完整文件界面而非维护独立 Git 状态侧栏，理由是减少重复入口与
   状态不一致风险；Diffview 保留而非删除，因为部分工作流（如逐 hunk 历史）仍依赖其原生能力。
 - **踩坑**：消费 Git porcelain 输出时若不使用 NUL 分隔记录，含空格/重命名的路径会被错误解析；

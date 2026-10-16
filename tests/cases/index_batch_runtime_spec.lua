@@ -30,7 +30,7 @@ local function fixture(body)
   h.ctx = { paths = { clangd_dir = root, semantic_cdb = root .. "/background/compile_commands.json" } }
   h.command = { "clangd", "--background-index", "--compile-commands-dir=" .. root .. "/background" }
   h.descriptor = { ok = true, info_sha256 = "sha-v1", generation_id = "gen-a", compiler_environment = {}, tool_path = root .. "/clangd.exe",
-    receipts = { root .. "/receipt.json" },
+    compiler_lookup_environment = {}, receipts = { root .. "/receipt.json" },
     watch_roots = { root .. "/input", root .. "/output" }, exclude_roots = { root .. "/output" },
     input_roots = { root .. "/input" },
     watched_files = { root .. "/output/frozen.cpp", root .. "/output/metadata.json" },
@@ -98,6 +98,61 @@ local function fixture(body)
 end
 
 t.describe("frozen batch startup runtime", function()
+  t.it("reports published, ready and attached batch TUs as separate stages", function()
+    fixture(function(h)
+      h.descriptor.published_batch_count = 2
+      h.prepare(); h.describe()
+      local snapshot = runtime.activation(h.ctx.paths.semantic_cdb)
+      t.assert_eq(snapshot.published_batch_count, 2); t.assert_false(snapshot.ready)
+      t.assert_eq(snapshot.client_batch_tu_count, 0)
+      h.validate()
+      snapshot = runtime.activation(h.ctx.paths.semantic_cdb)
+      t.assert_true(snapshot.ready); t.assert_eq(snapshot.client_batch_tu_count, 0)
+      local config = {}
+      runtime.configure_process(h.command, config)
+      local stopped = false
+      runtime.attach({ id = 891, config = config, attached_buffers = {},
+        request = function() return true, 1 end, is_stopped = function() return stopped end }, 0)
+      snapshot = runtime.activation(h.ctx.paths.semantic_cdb)
+      t.assert_eq(snapshot.batch_client_count, 1); t.assert_eq(snapshot.client_batch_tu_count, 2)
+      stopped = true
+      t.assert_eq(runtime.activation(h.ctx.paths.semantic_cdb).client_batch_tu_count, 0)
+    end)
+  end)
+
+  t.it("preserves a helper's explicit no-batch reason instead of mislabelling its descriptor", function()
+    fixture(function(h)
+      h.prepare(); h.calls[1].callback({ ok = false, reason = "no-verified-batches" }); h.flush()
+      local snapshot = runtime.activation(h.ctx.paths.semantic_cdb)
+      t.assert_eq(snapshot.reason, "no-verified-batches"); t.assert_false(snapshot.ready)
+      t.assert_eq(snapshot.client_batch_tu_count, 0)
+      t.assert_eq(#h.calls, 1); t.assert_eq(#h.roots, 1)
+    end)
+  end)
+
+  t.it("ignores unrelated direct asset siblings while keeping exact files and ancestor namespace protected", function()
+    fixture(function(h, root)
+      h.descriptor.watch_roots = { root .. "/input" }
+      h.descriptor.lookup_roots = { root .. "/output", root }
+      h.descriptor.exclude_roots = {}
+      h.descriptor.watched_files[#h.descriptor.watched_files + 1] = root .. "/output"
+      h.opts.probe_direct = function(callback) callback(true) end
+      h.prepare(); h.describe(); h.flush(); h.validate()
+      local output, ancestor
+      for _, watch in ipairs(h.watches) do
+        if watch.root == root .. "/output" then output = watch end
+        if watch.root == root then ancestor = watch end
+      end
+      t.assert_true(output ~= nil and ancestor ~= nil)
+      output.callback(nil, ".nvim-ue-watch-barrier-other-process.tmp", { action = 1, stream = "metadata", rename = true })
+      output.callback(nil, "proof-unfinished/pending.cpp", { action = 3, stream = "write" })
+      t.assert_true(runtime.activation(h.ctx.paths.semantic_cdb).ready, "unrelated producers must not revoke exact assets")
+      ancestor.callback(nil, "output", { action = 4, directory = true, stream = "metadata", rename = true })
+      t.assert_false(runtime.activation(h.ctx.paths.semantic_cdb).ready, "asset directory rename must revoke immediately")
+      h.flush()
+    end)
+  end)
+
   t.it("document preflight retains original before metadata work and revalidates after clean demand", function()
     fixture(function(h)
       local buffer = h.document(); h.edit(buffer)
@@ -749,13 +804,14 @@ t.describe("frozen batch startup runtime", function()
     end)
   end)
 
-  for _, mutation in ipairs({ "query", "cwd", "environment", "unknown-option", "enabled-config" }) do
+  for _, mutation in ipairs({ "query", "cwd", "environment", "lookup", "unknown-option", "enabled-config" }) do
     t.it("retains original commands after a certified profile changes " .. mutation, function()
       fixture(function(h, root)
-        h.config = { cmd_cwd = root, cmd_env = { CPATH = "proof-include" } }
+        h.config = { cmd_cwd = root, cmd_env = { CPATH = "proof-include", PATH = "validated-lookup" } }
         vim.list_extend(h.command, { "--enable-config=false", "--query-driver=clang*" })
         h.descriptor.server_profile = runtime.server_profile(h.command, h.config)
         h.descriptor.compiler_environment = { CPATH = "proof-include" }
+        h.descriptor.compiler_lookup_environment = { PATH = "validated-lookup" }
         h.prepare(); h.describe(); h.validate()
         local config, changed = vim.deepcopy(h.config), vim.deepcopy(h.command)
         local frozen = runtime.command(changed, config)
@@ -766,6 +822,7 @@ t.describe("frozen batch startup runtime", function()
           vim.fn.mkdir(root .. "/other", "p")
           config.cmd_cwd = root .. "/other"
         elseif mutation == "environment" then config.cmd_env.CPATH = "different"
+        elseif mutation == "lookup" then config.cmd_env.PATH = "changed-after-validation"
         elseif mutation == "unknown-option" then
           changed[#changed + 1], frozen[#frozen + 1] = "--experimental-semantic-option", "--experimental-semantic-option"
         else
@@ -780,18 +837,20 @@ t.describe("frozen batch startup runtime", function()
     end)
   end
 
-  for _, mutation in ipairs({ "cwd", "environment", "query" }) do
+  for _, mutation in ipairs({ "cwd", "environment", "lookup", "query" }) do
     t.it("rejects asynchronous validation if the requested " .. mutation .. " changes", function()
       fixture(function(h, root)
-        h.config = { cmd_cwd = root, cmd_env = { CPATH = "proof-include" } }
+        h.config = { cmd_cwd = root, cmd_env = { CPATH = "proof-include", PATH = "validated-lookup" } }
         vim.list_extend(h.command, { "--enable-config=false", "--query-driver=clang*" })
         h.descriptor.server_profile = runtime.server_profile(h.command, h.config)
         h.descriptor.compiler_environment = { CPATH = "proof-include" }
+        h.descriptor.compiler_lookup_environment = { PATH = "validated-lookup" }
         h.prepare(); h.describe()
         if mutation == "cwd" then
           vim.fn.mkdir(root .. "/other", "p")
           h.config.cmd_cwd = root .. "/other"
         elseif mutation == "environment" then h.config.cmd_env.CPATH = "changed-after-describe"
+        elseif mutation == "lookup" then h.config.cmd_env.PATH = "changed-after-describe"
         else h.command[#h.command] = "--query-driver=other*" end
         h.validate()
         t.assert_eq(#h.roots, 1)

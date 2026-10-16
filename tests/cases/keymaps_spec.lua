@@ -57,10 +57,17 @@ t.describe("keymaps: DAP 功能键多模式", function()
     end
   end
 
-  t.it("<F5> → UEDAPContinue", function()
+  t.it("<F5> → run/debug target (continue inside a session)", function()
     local m = t.get_keymap("n", "<F5>")
     t.assert_true(m ~= nil, "<F5> 未绑定")
-    t.assert_contains(m.rhs or "", "UEDAPContinue")
+    t.assert_contains(m.rhs or "", "ue_hub').run_or_debug")
+  end)
+  t.it("<S-F5> → UEDAPStop in all four modes", function()
+    for _, mode in ipairs({ "n", "i", "t", "v" }) do
+      local m = t.get_keymap(mode, "<S-F5>")
+      t.assert_true(m ~= nil, "<S-F5> 未绑定 mode=" .. mode)
+      t.assert_contains(m.rhs or "", "UEDAPStop")
+    end
   end)
   t.it("<F9> → UEDAPToggleBreakpoint", function()
     local m = t.get_keymap("n", "<F9>")
@@ -75,6 +82,18 @@ t.describe("keymaps: DAP 功能键多模式", function()
 end)
 
 t.describe("keymaps: leader 代表键", function()
+  t.it("<leader>uJ cycles panels from normal and terminal modes", function()
+    for _, mode in ipairs({ "n", "t" }) do
+      t.assert_contains(t.get_keymap(mode, "<leader>uJ").rhs, "UEPanelNext")
+    end
+  end)
+  t.it("<leader>u? → user guide", function()
+    t.assert_contains(t.get_keymap("n", "<leader>u?").rhs, "UEGuide")
+  end)
+
+  t.it("<leader>uE → first build error", function()
+    t.assert_contains(t.get_keymap("n", "<leader>uE").rhs, "UEBuildFirstError")
+  end)
   local function rhs_of(mode, lhs)
     local m = t.get_keymap(mode, lhs)
     return m and (m.rhs or "") or nil

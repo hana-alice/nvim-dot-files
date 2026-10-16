@@ -61,6 +61,19 @@ end
 
 function M.run(request)
   local payload = request.payload or {}
+  local ctx, env = payload.context, payload.env
+  local device = payload.android_device or android_device
+  local serial = device.get()
+  if serial and env and ctx and env.trim((ctx.state or {}).android_package or "") == ""
+      and type(payload.reinvoke) == "function" then
+    require("utils.android_package").pick({ adb = device.adb_executable(), serial = serial,
+      prompt = "Android package for UE logcat:" }, function(picked)
+      if not picked then return end
+      if ctx.engine_root then env.update_state_field(ctx.engine_root, "android_package", picked) end
+      payload.reinvoke()
+    end)
+    return nil, nil
+  end
   local spec, err = M.resolve(payload.env, payload.context, payload)
   if not spec and err == "Android device is not selected; run :UESetAndroidDevice" then
     local device = payload.android_device or android_device

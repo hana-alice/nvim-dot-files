@@ -1,6 +1,7 @@
 local ffi = require("ffi")
 
 local platform = require("utils.platform")
+local inputs = require("utils.ue_goto.semantic_sidecar_inputs")
 
 local M = {}
 
@@ -96,6 +97,8 @@ int clang_reparseTranslationUnit(
 void clang_disposeTranslationUnit(CXTranslationUnit);
 
 CXFile clang_getFile(CXTranslationUnit tu, const char *file_name);
+int clang_File_isEqual(CXFile file1, CXFile file2);
+const char *clang_getFileContents(CXTranslationUnit tu, CXFile file, size_t *size);
 CXSourceLocation clang_getLocation(CXTranslationUnit tu, CXFile file, unsigned line, unsigned column);
 void clang_getExpansionLocation(
   CXSourceLocation location,
@@ -222,69 +225,33 @@ function M.read_json(path)
 end
 
 function M.file_signature(path)
-  local stat = uv.fs_stat(path)
-  if not stat or stat.type ~= "file" then
-    return nil
-  end
-  return M.sha256(vim.json.encode({
-    M.normalize(path),
-    tostring(stat.size or 0),
-    tostring(stat.mtime and stat.mtime.sec or 0),
-    tostring(stat.mtime and stat.mtime.nsec or 0),
-  }))
+  return inputs.file_signature(M, path)
 end
 
--- Compiler-authored dependency paths, including the main file. Kept only in
--- the sidecar: warm validation must not scan the project or block the editor.
 function M.tu_file_signatures(lib, tu, origin, cwd)
-  origin = M.absolute_path(origin, cwd)
-  local signatures = { [origin] = M.file_signature(origin) or false }
-  local visitor = ffi.cast("CXInclusionVisitor", function(file)
-    local path = M.absolute_path(M.cxstring_to_string(lib, lib.clang_getFileName(file)), cwd)
-    if path ~= "" then signatures[path] = M.file_signature(path) or false end
-  end)
-  local ok, err = pcall(lib.clang_getInclusions, tu, visitor, nil)
-  visitor:free()
-  if not ok then error(err) end
-  return signatures
+  return inputs.tu_file_signatures(M, lib, tu, origin, cwd)
 end
--- libclang calls back into Lua; this FFI call must remain outside JIT traces.
 jit.off(M.tu_file_signatures, true)
 
-function M.file_signatures_current(signatures)
-  if not signatures then return false end
-  for path, signature in pairs(signatures) do
-    if (M.file_signature(path) or false) ~= signature then return false end
-  end
-  return true
+function M.tu_includes_file(lib, tu, requested)
+  return inputs.tu_includes_file(M, lib, tu, requested)
+end
+jit.off(M.tu_includes_file, true)
+
+function M.file_contents_match(lib, tu, file, path, overlays)
+  return inputs.file_contents_match(M, lib, tu, file, path, overlays)
 end
 
-local function mtime_before(left, right)
-  local lm, rm = left and left.mtime, right and right.mtime
-  if not lm or not rm then return false end
-  if lm.sec ~= rm.sec then return lm.sec < rm.sec end
-  return (lm.nsec or 0) < (rm.nsec or 0)
+function M.vfs_input_signatures(compile, included_files)
+  return inputs.vfs_input_signatures(M, compile, included_files)
+end
+
+function M.file_signatures_current(signatures)
+  return inputs.file_signatures_current(M, signatures)
 end
 
 function M.active_cdb_is_fresh(cdb_path, active_cdb_path, manifest_path)
-  local merged = M.uv.fs_stat(cdb_path)
-  local active = M.uv.fs_stat(active_cdb_path)
-  if not merged or merged.type ~= "file" then return false, "merged-cdb-unreadable" end
-  if not active or active.type ~= "file" then return false, "active-cdb-unreadable" end
-  if M.normalize(cdb_path):lower() ~= M.normalize(active_cdb_path):lower()
-      and mtime_before(merged, active) then
-    return false, "merged-cdb-predates-active-shard"
-  end
-  if manifest_path and manifest_path ~= "" then
-    local manifest = M.uv.fs_stat(manifest_path)
-    if not manifest or manifest.type ~= "file" then
-      return false, "active-manifest-unreadable"
-    end
-    if mtime_before(merged, manifest) then
-      return false, "merged-cdb-predates-active-selection"
-    end
-  end
-  return true
+  return inputs.active_cdb_is_fresh(M, cdb_path, active_cdb_path, manifest_path)
 end
 
 function M.dirname(path)
@@ -630,7 +597,26 @@ function M.cursor_shim_cache_clear()
   end
 end
 
-function M.semantic_parse_args(argv)
+function M.compiler_resource_dir(toolchain)
+  local version = type(toolchain) == "table" and tostring(toolchain.clang_version or ""):match("clang version ([%d.]+)")
+  if not version then return nil end
+  local major = version:match("^%d+")
+  for _, binary in ipairs({ toolchain.libclang_path or "", toolchain.clangd_path or "" }) do
+    local actual = binary ~= "" and (uv.fs_realpath(binary) or M.normalize(binary))
+    if actual then
+      local root = vim.fs.dirname(vim.fs.dirname(actual))
+      for _, name in ipairs({ version, major }) do
+        for _, base in ipairs({ "lib/clang", "lib64/clang" }) do
+          local directory = M.normalize(vim.fs.joinpath(root, base, name))
+          if M.file_exists(directory .. "/include/stddef.h") then return directory end
+        end
+      end
+    end
+  end
+  return nil
+end
+
+function M.semantic_parse_args(argv, toolchain)
   local out = {}
   local gcc_toolchain
   local has_resource_dir = false
@@ -638,7 +624,8 @@ function M.semantic_parse_args(argv)
   while i <= #argv do
     local arg = argv[i]
     local lower = arg:lower()
-    if lower:match("^%-resource%-dir=") then has_resource_dir = true end
+    if lower == "-resource-dir" or lower == "--resource-dir"
+        or lower:match("^%-%-?resource%-dir=") then has_resource_dir = true end
     if lower:match("^%-%-gcc%-toolchain=") then
       gcc_toolchain = arg:sub(#"--gcc-toolchain=" + 1)
     elseif arg == "--gcc-toolchain" and argv[i + 1] then
@@ -659,22 +646,30 @@ function M.semantic_parse_args(argv)
   end
 
   if not has_resource_dir and gcc_toolchain then
-    local versions = {}
-    for _, base in ipairs({
-      M.normalize(gcc_toolchain .. "/lib64/clang"),
-      M.normalize(gcc_toolchain .. "/lib/clang"),
-    }) do
-      local scanner = uv.fs_scandir(base)
-      if scanner then
-        while true do
-          local name, kind = uv.fs_scandir_next(scanner)
-          if not name then break end
-          if kind == "directory" then versions[#versions + 1] = M.normalize(base .. "/" .. name) end
+    -- --gcc-toolchain supplies the target ABI/sysroot; its old builtin
+    -- headers are not compatible with the newer parser loaded by libclang.
+    local compiler_resource = toolchain and M.compiler_resource_dir(toolchain)
+    if toolchain and not compiler_resource then return nil, "compiler-resource-dir-unavailable" end
+    if compiler_resource then
+      table.insert(out, 1, "-resource-dir=" .. compiler_resource)
+    else
+      local versions = {}
+      for _, base in ipairs({
+        M.normalize(gcc_toolchain .. "/lib64/clang"),
+        M.normalize(gcc_toolchain .. "/lib/clang"),
+      }) do
+        local scanner = uv.fs_scandir(base)
+        if scanner then
+          while true do
+            local name, kind = uv.fs_scandir_next(scanner)
+            if not name then break end
+            if kind == "directory" then versions[#versions + 1] = M.normalize(base .. "/" .. name) end
+          end
         end
       end
-    end
-    if #versions == 1 then
-      table.insert(out, 1, "-resource-dir=" .. versions[1])
+      if #versions == 1 then
+        table.insert(out, 1, "-resource-dir=" .. versions[1])
+      end
     end
   end
 

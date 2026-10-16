@@ -50,12 +50,107 @@ local function fixture(callback)
   end }, deps = { read_all = read, write_all = write } })
   local function publish() return index.publish_semantic_cdb(ctx, state, generation) end
   local ok, err = pcall(callback, { originals = originals, ctx = ctx, phase = phase, batch = batch,
-    publish = publish, read = read, json = json, root = root })
+    publish = publish, read = read, json = json, root = root, index = index, state = state })
   vim.fn.delete(root, "rf")
   if not ok then error(err) end
 end
 
 t.describe("exactly-once batch publication", function()
+  t.it("same-generation ordinary append preflight preserves bytes until the barrier releases", function()
+    fixture(function(f)
+      f.phase("current", { f.originals[1] })
+      t.assert_true(f.publish())
+      f.state.index_selection = { generation_id = "test" }
+      f.phase("full", f.originals)
+      local before = f.read(f.ctx.paths.semantic_cdb)
+      local stamp = vim.uv.fs_stat(f.ctx.paths.semantic_cdb).mtime
+      f.index._defer_append = true
+      local ok, report = f.publish(); t.assert_true(ok); t.assert_true(report.deferred)
+      t.assert_eq(f.read(f.ctx.paths.semantic_cdb), before)
+      t.assert_true(vim.deep_equal(vim.uv.fs_stat(f.ctx.paths.semantic_cdb).mtime, stamp))
+      f.index._defer_append = false
+      local published, final = f.publish(); t.assert_true(published); t.assert_true(final.changed)
+      t.assert_eq(#vim.json.decode(f.read(f.ctx.paths.semantic_cdb)), 3)
+    end)
+  end)
+
+  for _, bypass in ipairs({ "generation", "frozen" }) do
+    t.it("append preflight bypasses " .. bypass .. " without changing its publication boundary", function()
+      fixture(function(f)
+        f.phase("current", { f.originals[3] })
+        t.assert_true(f.publish())
+        f.state.index_selection = { generation_id = bypass == "generation" and "older" or "test" }
+        if bypass == "frozen" then
+          local candidate = f.batch("AB", { f.originals[1], f.originals[2] })
+          f.phase("full", { candidate, f.originals[3] }, f.originals)
+        else
+          f.phase("full", f.originals)
+        end
+        f.index._defer_append = true
+        local ok, report = f.publish(); t.assert_true(ok); t.assert_true(report.deferred ~= true)
+        t.assert_eq(#vim.json.decode(f.read(f.ctx.paths.semantic_cdb)), 1, "bypass preflight is read-only too")
+        f.index._defer_append = false
+        ok, report = f.publish(); t.assert_true(ok)
+        t.assert_true(report.changed)
+        t.assert_eq(#vim.json.decode(f.read(f.ctx.paths.semantic_cdb)), 3)
+        if bypass == "frozen" then
+          t.assert_false(report.ordinary)
+          t.assert_true(vim.uv.fs_stat(f.root .. "/batches.json") ~= nil)
+        end
+      end)
+    end)
+  end
+
+  t.it("only unchanged unique-file supersets authorize ordinary same-process reload", function()
+    fixture(function(f)
+      f.phase("current", { f.originals[1] })
+      local ok, first = f.publish(); t.assert_true(ok)
+      t.assert_false(first.original_append_only)
+      f.phase("hot", { f.originals[2] })
+      local hot_ok, hot = f.publish(); t.assert_true(hot_ok)
+      t.assert_true(hot.original_append_only)
+      f.phase("full", f.originals)
+      local full_ok, full = f.publish(); t.assert_true(full_ok)
+      t.assert_true(full.original_append_only)
+      local cached_ok, cached = f.publish(); t.assert_true(cached_ok)
+      t.assert_false(cached.changed)
+      t.assert_true(cached.original_append_only ~= true)
+    end)
+  end)
+
+  for _, change in ipairs({ "argv", "directory", "output", "removed", "variant" }) do
+    t.it("refuses same-process append classification for " .. change, function()
+      fixture(function(f)
+        f.phase("full", { f.originals[1], f.originals[2] })
+        t.assert_true(f.publish())
+        local rows = vim.deepcopy(f.originals)
+        if change == "argv" then table.insert(rows[1].arguments, 2, "-DCHANGED=1")
+        elseif change == "directory" then rows[1].directory = f.root .. "/other"
+        elseif change == "output" then rows[1].output = "other.o"
+        elseif change == "removed" then table.remove(rows, 1)
+        else
+          local variant = vim.deepcopy(rows[1]); table.insert(variant.arguments, 2, "-DVARIANT=1")
+          rows[#rows + 1] = variant
+        end
+        f.phase("full", rows)
+        local ok, result = f.publish(); t.assert_true(ok)
+        t.assert_false(result.original_append_only)
+      end)
+    end)
+  end
+
+  t.it("receipt-backed growth retains the frozen activation boundary", function()
+    fixture(function(f)
+      f.phase("current", { f.originals[3] })
+      t.assert_true(f.publish())
+      local candidate = f.batch("AB", { f.originals[1], f.originals[2] })
+      f.phase("full", { candidate, f.originals[3] }, f.originals)
+      local ok, result = f.publish(); t.assert_true(ok)
+      t.assert_true(result.original_changed)
+      t.assert_false(result.original_append_only)
+    end)
+  end)
+
   t.it("distinguishes original command changes from frozen-only publication and cached reuse", function()
     fixture(function(f)
       f.phase("full", f.originals)

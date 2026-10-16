@@ -809,6 +809,21 @@ local function with_dispatch_events(body)
 end
 
 t.describe("cpp semantic client: serialized dispatch", function()
+  t.it("background requests lower only the owned transport priority and foreground dispatch restores it", function()
+    with_dispatch_events(function(isolated, events)
+      local priorities = {}
+      isolated.set_priority = function(value) priorities[#priorities + 1] = value end
+      local options = { clangd_path = vim.v.progpath }
+      isolated.request("stats", {}, function() end, options, function() return true end, true)
+      events.respond() -- handshake, then background stats
+      t.assert_eq(priorities[#priorities], "low")
+      isolated.request("stats", {}, function() end, options)
+      events.respond() -- background stats completes; foreground dispatches
+      t.assert_eq(priorities[#priorities], "normal")
+      events.respond()
+    end)
+  end)
+
   t.it("a handshake deadline expires without entering the crash-retry path", function()
     with_dispatch_events(function(isolated, events)
       local responses = {}

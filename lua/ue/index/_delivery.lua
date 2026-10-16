@@ -73,9 +73,12 @@ return function(M, core)
     local status = fs.trim(tostring(summary.status or ""))
     local phase = fs.trim(tostring(summary.phase_label or summary.phase or ""))
     local coverage = fs.trim(tostring(summary.coverage_level or ""))
+    local background = summary.background_index
+    local first_stage = background and background.first_stage_complete
 
     if status == "running" then
-      return "building", ("Semantic index: BUILDING (%s) — C++ definition navigation is not ready yet")
+      return "building", (first_stage and "Semantic index: first stage indexed; BUILDING (%s)"
+        or "Semantic index: BUILDING (%s) — C++ definition navigation is not ready yet")
         :format(phase ~= "" and phase or "index")
     end
     if status == "error" then
@@ -92,13 +95,20 @@ return function(M, core)
     if summary.source_refresh_pending then
       return "pending", "Semantic index: source changes awaiting clangd refresh"
     end
+    if background and background.status ~= "indexed" and background.status ~= "bypassed" then
+      return "pending", ("Semantic index: CDB generated (%s); background %s%s")
+        :format(background.phase or phase, background.status,
+          first_stage and "; first stage indexed" or "; completion unconfirmed")
+    end
     -- Only a selected artifact of the CURRENT generation counts as delivered.
     -- A stale or missing selection MUST NOT be reported as ready: the clangd gate
     -- consumes persisted readiness, so claiming "ready" here while the gate defers
     -- is exactly the contradiction that hid this defect (K41).
     if summary.freshness ~= "missing" and summary.freshness ~= "stale"
         and coverage ~= "" and coverage ~= "-" then
-      return "ready", ("Semantic index: ready (%s)"):format(coverage)
+      local evidence = background and background.status == "indexed" and "background indexed"
+        or "CDB generated; background completion unconfirmed"
+      return "ready", ("Semantic index: ready (%s); %s"):format(coverage, evidence)
     end
     return "pending", "Semantic index: not delivered yet — C++ definition navigation is not ready"
   end
@@ -142,6 +152,9 @@ return function(M, core)
     end
     local state = core.h.ensure_index_state(ctx)
     local generation = core.h.generation_for_context(ctx)
+    -- No generation verdict exists while the current digest is in flight.
+    -- Reporting a mismatch here would label intact artifacts as obsolete.
+    if generation.pending or generation.failed then return rows end
     local paths = {
       current = ctx.paths.index_current_cdb,
       hot = ctx.paths.index_hot_cdb,

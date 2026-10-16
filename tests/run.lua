@@ -27,6 +27,7 @@ vim.fn.mkdir(probe_test_dir, "p")
 -- Keep installed plugins/config readable, but never write local user evidence.
 -- Children inherit these process-local overrides; the launching shell is unchanged.
 vim.env.NVIM_TEST_RUN_ROOT = probe_test_dir
+vim.env.NVIM_LOG_FILE = probe_test_dir .. "/nvim.log"
 vim.env.XDG_STATE_HOME = probe_test_dir .. "/state"
 vim.env.NVIM_UE_LOG_DIR = probe_test_dir .. "/logs"
 vim.env.NVIM_UE_PROBE_PATH = probe_test_dir .. "/ue_probes.json"

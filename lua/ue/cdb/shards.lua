@@ -171,14 +171,21 @@ function M.shard_path(ctx, key)
   return fs.join(M.shards_dir(ctx), key .. ".json")
 end
 
-local function read_json(path)
-  local f = io.open(path, "rb")
-  if not f then return nil end
-  local data = f:read("*a")
-  f:close()
-  if not data or data == "" then return nil end
+local function read_json(path, require_array)
+  local f, open_err, code = io.open(path, "rb")
+  if not f then
+    return nil, ("cannot read %s: %s"):format(path, tostring(open_err)), code == 2 and "missing" or "error"
+  end
+  local data, read_err = f:read("*a")
+  local closed, close_err = f:close()
+  if not data or not closed then
+    return nil, ("cannot read %s: %s"):format(path, tostring(read_err or close_err)), "error"
+  end
   local ok, decoded = pcall(vim.json.decode, data)
-  if not ok then return nil end
+  if not ok then return nil, ("invalid JSON in %s: %s"):format(path, tostring(decoded)), "error" end
+  if require_array and (type(decoded) ~= "table" or not data:match("^%s*%[")) then
+    return nil, "expected an entries array in " .. path, "error"
+  end
   return decoded
 end
 
@@ -194,9 +201,13 @@ local function write_json(path, value)
   local temp = path .. (".tmp.%d.%s"):format(vim.fn.getpid(), tostring(vim.uv.hrtime()))
   local f = io.open(temp, "wb")
   if not f then return false, "cannot open " .. temp end
-  f:write(raw)
-  f:flush()
-  f:close()
+  local written, write_err = f:write(raw)
+  if written then written, write_err = f:flush() end
+  local closed, close_err = f:close()
+  if not written or not closed then
+    pcall(os.remove, temp)
+    return false, ("cannot write %s: %s"):format(path, tostring(write_err or close_err))
+  end
   local ok, err = vim.uv.fs_rename(temp, path)
   if not ok then
     pcall(os.remove, temp)
@@ -206,9 +217,14 @@ local function write_json(path, value)
 end
 
 function M.read_manifest(ctx)
-  local m = read_json(manifest_path(M.shards_dir(ctx)))
-  if type(m) ~= "table" then
+  local path = manifest_path(M.shards_dir(ctx))
+  local m, err, status = read_json(path)
+  if status == "missing" then
     return { active = nil, shards = {} }
+  end
+  if err then return nil, err, status end
+  if type(m) ~= "table" or (m.shards ~= nil and type(m.shards) ~= "table") then
+    return nil, "invalid shard manifest in " .. path, "error"
   end
   m.shards = m.shards or {}
   return m
@@ -223,13 +239,15 @@ end
 -- ==========================================================================
 
 --- Persist a shard with its (platform, target, config) metadata + source
---- roots used to discover it. Returns the shard key.
+--- roots used to discover it. Returns key, path; failure returns nil, error.
 function M.write_shard(ctx, platform, target, config, entries, source_roots)
   local key = M.shard_key(platform, target, config)
   local path = M.shard_path(ctx, key)
-  write_json(path, entries)
+  local manifest, manifest_err = M.read_manifest(ctx)
+  if not manifest then return nil, manifest_err end
+  local written, write_err = write_json(path, entries)
+  if not written then return nil, ("cannot publish shard %s: %s"):format(path, tostring(write_err)) end
   local st = vim.uv.fs_stat(path)
-  local manifest = M.read_manifest(ctx)
   manifest.shards[key] = {
     platform = platform,
     target = target,
@@ -240,14 +258,22 @@ function M.write_shard(ctx, platform, target, config, entries, source_roots)
     updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
   }
   manifest.active = key
-  M.write_manifest(ctx, manifest)
+  local saved, save_err = M.write_manifest(ctx, manifest)
+  if not saved then return nil, ("cannot publish manifest for %s: %s"):format(key, tostring(save_err)) end
   return key, path
 end
 
---- Load a single shard's entries from disk.
+--- Load entries, including a valid empty array. Failure returns nil, error,
+--- status ("missing" or "error"), so unreadable input cannot become empty.
 function M.read_shard(ctx, key)
-  local entries = read_json(M.shard_path(ctx, key))
-  if type(entries) ~= "table" then return {} end
+  local path = M.shard_path(ctx, key)
+  local entries, err, status = read_json(path, true)
+  if not entries then return nil, err, status end
+  for _, entry in ipairs(entries) do
+    if type(entry) ~= "table" or type(entry.file) ~= "string" or entry.file == "" then
+      return nil, "invalid compile entry in " .. path, "error"
+    end
+  end
   return entries
 end
 
@@ -301,8 +327,13 @@ end
 
 --- Merge every shard into a single entries array, applying the dedup
 --- priority rule. Returns entries, stats { total_in, total_out, dropped }.
+--- Every declared shard is required; failure returns nil, failure details.
 function M.merge_shards(ctx, manifest)
-  manifest = manifest or M.read_manifest(ctx)
+  if not manifest then
+    local err, status
+    manifest, err, status = M.read_manifest(ctx)
+    if not manifest then return nil, { error = err, status = status, complete = false } end
+  end
   local active = M.active_key(ctx, manifest)
 
   -- Walk every shard, accumulate entries with their owning key.
@@ -319,7 +350,11 @@ function M.merge_shards(ctx, manifest)
   end)
 
   for _, key in ipairs(keys) do
-    local entries = M.read_shard(ctx, key)
+    local entries, err, status = M.read_shard(ctx, key)
+    if not entries then
+      return nil, { error = err, status = status, failed_shard = key,
+        path = M.shard_path(ctx, key), active = active, shard_count = #keys, complete = false }
+    end
     total_in = total_in + #entries
     for _, e in ipairs(entries) do
       local f = (e.file or ""):gsub("\\", "/"):lower()
@@ -349,10 +384,11 @@ end
 function M.migrate_legacy_if_needed(ctx, legacy_path)
   local sd = M.shards_dir(ctx)
   fs.ensure_dir(sd)
-  local m = M.read_manifest(ctx)
+  local m, manifest_err = M.read_manifest(ctx)
+  if not m then return false, manifest_err end
   if next(m.shards or {}) then return false end
   if not legacy_path or not fs.is_file(legacy_path) then return false end
-  local entries = read_json(legacy_path)
+  local entries = read_json(legacy_path, true)
   if type(entries) ~= "table" or #entries == 0 then return false end
   -- Guess a key from ctx.state. Fall back to "Legacy-Unknown-Unknown".
   local state = ctx.state or {}
@@ -361,7 +397,8 @@ function M.migrate_legacy_if_needed(ctx, legacy_path)
   local target = "Unknown"
   local stripped = conf_raw:gsub(" Editor$", "")
   if stripped ~= conf_raw then target = "Editor" end
-  M.write_shard(ctx, plat, target, stripped, entries, { "legacy:" .. legacy_path })
+  local key, err = M.write_shard(ctx, plat, target, stripped, entries, { "legacy:" .. legacy_path })
+  if not key then return false, err end
   return true
 end
 

@@ -51,6 +51,40 @@ with tempfile.TemporaryDirectory(prefix='verified_batch_') as temporary, context
             b = module._graph_result(result, root / 'trigger.cpp', record_pool=pool)
         assert a is not b and a[uri] is b[uri]
         assert module._json(a) == module._json(module.canonical_file_graph(shards))
+        # Only exact bytes authorize a decoder cache hit, even when SHA collides.
+        shard_paths = [root / ('header%d.idx' % index) for index in range(3)]
+        for path, raw in zip(shard_paths, (b'same header shard', b'same header shard', b'changed header shard')):
+            path.write_bytes(raw)
+        different = copy.deepcopy(shards[0])
+        different['refs'][0]['symbol_id'] = 'b' * 16
+        pool = {}
+        with patch.object(module, '_sha', return_value='collision'), \
+             patch.object(module, 'read_shard', side_effect=[copy.deepcopy(shards[0]), different]) as decoded:
+            collected = [module._graph_result(dict(result, shards=[str(path)]), root / 'trigger.cpp',
+                record_pool=pool) for path in shard_paths]
+        assert decoded.call_count == 2, 'only the byte-identical second shard may skip decoding'
+        assert collected[0][uri] is collected[1][uri]
+        assert collected[2][uri] is not collected[0][uri]
+        assert module._json(collected[0]) == module._json(a)
+        rejected = module.compare_graphs([collected[0], collected[2]], collected[0])
+        assert not rejected['accepted'] and rejected['reason'] == 'references-removed-or-retargeted', rejected
+        pool.clear()
+        assert not pool, 'the per-proof byte cache must die with the original record pool'
+        for issue, expected in (('errors', 'private-index-had-errors:'),
+                                ('includes', 'incomplete-dependency-shards:')):
+            malformed = copy.deepcopy(shards[0])
+            if issue == 'errors': malformed['sources'][uri]['flags'] = 2
+            else: malformed['sources'][uri]['direct_includes'] = [(root / 'missing.h').as_uri()]
+            pool = {}
+            with patch.object(module, 'read_shard', return_value=malformed) as decoded:
+                for _ in range(2):
+                    try:
+                        module._graph_result(dict(result, shards=[str(shard_paths[0])]),
+                            root / 'trigger.cpp', record_pool=pool)
+                        raise AssertionError('cached malformed source graph was accepted')
+                    except ValueError as error:
+                        assert str(error).startswith(expected), str(error)
+            assert decoded.call_count == 1, 'cache hits must still execute the failure gates'
         print(json.dumps({'operation': operation, 'exact_record_sharing': True,
                           'hash_collision_preserves_different_binding': True, 'serialized_graphs_unchanged': True}))
         sys.exit(0)
@@ -693,6 +727,24 @@ module._write(root / 'snapshot.h', b'certified snapshot bytes')
     assert metrics['original_ubt_count'] == 2 and metrics['exact_count'] == 1 and metrics['shader_count'] == 1
     assert metrics['other_count'] == 0
     assert metrics['proof_seconds'] >= 0
+    if metrics['groups']:
+        phase = metrics['groups'][0]['phase_timings']
+        assert phase['original_index']['calls'] >= 1, phase
+        assert phase['original_index']['seconds'] > 0, phase
+        assert all(run['process_wall_seconds'] >= run['indexing_wall_seconds']
+                   and run['graph_decode_seconds'] >= 0 and run['spawn_seconds'] >= 0
+                   and run['shutdown_seconds'] >= 0 for run in metrics['groups'][0]['run_metrics'])
+    if metrics['batch_count']:
+        import hashlib
+        proof_record = json.loads(next((root / 'proofs/receipts').glob('*.json')).read_text())
+        proof_receipt = json.loads(pathlib.Path(output[0]['nvim_ue_batch_receipt']).read_text())
+        actual = [hashlib.sha256(pathlib.Path(asset['path']).read_bytes()).hexdigest()
+                  for asset in proof_record['graph_files']]
+        assert proof_receipt['original_graph_sha256'] == actual[:-1]
+        assert proof_receipt['candidate_graph_sha256'] == actual[-1]
+    elif operation == 'overload':
+        assert phase['graph_compare_and_bindings']['seconds'] > 0
+        assert len(metrics['groups'][0]['run_metrics']) == 3, 'rejections retain completed index costs'
     if operation == 'template_arguments':
         assert metrics['batch_count'] == 1, metrics
         receipt = json.loads(pathlib.Path(output[0]['nvim_ue_batch_receipt']).read_text())
@@ -701,6 +753,7 @@ module._write(root / 'snapshot.h', b'certified snapshot bytes')
         assert len(proof_assets) == 2
         record = json.loads(next((root / 'proofs/receipts').glob('*.json')).read_text())
         assert all(asset in record['assets'] for asset in proof_assets)
+        assert all(pathlib.Path(asset['path']).parent == root / 'proofs/assets' for asset in proof_assets)
         proof = json.loads(pathlib.Path(proof_assets[1]['path']).read_text())
         assert proof['ok'] is True
         assert proof['evidence']['entries'] == receipt['effective_entries'] + [receipt['effective_candidate']]
@@ -785,6 +838,10 @@ module._write(root / 'snapshot.h', b'certified snapshot bytes')
         assert deferred['groups'][0]['reason'] == 'verification-not-cached', deferred
     elif operation == 'pass':
         assert len(output) == 3 and metrics['batch_count'] == 1, metrics
+        work = pathlib.Path(metrics['proof_directory'])
+        assert work.parent == module._proof_work_root(root / 'proofs')
+        assert not work.is_relative_to(root / 'proofs'), 'mutable proof must leave frozen asset ancestors'
+        assert metrics['proof_accepted_count'] == 1 and metrics['proof_rejected_count'] == 0
         batch = output[0]
         assert batch['nvim_ue_batch_receipt_sha256'] == module._sha(pathlib.Path(batch['nvim_ue_batch_receipt']).read_bytes())
         assert batch['nvim_ue_batch_ubt_count'] == 2
@@ -797,14 +854,28 @@ module._write(root / 'snapshot.h', b'certified snapshot bytes')
         assert again == output and repeat['batch_count'] == 1, repeat
         assert before == {str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
         assert repeat['baseline_cache_reused'] is True and repeat['cache_hits'] == 1
+        assert repeat['proof_directory'] is None and repeat['new_proof_count'] == 0
         record = json.loads(next((root / 'proofs/receipts').glob('*.json')).read_text())
         excluded = (root / 'proofs').resolve()
         assert module._cache_valid(record, excluded, {})
         receipts = [batch['nvim_ue_batch_receipt']]
         described = module.describe_receipts(receipts)
-        assert described['ok'] and described['watch_roots'] and str(excluded) in described['exclude_roots']
+        assert described['ok'] and described['watch_roots'] and described['exclude_roots'] == []
         validated = module.validate_receipts(receipts, clangd)
         assert validated['ok'] and validated['validation_seconds'] >= 0, validated
+        replay_before = {str(path): (path.read_bytes(), path.stat().st_mtime_ns)
+                         for path in work.rglob('*') if path.is_file()}
+        replay = module.replay_proof(entries[:2], work / 'group-0', clangd, timeout=30)
+        assert replay['diagnostic_only'] and not replay['freshness_proven'], replay
+        assert pathlib.Path(replay['evidence_dir']).parent == module._proof_work_root(work / 'group-0')
+        assert replay_before == {str(path): (path.read_bytes(), path.stat().st_mtime_ns)
+                                  for path in work.rglob('*') if path.is_file()}, 'diagnostic replay mutated historical proof'
+        incomplete = work.parent / 'incomplete-next-proof'
+        incomplete.mkdir()
+        (incomplete / 'query.stdout.log').write_text('mutable next qualification')
+        assert module._cache_valid(record, excluded, {}), 'next proof scratch must not change receipt inputs'
+        assert not any(work == pathlib.Path(path) or pathlib.Path(path) in work.parents
+                       for path in described['watch_roots']), 'source inventory watches must not cover proof scratch'
         request_path, response_path = root / 'proofs/request.json', root / 'proofs/response.json'
         request_path.write_text(json.dumps(receipts), encoding='utf-8')
         for action in ('--describe-receipts', '--validate-receipts'):

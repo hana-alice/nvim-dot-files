@@ -78,6 +78,7 @@ t.describe("real clangd: source identity and destination roles", function()
     vim.api.nvim_set_current_buf(bufnr)
     vim.bo[bufnr].filetype = "cpp"
     local client
+    local lineages = {}
     local old_notify = vim.notify
     vim.notify = function() end
     local ok, err = xpcall(function()
@@ -94,6 +95,7 @@ t.describe("real clangd: source identity and destination roles", function()
             winid = vim.api.nvim_get_current_win(), document_version = vim.api.nvim_buf_get_changedtick(bufnr) } end,
           discover_toolchain = function() return { index = { readiness = "ready", complete = true } } end,
           snapshot_is_current = function() return true end,
+          note_origin = function(_, context) lineages[#lineages + 1] = vim.deepcopy(context) end,
         },
         ["utils.probe"] = { record = function() end },
       }, function()
@@ -120,17 +122,27 @@ t.describe("real clangd: source identity and destination roles", function()
             t.assert_eq(result.state, "unavailable")
             t.assert_eq(result.destination_role, "declaration")
             t.assert_true(vim.deep_equal(vim.api.nvim_win_get_cursor(0), cursor))
+            t.assert_eq(#lineages, 0, "a declaration miss cannot seed a source candidate")
           else
             t.assert_eq(result.state, "resolved", symbol .. " definition must remain navigable")
             t.assert_eq(result.destination_role, "definition")
+            local origin = lineages[#lineages]
+            t.assert_true(origin ~= nil, "compiler-verified source definition retains its exact context")
+            t.assert_true(origin.source_exact_candidate)
+            t.assert_eq(origin.origin_tu, path)
+            t.assert_true(vim.deep_equal(origin.compile.argv, command))
+            t.assert_true(origin.subject_membership[path])
+            t.assert_eq(origin.evidence_kind, "clangd-source-exact-command")
           end
         end
         vim.api.nvim_win_set_cursor(0, { 8, assert(lines[8]:find("overloaded", 1, true)) - 1 })
+        local before_ambiguous = #lineages
         nav.cpp_definition("overloaded", bufnr, vim.api.nvim_buf_get_name(bufnr), "cpp")
         t.assert_true(vim.wait(10000, function() return owner._last_cpp_transaction.result ~= nil end, 20))
         local result = owner._last_cpp_transaction.result
         t.assert_eq(result.reason, "identity-conflict")
         t.assert_eq(#result.provider_result.identities, 2)
+        t.assert_eq(#lineages, before_ambiguous, "ambiguous identity cannot replace source provenance")
       end)
     end, debug.traceback)
     if client then client:stop(true); vim.wait(1000, function() return client:is_stopped() end, 20) end

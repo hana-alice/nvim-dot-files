@@ -119,7 +119,7 @@ t.describe("ue.android_build_command（SO-only）", function()
     t.assert_false(script:find('"-SkipDeploy"', 1, true) ~= nil)
   end)
 
-  t.it("运行中的 build terminal 可隐藏，任务退出后才恢复 wipe", function()
+  t.it("运行中与已结束的 build terminal 都可隐藏回看", function()
     local source = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue.lua"), "\n")
     local section = source:match(
       "local function open_terminal_command%b().-\nend\n\n%-%- =========================================================================="
@@ -130,8 +130,8 @@ t.describe("ue.android_build_command（SO-only）", function()
     local wipe_at = section:find('vim.bo[buf].bufhidden = "wipe"', 1, true)
     t.assert_true(hide_at ~= nil and termopen_at ~= nil and hide_at < termopen_at,
       "任务启动前 terminal 必须使用 bufhidden=hide，关窗不得终止 build")
-    t.assert_true(wipe_at ~= nil and wipe_at > termopen_at,
-      "任务退出后 terminal 必须恢复 bufhidden=wipe")
+    t.assert_nil(wipe_at, "完成后不可 wipe，面板须能回看构建输出")
+    t.assert_contains(section, 'require("utils.bottom_panel").register("build", buf)')
   end)
 
   t.it("项目和 SO 发现不固定 Client 项目路径", function()
@@ -374,6 +374,29 @@ t.describe("ue.android_build_command（SO-only）", function()
       "SO deploy 不得通过读取运行进程来隐式耦合启动")
     t.assert_false(script:find("system:system", 1, true) ~= nil,
       "不得假设设备安装目录固定属于 system:system")
+  end)
+
+  t.it("SO 未变在 force-stop 前跳过，探测失败继续部署且可强制", function()
+    local config = vim.fn.stdpath("config")
+    local script = table.concat(vim.fn.readfile(config .. "/scripts/ue_android_so_deploy.ps1"), "\n")
+    local skip = assert(script:find("if (-not $Force -and (Test-DeployedSoUnchanged", 1, true))
+    local stop = assert(script:find('"shell", "am", "force-stop"', 1, true))
+    t.assert_true(skip < stop, "跳过判定必须先于停止应用")
+    t.assert_contains(script, "catch { return $false }")
+    t.assert_contains(script, "[switch]$Force")
+    t.assert_contains(script, "unchanged (sha256=$localHash) $([char]0x2014) skipped")
+    t.assert_contains(script, "if ($deploymentStarted)")
+    if vim.fn.executable("powershell.exe") ~= 1 then
+      t.skip("PowerShell unavailable")
+      return
+    end
+    local result = vim.system({
+      "powershell.exe", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass",
+      "-File", config .. "/tests/fixtures/android_so_deploy/unchanged_spec.ps1",
+      "-DeployScript", config .. "/scripts/ue_android_so_deploy.ps1",
+    }, { text = true }):wait()
+    t.assert_eq(result.code, 0, result.stderr or result.stdout)
+    t.assert_contains(result.stdout or "", "PASS unchanged SO root + manifest + fail-open")
   end)
 
   t.it("SO deploy 替换前等待旧 PID 消失且等待有界", function()

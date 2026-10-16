@@ -3,6 +3,7 @@
 local M = {}
 local api = vim.api
 local pending = {}
+local picker_windows = {}
 
 local function notify(message)
   vim.notify(message, vim.log.levels.ERROR, { title = "Git review" })
@@ -384,9 +385,41 @@ function M.setup()
     group = group, pattern = { "CodeDiffOpen", "CodeDiffFileSelect" },
     callback = function(ev)
       local tab = ev.data and ev.data.tabpage or api.nvim_get_current_tabpage()
-      require("codediff.ui.lifecycle").set_tab_keymap(tab, "n", "<localleader>c", function()
+      local lifecycle = require("codediff.ui.lifecycle")
+      local session = lifecycle.get_session(tab)
+      require("utils.layout").sync_review(tab, session)
+      if session then
+        local panel = session.panel and session.panel.view
+        -- Panels keep their buffer after mounting; only the code panes switch files.
+        if panel and panel.winid and api.nvim_win_is_valid(panel.winid) then
+          vim.wo[panel.winid].winfixbuf = true
+        end
+        local win = session.modified_win
+        if not win or not api.nvim_win_is_valid(win) then win = session.original_win end
+        local previous = picker_windows[tab]
+        if previous ~= win and previous and api.nvim_win_is_valid(previous) then
+          vim.w[previous].snacks_main = nil
+        end
+        picker_windows[tab] = nil
+        if win and api.nvim_win_is_valid(win) then
+          -- Revision buffers are nowrite, so Snacks' file-only filter needs this hint.
+          vim.w[win].snacks_main = true
+          picker_windows[tab] = win
+        end
+      end
+      lifecycle.set_tab_keymap(tab, "n", "<localleader>c", function()
         M.neogit("commit")
       end, { desc = "Git: commit reviewed changes" })
+    end,
+  })
+  api.nvim_create_autocmd("User", {
+    group = group, pattern = "CodeDiffClose",
+    callback = function(ev)
+      local tab = ev.data and ev.data.tabpage or api.nvim_get_current_tabpage()
+      require("utils.layout").sync_review(tab)
+      local win = picker_windows[tab]
+      if win and api.nvim_win_is_valid(win) then vim.w[win].snacks_main = nil end
+      picker_windows[tab] = nil
     end,
   })
   api.nvim_create_autocmd("BufWritePost", {

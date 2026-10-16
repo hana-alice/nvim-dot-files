@@ -34,27 +34,12 @@ local function prune_state()
   end
 end
 
-local function focus_window(win)
-  if win and vim.api.nvim_win_is_valid(win) then
-    vim.api.nvim_set_current_win(win)
-    return true
-  end
-  return false
-end
-
 local function job_running()
   if not state.jobid then
     return false
   end
   local ok, result = pcall(vim.fn.jobwait, { state.jobid }, 0)
   return ok and result and result[1] == -1
-end
-
-local function close_window()
-  if state.win and vim.api.nvim_win_is_valid(state.win) then
-    pcall(vim.api.nvim_win_close, state.win, false)
-    state.win = nil
-  end
 end
 
 local function stop_job()
@@ -67,7 +52,7 @@ end
 
 local function reset_state()
   stop_job()
-  close_window()
+  require("utils.bottom_panel").remove("logcat", state.buf)
   if state.buf and vim.api.nvim_buf_is_valid(state.buf) then
     pcall(vim.api.nvim_buf_delete, state.buf, { force = true })
   end
@@ -75,23 +60,13 @@ local function reset_state()
   state.kind = nil
   state.source_id = nil
   state.title = nil
+  state.win = nil
 end
 
 local function ensure_window(height)
   prune_state()
-
-  if state.win and focus_window(state.win) then
-    return state.win
-  end
-
   local target_height = height or math.max(10, math.floor(vim.o.lines * 0.28))
-  vim.cmd(("botright %dnew"):format(target_height))
-  state.win = vim.api.nvim_get_current_win()
-
-  if state.buf and vim.api.nvim_buf_is_valid(state.buf) then
-    vim.api.nvim_win_set_buf(state.win, state.buf)
-  end
-
+  state.win = require("utils.bottom_panel").show("logcat", state.buf, { height = target_height })
   return state.win
 end
 
@@ -324,7 +299,7 @@ end
 local function create_buffer(spec)
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].buftype = "nofile"
-  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].bufhidden = "hide"
   vim.bo[buf].buflisted = false
   vim.bo[buf].swapfile = false
   vim.bo[buf].filetype = "log"
@@ -370,6 +345,7 @@ local function start_stream(env, spec)
   local buf = create_buffer(spec)
   vim.api.nvim_win_set_buf(win, buf)
   track_state(buf, win)
+  require("utils.bottom_panel").register("logcat", buf)
 
   state.kind = spec.kind
   state.source_id = spec.source_id

@@ -2,7 +2,7 @@ local t = require("tests.harness")
 t.bootstrap()
 local ue = require("ue")
 
--- Exercise the real picker finder/drain/watchdog with a controllable async
+-- Exercise the real picker finder/drain with a controllable async
 -- backend. The separate real-Snacks reproduction covers its trimmed-query dedup.
 local function fixture(raw, body)
   local captured, runtime, resolve_index, previous_resolve
@@ -17,7 +17,7 @@ local function fixture(raw, body)
   local new_timer, schedule_wrap = vim.loop.new_timer, vim.schedule_wrap
   local notify_freshness = runtime.notify_freshness
   local old_trace, old_grouping = vim.g.ue_grep_trace, vim.g.ue_grep_grouping_enabled
-  local h = { stopped = false, hits = {}, calls = 0, sleeps = 0 }
+  local h = { stopped = false, hits = {}, calls = 0, sleeps = 0, timers = 0, events = {} }
   local context = { engine_root = vim.fn.getcwd(), paths = { csearch_idx = "fixture.idx" }, state = {} }
   local ok, err = xpcall(function()
     debug.setupvalue(ue.cached_grep, resolve_index, function() return context end)
@@ -33,13 +33,8 @@ local function fixture(raw, body)
     }
     vim.schedule_wrap = function(callback) return callback end
     vim.loop.new_timer = function()
-      local timer = { closed = false }
-      function timer:start(_, _, callback) self.callback = callback end
-      function timer:stop() self.stopped = true end
-      function timer:close() self.closed = true end
-      function timer:is_closing() return self.closed end
-      h.timer = timer
-      return timer
+      h.timers = h.timers + 1
+      error("finder created a polling timer")
     end
     assert(ue.cached_grep({ search = "" }))
     h.picker = { opts = { regex = false, word = false, case = false, scoped = false },
@@ -51,13 +46,22 @@ local function fixture(raw, body)
     function h.run(step)
       local finder = captured.finder({}, {
         filter = { search = vim.trim(raw) }, picker = h.picker,
-        async = { sleep = function()
-          h.sleeps = h.sleeps + 1
-          assert(h.sleeps <= 5, "finder did not settle after controlled completion")
-          step(h.sleeps)
-        end },
+        async = {
+          on = function(self, event, callback)
+            h.events[event] = callback
+            return self
+          end,
+          sleep = function()
+            h.sleeps = h.sleeps + 1
+            assert(h.sleeps <= 5, "finder did not settle after controlled completion")
+            step(h.sleeps)
+          end,
+        },
       })
       finder(function(item) h.hits[#h.hits + 1] = item end)
+      t.assert_type(h.events.abort, "function")
+      t.assert_type(h.events.error, "function")
+      t.assert_eq(h.timers, 0, "finder lifecycle must use Async events without a polling timer")
     end
     body(h)
   end, debug.traceback)
@@ -85,17 +89,15 @@ t.describe("csearch picker query lifecycle", function()
     end)
   end
 
-  t.it("keeps delayed backend results when the watchdog sees only padding change", function()
+  t.it("keeps delayed backend results after only padding changes", function()
     fixture("KnownNeedle", function(h)
       h.run(function(step)
         if step == 1 then
           h.picker.input.filter.search = " KnownNeedle "
-          h.timer.callback()
         else h.complete() end
       end)
-      t.assert_false(h.stopped, "watchdog must compare the normalized query")
+      t.assert_false(h.stopped, "live input must compare the normalized query")
       t.assert_eq(#h.hits, 1)
-      t.assert_true(h.timer.closed)
     end)
   end)
 
@@ -114,12 +116,11 @@ t.describe("csearch picker query lifecycle", function()
     fixture("KnownNeedle", function(h)
       h.run(function()
         h.picker.input.filter.search = "DifferentQuery"
-        h.timer.callback()
+        h.events.abort() -- Snacks aborts the old finder when the normalized input changes.
         h.complete() -- Deliberately late delivery must not escape the aborted finder.
       end)
       t.assert_true(h.stopped)
       t.assert_eq(#h.hits, 0)
-      t.assert_true(h.timer.closed)
     end)
   end)
 end)

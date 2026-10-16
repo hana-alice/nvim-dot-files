@@ -52,6 +52,21 @@ local function harness(overrides, attach_now)
 end
 
 t.describe("frozen batch live validity guard", function()
+  t.it("registers all already-started grouped subscriptions before yielding", function()
+    local roots, registered = {}, 0
+    for index = 1, 20 do roots[index] = { path = "/fixture/root" .. index, recursive = false } end
+    local h = harness({ roots = roots, watch_backend = function()
+      return function(_, _, options)
+        registered = registered + 1
+        return { close = function() end }, { direct = true, pending = true }
+      end, function() end
+    end })
+    t.assert_eq(registered, 20, "grouped backend is already observing all roots; callbacks cannot wait for another turn")
+    t.assert_eq(h.guard:status().state, "validating")
+    t.assert_nil(h.callbacks.verify, "registration alone does not grant native readiness")
+    h.guard:stop(); h.flush()
+  end)
+
   t.it("installs minimal recursive watches before asynchronous proof and supports later client attachment", function()
     local h = harness()
     t.assert_eq(table.concat(h.order, ","), "watch,watch,verify")
@@ -156,6 +171,12 @@ t.describe("frozen batch live validity guard", function()
     t.assert_nil(event.stream); t.assert_nil(event.stable_directory_write)
     t.assert_eq(event.rename, false)
     missing.flush(); t.assert_eq(missing.callbacks.reason, "watch-error")
+
+    local grouped = harness()
+    grouped.watches[1].callback("native input watcher: overflow", nil, { unknown = true })
+    t.assert_eq(grouped.guard:status().event.root_kind, "observer-subscription")
+    t.assert_true(grouped.guard:status().event.unknown)
+    grouped.flush(); t.assert_eq(grouped.callbacks.reason, "watch-error")
 
     local root, filename = "/" .. string.rep("r", 32768), string.rep("f", 32769)
     local oversized = harness({ roots = { root } })

@@ -100,11 +100,49 @@ local function finish(code)
   end
 
   local chosen = first_path(state.chooser_file)
+  local layout = require("utils.layout")
+  local tab = state.origin_tab or (state.origin_win and vim.api.nvim_win_is_valid(state.origin_win)
+    and vim.api.nvim_win_get_tabpage(state.origin_win))
+  local session = tab and layout.sync_review(tab)
+  local owner = tab and layout.navigation_owner(tab)
+  local active_tab = vim.api.nvim_get_current_tabpage()
   cleanup_path(state.chooser_file)
   cleanup_path(state.cwd_file)
 
   close_window(state.win)
   delete_buffer(state.buf)
+
+  local function origin_unchanged()
+    return state.origin_win and vim.api.nvim_win_is_valid(state.origin_win)
+      and vim.api.nvim_win_get_tabpage(state.origin_win) == tab
+      and vim.api.nvim_win_get_buf(state.origin_win) == state.origin_buf
+      and vim.api.nvim_buf_get_changedtick(state.origin_buf) == state.origin_tick
+      and vim.deep_equal(vim.api.nvim_win_get_cursor(state.origin_win), state.origin_cursor)
+  end
+
+  if chosen and is_file(chosen) and (owner or state.navigation_owner or session or state.review_session) then
+    if not owner or (state.navigation_owner and state.navigation_owner ~= owner)
+      or (state.review_session and state.review_session ~= session)
+      or active_tab ~= tab or vim.api.nvim_get_current_tabpage() ~= tab
+      or not origin_unchanged() then
+      return vim.notify("Yazi navigation owner is no longer active", vim.log.levels.WARN)
+    end
+    local handoff = require("utils.layout_handoff")
+    local snapshot = handoff.capture(state.origin_win)
+    local target = vim.fn.bufadd(chosen)
+    local prior = layout.resolve({ tab = tab, source_win = state.origin_win, create = false, route_to_normal = true })
+    local prior_snapshot = prior and handoff.capture(prior)
+    if prior_snapshot then prior_snapshot.active, prior_snapshot.code = false, true end
+    if not handoff.load(snapshot, target, prior_snapshot) then return end
+    local win, err = layout.focus({ tab = tab, source_win = state.origin_win })
+    if not win then return vim.notify(err, vim.log.levels.WARN) end
+    local destination = { win = win, tab = vim.api.nvim_win_get_tabpage(win), buf = target, code = true }
+    if not handoff.revalidate(snapshot, { win = win, tab = destination.tab, buf = vim.api.nvim_win_get_buf(win), code = true }) then return end
+    destination.tick = vim.api.nvim_buf_get_changedtick(target)
+    local ok, _, failure = handoff.handoff(snapshot, destination, function() vim.api.nvim_win_set_buf(win, target) end)
+    if not ok then vim.notify(tostring(failure), vim.log.levels.WARN) end
+    return
+  end
 
   if state.origin_win and vim.api.nvim_win_is_valid(state.origin_win) then
     pcall(vim.api.nvim_set_current_win, state.origin_win)
@@ -153,6 +191,12 @@ function M.open_current()
     chooser_file = chooser_file,
     cwd_file = cwd_file,
     origin_win = origin_win,
+    origin_buf = vim.api.nvim_win_get_buf(origin_win),
+    origin_cursor = vim.api.nvim_win_get_cursor(origin_win),
+    origin_tick = vim.api.nvim_buf_get_changedtick(vim.api.nvim_win_get_buf(origin_win)),
+    origin_tab = vim.api.nvim_get_current_tabpage(),
+    review_session = require("utils.layout").sync_review(vim.api.nvim_get_current_tabpage()),
+    navigation_owner = require("utils.layout").navigation_owner(vim.api.nvim_get_current_tabpage()),
   }
 
   local cmd = { "yazi", "--chooser-file", chooser_file, "--cwd-file", cwd_file, entry }

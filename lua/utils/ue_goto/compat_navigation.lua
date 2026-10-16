@@ -54,13 +54,13 @@ end
 -- ---------------------------------------------------------------------------
 
 function M.gtags_fallback_async(symbol, on_done)
-  if not symbol then
-    on_done(false)
+  if not symbol or symbol == "" then
+    on_done(false, { backend = "none", reason = "unavailable", coverage = "unavailable", detail = "no symbol" })
     return
   end
   local ok, ue = pcall(require, "ue")
   if not ok then
-    on_done(false)
+    on_done(false, { backend = "none", reason = "unavailable", coverage = "unavailable", detail = "UE context unavailable" })
     return
   end
   if ue.gtags_definition_async then
@@ -71,27 +71,42 @@ function M.gtags_fallback_async(symbol, on_done)
   -- the press itself still feels responsive.
   vim.schedule(function()
     local r = ue.gtags_definition and ue.gtags_definition(symbol) or false
-    on_done(r and true or false)
+    local result = { backend = "none", coverage = "unavailable" }
+    if not r then result.reason = "unavailable" end
+    on_done(r and true or false, result)
   end)
+end
+
+function M.definition_failure_message(symbol, result)
+  result = result or {}
+  local backend, reason, coverage = result.backend or "none", result.reason or "unavailable", result.coverage or "unavailable"
+  if backend == "gtags" and reason == "empty" and coverage == "complete" then
+    return "No definition (GTAGS empty; coverage=complete): " .. (symbol or "?")
+  end
+  local reasons = {
+    empty = "no definition returned", unavailable = "query unavailable", ["command-failed"] = "query command failed",
+    ["coverage-missing"] = "index coverage missing", ["jump-failed"] = "definition found, but jump failed",
+  }
+  return string.format("Definition lookup: %s (backend=%s; reason=%s; coverage=%s): %s",
+    reasons[reason] or "query did not resolve", backend, reason, coverage, symbol or "?")
 end
 
 function M.install(deps)
   local compat = {}
   local provider = require("utils.ue_goto.provider")
   local symbol_mod = require("utils.ue_goto.symbol")
-  local location_mod = location
   local ui = require("utils.ue_goto.ui")
   local cache = require("utils.ue_goto.cache")
   local csearch_fb = require("utils.ue_goto.csearch_fallback")
   local dtrace, jump_to_location, format_jump_msg = deps.dtrace, deps.jump_to_location, deps.format_jump_msg
   local LSP_PROGRESS_NOTICE_MS, OVERALL_TIMEOUT_MS, CSEARCH_TIMEOUT_MS = 600, 30000, 4000
   local request_token = 0
-  local generation = 0
   function compat.request_token() return request_token end
   function compat.dispose()
     request_token = request_token + 1
-    generation = generation + 1
     if compat._active_notice then pcall(compat._active_notice.clear); compat._active_notice = nil end
+    local reading = package.loaded["utils.ue_goto.reading"]
+    if reading then reading.cancel() end
   end
   function compat.definition(sym, receiver, bufnr, ref_file, ref_line, ext)
     local at_def, def_kind, def_name = symbol_mod.is_at_definition_at_cursor()
@@ -167,11 +182,11 @@ function M.install(deps)
 
     if ui.NON_CLANGD_EXTS[ext] then
       dtrace("non-clangd ext=%s -> GTAGS direct", tostring(ext))
-      provider.gtags_fallback_async(sym, function(ok)
+      provider.gtags_fallback_async(sym, function(ok, result)
         if not still_current() then return end
         done()
         if not ok then
-          vim.notify("No definition (GTAGS empty): " .. (sym or "?"), vim.log.levels.INFO)
+          vim.notify(M.definition_failure_message(sym, result), vim.log.levels.INFO)
         end
       end)
       return
@@ -219,16 +234,14 @@ function M.install(deps)
           dtrace("path-B: csearch jump failed; falling through to GTAGS")
         end
 
-        provider.gtags_fallback_async(sym, function(g_jumped)
+        provider.gtags_fallback_async(sym, function(g_jumped, result)
           if not still_current() or resolved then clear_notice(); return end
           if g_jumped then
             jumped = true
-            done(string.format("✓ %s (GTAGS fallback)", sym or "?"), 3000)
+            done(string.format("✓ %s (%s fallback)", sym or "?", result and result.backend or "compatibility"), 3000)
           else
             done()
-            vim.notify(string.format(
-              "No definition (clangd/csearch/GTAGS all empty): %s", sym or "?"),
-              vim.log.levels.INFO)
+            vim.notify(M.definition_failure_message(sym, result), vim.log.levels.INFO)
           end
         end)
       end)
@@ -273,37 +286,7 @@ function M.install(deps)
     end)
   end
   function compat.references()
-    local request_generation = generation
-    local sym = symbol_mod.current_symbol()
-    if not sym then
-      vim.notify("No symbol under cursor", vim.log.levels.WARN)
-      return
-    end
-
-    local function gtags_fallback()
-      if request_generation ~= generation then return end
-      local ok, ue = pcall(require, "ue")
-      if ok and ue.gtags_references_async then
-        ue.gtags_references_async(sym, function(jumped)
-          if request_generation ~= generation then return end
-          if not jumped then
-            vim.notify("No references (LSP/GTAGS)", vim.log.levels.INFO)
-          end
-        end)
-        return
-      end
-      vim.notify("No references (LSP/GTAGS)", vim.log.levels.INFO)
-    end
-
-    local bufnr = vim.api.nvim_get_current_buf()
-    provider.async_lsp_request(bufnr, "textDocument/references", function(locations)
-      if request_generation ~= generation then return end
-      if locations and #locations > 0
-        and location_mod.populate_quickfix("LSP references: " .. sym, locations) then
-        return
-      end
-      gtags_fallback()
-    end)
+    return require("utils.ue_goto.reading").references()
   end
   return compat
 end

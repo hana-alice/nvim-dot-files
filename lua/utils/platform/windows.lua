@@ -28,7 +28,9 @@ function M.input_event_watcher(roots)
   local python = require("utils.platform").resolve_tool({ name = "python", env = { "UE_PYTHON" },
     driver_candidates = function(driver) return driver.python_candidates() end })
   if not python.ok then return nil, "Python unavailable for Windows input watcher" end
-  return require("workarounds.libuv.content_events").new_group(python.path, roots)
+  local group, reason = require("workarounds.libuv.content_events").new_group(python.path, roots)
+  if not group then return nil, reason end
+  return require("utils.platform.input_watch_barrier").attach(group, roots)
 end
 
 function M.shell_entry(kind)
@@ -542,6 +544,103 @@ end
 
 function M.powershell_entry()
   return M.shell_entry("powershell")
+end
+
+-- Optional Editor test capability. Resolve the executable from this engine's
+-- structured version, never from another checkout or a guessed target name.
+function M.ue_editor_test_plan(spec)
+  spec = spec or {}
+  if spec.operation ~= "list" and spec.operation ~= "run" then return nil, "unsupported test operation" end
+  local engine = tostring(spec.engine_root or "")
+  local project = tostring(spec.uproject or "")
+  if engine == "" or project == "" or vim.fn.filereadable(project) ~= 1 then
+    return nil, "test runner needs the selected engine and existing .uproject"
+  end
+  local file = io.open(vim.fs.joinpath(engine, "Engine/Build/Build.version"), "rb")
+  if not file then return nil, "cannot read selected Engine/Build/Build.version" end
+  local raw = file:read(8193)
+  file:close()
+  if not raw or #raw > 8192 then return nil, "engine version record is unreadable or exceeds 8 KiB" end
+  local ok, version = pcall(vim.json.decode, raw)
+  local binaries = { [4] = "UE4Editor-Cmd.exe", [5] = "UnrealEditor-Cmd.exe" }
+  local binary = ok and type(version) == "table" and binaries[version.MajorVersion]
+  if not binary then return nil, "unrecognized engine major version for Editor tests" end
+  local editor = vim.fs.joinpath(engine, "Engine/Binaries/Win64", binary)
+  if vim.fn.executable(editor) ~= 1 then return nil, "selected engine Editor command-line executable is unavailable" end
+  local filter = tostring(spec.filter or "")
+  if filter:find("[,;'\"\r\n]") or filter:find("\0", 1, true) then
+    return nil, "test filter contains a console command separator"
+  end
+  if spec.operation == "run" and filter == "" then return nil, "choose a test/filter before running" end
+  local command = spec.operation == "list" and "Automation List;Quit"
+    or ("Automation RunTests " .. filter .. ";Quit")
+  local argv = { editor, project, "-ExecCmds=" .. command,
+    "-NullRHI", "-NoShaderCompile", "-nosound", "-unattended", "-nosplash",
+    "-stdout", "-FullStdOutLogOutput" }
+  if spec.report_dir then argv[#argv + 1] = "-ReportExportPath=" .. spec.report_dir end
+  if spec.log_path then argv[#argv + 1] = "-abslog=" .. spec.log_path end
+  return { argv = argv, cwd = vim.fs.dirname(project), report_dir = spec.report_dir, log_path = spec.log_path }
+end
+
+-- No upvalues/editor APIs: luv executes this in an independent Lua state.
+local function exclusive_move_worker(from, to)
+  local invoked, ok, err = pcall(function()
+    local ffi = require("ffi")
+    if ffi.os ~= "Windows" then
+      return false, "Windows native no-replace move is unavailable on this host"
+    end
+    from, to = from:gsub("/", "\\"), to:gsub("/", "\\")
+    local function absolute(path)
+      return path:match("^%a:\\") or path:match("^\\\\[^\\]+\\[^\\]+")
+    end
+    if not absolute(from) or not absolute(to) then
+      return false, "Native no-replace move requires absolute paths"
+    end
+    ffi.cdef([[
+      int __stdcall MultiByteToWideChar(unsigned int, unsigned long,
+        const char *, int, uint16_t *, int);
+      int __stdcall MoveFileExW(const uint16_t *, const uint16_t *, unsigned long);
+      unsigned long __stdcall GetLastError(void);
+    ]])
+    local kernel = ffi.load("kernel32")
+    local function wide(path)
+      local length = kernel.MultiByteToWideChar(65001, 8, path, #path, nil, 0)
+      if length == 0 then
+        return nil, "UTF-8 path conversion failed (Win32 error " .. tonumber(kernel.GetLastError()) .. ")"
+      end
+      if length > 32766 then
+        return nil, "UTF-8 path exceeds the native Windows length limit"
+      end
+      local buffer = ffi.new("uint16_t[?]", length + 1)
+      if kernel.MultiByteToWideChar(65001, 8, path, #path, buffer, length) ~= length then
+        return nil, "UTF-8 path conversion failed (Win32 error " .. tonumber(kernel.GetLastError()) .. ")"
+      end
+      return buffer
+    end
+    local source, source_err = wide(from)
+    if not source then
+      return false, source_err
+    end
+    local target, target_err = wide(to)
+    if not target then
+      return false, target_err
+    end
+    -- Flags zero disables both replacement and cross-volume copy/delete.
+    -- MoveFileW alone permits cross-volume file moves.
+    if kernel.MoveFileExW(source, target, 0) ~= 0 then
+      return true
+    end
+    return false, "MoveFileExW failed (Win32 error " .. tonumber(kernel.GetLastError()) .. ")"
+  end)
+  if not invoked then
+    return false, "Native no-replace move unavailable: " .. tostring(ok)
+  end
+  return ok, err
+end
+
+-- Atomic destination refusal; source identity is the caller's responsibility.
+function M.rename_no_replace(from, to, callback)
+  return require("utils.platform.exclusive_move").rename(exclusive_move_worker, from, to, callback)
 end
 
 return M

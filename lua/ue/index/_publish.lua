@@ -14,11 +14,16 @@ return function(M, core)
   end
 
   local function atomic_write_json(path, value)
+    if M._publication_guard then M._publication_guard() end
     _ufs.ensure_dir(vim.fs.dirname(path))
     local tmp = path .. ".tmp." .. tostring(vim.uv.hrtime())
     if not core.deps.write_all(tmp, vim.json.encode(value)) then
       pcall(vim.fn.delete, tmp)
       return false, "temporary write failed"
+    end
+    if M._publication_guard then
+      local current, reason = pcall(M._publication_guard)
+      if not current then pcall(vim.fn.delete, tmp); return false, tostring(reason) end
     end
     local ok, err = (vim.uv or vim.loop).fs_rename(tmp, path)
     if not ok then
@@ -113,6 +118,31 @@ return function(M, core)
     return key
   end
 
+  -- SeenKeys is keyed by file, so an additional command variant for an old
+  -- file is not an additive update. Compare literal argv/cwd/output as well.
+  local function append_only(previous, proposed)
+    if not vim.islist(previous) or #previous == 0 or #proposed <= #previous then return false end
+    local path_key = require("utils.platform").driver().path_key
+    local function commands(entries)
+      local result = {}
+      for _, entry in ipairs(entries) do
+        local file = M.normalize_cdb_file(entry)
+        local command = entry_key(entry)
+        if not command or not fs.is_absolute_path(file) then return nil end
+        file = path_key(vim.fs.normalize(file))
+        if result[file] then return nil end
+        result[file] = command
+      end
+      return result
+    end
+    local before, after = commands(previous), commands(proposed)
+    if not before or not after then return false end
+    for file, command in pairs(before) do
+      if after[file] ~= command then return false end
+    end
+    return true
+  end
+
   M.publish_semantic_cdb = function(ctx, state, generation)
     local base_path = M.base_compile_commands_path(ctx)
     if not base_path or not _ufs.is_file(base_path) then
@@ -123,7 +153,8 @@ return function(M, core)
     if cached and vim.deep_equal(cached.key, key) then
       return true, { entry_count = cached.entry_count,
         controlled_entry_count = cached.controlled_entry_count,
-        shader_compatibility_count = cached.shader_compatibility_count, changed = false, original_changed = false }
+        shader_compatibility_count = cached.shader_compatibility_count, changed = false, original_changed = false,
+        ordinary = cached.ordinary }
     end
     RT.publication_cache = nil
 
@@ -245,7 +276,16 @@ return function(M, core)
 
     -- Reordering unique unchanged files only reprioritizes an existing queue.
     -- Keep its bytes/mtime; same-file variants retain order-sensitive comparison.
-    local original_changed = not same_publication(read_cdb(ctx.paths.semantic_cdb), merged)
+    local previous = read_cdb(ctx.paths.semantic_cdb)
+    local original_changed = not same_publication(previous, merged)
+    local original_append_only = original_changed and append_only(previous, merged) or false
+    local batch_info_path = fs.join(vim.fs.dirname(ctx.paths.semantic_cdb), "batches.json")
+    local ordinary = next(receipts) == nil and not _ufs.is_file(batch_info_path)
+    if M._defer_append then
+      local deferred = original_append_only and ordinary and state.index_selection
+        and state.index_selection.generation_id == generation.generation_id or false
+      return true, { deferred = deferred, original_append_only = original_append_only, ordinary = ordinary }
+    end
     local changed = original_changed
     if changed then
       local ok, err = atomic_write_json(ctx.paths.semantic_cdb, merged)
@@ -255,7 +295,6 @@ return function(M, core)
     -- batches have their own CDB and shard environment; only the asynchronous
     -- input/watch guard may select them. A partial publication cannot make an
     -- unguarded client silently consume snapshots.
-    local batch_info_path = fs.join(vim.fs.dirname(ctx.paths.semantic_cdb), "batches.json")
     local receipt_paths = vim.tbl_keys(receipts)
     table.sort(receipt_paths)
     if #receipt_paths > 0 then
@@ -296,13 +335,18 @@ return function(M, core)
     key.published[2] = file_signature(ctx.paths.semantic_cdb)
     local shader_count = vim.tbl_count(shader_compatibility)
     RT.publication_cache = { key = key, entry_count = #merged,
-      controlled_entry_count = controlled_count, shader_compatibility_count = shader_count }
+      controlled_entry_count = controlled_count, shader_compatibility_count = shader_count, ordinary = ordinary }
     return true, {
       entry_count = #merged,
       controlled_entry_count = controlled_count,
       shader_compatibility_count = shader_count,
       changed = changed,
       original_changed = original_changed,
+      ordinary = ordinary,
+      -- Frozen activation owns its independent reader/cache and cannot use the
+      -- ordinary directory reload path, even if original rows only grew.
+      original_append_only = original_append_only and #receipt_paths == 0 and not _ufs.is_file(batch_info_path),
     }
   end
+  require("ue.index._publication_async")(M, core)
 end

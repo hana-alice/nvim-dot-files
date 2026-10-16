@@ -114,6 +114,13 @@ SONAME 复用。任一环节不匹配时 SHALL fail closed，不得回落加载�
 - **THEN** `<leader>ul` SHALL 在启动前失败并要求重新执行 `<leader>uq`，不得静默
   回落启动 APK 原 SO
 
+### Requirement: 相同已部署产物跳过设备变更
+
+部署 SHALL 在停止应用前以设备端已有事实核对本地 stripped SO；root 使用目标 SO 的 SHA-256，
+app-private 使用 current generation manifest 的 SO/agent hash 与安装基线。证据相同 SHALL 返回成功，
+保留应用运行状态并跳过上传和替换；证据缺失、畸形或命令失败 SHALL 按变更进入原校验与回滚流程。
+显式强制参数 SHALL 绕过此优化，不能以主机缓存替代设备证据。
+
 ### Requirement: 安装、部署与启动必须显式分离
 
 系统 MUST NOT 在 APK 安装或 SO 替换完成后自动启动应用；应用启动 SHALL 只由用户

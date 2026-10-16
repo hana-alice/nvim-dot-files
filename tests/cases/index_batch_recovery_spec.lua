@@ -27,7 +27,7 @@ local function fixture(body)
   h.original.stop = function() error("coordinator must use its scoped restart dependency") end
   h.clients = { h.original }
   h.descriptor = { ok = true, info_sha256 = "info-a", generation_id = h.generation,
-    compiler_environment = {}, tool_path = root .. "/clangd.exe", receipts = { root .. "/receipt.json" },
+    compiler_environment = {}, compiler_lookup_environment = {}, tool_path = root .. "/clangd.exe", receipts = { root .. "/receipt.json" },
     watch_roots = { root .. "/engine", root .. "/background" }, input_roots = { root .. "/engine" },
     exclude_roots = {}, watched_files = { source, root .. "/receipt.json" },
     original_cdb = h.ctx.paths.semantic_cdb, verified_cdb = root .. "/background/verified/compile_commands.json" }

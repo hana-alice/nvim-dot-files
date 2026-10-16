@@ -223,8 +223,10 @@ destination cache 有独立 LRU，默认上限 128 项（`UE_SEMANTICD_MAX_LOOKU
 命中更新顺序、无效签名条目清除；TU 数量上限不能替代该缓存上限。
 
 sidecar 记录 cold parse、reparse、warm cursor query、TU 数量和进程 RSS。实机表明单个
-UE Android TU 可达到数 GB working set，因此默认 LRU 容量为 1（可显式配置），并在 30 秒
-无请求后 evict；不得为每次按键 spawn `clang-check/clang-query`，也不得在 UI
+UE Android TU 可达到数 GB working set，因此默认 LRU 容量为 4（可显式配置），额外缓存受
+进程 RSS 和宿主剩余内存约束，并在 5 分钟无请求后 evict。头文件进入后异步低优先级
+预热复用现有 proven-context resolver，不提交导航或 window lineage；前台请求取消排队预热。
+不得为每次按键 spawn `clang-check/clang-query`，也不得在 UI
 主循环 parse/reparse。
 
 ## 6. 非 C++ compatibility boundary
@@ -262,4 +264,5 @@ namespace alias、macro、operator、multi-context、invalid context 和 unsaved
 只读消费 active UE build artifacts，不修改引擎或项目文件。当前 Android Vulkan 4-wrapper
 实测：三个不同 canonical USR 的首次 module lookup 各约 29–31 秒；相同 USR 从另一个调用点
 或 declaration 再查为 0ms；`tu_count=1` 时 sidecar RSS 为 1797–1818 MiB。默认
-`max_tus=1` 保持内存有界，不用并发 TU 换取冷路径速度。
+`max_tus=1` 是该历史测量的配置；当前默认缓存 4 个 TU，同时执行的请求仍为一个，
+并受上述内存约束。冷启动与预热后的导航延迟必须分别实测，缓存容量不能冒充延迟保证。

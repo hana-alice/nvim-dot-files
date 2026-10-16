@@ -111,6 +111,68 @@ clangd 是长驻交互式服务，终止会丢弃已构建的 preamble。系统 
 
 ## 选型与踩坑
 
+- **原生交付验收与进度窗口（2026-10-15）**：小范围隔离实验应复制真实 per-file CDB 与完整
+  sealed unity receipt，交给生产生成器、worker、发布和 reload，不能由 runner 代写阶段 CDB。
+  显式 headless fixture 只跳过前置扫描/GTAGS/csearch/RSP/分区，并禁止额外后台 proof；普通默认
+  路径不变。真实输入 membership 会漂移，旧样本成员清单不可直接当作本轮覆盖或公平耗时基线。
+  延迟 reload 不得抹掉已经观察到的 begin；仅同 generation、前阶段已完成的同 reader 且发布时
+  没有旧 pending，才可采纳 loading 时现存的正向 begin。若 begin/end 整轮均发生在观察窗口前，
+  仍可能走 180 秒兜底，此缺口尚未关闭；空 pending/前台响应不能冒充后台完成。
+  clangd `sync` 有 idle 保证但阻塞服务线程，仅用于隔离验收，不能默认加入用户流程；
+  `compilationDatabaseChanges` 会留下内存命令覆盖，也不能为了制造进度当作无副作用探针。
+
+- **阶段屏障（2026-10-15）**：prepare 的 current/hot/full deadline 是生成调度，不是 clangd
+  完成顺序；full 可以先于 hot 发布。普通同 generation 的实际纯追加在独立 publisher 预检后，
+  等待前阶段同根普通 reader 的 `backgroundIndexProgress` begin/end，单阶段最多 180 秒；
+  释放后重新验证 lease、输入与 generation 再完整发布。命令变化、显式 `UEPrepare!`、冻结
+  receipts/批次和失效回退不因本屏障等待。CDB 生成与首阶段后台完成分别记录；超时不可冒充完成。
+  clangd 会重排待执行队列，但已有路径的去重仍有效，不能表述成「全部旧 TU 重索引」。
+  此顺序修复不改变二次合并资格，也不代表全工程索引性能已经恢复。
+
+- **踩坑与选型（2026-10-15）**：current/hot/full 的模块选择并不天然构成 TU 超集；普通发布只有在
+  同 generation、实际旧 CDB 非空且规范化文件唯一、旧 argv/cwd/output 完全不变并只新增文件时，
+  才保留既有 reader。目录 CDB 有重验时间窗，打开源的 exact overlay 和 watched-files 通知不能
+  保证加载新增数据库；延后用同根内存空文档触发目录查询，解析响应后关闭。被防抖推迟的非追加
+  重启必须继续标记旧 reader 待退役，不能被下一次追加洗白。冻结 receipts、源码刷新和命令变化
+  保留原有失效/独立缓存边界；此受限交付不代表冻结阶段无重启或全工程性能已经恢复。
+
+- **踩坑与选型（2026-10-13）**：后台队列只存内存 completed 会让 owner 退出后的已接受候选
+  无法继续收集。持久小摘要分别保存 proof、collect attempt/outcome、待收集候选和 owner PID
+  活性；摘要和旧 worker 的 ok 都不授予资格。新一轮 plan 只发现匹配当前输入/profile/group 的
+  旧结果提示，仍经原 receipt/cache-only 门禁、后台与发布 leases 重验再收集，失败候选继续证明
+  或保留原 UBT。历史退出事件缺失时不得把推测写成唯一根因。
+- **选型（2026-10-13）**：显式切分支刷新由子模块注册，首次无有效 CDB/shard baseline、未覆盖
+  的新增/删除/改名委派既有 prepare；只有实际成功 prepare 完成信号能建立 baseline，正常 reader
+  attachment 与私有加速结果分别报告。TEMP 盘点仅 dry-run，传递引用证据与未知活性保守保留，
+  不实现删除；这些交付不等于真实全工程压缩和索引性能已经恢复。
+
+- **选型（2026-10-12）**：源码刷新前的私有 reindex helper 共享原 semantic CDB 的 shard
+  目录，使用 junction 而非复制/播种；复用已有 index build lease 和 active CDB writer lease，
+  排除普通/batch 发布与 prepare 的 header shard migration 并发。phase 完成回调返回后才取锁，
+  避免拒绝自己尚未释放的 lease；helper 退出后释放，异常仍走原重启确认路径。冻结 seed
+  只读原缓存、只增独立 verified 缓存，clangd 原子 shard 写入可并存；不改用户进程生命周期。
+  独立 Python CLI 只有工作目录锁，发布 lease 由 Lua 调用方持有。提交内存不足导致的 Job
+  终止是失败回退，不能当作成功重索引耗时或全工程性能恢复证据。
+
+- **选型（2026-10-09）**：冷大型 CDB generation 摘要与普通 phase 的 manifest/语义发布使用独立
+  nvim worker；摘要按 size/mtime/ctime/dev/ino 绑定当前输入，计算期间替换必须丢弃并重算。
+  未就绪与 worker 失败分别处理，旧 selection 只保留为历史，不冒充当前已验证 generation；
+  成功后恢复延迟 reader，发布保持原 writer lease、来源校验和未变更不写入语义。
+  子进程异步计算不等于整个启动/prepare 无卡顿；主循环最大间隔与 GUI 响应仍需分别实测。
+
+- **踩坑（2026-10-08）**：正常 prepare 的 current/hot/full 曾统一只复用 proof；新项目桶没有
+  receipts 或 accepted hints 时，所有候选都 deferred=`verification-not-cached`，不会自行生产证明。
+  历史上其他项目桶的成功 proof 不能证明当前 build，也不能靠复制或改写其身份来命中。
+- **阶段选型（2026-10-08）**：无外部 proof selector 的 full 在已有异步 worker、writer lease
+  和宿主准入下有界生产独立原 TU 图证明，优先小组；每轮新接受一个合格批次后停止该轮证明。
+  重复 prepare 完整重验并复用已有批次，缓存命中不消耗本轮新接受批次名额，下一组仍可在
+  预算内证明；新增产物按计划发布，纯缓存轮保持 no-op。失效或预算未覆盖的组保留原 UBT。current/hot 与显式
+  外部 store 仍仅复用；完整 argv、宏/PCH、图比较、来源及真实过期拒绝门禁保持不变。
+  这是生产/命中路径的阶段修复，不能用条目数下降宣称全工程性能恢复。
+- **踩坑（2026-10-08）**：冻结激活安装监听后，query profile 验证若在 proof store 内创建临时
+  目录，会改变受保护的 receipt/asset 祖先目录并触发自撤权。查询 scratch 必须外置且自动收尾；
+  不得提前应用 exclude、忽略目录事件或削弱真实修改与祖先 rename/delete 的保护来规避该故障。
+
 - **踩坑**：`openspec/changes/archive/2026-09-28-restructure-super-unity-compression/` 的
   调查发现，「Secondary batches」二次合并的**实际交付量为零**——活跃索引缓存 33,014 个
   shard 中 995 个 `SuperUnity.UBT`、仅 **1 个** `SuperUnity.Batch`。根因不是合并质量差，而是

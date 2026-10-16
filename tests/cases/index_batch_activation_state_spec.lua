@@ -16,7 +16,7 @@ local function fixture(body)
   h.ctx = { paths = { semantic_cdb = h.original, clangd_dir = root } }
   h.descriptor = { ok = true, original_cdb = h.original,
     verified_cdb = root .. "/background/verified/compile_commands.json",
-    info_sha256 = "publication-a", generation_id = "generation-a", compiler_environment = {},
+    info_sha256 = "publication-a", generation_id = "generation-a", compiler_environment = {}, compiler_lookup_environment = {},
     tool_path = root .. "/clangd.exe", receipts = { root .. "/receipt.json" },
     watch_roots = { root .. "/input" }, input_roots = { root .. "/input" },
     watched_files = { root .. "/input/file.h" }, exclude_roots = {} }
@@ -76,7 +76,8 @@ t.describe("activation observation and cancellation", function()
       t.assert_false(state.ready); t.assert_false(state.failed)
       t.assert_type(state.attempt, "number"); t.assert_type(state.scope, "string")
       local allowed = { scope = true, attempt = true, stamp = true, generation = true, phase = true,
-        reason = true, failed = true, ready = true, pending_helpers = true, retry_after = true, verified = true }
+        reason = true, failed = true, ready = true, pending_helpers = true, retry_after = true, verified = true,
+        published_batch_count = true, client_batch_tu_count = true, batch_client_count = true }
       for field, value in pairs(state) do
         t.assert_true(allowed[field], "unexpected exported field " .. field)
         t.assert_true(type(value) == "string" or type(value) == "number" or type(value) == "boolean")

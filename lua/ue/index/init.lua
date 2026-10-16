@@ -58,9 +58,11 @@ require("ue.index._delivery")(M, core)
 require("ue.index._clangd")(M, core)
 require("ue.index._source")(M, core)
 require("ue.index._build")(M, core)
+require("ue.index._batch_background")(M, core)
 -- After _build: admission policy gates build_phase_async starts.
 require("ue.index._admission")(M, core)
 -- After _build: scheduling drives build_phase_async / base_compile_commands_path.
 require("ue.index._schedule")(M, core)
+require("ue.index._phase_barrier")(M, core)
 
 return M

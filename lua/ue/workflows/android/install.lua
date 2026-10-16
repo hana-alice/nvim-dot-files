@@ -112,8 +112,8 @@ local function failure_hint(summary, serial)
   if summary:find("INSTALL_PARSE_FAILED") then
     return "→ APK corrupt or unsigned; rebuild + re-sign"
   end
-  if summary:find("device offline") or summary:find("no devices/emulators") then
-    return "→ adb device gone; check: adb devices"
+  if summary:find("device offline") or summary:find("no devices/emulators") or summary:find("not found") then
+    return "→ adb device gone; <leader>uk picks another device"
   end
   return nil
 end
@@ -320,6 +320,10 @@ function M.run(request)
         local stdout_blob = table.concat(stdout_lines, "\n")
         local summary = pick_summary(stderr_lines, stdout_lines)
         local hint = failure_hint(summary, snapshot.device.serial)
+        -- Injected device stubs in tests may carry only the parts they exercise.
+        if d.android_device.report_if_gone then
+          d.android_device.report_if_gone(stderr_blob .. "\n" .. stdout_blob, snapshot.device.serial)
+        end
 
         handle.message = ("✗ exit %d — %s%s"):format(code, summary, hint and ("  " .. hint) or "")
         notify_history(d.notification_history, {

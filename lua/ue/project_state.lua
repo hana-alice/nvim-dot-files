@@ -10,6 +10,11 @@ local lock = require("ue.file_lock")
 
 local M = {}
 
+local function selection_changed()
+  local hub = package.loaded["utils.ue_hub"]
+  if hub and hub.selection_changed then hub.selection_changed() end
+end
+
 local sessions = {}
 local session_values = {}
 -- One-shot, process-local handoff from an explicit :UESetPlatform to the next
@@ -65,8 +70,11 @@ local function atomic_write(path, value)
   local suffix = table.concat({ vim.fn.getpid(), vim.uv.hrtime(), math.random(1, 2147483646) }, ".")
   local temp = path .. ".tmp." .. suffix
   local file, err = io.open(temp, "wb")
-  if not file then return false, err or ("cannot open " .. temp) end
-  file:write(vim.json.encode(value))
+  if not file then
+    return false, err or ("cannot open " .. temp)
+  end
+  local encoded = vim.json.encode(value)
+  file:write(encoded)
   file:flush()
   file:close()
   local ok, rename_err = vim.uv.fs_rename(temp, path)
@@ -74,7 +82,7 @@ local function atomic_write(path, value)
     pcall(os.remove, temp)
     return false, rename_err or ("cannot replace " .. path)
   end
-  return true
+  return true, nil, { path = path, revision = vim.fn.sha256(encoded) }
 end
 
 local function locked_update(path, transform)
@@ -141,6 +149,7 @@ function M.select(engine_root, project_root, uproject, opts)
       session_values[key][field] = persisted[field]
     end
   end
+  selection_changed()
   return vim.deepcopy(selection)
 end
 
@@ -195,6 +204,36 @@ end
 local function field_path(engine_root, selection, key)
   if not tostring(key):match("^[%w_%-]+$") then return nil end
   return fs.join(fields_dir(engine_root, selection), tostring(key) .. ".json")
+end
+
+-- Ordinary writes and guarded recovery share this nonblocking per-key lease.
+-- The receipt identifies exact committed bytes; a unique token also rejects
+-- same-value rewrites by a newer owner. It is not a collection-wide lock.
+local function write_field(path, value, expected)
+  local lease, err = lock.acquire(path .. ".lock")
+  if not lease then
+    return false, "state is being updated by another Neovim: " .. tostring(err)
+  end
+  local called, ok, write_err, receipt = pcall(function()
+    if expected then
+      local current, raw = read_json(path)
+      if not current or not raw or vim.fn.sha256(raw) ~= expected.revision then
+        return false, "field ownership changed; newer input preserved"
+      end
+    end
+    return atomic_write(path, {
+      present = value ~= nil,
+      value = value,
+      updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+      writer_pid = vim.fn.getpid(),
+      writer_token = table.concat({ vim.fn.getpid(), vim.uv.hrtime(), math.random(1, 2147483646) }, "."),
+    })
+  end)
+  lock.release(lease)
+  if not called then
+    return false, ok
+  end
+  return ok, write_err, receipt
 end
 
 local function target_path(engine_root, selection)
@@ -316,6 +355,8 @@ function M.revision(engine_root, captured)
 end
 
 -- A captured project is a persistence address, never a request to select it.
+-- Ordinary fields additionally return a receipt for guarded recovery; the
+-- existing (ok, error) return contract is unchanged.
 function M.update(engine_root, key, value, captured)
   local selection
   if captured then
@@ -334,17 +375,36 @@ function M.update(engine_root, key, value, captured)
   end
   local path = field_path(engine_root, selection, key)
   if not path then return false, "invalid project state field: " .. tostring(key) end
-  -- One file per field turns concurrent distinct-key updates into independent
-  -- atomic replaces, eliminating JSON read/modify/write loss without a global
-  -- critical section. Same-key writes intentionally remain last-writer-wins.
-  local ok, err = atomic_write(path, {
-    present = value ~= nil,
-    value = value,
-    updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-    writer_pid = vim.fn.getpid(),
-  })
-  if not ok then return false, err end
-  return true
+  -- Distinct fields remain independent. Same-key contention fails immediately
+  -- rather than waiting on the UI or bypassing guarded recovery's lease.
+  return write_field(path, value)
+end
+
+--- Replace a field only while its exact committed receipt still owns it.
+--- Cooperating writers must use update/commit; missing or foreign receipts
+--- fail closed. Captured buckets never redirect the live project/target.
+function M.compare_update(engine_root, key, expected, value, captured)
+  local selection = captured and normalize_selection(engine_root, captured.project_root, captured.uproject)
+    or (not captured and M.current(engine_root))
+  if not selection then
+    return false, "no project selected in this Neovim session"
+  end
+  if SESSION_LOCAL_FIELDS[key] or key == "target-selection" then
+    return false, "guarded fields cannot change live target selection"
+  end
+  local path = field_path(engine_root, selection, key)
+  if not path then
+    return false, "invalid project state field: " .. tostring(key)
+  end
+  if
+    type(expected) ~= "table"
+    or expected.path ~= path
+    or type(expected.revision) ~= "string"
+    or expected.revision == ""
+  then
+    return false, "missing or foreign field ownership receipt"
+  end
+  return write_field(path, value, expected)
 end
 
 --- Write one state field and PROVE the value reads back from the same bucket
@@ -367,12 +427,14 @@ function M.commit(engine_root, key, value)
     if type(seen) ~= "table" then
       return false, ("read-back missing for %s"):format(tostring(key))
     end
+    selection_changed()
     return true
   end
   if seen ~= value then
     return false, ("read-back mismatch for %s (wrote %s, reads %s)")
       :format(tostring(key), tostring(value), tostring(seen))
   end
+  selection_changed()
   return true
 end
 
@@ -400,6 +462,7 @@ function M.update_target(engine_root, platform, configuration)
   session_values[session_key] = session_values[session_key] or {}
   session_values[session_key].target_platform = platform
   session_values[session_key].target_configuration = configuration
+  selection_changed()
   return true
 end
 

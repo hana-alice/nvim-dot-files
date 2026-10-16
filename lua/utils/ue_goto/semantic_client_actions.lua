@@ -22,9 +22,10 @@ function M.install(client, deps)
     end
   end
 
-  function client.begin_action(bufnr)
+  function client.begin_action(bufnr, scope)
     if not bufnr or bufnr == 0 then bufnr = vim.api.nvim_get_current_buf() end
     client.cancel_action()
+    if type(client.set_priority) == "function" then client.set_priority("normal") end
     state.next_action_token = state.next_action_token + 1
     state.active_action_token = state.next_action_token
     local snapshot = {
@@ -34,31 +35,39 @@ function M.install(client, deps)
       cursor = vim.api.nvim_win_get_cursor(0),
       changedtick = vim.api.nvim_buf_get_changedtick(bufnr),
       document_version = vim.api.nvim_buf_get_changedtick(bufnr),
+      focus_is_current = scope and scope.is_current,
     }
     local function invalidate()
-      if state.active_action_token == snapshot.token then client.cancel_action() end
+      if state.active_action_token ~= snapshot.token then return end
+      -- An owned picker can emit CursorMoved while returning focus even when
+      -- its source snapshot is unchanged. Keep listening after that event.
+      if snapshot.focus_is_current and client.snapshot_is_current(snapshot) then return end
+      client.cancel_action()
     end
-    local ok_buffer, buffer_id = pcall(vim.api.nvim_create_autocmd, {
-      "CursorMoved", "CursorMovedI", "BufLeave", "TextChanged", "TextChangedI",
-    }, {
+    local events = { "CursorMoved", "CursorMovedI", "TextChanged", "TextChangedI" }
+    if not snapshot.focus_is_current then events[#events + 1] = "BufLeave" end
+    local ok_buffer, buffer_id = pcall(vim.api.nvim_create_autocmd, events, {
       buffer = bufnr,
-      once = true,
+      once = not snapshot.focus_is_current,
       callback = invalidate,
       desc = "Invalidate stale C++ semantic definition action",
     })
     if ok_buffer then state.action_autocmds[#state.action_autocmds + 1] = buffer_id end
-    local ok_window, window_id = pcall(vim.api.nvim_create_autocmd, "WinLeave", {
+    if not snapshot.focus_is_current then
+      local ok_window, window_id = pcall(vim.api.nvim_create_autocmd, "WinLeave", {
       once = true,
       callback = function()
         if vim.api.nvim_get_current_win() == snapshot.winid then invalidate() end
       end,
       desc = "Invalidate C++ semantic action when its window is left",
     })
-    if ok_window then state.action_autocmds[#state.action_autocmds + 1] = window_id end
+      if ok_window then state.action_autocmds[#state.action_autocmds + 1] = window_id end
+    end
     return snapshot
   end
 
   function client.cancel_action()
+    if type(client.cancel_prewarm) == "function" then client.cancel_prewarm("foreground-action") end
     for _, id in ipairs(state.action_autocmds) do pcall(vim.api.nvim_del_autocmd, id) end
     state.action_autocmds = {}
     state.next_action_token = state.next_action_token + 1
@@ -84,15 +93,23 @@ function M.install(client, deps)
   end
 
   function client.snapshot_is_current(snapshot, response)
-    if not snapshot or snapshot.token ~= state.active_action_token then return false, "superseded" end
+    if not snapshot then return false, "superseded" end
+    if snapshot.prewarm then
+      if type(snapshot.background_is_current) ~= "function" or not snapshot.background_is_current() then
+        return false, "prewarm-cancelled"
+      end
+    elseif snapshot.token ~= state.active_action_token then return false, "superseded" end
     if not vim.api.nvim_win_is_valid(snapshot.winid) then return false, "window-invalid" end
-    if vim.api.nvim_get_current_win() ~= snapshot.winid then return false, "window-changed" end
+    if snapshot.focus_is_current then
+      local ok, current = pcall(snapshot.focus_is_current)
+      if not ok or not current then return false, "reading-owner-changed" end
+    elseif vim.api.nvim_get_current_win() ~= snapshot.winid then return false, "window-changed" end
     if vim.api.nvim_win_get_buf(snapshot.winid) ~= snapshot.bufnr then return false, "buffer-changed" end
     if vim.api.nvim_buf_get_changedtick(snapshot.bufnr) ~= snapshot.changedtick then
       return false, "document-changed"
     end
     local cursor = vim.api.nvim_win_get_cursor(snapshot.winid)
-    if cursor[1] ~= snapshot.cursor[1] or cursor[2] ~= snapshot.cursor[2] then
+    if not snapshot.prewarm and (cursor[1] ~= snapshot.cursor[1] or cursor[2] ~= snapshot.cursor[2]) then
       return false, "cursor-changed"
     end
     if response and response.document_version ~= nil
@@ -309,6 +326,7 @@ function M.install(client, deps)
       return true
     end
 
+    local source_candidate_failure
     local function finish(response, context)
       local current, reason = snapshot_current(response)
       if not current then
@@ -323,6 +341,9 @@ function M.install(client, deps)
         lineage.subject_membership = semantic_context.context_subject_membership(context)
         if #lineage.subject_membership == 0 then lineage.subject_membership = { spec.path } end
         response = vim.tbl_extend("force", response, { origin_context = lineage })
+      end
+      if response and source_candidate_failure then
+        response = vim.tbl_extend("force", response, { source_candidate_failure = source_candidate_failure })
       end
       callback(response)
     end
@@ -368,7 +389,7 @@ function M.install(client, deps)
       query(spec, context, function(response)
         if not snapshot_current(response) then finish(response); return end
         if response and response.reason == "invalid-query-file-not-in-tu" and allow_recatalog then
-          state.window_contexts[snapshot.winid] = nil
+          if not snapshot.prewarm then state.window_contexts[snapshot.winid] = nil end
           catalog_contexts()
           return
         end
@@ -376,8 +397,73 @@ function M.install(client, deps)
       end)
     end
 
-    local inherited = client.window_origin(snapshot.winid, environment.build_fingerprint, spec.path)
+    -- Subject validation intentionally revokes non-members. Keep a copy of a
+    -- validated source command solely as a candidate for fresh compiler proof.
+    local candidate, inherited
+    if snapshot.prewarm then
+      local stored = state.window_contexts[snapshot.winid]
+      candidate = stored and stored.build_fingerprint == environment.build_fingerprint and vim.deepcopy(stored) or nil
+      inherited = candidate and semantic_context.context_supports_subject(candidate, spec.path) and candidate or nil
+    else
+      candidate = client.window_origin(snapshot.winid, environment.build_fingerprint)
+      inherited = client.window_origin(snapshot.winid, environment.build_fingerprint, spec.path)
+    end
     if inherited and inherited.origin_tu then dispatch(inherited, true); return end
+    local function source_fingerprint(context)
+      local compile = type(context) == "table" and context.compile
+      local origin = type(context) == "table" and context.origin_tu
+      local sources = { c = true, cc = true, cpp = true, cxx = true, m = true, mm = true }
+      if type(origin) ~= "string" or not sources[origin:lower():match("%.([^./\\]+)$") or ""]
+          or type(compile) ~= "table" or type(compile.file) ~= "string"
+          or semantic_context.match_key(compile.file) ~= semantic_context.match_key(origin)
+          or type(compile.directory) ~= "string" or compile.directory == ""
+          or type(compile.argv) ~= "table" or #compile.argv == 0 then return nil end
+      for _, argument in ipairs(compile.argv) do
+        if type(argument) ~= "string" or argument == "" then return nil end
+      end
+      return semantic_context.compile_descriptor_fingerprint(compile.directory, compile.file, compile.argv)
+    end
+    local candidate_fingerprint = candidate and candidate.source_exact_candidate == true
+      and source_fingerprint(candidate)
+    if candidate_fingerprint then
+      client.request("prove", {
+        source = candidate.origin_tu, context_id = candidate_fingerprint,
+        cdb_dir = environment.cdb_dir, cdb_path = environment.cdb_path,
+        active_cdb_path = environment.active_cdb_path, active_manifest_path = environment.active_manifest_path,
+      }, function(proof, proof_reason)
+        if not snapshot_current(proof) then finish(proof); return end
+        if not proof or proof.state ~= "resolved" then
+          finish(proof or unavailable(proof_reason or "source-exact-proof-unavailable", "prove"))
+          return
+        end
+        if type(proof.context_id) ~= "string" or proof.context_id == ""
+            or source_fingerprint(proof) ~= candidate_fingerprint then
+          finish(unavailable("source-exact-compile-descriptor-mismatch", "prove"))
+          return
+        end
+        local context = {
+          id = proof.context_id, context_id = proof.context_id, origin_tu = proof.origin_tu,
+          cdb_dir = environment.cdb_dir, compile = proof.compile,
+          compile_command_fingerprint = candidate_fingerprint,
+          subject_membership = semantic_context.context_subject_membership(candidate),
+          evidence_kind = "source-exact-compiler-inclusion",
+          source_exact_candidate = true,
+        }
+        query(spec, context, function(response, query_reason)
+          if not snapshot_current(response) then finish(response); return end
+          if response and response.reason == "invalid-query-file-not-in-tu" then
+            source_candidate_failure = { stage = "query", reason = response.reason, origin_tu = context.origin_tu }
+            catalog_contexts()
+            return
+          end
+          if response and response.state == "resolved" then
+            context.subject_membership[#context.subject_membership + 1] = spec.path
+          end
+          finish(response or unavailable(query_reason or "source-exact-header-query-unavailable", "query"), context)
+        end)
+      end, environment, snapshot)
+      return
+    end
     if #environment.evidence_roots == 0 then
       finish(unavailable("no active build dependency roots", "catalog"))
       return

@@ -14,58 +14,55 @@
 -- clangd's compile-database lookup keys on filesystem paths. A buffer
 -- backed by `fugitive:///D:/foo//<sha>/bar.cpp` has no on-disk path,
 -- so clangd cannot honour any LSP request scoped to that URI and
--- replies with -32602 InvalidParams. The autocmd `LspAttach` is the
--- right hook: clangd has just attached, but **no requests have flown
--- yet**, so a single buf_detach_client call removes it cleanly with
--- zero error spam.
+-- replies with -32602 InvalidParams. The autocmd `LspAttach` is already
+-- too late to prevent didOpen. In Neovim 0.11.5, synchronously detaching
+-- inside LspAttach also lets Client:on_attach restore attached_buffers after
+-- changetracking was reset, so a later buffer deletion resets missing state.
 --
--- We check by URI scheme rather than buffer name because:
---   * scheme is always lowercased and stable (`fugitive`, `diffview`,
+-- We check the buffer name's URI scheme rather than its filetype because:
+--   * schemes are compared case-insensitively (`fugitive`, `diffview`,
 --     `gitsigns`, `oil`, `octo`, `neogit`, ...)
 --   * future plugins that introduce new schemes will be caught
 --     without a code change here, since we WHITELIST file:// rather
 --     than blacklist known offenders
---   * empty-name scratch buffers also get caught (uri = "buffer://N")
+--   * empty-name scratch buffers also get caught
 --     and they have no business holding a clangd session anyway
 --
--- We deliberately do NOT prevent clangd from attaching in the first
--- place via the lspconfig `root_dir` callback: that path doesn't see
--- the URI scheme reliably, and turning attach off plugin-wide would
--- regress the normal `file://` flow if a synthetic URI buffer is open
--- when nvim starts. Detaching post-attach is one extra LSP frame but
--- has no observable cost.
+-- Guard the public attach entry and each clangd's deferred on_attach before
+-- didOpen. A scheduled event fallback handles callers holding the old entry;
+-- it must run after Client:on_attach has finished setting its attached flag.
 
 local M = {}
 
 local applied = false
 local AUGROUP_NAME = "workaround_clangd_non_file_uri_detach"
 local detached_count = 0
+local blocked_count = 0
+local original_attach, guarded_attach
+local guarded_clients = setmetatable({}, { __mode = "k" })
+local uri = require("utils.buffer_uri")
 
 -- Returns true if this buffer's URI is anything other than file://.
--- Empty-name buffers also count as non-file (they get "buffer://N").
+-- Empty-name scratch buffers also count as non-file.
 local function is_non_file_uri(buf)
-  local name = vim.api.nvim_buf_get_name(buf)
-  if name == "" then return true end
-  -- Cheap prefix check first; vim.uri_from_fname handles edge cases
-  -- but is more expensive. The "://" sentinel matches every URI scheme.
-  -- Real on-disk paths never contain "://" before a path separator.
-  --
-  -- IMPORTANT: on Windows, plain paths look like `D:/foo/bar.cpp` and a
-  -- naive `^(%w[%w+.-]*):/` match would treat the drive letter `D` as a
-  -- URI scheme and detach clangd from EVERY real file. Real URI schemes
-  -- are always >=2 chars (file/http/oil/fugitive/gitsigns/diffview/...),
-  -- and Windows drive letters are exactly 1 char, so requiring length>=2
-  -- cleanly disambiguates. We additionally require `://` (two slashes)
-  -- because that's the actual URI grammar, while `D:/` only has one.
-  local scheme = name:match("^(%a[%w+.-]+)://")
-  if not scheme then
-    -- Plain path (incl. Windows `D:/...`) — treat as file://
-    return false
+  return not uri.is_file_buffer(buf)
+end
+
+local function guard_client(client)
+  if guarded_clients[client] or type(client.on_attach) ~= "function" then return end
+  local original, previous = client.on_attach, rawget(client, "on_attach")
+  local guarded = function(self, buf)
+    if not applied then return original(self, buf) end
+    if not vim.api.nvim_buf_is_valid(buf) or is_non_file_uri(buf) then
+      -- Deferred initialization has not entered changetracking/didOpen.
+      self.attached_buffers[buf] = nil
+      blocked_count = blocked_count + 1
+      return
+    end
+    return original(self, buf)
   end
-  if scheme == "file" then
-    return false
-  end
-  return true, scheme
+  guarded_clients[client] = { previous = previous, guarded = guarded }
+  client.on_attach = guarded
 end
 
 local function on_attach(args)
@@ -76,36 +73,35 @@ local function on_attach(args)
   local client = vim.lsp.get_client_by_id(client_id)
   if not client or client.name ~= "clangd" then return end
 
-  local non_file, scheme = is_non_file_uri(buf)
-  if not non_file then return end
-
-  -- Detach. Use the modern API when available (vim.lsp.buf_detach_client
-  -- was deprecated for 0.10+ in favor of client:detach), but fall back
-  -- so this works across the version range we support.
-  local ok
-  if type(client.detach) == "function" then
-    ok = pcall(function() client:detach(buf) end)
-  end
-  if not ok then
-    pcall(vim.lsp.buf_detach_client, buf, client_id)
-  end
-
-  detached_count = detached_count + 1
-  -- Single quiet log line per detach, scoped so it doesn't notify.
-  -- Use the project's scoped logger if available; fall back to the
-  -- default vim.lsp.log to be safe in early-load scenarios.
-  local ok_log, log = pcall(require, "utils.log")
-  if ok_log and log.scoped then
-    local L = log.scoped("workarounds.clangd")
-    L.debug(string.format(
-      "detached clangd from buf %d (scheme=%s, name=%s)",
-      buf, scheme or "?", vim.api.nvim_buf_get_name(buf)))
-  end
+  if not is_non_file_uri(buf) then return end
+  vim.schedule(function()
+    if not applied or not vim.api.nvim_buf_is_valid(buf) or not is_non_file_uri(buf)
+      or vim.lsp.get_client_by_id(client_id) ~= client
+      or not vim.lsp.buf_is_attached(buf, client_id) then return end
+    if pcall(vim.lsp.buf_detach_client, buf, client_id) then detached_count = detached_count + 1 end
+  end)
 end
 
 function M.apply()
   if applied then return end
   applied = true
+
+  local attach = vim.lsp.buf_attach_client
+  original_attach = attach
+  guarded_attach = function(buf, id)
+    if not applied then return attach(buf, id) end
+    local resolved = buf == 0 and vim.api.nvim_get_current_buf() or buf
+    local client = vim.lsp.get_client_by_id(id)
+    if client and client.name == "clangd" then
+      if vim.api.nvim_buf_is_valid(resolved) and is_non_file_uri(resolved) then
+        blocked_count = blocked_count + 1
+        return false
+      end
+      guard_client(client)
+    end
+    return attach(buf, id)
+  end
+  vim.lsp.buf_attach_client = guarded_attach
 
   local group = vim.api.nvim_create_augroup(AUGROUP_NAME, { clear = true })
   vim.api.nvim_create_autocmd("LspAttach", {
@@ -118,10 +114,15 @@ end
 function M.disable()
   applied = false
   pcall(vim.api.nvim_del_augroup_by_name, AUGROUP_NAME)
+  if vim.lsp.buf_attach_client == guarded_attach then vim.lsp.buf_attach_client = original_attach end
+  for client, saved in pairs(guarded_clients) do
+    if client.on_attach == saved.guarded then client.on_attach = saved.previous end
+  end
+  guarded_clients = setmetatable({}, { __mode = "k" })
 end
 
 function M.status()
-  return { applied = applied, detached_count = detached_count }
+  return { applied = applied, detached_count = detached_count, blocked_count = blocked_count }
 end
 
 return M

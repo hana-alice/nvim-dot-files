@@ -12,6 +12,12 @@
 
 ## 按领域导航（权威在 CONSTRAINTS §二）
 
+### 文档位置输入与剪贴板验收
+
+同包输入和关闭期间新选择需要真实 UI 验证；位置输入完成模式交接后关闭，复制保护命名寄存器。
+剪贴板 provider 在启动前隔离，不能以启动后替换配置证明没有触及系统剪贴板。
+→ `../docs/CONSTRAINTS.md §二 文件操作与大纲`；`../lua/utils/document_location.lua`。
+
 ### C++ diagnostic compatibility (K74)
 
 DefaultError 不能直接归因于全局 `-Werror`。用真实 TU 和完整索引记录验证有界兼容策略，

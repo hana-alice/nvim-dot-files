@@ -268,6 +268,7 @@ tests/                    headless 回归套件
 
 | 主题 | 位置 |
 | --- | --- |
+| **使用手册（日常流程、按键、排障）** | [`USER_GUIDE.md`](USER_GUIDE.md) |
 | 架构总览 | [`architecture/overview.md`](architecture/overview.md) |
 | 相对 LazyVim 的增量 | [`architecture-vs-lazyvim.md`](architecture-vs-lazyvim.md) |
 | 符号解析内部 | [`architecture-symbol-resolution.md`](architecture-symbol-resolution.md) |

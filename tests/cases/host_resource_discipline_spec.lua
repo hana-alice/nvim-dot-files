@@ -20,6 +20,15 @@ end
 -- explicit resource classification and rationale here. Broad file/API
 -- exemptions are deliberately impossible.
 local SPAWN_AUDIT = {
+  { p="lua/ue/index/switch_commands.lua", api="vim.system", a="local ok, handle = pcall(deps.system or vim.system", class="foreground", reason="single explicit read-only TEMP stat/reference inventory; bounded timeout, no deletion, owned task and once-only token release", guard="foreground_begin" },
+  { p="lua/utils/search_process.lua", api="spawn", a="local handle, spawn_err = uv.spawn", class="foreground", reason="single explicit grep query with bounded reader, owned abort and stderr status", guard="foreground_begin" },
+  { p="lua/utils/document_find_process.lua", api="vim.system", a="local system = vim.system", class="foreground", reason="single document snapshot query with bounded stdin, streamed output, owned cancellation and explicit partial status", guard="foreground_begin" },
+  { p="lua/utils/file_inventory.lua", api="vim.system", a="pcall(vim.system, plan.command", class="foreground", reason="explicit single-thread fd inventory with owned cancellation and bounded cache; no background polling", guard="foreground_begin" },
+  { p="lua/utils/file_inventory.lua", api="vim.system", a="pcall(vim.system, command", class="short", reason="explicit prepare scan continuation; serialized read-only tracked/ignore Git queries, 15s timeout, bounded path bytes, owned task and cancellation", guard="task_registry" },
+  { p="lua/utils/file_mutations_trash.lua", api="vim.system", a="local ok, handle = pcall(vim.system, argv", class="foreground", reason="one explicit trash child for an already quarantined object; bounded timeout, handle-derived task state and once-only foreground release", guard="foreground_begin" },
+  { p="lua/ue/editor_tests.lua", api="vim.system", a="pcall(opts.system or vim.system", class="foreground", reason="one explicit Editor automation worker; frozen project, bounded list/run timeout and owned cancellation", guard="foreground_begin" },
+  { p="lua/ue/csearch_git.lua", api="vim.system", a="pcall(vim.system, command", class="short", reason="serialized read-only Git evidence for explicit csearch writer; 15s timeout and cancellable task" },
+  { p="lua/ue/csearch_verify.lua", api="vim.system", a="local ok, handle = pcall(vim.system, command", class="short", reason="explicit admitted csearch writer continuation; read-only queries serialized to one child, at most 20 files / 40 tokens, each with 5s timeout and owned task", guard="task_registry" },
   { p="lua/workarounds/codediff/threaded_git.lua", api="spawn", a="process, pid = uv.spawn", class="interactive", reason="two-worker bound; foreground Git spawn occurs inside libuv worker with owned cancellation and timeout", guard="task_registry" },
   { p="lua/workarounds/codediff/threaded_git.lua", api="fn-system", a="local result = vim.fn.systemlist", class="sync-debug", reason="upstream explicit synchronous runner compatibility; UI async callers use worker transport" },
   { p="lua/config/lazy.lua", api="fn-system", a="vim.fn.system({ \"git\", \"clone\"", class="bootstrap", reason="one-time lazy.nvim bootstrap before UI exists" },
@@ -29,6 +38,9 @@ local SPAWN_AUDIT = {
   { p="lua/ue/cdb/pipeline.lua", api="jobstart", a="_rt.jobstart(step.command", class="deferrable", reason="admitted CDB chain", guard="host_admission" },
   { p="lua/ue/cdb/pipeline.lua", api="fn-system", a="vim.fn.system(cmd)", class="subprocess-only", reason="slim runs inside admitted ccjson or explicit sync path" },
   { p="lua/ue/cdb/transaction.lua", api="vim.system", a="local ok_spawn, handle = pcall(vim.system", class="deferrable", reason="admitted sequential prepare staging/commit child; large copies and hashing stay outside UI", guard="host_admission" },
+  { p="lua/ue/cdb/prepare_cache.lua", api="vim.system", a="local spawned, handle = pcall(vim.system", class="deferrable", reason="one admitted input/product inventory child on miss or seal, or bounded readonly-tool identity verification on reuse; writable-root reuse launches no inventory", guard="host_admission" },
+  { p="lua/ue/cdb/prepare_inputs.lua", api="vim.system", a="return vim.system({ path, \"-print-resource-dir\" }", class="subprocess-only", reason="once per nonstandard-layout compiler driver inside the admitted prepare inventory child; 3s timeout, fail-closed; never on cache-hit/UI path" },
+  { p="lua/ue/cdb/prepare_scan_roots.lua", api="vim.system", a="local ok, handle = pcall(vim.system", class="deferrable", reason="one admitted prepare-only root discovery child after native input observation; cached roots spawn none; bounded timeout and owned cancellation", guard="host_admission" },
   { p="lua/ue/clangd_commands.lua", api="vim.system", a="vim.system(cmd, { text = true }", class="interactive", reason="bounded compile-command query for active LSP request" },
   { p="lua/ue/dap/android.lua", api="vim.system", a="local ok_spawn = pcall(vim.system", n=3, class="dap", reason="DAP protocol/process lifecycle exemption (liveness pidof probe, gate release, session-exit post-mortem)" },
   -- L1 传输层拆分后（design D7），platform server 的 spawn 随代码搬到 _android_transport。
@@ -36,6 +48,9 @@ local SPAWN_AUDIT = {
   { p="lua/ue/dap/android.lua", api="jobstart", a="vim.fn.jobstart(jdb_connect_argv", class="dap", reason="DAP JDWP bridge" },
   { p="lua/ue/dap/android.lua", api="vim.system", a="vim.system(", class="dap", reason="DAP bounded host operation" },
   { p="lua/ue/dap/android.lua", api="fn-system", a="vim.fn.system(cmd)", n=2, class="dap", reason="DAP preflight fallback" },
+  { p="lua/ue/dap/android.lua", api="vim.system", a="local ok, err = pcall(vim.system, cmd", class="dap", reason="async adb round-trip for interactive attach/launch steps (K53)" },
+  { p="lua/ue/dap/_android_crash.lua", api="vim.system", a="opts.system or vim.system", class="interactive", reason="one llvm-symbolizer run for a user-requested crash report" },
+  { p="lua/ue/dap/_android_crash.lua", api="vim.system", a="vim.system({ adb, \"-s\", serial, \"logcat\", \"-b\", \"crash\"", class="interactive", reason="one bounded crash-buffer dump requested by user" },
   -- C10 L2 gate: the layered capability preflight owns exactly ONE spawn point,
   -- deliberately centralized here instead of spread across target owners so this
   -- ratchet has a stable owner. Bounded by preflight.PROBE_TIMEOUT_MS; async only
@@ -52,12 +67,16 @@ local SPAWN_AUDIT = {
   { p="lua/ue/index/_build.lua", api="vim.system", a="local ok_spawn, handle = pcall(vim.system, plan.command", class="deferrable", reason="admitted async CDB partition under actual base writer lease", guard="admission.run_when_allowed" },
   { p="lua/ue/index/_build.lua", api="vim.system", a="vim.system(cmd, {", class="deferrable", reason="controlled index child admitted by scheduler", guard="admit_background_phase", gp="lua/ue/index/_schedule.lua" },
   { p="lua/ue/index/_generation.lua", api="vim.system", a="vim.system({ path,", class="short", reason="cached bounded toolchain identity probe" },
+  { p="lua/ue/index/_generation_digest.lua", api="vim.system", a="local spawn = opts.spawn or vim.system", class="interactive", reason="coalesced single CDB identity worker per input; bounded timeout/retries, no main-loop large reads" },
+  { p="lua/ue/index/_publication_async.lua", api="vim.system", a="local spawned, process = pcall(vim.system,", class="deferrable", reason="one ordinary publication child under retained build job and writer lease; inherited scheduler admission", guard="admit_background_phase", gp="lua/ue/index/_schedule.lua" },
   { p="lua/ue/index/batch_runtime.lua", api="vim.system", a="local handle = vim.system(command", class="interactive", reason="bounded asynchronous clangd startup receipt verification", guard="task_registry" },
+  { p="lua/ue/index/batch_background.lua", api="vim.system", a="local handle = vim.system(command", class="deferrable", reason="two private proof workers; shared host admission, owned cancellation and coalesced publication", guard="admission.run_when_allowed" },
   { p="lua/ue/index/batch_shard_seed.lua", api="vim.system", a="local handle = vim.system(command", class="interactive", reason="bounded one-time add-only frozen shard-cache seed before startup watches", guard="task_registry" },
+  { p="lua/ue/index/switch_reindex.lua", api="vim.system", a="(deps.system or vim.system)(argv", class="deferrable", reason="bounded branch-switch shard reindex through private CDBs and one shared junction; host admission first, single 600s deadline, killed on exit", guard="admission.admit" },
   { p="lua/ue/target_tasks.lua", api="vim.system", a="pcall(vim.system, command", class="foreground", reason="operation metadata classifies explicit task", guard="is_foreground_operation" },
   { p="lua/ue/workflows/android/install.lua", api="jobstart", a="pcall(d.jobstart, install_cmd", class="foreground", reason="explicit APK install", guard="foreground_begin" },
   { p="lua/ue/workflows/android/launch.lua", api="jobstart", a="pcall(deps.jobstart, prepared.command", class="interactive", reason="short explicit app launch" },
-  { p="lua/ue.lua", api="vim.system", a="if vim.system then", n=2, class="helper", reason="capability branch for shared sync query helper" },
+  { p="lua/ue.lua", api="vim.system", a="if vim.system then", n=1, class="helper", reason="capability branch for shared sync query helper" },
   { p="lua/ue.lua", api="vim.system", a="local result = vim.system(cmd, system_opts):wait()", class="sync-debug", reason="explicit sync helper used by UEPrepareSync/query fallbacks" },
   { p="lua/ue.lua", api="vim.system", a="if not vim.system then", class="helper", reason="async helper capability branch" },
   { p="lua/ue.lua", api="vim.system", a="local handle = vim.system(cmd, system_opts", class="interactive", reason="async short query helper" },
@@ -67,11 +86,12 @@ local SPAWN_AUDIT = {
   { p="lua/ue.lua", api="jobstart", a="function M._logged_jobstart", class="helper", reason="CDB runner definition; concrete call is separately audited" },
   { p="lua/ue.lua", api="jobstart", a="vim.fn.jobstart(cmd, job_opts)", class="deferrable", reason="CDB job runner is called behind pipeline admission", guard="host_admission", gp="lua/ue/cdb/pipeline.lua" },
   { p="lua/ue.lua", api="termopen", a="vim.fn.termopen(cmd", class="foreground", reason="visible user terminal task", guard="foreground_begin" },
-  { p="lua/ue.lua", api="jobstart", a="CORE_RT.prepare_jobid = vim.fn.jobstart", class="deferrable", reason="admitted cold GTAGS", guard="admission.run_when_allowed" },
   { p="lua/ue.lua", api="jobstart", a="local pch_jobid = vim.fn.jobstart", class="foreground", reason="explicit PCH rebuild", guard="foreground_begin" },
   { p="lua/ue.lua", api="vim.system", a="local handle = vim.system(cmd, {", class="deferrable", reason="admitted ccjson subprocess", guard="admission.run_when_allowed" },
   { p="lua/ue.lua", api="fn-system", a="vim.fn.systemlist(joined)", class="helper", reason="legacy fallback for shared sync helper" },
   { p="lua/utils/android_device.lua", api="vim.system", a="pcall(vim.system", class="interactive", reason="bounded device discovery requested by user" },
+  { p="lua/utils/android_device.lua", api="vim.system", a="pcall(opts.system or vim.system", class="interactive", reason="one bounded `adb -s <serial> get-state` liveness check (doctor row)" },
+  { p="lua/utils/android_package.lua", api="vim.system", a="opts.system or vim.system", class="interactive", reason="one `pm list packages` for a user-driven package picker" },
   { p="lua/utils/code_search/init.lua", api="spawn", a="vim.loop.spawn(cs", class="interactive", reason="cancellable indexed query" },
   { p="lua/utils/code_search/init.lua", api="spawn", a="vim.loop.spawn(rg", class="interactive", reason="cancellable grep fallback" },
   { p="lua/utils/code_search/init.lua", api="spawn", a="vim.loop.spawn(cindex", class="deferrable", reason="admitted csearch rebuild", guard="admission.run_when_allowed" },
@@ -84,7 +104,7 @@ local SPAWN_AUDIT = {
   { p="lua/utils/platform/windows.lua", api="jobstart", a="vim.fn.jobstart(command, { detach = true }", class="detached", reason="Explorer opener/revealer" },
   { p="lua/workarounds/libuv/content_events.lua", api="jobstart", a="vim.fn.jobstart(command, options)", class="long-lived", reason="parent-bound native content watcher owned until editor exit", guard="task_registry" },
   { p="lua/utils/restart.lua", api="spawn", a="uv.spawn(exe", class="interactive", reason="explicit editor restart handoff" },
-  { p="lua/utils/ue_goto/semantic_client_runtime.lua", api="jobstart", a="vim.fn.jobstart({", class="interactive", reason="compiler-semantic sidecar for active gd" },
+  { p="lua/utils/ue_goto/semantic_client_runtime.lua", api="jobstart", a="vim.fn.jobstart({", class="long-lived", reason="owned compiler-semantic service; background warmup is admitted and lower priority", guard='client.set_priority(pending.background and "low" or "normal")' },
   { p="lua/utils/ue_goto/semantic_sidecar_catalog.lua", api="vim.system", a="vim.system(args", class="subprocess-only", reason="bounded compiler probe inside headless sidecar" },
   { p="lua/utils/ue_goto/semantic_sidecar_libclang.lua", api="vim.system", a="vim.system(cmd", class="subprocess-only", reason="bounded compiler probe inside headless sidecar" },
   { p="lua/utils/ue_launch.lua", api="vim.system", a="vim.system(cmd", class="interactive", reason="explicit target launch waits only for PID handoff" },
@@ -227,16 +247,16 @@ t.describe("host discipline: deferrable batch integration", function()
     t.assert_eq(sync_calls, 0, "UI 命令/正常 prepare 不得落回 blocking twin")
   end)
 
-  t.it("cold UEPrepare GTAGS 在 jobstart 前使用通用 queue", function()
+  t.it("cold UEPrepare GTAGS uses the same admitted validated owner as watcher", function()
     local text = source("lua/ue.lua")
     local phase_at = assert(text:find("Phase 3b: build GTAGS", 1, true))
-    local closure_at = assert(text:find("local function start_gtags_phase", phase_at, true))
-    local spawn_at = assert(text:find("CORE_RT.prepare_jobid = vim.fn.jobstart", phase_at, true))
-    local gate_at = assert(text:find("admission.run_when_allowed", phase_at, true))
-    local start_ref = assert(text:find("start = start_gtags_phase", gate_at, true))
-    t.assert_true(closure_at < spawn_at and spawn_at < gate_at and gate_at < start_ref,
-      "jobstart 必须封装在只由 admission 调用的 continuation 中")
+    local phase_end = assert(text:find("-- ── Phase 1:", phase_at, true))
+    local phase = text:sub(phase_at, phase_end - 1)
+    t.assert_contains(phase, 'require("ue.gtags").rebuild_async(require("ue.gtags").workspace_spec(ctx)')
+    t.assert_nil(phase:find("vim.fn.jobstart", 1, true))
+    t.assert_contains(source("lua/ue/gtags.lua"), "admission.run_when_allowed")
   end)
+
 end)
 
 t.describe("host discipline: watcher GTAGS is async", function()
@@ -278,7 +298,8 @@ t.describe("host discipline: watcher GTAGS is async", function()
     local root = vim.fn.tempname() .. "-gtags"
     local filelist, db = root .. "/files", root .. "/db"
     vim.fn.mkdir(root, "p")
-    write(filelist, "Source/Test.cpp\n")
+    write(filelist, "Test.ush\n")
+    write(root .. "/Test.ush", "float Test() { return 1; }\n")
     local calls, result = 0, nil
     local ok, state = gtags.rebuild_async({
       root = root,
@@ -286,11 +307,17 @@ t.describe("host discipline: watcher GTAGS is async", function()
       db_dir = db,
       label = "test async GTAGS",
       first_executable = function() return "gtags" end,
-      system = function(_, _, on_exit)
+      system = function(command, _, on_exit)
         calls = calls + 1
-        vim.fn.mkdir(db, "p")
-        for _, name in ipairs({ "GTAGS", "GRTAGS", "GPATH" }) do write(db .. "/" .. name) end
-        on_exit({ code = 0, stdout = "", stderr = "" })
+        local stdout = ""
+        if command[1] == "gtags" then
+          local staged = command[#command]
+          vim.fn.mkdir(staged, "p")
+          for _, name in ipairs({ "GTAGS", "GRTAGS", "GPATH" }) do write(staged .. "/" .. name) end
+        else
+          stdout = "Test 1 " .. root:gsub("\\", "/") .. "/Test.ush float Test() {\n"
+        end
+        on_exit({ code = 0, stdout = stdout, stderr = "" })
         return { kill = function() end, is_closing = function() return false end }
       end,
     }, function(done, message)
@@ -299,7 +326,7 @@ t.describe("host discipline: watcher GTAGS is async", function()
     t.assert_true(ok)
     t.assert_eq(state, "running")
     vim.wait(100, function() return result ~= nil end)
-    t.assert_eq(calls, 1)
+    t.assert_eq(calls, 2, "build plus bounded positive global witness")
     t.assert_true(result and result[1], tostring(result and result[2]))
     t.assert_false(gtags.is_running())
     vim.fn.delete(root, "rf")

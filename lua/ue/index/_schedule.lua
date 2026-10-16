@@ -197,6 +197,7 @@ M.ADMISSION_RETRY_MS = 5000
     if not ctx or not M.base_compile_commands_path(ctx) then
       return
     end
+    require("ue.index.prepare_observer").prepared(ctx)
     M.schedule_index_phase(ctx, "current", 50)
     M.schedule_index_phase(ctx, "hot", 2500)
     M.schedule_index_phase(ctx, "full", M.PREPARE_FULL_DELAY_MS, { protect = true })

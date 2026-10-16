@@ -206,3 +206,41 @@ t.describe("ue.dap.android: process-local serial precedence", function()
     devices.clear()
   end)
 end)
+
+t.describe("utils.android_device: unplugged selected device", function()
+  t.it("recognises adb's not-found / offline wording and nothing else", function()
+    t.assert_true(devices.is_gone_output("adb.exe: device 'SERIAL-OLD' not found"))
+    t.assert_true(devices.is_gone_output("error: device offline"))
+    t.assert_true(devices.is_gone_output("adb: no devices/emulators found"))
+    t.assert_false(devices.is_gone_output("Failure [INSTALL_FAILED_UPDATE_INCOMPATIBLE]"))
+    t.assert_false(devices.is_gone_output(nil))
+  end)
+
+  t.it("offers re-selection as the one-key fix but keeps the selected serial", function()
+    local hub = require("utils.ue_hub")
+    hub._pending_fix = nil
+    devices.set("SERIAL-OLD")
+    local orig = vim.notify
+    vim.notify = function() end
+    local reported = devices.report_if_gone("adb.exe: device 'SERIAL-OLD' not found", "SERIAL-OLD")
+    vim.notify = orig
+    t.assert_true(reported)
+    t.assert_eq(hub._pending_fix.command, "UESetAndroidDevice")
+    t.assert_eq(devices.get(), "SERIAL-OLD")
+    t.assert_false(devices.report_if_gone("exit 1: some other failure", "SERIAL-OLD"))
+    hub._pending_fix = nil
+    devices.clear()
+  end)
+
+  t.it("check_async targets the serial with get-state and reports adb's answer", function()
+    local argv, result
+    devices.check_async("SERIAL-A", function(ok, detail) result = { ok, detail } end, {
+      adb = "adb",
+      system = function(cmd, _, cb) argv = cmd; cb({ code = 1, stdout = "", stderr = "error: device 'SERIAL-A' not found" }) end,
+    })
+    vim.wait(1000, function() return result ~= nil end)
+    t.assert_eq(table.concat(argv, " "), "adb -s SERIAL-A get-state")
+    t.assert_false(result[1])
+    t.assert_contains(result[2], "not found")
+  end)
+end)

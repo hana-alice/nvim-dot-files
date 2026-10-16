@@ -157,6 +157,72 @@ t.describe("source content refresh delivery", function()
     t.assert_eq(scheduled[#scheduled][1], "current")
   end)
 
+  t.it("uncovered source refresh waits for prepare, baseline and actual reader acknowledgement", function()
+    local m, ctx, _, _, cleared = fixture()
+    m.source_content_changed(ctx, "/project/new.h", "new")
+    local old = package.loaded["ue.index.switch_reindex"]
+    local prepared, attached, notices, restarts = nil, nil, {}, 0
+    package.loaded["ue.index.switch_reindex"] = {
+      before = function(_, _, done)
+        done({ ok = false, needs_prepare = true, reason = "uncovered", changed = 1 }); return true
+      end,
+      baseline = function(_, _, done) done({ ok = true, action = "baseline" }); return true end,
+      summary = function(result) return result.fallback or "result" end,
+    }
+    local ok, err = xpcall(function()
+      m.deliver_source_refresh(ctx, { "module" }, {
+        prepare = function(_, done) prepared = done; return true end,
+        restart = function(_, done) restarts = restarts + 1; attached = done; return true end,
+        notify = function(message) notices[#notices + 1] = message end,
+      })
+      t.assert_true(m.source_refresh_pending(ctx))
+      t.assert_eq(restarts, 0)
+      t.assert_eq(#notices, 1)
+      prepared(true)
+      t.assert_eq(restarts, 1)
+      t.assert_true(m.source_refresh_pending(ctx), "prepare completion is not reader delivery")
+      t.assert_eq(#cleared, 0)
+      attached(true)
+      attached(true)
+      t.assert_false(m.source_refresh_pending(ctx))
+      t.assert_eq(#cleared, 1)
+      t.assert_eq(#notices, 2)
+    end, debug.traceback)
+    package.loaded["ue.index.switch_reindex"] = old
+    if not ok then error(err) end
+  end)
+
+  t.it("failed uncovered prepare remains pending and retry notifications are bounded", function()
+    local m, ctx, _, scheduled, cleared = fixture()
+    m.source_content_changed(ctx, "/project/new.h", "new")
+    local old = package.loaded["ue.index.switch_reindex"]
+    local notices, restarts = {}, 0
+    package.loaded["ue.index.switch_reindex"] = {
+      before = function(_, _, done)
+        done({ ok = false, needs_prepare = true, reason = "uncovered" }); return true
+      end,
+      summary = function(result) return result.fallback or "result" end,
+    }
+    local ok, err = xpcall(function()
+      local deps = {
+        prepare = function(_, done) done(false, "real-prepare-failed"); return true end,
+        restart = function() restarts = restarts + 1 end,
+        notify = function(message) notices[#notices + 1] = message end,
+      }
+      m.deliver_source_refresh(ctx, { "module" }, deps)
+      t.assert_true(m.source_refresh_pending(ctx))
+      t.assert_eq(#cleared, 0)
+      t.assert_eq(restarts, 0)
+      t.assert_eq(#notices, 2)
+      t.assert_eq(scheduled[#scheduled][1], "current")
+      m.deliver_source_refresh(ctx, { "module" }, deps)
+      t.assert_eq(#notices, 2)
+      t.assert_true(m.source_refresh_pending(ctx))
+    end, debug.traceback)
+    package.loaded["ue.index.switch_reindex"] = old
+    if not ok then error(err) end
+  end)
+
   t.it("generated artifacts cannot report source changes delivered before attachment", function()
     local m = {}
     require("ue.index._delivery")(m, {})

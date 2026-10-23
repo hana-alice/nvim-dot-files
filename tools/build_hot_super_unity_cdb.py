@@ -55,7 +55,9 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
+import time
 from collections import defaultdict
 # Emit UTF-8 regardless of the host ANSI code page (cp1252 on CI runners).
 # At import time so callers that import this module and call main() are covered.
@@ -149,7 +151,7 @@ def strip_write_only_flags(args):
         if arg in WRITE_ONLY_FLAGS:
             index += 1
             continue
-        if any(arg.startswith(prefix) for prefix in WRITE_ONLY_PREFIXES):
+        if arg.startswith(WRITE_ONLY_PREFIXES):
             index += 1
             continue
         stripped.append(args[index])
@@ -176,41 +178,388 @@ def compile_context_key(entry):
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]
 
 
-def secondary_unity_chunks(entries, max_sources=80, max_unities=8):
+def _member_stems(members):
+    sources, generated = set(), set()
+    for member in members:
+        name = member.replace('\\', '/').rsplit('/', 1)[-1].casefold()
+        if name.endswith('.gen.cpp'):
+            generated.add(name[:-8])
+        else:
+            stem, suffix = os.path.splitext(name)
+            if suffix in ('.cpp', '.cc', '.cxx'):
+                sources.add(stem)
+    return sources, generated
+
+
+def secondary_unity_chunks(entries, max_sources=None, max_unities=8,
+                           budget_factor=None, diagnostics=None, split_member_classes=True,
+                           avoid_same_stem_pairs=False):
     """Plan same-context SuperUnity chunks without modifying original commands.
 
-    The source budget counts every member, including generated sources. Original
-    UBT groups remain indivisible, and unrelated/exact entries remain available
-    to the caller. These are candidates; the native admission step still decides
-    whether a chunk can replace its originals.
+    Each chunk is bounded by budget_factor * UBT's 384 KiB member-source budget.
+    max_sources is an optional additional limit for existing strict callers.
+    Original UBT groups remain indivisible; unknown source sizes conservatively
+    exceed the budget. Same-stem exclusion is an optional planning constraint;
+    Tier 1 normally retries failed cross-class candidates by member class.
+    These are candidates, not admission receipts.
     """
-    if max_sources < 1 or max_unities < 1:
+    if not isinstance(split_member_classes, bool):
+        raise ValueError('SuperUnity member-class split must be boolean')
+    if budget_factor is None:
+        budget_factor = int(os.environ.get('NVIM_UE_SUPER_UNITY_BUDGET_FACTOR', '8'))
+    if (not isinstance(budget_factor, int) or isinstance(budget_factor, bool)
+            or budget_factor < 1 or not isinstance(max_unities, int)
+            or isinstance(max_unities, bool) or max_unities < 1
+            or (max_sources is not None and (not isinstance(max_sources, int)
+                or isinstance(max_sources, bool) or max_sources < 1))):
         raise ValueError('SuperUnity chunk budgets must be positive')
+    byte_budget = budget_factor * 393216
     buckets = defaultdict(list)
     for index, entry in enumerate(entries):
         members = entry.get('nvim_ue_members')
         module = entry.get('nvim_ue_module_root')
         name = entry.get('file', '').replace('\\', '/').rsplit('/', 1)[-1]
         if name.startswith('SuperUnity.UBT.') and members and module:
-            buckets[(module, compile_context_key(entry))].append(index)
+            generated = [member.lower().endswith('.gen.cpp') for member in members]
+            member_class = 'gen' if all(generated) else 'mixed' if any(generated) else 'src'
+            buckets[(module, compile_context_key(entry),
+                     member_class if split_member_classes else None)].append(index)
+
+    def member_bytes(index):
+        entry = entries[index]
+        wrapper = winpath_local(entry['file'])
+        if not os.path.isabs(wrapper):
+            wrapper = os.path.join(winpath_local(entry.get('directory', '')), wrapper)
+        member = None
+        try:
+            with open(wrapper, encoding='utf-8') as source:
+                paths = [match.group(1) for line in source
+                         if (match := UNITY_INCLUDE_RE.match(line))]
+            if [portable_member_path(path) for path in paths] != entry['nvim_ue_members']:
+                raise ValueError('wrapper-membership-mismatch')
+            size = 0
+            for member in paths:
+                path = winpath_local(member)
+                if not os.path.isabs(path):
+                    path = os.path.join(os.path.dirname(wrapper), path)
+                size += os.stat(path).st_size
+            return size
+        except (OSError, UnicodeError, ValueError) as error:
+            detail = {'entry_index': index, 'file': entry['file'], 'member': member,
+                      'reason': 'member-size-unavailable', 'detail': str(error),
+                      'assumed_bytes': byte_budget + 1}
+            if diagnostics is not None:
+                diagnostics.append(detail)
+            else:
+                print('[hot-super] ' + json.dumps(detail, ensure_ascii=True), file=sys.stderr)
+            return byte_budget + 1
 
     chunks = []
     for indexes in buckets.values():
-        chunk, count = [], 0
+        chunk, size, count = [], 0, 0
+        chunk_sources, chunk_generated = set(), set()
         for index in indexes:
-            size = len(entries[index]['nvim_ue_members'])
-            if chunk and (count + size > max_sources or len(chunk) >= max_unities):
+            source_bytes = member_bytes(index)
+            sources = len(entries[index]['nvim_ue_members'])
+            source_stems, generated_stems = (set(), set())
+            if not split_member_classes and avoid_same_stem_pairs:
+                source_stems, generated_stems = _member_stems(entries[index]['nvim_ue_members'])
+            if chunk and (size + source_bytes > byte_budget or len(chunk) >= max_unities
+                    or (max_sources is not None and count + sources > max_sources)
+                    or source_stems.intersection(chunk_generated)
+                    or generated_stems.intersection(chunk_sources)):
                 if len(chunk) > 1:
                     chunks.append(chunk)
-                chunk, count = [], 0
-            if size > max_sources:
+                chunk, size, count = [], 0, 0
+                chunk_sources, chunk_generated = set(), set()
+            if source_bytes > byte_budget or (max_sources is not None and sources > max_sources):
                 # An oversized original is retained, not split or omitted.
                 continue
             chunk.append(index)
-            count += size
+            size += source_bytes
+            count += sources
+            chunk_sources.update(source_stems)
+            chunk_generated.update(generated_stems)
         if len(chunk) > 1:
             chunks.append(chunk)
     return sorted(chunks, key=lambda chunk: chunk[0])
+
+
+def _tier2_path(path, directory):
+    path = winpath_local(str(path))
+    if not os.path.isabs(path):
+        path = os.path.join(winpath_local(directory), path)
+    return os.path.normpath(os.path.abspath(path))
+
+
+def _tier2_entry(entry):
+    """Read one compiler-authored owner; never write or grant admission."""
+    directory = _tier2_path(entry.get('directory', ''), os.getcwd())
+    source = _tier2_path(entry['file'], directory)
+    args = strip_write_only_flags(entry['arguments'])
+    residual, includes, forced, context = [], [], [], []
+    index = 1
+    while index < len(args):
+        arg = str(args[index])
+        if arg in ('-I', '-include'):
+            if index + 1 >= len(args):
+                raise ValueError('missing operand: ' + arg)
+            value = str(args[index + 1])
+            (includes if arg == '-I' else forced).append(_tier2_path(value, directory))
+            if arg == '-include' and not os.path.basename(value.replace('\\', '/')).startswith('Definitions.'):
+                context.extend((arg, value))
+            index += 2
+            continue
+        if arg.startswith('-I') and len(arg) > 2:
+            includes.append(_tier2_path(arg[2:], directory))
+        elif arg.startswith('-include='):
+            value = arg[len('-include='):]
+            forced.append(_tier2_path(value, directory))
+            if not os.path.basename(value.replace('\\', '/')).startswith('Definitions.'):
+                context.append(arg)
+        elif arg != '-c' and os.path.normcase(_tier2_path(arg, directory)) != os.path.normcase(source):
+            residual.append(arg)
+            context.append(arg)
+        elif arg == '-c':
+            context.append(arg)
+        index += 1
+    definitions = [path for path in forced
+                   if os.path.basename(path).startswith('Definitions.')]
+    shared = [path for path in forced if 'sharedpch' in os.path.basename(path).casefold()]
+    if len(definitions) != 1 or len(shared) != 1:
+        raise ValueError('expected one Definitions header and one SharedPCH header')
+    with open(definitions[0], encoding='utf-8-sig') as stream:
+        definition_text = stream.read()
+    engine = re.findall(r'^\s*#\s*define\s+UE_IS_ENGINE_MODULE\s+([^\r\n]+)',
+                        definition_text, re.MULTILINE)
+    if len(engine) != 1:
+        raise ValueError('expected one UE_IS_ENGINE_MODULE definition')
+    with open(source, encoding='utf-8-sig') as stream:
+        members = [_tier2_path(match.group(1), os.path.dirname(source))
+                   for line in stream if (match := UNITY_INCLUDE_RE.match(line))]
+    if not members or [portable_member_path(path) for path in members] != entry.get('nvim_ue_members'):
+        raise ValueError('wrapper-membership-mismatch')
+    prefix = [path for path in forced if path not in definitions]
+    # Preserve forced includes at their original argv positions in the key.
+    key = (os.path.normcase(directory), str(args[0]), os.path.normcase(shared[0]),
+           engine[0].strip(), tuple(context))
+    return {'directory': directory, 'source': source, 'driver': args[0],
+            'residual': residual, 'includes': includes, 'forced': forced,
+            'definitions': definitions[0], 'definition_text': definition_text,
+            'members': members, 'prefix': prefix, 'key': key}
+
+
+def tier2_unity_chunks(entries, max_unities=8, budget_factor=8, diagnostics=None):
+    """Plan whole-module, ordered cross-module candidates without writing files.
+
+    Incompatible or oversized complete modules remain available to Tier 1.
+    Reading compiler-owned wrappers and member sizes does not grant qualification.
+    """
+    if any(not isinstance(value, int) or isinstance(value, bool) or value < 1
+           for value in (max_unities, budget_factor)):
+        raise ValueError('Tier 2 budgets must be positive integers')
+    budget = budget_factor * 393216
+    modules = defaultdict(list)
+    for index, entry in enumerate(entries):
+        if (os.path.basename(entry.get('file', '').replace('\\', '/')).startswith('SuperUnity.UBT.')
+                and entry.get('nvim_ue_members') and entry.get('nvim_ue_module_root')):
+            modules[entry['nvim_ue_module_root']].append(index)
+    buckets = defaultdict(list)
+    for module, indexes in modules.items():
+        try:
+            infos = [_tier2_entry(entries[index]) for index in indexes]
+            if len({compile_context_key(entries[index]) for index in indexes}) != 1:
+                raise ValueError('module has multiple compiler contexts')
+            if len({info['key'] for info in infos}) != 1:
+                raise ValueError('module has incompatible Tier 2 contexts')
+            size = sum(os.stat(member).st_size for info in infos for member in info['members'])
+            if size > budget or len(indexes) > max_unities:
+                raise ValueError('whole module exceeds Tier 2 budget')
+            buckets[infos[0]['key']].append((indexes, size))
+        except (OSError, UnicodeError, ValueError, KeyError) as error:
+            if diagnostics is not None:
+                diagnostics.append({'module': module, 'entry_indexes': indexes, 'reason': str(error)})
+    chunks = []
+    for modules_in_bucket in buckets.values():
+        chunk, size, module_count = [], 0, 0
+        for indexes, module_size in modules_in_bucket:
+            if chunk and (len(chunk) + len(indexes) > max_unities or size + module_size > budget):
+                if module_count > 1:
+                    chunks.append(sorted(chunk))
+                chunk, size, module_count = [], 0, 0
+            chunk.extend(indexes)
+            size += module_size
+            module_count += 1
+        if module_count > 1:
+            chunks.append(sorted(chunk))
+    return sorted(chunks, key=lambda chunk: chunk[0])
+
+
+def tier2_candidate_spec(group, wrapper_path):
+    """Return an explicit cross-module candidate and wrapper text; do not write."""
+    if not group:
+        raise ValueError('empty Tier 2 group')
+    infos = [_tier2_entry(entry) for entry in group]
+    if len({info['key'] for info in infos}) != 1:
+        raise ValueError('incompatible Tier 2 group')
+    modules = defaultdict(list)
+    for entry, info in zip(group, infos):
+        modules[entry['nvim_ue_module_root']].append(info)
+    for module in modules:
+        if len({compile_context_key(entry) for entry in group
+                if entry['nvim_ue_module_root'] == module}) != 1:
+            raise ValueError('module has multiple compiler contexts')
+    if len(modules) < 2:
+        raise ValueError('Tier 2 requires multiple modules')
+    lines = ['// Explicit Tier 2 candidate; qualification required.']
+    lines.extend('#include "' + path.replace('\\', '/') + '"' for path in infos[0]['prefix'])
+    for module_infos in modules.values():
+        if len({info['definitions'] for info in module_infos}) != 1:
+            raise ValueError('module has multiple Definitions headers')
+        macros = list(dict.fromkeys(re.findall(r'^\s*#\s*define\s+([A-Za-z_]\w*)',
+                    module_infos[0]['definition_text'], re.MULTILINE)))
+        for macro in macros:
+            lines.extend(['#pragma push_macro("' + macro + '")', '#undef ' + macro])
+        lines.append('#include "' + module_infos[0]['definitions'].replace('\\', '/') + '"')
+        lines.extend('#include "' + member.replace('\\', '/') + '"'
+                     for info in module_infos for member in info['members'])
+        lines.extend('#pragma pop_macro("' + macro + '")' for macro in reversed(macros))
+    includes = list(dict.fromkeys(path for info in infos for path in info['includes']))
+    source = _tier2_path(wrapper_path, infos[0]['directory'])
+    candidate = dict(group[0])
+    candidate.update(file=source, arguments=[infos[0]['driver'], *infos[0]['residual'],
+                     *('-I' + path for path in includes), '-c', source],
+                     nvim_ue_members=[member for entry in group for member in entry['nvim_ue_members']],
+                     nvim_ue_tier=2,
+                     nvim_ue_tier2_modules=list(modules))
+    return candidate, '\n'.join(lines) + '\n'
+
+
+def _tier2_dependency_paths(text):
+    """Decode Make dependency escaping without consuming Windows separators."""
+    paths, token, index = [], [], 0
+    while index < len(text):
+        char = text[index]
+        if char == '\\' and index + 1 < len(text):
+            following = text[index + 1]
+            if following.isspace() or following in '#$:' or (following == '\\' and os.name != 'nt'):
+                token.append(following)
+                index += 2
+                continue
+        if char.isspace():
+            if token:
+                paths.append(''.join(token).replace('$$', '$'))
+                token = []
+        else:
+            token.append(char)
+        index += 1
+    if token:
+        paths.append(''.join(token).replace('$$', '$'))
+    return paths
+
+
+def tier2_include_gate(group, work_dir, clang_path, timeout=10):
+    """Compare actual preprocessing dependencies; sequential and private only."""
+    started = time.monotonic()
+    result = {'ok': False, 'reason': '', 'seconds': 0.0, 'commands': [],
+              'only_tier1': [], 'only_tier2': []}
+    try:
+        work_dir = os.path.realpath(os.path.abspath(work_dir))
+        if '/.cache/nvim-ue/' in (work_dir.replace('\\', '/').casefold().rstrip('/') + '/'):
+            raise ValueError('include gate work directory must be private')
+        os.makedirs(work_dir, exist_ok=True)
+        wrapper = os.path.join(work_dir, 'Tier2.include-gate.cpp')
+        candidate, body = tier2_candidate_spec(group, wrapper)
+        with open(wrapper, 'w', encoding='utf-8', newline='\n') as stream:
+            stream.write(body)
+        modules = defaultdict(list)
+        for entry in group:
+            modules[entry['nvim_ue_module_root']].append(entry)
+        commands = []
+        for number, module_entries in enumerate(modules.values()):
+            infos = [_tier2_entry(entry) for entry in module_entries]
+            info = infos[0]
+            original_wrapper = os.path.join(work_dir, 'Tier1.include-gate.' + str(number) + '.cpp')
+            with open(original_wrapper, 'w', encoding='utf-8', newline='\n') as stream:
+                stream.write(''.join('#include "' + member.replace('\\', '/') + '"\n'
+                                    for item in infos for member in item['members']))
+            original_args = strip_write_only_flags(module_entries[0]['arguments'])[1:]
+            original_args = [arg for arg in original_args if arg != '-c' and
+                os.path.normcase(_tier2_path(arg, info['directory'])) != os.path.normcase(info['source'])]
+            commands.append(('tier1', info['directory'], [*original_args, original_wrapper], original_wrapper))
+        commands.append(('tier2', candidate['directory'],
+                         [arg for arg in candidate['arguments'][1:] if arg != '-c'], wrapper))
+        generated = {os.path.normcase(os.path.realpath(item[3])) for item in commands}
+        dependencies = {'tier1': set(), 'tier2': set()}
+        for number, (kind, directory, args, _source) in enumerate(commands):
+            remaining = timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired('include-gate', timeout)
+            depfile = os.path.join(work_dir, str(number) + '.d')
+            argv = [str(clang_path), *args, '-E', '-M', '-MF', depfile, '-MT', 'tier2_gate']
+            command_started = time.monotonic()
+            try:
+                completed = subprocess.run(argv, cwd=directory, capture_output=True, text=True,
+                    encoding='utf-8', errors='replace', timeout=remaining,
+                    creationflags=getattr(subprocess, 'BELOW_NORMAL_PRIORITY_CLASS', 0) if os.name == 'nt' else 0)
+            except subprocess.TimeoutExpired:
+                result['commands'].append({'kind': kind, 'argv': argv, 'returncode': None,
+                    'seconds': round(time.monotonic() - command_started, 6), 'timeout': True})
+                raise
+            result['commands'].append({'kind': kind, 'argv': argv, 'returncode': completed.returncode,
+                'seconds': round(time.monotonic() - command_started, 6), 'stderr': completed.stderr[-6000:]})
+            if completed.returncode:
+                raise ValueError(kind + ' preprocessing failed')
+            with open(depfile, encoding='utf-8') as stream:
+                text = stream.read().replace('\\\n', ' ').replace('\\\r\n', ' ')
+            if not text.startswith('tier2_gate:'):
+                raise ValueError('unexpected dependency target')
+            for path in _tier2_dependency_paths(text[len('tier2_gate:'):]):
+                normalized = os.path.normcase(os.path.realpath(_tier2_path(path, directory)))
+                if normalized not in generated:
+                    dependencies[kind].add(normalized)
+        result['only_tier1'] = sorted(dependencies['tier1'] - dependencies['tier2'])
+        result['only_tier2'] = sorted(dependencies['tier2'] - dependencies['tier1'])
+        result['dependency_counts'] = {key: len(value) for key, value in dependencies.items()}
+        result['ok'] = not result['only_tier1'] and not result['only_tier2']
+        result['reason'] = 'equal' if result['ok'] else 'dependency-set-mismatch'
+    except (OSError, UnicodeError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
+        result['reason'] = str(error)
+    result['seconds'] = round(time.monotonic() - started, 6)
+    return result
+
+
+def strict_unity_chunks(entries, max_sources=None, max_unities=8,
+                        budget_factor=None, diagnostics=None):
+    """Keep same-class candidates first, then pack unclaimed strict candidates.
+
+    Removing chunks can make remaining same-class originals fit together, so
+    settle those first. Each final cross-class group then replans as one group.
+    The residual pass may cross member classes, but preserves module/context,
+    original entry order and all budgets. Every result still needs strict proof.
+    """
+    chunks, available = [], list(range(len(entries)))
+    split_member_classes = True
+    while True:
+        residual_diagnostics = []
+        residual = secondary_unity_chunks([entries[index] for index in available],
+            max_sources=max_sources, max_unities=max_unities, budget_factor=budget_factor,
+            diagnostics=residual_diagnostics, split_member_classes=split_member_classes,
+            avoid_same_stem_pairs=False)
+        for detail in residual_diagnostics:
+            detail['entry_index'] = available[detail['entry_index']]
+            if diagnostics is not None:
+                diagnostics.append(detail)
+            else:
+                print('[hot-super] ' + json.dumps(detail, ensure_ascii=True), file=sys.stderr)
+        chunks.extend([available[index] for index in chunk] for chunk in residual)
+        if not split_member_classes:
+            return chunks
+        if residual:
+            claimed = {index for chunk in residual for index in chunk}
+            available = [index for position, index in enumerate(available) if position not in claimed]
+        else:
+            split_member_classes = False
 
 
 def compiler_authored_module_roots(cdb, groups):

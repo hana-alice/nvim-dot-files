@@ -2,8 +2,30 @@ local t = require("tests.harness")
 t.bootstrap()
 
 local fixture = [=[
-import contextlib, hashlib, io, json, os, pathlib, shutil, subprocess, sys, tempfile, time
+import ast, contextlib, hashlib, io, json, os, pathlib, shutil, subprocess, sys, tempfile, time
 sys.dont_write_bytecode = True
+
+def reverse_first_freeze_group(source):
+    tree = ast.parse(source)
+    proofs = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == '_prove']
+    assert len(proofs) == 1, 'one archived _prove required'
+    matches = [node for node in ast.walk(proofs[0]) if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name) and node.func.id == '_timed' and len(node.args) >= 4
+        and isinstance(node.args[1], ast.Constant) and node.args[1].value == 'freeze'
+        and isinstance(node.args[2], ast.Name) and node.args[2].id == '_freeze'
+        and isinstance(node.args[3], ast.Name) and node.args[3].id == 'group']
+    assert len(matches) == 1, 'one original-order archived freeze call required'
+    argument = matches[0].args[3]
+    raw = source.encode('utf-8')
+    lines = raw.splitlines(keepends=True)
+    start = sum(map(len, lines[:argument.lineno-1])) + argument.col_offset
+    end = sum(map(len, lines[:argument.end_lineno-1])) + argument.end_col_offset
+    replacement = 'list(reversed(group))'
+    transformed = (raw[:start] + replacement.encode('utf-8') + raw[end:]).decode('utf-8')
+    matches[0].args[3] = ast.parse(replacement, mode='eval').body
+    assert ast.dump(ast.parse(transformed)) == ast.dump(tree), 'archived freeze transform changed other syntax'
+    return transformed
+
 config, clangd, mode = sys.argv[1:4]
 if mode == 'import_changed':
     sys.path.insert(0, str(pathlib.Path(config) / 'tools'))
@@ -37,6 +59,29 @@ class OwnedDirectory(tempfile.TemporaryDirectory):
             except PermissionError:
                 if time.monotonic() >= deadline: raise
                 time.sleep(0.05)
+
+def write_owned_driver(path, contents):
+    # Native execution can trigger a short host security-service file lock.
+    # Retry only our fixture copy; permanent denial must remain a failure.
+    started, retries, waited = time.monotonic(), 0, 0.0
+    deadline = started + 2
+    while True:
+        try:
+            path.write_bytes(contents)
+            result = dict(retries=retries, waited_seconds=round(waited, 6),
+                          elapsed_seconds=round(time.monotonic() - started, 6))
+            print('owned driver write: ' + json.dumps(result), file=sys.stderr)
+            return result
+        except PermissionError as error:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError('owned driver write denied after %d retries, %.6fs waited, %.6fs elapsed: %s' %
+                    (retries, waited, time.monotonic() - started, error)) from error
+            retries += 1
+            sleeping = time.monotonic()
+            time.sleep(min(0.05, remaining))
+            waited += time.monotonic() - sleeping
+
 with OwnedDirectory(prefix='receipt_migration_') as temporary:
     root = pathlib.Path(temporary).resolve()
     # Build an actual legacy-format native producer in an owned archive. Its
@@ -54,10 +99,9 @@ with OwnedDirectory(prefix='receipt_migration_') as temporary:
     helper.write_text(helper.read_text().replace('query-driver-v5', 'query-driver-v4').replace(
         "'COMPILER_PATH', 'WindowsSdkDir'", "'COMPILER_PATH', 'PATH', 'PATHEXT', 'WindowsSdkDir'"))
     collector = archive / 'tools/cdb_verified_batch.py'
-    collector.write_text(collector.read_text().replace(
-        "if server_profile is None or name not in ('PATH', 'PATHEXT')", '').replace(
-        'group, originals, assets, tool_hash, server_profile, timings=timings)',
-        'list(reversed(group)), originals, assets, tool_hash, server_profile, timings=timings)').replace(
+    collector_source = collector.read_text().replace(
+        "if server_profile is None or name not in ('PATH', 'PATHEXT')", '')
+    collector.write_text(reverse_first_freeze_group(collector_source).replace(
         'evidence.update(dependencies=files, identity=identity, replay_candidate=candidate)',
         'evidence.update(dependencies=files, identity=identity, replay_candidate=candidate, candidate_order=list(reversed(range(len(group)))))'))
     (root / 'bin').mkdir()
@@ -97,11 +141,11 @@ with OwnedDirectory(prefix='receipt_migration_') as temporary:
     run = lambda: migration.migrate_cache(old_path, entries, output, pathlib.Path(clangd), server, archive)
     # Modifications are confined to this fixture's owned native driver copy.
     driver_bytes = driver.read_bytes()
-    driver.write_bytes(driver_bytes + b'\0')
+    driver_writes = [write_owned_driver(driver, driver_bytes + b'\0')]
     changed = run()
     assert not changed['ok'], changed
     assert 'driver' in changed['reason'] or 'sha' in changed['reason'], changed
-    driver.write_bytes(driver_bytes)
+    driver_writes.append(write_owned_driver(driver, driver_bytes))
     dependency = pathlib.Path(record['dependencies'][0]['path'])
     dependency_bytes = dependency.read_bytes()
     dependency.write_bytes(dependency_bytes + b'\n')
@@ -170,7 +214,7 @@ with OwnedDirectory(prefix='receipt_migration_') as temporary:
             assert child.returncode == 0, child.stdout + child.stderr
     print(json.dumps({'migrated': True, 'compiler_changed_rejected': True,
         'dependency_changed_rejected': True, 'graph_missing_rejected': True,
-        'riff_missing_rejected': True, 'legacy_preserved': True}))
+        'riff_missing_rejected': True, 'legacy_preserved': True, 'driver_writes': driver_writes}))
 ]=]
 
 t.describe("archived verified batch migration", function()
@@ -190,6 +234,7 @@ t.describe("archived verified batch migration", function()
     vim.fn.delete(script)
     t.assert_eq(result.code, 0, (result.stderr or "") .. (result.stdout or ""))
     local evidence = vim.json.decode(result.stdout)
+    io.stdout:write('  owned driver writes: ' .. vim.json.encode(evidence.driver_writes) .. '\n')
     t.assert_eq(evidence.migrated, true)
     t.assert_eq(evidence.legacy_preserved, true)
   end)

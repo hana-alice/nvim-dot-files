@@ -18,6 +18,11 @@
 剪贴板 provider 在启动前隔离，不能以启动后替换配置证明没有触及系统剪贴板。
 → `../docs/CONSTRAINTS.md §二 文件操作与大纲`；`../lua/utils/document_location.lua`。
 
+### Unity 成员与 exact TU 的缓存角色（K75）
+
+同字节缓存命中不能证明新 exact 命令执行过；检查实际 own TU 标记，修复须保留 writer 与身份边界。
+→ `../docs/CONSTRAINTS.md §二 K75`；`../openspec/specs/cpp-semantic-index-coverage/spec.md`。
+
 ### C++ diagnostic compatibility (K74)
 
 DefaultError 不能直接归因于全局 `-Werror`。用真实 TU 和完整索引记录验证有界兼容策略，

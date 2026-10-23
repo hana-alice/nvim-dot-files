@@ -5,6 +5,7 @@ local fixture = [=[
 import contextlib, copy, importlib.util, json, os, pathlib, subprocess, sys, tempfile, time
 from unittest.mock import patch
 tool, clangd, operation = sys.argv[1:]
+case = operation.removeprefix('mixed_')
 spec = importlib.util.spec_from_file_location('verified_batch', tool)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
@@ -217,11 +218,12 @@ module._write(root / 'snapshot.h', b'certified snapshot bytes')
   template<typename Dummy> struct Link<__COUNTER__ - Base, Dummy> {};
 };
 ''' for name in ('Alpha', 'Beta')],
-    }.get('aliases' if operation == 'owned_aliases' else operation,
+    }.get('aliases' if operation == 'owned_aliases' else case,
           ['int alpha() { return 1; }\n', 'int beta() { return 2; }\n'])
     entries = []
     for index, body in enumerate(bodies):
-        member = source / ('Member' + str(index) + '.cpp')
+        suffix = '.gen.cpp' if operation.startswith('mixed_') and index == 1 else '.cpp'
+        member = source / ('Member' + str(index) + suffix)
         member.write_text(body, encoding='utf-8')
         wrapper = root / ('SuperUnity.UBT.' + str(index) + '.cpp')
         wrapper.write_text('// Compiler-authored UBT unity membership; copied into nvim cache.\n'
@@ -742,10 +744,29 @@ module._write(root / 'snapshot.h', b'certified snapshot bytes')
                   for asset in proof_record['graph_files']]
         assert proof_receipt['original_graph_sha256'] == actual[:-1]
         assert proof_receipt['candidate_graph_sha256'] == actual[-1]
-    elif operation == 'overload':
+    elif case == 'overload':
         assert phase['graph_compare_and_bindings']['seconds'] > 0
         assert len(metrics['groups'][0]['run_metrics']) == 3, 'rejections retain completed index costs'
-    if operation == 'template_arguments':
+    if operation == 'mixed_pass':
+        assert len(output) == 3 and metrics['batch_count'] == 1, metrics
+        batch = output[0]
+        assert batch['nvim_ue_members'] == entries[0]['nvim_ue_members'] + entries[1]['nvim_ue_members']
+        assert batch['nvim_ue_batch_ubt_count'] == 2
+        receipts = [batch['nvim_ue_batch_receipt']]
+        receipt = json.loads(pathlib.Path(receipts[0]).read_text())
+        assert receipt['schema'] == 2 and module.validate_receipts(receipts, clangd)['ok']
+        before = {str(path): (path.read_bytes(), path.stat().st_mtime_ns)
+                  for path in (root / 'proofs').rglob('*') if path.is_file()}
+        again, cached = cached_only(entries, root / 'proofs')
+        assert again == output and cached['cache_hits'] == 1 and cached['new_proof_count'] == 0, cached
+        assert before == {str(path): (path.read_bytes(), path.stat().st_mtime_ns)
+                          for path in (root / 'proofs').rglob('*') if path.is_file()}
+        generated = source / 'Member1.gen.cpp'
+        generated.write_text('int beta() { return 3; }\n', encoding='utf-8')
+        retained, invalidated = cached_only(entries, root / 'proofs')
+        assert retained == entries and invalidated['batch_count'] == 0, invalidated
+        assert invalidated['deferred_group_count'] == 1 and not module.validate_receipts(receipts, clangd)['ok']
+    elif operation == 'template_arguments':
         assert metrics['batch_count'] == 1, metrics
         receipt = json.loads(pathlib.Path(output[0]['nvim_ue_batch_receipt']).read_text())
         assert receipt['proven_template_arguments'], receipt
@@ -942,7 +963,7 @@ module._write(root / 'snapshot.h', b'certified snapshot bytes')
     else:
         assert output == entries and metrics['batch_count'] == 0, metrics
         assert len(metrics['groups']) == 1 and metrics['groups'][0]['reason'], metrics
-        if operation == 'conflict':
+        if case == 'conflict':
             assert 'private-index-failed' in metrics['groups'][0]['reason'], metrics
             assert not list((root / 'proofs/originals').glob('*.json')), 'failed frozen compilation cannot bind original digests to snapshots'
             again, repeat = module.accelerate(entries, root / 'proofs', clangd, max_group=2, timeout=30)
@@ -950,7 +971,7 @@ module._write(root / 'snapshot.h', b'certified snapshot bytes')
         elif operation == 'original_error':
             assert 'private-index-failed' in metrics['groups'][0]['reason'], metrics
             assert not list((root / 'proofs/receipts').glob('*.json')), 'incomplete original proof cannot be cached'
-        elif operation == 'overload':
+        elif case == 'overload':
             assert 'admission-rejected' in metrics['groups'][0]['reason'], metrics
             again, repeat = module.accelerate(entries, root / 'proofs', clangd, max_group=2, timeout=30)
             assert again == entries and repeat['cache_hits'] == 1, repeat
@@ -961,6 +982,687 @@ module._write(root / 'snapshot.h', b'certified snapshot bytes')
             assert cached_rejection['groups'][0]['reason'] == metrics['groups'][0]['reason'], cached_rejection
     print(json.dumps({'operation': operation, 'metrics': metrics}))
 ]=]
+
+local tier1_fixture = [=[
+import collections, contextlib, copy, importlib.util, json, os, pathlib, re, subprocess, sys, tempfile
+from unittest.mock import patch
+tool, clangd, operation = sys.argv[1:]
+if operation == 'partial':
+    # This fixture deliberately tests independent src/gen acceptance via rollback.
+    os.environ['NVIM_UE_TIER1_SPLIT_CLASSES'] = '1'
+spec = importlib.util.spec_from_file_location('verified_tier1', tool)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+with tempfile.TemporaryDirectory(prefix='verified_tier1_') as temporary, contextlib.ExitStack() as stack:
+    root = pathlib.Path(temporary).resolve()
+    source = root / 'Source/Runtime/Sample/Private'
+    source.mkdir(parents=True)
+    def unit(name, generated=False):
+        member = source / (name + ('.gen.cpp' if generated else '.cpp'))
+        member.write_text('int ' + name + '() { return 1; }\n', encoding='utf-8')
+        wrapper = root / ('SuperUnity.UBT.' + name + '.cpp')
+        wrapper.write_text('// Compiler-authored UBT unity membership; copied into nvim cache.\n'
+            + '#include "' + member.as_posix() + '"\n', encoding='utf-8')
+        compiler = pathlib.Path(clangd).with_name('clang++' + pathlib.Path(clangd).suffix) if clangd else 'clang++'
+        return {'directory': str(root), 'file': str(wrapper),
+            'arguments': [str(compiler), '-std=c++17', '-c', str(wrapper)],
+            'nvim_ue_module_root': 'Source/Runtime/Sample',
+            'nvim_ue_members': [module.portable_member_path(str(member))]}
+    a, b = unit('alpha'), unit('beta')
+    recipe_options, prefix_headers = {}, []
+    if operation in ('native_prefix', 'prefix_contract'):
+        recipe_options = {'recipe': 'tier1-ordered-absolute-forced-prefix-v1'}
+        prefix_headers = [root / 'FirstForced.h', root / 'SecondForced.h']
+        prefix_headers[0].write_text('#define PREFIX_FIRST 7\n', encoding='utf-8')
+        prefix_headers[1].write_text('static_assert(PREFIX_FIRST == 7, "forced order");\n'
+            + '#define PREFIX_SECOND 11\n', encoding='utf-8')
+        for name, entry in (('alpha', a), ('beta', b)):
+            entry['arguments'][1:1] = [token for header in prefix_headers
+                for token in ('-include', str(header))]
+            (source / (name + '.cpp')).write_text('int ' + name
+                + '() { return PREFIX_FIRST + PREFIX_SECOND; }\n', encoding='utf-8')
+    if operation == 'native_conflict':
+        for name in ('alpha', 'beta'):
+            (source / (name + '.cpp')).write_text('static int Collision;\nint ' + name
+                + '() { return Collision; }\n', encoding='utf-8')
+    exact = {'file': str(root / 'Exact.cpp'), 'directory': str(root), 'arguments': ['clang++', '-c', str(root / 'Exact.cpp')]}
+    shader = {'file': str(root / 'Shader.ush'), 'directory': str(root), 'arguments': ['clang++', '-c', str(root / 'Shader.ush')]}
+    entries = [a, exact, b, shader]
+    if operation == 'native_prefix': entries = [a, b]
+    expected_paths = [path for entry in [a, b] for path in module._validate_ubt(entry)]
+    if operation in ('original_define', 'original_extra_include'):
+        original_wrapper = pathlib.Path(a['file'])
+        raw = original_wrapper.read_text(encoding='utf-8')
+        if operation == 'original_define':
+            raw = raw.replace('\n', '\n#define ORIGINAL_CONTEXT 1\n', 1)
+        else:
+            header = root / 'Extra.h'
+            header.write_text('#define ORIGINAL_CONTEXT 1\n', encoding='utf-8')
+            raw += '# include "' + header.as_posix() + '"\n'
+        original_wrapper.write_text(raw, encoding='utf-8')
+    for name in ('_index', '_prove', 'compare_graphs'):
+        stack.enter_context(patch.object(module, name, side_effect=AssertionError('Tier 1 must not call ' + name)))
+    if operation not in ('native', 'native_conflict', 'native_prefix'):
+        stack.enter_context(patch.object(subprocess, 'Popen', side_effect=AssertionError('mock fixture must not start a process')))
+    if operation == 'prefix_contract':
+        group = [a, b]
+        recipe = recipe_options['recipe']
+        default, old_body = module._tier1_candidate_spec(group, root / 'flat-assets')
+        old_key = module._tier1_cache_key(group, default, 'tool', None, {})
+        assert old_key == module._tier1_cache_key(group, default, 'tool', None, {}, recipe=None)
+        assert 'nvim_ue_tier1_recipe' not in default
+        assert old_body.startswith('// Tier 1 same-context compiler-authored UBT batch.\n')
+        repeated = copy.deepcopy(group)
+        for entry in repeated: entry['arguments'][1:1] = ['-include', str(prefix_headers[0])]
+        candidate = module._tier1_candidate(repeated, root / 'prefix-assets', recipe=recipe)
+        body = pathlib.Path(candidate['file']).read_text(encoding='utf-8')
+        includes = re.findall(r'^#include "([^"\r\n]+)"$', body, re.M)
+        assert includes == [prefix_headers[0].as_posix()] + [p.as_posix() for p in prefix_headers] + expected_paths
+        assert candidate['nvim_ue_members'] == a['nvim_ue_members'] + b['nvim_ue_members']
+        assert module._tier1_members_match(repeated, candidate, recipe=recipe)[0]
+        assert not module._tier1_members_match(repeated, candidate)[0]
+        original_tokens = module.rewritten_arguments(repeated[0], candidate['file'])
+        _, removed, reason = module._forced_prefix_arguments(original_tokens)
+        assert reason is None
+        wanted = module._windows_paths(dict(candidate, arguments=[token for index, token in enumerate(original_tokens)
+            if index not in removed]))
+        assert candidate['arguments'] == wanted['arguments']
+        for bad_body in (body.replace(prefix_headers[0].as_posix(), prefix_headers[1].as_posix(), 1),
+                         body + '#define EXTRA 1\n', body + '#include "' + expected_paths[0] + '"\n'):
+            pathlib.Path(candidate['file']).write_text(bad_body, encoding='utf-8')
+            assert not module._tier1_members_match(repeated, candidate, recipe=recipe)[0]
+        pathlib.Path(candidate['file']).write_text(body, encoding='utf-8')
+        for option in ('@arguments.rsp', '-include-pch', '-imacros', '--config=extra', '-includejoined', '-Xclang'):
+            changed = copy.deepcopy(group)
+            for entry in changed: entry['arguments'].append(option)
+            try: module._tier1_candidate_spec(changed, root / 'unsupported', recipe=recipe)
+            except ValueError: pass
+            else: raise AssertionError(('unsupported recipe option accepted', option))
+        for value in ('unknown-recipe', {'recipe': recipe}, True):
+            try: module._tier1_candidate_spec(group, root / 'unsupported', recipe=value)
+            except ValueError: pass
+            else: raise AssertionError(('unknown recipe accepted', value))
+        print('real-file prefix order/duplicates/argv/body/default and unknown-recipe contracts passed')
+        sys.exit(0)
+    if operation == 'own_shard_contract':
+        uri = (source / 'alpha.cpp').as_uri()
+        result = {'background_compile_success': True, 'missing_main_shards': [], 'shards': ['fixture.idx'],
+            'indexing_complete': True, 'exit_code': 0, 'compile_failure_count': 0}
+        def decode(flags=0, digest='1234567890abcdef', extra=False):
+            nodes = {uri: {'digest': digest, 'flags': flags}}
+            if extra: nodes[(source / 'beta.cpp').as_uri()] = {'digest': digest, 'flags': 0}
+            return {'sources': nodes}
+        with patch.object(module, 'run', return_value=result):
+            for flags in (0, 1):
+                with patch.object(module, 'read_shard', return_value=decode(flags)):
+                    observed = module._tier1_candidate_index(a, root / 'own-shard', sys.executable, 1)
+                    assert observed['member_main_shards'] == [str(source / 'alpha.cpp')], observed
+            for malformed in (decode(digest='0000000000000000'), decode(extra=True)):
+                with patch.object(module, 'read_shard', return_value=malformed):
+                    try: module._tier1_candidate_index(a, root / 'own-shard', sys.executable, 1)
+                    except ValueError: pass
+                    else: raise AssertionError('invalid own shard was accepted')
+            with patch.object(module, 'read_shard', return_value=decode(flags=2)):
+                rejected = module._tier1_candidate_index(a, root / 'own-shard', sys.executable, 1)
+                assert rejected['background_compile_success'] is False and rejected['shard_had_errors'] is True
+            failed = dict(result, background_compile_success=False, compile_failure_count=1)
+            with patch.object(module, 'run', return_value=failed), \
+                 patch.object(module, 'read_shard', side_effect=AssertionError('failed run must retain its result')):
+                rejected = module._tier1_candidate_index(a, root / 'own-shard', sys.executable, 1)
+                assert rejected['compile_failure_count'] == 1 and rejected['indexing_complete'] is True
+        print(json.dumps({'operation': operation, 'status': 'passed'}))
+        sys.exit(0)
+    if operation == 'strict_default':
+        with patch.object(module, 'accelerate_tier1', side_effect=AssertionError('strict path must remain explicit')):
+            output, metrics = module.accelerate(entries, root / 'strict', sys.executable, verify_missing=False)
+        assert output == entries and metrics['batch_count'] == 0 and metrics['deferred_group_count'] == 1, metrics
+        print(json.dumps({'operation': operation, 'status': 'passed'}))
+        sys.exit(0)
+    candidate_builder = module._tier1_candidate
+    if operation in ('actual_members', 'metadata_members'):
+        variations = ('missing', 'extra', 'duplicate')
+    else:
+        variations = (operation,)
+    for variation in variations:
+        native_results = []
+        def build(group, assets, **options):
+            candidate = candidate_builder(group, assets, **options)
+            if operation in ('actual_members', 'noncanonical_include'):
+                path = pathlib.Path(candidate['file'])
+                lines = path.read_text(encoding='utf-8').splitlines(keepends=True)
+                includes = [line for line in lines if line.startswith('#include')]
+                if variation == 'missing': includes.pop()
+                elif variation == 'duplicate': includes.append(includes[0])
+                else:
+                    foreign = source / 'foreign.cpp'
+                    foreign.write_text('int foreign() { return 1; }\n', encoding='utf-8')
+                    directive = '# include' if operation == 'noncanonical_include' else '#include'
+                    includes.append(directive + ' "' + foreign.as_posix() + '"\n')
+                path.write_text(lines[0] + ''.join(includes), encoding='utf-8')
+            elif operation == 'metadata_members':
+                members = candidate['nvim_ue_members'][:]
+                if variation == 'missing': members.pop()
+                elif variation == 'duplicate': members.append(members[0])
+                else: members.append('Source/Runtime/Sample/Private/foreign.cpp')
+                candidate['nvim_ue_members'] = members
+            return candidate
+        def candidate_run(candidate, directory, executable, timeout, server_profile=None):
+            if operation == 'timeout': raise subprocess.TimeoutExpired('fixture candidate', timeout)
+            paths = re.findall(r'^#include "([^"]+)"\s*$', pathlib.Path(candidate['file']).read_text(), re.M)
+            result = {'background_compile_success': operation != 'compile_failure',
+                'missing_main_shards': ['fixture.cpp'] if operation == 'missing_main' else [],
+                'member_main_shards': paths[:-1] if operation == 'missing_member_main' else paths,
+                'shards': [], 'indexing_complete': True, 'exit_code': 0,
+                'compile_failure_count': int(operation == 'compile_failure')}
+            if operation == 'partial' and any(path.endswith('.gen.cpp') for path in paths):
+                result['background_compile_success'] = False
+                result['compile_failure_count'] = 1
+            return result
+        if operation in ('native', 'native_conflict', 'native_prefix'):
+            native_runner = module._tier1_candidate_index
+            def observed_run(*args, **kwargs):
+                result = native_runner(*args, **kwargs)
+                native_results.append(result)
+                return result
+            runner = observed_run
+        else:
+            runner = candidate_run
+        inputs = entries + ([unit('gamma', True), unit('delta', True)] if operation == 'partial' else [])
+        before = copy.deepcopy(inputs)
+        with patch.object(module, '_tier1_candidate', side_effect=build), \
+             patch.object(module, '_tier1_candidate_index', side_effect=runner) as indexed:
+            output, metrics = module.accelerate_tier1(inputs, root / variation,
+                clangd or sys.executable, max_group=8, timeout=30, budget_factor=1, **recipe_options)
+        assert inputs == before, 'qualification mutated the caller input entries'
+        assert metrics['tier'] == 1 and metrics['coverage_complete'], metrics
+        assert metrics['input_member_count'] == metrics['output_member_count'], metrics
+        coverage = lambda values: collections.Counter(member for value in values for member in
+            (value.get('nvim_ue_members') or [value['file']]))
+        assert coverage(output) == coverage(inputs), (output, inputs)
+        if operation != 'native_prefix':
+            assert exact in output and shader in output, 'exact or shader passthrough was dropped'
+        for record in metrics['groups']:
+            assert record['tier'] == 1 and record['reason'], record
+            receipt = json.loads(pathlib.Path(record['receipt']).read_text(encoding='utf-8'))
+            assert receipt['tier'] == 1 and receipt['accepted'] == record['accepted'], receipt
+            assert receipt['gates'] == record['gates'] and receipt['reason'] == record['reason'], receipt
+            if record['accepted'] or operation in ('compile_failure', 'partial', 'native_conflict'):
+                assert receipt['reusable'] is True, 'successful qualification and complete compile rejection are reusable'
+            else:
+                assert receipt['reusable'] is False, 'incomplete qualification must be retryable'
+            if receipt['candidate'] is not None:
+                assert receipt['cache_key'], receipt
+        record = metrics['groups'][0]
+        if operation in ('success', 'native', 'native_prefix', 'partial', 'repeat'):
+            assert record['accepted'] and all(record['gates'].values()), metrics
+            batch = output[0]
+            assert batch['nvim_ue_tier'] == 1 and batch['nvim_ue_members'] == a['nvim_ue_members'] + b['nvim_ue_members']
+            assert 'nvim_ue_tier1_receipt' in batch and 'nvim_ue_batch_receipt' not in batch
+            assert not module.describe_receipts([batch['nvim_ue_tier1_receipt']])['ok'], \
+                'strict frozen reader must not accept the Tier 1 diagnostic receipt'
+            assert metrics['batch_count'] == 1, metrics
+            if operation == 'partial':
+                assert not metrics['groups'][1]['accepted'] and output[-2:] == inputs[-2:], metrics
+            elif operation == 'native_prefix':
+                assert len(output) == 1, output
+            else:
+                assert len(output) == 3 and output[1:] == [exact, shader], output
+            if operation == 'repeat':
+                artifacts = [pathlib.Path(batch['file']), pathlib.Path(batch['nvim_ue_tier1_receipt'])]
+                stamps = {str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in artifacts}
+                with patch.object(module, '_tier1_candidate_index', side_effect=candidate_run) as repeated:
+                    again, repeat = module.accelerate_tier1(inputs, root / variation,
+                        sys.executable, max_group=8, timeout=30, budget_factor=1)
+                assert again == output and repeat['batch_count'] == 1 and repeated.call_count == 0, repeat
+                assert indexed.call_count == 1, 'unchanged Tier 1 inputs must reuse qualification'
+                assert repeat['cache_hits'] == 1, repeat
+                assert stamps == {str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in artifacts}, \
+                    'identical repeat must not rewrite candidate or diagnostic receipt'
+                previous_receipt = json.loads(artifacts[1].read_text(encoding='utf-8'))
+                changed_source = pathlib.Path(expected_paths[0])
+                changed_source.write_text('int alpha() { return 2; }\n', encoding='utf-8')
+                with patch.object(module, '_tier1_candidate_index', side_effect=candidate_run) as changed_run:
+                    changed, changed_metrics = module.accelerate_tier1(inputs, root / variation,
+                        sys.executable, max_group=8, timeout=30, budget_factor=1)
+                assert changed_run.call_count == 1 and changed_metrics['batch_count'] == 1, changed_metrics
+                changed_receipt_path = pathlib.Path(changed[0]['nvim_ue_tier1_receipt'])
+                assert changed_receipt_path != artifacts[1], 'changed source reused an old receipt identity'
+                changed_receipt = json.loads(changed_receipt_path.read_text(encoding='utf-8'))
+                hashes = lambda value: {module._command_key(item['path']): item['sha256'] for item in value['inputs']}
+                source_key = module._command_key(str(changed_source))
+                assert hashes(previous_receipt)[source_key] != hashes(changed_receipt)[source_key]
+                assert stamps == {str(path): (path.read_bytes(), path.stat().st_mtime_ns) for path in artifacts}, \
+                    'new qualification must preserve historical artifact bytes and timestamps'
+            if operation in ('native', 'native_prefix'):
+                assert len(native_results) == 1
+                paths = {module._command_key(path) for path in expected_paths}
+                assert paths <= {module._command_key(path) for path in native_results[0]['member_main_shards']}
+                observed_flags = {}
+                for shard_path in native_results[0]['shards']:
+                    shard = module.read_shard(shard_path)
+                    for uri, node in shard['sources'].items():
+                        key = module._command_key(str(module._uri_path(uri)))
+                        if key in paths and node['digest'] != '0000000000000000': observed_flags[key] = node['flags']
+                assert set(observed_flags) == paths and all(not flags & 2 for flags in observed_flags.values()), observed_flags
+                assert any(not flags & 1 for flags in observed_flags.values()), 'included .cpp own shards must not require IsTU'
+                print(json.dumps({'native_member_own_flags': observed_flags}))
+                if operation == 'native_prefix':
+                    descriptor = batch['nvim_ue_tier1_recipe']
+                    assert descriptor['headers'] == [str(path) for path in prefix_headers]
+                    body = pathlib.Path(batch['file']).read_text(encoding='utf-8')
+                    includes = re.findall(r'^#include "([^"\r\n]+)"$', body, re.M)
+                    assert includes == [path.as_posix() for path in prefix_headers] + expected_paths
+                    assert '-include' not in batch['arguments'] and batch['nvim_ue_members'] == a['nvim_ue_members'] + b['nvim_ue_members']
+                    receipt = json.loads(pathlib.Path(batch['nvim_ue_tier1_receipt']).read_text())
+                    assert receipt['recipe'] == descriptor and set(receipt['candidate']) == {'directory', 'file', 'arguments'}
+                    bound = {module._command_key(row['path']) for row in receipt['inputs']}
+                    assert {module._command_key(str(path)) for path in prefix_headers} <= bound
+                    artifacts = [pathlib.Path(batch['file']), pathlib.Path(batch['nvim_ue_tier1_receipt'])]
+                    stamps = [(path.read_bytes(), path.stat().st_mtime_ns) for path in artifacts]
+                    with patch.object(module, '_tier1_candidate_index', side_effect=AssertionError('native recipe repeat indexed')):
+                        repeated, repeat_metrics = module.reuse_tier1(inputs, root / variation, clangd,
+                            max_group=8, timeout=30, budget_factor=1, **recipe_options)
+                    assert repeated == output and repeat_metrics['new_proof_count'] == 0
+                    assert stamps == [(path.read_bytes(), path.stat().st_mtime_ns) for path in artifacts]
+
+        else:
+            if operation in ('original_define', 'original_extra_include'):
+                assert record['reason'] == 'tier1-noncanonical-original-wrapper', \
+                    (record['reason'], indexed.call_count)
+                assert indexed.call_count == 0, 'noncanonical originals reached candidate indexing'
+            assert output == inputs and not record['accepted'] and metrics['batch_count'] == 0, metrics
+            if operation in ('compile_failure', 'timeout'): assert not record['gates']['compile_success'], record
+            if operation in ('missing_main', 'missing_member_main'):
+                assert record['gates']['compile_success'] and not record['gates']['main_shards_complete'], record
+            if operation in ('actual_members', 'metadata_members', 'noncanonical_include'):
+                assert not record['gates']['members_equal'] and indexed.call_count == 0, record
+            if operation == 'native_conflict':
+                assert len(native_results) == 1 and module._tier1_compile_rejection(native_results[0]), native_results
+                with patch.object(module, '_tier1_candidate_index', side_effect=AssertionError('stable conflict must reuse')):
+                    repeated, repeated_metrics = module.accelerate_tier1(inputs, root / variation,
+                        clangd, max_group=8, timeout=30, budget_factor=1)
+                assert repeated == inputs and repeated_metrics['cache_hits'] == 1, repeated_metrics
+    print(json.dumps({'operation': operation, 'status': 'passed'}))
+]=]
+
+local tier1_cache_fixture = [=[
+import collections, contextlib, copy, importlib.util, json, os, pathlib, re, shutil, subprocess, sys, tempfile
+from unittest.mock import patch
+tool, operation = sys.argv[1:]
+spec = importlib.util.spec_from_file_location('verified_tier1_cache', tool)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+with tempfile.TemporaryDirectory(prefix='verified_tier1_cache_') as temporary, contextlib.ExitStack() as stack:
+    root = pathlib.Path(temporary).resolve()
+    source = root / 'Source/Runtime/Sample/Private'
+    source.mkdir(parents=True)
+    def unit(name):
+        member = source / (name + '.cpp')
+        member.write_text('int ' + name + '() { return 1; }\n', encoding='utf-8')
+        wrapper = root / ('SuperUnity.UBT.' + name + '.cpp')
+        wrapper.write_text('// Compiler-authored UBT unity membership; copied into nvim cache.\n'
+            + '#include "' + member.as_posix() + '"\n', encoding='utf-8')
+        return {'directory': str(root), 'file': str(wrapper),
+            'arguments': ['clang++', '-std=c++17', '-c', str(wrapper)],
+            'nvim_ue_module_root': 'Source/Runtime/Sample',
+            'nvim_ue_members': [module.portable_member_path(str(member))]}
+    a, b = unit('alpha'), unit('beta')
+    entries = [a, b]
+    before_entries = copy.deepcopy(entries)
+    store = root / 'proofs'
+    executable, extra = sys.executable, None
+    if operation.startswith('scope_'):
+        extra = [unit('gamma'), unit('delta')]
+        # Real executable bytes in an owned copy: this tests receipt identity,
+        # never executable capability. Every subprocess remains forbidden.
+        executable = str(root / pathlib.Path(sys.executable).name)
+        shutil.copyfile(sys.executable, executable)
+    profile = None
+    overlay = None
+    if operation == 'cache_header':
+        (source / 'Header.h').write_text('#define HEADER_CHANGED 0\n', encoding='utf-8')
+        member = source / 'alpha.cpp'
+        member.write_text('#include "Header.h"\n' + member.read_text(encoding='utf-8'), encoding='utf-8')
+    if operation == 'cache_overlay' or operation.startswith('scope_'):
+        physical = [source / 'alpha.cpp', source / 'beta.cpp', pathlib.Path(a['file']), pathlib.Path(b['file'])]
+        if extra:
+            physical += [source / 'gamma.cpp', source / 'delta.cpp'] + [pathlib.Path(entry['file']) for entry in extra]
+        raw = module._json({'version': 0, 'case-sensitive': False, 'use-external-names': True,
+            'fallthrough': True, 'roots': [{'type': 'file', 'name': path.as_posix(),
+                'external-contents': path.as_posix()} for path in physical]}).encode()
+        overlay = root / 'header-path-case' / ('header-path-case.' + module._sha(raw) + '.json')
+        overlay.parent.mkdir()
+        overlay.write_bytes(raw)
+        for entry in entries + (extra or []):
+            entry['arguments'] += ['-ivfsoverlay', str(overlay)]
+        before_entries = copy.deepcopy(entries)
+    if operation == 'cache_profile':
+        profile = {'query_driver': sys.executable, 'launch_cwd': str(root), 'enable_config': False}
+    for name in ('_index', '_prove', 'compare_graphs'):
+        stack.enter_context(patch.object(module, name, side_effect=AssertionError('Tier 1 must not call ' + name)))
+    stack.enter_context(patch.object(subprocess, 'Popen', side_effect=AssertionError('cache fixture must not spawn')))
+    failure_operations = ('cache_failure', 'cache_timeout', 'cache_process_failure', 'cache_incomplete_errors',
+        'cache_exception', 'cache_legacy_failure')
+    transient_operations = ('cache_timeout', 'cache_process_failure', 'cache_incomplete_errors', 'cache_exception')
+    def candidate_run(candidate, directory, executable, timeout, server_profile=None):
+        if operation == 'cache_exception': raise subprocess.TimeoutExpired('fixture candidate', timeout)
+        paths = re.findall(r'^#include "([^"]+)"\s*$', pathlib.Path(candidate['file']).read_text(), re.M)
+        return {'background_compile_success': operation not in failure_operations,
+            'indexing_complete': operation not in ('cache_timeout', 'cache_incomplete_errors'),
+            'exit_code': 7 if operation == 'cache_process_failure' else 0,
+            'compile_failure_count': int(operation in ('cache_failure', 'cache_incomplete_errors', 'cache_legacy_failure')),
+            'missing_main_shards': [], 'member_main_shards': paths, 'shards': []}
+    def snapshot():
+        return {str(path): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in root.rglob('*') if path.is_file()}
+    def readonly(profile_override=None):
+        existing = snapshot()
+        with patch.object(module, '_tier1_candidate_index', side_effect=AssertionError('reuse must not index')), \
+             patch.object(module, '_write', side_effect=AssertionError('reuse must not call write helper')), \
+             patch.object(pathlib.Path, 'mkdir', side_effect=AssertionError('reuse must not create directories')), \
+             patch.object(pathlib.Path, 'write_bytes', side_effect=AssertionError('reuse must not write bytes')), \
+             patch.object(pathlib.Path, 'write_text', side_effect=AssertionError('reuse must not write text')):
+            output, metrics = module.reuse_tier1(entries, store, sys.executable,
+                max_group=8, timeout=30, budget_factor=1,
+                server_profile=profile if profile_override is None else profile_override)
+        assert existing == snapshot(), 'read-only reuse changed fixture files or timestamps'
+        assert entries == before_entries, 'read-only reuse mutated caller entries'
+        return output, metrics
+    if operation == 'cache_miss':
+        output, metrics = readonly()
+        assert output == entries and metrics['batch_count'] == metrics['cache_hits'] == 0, metrics
+        assert not store.exists(), 'a cache miss created the proof store'
+        print(json.dumps({'operation': operation, 'status': 'passed'}))
+        sys.exit(0)
+    with patch.object(module, '_tier1_candidate_index', side_effect=candidate_run) as indexed:
+        output, metrics = module.accelerate_tier1(entries, store, executable,
+            max_group=8, timeout=30, budget_factor=1, server_profile=profile)
+    assert indexed.call_count == 1 and metrics['cache_hits'] == 0, metrics
+    first_record = metrics['groups'][0]
+    receipt_path = pathlib.Path(first_record['receipt'])
+    receipt = json.loads(receipt_path.read_text(encoding='utf-8'))
+    assert receipt['schema'] == 1 and receipt['tier'] == 1, receipt
+    assert receipt['reusable'] is (operation not in transient_operations), receipt
+    assert re.fullmatch('[0-9a-f]{64}', receipt['cache_key']), receipt
+    index_path = store / 'tier1/receipts' / (receipt['cache_key'] + '.json')
+    assert index_path.is_file(), 'Tier 1 deterministic cache index is missing'
+    assert receipt_path.name.startswith('receipt.'), 'publication must bind an immutable receipt'
+    assert receipt['original_entries'] == [module._native(entry) for entry in entries]
+    assert receipt['candidate_sha256'] == module._sha(pathlib.Path(receipt['candidate']['file']).read_bytes())
+    bound = {module._command_key(item['path']) for item in receipt['inputs']}
+    assert all(module._command_key(str(path)) in bound
+        for path in [pathlib.Path(a['file']), pathlib.Path(b['file']), source / 'alpha.cpp', source / 'beta.cpp'])
+    if overlay is not None:
+        assert module._command_key(str(overlay)) in bound, 'owned overlay bytes must be bound'
+    if operation in failure_operations:
+        assert output == entries and not first_record['accepted'], metrics
+    else:
+        assert metrics['batch_count'] == 1 and len(output) == 1 and first_record['accepted'], metrics
+        assert 'nvim_ue_batch_receipt' not in output[0]
+    if operation.startswith('scope_'):
+        second_store = root / 'second-proofs'
+        with patch.object(module, '_tier1_candidate_index', side_effect=candidate_run):
+            second_output, second_metrics = module.accelerate_tier1(extra, second_store, executable,
+                max_group=8, timeout=30, budget_factor=1)
+        assert second_metrics['batch_count'] == 1
+        groups = [(entries, store, output), (extra, second_store, second_output)]
+        read_bytes, sha = pathlib.Path.read_bytes, module._sha
+        reads, hashes = collections.Counter(), collections.Counter()
+        tool_path = pathlib.Path(executable)
+        tool_raw, overlay_raw = read_bytes(tool_path), read_bytes(overlay)
+        def observed_read(path):
+            reads[module._command_key(str(path))] += 1
+            return read_bytes(path)
+        def observed_sha(raw):
+            hashes[raw] += 1
+            return sha(raw)
+        def quiet_snapshot():
+            return {str(path): (read_bytes(path), path.stat().st_mtime_ns)
+                    for path in root.rglob('*') if path.is_file()}
+        def reuse(index=0, selected=None, expected=True):
+            originals, directory, admitted = groups[index]
+            selected = originals if selected is None else selected
+            before = quiet_snapshot()
+            with patch.object(module, '_tier1_candidate_index', side_effect=AssertionError('scope reuse indexed')), \
+                 patch.object(module, '_write', side_effect=AssertionError('scope reuse wrote')):
+                result, metrics = module.reuse_tier1(selected, directory, executable, max_group=8, budget_factor=1)
+            assert before == quiet_snapshot(), 'scope reuse changed actual bytes or mtimes'
+            assert result == (admitted if expected else selected), metrics
+            assert metrics['batch_count'] == metrics['cache_hits'] == int(expected), metrics
+            return metrics
+        def same_stamp_write(path, raw, stamp):
+            path.write_bytes(raw)
+            os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+            assert path.stat().st_size == len(raw) and path.stat().st_mtime_ns == stamp.st_mtime_ns
+        with patch.object(pathlib.Path, 'read_bytes', observed_read), patch.object(module, '_sha', observed_sha):
+            if operation == 'scope_lifecycle':
+                with module.tier1_overlay_scope():
+                    reuse(0)
+                    with module.tier1_overlay_scope(): reuse(1)
+                    reuse(0)
+                    assert hashes[tool_raw] == hashes[overlay_raw] == 1, 'nested groups repeated unchanged blob SHA'
+                    assert reads[module._command_key(executable)] == 3, 'every public reuse must read actual tool bytes'
+                    assert reads[module._command_key(str(overlay))] >= 6, 'overlay accesses must keep reading actual bytes'
+                    member_raw = read_bytes(source / 'alpha.cpp')
+                    assert hashes[member_raw] >= 2, 'source hashes must not use the tool/overlay optimization'
+                    assert len(module._TIER1_BLOB_MEMO) == 2, 'two blob kinds must have independent bounded slots'
+                    # Strict cache-only calls remain real strict entrypoints;
+                    # they must hash the tool even while a Tier 1 scope exists.
+                    for _ in range(2):
+                        retained, deferred = module.accelerate(entries, root / 'strict-miss', executable,
+                            max_group=2, timeout=30, verify_missing=False)
+                        assert retained == entries and deferred['deferred_group_count'] == 1
+                    assert hashes[tool_raw] == 3
+                assert module._TIER1_BLOB_MEMO == {} and module._TIER1_OVERLAY_SCOPE_DEPTH == 0, \
+                    'normal outer exit must immediately release large blob references'
+                previous_reads = reads[module._command_key(executable)]
+                previous_overlay_reads = reads[module._command_key(str(overlay))]
+                reuse(1)
+                assert hashes[tool_raw] == 4 and hashes[overlay_raw] == 2, 'independent calls must start from fresh bytes'
+                assert reads[module._command_key(executable)] == previous_reads + 1
+                assert reads[module._command_key(str(overlay))] > previous_overlay_reads
+                class InterruptedScope(Exception): pass
+                try:
+                    with module.tier1_overlay_scope():
+                        reuse(0)
+                        raise InterruptedScope()
+                except InterruptedScope:
+                    pass
+                assert module._TIER1_BLOB_MEMO == {} and module._TIER1_OVERLAY_SCOPE_DEPTH == 0, \
+                    'exception outer exit must immediately release large blob references'
+                before_tool, before_overlay = hashes[tool_raw], hashes[overlay_raw]
+                reuse(0)
+                assert hashes[tool_raw] == before_tool + 1 and hashes[overlay_raw] == before_overlay + 1, \
+                    'exception exit leaked a digest into the next public call'
+            elif operation == 'scope_mutations':
+                with module.tier1_overlay_scope():
+                    reuse(0)
+                    stamp = overlay.stat()
+                    changed = overlay_raw.replace(b'"version":0', b'"version":1')
+                    assert changed != overlay_raw and len(changed) == len(overlay_raw)
+                    same_stamp_write(overlay, changed, stamp)
+                    rejected = reuse(0, expected=False)
+                    assert 'header-overlay-content-hash-mismatch' in rejected['groups'][0]['reason']
+                    assert hashes[changed] > 0, 'same-stat overlay change bypassed SHA'
+                    same_stamp_write(overlay, overlay_raw, stamp)
+                    reuse(0)
+                    assert hashes[overlay_raw] == 2, 'A/B/A must rehash current A after intervening B'
+                    stamp = tool_path.stat()
+                    changed_tool = tool_raw[:-1] + bytes([tool_raw[-1] ^ 1])
+                    same_stamp_write(tool_path, changed_tool, stamp)
+                    reuse(0, expected=False)
+                    assert hashes[changed_tool] == 1, 'same-stat tool change bypassed SHA'
+                    same_stamp_write(tool_path, tool_raw, stamp)
+                    reuse(0)
+                    assert hashes[tool_raw] == 2, 'tool A/B/A must not retain a multi-value history'
+                    member = source / 'alpha.cpp'
+                    stamp, member_raw = member.stat(), read_bytes(member)
+                    changed_member = member_raw.replace(b'return 1', b'return 2')
+                    same_stamp_write(member, changed_member, stamp)
+                    reuse(0, expected=False)
+                    assert hashes[changed_member] > 0, 'source changed under an active outer scope'
+                    same_stamp_write(member, member_raw, stamp)
+                    reuse(0)
+                reuse(0)
+            elif operation == 'scope_rotation':
+                variants = []
+                for number in range(2):
+                    added = root / ('extra%d.h' % number)
+                    added.write_text('// real extra overlay target\n', encoding='utf-8')
+                    document = json.loads(overlay_raw)
+                    document['roots'].append({'type': 'file', 'name': added.as_posix(), 'external-contents': added.as_posix()})
+                    raw = module._json(document).encode()
+                    path = overlay.parent / ('header-path-case.' + sha(raw) + '.json')
+                    path.write_bytes(raw)
+                    selected = copy.deepcopy(entries)
+                    for entry in selected: entry['arguments'][-1] = str(path)
+                    variants.append((selected, raw))
+                with module.tier1_overlay_scope():
+                    reuse(0)
+                    for selected, raw in variants:
+                        reuse(0, selected=selected, expected=False)  # New argv needs its own qualification.
+                        assert hashes[raw] == 1
+                        assert len(module._TIER1_BLOB_MEMO) == 2, 'rotating overlays grew retained blob memory'
+                    reuse(0)
+                    assert hashes[overlay_raw] == 2, 'an older overlay must miss the single last-value slot'
+                    assert hashes[tool_raw] == 1, 'overlay rotation evicted the independent tool slot'
+                    assert reads[module._command_key(executable)] == 4, 'cache hits must still read the tool'
+            else:
+                raise AssertionError(operation)
+        print(json.dumps({'operation': operation, 'status': 'passed', 'scope': 'public cache/byte integrity; no native capability claim'}))
+        sys.exit(0)
+    if operation in ('cache_hit', 'cache_failure'):
+        existing = snapshot()
+        with patch.object(module, '_tier1_candidate_index', side_effect=AssertionError('cache hit must not reindex')):
+            repeated, repeated_metrics = module.accelerate_tier1(entries, store, sys.executable,
+                max_group=8, timeout=30, budget_factor=1, server_profile=profile)
+        assert repeated == output and repeated_metrics['cache_hits'] == 1, repeated_metrics
+        assert existing == snapshot(), 'a cache hit rewrote a candidate, cache index or receipt'
+        reused, reused_metrics = readonly()
+        assert reused == output and reused_metrics['cache_hits'] == 1, reused_metrics
+        if operation == 'cache_failure':
+            assert reused_metrics['groups'][0]['reason'] == first_record['reason'], reused_metrics
+            assert not reused_metrics['groups'][0]['accepted'], reused_metrics
+        print(json.dumps({'operation': operation, 'status': 'passed'}))
+        sys.exit(0)
+    if operation in transient_operations or operation == 'cache_legacy_failure':
+        if operation == 'cache_legacy_failure':
+            receipt.pop('compile_result', None)
+            receipt_path.write_text(module._json(receipt), encoding='utf-8')
+            index = json.loads(index_path.read_text(encoding='utf-8'))
+            index['receipt_sha256'] = module._sha(receipt_path.read_bytes())
+            index_path.write_text(module._json(index), encoding='utf-8')
+        reused, reuse_metrics = readonly()
+        assert reused == entries and reuse_metrics['cache_hits'] == 0, reuse_metrics
+        assert reuse_metrics['groups'][0]['deferred'], 'unclassified rejection must remain eligible for proof'
+        successful = {'background_compile_success': True, 'missing_main_shards': [],
+            'member_main_shards': [str(source / 'alpha.cpp'), str(source / 'beta.cpp')], 'shards': []}
+        with patch.object(module, '_tier1_candidate_index', return_value=successful) as retried:
+            recovered, recovered_metrics = module.accelerate_tier1(entries, store, sys.executable,
+                max_group=8, timeout=30, budget_factor=1, server_profile=profile)
+        assert retried.call_count == 1 and recovered_metrics['batch_count'] == 1, recovered_metrics
+        assert len(recovered) == 1
+        print(json.dumps({'operation': operation, 'status': 'passed'}))
+        sys.exit(0)
+    if operation == 'cache_source':
+        member = source / 'alpha.cpp'
+        stamp = member.stat()
+        raw = member.read_bytes()
+        member.write_bytes(raw.replace(b'return 1', b'return 2'))
+        os.utime(member, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        assert member.stat().st_size == len(raw) and member.stat().st_mtime_ns == stamp.st_mtime_ns
+    elif operation == 'cache_wrapper':
+        wrapper = pathlib.Path(a['file'])
+        raw = wrapper.read_bytes()
+        wrapper.write_bytes(raw.replace(b'\r\n', b'\n') if b'\r\n' in raw else raw.replace(b'\n', b'\r\n'))
+        assert module._tier1_ubt_members(a), 'wrapper remains canonical after newline-only byte change'
+    elif operation == 'cache_overlay':
+        stamp = overlay.stat()
+        overlay.write_bytes(overlay.read_bytes() + b' ')
+        os.utime(overlay, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+    elif operation == 'cache_receipt_tamper':
+        receipt_path.write_bytes(receipt_path.read_bytes() + b' ')
+    elif operation == 'cache_candidate_tamper':
+        candidate_path = pathlib.Path(output[0]['file'])
+        candidate_path.write_bytes(candidate_path.read_bytes() + b'#error changed candidate\n')
+    elif operation in ('cache_missing_candidate_hash', 'cache_changed_candidate_hash'):
+        if operation == 'cache_missing_candidate_hash':
+            del receipt['candidate_sha256']
+        else:
+            receipt['candidate_sha256'] = '0' * 64
+        receipt_path.write_text(module._json(receipt), encoding='utf-8')
+        index = json.loads(index_path.read_text(encoding='utf-8'))
+        index['receipt_sha256'] = module._sha(receipt_path.read_bytes())
+        index_path.write_text(module._json(index), encoding='utf-8')
+    elif operation == 'cache_environment':
+        stack.enter_context(patch.dict(os.environ, {'CPATH': str(root / 'different-includes')}))
+    elif operation == 'cache_tool':
+        read_bytes = pathlib.Path.read_bytes
+        executable_key = module._command_key(str(pathlib.Path(sys.executable).resolve()))
+        def changed_tool_bytes(path):
+            raw = read_bytes(path)
+            return raw + b'changed-tool-identity' if module._command_key(str(path.resolve())) == executable_key else raw
+        stack.enter_context(patch.object(pathlib.Path, 'read_bytes', changed_tool_bytes))
+    elif operation == 'cache_header':
+        # Accepted policy: Tier 1 binds wrappers and member sources, not header bytes.
+        header = source / 'Header.h'
+        header.write_text('#define HEADER_CHANGED 1\n', encoding='utf-8')
+        reused, reused_metrics = readonly()
+        assert reused == output and reused_metrics['cache_hits'] == 1, reused_metrics
+        header.write_text('#define HEADER_CHANGED 2\n', encoding='utf-8')
+        reused, reused_metrics = readonly()
+        assert reused == output and reused_metrics['cache_hits'] == 1, reused_metrics
+        assert module._command_key(str(header)) not in bound
+        print(json.dumps({'operation': operation, 'status': 'passed'}))
+        sys.exit(0)
+    changed_profile = dict(profile, query_driver=profile['query_driver'] + '/*') if operation == 'cache_profile' else None
+    reused, reused_metrics = readonly(changed_profile)
+    assert reused == entries and reused_metrics['batch_count'] == reused_metrics['cache_hits'] == 0, reused_metrics
+    if operation in ('cache_source', 'cache_missing_candidate_hash', 'cache_changed_candidate_hash'):
+        with patch.object(module, '_tier1_candidate_index', side_effect=candidate_run) as reindexed:
+            fresh, fresh_metrics = module.accelerate_tier1(entries, store, sys.executable,
+                max_group=8, timeout=30, budget_factor=1, server_profile=profile)
+        assert reindexed.call_count == 1 and fresh_metrics['batch_count'] == 1, fresh_metrics
+        fresh_receipt = json.loads(pathlib.Path(fresh[0]['nvim_ue_tier1_receipt']).read_text(encoding='utf-8'))
+        assert fresh_receipt['candidate_sha256'] == module._sha(pathlib.Path(fresh[0]['file']).read_bytes())
+        if operation == 'cache_source':
+            assert fresh[0]['nvim_ue_tier1_receipt'] != str(receipt_path), 'changed source reused a stale immutable receipt'
+    print(json.dumps({'operation': operation, 'status': 'passed'}))
+]=]
+
+local function run_tier1_cache_fixture(operation)
+  local python = vim.fn.exepath("python")
+  if python == "" then python = vim.fn.exepath("python3") end
+  if python == "" then
+    t.skip("Tier 1 cache fixture", "Python unavailable", { native = true })
+    return
+  end
+  local script = vim.fn.tempname() .. "_verified_tier1_cache.py"
+  local stream = assert(io.open(script, "wb"))
+  stream:write(tier1_cache_fixture)
+  stream:close()
+  local result = vim.system({ python, "-B", "-I", script,
+    vim.fn.stdpath("config") .. "/tools/cdb_verified_batch.py", operation }, { text = true }):wait()
+  pcall(vim.fn.delete, script)
+  t.assert_eq(result.code, 0, (result.stderr or "") .. (result.stdout or ""))
+end
+
+local function run_tier1_fixture(operation, clangd)
+  local python = vim.fn.exepath("python")
+  if python == "" then python = vim.fn.exepath("python3") end
+  if python == "" then
+    t.skip("Tier 1 verified batch fixture", "Python unavailable", { native = true })
+    return
+  end
+  local script = vim.fn.tempname() .. "_verified_tier1.py"
+  local stream = assert(io.open(script, "wb"))
+  stream:write(tier1_fixture)
+  stream:close()
+  local result = vim.system({ python, "-B", "-I", script,
+    vim.fn.stdpath("config") .. "/tools/cdb_verified_batch.py", clangd or "", operation }, { text = true }):wait()
+  pcall(vim.fn.delete, script)
+  t.assert_eq(result.code, 0, (result.stderr or "") .. (result.stdout or ""))
+end
 
 local function run_fixture(operation, clangd)
   local python = vim.fn.exepath("python")
@@ -980,14 +1682,125 @@ local function run_fixture(operation, clangd)
 end
 
 t.describe("verified compiler-context UBT batching", function()
+  t.it("admits Tier 1 candidates through explicit gates without original indexing or graph comparison", function()
+    run_tier1_fixture("success")
+  end)
+  t.it("retains the original UBT block when the Tier 1 candidate compiler fails", function()
+    run_tier1_fixture("compile_failure")
+  end)
+  t.it("retains the original UBT block and visible receipt reason when Tier 1 indexing times out", function()
+    run_tier1_fixture("timeout")
+  end)
+  t.it("retains the original UBT block when the Tier 1 runner reports missing main shards", function()
+    run_tier1_fixture("missing_main")
+  end)
+  t.it("requires a real own shard for every Tier 1 member despite an empty missing-main report", function()
+    run_tier1_fixture("missing_member_main")
+  end)
+  t.it("rejects missing, extra and duplicate actual Tier 1 includes independently of metadata", function()
+    run_tier1_fixture("actual_members")
+  end)
+  t.it("rejects missing, extra and duplicate Tier 1 member metadata before indexing", function()
+    run_tier1_fixture("metadata_members")
+  end)
+  t.it("rejects noncanonical extra Tier 1 includes before indexing", function()
+    run_tier1_fixture("noncanonical_include")
+  end)
+  t.it("retains original UBT wrappers with extra defines before Tier 1 flattening", function()
+    run_tier1_fixture("original_define")
+  end)
+  t.it("retains original UBT wrappers with noncanonical extra includes before Tier 1 flattening", function()
+    run_tier1_fixture("original_extra_include")
+  end)
+  t.it("preserves complete source coverage when one Tier 1 block passes and another falls back", function()
+    run_tier1_fixture("partial")
+  end)
+  t.it("validates Tier 1 own digests and errors without requiring the enclosing-TU flag", function()
+    run_tier1_fixture("own_shard_contract")
+  end)
+  t.it("keeps the default accelerate path under the strict proof policy", function()
+    run_tier1_fixture("strict_default")
+  end)
+  t.it("reuses qualified Tier 1 repeats without indexing or rewriting identical assets and receipts", function()
+    run_tier1_fixture("repeat")
+  end)
+  t.it("reuses Tier 1 cache hits without indexing, writes or timestamp changes", function()
+    run_tier1_cache_fixture("cache_hit")
+  end)
+  t.it("shares Tier 1 blob SHA work across nested public reuse while rereading bytes and clearing on scope exits", function()
+    run_tier1_cache_fixture("scope_lifecycle")
+  end)
+  t.it("rejects same-stat overlay, tool and source mutations inside a Tier 1 scope and rechecks restored bytes", function()
+    run_tier1_cache_fixture("scope_mutations")
+  end)
+  t.it("bounds Tier 1 blob retention while rotating real overlays without evicting the independent tool slot", function()
+    run_tier1_cache_fixture("scope_rotation")
+  end)
+  t.it("retains original UBTs on a read-only Tier 1 cache miss without creating files", function()
+    run_tier1_cache_fixture("cache_miss")
+  end)
+  t.it("invalidates Tier 1 member bytes even when size and mtime are unchanged", function()
+    run_tier1_cache_fixture("cache_source")
+  end)
+  t.it("invalidates Tier 1 original wrapper byte changes that preserve canonical membership", function()
+    run_tier1_cache_fixture("cache_wrapper")
+  end)
+  t.it("invalidates Tier 1 owned overlay byte changes", function()
+    run_tier1_cache_fixture("cache_overlay")
+  end)
+  t.it("reuses failed Tier 1 qualification without reindexing and keeps its reason visible", function()
+    run_tier1_cache_fixture("cache_failure")
+  end)
+  for _, failure in ipairs({ "cache_timeout", "cache_process_failure", "cache_incomplete_errors", "cache_exception",
+    "cache_legacy_failure" }) do
+    t.it("retries Tier 1 qualification after an inconclusive rejection: " .. failure, function()
+      run_tier1_cache_fixture(failure)
+    end)
+  end
+  t.it("invalidates Tier 1 receipts when the clangd tool identity changes", function()
+    run_tier1_cache_fixture("cache_tool")
+  end)
+  t.it("invalidates Tier 1 receipts when the normalized server profile changes", function()
+    run_tier1_cache_fixture("cache_profile")
+  end)
+  t.it("invalidates Tier 1 receipts when compiler include environment changes", function()
+    run_tier1_cache_fixture("cache_environment")
+  end)
+  t.it("rejects changed Tier 1 immutable receipt bytes during read-only reuse", function()
+    run_tier1_cache_fixture("cache_receipt_tamper")
+  end)
+  t.it("rejects changed Tier 1 candidate bytes without repairing them during read-only reuse", function()
+    run_tier1_cache_fixture("cache_candidate_tamper")
+  end)
+  t.it("privately requalifies legacy Tier 1 receipts missing a candidate content hash", function()
+    run_tier1_cache_fixture("cache_missing_candidate_hash")
+  end)
+  t.it("privately requalifies Tier 1 receipts with a noncanonical candidate content hash", function()
+    run_tier1_cache_fixture("cache_changed_candidate_hash")
+  end)
+  t.it("keeps Tier 1 qualification reusable after header-only edits under the accepted policy", function()
+    run_tier1_cache_fixture("cache_header")
+  end)
   t.it("interns exact read-only file records without losing same-URI bindings or changing graph JSON", function()
     run_fixture("intern_records", "")
+  end)
+  t.it("checks complete forced-prefix order, duplicate operands and recipe body authority using real files", function()
+    run_tier1_fixture("prefix_contract", "")
   end)
   local discovered = require("utils.ue_goto.semantic_sidecar_libclang").discover_toolchain()
   if not discovered.ok then
     t.skip("native verified batching", discovered.reason, { native = true })
     return
   end
+  t.it("indexes a tiny native Tier 1 candidate with own shards for both included source members", function()
+    run_tier1_fixture("native", discovered.clangd_path)
+  end)
+  t.it("indexes an ordered forced-prefix Tier 1 recipe and reuses its bound headers without a second native run", function()
+    run_tier1_fixture("native_prefix", discovered.clangd_path)
+  end)
+  t.it("caches a completed native Tier 1 compile conflict without repeating compiler work", function()
+    run_tier1_fixture("native_conflict", discovered.clangd_path)
+  end)
   t.it("shares identical independent native header records while preserving graph output and cached loads", function()
     run_fixture("intern_native", discovered.clangd_path)
   end)
@@ -996,6 +1809,15 @@ t.describe("verified compiler-context UBT batching", function()
   end)
   t.it("proves a compatible batch, preserves other entries and repeats without artifact rewrites", function()
     run_fixture("pass", discovered.clangd_path)
+  end)
+  t.it("proves a source/generated batch with a complete receipt and read-only invalidating cache reuse", function()
+    run_fixture("mixed_pass", discovered.clangd_path)
+  end)
+  t.it("retains source/generated originals when the merged candidate has a static name collision", function()
+    run_fixture("mixed_conflict", discovered.clangd_path)
+  end)
+  t.it("rejects source/generated overload pollution even when the merged compiler accepts it", function()
+    run_fixture("mixed_overload", discovered.clangd_path)
   end)
   t.it("preserves distinct file identity for byte-identical pragma-once headers", function()
     run_fixture("distinct_identical", discovered.clangd_path)

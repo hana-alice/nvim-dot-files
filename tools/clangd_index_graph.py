@@ -151,7 +151,12 @@ def read_shard(path):
     or None). File I/O failures retain their usual OSError type. Digest is the
     eight on-disk bytes as hex, not an integer or a SHA hash.
     """
-    chunks = _chunks(Path(path).read_bytes())
+    return decode_shard(Path(path).read_bytes())
+
+
+def decode_shard(raw):
+    """Decode the exact bytes already read by a collector, without file I/O."""
+    chunks = _chunks(raw)
     strings = _strings(chunks[b"stri"])
     result = {"version": VERSION, "symbols": [], "refs": [], "relations": [],
               "sources": {}, "command": None}

@@ -1214,6 +1214,12 @@
   → `docs/cpp-index-restart-investigation.md`；`tools/clangd_diagnostic_compat.py`；
     `openspec/specs/macos-ios-cdb-semantic-prepare/spec.md`；`tests/cases/ue_cdb_diagnostic_compat_spec.lua`。
 
+- **K75 — Unity 成员变为 exact TU 后仍可能命中旧非 TU shard**
+  实证：clangd 22.1.5 对同字节旧缓存按 digest 复用，命令或主文件角色改变不保证重索引。
+  缓存存在不能证明 exact 已编译；缺少可选 `cmdl` 也不能单独判错。后续修复须先确认对应
+  writer 退出，再重验身份并仅处理目标 own shard；不变发布保持 no-op。自动修复尚未落地。
+  → `openspec/specs/cpp-semantic-index-coverage/spec.md`「原生缓存角色变化」。
+
 ## 三、约束（Constraints）
 
 承重项。所有贡献都必须遵守。

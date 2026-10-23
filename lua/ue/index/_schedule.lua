@@ -55,6 +55,26 @@ return function(M, core)
     return true
   end
 
+  M.retry_index_writer = function(ctx, phase, reason, opts)
+    if not tostring(reason):match("^owned by live process ") then return false end
+    opts = opts or {}
+    local timer_key = core.deps.status_root_key(ctx) .. "::" .. phase
+    -- A live writer is temporary contention, not a failed delivery promise.
+    M.schedule_index_phase(ctx, phase, M.ADMISSION_RETRY_MS, { protect = opts.protect == true
+      or (RT.protected_deadlines and RT.protected_deadlines[timer_key] == true) })
+    return true
+  end
+
+  M.consume_index_phase = function(ctx, phase, state)
+    -- Queue draining can win before the retry deadline. Consume that timer with
+    -- this start so it cannot enqueue the same phase again behind the active job.
+    local timer_key = core.deps.status_root_key(ctx) .. "::" .. phase
+    local timer = RT.timers and RT.timers[timer_key]
+    if timer then timer:stop(); timer:close(); RT.timers[timer_key] = nil end
+    if RT.protected_deadlines then RT.protected_deadlines[timer_key] = nil end
+    state.queue[phase] = nil
+  end
+
   --- Shared start gate for timer deadlines AND queued-drain starts.
   M.admit_index_phase_start = function(ctx, phase, opts)
     opts = opts or {}
@@ -140,7 +160,7 @@ return function(M, core)
       -- The deadline answers WHEN; the shared gate answers WHETHER. Queued
       -- drain uses this same function, so no second start path can bypass it.
       if not M.admit_index_phase_start(ctx, phase, { protect = protect_again }) then return end
-      M.build_phase_async(ctx, phase)
+      M.build_phase_async(ctx, phase, { protect = protect_again })
     end))
   end
 

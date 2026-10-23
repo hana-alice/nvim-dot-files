@@ -6,6 +6,7 @@ assertion that compilation or graph equivalence succeeded. Never attaches to
 or controls the user's compiler process.
 """
 import argparse
+from contextlib import ExitStack
 import ctypes
 from ctypes import wintypes
 import hashlib
@@ -13,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import subprocess
 import shutil
 import threading
@@ -59,33 +61,78 @@ def normalize_server_profile(profile):
     return {'query_driver': query, 'launch_cwd': Path(cwd).resolve().as_posix(), 'enable_config': False}
 
 
-def run(cdb_dir, out_dir, trigger, clangd, timeout=90, jobs=1, server_profile=None):
+def _position_encoding(result, requested):
+    capabilities = result.get('capabilities', {}) if isinstance(result, dict) else {}
+    standard = capabilities.get('positionEncoding')
+    extension = result.get('offsetEncoding', capabilities.get('offsetEncoding')) if isinstance(result, dict) else None
+    values = [value for value in (standard, extension) if value is not None]
+    valid = all(value in ('utf-8', 'utf-16', 'utf-32') for value in values)
+    consistent = valid and len(set(values)) <= 1
+    return {'requested': requested, 'standard': standard, 'extension': extension,
+        'effective': (values[0] if values else 'utf-16') if consistent else None,
+        'source': ('initialize-response' if values else 'protocol-default') if consistent else 'conflicting-response'}
+
+
+def _background_progress(events):
+    opened = begins = ends = pairs = 0
+    errors = []
+    for event in events:
+        if event.get('token') != 'backgroundIndexProgress':
+            continue
+        kind = event.get('value', {}).get('kind')
+        if kind == 'begin':
+            if opened:
+                errors.append('overlapping-begin')
+            opened += 1
+            begins += 1
+        elif kind == 'end':
+            ends += 1
+            if opened:
+                opened -= 1
+                pairs += 1
+            else:
+                errors.append('unpaired-end')
+    return {'token': 'backgroundIndexProgress', 'begins': begins, 'ends': ends,
+        'pairs': pairs, 'open': opened, 'errors': errors,
+        'complete': pairs > 0 and opened == 0 and not errors}
+
+
+def run(cdb_dir, out_dir, trigger, clangd, timeout=90, jobs=1, server_profile=None,
+        *, position_encoding=None, cache_environment=None, require_main_evidence=False):
     cdb_dir, out_dir, trigger = (Path(path).resolve() for path in (cdb_dir, out_dir, trigger))
+    if position_encoding not in (None, 'utf-8', 'utf-16', 'utf-32'):
+        raise ValueError('unsupported-position-encoding')
     profile = normalize_server_profile(server_profile)
     out_dir.mkdir(parents=True, exist_ok=True)
-    environment = out_dir / 'environment'
-    environment.mkdir(exist_ok=True)
+    environment = Path(cache_environment).resolve() if cache_environment is not None else out_dir / 'environment'
+    environment.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env.update({'LOCALAPPDATA': str(environment), 'XDG_CACHE_HOME': str(environment / 'cache'),
                 'TEMP': str(environment), 'TMP': str(environment)})
     entries = json.loads((cdb_dir / 'compile_commands.json').read_text(encoding='utf-8-sig'))
+    main_paths = {os.path.normcase(str((Path(entry['directory']) / entry['file']).resolve())) for entry in entries}
     command = [str(clangd), '--compile-commands-dir=' + str(cdb_dir), '--background-index',
                '--enable-config=false', '-j=' + str(max(1, int(jobs))), '--log=info']
     if profile:
         command.append('--query-driver=' + profile['query_driver'])
     launch_cwd = profile['launch_cwd'] if profile else str(cdb_dir)
     started = time.monotonic()
-    process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, cwd=launch_cwd, env=env,
-        creationflags=(subprocess.CREATE_NO_WINDOW | subprocess.IDLE_PRIORITY_CLASS) if os.name == 'nt' else 0)
-    spawn_seconds = time.monotonic() - started
+    process = None
     messages = queue.Queue()
-    stdout_log = (out_dir / 'lsp-received.ndjson').open('w', encoding='utf-8')
-    sent_log = (out_dir / 'lsp-sent.ndjson').open('w', encoding='utf-8')
-    stderr_log = (out_dir / 'clangd.stderr.log').open('wb')
+    logs = ExitStack()
+    try:
+        stdout_log = logs.enter_context((out_dir / 'lsp-received.ndjson').open('w', encoding='utf-8'))
+        sent_log = logs.enter_context((out_dir / 'lsp-sent.ndjson').open('w', encoding='utf-8'))
+        stderr_log = logs.enter_context((out_dir / 'clangd.stderr.log').open('wb'))
+    except BaseException:
+        logs.close()
+        raise
     stderr_lines = deque(maxlen=512)
     compile_failures = []
     compile_failure_count = 0
+    observer_errors, observed_progress, main_events, loaded_cdb_events = [], [], [], []
+    observer_eof = {'stdout': False, 'stderr': False}
+    encoding = None
 
     def read_stdout():
         try:
@@ -94,34 +141,54 @@ def run(cdb_dir, out_dir, trigger, clangd, timeout=90, jobs=1, server_profile=No
                 while True:
                     line = process.stdout.readline()
                     if not line:
+                        if headers:
+                            raise EOFError('incomplete LSP headers')
+                        observer_eof['stdout'] = True
                         return
                     if line in (b'\r\n', b'\n'):
                         break
                     key, value = line.decode('ascii').split(':', 1)
                     headers[key.lower()] = value.strip()
                 body = process.stdout.read(int(headers['content-length']))
+                if len(body) != int(headers['content-length']):
+                    raise EOFError('incomplete LSP body')
                 message = json.loads(body)
                 stdout_log.write(json.dumps({'seconds': round(time.monotonic() - started, 4), 'message': message}) + '\n')
                 stdout_log.flush()
+                if message.get('method') == '$/progress':
+                    observed_progress.append({'seconds': round(time.monotonic() - started, 4), **message['params']})
                 messages.put(message)
         except Exception as error:
+            observer_errors.append({'channel': 'stdout', 'error': repr(error)})
             messages.put({'reader_error': repr(error)})
 
     def read_stderr():
         nonlocal compile_failure_count
-        for line in iter(process.stderr.readline, b''):
-            stderr_log.write(line)
-            stderr_log.flush()
-            decoded = line.decode('utf-8', errors='replace').rstrip()
-            stderr_lines.append(decoded)
-            if 'Failed to compile ' in decoded:
-                compile_failure_count += 1
-                if len(compile_failures) < 32:
-                    compile_failures.append(decoded)
+        try:
+            for line in iter(process.stderr.readline, b''):
+                stderr_log.write(line)
+                stderr_log.flush()
+                decoded = line.decode('utf-8', errors='replace').rstrip()
+                stderr_lines.append(decoded)
+                loaded = re.search(r'\bLoaded compilation database from (.+)$', decoded)
+                if loaded:
+                    loaded_cdb_events.append({'path': loaded.group(1),
+                        'seconds': round(time.monotonic() - started, 4), 'line': decoded})
+                indexed = re.search(r'\bIndexed (.+) \(\d+ symbols, \d+ refs, \d+ files\)$', decoded)
+                if indexed:
+                    main = os.path.normcase(str(Path(indexed.group(1)).resolve()))
+                    if main in main_paths:
+                        main_events.append({'path': main, 'seconds': round(time.monotonic() - started, 4), 'line': decoded})
+                if 'Failed to compile ' in decoded:
+                    compile_failure_count += 1
+                    if len(compile_failures) < 32:
+                        compile_failures.append(decoded)
+            observer_eof['stderr'] = True
+        except Exception as error:
+            observer_errors.append({'channel': 'stderr', 'error': repr(error)})
 
     readers = [threading.Thread(target=read_stdout, daemon=True), threading.Thread(target=read_stderr, daemon=True)]
-    for reader in readers:
-        reader.start()
+    started_readers = []
 
     def send(message):
         encoded = json.dumps(message, separators=(',', ':')).encode('utf-8')
@@ -142,9 +209,21 @@ def run(cdb_dir, out_dir, trigger, clangd, timeout=90, jobs=1, server_profile=No
     observed_shards = []
     deadline = started + timeout
     try:
+        started = time.monotonic()
+        deadline = started + timeout
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, cwd=launch_cwd, env=env,
+            creationflags=(subprocess.CREATE_NO_WINDOW | subprocess.IDLE_PRIORITY_CLASS) if os.name == 'nt' else 0)
+        spawn_seconds = time.monotonic() - started
+        for reader in readers:
+            reader.start()
+            started_readers.append(reader)
+        capabilities = {'window': {'workDoneProgress': True}}
+        if position_encoding is not None:
+            capabilities.update(general={'positionEncodings': [position_encoding]}, offsetEncoding=[position_encoding])
         send({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {
             'processId': os.getpid(), 'rootUri': cdb_dir.as_uri(),
-            'capabilities': {'window': {'workDoneProgress': True}},
+            'capabilities': capabilities,
             'workspaceFolders': [{'uri': cdb_dir.as_uri(), 'name': 'isolated-probe'}]}})
         while time.monotonic() < deadline and process.poll() is None:
             try:
@@ -154,6 +233,7 @@ def run(cdb_dir, out_dir, trigger, clangd, timeout=90, jobs=1, server_profile=No
             handle(message)
             if message.get('id') == 1 and 'result' in message and not initialized:
                 initialized = True
+                encoding = _position_encoding(message['result'], position_encoding)
                 send({'jsonrpc': '2.0', 'method': 'initialized', 'params': {}})
                 send({'jsonrpc': '2.0', 'method': 'textDocument/didOpen', 'params': {'textDocument': {
                     'uri': trigger.as_uri(), 'languageId': 'cpp', 'version': 1,
@@ -166,13 +246,17 @@ def run(cdb_dir, out_dir, trigger, clangd, timeout=90, jobs=1, server_profile=No
             if progress_end and time.monotonic() - progress_end >= 0.8:
                 observed_shards = list(cdb_dir.rglob('*.idx')) + list(environment.rglob('*.idx'))
                 present = {path.name for path in observed_shards}
-                if all(any(name.startswith(prefix) for name in present) for prefix in expected_names):
+                mains_observed = {event['path'] for event in main_events}
+                witnessed = (not require_main_evidence or (_background_progress(observed_progress)['complete']
+                    and main_paths.issubset(mains_observed)))
+                if witnessed and all(any(name.startswith(prefix) for name in present) for prefix in expected_names):
                     complete = True
                     break
         indexed_wall = time.monotonic() - started
         shutdown_started = time.monotonic()
         before_shutdown = process_metrics(process)
         shutdown_response = False
+        shutdown_clean = False
         if process.poll() is None:
             send({'jsonrpc': '2.0', 'id': 2, 'method': 'shutdown', 'params': None})
             shutdown_deadline = time.monotonic() + 8
@@ -184,6 +268,7 @@ def run(cdb_dir, out_dir, trigger, clangd, timeout=90, jobs=1, server_profile=No
                 handle(message)
                 if message.get('id') == 2:
                     shutdown_response = True
+                    shutdown_clean = 'result' in message and 'error' not in message
                     break
             send({'jsonrpc': '2.0', 'method': 'exit', 'params': None})
             try:
@@ -193,19 +278,18 @@ def run(cdb_dir, out_dir, trigger, clangd, timeout=90, jobs=1, server_profile=No
                 process.wait()
         metrics = process_metrics(process)
     finally:
-        if process.poll() is None:
+        if process is not None and process.poll() is None:
             process.kill()
             process.wait()
-        for reader in readers:
+        for reader in started_readers:
             reader.join(timeout=2)
-        stdout_log.close()
-        sent_log.close()
-        stderr_log.close()
+        logs.close()
     shutdown_seconds = time.monotonic() - shutdown_started
     observed_shards = sorted({str(path) for path in list(cdb_dir.rglob('*.idx')) + list(environment.rglob('*.idx'))})
     present = {Path(path).name for path in observed_shards}
     missing = [prefix for prefix in expected_names if not any(name.startswith(prefix) for name in present)]
     report = {'command': command, 'server_profile': profile, 'launch_cwd': Path(launch_cwd).as_posix(),
+        'cdb_dir': str(cdb_dir), 'root_uri': cdb_dir.as_uri(), 'trigger': str(trigger),
         'isolated_environment': {key: env[key] for key in ('LOCALAPPDATA', 'XDG_CACHE_HOME', 'TEMP', 'TMP')},
         'cdb_sha256': hashlib.sha256((cdb_dir / 'compile_commands.json').read_bytes()).hexdigest(),
         'initialized': initialized, 'indexing_complete': complete, 'shutdown_response': shutdown_response,
@@ -216,6 +300,11 @@ def run(cdb_dir, out_dir, trigger, clangd, timeout=90, jobs=1, server_profile=No
         **metrics, 'indexing_log_lines': [line for line in stderr_lines if 'Indexed ' in line or 'Enqueueing ' in line],
         'error_lines': [line for line in stderr_lines if line.startswith('E[')],
         'compile_failure_lines': compile_failures, 'compile_failure_count': compile_failure_count,
+        'position_encoding': encoding, 'main_events': main_events, 'loaded_cdb_events': loaded_cdb_events,
+        'observed_progress': observed_progress, 'background_progress': _background_progress(observed_progress),
+        'observers': {'eof': observer_eof, 'errors': observer_errors,
+            'joined': all(not reader.is_alive() for reader in readers)},
+        'process_reaped': process.poll() is not None, 'shutdown_clean': shutdown_clean,
         'background_compile_success': complete and process.returncode == 0 and compile_failure_count == 0}
     (out_dir / 'run.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     return report

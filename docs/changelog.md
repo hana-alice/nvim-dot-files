@@ -90,27 +90,9 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v2.8.0` → [docs/release_2.8.0.md](release_2.8.0.md) (staged index delivery, honest failure reporting and layout roles; tag pending)
 
+- `v2.9.0` → [docs/release_2.9.0.md](release_2.9.0.md) (Tier 1 SuperUnity production delivery; full regression 4079/4079, 2 skips; tag pending)
+
+- `v2.10.0` → [docs/release_2.10.0.md](release_2.10.0.md) (Tier 1 gen/src merge, context-migration shard invalidation, opt-in Tier 2, cost ceilings; tag pending)
+
 ## Unreleased
 
-已将本轮切片归档至 [2.8.0](release_2.8.0.md)。
-
-### 2026-10-16 — 公开镜像脱敏与 2.8.0 归档
-
-**Task**
-同步、归档并推送本轮收敛结果，推送前移除测试夹具中的私有标识。
-
-**Implemented**
-- `gtags_x1_spec` 私有 native 用例的工程 shader 路径与符号改由 `NVIM_X1_NATIVE_PROJECT_SHADER` / `NVIM_X1_NATIVE_PROJECT_SYMBOL` 提供，缺失即 skip。
-- `ue_index_status_spec` 索引文件名改为中性 `sample_project`；`ue_cdb_partition_spec` 插件名改为 Sample*（与远端已脱敏版本一致）。
-- `layout_handoff_spec` 子进程的 snacks.nvim 路径由父进程按 `stdpath("data")` 经 `SCAN_SNACKS_RTP` 传入，不再写死个人目录。
-- Unreleased 切片归档至 `docs/release_2.8.0.md`。
-
-**Pitfalls / Gotchas**
-- 外置 denylist 只拦截部分私有标识，工程插件名、平台键与个人路径需人工补扫。
-
-**Validation**
-- `gtags_x1` 14/14（1 skip）、`ue_index_status` 29/29、`layout_handoff` 13/13、`ue_cdb_partition` 9/9。
-- 串行全量 3978/3987，9 FAIL（既有顺序依赖）、2 SKIP。
-
-**Follow-ups**
-- 定位串行全量跨文件状态泄漏，恢复全绿门禁。

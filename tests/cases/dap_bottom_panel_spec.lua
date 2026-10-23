@@ -53,7 +53,7 @@ t.describe("dap bottom panel bounded pin handoff", function()
   end)
 
   t.it("cold native copen temporarily releases a pinned retained quickfix host", function()
-    isolated(function(bottom, group)
+    isolated(function(bottom)
       local source = api.nvim_get_current_win()
       vim.fn.setqflist({}, " ", { items = { { lnum = 1, text = "issue" } } })
       local host = bottom.show("quickfix", nil, { focus = false })
@@ -63,13 +63,18 @@ t.describe("dap bottom panel bounded pin handoff", function()
       local qf = vim.fn.getqflist({ qfbufnr = 0 }).qfbufnr
       api.nvim_buf_delete(qf, { unload = true })
       local observed
-      api.nvim_create_autocmd("BufWinEnter", {
-        group = group, pattern = "*", callback = function()
-          if vim.bo.buftype == "quickfix" then observed = vim.wo[host].winfixbuf end
-        end,
-      })
+      -- Observe command entry: normal problem-list BufWinEnter callbacks may
+      -- already have re-pinned the host by the time a later observer runs.
+      local exec = api.nvim_exec2
+      api.nvim_exec2 = function(command, opts)
+        if command == "botright copen" then observed = vim.wo[host].winfixbuf end
+        return exec(command, opts)
+      end
       local count = #api.nvim_tabpage_list_wins(0)
-      t.assert_eq(bottom.show("quickfix", nil, { focus = false }), host)
+      local ok, shown = pcall(bottom.show, "quickfix", nil, { focus = false })
+      api.nvim_exec2 = exec
+      t.assert_true(ok, tostring(shown))
+      t.assert_eq(shown, host)
       t.assert_eq(observed, false, "native copen runs within the host pin handoff")
       t.assert_true(vim.wo[host].winfixbuf)
       t.assert_eq(#api.nvim_tabpage_list_wins(0), count)

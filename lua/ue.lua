@@ -4469,12 +4469,12 @@ local function open_terminal_command(cmd, opts)
     return ok and result and result[1] == -1
   end
 
-  local function ensure_window()
+  local function ensure_window(buf)
     prune_state()
     local height = opts.height or math.max(8, math.floor(vim.o.lines * 0.25))
     CORE_RT.build_term_win = require("utils.bottom_panel").show(
       "build",
-      CORE_RT.build_term_buf,
+      buf or CORE_RT.build_term_buf,
       { height = height, focus = opts.focus == true }
     )
     return CORE_RT.build_term_win
@@ -4492,10 +4492,9 @@ local function open_terminal_command(cmd, opts)
     return
   end
 
-  local win = ensure_window()
   local buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_win_set_buf(win, buf)
   vim.b[buf].ue_build_title = opts.quickfix_title or opts.finish_label or "UE build"
+  local win = ensure_window(buf)
   track_state(buf, win)
   -- Closing the terminal window is a presentation action, not task
   -- cancellation. `bufhidden=wipe` terminates a live terminal job (reported

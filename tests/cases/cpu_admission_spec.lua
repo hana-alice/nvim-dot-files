@@ -473,7 +473,7 @@ t.describe("调度接入：推迟不得丢阶段、不得杀在跑的构建", fu
     local s = sched_src()
     local reading_at = s:find("cpu_load%.reading")
     local admit_at = s:find("M%.admit_background_phase%(load, deferred, policy%)")
-    local start_at = s:find("M%.build_phase_async%(ctx, phase%)")
+    local start_at = s:find("M.build_phase_async(ctx, phase, { protect = protect_again })", 1, true)
     t.assert_type(reading_at, "number", "调度必须读取常驻缓存")
     t.assert_type(admit_at, "number", "调度必须调用准入判定")
     t.assert_type(start_at, "number", "未找到构建启动点")

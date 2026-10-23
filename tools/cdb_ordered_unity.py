@@ -122,7 +122,7 @@ def _context(entry, common, state):
     return _json([entry['directory'], common, semantic])
 
 
-def build_candidates(entries, membership, output_dir, *, max_originals=50, max_sources=2000):
+def build_candidates(entries, membership, output_dir, *, max_originals=50, max_sources=2000, parse_entry=None):
     """Return candidates, original fallbacks and separate ownership metadata.
 
     membership maps absolute original-TU paths to ordered absolute member paths.
@@ -156,7 +156,7 @@ def build_candidates(entries, membership, output_dir, *, max_originals=50, max_s
                 raise ValueError('member paths must be absolute')
             if len(members) > max_sources:
                 raise ValueError('original Unity exceeds member source budget')
-            common, search, definitions = _parse(entry)
+            common, search, definitions = (parse_entry or _parse)(entry)
             state = {}
             for path in definitions:
                 if path not in headers:

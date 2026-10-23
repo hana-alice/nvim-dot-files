@@ -57,7 +57,18 @@
   gate：当前 project/target/platform/configuration 的 selection、manifest、controlled CDB 与源 CDB 签名
   仍有效时，新 Neovim 直接复用并启动；仅工件缺失、stale 或 tuple 变化时等待下一次 `:UEPrepare`。
   非 UE C++ root 不经过该 gate。全程 async + 进度 UI。
-  二次批次由独立原 TU 完整图证明，冻结输入与 receipt 绑定；原 semantic CDB 继续负责 native
+  默认 Tier 1 二次批次由 `tools/build_hot_super_unity_cdb.py` 按同模块、完整编译上下文进行字节预算
+  分组（默认不按 gen/src 拆分，`NVIM_UE_TIER1_SPLIT_CLASSES=1` 回退；跨类别块失败后按类别拆分重试一次，
+  子块收据记录 `fallback_of`）；可选 Tier 2（`NVIM_UE_TIER2=1`）由 `tier2_unity_chunks` 在同一 SharedPCH
+  下跨模块整模块打包，额外要求 clang 依赖文件集合与逐模块 Tier 1 并集完全相等，失败退回逐模块 Tier 1。
+  `_publish.lua` 发布时比较新旧 live CDB，对改变上下文的 main 按 CDB 拼写或 own-URI 身份作废旧 main shard
+  （`lua/ue/index/shard_name.lua` / `shard_migration.lua`）。`tools/cdb_verified_batch.py` 私有验证候选编译/索引、成员主 shard 与完整成员集合。
+  `tools/cdb_background_batch.py` 有界生产资格并收集可复用收据，普通 current/hot/full 只消费已有资格；
+  `_publish.lua` 发布前重验收据声明的输入与候选字节，合格候选进入普通 live CDB，失效块保留原 UBT。
+  Tier 1 不预置 shard、不授予 frozen 权限，头文件不属于其资格缓存失效边界；小 CDB 的批次校验也交给
+  既有 publication worker。临时验证失败不形成永久负缓存，overlay 物理检查只在一次 collect/reuse 内复用。
+  资格首次成本、实际阶段收益与全工程缺口见 `docs/release_2.9.0.md`。
+  严格路线的二次批次由独立原 TU 完整图证明，冻结输入与 receipt 绑定；原 semantic CDB 继续负责 native
   definition，冻结 BackgroundIndex 使用独立目录与缓存。先监听再异步验证才可启用；输入变化
   立即撤销 references/rename epoch，并退回原 UBT 路径。详细契约见 `cpp-semantic-index-coverage`。
   `batch_documents.lua` 仅筛选相关的已加载未保存文档；`batch_runtime.lua` 保留 CDB 归属、
@@ -75,10 +86,11 @@
   交付小型选择请求。worker 校验 active 输入、编辑器/Python 存活及 build lease，原子发布子集；
   规范化与注入仍只操作子集，不修改 active CDB。direct scope 优先；对不可能匹配所选模块根末段的
   普通 Unity 名称，跳过递归 fallback 查找。不规则名称/未知 key 保留原发现，同名根优先级不变。
-  自动交付只复用有效证明，不启动冷证明；未认证的 query-driver profile 保持原 UBT 路径。
+  阶段发布只复用有效资格或证明；新资格由独立后台队列生成，未认证的 query-driver profile 保持原 UBT 路径。
   semantic CDB 同目录的 `batch-store.json`（`schema: 1`、绝对 `path`）可按项目/target 选择外部证明目录；
   current/hot/full 通过 `--verified-batch-store` 接入现有 cache-only 验证，选择文件本身不授予语义权限。
-  没有选择文件时仍用原默认目录；已有 receipt/snapshot 不因接入而迁移或改写，失效组保留原命令。
+  显式选择文件保留严格路线；没有选择文件时使用默认后台资格目录。已有 receipt/snapshot 不因接入
+  而迁移或改写，失效组保留原命令。
   认证使用实际 server profile、进程 cwd/environment 和原 TU 主 shard 的有效命令；驱动由原生
   查询发现。源码/include 保持递归监听，驱动搜索候选及祖先用独立非递归监听，分轮安装后再重验。
   profile 或环境变化撤销待启用批次；未知参数和不支持的宿主能力保持原 UBT 配置。

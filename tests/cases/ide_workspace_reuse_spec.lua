@@ -263,6 +263,19 @@ t.describe("ide_workspace_reuse: explicit editor destination", function()
     native(function(f)
       installed_picker(f)
       f.picker("Hidden1")
+      -- Window lifecycle evidence: macOS CI twice ended with 2 normal windows and the picker
+      -- floats still present after 3s; record who creates/closes windows (cause unverified).
+      f.lua([[
+        win_events = {}
+        api.nvim_create_autocmd({ 'WinNew', 'WinClosed', 'BufEnter' }, { callback = function(args)
+          local win = args.event == 'WinClosed' and tonumber(args.match) or api.nvim_get_current_win()
+          local ok, cfg = pcall(api.nvim_win_get_config, win)
+          win_events[#win_events + 1] = { ev = args.event, win = win,
+            buf = vim.fn.fnamemodify(api.nvim_buf_get_name(args.buf), ':t'),
+            relative = ok and cfg.relative or '?',
+            trace = args.event == 'WinClosed' and debug.traceback('', 2):sub(1, 600) or nil }
+        end })
+      ]])
       f.input("<CR>")
       -- macOS CI observed normal=2 right after close (likely the closing preview float still held the
       -- buffer, unverified); wait for the editor split that the default action creates.
@@ -281,7 +294,9 @@ t.describe("ide_workspace_reuse: explicit editor destination", function()
         return { normal = normal_count(), source_buf = api.nvim_win_get_buf(source_win)==source_buf,
           cursor = api.nvim_win_get_cursor(source_win), other = unchanged_other_and_qf(),
           current = api.nvim_get_current_win(), source_win = source_win, closed = picker.closed,
-          notices = notices, wins = wins }
+          notices = notices, wins = wins, win_events = win_events, errmsg = vim.v.errmsg,
+          mode = api.nvim_get_mode(), current_buf = vim.fn.fnamemodify(api.nvim_buf_get_name(0), ':t'),
+          messages = vim.fn.execute('messages') }
       ]])
       t.assert_true(state.normal == 3 and state.source_buf and vim.deep_equal(state.cursor, { 1, 4 })
         and state.other, vim.inspect(state))

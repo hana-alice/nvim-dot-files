@@ -437,3 +437,15 @@ clangd 是长驻交互式服务，终止会丢弃已构建的 preamble。系统 
   图的并集，原始侧也要实测。原始侧已有缺口不豁免候选的新损失，冷进程内可见的目标也
   不自动证明暖加载可见。诊断预算耗尽保留失败与成本，仅在新检查中继续完整比较，不能
   把未完成的输出当零差异或补写历史成功回执。
+- **长期优化：clangd 索引的模块优先级（2026-10-23 记录，未实施）**：current/hot/full 只决定
+  CDB 分阶段发布顺序，阶段内的执行顺序不由我们控制。源码证据：stock clangd 入队时打乱任务
+  （`Background.cpp` shuffle）；`BackgroundQueue::adjust` 丢弃 SeenKeys 中已有 key 的任务，
+  因此重发 CDB 不能给已排队任务重新排序；`boost(Tag)` 按文件名粒度生效，只由 didOpen 触发；
+  过期检查只发生在入队时。现状还有三点：`INDEX_CORE_MODULES` 含 Engine/UnrealEd，hot 中 Engine
+  约占 48%，Android 场景也带 UnrealEd；BufEnter 切模块只调整 `set_active_module` 分数并记录
+  baseline 哈希，不排 current；已有 job 时不抢占。两类场景分开处理：
+  ① full 尚未发布：切到其他模块后约 1.5 s 防抖重排 current，并加探针；
+  ② full 已发布但仍在索引：需要目录前缀 boost（A：给 clangd 打补丁，如 `$/boostDirectory`
+  在 `BackgroundQueue::boost` 做前缀匹配），或预置 shard（B：排队任务能否跳过尚未验证）。
+  另外可在 current 与 hot 之间加一层渲染层（Renderer、RenderCore、RHI、平台 RHI、Core、
+  CoreUObject，约 1000 条）。以上均待实测；收益未验证前不得宣称渲染模块已经优先完成索引。

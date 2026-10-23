@@ -20,6 +20,8 @@ local function fixture(run)
   core.deps.status_root_key = function() return root end
   core.deps.refresh_statusline = function() end
   core.deps.invalidate_status_cache = function() end
+  local probes = {}
+  core.deps.probe = function(topic, key, data) probes[#probes + 1] = { topic = topic, key = key, data = data } end
   M.base_compile_commands_path = function() return root .. "/base.json" end
   M.source_refresh_pending = function() return false end
   vim.defer_fn = function(callback, delay)
@@ -34,7 +36,13 @@ local function fixture(run)
     end
     return found
   end
-  local f = { m = M, ctx = ctx, state = state, timers = timers, signatures = signatures, root = root }
+  local f = { m = M, ctx = ctx, state = state, timers = timers, signatures = signatures, root = root,
+    probes = probes }
+  function f.probe_keys()
+    local keys = {}
+    for _, item in ipairs(probes) do keys[#keys + 1] = item.key end
+    return keys
+  end
   function f.client(id, config)
     local client = {
       id = id, name = "clangd", initialized = true,
@@ -82,10 +90,72 @@ local function fixture(run)
   vim.defer_fn = original.defer
   vim.lsp.get_client_by_id = original.get_client
   vim.lsp.get_clients = original.get_clients
+  vim.fn.delete(root, "rf")
   if not ok then error(err) end
 end
 
 t.describe("ordinary phase publication completion barrier", function()
+  t.it("旧空收据文件仍让 full 等待 hot 的真实 begin/end", function()
+    fixture(function(f)
+      vim.fn.mkdir(f.root, "p")
+      vim.fn.writefile({ vim.json.encode({ schema = 1, receipts = {} }) }, f.root .. "/batches.json")
+      local reader = f.client(11)
+      f.arm({ ordinary = true, original_changed = true, original_append_only = true }, "hot")
+      local full = false
+      f.m.wait_phase_publication(f.ctx, function() full = true end)
+      f.flush()
+      t.assert_false(full, "空收据不能撤掉阶段屏障")
+      f.m.phase_reader_loading(f.ctx, reader)
+      f.progress(11, "begin")
+      t.assert_false(full)
+      f.progress(11, "end")
+      t.assert_true(full)
+      t.assert_eq(f.m.phase_barrier_status(f.ctx).status, "indexed")
+    end)
+  end)
+
+  for _, bytes in ipairs({ '{"schema":1,"receipts":["strict.json"]}', '{"schema":1}', 'broken' }) do
+    t.it("非空或损坏批次元数据不得被当作 ordinary: " .. bytes, function()
+      fixture(function(f)
+        vim.fn.mkdir(f.root, "p")
+        vim.fn.writefile({ bytes }, f.root .. "/batches.json")
+        f.arm()
+        t.assert_false(f.m.phase_barrier_pending(f.ctx))
+      end)
+    end)
+  end
+
+  t.it("探针：hot 完成记 ok；超时与 full 抢跑都记录失败原因", function()
+    fixture(function(f)
+      local reader = f.client(11)
+      f.arm(nil, "hot")
+      f.m.phase_reader_loading(f.ctx, reader)
+      f.progress(11, "begin")
+      f.progress(11, "end")
+      t.assert_eq(f.probes[#f.probes].key, "hot:indexed:background-index-end")
+      t.assert_eq(f.probes[#f.probes].data.state, "ok")
+      t.assert_eq(f.probes[#f.probes].topic, "index-phase-barrier")
+      -- hot 已完成后的 full 不算抢跑
+      f.arm(nil, "full")
+      t.assert_false(vim.tbl_contains(f.probe_keys(), "full:unordered:indexed"))
+    end)
+    fixture(function(f)
+      f.arm(nil, "hot")
+      f.timeout()
+      t.assert_eq(f.probes[#f.probes].key, "hot:timeout:background-index-timeout")
+      t.assert_eq(f.probes[#f.probes].data.state, "failed")
+      f.arm(nil, "full")
+      t.assert_true(vim.tbl_contains(f.probe_keys(), "full:unordered:background-index-timeout"))
+    end)
+    fixture(function(f)
+      f.arm({ ordinary = false, original_changed = true }, "full")
+      local last = f.probes[#f.probes]
+      t.assert_eq(last.key, "full:unordered:no-barrier-record")
+      t.assert_eq(last.data.state, "failed")
+      t.assert_false(last.data.ordinary)
+    end)
+  end)
+
   t.it("交付文案区分 CDB 生成、首阶段完成与后续后台索引", function()
     local M = {}
     require("ue.index._delivery")(M, { h = {}, deps = {} })

@@ -141,6 +141,63 @@ if short_paths_available ~= nil then
   end)
 end
 
+t.describe("ordinary publication metadata", function()
+  for _, old in ipairs({ "empty", "populated" }) do
+    t.it("无收据发布删除旧 " .. old .. " 元数据并保持重复发布 no-op", function()
+      fixture(function(f)
+        f.json(f.root .. "/batches.json", { schema = 1, receipts = old == "empty" and {} or { "old.json" } })
+        f.phase("current", { f.originals[1] })
+        local ok, report = f.publish(); t.assert_true(ok, report)
+        t.assert_nil(f.read(f.root .. "/batches.json"))
+        t.assert_true(report.ordinary)
+        local bytes, stamp = f.read(f.ctx.paths.semantic_cdb), vim.uv.fs_stat(f.ctx.paths.semantic_cdb).mtime
+        local repeated, unchanged = f.publish(); t.assert_true(repeated, unchanged)
+        t.assert_false(unchanged.changed)
+        t.assert_eq(f.read(f.ctx.paths.semantic_cdb), bytes)
+        t.assert_true(vim.deep_equal(vim.uv.fs_stat(f.ctx.paths.semantic_cdb).mtime, stamp))
+      end)
+    end)
+  end
+
+  t.it("旧空收据仍允许普通 append defer", function()
+    fixture(function(f)
+      f.phase("current", { f.originals[1] }); t.assert_true(f.publish())
+      f.json(f.root .. "/batches.json", { schema = 1, receipts = {} })
+      f.phase("hot", { f.originals[1], f.originals[2] })
+      f.state.index_selection = { generation_id = "test" }
+      f.index._defer_append = true
+      local ok, report = f.publish(); t.assert_true(ok, report)
+      t.assert_true(report.ordinary)
+      t.assert_true(report.original_append_only)
+      t.assert_true(report.deferred)
+      f.index._defer_append = nil
+      ok, report = f.publish(); t.assert_true(ok, report)
+      t.assert_true(report.original_append_only)
+      t.assert_nil(f.read(f.root .. "/batches.json"))
+    end)
+  end)
+
+  t.it("删除失败必须报告，保留旧文件并可重试", function()
+    fixture(function(f)
+      f.phase("current", { f.originals[1] }); t.assert_true(f.publish())
+      f.json(f.root .. "/batches.json", { schema = 1, receipts = {} })
+      local unlink = vim.uv.fs_unlink
+      vim.uv.fs_unlink = function(path)
+        if path == f.root .. "/batches.json" then return nil, "EACCES: fixture", "EACCES" end
+        return unlink(path)
+      end
+      local called, ok, reason = pcall(f.publish)
+      vim.uv.fs_unlink = unlink
+      t.assert_true(called, ok)
+      t.assert_false(ok)
+      t.assert_match(reason, "EACCES")
+      t.assert_true(f.read(f.root .. "/batches.json") ~= nil)
+      t.assert_true(f.publish())
+      t.assert_nil(f.read(f.root .. "/batches.json"))
+    end)
+  end)
+end)
+
 local function assert_activation_coverage(f)
   local python = vim.fn.exepath("python")
   if python == "" then python = vim.fn.exepath("python3") end
@@ -1359,18 +1416,19 @@ t.describe("privately qualified live Tier 1 publication", function()
     end)
   end)
 
-  t.it("publishes an actual Python Tier 1 receipt with identical native command identities", function()
+  t.it("catalog reuse aligns rebuilt priority phases with full native command identities", function()
     fixture(function(f)
       local python = vim.fn.exepath("python")
       if python == "" then python = vim.fn.exepath("python3") end
       t.assert_true(python ~= "")
       local code = [=[
-import json, sys
+import json, os, sys
 sys.dont_write_bytecode = True
 sys.path.insert(0, sys.argv[1])
 from pathlib import Path
 from unittest.mock import patch
 import cdb_verified_batch as verified
+import cdb_background_batch as background
 root = Path(sys.argv[2]).resolve()
 source = root / 'Source/Runtime/Sample/Private'
 source.mkdir(parents=True)
@@ -1391,13 +1449,42 @@ entries = [a, b, c]
 expected = [path for entry in [a, b] for path in verified._tier1_ubt_members(entry)]
 result = {'background_compile_success': True, 'missing_main_shards': [],
           'member_main_shards': expected, 'shards': []}
-with patch.object(verified, '_tier1_candidate_index', return_value=result) as indexed:
-    output, metrics = verified.accelerate_tier1(entries, root / 'private-proof', sys.executable,
-        max_group=8, timeout=1, budget_factor=1)
-assert indexed.call_count == 1 and metrics['batch_count'] == 1 and metrics['coverage_complete'], metrics
+store = root / 'private-proof'
+source, plan_path = root / 'plan-source.json', root / 'plan.json'
+source.write_text(json.dumps(entries), encoding='utf-8')
+out_path, marker = root / 'full-background.json', root / 'marker.json'
+marker.write_text('{}', encoding='utf-8')
+with patch.dict(os.environ, {'NVIM_UE_BATCH_TIER': '1'}):
+    # First prepare has no catalog. No missing-directory result is cached.
+    cold, _ = background.reuse_completed(entries[:2], store, sys.executable)
+    assert cold == entries[:2]
+    plan = background.make_plan(source, store, sys.executable)
+    plan_path.write_text(json.dumps(plan), encoding='utf-8')
+    assert len(plan['groups']) == 1, plan
+    group = plan['groups'][0]
+    selected = [entries[index] for index in group['indexes']]
+    # Native qualification is injected here; real gates/receipts/catalog and
+    # read-only reuse remain intact. Native indexing has separate coverage.
+    with patch.object(verified, '_tier1_candidate_index', return_value=result) as indexed:
+        _, metrics = verified.accelerate_tier1(selected, group['store'], sys.executable,
+            max_group=8, timeout=1, budget_factor=1)
+        assert indexed.call_count == 1 and metrics['batch_count'] == 1 and metrics['coverage_complete'], metrics
+        collected = background.collect(plan_path, [group['id']], out_path, marker, sys.executable)
+        assert collected['ok'] and collected['metrics']['batch_count'] == 1, collected
+        catalog = root / 'background-proofs/tier1/catalog.json'
+        before = (catalog.read_bytes(), catalog.stat().st_mtime_ns)
+        output, _ = background.reuse_completed(entries, store, sys.executable)
+        hot, reused = background.reuse_completed(entries[:2], store, sys.executable)
+        again, _ = background.reuse_completed(entries[:2], store, sys.executable)
+        assert indexed.call_count == 1, 'rebuilding current/hot must not run new qualification'
+        assert hot == again and reused['batch_count'] == 1
+        assert (catalog.read_bytes(), catalog.stat().st_mtime_ns) == before
+        assert (hot[0]['file'], hot[0]['arguments'], hot[0]['directory']) == (
+            output[0]['file'], output[0]['arguments'], output[0]['directory'])
 assert len(output) == 2 and output[0]['nvim_ue_tier1_receipt'], output
 (root / 'python-originals.json').write_text(json.dumps(entries), encoding='utf-8')
 (root / 'python-background.json').write_text(json.dumps(output), encoding='utf-8')
+(root / 'python-hot.json').write_text(json.dumps(hot), encoding='utf-8')
 ]=]
       local result = vim.system({ python, "-B", "-I", "-c", code, vim.fn.stdpath("config") .. "/tools", f.root },
         { text = true }):wait()
@@ -1419,6 +1506,21 @@ assert len(output) == 2 and output[0]['nvim_ue_tier1_receipt'], output
       t.assert_nil(f.read(f.root .. "/batches.json"))
       t.assert_nil(f.read(f.root .. "/verified/compile_commands.json"))
       local before = f.read(f.ctx.paths.semantic_cdb)
+      local stamp = vim.uv.fs_stat(f.ctx.paths.semantic_cdb).mtime
+      local hot = vim.json.decode(f.read(f.root .. "/python-hot.json"))
+      for _, phase in ipairs({ "current", "hot" }) do
+        f.phase(phase, hot, { originals[1], originals[2] })
+        local refreshed, unchanged = f.publish(); t.assert_true(refreshed, unchanged)
+        t.assert_false(unchanged.changed, "重建 " .. phase .. " 不得重写或退回 full")
+        t.assert_eq(f.read(f.ctx.paths.semantic_cdb), before)
+        t.assert_true(vim.deep_equal(vim.uv.fs_stat(f.ctx.paths.semantic_cdb).mtime, stamp))
+        local rows = vim.json.decode(f.read(f.ctx.paths.semantic_cdb))
+        t.assert_eq(#rows, 2)
+        local shared = rows[1].file == hot[1].file and rows[1] or rows[2]
+        t.assert_eq(shared.file, hot[1].file)
+        t.assert_eq(shared.directory, hot[1].directory)
+        t.assert_true(vim.deep_equal(shared.arguments, hot[1].arguments))
+      end
       local repeated, unchanged = f.publish(); t.assert_true(repeated, unchanged)
       t.assert_false(unchanged.changed)
       t.assert_eq(f.read(f.ctx.paths.semantic_cdb), before)

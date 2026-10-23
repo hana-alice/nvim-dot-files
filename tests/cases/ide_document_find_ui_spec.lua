@@ -41,7 +41,9 @@ def wait(code):
         time.sleep(.015)
     raise AssertionError(code+' '+str(lua('return {kind=Kind,status=P and F.status(P),notices=Notices,mode=vim.fn.mode(),win=vim.api.nvim_get_current_win()==Source.win,cursor=vim.api.nvim_win_get_cursor(Source.win)}')))
 def settle():
-    wait('return P and not P.closed and not P.finder:running() and not P.matcher:running() and F.status(P).state~="debounce" and F.status(P).state~="running"')
+    # The list can still show the previous generation's row after the finder settles; Enter on it is
+    # rejected as stale (macOS CI: "查找结果已失效", generation 2). Wait for the current row to catch up.
+    wait('return P and not P.closed and not P.finder:running() and not P.matcher:running() and F.status(P).state~="debounce" and F.status(P).state~="running" and (not P:current() or P:current().generation==F.status(P).generation)')
     return lua('return F.status(P)')
 def close():
     keys('<Esc>');wait('return P.closed and vim.fn.mode()=="n"');time.sleep(.04)

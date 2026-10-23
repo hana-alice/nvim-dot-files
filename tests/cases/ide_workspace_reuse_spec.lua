@@ -276,6 +276,14 @@ t.describe("ide_workspace_reuse: explicit editor destination", function()
             trace = args.event == 'WinClosed' and debug.traceback('', 2):sub(1, 600) or nil }
         end })
       ]])
+      f.lua([[
+        close_traces = {}
+        local close = picker.close
+        picker.close = function(self, ...)
+          close_traces[#close_traces + 1] = { mode = vim.fn.mode(), trace = debug.traceback('', 2):sub(1, 900) }
+          return close(self, ...)
+        end
+      ]])
       f.input("<CR>")
       -- macOS CI observed normal=2 right after close (likely the closing preview float still held the
       -- buffer, unverified); wait for the editor split that the default action creates.
@@ -294,7 +302,7 @@ t.describe("ide_workspace_reuse: explicit editor destination", function()
         return { normal = normal_count(), source_buf = api.nvim_win_get_buf(source_win)==source_buf,
           cursor = api.nvim_win_get_cursor(source_win), other = unchanged_other_and_qf(),
           current = api.nvim_get_current_win(), source_win = source_win, closed = picker.closed,
-          notices = notices, wins = wins, win_events = win_events, errmsg = vim.v.errmsg,
+          notices = notices, wins = wins, win_events = win_events, errmsg = vim.v.errmsg, close_traces = close_traces,
           mode = api.nvim_get_mode(), current_buf = vim.fn.fnamemodify(api.nvim_buf_get_name(0), ':t'),
           messages = vim.fn.execute('messages') }
       ]])

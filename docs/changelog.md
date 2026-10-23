@@ -156,6 +156,8 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
   green on Windows nvim 0.11.5 and 0.12.6 and WSL Ubuntu 24.04.
 - GitHub Actions push run 39974324072 (0d54706): ubuntu-24.04, macos-latest, windows-latest all
   green; dispatch run 39974328498 (same commit): macOS 4292/4295 (flake above), others green.
+- GitHub Actions push run 39990582029 (0be7e83, after the Find settle, Windows fd retry and `vim.NIL`
+  wait fixes): ubuntu-24.04, macos-latest, windows-latest all green.
 
 ### 2026-10-23 — Repair headless CI on ubuntu / macOS / windows (nvim 0.12.6)
 

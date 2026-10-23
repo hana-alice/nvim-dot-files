@@ -125,16 +125,28 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
   all eight writers behind a file barrier with a 40ms stagger, so slow child startup can no longer
   exhaust the first writer's bounded retries (cause 推测 from the CI stderr); `ide_workspace_reuse`
   default Enter waits for the third normal window and dumps the full window layout on failure.
+- Fourth/fifth CI runs (macOS only): `ide_workspace_reuse` default Enter now waits inside the child
+  (`vim.wait` 5s) instead of parent RPC polling, and on failure dumps window events, picker close
+  callers, every `vim.schedule` callback (origin / started / finished) and the `W.activate` result.
 
 **Pitfalls / Gotchas**
 - nvim 0.12.6 Windows: stopping a terminal job in the same tick its buffer is shown at a new size
   crashes nvim (jobstop/chanclose/kill alike; minimal repro: termopen → enew → split → set_buf → jobstop).
+- macOS CI known flake (open, cause unverified): at 0d54706 the push run was green on all three
+  hosts while a concurrent dispatch run failed on macOS. Evidence from the dump: after the picker
+  closed, the Snacks close cleanup (`picker.lua:664`) and the Workspace confirm (`workspace.lua:565`)
+  were queued by `vim.schedule` but had not started 5s later, even inside the child's own `vim.wait`.
+  Two `ide_document_find_ui` cases failed in the same run with the same shape (picker still open, mode
+  `i`). Not reproduced on Windows nvim 0.11.5/0.12.6 or WSL, including with `<CR>` fed from inside the
+  RPC request.
 
 **Validation**
 - Windows nvim 0.11.5 and 0.12.6, WSL Ubuntu 24.04: affected filters green (see full-regression line
   in the commit); Windows nvim 0.11.5 full regression 4383/4383 passed, 2 skipped.
 - Third-run fixes: `ui_responsiveness` `multi_instance_state` (3 consecutive runs) `ide_workspace_reuse`
   green on Windows nvim 0.11.5 and 0.12.6 and WSL Ubuntu 24.04.
+- GitHub Actions push run 39974324072 (0d54706): ubuntu-24.04, macos-latest, windows-latest all
+  green; dispatch run 39974328498 (same commit): macOS 4292/4295 (flake above), others green.
 
 ### 2026-10-23 — Repair headless CI on ubuntu / macOS / windows (nvim 0.12.6)
 

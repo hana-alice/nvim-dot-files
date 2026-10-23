@@ -143,6 +143,55 @@ return function(M, core)
     return true
   end
 
+  local function empty_migration()
+    return { count = 0, removed = 0, removed_by_identity = 0, missing = 0, errors = {},
+      compare_ms = 0, delete_ms = 0, scan_ms = 0, read_ms = 0, scan_count = 0, candidates_read = 0 }
+  end
+
+  -- clangd tests source digests, not the stored main command, when loading a
+  -- shard. A former wrapper member can therefore survive as an exact main with
+  -- the old context. Compare the two live views, never the base/phase metadata.
+  local function invalidate_migrated_mains(previous, proposed, cdb_path)
+    local uv = vim.uv or vim.loop
+    local report, started = empty_migration(), uv.hrtime()
+    local driver = require("utils.platform").driver()
+    local function commands(entries)
+      local result = {}
+      for _, entry in ipairs(entries or {}) do
+        local file = M.normalize_cdb_file(entry)
+        if fs.is_absolute_path(file) then
+          file = vim.fs.normalize(file)
+          local key = driver.path_key(file)
+          local item = result[key]
+          if not item then item = { file = file, keys = {} }; result[key] = item end
+          -- Preserve same-main variant order, just as same_publication does.
+          item.keys[#item.keys + 1] = entry_key(entry)
+        else
+          report.errors[#report.errors + 1] = { file = file, error = "main path is not absolute" }
+        end
+      end
+      return result
+    end
+    local before = commands(vim.islist(previous) and previous or {})
+    local after, migrated = commands(proposed), {}
+    for key, item in pairs(after) do
+      if not before[key] or not vim.deep_equal(before[key].keys, item.keys) then
+        migrated[#migrated + 1] = item.file
+      end
+    end
+    table.sort(migrated)
+    report.count = #migrated
+    report.compare_ms = (uv.hrtime() - started) / 1e6
+    local cache = fs.join(vim.fs.dirname(cdb_path), ".cache", "clangd", "index")
+    require("ue.index.shard_migration").invalidate(migrated, cache, report)
+    pcall(function()
+      local log = require("utils.log")
+      local emit = #report.errors > 0 and log.warn_ctx or log.info_ctx
+      emit("ue.index", "published main context migration", { context_migrated = report })
+    end)
+    return report
+  end
+
   M.publish_semantic_cdb = function(ctx, state, generation)
     local base_path = M.base_compile_commands_path(ctx)
     if not base_path or not _ufs.is_file(base_path) then
@@ -156,7 +205,7 @@ return function(M, core)
       return true, { entry_count = cached.entry_count,
         controlled_entry_count = cached.controlled_entry_count,
         shader_compatibility_count = cached.shader_compatibility_count, changed = false, original_changed = false,
-        ordinary = cached.ordinary }
+        ordinary = cached.ordinary, context_migrated = empty_migration() }
     end
     RT.publication_cache = nil
 
@@ -185,7 +234,8 @@ return function(M, core)
       local path, digest = entry.nvim_ue_tier1_receipt, entry.nvim_ue_tier1_receipt_sha256
       if type(path) ~= "string" or path == "" or type(digest) ~= "string" or digest == "" then return nil end
       local receipt, content = read_cdb(path)
-      if not receipt or vim.fn.sha256(content) ~= digest or receipt.schema ~= 1 or receipt.tier ~= 1
+      if not receipt or vim.fn.sha256(content) ~= digest or receipt.schema ~= 1
+        or (receipt.tier ~= 1 and receipt.tier ~= 2)
         or type(receipt.original_entries) ~= "table" or not vim.islist(receipt.original_entries)
         or #receipt.original_entries == 0 then return nil end
       local keys = {}
@@ -208,10 +258,19 @@ return function(M, core)
       if phase_candidates[candidate_key] ~= 1 then return nil, "tier1-candidate-repeated-in-phase" end
       local receipt, content = read_cdb(path)
       if not receipt or vim.fn.sha256(content) ~= digest then return nil, "tier1-receipt-sha256-mismatch" end
-      if receipt.schema ~= 1 or receipt.tier ~= 1 or receipt.accepted ~= true or receipt.reusable ~= true
+      if receipt.schema ~= 1 or (receipt.tier ~= 1 and receipt.tier ~= 2)
+        or receipt.accepted ~= true or receipt.reusable ~= true
         or type(receipt.gates) ~= "table" or receipt.gates.compile_success ~= true
         or receipt.gates.main_shards_complete ~= true or receipt.gates.members_equal ~= true then
         return nil, "tier1-receipt-not-accepted"
+      end
+      if receipt.tier == 2 then
+        if vim.env.NVIM_UE_TIER2 ~= "1" then return nil, "tier2-disabled" end
+        if entry.nvim_ue_tier ~= 2 or receipt.gates.include_resolution_equal ~= true then
+          return nil, "tier2-receipt-not-accepted"
+        end
+      elseif entry.nvim_ue_tier == 2 then
+        return nil, "tier2-receipt-tier-mismatch"
       end
       if entry_key(receipt.candidate) ~= candidate_key then return nil, "tier1-candidate-command-mismatch" end
       if type(receipt.inputs) ~= "table" or not vim.islist(receipt.inputs) or #receipt.inputs == 0 then
@@ -229,6 +288,31 @@ return function(M, core)
       end
       if type(receipt.original_entries) ~= "table" or not vim.islist(receipt.original_entries)
         or #receipt.original_entries == 0 then return nil, "tier1-original-commands-missing" end
+      if receipt.tier == 2 then
+        local path_key = require("utils.platform").driver().path_key
+        local inputs, definitions = {}, {}
+        for _, input in ipairs(receipt.inputs) do inputs[path_key(fs.norm(input.path))] = true end
+        for _, original in ipairs(receipt.original_entries) do
+          local arguments, position = original.arguments or {}, 1
+          while position <= #arguments do
+            local argument, header = arguments[position], nil
+            if argument == "-include" then
+              header, position = arguments[position + 1], position + 1
+            elseif type(argument) == "string" then
+              header = argument:match("^%-include=(.+)$")
+            end
+            if type(header) == "string" and vim.fs.basename(fs.norm(header)):match("^Definitions%.") then
+              header = fs.norm(header)
+              if not fs.is_absolute_path(header) then header = fs.join(original.directory, header) end
+              local key = path_key(header)
+              if not inputs[key] then return nil, "tier2-definition-input-missing" end
+              definitions[key] = true
+            end
+            position = position + 1
+          end
+        end
+        if vim.tbl_count(definitions) < 2 then return nil, "tier2-definition-inputs-missing" end
+      end
       if originals[candidate_key] then return nil, "tier1-candidate-aliases-original" end
       local consumed = {}
       for _, original in ipairs(receipt.original_entries) do
@@ -375,9 +459,10 @@ return function(M, core)
 
     -- A later full phase contains the original UBT rows even when an earlier
     -- phase supplied a batch. Only its exact receipt originals may be consumed.
-    local consumed = {}
+    local consumed, batch_fallbacks, excluded_batches = {}, {}, {}
     for candidate_key, batch in pairs(batches) do
       if seen[candidate_key] then return false, "batch command aliases an original command" end
+      if tier1_batches[candidate_key] then return false, "batch command aliases a Tier 1 command" end
       for _, original in ipairs(batch.originals) do
         local original_key = entry_key(original)
         if not original_key or not seen[original_key] then
@@ -385,15 +470,25 @@ return function(M, core)
         end
         if consumed[original_key] then return false, "batch original command is covered more than once" end
         consumed[original_key] = true
+        if tier1_consumed[original_key] then excluded_batches[candidate_key] = true end
       end
     end
+    -- Keep the admitted live Tier 1 baseline. A strict receipt is indivisible:
+    -- any original already replaced by Tier 1 defers that entire strict batch.
+    for candidate_key in pairs(excluded_batches) do
+      local batch = batches[candidate_key]
+      receipts[batch.path] = nil
+      for _, original in ipairs(batch.originals) do consumed[entry_key(original)] = nil end
+      batch_fallbacks[#batch_fallbacks + 1] = { receipt = batch.path, reason = "tier1-original-overlap" }
+    end
+    table.sort(batch_fallbacks, function(a, b) return a.receipt < b.receipt end)
     local selected, selected_seen = {}, {}
     for _, entry in ipairs(frozen) do
       local candidate_key = entry_key(entry)
       if not batches[candidate_key] and not seen[candidate_key] then
         return false, "background command is not a proven original or batch"
       end
-      if not consumed[candidate_key] then
+      if not consumed[candidate_key] and not excluded_batches[candidate_key] then
         selected[#selected + 1] = entry
         selected_seen[candidate_key] = true
       end
@@ -407,24 +502,29 @@ return function(M, core)
     end
     frozen = selected
 
-    -- Tier 1 uses live wrappers, not the frozen/activation route. Its receipt
-    -- binds wrapper/member source bytes, tool and environment; header changes
-    -- do not invalidate it. This is the explicitly accepted Tier 1 tradeoff.
-    local live, live_seen = {}, {}
-    for _, entry in ipairs(merged) do
-      local original_key = entry_key(entry)
-      local candidate_key = tier1_consumed[original_key]
-      if candidate_key then
-        if not live_seen[candidate_key] then
-          live[#live + 1] = clangd_cdb_entry(tier1_batches[candidate_key].entry)
-          live_seen[candidate_key] = true
+    -- Tier 1 uses the same live wrapper command in both views; strict activation
+    -- retains it as an original, never as a frozen receipt. Its receipt binds
+    -- wrapper/member source bytes, tool and environment; header changes do not
+    -- invalidate it. This is the explicitly accepted Tier 1 tradeoff.
+    local function project_tier1(entries)
+      local projected, projected_seen = {}, {}
+      for _, entry in ipairs(entries) do
+        local original_key = entry_key(entry)
+        local candidate_key = tier1_consumed[original_key]
+        if candidate_key then
+          if not projected_seen[candidate_key] then
+            projected[#projected + 1] = clangd_cdb_entry(tier1_batches[candidate_key].entry)
+            projected_seen[candidate_key] = true
+          end
+        elseif not projected_seen[original_key] then
+          projected[#projected + 1] = entry
+          projected_seen[original_key] = true
         end
-      elseif not live_seen[original_key] then
-        live[#live + 1] = entry
-        live_seen[original_key] = true
       end
+      return projected
     end
-    merged = live
+    merged = project_tier1(merged)
+    if next(receipts) and next(tier1_batches) then frozen = project_tier1(frozen) end
     controlled_count = #merged
 
     -- Reordering unique unchanged files only reprioritizes an existing queue.
@@ -440,9 +540,14 @@ return function(M, core)
       return true, { deferred = deferred, original_append_only = original_append_only, ordinary = ordinary }
     end
     local changed = original_changed
+    local context_migrated = empty_migration()
     if changed then
       local ok, err = atomic_write_json(ctx.paths.semantic_cdb, merged)
       if not ok then return false, err end
+      -- The live view is committed now. Do not defer invalidation past optional
+      -- frozen metadata writes: if one fails, a retry has already lost previous.
+      -- Large CDBs run this entire function in the existing publication worker.
+      context_migrated = invalidate_migrated_mains(previous, merged, ctx.paths.semantic_cdb)
     end
     -- Strict batches retain their separate CDB/shard environment and input
     -- guard. Tier 1 above is qualified for live source commands and never
@@ -495,8 +600,10 @@ return function(M, core)
       shader_compatibility_count = shader_count,
       changed = changed,
       original_changed = original_changed,
+      context_migrated = context_migrated,
       ordinary = ordinary,
       tier1_fallbacks = tier1_fallbacks,
+      batch_fallbacks = batch_fallbacks,
       -- Frozen activation owns its independent reader/cache and cannot use the
       -- ordinary directory reload path, even if original rows only grew.
       original_append_only = original_append_only and #receipt_paths == 0 and not _ufs.is_file(batch_info_path),

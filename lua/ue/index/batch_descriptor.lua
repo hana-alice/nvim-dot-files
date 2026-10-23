@@ -4,6 +4,24 @@ local uv = vim.uv or vim.loop
 local platform = require("utils.platform")
 local fs = require("ue.core.fs")
 
+function M.selected_store(store, phase)
+  if type(store) ~= "table" or store.schema ~= 1 or type(store.path) ~= "string"
+      or not fs.is_absolute_path(store.path) or store.path:find("[%z\r\n]") then
+    return nil, "invalid batch-store.json: expected schema=1 and an absolute proof-store path"
+  end
+  if store.phases == nil then return store.path end
+  local invalid = "invalid batch-store.json: phases must be a nonempty unique list of current/hot/full"
+  if type(store.phases) ~= "table" or not vim.islist(store.phases) or #store.phases == 0 then
+    return nil, invalid
+  end
+  local allowed, seen = { current = true, hot = true, full = true }, {}
+  for _, name in ipairs(store.phases) do
+    if type(name) ~= "string" or not allowed[name] or seen[name] then return nil, invalid end
+    seen[name] = true
+  end
+  if seen[phase] then return store.path end
+end
+
 local function key(path)
   return platform.driver().path_key(vim.fs.normalize(path))
 end

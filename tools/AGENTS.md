@@ -57,11 +57,16 @@ controlled BackgroundIndex 生成器由 `index_generation` / `cpp_semantic_index
 真实验收必须检查源文件引用指向的全局 header 符号，不能只比较源文件自身声明的符号。
 
 二次批次 / RIFF 图 / 原 TU binding / 冻结 VFS 工具另跑 `index_graph`、`index_batch`、
-`index_verified_batch`、`index_vfs_aliases`；最终使用 `NVIM_TEST_REQUIRE_NATIVE=1`，
+`index_verified_batch`、`index_tier1_cohort`、`index_vfs_aliases`；最终使用 `NVIM_TEST_REQUIRE_NATIVE=1`，
 不得把 native 跳过视为通过。实际性能验收仍须真实工程，不由 fixture 代替。
 
 离线有序候选 `cdb_ordered_unity.py` 另跑 `index_ordered_unity`（required-native）和 `structure`；
 它仅生成候选，不得把语法检查通过当作生产准入或完整索引性能验收。
+
+显式有序 strict 配方 `cdb_ordered_batch.py` 及验证/后台接入另跑 `index_ordered_batch`、
+`index_ordered_unity`、`index_verified_batch`、`index_batch_background` 和 `structure`（required-native）。
+构造器不自行授予资格；跨模块完整 generated owner 仍由独立原 TU 图和正常 strict 收据流程验证，
+普通 Tier 1 默认不变。
 
 ## 先读
 

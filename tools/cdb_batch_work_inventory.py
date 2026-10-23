@@ -37,9 +37,21 @@ def linked(path):
 
 
 def safe_path(path):
-    for parent in (path, *path.parents):
-        if parent.exists() and linked(parent):
-            raise ValueError('reparse-or-symbolic-link: ' + str(parent))
+    # Inspect ancestors before descendants; exists() would hide broken links.
+    for parent in reversed((path, *path.parents)):
+        try:
+            if linked(parent):
+                raise ValueError('reparse-or-symbolic-link: ' + str(parent))
+        except FileNotFoundError:
+            continue
+
+
+def path_identity(path):
+    path = absolute(path)
+    safe_path(path)
+    # Match cdb_verified_batch._proof_work_root, including missing suffixes.
+    # Only comparison/hash keys are resolved; traversal keeps its original path.
+    return path.resolve()
 
 
 def process_snapshot():
@@ -111,9 +123,19 @@ def inventory(work_root, reference_roots, active_roots=(), observe=process_snaps
     fingerprints, seen, pending = {}, set(), []
     before = observe()
 
+    def identity(path):
+        try:
+            return path_identity(path)
+        except (OSError, ValueError) as error:
+            errors.append({'path': str(path), 'reason': str(error)})
+            return None
+
+    work_identity = identity(work_root)
+    active_identities = [value for root in active_roots if (value := identity(root)) is not None]
+
     def store(path):
         path = absolute(path)
-        bucket = hashlib.sha256(str(path).encode()).hexdigest()[:24]
+        bucket = hashlib.sha256(str(path_identity(path)).encode()).hexdigest()[:24]
         stores.setdefault(bucket, set()).add(str(path))
 
     def read(path):
@@ -293,13 +315,17 @@ def inventory(work_root, reference_roots, active_roots=(), observe=process_snaps
               ('referenced', 'active', 'unreferenced_reclaimable', 'unknown')}
     def group_sources(sources):
         grouped, ancestors = {}, []
+        if work_identity is None:
+            return grouped, ancestors
         for item in sources:
-            path = Path(item['path'])
-            if not path.is_relative_to(work_root):
-                if work_root.is_relative_to(path):
+            path = identity(item['path'])
+            if path is None:
+                continue
+            if not path.is_relative_to(work_identity):
+                if work_identity.is_relative_to(path):
                     ancestors.append((path, item))
                 continue
-            parts = path.relative_to(work_root).parts
+            parts = path.relative_to(work_identity).parts
             if len(parts) < 2:
                 ancestors.append((path, item))
             else:
@@ -309,12 +335,16 @@ def inventory(work_root, reference_roots, active_roots=(), observe=process_snaps
 
     by_unit, ancestor_refs = group_sources(references)
     historical_by_unit, ancestor_history = group_sources(historical)
+    unit_identities = {path: identity(path) for path in units}
     for row in units.values():
-        unit = Path(row['path'])
-        row['references'] = by_unit.get(str(unit), []) + [ref for path, ref in ancestor_refs if unit.is_relative_to(path)]
-        row['historical_sources'] = historical_by_unit.get(str(unit), []) + [ref for path, ref in ancestor_history if unit.is_relative_to(path)]
+        unit = unit_identities[row['path']]
+        row['references'] = by_unit.get(row['path'], []) + [ref for path, ref in ancestor_refs
+            if unit is not None and unit.is_relative_to(path)]
+        row['historical_sources'] = historical_by_unit.get(row['path'], []) + [ref for path, ref in ancestor_history
+            if unit is not None and unit.is_relative_to(path)]
         row['stores'] = sorted(stores.get(row['bucket'], []))
-        explicit_active = any(unit.is_relative_to(root) or root.is_relative_to(unit) for root in active_roots)
+        explicit_active = unit is not None and any(unit.is_relative_to(root) or root.is_relative_to(unit)
+            for root in active_identities)
         if explicit_active or (row['stores'] and owner_active):
             category, reason = 'active', 'explicit-active-root-or-live-owner'
         elif row['references']:
@@ -351,7 +381,9 @@ def main():
     args = parser.parse_args()
     output = absolute(args.out)
     safe_path(output.parent)
-    if output.is_relative_to(absolute(args.work_root)) or any(output.is_relative_to(absolute(root)) for root in args.reference_root):
+    output_identity = path_identity(output)
+    if output_identity.is_relative_to(path_identity(args.work_root)) or any(
+            output_identity.is_relative_to(path_identity(root)) for root in args.reference_root):
         parser.error('--out must be outside work and reference roots')
     if output.exists():
         parser.error('--out already exists; choose a new report path')

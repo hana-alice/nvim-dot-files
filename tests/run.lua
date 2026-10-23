@@ -19,6 +19,26 @@
 -- 抑制 LazyVim 的 stdin 启动路径（与 headless_smoke.lua 一致）。
 vim.g.started_with_stdin = true
 
+-- A Windows 8.3 TEMP alias makes every vim.fn.tempname() fixture spell its root differently from
+-- the physical path that clangd and the native watchers report. tempname()'s directory is fixed
+-- at process start, so re-run once under the long TEMP rather than patching each fixture.
+-- Short-path behaviour keeps explicit coverage in specs that build 8.3 aliases themselves.
+if vim.fn.has("win32") == 1 and vim.env.NVIM_TEST_LONG_TEMP ~= "1" then
+  local temp = vim.env.TEMP or vim.env.TMP
+  local real = temp and vim.uv.fs_realpath(temp)
+  local function norm(path) return (path:gsub("/", "\\"):gsub("\\+$", ""):lower()) end
+  if real and norm(real) ~= norm(temp) then
+    local env = vim.fn.environ()
+    env.TEMP, env.TMP, env.NVIM_TEST_LONG_TEMP = real, real, "1"
+    local cmd = { vim.v.progpath, "--headless", "-l", debug.getinfo(1, "S").source:sub(2) }
+    vim.list_extend(cmd, _G.arg or {})
+    local result = vim.system(cmd, { env = env, clear_env = true, text = true }):wait()
+    io.stdout:write(result.stdout or "")
+    io.stderr:write(result.stderr or "")
+    os.exit(result.code)
+  end
+end
+
 -- 回归中的 probe 调用必须写入临时隔离文件，绝不能污染真实的
 -- stdpath('state')/ue_probes.json。probe.lua 也会在测试 seam 切换时取消
 -- 尚未触发的防抖 timer，避免旧测试 payload 延迟写到新路径。

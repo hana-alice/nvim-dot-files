@@ -212,7 +212,7 @@ t.describe("index subset runs outside the editor thread", function()
     if not ok then error(failure) end
   end)
 
-  t.it("all phases select a proof store without reading the active CDB on the editor thread", function()
+  t.it("proof store phase scopes preserve ordinary dispatch without reading the active CDB", function()
     local ctx, _, keys = fixture()
     ctx.paths.index_full_cdb, ctx.paths.full_index = ctx.engine_root .. "/index/full.json", ctx.engine_root .. "/index/full.idx"
     ctx.paths.semantic_full_cdb = ctx.engine_root .. "/background/full/compile_commands.json"
@@ -220,7 +220,9 @@ t.describe("index subset runs outside the editor thread", function()
     write(vim.fs.dirname(ctx.paths.semantic_cdb) .. "/batch-store.json", vim.json.encode({ schema = 1, path = store }))
     local saved = { open = io.open, system = vim.system, select = index.select_phase_module_keys,
       subset = index.write_subset_compile_commands, queued = index.try_start_queued_build,
-      notify = vim.notify, job = index._rt.job }
+      notify = vim.notify, job = index._rt.job, needs_worker = index.publication_needs_worker,
+      finish_publication = index.finish_publication_async, background = index.start_background_batches,
+      source_pending = index.source_refresh_pending, phase_committed = index.phase_publication_committed }
     local ok, failure = pcall(function()
       index._rt.job = nil
       index.select_phase_module_keys = function() return keys end
@@ -270,9 +272,74 @@ t.describe("index subset runs outside the editor thread", function()
         t.assert_nil(vim.uv.fs_stat(ctx.paths.semantic_cdb), "failed subset must not publish")
       end
       if vim.tbl_contains(command, "--verified-batches") then
+        for _, phases in ipairs({ { "current", "hot" }, { "full" }, { "hot" }, { "full", "current", "hot" } }) do
+          write(vim.fs.dirname(ctx.paths.semantic_cdb) .. "/batch-store.json",
+            vim.json.encode({ schema = 1, path = store, phases = phases }))
+          for _, phase in ipairs({ "current", "hot", "full" }) do
+            t.assert_true(index.build_phase_async(ctx, phase))
+            local selected
+            for position, value in ipairs(command) do
+              if value == "--verified-batch-store" then selected = command[position + 1] end
+            end
+            t.assert_eq(selected, vim.tbl_contains(phases, phase) and store or nil,
+              "only listed phases select the external proof store")
+            t.assert_true(vim.tbl_contains(command, "--verified-batches"))
+            t.assert_true(vim.tbl_contains(command, "--reuse-verified-only"),
+              "unlisted phases retain ordinary cache reuse, not synchronous qualification")
+            t.assert_false(vim.tbl_contains(command, "--batch-proof-limit"))
+            pending({ code = 1, stdout = "", stderr = "phase-scoped selector fixture" })
+            t.assert_true(vim.wait(1000, function() return index._rt.job == nil end, 10))
+          end
+        end
+        -- Complete only the generator/publication seams: the actual build
+        -- callback must retain the ordinary full proof queue when excluded.
+        local background_requests = {}
+        index.publication_needs_worker = function() return true end
+        index.source_refresh_pending = function() return false end
+        index.phase_publication_committed = function() end
+        index.finish_publication_async = function(context, _, phase, path, _, _, callback)
+          t.assert_eq(context, ctx)
+          t.assert_eq(phase, "full")
+          local manifest = { phase = phase, index_path = path, coverage_level = "full",
+            generation_id = "selector-fixture-generation", artifact_fingerprint = "selector-fixture-artifact" }
+          callback(nil, { manifest = manifest, generation = { generation_id = manifest.generation_id },
+            selection = manifest, promoted = true, publication = { changed = false } })
+          return true
+        end
+        index.start_background_batches = function(context, request)
+          t.assert_eq(context, ctx)
+          t.assert_true(request.enabled)
+          t.assert_eq(request.store, vim.fs.dirname(ctx.paths.semantic_cdb) .. "/verified_batches")
+          t.assert_eq(request.background, ctx.paths.semantic_full_cdb)
+          t.assert_eq(request.marker, ctx.paths.full_index)
+          t.assert_type(request.env, "table")
+          background_requests[#background_requests + 1] = request
+        end
+        write(ctx.paths.full_index, "selector-fixture-marker")
+        write(ctx.paths.semantic_full_cdb, "[]")
+        for _, selection in ipairs({
+          { phases = { "current", "hot" }, queued = 1 },
+          { queued = 0 }, -- Omitted phases still select the external store for full.
+          { phases = { "full" }, queued = 0 },
+        }) do
+          background_requests = {}
+          write(vim.fs.dirname(ctx.paths.semantic_cdb) .. "/batch-store.json",
+            vim.json.encode({ schema = 1, path = store, phases = selection.phases }))
+          t.assert_true(index.build_phase_async(ctx, "full"))
+          pending({ code = 0, stdout = "", stderr = "" })
+          t.assert_true(vim.wait(1000, function() return index._rt.job == nil end, 10))
+          t.assert_eq(index.ensure_index_state(ctx).build.status, "ready")
+          t.assert_eq(#background_requests, selection.queued,
+            "only unlisted full phases retain the ordinary Tier 1 background queue")
+        end
         write(ctx.paths.semantic_cdb, "previous-publication")
-        for _, invalid in ipairs({ "{broken", vim.json.encode({ schema = 2, path = store }),
-          vim.json.encode({ schema = 1, path = "relative/store" }), string.rep(" ", 65537) }) do
+        local invalid_selections = { "{broken", vim.json.encode({ schema = 2, path = store }),
+          vim.json.encode({ schema = 1, path = "relative/store" }), string.rep(" ", 65537) }
+        for _, phases in ipairs({ {}, false, "current", vim.NIL, { "current", "current" },
+          { "current", "unknown" }, { "CURRENT" }, { "current", false }, { current = true }, { 1 } }) do
+          invalid_selections[#invalid_selections + 1] = vim.json.encode({ schema = 1, path = store, phases = phases })
+        end
+        for _, invalid in ipairs(invalid_selections) do
           write(vim.fs.dirname(ctx.paths.semantic_cdb) .. "/batch-store.json", invalid)
           command = nil
           local started, reason = index.build_phase_async(ctx, "full")
@@ -303,6 +370,9 @@ t.describe("index subset runs outside the editor thread", function()
     io.open, vim.system, vim.notify = saved.open, saved.system, saved.notify
     index.select_phase_module_keys, index.write_subset_compile_commands = saved.select, saved.subset
     index.try_start_queued_build, index._rt.job = saved.queued, saved.job
+    index.publication_needs_worker, index.finish_publication_async = saved.needs_worker, saved.finish_publication
+    index.start_background_batches, index.source_refresh_pending = saved.background, saved.source_pending
+    index.phase_publication_committed = saved.phase_committed
     cleanup(ctx)
     if not ok then error(failure) end
   end)

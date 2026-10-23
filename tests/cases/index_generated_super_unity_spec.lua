@@ -215,12 +215,13 @@ spec.loader.exec_module(module)
 with tempfile.TemporaryDirectory(prefix='tier1_chunks_') as temporary:
     root = pathlib.Path(temporary).resolve()
     baseline = 393216
-    def unit(name, sizes=(1,), kinds=None, module_name='Sample', options=()):
+    def unit(name, sizes=(1,), kinds=None, module_name='Sample', options=(), member_names=None):
         members = []
         kinds = kinds or ['src'] * len(sizes)
         for index, (size, kind) in enumerate(zip(sizes, kinds)):
             suffix = '.gen.cpp' if kind == 'gen' else '.cpp'
-            member = root / 'Source/Runtime' / module_name / 'Private' / (name + str(index) + suffix)
+            member_name = member_names[index] if member_names is not None else name + str(index) + suffix
+            member = root / 'Source/Runtime' / module_name / 'Private' / member_name
             member.parent.mkdir(parents=True, exist_ok=True)
             with member.open('wb') as stream: stream.truncate(size)
             members.append(member)
@@ -233,14 +234,15 @@ with tempfile.TemporaryDirectory(prefix='tier1_chunks_') as temporary:
             'nvim_ue_module_root': 'Source/Runtime/' + module_name}
     def plan(entries, **kwargs):
         before = copy.deepcopy(entries)
+        planner = module.strict_unity_chunks if kwargs.pop('strict', False) else module.secondary_unity_chunks
         with patch.object(subprocess, 'Popen', side_effect=AssertionError('chunk planning must not run native')):
-            chunks = module.secondary_unity_chunks(entries, **kwargs)
+            chunks = planner(entries, **kwargs)
         assert entries == before, 'planning mutated original commands or membership'
         assert len([i for chunk in chunks for i in chunk]) == len(set(i for chunk in chunks for i in chunk))
         return chunks
     with patch.dict(os.environ, {}, clear=False):
         os.environ.pop('NVIM_UE_SUPER_UNITY_BUDGET_FACTOR', None)
-        if operation == 'triple_key':
+        if operation in ('triple_key', 'noclass_unchanged'):
             entries = [unit('g0', kinds=['gen']), unit('s0'),
                 unit('m0', (1, 1), ['gen', 'src']),
                 unit('ctx0', kinds=['gen'], options=['-DVALUE=1']),
@@ -249,7 +251,61 @@ with tempfile.TemporaryDirectory(prefix='tier1_chunks_') as temporary:
                 unit('m1', (1, 1), ['src', 'gen']),
                 unit('ctx1', kinds=['gen'], options=['-DVALUE=1']),
                 unit('other1', kinds=['gen'], module_name='Other')]
-            assert plan(entries) == [[0, 5], [1, 6], [2, 7], [3, 8], [4, 9]]
+            if operation == 'triple_key':
+                assert plan(entries) == [[0, 5], [1, 6], [2, 7], [3, 8], [4, 9]]
+            else:
+                assert plan(entries, split_member_classes=False) == [[0, 1, 2, 5, 6, 7], [3, 8], [4, 9]]
+                assert plan(entries, split_member_classes=False, max_unities=3) == [
+                    [0, 1, 2], [3, 8], [4, 9], [5, 6, 7]]
+        elif operation == 'noclass_same_stem':
+            # The existing wrapper-size parser accepts .cpp only. Exercise
+            # .cc/.cxx stem recognition directly without changing that policy.
+            assert module._member_stems([
+                r'D:\\Source\\Mixed\\Alpha.CPP', '/different/ALPHA.gen.CPP',
+                '/source/Beta.CC', '/generated/beta.GEN.cpp', '/source/Gamma.cXx',
+                '/ignored/Header.h', '/ignored/Other.c']) == ({'alpha', 'beta', 'gamma'}, {'alpha', 'beta'})
+            source = unit('same_source', member_names=['Source/Alpha.CPP'])
+            generated = unit('same_generated', kinds=['gen'], member_names=['Inc/aLpHa.GeN.CpP'])
+            safe_source, safe_generated = unit('safe_source'), unit('safe_generated', kinds=['gen'])
+            for entries in ([source, safe_source, generated, safe_generated],
+                            [generated, safe_generated, source, safe_source]):
+                assert plan(entries, split_member_classes=False) == [[0, 1, 2, 3]], \
+                    'same-stem avoidance must remain opt-in'
+                assert plan(entries, split_member_classes=False, avoid_same_stem_pairs=True) == [[0, 1], [2, 3]]
+                assert plan([entries[0], entries[2]], split_member_classes=False, avoid_same_stem_pairs=True) == []
+            # A later member of either indivisible UBT can cause the conflict.
+            multi_source = unit('multi_source', (1, 1), member_names=['Left/First.cpp', 'Left/Second.cpp'])
+            multi_generated = unit('multi_generated', (1, 1), ['gen', 'gen'],
+                member_names=['Right/Other.gen.cpp', 'Right/sEcOnD.gen.cpp'])
+            for entries in ([multi_source, safe_source, multi_generated, safe_generated],
+                            [multi_generated, safe_generated, multi_source, safe_source]):
+                assert plan(entries, split_member_classes=False, avoid_same_stem_pairs=True) == [[0, 1], [2, 3]], entries
+                assert all(len(entries[index]['nvim_ue_members']) == 2 for index in (0, 2))
+        elif operation == 'noclass_stem_boundaries':
+            names = ['X.cpp', 'A.cpp', 'x.gen.cpp', 'B.cpp', 'Y.cpp', 'y.gen.cpp', 'C.cpp']
+            entries = [unit('limit' + str(index), (baseline // 2,), member_names=[name])
+                for index, name in enumerate(names)]
+            # A conflict closes the current block; subsequent candidates retain
+            # original order, byte limits, member limits and UBT count limits.
+            assert plan(entries, split_member_classes=False) == [list(range(7))]
+            assert plan(entries, split_member_classes=False, avoid_same_stem_pairs=True) == [[0, 1], [2, 3, 4], [5, 6]]
+            for limits in ({'budget_factor': 1}, {'max_unities': 2}, {'max_sources': 2}):
+                assert plan(entries, split_member_classes=False, avoid_same_stem_pairs=True, **limits) == [[0, 1], [2, 3], [5, 6]], limits
+            assert plan(entries, split_member_classes=False, avoid_same_stem_pairs=True, max_unities=1) == []
+            oversized = unit('too_large', (baseline + 1,), member_names=['Oversized/X.gen.cpp'])
+            assert plan([entries[0], oversized, entries[2], entries[3]],
+                split_member_classes=False, avoid_same_stem_pairs=True, budget_factor=1) == [[2, 3]]
+        elif operation == 'split_strict_stem_unchanged':
+            names = ['X.cpp', 'x.gen.cpp', 'A.cpp', 'B.gen.cpp', 'Y.cpp', 'y.gen.cpp']
+            entries = [unit('unchanged' + str(index), member_names=[name]) for index, name in enumerate(names)]
+            assert plan(entries, split_member_classes=True, max_unities=2) == [[0, 2], [1, 3]]
+            assert plan(entries, strict=True, max_unities=2) == [[0, 2], [1, 3], [4, 5]]
+            assert plan(entries[4:], split_member_classes=True) == []
+            assert plan(entries[4:], strict=True) == [[0, 1]], 'strict residual policy must remain unchanged'
+            mixed = [unit('mixed_left', (1, 1), member_names=['Mixed/X.cpp', 'Mixed/A.gen.cpp']),
+                unit('mixed_right', (1, 1), member_names=['Other/X.gen.cpp', 'Other/B.cpp'])]
+            assert plan(mixed, split_member_classes=True) == [[0, 1]], 'mixed class packing must remain unchanged'
+            assert plan(mixed, strict=True) == [[0, 1]]
         elif operation == 'byte_budget':
             entries = [unit(str(i), (size,)) for i, size in enumerate([200000, 190000, 5000, 200000])]
             assert plan(entries, budget_factor=1) == [[0, 1], [2, 3]]
@@ -294,6 +350,44 @@ with tempfile.TemporaryDirectory(prefix='tier1_chunks_') as temporary:
             assert record['reason'] == 'member-size-unavailable' and record['entry_index'] == 0, record
             assert record['assumed_bytes'] > baseline and record['member'], record
             assert record['file'] == unknown['file'], record
+        elif operation == 'strict_leftovers':
+            six = [unit('source', (1, 1, 1)), unit('generated', (1, 1, 1), ['gen'] * 3)]
+            assert plan(six) == [], 'Tier 1 must retain its member-class boundary'
+            assert plan(six, strict=True) == [[0, 1]]
+            entries = [unit(str(i), kinds=['src' if i % 2 == 0 else 'gen']) for i in range(6)]
+            existing = [[0, 2], [1, 3]]
+            assert plan(entries, max_unities=2) == existing
+            assert plan(entries, max_unities=2, split_member_classes=False) == [[0, 1], [2, 3], [4, 5]]
+            assert plan(entries, strict=True, max_unities=2) == existing + [[4, 5]], \
+                'strict planning must retain established groups before consuming only unclaimed originals'
+        elif operation == 'strict_boundaries':
+            source, generated = unit('src'), unit('gen', kinds=['gen'])
+            assert plan([source, generated], strict=True) == [[0, 1]]
+            changed_cwd = dict(generated, directory=str(root / 'other-cwd'))
+            changed_flags = dict(generated, arguments=generated['arguments'] + ['-DOTHER_CONTEXT=1'])
+            changed_module = dict(generated, nvim_ue_module_root='Source/Runtime/Other')
+            for changed in (changed_cwd, changed_flags, changed_module):
+                assert plan([source, changed], strict=True) == [], changed
+            assert plan([source, generated], strict=True, max_unities=1) == []
+            multi = [unit('manysrc', (1,) * 40), unit('manygen', (1,) * 41, ['gen'] * 41)]
+            assert plan(multi, strict=True, max_sources=80) == [], 'strict planning must preserve its caller member limit'
+            assert plan(multi, strict=True, max_sources=81) == [[0, 1]]
+            assert plan([source, generated], strict=True, max_sources=1) == []
+            edge = [unit('edgesrc', (baseline // 2,)), unit('edgegen', (baseline // 2,), ['gen'])]
+            assert plan(edge, strict=True, budget_factor=1) == [[0, 1]], 'byte limit is inclusive'
+            too_large = unit('oversizegen', (baseline // 2 + 1,), ['gen'])
+            assert plan([edge[0], too_large], strict=True, budget_factor=1) == []
+        elif operation == 'strict_residual_closure':
+            entries = [unit('a', (2 * baseline,)), unit('b', (baseline,), ['gen']),
+                unit('c', (3 * baseline,)), unit('d', (baseline,)), unit('e', (baseline,))]
+            assert plan(entries, budget_factor=4) == [[2, 3]]
+            chunks = plan(entries, strict=True, budget_factor=4)
+            assert chunks == [[2, 3], [0, 4]], chunks
+            assert 1 not in [index for chunk in chunks for index in chunk], 'generated singleton must retain its original UBT'
+            for chunk in chunks:
+                selected = [entries[index] for index in chunk]
+                assert plan(selected, strict=True, budget_factor=4) == [list(range(len(selected)))], \
+                    'every selected group must pass the worker independent regrouping guard'
         else: raise AssertionError(operation)
     print(json.dumps({'operation': operation, 'status': 'passed'}))
 ]=]
@@ -333,6 +427,24 @@ t.describe("Tier 1 byte-budget secondary UBT planning", function()
   end)
   t.it("keeps unreadable members outside batches and reports the conservative byte estimate", function()
     run_secondary_fixture("unknown_size")
+  end)
+end)
+
+t.describe("Tier 1 optional no-class same-stem exclusion", function()
+  for _, operation in ipairs({ "noclass_same_stem", "noclass_stem_boundaries", "noclass_unchanged", "split_strict_stem_unchanged" }) do
+    t.it(operation, function() run_secondary_fixture(operation) end)
+  end
+end)
+
+t.describe("strict secondary UBT planning", function()
+  t.it("retains established class groups and adds only compatible unclaimed source/generated groups", function()
+    run_secondary_fixture("strict_leftovers")
+  end)
+  t.it("preserves compiler contexts and indivisible byte, member and UBT limits across classes", function()
+    run_secondary_fixture("strict_boundaries")
+  end)
+  t.it("exhausts newly compatible same-class leftovers before forming independently regroupable batches", function()
+    run_secondary_fixture("strict_residual_closure")
   end)
 end)
 

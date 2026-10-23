@@ -464,25 +464,24 @@ M.build_phase_async = function(ctx, phase, opts)
     -- It selects where to look; only the existing receipt checks grant reuse.
     local store_path = fs.join(vim.fs.dirname(ctx.paths.semantic_cdb), "batch-store.json")
     local store_stat = vim.uv.fs_stat(store_path)
+    local selected_store
     if store_stat then
       if store_stat.type ~= "file" or store_stat.size > 65536 then
         return fail_before_spawn("invalid batch-store.json: expected a small selection file")
       end
       local store = core.h.read_json_file(store_path)
-      if type(store) ~= "table" or store.schema ~= 1 or type(store.path) ~= "string"
-          or not fs.is_absolute_path(store.path) or store.path:find("[%z\r\n]") then
-        return fail_before_spawn("invalid batch-store.json: expected schema=1 and an absolute proof-store path")
-      end
-      vim.list_extend(cmd, { "--verified-batch-store", store.path })
-      vim.list_extend(cmd, { "--reuse-verified-only" })
+      local selection_error
+      selected_store, selection_error = require("ue.index.batch_descriptor").selected_store(store, phase)
+      if selection_error then return fail_before_spawn(selection_error) end
+    end
+    if selected_store then
+      vim.list_extend(cmd, { "--verified-batch-store", selected_store })
     elseif phase == "full" then
-      vim.list_extend(cmd, { "--reuse-verified-only" })
       background_request = { enabled = true, python = python, clangd = clangd.path, profile = server_profile,
         store = fs.join(vim.fs.dirname(ctx.paths.semantic_cdb), "verified_batches"),
         background = background_cdb, marker = out_idx }
-    else
-      vim.list_extend(cmd, { "--reuse-verified-only" })
     end
+    vim.list_extend(cmd, { "--reuse-verified-only" })
     if server_profile then vim.list_extend(cmd, { "--server-profile", vim.json.encode(server_profile) }) end
   end
 

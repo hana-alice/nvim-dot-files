@@ -43,8 +43,9 @@ fail-closed 语义），禁止注入假可执行文件/假宿主让断言「碰�
 | `lua/ue/cdb/**` | `ue_cdb` |
 | `lua/ue/dap/**` / `lua/utils/platform/**` | `dap` `platform` `dap_failure_layer` `ue_platform_boundary` |
 | `lua/ue/index/**` / `lua/ue/clangd_commands.lua` / controlled CDB generators | `index_generation` `index_subset_async` `cpp_semantic_index` `clangd_commands` `ue_api` `ue_platform_boundary` |
-| 二次批次 / RIFF 图 / 冻结输入验证与运行时保护（含 `batch_runtime` / `batch_shard_seed`） | `index_batch_runtime` `index_graph` `index_batch` `index_input_directory` `index_verified_batch` `index_inventory` `index_query_profile` `index_vfs_aliases` `index_generation` `cpp_semantic_client` `host_resource_discipline` |
+| 二次批次 / RIFF 图 / 冻结输入验证与运行时保护（含 `batch_runtime` / `batch_shard_seed`） | `index_batch_runtime` `index_graph` `index_batch` `index_input_directory` `index_verified_batch` `index_tier1_cohort` `index_inventory` `index_query_profile` `index_vfs_aliases` `index_generation` `cpp_semantic_client` `host_resource_discipline` |
 | 离线有序二次候选 `tools/cdb_ordered_unity.py` | `index_ordered_unity` `structure` |
+| 显式有序 strict 配方 `tools/cdb_ordered_batch.py` 及验证/后台接入 | `index_ordered_batch` `index_ordered_unity` `index_verified_batch` `index_batch_background` `structure` |
 | 离线 generated-only 二次候选 | `index_generated_super_unity` `structure` |
 | Shader donor 来源 / C++ 后台路由 | `ue_cdb` `ue_unity_origin` `index_unity_receipt` `index_shader_routing` `index_generation` |
 | 源码内容变化 / 相同 CDB 的后台刷新 | `index_source_refresh` `index_delivery` `ue_watch_csearch` `stability` |

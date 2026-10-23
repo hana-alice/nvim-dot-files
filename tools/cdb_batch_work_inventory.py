@@ -38,7 +38,11 @@ def linked(path):
 
 def safe_path(path):
     # Inspect ancestors before descendants; exists() would hide broken links.
+    # Top-level OS layout links (macOS /var -> /private/var, /tmp) are not
+    # user junctions; checking them would reject every temporary path.
     for parent in reversed((path, *path.parents)):
+        if os.name != 'nt' and len(parent.parts) <= 2:
+            continue
         try:
             if linked(parent):
                 raise ValueError('reparse-or-symbolic-link: ' + str(parent))

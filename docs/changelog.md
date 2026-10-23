@@ -140,7 +140,10 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
   request.
 - `ide_document_find_ui` (macOS CI, 2 runs): Enter was rejected with "查找结果已失效" at generation 2
   and the picker stayed open. 推测: the finder had settled but the list still showed the previous
-  generation's row. `settle()` now also waits until the current row's generation matches the session.
+  generation's row. `settle()` now waits until the list holds exactly `status.count` rows, all from the
+  current generation (the first fix only checked the current row and still failed once on macOS).
+- Windows CI (c7efc22): the Chocolatey feed answered 503 for `fd` while `choco install` still exited 0,
+  so five native fd cases failed. The workflow step now retries and requires `rg` and `fd` on PATH.
 
 **Validation**
 - Windows nvim 0.11.5 and 0.12.6, WSL Ubuntu 24.04: affected filters green (see full-regression line

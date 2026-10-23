@@ -105,7 +105,17 @@ jobs:
 
       - name: Existing search prerequisites (Windows)
         if: runner.os == 'Windows'
-        run: choco install ripgrep fd -y --no-progress
+        shell: pwsh
+        # The Chocolatey community feed can answer 503 for one package while choco still exits 0
+        # ("installed 1/1"); retry and require both tools on PATH.
+        run: |
+          foreach ($attempt in 1..5) {
+            choco install ripgrep fd -y --no-progress
+            if ((Get-Command rg -ErrorAction SilentlyContinue) -and (Get-Command fd -ErrorAction SilentlyContinue)) { exit 0 }
+            Write-Host "rg/fd missing after attempt $attempt; retrying in 20s"
+            Start-Sleep -Seconds 20
+          }
+          throw "ripgrep/fd install failed after 5 attempts"
 
       - name: Bootstrap locked plugins and syntax parsers
         run: nvim --headless -l scripts/bootstrap_headless_ci.lua

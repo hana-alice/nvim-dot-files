@@ -41,9 +41,16 @@ def wait(code):
         time.sleep(.015)
     raise AssertionError(code+' '+str(lua('return {kind=Kind,status=P and F.status(P),notices=Notices,mode=vim.fn.mode(),win=vim.api.nvim_get_current_win()==Source.win,cursor=vim.api.nvim_win_get_cursor(Source.win)}')))
 def settle():
-    # The list can still show the previous generation's row after the finder settles; Enter on it is
-    # rejected as stale (macOS CI: "查找结果已失效", generation 2). Wait for the current row to catch up.
-    wait('return P and not P.closed and not P.finder:running() and not P.matcher:running() and F.status(P).state~="debounce" and F.status(P).state~="running" and (not P:current() or P:current().generation==F.status(P).generation)')
+    # The list can still show the previous generation's rows (or none yet) after the finder settles; Enter
+    # on such a row is rejected as stale (macOS CI: "查找结果已失效", generation 2, count 2). Wait until the
+    # list holds exactly the current generation's rows.
+    lua('''Fresh=function()
+      local st=F.status(P);local items=P:items()
+      if #items~=st.count then return false end
+      for _,it in ipairs(items) do if it.generation~=st.generation then return false end end
+      return st.count==0 or P:current()~=nil
+    end''')
+    wait('return P and not P.closed and not P.finder:running() and not P.matcher:running() and F.status(P).state~="debounce" and F.status(P).state~="running" and Fresh()')
     return lua('return F.status(P)')
 def close():
     keys('<Esc>');wait('return P.closed and vim.fn.mode()=="n"');time.sleep(.04)

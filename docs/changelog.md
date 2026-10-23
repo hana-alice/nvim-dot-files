@@ -144,6 +144,10 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
   current generation (the first fix only checked the current row and still failed once on macOS).
 - Windows CI (c7efc22): the Chocolatey feed answered 503 for `fd` while `choco install` still exited 0,
   so five native fd cases failed. The workflow step now retries and requires `rg` and `fd` on PATH.
+- `ide_workspace_reuse` / `ide_workspace` RPC waits: a Lua `nil` returned over RPC arrives as `vim.NIL`,
+  which is truthy, so `picker.closed and mutation and ...` counted as ready while `mutation` was still nil
+  (macOS CI then indexed it). Verified locally (`return nil and 1` → `vim.NIL`); the waits now treat
+  `nil`/`vim.NIL`/`false` as not ready.
 
 **Validation**
 - Windows nvim 0.11.5 and 0.12.6, WSL Ubuntu 24.04: affected filters green (see full-regression line

@@ -24,9 +24,15 @@ local function native(check)
     local encoded = lua("return vim.api.nvim_replace_termcodes(..., true, false, true)", keys)
     t.assert_true(vim.rpcrequest(job, "nvim_input", encoded) > 0)
   end
+  -- A Lua nil crosses RPC as vim.NIL, which is truthy: `a and nil_global` must not count as ready
+  -- (macOS CI passed the wait with `mutation` still nil, then indexed it).
+  local function truthy(code)
+    local value = lua(code)
+    return value ~= nil and value ~= vim.NIL and value ~= false
+  end
   local function eventually(code)
     local ready = vim.wait(3000, function()
-      return not not lua(code)
+      return truthy(code)
     end, 10)
     local details = not ready
         and lua([[
@@ -50,7 +56,7 @@ local function native(check)
       .. string.format("%q", query)
       .. ",1,true)~=nil"
     for _ = 1, 20 do
-      if lua(wanted) then
+      if truthy(wanted) then
         return
       end
       input("<C-n>")

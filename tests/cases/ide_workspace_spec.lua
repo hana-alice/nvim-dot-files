@@ -19,7 +19,8 @@ local function native(check)
   end
   local function eventually(code)
     local ready = vim.wait(2000, function()
-      return lua(code)
+      local value = lua(code) -- nil crosses RPC as the truthy vim.NIL
+      return value ~= nil and value ~= vim.NIL and value ~= false
     end, 10)
     if not ready then
       local details = lua([[return { mode = vim.fn.mode(),

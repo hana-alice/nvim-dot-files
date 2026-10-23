@@ -265,10 +265,12 @@ t.describe("ide_workspace_reuse: explicit editor destination", function()
       f.picker("Hidden1")
       f.input("<CR>")
       f.eventually("return picker.closed and api.nvim_get_current_buf()==hidden[1]")
-      t.assert_true(f.lua([[
-        return normal_count()==3 and api.nvim_win_get_buf(source_win)==source_buf
-          and vim.deep_equal(api.nvim_win_get_cursor(source_win),{1,4}) and unchanged_other_and_qf()
-      ]]))
+      local state = f.lua([[
+        return { normal = normal_count(), source_buf = api.nvim_win_get_buf(source_win)==source_buf,
+          cursor = api.nvim_win_get_cursor(source_win), other = unchanged_other_and_qf() }
+      ]])
+      t.assert_true(state.normal == 3 and state.source_buf and vim.deep_equal(state.cursor, { 1, 4 })
+        and state.other, vim.inspect(state))
     end)
   end)
 

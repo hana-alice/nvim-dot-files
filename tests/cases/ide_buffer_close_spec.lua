@@ -76,7 +76,9 @@ try:
         assert time.monotonic()<deadline,'native confirmation timer failed'
         time.sleep(.01)
     screen='\n'.join(''.join(row) for rows in instance.grids.values() for row in rows)
-    assert 'Alpha.cpp' in screen and '放弃' in screen and '取消' in screen,screen
+    # A long temp path (macOS /private/var/folders/...) wraps the prompt across grid rows.
+    flat=''.join(''.join(row) for rows in instance.grids.values() for row in rows)
+    assert 'Alpha.cpp' in flat and '放弃' in screen and '取消' in screen,screen
     assert instance.lua('return vim.fn.mode(1)')=='r?','must wait in native confirmation'
     assert instance.call('nvim_input','n')>0
     # Let native input dispatch finish the confirmation before another RPC

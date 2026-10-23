@@ -170,7 +170,7 @@ function M.wait_for_clangd(buf, win, cursor, callback, timeout_ms)
         clients[#clients + 1] = string.format("id=%s root=%s initialized=%s stopped=%s attached=%s",
           tostring(client.id), tostring(client.config and client.config.root_dir),
           tostring(client.initialized), tostring(stopped(client)),
-          tostring(client.attached_buffers and client.attached_buffers[buf] == true))
+          tostring(client.attached_buffers and client.attached_buffers[buf] ~= nil))
       end
       notify(string.format("等待 clangd 附加超时（%.0f ms）；%s；client 状态：%s。已保留工作区文件，可稍后重试 gd。",
         (vim.uv.hrtime() - started) / 1000000, start_state,

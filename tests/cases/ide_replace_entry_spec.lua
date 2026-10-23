@@ -57,6 +57,11 @@ assert(vim.deep_equal(vim.api.nvim_buf_get_lines(source_buf, 0, -1, true), origi
   "opening the explicit replacement tool changed source text")
 vim.api.nvim_set_current_win(source_win)
 vim.api.nvim_win_set_buf(source_win, source_buf)
+-- GrugFar's own window may start Insert mode (Linux/macOS CI showed "-- (insert) --");
+-- leave it, and close the fixture's setup undo block so u restores only the substitute.
+vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
+vim.bo[source_buf].undolevels = vim.bo[source_buf].undolevels
+assert(vim.fn.mode() == "n", "source must be in Normal mode before the replace entry")
 if scenario == "visual" then
   vim.cmd("normal! gg0v4l")
   after.callback()

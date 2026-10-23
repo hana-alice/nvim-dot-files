@@ -98,6 +98,33 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-10-23 — Headless CI follow-up (Linux /proc links, macOS wraps, nvim 0.12 Windows)
+
+**Task**
+- The second CI run (889687c) still failed on all three platforms; fix the remaining real causes.
+
+**Implemented**
+- `prepare_inputs.scan`: a non-input tool link whose target lies outside every covered root (Linux
+  `/proc/<pid>/fd` style links under the tool tree) is not followed; EACCES tolerance stays.
+- `ue.lua diagnostic_entries_from_output`: a bare `error:`/`warning:` location line whose message the
+  terminal wrapped onto the next line keeps that message (macOS clang output); new regression case.
+- `ui_responsiveness`: LSP log level goes through `vim.lsp.log.set_level` when available (0.12).
+- `review_goto`: `attached_buffers[buf] ~= nil` (0.12 stores non-boolean values).
+- Specs: `review_goto_native` resolves clangd/clang++ from `UE_CLANGD`/PATH and skips without a
+  sibling compiler; prepare-cache read-only-tool guard; `ide_buffer_close` matches a wrapped prompt;
+  `ide_workspace` waits for the resize before stopping a re-shown terminal (0.12.6 Windows segfault);
+  `ide_replace_entry` starts the substitute from Normal mode with a closed undo block;
+  `search_precision_ui` accepts a superseded stream that finished natively before the stop on a fast
+  host; `ide_workspace_reuse` reports its observed window state on failure.
+
+**Pitfalls / Gotchas**
+- nvim 0.12.6 Windows: stopping a terminal job in the same tick its buffer is shown at a new size
+  crashes nvim (jobstop/chanclose/kill alike; minimal repro: termopen → enew → split → set_buf → jobstop).
+
+**Validation**
+- Windows nvim 0.11.5 and 0.12.6, WSL Ubuntu 24.04: affected filters green (see full-regression line
+  in the commit); Windows nvim 0.11.5 full regression 4383/4383 passed, 2 skipped.
+
 ### 2026-10-23 — Repair headless CI on ubuntu / macOS / windows (nvim 0.12.6)
 
 **Task**

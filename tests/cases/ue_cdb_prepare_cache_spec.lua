@@ -202,6 +202,10 @@ t.describe("prepare cache real input evidence", function()
           t.skip("system toolchain layouts", "creating a link to the real compiler needs a host privilege (Windows developer mode)")
           return
         end
+        -- A linked driver derives its resource directory from the link location
+        -- (toolchain/lib/clang/<major>), as a real relocated toolchain would ship it.
+        local resource = vim.trim(vim.system({ driver, "-print-resource-dir" }, { text = true }):wait(10000).stdout or "")
+        if resource ~= "" and not uv.fs_stat(resource) then vim.fn.mkdir(resource .. "/include", "p") end
         local function collect()
           write(ctx.paths.active_cdb, { { directory = root, file = root .. "/Source/A.cpp",
             arguments = { driver, "-c", root .. "/Source/A.cpp" } } })
@@ -283,9 +287,24 @@ t.describe("prepare cache real input evidence", function()
     end)
   end)
 
+  -- Readonly identity reuse needs an installed toolchain this account cannot
+  -- write (Program Files as a normal user). An elevated CI runner with LLVM in
+  -- its temp directory writes the barrier marker successfully, so the host
+  -- lacks the capability; that is a skip, never a faked denial.
+  local function readonly_tools_or_skip(name)
+    if next(cache.status().readonly_tool_roots or {}) ~= nil then return true end
+    local directory = vim.fs.dirname(compiler)
+    if uv.fs_access(directory, "W") then
+      t.skip(name, "installed compiler directory is writable by this account: no readonly tool root")
+      return false
+    end
+    return true
+  end
+
   t.it("reseal after writable tool markers preserves readonly evidence and later reuse", function()
     fixture(function(ctx)
       seal(ctx)
+      if not readonly_tools_or_skip("reseal readonly evidence") then return end
       t.assert_true(next(cache.status().readonly_tool_roots or {}) ~= nil)
       local original_system, completed, inventories = vim.system, false, 0
       vim.system = function(command, options, callback)
@@ -323,6 +342,7 @@ t.describe("prepare cache real input evidence", function()
   t.it("closed source write immediately before begin revokes reuse without a settling sleep", function()
     fixture(function(ctx, _, root)
       seal(ctx)
+      if not readonly_tools_or_skip("closed source write readonly reuse") then return end
       t.assert_true(next(cache.status().readonly_tool_roots or {}) ~= nil,
         "default installed tools must exercise readonly identity reuse")
       t.assert_true((cache.status().tools_verified or 0) > 0, "reuse must carry verified readonly tools")

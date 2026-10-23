@@ -357,13 +357,23 @@ local function diagnostic_entries_from_output(output, opts)
   local entries = {}
   local seen = {}
 
-  for _, line in ipairs(lines) do
+  local index = 1
+  while index <= #lines do
+    local line = lines[index]
     local entry = parse_output_entry(line, opts)
+    -- Compilers attached to a terminal wrap at its width: a long path leaves
+    -- only "error:" on the location line and the message on the next one.
+    local following = lines[index + 1]
+    if entry and following and entry.text:match("^%a[%a ]*:$") and not parse_output_entry(following, opts) then
+      entry.text = entry.text .. " " .. following
+      index = index + 1
+    end
     if entry then
       add_quickfix_entry(entries, seen, entry)
     elseif is_summary_diagnostic_line(line) then
       add_quickfix_entry(entries, seen, { text = trim(line) })
     end
+    index = index + 1
   end
 
   if #entries == 0 then

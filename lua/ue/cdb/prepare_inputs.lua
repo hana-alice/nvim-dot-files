@@ -520,7 +520,7 @@ local function collect(request)
   -- Scan every directory, including Build/Intermediate and generated caches;
   -- an unreadable tree or budget exhaustion disables cache instead of guessing.
   local scanned, directory_count = {}, 0
-  local function scan(directory)
+  local function scan(directory, via_tool)
     local physical = uv.fs_realpath(directory)
     if not physical then error("unresolvable watch directory: " .. directory) end
     local id = key(absolute(physical))
@@ -530,13 +530,24 @@ local function collect(request)
     directory_count = directory_count + 1
     if directory_count > (request.max_directories or 150000) then error("watch directory scan budget exceeded") end
     local scanner, err = uv.fs_scandir(directory)
-    if not scanner then error("unreadable watch directory: " .. directory .. ": " .. tostring(err)) end
+    if not scanner then
+      -- A permission-denied directory reached through a read-only toolchain
+      -- (e.g. /usr/lib/ssl/private -> /etc/ssl/private when a distro driver
+      -- lives in /usr/bin) holds no compiler
+      -- input; its readable parent stays under recursive observation. Anywhere
+      -- else, an unreadable directory still makes the capsule unprovable.
+      local tool_tree = via_tool or (readonly_tool(directory) and not tool_input(directory))
+      if not (tostring(err):match("^EACCES") and tool_tree) then
+        error("unreadable watch directory: " .. directory .. ": " .. tostring(err))
+      end
+      return
+    end
     while true do
       local name, kind = uv.fs_scandir_next(scanner)
       if not name then break end
       if name ~= ".git" then
         local child = directory .. "/" .. name
-        if kind == "directory" then scan(child)
+        if kind == "directory" then scan(child, via_tool)
         elseif kind == "file" then
           if compiler_config_dirs[key(directory)] and name:lower():match("%.cfg$") and relevant_config(name) then
             -- Default configs can add @files and external input directories.
@@ -548,17 +559,32 @@ local function collect(request)
           local stat = uv.fs_stat(child)
           -- A dangling link inside a read-only toolchain (e.g. an lldb module
           -- in a distro LLVM) is not a compiler input; its directory stays under
-          -- recursive observation, so retargeting it is still noticed.
-          local dangling_tool = not stat and readonly_tool(child) and not tool_input(child)
-            and uv.fs_lstat(child) ~= nil
-          if not dangling_tool then
-            if not stat then error("unresolvable watch link: " .. child) end
-            local target = uv.fs_realpath(child)
-            if not target then error("unresolvable physical input: " .. child) end
+          -- recursive observation, so retargeting it is still noticed. The same
+          -- holds for a tool link to a directory this user cannot list (a distro
+          -- /usr/lib/ssl/private -> /etc/ssl/private reached from /usr/bin/clang).
+          -- Links to devices/pipes (systemd units masked to /dev/null, /dev/stdin
+          -- style links) are not compiler inputs either.
+          local tool_link = via_tool or (readonly_tool(child) and not tool_input(child))
+          local skipped_tool = tool_link and ((not stat and uv.fs_lstat(child) ~= nil)
+            or (stat and stat.type ~= "file" and stat.type ~= "directory")
+            or (stat and stat.type == "directory" and not uv.fs_access(child, "RX")))
+          local target = not skipped_tool and uv.fs_realpath(child)
+          -- A non-input tool link that leaves every observed root (a distro
+          -- /usr/lib/ssl/certs -> /etc/ssl/certs, WSL /usr/bin/wslpath -> /init)
+          -- is not a compiler input: following it would watch /etc or /. The
+          -- link node itself stays under its directory's recursive watch.
+          if target and tool_link and not covered(absolute(target)) then target = nil; skipped_tool = true end
+          if not skipped_tool and not stat then error("unresolvable watch link: " .. child) end
+          -- /dev/stdin-style links resolve through /proc/<pid>/fd to a stream
+          -- with no physical path; inside a tool tree that is not an input.
+          if not skipped_tool and not target and not tool_link then
+            error("unresolvable physical input: " .. child)
+          end
+          if target then
             input(target)
             if tool_input(child) and stat.type == "file" then tool_file(child) end
             if #roots > (request.max_roots or 32) then error("watch root budget exceeded") end
-            if stat.type == "directory" then scan(target) end
+            if stat.type == "directory" then scan(target, tool_link) end
           end
         end
       end

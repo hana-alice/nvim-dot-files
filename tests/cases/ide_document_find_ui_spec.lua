@@ -39,7 +39,7 @@ def wait(code):
     while time.monotonic()<deadline:
         if lua(code):return
         time.sleep(.015)
-    raise AssertionError(code+' '+str(lua('return {status=P and F.status(P),notices=Notices,mode=vim.fn.mode()}')))
+    raise AssertionError(code+' '+str(lua('return {kind=Kind,status=P and F.status(P),notices=Notices,mode=vim.fn.mode(),win=vim.api.nvim_get_current_win()==Source.win,cursor=vim.api.nvim_win_get_cursor(Source.win)}')))
 def settle():
     wait('return P and not P.closed and not P.finder:running() and not P.matcher:running() and F.status(P).state~="debounce" and F.status(P).state~="running"')
     return lua('return F.status(P)')
@@ -117,9 +117,13 @@ try:
           Other=vim.api.nvim_open_win(vim.api.nvim_create_buf(true,false),false,{split='right',win=Source.win})
         ''')
         for kind in ('edit','cursor','window','enter'):
+            # Let the previous close's scheduled window/cursor restoration finish before capturing
+            # the next owner (macOS CI once saw a stale owner on Enter; cause unverified).
+            lua('vim.wait(60, function() return false end, 10)')
             open(['Needle Needle','tail'],'Needle',(2,1))
             lua('''
               local kind=...
+              Kind=kind
               if kind=='enter' then
                 Group=vim.api.nvim_create_augroup('FindOwnedHandoff',{clear=true})
                 vim.api.nvim_create_autocmd('WinEnter',{group=Group,callback=function()

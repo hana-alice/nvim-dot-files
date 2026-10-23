@@ -115,7 +115,10 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
   `ide_workspace` waits for the resize before stopping a re-shown terminal (0.12.6 Windows segfault);
   `ide_replace_entry` starts the substitute from Normal mode with a closed undo block;
   `search_precision_ui` accepts a superseded stream that finished natively before the stop on a fast
-  host; `ide_workspace_reuse` reports its observed window state on failure.
+  host; `ide_workspace_reuse` waits for the default action's editor split (macOS CI saw 2 normal
+  windows right after close); `ide_replace_entry` loads its source from disk (no setup undo history)
+  and resets the cursor after GrugFar; `ide_document_find_ui` handoff settles between kinds and
+  reports window/cursor evidence (one macOS CI run cancelled the jump with a stale owner; cause unverified).
 
 **Pitfalls / Gotchas**
 - nvim 0.12.6 Windows: stopping a terminal job in the same tick its buffer is shown at a new size

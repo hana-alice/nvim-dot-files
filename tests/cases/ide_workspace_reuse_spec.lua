@@ -264,7 +264,10 @@ t.describe("ide_workspace_reuse: explicit editor destination", function()
       installed_picker(f)
       f.picker("Hidden1")
       f.input("<CR>")
-      f.eventually("return picker.closed and api.nvim_get_current_buf()==hidden[1]")
+      -- macOS CI observed normal=2 right after close (likely the closing preview float still held the
+      -- buffer, unverified); wait for the editor split that the default action creates.
+      f.eventually("return picker.closed and api.nvim_get_current_buf()==hidden[1]"
+        .. " and api.nvim_win_get_config(0).relative==''")
       local state = f.lua([[
         return { normal = normal_count(), source_buf = api.nvim_win_get_buf(source_win)==source_buf,
           cursor = api.nvim_win_get_cursor(source_win), other = unchanged_other_and_qf() }

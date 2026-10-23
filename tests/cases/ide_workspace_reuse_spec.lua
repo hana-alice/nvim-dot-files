@@ -284,6 +284,26 @@ t.describe("ide_workspace_reuse: explicit editor destination", function()
           return close(self, ...)
         end
       ]])
+      f.lua([[
+        sched = { queued = 0, ran = 0, errors = {} }
+        local schedule = vim.schedule
+        vim.schedule = function(fn)
+          sched.queued = sched.queued + 1
+          local id = sched.queued
+          return schedule(function()
+            sched.ran = sched.ran + 1
+            local ok, err = xpcall(fn, debug.traceback)
+            if not ok then sched.errors[#sched.errors + 1] = { id = id, err = tostring(err):sub(1, 900) } end
+          end)
+        end
+        local activate = W.activate
+        W.activate = function(...)
+          activate_calls = (activate_calls or 0) + 1
+          local win, err = activate(...)
+          activate_result = { win = win, err = err }
+          return win, err
+        end
+      ]])
       f.input("<CR>")
       -- macOS CI observed normal=2 right after close (likely the closing preview float still held the
       -- buffer, unverified); wait for the editor split that the default action creates.
@@ -303,6 +323,7 @@ t.describe("ide_workspace_reuse: explicit editor destination", function()
           cursor = api.nvim_win_get_cursor(source_win), other = unchanged_other_and_qf(),
           current = api.nvim_get_current_win(), source_win = source_win, closed = picker.closed,
           notices = notices, wins = wins, win_events = win_events, errmsg = vim.v.errmsg, close_traces = close_traces,
+          sched = sched, activate_calls = activate_calls, activate_result = activate_result,
           mode = api.nvim_get_mode(), current_buf = vim.fn.fnamemodify(api.nvim_buf_get_name(0), ':t'),
           messages = vim.fn.execute('messages') }
       ]])

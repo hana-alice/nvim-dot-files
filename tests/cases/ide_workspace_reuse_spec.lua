@@ -285,14 +285,19 @@ t.describe("ide_workspace_reuse: explicit editor destination", function()
         end
       ]])
       f.lua([[
-        sched = { queued = 0, ran = 0, errors = {} }
+        sched = { queued = 0, ran = 0, errors = {}, items = {} }
         local schedule = vim.schedule
         vim.schedule = function(fn)
           sched.queued = sched.queued + 1
           local id = sched.queued
+          local item = { id = id, at = debug.traceback('', 2):gsub('stack traceback:', ''):sub(1, 500),
+            mode = vim.fn.mode(), started = false, finished = false }
+          sched.items[id] = item
           return schedule(function()
             sched.ran = sched.ran + 1
+            item.started = true
             local ok, err = xpcall(fn, debug.traceback)
+            item.finished = true
             if not ok then sched.errors[#sched.errors + 1] = { id = id, err = tostring(err):sub(1, 900) } end
           end)
         end

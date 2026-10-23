@@ -266,11 +266,22 @@ t.describe("ide_workspace_reuse: explicit editor destination", function()
       f.input("<CR>")
       -- macOS CI observed normal=2 right after close (likely the closing preview float still held the
       -- buffer, unverified); wait for the editor split that the default action creates.
-      f.eventually("return picker.closed and api.nvim_get_current_buf()==hidden[1]"
-        .. " and api.nvim_win_get_config(0).relative==''")
+      -- The split count is part of the wait: macOS once read normal=2 right after the current
+      -- window already showed Hidden1, so a one-shot read raced the layout settling.
+      vim.wait(3000, function()
+        return f.lua("return picker.closed and api.nvim_get_current_buf()==hidden[1]"
+          .. " and api.nvim_win_get_config(0).relative=='' and normal_count()==3")
+      end, 10)
       local state = f.lua([[
+        local wins = {}
+        for _, win in ipairs(api.nvim_list_wins()) do
+          wins[#wins + 1] = { win = win, buf = vim.fn.fnamemodify(api.nvim_buf_get_name(api.nvim_win_get_buf(win)), ':t'),
+            relative = api.nvim_win_get_config(win).relative, tab = api.nvim_win_get_tabpage(win) }
+        end
         return { normal = normal_count(), source_buf = api.nvim_win_get_buf(source_win)==source_buf,
-          cursor = api.nvim_win_get_cursor(source_win), other = unchanged_other_and_qf() }
+          cursor = api.nvim_win_get_cursor(source_win), other = unchanged_other_and_qf(),
+          current = api.nvim_get_current_win(), source_win = source_win, closed = picker.closed,
+          notices = notices, wins = wins }
       ]])
       t.assert_true(state.normal == 3 and state.source_buf and vim.deep_equal(state.cursor, { 1, 4 })
         and state.other, vim.inspect(state))

@@ -119,6 +119,12 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
   windows right after close); `ide_replace_entry` loads its source from disk (no setup undo history)
   and resets the cursor after GrugFar; `ide_document_find_ui` handoff settles between kinds and
   reports window/cursor evidence (one macOS CI run cancelled the jump with a stale owner; cause unverified).
+- Third CI run (c4c2c50, macOS only): `ui_responsiveness` argv check compares `-j` with
+  `clangd_jobs.resolve()` and applies the UI-reserve bound only when `cpus - UI_RESERVED_CORES >=
+  MIN_JOBS` (5-core runner gets the documented floor -j=4); `multi_instance_state` dirty union starts
+  all eight writers behind a file barrier with a 40ms stagger, so slow child startup can no longer
+  exhaust the first writer's bounded retries (cause 推测 from the CI stderr); `ide_workspace_reuse`
+  default Enter waits for the third normal window and dumps the full window layout on failure.
 
 **Pitfalls / Gotchas**
 - nvim 0.12.6 Windows: stopping a terminal job in the same tick its buffer is shown at a new size
@@ -127,6 +133,8 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 **Validation**
 - Windows nvim 0.11.5 and 0.12.6, WSL Ubuntu 24.04: affected filters green (see full-regression line
   in the commit); Windows nvim 0.11.5 full regression 4383/4383 passed, 2 skipped.
+- Third-run fixes: `ui_responsiveness` `multi_instance_state` (3 consecutive runs) `ide_workspace_reuse`
+  green on Windows nvim 0.11.5 and 0.12.6 and WSL Ubuntu 24.04.
 
 ### 2026-10-23 — Repair headless CI on ubuntu / macOS / windows (nvim 0.12.6)
 

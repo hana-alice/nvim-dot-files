@@ -291,7 +291,7 @@ t.describe("ide_workspace_reuse: explicit editor destination", function()
           sched.queued = sched.queued + 1
           local id = sched.queued
           local item = { id = id, at = debug.traceback('', 2):gsub('stack traceback:', ''):sub(1, 500),
-            mode = vim.fn.mode(), started = false, finished = false }
+            fast = vim.in_fast_event(), started = false, finished = false }
           sched.items[id] = item
           return schedule(function()
             sched.ran = sched.ran + 1
@@ -314,10 +314,12 @@ t.describe("ide_workspace_reuse: explicit editor destination", function()
       -- buffer, unverified); wait for the editor split that the default action creates.
       -- The split count is part of the wait: macOS once read normal=2 right after the current
       -- window already showed Hidden1, so a one-shot read raced the layout settling.
-      vim.wait(3000, function()
-        return f.lua("return picker.closed and api.nvim_get_current_buf()==hidden[1]"
-          .. " and api.nvim_win_get_config(0).relative=='' and normal_count()==3")
-      end, 10)
+      -- Wait inside the child: macOS CI showed the Snacks close cleanup and the workspace confirm
+      -- staying queued for 3s while the parent polled via rpcrequest every 10ms (cause unverified).
+      f.lua([[return vim.wait(5000, function()
+        return picker.closed and api.nvim_get_current_buf()==hidden[1]
+          and api.nvim_win_get_config(0).relative=='' and normal_count()==3
+      end, 20)]])
       local state = f.lua([[
         local wins = {}
         for _, win in ipairs(api.nvim_list_wins()) do

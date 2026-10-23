@@ -244,8 +244,9 @@ t.describe("ide_refactor: 审阅后的整批修改与恢复", function()
         return original(buf,...)
       end
       local ok=pcall(vim.lsp.util.apply_workspace_edit,{documentChanges={
-        {textDocument={uri=a.uri},edits={text_edit('New')}},
-        {textDocument={uri=b.uri},edits={text_edit('New')}}}},'utf-16')
+        -- 0.12 requires a version field and 0.11 cannot compare vim.NIL; version 0 skips the check on both.
+        {textDocument={uri=a.uri,version=0},edits={text_edit('New')}},
+        {textDocument={uri=b.uri,version=0},edits={text_edit('New')}}}},'utf-16')
       api.nvim_buf_set_text=original
       assert(not ok and lines(a)[1]=='New a;' and lines(b)[1]=='Old b;')
       assert(disk(a)=='Old a;\n' and disk(b)=='Old b;\n')

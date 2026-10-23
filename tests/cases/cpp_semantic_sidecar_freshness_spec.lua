@@ -120,15 +120,20 @@ t.describe("semantic sidecar committed CDB identity", function()
 end)
 
 t.describe("semantic sidecar builtin resource ownership", function()
-  t.it("uses the loaded parser's installed resource headers instead of the target GCC toolchain", function()
-    local toolchain = native.discover_toolchain()
-    t.assert_true(toolchain.ok, toolchain.reason)
-    local directory = native.compiler_resource_dir(toolchain)
-    t.assert_true(directory ~= nil, "loaded compiler resource headers unavailable")
-    local args = assert(native.semantic_parse_args({ "clang++", "--gcc-toolchain=/target-toolchain", "input.cpp" }, toolchain))
-    t.assert_eq(args[1], "-resource-dir=" .. directory)
-    t.assert_true(vim.tbl_contains(args, "--gcc-toolchain=/target-toolchain"))
-  end)
+  local name = "uses the loaded parser's installed resource headers instead of the target GCC toolchain"
+  local discovered = native.discover_toolchain()
+  if not discovered.ok then
+    t.skip(name, discovered.reason, { native = true })
+  else
+    t.it(name, function()
+      local toolchain = discovered
+      local directory = native.compiler_resource_dir(toolchain)
+      t.assert_true(directory ~= nil, "loaded compiler resource headers unavailable")
+      local args = assert(native.semantic_parse_args({ "clang++", "--gcc-toolchain=/target-toolchain", "input.cpp" }, toolchain))
+      t.assert_eq(args[1], "-resource-dir=" .. directory)
+      t.assert_true(vim.tbl_contains(args, "--gcc-toolchain=/target-toolchain"))
+    end)
+  end
 
   t.it("preserves an explicit resource directory in both compiler argument forms", function()
     for _, flags in ipairs({ { "-resource-dir=/explicit" }, { "-resource-dir", "/explicit" } }) do

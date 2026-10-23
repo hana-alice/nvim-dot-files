@@ -97,3 +97,35 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 - `v2.11.0` → [docs/release_2.11.0.md](release_2.11.0.md) (module-priority phase barrier fix, priority refresh after activation, phase probes; full regression 4381/4381, 2 skips; tag pending)
 
 ## Unreleased
+
+### 2026-10-23 — Repair headless CI on ubuntu / macOS / windows (nvim 0.12.6)
+
+**Task**
+- CI failed on all three platforms; fix the real causes instead of fake hosts.
+
+**Implemented**
+- `document_find_process`: ripgrep < 15 reports `searches = 0, bytes_searched = 0` for a no-match
+  search; accept that only when our own confirmed stdin write proves delivery.
+- `prepare_inputs`: tolerate system toolchain layouts — dangling links inside read-only tool roots
+  (distro LLVM lldb modules) and cross-target `*.cfg` beside the driver (macOS CommandLineTools).
+  Configs clang would load for this driver/target (`<driver>.cfg`, `clang.cfg`, `<triple>-clang.cfg`,
+  unknown triple) still fail closed.
+- `tests/run.lua`: the physical-temp relaunch now also covers macOS `TMPDIR=/var/...` → `/private/var/...`.
+- nvim 0.12 compatibility in specs (`version = 0` text edits, exited terminal channels, a ConPTY
+  resize/jobstop race wait); capability guards for missing csearch tools / libclang.
+- Workflow installs the cindex-uefilter fork + pinned csearch; job timeout 60 min.
+
+**Pitfalls / Gotchas**
+- nvim 0.12 on Windows segfaults when a ConPTY job is stopped within ~20 ms of a resize (upstream).
+- A stale `refs/heads/<branch>.lock` left by an interrupted rebase blocks the ref update.
+
+**Validation**
+- Windows nvim 0.11.5 and 0.12.6: `ue_cdb` 208/208 (+1 skip), `ue_cdb_prepare_cache` 21/21 (new system
+  toolchain fixture), `ide_refactor` 30/30, `ide_task_inspection` 7/7, `search_interaction` 16/16,
+  `cpp_semantic_sidecar_freshness` 10/10, `workarounds_uri` 15/15, `ide_document_find` 28/28.
+- WSL Ubuntu 24.04 (rg 14.1.0): `ide_document_find` 28/28, `search_interaction` 15 + 1 skip.
+- macOS lane validated only through CI.
+
+**Follow-ups**
+- Remaining macOS-only failures (dap_persist_failure, ide_buffer_close, clipboard, ide_recovery,
+  ide_workbench, ide_workspace_reuse) to be re-triaged from the next CI run.

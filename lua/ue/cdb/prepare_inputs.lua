@@ -45,6 +45,10 @@ local function collect(request)
   local explicit_inputs, resource_dirs, tool_input_trees, selected_toolchain = {}, {}, {}, nil
   local header_directories, compiler_config_dirs = {}, {}
   local compiler_resource_seen = {}
+  -- Clang only loads <triple>-<mode>.cfg, <triple>.cfg, <mode>.cfg or
+  -- <executable>.cfg for the effective triple. Toolchains (macOS CommandLine
+  -- Tools) ship configs for unrelated cross targets next to the driver.
+  local config_names, config_tails, config_unknown = {}, {}, false
   local windows = uv.os_uname().sysname:match("Windows") ~= nil
   local function key(path) return windows and path:lower() or path end
   local function beneath(path, parent)
@@ -229,6 +233,18 @@ local function collect(request)
     -- bin's parent covers lib/clang resources and adjacent toolchain files.
     local directory = vim.fs.dirname(path)
     if not executable_only then
+      for _, name in ipairs({ path, uv.fs_realpath(path) or path }) do
+        config_names[key(vim.fs.basename(name):gsub("%.exe$", ""))] = true
+      end
+      local ok, result = pcall(function()
+        return vim.system({ path, "-dumpmachine" }, { text = true, timeout = 3000 }):wait()
+      end)
+      local triple = ok and result.code == 0 and vim.trim(result.stdout or "") or ""
+      if triple:match("^[%w_.]+%-[%w_.%-]+$") then
+        config_tails[key(triple:match("^[^-]+%-(.+)$"))] = true
+      else
+        config_unknown = true
+      end
       compiler_config_dirs[key(directory)] = true
       compiler_config_dirs[key(absolute(assert(uv.fs_realpath(directory))))] = true
     end
@@ -324,6 +340,24 @@ local function collect(request)
     ["-gcc-toolchain"] = true, ["-gcc-toolchain="] = true,
     ["--gcc-install-dir="] = true, ["--sysroot"] = true,
     ["--sysroot="] = true, ["-isysroot"] = true }
+  local function target(triple)
+    local tail = type(triple) == "string" and triple:match("^[^-]+%-(.+)$")
+    if tail then config_tails[key(tail)] = true else config_unknown = true end
+  end
+  local function relevant_config(name)
+    if config_unknown then return true end
+    local stem = key(name:gsub("%.[cC][fF][gG]$", ""))
+    if config_names[stem] then return true end
+    local modes = { "clang%+%+", "clang%-cl", "clang", "cpp", "flang" }
+    for _, mode in ipairs(modes) do
+      if stem:match("^" .. mode .. "$") then return true end
+      local prefix = stem:match("^(.+)%-" .. mode .. "$")
+      if prefix then stem = prefix; break end
+    end
+    local tail = stem:match("^[^-]+%-(.+)$")
+    -- A stem without a triple shape cannot be classified: keep it relevant.
+    return not tail or config_tails[tail] == true
+  end
   for _, entry in ipairs(entries) do
     if type(entry.arguments) ~= "table" or #entry.arguments == 0 then error("command-only CDB unsupported") end
     local cwd = absolute(entry.directory)
@@ -335,6 +369,9 @@ local function collect(request)
       local token = entry.arguments[index]
       if type(token) ~= "string" then error("invalid argument") end
       if token:sub(1, 1) == "@" then error("unexpanded response file") end
+      if token:match("^%-%-?target=") then target(token:match("=(.*)$"))
+      elseif token == "-target" or token == "--target" then target(entry.arguments[index + 1])
+      end
       if separate[token] then
         index = index + 1
         if token == "-ivfsoverlay" then overlay(entry.arguments[index], cwd)
@@ -501,7 +538,7 @@ local function collect(request)
         local child = directory .. "/" .. name
         if kind == "directory" then scan(child)
         elseif kind == "file" then
-          if compiler_config_dirs[key(directory)] and name:lower():match("%.cfg$") then
+          if compiler_config_dirs[key(directory)] and name:lower():match("%.cfg$") and relevant_config(name) then
             -- Default configs can add @files and external input directories.
             -- Until those arguments are inventoried, no capsule is provable.
             error("compiler configuration inputs unavailable: " .. child)
@@ -509,13 +546,20 @@ local function collect(request)
           if tool_input(child) then tool_file(child) end
         elseif kind == "link" or kind == "unknown" then
           local stat = uv.fs_stat(child)
-          if not stat then error("unresolvable watch link: " .. child) end
-          local target = uv.fs_realpath(child)
-          if not target then error("unresolvable physical input: " .. child) end
-          input(target)
-          if tool_input(child) and stat.type == "file" then tool_file(child) end
-          if #roots > (request.max_roots or 32) then error("watch root budget exceeded") end
-          if stat.type == "directory" then scan(target) end
+          -- A dangling link inside a read-only toolchain (e.g. an lldb module
+          -- in a distro LLVM) is not a compiler input; its directory stays under
+          -- recursive observation, so retargeting it is still noticed.
+          local dangling_tool = not stat and readonly_tool(child) and not tool_input(child)
+            and uv.fs_lstat(child) ~= nil
+          if not dangling_tool then
+            if not stat then error("unresolvable watch link: " .. child) end
+            local target = uv.fs_realpath(child)
+            if not target then error("unresolvable physical input: " .. child) end
+            input(target)
+            if tool_input(child) and stat.type == "file" then tool_file(child) end
+            if #roots > (request.max_roots or 32) then error("watch root budget exceeded") end
+            if stat.type == "directory" then scan(target) end
+          end
         end
       end
     end

@@ -66,7 +66,8 @@ function M.start(spec, callbacks)
   local completion = {}
   local handle, timer, exit, eof, scheduled, terminal, released, killed
   local queue, head, tail, fragments, fragment_bytes = {}, 1, 0, {}, 0
-  local current, subindex, stderr, searched = nil, 1, "", nil
+  local current, subindex, stderr, searched, searches = nil, 1, "", nil, nil
+  local delivered = false
   local drain
 
   local function release()
@@ -130,7 +131,17 @@ function M.start(spec, callbacks)
     end
     job.finished = true
     release()
-    if not terminal and exit.signal == 0 and (exit.code == 0 or exit.code == 1) and searched ~= #spec.text then
+    -- ripgrep < 15 omits a no-match search from the JSON summary (searches = 0,
+    -- bytes_searched = 0). Only then does our own confirmed stdin write prove that
+    -- rg received the whole document.
+    local unreported = exit.code == 1 and searches == 0 and searched == 0 and delivered
+    if
+      not terminal
+      and exit.signal == 0
+      and (exit.code == 0 or exit.code == 1)
+      and searched ~= #spec.text
+      and not unreported
+    then
       terminal = { state = "error", reason = "stdin-incomplete" }
     end
     local result = terminal
@@ -180,7 +191,8 @@ function M.start(spec, callbacks)
           break
         end
         if decoded.type == "summary" then
-          searched = decoded.data and decoded.data.stats and decoded.data.stats.bytes_searched
+          local stats = decoded.data and decoded.data.stats
+          searched, searches = stats and stats.bytes_searched, stats and stats.searches
         elseif decoded.type == "match" then
           current, subindex = decoded.data, 1
           if type(current) ~= "table" or type(current.submatches) ~= "table" then
@@ -343,6 +355,14 @@ function M.start(spec, callbacks)
     handle = system
     local written = pcall(function()
       system:write(spec.text)
+      -- The write callback fires only after every queued byte reached the pipe.
+      local state = rawget(system, "_state")
+      local stdin = state and state.stdin
+      if stdin then
+        stdin:write("", function(err)
+          delivered = not err
+        end)
+      end
       system:write(nil)
     end)
     if not written then

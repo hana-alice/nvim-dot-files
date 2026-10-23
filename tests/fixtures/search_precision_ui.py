@@ -252,7 +252,10 @@ try:
     state = instance.lua('return {case=_G.P.opts.case,scoped=_G.P.opts.scoped,query=_G.P.input.filter.search,status=_G.P.opts.ue_search_status,count=#_G.P:items(),events=_G.stream_events}')
     assert state['case'] is True and state['scoped'] is True and state['query'] == 'Alpha', state
     assert state['status']['state'] == 'complete' and state['count'] == 5, state
-    assert any(event['stopped'] for event in state['events'][:-1]), state
+    # Superseded streams must never reach the picker; on a fast host (macOS CI csearch ~6 ms) the
+    # earlier process may already have exited natively, so it is either stopped or finished.
+    assert len(state['events']) >= 2, state
+    assert all(event['stopped'] or event['done'] == 1 for event in state['events'][:-1]), state
     result['cases']['same_query_modes_keep_latest_intent'] = state
     instance.lua('require("utils.code_search").stream=_G.native_stream')
 

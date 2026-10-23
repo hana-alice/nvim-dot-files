@@ -50,11 +50,18 @@ local M = {}
 -- one command away, instead of being paid for continuously by every keystroke.
 local LSP_LOG_DEFAULT = "off"
 
+-- vim.lsp.set_log_level() is deprecated in 0.12 (its warning lands in the
+-- message area of every session); vim.lsp.log.set_level() exists in 0.11+.
+local function set_lsp_log_level(level)
+  local log = vim.lsp.log
+  if type(log) == "table" and type(log.set_level) == "function" then return log.set_level(level) end
+  return vim.lsp.set_log_level(level)
+end
+M._set_lsp_log_level = set_lsp_log_level
+
 function M.setup_lsp_logging()
-  -- Guard: vim.lsp.set_log_level exists in 0.10+; never hard-fail startup.
-  local ok = pcall(function()
-    vim.lsp.set_log_level(vim.log.levels.OFF)
-  end)
+  -- Guard: never hard-fail startup.
+  local ok = pcall(set_lsp_log_level, vim.log.levels.OFF)
 
   vim.api.nvim_create_user_command("LspLogLevel", function(args)
     local level = vim.trim(args.args or "")
@@ -84,9 +91,7 @@ function M.setup_lsp_logging()
       vim.notify("unknown level: " .. level .. " (off|error|warn|info|debug|trace)", vim.log.levels.ERROR)
       return
     end
-    local set_ok = pcall(function()
-      vim.lsp.set_log_level(value)
-    end)
+    local set_ok = pcall(set_lsp_log_level, value)
     vim.notify(
       set_ok and ("LSP log level -> " .. level:lower() .. "  (" .. vim.lsp.log.get_filename() .. ")")
         or "failed to set LSP log level",

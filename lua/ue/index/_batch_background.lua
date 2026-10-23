@@ -61,16 +61,51 @@ return function(M, core)
       publication_worker = fs.join(vim.fn.stdpath("config"), "lua", "ue", "index", "batch_publish_worker.lua"),
       publish_lock = ctx.paths.index_state .. ".build.lock", current = current,
       publish = function(result)
-        if not current() then error("background-proof-generation-changed") end
+        local function probe(key, data)
+          pcall(function()
+            local record = core.deps.probe or require("utils.probe").record
+            record("index-priority-refresh", key, vim.tbl_extend("force", { generation = generation.generation_id }, data))
+          end)
+        end
+        if not current() then
+          probe("skipped:generation-changed", { state = "failed", reason = "background-proof-generation-changed" })
+          error("background-proof-generation-changed")
+        end
         local state = h.ensure_index_state(ctx)
         h.normalize_index_state(state)
         local activated = result.activation
         if not activated or not activated.ok or activated.generation_id ~= generation.generation_id
             or not activated.manifest or activated.manifest.generation_id ~= generation.generation_id then
+          probe("failed:activation", { state = "failed", reason = "background-proof-publication-failed",
+            activation_ok = activated and activated.ok or false, error = activated and activated.error or nil })
           error("background-proof-publication-failed")
         end
         state.index_artifacts.full, state.index_selection = activated.manifest, activated.index_selection
         local publication = activated.publication
+        if type(publication) == "table" and publication.changed == true and publication.original_changed == true then
+          -- Reuse the newly admitted owners in both priority phases. Cancel
+          -- independent timers so admission cannot let hot overtake current;
+          -- the single-job queue drains these in priority order.
+          for _, phase in ipairs({ "current", "hot" }) do
+            M.consume_index_phase(ctx, phase, state)
+            state.queue[phase] = h.unix_now()
+          end
+          -- The collector still holds the writer lease until publish returns.
+          vim.schedule(function()
+            if not current() then
+              probe("skipped:generation-changed-before-drain", { state = "failed", reason = "generation-changed" })
+            elseif not M.try_start_queued_build() and not (core.RT.job and core.RT.job.phase == "current") then
+              -- Not fatal (the queue drains later), but a priority rebuild that cannot start is evidence.
+              probe("deferred:queue-not-started", { state = "failed", reason = "try_start_queued_build-false",
+                running_phase = core.RT.job and core.RT.job.phase or nil })
+            else
+              probe("queued:current-hot", { state = "ok" })
+            end
+          end)
+        elseif type(publication) == "table" then
+          probe("noop:publication-unchanged", { state = "ok", changed = publication.changed,
+            original_changed = publication.original_changed })
+        end
         h.save_index_state(ctx, state)
         core.deps.invalidate_status_cache()
         core.deps.refresh_statusline()

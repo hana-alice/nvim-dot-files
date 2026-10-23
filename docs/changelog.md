@@ -94,5 +94,99 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v2.10.0` → [docs/release_2.10.0.md](release_2.10.0.md) (Tier 1 gen/src merge, context-migration shard invalidation, opt-in Tier 2, cost ceilings; tag pending)
 
+- `v2.11.0` → [docs/release_2.11.0.md](release_2.11.0.md) (module-priority phase barrier fix, priority refresh after activation, phase probes; full regression 4381/4381, 2 skips; tag pending)
+
 ## Unreleased
 
+### 2026-10-23 — Headless CI follow-up (Linux /proc links, macOS wraps, nvim 0.12 Windows)
+
+**Task**
+- The second CI run (889687c) still failed on all three platforms; fix the remaining real causes.
+
+**Implemented**
+- `prepare_inputs.scan`: a non-input tool link whose target lies outside every covered root (Linux
+  `/proc/<pid>/fd` style links under the tool tree) is not followed; EACCES tolerance stays.
+- `ue.lua diagnostic_entries_from_output`: a bare `error:`/`warning:` location line whose message the
+  terminal wrapped onto the next line keeps that message (macOS clang output); new regression case.
+- `ui_responsiveness`: LSP log level goes through `vim.lsp.log.set_level` when available (0.12).
+- `review_goto`: `attached_buffers[buf] ~= nil` (0.12 stores non-boolean values).
+- Specs: `review_goto_native` resolves clangd/clang++ from `UE_CLANGD`/PATH and skips without a
+  sibling compiler; prepare-cache read-only-tool guard; `ide_buffer_close` matches a wrapped prompt;
+  `ide_workspace` waits for the resize before stopping a re-shown terminal (0.12.6 Windows segfault);
+  `ide_replace_entry` starts the substitute from Normal mode with a closed undo block;
+  `search_precision_ui` accepts a superseded stream that finished natively before the stop on a fast
+  host; `ide_workspace_reuse` waits for the default action's editor split (macOS CI saw 2 normal
+  windows right after close); `ide_replace_entry` loads its source from disk (no setup undo history)
+  and resets the cursor after GrugFar; `ide_document_find_ui` handoff settles between kinds and
+  reports window/cursor evidence (one macOS CI run cancelled the jump with a stale owner; cause unverified).
+- Third CI run (c4c2c50, macOS only): `ui_responsiveness` argv check compares `-j` with
+  `clangd_jobs.resolve()` and applies the UI-reserve bound only when `cpus - UI_RESERVED_CORES >=
+  MIN_JOBS` (5-core runner gets the documented floor -j=4); `multi_instance_state` dirty union starts
+  all eight writers behind a file barrier with a 40ms stagger, so slow child startup can no longer
+  exhaust the first writer's bounded retries (cause 推测 from the CI stderr); `ide_workspace_reuse`
+  default Enter waits for the third normal window and dumps the full window layout on failure.
+- Fourth/fifth CI runs (macOS only): `ide_workspace_reuse` default Enter now waits inside the child
+  (`vim.wait` 5s) instead of parent RPC polling, and on failure dumps window events, picker close
+  callers, every `vim.schedule` callback (origin / started / finished) and the `W.activate` result.
+
+**Pitfalls / Gotchas**
+- nvim 0.12.6 Windows: stopping a terminal job in the same tick its buffer is shown at a new size
+  crashes nvim (jobstop/chanclose/kill alike; minimal repro: termopen → enew → split → set_buf → jobstop).
+- macOS CI known flake (open, cause unverified): at 0d54706 the push run was green on all three
+  hosts while a concurrent dispatch run failed on macOS. Evidence from the dump: after the picker
+  closed, the Snacks close cleanup (`picker.lua:664`) and the Workspace confirm (`workspace.lua:565`)
+  were queued by `vim.schedule` but had not started 5s later, even inside the child's own `vim.wait`.
+  Not reproduced on Windows nvim 0.11.5/0.12.6 or WSL, including with `<CR>` fed from inside the RPC
+  request.
+- `ide_document_find_ui` (macOS CI, 2 runs): Enter was rejected with "查找结果已失效" at generation 2
+  and the picker stayed open. 推测: the finder had settled but the list still showed the previous
+  generation's row. `settle()` now waits until the list holds exactly `status.count` rows, all from the
+  current generation (the first fix only checked the current row and still failed once on macOS).
+- Windows CI (c7efc22): the Chocolatey feed answered 503 for `fd` while `choco install` still exited 0,
+  so five native fd cases failed. The workflow step now retries and requires `rg` and `fd` on PATH.
+- `ide_workspace_reuse` / `ide_workspace` RPC waits: a Lua `nil` returned over RPC arrives as `vim.NIL`,
+  which is truthy, so `picker.closed and mutation and ...` counted as ready while `mutation` was still nil
+  (macOS CI then indexed it). Verified locally (`return nil and 1` → `vim.NIL`); the waits now treat
+  `nil`/`vim.NIL`/`false` as not ready.
+
+**Validation**
+- Windows nvim 0.11.5 and 0.12.6, WSL Ubuntu 24.04: affected filters green (see full-regression line
+  in the commit); Windows nvim 0.11.5 full regression 4383/4383 passed, 2 skipped.
+- Third-run fixes: `ui_responsiveness` `multi_instance_state` (3 consecutive runs) `ide_workspace_reuse`
+  green on Windows nvim 0.11.5 and 0.12.6 and WSL Ubuntu 24.04.
+- GitHub Actions push run 39974324072 (0d54706): ubuntu-24.04, macos-latest, windows-latest all
+  green; dispatch run 39974328498 (same commit): macOS 4292/4295 (flake above), others green.
+- GitHub Actions push run 39990582029 (0be7e83, after the Find settle, Windows fd retry and `vim.NIL`
+  wait fixes): ubuntu-24.04, macos-latest, windows-latest all green.
+
+### 2026-10-23 — Repair headless CI on ubuntu / macOS / windows (nvim 0.12.6)
+
+**Task**
+- CI failed on all three platforms; fix the real causes instead of fake hosts.
+
+**Implemented**
+- `document_find_process`: ripgrep < 15 reports `searches = 0, bytes_searched = 0` for a no-match
+  search; accept that only when our own confirmed stdin write proves delivery.
+- `prepare_inputs`: tolerate system toolchain layouts — dangling links inside read-only tool roots
+  (distro LLVM lldb modules) and cross-target `*.cfg` beside the driver (macOS CommandLineTools).
+  Configs clang would load for this driver/target (`<driver>.cfg`, `clang.cfg`, `<triple>-clang.cfg`,
+  unknown triple) still fail closed.
+- `tests/run.lua`: the physical-temp relaunch now also covers macOS `TMPDIR=/var/...` → `/private/var/...`.
+- nvim 0.12 compatibility in specs (`version = 0` text edits, exited terminal channels, a ConPTY
+  resize/jobstop race wait); capability guards for missing csearch tools / libclang.
+- Workflow installs the cindex-uefilter fork + pinned csearch; job timeout 60 min.
+
+**Pitfalls / Gotchas**
+- nvim 0.12 on Windows segfaults when a ConPTY job is stopped within ~20 ms of a resize (upstream).
+- A stale `refs/heads/<branch>.lock` left by an interrupted rebase blocks the ref update.
+
+**Validation**
+- Windows nvim 0.11.5 and 0.12.6: `ue_cdb` 208/208 (+1 skip), `ue_cdb_prepare_cache` 21/21 (new system
+  toolchain fixture), `ide_refactor` 30/30, `ide_task_inspection` 7/7, `search_interaction` 16/16,
+  `cpp_semantic_sidecar_freshness` 10/10, `workarounds_uri` 15/15, `ide_document_find` 28/28.
+- WSL Ubuntu 24.04 (rg 14.1.0): `ide_document_find` 28/28, `search_interaction` 15 + 1 skip.
+- macOS lane validated only through CI.
+
+**Follow-ups**
+- Remaining macOS-only failures (dap_persist_failure, ide_buffer_close, clipboard, ide_recovery,
+  ide_workbench, ide_workspace_reuse) to be re-triaged from the next CI run.

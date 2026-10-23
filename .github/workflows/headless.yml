@@ -13,7 +13,7 @@ jobs:
   smoke:
     name: ${{ matrix.os }} / nvim ${{ matrix.nvim }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       # stdpath(config) must point at this checkout on both Windows and POSIX.
       # Keep installation and startup-probe writes inside the disposable job.
@@ -56,6 +56,14 @@ jobs:
           go-version-file: nvim/tools/cindex-uefilter/go.mod
           cache-dependency-path: nvim/tools/cindex-uefilter/go.sum
 
+      - name: Existing csearch tools (cindex-uefilter fork + pinned csearch)
+        shell: bash
+        run: |
+          export GOBIN="$RUNNER_TEMP/gobin"
+          go -C tools/cindex-uefilter install ./...
+          go install github.com/google/codesearch/cmd/csearch@v1.2.0
+          echo "$GOBIN" >> "$GITHUB_PATH"
+
       - name: Windows parser compiler environment
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
@@ -97,7 +105,17 @@ jobs:
 
       - name: Existing search prerequisites (Windows)
         if: runner.os == 'Windows'
-        run: choco install ripgrep fd -y --no-progress
+        shell: pwsh
+        # The Chocolatey community feed can answer 503 for one package while choco still exits 0
+        # ("installed 1/1"); retry and require both tools on PATH.
+        run: |
+          foreach ($attempt in 1..5) {
+            choco install ripgrep fd -y --no-progress
+            if ((Get-Command rg -ErrorAction SilentlyContinue) -and (Get-Command fd -ErrorAction SilentlyContinue)) { exit 0 }
+            Write-Host "rg/fd missing after attempt $attempt; retrying in 20s"
+            Start-Sleep -Seconds 20
+          }
+          throw "ripgrep/fd install failed after 5 attempts"
 
       - name: Bootstrap locked plugins and syntax parsers
         run: nvim --headless -l scripts/bootstrap_headless_ci.lua

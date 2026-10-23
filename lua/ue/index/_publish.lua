@@ -106,6 +106,7 @@ return function(M, core)
       base = { base_path, file_signature(base_path) },
       generation = { generation.generation_id, generation.build_key or "" },
       published = { ctx.paths.semantic_cdb, file_signature(ctx.paths.semantic_cdb) },
+      batches = file_signature(fs.join(vim.fs.dirname(ctx.paths.semantic_cdb), "batches.json")),
       phases = {},
     }
     for _, phase in ipairs({ "current", "hot", "full" }) do
@@ -533,7 +534,7 @@ return function(M, core)
     local original_changed = not same_publication(previous, merged)
     local original_append_only = original_changed and append_only(previous, merged) or false
     local batch_info_path = fs.join(vim.fs.dirname(ctx.paths.semantic_cdb), "batches.json")
-    local ordinary = next(receipts) == nil and not _ufs.is_file(batch_info_path)
+    local ordinary = next(receipts) == nil and require("ue.index.batch_metadata").is_ordinary(batch_info_path)
     if M._defer_append then
       local deferred = original_append_only and ordinary and state.index_selection
         and state.index_selection.generation_id == generation.generation_id or false
@@ -579,17 +580,19 @@ return function(M, core)
       end
       changed = changed or frozen_changed
     elseif _ufs.is_file(batch_info_path) then
-      local empty = { schema = 1, receipts = {} }
-      if not vim.deep_equal(read_cdb(batch_info_path), empty) then
-        local ok, err = atomic_write_json(batch_info_path, empty)
-        if not ok then return false, err end
-        changed = true
-      end
+      if M._publication_guard then M._publication_guard() end
+      -- unlink is the atomic transition to ordinary publication. A failed
+      -- removal must not leave a successful/cached publication behind.
+      local ok, err = vim.uv.fs_unlink(batch_info_path)
+      if not ok then return false, "batch metadata removal failed: " .. tostring(err) end
+      changed = true
     end
+    ordinary = #receipt_paths == 0
     -- Cache only the last verified publication's small identities/counts.
     -- Phase bytes/argv stay collectible, and any changed input or output stat
     -- takes the full manifest verification path on the next call.
     key.published[2] = file_signature(ctx.paths.semantic_cdb)
+    key.batches = file_signature(batch_info_path)
     local shader_count = vim.tbl_count(shader_compatibility)
     RT.publication_cache = { key = key, entry_count = #merged,
       controlled_entry_count = controlled_count, shader_compatibility_count = shader_count, ordinary = ordinary,
@@ -606,7 +609,7 @@ return function(M, core)
       batch_fallbacks = batch_fallbacks,
       -- Frozen activation owns its independent reader/cache and cannot use the
       -- ordinary directory reload path, even if original rows only grew.
-      original_append_only = original_append_only and #receipt_paths == 0 and not _ufs.is_file(batch_info_path),
+      original_append_only = original_append_only and ordinary,
     }
   end
   require("ue.index._publication_async")(M, core)

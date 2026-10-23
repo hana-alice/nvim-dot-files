@@ -190,6 +190,52 @@ t.describe("prepare cache real input evidence", function()
     end)
   end)
 
+  t.it("system toolchain layouts: unrelated cross-target configs and dangling tool links", function()
+    fixture(function(ctx, request, root)
+      local toolchain = vim.fs.normalize(vim.fn.tempname() .. "-system-toolchain")
+      local suffix = vim.fn.has("win32") == 1 and ".exe" or ""
+      local driver = toolchain .. "/bin/clang" .. suffix
+      vim.fn.mkdir(toolchain .. "/bin", "p")
+      local ok, err = xpcall(function()
+        -- A hard or symbolic link keeps the real driver (and its -dumpmachine) without copying it.
+        if not uv.fs_link(compiler, driver) and not uv.fs_symlink(compiler, driver) then
+          t.skip("system toolchain layouts", "creating a link to the real compiler needs a host privilege (Windows developer mode)")
+          return
+        end
+        -- A linked driver derives its resource directory from the link location
+        -- (toolchain/lib/clang/<major>), as a real relocated toolchain would ship it.
+        local resource = vim.trim(vim.system({ driver, "-print-resource-dir" }, { text = true }):wait(10000).stdout or "")
+        if resource ~= "" and not uv.fs_stat(resource) then vim.fn.mkdir(resource .. "/include", "p") end
+        local function collect()
+          write(ctx.paths.active_cdb, { { directory = root, file = root .. "/Source/A.cpp",
+            arguments = { driver, "-c", root .. "/Source/A.cpp" } } })
+          return inputs.collect(request)
+        end
+        -- macOS CommandLineTools ship configs for cross targets beside the driver.
+        write(toolchain .. "/bin/aarch64-unrelated-linux-musl-clang.cfg", "--sysroot=/elsewhere\n")
+        local value = collect()
+        t.assert_true(value.ok, value.reason)
+        -- A config clang would load for this driver still fails closed.
+        write(toolchain .. "/bin/clang.cfg", "-I/elsewhere\n")
+        t.assert_match(collect().reason or "", "compiler configuration inputs unavailable")
+        os.remove(toolchain .. "/bin/clang.cfg")
+        -- Dangling links inside a read-only tool root (distro LLVM lldb modules).
+        vim.fn.mkdir(toolchain .. "/lib", "p")
+        if not uv.fs_symlink(toolchain .. "/lib/missing.so.1", toolchain .. "/lib/dangling.so") then
+          return -- Symbolic links need a host privilege (Windows without developer mode).
+        end
+        value = collect()
+        t.assert_true(value.ok, value.reason)
+        -- Outside tool roots a dangling link stays unresolvable evidence.
+        if uv.fs_symlink(root .. "/Source/missing.h", root .. "/Source/dangling.h") then
+          t.assert_match(collect().reason or "", "unresolvable watch link")
+        end
+      end, debug.traceback)
+      vim.fn.delete(toolchain, "rf")
+      if not ok then error(err) end
+    end)
+  end)
+
   t.it("collector watches VFS external contents and refuses unsupported overlays or root budgets", function()
     fixture(function(ctx, request, root)
       local external = vim.fs.normalize(vim.fn.tempname() .. "-prepare-vfs")
@@ -241,9 +287,24 @@ t.describe("prepare cache real input evidence", function()
     end)
   end)
 
+  -- Readonly identity reuse needs an installed toolchain this account cannot
+  -- write (Program Files as a normal user). An elevated CI runner with LLVM in
+  -- its temp directory writes the barrier marker successfully, so the host
+  -- lacks the capability; that is a skip, never a faked denial.
+  local function readonly_tools_or_skip(name)
+    if next(cache.status().readonly_tool_roots or {}) ~= nil then return true end
+    local directory = vim.fs.dirname(compiler)
+    if uv.fs_access(directory, "W") then
+      t.skip(name, "installed compiler directory is writable by this account: no readonly tool root")
+      return false
+    end
+    return true
+  end
+
   t.it("reseal after writable tool markers preserves readonly evidence and later reuse", function()
     fixture(function(ctx)
       seal(ctx)
+      if not readonly_tools_or_skip("reseal readonly evidence") then return end
       t.assert_true(next(cache.status().readonly_tool_roots or {}) ~= nil)
       local original_system, completed, inventories = vim.system, false, 0
       vim.system = function(command, options, callback)
@@ -281,6 +342,7 @@ t.describe("prepare cache real input evidence", function()
   t.it("closed source write immediately before begin revokes reuse without a settling sleep", function()
     fixture(function(ctx, _, root)
       seal(ctx)
+      if not readonly_tools_or_skip("closed source write readonly reuse") then return end
       t.assert_true(next(cache.status().readonly_tool_roots or {}) ~= nil,
         "default installed tools must exercise readonly identity reuse")
       t.assert_true((cache.status().tools_verified or 0) > 0, "reuse must carry verified readonly tools")

@@ -10,10 +10,11 @@ t.describe("non-file URI consumer boundaries", function()
       t.assert_nil(require("ue")._foreign_buffer_key_for_test(name, "C:/Project", "D:/UE"))
       local buf = vim.api.nvim_create_buf(false, true)
       vim.api.nvim_buf_set_name(buf, name)
-      if name:find(":/", 1, true) then
+      if name:find(":/", 1, true) and not uri.is_file_name(vim.api.nvim_buf_get_name(buf)) then
         t.assert_nil(require("ue").clangd_start_root(buf))
       else
-        -- Neovim expands non-hierarchical names to ordinary absolute filenames.
+        -- Neovim expands non-hierarchical names to ordinary absolute filenames; on
+        -- POSIX a one-letter scheme ("x:") is not a URL to Neovim either.
         t.assert_true(uri.is_file_name(vim.api.nvim_buf_get_name(buf)))
       end
     end)

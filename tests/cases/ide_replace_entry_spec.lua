@@ -43,7 +43,11 @@ assert(type(before.callback) == "function", "source replace callback missing")
 local source_buf, source_win = vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win()
 local original = scenario == "visual" and { "alpha beta", "gamma alpha", "alpha gamma" }
   or { "alpha beta", "alphabeta", "second alpha" }
-vim.api.nvim_buf_set_lines(source_buf, 0, -1, true, original)
+-- Load the text from disk so the source has no undo history of its own: the only change native
+-- u may revert is the substitute (a set_lines in a -l script can join the substitute's undo block).
+vim.fn.writefile(original, root .. "/source.txt")
+vim.cmd("edit " .. vim.fn.fnameescape(root .. "/source.txt"))
+source_buf = vim.api.nvim_get_current_buf()
 vim.api.nvim_win_set_cursor(source_win, { 1, 0 })
 assert(not require("lazy.core.config").plugins["grug-far.nvim"]._.loaded, "Grug loaded before the command")
 vim.cmd("GrugFar")
@@ -57,6 +61,13 @@ assert(vim.deep_equal(vim.api.nvim_buf_get_lines(source_buf, 0, -1, true), origi
   "opening the explicit replacement tool changed source text")
 vim.api.nvim_set_current_win(source_win)
 vim.api.nvim_win_set_buf(source_win, source_buf)
+-- GrugFar's own window may start Insert mode (Linux/macOS CI showed "-- (insert) --");
+-- leave it, and close the fixture's setup undo block so u restores only the substitute.
+vim.wait(50, function() return false end, 10)
+vim.cmd("stopinsert")
+vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
+assert(vim.fn.mode() == "n", "source must be in Normal mode before the replace entry")
+vim.api.nvim_win_set_cursor(source_win, { 1, 0 })
 if scenario == "visual" then
   vim.cmd("normal! gg0v4l")
   after.callback()
@@ -71,7 +82,8 @@ assert(vim.deep_equal(vim.api.nvim_buf_get_lines(source_buf, 0, -1, true), expec
 assert(vim.bo[source_buf].modified, "substitute must remain an unsaved source edit")
 vim.api.nvim_feedkeys("u", "xt", false)
 assert(vim.deep_equal(vim.api.nvim_buf_get_lines(source_buf, 0, -1, true), original),
-  "native u did not restore the source text after substitution")
+  "native u did not restore the source text after substitution: "
+    .. vim.inspect(vim.api.nvim_buf_get_lines(source_buf, 0, -1, true)))
 io.write("REPLACE_ENTRY_NATIVE_OK\n")
 ]=]
 

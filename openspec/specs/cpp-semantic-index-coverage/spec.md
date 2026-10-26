@@ -118,6 +118,10 @@ clangd 是长驻交互式服务，终止会丢弃已构建的 preamble。系统 
 - **WHEN** 某索引阶段的 deadline 到达，而宿主 CPU 使用率高于高水位
 - **THEN** 系统 SHALL 推迟该阶段启动，MUST NOT 启动新的构建子进程，推迟原因 SHALL 可观测
 
+#### Scenario: A large background-index run has finished
+- **WHEN** clangd 一次后台索引处理的任务数达到阈值，结束后编辑器空闲，没有未保存 buffer，也没有 prepare 在跑
+- **THEN** 系统 SHALL 重启该 clangd 一次，以归还 Windows 堆不会自行释放的索引期内存；加载已有 shard 引发的重启 MUST NOT 再次触发回收，重启频率 SHALL 有会话级上限，放弃回收时 SHALL 记录原因
+
 ## 选型与踩坑
 
 - **显式有序 strict 配方（2026-10-18）**：跨模块 generated-only 候选可由
@@ -449,3 +453,11 @@ clangd 是长驻交互式服务，终止会丢弃已构建的 preamble。系统 
   在 `BackgroundQueue::boost` 做前缀匹配），或预置 shard（B：排队任务能否跳过尚未验证）。
   另外可在 current 与 hot 之间加一层渲染层（Renderer、RenderCore、RHI、平台 RHI、Core、
   CoreUObject，约 1000 条）。以上均待实测；收益未验证前不得宣称渲染模块已经优先完成索引。
+- **clangd 用完归还（2026-10-26）**：Windows 版 clangd 没有 malloc_trim（`ClangdMain.cpp` 中这部分只在
+  `__GLIBC__` 下编译），后台索引期间分配的 2.5–3 GB 堆在索引结束后不会还给系统。曾试过 Segment Heap
+  （manifest 和 IFEO 两种方式），实测无效，已证伪。最初看到的下降，是因为测试用的 clangd 缺少
+  `lib/clang` 资源目录，少解析了内容。因此采用重启回收（`ue.clangd_memory_reclaim`）：大规模索引完成后
+  静默重启一次。实测 16 个 TU 时 3.32→1.85 GB；生产 shard 库下降到约 4.3 GB，其中约 3 GB 是必要的
+  内存索引（Dex）。preamble 改为 `--pch-storage=disk`（3 个 TU 时 1291→223 MB）。disk 模式下 clangd
+  被 kill 后会留下 `preamble-*.pch`，所以每个会话的 clangd 使用独立 TEMP（`ue.clangd_temp`），
+  只清理所属进程已确认退出的目录。

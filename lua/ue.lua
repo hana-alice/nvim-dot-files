@@ -665,7 +665,7 @@ function M.clangd_cmd(root_dir)
     "--completion-style=detailed",
     "--completion-parse=auto",          -- text-based completion while preamble builds
     "--header-insertion=never",
-    "--pch-storage=memory",
+    "--pch-storage=disk",                -- memory 模式每个打开 TU 多占约 0.4 GB commit（2026-10-26 实测 3 TU：1291→223 MB）
     "--clang-tidy=false",               -- explicit because project/user config is disabled below
     "--enable-config=false",             -- reject stale project/user External.File fragments
     "--function-arg-placeholders=true",

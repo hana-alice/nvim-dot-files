@@ -59,7 +59,7 @@ return {
           config._ue_resolved_cmd = resolved_cmd
           local rpc = vim.lsp.rpc.start(resolved_cmd, dispatchers, {
             cwd = config.cmd_cwd,
-            env = config._ue_batch_spawn_env or config.cmd_env,
+            env = require("ue.clangd_temp").spawn_env(config._ue_batch_spawn_env or config.cmd_env),
             detached = config.detached,
           })
           -- Public RPC hides vim.SystemObj.pid. Bounded async discovery proves
@@ -86,6 +86,7 @@ return {
           end
           require("ue.clangd_commands").ensure(client, bufnr)
           require("ue.index.batch_recovery").attach(client, bufnr)
+          require("ue.clangd_memory_reclaim").setup()
         end,
         keys = {
           { "<leader>cI", function() require("utils.ue_goto.reading").calls("incoming") end,

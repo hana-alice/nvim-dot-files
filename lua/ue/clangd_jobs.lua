@@ -28,7 +28,7 @@
 -- --------
 -- Two independent ceilings, take the smaller, then never spend the UI's share:
 --   * memory ceiling: clangd holds ~2 GB per in-flight preamble with
---     --pch-storage=memory, so allow about one worker per 4 GB.
+--     preambles (now --pch-storage=disk), so allow about one worker per 4 GB.
 --   * cpu ceiling: total logical cores minus UI_RESERVED_CORES.
 -- Both are real; whichever binds first wins. RAM-only sizing was the bug.
 

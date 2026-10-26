@@ -75,7 +75,13 @@ t.describe("smoke: clangd capabilities", function()
     t.assert_eq(seen.root_dir, config.root_dir)
     t.assert_eq(seen.dispatchers, dispatchers)
     t.assert_eq(seen.spawn.cwd, config.cmd_cwd)
-    t.assert_eq(seen.spawn.env, config.cmd_env)
+    -- Caller env is preserved; clangd additionally gets its per-session TEMP
+    -- (ue.clangd_temp) so killed servers cannot leave preambles in %TEMP%.
+    t.assert_eq(seen.spawn.env.SAMPLE, "1")
+    local session_temp = vim.fs.joinpath(require("ue.clangd_temp").root(), tostring(vim.fn.getpid()))
+    t.assert_eq(seen.spawn.env.TEMP, session_temp)
+    t.assert_eq(seen.spawn.env.TMP, session_temp)
+    t.assert_nil(config.cmd_env.TEMP, "caller cmd_env must not be mutated")
     t.assert_eq(seen.spawn.detached, config.detached)
     t.assert_contains(seen.cmd, "--compile-commands-dir=/fake/scoped-cdb")
     t.assert_eq(config._ue_resolved_cmd, seen.cmd,

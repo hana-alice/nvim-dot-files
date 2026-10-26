@@ -16,7 +16,7 @@ local jumper       = require("utils.ue_goto.jumper")
 local semantic     = require("utils.ue_goto.semantic_client")
 local semantic_nav = require("utils.ue_goto.semantic_navigation")
 
-local MODULE_REVISION = "contextual-clang-v2"
+local MODULE_REVISION = "contextual-clang-v3"
 local TRACE_MAX = 200
 local trace_ring = {}
 local trace_idx = 0
@@ -239,15 +239,24 @@ function M.definition()
   local sym = symbol_mod.current_symbol()
   local path = location_mod.normalize_path(vim.api.nvim_buf_get_name(bufnr))
   local ext = ui.buf_extension(bufnr)
+  local cpp_buffer = navigation.CPP_SOURCE_EXTS[ext] or navigation.CPP_HEADER_EXTS[ext]
+  local generic_cpp = false
+  if cpp_buffer and type(semantic.is_ue_buffer) == "function" then
+    local ok_scope, scope = pcall(semantic.is_ue_buffer, bufnr)
+    -- Only an explicit ordinary-workspace result bypasses UE authority.
+    generic_cpp = ok_scope and scope == false
+  end
   dtrace("M.definition() sym=%q file=%s:%d", sym or "", vim.fn.fnamemodify(path, ":t"),
     vim.api.nvim_win_get_cursor(0)[1])
-  if navigation.CPP_SOURCE_EXTS[ext] or navigation.CPP_HEADER_EXTS[ext] then
+  if cpp_buffer and not generic_cpp then
     if compat then compat.dispose() end
     navigation.cpp_definition(sym, bufnr, path, ext)
     return
   end
   semantic.cancel_action()
-  compatibility().definition(sym, symbol_mod.current_receiver(), bufnr, path, vim.api.nvim_win_get_cursor(0)[1], ext)
+  local receiver = not generic_cpp and symbol_mod.current_receiver() or nil
+  compatibility().definition(sym, receiver, bufnr, path, vim.api.nvim_win_get_cursor(0)[1], ext,
+    { lsp_only = generic_cpp })
 end
 
 function M.status()

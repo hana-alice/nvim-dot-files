@@ -652,6 +652,7 @@ local find_engine_root
 
 function M.clangd_cmd(root_dir)
   local clangd = _uproc.first_executable(clangd_candidates(root_dir or cwd())) or "clangd"
+  local engine_root = root_dir and root_dir ~= "" and find_engine_root(root_dir) or nil
 
   -- Parallel worker budget. Policy + UI core reservation live in ue.clangd_jobs
   -- (RAM alone gave -j=23 on 24 cores, starving the UI — 2026-08-25, K52).
@@ -666,19 +667,17 @@ function M.clangd_cmd(root_dir)
     "--completion-parse=auto",          -- text-based completion while preamble builds
     "--header-insertion=never",
     "--pch-storage=disk",                -- memory 模式每个打开 TU 多占约 0.4 GB commit（2026-10-26 实测 3 TU：1291→223 MB）
-    "--clang-tidy=false",               -- explicit because project/user config is disabled below
-    "--enable-config=false",             -- reject stale project/user External.File fragments
     "--function-arg-placeholders=true",
     "--limit-results=200",
     "--limit-references=200",
     "--query-driver=" .. table.concat(_uplat.driver().query_driver_globs(), ","),
   }
+  require("utils.clangd_workspace").apply_policy(cmd, root_dir, engine_root)
 
   -- Point clangd at this process's project+platform CDB bucket. Without an
   -- explicit directory clangd may discover a different Neovim instance's
   -- legacy engine-root compile_commands.json.
   if root_dir and root_dir ~= "" then
-    local engine_root = find_engine_root(root_dir)
     if engine_root then
       local state = CORE_RT.project_state.read(engine_root)
       local plat = trim(state.target_platform or "")

@@ -1,24 +1,25 @@
-# Symbol Resolution Architecture — C++ 语义权威与非 C++ 兼容链
+# Symbol Resolution Architecture — UE C++ 语义权威与普通 workspace 隔离
 
-> 最后更新：2026-09-15
-> 权威代码：`lua/utils/lsp_fallback.lua`、`lua/utils/ue_goto/semantic_*.lua`、
+> 最后更新：2026-10-03
+> 权威代码：`lua/utils/lsp_fallback.lua`、`lua/utils/clangd_workspace.lua`、`lua/utils/ue_goto/semantic_*.lua`、
 > `lua/ue/index/`、`lua/ue/clangd_commands.lua`、`scripts/ue_clang_semanticd.lua`、
 > `scripts/ue_clang_cursor_shim.c`
 
 ## 1. Authority invariant
 
-C/C++ `gd` 只接受当前 active build 中由 Clang 证明的实体身份。唯一合法主键是
+UE-owned C/C++ `gd` 只接受当前 active build 中由 Clang 证明的实体身份。唯一合法主键是
 canonical USR（或等价的 compiler-owned identity）；函数名、receiver 文本、arity、
 渲染后的 signature、候选顺序、文件距离和最近访问记录都不是身份。
 
-因此 C++ `gd` 不读取或写入 definition-location cache，不调用 workspace symbol、
+因此 UE C++ `gd` 不读取或写入 definition-location cache，不调用 workspace symbol、
 csearch 或 GTAGS 自动猜目标，也不让 Tree-sitter 决定或否决语义结果。显式搜索、
-references 和非 C++ 文件仍可使用 csearch / GTAGS；这是另一条能力边界。
+references 和非 C++ 文件仍可使用 csearch / GTAGS；普通非 UE C/C++ 只使用其自身附着的
+clangd definition，不继承 UE sidecar，也不降级到文本目标。
 
 环境要求按 route 区分：source 需要 clangd 与当前 build/CDB；header 才额外要求匹配 libclang。
 缺少 header 的 native tooling 不再提前阻断独立的 source clangd 路径。
 
-## 2. 两条 C++ 路径
+## 2. 两条 UE C++ 路径
 
 ### 2.1 Active CDB 覆盖的 source TU
 
@@ -106,8 +107,8 @@ source 与 header 共用同一 identity/destination authority。声明处不是�
 | `lsp_transport.lua` | 通用 LSP 请求、能力与超时；不发现 UE 构建，不调用 legacy search |
 | `clangd_adapter.lua` | clangd exact-command transport、canonical USR 与 identity 限定的 destination 请求 |
 | `clangd_referent.lua` | source macro/alias/namespace 的 compiler referent 关联与角色保留 |
-| `compat_navigation.lua` | 非 C++ definition 的重试/fallback 与 references 兼容策略 |
-| `semantic_environment.lua` | 只读环境快照与 transition 判定；不 evict、不清 lineage、不启动进程 |
+| `compat_navigation.lua` | 普通 C/C++ 的 LSP-only definition；非 C++ definition 的重试/fallback 与 references 兼容策略 |
+| `semantic_environment.lua` | buffer ownership、只读环境快照与 transition 判定；不 evict、不清 lineage、不启动进程 |
 | `semantic_client.lua` | composition root：分开的 transport/action state，环境变化处置与 dispose |
 | `semantic_client_runtime.lua` / `semantic_session.lua` | 队列、进程、deadline 与实际 compiler handshake session；通过请求级 validity callback 判断排队请求是否过期 |
 | `semantic_client_actions.lua` | 编辑器快照、overlay、取消与窗口 context；返回 origin evidence，由 coordinator 在 jump 成功后提交 |
@@ -163,7 +164,7 @@ clangd；其 `symbolInfo` USR 必须与 sidecar USR 完全相同。
 
 ## 4. Terminal states 与 UI 副作用
 
-每个 C++ 请求只能结束为：
+每个 UE C++ 请求只能结束为：
 
 | 状态 | 含义 | 是否跳转 |
 |---|---|---|
@@ -229,11 +230,21 @@ UE Android TU 可达到数 GB working set，因此默认 LRU 容量为 4（可�
 不得为每次按键 spawn `clang-check/clang-query`，也不得在 UI
 主循环 parse/reparse。
 
-## 6. 非 C++ compatibility boundary
+## 6. 普通 workspace compatibility boundary
 
-旧 `cache -> LSP -> csearch -> GTAGS` 链只保留给非 C++ 兼容路径；`.usf/.py/.Build.cs`
-等无 clangd 文件仍可直接走 GTAGS。`gr` references 和显式 csearch / GTAGS 命令不受
-C++ `gd` authority invariant 影响。
+workspace ownership 以当前 buffer 的归一化路径为准：只有路径位于已解析 UE context 的
+engine root 或 project root 内，才进入 controlled-CDB / semantic-sidecar 路径。当前 cwd、recent
+project 或进程内已选 UE context 不得接管根之外的 C/C++ buffer。
+
+普通非 UE C/C++ `gd` 直接使用该 buffer 已附着的 clangd `textDocument/definition`，不读写旧
+definition-location cache，不启动 UE sidecar，也不降级到 csearch / GTAGS。普通 CMake 项目若把
+`compile_commands.json` 放在 build tree，clangd 启动层从 CMake presets 与有界的常规 build 目录发现它；
+扫描不会递归进入 workspace/vendor tree，且不注入 UE 的 `--enable-config=false`，因此项目 `.clangd`
+仍然生效。
+
+旧 `cache -> LSP -> csearch -> GTAGS` 链只保留给非 C++ 兼容路径；`.usf/.py/.Build.cs` 等无 clangd
+文件仍可直接走 GTAGS。`gr` references 和显式 csearch / GTAGS 命令不受 UE C++ `gd` authority
+invariant 影响。
 
 `jumper.lua` 仍统一执行跳转并维护 Vim 原生 jumplist 后置条件：一个 `<C-O>` 回源、
 恰好一条源位置记录、无幽灵位置。

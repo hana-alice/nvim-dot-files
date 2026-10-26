@@ -1,8 +1,8 @@
--- Non-C++ definition policy and references compatibility; never used for C++ gd.
+-- Non-C++ compatibility and ordinary C++ LSP-only policy; never UE C++ gd.
 local M = {}
 local location = require("utils.ue_goto.location")
 
-function M.async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_current, on_result, config)
+function M.async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_current, on_result, config, opts)
   config = config or require("utils.ue_goto.provider").config
   local attempts = 0
   local on_result_fired = false
@@ -15,7 +15,8 @@ function M.async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_curr
   -- Single textDocument/definition request, self-filtered. Non-C++ callers
   -- retain their existing empty-result fallback outside this provider.
   local function def_only(inner)
-    require("utils.ue_goto.clangd_adapter").async_lsp_request(bufnr, "textDocument/definition", function(def_locs)
+    local transport = opts and opts.lsp_only and "utils.ue_goto.lsp_transport" or "utils.ue_goto.clangd_adapter"
+    require(transport).async_lsp_request(bufnr, "textDocument/definition", function(def_locs)
       def_locs = location.filter_self_locations(def_locs, ref_file, ref_line)
       inner(def_locs and #def_locs > 0 and def_locs or nil)
     end)
@@ -108,8 +109,10 @@ function M.install(deps)
     local reading = package.loaded["utils.ue_goto.reading"]
     if reading then reading.cancel() end
   end
-  function compat.definition(sym, receiver, bufnr, ref_file, ref_line, ext)
-    local at_def, def_kind, def_name = symbol_mod.is_at_definition_at_cursor()
+  function compat.definition(sym, receiver, bufnr, ref_file, ref_line, ext, opts)
+    local lsp_only = opts and opts.lsp_only == true
+    local at_def, def_kind, def_name
+    if not lsp_only then at_def, def_kind, def_name = symbol_mod.is_at_definition_at_cursor() end
     if at_def then
       vim.notify(string.format("● already at %s definition of `%s`",
         def_kind or "?", def_name or sym or "?"),
@@ -117,7 +120,8 @@ function M.install(deps)
       return
     end
 
-    local dep, dep_root, dep_chain = symbol_mod.is_dependent_at_cursor()
+    local dep, dep_root, dep_chain
+    if not lsp_only then dep, dep_root, dep_chain = symbol_mod.is_dependent_at_cursor() end
     if dep then
       vim.notify(string.format(
         "⊘ %s — dependent name (rooted at template param `%s`); not resolvable without instantiation.",
@@ -126,7 +130,8 @@ function M.install(deps)
       return
     end
 
-    local in_dead, dead_kind = symbol_mod.is_in_unresolvable_context_at_cursor()
+    local in_dead, dead_kind
+    if not lsp_only then in_dead, dead_kind = symbol_mod.is_in_unresolvable_context_at_cursor() end
     if in_dead then
       dtrace("dead-zone bail: kind=%s", tostring(dead_kind))
       vim.notify(string.format("⊘ cursor is inside %s — no definition lookup",
@@ -165,7 +170,8 @@ function M.install(deps)
       end
     end
 
-    local ch_locs, ch_key, ch_source = cache.get(sym, receiver, bufnr)
+    local ch_locs, ch_key, ch_source
+    if not lsp_only then ch_locs, ch_key, ch_source = cache.get(sym, receiver, bufnr) end
     if ch_locs and #ch_locs > 0 then
       dtrace("cache HIT key=%q source=%s n=%d",
         tostring(ch_key), tostring(ch_source), #ch_locs)
@@ -180,7 +186,7 @@ function M.install(deps)
       dtrace("cache: jump failed; proceeding to live resolve")
     end
 
-    if ui.NON_CLANGD_EXTS[ext] then
+    if not lsp_only and ui.NON_CLANGD_EXTS[ext] then
       dtrace("non-clangd ext=%s -> GTAGS direct", tostring(ext))
       provider.gtags_fallback_async(sym, function(ok, result)
         if not still_current() then return end
@@ -211,6 +217,11 @@ function M.install(deps)
 
     local function csearch_then_gtags()
       if jumped or resolved then return end
+      if lsp_only then
+        done()
+        vim.notify("No definition from attached language server: " .. (sym or "?"), vim.log.levels.INFO)
+        return
+      end
       dtrace("path-B: csearch dispatch sym=%q recv=%q", sym, tostring(receiver))
       csearch_fb.find(sym, {
         bufnr = bufnr,
@@ -268,7 +279,7 @@ function M.install(deps)
         locs[1]._sym_name     = sym
         if jump_to_location(locs[1]) then
           jumped = true
-          cache.put(sym, receiver, locs, "lsp", bufnr)
+          if not lsp_only then cache.put(sym, receiver, locs, "lsp", bufnr) end
           done(format_jump_msg(sym, locs[1], "precise"), 3000)
           return
         end
@@ -283,7 +294,7 @@ function M.install(deps)
       else
         done()
       end
-    end)
+    end, { lsp_only = lsp_only })
   end
   function compat.references()
     return require("utils.ue_goto.reading").references()

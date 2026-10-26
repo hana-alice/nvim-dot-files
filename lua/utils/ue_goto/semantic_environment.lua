@@ -196,16 +196,35 @@ local function evidence_roots(ctx, build)
   return roots
 end
 
-function M.read(bufnr, opts)
-  local route = opts and opts.route or "header"
-  if route ~= "source" and route ~= "header" then return nil, "unknown semantic route" end
+local function ue_context_for_buffer(bufnr)
   local ok_ue, ue = pcall(require, "ue")
   if not ok_ue or type(ue.resolve_context) ~= "function" then
     return nil, "UE context API unavailable"
   end
   local bufname = vim.api.nvim_buf_get_name(bufnr or 0)
-  local ctx, err = ue.resolve_context({ bufname = bufname ~= "" and bufname or nil })
-  if not ctx then return nil, err or "UE context unavailable" end
+  if bufname == "" then return nil, "not-ue-buffer" end
+  local ctx = ue.resolve_context({ bufname = bufname })
+  if not ctx or not require("utils.clangd_workspace").is_path_in_ue_context(bufname, ctx) then
+    return nil, "not-ue-buffer"
+  end
+  return ctx, bufname
+end
+
+-- nil means classification is unavailable, not permission to guess a target.
+function M.is_ue_buffer(bufnr)
+  local ctx, detail = ue_context_for_buffer(bufnr)
+  if ctx then return true end
+  if detail == "not-ue-buffer" then return false, detail end
+  return nil, detail
+end
+
+function M.read(bufnr, opts)
+  local route = opts and opts.route or "header"
+  if route ~= "source" and route ~= "header" then return nil, "unknown semantic route" end
+  local ctx, bufname_or_err = ue_context_for_buffer(bufnr)
+  if not ctx then return nil, bufname_or_err end
+  local bufname = bufname_or_err
+  local ue = require("ue")
 
   local clangd_cmd = type(ue.clangd_cmd) == "function" and ue.clangd_cmd(ctx.engine_root) or nil
   local clangd = resolve_executable(type(clangd_cmd) == "table" and clangd_cmd[1] or clangd_cmd)

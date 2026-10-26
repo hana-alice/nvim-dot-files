@@ -37,6 +37,7 @@ M.set_priority = transport.set_priority
 M.set_trace = transport.set_trace
 M.trace_event = runtime.emit_trace
 M.index_snapshot_is_current = environment.index_snapshot_is_current
+M.is_ue_buffer = environment.is_ue_buffer
 local actions = action_helper.install(M, {
   state = action_state, hash_text = runtime.hash_text,
   emit_trace = runtime.emit_trace, unavailable = runtime.unavailable,

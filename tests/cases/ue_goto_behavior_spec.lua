@@ -387,6 +387,123 @@ t.describe("C++ gd: 每个调用点必须独立请求语义目标", function()
     if not ok then error(err) end
   end)
 
+  t.it("非 UE C++ 工程只走 language-server definition，不启动 sidecar 或文本 fallback", function()
+    local saved = {}
+    local mocked = {
+      "utils.ue_goto.symbol",
+      "utils.ue_goto.location",
+      "utils.ue_goto.provider",
+      "utils.ue_goto.ui",
+      "utils.ue_goto.jumper",
+      "utils.ue_goto.cache",
+      "utils.ue_goto.csearch_fallback",
+      "utils.ue_goto.semantic_client",
+      "utils.lsp_fallback",
+    }
+    for _, name in ipairs(mocked) do saved[name] = package.loaded[name] end
+
+    local lsp_calls, jumps, sidecar_calls = 0, 0, 0
+    local has_lsp, open_ok, empty_result = true, true, false
+    package.loaded["utils.ue_goto.symbol"] = {
+      current_symbol = function() return "CreateWindow" end,
+      current_receiver = function() error("generic C++ must not select by receiver text") end,
+      is_at_definition_at_cursor = function() error("generic C++ must defer to clangd") end,
+      is_dependent_at_cursor = function() error("generic C++ must defer to clangd") end,
+      is_in_unresolvable_context_at_cursor = function() error("generic C++ must defer to clangd") end,
+    }
+    package.loaded["utils.ue_goto.location"] = {
+      normalize_path = function(path) return path end,
+      location_path = function(location) return vim.uri_to_fname(location.uri) end,
+      location_line = function(location) return location.range.start.line + 1 end,
+    }
+    package.loaded["utils.ue_goto.provider"] = {
+      async_lsp_definition_with_retry = function(_, _, _, _, callback)
+        lsp_calls = lsp_calls + 1
+        callback(not empty_result and { loc("file:///plain/include/window.h", 11) } or nil)
+      end,
+      gtags_fallback_async = function() error("generic C++ must not use GTAGS") end,
+    }
+    package.loaded["utils.ue_goto.ui"] = {
+      buf_extension = function() return "cpp" end,
+      NON_CLANGD_EXTS = {},
+      progress_notice = function() return { clear = function() end } end,
+      try_jump = function() return false end,
+    }
+    package.loaded["utils.ue_goto.jumper"] = {
+      jump = function()
+        jumps = jumps + 1
+        return open_ok
+      end,
+    }
+    package.loaded["utils.ue_goto.cache"] = {
+      get = function() error("generic C++ must not read the text-keyed cache") end,
+      put = function() error("generic C++ must not write the text-keyed cache") end,
+      stats = function() return { entries = 0 } end,
+      clear = function() return true end,
+    }
+    package.loaded["utils.ue_goto.csearch_fallback"] = {
+      find = function() error("generic C++ must not use csearch") end,
+    }
+    package.loaded["utils.ue_goto.semantic_client"] = {
+      set_trace = function() end,
+      is_ue_buffer = function() return false, "not-ue-buffer" end,
+      discover_toolchain = function()
+        sidecar_calls = sidecar_calls + 1
+        error("generic C++ must not discover the UE sidecar")
+      end,
+      cancel_action = function() end,
+      clear_contexts = function() end,
+      status = function() return {} end,
+    }
+    package.loaded["utils.lsp_fallback"] = nil
+
+    local previous_buf = vim.api.nvim_get_current_buf()
+    local test_buf = vim.api.nvim_create_buf(true, false)
+    vim.api.nvim_buf_set_name(test_buf, vim.fn.tempname():gsub("\\", "/") .. ".cpp")
+    vim.api.nvim_buf_set_lines(test_buf, 0, -1, false, { "CreateWindow();" })
+    vim.bo[test_buf].modified = false
+    vim.api.nvim_set_current_buf(test_buf)
+    vim.api.nvim_win_set_cursor(0, { 1, 1 })
+    local old_get_clients = vim.lsp.get_clients
+    local old_notify = vim.notify
+    vim.lsp.get_clients = function(opts)
+      return has_lsp and opts and opts.method == "textDocument/definition" and { { name = "clangd" } } or {}
+    end
+    vim.notify = function() end
+
+    local ok, err = xpcall(function()
+      require("utils.lsp_fallback").definition()
+      t.assert_eq(lsp_calls, 1)
+      t.assert_eq(jumps, 1)
+      t.assert_eq(sidecar_calls, 0)
+      empty_result = true
+      require("utils.lsp_fallback").definition()
+      t.assert_eq(lsp_calls, 2)
+      t.assert_eq(jumps, 1, "an empty LSP result must not use a text fallback")
+      empty_result, open_ok = false, false
+      require("utils.lsp_fallback").definition()
+      t.assert_eq(lsp_calls, 3)
+      t.assert_eq(jumps, 2, "a failed destination open must not use a text fallback")
+      has_lsp = false
+      require("utils.lsp_fallback").definition()
+      t.assert_eq(lsp_calls, 3, "missing LSP must not dispatch a UE fallback")
+      t.assert_eq(sidecar_calls, 0)
+    end, debug.traceback)
+
+    vim.lsp.get_clients = old_get_clients
+    vim.notify = old_notify
+    if vim.api.nvim_buf_is_valid(previous_buf) then vim.api.nvim_set_current_buf(previous_buf) end
+    if vim.api.nvim_buf_is_valid(test_buf) then vim.api.nvim_buf_delete(test_buf, { force = true }) end
+    for _, name in ipairs(mocked) do package.loaded[name] = saved[name] end
+    for _, cmd in ipairs({
+      "UEDefTrace", "UEDefSelfTest", "UEDefReload", "UEDefDiag",
+      "UEDefCacheClear", "UEDefCancel", "UEDefContextClear", "UEDefExplain",
+    }) do
+      pcall(vim.api.nvim_del_user_command, cmd)
+    end
+    if not ok then error(err) end
+  end)
+
   t.it("semantic explain/probe 可回放，150ms 进度在 stale 结束后会清理", function()
     local saved = {}
     local mocked = {

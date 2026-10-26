@@ -10,9 +10,9 @@ end
 function M.async_clangd_symbol_info(...)
   return require("utils.ue_goto.clangd_adapter").async_clangd_symbol_info(...)
 end
-function M.async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_current, callback)
+function M.async_lsp_definition_with_retry(bufnr, ref_file, ref_line, still_current, callback, opts)
   return require("utils.ue_goto.compat_navigation").async_lsp_definition_with_retry(
-    bufnr, ref_file, ref_line, still_current, callback, M.config)
+    bufnr, ref_file, ref_line, still_current, callback, M.config, opts)
 end
 function M.gtags_fallback_async(...)
   return require("utils.ue_goto.compat_navigation").gtags_fallback_async(...)

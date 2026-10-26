@@ -8,9 +8,23 @@ Clang 证明的实体身份（canonical USR / compiler-owned identity）可以�
 GTAGS、文件距离与候选顺序 MUST NOT 选择、替换或否决 C++ 语义目标（P11/P12）；
 显式搜索、`gr` references 与非 C++ 文件不受本契约约束，走独立的兼容链
 （`docs/architecture-symbol-resolution.md` §6）。本 spec 只管跳转决策与其
-异步/缓存/失败合同，不规定具体 UI 展现细节。
+异步/缓存/失败合同，不规定具体 UI 展现细节。UE 语义导航只管理已解析 engine/project
+roots 内的 buffer；普通非 UE C/C++ 使用自身附着 language server 的 definition。
 
 ## Requirements
+
+### Requirement: Workspace ownership SHALL isolate ordinary C/C++ navigation
+
+UE context 可解析不代表当前 buffer 属于该 context；系统 SHALL 验证 buffer path
+位于 engine/project roots 内。已确认属于普通 workspace 的 C/C++ SHALL 直接使用
+附着 language server 的 definition，不启动 UE sidecar，不读取文本键 definition
+cache，不降级到 csearch/GTAGS；分类器不可用时 MUST NOT 以猜测结果替代 UE 语义权威。
+普通 clangd SHALL 保留项目配置，并有界发现 CMake build compilation database，
+不得递归扫描 vendor tree。UE 的 exact-command、header proof 与 SuperUnity 合同不变。
+
+#### Scenario: 普通 CMake 项目与持久化 UE context 并存
+- **WHEN** 用户在已解析 UE roots 外的普通 C/C++ buffer 触发 `gd`
+- **THEN** 系统 SHALL 只请求该 buffer 附着 language server 的 definition，且空结果不触发文本搜索
 
 ### Requirement: 跳转只接受编译器证明的语义身份
 

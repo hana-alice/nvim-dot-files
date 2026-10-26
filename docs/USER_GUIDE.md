@@ -223,6 +223,8 @@ Editor 前提与报告完整性：[测试边界](USER_GUIDE_LIMITS.md#editor-测
 | 最近文件 / 跳转位置 / 书签 | `<leader>fr` / `<leader>sj` / `<leader>sm` |
 | 保存搜索结果 | Ctrl-Q，之后工作台 → 恢复 → 窗口/文件/结果，或 `:UEWorkspace results` |
 
+`<leader>gg` 打开 Git 改动审阅；`[[` 跳上一处改动，`]]` 跳下一处改动，可跨文件继续；`q` 关闭审阅。
+
 旧搜索格式与结果预算：[搜索历史边界](USER_GUIDE_LIMITS.md#搜索历史与结果)。
 
 ### 管理文件和关闭缓冲区

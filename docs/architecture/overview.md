@@ -33,7 +33,7 @@
 | Android device | `lua/utils/android_device.lua` | `adb devices -l` 枚举、当前进程 serial 选择、`adb -s` argv | `vim.g.ue_android_device_serial` 是本 Neovim 进程的交互真相；活跃任务捕获 serial |
 | Android SO 迭代 | `lua/ue/targets/android.lua` + `android_windows.lua` + `scripts/ue_android_so_*.ps1` + `scripts/ue_android_so_agent.c` | Windows host 上的 SO-only UBT action 执行；root 原子替换或 debuggable app-private ClassLoader 重定向 | Windows-only compatibility adapter；不增加 macOS→Android；正常 APK 流程保持独立 |
 | UE target drivers | `lua/ue/targets/` | Android / IOS / Mac / Win64 / Linux 的 UBT、UAT、产物和设备策略 | 各 target 独立实现；不得跨 driver fallback |
-| 符号解析栈 | `lua/utils/ue_goto/` + `lsp_fallback.lua` | C++ compiler identity；非 C++ compatibility | header 必须有 proven origin TU；非 resolved 不猜测 |
+| 符号解析栈 | `lua/utils/ue_goto/` + `lsp_fallback.lua` | UE C++ compiler identity；普通 C++ LSP；非 C++ compatibility | buffer path 决定 UE ownership；header 必须有 proven origin TU；非 resolved 不猜测 |
 | 代码搜索 | `lua/utils/code_search/` + `search_picker.lua` + `search_process.lua` | 索引查询、可证明 span、流式状态及后置过滤 | 索引入口不降级；显式 rg 沿用真实 provider argv；line-only/partial 可见，EOF 与 exit 分开 |
 | 当前文档查找 | `lua/utils/document_find.lua` + `document_find_process.lua` | 当前内存文本的逐次匹配和条件控制 | 不依赖 UE/CDB；有界单线程 rg stdin、流式解析和取消，来源版本与窗口交接复核 |
 | 当前文档位置 | `lua/utils/document_location.lua` | 编辑区行列直达及文件位置复制 | 同文件列表一基 UTF-8 字节列；严格拒绝无效坐标，输入期间核验来源，相对路径以窗口 cwd 为根 |
@@ -114,11 +114,12 @@
   engine authority，也不跨 Neovim 进程传播。UBT build 与 prepare/CDB pipeline 互斥
   （build 赢：启动时 cancel 在飞 pipeline；build 运行中 prepare 拒绝启动）——prepare 读的
   Module.*.rsp/receipts 正是 build 在写的产物（WAW，见 CONSTRAINTS K51）。
-- **goto-definition**：C++ source 以 controlled active CDB transport 的 exact command 在 clangd
+- **goto-definition**：UE C++ source 以 controlled active CDB transport 的 exact command 在 clangd
   精确光标取得 canonical USR，并只向同 identity client 查询唯一 definition；不再为每次 source `gd`
   让 sidecar 重读全量 CDB。header 仍在 proven origin TU 中取得 libclang exact-cursor canonical USR，
-  再在同 generation controlled module AST 中查唯一 body。非 C++ 兼容路径保留
-  cache/LSP/csearch/GTAGS。coordinator 独占最终跳转与成功后的 lineage；报告、通用 LSP transport、
+  再在同 generation controlled module AST 中查唯一 body。普通非 UE C/C++ 由 buffer path 隔离，
+  使用自身 clangd 与有界发现的 CMake build CDB，且不进入 UE sidecar/text fallback；非 C++ 兼容路径
+  保留 cache/LSP/csearch/GTAGS。coordinator 独占最终跳转与成功后的 lineage；报告、通用 LSP transport、
   clangd adapter 与 compatibility policy 分离。semantic client 分离只读环境、action state、transport
   state 与 compiler session；sidecar 由独立 TU store、catalog、definition resolver 组成。详见
   `docs/architecture-symbol-resolution.md`。
@@ -338,9 +339,10 @@ matrix 声明与回归，不能在 generic orchestration 中添加 shell/path �
   nvim-dap 的固定 `dap*.log` 名改为 `dap*.<pid>.log`。
 - **LSP 行为改动**只走 `lua/utils/lsp_fallback.lua` 或 `lua/workarounds/clangd/*`（禁全局 handler 覆盖）。
 - **上游 bug 补丁**只进 `lua/workarounds/<scope>/<name>.lua`（禁 inline monkey-patch）。
-- **C++ goto 精度**：source 由 exact-command clangd client 证明 canonical USR + definition；header
+- **UE C++ goto 精度**：source 由 exact-command clangd client 证明 canonical USR + definition；header
   由 proven libclang canonical USR + module AST 唯一 body 证明；TS 不给答案，
-  csearch/GTAGS 不参与 C++ destination。非 C++ 保留既有 LSP/csearch/GTAGS 兼容链。
+  csearch/GTAGS 不参与 C++ destination。普通非 UE C++ 只走附着 clangd 的 definition；非 C++ 保留
+  既有 LSP/csearch/GTAGS 兼容链。
 - **启动顺序**固定，见 `docs/CONSTRAINTS.md §三 C3` 与 `init.lua`。
 
 ## 6. 开发纪律入口

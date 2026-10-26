@@ -14,6 +14,8 @@ t.describe("semantic client architecture", function()
     local root = vim.fn.tempname():gsub("\\", "/")
     vim.fn.mkdir(root, "p")
     vim.fn.writefile({ "[]" }, root .. "/compile_commands.json")
+    local test_buf = vim.api.nvim_create_buf(true, false)
+    vim.api.nvim_buf_set_name(test_buf, root .. "/subject.cpp")
     package.loaded["ue"] = {
       resolve_context = function() return { engine_root = root, project_root = root, paths = {}, state = {} } end,
       clangd_cmd = function() return { tool.path } end,
@@ -28,16 +30,17 @@ t.describe("semantic client architecture", function()
     platform.libclang_candidates = function() return {} end
     local ok, err = xpcall(function()
       local environment = require("utils.ue_goto.semantic_environment")
-      local source = assert(environment.read(0, { route = "source" }))
+      local source = assert(environment.read(test_buf, { route = "source" }))
       t.assert_eq(source.clangd_path, vim.fs.normalize(tool.path))
       t.assert_nil(source.libclang_path)
-      local header, why = environment.read(0, { route = "header" })
+      local header, why = environment.read(test_buf, { route = "header" })
       t.assert_nil(header)
       t.assert_contains(why, "libclang")
-      t.assert_nil(environment.read(0))
+      t.assert_nil(environment.read(test_buf))
     end, debug.traceback)
     for _, key in ipairs(keys) do package.loaded[key] = saved[key] end
     platform.libclang_candidates = old_candidates
+    vim.api.nvim_buf_delete(test_buf, { force = true })
     vim.fn.delete(root, "rf")
     if not ok then error(err) end
   end)

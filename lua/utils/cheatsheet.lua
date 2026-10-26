@@ -518,7 +518,7 @@ local tabs = {
         title = "Inside CodeDiff",
         mappings = {
           { "gd",                "进入编辑 tab；Ctrl-O 不切回审阅 tab，用 <leader>w[ 返回" },
-          { "]c / [c",           "Next / prev hunk" },
+          { "[[ / ]]",           "Previous / next hunk" },
           { "<tab> / <s-tab>",   "Next / prev file" },
           { "gS",                "Switch staged / unstaged view" },
           { "<leader>hs",        "Stage hunk (Changes)" },

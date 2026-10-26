@@ -807,7 +807,7 @@ content search. A stage action must not implicitly save a dirty buffer.
 
 | Key | Action |
 |---|---|
-| `]c` / `[c` | Next / previous hunk, continuing across files |
+| `[[` / `]]` | Previous / next hunk, continuing across files |
 | `<Tab>` / `<S-Tab>` | Next / previous file |
 | `gS` | Switch staged / unstaged view |
 | `<localleader>c` | Open Neogit commit flow, then return to review |

@@ -357,13 +357,23 @@ local function diagnostic_entries_from_output(output, opts)
   local entries = {}
   local seen = {}
 
-  for _, line in ipairs(lines) do
+  local index = 1
+  while index <= #lines do
+    local line = lines[index]
     local entry = parse_output_entry(line, opts)
+    -- Compilers attached to a terminal wrap at its width: a long path leaves
+    -- only "error:" on the location line and the message on the next one.
+    local following = lines[index + 1]
+    if entry and following and entry.text:match("^%a[%a ]*:$") and not parse_output_entry(following, opts) then
+      entry.text = entry.text .. " " .. following
+      index = index + 1
+    end
     if entry then
       add_quickfix_entry(entries, seen, entry)
     elseif is_summary_diagnostic_line(line) then
       add_quickfix_entry(entries, seen, { text = trim(line) })
     end
+    index = index + 1
   end
 
   if #entries == 0 then
@@ -655,7 +665,7 @@ function M.clangd_cmd(root_dir)
     "--completion-style=detailed",
     "--completion-parse=auto",          -- text-based completion while preamble builds
     "--header-insertion=never",
-    "--pch-storage=memory",
+    "--pch-storage=disk",                -- memory 模式每个打开 TU 多占约 0.4 GB commit（2026-10-26 实测 3 TU：1291→223 MB）
     "--clang-tidy=false",               -- explicit because project/user config is disabled below
     "--enable-config=false",             -- reject stale project/user External.File fragments
     "--function-arg-placeholders=true",

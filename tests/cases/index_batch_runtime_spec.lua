@@ -765,6 +765,19 @@ t.describe("frozen batch startup runtime", function()
     end)
   end)
 
+  t.it("certifies the editor's --pch-storage=disk as a non-semantic server option", function()
+    fixture(function(h, root)
+      h.config = { cmd_cwd = root }
+      vim.list_extend(h.command, { "--pch-storage=disk", "--enable-config=false", "--query-driver=" .. root .. "/clang*" })
+      local profile, reason = runtime.server_profile(h.command, h.config)
+      t.assert_nil(reason)
+      t.assert_eq(profile.enable_config, false)
+      local _, rejected = runtime.server_profile({ "clangd", "--pch-storage=elsewhere", "--enable-config=false",
+        "--query-driver=" .. root .. "/clang*" }, h.config)
+      t.assert_eq(rejected, "unsupported-clangd-option:--pch-storage=elsewhere")
+    end)
+  end)
+
   t.it("activates only an explicitly requested and newly certified query profile with its effective environment", function()
     fixture(function(h, root)
       h.config = { cmd_cwd = root, cmd_env = { CPATH = "caller-include", KEEP = "caller" } }

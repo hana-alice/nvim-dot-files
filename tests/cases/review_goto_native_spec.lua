@@ -2,7 +2,7 @@ local t = require("tests.harness")
 local cfg = t.bootstrap()
 
 local native = [=[
-local cfg, root, plugins, clangd, reuse_git = unpack(arg)
+local cfg, root, plugins, clangd, reuse_git, compiler = unpack(arg)
 local stdpath = vim.fn.stdpath
 vim.fn.stdpath = function(kind)
   if kind == "cache" or kind == "state" or kind == "log" then return root .. "/" .. kind end
@@ -30,7 +30,7 @@ write("defs.hpp", {"inline int review_target() { return 42; }"})
 write("main.cpp", {'#include "defs.hpp"', "int run() { return review_target(); }"})
 write("compile_commands.json", {vim.json.encode({{
   directory=root, file=root .. "/main.cpp",
-  arguments={"C:/Program Files/LLVM/bin/clang++.exe", "-std=c++20", "-c", root .. "/main.cpp"},
+  arguments={compiler, "-std=c++20", "-c", root .. "/main.cpp"},
 }})})
 local old, new
 if reuse_git and reuse_git ~= "" then
@@ -164,8 +164,12 @@ vim.cmd("qa!")
 
 t.describe("review_goto real CodeDiff range + clangd", function()
   local plugins = vim.fs.joinpath(vim.fn.stdpath("data"), "lazy")
-  local clangd = "C:/Program Files/LLVM/bin/clangd.exe"
-  if vim.fn.executable(clangd) ~= 1 or not vim.uv.fs_stat(plugins .. "/codediff.nvim") then
+  -- The installed LLVM may live anywhere (CI installs it under the runner temp).
+  local clangd = vim.env.UE_CLANGD or vim.fn.exepath("clangd")
+  if clangd == "" then clangd = "C:/Program Files/LLVM/bin/clangd.exe" end
+  local compiler = vim.fs.joinpath(vim.fs.dirname(clangd), "clang++" .. (vim.fn.has("win32") == 1 and ".exe" or ""))
+  if vim.fn.executable(clangd) ~= 1 or vim.fn.executable(compiler) ~= 1
+    or not vim.uv.fs_stat(plugins .. "/codediff.nvim") then
     t.skip("cold/hidden/wrong-root/exited/timeout end-to-end", "installed native tools unavailable", { native = true })
     return
   end
@@ -175,7 +179,7 @@ t.describe("review_goto real CodeDiff range + clangd", function()
     local script = runroot .. "/review-native.lua"
     vim.fn.writefile(vim.split(native, "\n", { plain = true }), script)
     local process = vim.system({ vim.v.progpath, "--headless", "-u", "NONE", "-i", "NONE",
-      "-l", script, cfg, runroot, plugins, clangd, vim.env.NVIM_TEST_REVIEW_GIT_FIXTURE or "" }, { text = true,
+      "-l", script, cfg, runroot, plugins, clangd, vim.env.NVIM_TEST_REVIEW_GIT_FIXTURE or "", compiler }, { text = true,
       env = { NVIM_LOG_FILE = runroot .. "/nvim.log", XDG_STATE_HOME = runroot .. "/state" } }):wait(35000)
     t.assert_eq(process.code, 0, (process.stderr or "") .. (process.stdout or ""))
     t.assert_contains(process.stdout, "NATIVE_REVIEW_GD_OK")
@@ -184,6 +188,7 @@ t.describe("review_goto real CodeDiff range + clangd", function()
     t.assert_true(result.commits[1] ~= result.commits[2])
     -- Retain task evidence; do not remove fixture repositories or logs.
     local evidence = vim.env.NVIM_TEST_REVIEW_GIT_FIXTURE and "n1-gd-native-result.json" or "m-gd-native-result.json"
+    vim.fn.mkdir(cfg .. "/.tmp/review-gd", "p")
     vim.fn.writefile({vim.json.encode({root=runroot,result=result})}, cfg .. "/.tmp/review-gd/" .. evidence)
   end)
 end)

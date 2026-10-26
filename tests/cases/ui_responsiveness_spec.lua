@@ -87,9 +87,17 @@ t.describe("clangd -j：必须为 UI 保留 CPU 余量", function()
     end
     t.assert_type(argv_jobs, "number", "clangd argv 必须携带 -j")
 
+    local saved = vim.env.UE_CLANGD_JOBS
+    vim.env.UE_CLANGD_JOBS = nil
+    local expected = clangd_jobs.resolve()
+    vim.env.UE_CLANGD_JOBS = saved
+    if saved == nil or saved == "" then
+      t.assert_eq(argv_jobs, expected, "argv -j 必须等于 clangd_jobs.resolve() 策略值")
+    end
     local cpus = #((vim.uv or vim.loop).cpu_info() or {})
-    if cpus > clangd_jobs.UI_RESERVED_CORES then
-      -- 本宿主上 argv 必须满足同一条 UI 余量不变量。
+    -- 小宿主（如 5 核 CI）上 MIN_JOBS 下限按策略优先于 UI 预留；只在预留后仍不低于
+    -- 下限时，argv 才必须满足 UI 余量不变量。
+    if saved == nil and cpus - clangd_jobs.UI_RESERVED_CORES >= clangd_jobs.MIN_JOBS then
       t.assert_true(argv_jobs <= cpus - clangd_jobs.UI_RESERVED_CORES,
         ("argv -j=%d 未给 UI 留核（cpus=%d）"):format(argv_jobs, cpus))
     end

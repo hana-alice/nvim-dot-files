@@ -131,4 +131,16 @@ t.describe("build output terminal controls", function()
       t.assert_eq(rows[1].text, "error: plain diagnostic")
     end)
   end)
+
+  t.it("a terminal-wrapped clang diagnostic keeps its message with the location", function()
+    fixture(function(file)
+      -- clang wraps at the terminal width; a long path leaves only "error:".
+      local rows = parse({ file .. ":1:19: error:", "use of undeclared identifier 'x'",
+        "1 | int main(){return x;}", file .. ":2:1: error: next diagnostic" })
+      t.assert_eq(#rows, 2)
+      t.assert_eq(rows[1].col, 19)
+      t.assert_eq(rows[1].text, "error: use of undeclared identifier 'x'")
+      t.assert_eq(rows[2].text, "error: next diagnostic")
+    end)
+  end)
 end)

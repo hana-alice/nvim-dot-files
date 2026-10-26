@@ -22,7 +22,23 @@ return function(M, core)
     return directory ~= nil and path_key(vim.fs.normalize(directory))
       == path_key(vim.fs.dirname(ctx.paths.semantic_cdb))
   end
+  -- Evidence for the module-priority contract (hot finishes before full).
+  -- Every terminal barrier outcome, and every full publication that had no
+  -- barrier to wait on, is recorded with its reason; never notifies.
+  local function probe(phase, status, reason, data)
+    pcall(function()
+      local record = core.deps.probe or require("utils.probe").record
+      record("index-phase-barrier", phase .. ":" .. status .. ":" .. reason, vim.tbl_extend("force",
+        { phase = phase, status = status, reason = reason,
+          state = (status == "indexed" or status == "waited") and "ok" or "failed" }, data or {}))
+    end)
+  end
   local function finish(record, status, reason)
+    if record.status ~= status or record.reason ~= reason then
+      probe(record.phase or "?", status, reason, { generation = record.generation,
+        waited_s = record.started_at and (vim.uv.now() - record.started_at) / 1000 or nil,
+        began = record.began == true })
+    end
     record.status, record.reason = status, reason
     if status == "indexed" and record.phase == "current" then record.first_stage_complete = true end
     local waiters = record.waiters
@@ -37,7 +53,8 @@ return function(M, core)
         or not vim.deep_equal(record.signature, core.h.file_signature(key(record.ctx)))
         or not vim.deep_equal(record.base_signature, core.h.file_signature(record.base))
         or (M.source_refresh_pending and M.source_refresh_pending(record.ctx))
-        or vim.uv.fs_stat(vim.fs.dirname(key(record.ctx)) .. "/batches.json") then return false end
+        or not require("ue.index.batch_metadata").is_ordinary(
+          vim.fs.dirname(key(record.ctx)) .. "/batches.json") then return false end
     if record.client_id then
       return owns(vim.lsp.get_client_by_id(record.client_id), record.ctx)
     end
@@ -78,6 +95,12 @@ return function(M, core)
     end
     if publication.changed == false and (old or phase ~= "current"
         or (core.h.ensure_index_state(ctx).index_selection or {}).coverage_level == "full") then return end
+    if phase == "full" and publication.original_changed == true and not (old and (old.status == "indexed" or old.phase == "full")) then
+      -- Full replaced the priority phase before its reader finished: priority lost.
+      probe("full", "unordered", old and (old.reason or old.status) or "no-barrier-record",
+        { generation = generation.generation_id, ordinary = publication.ordinary == true,
+          previous_phase = old and old.phase or nil })
+    end
     if publication.ordinary ~= true then
       if old and pending(old) then finish(old, "bypassed", "frozen-publication") end
       records[scope] = nil
@@ -92,7 +115,7 @@ return function(M, core)
     local previous_pending = previous_reader and previous_reader.progress and previous_reader.progress.pending
       and previous_reader.progress.pending.backgroundIndexProgress
     local record = { ctx = ctx, generation = generation.generation_id, phase = phase,
-      status = "cdb-generated", signature = core.h.file_signature(scope), base = base,
+      status = "cdb-generated", started_at = vim.uv.now(), signature = core.h.file_signature(scope), base = base,
       base_signature = core.h.file_signature(base), waiters = {},
       observing = publication.original_append_only ~= true,
       completed_reader = previous_reader and not previous_pending and previous_reader.id or nil,

@@ -962,6 +962,8 @@ t.describe("multi-instance project state", function()
         -- this writer's actual published path, never its in-memory seeded set.
         local code = string.format(
           "local p,own=%q,%q; local w=require(%q); w._set_opts_for_test({dirty_json_path=p}); "
+            .. "vim.fn.writefile({'ready'},%q); "
+            .. "assert(vim.wait(20000,function() return vim.fn.filereadable(%q)==1 end,5),'start barrier timeout'); vim.wait(%d); "
             .. "w._seed_persistent_dirty_for_test({own}); w._save_persistent_dirty_for_test(); "
             .. "vim.fn.writefile({'attempted'},%q); "
             .. "assert(vim.wait(8000,function() local f=io.open(p,'rb'); if not f then return false end; "
@@ -969,7 +971,7 @@ t.describe("multi-instance project state", function()
             .. "if not decoded or type(arr)~='table' then return false end; "
             .. "for _,value in ipairs(arr) do if vim.fs.normalize(value):lower()==vim.fs.normalize(own):lower() then return true end end; "
             .. "return false end,10),'dirty path was not published before the persistence deadline')",
-          path, dirty, "utils.ue_watch", root .. "/attempted-" .. index
+          path, dirty, "utils.ue_watch", root .. "/ready-" .. index, root .. "/go", (index - 1) * 40, root .. "/attempted-" .. index
         )
         jobs[index] = vim.system({
           vim.v.progpath, "--headless", "-u", "NONE", "-i", "NONE",
@@ -977,6 +979,17 @@ t.describe("multi-instance project state", function()
           "-c", "lua " .. code, "-c", "qa!",
         }, { text = true })
       end
+      -- Start barrier: slow runners (macOS CI) spread child startup over seconds, so the
+      -- first writer could exhaust its bounded retry budget before the last one even
+      -- attempted (推测, from the CI "retries exhausted" stderr). Release writers together
+      -- with a 40ms per-writer stagger: a fully synchronous release puts all eight on the
+      -- same backoff schedule and only one can win each round (observed locally).
+      local ready = vim.wait(20000, function()
+        for index = 1, 8 do if vim.fn.filereadable(root .. "/ready-" .. index) ~= 1 then return false end end
+        return true
+      end, 10)
+      t.assert_true(ready, "not all dirty writers reached the start barrier")
+      vim.fn.writefile({ "go" }, root .. "/go")
       -- Every writer encounters a real live lease for longer than the old
       -- unconditional 300ms child lifetime before competing to publish its union.
       local attempted = vim.wait(5000, function()

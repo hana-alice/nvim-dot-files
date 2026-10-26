@@ -268,7 +268,9 @@ t.describe("native unchanged-CDB source refresh", function()
     local config = { name = "clangd", root_dir = root,
       cmd = { tool.clangd_path, "--background-index", "--enable-config=false", "-j=1", "--log=error",
         "--compile-commands-dir=" .. root },
-      cmd_env = { LOCALAPPDATA = root .. "/environment", XDG_CACHE_HOME = root .. "/environment" } }
+      -- TEMP inside root: force-stopped clangd leaves preamble-*.pch behind otherwise.
+      cmd_env = { LOCALAPPDATA = root .. "/environment", XDG_CACHE_HOME = root .. "/environment",
+        TEMP = root .. "/environment", TMP = root .. "/environment" } }
     local function start()
       starts = starts + 1
       local id = vim.lsp.start(vim.deepcopy(config), { bufnr = buffer, reuse_client = function() return false end })

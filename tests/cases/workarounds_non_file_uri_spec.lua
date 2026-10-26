@@ -20,7 +20,7 @@ local function integration(mode)
   vim.env.NVIM_LOG_FILE = root .. "/nvim.log"
   vim.env.NVIM_UE_LOG_DIR = root .. "/logs"
   vim.env.NVIM_UE_PROBE_PATH = root .. "/probes.json"
-  vim.lsp.set_log_level("debug")
+  vim.lsp.log.set_level("debug")
   local clangd, codediff = native_paths()
   assert(vim.fn.executable(clangd) == 1, "real clangd unavailable: " .. clangd)
   assert(vim.fn.isdirectory(codediff) == 1, "installed CodeDiff unavailable")
@@ -90,13 +90,13 @@ local function integration(mode)
     -- Real startup remains asynchronous: attach a file, then have the real
     -- CodeDiff loader repurpose the same buffer before initialize completes.
     assert(not client.initialized, "late-rename control missed initialization window")
-    report.attached_before_rename = client.attached_buffers[source] == true
+    report.attached_before_rename = client.attached_buffers[source] ~= nil
     vim.api.nvim_buf_set_name(source, virtual.create_url(repo, ":0", "a.cpp"))
     vim.api.nvim_exec_autocmds("BufReadCmd", { buffer = source })
     event("rename_before_initialize", { buf = source, uri = vim.uri_from_bufnr(source) })
     assert(vim.wait(10000, function() return client.initialized and loaded[source] end, 10), "late revision load timeout")
     vim.wait(100, function() return false end, 10)
-    report.attached_after_initialize = client.attached_buffers[source] == true
+    report.attached_after_initialize = client.attached_buffers[source] ~= nil
     report.revision_content = vim.api.nvim_buf_get_lines(source, 0, -1, false)
     report.virtual_did_open_count = 0
     for _, record in ipairs(report.text_document_traffic) do
@@ -107,7 +107,7 @@ local function integration(mode)
     local ordinary = vim.fn.bufadd(repo .. "/b.cpp")
     vim.fn.bufload(ordinary)
     report.normal_file_attach = vim.lsp.buf_attach_client(ordinary, id)
-    report.normal_file_still_attached = client.attached_buffers[ordinary] == true
+    report.normal_file_still_attached = client.attached_buffers[ordinary] ~= nil
     report.delete_ok, report.delete_error = pcall(vim.api.nvim_buf_delete, source, { force = true })
     report.v_errmsg = vim.v.errmsg
     client:stop(true)
@@ -150,9 +150,9 @@ local function integration(mode)
   report.attach_return = attach(old, id)
   if guarded_on_attach then client.on_attach = guarded_on_attach end
   report.bypassed_pre_attach_guard = mode == "fixed-fallback"
-  report.attached_immediate = client.attached_buffers[old] == true
+  report.attached_immediate = client.attached_buffers[old] ~= nil
   vim.wait(100, function() return false end, 10)
-  report.attached_after_schedule = client.attached_buffers[old] == true
+  report.attached_after_schedule = client.attached_buffers[old] ~= nil
   if mode == "unguarded" or mode == "legacy" or mode == "legacy-retain" then
     report.highlight_request = { method = "textDocument/documentHighlight", uri = vim.uri_from_bufnr(old) }
     local response = client:request_sync("textDocument/documentHighlight", {
@@ -172,7 +172,7 @@ local function integration(mode)
   report.switch_error = not switch_ok and switch_result or nil
   vim.wait(300, function() return false end, 10)
   report.old_buffer_valid = vim.api.nvim_buf_is_valid(old)
-  report.source_still_attached = client.attached_buffers[source] == true
+  report.source_still_attached = client.attached_buffers[source] ~= nil
   report.changetracking_crash = false
   if report.switch_error and report.switch_error:find("_changetracking.lua", 1, true) then
     report.changetracking_crash = true

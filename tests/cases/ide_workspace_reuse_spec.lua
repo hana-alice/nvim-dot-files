@@ -24,9 +24,15 @@ local function native(check)
     local encoded = lua("return vim.api.nvim_replace_termcodes(..., true, false, true)", keys)
     t.assert_true(vim.rpcrequest(job, "nvim_input", encoded) > 0)
   end
+  -- A Lua nil crosses RPC as vim.NIL, which is truthy: `a and nil_global` must not count as ready
+  -- (macOS CI passed the wait with `mutation` still nil, then indexed it).
+  local function truthy(code)
+    local value = lua(code)
+    return value ~= nil and value ~= vim.NIL and value ~= false
+  end
   local function eventually(code)
     local ready = vim.wait(3000, function()
-      return not not lua(code)
+      return truthy(code)
     end, 10)
     local details = not ready
         and lua([[
@@ -50,7 +56,7 @@ local function native(check)
       .. string.format("%q", query)
       .. ",1,true)~=nil"
     for _ = 1, 20 do
-      if lua(wanted) then
+      if truthy(wanted) then
         return
       end
       input("<C-n>")
@@ -263,12 +269,79 @@ t.describe("ide_workspace_reuse: explicit editor destination", function()
     native(function(f)
       installed_picker(f)
       f.picker("Hidden1")
+      -- Window lifecycle evidence: macOS CI twice ended with 2 normal windows and the picker
+      -- floats still present after 3s; record who creates/closes windows (cause unverified).
+      f.lua([[
+        win_events = {}
+        api.nvim_create_autocmd({ 'WinNew', 'WinClosed', 'BufEnter' }, { callback = function(args)
+          local win = args.event == 'WinClosed' and tonumber(args.match) or api.nvim_get_current_win()
+          local ok, cfg = pcall(api.nvim_win_get_config, win)
+          win_events[#win_events + 1] = { ev = args.event, win = win,
+            buf = vim.fn.fnamemodify(api.nvim_buf_get_name(args.buf), ':t'),
+            relative = ok and cfg.relative or '?',
+            trace = args.event == 'WinClosed' and debug.traceback('', 2):sub(1, 600) or nil }
+        end })
+      ]])
+      f.lua([[
+        close_traces = {}
+        local close = picker.close
+        picker.close = function(self, ...)
+          close_traces[#close_traces + 1] = { mode = vim.fn.mode(), trace = debug.traceback('', 2):sub(1, 900) }
+          return close(self, ...)
+        end
+      ]])
+      f.lua([[
+        sched = { queued = 0, ran = 0, errors = {}, items = {} }
+        local schedule = vim.schedule
+        vim.schedule = function(fn)
+          sched.queued = sched.queued + 1
+          local id = sched.queued
+          local item = { id = id, at = debug.traceback('', 2):gsub('stack traceback:', ''):sub(1, 500),
+            fast = vim.in_fast_event(), started = false, finished = false }
+          sched.items[id] = item
+          return schedule(function()
+            sched.ran = sched.ran + 1
+            item.started = true
+            local ok, err = xpcall(fn, debug.traceback)
+            item.finished = true
+            if not ok then sched.errors[#sched.errors + 1] = { id = id, err = tostring(err):sub(1, 900) } end
+          end)
+        end
+        local activate = W.activate
+        W.activate = function(...)
+          activate_calls = (activate_calls or 0) + 1
+          local win, err = activate(...)
+          activate_result = { win = win, err = err }
+          return win, err
+        end
+      ]])
       f.input("<CR>")
-      f.eventually("return picker.closed and api.nvim_get_current_buf()==hidden[1]")
-      t.assert_true(f.lua([[
-        return normal_count()==3 and api.nvim_win_get_buf(source_win)==source_buf
-          and vim.deep_equal(api.nvim_win_get_cursor(source_win),{1,4}) and unchanged_other_and_qf()
-      ]]))
+      -- macOS CI observed normal=2 right after close (likely the closing preview float still held the
+      -- buffer, unverified); wait for the editor split that the default action creates.
+      -- The split count is part of the wait: macOS once read normal=2 right after the current
+      -- window already showed Hidden1, so a one-shot read raced the layout settling.
+      -- Wait inside the child: macOS CI showed the Snacks close cleanup and the workspace confirm
+      -- staying queued for 3s while the parent polled via rpcrequest every 10ms (cause unverified).
+      f.lua([[return vim.wait(5000, function()
+        return picker.closed and api.nvim_get_current_buf()==hidden[1]
+          and api.nvim_win_get_config(0).relative=='' and normal_count()==3
+      end, 20)]])
+      local state = f.lua([[
+        local wins = {}
+        for _, win in ipairs(api.nvim_list_wins()) do
+          wins[#wins + 1] = { win = win, buf = vim.fn.fnamemodify(api.nvim_buf_get_name(api.nvim_win_get_buf(win)), ':t'),
+            relative = api.nvim_win_get_config(win).relative, tab = api.nvim_win_get_tabpage(win) }
+        end
+        return { normal = normal_count(), source_buf = api.nvim_win_get_buf(source_win)==source_buf,
+          cursor = api.nvim_win_get_cursor(source_win), other = unchanged_other_and_qf(),
+          current = api.nvim_get_current_win(), source_win = source_win, closed = picker.closed,
+          notices = notices, wins = wins, win_events = win_events, errmsg = vim.v.errmsg, close_traces = close_traces,
+          sched = sched, activate_calls = activate_calls, activate_result = activate_result,
+          mode = api.nvim_get_mode(), current_buf = vim.fn.fnamemodify(api.nvim_buf_get_name(0), ':t'),
+          messages = vim.fn.execute('messages') }
+      ]])
+      t.assert_true(state.normal == 3 and state.source_buf and vim.deep_equal(state.cursor, { 1, 4 })
+        and state.other, vim.inspect(state))
     end)
   end)
 

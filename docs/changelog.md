@@ -94,5 +94,8 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v2.10.0` → [docs/release_2.10.0.md](release_2.10.0.md) (Tier 1 gen/src merge, context-migration shard invalidation, opt-in Tier 2, cost ceilings; tag pending)
 
-## Unreleased
+- `v2.11.0` → [docs/release_2.11.0.md](release_2.11.0.md) (module-priority phase barrier fix, priority refresh after activation, phase probes; full regression 4381/4381, 2 skips; tag pending)
 
+- `v2.12.0` → [docs/release_2.12.0.md](release_2.12.0.md) (clangd memory reclaim after background index, disk preambles with per-session TEMP, headless CI fixes; full regression 4396/4396, 2 skips; tag pending)
+
+## Unreleased

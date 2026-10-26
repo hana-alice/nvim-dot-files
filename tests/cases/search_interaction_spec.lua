@@ -71,6 +71,15 @@ t.describe("search_interaction: native Snacks task replay", function()
     )
     return
   end
+  local code_search = require("utils.code_search")
+  if not code_search.cindex_uefilter_exe() or not code_search.csearch_exe() then
+    t.skip(
+      "replays real file input, resume, recipes and passive pin",
+      "installed cindex-uefilter and csearch are required (scripts/install_csearch.sh)",
+      { native = true }
+    )
+    return
+  end
   t.it("replays real file input, resume, recipes and passive pin", function()
     local root = vim.fn.stdpath("config"):gsub("\\", "/")
     local out = vim.fn.tempname():gsub("\\", "/")

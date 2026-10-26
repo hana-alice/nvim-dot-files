@@ -107,6 +107,11 @@ t.describe("ide_task_inspection: native task lifecycle", function()
       f.eventually("return not vim.api.nvim_win_is_valid(panel_host)")
       t.assert_eq(f.lua("return registry.status(task_id)"), "running", "closing output must not stop the task")
       f.lua("select_task(task_id)")
+      -- Upstream Neovim 0.12 on Windows segfaults when a ConPTY terminal job is
+      -- stopped within ~20 ms of its window being resized (reproduced with -u NONE:
+      -- termopen, re-show in a split, :resize, jobstop -> exit 139; 0.11 survives).
+      -- A person cannot press dd that quickly; let the reflow settle first.
+      vim.wait(100)
       f.input("dd")
       f.eventually("return registry.status(task_id) == 'cancelled'")
       t.assert_true(f.lua("return vim.fn.jobwait({control_job}, 0)[1] == -1 and source_preserved()"))
@@ -259,8 +264,10 @@ t.describe("ide_task_inspection: task identity and retained facts", function()
         end
         return { same_buffer = vim.api.nvim_get_current_buf() == terminal_buf,
           same_name = vim.api.nvim_buf_get_name(terminal_buf) == terminal_name,
-          stale_option = vim.bo[terminal_buf].channel == task_job, multiple_channels = channels > 1 }
+          stale_option = vim.bo[terminal_buf].channel == task_job, has_new_channel = channels >= 1 }
       ]])
+      -- Neovim 0.11 keeps the exited job's terminal channel listed; 0.12 closes it.
+      -- Either way the inspector must refuse to attribute the new stream to the old task.
       for key, value in pairs(witness) do
         t.assert_true(value, key)
       end

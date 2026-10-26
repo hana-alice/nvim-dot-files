@@ -54,7 +54,7 @@ local profile_options = {
   ["completion-style"] = { detailed = true },
   ["completion-parse"] = { auto = true },
   ["header-insertion"] = { never = true },
-  ["pch-storage"] = { memory = true },
+  ["pch-storage"] = { memory = true, disk = true },
   ["clang-tidy"] = { ["false"] = true },
   ["enable-config"] = { ["false"] = true },
   ["function-arg-placeholders"] = { ["true"] = true },

@@ -19,7 +19,8 @@ local function native(check)
   end
   local function eventually(code)
     local ready = vim.wait(2000, function()
-      return lua(code)
+      local value = lua(code) -- nil crosses RPC as the truthy vim.NIL
+      return value ~= nil and value ~= vim.NIL and value ~= false
     end, 10)
     if not ready then
       local details = lua([[return { mode = vim.fn.mode(),
@@ -408,6 +409,10 @@ t.describe("ide_workspace: native ownership and recovery", function()
         local win = workspace.activate(task, { source_win = source_win })
         local output = win and vim.api.nvim_win_get_buf(win) == terminal_buf
         local same_job = vim.bo[terminal_buf].channel == terminal_job
+        -- Let the re-shown terminal process its resize first: Nvim 0.12.6 on Windows
+        -- segfaults when a terminal's process exits in the same tick that the buffer
+        -- is shown at a new size (jobstop/chanclose/kill all crash; 0.11 does not).
+        vim.wait(100, function() return false end, 10)
         local stopped = workspace.stop(task)
         assert(vim.wait(2000, function() return registry.status(terminal_id) ~= 'running' end, 10))
         local outsider = vim.fn.jobwait({ outsider_job }, 0)[1] == -1

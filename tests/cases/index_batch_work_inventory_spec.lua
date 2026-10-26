@@ -10,6 +10,8 @@ spec = importlib.util.spec_from_file_location('inventory', sys.argv[1])
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 case = sys.argv[2]
 root = pathlib.Path(tempfile.mkdtemp(prefix='batch_work_inventory_'))
+# rmtree does not follow junctions/symlinks; without this every case leaked a dir into TEMP.
+import atexit, shutil; atexit.register(shutil.rmtree, root, ignore_errors=True)
 work = root/'work'; work.mkdir()
 refs = root/'metadata'; refs.mkdir()
 store = refs/'store'; store.mkdir()

@@ -19,17 +19,24 @@
 -- 抑制 LazyVim 的 stdin 启动路径（与 headless_smoke.lua 一致）。
 vim.g.started_with_stdin = true
 
--- A Windows 8.3 TEMP alias makes every vim.fn.tempname() fixture spell its root differently from
--- the physical path that clangd and the native watchers report. tempname()'s directory is fixed
--- at process start, so re-run once under the long TEMP rather than patching each fixture.
+-- A Windows 8.3 TEMP alias (or macOS TMPDIR=/var/... -> /private/var/...) makes every
+-- vim.fn.tempname() fixture spell its root differently from the physical path that clangd and
+-- the native watchers report. tempname()'s directory is fixed at process start, so re-run once
+-- under the physical temp directory rather than patching each fixture.
 -- Short-path behaviour keeps explicit coverage in specs that build 8.3 aliases themselves.
-if vim.fn.has("win32") == 1 and vim.env.NVIM_TEST_LONG_TEMP ~= "1" then
-  local temp = vim.env.TEMP or vim.env.TMP
+if vim.env.NVIM_TEST_LONG_TEMP ~= "1" then
+  local windows = vim.fn.has("win32") == 1
+  local names = windows and { "TEMP", "TMP" } or { "TMPDIR" }
+  local temp = vim.env[names[1]] or vim.env[names[2] or names[1]] or (not windows and "/tmp" or nil)
   local real = temp and vim.uv.fs_realpath(temp)
-  local function norm(path) return (path:gsub("/", "\\"):gsub("\\+$", ""):lower()) end
+  local function norm(path)
+    if windows then return (path:gsub("/", "\\"):gsub("\\+$", ""):lower()) end
+    return (path:gsub("/+$", ""))
+  end
   if real and norm(real) ~= norm(temp) then
     local env = vim.fn.environ()
-    env.TEMP, env.TMP, env.NVIM_TEST_LONG_TEMP = real, real, "1"
+    for _, name in ipairs(names) do env[name] = real end
+    env.NVIM_TEST_LONG_TEMP = "1"
     local cmd = { vim.v.progpath, "--headless", "-l", debug.getinfo(1, "S").source:sub(2) }
     vim.list_extend(cmd, _G.arg or {})
     local result = vim.system(cmd, { env = env, clear_env = true, text = true }):wait()
@@ -51,6 +58,13 @@ vim.env.NVIM_LOG_FILE = probe_test_dir .. "/nvim.log"
 vim.env.XDG_STATE_HOME = probe_test_dir .. "/state"
 vim.env.NVIM_UE_LOG_DIR = probe_test_dir .. "/logs"
 vim.env.NVIM_UE_PROBE_PATH = probe_test_dir .. "/ue_probes.json"
+-- Child processes (clangd, python helpers) get a TEMP inside the run root. A clangd
+-- that a test force-stops leaves preamble-*.pch behind (it only deletes them on
+-- didClose / graceful exit); this run root is deleted on exit, so nothing leaks into
+-- the user's %TEMP%. tempname() of this process is unaffected (fixed at startup).
+vim.fn.mkdir(probe_test_dir .. "/tmp", "p")
+vim.env.TEMP = probe_test_dir .. "/tmp"
+vim.env.TMP = probe_test_dir .. "/tmp"
 
 -- 自举：require("tests.harness") 之前必须先把配置根目录挂上 rtp/package.path，
 -- 否则 tests.* / ue / utils.* 均无法解析。这里手工做一次最小自举，

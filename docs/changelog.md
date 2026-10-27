@@ -98,4 +98,6 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v2.12.0` → [docs/release_2.12.0.md](release_2.12.0.md) (clangd memory reclaim after background index, disk preambles with per-session TEMP, headless CI fixes; full regression 4396/4396, 2 skips; tag pending)
 
+- `v2.12.1` → [docs/release_2.12.1.md](release_2.12.1.md) (clangd reclaim quiet-window, progress timer and prepare-owner guards; full regression 4400/4400, 2 skips; tag pending)
+
 ## Unreleased

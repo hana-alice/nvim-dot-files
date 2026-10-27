@@ -11,6 +11,140 @@ local function child(code)
   t.assert_contains((result.stdout or "") .. (result.stderr or ""), "EDITOR_REVIEW_OK")
 end
 
+local snacks_path = vim.fn.stdpath("data") .. "/lazy/snacks.nvim"
+
+local function snacks_child(check)
+  local root = assert(vim.env.NVIM_TEST_RUN_ROOT) .. "/snacks-review-" .. tostring(vim.uv.hrtime())
+  vim.fn.mkdir(root, "p")
+  local job = vim.fn.jobstart({ vim.v.progpath, "--headless", "--embed", "-u", "NONE", "-i", "NONE", "-n" }, {
+    rpc = true,
+    env = {
+      XDG_DATA_HOME = root .. "/data",
+      XDG_STATE_HOME = root .. "/state",
+      XDG_CACHE_HOME = root .. "/cache",
+      NVIM_UE_PROBE_PATH = root .. "/probes.json",
+      NVIM_UE_LOG_DIR = root .. "/logs",
+      NVIM_LOG_FILE = root .. "/nvim.log",
+    },
+  })
+  t.assert_true(job > 0, "owned Snacks child startup failed")
+  local function lua(code, ...)
+    return vim.rpcrequest(job, "nvim_exec_lua", code, { ... })
+  end
+  local function input(keys)
+    t.assert_true(vim.rpcrequest(job, "nvim_input", keys) > 0)
+  end
+  local function eventually(code)
+    t.assert_true(vim.wait(3000, function()
+      local value = lua(code)
+      return value ~= nil and value ~= vim.NIL and value ~= false
+    end, 10), code)
+  end
+  local ok, err = pcall(function()
+    lua([[
+      local cfg, plugin, root = ...
+      vim.opt.rtp:prepend(cfg)
+      vim.opt.rtp:append(plugin)
+      vim.api.nvim_set_current_dir(root)
+      vim.o.hidden, vim.o.swapfile, vim.o.shada, vim.o.more = true, false, '', false
+      vim.o.columns, vim.o.lines = 120, 40
+      Snacks = require('snacks')
+      local opts = dofile(cfg .. '/lua/plugins/snacks.lua')[1].opts(nil, {})
+      opts.scratch.root = root .. '/scratch'
+      Snacks.setup({scratch = opts.scratch, picker = opts.picker})
+      source_win, source_buf = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_buf()
+      vim.api.nvim_buf_set_lines(source_buf, 0, -1, false, {'dirty source text', 'second source line'})
+      vim.api.nvim_win_set_cursor(source_win, {1, 4})
+      fixture_root = root
+    ]], cfg, snacks_path, root)
+    check({ lua = lua, input = input, eventually = eventually })
+  end)
+  pcall(vim.fn.jobstop, job)
+  pcall(vim.fn.jobwait, { job }, 1000)
+  vim.fn.delete(root, "rf")
+  if not ok then error(err, 0) end
+end
+
+t.describe("review_editor: installed Snacks interactions", function()
+  if vim.fn.isdirectory(snacks_path) == 0 then
+    t.skip("scratch and picker behavior", "installed Snacks unavailable", { native = true })
+    return
+  end
+
+  t.it("scratch shares saved notes across directories while counts and old history remain separate", function()
+    snacks_child(function(f)
+      f.lua([[
+        local root = fixture_root .. '/scratch'
+        vim.fn.mkdir(root, 'p')
+        vim.fn.writefile({'1'}, root .. '/.version')
+        vim.fn.writefile({'older note'}, root .. '/legacy.md')
+        vim.fn.writefile({vim.json.encode({name='Legacy', ft='markdown', cwd='/old-project', branch='old-branch'})}, root .. '/legacy.md.meta')
+        for _, name in ipairs({'project-a', 'project-b'}) do vim.fn.mkdir(fixture_root .. '/' .. name, 'p') end
+        vim.api.nvim_set_current_dir(fixture_root .. '/project-a')
+        vim.keymap.set('n', '<F6>', function() scratch = Snacks.scratch() end)
+      ]])
+      f.lua("scratch = Snacks.scratch()")
+      f.eventually("return scratch and scratch:valid()")
+      local first = f.lua([[
+        assert(vim.wo[scratch.win].wrap and vim.wo[scratch.win].linebreak and vim.wo[scratch.win].breakindent)
+        vim.api.nvim_buf_set_lines(scratch.buf, 0, -1, false, {'shared saved note'})
+        local file = vim.api.nvim_buf_get_name(scratch.buf)
+        scratch:close()
+        return file
+      ]])
+      f.eventually("return not scratch:valid() and vim.api.nvim_get_current_win() == source_win")
+      t.assert_eq(f.lua("return vim.fn.readfile(...)[1]", first), "shared saved note")
+      f.lua("vim.api.nvim_set_current_dir(fixture_root .. '/project-b')")
+      f.lua("scratch = Snacks.scratch()")
+      f.eventually("return scratch and scratch:valid()")
+      t.assert_eq(f.lua("return vim.api.nvim_buf_get_name(scratch.buf)"), first)
+      t.assert_eq(f.lua("return vim.api.nvim_buf_get_lines(scratch.buf, 0, 1, false)[1]"), "shared saved note")
+      f.lua("scratch:close()")
+      f.eventually("return not scratch:valid() and vim.api.nvim_get_current_win() == source_win")
+      f.input("2<F6>")
+      f.eventually("return scratch and scratch:valid()")
+      t.assert_true(f.lua("return vim.api.nvim_buf_get_name(scratch.buf) ~= ...", first))
+      f.lua([[
+        vim.api.nvim_buf_set_lines(scratch.buf, 0, -1, false, {'second counted note'})
+        scratch:close()
+      ]])
+      f.eventually("return not scratch:valid()")
+      f.lua([[
+        local files = Snacks.scratch.list()
+        assert(#files == 3, vim.inspect(files))
+        local seen = {}
+        for _, item in ipairs(files) do seen[item.count or item.name] = item end
+        assert(seen[1] and seen[2] and seen.Legacy, vim.inspect(files))
+        assert(vim.fn.readfile(seen.Legacy.file)[1] == 'older note')
+        assert(vim.api.nvim_buf_get_lines(source_buf, 0, 1, false)[1] == 'dirty source text')
+      ]])
+    end)
+  end)
+
+  t.it("one Escape cancels an actual picker from insert and normal input without changing its source", function()
+    snacks_child(function(f)
+      for _, mode in ipairs({ "i", "n" }) do
+        f.lua([[
+          picker = Snacks.picker({items={{text='first'}, {text='second'}}, format='text', preview=false})
+        ]])
+        f.eventually("return picker and not picker.closed and picker.input.win:valid() and vim.fn.mode() == 'i'")
+        if mode == "n" then
+          f.input("<C-\\><C-n>")
+          f.eventually("return vim.fn.mode() == 'n' and not picker.closed")
+        end
+        f.input("<Esc>")
+        f.eventually("return picker.closed and vim.api.nvim_get_current_win() == source_win and vim.fn.mode() == 'n'")
+        f.lua([[
+          assert(vim.api.nvim_win_get_buf(source_win) == source_buf)
+          assert(vim.deep_equal(vim.api.nvim_win_get_cursor(source_win), {1, 4}))
+          assert(vim.api.nvim_buf_get_lines(source_buf, 0, 1, false)[1] == 'dirty source text')
+          assert(vim.bo[source_buf].modified)
+        ]])
+      end
+    end)
+  end)
+end)
+
 t.describe("review_editor: interaction regressions", function()
   t.it("visual replace captures first and subsequent live selections", function()
     child([[

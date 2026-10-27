@@ -100,4 +100,6 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v2.12.1` → [docs/release_2.12.1.md](release_2.12.1.md) (clangd reclaim quiet-window, progress timer and prepare-owner guards; full regression 4400/4400, 2 skips; tag pending)
 
+- `v2.12.2` → [docs/release_2.12.2.md](release_2.12.2.md) (shared Scratch, single-Escape picker cancellation and bounded workspace diagnostics; full regression 4402/4402, 2 skips; tag pending)
+
 ## Unreleased

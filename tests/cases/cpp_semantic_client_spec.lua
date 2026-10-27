@@ -564,6 +564,8 @@ t.describe("cpp semantic client: runtime controlled manifests", function()
       cdb_shards = package.loaded["ue.cdb.shards"],
     }
     local root = vim.fn.tempname():gsub("\\", "/") .. "_semantic_runtime_fp"
+    local previous_buf = vim.api.nvim_get_current_buf()
+    local test_buf = vim.api.nvim_create_buf(true, false)
     local ok, err = xpcall(function()
       local host_driver = require("utils.platform").driver()
       local clangd = root .. "/llvm/bin/clangd" .. tostring(host_driver.exe_suffix or "")
@@ -572,6 +574,9 @@ t.describe("cpp semantic client: runtime controlled manifests", function()
       local state_json = root .. "/state/state.json"
       local current_index = root .. "/indices/current.idx"
       local current_background = root .. "/indices/current.background.json"
+      local source = root .. "/project/Source/subject.cpp"
+      write_file(source, "int subject;\n")
+      vim.api.nvim_buf_set_name(test_buf, source)
       write_file(clangd, "")
       write_file(libclang, "")
       write_file(compile_commands, "[]")
@@ -628,18 +633,18 @@ t.describe("cpp semantic client: runtime controlled manifests", function()
         shard_path = function() return nil end,
       }
 
-      local first = assert(require("utils.ue_goto.semantic_environment").read(0))
+      local first = assert(require("utils.ue_goto.semantic_environment").read(test_buf))
       t.assert_nil(client.status().build_fingerprint, "reading an environment must not mutate client lifecycle")
-      client.discover_toolchain(0)
+      client.discover_toolchain(test_buf)
       t.assert_eq(first.controlled_cdb_path, vim.fs.normalize(current_background))
       t.assert_eq(first.controlled_manifest_path, vim.fs.normalize(current_index .. ".manifest.json"))
 
       vim.wait(1100, function() return false end, 1100)
       write_file(current_background, '[{"file":"changed.cpp"}]')
-      local pure_changed = assert(require("utils.ue_goto.semantic_environment").read(0))
+      local pure_changed = assert(require("utils.ue_goto.semantic_environment").read(test_buf))
       t.assert_eq(client.status().build_fingerprint, first.build_fingerprint)
       t.assert_true(pure_changed.build_fingerprint ~= first.build_fingerprint)
-      local second = assert(client.discover_toolchain(0))
+      local second = assert(client.discover_toolchain(test_buf))
       t.assert_true(first.build_fingerprint ~= second.build_fingerprint,
         "controlled background cdb size/mtime must affect build fingerprint")
 
@@ -653,7 +658,7 @@ t.describe("cpp semantic client: runtime controlled manifests", function()
         background_cdb_path = current_background,
         tag = "m2",
       }))
-      local third = assert(client.discover_toolchain(0))
+      local third = assert(client.discover_toolchain(test_buf))
       t.assert_true(second.build_fingerprint ~= third.build_fingerprint,
         "controlled manifest path/mtime/size must affect build fingerprint")
 
@@ -667,7 +672,7 @@ t.describe("cpp semantic client: runtime controlled manifests", function()
       }
       write_file(semantic_path, semantic_content)
       write_file(current_index .. ".manifest.json", vim.json.encode(split_manifest))
-      local split = assert(require("utils.ue_goto.semantic_environment").read(0))
+      local split = assert(require("utils.ue_goto.semantic_environment").read(test_buf))
       t.assert_eq(split.controlled_cdb_path, vim.fs.normalize(semantic_path))
       t.assert_eq(#split.semantic_cdb_paths, 1)
       t.assert_eq(split.semantic_cdb_paths[1], vim.fs.normalize(semantic_path))
@@ -681,13 +686,19 @@ t.describe("cpp semantic client: runtime controlled manifests", function()
       write_file(current_index .. ".manifest.json", vim.json.encode(split_manifest))
       assert(vim.uv.fs_utime(semantic_path, native_stat.atime.sec, native_stat.mtime.sec))
       assert(vim.uv.fs_utime(current_index .. ".manifest.json", manifest_stat.atime.sec, manifest_stat.mtime.sec))
-      local changed_split = assert(require("utils.ue_goto.semantic_environment").read(0))
+      local changed_split = assert(require("utils.ue_goto.semantic_environment").read(test_buf))
       t.assert_true(split.build_fingerprint ~= changed_split.build_fingerprint,
         "native semantic identity must invalidate caches even with unchanged file sizes and mtime seconds")
     end, debug.traceback)
     package.loaded["ue"] = saved.ue
     package.loaded["ue.cdb.paths"] = saved.cdb_paths
     package.loaded["ue.cdb.shards"] = saved.cdb_shards
+    if vim.api.nvim_buf_is_valid(previous_buf) then
+      vim.api.nvim_set_current_buf(previous_buf)
+    end
+    if vim.api.nvim_buf_is_valid(test_buf) then
+      vim.api.nvim_buf_delete(test_buf, { force = true })
+    end
     pcall(vim.fn.delete, root, "rf")
     if not ok then error(err) end
   end)
@@ -713,6 +724,40 @@ t.describe("cpp semantic client: unsaved overlays", function()
     t.assert_eq(found.contents, "void changed();\n")
     t.assert_eq(found.version, version)
     vim.api.nvim_buf_delete(bufnr, { force = true })
+  end)
+end)
+
+t.describe("cpp semantic client: UE workspace ownership", function()
+  t.it("distinguishes ordinary C++ buffers from the active UE roots", function()
+    local saved_ue = package.loaded["ue"]
+    local previous_buf = vim.api.nvim_get_current_buf()
+    local test_buf = vim.api.nvim_create_buf(true, false)
+    local base = vim.fn.tempname():gsub("\\", "/")
+    local source = base .. "/plain/source.cpp"
+    vim.api.nvim_buf_set_name(test_buf, source)
+    local ctx
+    package.loaded["ue"] = {
+      resolve_context = function() return ctx end,
+    }
+
+    local ok, err = xpcall(function()
+      local owned, reason = client.is_ue_buffer(test_buf)
+      t.assert_false(owned)
+      t.assert_eq(reason, "not-ue-buffer")
+
+      ctx = { engine_root = base .. "/engine", project_root = base .. "/game" }
+      owned, reason = client.is_ue_buffer(test_buf)
+      t.assert_false(owned)
+      t.assert_eq(reason, "not-ue-buffer")
+
+      ctx.project_root = base .. "/plain"
+      t.assert_true(client.is_ue_buffer(test_buf))
+    end, debug.traceback)
+
+    package.loaded["ue"] = saved_ue
+    if vim.api.nvim_buf_is_valid(previous_buf) then vim.api.nvim_set_current_buf(previous_buf) end
+    if vim.api.nvim_buf_is_valid(test_buf) then vim.api.nvim_buf_delete(test_buf, { force = true }) end
+    if not ok then error(err) end
   end)
 end)
 

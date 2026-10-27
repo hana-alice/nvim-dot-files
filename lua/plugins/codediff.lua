@@ -24,7 +24,10 @@ return {
       -- Saves, focus/tab return, mutations and R refresh without whole-tree polling.
       explorer = { view_mode = "tree", width = 38, untracked = "all", auto_refresh = false,
         line_stats = { enabled = true, count_untracked = false } },
-      keymaps = { view = { next_file = "<Tab>", prev_file = "<S-Tab>", toggle_stage = "<leader>hS" } },
+      keymaps = { view = {
+        prev_hunk = "[[", next_hunk = "]]",
+        next_file = "<Tab>", prev_file = "<S-Tab>", toggle_stage = "<leader>hS",
+      } },
     },
     config = function(_, opts)
       require("codediff").setup(opts)

@@ -65,6 +65,33 @@ t.describe("navigation architecture boundaries", function()
     if not ok then error(err) end
   end)
 
+  t.it("ordinary C++ definition retries use generic transport without UE exact-command preparation", function()
+    local old_clients = vim.lsp.get_clients
+    local old_commands = package.loaded["ue.clangd_commands"]
+    local preparations, requests = 0, 0
+    package.loaded["ue.clangd_commands"] = { ensure = function() preparations = preparations + 1 end }
+    vim.lsp.get_clients = function() return { {
+      id = 52, name = "clangd", offset_encoding = "utf-16",
+      request = function(_, method, _, cb)
+        requests = requests + 1
+        t.assert_eq(method, "textDocument/definition")
+        cb(nil, { { uri = "file:///fixture/body.cpp", range = { start = { line = 3, character = 0 } } } })
+        return true
+      end,
+    } } end
+    local ok, err = xpcall(function()
+      local result
+      require("utils.ue_goto.provider").async_lsp_definition_with_retry(0, "/fixture/source.cpp", 1,
+        function() return true end, function(value) result = value end, { lsp_only = true })
+      t.assert_true(vim.wait(1000, function() return result ~= nil end))
+      t.assert_eq(preparations, 0)
+      t.assert_eq(requests, 1)
+      t.assert_eq(#result, 1)
+    end, debug.traceback)
+    vim.lsp.get_clients, package.loaded["ue.clangd_commands"] = old_clients, old_commands
+    if not ok then error(err) end
+  end)
+
   t.it("report formatting creates data without notifying or recording probes", function()
     local report = require("utils.ue_goto.semantic_report")
     local old_notify, old_probe = vim.notify, package.loaded["utils.probe"]

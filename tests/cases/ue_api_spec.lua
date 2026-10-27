@@ -68,6 +68,29 @@ t.describe("ue.clangd_cmd", function()
         "monolithic External.File/index-file cannot prove source definitions")
     end
   end)
+
+  t.it("普通 CMake 工程使用其 build preset CDB 且保留项目 .clangd", function()
+    local root = vim.fn.tempname():gsub("\\", "/")
+    local cdb_dir = root .. "/build/debug"
+    vim.fn.mkdir(cdb_dir, "p")
+    vim.fn.writefile({ vim.json.encode({
+      version = 3,
+      configurePresets = {
+        { name = "base", hidden = true, binaryDir = "${sourceDir}/build/${presetName}" },
+        { name = "debug", inherits = "base" },
+      },
+    }) }, root .. "/CMakePresets.json")
+    vim.fn.writefile({ "[]" }, cdb_dir .. "/compile_commands.json")
+
+    local cmd = ue.clangd_cmd(root)
+    pcall(vim.fn.delete, root, "rf")
+
+    t.assert_contains(cmd, "--compile-commands-dir=" .. cdb_dir)
+    t.assert_false(vim.tbl_contains(cmd, "--enable-config=false"),
+      "非 UE workspace 必须允许自己的 .clangd")
+    t.assert_false(vim.tbl_contains(cmd, "--clang-tidy=false"),
+      "非 UE workspace 不应继承 UE 的 clang-tidy 禁用策略")
+  end)
 end)
 
 t.describe("ue.android_build_command（SO-only）", function()

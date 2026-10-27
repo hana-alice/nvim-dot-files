@@ -313,6 +313,40 @@ t.describe("utils.notification_history", function()
   end)
 end)
 
+t.describe("utils.clangd_workspace", function()
+  local workspace = require("utils.clangd_workspace")
+
+  t.it("resolves an inherited CMake preset without recursively selecting vendor CDBs", function()
+    local root = vim.fn.tempname():gsub("\\", "/")
+    local build_dir = root .. "/build/debug"
+    local vendor_dir = root .. "/vcpkg/buildtrees/vendor"
+    vim.fn.mkdir(build_dir, "p")
+    vim.fn.mkdir(vendor_dir, "p")
+    vim.fn.writefile({ vim.json.encode({
+      version = 3,
+      configurePresets = {
+        { name = "base", hidden = true, binaryDir = "${sourceDir}/build/${presetName}" },
+        { name = "debug", inherits = "base" },
+      },
+    }) }, root .. "/CMakePresets.json")
+    vim.fn.writefile({ "[]" }, build_dir .. "/compile_commands.json")
+    vim.fn.writefile({ "[]" }, vendor_dir .. "/compile_commands.json")
+
+    local dir, source = workspace.find_compile_commands_dir(root)
+    pcall(vim.fn.delete, root, "rf")
+
+    t.assert_eq(dir, build_dir)
+    t.assert_eq(source, "cmake-preset:debug")
+  end)
+
+  t.it("classifies only paths inside the active UE engine/project roots as UE-owned", function()
+    local ctx = { engine_root = "D:/UE", project_root = "E:/Games/Sample" }
+    t.assert_true(workspace.is_path_in_ue_context("D:/UE/Engine/Source/A.cpp", ctx))
+    t.assert_true(workspace.is_path_in_ue_context("E:/Games/Sample/Source/B.cpp", ctx))
+    t.assert_false(workspace.is_path_in_ue_context("E:/Libraries/Plain/Source/C.cpp", ctx))
+  end)
+end)
+
 t.describe("utils.ue_paths", function()
   local up = require("utils.ue_paths")
   t.it("返回 table", function() t.assert_type(up, "table") end)

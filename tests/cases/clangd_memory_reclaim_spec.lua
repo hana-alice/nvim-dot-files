@@ -83,6 +83,60 @@ t.describe("clangd memory reclaim", function()
     t.assert_eq(h.restarts, 1)
   end)
 
+  t.it("waits from the latest index end instead of a superseded timer", function()
+    local h = harness()
+    h.run(400)
+    local old = table.remove(h.deferred, 1)
+    h.run(40)
+    old.fn()
+    t.assert_eq(h.restarts, 0)
+    h.flush()
+    t.assert_eq(h.restarts, 1)
+  end)
+
+  t.it("invalidates a busy retry when another index run completes", function()
+    local h = harness()
+    h.run(400)
+    h.mode = "i"; h.flush()
+    local old = table.remove(h.deferred, 1)
+    h.mode = "n"; h.run(40)
+    old.fn()
+    t.assert_eq(h.restarts, 0)
+    h.flush()
+    t.assert_eq(h.restarts, 1)
+  end)
+
+  t.it("waits for the prepare owner even without an index job", function()
+    local h = harness()
+    local name = "ue.index.prepare_observer"
+    local previous = package.loaded[name]
+    local observer = assert(loadfile(vim.fn.stdpath("config") .. "/lua/ue/index/prepare_observer.lua"))()
+    local preparing = true
+    observer.configure(function() end, function() return preparing end)
+    package.loaded[name] = observer
+    h.run(400)
+    local ok, err = pcall(function()
+      h.flush()
+      t.assert_eq(h.restarts, 0)
+      preparing = false
+      h.flush()
+      t.assert_eq(h.restarts, 1)
+    end)
+    package.loaded[name] = previous
+    if not ok then error(err) end
+  end)
+
+  t.it("requires a full quiet window after normal-mode input", function()
+    local h = harness()
+    h.run(400)
+    h.now = 59000
+    vim.api.nvim_feedkeys("l", "xt", false)
+    h.now = 60000; h.flush()
+    t.assert_eq(h.restarts, 0)
+    h.now = 119000; h.flush()
+    t.assert_eq(h.restarts, 1)
+  end)
+
   t.it("gives up after bounded retries and records why", function()
     local h = harness()
     h.mode = "i"

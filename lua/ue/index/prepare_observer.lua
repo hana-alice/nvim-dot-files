@@ -7,6 +7,10 @@ function M.configure(start, running)
   prepare_start, prepare_running = start, running
 end
 
+function M.is_running()
+  return prepare_running and not not prepare_running() or false
+end
+
 function M.prepare(ctx, done)
   if not prepare_start then done(false, "prepare-observer-unavailable"); return false end
   M.run(ctx, prepare_start, prepare_running, done)

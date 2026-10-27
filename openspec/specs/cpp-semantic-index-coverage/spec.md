@@ -454,10 +454,16 @@ clangd 是长驻交互式服务，终止会丢弃已构建的 preamble。系统 
   另外可在 current 与 hot 之间加一层渲染层（Renderer、RenderCore、RHI、平台 RHI、Core、
   CoreUObject，约 1000 条）。以上均待实测；收益未验证前不得宣称渲染模块已经优先完成索引。
 - **clangd 用完归还（2026-10-26）**：Windows 版 clangd 没有 malloc_trim（`ClangdMain.cpp` 中这部分只在
-  `__GLIBC__` 下编译），后台索引期间分配的 2.5–3 GB 堆在索引结束后不会还给系统。曾试过 Segment Heap
+  `__GLIBC__` 下编译）；当次实验在后台索引结束后仍观察到约 2.5–3 GB 未被组件统计解释的 commit，
+  不能仅凭缺少 malloc_trim 推断所有已释放内存都不会归还。曾试过 Segment Heap
   （manifest 和 IFEO 两种方式），实测无效，已证伪。最初看到的下降，是因为测试用的 clangd 缺少
   `lib/clang` 资源目录，少解析了内容。因此采用重启回收（`ue.clangd_memory_reclaim`）：大规模索引完成后
   静默重启一次。实测 16 个 TU 时 3.32→1.85 GB；生产 shard 库下降到约 4.3 GB，其中约 3 GB 是必要的
   内存索引（Dex）。preamble 改为 `--pch-storage=disk`（3 个 TU 时 1291→223 MB）。disk 模式下 clangd
   被 kill 后会留下 `preamble-*.pch`，所以每个会话的 clangd 使用独立 TEMP（`ue.clangd_temp`），
   只清理所属进程已确认退出的目录。
+- **回收安全窗口（2026-10-27）**：normal mode 不能作为用户空闲的证据，index job 为空也不代表
+  UEPrepare 已结束；回收须读取真实 prepare owner 并检查用户活动。新进度必须使上一轮的回收定时器
+  及其重试失效，避免在最新索引刚结束时提前重启。隔离的真实 Neovide/LSP 夹具已验证一次自动回收、
+  原文档重新附加与既有 shard 加载后不重复回收；显式 root 与测试启动命令不代表完整 LazyVim 启动链，
+  小型夹具也不能作为完整 UE 工程长期内存或性能验收。

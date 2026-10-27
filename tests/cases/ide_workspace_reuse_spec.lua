@@ -322,11 +322,15 @@ t.describe("ide_workspace_reuse: explicit editor destination", function()
       -- window already showed Hidden1, so a one-shot read raced the layout settling.
       -- Wait inside the child: macOS CI showed the Snacks close cleanup and the workspace confirm
       -- staying queued for 3s while the parent polled via rpcrequest every 10ms (cause unverified).
-      f.lua([[return vim.wait(5000, function()
+      -- Capture bounded dispatch stacks and the wait result when layout settlement fails.
+      -- These diagnostics do not establish why input or cleanup was delayed.
+      f.lua([[wait_entry = debug.traceback('', 1):sub(1, 900)
+      wait_result = { vim.wait(5000, function()
         return picker.closed and api.nvim_get_current_buf()==hidden[1]
           and api.nvim_win_get_config(0).relative=='' and normal_count()==3
-      end, 20)]])
+      end, 20) }]])
       local state = f.lua([[
+        local dump_entry = debug.traceback('', 1):sub(1, 900)
         local wins = {}
         for _, win in ipairs(api.nvim_list_wins()) do
           wins[#wins + 1] = { win = win, buf = vim.fn.fnamemodify(api.nvim_buf_get_name(api.nvim_win_get_buf(win)), ':t'),
@@ -338,7 +342,8 @@ t.describe("ide_workspace_reuse: explicit editor destination", function()
           notices = notices, wins = wins, win_events = win_events, errmsg = vim.v.errmsg, close_traces = close_traces,
           sched = sched, activate_calls = activate_calls, activate_result = activate_result,
           mode = api.nvim_get_mode(), current_buf = vim.fn.fnamemodify(api.nvim_buf_get_name(0), ':t'),
-          messages = vim.fn.execute('messages') }
+          messages = vim.fn.execute('messages'), wait_entry = wait_entry, wait_result = wait_result,
+          dump_entry = dump_entry }
       ]])
       t.assert_true(state.normal == 3 and state.source_buf and vim.deep_equal(state.cursor, { 1, 4 })
         and state.other, vim.inspect(state))

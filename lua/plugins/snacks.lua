@@ -558,28 +558,18 @@ return {
       -- as a global matcher option means the smart picker (and every
       -- other source that doesn't override matcher) gets filename-first
       -- ranking with path matches as a fallback.
-      -- Scratch buffer persistence:
-      -- Default snacks.scratch already writes to stdpath("data").."/scratch"
-      -- and autowrites on hide. The annoyance is `filekey.ft = true`: opening
-      -- <leader>. with a different filetype context creates a NEW scratch
-      -- file, so the same project ends up with cpp/dosini/markdown/... islands
-      -- and `<leader>.` rarely re-opens the one you were just typing in.
-      --
-      -- We pin scratch to a fixed root under the data dir (explicit, not
-      -- magic), drop ft from the file key (one scratch per cwd+branch+count),
-      -- and force the buffer's filetype to markdown so headers/lists render.
-      -- For a second/third independent scratch in the same project, prefix a
-      -- count: `2<leader>.`, `3<leader>.` open distinct (count=2/3) buffers.
-      -- `<leader>S` still lists every scratch ever created (full history).
+      -- Share Markdown scratch notes across projects and branches.
+      -- Counts still select separate notes; <leader>S retains old history.
       opts.scratch = vim.tbl_deep_extend("force", opts.scratch or {}, {
         root = vim.fn.stdpath("data") .. "/scratch",
         ft = "markdown",
         autowrite = true,
+        win = { wo = { wrap = true, linebreak = true, breakindent = true } },
         filekey = {
-          cwd    = true,
-          branch = true,
+          cwd    = false,
+          branch = false,
           count  = true,
-          ft     = false, -- one persistent scratch per (cwd, branch, count)
+          ft     = false,
         },
       })
 
@@ -604,6 +594,7 @@ return {
       opts.picker.win.input = opts.picker.win.input or {}
       opts.picker.win.list = opts.picker.win.list or {}
       opts.picker.win.input.keys = vim.tbl_deep_extend("force", opts.picker.win.input.keys or {}, {
+        ["<Esc>"] = { "cancel", mode = { "i", "n" } },
         ["<C-q>"] = { "pin_sidebar_qflist", mode = { "i", "n" } },
         ["<C-v>"] = { "paste_clipboard", mode = { "i", "n" } },
         ["<M-v>"] = { "edit_vsplit", mode = { "i", "n" } },

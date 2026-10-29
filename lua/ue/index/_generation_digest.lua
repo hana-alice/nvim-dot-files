@@ -143,6 +143,10 @@ return function(M, core)
       end
       return (a.output or "") < (b.output or "")
     end)
+    -- Canonical encoding needs its own large strings. Retire the raw JSON and
+    -- decoded metadata first instead of carrying both through that peak.
+    content, decoded = nil, nil
+    if stat and stat.size > SYNC_LIMIT then collectgarbage("collect") end
     local digest = stable_hash(canonical) or ""
     if not vim.deep_equal(signature, identity(base_cdb_path)) then return nil, "cdb-changed" end
     CDB_DIGEST_CACHE[base_cdb_path] = { signature = signature, digest = digest }

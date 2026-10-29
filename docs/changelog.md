@@ -104,6 +104,8 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v2.12.3` → [docs/release_2.12.3.md](release_2.12.3.md) (preparation and history repairs; cold180 and complete warm semantics pending; tag pending)
 
+- `v2.12.4` → [docs/release_2.12.4.md](release_2.12.4.md) (large-CDB digest memory repair; full regression 4419/4419, 2 skips; tag pending)
+
 ## Unreleased
 
 _No unreleased entries._

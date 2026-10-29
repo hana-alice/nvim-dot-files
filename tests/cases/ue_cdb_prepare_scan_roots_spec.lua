@@ -210,7 +210,7 @@ t.describe('prepare input inventory binds pure tool roots without weakening sour
       for _, tree in ipairs(result.tool_input_trees) do
         if tree == root .. '/toolchain/lib/clang/include' then resource_trees = resource_trees + 1 end
       end
-      t.assert_eq(resource_trees, 2, 'lexical/physical resource trees are not multiplied by command cwd')
+      t.assert_eq(resource_trees, 1, 'identical lexical/physical resource tree is stored once across command cwd')
       t.assert_true(inventory.verify_tools(result.tools).ok)
     end)
   end)

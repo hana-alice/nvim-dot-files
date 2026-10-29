@@ -657,7 +657,9 @@ with tempfile.TemporaryDirectory(prefix='background_batch_') as temporary:
                     assert proof['batch_count'] == 1 and len(indexed) == 1
                     assert not module._catalog_path(store).exists()
                     reused, metrics = module.reuse_completed(entries, store, sys.executable)
-                    assert reused == entries[:8] + baseline + [exact, shader]
+                    witnessed = [dict(row, nvim_ue_tier1_ordinary_chunk=True,
+                        nvim_ue_tier1_ordinary_source_count=len(entries)) for row in baseline]
+                    assert reused == entries[:8] + witnessed + [exact, shader]
                     assert metrics['batch_count'] == 1 and metrics['accepted_ubt_count'] == 8
                     request = proposal(entries[7:16])
                     planned = module.make_plan(source, store, sys.executable, tier1_upgrades=[request])

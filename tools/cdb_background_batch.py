@@ -307,16 +307,19 @@ def _tuple_key(entry):
         'gen' if all(generated) else 'mixed' if any(generated) else 'src')
 
 
-def _upgrade_sequence(entries, indexes, sequences=None, *, sequence_provider=None):
+def _upgrade_sequence(entries, indexes, sequences=None, *, sequence_provider=None, split_member_classes=True):
     if not indexes or indexes != sorted(indexes):
         raise ValueError('background-proof-upgrade-order-changed')
-    key = _tuple_key(entries[indexes[0]])
-    if key is None or any(_tuple_key(entries[index]) != key for index in indexes):
+    def sequence_key(entry):
+        key = _tuple_key(entry)
+        return key if split_member_classes or key is None else key[:2]
+    key = sequence_key(entries[indexes[0]])
+    if key is None or any(sequence_key(entries[index]) != key for index in indexes):
         raise ValueError('background-proof-upgrade-tuple-mismatch')
     if sequences is None and sequence_provider is not None:
         sequences = sequence_provider()
     sequence = (sequences.get(key, []) if sequences is not None else
-        [index for index, entry in enumerate(entries) if _tuple_key(entry) == key])
+        [index for index, entry in enumerate(entries) if sequence_key(entry) == key])
     start = sequence.index(indexes[0])
     if sequence[start:start + len(indexes)] != indexes:
         raise ValueError('background-proof-upgrade-sequence-gap')
@@ -336,6 +339,68 @@ def _upgrade_owners(entries, indexes, records):
         owners.append(_identity([entries[index] for index in record['original_indexes']], '1', **_recipe_options(record)))
         covered.update(owned)
     return sorted(owners), len(owners) + len(selected - covered)
+
+
+def _ordinary_owner(entries, indexes, records, chunks=None):
+    """Only a CURRENT full-input default chunk may replace whole live owners.
+
+    Local repacking and arbitrary catalog subsets are not this route. Keep the
+    separate same-class upgrade sequence/packing contract unchanged.
+    """
+    if indexes not in (chunks if chunks is not None else _chunks(entries, '1')):
+        raise ValueError('background-proof-not-current-ordinary-chunk')
+    if len({_tuple_key(entries[index])[:2] for index in indexes}) != 1:
+        raise ValueError('background-proof-not-local-ordinary-chunk')
+    return _upgrade_owners(entries, indexes, records)
+
+
+def _adopt_ordinary(entries, indexes, local, local_claimed, checked, replacements, records, chunks):
+    """Inputs have passed _cache_only/_replacements; commit one whole owner or none."""
+    try:
+        owners, previous = _ordinary_owner(entries, indexes, records, chunks)
+        admitted = [record for record in checked if record.get('accepted')]
+        if (set(local) != {0} or local_claimed != set(range(len(indexes)))
+                or len(admitted) != 1 or admitted[0].get('tier') != 1
+                or admitted[0]['original_indexes'] != list(range(len(indexes)))
+                or admitted[0].get('recipe') is not None
+                or local[0].get('nvim_ue_tier') != 1
+                or local[0].get('nvim_ue_tier1_recipe') is not None):
+            return replacements, records, False
+        if previous <= 1:
+            same = any(record.get('accepted') and record['original_indexes'] == indexes
+                for record in records) and replacements.get(min(indexes)) == local[0]
+            return replacements, records, same
+        selected = set(indexes)
+        removed = [record for record in records if record.get('accepted')
+            and selected.intersection(record['original_indexes'])]
+        proposed = dict(replacements)
+        for record in removed:
+            proposed.pop(min(record['original_indexes']))
+        proposed[min(indexes)] = local[0]
+        updated = [record for record in records if record not in removed]
+        updated.append(dict(admitted[0], original_indexes=indexes))
+        _render_selection(entries, proposed, updated)
+        return proposed, updated, True
+    except (OSError, ValueError, KeyError, TypeError):
+        return replacements, records, False
+
+
+def _tag_ordinary(entries, output, metrics):
+    """Phase-local producer witness, not qualification; publisher still rechecks proof.
+
+    Only emitted at the public output boundary, never persisted in a receipt or
+    used to bypass canonical store/cache validation. Full publication also binds
+    this witness to its hash-checked same-phase semantic input count.
+    """
+    chunks = _chunks(entries, '1')
+    eligible = {record.get('receipt') for record in metrics['groups']
+        if record.get('accepted') and record.get('tier') == 1
+        and record.get('recipe') is None and record['original_indexes'] in chunks
+        and len({_tuple_key(entries[index])[:2] for index in record['original_indexes']}) == 1}
+    return [dict(entry, nvim_ue_tier1_ordinary_chunk=True,
+        nvim_ue_tier1_ordinary_source_count=len(entries))
+        if entry.get('nvim_ue_tier') == 1 and entry.get('nvim_ue_tier1_recipe') is None
+        and entry.get('nvim_ue_tier1_receipt') in eligible else entry for entry in output]
 
 
 def _whole_flat_owner(indexes, records):
@@ -370,9 +435,9 @@ def _automatic_large_groups(entries, ordinary, groups, records, store, clangd, p
             else:
                 atoms.update((index, indexes) for index in indexes)
     for chunk in ordinary:
-        if len({entries[index]['nvim_ue_module_root'] for index in chunk}) > 1:
+        if len({keys[index] for index in chunk}) > 1:
             barriers.update(chunk)
-            continue  # Cross-module owners cannot enter same-tuple upgrades.
+            continue  # Mixed ordinary atoms stay whole on the ordinary path.
         if not claimed.intersection(chunk):
             atoms.update((index, chunk) for index in chunk)
     ordinary_set = {tuple(chunk) for chunk in ordinary}
@@ -454,11 +519,13 @@ def _validate_schedule(plan, entries):
     identities = [group['id'] for group in groups]
     if len(set(identities)) != len(identities):
         raise ValueError('background-proof-duplicate-schedule-group')
-    sequences = {}
+    sequences, ordinary_sequences = {}, {}
+    ordinary_split = verified.tier1_grouping_options()['split_member_classes']
     for index, entry in enumerate(entries):
         key = _tuple_key(entry)
         if key is not None:
             sequences.setdefault(key, []).append(index)
+            ordinary_sequences.setdefault(key if ordinary_split else key[:2], []).append(index)
     # Preserve plan-time fallback boundaries when source sizes later change.
     # These scheduling atoms grant no proof or cache admission.
     ordinary = plan.get('tier1_ordinary_atoms')
@@ -471,7 +538,9 @@ def _validate_schedule(plan, entries):
                 or len(set(indexes)) != len(indexes) or atom_members.intersection(indexes)):
             raise ValueError('background-proof-invalid-schedule-atoms')
         if len({entries[index]['nvim_ue_module_root'] for index in indexes}) == 1:
-            _upgrade_sequence(entries, indexes, sequences)
+            # These are ordinary packing atoms, which share the actual Tier 1
+            # class policy. Large upgrades below retain their same-class gate.
+            _upgrade_sequence(entries, indexes, ordinary_sequences, split_member_classes=ordinary_split)
         elif not (verified.tier2_enabled() and tier2_unity_chunks(
                 [entries[index] for index in indexes], **verified.tier2_grouping_options())
                 == [list(range(len(indexes)))]):
@@ -681,7 +750,8 @@ def reuse_completed(entries, legacy_store, clangd, server_profile=None):
     with verified.tier1_overlay_scope(False):
         _reuse_completed(entries, legacy_store, clangd, server_profile, mode='strict',
             catalog_only=True, excluded=tier1['claimed'], selection=strict)
-    return _compose_selection(entries, tier1, strict)
+    output, metrics = _compose_selection(entries, tier1, strict)
+    return _tag_ordinary(entries, output, metrics), metrics
 
 
 def _compose_selection(entries, tier1, strict):
@@ -737,9 +807,7 @@ def _reuse_completed(entries, legacy_store, clangd, server_profile, include_upgr
         _, replacements, consumed, claimed = _render_selection(entries, replacements, records)
     # Retry children are receipt owners, not a second ordinary packing policy.
     ordinary_groups = [record['original_indexes'] for record in records if not record.get('fallback_of')]
-    cross_class_members = {index for chunk in ordinary_groups
-        if len({_tuple_key(entries[index])[2] for index in chunk}) > 1
-        for index in chunk} if mode == '1' else set()
+    current_chunks = _chunks(entries, '1') if mode == '1' else []
     catalog = _catalog(legacy_store, mode)
     positions = {}
     if catalog:
@@ -774,12 +842,13 @@ def _reuse_completed(entries, legacy_store, clangd, server_profile, include_upgr
                     or any(len(positions.get(value, [])) != 1 for value in hashes)):
                 continue
             indexes = [positions[value][0] for value in hashes]
-            # A historical class-split subset must not claim members of the
-            # current full-input Tier 1 chunk and prevent its qualification.
-            if (mode == '1' and indexes not in ordinary_groups
-                    and cross_class_members.intersection(indexes)):
-                continue
+            # Keep independently valid older class-split owners until the
+            # CURRENT full-input ordinary parent is actually qualified. Planning
+            # and atomic adoption below no longer let them suppress that parent.
             blocked = excluded | claimed
+            if (mode == '1' and any(record.get('accepted')
+                    and record['original_indexes'] == indexes for record in records)):
+                continue  # Preserve the existing whole owner; a relabel cannot reduce TUs.
             cross_module = (mode == '1' and verified.tier2_enabled()
                 and len({entries[index]['nvim_ue_module_root'] for index in indexes}) > 1)
             if cross_module:
@@ -788,7 +857,7 @@ def _reuse_completed(entries, legacy_store, clangd, server_profile, include_upgr
                         and index not in indexes for index, entry in enumerate(entries)):
                     continue
             if (len(set(indexes)) != len(indexes) or (cross_module and excluded.intersection(indexes))
-                    or (set(indexes) <= blocked and not cross_module)):
+                    or (set(indexes) <= blocked and not cross_module and indexes not in current_chunks)):
                 continue
             selected = [entries[index] for index in indexes]
             if strict_options:
@@ -813,6 +882,12 @@ def _reuse_completed(entries, legacy_store, clangd, server_profile, include_upgr
             local_replacements, local_consumed, local_claimed = _replacements(selected, output, metrics, mode)
             if validated_groups is not None:
                 validated_groups[identity] = (local_replacements, local_claimed, metrics['groups'])
+            if mode == '1' and indexes in current_chunks and not excluded.intersection(indexes):
+                replacements, records, adopted = _adopt_ordinary(entries, indexes,
+                    local_replacements, local_claimed, metrics['groups'], replacements, records, current_chunks)
+                if adopted:
+                    _, replacements, consumed, claimed = _render_selection(entries, replacements, records)
+                    continue
             if cross_module:
                 full = [record for record in metrics['groups'] if record.get('accepted')
                     and record.get('tier') == 2 and set(record['original_indexes']) == set(range(len(indexes)))]
@@ -1192,9 +1267,18 @@ def make_plan(source, store, clangd, profile=None, previous_path=None, tier1_upg
     groups, cache_probes, checked_positions, pending_checked = [], 0, [], 0
     for chunk in candidates:
         indexes = [available[index][0] for index in chunk]
-        if ((mode == '1' or residual) and tuple(indexes) not in retry_pending
-                and (claimed.intersection(indexes) or tuple(indexes) in rejected)):
-            continue
+        if ((mode == '1' or residual) and tuple(indexes) not in retry_pending):
+            if tuple(indexes) in rejected:
+                continue
+            if claimed.intersection(indexes):
+                if mode != '1' or residual:
+                    continue
+                try:
+                    _, previous = _ordinary_owner(entries, indexes, metrics['groups'], candidates)
+                except (OSError, ValueError, KeyError, TypeError):
+                    continue
+                if previous <= 1:
+                    continue
         selected = [entries[index] for index in indexes]
         if residual:
             if len(checked_positions) >= residual_strict_limit:
@@ -1587,6 +1671,14 @@ def _collect(plan_path, completed, background, marker_path, clangd, profile,
                     # This collect's baseline already passed the same canonical
                     # store through both cache and receipt gates. No cross-call cache.
                     local, local_claimed, checked_groups = validated
+                replacements, records, adopted = _adopt_ordinary(entries, group['indexes'],
+                    local, local_claimed, checked_groups, replacements, records, ordinary_groups)
+                if adopted:
+                    _, replacements, consumed, claimed = _render_selection(entries, replacements, records)
+                    revalidated.append(identity)
+                    catalog[identity] = {'id': identity, 'store': group['store'],
+                        'entry_hashes': [_sha(_json(entry).encode('utf-8')) for entry in selected]}
+                    continue
                 # A newly qualified whole cross-module owner may replace whole
                 # live Tier 1 owners. Never split an existing receipt owner.
                 selected_indexes = set(group['indexes'])
@@ -1680,6 +1772,7 @@ def _collect(plan_path, completed, background, marker_path, clangd, profile,
     else:
         strict = current
     output, metrics = _compose_selection(entries, tier1, strict)
+    output = _tag_ordinary(entries, output, metrics)
     records = metrics['groups']
     summary = {key: metrics[key] for key in ('original_ubt_count', 'exact_count', 'shader_count',
         'other_count', 'batch_count', 'accepted_ubt_count', 'retained_ubt_count', 'output_entries')}

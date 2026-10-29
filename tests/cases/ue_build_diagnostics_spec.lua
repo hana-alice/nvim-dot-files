@@ -143,4 +143,29 @@ t.describe("build output terminal controls", function()
       t.assert_eq(rows[2].text, "error: next diagnostic")
     end)
   end)
+
+  t.it("clang mid-message wraps retain all continuation words and stop at the source gutter", function()
+    fixture(function(file)
+      local rows = parse({ file .. ":1:19: error: use of",
+        "      undeclared identifier",
+        "      'workbench_missing_symbol'",
+        "    1 | int main(){return workbench_missing_symbol;}",
+        "      |                   ^~~~~~~~~~~~~~~~~~~~~~~~",
+        file .. ":2:1: warning: next diagnostic" })
+      t.assert_eq(#rows, 2)
+      t.assert_eq(rows[1].text, "error: use of undeclared identifier 'workbench_missing_symbol'")
+      t.assert_eq(rows[1].col, 19)
+      t.assert_eq(rows[2].text, "warning: next diagnostic")
+    end)
+  end)
+
+  t.it("clang continuation parsing does not absorb progress, source, caret or another diagnostic", function()
+    fixture(function(file)
+      for _, following in ipairs({ "unrelated progress", "      | ^~~~", "      2 | source();",
+        "      ^~~~", "      1 error generated.", "      " .. file .. ":2:1: error: next" }) do
+        local rows = parse({ file .. ":1:1: error: original", following })
+        t.assert_eq(rows[1].text, "error: original", following)
+      end
+    end)
+  end)
 end)

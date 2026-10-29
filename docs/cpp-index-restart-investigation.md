@@ -1232,3 +1232,76 @@ inventory 根（某项目插件的 `Intermediate/Build/Win64/UE4Editor/Developme
 inventory 只哈希文件名/类型/链接，所以新增文件即失效。由于 live 使用同一组 receipt 文件，**推测** live 的冻结激活当前同样失效并回落原 CDB，
 直到下次 prepare 重建 proof；未在 live nvim 上验证（按约束不触碰 live clangd）。这说明：Intermediate 中与 Android 目标无关的 Win64 产物也会使冻结失效，
 是"冻结失效来源"杠杆的实例证据。
+
+
+## 2026-10-29：stock 热加载的 forced-include 图断连与实际 LSP 丢失
+
+完整保存的工程缓存中，所有主 TU 与成员源都可达，仍有 379 个额外 own shard 不在 main 的
+Sources 可达集合内。独立解码及全缓存对比发现，其中有 51 个唯一 SymbolID、50 个已知定义 ID
+不在可达集合中；130,951 条 ref-slab 记录主要是 Definition|Spelled，只有 43 条带 Reference 位，
+不能把它们全部描述为调用或普通引用。单看源文件覆盖数不足以验收缓存交付。
+
+随后使用当前安装的 stock clangd 22.1.5 做了两个独立进程的原生因果对照：
+
+- 两个正常 `.cpp` 输入，其中 producer 通过原命令的 `-include forced.hpp` 获得定义；query
+  只有同一函数的声明与调用，不包含该头。两个进程都只打开 query，防止前台 AST 补回缺失定义。
+- 冷进程实际完成两个后台 TU 后，workspace symbol 能看到头内独有类型，definition 指向
+  forced.hpp 的函数体，references 同时含 query 和 forced.hpp 内的真实调用。
+- 暖进程复用同一个 CDB、相同 argv/cwd/UTF-16、同一份三文件 shard 库；实际完成磁盘加载、
+  后台重建及 sync 屏障后，头内独有类型消失，definition 退回 query 中的声明，references
+  仅剩 query 内的调用。两边的 canonical USR 和 SymbolID 相同。
+- 暖进程没有 Indexed 或 BackgroundIndex 事件；所有源码、CDB、shard 字节与纳秒 mtime
+  不变，两个进程正常退出且所属 Job 清空。没有修改、补边、迁移或删除缓存。
+
+机制与固定版本源码一致：
+[FileIndex.cpp 的 getSubGraph](https://github.com/llvm/llvm-project/blob/llvmorg-22.1.5/clang-tools-extra/clangd/index/FileIndex.cpp)
+只保留 own 节点及其直接边；
+[BackgroundIndexLoader.cpp](https://github.com/llvm/llvm-project/blob/llvmorg-22.1.5/clang-tools-extra/clangd/index/BackgroundIndexLoader.cpp)
+从主文件跟随保存的 Sources 键。缺少连接的 forced-header shard 即使存在且内容有效，也不会
+进入这次后台恢复结果。实际查询已证明缺失不只是诊断计数差异。
+
+两次 native 生命周期分别为 0.783172s / 0.735866s，Job CPU 为 0.9375s / 0.765625s；峰值
+WS 分别为 197,066,752 / 193,785,856 字节。小用例只采得实际起止宿主样本，不能描述为连续
+宿主监测保证。这些数字只记录实验成本，不是工程冷索引或热加载性能结论。
+
+当前完整缓存暖交付仍未通过语义验收。已形成但尚未应用的修复方向，是让 main shard 保存
+当前 TU 实际观察到的完整 Sources 键作为零 digest 依赖占位；还需原生修复验证、新工具资格、
+实际工程与查询验收，不能改写旧收据或历史缓存来制造通过。本对照只证明 forced-include
+机制，未证明工程中另外两个非 argv 条件头的历史生成顺序，也未恢复约 180 秒冷索引目标。
+
+## 2026-10-29：同一完整工程的当前机器冷索引对照
+
+对照使用记录中的最近正常选择：从原 owner ID 与当前有效收据重建 92 个二次批次、513 个
+原 UBT、214 个 exact，共 819 条 native 命令。没有把较早的 831 条布局或已退化的逐文件
+布局当作最近基线，也没有声称重建产物就是当时已发布的字节快照。
+
+| 指标 | 重建的正常基线 | 当前已资格验证方案 |
+|---|---:|---:|
+| 二次批次 / 原 UBT / exact | 92 / 513 / 214 | 260 / 153 / 214 |
+| Native 命令数 | 819 | 627 |
+| 唯一成员源 / 完整 UBT 祖先 / shader 兼容记录 | 14319 / 997 / 2119 | 14319 / 997 / 2119 |
+| 索引完成耗时 | 1295.9386s | 979.0467s |
+| 完整 native 生命周期 | 1298.5253s | 981.2681s |
+| Job CPU | 9445.75s | 7014.4375s |
+| Job 峰值 commit | 13.42GiB | 13.71GiB |
+| 已逐片验证的 shard | 32637 | 32445 |
+
+两组均为新进程、空私有索引库，j8/Idle，进程与 Job 上限均 16GiB，启动时物理和 commit
+余量各至少 32GiB，运行中各保留至少 16GiB。没有播种或清理全局缓存；OS 文件缓存与外部
+负载未受控。观察到约 24.45% wall、25.74% CPU 降幅，只是一次顺序对照，不是统计保证。
+宿主总 CPU 采样峰值为 88.3%/89.4%，不能据启动准入或 Idle 优先级声称全程低于 85%。
+
+全部 main 与 14319 个成员 own 节点均存在，无 HadErrors、缺失、重复或祖先拆分；exact
+命令及 shader 顺序单独核对。214 个 exact main 没有可选 cmdl 字段仍须满足 URI、IsTU、
+非零原生 digest 和完整覆盖；存在 cmdl 时继续校验原参数。实验校验器最初误拒了
+`-std=c++17` 紧邻 main 的合法参数布局，已依据
+[Clang 22.1.5 选项定义](https://github.com/llvm/llvm-project/blob/llvmorg-22.1.5/clang/include/clang/Options/Options.td)
+及实际保存命令，用独立修正版完成复核；旧拒绝记录、校验器、输入与缓存均保留。
+这些是结构覆盖证明，不能替代完整符号、定义、引用和暖加载语义验收。
+
+同版本私有发布的首次加同进程重复检查为 117.7s，新进程检查为 34.8s；重复时没有新资格
+验证或产物重写。此前实际资格验证、失败、文件预检和后处理成本另列，不能移出首次使用
+成本后包装成端到端结果。真实普通 UEPrepare、正常配置 reader 的交付及重复行为仍待实测。
+
+**目标仍未达到**：相较早先独立研究版 639 条命令的 1022.2383s，本次只再快约 4.2%；
+979.0467s 仍是 180s 的约 5.4 倍。上节 forced-header 暖加载缺失也尚未修复。

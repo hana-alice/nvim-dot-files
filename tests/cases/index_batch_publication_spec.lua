@@ -1038,6 +1038,50 @@ print('exactly-once coverage passed')
 end)
 
 t.describe("privately qualified live Tier 1 publication", function()
+  t.it("a validated full ordinary parent replaces whole current owners and repeats without writes", function()
+    fixture(function(f)
+      local old = f.tier1("AB", { f.originals[1], f.originals[2] })
+      local parent = f.tier1("ABC", f.originals)
+      parent.nvim_ue_tier = 1
+      parent.nvim_ue_tier1_ordinary_chunk = true
+      parent.nvim_ue_tier1_ordinary_source_count = #f.originals
+      f.phase("current", { old }, { f.originals[1], f.originals[2] })
+      f.phase("hot", { old, f.originals[3] }, f.originals)
+      f.phase("full", { parent }, f.originals)
+      local ok, report = f.publish(); t.assert_true(ok, report)
+      local published = vim.json.decode(f.read(f.ctx.paths.semantic_cdb))
+      t.assert_eq(#published, 1)
+      t.assert_eq(published[1].file, parent.file)
+      t.assert_nil(published[1].nvim_ue_tier1_ordinary_chunk)
+      local bytes, stamp = f.read(f.ctx.paths.semantic_cdb), vim.uv.fs_stat(f.ctx.paths.semantic_cdb).mtime
+      local repeated, second = f.publish(); t.assert_true(repeated, second)
+      t.assert_false(second.changed)
+      t.assert_eq(f.read(f.ctx.paths.semantic_cdb), bytes)
+      t.assert_true(vim.deep_equal(vim.uv.fs_stat(f.ctx.paths.semantic_cdb).mtime, stamp))
+    end)
+  end)
+
+  for _, fault in ipairs({ "partial-owner", "stale-parent", "wrong-input-count", "unwitnessed" }) do
+    t.it("full ordinary replacement retains valid whole owners for " .. fault, function()
+      fixture(function(f)
+        local old = f.tier1("AB", { f.originals[1], f.originals[2] })
+        local parent = f.tier1("new", fault == "partial-owner" and { f.originals[2], f.originals[3] } or f.originals)
+        parent.nvim_ue_tier = 1
+        parent.nvim_ue_tier1_ordinary_chunk = fault ~= "unwitnessed"
+        parent.nvim_ue_tier1_ordinary_source_count = #f.originals + (fault == "wrong-input-count" and 1 or 0)
+        f.phase("current", { old }, { f.originals[1], f.originals[2] })
+        f.phase("full", { parent }, f.originals)
+        if fault == "stale-parent" then f.write(parent.file, "// changed parent\n") end
+        local ok, report = f.publish(); t.assert_true(ok, report)
+        local published = vim.json.decode(f.read(f.ctx.paths.semantic_cdb))
+        t.assert_eq(#published, 2)
+        t.assert_eq(published[1].file, old.file)
+        t.assert_eq(published[2].file, f.originals[3].file)
+        t.assert_eq(#report.tier1_fallbacks, 1)
+      end)
+    end)
+  end
+
   t.it("publishes Tier 1 into live CDB without frozen artifacts or unknown clangd fields", function()
     fixture(function(f)
       local candidate = f.tier1("AB", { f.originals[1], f.originals[2] })

@@ -6,6 +6,7 @@ Callers must invalidate a published receipt when its live dependencies change.
 import collections
 import argparse
 from contextlib import contextmanager
+from contextvars import ContextVar
 import hashlib
 import importlib.util
 import json
@@ -41,6 +42,7 @@ _HEADER_CASE_POLICY = None
 _OWNED_OVERLAY_MEMO = {}
 _TIER1_BLOB_MEMO = {}
 _TIER1_OVERLAY_SCOPE_DEPTH = 0
+_TIER1_OVERLAY_READ_VIEW = ContextVar("tier1_overlay_read_view", default=None)
 _RUN_METRIC_FIELDS = ('indexing_wall_seconds', 'process_wall_seconds', 'graph_decode_seconds',
                       'spawn_seconds', 'shutdown_seconds', 'cpu_seconds', 'peak_working_set_bytes')
 _QUERY_RESOLUTION_MEMO = {}
@@ -206,11 +208,36 @@ def tier1_overlay_scope(enabled=True):
             _TIER1_BLOB_MEMO.clear()
 
 
+@contextmanager
+def _tier1_overlay_read_view():
+    """One synchronous Tier 1 description/input transaction, never a proof run.
+
+    Share one owned overlay's complete current byte observation across nested
+    wrapper validation and asset collection. Other paths retain per-access reads;
+    only one raw payload is retained. Re-read that path before returning; a
+    mismatch rejects the whole operation. No stat shortcut,
+    cross-call cache, native execution or frozen authority is authorized here.
+    This is not a filesystem snapshot or an ABA/mutation-exclusion guarantee.
+    """
+    view = {}
+    token = _TIER1_OVERLAY_READ_VIEW.set(view)
+    try:
+        yield
+        for path, (raw, _) in view.items():
+            if Path(path).read_bytes() != raw:
+                raise ValueError('owned-overlay-changed-during-tier1-operation')
+    finally:
+        _TIER1_OVERLAY_READ_VIEW.reset(token)
+
+
 def _owned_overlays(entry):
     """Validate only the producer's content-addressed identity overlay.
 
-    Bytes are checked on each access; expensive physical-spelling validation is
-    shared only within the current qualification/receipt-validation invocation.
+    Outside a synchronous Tier 1 read view, bytes are checked on every access.
+    A read view checks complete current bytes at entry/exit for one shared
+    path; other paths keep per-access reads. Physical-spelling validation stays
+    scoped to the outer
+    qualification/receipt-validation invocation.
     External target contents are not read here.
     """
     result = []
@@ -222,6 +249,10 @@ def _owned_overlays(entry):
                 or arguments[index - 1] in ('-Xclang', '-Xpreprocessor')):
             raise ValueError('unsupported-indirect-compiler-input: missing owned overlay')
         path = (Path(entry['directory']) / arguments[index + 1]).resolve()
+        view = _TIER1_OVERLAY_READ_VIEW.get()
+        if view is not None and str(path) in view:
+            result.append(view[str(path)][1])
+            continue
         raw = path.read_bytes()
         digest = _tier1_blob_sha('overlay', raw)
         key = (str(path), digest)
@@ -230,7 +261,10 @@ def _owned_overlays(entry):
             if path.read_bytes() != raw:
                 raise ValueError('owned-overlay-changed-during-validation')
             _OWNED_OVERLAY_MEMO[key] = mapping
-        result.append({'path': str(path), 'sha256': digest, 'mapping': _OWNED_OVERLAY_MEMO[key]})
+        item = {'path': str(path), 'sha256': digest, 'mapping': _OWNED_OVERLAY_MEMO[key]}
+        if view is not None and not view:
+            view[str(path)] = (raw, item)
+        result.append(item)
     return result
 
 
@@ -1690,6 +1724,7 @@ def _tier1_recipe(group, recipe=None):
     return {'recipe': recipe, 'headers': prefix['headers']}
 
 
+@_tier1_overlay_read_view()
 def _tier1_candidate_spec(group, assets, recipe=None):
     """Describe a deterministic live-source candidate without writing assets."""
     members = [path for entry in group for path in _tier1_ubt_members(entry)]
@@ -1799,6 +1834,7 @@ def _tier1_source_coverage(entries):
         (entry.get('nvim_ue_members') or [entry.get('file', '')]))
 
 
+@_tier1_overlay_read_view()
 def _tier1_inputs(group, recipe=None):
     paths = [entry['file'] for entry in group]
     paths += [path for entry in group for path in _tier1_ubt_members(entry)]

@@ -43,6 +43,7 @@ local function collect(request)
   local roots, seen, products, artifacts, compilers, resolved_inputs = {}, {}, {}, {}, {}, {}
   local tools, tool_files, tool_roots, tool_root_seen, writable_inputs = {}, {}, {}, {}, {}
   local explicit_inputs, resource_dirs, tool_input_trees, selected_toolchain = {}, {}, {}, nil
+  local collected_tool_roots, tool_input_tree_seen = {}, {}
   local header_directories, compiler_config_dirs = {}, {}
   local compiler_resource_seen = {}
   -- Clang only loads <triple>-<mode>.cfg, <triple>.cfg, <mode>.cfg or
@@ -55,11 +56,22 @@ local function collect(request)
     path, parent = key(path), key(parent)
     return path == parent or path:sub(1, #parent + 1) == parent .. "/"
   end
+  local function writable_scope(path)
+    -- Descendants add no writable intersection beyond an existing ancestor.
+    -- Keep physical aliases separately when they leave that ancestor.
+    for _, existing in ipairs(writable_inputs) do
+      if beneath(path, existing) then return end
+    end
+    for i = #writable_inputs, 1, -1 do
+      if beneath(writable_inputs[i], path) then table.remove(writable_inputs, i) end
+    end
+    writable_inputs[#writable_inputs + 1] = path
+  end
   local function writable(path, base)
     path = absolute(path, base)
-    writable_inputs[#writable_inputs + 1] = path
+    writable_scope(path)
     local physical = uv.fs_realpath(path)
-    if physical then writable_inputs[#writable_inputs + 1] = absolute(physical) end
+    if physical then writable_scope(absolute(physical)) end
   end
   local function tool_file(path)
     path = absolute(path)
@@ -116,8 +128,18 @@ local function collect(request)
     resolved_inputs[operand] = path
     return path
   end
+  local function tool_input_tree(path)
+    local id = key(path)
+    if tool_input_tree_seen[id] then return end
+    tool_input_tree_seen[id] = true
+    tool_input_trees[#tool_input_trees + 1] = path
+  end
   local function tool_root(path, base, resource, input_tree)
     path = input(path, base)
+    -- Same path may later gain a resource/input role. Dedup only identical
+    -- roles in this collection; the next collection reads metadata afresh.
+    local id = key(path) .. tostring(resource == true) .. tostring(input_tree == true)
+    if collected_tool_roots[id] then return end
     local stat = uv.fs_stat(path)
     if not stat or stat.type ~= "directory" then error("tool directory unavailable: " .. path) end
     for _, directory in ipairs({ path, absolute(assert(uv.fs_realpath(path))) }) do
@@ -130,10 +152,11 @@ local function collect(request)
     if resource then resource_dirs[key(path)] = path end
     if resource or input_tree then
       local tree = resource and path .. "/include" or path
-      tool_input_trees[#tool_input_trees + 1] = tree
+      tool_input_tree(tree)
       local physical = uv.fs_realpath(tree)
-      if physical then tool_input_trees[#tool_input_trees + 1] = absolute(physical) end
+      if physical then tool_input_tree(absolute(physical)) end
     end
+    collected_tool_roots[id] = true
   end
   local function header_input(path, base)
     path = input(path, base)
@@ -489,8 +512,8 @@ local function collect(request)
     if not readonly_tool(path) then return end
     tool_file(path) -- unavailable explicit tool input must fail closed
     if header_directories[key(path)] and uv.fs_stat(path).type == "directory" then
-      tool_input_trees[#tool_input_trees + 1] = path
-      tool_input_trees[#tool_input_trees + 1] = absolute(assert(uv.fs_realpath(path)))
+      tool_input_tree(path)
+      tool_input_tree(absolute(assert(uv.fs_realpath(path))))
     end
     local parent = vim.fs.dirname(path)
     while parent and readonly_tool(parent) do
@@ -520,11 +543,20 @@ local function collect(request)
   -- Scan every directory, including Build/Intermediate and generated caches;
   -- an unreadable tree or budget exhaustion disables cache instead of guessing.
   local scanned, directory_count = {}, 0
-  local function scan(directory, via_tool)
-    local physical = uv.fs_realpath(directory)
+  local function scan(directory, via_tool, physical)
+    local inherited = physical ~= nil
+    physical = physical or uv.fs_realpath(directory)
     if not physical then error("unresolvable watch directory: " .. directory) end
     local id = key(absolute(physical))
-    if scanned[id] then return end
+    if scanned[id] then
+      if inherited then
+        local current = uv.fs_realpath(directory)
+        if not current or key(absolute(current)) ~= id then
+          error("watch directory changed during inventory: " .. directory)
+        end
+      end
+      return
+    end
     scanned[id] = true
     if tool_input(directory) then tool_file(directory) end
     directory_count = directory_count + 1
@@ -547,7 +579,10 @@ local function collect(request)
       if not name then break end
       if name ~= ".git" then
         local child = directory .. "/" .. name
-        if kind == "directory" then scan(child, via_tool)
+        if kind == "directory" then
+          -- A regular dirent inherits the resolved parent's physical path.
+          -- Link/unknown entries below still resolve and classify their target.
+          scan(child, via_tool, physical .. "/" .. name)
         elseif kind == "file" then
           if compiler_config_dirs[key(directory)] and name:lower():match("%.cfg$") and relevant_config(name) then
             -- Default configs can add @files and external input directories.
@@ -649,6 +684,13 @@ local function collect(request)
   table.sort(artifacts, function(a, b) return a.path < b.path end)
   table.sort(tools, function(a, b) return a.path < b.path end)
   table.sort(classified_tool_roots)
+  -- Repeated argv roles share the initial lookup, but a changed directory or
+  -- retargeted tool-root alias during collection must still revoke the proof.
+  for _, item in ipairs(tools) do
+    if tool_root_seen[key(item.path)] and not vim.deep_equal(item.identity, tool_identity(item.path)) then
+      error("tool root changed during inventory: " .. item.path)
+    end
+  end
   if #roots > (request.max_roots or 32) then error("watch root budget exceeded") end
   return { ok = true, roots = roots, products = products, artifacts = artifacts,
     tools = tools, tool_roots = classified_tool_roots, toolchain = selected_toolchain,

@@ -106,6 +106,119 @@ t.describe("prepare cache real input evidence", function()
     end)
   end)
 
+  t.it("repeated tool operands preserve coverage without repeated metadata work", function()
+    fixture(function(ctx, request, root)
+      local external = vim.fs.normalize(vim.fn.tempname() .. "-repeated-tool-inputs")
+      write(external .. "/include/implicit.h", "// implicit tool input\n")
+      write(external .. "/lib/runtime.h", "// implicit runtime input\n")
+      local original_stat, original_realpath, original_scandir = uv.fs_stat, uv.fs_realpath, uv.fs_scandir
+      local calls = 0
+      local function count(path)
+        if vim.fs.normalize(path):lower() == external:lower() then calls = calls + 1 end
+      end
+      uv.fs_stat = function(path, ...) count(path); return original_stat(path, ...) end
+      uv.fs_realpath = function(path, ...) count(path); return original_realpath(path, ...) end
+      local ok, err = xpcall(function()
+        local function collect(n)
+          local entries = {}
+          for _ = 1, n do
+            entries[#entries + 1] = { directory = root, file = root .. "/Source/A.cpp",
+              arguments = { compiler, "--sysroot=" .. external, "-resource-dir", external,
+                "-c", root .. "/Source/A.cpp" } }
+          end
+          write(ctx.paths.active_cdb, entries)
+          calls = 0
+          local value = inputs.collect(request)
+          t.assert_true(value.ok, value.reason)
+          return value, calls
+        end
+        local once, once_calls = collect(1)
+        local repeated, repeated_calls = collect(64)
+        t.assert_eq(repeated.entries, 64)
+        t.assert_true(vim.deep_equal(repeated.roots, once.roots), "all recursive roots retained")
+        t.assert_true(vim.deep_equal(repeated.tools, once.tools), "all real tool identities retained")
+        local bound = {}
+        for _, item in ipairs(repeated.tools) do bound[item.path] = item end
+        t.assert_true(bound[external .. "/include/implicit.h"] ~= nil, "resource role must still add builtin headers")
+        t.assert_true(bound[external .. "/lib/runtime.h"] ~= nil, "sysroot role must still cover its full input tree")
+        os.remove(external .. "/include/implicit.h")
+        t.assert_false(inputs.verify_tools(repeated.tools).ok, "removed implicit input must still revoke proof")
+        t.assert_true(repeated_calls <= once_calls + 8,
+          ("identical tool operands amplified metadata calls: one=%d repeated=%d"):format(once_calls, repeated_calls))
+        local changed = false
+        uv.fs_scandir = function(path, ...)
+          if not changed and vim.fs.normalize(path):lower() == (external .. "/lib"):lower() then
+            changed = true
+            write(external .. "/added-during-collection.h", "// new directory member\n")
+          end
+          return original_scandir(path, ...)
+        end
+        local during = inputs.collect(request)
+        t.assert_true(changed, "real input subtree was scanned")
+        t.assert_false(during.ok, "a changed tool root cannot reuse its earlier metadata")
+        t.assert_match(during.reason, "tool root changed during inventory")
+        uv.fs_scandir = original_scandir
+        t.assert_true(inputs.collect(request).ok, "next collection reads the new tool state afresh")
+      end, debug.traceback)
+      uv.fs_stat, uv.fs_realpath, uv.fs_scandir = original_stat, original_realpath, original_scandir
+      vim.fn.delete(external, "rf")
+      if not ok then error(err) end
+    end)
+  end)
+
+  t.it("a previously scanned source alias cannot hide a disappearing ordinary directory", function()
+    fixture(function(_, request, root)
+      local parent, target = root .. "/Source", root .. "/Source/99-shared"
+      vim.fn.mkdir(target, "p")
+      local options = uv.os_uname().sysname:match("Windows") and { junction = true } or nil
+      local linked, reason = uv.fs_symlink(target, parent .. "/00-alias", options)
+      if not linked then
+        t.skip("duplicate source alias race", "host cannot create the real directory link: " .. tostring(reason))
+        return
+      end
+      local original_scan, original_next = uv.fs_scandir, uv.fs_scandir_next
+      local saved, visited, removed = {}, false, false
+      local function same(a, b) return vim.fs.normalize(a):lower() == vim.fs.normalize(b):lower() end
+      uv.fs_scandir = function(path, ...)
+        local handle, err = original_scan(path, ...)
+        if handle and same(path, target) then visited = true end
+        if handle and same(path, parent) then
+          local rows = {}
+          while true do
+            local name, kind = original_next(handle)
+            if not name then break end
+            rows[#rows + 1] = { name, kind }
+          end
+          -- Use actual saved dirents, with deterministic alias-first ordering.
+          table.sort(rows, function(a, b) return a[1] < b[1] end)
+          saved[handle] = { rows = rows, cursor = 0 }
+        end
+        return handle, err
+      end
+      uv.fs_scandir_next = function(handle)
+        local state = saved[handle]
+        if not state then return original_next(handle) end
+        state.cursor = state.cursor + 1
+        local row = state.rows[state.cursor]
+        if not row then return end
+        if row[1] == "99-shared" and not removed then
+          t.assert_eq(row[2], "directory", "ordinary dirent was captured before the change")
+          t.assert_true(visited, "the real alias was traversed first")
+          t.assert_true(uv.fs_rmdir(target), "remove the real empty source directory")
+          removed = true
+        end
+        return row[1], row[2]
+      end
+      local ok, err = xpcall(function()
+        local value = inputs.collect(request)
+        t.assert_true(visited and removed, "the duplicate scan boundary was exercised")
+        t.assert_false(value.ok, "a vanished duplicate source directory must revoke collection")
+      end, debug.traceback)
+      uv.fs_scandir, uv.fs_scandir_next = original_scan, original_next
+      if not ok then error(err) end
+    end)
+  end)
+
   t.it("narrow tool evidence binds used files, directory members and missing identities", function()
     fixture(function(ctx, request, root)
       local external = vim.fs.normalize(vim.fn.tempname() .. "-used-tool-inputs")

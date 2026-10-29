@@ -68,13 +68,36 @@ with tempfile.TemporaryDirectory(prefix='tier1_noclass_') as temporary:
         assert rows == entries and metrics['batch_count'] == 0
         assert [group['original_indexes'] for group in metrics['groups']] == chunks()
         assert all(group['deferred'] for group in metrics['groups'])
+        with patch.object(subprocess, 'Popen', side_effect=AssertionError('ordinary scheduling starts native work')):
+            scheduled = background.make_plan(source, store, sys.executable, auto_tier1_large=True)
+            assert scheduled['tier1_ordinary_atoms'] == chunks(), scheduled
+            assert [group['indexes'] for group in scheduled['groups']] == chunks(), scheduled
+            for altered in ([1, 0, 2, 3], [0, 2, 3]):
+                bad = copy.deepcopy(scheduled)
+                bad['tier1_ordinary_atoms'] = [altered]
+                rejected(lambda: background._validate_schedule(bad, entries))
+            changed = copy.deepcopy(entries)
+            changed[1]['arguments'].insert(1, '-DOTHER_CONTEXT=1')
+            rejected(lambda: background._validate_schedule(scheduled, changed))
+            rejected(lambda: background._upgrade_sequence(entries, [0, 1, 2, 3]))
         # The low-level API retains its class-splitting default for other callers.
         assert background.secondary_unity_chunks(entries) == [[0, 1], [2, 3]]
+        entries += [unit(index) for index in range(4, 16)]
+        source.write_text(json.dumps(entries), encoding='utf-8')
+        expected = [list(range(8)), list(range(8, 16))]
+        assert chunks() == expected
+        with patch.object(subprocess, 'Popen', side_effect=AssertionError('mixed atom planning starts native work')):
+            scheduled = background.make_plan(source, store, sys.executable, auto_tier1_large=True)
+            assert scheduled['tier1_ordinary_atoms'] == expected, scheduled
+            assert [group['indexes'] for group in scheduled['groups']] == expected, scheduled
+            assert all('packing' not in group for group in scheduled['groups']), scheduled
     elif operation == 'split_rollback':
         os.environ['NVIM_UE_TIER1_SPLIT_CLASSES'] = '1'
         assert chunks() == [[0, 1], [2, 3]]
         rows, metrics = verified.reuse_tier1(entries, store, sys.executable)
         assert rows == entries and [group['original_indexes'] for group in metrics['groups']] == chunks()
+        scheduled = background.make_plan(source, store, sys.executable, auto_tier1_large=True)
+        assert scheduled['tier1_ordinary_atoms'] == chunks(), scheduled
     elif operation == 'invalid_policy':
         for value in ('', 'invalid', '-1', '2', '0.5', 'true'):
             os.environ['NVIM_UE_TIER1_SPLIT_CLASSES'] = value
@@ -264,6 +287,39 @@ with tempfile.TemporaryDirectory(prefix='tier1_noclass_') as temporary:
         assert snapshot() == before, 'native fallback warm reuse changed bytes or mtimes'
         print('native-retry-evidence: ' + json.dumps({'cold': metrics, 'warm': warm_metrics, 'reuse': reuse_metrics,
             'parent_receipt': json.loads(pathlib.Path(metrics['groups'][0]['receipt']).read_text(encoding='utf-8'))}))
+    elif operation == 'native_same_scope_catalog_miss':
+        rows, metrics = verified.accelerate_tier1(entries, store, clangd, timeout=15)
+        assert metrics['batch_count'] == 1 and metrics['accepted_ubt_count'] == 4, metrics
+        assert len(rows) == 1 and all(metrics['groups'][0]['gates'].values()), metrics
+        root_receipt = rows[0]['nvim_ue_tier1_receipt']
+        identity = background._identity(entries, '1')
+        catalog_path = background._catalog_path(store, '1')
+        canonical_store = catalog_path.parent / identity
+        catalog_path.parent.mkdir(parents=True, exist_ok=True)
+        background._write(catalog_path, {'schema': 1, 'mode': '1', 'groups': [{
+            'id': identity, 'store': str(canonical_store),
+            'entry_hashes': [background._sha(background._json(entry).encode('utf-8')) for entry in entries]}]})
+        assert not canonical_store.exists()
+        def assert_root_retained():
+            before = snapshot()
+            with patch.object(subprocess, 'Popen', side_effect=AssertionError('catalog reuse starts native work')), \
+                 patch.object(verified, '_write', side_effect=AssertionError('catalog reuse writes proof artifacts')):
+                reused, reused_metrics = background.reuse_completed(entries, store, clangd)
+                assert len(reused) == 1 and reused[0]['nvim_ue_tier1_receipt'] == root_receipt, reused
+                assert reused_metrics['batch_count'] == 1 and reused_metrics['accepted_ubt_count'] == 4, reused_metrics
+                assert verified._tier1_source_coverage(reused) == verified._tier1_source_coverage(entries)
+                planned = background.make_plan(source, store, clangd)
+                assert planned['groups'] == [] and planned['proof_accepted_count'] == 1, planned
+            assert snapshot() == before, 'advisory lookup rewrote the valid root owner or other artifacts'
+        assert_root_retained()  # A missing advisory namespace cannot shadow a real root proof.
+        canonical, canonical_metrics = verified.accelerate_tier1(entries, canonical_store, clangd, timeout=15)
+        assert canonical_metrics['batch_count'] == 1 and len(canonical) == 1, canonical_metrics
+        assert canonical[0]['nvim_ue_tier1_receipt'] != root_receipt
+        assert_root_retained()  # A same-scope valid relabel cannot reduce native work.
+        candidate = pathlib.Path(canonical[0]['file'])
+        assert candidate != pathlib.Path(rows[0]['file'])
+        candidate.write_bytes(candidate.read_bytes() + b'// invalidate only the independent advisory wrapper\n')
+        assert_root_retained()  # The separate root receipt/assets remain valid.
     elif operation in ('native_plan_work_collect_noop', 'native_split_catalog_migration'):
         published.write_text('[]', encoding='utf-8')
         marker.write_text('{}', encoding='utf-8')
@@ -291,8 +347,8 @@ with tempfile.TemporaryDirectory(prefix='tier1_noclass_') as temporary:
             assert len(json.loads(published.read_text(encoding='utf-8'))) == 2
             assert len(background._catalog(store, '1')) == 2
             del os.environ['NVIM_UE_TIER1_SPLIT_CLASSES']
-            # Receipts remain valid for the same local inputs. Only obsolete
-            # full-input catalog boundaries must stop claiming the new chunk.
+            # Keep the valid whole owners while the mixed full chunk is pending;
+            # they must not prevent qualification or atomic adoption of its parent.
             before = snapshot()
             old_receipts = set()
             with patch.object(subprocess, 'Popen', side_effect=AssertionError('old receipt starts native work')):
@@ -302,9 +358,15 @@ with tempfile.TemporaryDirectory(prefix='tier1_noclass_') as temporary:
                     assert local_metrics['batch_count'] == local_metrics['cache_hits'] == 1
                     old_receipts.add(local_output[0]['nvim_ue_tier1_receipt'])
             assert len(old_receipts) == 2 and snapshot() == before
+            with patch.object(subprocess, 'Popen', side_effect=AssertionError('pending parent starts native work')):
+                retained, retained_metrics = background.reuse_completed(entries, store, clangd)
+            assert retained_metrics['batch_count'] == 2 and len(retained) == 2
+            assert {row['nvim_ue_tier1_receipt'] for row in retained} == old_receipts
+            assert snapshot() == before, 'pending parent rewrote valid old authorities'
         plan = background.make_plan(source, store, clangd)
         assert len(plan['groups']) == 1 and plan['groups'][0]['indexes'] == [0, 1, 2, 3]
-        assert plan['proof_accepted_count'] == 0 and plan['proof_uncached_count'] == 1
+        assert plan['proof_accepted_count'] == (2 if operation == 'native_split_catalog_migration' else 0)
+        assert plan['proof_uncached_count'] == 1
         background._write(plan_path, plan)
         # Replanning unfinished work retains the same pending identity, without writes.
         before = snapshot()
@@ -375,7 +437,7 @@ t.describe("Tier 1 source/generated grouping", function()
     t.skip("native mixed-class plan/work/collect", discovered.reason, { native = true })
     return
   end
-  for _, operation in ipairs({ "native_plan_work_collect_noop", "native_split_catalog_migration", "native_same_stem_header" }) do
+  for _, operation in ipairs({ "native_plan_work_collect_noop", "native_split_catalog_migration", "native_same_stem_header", "native_same_scope_catalog_miss" }) do
     t.it(operation, function() run_fixture(operation, discovered.clangd_path) end)
   end
 end)

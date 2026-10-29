@@ -212,6 +212,7 @@ return function(M, core)
 
     local merged, seen, frozen, frozen_seen, receipts, batches = {}, {}, {}, {}, {}, {}
     local tier1_batches, tier1_consumed, tier1_fallbacks, has_tier1 = {}, {}, {}, false
+    local tier1_proposals, tier1_validated = {}, {}
     -- Reuse byte reads only within this publication. Phase manifests and stat
     -- identities cannot detect same-size live input edits between publications.
     local content_hashes = {}
@@ -320,12 +321,9 @@ return function(M, core)
         local original_key = entry_key(original)
         if not original_key or not originals[original_key] then return nil, "tier1-phase-original-absent-or-changed" end
         if consumed[original_key] then return nil, "tier1-original-repeated-in-receipt" end
-        if tier1_consumed[original_key] and tier1_consumed[original_key] ~= candidate_key then
-          return nil, "tier1-original-covered-more-than-once"
-        end
         consumed[original_key] = true
       end
-      local previous = tier1_batches[candidate_key]
+      local previous = tier1_validated[candidate_key]
       if previous and (previous.path ~= path or previous.digest ~= digest) then
         return nil, "tier1-candidate-conflicting-receipts"
       end
@@ -402,8 +400,13 @@ return function(M, core)
               for _, original in ipairs(recovered) do recovered_entries[#recovered_entries + 1] = original end
             end
             if admitted then
-              tier1_batches[admitted.key] = admitted
-              for original_key in pairs(admitted.originals) do tier1_consumed[original_key] = admitted.key end
+              tier1_validated[admitted.key] = admitted
+              tier1_proposals[#tier1_proposals + 1] = { owner = admitted, phase = phase, source = source,
+                -- Producer recomputes this witness from the entire phase input,
+                -- only after canonical cache/receipt checks. It grants no proof.
+                ordinary = phase == "full" and entry.nvim_ue_tier == 1
+                  and entry.nvim_ue_tier1_recipe == nil and entry.nvim_ue_tier1_ordinary_chunk == true
+                  and entry.nvim_ue_tier1_ordinary_source_count == #originals }
             else tier1_fallback(phase, entry, reason, source) end
           else
             frozen_entries[#frozen_entries + 1] = entry
@@ -456,6 +459,45 @@ return function(M, core)
     end
     if controlled_count == 0 then
       return false, "no same-generation controlled translation units"
+    end
+
+    -- Resolve only fully validated proposals. A CURRENT full-input ordinary
+    -- chunk may supersede earlier whole owners, never an arbitrary catalog
+    -- subset, a partial receipt, a different recipe, or a nonreducing relabel.
+    -- Invalid later candidates cannot erase valid current/hot authorities.
+    for _, proposal in ipairs(tier1_proposals) do
+      local owner, overlaps, covered = proposal.owner, {}, {}
+      if not tier1_batches[owner.key] then
+        for original_key in pairs(owner.originals) do
+          local prior = tier1_consumed[original_key]
+          if prior then overlaps[prior] = true end
+        end
+        local reason, previous = nil, 0
+        for prior in pairs(overlaps) do
+          previous = previous + 1
+          for original_key in pairs(tier1_batches[prior].originals) do
+            if not owner.originals[original_key] then reason = "tier1-partial-owner-replacement" end
+            covered[original_key] = true
+          end
+        end
+        for original_key in pairs(owner.originals) do
+          if not covered[original_key] then previous = previous + 1 end
+        end
+        if next(overlaps) then
+          if not proposal.ordinary then reason = "tier1-original-covered-more-than-once"
+          elseif previous <= 1 then reason = reason or "tier1-replacement-does-not-reduce-tus" end
+        end
+        if reason then
+          tier1_fallback(proposal.phase, owner.entry, reason, proposal.source)
+        else
+          for prior in pairs(overlaps) do
+            for original_key in pairs(tier1_batches[prior].originals) do tier1_consumed[original_key] = nil end
+            tier1_batches[prior] = nil
+          end
+          tier1_batches[owner.key] = owner
+          for original_key in pairs(owner.originals) do tier1_consumed[original_key] = owner.key end
+        end
+      end
     end
 
     -- A later full phase contains the original UBT rows even when an earlier

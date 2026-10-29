@@ -102,4 +102,8 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v2.12.2` → [docs/release_2.12.2.md](release_2.12.2.md) (shared Scratch, single-Escape picker cancellation and bounded workspace diagnostics; full regression 4402/4402, 2 skips; tag pending)
 
+- `v2.12.3` → [docs/release_2.12.3.md](release_2.12.3.md) (preparation and history repairs; cold180 and complete warm semantics pending; tag pending)
+
 ## Unreleased
+
+_No unreleased entries._

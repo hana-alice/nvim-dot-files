@@ -216,8 +216,8 @@ local function normalize_output_lines(output)
   if type(output) == "table" then
     local lines = {}
     for _, line in ipairs(output) do
-      line = trim(strip_ansi(line))
-      if line ~= "" then
+      line = strip_ansi(line)
+      if trim(line) ~= "" then
         table.insert(lines, line)
       end
     end
@@ -226,8 +226,8 @@ local function normalize_output_lines(output)
 
   local lines = {}
   for line in tostring(output or ""):gmatch("[^\r\n]+") do
-    line = trim(strip_ansi(line))
-    if line ~= "" then
+    line = strip_ansi(line)
+    if trim(line) ~= "" then
       table.insert(lines, line)
     end
   end
@@ -359,14 +359,23 @@ local function diagnostic_entries_from_output(output, opts)
 
   local index = 1
   while index <= #lines do
-    local line = lines[index]
+    local line = trim(lines[index])
     local entry = parse_output_entry(line, opts)
-    -- Compilers attached to a terminal wrap at its width: a long path leaves
-    -- only "error:" on the location line and the message on the next one.
+    -- Clang word-wraps at terminal width with six-space continuation indents
+    -- (TextDiagnostic.cpp). Preserve that evidence through channel collection.
     local following = lines[index + 1]
-    if entry and following and entry.text:match("^%a[%a ]*:$") and not parse_output_entry(following, opts) then
-      entry.text = entry.text .. " " .. following
+    local severity = entry and entry.text:match("^([%a ]+):")
+    local clang_message = severity == "error" or severity == "fatal error" or severity == "warning" or severity == "note"
+    while entry and following and (entry.text:match("^%a[%a ]*:$") or clang_message and following:match("^      %S")) do
+      local continuation = trim(following)
+      if parse_output_entry(continuation, opts) or is_summary_diagnostic_line(continuation)
+        or continuation:match("^%d+%s*|") or continuation:match("^[|%^~]")
+        or continuation:match("^%d+ errors? generated%.") then
+        break
+      end
+      entry.text = entry.text .. " " .. continuation
       index = index + 1
+      following = lines[index + 1]
     end
     if entry then
       add_quickfix_entry(entries, seen, entry)
@@ -379,7 +388,7 @@ local function diagnostic_entries_from_output(output, opts)
   if #entries == 0 then
     local start = math.max(#lines - (opts.tail_limit or 12) + 1, 1)
     for index = start, #lines do
-      add_quickfix_entry(entries, seen, { text = lines[index] })
+      add_quickfix_entry(entries, seen, { text = trim(lines[index]) })
     end
   end
 
@@ -4415,16 +4424,16 @@ local function append_job_output(lines, pending, chunks)
   while true do
     local newline = pending:find("\n", 1, true)
     if not newline then break end
-    local line = trim(strip_ansi(pending:sub(1, newline - 1)))
-    if line ~= "" then table.insert(lines, line) end
+    local line = strip_ansi(pending:sub(1, newline - 1))
+    if trim(line) ~= "" then table.insert(lines, line) end
     pending = pending:sub(newline + 1)
   end
   return pending
 end
 
 local function flush_job_output(lines, pending)
-  pending = trim(strip_ansi(pending))
-  if pending ~= "" then
+  pending = strip_ansi(pending)
+  if trim(pending) ~= "" then
     table.insert(lines, pending)
   end
   return ""

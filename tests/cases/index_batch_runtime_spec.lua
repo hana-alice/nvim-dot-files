@@ -1112,7 +1112,10 @@ t.describe("frozen batch startup runtime", function()
       vim.fn.mkdir(root .. "/artifacts", "p")
       local source = root .. "/input/original.h"
       vim.fn.writefile({ "before" }, source)
-      h.descriptor.watch_roots = { root }
+      -- Exercise these three directories without also subscribing to their
+      -- workspace parent. Unclassified parent writes to input must revoke;
+      -- ancestor invalidation has a separate real-watch case below.
+      h.descriptor.watch_roots = { root .. "/input", root .. "/cache", root .. "/artifacts" }
       h.descriptor.exclude_roots = { root .. "/cache" }
       h.opts.probe_recursive, h.opts.watch_factory, h.opts.schedule = nil, nil, nil
       h.prepare(); h.describe()

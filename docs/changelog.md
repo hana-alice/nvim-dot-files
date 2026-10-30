@@ -106,6 +106,8 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v2.12.4` → [docs/release_2.12.4.md](release_2.12.4.md) (large-CDB digest memory repair; full regression 4419/4419, 2 skips; tag pending)
 
+- `v2.12.5` → [docs/release_2.12.5.md](release_2.12.5.md) (absent-cache preparation repair; full regression 4421/4421, 2 skips; tag pending)
+
 ## Unreleased
 
 _No unreleased entries._

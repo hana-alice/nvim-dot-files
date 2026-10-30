@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import time
 
@@ -195,6 +196,21 @@ def _items(manifest_path, value):
         yield item, original, backup
 
 
+def _absent_directory(path):
+    """Fresh no-follow component checks; only ENOENT is evidence of absence."""
+    path = Path(path)
+    for component in (*reversed(path.parents), path):
+        try:
+            info = component.lstat()
+        except FileNotFoundError:
+            return True
+        if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
+            raise ValueError('unsupported-header-path-link: ' + str(component))
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError('expected-header-directory: ' + str(component))
+    return False
+
+
 def migrate(active_cdb, semantic_cdb, cache_dir):
     started = time.monotonic()
     active = _safe(active_cdb)
@@ -202,6 +218,16 @@ def migrate(active_cdb, semantic_cdb, cache_dir):
     overlays = _overlays(active)
     if not overlays:
         return {'migrated': 0, 'reason': 'no-committed-owned-overlay'}
+    # Absence is a point-in-time non-persisted no-op, not a completed repair.
+    # Any history (including another policy key) stays on the guarded owner path.
+    history = cache.parent / 'header-path-case-migrations'
+    if _absent_directory(cache) and _absent_directory(history):
+        for overlay in overlays:
+            policy.validate_owned_overlay(_safe(overlay['path']))
+        # Validation can take time. Do not cache negative path observations.
+        if _absent_directory(cache) and _absent_directory(history):
+            return {'migrated': 0, 'status': 'not-needed', 'reason': 'owned-cache-absent',
+                    'persisted': False, 'manifest': None}
     identity = {'policy': POLICY, 'policy_sha256': _sha(__file__), 'mapper_sha256': _sha(policy.__file__),
                 'decoder_sha256': _sha(graph.__file__), 'cache_dir': str(cache), 'overlays': overlays}
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()

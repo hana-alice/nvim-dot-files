@@ -255,6 +255,86 @@ t.describe("ue.cdb Windows header path casing", function()
     if not ok then error(err) end
   end)
 
+  t.it("does not block an absent owned cache on a real live writer or persist its absence", function()
+    local platform = require("utils.platform")
+    if platform.driver().id ~= "windows" then t.skip("absent header cache", "Windows filesystem required"); return end
+    local tool = platform.resolve_tool({ name = "clangd", env = { "UE_CLANGD" },
+      config_candidates = require("utils.ue_goto.semantic_sidecar_libclang").discover_clangd_candidates() })
+    if not tool.ok then t.skip("absent header cache", tool.reason, { native = true }); return end
+    python_test([=[
+    import subprocess
+    sys.path.insert(0,str(repo/'lua/workarounds/clangd'))
+    import header_path_case_cache as cache
+    c.apply_policy(cdb,VERSION)
+    semantic=output/'absent-background/compile_commands.json'
+    folder=semantic.parent/'.cache/clangd/index'
+    history=folder.parent/'header-path-case-migrations'
+    before={p:(p.read_bytes(),p.stat().st_mtime_ns) for p in root.rglob('*') if p.is_file()}
+    writer=subprocess.Popen([sys.argv[2],'--enable-config=false','--background-index=false'],
+        stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    try:
+        assert writer.poll() is None and writer.pid in cache._running_clangd(), 'real writer unavailable'
+        for _ in range(2):
+            result=cache.migrate(cdb,semantic,folder)
+            assert result=={'migrated':0,'status':'not-needed','reason':'owned-cache-absent',
+                            'persisted':False,'manifest':None}, result
+            assert not folder.exists() and not history.exists()
+        assert {p:(p.read_bytes(),p.stat().st_mtime_ns) for p in root.rglob('*') if p.is_file()}==before
+        # Later creation must be examined anew, including an existing empty cache.
+        folder.mkdir(parents=True)
+        deferred=cache.migrate(cdb,semantic,folder)
+        assert deferred['deferred'] and writer.pid in deferred['writer_pids']
+        assert not history.exists()
+        folder.rmdir()
+        (history/'older-key').mkdir(parents=True)
+        (history/'older-key/manifest.json').write_text('{"status":"pending"}')
+        saved=(history/'older-key/manifest.json').read_bytes()
+        assert cache.migrate(cdb,semantic,folder)['deferred']
+        assert (history/'older-key/manifest.json').read_bytes()==saved
+    finally:
+        writer.stdin.close()
+        try: writer.wait(timeout=5)
+        except subprocess.TimeoutExpired: writer.terminate(); writer.wait(timeout=5)
+        writer.stdout.close(); writer.stderr.close()
+]=], tool.path)
+  end)
+
+  t.it("validates absent-cache inputs and rechecks paths after overlay validation", function()
+    python_test([=[
+    sys.path.insert(0,str(repo/'lua/workarounds/clangd'))
+    import header_path_case_cache as cache
+    applied=c.apply_policy(cdb,VERSION)
+    semantic=output/'validated-background/compile_commands.json'
+    folder=semantic.parent/'.cache/clangd/index'
+    history=folder.parent/'header-path-case-migrations'
+    overlay=pathlib.Path(applied['overlay']); original=overlay.read_bytes()
+    overlay.write_bytes(b'{}')
+    try: cache.migrate(cdb,semantic,folder)
+    except ValueError: pass
+    else: raise AssertionError('changed overlay accepted with absent cache')
+    overlay.write_bytes(original)
+    folder.parent.mkdir(parents=True)
+    lstat=pathlib.Path.lstat
+    def denied(path,*args,**kwargs):
+        if path==folder: raise PermissionError('fixture directory access denied')
+        return lstat(path,*args,**kwargs)
+    with patch.object(pathlib.Path,'lstat',denied):
+        try: cache.migrate(cdb,semantic,folder)
+        except PermissionError: pass
+        else: raise AssertionError('unknown path state reported as absent')
+    validate=cache.policy.validate_owned_overlay
+    for created in (folder,history):
+        def appeared(path):
+            value=validate(path); created.mkdir(); return value
+        with patch.object(cache.policy,'validate_owned_overlay',side_effect=appeared), \
+             patch.object(cache,'_running_clangd',side_effect=OSError('process probe unavailable')):
+            result=cache.migrate(cdb,semantic,folder)
+        assert result['deferred'] and 'probe-unavailable' in result['reason']
+        created.rmdir()
+    assert not folder.exists() and not history.exists()
+]=])
+  end)
+
   t.it("migrates only mapped empty header shards once and can restore every moved byte", function()
     python_test([=[
     import struct

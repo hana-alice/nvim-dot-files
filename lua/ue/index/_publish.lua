@@ -250,6 +250,49 @@ return function(M, core)
       -- semantic file is lost. It cannot authorize its live candidate this way.
       return receipt.original_entries
     end
+    local graph_directory_views = {}
+    local function graph_inputs_current(proof)
+      if type(proof) ~= "table" or proof.ok ~= true or type(proof.dependencies) ~= "table"
+        or not vim.islist(proof.dependencies) or type(proof.publication_directories) ~= "table"
+        or not vim.islist(proof.publication_directories) or type(proof.excluded) ~= "string" then return false end
+      for _, input in ipairs(proof.dependencies) do
+        if type(input) ~= "table" or not is_sha256(input.sha256)
+          or current_content_hash(input.path) ~= input.sha256 then return false end
+      end
+      local path_key = require("utils.platform").driver().path_key
+      local excluded = path_key(fs.norm(proof.excluded)):gsub("/+$", "")
+      for _, snapshot in ipairs(proof.publication_directories) do
+        if type(snapshot) ~= "table" or type(snapshot.path) ~= "string"
+          or type(snapshot.realpath) ~= "string" or type(snapshot.entries) ~= "table"
+          or not vim.islist(snapshot.entries) then return false end
+        local physical = vim.uv.fs_realpath(snapshot.path)
+        if not physical or path_key(fs.norm(physical)) ~= path_key(fs.norm(snapshot.realpath)) then return false end
+        local cache_key = snapshot.path .. "\0" .. excluded
+        local actual = graph_directory_views[cache_key]
+        if not actual then
+          actual = {}
+          local scan = vim.uv.fs_scandir(snapshot.path)
+          if not scan then return false end
+          while true do
+            local name = vim.uv.fs_scandir_next(scan)
+            if not name then break end
+            local path = fs.join(snapshot.path, name)
+            local key = path_key(fs.norm(path))
+            if key ~= excluded and key:sub(1, #excluded + 1) ~= excluded .. "/" then
+              local info, lexical = vim.uv.fs_stat(path), vim.uv.fs_lstat(path)
+              if not info or not lexical then return false end
+              local link = lexical.type == "link" and vim.uv.fs_readlink(path) or ""
+              if link == nil then return false end
+              actual[#actual + 1] = { name, info.type == "directory" and "directory" or "file", link }
+            end
+          end
+          table.sort(actual, function(a, b) return a[1] < b[1] end)
+          graph_directory_views[cache_key] = actual
+        end
+        if not vim.deep_equal(actual, snapshot.entries) then return false end
+      end
+      return true
+    end
     local function tier1_receipt(entry, originals, phase_candidates)
       local path, digest = entry.nvim_ue_tier1_receipt, entry.nvim_ue_tier1_receipt_sha256
       if type(path) ~= "string" or path == "" or type(digest) ~= "string" or digest == "" then
@@ -268,11 +311,17 @@ return function(M, core)
       end
       if receipt.tier == 2 then
         if vim.env.NVIM_UE_TIER2 ~= "1" then return nil, "tier2-disabled" end
-        if entry.nvim_ue_tier ~= 2 or receipt.gates.include_resolution_equal ~= true then
+        if entry.nvim_ue_tier ~= 2 or receipt.gates.include_resolution_equal ~= true
+          or receipt.gates.cross_module_definition_conflict ~= true or receipt.gates.graph_superset ~= true then
           return nil, "tier2-receipt-not-accepted"
         end
       elseif entry.nvim_ue_tier == 2 then
         return nil, "tier2-receipt-tier-mismatch"
+      end
+      if receipt.tier == 2 or entry.nvim_ue_graph_superset == true then
+        if receipt.gates.graph_superset ~= true or not graph_inputs_current(receipt.graph_result) then
+          return nil, "batch-graph-proof-stale-or-missing"
+        end
       end
       if entry_key(receipt.candidate) ~= candidate_key then return nil, "tier1-candidate-command-mismatch" end
       if type(receipt.inputs) ~= "table" or not vim.islist(receipt.inputs) or #receipt.inputs == 0 then

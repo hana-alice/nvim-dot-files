@@ -89,6 +89,12 @@ if vim.v.argv then
 end
 if _G.arg and _G.arg[1] and _G.arg[1] ~= "" then
   filter = _G.arg[1]
+  if filter == "--filter" then
+    filter = _G.arg[2]
+    if not filter or filter == "" or filter:sub(1, 1) == "-" then
+      error("--filter requires a spec filename filter")
+    end
+  end
 end
 if not filter then
   local env_filter = vim.env.FILTER

@@ -68,6 +68,7 @@ for _stream in (sys.stdout, sys.stderr):
 # Also importable when the CLI is started with Python's isolated (-I) mode.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cdb_unity_receipt import load_verified_groups
+from cdb_tier_merge import file_definitions
 
 
 # ---- path helpers ----------------------------------------------------------
@@ -159,6 +160,32 @@ def strip_write_only_flags(args):
     return stripped
 
 
+def _source_positions(args, source):
+    """Find source operands, never equal-valued option operands.
+
+    Multiple/unknown source occurrences are deliberately not rewritten: a
+    conservative per-file context is safer than guessing an argv grammar.
+    """
+    values = {'-D', '-U', '-I', '-isystem', '-iquote', '-idirafter', '-F', '-iframework',
+        '-include', '-imacros', '-include-pch', '-include-pth', '-ivfsoverlay', '-vfsoverlay',
+        '-isysroot', '--sysroot', '--gcc-toolchain', '-resource-dir', '-target', '--target',
+        '-arch', '-x', '-Xclang', '-Xpreprocessor', '-Xassembler', '-Xlinker', '-mllvm', '-working-directory',
+        '-o', '-MF', '-MT', '-MQ', '-MJ', '-dependency-file', '-serialize-diagnostics'}
+    wanted = os.path.normcase(str(source).replace('\\', '/'))
+    positions, index, options = [], 1, True
+    while index < len(args):
+        arg = str(args[index])
+        if options and arg == '--':
+            options = False
+        elif options and arg in values:
+            index += 2
+            continue
+        elif os.path.normcase(arg.replace('\\', '/')) == wanted:
+            positions.append(index)
+        index += 1
+    return positions
+
+
 def compile_context_key(entry):
     """Fingerprint every semantic compile input, ignoring per-file writes.
 
@@ -166,11 +193,10 @@ def compile_context_key(entry):
     key exact is intentionally conservative: less compression is acceptable;
     silently combining incompatible macro/include environments is not.
     """
-    source = os.path.normcase(entry.get('file', '').replace('\\', '/'))
-    normalized = []
-    for arg in strip_write_only_flags(entry.get('arguments', [])):
-        candidate = os.path.normcase(str(arg).replace('\\', '/'))
-        normalized.append('<SOURCE>' if candidate == source else arg)
+    normalized = strip_write_only_flags(entry.get('arguments', []))
+    positions = _source_positions(normalized, entry.get('file', ''))
+    if len(positions) == 1:
+        normalized[positions[0]] = '<SOURCE>'
     payload = json.dumps({
         'directory': entry.get('directory', ''),
         'arguments': normalized,
@@ -191,9 +217,19 @@ def _member_stems(members):
     return sources, generated
 
 
+def is_exact_cpp(entry):
+    """Only structured, single-member C/C++ originals; never shader/batch TUs."""
+    source = str(entry.get('file', ''))
+    return (os.path.splitext(source)[1].lower() in ('.c', '.cpp', '.cc', '.cxx', '.c++')
+        and not os.path.basename(source.replace('\\', '/')).startswith('SuperUnity.')
+        and entry.get('nvim_ue_members') == [portable_member_path(source)]
+        and bool(entry.get('nvim_ue_module_root')) and bool(entry.get('arguments'))
+        and not entry.get('nvim_ue_tier') and not entry.get('nvim_ue_background_route'))
+
+
 def secondary_unity_chunks(entries, max_sources=None, max_unities=8,
                            budget_factor=None, diagnostics=None, split_member_classes=True,
-                           avoid_same_stem_pairs=False):
+                           avoid_same_stem_pairs=False, include_exact=True):
     """Plan same-context SuperUnity chunks without modifying original commands.
 
     Each chunk is bounded by budget_factor * UBT's 384 KiB member-source budget.
@@ -219,11 +255,13 @@ def secondary_unity_chunks(entries, max_sources=None, max_unities=8,
         members = entry.get('nvim_ue_members')
         module = entry.get('nvim_ue_module_root')
         name = entry.get('file', '').replace('\\', '/').rsplit('/', 1)[-1]
-        if name.startswith('SuperUnity.UBT.') and members and module:
+        if (name.startswith('SuperUnity.UBT.') or (include_exact and is_exact_cpp(entry))) and members and module:
             generated = [member.lower().endswith('.gen.cpp') for member in members]
             member_class = 'gen' if all(generated) else 'mixed' if any(generated) else 'src'
-            buckets[(module, compile_context_key(entry),
-                     member_class if split_member_classes else None)].append(index)
+            # C and C++ extension inference is semantic even without -x.
+            # Keep it separate even when gen/src class splitting is disabled.
+            category = 'c' if os.path.splitext(entry['file'])[1] == '.c' else (member_class if split_member_classes else None)
+            buckets[(module, compile_context_key(entry), category)].append(index)
 
     def member_bytes(index):
         entry = entries[index]
@@ -232,6 +270,8 @@ def secondary_unity_chunks(entries, max_sources=None, max_unities=8,
             wrapper = os.path.join(winpath_local(entry.get('directory', '')), wrapper)
         member = None
         try:
+            if is_exact_cpp(entry):
+                return os.stat(wrapper).st_size
             with open(wrapper, encoding='utf-8') as source:
                 paths = [match.group(1) for line in source
                          if (match := UNITY_INCLUDE_RE.match(line))]
@@ -349,16 +389,35 @@ def _tier2_entry(entry):
             'members': members, 'prefix': prefix, 'key': key}
 
 
-def tier2_unity_chunks(entries, max_unities=8, budget_factor=8, diagnostics=None):
+def cross_module_definition_conflict(group):
+    owners, conflicts = {}, []
+    for entry in group:
+        module = entry['nvim_ue_module_root']
+        for member in _tier2_entry(entry)['members']:
+            with open(member, encoding='utf-8-sig') as stream:
+                names = file_definitions(stream.read())
+            for name in sorted(names):
+                if name in owners and owners[name] != module:
+                    conflicts.append({'name': name, 'modules': [owners[name], module], 'member': member})
+                owners.setdefault(name, module)
+    return {'ok': not conflicts, 'conflicts': conflicts}
+
+
+def tier2_unity_chunks(entries, max_unities=None, budget_factor=8, diagnostics=None, *,
+                       closure_budget=8000, byte_budget=None, module_closures=None,
+                       module_compile_results=None):
     """Plan whole-module, ordered cross-module candidates without writing files.
 
     Incompatible or oversized complete modules remain available to Tier 1.
     Reading compiler-owned wrappers and member sizes does not grant qualification.
     """
-    if any(not isinstance(value, int) or isinstance(value, bool) or value < 1
-           for value in (max_unities, budget_factor)):
+    values = [budget_factor, closure_budget] + ([max_unities] if max_unities is not None else [])
+    values += [byte_budget] if byte_budget is not None else []
+    if any(type(value) is not int or value < 1 for value in values):
         raise ValueError('Tier 2 budgets must be positive integers')
-    budget = budget_factor * 393216
+    budget = byte_budget if byte_budget is not None else budget_factor * 393216
+    module_closures = module_closures or {}
+    module_compile_results = module_compile_results or {}
     modules = defaultdict(list)
     for index, entry in enumerate(entries):
         if (os.path.basename(entry.get('file', '').replace('\\', '/')).startswith('SuperUnity.UBT.')
@@ -367,31 +426,45 @@ def tier2_unity_chunks(entries, max_unities=8, budget_factor=8, diagnostics=None
     buckets = defaultdict(list)
     for module, indexes in modules.items():
         try:
+            if module_compile_results.get(module) is False:
+                raise ValueError('whole-module-compile-failed')
             infos = [_tier2_entry(entries[index]) for index in indexes]
             if len({compile_context_key(entries[index]) for index in indexes}) != 1:
                 raise ValueError('module has multiple compiler contexts')
             if len({info['key'] for info in infos}) != 1:
                 raise ValueError('module has incompatible Tier 2 contexts')
             size = sum(os.stat(member).st_size for info in infos for member in info['members'])
-            if size > budget or len(indexes) > max_unities:
+            closure = set(module_closures.get(module, []))
+            if size > budget or (max_unities is not None and len(indexes) > max_unities) or len(closure) > closure_budget:
                 raise ValueError('whole module exceeds Tier 2 budget')
-            buckets[infos[0]['key']].append((indexes, size))
+            names = set()
+            for info in infos:
+                for member in info['members']:
+                    with open(member, encoding='utf-8-sig') as stream:
+                        names.update(file_definitions(stream.read()))
+            buckets[infos[0]['key']].append((indexes, size, closure, names))
         except (OSError, UnicodeError, ValueError, KeyError) as error:
             if diagnostics is not None:
                 diagnostics.append({'module': module, 'entry_indexes': indexes, 'reason': str(error)})
     chunks = []
     for modules_in_bucket in buckets.values():
-        chunk, size, module_count = [], 0, 0
-        for indexes, module_size in modules_in_bucket:
-            if chunk and (len(chunk) + len(indexes) > max_unities or size + module_size > budget):
-                if module_count > 1:
-                    chunks.append(sorted(chunk))
-                chunk, size, module_count = [], 0, 0
-            chunk.extend(indexes)
-            size += module_size
-            module_count += 1
-        if module_count > 1:
-            chunks.append(sorted(chunk))
+        bins = []
+        for indexes, module_size, closure, names in modules_in_bucket:
+            for batch in bins:
+                if ((max_unities is None or len(batch['indexes']) + len(indexes) <= max_unities)
+                        and batch['size'] + module_size <= budget
+                        and len(batch['closure'] | closure) <= closure_budget
+                        and not batch['names'].intersection(names)):
+                    break
+            else:
+                batch = {'indexes': [], 'size': 0, 'closure': set(), 'names': set(), 'modules': 0}
+                bins.append(batch)
+            batch['indexes'].extend(indexes)
+            batch['size'] += module_size
+            batch['closure'].update(closure)
+            batch['names'].update(names)
+            batch['modules'] += 1
+        chunks.extend(sorted(batch['indexes']) for batch in bins if batch['modules'] > 1)
     return sorted(chunks, key=lambda chunk: chunk[0])
 
 
@@ -545,7 +618,7 @@ def strict_unity_chunks(entries, max_sources=None, max_unities=8,
         residual = secondary_unity_chunks([entries[index] for index in available],
             max_sources=max_sources, max_unities=max_unities, budget_factor=budget_factor,
             diagnostics=residual_diagnostics, split_member_classes=split_member_classes,
-            avoid_same_stem_pairs=False)
+            avoid_same_stem_pairs=False, include_exact=False)
         for detail in residual_diagnostics:
             detail['entry_index'] = available[detail['entry_index']]
             if diagnostics is not None:
@@ -803,14 +876,11 @@ def compiler_authored_unity_groups(cdb, root, receipts=None):
 
 def rewritten_arguments(entry, new_source):
     args = strip_write_only_flags(list(entry.get('arguments', [])))
-    old_source = os.path.normcase(entry.get('file', '').replace('\\', '/'))
-    replaced = False
-    for index, arg in enumerate(args):
-        normalized = os.path.normcase(str(arg).replace('\\', '/'))
-        if normalized == old_source:
-            args[index] = new_source
-            replaced = True
-    return args if replaced else None
+    positions = _source_positions(args, entry.get('file', ''))
+    if len(positions) != 1:
+        return None
+    args[positions[0]] = new_source
+    return args
 
 
 def rewritten_response_arguments(template, unity_path, rsp_args, new_source):
@@ -818,20 +888,7 @@ def rewritten_response_arguments(template, unity_path, rsp_args, new_source):
     driver = template.get('arguments', [None])[0]
     if not driver:
         return None
-    unity_normalized = os.path.normcase(unity_path.replace('\\', '/'))
-    args = [driver]
-    replaced = False
-    index = 0
-    filtered_rsp_args = strip_write_only_flags(rsp_args)
-    while index < len(filtered_rsp_args):
-        arg = filtered_rsp_args[index]
-        if os.path.normcase(str(arg).replace('\\', '/')) == unity_normalized:
-            args.append(new_source)
-            replaced = True
-        else:
-            args.append(arg)
-        index += 1
-    return args if replaced else None
+    return rewritten_arguments({'file': unity_path, 'arguments': [driver, *rsp_args]}, new_source)
 
 
 # ---- main ------------------------------------------------------------------

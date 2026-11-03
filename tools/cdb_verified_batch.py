@@ -27,14 +27,16 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_hot_super_unity_cdb import (compile_context_key, portable_member_path,
     rewritten_arguments, secondary_unity_chunks, strict_unity_chunks,
-    tier2_unity_chunks, tier2_candidate_spec, tier2_include_gate, _tier2_entry)
+    tier2_unity_chunks, tier2_candidate_spec, tier2_include_gate, _tier2_entry,
+    cross_module_definition_conflict, is_exact_cpp)
+from cdb_tier_merge import graph_superset
 from clangd_batch_admission import compare_graphs
 from clangd_batch_runner import normalize_server_profile, run
 from clangd_index_graph import _record_key, canonical_file_graph, read_shard, decode_shard
 
 _COLLECTOR_FILES = ('cdb_verified_batch.py', 'build_hot_super_unity_cdb.py', 'clangd_index_graph.py',
                     'clangd_batch_runner.py', 'clangd_vfs_aliases.py', 'clangd_query_profile.py',
-                    'clangd_receipt_migration.py')
+                    'clangd_receipt_migration.py', 'cdb_tier_merge.py')
 _POLICY_FILES = ('clangd_batch_admission.py', 'clangd_batch_bindings.py',
                  '../lua/workarounds/clangd/header_path_case.py')
 _HEADER_CASE_PATH = Path(__file__).resolve().parent / _POLICY_FILES[-1]
@@ -381,7 +383,7 @@ def _validate_ubt(entry):
     return members
 
 
-def _inventory(path, excluded):
+def _inventory(path, excluded, publication=None):
     path = Path(path)
     if not path.is_dir():
         return {'exists': False, 'sha256': None}
@@ -410,6 +412,7 @@ def _inventory(path, excluded):
         if is_excluded(physical_key) or physical_key in visited:
             continue
         visited.add(physical_key)
+        direct = []
         with os.scandir(directory) as iterator:
             for item in sorted(iterator, key=lambda item: item.name):
                 if is_excluded(path_key(item.path)):
@@ -418,8 +421,12 @@ def _inventory(path, excluded):
                 is_directory = item.is_dir()
                 link = os.readlink(item.path) if item.is_symlink() else ''
                 records.append((child_relative, 'directory' if is_directory else 'file', link))
+                if publication is not None:
+                    direct.append([item.name, 'directory' if is_directory else 'file', link])
                 if is_directory:
                     pending.append((item.path, child_relative + os.sep, os.path.join(physical, item.name)))
+        if publication is not None:
+            publication.append({'path': directory, 'realpath': physical, 'entries': direct})
     return {'exists': True, 'sha256': _sha(_json(sorted(records)).encode())}
 
 
@@ -1700,6 +1707,17 @@ def _save_group_hints(output, additions):
 
 
 def _tier1_ubt_members(entry):
+    if is_exact_cpp(entry):
+        _owned_overlays(entry)
+        source = (Path(entry['directory']) / entry['file']).resolve(strict=True)
+        if not source.is_file() or rewritten_arguments(entry, '<SOURCE>') is None:
+            raise ValueError('tier1-invalid-exact-source')
+        if any(str(arg).startswith(('@', '--config', '-fmodule', '-fprebuilt-module', '-include-pch', '-include-pth'))
+               for arg in entry['arguments'][1:]):
+            raise ValueError('unsupported-indirect-compiler-input')
+        if any(os.environ.get(name) for name in ('CL', '_CL_', 'CCC_OVERRIDE_OPTIONS')):
+            raise ValueError('unsupported-compiler-option-environment')
+        return [str(source)]
     members = _validate_ubt(entry)
     expected = '// Compiler-authored UBT unity membership; copied into nvim cache.\n' + ''.join(
         '#include "' + path + '"\n' for path in members)
@@ -1737,7 +1755,8 @@ def _tier1_candidate_spec(group, assets, recipe=None):
             '#include "' + path.replace('\\', '/') + '"\n' for path in descriptor['headers'] + members)
         identity_inputs.update(body=body, recipe=descriptor)
     identity = _sha(_json(identity_inputs).encode())
-    wrapper = Path(assets) / ('SuperUnity.Tier1.Batch.' + identity[:24] + '.cpp')
+    suffix = '.c' if all(Path(entry['file']).suffix == '.c' for entry in group) else '.cpp'
+    wrapper = Path(assets) / ('SuperUnity.Tier1.Batch.' + identity[:24] + suffix)
     arguments = rewritten_arguments(group[0], str(wrapper))
     if arguments is None:
         raise ValueError('tier1-source-rewrite-failed')
@@ -1751,11 +1770,13 @@ def _tier1_candidate_spec(group, assets, recipe=None):
         arguments = [value for index, value in enumerate(arguments) if index not in removed]
     candidate = dict(group[0], file=str(wrapper), arguments=arguments,
         nvim_ue_members=[member for entry in group for member in entry['nvim_ue_members']],
-        nvim_ue_tier=1, nvim_ue_tier1_ubt_count=len(group))
+        nvim_ue_tier=1, nvim_ue_tier1_ubt_count=sum(_is_ubt(entry) for entry in group))
     # Tier 1 qualifies only this explicit candidate run. It must never inherit
     # a strict frozen reader's certificate or be discovered by its cache.
     for name in ('nvim_ue_batch_receipt', 'nvim_ue_batch_receipt_sha256', 'nvim_ue_batch_ubt_count'):
         candidate.pop(name, None)
+    if any(is_exact_cpp(entry) for entry in group):
+        candidate['nvim_ue_graph_superset'] = True
     if descriptor is not None:
         candidate['nvim_ue_tier1_recipe'] = descriptor
     return _windows_paths(candidate), body
@@ -1854,6 +1875,8 @@ def _tier1_cache_key(group, candidate, tool_hash, profile, environment, recipe=N
     value = {'original_entries': [_native(entry) for entry in group],
         'candidate': _native(candidate), 'tool_sha256': tool_hash,
         'server_profile': profile, 'compiler_environment': environment}
+    if any(is_exact_cpp(entry) for entry in group):
+        value['graph_policy'] = _code_identities()
     if recipe is not None:
         value['recipe'] = _tier1_recipe(group, recipe)
     if fallback_of is not None:
@@ -1916,8 +1939,11 @@ def _tier1_cached(group, candidate, body, output, key, inputs, tool_hash, profil
             raise ValueError('tier1-cache-receipt-identity-mismatch')
         if receipt.get('inputs') != inputs:
             raise ValueError('tier1-cache-inputs-changed')
+        if receipt['accepted'] and any(is_exact_cpp(entry) for entry in group):
+            if receipt.get('gates', {}).get('graph_superset') is not True or not _merge_graph_current(receipt.get('graph_result')):
+                raise ValueError('tier1-exact-graph-stale')
         if (not receipt['accepted'] and not _tier1_compile_rejection(receipt.get('compile_result'))
-                and not _tier1_split_rejection(receipt)):
+                and not _tier1_split_rejection(receipt) and not _merge_graph_rejection(receipt)):
             raise ValueError('tier1-cache-rejection-inconclusive')
         if receipt.get('candidate_sha256') != _sha(body.encode('utf-8')):
             raise ValueError('tier1-cache-candidate-hash-mismatch')
@@ -2031,7 +2057,8 @@ def _accelerate_tier1(entries, output_dir, clangd_path, max_group=8, timeout=90,
     for chunk, fallback_of in pending:
         group = [entries[index] for index in chunk]
         gates = {'compile_success': False, 'main_shards_complete': False, 'members_equal': False}
-        record = {'tier': 1, 'original_indexes': chunk, 'original_ubt_count': len(chunk),
+        record = {'tier': 1, 'original_indexes': chunk, 'original_ubt_count': sum(_is_ubt(entry) for entry in group),
+            'original_exact_count': sum(is_exact_cpp(entry) for entry in group),
             'accepted': False, 'gates': gates, 'run_metrics': [], 'cached': False, 'deferred': False}
         recipe_options = {'recipe': recipe} if recipe is not None else {}
         if recipe_options:
@@ -2040,6 +2067,9 @@ def _accelerate_tier1(entries, output_dir, clangd_path, max_group=8, timeout=90,
         if fallback_of is not None:
             record['fallback_of'] = fallback_of
         inputs, candidate, result, cache_key, cached, body = [], None, None, None, None, None
+        graph_result = None
+        if any(is_exact_cpp(entry) for entry in group):
+            gates['graph_superset'] = False
         group_started = time.monotonic()
         try:
             if profile_error:
@@ -2070,6 +2100,10 @@ def _accelerate_tier1(entries, output_dir, clangd_path, max_group=8, timeout=90,
                     invocation = Path(tempfile.mkdtemp(prefix='tier1-', dir=work))
                     metrics['proof_directory'] = str(invocation)
                 run_name = ('fallback-' if fallback_of is not None else 'group-') + str(chunk[0])
+                baselines = None
+                if any(is_exact_cpp(entry) for entry in group):
+                    baselines = [_merge_original_graph([entry], output, str(executable.resolve()), timeout,
+                        profile, exact=is_exact_cpp(entry)) for entry in group]
                 result = _tier1_candidate_index(candidate, invocation / run_name,
                     str(executable.resolve()), timeout, server_profile=profile)
                 record['run_metrics'] = [{key: result.get(key) for key in _RUN_METRIC_FIELDS}]
@@ -2082,6 +2116,12 @@ def _accelerate_tier1(entries, output_dir, clangd_path, max_group=8, timeout=90,
                     and not record['missing_member_main_shards'])
                 if not gates['main_shards_complete']:
                     raise ValueError('tier1-main-shards-missing')
+                if any(is_exact_cpp(entry) for entry in group):
+                    graph_result = _tier1_exact_graph_gate(group, candidate, result, output,
+                        invocation / run_name, str(executable.resolve()), timeout, profile, baselines=baselines)
+                    gates['graph_superset'] = graph_result.get('ok') is True
+                    if not gates['graph_superset']:
+                        raise ValueError('tier1-exact-graph-rejected: ' + graph_result.get('reason', 'unknown'))
                 # Recheck actual wrapper and source inputs after the private run.
                 _tier1_postcheck(group, candidate, inputs, environment, profile, gates, **recipe_options)
                 record.update(accepted=True, reason='tier1-compile-shards-members-accepted')
@@ -2098,9 +2138,11 @@ def _accelerate_tier1(entries, output_dir, clangd_path, max_group=8, timeout=90,
                 receipt_path, receipt_digest = Path(cached['receipt']), cached['receipt_sha256']
             elif not reuse_only:
                 receipt = {'schema': 1, 'tier': 1,
-                'reusable': record['accepted'] or _tier1_compile_rejection(result), 'cache_key': cache_key,
+                'reusable': record['accepted'] or _tier1_compile_rejection(result)
+                    or _merge_graph_rejection({'graph_result': graph_result}), 'cache_key': cache_key,
                 'accepted': record['accepted'],
                 'reason': record['reason'], 'gates': dict(gates), 'inputs': inputs,
+                'graph_result': graph_result,
                 'compile_result': {name: result.get(name) for name in
                     ('indexing_complete', 'exit_code', 'compile_failure_count', 'shard_had_errors')}
                     if result is not None else None,
@@ -2125,7 +2167,7 @@ def _accelerate_tier1(entries, output_dir, clangd_path, max_group=8, timeout=90,
             replacements[min(chunk)] = dict(sorted(candidate.items()))
             consumed.update(index for index in chunk if index != min(chunk))
             metrics['batch_count'] += 1
-            metrics['accepted_ubt_count'] += len(chunk)
+            metrics['accepted_ubt_count'] += sum(_is_ubt(entry) for entry in group)
         record['proof_seconds'] = round(time.monotonic() - group_started, 6)
         metrics['groups'].append(record)
         if split_retry and _tier1_gate_failed(record['reason']):
@@ -2147,6 +2189,8 @@ def _accelerate_tier1(entries, output_dir, clangd_path, max_group=8, timeout=90,
         output_member_count=sum(_tier1_source_coverage(background).values()),
         coverage_complete=original_coverage == _tier1_source_coverage(background),
         retained_ubt_count=metrics['original_ubt_count'] - metrics['accepted_ubt_count'],
+        accepted_exact_count=sum(sum(is_exact_cpp(entries[i]) for i in record['original_indexes'])
+            for record in metrics['groups'] if record['accepted']),
         new_batch_count=sum(record['accepted'] and not record['cached'] for record in metrics['groups']),
         new_proof_count=sum(not record['cached'] and not record['deferred'] for record in metrics['groups']),
         deferred_group_count=sum(record['deferred'] for record in metrics['groups']),
@@ -2159,6 +2203,268 @@ def _accelerate_tier1(entries, output_dir, clangd_path, max_group=8, timeout=90,
     return background, metrics
 
 
+def _merge_graph_rejection(receipt):
+    proof = receipt.get('graph_result')
+    return (isinstance(proof, dict) and proof.get('ok') is False
+        and type(proof.get('violation_count')) is int and proof['violation_count'] > 0
+        and _merge_graph_current(proof, accepted=False))
+
+
+def _merge_graph_current(proof, *, accepted=True):
+    """A conclusive graph verdict binds the same dependency/lookup bytes."""
+    if not isinstance(proof, dict) or proof.get('ok') is not accepted:
+        return False
+    try:
+        if any(_sha(Path(item['path']).read_bytes()) != item['sha256']
+               for item in proof['dependencies']):
+            return False
+        return all(_inventory(path, proof['excluded']) == value
+                   for path, value in proof.get('inventories', {}).items())
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def _merge_original_current(saved, identity):
+    return (isinstance(saved, dict) and isinstance(saved.get('graph'), dict)
+        and isinstance(saved.get('gates'), dict) and saved.get('identity') == identity
+        and saved.get('graph_sha256') == _sha(_json(saved['graph']).encode())
+        and all(saved.get('gates', {}).get(name) is True for name in
+                ('compile_success', 'main_shards_complete', 'members_equal'))
+        and _merge_graph_current(saved))
+
+
+def _merge_original_identity(group, clangd, profile):
+    return {'entries': [_native(e) for e in group], 'inputs': _tier1_inputs(group),
+        'tool': _sha(Path(clangd).read_bytes()), 'profile': profile,
+        'environment': _compiler_environment(profile), 'policy': _code_identities()}
+
+
+def tier2_planning_state(entries, store, clangd, profile=None):
+    """Read-only current module results/closures; never synthesize qualification.
+
+    Known completed Tier 1 compile failures are excluded BEFORE cross-module
+    packing. Missing/stale evidence is unknown, and must be privately compiled.
+    """
+    modules = collections.defaultdict(list)
+    for entry in entries:
+        if _is_ubt(entry):
+            modules[entry['nvim_ue_module_root']].append(entry)
+    results, closures = {}, {}
+    executable = Path(shutil.which(str(clangd)) or clangd or '')
+    if not executable.is_file():
+        return {'module_compile_results': results, 'module_closures': closures}
+    profile = normalize_server_profile(profile)
+    for module, group in modules.items():
+        try:
+            if len({compile_context_key(entry) for entry in group}) != 1:
+                continue
+            identity = _merge_original_identity(group, executable, profile)
+            candidate, body = _tier1_candidate_spec(group, Path(store) / 'tier1/assets')
+            key = _tier1_cache_key(group, candidate, identity['tool'], profile, identity['environment'])
+            cached, _ = _tier1_cached(group, candidate, body, Path(store) / 'tier1', key,
+                identity['inputs'], identity['tool'], profile, identity['environment'])
+            if cached and cached['gates'].get('compile_success') is False:
+                results[module] = False
+            graph_path = Path(store) / 'tier2/module-graphs' / (_sha(_json(identity).encode()) + '.json')
+            saved = json.loads(graph_path.read_bytes())
+            if _merge_original_current(saved, identity):
+                results[module] = True
+                closures[module] = set(saved['graph']) - {Path(saved['original_file']).as_uri()}
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return {'module_compile_results': results, 'module_closures': closures}
+
+
+def _merge_original_graph(group, output, clangd, timeout, profile, *, exact=False):
+    """Cache a REAL independent module Tier 1 (or exact TU) index.
+
+    A cache miss uses the ordinary private runner, never a shared live cache.
+    Whole-module success has the same compile/main/member gates as Tier 1;
+    existing conclusive Tier 1 rejection is consulted before another run.
+    """
+    identity = _merge_original_identity(group, clangd, profile)
+    tool_hash, inputs = identity['tool'], identity['inputs']
+    key = _sha(_json(identity).encode())
+    cache = Path(output) / 'module-graphs' / (key + '.json')
+    try:
+        saved = json.loads(cache.read_bytes())
+        if _merge_original_current(saved, identity):
+            return saved
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    if exact:
+        original, body = group[0], None
+    else:
+        original, body = _tier1_candidate_spec(group, Path(output).parent / 'tier1' / 'assets')
+        environment = _compiler_environment(profile)
+        tier1_key = _tier1_cache_key(group, original, tool_hash, profile, environment)
+        previous, _ = _tier1_cached(group, original, body, Path(output).parent / 'tier1',
+            tier1_key, inputs, tool_hash, profile, environment)
+        if previous and not previous['accepted']:
+            raise ValueError('tier2-whole-module-compile-failed')
+        _write(original['file'], body)
+    work = _proof_work_root(output)
+    work.mkdir(parents=True, exist_ok=True)
+    directory = Path(tempfile.mkdtemp(prefix='module-', dir=work))
+    try:
+        graph, result, _ = _index([original], directory, clangd, timeout, profile)
+    except ValueError as error:
+        # Only native completed compiler failures become ordinary Tier 1
+        # negative receipts. Timeouts/partial/process failures are never cached.
+        try:
+            result = json.loads((directory / 'run/run.json').read_bytes())
+            if str(error).startswith('private-index-had-errors: '):
+                result['shard_had_errors'] = True
+            if (not exact and _tier1_compile_rejection(result)
+                    and _tier1_inputs(group) == inputs
+                    and _compiler_environment(profile) == identity['environment']
+                    and _sha(Path(clangd).read_bytes()) == tool_hash):
+                _merge_module_receipt(group, original, body, Path(output).parent / 'tier1',
+                    identity, result, accepted=False)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        raise
+    expected = [path for entry in group for path in _tier1_ubt_members(entry)]
+    if not all(Path(path).as_uri() in graph for path in expected):
+        raise ValueError('tier2-whole-module-main-shards-missing')
+    if not exact and not _tier1_members_match(group, original)[0]:
+        raise ValueError('tier2-whole-module-members-mismatch')
+    # Preserve full graph bytes independently of candidate and live caches.
+    excluded = str(Path(output).parent.resolve())
+    dependencies = [{'path': str(_uri_path(uri)), 'sha256': _sha(_uri_path(uri).read_bytes())}
+                    for uri in graph]
+    dependencies.extend(inputs)
+    roots = _include_roots(group, [{'uri': uri} for uri in graph])
+    publication = []
+    inventories = {path: _inventory(path, excluded, publication) for path in roots}
+    saved = {'ok': True, 'identity': identity, 'graph': graph, 'graph_sha256': _sha(_json(graph).encode()),
+        'original_file': original['file'], 'exact': exact, 'dependencies': dependencies,
+        'inventories': inventories, 'excluded': excluded, 'publication_directories': publication,
+        'gates': dict(compile_success=True, main_shards_complete=True, members_equal=True),
+        'run_metrics': {name: result.get(name) for name in _RUN_METRIC_FIELDS}}
+    if _tier1_inputs(group) != inputs or not _merge_graph_current(saved):
+        raise ValueError('tier2-module-inputs-changed')
+    if not exact:
+        _merge_module_receipt(group, original, body, Path(output).parent / 'tier1', identity, result, accepted=True)
+    _write(cache, _json(saved))
+    saved['cache_path'] = str(cache)
+    return saved
+
+
+def _merge_module_receipt(group, candidate, body, output, identity, result, *, accepted):
+    key = _tier1_cache_key(group, candidate, identity['tool'], identity['profile'], identity['environment'])
+    receipt = dict(schema=1, tier=1, reusable=True, accepted=accepted, cache_key=key,
+        reason='tier1-compile-shards-members-accepted' if accepted else 'tier1-candidate-index-failed',
+        gates=dict(compile_success=accepted, main_shards_complete=accepted, members_equal=True),
+        inputs=identity['inputs'], original_entries=[_native(e) for e in group], candidate=_native(candidate),
+        candidate_sha256=_sha(body.encode()), members=candidate['nvim_ue_members'],
+        tool_sha256=identity['tool'], server_profile=identity['profile'], compiler_environment=identity['environment'],
+        compile_result={name: result.get(name) for name in
+            ('indexing_complete', 'exit_code', 'compile_failure_count', 'shard_had_errors')})
+    _tier1_write_receipt(output, receipt, {})
+
+
+def _tier2_baselines(group, output, clangd, timeout, profile):
+    modules = collections.defaultdict(list)
+    for entry in group:
+        modules[entry['nvim_ue_module_root']].append(entry)
+    return [_merge_original_graph(entries, output, clangd, timeout, profile)
+            for entries in modules.values()]
+
+
+def _merge_macro_sites(graphs):
+    """Only byte-identical #define lines in actual Definitions.*.h files."""
+    sites, lines = collections.defaultdict(set), {}
+    for graph in graphs:
+        for record in graph.values():
+            for ref in record['refs']:
+                location = ref['location']
+                if '/Definitions.' not in location['uri']:
+                    continue
+                path = _uri_path(location['uri'])
+                if not path.name.startswith('Definitions.') or path.suffix != '.h':
+                    continue
+                if path not in lines:
+                    lines[path] = path.read_bytes().splitlines()
+                line = location['start'][0]
+                if line < len(lines[path]):
+                    text = lines[path][line]
+                    if re.match(rb'^\s*#\s*define\s', text):
+                        sites[ref['symbol_id']].add(text)
+    return sites
+
+
+def _merge_graph_verdict(baselines, candidate, result, directory, extra_ignored=(), closure_budget=None):
+    graph = _graph_result(result, Path(directory) / 'trigger.cpp')
+    ignored = {Path(candidate['file']).as_uri(), *extra_ignored,
+               *(Path(item['original_file']).as_uri() for item in baselines if not item.get('exact'))}
+    original_graphs = [item['graph'] for item in baselines]
+    verdict = graph_superset(original_graphs, graph, ignore_files=ignored,
+        macro_sites=_merge_macro_sites(original_graphs + [graph]))
+    closure = set(graph) - ignored
+    if closure_budget is not None and len(closure) > closure_budget:
+        verdict.update(ok=False, reason='closure-budget-exceeded')
+    dependencies, inventories, publication = {}, {}, {}
+    excluded = baselines[0]['excluded'] if baselines else ''
+    for item in baselines:
+        if not _merge_graph_current(item):
+            verdict.update(ok=False, reason='baseline-inputs-changed')
+        for dependency in item['dependencies']:
+            previous = dependencies.setdefault(dependency['path'], dependency)
+            if previous != dependency:
+                verdict.update(ok=False, reason='baseline-dependencies-disagree')
+        for snapshot in item['publication_directories']:
+            path = snapshot['path']
+            if path in publication and publication[path] != snapshot:
+                verdict.update(ok=False, reason='baseline-directory-snapshots-disagree')
+            publication[path] = snapshot
+        for path, value in item['inventories'].items():
+            if path in inventories and inventories[path] != value:
+                verdict.update(ok=False, reason='baseline-lookups-disagree')
+            inventories[path] = value
+    # Candidate-only dependencies must be bound too, even on a rejected graph.
+    for uri in graph:
+        path = str(_uri_path(uri))
+        dependency = {'path': path, 'sha256': _sha(Path(path).read_bytes())}
+        if path in dependencies and dependencies[path] != dependency:
+            verdict.update(ok=False, reason='candidate-dependencies-changed')
+        dependencies[path] = dependency
+    verdict.update(dependencies=list(dependencies.values()), inventories=inventories, excluded=excluded,
+        publication_directories=[publication[path] for path in sorted(publication)],
+        evidence=[{'original_file': item['original_file'], 'gates': item['gates']} for item in baselines])
+    return verdict
+
+
+def _tier2_graph_gate(group, candidate, result, output, directory, clangd, timeout, profile,
+                      closure_budget=8000, baselines=None):
+    baselines = baselines if baselines is not None else _tier2_baselines(group, output, clangd, timeout, profile)
+    return _merge_graph_verdict(baselines, candidate, result, directory,
+        [Path(entry['file']).as_uri() for entry in group], closure_budget)
+
+
+def _tier1_exact_graph_gate(group, candidate, result, output, directory, clangd, timeout, profile,
+                            baselines=None):
+    baselines = baselines if baselines is not None else [
+        _merge_original_graph([entry], output, clangd, timeout, profile, exact=is_exact_cpp(entry)) for entry in group]
+    # Exact sources change from main to included; only IsTU is a role change.
+    # Compare the actual source records after clearing this single role bit.
+    # Copy only the touched records (baselines are 100+ MB each and cached).
+    exact_uris = {Path(entry['file']).as_uri() for entry in group if is_exact_cpp(entry)}
+    adjusted = []
+    for item in baselines:
+        graph = item['graph']
+        touched = exact_uris.intersection(graph)
+        if touched:
+            graph = dict(graph)
+            for uri in touched:
+                record = dict(graph[uri])
+                record['source'] = dict(record['source'], flags=record['source']['flags'] & ~1)
+                graph[uri] = record
+            item = dict(item, graph=graph)
+        adjusted.append(item)
+    return _merge_graph_verdict(adjusted, candidate, result, directory)
+
+
 def tier2_enabled():
     value = os.environ.get('NVIM_UE_TIER2', '0')
     if value not in ('0', '1'):
@@ -2167,10 +2473,15 @@ def tier2_enabled():
 
 
 def tier2_grouping_options(max_unities=8, budget_factor=None):
-    """Resolve the same environment budget as ordinary Tier 1 planning."""
-    if budget_factor is None:
-        budget_factor = int(os.environ.get('NVIM_UE_SUPER_UNITY_BUDGET_FACTOR', '8'))
-    return {'max_unities': max_unities, 'budget_factor': budget_factor}
+    """Whole modules use independent configurable closure/byte budgets.
+
+    max_unities/budget_factor remain Tier 1 fallback budgets, not Tier 2 limits.
+    """
+    return {'max_unities': int(os.environ['NVIM_UE_TIER2_MAX_UNITIES'])
+                if 'NVIM_UE_TIER2_MAX_UNITIES' in os.environ else None,
+        'budget_factor': 8,
+        'byte_budget': int(os.environ.get('NVIM_UE_TIER2_BYTE_BUDGET', str(3 * 1024 * 1024))),
+        'closure_budget': int(os.environ.get('NVIM_UE_TIER2_CLOSURE_BUDGET', '8000'))}
 
 
 def _tier2_candidate(group, assets):
@@ -2219,14 +2530,15 @@ def _tier2_include_tool(clangd):
     return path, _sha(path.read_bytes())
 
 
-_TIER2_GATES = ('include_resolution_equal', 'compile_success', 'main_shards_complete', 'members_equal')
+_TIER2_GATES = ('include_resolution_equal', 'compile_success', 'main_shards_complete', 'members_equal',
+                'cross_module_definition_conflict', 'graph_superset')
 
 
 def _tier2_reusable_rejection(receipt):
     include = receipt.get('include_result')
     return (isinstance(include, dict) and include.get('ok') is False
         and include.get('reason') == 'dependency-set-mismatch'
-        or _tier1_compile_rejection(receipt.get('compile_result')))
+        or _tier1_compile_rejection(receipt.get('compile_result')) or _merge_graph_rejection(receipt))
 
 
 def _tier2_cached(output, identity, candidate, body):
@@ -2254,6 +2566,8 @@ def _tier2_cached(output, identity, candidate, body):
                     receipt['gates'].get(name) is True for name in _TIER2_GATES))
                 or (not receipt['accepted'] and not _tier2_reusable_rejection(receipt))):
             raise ValueError('tier2-cache-receipt-identity-mismatch')
+        if receipt['accepted'] and not _merge_graph_current(receipt.get('graph_result')):
+            raise ValueError('tier2-cache-graph-stale')
         if Path(candidate['file']).read_bytes() != body.encode('utf-8'):
             raise ValueError('tier2-cache-candidate-changed')
         return {'receipt': str(path), 'receipt_sha256': digest,
@@ -2289,7 +2603,8 @@ def _accelerate_tier2(entries, output_dir, clangd_path, max_group=8, timeout=90,
     output = Path(output_dir).resolve() / 'tier2'
     diagnostics = []
     packing = tier2_grouping_options(max_unities=max_group, budget_factor=budget_factor)
-    chunks = tier2_unity_chunks(entries, **packing, diagnostics=diagnostics)
+    planning_state = tier2_planning_state(entries, Path(output_dir).resolve(), clangd_path, server_profile)
+    chunks = tier2_unity_chunks(entries, **packing, **planning_state, diagnostics=diagnostics)
     records, replacements, consumed = [], {}, set()
     resolved = shutil.which(str(clangd_path)) if clangd_path else None
     executable = Path(resolved or clangd_path or '')
@@ -2311,18 +2626,22 @@ def _accelerate_tier2(entries, output_dir, clangd_path, max_group=8, timeout=90,
         record = {'tier': 2, 'original_indexes': chunk, 'original_ubt_count': len(chunk),
             'accepted': False, 'gates': gates, 'run_metrics': [], 'cached': False, 'deferred': False}
         candidate, body, identity, cached, result, key = None, None, None, None, None, None
-        include_result = None
+        include_result, graph_result = None, None
         group_started = time.monotonic()
         try:
             if setup_error:
                 raise ValueError(setup_error)
+            conflicts = cross_module_definition_conflict(group)
+            gates['cross_module_definition_conflict'] = conflicts['ok']
+            if not conflicts['ok']:
+                raise ValueError('tier2-cross-module-definition-conflict')
             inputs = _tier2_inputs(group)
             candidate, body = _tier2_candidate(group, output / 'assets')
             identity = {'original_entries': [_native(entry) for entry in group],
                 'candidate': _native(candidate), 'candidate_sha256': _sha(body.encode('utf-8')),
                 'inputs': inputs, 'tool_sha256': tool_hash, 'include_tool': str(include_tool),
                 'include_tool_sha256': include_hash, 'server_profile': profile,
-                'compiler_environment': environment}
+                'compiler_environment': environment, 'merge_policy': _code_identities()}
             key = _sha(_json(identity).encode())
             record['cache_key'] = key
             cached, record['cache_reason'] = _tier2_cached(output, identity, candidate, body)
@@ -2340,8 +2659,10 @@ def _accelerate_tier2(entries, output_dir, clangd_path, max_group=8, timeout=90,
                 # A conclusive include rejection also binds an actual asset;
                 # reuse validates its complete bytes without recreating it.
                 _write(candidate['file'], body)
+                # Whole-module preprocessing of several real modules exceeds 10 s;
+                # a timeout is a non-conclusive rejection, so use the run budget.
                 include_result = tier2_include_gate(group, group_work / 'includes',
-                    str(include_tool), timeout=min(timeout, 10))
+                    str(include_tool), timeout=timeout)
                 record['include_gate'] = include_result
                 gates['include_resolution_equal'] = include_result.get('ok') is True
                 if not gates['include_resolution_equal']:
@@ -2349,6 +2670,10 @@ def _accelerate_tier2(entries, output_dir, clangd_path, max_group=8, timeout=90,
                 gates['members_equal'], expected = _tier2_members_match(group, candidate, body)
                 if not gates['members_equal']:
                     raise ValueError('tier2-membership-mismatch')
+                baselines = _tier2_baselines(group, output, str(executable.resolve()), timeout, profile)
+                closure = set().union(*(set(item['graph']) - {Path(item['original_file']).as_uri()} for item in baselines))
+                if len(closure) > packing['closure_budget']:
+                    raise ValueError('tier2-closure-budget-exceeded')
                 result = _tier1_candidate_index(candidate, group_work / 'index',
                     str(executable.resolve()), timeout, server_profile=profile)
                 record['run_metrics'] = [{name: result.get(name) for name in _RUN_METRIC_FIELDS}]
@@ -2361,6 +2686,12 @@ def _accelerate_tier2(entries, output_dir, clangd_path, max_group=8, timeout=90,
                     and not record['missing_member_main_shards'])
                 if not gates['main_shards_complete']:
                     raise ValueError('tier2-main-shards-missing')
+                graph_result = _tier2_graph_gate(group, candidate, result, output, group_work / 'index',
+                    str(executable.resolve()), timeout, profile, packing['closure_budget'], baselines=baselines)
+                record['graph_gate'] = graph_result
+                gates['graph_superset'] = graph_result.get('ok') is True
+                if not gates['graph_superset']:
+                    raise ValueError('tier2-graph-superset-rejected: ' + graph_result.get('reason', 'unknown'))
                 gates['members_equal'], _ = _tier2_members_match(group, candidate, body)
                 if not gates['members_equal']:
                     raise ValueError('tier2-membership-mismatch')
@@ -2380,6 +2711,7 @@ def _accelerate_tier2(entries, output_dir, clangd_path, max_group=8, timeout=90,
                 receipt = dict(identity or {}, schema=1, tier=2, cache_key=key,
                     accepted=record['accepted'], reusable=record['accepted'], reason=record['reason'],
                     gates=dict(gates), members=candidate.get('nvim_ue_members', []) if candidate else [],
+                    graph_result=graph_result,
                     include_result={name: include_result.get(name) for name in
                         ('ok', 'reason', 'only_tier1', 'only_tier2')} if include_result is not None else None,
                     compile_result={name: result.get(name) for name in
@@ -2400,7 +2732,7 @@ def _accelerate_tier2(entries, output_dir, clangd_path, max_group=8, timeout=90,
     residual_indexes = [index for index in range(len(entries)) if index not in consumed]
     residual = [entries[index] for index in residual_indexes]
     fallback, metrics = _accelerate_tier1(residual, output_dir, clangd_path, max_group,
-        timeout, packing['budget_factor'], server_profile, reuse_only=reuse_only)
+        timeout, budget_factor, server_profile, reuse_only=reuse_only)
     # Rebase the residual Tier 1 proof records and attach each replacement to its
     # first original owner. This preserves CDB order across both tiers.
     by_receipt = {entry.get('nvim_ue_tier1_receipt'): entry for entry in fallback

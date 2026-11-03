@@ -36,6 +36,10 @@ with tempfile.TemporaryDirectory(prefix='tier2_verified_') as temporary:
             'member_main_shards':[] if bad and operation=='missing_shards' else expected,
             'missing_main_shards':[],'cpu_seconds':1.0}
     def gate(*args,**kwargs):
+        # Real whole-module preprocessing of several modules takes tens of
+        # seconds; the include gate must get the caller's budget, not 10 s.
+        if operation=='include_budget':
+            assert kwargs.get('timeout')==300,kwargs
         if operation=='cache_store':
             assert '/.cache/nvim-ue/' not in str(args[1]).replace('\\','/').lower(),args
         rejected=operation in ('include_failure','negative_reuse','timeout_uncached')
@@ -59,8 +63,10 @@ with tempfile.TemporaryDirectory(prefix='tier2_verified_') as temporary:
     else:
         os.environ['NVIM_UE_TIER2']='1'
         with patch.object(v,'_tier1_candidate_index',side_effect=index),patch.object(v,'tier2_include_gate',side_effect=gate),\
+             patch.object(v,'_tier2_baselines',return_value=[]),\
+             patch.object(v,'_tier2_graph_gate',return_value=dict(ok=True,dependencies=[],inventories={},excluded=str(root))),\
              patch.object(v,'_proof_work_root',return_value=root/'private-tier1-work'):
-            output,metrics=v.accelerate_tier2(entries,out,str(tool),timeout=10)
+            output,metrics=v.accelerate_tier2(entries,out,str(tool),timeout=300 if operation=='include_budget' else 10)
             assert entries==before
             assert v._tier1_source_coverage(output)==v._tier1_source_coverage(entries)
             assert metrics['coverage_complete']
@@ -121,7 +127,7 @@ local function run(operation)
 end
 
 t.describe("Tier 2 private qualification and fallback", function()
-  for _, operation in ipairs({ "environment", "success", "include_failure", "compile_failure",
+  for _, operation in ipairs({ "environment", "success", "include_budget", "include_failure", "compile_failure",
     "missing_shards", "reuse", "definitions_invalidate", "default_off", "negative_reuse", "timeout_uncached",
     "cache_store" }) do
     t.it(operation, function() run(operation) end)

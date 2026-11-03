@@ -79,13 +79,13 @@ def _group_packing(mode, packing=None):
     return dict(packing)
 
 
-def _chunks(entries, mode, packing=None):
+def _chunks(entries, mode, packing=None, *, planning_state=None):
     limits = _group_packing(mode, packing)
     if mode == 'strict':
         return strict_unity_chunks(entries, max_sources=80, max_unities=8)
     options = dict(max_unities=limits.get('max_unities', 8), budget_factor=limits.get('budget_factor'))
     if verified.tier2_enabled():
-        cross = tier2_unity_chunks(entries, **verified.tier2_grouping_options(**options))
+        cross = tier2_unity_chunks(entries, **verified.tier2_grouping_options(**options), **(planning_state or {}))
         claimed = {index for chunk in cross for index in chunk}
         remaining = [index for index in range(len(entries)) if index not in claimed]
         local = secondary_unity_chunks([entries[index] for index in remaining],
@@ -214,6 +214,8 @@ def _tier1_receipt(entries, candidate, recipe=None):
                 or receipt.get('original_entries') != [verified._native(entry) for entry in entries]
                 or receipt.get('candidate') != verified._native(candidate)
                 or not all(receipt.get('gates', {}).get(name) is True for name in verified._TIER2_GATES)
+                or not verified._merge_graph_current(receipt.get('graph_result'))
+                or receipt.get('merge_policy') != verified._code_identities()
                 or receipt.get('inputs') != verified._tier2_inputs(entries)
                 or len(members) != len(set(members))
                 or receipt.get('members') != candidate.get('nvim_ue_members')
@@ -221,6 +223,10 @@ def _tier1_receipt(entries, candidate, recipe=None):
             raise ValueError('background-proof-tier2-receipt-mismatch')
         return
     descriptor = verified._tier1_recipe(entries, recipe)
+    if any(verified.is_exact_cpp(entry) for entry in entries):
+        if (receipt.get('gates', {}).get('graph_superset') is not True
+                or not verified._merge_graph_current(receipt.get('graph_result'))):
+            raise ValueError('background-proof-exact-graph-mismatch')
     if (receipt.get('schema') != 1 or receipt.get('tier') != 1
             or receipt.get('accepted') is not True or receipt.get('reusable') is not True
             or receipt.get('original_entries') != [verified._native(entry) for entry in entries]
@@ -245,7 +251,8 @@ def _replacements(entries, output, metrics, mode=None):
                 for index in indexes) or len(set(indexes)) != len(indexes)
                 or claimed.intersection(indexes)):
             raise ValueError('background-proof-invalid-admitted-group')
-        if not all(verified._is_ubt(entries[index]) for index in indexes):
+        if not all(verified._is_ubt(entries[index]) or ((mode or _mode()) == '1'
+                and verified.is_exact_cpp(entries[index])) for index in indexes):
             raise ValueError('background-proof-non-ubt-replacement')
         anchor = min(indexes)
         anchors[anchor] = indexes
@@ -300,10 +307,11 @@ def _catalog(store, mode=None, strict_recipe=None):
 
 
 def _tuple_key(entry):
-    if not verified._is_ubt(entry):
+    if not (verified._is_ubt(entry) or verified.is_exact_cpp(entry)):
         return None
     generated = [member.lower().endswith('.gen.cpp') for member in entry['nvim_ue_members']]
     return (entry['nvim_ue_module_root'], verified.compile_context_key(entry),
+        'c' if str(entry['file']).endswith('.c') else
         'gen' if all(generated) else 'mixed' if any(generated) else 'src')
 
 
@@ -533,13 +541,15 @@ def _validate_schedule(plan, entries):
         raise ValueError('background-proof-invalid-schedule-atoms')
     atom_members = set()
     for indexes in ordinary:
-        if (not isinstance(indexes, list) or not 2 <= len(indexes) <= 8
+        if (not isinstance(indexes, list) or not 2 <= len(indexes) <= len(entries)
                 or any(type(index) is not int or not 0 <= index < len(entries) for index in indexes)
                 or len(set(indexes)) != len(indexes) or atom_members.intersection(indexes)):
             raise ValueError('background-proof-invalid-schedule-atoms')
         if len({entries[index]['nvim_ue_module_root'] for index in indexes}) == 1:
             # These are ordinary packing atoms, which share the actual Tier 1
             # class policy. Large upgrades below retain their same-class gate.
+            if len(indexes) > 8:
+                raise ValueError('background-proof-invalid-schedule-atoms')
             _upgrade_sequence(entries, indexes, ordinary_sequences, split_member_classes=ordinary_split)
         elif not (verified.tier2_enabled() and tier2_unity_chunks(
                 [entries[index] for index in indexes], **verified.tier2_grouping_options())
@@ -725,8 +735,11 @@ def _render_selection(entries, replacements, records):
 
 def _merge_metrics(entries, legacy, replacements, claimed, records):
     result = {key: legacy[key] for key in ('original_ubt_count', 'exact_count', 'shader_count', 'other_count')}
-    result.update(batch_count=len(replacements), accepted_ubt_count=len(claimed),
-        retained_ubt_count=legacy['original_ubt_count'] - len(claimed),
+    accepted_ubt = sum(verified._is_ubt(entries[index]) for index in claimed)
+    accepted_exact = sum(verified.is_exact_cpp(entries[index]) for index in claimed)
+    result.update(batch_count=len(replacements), accepted_ubt_count=accepted_ubt,
+        accepted_exact_count=accepted_exact,
+        retained_ubt_count=legacy['original_ubt_count'] - accepted_ubt,
         output_entries=len(entries) - len(claimed) + len(replacements), groups=records,
         cache_hits=sum(bool(record.get('cached')) for record in records),
         deferred_group_count=sum(bool(record.get('deferred')) for record in records),
@@ -1232,7 +1245,18 @@ def make_plan(source, store, clangd, profile=None, previous_path=None, tier1_upg
         residual_strict_limit, pairs) if residual else (0, [])
     positions = pending + [position for position in (
         list(range(start_cursor, len(pairs))) + list(range(start_cursor))) if position not in pending]
-    candidates = [pairs[position] for position in positions] if residual else _chunks([entry for _, entry in available], mode)
+    planning_state = {'module_compile_results': {}, 'module_closures': {}}
+    if mode == '1' and verified.tier2_enabled():
+        # Catalog locations are hints only: each module result is independently
+        # checked against CURRENT commands, members, tool and environment.
+        stores = [store] + [Path(row['store']) for row in _catalog(store, '1')
+                           if isinstance(row, dict) and isinstance(row.get('store'), str)]
+        for location in dict.fromkeys(stores):
+            state = verified.tier2_planning_state(entries, location, clangd, profile)
+            for key in planning_state:
+                planning_state[key].update(state[key])
+    candidates = [pairs[position] for position in positions] if residual else _chunks(
+        [entry for _, entry in available], mode, planning_state=planning_state)
     rejected = {tuple(record['original_indexes']) for record in metrics['groups']
         if record.get('cached') and not record.get('accepted') and not record.get('deferred')}
     # The parent's negative receipt remains reusable while a missing child still

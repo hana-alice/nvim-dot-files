@@ -1592,6 +1592,14 @@ t.describe("Tier 2 ordinary live publication", function()
     local entry, receipt = f.tier1("Tier2AB", { f.originals[1], f.originals[2] })
     entry.nvim_ue_tier, receipt.tier = 2, 2
     receipt.gates.include_resolution_equal = true
+    receipt.gates.cross_module_definition_conflict = true
+    receipt.gates.graph_superset = true
+    local lookup = f.root .. "/lookup"
+    vim.fn.mkdir(lookup, "p")
+    f.write(lookup .. "/header.h", "// graph input\n")
+    receipt.graph_result = { ok = true, excluded = f.root .. "/proof", dependencies = {
+      { path = lookup .. "/header.h", sha256 = vim.fn.sha256(f.read(lookup .. "/header.h")) },
+    }, publication_directories = { { path = lookup, realpath = lookup, entries = { { "header.h", "file", "" } } } } }
     for _, path in ipairs(definitions) do
       receipt.inputs[#receipt.inputs + 1] = { path = path, sha256 = vim.fn.sha256(f.read(path)) }
     end
@@ -1620,12 +1628,17 @@ t.describe("Tier 2 ordinary live publication", function()
       end)
     end)
   end)
-  for _, kind in ipairs({ "missing-include-gate", "changed-definitions", "missing-definitions", "disabled" }) do
+  for _, kind in ipairs({ "missing-include-gate", "changed-definitions", "missing-definitions", "disabled",
+    "missing-graph-gate", "missing-conflict-gate", "changed-graph-input", "new-lookup-name" }) do
     t.it("retains original commands for Tier 2 " .. kind, function()
       with_tier2(function()
         fixture(function(f)
           local entry, receipt, definitions = candidate(f)
           if kind == "missing-include-gate" then receipt.gates.include_resolution_equal = nil end
+          if kind == "missing-graph-gate" then receipt.gates.graph_superset = nil end
+          if kind == "missing-conflict-gate" then receipt.gates.cross_module_definition_conflict = nil end
+          if kind == "changed-graph-input" then f.write(f.root .. "/lookup/header.h", "// changed\n") end
+          if kind == "new-lookup-name" then f.write(f.root .. "/lookup/shadow.h", "// new\n") end
           if kind == "missing-definitions" then table.remove(receipt.inputs) end
           entry.nvim_ue_tier1_receipt_sha256 = f.json(entry.nvim_ue_tier1_receipt, receipt)
           if kind == "changed-definitions" then f.write(definitions[1], "// changed\n") end

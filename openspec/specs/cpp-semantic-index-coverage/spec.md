@@ -124,6 +124,22 @@ clangd 是长驻交互式服务，终止会丢弃已构建的 preamble。系统 
 
 ## 选型与踩坑
 
+- **Tier 2 整模块与 exact 扩展（2026-11-02，实现阶段）**：可选 Tier 2 保持默认关闭，
+  按完整模块规划，使用独立可配置的成员字节/依赖闭包预算，不再把八个 UBT 当语义上限。
+  复用当前有效 Tier 1 整模块编译失败证据排除不可用模块；未知结果必须经真实私有整模块
+  编译/索引取得，静态冲突筛查只能拆组，不能代替编译裁决。跨模块成员的文件级 static、
+  匿名 namespace、静态日志类别及 struct/class 同名定义由保守 token/scope 扫描预筛。
+  候选须与各模块独立 Tier 1 图作全局 SymbolID 超集检查：允许 include 重复计数、同字节
+  Definitions 宏定义位置、已有位置上的附加引用和 canonical 声明换到 A 的已有声明位置；
+  不允许 signature/名称/已知定义变化、ID 消失（含 counter/typedef 合并）或丢失 friend 引用。
+  同模块/完整上下文一致的 exact C/C++ 源也可进入 Tier 1，但必须额外比较独立 exact 图；
+  隐式 C 与 C++ 语言上下文分桶，C 配方保持 `.c` 后缀，不因 wrapper 后缀改成 C++。
+  IsTU 是主文件转成员的唯一角色位豁免，成员引用不能随 wrapper 一起忽略。失败保留原命令。
+  图收据及确定图拒绝绑定依赖字节、lookup 名称与策略；重复 prepare 复用而不重新索引，发布
+  再验图依赖和目录快照。既有 UBT Tier 1 三门与 strict 路线不变。此处是实现/夹具验收，
+  真实工程资格成本、首次/重复 prepare、冷/热 reader、完整覆盖及性能仍需单独实测；不代表
+  全工程压缩或 180 秒目标已经恢复。
+
 - **显式有序 strict 配方（2026-10-18）**：跨模块 generated-only 候选可由
   `tools/cdb_ordered_batch.py` 构造，但必须显式选定完整原 UBT owner，逐原 TU 独立图仍走既有
   strict 准入、冻结验证和 schema2 收据；有序构造或宏分类本身不授予资格，不自动扩大/缩小范围。

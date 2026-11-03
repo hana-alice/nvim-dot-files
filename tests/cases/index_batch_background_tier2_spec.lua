@@ -46,6 +46,8 @@ with tempfile.TemporaryDirectory(prefix='background_tier2_') as temporary:
     def snapshot():
         return {str(p):(p.read_bytes(),p.stat().st_mtime_ns) for p in root.rglob('*') if p.is_file()}
     with patch.object(v,'_tier1_candidate_index',side_effect=index),patch.object(v,'tier2_include_gate',side_effect=gate),\
+         patch.object(v,'_tier2_baselines',return_value=[]),\
+         patch.object(v,'_tier2_graph_gate',return_value=dict(ok=True,dependencies=[],inventories={},excluded=str(root))),\
          patch.object(v,'_proof_work_root',return_value=root/'private-tier1-work'),patch.object(b,'_owned_job',return_value=None):
         if operation=='grouping':
             os.environ['NVIM_UE_TIER2']='0'

@@ -1038,6 +1038,50 @@ print('exactly-once coverage passed')
 end)
 
 t.describe("privately qualified live Tier 1 publication", function()
+  t.it("a validated full ordinary parent replaces whole current owners and repeats without writes", function()
+    fixture(function(f)
+      local old = f.tier1("AB", { f.originals[1], f.originals[2] })
+      local parent = f.tier1("ABC", f.originals)
+      parent.nvim_ue_tier = 1
+      parent.nvim_ue_tier1_ordinary_chunk = true
+      parent.nvim_ue_tier1_ordinary_source_count = #f.originals
+      f.phase("current", { old }, { f.originals[1], f.originals[2] })
+      f.phase("hot", { old, f.originals[3] }, f.originals)
+      f.phase("full", { parent }, f.originals)
+      local ok, report = f.publish(); t.assert_true(ok, report)
+      local published = vim.json.decode(f.read(f.ctx.paths.semantic_cdb))
+      t.assert_eq(#published, 1)
+      t.assert_eq(published[1].file, parent.file)
+      t.assert_nil(published[1].nvim_ue_tier1_ordinary_chunk)
+      local bytes, stamp = f.read(f.ctx.paths.semantic_cdb), vim.uv.fs_stat(f.ctx.paths.semantic_cdb).mtime
+      local repeated, second = f.publish(); t.assert_true(repeated, second)
+      t.assert_false(second.changed)
+      t.assert_eq(f.read(f.ctx.paths.semantic_cdb), bytes)
+      t.assert_true(vim.deep_equal(vim.uv.fs_stat(f.ctx.paths.semantic_cdb).mtime, stamp))
+    end)
+  end)
+
+  for _, fault in ipairs({ "partial-owner", "stale-parent", "wrong-input-count", "unwitnessed" }) do
+    t.it("full ordinary replacement retains valid whole owners for " .. fault, function()
+      fixture(function(f)
+        local old = f.tier1("AB", { f.originals[1], f.originals[2] })
+        local parent = f.tier1("new", fault == "partial-owner" and { f.originals[2], f.originals[3] } or f.originals)
+        parent.nvim_ue_tier = 1
+        parent.nvim_ue_tier1_ordinary_chunk = fault ~= "unwitnessed"
+        parent.nvim_ue_tier1_ordinary_source_count = #f.originals + (fault == "wrong-input-count" and 1 or 0)
+        f.phase("current", { old }, { f.originals[1], f.originals[2] })
+        f.phase("full", { parent }, f.originals)
+        if fault == "stale-parent" then f.write(parent.file, "// changed parent\n") end
+        local ok, report = f.publish(); t.assert_true(ok, report)
+        local published = vim.json.decode(f.read(f.ctx.paths.semantic_cdb))
+        t.assert_eq(#published, 2)
+        t.assert_eq(published[1].file, old.file)
+        t.assert_eq(published[2].file, f.originals[3].file)
+        t.assert_eq(#report.tier1_fallbacks, 1)
+      end)
+    end)
+  end
+
   t.it("publishes Tier 1 into live CDB without frozen artifacts or unknown clangd fields", function()
     fixture(function(f)
       local candidate = f.tier1("AB", { f.originals[1], f.originals[2] })
@@ -1548,6 +1592,14 @@ t.describe("Tier 2 ordinary live publication", function()
     local entry, receipt = f.tier1("Tier2AB", { f.originals[1], f.originals[2] })
     entry.nvim_ue_tier, receipt.tier = 2, 2
     receipt.gates.include_resolution_equal = true
+    receipt.gates.cross_module_definition_conflict = true
+    receipt.gates.graph_superset = true
+    local lookup = f.root .. "/lookup"
+    vim.fn.mkdir(lookup, "p")
+    f.write(lookup .. "/header.h", "// graph input\n")
+    receipt.graph_result = { ok = true, excluded = f.root .. "/proof", dependencies = {
+      { path = lookup .. "/header.h", sha256 = vim.fn.sha256(f.read(lookup .. "/header.h")) },
+    }, publication_directories = { { path = lookup, realpath = lookup, entries = { { "header.h", "file", "" } } } } }
     for _, path in ipairs(definitions) do
       receipt.inputs[#receipt.inputs + 1] = { path = path, sha256 = vim.fn.sha256(f.read(path)) }
     end
@@ -1576,12 +1628,17 @@ t.describe("Tier 2 ordinary live publication", function()
       end)
     end)
   end)
-  for _, kind in ipairs({ "missing-include-gate", "changed-definitions", "missing-definitions", "disabled" }) do
+  for _, kind in ipairs({ "missing-include-gate", "changed-definitions", "missing-definitions", "disabled",
+    "missing-graph-gate", "missing-conflict-gate", "changed-graph-input", "new-lookup-name" }) do
     t.it("retains original commands for Tier 2 " .. kind, function()
       with_tier2(function()
         fixture(function(f)
           local entry, receipt, definitions = candidate(f)
           if kind == "missing-include-gate" then receipt.gates.include_resolution_equal = nil end
+          if kind == "missing-graph-gate" then receipt.gates.graph_superset = nil end
+          if kind == "missing-conflict-gate" then receipt.gates.cross_module_definition_conflict = nil end
+          if kind == "changed-graph-input" then f.write(f.root .. "/lookup/header.h", "// changed\n") end
+          if kind == "new-lookup-name" then f.write(f.root .. "/lookup/shadow.h", "// new\n") end
           if kind == "missing-definitions" then table.remove(receipt.inputs) end
           entry.nvim_ue_tier1_receipt_sha256 = f.json(entry.nvim_ue_tier1_receipt, receipt)
           if kind == "changed-definitions" then f.write(definitions[1], "// changed\n") end

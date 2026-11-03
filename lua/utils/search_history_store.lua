@@ -149,10 +149,12 @@ local function publish(path, entries)
     vim.uv.fs_unlink(temp)
     return nil, write_err or close_err or "search history write failed"
   end
-  local renamed, rename_err = vim.uv.fs_rename(temp, path)
+  local renamed, rename_err, rename_code = vim.uv.fs_rename(temp, path)
   if not renamed then
     vim.uv.fs_unlink(temp)
-    return nil, rename_err
+    -- A reader can temporarily deny replacement even while we own the writer
+    -- lease. Keep the uncommitted uses for the existing bounded async retry.
+    return nil, rename_err, rename_code == "EPERM" or rename_code == "EACCES" or rename_code == "EBUSY"
   end
   return entries
 end
@@ -170,7 +172,7 @@ local function flush(key)
   if not lease then
     return nil, lock_err, true
   end
-  local ok, entries, err = xpcall(function()
+  local ok, entries, err, busy = xpcall(function()
     local latest, load_err = M.load(key)
     if load_err then
       return nil, load_err
@@ -187,7 +189,7 @@ local function flush(key)
   if entries then
     pending[key] = nil
   end
-  return entries, err
+  return entries, err, busy
 end
 
 local function retry(key, attempts)

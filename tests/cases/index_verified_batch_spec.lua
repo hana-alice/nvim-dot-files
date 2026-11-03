@@ -1435,7 +1435,90 @@ with tempfile.TemporaryDirectory(prefix='verified_tier1_cache_') as temporary, c
             os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
             assert path.stat().st_size == len(raw) and path.stat().st_mtime_ns == stamp.st_mtime_ns
         with patch.object(pathlib.Path, 'read_bytes', observed_read), patch.object(module, '_sha', observed_sha):
-            if operation == 'scope_lifecycle':
+            if operation == 'scope_read_view':
+                with module.tier1_overlay_scope():
+                    reuse(0)
+                    originals = entries + extra
+                    expected = module._tier1_inputs(originals)
+                    for _ in range(2):
+                        old_reads = reads[module._command_key(str(overlay))]
+                        assert module._tier1_inputs(originals) == expected
+                        assert reads[module._command_key(str(overlay))] - old_reads == 2, \
+                            'one synchronous input call must read shared overlay at entry and exit only'
+                        assert module._TIER1_OVERLAY_READ_VIEW.get() is None
+                    old_reads = reads[module._command_key(str(overlay))]
+                    candidate, body = module._tier1_candidate_spec(originals, root / 'view-assets')
+                    assert candidate['nvim_ue_members'] == [m for e in originals for m in e['nvim_ue_members']]
+                    assert body.count('#include ') == 4
+                    assert reads[module._command_key(str(overlay))] - old_reads == 2
+                    assert module._TIER1_OVERLAY_READ_VIEW.get() is None
+                    old_reads = reads[module._command_key(str(overlay))]
+                    module._owned_overlays(entries[0])
+                    module._owned_overlays(entries[0])
+                    assert reads[module._command_key(str(overlay))] - old_reads == 2, \
+                        'direct/strict overlay accesses must retain their fresh reads'
+            elif operation in ('scope_read_view_drift', 'scope_read_view_delete',
+                               'scope_read_view_exception', 'scope_read_view_aba'):
+                stamp = overlay.stat()
+                changed = overlay_raw.replace(b'"version":0', b'"version":1')
+                assert changed != overlay_raw and len(changed) == len(overlay_raw)
+                actual_members, calls = module._tier1_ubt_members, [0]
+                class InterruptedView(Exception): pass
+                def during_members(entry):
+                    members = actual_members(entry)
+                    calls[0] += 1
+                    if calls[0] == 1:
+                        if operation == 'scope_read_view_delete': overlay.unlink()
+                        else: same_stamp_write(overlay, changed, stamp)
+                        if operation == 'scope_read_view_exception': raise InterruptedView('primary failure')
+                    elif operation == 'scope_read_view_aba':
+                        same_stamp_write(overlay, overlay_raw, stamp)
+                    return members
+                with module.tier1_overlay_scope():
+                    expected = module._tier1_inputs(entries)
+                    try:
+                        with patch.object(module, '_tier1_ubt_members', side_effect=during_members):
+                            result = module._tier1_inputs(entries)
+                        assert operation == 'scope_read_view_aba', 'persistent drift returned a successful input list'
+                        assert result == expected, 'transient ABA is not an exclusion guarantee'
+                    except InterruptedView as error:
+                        assert operation == 'scope_read_view_exception' and str(error) == 'primary failure'
+                    except FileNotFoundError:
+                        assert operation == 'scope_read_view_delete'
+                    except ValueError as error:
+                        assert operation == 'scope_read_view_drift'
+                        assert str(error) == 'owned-overlay-changed-during-tier1-operation'
+                    finally:
+                        same_stamp_write(overlay, overlay_raw, stamp)
+                    assert module._TIER1_OVERLAY_READ_VIEW.get() is None, 'failed function leaked its byte view'
+                    assert module._tier1_inputs(entries) == expected, 'next function did not start fresh'
+                    same_stamp_write(overlay, changed, stamp)
+                    try:
+                        module._tier1_inputs(entries)
+                        raise AssertionError('same-size/mtime change between calls was accepted')
+                    except ValueError as error:
+                        assert 'header-overlay-content-hash-mismatch' in str(error)
+                    finally:
+                        same_stamp_write(overlay, overlay_raw, stamp)
+            elif operation == 'scope_read_view_extra':
+                added = root / 'extra-header.h'
+                added.write_bytes(b'// real additional overlay target\n')
+                document = json.loads(overlay_raw)
+                document['roots'].append({'type': 'file', 'name': added.as_posix(), 'external-contents': added.as_posix()})
+                raw = module._json(document).encode()
+                other = overlay.parent / ('header-path-case.' + sha(raw) + '.json')
+                other.write_bytes(raw)
+                different = copy.deepcopy(entries[0])
+                different['arguments'][-1] = str(other)
+                with module.tier1_overlay_scope(), module._tier1_overlay_read_view():
+                    module._owned_overlays(entries[0])
+                    module._owned_overlays(different)
+                    old_reads = reads[module._command_key(str(other))]
+                    module._owned_overlays(different)
+                    assert reads[module._command_key(str(other))] == old_reads + 1
+                    assert len(module._TIER1_OVERLAY_READ_VIEW.get()) == 1, 'read view retained multiple large overlays'
+                assert module._TIER1_OVERLAY_READ_VIEW.get() is None
+            elif operation == 'scope_lifecycle':
                 with module.tier1_overlay_scope():
                     reuse(0)
                     with module.tier1_overlay_scope(): reuse(1)
@@ -1748,6 +1831,12 @@ t.describe("verified compiler-context UBT batching", function()
   t.it("invalidates Tier 1 owned overlay byte changes", function()
     run_tier1_cache_fixture("cache_overlay")
   end)
+  for _, scenario in ipairs({ "scope_read_view", "scope_read_view_drift", "scope_read_view_delete",
+    "scope_read_view_exception", "scope_read_view_aba", "scope_read_view_extra" }) do
+    t.it("bounds synchronous Tier 1 overlay observations: " .. scenario, function()
+      run_tier1_cache_fixture(scenario)
+    end)
+  end
   t.it("reuses failed Tier 1 qualification without reindexing and keeps its reason visible", function()
     run_tier1_cache_fixture("cache_failure")
   end)

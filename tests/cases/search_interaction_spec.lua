@@ -282,6 +282,44 @@ t.describe("search_interaction: durable search intent", function()
     end
   end)
 
+  if require("utils.platform").is_windows then
+    t.it("retains pending uses when a real open reader blocks atomic publication", function()
+      local store = require("utils.search_history_store")
+      local key = "native-publication-retry-" .. vim.fn.getpid()
+      local path = assert(store.path(key))
+      vim.fn.mkdir(vim.fs.dirname(path), "p")
+      vim.fn.writefile({ "[]" }, path)
+      local reader = assert(io.open(path, "rb"))
+      local notify, warnings = vim.notify, {}
+      vim.notify = function(message)
+        warnings[#warnings + 1] = tostring(message)
+      end
+      local ok, err = xpcall(function()
+        local first, first_err = store.record({ query = "Shared", kind = "grep", count = 1, last = 1 }, key)
+        local second, second_err = store.record({ query = "Shared", kind = "grep", count = 1, last = 2 }, key)
+        local queued = store.pending_count()
+        assert(reader:close())
+        reader = nil
+        t.assert_nil(first, "the real Windows reader must block replacement")
+        t.assert_nil(second, "the reader is still held for the second use")
+        t.assert_contains(first_err, "EPERM")
+        t.assert_contains(second_err, "EPERM")
+        t.assert_eq(queued, 2, "failed publication must retain both uncommitted uses")
+        t.assert_true(vim.wait(2000, function() return store.pending_count() == 0 end, 10))
+        local entries = store.load(key)
+        t.assert_eq(#entries, 1)
+        t.assert_eq(entries[1].query, "Shared")
+        t.assert_eq(entries[1].count, 2, "retry merges both uses exactly once")
+        t.assert_eq(#warnings, 0, "temporary publication contention is recovered")
+      end, debug.traceback)
+      if reader then reader:close() end
+      vim.notify = notify
+      if not ok then error(err) end
+    end)
+  else
+    t.skip("retains pending uses when a real open reader blocks atomic publication", "Windows sharing semantics")
+  end
+
   t.it("merges two real Neovim writers without losing uses", function()
     local dir = vim.fn.tempname():gsub("\\", "/")
     vim.fn.mkdir(dir, "p")

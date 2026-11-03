@@ -212,6 +212,7 @@ return function(M, core)
 
     local merged, seen, frozen, frozen_seen, receipts, batches = {}, {}, {}, {}, {}, {}
     local tier1_batches, tier1_consumed, tier1_fallbacks, has_tier1 = {}, {}, {}, false
+    local tier1_proposals, tier1_validated = {}, {}
     -- Reuse byte reads only within this publication. Phase manifests and stat
     -- identities cannot detect same-size live input edits between publications.
     local content_hashes = {}
@@ -249,6 +250,49 @@ return function(M, core)
       -- semantic file is lost. It cannot authorize its live candidate this way.
       return receipt.original_entries
     end
+    local graph_directory_views = {}
+    local function graph_inputs_current(proof)
+      if type(proof) ~= "table" or proof.ok ~= true or type(proof.dependencies) ~= "table"
+        or not vim.islist(proof.dependencies) or type(proof.publication_directories) ~= "table"
+        or not vim.islist(proof.publication_directories) or type(proof.excluded) ~= "string" then return false end
+      for _, input in ipairs(proof.dependencies) do
+        if type(input) ~= "table" or not is_sha256(input.sha256)
+          or current_content_hash(input.path) ~= input.sha256 then return false end
+      end
+      local path_key = require("utils.platform").driver().path_key
+      local excluded = path_key(fs.norm(proof.excluded)):gsub("/+$", "")
+      for _, snapshot in ipairs(proof.publication_directories) do
+        if type(snapshot) ~= "table" or type(snapshot.path) ~= "string"
+          or type(snapshot.realpath) ~= "string" or type(snapshot.entries) ~= "table"
+          or not vim.islist(snapshot.entries) then return false end
+        local physical = vim.uv.fs_realpath(snapshot.path)
+        if not physical or path_key(fs.norm(physical)) ~= path_key(fs.norm(snapshot.realpath)) then return false end
+        local cache_key = snapshot.path .. "\0" .. excluded
+        local actual = graph_directory_views[cache_key]
+        if not actual then
+          actual = {}
+          local scan = vim.uv.fs_scandir(snapshot.path)
+          if not scan then return false end
+          while true do
+            local name = vim.uv.fs_scandir_next(scan)
+            if not name then break end
+            local path = fs.join(snapshot.path, name)
+            local key = path_key(fs.norm(path))
+            if key ~= excluded and key:sub(1, #excluded + 1) ~= excluded .. "/" then
+              local info, lexical = vim.uv.fs_stat(path), vim.uv.fs_lstat(path)
+              if not info or not lexical then return false end
+              local link = lexical.type == "link" and vim.uv.fs_readlink(path) or ""
+              if link == nil then return false end
+              actual[#actual + 1] = { name, info.type == "directory" and "directory" or "file", link }
+            end
+          end
+          table.sort(actual, function(a, b) return a[1] < b[1] end)
+          graph_directory_views[cache_key] = actual
+        end
+        if not vim.deep_equal(actual, snapshot.entries) then return false end
+      end
+      return true
+    end
     local function tier1_receipt(entry, originals, phase_candidates)
       local path, digest = entry.nvim_ue_tier1_receipt, entry.nvim_ue_tier1_receipt_sha256
       if type(path) ~= "string" or path == "" or type(digest) ~= "string" or digest == "" then
@@ -267,11 +311,17 @@ return function(M, core)
       end
       if receipt.tier == 2 then
         if vim.env.NVIM_UE_TIER2 ~= "1" then return nil, "tier2-disabled" end
-        if entry.nvim_ue_tier ~= 2 or receipt.gates.include_resolution_equal ~= true then
+        if entry.nvim_ue_tier ~= 2 or receipt.gates.include_resolution_equal ~= true
+          or receipt.gates.cross_module_definition_conflict ~= true or receipt.gates.graph_superset ~= true then
           return nil, "tier2-receipt-not-accepted"
         end
       elseif entry.nvim_ue_tier == 2 then
         return nil, "tier2-receipt-tier-mismatch"
+      end
+      if receipt.tier == 2 or entry.nvim_ue_graph_superset == true then
+        if receipt.gates.graph_superset ~= true or not graph_inputs_current(receipt.graph_result) then
+          return nil, "batch-graph-proof-stale-or-missing"
+        end
       end
       if entry_key(receipt.candidate) ~= candidate_key then return nil, "tier1-candidate-command-mismatch" end
       if type(receipt.inputs) ~= "table" or not vim.islist(receipt.inputs) or #receipt.inputs == 0 then
@@ -320,12 +370,9 @@ return function(M, core)
         local original_key = entry_key(original)
         if not original_key or not originals[original_key] then return nil, "tier1-phase-original-absent-or-changed" end
         if consumed[original_key] then return nil, "tier1-original-repeated-in-receipt" end
-        if tier1_consumed[original_key] and tier1_consumed[original_key] ~= candidate_key then
-          return nil, "tier1-original-covered-more-than-once"
-        end
         consumed[original_key] = true
       end
-      local previous = tier1_batches[candidate_key]
+      local previous = tier1_validated[candidate_key]
       if previous and (previous.path ~= path or previous.digest ~= digest) then
         return nil, "tier1-candidate-conflicting-receipts"
       end
@@ -402,8 +449,13 @@ return function(M, core)
               for _, original in ipairs(recovered) do recovered_entries[#recovered_entries + 1] = original end
             end
             if admitted then
-              tier1_batches[admitted.key] = admitted
-              for original_key in pairs(admitted.originals) do tier1_consumed[original_key] = admitted.key end
+              tier1_validated[admitted.key] = admitted
+              tier1_proposals[#tier1_proposals + 1] = { owner = admitted, phase = phase, source = source,
+                -- Producer recomputes this witness from the entire phase input,
+                -- only after canonical cache/receipt checks. It grants no proof.
+                ordinary = phase == "full" and entry.nvim_ue_tier == 1
+                  and entry.nvim_ue_tier1_recipe == nil and entry.nvim_ue_tier1_ordinary_chunk == true
+                  and entry.nvim_ue_tier1_ordinary_source_count == #originals }
             else tier1_fallback(phase, entry, reason, source) end
           else
             frozen_entries[#frozen_entries + 1] = entry
@@ -456,6 +508,45 @@ return function(M, core)
     end
     if controlled_count == 0 then
       return false, "no same-generation controlled translation units"
+    end
+
+    -- Resolve only fully validated proposals. A CURRENT full-input ordinary
+    -- chunk may supersede earlier whole owners, never an arbitrary catalog
+    -- subset, a partial receipt, a different recipe, or a nonreducing relabel.
+    -- Invalid later candidates cannot erase valid current/hot authorities.
+    for _, proposal in ipairs(tier1_proposals) do
+      local owner, overlaps, covered = proposal.owner, {}, {}
+      if not tier1_batches[owner.key] then
+        for original_key in pairs(owner.originals) do
+          local prior = tier1_consumed[original_key]
+          if prior then overlaps[prior] = true end
+        end
+        local reason, previous = nil, 0
+        for prior in pairs(overlaps) do
+          previous = previous + 1
+          for original_key in pairs(tier1_batches[prior].originals) do
+            if not owner.originals[original_key] then reason = "tier1-partial-owner-replacement" end
+            covered[original_key] = true
+          end
+        end
+        for original_key in pairs(owner.originals) do
+          if not covered[original_key] then previous = previous + 1 end
+        end
+        if next(overlaps) then
+          if not proposal.ordinary then reason = "tier1-original-covered-more-than-once"
+          elseif previous <= 1 then reason = reason or "tier1-replacement-does-not-reduce-tus" end
+        end
+        if reason then
+          tier1_fallback(proposal.phase, owner.entry, reason, proposal.source)
+        else
+          for prior in pairs(overlaps) do
+            for original_key in pairs(tier1_batches[prior].originals) do tier1_consumed[original_key] = nil end
+            tier1_batches[prior] = nil
+          end
+          tier1_batches[owner.key] = owner
+          for original_key in pairs(owner.originals) do tier1_consumed[original_key] = owner.key end
+        end
+      end
     end
 
     -- A later full phase contains the original UBT rows even when an earlier

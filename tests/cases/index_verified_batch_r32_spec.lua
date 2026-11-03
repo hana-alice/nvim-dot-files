@@ -8,6 +8,8 @@ sys.path.insert(0, str(pathlib.Path(sys.argv[1]).parent))
 import build_hot_super_unity_cdb as h
 import cdb_verified_batch as v
 op=sys.argv[2]
+# Exact-in-Tier1 is opt-in (user 2026-11-03: rejected under the strict gate); R32 cases exercise it explicitly.
+if op!='exact_default_off':os.environ['NVIM_UE_TIER1_EXACT']='1'
 with tempfile.TemporaryDirectory(prefix='r32-tier-') as tmp:
     root=pathlib.Path(tmp).resolve()
     def write(name,text):
@@ -101,6 +103,12 @@ with tempfile.TemporaryDirectory(prefix='r32-tier-') as tmp:
         result=v.graph_superset([a],b,**options)
         assert result['ok']==(op in ('graph_superset','graph_macro','graph_large','graph_forward_row')),result
         if op=='graph_large':assert b[u]['refs'].iterations<=6,b[u]['refs'].iterations
+    elif op=='exact_default_off':
+        os.environ.pop('NVIM_UE_TIER1_EXACT',None)
+        entries=[unit('A',0,exact=True),unit('A',1,exact=True)]
+        assert h.secondary_unity_chunks(entries)==[],'exact must not enter Tier1 by default'
+        ubt=[unit('B',0),unit('B',1)]
+        assert h.secondary_unity_chunks(ubt)==[[0,1]],'UBT Tier1 unchanged'
     elif op=='exact_c':
         entries=[unit('A',0,exact=True),unit('A',1,exact=True)]
         for entry in entries:
@@ -280,7 +288,7 @@ end
 t.describe("R32 production tier expansion", function()
   for _, operation in ipairs({ "closure_budget", "definition_conflicts", "graph_superset", "graph_forward_row", "graph_decl_unknown", "graph_signature",
     "graph_counter", "graph_typedef", "graph_friend", "graph_definition", "graph_relation", "graph_target", "graph_macro", "graph_large",
-    "exact_success", "exact_failure", "exact_context", "exact_graph_rejection", "tier2_exact_metrics", "tier2_graph_rejection", "module_graph_cache",
+    "exact_default_off", "exact_success", "exact_failure", "exact_context", "exact_graph_rejection", "tier2_exact_metrics", "tier2_graph_rejection", "module_graph_cache",
     "module_compile_exclusion", "module_shard_errors", "module_graph_tamper", "graph_dependency_invalidate", "exact_background", "exact_graph_records", "exact_operands", "exact_c" }) do
     t.it(operation, function() run(operation) end)
   end

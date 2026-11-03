@@ -229,7 +229,7 @@ def is_exact_cpp(entry):
 
 def secondary_unity_chunks(entries, max_sources=None, max_unities=8,
                            budget_factor=None, diagnostics=None, split_member_classes=True,
-                           avoid_same_stem_pairs=False, include_exact=True):
+                           avoid_same_stem_pairs=False, include_exact=None):
     """Plan same-context SuperUnity chunks without modifying original commands.
 
     Each chunk is bounded by budget_factor * UBT's 384 KiB member-source budget.
@@ -241,6 +241,11 @@ def secondary_unity_chunks(entries, max_sources=None, max_unities=8,
     """
     if not isinstance(split_member_classes, bool):
         raise ValueError('SuperUnity member-class split must be boolean')
+    if include_exact is None:
+        # Exact-in-Tier1 is opt-in: under the strict graph gate real exact
+        # candidates are rejected (main-file-only symbols gain completion
+        # fields), so default planning would only spend qualification time.
+        include_exact = os.environ.get('NVIM_UE_TIER1_EXACT', '0') == '1'
     if budget_factor is None:
         budget_factor = int(os.environ.get('NVIM_UE_SUPER_UNITY_BUDGET_FACTOR', '8'))
     if (not isinstance(budget_factor, int) or isinstance(budget_factor, bool)

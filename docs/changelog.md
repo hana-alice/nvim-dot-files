@@ -108,7 +108,7 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v2.12.5` → [docs/release_2.12.5.md](release_2.12.5.md) (absent-cache preparation repair; full regression 4421/4421, 2 skips; tag pending)
 
-- `v2.13.0` → [docs/release_2.13.0.md](release_2.13.0.md) (real-build qualification fixes, opt-in whole-module Tier 2 and exact Tier 1 behind a strict graph gate; full regression 4441/4456, 15 known junction-config failures identical to base, 2 skips; tag pending)
+- `v2.13.0` → [docs/release_2.13.0.md](release_2.13.0.md) (real-build qualification fixes, opt-in whole-module Tier 2 and exact Tier 1 behind a strict graph gate; full regression 4462/4462, 2 skips; tag pending)
 
 ## Unreleased
 

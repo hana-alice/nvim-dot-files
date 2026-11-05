@@ -4,12 +4,13 @@ local M = {}
 local recipes = require("utils.search_recipe")
 local locks = require("ue.file_lock")
 local MAX_ENTRIES, MAX_BYTES = 300, 2 * 1024 * 1024
-local pending, scheduled, legacy_keys = {}, {}, {}
+local pending, scheduled, legacy_keys, engines = {}, {}, {}, {}
 
 function M.key(project)
   project = project or recipes.context()
   local root = project.root
   local key = vim.fn.sha256(recipes.path_key(project.identity or root)):sub(1, 16)
+  if type(project.engine) == "string" and project.engine ~= "" then engines[key] = project.engine end
   legacy_keys[key] = {}
   for _, previous in ipairs({ vim.fs.normalize(root), recipes.path_key(root) }) do
     local legacy = vim.fn.sha256(previous):sub(1, 16)
@@ -25,6 +26,13 @@ function M.path(key)
   if type(key) ~= "string" or not key:match("^[%w_+%.%-]+$") or #key > 96 then
     return nil, "invalid history project key"
   end
+  -- Follows the project's engine (<engine>/.cache/nvim-ue/search-history);
+  -- stdpath state only for keys whose project has no engine.
+  local dir = engines[key] and require("ue.engine_cache").dir("search-history", { engine_root = engines[key], current = false })
+  return vim.fs.joinpath(dir or vim.fs.joinpath(vim.fn.stdpath("state"), "ue_search_history"), key .. ".json")
+end
+
+local function stdpath_file(key)
   return vim.fs.joinpath(vim.fn.stdpath("state"), "ue_search_history", key .. ".json")
 end
 
@@ -52,23 +60,10 @@ local function clean_entry(entry)
   return out
 end
 
-function M.load(key)
-  key = key or M.key()
-  local path, path_err = M.path(key)
-  if not path then
-    return {}, path_err
-  end
+local function read_file(path)
   local stat = vim.uv.fs_stat(path)
   if not stat then
-    -- Old query-only history is imported read-only on the first publication.
-    -- The old file remains intact; future reads use the canonical bucket.
-    for _, legacy in ipairs(legacy_keys[key] or {}) do
-      local legacy_path = M.path(legacy)
-      if vim.uv.fs_stat(legacy_path) then
-        return M.load(legacy)
-      end
-    end
-    return {}
+    return nil
   end
   if stat.size > MAX_BYTES then
     return {}, "search history exceeds its byte budget"
@@ -94,6 +89,34 @@ function M.load(key)
     end
   end
   return out
+end
+
+function M.load(key)
+  key = key or M.key()
+  local path, path_err = M.path(key)
+  if not path then
+    return {}, path_err
+  end
+  local entries, err = read_file(path)
+  if entries then
+    return entries, err
+  end
+  -- Older buckets are imported read-only on the first publication and stay
+  -- intact; future reads use the canonical bucket. Order: the same key's
+  -- pre-engine stdpath file, then query-only legacy keys (stdpath).
+  local candidates = { stdpath_file(key) }
+  for _, legacy in ipairs(legacy_keys[key] or {}) do
+    candidates[#candidates + 1] = stdpath_file(legacy)
+  end
+  for _, candidate in ipairs(candidates) do
+    if candidate ~= path then
+      local imported, import_err = read_file(candidate)
+      if imported then
+        return imported, import_err
+      end
+    end
+  end
+  return {}
 end
 
 local function identity(entry)

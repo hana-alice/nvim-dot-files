@@ -496,6 +496,10 @@ clangd 是长驻交互式服务，终止会丢弃已构建的 preamble。系统 
   内存索引（Dex）。preamble 改为 `--pch-storage=disk`（3 个 TU 时 1291→223 MB）。disk 模式下 clangd
   被 kill 后会留下 `preamble-*.pch`，所以每个会话的 clangd 使用独立 TEMP（`ue.clangd_temp`），
   只清理所属进程已确认退出的目录。
+- **缓存位置跟随引擎（2026-11，K76）**：生产 clangd 以 background 优先级运行，Windows 上这同时
+  降低 IO 优先级；系统盘 shard 写入实测 7–10 ms，引擎数据盘约 1 ms。因此 clangd TEMP、批次证明
+  工作目录等落在 `<engine>/.cache/nvim-ue/`，仅无引擎时回落 stdpath/TEMP；新增缓存位置沿用此规则。
+  CDB prepare 暂存仍刻意留在 live root 之外（原生 watcher 64 KiB 缓冲溢出风险），待评估后再迁。
 - **回收安全窗口（2026-10-27）**：normal mode 不能作为用户空闲的证据，index job 为空也不代表
   UEPrepare 已结束；回收须读取真实 prepare owner 并检查用户活动。新进度必须使上一轮的回收定时器
   及其重试失效，避免在最新索引刚结束时提前重启。隔离的真实 Neovide/LSP 夹具已验证一次自动回收、

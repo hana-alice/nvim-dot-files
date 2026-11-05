@@ -378,7 +378,16 @@ local specs=assert(loadfile(root .. "/lua/plugins/snacks.lua"))()
 local options=specs[1].opts(nil,{})
 Snacks.config.picker=options.picker
 check(options.picker.sources.grep.finder==require("utils.search_recipe").grep_finder, "grep recipe finder was lost")
-check(options.picker.confirm==layout.confirm, "default confirm did not use layout")
+check(options.picker.actions.confirm==layout.confirm and options.picker.confirm==nil, "default confirm did not use layout")
+-- vim.ui.select must keep its own confirm under the repo options (regression:
+-- global confirm hijacked :UESetPlatform with "Either item.buf or item.file is required").
+local chosen
+local sel=Snacks.picker.select({"Win64","Android"},{prompt="Target Platform:"},function(c) chosen=c end)
+check(vim.wait(3000,function() return sel and sel:current() ~= nil end,20),"select picker not ready")
+sel.list:view(2)
+sel:action("confirm")
+check(vim.wait(3000,function() return chosen ~= nil end,20),"vim.ui.select confirm did not return the choice")
+check(chosen=="Android","vim.ui.select confirm returned "..tostring(chosen))
 api.nvim_set_current_win(panel)
 local actual=Snacks.picker.pick("files",{
   finder=function() return {{file=paths[4],buf=session.modified_bufnr,pos={1,4}}} end,

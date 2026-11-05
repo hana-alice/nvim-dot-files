@@ -216,7 +216,8 @@ function M.plan(ctx, opts)
   end
   sequence = sequence + 1
   local project = vim.fn.sha256(identity):sub(1, 16)
-  local root = opts.output_root or (vim.fn.stdpath("state") .. "/ue-tests")
+  local root = opts.output_root or require("ue.engine_cache").dir_or("ue-tests",
+    vim.fn.stdpath("state") .. "/ue-tests", { engine_root = ctx.engine_root })
   local report_dir = vim.fs.normalize(root .. "/" .. project .. "/" .. vim.fn.getpid() .. "-" .. sequence)
   local frozen = vim.deepcopy(ctx)
   frozen.uproject = vim.fs.normalize(assert(vim.uv.fs_realpath(ctx.uproject)))

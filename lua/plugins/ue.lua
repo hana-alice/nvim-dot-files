@@ -59,7 +59,8 @@ return {
           config._ue_resolved_cmd = resolved_cmd
           local rpc = vim.lsp.rpc.start(resolved_cmd, dispatchers, {
             cwd = config.cmd_cwd,
-            env = require("ue.clangd_temp").spawn_env(config._ue_batch_spawn_env or config.cmd_env),
+            env = require("ue.clangd_temp").spawn_env(config._ue_batch_spawn_env or config.cmd_env,
+              { engine_root = require("ue").engine_root_of(config.root_dir) }),
             detached = config.detached,
           })
           -- Public RPC hides vim.SystemObj.pid. Bounded async discovery proves

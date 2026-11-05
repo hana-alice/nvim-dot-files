@@ -18,6 +18,18 @@
 剪贴板 provider 在启动前隔离，不能以启动后替换配置证明没有触及系统剪贴板。
 → `../docs/CONSTRAINTS.md §二 文件操作与大纲`；`../lua/utils/document_location.lua`。
 
+### 后台 clangd 的 IO 降级与缓存位置（K76）
+
+background/low 优先级在 Windows 同时降 IO 优先级；系统盘上 shard 写入慢 5–7 倍。
+缓存与工作目录跟随引擎目录，实验优先级与生产一致。
+→ `../docs/CONSTRAINTS.md §二 K76`；`../lua/ue/clangd_temp.lua`。
+
+### 冷索引研究方法（K77）
+
+先拆相位再选杠杆；固定顺序的漂亮倍数不代表生产形态；等价性以解码 shard 为准；
+写出慢的根因修掉后前缀 PCH 恢复为杠杆；门禁与归因用小样本，不靠全量。
+→ `../docs/CONSTRAINTS.md §二 K77`。
+
 ### Unity 成员与 exact TU 的缓存角色（K75）
 
 同字节缓存命中不能证明新 exact 命令执行过；检查实际 own TU 标记，修复须保留 writer 与身份边界。

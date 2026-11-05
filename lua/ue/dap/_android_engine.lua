@@ -221,7 +221,7 @@ end
 -- we write a focused report by running `image lookup` for the configured
 -- probe file and logging `breakpoint list` — all non-mutating / non-resuming.
 --
--- The diagnosis lines land in stdpath('cache')/ue-dap-bp-diag.log written by
+-- The diagnosis lines land in <engine>/.cache/nvim-ue/logs/ue-dap-bp-diag.<pid>.log written by
 -- the on-console listener in lua/ue/dap.lua (D._dap_bp_diag_*). Here we just
 -- issue the read-only probe commands so that listener has something to capture.
 function M.post_run_commands(session)

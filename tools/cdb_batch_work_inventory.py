@@ -218,7 +218,9 @@ def inventory(work_root, reference_roots, active_roots=(), observe=process_snaps
                         links.append(str(path)); directories.remove(name)
                     elif name.endswith('.lock'):
                         locks.append(path); directories.remove(name)
-                    elif name in SKIP_DIRS:
+                    elif name in SKIP_DIRS or name == 'clangd-tmp' or (
+                            work_identity is not None and identity(path) == work_identity):
+                        # The work root may live inside an engine cache reference root (K76).
                         directories.remove(name)
                 if Path(current).name in ('receipts', 'assets', 'originals'):
                     store(Path(current).parent)

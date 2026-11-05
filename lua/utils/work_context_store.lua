@@ -89,7 +89,17 @@ function M.path(project)
   if not key then
     return nil, err
   end
-  return vim.fs.joinpath(vim.fn.stdpath("state"), "ue_work_contexts", key .. ".json")
+  -- Follows the project's engine (<engine>/.cache/nvim-ue/work-contexts);
+  -- stdpath state only for projects without an engine.
+  local owner = project_value(project)
+  local engine = owner and owner.engine ~= ""
+    and require("ue.engine_cache").dir("work-contexts", { engine_root = owner.engine, current = false })
+  return vim.fs.joinpath(engine or vim.fs.joinpath(vim.fn.stdpath("state"), "ue_work_contexts"), key .. ".json")
+end
+
+local function legacy_path(project)
+  local key = M.key(project)
+  return key and vim.fs.joinpath(vim.fn.stdpath("state"), "ue_work_contexts", key .. ".json")
 end
 
 local function draft_value(draft, project, published)
@@ -310,6 +320,18 @@ local function publish(path, raw, done)
   end)
 end
 
+-- First read of a bucket: a missing engine file imports the pre-engine stdpath
+-- file read-only; the next publication writes the engine bucket.
+local function read_current(path, project, done)
+  read_raw(path, function(raw, err)
+    local old = legacy_path(project)
+    if raw ~= nil or err or not old or old == path then
+      return done(raw, err)
+    end
+    read_raw(old, done)
+  end)
+end
+
 local function transaction(project, change, done)
   local path = assert(M.path(project))
   mkdir(vim.fs.dirname(path), function(dir_err)
@@ -333,7 +355,7 @@ local function transaction(project, change, done)
       end
       later(done, result, err)
     end
-    read_raw(path, function(previous, read_err)
+    read_current(path, project, function(previous, read_err)
       if read_err then
         return finish(nil, read_err)
       end
@@ -413,7 +435,7 @@ function M.load(project, done)
     if not owner then
       return done(nil, err)
     end
-    read_raw(assert(M.path(owner)), function(raw, read_err)
+    read_current(assert(M.path(owner)), owner, function(raw, read_err)
       if read_err then
         return done(nil, read_err)
       end

@@ -202,7 +202,7 @@ local function append_android_bp_diag(lines)
   if type(lines) == "string" then lines = { lines } end
   if type(lines) ~= "table" then return end
   pcall(function()
-    local path = vim.fn.stdpath("cache") .. ("/ue-dap-bp-diag.%d.log"):format(vim.fn.getpid())
+    local path = require("ue.engine_cache").file("logs", ("ue-dap-bp-diag.%d.log"):format(vim.fn.getpid()), vim.fn.stdpath("cache"))
     local fh = io.open(path, "a")
     if not fh then return end
     for _, line in ipairs(lines) do
@@ -1166,13 +1166,15 @@ break end
   do
     local lines = {}
     local pid = vim.fn.getpid()
+    local engine_logs = require("ue.engine_cache").dir_or("logs", vim.fn.stdpath("cache"))
     local logs = {
+      -- nvim-dap's logger hardcodes stdpath('cache') (dap/log.lua getpath).
       { name = "dap.log (nvim-dap)",
         path = vim.fn.stdpath("cache") .. ("/dap.%d.log"):format(pid) },
       { name = "lldb-dap protocol",
-        path = vim.fn.stdpath("cache") .. ("/lldb-dap-protocol.%d.log"):format(pid) },
+        path = engine_logs .. ("/lldb-dap-protocol.%d.log"):format(pid) },
       { name = "UE DAP breakpoint diagnostics",
-        path = vim.fn.stdpath("cache") .. ("/ue-dap-bp-diag.%d.log"):format(pid) },
+        path = engine_logs .. ("/ue-dap-bp-diag.%d.log"):format(pid) },
     }
     for _, l in ipairs(logs) do
       lines[#lines + 1] = ("── %s ──"):format(l.name)

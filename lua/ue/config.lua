@@ -66,8 +66,14 @@ local function defaults()
     paths = {
       -- Lazy-evaluated so callers always see the current `stdpath` result
       -- (XDG vars / nvim startup quirks make eager eval unsafe).
-      state_dir = function() return vim.fn.stdpath("state") .. "/ue" end,
-      cache_dir = function() return vim.fn.stdpath("cache") .. "/ue" end,
+      -- Non-config artifacts follow the current engine (<engine>/.cache/nvim-ue);
+      -- stdpath only when no engine is known (see ue/engine_cache.lua).
+      state_dir = function()
+        return require("ue.engine_cache").dir_or("state", vim.fn.stdpath("state") .. "/ue")
+      end,
+      cache_dir = function()
+        return require("ue.engine_cache").dir_or(nil, vim.fn.stdpath("cache") .. "/ue")
+      end,
     },
     -- Phase I additions ────────────────────────────────────────────────
     clangd = {

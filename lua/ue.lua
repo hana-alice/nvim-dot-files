@@ -4046,14 +4046,15 @@ local function slim_compile_commands_file(path)
 end
 
 --- Spawn a long-running shell job, capture stdout+stderr to a timestamped log
---- file under stdpath('log')/<tag>/, and notify on failure with the log path.
+--- file under <engine>/.cache/nvim-ue/logs/<tag>/ (stdpath('log')/<tag>/ without
+--- an engine), and notify on failure with the log path.
 ---
 --- This is the standard pattern for any background job in ue.lua. When it fails,
 --- the user can quote the log file path back to the agent for instant debugging
 --- — no need to re-run to capture the failure.
 ---
 --- @param cmd string|string[] command (string for shell, list for argv)
---- @param tag string subdirectory name under stdpath('log') (e.g. "ue-pipeline")
+--- @param tag string log subdirectory name (e.g. "ue-pipeline")
 --- @param opts table {
 ---   cdb     = string?      -- optional context to record in log header
 ---   on_exit = fun(code:integer, log_lines:string[], log_path:string)
@@ -4068,7 +4069,9 @@ end
 --- @return string log_path
 function M._logged_jobstart(cmd, tag, opts)
   opts = opts or {}
-  local log_dir = vim.fn.stdpath("log") .. "/" .. tag
+  -- Pipeline logs follow the engine (path from opts.cdb / cwd); stdpath only without one.
+  local log_dir = require("ue.engine_cache").dir_or("logs/" .. tag,
+    vim.fn.stdpath("log") .. "/" .. tag, { path = opts.cdb or opts.cwd })
   vim.fn.mkdir(log_dir, "p")
   local log_path = log_dir .. ("/%s.%d.%s.log"):format(
     os.date("%Y%m%d-%H%M%S"), vim.fn.getpid(), tostring(vim.uv.hrtime()))
@@ -5220,6 +5223,11 @@ function M.ue_roots(opts)
     return nil, ctx.engine_root, "No project configured for engine root. Run :UESetProject [path]"
   end
   return ctx.project_root, ctx.engine_root, nil
+end
+
+--- Engine root containing `path` (nil when none); used to place caches with the engine.
+function M.engine_root_of(path)
+  return path and path ~= "" and find_engine_root(path) or nil
 end
 
 function M.clangd_root(bufnr)
@@ -8643,7 +8651,7 @@ function M.setup()
   vim.api.nvim_create_user_command("UEGrepTraceToggle", function()
     vim.g.ue_grep_trace = not (vim.g.ue_grep_trace == true)
     local on = vim.g.ue_grep_trace
-    local path = vim.fn.stdpath("state") .. ("/ue_grep_trace.%d.log"):format(vim.fn.getpid())
+    local path = require("ue.engine_cache").file("logs", ("ue_grep_trace.%d.log"):format(vim.fn.getpid()), vim.fn.stdpath("state"))
 
     -- Error sink: poll :messages and tee Error/E5/attempt patterns to disk.
     -- We DO NOT override vim.notify (noice would warn about that and ding
@@ -8653,7 +8661,7 @@ function M.setup()
     -- a P5-adjacent leak. Handle lives on CORE_RT so repeated toggles reuse
     -- one slot; OFF stops AND closes it.
     if on and not CORE_RT.err_sink_timer then
-      local err_log = vim.fn.stdpath("state") .. ("/ue_errors.%d.log"):format(vim.fn.getpid())
+      local err_log = require("ue.engine_cache").file("logs", ("ue_errors.%d.log"):format(vim.fn.getpid()), vim.fn.stdpath("state"))
       local f = io.open(err_log, "w")
       if f then f:write("=== installed " .. os.date() .. " ===\n")
 f:close() end
@@ -8685,7 +8693,7 @@ f:close() end
   end, { desc = "Toggle UE grep finder trace logging + error sink" })
 
   vim.api.nvim_create_user_command("UEGrepTraceShow", function()
-    local path = vim.fn.stdpath("state") .. ("/ue_grep_trace.%d.log"):format(vim.fn.getpid())
+    local path = require("ue.engine_cache").file("logs", ("ue_grep_trace.%d.log"):format(vim.fn.getpid()), vim.fn.stdpath("state"))
     if vim.fn.filereadable(path) == 0 then
       vim.notify("no trace log at " .. path, vim.log.levels.WARN, { title = "UE" })
       return
@@ -8700,9 +8708,9 @@ f:close() end
   vim.api.nvim_create_user_command("UEGrepDiagDump", function()
     -- One-shot bundle: trace + errors + tail of :messages + Snacks notifier
     -- history into a single file the user can paste back in one go.
-    local out_path = vim.fn.stdpath("state") .. ("/ue_grep_diag.%d.txt"):format(vim.fn.getpid())
-    local trace_path = vim.fn.stdpath("state") .. ("/ue_grep_trace.%d.log"):format(vim.fn.getpid())
-    local err_path = vim.fn.stdpath("state") .. ("/ue_errors.%d.log"):format(vim.fn.getpid())
+    local out_path = require("ue.engine_cache").file("logs", ("ue_grep_diag.%d.txt"):format(vim.fn.getpid()), vim.fn.stdpath("state"))
+    local trace_path = require("ue.engine_cache").file("logs", ("ue_grep_trace.%d.log"):format(vim.fn.getpid()), vim.fn.stdpath("state"))
+    local err_path = require("ue.engine_cache").file("logs", ("ue_errors.%d.log"):format(vim.fn.getpid()), vim.fn.stdpath("state"))
 
     local function read_file(p, max_bytes)
       max_bytes = max_bytes or 50000

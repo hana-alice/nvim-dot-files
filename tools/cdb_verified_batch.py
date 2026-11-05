@@ -97,9 +97,17 @@ def _tier1_blob_sha(kind, raw):
 
 
 def _proof_work_root(output):
-    """Persistent private work, outside published receipt/asset namespaces."""
-    return (Path(tempfile.gettempdir()).resolve() / 'nvim-ue-batch-work'
-            / _sha(str(Path(output).resolve()).encode())[:24])
+    """Persistent private work, outside published receipt/asset namespaces.
+
+    Follows the engine cache (<engine>/.cache/nvim-ue/batch-work) that owns the
+    output: background-priority clangd writes are IO-throttled on the system
+    drive (K76). Outputs outside an engine cache keep the TEMP location.
+    """
+    resolved = Path(output).resolve()
+    base = next((parent / 'batch-work' for parent in resolved.parents
+                 if parent.name == 'nvim-ue' and parent.parent.name == '.cache'),
+                Path(tempfile.gettempdir()).resolve() / 'nvim-ue-batch-work')
+    return base / _sha(str(resolved).encode())[:24]
 
 
 @contextmanager

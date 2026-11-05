@@ -113,9 +113,10 @@ function M.open(opts, ctx, owner)
   -- Zero overhead when disabled (single boolean check per event).
   --
   -- Toggle: :UEGrepTraceToggle  (or set vim.g.ue_grep_trace = true)
-  -- Log:    vim.fn.stdpath("state") .. "/ue_grep_trace.log"
+  -- Log:    <engine>/.cache/nvim-ue/logs/ue_grep_trace.<pid>.log (stdpath state without an engine)
   local trace_enabled = vim.g.ue_grep_trace == true
-  local trace_log_path = vim.fn.stdpath("state") .. ("/ue_grep_trace.%d.log"):format(vim.fn.getpid())
+  local trace_log_path = trace_enabled and require("ue.engine_cache").file("logs",
+    ("ue_grep_trace.%d.log"):format(vim.fn.getpid()), vim.fn.stdpath("state")) or nil
   local trace_t0 = vim.loop.hrtime()
   local function trace(fmt, ...)
     if not trace_enabled then
@@ -151,11 +152,13 @@ function M.open(opts, ctx, owner)
   -- vim.g.ue_grep_trace flag so a normal grep writes nothing to disk (P5: no
   -- silent per-action side-effects). Enable with :UEGrepTraceToggle when
   -- debugging backend/mode/result-count.
-  local debug_log_path = vim.fn.stdpath("state") .. ("/ue_grep_backend_debug.%d.log"):format(vim.fn.getpid())
+  local debug_log_path
   local function grep_debug(fmt, ...)
     if vim.g.ue_grep_trace ~= true then
       return
     end
+    debug_log_path = debug_log_path or require("ue.engine_cache").file("logs",
+      ("ue_grep_backend_debug.%d.log"):format(vim.fn.getpid()), vim.fn.stdpath("state"))
     local ok, line = pcall(string.format, fmt, ...)
     if not ok then
       line = tostring(fmt)

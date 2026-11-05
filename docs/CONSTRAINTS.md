@@ -456,8 +456,10 @@
   不是漏改一处**。三类负载根本不在视野内: clangd 本体（仅启动时静态 `-j`）、UE build、Neovide 渲染。
   次因: `-j` 只「保留 4 核」→ 24 核机器给 clangd 20 核（**83%**）。固定核数在不同规模宿主上语义不同
   （保留 4/8 很激进，保留 4/64 形同没有），必须叠加**份额上限**。
-  另: `--background-index-priority=background` 按 clangd `--help` 为 *OS-specific*，
-  **Windows 未验证**，不得计入已有防线。
+  另: `--background-index-priority=background` 按 clangd `--help` 为 *OS-specific*；
+  2026-11 源码核对（LLVM `Support/Windows/Threading.inc`）确认 Windows 上 low/background 均进入
+  `THREAD_MODE_BACKGROUND_BEGIN`，**同时降低 IO 优先级**（见 K76）；CPU 让出效果仍未实测，
+  不得计入 CPU 防线。
   解决约束: P6 提升为**宿主级首要原则**（见 §一 P6、§三 C4-2）。判据必须**全仓共用一份**
   （不得各子系统各写阈值）；按类型分策略——可推迟批任务→推迟启动；长驻交互服务→**可逆 OS 级降级，
   MUST NOT kill/suspend**（杀掉丢 preamble，下次导航重付分钟级）；用户显式发起的前台任务→不得自动
@@ -1219,6 +1221,37 @@
   缓存存在不能证明 exact 已编译；缺少可选 `cmdl` 也不能单独判错。后续修复须先确认对应
   writer 退出，再重验身份并仅处理目标 own shard；不变发布保持 no-op。自动修复尚未落地。
   → `openspec/specs/cpp-semantic-index-coverage/spec.md`「原生缓存角色变化」。
+
+- **K76 — 后台优先级 clangd 的 IO 被降级，索引写入/TEMP 不得放在受压系统盘**
+  实证（R36，600 个真实 shard 的 writeToOutput 等价重放，中位数）：系统盘正常优先级 1.5–2.7 ms/shard，
+  进程 IDLE 或线程 background 模式 7–10 ms/shard；引擎所在数据盘任意组合 0.5–1.3 ms。
+  LLVM Windows `set_thread_priority` 对 low/background 调 `THREAD_MODE_BACKGROUND_BEGIN`
+  （同时降 IO 优先级），而生产 clangd 使用 `--background-index-priority=background`。
+  约束：索引存储、clangd TEMP、批次/prepare 工作目录、实验输出**跟随引擎目录**
+  （`<engine>/.cache/nvim-ue/...`，无引擎时才回落 stdpath）；实验 harness 的进程/线程优先级
+  必须与生产一致，否则耗时拆分不可比。未闭环：数据盘上 clangd 实测 4.3 ms 与重放 1 ms 的差距、
+  PCH 臂 14 vs 7 ms 尚未解释（待验证）。
+  推广（用户 2026-11-05）：**除 nvim 配置本身外**，日志、诊断 trace、Editor 测试报告、定义缓存、
+  cursor shim、搜索历史、工作上下文、pipeline 日志、研究报告一律经 `lua/ue/engine_cache.lua`
+  放到 `<engine>/.cache/nvim-ue/<sub>`；持久集合首读时只读导入旧 stdpath 桶。**刻意例外**：
+  CDB transaction staging、batch_runtime watch probe、冻结输入守卫期间写的短命请求 JSON 必须留在
+  TEMP（引擎/项目根被 watcher 监视，写入会触发 overflow→unknown 失效）；nvim-dap 自身 logger
+  硬编码 stdpath('cache')；私有机器策略文件（SDK policy、BuildDispatch）跨引擎共用，留 stdpath。
+  → `lua/ue/clangd_temp.lua`；`lua/ue/engine_cache.lua`；`tools/cdb_verified_batch.py`；`openspec/specs/cpp-semantic-index-coverage/spec.md`。
+
+- **K77 — 冷索引提速研究：先拆相位再选杠杆；写出根因修掉前，前缀 PCH 在生产形态看不出收益**
+  实证（R34–R35）：固定顺序下前缀 PCH 可 shard 全等且稳态 2.8×，但生产形态（随机顺序、j4、
+  真实分组）thin 收益≈1.0×，且 DiskStoreShard 约占 TU 时间一半——瓶颈在写出而非解析。
+  教训：①先用 trace 拆出 parse/index/store 各相位，再决定改哪一层；②实验 CDB 的引擎根必须与
+  当前 build 一致，否则 shard 差异来自路径而非算法；③日志里的 ref 计数不含回放元数据，不能作等价证据，
+  以解码后的 shard 逐条比较为准；④小样本先给预期区间与决策点，结论可预测就不跑全量。
+  **2026-11-05 修正**：R35 的"写出是瓶颈"根因找到——`llvm::writeToOutput` 的 TempFile 路径每个文件调一次
+  `GetVolumePathNameW`（≈3.5 ms/shard）。私有 clangd 改为 tmp+rename 后，前缀 PCH 在生产形态恢复为杠杆：
+  6 行样本 1.77×；全工程（633 TU、j12）冷索引 481 s（另加产 PCH 95 s，旧 1212-TU 基线 1028 s，非同输入对照），
+  官方 clangd 直接加载这些 shard，0 重索引。同 CDB 普通臂对照与严格门禁尚未做（待小样本验证）。
+  教训⑤：manifest 键是 clangd 的实际命令——CDB 文件是正斜杠时，clangd 在 `--` 后写反斜杠路径；
+  样本若恰好全是同一种路径风格，会掩盖键不匹配。⑥全量运行占满整机，门禁与归因一律用小样本（用户要求）。
+  → `memory/project_overview.md` 知识库导航；`openspec/specs/cpp-semantic-index-coverage/spec.md`。
 
 ## 三、约束（Constraints）
 

@@ -82,9 +82,15 @@ function M.inventory(deps)
   if not python.ok then notify("Inventory failed: python-unavailable", vim.log.levels.WARN); return false end
   local config = vim.fn.stdpath("config")
   local token = tostring(vim.fn.getpid()) .. "-" .. tostring((vim.uv or vim.loop).hrtime())
-  local output = vim.fs.joinpath(config, ".tmp", "review-gd", "n4", "batch-work-inventory-command-" .. token .. ".json")
+  -- Reports follow the engine; the config-dir .tmp is only the no-engine fallback.
+  local report_dir = require("ue.engine_cache").dir_or("reports/batch-work-inventory",
+    vim.fs.joinpath(config, ".tmp", "review-gd", "n4"), { engine_root = ctx.engine_root, current = false })
+  local output = vim.fs.joinpath(report_dir, "batch-work-inventory-command-" .. token .. ".json")
   vim.fn.mkdir(vim.fs.dirname(output), "p")
-  local work = deps.work_root or vim.fs.joinpath(vim.env.TEMP or vim.env.TMP or vim.fn.stdpath("cache"), "nvim-ue-batch-work")
+  -- Matches cdb_verified_batch._proof_work_root: engine cache first (K76), legacy TEMP without one.
+  local work = deps.work_root or (ctx.engine_root and ctx.engine_root ~= ""
+    and vim.fs.joinpath(ctx.engine_root, ".cache", "nvim-ue", "batch-work")
+    or vim.fs.joinpath(vim.env.TEMP or vim.env.TMP or vim.fn.stdpath("cache"), "nvim-ue-batch-work"))
   local argv = { python.path, "-B", vim.fs.joinpath(config, "tools", "cdb_batch_work_inventory.py"),
     "--work-root", work, "--out", output }
   local paths = ctx.paths or {}

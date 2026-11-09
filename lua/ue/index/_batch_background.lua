@@ -4,6 +4,58 @@ return function(M, core)
   local queue = require("ue.index.batch_background")
   local h = core.h
 
+  -- Shared by the background proof queue and the offline Tier 1 absorption.
+  -- opts.drain=false: the caller still owns RT.job and drains the queue itself.
+  -- opts.restart=false: the caller performs its own single reader reload.
+  M.apply_background_activation = function(ctx, generation, activated, opts)
+    opts = opts or {}
+    local probe = opts.probe or function() end
+    local state = h.ensure_index_state(ctx)
+    h.normalize_index_state(state)
+    if not activated or not activated.ok or activated.generation_id ~= generation.generation_id
+        or not activated.manifest or activated.manifest.generation_id ~= generation.generation_id then
+      probe("failed:activation", { state = "failed", reason = "background-proof-publication-failed",
+        activation_ok = activated and activated.ok or false, error = activated and activated.error or nil })
+      error("background-proof-publication-failed")
+    end
+    state.index_artifacts.full, state.index_selection = activated.manifest, activated.index_selection
+    local publication = activated.publication
+    if type(publication) == "table" and publication.changed == true and publication.original_changed == true then
+      -- Reuse the newly admitted owners in both priority phases. Cancel
+      -- independent timers so admission cannot let hot overtake current;
+      -- the single-job queue drains these in priority order.
+      for _, phase in ipairs({ "current", "hot" }) do
+        M.consume_index_phase(ctx, phase, state)
+        state.queue[phase] = h.unix_now()
+      end
+      -- The collector still holds the writer lease until publish returns.
+      if opts.drain ~= false then
+        vim.schedule(function()
+          if opts.current and not opts.current() then
+            probe("skipped:generation-changed-before-drain", { state = "failed", reason = "generation-changed" })
+          elseif not M.try_start_queued_build() and not (core.RT.job and core.RT.job.phase == "current") then
+            -- Not fatal (the queue drains later), but a priority rebuild that cannot start is evidence.
+            probe("deferred:queue-not-started", { state = "failed", reason = "try_start_queued_build-false",
+              running_phase = core.RT.job and core.RT.job.phase or nil })
+          else
+            probe("queued:current-hot", { state = "ok" })
+          end
+        end)
+      end
+    elseif type(publication) == "table" then
+      probe("noop:publication-unchanged", { state = "ok", changed = publication.changed,
+        original_changed = publication.original_changed })
+    end
+    h.save_index_state(ctx, state)
+    core.deps.invalidate_status_cache()
+    core.deps.refresh_statusline()
+    if opts.restart ~= false and (type(publication) ~= "table" or publication.changed ~= false) then
+      M.maybe_restart_clangd_for_index({ context = ctx,
+        original_changed = type(publication) == "table" and publication.original_changed or nil })
+    end
+    return publication
+  end
+
   M.start_background_batches = function(ctx, request)
     if not request or not request.enabled then return end
     local residual_limit, child_env = request.residual_strict_limit, request.env
@@ -71,48 +123,7 @@ return function(M, core)
           probe("skipped:generation-changed", { state = "failed", reason = "background-proof-generation-changed" })
           error("background-proof-generation-changed")
         end
-        local state = h.ensure_index_state(ctx)
-        h.normalize_index_state(state)
-        local activated = result.activation
-        if not activated or not activated.ok or activated.generation_id ~= generation.generation_id
-            or not activated.manifest or activated.manifest.generation_id ~= generation.generation_id then
-          probe("failed:activation", { state = "failed", reason = "background-proof-publication-failed",
-            activation_ok = activated and activated.ok or false, error = activated and activated.error or nil })
-          error("background-proof-publication-failed")
-        end
-        state.index_artifacts.full, state.index_selection = activated.manifest, activated.index_selection
-        local publication = activated.publication
-        if type(publication) == "table" and publication.changed == true and publication.original_changed == true then
-          -- Reuse the newly admitted owners in both priority phases. Cancel
-          -- independent timers so admission cannot let hot overtake current;
-          -- the single-job queue drains these in priority order.
-          for _, phase in ipairs({ "current", "hot" }) do
-            M.consume_index_phase(ctx, phase, state)
-            state.queue[phase] = h.unix_now()
-          end
-          -- The collector still holds the writer lease until publish returns.
-          vim.schedule(function()
-            if not current() then
-              probe("skipped:generation-changed-before-drain", { state = "failed", reason = "generation-changed" })
-            elseif not M.try_start_queued_build() and not (core.RT.job and core.RT.job.phase == "current") then
-              -- Not fatal (the queue drains later), but a priority rebuild that cannot start is evidence.
-              probe("deferred:queue-not-started", { state = "failed", reason = "try_start_queued_build-false",
-                running_phase = core.RT.job and core.RT.job.phase or nil })
-            else
-              probe("queued:current-hot", { state = "ok" })
-            end
-          end)
-        elseif type(publication) == "table" then
-          probe("noop:publication-unchanged", { state = "ok", changed = publication.changed,
-            original_changed = publication.original_changed })
-        end
-        h.save_index_state(ctx, state)
-        core.deps.invalidate_status_cache()
-        core.deps.refresh_statusline()
-        if type(publication) ~= "table" or publication.changed ~= false then
-          M.maybe_restart_clangd_for_index({ context = ctx,
-            original_changed = type(publication) == "table" and publication.original_changed or nil })
-        end
+        M.apply_background_activation(ctx, generation, result.activation, { probe = probe, current = current })
       end,
     }
     return queue.start(spec, { max_workers = residual_limit and 1

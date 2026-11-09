@@ -32,6 +32,11 @@ local function defaults()
       debounce_hot_ms    = 8000,
       restart_debounce_s = 45,
       status_ttl_s       = 30,
+      pch_offline = {
+        enabled = true, -- capability probe decides availability; false disables it
+        bin_dir = "~/.cache/clangd-pch-22.1.5/metadata-v21/bin",
+        timeout_s = 1800,
+      },
     },
     -- One host-resource policy for every workload class. Sensor data lives in
     -- utils.cpu_load; decisions and foreground ownership live in

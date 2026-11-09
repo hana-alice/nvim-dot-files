@@ -107,8 +107,12 @@ t.describe("index 构建失败必须可见（notify + 结构化日志）", funct
   local build_src
   local function src()
     if not build_src then
-      local path = vim.fn.stdpath("config") .. "/lua/ue/index/_build.lua"
-      build_src = table.concat(vim.fn.readfile(path), "\n")
+      -- The failure report lives in _delivery.lua (split for the 800-line gate).
+      local parts = {}
+      for _, name in ipairs({ "_build.lua", "_delivery.lua" }) do
+        parts[#parts + 1] = table.concat(vim.fn.readfile(vim.fn.stdpath("config") .. "/lua/ue/index/" .. name), "\n")
+      end
+      build_src = table.concat(parts, "\n")
     end
     return build_src
   end

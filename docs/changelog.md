@@ -112,6 +112,8 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v2.13.1` → [docs/release_2.13.1.md](release_2.13.1.md) (engine-following caches, select-confirm fix, cold-index research record; full regression 4472/4472, 2 skips; tag pending)
 
+- `v2.14.0` → [docs/release_2.14.0.md](release_2.14.0.md) (private prefix-PCH offline index with offline Tier 1 absorption; full regression 4485/4485, 2 skips; tag pending)
+
 ## Unreleased
 
 ### 2026-10-26 — Use double brackets for review hunk navigation

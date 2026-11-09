@@ -124,6 +124,29 @@ clangd 是长驻交互式服务，终止会丢弃已构建的 preamble。系统 
 
 ## 选型与踩坑
 
+- **离线 PCH 吸收普通 Tier 1（2026-11-06，方向 A）**：full 离线运行把后台 proof 计划中的普通
+  Tier 1 组以规范 wrapper 放进私有 paired 输入，由同一次私有 PCH clangd 运行判定
+  compile_success / main_shards_complete / members_equal；通过组写成按官方 reader 计算 key 的
+  schema-1 receipt，再经 cache-only collect 与原隔离发布 worker 在同一 writer lease 下发布。
+  这是**资格权威变更**（用户批准）：被吸收组的证据来自私有 PCH clangd 而非官方重新索引。
+  失败组按组回落原 UBT 行；plan/collect 失败只关闭吸收，不影响 PCH producer 交付。
+
+- **私有 PCH 离线接入（2026-11-05，S2）**：仅 full 在语义 CDB 发布后、reader 交付前异步
+  运行可探测的私有 producer，沿用 writer lease；官方 clangd 的命令与语义权威不变，普通
+  SuperUnity/Tier 1 构造和发布不变。没有私有工具、工具失败或超时均记录证据并回到原交付。
+  完成态 receipt 包含失败 TU，输入未变不重复尝试；工具跳过且 CDB 未变不重启。producer
+  失败的 TU 直接交官方，不在普通离线通道重复编译。R42 snapshot overlay 与磁盘不一致
+  造成的重建不能当工具失效；R43 门禁按已发布 TU 官方零重建放行。当前小范围接线验收
+  不代表全工程性能已验收。
+
+- **离线 PCH 失效两档（2026-11-05，S3）**：正确性只依赖官方 reader 加载时的逐 shard
+  摘要检查，离线工具的 receipt 只决定是否值得重跑。receipt 记录每 TU 的根（源、强制头、
+  overlay、失败 PCH 上下文）与 shard include 图；输入变化后反向求受影响 TU，比例或缺失
+  shard 比例超过阈值（默认 0.5，依据 R41 引擎漂移命中 94%）重跑离线全量，否则跳过，由
+  reader 自行重建过期 shard。producer 失败上下文用 `-M -MG` 绑定前缀闭包（缺失 generated
+  头也入列）。overlay 映射不建图边，避免每个 TU 扇出到整个引擎。离线发布与运行中 reader
+  同目录写入经 40 TU 实测无错误、无残留，合并后的 store 官方重载零重建。
+
 - **Tier 2 整模块与 exact 扩展（2026-11-02，实现阶段）**：可选 Tier 2 保持默认关闭，
   按完整模块规划，使用独立可配置的成员字节/依赖闭包预算，不再把八个 UBT 当语义上限。
   复用当前有效 Tier 1 整模块编译失败证据排除不可用模块；未知结果必须经真实私有整模块

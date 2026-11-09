@@ -455,8 +455,9 @@ M.build_phase_async = function(ctx, phase, opts)
     config = { "clangd.candidates_extra" },
     driver_candidates = function(driver) return driver.default_clangd_candidates() end })
   local process_config = vim.lsp.config and vim.lsp.config.clangd or {}
+  local reader_command = require("ue").clangd_cmd(ctx.engine_root)
   local server_profile, profile_error = require("ue.index.batch_runtime").server_profile(
-    require("ue").clangd_cmd(ctx.engine_root), process_config)
+    reader_command, process_config)
   local background_request
   if clangd.ok and not profile_error then
     vim.list_extend(cmd, { "--verified-batches", "--clangd", clangd.path, "--batch-size", "8" })
@@ -594,6 +595,24 @@ M.build_phase_async = function(ctx, phase, opts)
         finished_at = unix_now(),
       }
       local function finalize(publication_error, publication_result)
+        -- Hold the phase lease/job through the optional asynchronous producer.
+        -- Every outcome returns here, so delivery and release happen once.
+        local function finish_build()
+          if ok_result then
+            progress_finish()
+          else
+            local detail = fs.trim(live_state.build and live_state.build.message or "")
+            M.report_index_build_failure({ phase = phase, exit_code = result.code, modules = #selected_keys,
+              elapsed_s = elapsed_s, detail = detail ~= "" and detail or last_line }, progress_finish)
+          end
+
+          core.deps.invalidate_status_cache()
+          core.deps.refresh_statusline()
+          file_lock.release(phase_lease)
+          RT.job = nil
+          if ok_result and background_request and not ctx._headless_index_fixture then background_request.env = child_env; M.start_background_batches(ctx, background_request) end
+          M.try_start_queued_build()
+        end
         if publication_error then
           ok_result, stderr = false, tostring(publication_error)
           live_state.index_timings[phase].status = "error"
@@ -670,20 +689,31 @@ M.build_phase_async = function(ctx, phase, opts)
           -- Phase/coverage metadata may change without changing clangd's commands.
           -- Preserve its in-flight index work when the published CDB is identical.
           local publication_changed = type(publication) ~= "table" or publication.changed ~= false
-          if selection and promoted and source_pending then
-            M.deliver_source_refresh(ctx, selected_keys)
-          elseif selection_changed and promoted and publication_changed then
-            local restart_options = { context = ctx,
-              same_generation = prev_generation ~= "" and prev_generation == snapshot.generation_id }
-            if type(publication) == "table" then
-              restart_options.original_changed = publication.original_changed
-              restart_options.original_append_only = publication.original_append_only
+          local function deliver(offline)
+            local produced = offline and offline.ok and offline.skipped ~= true
+            if selection and promoted and source_pending then
+              M.deliver_source_refresh(ctx, selected_keys)
+            elseif promoted and ((selection_changed and publication_changed) or produced) then
+              local restart_options = { context = ctx,
+                same_generation = prev_generation ~= "" and prev_generation == snapshot.generation_id }
+              if type(publication) == "table" then
+                restart_options.original_changed = publication.original_changed
+                restart_options.original_append_only = publication.original_append_only
+              end
+              -- A new shard set needs a reader reload rather than an additive
+              -- CDB wake-up. The ordinary reader/recovery safety checks remain.
+              if produced then restart_options.original_append_only = false end
+              M.maybe_restart_clangd_for_index(restart_options)
             end
-            M.maybe_restart_clangd_for_index(restart_options)
-          end
-          if not (selection and promoted) then
             -- Produced artifacts without selection/promotion are failed delivery.
-            ok_result = false
+            if not (selection and promoted) then ok_result = false end
+            finish_build()
+          end
+          if phase == "full" and selection and promoted then -- lease held until deliver()
+            M.run_pch_offline(ctx, { python = python, env = child_env, command = reader_command,
+              tier1 = not ctx._headless_index_fixture and M.pch_offline_tier1_request(background_request, phase_lease) or nil }, deliver)
+          else
+            deliver()
           end
         else
           live_state.build = {
@@ -695,38 +725,8 @@ M.build_phase_async = function(ctx, phase, opts)
             active_index = live_state.build.active_index or "",
           }
           save_index_state(ctx, live_state)
+          finish_build()
         end
-
-        -- Failure must be visible in both the log and the user notification.
-        if ok_result then
-          progress_finish()
-        else
-          local detail = fs.trim(live_state.build and live_state.build.message or "")
-          if detail == "" then detail = last_line end
-          pcall(function()
-            require("utils.log").error_ctx("ue.index", "controlled index build failed", {
-              phase = phase,
-              exit_code = result.code,
-              modules = #selected_keys,
-              elapsed_s = math.floor(elapsed_s * 10 + 0.5) / 10,
-              detail = detail ~= "" and detail:sub(1, 400) or nil,
-            })
-          end)
-          progress_finish(string.format("%s FAILED", phase))
-          vim.notify(string.format(
-            "UE index: %s build failed (exit %s) -- C++ definition navigation stays degraded.\n%s\nSee :NvimLog for details.",
-            phase,
-            tostring(result.code),
-            detail ~= "" and detail:sub(1, 200) or "no output captured"),
-            vim.log.levels.ERROR, { title = "UE index" })
-        end
-
-        core.deps.invalidate_status_cache()
-        core.deps.refresh_statusline()
-        file_lock.release(phase_lease)
-        RT.job = nil
-        if ok_result and background_request and not ctx._headless_index_fixture then background_request.env = child_env; M.start_background_batches(ctx, background_request) end
-        M.try_start_queued_build()
       end
 
       if ok_result and ((phase ~= "current" and M.phase_barrier_pending and M.phase_barrier_pending(ctx))

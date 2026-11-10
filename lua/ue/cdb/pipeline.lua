@@ -592,7 +592,7 @@ function M.run(path, targets, on_done, opts)
   -- Register the pipeline in the generic task registry so :Tasks can
   -- list/cancel it. Register-only side path per task_registry contract:
   -- single pcall AFTER job creation, nothing added to on_exit callbacks.
-  -- (Each step streams its own live log under stdpath('log')/ue-pipeline-*;
+  -- (Each step streams its own live log under <engine>/.cache/nvim-ue/logs/ue-pipeline-*;
   -- failures carry the exact per-step log path.)
   pcall(function()
     require("utils.task_registry").register({

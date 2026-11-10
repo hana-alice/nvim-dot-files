@@ -67,6 +67,9 @@
   `_publish.lua` 发布前重验收据声明的输入与候选字节，合格候选进入普通 live CDB，失效块保留原 UBT。
   Tier 1 不预置 shard、不授予 frozen 权限，头文件不属于其资格缓存失效边界；小 CDB 的批次校验也交给
   既有 publication worker。临时验证失败不形成永久负缓存，overlay 物理检查只在一次 collect/reuse 内复用。
+  可选私有前缀 PCH 离线索引（`lua/ue/index/pch_offline.lua` → `tools/clangd_pch_offline.py` + `tools/pch_offline_tier1.py`）：
+  full CDB 发布后，在同一 writer lease 内，由能力探测通过的私有 clangd 预产 shard，并吸收普通 Tier 1 组（receipt 按官方 reader 计算 key）。
+  官方 reader 加载时的逐 shard 摘要检查仍是正确性权威。工具缺失、失败或超时都回到原交付路径。
   资格首次成本、实际阶段收益与全工程缺口见 `docs/release_2.9.0.md`。
   严格路线的二次批次由独立原 TU 完整图证明，冻结输入与 receipt 绑定；原 semantic CDB 继续负责 native
   definition，冻结 BackgroundIndex 使用独立目录与缓存。先监听再异步验证才可启用；输入变化

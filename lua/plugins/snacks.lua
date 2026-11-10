@@ -512,7 +512,13 @@ return {
         enabled = false,
       })
       opts.picker = opts.picker or {}
-      opts.picker.confirm = require("utils.layout").confirm
+      -- Route the default confirm through layout via actions.confirm, NOT the
+      -- top-level `confirm` shortcut: Snacks.picker.select runs config.get twice,
+      -- and on the second pass a global `confirm` re-expands over select's own
+      -- actions.confirm, so every vim.ui.select <CR> became a file jump
+      -- ("Either item.buf or item.file is required"). Source-level confirm still wins.
+      opts.picker.actions = opts.picker.actions or {}
+      opts.picker.actions.confirm = require("utils.layout").confirm
       opts.picker.layout = vim.tbl_deep_extend("force", { preset = "vscode" }, opts.picker.layout or {})
 
       -- Per-source layout overrides:

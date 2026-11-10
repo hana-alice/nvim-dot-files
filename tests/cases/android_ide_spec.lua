@@ -275,7 +275,7 @@ t.describe("history hub: searches worth finding again", function()
     local loaded = history.load(key)
     t.assert_eq(#loaded, 1)
     t.assert_eq(loaded[1].count, 2)
-    os.remove(vim.fs.joinpath(vim.fn.stdpath("state"), "ue_search_history", key .. ".json"))
+    os.remove(require("utils.search_history_store").path(key))
   end)
 
   t.it("every history surface has a runnable entry and a key", function()

@@ -356,7 +356,8 @@ do
       }
     end
 
-    local shim, shim_err = libclang.ensure_cursor_shim(self.toolchain)
+    local shim, shim_err = libclang.ensure_cursor_shim(self.toolchain,
+      { cache_root = libclang.engine_cache_of(record.path) })
     if not shim then
       return {
         v = self.protocol.VERSION,

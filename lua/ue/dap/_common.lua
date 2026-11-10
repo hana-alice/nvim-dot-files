@@ -39,7 +39,7 @@ function M._lldb_dap_env()
   -- tool/lldb-dap.cpp L644 (getenv "LLDBDAP_LOG"). Captures full DAP
   -- request/response/event stream including state transitions that
   -- nvim-dap log can't see.
-  local log_file = vim.fn.stdpath("cache") .. ("/lldb-dap-protocol.%d.log"):format(vim.fn.getpid())
+  local log_file = require("ue.engine_cache").file("logs", ("lldb-dap-protocol.%d.log"):format(vim.fn.getpid()), vim.fn.stdpath("cache"))
   -- Truncate previous run's log so each attach session is fresh
   local f = io.open(log_file, "w")
   if f then f:close() end

@@ -20,23 +20,29 @@ local MODULE_REVISION = "contextual-clang-v3"
 local TRACE_MAX = 200
 local trace_ring = {}
 local trace_idx = 0
-local DISK_LOG = vim.fn.stdpath("cache") .. ("/ue_def_trace.%d.log"):format(vim.fn.getpid())
+-- Resolved on first trace so it follows the engine of the buffer being
+-- navigated (<engine>/.cache/nvim-ue/logs); stdpath cache without an engine.
+local DISK_LOG
 
-pcall(function()
+local function disk_log()
+  if DISK_LOG then return DISK_LOG end
+  DISK_LOG = require("ue.engine_cache").file("logs",
+    ("ue_def_trace.%d.log"):format(vim.fn.getpid()), vim.fn.stdpath("cache"))
   local f = io.open(DISK_LOG, "w")
   if f then
     f:write(string.format("=== module loaded rev=%s at %s ===\n",
       MODULE_REVISION, os.date("%Y-%m-%d %H:%M:%S")))
     f:close()
   end
-end)
+  return DISK_LOG
+end
 
 local function dtrace(fmt, ...)
   trace_idx = trace_idx + 1
   local line = string.format("[%s #%d] " .. fmt, os.date("%H:%M:%S"), trace_idx, ...)
   trace_ring[((trace_idx - 1) % TRACE_MAX) + 1] = line
   pcall(function()
-    local f = io.open(DISK_LOG, "a")
+    local f = io.open(disk_log(), "a")
     if f then f:write(line .. "\n"); f:close() end
   end)
 end

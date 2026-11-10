@@ -185,4 +185,26 @@ return function(M, core)
     end
     return rows
   end
+
+  -- A failed controlled build must be visible in both the log and the user
+  -- notification (the "silently degraded gd" symptom above).
+  M.report_index_build_failure = function(failure, progress_finish)
+    local detail = failure.detail or ""
+    pcall(function()
+      require("utils.log").error_ctx("ue.index", "controlled index build failed", {
+        phase = failure.phase,
+        exit_code = failure.exit_code,
+        modules = failure.modules,
+        elapsed_s = math.floor(failure.elapsed_s * 10 + 0.5) / 10,
+        detail = detail ~= "" and detail:sub(1, 400) or nil,
+      })
+    end)
+    progress_finish(string.format("%s FAILED", failure.phase))
+    vim.notify(string.format(
+      "UE index: %s build failed (exit %s) -- C++ definition navigation stays degraded.\n%s\nSee :NvimLog for details.",
+      failure.phase,
+      tostring(failure.exit_code),
+      detail ~= "" and detail:sub(1, 200) or "no output captured"),
+      vim.log.levels.ERROR, { title = "UE index" })
+  end
 end

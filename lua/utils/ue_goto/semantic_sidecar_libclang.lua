@@ -530,7 +530,17 @@ local function compile_cursor_shim(compiler, source, output)
   return result
 end
 
-function M.ensure_cursor_shim(toolchain)
+-- `<engine>/.cache/nvim-ue` ancestor of a controlled CDB path (pure string:
+-- the sidecar process must not load the ue façade). nil when absent.
+function M.engine_cache_of(path)
+  local normalized = type(path) == "string" and path:gsub("\\", "/") or ""
+  local prefix = normalized:match("^(.-/%.cache/nvim%-ue)/")
+  return prefix
+end
+
+--- opts.cache_root: engine cache (from the controlled CDB) so the built shim
+--- follows the engine; stdpath cache only without one.
+function M.ensure_cursor_shim(toolchain, opts)
   local clangd_path = toolchain and toolchain.clangd_path or nil
   local toolchain_identity = toolchain and toolchain.toolchain_identity or ""
   local source = M.normalize(vim.fs.joinpath(vim.fn.stdpath("config"), "scripts", "ue_clang_cursor_shim.c"))
@@ -547,7 +557,9 @@ function M.ensure_cursor_shim(toolchain)
     return cursor_shim_cache[build_key]
   end
 
-  local out_dir = M.normalize(vim.fs.joinpath(vim.fn.stdpath("cache"), "ue_cursor_shim", build_key))
+  local cache_root = opts and opts.cache_root
+  local out_dir = M.normalize(cache_root and vim.fs.joinpath(cache_root, "cursor-shim", build_key)
+    or vim.fs.joinpath(vim.fn.stdpath("cache"), "ue_cursor_shim", build_key))
   vim.fn.mkdir(out_dir, "p")
   local output = M.normalize(vim.fs.joinpath(out_dir, "ue_clang_cursor_shim" .. cursor_shim_ext()))
   if not M.file_exists(output) then

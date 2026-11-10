@@ -38,6 +38,17 @@ if case == 'reference':
     assert row(result)['category']=='referenced', result
     assert row(result)['logical_bytes']==payload.stat().st_size
     assert row(result)['references'][0]['kind']=='graphs'
+elif case == 'engine_cache':
+    cache = root/'Engine'/'.cache'/'nvim-ue'
+    engine_store = cache/'projects'/'p'/'clangd'/'a'/'index'
+    engine_work = _proof_work_root(engine_store)
+    assert engine_work.parent == (cache/'batch-work').resolve(), engine_work
+    nested = engine_work/'proof-two'; nested.mkdir(parents=True)
+    (nested/'stray.json').write_text('not metadata')
+    write(cache/'projects'/'p'/'batches.json', {'receipts': []})
+    result=m.inventory(cache/'batch-work', [cache], observe=observe)
+    assert not any('stray.json' in e['path'] for e in result['errors']), result['errors']
+    assert any(u['path']==str(nested) for u in result['units']), result['units']
 elif case == 'historical':
     write(refs/'worker-result.json', {'metrics': {'proof_directory':str(unit)}})
     result=m.inventory(work, [refs], observe=observe)
@@ -165,7 +176,7 @@ print('ok')
 ]=]
 
 t.describe("batch proof TEMP dry-run inventory", function()
-  for _, case in ipairs({ "reference", "historical", "active", "unknown", "lock_unknown", "links", "cli",
+  for _, case in ipairs({ "reference", "engine_cache", "historical", "active", "unknown", "lock_unknown", "links", "cli",
     "short_aliases", "missing_store", "identity_links" }) do
     local python = vim.fn.exepath("python")
     if python == "" then python = vim.fn.exepath("python3") end

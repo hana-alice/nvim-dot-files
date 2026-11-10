@@ -57,4 +57,25 @@ t.describe("clangd per-session TEMP", function()
     temp.spawn_env(nil, deps)
     t.assert_eq(sweeps, 1)
   end)
+
+  t.it("places TEMP under the engine cache when an engine is known (K76)", function()
+    temp._reset_for_test()
+    local engine = fixture()
+    local env = temp.spawn_env(nil, { engine_root = engine, pid = 55, process_exists = function() return true end })
+    t.assert_eq(env.TEMP, vim.fs.joinpath(engine, ".cache", "nvim-ue", "clangd-tmp", "55"))
+    t.assert_eq(temp.root({}), vim.fs.joinpath(vim.fn.stdpath("state"), "clangd-tmp"))
+  end)
+
+  t.it("still sweeps dead sessions left in the legacy stdpath root", function()
+    temp._reset_for_test()
+    local engine, roots = fixture(), {}
+    local original = temp.sweep
+    temp.sweep = function(deps) roots[#roots + 1] = deps.root; return 0 end
+    temp.spawn_env(nil, { engine_root = engine, pid = 56, process_exists = function() return true end })
+    temp.spawn_env(nil, { engine_root = engine, pid = 56, process_exists = function() return true end })
+    temp.sweep = original
+    t.assert_eq(#roots, 2)
+    t.assert_eq(roots[1], vim.fs.joinpath(engine, ".cache", "nvim-ue", "clangd-tmp"))
+    t.assert_eq(roots[2], vim.fs.joinpath(vim.fn.stdpath("state"), "clangd-tmp"))
+  end)
 end)

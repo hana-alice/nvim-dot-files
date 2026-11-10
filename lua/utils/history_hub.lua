@@ -11,7 +11,8 @@
 --     query, dedupe case-insensitively);
 --   * offers one hub that lists every history surface.
 --
--- Storage: one small JSON file per project under stdpath("state"); written on
+-- Storage: utils.search_history_store (with the project's engine; stdpath("state")
+-- only without one); written on
 -- use only (no timers). Bounded by MAX_ENTRIES.
 
 local M = {}

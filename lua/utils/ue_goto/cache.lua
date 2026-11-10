@@ -96,7 +96,10 @@ local function project_dir_for(bufnr)
   local base = norm:match("([^/]+)$") or "unknown"
   -- sanitize basename for filesystem (drop weird chars)
   base = base:gsub("[^%w%-_.]", "_")
-  local cache_root = vim.fn.stdpath("data") .. "/ue_def_cache"
+  -- No project selected yet: still keep the cache with the engine; the
+  -- stdpath data dir is used only when the root has no engine above it.
+  local cache_root = require("ue.engine_cache").dir_or("definition-cache",
+    vim.fn.stdpath("data") .. "/ue_def_cache", { path = engine_root, current = false })
   local dir = string.format("%s/%s-%s", cache_root, hash8(norm), base)
   return dir, norm
 end

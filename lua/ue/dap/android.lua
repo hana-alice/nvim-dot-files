@@ -655,7 +655,7 @@ local function append_bp_diag(lines)
   if type(lines) == "string" then lines = { lines } end
   if type(lines) ~= "table" then return end
   pcall(function()
-    local path = vim.fn.stdpath("cache") .. ("/ue-dap-bp-diag.%d.log"):format(vim.fn.getpid())
+    local path = require("ue.engine_cache").file("logs", ("ue-dap-bp-diag.%d.log"):format(vim.fn.getpid()), vim.fn.stdpath("cache"))
     local fh = io.open(path, "a")
     if not fh then return end
     for _, line in ipairs(lines) do
@@ -1683,7 +1683,7 @@ function M._finalize_attach_config(sess, pid, cfg_name, run_label)
   cfg._ue_operation_id = sess._operation and sess._operation.id
   -- K33 diagnosis: pick the first current nvim breakpoint as the post-attach
   -- probe so post_run_commands logs `image lookup` + `breakpoint list` to
-  -- stdpath('cache')/ue-dap-bp-diag.log. Non-mutating, does not resume.
+  -- <engine>/.cache/nvim-ue/logs/ue-dap-bp-diag.<pid>.log. Non-mutating, does not resume.
   do
     local ok_c, cur = pcall(current_breakpoint_commands)
     if ok_c and type(cur) == "table" and #cur > 0 then

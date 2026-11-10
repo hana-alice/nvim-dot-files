@@ -57,6 +57,7 @@ require("ue.index._recover")(M, core)
 require("ue.index._delivery")(M, core)
 require("ue.index._clangd")(M, core)
 require("ue.index._source")(M, core)
+require("ue.index.pch_offline")(M, core)
 require("ue.index._build")(M, core)
 require("ue.index._batch_background")(M, core)
 -- After _build: admission policy gates build_phase_async starts.

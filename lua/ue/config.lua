@@ -34,7 +34,7 @@ local function defaults()
       status_ttl_s       = 30,
       pch_offline = {
         enabled = true, -- capability probe decides availability; false disables it
-        bin_dir = "~/.cache/clangd-pch-22.1.5/metadata-v24c/bin",
+        bin_dir = "~/.cache/clangd-pch-22.1.5/metadata-v26/bin",
         timeout_s = 1800,
       },
     },

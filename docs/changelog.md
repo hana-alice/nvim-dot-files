@@ -120,4 +120,15 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
-(empty)
+### 2026-11-11 — gd inside Diffview no longer breaks the diff pair
+
+**Task**
+- In a Diffview tab (`<leader>gv`), `gd` replaced the current diff pane's buffer with the target file. The other pane was left alone and the diff became unusable. CodeDiff already routed `gd` to the editing tab; Diffview did not.
+
+**Implemented**
+- New `lua/utils/layout_diffview.lua`: reads the already-loaded `diffview.lib` (`tabpage_to_view`) and builds review-group options (valid/focus/restore, repo, selected path). It never loads Diffview.
+- `lua/utils/layout.lua`: `navigation_owner` and `discover_groups` register a Diffview tab as a `review` group. `routes_to_normal` is therefore true there, and `gd`, LSP jumps and picker confirmations go to the normal editing tab (`<leader>w[` returns). CodeDiff-only token retirement is restricted to `owner == "codediff"`.
+
+**Validation**
+- New `tests/cases/git_review_diffview_goto_spec.lua` (real LazyVim child, real `<leader>gv`): a jump from either pane lands in the editing tab, and both panes keep their buffer and `diff` mode. After `DiffviewClose` the tab routes normally again. It fails without the fix ("Diffview tab is not a review owner").
+- `layout` 158/158, `review` 128/128.

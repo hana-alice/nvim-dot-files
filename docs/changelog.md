@@ -120,6 +120,21 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 ## Unreleased
 
+### 2026-11-11 — UEPrepare warns about stale UHT output; quieter index logs
+
+**Task**
+- UEPrepare builds compile_commands from the last build's `.rsp` files and never runs UnrealHeaderTool. After a branch switch, `*.generated.h` and its line-keyed `GENERATED_BODY` macros went stale, and clangd reported dozens of false errors that came from the shared PCH.
+- Daily logs showed recurring noise: `Git tracked inventory unavailable:` with an empty reason, `atomic replace failed: EPERM`, and thousands of identical `background proof retained originals` WARN lines.
+
+**Changes**
+- New `ue.cdb.uht_freshness`: after prepare, compares each UHT `Inc/<Module>/Timestamp` against the headers it lists for the active platform. If any are newer, prepare shows a WARN asking you to build once and then `:LspRestart`. It runs asynchronously and finished in under 1s on 4.6k headers.
+- The Git tracked-file inventory timeout goes from 15s to 120s. A timeout (exit 124) is now reported as a timeout, and other failures include the exit code.
+- `write_all` retries the rename up to three times (10/25/50ms) on EPERM/EACCES/EBUSY. Windows rejects the replace while another process briefly holds the target open.
+- The background proof logs a repeated failure reason once instead of every 5s retry.
+
+**Tests**
+- `tests/cases/ue_uht_freshness_spec.lua` (4 cases), plus `file_inventory` and `index_batch` regressions.
+
 ### 2026-11-11 — gd inside Diffview no longer breaks the diff pair
 
 **Task**

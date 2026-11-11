@@ -175,9 +175,14 @@ function M.start(spec, opts)
   end
   record.finish = finish
   persist()
+  local last_logged_reason
   local function log_error(reason)
     record.error = reason
     persist()
+    -- A busy publication writer re-arms every 5s; log each distinct reason once
+    -- per run of repeats instead of thousands of identical WARN lines.
+    if reason == last_logged_reason then return end
+    last_logged_reason = reason
     pcall(function() require("utils.log").warn_ctx("ue.index", "background proof retained originals",
       { reason = reason, scope = spec.scope }) end)
   end
@@ -313,7 +318,7 @@ function M.start(spec, opts)
         else log_error("invalid-proof-collection") end
       else log_error(result.stderr or "proof-collection-failed") end
       if delivered then
-        record.error = nil
+        record.error, last_logged_reason = nil, nil
         record.collect_accepted = collected.metrics and (collected.metrics.collect_accepted_count or collected.metrics.batch_count) or 0
         record.published_count, record.last_publish = #record.completed, now()
         record.publications = (record.publications or 0) + 1

@@ -112,6 +112,14 @@ local function add_candidate(candidates, seen, dir, source)
   local cdb = fs.join(dir, "compile_commands.json")
   local stat = (vim.uv or vim.loop).fs_stat(cdb)
   if stat and stat.type == "file" then
+    -- Case-insensitive hosts (default macOS APFS, Windows) resolve
+    -- build/debug and build/Debug to the same file: keep the first spelling,
+    -- which is the declared preset, instead of letting the name sort decide.
+    local file_key = (tonumber(stat.ino) or 0) ~= 0 and ("inode:" .. tostring(stat.dev) .. ":" .. tostring(stat.ino)) or nil
+    if file_key then
+      if seen[file_key] then return end
+      seen[file_key] = true
+    end
     local mtime = stat.mtime
     candidates[#candidates + 1] = {
       dir = dir,

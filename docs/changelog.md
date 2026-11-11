@@ -132,3 +132,16 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 **Validation**
 - `index_pch_offline` 13/13; `python -B -I tests/py/test_clangd_pch_offline.py` 42/42; full regression see commit.
+
+### 2026-11-11 — Fix headless CI on all three hosts
+
+**Task**
+- `headless` had been failing on ubuntu, macOS and Windows since several pushes ago.
+
+**Implemented**
+- `tools/clangd_pch_offline.py` `parse_depfile`: Windows drive-letter paths (`D:\...`, `C:/...`) are treated as absolute on POSIX hosts as well. Previously `os.path.join("/work", "D:\\...")` produced `/work/D:\...`. This was the ubuntu and macOS failure.
+- `lua/utils/clangd_workspace.lua` `add_candidate`: also deduplicate by `compile_commands.json` dev:inode. On a case-insensitive filesystem (default macOS APFS), `build/debug` and `build/Debug` are the same file, and the name sort used to pick `Debug` over the declared preset spelling. This was the macOS `ue.clangd_cmd` / `utils.clangd_workspace` failure.
+- `.github/workflows/headless.yml`: the Windows lane (`NVIM_TEST_REQUIRE_NATIVE=1`) downloads the `v2.15.0` release clangd-pch zip with a pinned sha256 and installs it to `~/.cache/clangd-pch-22.1.5/metadata-v26/bin`. The 3 native offline-loader cases no longer fail with `private-binaries-missing`. Both exes import only system DLLs (KERNEL32/ADVAPI32/ntdll/VERSION/OLEAUT32).
+
+**Validation**
+- Local: py 42/42 (plus POSIX `os.path` emulation of the depfile case), `utils` 51/51, `ue_api` 67/67, `index_pch_offline` 13/13, `git_review_tree` 9/9. macOS case-insensitivity and the CI download step are verified only on CI.

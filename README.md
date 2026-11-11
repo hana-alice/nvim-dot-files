@@ -7,9 +7,11 @@
 
 ## Features
 
-- **Super-unity indexing** — collapses 11,593 translation units into ~23
-  aggregator TUs, cutting a full cold index from **hours to ~3 minutes** on
-  Windows/NTFS while keeping ≥90% of symbols.
+- **Fast cold indexing** — an optional offline prefix-PCH indexer (private
+  clangd fork) plus Tier 1 SuperUnity absorption produces the clangd index
+  store before the official clangd loads it: a full cold index of a large UE
+  project went from **1261 s to 253–293 s** on a quiet Windows host, and the
+  official clangd then loads that store without re-indexing.
 - **Context-aware C++ goto-definition**: source calls use clangd's exact-cursor
   identity; headers resolve in a compiler-proven origin TU through an async
   libclang sidecar.
@@ -30,22 +32,73 @@ The editor remains general-purpose; UE features no-op when no UE project is pres
 
 ## Benchmarks
 
-Measured on UEProj: **11,593 `.cpp` files**, 757 `-D` macros per CDB entry,
-on Windows/NTFS — where directory recursion and per-TU indexing are the real
-bottlenecks.
+Measured on large UE projects on Windows/NTFS, where directory recursion and
+per-TU indexing are the real bottlenecks.
 
-### Super-unity indexing — the headline
+### Cold full index — the headline
 
-A naive one-index-per-TU cold build of a UE project runs for **hours**. The
-super-unity pipeline collapses the 11,593 translation units into **~23
-aggregator TUs**, then indexes those — a full cold index in **~3 minutes**,
-keeping ≥90% of symbols.
+Wall time of the offline prefix-PCH indexer for one full cold index of the same
+project (generated UHT headers were refreshed once along the way). Every run
+passed the correctness gates: no fallback, no shard mismatch, and the official
+clangd reloads the store with zero re-index:
 
 ```
-Full cold index (11,593 TUs)
-  naive per-TU     ████████████████████████████████████████  hours
-  super-unity      ██▏ ~3 min     (collapses 11,593 TUs → ~23)
+Cold full index (lower is better)
+  baseline            ████████████████████████████████████████  1261 s
+  + Tier 1 absorption ██████████████████████████▎               830 s
+  + ordered schedule  █████████████████▎                        545 s
+  + seed gate         ████████████████▏                         510 s
+  + thin-PCH filters  ███████████▎                              357 s
+  + PGO/LTO/caches    ████████▌                                 268 s (median)
 ```
+
+Acceptance was pre-registered as "median of a 3-run batch ≤ 300 s". Seven
+consecutive batches met it (medians 254.9–294.7 s), and 15 of 15 runs after a
+disk cleanup stayed ≤ 300 s. With heavy concurrent clangd/python load on the
+same machine the run still takes 370–430 s, because the indexer's workers run
+at idle priority and yield the CPU.
+
+### What made it fast
+
+Counted per batch: each batch is a set of changes measured together by one
+full cold index.
+
+| Area | Optimization | Status |
+| --- | --- | --- |
+| Pipeline | Tier 1 SuperUnity groups absorbed by the same offline run (receipts keyed for the official reader) | adopted |
+| Pipeline | Ordered schedule (seed first per context, then by size); skip already-published shards | adopted |
+| Pipeline | Parallel prepare overlay, include-graph and publish; background publish/commit overlapping the retry lane | adopted |
+| Pipeline | Retry lane re-indexes failed wrappers as their original UBT rows (fallback 51 → 0) | adopted |
+| Pipeline | One-shot PCH production, 4-thread Tier 1 prepare/commit, parallel index lanes | adopted |
+| Pipeline | didOpen → didClose inside lanes; skip clangd's idle index rebuild | adopted |
+| clangd fork | Seed gate: later TUs of a context wait for the seed, then reuse a thin PCH | adopted |
+| clangd fork | Prefix-header shard preload; seeds shared across contexts that differ only in path spelling | adopted |
+| clangd fork | Native-path filter + thin TUs skip loading prefix top-level decls (510 → 357 s) | adopted |
+| clangd fork | rpmalloc, PGO, ThinLTO builds | adopted |
+| clangd fork | Per-process cache of parsed VFS overlay files | adopted |
+| Rejected | Merge contexts by path-separator spelling (output beyond noise) | opt-in only |
+| Rejected | Fold Tier 1 retries into the paired lane (correct after a fix, but slower in both A/B pairs) | opt-in only |
+| Rejected | Speculative PCH producer (+19% CPU) | opt-in only |
+| Rejected | Higher `-j`, `-w`, EcoQoS priority, extended prefix closure, early retry overlap | dropped |
+
+Measurement discipline: pre-registered verdicts, ABAB pairs, a start gate on
+host CPU and on CPU used by outside clangd/python processes, per-run accounting
+of outside CPU, a free-disk gate, and per-run scratch cleanup. Disproved claims
+are kept on record rather than deleted.
+
+Other improvements in this configuration that are not about the cold index:
+
+- **Tier 1 / Tier 2 SuperUnity delivery** with strict graph gates, qualification
+  that survives real-build inputs, and context-migration shard invalidation.
+- **clangd memory reclaim** after background indexing in a quiet window, disk
+  preambles with a per-session TEMP, and caches/logs that follow the engine
+  directory instead of the system drive.
+- **Large-CDB robustness**: bounded digest memory, staged index delivery with
+  honest failure reporting, and preparation that never loses valid work.
+- **Contextual goto-definition** for source and header files, and ordinary
+  (non-UE) C/C++ workspaces kept on plain LSP.
+- **Review workflow**: CodeDiff as the default review view with `[[` / `]]`
+  hunk navigation.
 
 ### Project-wide grep
 
@@ -250,11 +303,11 @@ What makes it AI-durable, by the numbers:
 
 | Mechanism | Count | Purpose |
 | --- | ---: | --- |
-| Per-directory `CLAUDE.md` rules | 19 | Local subsystem rules; children write deltas only |
-| Recorded pitfalls (`K1…`) | 39 | Every debugged trap kept with symptom → fix → source |
-| Isolated workaround files | 9 | Each upstream-bug patch carries a frontmatter contract |
-| Headless regression specs | 21 | Behaviour locked so refactors and migrations stay safe |
-| OpenSpec specs / archived changes | 14 / 12 | Decisions and changes are spec-driven and traceable |
+| Per-directory `AGENTS.md` rules (`CLAUDE.md` stubs) | 23 | Local subsystem rules; children write deltas only |
+| Recorded pitfalls (`K1…`) | 77 | Every debugged trap kept with symptom → fix → source |
+| Isolated workaround files | 23 | Each upstream-bug patch carries a frontmatter contract |
+| Headless regression specs | 263 | Behaviour locked so refactors and migrations stay safe |
+| OpenSpec specs / archived changes | 41 / 51 | Decisions and changes are spec-driven and traceable |
 
 Four knowledge zones, each with a fixed entry point:
 
@@ -285,9 +338,10 @@ lua/
   utils/code_search/      csearch sub-second grep
   utils/platform/         the only place OS branching is allowed
   workarounds/            isolated upstream-bug patches and registry
-tools/                    cindex-uefilter (Go) and Python CDB/PCH/index utilities
-docs/                     architecture, constraints, tooling, cheatsheet
-tests/                    headless regression suite
+tools/                    cindex-uefilter (Go) and Python CDB/PCH/index utilities,
+                          including the offline prefix-PCH indexer
+docs/                     architecture, constraints, tooling, cheatsheet, releases
+tests/                    headless regression suite (+ tests/py for Python tools)
 ```
 
 ## Documentation
@@ -308,6 +362,7 @@ tests/                    headless regression suite
 nvim --headless -l tests/run.lua            # full suite (authoritative)
 nvim --headless -l tests/run.lua <filter>   # scoped
 pwsh -File scripts\run_regression.ps1       # Windows wrapper
+python -B -I tests/py/test_clangd_pch_offline.py   # offline indexer unit tests
 ```
 
 Exit code `0` indicates success, `1` indicates failure. Policy and the

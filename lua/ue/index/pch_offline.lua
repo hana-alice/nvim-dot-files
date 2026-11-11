@@ -32,7 +32,7 @@ return function(M, core)
   M.probe_pch_offline = function(callback)
     local opts = settings()
     if opts.enabled == false then callback({ ok = false, disabled = true }); return end
-    local directory = vim.fn.expand(opts.bin_dir or "~/.cache/clangd-pch-22.1.5/metadata-v21/bin")
+    local directory = vim.fn.expand(opts.bin_dir or "~/.cache/clangd-pch-22.1.5/metadata-v24c/bin")
     local suffix = tostring(require("utils.platform").driver().exe_suffix or "")
     local clangd = vim.fs.joinpath(directory, "clangd" .. suffix)
     local probe = vim.fs.joinpath(directory, "clangd-pch-probe" .. suffix)

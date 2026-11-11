@@ -33,7 +33,7 @@ local function await_probe(module)
   return report
 end
 
-local real_bin = vim.fn.expand("~/.cache/clangd-pch-22.1.5/metadata-v21/bin")
+local real_bin = vim.fn.expand("~/.cache/clangd-pch-22.1.5/metadata-v24c/bin")
 local function native_capability(directory)
   local report
   local ok, err = pcall(function()

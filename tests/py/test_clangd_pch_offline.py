@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 import clangd_pch_offline as tool
@@ -53,6 +54,24 @@ class CommandTests(unittest.TestCase):
         for row in variants:
             with self.subTest(row=row):
                 self.assertNotEqual(tool.context_key(base), tool.context_key(row))
+
+    def test_context_keeps_separator_spelling_apart_by_default(self):
+        # R50 cold13: merging these changed the full index beyond noise.
+        a = command("--sysroot=C:\\ndk\\sysroot", "-include", "C:\\b\\PCH.Core.h", directory="C:\\w")
+        b = command("--sysroot=C:/ndk/sysroot", "-include", "C:/b/PCH.Core.h", directory="C:/w")
+        with mock.patch.object(tool, "MERGE_SEPARATORS", False):
+            self.assertNotEqual(tool.context_key(a), tool.context_key(b))
+
+    def test_context_opt_in_ignores_path_separator_spelling_but_not_macro_values(self):
+        a = command("--sysroot=C:\\ndk\\sysroot", "-isystem", "C:\\ndk\\include",
+                    "-include", "C:\\b\\PCH.Core.h", "-DPATH=\"a\\b\"", directory="C:\\w")
+        b = command("--sysroot=C:/ndk/sysroot", "-isystem", "C:/ndk/include",
+                    "-include", "C:/b/PCH.Core.h", "-DPATH=\"a\\b\"", directory="C:/w")
+        with mock.patch.object(tool, "MERGE_SEPARATORS", True):
+            self.assertEqual(tool.context_key(a), tool.context_key(b))
+            c = copy.deepcopy(b)
+            c["arguments"] = [x.replace("a\\b", "a/b") for x in c["arguments"]]
+            self.assertNotEqual(tool.context_key(b), tool.context_key(c))
 
     def test_context_binds_overlay_contents_and_preserves_prefix_order(self):
         a = command("-include", "First.h", "-include", "Second.h", "-include", "PCH.Core.h",
@@ -140,6 +159,15 @@ class CommandTests(unittest.TestCase):
                          {"paired": 1, "mismatch": 1, "unlisted": 1, "compile_failure_count": 2,
                           "compile_failure_tus": ["C:/path with spaces/a,b.cc", "/b.cpp"]})
         self.assertEqual(tool.log_counts([])["compile_failure_tus"], [])
+
+    def test_log_counts_treats_failed_indexing_as_compile_failure(self):
+        # A rejected PCH (e.g. compiler version string mismatch) fails before
+        # any diagnostics: no "Failed to compile", only "Indexing X failed".
+        lines = ["E[14:58:28.608] Indexing C:/x/a b.cpp failed: BeginSourceFile() failed",
+                 "E[14:58:28.700] Indexing /b.cpp failed: BeginSourceFile() failed",
+                 "I[12:02] Failed to compile /b.cpp, index may be incomplete",
+                 "I[12:03] note: Indexing /c.cpp failed: unrelated message text"]
+        self.assertEqual(tool.log_counts(lines)["compile_failure_tus"], ["C:/x/a b.cpp", "/b.cpp"])
 
     def test_dependency_scan_replaces_pch_output_with_preprocess_listing(self):
         producer = ["clang++", "-x", "c++-header", "PCH.Core.h", "-o", "out.pch"]
@@ -265,6 +293,15 @@ class ReceiptTests(unittest.TestCase):
                           "D:/e/Logs.h(11,12): error: redefinition of 'X'", "note: here", ""])
         self.assertEqual(tool.first_error(text), "D:/e/Logs.h(11,12): error: redefinition of 'X'")
         self.assertEqual(tool.first_error("warning: only"), "")
+
+    def test_fold_keeps_member_shards_of_clean_folded_rows(self):
+        # R50 cold40: a folded UBT row re-produces its unity members' shards; only
+        # the row's own shard was kept and 783 member shards went unpublished.
+        edges = {"ubt.cpp": {"m1.cpp", "m2.cpp", "h.h"}, "m1.cpp": {"h.h"}}
+        owner = {"ubt.cpp": "ubt.idx", "m1.cpp": "m1.idx", "m2.cpp": "m2.idx", "h.h": "h.idx", "x.cpp": "x.idx"}
+        shards = {"ubt.idx": 1, "m1.idx": 1, "h.idx": 1, "x.idx": 1}  # m2 rejected (not in shards)
+        self.assertEqual(tool.fold_kept_shards({"ubt.cpp"}, edges, owner, shards), {"ubt.idx", "m1.idx", "h.idx"})
+        self.assertEqual(tool.fold_kept_shards(set(), edges, owner, shards), set())
 
     def test_clean_tu_reaching_rejected_header_shard_falls_back(self):
         edges = {"a.cpp": {"x.h"}, "x.h": {"bad.h"}, "b.cpp": {"y.h"}, "y.h": {"x.h"}, "c.cpp": {"z.h"}}

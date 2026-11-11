@@ -124,6 +124,14 @@ clangd 是长驻交互式服务，终止会丢弃已构建的 preamble。系统 
 
 ## 选型与踩坑
 
+- **离线 PCH 冷全量提速（2026-11-11，R50）**：默认开启 fork 的 FILTER_NATIVE_PATH、
+  THIN_NOLOAD、SKIP_INDEX_REBUILD 和 VFS_OVERLAY_CACHE，并让 lane 并行、Tier 1 prepare/commit
+  多线程。冷全量在安静宿主上 253–293 s，连续 7 批的 3 次中位数 ≤ 300 s。
+  - 否决：按分隔符合并上下文（输出差异超出噪声）、FOLD_RETRY（修复后正确但更慢）、
+    投机 producer（CPU +19%）。三者都只保留为 opt-in。
+  - 踩坑：宿主 CPU 计数器区分不了外部负载，需要单独累计外部 clangd/python 的 CPU，作为起跑门禁和
+    结果作废的依据。实验 scratch 曾写满数据盘，现在每次运行前检查剩余空间，运行后清理 scratch。
+
 - **离线 PCH 吸收普通 Tier 1（2026-11-06，方向 A）**：full 离线运行把后台 proof 计划中的普通
   Tier 1 组以规范 wrapper 放进私有 paired 输入，由同一次私有 PCH clangd 运行判定
   compile_success / main_shards_complete / members_equal；通过组写成按官方 reader 计算 key 的

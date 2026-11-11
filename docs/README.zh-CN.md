@@ -7,8 +7,9 @@
 
 ## 特性
 
-- **Super-unity 索引**：把 11,593 个翻译单元折叠成约 23 个聚合 TU，在
-  Windows/NTFS 上把全量冷索引从**几小时压到约 3 分钟**，且保留 ≥90% 符号。
+- **快速冷索引**：可选的离线前缀 PCH 索引器（私有 clangd fork）加上 Tier 1
+  SuperUnity 吸收，在官方 clangd 加载之前预先产出索引存储。大型 UE 工程的全量冷索引
+  在安静的 Windows 宿主上从 **1261 s 降到 253–293 s**，官方 clangd 加载时零重建。
 - **上下文感知 C++ 跳定义**：source 用 clangd exact-cursor identity；header 在
   compiler-emitted evidence 证明的真实 origin TU 中由异步 libclang sidecar 解析重载。
 - **亚秒级工程 grep**：对工程文件清单建 trigram 索引（`FRDGBuilder` 约
@@ -26,20 +27,61 @@
 
 ## 性能数据
 
-实测于 UEProj：**11,593 个 `.cpp` 文件**、每条 CDB 757 个 `-D` 宏、运行在
-Windows/NTFS 上——目录递归与逐 TU 索引才是真正的瓶颈。
+实测于 Windows/NTFS 上的大型 UE 工程，目录递归与逐 TU 索引才是真正的瓶颈。
 
-### Super-unity 索引——核心亮点
+### 冷全量索引——核心亮点
 
-朴素的「一 TU 一索引」冷构建跑下来是**几小时**起步。super-unity 流水线把这
-11,593 个翻译单元折叠成**约 23 个聚合 TU** 再索引——全量冷索引**约 3 分钟**，
-保留 ≥90% 符号。
+离线前缀 PCH 索引器跑一次全量冷索引的墙钟，始终是同一个工程（中途刷新过一次 UHT 生成头）。
+每次运行都过了正确性门禁：回落 0、shard mismatch 0、官方 clangd 重载零重建。
 
 ```
-全量冷索引（11,593 TU）
-  朴素逐 TU        ████████████████████████████████████████  几小时
-  super-unity      ██▏ ~3 min     （11,593 TU 折叠成 ~23）
+冷全量索引（越低越好）
+  基线                ████████████████████████████████████████  1261 s
+  + Tier 1 吸收       ██████████████████████████▎               830 s
+  + 有序调度          █████████████████▎                        545 s
+  + seed gate         ████████████████▏                         510 s
+  + thin PCH 过滤     ███████████▎                              357 s
+  + PGO/LTO/缓存      ████████▌                                 268 s（中位）
 ```
+
+验收判据事先登记为「一批 3 次的中位数 ≤ 300 s」。连续 7 批达标，中位数 254.9–294.7 s；
+清理磁盘之后的 15 次运行 15/15 ≤ 300 s。同机有大量 clangd/python 并发负载时仍要
+370–430 s，原因是索引器的 worker 以 IDLE 优先级运行，会让出 CPU。
+
+### 提速靠的是什么
+
+按批次统计：一个批次是一组一起用一次全量冷索引计时的改动。
+
+| 方面 | 优化 | 状态 |
+| --- | --- | --- |
+| 流水线 | 同一次离线运行吸收 Tier 1 SuperUnity 组（receipt 按官方 reader 的 key 写） | 采用 |
+| 流水线 | 有序调度（每个上下文先跑 seed，其余按规模）；跳过已发布的 shard | 采用 |
+| 流水线 | prepare overlay、include 图、publish 并行；后台 publish/commit 与 retry lane 重叠 | 采用 |
+| 流水线 | retry lane 把失败的 wrapper 按原 UBT 行重新索引（回落 51 → 0） | 采用 |
+| 流水线 | PCH 一次性产出、Tier 1 prepare/commit 4 线程、index lane 并行 | 采用 |
+| 流水线 | lane 内 didOpen 后立即 didClose；跳过 clangd 的 idle 索引重建 | 采用 |
+| clangd fork | seed gate：同上下文的后续 TU 等 seed 结束，再复用 thin PCH | 采用 |
+| clangd fork | prefix 头 shard 预载；只差路径拼写的上下文共用 seed | 采用 |
+| clangd fork | 原生路径过滤 + thin TU 不加载 prefix 顶层 decl（510 → 357 s） | 采用 |
+| clangd fork | rpmalloc、PGO、ThinLTO 构建 | 采用 |
+| clangd fork | 进程内缓存已解析的 VFS overlay 文件 | 采用 |
+| 否决 | 按路径分隔符合并上下文（输出差异超噪声） | 仅 opt-in |
+| 否决 | Tier 1 retry 并入 paired lane（修复后正确，但两对 A/B 都更慢） | 仅 opt-in |
+| 否决 | 投机 PCH producer（CPU +19%） | 仅 opt-in |
+| 否决 | 提高 `-j`、`-w`、EcoQoS 优先级、扩展 prefix 闭包、提前 retry 重叠 | 放弃 |
+
+测量纪律：判据预登记、ABAB 配对、起跑门禁（宿主 CPU + 外部 clangd/python 实际占用）、
+逐次统计外部 CPU、磁盘剩余空间门禁、每次运行后清理 scratch。被证伪的结论留底，不删除。
+
+与冷索引无关的其他改进：
+
+- **Tier 1 / Tier 2 SuperUnity 交付**：严格图门禁、资格验证经得起真实构建输入、
+  上下文迁移时失效对应 shard。
+- **clangd 内存回收**：后台索引结束后在安静窗口回收；preamble 落盘并使用每会话 TEMP；
+  缓存/日志跟随引擎目录，不写系统盘。
+- **大 CDB 健壮性**：digest 内存有界、分阶段交付索引且如实报告失败、准备阶段不丢有效工作。
+- **上下文感知跳定义**：覆盖 source 与 header；普通（非 UE）C/C++ 工程只走 LSP。
+- **评审流程**：CodeDiff 为默认评审视图，`[[` / `]]` 跳 hunk。
 
 ### 工程级 grep
 
@@ -226,11 +268,11 @@ expression、loaded-image UUID 与 owner cleanup 全部成立，才算成功。h
 
 | 机制 | 数量 | 用途 |
 | --- | ---: | --- |
-| 逐目录 `CLAUDE.md` 规则 | 19 | 本地子系统规则；子级只写增量 |
-| 记录在案的踩坑（`K1…`） | 39 | 每个调试陷阱都留有 症状 → 解决 → 出处 |
-| 隔离的 workaround 文件 | 9 | 每个上游 bug 补丁带 frontmatter 契约 |
-| headless 回归 spec | 21 | 锁定行为，保证重构与迁移安全 |
-| OpenSpec spec / 已归档 change | 14 / 12 | 决策与变更可规格化、可追溯 |
+| 逐目录 `AGENTS.md` 规则（`CLAUDE.md` 为 stub） | 23 | 本地子系统规则；子级只写增量 |
+| 记录在案的踩坑（`K1…`） | 77 | 每个调试陷阱都留有 症状 → 解决 → 出处 |
+| 隔离的 workaround 文件 | 23 | 每个上游 bug 补丁带 frontmatter 契约 |
+| headless 回归 spec | 263 | 锁定行为，保证重构与迁移安全 |
+| OpenSpec spec / 已归档 change | 41 / 51 | 决策与变更可规格化、可追溯 |
 
 四个知识区，各有固定入口：
 
@@ -255,13 +297,13 @@ lua/
   plugins/                per-plugin setup（snacks-only）
   ue.lua                  UE 引擎中枢（~10k 行）
   ue/{cdb,core,dap}/      CDB 流水线、纯函数、多平台 DAP
-  utils/ue_goto/          5 层跳定义
+  utils/ue_goto/          上下文感知 C++ 跳定义 + 非 C++ 兼容导航
   utils/code_search/      csearch 亚秒 grep
   utils/platform/         唯一允许做 OS 分支的地方
   workarounds/            隔离的上游 bug 补丁与注册表
-tools/                    cindex-uefilter（Go）与 Python CDB/PCH/索引工具
-docs/                     架构、约束、工具链、速查表
-tests/                    headless 回归套件
+tools/                    cindex-uefilter（Go）与 Python CDB/PCH/索引工具（含离线前缀 PCH 索引器）
+docs/                     架构、约束、工具链、速查表、release 记录
+tests/                    headless 回归套件（tests/py 为 Python 工具单测）
 ```
 
 ## 文档
@@ -282,6 +324,7 @@ tests/                    headless 回归套件
 nvim --headless -l tests/run.lua            # 全量（权威）
 nvim --headless -l tests/run.lua <filter>   # 分范围
 pwsh -File scripts\run_regression.ps1       # Windows 包装
+python -B -I tests/py/test_clangd_pch_offline.py   # 离线索引器单测
 ```
 
 退出码 `0` 表示通过，`1` 表示失败。政策与 change→filter 映射见

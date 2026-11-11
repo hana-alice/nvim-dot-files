@@ -26,6 +26,7 @@ import pch_offline_tier1 as tier1
 # Threads for per-file metadata/IO work (shard decode, stat, publish copy).
 # File-open latency bound, not CPU: no compiler or clangd runs on these.
 IO_THREADS = 4
+MERGE_SEPARATORS = os.name == "nt" and os.environ.get("PCH_OFFLINE_MERGE_SEPARATORS") == "1"
 
 
 def norm(value):
@@ -73,6 +74,10 @@ def context_key(cmd, overlay_digests=None):
         if arg == "--":
             i += 1
             continue
+        if arg in ("-D", "-U") and i + 1 < len(args):
+            out += [arg, args[i + 1]]
+            i += 2
+            continue
         if arg == "-include":
             if forced < len(prefix):
                 out += [arg, norm(args[i + 1])]
@@ -90,6 +95,11 @@ def context_key(cmd, overlay_digests=None):
         if arg in ("-c", "-MD", "-MMD") or arg.startswith(("-I", "-MF")) or norm(arg) == norm(cmd["file"]):
             i += 1
             continue
+        # Opt-in only. Merging separator-spelling duplicates (27 → 18 contexts)
+        # changed the full-run index far beyond noise in R50 cold13, so it stays
+        # off until the cause is understood. Macro values keep their exact bytes.
+        if MERGE_SEPARATORS and not arg.startswith(("-D", "-U")):
+            arg = arg.replace("\\", "/")
         out.append(arg)
         i += 1
     # Relative headers and include paths must not accidentally share a context.
@@ -301,8 +311,13 @@ def log_counts(lines):
                 result["unlisted"] += 1
         if "Failed to compile " in line:
             source = line.split("Failed to compile ", 1)[1].rsplit(", index may be incomplete", 1)[0]
-            if source not in result["compile_failure_tus"]:
-                result["compile_failure_tus"].append(source)
+        elif " failed: " in line and line.split("] ", 1)[-1].startswith("Indexing "):
+            # Fails before diagnostics (e.g. PCH rejected): no "Failed to compile".
+            source = line.split("Indexing ", 1)[1].split(" failed: ", 1)[0]
+        else:
+            source = None
+        if source is not None and source not in result["compile_failure_tus"]:
+            result["compile_failure_tus"].append(source)
     result["compile_failure_count"] = len(result["compile_failure_tus"])
     return result
 
@@ -433,11 +448,15 @@ class Resources:
             self.kernel.CloseHandle(self.job)
 
 
-def index_workspace(cdb_dir, clangd, env, resources, jobs, resource_dir, timeout, manifest=None, order=None):
+def index_workspace(cdb_dir, clangd, env, resources, jobs, resource_dir, timeout, manifest=None, order=None,
+                    inject=None):
     """Wait for an initialize handshake and paired BackgroundIndex progress.
 
     One didOpen triggers compilation database discovery (the production reader
     uses the same handshake). Completion requires background progress.
+    inject: {normalized main file: [raw CDB rows]}; when that file logs a
+    compile failure, its rows are pushed into this clangd's in-memory CDB
+    (LSP compilationDatabaseChanges) and indexed before completion.
     """
     # clangd's LLVM build pins _WIN32_WINNT 0x0601, so its EcoQoS branch is
     # compiled out: "background" and "low" both map to THREAD_MODE_BACKGROUND
@@ -468,6 +487,31 @@ def index_workspace(cdb_dir, clangd, env, resources, jobs, resource_dir, timeout
     # digest matches the disk file (thin selection still checks metadata).
     local_env["CLANGD_EXPERIMENTAL_PCH_PRELOAD_PREFIX"] = (
         "0" if os.environ.get("PCH_OFFLINE_PRELOAD_PREFIX") == "0" else "1")
+    # The shard-version lookup of the file filter used mixed-separator paths on
+    # Windows, so every TU re-collected all already-stored headers (62-row j1
+    # sample: -43% worker cpu, symbols/refs identical). Its doc-comment fix-ups
+    # in SymbolCollector are gated by the same flag. =0 disables (A/B).
+    local_env["CLANGD_EXPERIMENTAL_FILTER_NATIVE_PATH"] = (
+        "0" if os.environ.get("PCH_OFFLINE_FILTER_NATIVE_PATH") == "0" else "1")
+    # Thin TUs skip deserializing prefix top-level decls; with the filter fixed
+    # those are all rejected anyway (merged diff 0, a further -9%). =0 disables.
+    local_env["CLANGD_EXPERIMENTAL_THIN_NOLOAD"] = (
+        "0" if os.environ.get("PCH_OFFLINE_THIN_NOLOAD") == "0" else "1")
+    # Offline lanes never query the in-memory index, yet the idle Heavy rebuild
+    # runs before the progress "end" (BackgroundQueue OnIdle), holding the
+    # paired lane 6.8-9.1 s after its last TU (cold10-19). j1 shards identical.
+    # =0 keeps the rebuilds (A/B).
+    local_env["CLANGD_EXPERIMENTAL_SKIP_INDEX_REBUILD"] = (
+        "0" if os.environ.get("PCH_OFFLINE_SKIP_INDEX_REBUILD") == "0" else "1")
+    # Every row carries the same multi-MB -ivfsoverlay; re-parsing its YAML costs
+    # ~0.08 s per TU (j1 rep->load 0.045 vs 0.125 s). v26+ caches the parsed
+    # tree per process and clones it per TU. Older binaries ignore it. =0 A/B.
+    local_env["CLANGD_EXPERIMENTAL_VFS_OVERLAY_CACHE"] = (
+        "0" if os.environ.get("PCH_OFFLINE_VFS_OVERLAY_CACHE") == "0" else "1")
+    if inject:
+        # An injected unity member already has a (non-TU) shard written by its
+        # failed wrapper with the same digest; upstream would skip it as fresh.
+        local_env["CLANGD_EXPERIMENTAL_REINDEX_NON_TU"] = "1"
     process = resources.spawn(command, cwd=cdb_dir, env=local_env, stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     messages, errors, lines = queue.Queue(), [], []
@@ -506,6 +550,35 @@ def index_workspace(cdb_dir, clangd, env, resources, jobs, resource_dir, timeout
         process.stdin.write(("Content-Length: %d\r\n\r\n" % len(data)).encode() + data)
         process.stdin.flush()
     started, began, ended, completed, initialized = time.monotonic(), False, None, False, False
+    inject = dict(inject or {})
+    scanned, pending, injected, settled = 0, set(), [], 0.0
+    def scan_injections():
+        nonlocal scanned, settled
+        count = len(lines)
+        for line in lines[scanned:count]:
+            if "Failed to compile " in line and inject:
+                source = line.split("Failed to compile ", 1)[1].rsplit(", index may be incomplete", 1)[0]
+                rows = inject.pop(norm(Path(source).resolve()), None)
+                if rows:
+                    send(dict(method="workspace/didChangeConfiguration", params={"settings": {
+                        "compilationDatabaseChanges": {row["file"]: {
+                            "workingDirectory": row["directory"], "compilationCommand": row["arguments"]}
+                            for row in rows}}}))
+                    for row in rows:
+                        pending.add(norm(Path(row["directory"], row["file"]).resolve()))
+                        injected.append(row["file"])
+            elif pending and ("Indexed " in line or "Indexing " in line):
+                if line.split("] ", 1)[-1].startswith("Indexed "):
+                    done = line.split("Indexed ", 1)[1].rsplit(" (", 1)[0]
+                elif " failed: " in line and line.split("] ", 1)[-1].startswith("Indexing "):
+                    done = line.split("Indexing ", 1)[1].split(" failed: ", 1)[0]
+                else:
+                    continue
+                key = norm(Path(done).resolve())
+                if key in pending:
+                    pending.discard(key)
+                    settled = time.monotonic()
+        scanned = count
     try:
         send(dict(id=1, method="initialize", params={"processId": os.getpid(), "rootUri": cdb_dir.as_uri(),
              "capabilities": {"window": {"workDoneProgress": True}},
@@ -527,13 +600,28 @@ def index_workspace(cdb_dir, clangd, env, resources, jobs, resource_dir, timeout
                 send(dict(method="textDocument/didOpen", params={"textDocument": {
                     "uri": source.as_uri(), "languageId": "cpp", "version": 1,
                     "text": source.read_text(encoding="utf-8-sig")}}))
+                if os.environ.get("PCH_OFFLINE_KEEP_OPEN") != "1":
+                    # The open's first update looks up the command, which
+                    # broadcasts the CDB to the background index; closing at
+                    # once stops its foreground preamble/AST, which otherwise
+                    # competes with the workers (R50 cold12 retry: 13 s, 127 MB).
+                    # =1 keeps the file open (A/B).
+                    send(dict(method="textDocument/didClose", params={"textDocument": {
+                        "uri": source.as_uri()}}))
             if message.get("method") == "$/progress" and message["params"].get("token") == "backgroundIndexProgress":
                 kind = message["params"]["value"]["kind"]
                 if kind == "begin":
                     began, ended = True, None
                 elif kind == "end" and began:
                     ended = time.monotonic()
-            if initialized and ended and time.monotonic() - ended > 1:
+            if initialized:
+                scan_injections()
+            # An injected TU's end can be read before its log line: wait for
+            # every injected file (at most 10 s past an end, for a file clangd
+            # did not index), then 2 s without a new progress begin.
+            now = time.monotonic()
+            if (initialized and ended and now - ended > 1 and (not pending or now - ended > 10)
+                    and (not injected or now - max(ended, settled) > 2)):
                 completed = True
                 break
         if not completed:
@@ -558,7 +646,7 @@ def index_workspace(cdb_dir, clangd, env, resources, jobs, resource_dir, timeout
             reader.join(timeout=2)
         resources.finish(process)
     return dict(log_counts(lines), elapsed_s=round(time.monotonic() - started, 3),
-                indexing_complete=completed, command=command)
+                indexing_complete=completed, command=command, injected=injected)
 
 
 def path_stamp(path):
@@ -692,6 +780,24 @@ def affected_rows(edges, roots, changed):
     return {key for key, row in roots.items() if reached.intersection(row["roots"])}
 
 
+def fold_kept_shards(covered, edges, shard_owner, shards):
+    """Shards judge dropped that a cleanly folded original row re-produced.
+
+    judge withholds the failed wrapper's member shards; the folded UBT row that
+    the paired clangd then indexed cleanly rewrote those members' shards
+    (REINDEX_NON_TU). Keep the row's own shard and its directly included,
+    clean, owned shards (R50 cold40: only the row's own shard was kept, so 783
+    member .cpp shards went unpublished, 31680 vs 32463).
+    """
+    kept = set()
+    for source in covered:
+        for node in [source, *edges.get(source, ())]:
+            name = shard_owner.get(node)
+            if name in shards:
+                kept.add(name)
+    return kept
+
+
 def retry_lane(run_dir, retry, groups, profiles, clangd, env, resources, args, resource_dir,
                report, shards, shard_owner, rejected, edges, dependencies):
     """Index failed Tier 1 wrappers' original UBT rows with thin PCH; return covered sources.
@@ -806,6 +912,24 @@ def drift_plan(previous, identity, rows, target, threshold):
         return "full", "receipt", None
 
 
+def group_contexts(rows, commands):
+    """Return ({context: [(row, command)]}, no-PCH rows, {overlay: content digest})."""
+    groups, ordinary, overlay_digests = {}, [], {}
+    for command in commands:
+        for i, token in enumerate(command["arguments"][:-1]):
+            if token == "-ivfsoverlay":
+                overlay = command["arguments"][i + 1]
+                if overlay not in overlay_digests:
+                    overlay_digests[overlay] = sha(Path(command["directory"]) / overlay)
+    for row, command in zip(rows, commands):
+        key = context_key(command, overlay_digests)
+        if key == "no-pch":
+            ordinary.append(row)
+        else:
+            groups.setdefault(key, []).append((row, command))
+    return groups, ordinary, overlay_digests
+
+
 def run(args):
     started, resources = time.monotonic(), Resources(getattr(args, "process_gib", 16) << 30)
     cdb, target, binary = Path(args.cdb).resolve(), Path(args.index_dir).resolve(), Path(args.bin_dir).expanduser().resolve()
@@ -816,23 +940,13 @@ def run(args):
                   compile_failure_tus=[], producer_failure_tus=[], fallback_tus=[], fallback_count=0,
                   ordinary_tus=0, shards=0)
     lock = work / "writer.lock"
-    lock_fd = side = None
+    lock_fd = side = spec_pool = None
     try:
         lock_fd = acquire_writer_lock(lock)
         rows = json.loads(cdb.read_text(encoding="utf-8-sig"))
         if not rows or any(not isinstance(row.get("arguments"), list) for row in rows):
             raise ValueError("nonempty arguments-based CDB required")
         tier1_state = None
-        if getattr(args, "tier1_plan", None):
-            # Absorb the background proof's ordinary Tier 1 groups: one private
-            # run decides their gates. Any setup failure keeps the rows unchanged.
-            try:
-                rows, tier1_state = tier1.prepare(rows, args.tier1_plan, args.tier1_clangd,
-                                                  getattr(args, "server_profile", None))
-            except Exception as error:
-                report["tier1_error"] = str(error)[:300]
-        source_paths = {(row["directory"], row["file"]): str((Path(row["directory"]) / row["file"]).resolve())
-                        for row in rows}
         clangd, probe = binary / "clangd.exe", binary / "clangd-pch-probe.exe"
         compiler_candidates = [args.compiler, shutil.which("clang++"), str(binary / "clang++.exe")]
         if os.name == "nt" and os.environ.get("ProgramFiles"):
@@ -869,14 +983,91 @@ def run(args):
                     raise RuntimeError("builtin include query failed: " + err)
                 driver_cache[key] = parse_driver_output(output, builtin)
             return driver_cache[key]
+        receipt = work / "receipt.json"
+        run_dir = work / ("run-" + str(time.time_ns()))
+        reasons = {}
+        def build_variant(task):
+            key, command, headers, variant = task
+            # Named by the producer input, not the context key: a speculative
+            # build is found by its input, and one input is built once per run.
+            name = hashlib.sha256(json.dumps(signature(task)[1:]).encode()).hexdigest()[:24]
+            directory = run_dir / "artifacts" / name / variant
+            directory.mkdir(parents=True)
+            argv = [str(probe), str(directory / "metadata.idx"), "--",
+                    *producer_args(command, directory / "prefix.pch", headers, compiler)]
+            local_env = dict(env)
+            if variant == "thin":
+                local_env["CLANGD_EXPERIMENTAL_PCH_THIN"] = "1"
+            rc, out, err = resources.capture(argv, command["directory"], local_env)
+            (directory / "stderr.log").write_text(err, encoding="utf-8")
+            write_json(directory / "command.json", argv)
+            if rc or not (directory / "prefix.pch").is_file() or not (directory / "metadata.idx").is_file():
+                reason = first_error(err) or "exit %s" % rc
+                # Bind the failed prefix closure so a header fix retriggers the
+                # tool; -MG keeps listing past missing (generated) headers.
+                scan = dependency_scan_args(argv[3:])
+                rc, out, err = resources.capture(scan, command["directory"], env)
+                (directory / "depscan.log").write_text(err, encoding="utf-8")
+                closure = parse_depfile(out, command["directory"])
+                return None, closure or [os.path.normpath(os.path.join(command["directory"], h))
+                                         for h in headers], reason
+            return {variant + "_pch": str(directory / "prefix.pch"),
+                    variant + "_metadata": str(directory / "metadata.idx")}, [], None
+        def producer_tasks(items):
+            # full and thin of one context are independent compiles: one flat
+            # task list keeps the longest context at max(full, thin) instead of
+            # full + thin (R50 cold12: 15 + 10 s on the producer critical path).
+            tasks = []
+            for key, members in items:
+                command = min((command for _, command in members), key=lambda x: sum(map(len, x["arguments"])))
+                headers = prefix_headers(command)
+                tasks += [(key, command, headers, variant) for variant in ("full", "thin")]
+            return tasks
+        def signature(task):
+            # Everything the producer reads from its task; the output path is a
+            # placeholder. The context key is only a label: retry-only rows' keys
+            # spell overlays by path, not digest, when no published row names them.
+            _, command, headers, variant = task
+            return variant, command["directory"], tuple(producer_args(command, Path("pch"), headers, compiler))
+        # Speculative producer: contexts whose producer argv Tier 1 substitution
+        # does not change are built while prepare (file-IO bound, ~22 s) runs
+        # (R50 cold12: 10 of 27 contexts, 82 of 372 producer worker-s). A result
+        # is used only for a task with the identical signature. Cold runs only:
+        # a receipt may mean reuse, where any producer work is waste.
+        # PCH_OFFLINE_SPECULATE=1 enables it (experimental).
+        speculative = {}
+        if (getattr(args, "tier1_plan", None) and not receipt.is_file()
+                and os.environ.get("PCH_OFFLINE_SPECULATE") == "1"):
+            try:
+                pre_groups = group_contexts(rows, [manifest_command(row, driver_for(row), resource_dir)
+                                                   for row in rows])[0]
+            except (OSError, ValueError, RuntimeError):
+                pre_groups = {}
+            if pre_groups:
+                spec_pool = concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs)
+                for task in producer_tasks(pre_groups.items()):
+                    speculative[signature(task)] = spec_pool.submit(build_variant, task)
+            report["speculative_tasks"] = len(speculative)
+        if getattr(args, "tier1_plan", None):
+            # Absorb the background proof's ordinary Tier 1 groups: one private
+            # run decides their gates. Any setup failure keeps the rows unchanged.
+            begin = time.monotonic()
+            try:
+                rows, tier1_state = tier1.prepare(rows, args.tier1_plan, args.tier1_clangd,
+                                                  getattr(args, "server_profile", None))
+            except Exception as error:
+                report["tier1_error"] = str(error)[:300]
+            report["tier1_prepare_s"] = round(time.monotonic() - begin, 3)
+        source_paths = {(row["directory"], row["file"]): str((Path(row["directory"]) / row["file"]).resolve())
+                        for row in rows}
         for row in rows:
             commands.append(manifest_command(row, driver_for(row), resource_dir))
+        report["setup_commands_s"] = round(time.monotonic() - started, 3)
         identity = hashlib.sha256(json.dumps({k: v for k, v in identities.items() if k != str(cdb)},
                                              sort_keys=True).encode()).hexdigest()
         row_commands = {norm(source_paths[row["directory"], row["file"]]):
                         dict(command=hashlib.sha256(json.dumps(command, sort_keys=True).encode()).hexdigest())
                         for row, command in zip(rows, commands)}
-        receipt = work / "receipt.json"
         try:
             previous = json.loads(receipt.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -893,20 +1084,8 @@ def run(args):
             report["full_reason"] = reason
         else:
             report["full_reason"] = "no-receipt"
-        run_dir = work / ("run-" + str(time.time_ns()))
-        run_dir.mkdir()
-        groups, ordinary, overlay_digests = {}, [], {}
-        for command in commands:
-            for i, token in enumerate(command["arguments"][:-1]):
-                if token == "-ivfsoverlay":
-                    overlay = command["arguments"][i + 1]
-                    overlay_digests[overlay] = sha(Path(command["directory"]) / overlay)
-        for row, command in zip(rows, commands):
-            key = context_key(command, overlay_digests)
-            if key == "no-pch":
-                ordinary.append(row)
-            else:
-                groups.setdefault(key, []).append((row, command))
+        run_dir.mkdir(exist_ok=True)
+        groups, ordinary, overlay_digests = group_contexts(rows, commands)
         report.update(contexts=len(groups), ordinary_tus=len(ordinary), rows=len(rows))
         phases = report.setdefault("phase_s", {})
         mark = [time.monotonic()]
@@ -915,38 +1094,36 @@ def run(args):
             phases[name] = round(now - mark[0], 3)
             mark[0] = now
         phases["setup"] = round(mark[0] - started, 3)
-        def produce(item):
-            key, members = item
-            command = min((command for _, command in members), key=lambda x: sum(map(len, x["arguments"])))
-            headers = prefix_headers(command)
-            profile = dict(first_header=headers[-1], prefix_headers=headers)
-            for variant in ("full", "thin"):
-                directory = run_dir / "artifacts" / key / variant
-                directory.mkdir(parents=True)
-                argv = [str(probe), str(directory / "metadata.idx"), "--",
-                        *producer_args(command, directory / "prefix.pch", headers, compiler)]
-                local_env = dict(env)
-                if variant == "thin":
-                    local_env["CLANGD_EXPERIMENTAL_PCH_THIN"] = "1"
-                rc, out, err = resources.capture(argv, command["directory"], local_env)
-                (directory / "stderr.log").write_text(err, encoding="utf-8")
-                write_json(directory / "command.json", argv)
-                if rc or not (directory / "prefix.pch").is_file() or not (directory / "metadata.idx").is_file():
-                    reasons[key] = first_error(err) or "exit %s" % rc
-                    # Bind the failed prefix closure so a header fix retriggers the
-                    # tool; -MG keeps listing past missing (generated) headers.
-                    scan = dependency_scan_args(argv[3:])
-                    rc, out, err = resources.capture(scan, command["directory"], env)
-                    (directory / "depscan.log").write_text(err, encoding="utf-8")
-                    closure = parse_depfile(out, command["directory"])
-                    return key, None, closure or [os.path.normpath(os.path.join(command["directory"], h))
-                                                  for h in headers]
-                profile[variant + "_pch"] = str(directory / "prefix.pch")
-                profile[variant + "_metadata"] = str(directory / "metadata.idx")
-            return key, profile, []
-        profiles, failed_closure, failed_contexts, reasons = {}, set(), {}, {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-            for key, profile, closure in pool.map(produce, groups.items()):
+        def produce_all(items, pool, reuse=None):
+            tasks = producer_tasks(items)
+            reuse = {} if reuse is None else reuse
+            # One build per producer input per run (its artifact path is derived from it).
+            futures = [reuse.get(signature(task)) or reuse.setdefault(signature(task), pool.submit(build_variant, task))
+                       for task in tasks]
+            built = {}
+            for (key, _, headers, _), future in zip(tasks, futures):
+                result = future.result()
+                if result[2]:
+                    reasons.setdefault(key, result[2])
+                built.setdefault(key, (dict(first_header=headers[-1], prefix_headers=headers), []))
+                if built[key][0] is None or result[0] is None:
+                    built[key] = (None, built[key][1] + result[1])
+                else:
+                    built[key][0].update(result[0])
+            return [(key, profile, closure) for key, (profile, closure) in built.items()]
+        profiles, failed_closure, failed_contexts = {}, set(), {}
+        if spec_pool:
+            # Contexts only the pre-substitution rows have are the Tier 1 original
+            # rows' own; they stay for the retry lane's missing contexts below.
+            # Unstarted ones are cancelled so they do not delay the producer phase.
+            wanted = {signature(task) for task in producer_tasks(groups.items())}
+            for name in [name for name in speculative if name not in wanted]:
+                if speculative[name].cancel():
+                    del speculative[name]
+            report["speculative_used"] = len(wanted & speculative.keys())
+        pool = spec_pool or concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs)
+        try:
+            for key, profile, closure in produce_all(groups.items(), pool, speculative):
                 if profile:
                     profiles[key] = profile
                 else:
@@ -955,6 +1132,9 @@ def run(args):
                     report["producer_failure_context_count"] += 1
                     report["producer_failure_tus"] += [source_paths[row["directory"], row["file"]]
                                                        for row, _ in groups[key]]
+        finally:
+            # Speculative retry-only contexts may still build; do not wait for them here.
+            pool.shutdown(wait=pool is not spec_pool)
         phase("producer")
         # Keep the first diagnostic per failed context so the cause is visible.
         report["producer_failure_reasons"] = dict(sorted(reasons.items()))
@@ -967,6 +1147,28 @@ def run(args):
                     paired_rows.append(row)
                     paired_contexts.append(key)
                     manifest_rows.append(dict(command, profile=key))
+        # Fold the Tier 1 retry into the paired clangd: a wrapper that logs a
+        # compile failure gets its original UBT rows pushed over LSP at once,
+        # while the lane is still busy, instead of a separate retry lane after
+        # it (R50 cold12: 44 s phase; failures logged 19-137 s in). Only groups
+        # whose every original row has a paired profile; the rest keep the lane.
+        # PCH_OFFLINE_FOLD_RETRY=1 enables it (experimental).
+        fold, fold_rows = {}, set()
+        if tier1_state and os.environ.get("PCH_OFFLINE_FOLD_RETRY") == "1":
+            for group in tier1_state["groups"]:
+                if group["cached"]:
+                    continue
+                built = [(row, manifest_command(row, driver_for(row), resource_dir)) for row in group["original_rows"]]
+                keys = [context_key(command, overlay_digests) for _, command in built]
+                if not built or any(key not in profiles for key in keys):
+                    continue
+                if len(manifest_rows) + len(built) > 2000:
+                    break  # the clangd manifest limit; the rest keep the retry lane
+                fold[norm(group["wrapper"])] = [row for row, _ in built]
+                # Pushed commands carry no output (ClangdLSPServer::applyConfiguration).
+                manifest_rows += [dict(command, output="", profile=key) for (_, command), key in zip(built, keys)]
+                fold_rows.update(norm(Path(row["directory"], row["file"]).resolve()) for row, _ in built)
+            report["tier1_fold_groups"] = len(fold)
         manifest = run_dir / "manifest.json"
         write_json(manifest, dict(version=1, profiles=profiles, commands=manifest_rows))
         report["manifest"] = str(manifest)
@@ -978,16 +1180,28 @@ def run(args):
             edges["context:" + key] = {norm(p) for p in closure}
         shards, shard_owner, rejected = {}, {}, set()
         lanes = []
-        for name, lane_rows, lane_manifest, lane_contexts in (("ordinary", ordinary, None, None),
-                                                              ("paired", paired_rows, manifest, paired_contexts)):
-            if not lane_rows:
-                continue
+        lane_specs = [(name, lane_rows, lane_manifest, lane_contexts)
+                      for name, lane_rows, lane_manifest, lane_contexts in (
+                          ("ordinary", ordinary, None, None), ("paired", paired_rows, manifest, paired_contexts))
+                      if lane_rows]
+        def index_lane(spec):
+            name, lane_rows, lane_manifest, lane_contexts = spec
             lane = run_dir / name
             write_json(lane / "compile_commands.json", lane_rows)
             order = write_index_order(lane, lane_rows, lane_contexts)
-            summary = index_workspace(lane, clangd, env, resources, args.jobs, resource_dir, args.timeout,
-                                      lane_manifest, order)
-            phase("index_" + name)
+            return index_workspace(lane, clangd, env, resources, args.jobs, resource_dir, args.timeout,
+                                   lane_manifest, order, fold if name == "paired" else None)
+        # The lanes share nothing (own directory, own clangd); the few no-PCH
+        # TUs fill the paired lane's seed ramp instead of running before it
+        # (R50 cold12: ordinary 7 s serial; paired occupancy 0-9 in its first 10 s).
+        # Results are consumed in the original lane order below.
+        # PCH_OFFLINE_SERIAL_LANES=1 restores the serial order (A/B measurement).
+        lane_workers = 1 if os.environ.get("PCH_OFFLINE_SERIAL_LANES") == "1" else max(1, len(lane_specs))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=lane_workers) as pool:
+            summaries = list(pool.map(index_lane, lane_specs))
+        phase("index_lanes")
+        for (name, _, _, _), summary in zip(lane_specs, summaries):
+            lane = run_dir / name
             lanes.append(summary)
             for key in ("paired", "mismatch", "unlisted"):
                 report[key] += summary[key]
@@ -1031,6 +1245,18 @@ def run(args):
         if tier1_state:
             tier1_verdicts, dropped, tier1_mapping = tier1.judge(
                 tier1_state, report["compile_failure_tus"], report["producer_failure_tus"], shard_owner, shards)
+            if fold:
+                # Folded original rows the paired clangd indexed cleanly keep
+                # their (rewritten, clean) shards; judge drops every shard the
+                # failed wrapper's members own.
+                tried = {norm(Path(p).resolve()) for summary in summaries for p in summary.get("injected", ())}
+                failed = {norm(p) for p in report["compile_failure_tus"]}
+                rejected_files = {file for file, name in shard_owner.items() if name in rejected}
+                blocked = {norm(p) for p in reaching_sources(edges, sorted(tried), rejected_files)}
+                retry_covered = {p for p in tried if p not in failed and p not in blocked
+                                 and shard_owner.get(p) in shards}
+                dropped = set(dropped) - fold_kept_shards(retry_covered, edges, shard_owner, shards)
+                report["tier1_fold_tus"], report["tier1_fold_covered"] = len(tried), len(retry_covered)
             # An unqualified wrapper's shards never reach the reader; its original
             # UBT rows stay in the published CDB and are indexed there.
             for name in dropped:
@@ -1047,6 +1273,8 @@ def run(args):
         if tier1_state:
             retry, missing = [], {}
             for row in tier1.retry_rows(tier1_state, tier1_verdicts):
+                if norm(Path(row["directory"], row["file"]).resolve()) in fold_rows:
+                    continue  # already tried in the paired clangd
                 command = manifest_command(row, driver_for(row), resource_dir)
                 key = context_key(command, overlay_digests)
                 if key in profiles:
@@ -1058,15 +1286,19 @@ def run(args):
             # cold4: 6 CoreUObject TUs otherwise fell back to the reader).
             if missing:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-                    for key, profile, _ in pool.map(produce, missing.items()):
+                    for key, profile, _ in produce_all(missing.items(), pool, speculative):
                         if profile:
                             profiles[key] = profile
                             retry += [(row, command, key) for row, command in missing[key]]
                 report["tier1_retry_new_contexts"] = sum(key in profiles for key in missing)
             if retry:
-                retry_covered = retry_lane(run_dir, retry, groups, profiles, clangd, env, resources, args, resource_dir,
-                                           report, shards, shard_owner, rejected, edges, dependencies)
-                report["tier1_retry_tus"], report["tier1_retry_covered"] = len(retry), len(retry_covered)
+                # Union, not assignment: folded rows the paired clangd already
+                # covered stay covered (R50 cold40: 45 folded rows reported as
+                # fallback because the 6-row retry lane overwrote the set).
+                lane_covered = retry_lane(run_dir, retry, groups, profiles, clangd, env, resources, args, resource_dir,
+                                          report, shards, shard_owner, rejected, edges, dependencies)
+                retry_covered = retry_covered | lane_covered
+                report["tier1_retry_tus"], report["tier1_retry_covered"] = len(retry), len(lane_covered)
                 phase("index_retry")
         rejected_files = {file for file, name in shard_owner.items() if name in rejected}
         report["dependency_fallback_tus"] = sorted(
@@ -1140,6 +1372,8 @@ def run(args):
     finally:
         if side is not None:
             side.shutdown(wait=True)
+        if spec_pool is not None:
+            spec_pool.shutdown(wait=True, cancel_futures=True)
         resources.close()
         report.update(elapsed_s=round(time.monotonic() - started, 3), peak_process_bytes=resources.peak_bytes,
                       min_available_bytes=resources.min_available, child_cpu_s=round(resources.cpu_seconds, 3))

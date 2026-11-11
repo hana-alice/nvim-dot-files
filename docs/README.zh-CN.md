@@ -10,6 +10,9 @@
 - **快速冷索引**：可选的离线前缀 PCH 索引器（私有 clangd fork）加上 Tier 1
   SuperUnity 吸收，在官方 clangd 加载之前预先产出索引存储。大型 UE 工程的全量冷索引
   在安静的 Windows 宿主上从 **1261 s 降到 253–293 s**，官方 clangd 加载时零重建。
+  fork 源码在 `hana-alice/llvm-project` 的 `clangd-pch/v26` 分支，以子模块
+  `third_party/llvm-project` 挂入仓库，默认不拉取。Windows x64 二进制附在 release
+  `v2.15.0` 中，解压到 `~/.cache/clangd-pch-22.1.5/metadata-v26/bin` 即可使用。
 - **上下文感知 C++ 跳定义**：source 用 clangd exact-cursor identity；header 在
   compiler-emitted evidence 证明的真实 origin TU 中由异步 libclang sidecar 解析重载。
 - **亚秒级工程 grep**：对工程文件清单建 trigram 索引（`FRDGBuilder` 约

@@ -1,0 +1,6 @@
+[submodule "third_party/llvm-project"]
+	path = third_party/llvm-project
+	url = https://github.com/hana-alice/llvm-project.git
+	branch = clangd-pch/v26
+	shallow = true
+	update = none

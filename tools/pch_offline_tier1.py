@@ -9,10 +9,12 @@ the background proof's cache-only collect reuses them without re-indexing.
 Rejected or uncertain groups write nothing reusable: their original UBT rows
 stay in the published CDB for the official reader and later background proof.
 """
+import concurrent.futures
 import os
 from pathlib import Path
 import shutil
 
+PREPARE_THREADS = 4
 QUALIFIER = "private-pch-clangd"
 ACCEPTED = "tier1-compile-shards-members-accepted"
 _SPECIAL = ("packing", "fallback_of", "upgrade_of", "schedule_role", "recipe", "strict_recipe")
@@ -92,7 +94,14 @@ def prepare(rows, plan_path, clangd, server_profile):
             except (OSError, ValueError, KeyError, TypeError) as error:
                 return _short(error)
             return (group, selected, indexes, output, inputs, candidate, body, key, cached, expected)
-        for result in map(evaluate, plan["groups"]):
+        # Groups are independent and file-open bound (R50: ~35 s serial, 23.6 s
+        # with 4 threads, identical state; 8+ threads slower). Results keep plan
+        # order, so overlap resolution below is unchanged. The overlay policy
+        # module is loaded lazily; load it once before threads share it.
+        verified._owned_overlay_policy()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=PREPARE_THREADS) as pool:
+            results = list(pool.map(evaluate, plan["groups"]))
+        for result in results:
             if isinstance(result, str):
                 skip(result)
                 continue
@@ -200,15 +209,8 @@ def commit(state, verdicts, private_sha):
     verified = bg.verified
     accepted, rejected, cache_hits = [], {}, 0
     with verified.tier1_overlay_scope(True):
-        for group in state["groups"]:
+        def write(group):
             verdict = verdicts[group["id"]]
-            if verdict["accepted"] and group["cached"]:
-                cache_hits += 1
-                accepted.append(group["id"])
-                continue
-            if not verdict["accepted"]:
-                rejected[group["id"]] = verdict["reason"]
-                continue
             gates = dict(verdict["gates"])
             try:
                 with verified._tier1_overlay_read_view():
@@ -228,7 +230,27 @@ def commit(state, verdicts, private_sha):
                            "qualified_by": {"tool": QUALIFIER, "sha256": private_sha}}
                 verified._tier1_write_receipt(group["output"], receipt, {})
             except (OSError, ValueError, KeyError, TypeError) as error:
-                rejected[group["id"]] = "tier1-receipt-unavailable: " + _short(error)
+                return "tier1-receipt-unavailable: " + _short(error)
+            return None
+        # Each new receipt lives in its group's own store and its checks are
+        # file-IO bound like prepare (R50 cold12: 36.6 s serial for 272 groups).
+        # Results keep plan order, so the report is unchanged.
+        fresh = [group for group in state["groups"]
+                 if verdicts[group["id"]]["accepted"] and not group["cached"]]
+        verified._owned_overlay_policy()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=PREPARE_THREADS) as pool:
+            errors = dict(zip((group["id"] for group in fresh), pool.map(write, fresh)))
+        for group in state["groups"]:
+            verdict = verdicts[group["id"]]
+            if verdict["accepted"] and group["cached"]:
+                cache_hits += 1
+                accepted.append(group["id"])
+                continue
+            if not verdict["accepted"]:
+                rejected[group["id"]] = verdict["reason"]
+                continue
+            if errors[group["id"]]:
+                rejected[group["id"]] = errors[group["id"]]
                 continue
             accepted.append(group["id"])
     return dict(tier1_groups=len(state["groups"]), tier1_plan_groups=state["plan_group_count"],

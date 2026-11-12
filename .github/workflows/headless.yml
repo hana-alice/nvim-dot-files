@@ -99,6 +99,26 @@ jobs:
           "UE_CLANGD=$llvmRoot/bin/clangd.exe" >> $env:GITHUB_ENV
           "$llvmRoot/bin" >> $env:GITHUB_PATH
 
+      - name: Private prefix-PCH clangd build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        # Prebuilt from hana-alice/llvm-project tag clangd-pch-v26; the native
+        # offline-loader tests require it under NVIM_TEST_REQUIRE_NATIVE=1.
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'clangd-pch.zip'
+          Invoke-WebRequest 'https://github.com/hana-alice/nvim-dot-files/releases/download/v2.15.0/clangd-pch-22.1.5-v26-windows-x64.zip' -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne '7d80ea6abfbbf5028f45ce36f9d81663fd2a6e20a79d24f73b0e7d2a8a6f0d67') {
+            throw 'clangd-pch archive checksum mismatch'
+          }
+          $home_dir = (nvim --headless --clean "+lua io.stdout:write(vim.fn.expand('~'))" +qa | Out-String).Trim()
+          if (-not $home_dir) { $home_dir = $env:USERPROFILE }
+          $dest = Join-Path $home_dir '.cache/clangd-pch-22.1.5/metadata-v26'
+          $unpack = Join-Path $env:RUNNER_TEMP 'clangd-pch'
+          Expand-Archive $zip -DestinationPath $unpack -Force
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          Copy-Item (Join-Path $unpack 'clangd-pch-22.1.5-v26-windows-x64/bin') $dest -Recurse -Force
+          & (Join-Path $dest 'bin/clangd.exe') --version
+
       - name: Existing ripgrep prerequisite (macOS)
         if: runner.os == 'macOS'
         run: command -v rg || brew install ripgrep

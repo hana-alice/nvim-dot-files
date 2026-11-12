@@ -8,6 +8,10 @@ local cache, clock, revision = {}, 0, 0
 
 M.MAX_FILES = 200000
 M.MAX_PATH_BYTES = 64 * 1024 * 1024
+-- vim.system reports a timeout as exit 124 with empty stderr, which matches the
+-- "unavailable: " failures logged by UEPrepare; ls-files over a large engine
+-- tree on a cold, busy disk can exceed the old 15s budget.
+M.GIT_TIMEOUT_MS = 120000
 M.MAX_SCOPES = 8
 
 local function canonical(path, cwd)
@@ -191,7 +195,7 @@ function M.supplement_tracked(root, search_paths, lines, cb, opts)
     local command = { "git", "--no-optional-locks", "-C", root }
     vim.list_extend(command, args)
     -- Short read-only continuation of the explicitly admitted prepare scan.
-    local ok, child = pcall(vim.system, command, { text = false, stdin = input, timeout = 15000 }, function(result)
+    local ok, child = pcall(vim.system, command, { text = false, stdin = input, timeout = M.GIT_TIMEOUT_MS }, function(result)
       vim.schedule(function()
         if stopped then return end
         if #(result.stdout or "") > M.MAX_PATH_BYTES then done(nil, "Git inventory exceeds path budget"); return end
@@ -222,7 +226,10 @@ function M.supplement_tracked(root, search_paths, lines, cb, opts)
   run(args, nil, function(result)
     if result.code ~= 0 then
       if result.code == 128 and (result.stderr or ""):find("not a git repository", 1, true) then done(original)
-      else done(nil, "Git tracked inventory unavailable: " .. tostring(result.stderr)) end
+      elseif result.code == 124 and result.signal == 15 then
+        done(nil, ("Git tracked inventory timed out after %ds"):format(M.GIT_TIMEOUT_MS / 1000))
+      else done(nil, ("Git tracked inventory unavailable (exit %s): %s"):format(tostring(result.code),
+        vim.trim(tostring(result.stderr or "")))) end
       return
     end
     records(result.stdout or "", function(row)
@@ -283,7 +290,8 @@ function M.supplement_tracked_sync(root, search_paths, lines, opts)
   local stop = M.supplement_tracked(root, search_paths, lines, function(value, err)
     completed, result, failure = true, value, err
   end, opts)
-  if not vim.wait(35000, function() return completed end, 5) then
+  -- ls-files plus check-ignore, each bounded by GIT_TIMEOUT_MS.
+  if not vim.wait(2 * M.GIT_TIMEOUT_MS + 5000, function() return completed end, 5) then
     stop(); return nil, "Git tracked supplement timed out"
   end
   return result, failure

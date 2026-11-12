@@ -111,10 +111,21 @@ function M.window_role(win, tab)
   return code(win, tab, s) and "code" or "aux", nil, false
 end
 
+-- Diffview owns its tab like CodeDiff; register it so gd/pickers keep both panes.
+local function sync_diffview(tab)
+  local adapter = require("utils.layout_diffview")
+  local view = adapter.view(tab)
+  if not view then return nil end
+  M.register_group("review", adapter.group_opts(tab, view))
+  return view
+end
+
 function M.navigation_owner(tab)
   tab = tab or api.nvim_get_current_tabpage()
   local review = M.sync_review(tab)
   if review then return review, "review" end
+  local diffview = sync_diffview(tab)
+  if diffview then return diffview, "review" end
   for index = #groups, 1, -1 do
     local group = groups[index]
     if group.tab == tab and group.kind == "debug" and (not group.valid or group.valid(group)) then
@@ -462,7 +473,7 @@ function M.discover_groups(tab)
   tab = tab or api.nvim_get_current_tabpage()
   local lifecycle = package.loaded["codediff.ui.lifecycle"]
   for _, group in ipairs(groups) do
-    if group.tab == tab and group.kind == "review" and group.token and (not api.nvim_tabpage_is_valid(group.tab)
+    if group.tab == tab and group.kind == "review" and group.owner == "codediff" and group.token and (not api.nvim_tabpage_is_valid(group.tab)
       or not lifecycle or lifecycle.get_session(group.tab) ~= group.token) then
       -- Keep reopen metadata and the invalid group ID, not the closed UI tree.
       group.token, group.navigation_origin = nil, nil
@@ -470,7 +481,7 @@ function M.discover_groups(tab)
   end
   for _, callbacks in pairs(owners) do if callbacks.discover then callbacks.discover(tab) end end
   if api.nvim_tabpage_is_valid(tab) then
-    local review = M.sync_review(tab)
+    local review = M.sync_review(tab) or sync_diffview(tab)
     local other
     for _, group in ipairs(groups) do
       if group.tab == tab and group.kind ~= "normal" and (not group.valid or group.valid(group)) then other = group end

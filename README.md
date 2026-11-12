@@ -11,7 +11,11 @@
   clangd fork) plus Tier 1 SuperUnity absorption produces the clangd index
   store before the official clangd loads it: a full cold index of a large UE
   project went from **1261 s to 253–293 s** on a quiet Windows host, and the
-  official clangd then loads that store without re-indexing.
+  official clangd then loads that store without re-indexing. Fork source:
+  `hana-alice/llvm-project` branch `clangd-pch/v26` (submodule
+  `third_party/llvm-project`, not fetched by default); Windows x64 binaries
+  are attached to the `v2.15.0` release — extract to
+  `~/.cache/clangd-pch-22.1.5/metadata-v26/bin`.
 - **Context-aware C++ goto-definition**: source calls use clangd's exact-cursor
   identity; headers resolve in a compiler-proven origin TU through an async
   libclang sidecar.

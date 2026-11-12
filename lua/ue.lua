@@ -801,6 +801,8 @@ do
   end
 end
 
+local RENAME_RETRY_DELAYS_MS = { 10, 25, 50 }
+
 local function write_all(path, content)
   _ufs.ensure_dir(_ufs.dirname(path))
   local existing = io.open(path, "rb")
@@ -818,7 +820,14 @@ local function write_all(path, content)
   file:write(content)
   file:flush()
   file:close()
-  local ok, rename_err = vim.uv.fs_rename(temp, path)
+  local ok, rename_err, rename_code = vim.uv.fs_rename(temp, path)
+  -- Windows denies replacement while another process (a second Neovim, a
+  -- scanner) briefly holds the target open. Retry a bounded few times.
+  for attempt = 1, #RENAME_RETRY_DELAYS_MS do
+    if ok or not (rename_code == "EPERM" or rename_code == "EACCES" or rename_code == "EBUSY") then break end
+    vim.uv.sleep(RENAME_RETRY_DELAYS_MS[attempt])
+    ok, rename_err, rename_code = vim.uv.fs_rename(temp, path)
+  end
   if not ok then
     pcall(os.remove, temp)
     require("utils.log").notify_error("ue.io", "atomic replace failed: " .. tostring(rename_err or path))
@@ -2388,8 +2397,22 @@ local function prepare_cache_ready(ctx)
   return key ~= "" and not CORE_RT.dirty_index_roots[key]
 end
 
+local function warn_stale_uht(ctx)
+  local platform = ctx and ctx.state and trim(ctx.state.target_platform or "") or ""
+  if platform == "" or vim.g.ue_prepare_headless == 1 then return end
+  local roots = { join(ctx.engine_root, "Engine", "Intermediate", "Build") }
+  if ctx.project_root and ctx.project_root ~= "" then roots[#roots + 1] = join(ctx.project_root, "Intermediate", "Build") end
+  if ctx.uproject and ctx.uproject ~= "" then roots[#roots + 1] = join(_ufs.dirname(ctx.uproject), "Intermediate", "Build") end
+  local uht = require("ue.cdb.uht_freshness")
+  pcall(uht.check, uht.timestamp_files(roots, platform), function(result)
+    local msg = uht.message(result, platform)
+    if msg then vim.notify(msg, vim.log.levels.WARN, { title = "UE", replace = "ue.uht.stale" }) end
+  end)
+end
+
 local function prepare_summary(ctx, compile_path, opts)
   opts = opts or {}
+  pcall(warn_stale_uht, ctx)
   pcall(function() require("utils.probe").record("prepare-path", opts.reused_cache and "fast" or "cold", { state = "ok" }) end)
   local project_count = opts.project_count or count_cached_entries(ctx.paths.project_list)
   local engine_count = opts.engine_count or count_cached_entries(ctx.paths.engine_list)

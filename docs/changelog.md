@@ -116,19 +116,8 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v2.15.0` → [docs/release_2.15.0.md](release_2.15.0.md) (offline prefix-PCH index speed-up: quiet-host cold full index 253–293 s, 7 batches with median ≤300 s; README refresh; tagged `v2.15.0`)
 
+- `v2.15.1` → [docs/release_2.15.1.md](release_2.15.1.md) (default v26 private bin, llvm fork submodule, headless CI green on ubuntu/macOS/Windows; tag pending)
+
+- `v2.15.2` → [docs/release_2.15.2.md](release_2.15.2.md) (stale-UHT warning after prepare, Diffview `gd` routing, quieter index logs; full regression 4490/4490, 2 skips; tag pending)
+
 ## Unreleased
-
-### 2026-11-11 — Default private offline-index bin to the v26 build
-
-**Task**
-- The 2.15.0 timings were measured with the v26 private build (PGO + ThinLTO + rpmalloc + overlay cache), but the default `bin_dir` still pointed at `metadata-v24c`.
-
-**Implemented**
-- `lua/ue/config.lua`, `lua/ue/index/pch_offline.lua`, `tests/cases/index_pch_offline_spec.lua`: default `index.pch_offline.bin_dir` changed from `metadata-v24c` to `metadata-v26`. Private binaries still stay out of the public repo. If the directory is missing, behavior is the same as before (probe absent → offline path not taken).
-
-- Fork source published: `hana-alice/llvm-project`, branch `clangd-pch/v26`, tag `clangd-pch-v26`. It is one commit on top of `llvmorg-22.1.5` (20 files, +2033/-75).
-- `.gitmodules` + gitlink `third_party/llvm-project` point at that commit with `update = none` and `shallow = true`. A recursive clone does not fetch llvm. To fetch it explicitly: `git submodule update --init --checkout --depth 1 third_party/llvm-project`.
-- Prebuilt Windows x64 binaries (`clangd.exe`, `clangd-pch-probe.exe`, plus LICENSE and the patch) are attached to GitHub release `v2.15.0`.
-
-**Validation**
-- `index_pch_offline` 13/13; `python -B -I tests/py/test_clangd_pch_offline.py` 42/42; full regression see commit.

@@ -142,6 +142,9 @@ def dependency_scan_args(producer):
     return producer[:-2] + ["-M", "-MG"]
 
 
+WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
+
+
 def parse_depfile(text, directory):
     """Make-style depfile -> absolute prerequisite paths (escapes, continuations, drive letters)."""
     joined = re.sub(r"\\\r?\n", " ", text)
@@ -168,7 +171,10 @@ def parse_depfile(text, directory):
         i += 1
     if current:
         result.append("".join(current))
-    return [os.path.normpath(os.path.join(directory, p)) for p in result]
+    # A drive-letter path is absolute even when the tool runs on a POSIX host
+    # (depfiles from a Windows toolchain); os.path.join would prefix it.
+    return [os.path.normpath(p if WINDOWS_DRIVE_PATH.match(p) else os.path.join(directory, p))
+            for p in result]
 
 
 def driver_query_args(row):

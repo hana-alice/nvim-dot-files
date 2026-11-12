@@ -118,32 +118,6 @@ a versioned `release_X.Y.Z.md` and keep this file rolling forward.
 
 - `v2.15.1` → [docs/release_2.15.1.md](release_2.15.1.md) (default v26 private bin, llvm fork submodule, headless CI green on ubuntu/macOS/Windows; tag pending)
 
+- `v2.15.2` → [docs/release_2.15.2.md](release_2.15.2.md) (stale-UHT warning after prepare, Diffview `gd` routing, quieter index logs; full regression 4490/4490, 2 skips; tag pending)
+
 ## Unreleased
-
-### 2026-11-11 — UEPrepare warns about stale UHT output; quieter index logs
-
-**Task**
-- UEPrepare builds compile_commands from the last build's `.rsp` files and never runs UnrealHeaderTool. After a branch switch, `*.generated.h` and its line-keyed `GENERATED_BODY` macros went stale, and clangd reported dozens of false errors that came from the shared PCH.
-- Daily logs showed recurring noise: `Git tracked inventory unavailable:` with an empty reason, `atomic replace failed: EPERM`, and thousands of identical `background proof retained originals` WARN lines.
-
-**Changes**
-- New `ue.cdb.uht_freshness`: after prepare, compares each UHT `Inc/<Module>/Timestamp` against the headers it lists for the active platform. If any are newer, prepare shows a WARN asking you to build once and then `:LspRestart`. It runs asynchronously and finished in under 1s on 4.6k headers.
-- The Git tracked-file inventory timeout goes from 15s to 120s. A timeout (exit 124) is now reported as a timeout, and other failures include the exit code.
-- `write_all` retries the rename up to three times (10/25/50ms) on EPERM/EACCES/EBUSY. Windows rejects the replace while another process briefly holds the target open.
-- The background proof logs a repeated failure reason once instead of every 5s retry.
-
-**Tests**
-- `tests/cases/ue_uht_freshness_spec.lua` (4 cases), plus `file_inventory` and `index_batch` regressions.
-
-### 2026-11-11 — gd inside Diffview no longer breaks the diff pair
-
-**Task**
-- In a Diffview tab (`<leader>gv`), `gd` replaced the current diff pane's buffer with the target file. The other pane was left alone and the diff became unusable. CodeDiff already routed `gd` to the editing tab; Diffview did not.
-
-**Implemented**
-- New `lua/utils/layout_diffview.lua`: reads the already-loaded `diffview.lib` (`tabpage_to_view`) and builds review-group options (valid/focus/restore, repo, selected path). It never loads Diffview.
-- `lua/utils/layout.lua`: `navigation_owner` and `discover_groups` register a Diffview tab as a `review` group. `routes_to_normal` is therefore true there, and `gd`, LSP jumps and picker confirmations go to the normal editing tab (`<leader>w[` returns). CodeDiff-only token retirement is restricted to `owner == "codediff"`.
-
-**Validation**
-- New `tests/cases/git_review_diffview_goto_spec.lua` (real LazyVim child, real `<leader>gv`): a jump from either pane lands in the editing tab, and both panes keep their buffer and `diff` mode. After `DiffviewClose` the tab routes normally again. It fails without the fix ("Diffview tab is not a review owner").
-- `layout` 158/158, `review` 128/128.
